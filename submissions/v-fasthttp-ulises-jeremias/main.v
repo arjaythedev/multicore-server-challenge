@@ -342,10 +342,10 @@ fn favorite(app &App, mut ctx Context, slug string, auth Auth, favorite bool) ve
 }
 
 fn list_comments(app &App, mut ctx Context, slug string, auth Auth) veb.Result {
-	article := app.one('SELECT id::text FROM articles WHERE slug=$1', [slug]) or { return ctx.fail(404, 'article not found') }
 	viewer := if auth.present { auth.id } else { '0' }
-	row := app.one("SELECT COALESCE(json_agg(json_build_object('id',c.id,'createdAt',to_char(c.created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),'updatedAt',to_char(c.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),'body',c.body,'author',json_build_object('username',u.username,'bio',u.bio,'image',u.image,'following',EXISTS(SELECT 1 FROM follows f WHERE f.follower_id=$1 AND f.followee_id=u.id)))),'[]'::json) FROM (SELECT * FROM comments WHERE article_id=$2 ORDER BY created_at DESC,id DESC LIMIT 100) c JOIN users u ON u.id=c.author_id", [viewer,article.val(0)]) or { return ctx.fail(500, 'database error') }
-	return ctx.reply(200, '{"comments":${row.val(0)}}')
+	rows := app.query("SELECT COALESCE((SELECT json_agg(json_build_object('id',c.id,'createdAt',to_char(c.created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),'updatedAt',to_char(c.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),'body',c.body,'author',json_build_object('username',u.username,'bio',u.bio,'image',u.image,'following',EXISTS(SELECT 1 FROM follows f WHERE f.follower_id=$1 AND f.followee_id=u.id))) ORDER BY c.created_at DESC,c.id DESC) FROM (SELECT * FROM comments WHERE article_id=a.id ORDER BY created_at DESC,id DESC LIMIT 100) c JOIN users u ON u.id=c.author_id),'[]'::json) FROM articles a WHERE a.slug=$2", [viewer,slug]) or { return ctx.fail(500, 'database error') }
+	if rows.len == 0 { return ctx.fail(404, 'article not found') }
+	return ctx.reply(200, '{"comments":' + rows[0].val(0) + '}')
 }
 
 fn create_comment(app &App, mut ctx Context, slug string, auth Auth) veb.Result {
