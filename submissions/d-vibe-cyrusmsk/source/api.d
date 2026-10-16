@@ -66,6 +66,8 @@ void errorPage(HTTPServerRequest req, HTTPServerResponse res, HTTPServerErrorInf
 {
     if (res.headerWritten)
         return;
+    if (error.code >= 500)
+        logError("%s %s -> %s: %s", req.method, req.requestURI, error.code, error.message);
     writeError(res, error.code, error.message.length ? error.message : "error");
 }
 
@@ -893,7 +895,12 @@ private void createArticle(HTTPServerRequest req, HTTPServerResponse res)
     auto conn = pool.lockConnection;
     conn.execStatement("BEGIN");
     scope (failure)
-        conn.execStatement("ROLLBACK");
+    {
+        try
+            conn.execStatement("ROLLBACK");
+        catch (Exception rollbackError)
+            logError("rollback failed: %s", rollbackError.msg);
+    }
 
     QueryParams insert;
     insert.preparedStatementName = Name.insertArticle;
@@ -1071,7 +1078,10 @@ private void listComments(HTTPServerRequest req, HTTPServerResponse res)
     auto answer = pool.lockConnection.execPreparedStatement(params);
     auto comments = new CommentOut[](answer.length);
     foreach (i; 0 .. answer.length)
-        comments[i] = commentOut(answer[i], answer[i][7].as!bool);
+    {
+        auto row = answer[i];
+        comments[i] = commentOut(row, row[7].as!bool);
+    }
     writeJson(res, 200, CommentsOut(comments));
 }
 
