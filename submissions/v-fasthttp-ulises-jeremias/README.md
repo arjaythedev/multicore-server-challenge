@@ -10,4 +10,4 @@ Direct mode lets the V server accept keep-alive connections on the benchmark por
 
 ## Local load results
 
-On the development host, the full 500,000-article seed passed the five-minute hold at 4,000 VUs with `-think-scale 0.2`: 4,875 req/s, p95 392.7 ms, p99 915.5 ms, and no errors. This ran after a 60-second ramp; the app, PostgreSQL, and load generator shared a 24-thread host. The accelerated think scale and shared host make this a local comparison result, not the official score: the challenge box has 8 vCPUs and its official five-minute hold uses the default workload settings.
+On the development host, the full 500,000-article seed passed a five-minute hold at 4,000 VUs with `-think-scale 0.2`: 5,133 req/s, p95 126.1 ms, p99 487.7 ms, and no errors. This ran after a 60-second ramp; the app, PostgreSQL, and load generator shared a 24-thread host. The accelerated think scale and shared host make this a local comparison result, not the official score: the challenge box has 8 vCPUs and its official five-minute hold uses the default workload settings.
