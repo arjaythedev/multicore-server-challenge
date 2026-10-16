@@ -6,7 +6,7 @@ Article-list pages and their capped counts come from one SQL statement. Article 
 
 Direct mode lets the V server accept keep-alive connections on the benchmark port without Nginx in front. This saves the proxy CPU and avoids an extra request hop. The service unit grants the capability needed to bind port 80 without running the server as root.
 
-`install.sh` builds V at commit `d67ee5500338554f54c7c8ca4cc00df42159577d` and links against the system `libpq` client. `build.sh` compiles the server with `-prod -prealloc -d new_veb`. No generated binaries or vendored dependencies are committed.
+`install.sh` builds V at commit `a8a9a3bec8804d37554826204140e42ae8c8ec4c` and links against the system `libpq` client. This V revision includes the Linux syscall header fix needed by its bootstrap compiler on Ubuntu 24.04. `build.sh` compiles the server with `-prod -prealloc -d new_veb`. No generated binaries or vendored dependencies are committed.
 
 ## Local load results
 
