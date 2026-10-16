@@ -6,9 +6,9 @@ vibe-core 2.14.0) — **Driver:** [dpq2](https://code.dlang.org/packages/dpq2) 1
 
 | | |
 |---|---|
-| `install.sh` | LDC 1.41.0, a checksummed tarball (with its own dub) into `/usr/local/ldc`, plus `libpq-dev`, `libbsd-dev`, `zlib1g-dev`, `gcc` and `git` |
+| `install.sh` | LDC 1.41.0, a checksummed tarball (with its own dub) into `/usr/local/ldc`, plus `libpq-dev` (PGDG, 17+ for the driver's pipeline API), `libbsd-dev`, `libssl-dev`, `zlib1g-dev`, `libmimalloc-dev`, `gcc` and `git` |
 | `build.sh` | `dub build --build=release`; every dependency version is pinned in `dub.selections.json` |
-| `start.sh` | `exec ./bin/conduit-vibed`, configured only by `DATABASE_URL`, `JWT_SECRET`, `HOST`, `PORT` (plus optional `THREADS`, `CONNS`) |
+| `start.sh` | `exec ./bin/conduit-vibed`, configured only by `DATABASE_URL`, `JWT_SECRET`, `HOST`, `PORT` (plus optional `THREADS`, `CONNS`); preloads mimalloc as the C allocator when installed (`MIMALLOC=0` skips it) |
 
 **Front: direct** — the server holds every virtual user's keep-alive connection itself
 (`LimitNOFILE=200000`), and no Nginx CPU is spent.

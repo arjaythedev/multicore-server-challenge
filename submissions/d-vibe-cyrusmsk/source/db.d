@@ -205,7 +205,7 @@ final class Db
         foreach (_; 0 .. connections)
         {
             auto conn = client.lockConnection;
-            conn.execStatement("SELECT 1");
+            conn.exec("SELECT 1");
         }
     }
 
@@ -220,14 +220,14 @@ final class Db
 /// Runs once per new connection: force a UTC session and prepare everything.
 private void initConnection(Connection conn)
 {
-    conn.execStatement(`SET TIME ZONE 'UTC'`);
+    conn.exec(`SET TIME ZONE 'UTC'`);
     // Our statements are prepared once and executed with ever-changing
     // parameters; generic plans avoid re-planning per execution, and JIT
     // never pays for these point queries. Session-level SET, allowed.
-    conn.execStatement(`SET plan_cache_mode = force_generic_plan`);
-    conn.execStatement(`SET jit = off`);
+    conn.exec(`SET plan_cache_mode = force_generic_plan`);
+    conn.exec(`SET jit = off`);
     foreach (name, sql; allStatements)
-        conn.prepareStatement(name, sql);
+        conn.prepareEx(name, sql);
 }
 
 /// Runs prepared statements as one libpq pipeline and returns their answers in

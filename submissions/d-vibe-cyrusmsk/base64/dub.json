@@ -1,0 +1,39 @@
+{
+	"name": "base64",
+	"description": "Fast base64 encoding and decoding for D, with the std.base64 API",
+	"license": "BSL-1.0",
+	"copyright": "Copyright \u00a9 2026, Sergei Giniatulin",
+	"authors": [
+		"Sergei Giniatulin"
+	],
+	"targetPath": "bin",
+	"importPaths": [
+		"source"
+	],
+	"sourcePaths": [
+		"source"
+	],
+	"configurations": [
+		{
+			"name": "library",
+			"description": "The library, with SIMD used when the target supports it"
+		},
+		{
+			"name": "SIMD",
+			"description": "Force the core.simd implementation, even where it is not detected",
+			"versions": [
+				"SIMD"
+			]
+		},
+		{
+			"name": "no_SIMD",
+			"description": "Force the plain byte loops, so the auto-vectoriser has to do the work",
+			"versions": [
+				"no_SIMD"
+			]
+		}
+	],
+	"dependencies": {
+		"intel-intrinsics": "~>1.14.11"
+	}
+}

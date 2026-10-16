@@ -483,7 +483,7 @@ private Answer execUnique(HTTPServerResponse res, QueryParams params, out bool o
     try
     {
         ok = true;
-        return pool.lockConnection.execPreparedStatement(params);
+        return pool.lockConnection.execPrepared(params);
     }
     catch (Exception e)
     {
@@ -563,7 +563,7 @@ private void login(HTTPServerRequest req, HTTPServerResponse res)
     QueryParams params;
     params.preparedStatementName = Name.userByEmail;
     params.argsVariadic(email);
-    auto answer = pool.lockConnection.execPreparedStatement(params);
+    auto answer = pool.lockConnection.execPrepared(params);
     if (answer.length == 0 || !verifyPassword(password, answer[0][5].as!string))
     {
         writeError(res, 401, "invalid email or password");
@@ -583,7 +583,7 @@ private void currentUser(HTTPServerRequest req, HTTPServerResponse res)
     QueryParams params;
     params.preparedStatementName = Name.userById;
     params.argsVariadic(viewer);
-    auto answer = pool.lockConnection.execPreparedStatement(params);
+    auto answer = pool.lockConnection.execPrepared(params);
     if (answer.length == 0)
     {
         writeError(res, 401, "unauthorized");
@@ -661,7 +661,7 @@ private void getProfile(HTTPServerRequest req, HTTPServerResponse res)
     QueryParams params;
     params.preparedStatementName = Name.profile;
     params.argsVariadic(viewer, req.params["username"]);
-    auto answer = pool.lockConnection.execPreparedStatement(params);
+    auto answer = pool.lockConnection.execPrepared(params);
     if (answer.length == 0)
     {
         writeError(res, 404, "profile not found");
@@ -682,7 +682,7 @@ private void follow(HTTPServerRequest req, HTTPServerResponse res, bool follow)
     lookup.preparedStatementName = Name.userByUsername;
     lookup.argsVariadic(req.params["username"]);
     auto conn = pool.lockConnection;
-    auto found = conn.execPreparedStatement(lookup);
+    auto found = conn.execPrepared(lookup);
     if (found.length == 0)
     {
         writeError(res, 404, "profile not found");
@@ -693,7 +693,7 @@ private void follow(HTTPServerRequest req, HTTPServerResponse res, bool follow)
     QueryParams change;
     change.preparedStatementName = follow ? Name.insertFollow : Name.deleteFollow;
     change.argsVariadic(viewer, followee);
-    conn.execPreparedStatement(change);
+    conn.execPrepared(change);
 
     ProfileOut profile;
     profile.username = cellText(found[0][1]);
@@ -837,7 +837,7 @@ private void getArticle(HTTPServerRequest req, HTTPServerResponse res)
     QueryParams params;
     params.preparedStatementName = Name.articleBySlug;
     params.argsVariadic(viewer, req.params["slug"]);
-    auto answer = pool.lockConnection.execPreparedStatement(params);
+    auto answer = pool.lockConnection.execPrepared(params);
     if (answer.length == 0)
     {
         writeError(res, 404, "article not found");
@@ -893,11 +893,11 @@ private void createArticle(HTTPServerRequest req, HTTPServerResponse res)
     }
 
     auto conn = pool.lockConnection;
-    conn.execStatement("BEGIN");
+    conn.exec("BEGIN");
     scope (failure)
     {
         try
-            conn.execStatement("ROLLBACK");
+            conn.exec("ROLLBACK");
         catch (Exception rollbackError)
             logError("rollback failed: %s", rollbackError.msg);
     }
@@ -905,7 +905,7 @@ private void createArticle(HTTPServerRequest req, HTTPServerResponse res)
     QueryParams insert;
     insert.preparedStatementName = Name.insertArticle;
     insert.argsVariadic(viewer, title, description, body);
-    auto created = conn.execPreparedStatement(insert);
+    auto created = conn.execPrepared(insert);
     if (created.length != 1)
     {
         writeError(res, 500, "internal error");
@@ -917,18 +917,18 @@ private void createArticle(HTTPServerRequest req, HTTPServerResponse res)
         QueryParams names;
         names.preparedStatementName = Name.insertTags;
         names.argsVariadic(tags);
-        conn.execPreparedStatement(names);
+        conn.execPrepared(names);
         QueryParams links;
         links.preparedStatementName = Name.insertArticleTags;
         links.argsVariadic(id, tags);
-        conn.execPreparedStatement(links);
+        conn.execPrepared(links);
     }
-    conn.execStatement("COMMIT");
+    conn.exec("COMMIT");
 
     QueryParams full;
     full.preparedStatementName = Name.articleById;
     full.argsVariadic(viewer, id);
-    auto answer = conn.execPreparedStatement(full);
+    auto answer = conn.execPrepared(full);
     writeJson(res, 201, ArticleOut(fullArticle(answer[0])));
 }
 
@@ -938,7 +938,7 @@ private bool ownArticle(HTTPServerResponse res, string slug, long viewer, out lo
     QueryParams params;
     params.preparedStatementName = Name.articleOwner;
     params.argsVariadic(slug);
-    auto answer = pool.lockConnection.execPreparedStatement(params);
+    auto answer = pool.lockConnection.execPrepared(params);
     if (answer.length == 0)
     {
         writeError(res, 404, "article not found");
@@ -982,12 +982,12 @@ private void updateArticle(HTTPServerRequest req, HTTPServerResponse res)
         hasTitle ? Nullable!string(title) : Nullable!string.init,
         hasDescription ? Nullable!string(description) : Nullable!string.init,
         hasBody ? Nullable!string(body) : Nullable!string.init);
-    pool.lockConnection.execPreparedStatement(params);
+    pool.lockConnection.execPrepared(params);
 
     QueryParams full;
     full.preparedStatementName = Name.articleById;
     full.argsVariadic(viewer, id);
-    auto answer = pool.lockConnection.execPreparedStatement(full);
+    auto answer = pool.lockConnection.execPrepared(full);
     writeJson(res, 200, ArticleOut(fullArticle(answer[0])));
 }
 
@@ -1005,7 +1005,7 @@ private void deleteArticle(HTTPServerRequest req, HTTPServerResponse res)
     QueryParams params;
     params.preparedStatementName = Name.deleteArticle;
     params.argsVariadic(id);
-    pool.lockConnection.execPreparedStatement(params);
+    pool.lockConnection.execPrepared(params);
     writeNoContent(res);
 }
 
@@ -1015,7 +1015,7 @@ private bool articleId(HTTPServerResponse res, string slug, out long id)
     QueryParams params;
     params.preparedStatementName = Name.articleIdBySlug;
     params.argsVariadic(slug);
-    auto answer = pool.lockConnection.execPreparedStatement(params);
+    auto answer = pool.lockConnection.execPrepared(params);
     if (answer.length == 0)
     {
         writeError(res, 404, "article not found");
@@ -1041,11 +1041,11 @@ private void favorite(HTTPServerRequest req, HTTPServerResponse res, bool favori
     change.argsVariadic(viewer, id);
 
     auto conn = pool.lockConnection;
-    conn.execPreparedStatement(change);
+    conn.execPrepared(change);
     QueryParams full;
     full.preparedStatementName = Name.articleById;
     full.argsVariadic(viewer, id);
-    auto answer = conn.execPreparedStatement(full);
+    auto answer = conn.execPrepared(full);
     writeJson(res, 200, ArticleOut(fullArticle(answer[0])));
 }
 
@@ -1075,7 +1075,7 @@ private void listComments(HTTPServerRequest req, HTTPServerResponse res)
     QueryParams params;
     params.preparedStatementName = Name.commentsByArticle;
     params.argsVariadic(viewer, id);
-    auto answer = pool.lockConnection.execPreparedStatement(params);
+    auto answer = pool.lockConnection.execPrepared(params);
     auto comments = new CommentOut[](answer.length);
     foreach (i; 0 .. answer.length)
     {
@@ -1105,7 +1105,7 @@ private void createComment(HTTPServerRequest req, HTTPServerResponse res)
     QueryParams params;
     params.preparedStatementName = Name.insertComment;
     params.argsVariadic(id, viewer, body);
-    auto answer = pool.lockConnection.execPreparedStatement(params);
+    auto answer = pool.lockConnection.execPrepared(params);
     if (answer.length != 1)
     {
         writeError(res, 500, "internal error");
@@ -1132,7 +1132,7 @@ private void deleteComment(HTTPServerRequest req, HTTPServerResponse res)
     params.preparedStatementName = Name.commentOwner;
     params.argsVariadic(commentId, req.params["slug"]);
     auto conn = pool.lockConnection;
-    auto answer = conn.execPreparedStatement(params);
+    auto answer = conn.execPrepared(params);
     if (answer.length == 0)
     {
         writeError(res, 404, "comment not found");
@@ -1146,7 +1146,7 @@ private void deleteComment(HTTPServerRequest req, HTTPServerResponse res)
     QueryParams remove;
     remove.preparedStatementName = Name.deleteComment;
     remove.argsVariadic(commentId);
-    conn.execPreparedStatement(remove);
+    conn.execPrepared(remove);
     writeNoContent(res);
 }
 
@@ -1158,7 +1158,7 @@ private void tags(HTTPServerRequest req, HTTPServerResponse res)
 {
     QueryParams params;
     params.preparedStatementName = Name.tagsAll;
-    auto answer = pool.lockConnection.execPreparedStatement(params);
+    auto answer = pool.lockConnection.execPrepared(params);
     auto names = new string[](answer.length);
     foreach (i; 0 .. answer.length)
         names[i] = cellText(answer[i][0]);
