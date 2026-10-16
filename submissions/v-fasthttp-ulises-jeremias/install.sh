@@ -7,7 +7,9 @@ V_DIR="/opt/vlang-${V_COMMIT:0:8}"
 if [ ! -x "$V_DIR/v" ]; then
 	git clone https://github.com/vlang/v.git "$V_DIR"
 	git -C "$V_DIR" checkout --detach "$V_COMMIT"
-	make -C "$V_DIR"
+	# V's bootstrap uses strict C99; diagnostics needs GNU/Linux declarations
+	# such as PR_SET_PDEATHSIG and SYS_memfd_create on Ubuntu.
+	make -C "$V_DIR" CFLAGS=-D_GNU_SOURCE
 fi
 test "$(git -C "$V_DIR" rev-parse HEAD)" = "$V_COMMIT"
 ln -sfn "$V_DIR/v" /usr/local/bin/v
