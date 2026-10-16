@@ -7,7 +7,18 @@
 /// startup, and then reused for the life of the process.
 module conduit.db;
 
-import vibe.db.postgresql;
+import dpq2.connection : DPQConnection = Connection;
+import dpq2.args : QueryParams;
+import dpq2.value : Value, ValueFormat;
+import dpq2.result : Answer, Result, Row;
+import derelict.pq.pq : PGRES_COMMAND_OK, PGRES_TUPLES_OK, PGRES_PIPELINE_SYNC,
+    PGpipelineStatus;
+
+public import dpq2.args : QueryParams;
+public import dpq2.value : Value, ValueFormat;
+public import dpq2.result : Answer, Result, Row;
+
+import vibe.core.connectionpool : ConnectionPool, LockedConnection;
 
 /// All statements, each under the name it is prepared as.
 private struct Statements
@@ -184,18 +195,28 @@ private string[string] allStatements()
     return statements;
 }
 
-/// One connection pool per worker thread: a vibe.d connection belongs to the
-/// thread that opened it, so a pool must never be shared between threads.
+/// One connection pool per worker thread: a connection belongs to the thread
+/// that opened it, so a pool must never be shared between threads.
+///
+/// Blocking libpq calls are used throughout: photon passes them through to
+/// raw syscalls, so they complete like normal blocking I/O. No async waiter
+/// is involved anywhere on this path.
 ///
 /// The pool holds at most `maxConns` connections; they are opened lazily and
 /// reused for the life of the process, so a request never dials.
 final class Db
 {
-    private PostgresClient client;
+    private ConnectionPool!DPQConnection client;
 
     this(string connString, uint maxConns)
     {
-        client = new PostgresClient(connString, maxConns, (conn) => initConnection(conn));
+        client = new ConnectionPool!DPQConnection(
+            () @safe {
+                auto conn = () @trusted { return new DPQConnection(connString); } ();
+                () @trusted { initConnection(conn); } ();
+                return conn;
+            },
+            maxConns);
     }
 
     /// Opens every connection and prepares the statements up front, so no
@@ -205,7 +226,7 @@ final class Db
         foreach (_; 0 .. connections)
         {
             auto conn = client.lockConnection;
-            conn.exec("SELECT 1");
+            execSimple(conn, "SELECT 1");
         }
     }
 
@@ -218,16 +239,27 @@ final class Db
 }
 
 /// Runs once per new connection: force a UTC session and prepare everything.
-private void initConnection(Connection conn)
+private void initConnection(DPQConnection conn)
 {
-    conn.exec(`SET TIME ZONE 'UTC'`);
+    execSimple(conn, `SET TIME ZONE 'UTC'`);
     // Our statements are prepared once and executed with ever-changing
     // parameters; generic plans avoid re-planning per execution, and JIT
     // never pays for these point queries. Session-level SET, allowed.
-    conn.exec(`SET plan_cache_mode = force_generic_plan`);
-    conn.exec(`SET jit = off`);
+    execSimple(conn, `SET plan_cache_mode = force_generic_plan`);
+    execSimple(conn, `SET jit = off`);
     foreach (name, sql; allStatements)
         conn.prepareEx(name, sql);
+}
+
+/// Runs a one-off statement and discards the result (SET, BEGIN, ...).
+void execSimple(DPQConnection conn, string sql)
+{
+    QueryParams p;
+    p.sqlCommand = sql;
+    conn.sendQueryParams(p);
+    while (conn.getResult() !is null)
+    {
+    }
 }
 
 /// Runs prepared statements as one libpq pipeline and returns their answers in
@@ -236,13 +268,13 @@ private void initConnection(Connection conn)
 ///
 /// Only for statements whose parameters are all known up front. On any error
 /// the pipeline is drained and left clean, and the error is thrown.
-immutable(Answer)[] execPipeline(LockedConnection conn, scope const(QueryParams)[] queries)
+immutable(Answer)[] execPipeline(LockedConnection!DPQConnection conn, scope const(QueryParams)[] queries)
 {
     conn.enterPipelineMode;
     scope (exit)
     {
         while (conn.pipelineStatus == PGpipelineStatus.PQ_PIPELINE_ABORTED)
-            conn.getResult(conn.pollingTimeout);
+            conn.getResult();
         conn.exitPipelineMode;
     }
 
@@ -260,26 +292,13 @@ immutable(Answer)[] execPipeline(LockedConnection conn, scope const(QueryParams)
     return answers;
 }
 
-/// Reads one pipelined result, waiting (without blocking the thread) for it
-/// to arrive. A plain `getResult` cannot be used here: between two pipelined
-/// results the connection can briefly look idle, and then it returns null for
-/// a result that is still on its way.
-private immutable(Result) awaitResult(LockedConnection conn)
+/// Reads one pipelined result. libpq is in blocking mode, so `getResult`
+/// waits inside the call until the result arrives; no yielding needed.
+private immutable(Result) awaitResult(LockedConnection!DPQConnection conn)
 {
-    import vibe.core.core : sleep;
-    import std.datetime : MonoTime;
-    import core.time : usecs;
-
-    auto deadline = MonoTime.currTime + conn.requestTimeout;
     while (true)
     {
-        if (auto result = conn.getResult(conn.requestTimeout))
+        if (auto result = conn.getResult())
             return result;
-        if (MonoTime.currTime >= deadline)
-            throw new Exception("timed out waiting for a pipelined result");
-        // Nothing buffered (or nothing arrived yet): pull in whatever is on
-        // the socket, then yield so other requests proceed while waiting.
-        conn.consumeInput();
-        sleep(100.usecs);
     }
 }

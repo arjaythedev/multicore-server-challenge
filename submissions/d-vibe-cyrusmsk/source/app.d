@@ -1,4 +1,4 @@
-import vibe.core.core : runApplication, runWorkerTaskDist, setupWorkerThreads;
+import vibe.core.core : runApplication;
 import vibe.core.log;
 import vibe.http.router;
 import vibe.http.server;
@@ -7,9 +7,10 @@ import conduit.api;
 import conduit.auth;
 import conduit.db;
 
+import photon : goOnAllThreads, schedulerThreads;
+
 import std.conv : to;
 import std.exception : enforce;
-import std.parallelism : totalCPUs;
 import std.process : environment;
 
 import core.time : seconds;
@@ -38,15 +39,17 @@ void main()
     catch (Exception)
         g_port = 3000;
 
-    // One event loop thread per core; each serves its own connections and
-    // holds its own database pool.
-    immutable threads = totalCPUs > 8 ? 8 : totalCPUs;
-    g_perThread = totalConnections / threads;
+    // Every photon scheduler thread runs its own setup: its own database
+    // pool, router and listening socket (SO_REUSEPORT spreads connections).
+    // Queue the setups first, then start the schedulers; waiting here (like
+    // full vibe.d's runWorkerTaskDist does) would deadlock, as no scheduler
+    // runs before runApplication.
+    immutable schedulers = cast(uint) schedulerThreads();
+    g_perThread = totalConnections / (schedulers > 0 ? schedulers : 1);
     if (g_perThread < 1)
         g_perThread = 1;
 
-    setupWorkerThreads(threads);
-    runWorkerTaskDist(&workerMain, g_dbUrl, g_host, g_port, g_secret);
+    goOnAllThreads({ workerMain(g_dbUrl, g_host, g_port, g_secret); });
     runApplication();
 }
 
@@ -55,6 +58,7 @@ void main()
 /// (SO_REUSEPORT spreads the connections over the threads).
 void workerMain(string dbUrl, string host, ushort port, string secret) nothrow
 {
+    import core.thread : Thread;
     try
     {
         auto db = new Db(dbUrl, g_perThread);

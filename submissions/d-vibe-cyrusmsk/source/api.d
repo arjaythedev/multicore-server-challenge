@@ -10,12 +10,16 @@ import vibe.core.log;
 import vibe.http.router;
 import vibe.http.server;
 import vibe.data.json;
-import vibe.db.postgresql;
 import vibe.stream.operations : readAllUTF8;
 
 import conduit.auth;
 import conduit.bcrypt;
 import conduit.db;
+
+import dpq2.args : QueryParams;
+import dpq2.value : Value;
+import dpq2.result : Answer, Row, asArray, ResponseException;
+import dpq2.conv.to_d_types : as;
 
 import std.datetime : SysTime;
 import std.format : format;
@@ -893,11 +897,11 @@ private void createArticle(HTTPServerRequest req, HTTPServerResponse res)
     }
 
     auto conn = pool.lockConnection;
-    conn.exec("BEGIN");
+    execSimple(conn, "BEGIN");
     scope (failure)
     {
         try
-            conn.exec("ROLLBACK");
+            execSimple(conn, "ROLLBACK");
         catch (Exception rollbackError)
             logError("rollback failed: %s", rollbackError.msg);
     }
@@ -923,7 +927,7 @@ private void createArticle(HTTPServerRequest req, HTTPServerResponse res)
         links.argsVariadic(id, tags);
         conn.execPrepared(links);
     }
-    conn.exec("COMMIT");
+    execSimple(conn, "COMMIT");
 
     QueryParams full;
     full.preparedStatementName = Name.articleById;
