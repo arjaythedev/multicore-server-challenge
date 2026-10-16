@@ -42,7 +42,10 @@ RETURNING id, username, email, bio, image`;
   FROM articles a
   JOIN users u ON u.id = a.author_id
  ORDER BY a.id DESC LIMIT $2 OFFSET $3`;
-    enum countAll = `SELECT count(*) FROM (SELECT 1 FROM articles a LIMIT 1000) s`;
+    // The count walks the primary key from the oldest end: those pages are
+    // all-visible (frozen), so it stays an index-only scan with no heap
+    // fetches. Same answer either way: min(count, 1000).
+    enum countAll = `SELECT count(*) FROM (SELECT 1 FROM articles a ORDER BY a.id LIMIT 1000) s`;
     enum listByTag = `SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at,
        ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id
               WHERE at.article_id = a.id ORDER BY t.name) AS tag_list,
@@ -218,6 +221,11 @@ final class Db
 private void initConnection(Connection conn)
 {
     conn.execStatement(`SET TIME ZONE 'UTC'`);
+    // Our statements are prepared once and executed with ever-changing
+    // parameters; generic plans avoid re-planning per execution, and JIT
+    // never pays for these point queries. Session-level SET, allowed.
+    conn.execStatement(`SET plan_cache_mode = force_generic_plan`);
+    conn.execStatement(`SET jit = off`);
     foreach (name, sql; allStatements)
         conn.prepareStatement(name, sql);
 }
