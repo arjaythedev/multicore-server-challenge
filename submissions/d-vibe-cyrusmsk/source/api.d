@@ -1,220 +1,91 @@
-/**
- * The 19 Conduit endpoints (SPEC.md).
- *
- * Every handler reads its rows from Postgres while it is being served - there are
- * no response caches, query caches, in-memory table copies, or remembered JWT
- * verifications in this file. What is shared between requests is only patterns:
- * prepared statements, connections, and code.
- */
+/// The 19 Conduit endpoints (SPEC.md), served through vibe.d's URLRouter.
+///
+/// Every handler reads its rows from Postgres while it is being served: no
+/// response caches, no query caches, no in-memory table copies, no remembered
+/// verifications. Responses are built with vibe.data.json and written with
+/// `writeJsonBody`, which sets `Content-Length` on the way out.
 module conduit.api;
 
 import vibe.core.log;
+import vibe.http.router;
 import vibe.http.server;
+import vibe.data.json;
+import vibe.db.postgresql;
 import vibe.stream.operations : readAllUTF8;
 
-import conduit.body;
+import conduit.auth;
 import conduit.bcrypt;
 import conduit.db;
-import conduit.db : Name, lastStatement;
-import conduit.jwt;
-import conduit.json;
 
-import dpq2;
-import dpq2.args : QueryParams;
-import dpq2.result : Answer, ResponseException;
-
-import std.array : Appender, appender;
-import std.conv : to;
-import std.string : indexOf;
+import std.datetime : SysTime;
+import std.format : format;
 import std.typecons : Nullable;
 
-/// The per-thread database pool. A vibe.d Postgres connection belongs to the
-/// thread (and fiber pool) that opened it, so this has to be thread-local.
-static Db g_db;
+/// The database pool of the worker thread that serves this request. A vibe.d
+/// connection belongs to the thread that opened it, so each thread sets its
+/// own pool once, in `workerMain`.
+static Db pool;
 
-/// Called once per thread, from that thread.
-void setDb(Db db) @trusted nothrow
+/// Called once per worker thread, from that thread.
+void setPool(Db db) nothrow
 {
-    g_db = db;
+    pool = db;
 }
 
-/// Prepares a statement call. The result comes back as text, which for these
-/// queries is what the JSON response wants almost verbatim.
-QueryParams params(Args...)(string stmt, Args args)
+/// Registers the 19 endpoints. `/api/articles/feed` comes before
+/// `/api/articles/:slug`, otherwise "feed" would match `:slug`.
+void registerRoutes(URLRouter router)
 {
-    QueryParams p;
-    p.sqlCommand = stmt;
-    p.resultFormat = ValueFormat.TEXT;
-    static if (Args.length > 0)
-        p.argsVariadic(args);
-    return p;
+    router.post("/api/users", &register);
+    router.post("/api/users/login", &login);
+    router.get("/api/user", &currentUser);
+    router.put("/api/user", &updateUser);
+
+    router.get("/api/profiles/:username", &getProfile);
+    router.post("/api/profiles/:username/follow", &followProfile);
+    router.delete_("/api/profiles/:username/follow", &unfollowProfile);
+
+    router.get("/api/articles/feed", &feed);
+    router.get("/api/articles", &listArticles);
+    router.post("/api/articles", &createArticle);
+    router.get("/api/articles/:slug/comments", &listComments);
+    router.post("/api/articles/:slug/comments", &createComment);
+    router.delete_("/api/articles/:slug/comments/:id", &deleteComment);
+    router.post("/api/articles/:slug/favorite", &favoriteArticle);
+    router.delete_("/api/articles/:slug/favorite", &unfavoriteArticle);
+    router.get("/api/articles/:slug", &getArticle);
+    router.put("/api/articles/:slug", &updateArticle);
+    router.delete_("/api/articles/:slug", &deleteArticle);
+
+    router.get("/api/tags", &tags);
 }
 
-// ---------------------------------------------------------------------------
-// request handling
-
-/// vibe.d entry point for every connection.
-void handleRequest(scope HTTPServerRequest req, scope HTTPServerResponse res)
-@trusted
+/// vibe.d's own error path (unknown paths, malformed requests, uncaught
+/// exceptions): the same `{"errors": {"body": [...]}}` shape as every error.
+void errorPage(HTTPServerRequest req, HTTPServerResponse res, HTTPServerErrorInfo error)
 {
-    try dispatch(req, res);
-    catch (Exception e) {
-        logError("request failed in %s: %s", lastStatement, e.msg);
-        try sendError(res, 500, "internal error");
-        catch (Exception) {
-        }
-    }
-}
-
-private void dispatch(scope HTTPServerRequest req, scope HTTPServerResponse res)
-@trusted
-{
-    const(char)[] path = req.requestURI;
-    immutable q = path.indexOf('?');
-    if (q >= 0) path = path[0 .. cast(size_t) q];
-
-    // tolerate an absolute request target ("GET http://host/api/...").
-    if (path.length >= 7 && path[0 .. 7] == "http://") {
-        immutable slash = path.indexOf('/', 7);
-        path = slash < 0 ? "/" : path[cast(size_t) slash .. $];
-    }
-
-    if (path.length < 4 || path[0 .. 4] != "/api") {
-        sendError(res, 404, "not found");
+    if (res.headerWritten)
         return;
-    }
-
-    switch (req.method) {
-    case HTTPMethod.GET:
-        routeGet(req, res, path);
-        return;
-    case HTTPMethod.POST:
-        routePost(req, res, path);
-        return;
-    case HTTPMethod.PUT:
-        routePut(req, res, path);
-        return;
-    case HTTPMethod.DELETE:
-        routeDelete(req, res, path);
-        return;
-    default:
-        sendError(res, 404, "not found");
-        return;
-    }
-}
-
-/// True when `path` is `prefix` plus exactly one non-empty segment.
-private bool segment(const(char)[] path, const(char)[] prefix, out const(char)[] rest) pure nothrow @safe
-{
-    if (path.length <= prefix.length || path[0 .. prefix.length] != prefix) return false;
-    rest = path[prefix.length .. $];
-    return rest.length > 0 && rest.indexOf('/') < 0;
-}
-
-/// True when `path` is `prefix` plus exactly two non-empty segments.
-private bool twoSegments(const(char)[] path, const(char)[] prefix, out const(char)[] first,
-        out const(char)[] second) pure nothrow @safe
-{
-    if (path.length <= prefix.length || path[0 .. prefix.length] != prefix) return false;
-    auto rest = path[prefix.length .. $];
-    immutable slash = rest.indexOf('/');
-    if (slash <= 0 || cast(size_t) slash + 1 >= rest.length) return false;
-    first = rest[0 .. cast(size_t) slash];
-    second = rest[cast(size_t) slash + 1 .. $];
-    return second.indexOf('/') < 0;
-}
-
-/// True when `path` is `prefix` plus exactly three non-empty segments.
-private bool threeSegments(const(char)[] path, const(char)[] prefix, out const(char)[] first,
-        out const(char)[] second, out const(char)[] third) pure nothrow @safe
-{
-    if (path.length <= prefix.length || path[0 .. prefix.length] != prefix) return false;
-    auto rest = path[prefix.length .. $];
-    immutable s1 = rest.indexOf('/');
-    if (s1 <= 0 || cast(size_t) s1 + 1 >= rest.length) return false;
-    auto tail = rest[cast(size_t) s1 + 1 .. $];
-    immutable s2 = tail.indexOf('/');
-    if (s2 <= 0 || cast(size_t) s2 + 1 >= tail.length) return false;
-    first = rest[0 .. cast(size_t) s1];
-    second = tail[0 .. cast(size_t) s2];
-    third = tail[cast(size_t) s2 + 1 .. $];
-    return third.indexOf('/') < 0;
-}
-
-private void routeGet(scope HTTPServerRequest req, scope HTTPServerResponse res, const(char)[] path)
-@trusted
-{
-    if (path == "/api/tags") return sendTags(req, res);
-    if (path == "/api/user") return sendCurrentUser(req, res);
-    if (path == "/api/articles") return sendArticleList(req, res);
-    if (path == "/api/articles/feed") return sendFeed(req, res);
-
-    const(char)[] a, b;
-    if (twoSegments(path, "/api/articles/", a, b) && b == "comments")
-        return sendComments(req, res, a);
-    if (segment(path, "/api/articles/", a)) return sendArticle(req, res, a);
-    if (segment(path, "/api/profiles/", a)) return sendProfile(req, res, a);
-    sendError(res, 404, "not found");
-}
-
-private void routePost(scope HTTPServerRequest req, scope HTTPServerResponse res, const(char)[] path)
-@trusted
-{
-    if (path == "/api/users") return sendRegister(req, res);
-    if (path == "/api/users/login") return sendLogin(req, res);
-    if (path == "/api/articles") return createArticle(req, res);
-
-    const(char)[] a, b;
-    if (twoSegments(path, "/api/articles/", a, b) && b == "favorite")
-        return favoriteArticle(req, res, a, true);
-    if (twoSegments(path, "/api/articles/", a, b) && b == "comments")
-        return createComment(req, res, a);
-    if (twoSegments(path, "/api/profiles/", a, b) && b == "follow")
-        return followProfile(req, res, a, true);
-    sendError(res, 404, "not found");
-}
-
-private void routePut(scope HTTPServerRequest req, scope HTTPServerResponse res, const(char)[] path)
-@trusted
-{
-    if (path == "/api/user") return updateUser(req, res);
-    const(char)[] a;
-    if (segment(path, "/api/articles/", a)) return updateArticle(req, res, a);
-    sendError(res, 404, "not found");
-}
-
-private void routeDelete(scope HTTPServerRequest req, scope HTTPServerResponse res, const(char)[] path)
-@trusted
-{
-    const(char)[] a, b, c;  // slug, sub-path, comment id
-    if (twoSegments(path, "/api/profiles/", a, b) && b == "follow")
-        return followProfile(req, res, a, false);
-    if (twoSegments(path, "/api/articles/", a, b) && b == "favorite")
-        return favoriteArticle(req, res, a, false);
-    if (threeSegments(path, "/api/articles/", a, b, c) && b == "comments")
-        return deleteComment(req, res, a, c);
-    if (segment(path, "/api/articles/", a)) return deleteArticle(req, res, a);
-    sendError(res, 404, "not found");
+    writeError(res, error.code, error.message.length ? error.message : "error");
 }
 
 // ---------------------------------------------------------------------------
 // responses
 
-private void sendBody(HTTPServerResponse res, int status, const(char)[] body) @safe
+private void writeJson(HTTPServerResponse res, int status, Json body)
 {
-    res.writeBody(cast(const(ubyte)[]) body, status, "application/json");
+    // Chunked: a single serialization pass. The default counts the body first
+    // (a full extra serialization) to set Content-Length; chunk framing on a
+    // buffered stream costs far less than serializing twice.
+    res.writeJsonBody(body, status, true);
 }
 
-void sendError(HTTPServerResponse res, int status, const(char)[] message) @safe
+private void writeError(HTTPServerResponse res, int status, string message)
 {
-    auto b = JsonBuf.init;
-    b.put(`{"errors":{"body":[`);
-    b.putJsonString(message);
-    b.put(`]}}`);
-    sendBody(res, status, b[]);
+    writeJson(res, status, Json(["errors": Json(["body": Json([Json(message)])])]));
 }
 
-private void sendNoContent(HTTPServerResponse res) @safe
+private void writeNoContent(HTTPServerResponse res)
 {
     res.statusCode = 204;
     res.writeVoidBody();
@@ -226,46 +97,48 @@ private void sendNoContent(HTTPServerResponse res) @safe
 private struct Viewer
 {
     long id;
-    const(char)[] token;
+    string token;
     bool present;
 }
 
-/// Reads the Authorization header and verifies the token. The signature and exp
-/// are checked on every request.
-private Viewer viewerOf(HTTPServerRequest req) @safe
+/// Reads the `Authorization` header and verifies the token: HS256 signature
+/// and `exp`, checked on every request.
+private Viewer viewerOf(HTTPServerRequest req)
 {
-    auto h = "Authorization" in req.headers;
-    if (h is null) return Viewer(0, null, false);
-    const(char)[] scheme = "Token ";
-    if ((*h).length <= scheme.length || (*h)[0 .. scheme.length] != scheme)
+    auto header = "Authorization" in req.headers;
+    if (!header)
+        return Viewer(0, null, false);
+    if ((*header).length <= 6 || (*header)[0 .. 6] != "Token ")
         return Viewer(0, null, true);
-    const(char)[] tok = (*h)[scheme.length .. $];
+    string token = (*header)[6 .. $];
     long id;
-    if (!verifyToken(tok, id)) return Viewer(0, null, true);
-    return Viewer(id, tok, true);
+    if (!verifyToken(token, id))
+        return Viewer(0, null, true);
+    return Viewer(id, token, true);
 }
 
-/// True when the request presents a valid token; otherwise a 401 is written.
-private bool requireAuth(HTTPServerResponse res, HTTPServerRequest req, out long viewer,
-        out const(char)[] token) @safe
+/// A missing or invalid token is a 401.
+private bool requireAuth(HTTPServerResponse res, HTTPServerRequest req, out long viewer, out string token)
 {
-    auto v = viewerOf(req);
-    viewer = v.id;
-    token = v.token;
-    if (!v.present || v.id == 0) {
-        sendError(res, 401, "unauthorized");
+    auto auth = viewerOf(req);
+    viewer = auth.id;
+    token = auth.token;
+    if (!auth.present || auth.id == 0)
+    {
+        writeError(res, 401, "unauthorized");
         return false;
     }
     return true;
 }
 
-/// True when the request is anonymous or presents a valid token.
-private bool optionalAuth(HTTPServerResponse res, HTTPServerRequest req, out long viewer) @safe
+/// No header means anonymous; a present but invalid token is a 401.
+private bool optionalAuth(HTTPServerResponse res, HTTPServerRequest req, out long viewer)
 {
-    auto v = viewerOf(req);
-    viewer = v.id;
-    if (v.present && v.id == 0) {
-        sendError(res, 401, "unauthorized");
+    auto auth = viewerOf(req);
+    viewer = auth.id;
+    if (auth.present && auth.id == 0)
+    {
+        writeError(res, 401, "unauthorized");
         return false;
     }
     return true;
@@ -274,103 +147,231 @@ private bool optionalAuth(HTTPServerResponse res, HTTPServerRequest req, out lon
 // ---------------------------------------------------------------------------
 // request bodies
 
-/// Reads the wrapper object of a request body (for example `{"user": {...}}`),
-/// or writes a 422 and returns false.
-private bool readWrapper(HTTPServerResponse res, HTTPServerRequest req, const(char)[] wrapper,
-        out const(char)[] inner) @safe
+/// Reads the wrapper object of a request body (`{"user": {...}}`), or writes
+/// a 422. Anything malformed, missing, or not an object is a 422.
+private bool readWrapper(HTTPServerRequest req, HTTPServerResponse res, string wrapper, out Json inner)
 {
-    string body;
-    try body = req.bodyReader.readAllUTF8();
-    catch (Exception e) {
-        logDebug("failed to read request body: %s", e.msg);
-        sendError(res, 422, "invalid body");
+    Json top;
+    try
+        top = parseJsonString(req.bodyReader.readAllUTF8());
+    catch (Exception)
+    {
+        writeError(res, 422, "invalid body");
         return false;
     }
-    if (!findWrapper(body, wrapper, inner)) {
-        sendError(res, 422, "invalid body");
+    if (top.type != Json.Type.object)
+    {
+        writeError(res, 422, "invalid body");
         return false;
     }
+    auto members = top.get!(Json[string]);
+    auto found = wrapper in members;
+    if (!found || (*found).type != Json.Type.object)
+    {
+        writeError(res, 422, "invalid body");
+        return false;
+    }
+    inner = *found;
     return true;
 }
 
-/// A string member's raw value, "missing" when absent or null.
-private enum Field
+/// A member's value: absent (or null) reads as missing, a string reads as
+/// itself, anything else is invalid.
+private struct Field
 {
-    missing,
-    nullValue,
-    text,
-    other
+    bool present;
+    string value;
+    bool valid = true;
 }
 
-private Field field(const(char)[] object, const(char)[] key, out const(char)[] raw) @safe
+private Field field(Json obj, string key)
 {
-    auto o = JsonObject.init;
-    if (!o.parseObject(object)) return Field.other;
-    Member m;
-    while (o.next(m)) {
-        if (m.name == key) {
-            raw = m.value;
-            switch (kindOf(raw)) {
-                case JsonKind.text: return Field.text;
-                case JsonKind.nullValue: return Field.nullValue;
-                default: return Field.other;
-            }
-        }
-    }
-    return Field.missing;
+    auto members = obj.get!(Json[string]);
+    auto found = key in members;
+    if (!found)
+        return Field(false, null, true);
+    if ((*found).type == Json.Type.null_)
+        return Field(false, null, true);
+    if ((*found).type != Json.Type.string)
+        return Field(false, null, false);
+    return Field(true, (*found).get!string, true);
 }
 
 /// A required non-empty string member, or 422.
-private bool requiredString(HTTPServerResponse res, const(char)[] object, const(char)[] key,
-        out Appender!(char[]) value) @safe
+private bool reqString(HTTPServerResponse res, Json obj, string key, out string value)
 {
-    const(char)[] raw;
-    immutable f = field(object, key, raw);
-    if (f != Field.text || raw.length == 2) {
-        sendError(res, 422, key ~ " must be a non-empty string");
+    auto f = field(obj, key);
+    if (!f.valid || !f.present || f.value.length == 0)
+    {
+        writeError(res, 422, key ~ " must be a non-empty string");
         return false;
     }
-    if (!decodeString(raw, value)) {
-        sendError(res, 422, key ~ " must be a non-empty string");
+    value = f.value;
+    return true;
+}
+
+/// An optional string member: absent or null leaves it unset, a string sets
+/// it, anything else is a 422.
+private bool optString(HTTPServerResponse res, Json obj, string key, bool nonEmpty,
+        out bool present, out string value)
+{
+    auto f = field(obj, key);
+    if (!f.valid || (nonEmpty && f.present && f.value.length == 0))
+    {
+        writeError(res, 422, key ~ " must be a non-empty string");
         return false;
+    }
+    present = f.present;
+    value = f.value;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// pages and ids
+
+/// `limit` (default 20, 1..100) and `offset` (default 0, >= 0), or 422.
+private bool pageArgs(HTTPServerResponse res, HTTPServerRequest req, out long limit, out long offset)
+{
+    limit = 20;
+    offset = 0;
+    auto query = req.query;
+    if (auto value = "limit" in query)
+    {
+        if (!parseDigits(*value, limit) || limit < 1 || limit > 100)
+        {
+            writeError(res, 422, "limit must be an integer 1..100");
+            return false;
+        }
+    }
+    if (auto value = "offset" in query)
+    {
+        if (!parseDigits(*value, offset) || offset < 0)
+        {
+            writeError(res, 422, "offset must be an integer >= 0");
+            return false;
+        }
     }
     return true;
 }
 
-/// An optional string member: absent or null leaves it unset, a string sets it,
-/// anything else is a 422.
-private bool optionalString(HTTPServerResponse res, const(char)[] object, const(char)[] key,
-        bool nonEmpty, out bool present, out Appender!(char[]) value) @safe
+/// ASCII digits only, no sign, no spaces, fitting in a long. Leading zeros are
+/// fine (`limit=05`); a value that overflows is not.
+private bool parseDigits(const(char)[] s, out long value) pure nothrow @safe
 {
-    const(char)[] raw;
-    immutable f = field(object, key, raw);
-    if (f == Field.missing || f == Field.nullValue) {
-        present = false;
-        return true;
-    }
-    if (f != Field.text || (nonEmpty && raw.length == 2)) {
-        sendError(res, 422, key ~ " must be a non-empty string");
+    value = 0;
+    if (s.length == 0 || s.length > 18)
         return false;
+    long parsed;
+    foreach (c; s)
+    {
+        if (c < '0' || c > '9')
+            return false;
+        parsed = parsed * 10 + (c - '0');
     }
-    if (!decodeString(raw, value)) {
-        sendError(res, 422, key ~ " must be a non-empty string");
-        return false;
-    }
-    present = true;
+    value = parsed;
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// rows to JSON
+
+/// A UTC timestamp as SPEC.md wants it: RFC 3339, exactly 3 fractional digits.
+private string formatTs(SysTime time)
+{
+    auto utc = time.toUTC();
+    return format!"%04d-%02d-%02dT%02d:%02d:%02d.%03dZ"(
+        utc.year, utc.month, utc.day, utc.hour, utc.minute, utc.second,
+        utc.fracSecs.total!"msecs");
+}
+
+/// A nullable text column: JSON null, or the string.
+private Json nullable(Row row, size_t column)
+{
+    return row[column].isNull ? Json(null) : Json(row[column].as!string);
+}
+
+/// The author object shared by articles and comments.
+private Json profileJson(Row row, size_t username)
+{
+    return Json([
+        "username": Json(row[username].as!string),
+        "bio": nullable(row, username + 1),
+        "image": nullable(row, username + 2),
+        "following": Json(row[username + 3].as!bool),
+    ]);
+}
+
+/// An article, with or without its body. The column layout is the reference
+/// SQL's: id, slug, title, description, [body,] created, updated, tag list,
+/// favorites count, favorited, author columns.
+private Json articleJson(Row row, bool withBody)
+{
+    auto created = withBody ? 5 : 4;
+    auto tags = withBody ? 7 : 6;
+    auto author = withBody ? 10 : 9;
+    Json article = Json([
+        "slug": Json(row[1].as!string),
+        "title": Json(row[2].as!string),
+        "description": Json(row[3].as!string),
+        "tagList": tagJson(row, tags),
+        "createdAt": Json(formatTs(row[created].as!SysTime)),
+        "updatedAt": Json(formatTs(row[created + 1].as!SysTime)),
+        "favorited": Json(row[tags + 2].as!bool),
+        "favoritesCount": Json(row[tags + 1].as!long),
+        "author": profileJson(row, author),
+    ]);
+    if (withBody)
+        article["body"] = Json(row[4].as!string);
+    return article;
+}
+
+/// A Postgres `text[]` as a JSON array of strings.
+private Json tagJson(Row row, size_t column)
+{
+    auto tags = Json.emptyArray;
+    auto array = row[column].asArray;
+    foreach (i; 0 .. array.length)
+        tags ~= Json(array[i].as!string);
+    return tags;
+}
+
+private Json commentJson(Row row)
+{
+    return Json([
+        "id": Json(row[0].as!long),
+        "createdAt": Json(formatTs(row[2].as!SysTime)),
+        "updatedAt": Json(formatTs(row[3].as!SysTime)),
+        "body": Json(row[1].as!string),
+        "author": profileJson(row, 4),
+    ]);
+}
+
+private Json userJson(Row row, string token)
+{
+    return Json([
+        "username": Json(row[1].as!string),
+        "email": Json(row[2].as!string),
+        "bio": nullable(row, 3),
+        "image": nullable(row, 4),
+        "token": Json(token),
+    ]);
 }
 
 /// Runs a statement whose unique violations (a taken username or email) are a
 /// 422. `ok` is false when the response was already written.
-private Answer execOrTaken(HTTPServerResponse res, QueryParams p, out bool ok) @trusted
+private Answer execUnique(HTTPServerResponse res, QueryParams params, out bool ok)
 {
-    try {
+    try
+    {
         ok = true;
-        return g_db.exec(p);
-    } catch (Exception e) {
+        return pool.lockConnection.execPreparedStatement(params);
+    }
+    catch (Exception e)
+    {
         ok = false;
-        if (isDuplicate(e)) {
-            sendError(res, 422, "username or email is already taken");
+        if (isDuplicate(e))
+        {
+            writeError(res, 422, "username or email is already taken");
             return null;
         }
         throw e;
@@ -378,376 +379,219 @@ private Answer execOrTaken(HTTPServerResponse res, QueryParams p, out bool ok) @
 }
 
 /// True when a statement failed on a unique constraint (SPEC.md: 422).
-private bool isDuplicate(Exception e) @trusted
+private bool isDuplicate(Exception e)
 {
-    auto re = cast(ResponseException) e;
-    if (re is null) return false;
-    try {
-        return re.result.resultErrorField('C') == "23505";
-    } catch (Exception) {
+    auto response = cast(ResponseException) e;
+    if (!response)
         return false;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// pages
-
-/// Parses limit (default 20, 1..100) and offset (default 0, >= 0).
-private bool pageArgs(HTTPServerResponse res, HTTPServerRequest req, out long limit,
-        out long offset) @safe
-{
-    limit = 20;
-    offset = 0;
-    auto q = req.query;
-    if (auto pv = "limit" in q) {
-        if (!parseDigits(*pv, limit) || limit < 1 || limit > 100) {
-            sendError(res, 422, "limit must be an integer 1..100");
-            return false;
-        }
-    }
-    if (auto pv = "offset" in q) {
-        if (!parseDigits(*pv, offset) || offset < 0) {
-            sendError(res, 422, "offset must be an integer >= 0");
-            return false;
-        }
-    }
-    return true;
-}
-
-/// ASCII digits only, no sign, no spaces, fitting in a long.
-private bool parseDigits(const(char)[] s, out long value) pure nothrow @safe
-{
-    value = 0;
-    if (s.length == 0 || s.length > 18) return false;
-    long v;
-    foreach (c; s) {
-        if (c < '0' || c > '9') return false;
-        v = v * 10 + (c - '0');
-    }
-    value = v;
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-// JSON helpers for rows
-
-/// Writes a nullable text column as `null` or a JSON string.
-private void putNullable(ref JsonBuf b, immutable(Row) row, size_t col) @trusted
-{
-    auto v = row[col];
-    if (v.isNull) {
-        b.putNull();
-        return;
-    }
-    b.putJsonString(cast(const(char)[]) v.data);
-}
-
-private void putText(ref JsonBuf b, immutable(Row) row, size_t col) @trusted
-{
-    b.putJsonString(cast(const(char)[]) row[col].data);
-}
-
-private void putTimestamp(ref JsonBuf b, immutable(Row) row, size_t col) @trusted
-{
-    auto t = cast(const(char)[]) row[col].data;
-    if (t.length < 19 || t[10] != ' ') {
-        // Not a timestamptz rendering: keep the response well-formed.
-        b.putJsonString(t);
-        return;
-    }
-    b.putByte('"');
-    b.putTimestamp(t);
-    b.putByte('"');
-}
-
-private void putBool(ref JsonBuf b, immutable(Row) row, size_t col) @trusted
-{
-    auto t = cast(const(char)[]) row[col].data;
-    b.putBool(t.length == 1 && t[0] == 't');
-}
-
-/// Writes a bigint column as a JSON integer (Postgres text digits).
-private void putIntColumn(ref JsonBuf b, immutable(Row) row, size_t col) @trusted
-{
-    b.put(cast(const(char)[]) row[col].data);
-}
-
-private void putArray(ref JsonBuf b, immutable(Row) row, size_t col) @trusted
-{
-    // Postgres renders an empty ARRAY(...) as "{}", but a changed query could
-    // return NULL, and an article's tag list is an array either way.
-    auto v = row[col];
-    if (v.isNull) {
-        b.put("[]");
-        return;
-    }
-    b.putStringArray(cast(const(char)[]) v.data);
-}
-
-/// The author object shared by articles and comments.
-private void putProfile(ref JsonBuf b, immutable(Row) row, size_t usernameCol) @trusted
-{
-    b.put(`{"username":`);
-    putText(b, row, usernameCol);
-    b.put(`,"bio":`);
-    putNullable(b, row, usernameCol + 1);
-    b.put(`,"image":`);
-    putNullable(b, row, usernameCol + 2);
-    b.put(`,"following":`);
-    putBool(b, row, usernameCol + 3);
-    b.putByte('}');
+    try
+        return response.result.resultErrorField('C') == "23505";
+    catch (Exception)
+        return false;
 }
 
 // ---------------------------------------------------------------------------
 // users
 
 /// POST /api/users
-private void sendRegister(scope HTTPServerRequest req, scope HTTPServerResponse res)
-@trusted
+private void register(HTTPServerRequest req, HTTPServerResponse res)
 {
-    const(char)[] inner;
-    if (!readWrapper(res, req, "user", inner)) return;
+    Json inner;
+    if (!readWrapper(req, res, "user", inner))
+        return;
+    string username, email, password;
+    if (!reqString(res, inner, "username", username))
+        return;
+    if (!reqString(res, inner, "email", email))
+        return;
+    if (!reqString(res, inner, "password", password))
+        return;
 
-    auto username = appender!(char[]);
-    auto email = appender!(char[]);
-    auto password = appender!(char[]);
-    if (!requiredString(res, inner, "username", username)) return;
-    if (!requiredString(res, inner, "email", email)) return;
-    if (!requiredString(res, inner, "password", password)) return;
-
-    auto hash = hashPassword(password.data);
-    if (hash is null) {
-        sendError(res, 422, "password is too long");
+    auto hash = hashPassword(password);
+    if (!hash)
+    {
+        writeError(res, 422, "password is too long");
         return;
     }
 
+    QueryParams params;
+    params.preparedStatementName = Name.insertUser;
+    params.argsVariadic(username, email, hash);
     bool ok;
-    auto ans = execOrTaken(res, params(Name.insertUser, username.data, email.data, hash), ok);
-    if (!ok) return;
-    if (ans.length != 1) {
-        sendError(res, 500, "internal error");
+    auto answer = execUnique(res, params, ok);
+    if (!ok)
+        return;
+    if (answer.length != 1)
+    {
+        writeError(res, 500, "internal error");
         return;
     }
-    immutable id = parseId(ans[0]);
-
-    auto b = JsonBuf.init;
-    b.put(`{"user":{"username":`);
-    putText(b, ans[0], 1);
-    b.put(`,"email":`);
-    putText(b, ans[0], 2);
-    b.put(`,"bio":`);
-    putNullable(b, ans[0], 3);
-    b.put(`,"image":`);
-    putNullable(b, ans[0], 4);
-    b.put(`,"token":`);
-    b.putJsonString(issueToken(id, nowUnix()));
-    b.put(`}}`);
-    sendBody(res, 201, b[]);
+    writeJson(res, 201, Json(["user": userJson(answer[0], issueToken(answer[0][0].as!long, nowUnix()))]));
 }
 
 /// POST /api/users/login
-private void sendLogin(scope HTTPServerRequest req, scope HTTPServerResponse res)
-@trusted
+private void login(HTTPServerRequest req, HTTPServerResponse res)
 {
-    const(char)[] inner;
-    if (!readWrapper(res, req, "user", inner)) return;
+    Json inner;
+    if (!readWrapper(req, res, "user", inner))
+        return;
+    string email, password;
+    if (!reqString(res, inner, "email", email))
+        return;
+    if (!reqString(res, inner, "password", password))
+        return;
 
-    auto email = appender!(char[]);
-    auto password = appender!(char[]);
-    if (!requiredString(res, inner, "email", email)) return;
-    if (!requiredString(res, inner, "password", password)) return;
-
-    auto ans = g_db.exec(params(Name.userByEmail, email.data));
-    if (ans.length == 0) {
-        sendError(res, 401, "invalid email or password");
+    QueryParams params;
+    params.preparedStatementName = Name.userByEmail;
+    params.argsVariadic(email);
+    auto answer = pool.lockConnection.execPreparedStatement(params);
+    if (answer.length == 0 || !verifyPassword(password, answer[0][5].as!string))
+    {
+        writeError(res, 401, "invalid email or password");
         return;
     }
-    immutable row = ans[0];
-    const(char)[] stored = cast(const(char)[]) row[5].data;
-    if (!verifyPassword(password.data, stored)) {
-        sendError(res, 401, "invalid email or password");
-        return;
-    }
-    immutable id = parseId(row);
-
-    auto b = JsonBuf.init;
-    b.put(`{"user":{"username":`);
-    putText(b, row, 1);
-    b.put(`,"email":`);
-    putText(b, row, 2);
-    b.put(`,"bio":`);
-    putNullable(b, row, 3);
-    b.put(`,"image":`);
-    putNullable(b, row, 4);
-    b.put(`,"token":`);
-    b.putJsonString(issueToken(id, nowUnix()));
-    b.put(`}}`);
-    sendBody(res, 200, b[]);
+    writeJson(res, 200, Json(["user": userJson(answer[0], issueToken(answer[0][0].as!long, nowUnix()))]));
 }
 
 /// GET /api/user
-private void sendCurrentUser(scope HTTPServerRequest req, scope HTTPServerResponse res)
-@trusted
+private void currentUser(HTTPServerRequest req, HTTPServerResponse res)
 {
     long viewer;
-    const(char)[] token;
-    if (!requireAuth(res, req, viewer, token)) return;
+    string token;
+    if (!requireAuth(res, req, viewer, token))
+        return;
 
-    auto ans = g_db.exec(params(Name.userById, viewer));
-    if (ans.length == 0) {
-        sendError(res, 401, "unauthorized");
+    QueryParams params;
+    params.preparedStatementName = Name.userById;
+    params.argsVariadic(viewer);
+    auto answer = pool.lockConnection.execPreparedStatement(params);
+    if (answer.length == 0)
+    {
+        writeError(res, 401, "unauthorized");
         return;
     }
-    auto b = JsonBuf.init;
-    b.put(`{"user":{"username":`);
-    putText(b, ans[0], 1);
-    b.put(`,"email":`);
-    putText(b, ans[0], 2);
-    b.put(`,"bio":`);
-    putNullable(b, ans[0], 3);
-    b.put(`,"image":`);
-    putNullable(b, ans[0], 4);
-    b.put(`,"token":`);
-    b.putJsonString(token);
-    b.put(`}}`);
-    sendBody(res, 200, b[]);
+    writeJson(res, 200, Json(["user": userJson(answer[0], token)]));
 }
 
 /// PUT /api/user
-private void updateUser(scope HTTPServerRequest req, scope HTTPServerResponse res)
-@trusted
+private void updateUser(HTTPServerRequest req, HTTPServerResponse res)
 {
     long viewer;
-    const(char)[] token;
-    if (!requireAuth(res, req, viewer, token)) return;
+    string token;
+    if (!requireAuth(res, req, viewer, token))
+        return;
+    Json inner;
+    if (!readWrapper(req, res, "user", inner))
+        return;
 
-    const(char)[] inner;
-    if (!readWrapper(res, req, "user", inner)) return;
+    string email, username, password, bio, image;
+    bool hasEmail, hasUsername, hasPassword, hasBio, hasImage;
+    if (!optString(res, inner, "email", true, hasEmail, email))
+        return;
+    if (!optString(res, inner, "username", true, hasUsername, username))
+        return;
+    if (!optString(res, inner, "password", true, hasPassword, password))
+        return;
+    if (!optString(res, inner, "bio", false, hasBio, bio))
+        return;
+    if (!optString(res, inner, "image", false, hasImage, image))
+        return;
 
-    auto email = appender!(char[]);
-    auto username = appender!(char[]);
-    auto password = appender!(char[]);
-    auto bio = appender!(char[]);
-    auto image = appender!(char[]);
-    bool haveEmail, haveUsername, havePassword, haveBio, haveImage;
-    if (!optionalString(res, inner, "email", true, haveEmail, email)) return;
-    if (!optionalString(res, inner, "username", true, haveUsername, username)) return;
-    if (!optionalString(res, inner, "password", true, havePassword, password)) return;
-    if (!optionalString(res, inner, "bio", false, haveBio, bio)) return;
-    if (!optionalString(res, inner, "image", false, haveImage, image)) return;
-
-    string hash = null;
-    if (havePassword) {
-        hash = hashPassword(password.data);
-        if (hash is null) {
-            sendError(res, 422, "password is too long");
+    Nullable!string hash;
+    if (hasPassword)
+    {
+        auto hashed = hashPassword(password);
+        if (!hashed)
+        {
+            writeError(res, 422, "password is too long");
             return;
         }
+        hash = hashed;
     }
 
+    QueryParams params;
+    params.preparedStatementName = Name.updateUser;
+    params.argsVariadic(viewer,
+        hasEmail ? Nullable!string(email) : Nullable!string.init,
+        hasUsername ? Nullable!string(username) : Nullable!string.init,
+        hash,
+        hasBio ? Nullable!string(bio) : Nullable!string.init,
+        hasImage ? Nullable!string(image) : Nullable!string.init);
     bool ok;
-    auto ans = execOrTaken(res, params(Name.updateUser, viewer,
-            haveEmail ? someText(email.data) : noText,
-            haveUsername ? someText(username.data) : noText,
-            havePassword ? someText(hash) : noText,
-            haveBio ? someText(bio.data) : noText,
-            haveImage ? someText(image.data) : noText), ok);
-    if (!ok) return;
-    if (ans.length != 1) {
-        sendError(res, 401, "unauthorized");
+    auto answer = execUnique(res, params, ok);
+    if (!ok)
+        return;
+    if (answer.length == 0)
+    {
+        writeError(res, 401, "unauthorized");
         return;
     }
-
-    auto b = JsonBuf.init;
-    b.put(`{"user":{"username":`);
-    putText(b, ans[0], 1);
-    b.put(`,"email":`);
-    putText(b, ans[0], 2);
-    b.put(`,"bio":`);
-    putNullable(b, ans[0], 3);
-    b.put(`,"image":`);
-    putNullable(b, ans[0], 4);
-    b.put(`,"token":`);
-    b.putJsonString(token);
-    b.put(`}}`);
-    sendBody(res, 200, b[]);
-}
-
-/// A set argument for the COALESCE(...) updates. The cast only drops `const`,
-/// because the driver reads the value while the query runs.
-private Nullable!string someText(const(char)[] s) @trusted
-{
-    return Nullable!string(cast(string) s);
-}
-
-/// An absent argument for the COALESCE(...) updates.
-private Nullable!string noText()
-{
-    return Nullable!string.init;
+    writeJson(res, 200, Json(["user": userJson(answer[0], token)]));
 }
 
 // ---------------------------------------------------------------------------
 // profiles
 
 /// GET /api/profiles/:username
-private void sendProfile(scope HTTPServerRequest req, scope HTTPServerResponse res, const(char)[] username)
-@trusted
+private void getProfile(HTTPServerRequest req, HTTPServerResponse res)
 {
     long viewer;
-    if (!optionalAuth(res, req, viewer)) return;
+    if (!optionalAuth(res, req, viewer))
+        return;
 
-    auto ans = g_db.exec(params(Name.profile, viewer, username));
-    if (ans.length == 0) {
-        sendError(res, 404, "profile not found");
+    QueryParams params;
+    params.preparedStatementName = Name.profile;
+    params.argsVariadic(viewer, req.params["username"]);
+    auto answer = pool.lockConnection.execPreparedStatement(params);
+    if (answer.length == 0)
+    {
+        writeError(res, 404, "profile not found");
         return;
     }
-    auto b = JsonBuf.init;
-    b.put(`{"profile":{`);
-    // same shape as an article's author
-    b.put(`"username":`);
-    putText(b, ans[0], 1);
-    b.put(`,"bio":`);
-    putNullable(b, ans[0], 2);
-    b.put(`,"image":`);
-    putNullable(b, ans[0], 3);
-    b.put(`,"following":`);
-    putBool(b, ans[0], 4);
-    b.put(`}}`);
-    sendBody(res, 200, b[]);
+    writeJson(res, 200, Json(["profile": profileJson(answer[0], 1)]));
 }
 
 /// POST and DELETE /api/profiles/:username/follow
-private void followProfile(scope HTTPServerRequest req, scope HTTPServerResponse res,
-        const(char)[] username, bool follow)
-@trusted
+private void follow(HTTPServerRequest req, HTTPServerResponse res, bool follow)
 {
     long viewer;
-    const(char)[] token;
-    if (!requireAuth(res, req, viewer, token)) return;
+    string token;
+    if (!requireAuth(res, req, viewer, token))
+        return;
 
-    auto ans = g_db.exec(params(Name.userByUsername, username));
-    if (ans.length == 0) {
-        sendError(res, 404, "profile not found");
+    QueryParams lookup;
+    lookup.preparedStatementName = Name.userByUsername;
+    lookup.argsVariadic(req.params["username"]);
+    auto conn = pool.lockConnection;
+    auto found = conn.execPreparedStatement(lookup);
+    if (found.length == 0)
+    {
+        writeError(res, 404, "profile not found");
         return;
     }
-    immutable followee = parseId(ans[0]);
+    auto followee = found[0][0].as!long;
 
-    if (follow)
-        g_db.exec(params(Name.insertFollow, viewer, followee));
-    else
-        g_db.exec(params(Name.deleteFollow, viewer, followee));
+    QueryParams change;
+    change.preparedStatementName = follow ? Name.insertFollow : Name.deleteFollow;
+    change.argsVariadic(viewer, followee);
+    conn.execPreparedStatement(change);
 
-    auto b = JsonBuf.init;
-    b.put(`{"profile":{"username":`);
-    putText(b, ans[0], 1);
-    b.put(`,"bio":`);
-    putNullable(b, ans[0], 2);
-    b.put(`,"image":`);
-    putNullable(b, ans[0], 3);
-    b.put(`,"following":`);
-    b.putBool(follow);
-    b.put(`}}`);
-    sendBody(res, 200, b[]);
+    writeJson(res, 200, Json(["profile": Json([
+        "username": Json(found[0][1].as!string),
+        "bio": nullable(found[0], 2),
+        "image": nullable(found[0], 3),
+        "following": Json(follow),
+    ])]));
+}
+
+private void followProfile(HTTPServerRequest req, HTTPServerResponse res)
+{
+    follow(req, res, true);
+}
+
+private void unfollowProfile(HTTPServerRequest req, HTTPServerResponse res)
+{
+    follow(req, res, false);
 }
 
 // ---------------------------------------------------------------------------
@@ -758,564 +602,448 @@ private enum ListKind
     all,
     tag,
     author,
-    favorited
+    favorited,
 }
 
-/// GET /api/articles
-private void sendArticleList(scope HTTPServerRequest req, scope HTTPServerResponse res)
-@trusted
+/// GET /api/articles. With more than one filter, the first non-empty one in
+/// the order tag, author, favorited applies.
+private void listArticles(HTTPServerRequest req, HTTPServerResponse res)
 {
     long viewer;
-    if (!optionalAuth(res, req, viewer)) return;
-
+    if (!optionalAuth(res, req, viewer))
+        return;
     long limit, offset;
-    if (!pageArgs(res, req, limit, offset)) return;
+    if (!pageArgs(res, req, limit, offset))
+        return;
 
-    // SPEC.md: "If more than one is given, only the first in that order applies",
-    // and an empty value counts as not given.
-    auto q = req.query;
+    auto query = req.query;
     ListKind kind = ListKind.all;
-    const(char)[] filter;
-    if (auto pv = "tag" in q) {
-        filter = *pv;
+    string filter;
+    if (auto value = "tag" in query)
+    {
+        filter = *value;
         kind = ListKind.tag;
     }
-    if (filter.length == 0) {
-        if (auto pv = "author" in q) {
-            filter = *pv;
+    if (!filter.length)
+    {
+        if (auto value = "author" in query)
+        {
+            filter = *value;
             kind = ListKind.author;
         }
     }
-    if (filter.length == 0) {
-        if (auto pv = "favorited" in q) {
-            filter = *pv;
+    if (!filter.length)
+    {
+        if (auto value = "favorited" in query)
+        {
+            filter = *value;
             kind = ListKind.favorited;
         }
     }
-    if (filter.length == 0) kind = ListKind.all;
+    if (!filter.length)
+        kind = ListKind.all;
 
-    auto pCount = params(Name.countAll);
-    auto pList = params(Name.listAll, viewer, limit, offset);
-    final switch (kind) {
+    QueryParams page, count;
+    final switch (kind)
+    {
     case ListKind.all:
+        page.preparedStatementName = Name.listAll;
+        page.argsVariadic(viewer, limit, offset);
+        count.preparedStatementName = Name.countAll;
         break;
     case ListKind.tag:
-        pCount = params(Name.countByTag, filter);
-        pList = params(Name.listByTag, viewer, limit, offset, filter);
+        page.preparedStatementName = Name.listByTag;
+        page.argsVariadic(viewer, limit, offset, filter);
+        count.preparedStatementName = Name.countByTag;
+        count.argsVariadic(filter);
         break;
     case ListKind.author:
-        pCount = params(Name.countByAuthor, filter);
-        pList = params(Name.listByAuthor, viewer, limit, offset, filter);
+        page.preparedStatementName = Name.listByAuthor;
+        page.argsVariadic(viewer, limit, offset, filter);
+        count.preparedStatementName = Name.countByAuthor;
+        count.argsVariadic(filter);
         break;
     case ListKind.favorited:
-        pCount = params(Name.countByFavorite, filter);
-        pList = params(Name.listByFavorite, viewer, limit, offset, filter);
+        page.preparedStatementName = Name.listByFavorite;
+        page.argsVariadic(viewer, limit, offset, filter);
+        count.preparedStatementName = Name.countByFavorite;
+        count.argsVariadic(filter);
         break;
     }
 
-    auto b = JsonBuf.init;
-    b.reserve(4 * 1024);
-    auto pair = g_db.execPair(pList, pCount);
-    b.put(`{"articles":`);
-    appendListRows(b, pair.a);
-    b.put(`,"articlesCount":`);
-    appendCountRows(b, pair.b);
-    b.putByte('}');
-    sendBody(res, 200, b[]);
+    auto conn = pool.lockConnection;
+    auto rows = conn.execPreparedStatement(page);
+    auto total = conn.execPreparedStatement(count);
+    auto articles = Json.emptyArray;
+    foreach (i; 0 .. rows.length)
+        articles ~= articleJson(rows[i], false);
+    writeJson(res, 200, Json(["articles": articles, "articlesCount": Json(total[0][0].as!long)]));
 }
 
 /// GET /api/articles/feed
-private void sendFeed(scope HTTPServerRequest req, scope HTTPServerResponse res)
-@trusted
+private void feed(HTTPServerRequest req, HTTPServerResponse res)
 {
     long viewer;
-    const(char)[] token;
-    if (!requireAuth(res, req, viewer, token)) return;
-
+    string token;
+    if (!requireAuth(res, req, viewer, token))
+        return;
     long limit, offset;
-    if (!pageArgs(res, req, limit, offset)) return;
+    if (!pageArgs(res, req, limit, offset))
+        return;
 
-    auto b = JsonBuf.init;
-    b.reserve(4 * 1024);
-    auto pair = g_db.execPair(params(Name.listFeed, viewer, limit, offset),
-            params(Name.countFeed, viewer));
-    b.put(`{"articles":`);
-    appendListRows(b, pair.a);
-    b.put(`,"articlesCount":`);
-    appendCountRows(b, pair.b);
-    b.putByte('}');
-    sendBody(res, 200, b[]);
+    QueryParams page, count;
+    page.preparedStatementName = Name.listFeed;
+    page.argsVariadic(viewer, limit, offset);
+    count.preparedStatementName = Name.countFeed;
+    count.argsVariadic(viewer);
+
+    auto conn = pool.lockConnection;
+    auto rows = conn.execPreparedStatement(page);
+    auto total = conn.execPreparedStatement(count);
+    auto articles = Json.emptyArray;
+    foreach (i; 0 .. rows.length)
+        articles ~= articleJson(rows[i], false);
+    writeJson(res, 200, Json(["articles": articles, "articlesCount": Json(total[0][0].as!long)]));
 }
 
 /// GET /api/articles/:slug
-private void sendArticle(scope HTTPServerRequest req, scope HTTPServerResponse res,
-        const(char)[] slug)
-@trusted
+private void getArticle(HTTPServerRequest req, HTTPServerResponse res)
 {
     long viewer;
-    if (!optionalAuth(res, req, viewer)) return;
+    if (!optionalAuth(res, req, viewer))
+        return;
 
-    auto ans = g_db.exec(params(Name.articleBySlug, viewer, slug));
-    if (ans.length == 0) {
-        sendError(res, 404, "article not found");
+    QueryParams params;
+    params.preparedStatementName = Name.articleBySlug;
+    params.argsVariadic(viewer, req.params["slug"]);
+    auto answer = pool.lockConnection.execPreparedStatement(params);
+    if (answer.length == 0)
+    {
+        writeError(res, 404, "article not found");
         return;
     }
-    auto b = JsonBuf.init;
-    b.reserve(4 * 1024);
-    b.put(`{"article":`);
-    appendArticle(b, ans[0], true);
-    b.putByte('}');
-    sendBody(res, 200, b[]);
-}
-
-private void appendArticle(ref JsonBuf b, immutable(Row) row, bool withBody) @trusted
-{
-    b.put(`{"slug":`);
-    putText(b, row, 1);
-    b.put(`,"title":`);
-    putText(b, row, 2);
-    b.put(`,"description":`);
-    putText(b, row, 3);
-    if (withBody) {
-        b.put(`,"body":`);
-        putText(b, row, 4);
-    }
-    b.put(`,"tagList":`);
-    putArray(b, row, withBody ? 7 : 6);
-    b.put(`,"createdAt":`);
-    putTimestamp(b, row, withBody ? 5 : 4);
-    b.put(`,"updatedAt":`);
-    putTimestamp(b, row, withBody ? 6 : 5);
-    b.put(`,"favorited":`);
-    putBool(b, row, withBody ? 9 : 8);
-    b.put(`,"favoritesCount":`);
-    putIntColumn(b, row, withBody ? 8 : 7);
-    b.put(`,"author":`);
-    putProfile(b, row, withBody ? 10 : 9);
-    b.putByte('}');
-}
-
-/// Writes the list endpoint's "articles" array.
-private void appendListRows(ref JsonBuf b, immutable(Answer) ans) @trusted
-{
-    b.putByte('[');
-    foreach (i; 0 .. ans.length) {
-        if (i) b.putByte(',');
-        appendArticle(b, ans[i], false);
-    }
-    b.putByte(']');
-}
-
-/// Writes a list endpoint's "articlesCount".
-private void appendCountRows(ref JsonBuf b, immutable(Answer) ans) @trusted
-{
-    if (ans.length == 1) putIntColumn(b, ans[0], 0);
-    else b.putInt(0);
+    writeJson(res, 200, Json(["article": articleJson(answer[0], true)]));
 }
 
 /// POST /api/articles
-private void createArticle(scope HTTPServerRequest req, scope HTTPServerResponse res)
-@trusted
+private void createArticle(HTTPServerRequest req, HTTPServerResponse res)
 {
     long viewer;
-    const(char)[] token;
-    if (!requireAuth(res, req, viewer, token)) return;
+    string token;
+    if (!requireAuth(res, req, viewer, token))
+        return;
+    Json inner;
+    if (!readWrapper(req, res, "article", inner))
+        return;
+    string title, description, body;
+    if (!reqString(res, inner, "title", title))
+        return;
+    if (!reqString(res, inner, "description", description))
+        return;
+    if (!reqString(res, inner, "body", body))
+        return;
 
-    const(char)[] inner;
-    if (!readWrapper(res, req, "article", inner)) return;
-
-    auto title = appender!(char[]);
-    auto description = appender!(char[]);
-    auto body = appender!(char[]);
-    if (!requiredString(res, inner, "title", title)) return;
-    if (!requiredString(res, inner, "description", description)) return;
-    if (!requiredString(res, inner, "body", body)) return;
-
-    // tagList is optional; when present it must be an array of non-empty strings.
     string[] tags;
     {
-        const(char)[] raw;
-        auto f = field(inner, "tagList", raw);
-        if (f != Field.missing) {
-            if (f == Field.nullValue) {
-                // null tagList: no tags
-            } else {
-                if (kindOf(raw) != JsonKind.array) {
-                    sendError(res, 422, "tagList must be an array of non-empty strings");
-                    return;
-                }
-                auto arr = JsonArray(raw);
-                while (true) {
-                    const(char)[] item;
-                    if (!arr.next(item)) break;
-                    if (kindOf(item) != JsonKind.text || item.length == 2) {
-                        sendError(res, 422, "tagList must be an array of non-empty strings");
+        auto members = inner.get!(Json[string]);
+        if (auto raw = "tagList" in members)
+        {
+            if ((*raw).type == Json.Type.null_)
+            {
+            }
+            else if ((*raw).type != Json.Type.array)
+            {
+                writeError(res, 422, "tagList must be an array of non-empty strings");
+                return;
+            }
+            else
+            {
+                foreach (item; (*raw).get!(Json[]))
+                {
+                    if (item.type != Json.Type.string || item.get!string.length == 0)
+                    {
+                        writeError(res, 422, "tagList must be an array of non-empty strings");
                         return;
                     }
-                    auto t = appender!(char[]);
-                    if (!decodeString(item, t)) {
-                        sendError(res, 422, "tagList must be an array of non-empty strings");
-                        return;
-                    }
-                    tags ~= t.data.idup;
+                    tags ~= item.get!string;
                 }
             }
         }
     }
 
-    // The slug is SLUGIFY(title) || '-' || id: the title is slugified here so that
-    // Postgres never runs a regexp_replace, and the id is appended in SQL.
-    auto slug = appender!(char[]);
-    slugify(title.data, slug);
+    auto conn = pool.lockConnection;
+    conn.execStatement("BEGIN");
+    scope (failure)
+        conn.execStatement("ROLLBACK");
 
-    immutable id = insertArticle(viewer, slug.data, title.data, description.data, body.data, tags);
-    if (id == 0) {
-        sendError(res, 500, "internal error");
+    QueryParams insert;
+    insert.preparedStatementName = Name.insertArticle;
+    insert.argsVariadic(viewer, title, description, body);
+    auto created = conn.execPreparedStatement(insert);
+    if (created.length != 1)
+    {
+        writeError(res, 500, "internal error");
         return;
     }
-
-    auto ans = g_db.exec(params(Name.articleById, viewer, id));
-    auto b = JsonBuf.init;
-    b.reserve(4 * 1024);
-    b.put(`{"article":`);
-    appendArticle(b, ans[0], true);
-    b.putByte('}');
-    sendBody(res, 201, b[]);
-}
-
-/// Inserts the article, its tags and its tag links in one statement (one implicit
-/// transaction), and returns the new article id.
-private long insertArticle(long viewer, const(char)[] slug, const(char)[] title,
-        const(char)[] description, const(char)[] body, string[] tags) @trusted
-{
-    auto ans = g_db.exec(params(Name.insertArticle, slug, viewer, title, description, body, tags));
-    if (ans.length != 1) return 0;
-    return parseId(ans[0]);
-}
-
-/// POST and DELETE /api/articles/:slug/favorite
-private void favoriteArticle(scope HTTPServerRequest req, scope HTTPServerResponse res,
-        const(char)[] slug, bool favorite)
-@trusted
-{
-    long viewer;
-    const(char)[] token;
-    if (!requireAuth(res, req, viewer, token)) return;
-
-    auto ans = g_db.exec(params(Name.articleIdBySlug, slug));
-    if (ans.length == 0) {
-        sendError(res, 404, "article not found");
-        return;
+    auto id = created[0][0].as!long;
+    if (tags.length)
+    {
+        QueryParams names;
+        names.preparedStatementName = Name.insertTags;
+        names.argsVariadic(tags);
+        conn.execPreparedStatement(names);
+        QueryParams links;
+        links.preparedStatementName = Name.insertArticleTags;
+        links.argsVariadic(id, tags);
+        conn.execPreparedStatement(links);
     }
-    immutable id = parseId(ans[0]);
+    conn.execStatement("COMMIT");
 
-    if (favorite)
-        g_db.exec(params(Name.insertFavorite, viewer, id));
-    else
-        g_db.exec(params(Name.deleteFavorite, viewer, id));
+    QueryParams full;
+    full.preparedStatementName = Name.articleById;
+    full.argsVariadic(viewer, id);
+    auto answer = conn.execPreparedStatement(full);
+    writeJson(res, 201, Json(["article": articleJson(answer[0], true)]));
+}
 
-    auto full = g_db.exec(params(Name.articleById, viewer, id));
-    auto b = JsonBuf.init;
-    b.reserve(4 * 1024);
-    b.put(`{"article":`);
-    appendArticle(b, full[0], true);
-    b.putByte('}');
-    sendBody(res, 200, b[]);
+/// The article by slug, or 404; the article's author, or 403.
+private bool ownArticle(HTTPServerResponse res, string slug, long viewer, out long id)
+{
+    QueryParams params;
+    params.preparedStatementName = Name.articleOwner;
+    params.argsVariadic(slug);
+    auto answer = pool.lockConnection.execPreparedStatement(params);
+    if (answer.length == 0)
+    {
+        writeError(res, 404, "article not found");
+        return false;
+    }
+    if (answer[0][1].as!long != viewer)
+    {
+        writeError(res, 403, "not the author");
+        return false;
+    }
+    id = answer[0][0].as!long;
+    return true;
 }
 
 /// PUT /api/articles/:slug
-private void updateArticle(scope HTTPServerRequest req, scope HTTPServerResponse res, const(char)[] slug)
-@trusted
+private void updateArticle(HTTPServerRequest req, HTTPServerResponse res)
 {
     long viewer;
-    const(char)[] token;
-    if (!requireAuth(res, req, viewer, token)) return;
-
-    const(char)[] inner;
-    if (!readWrapper(res, req, "article", inner)) return;
-
-    auto title = appender!(char[]);
-    auto description = appender!(char[]);
-    auto body = appender!(char[]);
-    bool haveTitle, haveDescription, haveBody;
-    if (!optionalString(res, inner, "title", true, haveTitle, title)) return;
-    if (!optionalString(res, inner, "description", true, haveDescription, description)) return;
-    if (!optionalString(res, inner, "body", true, haveBody, body)) return;
-
-    auto ans = g_db.exec(params(Name.articleOwner, slug));
-    if (ans.length == 0) {
-        sendError(res, 404, "article not found");
+    string token;
+    if (!requireAuth(res, req, viewer, token))
         return;
-    }
-    immutable row = ans[0];
-    if (parseColumn(row, 1) != viewer) {
-        sendError(res, 403, "not the author");
+    Json inner;
+    if (!readWrapper(req, res, "article", inner))
         return;
-    }
-    immutable id = parseId(row);
+    string title, description, body;
+    bool hasTitle, hasDescription, hasBody;
+    if (!optString(res, inner, "title", true, hasTitle, title))
+        return;
+    if (!optString(res, inner, "description", true, hasDescription, description))
+        return;
+    if (!optString(res, inner, "body", true, hasBody, body))
+        return;
 
-    // A new title changes the slug to SLUGIFY(title) || '-' || id, as in the
-    // reference SQL.
-    string newSlug;
-    if (haveTitle) {
-        auto s = appender!(char[]);
-        slugify(title.data, s);
-        s.put('-');
-        s.put(id.to!string);
-        newSlug = s.data.idup;
-    }
+    long id;
+    if (!ownArticle(res, req.params["slug"], viewer, id))
+        return;
 
-    g_db.exec(params(Name.updateArticle, id,
-            haveTitle ? someText(newSlug) : noText,
-            haveTitle ? someText(title.data) : noText,
-            haveDescription ? someText(description.data) : noText,
-            haveBody ? someText(body.data) : noText));
+    QueryParams params;
+    params.preparedStatementName = Name.updateArticle;
+    params.argsVariadic(id,
+        hasTitle ? Nullable!string(title) : Nullable!string.init,
+        hasDescription ? Nullable!string(description) : Nullable!string.init,
+        hasBody ? Nullable!string(body) : Nullable!string.init);
+    pool.lockConnection.execPreparedStatement(params);
 
-    auto full = g_db.exec(params(Name.articleById, viewer, id));
-    auto b = JsonBuf.init;
-    b.reserve(4 * 1024);
-    b.put(`{"article":`);
-    appendArticle(b, full[0], true);
-    b.putByte('}');
-    sendBody(res, 200, b[]);
+    QueryParams full;
+    full.preparedStatementName = Name.articleById;
+    full.argsVariadic(viewer, id);
+    auto answer = pool.lockConnection.execPreparedStatement(full);
+    writeJson(res, 200, Json(["article": articleJson(answer[0], true)]));
 }
 
 /// DELETE /api/articles/:slug
-private void deleteArticle(scope HTTPServerRequest req, scope HTTPServerResponse res, const(char)[] slug)
-@trusted
+private void deleteArticle(HTTPServerRequest req, HTTPServerResponse res)
 {
     long viewer;
-    const(char)[] token;
-    if (!requireAuth(res, req, viewer, token)) return;
+    string token;
+    if (!requireAuth(res, req, viewer, token))
+        return;
 
-    auto ans = g_db.exec(params(Name.articleOwner, slug));
-    if (ans.length == 0) {
-        sendError(res, 404, "article not found");
+    long id;
+    if (!ownArticle(res, req.params["slug"], viewer, id))
         return;
+    QueryParams params;
+    params.preparedStatementName = Name.deleteArticle;
+    params.argsVariadic(id);
+    pool.lockConnection.execPreparedStatement(params);
+    writeNoContent(res);
+}
+
+/// The article id by slug, or 404.
+private bool articleId(HTTPServerResponse res, string slug, out long id)
+{
+    QueryParams params;
+    params.preparedStatementName = Name.articleIdBySlug;
+    params.argsVariadic(slug);
+    auto answer = pool.lockConnection.execPreparedStatement(params);
+    if (answer.length == 0)
+    {
+        writeError(res, 404, "article not found");
+        return false;
     }
-    immutable row = ans[0];
-    if (parseColumn(row, 1) != viewer) {
-        sendError(res, 403, "not the author");
+    id = answer[0][0].as!long;
+    return true;
+}
+
+/// POST and DELETE /api/articles/:slug/favorite
+private void favorite(HTTPServerRequest req, HTTPServerResponse res, bool favorite)
+{
+    long viewer;
+    string token;
+    if (!requireAuth(res, req, viewer, token))
         return;
-    }
-    g_db.exec(params(Name.deleteArticle, parseId(row)));
-    sendNoContent(res);
+
+    long id;
+    if (!articleId(res, req.params["slug"], id))
+        return;
+    QueryParams change;
+    change.preparedStatementName = favorite ? Name.insertFavorite : Name.deleteFavorite;
+    change.argsVariadic(viewer, id);
+
+    auto conn = pool.lockConnection;
+    conn.execPreparedStatement(change);
+    QueryParams full;
+    full.preparedStatementName = Name.articleById;
+    full.argsVariadic(viewer, id);
+    auto answer = conn.execPreparedStatement(full);
+    writeJson(res, 200, Json(["article": articleJson(answer[0], true)]));
+}
+
+private void favoriteArticle(HTTPServerRequest req, HTTPServerResponse res)
+{
+    favorite(req, res, true);
+}
+
+private void unfavoriteArticle(HTTPServerRequest req, HTTPServerResponse res)
+{
+    favorite(req, res, false);
 }
 
 // ---------------------------------------------------------------------------
 // comments
 
 /// GET /api/articles/:slug/comments
-private void sendComments(scope HTTPServerRequest req, scope HTTPServerResponse res, const(char)[] slug)
-@trusted
+private void listComments(HTTPServerRequest req, HTTPServerResponse res)
 {
     long viewer;
-    if (!optionalAuth(res, req, viewer)) return;
-
-    auto ids = g_db.exec(params(Name.articleIdBySlug, slug));
-    if (ids.length == 0) {
-        sendError(res, 404, "article not found");
+    if (!optionalAuth(res, req, viewer))
         return;
-    }
-    immutable id = parseId(ids[0]);
 
-    auto ans = g_db.exec(params(Name.commentsByArticle, viewer, id));
-    auto b = JsonBuf.init;
-    b.reserve(4 * 1024);
-    b.put(`{"comments":[`);
-    foreach (i; 0 .. ans.length) {
-        if (i) b.putByte(',');
-        auto row = ans[i];
-        b.put(`{"id":`);
-        putIntColumn(b, row, 0);
-        b.put(`,"body":`);
-        putText(b, row, 1);
-        b.put(`,"createdAt":`);
-        putTimestamp(b, row, 2);
-        b.put(`,"updatedAt":`);
-        putTimestamp(b, row, 3);
-        b.put(`,"author":`);
-        putProfile(b, row, 4);
-        b.putByte('}');
-    }
-    b.put(`]}`);
-    sendBody(res, 200, b[]);
+    long id;
+    if (!articleId(res, req.params["slug"], id))
+        return;
+    QueryParams params;
+    params.preparedStatementName = Name.commentsByArticle;
+    params.argsVariadic(viewer, id);
+    auto answer = pool.lockConnection.execPreparedStatement(params);
+    auto comments = Json.emptyArray;
+    foreach (i; 0 .. answer.length)
+        comments ~= commentJson(answer[i]);
+    writeJson(res, 200, Json(["comments": comments]));
 }
 
 /// POST /api/articles/:slug/comments
-private void createComment(scope HTTPServerRequest req, scope HTTPServerResponse res, const(char)[] slug)
-@trusted
+private void createComment(HTTPServerRequest req, HTTPServerResponse res)
 {
     long viewer;
-    const(char)[] token;
-    if (!requireAuth(res, req, viewer, token)) return;
+    string token;
+    if (!requireAuth(res, req, viewer, token))
+        return;
+    Json inner;
+    if (!readWrapper(req, res, "comment", inner))
+        return;
+    string body;
+    if (!reqString(res, inner, "body", body))
+        return;
 
-    const(char)[] inner;
-    if (!readWrapper(res, req, "comment", inner)) return;
-    auto body = appender!(char[]);
-    if (!requiredString(res, inner, "body", body)) return;
-
-    auto ids = g_db.exec(params(Name.articleIdBySlug, slug));
-    if (ids.length == 0) {
-        sendError(res, 404, "article not found");
+    long id;
+    if (!articleId(res, req.params["slug"], id))
+        return;
+    QueryParams params;
+    params.preparedStatementName = Name.insertComment;
+    params.argsVariadic(id, viewer, body);
+    auto answer = pool.lockConnection.execPreparedStatement(params);
+    if (answer.length != 1)
+    {
+        writeError(res, 500, "internal error");
         return;
     }
-    immutable id = parseId(ids[0]);
-
-    auto ans = g_db.exec(params(Name.insertComment, id, viewer, body.data));
-    if (ans.length != 1) {
-        sendError(res, 500, "internal error");
-        return;
-    }
-    auto row = ans[0];
-    auto b = JsonBuf.init;
-    b.put(`{"comment":{"id":`);
-    putIntColumn(b, row, 0);
-    b.put(`,"body":`);
-    putText(b, row, 1);
-    b.put(`,"createdAt":`);
-    putTimestamp(b, row, 2);
-    b.put(`,"updatedAt":`);
-    putTimestamp(b, row, 3);
-    b.put(`,"author":`);
-    // insertComment has no following column; write the author inline
-    b.put(`{"username":`);
-    putText(b, row, 4);
-    b.put(`,"bio":`);
-    putNullable(b, row, 5);
-    b.put(`,"image":`);
-    putNullable(b, row, 6);
-    b.put(`,"following":false}`);
-    b.put(`}}`);
-    sendBody(res, 201, b[]);
+    auto row = answer[0];
+    writeJson(res, 201, Json(["comment": Json([
+        "id": Json(row[0].as!long),
+        "createdAt": Json(formatTs(row[2].as!SysTime)),
+        "updatedAt": Json(formatTs(row[3].as!SysTime)),
+        "body": Json(row[1].as!string),
+        "author": Json([
+            "username": Json(row[4].as!string),
+            "bio": nullable(row, 5),
+            "image": nullable(row, 6),
+            "following": Json(false),
+        ]),
+    ])]));
 }
 
-/// DELETE /api/articles/:slug/comments/:id
-private void deleteComment(scope HTTPServerRequest req, scope HTTPServerResponse res,
-        const(char)[] slug, const(char)[] idText)
-@trusted
+/// DELETE /api/articles/:slug/comments/:id. A non-integer id is a 404.
+private void deleteComment(HTTPServerRequest req, HTTPServerResponse res)
 {
     long viewer;
-    const(char)[] token;
-    if (!requireAuth(res, req, viewer, token)) return;
+    string token;
+    if (!requireAuth(res, req, viewer, token))
+        return;
 
     long commentId;
-    if (!parseDigits(idText, commentId)) {
-        sendError(res, 404, "comment not found");
+    if (!parseDigits(req.params["id"], commentId))
+    {
+        writeError(res, 404, "comment not found");
         return;
     }
-
-    auto ans = g_db.exec(params(Name.commentOwner, commentId, slug));
-    if (ans.length == 0) {
-        sendError(res, 404, "comment not found");
+    QueryParams params;
+    params.preparedStatementName = Name.commentOwner;
+    params.argsVariadic(commentId, req.params["slug"]);
+    auto conn = pool.lockConnection;
+    auto answer = conn.execPreparedStatement(params);
+    if (answer.length == 0)
+    {
+        writeError(res, 404, "comment not found");
         return;
     }
-    if (parseColumn(ans[0], 0) != viewer) {
-        sendError(res, 403, "not the author");
+    if (answer[0][0].as!long != viewer)
+    {
+        writeError(res, 403, "not the author");
         return;
     }
-    g_db.exec(params(Name.deleteComment, commentId));
-    sendNoContent(res);
+    QueryParams remove;
+    remove.preparedStatementName = Name.deleteComment;
+    remove.argsVariadic(commentId);
+    conn.execPreparedStatement(remove);
+    writeNoContent(res);
 }
 
 // ---------------------------------------------------------------------------
 // tags
 
 /// GET /api/tags
-private void sendTags(scope HTTPServerRequest req, scope HTTPServerResponse res)
-@trusted
+private void tags(HTTPServerRequest req, HTTPServerResponse res)
 {
-    auto ans = g_db.exec(params(Name.tags));
-    auto b = JsonBuf.init;
-    b.reserve(4 * 1024);
-    b.put(`{"tags":[`);
-    foreach (i; 0 .. ans.length) {
-        if (i) b.putByte(',');
-        putText(b, ans[i], 0);
-    }
-    b.put(`]}`);
-    sendBody(res, 200, b[]);
-}
-
-// ---------------------------------------------------------------------------
-// row helpers
-
-private long parseId(immutable(Row) row) @trusted
-{
-    return parseColumn(row, 0);
-}
-
-private long parseColumn(immutable(Row) row, size_t col) @trusted
-{
-    auto v = row[col];
-    auto text = cast(const(char)[]) v.data;
-    long n = 0;
-    foreach (c; text)
-        if (c >= '0' && c <= '9') n = n * 10 + (c - '0');
-    return n;
-}
-
-// ---------------------------------------------------------------------------
-// slugify
-
-/// SLUGIFY(x): trim(both '-' from lower(regexp_replace(x, '[^A-Za-z0-9]+', '-', 'g')))
-/// Postgres works on characters; working on bytes gives the same output because a
-/// multi-byte character's bytes are all non-alphanumeric and are collapsed into
-/// one '-' either way.
-private void slugify(const(char)[] s, ref Appender!(char[]) sink) @safe
-{
-    ptrdiff_t start = 0, end = cast(ptrdiff_t) s.length;
-    while (start < end && !isAlnum(s[cast(size_t) start])) start++;
-    while (end > start && !isAlnum(s[cast(size_t)(end - 1)])) end--;
-
-    bool pendingDash = false;
-    foreach (i; cast(size_t) start .. cast(size_t) end) {
-        immutable c = s[i];
-        if (isAlnum(c)) {
-            if (pendingDash) {
-                sink.put('-');
-                pendingDash = false;
-            }
-            sink.put(c >= 'A' && c <= 'Z' ? cast(char)(c + 32) : c);
-        } else {
-            pendingDash = true;
-        }
-    }
-}
-
-private bool isAlnum(char c) pure nothrow @safe @nogc
-{
-    return c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z';
-}
-
-// ---------------------------------------------------------------------------
-// misc
-
-private long nowUnix() @trusted nothrow
-{
-    import std.datetime : Clock, UTC;
-
-    return cast(long) Clock.currTime(UTC()).toUnixTime();
-}
-
-@safe unittest
-{
-    import std.format : format;
-
-    // slugify must match Postgres's SLUGIFY byte for byte
-    static void check(string s, string want)
-    {
-        auto out_ = appender!(char[]);
-        slugify(s, out_);
-        assert(out_.data == want, format!"sluggify(%s) = %s, want %s"(s, out_.data, want));
-    }
-
-    check("Hello, World! 2026", "hello-world-2026");
-    check("  Conformance -- Renamed Title!  ", "conformance-renamed-title");
-    check("abc", "abc");
-    check("---", "");
-    check("", "");
-    check("Ünïcode Tëst", "n-code-t-st");
-    check("a__b", "a-b");
-    check("MiXeD CaSe", "mixed-case");
+    QueryParams params;
+    params.preparedStatementName = Name.tagsAll;
+    auto answer = pool.lockConnection.execPreparedStatement(params);
+    auto names = Json.emptyArray;
+    foreach (i; 0 .. answer.length)
+        names ~= Json(answer[i][0].as!string);
+    writeJson(res, 200, Json(["tags": names]));
 }
