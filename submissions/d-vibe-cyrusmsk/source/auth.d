@@ -10,7 +10,7 @@ import jwtlited;
 import jwtlited.openssl : HS256Handler;
 import vibe.data.json : Json, parseJsonString;
 
-import base64 : Base64URLNoPadding;
+import std.base64 : Base64URLNoPadding;
 
 import std.datetime : Clock, SysTime, UTC;
 import std.format : format;

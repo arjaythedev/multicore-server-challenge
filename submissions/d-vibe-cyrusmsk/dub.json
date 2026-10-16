@@ -14,8 +14,7 @@
         "passwd": "~>0.3.0",
         "jwtlited:openssl": "~>1.4.0",
         "openssl": "~>3.4.0",
-        "vibe-stream:tls": "~>1.4.1",
-        "base64": {"path": "./base64"}
+        "vibe-stream:tls": "~>1.4.1"
     },
     "dflags": ["-mcpu=native"],
     "dflags-ldc": ["-flto=full"],
