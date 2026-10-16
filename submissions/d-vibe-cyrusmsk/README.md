@@ -65,11 +65,14 @@ There is no JSON DOM, no reflection, and no second pass over the body: one buffe
 | the note | here |
 |---|---|
 | "don't use nginx, let the server serve directly" | **Front: direct**: the process binds `HOST:PORT` on all its threads |
-| "prepare sql once, init it and reuse later" | 32 statements, prepared once per connection at startup (`initConnection`); 31 of the 32 endpoints are one statement, and writing an article is one CTE |
+| "prepare sql once, init it and reuse later" | 34 statements, prepared once per connection at startup (`initConnection`); single-statement endpoints run prepared, a page and its count share one libpq pipeline (see below) |
 | "use one reused DB connection" | a fixed set of long-lived connections per thread, opened at startup — a request never dials (per-thread, because a vibe.d connection is fiber-bound to its thread) |
-| "use group commit - many writes - one commit" | a write is one statement, so its transaction is committed before the response is written, and Postgres groups the concurrent commits it gets |
-| "for jwt - use jwtlited (the fastest in D)" | `source/jwt.d` is a thin layer over jwtlited's `HS256Handler`: it does the crypto, only the three claims are checked here |
-| (passwords) | [`passwd`](https://code.dlang.org/packages/passwd) 0.3 — bcrypt with OpenBSD test vectors, not a hand-rolled implementation |
+| "use group commit - many writes - one commit" | each write commits before its response is sent; Postgres groups the concurrent commits itself |
+| "for jwt - use jwtlited (the fastest in D)" | `source/auth.d` over jwtlited's OpenSSL `HS256Handler`: it does the crypto and the base64, only the three claims are checked here |
+| (passwords) | [`passwd`](https://code.dlang.org/packages/passwd) — bcrypt with OpenBSD test vectors, not a hand-rolled implementation |
+| (pipelines) | `execPipeline` in `source/db.d` (after `example_pipelining`): a list page and its count go out in one flush and come back in order; anything that needs a previous answer stays sequential |
+| (responses) | typed structs holding slices of the answer, serialized directly — no JSON DOM, no copies; `writeJsonBody` chunked, so a single pass |
+| (compile) | `-mcpu=native` + LTO; PGO needs a database at build time, which `build.sh` does not have |
 
 ### Nothing that reads data is shared across requests
 
@@ -121,8 +124,8 @@ bash test/run.sh submissions/d-vibe-cyrusmsk     # needs Go, psql, curl
 
 ## Measured
 
-Against the Go reference server (`examples/go`) on the same laptop, same dev seed, same load
-generator, `Front: direct` vs Go's `Front: nginx`:
+Same laptop, same dev seed, same load generator, Go (`examples/go`) vs this
+(`Front: direct` in both cases here; the video ran Go behind nginx):
 
 | users | Go: req/s (p50/p95/p99) | this: req/s (p50/p95/p99) |
 |---|---|---|
@@ -131,17 +134,22 @@ generator, `Front: direct` vs Go's `Front: nginx`:
 | 12 000 | 3208 (0.4/3.0/5.6 ms) | fails (p95 116 ms, 28 % connect timeouts) |
 | 16 000 | 4248 (0.4/4.1/9.6 ms) | — |
 
-Go stays at ~0.4 ms median per request up to its ceiling; this server is ~2.5× the CPU per
-request and stops scaling near 8 000 users on the same box. In the closed-loop workload
-req/s tracks the user count (~0.27/user), so those columns are mostly a statement about how
-much CPU each request costs — Go's `net/http` plus pgx costs far less than vibe-http's request
-parsing, the fibers and dpq2/libpq's row access. The published video scores are 22 000 (Go),
-21 000 (Java), 19 000 (Rust) and 10 000 (Python) users on 8 vCPUs, i.e. roughly 5.5k, 5.2k, 4.7k
-and 2.5k req/s at the workload's ~0.25 req/s per user.
+Raw request cost on the same box (persistent connections, 4 read endpoints):
 
-Two things the measurements did change: `vibe-http`'s default `keepAliveTimeout` (10 s) is raised
-to 120 s here so the load generator's idle sockets are never closed under it, and the response
-buffer starts at 4 KB instead of 64 KB (the size of the biggest list page), which alone cut p95
-at 8 000 users from 165 ms to 116 ms. A per-thread reusable response buffer and dropping the
-unused `a.id` column from the article queries were both tried and neither moved the numbers, so
-neither is in.
+| threads | Go | this (before) | this (now) |
+|---|---|---|---|
+| 8 | 8800 req/s, p50 0.84 ms | 3600 req/s, p50 2.15 ms | 6500 req/s, p50 1.0 ms |
+| 16 | 9700 req/s, p50 1.45 ms | 3380 req/s, p50 4.7 ms | 6500 req/s, p50 1.66 ms |
+
+What moved it, in order: typed response structs holding slices of the answer
+instead of a `Json` DOM (`serializeToJson` writes them directly, no hashing,
+no copies), one libpq pipeline for a page and its count instead of two round
+trips, chunked `writeJsonBody` (a single serialization pass instead of
+count-then-write), and LTO. The published video scores are 22 000 (Go),
+21 000 (Java), 19 000 (Rust) and 10 000 (Python) users on 8 vCPUs, i.e.
+roughly 5.5k, 5.2k, 4.7k and 2.5k req/s at the workload's ~0.25 req/s/user.
+
+Deliberately not done: PGO (there is no database at build time to profile
+against, so `build.sh` cannot collect profiles), response-buffer pooling
+(tried: unmeasurable, and reusing a buffer the driver may still reference
+is not obviously safe), and anything outside the wrapper libraries.

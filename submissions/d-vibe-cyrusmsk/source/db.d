@@ -240,18 +240,38 @@ immutable(Answer)[] execPipeline(LockedConnection conn, scope const(QueryParams)
 
     foreach (ref const query; queries)
         conn.sendQueryPrepared(query);
+    conn.sendFlushRequest;
+    conn.flush();
     conn.pipelineSync;
 
     immutable(Answer)[] answers;
     foreach (_; queries)
-    {
-        auto result = conn.getResult(conn.requestTimeout);
-        if (result is null || result.status != PGRES_TUPLES_OK)
-            throw new Exception("pipeline query failed");
-        answers ~= result.getAnswer;
-    }
-    auto sync = conn.getResult(conn.requestTimeout);
-    if (sync is null || sync.status != PGRES_PIPELINE_SYNC)
+        answers ~= awaitResult(conn).getAnswer;
+    if (awaitResult(conn).status != PGRES_PIPELINE_SYNC)
         throw new Exception("pipeline sync failed");
     return answers;
+}
+
+/// Reads one pipelined result, waiting (without blocking the thread) for it
+/// to arrive. A plain `getResult` cannot be used here: between two pipelined
+/// results the connection can briefly look idle, and then it returns null for
+/// a result that is still on its way.
+private immutable(Result) awaitResult(LockedConnection conn)
+{
+    import vibe.core.core : sleep;
+    import std.datetime : MonoTime;
+    import core.time : usecs;
+
+    auto deadline = MonoTime.currTime + conn.requestTimeout;
+    while (true)
+    {
+        if (auto result = conn.getResult(conn.requestTimeout))
+            return result;
+        if (MonoTime.currTime >= deadline)
+            throw new Exception("timed out waiting for a pipelined result");
+        // Nothing buffered (or nothing arrived yet): pull in whatever is on
+        // the socket, then yield so other requests proceed while waiting.
+        conn.consumeInput();
+        sleep(100.usecs);
+    }
 }

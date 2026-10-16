@@ -80,6 +80,13 @@ private void writeJson(HTTPServerResponse res, int status, Json body)
     res.writeJsonBody(body, status, true);
 }
 
+/// Struct responses serialize directly, without a JSON DOM in between.
+private void writeJson(T)(HTTPServerResponse res, int status, T body)
+    if (!is(T == Json))
+{
+    res.writeJsonBody(body, status, true);
+}
+
 private void writeError(HTTPServerResponse res, int status, string message)
 {
     writeJson(res, status, Json(["errors": Json(["body": Json([Json(message)])])]));
@@ -284,77 +291,187 @@ private string formatTs(SysTime time)
         utc.fracSecs.total!"msecs");
 }
 
-/// A nullable text column: JSON null, or the string.
-private Json nullable(Row row, size_t column)
+/// A text cell as a slice of the answer: no copy. The answer outlives the
+/// response being written, so the slice is always valid.
+private string cellText(immutable(Value) cell) @trusted
 {
-    return row[column].isNull ? Json(null) : Json(row[column].as!string);
+    return cast(string) cell.data;
+}
+
+private Nullable!string cellNullable(immutable(Value) cell) @trusted
+{
+    return cell.isNull ? Nullable!string.init : Nullable!string(cast(string) cell.data);
+}
+
+// Responses are typed structs holding slices of the answer: no JSON DOM, no
+// intermediate copies. `writeJsonBody` serializes the struct directly.
+struct ProfileOut
+{
+    string username;
+    Nullable!string bio;
+    Nullable!string image;
+    bool following;
+}
+
+struct ArticleListOut
+{
+    string slug;
+    string title;
+    string description;
+    string[] tagList;
+    string createdAt;
+    string updatedAt;
+    bool favorited;
+    long favoritesCount;
+    ProfileOut author;
+}
+
+struct ArticleFullOut
+{
+    string slug;
+    string title;
+    string description;
+    string body;
+    string[] tagList;
+    string createdAt;
+    string updatedAt;
+    bool favorited;
+    long favoritesCount;
+    ProfileOut author;
+}
+
+struct ArticlesOut
+{
+    ArticleListOut[] articles;
+    long articlesCount;
+}
+
+struct ArticleOut
+{
+    ArticleFullOut article;
+}
+
+struct UserOut
+{
+    string username;
+    string email;
+    Nullable!string bio;
+    Nullable!string image;
+    string token;
+}
+
+struct UserResponse
+{
+    UserOut user;
+}
+
+struct ProfileResponse
+{
+    ProfileOut profile;
+}
+
+struct CommentOut
+{
+    long id;
+    string createdAt;
+    string updatedAt;
+    string body;
+    ProfileOut author;
+}
+
+struct CommentResponse
+{
+    CommentOut comment;
+}
+
+struct CommentsOut
+{
+    CommentOut[] comments;
+}
+
+struct TagsOut
+{
+    string[] tags;
 }
 
 /// The author object shared by articles and comments.
-private Json profileJson(Row row, size_t username)
+private ProfileOut profileOut(Row row, size_t username)
 {
-    return Json([
-        "username": Json(row[username].as!string),
-        "bio": nullable(row, username + 1),
-        "image": nullable(row, username + 2),
-        "following": Json(row[username + 3].as!bool),
-    ]);
+    ProfileOut profile;
+    profile.username = cellText(row[username]);
+    profile.bio = cellNullable(row[username + 1]);
+    profile.image = cellNullable(row[username + 2]);
+    profile.following = row[username + 3].as!bool;
+    return profile;
 }
 
-/// An article, with or without its body. The column layout is the reference
-/// SQL's: id, slug, title, description, [body,] created, updated, tag list,
-/// favorites count, favorited, author columns.
-private Json articleJson(Row row, bool withBody)
+/// A Postgres `text[]` as an array of strings.
+private string[] tagList(Row row, size_t column)
 {
-    auto created = withBody ? 5 : 4;
-    auto tags = withBody ? 7 : 6;
-    auto author = withBody ? 10 : 9;
-    Json article = Json([
-        "slug": Json(row[1].as!string),
-        "title": Json(row[2].as!string),
-        "description": Json(row[3].as!string),
-        "tagList": tagJson(row, tags),
-        "createdAt": Json(formatTs(row[created].as!SysTime)),
-        "updatedAt": Json(formatTs(row[created + 1].as!SysTime)),
-        "favorited": Json(row[tags + 2].as!bool),
-        "favoritesCount": Json(row[tags + 1].as!long),
-        "author": profileJson(row, author),
-    ]);
-    if (withBody)
-        article["body"] = Json(row[4].as!string);
-    return article;
-}
-
-/// A Postgres `text[]` as a JSON array of strings.
-private Json tagJson(Row row, size_t column)
-{
-    auto tags = Json.emptyArray;
     auto array = row[column].asArray;
+    auto tags = new string[](array.length);
     foreach (i; 0 .. array.length)
-        tags ~= Json(array[i].as!string);
+        tags[i] = cellText(array[i]);
     return tags;
 }
 
-private Json commentJson(Row row)
+/// An article row. The column layout is the reference SQL's: id, slug, title,
+/// description, [body,] created, updated, tag list, favorites count,
+/// favorited, author columns.
+private ArticleFullOut fullArticle(Row row)
 {
-    return Json([
-        "id": Json(row[0].as!long),
-        "createdAt": Json(formatTs(row[2].as!SysTime)),
-        "updatedAt": Json(formatTs(row[3].as!SysTime)),
-        "body": Json(row[1].as!string),
-        "author": profileJson(row, 4),
-    ]);
+    ArticleFullOut article;
+    article.slug = cellText(row[1]);
+    article.title = cellText(row[2]);
+    article.description = cellText(row[3]);
+    article.body = cellText(row[4]);
+    article.tagList = tagList(row, 7);
+    article.createdAt = formatTs(row[5].as!SysTime);
+    article.updatedAt = formatTs(row[6].as!SysTime);
+    article.favoritesCount = row[8].as!long;
+    article.favorited = row[9].as!bool;
+    article.author = profileOut(row, 10);
+    return article;
 }
 
-private Json userJson(Row row, string token)
+private ArticleListOut listArticle(Row row)
 {
-    return Json([
-        "username": Json(row[1].as!string),
-        "email": Json(row[2].as!string),
-        "bio": nullable(row, 3),
-        "image": nullable(row, 4),
-        "token": Json(token),
-    ]);
+    ArticleListOut article;
+    article.slug = cellText(row[1]);
+    article.title = cellText(row[2]);
+    article.description = cellText(row[3]);
+    article.tagList = tagList(row, 6);
+    article.createdAt = formatTs(row[4].as!SysTime);
+    article.updatedAt = formatTs(row[5].as!SysTime);
+    article.favoritesCount = row[7].as!long;
+    article.favorited = row[8].as!bool;
+    article.author = profileOut(row, 9);
+    return article;
+}
+
+private CommentOut commentOut(Row row, bool following)
+{
+    CommentOut comment;
+    comment.id = row[0].as!long;
+    comment.createdAt = formatTs(row[2].as!SysTime);
+    comment.updatedAt = formatTs(row[3].as!SysTime);
+    comment.body = cellText(row[1]);
+    comment.author.username = cellText(row[4]);
+    comment.author.bio = cellNullable(row[5]);
+    comment.author.image = cellNullable(row[6]);
+    comment.author.following = following;
+    return comment;
+}
+
+private UserOut userOut(Row row, string token)
+{
+    UserOut user;
+    user.username = cellText(row[1]);
+    user.email = cellText(row[2]);
+    user.bio = cellNullable(row[3]);
+    user.image = cellNullable(row[4]);
+    user.token = token;
+    return user;
 }
 
 /// Runs a statement whose unique violations (a taken username or email) are a
@@ -426,7 +543,7 @@ private void register(HTTPServerRequest req, HTTPServerResponse res)
         writeError(res, 500, "internal error");
         return;
     }
-    writeJson(res, 201, Json(["user": userJson(answer[0], issueToken(answer[0][0].as!long, nowUnix()))]));
+    writeJson(res, 201, UserResponse(userOut(answer[0], issueToken(answer[0][0].as!long, nowUnix()))));
 }
 
 /// POST /api/users/login
@@ -450,7 +567,7 @@ private void login(HTTPServerRequest req, HTTPServerResponse res)
         writeError(res, 401, "invalid email or password");
         return;
     }
-    writeJson(res, 200, Json(["user": userJson(answer[0], issueToken(answer[0][0].as!long, nowUnix()))]));
+    writeJson(res, 200, UserResponse(userOut(answer[0], issueToken(answer[0][0].as!long, nowUnix()))));
 }
 
 /// GET /api/user
@@ -470,7 +587,7 @@ private void currentUser(HTTPServerRequest req, HTTPServerResponse res)
         writeError(res, 401, "unauthorized");
         return;
     }
-    writeJson(res, 200, Json(["user": userJson(answer[0], token)]));
+    writeJson(res, 200, UserResponse(userOut(answer[0], token)));
 }
 
 /// PUT /api/user
@@ -526,7 +643,7 @@ private void updateUser(HTTPServerRequest req, HTTPServerResponse res)
         writeError(res, 401, "unauthorized");
         return;
     }
-    writeJson(res, 200, Json(["user": userJson(answer[0], token)]));
+    writeJson(res, 200, UserResponse(userOut(answer[0], token)));
 }
 
 // ---------------------------------------------------------------------------
@@ -548,7 +665,7 @@ private void getProfile(HTTPServerRequest req, HTTPServerResponse res)
         writeError(res, 404, "profile not found");
         return;
     }
-    writeJson(res, 200, Json(["profile": profileJson(answer[0], 1)]));
+    writeJson(res, 200, ProfileResponse(profileOut(answer[0], 1)));
 }
 
 /// POST and DELETE /api/profiles/:username/follow
@@ -576,12 +693,12 @@ private void follow(HTTPServerRequest req, HTTPServerResponse res, bool follow)
     change.argsVariadic(viewer, followee);
     conn.execPreparedStatement(change);
 
-    writeJson(res, 200, Json(["profile": Json([
-        "username": Json(found[0][1].as!string),
-        "bio": nullable(found[0], 2),
-        "image": nullable(found[0], 3),
-        "following": Json(follow),
-    ])]));
+    ProfileOut profile;
+    profile.username = cellText(found[0][1]);
+    profile.bio = cellNullable(found[0][2]);
+    profile.image = cellNullable(found[0][3]);
+    profile.following = follow;
+    writeJson(res, 200, ProfileResponse(profile));
 }
 
 private void followProfile(HTTPServerRequest req, HTTPServerResponse res)
@@ -672,12 +789,13 @@ private void listArticles(HTTPServerRequest req, HTTPServerResponse res)
     }
 
     auto conn = pool.lockConnection;
-    auto rows = conn.execPreparedStatement(page);
-    auto total = conn.execPreparedStatement(count);
-    auto articles = Json.emptyArray;
+    auto answers = execPipeline(conn, [page, count]);
+    auto rows = answers[0];
+    auto total = answers[1];
+    auto articles = new ArticleListOut[](rows.length);
     foreach (i; 0 .. rows.length)
-        articles ~= articleJson(rows[i], false);
-    writeJson(res, 200, Json(["articles": articles, "articlesCount": Json(total[0][0].as!long)]));
+        articles[i] = listArticle(rows[i]);
+    writeJson(res, 200, ArticlesOut(articles, total[0][0].as!long));
 }
 
 /// GET /api/articles/feed
@@ -698,12 +816,13 @@ private void feed(HTTPServerRequest req, HTTPServerResponse res)
     count.argsVariadic(viewer);
 
     auto conn = pool.lockConnection;
-    auto rows = conn.execPreparedStatement(page);
-    auto total = conn.execPreparedStatement(count);
-    auto articles = Json.emptyArray;
+    auto answers = execPipeline(conn, [page, count]);
+    auto rows = answers[0];
+    auto total = answers[1];
+    auto articles = new ArticleListOut[](rows.length);
     foreach (i; 0 .. rows.length)
-        articles ~= articleJson(rows[i], false);
-    writeJson(res, 200, Json(["articles": articles, "articlesCount": Json(total[0][0].as!long)]));
+        articles[i] = listArticle(rows[i]);
+    writeJson(res, 200, ArticlesOut(articles, total[0][0].as!long));
 }
 
 /// GET /api/articles/:slug
@@ -722,7 +841,7 @@ private void getArticle(HTTPServerRequest req, HTTPServerResponse res)
         writeError(res, 404, "article not found");
         return;
     }
-    writeJson(res, 200, Json(["article": articleJson(answer[0], true)]));
+    writeJson(res, 200, ArticleOut(fullArticle(answer[0])));
 }
 
 /// POST /api/articles
@@ -803,7 +922,7 @@ private void createArticle(HTTPServerRequest req, HTTPServerResponse res)
     full.preparedStatementName = Name.articleById;
     full.argsVariadic(viewer, id);
     auto answer = conn.execPreparedStatement(full);
-    writeJson(res, 201, Json(["article": articleJson(answer[0], true)]));
+    writeJson(res, 201, ArticleOut(fullArticle(answer[0])));
 }
 
 /// The article by slug, or 404; the article's author, or 403.
@@ -862,7 +981,7 @@ private void updateArticle(HTTPServerRequest req, HTTPServerResponse res)
     full.preparedStatementName = Name.articleById;
     full.argsVariadic(viewer, id);
     auto answer = pool.lockConnection.execPreparedStatement(full);
-    writeJson(res, 200, Json(["article": articleJson(answer[0], true)]));
+    writeJson(res, 200, ArticleOut(fullArticle(answer[0])));
 }
 
 /// DELETE /api/articles/:slug
@@ -920,7 +1039,7 @@ private void favorite(HTTPServerRequest req, HTTPServerResponse res, bool favori
     full.preparedStatementName = Name.articleById;
     full.argsVariadic(viewer, id);
     auto answer = conn.execPreparedStatement(full);
-    writeJson(res, 200, Json(["article": articleJson(answer[0], true)]));
+    writeJson(res, 200, ArticleOut(fullArticle(answer[0])));
 }
 
 private void favoriteArticle(HTTPServerRequest req, HTTPServerResponse res)
@@ -950,10 +1069,10 @@ private void listComments(HTTPServerRequest req, HTTPServerResponse res)
     params.preparedStatementName = Name.commentsByArticle;
     params.argsVariadic(viewer, id);
     auto answer = pool.lockConnection.execPreparedStatement(params);
-    auto comments = Json.emptyArray;
+    auto comments = new CommentOut[](answer.length);
     foreach (i; 0 .. answer.length)
-        comments ~= commentJson(answer[i]);
-    writeJson(res, 200, Json(["comments": comments]));
+        comments[i] = commentOut(answer[i], answer[i][7].as!bool);
+    writeJson(res, 200, CommentsOut(comments));
 }
 
 /// POST /api/articles/:slug/comments
@@ -982,19 +1101,7 @@ private void createComment(HTTPServerRequest req, HTTPServerResponse res)
         writeError(res, 500, "internal error");
         return;
     }
-    auto row = answer[0];
-    writeJson(res, 201, Json(["comment": Json([
-        "id": Json(row[0].as!long),
-        "createdAt": Json(formatTs(row[2].as!SysTime)),
-        "updatedAt": Json(formatTs(row[3].as!SysTime)),
-        "body": Json(row[1].as!string),
-        "author": Json([
-            "username": Json(row[4].as!string),
-            "bio": nullable(row, 5),
-            "image": nullable(row, 6),
-            "following": Json(false),
-        ]),
-    ])]));
+    writeJson(res, 201, CommentResponse(commentOut(answer[0], false)));
 }
 
 /// DELETE /api/articles/:slug/comments/:id. A non-integer id is a 404.
@@ -1042,8 +1149,8 @@ private void tags(HTTPServerRequest req, HTTPServerResponse res)
     QueryParams params;
     params.preparedStatementName = Name.tagsAll;
     auto answer = pool.lockConnection.execPreparedStatement(params);
-    auto names = Json.emptyArray;
+    auto names = new string[](answer.length);
     foreach (i; 0 .. answer.length)
-        names ~= Json(answer[i][0].as!string);
-    writeJson(res, 200, Json(["tags": names]));
+        names[i] = cellText(answer[i][0]);
+    writeJson(res, 200, TagsOut(names));
 }
