@@ -1,0 +1,21 @@
+{
+  "packages": [],
+  "deps": [
+    {
+      "locator": "github.com/ponylang/postgres.git",
+      "version": "3c52024d9f814fd0a2dbc01180cdd0e60a05fe4a"
+    },
+    {
+      "locator": "github.com/ponylang/stallion.git",
+      "version": "becc51753ec076fdda011f7f9d5c73a50e814368"
+    }
+  ],
+  "info": {
+    "description": "",
+    "homepage": "",
+    "license": "",
+    "documentation_url": "",
+    "version": "",
+    "name": ""
+  }
+}
