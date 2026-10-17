@@ -1,0 +1,189 @@
+using System;
+using Npgsql;
+using NpgsqlTypes;
+
+namespace Conduit;
+
+public static class Db
+{
+    public static NpgsqlDataSource Source = null!;
+
+    public static void Init(string databaseUrl, int poolSize, bool multiplexing)
+    {
+        var uri = new Uri(databaseUrl);
+        string[] userInfo = uri.UserInfo.Split(':', 2);
+        var csb = new NpgsqlConnectionStringBuilder
+        {
+            Host = uri.Host,
+            Port = uri.Port > 0 ? uri.Port : 5432,
+            Database = Uri.UnescapeDataString(uri.AbsolutePath.TrimStart('/')),
+            Username = Uri.UnescapeDataString(userInfo[0]),
+            Password = userInfo.Length > 1 ? Uri.UnescapeDataString(userInfo[1]) : null,
+            SslMode = SslMode.Disable,
+            // Many requests share each connection: commands from concurrent requests are pipelined onto a few
+            // connections instead of each request holding one, so Postgres runs few busy backends.
+            Multiplexing = multiplexing,
+            MaxPoolSize = poolSize,
+            NoResetOnClose = true,
+            Enlist = false,
+            // Every statement is prepared once per connection (Parse/plan once, then only Bind/Execute).
+            MaxAutoPrepare = 64,
+            AutoPrepareMinUsages = 2,
+            // Session settings. The reference queries take LIMIT/OFFSET as parameters, which makes Postgres's
+            // plan cache keep choosing custom plans and re-plan every execution. Our statements are written so
+            // the generic plan is the right plan, so it is planned once per connection. JIT never pays off
+            // for statements this short.
+            Options = "-c plan_cache_mode=force_generic_plan -c jit=off",
+        };
+        Source = NpgsqlDataSource.Create(csb.ConnectionString);
+    }
+
+    public static NpgsqlParameter<long> P(long v) => new() { TypedValue = v };
+    public static NpgsqlParameter<string> P(string v) => new() { TypedValue = v };
+    public static NpgsqlParameter<string[]> P(string[] v) => new() { TypedValue = v };
+    public static NpgsqlParameter Text(string? v) => new() { NpgsqlDbType = NpgsqlDbType.Text, Value = (object?)v ?? DBNull.Value };
+}
+
+/// <summary>
+/// The SQL. Responses match SPEC.md's reference SQL; the statements differ where that is cheaper for Postgres:
+/// one statement per request where the reference runs several, the page is picked before the per-article
+/// subqueries run (so OFFSET rows are never decorated), tag names come by primary key lookups instead of a hash
+/// join over all tags per article, and an anonymous viewer skips the favorited/following probes.
+/// $1 is always the viewer (0 = anonymous).
+/// </summary>
+public static class Sql
+{
+    static string Slugify(string x) => $"trim(both '-' from lower(regexp_replace({x}, '[^A-Za-z0-9]+', '-', 'g')))";
+
+    const string TagList = "ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at WHERE at.article_id = a.id ORDER BY 1)";
+    const string FavoritesCount = "(SELECT count(*) FROM favorites f WHERE f.article_id = a.id)";
+    const string Favorited = "($1 <> 0 AND EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1))";
+    /// <summary>Whether the viewer follows <paramref name="followee"/> (false for an anonymous viewer).</summary>
+    static string Following(string followee) =>
+        $"($1 <> 0 AND EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = {followee}))";
+
+    /// <summary>Article columns, read by Articles.Write in this order.</summary>
+    static string Columns(bool body, string favorited = Favorited, string favoritesCount = FavoritesCount) =>
+        $"a.slug, a.title, a.description, {(body ? "a.body, " : "")}a.created_at, a.updated_at, {TagList}, {favoritesCount}, {favorited}, " +
+        $"u.username, u.bio, u.image, {Following("a.author_id")}";
+
+    // ---------- users ----------
+
+    public const string Register = "INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3) RETURNING id, username, email, bio, image";
+    public const string Login = "SELECT id, username, email, bio, image, password_hash FROM users WHERE email = $1";
+    public const string CurrentUser = "SELECT username, email, bio, image FROM users WHERE id = $1";
+    public const string UpdateUser =
+        "UPDATE users SET email = COALESCE($2, email), username = COALESCE($3, username), password_hash = COALESCE($4, password_hash), " +
+        "bio = COALESCE($5, bio), image = COALESCE($6, image) WHERE id = $1 RETURNING username, email, bio, image";
+
+    // ---------- profiles ----------
+
+    public static readonly string Profile = $"SELECT u.username, u.bio, u.image, {Following("u.id")} FROM users u WHERE u.username = $2";
+    public const string Follow =
+        "WITH t AS (SELECT id, username, bio, image FROM users WHERE username = $2), " +
+        "w AS (INSERT INTO follows (follower_id, followee_id) SELECT $1, id FROM t ON CONFLICT DO NOTHING) " +
+        "SELECT username, bio, image FROM t";
+    public const string Unfollow =
+        "WITH t AS (SELECT id, username, bio, image FROM users WHERE username = $2), " +
+        "w AS (DELETE FROM follows WHERE follower_id = $1 AND followee_id = (SELECT id FROM t)) " +
+        "SELECT username, bio, image FROM t";
+
+    // ---------- article lists: $2 limit, $3 offset, $4 filter (feed: limit + offset) ----------
+
+    public enum ListKind { Global, Tag, Author, Favorited, Feed }
+
+    static string Page(string ids) =>
+        $"SELECT {Columns(false)} FROM ({ids}) p JOIN articles a ON a.id = p.id JOIN users u ON u.id = a.author_id ORDER BY a.id DESC";
+
+    public static readonly string[] List =
+    [
+        Page("SELECT id FROM articles ORDER BY id DESC LIMIT $2 OFFSET $3"),
+        Page("SELECT at.article_id AS id FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = $4) " +
+             "ORDER BY at.article_id DESC LIMIT $2 OFFSET $3"),
+        Page("SELECT a2.id FROM articles a2 WHERE a2.author_id = (SELECT au.id FROM users au WHERE au.username = $4) " +
+             "ORDER BY a2.id DESC LIMIT $2 OFFSET $3"),
+        Page("SELECT f.article_id AS id FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = $4) " +
+             "ORDER BY f.article_id DESC LIMIT $2 OFFSET $3"),
+        Page("SELECT x.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id " +
+             "ORDER BY a2.id DESC LIMIT $4) x WHERE fo.follower_id = $1 ORDER BY x.id DESC LIMIT $2 OFFSET $3"),
+    ];
+
+    /// <summary>Capped counts. $1 is the filter (feed: the viewer).</summary>
+    public static readonly string[] Count =
+    [
+        "SELECT count(*) FROM (SELECT 1 FROM articles a LIMIT 1000) s",
+        "SELECT count(*) FROM (SELECT 1 FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = $1) LIMIT 1000) s",
+        "SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = (SELECT u.id FROM users u WHERE u.username = $1) LIMIT 1000) s",
+        "SELECT count(*) FROM (SELECT 1 FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = $1) LIMIT 1000) s",
+        "SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $1) LIMIT 1000) s",
+    ];
+
+    // ---------- single articles ----------
+
+    public static readonly string ArticleBySlug = $"SELECT {Columns(true)} FROM articles a JOIN users u ON u.id = a.author_id WHERE a.slug = $2";
+
+    /// <summary>Create runs as one batch (one implicit transaction): insert, tags, article_tags, then the article.</summary>
+    public static readonly string InsertArticle =
+        "INSERT INTO articles (id, slug, author_id, title, description, body) " +
+        $"SELECT n.id, {Slugify("$2")} || '-' || n.id, $1, $2, $3, $4 FROM (SELECT nextval(pg_get_serial_sequence('articles', 'id')) AS id) n";
+    // New names are inserted in sorted order: two creates adding the same new tags then wait on each other in one
+    // order instead of deadlocking.
+    public const string InsertTags = "INSERT INTO tags (name) SELECT DISTINCT unnest($1::text[]) ORDER BY 1 ON CONFLICT (name) DO NOTHING";
+    public const string InsertArticleTags =
+        "INSERT INTO article_tags (article_id, tag_id) SELECT currval(pg_get_serial_sequence('articles', 'id')), t.id FROM tags t WHERE t.name = ANY($1::text[])";
+    public static readonly string InsertedArticle =
+        $"SELECT {Columns(true)} FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id = (SELECT currval(pg_get_serial_sequence('articles', 'id')))";
+
+    /// <summary>$2 slug, $3 title, $4 description, $5 body. Returns author_id, then the article if the viewer wrote it.</summary>
+    public static readonly string UpdateArticle =
+        "WITH t AS (SELECT id, author_id FROM articles WHERE slug = $2), " +
+        "a AS (UPDATE articles SET title = COALESCE($3, title), description = COALESCE($4, description), body = COALESCE($5, body), " +
+        $"slug = CASE WHEN $3::text IS NULL THEN slug ELSE {Slugify("$3")} || '-' || id END, updated_at = now() " +
+        "WHERE id = (SELECT id FROM t WHERE author_id = $1) RETURNING id, slug, title, description, body, created_at, updated_at, author_id) " +
+        $"SELECT t.author_id, x.* FROM t LEFT JOIN LATERAL (SELECT {Columns(true)} FROM a JOIN users u ON u.id = a.author_id) x ON true";
+
+    /// <summary>Returns author_id; the article is deleted only if the viewer wrote it.</summary>
+    public const string DeleteArticle =
+        "WITH t AS (SELECT id, author_id FROM articles WHERE slug = $2), " +
+        "d AS (DELETE FROM articles WHERE id = (SELECT id FROM t WHERE author_id = $1)) " +
+        "SELECT author_id FROM t";
+
+    // The favorite toggles write and read in one statement. Its snapshot can't see its own write, so the count
+    // is adjusted by the rows the write changed; favorited is what the write just made true.
+    public static readonly string Favorite =
+        "WITH t AS (SELECT id FROM articles WHERE slug = $2), " +
+        "w AS (INSERT INTO favorites (user_id, article_id) SELECT $1, id FROM t ON CONFLICT DO NOTHING RETURNING 1) " +
+        $"SELECT {Columns(true, "true", $"({FavoritesCount} + (SELECT count(*) FROM w))")} " +
+        "FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id = (SELECT id FROM t)";
+    public static readonly string Unfavorite =
+        "WITH t AS (SELECT id FROM articles WHERE slug = $2), " +
+        "w AS (DELETE FROM favorites WHERE user_id = $1 AND article_id = (SELECT id FROM t) RETURNING 1) " +
+        $"SELECT {Columns(true, "false", $"({FavoritesCount} - (SELECT count(*) FROM w))")} " +
+        "FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id = (SELECT id FROM t)";
+
+    // ---------- comments ----------
+
+    /// <summary>No row: unknown article. One row with a NULL id: no comments.</summary>
+    public static readonly string Comments =
+        "SELECT x.id, x.created_at, x.updated_at, x.body, x.username, x.bio, x.image, x.following FROM articles a " +
+        $"LEFT JOIN LATERAL (SELECT c.id, c.created_at, c.updated_at, c.body, u.username, u.bio, u.image, {Following("c.author_id")} AS following " +
+        "FROM comments c JOIN users u ON u.id = c.author_id WHERE c.article_id = a.id " +
+        "ORDER BY c.created_at DESC, c.id DESC LIMIT 100) x ON true " +
+        "WHERE a.slug = $2 ORDER BY x.created_at DESC, x.id DESC";
+
+    /// <summary>$2 body, $3 slug. No row: unknown article.</summary>
+    public const string CreateComment =
+        "WITH c AS (INSERT INTO comments (article_id, author_id, body) SELECT a.id, $1, $2 FROM articles a WHERE a.slug = $3 " +
+        "RETURNING id, created_at, updated_at) " +
+        "SELECT c.id, c.created_at, c.updated_at, u.username, u.bio, u.image FROM c, users u WHERE u.id = $1";
+
+    /// <summary>$2 comment id, $3 slug. Returns author_id; the comment is deleted only if the viewer wrote it.</summary>
+    public const string DeleteComment =
+        "WITH c AS (SELECT c.id, c.author_id FROM comments c JOIN articles a ON a.id = c.article_id WHERE c.id = $2 AND a.slug = $3), " +
+        "d AS (DELETE FROM comments WHERE id = (SELECT id FROM c WHERE author_id = $1)) " +
+        "SELECT author_id FROM c";
+
+    // ---------- tags ----------
+
+    public const string Tags = "SELECT name FROM tags ORDER BY name";
+}
