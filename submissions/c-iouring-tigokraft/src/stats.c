@@ -12,8 +12,9 @@ typedef struct { uint64_t n; uint32_t b[HB]; } hist_t;
 
 struct stats {
     uint64_t last_us, last_cpu_us;
+    int64_t conns; // open client connections (carried across seconds)
     uint64_t reqs, busy_us, wakes, cqes, maxcqe, maxbusy_us;
-    uint64_t enq, enq_depth_sum, maxdepth;
+    uint64_t enq, enq_depth_sum, maxdepth, maxwq;
     hist_t total, pg_r, pg_rb, pg_w, bc;
 };
 
@@ -72,7 +73,6 @@ void stats_req_done(worker_t *w, uint64_t t0) {
 
 void stats_pg_enq(pgconn_t *c, pgbatch_t *b) {
     stats_t *s = c->w->stats;
-    b->t_enq = stats_now();
     b->behind_w = c->pend_w > 0;
     if (b->is_write) c->pend_w++;
     s->enq++;
@@ -112,6 +112,7 @@ void stats_loop(worker_t *w, uint64_t t0, unsigned n) {
     s->cqes += n;
     if (n > s->maxcqe) s->maxcqe = n;
     s->busy_us += now - t0;
+    if ((uint64_t)w->wq_n > s->maxwq) s->maxwq = w->wq_n;
     if (now - t0 > s->maxbusy_us) s->maxbusy_us = now - t0;
     if (now - s->last_us < 1000000) return;
 
@@ -131,17 +132,21 @@ void stats_loop(worker_t *w, uint64_t t0, unsigned n) {
         c->lat_sum = c->lat_n = 0;
     }
     fprintf(stderr,
-            "STATS w%d req=%lu loopcpu=%.0f%% busy=%.0f%% wake=%lu cqe/wake=%.1f maxcqe=%lu maxwake=%.1fms | "
+            "STATS w%d conns=%ld req=%lu loopcpu=%.0f%% busy=%.0f%% wake=%lu cqe/wake=%.1f maxcqe=%lu maxwake=%.1fms | "
             "tot p50=%.1f p99=%.1f max=%.1f | pgR n=%lu p50=%.1f p99=%.1f | pgR-behind-W n=%lu p50=%.1f p99=%.1f | "
-            "pgW n=%lu p50=%.1f p99=%.1f | bc n=%lu p50=%.0f p99=%.0f | inflight sum=%d max=%d enq-avg=%.1f enq-max=%lu [%s] connlat-ms [%s]\n",
-            w->id, s->reqs, 100.0 * (cpu - s->last_cpu_us) / wall, 100.0 * s->busy_us / wall, s->wakes,
+            "pgW n=%lu p50=%.1f p99=%.1f | bc n=%lu p50=%.0f p99=%.0f | inflight sum=%d max=%d enq-avg=%.1f enq-max=%lu wq=%d wq-max=%lu [%s] connlat-ms [%s]\n",
+            w->id, (long)s->conns, s->reqs, 100.0 * (cpu - s->last_cpu_us) / wall, 100.0 * s->busy_us / wall, s->wakes,
             s->wakes ? (double)s->cqes / s->wakes : 0, s->maxcqe, s->maxbusy_us / 1000.0,
             hpct(&s->total, .5), hpct(&s->total, .99), hpct(&s->total, 1), s->pg_r.n, hpct(&s->pg_r, .5),
             hpct(&s->pg_r, .99), s->pg_rb.n, hpct(&s->pg_rb, .5), hpct(&s->pg_rb, .99), s->pg_w.n,
             hpct(&s->pg_w, .5), hpct(&s->pg_w, .99), s->bc.n, hpct(&s->bc, .5), hpct(&s->bc, .99), tot, mx,
-            s->enq ? (double)s->enq_depth_sum / s->enq : 0, s->maxdepth, snap, lat);
+            s->enq ? (double)s->enq_depth_sum / s->enq : 0, s->maxdepth, w->wq_n, s->maxwq, snap, lat);
     uint64_t keep_last_cpu = cpu;
+    int64_t conns = s->conns;
     memset(s, 0, sizeof *s);
+    s->conns = conns;
     s->last_us = now;
     s->last_cpu_us = keep_last_cpu;
 }
+
+void stats_conn(worker_t *w, int d) { w->stats->conns += d; }

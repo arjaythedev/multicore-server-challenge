@@ -232,6 +232,7 @@ static void conn_arm_recv(conn_t *c) {
 
 static void conn_maybe_free(conn_t *c) {
     if (!c->closing || c->recv_armed || c->send_inflight || c->req) return;
+    if (UNLIKELY(STATS_ON)) stats_conn(c->w, -1);
     close(c->fd);
     buf_free(&c->in);
     buf_free(&c->out);
@@ -548,6 +549,7 @@ static void on_accept(worker_t *w, struct io_uring_cqe *cqe) {
         if (!c) die("out of memory");
         c->w = w;
         c->fd = fd;
+        if (UNLIKELY(STATS_ON)) stats_conn(w, 1);
         conn_arm_recv(c);
     } else if (cqe->res != -EAGAIN && cqe->res != -EINTR && cqe->res != -ECONNABORTED) {
         logf_("accept: %s", strerror(-cqe->res));
@@ -712,6 +714,11 @@ int main(int argc, char **argv) {
     CFG.db_conns = env_int("DB_CONNS", ncpu * 4 > 95 ? 95 : ncpu * 4);
     CFG.bcrypt_threads = env_int("BCRYPT_THREADS", ncpu >= 2 ? ncpu / 2 : 1);
     CFG.bcrypt_lanes = env_int("BCRYPT_LANES", BC_LANES);
+    // Batches in flight per Postgres connection; the rest wait in one FIFO per worker (pg.c). Past saturation
+    // this makes every request wait in arrival order instead of behind whatever happens to be queued on its
+    // connection: at 10,000 users x0.1, p95 465-477 -> 429-432 ms, p99 515-525 -> 456-466 ms, same req/s.
+    // 2-4 starve the backends (-4..-7% req/s while the loop refills them); 16..64 are equivalent.
+    CFG.pg_depth = env_int("PG_DEPTH", 16);
     CFG.bcrypt_wait_ms = getenv("BCRYPT_WAIT_MS") ? atoi(getenv("BCRYPT_WAIT_MS")) : 150;
     if (CFG.bcrypt_lanes > BC_LANES) CFG.bcrypt_lanes = BC_LANES;
     // Session settings on our own connections. force_generic_plan: every prepared statement keeps one plan

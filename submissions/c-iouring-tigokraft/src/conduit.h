@@ -89,7 +89,7 @@ typedef struct {
     char *db_host, *db_port, *db_user, *db_pass, *db_name;
     char *host, *port;
     char *pg_session; // extra session settings sent at startup: name=value,name=value
-    int threads, db_conns, bcrypt_threads, bcrypt_lanes, bcrypt_wait_ms;
+    int threads, db_conns, bcrypt_threads, bcrypt_lanes, bcrypt_wait_ms, pg_depth;
     hmac_key_t jwt_key;
 } config_t;
 extern config_t CFG;
@@ -108,7 +108,8 @@ typedef struct pgbatch {
     struct pgbatch *next;
     struct req *req;
     void (*cb)(struct req *, struct pgbatch *);
-    struct pgconn *conn;
+    struct pgconn *conn; // NULL while the batch waits in the worker's queue
+    buf_t *buf, own;     // where its messages are built: the connection's output, or `own` while queued
     int nst, cur;
     bool failed, is_write, behind_w; // is_write/behind_w/t_enq: STATS=1 only
     uint64_t t_enq;
@@ -153,6 +154,7 @@ void stats_pg_enq(pgconn_t *c, pgbatch_t *b);
 void stats_pg_done(pgconn_t *c, pgbatch_t *b);
 void stats_bc_done(struct worker *w, uint64_t t0);
 void stats_loop(struct worker *w, uint64_t t0, unsigned n);
+void stats_conn(struct worker *w, int d);
 bool stmt_is_write(int stmt);
 
 // ---------- event loop (server.c) ----------
@@ -178,6 +180,8 @@ typedef struct worker {
     char *rbuf; // receive scratch: data is copied out at once, so idle connections own no buffer
     pgconn_t *pg;
     int npg;
+    pgbatch_t *wq_head, *wq_tail; // batches waiting for a pipeline slot, oldest first
+    int wq_n;
     int efd;
     uint64_t efd_val;
     pthread_mutex_t mu;

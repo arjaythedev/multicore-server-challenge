@@ -284,21 +284,30 @@ void pg_connect(pgconn_t *c, worker_t *w) {
 
 static const char SYNC[5] = {'S', 0, 0, 0, 4};
 
+// A connection carries at most CFG.pg_depth batches at a time; the rest wait in the worker's FIFO queue and go
+// out, oldest first, as replies free slots. A batch built while a connection has room (and nothing is queued)
+// is written straight into that connection's output buffer; otherwise into its own buffer until it is placed.
 pgbatch_t *pg_begin(req_t *r, void (*cb)(req_t *, pgbatch_t *)) {
     worker_t *w = r->w;
-    pgconn_t *best = &w->pg[0];
-    for (int i = 1; i < w->npg; i++)
-        if (w->pg[i].inflight < best->inflight) best = &w->pg[i];
     pgbatch_t *b = arena_alloc(&r->arena, sizeof *b);
     memset(b, 0, sizeof *b);
     b->req = r;
     b->cb = cb;
-    b->conn = best;
+    b->buf = &b->own;
+    if (!w->wq_head) {
+        pgconn_t *best = &w->pg[0];
+        for (int i = 1; i < w->npg; i++)
+            if (w->pg[i].inflight < best->inflight) best = &w->pg[i];
+        if (best->inflight < CFG.pg_depth) {
+            b->conn = best;
+            b->buf = &best->out;
+        }
+    }
     return b;
 }
 
 void pg_stmt(pgbatch_t *b, int stmt, const str_t *params) {
-    buf_t *o = &b->conn->out;
+    buf_t *o = b->buf;
     const stmt_def_t *d = &STMTS[stmt];
     size_t at = o->len;
     buf_putc(o, 'B');
@@ -325,14 +334,43 @@ void pg_stmt(pgbatch_t *b, int stmt, const str_t *params) {
     if (UNLIKELY(STATS_ON) && stmt_is_write(stmt)) b->is_write = true;
 }
 
-void pg_end(pgbatch_t *b) {
-    pgconn_t *c = b->conn;
-    buf_put(&c->out, SYNC, sizeof SYNC);
+static void pg_link(pgconn_t *c, pgbatch_t *b) {
+    b->conn = c;
     if (c->tail) c->tail->next = b;
     else c->head = b;
     c->tail = b;
     c->inflight++;
     if (UNLIKELY(STATS_ON)) stats_pg_enq(c, b);
+}
+
+void pg_end(pgbatch_t *b) {
+    buf_put(b->buf, SYNC, sizeof SYNC);
+    if (UNLIKELY(STATS_ON)) b->t_enq = stats_now();
+    if (b->conn) {
+        pg_link(b->conn, b);
+        return;
+    }
+    worker_t *w = b->req->w;
+    b->next = NULL;
+    if (w->wq_tail) w->wq_tail->next = b;
+    else w->wq_head = b;
+    w->wq_tail = b;
+    w->wq_n++;
+}
+
+// Moves queued batches onto `c` while it has room.
+static void pg_fill(pgconn_t *c) {
+    worker_t *w = c->w;
+    while (w->wq_head && c->inflight < CFG.pg_depth) {
+        pgbatch_t *b = w->wq_head;
+        w->wq_head = b->next;
+        if (!w->wq_head) w->wq_tail = NULL;
+        w->wq_n--;
+        b->next = NULL;
+        buf_put(&c->out, b->own.p, b->own.len);
+        buf_free(&b->own);
+        pg_link(c, b);
+    }
 }
 
 void pg_flush(pgconn_t *c) {
@@ -433,6 +471,7 @@ void pg_on_recv(pgconn_t *c, int res) {
             if (!c->head) c->tail = NULL;
             c->inflight--;
             if (UNLIKELY(STATS_ON)) stats_pg_done(c, b);
+            pg_fill(c);
             b->cb(b->req, b);
             break;
         default: // BindComplete, notices, parameter status, ...
