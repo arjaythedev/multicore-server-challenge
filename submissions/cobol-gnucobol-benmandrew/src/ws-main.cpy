@@ -1,0 +1,120 @@
+*> ---------- sizes ----------
+78 MAX-FD            VALUE 65536.
+78 MAX-PG            VALUE 8.
+78 EAGAIN            VALUE 11.
+78 EINTR             VALUE 4.
+
+*> Arguments passed BY VALUE to C: int unless named -D (64-bit: size_t, pointers, long).
+01 K-0               BINARY-LONG VALUE 0.
+01 K-AF-UNIX         BINARY-LONG VALUE 1.
+01 K-AF-INET         BINARY-LONG VALUE 2.
+01 K-SOCK-STREAM     BINARY-LONG VALUE 1.
+01 K-SOCK-STREAM-NB  BINARY-LONG VALUE 2049.
+01 K-SOCK-NONBLOCK   BINARY-LONG VALUE 2048.
+01 K-SOL-SOCKET      BINARY-LONG VALUE 1.
+01 K-SO-REUSEADDR    BINARY-LONG VALUE 2.
+01 K-SO-REUSEPORT    BINARY-LONG VALUE 15.
+01 K-IPPROTO-TCP     BINARY-LONG VALUE 6.
+01 K-TCP-NODELAY     BINARY-LONG VALUE 1.
+01 K-OPT-ON          BINARY-LONG VALUE 1.
+01 K-OPT-LEN         BINARY-LONG VALUE 4.
+01 K-SA-LEN          BINARY-LONG VALUE 16.
+01 K-BACKLOG         BINARY-LONG VALUE 4096.
+01 K-F-SETFL         BINARY-LONG VALUE 4.
+01 K-O-NONBLOCK      BINARY-LONG VALUE 2048.
+01 K-CTL-ADD         BINARY-LONG VALUE 1.
+01 K-CTL-DEL         BINARY-LONG VALUE 2.
+01 K-CTL-MOD         BINARY-LONG VALUE 3.
+01 K-EV-IN           BINARY-LONG VALUE 1.
+01 K-EV-OUT          BINARY-LONG VALUE 4.
+01 K-EV-INOUT        BINARY-LONG VALUE 5.
+01 K-EV-MAX          BINARY-LONG VALUE 512.
+01 K-IOV-2           BINARY-LONG VALUE 2.
+01 K-SIGPIPE         BINARY-LONG VALUE 13.
+01 K-SIGTERM         BINARY-LONG VALUE 15.
+01 K-SIG-IGN-D       BINARY-DOUBLE VALUE 1.
+01 K-PDEATHSIG-D     BINARY-DOUBLE VALUE 1.
+01 K-SIGTERM-D       BINARY-DOUBLE VALUE 15.
+01 K-CLOCK-MONO      BINARY-LONG VALUE 1.
+01 K-16-D            BINARY-DOUBLE VALUE 16.
+01 K-18              BINARY-LONG VALUE 18.
+01 K-32              BINARY-LONG VALUE 32.
+01 K-32-D            BINARY-DOUBLE VALUE 32.
+01 K-10-D            BINARY-DOUBLE VALUE 10.
+01 K-30              BINARY-LONG VALUE 30.
+01 K-COST-D          BINARY-DOUBLE VALUE 10.
+01 NULL-PTR          USAGE POINTER VALUE NULL.
+
+*> ---------- byte and integer scratch ----------
+*> Binary fields are native (little-endian) except PIC S9(n) COMP, which is big-endian. Byte order is swapped
+*> by moving single bytes, which compiles to plain C; MOVE between binary fields of different sizes does not.
+01 BYTE-V            BINARY-CHAR UNSIGNED.
+01 BYTE-X REDEFINES BYTE-V PIC X.
+01 BYTE2-V           BINARY-CHAR UNSIGNED.
+01 BYTE2-X REDEFINES BYTE2-V PIC X.
+01 BYTE3-V           BINARY-CHAR UNSIGNED.
+01 BYTE3-X REDEFINES BYTE3-V PIC X.
+01 L32               BINARY-LONG.
+01 L32-X REDEFINES L32 PIC X(4).
+
+*> ---------- configuration ----------
+01 ENV-VAL           PIC X(1024).
+01 DB-URL            PIC X(1024).
+01 URL-SCHEME        PIC X(32).
+01 URL-REST          PIC X(1024).
+01 URL-USERINFO      PIC X(512).
+01 URL-HOSTPART      PIC X(512).
+01 URL-HOSTPORT      PIC X(512).
+01 DB-USER           PIC X(128).
+01 DB-USER-LEN       BINARY-LONG.
+01 DB-PASS           PIC X(256).
+01 DB-PASS-LEN       BINARY-LONG.
+01 DB-HOST           PIC X(128).
+01 DB-HOST-LEN       BINARY-LONG.
+01 DB-HOST-Z         PIC X(129).
+01 DB-PORT-STR       PIC X(8).
+01 DB-PORT           BINARY-LONG.
+01 DB-NAME           PIC X(128).
+01 DB-NAME-LEN       BINARY-LONG.
+01 PCT-SRC           PIC X(256).
+01 PCT-SRC-LEN       BINARY-LONG.
+01 PCT-I             BINARY-LONG.
+01 PCT-O             BINARY-LONG.
+01 LISTEN-HOST       PIC X(64).
+01 LISTEN-HOST-Z     PIC X(65).
+01 LISTEN-PORT       BINARY-LONG.
+01 N-WORKERS         BINARY-LONG.
+01 N-PG              BINARY-LONG.
+01 MAX-SYNCS         BINARY-LONG.
+01 JWT-SECRET        PIC X(1024).
+01 JWT-SECRET-LEN    BINARY-LONG.
+01 SESSION-SQL       PIC X(1024).
+01 SESSION-SQL-LEN   BINARY-LONG.
+01 BC-WAIT-MS        BINARY-LONG.
+01 BC-THREADS        BINARY-LONG.
+01 BC-NICE           BINARY-LONG.
+01 NUM-ED            PIC Z(9)9.
+01 NUM-ED2           PIC Z(9)9.
+
+*> ---------- processes ----------
+01 W                 BINARY-LONG.
+01 WORKER-INDEX      BINARY-LONG.
+01 PID               BINARY-LONG.
+01 WAIT-STATUS       BINARY-LONG.
+01 N-CHILDREN        BINARY-LONG.
+01 CHILD-PIDS.
+   05 CHILD-PID      BINARY-LONG OCCURS 300.
+*> One socketpair per worker to the bcrypt process: [1] stays in the worker, [2] in the bcrypt process.
+01 BC-PAIRS.
+   05 BC-PAIR OCCURS 256.
+      10 BC-PAIR-FD  BINARY-LONG OCCURS 2.
+01 PAIR-FDS.
+   05 PAIR-FD        BINARY-LONG OCCURS 2.
+01 J                 BINARY-LONG.
+
+*> ---------- time ----------
+01 TS.
+   05 TS-SEC         BINARY-DOUBLE.
+   05 TS-NSEC        BINARY-DOUBLE.
+01 NOW-MS            BINARY-DOUBLE.
+01 NOW-SEC           BINARY-DOUBLE.
