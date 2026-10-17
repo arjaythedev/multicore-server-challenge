@@ -55,6 +55,13 @@ differences.
   create article (insert, tags, article_tags via `currval`, then the article, all before one Sync). Comments are
   one statement (`LEFT JOIN LATERAL`), so a missing article and an empty thread are told apart without a second
   query.
+- **The global list's page is bounded by a constant inner limit.** A bare `LIMIT $2` makes the generic plan assume
+  10% of the table (50k rows), so the planner puts a Memoize node on the `users` join, and Memoize zeroes a large
+  hash table on every execution (12% of one backend's CPU in `perf`, in `memset`). The page is now
+  `SELECT ... FROM (SELECT ... ORDER BY id DESC OFFSET $3 LIMIT 100) a LIMIT $2`: `limit` is validated to 1-100, so
+  the rows are the same, and the planner sees at most 10. pgbench A/B: +14.7% on that statement (3 rounds, 0 result
+  mismatches in 2,000 random requests); end to end at 6,000 users x0.1, three interleaved before/after pairs:
+  Postgres 0.178 -> 0.174 cores per 1,000 req/s, 14.2k -> 14.5k req/s.
 - **Session settings on our own connections** (sent in the startup message; allowed by rule 2):
   `plan_cache_mode = force_generic_plan` (Postgres otherwise keeps re-planning several statements; pgbench A/B:
   +41% list, +12% article throughput), `jit = off`, `max_parallel_workers_per_gather = 0`.
@@ -63,7 +70,14 @@ differences.
   p99, and bcrypt starved into timeouts).
 
 What's left in Postgres is real query work: `perf` shows 85% of its CPU in the executor (B-tree descents, buffer
-lookups) and 9% in the kernel. Tried and dropped: letting several read-only requests share one Sync
+lookups) and 9% in the kernel. Tried and dropped (pgbench A/B against the current statements, interleaved, Postgres on 4 cores): the capped count is
+20-25% of each list statement (1,000 index tuples), and no cheaper exact form exists (`OFFSET 999 LIMIT 1` first:
++3% on global/tag lists, -5% on author/favorited/feed); whole-page set-based subqueries with `= ANY(ids)` for tags,
+favorite counts and authors (-9% to +7%, only the authors one helps, and only the global list); a hash join for tag
+names (-9%); a literal `LIMIT` (+15% on the global list only, same as the bounded form above, 0 elsewhere);
+`enable_memoize = off` (-55%: the plan turns into a hash join of all users); feed: `following` as a constant and
+`IN` as a join, `ANY(array)` for the capped count (+1% to +4.5% together, under the bar). The favorites counts
+mostly cost heap fetches, because writes clear visibility-map bits on the hot articles' pages. Also dropped: letting several read-only requests share one Sync
 (transaction + flush per group instead of per request). It saved no CPU in the full system and serialized reads
 on one backend, raising p99.
 
