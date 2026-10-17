@@ -20,15 +20,20 @@ The CPU budget is the whole game: Postgres, bcrypt and the server share 8 vCPUs,
 users the box serves before p95/p99 break. So the server is built to cost as little as possible per request and
 per idle connection, and to make each request cost Postgres as little as possible.
 
-- **Event loops: 2 threads, each with its own io_uring, its own `SO_REUSEPORT` listener and its own Postgres
-  connections.** Nothing is shared between them. Accepts are multishot. Each connection has one multishot
-  readiness poll and is read with `recv()` into the thread's scratch buffer, so an idle keep-alive connection
-  owns no buffer: about 200 bytes of user memory per connection (80,000 connections: 17 MB RSS).
-  Provided-buffer rings would save the `recv()`, but the Ubuntu 24.04 kernel (6.8.0-142) rejects them.
+- **Event loops: one thread per 4 CPUs (1 up to 7 CPUs, 2 on the 8-vCPU box), each with its own io_uring, its
+  own `SO_REUSEPORT` listener and its own Postgres connections.** Nothing is shared between them. Accepts are
+  multishot. Each connection has one multishot readiness poll and is read with `recv()` into the thread's scratch
+  buffer, so an idle keep-alive connection owns no buffer: about 200 bytes of user memory per connection (80,000
+  connections: 17 MB RSS). Provided-buffer rings would save the `recv()`, but the Ubuntu 24.04 kernel
+  (6.8.0-142) rejects them.
 - **One Postgres round trip per request.** Each request's statements go out as one batch (Bind/Execute per
   statement, one Sync), and batches from many requests are pipelined on the same connection without waiting
   for each other's replies. Each batch is its own implicit transaction, committed at its Sync, and the response
   is sent only after Postgres's ReadyForQuery for it, so writes are committed before we answer (rule 6).
+- **At most 16 batches in flight per Postgres connection; the rest wait in one FIFO per event loop.** Without a
+  cap, past saturation every connection's pipeline holds 100+ batches and a request waits behind whatever
+  happened to be queued on the connection it was given; with the cap, requests are served in arrival order.
+  See "Overload behavior" below.
 - **Every statement is prepared once per connection at startup**, results come back in text format, and rows
   are copied straight into the JSON response (timestamps reformatted, `text[]` turned into a JSON array).
 - **bcrypt runs on its own threads** so a ~45 ms hash never stalls an event loop.
@@ -100,24 +105,94 @@ Intel i5-9500, 6 vCPUs: Postgres + server pinned to 4, the load generators to 2.
 
 | Users (think time) | Open connections | req/s | p50 | p95 | p99 | errors | server RSS |
 |---|---|---|---|---|---|---|---|
-| 6,000 (x0.1) | 6,000 | 14,548 | 32 ms | 75 ms | 97 ms | 0 | 10 MB |
-| 80,000 (x2) | 80,000 | 10,615 | 1.1 ms | 5.9 ms | 11.8 ms | 0 | 17 MB |
+| 6,000 (x0.1) | 6,000 | 14,860 | 24 ms | 56 ms | 71 ms | 0 | 9 MB |
+| 80,000 (x2) | 80,000 | 10,603 | 1.1 ms | 5.7 ms | 10.6 ms | 0 | 16 MB |
 | 150,000 (x4) | ~149,000 | 9,952 | 1.0 ms | 5.1 ms | 11.5 ms | 0 | 28 MB |
+
+The 150,000-connection row is from before the event-loop change; on the 2 cores left for load generators it
+cannot be re-run on this VM (the generators fall behind with one loop or two alike).
 
 On these 4 cores the ceiling is about 14k req/s, CPU-bound (~73% Postgres, ~14% bcrypt, ~13% kernel TCP; this
 server's own code is a few percent). At the real 7 s think time that is roughly 55k users per 4 such cores.
 Connections cost almost nothing, so on the 8-vCPU box the limit is CPU, not the connection count; the hard cap
 is the unit's `LimitNOFILE=200000`.
 
+## Overload behavior
+
+The score is the highest user count that still passes (p95 < 500 ms, p99 < 1 s, < 1% errors), so what the server
+does past saturation matters. Measured on the 4-core slice of the VM described above (think time x0.1, a
+2.5-minute warm-up at full load before a 2-minute measurement, because a fresh database copy is about 8% faster
+than one that has taken a few minutes of writes):
+
+| Users (x0.1) | before: req/s, p50 / p95 / p99 | now: req/s, p50 / p95 / p99 |
+|---|---|---|
+| 9,500 | 12.5k, 384 / 490 / 541 ms | 12.7k, 370 / 425 / 458 ms |
+| 10,000 | 12.4k, 430 / 540 / 595 ms (3 runs, all fail) | 12.8k, 405 / 455 / 481 ms (3 runs, all pass) |
+| 10,500 | 12.3k, 475 / 587 / 638 ms | 12.8k, 445 / 501 / 543 ms (2 of 3 pass) |
+| 11,000 | 12.1k, 536 / 659 / 717 ms | 12.1k, 530 / 603 / 647 ms |
+| 13,000 | 11.8k, 731 / 877 / 944 ms | 12.2k, 692 / 752 / 780 ms |
+| 16,000 | | 11.6k, 1008 / 1096 / 1134 ms |
+
+The limit moved from about 9,500 to 10,000 users (x0.1): a 5-minute hold at 10,000 (after a 3-minute warm-up at
+full load) passes with 12.8k req/s, p50 404 / p95 458 / p99 485 ms, max 849 ms, 0 errors; a hold at 10,500 fails
+on p95 (513 ms; p99 553 ms). By the 80,000-user row that is roughly 48,000 real users per 4 cores. Nothing breaks past it: no errors up to
+16,000 users, throughput falls about 9% between 10,000 and 16,000 users (12.8k to 11.6k req/s; the server's
+CPU share rises from 1.1 to 1.4 cores while Postgres's falls), and latency grows linearly, as it must in a closed
+loop (users in the system = req/s x (think + latency)).
+
+What the measurements showed (`STATS=1`, vmstat/mpstat, the Postgres log, per-second p99 from the load generator):
+
+- **The tail is queueing, not stalls.** The per-second p99 timeline is flat with a noise of +-20%, no spikes. At
+  saturation a request's server-side latency equals its Postgres batch latency to within the histogram's
+  resolution (both 328 ms in the 10,000-user runs), so the time is spent waiting for Postgres: at 7,000 users
+  before the cap, 50-110 batches were queued on each of the 32 connections.
+- **Head-of-line blocking behind write commits does not matter here.** A commit waits ~0.7 ms for the WAL flush
+  (iostat: 200 flushes/s, w_await 0.74 ms) while the queue ahead of it is hundreds of milliseconds long. Write
+  batches and read batches show the same latency, so separate connections for writes, or reordering reads ahead
+  of a pending write, would not move p95.
+- **Checkpoints and autovacuum do not show up in the tail.** `log_checkpoints` shows spread-out checkpoints
+  (`checkpoint_completion_target`) and 10-30 autovacuum runs per 20 minutes on `favorites`, `follows` and
+  `article_tags`; neither correlates with the per-second p99 (max 500-570 ms against a median of 400-450).
+- **Drift: capacity falls about 8% in the first 5 minutes after a fresh database copy, then holds.** A 20-minute
+  run at 9,500 users: 13.7k req/s in minutes 0-2, 12.6k in minutes 4-6, then 12.8-13.0k until the end (p50
+  315 -> 379 -> 355-365 ms, mean of the per-second p99 360 -> 428 -> 400-413 ms, worst second 502 ms). Writes added
+  300k favorites and 210k comments (+6%, +8%). Server RSS stayed at 31 MB, errors 0, the 4 cores 98% busy
+  throughout. The cause is probably on the Postgres side: visibility-map bits cleared by writes (more heap
+  fetches in the index-only scans), which autovacuum partly restores, but that was not isolated.
+- **Uneven pipelines and the cap.** Without a cap on batches per connection, a request waits behind whatever
+  its connection happens to have queued, and p95 sat 28% above p50. Capping the pipeline at 16 batches and
+  queueing the rest in one FIFO per event loop serves requests in arrival order: p95/p50 28% -> 18%, same
+  req/s. At 10,000 users, 3 interleaved pairs on a fresh database: p95 465 / 477 / 475 -> 429 / 429 / 432 ms, p99 514 / 529 / 525 -> 456 / 466 / 460 ms, req/s
+  13.4-13.5k both. A cap of 2-4 starves the Postgres backends while the loop refills them (-4% to -7% req/s); 8
+  to 64 are equivalent within noise.
+- **One event loop per 4 CPUs.** With the FIFO, one loop thread on the 4 cores beat two: 14.0k vs 13.3k req/s
+  (+5%), p95 385-392 vs 434-445 ms at 10,000 users (2 pairs), and at 6,000 users 14.9k vs 14.0-14.5k req/s, p95 56
+  vs 74-87 ms (2 pairs). Fewer context switches (vmstat, whole VM: 32k/s vs 49k/s) and larger io_uring
+  wake-ups (about 3.1 completions per wake instead of 2.2). Three loops are worse (p95 490-503 ms). On the
+  8-vCPU box the rule gives two loops, which carry the same load per loop (about 0.55 core each) as the one loop
+  here; that has not been measured on 8 cores.
+- **Aged database, 3 interleaved pairs at 10,000 users** (final vs the starting binary): req/s 12.25 / 12.46 / 12.37k
+  -> 12.60 / 12.83 / 12.96k; p95 549 / 540 / 538 -> 469 / 452 / 443 ms; p99 602 / 596 / 586 -> 493 / 481 / 469 ms.
+
+Tried and dropped: balancing the two loops' connection counts (4,941 vs 5,060 under hash distribution; no change
+in p95 in 3 pairs); 12 to 64 Postgres connections with the FIFO (12-32 are equal, 48+ have a worse p99).
+
+`STATS=1` is off by default (the hooks are one predictable branch each). When on, every second each event loop
+prints: requests, loop thread CPU and time spent handling completions, completions per wake-up, server-side latency
+percentiles (whole request; Postgres batches split into reads, reads queued behind a write, writes; bcrypt jobs),
+batches in flight per connection, the FIFO length, and the mean batch latency per connection.
+
 ## Tuning knobs (environment, all optional)
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `THREADS` | 2 (1 below 4 CPUs) | event-loop threads |
+| `THREADS` | CPUs / 4, at least 1 | event-loop threads |
+| `PG_DEPTH` | 16 | batches in flight per Postgres connection; more wait in the event loop's FIFO |
 | `DB_CONNS` | 4 x CPUs, max 95 | Postgres connections, split over the threads |
 | `BCRYPT_THREADS` | CPUs / 2 | bcrypt threads |
 | `BCRYPT_LANES` | 4 | hashes per bcrypt batch |
 | `BCRYPT_WAIT_MS` | 150 | how long a login may wait for its batch to fill |
+| `STATS` | off | `STATS=1` prints one line per event loop per second to stderr (see below) |
 | `PG_SESSION` | `plan_cache_mode=force_generic_plan,jit=off,max_parallel_workers_per_gather=0` | session settings |
 
 ## Rules
