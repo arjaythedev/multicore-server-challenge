@@ -59,8 +59,12 @@ const stmt_def_t STMTS[] = {
                     2, {INT8, TEXT}},
     [S_USER_BY_NAME] = {"SELECT username, bio, image FROM users WHERE username = $1", 1, {TEXT}},
 
+    // limit is validated to 1-100, so OFFSET $3 LIMIT 100 inside and LIMIT $2 outside return the same rows as
+    // LIMIT $2 OFFSET $3. A bare LIMIT $2 makes the generic plan assume 10% of the table, which picks a Memoize
+    // node for the users join that zeroes a huge hash table on every execution.
     [S_LIST_ALL] = {LIST_Q("SELECT 1 FROM articles a",
-                           "SELECT " PAGE_COLS " FROM articles a ORDER BY a.id DESC LIMIT $2 OFFSET $3"),
+                           "SELECT " PAGE_COLS " FROM (SELECT " PAGE_COLS " FROM articles a ORDER BY a.id DESC "
+                           "OFFSET $3 LIMIT 100) a LIMIT $2"),
                     3, {INT8, INT8, INT8}},
     [S_LIST_TAG] = {LIST_Q("SELECT 1 FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = $4)",
                            "SELECT " PAGE_COLS " FROM articles a WHERE a.id IN (SELECT at.article_id FROM article_tags at "
