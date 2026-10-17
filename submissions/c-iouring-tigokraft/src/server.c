@@ -44,6 +44,7 @@ static bool gathering;
 
 void submit_job(job_t *j) {
     j->next = NULL;
+    if (UNLIKELY(STATS_ON)) j->t0 = stats_now();
     pthread_mutex_lock(&jobs_mu);
     if (jobs_tail) jobs_tail->next = j;
     else jobs_head = j;
@@ -211,6 +212,7 @@ static void on_event(worker_t *w) {
     pthread_mutex_unlock(&w->mu);
     while (j) {
         job_t *next = j->next;
+        if (UNLIKELY(STATS_ON)) stats_bc_done(w, j->t0);
         j->cb(j->r, j);
         j = next;
     }
@@ -325,6 +327,7 @@ void reply(req_t *r, int status, const buf_t *body) {
     conn_t *c = r->c;
     bool keepalive = r->keepalive;
     c->req = NULL;
+    if (UNLIKELY(STATS_ON)) stats_req_done(r->w, r->t0);
     req_free(r);
     if (c->closing) { conn_maybe_free(c); return; }
     write_response(c, status, body, keepalive);
@@ -461,6 +464,7 @@ static int conn_parse(conn_t *c) {
     r->c = c;
     r->w = c->w;
     r->keepalive = keepalive;
+    if (UNLIKELY(STATS_ON)) r->t0 = stats_now();
     char *raw = arena_alloc(&r->arena, total + 1);
     memcpy(raw, in, total);
     raw[total] = 0;
@@ -561,6 +565,7 @@ static void *worker_main(void *arg) {
     worker_t *w = arg;
     pthread_setname_np(pthread_self(), "loop");
     for (int i = 0; i < w->npg; i++) pg_connect(&w->pg[i], w);
+    if (STATS_ON) stats_init(w);
 
     struct io_uring_params p = {0};
     p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_COOP_TASKRUN | IORING_SETUP_CQSIZE;
@@ -589,6 +594,7 @@ static void *worker_main(void *arg) {
         for (int i = 0; i < w->npg; i++) pg_flush(&w->pg[i]);
         ret = io_uring_submit_and_wait(&w->ring, 1);
         if (ret < 0 && ret != -EINTR && ret != -EAGAIN && ret != -EBUSY) die("io_uring_submit_and_wait: %s", strerror(-ret));
+        uint64_t t_wake = UNLIKELY(STATS_ON) ? stats_now() : 0;
         struct io_uring_cqe *cqe;
         unsigned head, n = 0;
         io_uring_for_each_cqe(&w->ring, head, cqe) {
@@ -605,6 +611,7 @@ static void *worker_main(void *arg) {
             }
         }
         io_uring_cq_advance(&w->ring, n);
+        if (UNLIKELY(STATS_ON)) stats_loop(w, t_wake, n);
     }
     return NULL;
 }
@@ -688,6 +695,7 @@ int main(int argc, char **argv) {
     setvbuf(stderr, NULL, _IOLBF, 0);
     if (argc > 1 && !strcmp(argv[1], "--bcrypt-selftest")) return bcrypt_selftest();
     signal(SIGPIPE, SIG_IGN);
+    STATS_ON = getenv("STATS") && *getenv("STATS") && strcmp(getenv("STATS"), "0") != 0;
     const char *url = getenv("DATABASE_URL"), *secret = getenv("JWT_SECRET");
     if (!url || !*url || !secret || !*secret) die("DATABASE_URL and JWT_SECRET are required");
     parse_db_url(url);

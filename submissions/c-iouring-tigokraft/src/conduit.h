@@ -110,7 +110,8 @@ typedef struct pgbatch {
     void (*cb)(struct req *, struct pgbatch *);
     struct pgconn *conn;
     int nst, cur;
-    bool failed;
+    bool failed, is_write, behind_w; // is_write/behind_w/t_enq: STATS=1 only
+    uint64_t t_enq;
     char sqlstate[6];
     pgst_t st[PG_MAXST];
 } pgbatch_t;
@@ -124,6 +125,8 @@ typedef struct pgconn {
     buf_t in;
     pgbatch_t *head, *tail;
     int inflight;
+    int pend_w; // STATS=1: write batches in the pipeline
+    uint64_t lat_sum, lat_n; // STATS=1: batch latency this second
 } pgconn_t;
 
 typedef struct { const char *sql; int nparams; uint32_t oids[8]; } stmt_def_t;
@@ -139,6 +142,19 @@ void pg_on_send(pgconn_t *c, int res);
 void pg_on_recv(pgconn_t *c, int res);
 void pg_arm_recv(pgconn_t *c);
 
+// ---------- optional diagnostics (stats.c), STATS=1 ----------
+
+extern bool STATS_ON;
+typedef struct stats stats_t;
+uint64_t stats_now(void); // microseconds, monotonic
+void stats_init(struct worker *w);
+void stats_req_done(struct worker *w, uint64_t t0);
+void stats_pg_enq(pgconn_t *c, pgbatch_t *b);
+void stats_pg_done(pgconn_t *c, pgbatch_t *b);
+void stats_bc_done(struct worker *w, uint64_t t0);
+void stats_loop(struct worker *w, uint64_t t0, unsigned n);
+bool stmt_is_write(int stmt);
+
 // ---------- event loop (server.c) ----------
 
 enum { UD_ACCEPT = 1, UD_RECV, UD_SEND, UD_PGRECV, UD_PGSEND, UD_EVENT };
@@ -151,6 +167,7 @@ typedef struct job {
     const char *pw, *setting;
     char out[128];
     bool ok;
+    uint64_t t0; // STATS=1: submit time
     void (*cb)(struct req *, struct job *);
 } job_t;
 
@@ -166,6 +183,7 @@ typedef struct worker {
     pthread_mutex_t mu;
     job_t *done;
     buf_t body; // scratch for building a response body
+    struct stats *stats; // STATS=1 only
     pthread_t th;
 } worker_t;
 
@@ -193,6 +211,7 @@ typedef struct req {
     str_t token;
     // handler scratch
     int kind;
+    uint64_t t0; // STATS=1: arrival time
     int64_t limit, offset, id;
     str_t s[8];
     void *ctx;

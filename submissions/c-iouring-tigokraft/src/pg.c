@@ -322,6 +322,7 @@ void pg_stmt(pgbatch_t *b, int stmt, const str_t *params) {
     static const char exec[10] = {'E', 0, 0, 0, 9, 0, 0, 0, 0, 0};
     buf_put(o, exec, sizeof exec);
     b->nst++;
+    if (UNLIKELY(STATS_ON) && stmt_is_write(stmt)) b->is_write = true;
 }
 
 void pg_end(pgbatch_t *b) {
@@ -331,6 +332,7 @@ void pg_end(pgbatch_t *b) {
     else c->head = b;
     c->tail = b;
     c->inflight++;
+    if (UNLIKELY(STATS_ON)) stats_pg_enq(c, b);
 }
 
 void pg_flush(pgconn_t *c) {
@@ -430,6 +432,7 @@ void pg_on_recv(pgconn_t *c, int res) {
             c->head = b->next;
             if (!c->head) c->tail = NULL;
             c->inflight--;
+            if (UNLIKELY(STATS_ON)) stats_pg_done(c, b);
             b->cb(b->req, b);
             break;
         default: // BindComplete, notices, parameter status, ...
