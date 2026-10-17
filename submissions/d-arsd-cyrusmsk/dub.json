@@ -1,0 +1,39 @@
+{
+	"targetName": "server",
+	"authors": [
+		"cyrusmsk"
+	],
+	"license": "MIT",
+	"targetPath": "bin",
+	"dflags": [
+		"-mcpu=native"
+	],
+	"name": "conduit-arsd",
+	"copyright": "Copyright (c) 2026 cyrusmsk",
+	"sourcePaths": [
+		"source"
+	],
+	"description": "RealWorld Conduit API server in D on arsd.cgi + arsd.postgres (multicore server challenge)",
+	"dependencies": {
+		"arsd-official:database_base": "~>12.1",
+		"passwd": "~>0.3.0",
+		"arsd-official:core": "~>12.1",
+		"arsd-official:postgres": "~>12.1",
+		"jwtlited:phobos": "~>1.4",
+		"arsd-official:cgi": "~>12.1",
+		"asdf": "~>0.8.0"
+	},
+	"targetType": "executable",
+	"configurations": [
+		{
+			"platforms": [
+				"linux"
+			],
+			"targetType": "executable",
+			"subConfigurations": {
+				"arsd-official:cgi": "embedded_httpd_hybrid"
+			},
+			"name": "fiber-server"
+		}
+	]
+}

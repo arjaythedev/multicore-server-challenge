@@ -1,0 +1,12 @@
+{
+	"fileVersion": 1,
+	"versions": {
+		"arsd-official": "12.1.2",
+		"asdf": "0.8.0",
+		"jwtlited": "1.4.0",
+		"mir-algorithm": "3.22.4",
+		"mir-core": "1.7.4",
+		"passwd": "0.3.1",
+		"silly": "1.1.1"
+	}
+}
