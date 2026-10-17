@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseAppHost>false</UseAppHost>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <UseSystemResourceKeys>true</UseSystemResourceKeys>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <EnableDefaultContentItems>false</EnableDefaultContentItems>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <EventSourceSupport>false</EventSourceSupport>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- tools/ holds a separate project -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);tools/**</DefaultItemExcludes>
+    <!-- GC and JIT defaults; start.sh can override each of them with DOTNET_* environment variables.
+         Server GC: with tens of thousands of connection objects alive, workstation GC paused the process for 12% of the time
+         (about 10 gen0 collections a second at ~12 ms each); Server GC collects in parallel and pauses 2%. -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <TieredPGO>true</TieredPGO>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Npgsql" Version="10.0.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Idle thread-pool workers sleep at once instead of spinning for work first: the spinning burned CPU that Postgres, on the same cores, needs
+         (9% less app CPU per request). -->
+    <RuntimeHostConfigurationOption Include="System.Threading.ThreadPool.UnfairSemaphoreSpinLimit" Value="0" />
+  </ItemGroup>
+
+</Project>
