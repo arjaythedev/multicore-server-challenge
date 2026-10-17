@@ -21,7 +21,11 @@ let package = Package(
                 "CVaporBcrypt",
             ],
             path: "Sources/Conduit",
-            swiftSettings: [.swiftLanguageMode(.v5)]
+            swiftSettings: [
+                .swiftLanguageMode(.v5),
+                .unsafeFlags(["-Ounchecked", "-enforce-exclusivity=unchecked", "-cross-module-optimization"],
+                             .when(configuration: .release)),
+            ]
         ),
         .target(
             name: "CVaporBcrypt",

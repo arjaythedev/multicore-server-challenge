@@ -135,26 +135,26 @@ extension PostgresRow {
 }
 
 extension App {
-    /// ARTICLE_FULL_SELECT with the given WHERE tail; 404 if no row.
-    func writeFullArticle(status: HTTPResponse.Status, query: String, viewer: Int64, key: any PostgresEncodable) async throws -> Response {
-        guard let row = try await queryRow(query, [viewer, key]) else {
+    /// One article as seen by the viewer; 404 if no row.
+    func writeFullArticle<Q: ArticleSQL>(status: HTTPResponse.Status, _ statement: ArticleByKey<Q>) async throws -> Response {
+        guard let article = try await fetchAll(statement).first else {
             throw ApiError(.notFound, "article not found")
         }
-        let body = try row.fullArticle().json(full: true)
-        return jsonResponse(status, "{\"article\":\(body)}")
+        return jsonResponse(status, "{\"article\":\(article.json(full: true))}")
     }
 
-    func writeList(list: String, count: String, viewer: Int64, limit: Int64, offset: Int64,
-                   filter: (any PostgresEncodable)? = nil, countBinds: [any PostgresEncodable] = []) async throws -> Response {
-        let rows = try await queryAll(list, filter.map { [viewer, limit, offset, $0] } ?? [viewer, limit, offset])
+    /// The page and its count run at the same time, on two pooled connections.
+    func writeList<L: ArticleSQL, C: ArticleSQL>(list: ArticleList<L>, count: ArticleCount<C>) async throws -> Response {
+        async let rows = fetchAll(list)
+        async let total = fetchAll(count)
         var out = "{\"articles\":["
         var first = true
-        for row in rows {
+        for article in try await rows {
             if !first { out += "," }
             first = false
-            out += try row.listArticle().json(full: false)
+            out += article.json(full: false)
         }
-        let n = try await queryRow(count, countBinds)!.cell(0).int()
+        let n = try await total.first ?? 0
         out += "],\"articlesCount\":\(n)}"
         return jsonResponse(.ok, out)
     }
@@ -166,34 +166,39 @@ extension App {
         let (limit, offset) = try limitOffset(query)
         // The first non-empty filter in the order tag, author, favorited applies.
         if let tag = query.get("tag"), !tag.isEmpty {
-            return try await writeList(list: listByTag, count: countByTag, viewer: auth.viewer,
-                                       limit: limit, offset: offset, filter: tag, countBinds: [tag])
+            return try await writeList(
+                list: ArticleList<ListByTagSQL>(viewer: auth.viewer, limit: limit, offset: offset, filter: tag),
+                count: ArticleCount<CountByTagSQL>(bind: tag))
         }
         if let author = query.get("author"), !author.isEmpty {
-            return try await writeList(list: listByAuthor, count: countByAuthor, viewer: auth.viewer,
-                                       limit: limit, offset: offset, filter: author, countBinds: [author])
+            return try await writeList(
+                list: ArticleList<ListByAuthorSQL>(viewer: auth.viewer, limit: limit, offset: offset, filter: author),
+                count: ArticleCount<CountByAuthorSQL>(bind: author))
         }
         if let favorited = query.get("favorited"), !favorited.isEmpty {
-            return try await writeList(list: listByFavorite, count: countByFavorite, viewer: auth.viewer,
-                                       limit: limit, offset: offset, filter: favorited, countBinds: [favorited])
+            return try await writeList(
+                list: ArticleList<ListByFavoriteSQL>(viewer: auth.viewer, limit: limit, offset: offset, filter: favorited),
+                count: ArticleCount<CountByFavoriteSQL>(bind: favorited))
         }
-        return try await writeList(list: listAll, count: countAll, viewer: auth.viewer,
-                                   limit: limit, offset: offset)
+        return try await writeList(
+            list: ArticleList<ListAllSQL>(viewer: auth.viewer, limit: limit, offset: offset, filter: nil),
+            count: ArticleCount<CountAllSQL>(bind: nil))
     }
 
     // GET /api/articles/feed
     func feed(_ request: Request, _ ctx: BasicRequestContext) async throws -> Response {
         let auth = try Auth.require(request, secret: secret)
         let (limit, offset) = try limitOffset(QueryParams(request.uri.query))
-        return try await writeList(list: listFeed, count: countFeed, viewer: auth.viewer,
-                                   limit: limit, offset: offset, countBinds: [auth.viewer])
+        return try await writeList(
+            list: ArticleList<ListFeedSQL>(viewer: auth.viewer, limit: limit, offset: offset, filter: nil),
+            count: ArticleCount<CountFeedSQL>(bind: auth.viewer))
     }
 
     // GET /api/articles/:slug
     func getArticle(_ request: Request, _ ctx: BasicRequestContext) async throws -> Response {
         let auth = try Auth.optional(request, secret: secret)
         let slug = ctx.parameters.get("slug") ?? ""
-        return try await writeFullArticle(status: .ok, query: articleBySlug, viewer: auth.viewer, key: slug)
+        return try await writeFullArticle(status: .ok, ArticleByKey<ArticleBySlugSQL>(viewer: auth.viewer, key: slug))
     }
 
     // POST /api/articles
@@ -225,7 +230,7 @@ extension App {
             }
             return newId
         }
-        return try await writeFullArticle(status: .created, query: articleByID, viewer: auth.viewer, key: id)
+        return try await writeFullArticle(status: .created, ArticleByKey<ArticleByIDSQL>(viewer: auth.viewer, key: id))
     }
 
     private func updateArticleBinds(id: Int64, title: String?, description: String?, body: String?) -> PostgresBindings {
@@ -266,7 +271,7 @@ extension App {
         }
         let id = try await ownArticle(slug, viewer: auth.viewer)
         try await exec(updateArticle, binds: updateArticleBinds(id: id, title: title, description: description, body: body))
-        return try await writeFullArticle(status: .ok, query: articleByID, viewer: auth.viewer, key: id)
+        return try await writeFullArticle(status: .ok, ArticleByKey<ArticleByIDSQL>(viewer: auth.viewer, key: id))
     }
 
     // DELETE /api/articles/:slug
@@ -296,6 +301,6 @@ extension App {
         } else {
             try await exec("DELETE FROM favorites WHERE user_id = $1 AND article_id = $2", [auth.viewer, id])
         }
-        return try await writeFullArticle(status: .ok, query: articleByID, viewer: auth.viewer, key: id)
+        return try await writeFullArticle(status: .ok, ArticleByKey<ArticleByIDSQL>(viewer: auth.viewer, key: id))
     }
 }
