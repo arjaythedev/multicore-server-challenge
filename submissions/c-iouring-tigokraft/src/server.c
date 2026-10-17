@@ -707,10 +707,12 @@ int main(int argc, char **argv) {
     cpu_set_t cs;
     int ncpu = sched_getaffinity(0, sizeof cs, &cs) == 0 ? CPU_COUNT(&cs) : (int)sysconf(_SC_NPROCESSORS_ONLN);
     if (ncpu < 1) ncpu = 1;
-    // Measured on 6 CPUs shared with Postgres (results in README.md): two event loops beat one (a lone loop
-    // thread starves among ~40 busy processes) and beat four or six (more threads, more contention); about four
-    // Postgres connections per CPU beat both fewer (idle CPU) and more (more processes fighting for it).
-    CFG.threads = env_int("THREADS", ncpu >= 4 ? 2 : 1);
+    // One event loop per 4 CPUs (a loop costs about 0.55 core at 14k req/s). With the per-worker FIFO (pg.c) a
+    // single loop beat two on 4 cores, all else equal: 14.0k vs 13.3k req/s, p95 387-392 vs 434-445 ms at
+    // 10,000 users x0.1; three were worse (p95 490-503 ms). Earlier, without the FIFO, one loop starved among ~40
+    // busy processes on 6 CPUs and two were best. About four Postgres connections per CPU beat both fewer (idle
+    // CPU) and more (more processes fighting for it).
+    CFG.threads = env_int("THREADS", ncpu >= 8 ? ncpu / 4 : 1);
     CFG.db_conns = env_int("DB_CONNS", ncpu * 4 > 95 ? 95 : ncpu * 4);
     CFG.bcrypt_threads = env_int("BCRYPT_THREADS", ncpu >= 2 ? ncpu / 2 : 1);
     CFG.bcrypt_lanes = env_int("BCRYPT_LANES", BC_LANES);
