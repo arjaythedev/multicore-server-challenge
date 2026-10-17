@@ -9,10 +9,7 @@ enum Bcrypt {
     /// Generates a "$2a$10$<22 chars>" salt (OpenBSD radix-64 of 16 random bytes).
     private static func generateSalt() throws -> String {
         var random = [UInt8](repeating: 0, count: 16)
-        let result = random.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 16, $0.baseAddress!) }
-        if result != errSecSuccess {
-            for i in random.indices { random[i] = UInt8.random(in: 0...255) }
-        }
+        for i in random.indices { random[i] = UInt8.random(in: 0...255) }
         let encoded = [UInt8](unsafeUninitializedCapacity: 22) { buf, count in
             let bytes = UnsafeMutablePointer<Int8>.allocate(capacity: 25)
             defer { bytes.deallocate() }
@@ -68,12 +65,3 @@ enum Bcrypt {
         return diff == 0
     }
 }
-
-#if canImport(Security)
-import Security
-#else
-func SecRandomCopyBytes(_ _: Any, _ count: Int, _ out: UnsafeMutableRawPointer) -> Int32 {
-    for i in 0..<count { (out.assumingMemoryBound(to: UInt8.self) + i).pointee = UInt8.random(in: 0...255) }
-    return 0
-}
-#endif
