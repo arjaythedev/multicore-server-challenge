@@ -295,12 +295,14 @@ extension App {
     func favorite(_ request: Request, _ ctx: BasicRequestContext, fav: Bool) async throws -> Response {
         let auth = try Auth.require(request, secret: secret)
         let slug = ctx.parameters.get("slug") ?? ""
-        let id = try await articleID(slug)
-        if fav {
-            try await exec("INSERT INTO favorites (user_id, article_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", [auth.viewer, id])
-        } else {
-            try await exec("DELETE FROM favorites WHERE user_id = $1 AND article_id = $2", [auth.viewer, id])
+        // One round trip for the lookup and the toggle; no row means no such article (404).
+        let toggle = fav
+            ? "WITH a AS (SELECT id FROM articles WHERE slug = $2), ins AS (INSERT INTO favorites (user_id, article_id) SELECT $1, id FROM a ON CONFLICT DO NOTHING) SELECT id FROM a"
+            : "WITH a AS (SELECT id FROM articles WHERE slug = $2), del AS (DELETE FROM favorites WHERE user_id = $1 AND article_id IN (SELECT id FROM a)) SELECT id FROM a"
+        guard let row = try await queryRow(toggle, [auth.viewer, slug]) else {
+            throw ApiError(.notFound, "article not found")
         }
+        let id = try row.cell(0).int()
         return try await writeFullArticle(status: .ok, ArticleByKey<ArticleByIDSQL>(viewer: auth.viewer, key: id))
     }
 }
