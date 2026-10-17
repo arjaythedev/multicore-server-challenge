@@ -6,18 +6,18 @@
     "authors": ["cyrusmsk"],
     "targetType": "executable",
     "targetPath": "bin",
+    "targetName": "server",
     "sourcePaths": ["source"],
     "dependencies": {
         "vibe-core": "~>2.14.0",
         "vibe-http": "~>1.5.1",
-        "vibe-d-postgresql": "~>3.5.0-alpha.1",
+        "vibe-d-postgresql": "~>3.5.0",
+        "vibe-stream:tls": "~>1.4.1",
         "passwd": "~>0.3.0",
         "jwtlited:openssl": "~>1.4.0",
-        "openssl": "~>3.4.0",
-        "vibe-stream:tls": "~>1.4.1"
+        "openssl": "~>3.4.0"
     },
-    "dflags": ["-mcpu=native"],
-    "dflags-ldc": ["-flto=full"],
+    "dflags": ["-mcpu=native", "-flto=full"],
     "libs": ["ssl", "crypto"],
     "versions": [
       "VibeManualMemoryManagement",

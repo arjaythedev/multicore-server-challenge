@@ -19,7 +19,7 @@
 		"taggedalgebraic": "1.0.1",
 		"vibe-container": "1.7.1",
 		"vibe-core": "2.14.0",
-		"vibe-d-postgresql": "3.5.0-alpha.1",
+		"vibe-d-postgresql": "3.5.0",
 		"vibe-http": "1.5.1",
 		"vibe-inet": "1.3.1",
 		"vibe-serialization": "1.0.7",
