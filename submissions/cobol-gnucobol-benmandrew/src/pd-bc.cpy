@@ -225,8 +225,8 @@ BC-WORKER-EVENT.
 *> ---------- the bcrypt process ----------
 
 *> The collector: an epoll loop over the worker sockets (tag w in the event's high word) and the hasher sockets
-*> (tag 1000 + h). One batch is collected at a time: once a job is queued and a hasher is idle, it waits up to
-*> BC-WAIT-MS for four jobs, or sends at once if four are there. Never returns.
+*> (tag 1000 + h). One batch is collected at a time: once a hasher is idle, it sends at once if four jobs are
+*> queued, and otherwise waits until BC-WAIT-MS after the oldest job arrived. Never returns.
 BC-MAIN.
     CALL "prctl" USING BY VALUE K-PDEATHSIG-D BY VALUE K-SIGTERM-D
     CALL "__errno_location" RETURNING ERRNO-PTR
@@ -382,6 +382,8 @@ BC-ENQUEUE.
     MOVE BC-W TO BC-J-W (BC-QT)
     MOVE BC-H-FD TO BC-J-FD (BC-QT)
     MOVE BC-H-GEN TO BC-J-GEN (BC-QT)
+    PERFORM GET-NOW-MS
+    MOVE NOW-MS TO BC-J-AT (BC-QT)
     IF BC-NUL-AT = 0
         MOVE 0 TO BC-SET-LEN BC-KEY-LEN
     ELSE
@@ -421,15 +423,16 @@ BC-DISPATCH.
             END-IF
         END-PERFORM
         IF BC-HI = 0
+            *> a hasher finishing wakes the loop, so no timer is needed
+            MOVE 0 TO BC-DEADLINE-SET
             EXIT PERFORM
         END-IF
         IF BC-NJ < 4 AND BC-WAIT-MS > 0
+            *> the head job is the oldest, so time from its arrival: a job that queued behind busy hashers has
+            *> already waited and goes as soon as a hasher is idle
+            COMPUTE BC-DEADLINE = BC-J-AT (BC-QH) + BC-WAIT-MS
+            MOVE 1 TO BC-DEADLINE-SET
             PERFORM GET-NOW-MS
-            IF BC-DEADLINE-SET = 0
-                COMPUTE BC-DEADLINE = NOW-MS + BC-WAIT-MS
-                MOVE 1 TO BC-DEADLINE-SET
-                EXIT PERFORM
-            END-IF
             IF NOW-MS < BC-DEADLINE
                 EXIT PERFORM
             END-IF

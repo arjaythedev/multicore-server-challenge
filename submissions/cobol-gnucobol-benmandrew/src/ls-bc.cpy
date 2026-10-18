@@ -5,6 +5,7 @@
       10 BC-J-W      BINARY-LONG.
       10 BC-J-FD     BINARY-LONG.
       10 BC-J-GEN    BINARY-LONG.
+      10 BC-J-AT     BINARY-DOUBLE.
       10 BC-J-SET    PIC X(128).
       10 BC-J-KEY    PIC X(80).
 01 L-BC-WB.
