@@ -21,9 +21,10 @@ actor \nodoc\ _WorkerOverlapTest is (_QueryClient & _WorkerBarrier)
   var _barrier: Bool = false
   var _second: Bool = false
 
-  new create(auth: TCPConnectAuth, config: _Config, env: Env) =>
+  new create(auth: TCPConnectAuth, config: _Config, env: Env,
+    layout: _DatabaseLayout) =>
     _env = env
-    _worker = _Worker(auth, config, Timers, env.err)
+    _worker = _Worker(auth, config, Timers, env.err, layout.pool_size(0))
     _first = _CanceledQueryClient(this)
     _worker.query(this, 0, _CurrentUser, _P.one(I64(0)))
 
@@ -54,7 +55,7 @@ actor \nodoc\ _WorkerOverlapTest is (_QueryClient & _WorkerBarrier)
     _fail("unexpected second-client failure")
 
   be worker_barrier(pending: USize) =>
-    if pending != 0 then
+    if pending != 1 then
       _fail("unexpected pending overlap work")
       return
     end
@@ -73,20 +74,17 @@ actor \nodoc\ _WorkerOverlapTest is (_QueryClient & _WorkerBarrier)
     _env.exitcode(1)
     _worker.close()
 
-actor \nodoc\ _WorkerSubmittedLossTest is (_QueryClient & _WorkerBarrier)
+actor \nodoc\ _WorkerCloseTest is (_QueryClient & _WorkerBarrier)
   let _env: Env
   let _worker: _Worker
-  let _close: Bool
   var _barrier: Bool = false
   var _failures: USize = 0
   let _seen: Array[Bool] = [false; false; false]
 
   new create(auth: TCPConnectAuth, config: _Config, env: Env,
-    close': Bool = false)
-  =>
+    layout: _DatabaseLayout) =>
     _env = env
-    _close = close'
-    _worker = _Worker(auth, config, Timers, env.err)
+    _worker = _Worker(auth, config, Timers, env.err, layout.pool_size(0))
     _worker.query(this, 0, _CurrentUser, _P.one(I64(0)))
 
   be db_result(id: U64, result: pg.Result) =>
@@ -119,13 +117,13 @@ actor \nodoc\ _WorkerSubmittedLossTest is (_QueryClient & _WorkerBarrier)
     if _barrier and (_failures == 3) then _done() end
 
   be worker_barrier(pending: USize) =>
-    if pending != 0 then
-      _fail("submitted work remained pending")
+    if pending != 2 then
+      _fail("unexpected shared queue depth")
       return
     end
     _barrier = true
     _env.out.print("submitted work accepted")
-    if _close then _worker.close() end
+    _worker.close()
     if _failures == 3 then _done() end
 
   fun ref _done() =>
@@ -154,9 +152,10 @@ actor \nodoc\ _WorkerPendingCancelTest is (_QueryClient & _WorkerBarrier)
   let _first: _PendingCanceledClient
   var _stage: U8 = 0
 
-  new create(auth: TCPConnectAuth, config: _Config, env: Env) =>
+  new create(auth: TCPConnectAuth, config: _Config, env: Env,
+    layout: _DatabaseLayout) =>
     _env = env
-    _worker = _Worker(auth, config, Timers, env.err)
+    _worker = _Worker(auth, config, Timers, env.err, layout.pool_size(0))
     _first = _PendingCanceledClient(this)
     _worker.query(_first, 1, _Tags, _P.none())
     _worker.query(this, 1, _Tags, _P.none())
@@ -167,7 +166,7 @@ actor \nodoc\ _WorkerPendingCancelTest is (_QueryClient & _WorkerBarrier)
       _stage = 1
       _worker.cancel(_first)
       _worker.barrier(this)
-    elseif (_stage == 1) and (pending == 1) then
+    elseif (_stage == 1) and (pending == 2) then
       _stage = 2
       _env.out.print("pending cancellation accepted")
     else

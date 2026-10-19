@@ -1,11 +1,14 @@
 import base64
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, ExitStack
 import hashlib
 import hmac
 import http.client
+import io
 import json
 import os
 from pathlib import Path
+import re
 import selectors
 import socket
 import socketserver
@@ -18,26 +21,328 @@ import unittest
 import uuid
 
 
+def _executable():
+    variant = os.environ.get("CONDUIT_VARIANT", "ordinary")
+    if variant not in ("ordinary", "diagnostic"):
+        raise ValueError("CONDUIT_VARIANT must be ordinary or diagnostic")
+    name = "conduit-diagnostic" if variant == "diagnostic" else "conduit"
+    return Path(__file__).resolve().parents[1] / "bin" / name
+
+
+def _diagnostic_mode():
+    return os.environ.get("CONDUIT_VARIANT", "ordinary") == "diagnostic"
+
+
+def _failure_output(value):
+    return "diagnostic subprocess failed" if _diagnostic_mode() else value
+
+
+CSV_FIELDS = ("monotonic_ns", "worker_id", "connecting", "preparing", "idle",
+              "busy", "backoff", "stopped", "pending")
+CSV_HEADER = ",".join(CSV_FIELDS)
+
+
+class WorkerCSV:
+    def __init__(self, counts=None):
+        self.counts = counts
+        self.header = False
+        self.rows = []
+
+    def consume(self, line):
+        if isinstance(line, bytes):
+            line = line.decode("utf-8")
+        line = line.rstrip("\r\n")
+        if line.startswith("{"):
+            return False
+        if line == CSV_HEADER:
+            if self.header:
+                raise AssertionError("duplicate CSV header")
+            self.header = True
+            return True
+        if not self.header:
+            raise AssertionError("missing CSV header")
+        values = line.split(",")
+        if len(values) != len(CSV_FIELDS) or any(
+                re.fullmatch(r"[0-9]+", value) is None for value in values):
+            raise AssertionError("invalid CSV row")
+        row = dict(zip(CSV_FIELDS, map(int, values)))
+        if any(value > (1 << 64) - 1 for value in row.values()):
+            raise AssertionError("invalid CSV value")
+        if self.counts is not None:
+            self.validate(row, self.counts)
+        self.rows.append(row)
+        return True
+
+    @staticmethod
+    def validate(row, counts):
+        worker = row["worker_id"]
+        if worker not in counts:
+            raise AssertionError("invalid CSV worker identity")
+        if sum(row[name] for name in CSV_FIELDS[2:8]) != counts[worker]:
+            raise AssertionError("invalid CSV state total")
+
+
+def _split_output(stream, counts=None, allow_json=True):
+    stream.seek(0)
+    csv = WorkerCSV(counts)
+    lines = []
+    for line in stream:
+        if not csv.consume(line):
+            if not allow_json:
+                raise AssertionError("unexpected JSON in CSV output")
+            lines.append(line)
+    return csv, lines
+
+
+def _metric_records(stream):
+    return [json.loads(line) for line in _split_output(stream)[1]]
+
+
+def _check_metric_output(stream, require_activity=False):
+    if stream is None:
+        return
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate diagnostic key")
+            result[key] = value
+        return result
+
+    def unsigned(value):
+        return type(value) is int and 0 <= value <= (1 << 64) - 1
+
+    csv, lines = _split_output(stream)
+    records = 0
+    startups = {}
+    heartbeats = set()
+    identities = set()
+    pool_snapshots = {}
+    connection_snapshots = []
+    for line in lines:
+        try:
+            record = json.loads(line, object_pairs_hook=unique)
+        except (ValueError, UnicodeDecodeError):
+            raise AssertionError("invalid diagnostic record") from None
+        if record.get("kind") != "conduit_diag" or record.get("schema") != 3:
+            raise AssertionError("unexpected diagnostic record")
+        worker_id = record.get("worker_id")
+        if type(worker_id) is not int or worker_id not in range(95):
+            raise AssertionError("invalid diagnostic worker identity")
+        owner = record.get("owner")
+        if "connection_count" in record:
+            if owner != 0 or set(record) != {
+                    "kind", "schema", "owner", "worker_id", "connection_count",
+                    "total_connection_count", "database_actor_count",
+                    "period_ns"}:
+                raise AssertionError("invalid diagnostic startup record")
+            if not unsigned(record["connection_count"]) or not unsigned(
+                    record["period_ns"]):
+                raise AssertionError("invalid diagnostic startup value")
+            connection_count = record["connection_count"]
+            actor_count = record["database_actor_count"]
+            if (type(actor_count) is not int or
+                    actor_count not in range(1, 96) or
+                    not 1 <= connection_count <= 95 or
+                    worker_id >= actor_count or
+                    not unsigned(record["total_connection_count"]) or
+                    not actor_count <= record["total_connection_count"] <= 95):
+                raise AssertionError(
+                    "invalid pool configuration or worker identity")
+            if worker_id in startups:
+                raise AssertionError("duplicate diagnostic startup")
+            if startups and any(record[key] != previous[key]
+                    for previous in startups.values() for key in
+                    ("database_actor_count", "total_connection_count",
+                     "period_ns")):
+                raise AssertionError("conflicting diagnostic startup")
+            startups[worker_id] = record
+        elif owner == 0:
+            if worker_id not in startups:
+                raise AssertionError("diagnostic record precedes worker startup")
+            if set(record) != {"kind", "schema", "owner", "worker_id", "report_ns",
+                               "next_request"} or not all(unsigned(record[k])
+                               for k in ("report_ns", "next_request")):
+                raise AssertionError("invalid diagnostic heartbeat")
+            heartbeats.add(worker_id)
+        elif owner in (1, 2):
+            if worker_id not in startups:
+                raise AssertionError("diagnostic record precedes worker startup")
+            connection_count = startups[worker_id]["connection_count"]
+            if not unsigned(record.get("slot")) or record["slot"] >= connection_count:
+                raise AssertionError("invalid diagnostic slot")
+            shared = {"kind", "schema", "owner", "worker_id", "slot", "generation",
+                      "request", "report_ns"}
+            if record.get("missing") is True:
+                if set(record) != shared | {"missing", "reason"} or record[
+                        "reason"] not in ("overdue", "unavailable"):
+                    raise AssertionError("invalid missing record")
+            else:
+                required = shared | {"observed_ns", "overflow",
+                                     "invalid_clock", "counters", "gauges",
+                                     "histograms"}
+                if set(record) != required or type(record["overflow"]) is not bool:
+                    raise AssertionError("invalid snapshot shape")
+                counts = 10 if owner == 1 else 4
+                gauges = 10 if owner == 1 else 4
+                hists = 33 if owner == 1 else 8
+                for key, size in (("counters", counts), ("gauges", gauges),
+                                  ("histograms", hists)):
+                    if type(record[key]) is not list or len(record[key]) != size:
+                        raise AssertionError("invalid diagnostic array")
+                if not all(unsigned(x) for x in record["counters"] +
+                           record["gauges"]):
+                    raise AssertionError("invalid diagnostic value")
+                for hist in record["histograms"]:
+                    if type(hist) is not dict or set(hist) != {
+                            "count", "sum_ns", "max_ns", "overflow",
+                            "buckets"}:
+                        raise AssertionError("invalid histogram shape")
+                    if type(hist["overflow"]) is not bool or type(
+                            hist["buckets"]) is not list or len(
+                            hist["buckets"]) != 27:
+                        raise AssertionError("invalid histogram value")
+                    if not all(unsigned(hist[k]) for k in (
+                            "count", "sum_ns", "max_ns")) or not all(
+                            unsigned(x) for x in hist["buckets"]):
+                        raise AssertionError("invalid histogram integer")
+                    if not hist["overflow"] and sum(hist["buckets"]) != hist[
+                            "count"]:
+                        raise AssertionError("invalid histogram count")
+                if not unsigned(record["observed_ns"]) or not unsigned(
+                        record["invalid_clock"]) or record["observed_ns"] > record[
+                        "report_ns"]:
+                    raise AssertionError("invalid observation time")
+                if owner == 1:
+                    c, g = record["counters"], record["gauges"]
+                    if c[0] != g[0] + g[1] + c[2]:
+                        raise AssertionError("accepted work is not conserved")
+                    if c[1] + c[3] != c[2] + g[1] or c[7] + c[8] != c[2]:
+                        raise AssertionError("terminal work is not conserved")
+                    if sum(g[4:10]) != connection_count or g[7] != g[1]:
+                        raise AssertionError("physical slot states are inconsistent")
+                    identity = (worker_id, record["slot"], record["request"])
+                    if identity in pool_snapshots:
+                        raise AssertionError("duplicate Worker snapshot")
+                    pool_snapshots[identity] = record
+                else:
+                    connection_snapshots.append(record)
+            generation = record["generation"]
+            unknown_generation = (owner == 1 and record.get("missing") is True
+                                  and generation is None)
+            if (not all(unsigned(record[k]) for k in (
+                    "slot", "request", "report_ns")) or
+                    not (unsigned(generation) or unknown_generation)):
+                raise AssertionError("invalid record identity")
+            identity = (owner, worker_id, record["slot"], generation,
+                        record["request"])
+            if not record.get("missing") and identity in identities:
+                raise AssertionError("duplicate diagnostic record")
+            if not record.get("missing"):
+                identities.add(identity)
+        else:
+            raise AssertionError("invalid diagnostic owner")
+        records += 1
+    if not startups:
+        raise AssertionError("missing diagnostic startup record")
+    expected_workers = set(range(next(iter(startups.values()))[
+        "database_actor_count"]))
+    if set(startups) != expected_workers:
+        raise AssertionError("missing worker startup record")
+    if sum(record["connection_count"] for record in startups.values()) != next(
+            iter(startups.values()))["total_connection_count"]:
+        raise AssertionError("invalid pool configuration total")
+    for row in csv.rows:
+        WorkerCSV.validate(row, {worker: startup["connection_count"]
+                                for worker, startup in startups.items()})
+    if require_activity:
+        if (heartbeats != expected_workers or not pool_snapshots or
+                not connection_snapshots):
+            raise AssertionError("missing periodic diagnostics")
+        if {(worker, slot) for worker, slot, _ in pool_snapshots} != {
+                (worker, slot) for worker in expected_workers
+                for slot in range(startups[worker]["connection_count"])}:
+            raise AssertionError("missing selected connection slot")
+        if {record["worker_id"] for record in pool_snapshots.values()
+                if record["counters"][0] > 0} != expected_workers:
+            raise AssertionError("missing pool traffic")
+        if {record["worker_id"] for record in connection_snapshots
+                if record["counters"][0] > 0 and
+                record["histograms"][6]["count"] > 0} != expected_workers:
+            raise AssertionError("missing transport traffic")
+        for record in connection_snapshots:
+            if record["request"] == 0:
+                continue
+            worker = pool_snapshots.get((record["worker_id"], record["slot"],
+                                         record["request"]))
+            if worker is None or worker["observed_ns"] != record["observed_ns"]:
+                raise AssertionError("unmatched connection snapshot")
+
+
+class FrameGate:
+    def __init__(self, kind, connection, skipped=0, timeout=20):
+        self.kind = kind
+        self.connection = connection
+        self.skipped = skipped
+        self.reached = threading.Event()
+        self.release = threading.Event()
+        self.abort = False
+        self.claimed = False
+        self.timeout = timeout
+
+
 class ProtocolProxy(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
+    request_queue_size = 128
 
-    def __init__(self, database_host, database_port, frame_timeout=15):
+    def __init__(self, database_host, database_port, frame_timeout=15, capacity=128):
         self.database_host = database_host
         self.database_port = int(database_port)
         self.frame_timeout = frame_timeout
         self.messages = []
+        self.frame_gates = []
+        self.failures = []
+        self.capacity = capacity
         self.backends = []
+        self.frontends = []
         self.mutate_next_row = False
         self.drop_next_command_complete = False
         self.command_complete_gate = None
+        self.command_complete_held = threading.Event()
+        self.held_frontend = None
         self.command_complete_skip = 0
         self.command_complete_abort = False
         self.lock = threading.Lock()
-        self.connections = threading.BoundedSemaphore(64)
+        self.reject_new = False
+        self.connections = threading.BoundedSemaphore(capacity)
         super().__init__(("127.0.0.1", 0), ProtocolConnection)
         self.thread = threading.Thread(target=self.serve_forever, daemon=True)
         self.thread.start()
+
+    def hold_frame(self, kind, connection, skipped=0, timeout=20):
+        gate = FrameGate(kind, connection, skipped, timeout)
+        with self.lock:
+            self.frame_gates.append(gate)
+        return gate
+
+    def frame_gate(self, kind, connection):
+        with self.lock:
+            for gate in self.frame_gates:
+                if gate.claimed or gate.kind != kind or gate.connection != connection:
+                    continue
+                if gate.skipped:
+                    gate.skipped -= 1
+                    continue
+                gate.claimed = True
+                gate.reached.set()
+                return gate
+        return None
+
+    def assert_healthy(self):
+        with self.lock:
+            if self.failures:
+                raise AssertionError("; ".join(self.failures))
 
     def snapshot(self):
         with self.lock:
@@ -53,6 +358,20 @@ class ProtocolProxy(socketserver.ThreadingTCPServer):
         with self.lock:
             self.mutate_next_row = True
 
+    def send_notice(self, frontend=None):
+        payload = b"SNOTICE\0Midle notice\0\0"
+        frame = b"N" + (len(payload) + 4).to_bytes(4, "big") + payload
+        with self.lock:
+            frontends = [frontend] if frontend is not None else list(self.frontends)
+        sent = 0
+        for frontend in frontends:
+            try:
+                frontend.sendall(frame)
+                sent += 1
+            except OSError:
+                pass
+        return sent
+
     def suppress_next_command_complete(self):
         with self.lock:
             self.drop_next_command_complete = True
@@ -60,6 +379,8 @@ class ProtocolProxy(socketserver.ThreadingTCPServer):
     def hold_command_complete_after(self, skipped):
         with self.lock:
             self.command_complete_gate = threading.Event()
+            self.command_complete_held.clear()
+            self.held_frontend = None
             self.command_complete_skip = skipped
             self.command_complete_abort = False
 
@@ -71,7 +392,7 @@ class ProtocolProxy(socketserver.ThreadingTCPServer):
             gate.set()
 
     def verify_request(self, request, client_address):
-        return self.connections.acquire(blocking=False)
+        return not self.reject_new and self.connections.acquire(blocking=False)
 
     def process_request_thread(self, request, client_address):
         try:
@@ -81,6 +402,9 @@ class ProtocolProxy(socketserver.ThreadingTCPServer):
 
     def stop(self):
         self.release_command_complete(abort=True)
+        for gate in self.frame_gates:
+            gate.abort = True
+            gate.release.set()
         self.shutdown()
         self.server_close()
         self.thread.join(timeout=5)
@@ -107,9 +431,11 @@ class ProtocolConnection(socketserver.BaseRequestHandler):
                                        self.server.database_port)) as backend:
             messages = []
             with self.server.lock:
-                if len(self.server.messages) < 128:
+                index = len(self.server.messages)
+                if index < self.server.capacity:
                     self.server.messages.append(messages)
                     self.server.backends.append(backend)
+                    self.server.frontends.append(self.request)
 
             def downstream():
                 try:
@@ -134,10 +460,24 @@ class ProtocolConnection(socketserver.BaseRequestHandler):
                                     self.server.command_complete_skip -= 1
                                 else:
                                     gate = self.server.command_complete_gate
+                        frame_gate = self.server.frame_gate(kind, index)
+                        if frame_gate is not None:
+                            if not frame_gate.release.wait(frame_gate.timeout):
+                                with self.server.lock:
+                                    self.server.failures.append("frame gate expired")
+                                raise EOFError
+                            if frame_gate.abort:
+                                raise EOFError
                         if suppress:
                             continue
                         if gate is not None:
-                            gate.wait(10)
+                            with self.server.lock:
+                                self.server.held_frontend = self.request
+                                self.server.command_complete_held.set()
+                            if not gate.wait(20):
+                                with self.server.lock:
+                                    self.server.failures.append("command gate expired")
+                                raise EOFError
                             with self.server.lock:
                                 abort = self.server.command_complete_abort
                                 self.server.command_complete_gate = None
@@ -203,6 +543,111 @@ class ProtocolConnection(socketserver.BaseRequestHandler):
                 except OSError:
                     pass
                 thread.join(timeout=5)
+
+
+class PoolRun:
+    def __init__(self, case, process, proxy, csv=False, count=2, actors=1):
+        self.case = case
+        self.process = process
+        self.proxy = proxy
+        self.buffer = b""
+        self.events = []
+        self.history = []
+        self.sequence = 0
+        self.csv = WorkerCSV(dict.fromkeys(range(actors), count)) if csv else None
+        self.selector = selectors.DefaultSelector()
+        self.selector.register(process.stdout, selectors.EVENT_READ)
+        self.receive(lambda event: event.get("event") == "started")
+
+    def send(self, *commands):
+        self.process.stdin.write(("\n".join(commands) + "\n").encode())
+        self.process.stdin.flush()
+
+    def receive(self, predicate, timeout=10):
+        deadline = time.monotonic() + timeout
+        while True:
+            for index, event in enumerate(self.events):
+                if predicate(event):
+                    return self.events.pop(index)
+            while b"\n" in self.buffer:
+                line, self.buffer = self.buffer.split(b"\n", 1)
+                if self.csv is not None and self.csv.consume(line):
+                    if line.decode() == CSV_HEADER:
+                        continue
+                    event = {"event": "csv", "row": self.csv.rows[-1]}
+                else:
+                    event = json.loads(line)
+                self.events.append(event)
+                self.history.append(event)
+            if any(predicate(event) for event in self.events):
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not self.selector.select(remaining):
+                raise AssertionError("pool probe response timed out")
+            chunk = os.read(self.process.stdout.fileno(), 65536)
+            if not chunk:
+                raise AssertionError("pool probe exited before response")
+            self.buffer += chunk
+
+    def state(self):
+        self.sequence += 1
+        request = self.sequence
+        self.send(f"state {request}")
+        state = self.receive(lambda event: event.get("event") == "state"
+                             and event["request"] == request)
+        idle = state["idle"]
+        self.case.assertEqual(len(idle), len(set(idle)))
+        self.case.assertEqual(set(idle), {index for index, code in
+                              enumerate(state["phases"]) if code == 2})
+        self.case.assertEqual(state["outstanding"],
+                              len(state["queued"]) + len(state["active"]))
+        return state
+
+    def csv_sample(self):
+        self.sequence += 1
+        self.send(f"csv-sample {self.sequence}")
+        event = self.receive(lambda event: event.get("event") == "csv_sample"
+                             and event["request"] == self.sequence)
+        parser = WorkerCSV(self.csv.counts)
+        parser.consume(CSV_HEADER)
+        parser.consume(event["row"])
+        return parser.rows[0]
+
+    def csv_fence(self):
+        self.sequence += 1
+        self.send(f"csv-tick-fence {self.sequence}")
+        return self.receive(lambda event: event.get("event") == "csv_fence"
+                            and event["request"] == self.sequence)
+
+    def wait_state(self, predicate, timeout=10):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            state = self.state()
+            if predicate(state):
+                return state
+            time.sleep(0.01)
+        raise AssertionError("pool state condition timed out")
+
+    def ready(self, count):
+        return self.wait_state(lambda state: state["phases"] == [2] * count)
+
+    def result(self, id, kind="ok"):
+        result = self.receive(lambda event: event.get("event") == "result"
+                              and event["id"] == id)
+        self.case.assertEqual(result["kind"], kind)
+        return result
+
+    def fence(self):
+        self.sequence += 1
+        request = self.sequence
+        self.send(f"fence {request}")
+        values = {}
+        for _ in range(4):
+            event = self.receive(lambda event: event.get("event") == "fence"
+                                 and event["request"] == request)
+            self.case.assertNotIn(event["client"], values)
+            values[event["client"]] = event["callbacks"]
+        return values
 
 
 class SQLSession:
@@ -272,6 +717,7 @@ class Integration(unittest.TestCase):
         cls.secret = "integration-secret"
         cls.sql(f"CREATE DATABASE {cls.database} TEMPLATE conduit_dev")
         cls.addClassCleanup(cls.sql, f"DROP DATABASE {cls.database} WITH (FORCE)")
+        cls.sql(f"ALTER DATABASE {cls.database} SET DateStyle TO 'SQL, DMY'")
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
             cls.port = listener.getsockname()[1]
@@ -285,12 +731,17 @@ class Integration(unittest.TestCase):
             DATABASE_URL=f"postgres://conduit:conduit@127.0.0.1:"
                          f"{cls.proxy.server_address[1]}/{cls.database}",
             JWT_SECRET=cls.secret, HOST="127.0.0.1", PORT=str(cls.port),
-            DB_WORKERS="10")
+            CONDUIT_TEST_POOL_SIZE="5")
         cls.server_env = env
-        executable = Path(__file__).resolve().parents[1] / "bin" / "conduit"
+        executable = _executable()
         cls.server_log = tempfile.TemporaryFile(mode="w+b")
         cls.addClassCleanup(cls.server_log.close)
-        cls.server = subprocess.Popen([str(executable)], env=env,
+        cls.server_metrics = tempfile.TemporaryFile(mode="w+b")
+        if cls.server_metrics is not None:
+            cls.addClassCleanup(cls.server_metrics.close)
+        cls.server = subprocess.Popen(
+            [str(executable), "--test-http", "--db-worker-count=4"], env=env,
+                                      stdout=cls.server_metrics,
                                       stderr=cls.server_log)
         cls.addClassCleanup(cls.stop)
         deadline = time.monotonic() + 60
@@ -313,6 +764,11 @@ class Integration(unittest.TestCase):
         except subprocess.TimeoutExpired:
             cls.server.kill()
             cls.server.wait(timeout=5)
+        if _diagnostic_mode():
+            _check_metric_output(cls.server_metrics)
+        else:
+            _split_output(cls.server_metrics, dict.fromkeys(range(4), 5),
+                          allow_json=False)
 
     @classmethod
     def request(cls, method, path, body=None, token=None, timeout=5):
@@ -347,6 +803,110 @@ class Integration(unittest.TestCase):
         signature = hmac.digest(cls.secret.encode(), data, hashlib.sha256)
         return (data + b"." + encode(signature)).decode()
 
+    def test_diagnostic_reporting(self):
+        if not _diagnostic_mode():
+            self.skipTest("diagnostic variant only")
+        for _ in range(4):
+            self.assertEqual(self.request("GET", "/api/tags")[0], 200)
+
+        def paired_snapshots():
+            size = os.fstat(self.server_metrics.fileno()).st_size
+            data = os.pread(self.server_metrics.fileno(), size, 0)
+            end = data.rfind(b"\n")
+            if end < 0:
+                raise AssertionError("missing diagnostic records")
+            complete = data[:end + 1]
+            _check_metric_output(io.BytesIO(complete), require_activity=True)
+            workers = {}
+            sessions = {}
+            for record in _metric_records(io.BytesIO(complete)):
+                if record.get("missing") or record.get("request") == 0:
+                    continue
+                if record["owner"] == 1:
+                    workers[record["worker_id"], record["slot"]] = record
+                elif record["owner"] == 2:
+                    sessions[record["worker_id"], record["slot"]] = record
+            paired = {slot: (worker, sessions[slot]) for slot, worker
+                      in workers.items() if slot in sessions and
+                      sessions[slot]["request"] == worker["request"] and
+                      sessions[slot]["observed_ns"] == worker["observed_ns"]}
+            if len(paired) != 20:
+                raise AssertionError("incomplete diagnostic rotation")
+            return paired
+
+        def wait_for_snapshots(after=None, minimum_request=0):
+            deadline = time.monotonic() + 15
+            last_error = None
+            while time.monotonic() < deadline:
+                try:
+                    paired = paired_snapshots()
+                    if all(pair[0]["request"] > minimum_request for pair in
+                           paired.values()) and (after is None or all(
+                           paired[slot][0]["request"] >
+                           after[slot][0]["request"] for slot in after)):
+                        return paired
+                except AssertionError as error:
+                    last_error = error
+                time.sleep(0.1)
+            self.fail(str(last_error or "missing diagnostic rotation"))
+
+        initial = wait_for_snapshots()
+        entry_request = max(pair[0]["request"] for pair in initial.values())
+        before = wait_for_snapshots(minimum_request=entry_request)
+        self.assertEqual(self.request("GET", "/api/tags")[0], 200)
+        post_request = wait_for_snapshots(before)
+        post_request_id = max(pair[0]["request"] for pair in
+                              post_request.values())
+        after = wait_for_snapshots(minimum_request=post_request_id)
+        def accepted(pairs):
+            return sum(max((pair[0] for identity, pair in pairs.items()
+                            if identity[0] == worker),
+                           key=lambda r: r["request"])["counters"][0]
+                       for worker in range(4))
+        self.assertEqual(accepted(after) - accepted(before), 1)
+        self.assertEqual(sum(pair[1]["counters"][0] for pair in after.values())
+                         - sum(pair[1]["counters"][0] for pair in
+                               before.values()), 1)
+        self.assertEqual(sum(pair[1]["histograms"][6]["count"] for pair in
+                             after.values()) - sum(pair[1]["histograms"][6][
+                             "count"] for pair in before.values()), 1)
+
+    def test_close_after_rejected_preparation(self):
+        process = subprocess.run(
+            [str(_executable()), "--test-session-resume-close"],
+            env=self.server_env | {"CONDUIT_TEST_POOL_SIZE": "1"},
+            capture_output=True, text=True, timeout=10)
+        self.assertEqual(process.returncode, 0,
+                         _failure_output(process.stderr))
+        self.assertEqual(process.stdout.strip(),
+                         "rejected preparation closed")
+
+    def test_direct_callback_diagnostic_accounting(self):
+        if not _diagnostic_mode():
+            self.skipTest("diagnostic variant only")
+        database = f"pony_diag_callback_{os.getpid()}"
+        self.sql(f"CREATE DATABASE {database} TEMPLATE conduit_dev")
+        try:
+            self.sql("ALTER TABLE tags RENAME TO tags_hidden", database)
+            env = self.server_env.copy()
+            env.update(DATABASE_URL=f"postgres://conduit:conduit@"
+                       f"{self.proxy.database_host}:"
+                       f"{self.proxy.database_port}/{database}",
+                       CONDUIT_TEST_POOL_SIZE="1")
+            process = subprocess.run(
+                [str(_executable()), "--test-worker-diagnostic"],
+                env=env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(process.returncode, 0,
+                             _failure_output(process.stderr))
+            counts = json.loads(process.stdout)
+            self.assertEqual(set(counts), {"callbacks", "pending_close",
+                                           "stopped_rejection"})
+            self.assertEqual(counts["callbacks"], 3)
+            self.assertEqual(counts["pending_close"], 2)
+            self.assertEqual(counts["stopped_rejection"], 1)
+        finally:
+            self.sql(f"DROP DATABASE {database} WITH (FORCE)")
+
     def test_feed_named_parameter_width(self):
         suffix = uuid.uuid4().hex
         follower = int(self.db(
@@ -375,12 +935,14 @@ class Integration(unittest.TestCase):
             if b"22003" in diagnostics:
                 break
             time.sleep(0.01)
-        self.assertIn(b"Database error 22003:", diagnostics)
-        self.assertNotIn(b"22P03", diagnostics)
+        self.assertTrue(b"Database error 22003:" in diagnostics,
+                        "expected database error code absent")
+        self.assertTrue(b"22P03" not in diagnostics,
+                        "unexpected database error code")
 
     def test_prepared_startup_and_runtime_wire(self):
         def workers():
-            return [session for session in self.proxy.snapshot()[:10]
+            return [session for session in self.proxy.snapshot()[:20]
                     if any(kind == b"P" and
                            payload.split(b"\0", 1)[0] == b"tags"
                            for kind, payload in session)]
@@ -388,12 +950,12 @@ class Integration(unittest.TestCase):
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             sessions = workers()
-            if len(sessions) == 10 and all(
+            if len(sessions) == 20 and all(
                 len([message for message in session if message[0] == b"P"])
                 == 30 for session in sessions):
                 break
             time.sleep(0.01)
-        self.assertEqual(len(sessions), 10)
+        self.assertEqual(len(sessions), 20)
         initial = []
         for session in sessions:
             names = [payload.split(b"\0", 1)[0] for kind, payload
@@ -415,44 +977,997 @@ class Integration(unittest.TestCase):
                        for kind, payload in session if kind == b"B"]
         self.assertIn(b"tags", bound_names)
 
-    def test_listener_assigns_workers_round_robin(self):
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            sessions = self.proxy.snapshot()[:10]
-            if len(sessions) == 10 and all(
-                sum(kind == b"P" for kind, _ in session) == 30
-                    for session in sessions):
-                break
-            time.sleep(0.01)
-        self.assertEqual(len(sessions), 10)
-        before = [sum(kind == b"B" for kind, _ in session)
-                  for session in sessions]
-        connections = []
+    @contextmanager
+    def pool_run(self, count=2, configure=None, retry_ns=None, csv=False,
+                 listener=False):
+        proxy = ProtocolProxy(self.proxy.database_host,
+                              self.proxy.database_port)
+        if configure is not None:
+            configure(proxy)
+        env = self.server_env.copy()
+        env.update(DATABASE_URL=f"postgres://conduit:conduit@127.0.0.1:"
+                   f"{proxy.server_address[1]}/{self.database}",
+                   CONDUIT_TEST_POOL_SIZE=str(count))
+        if retry_ns is not None:
+            env["CONDUIT_TEST_RETRY_NS"] = str(retry_ns)
+        if listener:
+            with socket.socket() as listener_socket:
+                listener_socket.bind(("127.0.0.1", 0))
+                env["PORT"] = str(listener_socket.getsockname()[1])
+        with tempfile.TemporaryFile(mode="w+b") as errors:
+            process = subprocess.Popen(
+                [str(_executable()),
+                 ("--test-listener-csv" if listener else
+                  "--test-pool-csv" if csv else "--test-pool"),
+                 "--ponymaxthreads=1"],
+                env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=errors)
+            run = None
+            try:
+                run = PoolRun(self, process, proxy, csv, count, 4 if listener else 1)
+                yield run
+            finally:
+                for gate in proxy.frame_gates:
+                    gate.abort = True
+                    gate.release.set()
+                if process.poll() is None:
+                    try:
+                        process.stdin.write(b"quit\n")
+                        process.stdin.flush()
+                        process.wait(timeout=10)
+                    except (BrokenPipeError, subprocess.TimeoutExpired):
+                        process.kill()
+                        process.wait(timeout=5)
+                if run is not None:
+                    run.selector.close()
+                process.stdin.close()
+                process.stdout.close()
+                proxy.stop()
+                proxy.assert_healthy()
+                errors.seek(0)
+                self.assertEqual(process.returncode, 0,
+                                 _failure_output(errors.read().decode()))
+
+    def test_pool_uses_idle_connection_while_another_is_blocked(self):
+        with self.pool_run() as run:
+            run.ready(2)
+            with SQLSession(self.database) as holder:
+                holder.execute("BEGIN; LOCK TABLE tags IN ACCESS EXCLUSIVE MODE;")
+                run.send("tags 1 0")
+                run.wait_state(lambda state: len(state["active"]) == 1)
+                run.send("user 2 0")
+                run.result(2)
+                state = run.state()
+                self.assertEqual([item[1] for item in state["active"]], [1])
+                self.assertEqual(state["queued"], [])
+                holder.execute("ROLLBACK;")
+                run.result(1)
+            run.ready(2)
+
+    def test_pool_initial_connections_become_ready_independently(self):
+        gates = []
+        with self.pool_run(configure=lambda proxy: gates.append(
+                proxy.hold_frame(b"1", 0))) as run:
+            self.assertTrue(gates[0].reached.wait(5))
+            run.wait_state(lambda state: sorted(state["phases"]) == [1, 2])
+            run.send("user 1 0")
+            run.result(1)
+            self.assertEqual(self.routing_binds(run.proxy)[0], [])
+            self.assertEqual(sorted(run.state()["phases"]), [1, 2])
+            gates[0].release.set()
+            run.ready(2)
+
+    def test_pool_fifo_dispatches_detached_jobs_on_each_freed_connection(self):
+        with self.pool_run() as run:
+            run.ready(2)
+            gates = [run.proxy.hold_frame(b"Z", index) for index in range(2)]
+            run.send("tags 1 0", "user 2 0")
+            for gate in gates:
+                self.assertTrue(gate.reached.wait(5))
+            run.wait_state(lambda state: len(state["active"]) == 2 and
+                           all(item[2] == 1 for item in state["active"]))
+            name = "pool-fifo-" + uuid.uuid4().hex
+            run.send("tags 3 0", "user 4 1", f"register 5 0 {name}", "cancel 1")
+            self.assertEqual(run.state()["queued"], [3, 4, 5])
+            following = [run.proxy.hold_frame(b"Z", index) for index in range(2)]
+            gates[0].release.set()
+            self.assertTrue(following[0].reached.wait(5))
+            binds = self.routing_binds(run.proxy)
+            self.assertEqual(len(binds[0]), 2)
+            self.assertEqual(binds[0][-1], b"tags")
+            self.assertEqual(len(binds[1]), 1)
+            self.assertEqual(run.state()["queued"], [4, 5])
+            gates[1].release.set()
+            self.assertTrue(following[1].reached.wait(5))
+            binds = self.routing_binds(run.proxy)
+            self.assertEqual(len(binds[1]), 2)
+            self.assertEqual(binds[1][-1], b"current_user")
+            self.assertEqual(run.state()["queued"], [5])
+            following[0].release.set()
+            run.result(3)
+            run.result(5)
+            following[1].release.set()
+            run.result(1)
+            run.result(2)
+            run.ready(2)
+            self.assertEqual(run.fence(), {0: 4, 1: 0, 2: 0, 3: 0})
+
+    def test_pool_success_and_sql_failure_wait_for_final_readiness(self):
+        name = "pool-duplicate-" + uuid.uuid4().hex
+        self.db("INSERT INTO users(username,email,password_hash) VALUES (" +
+                self.literal(name) + "," + self.literal(name + "@pool.test") +
+                ",'test-hash')")
+        for command, outcome, kind, bound in [
+                ("tags 1 0", 1, "ok", b"tags"),
+                (f"register 1 0 {name}", 2, "23505", b"register_user")]:
+            with self.subTest(kind=kind), self.pool_run(1) as run:
+                run.ready(1)
+                gate = run.proxy.hold_frame(b"Z", 0)
+                run.send(command, "user 2 0")
+                self.assertTrue(gate.reached.wait(5))
+                state = run.wait_state(lambda state:
+                    state["active"] == [[0, 1, outcome]])
+                self.assertEqual(state["queued"], [2])
+                self.assertEqual(self.routing_binds(run.proxy)[0], [bound])
+                self.assertEqual(run.fence()[0], 0)
+                gate.release.set()
+                run.result(1, kind)
+                run.result(2)
+                run.ready(1)
+                self.assertEqual(len(run.proxy.snapshot()), 1)
+                self.assertEqual(run.fence()[0], 2)
+
+    def test_pool_decode_failure_reports_once_while_draining(self):
+        for ending in ("drain", "loss", "close"):
+            with self.subTest(ending=ending), self.pool_run(1) as run:
+                run.ready(1)
+                gate = run.proxy.hold_frame(b"Z", 0)
+                run.proxy.corrupt_next_data_row()
+                run.send("tags 1 0", "user 2 0")
+                self.assertTrue(gate.reached.wait(5))
+                run.result(1, "data")
+                state = run.wait_state(lambda state:
+                    state["active"] == [[0, 1, 3]])
+                self.assertEqual(state["queued"], [2])
+                self.assertEqual(run.fence()[0], 1)
+                if ending == "loss":
+                    gate.abort = True
+                    gate.release.set()
+                elif ending == "close":
+                    run.send("close")
+                else:
+                    gate.release.set()
+                run.result(2, "lost" if ending == "close" else "ok")
+                run.wait_state(lambda state: not state["queued"] and
+                               not state["active"])
+                self.assertEqual(run.fence()[0], 2)
+
+    def test_pool_detached_unsent_write_runs_and_new_attachment_survives(self):
+        with self.pool_run(1) as run:
+            run.ready(1)
+            gate = run.proxy.hold_frame(b"Z", 0)
+            run.send("tags 1 0")
+            self.assertTrue(gate.reached.wait(5))
+            name = "pool-detached-" + uuid.uuid4().hex
+            run.send(f"register 2 1 {name}", "cancel 1", "user 3 1")
+            state = run.state()
+            self.assertEqual(state["queued"], [2, 3])
+            self.assertEqual(state["recipients"], 2)
+            self.assertEqual(state["outstanding"], 3)
+            gate.release.set()
+            run.result(1)
+            run.result(3)
+            run.ready(1)
+            self.assertEqual(run.fence(), {0: 1, 1: 1, 2: 0, 3: 0})
+            self.assertEqual(run.state()["recipients"], 0)
+            self.assertEqual(self.db("SELECT count(*) FROM users WHERE username=" +
+                                    self.literal(name)), "1")
+
+    def test_pool_detached_startup_write_still_runs(self):
+        gates = []
+        with self.pool_run(1, configure=lambda proxy: gates.append(
+                proxy.hold_frame(b"1", 0))) as run:
+            self.assertTrue(gates[0].reached.wait(5))
+            name = "pool-startup-" + uuid.uuid4().hex
+            run.send(f"register 1 1 {name}", "user 2 0", "cancel 1")
+            self.assertEqual(run.state()["queued"], [1, 2])
+            gates[0].release.set()
+            run.result(2)
+            run.ready(1)
+            self.assertEqual(run.fence(), {0: 1, 1: 0, 2: 0, 3: 0})
+            self.assertEqual(self.db("SELECT count(*) FROM users WHERE username=" +
+                                    self.literal(name)), "1")
+
+    def test_pool_connection_loss_does_not_replay_committed_write(self):
+        with self.pool_run() as run:
+            run.ready(2)
+            gates = [run.proxy.hold_frame(b"Z", index) for index in range(2)]
+            name = "pool-committed-" + uuid.uuid4().hex
+            run.send(f"register 1 0 {name}", "tags 2 0")
+            for gate in gates:
+                self.assertTrue(gate.reached.wait(5))
+            run.wait_state(lambda state: len(state["active"]) == 2 and
+                           all(item[2] == 1 for item in state["active"]))
+            self.assertEqual(self.db("SELECT count(*) FROM users WHERE username=" +
+                                    self.literal(name)), "1")
+            binds = self.routing_binds(run.proxy)
+            lost = next(index for index, names in enumerate(binds)
+                        if names == [b"register_user"])
+            replacement = run.proxy.hold_frame(b"1", 2)
+            run.send("user 3 0")
+            self.assertEqual(run.state()["queued"], [3])
+            gates[lost].abort = True
+            gates[lost].release.set()
+            run.result(1, "lost")
+            gates[1 - lost].release.set()
+            run.result(2)
+            run.result(3)
+            self.assertTrue(replacement.reached.wait(5))
+            self.assertEqual(self.routing_binds(run.proxy)[2], [])
+            replacement.release.set()
+            run.ready(2)
+            binds = self.routing_binds(run.proxy)
+            self.assertEqual(sum(names.count(b"register_user") for names in binds), 1)
+            self.assertEqual(sum(kind == b"P" for kind, _ in
+                                 run.proxy.snapshot()[2]), 30)
+            self.assertEqual(run.fence()[0], 3)
+
+    def test_pool_nonidle_and_missing_statement_retire_only_the_slot(self):
+        for command, kind in (("begin 1 0", "lost"),
+                              ("deallocate 1 0", "ok")):
+            with self.subTest(command=command), self.pool_run(1) as run:
+                run.ready(1)
+                run.send(command)
+                run.result(1, kind)
+                if command.startswith("deallocate"):
+                    run.send("tags 2 0")
+                    run.result(2, "26000")
+                run.wait_state(lambda state: state["generations"] == [1])
+                run.send("user 3 0")
+                run.result(3)
+                run.ready(1)
+                self.assertEqual(len(run.proxy.snapshot()), 2)
+                self.assertEqual(sum(kind == b"P" for kind, _ in
+                                     run.proxy.snapshot()[1]), 30)
+                self.assertEqual(run.fence()[0], 3 if command.startswith(
+                                 "deallocate") else 2)
+
+    def test_pool_stale_retry_token_generation_and_close_are_ignored(self):
+        with self.pool_run(1, retry_ns=60_000_000_000) as run:
+            run.ready(1)
+            run.send("retire 0")
+            first = run.wait_state(lambda state: state["phases"] == [4])
+            run.send(f"retry 0 {first['request']} 1")
+            run.ready(1)
+            run.send("retire 0")
+            second = run.wait_state(lambda state: state["phases"] == [4])
+            run.send(f"retry 0 {first['request']} 2")
+            self.assertEqual(run.state()["phases"], [4])
+            run.send(f"retry 0 {second['request']} 1")
+            self.assertEqual(run.state()["phases"], [4])
+            self.assertEqual(len(run.proxy.snapshot()), 2)
+            run.send(f"retry 0 {second['request']} 2")
+            run.ready(1)
+            run.send("retire 0")
+            third = run.wait_state(lambda state: state["phases"] == [4])
+            run.send("close", f"retry 0 {third['request']} 3")
+            state = run.state()
+            self.assertEqual(state["phases"], [5])
+            self.assertEqual(state["generations"], [3])
+            self.assertEqual(len(run.proxy.snapshot()), 3)
+            run.send("tags 1 0")
+            run.result(1, "lost")
+            self.assertEqual(run.fence()[0], 1)
+
+    def test_pool_synchronous_rejections_yield_then_drain(self):
+        with self.pool_run(1) as run:
+            run.ready(1)
+            run.send("badbatch 130 900001")
+            partial = run.receive(lambda event: event.get("event") == "state"
+                                  and event["request"] == 900001)
+            self.assertGreater(len(partial["queued"]), 0)
+            self.assertLess(len(partial["queued"]), 130)
+            self.assertEqual(partial["active"], [])
+            self.assertEqual(partial["idle"], [0])
+            self.assertEqual(partial["outstanding"], len(partial["queued"]))
+            for id in range(100000, 100130):
+                run.result(id, "data")
+            run.ready(1)
+            self.assertEqual(run.fence()[0], 130)
+            self.assertEqual(self.routing_binds(run.proxy)[0], [])
+            run.send("user 1 0")
+            run.result(1)
+            self.assertEqual(len(run.proxy.snapshot()), 1)
+
+    def test_pool_close_settles_attached_jobs_once_and_stops_dispatch(self):
+        with self.pool_run(1) as run:
+            run.ready(1)
+            gate = run.proxy.hold_frame(b"Z", 0)
+            run.send("tags 1 0", "user 2 0", "user 3 1", "cancel 1")
+            self.assertTrue(gate.reached.wait(5))
+            run.wait_state(lambda state: state["active"] == [[0, 1, 1]])
+            run.send("close", "close", "user 4 0")
+            run.result(1, "lost")
+            run.result(2, "lost")
+            run.result(4, "lost")
+            state = run.state()
+            self.assertEqual(state["phases"], [5])
+            self.assertEqual(state["recipients"], 0)
+            self.assertEqual(state["outstanding"], 0)
+            self.assertEqual(self.routing_binds(run.proxy)[0], [b"tags"])
+            self.assertEqual(run.fence(), {0: 3, 1: 0, 2: 0, 3: 0})
+
+    @contextmanager
+    def routing_server(self, count, readiness=True):
+        proxy = ProtocolProxy(self.proxy.database_host,
+                              self.proxy.database_port)
         try:
-            for _ in range(10):
-                connection = http.client.HTTPConnection(
-                    "127.0.0.1", self.port, timeout=5)
-                connections.append(connection)
-                connection.request("GET", "/api/tags")
-                response = connection.getresponse()
-                self.assertEqual(response.status, 200)
-                response.read()
-            sessions = self.proxy.snapshot()[:10]
-            after = [sum(kind == b"B" for kind, _ in session)
-                     for session in sessions]
-            self.assertEqual([a - b for a, b in zip(after, before)],
-                             [1] * 10)
+            with socket.socket() as listener:
+                listener.bind(("127.0.0.1", 0))
+                port = listener.getsockname()[1]
+            env = self.server_env.copy()
+            env.update(DATABASE_URL=f"postgres://conduit:conduit@127.0.0.1:"
+                       f"{proxy.server_address[1]}/{self.database}",
+                       PORT=str(port), CONDUIT_TEST_POOL_SIZE=str(count))
+            with tempfile.TemporaryFile(mode="w+b") as log, \
+                 tempfile.TemporaryFile(mode="w+b") as metrics:
+                server = subprocess.Popen(
+                    [str(_executable()), "--test-http", "--db-worker-count=4"],
+                    env=env, stderr=log,
+                    stdout=metrics)
+                try:
+                    deadline = time.monotonic() + 15
+                    while time.monotonic() < deadline:
+                        self.assertIsNone(server.poll())
+                        sessions = proxy.snapshot()
+                        if len(sessions) == 4 * count and all(
+                                any(kind == b"P" and payload == b"rollback\0"
+                                    for kind, payload in session)
+                                for session in sessions):
+                            break
+                        time.sleep(0.01)
+                    else:
+                        self.fail("routing server preparation timed out")
+                    if readiness:
+                        ready = self.routing_connect(port)
+                        try:
+                            self.routing_tags(ready, proxy)
+                        finally:
+                            ready.close()
+                    yield port, proxy, metrics, server
+                finally:
+                    server.terminate()
+                    try:
+                        server.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        server.kill()
+                        server.wait(timeout=5)
+                    _check_metric_output(metrics if _diagnostic_mode() else None)
         finally:
+            proxy.stop()
+
+    @staticmethod
+    def routing_binds(proxy):
+        return [[payload.split(b"\0", 2)[1] for kind, payload in session
+                 if kind == b"B"] for session in proxy.snapshot()]
+
+    def csv_output(self, metrics, counts):
+        data = os.pread(metrics.fileno(),
+                                        os.fstat(metrics.fileno()).st_size, 0)
+        data = data[:data.rfind(b"\n") + 1]
+        return _split_output(io.BytesIO(data), counts,
+                             allow_json=_diagnostic_mode())[0]
+
+    def wait_csv(self, metrics, server, predicate, count=1, timeout=15):
+        deadline = time.monotonic() + timeout
+        latest = {}
+        while time.monotonic() < deadline:
+            self.assertIsNone(server.poll())
+            csv = self.csv_output(metrics, dict.fromkeys(range(4), count))
+            for row in csv.rows:
+                latest[row["worker_id"]] = row
+            if predicate(latest):
+                return latest
+            time.sleep(0.02)
+        self.fail("CSV state timed out: " + repr(latest))
+
+    def assert_csv_phase(self, row, phase, pending=0):
+        for name in CSV_FIELDS[2:8]:
+            with self.subTest(phase=phase, column=name):
+                self.assertEqual(row[name], int(name == phase), name)
+        self.assertEqual(row["pending"], pending)
+        self.assertGreater(row["monotonic_ns"], 0)
+
+    def test_worker_csv_periodic_identity(self):
+        with self.routing_server(1, readiness=False) as run:
+            _, _, metrics, server = run
+            self.wait_csv(metrics, server,
+                lambda rows: len(rows) == 4 and all(row["idle"] == 1
+                                                   for row in rows.values()))
+            first = self.csv_output(metrics, dict.fromkeys(range(4), 1))
+            previous = {row["worker_id"]: row["monotonic_ns"]
+                        for row in first.rows}
+            self.wait_csv(metrics, server,
+                lambda rows: all(rows.get(worker, {}).get("monotonic_ns", 0)
+                                 > stamp for worker, stamp in previous.items()))
+            csv = self.csv_output(metrics, dict.fromkeys(range(4), 1))
+            self.assertTrue(csv.header)
+            self.assertEqual({row["worker_id"] for row in csv.rows}, set(range(4)))
+            for worker in range(4):
+                rows = [row for row in csv.rows if row["worker_id"] == worker
+                        and row["monotonic_ns"] >= previous[worker]]
+                self.assertGreaterEqual(len(rows), 2)
+                for row in rows:
+                    self.assert_csv_phase(row, "idle")
+                self.assertTrue(all(a["monotonic_ns"] < b["monotonic_ns"]
+                                    for a, b in zip(rows, rows[1:])))
+
+    def test_worker_csv_queue_is_per_worker(self):
+        with self.routing_server(1, readiness=False) as run, ExitStack() as cleanup:
+            port, proxy, metrics, server = run
+            connections = [self.routing_connect(port) for _ in range(4)]
             for connection in connections:
+                cleanup.callback(connection.close)
+            routes = [self.routing_tags(connection, proxy)
+                      for connection in connections]
+            self.assertEqual(len(set(routes)), 4)
+            gate = proxy.hold_frame(b"Z", routes[0], timeout=60)
+            cleanup.callback(gate.release.set)
+            request = b"GET /api/tags HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            connections[0].sock.sendall(request)
+            self.assertTrue(gate.reached.wait(5))
+            connections[0].sock.sendall(request * 2)
+            held = self.wait_csv(metrics, server,
+                lambda rows: rows.get(0, {}).get("pending") == 2)
+            self.assert_csv_phase(held[0], "busy", 2)
+            stamp = held[0]["monotonic_ns"]
+            rows = self.wait_csv(metrics, server,
+                lambda rows: len(rows) == 4 and all(
+                    row["monotonic_ns"] >= stamp for row in rows.values()))
+            self.assert_csv_phase(rows[0], "busy", 2)
+            for worker in range(1, 4):
+                self.assert_csv_phase(rows[worker], "idle")
+            self.assertEqual(self.routing_binds(proxy)[routes[0]], [b"tags"] * 2)
+            self.assertFalse(gate.release.is_set())
+            gate.release.set()
+            with connections[0].sock.makefile("rb") as stream:
+                for _ in range(3):
+                    status, body = self.routing_read_response(stream)
+                    self.assertEqual(status, 200)
+                    self.assertIsInstance(body["tags"], list)
+            rows = self.wait_csv(metrics, server,
+                lambda rows: rows.get(0, {}).get("idle") == 1 and
+                    rows[0]["pending"] == 0 and rows[0]["monotonic_ns"] > stamp)
+            self.assert_csv_phase(rows[0], "idle")
+
+    def test_pool_csv_busy_pending(self):
+        with self.pool_run(1, csv=True) as run:
+            run.ready(1)
+            gate = run.proxy.hold_frame(b"Z", 0, timeout=60)
+            run.send("tags 1 0", "user 2 1", "user 3 1")
+            self.assertTrue(gate.reached.wait(5))
+            run.wait_state(lambda state: len(state["active"]) == 1 and
+                           state["queued"] == [2, 3])
+            observed = run.csv_sample()["monotonic_ns"]
+            row = run.receive(lambda event: event.get("event") == "csv" and
+                              event["row"]["monotonic_ns"] > observed)["row"]
+            self.assert_csv_phase(row, "busy", 2)
+            self.assertEqual(self.routing_binds(run.proxy)[0], [b"tags"])
+            run.send("cancel 1")
+            state = run.state()
+            self.assertEqual(state["queued"], [2, 3])
+            self.assert_csv_phase(run.csv_sample(), "busy", 2)
+            gate.release.set()
+            run.result(1)
+            run.ready(1)
+            row = run.receive(lambda event: event.get("event") == "csv" and
+                event["row"]["idle"] == 1 and event["row"]["pending"] == 0
+                and event["row"]["monotonic_ns"] > row["monotonic_ns"])["row"]
+            self.assert_csv_phase(row, "idle")
+
+    def test_pool_csv_phase_mapping(self):
+        gates = []
+        def configure(proxy):
+            gates.append(proxy.hold_frame(b"Z", 0, timeout=60))
+            gates.append(proxy.hold_frame(b"1", 0, timeout=60))
+        with self.pool_run(1, configure=configure, retry_ns=60_000_000_000,
+                           csv=True) as run:
+            for code, phase in ((0, "connecting"), (1, "preparing")):
+                self.assertTrue(gates[code].reached.wait(5))
+                run.wait_state(lambda state: state["phases"] == [code])
+                sample = run.csv_sample()
+                self.assert_csv_phase(sample, phase)
+                event = run.receive(lambda event: event.get("event") == "csv"
+                    and event["row"]["monotonic_ns"] > sample["monotonic_ns"])
+                self.assert_csv_phase(event["row"], phase)
+                gates[code].release.set()
+            run.ready(1)
+            self.assert_csv_phase(run.csv_sample(), "idle")
+            run.send("retire 0")
+            run.wait_state(lambda state: state["phases"] == [4])
+            sample = run.csv_sample()
+            self.assert_csv_phase(sample, "backoff")
+            event = run.receive(lambda event: event.get("event") == "csv" and
+                event["row"]["monotonic_ns"] > sample["monotonic_ns"])
+            self.assert_csv_phase(event["row"], "backoff")
+            run.send("close")
+            run.wait_state(lambda state: state["phases"] == [5])
+            self.assert_csv_phase(run.csv_sample(), "stopped")
+
+    def test_pool_csv_lifecycle(self):
+        with self.pool_run(1, csv=True) as run:
+            run.ready(1)
+            run.receive(lambda event: event.get("event") == "csv")
+            run.send("stop-csv", "stop-csv")
+            run.csv_fence()
+            before = len(run.csv.rows)
+            run.csv_fence()
+            self.assertEqual(len(run.csv.rows), before)
+            run.send("close", "close")
+            run.csv_fence()
+            self.assertEqual(len(run.csv.rows), before)
+            self.assert_csv_phase(run.csv_sample(), "stopped")
+            run.send("quit")
+            self.assertEqual(run.process.wait(timeout=5), 0)
+
+    def test_listener_close_stops_csv_preserves_workers(self):
+        with self.pool_run(1, csv=True, listener=True) as run:
+            run.ready(1)
+            for worker in range(4):
+                run.receive(lambda event: event.get("event") == "csv" and
+                            event["row"]["worker_id"] == worker and
+                            event["row"]["idle"] == 1)
+            run.send("listener-close")
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                run.sequence += 1
+                request = run.sequence
+                run.send(f"sampling {request}")
+                states = [run.receive(lambda event: event.get("event") ==
+                    "sampling" and event["request"] == request)
+                    for _ in range(4)]
+                self.assertEqual({state["worker_id"] for state in states},
+                                 set(range(4)))
+                self.assertTrue(all(not state["stopped"] for state in states))
+                if all(not state["running"] for state in states):
+                    break
+            else:
+                self.fail("listener close left a sampling timer enabled")
+            self.assertEqual(len(run.proxy.snapshot()), 4)
+            self.assertEqual(self.db("SELECT count(*) FROM pg_stat_activity "
+                f"WHERE datname = '{self.database}' AND usename = 'conduit'"),
+                "24")
+            run.send("tags 1 0")
+            run.result(1)
+            run.csv_fence()
+            before = len(run.csv.rows)
+            run.csv_fence()
+            self.assertEqual(len(run.csv.rows), before)
+            run.send("quit")
+            self.assertEqual(run.process.wait(timeout=5), 0)
+
+    def routing_connect(self, port):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            connection = http.client.HTTPConnection("127.0.0.1", port,
+                                                     timeout=5)
+            try:
+                connection.connect()
+                return connection
+            except ConnectionRefusedError:
                 connection.close()
+                time.sleep(0.01)
+        self.fail("HTTP listener did not become ready")
+
+    def test_four_workers_config_is_per_worker(self):
+        with self.routing_server(2, readiness=False) as run:
+            port, proxy, metrics, server = run
+            self.assertEqual(len(proxy.snapshot()), 8)
+            with ExitStack() as cleanup:
+                connections = [self.routing_connect(port) for _ in range(4)]
+                for connection in connections:
+                    cleanup.callback(connection.close)
+                routes = [{self.routing_tags(connection, proxy)
+                           for _ in range(2)}
+                          for connection in connections]
+                self.assertEqual([len(route) for route in routes], [2] * 4)
+                for index, route in enumerate(routes):
+                    for other in routes[index + 1:]:
+                        self.assertTrue(route.isdisjoint(other))
+                self.assertEqual(set.union(*routes), set(range(8)))
+
+    def test_four_workers_round_robin_accepts(self):
+        with self.routing_server(1, readiness=False) as run, ExitStack() as cleanup:
+            port, proxy, metrics, server = run
+            routes = []
+            for _ in range(8):
+                connection = self.routing_connect(port)
+                cleanup.callback(connection.close)
+                routes.append(self.routing_tags(connection, proxy))
+                if _diagnostic_mode() and len(routes) == 1:
+                    self.routing_wait_pool(metrics, server,
+                        lambda r: r["counters"][0] == 1, worker_id=0)
+                    for worker in range(1, 4):
+                        self.routing_wait_pool(metrics, server,
+                            lambda r: r["counters"][0] == 0, worker_id=worker)
+            self.assertEqual(len(set(routes[:4])), 4)
+            self.assertEqual(routes, routes[:4] * 2)
+            if _diagnostic_mode():
+                for worker_id in range(4):
+                    state = self.routing_wait_pool(metrics, server,
+                        lambda r: r["counters"][0] == 2, worker_id)
+                    self.assertEqual(state["gauges"][6], 1)
+
+    def test_four_workers_keepalive_is_sticky(self):
+        title = "sticky-" + uuid.uuid4().hex
+        token = self.token(self.author())
+        status, created = self.request("POST", "/api/articles",
+                                       self.article(title, []), token)
+        self.assertEqual(status, 201)
+        slug = created["article"]["slug"]
+        with self.routing_server(1, readiness=False) as run, ExitStack() as cleanup:
+            port, proxy, _, _ = run
+            connections = [self.routing_connect(port) for _ in range(4)]
+            for connection in connections:
+                cleanup.callback(connection.close)
+            routes = [self.routing_tags(connection, proxy)
+                      for connection in connections]
+            self.assertEqual(len(set(routes)), 4)
+            for _ in range(3):
+                for connection, route in zip(connections, routes):
+                    self.assertEqual(self.routing_tags(connection, proxy), route)
+            for connection, route in zip(connections, routes):
+                content = "sticky " + uuid.uuid4().hex
+                status, body, changes = self.routing_request(
+                    connection, proxy, "PUT", "/api/articles/" + slug,
+                    {"article": {"body": content}}, token)
+                self.assertEqual(status, 200)
+                self.assertEqual(body["article"]["body"], content)
+                self.assertEqual(set(changes), {route})
+                self.assertEqual(changes[route], [b"article_update_input",
+                    b"article_update", b"article_full_by_id"])
+
+    def test_four_workers_progress_independently(self):
+        with self.routing_server(1, readiness=False) as run, ExitStack() as cleanup:
+            port, proxy, _, _ = run
+            first = self.routing_connect(port)
+            cleanup.callback(first.close)
+            others = [self.routing_connect(port) for _ in range(3)]
+            for connection in others:
+                cleanup.callback(connection.close)
+            first_route = self.routing_tags(first, proxy)
+            routes = [self.routing_tags(connection, proxy)
+                      for connection in others]
+            self.assertEqual(len(set([first_route] + routes)), 4)
+            gate = proxy.hold_frame(b"Z", first_route, timeout=60)
+            cleanup.callback(gate.release.set)
+            first.request("GET", "/api/tags")
+            self.assertTrue(gate.reached.wait(5), "first worker was not held")
+            for connection, route in zip(others, routes):
+                self.assertEqual(self.routing_tags(connection, proxy), route)
+            self.assertTrue(gate.reached.is_set())
+            self.assertFalse(gate.release.is_set())
+            gate.release.set()
+            response = first.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertIsInstance(json.loads(response.read())["tags"], list)
+            proxy.assert_healthy()
+
+    def test_four_workers_close_cancels_only_assigned_work(self):
+        if not _diagnostic_mode():
+            self.skipTest("diagnostic cancellation observation required")
+        with self.routing_server(1, readiness=False) as run, ExitStack() as cleanup:
+            port, proxy, metrics, server = run
+            first = self.routing_connect(port)
+            second = self.routing_connect(port)
+            cleanup.callback(first.close)
+            cleanup.callback(second.close)
+            routes = [self.routing_tags(connection, proxy)
+                      for connection in (first, second)]
+            self.assertNotEqual(*routes)
+            gates = [proxy.hold_frame(b"Z", route, timeout=60)
+                     for route in routes]
+            for gate in gates:
+                cleanup.callback(gate.release.set)
+            held_deadline = time.monotonic() + 40
+            for connection in (first, second):
+                connection.request("GET", "/api/tags")
+            for gate in gates:
+                self.assertTrue(gate.reached.wait(5), "query was not held")
+            first.sock.sendall(b"GET /api/tags HTTP/1.1\r\n"
+                               b"Host: localhost\r\n\r\n")
+            self.routing_wait_pool(metrics, server,
+                lambda r: r["gauges"][:2] == [1, 1], worker_id=0,
+                deadline=held_deadline)
+            first.sock.shutdown(socket.SHUT_RDWR)
+            first.close()
+            detached = self.routing_wait_pool(metrics, server,
+                lambda r: r["counters"][6] == 1, worker_id=0,
+                deadline=held_deadline)
+            survivor = self.routing_wait_pool(metrics, server,
+                lambda r: r["gauges"][1] == 1, worker_id=1,
+                deadline=held_deadline)
+            self.assertLess(time.monotonic(), held_deadline)
+            self.assertEqual(detached["gauges"][1], 1)
+            self.assertEqual(detached["gauges"][0], 1)
+            self.assertEqual(survivor["counters"][6], 0)
+            self.assertTrue(all(not gate.release.is_set() for gate in gates))
+            proxy.assert_healthy()
+            gates[1].release.set()
+            response = second.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertIsInstance(json.loads(response.read())["tags"], list)
+            self.assertEqual(self.routing_tags(second, proxy), routes[1])
+            gates[0].release.set()
+            self.routing_wait_pool(metrics, server,
+                lambda r: r["counters"][2] == 3 and r["gauges"][:2] == [0, 0],
+                worker_id=0)
+            self.assertEqual(self.routing_binds(proxy)[routes[0]],
+                             [b"tags"] * 3)
+            proxy.assert_healthy()
+
+    def test_four_workers_listen_failure_closes_all(self):
+        proxy = ProtocolProxy(self.proxy.database_host,
+                              self.proxy.database_port)
+        try:
+            with socket.socket() as occupied, tempfile.TemporaryFile() as metrics:
+                occupied.bind(("127.0.0.1", 0))
+                occupied.listen()
+                env = self.server_env | {
+                    "PORT": str(occupied.getsockname()[1]),
+                    "CONDUIT_TEST_POOL_SIZE": "1",
+                    "DATABASE_URL": "postgres://conduit:conduit@127.0.0.1:"
+                    f"{proxy.server_address[1]}/{self.database}"}
+                result = subprocess.run(
+                    [str(_executable()), "--test-http", "--db-worker-count=4"],
+                    env=env,
+                    stdout=metrics, stderr=subprocess.PIPE, timeout=10)
+                self.assertNotEqual(result.returncode, 0)
+                with proxy.lock:
+                    frontends = list(proxy.frontends)
+                for frontend in frontends:
+                    try:
+                        frontend.settimeout(2)
+                        self.assertEqual(frontend.recv(1), b"")
+                    except socket.timeout:
+                        self.fail("failed listener left a database socket open")
+                    except OSError:
+                        pass
+                if _diagnostic_mode():
+                    _check_metric_output(metrics)
+        finally:
+            proxy.stop()
+
+    def test_four_workers_diagnostic_identity(self):
+        if not _diagnostic_mode():
+            self.skipTest("diagnostic variant only")
+        with self.routing_server(1, readiness=False) as run, ExitStack() as cleanup:
+            port, proxy, metrics, server = run
+            for _ in range(4):
+                connection = self.routing_connect(port)
+                cleanup.callback(connection.close)
+                self.routing_tags(connection, proxy)
+            for worker_id in range(4):
+                self.routing_wait_pool(metrics, server,
+                    lambda r: r["counters"][0] == 1, worker_id)
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                data = os.pread(metrics.fileno(),
+                                os.fstat(metrics.fileno()).st_size, 0)
+                data = data[:data.rfind(b"\n") + 1]
+                try:
+                    _check_metric_output(io.BytesIO(data), require_activity=True)
+                    break
+                except AssertionError:
+                    time.sleep(0.05)
+            else:
+                _check_metric_output(io.BytesIO(data), require_activity=True)
+            proxy.reject_new = True
+            for index in range(4):
+                proxy.drop_backend(index)
+            deadline = time.monotonic() + 35
+            missing_workers = set()
+            while time.monotonic() < deadline:
+                data = os.pread(metrics.fileno(),
+                                os.fstat(metrics.fileno()).st_size, 0)
+                data = data[:data.rfind(b"\n") + 1]
+                missing_workers = {record["worker_id"] for record in
+                    _metric_records(io.BytesIO(data))
+                    if record.get("missing") and
+                    record.get("reason") == "unavailable"}
+                if missing_workers == set(range(4)):
+                    break
+                self.assertIsNone(server.poll())
+                time.sleep(0.05)
+            self.assertEqual(missing_workers, set(range(4)))
+            _check_metric_output(io.BytesIO(data), require_activity=True)
+
+    def routing_request(self, connection, proxy, method="GET", path="/api/tags",
+                        body=None, token=None):
+        before = self.routing_binds(proxy)
+        original_socket = connection.sock
+        headers = {"Content-Type": "application/json"}
+        if token is not None:
+            headers["Authorization"] = "Token " + token
+        connection.request(method, path,
+                           None if body is None else json.dumps(body), headers)
+        response = connection.getresponse()
+        data = response.read()
+        self.assertIsNotNone(connection.sock)
+        if original_socket is not None:
+            self.assertIs(connection.sock, original_socket)
+        after = self.routing_binds(proxy)
+        self.assertEqual(len(after), len(before))
+        changes = {index: names[len(before[index]):]
+                   for index, names in enumerate(after)
+                   if names != before[index]}
+        return response.status, json.loads(data) if data else None, changes
+
+    def routing_tags(self, connection, proxy):
+        status, body, changes = self.routing_request(connection, proxy)
+        self.assertEqual(status, 200)
+        self.assertIsInstance(body["tags"], list)
+        self.assertEqual(len(changes), 1)
+        worker, names = next(iter(changes.items()))
+        self.assertEqual(names, [b"tags"])
+        return worker
+
+    def test_no_sql_request_sends_no_database_query(self):
+        with self.routing_server(3) as run:
+            port, proxy, _, _ = run
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            try:
+                for path, expected in (("/api/user", 401),
+                                       ("/missing-routing-test", 404)):
+                    status, body, changes = self.routing_request(
+                        connection, proxy, path=path)
+                    self.assertEqual(status, expected)
+                    self.assertIsInstance(body["errors"]["body"], list)
+                    self.assertEqual(changes, {})
+                self.routing_tags(connection, proxy)
+            finally:
+                connection.close()
+
+    def test_operation_followups_use_available_connections(self):
+        title = "routing-" + uuid.uuid4().hex
+        token = self.token(self.author())
+        status, created = self.request("POST", "/api/articles",
+                                       self.article(title, []), token)
+        self.assertEqual(status, 201)
+        slug = created["article"]["slug"]
+        with self.routing_server(3) as run:
+            port, proxy, _, _ = run
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            try:
+                routes = [self.routing_tags(connection, proxy) for _ in range(3)]
+                self.assertEqual(len(set(routes)), 3)
+                content = "routing body " + uuid.uuid4().hex
+                status, body, changes = self.routing_request(
+                    connection, proxy, "PUT", "/api/articles/" + slug,
+                    {"article": {"body": content}}, token)
+                self.assertEqual(status, 200)
+                self.assertEqual(body["article"]["body"], content)
+                self.assertEqual(body["article"]["slug"], slug)
+                names = [name for commands in changes.values() for name in commands]
+                self.assertCountEqual(names, [b"article_update_input",
+                                             b"article_update",
+                                             b"article_full_by_id"])
+                self.assertGreater(len(changes), 1)
+
+            finally:
+                connection.close()
+
+    def routing_wait_pool(self, metrics, server, predicate, worker_id=0,
+                          deadline=None):
+        if deadline is None:
+            deadline = time.monotonic() + 25
+        latest = None
+        while time.monotonic() < deadline:
+            self.assertIsNone(server.poll())
+            data = os.pread(metrics.fileno(),
+                                        os.fstat(metrics.fileno()).st_size, 0)
+            end = data.rfind(b"\n")
+            for record in _metric_records(io.BytesIO(data[:end + 1])):
+                if (record.get("owner") == 1 and not record.get("missing") and
+                        record.get("worker_id") == worker_id):
+                    latest = record
+            if latest is not None and predicate(latest):
+                return latest
+            time.sleep(0.05)
+        self.fail("pool state timed out: " + repr(latest))
+
+    def routing_read_response(self, stream):
+        status = stream.readline().split()
+        self.assertGreaterEqual(len(status), 2)
+        headers = {}
+        while (line := stream.readline()) != b"\r\n":
+            self.assertTrue(line)
+            name, value = line.split(b":", 1)
+            headers[name.lower()] = value.strip()
+        size = int(headers[b"content-length"])
+        body = stream.read(size)
+        self.assertEqual(len(body), size)
+        return int(status[1]), json.loads(body) if body else None
+
+    def test_http_disconnect_detaches_shared_queue_preserves_other_client(self):
+        if not _diagnostic_mode():
+            self.skipTest("diagnostic variant only")
+        count = 3
+        with self.routing_server(count) as run, ExitStack() as cleanup:
+            port, proxy, metrics, server = run
+            baseline = self.routing_wait_pool(metrics, server,
+                lambda r: r["counters"][0] == 1 and r["gauges"][1] == 0)
+            with SQLSession(self.database) as holder:
+                holder.execute("BEGIN; LOCK TABLE tags IN ACCESS EXCLUSIVE MODE;")
+                for _ in range(3):
+                    with socket.create_connection(("127.0.0.1", port), 10):
+                        pass
+                abandoned = socket.create_connection(("127.0.0.1", port), 10)
+                cleanup.callback(abandoned.close)
+                request = b"GET /api/tags HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                abandoned.sendall(request * (count + 1))
+                self.routing_wait_pool(metrics, server,
+                    lambda r: r["counters"][0] == 5 and r["gauges"][:2] == [1, 3])
+                for _ in range(3):
+                    with socket.create_connection(("127.0.0.1", port), 10):
+                        pass
+                survivor = socket.create_connection(("127.0.0.1", port), 10)
+                cleanup.callback(survivor.close)
+                survivor.sendall(request * count)
+                self.routing_wait_pool(metrics, server,
+                    lambda r: r["counters"][0] == 8 and r["gauges"][:2] == [4, 3])
+                abandoned.shutdown(socket.SHUT_RDWR)
+                abandoned.close()
+                detached = self.routing_wait_pool(metrics, server,
+                    lambda r: r["counters"][6] - baseline["counters"][6] == 1)
+                self.assertEqual(detached["gauges"][:2], [4, 3])
+                holder.execute("ROLLBACK;")
+                stream = survivor.makefile("rb")
+                cleanup.callback(stream.close)
+                for _ in range(count):
+                    status, body = self.routing_read_response(stream)
+                    self.assertEqual(status, 200)
+                    self.assertIsInstance(body["tags"], list)
+                survivor.sendall(request)
+                status, body = self.routing_read_response(stream)
+                self.assertEqual(status, 200)
+                self.assertIsInstance(body["tags"], list)
+                final = self.routing_wait_pool(metrics, server,
+                    lambda r: r["counters"][0] == 9 and r["gauges"][:2] == [0, 0])
+                self.assertEqual(final["counters"][2], 9)
+                self.assertEqual(final["counters"][5] - baseline["counters"][5], 4)
+
+    def test_shared_pool_reuses_all_idle_connections(self):
+        with self.routing_server(5, readiness=False) as run, ExitStack() as cleanup:
+            port, proxy, _, _ = run
+            warm = [self.routing_connect(port) for _ in range(4)]
+            for connection in warm:
+                cleanup.callback(connection.close)
+            used = set()
+            deadline = time.monotonic() + 15
+            while len(used) < 20 and time.monotonic() < deadline:
+                for connection in warm:
+                    used.add(self.routing_tags(connection, proxy))
+            self.assertEqual(used, set(range(20)))
+            before = self.routing_binds(proxy)
+            for _ in range(20):
+                connection = self.routing_connect(port)
+                cleanup.callback(connection.close)
+                self.routing_tags(connection, proxy)
+            after = self.routing_binds(proxy)
+            self.assertEqual([len(a) - len(b) for a, b in zip(after, before)],
+                             [1] * 20)
+            proxy.assert_healthy()
 
     def test_named_rollback_after_failed_transaction(self):
         before = len(self.proxy.snapshot())
-        executable = Path(__file__).resolve().parents[1] / "bin" / "conduit"
+        executable = _executable()
         result = subprocess.run([str(executable), "--test-named-rollback"],
-                                env=self.server_env, capture_output=True,
+                                env=self.server_env | {
+                                    "CONDUIT_TEST_POOL_SIZE": "1"},
+                                capture_output=True,
                                 text=True, timeout=10)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, 0, _failure_output(result.stderr))
         self.assertEqual(result.stdout.strip(),
                          "named rollback after failed transaction passed")
         sessions = self.proxy.snapshot()
@@ -467,13 +1982,206 @@ class Integration(unittest.TestCase):
                 probes.append(traffic)
         self.assertEqual(len(probes), 1)
 
+    def test_database_hostname_connects(self):
+        env = self.server_env.copy()
+        env["DATABASE_URL"] = env["DATABASE_URL"].replace(
+            "@127.0.0.1:", "@localhost:")
+        executable = _executable()
+        result = subprocess.run([str(executable), "--test-named-rollback"],
+                                env=env, capture_output=True, text=True,
+                                timeout=10)
+        self.assertEqual(result.returncode, 0, _failure_output(result.stderr))
+        self.assertEqual(result.stdout.strip(),
+                         "named rollback after failed transaction passed")
+
+    def test_dns_resolution_does_not_block_scheduler(self):
+        source = Path(__file__).with_name("slow_dns.c")
+        with tempfile.TemporaryDirectory() as directory:
+            preload = Path(directory) / "slow_dns.so"
+            subprocess.run(["cc", "-shared", "-fPIC", str(source), "-ldl",
+                            "-o", str(preload)], check=True)
+            env = self.server_env.copy()
+            env["DATABASE_URL"] = env["DATABASE_URL"].replace(
+                "@127.0.0.1:", "@localhost:")
+            env["LD_PRELOAD"] = str(preload)
+            marker = Path(directory) / "dns-entered"
+            release = Path(directory) / "dns-release"
+            env["CONDUIT_DNS_MARKER"] = str(marker)
+            env["CONDUIT_DNS_RELEASE"] = str(release)
+            executable = _executable()
+            process = subprocess.Popen(
+                [str(executable), "--ponymaxthreads=1", "--test-dns-progress"],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True)
+            try:
+                with selectors.DefaultSelector() as selector:
+                    selector.register(process.stderr, selectors.EVENT_READ)
+                    self.assertTrue(selector.select(5),
+                                    "delayed DNS hook was not entered")
+                self.assertTrue(
+                    process.stderr.readline().strip() == "DNS delay entered",
+                    "DNS delay marker absent")
+                self.assertTrue(marker.exists())
+                with selectors.DefaultSelector() as selector:
+                    selector.register(process.stdout, selectors.EVENT_READ)
+                    self.assertTrue(selector.select(5),
+                                    "DNS resolution blocked the scheduler")
+                self.assertEqual(process.stdout.readline().strip(),
+                                 "scheduler progressed")
+                release.touch()
+                _, errors = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0, _failure_output(errors))
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+
+    def test_session_rejects_truncated_strings_and_preserves_status(self):
+        executable = _executable()
+        result = subprocess.run([str(executable), "--test-session-boundary"],
+                                env=self.server_env | {
+                                    "CONDUIT_TEST_POOL_SIZE": "invalid"},
+                                capture_output=True,
+                                text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, _failure_output(result.stderr))
+        self.assertEqual(result.stdout.strip(), "session boundaries passed")
+
+    def test_session_shutdown_settles_accepted_commands(self):
+        executable = _executable()
+        result = subprocess.run([str(executable), "--test-session-shutdown"],
+                                env=self.server_env | {
+                                    "CONDUIT_TEST_POOL_SIZE": "1"},
+                                capture_output=True,
+                                text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, _failure_output(result.stderr))
+        self.assertEqual(result.stdout.strip(),
+                         "session shutdown settled commands")
+
+    def test_startup_shutdown_settles_accepted_commands(self):
+        source = Path(__file__).with_name("slow_dns.c")
+        with tempfile.TemporaryDirectory() as directory:
+            preload = Path(directory) / "slow_dns.so"
+            subprocess.run(["cc", "-shared", "-fPIC", str(source), "-ldl",
+                            "-o", str(preload)], check=True)
+            env = self.server_env.copy()
+            env["DATABASE_URL"] = env["DATABASE_URL"].replace(
+                "@127.0.0.1:", "@localhost:")
+            env["LD_PRELOAD"] = str(preload)
+            marker = Path(directory) / "dns-entered"
+            release = Path(directory) / "dns-release"
+            env["CONDUIT_DNS_MARKER"] = str(marker)
+            env["CONDUIT_DNS_RELEASE"] = str(release)
+            executable = _executable()
+            process = subprocess.Popen([str(executable),
+                                        "--test-startup-shutdown"], env=env,
+                                       stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, text=True)
+            try:
+                with selectors.DefaultSelector() as selector:
+                    selector.register(process.stdout, selectors.EVENT_READ)
+                    self.assertTrue(selector.select(5),
+                                    "shutdown did not finish during DNS")
+                output = process.stdout.readline().strip()
+                self.assertTrue(marker.exists(),
+                                "delayed DNS hook was not entered")
+                release.touch()
+                _, errors = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0, _failure_output(errors))
+                self.assertTrue("DNS delay entered" in errors,
+                                "DNS delay marker absent")
+                self.assertEqual(output,
+                                 "startup shutdown settled commands")
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+
+    def test_connection_fields_reject_nul(self):
+        executable = _executable()
+        result = subprocess.run([str(executable), "--test-connection-nul"],
+                                env=self.server_env | {
+                                    "CONDUIT_TEST_POOL_SIZE": "1"},
+                                capture_output=True,
+                                text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, _failure_output(result.stderr))
+        self.assertEqual(result.stdout.strip(),
+                         "connection fields rejected NUL")
+
+    def test_result_shapes_reject_nested_arrays_and_keep_infinities(self):
+        executable = _executable()
+        result = subprocess.run([str(executable), "--test-result-shapes"],
+                                env=self.server_env | {
+                                    "CONDUIT_TEST_POOL_SIZE": "1"},
+                                capture_output=True,
+                                text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, _failure_output(result.stderr))
+        self.assertEqual(result.stdout.strip(), "result shapes passed")
+
+    def test_deep_rejection_queue_drains(self):
+        executable = _executable()
+        result = subprocess.run([str(executable), "--test-queue-drain"],
+                                env=self.server_env | {
+                                    "CONDUIT_TEST_POOL_SIZE": "1"},
+                                capture_output=True,
+                                text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, _failure_output(result.stderr))
+        self.assertEqual(result.stdout.strip(), "deep rejection queue drained")
+
+    def test_database_url_rejects_nul(self):
+        env = self.server_env.copy()
+        env["DATABASE_URL"] = env["DATABASE_URL"].replace(
+            "/" + self.database, "/%00")
+        executable = _executable()
+        result = subprocess.run([str(executable), "--test-named-rollback"],
+                                env=env, capture_output=True, text=True,
+                                timeout=10)
+        self.assertEqual(result.returncode, 1)
+        self.assertTrue("Invalid configuration" in result.stderr,
+                        "configuration error absent")
+
+    def test_idle_notice_does_not_complete_query(self):
+        before = len(self.proxy.snapshot())
+        self.assertGreater(self.proxy.send_notice(), 0)
+        time.sleep(1.2)
+        self.assertEqual(self.request("GET", "/api/tags")[0], 200)
+        self.assertEqual(len(self.proxy.snapshot()), before)
+
+    def test_notice_does_not_complete_inflight_query(self):
+        before = len(self.proxy.snapshot())
+        self.proxy.hold_command_complete_after(0)
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                request = pool.submit(self.request, "GET", "/api/tags")
+                self.assertTrue(self.proxy.command_complete_held.wait(5))
+                with self.proxy.lock:
+                    frontend = self.proxy.held_frontend
+                offset = os.fstat(self.server_log.fileno()).st_size
+                self.assertGreater(self.proxy.send_notice(frontend), 0)
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    size = os.fstat(self.server_log.fileno()).st_size
+                    if b"idle notice" in os.pread(
+                            self.server_log.fileno(), size - offset, offset):
+                        break
+                    time.sleep(0.01)
+                else:
+                    self.fail("libpq did not consume the notice")
+                self.assertFalse(request.done())
+                self.proxy.release_command_complete()
+                self.assertEqual(request.result(timeout=5)[0], 200)
+        finally:
+            self.proxy.release_command_complete(abort=True)
+        self.assertEqual(len(self.proxy.snapshot()), before)
+
     def test_presend_data_error_keeps_worker_query_order(self):
         before = len(self.proxy.snapshot())
-        executable = Path(__file__).resolve().parents[1] / "bin" / "conduit"
+        executable = _executable()
         result = subprocess.run([str(executable), "--test-worker-data-error"],
-                                env=self.server_env, capture_output=True,
+                                env=self.server_env | {
+                                    "CONDUIT_TEST_POOL_SIZE": "1"},
+                                capture_output=True,
                                 text=True, timeout=10)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, 0, _failure_output(result.stderr))
         self.assertEqual(result.stdout.strip(),
                          "worker data errors followed by query passed")
         sessions = self.proxy.snapshot()[before:]
@@ -486,35 +2194,19 @@ class Integration(unittest.TestCase):
         self.assertGreater(int(self.db("SELECT count(*) FROM tags")), 0)
         before = len(self.proxy.snapshot())
         self.proxy.corrupt_next_data_row()
-        executable = Path(__file__).resolve().parents[1] / "bin" / "conduit"
+        executable = _executable()
         result = subprocess.run([str(executable), "--test-worker-decode-error"],
-                                env=self.server_env, capture_output=True,
+                                env=self.server_env | {
+                                    "CONDUIT_TEST_POOL_SIZE": "1"},
+                                capture_output=True,
                                 text=True, timeout=10)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, 0, _failure_output(result.stderr))
         self.assertEqual(result.stdout.strip(),
                          "worker decode error followed by query passed")
         sessions = self.proxy.snapshot()[before:]
         self.assertEqual(len(sessions), 1)
         bound = [payload.split(b"\0", 2)[1] for kind, payload
                  in sessions[0] if kind == b"B"]
-        self.assertEqual(bound, [b"tags", b"tags"])
-
-    def test_foreign_session_callback_does_not_retire_worker(self):
-        before = len(self.proxy.snapshot())
-        executable = Path(__file__).resolve().parents[1] / "bin" / "conduit"
-        result = subprocess.run(
-            [str(executable), "--test-worker-foreign-callback"],
-            env=self.server_env, capture_output=True, text=True, timeout=10)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(),
-                         "foreign session callback ignored")
-        sessions = self.proxy.snapshot()[before:]
-        prepared = [session for session in sessions if any(
-            kind == b"P" and payload.split(b"\0", 1)[0] == b"tags"
-            for kind, payload in session)]
-        self.assertEqual(len(prepared), 1)
-        bound = [payload.split(b"\0", 2)[1] for kind, payload
-                 in prepared[0] if kind == b"B"]
         self.assertEqual(bound, [b"tags", b"tags"])
 
     def test_missing_query_completion_fails_request(self):
@@ -535,12 +2227,13 @@ class Integration(unittest.TestCase):
             connection.close()
 
     def test_shared_worker_cancellation_preserves_other_client(self):
-        executable = Path(__file__).resolve().parents[1] / "bin" / "conduit"
+        executable = _executable()
         before = len(self.proxy.snapshot())
         self.proxy.hold_command_complete_after(1)
         process = subprocess.Popen(
             [str(executable), "--test-worker-overlap"],
-            env=self.server_env, stdout=subprocess.PIPE,
+            env=self.server_env | {"CONDUIT_TEST_POOL_SIZE": "1"},
+            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, bufsize=1)
         try:
             self.probe_line(process, "overlap accepted")
@@ -556,7 +2249,7 @@ class Integration(unittest.TestCase):
                 self.fail("first client's query did not reach PostgreSQL")
             self.proxy.release_command_complete()
             stdout, stderr = process.communicate(timeout=10)
-            self.assertEqual(process.returncode, 0, stderr)
+            self.assertEqual(process.returncode, 0, _failure_output(stderr))
             self.assertEqual(stdout.strip(), "surviving client passed")
             sessions = self.proxy.snapshot()[before:]
             self.assertEqual(len(sessions), 1)
@@ -570,52 +2263,17 @@ class Integration(unittest.TestCase):
                 process.kill()
                 process.communicate(timeout=5)
 
-    def test_submitted_jobs_each_fail_on_database_loss(self):
-        executable = Path(__file__).resolve().parents[1] / "bin" / "conduit"
-        before = len(self.proxy.snapshot())
-        self.proxy.hold_command_complete_after(1)
-        process = subprocess.Popen(
-            [str(executable), "--test-worker-submitted-loss"],
-            env=self.server_env, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, bufsize=1)
-        try:
-            self.probe_line(process, "submitted work accepted")
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
-                sessions = self.proxy.snapshot()[before:]
-                if sessions and any(kind == b"B" and
-                        payload.split(b"\0", 2)[1] == b"tags"
-                        for kind, payload in sessions[0]):
-                    break
-                time.sleep(0.01)
-            else:
-                self.fail("submitted query did not reach PostgreSQL")
-            self.proxy.drop_backend(before)
-            self.proxy.release_command_complete(abort=True)
-            stdout, stderr = process.communicate(timeout=10)
-            self.assertEqual(process.returncode, 0, stderr)
-            self.assertEqual(stdout.strip(), "submitted work failed once")
-            sessions = self.proxy.snapshot()[before:]
-            self.assertEqual(len(sessions), 1)
-            bound = [payload.split(b"\0", 2)[1] for kind, payload
-                     in sessions[0] if kind == b"B"]
-            self.assertEqual(bound, [b"current_user", b"tags"])
-        finally:
-            self.proxy.release_command_complete(abort=True)
-            if process.poll() is None:
-                process.kill()
-                process.communicate(timeout=5)
-
     def test_explicit_worker_close_fails_each_submitted_job(self):
-        executable = Path(__file__).resolve().parents[1] / "bin" / "conduit"
+        executable = _executable()
         self.proxy.hold_command_complete_after(1)
         process = subprocess.Popen(
             [str(executable), "--test-worker-close-drain"],
-            env=self.server_env, stdout=subprocess.PIPE,
+            env=self.server_env | {"CONDUIT_TEST_POOL_SIZE": "1"},
+            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, bufsize=1)
         try:
             stdout, stderr = process.communicate(timeout=10)
-            self.assertEqual(process.returncode, 0, stderr)
+            self.assertEqual(process.returncode, 0, _failure_output(stderr))
             self.assertEqual(stdout.splitlines(),
                              ["submitted work accepted",
                               "submitted work failed once"])
@@ -652,17 +2310,20 @@ class Integration(unittest.TestCase):
         finally:
             proxy.stop()
 
-    def test_worker_count_configuration(self):
-        executable = Path(__file__).resolve().parents[1] / "bin" / "conduit"
+    def test_private_worker_count_configuration(self):
+        executable = _executable()
         for count in ("", "invalid", "0", "96"):
             with self.subTest(count=count):
                 env = self.server_env.copy()
-                env["DB_WORKERS"] = count
-                result = subprocess.run([str(executable)], env=env,
+                env["CONDUIT_TEST_POOL_SIZE"] = count
+                result = subprocess.run(
+                    [str(executable), "--test-http", "--db-worker-count=4"],
+                    env=env,
                                         capture_output=True, text=True,
                                         timeout=5)
                 self.assertEqual(result.returncode, 1)
-                self.assertIn("DB_WORKERS must be valid", result.stderr)
+                self.assertTrue("CONDUIT_TEST_POOL_SIZE" in result.stderr,
+                                "worker-count error absent")
 
     def test_invalid_catalog_prevents_worker_dispatch(self):
         database = "pony_invalid_" + uuid.uuid4().hex
@@ -679,10 +2340,15 @@ class Integration(unittest.TestCase):
                 DATABASE_URL=f"postgres://conduit:conduit@127.0.0.1:"
                              f"{proxy.server_address[1]}/{database}",
                 JWT_SECRET=self.secret, HOST="127.0.0.1", PORT=str(port),
-                DB_WORKERS="1")
-            executable = Path(__file__).resolve().parents[1] / "bin" / "conduit"
-            with tempfile.TemporaryFile(mode="w+b") as log:
-                server = subprocess.Popen([str(executable)], env=env,
+                CONDUIT_TEST_POOL_SIZE="1")
+            executable = _executable()
+            with tempfile.TemporaryFile(mode="w+b") as log, \
+                 tempfile.TemporaryFile(mode="w+b") as metrics:
+                server = subprocess.Popen(
+                    [str(executable), "--test-http", "--db-worker-count=4"],
+                    env=env,
+                                          stdout=(metrics if _diagnostic_mode()
+                                                  else None),
                                           stderr=log)
                 try:
                     with ThreadPoolExecutor(max_workers=1) as executor:
@@ -711,7 +2377,9 @@ class Integration(unittest.TestCase):
                             if b"Database prepare tags failed" in diagnostic:
                                 break
                             time.sleep(0.01)
-                        self.assertIn(b"Database prepare tags failed", diagnostic)
+                        self.assertTrue(
+                            b"Database prepare tags failed" in diagnostic,
+                            "expected prepare failure absent")
                         self.assertFalse(future.done())
                         self.sql("ALTER TABLE tags_hidden RENAME TO tags", database)
                         status, body = future.result(timeout=12)
@@ -728,6 +2396,8 @@ class Integration(unittest.TestCase):
                     except subprocess.TimeoutExpired:
                         server.kill()
                         server.wait(timeout=5)
+                    _check_metric_output(metrics if _diagnostic_mode()
+                                         else None)
         finally:
             proxy.stop()
             self.sql(f"DROP DATABASE {database} WITH (FORCE)")
@@ -741,8 +2411,9 @@ class Integration(unittest.TestCase):
             self.sql("ALTER TABLE tags RENAME TO tags_hidden", database)
             env = self.server_env.copy()
             env.update(DATABASE_URL=f"postgres://conduit:conduit@127.0.0.1:"
-                       f"{proxy.server_address[1]}/{database}")
-            executable = Path(__file__).resolve().parents[1] / "bin" / "conduit"
+                       f"{proxy.server_address[1]}/{database}",
+                       CONDUIT_TEST_POOL_SIZE="1")
+            executable = _executable()
             process = subprocess.Popen(
                 [str(executable), "--test-worker-pending-cancel"], env=env,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -751,13 +2422,13 @@ class Integration(unittest.TestCase):
                 self.probe_line(process, "pending cancellation accepted")
                 self.sql("ALTER TABLE tags_hidden RENAME TO tags", database)
                 stdout, stderr = process.communicate(timeout=15)
-                self.assertEqual(process.returncode, 0, stderr)
+                self.assertEqual(process.returncode, 0, _failure_output(stderr))
                 self.assertEqual(stdout.strip(),
                                  "surviving pending client passed")
                 bound = [payload.split(b"\0", 2)[1]
                          for session in proxy.snapshot()
                          for kind, payload in session if kind == b"B"]
-                self.assertEqual(bound, [b"tags"])
+                self.assertEqual(bound, [b"tags", b"tags"])
             finally:
                 if process.poll() is None:
                     process.kill()
@@ -776,10 +2447,15 @@ class Integration(unittest.TestCase):
             env = self.server_env.copy()
             env.update(DATABASE_URL=f"postgres://conduit:conduit@127.0.0.1:"
                        f"{proxy.server_address[1]}/{self.database}",
-                       PORT=str(port), DB_WORKERS="1")
-            executable = Path(__file__).resolve().parents[1] / "bin" / "conduit"
-            with tempfile.TemporaryFile(mode="w+b") as log:
-                server = subprocess.Popen([str(executable)], env=env,
+                       PORT=str(port), CONDUIT_TEST_POOL_SIZE="1")
+            executable = _executable()
+            with tempfile.TemporaryFile(mode="w+b") as log, \
+                 tempfile.TemporaryFile(mode="w+b") as metrics:
+                server = subprocess.Popen(
+                    [str(executable), "--test-http", "--db-worker-count=4"],
+                    env=env,
+                                          stdout=(metrics if _diagnostic_mode()
+                                                  else None),
                                           stderr=log)
                 try:
                     deadline = time.monotonic() + 10
@@ -798,71 +2474,66 @@ class Integration(unittest.TestCase):
                         response = connection.getresponse()
                         self.assertEqual(response.status, 200)
                         self.assertIn("tags", json.loads(response.read()))
-                        self.assertEqual(len(proxy.snapshot()), 1)
-                        proxy.drop_backend(0)
+                        sessions = proxy.snapshot()
+                        self.assertEqual(len(sessions), 4)
+                        serving = [index for index, session in enumerate(sessions)
+                                   if any(kind == b"B" for kind, _ in session)]
+                        self.assertEqual(len(serving), 1)
+                        proxy.drop_backend(serving[0])
                         deadline = time.monotonic() + 5
                         while time.monotonic() < deadline:
-                            log.seek(0)
-                            if b"Postgres session shutdown" in log.read():
+                            sessions = proxy.snapshot()
+                            if len(sessions) == 5 and sum(kind == b"P"
+                                    for kind, _ in sessions[4]) == 30:
                                 break
                             time.sleep(0.01)
                         else:
-                            self.fail("worker did not observe lost database socket")
+                            self.fail("worker did not prepare a replacement connection")
                         connection.request("GET", "/api/tags")
                         response = connection.getresponse()
                         self.assertEqual(response.status, 200)
                         self.assertIn("tags", json.loads(response.read()))
                         sessions = proxy.snapshot()
-                        self.assertEqual(len(sessions), 2)
+                        self.assertEqual(len(sessions), 5)
                         self.assertEqual(sum(kind == b"P" for kind, _
-                                             in sessions[1]), 30)
+                                             in sessions[4]), 30)
                         self.assertIn(b"tags", [payload.split(b"\0", 2)[1]
-                            for kind, payload in sessions[1] if kind == b"B"])
+                            for kind, payload in sessions[4] if kind == b"B"])
                         with SQLSession(self.database) as holder:
                             holder.execute("BEGIN; LOCK TABLE tags IN "
                                            "ACCESS EXCLUSIVE MODE;")
                             try:
-                                with socket.create_connection(
-                                        ("127.0.0.1", port), timeout=5) as sock:
-                                    sock.settimeout(8)
-                                    sock.sendall((
-                                        b"GET /api/tags HTTP/1.1\r\n"
-                                        b"Host: localhost\r\n\r\n"))
-                                    deadline = time.monotonic() + 5
-                                    while time.monotonic() < deadline:
-                                        traffic = proxy.snapshot()[1]
-                                        if sum(kind == b"B" for kind, _
-                                               in traffic) >= 2:
-                                            break
-                                        time.sleep(0.01)
-                                    else:
-                                        self.fail("blocked query was not submitted")
-                                    proxy.drop_backend(1)
-                                    with sock.makefile("rb") as stream:
-                                        self.assertEqual(
-                                            stream.readline().split()[1], b"500")
-                                        headers = {}
-                                        while (line := stream.readline()) != b"\r\n":
-                                            self.assertTrue(line)
-                                            name, value = line.split(b":", 1)
-                                            headers[name.lower()] = value.strip()
-                                        body = json.loads(stream.read(
-                                            int(headers[b"content-length"])))
-                                        self.assertEqual(
-                                            body["errors"]["body"],
-                                            ["connection lost"])
+                                before = self.routing_binds(proxy)
+                                connection.request("GET", "/api/tags")
+                                deadline = time.monotonic() + 5
+                                while time.monotonic() < deadline:
+                                    after = self.routing_binds(proxy)
+                                    changed = [index for index in range(len(after))
+                                        if len(after[index]) > len(before[index])]
+                                    if changed:
+                                        break
+                                    time.sleep(0.01)
+                                else:
+                                    self.fail("blocked query was not submitted")
+                                self.assertEqual(changed, [4])
+                                proxy.drop_backend(changed[0])
+                                response = connection.getresponse()
+                                self.assertEqual(response.status, 500)
+                                body = json.loads(response.read())
+                                self.assertEqual(body["errors"]["body"],
+                                                 ["connection lost"])
                             finally:
                                 holder.execute("ROLLBACK;")
                         deadline = time.monotonic() + 5
                         while time.monotonic() < deadline:
                             sessions = proxy.snapshot()
-                            if len(sessions) == 3 and sum(kind == b"P" for
-                                    kind, _ in sessions[2]) == 30:
+                            if len(sessions) == 6 and sum(kind == b"P" for
+                                    kind, _ in sessions[5]) == 30:
                                 break
                             time.sleep(0.01)
-                        self.assertEqual(len(sessions), 3)
+                        self.assertEqual(len(sessions), 6)
                         self.assertFalse(any(kind == b"B" for kind, _
-                                             in sessions[2]))
+                                             in sessions[5]))
                         connection.request("GET", "/api/tags")
                         response = connection.getresponse()
                         self.assertEqual(response.status, 200)
@@ -876,24 +2547,61 @@ class Integration(unittest.TestCase):
                     except subprocess.TimeoutExpired:
                         server.kill()
                         server.wait(timeout=5)
+                    _check_metric_output(metrics if _diagnostic_mode()
+                                         else None)
+                    if _diagnostic_mode():
+                        metrics.seek(0)
+                        final = [record for record in
+                                 _metric_records(metrics)
+                                 if record.get("owner") == 2 and
+                                 record.get("request") == 0]
+                        self.assertEqual({record["generation"] for record
+                                          in final}, {0, 1})
+                        worker_ids = {record["worker_id"] for record in final}
+                        self.assertEqual(len(worker_ids), 1)
+                        worker_id = next(iter(worker_ids))
+                        self.assertTrue(all(record["counters"][11] == 1
+                                            for record in final))
+                        by_generation = {(record["worker_id"],
+                                          record["generation"]): record
+                                         for record in final}
+                        original = by_generation[worker_id, 0]
+                        replacement = by_generation[worker_id, 1]
+                        self.assertEqual(original["counters"][1], 1)
+                        self.assertEqual(original["counters"][3], 1)
+                        self.assertEqual(replacement["counters"][1], 2)
+                        self.assertEqual(replacement["counters"][3], 2)
+                        self.assertEqual(original["histograms"][2][
+                            "count"], 31)
+                        self.assertEqual(replacement["histograms"][2][
+                            "count"], 32)
         finally:
             proxy.stop()
 
     def test_atomic_failure_reuses_all_workers(self):
         token = self.token(9223372036854775807)
-        for _ in range(10):
+        before = self.routing_binds(self.proxy)[:20]
+        self.assertEqual(len(before), 20)
+        for _ in range(20):
             status, body = self.request("POST", "/api/articles", {
                 "article": {"title": "rollback", "description": "d", "body": "b"}},
                 token)
             self.assertEqual(status, 500)
             self.assertIsInstance(body["errors"]["body"], list)
-        for _ in range(10):
+        after_failure = self.routing_binds(self.proxy)[:20]
+        self.assertTrue(all(len(after) > len(initial)
+            for initial, after in zip(before, after_failure)))
+        for _ in range(20):
             self.assertEqual(self.request("GET", "/api/tags")[0], 200)
+        after_read = self.routing_binds(self.proxy)[:20]
+        self.assertEqual([after[len(failed):]
+            for failed, after in zip(after_failure, after_read)],
+            [[b"tags"]] * 20)
         states = self.sql(
             "SELECT count(*), count(*) FILTER (WHERE state = 'idle') "
             "FROM pg_stat_activity "
             f"WHERE datname = '{self.database}' AND usename = 'conduit'")
-        self.assertEqual(states, "10|10")
+        self.assertEqual(states, "20|20")
 
     def author(self):
         return int(self.db("SELECT id FROM users ORDER BY id LIMIT 1"))
@@ -953,6 +2661,24 @@ class Integration(unittest.TestCase):
                 self.assert_article(response, title, tags or [])
         self.assertEqual(self.db(
             f"SELECT id FROM tags WHERE name={self.literal(existing)}"), existing_id)
+
+    def test_timestamp_values_across_postgres_epoch(self):
+        title = "timestamp_" + uuid.uuid4().hex
+        status, created = self.request("POST", "/api/articles",
+            self.article(title, []), self.token(self.author()))
+        self.assertEqual(status, 201)
+        slug = self.literal(created["article"]["slug"])
+        self.db("UPDATE articles SET "
+                "created_at = TIMESTAMPTZ '1999-12-31 23:59:59.123456+00', "
+                "updated_at = TIMESTAMPTZ '2000-01-01 00:00:00.987654+00' "
+                f"WHERE slug = {slug}")
+        status, fetched = self.request(
+            "GET", "/api/articles/" + created["article"]["slug"])
+        self.assertEqual(status, 200)
+        self.assertEqual(fetched["article"]["createdAt"],
+                         "1999-12-31T23:59:59.123Z")
+        self.assertEqual(fetched["article"]["updatedAt"],
+                         "2000-01-01T00:00:00.987Z")
 
     def test_sql_json_list_and_tags(self):
         suffix = uuid.uuid4().hex
@@ -1169,6 +2895,398 @@ class Integration(unittest.TestCase):
                     body = json.loads(stream.read(int(headers[b"content-length"])))
                     self.assertIn(expected, body)
 
+
+class WorkerCSVParser(unittest.TestCase):
+    def test_exact_schema_and_mixed_diagnostic_output(self):
+        records = DiagnosticParser.records(4)
+        stream = CSV_HEADER + "\n" + "11,3,0,0,0,1,0,0,2\n"
+        csv, lines = _split_output(io.StringIO(stream), {3: 1}, allow_json=False)
+        self.assertTrue(csv.header)
+        self.assertEqual(lines, [])
+        self.assertEqual(csv.rows[0]["worker_id"], 3)
+        self.assertEqual(csv.rows[0]["busy"], 1)
+        self.assertEqual(csv.rows[0]["pending"], 2)
+        mixed = (json.dumps(records[0]) + "\n" + stream +
+                 "".join(json.dumps(record) + "\n" for record in records[1:]))
+        _check_metric_output(io.StringIO(mixed), require_activity=True)
+        with self.assertRaisesRegex(AssertionError, "unexpected JSON"):
+            _split_output(io.StringIO(mixed), allow_json=False)
+
+    def test_high_worker_ids_use_supplied_topology(self):
+        for worker in (4, 7, 94):
+            text = CSV_HEADER + f"\n11,{worker},0,0,1,0,0,0,2\n"
+            csv, _ = _split_output(io.StringIO(text), {worker: 1})
+            self.assertEqual(csv.rows[0]["worker_id"], worker)
+            with self.assertRaisesRegex(AssertionError, "worker identity"):
+                _split_output(io.StringIO(text), {worker - 1: 1})
+
+    def test_malformed_csv_is_rejected(self):
+        good = "11,0,0,0,1,0,0,0,2\n"
+        for text, message in (
+                (good, "missing CSV header"),
+                (CSV_HEADER + "\n" + CSV_HEADER + "\n", "duplicate CSV header"),
+                (CSV_HEADER + "\n" + good.replace("11,", "-1,", 1), "invalid CSV row"),
+                (CSV_HEADER + "\n" + good.replace("11,", "1.0,", 1), "invalid CSV row"),
+                (CSV_HEADER + "\n" + good.replace("11,", str(1 << 64) + ",", 1),
+                 "invalid CSV value"),
+                (CSV_HEADER + "\n" + "11,4,0,0,1,0,0,0,2\n", "worker identity"),
+                (CSV_HEADER + "\n" + good.rstrip() + ",0\n", "invalid CSV row"),
+                (CSV_HEADER + "\n" + "arbitrary output\n", "invalid CSV row"),
+                (CSV_HEADER + "\n" + good.replace(",1,0,0,0,2", ",2,0,0,0,2"),
+                 "invalid CSV state total")):
+            with self.subTest(text=text), self.assertRaisesRegex(
+                    AssertionError, message):
+                _split_output(io.StringIO(text), {0: 1})
+        records = DiagnosticParser.records(1)
+        mixed = (CSV_HEADER + "\n11,1,0,0,1,0,0,0,2\n" +
+                 "".join(json.dumps(record) + "\n" for record in records))
+        with self.assertRaisesRegex(AssertionError, "CSV worker identity"):
+            _check_metric_output(io.StringIO(mixed))
+
+
+class DiagnosticParser(unittest.TestCase):
+    @staticmethod
+    def records(actor_count=2):
+        sizes = ([1] * actor_count if isinstance(actor_count, int)
+                 else actor_count)
+        actor_count = len(sizes)
+        records = []
+        for worker_id, size in enumerate(sizes):
+            records.append({"kind": "conduit_diag", "schema": 3,
+                "owner": 0, "worker_id": worker_id, "database_actor_count": actor_count,
+                "connection_count": size, "total_connection_count": sum(sizes),
+                "period_ns": 10000000000})
+            for slot in range(size):
+                for owner in (1, 2):
+                    histograms = [{"count": 0, "sum_ns": 0, "max_ns": 0,
+                        "overflow": False, "buckets": [0] * 27}
+                        for _ in range(33 if owner == 1 else 8)]
+                    if owner == 2:
+                        histograms[6].update(count=1, sum_ns=1, max_ns=1,
+                                             buckets=[1] + [0] * 26)
+                    records.append({"kind": "conduit_diag", "schema": 3,
+                        "owner": owner, "worker_id": worker_id, "slot": slot,
+                        "generation": 0, "request": 1, "report_ns": 10,
+                        "observed_ns": 9, "overflow": False, "invalid_clock": 0,
+                        "counters": ([1, 1, 1, 0, 0, 1, 0, 1, 0, 0]
+                                     if owner == 1 else [1, 0, 0, 0]),
+                        "gauges": ([0, 0, 0, 0, 0, 0, size, 0, 0, 0]
+                                   if owner == 1 else [0, 0, 0, 0]),
+                        "histograms": histograms})
+            records.append({"kind": "conduit_diag", "schema": 3,
+                "owner": 0, "worker_id": worker_id, "report_ns": 11,
+                "next_request": 2})
+        return records
+
+    @staticmethod
+    def stream(records):
+        return io.StringIO("".join(json.dumps(record) + "\n" for record in records))
+
+    def test_interleaved_workers_and_single_worker_probes(self):
+        for actor_count in (1, 2, 4, 8, 95, [48, 47], [12] * 7 + [11]):
+            with self.subTest(actor_count=actor_count):
+                records = self.records(actor_count)
+                _check_metric_output(self.stream(records), require_activity=True)
+        for generation in (0, 1):
+            final = dict(records[2], request=0, generation=generation)
+            records.append(final)
+        _check_metric_output(self.stream(records), require_activity=True)
+
+    def test_missing_worker_identity_is_rejected_on_every_record_kind(self):
+        for index in range(4):
+            with self.subTest(record=index):
+                records = self.records()
+                del records[index]["worker_id"]
+                with self.assertRaisesRegex(AssertionError, "worker identity"):
+                    _check_metric_output(self.stream(records))
+
+    def test_invalid_metadata_and_unknown_worker_are_rejected(self):
+        for key, value, message in (
+                ("total_connection_count", 3, "conflicting diagnostic startup"),
+                ("worker_id", 4, "worker identity"),
+                ("schema", 2, "unexpected diagnostic")):
+            records = self.records()
+            records[0][key] = value
+            with self.subTest(key=key), self.assertRaisesRegex(AssertionError, message):
+                _check_metric_output(self.stream(records))
+        records = self.records()
+        records[4]["period_ns"] += 1
+        with self.assertRaisesRegex(AssertionError, "conflicting diagnostic startup"):
+            _check_metric_output(self.stream(records))
+
+    def test_unequal_topology_validation(self):
+        for mutate, message in (
+                (lambda records: records[0].update(connection_count=47),
+                 "physical slot states"),
+                (lambda records: [record.update(total_connection_count=94)
+                    for record in records if "connection_count" in record],
+                 "pool configuration total"),
+                (lambda records: records[1].update(slot=48), "diagnostic slot"),
+                (lambda records: records[0].update(connection_count=0),
+                 "pool configuration"),
+                (lambda records: records.append(records[0]),
+                 "duplicate diagnostic startup"),
+                (lambda records: records[0].update(worker_id=True),
+                 "worker identity"),
+                (lambda records: records[0].pop("period_ns"),
+                 "startup record")):
+            records = self.records([48, 47])
+            mutate(records)
+            with self.subTest(message=message), \
+                    self.assertRaisesRegex(AssertionError, message):
+                _check_metric_output(self.stream(records))
+        records = self.records([48, 47])
+        records = [record for record in records if record["worker_id"] == 0]
+        records[0]["total_connection_count"] = 48
+        with self.assertRaisesRegex(AssertionError, "missing worker startup"):
+            _check_metric_output(self.stream(records))
+        stream = self.stream(self.records([48, 47])).getvalue()
+        stream = stream.replace('"schema": 3', '"schema": 3, "schema": 3', 1)
+        with self.assertRaisesRegex(AssertionError,
+                                    "invalid diagnostic record"):
+            _check_metric_output(io.StringIO(stream))
+
+    def test_duplicate_snapshots_within_worker_are_rejected(self):
+        for index, message in ((1, "duplicate Worker snapshot"),
+                               (2, "duplicate diagnostic record")):
+            records = self.records()
+            records.append(records[index])
+            with self.subTest(owner=records[index]["owner"]), \
+                    self.assertRaisesRegex(AssertionError, message):
+                _check_metric_output(self.stream(records))
+
+    def test_repeated_overdue_reports_are_valid(self):
+        records = self.records()
+        for report_ns in (20, 30):
+            records.append({"kind": "conduit_diag", "schema": 3,
+                "owner": 1, "worker_id": 0, "slot": 0, "generation": None,
+                "request": 2, "report_ns": report_ns, "missing": True,
+                "reason": "overdue"})
+        _check_metric_output(self.stream(records), require_activity=True)
+
+    def test_pairing_cannot_borrow_other_workers_snapshot(self):
+        records = self.records()
+        records[5]["request"] = 2
+        with self.assertRaisesRegex(AssertionError, "unmatched connection snapshot"):
+            _check_metric_output(self.stream(records), require_activity=True)
+
+    def test_each_worker_requires_traffic_and_complete_rotation(self):
+        for owner, message in ((1, "missing pool traffic"),
+                               (2, "missing transport traffic")):
+            records = self.records()
+            record = next(record for record in records
+                          if record["worker_id"] == 1 and record["owner"] == owner)
+            record["counters"] = [0] * len(record["counters"])
+            with self.subTest(owner=owner), self.assertRaisesRegex(AssertionError, message):
+                _check_metric_output(self.stream(records), require_activity=True)
+        records = self.records()
+        records = [record for record in records if not (
+            record["owner"] == 1 and record["worker_id"] == 1)]
+        with self.assertRaisesRegex(AssertionError, "missing selected connection slot"):
+            _check_metric_output(self.stream(records), require_activity=True)
+
+
+class WorkerCountCLI(unittest.TestCase):
+    def test_rejected_flags_and_private_sizes_do_not_connect(self):
+        cases = [["--db-worker-count=" + value] for value in
+                 ("", "0", "96", "-1", "+1", "1x", " 1", "1 ",
+                  "9223372036854775808")]
+        cases += [["--db-worker-count"],
+                  ["--db-worker-count", "--ponymaxthreads=1"],
+                  ["--db-worker-count=2", "--db-worker-count", "2"],
+                  ["--db-worker-count=2", "--db-worker-count=2"],
+                  ["--db-worker-count", "1", "--db-worker-count", "2"]]
+        for args, size in [(args, "1") for args in cases] + [
+                (["--test-http", "--db-worker-count=4"], size)
+                for size in ("", "invalid", "0", "24",
+                             "9223372036854775808")] + [
+                (["--test-pool"], "invalid")]:
+            with self.subTest(args=args, private_size=size), \
+                    socket.socket() as backend:
+                backend.bind(("127.0.0.1", 0))
+                backend.listen(128)
+                backend.settimeout(0.02)
+                attempts = []
+                done = threading.Event()
+                def accept():
+                    while not done.is_set():
+                        try:
+                            connection, _ = backend.accept()
+                            attempts.append(connection)
+                        except socket.timeout:
+                            pass
+                thread = threading.Thread(target=accept)
+                thread.start()
+                try:
+                    env = os.environ.copy()
+                    env.update(DATABASE_URL="postgres://test:test@127.0.0.1:"
+                        f"{backend.getsockname()[1]}/test",
+                        JWT_SECRET="cli-test",
+                        CONDUIT_TEST_POOL_SIZE=size)
+                    result = subprocess.run([str(_executable()), *args,
+                        "--ponymaxthreads=1"], env=env, capture_output=True,
+                        text=True, timeout=5)
+                    self.assertEqual(result.returncode, 1)
+                    expected = ("--db-worker-count" if args in cases else
+                                "CONDUIT_TEST_POOL_SIZE")
+                    self.assertIn(expected, result.stderr)
+                finally:
+                    done.set()
+                    thread.join(timeout=2)
+                    self.assertFalse(thread.is_alive())
+                    backend.setblocking(False)
+                    while True:
+                        try:
+                            connection, _ = backend.accept()
+                            attempts.append(connection)
+                        except BlockingIOError:
+                            break
+                    for connection in attempts:
+                        connection.close()
+                self.assertEqual(len(attempts), 0,
+                                 "rejected input opened a backend")
+
+    def test_accepted_spellings_with_runtime_flags(self):
+        for args in (["--db-worker-count=008"], ["--db-worker-count", "2"],
+                     ["--db-worker-count=95"]):
+            with self.subTest(args=args):
+                result = subprocess.run([str(_executable()), *args,
+                    "--self-test", "--ponymaxthreads=1", "--ponynoblock"],
+                    capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Self-tests passed", result.stdout)
+
+
+class DefaultTopology(unittest.TestCase):
+    routing_binds = staticmethod(Integration.routing_binds)
+    routing_request = Integration.routing_request
+
+    def test_default_one_scheduler_worker(self):
+        self.check_topology([], [95], schedulers=1)
+
+    def test_default_two_scheduler_workers(self):
+        self.check_topology([], [48, 47], schedulers=2)
+
+    def test_default_eight_workers(self):
+        self.check_topology([], [12] * 7 + [11])
+
+    def test_two_unequal_workers_and_routing(self):
+        self.check_topology(["--db-worker-count", "2"], [48, 47])
+
+    def test_maximum_worker_count(self):
+        self.check_topology(["--db-worker-count=95"], [1] * 95, schedulers=1)
+
+    def check_topology(self, args, sizes, schedulers=8):
+        database = "pony_default_" + uuid.uuid4().hex
+        Integration.sql(f"CREATE DATABASE {database} TEMPLATE conduit_dev")
+        try:
+            self.run_topology(database, args, sizes, schedulers)
+        finally:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                remaining = Integration.sql(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    f"WHERE datname = '{database}' AND usename = 'conduit'")
+                if remaining == "0":
+                    break
+                time.sleep(0.02)
+            Integration.sql(f"DROP DATABASE {database} WITH (FORCE)")
+            self.assertEqual(remaining, "0", "server backend sessions remained")
+
+    def run_topology(self, database, args, sizes, schedulers=8):
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+        env = os.environ.copy()
+        host = env.get("PGHOST", "127.0.0.1")
+        if host.startswith("/"):
+            host = "127.0.0.1"
+        proxy = ProtocolProxy(host, env.get("PGPORT", "5432"))
+        try:
+            env.update(DATABASE_URL="postgres://conduit:conduit@127.0.0.1:"
+                f"{proxy.server_address[1]}/{database}",
+                JWT_SECRET="topology-secret",
+                HOST="127.0.0.1", PORT=str(port), DB_WORKERS="invalid",
+                CONDUIT_TEST_POOL_SIZE="1")
+            counts = dict(enumerate(sizes))
+            with tempfile.TemporaryFile() as log, \
+                    tempfile.TemporaryFile() as metrics:
+                server = subprocess.Popen([str(_executable()), *args,
+                    f"--ponymaxthreads={schedulers}"],
+                    env=env, stdout=metrics, stderr=log)
+                try:
+                    deadline = time.monotonic() + 40
+                    while time.monotonic() < deadline:
+                        self.assertIsNone(server.poll(),
+                                          "topology server exited")
+                        state = Integration.sql(
+                            "SELECT count(*), count(*) FILTER "
+                            "(WHERE state = 'idle') FROM pg_stat_activity "
+                            f"WHERE datname = '{database}' "
+                            "AND usename = 'conduit'")
+                        csv = Integration.csv_output(self, metrics, counts)
+                        ready = {row["worker_id"] for row in csv.rows
+                                 if row["idle"] == counts[row["worker_id"]]}
+                        data = os.pread(metrics.fileno(),
+                                        os.fstat(metrics.fileno()).st_size, 0)
+                        data = data[:data.rfind(b"\n") + 1]
+                        records = _metric_records(io.BytesIO(data))
+                        selected = {(record["worker_id"], record["slot"])
+                                    for record in records
+                                    if record.get("owner") == 1
+                                    and "counters" in record}
+                        expected = {(worker, slot)
+                                    for worker, count in counts.items()
+                                    for slot in range(count)}
+                        if state == "95|95" and (not _diagnostic_mode() or (
+                                ready == set(counts) and selected == expected)):
+                            break
+                        time.sleep(0.05)
+                    self.assertEqual(state, "95|95")
+                    if _diagnostic_mode():
+                        self.assertEqual(ready, set(counts))
+                        self.assertEqual(selected, expected)
+                        startups = [record for record in records
+                                    if "connection_count" in record]
+                        self.assertEqual(len(startups), len(sizes))
+                        self.assertEqual(
+                            {record["worker_id"]: record["connection_count"]
+                             for record in startups}, counts)
+                        for record in startups:
+                            self.assertEqual(
+                                record["total_connection_count"], 95)
+                            self.assertEqual(
+                                record["database_actor_count"], len(sizes))
+                    else:
+                        self.assertEqual(data, b"",
+                                         "ordinary startup emitted metrics")
+                    if sizes == [48, 47]:
+                        with ExitStack() as cleanup:
+                            connections = [Integration.routing_connect(
+                                self, port) for _ in sizes]
+                            for connection in connections:
+                                cleanup.callback(connection.close)
+                            routes = [{Integration.routing_tags(
+                                self, connection, proxy)
+                                for _ in range(size * 2)}
+                                for connection, size in zip(connections, sizes)]
+                            self.assertEqual([len(route) for route in routes],
+                                             sizes)
+                            self.assertTrue(routes[0].isdisjoint(routes[1]))
+                            self.assertEqual(routes[0] | routes[1],
+                                             set(range(95)))
+                    proxy.assert_healthy()
+                finally:
+                    server.terminate()
+                    try:
+                        server.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        server.kill()
+                        server.wait(timeout=5)
+                    if _diagnostic_mode():
+                        _check_metric_output(metrics)
+        finally:
+            proxy.stop()
 
 if __name__ == "__main__":
     unittest.main()

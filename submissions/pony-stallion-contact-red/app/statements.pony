@@ -45,6 +45,39 @@ primitive _CommentDelete
 primitive _Rollback
 
 primitive _Catalog
+  fun kind(statement: _RequestStatement): USize =>
+    match statement
+    | _Tags => 0
+    | _RegisterUser => 1
+    | _LoginUser => 2
+    | _CurrentUser => 3
+    | _UpdateUser => 4
+    | _Profile => 5
+    | _FollowTarget => 6
+    | _FollowInsert => 7
+    | _FollowDelete => 8
+    | _ArticlePageAll => 9
+    | _ArticlePageFeed => 10
+    | _ArticlePageTag => 11
+    | _ArticlePageAuthor => 12
+    | _ArticlePageFavorited => 13
+    | _ArticleFullBySlug => 14
+    | _ArticleFullById => 15
+    | _ArticleInsert => 16
+    | _ArticleIdAndAuthorBySlug => 17
+    | _ArticleUpdateInput => 18
+    | _ArticleUpdate => 19
+    | _ArticleDelete => 20
+    | _ArticleIdBySlug => 21
+    | _FavoriteInsert => 22
+    | _FavoriteDelete => 23
+    | _CommentsByArticle => 24
+    | _CommentInput => 25
+    | _CommentInsert => 26
+    | _CommentOwner => 27
+    | _CommentDelete => 28
+    end
+
   fun all(): Array[_Statement] val =>
     recover val
       Array[_Statement]

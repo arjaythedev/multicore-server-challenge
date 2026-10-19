@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 apt-get update -q
-apt-get install -y -q build-essential curl ca-certificates git libssl-dev xz-utils
+apt-get install -y -q build-essential curl ca-certificates git libpq-dev libssl-dev xz-utils
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 cd "$stage"

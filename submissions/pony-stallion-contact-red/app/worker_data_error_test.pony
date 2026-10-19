@@ -11,18 +11,20 @@ actor \nodoc\ _WorkerDataErrorTest is (_QueryClient & _WorkerBarrier)
   var _results: U8 = 0
 
   new create(auth: TCPConnectAuth, config: _Config, env: Env,
-    decode: Bool)
+    layout: _DatabaseLayout, decode: Bool)
   =>
     _env = env
     _decode = decode
-    _worker = _Worker(auth, config, Timers, env.err)
+    _worker = _Worker(auth, config, Timers, env.err, layout.pool_size(0))
     let bad = pg.PgArray(26,
       recover val [as (pg.FieldData | None): "not-an-oid"] end)
     let params: Array[_Param] val = if decode then _P.none()
       else recover val [as _Param: bad] end
       end
     _worker.query(this, 1, _Tags, params)
-    if not decode then _worker.query(this, 2, _Tags, params) end
+    if not decode then
+      _worker.query(this, 2, _Tags, _P.one("before\0after"))
+    end
     _worker.query(this, if decode then 2 else 3 end, _Tags, _P.none())
 
   be db_result(id: U64, result: pg.Result) =>

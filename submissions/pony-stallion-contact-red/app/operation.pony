@@ -2,6 +2,7 @@ use json = "json"
 use pg = "postgres"
 use stallion = "stallion"
 use uri = "uri"
+use "time"
 
 class _Operation
   let _request: _Request
@@ -22,7 +23,12 @@ class _Operation
     next': _Next)
   =>
     _next = next'
-    _worker.query(_request._2, _request._3, statement, params)
+    ifdef "conduit_diagnostic" then
+      _worker.query(_request._2, _request._3, statement, params,
+        Time.nanos())
+    else
+      _worker.query(_request._2, _request._3, statement, params)
+    end
 
   fun ref result(result': pg.Result) =>
     try

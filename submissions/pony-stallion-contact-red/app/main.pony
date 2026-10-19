@@ -3,6 +3,7 @@ use "collections"
 use "net"
 use "time"
 use pg = "postgres"
+use runtime = "runtime_info"
 use stallion = "stallion"
 use uri = "uri"
 
@@ -10,62 +11,147 @@ actor Main
   """Runs the Conduit API server."""
   new create(env: Env) =>
     """Run a requested test mode or start the HTTP listener."""
+    let production = match _DatabaseOptions(env.args,
+      runtime.Scheduler.schedulers(runtime.SchedulerInfoAuth(env.root)).usize())
+    | let layout: _DatabaseLayout => layout
+    | let failure: _WorkerCountError =>
+      env.err.print(failure.string())
+      env.exitcode(1)
+      return
+    end
     try
+      var test_http = false
       for arg in env.args.values() do
         if arg == "--self-test" then
           _SelfTest(env)
+          return
+        elseif arg == "--test-diag-arithmetic" then
+          _DiagArithmeticTest(env)
+          return
+        elseif arg == "--test-csv-tick" then
+          _WorkerCSVTickTest(env)
+          return
+        elseif (arg == "--test-pool") or (arg == "--test-pool-csv") or
+          (arg == "--test-listener-csv") then
+          let config = _Config(env.vars)?
+          let layout = _TestDatabaseLayout(env.vars,
+            if arg == "--test-listener-csv" then 4 else 1 end)?
+          _PoolProbe(TCPConnectAuth(env.root), config, env, layout,
+            arg != "--test-pool", arg == "--test-listener-csv")
           return
         elseif arg == "--test-named-rollback" then
           let config = _Config(env.vars)?
           _RollbackTest(TCPConnectAuth(env.root), config, env)
           return
+        elseif arg == "--test-session-boundary" then
+          let config = _Config(env.vars)?
+          _SessionBoundaryTest(TCPConnectAuth(env.root), config, env)
+          return
+        elseif arg == "--test-dns-progress" then
+          let config = _Config(env.vars)?
+          _DNSProgressTest(TCPConnectAuth(env.root), config, env)
+          return
+        elseif arg == "--test-session-shutdown" then
+          let config = _Config(env.vars)?
+          _SessionShutdownTest(TCPConnectAuth(env.root), config, env)
+          return
+        elseif arg == "--test-session-resume-close" then
+          let config = _Config(env.vars)?
+          _SessionResumeAfterCloseTest(TCPConnectAuth(env.root), config, env)
+          return
+        elseif arg == "--test-startup-shutdown" then
+          let config = _Config(env.vars)?
+          _StartupShutdownTest(TCPConnectAuth(env.root), config, env)
+          return
+        elseif arg == "--test-connection-nul" then
+          let config = _Config(env.vars)?
+          _ConnectionNulTest(TCPConnectAuth(env.root), config, env)
+          return
+        elseif arg == "--test-queue-drain" then
+          let config = _Config(env.vars)?
+          _QueueDrainTest(TCPConnectAuth(env.root), config, env)
+          return
+        elseif arg == "--test-result-shapes" then
+          let config = _Config(env.vars)?
+          _ResultShapeTest(TCPConnectAuth(env.root), config, env)
+          return
         elseif arg == "--test-worker-data-error" then
           let config = _Config(env.vars)?
-          _WorkerDataErrorTest(TCPConnectAuth(env.root), config, env, false)
+          _WorkerDataErrorTest(TCPConnectAuth(env.root), config, env,
+            _TestDatabaseLayout(env.vars, 1)?, false)
           return
         elseif arg == "--test-worker-decode-error" then
           let config = _Config(env.vars)?
-          _WorkerDataErrorTest(TCPConnectAuth(env.root), config, env, true)
-          return
-        elseif arg == "--test-worker-foreign-callback" then
-          let config = _Config(env.vars)?
-          _WorkerForeignCallbackTest(TCPConnectAuth(env.root), config, env)
+          _WorkerDataErrorTest(TCPConnectAuth(env.root), config, env,
+            _TestDatabaseLayout(env.vars, 1)?, true)
           return
         elseif arg == "--test-worker-overlap" then
           let config = _Config(env.vars)?
-          _WorkerOverlapTest(TCPConnectAuth(env.root), config, env)
-          return
-        elseif arg == "--test-worker-submitted-loss" then
-          let config = _Config(env.vars)?
-          _WorkerSubmittedLossTest(TCPConnectAuth(env.root), config, env)
+          _WorkerOverlapTest(TCPConnectAuth(env.root), config, env,
+            _TestDatabaseLayout(env.vars, 1)?)
           return
         elseif arg == "--test-worker-close-drain" then
           let config = _Config(env.vars)?
-          _WorkerSubmittedLossTest(TCPConnectAuth(env.root), config, env,
-            true)
+          _WorkerCloseTest(TCPConnectAuth(env.root), config, env,
+            _TestDatabaseLayout(env.vars, 1)?)
           return
         elseif arg == "--test-worker-pending-cancel" then
           let config = _Config(env.vars)?
-          _WorkerPendingCancelTest(TCPConnectAuth(env.root), config, env)
+          _WorkerPendingCancelTest(TCPConnectAuth(env.root), config, env,
+            _TestDatabaseLayout(env.vars, 1)?)
+          return
+        elseif arg == "--test-http" then
+          test_http = true
+        elseif arg == "--test-worker-diagnostic" then
+          ifdef "conduit_diagnostic" then
+            let config = _Config(env.vars)?
+            _WorkerDiagnosticTest(TCPConnectAuth(env.root), config, env,
+              _TestDatabaseLayout(env.vars, 1)?)
+          else
+            env.err.print("This test requires a diagnostic build")
+            env.exitcode(1)
+          end
           return
         end
       end
-      let config = _Config(env.vars)?
-      let db_auth = TCPConnectAuth(env.root)
-      let timers = Timers
-      let workers: Array[_Worker] iso = recover iso Array[_Worker] end
-      let first = _Worker(db_auth, config, timers, env.err)
-      workers.push(first)
-      for i in Range(1, config.dbworkers) do
-        workers.push(_Worker(db_auth, config, timers, env.err))
-      end
-      _Listener(TCPListenAuth(env.root), config, first,
-        consume workers, env)
+      let layout = if test_http then
+        _TestDatabaseLayout(env.vars, production.sizes.size())?
+      else production end
+      _start(env, _Config(env.vars)?, layout, test_http)
     else
       env.err.print("Invalid configuration: DATABASE_URL and JWT_SECRET "
-        + "are required; HOST, PORT, and DB_WORKERS must be valid.")
+        + "are required; HOST and PORT must be valid. In worker and HTTP "
+        + "test modes, CONDUIT_TEST_POOL_SIZE must be 1..95 (default 1), "
+        + "with at most 95 total connections.")
       env.exitcode(1)
     end
+
+  fun _start(env: Env, config: _Config, layout: _DatabaseLayout,
+    csv_sampling: Bool)
+  =>
+    let db_auth = TCPConnectAuth(env.root)
+    let timers = Timers
+    let csv = ifdef "conduit_diagnostic" then
+      _WorkerCSV(env.out)
+    else
+      if csv_sampling then _WorkerCSV(env.out) else None end
+    end
+    let workers = recover iso Array[_Worker] end
+    let reporters = recover iso Array[_DiagReporter] end
+    let actor_count = layout.sizes.size()
+    for index in Range(0, actor_count) do
+      let worker = _Worker(db_auth, config, timers, env.err,
+        layout.pool_size(index) where csv = csv, worker_id = index)
+      workers.push(worker)
+      ifdef "conduit_diagnostic" then
+        let reporter = _DiagReporter(env.out, timers, layout.pool_size(index),
+          index, actor_count, layout.total)
+        reporter.register(worker)
+        reporters.push(reporter)
+      end
+    end
+    _Listener(TCPListenAuth(env.root), config, consume workers, env,
+      consume reporters)
 
   fun @runtime_override_defaults(rto: RuntimeOptions) => rto.ponynoblock = true
 
@@ -78,7 +164,6 @@ class val _Config
   let user: String
   let password: String
   let database: String
-  let dbworkers: USize
   let http: stallion.ServerConfig
 
   new val create(vars: (Array[String] val | None)) ? =>
@@ -113,47 +198,52 @@ class val _Config
     database = uri.PercentDecode(path) as String
     if (dbhost.size() == 0) or (user.size() == 0)
       or (database.size() == 0) then error end
-    let count = _Input.decimal(
-      try e("DB_WORKERS")? else "95" end)?
-    if (count < 1) or (count > 95) then error end
-    dbworkers = count.usize()
+    if dbhost.contains("\0") or user.contains("\0") or
+      password.contains("\0") or database.contains("\0") then error end
 
 actor _Listener is TCPListenerActor
   var _tcp: TCPListener = TCPListener.none()
   let _auth: TCPServerAuth
   let _config: stallion.ServerConfig
-  let _first: _Worker
-  let _workers: Array[_Worker] ref
+  let _workers: Array[_Worker] val
   var _next_worker: USize = 0
   let _env: Env
   let _secret: String
+  let _diag_reporters: Array[_DiagReporter] val
 
-  new create(auth: TCPListenAuth, config: _Config, first: _Worker,
-    workers: Array[_Worker] iso, env: Env)
+  new create(auth: TCPListenAuth, config: _Config,
+    workers: Array[_Worker] val, env: Env,
+    reporters: Array[_DiagReporter] val)
   =>
     _auth = TCPServerAuth(auth)
     _config = config.http
-    _first = first
-    _workers = consume workers
+    _workers = workers
     _env = env
     _secret = config.secret
+    _diag_reporters = reporters
     _tcp = TCPListener(auth, config.host, config.port, this)
 
   fun ref _listener(): TCPListener => _tcp
 
-  fun ref _on_accept(fd: U32): TCPConnectionActor =>
-    let worker = try _workers(_next_worker)?
-      else
-        _Unreachable()
-        _first
-      end
-    _next_worker = (_next_worker + 1) % _workers.size()
-    _Connection(_auth, fd, _config, worker, _secret)
+  fun ref _on_accept(fd: U32): TCPConnectionActor ? =>
+    try
+      let worker = _workers(_next_worker)?
+      _next_worker = (_next_worker + 1) % _workers.size()
+      _Connection(_auth, fd, _config, worker, _secret)
+    else
+      _Unreachable()
+      error
+    end
 
   fun ref _on_listen_failure() =>
+    for reporter in _diag_reporters.values() do reporter.stop() end
     _env.err.print("Unable to listen")
     _env.exitcode(1)
     for worker in _workers.values() do worker.close() end
+
+  fun ref _on_closed() =>
+    for reporter in _diag_reporters.values() do reporter.stop() end
+    for worker in _workers.values() do worker.stop_sampling() end
 
 actor _Connection is (stallion.HTTPServerActor & _QueryClient)
   var _http: stallion.HTTPServer = stallion.HTTPServer.none()
@@ -237,9 +327,9 @@ actor _Connection is (stallion.HTTPServerActor & _QueryClient)
     end
 
   fun ref on_closed() =>
+    if _operations.size() > 0 then _worker.cancel(this) end
     _responders.clear()
     _operations.clear()
-    _worker.cancel(this)
 
 primitive _RequestTag
 

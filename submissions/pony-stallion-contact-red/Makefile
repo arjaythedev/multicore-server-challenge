@@ -3,12 +3,27 @@ FETCH ?= corral fetch
 CC ?= cc
 AR ?= ar
 CFLAGS ?= -O3 -std=c11
+LIBPQ_LIBDIR ?= /usr/lib/x86_64-linux-gnu
 
-.PHONY: build test test-integration clean
+.PHONY: build build-diagnostic test test-integration clean
+CONDUIT_VARIANT ?= ordinary
+ifeq ($(CONDUIT_VARIANT),diagnostic)
+CONDUIT_BINARY := conduit-diagnostic
+CONDUIT_DEFINE := -Dconduit_diagnostic
+else ifeq ($(CONDUIT_VARIANT),ordinary)
+CONDUIT_BINARY := conduit
+CONDUIT_DEFINE :=
+else
+$(error CONDUIT_VARIANT must be ordinary or diagnostic)
+endif
+
 build: native/libconduit_password.a
 	$(FETCH)
 	mkdir -p bin
-	corral run -- $(PONYC) -Dopenssl_3.0.x app -o bin -b conduit -p native
+	corral run -- $(PONYC) -Dopenssl_3.0.x $(CONDUIT_DEFINE) app -o bin -b $(CONDUIT_BINARY) -p native -L $(LIBPQ_LIBDIR)
+
+build-diagnostic:
+	$(MAKE) CONDUIT_VARIANT=diagnostic build
 
 native/libconduit_password.a: native/crypt_blowfish.o native/password.o
 	$(AR) rcs $@ $^
@@ -24,7 +39,9 @@ native/password_test: native/password_test.c native/libconduit_password.a
 
 test: build native/password_test
 	./native/password_test
-	./bin/conduit --self-test
+	./bin/$(CONDUIT_BINARY) --self-test
+	./bin/$(CONDUIT_BINARY) --test-diag-arithmetic
+	./bin/$(CONDUIT_BINARY) --test-csv-tick
 
 test-integration: build
 	python3 test/integration.py
