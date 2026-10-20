@@ -1,0 +1,27 @@
+[package]
+name = "conduit-urus"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+smarm = { git = "https://git.kalsbeek.dev/Markk116/smarm", tag = "v0.8.1" }
+urus = { git = "https://git.kalsbeek.dev/Markk116/urus", tag = "v0.3.1" }
+smarm-pg = { git = "https://git.kalsbeek.dev/Markk116/smarm-pg", tag = "v0.1.0" }
+blowfish = { version = "0.9", features = ["bcrypt"] }
+getrandom = "0.3"
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+time = { version = "0.3", features = ["formatting", "macros"] }
+
+[dev-dependencies]
+bcrypt = "0.17"
+
+[profile.release]
+panic = "unwind"
+codegen-units = 1
+lto = "thin"
+
