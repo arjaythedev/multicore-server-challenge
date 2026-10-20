@@ -153,7 +153,10 @@ actor Main
     _Listener(TCPListenAuth(env.root), config, consume workers, env,
       consume reporters)
 
-  fun @runtime_override_defaults(rto: RuntimeOptions) => rto.ponynoblock = true
+  fun @runtime_override_defaults(rto: RuntimeOptions) =>
+    rto.ponynoblock = true
+    rto.ponynoscale = true
+    rto.ponypin     = true
 
 class val _Config
   let host: String
