@@ -2,6 +2,3 @@ seed/data-*/
 seed/.seedgen
 results/
 .DS_Store
-submissions/pony-stallion-contact-red/native/*.o
-submissions/pony-stallion-contact-red/native/*.a
-submissions/pony-stallion-contact-red/native/password_test
