@@ -1,5 +1,10 @@
 package main
 
+// util.go has the small helpers shared by the request path: the request view of a
+// parsed HTTP request (with a query string reader that does not build a map),
+// zero-copy string/byte conversions, query and path parameter parsing, and
+// reading JSON request bodies.
+
 import (
 	"bytes"
 	"context"

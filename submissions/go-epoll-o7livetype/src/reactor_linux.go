@@ -2,6 +2,48 @@
 
 package main
 
+// reactor_linux.go is the HTTP server: a few event loops built directly on
+// epoll, serving every client connection without a goroutine per connection.
+//
+// Threads. EPOLL_LOOPS event loops each own a listening socket (the kernel
+// spreads new connections between them with SO_REUSEPORT), an epoll instance,
+// and every connection they accepted. Database workers (db.go) run the
+// requests. Nothing else touches a loop's state; workers hand finished
+// requests back through the loop's completed channel and wake it up with an
+// eventfd.
+//
+// A request's life on one connection:
+//
+//	accept    The connection joins the loop's table (indexed by fd).
+//	read      Bytes arrive. parseWire (wire_http.go) finds a complete request.
+//	          A partial one stays buffered on the connection (c.in) until the
+//	          rest arrives.
+//	frame     The request takes a free slot (reactorJob): its bytes are copied
+//	          into the slot, it is classified as a read or a write (api.go),
+//	          and it is queued for the database workers (submit).
+//	finish    A worker answers it (db.go, api.go) and calls finish, which
+//	          renders the response header and hands the slot back to the loop.
+//	flush     The loop writes header and body with one sendmsg, continuing
+//	          when the socket is writable again if the client reads slowly.
+//	next      The slot is freed. The connection goes back to reading: a
+//	          request already buffered behind this one (HTTP pipelining) is
+//	          served next turn, otherwise it waits until the idle timeout.
+//
+// Fixed resources. Each loop preallocates its request slots (MAX_INFLIGHT +
+// MAX_QUEUED, split between loops), a 4 KB inline buffer per slot, and small
+// and large input buffers for requests that arrive in pieces. None of these
+// grow with load.
+//
+// Backpressure. When every slot is busy, a connection is parked instead of
+// read: its request waits in the kernel socket buffer until a slot frees, so
+// overload shows up as latency rather than errors.
+//
+// Timeouts. Each connection has one deadline (reading a request, writing a
+// response, idling or parked). Every tick the loop closes connections past it.
+//
+// Shutdown. On SIGTERM the loops stop accepting and close idle connections,
+// finish the requests in progress (up to shutdownTimeout), and return.
+
 import (
 	"context"
 	"encoding/binary"
@@ -16,14 +58,37 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// ---------- configuration and state ----------
+
+// reactorConfig sizes the reactor. All counts are fixed at startup.
 type reactorConfig struct {
-	host                                                    string
-	port, loops, workers, active, queued, sockets, fdSlots  int
-	readTimeout, writeTimeout, idleTimeout, shutdownTimeout time.Duration
+	host    string
+	port    int
+	loops   int // event loops (EPOLL_LOOPS)
+	workers int // handler goroutines; only the test dispatcher uses them
+	active  int // request slots being worked on (MAX_INFLIGHT)
+	queued  int // request slots waiting in queues (MAX_QUEUED)
+	sockets int // most open client connections
+	fdSlots int // size of the per-loop connection tables (indexed by fd)
+
+	readTimeout     time.Duration // to receive a whole request
+	writeTimeout    time.Duration // to send a whole response
+	idleTimeout     time.Duration // keep-alive between requests
+	shutdownTimeout time.Duration // to finish in-flight requests on SIGTERM
 }
 
 func reactorConfigFromEnv(cores, active, queued, sockets, fdSlots int) (reactorConfig, error) {
-	c := reactorConfig{host: envOr("HOST", "0.0.0.0"), active: active, queued: queued, sockets: sockets, fdSlots: fdSlots, readTimeout: 15 * time.Second, writeTimeout: 15 * time.Second, idleTimeout: 75 * time.Second, shutdownTimeout: 10 * time.Second}
+	c := reactorConfig{
+		host:            envOr("HOST", "0.0.0.0"),
+		active:          active,
+		queued:          queued,
+		sockets:         sockets,
+		fdSlots:         fdSlots,
+		readTimeout:     15 * time.Second,
+		writeTimeout:    15 * time.Second,
+		idleTimeout:     75 * time.Second,
+		shutdownTimeout: 10 * time.Second,
+	}
 	var err error
 	c.port, err = envInt("PORT", 3000, 1, 65535)
 	if err != nil {
@@ -38,6 +103,18 @@ func reactorConfigFromEnv(cores, active, queued, sockets, fdSlots int) (reactorC
 	return c, err
 }
 
+// reactorServer is the whole HTTP side: the event loops plus the dispatcher
+// they hand requests to.
+type reactorServer struct {
+	config      reactorConfig
+	disp        dispatcher
+	loops       []*eventLoop
+	active      chan struct{} // slots for requests being worked on (test dispatcher)
+	sockets     atomic.Int64  // open client connections, across loops
+	outputBytes atomic.Int64  // finished response bytes not yet sent, across loops
+	addr        string
+}
+
 // dispatcher runs jobs off the event loops. submit must not block; it reports
 // false when the job cannot be queued. Every accepted job is eventually passed
 // to reactorServer.finish exactly once.
@@ -47,95 +124,133 @@ type dispatcher interface {
 	stop()
 }
 
-type reactorServer struct {
-	config      reactorConfig
-	disp        dispatcher
-	loops       []*eventLoop
-	active      chan struct{}
-	sockets     atomic.Int64
-	outputBytes atomic.Int64
-	addr        string
+// eventLoop owns a listening socket, an epoll instance, and every connection
+// it accepted. Only its own goroutine touches its fields, except completed and
+// notified, which workers use to hand finished requests back.
+type eventLoop struct {
+	server             *reactorServer
+	ep, listen, wakeFD int // epoll, listening socket, eventfd for wake-ups
+	events             [512]unix.EpollEvent
+
+	// Connections, indexed by file descriptor.
+	conns []reactorConn
+
+	// Request slots: a fixed array of jobs and the indexes of the free ones.
+	jobs        []reactorJob
+	freeJobs    []int
+	outstanding int              // slots in use
+	completed   chan *reactorJob // finished by workers, waiting to be sent
+	notified    atomic.Bool      // a wake-up is already pending on wakeFD
+
+	// Input buffers for requests that arrive in pieces: small ones (smallInputBytes)
+	// and a few large ones (maxWireBytes), shared by this loop's connections.
+	inputArena, largeArena []byte
+	freeInput, freeLarge   []int
+	readbuf                [smallInputBytes]byte // scratch for each read
+
+	// Connections with buffered input to read next turn (FIFO ring).
+	ready                            []resumeRead
+	readyHead, readyTail, readyCount int
+	// Connections parked until a request slot frees (FIFO ring).
+	waiting                       []resumeRead
+	waitHead, waitTail, waitCount int
+
+	// Time, in ms since the loop started.
+	started        time.Time
+	now, nextSweep int64
+	tick           time.Duration // how often deadlines are checked
+	stopping       bool
+	stopAt         int64
+	paused         bool // accepting is paused (socket limit or out of descriptors)
+	acceptRetryAt  int64
+	listenerClosed bool
+	errorFrames    map[int][3][]byte // cached error responses (see error)
+	errorSecond    int64
 }
+
+// reactorConn is one client connection. A connection holds at most one
+// request at a time (c.job); pipelined requests wait in c.in until it is sent.
 type reactorConn struct {
-	events                                     uint32
-	in                                         []byte
-	out                                        []byte
-	job                                        *reactorJob
-	deadline                                   int64
-	generation                                 uint32
-	inputID, largeID                           int32
-	sent                                       int32
-	open, closing, interim, continued, peerEOF bool
-	resume, parked                             bool
+	open       bool
+	generation uint32 // bumped on every accept, so stale events and jobs are ignored
+	events     uint32 // the epoll interest currently set
+	deadline   int64  // close the connection at this time (ms)
+
+	in               []byte // received bytes not yet framed into a request
+	inputID, largeID int32  // which arena buffer c.in uses, or -1
+
+	job *reactorJob // the request in progress, if any
+
+	out  []byte // a fixed frame to send instead of a job (errors, 100 Continue)
+	sent int32  // bytes of out already sent
+
+	closing   bool // close after the current response
+	interim   bool // out is a 100 Continue; keep reading the body afterwards
+	continued bool // a 100 Continue was already sent for this request
+	peerEOF   bool // the client shut down its sending side
+	resume    bool // queued in the ready ring
+	parked    bool // queued in the waiting ring (no free request slot)
 }
+
+// reactorJob is one request slot: the request bytes, its parsed form, its
+// database state and its response. Slots are preallocated per event loop.
 type reactorJob struct {
-	owner             *eventLoop
-	fd, slot          int
-	generation        uint32
-	frame             []byte
-	input             []byte
-	largeID           int
-	req               request
-	wire              wireRequest
-	response          response
-	ctx               context.Context
-	cancel            context.CancelFunc
-	header            [256]byte
-	headerN, sent     int
-	active, completed bool
-	outputBytes       int64
-	class             jobClass
-	enqueued          int64  // monoNow at submission
-	abandoned         uint32 // atomic: the connection closed before completion
-	db                dbJob
+	owner      *eventLoop
+	slot       int
+	fd         int
+	generation uint32 // the connection's generation when the request arrived
+
+	input   []byte // this slot's inline copy buffer (jobInputBytes)
+	frame   []byte // the complete request bytes (in input, a large buffer, or the heap)
+	largeID int    // the large arena buffer frame lives in, or -1
+	wire    wireRequest
+	req     request
+	class   jobClass // read or write queue
+
+	db        dbJob
+	enqueued  int64  // monoNow when queued
+	abandoned uint32 // atomic: the connection closed before the response
+
+	response    response
+	header      [256]byte // the rendered response header
+	headerN     int
+	sent        int   // bytes of header+body already sent
+	completed   bool  // the response is ready to send
+	outputBytes int64 // counted against the server-wide output budget
+
+	// Test dispatcher only.
+	ctx    context.Context
+	cancel context.CancelFunc
+	active bool
 }
 
 // jobInputBytes is each job's inline request copy; larger frames use the
 // connection's large buffer or, rarely, a heap copy.
 const jobInputBytes = 4 << 10
 
-var clockStart = time.Now()
-
-func monoNow() int64 { return int64(time.Since(clockStart)) }
-
-type eventLoop struct {
-	notified                         atomic.Bool
-	ready                            []resumeRead
-	readyHead, readyTail, readyCount int
-	waiting                          []resumeRead // connections parked until a request slot frees
-	waitHead, waitTail, waitCount    int
-	acceptRetryAt                    int64
-	server                           *reactorServer
-	ep, listen, wakeFD               int
-	conns                            []reactorConn
-	jobs                             []reactorJob
-	freeJobs                         []int
-	completed                        chan *reactorJob
-	inputArena, largeArena           []byte
-	freeInput, freeLarge             []int
-	events                           [512]unix.EpollEvent
-	readbuf                          [smallInputBytes]byte
-	now, nextSweep, stopAt           int64
-	started                          time.Time
-	tick                             time.Duration
-	paused, stopping, listenerClosed bool
-	outstanding                      int
-	errorFrames                      map[int][3][]byte
-	errorSecond                      int64
-}
-
+// resumeRead names a connection in the ready or waiting ring. The generation
+// tells whether the descriptor still belongs to the same connection.
 type resumeRead struct {
 	fd         int32
 	generation uint32
 }
 
+var clockStart = time.Now()
+
+func monoNow() int64 { return int64(time.Since(clockStart)) }
+
+// ---------- startup and shutdown ----------
+
+// newReactorServer serves a plain handler (tests).
 func newReactorServer(h handler, c reactorConfig) (*reactorServer, error) {
 	return newReactorServerWith(c, func(s *reactorServer) dispatcher {
 		return &handlerDispatcher{s: s, handler: h, work: make(chan *reactorJob, c.queued)}
 	})
 }
+
 func newReactorServerWith(c reactorConfig, makeDispatcher func(*reactorServer) dispatcher) (*reactorServer, error) {
-	if c.loops < 1 || c.workers < 1 || c.active < 1 || c.queued < 1 || c.sockets < 1 || c.fdSlots < c.sockets || c.readTimeout <= 0 || c.writeTimeout <= 0 || c.idleTimeout <= 0 {
+	if c.loops < 1 || c.workers < 1 || c.active < 1 || c.queued < 1 || c.sockets < 1 ||
+		c.fdSlots < c.sockets || c.readTimeout <= 0 || c.writeTimeout <= 0 || c.idleTimeout <= 0 {
 		return nil, errors.New("invalid reactor bounds")
 	}
 	c.loops = min(c.loops, c.active+c.queued)
@@ -166,11 +281,14 @@ func newReactorServerWith(c reactorConfig, makeDispatcher func(*reactorServer) d
 			return nil, err
 		}
 		for _, fd := range []int{r.listen, r.wakeFD} {
-			if err = unix.EpollCtl(r.ep, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(fd)}); err != nil {
+			ev := unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(fd)}
+			if err = unix.EpollCtl(r.ep, unix.EPOLL_CTL_ADD, fd, &ev); err != nil {
 				cleanup()
 				return nil, err
 			}
 		}
+		// Split the request slots evenly between loops, and preallocate
+		// everything a loop needs: connection table, rings, slots and buffers.
 		jobs := (c.active + c.queued) / c.loops
 		if i < (c.active+c.queued)%c.loops {
 			jobs++
@@ -206,7 +324,12 @@ func newReactorServerWith(c reactorConfig, makeDispatcher func(*reactorServer) d
 	s.addr = net.JoinHostPort(c.host, strconv.Itoa(c.port))
 	return s, nil
 }
+
+// Addr is the address the server listens on.
 func (s *reactorServer) Addr() string { return s.addr }
+
+// listenSocket opens a non-blocking listening socket, returning its descriptor
+// and port (useful when port 0 asked for any free port).
 func listenSocket(host string, port int, reuse bool) (int, int, error) {
 	addr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
@@ -264,29 +387,10 @@ func listenSocket(host string, port int, reuse bool) (int, int, error) {
 	}
 	return fd, port, nil
 }
-func (r *eventLoop) dispose() {
-	if !r.listenerClosed && r.listen >= 0 {
-		unix.Close(r.listen)
-		r.listenerClosed = true
-	}
-	if r.ep >= 0 {
-		unix.Close(r.ep)
-	}
-	if r.wakeFD >= 0 {
-		unix.Close(r.wakeFD)
-	}
-}
-func (r *eventLoop) wake() {
-	var b [8]byte
-	binary.NativeEndian.PutUint64(b[:], 1)
-	for {
-		_, e := unix.Write(r.wakeFD, b[:])
-		if e == unix.EINTR {
-			continue
-		}
-		return
-	}
-}
+
+// Serve runs the event loops and the dispatcher until ctx is cancelled, then
+// shuts down: the loops stop accepting, finish in-flight requests (up to
+// shutdownTimeout) and return; then the dispatcher stops.
 func (s *reactorServer) Serve(ctx context.Context) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -325,102 +429,35 @@ func (s *reactorServer) Serve(ctx context.Context) error {
 	return result
 }
 
-// handlerDispatcher runs a synchronous handler on a fixed worker pool with one
-// shared queue. Tests use it; production uses the database dispatcher.
-type handlerDispatcher struct {
-	s       *reactorServer
-	handler handler
-	work    chan *reactorJob
-	workers sync.WaitGroup
-}
-
-func (d *handlerDispatcher) start() {
-	for range d.s.config.workers {
-		d.workers.Go(func() {
-			for j := range d.work {
-				d.execute(j)
-				d.s.finish(j)
-			}
-		})
-	}
-}
-func (d *handlerDispatcher) stop() { close(d.work); d.workers.Wait() }
-func (d *handlerDispatcher) submit(j *reactorJob) bool {
-	j.ctx, j.cancel = context.WithTimeout(context.Background(), 7*time.Second)
-	select {
-	case d.work <- j:
-		return true
-	default:
-		j.cancel()
-		return false
-	}
-}
-func (d *handlerDispatcher) execute(j *reactorJob) {
-	defer j.cancel()
-	defer func() {
-		if p := recover(); p != nil {
-			log.Printf("handler panic: %v", p)
-			writeError(&j.response, 500, "internal error")
-		}
-	}()
-	if j.ctx.Err() != nil {
-		writeError(&j.response, 503, "server busy")
-		return
-	}
-	select {
-	case d.s.active <- struct{}{}:
-		j.active = true
-	case <-j.ctx.Done():
-		writeError(&j.response, 503, "server busy")
-		return
-	}
-	if !parseJob(j) {
-		return
-	}
-	j.req.ctx = j.ctx
-	d.handler(&j.response, &j.req)
-}
-
-// parseJob fills j.req from the job's frame, or sets a 400 response.
-func parseJob(j *reactorJob) bool {
-	var wire wireRequest
-	if parseWire(j.frame, &wire) <= 0 {
-		writeError(&j.response, 400, "invalid request")
-		j.wire.close = true
-		return false
-	}
-	j.req = request{authHeader: wire.auth, authCount: wire.authCount, body: wire.body}
-	j.req.setTarget(wire.method, wire.target)
-	if wire.chunked {
-		j.req.body = decodeChunks(wire.body)
-	}
-	return true
-}
-
-// finish accounts the response, renders its header and hands the job back to
-// its event loop. Called exactly once per accepted job, from any goroutine.
-func (s *reactorServer) finish(j *reactorJob) {
-	// Bound completed response bytes held by slow peers independently of sockets.
-	size := int64(len(j.response.body))
+// wake interrupts the loop's epoll_wait through its eventfd.
+func (r *eventLoop) wake() {
+	var b [8]byte
+	binary.NativeEndian.PutUint64(b[:], 1)
 	for {
-		n := s.outputBytes.Load()
-		if size > 16<<20 || n+size > 256<<20 {
-			writeError(&j.response, 503, "server busy")
-			size = int64(len(j.response.body))
+		_, e := unix.Write(r.wakeFD, b[:])
+		if e == unix.EINTR {
+			continue
 		}
-		if s.outputBytes.CompareAndSwap(n, n+size) {
-			j.outputBytes = size
-			break
-		}
-	}
-	header := appendResponseHeader(j.header[:0], &j.response, j.wire.close, j.wire.http10)
-	j.headerN = len(header)
-	owner := j.owner
-	owner.completed <- j
-	if owner.notified.CompareAndSwap(false, true) {
-		owner.wake()
+		return
 	}
 }
+
+// dispose closes the loop's descriptors once it has stopped.
+func (r *eventLoop) dispose() {
+	if !r.listenerClosed && r.listen >= 0 {
+		unix.Close(r.listen)
+		r.listenerClosed = true
+	}
+	if r.ep >= 0 {
+		unix.Close(r.ep)
+	}
+	if r.wakeFD >= 0 {
+		unix.Close(r.wakeFD)
+	}
+}
+
+// ---------- the event loop ----------
+
 func (r *eventLoop) run(ctx context.Context) error {
 	var fatal error
 	for {
@@ -432,6 +469,7 @@ func (r *eventLoop) run(ctx context.Context) error {
 			r.complete(j)
 			continue
 		}
+		// Wait for events; don't wait if there is already work to do.
 		timeout := int(r.tick / time.Millisecond)
 		if len(r.completed) > 0 || r.readyCount > 0 {
 			timeout = 0
@@ -452,6 +490,7 @@ func (r *eventLoop) run(ctx context.Context) error {
 		for i := 0; i < n; i++ {
 			ev := r.events[i]
 			fd := int(ev.Fd)
+			// A worker finished requests: collect them.
 			if fd == r.wakeFD {
 				var b [8]byte
 				for {
@@ -465,6 +504,7 @@ func (r *eventLoop) run(ctx context.Context) error {
 				r.drain()
 				continue
 			}
+			// New connections.
 			if fd == r.listen {
 				if !r.stopping {
 					r.accept()
@@ -478,6 +518,7 @@ func (r *eventLoop) run(ctx context.Context) error {
 			if !c.open || c.generation != uint32(ev.Pad) {
 				continue
 			}
+			// A client connection: error, half-close, writable, or readable.
 			if ev.Events&(unix.EPOLLERR|unix.EPOLLHUP) != 0 {
 				r.close(fd)
 				continue
@@ -501,6 +542,8 @@ func (r *eventLoop) run(ctx context.Context) error {
 				r.read(fd)
 			}
 		}
+		// After the events: send finished responses, serve buffered requests,
+		// close connections past their deadline, and handle shutdown.
 		r.drain()
 		r.resumeReads()
 		if r.now >= r.nextSweep {
@@ -524,6 +567,9 @@ func (r *eventLoop) run(ctx context.Context) error {
 		}
 	}
 }
+
+// beginStop closes the listener and every idle connection. With force (an
+// epoll error) it closes busy connections too.
 func (r *eventLoop) beginStop(force bool) {
 	if !r.stopping {
 		r.stopping = true
@@ -539,9 +585,12 @@ func (r *eventLoop) beginStop(force bool) {
 		}
 	}
 }
+
+// listenEvents sets the epoll interest of the listening socket (0 pauses accepting).
 func (r *eventLoop) listenEvents(events uint32) {
 	_ = unix.EpollCtl(r.ep, unix.EPOLL_CTL_MOD, r.listen, &unix.EpollEvent{Events: events, Fd: int32(r.listen)})
 }
+
 func (r *eventLoop) arm(fd int, events uint32) {
 	c := &r.conns[fd]
 	if !c.open {
@@ -553,12 +602,16 @@ func (r *eventLoop) arm(fd int, events uint32) {
 	if c.events == events {
 		return
 	}
-	if err := unix.EpollCtl(r.ep, unix.EPOLL_CTL_MOD, fd, &unix.EpollEvent{Events: events, Fd: int32(fd), Pad: int32(c.generation)}); err != nil {
+	ev := unix.EpollEvent{Events: events, Fd: int32(fd), Pad: int32(c.generation)}
+	if err := unix.EpollCtl(r.ep, unix.EPOLL_CTL_MOD, fd, &ev); err != nil {
 		r.close(fd)
 	} else {
 		c.events = events
 	}
 }
+
+// ---------- accepting connections ----------
+
 func (r *eventLoop) accept() {
 	for range 256 {
 		for {
@@ -597,54 +650,20 @@ func (r *eventLoop) accept() {
 		_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_KEEPCNT, 3)
 		c := &r.conns[fd]
 		generation := c.generation + 1
-		*c = reactorConn{open: true, generation: generation, inputID: -1, largeID: -1, deadline: r.now + r.server.config.readTimeout.Milliseconds()}
+		*c = reactorConn{
+			open: true, generation: generation, inputID: -1, largeID: -1,
+			deadline: r.now + r.server.config.readTimeout.Milliseconds(),
+		}
 		c.events = unix.EPOLLIN | unix.EPOLLRDHUP
-		if unix.EpollCtl(r.ep, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{Events: unix.EPOLLIN | unix.EPOLLRDHUP, Fd: int32(fd), Pad: int32(generation)}) != nil {
+		ev := unix.EpollEvent{Events: c.events, Fd: int32(fd), Pad: int32(generation)}
+		if unix.EpollCtl(r.ep, unix.EPOLL_CTL_ADD, fd, &ev) != nil {
 			r.close(fd)
 		}
 	}
 }
-func (r *eventLoop) releaseInput(c *reactorConn) {
-	if c.inputID >= 0 {
-		r.freeInput = append(r.freeInput, int(c.inputID))
-	}
-	if c.largeID >= 0 {
-		r.freeLarge = append(r.freeLarge, int(c.largeID))
-	}
-	c.in = nil
-	c.inputID = -1
-	c.largeID = -1
-}
-func (r *eventLoop) buffer(c *reactorConn, b []byte) bool {
-	if len(b) > maxWireBytes-len(c.in) {
-		return false
-	}
-	if cap(c.in)-len(c.in) < len(b) {
-		var next []byte
-		id := -1
-		large := -1
-		if len(c.in)+len(b) <= smallInputBytes && len(r.freeInput) > 0 {
-			id = r.freeInput[len(r.freeInput)-1]
-			r.freeInput = r.freeInput[:len(r.freeInput)-1]
-			next = r.inputArena[id*smallInputBytes : (id+1)*smallInputBytes]
-		}
-		if next == nil && len(r.freeLarge) > 0 {
-			large = r.freeLarge[len(r.freeLarge)-1]
-			r.freeLarge = r.freeLarge[:len(r.freeLarge)-1]
-			next = r.largeArena[large*maxWireBytes : (large+1)*maxWireBytes]
-		}
-		if next == nil {
-			return false
-		}
-		n := copy(next, c.in)
-		r.releaseInput(c)
-		c.in = next[:n]
-		c.inputID = int32(id)
-		c.largeID = int32(large)
-	}
-	c.in = append(c.in, b...)
-	return true
-}
+
+// ---------- reading and framing requests ----------
+
 func (r *eventLoop) read(fd int) {
 	c := &r.conns[fd]
 	if !c.open || c.job != nil || c.out != nil {
@@ -656,6 +675,7 @@ func (r *eventLoop) read(fd int) {
 		r.park(fd)
 		return
 	}
+	// A complete request may already be buffered (HTTP pipelining).
 	var b []byte
 	if len(c.in) > 0 {
 		b = c.in
@@ -666,6 +686,8 @@ func (r *eventLoop) read(fd int) {
 			return
 		}
 	}
+	// Read what the socket has. The common case is a whole request in one read,
+	// framed straight from readbuf without buffering.
 	n, err := unix.Read(fd, r.readbuf[:])
 	if err == unix.EINTR {
 		return
@@ -696,6 +718,7 @@ func (r *eventLoop) read(fd int) {
 		}
 		b = c.in
 	}
+	// Frame a complete request, or keep the partial one buffered and wait.
 	var wire wireRequest
 	size := parseWire(b, &wire)
 	if size != 0 {
@@ -715,6 +738,7 @@ func (r *eventLoop) read(fd int) {
 	}
 	r.arm(fd, unix.EPOLLIN|unix.EPOLLRDHUP)
 }
+
 func (r *eventLoop) frame(fd int, b []byte, n int, wire wireRequest) {
 	c := &r.conns[fd]
 	if n < 0 {
@@ -733,8 +757,12 @@ func (r *eventLoop) frame(fd int, b []byte, n int, wire wireRequest) {
 	r.freeJobs = r.freeJobs[:len(r.freeJobs)-1]
 	j := &r.jobs[slot]
 	j.db.reset()
+	// Reset the slot but keep its fixed buffers.
 	owner, input, db := j.owner, j.input, j.db
-	*j = reactorJob{owner: owner, input: input, slot: slot, fd: fd, generation: c.generation, largeID: -1, wire: wire, db: db}
+	*j = reactorJob{
+		owner: owner, input: input, db: db, slot: slot,
+		fd: fd, generation: c.generation, largeID: -1, wire: wire,
+	}
 	j.class = classify(wire.method, wire.target)
 	if n <= len(j.input) {
 		j.frame = j.input[:n]
@@ -783,6 +811,9 @@ queued:
 		r.flush(fd)
 	}
 }
+
+// consume drops the first n bytes (the framed request) from the connection's
+// input, keeping what follows. false means the remainder could not be buffered.
 func (r *eventLoop) consume(c *reactorConn, b []byte, n int) bool {
 	tail := b[n:]
 	if len(tail) == 0 {
@@ -797,82 +828,76 @@ func (r *eventLoop) consume(c *reactorConn, b []byte, n int) bool {
 	return r.buffer(c, tail)
 }
 
-var continueFrame = []byte("HTTP/1.1 100 Continue\r\n\r\n")
-
-func buildErrorFrames() map[int][3][]byte {
-	m := make(map[int][3][]byte)
-	for _, status := range []int{400, 413, 417, 503} {
-		var a [3][]byte
-		for i := range a {
-			w := response{}
-			msg := "invalid request"
-			if status == 503 {
-				msg = "server busy"
-			}
-			writeError(&w, status, msg)
-			a[i] = appendResponseHeader(nil, &w, i != 0, false)
-			if i != 2 {
-				a[i] = append(a[i], w.body...)
-			}
-		}
-		m[status] = a
+// buffer appends b to the connection's input, moving it to a small or large
+// arena buffer as it grows. false means no buffer was free or the request is too big.
+func (r *eventLoop) buffer(c *reactorConn, b []byte) bool {
+	if len(b) > maxWireBytes-len(c.in) {
+		return false
 	}
-	return m
-}
-
-func (r *eventLoop) error(fd, status int, close, head bool) {
-	c := &r.conns[fd]
-	if close || head {
+	if cap(c.in)-len(c.in) < len(b) {
+		var next []byte
+		id := -1
+		large := -1
+		if len(c.in)+len(b) <= smallInputBytes && len(r.freeInput) > 0 {
+			id = r.freeInput[len(r.freeInput)-1]
+			r.freeInput = r.freeInput[:len(r.freeInput)-1]
+			next = r.inputArena[id*smallInputBytes : (id+1)*smallInputBytes]
+		}
+		if next == nil && len(r.freeLarge) > 0 {
+			large = r.freeLarge[len(r.freeLarge)-1]
+			r.freeLarge = r.freeLarge[:len(r.freeLarge)-1]
+			next = r.largeArena[large*maxWireBytes : (large+1)*maxWireBytes]
+		}
+		if next == nil {
+			return false
+		}
+		n := copy(next, c.in)
 		r.releaseInput(c)
+		c.in = next[:n]
+		c.inputID = int32(id)
+		c.largeID = int32(large)
 	}
-	c.interim = false
-	c.continued = false
-	c.closing = close
-	c.sent = 0
-	i := 0
-	if close {
-		i = 1
-	}
-	if head {
-		i = 2
-		c.closing = true
-	}
-	// Cached frames stay immutable while slow peers may still reference them.
-	// Refresh Date at most once per second, allocating only on this error path.
-	if r.errorFrames == nil || r.errorSecond != r.now/1000 {
-		r.errorFrames = buildErrorFrames()
-		r.errorSecond = r.now / 1000
-	}
-	c.out = r.errorFrames[status][i]
-	c.deadline = r.now + r.server.config.writeTimeout.Milliseconds()
-	r.flush(fd)
+	c.in = append(c.in, b...)
+	return true
 }
-func (r *eventLoop) drain() {
-	for range 512 {
-		select {
-		case j := <-r.completed:
-			r.complete(j)
-		default:
-			return
-		}
+
+// releaseInput returns a connection's input buffer to the arena.
+func (r *eventLoop) releaseInput(c *reactorConn) {
+	if c.inputID >= 0 {
+		r.freeInput = append(r.freeInput, int(c.inputID))
 	}
+	if c.largeID >= 0 {
+		r.freeLarge = append(r.freeLarge, int(c.largeID))
+	}
+	c.in = nil
+	c.inputID = -1
+	c.largeID = -1
 }
-func (r *eventLoop) complete(j *reactorJob) {
-	j.completed = true
-	if j.largeID >= 0 {
-		r.freeLarge = append(r.freeLarge, j.largeID)
-		j.largeID = -1
+
+// parseJob fills j.req from the job's frame, or sets a 400 response.
+func parseJob(j *reactorJob) bool {
+	var wire wireRequest
+	if parseWire(j.frame, &wire) <= 0 {
+		writeError(&j.response, 400, "invalid request")
+		j.wire.close = true
+		return false
 	}
-	j.frame = nil
-	j.req = request{}
-	c := &r.conns[j.fd]
-	if !c.open || c.generation != j.generation || c.job != j {
-		r.releaseJob(j)
-		return
+	j.req = request{authHeader: wire.auth, authCount: wire.authCount, body: wire.body}
+	j.req.setTarget(wire.method, wire.target)
+	if wire.chunked {
+		j.req.body = decodeChunks(wire.body)
 	}
-	c.deadline = r.now + r.server.config.writeTimeout.Milliseconds()
-	r.flush(j.fd)
+	return true
 }
+
+// ---------- request slots and backpressure ----------
+//
+// A request needs a free slot. When every slot is busy, read parks the
+// connection: it is not read (the request waits in the kernel socket buffer)
+// until releaseJob frees a slot and unparks the oldest parked connection.
+
+// releaseJob frees a request slot once its response is sent (or abandoned) and
+// hands the slot to the longest-parked connection.
 func (r *eventLoop) releaseJob(j *reactorJob) {
 	if j.largeID >= 0 {
 		r.freeLarge = append(r.freeLarge, j.largeID)
@@ -933,6 +958,71 @@ func (r *eventLoop) unparkOne() {
 		return
 	}
 }
+
+// ---------- responses ----------
+//
+// Workers call finish from their own goroutines. The loop picks finished
+// requests up in drain/complete and writes them out in flush.
+
+// finish accounts the response, renders its header and hands the job back to
+// its event loop. Called exactly once per accepted job, from any goroutine.
+func (s *reactorServer) finish(j *reactorJob) {
+	// Bound completed response bytes held by slow peers independently of sockets.
+	size := int64(len(j.response.body))
+	for {
+		n := s.outputBytes.Load()
+		if size > 16<<20 || n+size > 256<<20 {
+			writeError(&j.response, 503, "server busy")
+			size = int64(len(j.response.body))
+		}
+		if s.outputBytes.CompareAndSwap(n, n+size) {
+			j.outputBytes = size
+			break
+		}
+	}
+	header := appendResponseHeader(j.header[:0], &j.response, j.wire.close, j.wire.http10)
+	j.headerN = len(header)
+	owner := j.owner
+	owner.completed <- j
+	if owner.notified.CompareAndSwap(false, true) {
+		owner.wake()
+	}
+}
+
+// drain completes requests that workers have finished, up to 512 per turn.
+func (r *eventLoop) drain() {
+	for range 512 {
+		select {
+		case j := <-r.completed:
+			r.complete(j)
+		default:
+			return
+		}
+	}
+}
+
+// complete starts sending a finished request's response, or frees its slot if
+// the connection went away meanwhile.
+func (r *eventLoop) complete(j *reactorJob) {
+	j.completed = true
+	if j.largeID >= 0 {
+		r.freeLarge = append(r.freeLarge, j.largeID)
+		j.largeID = -1
+	}
+	j.frame = nil
+	j.req = request{}
+	c := &r.conns[j.fd]
+	if !c.open || c.generation != j.generation || c.job != j {
+		r.releaseJob(j)
+		return
+	}
+	c.deadline = r.now + r.server.config.writeTimeout.Milliseconds()
+	r.flush(j.fd)
+}
+
+// flush sends as much of the current response (a job's, or a fixed frame) as
+// the socket takes. When done it frees the slot and goes back to reading: the
+// next buffered request, or waiting for one until the idle timeout.
 func (r *eventLoop) flush(fd int) {
 	c := &r.conns[fd]
 	if !c.open {
@@ -1014,6 +1104,62 @@ func (r *eventLoop) flush(fd int) {
 	}
 }
 
+var continueFrame = []byte("HTTP/1.1 100 Continue\r\n\r\n")
+
+// buildErrorFrames renders the fixed error responses, each in three forms:
+// keep-alive, closing, and closing without a body (HEAD).
+func buildErrorFrames() map[int][3][]byte {
+	m := make(map[int][3][]byte)
+	for _, status := range []int{400, 413, 417, 503} {
+		var a [3][]byte
+		for i := range a {
+			w := response{}
+			msg := "invalid request"
+			if status == 503 {
+				msg = "server busy"
+			}
+			writeError(&w, status, msg)
+			a[i] = appendResponseHeader(nil, &w, i != 0, false)
+			if i != 2 {
+				a[i] = append(a[i], w.body...)
+			}
+		}
+		m[status] = a
+	}
+	return m
+}
+
+// error sends a fixed error response on a connection, closing it if asked.
+func (r *eventLoop) error(fd, status int, close, head bool) {
+	c := &r.conns[fd]
+	if close || head {
+		r.releaseInput(c)
+	}
+	c.interim = false
+	c.continued = false
+	c.closing = close
+	c.sent = 0
+	i := 0
+	if close {
+		i = 1
+	}
+	if head {
+		i = 2
+		c.closing = true
+	}
+	// Cached frames stay immutable while slow peers may still reference them.
+	// Refresh Date at most once per second, allocating only on this error path.
+	if r.errorFrames == nil || r.errorSecond != r.now/1000 {
+		r.errorFrames = buildErrorFrames()
+		r.errorSecond = r.now / 1000
+	}
+	c.out = r.errorFrames[status][i]
+	c.deadline = r.now + r.server.config.writeTimeout.Milliseconds()
+	r.flush(fd)
+}
+
+// ---------- serving buffered requests ----------
+
 // Buffered pipeline tails do not imply kernel readability. Schedule them
 // explicitly, with a per-turn budget, instead of recursively serving pipelines.
 func (r *eventLoop) scheduleRead(fd int) {
@@ -1030,6 +1176,8 @@ func (r *eventLoop) scheduleRead(fd int) {
 	r.readyTail = (r.readyTail + 1) % len(r.ready)
 	r.readyCount++
 }
+
+// resumeReads serves up to 64 connections from the ready ring per turn.
 func (r *eventLoop) resumeReads() {
 	for range min(64, r.readyCount) {
 		e := r.ready[r.readyHead]
@@ -1045,6 +1193,11 @@ func (r *eventLoop) resumeReads() {
 		}
 	}
 }
+
+// ---------- closing and timeouts ----------
+
+// close closes a connection. A request still being worked on is marked
+// abandoned; its slot is freed when the worker hands it back.
 func (r *eventLoop) close(fd int) {
 	c := &r.conns[fd]
 	if !c.open {
@@ -1066,6 +1219,8 @@ func (r *eventLoop) close(fd int) {
 	*c = reactorConn{generation: generation}
 	r.server.sockets.Add(-1)
 }
+
+// expire closes every connection past its deadline (read, write, idle or parked).
 func (r *eventLoop) expire() {
 	for fd := range r.conns {
 		c := &r.conns[fd]
@@ -1073,4 +1228,67 @@ func (r *eventLoop) expire() {
 			r.close(fd)
 		}
 	}
+}
+
+// ---------- test dispatcher ----------
+
+// handlerDispatcher runs a synchronous handler on a fixed worker pool with one
+// shared queue. Tests use it; production uses the database dispatcher.
+type handlerDispatcher struct {
+	s       *reactorServer
+	handler handler
+	work    chan *reactorJob
+	workers sync.WaitGroup
+}
+
+// Test dispatcher: start, stop, submit and execute run a plain handler on a
+// fixed pool of goroutines with one queue.
+func (d *handlerDispatcher) start() {
+	for range d.s.config.workers {
+		d.workers.Go(func() {
+			for j := range d.work {
+				d.execute(j)
+				d.s.finish(j)
+			}
+		})
+	}
+}
+
+func (d *handlerDispatcher) stop() { close(d.work); d.workers.Wait() }
+
+func (d *handlerDispatcher) submit(j *reactorJob) bool {
+	j.ctx, j.cancel = context.WithTimeout(context.Background(), 7*time.Second)
+	select {
+	case d.work <- j:
+		return true
+	default:
+		j.cancel()
+		return false
+	}
+}
+
+func (d *handlerDispatcher) execute(j *reactorJob) {
+	defer j.cancel()
+	defer func() {
+		if p := recover(); p != nil {
+			log.Printf("handler panic: %v", p)
+			writeError(&j.response, 500, "internal error")
+		}
+	}()
+	if j.ctx.Err() != nil {
+		writeError(&j.response, 503, "server busy")
+		return
+	}
+	select {
+	case d.s.active <- struct{}{}:
+		j.active = true
+	case <-j.ctx.Done():
+		writeError(&j.response, 503, "server busy")
+		return
+	}
+	if !parseJob(j) {
+		return
+	}
+	j.req.ctx = j.ctx
+	d.handler(&j.response, &j.req)
 }

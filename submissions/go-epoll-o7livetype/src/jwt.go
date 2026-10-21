@@ -1,5 +1,10 @@
 package main
 
+// jwt.go signs and verifies HS256 tokens. Tokens in the standard shape this
+// server issues ({"alg":"HS256","typ":"JWT"} header, sub/iat/exp claims) are
+// verified by a fast path that allocates nothing; anything else is decided by
+// golang-jwt, so unusual tokens get exactly the library's answer.
+
 import (
 	"bytes"
 	"crypto/hmac"

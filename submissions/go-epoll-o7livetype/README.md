@@ -16,18 +16,19 @@ allocation-free request path, and pipelined, group-committed prepared statements
 
 ## Results
 
-1-minute runs on my machine (not the official box), one session, box configs; everything shares 1 core / 2 GB
-or 8 cores / 16 GB. Users = most passing p95 < 500 ms and p99 < 1 s with zero errors; the rest is at the 8-core
-limit.
+Earlier local 60-second screens, not official five-minute scores. User counts passed p95 < 500 ms,
+p99 < 1 s and zero errors in that block; near-limit repeats vary. App + PG share 1 core / 2 GB or
+8 cores / 16 GB; Nginx uses the same cores with a separate 2 GB cap. Other metrics are at the
+8-core counts; memory is app/Nginx RSS and PG private memory (excludes shared buffers).
 
-| Implementation | Front | 1 core | 8 cores | req/s | p95 | CPU server / PG / Nginx | Memory server / Nginx / PG | |
-|---|---|---|---|---|---|---|---|---|
-| `examples/go` | nginx | 5,000 | 37,500 | 9,525 | 319 ms | 2.3 / 4.1 / 1.4 | 182 MB / 316 MB / 610 MB | |
-| `go-fasthttp-o7livetype` | nginx | 10,000 | 67,500 | 17,780 | 49 ms | 2.1 / 3.7 / 2.0 | 142 MB / 318 MB / 159 MB | |
-| `go-fasthttp-o7livetype`, no Nginx | direct | 13,500 | 100,000 | 25,818 | 318 ms | 3.2 / 4.7 / - | 2.0 GB / - / 159 MB | |
-| this build | direct | 18,500 | 135,000 | 33,645 | 386 ms | 1.9 / 6.1 / - | 1.3 GB / - / 159 MB | **<-- This submission** |
+| Implementation | Front | 1 core | 8 cores | users vs `examples/go` (1 / 8 cores) | req/s | req/s vs `examples/go` | p50 | p95 | p99 | CPU server / PG / Nginx | Memory server / Nginx / PG | |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `examples/go` | nginx | 5,000 | 37,500 | 1.0x / 1.0x | 9,525 | 1.0x | 142 ms | 319 ms | 372 ms | 2.3 / 4.1 / 1.4 | 182 MB / 316 MB / 610 MB |  |
+| `go-fasthttp-o7livetype` | nginx | 10,000 | 67,500 | 2.0x / 1.8x | 17,780 | 1.9x | 13 ms | 49 ms | 77 ms | 2.1 / 3.7 / 2.0 | 142 MB / 318 MB / 159 MB |  |
+| `go-fasthttp-o7livetype`, no Nginx | direct | 13,500 | 100,000 | 2.7x / 2.7x | 25,818 | 2.7x | 33 ms | 318 ms | 360 ms | 3.2 / 4.7 / - | 2.0 GB / - / 159 MB |  |
+| this build | direct | 18,500 | 135,000 | 3.7x / 3.6x | 33,645 | 3.5x | 231 ms | 386 ms | 452 ms | 1.9 / 6.1 / - | 1.3 GB / - / 159 MB | **<-- This submission** |
 
-3.6x the users of `examples/go` on 8 cores, 3.7x on 1 core. Past each limit, runs fail on latency, never errors.
+The 135k epoll result did not repeat: old/new builds both missed latency with zero errors.
 
 ## Changes from `examples/go`
 
@@ -45,7 +46,7 @@ limit.
 | Feed returns `following` as constant `true` | Every feed author is followed (-3% CPU on that query) | Good |
 | Backpressure instead of 503s, 30 s timeout | Overload shows up as latency, not errors | Good with latency alerts |
 | bcrypt workers stretch after 1 s of backlog | Logins don't time out under load | Good |
-| Reconnect with exponential backoff (100 ms to 5 s, jitter) | Survives PostgreSQL restarts without errors or double writes | Essential |
+| Reconnect with exponential backoff (100 ms to 5 s, jitter) | Retries reads and unsent writes; never replays uncertain commits | Essential |
 
 ## Build and run
 

@@ -1,5 +1,12 @@
 package main
 
+// wire_http.go parses and writes HTTP/1.1 on raw bytes for the event loops.
+// parseWire finds one complete request at the start of a buffer (request line,
+// headers, Content-Length or chunked body) without copying; it rejects anything
+// ambiguous (duplicate lengths, both length and chunked, bad characters). It
+// returns the request's length, 0 if more bytes are needed, or minus the status
+// to answer (400, 413, 417). appendResponseHeader writes a response header.
+
 import (
 	"bytes"
 	"net/http"

@@ -1,5 +1,11 @@
 package main
 
+// sql.go holds the prepared statements, one per endpoint. Read statements are
+// prepared on read connections and write statements on write connections
+// (db.go). Each statement below is documented with its parameters, in the
+// order the plan functions in api.go add them, and its result columns, in the
+// order the finish functions read them.
+
 import "strings"
 
 // Every endpoint is one prepared statement. Mutations fold their lookups,
@@ -124,20 +130,29 @@ func feedStatement() string {
 const slugify = `trim(both '-' from lower(regexp_replace($2, '[^A-Za-z0-9]+', '-', 'g')))`
 
 var stmts = [numStmts]stmtDef{
-	stTags:        {`SELECT ARRAY(SELECT name FROM tags ORDER BY name)`, ""},
-	stUserByID:    {`SELECT username, email, bio, image FROM users WHERE id = $1`, "i"},
+	// No parameters. Returns one row: all tag names, sorted.
+	stTags: {`SELECT ARRAY(SELECT name FROM tags ORDER BY name)`, ""},
+	// $1 user id. Returns username, email, bio, image.
+	stUserByID: {`SELECT username, email, bio, image FROM users WHERE id = $1`, "i"},
+	// $1 email. Returns id, username, email, bio, image, password_hash.
 	stUserByEmail: {`SELECT id, username, email, bio, image, password_hash FROM users WHERE email = $1`, "t"},
+	// $1 viewer, $2 username. Returns username, bio, image, following.
 	stProfile: {`SELECT u.username, u.bio, u.image,
  EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = u.id)
 FROM users u WHERE u.username = $2`, "it"},
-	stListAll:       {listStatements[listAll], "iii"},
-	stListTag:       {listStatements[listByTag], "iiit"},
-	stListAuthor:    {listStatements[listByAuthor], "iiit"},
-	stListFavorite:  {listStatements[listByFavorite], "iiit"},
-	stListFeed:      {feedStatement(), "iii"},
+	// Lists: $1 viewer, $2 limit, $3 offset, [$4 tag, author or favoriting username].
+	// Every row starts with the capped total count (see listStatements).
+	stListAll:      {listStatements[listAll], "iii"},
+	stListTag:      {listStatements[listByTag], "iiit"},
+	stListAuthor:   {listStatements[listByAuthor], "iiit"},
+	stListFavorite: {listStatements[listByFavorite], "iiit"},
+	stListFeed:     {feedStatement(), "iii"},
+	// $1 viewer, $2 slug. Returns the full Article layout (articleCols).
 	stArticleBySlug: {articleBySlug, "it"},
 	// One row per comment; one null-comment row for an existing empty thread
 	// and no rows for a missing article.
+	// $1 viewer, $2 slug. Returns id, body, created_at, updated_at, username, bio,
+	// image, following.
 	stComments: {`SELECT c.id,c.body,c.created_at,c.updated_at,c.username,c.bio,c.image,COALESCE(c.following,false)
  FROM articles a LEFT JOIN LATERAL (
   SELECT c.id,c.body,c.created_at,c.updated_at,u.username,u.bio,u.image,
@@ -148,16 +163,20 @@ FROM users u WHERE u.username = $2`, "it"},
 
 	// A duplicate username or email inserts nothing and returns no row, so it
 	// cannot abort the other requests sharing its group transaction.
+	// $1 username, $2 email, $3 password hash. Returns id, username, email, bio, image.
 	stRegister: {`INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3)
 ON CONFLICT DO NOTHING RETURNING id, username, email, bio, image`, "ttt"},
 	// Row: clash, username, email, bio, image. A visible clash skips the update
 	// (422); no user gives NULLs (401). A concurrent clash still raises 23505,
 	// which the group retry maps to 422.
+	// $1 user id, $2 email, $3 username, $4 password hash, $5 bio, $6 image; NULL
+	// keeps the current value.
 	stUserUpdate: {`WITH clash AS (SELECT EXISTS (SELECT 1 FROM users WHERE id <> $1 AND (email = $2 OR username = $3)) AS c),
  w AS (UPDATE users SET email = COALESCE($2, email), username = COALESCE($3, username),
        password_hash = COALESCE($4, password_hash), bio = COALESCE($5, bio), image = COALESCE($6, image)
        WHERE id = $1 AND NOT (SELECT c FROM clash) RETURNING username, email, bio, image)
 SELECT clash.c, w.username, w.email, w.bio, w.image FROM clash LEFT JOIN w ON true`, "ittttt"},
+	// Follow and unfollow: $1 viewer, $2 username. Return username, bio, image.
 	stFollow: {`WITH t AS (SELECT id, username, bio, image FROM users WHERE username = $2),
  w AS (INSERT INTO follows (follower_id, followee_id) SELECT $1, id FROM t ON CONFLICT DO NOTHING)
 SELECT username, bio, image FROM t`, "it"},
@@ -166,6 +185,7 @@ SELECT username, bio, image FROM t`, "it"},
 SELECT username, bio, image FROM t`, "it"},
 	// Article, tags and links in one statement. ON CONFLICT DO UPDATE returns
 	// the id of a tag another transaction committed after this snapshot.
+	// $1 author, $2 title, $3 description, $4 body, $5 tags. Returns the full Article.
 	stArticleCreate: {`WITH n AS (SELECT nextval(pg_get_serial_sequence('articles', 'id')) AS id),
  a AS (INSERT INTO articles (id, slug, author_id, title, description, body)
        SELECT n.id, ` + slugify + ` || '-' || n.id, $1, $2, $3, $4 FROM n
@@ -185,6 +205,7 @@ FROM a JOIN users u ON u.id = a.author_id`, "ittta"},
 	// Row: author_id, then the full Article layout (NULL unless updated). The
 	// update changes no tags, favorites or author, so the statement snapshot
 	// is current for those columns.
+	// $1 slug, $2 title, $3 description, $4 body (NULL keeps the value), $5 viewer.
 	stArticleUpdate: {`WITH t AS (SELECT id, author_id FROM articles WHERE slug = $1),
  w AS (UPDATE articles SET title = COALESCE($2, title), description = COALESCE($3, description), body = COALESCE($4, body),
        slug = CASE WHEN $2::text IS NULL THEN slug ELSE ` + slugify + ` || '-' || id END,
@@ -194,11 +215,13 @@ FROM a JOIN users u ON u.id = a.author_id`, "ittta"},
 SELECT t.author_id, ` + articleCols("w", "$5", `(SELECT count(*) FROM favorites f WHERE f.article_id = w.id)`,
 		`EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = w.id AND f.user_id = $5)`) + `
 FROM t LEFT JOIN w ON true LEFT JOIN users u ON u.id = w.author_id`, "tttti"},
+	// $1 slug, $2 viewer. Returns the author_id, if the article exists.
 	stArticleDelete: {`WITH t AS (SELECT id, author_id FROM articles WHERE slug = $1),
  w AS (DELETE FROM articles WHERE id = (SELECT id FROM t WHERE author_id = $2))
 SELECT author_id FROM t`, "ti"},
 	// Mutation and response in one statement. CTE writes are invisible to the
 	// statement's own snapshot, so the count adds this statement's change.
+	// Favorite and unfavorite: $1 viewer, $2 slug. Return the full Article layout.
 	stFavorite: {`WITH t AS (SELECT id, slug, title, description, body, created_at, updated_at, author_id FROM articles WHERE slug = $2),
  w AS (INSERT INTO favorites (user_id, article_id) SELECT $1, id FROM t ON CONFLICT DO NOTHING RETURNING 1)
 SELECT ` + articleCols("t", "$1", `(SELECT count(*) FROM favorites f WHERE f.article_id = t.id) + (SELECT count(*) FROM w)`, `true`) + `
@@ -207,10 +230,13 @@ FROM t JOIN users u ON u.id = t.author_id`, "it"},
  w AS (DELETE FROM favorites WHERE user_id = $1 AND article_id = (SELECT id FROM t) RETURNING 1)
 SELECT ` + articleCols("t", "$1", `(SELECT count(*) FROM favorites f WHERE f.article_id = t.id) - (SELECT count(*) FROM w)`, `false`) + `
 FROM t JOIN users u ON u.id = t.author_id`, "it"},
+	// $1 slug, $2 author, $3 body. Returns id, body, created_at, updated_at, username,
+	// bio, image.
 	stCommentCreate: {`WITH c AS (INSERT INTO comments (article_id, author_id, body) SELECT id, $2, $3 FROM articles WHERE slug = $1
            RETURNING id, body, created_at, updated_at, author_id)
 SELECT c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image
   FROM c JOIN users u ON u.id = c.author_id`, "tit"},
+	// $1 comment id, $2 slug, $3 viewer. Returns the author_id, if the comment exists.
 	stCommentDelete: {`WITH t AS (SELECT c.id, c.author_id FROM comments c JOIN articles a ON a.id = c.article_id
                 WHERE c.id = $1 AND a.slug = $2),
  w AS (DELETE FROM comments WHERE id = (SELECT id FROM t WHERE author_id = $3))
