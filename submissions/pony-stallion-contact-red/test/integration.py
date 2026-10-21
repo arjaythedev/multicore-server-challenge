@@ -1057,6 +1057,96 @@ class Integration(unittest.TestCase):
             gates[0].release.set()
             run.ready(2)
 
+    def test_pool_retiring_idle_slots_preserves_available_connections(self):
+        for count, position in ((1, 0), (3, 0), (3, 1), (3, 2)):
+            with self.subTest(count=count, position=position), self.pool_run(
+                    count, retry_ns=60_000_000_000) as run:
+                before = run.ready(count)
+                victim = before["idle"][position]
+                survivors = set(before["idle"]) - {victim}
+                generations = before["generations"].copy()
+                generations[victim] += 1
+                run.send(f"retire {victim}")
+                retired = run.wait_state(lambda state:
+                    state["phases"][victim] == 4)
+                self.assertEqual(set(retired["idle"]), survivors)
+                self.assertEqual(retired["generations"], generations)
+                with SQLSession(self.database) as holder:
+                    holder.execute(
+                        "BEGIN; LOCK TABLE tags IN ACCESS EXCLUSIVE MODE;")
+                    run.send(*(f"tags {id} 0" for id in range(1, count + 1)))
+                    busy = run.wait_state(lambda state:
+                        len(state["active"]) == len(survivors) and
+                        state["queued"] == [count])
+                    self.assertEqual({item[0] for item in busy["active"]},
+                                     survivors)
+                    self.assertEqual({item[1] for item in busy["active"]},
+                                     set(range(1, count)))
+                    self.assertEqual(busy["idle"], [])
+                    self.assertEqual(busy["phases"][victim], 4)
+                    holder.execute("ROLLBACK;")
+                if survivors:
+                    for id in range(1, count + 1):
+                        run.result(id)
+                    settled = run.wait_state(lambda state:
+                        not state["active"] and not state["queued"])
+                    self.assertEqual(set(settled["idle"]), survivors)
+                    self.assertEqual(settled["phases"][victim], 4)
+                else:
+                    run.send("close")
+                    run.result(1, "lost")
+                run.send("close", "close")
+                stopped = run.state()
+                self.assertEqual(stopped["phases"], [5] * count)
+                self.assertEqual(stopped["idle"], [])
+                self.assertEqual(stopped["active"], [])
+                self.assertEqual(stopped["queued"], [])
+                self.assertEqual(stopped["generations"], generations)
+                self.assertEqual(stopped["recipients"], 0)
+                self.assertEqual(stopped["outstanding"], 0)
+                self.assertEqual(run.fence(), {0: count, 1: 0, 2: 0, 3: 0})
+
+    def test_pool_retiring_busy_slot_preserves_other_idle_connections(self):
+        with self.pool_run(3, retry_ns=60_000_000_000) as run:
+            run.ready(3)
+            with SQLSession(self.database) as holder:
+                holder.execute(
+                    "BEGIN; LOCK TABLE tags IN ACCESS EXCLUSIVE MODE;")
+                run.send("tags 1 0")
+                before = run.wait_state(lambda state:
+                    len(state["active"]) == 1)
+                victim = before["active"][0][0]
+                survivors = set(before["idle"])
+                generations = before["generations"].copy()
+                generations[victim] += 1
+                run.send(f"retire {victim}")
+                run.result(1, "lost")
+                retired = run.state()
+                self.assertEqual(set(retired["idle"]), survivors)
+                self.assertEqual(retired["phases"][victim], 4)
+                self.assertEqual(retired["generations"], generations)
+                run.send("tags 2 0", "tags 3 0", "tags 4 0")
+                busy = run.wait_state(lambda state:
+                    len(state["active"]) == 2 and state["queued"] == [4])
+                self.assertEqual({item[0] for item in busy["active"]},
+                                 survivors)
+                self.assertEqual({item[1] for item in busy["active"]}, {2, 3})
+                self.assertEqual(busy["idle"], [])
+                self.assertEqual(busy["phases"][victim], 4)
+                holder.execute("ROLLBACK;")
+            for id in (2, 3, 4):
+                run.result(id)
+            settled = run.wait_state(lambda state:
+                not state["active"] and not state["queued"])
+            self.assertEqual(set(settled["idle"]), survivors)
+            self.assertEqual(settled["phases"][victim], 4)
+            run.send("close", "close")
+            stopped = run.state()
+            self.assertEqual(stopped["phases"], [5] * 3)
+            self.assertEqual(stopped["idle"], [])
+            self.assertEqual(stopped["outstanding"], 0)
+            self.assertEqual(run.fence(), {0: 4, 1: 0, 2: 0, 3: 0})
+
     def test_pool_fifo_dispatches_detached_jobs_on_each_freed_connection(self):
         with self.pool_run() as run:
             run.ready(2)
@@ -1351,6 +1441,42 @@ class Integration(unittest.TestCase):
         return [[payload.split(b"\0", 2)[1] for kind, payload in session
                  if kind == b"B"] for session in proxy.snapshot()]
 
+    def routing_pool_routes(self, database, connections, proxy, sizes):
+        request = b"GET /api/tags HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        routes = []
+        with SQLSession(database) as holder:
+            holder.execute("BEGIN; LOCK TABLE tags IN ACCESS EXCLUSIVE MODE;")
+            for connection, count in zip(connections, sizes):
+                before = self.routing_binds(proxy)
+                connection.sock.sendall(request * count)
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    after = self.routing_binds(proxy)
+                    self.assertEqual(len(after), len(before))
+                    changes = {index: names[len(before[index]):]
+                               for index, names in enumerate(after)
+                               if names != before[index]}
+                    if sum(map(len, changes.values())) >= count:
+                        break
+                    time.sleep(0.01)
+                else:
+                    self.fail("pool capacity timed out: " + repr(changes))
+                self.assertEqual(len(changes), count)
+                self.assertTrue(all(names == [b"tags"]
+                                    for names in changes.values()))
+                route = set(changes)
+                for previous in routes:
+                    self.assertTrue(route.isdisjoint(previous))
+                routes.append(route)
+            holder.execute("ROLLBACK;")
+        for connection, count in zip(connections, sizes):
+            with connection.sock.makefile("rb") as stream:
+                for _ in range(count):
+                    status, body = self.routing_read_response(stream)
+                    self.assertEqual(status, 200)
+                    self.assertIsInstance(body["tags"], list)
+        return routes
+
     def csv_output(self, metrics, counts):
         data = os.pread(metrics.fileno(),
                                         os.fstat(metrics.fileno()).st_size, 0)
@@ -1567,9 +1693,8 @@ class Integration(unittest.TestCase):
                 connections = [self.routing_connect(port) for _ in range(4)]
                 for connection in connections:
                     cleanup.callback(connection.close)
-                routes = [{self.routing_tags(connection, proxy)
-                           for _ in range(2)}
-                          for connection in connections]
+                routes = self.routing_pool_routes(
+                    self.database, connections, proxy, [2] * 4)
                 self.assertEqual([len(route) for route in routes], [2] * 4)
                 for index, route in enumerate(routes):
                     for other in routes[index + 1:]:
@@ -1839,8 +1964,7 @@ class Integration(unittest.TestCase):
             port, proxy, _, _ = run
             connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
             try:
-                routes = [self.routing_tags(connection, proxy) for _ in range(3)]
-                self.assertEqual(len(set(routes)), 3)
+                self.routing_tags(connection, proxy)
                 content = "routing body " + uuid.uuid4().hex
                 status, body, changes = self.routing_request(
                     connection, proxy, "PUT", "/api/articles/" + slug,
@@ -1852,7 +1976,6 @@ class Integration(unittest.TestCase):
                 self.assertCountEqual(names, [b"article_update_input",
                                              b"article_update",
                                              b"article_full_by_id"])
-                self.assertGreater(len(changes), 1)
 
             finally:
                 connection.close()
@@ -1937,26 +2060,16 @@ class Integration(unittest.TestCase):
                 self.assertEqual(final["counters"][2], 9)
                 self.assertEqual(final["counters"][5] - baseline["counters"][5], 4)
 
-    def test_shared_pool_reuses_all_idle_connections(self):
+    def test_shared_pool_uses_all_available_connections(self):
         with self.routing_server(5, readiness=False) as run, ExitStack() as cleanup:
             port, proxy, _, _ = run
-            warm = [self.routing_connect(port) for _ in range(4)]
-            for connection in warm:
+            connections = [self.routing_connect(port) for _ in range(4)]
+            for connection in connections:
                 cleanup.callback(connection.close)
-            used = set()
-            deadline = time.monotonic() + 15
-            while len(used) < 20 and time.monotonic() < deadline:
-                for connection in warm:
-                    used.add(self.routing_tags(connection, proxy))
-            self.assertEqual(used, set(range(20)))
-            before = self.routing_binds(proxy)
-            for _ in range(20):
-                connection = self.routing_connect(port)
-                cleanup.callback(connection.close)
-                self.routing_tags(connection, proxy)
-            after = self.routing_binds(proxy)
-            self.assertEqual([len(a) - len(b) for a, b in zip(after, before)],
-                             [1] * 20)
+            routes = self.routing_pool_routes(
+                self.database, connections, proxy, [5] * 4)
+            self.assertEqual([len(route) for route in routes], [5] * 4)
+            self.assertEqual(set.union(*routes), set(range(20)))
             proxy.assert_healthy()
 
     def test_named_rollback_after_failed_transaction(self):
@@ -2589,14 +2702,18 @@ class Integration(unittest.TestCase):
             self.assertEqual(status, 500)
             self.assertIsInstance(body["errors"]["body"], list)
         after_failure = self.routing_binds(self.proxy)[:20]
-        self.assertTrue(all(len(after) > len(initial)
-            for initial, after in zip(before, after_failure)))
+        failures = [after[len(initial):]
+                    for initial, after in zip(before, after_failure)]
+        self.assertEqual(sum(map(len, failures)), 20)
+        self.assertGreaterEqual(sum(bool(names) for names in failures), 4)
+        self.assertTrue(all(name == b"article_insert"
+                            for names in failures for name in names))
         for _ in range(20):
             self.assertEqual(self.request("GET", "/api/tags")[0], 200)
         after_read = self.routing_binds(self.proxy)[:20]
         self.assertEqual([after[len(failed):]
             for failed, after in zip(after_failure, after_read)],
-            [[b"tags"]] * 20)
+            [[b"tags"] * len(names) for names in failures])
         states = self.sql(
             "SELECT count(*), count(*) FILTER (WHERE state = 'idle') "
             "FROM pg_stat_activity "
@@ -2639,6 +2756,214 @@ class Integration(unittest.TestCase):
         status, fetched = self.request("GET", "/api/articles/" + article["slug"])
         self.assertEqual(status, 200)
         self.assertEqual(fetched["article"], article)
+
+    def test_direct_json_response_wiring(self):
+        def strict(data):
+            def unique(pairs):
+                result = {}
+                for key, value in pairs:
+                    if key in result:
+                        raise ValueError("duplicate JSON key")
+                    result[key] = value
+                return result
+            return json.loads(data, object_pairs_hook=unique)
+
+        for data in ('{"a":1,"a":2}', '{"a":{"b":1,"b":2}}'):
+            with self.assertRaisesRegex(ValueError, "duplicate JSON key"):
+                strict(data)
+        self.assertEqual(strict('{"a":{"b":1}}'), {"a": {"b": 1}})
+
+        def fetch(method, path, body=None, token=None):
+            connection = http.client.HTTPConnection("127.0.0.1", self.port,
+                                                    timeout=5)
+            try:
+                headers = {"Content-Type": "application/json"}
+                if token:
+                    headers["Authorization"] = "Token " + token
+                payload = None if body is None else json.dumps(
+                    body, ensure_ascii=False).encode()
+                connection.request(method, path, payload, headers)
+                response = connection.getresponse()
+                data = response.read()
+                self.assertEqual(int(response.getheader("Content-Length")),
+                                 len(data))
+                return response.status, strict(data)
+            finally:
+                connection.close()
+
+        def keys(value, expected):
+            self.assertIs(type(value), dict)
+            self.assertEqual(set(value), set(expected))
+
+        def profile(value, username, bio, image, following):
+            keys(value, ("username", "bio", "image", "following"))
+            self.assertEqual(value["username"], username)
+            self.assertEqual(value["bio"], bio)
+            self.assertEqual(value["image"], image)
+            self.assertIs(type(value["following"]), bool)
+            self.assertIs(value["following"], following)
+
+        def deleted(path, token):
+            request = (f"DELETE {path} HTTP/1.1\r\nHost: localhost\r\n"
+                       f"Authorization: Token {token}\r\n"
+                       "Connection: close\r\n\r\n").encode()
+            with socket.create_connection(("127.0.0.1", self.port), 5) as sock:
+                sock.sendall(request)
+                deadline = time.monotonic() + 5
+                data = bytearray()
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self.fail("DELETE response did not close")
+                    sock.settimeout(remaining)
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    data.extend(chunk)
+                    self.assertLess(len(data), 65536)
+            head, body = bytes(data).split(b"\r\n\r\n", 1)
+            self.assertEqual(head.split(b"\r\n", 1)[0].split()[1], b"204")
+            self.assertEqual(body, b"")
+
+        suffix = uuid.uuid4().hex
+        username, target = "writer_" + suffix, "reader_" + suffix
+        password = "direct-json-password"
+        email = username + "@example.invalid"
+        user_keys = ("username", "email", "bio", "image", "token")
+        for name in (username, target):
+            status, response = fetch("POST", "/api/users", {"user": {
+                "username": name, "email": name + "@example.invalid",
+                "password": password}})
+            self.assertEqual(status, 201)
+            keys(response, ("user",))
+            user = response["user"]
+            keys(user, user_keys)
+            self.assertEqual(user["username"], name)
+            self.assertEqual(user["email"], name + "@example.invalid")
+            self.assertIsNone(user["bio"])
+            self.assertIsNone(user["image"])
+            self.assertIs(type(user["token"]), str)
+            if name == target:
+                target_token = user["token"]
+        status, response = fetch("POST", "/api/users/login", {"user": {
+            "email": email, "password": password}})
+        self.assertEqual(status, 200)
+        keys(response, ("user",))
+        keys(response["user"], user_keys)
+        self.assertEqual(response["user"]["username"], username)
+        self.assertIs(type(response["user"]["token"]), str)
+        token = response["user"]["token"]
+        status, response = fetch("GET", "/api/user", token=token)
+        self.assertEqual(status, 200)
+        keys(response, ("user",))
+        keys(response["user"], user_keys)
+        self.assertEqual(response["user"]["token"], token)
+        special = 'quote"\\\b\f\n\r\t\x1f雪🐎tail'
+        for bio, image in ((special, ""), ("", special)):
+            status, response = fetch("PUT", "/api/user", {"user": {
+                "bio": bio, "image": image}}, token)
+            self.assertEqual(status, 200)
+            keys(response, ("user",))
+            keys(response["user"], user_keys)
+            self.assertEqual(response["user"]["username"], username)
+            self.assertEqual(response["user"]["email"], email)
+            self.assertEqual(response["user"]["bio"], bio)
+            self.assertEqual(response["user"]["image"], image)
+            self.assertEqual(response["user"]["token"], token)
+        status, response = fetch("GET", "/api/profiles/" + username)
+        self.assertEqual(status, 200)
+        keys(response, ("profile",))
+        profile(response["profile"], username, "", special, False)
+        for method, following in (("POST", True), ("DELETE", False)):
+            status, response = fetch(method,
+                "/api/profiles/" + target + "/follow", token=token)
+            self.assertEqual(status, 200)
+            keys(response, ("profile",))
+            profile(response["profile"], target, None, None, following)
+            status, response = fetch("GET", "/api/profiles/" + target,
+                                     token=token)
+            self.assertEqual(status, 200)
+            profile(response["profile"], target, None, None, following)
+
+        status, response = fetch("POST", "/api/articles", {"article": {
+            "title": "direct_" + suffix, "description": special,
+            "body": "body_" + special, "tagList": [special]}}, token)
+        self.assertEqual(status, 201)
+        keys(response, ("article",))
+        article = response["article"]
+        keys(article, ("slug", "title", "description", "body", "createdAt",
+                       "updatedAt", "tagList", "favoritesCount", "favorited",
+                       "author"))
+        self.assertEqual(article["title"], "direct_" + suffix)
+        self.assertEqual(article["description"], special)
+        self.assertEqual(article["body"], "body_" + special)
+        self.assertEqual(article["tagList"], [special])
+        self.assertIs(type(article["favoritesCount"]), int)
+        self.assertEqual(article["favoritesCount"], 0)
+        self.assertIs(article["favorited"], False)
+        profile(article["author"], username, "", special, False)
+        path = "/api/articles/" + article["slug"]
+        status, response = fetch("GET", path, token=token)
+        self.assertEqual(status, 200)
+        self.assertEqual(response["article"], article)
+        status, response = fetch("PUT", path, {"article": {
+            "description": "updated_" + special,
+            "body": "updated body_" + special}}, token)
+        self.assertEqual(status, 200)
+        self.assertEqual(response["article"]["description"],
+                         "updated_" + special)
+        self.assertEqual(response["article"]["body"], "updated body_" + special)
+        for method, favorited, count in (("POST", True, 1),
+                                         ("DELETE", False, 0)):
+            status, response = fetch(method, path + "/favorite", token=token)
+            self.assertEqual(status, 200)
+            self.assertIs(response["article"]["favorited"], favorited)
+            self.assertIs(type(response["article"]["favoritesCount"]), int)
+            self.assertEqual(response["article"]["favoritesCount"], count)
+        status, response = fetch("GET", path + "/comments", token=token)
+        self.assertEqual(status, 200)
+        keys(response, ("comments",))
+        self.assertEqual(response["comments"], [])
+        status, response = fetch("POST", "/api/profiles/" + target + "/follow",
+                                 token=token)
+        self.assertEqual(status, 200)
+        profile(response["profile"], target, None, None, True)
+        comments = []
+        for name, auth, bio, image in ((target, target_token, None, None),
+                                       (username, token, "", special)):
+            status, response = fetch("POST", path + "/comments",
+                {"comment": {"body": name + special}}, auth)
+            self.assertEqual(status, 201)
+            keys(response, ("comment",))
+            comment = response["comment"]
+            keys(comment, ("id", "body", "createdAt", "updatedAt", "author"))
+            self.assertIs(type(comment["id"]), int)
+            self.assertEqual(comment["body"], name + special)
+            profile(comment["author"], name, bio, image, False)
+            comments.append(comment)
+            status, listed = fetch("GET", path + "/comments", token=token)
+            self.assertEqual(status, 200)
+            keys(listed, ("comments",))
+            self.assertEqual([c["id"] for c in listed["comments"]],
+                             [c["id"] for c in reversed(comments)])
+            for c in listed["comments"]:
+                expected = next(x for x in comments if x["id"] == c["id"])
+                self.assertEqual(c["body"], expected["body"])
+                author = expected["author"]
+                profile(c["author"], author["username"], author["bio"],
+                        author["image"], author["username"] == target)
+        for comment, auth in zip(comments, (target_token, token)):
+            deleted(path + "/comments/" + str(comment["id"]), auth)
+        deleted(path, token)
+        for method, url, body, expected, message in (
+                ("GET", "/api/user", None, 401, "unauthorized"),
+                ("GET", "/unknown", None, 404, "not found"),
+                ("POST", "/api/users", {"user": {}}, 422, "invalid request")):
+            status, response = fetch(method, url, body)
+            self.assertEqual(status, expected)
+            keys(response, ("errors",))
+            keys(response["errors"], ("body",))
+            self.assertEqual(response["errors"]["body"], [message])
 
     def test_article_tag_variants(self):
         prefix = "atomic_" + uuid.uuid4().hex
@@ -3160,6 +3485,8 @@ class WorkerCountCLI(unittest.TestCase):
 class DefaultTopology(unittest.TestCase):
     routing_binds = staticmethod(Integration.routing_binds)
     routing_request = Integration.routing_request
+    routing_pool_routes = Integration.routing_pool_routes
+    routing_read_response = Integration.routing_read_response
 
     def test_default_one_scheduler_worker(self):
         self.check_topology([], [95], schedulers=1)
@@ -3266,10 +3593,8 @@ class DefaultTopology(unittest.TestCase):
                                 self, port) for _ in sizes]
                             for connection in connections:
                                 cleanup.callback(connection.close)
-                            routes = [{Integration.routing_tags(
-                                self, connection, proxy)
-                                for _ in range(size * 2)}
-                                for connection, size in zip(connections, sizes)]
+                            routes = self.routing_pool_routes(
+                                database, connections, proxy, sizes)
                             self.assertEqual([len(route) for route in routes],
                                              sizes)
                             self.assertTrue(routes[0].isdisjoint(routes[1]))

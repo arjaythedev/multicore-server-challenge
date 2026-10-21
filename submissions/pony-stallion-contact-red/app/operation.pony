@@ -1,4 +1,3 @@
-use json = "json"
 use pg = "postgres"
 use stallion = "stallion"
 use uri = "uri"
@@ -47,17 +46,14 @@ class _Operation
     else error_reply(500, "database error")
     end
 
-  fun ref reply(status: U16, value: json.JSONValue = None) =>
-    let body: String val = if status == 204 then ""
-      else json.JSONPrinter.print(value)
-      end
-    _outcome = (status, body)
+  fun ref reply(status: U16, body: String = "") =>
+    _outcome = (status, if status == 204 then "" else body end)
 
   fun ref reply_json(status: U16, row: pg.Row) ? =>
     _outcome = (status, row.fields(0)?.value as String)
 
   fun ref error_reply(status: U16, message: String) =>
-    reply(status, _Output.error_value(message))
+    reply(status, _Output.error_body(message))
 
   fun ref outcome(): ((U16, String) | None) => _outcome
 
@@ -155,7 +151,7 @@ class _Operation
         _JWT.issue(_request._6, _Output.id(row)?)?
       else _token
       end
-      reply(status, json.JSONObject.update("user", _Output.user(row, token)?))
+      reply(status, _Output.user_body(row, token)?)
     else error_reply(401, "unauthorized")
     end
 
@@ -213,8 +209,7 @@ class _Operation
       {ref(w': _Operation ref, r: pg.Result) ? =>
         match _Output.first(r)?
         | let row: pg.Row =>
-          w'.reply(200, json.JSONObject.update("profile",
-            _Output.profile(row, 1)?))
+          w'.reply(200, _Output.profile_body(row, 1)?)
         else w'.error_reply(404, "profile not found")
         end
       })
@@ -233,8 +228,7 @@ class _Operation
           end
           w'.query(statement, _P.two(viewer, _Output.id(row)?),
             {ref(w'': _Operation ref, r': pg.Result) ? =>
-              w''.reply(200, json.JSONObject.update("profile",
-                _Output.profile(row, 1, following)?)) })
+              w''.reply(200, _Output.profile_body(row, 1, following)?) })
         else w'.error_reply(404, "profile not found")
         end
       })
@@ -276,8 +270,7 @@ class _Operation
       {ref(w': _Operation ref, r: pg.Result) ? =>
         match _Output.first(r)?
         | let row: pg.Row =>
-          w'.reply(status, json.JSONObject.update("article",
-            _Output.article(row, true)?))
+          w'.reply(status, _Output.article_body(row)?)
         else w'.error_reply(404, "article not found")
         end
       })
@@ -367,11 +360,7 @@ class _Operation
       let id = _Output.id(_Output.first(r)? as pg.Row)?
       w'.query(_CommentsByArticle, _P.two(viewer, id),
         {ref(w'': _Operation ref, r': pg.Result) ? =>
-          var comments' = json.JSONArray
-          for row in _Output.rows(r')?.values() do
-            comments' = comments'.push(_Output.comment(row)?)
-          end
-          w''.reply(200, json.JSONObject.update("comments", comments'))
+          w''.reply(200, _Output.comments_body(_Output.rows(r')?)?)
         })
     })
 
@@ -389,8 +378,8 @@ class _Operation
             _P.three(_Output.id(row, 1)?, viewer,
               row.fields(2)?.value as String),
             {ref(w'': _Operation ref, r': pg.Result) ? =>
-              w''.reply(201, json.JSONObject.update("comment",
-                _Output.comment(_Output.first(r')? as pg.Row, false)?))
+              w''.reply(201,
+                _Output.comment_body(_Output.first(r')? as pg.Row, false)?)
             })
         end
     })

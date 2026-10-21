@@ -254,12 +254,10 @@ class _PoolSlot
   let owner: _Worker ref
   var generation: U64 = 0
   var phase: _SlotPhase = _StoppedSlot
-  embed idle_node: ListNode[USize]
 
   new create(index': USize, owner': _Worker ref) =>
     index = index'
     owner = owner'
-    idle_node = ListNode[USize](index')
 
 class iso _Retry is TimerNotify
   let _worker: _Worker
@@ -288,7 +286,7 @@ actor _Worker is (AsioEventNotify & _PGOwner)
   embed _events: _PGEvents
   embed _slots: Array[_PoolSlot] = Array[_PoolSlot]
   embed _pending: List[_Job] = List[_Job]
-  embed _idle: List[USize] = List[USize]
+  embed _idle: Array[USize]
   embed _recipients: MapIs[_QueryClient, _Recipient] =
     MapIs[_QueryClient, _Recipient]
   var _stopped: Bool = false
@@ -313,6 +311,7 @@ actor _Worker is (AsioEventNotify & _PGOwner)
     _retry_delay = retry_delay
     _csv = csv
     _worker_id = worker_id
+    _idle = Array[USize](pool_size)
     _events = _PGEvents(this)
     ifdef "conduit_diagnostic" then _diag = pg.DiagState(10, 33) end
     for index in Range(0, pool_size) do
@@ -431,7 +430,7 @@ actor _Worker is (AsioEventNotify & _PGOwner)
     end
 
   fun ref available(slot: _PoolSlot ref) =>
-    _idle.append_node(slot.idle_node)
+    _idle.push(slot.index)
     _dispatch()
 
   fun ref _dispatch() =>
@@ -442,9 +441,7 @@ actor _Worker is (AsioEventNotify & _PGOwner)
       budget = budget - 1
       try
         let job = _pending.shift()?
-        let node = _idle.head()?
-        let slot = _slots(node()?)?
-        node.remove()
+        let slot = _slots(_idle.pop()?)?
         job.started = _now()
         _count(1)
         _inflight = _inflight + 1
@@ -559,12 +556,23 @@ actor _Worker is (AsioEventNotify & _PGOwner)
       end
     end
 
+  fun ref _remove_idle(index: USize) =>
+    for (position, candidate) in _idle.pairs() do
+      if candidate == index then
+        try
+          _idle(position)? = _idle(_idle.size() - 1)?
+          _idle.pop()?
+        else _Unreachable() end
+        return
+      end
+    end
+
   fun ref retire(slot: _PoolSlot ref) =>
     let old = slot.phase
     match old.connection()
     | None => return
     end
-    slot.idle_node.remove()
+    _remove_idle(slot.index)
     try slot.generation = slot.generation +? 1
     else _Unreachable() end
     let token = _RetryToken
@@ -593,7 +601,7 @@ actor _Worker is (AsioEventNotify & _PGOwner)
   fun ref stop_slot(slot: _PoolSlot ref) =>
     let old = slot.phase
     slot.phase = _StoppedSlot
-    slot.idle_node.remove()
+    _remove_idle(slot.index)
     _finish_lost(old)
     match old
     | let live: _ConnectingSlot => live.conn.close()
