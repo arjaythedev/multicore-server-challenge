@@ -2321,6 +2321,147 @@ class Integration(unittest.TestCase):
         self.assertEqual(result.returncode, 0, _failure_output(result.stderr))
         self.assertEqual(result.stdout.strip(), "result shapes passed")
 
+    @contextmanager
+    def query_storage_library(self):
+        with tempfile.TemporaryDirectory(
+                prefix="conduit-query-storage-") as temp:
+            library = Path(temp) / "control.so"
+            source = Path(__file__).with_name("query_transport_control.c")
+            subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
+                            "-shared", "-fPIC", "-I/usr/include/postgresql",
+                            str(source), "-o", str(library), "-ldl",
+                            "-pthread"],
+                           check=True, capture_output=True, timeout=30)
+            yield library
+
+    def query_storage_case(self, mode, api, count, library=None,
+                           control="clear", expect_success=True):
+        scenarios = {"send0": 1, "flush-error": 2, "writing": 3,
+                     "replacement": 4, "reject-writing": 5,
+                     "reject-reading": 6, "pending": 7, "root": 8,
+                     "validate": 9, "close-failure": 9, "close-result": 10,
+                     "close-completion": 12}
+        scenario = scenarios.get(mode, 0)
+        expressions = []
+        for p in range(1, count + 1):
+            parameter = f"${p}::text"
+            value = parameter
+            if mode in ("pending", "root") and p == 1:
+                value = f"md5({parameter})"
+            expressions += [value, f"({parameter}) IS NULL",
+                            f"length({parameter})"]
+        marker = "storage_selected" if api == "named" else (
+            "SELECT " + ", ".join(expressions) + " /*storage*/")
+        host = os.environ.get("PGHOST", "127.0.0.1")
+        if host.startswith("/"):
+            host = "127.0.0.1"
+        port = os.environ.get("PGPORT", "5432")
+        env = self.server_env | {
+            "DATABASE_URL": f"postgres://conduit:conduit@{host}:"
+                            f"{port}/{self.database}",
+            "CONDUIT_QUERY_CASE": mode, "CONDUIT_QUERY_API": api,
+            "CONDUIT_QUERY_COUNT": str(count),
+            "CONDUIT_QUERY_SCENARIO": str(scenario),
+            "CONDUIT_QUERY_MARKER": marker,
+            "CONDUIT_QUERY_ROOT_CONTROL": control}
+        env.pop("LD_PRELOAD", None)
+        if library is not None:
+            env["LD_PRELOAD"] = str(library)
+        result = subprocess.run(
+            [str(_executable()), "--test-query-storage", "--ponymaxthreads=1"],
+            env=env, capture_output=True, text=True,
+            timeout=30 if mode == "pending" else 10)
+        if not expect_success:
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("query storage passed", result.stdout)
+            return []
+        self.assertEqual(result.returncode, 0, (mode, api, count,
+                         _failure_output(result.stderr)))
+        lines = result.stdout.splitlines()
+        self.assertEqual(lines[-1], "query storage passed " + mode)
+        ledger = []
+        for index, line in enumerate(lines[:-1]):
+            parts = line.split()
+            self.assertEqual(len(parts), 6)
+            self.assertEqual(parts[0], "ledger")
+            values = list(map(int, parts[1:]))
+            self.assertEqual(values[0], index)
+            self.assertEqual(values[1], 1)
+            self.assertIn(values[2], (1, 2, 3, 4))
+            self.assertIn(values[3], (0, 1))
+            self.assertNotEqual(values[4], -(1 << 63))
+            ledger.append(tuple(values[2:]))
+        self.assertLessEqual(len(ledger), 256)
+        return ledger
+
+    def test_query_storage_native_control(self):
+        self.query_storage_case("send0", "plain", 3, expect_success=False)
+        with self.query_storage_library() as library:
+            for api in ("plain", "named"):
+                for mode in ("boundary", "fresh", "property"):
+                    with self.subTest(api=api, mode=mode):
+                        self.assertEqual(
+                            self.query_storage_case(mode, api, 3), [])
+                for count in (3, 9):
+                    for mode in ("send0", "flush-error", "writing",
+                                 "replacement", "reject-writing",
+                                 "reject-reading", "validate", "close-result",
+                                 "close-failure", "close-completion"):
+                        with self.subTest(api=api, count=count, mode=mode):
+                            ledger = self.query_storage_case(mode, api, count,
+                                                             library)
+                            send = 1 if api == "plain" else 2
+                            if mode in ("validate", "close-failure"):
+                                self.assertEqual(ledger, [])
+                                continue
+                            self.assertEqual(ledger[0],
+                                             (send, int(mode == "send0"),
+                                              int(mode != "send0")))
+                            flushes = ledger[1:]
+                            if mode == "send0":
+                                self.assertEqual(flushes, [])
+                            elif mode == "flush-error":
+                                self.assertEqual(flushes, [(3, 1, -1)])
+                            elif mode in ("writing", "replacement"):
+                                scripted = 2 if mode == "writing" else 1
+                                self.assertEqual(flushes[:scripted],
+                                                 [(3, 1, 1)] * scripted)
+                                self.assertEqual(flushes[-1], (3, 0, 0))
+                                self.assertTrue(all(
+                                    row == (3, 0, 1)
+                                    for row in flushes[scripted:-1]))
+                            elif mode == "reject-writing":
+                                self.assertEqual(flushes, [(3, 1, 1)])
+                            elif mode == "reject-reading":
+                                self.assertEqual(flushes[0], (3, 1, 1))
+                                self.assertEqual(flushes[-1], (3, 0, 0))
+                            else:
+                                self.assertEqual(flushes[-1], (3, 0, 0))
+
+    def test_query_storage_real_pending(self):
+        with self.query_storage_library() as library:
+            for api in ("plain", "named"):
+                for count in (3, 9):
+                    with self.subTest(api=api, count=count):
+                        ledger = self.query_storage_case("pending", api, count,
+                                                         library)
+                        send = 1 if api == "plain" else 2
+                        self.assertEqual(ledger[0][:2], (4, 0))
+                        self.assertEqual(ledger[1], (send, 0, 1))
+                        self.assertIn((3, 0, 1), ledger[2:],
+                                      "actual pending precondition unmet")
+                        self.assertEqual(ledger[-1], (3, 0, 0))
+                        self.assertTrue(all(row in ((3, 0, 1), (3, 0, 0))
+                                            for row in ledger[2:]))
+
+    def test_query_storage_root_release(self):
+        with self.query_storage_library() as library:
+            for control in ("clear", "held", "never"):
+                with self.subTest(control=control):
+                    ledger = self.query_storage_case("root", "plain", 1,
+                                                     library, control)
+                    self.assertEqual(ledger, [(1, 1, 0)])
+
     def scalar_decode_case(self, oid, payload, kind, value="", atomic=None,
                            row=0, column=0):
         host = os.environ.get("PGHOST", "127.0.0.1")

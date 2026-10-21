@@ -93,14 +93,22 @@ class _PGEvents
       end
     end
 
-class _PGCommand
+class _PGCommand is _PGPhase
   let value: (pg.Query | (String, String))
   var seen: Bool = false
   let started: U64
+  var _phase: _PGCommandPhase = _PGWriting
 
   new create(value': (pg.Query | (String, String))) =>
     value = value'
     started = ifdef "conduit_diagnostic" then Time.nanos() else 0 end
+
+  fun code(): U64 => _phase.code()
+  fun active_command(): _PGCommand box => this
+  fun ref event(c: _PGConnection ref, flags: U32) => _phase.event(c, this)
+  fun ref send(c: _PGConnection ref, command: _PGCommand ref) =>
+    c.shutdown()
+  fun ref reading() => _phase = _PGReading
 
 trait ref _PGPhase
   fun code(): U64
@@ -130,23 +138,19 @@ class _PGIdle is _PGPhase
   fun ref send(c: _PGConnection ref, command: _PGCommand ref) =>
     c.send(command)
 
-class _PGWriting is _PGPhase
-  let _command: _PGCommand ref
-  new create(command: _PGCommand ref) => _command = command
-  fun code(): U64 => 3
-  fun active_command(): _PGCommand box => _command
-  fun ref event(c: _PGConnection ref, flags: U32) => c.flush(_command)
-  fun ref send(c: _PGConnection ref, command: _PGCommand ref) =>
-    c.shutdown()
+trait val _PGCommandPhase
+  fun code(): U64
+  fun event(c: _PGConnection ref, command: _PGCommand ref)
 
-class _PGReading is _PGPhase
-  let _command: _PGCommand ref
-  new create(command: _PGCommand ref) => _command = command
+primitive _PGWriting is _PGCommandPhase
+  fun code(): U64 => 3
+  fun event(c: _PGConnection ref, command: _PGCommand ref) =>
+    c.flush(command)
+
+primitive _PGReading is _PGCommandPhase
   fun code(): U64 => 4
-  fun active_command(): _PGCommand box => _command
-  fun ref event(c: _PGConnection ref, flags: U32) => c.read(_command)
-  fun ref send(c: _PGConnection ref, command: _PGCommand ref) =>
-    c.shutdown()
+  fun event(c: _PGConnection ref, command: _PGCommand ref) =>
+    c.read(command)
 
 class _PGClosed is _PGPhase
   fun code(): U64 => 5
@@ -159,6 +163,9 @@ class _PGConnection
   let generation: U64
   let _owner: _PGOwner ref
   let _events: _PGEvents ref
+  embed _idle: _PGIdle = _PGIdle
+  embed _send_strings: Array[String] = Array[String]
+  embed _send_values: Array[Pointer[U8] tag] = Array[Pointer[U8] tag]
   var _phase: _PGPhase = _PGResolving
   var _conn: Pointer[None] tag = Pointer[None]
   var _event: AsioEventID = AsioEvent.none()
@@ -219,7 +226,7 @@ class _PGConnection
         shutdown()
         return
       end
-      _phase = _PGIdle
+      _phase = _idle
       _owner.pg_ready(this)
     else shutdown()
     end
@@ -231,7 +238,7 @@ class _PGConnection
     _phase.send(this, _PGCommand((name, sql)))
 
   fun ref send(command: _PGCommand ref) =>
-    _phase = _PGWriting(command)
+    _phase = command
     _count(0)
     let start' = ifdef "conduit_diagnostic" then Time.nanos() else 0 end
     let sent = match command.value
@@ -275,8 +282,16 @@ class _PGConnection
       | let named: pg.NamedPreparedQuery => named.params
       | let plain: pg.PreparedQuery => plain.params
       end
-    let strings = Array[String](params.size())
-    let values = Array[Pointer[U8] tag](params.size())
+    if params.size() <= 8 then
+      _send_with(query', params, _send_strings, _send_values)
+    else
+      _send_with(query', params, Array[String](params.size()),
+        Array[Pointer[U8] tag](params.size()))
+    end
+
+  fun ref _send_with(query': pg.Query, params: Array[pg.FieldDataTypes] val,
+    strings: Array[String] ref, values: Array[Pointer[U8] tag] ref): I32
+  =>
     for param in params.values() do
       match param
       | None => values.push(Pointer[U8])
@@ -294,7 +309,7 @@ class _PGConnection
       else _Unreachable()
       end
     end
-    match query'
+    let sent = match query'
     | let named: pg.NamedPreparedQuery =>
       @PQsendQueryPrepared(_conn, named.name.cstring(), params.size().i32(),
         values.cpointer(), Pointer[I32], Pointer[I32], 0)
@@ -302,12 +317,16 @@ class _PGConnection
       @PQsendQueryParams(_conn, plain.string.cstring(), params.size().i32(),
         Pointer[U32], values.cpointer(), Pointer[I32], Pointer[I32], 0)
     end
+    // libpq copies parameter data into its output buffer before returning.
+    strings.clear()
+    values.clear()
+    sent
 
   fun ref _local_error() =>
     match _phase.active_command()
     | let command: _PGCommand box => _observe(6, command.started)
     end
-    _phase = _PGIdle
+    _phase = _idle
     _owner.pg_failed(this, pg.DataError)
     _count(1)
     _count(2)
@@ -319,10 +338,9 @@ class _PGConnection
     _observe(1, start')
     match status
     | 0 =>
-      _phase = _PGReading(command)
+      command.reading()
       _arm(false)
     | 1 =>
-      _phase = _PGWriting(command)
       _arm(true)
     else shutdown()
     end
@@ -348,7 +366,7 @@ class _PGConnection
       _observe(4, result_start)
       if raw.is_null() then
         if not command.seen then shutdown(); return end
-        _phase = _PGIdle
+        _phase = _idle
         _count(1)
         _observe(6, command.started)
         _complete()
@@ -451,6 +469,14 @@ class _PGConnection
     match _phase | let _: _PGClosed box => true else false end
 
   fun phase_code(): U64 => _phase.code()
+
+  fun _test_send_storage(): (USize, USize, USize, USize) =>
+    (_send_strings.size(), _send_values.size(),
+      _send_strings.space(), _send_values.space())
+
+  fun _test_command(): (_PGCommand box | None) => _phase.active_command()
+
+  fun _test_writing(): Bool => _writing
 
   fun native_starts(): U64 => _starts
 

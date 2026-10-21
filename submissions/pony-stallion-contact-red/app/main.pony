@@ -25,6 +25,14 @@ actor Main
         if arg == "--self-test" then
           _SelfTest(env)
           return
+        elseif arg == "--test-pending-jobs" then
+          _PendingJobsTest(env)?
+          return
+        elseif arg == "--test-query-storage" then
+          let config = _Config(env.vars)?
+          let options = _StorageOptions(env.vars)?
+          _QueryStorageTest(TCPConnectAuth(env.root), config, env, options)
+          return
         elseif arg == "--test-diag-arithmetic" then
           _DiagArithmeticTest(env)
           return

@@ -42,6 +42,7 @@ class _Job
   let enqueued: U64
   var started: U64 = 0
   var outcome: _JobOutcome = _AwaitingResult
+  var _next: (_Job ref | None) = None
 
   new create(recipient': _Recipient, id': U64, query': pg.Query,
     kind': USize, enqueued': U64)
@@ -51,6 +52,12 @@ class _Job
     query = query'
     kind = kind'
     enqueued = enqueued'
+
+  fun ref _pending_link(next': _Job ref) => _next = next'
+
+  fun ref _pending_take_next(): (_Job ref | None) => _next = None
+
+  fun _pending_next(): (_Job box | None) => _next
 
 trait ref _SlotPhase
   fun connection(): (_PGConnection box | None)
@@ -136,7 +143,7 @@ class _IdleSlot is _LiveSlot
   fun connection(): _PGConnection box => conn
   fun code(): U64 => 2
   fun ref dispatch(slot: _PoolSlot ref, job': _Job ref) =>
-    slot.phase = _BusySlot(conn, job')
+    slot.phase = _BusySlot(this, job')
     conn.execute(job'.query)
 
   fun job(): None => None
@@ -153,11 +160,13 @@ class _IdleSlot is _LiveSlot
     slot.owner.retire(slot)
 
 class _BusySlot is _LiveSlot
+  let idle: _IdleSlot ref
   let conn: _PGConnection ref
   let active: _Job ref
 
-  new create(conn': _PGConnection ref, job': _Job ref) =>
-    conn = conn'
+  new create(idle': _IdleSlot ref, job': _Job ref) =>
+    idle = idle'
+    conn = idle'.conn
     active = job'
 
   fun connection(): _PGConnection box => conn
@@ -195,7 +204,7 @@ class _BusySlot is _LiveSlot
       | let failure: _SQLFailure => failure.code == "26000"
       else false
       end
-    slot.phase = _IdleSlot(conn)
+    slot.phase = idle
     slot.owner.settle(active)
     if missing_statement then slot.owner.retire(slot)
     else slot.owner.available(slot) end
@@ -285,7 +294,7 @@ actor _Worker is (AsioEventNotify & _PGOwner)
   let _retry_delay: U64
   embed _events: _PGEvents
   embed _slots: Array[_PoolSlot] = Array[_PoolSlot]
-  embed _pending: List[_Job] = List[_Job]
+  embed _pending: _PendingJobs = _PendingJobs
   embed _idle: Array[USize]
   embed _recipients: MapIs[_QueryClient, _Recipient] =
     MapIs[_QueryClient, _Recipient]
@@ -682,7 +691,7 @@ actor _Worker is (AsioEventNotify & _PGOwner)
       let pending = _pending.size().u64()
       let peak = _pending_peak
       let inflight = _inflight
-      let oldest = try now - _pending(0)?.enqueued else 0 end
+      let oldest = try now - _pending.front()?.enqueued else 0 end
       let gauges: Array[U64] iso = recover iso Array[U64] end
       gauges.>push(pending).>push(inflight).>push(oldest).>push(peak)
       for value in phases.values() do gauges.push(value) end

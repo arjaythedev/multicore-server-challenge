@@ -15,6 +15,7 @@ class \nodoc\ _SelfTest
       query_params()?
       _OutputTest(env)?
       _PGDecodeTest(env)?
+      _PendingJobsTest(env)?
       passwords()?
       tokens()?
       env.out.print("Self-tests passed: decimal, fields, query, output, "
