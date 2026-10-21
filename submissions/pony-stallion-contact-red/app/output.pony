@@ -19,7 +19,7 @@ primitive _Output
     if rs.size() == 0 then None else rs(0)? end
 
   fun _field(out: String ref, row: pg.Row, i: USize) ? =>
-    match row.fields(i)?.value
+    match row.fields(i)?
     | let s: String => _quoted(out, s)
     | let n: I64 => out.append(n.string())
     | let n: I32 => out.append(n.string())
@@ -46,7 +46,7 @@ primitive _Output
     end
 
   fun id(row: pg.Row, i: USize = 0): I64 ? =>
-    row.fields(i)?.value as I64
+    row.fields(i)? as I64
 
   fun profile_body(row: pg.Row, i: USize,
     following: (Bool | None) = None): String ?

@@ -307,6 +307,8 @@ class ProtocolProxy(socketserver.ThreadingTCPServer):
         self.backends = []
         self.frontends = []
         self.mutate_next_row = False
+        self.scalar_replacement = None
+        self.scalar_receipts = []
         self.drop_next_command_complete = False
         self.command_complete_gate = None
         self.command_complete_held = threading.Event()
@@ -357,6 +359,86 @@ class ProtocolProxy(socketserver.ThreadingTCPServer):
     def corrupt_next_data_row(self):
         with self.lock:
             self.mutate_next_row = True
+
+    def replace_scalar_field(self, connection, row, column, oid, value):
+        with self.lock:
+            if self.scalar_replacement is not None:
+                raise ValueError("scalar replacement already armed")
+            self.scalar_replacement = dict(
+                connection=connection, row=row, column=column, oid=oid,
+                value=value, seen=0, oids=None, preceding=[])
+
+    def replace_scalar_payload(self, kind, connection, payload):
+        with self.lock:
+            change = self.scalar_replacement
+            if change is None or change["connection"] != connection:
+                return payload
+            if kind == b"T":
+                count = int.from_bytes(payload[:2], "big")
+                cursor = 2
+                oids = []
+                for _ in range(count):
+                    cursor = payload.index(b"\0", cursor) + 1
+                    if cursor + 18 > len(payload):
+                        raise ValueError("short row description")
+                    oids.append(int.from_bytes(payload[cursor + 6:cursor + 10],
+                                               "big"))
+                    cursor += 18
+                if cursor != len(payload):
+                    raise ValueError("trailing row description bytes")
+                change["oids"] = oids
+                return payload
+            if kind != b"D":
+                return payload
+            ordinal = change["seen"]
+            change["seen"] += 1
+            count = int.from_bytes(payload[:2], "big")
+            fields = []
+            cursor = 2
+            for _ in range(count):
+                if cursor + 4 > len(payload):
+                    raise ValueError("short field length")
+                length = int.from_bytes(payload[cursor:cursor + 4], "big",
+                                        signed=True)
+                cursor += 4
+                if length == -1:
+                    fields.append(None)
+                elif length < 0 or cursor + length > len(payload):
+                    raise ValueError("invalid field length")
+                else:
+                    fields.append(payload[cursor:cursor + length])
+                    cursor += length
+            if cursor != len(payload):
+                raise ValueError("trailing data row bytes")
+            if ordinal != change["row"]:
+                change["preceding"].append(tuple(fields))
+                return payload
+            column = change["column"]
+            oids = change["oids"]
+            if (oids is None or len(oids) != count or column >= count or
+                    oids[column] != change["oid"]):
+                raise ValueError("scalar replacement target mismatch")
+            replaced = list(fields)
+            replaced[column] = change["value"]
+            parts = [count.to_bytes(2, "big")]
+            for value in replaced:
+                if value is None:
+                    parts.append((-1).to_bytes(4, "big", signed=True))
+                else:
+                    parts.append(len(value).to_bytes(4, "big", signed=True))
+                    parts.append(value)
+            changed = b"".join(parts)
+            self.scalar_receipts.append(dict(
+                connection=connection, row=ordinal, column=column,
+                oid=oids[column], before=tuple(fields), after=tuple(replaced),
+                preceding=tuple(change["preceding"]),
+                old_length=len(payload) + 4, new_length=len(changed) + 4))
+            self.scalar_replacement = None
+            return changed
+
+    def scalar_mutations(self):
+        with self.lock:
+            return list(self.scalar_receipts)
 
     def send_notice(self, frontend=None):
         payload = b"SNOTICE\0Midle notice\0\0"
@@ -446,6 +528,15 @@ class ProtocolConnection(socketserver.BaseRequestHandler):
                         if not 4 <= length <= 1048576:
                             break
                         payload = self.read_exact(backend, length - 4)
+                        try:
+                            payload = self.server.replace_scalar_payload(
+                                kind, index, payload)
+                        except (ValueError, IndexError) as error:
+                            with self.server.lock:
+                                self.server.failures.append(str(error))
+                            raise EOFError from error
+                        length = len(payload) + 4
+                        size = length.to_bytes(4, "big")
                         with self.server.lock:
                             mutate = kind == b"D" and self.server.mutate_next_row
                             if mutate:
@@ -2229,6 +2320,118 @@ class Integration(unittest.TestCase):
                                 text=True, timeout=10)
         self.assertEqual(result.returncode, 0, _failure_output(result.stderr))
         self.assertEqual(result.stdout.strip(), "result shapes passed")
+
+    def scalar_decode_case(self, oid, payload, kind, value="", atomic=None,
+                           row=0, column=0):
+        host = os.environ.get("PGHOST", "127.0.0.1")
+        if host.startswith("/"):
+            host = "127.0.0.1"
+        proxy = ProtocolProxy(host, os.environ.get("PGPORT", "5432"), capacity=2)
+        try:
+            proxy.replace_scalar_field(0, row, column, oid, payload)
+            env = self.server_env | {
+                "DATABASE_URL": "postgres://conduit:conduit@127.0.0.1:"
+                                f"{proxy.server_address[1]}/{self.database}",
+                "CONDUIT_TEST_DECODE_OID": str(oid),
+                "CONDUIT_TEST_DECODE_KIND": kind,
+                "CONDUIT_TEST_DECODE_VALUE": str(value)}
+            flag = "--test-decode-scalar"
+            if atomic is not None:
+                flag = "--test-decode-atomic"
+                env["CONDUIT_TEST_DECODE_ATOMIC_CASE"] = atomic
+            result = subprocess.run(
+                [str(_executable()), flag, "--ponymaxthreads=2"], env=env,
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, _failure_output(result.stderr))
+            self.assertEqual(result.stdout.strip(),
+                             "scalar decoding and recovery passed")
+            proxy.assert_healthy()
+            receipts = proxy.scalar_mutations()
+            self.assertEqual(len(receipts), 1)
+            receipt = receipts[0]
+            self.assertEqual(receipt["connection"], 0)
+            self.assertEqual(receipt["row"], row)
+            self.assertEqual(receipt["column"], column)
+            self.assertEqual(receipt["oid"], oid)
+            before, after = receipt["before"], receipt["after"]
+            self.assertEqual(len(after), len(before))
+            self.assertEqual(after[column], payload)
+            for index, original in enumerate(before):
+                if index != column:
+                    self.assertEqual(after[index], original)
+            for name, fields in (("old_length", before), ("new_length", after)):
+                length = 6 + sum(4 + (len(v) if v is not None else 0)
+                                 for v in fields)
+                self.assertEqual(receipt[name], length)
+            self.assertEqual(len(receipt["preceding"]), row)
+            if atomic is not None:
+                self.assertEqual(before[0], b"first" if row == 0 else b"second")
+                self.assertIsNone(before[1])
+                original = b"11" if oid == 20 else b"2000-01-01 00:00:00"
+                self.assertEqual(before[2], original)
+                if row == 1:
+                    self.assertEqual(receipt["preceding"][0],
+                                     (b"first", None, original))
+        finally:
+            proxy.stop()
+
+    def test_decode_scalar_payload_compatibility(self):
+        for oid in (20, 21, 23):
+            kind = "i64" if oid == 20 else "i32"
+            width = 64 if oid == 20 else 32
+            minimum, maximum = -(1 << (width - 1)), (1 << (width - 1)) - 1
+            cases = [(b"0", 0), (b"-0", 0), (b"1", 1), (b"-1", -1),
+                     (b"00012", 12), (str(minimum).encode(), minimum),
+                     (str(maximum).encode(), maximum), (b"0x7f", 127),
+                     (b"-0b10", -2), (b"1_2", 12), (b"12_", 12),
+                     (b"_12", 12), (b"12\0x", 12), (b"-0b10\0x", -2)]
+            if oid == 20:
+                cases += [(b"2147483648", 2147483648),
+                          (b"-2147483649", -2147483649)]
+            if oid == 21:
+                cases.append((b"32768", 32768))
+            for payload, expected in cases:
+                with self.subTest(oid=oid, payload=payload, expected=expected):
+                    self.scalar_decode_case(oid, payload, kind, expected)
+            invalid = [b"", b"-", b"+1", b" 1", b"1 ", b"12x", b"0x",
+                       b"_", b"\0", str(minimum - 1).encode(),
+                       str(maximum + 1).encode(), b"9223372036854775808",
+                       b"-9223372036854775809"]
+            for payload in invalid:
+                with self.subTest(oid=oid, payload=payload, outcome="DataError"):
+                    self.scalar_decode_case(oid, payload, "error")
+            with self.subTest(oid=oid, payload=None):
+                self.scalar_decode_case(oid, None, "none")
+        for payload, expected in ((b"t", "true"), (b"f", "false"),
+                                  (b"", "false"), (b"true", "false"),
+                                  (b"T", "false"), (b"t\0x", "true")):
+            with self.subTest(oid=16, payload=payload):
+                self.scalar_decode_case(16, payload, "bool", expected)
+        self.scalar_decode_case(16, None, "none")
+        for oid in (1114, 1184):
+            cases = [(b"infinity", (1 << 63) - 1),
+                     (b"-infinity", -(1 << 63)),
+                     (b"infinity\0x", (1 << 63) - 1),
+                     (b"2000-01-01 00:00:00.1", 100000),
+                     (b"2000-01-01 00:00:00.1+00", 100000),
+                     (b"2000-01-01 00:00:00.1+00:00", 100000)]
+            for payload, expected in cases:
+                with self.subTest(oid=oid, payload=payload, expected=expected):
+                    self.scalar_decode_case(oid, payload, "timestamp", expected)
+            for payload in (b"", b"not-a-timestamp", b"infinityx",
+                            b"2000-01-01 00:00:00.1234567"):
+                with self.subTest(oid=oid, payload=payload, outcome="DataError"):
+                    self.scalar_decode_case(oid, payload, "error")
+            self.scalar_decode_case(oid, None, "none")
+
+    def test_decode_scalar_failure_is_atomic(self):
+        for family, oid, payload in (("integer", 20, b"12x"),
+                                     ("timestamp", 1114, b"not-a-timestamp")):
+            for placement, row in (("late-column", 0), ("late-row", 1)):
+                case = family + "-" + placement
+                with self.subTest(case=case):
+                    self.scalar_decode_case(oid, payload, "error", atomic=case,
+                                            row=row, column=2)
 
     def test_deep_rejection_queue_drains(self):
         executable = _executable()

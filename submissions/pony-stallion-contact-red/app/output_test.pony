@@ -340,18 +340,13 @@ class \nodoc\ _OutputTest
     end
 
   fun _row(values: Array[pg.FieldData] val): pg.Row =>
-    let fields: Array[pg.Field] val = recover val
-      let result = Array[pg.Field]
-      for value in values.values() do result.push(pg.Field(value)) end
-      result
-    end
-    pg.Row(fields)
+    pg.Row(values)
 
   fun _replace(row: pg.Row, index: USize, value: pg.FieldData): pg.Row =>
-    let fields: Array[pg.Field] val = recover val
-      let result = Array[pg.Field]
+    let fields: Array[pg.FieldData] val = recover val
+      let result = Array[pg.FieldData]
       for (i, field) in row.fields.pairs() do
-        result.push(if i == index then pg.Field(value) else field end)
+        result.push(if i == index then value else field end)
       end
       result
     end

@@ -12,6 +12,9 @@ use @conduit_pq_start[I32](host: Pointer[U8] tag, port: Pointer[U8] tag,
 use @conduit_pq_take[Pointer[None] tag](socket: I32)
 use @conduit_pq_cancel[None](socket: I32)
 use @conduit_pq_timestamp[I64](value: Pointer[U8] tag)
+use @conduit_pq_i64_decimal[I32](value: Pointer[U8] tag, length: USize,
+  output: Pointer[I64])
+use @strcmp[I32](left: Pointer[U8] tag, right: Pointer[U8] tag)
 use @PQconnectPoll[I32](conn: Pointer[None] tag)
 use @PQstatus[I32](conn: Pointer[None] tag)
 use @PQsocket[I32](conn: Pointer[None] tag)
@@ -38,6 +41,7 @@ use @PQntuples[I32](result: Pointer[None] tag)
 use @PQnfields[I32](result: Pointer[None] tag)
 use @PQftype[U32](result: Pointer[None] tag, column: I32)
 use @PQgetisnull[I32](result: Pointer[None] tag, row: I32, column: I32)
+use @PQgetlength[I32](result: Pointer[None] tag, row: I32, column: I32)
 use @PQgetvalue[Pointer[U8] val](result: Pointer[None] tag,
   row: I32, column: I32)
 use @PQclear[None](result: Pointer[None] tag)
@@ -490,38 +494,59 @@ class _PGConnection
     let rows = recover iso Array[pg.Row] end
     var row: I32 = 0
     while row < @PQntuples(raw) do
-      let fields = recover iso Array[pg.Field] end
+      let fields = recover iso Array[pg.FieldData] end
       var column: I32 = 0
       while column < @PQnfields(raw) do
         let value: pg.FieldData = if @PQgetisnull(raw, row, column) != 0 then
           None
         else
-          let text': String val = _copy(@PQgetvalue(raw, row, column))
+          let ptr = @PQgetvalue(raw, row, column)
           match @PQftype(raw, column)
-          | 16 => text' == "t"
-          | 20 => text'.i64()?
-          | 21 | 23 => text'.i32()?
+          | 16 => @strcmp(ptr, "t".cstring()) == 0
+          | 20 => _integer(ptr, @PQgetlength(raw, row, column))?
+          | 21 | 23 => _integer32(ptr, @PQgetlength(raw, row, column))?
           | 1114 | 1184 =>
-            if text' == "infinity" then
+            if @strcmp(ptr, "infinity".cstring()) == 0 then
               pg.PgTimestamp(I64.max_value())
-            elseif text' == "-infinity" then
+            elseif @strcmp(ptr, "-infinity".cstring()) == 0 then
               pg.PgTimestamp(I64.min_value())
             else
-              let us = @conduit_pq_timestamp(text'.cstring())
+              let us = @conduit_pq_timestamp(ptr)
               if us == I64.min_value() then error end
               pg.PgTimestamp(us)
             end
-          | 1009 => _decode_array(text')?
-          else text'
+          | 1009 => _decode_array(_copy(ptr))?
+          else _copy(ptr)
           end
         end
-        fields.push(pg.Field(value))
+        fields.push(value)
         column = column + 1
       end
       rows.push(pg.Row(consume fields))
       row = row + 1
     end
     consume rows
+
+  fun _integer(ptr: Pointer[U8] val, length: I32): I64 ? =>
+    if length < 0 then error end
+    var value: I64 = 0
+    if @conduit_pq_i64_decimal(ptr, length.usize(), addressof value) == 1 then
+      value
+    else
+      _copy(ptr).i64()?
+    end
+
+  fun _integer32(ptr: Pointer[U8] val, length: I32): I32 ? =>
+    if length < 0 then error end
+    var value: I64 = 0
+    if (@conduit_pq_i64_decimal(ptr, length.usize(), addressof value) == 1)
+      and (value >= I32.min_value().i64())
+      and (value <= I32.max_value().i64())
+    then
+      value.i32()
+    else
+      _copy(ptr).i32()?
+    end
 
   fun _decode_array(value: String): pg.PgArray ? =>
     if (value.size() < 2) or (value(0)? != '{') or

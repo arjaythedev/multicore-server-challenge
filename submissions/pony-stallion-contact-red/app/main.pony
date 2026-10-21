@@ -75,6 +75,14 @@ actor Main
           let config = _Config(env.vars)?
           _ResultShapeTest(TCPConnectAuth(env.root), config, env)
           return
+        elseif (arg == "--test-decode-scalar") or
+          (arg == "--test-decode-atomic") then
+          let config = _Config(env.vars)?
+          let case' = if arg == "--test-decode-scalar" then
+            _ScalarDecodeCase.scalar(env.vars)?
+          else _ScalarDecodeCase.atomic(env.vars)? end
+          _ScalarDecodeTest(TCPConnectAuth(env.root), config, env, case')
+          return
         elseif arg == "--test-worker-data-error" then
           let config = _Config(env.vars)?
           _WorkerDataErrorTest(TCPConnectAuth(env.root), config, env,

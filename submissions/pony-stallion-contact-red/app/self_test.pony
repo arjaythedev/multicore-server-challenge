@@ -14,10 +14,11 @@ class \nodoc\ _SelfTest
       fields()?
       query_params()?
       _OutputTest(env)?
+      _PGDecodeTest(env)?
       passwords()?
       tokens()?
       env.out.print("Self-tests passed: decimal, fields, query, output, "
-        + "bcrypt, JWT")
+        + "database decoding, bcrypt, JWT")
     else
       env.err.print("Self-test failed")
       env.exitcode(1)

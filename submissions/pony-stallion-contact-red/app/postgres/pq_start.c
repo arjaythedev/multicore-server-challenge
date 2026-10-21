@@ -93,6 +93,28 @@ PGconn *conduit_pq_take(int socket) {
 
 void conduit_pq_cancel(int socket) { close(socket); }
 
+int conduit_pq_i64_decimal(const char *text, size_t length, int64_t *output) {
+  if (length == 0) return 0;
+  int negative = text[0] == '-';
+  size_t index = negative ? 1 : 0;
+  if (index == length) return 0;
+  uint64_t limit = (uint64_t)INT64_MAX + negative;
+  uint64_t magnitude = 0;
+  for (; index < length; index++) {
+    unsigned char ch = (unsigned char)text[index];
+    if (ch < '0' || ch > '9') return 0;
+    uint64_t digit = ch - '0';
+    if (magnitude > (limit - digit) / 10) return 0;
+    magnitude = magnitude * 10 + digit;
+  }
+  if (negative && magnitude == (uint64_t)INT64_MAX + 1) {
+    *output = INT64_MIN;
+  } else {
+    *output = negative ? -(int64_t)magnitude : (int64_t)magnitude;
+  }
+  return 1;
+}
+
 int64_t conduit_pq_timestamp(const char *text) {
   int year, month, day, hour, minute, second;
   int count = 0;

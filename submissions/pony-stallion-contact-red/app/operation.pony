@@ -50,7 +50,7 @@ class _Operation
     _outcome = (status, if status == 204 then "" else body end)
 
   fun ref reply_json(status: U16, row: pg.Row) ? =>
-    _outcome = (status, row.fields(0)?.value as String)
+    _outcome = (status, row.fields(0)? as String)
 
   fun ref error_reply(status: U16, message: String) =>
     reply(status, _Output.error_body(message))
@@ -174,7 +174,7 @@ class _Operation
       {ref(w': _Operation ref, r: pg.Result) ? =>
         match _Output.first(r)?
         | let row: pg.Row =>
-          if _Password.verify(password, row.fields(5)?.value as String) then
+          if _Password.verify(password, row.fields(5)? as String) then
             op.user_response(r, true)?
           else w'.error_reply(401, "invalid email or password")
           end
@@ -306,18 +306,18 @@ class _Operation
     query(_ArticleUpdateInput, _P.two(_slug, _request._5),
       {ref(w': _Operation ref, r: pg.Result)(op, viewer) ? =>
         let row = _Output.first(r)? as pg.Row
-        if not (row.fields(0)?.value as Bool) then
+        if not (row.fields(0)? as Bool) then
           w'.error_reply(422, "invalid request")
-        elseif row.fields(1)?.value is None then
+        elseif row.fields(1)? is None then
           w'.error_reply(404, "article not found")
         elseif _Output.id(row, 2)? != viewer then
           w'.error_reply(403, "not the author")
         else
           let id = _Output.id(row, 1)?
           w'.query(_ArticleUpdate, _P.four(id,
-              row.fields(3)?.value as (String | None),
-              row.fields(4)?.value as (String | None),
-              row.fields(5)?.value as (String | None)),
+              row.fields(3)? as (String | None),
+              row.fields(4)? as (String | None),
+              row.fields(5)? as (String | None)),
             {ref(w'': _Operation ref, r': pg.Result) =>
               op.full_article(_ArticleFullById, id) })
         end
@@ -369,14 +369,14 @@ class _Operation
     query(_CommentInput, _P.two(_slug, _request._5),
       {ref(w': _Operation ref, r: pg.Result)(viewer) ? =>
         let row = _Output.first(r)? as pg.Row
-        if not (row.fields(0)?.value as Bool) then
+        if not (row.fields(0)? as Bool) then
           w'.error_reply(422, "invalid request")
-        elseif row.fields(1)?.value is None then
+        elseif row.fields(1)? is None then
           w'.error_reply(404, "article not found")
         else
           w'.query(_CommentInsert,
             _P.three(_Output.id(row, 1)?, viewer,
-              row.fields(2)?.value as String),
+              row.fields(2)? as String),
             {ref(w'': _Operation ref, r': pg.Result) ? =>
               w''.reply(201,
                 _Output.comment_body(_Output.first(r')? as pg.Row, false)?)

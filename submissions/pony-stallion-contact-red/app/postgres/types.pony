@@ -2,7 +2,7 @@ use net = "net"
 
 type FieldData is (String | I64 | I32 | F64 | Bool | None | PgArray |
   PgTimestamp)
-  """Values decoded from PostgreSQL result columns."""
+  """Values decoded from PostgreSQL columns. None denotes SQL NULL."""
 
 type FieldDataTypes is (String | I64 | I32 | None | PgArray)
   """Values accepted as PostgreSQL query parameters."""
@@ -28,19 +28,11 @@ class val PgTimestamp
     """Use PostgreSQL's 2000-01-01 UTC epoch."""
     microseconds = value
 
-class val Field
-  """A decoded column value."""
-  let value: FieldData
-
-  new val create(value': FieldData) =>
-    """Represent SQL NULL with None."""
-    value = value'
-
 class val Row
   """One row of decoded columns."""
-  let fields: Array[Field] val
+  let fields: Array[FieldData] val
 
-  new val create(fields': Array[Field] val) =>
+  new val create(fields': Array[FieldData] val) =>
     """Keep columns in SELECT result order."""
     fields = fields'
 
