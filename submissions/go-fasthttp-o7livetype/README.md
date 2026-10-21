@@ -16,18 +16,19 @@ reconnect with backoff and graceful shutdown. Source is in `src/`.
 
 ## Results
 
-1-minute runs on my machine (not the official box), one session, box configs; everything shares 1 core / 2 GB
-or 8 cores / 16 GB. Users = most passing p95 < 500 ms and p99 < 1 s with zero errors; the rest is at the 8-core
-limit.
+Earlier local 60-second screens, not official five-minute scores. User counts passed p95 < 500 ms,
+p99 < 1 s and zero errors in that block; near-limit repeats vary. App + PG share 1 core / 2 GB or
+8 cores / 16 GB; Nginx uses the same cores with a separate 2 GB cap. Other metrics are at the
+8-core counts; memory is app/Nginx RSS and PG private memory (excludes shared buffers).
 
-| Implementation | Front | 1 core | 8 cores | req/s | p95 | CPU server / PG / Nginx | Memory server / Nginx / PG | |
-|---|---|---|---|---|---|---|---|---|
-| `examples/go` | nginx | 5,000 | 37,500 | 9,525 | 319 ms | 2.3 / 4.1 / 1.4 | 182 MB / 316 MB / 610 MB | |
-| this build | nginx | 10,000 | 67,500 | 17,780 | 49 ms | 2.1 / 3.7 / 2.0 | 142 MB / 318 MB / 159 MB | **<-- This submission** |
-| this build, no Nginx | direct | 13,500 | 100,000 | 25,818 | 318 ms | 3.2 / 4.7 / - | 2.0 GB / - / 159 MB | |
-| `go-epoll-o7livetype` | direct | 18,500 | 135,000 | 33,645 | 386 ms | 1.9 / 6.1 / - | 1.3 GB / - / 159 MB | |
+| Implementation | Front | 1 core | 8 cores | users vs `examples/go` (1 / 8 cores) | req/s | req/s vs `examples/go` | p50 | p95 | p99 | CPU server / PG / Nginx | Memory server / Nginx / PG | |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `examples/go` | nginx | 5,000 | 37,500 | 1.0x / 1.0x | 9,525 | 1.0x | 142 ms | 319 ms | 372 ms | 2.3 / 4.1 / 1.4 | 182 MB / 316 MB / 610 MB |  |
+| this build | nginx | 10,000 | 67,500 | 2.0x / 1.8x | 17,780 | 1.9x | 13 ms | 49 ms | 77 ms | 2.1 / 3.7 / 2.0 | 142 MB / 318 MB / 159 MB | **<-- This submission** |
+| this build, no Nginx | direct | 13,500 | 100,000 | 2.7x / 2.7x | 25,818 | 2.7x | 33 ms | 318 ms | 360 ms | 3.2 / 4.7 / - | 2.0 GB / - / 159 MB |  |
+| `go-epoll-o7livetype` | direct | 18,500 | 135,000 | 3.7x / 3.6x | 33,645 | 3.5x | 231 ms | 386 ms | 452 ms | 1.9 / 6.1 / - | 1.3 GB / - / 159 MB |  |
 
-Past each limit, runs fail on latency, never errors.
+The 135k epoll result did not repeat: old/new builds both missed latency with zero errors.
 
 ## Changes from `examples/go`
 
@@ -41,7 +42,7 @@ Past each limit, runs fail on latency, never errors.
 | JSON written straight from binary rows | No structs or reflection | Mixed: fast, but more code to maintain |
 | Queues sized per connection, 30 s timeout | Overload shows up as latency, not 503s | Good with latency alerts; bad if you prefer failing fast |
 | bcrypt capped at cores/2, stretches after 1 s | Logins can't starve PostgreSQL, but don't time out | Good |
-| Reconnect with exponential backoff (100 ms to 5 s, jitter) | Survives PostgreSQL restarts without errors or double writes | Essential |
+| Reconnect with exponential backoff (100 ms to 5 s, jitter) | Retries reads and unsent writes; never replays uncertain commits | Essential |
 | Input validation (field limits, email shape) | Rejects huge or garbage input before it joins a shared transaction | Essential |
 | JSON logs: errors, slow requests, 30 s stats line | Shows problems without logging every request | Essential |
 | Behind Nginx | TLS, access logs, slow-client buffering | Good for operations; costs about 1 core and a third of capacity |

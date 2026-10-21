@@ -1,5 +1,9 @@
 package main
 
+// server.go is the HTTP side: fasthttp calls handle on the connection's
+// goroutine, which runs the request through its steps (see api.go) and sends
+// the response.
+
 import (
 	"errors"
 	"fmt"
@@ -14,22 +18,21 @@ import (
 
 const bcryptCost = 10
 
-// job is one request's state while its handler goroutine waits for a database
-// worker. Jobs are pooled; their response and parameter buffers are reused.
+// job is one request in flight. Jobs are pooled, so their buffers are reused.
 type job struct {
 	req      request
 	db       dbJob
 	status   int
 	resp     []byte
-	done     chan struct{}
-	enqueued time.Time
+	done     chan struct{} // a database worker signals here when the statement is done
+	enqueued time.Time     // when it joined a database queue
 }
 
 type server struct {
 	d      *dbDispatcher
 	jwt    *jwtCodec
-	bcrypt chan struct{} // bounds concurrent bcrypt work to protect database CPU
-	wait   time.Duration
+	bcrypt chan struct{} // slots bounding concurrent bcrypt work (see acquireBcrypt)
+	wait   time.Duration // BCRYPT_WAIT
 	pool   sync.Pool
 	log    *logConfig
 }
@@ -40,24 +43,32 @@ func newServer(d *dbDispatcher, codec *jwtCodec, bcryptWorkers int, bcryptWait t
 	return s
 }
 
-// handle plans the request on this goroutine (routing, auth, validation and
-// parameter encoding), hands database work to the read or write queue, and
-// writes the JSON the worker produced from the result rows.
+// handle serves one request: copy what it needs from fasthttp, run it, send
+// the response, log it.
 func (s *server) handle(ctx *fasthttp.RequestCtx) {
 	start := time.Now()
 	j := s.pool.Get().(*job)
 	j.db.reset()
 	j.status, j.resp = 0, nil
+
 	auth := ctx.Request.Header.PeekAll(fasthttp.HeaderAuthorization)
-	j.req = request{method: bstr(ctx.Method()), path: bstr(ctx.URI().PathOriginal()), body: ctx.PostBody(), args: ctx.QueryArgs(), authCount: len(auth)}
+	j.req = request{
+		method:    bstr(ctx.Method()),
+		path:      bstr(ctx.URI().PathOriginal()),
+		body:      ctx.PostBody(),
+		args:      ctx.QueryArgs(),
+		authCount: len(auth),
+	}
 	if len(auth) > 0 {
 		j.req.authHeader = auth[0]
 	}
+
 	s.run(j)
+
 	ctx.SetStatusCode(j.status)
 	ctx.SetContentType("application/json")
 	if j.status != fasthttp.StatusNoContent {
-		ctx.SetBody(j.resp) // copies; the job's buffer goes back to the pool
+		ctx.SetBody(j.resp) // copies, so the job's buffer can go back to the pool
 	}
 	elapsed := time.Since(start)
 	stats.observe(j.status, elapsed)
@@ -66,11 +77,14 @@ func (s *server) handle(ctx *fasthttp.RequestCtx) {
 	s.pool.Put(j)
 }
 
+// run takes the request through its steps until the response is ready:
+// plan, then (as plan and finish decide) query, hash or verify.
 func (s *server) run(j *job) {
 	defer func() {
 		if p := recover(); p != nil {
 			stats.panics.Add(1)
-			slog.Error("panic in request handler", "route", j.db.route.String(), "panic", fmt.Sprint(p), "stack", string(debug.Stack()))
+			slog.Error("panic in request handler", "route", j.db.route.String(),
+				"panic", fmt.Sprint(p), "stack", string(debug.Stack()))
 			respond(j, 500, errInternal)
 		}
 	}()
@@ -78,40 +92,53 @@ func (s *server) run(j *job) {
 	for act != actDone {
 		switch act {
 		case actQuery:
-			if !s.d.submit(j) {
-				respond(j, 503, errBusy) // queue full: shed load instead of growing latency
-				return
-			}
-			<-j.done
-			act = j.db.next
+			act = s.query(j)
 		case actHash:
-			release := s.acquireBcrypt()
-			h, err := bcrypt.GenerateFromPassword(sbytes(j.db.str[2]), bcryptCost)
-			release()
-			if errors.Is(err, bcrypt.ErrPasswordTooLong) {
-				respond(j, 422, errPasswordLong)
-				return
-			}
-			if err != nil {
-				slog.Error("bcrypt hash failed", "route", j.db.route.String(), "err", err)
-				respond(j, 500, errInternal)
-				return
-			}
-			j.db.hashLen = copy(j.db.hash[:], h)
-			j.db.stage = 1
-			act = s.plan(j)
+			act = s.hashPassword(j)
 		case actVerify:
-			release := s.acquireBcrypt()
-			err := bcrypt.CompareHashAndPassword(j.db.hash[:j.db.hashLen], sbytes(j.db.str[1]))
-			release()
-			if err != nil && !errors.Is(err, bcrypt.ErrMismatchedHashAndPassword) {
-				// A stored hash this server cannot read: fail closed, but say why.
-				slog.Error("stored password hash is unreadable", "user_id", j.db.userID, "err", err)
-			}
-			completeLogin(s.jwt, j, err == nil)
-			return
+			s.verifyPassword(j)
+			act = actDone
 		}
 	}
+}
+
+// query hands the planned statement to a database worker and waits for it.
+func (s *server) query(j *job) action {
+	if !s.d.submit(j) {
+		return respond(j, 503, errBusy)
+	}
+	<-j.done
+	return j.db.next
+}
+
+// hashPassword hashes a new password (register, update-user), then plans the
+// route again to build its statement.
+func (s *server) hashPassword(j *job) action {
+	release := s.acquireBcrypt()
+	h, err := bcrypt.GenerateFromPassword(sbytes(*j.db.in.password), bcryptCost)
+	release()
+	if errors.Is(err, bcrypt.ErrPasswordTooLong) {
+		return respond(j, 422, errPasswordLong)
+	}
+	if err != nil {
+		slog.Error("bcrypt hash failed", "route", j.db.route.String(), "err", err)
+		return respond(j, 500, errInternal)
+	}
+	j.db.hashLen = copy(j.db.hash[:], h)
+	j.db.hashed = true
+	return s.plan(j)
+}
+
+// verifyPassword checks a login password against the stored hash and responds.
+func (s *server) verifyPassword(j *job) {
+	release := s.acquireBcrypt()
+	err := bcrypt.CompareHashAndPassword(j.db.hash[:j.db.hashLen], sbytes(*j.db.in.password))
+	release()
+	if err != nil && !errors.Is(err, bcrypt.ErrMismatchedHashAndPassword) {
+		// A stored hash this server cannot read: fail closed, but say why.
+		slog.Error("stored password hash is unreadable", "user_id", j.db.userID, "err", err)
+	}
+	completeLogin(s.jwt, j, err == nil)
 }
 
 // acquireBcrypt takes one of the BCRYPT_WORKERS slots. Normally that bounds how
@@ -139,7 +166,7 @@ func (s *server) acquireBcrypt() (release func()) {
 func (s *server) releaseBcrypt() { <-s.bcrypt }
 
 // errorHandler answers requests fasthttp could not parse (malformed HTTP, a
-// body over the size limit). They never reach the handler.
+// body over the size limit). They never reach handle.
 func errorHandler(ctx *fasthttp.RequestCtx, err error) {
 	status := fasthttp.StatusBadRequest
 	if errors.Is(err, fasthttp.ErrBodyTooLarge) {

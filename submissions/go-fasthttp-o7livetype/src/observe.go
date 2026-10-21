@@ -1,5 +1,8 @@
 package main
 
+// observe.go is logging and metrics: log/slog setup, the per-request log
+// policy, process-wide counters and the periodic stats line.
+
 import (
 	"context"
 	"fmt"
@@ -187,7 +190,8 @@ func reportStats(ctx context.Context, every time.Duration, d *dbDispatcher) {
 			"total_group_retries", stats.groupRetries.Load(),
 			"total_bcrypt_overflow", stats.bcryptOverflow.Load(),
 		)
-		last.req, last.c4, last.s5, last.busy, last.slow, last.lat, last.dbe, last.dropped = req, c4, s5, busy, slow, lat, dbe, dropped
+		last.req, last.c4, last.s5, last.busy = req, c4, s5, busy
+		last.slow, last.lat, last.dbe, last.dropped = slow, lat, dbe, dropped
 	}
 }
 
@@ -199,11 +203,14 @@ func logRequest(cfg *logConfig, id uint64, method, path string, rt route, status
 	}
 	switch {
 	case cfg.access:
-		slog.Info("request", "id", id, "method", method, "path", clip(path), "route", rt.String(), "status", status, "duration", d.String())
+		slog.Info("request", "id", id, "method", method, "path", clip(path),
+			"route", rt.String(), "status", status, "duration", d.String())
 	case status >= 500 && warnLog.allow():
-		slog.Warn("server error", "id", id, "method", method, "path", clip(path), "route", rt.String(), "status", status, "duration", d.String())
+		slog.Warn("server error", "id", id, "method", method, "path", clip(path),
+			"route", rt.String(), "status", status, "duration", d.String())
 	case slowReq && warnLog.allow():
-		slog.Warn("slow request", "id", id, "method", method, "path", clip(path), "route", rt.String(), "status", status, "duration", d.String())
+		slog.Warn("slow request", "id", id, "method", method, "path", clip(path),
+			"route", rt.String(), "status", status, "duration", d.String())
 	}
 }
 

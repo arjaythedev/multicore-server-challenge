@@ -1,5 +1,9 @@
 package main
 
+// util.go has the small helpers shared by the request path: the request view of a
+// fasthttp request, zero-copy string/byte conversions, query and path parameter
+// parsing, and reading JSON request bodies.
+
 import (
 	"bytes"
 	"errors"

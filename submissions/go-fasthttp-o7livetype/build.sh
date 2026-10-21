@@ -6,5 +6,5 @@ GO=/usr/local/go/bin/go
 [ -x "$GO" ] || GO=go
 export CGO_ENABLED=0
 mkdir -p bin
-(cd src && "$GO" build -trimpath -buildvcs=false -ldflags="-s -w" -o ../bin/conduit .)
+"$GO" build -trimpath -buildvcs=false -ldflags="-s -w" -o bin/conduit ./src
 echo "built bin/conduit ($("$GO" version | awk '{print $3}'))"
