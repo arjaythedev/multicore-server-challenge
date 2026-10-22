@@ -3,9 +3,29 @@ use stallion = "stallion"
 use uri = "uri"
 use "time"
 
+interface ref _HashNext
+  fun ref apply(operation: _Operation ref, hash: String) ?
+
+interface ref _VerifyNext
+  fun ref apply(operation: _Operation ref, verified: Bool) ?
+
+primitive _HashWaiting
+primitive _VerifyWaiting
+type _PasswordWaitKind is (None | _HashWaiting | _VerifyWaiting)
+
+class _HashWait
+  let next: _HashNext
+  new create(next': _HashNext) => next = next'
+
+class _VerifyWait
+  let next: _VerifyNext
+  new create(next': _VerifyNext) => next = next'
+
 class _Operation
   let _request: _Request
   let _worker: _Worker
+  let _passwords: (_PasswordDispatcher | None)
+  var _password_wait: (None | _HashWait | _VerifyWait) = None
   var _next: (_Next | None) = None
   var _outcome: ((U16, String) | None) = None
   var _viewer: I64 = 0
@@ -14,9 +34,72 @@ class _Operation
   var _name: String = ""
   var _method: String = ""
 
-  new create(request': _Request, worker: _Worker) =>
+  new create(request': _Request, worker: _Worker,
+    passwords: (_PasswordDispatcher | None) = None)
+  =>
     _request = request'
     _worker = worker
+    _passwords = passwords
+
+  fun password_waiting(): _PasswordWaitKind =>
+    match _password_wait
+    | let _: _HashWait box => _HashWaiting
+    | let _: _VerifyWait box => _VerifyWaiting
+    else None
+    end
+
+  fun _test_request(): stallion.Request => _request._4
+
+  fun ref hash_password(password: String, next': _HashNext) ? =>
+    match _passwords
+    | let passwords: _PasswordDispatcher =>
+      _password_wait = _HashWait(next')
+      passwords.submit(_PasswordHashJob(_request._2, _request._3, password))
+    else next'(this, _Password.hash(password)?)?
+    end
+
+  fun ref verify_password(password: String, hash: String,
+    next': _VerifyNext) ?
+  =>
+    match _passwords
+    | let passwords: _PasswordDispatcher =>
+      _password_wait = _VerifyWait(next')
+      passwords.submit(_PasswordVerifyJob(_request._2, _request._3,
+        password, hash))
+    else next'(this, _Password.verify(password, hash))?
+    end
+
+  fun ref hashed(outcome': _HashOutcome) =>
+    match _password_wait
+    | let wait: _HashWait =>
+      _password_wait = None
+      try
+        match outcome'
+        | let hash: String => wait.next(this, hash)?
+        else error_reply(422, "invalid request")
+        end
+      else error_reply(422, "invalid request")
+      end
+    end
+
+  fun ref verified(outcome': _VerifyOutcome) =>
+    match _password_wait
+    | let wait: _VerifyWait =>
+      _password_wait = None
+      try wait.next(this, outcome' is _PasswordVerified)?
+      else error_reply(500, "invalid database result")
+      end
+    end
+
+  fun ref _test_password_continuation_error() =>
+    match _password_wait
+    | let _: _HashWait =>
+      _password_wait = _HashWait(
+        {ref(operation: _Operation ref, hash: String) ? => error })
+    | let _: _VerifyWait =>
+      _password_wait = _VerifyWait(
+        {ref(operation: _Operation ref, verified: Bool) ? => error })
+    end
 
   fun ref query(statement: _RequestStatement, params: Array[_Param] val,
     next': _Next)
@@ -159,11 +242,11 @@ class _Operation
     let obj = _Input.wrapper(_request._5, "user")?
     let username = _Input.required(obj, "username")?
     let email = _Input.required(obj, "email")?
-    let hash' = _Password.hash(_Input.required(obj, "password")?)?
-    let op = this
-    query(_RegisterUser, _P.three(username, email, hash'),
-      {ref(w': _Operation ref, r: pg.Result) ? =>
-        op.user_response(r, true, 201)? })
+    hash_password(_Input.required(obj, "password")?,
+      {ref(op: _Operation ref, hash': String) =>
+        op.query(_RegisterUser, _P.three(username, email, hash'),
+          {ref(w': _Operation ref, r: pg.Result) ? =>
+            w'.user_response(r, true, 201)? }) })?
 
   fun ref login() ? =>
     let obj = _Input.wrapper(_request._5, "user")?
@@ -174,10 +257,11 @@ class _Operation
       {ref(w': _Operation ref, r: pg.Result) ? =>
         match _Output.first(r)?
         | let row: pg.Row =>
-          if _Password.verify(password, row.fields(5)? as String) then
-            op.user_response(r, true)?
-          else w'.error_reply(401, "invalid email or password")
-          end
+          op.verify_password(password, row.fields(5)? as String,
+            {ref(w'': _Operation ref, verified': Bool) ? =>
+              if verified' then w''.user_response(r, true)?
+              else w''.error_reply(401, "invalid email or password") end
+            })?
         else w'.error_reply(401, "invalid email or password")
         end
       })
@@ -192,17 +276,23 @@ class _Operation
     let obj = _Input.wrapper(_request._5, "user")?
     let email = _Input.optional(obj, "email")?
     let username = _Input.optional(obj, "username")?
-    let hash': (String | None) = match _Input.optional(obj, "password")?
-      | let password: String => _Password.hash(password)?
-      else None
-      end
+    let password = _Input.optional(obj, "password")?
     let bio = _Input.optional(obj, "bio", false)?
     let image = _Input.optional(obj, "image", false)?
-    let op = this
-    query(_UpdateUser,
-      _P.six(_viewer, email, username, hash', bio, image),
+    match password
+    | let text: String =>
+      hash_password(text, {ref(op: _Operation ref, hash': String) =>
+        op.update_user_query(email, username, hash', bio, image) })?
+    else update_user_query(email, username, None, bio, image)
+    end
+
+  fun ref update_user_query(email: (String | None),
+    username: (String | None), hash': (String | None),
+    bio: (String | None), image: (String | None))
+  =>
+    query(_UpdateUser, _P.six(_viewer, email, username, hash', bio, image),
       {ref(w': _Operation ref, r: pg.Result) ? =>
-        op.user_response(r, false)? })
+        w'.user_response(r, false)? })
 
   fun ref profile() =>
     query(_Profile, _P.two(_viewer, _name),

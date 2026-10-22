@@ -795,6 +795,20 @@ int _crypt_output_magic(const char *setting, char *output, int size)
 	return 0;
 }
 
+static int BF_key_self_test(void)
+{
+#ifdef CONDUIT_PASSWORD_TEST
+	conduit_test_key_enter();
+#endif
+	const char *k = "\xff\xa3" "34" "\xff\xff\xff\xa3" "345";
+	BF_key ae, ai, ye, yi;
+	BF_set_key(k, strlen(k), ae, ai, 2);
+	BF_set_key(k, strlen(k), ye, yi, 4);
+	ai[0] ^= 0x10000;
+	return ai[0] == 0xdb9c59bc && ye[17] == 0x33343500 &&
+	    !memcmp(ae, ye, sizeof(ae)) && !memcmp(ai, yi, sizeof(ai));
+}
+
 /*
  * Please preserve the runtime self-test.  It serves two purposes at once:
  *
@@ -860,16 +874,7 @@ char *_crypt_blowfish_len_rn(const char *key, size_t keylen,
 	    !memcmp(p, buf.s, 7 + 22) &&
 	    !memcmp(p + (7 + 22), test_hash, 31 + 1 + 1 + 1));
 
-	{
-		const char *k = "\xff\xa3" "34" "\xff\xff\xff\xa3" "345";
-		BF_key ae, ai, ye, yi;
-		BF_set_key(k, strlen(k), ae, ai, 2); /* $2a$ */
-		BF_set_key(k, strlen(k), ye, yi, 4); /* $2y$ */
-		ai[0] ^= 0x10000; /* undo the safety (for comparison) */
-		ok = ok && ai[0] == 0xdb9c59bc && ye[17] == 0x33343500 &&
-		    !memcmp(ae, ye, sizeof(ae)) &&
-		    !memcmp(ai, yi, sizeof(ai));
-	}
+	ok = ok && BF_key_self_test();
 
 	__set_errno(save_errno);
 	if (ok)
@@ -914,3 +919,5 @@ char *_crypt_gensalt_blowfish_rn(const char *prefix, unsigned long count,
 
 	return output;
 }
+
+#include "bcrypt_batch.h"

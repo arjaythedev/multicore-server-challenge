@@ -308,10 +308,12 @@ actor _Worker is (AsioEventNotify & _PGOwner)
   let _worker_id: USize
   var _csv_timer: (Timer tag | None) = None
   var _sampling: Bool = false
+  let _password_observer: (_PasswordApplicationObserver | None)
 
   new create(auth: TCPConnectAuth, config: _Config, timers: Timers,
     err: OutStream, pool_size: USize, retry_delay: U64 = 1_000_000_000,
-    csv: (_WorkerCSV | None) = None, worker_id: USize = 0)
+    csv: (_WorkerCSV | None) = None, worker_id: USize = 0,
+    password_observer: (_PasswordApplicationObserver | None) = None)
   =>
     _auth = auth
     _config = config
@@ -320,6 +322,7 @@ actor _Worker is (AsioEventNotify & _PGOwner)
     _retry_delay = retry_delay
     _csv = csv
     _worker_id = worker_id
+    _password_observer = password_observer
     _idle = Array[USize](pool_size)
     _events = _PGEvents(this)
     ifdef "conduit_diagnostic" then _diag = pg.DiagState(10, 33) end
@@ -498,6 +501,10 @@ actor _Worker is (AsioEventNotify & _PGOwner)
   fun ref _enqueue(client: _QueryClient, id: U64, query': pg.Query,
     kind: USize, now: U64)
   =>
+    match _password_observer
+    | let observer: _PasswordApplicationObserver =>
+      observer.application_sql(client, id, kind)
+    end
     let recipient = try _recipients(client)?
       else
         let fresh = _Recipient(client)
@@ -515,10 +522,20 @@ actor _Worker is (AsioEventNotify & _PGOwner)
     client.db_failed(id, _DataFailure)
 
   be cancel(client: _QueryClient) =>
+    match _password_observer
+    | let observer: _PasswordApplicationObserver =>
+      observer.application_cancel(client)
+    end
     try
       (_, let recipient) = _recipients.remove(client)?
       recipient.client = None
       _count(6)
+    end
+
+  be _password_fence(client: _QueryClient, request: U64) =>
+    match _password_observer
+    | let observer: _PasswordApplicationObserver =>
+      observer.application_fence(client, request)
     end
 
   be barrier(probe: _WorkerBarrier) =>

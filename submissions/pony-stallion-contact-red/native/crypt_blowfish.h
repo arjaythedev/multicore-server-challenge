@@ -26,6 +26,10 @@ extern char *_crypt_blowfish_len_rn(const char *key, size_t keylen,
 	const char *setting, char *output, int size);
 extern int _crypt_blowfish_decode(const char *input,
 	unsigned char *output, int size);
+extern int _crypt_blowfish_batch_selftest(void);
+extern int _crypt_blowfish_batch_rn(const char *const *keys,
+	const size_t *lengths, const char *const *settings,
+	char (*outputs)[61], size_t count);
 extern char *_crypt_gensalt_blowfish_rn(const char *prefix,
 	unsigned long count,
 	const char *input, int size, char *output, int output_size);

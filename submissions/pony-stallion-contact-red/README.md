@@ -18,6 +18,23 @@ The binary's `--db-worker-count` option defaults the number of detected CPUs to 
 
 Production always uses 95 database connections, distributed as evenly as possible across those workers: for example - For 8 cores, you get seven pools of 12 and one of 11.
 
+### Experimental password batching
+
+`BCRYPT_MODE` defaults to `batch`, which sends password work to compute actors and interleaves two to four eligible jobs with cost 10 inside one native call. `scalar` uses the same actor pipeline with the existing scalar implementation. `inline` performs bcrypt in the connection actor. A lone job runs immediately through the scalar implementation; there is no timer or wait to fill a batch. Login still fetches the stored hash before verification. JWT validation does not use bcrypt.
+
+`BCRYPT_WORKERS` defaults to the smaller of `3` and the scheduler count and must be a decimal integer from `1` through the smaller of `8` and the scheduler count. The value is validated in every mode. Each compute actor handles one native call at a time, including scalar fallbacks for other supported costs. These calls occupy Pony scheduler threads; no scheduler is reserved for HTTP or database work.
+
+To run on eight CPUs, with the existing database and JWT environment configured:
+
+```sh
+taskset -c 0-7 env BCRYPT_MODE=batch BCRYPT_WORKERS=3 \
+  ./bin/conduit --ponymaxthreads=8
+```
+
+The command above uses eight database workers sharing 95 connections. In asynchronous modes, a connection defers later application work while a password operation is pending, preserving the order in which pipelined requests submit their first SQL query. Accepted application events run before logical close and recipient cancellation. Database callbacks arriving after physical close are dropped, so dependent query chains may end there.
+
+Pending password jobs, deferred requests and queued database results are unbounded; requests retain their full bodies until settlement or logical close. A selected scalar fallback can delay the other jobs in its call. Batching can increase individual request latency, and native CPU measurements do not establish a server throughput improvement.
+
 ## How we use multiple cores
 
 ### The Language (Provided for your ease)
