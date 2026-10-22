@@ -8,7 +8,7 @@ type _RequestStatement is (
   _ArticleUpdate |
   _ArticleDelete |
   _ArticleIdBySlug | _FavoriteInsert | _FavoriteDelete |
-  _CommentsByArticle | _CommentInput | _CommentInsert |
+  _CommentsBySlug | _CommentInput | _CommentInsert |
   _CommentOwner | _CommentDelete)
 
 type _Statement is (_RequestStatement | _Rollback)
@@ -37,7 +37,7 @@ primitive _ArticleDelete
 primitive _ArticleIdBySlug
 primitive _FavoriteInsert
 primitive _FavoriteDelete
-primitive _CommentsByArticle
+primitive _CommentsBySlug
 primitive _CommentInput
 primitive _CommentInsert
 primitive _CommentOwner
@@ -71,7 +71,7 @@ primitive _Catalog
     | _ArticleIdBySlug => 21
     | _FavoriteInsert => 22
     | _FavoriteDelete => 23
-    | _CommentsByArticle => 24
+    | _CommentsBySlug => 24
     | _CommentInput => 25
     | _CommentInsert => 26
     | _CommentOwner => 27
@@ -92,7 +92,7 @@ primitive _Catalog
         .>push(_ArticleUpdateInput).>push(_ArticleUpdate)
         .>push(_ArticleDelete)
         .>push(_ArticleIdBySlug).>push(_FavoriteInsert)
-        .>push(_FavoriteDelete).>push(_CommentsByArticle)
+        .>push(_FavoriteDelete).>push(_CommentsBySlug)
         .>push(_CommentInput).>push(_CommentInsert).>push(_CommentOwner)
         .>push(_CommentDelete).>push(_Rollback)
     end
@@ -123,7 +123,7 @@ primitive _Catalog
     | _ArticleIdBySlug => "article_id_by_slug"
     | _FavoriteInsert => "favorite_insert"
     | _FavoriteDelete => "favorite_delete"
-    | _CommentsByArticle => "comments_by_article"
+    | _CommentsBySlug => "comments_by_slug"
     | _CommentInput => "comment_input"
     | _CommentInsert => "comment_insert"
     | _CommentOwner => "comment_owner"
@@ -230,7 +230,7 @@ primitive _Catalog
         + "ON CONFLICT DO NOTHING"
     | _FavoriteDelete =>
       "DELETE FROM favorites WHERE user_id = $1 AND article_id = $2"
-    | _CommentsByArticle => _SQL.comments()
+    | _CommentsBySlug => _SQL.comments()
     | _CommentInput => _SQL.comment_input()
     | _CommentInsert => _SQL.insert_comment()
     | _CommentOwner =>

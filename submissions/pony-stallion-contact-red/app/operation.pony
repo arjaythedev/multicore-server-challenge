@@ -355,14 +355,18 @@ class _Operation
     })
 
   fun ref comments() =>
-    let viewer = _viewer
-    with_article({ref(w': _Operation ref, r: pg.Result) ? =>
-      let id = _Output.id(_Output.first(r)? as pg.Row)?
-      w'.query(_CommentsByArticle, _P.two(viewer, id),
-        {ref(w'': _Operation ref, r': pg.Result) ? =>
-          w''.reply(200, _Output.comments_body(_Output.rows(r')?)?)
-        })
-    })
+    query(_CommentsBySlug, _P.two(_viewer, _slug),
+      {ref(w': _Operation ref, r: pg.Result) ? =>
+        let rows = _Output.rows(r)?
+        if rows.size() == 0 then
+          w'.error_reply(404, "article not found")
+        else
+          let comments: pg.Rows = if rows(0)?.fields(0)? is None then
+            recover val Array[pg.Row] end
+          else rows end
+          w'.reply(200, _Output.comments_body(comments)?)
+        end
+      })
 
   fun ref create_comment() =>
     let viewer = _viewer

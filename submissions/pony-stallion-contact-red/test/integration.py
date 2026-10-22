@@ -3349,6 +3349,110 @@ class Integration(unittest.TestCase):
         self.assertEqual(fetched["article"]["updatedAt"],
                          "2000-01-01T00:00:00.987Z")
 
+    def test_comments_states_use_one_statement(self):
+        slug = "comments_states_" + uuid.uuid4().hex
+        author = self.author()
+        article = self.db("WITH inserted AS (INSERT INTO articles "
+            "(slug, author_id, title, description, body) VALUES "
+            f"('{slug}', {author}, 'comments', 'd', 'b') RETURNING id) "
+            "SELECT id FROM inserted")
+        with self.routing_server(1) as run:
+            port, proxy, _, _ = run
+            connection = self.routing_connect(port)
+            try:
+                for token in (None, self.token(author)):
+                    status, body, changes = self.routing_request(
+                        connection, proxy, path="/api/articles/" + slug
+                        + "_missing/comments", token=token)
+                    self.assertEqual(status, 404)
+                    self.assertEqual(body["errors"]["body"],
+                                     ["article not found"])
+                    self.assertEqual(sum(map(len, changes.values())), 1)
+                    status, body, changes = self.routing_request(
+                        connection, proxy, path="/api/articles/" + slug
+                        + "/comments", token=token)
+                    self.assertEqual(status, 200)
+                    self.assertEqual(body["comments"], [])
+                    self.assertEqual(sum(map(len, changes.values())), 1)
+                comment = int(self.db("WITH inserted AS (INSERT INTO comments "
+                    "(article_id, author_id, body) VALUES "
+                    f"({article}, {author}, 'one') RETURNING id) "
+                    "SELECT id FROM inserted"))
+                for token in (None, self.token(author)):
+                    status, body, changes = self.routing_request(
+                        connection, proxy, path="/api/articles/" + slug
+                        + "/comments", token=token)
+                    self.assertEqual(status, 200)
+                    self.assertEqual([c["id"] for c in body["comments"]],
+                                     [comment])
+                    self.assertEqual(sum(map(len, changes.values())), 1)
+                proxy.assert_healthy()
+            finally:
+                connection.close()
+
+    def test_comments_newest_hundred(self):
+        suffix = uuid.uuid4().hex
+        names = [f"comments_{suffix}_{index}" for index in range(3)]
+        users = [int(self.db("WITH inserted AS (INSERT INTO users "
+            "(username, email, password_hash) VALUES "
+            f"('{name}', '{name}@example.invalid', 'unused') RETURNING id) "
+            "SELECT id FROM inserted"))
+            for name in names]
+        slug = "comments_order_" + suffix
+        articles = [int(self.db("WITH inserted AS (INSERT INTO articles "
+            "(slug, author_id, title, description, body) VALUES "
+            f"('{name}', {users[0]}, 'comments', 'd', 'b') RETURNING id) "
+            "SELECT id FROM inserted"))
+            for name in (slug, slug + "_decoy")]
+        self.db("INSERT INTO follows (follower_id, followee_id) "
+                f"VALUES ({users[2]}, {users[0]})")
+        records = json.loads(self.db("WITH inserted AS (INSERT INTO comments "
+            "(article_id, author_id, body, created_at, updated_at) SELECT "
+            f"{articles[0]}, CASE WHEN n % 2 = 0 THEN {users[0]} "
+            f"ELSE {users[1]} END, 'comment_' || n, "
+            "CASE WHEN n = 0 THEN '2026-01-02 00:00:00.123456+00'::timestamptz "
+            "ELSE '2026-01-01 00:00:00+00'::timestamptz END, "
+            "'2026-01-03 00:00:00.987654+00'::timestamptz "
+            "FROM generate_series(0, 101) n ORDER BY n "
+            "RETURNING id, author_id, body) SELECT json_agg("
+            "json_build_object('id', id, 'author_id', author_id, "
+            "'body', body)) "
+            "FROM inserted"))
+        self.db("INSERT INTO comments "
+            "(article_id, author_id, body, created_at) VALUES "
+            f"({articles[1]}, {users[0]}, 'decoy', "
+            "'2026-01-04 00:00:00+00')")
+        expected = sorted(records,
+            key=lambda row: (row["body"] == "comment_0", row["id"]),
+            reverse=True)[:100]
+        with self.routing_server(1) as run:
+            port, proxy, _, _ = run
+            connection = self.routing_connect(port)
+            try:
+                for token in (None, self.token(users[2])):
+                    status, body, changes = self.routing_request(
+                        connection, proxy, path="/api/articles/" + slug
+                        + "/comments", token=token)
+                    self.assertEqual(status, 200)
+                    comments = body["comments"]
+                    self.assertEqual(len(comments), 100)
+                    self.assertEqual([c["id"] for c in comments],
+                                     [row["id"] for row in expected])
+                    for comment, row in zip(comments, expected):
+                        self.assertIs(comment["author"]["following"],
+                            token is not None and row["author_id"] == users[0])
+                    self.assertEqual(comments[0]["body"], "comment_0")
+                    self.assertEqual(comments[0]["createdAt"],
+                                     "2026-01-02T00:00:00.123Z")
+                    self.assertEqual(comments[0]["updatedAt"],
+                                     "2026-01-03T00:00:00.987Z")
+                    self.assertEqual(comments[0]["author"]["username"],
+                                     names[0])
+                    self.assertEqual(sum(map(len, changes.values())), 1)
+                proxy.assert_healthy()
+            finally:
+                connection.close()
+
     def test_sql_json_list_and_tags(self):
         suffix = uuid.uuid4().hex
         title = "json_雪_\\\"_" + suffix

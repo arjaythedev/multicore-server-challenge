@@ -158,8 +158,12 @@ primitive _SQL
       u.username, u.bio, u.image,
       EXISTS(SELECT 1 FROM follows fo
         WHERE fo.follower_id = $1 AND fo.followee_id = c.author_id)
-    FROM comments c JOIN users u ON u.id = c.author_id
-    WHERE c.article_id = $2 ORDER BY c.created_at DESC, c.id DESC LIMIT 100
+    FROM articles a
+    LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at,
+      c.author_id FROM comments c WHERE c.article_id = a.id
+      ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true
+    LEFT JOIN users u ON u.id = c.author_id
+    WHERE a.slug = $2 ORDER BY c.created_at DESC, c.id DESC
     """
 
   fun insert_comment(): String =>
