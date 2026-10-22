@@ -18,4 +18,4 @@ if [ "${MIMALLOC:-1}" = 1 ] && [ -n "$MI_PATH" ]; then
   echo "start.sh: preloading mimalloc ($LD_PRELOAD)" >&2
 fi
 
-exec ./bin/conduit-vibed
+exec ./bin/server
