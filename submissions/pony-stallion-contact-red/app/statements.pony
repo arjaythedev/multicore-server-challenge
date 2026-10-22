@@ -171,7 +171,7 @@ primitive _Catalog
     | _FollowDelete =>
       "DELETE FROM follows WHERE follower_id = $1 AND followee_id = $2"
     | _ArticlePageAll =>
-      _SQL.article_list(_SQL.article(false) + _SQL.order_page(),
+      _SQL.article_list(_SQL.article_page(),
         "SELECT count(*) AS total FROM " +
         "(SELECT 1 FROM articles a LIMIT 1000) s")
     | _ArticlePageFeed =>
@@ -198,9 +198,8 @@ primitive _Catalog
         LIMIT 1000) s
       """)
     | _ArticlePageAuthor =>
-      _SQL.article_list(_SQL.article(false) + " WHERE a.author_id = "
-        + "(SELECT au.id FROM users au WHERE au.username = $4)"
-        + _SQL.order_page(),
+      _SQL.article_list(_SQL.article_page("WHERE a.author_id = " +
+        "(SELECT au.id FROM users au WHERE au.username = $4)"),
         "SELECT count(*) AS total FROM (SELECT 1 FROM articles a " +
         "WHERE a.author_id = " +
         "(SELECT u.id FROM users u WHERE u.username = $4) " +
