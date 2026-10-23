@@ -2,7 +2,7 @@
  * Checks the lane-interleaved bcrypt against the reference ts_bcrypt on random inputs and times both.
  *   cc -O3 -o /tmp/test_lanes native/test_lanes.c native/blowfish.c && /tmp/test_lanes
  */
-#define _POSIX_C_SOURCE 199309L
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

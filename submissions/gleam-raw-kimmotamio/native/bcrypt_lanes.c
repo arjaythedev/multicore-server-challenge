@@ -142,7 +142,7 @@ static int parse_salt(const char *salt, lane_salt *out) {
  * when every lane succeeded; a lane that fails leaves outs[i][0] == 0.
  */
 int bcrypt_lanes(int n, const char **keys, const char **salts, char **outs) {
-    static blf_ctx state[LANES];
+    blf_ctx state[LANES];
     lane_salt ls[LANES];
     const u_int8_t *keyp[LANES], *saltp[LANES];
     u_int16_t keylen[LANES], saltlen[LANES];
