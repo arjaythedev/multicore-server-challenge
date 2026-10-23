@@ -1,3 +1,4 @@
+import conduit/bcrypt
 import conduit/jsonw
 import conduit/jwt
 import conduit/pg/proto
@@ -72,4 +73,17 @@ pub fn proto_test() {
   assert proto.col_text_array(Some(<<0:size(32), 0:size(32), 25:size(32)>>)) == []
   assert proto.text_array_param(["a\"b", "c\\d"]) == Some(<<"{\"a\\\"b\",\"c\\\\d\"}":utf8>>)
   assert proto.array_literal([Some(<<"1":utf8>>), None]) == Some(<<"{\"1\",NULL}":utf8>>)
+}
+
+pub fn bcrypt_test() {
+  bcrypt.start(20)
+  let assert Ok(hash) = bcrypt.hash(<<"conformance-pass-1":utf8>>)
+  assert bit_array.byte_size(hash) == 60
+  assert bcrypt.verify(<<"conformance-pass-1":utf8>>, hash)
+  assert !bcrypt.verify(<<"wrong":utf8>>, hash)
+  // A seeded user's hash ("password123").
+  let seeded = <<"$2a$10$ZSfEoPvlcsj2XfvsSeK25em4NZ9Jm7ntGqXuLgQfHEeZPYB8899wq":utf8>>
+  assert bcrypt.verify(<<"password123":utf8>>, seeded)
+  assert !bcrypt.verify(<<"password124":utf8>>, seeded)
+  assert !bcrypt.verify(<<"x":utf8>>, <<"not-a-hash":utf8>>)
 }

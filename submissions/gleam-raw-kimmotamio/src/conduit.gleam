@@ -1,6 +1,7 @@
 //// Entry point: reads the runtime contract from the environment, opens the Postgres connections, starts the
 //// HTTP acceptors and then sleeps forever.
 
+import conduit/bcrypt
 import conduit/handler.{Ctx}
 import conduit/http
 import conduit/pg/conn.{type Config, Config}
@@ -61,6 +62,7 @@ pub fn main() {
   let write_conns = env_int("DB_WRITE_CONNS", 8)
   let acceptors = env_int("ACCEPTORS", 16)
   let hibernate_words = env_int("HIB_WORDS", 2048)
+  let bcrypt_window = env_int("BCRYPT_BATCH_MS", 120)
   case database_url == "" || secret == "" {
     True -> {
       log("DATABASE_URL and JWT_SECRET are required")
@@ -76,6 +78,7 @@ pub fn main() {
     False -> Nil
   }
   let config = parse_database_url(database_url)
+  bcrypt.start(bcrypt_window)
 
   let register = process.new_subject()
   list.each(list.repeat(Nil, read_conns + write_conns), fn(_) { conn.start(config, register) })

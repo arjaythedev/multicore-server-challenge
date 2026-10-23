@@ -6,7 +6,7 @@
          listen/2, accept/1, connect/3, recv/1, recv_passive/2, send/2, close/1, parse_request/1,
          hibernate_http/3, heap_words/0, mailbox_len/0, safe/1, log/1,
          pool_init/2, pick_read/0, pick_write/0, sleep/1, stat_add/2, stats/0,
-         json_string/1, split_segments/1, split_target/1]).
+         json_string/1, split_segments/1, split_target/1, bcrypt_init/1, bcrypt_collector/0]).
 
 %% ---------------------------------------------------------------- misc
 
@@ -236,6 +236,11 @@ pick(Key, Ix) ->
     C = persistent_term:get({?MODULE, counters}),
     N = atomics:add_get(C, Ix, 1),
     element((N rem tuple_size(T)) + 1, T).
+
+%% ---------------------------------------------------------------- bcrypt collector registry
+
+bcrypt_init(Subject) -> persistent_term:put({?MODULE, bcrypt}, Subject), nil.
+bcrypt_collector() -> persistent_term:get({?MODULE, bcrypt}).
 
 %% ---------------------------------------------------------------- counters (optional STATS=1 logging)
 

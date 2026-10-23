@@ -11,7 +11,7 @@ case "$(uname -s)" in
   *) LDFLAGS_EXTRA="" ;;
 esac
 "$CC" -O3 -fPIC -shared -std=c99 -Wall -I"$ERTS_INCLUDE" $LDFLAGS_EXTRA \
-  -o priv/bcrypt_nif.so native/bcrypt_nif.c native/bcrypt.c native/blowfish.c
+  -o priv/bcrypt_nif.so native/bcrypt_nif.c native/bcrypt_lanes.c native/blowfish.c
 gleam deps download
 gleam build --target erlang
 gleam export erlang-shipment

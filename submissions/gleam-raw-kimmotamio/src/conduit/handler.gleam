@@ -163,7 +163,7 @@ fn register(r: Req) -> Result(Response, Response) {
   use email <- result.try(nonempty(c.email, msg))
   use password <- result.try(nonempty(c.password, msg))
   use password <- result.try(password_ok(password))
-  let hash = bcrypt.hash(util.to_bits(password))
+  use hash <- result.try(hash_password(password))
   use rows <- result.try(write(sql.user_insert, [
     proto.text_param(username),
     proto.text_param(email),
@@ -245,7 +245,8 @@ fn update_user(r: Req) -> Result(Response, Response) {
     None -> Ok(None)
     Some(p) -> {
       use p <- result.try(password_ok(p))
-      Ok(Some(bcrypt.hash(util.to_bits(p))))
+      use h <- result.try(hash_password(p))
+      Ok(Some(h))
     }
   })
   use rows <- result.try(write(sql.user_update, [
@@ -660,6 +661,13 @@ fn opt_clean(s: Option(String), msg: String) -> Result(Option(String), Response)
         False -> Error(fail(422, msg))
       }
     None -> Ok(None)
+  }
+}
+
+fn hash_password(p: String) -> Result(BitArray, Response) {
+  case bcrypt.hash(util.to_bits(p)) {
+    Ok(h) -> Ok(h)
+    Error(_) -> Error(fail(503, "password hashing unavailable"))
   }
 }
 
