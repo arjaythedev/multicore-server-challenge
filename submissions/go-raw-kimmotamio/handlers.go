@@ -8,7 +8,13 @@ import (
 	"errors"
 	"net"
 	"strings"
+	"unicode/utf8"
 )
+
+// validText reports whether s can be a Postgres text value (UTF-8 without NUL).
+func validText(s string) bool {
+	return utf8.ValidString(s) && strings.IndexByte(s, 0) < 0
+}
 
 type app struct {
 	db  *db
@@ -59,6 +65,9 @@ func (a *app) handle(c net.Conn, cs *connState, r *request) bool {
 			break
 		}
 		name = unescape(name)
+		if !validText(name) {
+			break
+		}
 		if rest == "" && r.method == "GET" {
 			return a.profile(c, cs, r, name)
 		}
@@ -85,6 +94,9 @@ func (a *app) handle(c net.Conn, cs *connState, r *request) bool {
 			return a.feed(c, cs, r)
 		}
 		slug = unescape(slug)
+		if !validText(slug) {
+			break
+		}
 		if rest == "" {
 			switch r.method {
 			case "GET":
@@ -122,6 +134,9 @@ func (a *app) handle(c net.Conn, cs *connState, r *request) bool {
 				return a.deleteComment(c, cs, r, slug, id)
 			}
 		}
+	}
+	if r.method == "HEAD" {
+		r.close = true // the 404 carries a body
 	}
 	return a.errResp(c, r, 404, "not found")
 }
@@ -337,7 +352,7 @@ func optString(m map[string]json.RawMessage, k string, nonEmpty bool) (*string, 
 		return nil, nil
 	}
 	var s string
-	if err := json.Unmarshal(raw, &s); err != nil {
+	if err := json.Unmarshal(raw, &s); err != nil || !validText(s) {
 		return nil, errBadBody
 	}
 	if nonEmpty && s == "" {
@@ -530,6 +545,10 @@ func (a *app) listArticles(c net.Conn, cs *connState, r *request) bool {
 	} else if v, _ := queryParam(r.query, "favorited"); v != "" {
 		q.kind, q.s = kListFav, v
 	}
+	if !validText(q.s) {
+		putBuf(q.buf)
+		return a.errResp(c, r, 422, "invalid filter")
+	}
 	a.read(q)
 	return a.finishReq(c, r, q, 200)
 }
@@ -585,7 +604,7 @@ func (a *app) createArticle(c net.Conn, cs *connState, r *request) bool {
 		}
 		for _, it := range items {
 			var s string
-			if isNull(it) || json.Unmarshal(it, &s) != nil || s == "" {
+			if isNull(it) || json.Unmarshal(it, &s) != nil || s == "" || !validText(s) {
 				return a.errResp(c, r, 422, "tagList must be an array of non-empty strings")
 			}
 			tagList = append(tagList, s)

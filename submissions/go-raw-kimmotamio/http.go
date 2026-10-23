@@ -93,15 +93,15 @@ func (s *server) handleConn(c net.Conn) {
 			copy(nb, buf[:used])
 			buf = nb
 		}
+		if used == 0 && len(buf) > readBufSize {
+			buf = make([]byte, readBufSize) // drop a buffer grown for a large body
+		}
 		n, err := c.Read(buf[used:])
 		if n > 0 {
 			used += n
 		}
 		if err != nil {
 			return
-		}
-		if used == 0 && len(buf) > readBufSize {
-			buf = make([]byte, readBufSize)
 		}
 	}
 }
@@ -111,18 +111,24 @@ var errBadRequest = errors.New("bad request")
 // parseRequest parses one request from b. It returns the number of bytes consumed and ok=true when
 // a complete request (headers and body) is present. The request's slices alias b.
 func parseRequest(b []byte, r *request) (int, bool, error) {
-	end := bytes.Index(b, []byte("\r\n\r\n"))
+	// Empty lines before the request line are ignored (RFC 9112 2.2).
+	skip := 0
+	for skip < len(b) && (b[skip] == '\r' || b[skip] == '\n') {
+		skip++
+	}
+	end := bytes.Index(b[skip:], []byte("\r\n\r\n"))
 	if end < 0 {
 		if len(b) > 64<<10 {
 			return 0, false, errBadRequest
 		}
 		return 0, false, nil
 	}
+	b = b[skip:]
 	head := b[:end]
 	// Request line.
 	nl := bytes.IndexByte(head, '\n')
 	if nl < 0 {
-		nl = len(head)
+		nl = len(head) // no headers at all
 	}
 	line := head[:nl]
 	if n := len(line); n > 0 && line[n-1] == '\r' {
@@ -152,7 +158,10 @@ func parseRequest(b []byte, r *request) (int, bool, error) {
 	}
 	// Headers.
 	contentLength := 0
-	rest := head[nl+1:]
+	var rest []byte
+	if nl < len(head) {
+		rest = head[nl+1:]
+	}
 	for len(rest) > 0 {
 		nl = bytes.IndexByte(rest, '\n')
 		var hl []byte
@@ -174,6 +183,9 @@ func parseRequest(b []byte, r *request) (int, bool, error) {
 		case 13:
 			if bytes.EqualFold(name, []byte("Authorization")) {
 				r.auth = val
+				if r.auth == nil {
+					r.auth = []byte{} // present but empty: invalid, not absent
+				}
 			}
 		case 14:
 			if bytes.EqualFold(name, []byte("Content-Length")) {
@@ -202,7 +214,7 @@ func parseRequest(b []byte, r *request) (int, bool, error) {
 		return 0, false, nil
 	}
 	r.body = b[end+4 : total]
-	return total, true, nil
+	return skip + total, true, nil
 }
 
 // Cached Date header, refreshed once a second.

@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"hash"
+	"math"
 	"strconv"
 	"sync"
 	"time"
@@ -257,7 +258,11 @@ func parseUint(s string) (int64, bool) {
 		if s[i] < '0' || s[i] > '9' {
 			return 0, false
 		}
-		n = n*10 + int64(s[i]-'0')
+		d := int64(s[i] - '0')
+		if n > (math.MaxInt64-d)/10 {
+			return 0, false // overflow
+		}
+		n = n*10 + d
 	}
 	return n, true
 }

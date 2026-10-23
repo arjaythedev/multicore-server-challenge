@@ -11,6 +11,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
+	"sync/atomic"
 	"time"
 )
 
@@ -179,51 +180,80 @@ func bcryptLanes(jobs []*bcryptJob) {
 	}
 }
 
-// bcryptPool runs hashes on a few worker goroutines, each collecting up to four jobs of the same
-// cost for a short while so they can share one interleaved run.
+// bcryptPool runs hashes on a few worker goroutines. One collector goroutine groups queued jobs of
+// the same cost into batches of up to `lanes` (waiting at most `wait` after the first job of a
+// batch, longer only while every worker is busy) so that each batch is one interleaved run.
 type bcryptPool struct {
-	queue chan *bcryptJob
-	lanes int
-	wait  time.Duration
+	queue   chan *bcryptJob
+	batches chan []*bcryptJob
+	lanes   int
+	wait    time.Duration
+	runs    atomic.Int64 // interleaved runs started (for tests)
 }
 
 func newBcryptPool(workers, lanes int, wait time.Duration) *bcryptPool {
-	p := &bcryptPool{queue: make(chan *bcryptJob, 4096), lanes: lanes, wait: wait}
+	p := &bcryptPool{queue: make(chan *bcryptJob, 4096), batches: make(chan []*bcryptJob), lanes: lanes, wait: wait}
 	for i := 0; i < workers; i++ {
 		go p.worker()
 	}
+	go p.collector()
 	return p
 }
 
 func (p *bcryptPool) worker() {
-	var jobs []*bcryptJob
-	var pending *bcryptJob
-	for {
-		jobs = jobs[:0]
-		if pending != nil {
-			jobs = append(jobs, pending)
-			pending = nil
-		} else {
-			jobs = append(jobs, <-p.queue)
-		}
-		deadline := time.NewTimer(p.wait)
-	collect:
-		for len(jobs) < p.lanes {
-			select {
-			case j := <-p.queue:
-				if j.cost != jobs[0].cost {
-					pending = j
-					break collect
-				}
-				jobs = append(jobs, j)
-			case <-deadline.C:
-				break collect
-			}
-		}
-		deadline.Stop()
+	for jobs := range p.batches {
+		p.runs.Add(1)
 		bcryptLanes(jobs)
 		for _, j := range jobs {
 			j.done <- struct{}{}
+		}
+	}
+}
+
+func (p *bcryptPool) collector() {
+	var pending *bcryptJob
+	timer := time.NewTimer(time.Hour)
+	for {
+		jobs := make([]*bcryptJob, 0, p.lanes)
+		if pending != nil {
+			jobs, pending = append(jobs, pending), nil
+		} else {
+			jobs = append(jobs, <-p.queue)
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(p.wait)
+		expired := false
+		for jobs != nil && len(jobs) < p.lanes {
+			var j *bcryptJob
+			if expired {
+				// Hand the batch to the first free worker; keep collecting until one is.
+				select {
+				case p.batches <- jobs:
+					jobs = nil
+					continue
+				case j = <-p.queue:
+				}
+			} else {
+				select {
+				case j = <-p.queue:
+				case <-timer.C:
+					expired = true
+					continue
+				}
+			}
+			if j.cost != jobs[0].cost {
+				pending = j
+				break
+			}
+			jobs = append(jobs, j)
+		}
+		if jobs != nil {
+			p.batches <- jobs
 		}
 	}
 }
@@ -232,6 +262,33 @@ func (p *bcryptPool) run(j *bcryptJob) {
 	j.done = make(chan struct{}, 1)
 	p.queue <- j
 	<-j.done
+}
+
+// calibrateLanes times 1..4 interleaved lanes at a low cost and returns the lane count with the
+// lowest time per hash (register pressure decides whether 4 lanes beat 2 on a given CPU).
+func calibrateLanes() int {
+	const cost = 7
+	best, bestPer := 1, time.Duration(0)
+	pw := []byte("calibration")
+	for lanes := 1; lanes <= 4; lanes++ {
+		jobs := make([]*bcryptJob, lanes)
+		for i := range jobs {
+			jobs[i] = &bcryptJob{password: pw, cost: cost}
+			jobs[i].salt[0] = byte(i)
+		}
+		var per time.Duration
+		for rep := 0; rep < 3; rep++ {
+			t := time.Now()
+			bcryptLanes(jobs)
+			if d := time.Since(t) / time.Duration(lanes); rep == 0 || d < per {
+				per = d
+			}
+		}
+		if lanes == 1 || per < bestPer {
+			best, bestPer = lanes, per
+		}
+	}
+	return best
 }
 
 // hash returns a new "$2a$<cost>$..." hash of password with a fresh random salt.

@@ -92,3 +92,25 @@ func BenchmarkXCrypto(b *testing.B) {
 	}
 	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/1e6, "ms/hash")
 }
+
+// TestPoolBatches checks that jobs arriving together share one interleaved run.
+func TestPoolBatches(t *testing.T) {
+	pool := newBcryptPool(2, 4, 30*time.Millisecond)
+	h, err := pool.hash([]byte("pw"), 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.runs.Store(0)
+	done := make(chan bool, 4)
+	for i := 0; i < 4; i++ {
+		go func() { done <- pool.verify(h, []byte("pw")) }()
+	}
+	for i := 0; i < 4; i++ {
+		if !<-done {
+			t.Fatal("verify failed")
+		}
+	}
+	if n := pool.runs.Load(); n != 1 {
+		t.Fatalf("4 concurrent jobs took %d runs, want 1", n)
+	}
+}

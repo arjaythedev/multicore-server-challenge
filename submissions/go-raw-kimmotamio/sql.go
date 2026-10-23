@@ -24,8 +24,9 @@ func articleCols(a, v string, body bool) string {
 
 // listSQL builds a batched list statement from a capped-count expression and a page-of-ids source,
 // both of which may refer to r.v, r.s, r.lim and r.off. The count sits behind OFFSET 0 so the planner
-// cannot pull it up and evaluate it once per article row. Every request yields at least one row (the count),
-// with NULL article columns when the page is empty.
+// cannot pull it up and evaluate it once per article row; a count that uses no request parameter
+// becomes an InitPlan, evaluated once per statement. Every request yields at least one row (the
+// count), with NULL article columns when the page is empty.
 func listSQL(withStr bool, countSrc, pageSrc, following string) string {
 	params := `unnest($1::int4[], $2::int8[], $3::int8[], $4::int8[]) AS r(i, v, lim, off)`
 	if withStr {
@@ -71,7 +72,9 @@ const slugify = `trim(both '-' from lower(regexp_replace($2, '[^A-Za-z0-9]+', '-
 
 var readSpecs = [nReadKinds]kindSpec{
 	kTags: {
-		sql: `SELECT r.i, (SELECT array_agg(t.name ORDER BY t.name) FROM tags t WHERE r.i >= 0)
+		// The tag list depends on no request parameter, so Postgres evaluates it once per statement
+		// (an InitPlan) for the requests in it.
+		sql: `SELECT r.i, (SELECT array_agg(t.name ORDER BY t.name) FROM tags t)
  FROM unnest($1::int4[]) AS r(i)`,
 		row: func(r *dbReq, v [][]byte) {
 			b := *r.buf
@@ -173,8 +176,9 @@ var readSpecs = [nReadKinds]kindSpec{
 		},
 	},
 	kListAll: {
+		// The global count depends on no request parameter: one evaluation per statement.
 		sql: listSQL(false,
-			cappedCountBig(`SELECT 1 FROM articles a WHERE r.i >= 0`),
+			cappedCountBig(`SELECT 1 FROM articles a`),
 			`SELECT a.id FROM articles a ORDER BY a.id DESC LIMIT r.lim OFFSET r.off`, ""),
 		params: []paramKind{pViewer, pLim, pOff},
 		row:    rowList, finish: finishList,

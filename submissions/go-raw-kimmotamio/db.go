@@ -6,7 +6,9 @@ package main
 // waiting while a read connection is busy are sent together as ONE statement: the per-request query
 // becomes the inner side of a LATERAL join over unnest() of the waiting requests' parameters, and
 // every row comes back tagged with its request's ordinal. Each request's rows are still produced by
-// its own execution of its own query, inside the request; nothing is cached or shared between requests.
+// its own execution of its own query, inside the request. A subquery that depends on no request
+// parameter (the tag list, the global article count) is evaluated once per statement for the requests
+// in it, as Postgres does for any uncorrelated subquery. Nothing is kept after the statement.
 //
 // Writes: requests queued while a write connection is busy go out as one extended-protocol batch with
 // a single Sync, i.e. one implicit transaction and one WAL flush (group commit). Every response waits
@@ -19,6 +21,7 @@ import (
 	"log"
 	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -71,7 +74,7 @@ const (
 // dbReq is one request's trip through the database layer.
 type dbReq struct {
 	kind kind
-	seq  uint64
+	t    time.Time // enqueue time
 
 	// Read parameters.
 	viewer   int64
@@ -125,68 +128,97 @@ var binResult = []int16{1}
 
 // ---------- read scheduling ----------
 
+// readSched queues read requests by kind. A free connection takes a batch of one kind when that
+// kind has maxBatch waiting requests or its oldest request has waited for the batching window
+// (a few milliseconds that let requests arriving together share one statement); it prefers
+// the kind whose oldest request has waited longest. A kind may hold at most maxKind connections.
 type readSched struct {
 	mu       sync.Mutex
-	cond     *sync.Cond
 	q        [nReadKinds][]*dbReq
 	inflight [nReadKinds]int
 	pending  int
-	seq      uint64
 	maxBatch int
 	maxKind  int
+	window   time.Duration
+	wake     chan struct{}
 }
 
-func newReadSched(maxBatch, maxKind int) *readSched {
-	s := &readSched{maxBatch: maxBatch, maxKind: maxKind}
-	s.cond = sync.NewCond(&s.mu)
-	return s
+func newReadSched(maxBatch, maxKind int, window time.Duration) *readSched {
+	return &readSched{maxBatch: maxBatch, maxKind: maxKind, window: window, wake: make(chan struct{}, 1)}
+}
+
+func (s *readSched) notify() {
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
 }
 
 func (s *readSched) submit(r *dbReq) {
+	r.t = time.Now()
 	s.mu.Lock()
-	s.seq++
-	r.seq = s.seq
-	s.q[r.kind] = append(s.q[r.kind], r)
+	q := append(s.q[r.kind], r)
+	s.q[r.kind] = q
 	s.pending++
 	s.mu.Unlock()
-	s.cond.Signal()
+	// A new deadline or a full batch: one sleeping worker re-evaluates.
+	if len(q) == 1 || len(q) >= s.maxBatch {
+		s.notify()
+	}
 }
 
-// next blocks until some kind has waiting requests and a free slot, then takes up to maxBatch of
-// the kind whose oldest request has waited longest.
-func (s *readSched) next(batch []*dbReq) (kind, []*dbReq) {
-	s.mu.Lock()
+// next blocks until a batch is due, then returns it. timer is the caller's reusable timer.
+func (s *readSched) next(batch []*dbReq, timer *time.Timer) (kind, []*dbReq) {
 	for {
-		best := -1
-		var bestSeq uint64
+		s.mu.Lock()
+		now := time.Now()
+		best, earliest := -1, time.Duration(-1)
+		var bestT0 time.Time
 		if s.pending > 0 {
 			for k := 0; k < int(nReadKinds); k++ {
-				if len(s.q[k]) == 0 || s.inflight[k] >= s.maxKind {
+				q := s.q[k]
+				if len(q) == 0 || s.inflight[k] >= s.maxKind {
 					continue
 				}
-				if best < 0 || s.q[k][0].seq < bestSeq {
-					best, bestSeq = k, s.q[k][0].seq
+				waited := now.Sub(q[0].t)
+				if len(q) >= s.maxBatch || waited >= s.window {
+					if best < 0 || q[0].t.Before(bestT0) {
+						best, bestT0 = k, q[0].t
+					}
+				} else if d := s.window - waited; earliest < 0 || d < earliest {
+					earliest = d
 				}
 			}
 		}
 		if best >= 0 {
 			q := s.q[best]
-			n := len(q)
-			if n > s.maxBatch {
-				n = s.maxBatch
-			}
+			n := min(len(q), s.maxBatch)
 			batch = append(batch, q[:n]...)
 			copy(q, q[n:])
-			for i := len(q) - n; i < len(q); i++ {
-				q[i] = nil
-			}
+			clear(q[len(q)-n:])
 			s.q[best] = q[:len(q)-n]
 			s.pending -= n
 			s.inflight[best]++
+			more := s.pending > 0
 			s.mu.Unlock()
+			if more {
+				s.notify()
+			}
 			return kind(best), batch
 		}
-		s.cond.Wait()
+		s.mu.Unlock()
+		if earliest < 0 {
+			<-s.wake
+			continue
+		}
+		timer.Reset(earliest)
+		select {
+		case <-s.wake:
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-timer.C:
+		}
 	}
 }
 
@@ -196,53 +228,76 @@ func (s *readSched) release(k kind) {
 	wake := s.pending > 0
 	s.mu.Unlock()
 	if wake {
-		s.cond.Signal()
+		s.notify()
 	}
 }
 
 // ---------- write scheduling ----------
 
+// writeSched is one queue: a free write connection takes everything waiting (up to maxBatch) once
+// the oldest request has waited for the window, or at once when the queue is full.
 type writeSched struct {
 	mu       sync.Mutex
-	cond     *sync.Cond
 	q        []*dbReq
 	maxBatch int
+	window   time.Duration
+	wake     chan struct{}
 }
 
-func newWriteSched(maxBatch int) *writeSched {
-	s := &writeSched{maxBatch: maxBatch}
-	s.cond = sync.NewCond(&s.mu)
-	return s
+func newWriteSched(maxBatch int, window time.Duration) *writeSched {
+	return &writeSched{maxBatch: maxBatch, window: window, wake: make(chan struct{}, 1)}
+}
+
+func (s *writeSched) notify() {
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
 }
 
 func (s *writeSched) submit(r *dbReq) {
+	r.t = time.Now()
 	s.mu.Lock()
 	s.q = append(s.q, r)
+	n := len(s.q)
 	s.mu.Unlock()
-	s.cond.Signal()
+	if n == 1 || n >= s.maxBatch {
+		s.notify()
+	}
 }
 
-func (s *writeSched) next(batch []*dbReq) []*dbReq {
-	s.mu.Lock()
-	for len(s.q) == 0 {
-		s.cond.Wait()
+func (s *writeSched) next(batch []*dbReq, timer *time.Timer) []*dbReq {
+	for {
+		s.mu.Lock()
+		if n := len(s.q); n > 0 {
+			waited := time.Since(s.q[0].t)
+			if n >= s.maxBatch || waited >= s.window {
+				n = min(n, s.maxBatch)
+				batch = append(batch, s.q[:n]...)
+				copy(s.q, s.q[n:])
+				clear(s.q[len(s.q)-n:])
+				s.q = s.q[:len(s.q)-n]
+				more := len(s.q) > 0
+				s.mu.Unlock()
+				if more {
+					s.notify()
+				}
+				return batch
+			}
+			s.mu.Unlock()
+			timer.Reset(s.window - waited)
+			select {
+			case <-s.wake:
+				if !timer.Stop() {
+					<-timer.C
+				}
+			case <-timer.C:
+			}
+			continue
+		}
+		s.mu.Unlock()
+		<-s.wake
 	}
-	n := len(s.q)
-	if n > s.maxBatch {
-		n = s.maxBatch
-	}
-	batch = append(batch, s.q[:n]...)
-	copy(s.q, s.q[n:])
-	for i := len(s.q) - n; i < len(s.q); i++ {
-		s.q[i] = nil
-	}
-	s.q = s.q[:len(s.q)-n]
-	more := len(s.q) > 0
-	s.mu.Unlock()
-	if more {
-		s.cond.Signal()
-	}
-	return batch
 }
 
 // ---------- connections ----------
@@ -290,9 +345,14 @@ func connectRetry(url string) *pgconn.PgConn {
 	}
 }
 
+// isConnError reports whether err means the connection is unusable: anything that is not a Postgres
+// error, or a FATAL one (pgconn closes the connection on those).
 func isConnError(err error) bool {
 	var pgErr *pgconn.PgError
-	return err != nil && !errors.As(err, &pgErr)
+	if err == nil {
+		return false
+	}
+	return !errors.As(err, &pgErr) || pgErr.Severity == "FATAL"
 }
 
 // readWorker owns one connection prepared with the batched read statements.
@@ -353,17 +413,24 @@ func (w *readWorker) reconnect() {
 
 func (w *readWorker) run() {
 	w.reconnect()
+	timer := time.NewTimer(time.Hour)
+	timer.Stop()
 	for {
-		k, batch := w.db.reads.next(w.batch[:0])
+		k, batch := w.db.reads.next(w.batch[:0], timer)
 		w.batch = batch
 		w.exec(k, batch)
 		w.db.reads.release(k)
 	}
 }
 
+// Batch statistics (reported on PPROF_ADDR/debug/batches).
+var statBatches, statRequests [nReadKinds]atomic.Int64
+
 func (w *readWorker) exec(k kind, batch []*dbReq) {
 	spec := &readSpecs[k]
 	n := len(batch)
+	statBatches[k].Add(1)
+	statRequests[k].Add(int64(n))
 	w.idx = w.idx[:0]
 	for i := range batch {
 		w.idx = append(w.idx, int32(i))
@@ -417,6 +484,15 @@ func (w *readWorker) exec(k kind, batch []*dbReq) {
 	}
 	_, err := rr.Close()
 	if err != nil {
+		if !isConnError(err) && n > 1 {
+			// One request's parameters made the statement fail (an invalid offset, bytes that are
+			// not UTF-8, ...): run each request alone so only that one fails.
+			for _, r := range batch {
+				r.reset()
+				w.exec(k, []*dbReq{r})
+			}
+			return
+		}
 		log.Printf("read batch (kind %d, %d reqs): %v", k, n, err)
 		for _, r := range batch {
 			r.reset()
@@ -477,8 +553,10 @@ func (w *writeWorker) reconnect() {
 
 func (w *writeWorker) run() {
 	w.reconnect()
+	timer := time.NewTimer(time.Hour)
+	timer.Stop()
 	for {
-		w.batch = w.db.writes.next(w.batch[:0])
+		w.batch = w.db.writes.next(w.batch[:0], timer)
 		w.exec(w.batch)
 	}
 }
