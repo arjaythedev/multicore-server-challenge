@@ -5,6 +5,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 export PATH="/usr/local/otp/bin:$PATH"
+# One socket per connection: use the file-descriptor limit the service gets (LimitNOFILE=200000 on the box).
+ulimit -n 200000 2>/dev/null || ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 cores=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 sched=$(( (cores * 5 + 4) / 8 )); (( sched >= 2 )) || sched=2
 dirty=$(( cores / 4 )); (( dirty >= 2 )) || dirty=2
