@@ -1,0 +1,15 @@
+# This file is machine-generated - editing it directly is not advised
+
+julia_version = "1.13.2"
+manifest_format = "2.1"
+project_hash = "39fefeb12df7e4b32e849b664f1647fafc8e40ea"
+
+[[deps.Conduit]]
+deps = ["Sockets"]
+path = "."
+uuid = "5d3a2c1e-8f4b-4e7a-9c1d-2b6e0f3a7c91"
+version = "0.1.0"
+
+[[deps.Sockets]]
+uuid = "6462fe0b-24de-5631-8697-dd941f90decc"
+version = "1.11.0"
