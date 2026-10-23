@@ -14,7 +14,7 @@ process per Postgres connection, bcrypt as a dirty-CPU NIF.
 | Erlang/OTP | 28.5.0.8 (hex.pm's official Ubuntu 24.04 build, sha256-pinned in `install.sh`; amd64 and arm64) |
 | Gleam | 1.19.2 (official release tarball, sha256-pinned) |
 | gleam_stdlib / gleam_erlang / gleam_json | 1.0.5 / 1.3.0 / 3.1.0 (pinned in `manifest.toml`; gleam_json is used for request bodies only) |
-| bcrypt | the OpenBSD `bcrypt.c`/`blowfish.c` as packaged by erlang-bcrypt, vendored in `native/` with its licence, wrapped by a 60-line NIF (`native/bcrypt_nif.c`) built by `build.sh`; cost 10 |
+| bcrypt | the OpenBSD `bcrypt.c`/`blowfish.c` as packaged by erlang-bcrypt, vendored in `native/` with its licence, plus a lane-interleaved variant (`native/bcrypt_lanes.c`) and a small NIF (`native/bcrypt_nif.c`), all built by `build.sh`; cost 10 |
 
 `build.sh` compiles the NIF with the system C compiler, downloads the three pinned Gleam packages and runs
 `gleam export erlang-shipment`. `start.sh` runs `erl` on the shipment in the foreground.
@@ -63,9 +63,21 @@ process per Postgres connection, bcrypt as a dirty-CPU NIF.
   (any other header is decoded and must say HS256); the flat `{"sub","iat","exp"}` payload is scanned with
   bit-array patterns, anything else goes through the JSON parser so both agree. `exp` (and `nbf` if present) are
   checked on every request. Nothing is remembered between requests.
-- **bcrypt** runs on dirty CPU schedulers (`+SDcpu`, cores/4, at least 2), which also bounds how many hashes run
-  at once; a login verifies the first 72 bytes of the password against the stored hash, registration and
-  password changes reject longer passwords with 422.
+- **bcrypt, four at a time.** A Blowfish round is a chain of dependent S-box loads, so one hash leaves much of
+  a core idle. A collector process gathers the hash jobs that arrive within `BCRYPT_BATCH_MS` (120 ms, or
+  sooner when four are waiting) and hands them to one dirty-CPU NIF call that computes them in lockstep,
+  round by round (`native/bcrypt_lanes.c`): every lane runs the full cost-10 schedule and produces the
+  reference output (checked against the OpenBSD routine on random inputs and the seed's hashes,
+  `native/test_lanes.c`), only the instruction interleaving differs. On an M-series core a batch of four
+  takes 48 ms against 44 ms for a single reference hash, so hashing throughput is about 3.5× higher and the
+  login tail grows by the collection window. Lanes whose salts disagree on the cost fall back to one-by-one.
+  A login verifies the first 72 bytes of the password against the stored hash; registration and password
+  changes reject longer passwords with 422.
+- **Overload behaviour.** A handler waits at most 10 s for its database result and answers 503 after that;
+  the request carries that deadline, and a connection process that reaches a queued request past its deadline
+  drops it (503) instead of running it for a client that has already given up, so a backlog clears instead
+  of feeding on itself. Reads waiting on a connection that turns out to be dead are retried on the reopened
+  one; writes are not (their commit state would be unknown).
 - **VM flags** (`start.sh`, sized from `nproc`): normal schedulers on ~5/8 of the cores (`+S 5:5` on 8), because
   Postgres needs about as much CPU per request as the BEAM does; `+sbwt none` and friends so idle schedulers sleep
   instead of spinning on cores Postgres needs; `+P 2000000 +Q 1000000` for one process and one port per
@@ -84,30 +96,40 @@ process per Postgres connection, bcrypt as a dirty-CPU NIF.
 ## Configuration
 
 `DATABASE_URL`, `JWT_SECRET` (required), `HOST`, `PORT`. Optional: `SCHEDULERS`, `DIRTY_CPU`, `DB_READ_CONNS`
-(12), `DB_WRITE_CONNS` (8), `ACCEPTORS` (16), `HIB_WORDS` (2048), `STATS=1` (log request/batch counters every
-10 s).
+(12), `DB_WRITE_CONNS` (8), `ACCEPTORS` (16), `HIB_WORDS` (2048), `BCRYPT_BATCH_MS` (120), `STATS=1` (log
+request/batch/expired counters every 10 s).
 
 ## Tests
 
 `gleam test` runs unit tests (no database): timestamp formatting, JSON escaping, JWT issue/verify, query and
-page validation, percent-decoding, Postgres message encoding/decoding. `test/run.sh` passes 197/197 and the
-normalized transcript is byte-identical to `bench/cmd/conformance/golden-dev.jsonl`.
+page validation, percent-decoding, Postgres message encoding/decoding, bcrypt hash/verify through the
+collector. `test/run.sh` passes 197/197 and the normalized transcript is byte-identical to
+`bench/cmd/conformance/golden-dev.jsonl`, also when replayed on a clean Ubuntu 24.04 container
+(`install.sh`, then `test/run.sh`, OTP 28).
 
 ## Local evidence
 
-MacBook Pro (M-series, 16 cores), PostgreSQL 17 (Postgres.app), the full seed, server and load generator on the
-same machine over loopback, so none of this is a challenge score. CPU below is measured from process CPU time
-over the measured window (BEAM process, Postgres client backends only).
+Not a challenge score. The closest local stand-in for the box: a Docker container on an Apple M-series
+laptop with a CPU quota of 8, Ubuntu 24.04, PostgreSQL 18 from PGDG with the box's pgtune settings
+(`box/pg-conf.sh` values for 8 cores / 16 GB), the full seed, this server on `0.0.0.0:80`, and the load
+generator in two other containers on the same Docker network (40,000 users each, `loadgen merge`). Runs are
+60 s ramp + 60 s measured. "Cores" is CPU time over the measured window divided by its length: the BEAM
+process, and the Postgres client backends.
 
-| Users × think-scale | req/s | p50 / p95 / p99 ms | BEAM cores | Postgres cores |
-|---|---:|---|---:|---:|
-| 5,000 × 0.25 | 5,300 | 0.3 / 1.0 / 1.2 | 0.83 | 1.12 |
-| 8,000 × 0.25 | 8,490 | 0.3 / 1.1 / 3.1 | 1.7 | 1.24 |
-| 15,000 × 1.0 (60 s ramp) | 3,960 | 0.6 / 3.9 / 8.2 | 0.75 | 1.1 |
+| Users | req/s | p50 / p95 / p99 ms | BEAM cores | Postgres cores | BEAM RSS |
+|---:|---:|---|---:|---:|---:|
+| 40,000 | 10,608 | 0.2 / 0.6 / 0.7 | 2.15 | 1.47 | 1.2 GB |
+| 60,000 | 15,910 | 0.3 / 0.7 / 0.9 | 3.28 | 2.66 | 2.3 GB |
+| 80,000 | 21,178 | 0.5 / 2.5 / 4.8 | 3.59 | 4.08 | 3.7 GB |
 
-That is about 0.16 ms of BEAM CPU and 0.15 ms of Postgres CPU per request. Resident memory was 379 MB with
-15,000 open keep-alive connections. macOS caps local runs at ~15k connections (ephemeral ports), so the box's
-8-core ceiling is extrapolated, not measured.
+80,000 users leaves about 0.3 of the 8 cores idle, so the ceiling here is near 85,000; an M-series core is
+faster than the box's x86 vCPU, so expect less on the box. Before the lane-interleaved bcrypt the BEAM took
+4.14 cores at 80,000 users (about one core of it hashing ~21 logins/s). Under `pg_stat_statements` at 40,000
+users the personal feed was 32% of Postgres time (0.58 ms, ~380 buffers: the page ids per followee, the
+capped count, and ten rendered articles), comments 15%, the global list 13%, an article by slug 12%.
+
+The same laptop running Postgres.app 17 natively does about 0.16 ms of BEAM CPU and 0.15 ms of Postgres CPU per
+request at 5,300 req/s, with p99 around 1 ms. macOS caps native runs at ~15k connections (ephemeral ports).
 
 ## Credits
 
