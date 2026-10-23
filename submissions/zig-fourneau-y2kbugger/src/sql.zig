@@ -192,7 +192,10 @@ pub const statements = std.enums.EnumArray(S, pg.Statement).init(.{
         .params = &.{.text_array},
     },
     .article_by_current = .{
-        .sql = article_full_select ++ " WHERE a.id = " ++ current_article,
+        // In a subquery: evaluated once (an InitPlan), so the key's index
+        // finds the row. As a bare comparison `currval` is volatile, and
+        // was evaluated per row: a scan of every article, 2.4 s.
+        .sql = article_full_select ++ " WHERE a.id = (SELECT " ++ current_article ++ ")",
         .params = &.{.int8},
     },
     .article_owner = .{
