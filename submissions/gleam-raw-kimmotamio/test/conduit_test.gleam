@@ -1,0 +1,75 @@
+import conduit/jsonw
+import conduit/jwt
+import conduit/pg/proto
+import conduit/util
+import gleam/bit_array
+import gleam/option.{None, Some}
+import gleam/string_tree
+import gleeunit
+
+pub fn main() {
+  gleeunit.main()
+}
+
+pub fn rfc3339_test() {
+  assert util.rfc3339(0) == "2000-01-01T00:00:00.000Z"
+  assert util.rfc3339(-1) == "1999-12-31T23:59:59.999Z"
+  // 2024-02-29T12:34:56.789999Z truncates, not rounds.
+  assert util.rfc3339(762_525_296_789_999) == "2024-02-29T12:34:56.789Z"
+  assert util.rfc3339(951_782_400_000_000) == "2030-02-28T00:00:00.000Z"
+}
+
+pub fn json_string_test() {
+  assert string_tree.to_string(jsonw.str(<<"plain":utf8>>)) == "\"plain\""
+  assert string_tree.to_string(jsonw.str(<<"a\"b\\c\nd\te":utf8, 1, "f":utf8>>)) == "\"a\\\"b\\\\c\\nd\\te\\u0001f\""
+  assert string_tree.to_string(jsonw.str(<<"ünï":utf8>>)) == "\"ünï\""
+  assert string_tree.to_string(jsonw.opt_str(None)) == "null"
+  assert string_tree.to_string(jsonw.str_array([<<"a":utf8>>, <<"b":utf8>>])) == "[\"a\",\"b\"]"
+}
+
+pub fn jwt_round_trip_test() {
+  let secret = <<"multicore-server-challenge":utf8>>
+  let token = jwt.issue(secret, 150, 1_700_000_000)
+  assert jwt.check("Token " <> token, secret, 1_700_000_001) == jwt.User(150, token)
+  assert jwt.check("Token " <> token, secret, 1_700_000_000 + 2_592_000) == jwt.Invalid
+  assert jwt.check("Token " <> token, <<"other":utf8>>, 1_700_000_001) == jwt.Invalid
+  assert jwt.check("Bearer " <> token, secret, 1_700_000_001) == jwt.Invalid
+  assert jwt.check("", secret, 1_700_000_001) == jwt.Anonymous
+  assert jwt.check("Token not.a.jwt", secret, 1_700_000_001) == jwt.Invalid
+}
+
+pub fn page_test() {
+  assert util.page(util.parse_query("")) == Ok(#(20, 0))
+  assert util.page(util.parse_query("limit=05&offset=005")) == Ok(#(5, 5))
+  assert util.page(util.parse_query("limit=0")) == Error(Nil)
+  assert util.page(util.parse_query("limit=101")) == Error(Nil)
+  assert util.page(util.parse_query("limit=%2B5")) == Error(Nil)
+  assert util.page(util.parse_query("offset=99999999999999999999")) == Error(Nil)
+  assert util.page(util.parse_query("offset=100000000")) == Ok(#(20, 100_000_000))
+  let q = util.parse_query("tag=&author=bob&tag=x&favorited=a%20b")
+  assert q.tag == Some("x")
+  assert q.author == Some("bob")
+  assert q.favorited == Some("a b")
+}
+
+pub fn pct_decode_test() {
+  assert util.pct_decode(<<"a%20b%zz+c":utf8>>, True) == <<"a b%zz c":utf8>>
+  assert util.pct_decode(<<"a+b":utf8>>, False) == <<"a+b":utf8>>
+  assert util.decode_segment("caf%C3%A9") == Ok("café")
+  assert util.decode_segment("%00") == Error(Nil)
+  assert util.decode_segment("") == Error(Nil)
+}
+
+pub fn proto_test() {
+  let row = <<2:size(16), 8:size(32), 42:size(64), -1:size(32)>>
+  let message = <<"D":utf8, { bit_array.byte_size(row) + 4 }:size(32), row:bits, "Z":utf8, 5:size(32), "I":utf8>>
+  let assert Ok(#(68, payload, rest)) = proto.next_message(message)
+  assert proto.data_row(payload) == [Some(<<42:size(64)>>), None]
+  let assert Ok(#(90, <<"I":utf8>>, <<>>)) = proto.next_message(rest)
+  assert proto.next_message(<<"D":utf8, 100:size(32), 1, 2>>) == Error(Nil)
+  let arr = <<1:size(32), 0:size(32), 25:size(32), 2:size(32), 1:size(32), 1:size(32), "a":utf8, 2:size(32), "bc":utf8>>
+  assert proto.col_text_array(Some(arr)) == [<<"a":utf8>>, <<"bc":utf8>>]
+  assert proto.col_text_array(Some(<<0:size(32), 0:size(32), 25:size(32)>>)) == []
+  assert proto.text_array_param(["a\"b", "c\\d"]) == Some(<<"{\"a\\\"b\",\"c\\\\d\"}":utf8>>)
+  assert proto.array_literal([Some(<<"1":utf8>>), None]) == Some(<<"{\"1\",NULL}":utf8>>)
+}

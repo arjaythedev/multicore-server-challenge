@@ -1,0 +1,450 @@
+//// One Postgres connection = one BEAM process owning one socket. It serves `Exec` requests from its mailbox
+//// one Sync group at a time: every statement of a request is sent as Bind/Execute, then one Sync, so a
+//// multi-statement request is one implicit transaction with one commit. Every statement in `sql.all()` is
+//// prepared once when the connection opens. If the socket breaks the process reconnects and keeps serving.
+
+import conduit/pg/proto.{type Param, type Row}
+import conduit/sql
+import gleam/bit_array
+import gleam/dict
+import gleam/erlang/process.{type Subject}
+import gleam/int
+import gleam/list
+import gleam/option.{type Option, None, Some}
+import gleam/string
+
+pub type Socket
+
+pub type PgError {
+  /// `code` is the SQLSTATE; "08000" stands for a lost connection.
+  PgError(code: String, message: String)
+}
+
+pub type Reply =
+  Result(List(List(Row)), PgError)
+
+pub type Request {
+  Exec(statements: List(#(Int, List(Param))), reply: Subject(Reply))
+}
+
+pub type Config {
+  Config(
+    host: String,
+    port: Int,
+    user: String,
+    password: String,
+    database: String,
+    options: String,
+  )
+}
+
+@external(erlang, "conduit_ffi", "connect")
+fn connect(host: String, port: Int, timeout: Int) -> Result(Socket, String)
+
+@external(erlang, "conduit_ffi", "recv_passive")
+fn recv(sock: Socket, timeout: Int) -> Result(BitArray, Nil)
+
+@external(erlang, "conduit_ffi", "send")
+fn send(sock: Socket, data: BitArray) -> Result(Nil, Nil)
+
+@external(erlang, "conduit_ffi", "close")
+fn close(sock: Socket) -> Nil
+
+@external(erlang, "conduit_ffi", "log")
+fn log(msg: String) -> Nil
+
+@external(erlang, "conduit_ffi", "sleep")
+fn sleep(ms: Int) -> Nil
+
+@external(erlang, "conduit_ffi", "stat_add")
+fn stat_add(index: Int, n: Int) -> Nil
+
+@external(erlang, "conduit_ffi", "hmac_sha256")
+fn hmac(key: BitArray, data: BitArray) -> BitArray
+
+@external(erlang, "conduit_ffi", "sha256")
+fn sha256(data: BitArray) -> BitArray
+
+@external(erlang, "conduit_ffi", "md5_hex")
+fn md5_hex(data: BitArray) -> BitArray
+
+@external(erlang, "conduit_ffi", "pbkdf2_sha256")
+fn pbkdf2(password: BitArray, salt: BitArray, iterations: Int) -> BitArray
+
+@external(erlang, "conduit_ffi", "random_bytes")
+fn random_bytes(n: Int) -> BitArray
+
+@external(erlang, "conduit_ffi", "xor_bytes")
+fn xor_bytes(a: BitArray, b: BitArray) -> BitArray
+
+/// Spawns the connection process; it sends its request subject to `register` once, before connecting.
+pub fn start(config: Config, register: Subject(Subject(Request))) -> Nil {
+  process.spawn_unlinked(fn() {
+    let subject = process.new_subject()
+    process.send(register, subject)
+    serve(config, subject, [], 0)
+  })
+  Nil
+}
+
+fn serve(config: Config, subject: Subject(Request), queue: List(Request), failures: Int) -> Nil {
+  case open(config) {
+    Ok(sock) -> loop(config, subject, sock, queue)
+    Error(reason) -> {
+      case failures < 3 || failures % 20 == 0 {
+        True -> log("postgres: " <> reason)
+        False -> Nil
+      }
+      sleep(500)
+      serve(config, subject, queue, failures + 1)
+    }
+  }
+}
+
+fn statement_name(index: Int) -> String {
+  "s" <> int.to_string(index)
+}
+
+/// Requests drained from the mailbox beyond the one being served wait in `queue`, oldest first.
+const drain_limit = 64
+
+fn loop(config: Config, subject: Subject(Request), sock: Socket, queue: List(Request)) -> Nil {
+  let #(first, queue) = case queue {
+    [] -> #(process.receive_forever(subject), [])
+    [head, ..rest] -> #(head, rest)
+  }
+  let queue = drain(subject, queue, drain_limit - list.length(queue))
+  case batch_key(first) {
+    // A write (or a multi-statement request): never retried, since its commit state would be unknown.
+    None -> {
+      let Exec(statements, reply) = first
+      stat_add(1, 1)
+      case run(sock, statements, [reply], False) {
+        True -> loop(config, subject, sock, queue)
+        False -> reconnect(config, subject, sock, queue)
+      }
+    }
+    // Reads are retried on the reopened connection when this one turns out to be dead.
+    Some(index) -> {
+      let #(same, others) = list.partition(queue, fn(r) { batch_key(r) == Some(index) })
+      let batch = [first, ..same]
+      let ok = case same {
+        [] -> {
+          let Exec(statements, reply) = first
+          stat_add(1, 1)
+          run(sock, statements, [reply], True)
+        }
+        _ -> {
+          stat_add(1, list.length(batch))
+          stat_add(2, 1)
+          stat_add(3, list.length(batch))
+          let params = list.map(batch, fn(r) {
+            let assert Exec([#(_, p)], _) = r
+            p
+          })
+          let replies = list.map(batch, fn(r) { r.reply })
+          run(sock, [#(index + sql.batch_offset, sql.batch_params(index, params))], replies, True)
+        }
+      }
+      case ok {
+        True -> loop(config, subject, sock, others)
+        False -> reconnect(config, subject, sock, list.append(batch, others))
+      }
+    }
+  }
+}
+
+fn reconnect(config: Config, subject: Subject(Request), sock: Socket, queue: List(Request)) -> Nil {
+  close(sock)
+  serve(config, subject, queue, 0)
+}
+
+/// The statement index when a request is a single batchable read.
+fn batch_key(r: Request) -> Option(Int) {
+  case r {
+    Exec([#(index, _)], _) ->
+      case sql.batchable(index) {
+        True -> Some(index)
+        False -> None
+      }
+    _ -> None
+  }
+}
+
+fn drain(subject: Subject(Request), queue: List(Request), room: Int) -> List(Request) {
+  case room <= 0 {
+    True -> queue
+    False ->
+      case process.receive(subject, 0) {
+        Ok(r) -> drain(subject, list.append(queue, [r]), room - 1)
+        Error(_) -> queue
+      }
+  }
+}
+
+/// Sends one Sync group and distributes the results. With several replies the statement is a batched variant
+/// whose rows carry the request ordinal in their first column. Returns False when the connection is gone; the
+/// requests are then answered with an error unless `retry` says the caller will run them again.
+fn run(sock: Socket, statements: List(#(Int, List(Param))), replies: List(Subject(Reply)), retry: Bool) -> Bool {
+  let message =
+    list.map(statements, fn(s) {
+      let #(index, params) = s
+      <<proto.bind(statement_name(index), params):bits, proto.execute:bits>>
+    })
+    |> list.append([proto.sync])
+    |> bit_array.concat
+  let lost = fn() {
+    case retry {
+      True -> Nil
+      False -> reply_all(replies, Error(PgError("08000", "connection lost")))
+    }
+    False
+  }
+  case send(sock, message) {
+    Error(_) -> lost()
+    Ok(_) ->
+      case read_results(sock, <<>>, [], [], None) {
+        Disconnected -> lost()
+        Done(_, Some(error)) -> {
+          reply_all(replies, Error(error))
+          True
+        }
+        Done(results, None) -> {
+          case replies {
+            [reply] -> process.send(reply, Ok(results))
+            _ -> demux(results, replies)
+          }
+          True
+        }
+      }
+  }
+}
+
+fn reply_all(replies: List(Subject(Reply)), reply: Reply) -> Nil {
+  list.each(replies, fn(r) { process.send(r, reply) })
+}
+
+// Rows of a batched statement are grouped by their ordinal column, in order; a request with no rows gets [].
+fn demux(results: List(List(Row)), replies: List(Subject(Reply))) -> Nil {
+  let rows = case results {
+    [rows] -> rows
+    _ -> []
+  }
+  let groups =
+    list.fold(rows, dict.new(), fn(acc, row) {
+      case row {
+        [ordinal, ..rest] -> {
+          let i = proto.col_int(ordinal)
+          dict.upsert(acc, i, fn(existing) {
+            case existing {
+              Some(list) -> [rest, ..list]
+              None -> [rest]
+            }
+          })
+        }
+        _ -> acc
+      }
+    })
+  list.index_map(replies, fn(reply, k) {
+    let own = case dict.get(groups, k + 1) {
+      Ok(list) -> list.reverse(list)
+      Error(_) -> []
+    }
+    process.send(reply, Ok([own]))
+  })
+  Nil
+}
+
+type Outcome {
+  Done(results: List(List(Row)), error: Option(PgError))
+  Disconnected
+}
+
+/// Reads backend messages until ReadyForQuery. DataRows accumulate per statement; CommandComplete closes one.
+fn read_results(
+  sock: Socket,
+  buf: BitArray,
+  current: List(Row),
+  results: List(List(Row)),
+  error: Option(PgError),
+) -> Outcome {
+  case proto.next_message(buf) {
+    Error(_) ->
+      case recv(sock, 60_000) {
+        Ok(data) -> read_results(sock, <<buf:bits, data:bits>>, current, results, error)
+        Error(_) -> Disconnected
+      }
+    Ok(#(tag, payload, rest)) ->
+      case tag {
+        // 'D' DataRow
+        68 -> read_results(sock, rest, [proto.data_row(payload), ..current], results, error)
+        // 'C' CommandComplete
+        67 -> read_results(sock, rest, [], [list.reverse(current), ..results], error)
+        // 'E' ErrorResponse: the rest of the Sync group is skipped by the backend
+        69 -> {
+          let #(code, msg) = proto.error_fields(payload)
+          read_results(sock, rest, [], results, Some(PgError(code, msg)))
+        }
+        // 'Z' ReadyForQuery
+        90 -> Done(list.reverse(results), error)
+        // '1' ParseComplete, '2' BindComplete, 'N' Notice, 's' PortalSuspended, 'n' NoData, 'I' EmptyQuery, 'S'/'K'
+        _ -> read_results(sock, rest, current, results, error)
+      }
+  }
+}
+
+// ---------------------------------------------------------------- startup
+
+fn open(config: Config) -> Result(Socket, String) {
+  case connect(config.host, config.port, 5000) {
+    Error(e) -> Error("connect: " <> e)
+    Ok(sock) -> {
+      let result = {
+        case send(sock, proto.startup(config.user, config.database, config.options)) {
+          Error(_) -> Error("startup: send failed")
+          Ok(_) ->
+            case authenticate(sock, config, <<>>, None) {
+              Error(e) -> Error(e)
+              Ok(_) -> prepare_all(sock)
+            }
+        }
+      }
+      case result {
+        Ok(_) -> Ok(sock)
+        Error(e) -> {
+          close(sock)
+          Error(e)
+        }
+      }
+    }
+  }
+}
+
+type Scram {
+  Scram(nonce: BitArray, client_first_bare: BitArray)
+}
+
+/// Drives authentication (trust, cleartext, md5, SCRAM-SHA-256) until the first ReadyForQuery.
+fn authenticate(
+  sock: Socket,
+  config: Config,
+  buf: BitArray,
+  scram: Option(Scram),
+) -> Result(Nil, String) {
+  case proto.next_message(buf) {
+    Error(_) ->
+      case recv(sock, 10_000) {
+        Ok(data) -> authenticate(sock, config, <<buf:bits, data:bits>>, scram)
+        Error(_) -> Error("auth: connection closed")
+      }
+    Ok(#(tag, payload, rest)) ->
+      case tag {
+        // 'R' Authentication*
+        82 ->
+          case payload {
+            <<0:size(32)>> -> authenticate(sock, config, rest, scram)
+            <<3:size(32)>> -> {
+              let _ = send(sock, proto.password_message(<<config.password:utf8>>))
+              authenticate(sock, config, rest, scram)
+            }
+            <<5:size(32), salt:bytes-size(4)>> -> {
+              let inner = md5_hex(<<config.password:utf8, config.user:utf8>>)
+              let outer = md5_hex(<<inner:bits, salt:bits>>)
+              let _ = send(sock, proto.password_message(<<"md5":utf8, outer:bits>>))
+              authenticate(sock, config, rest, scram)
+            }
+            <<10:size(32), mechanisms:bytes>> -> {
+              case string.contains(bit_array.to_string(mechanisms) |> unwrap_or(""), "SCRAM-SHA-256") {
+                False -> Error("auth: unsupported SASL mechanisms")
+                True -> {
+                  let nonce = bit_array.base64_encode(random_bytes(18), False)
+                  let bare = <<"n=,r=":utf8, nonce:utf8>>
+                  let _ = send(sock, proto.sasl_initial("SCRAM-SHA-256", <<"n,,":utf8, bare:bits>>))
+                  authenticate(sock, config, rest, Some(Scram(<<nonce:utf8>>, bare)))
+                }
+              }
+            }
+            <<11:size(32), server_first:bytes>> ->
+              case scram {
+                None -> Error("auth: unexpected SASL continue")
+                Some(Scram(nonce, bare)) ->
+                  case scram_final(config.password, nonce, bare, server_first) {
+                    Error(e) -> Error(e)
+                    Ok(final) -> {
+                      let _ = send(sock, proto.sasl_response(final))
+                      authenticate(sock, config, rest, scram)
+                    }
+                  }
+              }
+            <<12:size(32), _:bytes>> -> authenticate(sock, config, rest, scram)
+            _ -> Error("auth: unsupported authentication method")
+          }
+        // 'E'
+        69 -> {
+          let #(code, msg) = proto.error_fields(payload)
+          Error("auth: " <> code <> " " <> msg)
+        }
+        // 'Z'
+        90 -> Ok(Nil)
+        _ -> authenticate(sock, config, rest, scram)
+      }
+  }
+}
+
+fn scram_final(
+  password: String,
+  nonce: BitArray,
+  bare: BitArray,
+  server_first: BitArray,
+) -> Result(BitArray, String) {
+  let text = bit_array.to_string(server_first) |> unwrap_or("")
+  let fields = string.split(text, ",")
+  let get = fn(prefix: String) -> Result(String, Nil) {
+    list.find_map(fields, fn(f) {
+      case string.starts_with(f, prefix) {
+        True -> Ok(string.drop_start(f, string.length(prefix)))
+        False -> Error(Nil)
+      }
+    })
+  }
+  case get("r="), get("s="), get("i=") {
+    Ok(combined), Ok(salt_b64), Ok(iters) ->
+      case bit_array.starts_with(<<combined:utf8>>, nonce), bit_array.base64_decode(salt_b64), int.parse(iters) {
+        True, Ok(salt), Ok(iterations) -> {
+          let salted = pbkdf2(<<password:utf8>>, salt, iterations)
+          let client_key = hmac(salted, <<"Client Key":utf8>>)
+          let stored_key = sha256(client_key)
+          let without_proof = <<"c=biws,r=":utf8, combined:utf8>>
+          let auth_message = <<bare:bits, ",":utf8, server_first:bits, ",":utf8, without_proof:bits>>
+          let signature = hmac(stored_key, auth_message)
+          let proof = xor_bytes(client_key, signature)
+          Ok(<<without_proof:bits, ",p=":utf8, bit_array.base64_encode(proof, True):utf8>>)
+        }
+        _, _, _ -> Error("auth: bad SCRAM server-first message")
+      }
+    _, _, _ -> Error("auth: bad SCRAM server-first message")
+  }
+}
+
+fn prepare_all(sock: Socket) -> Result(Nil, String) {
+  let message =
+    list.map(list.append(sql.all(), sql.batched()), fn(s) { proto.parse(statement_name(s.index), s.query, s.params) })
+    |> list.append([proto.sync])
+    |> bit_array.concat
+  case send(sock, message) {
+    Error(_) -> Error("prepare: send failed")
+    Ok(_) ->
+      case read_results(sock, <<>>, [], [], None) {
+        Disconnected -> Error("prepare: connection closed")
+        Done(_, Some(PgError(code, msg))) -> Error("prepare: " <> code <> " " <> msg)
+        Done(_, None) -> Ok(Nil)
+      }
+  }
+}
+
+fn unwrap_or(r: Result(a, b), default: a) -> a {
+  case r {
+    Ok(v) -> v
+    Error(_) -> default
+  }
+}
