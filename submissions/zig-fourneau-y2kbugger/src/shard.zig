@@ -14,6 +14,7 @@ const sql = @import("sql.zig");
 const api = @import("api.zig");
 const jwt = @import("jwt.zig");
 const password = @import("password.zig");
+const batch = @import("batch.zig");
 
 pub const Server = fourneau.server.ServerType(App, .{
     .send_then_receive = Evented.sendThenReceive,
@@ -122,17 +123,17 @@ pub const Shard = struct {
     io: Io,
     key: *const jwt.Key,
     passwords: *password.Pool,
-    reads: []pg.Connection,
+    /// The batched reads (batch.zig) and the connections they go out on.
+    reads: batch.Reads = undefined,
+    read_connections: []pg.Connection,
+    /// Everything else: writes (each waits for its commit's flush, so reads
+    /// never queue behind one) and the rare reads not batched.
     writes: []pg.Connection,
     /// Rotates the ties of `pick`.
     rotation: u32 = 0,
     slots: Slots,
     jwt_memory: []u8,
     json_memory: []u8,
-
-    pub fn pick_read(shard: *Shard) *pg.Connection {
-        return pick(shard, shard.reads);
-    }
 
     pub fn pick_write(shard: *Shard) *pg.Connection {
         return pick(shard, shard.writes);
@@ -182,7 +183,7 @@ fn run_or_fail(options: Options) !noreturn {
         .io = io,
         .key = options.key,
         .passwords = options.passwords,
-        .reads = try gpa.alloc(pg.Connection, options.reads),
+        .read_connections = try gpa.alloc(pg.Connection, options.reads),
         .writes = try gpa.alloc(pg.Connection, options.writes),
         .slots = try .init(gpa, options.slots, 256 * 1024, 128 * 1024),
         .jwt_memory = try gpa.alloc(u8, jwt.memory_bytes),
@@ -190,12 +191,15 @@ fn run_or_fail(options: Options) !noreturn {
     };
     const statements = &sql.statements.values;
     var group: Io.Group = .init;
-    for ([_][]pg.Connection{ shard.reads, shard.writes }) |connections| {
+    for ([_][]pg.Connection{ shard.read_connections, shard.writes }) |connections| {
         for (connections) |*connection| {
             const fd = try pg.connect_blocking(options.url, statements);
             connection.* = try .init(gpa, io, fd, statements);
-            try group.concurrent(io, pg.Connection.read_loop, .{connection});
         }
+    }
+    shard.reads.init(io, shard.read_connections);
+    for ([_][]pg.Connection{ shard.read_connections, shard.writes }) |connections| {
+        for (connections) |*connection| try group.concurrent(io, pg.Connection.read_loop, .{connection});
     }
     const listener = try options.address.listen(io, .{ .reuse_address = true, .kernel_backlog = 65535 });
     var app: App = .{ .shard = &shard };

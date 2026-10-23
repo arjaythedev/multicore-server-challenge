@@ -26,7 +26,9 @@ pub const Oid = enum(u32) {
     int8 = 20,
     int4 = 23,
     text = 25,
+    int4_array = 1007,
     text_array = 1009,
+    int8_array = 1016,
     timestamptz = 1184,
 };
 
@@ -41,6 +43,35 @@ pub const Param = union(enum) {
     int4: i32,
     text: []const u8,
     text_array: []const []const u8,
+    int4_array: []const i32,
+    int8_array: []const i64,
+};
+
+/// Requests a batch holds at most: past ~10, a statement's own cost is
+/// all but gone (52.7 us of Postgres per request at 32, 53.4 at 10, 161
+/// one at a time; the article by slug, 2026-10-23).
+pub const batch_max = 32;
+
+/// A group's requests: one, or a batch, whose rows each name their request
+/// by their first column (an int4, its index into `waiters`), taken off as
+/// the row is kept.
+pub const Batch = struct {
+    waiters: [batch_max]*Waiter = undefined,
+    count: u8 = 0,
+    tagged: bool = false,
+};
+
+/// Called when a connection has nothing in flight: the shard's batches go
+/// out on it.
+pub const Idle = struct {
+    context: *anyopaque,
+    function: *const fn (context: *anyopaque, connection: *Connection) void,
+};
+
+/// One statement of a group, and its parameters.
+pub const Call = struct {
+    statement: u16,
+    params: []const Param,
 };
 
 /// Statements a request's group holds at most.
@@ -207,10 +238,14 @@ pub const Connection = struct {
     input: []u8,
     input_start: u32 = 0,
     input_end: u32 = 0,
-    queue: []*Waiter,
+    queue: []*Batch,
     queue_head: u32 = 0,
     queue_count: u32 = 0,
     broken: bool = false,
+    idle: ?Idle = null,
+    /// The batch in flight, for a connection the shard's batches use: one
+    /// at a time.
+    batch: Batch = .{},
 
     pub fn init(gpa: std.mem.Allocator, io: Io, fd: linux.fd_t, statements: []const Statement) !Connection {
         return .{
@@ -219,8 +254,38 @@ pub const Connection = struct {
             .statements = statements,
             .output = .{ try alloc_untouched(gpa, output_bytes), try alloc_untouched(gpa, output_bytes) },
             .input = try alloc_untouched(gpa, input_bytes),
-            .queue = try gpa.alloc(*Waiter, queue_max),
+            .queue = try gpa.alloc(*Batch, queue_max),
         };
+    }
+
+    /// Send a group for a batch (`batch.tagged`: each row names its
+    /// waiter): its calls, then Sync. False: it could not be sent, and
+    /// every waiter has its failure already.
+    pub fn send(connection: *Connection, batch: *Batch, calls: []const Call) bool {
+        assert(batch.count > 0);
+        const index = connection.filling;
+        const start = connection.output_used[index];
+        var out: Writer = .{ .buffer = connection.output[index], .used = start };
+        for (calls) |call| out.call(connection.statements, call);
+        const sync = out.begin('S');
+        out.end(sync);
+        var failure: ?Failure = null;
+        if (out.overflow or connection.queue_count == connection.queue.len) failure = .overflow;
+        if (connection.broken) failure = .broken;
+        if (failure) |failed| {
+            for (batch.waiters[0..batch.count]) |waiter| {
+                waiter.failure = failed;
+                waiter.done = true;
+                _ = Evented.unpark(connection.io, &waiter.parked);
+            }
+            return false;
+        }
+        connection.output_used[index] = @intCast(out.used);
+        const tail = (connection.queue_head + connection.queue_count) % connection.queue.len;
+        connection.queue[tail] = batch;
+        connection.queue_count += 1;
+        connection.flush();
+        return true;
     }
 
     /// Requests in flight: what a pool balances on.
@@ -273,32 +338,44 @@ pub const Connection = struct {
             else => {},
         }
         if (connection.queue_count == 0) return error.Protocol;
-        const waiter = connection.queue[connection.queue_head];
+        const batch = connection.queue[connection.queue_head];
+        const waiters = batch.waiters[0..batch.count];
         switch (kind) {
-            'D' => {
-                const room = waiter.rows.len - waiter.rows_used;
-                if (body.len + 4 > room) {
-                    if (waiter.failure == null) waiter.failure = .overflow;
-                    return;
-                }
-                const at = waiter.rows[waiter.rows_used..];
-                std.mem.writeInt(u32, at[0..4], @intCast(body.len), .native);
-                @memcpy(at[4..][0..body.len], body);
-                waiter.rows_used += @intCast(4 + body.len);
+            'D' => if (batch.tagged) {
+                // The tag: a non-null int4, the first column.
+                if (body.len < 10) return error.Protocol;
+                const count = std.mem.readInt(u16, body[0..2], .big);
+                const length = std.mem.readInt(i32, body[2..6], .big);
+                if (count == 0 or length != 4) return error.Protocol;
+                const tag = std.mem.readInt(i32, body[6..10], .big);
+                if (tag < 0 or tag >= batch.count) return error.Protocol;
+                var header: [2]u8 = undefined;
+                std.mem.writeInt(u16, &header, count - 1, .big);
+                keep_row(waiters[@intCast(tag)], &header, body[10..]);
+            } else {
+                keep_row(waiters[0], body[0..2], body[2..]);
             },
-            'C' => {
+            'C' => for (waiters) |waiter| {
                 if (waiter.statements == group_statements_max) return error.Protocol;
                 waiter.ends[waiter.statements] = waiter.rows_used;
                 waiter.statements += 1;
             },
-            'E' => if (waiter.failure == null) {
-                waiter.failure = .{ .sql = sqlstate(body) };
+            'E' => {
+                const state = sqlstate(body);
+                for (waiters) |waiter| {
+                    if (waiter.failure == null) waiter.failure = .{ .sql = state };
+                }
             },
             'Z' => {
                 connection.queue_head = @intCast((connection.queue_head + 1) % connection.queue.len);
                 connection.queue_count -= 1;
-                waiter.done = true;
-                _ = Evented.unpark(connection.io, &waiter.parked);
+                for (waiters) |waiter| {
+                    waiter.done = true;
+                    _ = Evented.unpark(connection.io, &waiter.parked);
+                }
+                if (connection.queue_count == 0) {
+                    if (connection.idle) |idle| idle.function(idle.context, connection);
+                }
             },
             // ParseComplete, BindComplete, CloseComplete, NoData,
             // PortalSuspended, EmptyQueryResponse: nothing to keep.
@@ -309,13 +386,15 @@ pub const Connection = struct {
 
     fn fail_all(connection: *Connection) void {
         connection.broken = true;
-        log.err("connection lost: {d} requests failed", .{connection.queue_count});
+        log.err("connection lost: {d} groups failed", .{connection.queue_count});
         for (0..connection.queue_count) |_| {
-            const waiter = connection.queue[connection.queue_head];
+            const batch = connection.queue[connection.queue_head];
             connection.queue_head = @intCast((connection.queue_head + 1) % connection.queue.len);
-            waiter.failure = .broken;
-            waiter.done = true;
-            _ = Evented.unpark(connection.io, &waiter.parked);
+            for (batch.waiters[0..batch.count]) |waiter| {
+                waiter.failure = .broken;
+                waiter.done = true;
+                _ = Evented.unpark(connection.io, &waiter.parked);
+            }
         }
         connection.queue_count = 0;
     }
@@ -343,10 +422,29 @@ pub const Connection = struct {
     }
 };
 
-/// A group being written: its Binds and Executes, then `wait`.
+/// A row into its waiter's buffer: its length, then the DataRow's body
+/// with `header` (the column count) in place of its own.
+fn keep_row(waiter: *Waiter, header: []const u8, columns: []const u8) void {
+    assert(header.len == 2);
+    const length = header.len + columns.len;
+    const room = waiter.rows.len - waiter.rows_used;
+    if (length + 4 > room) {
+        if (waiter.failure == null) waiter.failure = .overflow;
+        return;
+    }
+    const at = waiter.rows[waiter.rows_used..];
+    std.mem.writeInt(u32, at[0..4], @intCast(length), .native);
+    @memcpy(at[4..6], header);
+    @memcpy(at[6..][0..columns.len], columns);
+    waiter.rows_used += @intCast(4 + length);
+}
+
+/// One request's group, written into the output as its calls come (no
+/// wait in between: groups never interleave), then `wait`.
 pub const Query = struct {
     connection: *Connection,
     waiter: Waiter,
+    batch: Batch = .{},
     /// Where the group starts in the output, to take it back if it fails.
     start: u32,
     overflow: bool = false,
@@ -362,68 +460,34 @@ pub const Query = struct {
     /// Bind and Execute one statement with its parameters.
     pub fn run(query: *Query, statement: u16, params: []const Param) void {
         const connection = query.connection;
-        assert(statement < connection.statements.len);
-        assert(params.len == connection.statements[statement].params.len);
-        var out = query.writer();
-        // Bind: the unnamed portal, the statement, every parameter binary,
-        // every result binary.
-        const bind = out.begin('B');
-        out.byte(0);
-        out.statement_name(statement);
-        out.int16(1);
-        out.int16(1);
-        out.int16(@intCast(params.len));
-        for (params) |param| out.param(param);
-        out.int16(1);
-        out.int16(1);
-        out.end(bind);
-        const execute = out.begin('E');
-        out.byte(0);
-        out.int32(0);
-        out.end(execute);
-        query.keep(out);
+        const index = connection.filling;
+        var out: Writer = .{ .buffer = connection.output[index], .used = connection.output_used[index] };
+        out.overflow = query.overflow;
+        out.call(connection.statements, .{ .statement = statement, .params = params });
+        query.overflow = out.overflow;
+        if (!out.overflow) connection.output_used[index] = @intCast(out.used);
     }
 
     /// Sync, send, and wait for the answers: the group's transaction is
-    /// committed (or rolled back) when this returns.
+    /// committed (or rolled back) when this returns. In place: the batch
+    /// points at the query's waiter.
     pub fn wait(query: *Query) Results {
         const connection = query.connection;
-        var out = query.writer();
-        const sync = out.begin('S');
-        out.end(sync);
-        query.keep(out);
-        if (connection.broken) query.waiter.failure = .broken;
-        if (query.overflow or connection.queue_count == connection.queue.len) {
-            if (query.waiter.failure == null) query.waiter.failure = .overflow;
-        }
-        if (query.waiter.failure != null) {
-            // Never sent: take the group back.
+        query.batch = .{ .count = 1 };
+        query.batch.waiters[0] = &query.waiter;
+        if (query.overflow) {
             connection.output_used[connection.filling] = query.start;
+            query.waiter.failure = .overflow;
+            query.waiter.done = true;
             return .{ .waiter = &query.waiter };
         }
-        const tail = (connection.queue_head + connection.queue_count) % connection.queue.len;
-        connection.queue[tail] = &query.waiter;
-        connection.queue_count += 1;
-        connection.flush();
-        if (!query.waiter.done) Evented.park(connection.io, &query.waiter.parked);
+        if (connection.send(&query.batch, &.{})) {
+            if (!query.waiter.done) Evented.park(connection.io, &query.waiter.parked);
+        } else {
+            connection.output_used[connection.filling] = query.start;
+        }
         assert(query.waiter.done);
         return .{ .waiter = &query.waiter };
-    }
-
-    fn writer(query: *Query) Writer {
-        const connection = query.connection;
-        const index = connection.filling;
-        return .{
-            .buffer = connection.output[index],
-            .used = connection.output_used[index],
-            .overflow = query.overflow,
-        };
-    }
-
-    fn keep(query: *Query, out: Writer) void {
-        const connection = query.connection;
-        query.overflow = out.overflow;
-        connection.output_used[connection.filling] = @intCast(out.used);
     }
 };
 
@@ -484,8 +548,51 @@ const Writer = struct {
         std.mem.writeInt(i32, out.buffer[at..][0..4], length, .big);
     }
 
+    /// Bind and Execute: the unnamed portal, every parameter binary, every
+    /// result binary.
+    fn call(out: *Writer, statements: []const Statement, value: Call) void {
+        assert(value.statement < statements.len);
+        assert(value.params.len == statements[value.statement].params.len);
+        const bind = out.begin('B');
+        out.byte(0);
+        out.statement_name(value.statement);
+        out.int16(1);
+        out.int16(1);
+        out.int16(@intCast(value.params.len));
+        for (value.params) |item| out.param(item);
+        out.int16(1);
+        out.int16(1);
+        out.end(bind);
+        const execute = out.begin('E');
+        out.byte(0);
+        out.int32(0);
+        out.end(execute);
+    }
+
+    /// A one-dimensional array of fixed-size elements, none null.
+    fn fixed_array(out: *Writer, comptime T: type, oid: Oid, items: []const T) void {
+        const element_bytes = @sizeOf(T);
+        const header_bytes: usize = if (items.len == 0) 12 else 20;
+        out.int32(@intCast(header_bytes + items.len * (4 + element_bytes)));
+        out.int32(if (items.len == 0) 0 else 1);
+        out.int32(0); // no nulls
+        out.int32(@intCast(@intFromEnum(oid)));
+        if (items.len > 0) {
+            out.int32(@intCast(items.len));
+            out.int32(1); // lower bound
+        }
+        for (items) |item| {
+            out.int32(element_bytes);
+            var data: [element_bytes]u8 = undefined;
+            std.mem.writeInt(T, &data, item, .big);
+            out.bytes(&data);
+        }
+    }
+
     fn param(out: *Writer, value: Param) void {
         switch (value) {
+            .int4_array => |items| out.fixed_array(i32, .int4, items),
+            .int8_array => |items| out.fixed_array(i64, .int8, items),
             .null => out.int32(-1),
             .int8 => |number| {
                 out.int32(8);
@@ -610,7 +717,10 @@ pub fn parse_url(text: []const u8) !Url {
 }
 
 /// Session settings sent at startup, on our own connections only (the
-/// rules allow it): no JIT, no parallel workers, generic plans.
+/// rules allow it): no JIT, no parallel workers, generic plans (each
+/// statement's is as good as a custom one, and planning per execution is
+/// skipped), no Memoize (a generic plan of a page put one on the users
+/// join, which clears a hash table every execution).
 const session_settings = [_][2][]const u8{
     .{ "client_encoding", "UTF8" },
     .{ "TimeZone", "UTC" },
@@ -618,6 +728,7 @@ const session_settings = [_][2][]const u8{
     .{ "jit", "off" },
     .{ "max_parallel_workers_per_gather", "0" },
     .{ "plan_cache_mode", "force_generic_plan" },
+    .{ "enable_memoize", "off" },
 };
 
 /// Connect, authenticate (trust or SCRAM-SHA-256), and prepare every
