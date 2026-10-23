@@ -16,11 +16,11 @@ from conduit_server.domain.models import (
     TagsResponse,
     Empty,
 )
-import dataclasses
-
 from conduit_server.domain import services
 
 # Controllers use the db and crypto ports injected from main.py.
+# The hot reads are generators: `row = yield db.q_...(...)` hands the query to the server, which runs it pipelined
+# (the worker keeps serving meanwhile) and resumes the handler with its result; writes call the db directly.
 
 
 # Injected at startup by main.py (composition root).
@@ -35,16 +35,6 @@ def bootstrap(article_repository, crypto_adapter):
 
 
 # ---- shared helpers -------------------------------------------------------
-
-
-def _datetime_str(value) -> str:
-    """RFC 3339 UTC with exactly 3 fractional digits, truncated."""
-    dt = value
-    if dt.tzinfo is not None:
-        import datetime
-
-        dt = dt.astimezone(datetime.timezone.utc)
-    return "%s.%03dZ" % (dt.strftime("%Y-%m-%dT%H:%M:%S"), dt.microsecond // 1000)
 
 
 def _viewer(request: HttpRequest, required: bool) -> int:
@@ -91,9 +81,9 @@ def _article(row: dict, include_body: bool) -> ArticleData:
         title=row["title"],
         description=row["description"],
         body=body,
-        tagList=list(row["tag_list"]),
-        createdAt=_datetime_str(row["created_at"]),
-        updatedAt=_datetime_str(row["updated_at"]),
+        tagList=row["tag_list"],
+        createdAt=row["created_at"],
+        updatedAt=row["updated_at"],
         favorited=row["favorited"],
         favoritesCount=row["favorites_count"],
         author=ProfileData(
@@ -115,22 +105,34 @@ def _user_data(row: dict, token: str) -> UserData:
     )
 
 
-def _article_brief(row: dict) -> dict:
-    """List rows omit 'body' entirely (RealWorld spec), unlike single-article responses."""
-    full = _article(row, include_body=False)
-    d = dataclasses.asdict(full)
-    del d["body"]  # list rows omit 'body' entirely (RealWorld spec)
-    return d
-
-
-def _articles_response(rows: List[dict], total: int) -> dict:
-    return {"articles": [_article_brief(r) for r in rows], "articlesCount": total}
+def _articles_response(rows: List[tuple], total: int) -> dict:
+    """The list response from rows. The routes get it built by Postgres (`list_articles_json`); scripts/diffsql.py
+    checks that body against this one. Rows in ARTICLE_ROW order (ports.outbound). List entries omit 'body'
+    entirely (RealWorld spec), unlike single-article responses: same keys and order as ArticleData minus body."""
+    return {
+        "articles": [
+            {
+                "slug": slug,
+                "title": title,
+                "description": description,
+                "tagList": tag_list,
+                "createdAt": created_at,
+                "updatedAt": updated_at,
+                "favorited": favorited,
+                "favoritesCount": favorites_count,
+                "author": ProfileData(username=username, bio=bio, image=image, following=following),
+            }
+            for (_id, slug, title, description, created_at, updated_at, tag_list, favorites_count,
+                 favorited, username, bio, image, following) in rows
+        ],
+        "articlesCount": total,
+    }
 
 
 # ---- users / auth --------------------------------------------------------
 
 
-@router.post("/api/users")
+@router.post("/api/users", offload=True)  # bcrypt hash
 def register(request: HttpRequest):
     body = request.json()
     try:
@@ -150,7 +152,7 @@ def register(request: HttpRequest):
     return 201, UserResponse(user=_user_data(row, crypto.issue_token(row["id"])))
 
 
-@router.post("/api/users/login")
+@router.post("/api/users/login", offload=True)  # bcrypt verify
 def login(request: HttpRequest):
     body = request.json()
     try:
@@ -167,13 +169,13 @@ def login(request: HttpRequest):
 @router.get("/api/user")
 def current_user(request: HttpRequest):
     viewer = _viewer(request, required=True)
-    row = db.find_user_by_id(viewer)
+    row = yield db.q_find_user_by_id(viewer)
     if not row:
         raise ApiError(401, "no such user")
     return 200, UserResponse(user=_user_data(row, _token(request)))
 
 
-@router.put("/api/user")
+@router.put("/api/user", offload=True)  # bcrypt hash when the password changes
 def update_user(request: HttpRequest):
     viewer = _viewer(request, required=True)
     payload = request.json_wrapped("user")
@@ -205,7 +207,7 @@ def update_user(request: HttpRequest):
 @router.get("/api/profiles/:username")
 def get_profile(request: HttpRequest):
     viewer = _viewer(request, required=False)
-    row = db.find_profile(viewer, request.params["username"])
+    row = yield db.q_find_profile(viewer, request.params["username"])
     if not row:
         raise ApiError(404, "profile not found")
     return 200, ProfileResponse(profile=_profile(row))
@@ -245,22 +247,22 @@ def list_articles(request: HttpRequest):
         if request.query.get(k, "") != "":
             kind, value = k, request.query[k]
             break
-    total, rows = db.list_articles(viewer, limit, offset, kind, value)
-    return 200, _articles_response(rows, total)
+    body = yield db.q_list_articles_json(viewer, limit, offset, kind, value)  # built by Postgres
+    return 200, body
 
 
 @router.get("/api/articles/feed")
 def feed(request: HttpRequest):
     viewer = _viewer(request, required=True)
     limit, offset = _paging(request.query)
-    total, rows = db.feed_articles(viewer, limit, offset)
-    return 200, _articles_response(rows, total)
+    body = yield db.q_feed_articles_json(viewer, limit, offset)  # built by Postgres
+    return 200, body
 
 
 @router.get("/api/articles/:slug")
 def get_article(request: HttpRequest):
     viewer = _viewer(request, required=False)
-    row = db.find_article(viewer, request.params["slug"])
+    row = yield db.q_find_article(viewer, request.params["slug"])
     if not row:
         raise ApiError(404, "article not found")
     return 200, SingleArticleResponse(article=_article(row, include_body=True))
@@ -363,21 +365,18 @@ def unfavorite(request: HttpRequest):
 @router.get("/api/articles/:slug/comments")
 def list_comments(request: HttpRequest):
     viewer = _viewer(request, required=False)
-    art = db.article_for_write(request.params["slug"])
-    if not art:
+    rows = yield db.q_list_comments_by_slug(viewer, request.params["slug"])
+    if rows is None:
         raise ApiError(404, "article not found")
-    rows = db.list_comments(viewer, art["id"])
-    comments = [
+    comments = [  # rows in COMMENT_ROW order
         {
-            "id": r["id"],
-            "createdAt": _datetime_str(r["created_at"]),
-            "updatedAt": _datetime_str(r["updated_at"]),
-            "body": r["body"],
-            "author": ProfileData(
-                username=r["username"], bio=r["bio"], image=r["image"], following=r["following"]
-            ),
+            "id": id_,
+            "createdAt": created_at,
+            "updatedAt": updated_at,
+            "body": body,
+            "author": ProfileData(username=username, bio=bio, image=image, following=following),
         }
-        for r in rows
+        for (id_, body, created_at, updated_at, username, bio, image, following) in rows
     ]
     return 200, CommentsResponse(comments=comments)
 
@@ -394,8 +393,8 @@ def create_comment(request: HttpRequest):
     row = db.create_comment(viewer, art["id"], comment["body"])
     data = {
         "id": row["id"],
-        "createdAt": _datetime_str(row["created_at"]),
-        "updatedAt": _datetime_str(row["updated_at"]),
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
         "body": row["body"],
         "author": ProfileData(
             username=row["username"], bio=row["bio"], image=row["image"], following=False
@@ -424,4 +423,4 @@ def delete_comment(request: HttpRequest):
 
 @router.get("/api/tags")
 def tags(request: HttpRequest):
-    return 200, TagsResponse(tags=db.list_tags())
+    return 200, TagsResponse(tags=(yield db.q_list_tags()))
