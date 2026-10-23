@@ -158,12 +158,16 @@ fn pct_decode(out: u8[>..]&, s: const u8[:], plus: bool) -> bool {
 }
 
 // Well-formed UTF-8 without NUL: what Postgres stores in a text column.
-fn valid_text(s: const u8[:]) -> bool {
+fn valid_text(s: const u8[:]) -> bool { valid_utf8(s, false) }
+
+// Passwords use the same Unicode validation but may contain an embedded NUL;
+// their plaintext never enters a PostgreSQL text column or a C string API.
+fn valid_utf8(s: const u8[:], allow_nul: bool) -> bool {
     var i = 0;
     while i < s.len {
         let c = s[i];
         if c < 0x80 {
-            if c == 0 { return false; }
+            if c == 0 && !allow_nul { return false; }
             i += 1;
             continue;
         }

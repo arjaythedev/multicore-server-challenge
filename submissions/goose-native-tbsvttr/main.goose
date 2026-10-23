@@ -1,10 +1,11 @@
 // Conduit (the RealWorld API) for the multicore server challenge: epoll event loops that each own their
 // connections, pipelined Postgres, and bcrypt on threads of its own.
 //
-// Environment: DATABASE_URL, JWT_SECRET, HOST, PORT; WORKERS (event loops, 4), PG_READERS (read connections per
+// Environment: DATABASE_URL, JWT_SECRET, HOST, PORT; WORKERS (event loops, 2), PG_READERS (read connections per
 // loop, 3; each loop also has one writer), HASHERS (bcrypt threads, 2), BCRYPT_BATCH_MS (250), READ_BATCH (most
 // list reads one execution answers, 32; 0 off), READ_HOLD (batches in flight before reads wait, 1),
-// and ARTICLE_BATCH (0 by default; 1 lets queued article reads share metadata within one execution).
+// WRITE_BATCH_US (writer collection, 1000; 0 disables it), READ_BATCH_US (pending read collection, 5000 by default),
+// and ARTICLE_BATCH (1 by default; 1 lets queued article reads share metadata within one execution).
 
 import bcrypt;
 import crypto;
@@ -81,7 +82,7 @@ fn main() {
     let port = env_int("PORT", 3000);
     listen_addr = if host == "0.0.0.0" { 0 } else { address(host) };
     listen_port = port;
-    let workers = env_int("WORKERS", 4);
+    let workers = env_int("WORKERS", 2);
     readers = env_int("PG_READERS", 3);
     // Each loop owns readers plus one writer. Check before adding or multiplying
     // untrusted environment integers, and leave five connections for the box.
@@ -89,9 +90,13 @@ fn main() {
     if workers > 95 / (readers + 1) { abort("WORKERS * (PG_READERS + 1) must be at most 95"); }
     let hashers = env_int("HASHERS", 2);
     batch_ms = env_int("BCRYPT_BATCH_MS", 250);
+    write_batch_us = if env_or("WRITE_BATCH_US", "") == "0" { 0 } else { env_int("WRITE_BATCH_US", 1000) };
+    if write_batch_us > 1000000 { abort("WRITE_BATCH_US must be at most 1000000"); }
+    read_batch_us = if env_or("READ_BATCH_US", "5000") == "0" { 0 } else { env_int("READ_BATCH_US", 5000) };
+    if read_batch_us > 1000000 { abort("READ_BATCH_US must be at most 1000000"); }
     batch_max = if env_or("READ_BATCH", "") == "0" { 0 } else { env_int("READ_BATCH", 32) };
     batch_hold = env_int("READ_HOLD", 1);
-    let article = env_or("ARTICLE_BATCH", "0");
+    let article = env_or("ARTICLE_BATCH", "1");
     if article != "0" && article != "1" { abort("ARTICLE_BATCH must be 0 or 1"); }
     article_batch = article == "1";
     raise_nofile();

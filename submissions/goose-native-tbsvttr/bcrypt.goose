@@ -160,6 +160,163 @@ fn hash5(key: u32[18][5]&, salt: u32[18][5]&, cost: i64, ct: u32[6][5]&) {
     const for <K> in [0, 1, 2, 3, 4] { finish(st[K], ct[K]); }
 }
 
+// Exact lane counts avoid computing repeated hashes for unused slots.
+inline fn encipher2(st: Lane[2]&, l: u32[2]&, r: u32[2]&) {
+    const for <K> in [0, 1] { l[K] ^= st[K].p[0]; }
+    const for <J> in [1, 3, 5, 7, 9, 11, 13, 15] {
+        const for <K> in [0, 1] { r[K] ^= st[K].p[J]; r[K] ^= f(st[K], l[K]); }
+        const for <K> in [0, 1] { l[K] ^= st[K].p[J + 1]; l[K] ^= f(st[K], r[K]); }
+    }
+    const for <K> in [0, 1] {
+        let t = r[K] ^ st[K].p[17];
+        r[K] = l[K];
+        l[K] = t;
+    }
+}
+
+fn expand0_2(st: Lane[2]&, w: u32[18][5]&) {
+    for i in 18 { const for <K> in [0, 1] { st[K].p[i] ^= w[K][i]; } }
+    var l: u32[2] = [0; 2];
+    var r: u32[2] = [0; 2];
+    for h in 9 {
+        encipher2(st, l, r);
+        const for <K> in [0, 1] { st[K].p[2 * h] = l[K]; st[K].p[2 * h + 1] = r[K]; }
+    }
+    for h in 128 {
+        encipher2(st, l, r);
+        const for <K> in [0, 1] { st[K].s0[2 * h] = l[K]; st[K].s0[2 * h + 1] = r[K]; }
+    }
+    for h in 128 {
+        encipher2(st, l, r);
+        const for <K> in [0, 1] { st[K].s1[2 * h] = l[K]; st[K].s1[2 * h + 1] = r[K]; }
+    }
+    for h in 128 {
+        encipher2(st, l, r);
+        const for <K> in [0, 1] { st[K].s2[2 * h] = l[K]; st[K].s2[2 * h + 1] = r[K]; }
+    }
+    for h in 128 {
+        encipher2(st, l, r);
+        const for <K> in [0, 1] { st[K].s3[2 * h] = l[K]; st[K].s3[2 * h + 1] = r[K]; }
+    }
+}
+
+fn hash2(key: u32[18][5]&, salt: u32[18][5]&, cost: i64, ct: u32[6][5]&) {
+    var st: Lane[2] = default<Lane[2]>();
+    const for <K> in [0, 1] {
+        init(st[K]);
+        expand_state(st[K], key[K], salt[K]);
+    }
+    for n in 1 << cost {
+        expand0_2(st, key);
+        expand0_2(st, salt);
+    }
+    const for <K> in [0, 1] { finish(st[K], ct[K]); }
+}
+
+inline fn encipher3(st: Lane[3]&, l: u32[3]&, r: u32[3]&) {
+    const for <K> in [0, 1, 2] { l[K] ^= st[K].p[0]; }
+    const for <J> in [1, 3, 5, 7, 9, 11, 13, 15] {
+        const for <K> in [0, 1, 2] { r[K] ^= st[K].p[J]; r[K] ^= f(st[K], l[K]); }
+        const for <K> in [0, 1, 2] { l[K] ^= st[K].p[J + 1]; l[K] ^= f(st[K], r[K]); }
+    }
+    const for <K> in [0, 1, 2] {
+        let t = r[K] ^ st[K].p[17];
+        r[K] = l[K];
+        l[K] = t;
+    }
+}
+
+fn expand0_3(st: Lane[3]&, w: u32[18][5]&) {
+    for i in 18 { const for <K> in [0, 1, 2] { st[K].p[i] ^= w[K][i]; } }
+    var l: u32[3] = [0; 3];
+    var r: u32[3] = [0; 3];
+    for h in 9 {
+        encipher3(st, l, r);
+        const for <K> in [0, 1, 2] { st[K].p[2 * h] = l[K]; st[K].p[2 * h + 1] = r[K]; }
+    }
+    for h in 128 {
+        encipher3(st, l, r);
+        const for <K> in [0, 1, 2] { st[K].s0[2 * h] = l[K]; st[K].s0[2 * h + 1] = r[K]; }
+    }
+    for h in 128 {
+        encipher3(st, l, r);
+        const for <K> in [0, 1, 2] { st[K].s1[2 * h] = l[K]; st[K].s1[2 * h + 1] = r[K]; }
+    }
+    for h in 128 {
+        encipher3(st, l, r);
+        const for <K> in [0, 1, 2] { st[K].s2[2 * h] = l[K]; st[K].s2[2 * h + 1] = r[K]; }
+    }
+    for h in 128 {
+        encipher3(st, l, r);
+        const for <K> in [0, 1, 2] { st[K].s3[2 * h] = l[K]; st[K].s3[2 * h + 1] = r[K]; }
+    }
+}
+
+fn hash3(key: u32[18][5]&, salt: u32[18][5]&, cost: i64, ct: u32[6][5]&) {
+    var st: Lane[3] = default<Lane[3]>();
+    const for <K> in [0, 1, 2] {
+        init(st[K]);
+        expand_state(st[K], key[K], salt[K]);
+    }
+    for n in 1 << cost {
+        expand0_3(st, key);
+        expand0_3(st, salt);
+    }
+    const for <K> in [0, 1, 2] { finish(st[K], ct[K]); }
+}
+
+inline fn encipher4(st: Lane[4]&, l: u32[4]&, r: u32[4]&) {
+    const for <K> in [0, 1, 2, 3] { l[K] ^= st[K].p[0]; }
+    const for <J> in [1, 3, 5, 7, 9, 11, 13, 15] {
+        const for <K> in [0, 1, 2, 3] { r[K] ^= st[K].p[J]; r[K] ^= f(st[K], l[K]); }
+        const for <K> in [0, 1, 2, 3] { l[K] ^= st[K].p[J + 1]; l[K] ^= f(st[K], r[K]); }
+    }
+    const for <K> in [0, 1, 2, 3] {
+        let t = r[K] ^ st[K].p[17];
+        r[K] = l[K];
+        l[K] = t;
+    }
+}
+
+fn expand0_4(st: Lane[4]&, w: u32[18][5]&) {
+    for i in 18 { const for <K> in [0, 1, 2, 3] { st[K].p[i] ^= w[K][i]; } }
+    var l: u32[4] = [0; 4];
+    var r: u32[4] = [0; 4];
+    for h in 9 {
+        encipher4(st, l, r);
+        const for <K> in [0, 1, 2, 3] { st[K].p[2 * h] = l[K]; st[K].p[2 * h + 1] = r[K]; }
+    }
+    for h in 128 {
+        encipher4(st, l, r);
+        const for <K> in [0, 1, 2, 3] { st[K].s0[2 * h] = l[K]; st[K].s0[2 * h + 1] = r[K]; }
+    }
+    for h in 128 {
+        encipher4(st, l, r);
+        const for <K> in [0, 1, 2, 3] { st[K].s1[2 * h] = l[K]; st[K].s1[2 * h + 1] = r[K]; }
+    }
+    for h in 128 {
+        encipher4(st, l, r);
+        const for <K> in [0, 1, 2, 3] { st[K].s2[2 * h] = l[K]; st[K].s2[2 * h + 1] = r[K]; }
+    }
+    for h in 128 {
+        encipher4(st, l, r);
+        const for <K> in [0, 1, 2, 3] { st[K].s3[2 * h] = l[K]; st[K].s3[2 * h + 1] = r[K]; }
+    }
+}
+
+fn hash4(key: u32[18][5]&, salt: u32[18][5]&, cost: i64, ct: u32[6][5]&) {
+    var st: Lane[4] = default<Lane[4]>();
+    const for <K> in [0, 1, 2, 3] {
+        init(st[K]);
+        expand_state(st[K], key[K], salt[K]);
+    }
+    for n in 1 << cost {
+        expand0_4(st, key);
+        expand0_4(st, salt);
+    }
+    const for <K> in [0, 1, 2, 3] { finish(st[K], ct[K]); }
+}
+
 // ---------- bcrypt's base64: its own alphabet, no padding ----------
 
 let ALPHABET = "./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -229,7 +386,7 @@ let HASH_COST = 10;
 let LANES = 5;
 
 // verify: does password match hash? Otherwise: hash password with a fresh salt at HASH_COST.
-struct BJob { tag: u64, reply_fd: i32, verify: bool, password: u8[..72], hash: u8[..60] }
+struct BJob { tag: u64, enqueued_ns: i64, reply_fd: i32, verify: bool, password: u8[..72], hash: u8[..60] }
 
 // What goes back down the reply pipe: a fixed-size record, so a pipe write (atomic under 4 KiB) is never split.
 let REPLY_SIZE = 72;
@@ -317,8 +474,8 @@ fn send_reply(job: BJob&, r: BReply) {
     if native_write_atomic_reply(job.reply_fd, bytes) != REPLY_SIZE { abort("bcrypt reply delivery failed"); }
 }
 
-// How long the first job of a batch waits for company: five hashes interleaved cost about 1.3 times one hash,
-// and sign-ins are about one request in a thousand, so the wait never shows in the p95.
+// Collection wait is bounded from enqueue time, including time waiting for a hashing worker.
+// Already queued jobs are drained first; each batch computes only its actual number of lanes.
 var batch_ms = 250;
 
 // Runs at a lower priority than the event loops, so a burst of sign-ins slows itself, not every other request.
@@ -329,11 +486,13 @@ thread_fn hasher() {
     loop {
         jobs.clear();
         jobs.push(qget<BJob>());
-        let deadline = mono_ns() + batch_ms * 1000000;
+        let deadline = jobs[0].enqueued_ns + batch_ms * 1000000;
         while jobs.len < LANES {
-            let left = (deadline - mono_ns()) / 1000000;
-            if left <= 0 { break; }
-            let j, got = qget<BJob>(left);
+            let queued, ready = qpoll<BJob>();
+            if ready { jobs.push(queued); continue; }
+            let remaining = deadline - mono_ns();
+            if remaining <= 0 { break; }
+            let j, got = qget<BJob>((remaining + 999999) / 1000000);
             if !got { break; }
             jobs.push(j);
         }
@@ -362,9 +521,11 @@ thread_fn hasher() {
             hash1(keys[0], salts[0], cost, ct);
             answer(jobs[lane_of[0]], slots[lane_of[0]], ct);
         } else if lanes > 1 {
-            for k in lanes..LANES { keys[k] = keys[0]; salts[k] = salts[0]; }   // idle lanes repeat lane 0
             var cts: u32[6][5] = [[0; 6]; 5];
-            hash5(keys, salts, cost, cts);
+            if lanes == 2 { hash2(keys, salts, cost, cts); }
+            else if lanes == 3 { hash3(keys, salts, cost, cts); }
+            else if lanes == 4 { hash4(keys, salts, cost, cts); }
+            else { hash5(keys, salts, cost, cts); }
             for k in lanes { answer(jobs[lane_of[k]], slots[lane_of[k]], cts[k]); }
         }
     }

@@ -1,7 +1,8 @@
 // One event loop: its own listener (SO_REUSEPORT spreads connections over the loops), its own epoll, its own
 // Postgres connections and its own bcrypt reply pipe. A client connection runs one request at a time; requests that
 // need the database are Bind/Execute messages appended to a Postgres connection's output, and every request
-// appended in one turn of the loop shares one Sync, so a turn's writes commit together.
+// shares a Sync with a bounded writer collection interval. Only closed groups are sent;
+// every successful write is answered after its ReadyForQuery confirms commit.
 
 import bcrypt;
 import buf;
@@ -27,7 +28,9 @@ var jwt_key: u8[>..] = [];
 var readers = 3;
 var batch_max = 32;             // the most reads one batched execution answers; 0 sends every read on its own
 var batch_hold = 1;             // reads wait in the pool while this many batched executions are in flight
-var article_batch = false;     // optional live article reads share enrichment only within one SQL execution
+var read_batch_us = 5000;          // optional collection window for pending HTTP reads; 0 preserves immediate dispatch
+var write_batch_us = 1000;     // 0 restores immediate writer Sync; collection never delays read groups
+var article_batch = true;     // optional live article reads share enrichment only within one SQL execution
 
 // ---------- state ----------
 
@@ -96,6 +99,8 @@ struct Pgc {
     tail: i64 = -1,
     open: i64 = 0,              // requests appended since the last Sync
     waiting: i64 = 0,
+    sendable: i64 = 0,          // output bytes covered by a Sync; unclosed writer tail stays local
+    opened_ns: i64 = 0,         // monotonic first request time of the current open group
     scan: i64 = 0,              // where in inb the search for the next ReadyForQuery goes on
 }
 
@@ -108,6 +113,7 @@ var now_ms = 0;
 var ready: u64[>..] = [];       // connections with input left once their answer went out
 var scratch: u8[>..] = [];      // the receive buffer
 var pool: i64[>..] = [];        // list, tags, and optionally article reads waiting to be batched
+var pool_open_ns: i64 = 0;     // first pending request in this pool; no query result is retained here
 var in_flight = 0;              // executions sent from the pool and not answered
 
 let GROUP_MAX = 64;
@@ -279,6 +285,35 @@ fn close_group(p: i64) {
     put(pgs[p].out, SYNC_MSG);
     conns[pgs[p].tail].group_end = true;
     pgs[p].open = 0;
+    pgs[p].opened_ns = 0;
+    pgs[p].sendable = pending(pgs[p].out);
+}
+
+// Ceiling milliseconds make the poll wake for the writer deadline even on an otherwise idle loop.
+fn writer_wait_ms() -> i32 {
+    if pgs[writer].open == 0 { return -1; }
+    let left = pgs[writer].opened_ns + write_batch_us * 1000 - mono_ns();
+    if left <= 0 { return 0; }
+    return ((left + 999999) / 1000000) as! i32;
+}
+
+// A gated pool waits for a PG reply, not a repeatedly expired collection timer.
+// A full pool may bypass the in-flight gate, exactly as pool_flush already does.
+fn pool_wait_ms() -> i32 {
+    if read_batch_us == 0 || batch_max == 0 || pool.len == 0 { return -1; }
+    if pool.len >= batch_max { return 0; }
+    if in_flight >= batch_hold { return -1; }
+    let left = pool_open_ns + read_batch_us * 1000 - mono_ns();
+    if left <= 0 { return 0; }
+    return ((left + 999999) / 1000000) as! i32;
+}
+
+fn poll_wait_ms() -> i32 {
+    let write_ms = writer_wait_ms();
+    let read_ms = pool_wait_ms();
+    if write_ms < 0 { return read_ms; }
+    if read_ms < 0 { return write_ms; }
+    return min(write_ms, read_ms);
 }
 
 fn least_busy_reader() -> i64 {
@@ -292,6 +327,7 @@ fn put_request(p: i64, slot: i64, m: const u8[:]) {
     put(pgs[p].out, m);
     enqueue(p, slot);
     pgs[p].waiting += 1;
+    if pgs[p].open == 0 { pgs[p].opened_ns = mono_ns(); }
     pgs[p].open += 1;
     if pgs[p].open >= GROUP_MAX { close_group(p); }
     conns[slot].busy = true;
@@ -328,15 +364,17 @@ fn pool_add(slot: i64, m: const u8[:], fam: i64) {
     if batch_max == 0 { send_kept(slot); return; }
     c.fam = fam;
     c.busy = true;
+    if read_batch_us > 0 && pool.len == 0 { pool_open_ns = mono_ns(); }
     pool.push(slot);
 }
 
 fn pool_flush() {
     if pool.len == 0 || (in_flight >= batch_hold && pool.len < batch_max) { return; }
+    if read_batch_us > 0 && pool.len < batch_max && mono_ns() - pool_open_ns < read_batch_us * 1000 { return; }
     var group: i64[>..] = [];
-    for f in 6 {
-        let fam = if f < 4 { ST_LIST_ALL + f } else if f == 4 { ST_TAGS } else { ST_ARTICLE };
-        let limit = if fam == ST_ARTICLE { min(batch_max, 32) } else { batch_max };
+    for f in 8 {
+        let fam = if f < 4 { ST_LIST_ALL + f } else if f == 4 { ST_TAGS } else if f == 5 { ST_ARTICLE } else if f == 6 { ST_FEED } else { ST_COMMENTS };
+        let limit = if fam == ST_ARTICLE || fam == ST_COMMENTS { min(batch_max, 32) } else { batch_max };
         group.clear();
         for s in pool {
             if conns[s].fam != fam { continue; }
@@ -348,6 +386,7 @@ fn pool_flush() {
         if group.len > 0 { dispatch(group, fam); }
     }
     pool.clear();
+    pool_open_ns = 0;
 }
 
 // One execution for the group, answered to its first member, which hands each member its rows.
@@ -359,11 +398,25 @@ fn dispatch(group: const i64[:], fam: i64) {
     for s, i in group { conns[s].co_next = if i + 1 < group.len { group[i + 1] } else { -1 }; }
     conns[lead].lead = true;
     if fam == ST_TAGS { send_kept(lead); return; }      // the same statement answers them all
-    if fam == ST_ARTICLE {
+    if fam == ST_ARTICLE || fam == ST_COMMENTS {
         var m: u8[>..] = [];
-        let b = bind_begin(m, ST_BATCH_ARTICLE, 2);
+        let b = bind_begin(m, if fam == ST_ARTICLE { ST_BATCH_ARTICLE } else { ST_BATCH_COMMENTS }, 2);
         for k in 2 {
             let at = param_array_begin(m, if k == 0 { OID_INT8 } else { OID_TEXT }, group.len);
+            for s in group { m.append(bind_param(kept(s), k)); }
+            param_array_end(m, at);
+        }
+        bind_end(m, b);
+        put_request(least_busy_reader(), lead, m);
+        return;
+    }
+    // Feed pages depend on the viewer. Batch their executions without the
+    // non-viewer duplicate heuristic used for public lists; all four args are int8.
+    if fam == ST_FEED {
+        var m: u8[>..] = [];
+        let b = bind_begin(m, ST_BATCH_FEED, 4);
+        for k in 4 {
+            let at = param_array_begin(m, OID_INT8, group.len);
             for s in group { m.append(bind_param(kept(s), k)); }
             param_array_end(m, at);
         }
@@ -495,11 +548,15 @@ fn pg_readable(p: i64) {
 fn pg_flush() {
     pool_flush();
     for p in pgs.len {
-        if pgs[p].open > 0 { close_group(p); }
-        while pending(pgs[p].out) > 0 {
-            let n = sys_send(pgs[p].fd, waiting(pgs[p].out), MSG_DONTWAIT | MSG_NOSIGNAL);
+        if pgs[p].open > 0 && (p != writer || write_batch_us == 0 ||
+                mono_ns() - pgs[p].opened_ns >= write_batch_us * 1000) {
+            close_group(p);
+        }
+        while pgs[p].sendable > 0 {
+            let n = sys_send(pgs[p].fd, waiting(pgs[p].out)[..pgs[p].sendable], MSG_DONTWAIT | MSG_NOSIGNAL);
             if n <= 0 { break; }
             consume(pgs[p].out, n);
+            pgs[p].sendable -= n;
         }
     }
 }
@@ -587,7 +644,7 @@ fn pend_failed(slot: i64, code: const u8[:], text: const u8[:]) {
 // ---------- bcrypt ----------
 
 fn hash_job(slot: i64, verify: bool, password: const u8[:], hash: const u8[:]) {
-    var j = BJob { tag: tag_of(slot), reply_fd: reply_write, verify: verify, password: "", hash: "" };
+    var j = BJob { tag: tag_of(slot), enqueued_ns: mono_ns(), reply_fd: reply_write, verify: verify, password: "", hash: "" };
     j.password.append(password);
     j.hash.append(hash[..min(hash.len, 60)]);
     conns[slot].busy = true;
@@ -660,7 +717,7 @@ thread_fn worker(index: i64) {
 
     var evs: EpollEvent[256] = [EpollEvent { events: 0, data: 0 }; 256];
     loop {
-        let n = sys_epoll_wait(epfd, evs, -1);
+        let n = sys_epoll_wait(epfd, evs, poll_wait_ms());
         now_ms = wall_ns() / 1000000;
         for i in n as i64 {
             let e = evs[i];

@@ -50,6 +50,17 @@ fn optional(fbuf: const u8[:], f: Field, nonempty: bool) -> bool {
     return f.state == F_STRING && valid_text(value(fbuf, f)) && (!nonempty || f.len > 0);
 }
 
+// Passwords are bcrypt byte strings, not PostgreSQL text. JSON U+0000 is
+// valid here; usernames/email/bio/image keep the stricter text-column check.
+fn required_password(fbuf: const u8[:], f: Field) -> bool {
+    return f.state == F_STRING && f.len > 0 && valid_utf8(value(fbuf, f), true);
+}
+
+fn optional_password(fbuf: const u8[:], f: Field) -> bool {
+    if f.state == F_ABSENT || f.state == F_NULL { return true; }
+    return required_password(fbuf, f);
+}
+
 fn param_opt(m: u8[>..]&, fbuf: const u8[:], f: Field) {
     if f.state == F_STRING { param_text(m, value(fbuf, f)); } else { param_null(m); }
 }
@@ -189,7 +200,7 @@ fn register(slot: i64, r: Request&) {
         else { json::skip(jr); }
     };
     if !ok { fail(slot, 422, "invalid body"); return; }
-    if !required(fbuf, username) || !required(fbuf, email) || !required(fbuf, password) {
+    if !required(fbuf, username) || !required(fbuf, email) || !required_password(fbuf, password) {
         fail(slot, 422, "username, email and password are required");
         return;
     }
@@ -217,7 +228,7 @@ fn login(slot: i64, r: Request&) {
         else { json::skip(jr); }
     };
     if !ok { fail(slot, 422, "invalid body"); return; }
-    if !required(fbuf, email) || !required(fbuf, password) { fail(slot, 422, "email and password are required"); return; }
+    if !required(fbuf, email) || !required_password(fbuf, password) { fail(slot, 422, "email and password are required"); return; }
     if password.len > PASSWORD_MAX { fail(slot, 401, "invalid email or password"); return; }
     begin(slot, K_LOGIN, 0);
     var msg: u8[>..] = [];
@@ -258,7 +269,7 @@ fn update_user(slot: i64, r: Request&) {
         else { json::skip(jr); }
     };
     if !ok { fail(slot, 422, "invalid body"); return; }
-    if !optional(fbuf, email, true) || !optional(fbuf, username, true) || !optional(fbuf, password, true) || !optional(fbuf, bio, false)
+    if !optional(fbuf, email, true) || !optional(fbuf, username, true) || !optional_password(fbuf, password) || !optional(fbuf, bio, false)
        || !optional(fbuf, image, false) {
         fail(slot, 422, "invalid user fields");
         return;
@@ -377,7 +388,7 @@ fn feed(slot: i64, r: Request&) {
     param_int(msg, offset);
     param_int(msg, if offset > 0x7fffffffffffffff - limit { 0x7fffffffffffffff } else { offset + limit });
     bind_end(msg, b);
-    submit(slot, msg, false);
+    pool_add(slot, msg, ST_FEED);
 }
 
 // The single-article requests that take nothing but the slug.
@@ -399,20 +410,45 @@ fn by_slug(slot: i64, r: Request&, slug: const u8[:], kind: i64, auth: bool) {
     param_int(msg, viewer);
     param_text(msg, pval);
     bind_end(msg, b);
-    if kind == K_FAVORITE || kind == K_UNFAVORITE { set_ctx(slot, pval); }
-    if kind == K_ARTICLE && article_batch { pool_add(slot, msg, ST_ARTICLE); } else { submit(slot, msg, auth); }
+    if kind == K_COMMENTS { pool_add(slot, msg, ST_COMMENTS); }
+    else if kind == K_ARTICLE && article_batch { pool_add(slot, msg, ST_ARTICLE); }
+    else { submit(slot, msg, auth); }
 }
 
 // Called only after the writer's complete Sync group has reached ReadyForQuery.
 // Replace the saved mutation with a read, so retries can never replay a committed write.
+// The returned id remains valid even if the slug changed while the mutation waited.
 fn favorite_committed(slot: i64, rows: const u8[:]) {
-    if first_row(rows).len == 0 { fail(slot, 404, "article not found"); return; }
+    let m = first_row(rows);
+    if m.len == 0 { fail(slot, 404, "article not found"); return; }
+    var r = row(m);
+    let id = col_int(r);
     let viewer = conns[slot].viewer;
     begin(slot, K_ARTICLE, viewer);
     var msg: u8[>..] = [];
-    let b = stmt(slot, msg, ST_ARTICLE, 2);
+    let b = stmt(slot, msg, ST_ARTICLE_BY_ID, 2);
     param_int(msg, viewer);
-    param_text(msg, ctx(slot));
+    param_int(msg, id);
+    bind_end(msg, b);
+    submit(slot, msg, false);
+}
+
+// Called after the UPDATE writer group reaches ReadyForQuery. A separate
+// statement gets a fresh snapshot; replacing the kept mutation with this read
+// also means a later retry cannot replay an already committed UPDATE.
+fn article_update_committed(slot: i64, rows: const u8[:]) {
+    let m = first_row(rows);
+    if m.len == 0 { fail(slot, 404, "article not found"); return; }
+    var r = row(m);
+    let owner = col_int(r);
+    let id = col_int(r);
+    let viewer = conns[slot].viewer;
+    if owner != viewer { fail(slot, 403, "not the author"); return; }
+    begin(slot, K_ARTICLE, viewer);
+    var msg: u8[>..] = [];
+    let b = stmt(slot, msg, ST_ARTICLE_BY_ID, 2);
+    param_int(msg, viewer);
+    param_int(msg, id);
     bind_end(msg, b);
     submit(slot, msg, false);
 }
@@ -605,6 +641,7 @@ fn answer(slot: i64, rows: const u8[:]) {
     var out: u8[>..] = [];
     match c.kind {
         K_FAVORITE, K_UNFAVORITE => { favorite_committed(slot, rows); return; },
+        K_UPDATE_ARTICLE => { article_update_committed(slot, rows); return; },
         K_REGISTER, K_CURRENT, K_UPDATE_USER => {
             if m.len == 0 { fail(slot, 401, "unauthorized"); return; }
             var r = row(m);
@@ -664,13 +701,9 @@ fn answer(slot: i64, rows: const u8[:]) {
             out.push('}');
             end_response(out, at);
         },
-        K_ARTICLE, K_CREATE, K_UPDATE_ARTICLE => {
+        K_ARTICLE, K_CREATE => {
             if m.len == 0 { fail(slot, 404, "article not found"); return; }
             var r = row(m);
-            if c.kind == K_UPDATE_ARTICLE {
-                col_skip(r);                              // author_id; the article follows if the viewer wrote it
-                if col_null(r) { fail(slot, 403, "not the author"); return; }
-            }
             let at = begin_response(out, if c.kind == K_CREATE { 201 } else { 200 }, close);
             out.append("{\"article\":");
             write_article(out, r, true);
