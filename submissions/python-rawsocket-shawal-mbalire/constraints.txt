@@ -1,0 +1,5 @@
+bcrypt==5.0.0
+psycopg==3.3.4
+psycopg-pool==3.3.3
+PyJWT==2.15.1
+typing_extensions==4.16.0
