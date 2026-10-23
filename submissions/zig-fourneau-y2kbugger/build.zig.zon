@@ -1,0 +1,10 @@
+.{
+    .name = .conduit,
+    .version = "0.1.0",
+    .fingerprint = 0xfdbb5281d7816834,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .fourneau = .{ .path = "../../../eldhus/fourneau-multi" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
