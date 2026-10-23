@@ -1,0 +1,137 @@
+# Max-concurrency search for the c-libco submission on parallel GitHub
+# runners. Each matrix job hosts the full stack (Postgres 18 + the server +
+# the challenge's own loadgen) on one 4-vCPU ubuntu-24.04 runner and probes a
+# different user count, so the levels run simultaneously. The scoring box is
+# 8-core and the loadgen runs on separate machines there, so these numbers are
+# a lower bound and often LG-limited; they compare engines and smoke out
+# crashes, connection leaks and tail-latency blowups.
+name: bench
+on:
+  workflow_dispatch:
+    inputs:
+      levels:
+        description: 'JSON list of user counts'
+        default: '[1000, 2500, 5000, 10000, 15000, 20000]'
+permissions:
+  contents: read
+jobs:
+  asan:
+    if: github.event.inputs.levels == '[1000]'
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:18
+        env: { POSTGRES_PASSWORD: postgres }
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
+    env: { PGHOST: 127.0.0.1, PGPORT: 5432, PGUSER: postgres, PGPASSWORD: postgres, JWT_SECRET: multicore-server-challenge }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: bench/go.mod, cache-dependency-path: bench/go.sum }
+      - name: tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client curl jq
+      - name: seed
+        run: bash seed/make-seed.sh --dev
+      - name: build asan
+        run: |
+          sudo bash submissions/c-libco-ssmurfgg04-gif/install.sh
+          cd submissions/c-libco-ssmurfgg04-gif
+          mkdir -p bin
+          gcc -std=gnu11 -O0 -g -fsanitize=address -pthread -o bin/conduit-asan src/*.c -luring -lcrypt -lm
+      - name: start asan server
+        run: |
+          cd submissions/c-libco-ssmurfgg04-gif
+          DATABASE_URL="postgres://conduit:conduit@127.0.0.1:5432/conduit_dev" \
+          JWT_SECRET=multicore-server-challenge HOST=0.0.0.0 PORT=3000 \
+          ASAN_OPTIONS=detect_leaks=0:abort_on_error=0 \
+          setsid nohup ./bin/conduit-asan > /tmp/asan.log 2>&1 < /dev/null &
+          for i in $(seq 30); do curl -sf -o /dev/null http://127.0.0.1:3000/api/tags && break; sleep 1; done
+          curl -sf http://127.0.0.1:3000/api/tags > /dev/null && echo "asan server up"
+      - name: loadgen build
+        run: (cd bench && go build -o /tmp/loadgen ./cmd/loadgen)
+      - name: load 100 users (ASAN)
+        run: |
+          /tmp/loadgen run -target http://127.0.0.1:3000 -users 100 -ramp 10s -measure 30s \
+            -articles 10000 -run-id asan -secret "$JWT_SECRET" -out /tmp/asan-results.json 2>&1 | tail -15
+      - name: asan report
+        if: always()
+        run: |
+          echo "=== asan log ==="
+          cat /tmp/asan.log | tail -60
+          echo "=== process ==="
+          pgrep -a conduit-asan || echo "asan server died"
+
+  bench:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        users: ${{ fromJson(github.event.inputs.levels || '[1000, 2500, 5000, 10000, 15000, 20000]') }}
+    services:
+      postgres:
+        image: postgres:18
+        env: { POSTGRES_PASSWORD: postgres }
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      JWT_SECRET: multicore-server-challenge
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: bench/go.mod, cache-dependency-path: bench/go.sum }
+      - name: tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client curl jq
+      - name: seed
+        run: bash seed/make-seed.sh --dev
+      - name: install + build
+        run: |
+          sudo bash submissions/c-libco-ssmurfgg04-gif/install.sh
+          (cd submissions/c-libco-ssmurfgg04-gif && bash build.sh)
+      - name: start server
+        run: |
+          cd submissions/c-libco-ssmurfgg04-gif
+          DATABASE_URL="postgres://conduit:conduit@127.0.0.1:5432/conduit_dev" \
+          JWT_SECRET=multicore-server-challenge HOST=0.0.0.0 PORT=3000 \
+          THREADS=2 DB_READS=9 DB_WRITES=3 \
+          setsid nohup bash start.sh > /tmp/server.log 2>&1 < /dev/null &
+          for i in $(seq 60); do curl -sf -o /dev/null http://127.0.0.1:3000/api/tags && break; sleep 1; done
+          curl -sf http://127.0.0.1:3000/api/tags
+          echo "health-ok; process right now:"
+          pgrep -a conduit || echo "DEAD AT END OF START STEP"
+      - name: loadgen build
+        run: |
+          echo "process before go build:"
+          pgrep -a conduit || echo "DEAD BEFORE LOADGEN BUILD"
+          (cd bench && go build -o /tmp/loadgen ./cmd/loadgen)
+          echo "process after go build:"
+          pgrep -a conduit || echo "DEAD AFTER LOADGEN BUILD"
+          dmesg 2>/dev/null | grep -i -E "killed process|oom" | tail -3 || true
+      - name: warm-up (300 users)
+        run: /tmp/loadgen run -target http://127.0.0.1:3000 -users 300 -ramp 20s -measure 40s -articles 10000 -run-id warm-github -secret "$JWT_SECRET" -out /tmp/warm.json 2>&1 | tail -20
+      - name: probe (${{ matrix.users }} users)
+        run: |
+          /tmp/loadgen run -target http://127.0.0.1:3000 -users ${{ matrix.users }} \
+            -ramp 45s -measure 90s -articles 10000 -run-id gh-${{ matrix.users }} \
+            -secret "$JWT_SECRET" -out /tmp/results.json 2>&1 | tail -40
+      - name: verdict
+        run: |
+          jq '{users: .meta.users, rps: .merged.rps, pass: .merged.pass, lg_limited: .merged.lg_limited,
+               p50_ms: .merged.p50_ms, p95_ms: .merged.p95_ms, p99_ms: .merged.p99_ms,
+               errors: .merged.error_pct}' /tmp/results.json || cat /tmp/results.json | head -50
+      - name: server log
+        if: always()
+        run: |
+          echo "=== server log (full) ==="
+          cat /tmp/server.log || true
+          echo "=== process check ==="
+          pgrep -a conduit || echo "server process NOT running"
+      - name: upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.users }}
+          path: /tmp/results.json
