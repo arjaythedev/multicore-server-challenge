@@ -58,7 +58,7 @@ pub fn main() {
   let host = env("HOST", "127.0.0.1")
   let port = env_int("PORT", 3000)
   let read_conns = env_int("DB_READ_CONNS", 12)
-  let write_conns = env_int("DB_WRITE_CONNS", 4)
+  let write_conns = env_int("DB_WRITE_CONNS", 8)
   let acceptors = env_int("ACCEPTORS", 16)
   let hibernate_words = env_int("HIB_WORDS", 2048)
   case database_url == "" || secret == "" {

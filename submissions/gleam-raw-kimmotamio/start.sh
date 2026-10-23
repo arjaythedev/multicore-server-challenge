@@ -13,7 +13,7 @@ dirty=$(( cores / 4 )); (( dirty >= 2 )) || dirty=2
 export SCHEDULERS="${SCHEDULERS:-$sched}"
 export DIRTY_CPU="${DIRTY_CPU:-$dirty}"
 export DB_READ_CONNS="${DB_READ_CONNS:-12}"
-export DB_WRITE_CONNS="${DB_WRITE_CONNS:-4}"
+export DB_WRITE_CONNS="${DB_WRITE_CONNS:-8}"
 export ACCEPTORS="${ACCEPTORS:-16}"
 # +sbwt none: idle schedulers sleep instead of spinning, leaving the cores to Postgres.
 # +P/+Q: one process and one port per keep-alive connection; the defaults are too low for tens of thousands.
