@@ -28,6 +28,7 @@ var jwt_key: u8[>..] = [];
 var readers = 3;
 var batch_max = 32;             // the most reads one batched execution answers; 0 sends every read on its own
 var batch_hold = 1;             // reads wait in the pool while this many batched executions are in flight
+var read_group_max = 4;           // outstanding reader Sync groups; 0 leaves admission unbounded
 var read_batch_us = 5000;          // optional collection window for pending HTTP reads; 0 preserves immediate dispatch
 var write_batch_us = 1000;     // 0 restores immediate writer Sync; collection never delays read groups
 var article_batch = true;     // optional live article reads share enrichment only within one SQL execution
@@ -84,6 +85,8 @@ struct Conn {
     msg_len: i64 = 0,
     fam: i64 = -1,              // the statement of a read waiting in the pool
     pooled: bool = false,       // sent from the pool: counted in in_flight until its answer comes
+    read_node: i64 = -1,        // owned node in a local, unsubmitted readonly queue
+    read_order: i64 = 0,        // monotonic enqueue order within this worker
     lead: bool = false,         // its execution answers it and the members chained by co_next
     co_next: i64 = -1,
 }
@@ -99,6 +102,7 @@ struct Pgc {
     tail: i64 = -1,
     open: i64 = 0,              // requests appended since the last Sync
     waiting: i64 = 0,
+    groups: i64 = 0,            // closed Sync groups not yet answered by ReadyForQuery
     sendable: i64 = 0,          // output bytes covered by a Sync; unclosed writer tail stays local
     opened_ns: i64 = 0,         // monotonic first request time of the current open group
     scan: i64 = 0,              // where in inb the search for the next ReadyForQuery goes on
@@ -112,11 +116,19 @@ var reply_write: i32 = -1;
 var now_ms = 0;
 var ready: u64[>..] = [];       // connections with input left once their answer went out
 var scratch: u8[>..] = [];      // the receive buffer
-var pool: i64[>..] = [];        // list, tags, and optionally article reads waiting to be batched
+// Nine local FIFO queues: the eight pooled families and direct readonly work.
+// Nodes outlive a disconnected Conn slot only until unlink, and retain its tag.
+struct ReadNode { tag: u64 = 0, qid: i64 = 0, prev: i64 = -1, next: i64 = -1 }
+reusable var read_nodes: ReadNode[>..] = [];
+var read_heads: i64[9] = [-1; 9];
+var read_tails: i64[9] = [-1; 9];
+var read_serial: i64 = 0;
+var pool_count = 0;
 var pool_open_ns: i64 = 0;     // first pending request in this pool; no query result is retained here
 var in_flight = 0;              // executions sent from the pool and not answered
 
 let GROUP_MAX = 64;
+let READ_GROUP_MAX = 4;         // readonly results/credits release early; writer commit groups remain 64
 let RECV_SIZE = 65536;
 let SYNC_MSG: u8[5] = ['S', 0, 0, 0, 4];
 
@@ -132,6 +144,7 @@ fn log(s: const u8[:]) { sys_write(2, str("conduit: ", s, "\n")); }
 
 fn free_conn(slot: i64) {
     let c .= conns[slot];
+    if c.read_node >= 0 { unlink_read(c.read_node); }
     release(c.inb.run); release(c.outb.run); release(c.ctx); release(c.msg);
     c = Conn { .. };
     conns.free(slot);
@@ -140,7 +153,13 @@ fn free_conn(slot: i64) {
 fn close_conn(slot: i64) {
     let c .= conns[slot];
     if c.fd >= 0 { sys_close(c.fd); c.fd = -1; }
-    if c.busy { c.dead = true; return; }
+    if c.busy {
+        // Only locally owned reads can be discarded. Submitted work and writes
+        // retain their existing owner until its answer, even after disconnect.
+        if !c.write && c.read_node >= 0 { free_conn(slot); return; }
+        c.dead = true;
+        return;
+    }
     free_conn(slot);
 }
 
@@ -282,11 +301,13 @@ fn enqueue(p: i64, slot: i64) {
 }
 
 fn close_group(p: i64) {
+    if p != writer && read_group_max > 0 { assert(pgs[p].groups < read_group_max); }
     put(pgs[p].out, SYNC_MSG);
     conns[pgs[p].tail].group_end = true;
     pgs[p].open = 0;
     pgs[p].opened_ns = 0;
     pgs[p].sendable = pending(pgs[p].out);
+    pgs[p].groups += 1;
 }
 
 // Ceiling milliseconds make the poll wake for the writer deadline even on an otherwise idle loop.
@@ -300,9 +321,9 @@ fn writer_wait_ms() -> i32 {
 // A gated pool waits for a PG reply, not a repeatedly expired collection timer.
 // A full pool may bypass the in-flight gate, exactly as pool_flush already does.
 fn pool_wait_ms() -> i32 {
-    if read_batch_us == 0 || batch_max == 0 || pool.len == 0 { return -1; }
-    if pool.len >= batch_max { return 0; }
-    if in_flight >= batch_hold { return -1; }
+    oldest_pool_queue(); // discard any stale heads before the shared gate
+    if read_batch_us == 0 || batch_max == 0 || pool_blocked() { return -1; }
+    if pool_count >= batch_max { return 0; }
     let left = pool_open_ns + read_batch_us * 1000 - mono_ns();
     if left <= 0 { return 0; }
     return ((left + 999999) / 1000000) as! i32;
@@ -317,9 +338,18 @@ fn poll_wait_ms() -> i32 {
 }
 
 fn least_busy_reader() -> i64 {
-    var p = 0;
-    for i in 1..readers { if pgs[i].waiting < pgs[p].waiting { p = i; } }
+    var p = -1;
+    for i in readers {
+        if read_group_max > 0 && pgs[i].groups >= read_group_max { continue; }
+        if p < 0 || pgs[i].waiting < pgs[p].waiting { p = i; }
+    }
     return p;
+}
+
+// A full pool bypasses only READ_HOLD, never the hard reader reservation.
+fn pool_blocked() -> bool {
+    return pool_count == 0 || least_busy_reader() < 0 ||
+        (in_flight >= batch_hold && pool_count < batch_max);
 }
 
 // Appends a request's messages to Postgres connection p; its answer goes to slot.
@@ -329,14 +359,17 @@ fn put_request(p: i64, slot: i64, m: const u8[:]) {
     pgs[p].waiting += 1;
     if pgs[p].open == 0 { pgs[p].opened_ns = mono_ns(); }
     pgs[p].open += 1;
-    if pgs[p].open >= GROUP_MAX { close_group(p); }
+    if pgs[p].open >= (if p == writer { GROUP_MAX } else { READ_GROUP_MAX }) { close_group(p); }
     conns[slot].busy = true;
 }
 
 fn kept(slot: i64) -> u8[:] { view(conns[slot].msg)[..conns[slot].msg_len] }
 
 // Sends the connection's kept request (again).
-fn send_kept(slot: i64) { put_request(if conns[slot].write { writer } else { least_busy_reader() }, slot, kept(slot)); }
+fn send_kept(slot: i64) {
+    if conns[slot].write { put_request(writer, slot, kept(slot)); return; }
+    enqueue_read(slot, 8);
+}
 
 // Keeps the request's messages with the connection, to send (again).
 fn keep(slot: i64, m: const u8[:]) {
@@ -357,47 +390,136 @@ fn submit(slot: i64, m: const u8[:], write: bool) {
 
 // A list, tags, or enabled article read waits in the pool. Reads arriving while a batched execution is in flight
 // gather there, and the next flush sends each statement's waiting reads as one execution.
-fn pool_add(slot: i64, m: const u8[:], fam: i64) {
-    keep(slot, m);
-    let c .= conns[slot];
-    c.write = false;
-    if batch_max == 0 { send_kept(slot); return; }
-    c.fam = fam;
-    c.busy = true;
-    if read_batch_us > 0 && pool.len == 0 { pool_open_ns = mono_ns(); }
-    pool.push(slot);
+fn active_tag(tag: u64) -> bool {
+    let slot = (tag & 0xffffffff) as! i64;
+    return slot < conns.len && conns[slot].gen == (tag >> 32) as! u32 &&
+        conns[slot].fd >= 0 && !conns[slot].dead;
 }
 
+fn pooled_family(q: i64) -> i64 {
+    return if q < 4 { ST_LIST_ALL + q } else if q == 4 { ST_TAGS } else if q == 5 { ST_ARTICLE } else if q == 6 { ST_FEED } else { ST_COMMENTS };
+}
+
+fn pooled_queue(fam: i64) -> i64 {
+    if fam >= ST_LIST_ALL && fam < ST_LIST_ALL + 4 { return fam - ST_LIST_ALL; }
+    if fam == ST_TAGS { return 4; }
+    if fam == ST_ARTICLE { return 5; }
+    if fam == ST_FEED { return 6; }
+    assert(fam == ST_COMMENTS);
+    return 7;
+}
+
+fn enqueue_read(slot: i64, q: i64) {
+    let c .= conns[slot];
+    assert(!c.write && c.read_node < 0);
+    read_serial += 1;
+    c.read_order = read_serial;
+    c.busy = true;
+    let n = read_nodes.alloc_index(ReadNode { tag: tag_of(slot), qid: q, prev: read_tails[q], next: -1 });
+    c.read_node = n;
+    if read_tails[q] >= 0 { read_nodes[read_tails[q]].next = n; } else { read_heads[q] = n; }
+    read_tails[q] = n;
+    if q < 8 {
+        if read_batch_us > 0 && pool_count == 0 { pool_open_ns = mono_ns(); }
+        pool_count += 1;
+    }
+}
+
+// Queue ownership is detached before either PG admission or Conn reuse.
+fn unlink_read(n: i64) {
+    let r = read_nodes[n];
+    if r.prev >= 0 { read_nodes[r.prev].next = r.next; } else { read_heads[r.qid] = r.next; }
+    if r.next >= 0 { read_nodes[r.next].prev = r.prev; } else { read_tails[r.qid] = r.prev; }
+    if r.qid < 8 { pool_count -= 1; if pool_count == 0 { pool_open_ns = 0; } }
+    let slot = (r.tag & 0xffffffff) as! i64;
+    if slot < conns.len && conns[slot].gen == (r.tag >> 32) as! u32 && conns[slot].read_node == n {
+        conns[slot].read_node = -1;
+        conns[slot].fam = -1;
+    }
+    read_nodes[n] = ReadNode { .. };
+    read_nodes.free(n);
+}
+
+fn pending_head(q: i64) -> i64 {
+    while read_heads[q] >= 0 {
+        let n = read_heads[q];
+        let tag = read_nodes[n].tag;
+        let slot = (tag & 0xffffffff) as! i64;
+        if active_tag(tag) && conns[slot].read_node == n { return n; }
+        unlink_read(n);
+    }
+    return -1;
+}
+
+fn oldest_pool_queue() -> i64 {
+    var q = -1;
+    var order = 0;
+    for i in 8 {
+        let n = pending_head(i);
+        if n < 0 { continue; }
+        let slot = (read_nodes[n].tag & 0xffffffff) as! i64;
+        if q < 0 || conns[slot].read_order < order { q = i; order = conns[slot].read_order; }
+    }
+    return q;
+}
+
+fn pool_add(slot: i64, m: const u8[:], fam: i64) {
+    keep(slot, m);
+    conns[slot].write = false;
+    if batch_max == 0 { send_kept(slot); return; }
+    conns[slot].fam = fam;
+    enqueue_read(slot, pooled_queue(fam));
+}
+
+// Admit the oldest eligible direct request or pooled family. A pooled step
+// submits just one batch, then compares ages again; no family/class can refill
+// every released reservation ahead of older eligible work.
 fn pool_flush() {
-    if pool.len == 0 || (in_flight >= batch_hold && pool.len < batch_max) { return; }
-    if read_batch_us > 0 && pool.len < batch_max && mono_ns() - pool_open_ns < read_batch_us * 1000 { return; }
     var group: i64[>..] = [];
-    for f in 8 {
-        let fam = if f < 4 { ST_LIST_ALL + f } else if f == 4 { ST_TAGS } else if f == 5 { ST_ARTICLE } else if f == 6 { ST_FEED } else { ST_COMMENTS };
+    loop {
+        let p = least_busy_reader();
+        if p < 0 { return; }
+        let direct = pending_head(8);
+        var q = oldest_pool_queue();
+        if pool_blocked() || (read_batch_us > 0 && pool_count < batch_max &&
+                mono_ns() - pool_open_ns < read_batch_us * 1000) { q = -1; }
+        if direct < 0 && q < 0 { return; }
+        var choose_direct = direct >= 0;
+        if direct >= 0 && q >= 0 {
+            let d = (read_nodes[direct].tag & 0xffffffff) as! i64;
+            let n = read_heads[q];
+            let s = (read_nodes[n].tag & 0xffffffff) as! i64;
+            choose_direct = conns[d].read_order < conns[s].read_order;
+        }
+        if choose_direct {
+            let slot = (read_nodes[direct].tag & 0xffffffff) as! i64;
+            unlink_read(direct);
+            put_request(p, slot, kept(slot));
+            continue;
+        }
+        let fam = pooled_family(q);
         let limit = if fam == ST_ARTICLE || fam == ST_COMMENTS { min(batch_max, 32) } else { batch_max };
         group.clear();
-        for s in pool {
-            if conns[s].fam != fam { continue; }
-            conns[s].fam = -1;
-            if conns[s].dead { free_conn(s); continue; }
-            group.push(s);
-            if group.len == limit { dispatch(group, fam); group.clear(); }
+        while group.len < limit {
+            let n = pending_head(q);
+            if n < 0 { break; }
+            let slot = (read_nodes[n].tag & 0xffffffff) as! i64;
+            unlink_read(n);
+            group.push(slot);
         }
-        if group.len > 0 { dispatch(group, fam); }
+        dispatch(group, fam, p);
     }
-    pool.clear();
-    pool_open_ns = 0;
 }
 
 // One execution for the group, answered to its first member, which hands each member its rows.
-fn dispatch(group: const i64[:], fam: i64) {
+fn dispatch(group: const i64[:], fam: i64, p: i64) {
     let lead = group[0];
     conns[lead].pooled = true;
     in_flight += 1;
-    if group.len == 1 { send_kept(lead); return; }
+    if group.len == 1 { put_request(p, lead, kept(lead)); return; }
     for s, i in group { conns[s].co_next = if i + 1 < group.len { group[i + 1] } else { -1 }; }
     conns[lead].lead = true;
-    if fam == ST_TAGS { send_kept(lead); return; }      // the same statement answers them all
+    if fam == ST_TAGS { put_request(p, lead, kept(lead)); return; }      // the same statement answers them all
     if fam == ST_ARTICLE || fam == ST_COMMENTS {
         var m: u8[>..] = [];
         let b = bind_begin(m, if fam == ST_ARTICLE { ST_BATCH_ARTICLE } else { ST_BATCH_COMMENTS }, 2);
@@ -407,7 +529,7 @@ fn dispatch(group: const i64[:], fam: i64) {
             param_array_end(m, at);
         }
         bind_end(m, b);
-        put_request(least_busy_reader(), lead, m);
+        put_request(p, lead, m);
         return;
     }
     // Feed pages depend on the viewer. Batch their executions without the
@@ -421,7 +543,7 @@ fn dispatch(group: const i64[:], fam: i64) {
             param_array_end(m, at);
         }
         bind_end(m, b);
-        put_request(least_busy_reader(), lead, m);
+        put_request(p, lead, m);
         return;
     }
     // Shared enrichment pays when at most half the members ask for a page no other member asks for.
@@ -443,7 +565,7 @@ fn dispatch(group: const i64[:], fam: i64) {
         param_array_end(m, at);
     }
     bind_end(m, b);
-    put_request(least_busy_reader(), lead, m);
+    put_request(p, lead, m);
 }
 
 // The members of a batched execution, its lead first, unchained.
@@ -563,6 +685,8 @@ fn pg_flush() {
 
 // One Sync group's answer, up to and including its ReadyForQuery.
 fn group_done(p: i64, data: const u8[:]) {
+    assert(pgs[p].groups > 0);
+    pgs[p].groups -= 1;
     var members: i64[..64] = [];
     loop {
         let s = pgs[p].head;

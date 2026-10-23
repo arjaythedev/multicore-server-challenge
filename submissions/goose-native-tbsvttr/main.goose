@@ -5,7 +5,8 @@
 // loop, 3; each loop also has one writer), HASHERS (bcrypt threads, 2), BCRYPT_BATCH_MS (250), READ_BATCH (most
 // list reads one execution answers, 32; 0 off), READ_HOLD (batches in flight before reads wait, 1),
 // WRITE_BATCH_US (writer collection, 1000; 0 disables it), READ_BATCH_US (pending read collection, 5000 by default),
-// and ARTICLE_BATCH (1 by default; 1 lets queued article reads share metadata within one execution).
+// PG_READ_GROUPS (outstanding Sync groups per reader, 4; 0 unbounded), and ARTICLE_BATCH (1 by default;
+// 1 lets queued article reads share metadata within one execution).
 
 import bcrypt;
 import crypto;
@@ -94,6 +95,7 @@ fn main() {
     if write_batch_us > 1000000 { abort("WRITE_BATCH_US must be at most 1000000"); }
     read_batch_us = if env_or("READ_BATCH_US", "5000") == "0" { 0 } else { env_int("READ_BATCH_US", 5000) };
     if read_batch_us > 1000000 { abort("READ_BATCH_US must be at most 1000000"); }
+    read_group_max = if env_or("PG_READ_GROUPS", "4") == "0" { 0 } else { env_int("PG_READ_GROUPS", 4) };
     batch_max = if env_or("READ_BATCH", "") == "0" { 0 } else { env_int("READ_BATCH", 32) };
     batch_hold = env_int("READ_HOLD", 1);
     let article = env_or("ARTICLE_BATCH", "1");
