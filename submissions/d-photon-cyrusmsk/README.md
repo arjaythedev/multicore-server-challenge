@@ -6,7 +6,7 @@
 |---|---|
 | `install.sh` | LDC 1.41.0, a checksummed tarball (with its own dub) into `/usr/local/ldc`, plus `libpq-dev` (PGDG, 17+ for the driver's pipeline API), `libbsd-dev`, `libssl-dev`, `zlib1g-dev`, `libmimalloc-dev`, `gcc` and `git` |
 | `build.sh` | `dub build --build=release`; every dependency version is pinned in `dub.selections.json` |
-| `start.sh` | `exec ./bin/server`, configured only by `DATABASE_URL`, `JWT_SECRET`, `HOST`, `PORT` (plus optional `CONNS`); preloads mimalloc as the C allocator when installed (`MIMALLOC=0` skips it) |
+| `start.sh` | `exec ./bin/server`, configured only by `DATABASE_URL`, `JWT_SECRET`, `HOST`, `PORT` (plus optional `CONNS`); preloads mimalloc when installed (`MIMALLOC=0` skips it) and best-effort raises `ulimit -n` (`RAISE_NOFILE=0` skips it) |
 
 **Front: direct** — the server holds every virtual user's keep-alive connection itself
 (`LimitNOFILE=200000`), and no Nginx CPU is spent.
@@ -41,9 +41,9 @@ was already parsed and planned by Postgres, so the steady state has no connectio
 no plan, no SQL syntax errors: the statements in `source/db.d` are the only ones that exist, and a
 typo in one of them fails at startup instead of on the first request.
 
-Writing an article is a **single statement** (a CTE chain: article insert → tag insert → tag-link insert), so the write is one statement and
-one implicit transaction, and it commits before the response is sent. The endpoint then runs the
-full-article select on the same connection: two round trips total.
+Writing an article is one transaction: a CTE inserts the article and its tags, a second statement
+links the tag rows, and both commit before the response is sent. The endpoint then runs the
+full-article select on the same connection.
 
 ### Responses and requests go through mir-ion
 
@@ -68,7 +68,7 @@ or a wrong field type is a 422. Unknown fields are ignored, and `Nullable!string
 | (passwords) | [`passwd`](https://code.dlang.org/packages/passwd) — bcrypt with OpenBSD test vectors, not a hand-rolled implementation |
 | (pipelines) | `execPipeline` in `source/db.d`: a list page and its count go out in one flush and come back in order; anything that needs a previous answer stays sequential |
 | (responses) | typed structs serialized by mir-ion; request bodies deserialized by mir-ion — no JSON DOM |
-| (compile) | `-mcpu=native` |
+| (compile) | `CONFIG=native` (default) or `CONFIG=portable`; native uses `-mcpu=native` |
 
 `vendor/photon-http` is the 0.6.10 source with one parser fix: `reset()` clears the previous
 request's `Content-Length`, so a bodyless request that follows a request with a body is parsed

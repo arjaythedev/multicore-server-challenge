@@ -13,7 +13,9 @@ import photon : Mutex, delay, go, goOnAllThreads, initPhoton, mutex,
 
 import conduit.api : ConduitProcessor, setPool;
 import conduit.auth : initAuth;
+import conduit.bcrypt : initPasswordWorkers;
 import conduit.db : Db;
+import conduit.diag : logError;
 
 import core.atomic : atomicLoad, atomicOp, atomicStore, cas;
 import core.stdc.stdlib : abort;
@@ -72,6 +74,7 @@ void main()
         g_port = 3000;
 
     initPhoton();
+    initPasswordWorkers(2);
     clientLock = mutex();
     g_schedulers = schedulerThreads();
     enforce(g_schedulers > 0 && g_schedulers <= totalConnections,
@@ -172,7 +175,7 @@ private void acceptLoop()
                 {
                 }
             }
-            stderr.writeln("conduit: accept failed: ", e.msg);
+            logError("conduit: accept failed: ", e);
             delay(10.msecs);
             continue;
         }
@@ -191,14 +194,27 @@ private void acceptLoop()
 
         // Bind the socket to a heap object: a closure over the loop-local
         // `client` would keep reading the slot that the next accept reuses.
-        auto task = new ClientTask(client);
-        registerClient(task);
+        ClientTask task;
         try
+        {
+            task = new ClientTask(client);
+            registerClient(task);
             go(&task.run);
+        }
         catch (Throwable e)
         {
-            finishClient(task);
-            stderr.writeln("conduit: schedule failed: ", e);
+            if (task !is null)
+                finishClient(task);
+            else
+            {
+                try
+                    client.close();
+                catch (Throwable)
+                {
+                }
+                atomicOp!"-="(g_activeClients, 1);
+            }
+            logError("conduit: schedule failed: ", e);
         }
     }
 }
@@ -329,6 +345,6 @@ private void serveClient(ClientTask task)
         const msg = e.msg;
         if (msg.indexOf("Failed during http parsing") < 0 &&
             msg.indexOf("I/O error") < 0)
-            stderr.writeln("conduit: connection failed: ", e);
+            logError("conduit: connection failed: ", e);
     }
 }

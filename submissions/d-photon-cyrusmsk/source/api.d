@@ -15,12 +15,12 @@ import mir.serde : serdeIgnoreUnexpectedKeys, serdeOptional;
 import mir.ser.json : serializeJson;
 
 import std.array : Appender;
-import std.stdio : stderr;
 import std.string : indexOf;
 
 import conduit.auth;
 import conduit.bcrypt;
 import conduit.db;
+import conduit.diag : logError;
 
 import core.atomic : atomicStore;
 import core.time : MonoTime;
@@ -267,13 +267,14 @@ private bool ieq(const(char)[] a, const(char)[] b) pure nothrow @safe
     return true;
 }
 
-/// Percent-decodes a path segment or query value (`+` is a space). Text with
-/// no escape sequence is returned as a slice of the request buffer.
-private const(char)[] decodeComponent(const(char)[] text)
+/// Percent-decodes a path segment or query value. `+` means space only in a
+/// form-encoded query; in a path it is a literal plus. Text with no escape
+/// sequence is returned as a slice of the request buffer.
+private const(char)[] decodeComponent(const(char)[] text, bool plusIsSpace = true)
 {
     bool needsDecode;
     foreach (c; text)
-        if (c == '+' || c == '%')
+        if (c == '%' || (plusIsSpace && c == '+'))
         {
             needsDecode = true;
             break;
@@ -286,7 +287,7 @@ private const(char)[] decodeComponent(const(char)[] text)
     for (size_t i = 0; i < text.length; ++i)
     {
         const c = text[i];
-        if (c == '+')
+        if (c == '+' && plusIsSpace)
             out_ ~= ' ';
         else if (c == '%' && i + 2 < text.length)
         {
@@ -304,6 +305,11 @@ private const(char)[] decodeComponent(const(char)[] text)
             out_ ~= c;
     }
     return out_.idup;
+}
+
+private const(char)[] decodePath(const(char)[] text)
+{
+    return decodeComponent(text, false);
 }
 
 /// Reinterprets a request-lifetime slice as a `string` for dpq2. libpq copies
@@ -529,16 +535,19 @@ private bool pageArgs(HTTPServerResponse res, HTTPServerRequest req, out long li
 private bool parseDigits(const(char)[] s, out long value) pure nothrow @safe
 {
     value = 0;
-    if (s.length == 0 || s.length > 18)
+    if (s.length == 0)
         return false;
-    long parsed;
+    ulong parsed;
     foreach (c; s)
     {
         if (c < '0' || c > '9')
             return false;
-        parsed = parsed * 10 + (c - '0');
+        const digit = cast(ulong)(c - '0');
+        if (parsed > (cast(ulong) long.max - digit) / 10)
+            return false;
+        parsed = parsed * 10 + digit;
     }
-    value = parsed;
+    value = cast(long) parsed;
     return true;
 }
 
@@ -817,6 +826,19 @@ private bool isDuplicate(Exception e)
         return false;
 }
 
+/// A concurrent delete can turn an otherwise valid write into an FK failure.
+private bool isForeignKey(Exception e, string constraint)
+{
+    auto response = cast(ResponseException) e;
+    if (!response)
+        return false;
+    try
+        return response.result.resultErrorField('C') == "23503" &&
+            response.result.resultErrorField('n') == constraint;
+    catch (Exception)
+        return false;
+}
+
 // ---------------------------------------------------------------------------
 // users
 
@@ -836,7 +858,7 @@ private void register(HTTPServerRequest req, HTTPServerResponse res)
     if (!reqString(res, password, "password"))
         return;
 
-    auto hash = hashPassword(password);
+    auto hash = hashPasswordOffload(password);
     if (!hash)
     {
         writeError(res, 422, "password is too long");
@@ -875,7 +897,9 @@ private void login(HTTPServerRequest req, HTTPServerResponse res)
     params.preparedStatementName = Name.userByEmail;
     params.argsVariadic(email);
     auto answer = execOne(params);
-    if (answer.length == 0 || !verifyPassword(password, answer[0][5].as!string))
+    const storedHash = answer.length ? answer[0][5].as!string : dummyPasswordHash();
+    const valid = verifyPasswordOffload(password, storedHash);
+    if (answer.length == 0 || !valid)
     {
         writeError(res, 401, "invalid email or password");
         return;
@@ -930,7 +954,7 @@ private void updateUser(HTTPServerRequest req, HTTPServerResponse res)
     Nullable!string hash;
     if (hasPassword)
     {
-        auto hashed = hashPassword(password);
+        auto hashed = hashPasswordOffload(password);
         if (!hashed)
         {
             writeError(res, 422, "password is too long");
@@ -992,17 +1016,33 @@ private void follow(HTTPServerRequest req, HTTPServerResponse res, bool follow)
     QueryParams lookup;
     lookup.preparedStatementName = Name.userByUsername;
     lookup.argsVariadic(dbArg(req.params["username"]));
-    QueryParams change;
-    change.preparedStatementName = follow ? Name.insertFollowByUsername : Name.deleteFollowByUsername;
-    change.argsVariadic(viewer, dbArg(req.params["username"]));
     auto conn = pool.acquire();
     scope (exit) pool.release(conn);
-    auto answers = execPipeline(conn, [lookup, change]);
-    auto found = answers[0];
+    auto found = conn.execPrepared(lookup);
     if (found.length == 0)
     {
         writeError(res, 404, "profile not found");
         return;
+    }
+    const followee = found[0][0].as!long;
+    QueryParams change;
+    change.preparedStatementName = follow ? Name.insertFollow : Name.deleteFollow;
+    change.argsVariadic(viewer, followee);
+    try
+        conn.execPrepared(change);
+    catch (Exception e)
+    {
+        if (isForeignKey(e, "follows_follower_id_fkey"))
+        {
+            writeError(res, 401, "unauthorized");
+            return;
+        }
+        if (isForeignKey(e, "follows_followee_id_fkey"))
+        {
+            writeError(res, 404, "profile not found");
+            return;
+        }
+        throw e;
     }
 
     ProfileOut profile;
@@ -1167,13 +1207,7 @@ private void rollbackQuietly(ConduitConnection conn) nothrow
     try
         execSimple(conn, "ROLLBACK");
     catch (Exception rollbackError)
-    {
-        try
-            stderr.writeln("conduit: rollback failed: ", rollbackError.msg);
-        catch (Throwable)
-        {
-        }
-    }
+        logError("conduit: rollback failed: ", rollbackError);
 }
 
 /// POST /api/articles
@@ -1242,7 +1276,7 @@ private void createArticle(HTTPServerRequest req, HTTPServerResponse res)
     auto answer = conn.execPrepared(full);
     if (answer.length != 1)
     {
-        writeError(res, 500, "internal error");
+        writeError(res, 404, "article not found");
         return;
     }
     beginResponse();
@@ -1350,17 +1384,41 @@ private void favorite(HTTPServerRequest req, HTTPServerResponse res, bool favori
     QueryParams change;
     change.preparedStatementName = favorite ? Name.insertFavoriteBySlug : Name.deleteFavoriteBySlug;
     change.argsVariadic(viewer, dbArg(req.params["slug"]));
-    QueryParams full;
-    full.preparedStatementName = Name.articleBySlug;
-    full.argsVariadic(viewer, dbArg(req.params["slug"]));
-    auto answers = execPipeline(conn, [change, full]);
-    if (answers[1].length == 0)
+    try
     {
-        writeError(res, 404, "article not found");
-        return;
+        auto changed = conn.execPrepared(change);
+        if (changed.length == 0)
+        {
+            writeError(res, 404, "article not found");
+            return;
+        }
+        const id = changed[0][0].as!long;
+        QueryParams full;
+        full.preparedStatementName = Name.articleById;
+        full.argsVariadic(viewer, id);
+        auto answer = conn.execPrepared(full);
+        if (answer.length == 0)
+        {
+            writeError(res, 404, "article not found");
+            return;
+        }
+        beginResponse();
+        writeJson(res, 200, ArticleOut(fullArticle(answer[0])));
     }
-    beginResponse();
-    writeJson(res, 200, ArticleOut(fullArticle(answers[1][0])));
+    catch (Exception e)
+    {
+        if (isForeignKey(e, "favorites_user_id_fkey"))
+        {
+            writeError(res, 401, "unauthorized");
+            return;
+        }
+        if (isForeignKey(e, "favorites_article_id_fkey"))
+        {
+            writeError(res, 404, "article not found");
+            return;
+        }
+        throw e;
+    }
 }
 
 private void favoriteArticle(HTTPServerRequest req, HTTPServerResponse res)
@@ -1425,14 +1483,31 @@ private void createComment(HTTPServerRequest req, HTTPServerResponse res)
     QueryParams params;
     params.preparedStatementName = Name.insertCommentBySlug;
     params.argsVariadic(dbArg(req.params["slug"]), viewer, body);
-    auto answer = execOne(params);
-    if (answer.length == 0)
+    try
     {
-        writeError(res, 404, "article not found");
-        return;
+        auto answer = execOne(params);
+        if (answer.length == 0)
+        {
+            writeError(res, 404, "article not found");
+            return;
+        }
+        beginResponse();
+        writeJson(res, 201, CommentResponse(commentOut(answer[0], false)));
     }
-    beginResponse();
-    writeJson(res, 201, CommentResponse(commentOut(answer[0], false)));
+    catch (Exception e)
+    {
+        if (isForeignKey(e, "comments_author_id_fkey"))
+        {
+            writeError(res, 401, "unauthorized");
+            return;
+        }
+        if (isForeignKey(e, "comments_article_id_fkey"))
+        {
+            writeError(res, 404, "article not found");
+            return;
+        }
+        throw e;
+    }
 }
 
 /// DELETE /api/articles/:slug/comments/:id. A non-integer id is a 404.
@@ -1564,14 +1639,14 @@ private void dispatch(HTTPServerRequest req, HTTPServerResponse res)
 
     if (count == 4 && segment[1] == "api" && segment[2] == "profiles")
     {
-        req.params["username"] = decodeComponent(segment[3]);
+        req.params["username"] = decodePath(segment[3]);
         if (method == HttpMethod.GET)
             return getProfile(req, res);
     }
     if (count == 5 && segment[1] == "api" && segment[2] == "profiles"
             && segment[4] == "follow")
     {
-        req.params["username"] = decodeComponent(segment[3]);
+        req.params["username"] = decodePath(segment[3]);
         if (method == HttpMethod.POST)
             return followProfile(req, res);
         if (method == HttpMethod.DELETE)
@@ -1588,7 +1663,7 @@ private void dispatch(HTTPServerRequest req, HTTPServerResponse res)
     if (count == 5 && segment[1] == "api" && segment[2] == "articles"
             && segment[4] == "comments")
     {
-        req.params["slug"] = decodeComponent(segment[3]);
+        req.params["slug"] = decodePath(segment[3]);
         if (method == HttpMethod.GET)
             return listComments(req, res);
         if (method == HttpMethod.POST)
@@ -1597,15 +1672,15 @@ private void dispatch(HTTPServerRequest req, HTTPServerResponse res)
     if (count == 6 && segment[1] == "api" && segment[2] == "articles"
             && segment[4] == "comments")
     {
-        req.params["slug"] = decodeComponent(segment[3]);
-        req.params["id"] = decodeComponent(segment[5]);
+        req.params["slug"] = decodePath(segment[3]);
+        req.params["id"] = decodePath(segment[5]);
         if (method == HttpMethod.DELETE)
             return deleteComment(req, res);
     }
     if (count == 5 && segment[1] == "api" && segment[2] == "articles"
             && segment[4] == "favorite")
     {
-        req.params["slug"] = decodeComponent(segment[3]);
+        req.params["slug"] = decodePath(segment[3]);
         if (method == HttpMethod.POST)
             return favoriteArticle(req, res);
         if (method == HttpMethod.DELETE)
@@ -1613,7 +1688,7 @@ private void dispatch(HTTPServerRequest req, HTTPServerResponse res)
     }
     if (count == 4 && segment[1] == "api" && segment[2] == "articles")
     {
-        req.params["slug"] = decodeComponent(segment[3]);
+        req.params["slug"] = decodePath(segment[3]);
         if (method == HttpMethod.GET)
             return getArticle(req, res);
         if (method == HttpMethod.PUT)
@@ -1661,9 +1736,9 @@ final class ConduitProcessor : HttpProcessor
 
         try
             dispatch(req, response);
-        catch (Throwable e)
+        catch (Exception e)
         {
-            stderr.writeln("conduit: request failed: ", e);
+            logError("conduit: request failed: ", e);
             if (!response.headerWritten)
                 writeError(response, 500, "internal error");
         }

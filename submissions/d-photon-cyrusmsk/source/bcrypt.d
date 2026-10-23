@@ -7,6 +7,8 @@ module conduit.bcrypt;
 
 import passwd;
 import passwd.bcrypt;
+import core.atomic : atomicOp;
+import photon : offload;
 
 /// bcrypt cost 10 (SPEC.md).
 enum bcryptCost = 10;
@@ -33,4 +35,51 @@ bool verifyPassword(const(char)[] password, const(char)[] storedHash) @safe
         return password.canCryptTo(storedHash);
     catch (Exception)
         return false;
+}
+
+private shared int passwordActive;
+private __gshared int passwordSlots;
+private __gshared bool passwordWorkersReady;
+private __gshared string dummyHash;
+
+/// Called once after initPhoton(), before workers start. At most `slots`
+/// hashes run on photon's offload pool; beyond that the caller hashes on its
+/// scheduler instead of building an unbounded queue during the login ramp.
+void initPasswordWorkers(int slots = 4)
+{
+    passwordSlots = slots;
+    dummyHash = hashPassword("conduit-dummy-password").idup;
+    passwordWorkersReady = true;
+}
+
+/// The hash used for a missing email, so a failed login costs the same bcrypt
+/// verification as a wrong password for an existing account.
+string dummyPasswordHash() nothrow
+{
+    return dummyHash;
+}
+
+private T inPasswordSlot(T)(T delegate() work)
+{
+    if (!passwordWorkersReady)
+        return work();
+    const active = atomicOp!"+="(passwordActive, 1);
+    if (active > passwordSlots)
+    {
+        atomicOp!"-="(passwordActive, 1);
+        return work();
+    }
+    scope (exit)
+        atomicOp!"-="(passwordActive, 1);
+    return offload(work);
+}
+
+string hashPasswordOffload(const(char)[] password)
+{
+    return inPasswordSlot(() => hashPassword(password));
+}
+
+bool verifyPasswordOffload(const(char)[] password, const(char)[] storedHash)
+{
+    return inPasswordSlot(() => verifyPassword(password, storedHash));
 }
