@@ -1,0 +1,6 @@
+name = "Conduit"
+uuid = "5d3a2c1e-8f4b-4e7a-9c1d-2b6e0f3a7c91"
+version = "0.1.0"
+
+[deps]
+Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
