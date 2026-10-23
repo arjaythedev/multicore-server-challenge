@@ -31,7 +31,7 @@ fn stats_logger(previous: List(Int)) -> Nil {
   process.sleep(10_000)
   let current = stats()
   let delta = list.map2(current, previous, fn(a, b) { a - b })
-  log("stats (10s): requests/batches/batched = " <> string.join(list.map(delta, int.to_string), "/"))
+  log("stats (10s): requests/batches/batched/expired = " <> string.join(list.map(delta, int.to_string), "/"))
   stats_logger(current)
 }
 

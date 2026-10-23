@@ -32,6 +32,12 @@ fn pick_write() -> Subject(Request)
 @external(erlang, "conduit_ffi", "now_seconds")
 fn now() -> Int
 
+@external(erlang, "conduit_ffi", "monotonic_ms")
+fn monotonic_ms() -> Int
+
+/// How long a request may wait for a connection and its result before the handler answers 503.
+const db_timeout_ms = 10_000
+
 @external(erlang, "conduit_ffi", "log")
 fn log(msg: String) -> Nil
 
@@ -78,8 +84,8 @@ fn pg_error(e: PgError) -> Response {
 
 fn exec(pool: Subject(Request), statements: List(#(Int, List(Param)))) -> Result(List(List(Row)), Response) {
   let reply = process.new_subject()
-  process.send(pool, Exec(statements, reply))
-  case process.receive(reply, 10_000) {
+  process.send(pool, Exec(statements, reply, monotonic_ms() + db_timeout_ms))
+  case process.receive(reply, db_timeout_ms) {
     Ok(Ok(results)) -> Ok(results)
     Ok(Error(e)) -> Error(pg_error(e))
     Error(_) -> Error(fail(503, "database timeout"))
@@ -416,9 +422,10 @@ fn create_article_rows(
         Exec(
           [#(sql.tags_upsert, [tag_param]), #(sql.article_create_tagged, list.append(article, [tag_param]))],
           reply,
+          monotonic_ms() + db_timeout_ms,
         ),
       )
-      case process.receive(reply, 10_000) {
+      case process.receive(reply, db_timeout_ms) {
         Ok(Ok(results)) -> Ok(results)
         Ok(Error(PgError(code, _))) if attempt == 0 && { code == "40P01" || code == "40001" } ->
           case create_article_rows(viewer, title, description, text, tags, 1) {

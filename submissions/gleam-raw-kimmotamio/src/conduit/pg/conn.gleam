@@ -24,7 +24,9 @@ pub type Reply =
   Result(List(List(Row)), PgError)
 
 pub type Request {
-  Exec(statements: List(#(Int, List(Param))), reply: Subject(Reply))
+  /// `deadline` is a monotonic millisecond timestamp: a request still queued past it is dropped with an error
+  /// instead of being executed for a client that has already given up (the handler waits 10 s).
+  Exec(statements: List(#(Int, List(Param))), reply: Subject(Reply), deadline: Int)
 }
 
 pub type Config {
@@ -58,6 +60,9 @@ fn sleep(ms: Int) -> Nil
 
 @external(erlang, "conduit_ffi", "stat_add")
 fn stat_add(index: Int, n: Int) -> Nil
+
+@external(erlang, "conduit_ffi", "monotonic_ms")
+fn monotonic_ms() -> Int
 
 @external(erlang, "conduit_ffi", "hmac_sha256")
 fn hmac(key: BitArray, data: BitArray) -> BitArray
@@ -114,10 +119,21 @@ fn loop(config: Config, subject: Subject(Request), sock: Socket, queue: List(Req
     [head, ..rest] -> #(head, rest)
   }
   let queue = drain(subject, queue, drain_limit - list.length(queue))
+  case first.deadline < monotonic_ms() {
+    True -> {
+      stat_add(4, 1)
+      process.send(first.reply, Error(PgError("57014", "queued too long")))
+      loop(config, subject, sock, queue)
+    }
+    False -> serve_first(config, subject, sock, first, queue)
+  }
+}
+
+fn serve_first(config: Config, subject: Subject(Request), sock: Socket, first: Request, queue: List(Request)) -> Nil {
   case batch_key(first) {
     // A write (or a multi-statement request): never retried, since its commit state would be unknown.
     None -> {
-      let Exec(statements, reply) = first
+      let Exec(statements, reply, _) = first
       stat_add(1, 1)
       case run(sock, statements, [reply], False) {
         True -> loop(config, subject, sock, queue)
@@ -130,7 +146,7 @@ fn loop(config: Config, subject: Subject(Request), sock: Socket, queue: List(Req
       let batch = [first, ..same]
       let ok = case same {
         [] -> {
-          let Exec(statements, reply) = first
+          let Exec(statements, reply, _) = first
           stat_add(1, 1)
           run(sock, statements, [reply], True)
         }
@@ -139,7 +155,7 @@ fn loop(config: Config, subject: Subject(Request), sock: Socket, queue: List(Req
           stat_add(2, 1)
           stat_add(3, list.length(batch))
           let params = list.map(batch, fn(r) {
-            let assert Exec([#(_, p)], _) = r
+            let assert Exec([#(_, p)], _, _) = r
             p
           })
           let replies = list.map(batch, fn(r) { r.reply })
@@ -162,7 +178,7 @@ fn reconnect(config: Config, subject: Subject(Request), sock: Socket, queue: Lis
 /// The statement index when a request is a single batchable read.
 fn batch_key(r: Request) -> Option(Int) {
   case r {
-    Exec([#(index, _)], _) ->
+    Exec([#(index, _)], _, _) ->
       case sql.batchable(index) {
         True -> Some(index)
         False -> None

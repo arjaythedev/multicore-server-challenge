@@ -1,7 +1,7 @@
 %% The thin Erlang layer under the Gleam code: sockets, the HTTP request parser (erlang:decode_packet is a
 %% C BIF), crypto, environment, process tricks (hibernate, persistent_term, atomics) and try/catch.
 -module(conduit_ffi).
--export([getenv/1, now_seconds/0, hmac_sha256/2, sha256/1, md5_hex/1, hash_equals/2, pbkdf2_sha256/3, random_bytes/1,
+-export([getenv/1, now_seconds/0, monotonic_ms/0, hmac_sha256/2, sha256/1, md5_hex/1, hash_equals/2, pbkdf2_sha256/3, random_bytes/1,
          xor_bytes/2, has_nul/1, needs_json_escape/1, is_utf8/1,
          listen/2, accept/1, connect/3, recv/1, recv_passive/2, send/2, close/1, parse_request/1,
          hibernate_http/3, heap_words/0, mailbox_len/0, safe/1, log/1,
@@ -17,6 +17,7 @@ getenv(Name) ->
     end.
 
 now_seconds() -> erlang:system_time(second).
+monotonic_ms() -> erlang:monotonic_time(millisecond).
 
 sleep(Ms) -> timer:sleep(Ms), nil.
 
