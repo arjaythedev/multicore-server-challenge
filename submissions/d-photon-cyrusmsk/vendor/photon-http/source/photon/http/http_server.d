@@ -47,7 +47,7 @@ public enum HttpStatus : int {
 	TemporaryRedirect = 307,
 	PermanentRedirect = 308,
 	BadRequest = 400,
-	Unathorized = 401,
+	Unauthorized = 401,
 	PaymentRequried = 402,
 	Forbidden = 403,
 	NotFound = 404,
@@ -122,9 +122,11 @@ public abstract class HttpProcessor {
 		if (connectionClose) {
 			output ~= "Connection: close\r\n";
 		}
-		output ~= "Content-Length: ";
-		putInt(output, range.length);
-		output ~= "\r\n";
+		if (status != HttpStatus.NoContent) {
+			output ~= "Content-Length: ";
+			putInt(output, range.length);
+			output ~= "\r\n";
+		}
 		output ~= "\r\n";
 		output ~= range;
 		if (output.length > 8096) flush();
@@ -148,7 +150,10 @@ public abstract class HttpProcessor {
 				throw new Exception("socket send failed");
 			sent += n;
 		}
-		const grew = output.length > 16 * 1024;
+		// A keep-alive connection retains its output capacity. Large list
+		// responses are common; release those buffers instead of pinning
+		// tens of KB per idle socket.
+		const grew = output.length > 4 * 1024;
 		output.clear();
 		if (grew)
 			output = Buffer!char(256);
@@ -231,7 +236,7 @@ shared static this() {
 		statusMessages[TemporaryRedirect] = "Temporary Redirect";
 		statusMessages[PermanentRedirect] = "Permanent Redirect";
 		statusMessages[BadRequest] = "Bad Request";
-		statusMessages[Unathorized] = "Unathorized";
+		statusMessages[Unauthorized] = "Unauthorized";
 		statusMessages[PaymentRequried] = "Payment Requried";
 		statusMessages[Forbidden] = "Forbidden";
 		statusMessages[NotFound] = "Not Found";

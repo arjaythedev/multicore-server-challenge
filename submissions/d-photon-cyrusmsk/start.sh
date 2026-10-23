@@ -19,4 +19,15 @@ if [ "${MIMALLOC:-1}" = 1 ] && [ -n "$MI_PATH" ]; then
   echo "start.sh: preloading mimalloc ($LD_PRELOAD)" >&2
 fi
 
+# The benchmark sets LimitNOFILE=200000; raise it for direct/local runs too.
+if [ "${RAISE_NOFILE:-1}" = 1 ]; then
+  current_nofile=$(ulimit -n)
+  case "$current_nofile" in
+    unlimited) ;;
+    *) if [ "$current_nofile" -lt 200000 ]; then
+         ulimit -n 200000 2>/dev/null || true
+       fi ;;
+  esac
+fi
+
 exec ./bin/server

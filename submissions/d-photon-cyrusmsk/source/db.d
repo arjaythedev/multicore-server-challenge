@@ -164,16 +164,21 @@ SELECT na.id FROM new_article na`;
     enum deleteArticle = `DELETE FROM articles WHERE id = $1`;
     enum insertFavorite = `INSERT INTO favorites (user_id, article_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`;
     enum deleteFavorite = `DELETE FROM favorites WHERE user_id = $1 AND article_id = $2`;
-    enum insertFavoriteBySlug = `INSERT INTO favorites (user_id, article_id)
-SELECT $1, a.id FROM articles a WHERE a.slug = $2
-ON CONFLICT DO NOTHING`;
-    enum deleteFavoriteBySlug = `DELETE FROM favorites f USING articles a
- WHERE f.user_id = $1 AND f.article_id = a.id AND a.slug = $2`;
-    enum insertFollowByUsername = `INSERT INTO follows (follower_id, followee_id)
-SELECT $1, u.id FROM users u WHERE u.username = $2
-ON CONFLICT DO NOTHING`;
-    enum deleteFollowByUsername = `DELETE FROM follows f USING users u
- WHERE f.follower_id = $1 AND f.followee_id = u.id AND u.username = $2`;
+    enum insertFavoriteBySlug = `WITH target AS (
+    SELECT id FROM articles WHERE slug = $2 FOR SHARE
+), ins AS (
+    INSERT INTO favorites (user_id, article_id)
+    SELECT $1, id FROM target
+    ON CONFLICT DO NOTHING
+)
+SELECT id FROM target`;
+    enum deleteFavoriteBySlug = `WITH target AS (
+    SELECT id FROM articles WHERE slug = $2
+), del AS (
+    DELETE FROM favorites f USING target t
+     WHERE f.user_id = $1 AND f.article_id = t.id
+)
+SELECT id FROM target`;
 
     // -- comments --
     enum commentsByArticle = `SELECT c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image,

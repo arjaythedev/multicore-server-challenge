@@ -64,6 +64,20 @@ bool caselessEqual(const(char)[] a, const(char)[] b) {
     return true;
 }
 
+private bool hasHeaderToken(const(char)[] value, const(char)[] token) {
+  size_t start = 0;
+  while (start < value.length) {
+    size_t end = start;
+    while (end < value.length && value[end] != ',') end++;
+    auto part = value[start..end];
+    while (part.length && isSpace(part[0])) part = part[1..$];
+    while (part.length && isSpace(part[$-1])) part = part[0..$-1];
+    if (caselessEqual(part, token)) return true;
+    start = end + 1;
+  }
+  return false;
+}
+
 immutable bool[256] isURL = () {
   bool[256] table;
   foreach (ch; 0..128) {
@@ -272,6 +286,7 @@ private:
           return -1;
         }
         if (p == buf.length) return 0;
+        auto versionEnd = p;
         p = skipRN(p);
         if (p == 0) return 0;
         if (p == size_t.max) {
@@ -280,7 +295,9 @@ private:
           return -1;
         }
         pos = p;
-        version_ = cast(char[])buf[start..pos];
+        version_ = cast(char[])buf[start..versionEnd];
+        if (caselessEqual(version_, "HTTP/1.0"))
+            connectionClose = true;
         state = HEADER_START;
         goto case HEADER_START;
       case HEADER_START:
@@ -366,9 +383,18 @@ private:
               errorStatus = 400;
               return -1;
             }
+            else if (caselessEqual(header.key, "EXPECT")) {
+              error = "Expect is not supported";
+              errorStatus = 417;
+              return -1;
+            }
             else if(caselessEqual(header.key, "CONNECTION")) {
-              if (caselessEqual(header.value, "CLOSE")) {
+              if (hasHeaderToken(header.value, "CLOSE")) {
                 connectionClose = true;
+              }
+              else if (hasHeaderToken(header.value, "KEEP-ALIVE")
+                      && !caselessEqual(version_, "HTTP/1.0")) {
+                connectionClose = false;
               }
             }
             goto case HEADER_START;

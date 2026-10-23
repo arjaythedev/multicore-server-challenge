@@ -64,8 +64,12 @@ bool verifyToken(const(char)[] token, out long userId)
 
     // The payload jwtlited just authenticated, decoded with the local base64.
     const firstDot = token.indexOf('.');
+    if (firstDot <= 0)
+        return false;
     const rest = token[firstDot + 1 .. $];
     const secondDot = rest.indexOf('.');
+    if (secondDot < 0)
+        return false;
     const payload = rest[0 .. secondDot];
     const decodedLength = base64DecodedLength(payload);
     if (decodedLength <= 0 || decodedLength > 512)
