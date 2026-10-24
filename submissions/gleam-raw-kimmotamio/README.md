@@ -3,10 +3,10 @@
 **Front: direct**
 
 No web framework, no database driver library: the HTTP/1.1 server, the PostgreSQL wire-protocol client, the
-JSON writer and the JWT code are all written in Gleam, with a thin Erlang module underneath for sockets,
-`erlang:decode_packet`, crypto and a few process tricks, and two small C libraries: bcrypt as a dirty-CPU NIF,
-and JSON string escaping plus timestamp formatting as plain NIFs. One BEAM process per keep-alive connection,
-one BEAM process per Postgres connection.
+JSON writer and the JWT code are all written in Gleam, with a thin Erlang module underneath for sockets, crypto
+and a few process tricks, and two small C libraries: bcrypt as a dirty-CPU NIF, and the per-request leaf work
+(JSON string escaping, timestamp formatting, row decoding, the HTTP request head, HS256 verification) as plain
+NIFs. One BEAM process per keep-alive connection, one BEAM process per Postgres connection.
 
 ## Stack
 
@@ -16,7 +16,7 @@ one BEAM process per Postgres connection.
 | Gleam | 1.19.2 (official release tarball, sha256-pinned) |
 | gleam_stdlib / gleam_erlang / gleam_json | 1.0.5 / 1.3.0 / 3.1.0 (pinned in `manifest.toml`; gleam_json is used for request bodies only) |
 | bcrypt | the OpenBSD `bcrypt.c`/`blowfish.c` as packaged by erlang-bcrypt, vendored in `native/` with its licence, plus a lane-interleaved variant (`native/bcrypt_lanes.c`) and a small NIF (`native/bcrypt_nif.c`), all built by `build.sh`; cost 10 |
-| C helpers | `native/conduit_nif.c`: JSON string escaping, RFC 3339 timestamps, DataRow and `text[]` splitting (about 230 lines, no dependencies; the Gleam versions stay as the tests' reference) |
+| C helpers | `native/conduit_nif.c`: JSON string escaping, RFC 3339 timestamps, DataRow and `text[]` splitting, the HTTP request head, HS256 JWT verification with its own SHA-256 (about 600 lines, no dependencies; the Gleam and Erlang versions stay as the tests' reference) |
 
 `build.sh` compiles the NIFs with the system C compiler, downloads the three pinned Gleam packages and runs
 `gleam export erlang-shipment`. `start.sh` runs `erl` on the shipment in the foreground.
@@ -26,7 +26,9 @@ one BEAM process per Postgres connection.
 - **Front: direct.** Nginx would cost ~11% of the box and gzip nearly every response.
 - **HTTP** (`src/conduit/http.gleam`): `gen_tcp` in active mode. 16 acceptor processes block in `accept`; the one
   that gets a connection spawns its replacement and *becomes* the connection process, so there is no socket
-  hand-off. Requests are parsed with `erlang:decode_packet` (a C BIF) and the handler runs inline: it parses,
+  hand-off. The request head (method, path segments, query, `Authorization`, `Content-Length`, `Connection`)
+  is parsed by one NIF call into sub-binaries of the buffer, with the leniency of the `erlang:decode_packet`
+  parser it replaced (kept as the tests' reference), and the handler runs inline: it parses,
   authenticates, validates, picks the statement and hands the Postgres connection process the parameters, the
   client socket and a rendering function (`conn.Render`). That process decodes the rows, renders the JSON and
   writes the response, framed with its `Content-Length`, straight to the client socket, then tells the
@@ -83,14 +85,13 @@ one BEAM process per Postgres connection.
   nothing needs escaping (the common case: no copy), otherwise one escaped copy. A timestamp is one NIF call that
   writes the quoted RFC 3339 string (truncated to milliseconds); the Gleam formatter it replaced stays as the
   test oracle. The two together were about a tenth of the BEAM's time per request as Erlang pattern matching.
-- **JWT**: `crypto:mac(hmac, sha256, …)` and `crypto:hash_equals`. A token in the shape every issuer here
-  produces (the standard header, a payload, a 43-character signature) is taken apart with one bit-array pattern;
-  the signature is checked by base64url-encoding the expected HMAC and comparing it in constant time, so nothing
-  is decoded before the token is known to be genuine; then the payload is decoded and the flat
-  `{"sub","iat","exp"}` claims are scanned with bit-array patterns. Any other shape (another header spelling, a
-  padded signature, extra claims) goes through the general path: split, decode, the header must say HS256, the
-  JSON parser reads the claims. `exp` (and `nbf` if present) are checked on every request. Nothing is remembered
-  between requests.
+- **JWT**: a token in the shape every issuer here produces (the standard header, a flat
+  `{"sub","iat","exp"}` payload, a 43-character signature) is verified by one NIF call: HMAC-SHA256 over the
+  signed part with a SHA-256 written out in C (no OpenSSL round trip per request), the expected signature
+  encoded and compared in constant time, and only then the payload decoded and read; the HMAC is held to
+  `crypto:mac/4` on random inputs by the tests. Any other shape goes to the Gleam path (`crypto:mac`, the JSON
+  parser), which accepts the same tokens more slowly. `exp` (and `nbf` if present) are checked on every
+  request. Nothing is remembered between requests.
 - **bcrypt, four at a time.** A Blowfish round is a chain of dependent S-box loads, so one hash leaves much of
   a core idle. A collector process gathers the hash jobs that arrive within `BCRYPT_BATCH_MS` (250 ms, or
   sooner when four are waiting) and hands them to one dirty-CPU NIF call that computes them in lockstep,
@@ -131,8 +132,9 @@ one BEAM process per Postgres connection.
 
 ## Tests
 
-`gleam test` runs unit tests (no database): timestamp formatting and row/array decoding (the C versions against
-the Gleam ones), JSON escaping, JWT issue/verify (fast and general paths, tampering), query and page validation, percent-decoding, Postgres message encoding/decoding, bcrypt hash/verify through the
+`gleam test` runs unit tests (no database): timestamp formatting, row/array decoding, HMAC-SHA256 and the
+request-head parser (the C versions against the Gleam, OTP and `decode_packet` ones, the parser on 35 request
+shapes), JSON escaping, JWT issue/verify (fast and general paths, tampering, what the fast path leaves to the general one), query and page validation, percent-decoding, Postgres message encoding/decoding, bcrypt hash/verify through the
 collector. `test/run.sh` passes 197/197 and the normalized transcript is byte-identical to
 `bench/cmd/conformance/golden-dev.jsonl`, also when replayed on a clean Ubuntu 24.04 container
 (`install.sh`, then `test/run.sh`, OTP 28).
