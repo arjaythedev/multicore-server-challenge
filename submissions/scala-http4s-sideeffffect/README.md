@@ -17,8 +17,8 @@ Front: direct
 
 This is ordinary Typelevel code: a `HttpRoutes[IO]` with one case per endpoint, the reference SQL from
 [SPEC.md](../../SPEC.md) as skunk queries and commands, and circe case-class encoders. There is no hand-written HTTP parser
-or event loop. Concurrent article-page lookups are merged into one statement with a small fs2 "DataLoader"
-(`Batcher.scala`).
+or event loop. Concurrent article-page and feed lookups are merged into one statement with a small fs2
+"DataLoader" (`Batcher.scala`).
 
 **[FINDINGS.md](FINDINGS.md)** has every decision with its measurements, and the ideas that were rejected.
 **[RESEARCH.md](RESEARCH.md)** is the survey of the other submissions (merged and open PRs) it started from.
@@ -76,10 +76,12 @@ Optional knobs (env): `DB_READ_SESSIONS` (default 32), `DB_WRITE_SESSIONS` (defa
   Cats Effect gets half the cores as compute threads, leaving the rest to Postgres. Fiber tracing is off
   (`cats.effect.tracing.mode=none`), because it records a frame for every `IO` step. The CPU starvation checker is
   off, because its warnings only add noise under load.
-- **Article-page lookups batched.** `GET /api/articles/:slug` and `GET /api/articles/:slug/comments` go through
-  `Batcher`: the lookups that arrive while earlier batches run become one `unnest(...) WITH ORDINALITY` statement,
-  each request still getting its own row from a statement that started after it asked. +5-10% req/s and a much lower
-  tail at 6,000 users ([FINDINGS.md](FINDINGS.md#batching-the-dataloader-pattern-with-fs2)).
+- **Article page and feed lookups batched.** `GET /api/articles/:slug`, `GET /api/articles/:slug/comments` and
+  `GET /api/articles/feed` go through `Batcher`: the lookups that arrive while earlier batches run become one
+  `unnest(...) WITH ORDINALITY` statement, each request still getting its own rows, for its own viewer, from a
+  statement that started after it asked. The global list is not batched (it would share results between requests).
+  Together they moved the local limit from 6,000 to 8,000 users
+  ([FINDINGS.md](FINDINGS.md#batching-the-dataloader-pattern-with-fs2)).
 - **No caches** (rule 5). Every token's signature and `exp` are checked on every request. Every login verifies
   bcrypt against the stored hash. Every response is read from Postgres.
 
@@ -136,8 +138,11 @@ Measured and not adopted:
 
 ## Local numbers
 
-All 197 conformance steps pass. Only a smoke run so far (2 cores shared by the server and the load generator,
-Postgres 18 in Docker, dev seed, `-think-scale 0.2`): 1,000 users, 1,330 req/s, p95 3.4 ms, p99 7.7 ms, 0 errors.
+All 197 conformance steps pass. On a laptop set up like the box (Postgres 18 with the box's pgtune settings and the
+full seed; app and Postgres sharing 8 logical CPUs, i.e. 4 hyper-threaded cores; load generator on other cores;
+`-think-scale 0.2`): **8,000 users pass** (9,054 req/s, p95 387 ms, p99 606 ms, 0 errors); 8,500 fail on p95. The
+progression, stage by stage, is in [FINDINGS.md](FINDINGS.md#where-it-ended-up). Absolute numbers are a laptop's;
+the box has 8 dedicated vCPUs.
 
 ## License
 

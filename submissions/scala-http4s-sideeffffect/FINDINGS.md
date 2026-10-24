@@ -41,7 +41,7 @@ the SQL.
 | Session settings | `plan_cache_mode=force_generic_plan`, `jit=off`, `max_parallel_workers_per_gather=0`, sent at connect (rule 2 allows session settings) | other entries measured 17-30% less Postgres CPU |
 | Telemetry | otel4s no-op providers, query capture and pool/protocol spans off | skunk instruments every statement otherwise |
 | SQL | one statement per request, page-first lists, cheaper capped counts, CTE writes | README "SQL": up to 4× on deep pages, 1.1-1.6× on writes; two rewrites rejected for being slower |
-| Batching | **concurrent article and comment lookups merged into one statement each** (`Batcher.scala`, fs2) | below |
+| Batching | **concurrent article, comment and feed lookups merged into one statement each** (`Batcher.scala`, fs2) | below |
 | bcrypt | Bouncy Castle `OpenBSDBCrypt` on a pool of half the cores | 5.8% faster than at.favre (6 rounds); 2 threads made logins queue (p95 824 ms) |
 | Cats Effect | **compute threads = half the cores** | below |
 | Sessions | **32 read + 8 write** (40 of Postgres's 100) | below |
@@ -85,7 +85,8 @@ is one request and nothing waits; under load, the requests that arrive while bat
 Nothing is cached or shared: each request gets its own row, for its own viewer, from a statement that started after
 it asked (rule 5).
 
-Applied to the article page's two lookups (article by slug, comments by slug), the most common page:
+Applied first to the article page's two lookups (article by slug, comments by slug), the most common page, then to
+"your feed" (each feed depends only on its viewer):
 
 | 6,000 users, 2 runs each | req/s | p95 / p99 ms | app µs/req | Postgres µs/req |
 |---|---|---|---|---|
@@ -93,8 +94,27 @@ Applied to the article page's two lookups (article by slug, comments by slug), t
 | article lookup batched | 7,037-7,268 | 340-365 / 725-733 | 541-548 | 443-451 |
 | **article and comments batched** | **7,276-7,767** | **50-337 / 113-688** | **532-536** | **420-432** |
 
+| 7,500 users | req/s | p95 / p99 ms | app µs/req | Postgres µs/req |
+|---|---|---|---|---|
+| article and comments batched | 8,892 | 282 / 458 | 491 | 386 |
+| **and the feed** | **9,111** | **212 / 333** | **482** | **368** |
+
+The global article list is **deliberately not batched**: requests for the same page would get one shared result,
+which is caching between requests (rule 5). The same goes for `GET /api/tags`.
+
 Fewer statements save on both sides: Postgres starts fewer statements and snapshots, and the app does fewer skunk
-exchanges.
+exchanges. Batches also grow with load, so CPU per request *falls* as load rises, the right direction near the limit.
+
+## Where it ended up
+
+The most users passing on the laptop setup, at each stage:
+
+| Stage | Passes | Fails |
+|---|---|---|
+| skunk port + SQL rewrites, G1 4 GB, 8 compute threads, 16 + 4 sessions | below 6,000 | 6,000 (p99 1.2 s) |
+| + runtime from the sweep (Parallel GC, 45% heap, 4 compute threads, 32 + 8 sessions) | 6,000 | 7,000 |
+| + article and comment lookups batched | 7,500 | 8,500 |
+| + feeds batched | **8,000** (9,054 req/s, p95 387 ms, p99 606 ms) | 8,500 (p95 596 ms) |
 
 ## Considered and not adopted
 
@@ -104,7 +124,8 @@ exchanges.
 | Binary result format | skunk is text-only |
 | A hand-written Postgres client, SIMD / interleaved bcrypt | replaces the stack; interleaved bcrypt's wait windows also cost p99 in the entry that tried it |
 | Tag names by primary key in list queries | measured 0.75-0.81× (slower) on Postgres 18 |
-| Batching the list endpoints, group commit for writes | lists are cheaper per request already and vary in shape; writes are 5% of requests. The article page was the clear first target |
+| Batching the global list, tag, author and favorited lists | the global list would share results between requests (rule 5); the others are a smaller share of traffic. Feeds are batched |
+| Group commit for writes | writes are 5% of requests; with 8 write sessions Postgres already groups concurrent commits |
 | JSON built by Postgres | moves CPU into the busiest process |
 | One `GET /api/tags` result for all waiting requests | sharing a result between requests is caching (rule 5) |
 | Nginx in front | ~11% of the box; direct is affordable with a 7 GB heap |
