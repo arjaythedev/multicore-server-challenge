@@ -1,0 +1,15 @@
+.{
+    .name = .conduit,
+    .version = "0.1.0",
+    .fingerprint = 0xfdbb5281d7816834,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        // fourneau's HTTP/1.1-only branch, `fourneau-multicore-tuned`, at
+        // this commit.
+        .fourneau = .{
+            .url = "git+https://github.com/Eldhus/fourneau#7f8733cecdaebc792871cba88f062f45c9d9b894",
+            .hash = "fourneau-0.0.0-IEBWgMX3BQCYXz6YejN-SvjY1sqzUvzu-iFuVAxTSMuJ",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
