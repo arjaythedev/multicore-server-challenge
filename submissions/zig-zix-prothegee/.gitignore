@@ -1,0 +1,70 @@
+##
+## directory
+##
+.bin
+.tmp
+.out
+.log
+.logs
+.dist
+.build
+.cache
+.target
+.svelte-kit
+.node_modules
+.zig-cache
+.zig-out
+.zig-pkg
+
+bin
+tmp
+out
+log
+logs
+dist
+build
+cache
+target
+svelte-kit
+node_modules
+zig-cache
+zig-out
+zig-pkg
+
+##
+## editor
+##
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+*.sw?
+
+##
+## environment
+##
+.env
+
+config.json
+config.yaml
+
+##
+## extension
+##
+*.bak*
+*.zip
+*.pem
+*.bin
+*.sock
+
+*perf.*
+*Zone.Identifier
+
+##
+## file: include
+##
+common_check.*
+
+##
+## file: exclude
+##
