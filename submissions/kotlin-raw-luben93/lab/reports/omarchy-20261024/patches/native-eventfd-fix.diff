@@ -1,0 +1,13 @@
+diff --git i/submissions/kotlin-native-luben93/src/linuxX64Main/kotlin/conduit/platform/NativeHttp.kt w/submissions/kotlin-native-luben93/src/linuxX64Main/kotlin/conduit/platform/NativeHttp.kt
+index 3dfd3c4..8ac3e36 100644
+--- i/submissions/kotlin-native-luben93/src/linuxX64Main/kotlin/conduit/platform/NativeHttp.kt
++++ w/submissions/kotlin-native-luben93/src/linuxX64Main/kotlin/conduit/platform/NativeHttp.kt
+@@ -168,7 +168,7 @@ private class EpollLoop(val index: Int, val listenFd: Int, val engine: HttpEngin
+                 val flags = ev.events
+                 when (fd) {
+                     listenFd -> acceptAll()
+-                    wakeFd -> recv(wakeFd, wakeBuf.addressOf(0), 8u, 0)
++                    wakeFd -> platform.posix.read(wakeFd, wakeBuf.addressOf(0), 8u)
+                     else -> {
+                         val c = if (fd < conns.size) conns[fd] else null
+                         if (c != null) {

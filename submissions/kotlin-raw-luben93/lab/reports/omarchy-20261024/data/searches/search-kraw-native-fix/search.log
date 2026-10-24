@@ -1,0 +1,75 @@
+[03:59:33] === search search-kraw-native-fix: lang search-kraw-native-fix, target http://127.0.0.1:3000,http://127.0.0.2:3000,http://127.0.0.3:3000,http://127.0.0.4:3000,http://127.0.0.5:3000,http://127.0.0.6:3000,http://127.0.0.7:3000,http://127.0.0.8:3000 (local), boxes [{local 1}]
+[03:59:33] target: tz +0200, 20 cores
+[03:59:33] warmup       8000 users [8000], ramp 1m0s + 2m0s, start 03:59:38
+[04:02:55] warmup         8000 users     2131 req/s  p50    0.2  p95     8.1  p99    21.7 ms  err  0.00%  lgCPU 4%  PASS
+[04:03:02] probe-8000   8000 users [8000], ramp 1m0s + 1m0s, start 04:03:07
+[04:05:23] probe-8000     8000 users     2110 req/s  p50    0.2  p95     7.8  p99    21.3 ms  err  0.00%  lgCPU 5%  PASS
+[04:05:30] probe-16000  16000 users [16000], ramp 1m0s + 1m0s, start 04:05:35
+[04:07:51] probe-16000   16000 users     4248 req/s  p50    0.2  p95     8.0  p99    24.3 ms  err  0.00%  lgCPU 7%  PASS
+[04:07:58] probe-32000  32000 users [32000], ramp 1m0s + 1m0s, start 04:08:03
+[04:10:19] probe-32000   32000 users     8516 req/s  p50    0.2  p95    16.0  p99    33.6 ms  err  0.00%  lgCPU 13%  PASS
+[04:10:26] probe-64000  64000 users [64000], ramp 1m0s + 1m0s, start 04:10:31
+[04:12:48] probe-64000   64000 users    16953 req/s  p50    0.3  p95    16.1  p99    42.1 ms  err  0.00%  lgCPU 28%  PASS
+[04:12:55] probe-128000 128000 users [128000], ramp 1m0s + 1m0s, start 04:13:00
+[04:15:24] probe-128000 128000 users    31834 req/s  p50  278.0  p95   346.1  p99   377.6 ms  err  0.02%  lgCPU 51%  PASS
+[04:15:31] probe-160000 160000 users [160000], ramp 1m0s + 1m0s, start 04:15:36
+[04:18:02] probe-160000 160000 users    31429 req/s  p50 1321.0  p95  1545.2  p99  1669.1 ms  err  0.09%  lgCPU 52%  FAIL
+[04:18:02]   fail: p95 1545 ms >= 500, p99 1669 ms >= 1000
+[04:18:09] probe-140000 140000 users [140000], ramp 1m0s + 1m0s, start 04:18:14
+[04:20:40] probe-140000 140000 users    31739 req/s  p50  624.6  p95   784.9  p99   840.7 ms  err  0.06%  lgCPU 51%  FAIL
+[04:20:40]   fail: p95 785 ms >= 500
+[04:20:48] probe-130000 130000 users [130000], ramp 1m0s + 1m0s, start 04:20:53
+[04:23:17] probe-130000 130000 users    30805 req/s  p50  471.6  p95   594.4  p99   624.1 ms  err  0.02%  lgCPU 50%  FAIL
+[04:23:17]   fail: p95 594 ms >= 500
+[04:23:17] probes: highest pass 128000, lowest fail 130000
+[04:23:24] hold-128000  128000 users [128000], ramp 1m0s + 5m0s, start 04:23:29
+[04:29:55] hold-128000  128000 users    31760 req/s  p50  265.5  p95   420.1  p99   465.4 ms  err  0.09%  lgCPU 49%  PASS
+[04:29:55] RESULT: score 128000 users (5-minute hold passed)
+
+search-kraw-native-fix  (lang search-kraw-native-fix, target http://127.0.0.1:3000,http://127.0.0.2:3000,http://127.0.0.3:3000,http://127.0.0.4:3000,http://127.0.0.5:3000,http://127.0.0.6:3000,http://127.0.0.7:3000,http://127.0.0.8:3000)
+SCORE: 128000 users held 5 minutes
+probes: highest pass 128000, lowest fail 130000
+
+hold at 128000 users: 31760 req/s, p50 265.5 ms, p95 420.1 ms, p99 465.4 ms, errors 0.091%
+target over the hold window (264 samples): cpu 96%, steal ?%, app 23% / db 70% / nginx ?% (of one core)
+
+128000 users on 1 box(es), http://127.0.0.1:3000,http://127.0.0.2:3000,http://127.0.0.3:3000,http://127.0.0.4:3000,http://127.0.0.5:3000,http://127.0.0.6:3000,http://127.0.0.7:3000,http://127.0.0.8:3000, measured 300 s after a 60 s ramp
+endpoint                                      count    req/s      p50      p90      p95      p99      max    err%
+GET /api/tags                               1891215   6304.1    266.5    354.8    415.0    454.7      492    0.00
+GET /api/articles/:slug                     1890939   6303.1    268.3    357.4    421.1    457.2      490    0.00
+GET /api/articles/:slug/comments            1888710   6295.7    270.3    359.7    421.9    460.8      495    0.00
+GET /api/articles                           1125189   3750.6    277.2    366.6    425.2    466.7      501    0.00
+GET /api/articles/feed                       766197   2554.0    309.2    401.9    458.0    502.3      547    0.00
+GET /api/profiles/:username                  512714   1709.0    251.1    343.6    401.4    443.6      484    0.00
+GET /api/articles?author                     410464   1368.2    257.3    362.2    410.1    464.4      503    0.00
+GET /api/articles?tag                        409053   1363.5    265.7    359.2    411.6    459.0      502    0.00
+POST /api/articles/:slug/favorite            185770    619.2    262.4    397.8    450.8    547.8      799    0.00
+POST /api/articles/:slug/comments            128492    428.3     31.0     89.9    136.6    241.9      692    0.00
+GET /api/articles?favorited                  102263    340.9    184.8    325.1    357.6    437.0      500    0.00
+POST /api/profiles/:username/follow           55460    184.9     30.9     89.6    137.7    245.5      686    0.00
+GET /api/user                                 47124    157.1    116.7    271.1    309.8    378.9      471    0.00
+POST /api/articles                            40661    135.5     31.3     93.3    143.1    245.1      693    0.00
+DELETE /api/articles/:slug/favorite           20159     67.2    259.1    391.2    443.1    538.6      778    0.00
+DELETE /api/profiles/:username/follow         19450     64.8     30.9     88.4    135.7    244.0      692    0.00
+PUT /api/user                                 15564     51.9    185.3    247.7    260.2    298.5      403    0.00
+POST /api/users/login                         10169     33.9  10002.4  10002.4  10002.4  10002.4    10019   83.41
+DELETE /api/articles/:slug/comments/:id        5881     19.6     31.2     85.3    130.6    236.8      649    0.00
+PUT /api/articles/:slug                        2426      8.1    240.5    355.8    399.4    497.2      728    0.00
+POST /api/users                                 199      0.7  10002.4  10002.4  10002.4  10002.4    10011   84.42
+ALL                                         9528099  31760.3    265.5    364.5    420.1    465.4    10019    0.09
+errors: timeout=8650  (e.g. "request timeout")
+mix: 1.86 calls/page, 0.248 req/s per user, 5.0% writes, 5134692 page views
+box 0 (omarchy): 128000 users, CPU avg 49% max 63%, loadgen proc 13%, RSS peak 2523 MB, 136826 TCP connects, behind=false
+verdict: PASS   [p95 < 500 ms, p99 < 1000 ms, errors < 1%]
+lg_limited: no
+
+phase         users   pass  lg     req/s     p50     p95     p99   err%
+probe-8000     8000   true  false    2110     0.2     7.8    21.3   0.00
+probe-16000   16000   true  false    4248     0.2     8.0    24.3   0.00
+probe-32000   32000   true  false    8516     0.2    16.0    33.6   0.00
+probe-64000   64000   true  false   16953     0.3    16.1    42.1   0.00
+probe-128000 128000   true  false   31834   278.0   346.1   377.6   0.02
+probe-160000 160000   false false   31429  1321.0  1545.2  1669.1   0.09
+probe-140000 140000   false false   31739   624.6   784.9   840.7   0.06
+probe-130000 130000   false false   30805   471.6   594.4   624.1   0.02
+hold-128000  128000   true  false   31760   265.5   420.1   465.4   0.09

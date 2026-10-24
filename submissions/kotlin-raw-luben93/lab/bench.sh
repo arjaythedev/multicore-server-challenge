@@ -33,7 +33,7 @@ for _ in $(seq 120); do curl -sf -o /dev/null "http://127.0.0.1:$PORT/api/tags" 
 curl -sf -o /dev/null "http://127.0.0.1:$PORT/api/tags" || { echo "server not up"; tail -20 "$OUT/server.log"; exit 1; }
 APP=$(fuser $PORT/tcp 2>/dev/null | awk '{print $1}'); APP=${APP:-$SPID}
 echo "app pid $APP ($(cat /proc/$APP/comm)), nofile: $(awk '/open files/{print $4}' /proc/$APP/limits)"
-NT=$(( (USERS + 49999) / 50000 )); TARGETS=""
+NT=$(( (USERS + ${PER_TARGET:-50000} - 1) / ${PER_TARGET:-50000} )); TARGETS=""
 for i in $(seq 1 $NT); do TARGETS="${TARGETS:+$TARGETS,}http://127.0.0.$i:$PORT"; done
 ticks() { awk '{print $14+$15}' /proc/$1/stat 2>/dev/null || echo 0; }
 # Postgres CPU: summed over host processes of user postgres, or (Postgres in a container) from its cgroup:

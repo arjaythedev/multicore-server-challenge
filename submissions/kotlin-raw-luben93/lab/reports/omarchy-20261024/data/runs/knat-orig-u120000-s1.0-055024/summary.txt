@@ -1,0 +1,1 @@
+knat-orig users=120000 scale=1.0 rps=30538 p50=116.0 p95=321.0 p99=363.3 err=0.0000 | app=307%cpu pg=460%cpu | app_us/req=100.4 pg_us/req=150.7 total_us/req=251.1 | rss=1046MB fds=120018 pass=True lgcpu=15% lg_limited=False 
