@@ -1,0 +1,19 @@
+[package]
+name = "conduit"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+libc = "=0.2.191"
+mimalloc = { version = "=0.1.52", default-features = false }
+ring = "=0.17.14"
+serde_json = "=1.0.154"
+
+[dev-dependencies]
+bcrypt = "=0.19.3"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+debug = false
