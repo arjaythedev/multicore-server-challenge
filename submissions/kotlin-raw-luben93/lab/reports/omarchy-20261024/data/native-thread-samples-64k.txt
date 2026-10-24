@@ -1,0 +1,105 @@
+== 04:28:29 total 214%
+  tid 1147812 user 37% sys 63%
+  tid 1147811 user 37% sys 63%
+  tid 1147808 user 0% sys 0%
+  tid 1147807 user 0% sys 0%
+  tid 1147806 user 0% sys 0%
+  tid 1147805 user 0% sys 0%
+== 04:28:39 total 211%
+  tid 1147812 user 38% sys 62%
+  tid 1147811 user 37% sys 63%
+  tid 1147808 user 0% sys 0%
+  tid 1147807 user 0% sys 0%
+  tid 1147806 user 0% sys 0%
+  tid 1147805 user 0% sys 0%
+== 04:28:49 total 209%
+  tid 1147812 user 37% sys 62%
+  tid 1147811 user 37% sys 63%
+  tid 1147793 user 7% sys 0%
+== 04:28:59 total 201%
+  tid 1147812 user 38% sys 61%
+  tid 1147811 user 37% sys 63%
+== 04:29:09 total 207%
+  tid 1147812 user 37% sys 62%
+  tid 1147811 user 38% sys 62%
+  tid 1147808 user 1% sys 1%
+  tid 1147807 user 1% sys 0%
+  tid 1147806 user 0% sys 1%
+  tid 1147805 user 0% sys 1%
+== 04:29:19 total 225%
+  tid 1147812 user 38% sys 61%
+  tid 1147811 user 37% sys 62%
+  tid 1147808 user 1% sys 1%
+  tid 1147807 user 1% sys 1%
+  tid 1147806 user 1% sys 1%
+  tid 1147805 user 1% sys 1%
+== 04:29:30 total 240%
+  tid 1147812 user 38% sys 61%
+  tid 1147811 user 37% sys 61%
+  tid 1147808 user 2% sys 2%
+  tid 1147807 user 2% sys 2%
+  tid 1147806 user 2% sys 2%
+  tid 1147805 user 2% sys 2%
+== 04:29:40 total 258%
+  tid 1147812 user 38% sys 60%
+  tid 1147811 user 38% sys 60%
+  tid 1147808 user 2% sys 2%
+  tid 1147807 user 2% sys 2%
+  tid 1147806 user 2% sys 2%
+  tid 1147805 user 2% sys 3%
+== 04:29:50 total 281%
+  tid 1147812 user 38% sys 59%
+  tid 1147811 user 39% sys 58%
+  tid 1147808 user 3% sys 3%
+  tid 1147807 user 3% sys 3%
+  tid 1147806 user 3% sys 3%
+  tid 1147805 user 3% sys 3%
+== 04:30:00 total 298%
+  tid 1147812 user 40% sys 56%
+  tid 1147811 user 39% sys 56%
+  tid 1147808 user 4% sys 4%
+  tid 1147807 user 4% sys 3%
+  tid 1147806 user 4% sys 4%
+  tid 1147805 user 4% sys 4%
+== 04:30:10 total 315%
+  tid 1147812 user 40% sys 57%
+  tid 1147811 user 41% sys 56%
+  tid 1147808 user 4% sys 4%
+  tid 1147807 user 4% sys 4%
+  tid 1147806 user 4% sys 3%
+  tid 1147805 user 4% sys 4%
+== 04:30:20 total 326%
+  tid 1147812 user 40% sys 58%
+  tid 1147811 user 41% sys 56%
+  tid 1147808 user 4% sys 4%
+  tid 1147807 user 4% sys 4%
+  tid 1147806 user 4% sys 4%
+  tid 1147805 user 4% sys 3%
+== 04:30:30 total 324%
+  tid 1147812 user 40% sys 57%
+  tid 1147811 user 41% sys 56%
+  tid 1147808 user 4% sys 3%
+  tid 1147807 user 4% sys 3%
+  tid 1147806 user 4% sys 4%
+  tid 1147805 user 4% sys 3%
+== 04:30:40 total 327%
+  tid 1147812 user 40% sys 57%
+  tid 1147811 user 41% sys 56%
+  tid 1147808 user 4% sys 3%
+  tid 1147807 user 4% sys 3%
+  tid 1147806 user 4% sys 3%
+  tid 1147805 user 4% sys 3%
+== 04:30:50 total 328%
+  tid 1147812 user 40% sys 56%
+  tid 1147811 user 40% sys 56%
+  tid 1147808 user 4% sys 3%
+  tid 1147807 user 4% sys 3%
+  tid 1147806 user 4% sys 3%
+  tid 1147805 user 4% sys 3%
+== 04:31:00 total 0%
+== 04:31:10 total 0%
+== 04:31:20 total 0%
+== 04:31:30 total 0%
+== 04:31:40 total 0%
+== 04:31:50 total 0%
+== 04:32:00 total 0%

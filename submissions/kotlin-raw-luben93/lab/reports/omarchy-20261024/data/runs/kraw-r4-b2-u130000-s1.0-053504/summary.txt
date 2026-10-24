@@ -1,0 +1,1 @@
+kraw-r4-b2 users=130000 scale=1.0 rps=25486 p50=584.2 p95=10002.4 p99=10919.9 err=0.0561 | app=200%cpu pg=310%cpu | app_us/req=78.6 pg_us/req=121.8 total_us/req=200.3 | rss=1149MB fds=130011 pass=False lgcpu=16% lg_limited=False p95 10002 ms >= 500;p99 10920 ms >= 1000;errors 5.61% >= 1%

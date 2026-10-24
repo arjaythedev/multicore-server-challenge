@@ -1,0 +1,1 @@
+knat-fix users=120000 scale=1.0 rps=31765 p50=3.3 p95=24.1 p99=65.0 err=0.0000 | app=185%cpu pg=515%cpu | app_us/req=58.4 pg_us/req=162.1 total_us/req=220.5 | rss=215MB fds=120019 pass=True lgcpu=16% lg_limited=False 

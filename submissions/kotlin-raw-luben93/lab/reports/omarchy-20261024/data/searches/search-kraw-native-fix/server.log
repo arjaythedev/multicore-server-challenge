@@ -1,0 +1,2 @@
+Running as unit: mcsc-app.scope; invocation ID: e1cbf51362534ceeb56463a485a2118d
+conduit: listening on 0.0.0.0:3000 (cpus=8 http=2 db=6+2 bcrypt=1; kotlin/native, RLIMIT_NOFILE 524288)

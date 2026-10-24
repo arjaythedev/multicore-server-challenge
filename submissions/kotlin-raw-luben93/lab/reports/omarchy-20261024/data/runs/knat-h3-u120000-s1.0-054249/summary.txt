@@ -1,0 +1,1 @@
+knat-h3 users=120000 scale=1.0 rps=28131 p50=467.7 p95=752.6 p99=786.4 err=0.0006 | app=352%cpu pg=418%cpu | app_us/req=125.2 pg_us/req=148.6 total_us/req=273.8 | rss=1765MB fds=120022 pass=False lgcpu=14% lg_limited=False p95 753 ms >= 500

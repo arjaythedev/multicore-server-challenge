@@ -1,0 +1,1 @@
+kraw-h2-r4 users=120000 scale=1.0 rps=31033 p50=61.7 p95=194.0 p99=215.7 err=0.0000 | app=163%cpu pg=399%cpu | app_us/req=52.4 pg_us/req=128.7 total_us/req=181.1 | rss=1145MB fds=120022 pass=True lgcpu=15% lg_limited=False 
