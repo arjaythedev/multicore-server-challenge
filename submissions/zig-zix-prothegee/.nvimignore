@@ -1,0 +1,57 @@
+##
+## directory
+##
+.git
+.bin
+.tmp
+.out
+.log
+.logs
+.build
+.cache
+.target
+.svelte-kit
+.node_modules
+.zig-cache
+.zig-out
+.zig-pkg
+
+bin
+tmp
+out
+log
+logs
+build
+cache
+target
+svelte-kit
+node_modules
+zig-cache
+zig-out
+zig-pkg
+
+##
+## extension
+##
+*.bak*
+*.zip
+
+*Zone.Identifier
+
+##
+## file: include
+##
+.config/config.*.json
+.nvim/*.json
+.vscode/*.json
+.zed/*.json
+
+compile_commands.json
+
+##
+## file: exclude
+##
+!.config/config.*.json.template
+!.nvim/*.json.template
+!.vscode/*.json.tempalte
+!.zed/*.json.template
