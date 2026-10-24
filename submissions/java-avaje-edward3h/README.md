@@ -14,7 +14,7 @@ with Avaje replacing Spring. One JVM; every request runs on its own virtual thre
 | HTTP | avaje-http 3.12.1 annotations and `helidon` generator, on Helidon SE (WebServer) 4.5.6 |
 | JSON | avaje-jsonb 3.16 |
 | SQL | kiwiproc 1.0 (Gradle plugin), reference SQL from `SPEC.md` |
-| Driver and pool | pgjdbc 42.7.14, HikariCP 7.1.0 (10 connections per core, set in `start.sh`) |
+| Driver and pool | pgjdbc 42.7.14, HikariCP 7.1.0 (10 connections per core, capped at 95, set in `start.sh`) |
 | bcrypt | `at.favre.lib:bcrypt` 0.10.2, cost 10 |
 | JWT | hand-written HS256 (`javax.crypto.Mac`), in `Jwt.java` |
 
