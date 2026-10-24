@@ -170,8 +170,14 @@ pub const statements = std.enums.EnumArray(S, pg.Statement).init(.{
             "FROM (SELECT nextval(pg_get_serial_sequence('articles', 'id')) AS id) n",
         .params = &.{ .int8, .text, .text, .text },
     },
+    // Only the names missing, so an existing one takes no id from the
+    // sequence; in name order, so two groups creating the same new tags
+    // lock them in one order and cannot deadlock (which would cost both a
+    // second, Postgres's deadlock_timeout, and a retry alone).
     .tags_insert = .{
-        .sql = "INSERT INTO tags (name) SELECT DISTINCT unnest($1::text[]) ON CONFLICT (name) DO NOTHING",
+        .sql = "INSERT INTO tags (name) SELECT n.name FROM (SELECT DISTINCT unnest($1::text[]) AS name) n " ++
+            "WHERE NOT EXISTS (SELECT 1 FROM tags t WHERE t.name = n.name) ORDER BY n.name " ++
+            "ON CONFLICT (name) DO NOTHING",
         .params = &.{.text_array},
     },
     .article_tags_insert = .{
