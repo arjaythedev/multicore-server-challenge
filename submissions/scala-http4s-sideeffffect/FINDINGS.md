@@ -116,6 +116,25 @@ The most users passing on the laptop setup, at each stage:
 | + article and comment lookups batched | 7,500 | 8,500 |
 | + feeds batched | **8,000** (9,054 req/s, p95 387 ms, p99 606 ms) | 8,500 (p95 596 ms) |
 
+## Lessons from the challenge owner's videos
+
+The six videos behind both challenges are summarised at the end of [RESEARCH.md](RESEARCH.md). For this submission
+they confirmed choices rather than changed code:
+
+- **vCPUs are hyper-threads** ("one physical core can expose two hardware threads … your cloud provider will typically
+  schedule your virtual CPU onto those logical CPUs"), and per-core speed varied by up to 20% between his machines. That
+  is why the local runs share 4 hyper-threaded cores between the app and Postgres, and why only relative numbers count.
+- **Postgres takes about half of the 8-core box** in his reference stacks (apps 27-30%, Nginx 11-12%), and the leaderboard
+  entries put it at 70-80%. Our starting point was the reverse (the app cost more than Postgres per request), which is
+  why the app side got as much work as the SQL: half the cores for Cats Effect, batching, fewer round trips.
+- **Durability**: he flags SQLite's `synchronous=NORMAL` as a trade-off he wouldn't take in production, and notes the
+  server databases fsync every commit and share the flush through group commit. Postgres does that here by default
+  (`synchronous_commit = on`, which rule 6 also requires): every write the API acknowledges is on disk.
+- **bcrypt off the request threads** (his Rust example used a separate blocking pool): we use a bounded pool.
+- **Unbounded comment threads** grew expensive during his own runs, hence the spec's newest-100 cap, which we keep.
+- **Maintainability**: he wouldn't approve most of the fastest entries as production PRs (single-file servers, unsafe
+  code, coupling to database internals), which is the line this submission holds.
+
 ## Considered and not adopted
 
 | Idea | Why not |
