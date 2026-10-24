@@ -7,6 +7,7 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.jvm.JvmField
 import conduit.crypto.Bcrypt
+import conduit.crypto.BcryptKernel
 import conduit.json.JsonReader
 import conduit.json.JsonValue
 import conduit.platform.HmacSha256
@@ -350,8 +351,9 @@ object Jwt {
 
 /**
  * bcrypt cost 10 (rule 7), run on a small pool of low-priority threads so logins never take CPU from requests.
- * Several queued jobs are computed together with interleaved lanes (bcrypt's S-box lookups are latency-bound,
- * so 2-4 independent hashes in one loop run in about the time of one).
+ * Several queued jobs are computed together with interleaved lanes (bcrypt's S-box lookups are latency-bound, so
+ * independent hashes in one loop overlap): up to 8 per batch with the C kernel, 4 with the Kotlin one
+ * ([BcryptKernel]).
  */
 object Passwords {
     /** Cost of every new hash (rule 7). */
@@ -391,6 +393,7 @@ object Passwords {
         } finally {
             lock.unlock()
         }
+        println("bcrypt: ${BcryptKernel.init()}")
         for (i in 0 until maxOf(1, threads)) startThread("bcrypt-$i", nice = 10) { worker(warm = i == 0) }
     }
 
@@ -439,8 +442,8 @@ object Passwords {
     }
 
     private fun worker(warm: Boolean) {
-        if (warm) warmUp()
-        val batch = arrayOfNulls<Job>(Bcrypt.MAX_LANES)
+        if (warm && !BcryptKernel.native) warmUp()
+        val batch = arrayOfNulls<Job>(BcryptKernel.MAX_LANES)
         while (true) {
             val n = take(batch)
             try {
@@ -453,11 +456,11 @@ object Passwords {
     }
 
     /**
-     * Blocks until a batch is ready: up to [Bcrypt.MAX_LANES] jobs of the oldest job's cost, taken once the batch is
-     * full or the oldest job is due. One worker gathers at a time; the others take only full batches meanwhile.
+     * Blocks until a batch is ready: up to [BcryptKernel.maxLanes] jobs of the oldest job's cost, taken once the batch
+     * is full or the oldest job is due. One worker gathers at a time; the others take only full batches meanwhile.
      */
     private fun take(batch: Array<Job?>): Int {
-        val max = Bcrypt.MAX_LANES
+        val max = BcryptKernel.maxLanes
         lock.lock()
         try {
             while (true) {
@@ -507,7 +510,7 @@ object Passwords {
                 val keys = Array(n) { batch[it]!!.key }
                 val salts = Array(n) { batch[it]!!.salt }
                 val outs = Array(n) { batch[it]!!.out }
-                Bcrypt.hashLanes(n, keys, salts, first.cost, outs)
+                BcryptKernel.hashLanes(n, keys, salts, first.cost, outs)
             } catch (t: Throwable) {
                 failure = t
             }

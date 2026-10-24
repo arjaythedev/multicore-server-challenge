@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Runs once as root on a clean Ubuntu 24.04: Eclipse Temurin JDK 27+35 (checksum-verified) -> /opt/jdk.
+# Runs once as root on a clean Ubuntu 24.04: Eclipse Temurin JDK 27+35 (checksum-verified) -> /opt/jdk, and Ubuntu's
+# gcc, with which build.sh compiles the vendored C bcrypt core (native/, source only) into build/jvm.
 # Gradle 9.8.2 (checksum-pinned in gradle-wrapper.properties) and the Kotlin 2.4.21 toolchain, Kotlin/Native
 # included, are downloaded by build.sh.
 set -euo pipefail
-apt-get update -q && apt-get install -y -q curl jq ca-certificates
+apt-get update -q && apt-get install -y -q curl jq ca-certificates gcc libc6-dev
 META="$(curl -fsSL 'https://api.adoptium.net/v3/assets/release_name/eclipse/jdk-27%2B35?architecture=x64&image_type=jdk&os=linux')"
 URL="$(jq -r '.binaries[0].package.link' <<<"$META")"; SHA="$(jq -r '.binaries[0].package.checksum' <<<"$META")"
 curl -fsSLo /tmp/jdk.tgz "$URL"

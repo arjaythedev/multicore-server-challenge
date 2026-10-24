@@ -2,7 +2,9 @@
 
 One source tree, two binaries: `build/jvm/conduit.jar` (HotSpot, JDK 27) and
 `build/bin/linuxX64/releaseExecutable/conduit.kexe` (Kotlin/Native). No third-party libraries at all: our own
-HTTP/1.1 server, Postgres wire-protocol client, JSON, JWT, bcrypt. Coroutines are the Kotlin **language** feature
+HTTP/1.1 server, Postgres wire-protocol client, JSON, JWT, bcrypt. The one exception is bcrypt's inner loop: the
+public-domain Openwall C core, vendored as source in `native/` and compiled on the box. The pure-Kotlin bcrypt is
+the fallback. Coroutines are the Kotlin **language** feature
 (`suspend` + `kotlin.coroutines` intrinsics from the stdlib), with no kotlinx.coroutines and no dispatcher: a
 continuation is resumed directly on the thread that completed its I/O.
 
@@ -43,8 +45,10 @@ PG write thread (x DB_WRITE_CONNS, default 2): group commit. Takes all queued wr
   BEGIN; w1; w2; ...; COMMIT; Sync in ONE round trip; resumes callers only after COMMIT's ReadyForQuery.
   On any error: ROLLBACK, then each job alone (autocommit). `isolated` writes (register, user update: unique
   violations expected) always run alone.
-bcrypt thread (x BCRYPT_THREADS, default 1, nice 10): collects up to 4 jobs within BCRYPT_BATCH_MS (150 ms),
-  computes them as interleaved lanes, resumes each caller on the bcrypt thread.
+bcrypt thread (x BCRYPT_THREADS, default 1, nice 10): collects up to 8 jobs within BCRYPT_BATCH_MS (400 ms; at
+  ~28 logins/s 93% of batches are full), computes them as interleaved lanes in one call to the C kernel (FFM on the
+  JVM, cinterop on Native; 12.6-13 ms CPU/hash at 8 lanes vs 23.4 / 18.7 ms for the Kotlin 4 lanes), resumes
+  each caller on the bcrypt thread. If the kernel is missing or fails its startup checks: Kotlin lanes, up to 4.
 ```
 
 Every statement is prepared once per connection at startup (named `s<id>`, explicit parameter OIDs, no Describe);
@@ -63,6 +67,7 @@ every Bind asks for binary results. Startup packet `options`:
 | `http/Http.kt` | `HttpConn` (platform I/O), `HttpEngine` (common engine), `Exchange` (handler API) |
 | `json/Json.kt` | `JsonWriter` (streaming, pre-encoded `JsonName`s), `JsonReader` (request bodies) |
 | `auth/Auth.kt` | `Jwt` (HS256 sign/verify), `Passwords` (bcrypt pool, suspend hash/verify) |
+| `crypto/BcryptKernel.kt` | `BcryptKernel` (C or Kotlin lanes, chosen at startup), `BcryptC` (expect; FFM in jvmMain, cinterop in linuxX64Main; C in `native/`, see its README) |
 | `app/App.kt` | routes + handlers + SQL catalog (`reads`, `writes`) |
 | `Main.kt` | wiring + env knobs (done) |
 

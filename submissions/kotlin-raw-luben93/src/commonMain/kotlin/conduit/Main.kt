@@ -33,7 +33,9 @@ fun main() {
     val readConns = envInt("DB_READ_CONNS", maxOf(2, (cpus * 3 + 3) / 4))
     val writeConns = envInt("DB_WRITE_CONNS", maxOf(1, (cpus + 3) / 4))
     val bcryptThreads = envInt("BCRYPT_THREADS", maxOf(1, (cpus + 7) / 8))
-    val bcryptWindow = envInt("BCRYPT_BATCH_MS", 150).toLong()
+    // ~28 logins/s at 100k users: 400 ms fills 93% of 8-lane batches (mean 7.9 jobs). Logins are ~0.1% of requests,
+    // so their latency can't move p95/p99.
+    val bcryptWindow = envInt("BCRYPT_BATCH_MS", 400).toLong()
     val options = getenv("DB_OPTIONS") ?: DEFAULT_OPTIONS
 
     Jwt.init(secret)
