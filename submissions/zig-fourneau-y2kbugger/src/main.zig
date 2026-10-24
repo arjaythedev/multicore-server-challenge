@@ -43,8 +43,13 @@ const Tuning = struct {
 };
 /// Per shard: requests in flight at most.
 const slots_per_shard = 2048;
-/// All shards: the service's 200,000 descriptors, less Postgres's and a margin.
+/// All shards, at most: the descriptor limit less these is the cap
+/// (`connections_fitting`). Past the cap the longest idle are closed; past
+/// the limit accept would fail instead, and no slot would free.
 const connections_max = 196 * 1024;
+/// Descriptors not a connection: Postgres's, the rings, the listeners,
+/// stdio, and a margin.
+const descriptors_reserved = 1024;
 
 pub fn main(init: std.process.Init.Minimal) !void {
     const environ = init.environ;
@@ -53,12 +58,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const host = environ.getPosix("HOST") orelse "0.0.0.0";
     const port = try std.fmt.parseInt(u16, environ.getPosix("PORT") orelse "80", 10);
 
-    raise_descriptor_limit();
+    const descriptors = raise_descriptor_limit();
     // No transparent huge pages in this process: a connection touches a few
     // pages of each slab, and a 2 MiB page per touch would hold tens of KiB
     // per idle connection where THP is `always` (Ubuntu's `madvise` gives
     // none anyway).
-    const thp = linux.prctl(@intFromEnum(linux.PR.SET_THP_DISABLE), 1, 0, 0, 0);
+    const thp = linux.prctl(@backingInt(linux.PR.SET_THP_DISABLE), 1, 0, 0, 0);
     if (linux.errno(thp) != .SUCCESS) return error.ThpDisable;
     const url = try pg.parse_url(database_url);
     const gpa = std.heap.page_allocator;
@@ -73,7 +78,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .reads = tuning.reads,
         .writes = tuning.writes,
         .slots = slots_per_shard,
-        .connections_max = connections_fitting() / tuning.shards,
+        .connections_max = connections_fitting(descriptors) / tuning.shards,
         .address = try std.Io.net.IpAddress.parse(host, port),
         .key = key,
         .passwords = passwords,
@@ -82,8 +87,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const thread = try std.Thread.spawn(.{}, shard_module.run, .{options});
         thread.detach();
     }
-    std.debug.print("conduit on {s}:{d}: {d} shards of {d} reads and {d} writes, {d} bcrypt workers\n", .{
-        host, port, tuning.shards, tuning.reads, tuning.writes, tuning.bcrypt_workers,
+    std.debug.print("conduit on {s}:{d}: {d} shards of {d} reads, {d} writes and {d} connections, {d} bcrypt workers\n", .{
+        host,                    port,                  tuning.shards, tuning.reads, tuning.writes,
+        options.connections_max, tuning.bcrypt_workers,
     });
     shard_module.run(options);
 }
@@ -91,28 +97,38 @@ pub fn main(init: std.process.Init.Minimal) !void {
 /// The connection slots the kernel's map limit leaves room for: a fiber's
 /// stack sits over a guard page, two maps a fiber (`vm.max_map_count` is
 /// 65,530 on a kernel left at its default: 32k fibers, where a failed map
-/// would be a crash). Past the slots, the longest idle are closed.
-fn connections_fitting() u32 {
+/// would be a crash), and a descriptor each. Past the slots, the longest
+/// idle are closed.
+fn connections_fitting(descriptors: u64) u32 {
+    const by_descriptors = if (descriptors > descriptors_reserved + 1024)
+        descriptors - descriptors_reserved
+    else
+        1024;
+    const cap = @min(connections_max, by_descriptors);
     const maps_reserved = 8192; // the rest of the process: slabs, rings, libc
     var buffer: [32]u8 = undefined;
     const fd = linux.open("/proc/sys/vm/max_map_count", .{ .ACCMODE = .RDONLY }, 0);
-    if (linux.errno(fd) != .SUCCESS) return connections_max;
+    if (linux.errno(fd) != .SUCCESS) return @intCast(cap);
     defer _ = linux.close(@intCast(fd));
     const got = linux.read(@intCast(fd), &buffer, buffer.len);
-    if (linux.errno(got) != .SUCCESS) return connections_max;
+    if (linux.errno(got) != .SUCCESS) return @intCast(cap);
     const text = std.mem.trim(u8, buffer[0..got], " \n");
-    const maps = std.fmt.parseInt(u64, text, 10) catch return connections_max;
+    const maps = std.fmt.parseInt(u64, text, 10) catch return @intCast(cap);
     if (maps <= maps_reserved) return 1024;
     const fibers = (maps - maps_reserved) / 2;
-    return @intCast(@min(connections_max, fibers));
+    return @intCast(@min(cap, fibers));
 }
 
 /// The soft limit up to the hard one: a connection is a descriptor.
-fn raise_descriptor_limit() void {
+/// Returns the limit now in force.
+fn raise_descriptor_limit() u64 {
     var limit: linux.rlimit = undefined;
-    if (linux.errno(linux.getrlimit(.NOFILE, &limit)) != .SUCCESS) return;
+    if (linux.errno(linux.getrlimit(.NOFILE, &limit)) != .SUCCESS) return 1024;
     limit.cur = limit.max;
-    _ = linux.setrlimit(.NOFILE, &limit);
+    if (linux.errno(linux.setrlimit(.NOFILE, &limit)) != .SUCCESS) {
+        _ = linux.getrlimit(.NOFILE, &limit);
+    }
+    return limit.cur;
 }
 
 test {
