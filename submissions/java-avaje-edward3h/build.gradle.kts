@@ -1,0 +1,43 @@
+plugins {
+    java
+    application
+    id("org.ethelred.kiwiproc") version "1.0"
+}
+
+repositories {
+    mavenCentral()
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(26)
+    }
+}
+
+val avajeHttp = "3.12.1"
+val avajeInject = "12.7"
+val avajeJsonb = "3.16"
+
+dependencies {
+    implementation("io.avaje:avaje-http-api:$avajeHttp")
+    implementation("io.avaje:avaje-inject:$avajeInject")
+    implementation("io.avaje:avaje-jsonb:$avajeJsonb")
+    implementation("io.helidon.webserver:helidon-webserver:4.5.6")
+    implementation("jakarta.inject:jakarta.inject-api:2.0.1")
+    implementation("com.zaxxer:HikariCP:7.1.0")
+    implementation("org.postgresql:postgresql:42.7.14")
+    implementation("at.favre.lib:bcrypt:0.10.2")
+
+    annotationProcessor("io.avaje:avaje-http-helidon-generator:$avajeHttp")
+    annotationProcessor("io.avaje:avaje-inject-generator:$avajeInject")
+    annotationProcessor("io.avaje:avaje-jsonb-generator:$avajeJsonb")
+}
+
+application {
+    mainClass = "conduit.Main"
+}
+
+tasks.withType<JavaCompile>().configureEach {
+    options.release = 26
+    options.encoding = "UTF-8"
+}
