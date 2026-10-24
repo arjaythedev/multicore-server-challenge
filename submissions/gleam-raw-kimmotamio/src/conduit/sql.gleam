@@ -280,6 +280,14 @@ fn new_row_tail() -> String {
 // run once per request rather than once per statement.
 
 /// The read statements that have a batched variant.
+/// Statements that only read; a request made of these is safe to run again on a reopened connection.
+pub fn read_only(index: Int) -> Bool {
+  case index {
+    0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 15 | 17 | 23 | 24 -> True
+    _ -> False
+  }
+}
+
 pub fn batchable(index: Int) -> Bool {
   case index {
     0 | 1 | 2 | 3 | 4 | 6 | 7 | 8 | 24 -> True

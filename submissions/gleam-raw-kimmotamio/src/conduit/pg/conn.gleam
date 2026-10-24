@@ -165,12 +165,18 @@ fn loop(config: Config, subject: Subject(Request), sock: Socket, queue: List(Req
 
 fn serve_first(config: Config, subject: Subject(Request), sock: Socket, first: Request, queue: List(Request)) -> Nil {
   case batch_key(first) {
-    // A write (or a multi-statement request): never retried, since its commit state would be unknown.
+    // Not batched: a write or a multi-statement request is never retried, since its commit state would be
+    // unknown; a read that has no batched form (the feed, the probes, the user lookups) is.
     None -> {
       stat_add(1, 1)
-      case run(sock, first.statements, [first], False) {
+      let reads = list.all(first.statements, fn(s) { sql.read_only(s.0) })
+      case run(sock, first.statements, [first], reads) {
         True -> loop(config, subject, sock, queue)
-        False -> reconnect(config, subject, sock, queue)
+        False ->
+          case reads {
+            True -> reconnect(config, subject, sock, [first, ..queue])
+            False -> reconnect(config, subject, sock, queue)
+          }
       }
     }
     // Reads are retried on the reopened connection when this one turns out to be dead.

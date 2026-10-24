@@ -16,7 +16,7 @@ one BEAM process per Postgres connection.
 | Gleam | 1.19.2 (official release tarball, sha256-pinned) |
 | gleam_stdlib / gleam_erlang / gleam_json | 1.0.5 / 1.3.0 / 3.1.0 (pinned in `manifest.toml`; gleam_json is used for request bodies only) |
 | bcrypt | the OpenBSD `bcrypt.c`/`blowfish.c` as packaged by erlang-bcrypt, vendored in `native/` with its licence, plus a lane-interleaved variant (`native/bcrypt_lanes.c`) and a small NIF (`native/bcrypt_nif.c`), all built by `build.sh`; cost 10 |
-| C helpers | `native/conduit_nif.c`: JSON string escaping and RFC 3339 timestamps (about 150 lines, no dependencies) |
+| C helpers | `native/conduit_nif.c`: JSON string escaping, RFC 3339 timestamps, DataRow and `text[]` splitting (about 230 lines, no dependencies; the Gleam versions stay as the tests' reference) |
 
 `build.sh` compiles the NIFs with the system C compiler, downloads the three pinned Gleam packages and runs
 `gleam export erlang-shipment`. `start.sh` runs `erl` on the shipment in the foreground.
@@ -47,9 +47,9 @@ one BEAM process per Postgres connection.
   while without the setting the global list was re-planned on every execution, 0.19 ms of planning on top of
   0.15 ms of execution, because the planner prices an unknown `OFFSET` pessimistically), SCRAM-SHA-256 (also md5/cleartext),
   every statement prepared once per connection at startup (`Parse`), then one `Bind`/`Execute` per statement and
-  one `Sync` per request. Results come back in binary format and are decoded with bit-array pattern matching
-  (int8, bool, timestamptz as microseconds, `text[]`); text columns are sub-binaries of the socket buffer, never
-  copied. Two pools: `DB_READ_CONNS` (12) and `DB_WRITE_CONNS` (8) connection processes, chosen round-robin
+  one `Sync` per request. Results come back in binary format; a DataRow and a `text[]` are split into
+  sub-binaries of the socket buffer by two small NIFs (never copied), and the scalar columns (int8, bool,
+  timestamptz as microseconds) are read with bit-array patterns. Two pools: `DB_READ_CONNS` (12) and `DB_WRITE_CONNS` (8) connection processes, chosen round-robin
   through an `atomics` counter. A connection serves one Sync group at a time; a lost connection is reopened and
   the requests waiting in the process mailbox are served after the reconnect. A request carries its deadline; a
   response is never written after it, so the connection process's own 503 can't be followed by a late one.
@@ -124,8 +124,8 @@ one BEAM process per Postgres connection.
 
 ## Tests
 
-`gleam test` runs unit tests (no database): timestamp formatting (the C formatter against the Gleam one),
-JSON escaping, JWT issue/verify (fast and general paths, tampering), query and page validation, percent-decoding, Postgres message encoding/decoding, bcrypt hash/verify through the
+`gleam test` runs unit tests (no database): timestamp formatting and row/array decoding (the C versions against
+the Gleam ones), JSON escaping, JWT issue/verify (fast and general paths, tampering), query and page validation, percent-decoding, Postgres message encoding/decoding, bcrypt hash/verify through the
 collector. `test/run.sh` passes 197/197 and the normalized transcript is byte-identical to
 `bench/cmd/conformance/golden-dev.jsonl`, also when replayed on a clean Ubuntu 24.04 container
 (`install.sh`, then `test/run.sh`, OTP 28).
