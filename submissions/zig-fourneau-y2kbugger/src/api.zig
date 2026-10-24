@@ -449,9 +449,13 @@ fn read_body(context: *Context) ?[]const u8 {
     } else unreachable;
 }
 
+/// The body's fields. A string with escapes is decoded into the scratch
+/// after the body, the request's own: a handler keeps its fields across
+/// its waits, while the shard's other requests parse theirs. Decoding
+/// never lengthens a string, so a body under half the scratch always fits.
 fn parse(context: *Context, wrapper: []const u8, items: []const u8) ?json.Body {
     const text = read_body(context) orelse return null;
-    return json.parse_body(text, wrapper, items, context.shard.json_memory);
+    return json.parse_body(text, wrapper, items, context.request.scratch[text.len..]);
 }
 
 fn register(context: *Context) Response {

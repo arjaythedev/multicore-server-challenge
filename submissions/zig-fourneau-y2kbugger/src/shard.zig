@@ -134,7 +134,6 @@ pub const Shard = struct {
     write_connections: []pg.Connection,
     slots: Slots,
     jwt_memory: []u8,
-    json_memory: []u8,
 };
 
 pub fn run(options: Options) void {
@@ -172,7 +171,6 @@ fn run_or_fail(options: Options) !noreturn {
         .write_connections = try gpa.alloc(pg.Connection, options.writes),
         .slots = try .init(gpa, options.slots, 256 * 1024, 128 * 1024, options.connections_max),
         .jwt_memory = try gpa.alloc(u8, jwt.memory_bytes),
-        .json_memory = try gpa.alloc(u8, 256 * 1024),
     };
     const statements = &sql.statements.values;
     var group: Io.Group = .init;
