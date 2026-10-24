@@ -51,11 +51,26 @@ Every statement is prepared once per connection at startup (named `s<id>`, expli
 every Bind asks for binary results. Startup packet `options`:
 `-c plan_cache_mode=force_generic_plan -c jit=off -c max_parallel_workers_per_gather=0 -c enable_memoize=off`.
 
+## JVM specifics (jvmMain)
+
+- **HTTP loops** run on raw epoll through FFM (`EpollHttp.kt`, a port of the Native loop): recv/send/accept4/
+  epoll_ctl are *critical* downcalls that hand heap arrays straight to the kernel (no NIO channel lock, no copy
+  through a temporary direct buffer, no fd -> key `HashMap` lookup with a boxed fd per event); only epoll_wait (it
+  blocks) is a normal downcall. `HTTP_IO=nio` (or no FFM, or a non-IPv4 bind address) uses the java.nio selector
+  loops (`NioHttp.kt`). Both pass the same end-to-end tests (`NioHttpTest`, `EpollHttpTest`, `EmfileTest`).
+- **Postgres sockets** are blocking `SocketChannel`s (connected with a timeout through a selector, then switched to
+  blocking). A `java.net.Socket` stays non-blocking for good after a timed connect, which turns every waiting read
+  into read -> EAGAIN, poll, read.
+- **Our threads** are `ConduitThread`s: `threadScratch()` (JWT HMAC, scratch buffers) and the FFM errno capture
+  segment are plain fields, not `ThreadLocal` lookups.
+- **Per request**, the Authorization header is verified in place in the input buffer (`Exchange.authBuf`: no
+  String, no copy); the token String exists only for `/api/user`, which echoes it.
+
 ## Contracts (read the KDoc in these files; they are the source of truth)
 
 | File | What |
 |---|---|
-| `platform/Platform.kt` | the only platform surface: time, random, env, threads, `Monitor`, `BlockingSocket`, `HmacSha256`, `threadScratch`, `startHttpServer` |
+| `platform/Platform.kt` | the only platform surface: time, random, env, threads, `Monitor`, `BlockingSocket`, `HmacSha256`, `threadScratch`, `loadLongLE`, `startHttpServer` |
 | `util/ByteBuf.kt` | growable write buffer + big-endian helpers (done) |
 | `crypto/Sha256.kt` | pure-Kotlin SHA-256 + HMAC (done; Native's HMAC; SCRAM uses `HmacSha256`/`sha256`) |
 | `pg/Types.kt` | `Row` (binary column views), `Result`, `Params` (binary encoder), `PgError`, `Oid` (done) |

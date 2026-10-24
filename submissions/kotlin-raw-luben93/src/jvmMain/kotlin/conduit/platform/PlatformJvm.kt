@@ -33,9 +33,10 @@ actual fun getenv(name: String): String? = System.getenv(name)
 
 actual fun cpuCount(): Int = Runtime.getRuntime().availableProcessors()
 
-/** Our own threads carry their [Scratch] in a field: no ThreadLocal lookup on hot paths. */
+/** Our own threads carry their [Scratch] (and FFM errno capture) in fields: no ThreadLocal lookup on hot paths. */
 internal class ConduitThread(name: String, body: Runnable) : Thread(body, name) {
     @JvmField val scratch = Scratch()
+    @JvmField var capture: java.lang.foreign.MemorySegment? = null
 }
 
 actual fun startThread(name: String, nice: Int, body: () -> Unit) {
@@ -149,5 +150,19 @@ private val scratch = ThreadLocal.withInitial { Scratch() }
 
 actual fun threadScratch(): Scratch = (Thread.currentThread() as? ConduitThread)?.scratch ?: scratch.get()
 
-actual fun startHttpServer(host: String, port: Int, loops: Int, engine: conduit.http.HttpEngine) =
-    startNioServer(host, port, loops, engine) // NioHttp.kt
+/**
+ * Raw epoll through FFM (EpollHttp.kt; measured cheaper per request than NIO), unless HTTP_IO=nio, the bind address
+ * is not IPv4 or FFM is unusable: then java.nio selector loops (NioHttp.kt).
+ */
+actual fun startHttpServer(host: String, port: Int, loops: Int, engine: conduit.http.HttpEngine) {
+    if (getenv("HTTP_IO") != "nio") {
+        val ok = try {
+            startEpollServer(host, port, loops, engine)
+        } catch (e: LinkageError) { // FFM unusable (Sys failed to initialize): fall back
+            println("http: epoll via FFM unavailable ($e); using NIO")
+            false
+        }
+        if (ok) return
+    }
+    startNioServer(host, port, loops, engine)
+}

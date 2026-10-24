@@ -25,8 +25,10 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
-/** End-to-end: the NIO loops + the common engine over real sockets. */
-class NioHttpTest {
+/** End-to-end: the NIO loops + the common engine over real sockets. [EpollHttpTest] runs the same on FFM epoll. */
+open class NioHttpTest {
+    open val port: Int get() = nioPort
+
     companion object {
         private val timer: ScheduledExecutorService = Executors.newScheduledThreadPool(2) { r ->
             Thread(r, "answer").apply { isDaemon = true }
@@ -77,9 +79,15 @@ class NioHttpTest {
             error("no free port")
         }
 
-        val port: Int by lazy {
+        val nioPort: Int by lazy {
             val p = freePort(3101)
-            startHttpServer("127.0.0.1", p, 2, HttpEngine { handle(it) })
+            startNioServer("127.0.0.1", p, 2, HttpEngine { handle(it) })
+            p
+        }
+
+        val epollPort: Int by lazy {
+            val p = freePort(3101)
+            check(startEpollServer("127.0.0.1", p, 2, HttpEngine { handle(it) })) { "epoll via FFM unavailable" }
             p
         }
     }
@@ -412,4 +420,9 @@ fun readResponse(inp: InputStream, slow: Boolean = false): NioHttpTest.Resp {
         if (slow && p % 65536 < 16384) Thread.sleep(1)
     }
     return NioHttpTest.Resp(status, headers, body, size + n)
+}
+
+/** The same end-to-end tests on the FFM epoll loops (HTTP_IO=epoll). */
+class EpollHttpTest : NioHttpTest() {
+    override val port: Int get() = epollPort
 }
