@@ -47,6 +47,7 @@ fn all_digits(b: BitArray) -> Bool {
 }
 
 /// Percent-decoding that keeps malformed escapes literally; `plus` turns `+` into a space (query strings).
+/// Most segments have nothing to decode: one `binary:match` says so without a pass in Gleam.
 pub fn pct_decode(s: BitArray, plus: Bool) -> BitArray {
   case needs_decoding(s, plus) {
     False -> s
@@ -54,15 +55,8 @@ pub fn pct_decode(s: BitArray, plus: Bool) -> BitArray {
   }
 }
 
-fn needs_decoding(s: BitArray, plus: Bool) -> Bool {
-  case s {
-    <<>> -> False
-    <<"%":utf8, _:bytes>> -> True
-    <<"+":utf8, _:bytes>> if plus -> True
-    <<_:size(8), rest:bytes>> -> needs_decoding(rest, plus)
-    _ -> False
-  }
-}
+@external(erlang, "conduit_ffi", "needs_decoding")
+fn needs_decoding(s: BitArray, plus: Bool) -> Bool
 
 fn do_decode(s: BitArray, plus: Bool, acc: BitArray) -> BitArray {
   case s {

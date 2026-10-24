@@ -3,7 +3,7 @@
 %% reference the tests hold the NIF to.
 -module(conduit_ffi).
 -export([getenv/1, now_seconds/0, monotonic_ms/0, hmac_sha256/2, sha256/1, md5_hex/1, hash_equals/2, pbkdf2_sha256/3, random_bytes/1,
-         xor_bytes/2, has_nul/1, is_utf8/1, base64url_encode/1, base64url_decode/1,
+         xor_bytes/2, has_nul/1, has_quote_or_backslash/1, needs_decoding/2, is_utf8/1, base64url_encode/1, base64url_decode/1,
          listen/2, accept/1, connect/3, recv/1, recv_timeout/2, send/2, send_nosuspend/2, close/1, parse_request_ref/1, spawn_connection/2,
          hibernate_http/3, heap_words/0, mailbox_len/0, safe/1, log/1,
          pool_init/3, pick_read/1, pick_write/0, sleep/1, stat_add/2, stats/0,
@@ -36,6 +36,12 @@ random_bytes(N) -> crypto:strong_rand_bytes(N).
 xor_bytes(A, B) -> crypto:exor(A, B).
 
 has_nul(Bin) -> binary:match(Bin, <<0>>) =/= nomatch.
+
+has_quote_or_backslash(Bin) -> binary:match(Bin, [<<$">>, <<$\\>>]) =/= nomatch.
+
+%% Whether percent-decoding has anything to do (`+` counts in query strings).
+needs_decoding(Bin, true) -> binary:match(Bin, [<<$%>>, <<$+>>]) =/= nomatch;
+needs_decoding(Bin, false) -> binary:match(Bin, <<$%>>) =/= nomatch.
 
 is_utf8(Bin) ->
     case unicode:characters_to_binary(Bin, utf8, utf8) of

@@ -143,13 +143,20 @@ pub fn array_literal(items: List(Param)) -> Param {
     list.map(items, fn(p) {
       case p {
         None -> <<"NULL":utf8>>
-        Some(s) -> <<"\"":utf8, escape_array_elem(s, <<>>):bits, "\"":utf8>>
+        Some(s) ->
+          case has_quote_or_backslash(s) {
+            False -> <<"\"":utf8, s:bits, "\"":utf8>>
+            True -> <<"\"":utf8, escape_array_elem(s, <<>>):bits, "\"":utf8>>
+          }
       }
     })
     |> list.intersperse(<<",":utf8>>)
     |> bit_array.concat
   Some(<<"{":utf8, elems:bits, "}":utf8>>)
 }
+
+@external(erlang, "conduit_ffi", "has_quote_or_backslash")
+fn has_quote_or_backslash(s: BitArray) -> Bool
 
 fn escape_array_elem(s: BitArray, acc: BitArray) -> BitArray {
   case s {
