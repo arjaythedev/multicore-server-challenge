@@ -234,11 +234,21 @@ pub const statements = std.enums.EnumArray(S, pg.Statement).init(.{
             "AND a.slug = $2 AND c.author_id = $3",
         .params = &.{ .int8, .text, .int8 },
     },
-    // Not shared by slug: a batch repeats an article too seldom for the
-    // materialized set to pay (14,652 req/s against 14,835, 60k users).
+    // Each distinct slug of the batch read once: the article, its tags,
+    // favorite count and author; the viewer's flags per request. A batch
+    // repeats the articles of the lists its users just saw: 52 buffers a
+    // request against 61, and 1-3% more requests a second at saturation.
     .batch_article = .{
-        .sql = "SELECT r.i, x.* " ++ batch_keys ++ " CROSS JOIN LATERAL (" ++
-            article_full_select_of("r.v") ++ " WHERE a.slug = r.k) x",
+        .sql = "WITH r AS (SELECT * " ++ batch_keys ++ "), q AS (SELECT DISTINCT r.k FROM r), " ++
+            "x AS MATERIALIZED (SELECT q.k, a.id, a.author_id, a.slug, a.title, a.description, a.body, " ++
+            "a.created_at, a.updated_at, " ++ tag_list ++ " AS tag_list, " ++
+            "(SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites, " ++
+            "u.username, u.bio, u.image FROM q JOIN articles a ON a.slug = q.k JOIN users u ON u.id = a.author_id) " ++
+            "SELECT r.i, x.slug, x.title, x.description, x.body, x.created_at, x.updated_at, x.tag_list, " ++
+            "x.favorites, EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = x.id AND f.user_id = r.v), " ++
+            "x.username, x.bio, x.image, " ++
+            "EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.v AND fo.followee_id = x.author_id) " ++
+            "FROM r JOIN x ON x.k = r.k",
         .params = batch_key_params,
     },
     // The article found once, its comments joined to it: a request's rows
