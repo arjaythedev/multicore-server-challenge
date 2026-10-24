@@ -1,0 +1,30 @@
+[package]
+name = "conduit"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+libc = "=0.2.183"
+httparse = "=1.10.1"
+memchr = "=2.8.0"
+itoa = "=1.0.18"
+hmac = "=0.12.1"
+sha2 = "=0.10.9"
+base64 = "=0.22.1"
+serde_json = "=1.0.149"
+getrandom = "=0.3.4"
+mimalloc = { version = "=0.1.52", default-features = false }
+
+[dev-dependencies]
+bcrypt = "=0.19.3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+
+[profile.test]
+opt-level = 3
