@@ -29,7 +29,10 @@ process per Postgres connection, bcrypt as a dirty-CPU NIF.
   requests a connection process hibernates when its heap has grown past `HIB_WORDS` (2048 words), so an idle
   keep-alive connection costs about 20 KB; connections are never closed by the server (keep-alive forever).
 - **Postgres** (`src/conduit/pg/`): a minimal protocol 3.0 client. Startup with session options
-  (`jit=off`, `max_parallel_workers_per_gather=0`, `enable_memoize=off`), SCRAM-SHA-256 (also md5/cleartext),
+  (`jit=off`, `max_parallel_workers_per_gather=0`, `enable_memoize=off`, `plan_cache_mode=force_generic_plan`;
+  the generic plan of every statement has the same shape as its custom plan, checked with `EXPLAIN` for all 35,
+  while without the setting the global list was re-planned on every execution, 0.19 ms of planning on top of
+  0.15 ms of execution, because the planner prices an unknown `OFFSET` pessimistically), SCRAM-SHA-256 (also md5/cleartext),
   every statement prepared once per connection at startup (`Parse`), then one `Bind`/`Execute` per statement and
   one `Sync` per request. Results come back in binary format and are decoded with bit-array pattern matching
   (int8, bool, timestamptz as microseconds, `text[]`); text columns are sub-binaries of the socket buffer, never

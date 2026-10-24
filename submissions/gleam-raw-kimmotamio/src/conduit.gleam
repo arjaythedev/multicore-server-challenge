@@ -143,7 +143,7 @@ fn parse_database_url(url: String) -> Config {
     user: pct(user),
     password: pct(password),
     database: database,
-    options: "-c jit=off -c max_parallel_workers_per_gather=0 -c enable_memoize=off",
+    options: "-c jit=off -c max_parallel_workers_per_gather=0 -c enable_memoize=off -c plan_cache_mode=force_generic_plan",
   )
 }
 
