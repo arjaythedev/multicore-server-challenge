@@ -298,12 +298,15 @@ class ProtocolProxy(socketserver.ThreadingTCPServer):
 
     def __init__(self, database_host, database_port, frame_timeout=15, capacity=128,
                  complete_capture=False, record_limit=4096,
-                 name_bytes_limit=1048576, name_limit=128):
+                 name_bytes_limit=1048576, name_limit=128,
+                 frontend_limit=1048576, frontend_buffer=None):
         self.database_host = database_host
         self.database_port = int(database_port)
         self.frame_timeout = frame_timeout
         self.messages = []
         self.frame_gates = []
+        self.frontend_bind_gate = None
+        self.frontend_limit = frontend_limit
         self.failures = []
         self.capacity = capacity
         self.complete_capture = complete_capture
@@ -331,6 +334,9 @@ class ProtocolProxy(socketserver.ThreadingTCPServer):
         self.reject_new = False
         self.connections = threading.BoundedSemaphore(capacity)
         super().__init__(("127.0.0.1", 0), ProtocolConnection)
+        if frontend_buffer is not None:
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF,
+                                   frontend_buffer)
         self.thread = threading.Thread(target=self.serve_forever, daemon=True)
         self.thread.start()
 
@@ -546,7 +552,9 @@ class ProtocolProxy(socketserver.ThreadingTCPServer):
 
     def stop(self):
         self.release_command_complete(abort=True)
-        for gate in self.frame_gates:
+        gates = self.frame_gates + ([self.frontend_bind_gate]
+                                   if self.frontend_bind_gate is not None else [])
+        for gate in gates:
             gate.abort = True
             gate.release.set()
         self.shutdown()
@@ -683,8 +691,21 @@ class ProtocolConnection(socketserver.BaseRequestHandler):
                     deadline = time.monotonic() + self.server.frame_timeout
                     size = self.read_exact(self.request, 4, deadline)
                     length = int.from_bytes(size, "big")
-                    if not 4 <= length <= 1048576:
+                    if not 4 <= length <= self.server.frontend_limit:
+                        with self.server.lock:
+                            self.server.failures.append("frontend frame length limit")
                         return
+                    gate = self.server.frontend_bind_gate
+                    if (gate is not None and kind == b"B" and
+                            index == gate.connection and not gate.claimed):
+                        gate.claimed = True
+                        gate.reached.set()
+                        if not gate.release.wait(gate.timeout):
+                            with self.server.lock:
+                                self.server.failures.append("frontend Bind gate timed out")
+                            return
+                        if gate.abort:
+                            return
                     payload = self.read_exact(self.request, length - 4,
                                               deadline)
                     self.request.settimeout(None)
@@ -2362,6 +2383,27 @@ class Integration(unittest.TestCase):
         self.assertEqual(failures, [])
         self.assertEqual(forwarded, [bind])
         parse = (b"P", b"abc\0SELECT 1\0\0\0")
+        for field in ("record", "bytes", "connections"):
+            for count in (1, 2, 3):
+                with self.subTest(boundary=field, count=count):
+                    groups = [[parse] * count]
+                    if field == "record":
+                        limits = {"record_limit": 2}
+                        error = "capture record limit"
+                    elif field == "bytes":
+                        limits = {"name_bytes_limit": 8}
+                        error = "capture total name bytes limit"
+                    else:
+                        groups = [[parse] for _ in range(count)]
+                        limits = {"capacity": 2}
+                        error = "capture connection lifetime limit"
+                    records, failures, forwarded = capture_case(groups, **limits)
+                    retained = min(count, 2)
+                    expected = ([(b"P", b"abc\0")] * retained)
+                    self.assertEqual(records, [[item] for item in expected]
+                                     if field == "connections" else [expected])
+                    self.assertEqual(failures, [error] if count == 3 else [])
+                    self.assertEqual(forwarded, [parse] * retained)
         for groups, limits, expected_error in (
                 ([[parse, parse]], {"record_limit": 1}, "capture record limit"),
                 ([[parse, parse]], {"name_bytes_limit": 4}, "capture total name bytes limit"),
@@ -3664,6 +3706,71 @@ class Integration(unittest.TestCase):
                            check=True, capture_output=True, timeout=30)
             yield library
 
+    @contextmanager
+    def pending_query_storage(self, mode, env):
+        if mode != "pending":
+            yield env, ()
+            return
+        host = os.environ.get("PGHOST", "127.0.0.1")
+        if host.startswith("/"):
+            host = "127.0.0.1"
+        proxy = ProtocolProxy(host, os.environ.get("PGPORT", "5432"),
+                              frontend_limit=32 * 1024 * 1024,
+                              frontend_buffer=32 * 1024)
+        gate = FrameGate(b"B", 0, timeout=15)
+        proxy.frontend_bind_gate = gate
+        read_fd, write_fd = os.pipe()
+        failures = []
+        observed = []
+        deadline = time.monotonic() + 10
+
+        def release_after_pending():
+            try:
+                while not gate.reached.is_set():
+                    proxy.assert_healthy()
+                    remaining = deadline - time.monotonic()
+                    self.assertGreater(remaining, 0, "pending Bind body gate timed out")
+                    gate.reached.wait(min(remaining, 0.01))
+                with proxy.lock:
+                    frontend = proxy.frontends[0]
+                size = frontend.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+                self.assertGreater(size, 0)
+                self.assertLess(size, 16 * 1024 * 1024)
+                with selectors.DefaultSelector() as selector:
+                    selector.register(read_fd, selectors.EVENT_READ)
+                    self.assertTrue(selector.select(max(0, deadline - time.monotonic())),
+                                    "native pending notification timed out")
+                self.assertEqual(os.read(read_fd, 1), b"P",
+                                 "native pending notification byte")
+                observed.append(True)
+            except BaseException as failure:
+                failures.append(failure)
+                gate.abort = True
+            finally:
+                gate.release.set()
+
+        controller = threading.Thread(target=release_after_pending)
+        controller.start()
+        try:
+            yield env | {
+                "DATABASE_URL": "postgres://conduit:conduit@127.0.0.1:"
+                    f"{proxy.server_address[1]}/{self.database}",
+                "CONDUIT_QUERY_PENDING_FD": str(write_fd)}, (write_fd,)
+        finally:
+            os.close(write_fd)
+            gate.abort = True
+            gate.release.set()
+            controller.join(timeout=11)
+            try:
+                proxy.stop()
+            finally:
+                os.close(read_fd)
+            self.assertFalse(controller.is_alive(), "pending controller did not stop")
+            if failures:
+                raise failures[0]
+            proxy.assert_healthy()
+            self.assertEqual(observed, [True])
+
     def query_storage_case(self, mode, api, count, library=None,
                            control="clear", expect_success=True):
         scenarios = {"send0": 1, "flush-error": 2, "writing": 3,
@@ -3698,11 +3805,12 @@ class Integration(unittest.TestCase):
         env.pop("LD_PRELOAD", None)
         if library is not None:
             env["LD_PRELOAD"] = str(library)
-        result = subprocess.run(
-            [str(_executable()), "--test-query-storage", "--ponymaxthreads=1",
-             "--db-write-sessions=95"],
-            env=env, capture_output=True, text=True,
-            timeout=30 if mode == "pending" else 10)
+        with self.pending_query_storage(mode, env) as (controlled_env, descriptors):
+            result = subprocess.run(
+                [str(_executable()), "--test-query-storage", "--ponymaxthreads=1",
+                 "--db-write-sessions=95"],
+                env=controlled_env, pass_fds=descriptors, capture_output=True, text=True,
+                timeout=30 if mode == "pending" else 10)
         if not expect_success:
             self.assertNotEqual(result.returncode, 0)
             self.assertNotIn("query storage passed", result.stdout)

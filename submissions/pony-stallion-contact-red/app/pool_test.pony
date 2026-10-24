@@ -214,7 +214,8 @@ actor \nodoc\ _PoolProbe is
         for index in Range[USize](4, words.size()) do
           let value: String val = words(index)?.clone()
           if value.at("s:") then params.push(value.substring(2))
-          elseif value.at("i:") then params.push(_Input.decimal(value.substring(2))?)
+          elseif value.at("i:") then
+            params.push(_Input.decimal(value.substring(2))?)
           elseif value == "null" then params.push(None)
           else error end
         end

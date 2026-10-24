@@ -7,6 +7,8 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <libpq-fe.h>
+#include <unistd.h>
+#include <errno.h>
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static int64_t records[256][4];
@@ -15,6 +17,20 @@ static int overflow;
 static PGconn *selected;
 static int chosen, armed, remaining, scenario;
 static _Thread_local int inside_send;
+static int pending_notified;
+
+static void notify_pending(void) {
+  const char *value = getenv("CONDUIT_QUERY_PENDING_FD");
+  char *end;
+  if (!value || !*value) abort();
+  long descriptor = strtol(value, &end, 10);
+  if (*end || descriptor < 0 || descriptor > INT_MAX) abort();
+  ssize_t result;
+  do result = write((int)descriptor, "P", 1);
+  while (result < 0 && errno == EINTR);
+  if (result != 1) abort();
+  pending_notified = 1;
+}
 
 static void append(int function, int scripted, int result) {
   pthread_mutex_lock(&lock);
@@ -117,6 +133,7 @@ int PQflush(PGconn *conn) {
     if (remaining > 0) { remaining--; append(3, 1, 1); return 1; }
     int result = next(conn);
     append(3, 0, result);
+    if (scenario == 7 && result == 1 && !pending_notified) notify_pending();
     if (result != 1) armed = 0;
     return result;
   }
