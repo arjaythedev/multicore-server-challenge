@@ -4,13 +4,15 @@ import cats.effect.*
 import cats.effect.std.Console
 import cats.syntax.all.*
 import com.comcast.ip4s.{Host, Port}
-import com.zaxxer.hikari.HikariConfig
-import doobie.hikari.HikariTransactor
-import doobie.util.ExecutionContexts
-import doobie.util.transactor.{Strategy, Transactor}
 import org.http4s.ember.server.EmberServerBuilder
+import org.typelevel.otel4s.metrics.MeterProvider
+import org.typelevel.otel4s.trace.TracerProvider
+import skunk.Session
+import skunk.telemetry.{QueryCaptureConfig, TelemetryConfig}
 
 import java.net.URI
+import java.util.concurrent.Executors
+import scala.concurrent.ExecutionContext
 import scala.concurrent.duration.*
 
 final case class Config(
@@ -18,7 +20,8 @@ final case class Config(
     jwtSecret: String,
     host: Host,
     port: Port,
-    poolSize: Int,
+    readSessions: Int,
+    writeSessions: Int,
     bcryptThreads: Int,
     maxConnections: Int
 )
@@ -33,7 +36,8 @@ object Config:
       jwtSecret = required("JWT_SECRET"),
       host = env("HOST").flatMap(Host.fromString).getOrElse(Host.fromString("0.0.0.0").get),
       port = env("PORT").flatMap(Port.fromString).getOrElse(Port.fromInt(80).get),
-      poolSize = env("DB_POOL_SIZE").flatMap(_.toIntOption).getOrElse(4 * cores),
+      readSessions = env("DB_READ_SESSIONS").flatMap(_.toIntOption).getOrElse(16),
+      writeSessions = env("DB_WRITE_SESSIONS").flatMap(_.toIntOption).getOrElse(4),
       bcryptThreads = env("BCRYPT_THREADS").flatMap(_.toIntOption).getOrElse((cores / 2).max(1)),
       maxConnections = env("MAX_CONNECTIONS").flatMap(_.toIntOption).getOrElse(150_000)
     )
@@ -45,36 +49,54 @@ object Main extends IOApp.Simple:
   override protected def runtimeConfig =
     super.runtimeConfig.copy(cpuStarvationCheckInitialDelay = Duration.Inf)
 
-  /** `postgres://user:password@host:port/db` as HikariCP settings for the Postgres JDBC driver. */
-  private def hikariConfig(config: Config): HikariConfig =
-    val uri = URI(config.databaseUrl)
+  // No tracing or metrics: skunk instruments every statement through otel4s, and the no-op providers plus disabled
+  // pool and protocol spans make that free.
+  private given TracerProvider[IO] = TracerProvider.noop[IO]
+  private given MeterProvider[IO] = MeterProvider.noop[IO]
+
+  /** `postgres://user:password@host:port/db` as a skunk session. */
+  private def session(databaseUrl: String): Resource[IO, Session[IO]] =
+    val uri = URI(databaseUrl)
     val (user, password) = Option(uri.getUserInfo).map(_.split(":", 2)) match
       case Some(Array(u, p)) => (u, p)
       case Some(Array(u))    => (u, "")
-      case _                 => ("", "")
-    val port = if uri.getPort > 0 then uri.getPort else 5432
-    val hikari = HikariConfig()
-    hikari.setJdbcUrl(s"jdbc:postgresql://${uri.getHost}:$port${uri.getPath}")
-    hikari.setUsername(user)
-    hikari.setPassword(password)
-    hikari.setMaximumPoolSize(config.poolSize)
-    hikari.setMinimumIdle(config.poolSize)
-    hikari.setAutoCommit(true)
-    hikari.setConnectionTimeout(10_000)
-    // Server-side prepared statements from the first execution: every query here runs thousands of times.
-    hikari.addDataSourceProperty("prepareThreshold", "1")
-    hikari.addDataSourceProperty("preparedStatementCacheQueries", "1024")
-    hikari.addDataSourceProperty("ApplicationName", "conduit-scala-http4s")
-    hikari
+      case _                 => ("postgres", "")
+    Session
+      .Builder[IO]
+      .withHost(uri.getHost)
+      .withPort(if uri.getPort > 0 then uri.getPort else 5432)
+      .withUserAndPassword(user, password)
+      .withDatabase(uri.getPath.stripPrefix("/"))
+      // Session-level settings (rule 2): the same plan for every execution of a prepared statement instead of five
+      // custom plans first, no JIT compilation, and no parallel workers for these short index lookups.
+      .withConnectionParameters(
+        Session.DefaultConnectionParameters ++ Map(
+          "plan_cache_mode" -> "force_generic_plan",
+          "jit" -> "off",
+          "max_parallel_workers_per_gather" -> "0"
+        )
+      )
+      .withTelemetryConfig(
+        TelemetryConfig.default
+          .withCaptureQuery(QueryCaptureConfig.disabled)
+          .withPoolSpans(TelemetryConfig.PoolSpans.Disabled)
+          .withProtocolSpans(TelemetryConfig.ProtocolSpans.Disabled)
+      )
+      .single
+
+  private def fixedThreadPool(threads: Int): Resource[IO, ExecutionContext] =
+    Resource
+      .make(IO(Executors.newFixedThreadPool(threads)))(pool => IO.blocking(pool.shutdown()))
+      .map(ExecutionContext.fromExecutorService)
 
   def run: IO[Unit] =
     val server = for
       config <- Resource.eval(Config.fromEnv)
-      tx <- HikariTransactor.fromHikariConfig[IO](hikariConfig(config))
-      bcryptPool <- ExecutionContexts.fixedThreadPool[IO](config.bcryptThreads)
-      // Single statements run in autocommit mode: no BEGIN/COMMIT round trips around them.
-      db = Transactor.strategy.set(tx, Strategy.void)
-      api = Api(db, tx, Jwt(config.jwtSecret), bcryptPool)
+      // Writes get their own sessions, so a burst of reads can't queue them (or the other way round).
+      reads <- SessionPool(config.readSessions, session(config.databaseUrl))
+      writes <- SessionPool(config.writeSessions, session(config.databaseUrl))
+      bcryptPool <- fixedThreadPool(config.bcryptThreads)
+      api = Api(Db(reads, writes), Jwt(config.jwtSecret), bcryptPool)
       _ <- EmberServerBuilder
         .default[IO]
         .withHost(config.host)

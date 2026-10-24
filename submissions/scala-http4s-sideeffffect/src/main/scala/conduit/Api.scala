@@ -3,9 +3,7 @@ package conduit
 import at.favre.lib.crypto.bcrypt.BCrypt
 import cats.effect.IO
 import cats.syntax.all.*
-import doobie.*
-import doobie.implicits.*
-import doobie.postgres.sqlstate
+import skunk.{Session, SqlState}
 import io.circe.{Encoder, Json}
 import io.circe.syntax.*
 import org.http4s.*
@@ -21,13 +19,12 @@ import Sql.{Filter, Page}
 /** The 19 Conduit endpoints.
   *
   * @param db
-  *   runs statements in autocommit mode: one round trip each, no BEGIN/COMMIT
-  * @param tx
-  *   runs a whole program in one transaction (only POST /api/articles needs one)
+  *   lends a session for reads, or one for requests that write; statements run in autocommit mode (one round trip
+  *   each), and only POST /api/articles opens a transaction
   * @param bcryptPool
   *   bcrypt runs here, a few threads, so logins can't take over the CPUs the event loop needs
   */
-final class Api(db: Transactor[IO], tx: Transactor[IO], jwt: Jwt, bcryptPool: ExecutionContext):
+final class Api(db: Db, jwt: Jwt, bcryptPool: ExecutionContext):
 
   private val bcryptCost = 10
 
@@ -75,7 +72,7 @@ final class Api(db: Transactor[IO], tx: Transactor[IO], jwt: Jwt, bcryptPool: Ex
   private def created[A: Encoder](key: String, value: A): IO[Response[IO]] = Created(Json.obj(key -> value.asJson))
 
   private def uniqueViolation[A](io: IO[A]): IO[A] =
-    io.exceptSomeSqlState { case sqlstate.class23.UNIQUE_VIOLATION =>
+    io.recoverWith { case SqlState.UniqueViolation(_) =>
       IO.raiseError(ApiError.invalid("username or email has already been taken"))
     }
 
@@ -97,34 +94,41 @@ final class Api(db: Transactor[IO], tx: Transactor[IO], jwt: Jwt, bcryptPool: Ex
       .orElse(present("favorited").map(Filter.Favorited(_)))
       .getOrElse(Filter.All)
 
-  private def articleById(viewer: Long, id: Long): IO[Article] =
-    Sql.articleById(viewer, id).transact(db).flatMap(found("article")).map(_.toArticle)
+  private def articleById(session: Session[IO], viewer: Long, id: Long): IO[Article] =
+    session.option(Sql.articleById)((viewer, id)).flatMap(found("article")).map(_.toArticle)
+
+  private def articleId(session: Session[IO], slug: String): IO[Long] =
+    session.option(Sql.articleId)(slug).flatMap(found("article"))
 
   /** The article's id, if the caller wrote it: 404 if there is no such article, 403 if it is someone else's. */
-  private def owned(caller: Caller, slug: String): IO[Long] =
-    Sql.articleOwner(slug).transact(db).flatMap(found("article")).flatMap { (id, author) =>
+  private def owned(session: Session[IO], caller: Caller, slug: String): IO[Long] =
+    session.option(Sql.articleOwner)(slug).flatMap(found("article")).flatMap { (id, author) =>
       IO.raiseUnless(author == caller.id)(ApiError.forbidden).as(id)
     }
 
   private def setFavorite(request: Request[IO], slug: String, on: Boolean): IO[Response[IO]] =
     for
       caller <- required(request)
-      article <- (for
-        id <- Sql.articleId(slug).flatMap(_.liftTo[ConnectionIO](ApiError.notFound("article")))
-        _ <- if on then Sql.favorite(caller.id, id) else Sql.unfavorite(caller.id, id)
-        row <- Sql.articleById(caller.id, id)
-      yield row).transact(db).flatMap(found("article"))
-      response <- ok("article", article.toArticle)
+      article <- db.write.use { session =>
+        for
+          id <- articleId(session, slug)
+          _ <- session.execute(if on then Sql.favorite else Sql.unfavorite)((caller.id, id))
+          article <- articleById(session, caller.id, id)
+        yield article
+      }
+      response <- ok("article", article)
     yield response
 
   private def setFollow(request: Request[IO], username: String, on: Boolean): IO[Response[IO]] =
     for
       caller <- required(request)
-      profile <- (for
-        target <- Sql.userByUsername(username).flatMap(_.liftTo[ConnectionIO](ApiError.notFound("profile")))
-        (id, profile) = target
-        _ <- if on then Sql.follow(caller.id, id) else Sql.unfollow(caller.id, id)
-      yield profile.copy(following = on)).transact(db)
+      profile <- db.write.use { session =>
+        for
+          target <- session.option(Sql.userByUsername)(username).flatMap(found("profile"))
+          (id, profile) = target
+          _ <- session.execute(if on then Sql.follow else Sql.unfollow)((caller.id, id))
+        yield profile.copy(following = on)
+      }
       response <- ok("profile", profile)
     yield response
 
@@ -144,7 +148,7 @@ final class Api(db: Transactor[IO], tx: Transactor[IO], jwt: Jwt, bcryptPool: Ex
         )
         (username, email, password) = fields
         passwordHash <- hash(password)
-        row <- uniqueViolation(Sql.insertUser(username, email, passwordHash).transact(db))
+        row <- uniqueViolation(db.write.use(_.unique(Sql.insertUser)((username, email, passwordHash))))
         token <- sign(row.id)
         response <- created("user", row.toUser(token))
       yield response
@@ -154,7 +158,7 @@ final class Api(db: Transactor[IO], tx: Transactor[IO], jwt: Jwt, bcryptPool: Ex
         user <- Body.wrapped(request, "user")
         fields <- IO.fromEither((Body.required(user, "email"), Body.required(user, "password")).tupled)
         (email, password) = fields
-        row <- Sql.userByEmail(email).transact(db)
+        row <- db.read.use(_.option(Sql.userByEmail)(email))
         valid <- row.fold(IO.pure(false))((_, passwordHash) => verified(password, passwordHash))
         found <- IO.fromOption(row.filter(_ => valid))(ApiError(Status.Unauthorized, "email or password is invalid"))
         token <- sign(found._1.id)
@@ -164,7 +168,7 @@ final class Api(db: Transactor[IO], tx: Transactor[IO], jwt: Jwt, bcryptPool: Ex
     case request @ GET -> Root / "api" / "user" =>
       for
         caller <- required(request)
-        row <- Sql.userById(caller.id).transact(db).flatMap(IO.fromOption(_)(ApiError.unauthorized))
+        row <- db.read.use(_.option(Sql.userById)(caller.id)).flatMap(IO.fromOption(_)(ApiError.unauthorized))
         response <- ok("user", row.toUser(caller.token))
       yield response
 
@@ -183,8 +187,9 @@ final class Api(db: Transactor[IO], tx: Transactor[IO], jwt: Jwt, bcryptPool: Ex
         )
         (email, username, password, bio, image) = fields
         passwordHash <- password.traverse(hash)
-        row <- uniqueViolation(Sql.updateUser(caller.id, email, username, passwordHash, bio, image).transact(db))
-          .flatMap(IO.fromOption(_)(ApiError.unauthorized))
+        row <- uniqueViolation(
+          db.write.use(_.option(Sql.updateUser)((email, username, passwordHash, bio, image, caller.id)))
+        ).flatMap(IO.fromOption(_)(ApiError.unauthorized))
         response <- ok("user", row.toUser(caller.token))
       yield response
 
@@ -192,7 +197,7 @@ final class Api(db: Transactor[IO], tx: Transactor[IO], jwt: Jwt, bcryptPool: Ex
 
     case request @ GET -> Root / "api" / "profiles" / username =>
       viewer(request)
-        .flatMap(Sql.profile(_, username).transact(db))
+        .flatMap(viewer => db.read.use(_.option(Sql.profileByUsername)((viewer, username))))
         .flatMap(found("profile"))
         .flatMap(ok("profile", _))
 
@@ -207,7 +212,7 @@ final class Api(db: Transactor[IO], tx: Transactor[IO], jwt: Jwt, bcryptPool: Ex
         viewer <- viewer(request)
         page <- page(request)
         filter = this.filter(request)
-        list <- (Sql.articles(viewer, filter, page), Sql.countArticles(filter)).tupled.transact(db)
+        list <- db.read.use(Sql.articles(_, viewer, filter, page))
         response <- Ok(ArticleList(list._1.map(_.toArticle), list._2))
       yield response
 
@@ -215,13 +220,13 @@ final class Api(db: Transactor[IO], tx: Transactor[IO], jwt: Jwt, bcryptPool: Ex
       for
         caller <- required(request)
         page <- page(request)
-        list <- (Sql.feed(caller.id, page), Sql.countFeed(caller.id)).tupled.transact(db)
+        list <- db.read.use(Sql.feed(_, caller.id, page))
         response <- Ok(ArticleList(list._1.map(_.toArticle), list._2))
       yield response
 
     case request @ GET -> Root / "api" / "articles" / slug =>
       viewer(request)
-        .flatMap(Sql.articleBySlug(_, slug).transact(db))
+        .flatMap(viewer => db.read.use(_.option(Sql.articleBySlug)((viewer, slug))))
         .flatMap(found("article"))
         .flatMap(row => ok("article", row.toArticle))
 
@@ -238,11 +243,15 @@ final class Api(db: Transactor[IO], tx: Transactor[IO], jwt: Jwt, bcryptPool: Ex
           ).tupled
         )
         (title, description, body, tags) = fields
-        id <- Sql
-          .insertArticle(caller.id, title, description, body)
-          .flatTap(id => Sql.insertTags(id, tags).whenA(tags.nonEmpty))
-          .transact(tx)
-        article <- articleById(caller.id, id)
+        article <- db.write.use { session =>
+          session.transaction
+            .surround(
+              session
+                .unique(Sql.insertArticle)((caller.id, title, description, body))
+                .flatTap(id => Sql.insertTags(session, id, tags).whenA(tags.nonEmpty))
+            )
+            .flatMap(articleById(session, caller.id, _))
+        }
         response <- created("article", article)
       yield response
 
@@ -258,17 +267,20 @@ final class Api(db: Transactor[IO], tx: Transactor[IO], jwt: Jwt, bcryptPool: Ex
           ).tupled
         )
         (title, description, body) = fields
-        id <- owned(caller, slug)
-        _ <- Sql.updateArticle(id, title, description, body).transact(db)
-        updated <- articleById(caller.id, id)
+        updated <- db.write.use { session =>
+          for
+            id <- owned(session, caller, slug)
+            _ <- session.execute(Sql.updateArticle)((title, description, body, id))
+            updated <- articleById(session, caller.id, id)
+          yield updated
+        }
         response <- ok("article", updated)
       yield response
 
     case request @ DELETE -> Root / "api" / "articles" / slug =>
       for
         caller <- required(request)
-        id <- owned(caller, slug)
-        _ <- Sql.deleteArticle(id).transact(db)
+        _ <- db.write.use(session => owned(session, caller, slug).flatMap(session.execute(Sql.deleteArticle)))
       yield Response(Status.NoContent)
 
     // Favorites
@@ -282,10 +294,9 @@ final class Api(db: Transactor[IO], tx: Transactor[IO], jwt: Jwt, bcryptPool: Ex
     case request @ GET -> Root / "api" / "articles" / slug / "comments" =>
       for
         viewer <- viewer(request)
-        comments <- (for
-          id <- Sql.articleId(slug).flatMap(_.liftTo[ConnectionIO](ApiError.notFound("article")))
-          rows <- Sql.comments(viewer, id)
-        yield rows).transact(db)
+        comments <- db.read.use(session =>
+          articleId(session, slug).flatMap(id => session.execute(Sql.comments)((viewer, id)))
+        )
         response <- ok("comments", comments.map(_.toComment))
       yield response
 
@@ -294,10 +305,9 @@ final class Api(db: Transactor[IO], tx: Transactor[IO], jwt: Jwt, bcryptPool: Ex
         caller <- required(request)
         comment <- Body.wrapped(request, "comment")
         body <- IO.fromEither(Body.required(comment, "body"))
-        row <- (for
-          id <- Sql.articleId(slug).flatMap(_.liftTo[ConnectionIO](ApiError.notFound("article")))
-          row <- Sql.insertComment(id, caller.id, body)
-        yield row).transact(db)
+        row <- db.write.use(session =>
+          articleId(session, slug).flatMap(id => session.unique(Sql.insertComment)((id, caller.id, body)))
+        )
         response <- created("comment", row.toComment)
       yield response
 
@@ -305,16 +315,18 @@ final class Api(db: Transactor[IO], tx: Transactor[IO], jwt: Jwt, bcryptPool: Ex
       for
         caller <- required(request)
         id <- IO.fromOption(Body.unsigned(commentId))(ApiError.notFound("comment"))
-        _ <- (for
-          author <- Sql.commentAuthor(id, slug).flatMap(_.liftTo[ConnectionIO](ApiError.notFound("comment")))
-          _ <- ApiError.forbidden.raiseError[ConnectionIO, Unit].whenA(author != caller.id)
-          _ <- Sql.deleteComment(id)
-        yield ()).transact(db)
+        _ <- db.write.use { session =>
+          for
+            author <- session.option(Sql.commentAuthor)((id, slug)).flatMap(found("comment"))
+            _ <- IO.raiseWhen(author != caller.id)(ApiError.forbidden)
+            _ <- session.execute(Sql.deleteComment)(id)
+          yield ()
+        }
       yield Response(Status.NoContent)
 
     // Tags
 
-    case GET -> Root / "api" / "tags" => Sql.tags.transact(db).flatMap(ok("tags", _))
+    case GET -> Root / "api" / "tags" => db.read.use(_.execute(Sql.tags)).flatMap(ok("tags", _))
   }
 
   /** Every request gets an answer: unknown paths (and known paths with another method) are 404, errors use the SPEC's

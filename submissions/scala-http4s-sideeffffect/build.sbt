@@ -1,7 +1,6 @@
 ThisBuild / scalaVersion := "3.10.0"
 
 val http4sVersion = "0.23.38"
-val doobieVersion = "1.0.0-RC12"
 val circeVersion = "0.14.17"
 
 lazy val writeClasspath = taskKey[Unit]("Writes the runtime classpath to target/classpath.txt for start.sh")
@@ -19,16 +18,15 @@ lazy val root = (project in file("."))
       "org.http4s" %% "http4s-circe" % http4sVersion,
       "io.circe" %% "circe-core" % circeVersion,
       "io.circe" %% "circe-jawn" % circeVersion,
-      "org.tpolecat" %% "doobie-core" % doobieVersion,
-      "org.tpolecat" %% "doobie-hikari" % doobieVersion,
-      "org.tpolecat" %% "doobie-postgres" % doobieVersion,
-      "org.postgresql" % "postgresql" % "42.7.14",
-      "com.zaxxer" % "HikariCP" % "7.1.0",
-      "at.favre.lib" % "bcrypt" % "0.10.2",
-      "org.slf4j" % "slf4j-nop" % "2.0.20"
+      "org.tpolecat" %% "skunk-core" % "2.0.0-RC3",
+      "org.typelevel" %% "otel4s-core" % "1.1.0",
+      "at.favre.lib" % "bcrypt" % "0.10.2"
     ),
     writeClasspath := {
-      val cp = (Runtime / fullClasspath).value.files.map(_.getAbsolutePath).mkString(java.io.File.pathSeparator)
-      IO.write(target.value / "classpath.txt", cp)
+      val converter = fileConverter.value
+      val cp = (Runtime / fullClasspath).value
+        .map(entry => converter.toPath(entry.data).toAbsolutePath.toString)
+        .mkString(java.io.File.pathSeparator)
+      IO.write(baseDirectory.value / "target" / "classpath.txt", cp)
     }
   )
