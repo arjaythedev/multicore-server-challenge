@@ -74,7 +74,7 @@ pub type Config {
 @external(erlang, "conduit_ffi", "connect")
 fn connect(host: String, port: Int, timeout: Int) -> Result(Socket, String)
 
-@external(erlang, "conduit_ffi", "recv_passive")
+@external(erlang, "conduit_ffi", "recv_timeout")
 fn recv(sock: Socket, timeout: Int) -> Result(BitArray, Nil)
 
 @external(erlang, "conduit_ffi", "send")

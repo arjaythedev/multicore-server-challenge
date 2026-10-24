@@ -3,7 +3,7 @@
 -module(conduit_ffi).
 -export([getenv/1, now_seconds/0, monotonic_ms/0, hmac_sha256/2, sha256/1, md5_hex/1, hash_equals/2, pbkdf2_sha256/3, random_bytes/1,
          xor_bytes/2, has_nul/1, is_utf8/1, base64url_encode/1, base64url_decode/1,
-         listen/2, accept/1, connect/3, recv/1, recv_passive/2, send/2, send_nosuspend/2, close/1, parse_request/1,
+         listen/2, accept/1, connect/3, recv/1, recv_timeout/2, send/2, send_nosuspend/2, close/1, parse_request/1,
          hibernate_http/3, heap_words/0, mailbox_len/0, safe/1, log/1,
          pool_init/2, pick_read/0, pick_write/0, sleep/1, stat_add/2, stats/0,
          split_segments/1, split_target/1, bcrypt_init/1, bcrypt_collector/0]).
@@ -80,10 +80,11 @@ accept(L) ->
         {error, R} -> {error, atom_to_binary(R)}
     end.
 
-%% Postgres side: passive socket, large buffers.
+%% Postgres side: active socket (the backend only ever sends in reply to this process, so no flow control is
+%% needed, and a message per read beats a port_control round trip per read), large buffers.
 connect(Host, Port, Timeout) ->
     H = binary_to_list(Host),
-    case gen_tcp:connect(H, Port, [binary, {packet, raw}, {active, false}, {nodelay, true},
+    case gen_tcp:connect(H, Port, [binary, {packet, raw}, {active, true}, {nodelay, true},
                                    {buffer, 1048576}, {recbuf, 1048576}, {sndbuf, 262144}], Timeout) of
         {ok, S} -> {ok, S};
         {error, R} -> {error, atom_to_binary(R)}
@@ -97,10 +98,13 @@ recv(Sock) ->
         {tcp_error, Sock, _} -> {error, nil}
     end.
 
-recv_passive(Sock, Timeout) ->
-    case gen_tcp:recv(Sock, 0, Timeout) of
-        {ok, Data} -> {ok, Data};
-        {error, _} -> {error, nil}
+%% Active-mode receive with a timeout, for the Postgres socket. Requests queued in the same mailbox are left alone.
+recv_timeout(Sock, Timeout) ->
+    receive
+        {tcp, Sock, Data} -> {ok, Data};
+        {tcp_closed, Sock} -> {error, nil};
+        {tcp_error, Sock, _} -> {error, nil}
+    after Timeout -> {error, nil}
     end.
 
 %% prim_inet:send is what gen_tcp:send comes down to for inet-driver sockets, minus a lookup per call.
