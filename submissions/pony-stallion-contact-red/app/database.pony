@@ -321,6 +321,7 @@ actor _Worker is (AsioEventNotify & _PGOwner)
   var _csv_timer: (Timer tag | None) = None
   var _sampling: Bool = false
   let _password_observer: (_PasswordApplicationObserver | None)
+  var _test_previous: (_PGConnection ref | None) = None
 
   new create(auth: TCPConnectAuth, config: _Config, timers: Timers,
     err: OutStream, allocation: _SessionAllocation,
@@ -795,6 +796,9 @@ actor _Worker is (AsioEventNotify & _PGOwner)
     end
 
   be _test_state(request: U64, receiver: _PoolStateReceiver) =>
+    receiver.state(_test_snapshot(request))
+
+  fun _test_snapshot(request: U64): _PoolTestState =>
     let queued: Array[U64] iso = recover iso Array[U64] end
     let write_queued: Array[U64] iso = recover iso Array[U64] end
     let roles: Array[U64] iso = recover iso Array[U64] end
@@ -825,7 +829,7 @@ actor _Worker is (AsioEventNotify & _PGOwner)
       phases.push(slot.phase.code())
       generations.push(slot.generation)
       match slot.phase
-      | let backoff: _BackoffSlot => tokens.push(backoff.token)
+      | let backoff: _BackoffSlot box => tokens.push(backoff.token)
       else tokens.push(None)
       end
       match slot.phase.job()
@@ -853,16 +857,43 @@ actor _Worker is (AsioEventNotify & _PGOwner)
     for recipient in recipients.values() do
       outstanding = outstanding + recipient.outstanding
     end
-    receiver.state(_PoolTestState(request, consume queued, consume active,
+    _PoolTestState(request, consume queued, consume active,
       consume idle, consume phases, consume generations, consume tokens,
       _recipients.size(), outstanding, _worker_id, consume write_queued,
-      consume roles, consume read_idle, consume write_idle))
+      consume roles, consume read_idle, consume write_idle)
 
   be _test_fence(request: U64, clients: Array[_PoolClient] val) =>
     for client in clients.values() do client.fence(request) end
 
   be _test_retire(index: USize) =>
     try retire(_slots(index)?) else _Unreachable() end
+
+  be _test_save_connection(index: USize) =>
+    try
+      match _slots(index)?.phase
+      | let live: _ConnectingSlot => _test_previous = live.conn
+      | let live: _PreparingSlot => _test_previous = live.conn
+      | let live: _IdleSlot => _test_previous = live.conn
+      | let live: _BusySlot => _test_previous = live.conn
+      else _Unreachable() end
+    else _Unreachable() end
+
+  be _test_stale_callbacks(index: USize, same_generation: Bool,
+    request: U64, receiver: _PoolProbe, clients: Array[_PoolClient] val)
+  =>
+    try
+      let conn = if same_generation then
+        _PGConnection(this, _events, index, _slots(index)?.generation)
+      else _test_previous as _PGConnection ref end
+      pg_ready(conn)
+      pg_prepared(conn)
+      pg_result(conn, pg.SimpleResult(pg.PreparedQuery("SELECT 1", _P.none())))
+      pg_failed(conn, pg.DataError)
+      pg_complete(conn, pg.TransactionIdle)
+      pg_shutdown(conn)
+      receiver.state(_test_snapshot(request))
+      for client in clients.values() do client.fence(request) end
+    else _Unreachable() end
 
   be _test_query(client: _QueryClient, id: U64, query': pg.Query,
     statement_class: _StatementClass)
@@ -885,4 +916,80 @@ actor _Worker is (AsioEventNotify & _PGOwner)
         pg.PreparedQuery("bad\0query", _P.none()), 29, _now(), _ReadClass)
     end
     this._test_state(request, receiver)
+    _dispatch()
+
+  fun ref _test_enqueue_bad(reads: USize, writes: USize, first: U64,
+    client: _QueryClient)
+  =>
+    var remaining_reads = reads
+    var remaining_writes = writes
+    for index in Range[USize](0, reads + writes) do
+      let read = (remaining_reads > 0) and
+        (((index % 2) == 0) or (remaining_writes == 0))
+      let statement_class: _StatementClass = if read then
+        remaining_reads = remaining_reads - 1
+        _ReadClass
+      else
+        remaining_writes = remaining_writes - 1
+        _WriteClass
+      end
+      _enqueue(client, first + index.u64(),
+        pg.PreparedQuery("bad\0query", _P.none()), 29, _now(), statement_class)
+    end
+
+  be _test_split_batch(reads: USize, writes: USize, first: U64,
+    request: U64, receiver: _PoolProbe, clients: Array[_PoolClient] val,
+    close_before: Bool = false)
+  =>
+    if _stopped then _Unreachable(); return end
+    try _test_enqueue_bad(reads, writes, first, clients(0)?)
+    else _Unreachable() end
+    if close_before then this.close() end
+    this._test_checkpoint(request, receiver, clients)
+    _dispatch()
+
+  be _test_checkpoint(request: U64, receiver: _PoolProbe,
+    clients: Array[_PoolClient] val, next: U64 = 0)
+  =>
+    receiver.state(_test_snapshot(request))
+    for client in clients.values() do client.fence(request) end
+    if next != 0 then this._test_checkpoint(next, receiver, clients) end
+
+  be _test_coalescing(request: U64, receiver: _PoolProbe,
+    clients: Array[_PoolClient] val)
+  =>
+    try _test_enqueue_bad(128, 128, 100_000, clients(0)?)
+    else _Unreachable() end
+    this._test_checkpoint(request, receiver, clients)
+    this._test_coalescing_second(request + 1, receiver, clients)
+    _dispatch()
+
+  be _test_coalescing_second(request: U64, receiver: _PoolProbe,
+    clients: Array[_PoolClient] val)
+  =>
+    try _test_enqueue_bad(128, 128, 100_256, clients(0)?)
+    else _Unreachable() end
+    this._test_checkpoint(request, receiver, clients, request + 1)
+    _dispatch()
+
+  be _test_incompatible(statement_class: _StatementClass, request: U64,
+    receiver: _PoolProbe, clients: Array[_PoolClient] val)
+  =>
+    try
+      if statement_class is _ReadClass then
+        _test_enqueue_bad(64, 0, 100_000, clients(0)?)
+      else _test_enqueue_bad(0, 64, 100_000, clients(0)?) end
+    else _Unreachable() end
+    this._test_incompatible_second(statement_class, request, receiver, clients)
+    _dispatch()
+
+  be _test_incompatible_second(statement_class: _StatementClass,
+    request: U64, receiver: _PoolProbe, clients: Array[_PoolClient] val)
+  =>
+    try
+      if statement_class is _ReadClass then
+        _test_enqueue_bad(256, 0, 100_064, clients(0)?)
+      else _test_enqueue_bad(0, 256, 100_064, clients(0)?) end
+    else _Unreachable() end
+    this._test_checkpoint(request, receiver, clients)
     _dispatch()

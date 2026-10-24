@@ -13,7 +13,7 @@ import time
 import unittest
 import uuid
 
-from integration import Integration, PoolRun, SQLSession
+from integration import Integration, PoolRun, SQLSession, ProtocolProxy
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -343,6 +343,62 @@ class PasswordActors(unittest.TestCase):
 
 
 class PasswordOptions(unittest.TestCase):
+    def test_split_production_worker_roles(self):
+        database = "pony_split_startup_" + uuid.uuid4().hex
+        Integration.sql(f"CREATE DATABASE {database} TEMPLATE conduit_dev")
+        try:
+            for writes in (None, 0, 32):
+                with self.subTest(writes=writes):
+                    env = self.environment(workers="3")
+                    host = os.environ.get("PGHOST", "127.0.0.1")
+                    proxy = ProtocolProxy(host, os.environ.get("PGPORT", "5432"),
+                                          complete_capture=True)
+                    try:
+                        with socket.socket() as listener:
+                            listener.bind(("127.0.0.1", 0))
+                            env["PORT"] = str(listener.getsockname()[1])
+                        env["DATABASE_URL"] = ("postgres://conduit:conduit@127.0.0.1:"
+                            f"{proxy.server_address[1]}/{database}")
+                        args = ["--test-password-startup", "--db-worker-count=8"]
+                        if writes is not None:
+                            args.append(f"--db-write-sessions={writes}")
+                        with probe(self, 3, env, args, threads=8) as run:
+                            self.assertEqual(event(run, "startup")["workers"], 3)
+                            totals = []
+                            for worker in range(8):
+                                end = time.monotonic() + 20
+                                request = 100 + worker
+                                while True:
+                                    run.send(f"database-state {worker} {request}")
+                                    state = run.receive(lambda value:
+                                        value.get("event") == "state" and
+                                        value["request"] == request, deadline=end)
+                                    if all(code == 2 for code in state["phases"]):
+                                        break
+                                reads = 8 if worker < 7 else 7
+                                expected = ([1] * reads + [2] * 4 if writes
+                                            else [0] * (reads + 4))
+                                self.assertEqual(state["worker"], worker)
+                                self.assertEqual(state["roles"], expected)
+                                self.assertEqual(sorted(state["idle"]),
+                                                 list(range(reads + 4)))
+                                self.assertEqual(state["active"], [])
+                                self.assertEqual(state["outstanding"], 0)
+                                totals.extend(state["roles"])
+                            self.assertEqual(len(totals), 95)
+                            self.assertEqual(totals.count(1), 63 if writes else 0)
+                            self.assertEqual(totals.count(2), 32 if writes else 0)
+                            self.assertEqual(totals.count(0), 0 if writes else 95)
+                            self.assertEqual(Integration.sql("SELECT count(*) FROM "
+                                "pg_stat_activity WHERE datname='" + database
+                                + "' AND usename='conduit'"), "95")
+                            proxy.assert_healthy()
+                    finally:
+                        proxy.stop()
+                        proxy.assert_healthy()
+        finally:
+            Integration.sql(f"DROP DATABASE {database} WITH (FORCE)")
+
     def environment(self, mode="batch", workers="1"):
         env = os.environ.copy()
         env.update(DATABASE_URL="postgres://test:test@127.0.0.1:1/test",
@@ -506,6 +562,28 @@ class PasswordHTTP(unittest.TestCase):
         return dict(DATABASE_URL=f"postgres://conduit:conduit@{host}:"
                     f"{os.environ.get('PGPORT', '5432')}/{self.database}",
                     JWT_SECRET=self.secret, HOST="127.0.0.1", PORT=str(port))
+
+    def test_split_fixed_session_mode(self):
+        for size in ("1", "2", "invalid"):
+            with self.subTest(size=size):
+                env = self.environment()
+                env["CONDUIT_TEST_POOL_SIZE"] = size
+                with probe(self, 1, env, ["--test-password-http",
+                        "--db-write-sessions=0", "--db-worker-count=8"]) as run:
+                    with self.connection(env) as (connection, stream):
+                        connection.sendall(self.wire("GET", "/api/tags"))
+                        self.assertEqual(self.response(stream)[0], 200)
+                    run.send("database-state 0 700")
+                    state = event(run, "state", request=700)
+                    self.assertEqual(state["roles"], [0])
+                    self.assertEqual(len(state["phases"]), 1)
+                result = subprocess.run([str(EXE), "--test-password-http",
+                    "--db-write-sessions=1", "--ponymaxthreads=1"],
+                    env=dict(os.environ, **env, BCRYPT_WORKERS="1"),
+                    capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("1 sessions across 1 workers permit 0", result.stderr)
+                self.assertEqual(result.stdout, "")
 
     @contextmanager
     def connection(self, env):
