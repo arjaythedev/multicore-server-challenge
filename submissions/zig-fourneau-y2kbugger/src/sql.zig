@@ -28,30 +28,6 @@ fn following_of(comptime viewer: []const u8) []const u8 {
         " AND fo.followee_id = a.author_id)";
 }
 
-const following = following_of("$1");
-
-/// A page of articles, the rows `page` names (`id`, newest first, at most
-/// 100: the limit's ceiling, a constant so the generic plan expects a
-/// page, not a tenth of the table); the per-article work done for the page's
-/// rows only, not for those `OFFSET` skips.
-/// Columns: slug, title, description, created_at, updated_at, tag_list,
-/// favorites_count, favorited, username, bio, image, following.
-fn list_select_of(
-    comptime viewer: []const u8,
-    comptime limit: []const u8,
-    comptime page: []const u8,
-    comptime follow: []const u8,
-) []const u8 {
-    return "SELECT a.slug, a.title, a.description, a.created_at, a.updated_at, " ++ tag_list ++
-        ", " ++ article_flags(viewer) ++ ", " ++ follow ++
-        " FROM (" ++ page ++ ") p JOIN articles a ON a.id = p.id JOIN users u ON u.id = a.author_id" ++
-        " ORDER BY p.id DESC LIMIT " ++ limit;
-}
-
-fn list_select(comptime page: []const u8, comptime follow: []const u8) []const u8 {
-    return list_select_of("$1", "$2", page, follow);
-}
-
 /// Columns: slug, title, description, body, created_at, updated_at,
 /// tag_list, favorites_count, favorited, username, bio, image, following.
 fn article_full_select_of(comptime viewer: []const u8) []const u8 {
@@ -71,19 +47,17 @@ const article_full_select = article_full_select_of("$1");
 const batch_keys = "FROM unnest($1::int4[], $2::int8[], $3::text[]) AS r(i, v, k)";
 const batch_pages = "FROM unnest($1::int4[], $2::int8[], $3::int8[], $4::int8[], $5::text[]) AS r(i, v, l, o, k)";
 
-fn batch_page(comptime page: []const u8, comptime follow: []const u8) []const u8 {
-    return "SELECT r.i, x.* " ++ batch_pages ++ " CROSS JOIN LATERAL (" ++
-        list_select_of("r.v", "r.l", page, follow) ++ ") x";
-}
-
 /// A page every request of the batch shares with the others asking for
 /// the same one (`k`, `l`, `o`): its articles, their tags, favorite counts
 /// and authors read once in the statement, the viewer's flags per request.
-/// `page` names `q.k` and `q.o`. The rows come out by request, newest first.
-/// Each request's `favorited` and `following` take one probe of each index
-/// for its whole page (`fl`), not one an article: half the statement's
-/// buffer reads, 17% of its time (a global batch of 10); p95 -10% at 50k
-/// users on 4 CPUs.
+/// `page` names `q.k` and `q.o` and picks the page's ids on the bare index,
+/// at most 100 (the limit's ceiling, a constant so the generic plan expects
+/// a page, not a tenth of the table): the per-article work is done for the
+/// page's rows only, not for those `OFFSET` skips. The rows come out by
+/// request, newest first. Each request's `favorited` and `following` take
+/// one probe of each index for its whole page (`fl`), not one an article:
+/// half the statement's buffer reads, 17% of its time (a global batch of
+/// 10); p95 -10% at 50k users on 4 CPUs.
 fn shared_page(comptime page: []const u8) []const u8 {
     return "WITH r AS (SELECT * " ++ batch_pages ++ "), " ++
         "q AS (SELECT DISTINCT r.k, r.l, r.o FROM r), " ++
@@ -125,25 +99,11 @@ const slugify = "trim(both '-' from lower(regexp_replace($2, '[^A-Za-z0-9]+', '-
 const current_article = "currval(pg_get_serial_sequence('articles', 'id'))";
 
 pub const S = enum(u16) {
-    tags,
-    user_by_id,
-    user_by_email,
     user_insert,
     user_update,
-    profile,
     follow_insert,
     follow_delete,
     profile_by_username,
-    list_all,
-    count_all,
-    list_tag,
-    count_tag,
-    list_author,
-    count_author,
-    list_favorited,
-    count_favorited,
-    list_feed,
-    count_feed,
     article_by_slug,
     article_by_id,
     article_insert,
@@ -155,8 +115,6 @@ pub const S = enum(u16) {
     article_delete,
     favorite_insert,
     favorite_delete,
-    article_exists,
-    comments_by_slug,
     comment_insert,
     comment_owner,
     comment_delete,
@@ -178,19 +136,7 @@ pub const S = enum(u16) {
     batch_count_feed,
 };
 
-const viewer_page = &[_]Oid{ .int8, .int8, .int8 };
-const viewer_page_filter = &[_]Oid{ .int8, .int8, .int8, .text };
-
 pub const statements = std.enums.EnumArray(S, pg.Statement).init(.{
-    .tags = .{ .sql = "SELECT name FROM tags ORDER BY name", .params = &.{} },
-    .user_by_id = .{
-        .sql = "SELECT username, email, bio, image FROM users WHERE id = $1",
-        .params = &.{.int8},
-    },
-    .user_by_email = .{
-        .sql = "SELECT id, username, email, bio, image, password_hash FROM users WHERE email = $1",
-        .params = &.{.text},
-    },
     .user_insert = .{
         .sql = "INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3) " ++
             "RETURNING id, username, email, bio, image",
@@ -201,12 +147,6 @@ pub const statements = std.enums.EnumArray(S, pg.Statement).init(.{
             "password_hash = COALESCE($4, password_hash), bio = COALESCE($5, bio), " ++
             "image = COALESCE($6, image) WHERE id = $1 RETURNING username, email, bio, image",
         .params = &.{ .int8, .text, .text, .text, .text, .text },
-    },
-    .profile = .{
-        .sql = "SELECT u.username, u.bio, u.image, " ++
-            "EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = u.id) " ++
-            "FROM users u WHERE u.username = $2",
-        .params = &.{ .int8, .text },
     },
     .follow_insert = .{
         .sql = "INSERT INTO follows (follower_id, followee_id) " ++
@@ -221,61 +161,6 @@ pub const statements = std.enums.EnumArray(S, pg.Statement).init(.{
     .profile_by_username = .{
         .sql = "SELECT username, bio, image FROM users WHERE username = $1",
         .params = &.{.text},
-    },
-    .list_all = .{
-        .sql = list_select("SELECT a.id FROM articles a ORDER BY a.id DESC OFFSET $3 LIMIT 100", following),
-        .params = viewer_page,
-    },
-    .count_all = .{
-        .sql = "SELECT count(*) FROM (SELECT 1 FROM articles a LIMIT 1000) s",
-        .params = &.{},
-    },
-    .list_tag = .{
-        .sql = list_select("SELECT at.article_id AS id FROM article_tags at " ++
-            "WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = $4) " ++
-            "ORDER BY at.article_id DESC OFFSET $3 LIMIT 100", following),
-        .params = viewer_page_filter,
-    },
-    .count_tag = .{
-        .sql = "SELECT count(*) FROM (SELECT 1 FROM article_tags at " ++
-            "WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = $1) LIMIT 1000) s",
-        .params = &.{.text},
-    },
-    .list_author = .{
-        .sql = list_select("SELECT a.id FROM articles a " ++
-            "WHERE a.author_id = (SELECT au.id FROM users au WHERE au.username = $4) " ++
-            "ORDER BY a.id DESC OFFSET $3 LIMIT 100", following),
-        .params = viewer_page_filter,
-    },
-    .count_author = .{
-        .sql = "SELECT count(*) FROM (SELECT 1 FROM articles a " ++
-            "WHERE a.author_id = (SELECT u.id FROM users u WHERE u.username = $1) LIMIT 1000) s",
-        .params = &.{.text},
-    },
-    .list_favorited = .{
-        .sql = list_select("SELECT f.article_id AS id FROM favorites f " ++
-            "WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = $4) " ++
-            "ORDER BY f.article_id DESC OFFSET $3 LIMIT 100", following),
-        .params = viewer_page_filter,
-    },
-    .count_favorited = .{
-        .sql = "SELECT count(*) FROM (SELECT 1 FROM favorites f " ++
-            "WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = $1) LIMIT 1000) s",
-        .params = &.{.text},
-    },
-    // Every author of the feed is one the viewer follows, in the same
-    // snapshot: `following` is true.
-    .list_feed = .{
-        .sql = list_select("SELECT x.id FROM follows fo CROSS JOIN LATERAL " ++
-            "(SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id " ++
-            "ORDER BY a2.id DESC LIMIT ($2::int + $3::int)) x " ++
-            "WHERE fo.follower_id = $1 ORDER BY x.id DESC OFFSET $3 LIMIT 100", "true"),
-        .params = viewer_page,
-    },
-    .count_feed = .{
-        .sql = "SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id IN " ++
-            "(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $1) LIMIT 1000) s",
-        .params = &.{.int8},
     },
     .article_by_slug = .{ .sql = article_full_select ++ " WHERE a.slug = $2", .params = &.{ .int8, .text } },
     .article_by_id = .{ .sql = article_full_select ++ " WHERE a.id = $2", .params = &.{ .int8, .int8 } },
@@ -323,15 +208,6 @@ pub const statements = std.enums.EnumArray(S, pg.Statement).init(.{
     .favorite_delete = .{
         .sql = "DELETE FROM favorites WHERE user_id = $1 " ++
             "AND article_id = (SELECT a.id FROM articles a WHERE a.slug = $2)",
-        .params = &.{ .int8, .text },
-    },
-    .article_exists = .{ .sql = "SELECT 1 FROM articles WHERE slug = $1", .params = &.{.text} },
-    .comments_by_slug = .{
-        .sql = "SELECT c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image, " ++
-            "EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = c.author_id) " ++
-            "FROM comments c JOIN users u ON u.id = c.author_id " ++
-            "WHERE c.article_id = (SELECT a.id FROM articles a WHERE a.slug = $2) " ++
-            "ORDER BY c.created_at DESC, c.id DESC LIMIT 100",
         .params = &.{ .int8, .text },
     },
     .comment_insert = .{
