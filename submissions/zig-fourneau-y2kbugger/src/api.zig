@@ -305,9 +305,42 @@ fn write_timestamp(out: *Out, microseconds: i64) void {
     out.bytes("\"");
 }
 
+/// A feed batch's tags (its first row, sql.zig's `batch_list_feed`): their
+/// ids and names, both in Postgres's order of the names. A feed's article
+/// has its tags' ids; their names come out in that order, not sorted here
+/// by a guess at the database's collation.
+const TagOrder = struct {
+    /// Null when there are no tags at all.
+    ids: ?[]const u8,
+    names: ?[]const u8,
+
+    /// The row's columns where an article's are: the ids at 5, the names
+    /// last (12).
+    fn of(row: pg.Row) TagOrder {
+        return .{ .ids = row.columns[5], .names = row.columns[12] };
+    }
+
+    /// The names of the article's tags (`ids`, an int4[]), in order.
+    fn write(order: TagOrder, out: *Out, article_ids: pg.Int4Array) void {
+        if (article_ids.count == 0) return;
+        var ids = pg.Int4Array.parse(order.ids.?);
+        var names = pg.TextArray.parse(order.names.?);
+        var written: u32 = 0;
+        while (ids.next()) |id| {
+            const name = names.next().?;
+            if (!article_ids.contains(id)) continue;
+            if (written > 0) out.bytes(",");
+            out.string(name);
+            written += 1;
+            if (written == article_ids.count) return;
+        }
+    }
+};
+
 /// An article from a row of the list's columns, or the full one's (with
-/// the body at 3).
-fn write_article(out: *Out, row: pg.Row, full: bool) void {
+/// the body at 3); its tags as names, or as ids (a feed's, named by
+/// `order`).
+fn write_article(out: *Out, row: pg.Row, full: bool, order: ?TagOrder) void {
     const shift: usize = @intFromBool(full);
     out.bytes("{\"slug\":");
     out.string(row.text(0));
@@ -320,11 +353,15 @@ fn write_article(out: *Out, row: pg.Row, full: bool) void {
         out.string(row.text(3));
     }
     out.bytes(",\"tagList\":[");
-    var tags_array = row.text_array(5 + shift);
-    var index: usize = 0;
-    while (tags_array.next()) |tag| : (index += 1) {
-        if (index > 0) out.bytes(",");
-        out.string(tag);
+    if (order) |tag_order| {
+        tag_order.write(out, row.int4_array(5 + shift));
+    } else {
+        var tags_array = row.text_array(5 + shift);
+        var index: usize = 0;
+        while (tags_array.next()) |tag| : (index += 1) {
+            if (index > 0) out.bytes(",");
+            out.string(tag);
+        }
     }
     out.bytes("],\"createdAt\":");
     write_timestamp(out, row.timestamp(3 + shift));
@@ -616,10 +653,14 @@ fn write_list(context: *Context, page: Page, kind: batch.Kind, key: []const u8) 
     var out = read.slot.out();
     out.bytes("{\"articles\":[");
     var rows = results.rows(0);
+    const order: ?TagOrder = if (kind == .feed)
+        .of(rows.next() orelse return read.slot.finish(internal))
+    else
+        null;
     var index: usize = 0;
     while (rows.next()) |row| : (index += 1) {
         if (index > 0) out.bytes(",");
-        write_article(&out, row, false);
+        write_article(&out, row, false, order);
     }
     out.bytes("],\"articlesCount\":");
     const counted = results.rows(1).first() orelse return read.slot.finish(internal);
@@ -632,7 +673,7 @@ fn respond_article(slot: Slot, results: pg.Results, statement: u8, status: u16) 
     const row = results.rows(statement).first() orelse return slot.finish(failure(404, "article not found"));
     var out = slot.out();
     out.bytes("{\"article\":");
-    write_article(&out, row, true);
+    write_article(&out, row, true, null);
     out.bytes("}");
     return slot.respond(status, &out);
 }

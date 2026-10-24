@@ -194,6 +194,41 @@ pub const Row = struct {
     pub fn text_array(row: Row, index: usize) TextArray {
         return TextArray.parse(row.columns[index].?);
     }
+
+    /// A one-dimensional int4[] in binary: its elements, none null.
+    pub fn int4_array(row: Row, index: usize) Int4Array {
+        return Int4Array.parse(row.columns[index].?);
+    }
+};
+
+pub const Int4Array = struct {
+    bytes: []const u8,
+    count: u32,
+    at: usize,
+
+    pub fn parse(bytes: []const u8) Int4Array {
+        const dimensions = std.mem.readInt(i32, bytes[0..4], .big);
+        if (dimensions == 0) return .{ .bytes = bytes, .count = 0, .at = bytes.len };
+        assert(dimensions == 1);
+        const count = std.mem.readInt(i32, bytes[12..16], .big);
+        assert(bytes.len == 20 + 8 * @as(usize, @intCast(count)));
+        return .{ .bytes = bytes, .count = @intCast(count), .at = 20 };
+    }
+
+    pub fn next(array: *Int4Array) ?i32 {
+        if (array.at == array.bytes.len) return null;
+        const length = std.mem.readInt(i32, array.bytes[array.at..][0..4], .big);
+        assert(length == 4); // tag ids are never null
+        const value = std.mem.readInt(i32, array.bytes[array.at + 4 ..][0..4], .big);
+        array.at += 8;
+        return value;
+    }
+
+    pub fn contains(array: Int4Array, value: i32) bool {
+        var copy = array;
+        while (copy.next()) |element| if (element == value) return true;
+        return false;
+    }
 };
 
 pub const TextArray = struct {
@@ -201,7 +236,7 @@ pub const TextArray = struct {
     count: u32,
     at: usize,
 
-    fn parse(bytes: []const u8) TextArray {
+    pub fn parse(bytes: []const u8) TextArray {
         const dimensions = std.mem.readInt(i32, bytes[0..4], .big);
         if (dimensions == 0) return .{ .bytes = bytes, .count = 0, .at = bytes.len };
         assert(dimensions == 1);
@@ -405,10 +440,15 @@ pub const Connection = struct {
                 const length = std.mem.readInt(i32, body[2..6], .big);
                 if (count == 0 or length != 4) return error.Protocol;
                 const tag = std.mem.readInt(i32, body[6..10], .big);
-                if (tag < 0 or tag >= batch.count) return error.Protocol;
+                if (tag < -1 or tag >= batch.count) return error.Protocol;
                 var header: [2]u8 = undefined;
                 std.mem.writeInt(u16, &header, count - 1, .big);
-                keep_row(waiters[@intCast(tag)], &header, body[10..]);
+                // -1: the statement's own row, every request's (the feed's tags).
+                if (tag == -1) {
+                    for (waiters) |waiter| keep_row(waiter, &header, body[10..]);
+                } else {
+                    keep_row(waiters[@intCast(tag)], &header, body[10..]);
+                }
             } else {
                 if (batch.cursor >= batch.count) return error.Protocol;
                 keep_row(waiters[batch.cursor], body[0..2], body[2..]);

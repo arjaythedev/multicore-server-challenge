@@ -446,6 +446,10 @@ pub const statements = std.enums.EnumArray(S, pg.Statement).init(.{
     // snapshot: `following` is true.
     // Feeds overlap (the authors most followed write the most): each
     // request's ids picked on its own, each distinct article read once.
+    // An article's tags as their ids, and the first row (`-1`, every
+    // request's) the batch's tags, ids and names, in Postgres's order of the
+    // names: a lookup of each name by its key was a fifth of the feed's
+    // index descents (-13% of its time, a batch of 9).
     .batch_list_feed = .{
         .sql = "WITH r AS (SELECT * " ++ batch_pages ++ "), " ++
             "ids AS MATERIALIZED (SELECT r.i, r.v, p.id FROM r CROSS JOIN LATERAL (" ++
@@ -454,13 +458,18 @@ pub const statements = std.enums.EnumArray(S, pg.Statement).init(.{
             "ORDER BY a2.id DESC LIMIT (r.l + r.o)) x " ++
             "WHERE fo.follower_id = r.v ORDER BY x.id DESC OFFSET r.o LIMIT r.l) p), " ++
             "x AS MATERIALIZED (SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, " ++
-            tag_list ++ " AS tag_list, (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites, " ++
+            "ARRAY(SELECT at.tag_id FROM article_tags at WHERE at.article_id = a.id) AS tag_ids, " ++
+            "(SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites, " ++
             "u.username, u.bio, u.image FROM (SELECT DISTINCT ids.id FROM ids) d " ++
             "JOIN articles a ON a.id = d.id JOIN users u ON u.id = a.author_id) " ++
-            "SELECT ids.i, x.slug, x.title, x.description, x.created_at, x.updated_at, x.tag_list, x.favorites, " ++
-            "EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = x.id AND f.user_id = ids.v), " ++
-            "x.username, x.bio, x.image, true " ++
-            "FROM ids JOIN x ON x.id = ids.id ORDER BY ids.i, ids.id DESC",
+            "SELECT -1, NULL::text, NULL::text, NULL::text, NULL::timestamptz, NULL::timestamptz, g.ids, " ++
+            "NULL::int8, NULL::bool, NULL::text, NULL::text, NULL::text, NULL::bool, g.names, NULL::int8 " ++
+            "FROM (SELECT array_agg(t.id ORDER BY t.name) AS ids, array_agg(t.name ORDER BY t.name) AS names " ++
+            "FROM tags t) g " ++
+            "UNION ALL SELECT ids.i, x.slug, x.title, x.description, x.created_at, x.updated_at, x.tag_ids, " ++
+            "x.favorites, EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = x.id AND f.user_id = ids.v), " ++
+            "x.username, x.bio, x.image, true, NULL, ids.id " ++
+            "FROM ids JOIN x ON x.id = ids.id ORDER BY 1, 15 DESC",
         .params = batch_page_params,
     },
     .batch_count_feed = .{
