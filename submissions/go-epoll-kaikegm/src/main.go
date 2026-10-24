@@ -170,6 +170,7 @@ func postgresConfig(url string) (*pgconn.Config, error) {
 		"plan_cache_mode":                     planMode, // plans are prepared once per connection
 		"jit":                                 "off",    // short queries; JIT only adds latency
 		"max_parallel_workers_per_gather":     "0",      // concurrency comes from many requests
+		"enable_memoize":                      "off",    // avoid Memoize hash overhead on batched queries
 	}
 	for k, v := range settings {
 		pg.RuntimeParams[k] = v
