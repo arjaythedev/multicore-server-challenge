@@ -115,8 +115,9 @@ one BEAM process per Postgres connection.
 ## Configuration
 
 `DATABASE_URL`, `JWT_SECRET` (required), `HOST`, `PORT`. Optional: `SCHEDULERS`, `DIRTY_CPU`, `DB_READ_CONNS`
-(12), `DB_WRITE_CONNS` (8), `ACCEPTORS` (16), `HIB_WORDS` (2048), `BCRYPT_BATCH_MS` (120), `STATS=1` (log
-request/batch/expired counters every 10 s).
+(12), `DB_WRITE_CONNS` (8), `ACCEPTORS` (16), `MIN_HEAP` (1598 words: a connection process's starting heap),
+`HIB_WORDS` (4500: a connection process hibernates after a request that grew its heap past this),
+`BCRYPT_BATCH_MS` (120), `STATS=1` (log request/batch/expired counters every 10 s).
 
 ## Tests
 

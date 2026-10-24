@@ -3,7 +3,7 @@
 -module(conduit_ffi).
 -export([getenv/1, now_seconds/0, monotonic_ms/0, hmac_sha256/2, sha256/1, md5_hex/1, hash_equals/2, pbkdf2_sha256/3, random_bytes/1,
          xor_bytes/2, has_nul/1, is_utf8/1, base64url_encode/1, base64url_decode/1,
-         listen/2, accept/1, connect/3, recv/1, recv_timeout/2, send/2, send_nosuspend/2, close/1, parse_request/1,
+         listen/2, accept/1, connect/3, recv/1, recv_timeout/2, send/2, send_nosuspend/2, close/1, parse_request/1, spawn_connection/2,
          hibernate_http/3, heap_words/0, mailbox_len/0, safe/1, log/1,
          pool_init/2, pick_read/0, pick_write/0, sleep/1, stat_add/2, stats/0,
          split_segments/1, split_target/1, bcrypt_init/1, bcrypt_collector/0]).
@@ -64,12 +64,9 @@ listen(Host, Port) ->
         {ok, I} -> I;
         _ -> {ok, I} = inet:getaddr(binary_to_list(Host), inet), I
     end,
-    %% The watermarks are far above any single response (at most ~130 KB, and a client has one in flight), so a
-    %% write never makes the driver defer its reply until the client reads: whoever writes a response, including a
-    %% shared Postgres connection process, gets `ok` as soon as the bytes are queued.
     case gen_tcp:listen(Port, [binary, {ip, Ip}, {packet, raw}, {active, true}, {reuseaddr, true},
                                {backlog, 65535}, {nodelay, true}, {send_timeout, 30000},
-                               {send_timeout_close, true}, {high_watermark, 1048576}, {low_watermark, 262144}]) of
+                               {send_timeout_close, true}]) of
         {ok, L} -> {ok, L};
         {error, R} -> {error, atom_to_binary(R)}
     end.
@@ -114,14 +111,29 @@ send(Sock, IoData) ->
         {error, _} -> {error, nil}
     end.
 
-%% Never waits for the socket: when its driver queue is above the high-water mark (a client that has stopped
-%% reading) nothing is written and `busy` is returned, so a shared process can leave the write to the owner.
+%% A write that never waits for the client, for a shared process. The driver answers a write into an empty queue
+%% at once (whatever the kernel did not take stays queued and is flushed as the client reads), but a write into a
+%% non-empty queue may be held until the queue drains; so a socket whose previous response has not drained yet is
+%% reported `busy` and the response is left to the socket's owner, which blocks on it like any slow client's
+%% process would. That keeps the back-pressure of one blocked process per slow client and bounds the memory a
+%% client that stopped reading can hold here to one response.
 send_nosuspend(Sock, IoData) ->
-    case prim_inet:send(Sock, IoData, [nosuspend]) of
-        ok -> sent;
-        {error, busy} -> busy;
-        {error, _} -> gone
+    case erlang:port_info(Sock, queue_size) of
+        {queue_size, 0} ->
+            case prim_inet:send(Sock, IoData, [nosuspend]) of
+                ok -> sent;
+                {error, busy} -> busy;
+                {error, _} -> gone
+            end;
+        {queue_size, _} -> busy;
+        undefined -> gone
     end.
+
+%% A connection process. Its heap starts at MinHeap words so the first requests do not grow it in steps (each
+%% step is a collection); it hibernates only when a request grew it past HIB_WORDS.
+spawn_connection(Fun, MinHeap) ->
+    erlang:spawn_opt(Fun, [{min_heap_size, MinHeap}]),
+    nil.
 
 close(Sock) -> gen_tcp:close(Sock), nil.
 

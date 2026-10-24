@@ -13,8 +13,8 @@ pub type Response =
 
 pub type SendResult {
   Sent
-  /// The socket's driver queue is above its high-water mark (a client that has stopped reading): nothing was
-  /// written, so another process can take over with a blocking write.
+  /// The socket still holds an earlier response the client has not read: nothing was written, so the socket's
+  /// owner can take over with a blocking write.
   Busy
   Gone
 }
@@ -26,6 +26,10 @@ pub fn send(sock: Socket, data: StringTree) -> Result(Nil, Nil)
 /// Writes unless the socket would make the caller wait.
 @external(erlang, "conduit_ffi", "send_nosuspend")
 pub fn send_nosuspend(sock: Socket, data: StringTree) -> SendResult
+
+/// The same bytes as one binary (cheap to hand to another process).
+@external(erlang, "erlang", "iolist_to_binary")
+pub fn flatten(data: StringTree) -> StringTree
 
 pub fn render(status: Int, body: StringTree) -> StringTree {
   case status {

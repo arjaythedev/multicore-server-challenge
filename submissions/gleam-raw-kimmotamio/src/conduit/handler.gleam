@@ -21,7 +21,7 @@ import gleam/result
 import gleam/string_tree.{type StringTree}
 
 pub type Ctx {
-  Ctx(secret: BitArray, hibernate_words: Int)
+  Ctx(secret: BitArray, hibernate_words: Int, min_heap_words: Int)
 }
 
 /// What the connection process does after `handle`.

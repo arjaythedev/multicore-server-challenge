@@ -3,12 +3,12 @@
 //// rendered and written by the Postgres connection process that ran the query (`conn.Render`), so this process
 //// never holds the rows or the JSON and its heap stays small; it writes the response itself only when there was
 //// no query, on errors, or when the socket was busy. Between requests the process holds only the socket, and
-//// hibernates if the last request grew its heap, so tens of thousands of idle keep-alive connections stay cheap.
+//// hibernates if the last request grew its heap unusually, so tens of thousands of idle keep-alive connections
+//// stay cheap.
 
 import conduit/handler.{type Ctx}
 import conduit/response.{type Socket}
 import gleam/bit_array
-import gleam/erlang/process
 import gleam/string_tree
 
 pub type Listener
@@ -49,6 +49,9 @@ fn safe(f: fn() -> a) -> Result(a, Nil)
 @external(erlang, "conduit_ffi", "sleep")
 fn sleep(ms: Int) -> Nil
 
+@external(erlang, "conduit_ffi", "spawn_connection")
+fn spawn_connection(f: fn() -> Nil, min_heap_words: Int) -> Nil
+
 pub fn start(host: String, port: Int, acceptors: Int, ctx: Ctx) -> Result(Nil, String) {
   case listen(host, port) {
     Error(e) -> Error(e)
@@ -63,7 +66,7 @@ fn spawn_acceptors(listener: Listener, n: Int, ctx: Ctx) -> Nil {
   case n {
     0 -> Nil
     _ -> {
-      process.spawn_unlinked(fn() { acceptor(listener, ctx) })
+      spawn_connection(fn() { acceptor(listener, ctx) }, ctx.min_heap_words)
       spawn_acceptors(listener, n - 1, ctx)
     }
   }
@@ -73,7 +76,7 @@ fn spawn_acceptors(listener: Listener, n: Int, ctx: Ctx) -> Nil {
 fn acceptor(listener: Listener, ctx: Ctx) -> Nil {
   case accept(listener) {
     Ok(sock) -> {
-      process.spawn_unlinked(fn() { acceptor(listener, ctx) })
+      spawn_connection(fn() { acceptor(listener, ctx) }, ctx.min_heap_words)
       loop(sock, <<>>, ctx)
     }
     Error(_) -> {

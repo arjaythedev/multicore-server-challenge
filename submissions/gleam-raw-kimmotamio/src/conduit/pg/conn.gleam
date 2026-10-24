@@ -291,7 +291,7 @@ fn complete(r: Request, result: Reply) -> Nil {
                   let data = response.render(status, body)
                   case response.send_nosuspend(sock, data) {
                     response.Sent -> process.send(notify, Written)
-                    response.Busy -> process.send(notify, Busy(data))
+                    response.Busy -> process.send(notify, Busy(response.flatten(data)))
                     response.Gone -> process.send(notify, Gone)
                   }
                 }
