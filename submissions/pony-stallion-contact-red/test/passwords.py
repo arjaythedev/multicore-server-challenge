@@ -27,7 +27,7 @@ FIXED_HASH = "$2b$10$......................naFBfND/0rjnzNKXE2KCY4zIW5UdykO"
 
 @contextmanager
 def probe(case, workers=1, http_env=None, args=None, threads=8,
-          unset=(), expected_exit=0):
+          unset=(), expected_exit=0, database_sizes=None):
     env = os.environ.copy()
     env.update(BCRYPT_MODE=os.environ.get("PASSWORD_TEST_MODE", "batch"),
                BCRYPT_WORKERS=str(workers))
@@ -37,6 +37,9 @@ def probe(case, workers=1, http_env=None, args=None, threads=8,
         env.pop(key, None)
     command = args or ["--test-password-http" if http_env else
                        "--test-password-async"]
+    if command == ["--test-password-async"]:
+        command = command + ["--db-write-sessions=95"]
+        env["CONDUIT_TEST_POOL_SIZE"] = "invalid"
     with tempfile.TemporaryFile() as errors:
         process = subprocess.Popen(
             [str(EXE), *command, f"--ponymaxthreads={threads}"], env=env,
@@ -44,8 +47,11 @@ def probe(case, workers=1, http_env=None, args=None, threads=8,
             bufsize=0)
         run = None
         try:
-            run = PoolRun(case, process, None, csv="--test-http" in command,
-                          count=1, actors=1)
+            csv = "--test-http" in command or (VARIANT == "diagnostic" and
+                                               "--test-password-startup" in command)
+            run = PoolRun(case, process, None, csv=csv, count=1, actors=1,
+                          counts=dict(enumerate(database_sizes))
+                          if database_sizes is not None else None)
             yield run
         finally:
             failure = sys.exc_info()[1]
@@ -362,7 +368,8 @@ class PasswordOptions(unittest.TestCase):
                         args = ["--test-password-startup", "--db-worker-count=8"]
                         if writes is not None:
                             args.append(f"--db-write-sessions={writes}")
-                        with probe(self, 3, env, args, threads=8) as run:
+                        with probe(self, 3, env, args, threads=8,
+                                   database_sizes=[12] * 7 + [11]) as run:
                             self.assertEqual(event(run, "startup")["workers"], 3)
                             totals = []
                             for worker in range(8):
@@ -437,15 +444,23 @@ class PasswordOptions(unittest.TestCase):
             self.assertIn("Invalid BCRYPT", result.stderr)
 
     def test_actual_startup_modes_and_counts(self):
+        for writes in (0, 1):
+            with self.subTest(writes=writes):
+                self._actual_startup_modes_and_counts(writes)
+
+    def _actual_startup_modes_and_counts(self, writes):
         for mode, workers in ([("inline", 1), ("scalar", 1)] +
                               [("batch", n) for n in range(1, 9)]):
             env = self.environment(mode, "000" + str(workers))
+            env["CONDUIT_TEST_POOL_SIZE"] = "2" if writes else "1"
             with socket.socket() as s:
                 s.bind(("127.0.0.1", 0))
                 env["PORT"] = str(s.getsockname()[1])
             with self.subTest(mode=mode, workers=workers), probe(self,
                     workers, env, ["--test-http", "--test-password-startup",
-                                   "--db-worker-count=1"]) as run:
+                                   "--db-worker-count=1",
+                                   f"--db-write-sessions={writes}"],
+                    database_sizes=[2 if writes else 1]) as run:
                 startup = event(run, "startup")
                 self.assertEqual(startup["inline"], mode == "inline")
                 self.assertEqual(startup["pool"], mode != "inline")
@@ -458,12 +473,17 @@ class PasswordOptions(unittest.TestCase):
                                  list(range(workers)))
 
     def test_batch_startup_failure(self):
-        result = subprocess.run([str(EXE), "--test-http",
-            "--test-password-startup-failure", "--ponymaxthreads=8"],
-            env=self.environment(), capture_output=True, text=True, timeout=10)
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("Bcrypt batch self-test failed", result.stderr)
-        self.assertEqual(result.stdout, "")
+        for writes in (0, 1):
+            with self.subTest(writes=writes):
+                env = self.environment()
+                env["CONDUIT_TEST_POOL_SIZE"] = "2" if writes else "1"
+                result = subprocess.run([str(EXE), "--test-http",
+                    "--test-password-startup-failure", "--ponymaxthreads=8",
+                    "--db-worker-count=1", f"--db-write-sessions={writes}"],
+                    env=env, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("Bcrypt batch self-test failed", result.stderr)
+                self.assertEqual(result.stdout, "")
 
     def test_defaults_and_scheduler_cap(self):
         args = ["--test-http", "--test-password-startup", "--db-worker-count=1"]

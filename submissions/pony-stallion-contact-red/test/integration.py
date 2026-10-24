@@ -713,7 +713,7 @@ class ProtocolConnection(socketserver.BaseRequestHandler):
 
 class PoolRun:
     def __init__(self, case, process, proxy, csv=False, count=2, actors=1,
-                 deadline=None):
+                 deadline=None, counts=None):
         self.case = case
         self.process = process
         self.proxy = proxy
@@ -722,7 +722,8 @@ class PoolRun:
         self.history = []
         self.sequence = 0
         self.deadline = deadline
-        self.csv = WorkerCSV(dict.fromkeys(range(actors), count)) if csv else None
+        self.csv = WorkerCSV(counts if counts is not None else
+                             dict.fromkeys(range(actors), count)) if csv else None
         self.selector = selectors.DefaultSelector()
         self.selector.register(process.stdout, selectors.EVENT_READ)
         self.receive(lambda event: event.get("event") == "started")
@@ -807,15 +808,22 @@ class PoolRun:
         return self.receive(lambda event: event.get("event") == "csv_fence"
                             and event["request"] == self.sequence)
 
-    def wait_state(self, predicate, timeout=10, worker=0):
-        deadline = time.monotonic() + self.remaining(timeout, "wait state")
+    def wait_state(self, predicate, timeout=10, worker=0,
+                   event_name="pool state condition"):
+        deadline = time.monotonic() + self.remaining(timeout, event_name)
         while time.monotonic() < deadline:
-            state = self.state(worker=worker, deadline=deadline)
+            try:
+                state = self.state(worker=worker, deadline=deadline)
+            except AssertionError as failure:
+                if time.monotonic() >= deadline:
+                    raise AssertionError(event_name + " timed out") from failure
+                raise
             if predicate(state):
-                self.remaining(deadline - time.monotonic(), "state condition")
+                if time.monotonic() >= deadline:
+                    raise AssertionError(event_name + " timed out")
                 return state
             time.sleep(min(0.01, max(0, deadline - time.monotonic())))
-        raise AssertionError("pool state condition timed out")
+        raise AssertionError(event_name + " timed out")
 
     def ready(self, count):
         return self.wait_state(lambda state: state["phases"] == [2] * count)
@@ -1109,8 +1117,8 @@ class Integration(unittest.TestCase):
 
     def test_close_after_rejected_preparation(self):
         process = subprocess.run(
-            [str(_executable()), "--test-session-resume-close"],
-            env=self.server_env | {"CONDUIT_TEST_POOL_SIZE": "1"},
+            [str(_executable()), "--test-session-resume-close", "--db-write-sessions=95"],
+            env=self.server_env | {"CONDUIT_TEST_POOL_SIZE": "invalid"},
             capture_output=True, text=True, timeout=10)
         self.assertEqual(process.returncode, 0,
                          _failure_output(process.stderr))
@@ -1120,6 +1128,11 @@ class Integration(unittest.TestCase):
     def test_direct_callback_diagnostic_accounting(self):
         if not _diagnostic_mode():
             self.skipTest("diagnostic variant only")
+        for writes in (0, 1):
+            with self.subTest(writes=writes):
+                self._direct_callback_diagnostic_accounting(writes)
+
+    def _direct_callback_diagnostic_accounting(self, writes):
         database = f"pony_diag_callback_{os.getpid()}"
         self.sql(f"CREATE DATABASE {database} TEMPLATE conduit_dev")
         try:
@@ -1128,9 +1141,10 @@ class Integration(unittest.TestCase):
             env.update(DATABASE_URL=f"postgres://conduit:conduit@"
                        f"{self.proxy.database_host}:"
                        f"{self.proxy.database_port}/{database}",
-                       CONDUIT_TEST_POOL_SIZE="1")
+                       CONDUIT_TEST_POOL_SIZE="2" if writes else "1")
             process = subprocess.run(
-                [str(_executable()), "--test-worker-diagnostic"],
+                [str(_executable()), "--test-worker-diagnostic",
+                 f"--db-write-sessions={writes}"],
                 env=env, capture_output=True, text=True, timeout=10)
             self.assertEqual(process.returncode, 0,
                              _failure_output(process.stderr))
@@ -1275,6 +1289,8 @@ class Integration(unittest.TestCase):
 
     def split_hold(self, run, command, query_id, role, held=(), outcome=1,
                    worker=0):
+        self.assertTrue(run.proxy.complete_capture)
+        generations = run.state(worker)["generations"]
         before = run.proxy.snapshot()
         excluded = {entry["connection"] for entry in held}
         gates = {index: run.proxy.hold_frame(b"Z", index, timeout=60)
@@ -1282,17 +1298,9 @@ class Integration(unittest.TestCase):
         run.send(f"target {worker} " + command if worker else command)
         state = run.wait_state(lambda value: any(
             item[1:] == [query_id, outcome] for item in value["active"]),
-            worker=worker)
-        active = [item for item in state["active"] if item[1] == query_id]
-        self.assertEqual(len(active), 1)
-        slot = active[0][0]
-        self.assertEqual(state["roles"][slot], role)
-        after = run.proxy.snapshot()
-        candidates = [(index, name) for index, messages in enumerate(after)
-                      for kind, name in messages[len(before[index]):]
-                      if kind == b"B"]
-        self.assertEqual(len(candidates), 1)
-        connection, name = candidates[0]
+            worker=worker, event_name=f"worker {worker} query {query_id} outcome {outcome}")
+        connection, slot, name = self.split_mapping(before, run.proxy.snapshot(),
+                                                  state, generations, query_id, role)
         self.assertIn(connection, gates)
         self.assertTrue(gates[connection].reached.wait(
             run.remaining(5, f"query {query_id} ReadyForQuery gate")))
@@ -1306,6 +1314,21 @@ class Integration(unittest.TestCase):
                     generation=state["generations"][slot],
                     gate=gates[connection], name=name, id=query_id)
 
+    def split_mapping(self, before, after, state, generations, query_id, role):
+        active = [item for item in state["active"] if item[1] == query_id]
+        self.assertEqual(len(active), 1, "mapping active ID count")
+        slot = active[0][0]
+        self.assertEqual(state["roles"][slot], role, "mapping role mismatch")
+        self.assertEqual(state["generations"][slot], generations[slot],
+                         "mapping generation mismatch")
+        self.assertEqual(len(after), len(before), "mapping connection inventory changed")
+        candidates = [(index, name) for index, messages in enumerate(after)
+                      for kind, name in messages[len(before[index]):]
+                      if kind == b"B"]
+        self.assertEqual(len(candidates), 1, "mapping Bind count")
+        connection, name = candidates[0]
+        return connection, slot, name
+
     def split_successor(self, run, predecessor, query_id, role, queued,
                         predecessor_callback=True):
         gate = run.proxy.hold_frame(b"Z", predecessor["connection"], timeout=60)
@@ -1315,7 +1338,8 @@ class Integration(unittest.TestCase):
         self.assertTrue(gate.reached.wait(
             run.remaining(5, f"successor {query_id} ReadyForQuery gate")))
         state = run.wait_state(lambda value:
-            [predecessor["slot"], query_id, 1] in value["active"])
+            [predecessor["slot"], query_id, 1] in value["active"],
+            event_name=f"successor {query_id} in slot {predecessor['slot']}")
         run.proxy.assert_healthy()
         self.assertEqual(state["roles"][predecessor["slot"]], role)
         self.assertEqual(state["generations"][predecessor["slot"]],
@@ -1436,6 +1460,9 @@ class Integration(unittest.TestCase):
                 ["i:" + article_id, f"i:{author}", "s:" + name],
                 lambda: self.assertEqual(count("comments", "body=" + self.literal(name)), 1))
             self.assertEqual(run.fence(), {0: 6, 1: 0, 2: 0, 3: 0})
+            if _diagnostic_mode():
+                self.assertEqual(run.diag()["counters"][:9],
+                                 [6, 2, 6, 4, 2, 6, 1, 0, 6])
             run.proxy.assert_healthy()
             binds = [value for messages in run.proxy.snapshot()
                      for kind, value in messages if kind == b"B"]
@@ -1487,6 +1514,22 @@ class Integration(unittest.TestCase):
                     self.assertEqual(run.fence()[0], len(roles) + 5)
                     run.proxy.assert_healthy()
 
+        for writes in (None, 0):
+            with self.subTest(shared=writes), self.pool_run(
+                    writes=writes, complete_capture=True) as run:
+                self.assertEqual(run.ready(2)["roles"], [0, 0])
+                read = self.split_hold(run, "tags 1 0", 1, 0)
+                write = self.split_hold(run, f"register 2 0 s_{uuid.uuid4().hex}",
+                                        2, 0, [read])
+                run.send("tags 11 0", f"register 21 0 s_{uuid.uuid4().hex}")
+                write = self.split_successor(run, write, 11, 0, [21])
+                write = self.split_successor(run, write, 21, 0, [])
+                for entry in (read, write):
+                    entry["gate"].release.set()
+                    run.result(entry["id"])
+                self.assertEqual(run.ready(2)["outstanding"], 0)
+                self.assertEqual(run.fence(), {0: 4, 1: 0, 2: 0, 3: 0})
+
     def test_split_cancel_cohorts_across_queues(self):
         with self.pool_run(writes=1, complete_capture=True) as run:
             self.assertEqual(run.ready(2)["roles"], [1, 2])
@@ -1529,6 +1572,72 @@ class Integration(unittest.TestCase):
                      for kind, name in messages if kind == b"B"]
             self.assertEqual(binds.count(b"\0tags\0"), 4)
             self.assertEqual(binds.count(b"\0register_user\0"), 4)
+        for startup in (False, True):
+            gates = []
+            def configure(proxy):
+                if startup:
+                    gates.extend(proxy.hold_frame(b"1", index, timeout=60)
+                                 for index in range(2))
+            with self.subTest(startup=startup), self.pool_run(
+                    writes=1, complete_capture=True, configure=configure) as run:
+                if startup:
+                    for gate in gates:
+                        self.assertTrue(gate.reached.wait(5))
+                    self.assertEqual(run.state()["phases"], [1, 1])
+                else:
+                    run.ready(2)
+                    read = self.split_hold(run, "tags 1 3", 1, 1)
+                    write = self.split_hold(run, f"register 2 3 s_{uuid.uuid4().hex}",
+                                            2, 2, [read])
+                run.send("tags 10 0", f"register 11 0 s_{uuid.uuid4().hex}", "cancel 0",
+                         "tags 20 0", f"register 21 0 s_{uuid.uuid4().hex}",
+                         "tags 30 1", f"register 31 1 s_{uuid.uuid4().hex}")
+                state = run.state()
+                self.assertEqual(state["queued"], [10, 20, 30])
+                self.assertEqual(state["write_queued"], [11, 21, 31])
+                self.assertEqual(state["outstanding"], 6 if startup else 8)
+                self.assertEqual(state["recipients"], 2 if startup else 3)
+                if startup:
+                    completions = [run.proxy.hold_frame(b"Z", index, skipped=30,
+                                                       timeout=60) for index in range(2)]
+                    for gate in gates:
+                        gate.release.set()
+                    for gate in completions:
+                        self.assertTrue(gate.reached.wait(10))
+                    state = run.wait_state(lambda value:
+                        sorted(item[1:] for item in value["active"]) == [[10, 1], [11, 1]])
+                    actual = {}
+                    for connection, messages in enumerate(run.proxy.snapshot()):
+                        binds = [name for kind, name in messages if kind == b"B"]
+                        self.assertEqual(len(binds), 1)
+                        role = 1 if binds[0] == b"\0tags\0" else 2
+                        self.assertEqual(binds[0], b"\0tags\0" if role == 1 else b"\0register_user\0")
+                        query_id = 10 if role == 1 else 11
+                        slots = [slot for slot, ident, _ in state["active"] if ident == query_id]
+                        self.assertEqual(len(slots), 1)
+                        slot = slots[0]
+                        self.assertEqual(state["roles"][slot], role)
+                        self.assertNotIn(role, actual)
+                        actual[role] = dict(connection=connection, slot=slot,
+                            generation=state["generations"][slot], id=query_id,
+                            gate=completions[connection])
+                    self.assertEqual(set(actual), {1, 2})
+                    read, write = actual[1], actual[2]
+                else:
+                    read = self.split_successor(run, read, 10, 1, [20, 30])
+                    write = self.split_successor(run, write, 11, 2, [21, 31])
+                self.assertEqual(run.fence()[0], 0)
+                read = self.split_successor(run, read, 20, 1, [30], False)
+                write = self.split_successor(run, write, 21, 2, [31], False)
+                self.assertEqual(run.fence()[0], 0)
+                read = self.split_successor(run, read, 30, 1, [])
+                write = self.split_successor(run, write, 31, 2, [])
+                for entry in (read, write):
+                    entry["gate"].release.set()
+                    run.result(entry["id"])
+                self.assertEqual(run.ready(2)["outstanding"], 0)
+                self.assertEqual(run.fence(), {0: 2, 1: 2, 2: 0,
+                                               3: 0 if startup else 2})
 
     def test_split_close_drains_both_queues(self):
         with self.pool_run(writes=1, complete_capture=True) as run:
@@ -1560,6 +1669,54 @@ class Integration(unittest.TestCase):
                 + ")"), "0")
             run.proxy.assert_healthy()
             self.assertEqual(run.proxy.snapshot(), before)
+
+        with self.pool_run(writes=1, complete_capture=True) as run:
+            run.ready(2)
+            before = run.proxy.snapshot()
+            run.send("split-close-batch 65 65 100000 900")
+            state, counts, prefix = run.checkpoint(900)
+            self.assertEqual(prefix, [(i, "data") for i in range(100000, 100064)]
+                             + [(i, "lost") for i in range(100064, 100130, 2)]
+                             + [(i, "lost") for i in range(100065, 100130, 2)])
+            self.assertEqual(counts, {0: 130, 1: 0, 2: 0, 3: 0})
+            self.assertEqual(state["phases"], [5, 5])
+            self.assertEqual(state["outstanding"], 0)
+            self.assertEqual(run.state()["phases"], [5, 5])
+            run.proxy.assert_healthy()
+            self.assertEqual(run.proxy.snapshot(), before)
+        gates = []
+        with self.pool_run(writes=1, configure=lambda proxy: gates.extend(
+                proxy.hold_frame(b"1", index, timeout=60) for index in range(2))) as run:
+            for gate in gates:
+                self.assertTrue(gate.reached.wait(5))
+            self.assertEqual(run.state()["phases"], [1, 1])
+            run.send("tags 1 0", f"register 2 0 s_{uuid.uuid4().hex}", "close")
+            run.result(1, "lost")
+            run.result(2, "lost")
+            self.assertEqual(run.state()["phases"], [5, 5])
+            self.assertEqual(run.fence(), {0: 2, 1: 0, 2: 0, 3: 0})
+        for role in (1, 2):
+            deadline = time.monotonic() + 120
+            retry_ns = 600_000_000_000
+            self.assertGreater(retry_ns / 1e9, 120)
+            with self.subTest(backoff_close=role), self.pool_run(writes=1,
+                    retry_ns=retry_ns, deadline=deadline, complete_capture=True) as run:
+                run.ready(2)
+                command = "tags 1 0" if role == 1 else f"register 1 0 s_{uuid.uuid4().hex}"
+                held = self.split_hold(run, command, 1, role)
+                run.send(f"retire {held['slot']}")
+                run.result(1, "lost")
+                state = run.wait_state(lambda value: value["phases"][held["slot"]] == 4)
+                token = state["request"]
+                opposite = ("tags 4 0" if role == 2 else
+                            f"register 4 0 s_{uuid.uuid4().hex}")
+                self.split_hold(run, opposite, 4, 3 - role, [held])
+                run.send("tags 2 0", f"register 3 0 s_{uuid.uuid4().hex}", "close",
+                         f"retry {held['slot']} {token} 1")
+                for query_id in (2, 3, 4):
+                    run.result(query_id, "lost")
+                self.assertEqual(run.state()["phases"], [5, 5])
+                self.assertEqual(run.fence(), {0: 4, 1: 0, 2: 0, 3: 0})
 
     def test_split_dispatch_budget_and_continuation(self):
         for reads, writes in ((65, 65), (63, 0), (64, 0), (65, 0), (130, 0),
@@ -1760,6 +1917,133 @@ class Integration(unittest.TestCase):
                 self.assertEqual(run.state()["phases"], [5, 5])
                 self.assertEqual(run.fence(), {0: 3, 1: 1, 2: 0, 3: 0})
                 run.proxy.assert_healthy()
+
+        for role in (1, 2):
+            for busy in (False, True):
+                deadline = time.monotonic() + 120
+                self.assertGreater(600_000_000_000 / 1e9, 120)
+                with self.subTest(retire_role=role, busy=busy), self.pool_run(
+                        count=4, writes=2, retry_ns=600_000_000_000,
+                        deadline=deadline, complete_capture=True) as run:
+                    self.assertEqual(run.ready(4)["roles"], [1, 1, 2, 2])
+                    held = []
+                    for query_id, selected_role in enumerate((1, 1, 2, 2), 1):
+                        held.append(self.split_hold(run, command(query_id, selected_role),
+                                                    query_id, selected_role, held))
+                    victim = next(entry for entry in held
+                                  if (1 if entry["slot"] < 2 else 2) == role)
+                    if not busy:
+                        victim["gate"].release.set()
+                        run.result(victim["id"])
+                        run.wait_state(lambda value: value["phases"][victim["slot"]] == 2)
+                    run.send(f"retire {victim['slot']}")
+                    if busy:
+                        run.result(victim["id"], "lost")
+                    state = run.wait_state(lambda value: value["phases"][victim["slot"]] == 4)
+                    expected_generations = [0] * 4
+                    expected_generations[victim["slot"]] = 1
+                    self.assertEqual(state["generations"], expected_generations)
+                    self.assertEqual(state["roles"], [1, 1, 2, 2])
+                    survivors = [entry for entry in held if entry is not victim]
+                    self.assertEqual(sorted(state["active"]),
+                                     sorted([entry["slot"], entry["id"], 1] for entry in survivors))
+                    self.assertEqual(state["idle"], [])
+                    for entry in survivors:
+                        entry["gate"].release.set()
+                        run.result(entry["id"])
+                    expected_phases = [2] * 4
+                    expected_phases[victim["slot"]] = 4
+                    run.wait_state(lambda value: value["phases"] == expected_phases)
+                    exercised = []
+                    for query_id, entry in enumerate(survivors, 20):
+                        selected_role = 1 if entry["slot"] < 2 else 2
+                        exercised.append(self.split_hold(run, command(query_id, selected_role),
+                            query_id, selected_role, [victim, *exercised]))
+                    self.assertEqual({entry["slot"] for entry in exercised},
+                                     {entry["slot"] for entry in survivors})
+                    for entry in exercised:
+                        entry["gate"].release.set()
+                        run.result(entry["id"])
+                    self.assertEqual(run.fence(), {0: 7, 1: 0, 2: 0, 3: 0})
+            deadline = time.monotonic() + 120
+            self.assertGreater(600_000_000_000 / 1e9, 120)
+            with self.subTest(prepare_failure=role), self.pool_run(writes=1,
+                    retry_ns=600_000_000_000, deadline=deadline,
+                    complete_capture=True) as run:
+                run.ready(2)
+                held = self.split_hold(run, command(1, role), 1, role)
+                held["gate"].release.set()
+                run.result(1)
+                run.send(f"retire {held['slot']}", command(2, role))
+                state = run.wait_state(lambda value: value["phases"][held["slot"]] == 4)
+                replacement = len(run.proxy.snapshot())
+                run.proxy.replace_prepare(replacement, b"tags")
+                run.send(f"retry {held['slot']} {state['request']} 1")
+                failed = run.wait_state(lambda value: value["phases"][held["slot"]] == 4
+                                        and value["generations"][held["slot"]] == 2)
+                self.assertEqual(run.proxy.prepare_receipts, [(replacement, b"tags")])
+                self.assertEqual(failed["queued" if role == 1 else "write_queued"], [2])
+                self.assertEqual(run.fence()[0], 1)
+                run.send(command(3, 3 - role, client=1))
+                run.result(3)
+                replacement = len(run.proxy.snapshot())
+                gate = run.proxy.hold_frame(b"Z", replacement, skipped=31, timeout=60)
+                run.send(f"retry {held['slot']} {failed['request']} 2")
+                self.assertTrue(gate.reached.wait(run.remaining(10, "recovered prepared execution")))
+                state = run.wait_state(lambda value: [held["slot"], 2, 1] in value["active"])
+                self.assertEqual(state["roles"][held["slot"]], role)
+                messages = run.proxy.snapshot()[replacement]
+                self.assertEqual(sum(kind == b"P" for kind, _ in messages), 30)
+                self.assertEqual([name for kind, name in messages if kind == b"B"],
+                                 [b"\0tags\0" if role == 1 else b"\0register_user\0"])
+                gate.release.set()
+                run.result(2)
+                run.ready(2)
+                run.proxy.assert_healthy()
+            deadline = time.monotonic() + 120
+            self.assertGreater(600_000_000_000 / 1e9, 120)
+            with self.subTest(nonidle_missing_statement=role), self.pool_run(
+                    writes=1, retry_ns=600_000_000_000, deadline=deadline,
+                    complete_capture=True) as run:
+                self.assertEqual(run.ready(2)["roles"], [1, 2])
+                run.send("begin 1 0 " + ("read" if role == 1 else "write"))
+                run.result(1, "lost")
+                state = run.wait_state(lambda value: 4 in value["phases"])
+                slot = state["phases"].index(4)
+                self.assertEqual(state["roles"][slot], role)
+                run.send(f"retry {slot} {state['request']} 1")
+                run.ready(2)
+                run.send("deallocate 2 0 " + ("read" if role == 1 else "write"))
+                run.result(2)
+                run.send(command(3, role))
+                run.result(3, "26000")
+                state = run.wait_state(lambda value: value["phases"][slot] == 4)
+                self.assertEqual(state["generations"][slot], 2)
+                run.send(command(4, 3 - role, client=1))
+                run.result(4)
+                self.assertEqual(run.fence(), {0: 3, 1: 1, 2: 0, 3: 0})
+            for action in ("retire", "close"):
+                deadline = time.monotonic() + 120
+                self.assertGreater(600_000_000_000 / 1e9, 120)
+                with self.subTest(data_error_role=role, action=action), self.pool_run(
+                        writes=1, retry_ns=600_000_000_000, deadline=deadline,
+                        complete_capture=True) as run:
+                    run.ready(2)
+                    run.proxy.corrupt_next_data_row()
+                    held = self.split_hold(run, command(1, role), 1, role, outcome=3)
+                    run.result(1, "data")
+                    run.send(command(2, role), "close" if action == "close"
+                             else f"retire {held['slot']}")
+                    if action == "close":
+                        run.result(2, "lost")
+                        self.assertEqual(run.state()["phases"], [5, 5])
+                    else:
+                        state = run.wait_state(lambda value: value["phases"][held["slot"]] == 4)
+                        self.assertEqual(run.fence()[0], 1)
+                        run.send(f"retry {held['slot']} {state['request']} 1")
+                        run.result(2)
+                        run.ready(2)
+                    self.assertEqual(run.fence(), {0: 2, 1: 0, 2: 0, 3: 0})
 
     def test_split_http_continuations_and_durability(self):
         author = self.author()
@@ -1977,7 +2261,8 @@ class Integration(unittest.TestCase):
                     run.result(held["id"])
                 run.ready(2)
         for first_role in (1, 2):
-            with self.subTest(peak_first=first_role), self.pool_run(writes=1) as run:
+            with self.subTest(peak_first=first_role), self.pool_run(
+                    writes=1, complete_capture=True) as run:
                 run.ready(2)
                 for first_id, role, count in ((1, first_role, 3), (10, 3 - first_role, 5)):
                     def command(query_id):
@@ -2103,6 +2388,57 @@ class Integration(unittest.TestCase):
         self.assertFalse(proxy.thread.is_alive())
         self.assertTrue(all(not thread.is_alive() for thread in proxy.handlers))
         proxy.assert_healthy()
+        with self.pool_run(writes=1, complete_capture=True) as run:
+            initial = run.ready(2)
+            self.assertEqual(initial["roles"], [1, 2])
+            before = run.proxy.snapshot()
+            held = self.split_hold(run, "tags 1 0", 1, 1)
+            state = run.state()
+            after = run.proxy.snapshot()
+            expected = (held["connection"], held["slot"], b"\0tags\0")
+            self.assertEqual(self.split_mapping(before, after, state,
+                initial["generations"], 1, 1), expected)
+            with self.assertRaisesRegex(AssertionError, "mapping Bind count"):
+                self.split_mapping(before, before, state, initial["generations"], 1, 1)
+            duplicate = [list(messages) for messages in after]
+            duplicate[held["connection"]].append((b"B", b"\0tags\0"))
+            with self.assertRaisesRegex(AssertionError, "mapping Bind count"):
+                self.split_mapping(before, duplicate, state, initial["generations"], 1, 1)
+            with self.assertRaisesRegex(AssertionError, "mapping role mismatch"):
+                self.split_mapping(before, after, state, initial["generations"], 1, 2)
+            stale = initial["generations"].copy()
+            stale[held["slot"]] += 1
+            with self.assertRaisesRegex(AssertionError, "mapping generation mismatch"):
+                self.split_mapping(before, after, state, stale, 1, 1)
+            held["gate"].release.set()
+            run.result(1)
+        with self.assertRaisesRegex(AssertionError, "scenario deadline before pool fixture"):
+            with self.pool_run(writes=1, deadline=time.monotonic() - 1):
+                self.fail("expired fixture was created")
+        deadline = time.monotonic() + 120
+        self.assertGreater(600_000_000_000 / 1e9, 120)
+        with self.pool_run(writes=1, retry_ns=600_000_000_000,
+                           deadline=deadline) as run:
+            run.ready(2)
+            run.send("retire 0")
+            run.wait_state(lambda value: value["phases"][0] == 4)
+            with self.assertRaisesRegex(AssertionError, "suppressed manual retry timed out"):
+                run.wait_state(lambda value: value["phases"][0] == 2, timeout=0.1,
+                               event_name="suppressed manual retry")
+            run.send("state 999")
+            self.assertTrue(run.selector.select(5))
+            run.deadline = time.monotonic() - 1
+            try:
+                with self.assertRaisesRegex(AssertionError, "scenario deadline: late state"):
+                    run.receive(lambda value: value.get("request") == 999,
+                                timeout=10, event_name="late state")
+                with self.assertRaisesRegex(AssertionError, "scenario deadline: send pool command"):
+                    run.send("retry 0 1 1")
+            finally:
+                run.deadline = deadline
+            run.receive(lambda value: value.get("event") == "state" and value["request"] == 999)
+            run.send("close")
+            self.assertEqual(run.state()["phases"], [5, 5])
 
     def test_pool_uses_idle_connection_while_another_is_blocked(self):
         with self.pool_run() as run:
@@ -3151,9 +3487,10 @@ class Integration(unittest.TestCase):
     def test_named_rollback_after_failed_transaction(self):
         before = len(self.proxy.snapshot())
         executable = _executable()
-        result = subprocess.run([str(executable), "--test-named-rollback"],
+        result = subprocess.run([str(executable), "--test-named-rollback",
+                                 "--db-write-sessions=95"],
                                 env=self.server_env | {
-                                    "CONDUIT_TEST_POOL_SIZE": "1"},
+                                    "CONDUIT_TEST_POOL_SIZE": "invalid"},
                                 capture_output=True,
                                 text=True, timeout=10)
         self.assertEqual(result.returncode, 0, _failure_output(result.stderr))
@@ -3197,9 +3534,11 @@ class Integration(unittest.TestCase):
             release = Path(directory) / "dns-release"
             env["CONDUIT_DNS_MARKER"] = str(marker)
             env["CONDUIT_DNS_RELEASE"] = str(release)
+            env["CONDUIT_TEST_POOL_SIZE"] = "invalid"
             executable = _executable()
             process = subprocess.Popen(
-                [str(executable), "--ponymaxthreads=1", "--test-dns-progress"],
+                [str(executable), "--ponymaxthreads=1", "--test-dns-progress",
+                 "--db-write-sessions=95"],
                 env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True)
             try:
@@ -3227,7 +3566,8 @@ class Integration(unittest.TestCase):
 
     def test_session_rejects_truncated_strings_and_preserves_status(self):
         executable = _executable()
-        result = subprocess.run([str(executable), "--test-session-boundary"],
+        result = subprocess.run([str(executable), "--test-session-boundary",
+                                 "--db-write-sessions=95"],
                                 env=self.server_env | {
                                     "CONDUIT_TEST_POOL_SIZE": "invalid"},
                                 capture_output=True,
@@ -3237,9 +3577,10 @@ class Integration(unittest.TestCase):
 
     def test_session_shutdown_settles_accepted_commands(self):
         executable = _executable()
-        result = subprocess.run([str(executable), "--test-session-shutdown"],
+        result = subprocess.run([str(executable), "--test-session-shutdown",
+                                 "--db-write-sessions=95"],
                                 env=self.server_env | {
-                                    "CONDUIT_TEST_POOL_SIZE": "1"},
+                                    "CONDUIT_TEST_POOL_SIZE": "invalid"},
                                 capture_output=True,
                                 text=True, timeout=10)
         self.assertEqual(result.returncode, 0, _failure_output(result.stderr))
@@ -3260,9 +3601,11 @@ class Integration(unittest.TestCase):
             release = Path(directory) / "dns-release"
             env["CONDUIT_DNS_MARKER"] = str(marker)
             env["CONDUIT_DNS_RELEASE"] = str(release)
+            env["CONDUIT_TEST_POOL_SIZE"] = "invalid"
             executable = _executable()
             process = subprocess.Popen([str(executable),
-                                        "--test-startup-shutdown"], env=env,
+                                        "--test-startup-shutdown",
+                                        "--db-write-sessions=95"], env=env,
                                        stdout=subprocess.PIPE,
                                        stderr=subprocess.PIPE, text=True)
             try:
@@ -3287,9 +3630,10 @@ class Integration(unittest.TestCase):
 
     def test_connection_fields_reject_nul(self):
         executable = _executable()
-        result = subprocess.run([str(executable), "--test-connection-nul"],
+        result = subprocess.run([str(executable), "--test-connection-nul",
+                                 "--db-write-sessions=95"],
                                 env=self.server_env | {
-                                    "CONDUIT_TEST_POOL_SIZE": "1"},
+                                    "CONDUIT_TEST_POOL_SIZE": "invalid"},
                                 capture_output=True,
                                 text=True, timeout=10)
         self.assertEqual(result.returncode, 0, _failure_output(result.stderr))
@@ -3298,9 +3642,10 @@ class Integration(unittest.TestCase):
 
     def test_result_shapes_reject_nested_arrays_and_keep_infinities(self):
         executable = _executable()
-        result = subprocess.run([str(executable), "--test-result-shapes"],
+        result = subprocess.run([str(executable), "--test-result-shapes",
+                                 "--db-write-sessions=95"],
                                 env=self.server_env | {
-                                    "CONDUIT_TEST_POOL_SIZE": "1"},
+                                    "CONDUIT_TEST_POOL_SIZE": "invalid"},
                                 capture_output=True,
                                 text=True, timeout=10)
         self.assertEqual(result.returncode, 0, _failure_output(result.stderr))
@@ -3348,12 +3693,14 @@ class Integration(unittest.TestCase):
             "CONDUIT_QUERY_COUNT": str(count),
             "CONDUIT_QUERY_SCENARIO": str(scenario),
             "CONDUIT_QUERY_MARKER": marker,
-            "CONDUIT_QUERY_ROOT_CONTROL": control}
+            "CONDUIT_QUERY_ROOT_CONTROL": control,
+            "CONDUIT_TEST_POOL_SIZE": "invalid"}
         env.pop("LD_PRELOAD", None)
         if library is not None:
             env["LD_PRELOAD"] = str(library)
         result = subprocess.run(
-            [str(_executable()), "--test-query-storage", "--ponymaxthreads=1"],
+            [str(_executable()), "--test-query-storage", "--ponymaxthreads=1",
+             "--db-write-sessions=95"],
             env=env, capture_output=True, text=True,
             timeout=30 if mode == "pending" else 10)
         if not expect_success:
@@ -3460,13 +3807,15 @@ class Integration(unittest.TestCase):
                                 f"{proxy.server_address[1]}/{self.database}",
                 "CONDUIT_TEST_DECODE_OID": str(oid),
                 "CONDUIT_TEST_DECODE_KIND": kind,
-                "CONDUIT_TEST_DECODE_VALUE": str(value)}
+                "CONDUIT_TEST_DECODE_VALUE": str(value),
+                "CONDUIT_TEST_POOL_SIZE": "invalid"}
             flag = "--test-decode-scalar"
             if atomic is not None:
                 flag = "--test-decode-atomic"
                 env["CONDUIT_TEST_DECODE_ATOMIC_CASE"] = atomic
             result = subprocess.run(
-                [str(_executable()), flag, "--ponymaxthreads=2"], env=env,
+                [str(_executable()), flag, "--ponymaxthreads=2",
+                 "--db-write-sessions=95"], env=env,
                 capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 0, _failure_output(result.stderr))
             self.assertEqual(result.stdout.strip(),
@@ -3561,9 +3910,10 @@ class Integration(unittest.TestCase):
 
     def test_deep_rejection_queue_drains(self):
         executable = _executable()
-        result = subprocess.run([str(executable), "--test-queue-drain"],
+        result = subprocess.run([str(executable), "--test-queue-drain",
+                                 "--db-write-sessions=95"],
                                 env=self.server_env | {
-                                    "CONDUIT_TEST_POOL_SIZE": "1"},
+                                    "CONDUIT_TEST_POOL_SIZE": "invalid"},
                                 capture_output=True,
                                 text=True, timeout=30)
         self.assertEqual(result.returncode, 0, _failure_output(result.stderr))
@@ -3616,40 +3966,52 @@ class Integration(unittest.TestCase):
         self.assertEqual(len(self.proxy.snapshot()), before)
 
     def test_presend_data_error_keeps_worker_query_order(self):
+        for writes in (0, 1):
+            with self.subTest(writes=writes):
+                self._presend_data_error_keeps_worker_query_order(writes)
+
+    def _presend_data_error_keeps_worker_query_order(self, writes):
         before = len(self.proxy.snapshot())
         executable = _executable()
-        result = subprocess.run([str(executable), "--test-worker-data-error"],
+        result = subprocess.run([str(executable), "--test-worker-data-error",
+                                 f"--db-write-sessions={writes}"],
                                 env=self.server_env | {
-                                    "CONDUIT_TEST_POOL_SIZE": "1"},
+                                    "CONDUIT_TEST_POOL_SIZE": "2" if writes else "1"},
                                 capture_output=True,
                                 text=True, timeout=10)
         self.assertEqual(result.returncode, 0, _failure_output(result.stderr))
         self.assertEqual(result.stdout.strip(),
                          "worker data errors followed by query passed")
         sessions = self.proxy.snapshot()[before:]
-        self.assertEqual(len(sessions), 1)
-        bound = [payload.split(b"\0", 2)[1] for kind, payload
-                 in sessions[0] if kind == b"B"]
-        self.assertEqual(bound, [b"tags"])
+        bound = [[payload.split(b"\0", 2)[1] for kind, payload
+                  in session if kind == b"B"] for session in sessions]
+        self.assertEqual([names for names in bound if names], [[b"tags"]])
+        self.assertIn(len(sessions), (1, 2) if writes else (1,))
 
     def test_decode_data_error_keeps_worker_query_order(self):
+        for writes in (0, 1):
+            with self.subTest(writes=writes):
+                self._decode_data_error_keeps_worker_query_order(writes)
+
+    def _decode_data_error_keeps_worker_query_order(self, writes):
         self.assertGreater(int(self.db("SELECT count(*) FROM tags")), 0)
         before = len(self.proxy.snapshot())
         self.proxy.corrupt_next_data_row()
         executable = _executable()
-        result = subprocess.run([str(executable), "--test-worker-decode-error"],
+        result = subprocess.run([str(executable), "--test-worker-decode-error",
+                                 f"--db-write-sessions={writes}"],
                                 env=self.server_env | {
-                                    "CONDUIT_TEST_POOL_SIZE": "1"},
+                                    "CONDUIT_TEST_POOL_SIZE": "2" if writes else "1"},
                                 capture_output=True,
                                 text=True, timeout=10)
         self.assertEqual(result.returncode, 0, _failure_output(result.stderr))
         self.assertEqual(result.stdout.strip(),
                          "worker decode error followed by query passed")
         sessions = self.proxy.snapshot()[before:]
-        self.assertEqual(len(sessions), 1)
-        bound = [payload.split(b"\0", 2)[1] for kind, payload
-                 in sessions[0] if kind == b"B"]
-        self.assertEqual(bound, [b"tags", b"tags"])
+        bound = [[payload.split(b"\0", 2)[1] for kind, payload
+                  in session if kind == b"B"] for session in sessions]
+        self.assertEqual([names for names in bound if names], [[b"tags", b"tags"]])
+        self.assertIn(len(sessions), (1, 2) if writes else (1,))
 
     def test_missing_query_completion_fails_request(self):
         connection = http.client.HTTPConnection("127.0.0.1", self.port,
@@ -3669,12 +4031,17 @@ class Integration(unittest.TestCase):
             connection.close()
 
     def test_shared_worker_cancellation_preserves_other_client(self):
+        for writes in (0, 1):
+            with self.subTest(writes=writes):
+                self._shared_worker_cancellation_preserves_other_client(writes)
+
+    def _shared_worker_cancellation_preserves_other_client(self, writes):
         executable = _executable()
         before = len(self.proxy.snapshot())
         self.proxy.hold_command_complete_after(1)
         process = subprocess.Popen(
-            [str(executable), "--test-worker-overlap"],
-            env=self.server_env | {"CONDUIT_TEST_POOL_SIZE": "1"},
+            [str(executable), "--test-worker-overlap", f"--db-write-sessions={writes}"],
+            env=self.server_env | {"CONDUIT_TEST_POOL_SIZE": "2" if writes else "1"},
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, bufsize=1)
         try:
@@ -3684,7 +4051,7 @@ class Integration(unittest.TestCase):
                 sessions = self.proxy.snapshot()[before:]
                 if sessions and any(kind == b"B" and
                         payload.split(b"\0", 2)[1] == b"tags"
-                        for kind, payload in sessions[0]):
+                        for session in sessions for kind, payload in session):
                     break
                 time.sleep(0.01)
             else:
@@ -3694,11 +4061,11 @@ class Integration(unittest.TestCase):
             self.assertEqual(process.returncode, 0, _failure_output(stderr))
             self.assertEqual(stdout.strip(), "surviving client passed")
             sessions = self.proxy.snapshot()[before:]
-            self.assertEqual(len(sessions), 1)
-            bound = [payload.split(b"\0", 2)[1] for kind, payload
-                     in sessions[0] if kind == b"B"]
-            self.assertEqual(bound,
-                             [b"current_user", b"tags", b"profile"])
+            bound = [[payload.split(b"\0", 2)[1] for kind, payload
+                      in session if kind == b"B"] for session in sessions]
+            self.assertEqual([names for names in bound if names],
+                             [[b"current_user", b"tags", b"profile"]])
+            self.assertIn(len(sessions), (1, 2) if writes else (1,))
         finally:
             self.proxy.release_command_complete(abort=True)
             if process.poll() is None:
@@ -3706,11 +4073,16 @@ class Integration(unittest.TestCase):
                 process.communicate(timeout=5)
 
     def test_explicit_worker_close_fails_each_submitted_job(self):
+        for writes in (0, 1):
+            with self.subTest(writes=writes):
+                self._explicit_worker_close_fails_each_submitted_job(writes)
+
+    def _explicit_worker_close_fails_each_submitted_job(self, writes):
         executable = _executable()
         self.proxy.hold_command_complete_after(1)
         process = subprocess.Popen(
-            [str(executable), "--test-worker-close-drain"],
-            env=self.server_env | {"CONDUIT_TEST_POOL_SIZE": "1"},
+            [str(executable), "--test-worker-close-drain", f"--db-write-sessions={writes}"],
+            env=self.server_env | {"CONDUIT_TEST_POOL_SIZE": "2" if writes else "1"},
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, bufsize=1)
         try:
@@ -3845,6 +4217,11 @@ class Integration(unittest.TestCase):
             self.sql(f"DROP DATABASE {database} WITH (FORCE)")
 
     def test_pending_cancellation_keeps_other_client(self):
+        for writes in (0, 1):
+            with self.subTest(writes=writes):
+                self._pending_cancellation_keeps_other_client(writes)
+
+    def _pending_cancellation_keeps_other_client(self, writes):
         database = f"pony_pending_{os.getpid()}"
         self.sql(f"CREATE DATABASE {database} TEMPLATE conduit_dev")
         proxy = ProtocolProxy(self.proxy.database_host,
@@ -3854,10 +4231,11 @@ class Integration(unittest.TestCase):
             env = self.server_env.copy()
             env.update(DATABASE_URL=f"postgres://conduit:conduit@127.0.0.1:"
                        f"{proxy.server_address[1]}/{database}",
-                       CONDUIT_TEST_POOL_SIZE="1")
+                       CONDUIT_TEST_POOL_SIZE="2" if writes else "1")
             executable = _executable()
             process = subprocess.Popen(
-                [str(executable), "--test-worker-pending-cancel"], env=env,
+                [str(executable), "--test-worker-pending-cancel",
+                 f"--db-write-sessions={writes}"], env=env,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, bufsize=1)
             try:
@@ -4855,6 +5233,14 @@ class WorkerCountCLI(unittest.TestCase):
                       ["--db-write-sessions=1", "--db-write-sessions", "1"],
                       ["--db-write-sessions", "1", "--db-write-sessions", "1"]]
         cases = [(args, "invalid", "--db-write-sessions") for args in malformed]
+        no_workers = ["--self-test", "--test-pending-jobs", "--test-query-storage",
+                      "--test-diag-arithmetic", "--test-csv-tick", "--test-password-async",
+                      "--test-named-rollback", "--test-session-boundary", "--test-dns-progress",
+                      "--test-session-shutdown", "--test-session-resume-close",
+                      "--test-startup-shutdown", "--test-connection-nul", "--test-queue-drain",
+                      "--test-result-shapes", "--test-decode-scalar", "--test-decode-atomic"]
+        cases.extend(([mode, "--db-write-sessions=invalid"], "invalid",
+                      "--db-write-sessions") for mode in no_workers)
         for mode in ([], ["--test-password-startup"],
                      ["--test-password-startup-failure"]):
             for writes in (7, 88):
@@ -4931,6 +5317,18 @@ class WorkerCountCLI(unittest.TestCase):
                     text=True, timeout=10)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("Self-tests passed", result.stdout)
+
+        for args in (["--test-http", "--self-test"],
+                     ["--test-password-startup", "--self-test"],
+                     ["--test-pending-jobs"], ["--test-diag-arithmetic"],
+                     ["--test-csv-tick"]):
+            with self.subTest(no_worker=args):
+                result = subprocess.run([str(_executable()), *args,
+                    "--db-write-sessions=95", "--ponymaxthreads=1"],
+                    env=dict(os.environ, CONDUIT_TEST_POOL_SIZE="invalid"),
+                    capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotEqual(result.stdout.strip(), "")
 
     def test_rejected_flags_and_private_sizes_do_not_connect(self):
         cases = [["--db-worker-count=" + value] for value in
