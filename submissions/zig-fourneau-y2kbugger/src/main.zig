@@ -21,7 +21,9 @@ const Tuning = struct {
     bcrypt_workers: u32 = 2,
     /// Per shard: Postgres connections for reads and for writes (writes
     /// wait for their commit's flush, so reads never queue behind one).
-    reads: u32 = 6,
+    /// 6 and 9 measured alike on 4 CPUs (13,904 and 13,947 req/s at
+    /// saturation), 3 too few; the box runs Postgres on twice the CPUs.
+    reads: u32 = 8,
     writes: u32 = 2,
 
     fn from(environ: std.process.Environ) !Tuning {
@@ -69,7 +71,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .reads = tuning.reads,
         .writes = tuning.writes,
         .slots = slots_per_shard,
-        .connections_max = connections_max / tuning.shards,
+        .connections_max = connections_fitting() / tuning.shards,
         .address = try std.Io.net.IpAddress.parse(host, port),
         .key = key,
         .passwords = passwords,
@@ -82,6 +84,25 @@ pub fn main(init: std.process.Init.Minimal) !void {
         host, port, tuning.shards, tuning.reads, tuning.writes, tuning.bcrypt_workers,
     });
     shard_module.run(options);
+}
+
+/// The connection slots the kernel's map limit leaves room for: a fiber's
+/// stack sits over a guard page, two maps a fiber (`vm.max_map_count` is
+/// 65,530 on a kernel left at its default: 32k fibers, where a failed map
+/// would be a crash). Past the slots, the longest idle are closed.
+fn connections_fitting() u32 {
+    const maps_reserved = 8192; // the rest of the process: slabs, rings, libc
+    var buffer: [32]u8 = undefined;
+    const fd = linux.open("/proc/sys/vm/max_map_count", .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(fd) != .SUCCESS) return connections_max;
+    defer _ = linux.close(@intCast(fd));
+    const got = linux.read(@intCast(fd), &buffer, buffer.len);
+    if (linux.errno(got) != .SUCCESS) return connections_max;
+    const text = std.mem.trim(u8, buffer[0..got], " \n");
+    const maps = std.fmt.parseInt(u64, text, 10) catch return connections_max;
+    if (maps <= maps_reserved) return 1024;
+    const fibers = (maps - maps_reserved) / 2;
+    return @intCast(@min(connections_max, fibers));
 }
 
 /// The soft limit up to the hard one: a connection is a descriptor.
