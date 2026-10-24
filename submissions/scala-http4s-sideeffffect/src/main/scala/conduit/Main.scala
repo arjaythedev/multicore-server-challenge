@@ -36,8 +36,8 @@ object Config:
       jwtSecret = required("JWT_SECRET"),
       host = env("HOST").flatMap(Host.fromString).getOrElse(Host.fromString("0.0.0.0").get),
       port = env("PORT").flatMap(Port.fromString).getOrElse(Port.fromInt(80).get),
-      readSessions = env("DB_READ_SESSIONS").flatMap(_.toIntOption).getOrElse(16),
-      writeSessions = env("DB_WRITE_SESSIONS").flatMap(_.toIntOption).getOrElse(4),
+      readSessions = env("DB_READ_SESSIONS").flatMap(_.toIntOption).getOrElse(32),
+      writeSessions = env("DB_WRITE_SESSIONS").flatMap(_.toIntOption).getOrElse(8),
       bcryptThreads = env("BCRYPT_THREADS").flatMap(_.toIntOption).getOrElse((cores / 2).max(1)),
       maxConnections = env("MAX_CONNECTIONS").flatMap(_.toIntOption).getOrElse(150_000)
     )
@@ -48,6 +48,15 @@ object Main extends IOApp.Simple:
   // The server is CPU-bound by design; the starvation checker's warnings would only add noise under load.
   override protected def runtimeConfig =
     super.runtimeConfig.copy(cpuStarvationCheckInitialDelay = Duration.Inf)
+
+  /** Half the cores: Postgres runs on the same box and needs the rest (measured: 4 of 8 cores beat 6 and 8 on both CPU
+    * per request and tail latency). `COMPUTE_THREADS` overrides it.
+    */
+  override protected def computeWorkerThreadCount: Int =
+    sys.env
+      .get("COMPUTE_THREADS")
+      .flatMap(_.toIntOption)
+      .getOrElse((Runtime.getRuntime.availableProcessors / 2).max(2))
 
   // No tracing or metrics: skunk instruments every statement through otel4s, and the no-op providers plus disabled
   // pool and protocol spans make that free.
