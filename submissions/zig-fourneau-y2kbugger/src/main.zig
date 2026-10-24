@@ -23,13 +23,24 @@ const Tuning = struct {
     bcrypt_workers: u32 = 4,
     /// Per shard: Postgres connections for reads and for writes (writes
     /// wait for their commit's flush, so reads never queue behind one).
-    /// 6 and 9 measured alike on 4 CPUs (13,904 and 13,947 req/s at
-    /// saturation), 3 too few; the box runs Postgres on twice the CPUs.
-    reads: u32 = 8,
+    /// Reads from the CPUs the process may run on (`reads_for`).
+    reads: u32,
     writes: u32 = 2,
 
+    /// A statement in flight past those that keep Postgres busy is
+    /// contention, and batches shrink. On 4 CPUs at 58k users, 2 a shard
+    /// against 3, 4 and 8: p95 105-148 ms against 118-194, 148-204 and
+    /// 139-234 (and on a database aged by 20 minutes of writes, 146-187
+    /// against 189-254 and 191-267); 1 left CPUs idle (p95 460). Postgres
+    /// takes ~5.6 of the box's 8 CPUs at its limit: 5 a shard there, a
+    /// margin over the 4 of the same ratio.
+    fn reads_for(cpus: usize) u32 {
+        return @intCast(@max(2, cpus * 5 / 8));
+    }
+
     fn from(environ: std.process.Environ) !Tuning {
-        var tuning: Tuning = .{};
+        const cpus = std.Thread.getCpuCount() catch 8;
+        var tuning: Tuning = .{ .reads = reads_for(cpus) };
         inline for (.{ "shards", "bcrypt_workers", "reads", "writes" }) |name| {
             var key: [64]u8 = undefined;
             const upper = std.ascii.upperString(&key, "CONDUIT_" ++ name);
