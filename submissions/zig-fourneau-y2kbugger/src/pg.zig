@@ -288,6 +288,8 @@ pub const Connection = struct {
     /// The batch in flight, for a connection the shard's batches use: one
     /// at a time.
     batch: Batch = .{},
+    /// The batches' own mark: the kind it last ran (batch.zig).
+    last_kind: u8 = std.math.maxInt(u8),
 
     pub fn init(gpa: std.mem.Allocator, io: Io, fd: linux.fd_t, url: Url, statements: []const Statement) !Connection {
         return .{
