@@ -110,6 +110,33 @@ pub fn pct_decode_test() {
   assert util.decode_segment("") == Error(Nil)
 }
 
+// The C decoders agree with the Gleam ones, including on NULLs, empty values, truncation and empty arrays.
+pub fn decode_nif_test() {
+  let rows = [
+    <<2:size(16), 8:size(32), 42:size(64), -1:size(32)>>,
+    <<0:size(16)>>,
+    <<3:size(16), 0:size(32), -1:size(32), 5:size(32), "hello":utf8>>,
+    <<1:size(16), 3:size(32), "ab":utf8>>,
+    <<2:size(16), 1:size(32), "a":utf8>>,
+    <<>>,
+    <<7>>,
+  ]
+  list.each(rows, fn(r) { assert proto.data_row(r) == proto.data_row_gleam(r) })
+  let big = list.repeat(<<300:size(32), 0:size(2400)>>, 14) |> bit_array.concat
+  let row = <<14:size(16), big:bits>>
+  assert proto.data_row(row) == proto.data_row_gleam(row)
+  assert list.length(proto.data_row(row)) == 14
+  let arrays = [
+    Some(<<1:size(32), 0:size(32), 25:size(32), 2:size(32), 1:size(32), 1:size(32), "a":utf8, 2:size(32), "bc":utf8>>),
+    Some(<<1:size(32), 1:size(32), 25:size(32), 3:size(32), 1:size(32), -1:size(32), 0:size(32), 1:size(32), "x":utf8>>),
+    Some(<<0:size(32), 0:size(32), 25:size(32)>>),
+    Some(<<1:size(32), 0:size(32), 25:size(32), 2:size(32), 1:size(32), 1:size(32), "a":utf8, 9:size(32), "short":utf8>>),
+    Some(<<>>),
+    None,
+  ]
+  list.each(arrays, fn(a) { assert proto.col_text_array(a) == proto.col_text_array_gleam(a) })
+}
+
 pub fn proto_test() {
   let row = <<2:size(16), 8:size(32), 42:size(64), -1:size(32)>>
   let message = <<"D":utf8, { bit_array.byte_size(row) + 4 }:size(32), row:bits, "Z":utf8, 5:size(32), "I":utf8>>

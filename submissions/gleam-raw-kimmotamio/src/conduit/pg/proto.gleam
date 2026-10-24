@@ -177,7 +177,12 @@ pub fn next_message(buf: BitArray) -> Result(#(Int, BitArray, BitArray), Nil) {
   }
 }
 
-pub fn data_row(payload: BitArray) -> Row {
+/// Decodes a DataRow body into its columns (sub-binaries of the socket buffer; a NIF, see native/conduit_nif.c).
+@external(erlang, "conduit_nif", "decode_row")
+pub fn data_row(payload: BitArray) -> Row
+
+/// The same decoding in Gleam: the reference the tests hold the NIF to.
+pub fn data_row_gleam(payload: BitArray) -> Row {
   case payload {
     <<n:size(16), rest:bytes>> -> columns(rest, n, [])
     _ -> []
@@ -274,8 +279,19 @@ pub fn col_opt_text(c: Option(BitArray)) -> Option(BitArray) {
   c
 }
 
-/// A one-dimensional `text[]` in binary format.
+/// A one-dimensional `text[]` in binary format (a NIF, see native/conduit_nif.c).
 pub fn col_text_array(c: Option(BitArray)) -> List(BitArray) {
+  case c {
+    Some(bin) -> decode_text_array(bin)
+    None -> []
+  }
+}
+
+@external(erlang, "conduit_nif", "decode_text_array")
+fn decode_text_array(bin: BitArray) -> List(BitArray)
+
+/// The same decoding in Gleam: the reference the tests hold the NIF to.
+pub fn col_text_array_gleam(c: Option(BitArray)) -> List(BitArray) {
   case c {
     Some(<<0:size(32), _:bytes>>) -> []
     Some(<<1:size(32), _flags:size(32), _oid:size(32), n:size(32), _lb:size(32), rest:bytes>>) ->

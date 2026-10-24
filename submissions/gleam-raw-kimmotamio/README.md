@@ -34,10 +34,13 @@ one BEAM process per Postgres connection.
   process's heap holds only the request, and the Postgres side's long-lived heaps absorb the garbage with cheap
   generational collections. The connection process writes a response itself when no query was needed (errors,
   bad tokens), for the few flows that need the rows for a follow-up statement (login, ownership probes, article
-  creation), and when the Postgres side found the client socket busy and handed the bytes back rather than wait
-  on a client (the socket watermarks are set so that never happens for a client that reads). Pipelined requests
-  are served from the same buffer. Between requests a connection process hibernates when its heap has grown
-  past `HIB_WORDS` words; connections are never closed by the server (keep-alive forever).
+  creation), and when the Postgres side found an earlier response still unread in the socket and handed the bytes
+  back rather than wait on a client: the shared process only ever writes into an empty socket queue, which the
+  driver answers at once, so a client that stops reading blocks its own connection process and nothing else, as
+  before. Pipelined requests are served from the same buffer. A connection process is spawned with a 1598-word
+  heap (`MIN_HEAP`), enough for a request without growing in collected steps, and hibernates only after a request
+  that grew it past `HIB_WORDS` (4500): about 28 KB per idle connection all told. Connections are never closed by
+  the server (keep-alive forever).
 - **Postgres** (`src/conduit/pg/`): a minimal protocol 3.0 client. Startup with session options
   (`jit=off`, `max_parallel_workers_per_gather=0`, `enable_memoize=off`, `plan_cache_mode=force_generic_plan`;
   the generic plan of every statement has the same shape as its custom plan, checked with `EXPLAIN` for all 35,
