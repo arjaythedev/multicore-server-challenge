@@ -294,9 +294,9 @@ final class Api(db: Db, jwt: Jwt, bcryptPool: ExecutionContext):
     case request @ GET -> Root / "api" / "articles" / slug / "comments" =>
       for
         viewer <- viewer(request)
-        comments <- db.read.use(session =>
-          articleId(session, slug).flatMap(id => session.execute(Sql.comments)((viewer, id)))
-        )
+        rows <- db.read.use(_.execute(Sql.commentsBySlug)((viewer, slug)))
+        _ <- IO.raiseWhen(rows.isEmpty)(ApiError.notFound("article"))
+        comments = rows.flatMap(_._2)
         response <- ok("comments", comments.map(_.toComment))
       yield response
 

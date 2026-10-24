@@ -147,96 +147,103 @@ object Sql:
 
   // Articles
 
-  // Page first: the global and author lists cut the page from `articles` alone, then decorate only those rows. The
-  // reference (`ARTICLE_LIST_SELECT ... ORDER_PAGE`) also decorates every row that OFFSET skips (tags, favorite
-  // count, following): about 4x the time on page 5. The inner `LIMIT 100` is a constant on purpose (`limit` is at
-  // most 100, so the rows are the same): with `LIMIT $n` the generic plan picks a 2x slower plan for the author list.
+  // Lists: one statement per request. The capped count is the single outer row and the page joins it laterally, so
+  // an empty page (an unknown tag, or an offset past the end) still carries the count. This replaces the reference's
+  // two statements (page, then count): the same work for Postgres, one exchange less for the app.
+  //
+  // The global and author pages are also cut page first: the ids come from `articles` alone and only the returned
+  // rows are decorated. The reference also decorates every row OFFSET skips (tags, favorite count, following): about
+  // 4x the time on page 5. Their inner `LIMIT 100` is a constant on purpose (`limit` is at most 100, so the rows are
+  // the same): with `LIMIT $n` the generic plan picks a 2x slower plan for the author list.
 
-  /** The global list, page first. Replaces `ARTICLE_LIST_SELECT ORDER_PAGE`. */
-  private val listAll: Query[(Long, Int, Int), ArticleRow] =
-    sql"""$listColumns
-            FROM (SELECT id, slug, title, description, created_at, updated_at, author_id
-                    FROM articles ORDER BY id DESC OFFSET $int4 LIMIT 100) a
-            JOIN users u ON u.id = a.author_id
-           ORDER BY a.id DESC LIMIT $int4"""
-      .query(article)
+  private type Counted = (Long, Option[ArticleRow])
+
+  private val counted: Decoder[Counted] = int8 *: article.opt
+
+  /** The global list. Replaces `ARTICLE_LIST_SELECT ORDER_PAGE` and its count. */
+  private val listAll: Query[(Long, Int, Int), Counted] =
+    sql"""SELECT c.total, p.*
+            FROM (SELECT count(*) FROM (SELECT 1 FROM articles a LIMIT 1000) s) c(total)
+            LEFT JOIN LATERAL (
+              $listColumns
+                FROM (SELECT id, slug, title, description, created_at, updated_at, author_id
+                        FROM articles ORDER BY id DESC OFFSET $int4 LIMIT 100) a
+                JOIN users u ON u.id = a.author_id
+               ORDER BY a.id DESC LIMIT $int4) p ON true
+           ORDER BY p.id DESC"""
+      .query(counted)
       .contramap[(Long, Int, Int)]((viewer, limit, offset) => (viewer, offset, limit))
 
-  private val listByTag: Query[(Long, String, Int, Int), ArticleRow] =
-    sql"""$listSelect WHERE a.id IN (SELECT at.article_id FROM article_tags at
-                        WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = $text)
-                        ORDER BY at.article_id DESC LIMIT $int4 OFFSET $int4)
-          ORDER BY a.id DESC""".query(article)
+  /** The `tag` list (already page first in the reference). Replaces its page and count statements. */
+  private val listByTag: Query[(Long, String, Int, Int), Counted] =
+    sql"""SELECT c.total, p.*
+            FROM (SELECT count(*) FROM (SELECT 1 FROM article_tags at
+                    WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = $text) LIMIT 1000) s) c(total)
+            LEFT JOIN LATERAL (
+              $listSelect WHERE a.id IN (SELECT at.article_id FROM article_tags at
+                                WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = $text)
+                                ORDER BY at.article_id DESC LIMIT $int4 OFFSET $int4)) p ON true
+           ORDER BY p.id DESC"""
+      .query(counted)
+      .contramap[(Long, String, Int, Int)]((viewer, tag, limit, offset) => (tag, viewer, tag, limit, offset))
 
-  /** The author's list, page first. Replaces `ARTICLE_LIST_SELECT WHERE a.author_id = ... ORDER_PAGE`. */
-  private val listByAuthor: Query[(Long, String, Int, Int), ArticleRow] =
-    sql"""$listColumns
-            FROM (SELECT id, slug, title, description, created_at, updated_at, author_id
-                    FROM articles WHERE author_id = (SELECT au.id FROM users au WHERE au.username = $text)
-                   ORDER BY id DESC OFFSET $int4 LIMIT 100) a
-            JOIN users u ON u.id = a.author_id
-           ORDER BY a.id DESC LIMIT $int4"""
-      .query(article)
-      .contramap[(Long, String, Int, Int)]((viewer, author, limit, offset) => (viewer, author, offset, limit))
+  /** The `author` list, page first. Replaces `ARTICLE_LIST_SELECT WHERE a.author_id = ... ORDER_PAGE` and its count. */
+  private val listByAuthor: Query[(Long, String, Int, Int), Counted] =
+    sql"""SELECT c.total, p.*
+            FROM (SELECT count(*) FROM (SELECT 1 FROM articles a
+                    WHERE a.author_id = (SELECT u.id FROM users u WHERE u.username = $text) LIMIT 1000) s) c(total)
+            LEFT JOIN LATERAL (
+              $listColumns
+                FROM (SELECT id, slug, title, description, created_at, updated_at, author_id
+                        FROM articles WHERE author_id = (SELECT au.id FROM users au WHERE au.username = $text)
+                       ORDER BY id DESC OFFSET $int4 LIMIT 100) a
+                JOIN users u ON u.id = a.author_id
+               ORDER BY a.id DESC LIMIT $int4) p ON true
+           ORDER BY p.id DESC"""
+      .query(counted)
+      .contramap[(Long, String, Int, Int)]((viewer, author, limit, offset) => (author, viewer, author, offset, limit))
 
-  private val listByFavorited: Query[(Long, String, Int, Int), ArticleRow] =
-    sql"""$listSelect WHERE a.id IN (SELECT f.article_id FROM favorites f
-                        WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = $text)
-                        ORDER BY f.article_id DESC LIMIT $int4 OFFSET $int4)
-          ORDER BY a.id DESC""".query(article)
+  /** The `favorited` list (already page first in the reference). Replaces its page and count statements. */
+  private val listByFavorited: Query[(Long, String, Int, Int), Counted] =
+    sql"""SELECT c.total, p.*
+            FROM (SELECT count(*) FROM (SELECT 1 FROM favorites f
+                    WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = $text) LIMIT 1000) s) c(total)
+            LEFT JOIN LATERAL (
+              $listSelect WHERE a.id IN (SELECT f.article_id FROM favorites f
+                                WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = $text)
+                                ORDER BY f.article_id DESC LIMIT $int4 OFFSET $int4)) p ON true
+           ORDER BY p.id DESC"""
+      .query(counted)
+      .contramap[(Long, String, Int, Int)]((viewer, user, limit, offset) => (user, viewer, user, limit, offset))
 
-  private val countAll: Query[Void, Long] =
-    sql"SELECT count(*) FROM (SELECT 1 FROM articles a LIMIT 1000) s".query(int8)
+  /** The feed (already page first in the reference). Replaces its page and count statements. */
+  private val feedPage: Query[(Long, Int, Int), Counted] =
+    sql"""SELECT c.total, p.*
+            FROM (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id IN
+                    (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $int8) LIMIT 1000) s) c(total)
+            LEFT JOIN LATERAL (
+              $listSelect WHERE a.id IN (SELECT x.id FROM follows fo CROSS JOIN LATERAL
+                  (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id
+                    ORDER BY a2.id DESC LIMIT ($int4::int + $int4::int)) x
+                 WHERE fo.follower_id = $int8 ORDER BY x.id DESC LIMIT $int4 OFFSET $int4)) p ON true
+           ORDER BY p.id DESC"""
+      .query(counted)
+      .contramap[(Long, Int, Int)]((viewer, limit, offset) => (viewer, viewer, limit, offset, viewer, limit, offset))
 
-  private val countByTag: Query[String, Long] =
-    sql"""SELECT count(*) FROM (SELECT 1 FROM article_tags at
-            WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = $text) LIMIT 1000) s""".query(int8)
+  private def page(rows: List[Counted]): (List[ArticleRow], Long) =
+    (rows.flatMap(_._2), rows.headOption.fold(0L)(_._1))
 
-  private val countByAuthor: Query[String, Long] =
-    sql"""SELECT count(*) FROM (SELECT 1 FROM articles a
-            WHERE a.author_id = (SELECT u.id FROM users u WHERE u.username = $text) LIMIT 1000) s""".query(int8)
+  /** The page and the capped count. Only the first filter given applies. */
+  def articles(session: Session[IO], viewer: Long, filter: Filter, p: Page): IO[(List[ArticleRow], Long)] =
+    val rows = filter match
+      case Filter.All                 => session.execute(listAll)((viewer, p.limit, p.offset))
+      case Filter.Tag(name)           => session.execute(listByTag)((viewer, name, p.limit, p.offset))
+      case Filter.Author(username)    => session.execute(listByAuthor)((viewer, username, p.limit, p.offset))
+      case Filter.Favorited(username) => session.execute(listByFavorited)((viewer, username, p.limit, p.offset))
+    rows.map(page)
 
-  private val countByFavorited: Query[String, Long] =
-    sql"""SELECT count(*) FROM (SELECT 1 FROM favorites f
-            WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = $text) LIMIT 1000) s""".query(int8)
-
-  /** The page and the capped count, on one session. Only the first filter given applies. */
-  def articles(session: Session[IO], viewer: Long, filter: Filter, page: Page): IO[(List[ArticleRow], Long)] =
-    filter match
-      case Filter.All =>
-        (session.execute(listAll)((viewer, page.limit, page.offset)), session.unique(countAll)).tupled
-      case Filter.Tag(name) =>
-        (
-          session.execute(listByTag)((viewer, name, page.limit, page.offset)),
-          session.unique(countByTag)(name)
-        ).tupled
-      case Filter.Author(username) =>
-        (
-          session.execute(listByAuthor)((viewer, username, page.limit, page.offset)),
-          session.unique(countByAuthor)(username)
-        ).tupled
-      case Filter.Favorited(username) =>
-        (
-          session.execute(listByFavorited)((viewer, username, page.limit, page.offset)),
-          session.unique(countByFavorited)(username)
-        ).tupled
-
-  private val feedPage: Query[(Long, Int, Int, Long, Int, Int), ArticleRow] =
-    sql"""$listSelect WHERE a.id IN (SELECT x.id FROM follows fo CROSS JOIN LATERAL
-            (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id
-              ORDER BY a2.id DESC LIMIT ($int4::int + $int4::int)) x
-           WHERE fo.follower_id = $int8 ORDER BY x.id DESC LIMIT $int4 OFFSET $int4)
-          ORDER BY a.id DESC""".query(article)
-
-  private val feedCount: Query[Long, Long] =
-    sql"""SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id IN
-            (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $int8) LIMIT 1000) s""".query(int8)
-
-  def feed(session: Session[IO], viewer: Long, page: Page): IO[(List[ArticleRow], Long)] =
-    (
-      session.execute(feedPage)((viewer, page.limit, page.offset, viewer, page.limit, page.offset)),
-      session.unique(feedCount)(viewer)
-    ).tupled
+  def feed(session: Session[IO], viewer: Long, p: Page): IO[(List[ArticleRow], Long)] =
+    session.execute(feedPage)((viewer, p.limit, p.offset)).map(page)
 
   val articleBySlug: Query[(Long, String), ArticleRow] = sql"$fullSelect WHERE a.slug = $text".query(article)
 
@@ -290,13 +297,21 @@ object Sql:
 
   // Comments
 
-  val comments: Query[(Long, Long), CommentRow] =
-    sql"""SELECT c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image,
-                 EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $int8 AND fo.followee_id = c.author_id)
-            FROM comments c JOIN users u ON u.id = c.author_id
-           WHERE c.article_id = $int8
-           ORDER BY c.created_at DESC, c.id DESC
-           LIMIT 100""".query(comment)
+  /** The article and its newest 100 comments in one statement: no row means no such article (404), a single row without
+    * a comment means no comments. Replaces the reference's article-id lookup followed by the comments query.
+    */
+  val commentsBySlug: Query[(Long, String), (Long, Option[CommentRow])] =
+    sql"""SELECT a.id, c.*
+            FROM articles a
+            LEFT JOIN LATERAL (
+              SELECT c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image,
+                     EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $int8 AND fo.followee_id = c.author_id)
+                FROM comments c JOIN users u ON u.id = c.author_id
+               WHERE c.article_id = a.id
+               ORDER BY c.created_at DESC, c.id DESC
+               LIMIT 100) c ON true
+           WHERE a.slug = $text
+           ORDER BY c.created_at DESC, c.id DESC""".query(int8 *: comment.opt)
 
   val insertComment: Query[(Long, Long, String), CommentRow] =
     sql"""WITH c AS (INSERT INTO comments (article_id, author_id, body) VALUES ($int8, $int8, $text)
