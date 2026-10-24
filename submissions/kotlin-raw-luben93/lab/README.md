@@ -73,7 +73,8 @@ fds (like the box's systemd unit) and the load generator 1048576.
 
 All from the repo root. Each `bench.sh` line prints req/s, p50/p95/p99, errors, app and Postgres CPU (% of one
 core, and µs per request), app RSS and fds, pass/fail, and loadgen CPU (`lg_limited=True` means the load generator,
-not the server, was the limit: give it more cores). Lines are appended to `lab/results/ALL.txt`.
+not the server, was the limit: give it more cores). Lines are appended to `lab/results/ALL.txt`; raw run data goes to
+`lab/results/runs/` (the repo's .gitignore ignores every `results/` directory, so none of that is committed).
 
 **A. Calibration** (do this first, it tells us how this machine compares with the box). Real think times
 (`think-scale 1.0`), users = connections:
@@ -110,8 +111,7 @@ ulimit -n 1048576; taskset -c "$LG_CPUS" /tmp/connstress -target 127.0.0.1:3000 
 
 ## 4. Reporting
 
-Write `submissions/kotlin-raw-luben93/lab/results/<machine>-<YYYYMMDD>.md` with the machine description (section 1
-output, which CPUs you used for what), Postgres version, anything you had to change, and every result line
-(copy `lab/results/ALL.txt`). Then commit it (with `lab/results/ALL.txt`) on a branch named `lab-results`, branched
-from `kotlin-raw-luben93`, and push it. Don't commit `lab/results/runs/` (raw JSON, large). Don't push to
-`kotlin-raw-luben93` itself; that branch is being developed.
+Write `submissions/kotlin-raw-luben93/lab/reports/<machine>-<YYYYMMDD>.md` with the machine description (section 1
+output, which CPUs you used for what), Postgres version, anything you had to change, and every result line (paste
+`lab/results/ALL.txt` into it). Commit it on a branch named `lab-results`, branched from `kotlin-raw-luben93`, and
+push. Don't push to `kotlin-raw-luben93` itself; that branch is being developed.
