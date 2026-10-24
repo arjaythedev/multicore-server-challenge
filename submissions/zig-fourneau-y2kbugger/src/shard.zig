@@ -176,7 +176,7 @@ fn run_or_fail(options: Options) !noreturn {
     var group: Io.Group = .init;
     for ([_][]pg.Connection{ shard.read_connections, shard.write_connections }) |connections| {
         for (connections) |*connection| {
-            const fd = try pg.connect_blocking(options.url, statements);
+            const fd = try pg.connect_at_start(options.url, statements);
             connection.* = try .init(gpa, io, fd, options.url, statements);
         }
     }

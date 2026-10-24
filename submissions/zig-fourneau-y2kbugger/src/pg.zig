@@ -817,6 +817,24 @@ const session_settings = [_][2][]const u8{
 
 /// Connect, authenticate (trust or SCRAM-SHA-256), and prepare every
 /// statement as `s<index>`: blocking system calls.
+/// At startup, before the shard serves: 15 tries a second apart, so a
+/// Postgres just restarted on a cold page cache (its first statements read
+/// the catalog from disk) or not yet listening is waited for, not a crash.
+/// A refused connect fails at once; one that hangs, after 2 s.
+pub fn connect_at_start(url: Url, statements: []const Statement) !linux.fd_t {
+    const tries = 15;
+    for (0..tries) |attempt| {
+        return connect_blocking(url, statements) catch |err| {
+            log.err("connect at start, try {d} of {d}: {t}", .{ attempt + 1, tries, err });
+            if (attempt + 1 == tries) return err;
+            const second: linux.timespec = .{ .sec = 1, .nsec = 0 };
+            _ = linux.nanosleep(&second, null);
+            continue;
+        };
+    }
+    unreachable;
+}
+
 pub fn connect_blocking(url: Url, statements: []const Statement) !linux.fd_t {
     const fd: linux.fd_t = @intCast(linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0));
     if (fd < 0) return error.Socket;
@@ -858,7 +876,8 @@ const Blocking = struct {
         var sent: usize = 0;
         for (0..bytes.len + 1) |_| {
             if (sent == bytes.len) return;
-            const result = linux.write(stream.fd, bytes[sent..].ptr, bytes.len - sent);
+            // No SIGPIPE if Postgres has closed it: an error, as the ring's sends.
+            const result = linux.sendto(stream.fd, bytes[sent..].ptr, bytes.len - sent, linux.MSG.NOSIGNAL, null, 0);
             if (linux.errno(result) != .SUCCESS or result == 0) return error.Write;
             sent += result;
         } else unreachable;
