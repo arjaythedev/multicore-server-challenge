@@ -20,7 +20,7 @@ const bcrypt_workers = 2;
 /// for their commit's flush, so reads never queue behind one), and the
 /// requests in flight at most.
 const reads_per_shard = 6;
-const writes_per_shard = 3;
+const writes_per_shard = 2;
 const slots_per_shard = 2048;
 /// Per shard: the service's 200,000 descriptors, less Postgres's and a margin.
 const connections_per_shard = 98 * 1024;

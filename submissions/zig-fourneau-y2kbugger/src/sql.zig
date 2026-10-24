@@ -129,6 +129,7 @@ pub const S = enum(u16) {
     batch_comments,
     batch_profile,
     batch_user,
+    batch_login,
     batch_tags,
     batch_list_all,
     batch_count_all,
@@ -345,6 +346,11 @@ pub const statements = std.enums.EnumArray(S, pg.Statement).init(.{
         .sql = "SELECT r.i, u.username, u.email, u.bio, u.image " ++
             "FROM unnest($1::int4[], $2::int8[]) AS r(i, v) JOIN users u ON u.id = r.v",
         .params = &.{ .int4_array, .int8_array },
+    },
+    .batch_login = .{
+        .sql = "SELECT r.i, u.id, u.username, u.email, u.bio, u.image, u.password_hash " ++
+            batch_keys ++ " JOIN users u ON u.email = r.k",
+        .params = batch_key_params,
     },
     // `r.i >= 0` names the request: the tags are read for each.
     .batch_tags = .{

@@ -219,23 +219,37 @@ const Slot = struct {
     }
 };
 
-/// A request's own group, for what is not batched: a slot, a connection,
-/// the statements.
+/// A request's own statements, for what is not a batched read: writes,
+/// sent with the others waiting (batch.zig: one commit for the group), and
+/// the rare reads among them. Encoded into the slot's output, which the
+/// response is written over once the answers are in.
 const Group = struct {
     slot: Slot,
-    query: pg.Query,
+    encoded: pg.Encoded,
+    pending: batch.Write = undefined,
 
     fn begin(context: *Context) Group {
         const slot: Slot = .acquire(context);
-        return .{ .slot = slot, .query = .init(context.shard.pick_write(), slot.rows()) };
+        return .{ .slot = slot, .encoded = .init(context.shard.slots.output(slot.index)) };
     }
 
     fn run(group: *Group, statement: S, params: []const pg.Param) void {
-        group.query.run(@intFromEnum(statement), params);
+        group.encoded.run(&sql.statements.values, @intFromEnum(statement), params);
     }
 
+    /// In place: the group's queue points at `pending`.
     fn wait(group: *Group) pg.Results {
-        return group.query.wait();
+        group.pending = .{
+            .waiter = .{ .rows = group.slot.rows() },
+            .encoded = "",
+            .statements = group.encoded.statements,
+        };
+        group.pending.encoded = group.encoded.bytes() orelse {
+            group.pending.waiter.failure = .overflow;
+            group.pending.waiter.done = true;
+            return .{ .waiter = &group.pending.waiter };
+        };
+        return group.slot.context.shard.writes.write(&group.pending);
     }
 
     fn out(group: *Group) Out {
@@ -426,19 +440,21 @@ fn login(context: *Context) Response {
     const body = parse(context, "user", "") orelse return unprocessable;
     const email = body.required("email") orelse return failure(422, "email and password are required");
     const secret = body.required("password") orelse return failure(422, "email and password are required");
-    var group: Group = .begin(context);
-    group.run(.user_by_email, &.{.{ .text = email }});
-    const results = group.wait();
-    if (results.waiter.failure != null) return group.finish(internal);
-    const row = results.rows(0).first() orelse return group.finish(failure(401, "invalid email or password"));
+    var read: Read = undefined;
+    const results = read.run(context, .login, .{ .waiter = undefined, .key = email });
+    if (results.waiter.failure != null) return read.slot.finish(internal);
+    const invalid = failure(401, "invalid email or password");
+    const row = results.rows(0).first() orelse return read.slot.finish(invalid);
+    // bcrypt reads 72 bytes: no stored hash matches a longer password.
+    if (secret.len > password.password_bytes_max) return read.slot.finish(invalid);
     var job: password.Job = .{ .kind = .verify, .password = secret, .stored = row.text(5) };
     context.shard.passwords.run(context.shard.io, &job);
-    if (!job.matched) return group.finish(failure(401, "invalid email or password"));
+    if (!job.matched) return read.slot.finish(invalid);
     var token: [jwt.token_bytes_max]u8 = undefined;
     const issued = jwt.issue(context.shard.key, row.int8(0), now_s(), &token);
-    var out = group.out();
+    var out = read.slot.out();
     write_user(&out, row.text(2), issued, row.text(1), row.text_or_null(3), row.text_or_null(4));
-    return group.respond(200, &out);
+    return read.slot.respond(200, &out);
 }
 
 fn optional_param(value: json.Body.Optional) pg.Param {

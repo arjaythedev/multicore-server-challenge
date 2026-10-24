@@ -52,13 +52,18 @@ pub const Param = union(enum) {
 /// one at a time; the article by slug, 2026-10-23).
 pub const batch_max = 32;
 
-/// A group's requests: one, or a batch, whose rows each name their request
-/// by their first column (an int4, its index into `waiters`), taken off as
-/// the row is kept.
+/// A group's requests: one; or a batch of reads, whose rows each name
+/// their request by their first column (an int4, its index into
+/// `waiters`), taken off as the row is kept (`tagged`); or a sequence of
+/// requests' statements, `statements[w]` of them for waiter `w`, in order,
+/// all in the group's one transaction (writes: one commit for all).
 pub const Batch = struct {
     waiters: [batch_max]*Waiter = undefined,
     count: u8 = 0,
     tagged: bool = false,
+    statements: [batch_max]u8 = undefined,
+    /// The waiter whose statements are being answered (a sequence).
+    cursor: u8 = 0,
 };
 
 /// Called when a connection has nothing in flight: the shard's batches go
@@ -262,11 +267,18 @@ pub const Connection = struct {
     /// waiter): its calls, then Sync. False: it could not be sent, and
     /// every waiter has its failure already.
     pub fn send(connection: *Connection, batch: *Batch, calls: []const Call) bool {
+        return connection.send_parts(batch, calls, &.{});
+    }
+
+    /// As `send`, the calls followed by messages encoded already (each a
+    /// request's `Encoded`), all before the one Sync.
+    pub fn send_parts(connection: *Connection, batch: *Batch, calls: []const Call, parts: []const []const u8) bool {
         assert(batch.count > 0);
         const index = connection.filling;
         const start = connection.output_used[index];
         var out: Writer = .{ .buffer = connection.output[index], .used = start };
         for (calls) |call| out.call(connection.statements, call);
+        for (parts) |part| out.bytes(part);
         const sync = out.begin('S');
         out.end(sync);
         var failure: ?Failure = null;
@@ -353,12 +365,22 @@ pub const Connection = struct {
                 std.mem.writeInt(u16, &header, count - 1, .big);
                 keep_row(waiters[@intCast(tag)], &header, body[10..]);
             } else {
-                keep_row(waiters[0], body[0..2], body[2..]);
+                if (batch.cursor >= batch.count) return error.Protocol;
+                keep_row(waiters[batch.cursor], body[0..2], body[2..]);
             },
-            'C' => for (waiters) |waiter| {
+            'C' => if (batch.tagged) {
+                for (waiters) |waiter| {
+                    if (waiter.statements == group_statements_max) return error.Protocol;
+                    waiter.ends[waiter.statements] = waiter.rows_used;
+                    waiter.statements += 1;
+                }
+            } else {
+                if (batch.cursor >= batch.count) return error.Protocol;
+                const waiter = waiters[batch.cursor];
                 if (waiter.statements == group_statements_max) return error.Protocol;
                 waiter.ends[waiter.statements] = waiter.rows_used;
                 waiter.statements += 1;
+                if (waiter.statements == batch.statements[batch.cursor]) batch.cursor += 1;
             },
             'E' => {
                 const state = sqlstate(body);
@@ -439,55 +461,26 @@ fn keep_row(waiter: *Waiter, header: []const u8, columns: []const u8) void {
     waiter.rows_used += @intCast(4 + length);
 }
 
-/// One request's group, written into the output as its calls come (no
-/// wait in between: groups never interleave), then `wait`.
-pub const Query = struct {
-    connection: *Connection,
-    waiter: Waiter,
-    batch: Batch = .{},
-    /// Where the group starts in the output, to take it back if it fails.
-    start: u32,
-    overflow: bool = false,
+/// A request's statements, encoded once (Binds and Executes, no Sync):
+/// what a sequence of requests carries, and what a request sent again alone
+/// sends again.
+pub const Encoded = struct {
+    out: Writer,
+    statements: u8 = 0,
 
-    pub fn init(connection: *Connection, rows: []u8) Query {
-        return .{
-            .connection = connection,
-            .waiter = .{ .rows = rows },
-            .start = connection.output_used[connection.filling],
-        };
+    pub fn init(buffer: []u8) Encoded {
+        return .{ .out = .{ .buffer = buffer, .used = 0 } };
     }
 
-    /// Bind and Execute one statement with its parameters.
-    pub fn run(query: *Query, statement: u16, params: []const Param) void {
-        const connection = query.connection;
-        const index = connection.filling;
-        var out: Writer = .{ .buffer = connection.output[index], .used = connection.output_used[index] };
-        out.overflow = query.overflow;
-        out.call(connection.statements, .{ .statement = statement, .params = params });
-        query.overflow = out.overflow;
-        if (!out.overflow) connection.output_used[index] = @intCast(out.used);
+    pub fn run(encoded: *Encoded, statements: []const Statement, statement: u16, params: []const Param) void {
+        assert(encoded.statements < group_statements_max);
+        encoded.out.call(statements, .{ .statement = statement, .params = params });
+        encoded.statements += 1;
     }
 
-    /// Sync, send, and wait for the answers: the group's transaction is
-    /// committed (or rolled back) when this returns. In place: the batch
-    /// points at the query's waiter.
-    pub fn wait(query: *Query) Results {
-        const connection = query.connection;
-        query.batch = .{ .count = 1 };
-        query.batch.waiters[0] = &query.waiter;
-        if (query.overflow) {
-            connection.output_used[connection.filling] = query.start;
-            query.waiter.failure = .overflow;
-            query.waiter.done = true;
-            return .{ .waiter = &query.waiter };
-        }
-        if (connection.send(&query.batch, &.{})) {
-            if (!query.waiter.done) Evented.park(connection.io, &query.waiter.parked);
-        } else {
-            connection.output_used[connection.filling] = query.start;
-        }
-        assert(query.waiter.done);
-        return .{ .waiter = &query.waiter };
+    pub fn bytes(encoded: *const Encoded) ?[]const u8 {
+        if (encoded.out.overflow) return null;
+        return encoded.out.buffer[0..encoded.out.used];
     }
 };
 

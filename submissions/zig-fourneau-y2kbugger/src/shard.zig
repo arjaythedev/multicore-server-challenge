@@ -126,30 +126,14 @@ pub const Shard = struct {
     /// The batched reads (batch.zig) and the connections they go out on.
     reads: batch.Reads = undefined,
     read_connections: []pg.Connection,
-    /// Everything else: writes (each waits for its commit's flush, so reads
-    /// never queue behind one) and the rare reads not batched.
-    writes: []pg.Connection,
-    /// Rotates the ties of `pick`.
-    rotation: u32 = 0,
+    /// Everything else, in groups of one commit (batch.zig): writes (each
+    /// waits for its commit's flush, so reads never queue behind one) and
+    /// the rare reads not batched.
+    writes: batch.Writes = undefined,
+    write_connections: []pg.Connection,
     slots: Slots,
     jwt_memory: []u8,
     json_memory: []u8,
-
-    pub fn pick_write(shard: *Shard) *pg.Connection {
-        return pick(shard, shard.writes);
-    }
-
-    /// The connection with the fewest requests in flight, broken ones last.
-    fn pick(shard: *Shard, connections: []pg.Connection) *pg.Connection {
-        assert(connections.len > 0);
-        shard.rotation +%= 1;
-        var best: *pg.Connection = &connections[shard.rotation % connections.len];
-        for (connections) |*connection| {
-            if (connection.broken) continue;
-            if (best.broken or connection.load() < best.load()) best = connection;
-        }
-        return best;
-    }
 };
 
 pub fn run(options: Options) void {
@@ -184,21 +168,22 @@ fn run_or_fail(options: Options) !noreturn {
         .key = options.key,
         .passwords = options.passwords,
         .read_connections = try gpa.alloc(pg.Connection, options.reads),
-        .writes = try gpa.alloc(pg.Connection, options.writes),
+        .write_connections = try gpa.alloc(pg.Connection, options.writes),
         .slots = try .init(gpa, options.slots, 256 * 1024, 128 * 1024),
         .jwt_memory = try gpa.alloc(u8, jwt.memory_bytes),
         .json_memory = try gpa.alloc(u8, 256 * 1024),
     };
     const statements = &sql.statements.values;
     var group: Io.Group = .init;
-    for ([_][]pg.Connection{ shard.read_connections, shard.writes }) |connections| {
+    for ([_][]pg.Connection{ shard.read_connections, shard.write_connections }) |connections| {
         for (connections) |*connection| {
             const fd = try pg.connect_blocking(options.url, statements);
             connection.* = try .init(gpa, io, fd, statements);
         }
     }
     shard.reads.init(io, shard.read_connections);
-    for ([_][]pg.Connection{ shard.read_connections, shard.writes }) |connections| {
+    shard.writes.init(io, shard.write_connections);
+    for ([_][]pg.Connection{ shard.read_connections, shard.write_connections }) |connections| {
         for (connections) |*connection| try group.concurrent(io, pg.Connection.read_loop, .{connection});
     }
     const listener = try options.address.listen(io, .{ .reuse_address = true, .kernel_backlog = 65535 });

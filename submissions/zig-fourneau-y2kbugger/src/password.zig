@@ -49,6 +49,154 @@ pub fn verify(stored: []const u8, password: []const u8) bool {
     return std.crypto.timing_safe.eql([digest_text_bytes]u8, given.*, expected);
 }
 
+// ---------- bcrypt, several hashes in lockstep ----------
+//
+// A Blowfish round is a chain of four dependent table loads: one hash
+// leaves most of a core idle. Lanes of independent hashes, interleaved
+// round by round, fill it. The algorithm is std's (its initial state is
+// std's `State`), every round kept.
+
+pub const lanes_max = 4;
+const State = bcrypt.State;
+const digest_bytes = 23;
+
+fn word(data: []const u8, at: *usize) u32 {
+    var value: u32 = 0;
+    inline for (0..4) |_| {
+        if (at.* >= data.len) at.* = 0;
+        value = value << 8 | data[at.*];
+        at.* += 1;
+    }
+    return value;
+}
+
+inline fn half_round(state: *const State, i: u32, j: u32, comptime n: usize) u32 {
+    var r = state.sboxes[0][@as(u8, @truncate(j >> 24))];
+    r +%= state.sboxes[1][@as(u8, @truncate(j >> 16))];
+    r ^= state.sboxes[2][@as(u8, @truncate(j >> 8))];
+    r +%= state.sboxes[3][@as(u8, @truncate(j))];
+    return i ^ r ^ state.subkeys[n];
+}
+
+/// Blowfish's encryption of each lane's halves under each lane's state.
+inline fn encipher(comptime lanes: usize, states: *[lanes]State, l: *[lanes]u32, r: *[lanes]u32) void {
+    inline for (0..lanes) |x| l[x] ^= states[x].subkeys[0];
+    comptime var i = 1;
+    inline while (i < 16) : (i += 2) {
+        inline for (0..lanes) |x| r[x] = half_round(&states[x], r[x], l[x], i);
+        inline for (0..lanes) |x| l[x] = half_round(&states[x], l[x], r[x], i + 1);
+    }
+    inline for (0..lanes) |x| {
+        const left = l[x];
+        l[x] = r[x] ^ states[x].subkeys[17];
+        r[x] = left;
+    }
+}
+
+/// The key schedule: each lane's subkeys keyed by `keys`, then every
+/// subkey and S-box entry replaced by the cipher's output, its input
+/// first mixed with `salts` (bcrypt's `expand`) or not (`expand0`).
+fn expand(comptime lanes: usize, states: *[lanes]State, salts: ?*const [lanes][]const u8, keys: *const [lanes][]const u8) void {
+    var key_at: [lanes]usize = @splat(0);
+    for (0..18) |n| {
+        inline for (0..lanes) |x| states[x].subkeys[n] ^= word(keys[x], &key_at[x]);
+    }
+    var l: [lanes]u32 = @splat(0);
+    var r: [lanes]u32 = @splat(0);
+    var salt_at: [lanes]usize = @splat(0);
+    var n: usize = 0;
+    while (n < 18) : (n += 2) {
+        if (salts) |salt| inline for (0..lanes) |x| {
+            l[x] ^= word(salt[x], &salt_at[x]);
+            r[x] ^= word(salt[x], &salt_at[x]);
+        };
+        encipher(lanes, states, &l, &r);
+        inline for (0..lanes) |x| {
+            states[x].subkeys[n] = l[x];
+            states[x].subkeys[n + 1] = r[x];
+        }
+    }
+    for (0..4) |box| {
+        var k: usize = 0;
+        while (k < 256) : (k += 2) {
+            if (salts) |salt| inline for (0..lanes) |x| {
+                l[x] ^= word(salt[x], &salt_at[x]);
+                r[x] ^= word(salt[x], &salt_at[x]);
+            };
+            encipher(lanes, states, &l, &r);
+            inline for (0..lanes) |x| {
+                states[x].sboxes[box][k] = l[x];
+                states[x].sboxes[box][k + 1] = r[x];
+            }
+        }
+    }
+}
+
+/// bcrypt's digest of each lane's password (72 bytes at most) and salt,
+/// at 2^rounds_log rounds: what std's `bcrypt` gives, lanes at a time.
+fn digests(
+    comptime lanes: usize,
+    passwords: *const [lanes][]const u8,
+    salts: *const [lanes][bcrypt.salt_length]u8,
+    rounds_log: u6,
+) [lanes][digest_bytes]u8 {
+    var buffers: [lanes][password_bytes_max + 1]u8 = undefined;
+    var keys: [lanes][]const u8 = undefined;
+    var salt_slices: [lanes][]const u8 = undefined;
+    inline for (0..lanes) |x| {
+        const length = passwords[x].len;
+        assert(length <= password_bytes_max);
+        @memcpy(buffers[x][0..length], passwords[x]);
+        buffers[x][length] = 0;
+        keys[x] = buffers[x][0 .. length + 1];
+        salt_slices[x] = &salts[x];
+    }
+    var states: [lanes]State = @splat(.{});
+    expand(lanes, &states, &salt_slices, &keys);
+    const rounds = @as(u64, 1) << rounds_log;
+    for (0..rounds) |_| {
+        expand(lanes, &states, null, &keys);
+        expand(lanes, &states, null, &salt_slices);
+    }
+    var data: [lanes][6]u32 = @splat(.{ 0x4f727068, 0x65616e42, 0x65686f6c, 0x64657253, 0x63727944, 0x6f756274 });
+    for (0..64) |_| {
+        var pair: usize = 0;
+        while (pair < 6) : (pair += 2) {
+            var l: [lanes]u32 = undefined;
+            var r: [lanes]u32 = undefined;
+            inline for (0..lanes) |x| {
+                l[x] = data[x][pair];
+                r[x] = data[x][pair + 1];
+            }
+            encipher(lanes, &states, &l, &r);
+            inline for (0..lanes) |x| {
+                data[x][pair] = l[x];
+                data[x][pair + 1] = r[x];
+            }
+        }
+    }
+    var out: [lanes][digest_bytes]u8 = undefined;
+    inline for (0..lanes) |x| {
+        var bytes: [24]u8 = undefined;
+        for (data[x], 0..) |value, index| std.mem.writeInt(u32, bytes[index * 4 ..][0..4], value, .big);
+        out[x] = bytes[0..digest_bytes].*;
+        std.crypto.secureZero(u8, &buffers[x]);
+    }
+    return out;
+}
+
+test "password: lanes give std's digests" {
+    const long: [password_bytes_max]u8 = @splat('a');
+    const passwords = [lanes_max][]const u8{ "password123", "", &long, "x" };
+    var salts: [lanes_max][bcrypt.salt_length]u8 = undefined;
+    for (&salts, 0..) |*salt, index| salt.* = @splat(@intCast(index * 17 + 3));
+    const together = digests(lanes_max, &passwords, &salts, 4);
+    for (passwords, salts, together) |password, salt, digest| {
+        const alone = bcrypt.bcrypt(password, &salt, .{ .rounds_log = 4, .silently_truncate_password = true });
+        try std.testing.expectEqualSlices(u8, &alone, &digest);
+    }
+}
+
 /// `$2b$10$...` of `password` with a fresh random salt.
 pub fn hash(password: []const u8, out: *[hash_bytes]u8) void {
     assert(password.len <= password_bytes_max);
@@ -64,6 +212,11 @@ pub fn hash(password: []const u8, out: *[hash_bytes]u8) void {
     _ = encoder.encode(out[7 + salt_text_bytes ..][0..digest_text_bytes], &digest);
 }
 
+/// How long a worker holding fewer than `lanes_max` jobs waits for more,
+/// from the oldest's arrival: lanes hash 2.4 times as many (21 ms a hash
+/// at four, 51 alone), and logins are a thousandth of the requests.
+const gather_ns = 150 * std.time.ns_per_ms;
+
 pub const Job = struct {
     kind: enum { verify, hash },
     password: []const u8,
@@ -72,10 +225,86 @@ pub const Job = struct {
     /// The answer: whether it matched (`verify`), the new hash (`hash`).
     matched: bool = false,
     hashed: [hash_bytes]u8 = undefined,
+    /// What the worker hashes: from `stored` (`verify`) or drawn (`hash`).
+    salt: [bcrypt.salt_length]u8 = undefined,
+    rounds_log: u6 = cost,
+    /// A stored hash this cannot read: it matches nothing, and no worker
+    /// sees the job.
+    unreadable: bool = false,
+    queued_ns: i128 = 0,
     /// 0 until a worker has done it; the requesting fiber waits on it.
     done: std.atomic.Value(u32) = .init(0),
     next: ?*Job = null,
+
+    /// The salt and cost to hash with, on the requesting fiber.
+    fn prepare(job: *Job) void {
+        assert(job.password.len <= password_bytes_max);
+        switch (job.kind) {
+            .hash => {
+                const got = linux.getrandom(&job.salt, job.salt.len, 0);
+                assert(got == job.salt.len);
+                job.rounds_log = cost;
+            },
+            .verify => {
+                const stored = job.stored;
+                job.unreadable = true;
+                if (stored.len != hash_bytes or stored[0] != '$' or stored[1] != '2') return;
+                if (stored[3] != '$' or stored[6] != '$') return;
+                switch (stored[2]) {
+                    'a', 'b', 'y' => {},
+                    else => return,
+                }
+                const rounds_log = std.fmt.parseInt(u6, stored[4..6], 10) catch return;
+                if (rounds_log < 4 or rounds_log > 31) return;
+                decoder.decode(&job.salt, stored[7..][0..salt_text_bytes]) catch return;
+                job.rounds_log = rounds_log;
+                job.unreadable = false;
+            },
+        }
+    }
+
+    /// The answer from the job's digest.
+    fn finish(job: *Job, digest: *const [digest_bytes]u8) void {
+        var text: [digest_text_bytes]u8 = undefined;
+        _ = encoder.encode(&text, digest);
+        switch (job.kind) {
+            .verify => {
+                const given = job.stored[7 + salt_text_bytes ..][0..digest_text_bytes];
+                job.matched = std.crypto.timing_safe.eql([digest_text_bytes]u8, given.*, text);
+            },
+            .hash => {
+                @memcpy(job.hashed[0..7], "$2b$10$");
+                _ = encoder.encode(job.hashed[7..][0..salt_text_bytes], &job.salt);
+                @memcpy(job.hashed[7 + salt_text_bytes ..][0..digest_text_bytes], &text);
+            },
+        }
+    }
 };
+
+fn now_ns() i128 {
+    var spec: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &spec);
+    return @as(i128, spec.sec) * std.time.ns_per_s + spec.nsec;
+}
+
+/// The jobs' digests, lanes at a time (all of one cost).
+fn run_lanes(jobs: []const *Job) void {
+    assert(jobs.len >= 1 and jobs.len <= lanes_max);
+    switch (jobs.len) {
+        inline 1...lanes_max => |lanes| {
+            var passwords: [lanes][]const u8 = undefined;
+            var salts: [lanes][bcrypt.salt_length]u8 = undefined;
+            inline for (0..lanes) |x| {
+                assert(jobs[x].rounds_log == jobs[0].rounds_log);
+                passwords[x] = jobs[x].password;
+                salts[x] = jobs[x].salt;
+            }
+            const results = digests(lanes, &passwords, &salts, jobs[0].rounds_log);
+            inline for (0..lanes) |x| jobs[x].finish(&results[x]);
+        },
+        else => unreachable,
+    }
+}
 
 /// Jobs from every shard, taken by the workers in order.
 pub const Pool = struct {
@@ -96,6 +325,9 @@ pub const Pool = struct {
     /// Queue the job and wait for it, on the calling fiber.
     pub fn run(pool: *Pool, io: Io, job: *Job) void {
         assert(job.done.load(.monotonic) == 0);
+        job.prepare();
+        if (job.unreadable) return; // matches nothing (`matched` false)
+        job.queued_ns = now_ns();
         pool.acquire();
         if (pool.tail) |tail| tail.next = job else pool.head = job;
         pool.tail = job;
@@ -110,30 +342,59 @@ pub const Pool = struct {
     }
 
     fn work(pool: *Pool) void {
+        var jobs: [lanes_max]*Job = undefined;
         // Bounded only to say so: workers run for good.
         for (0..std.math.maxInt(u64)) |_| {
-            const seen = pool.queued.load(.acquire);
-            const job = pool.take() orelse {
-                _ = linux.futex_4arg(&pool.queued.raw, .{ .cmd = .WAIT, .private = true }, seen, null);
-                continue;
-            };
-            switch (job.kind) {
-                .verify => job.matched = verify(job.stored, job.password),
-                .hash => hash(job.password, &job.hashed),
+            const count = pool.gather(&jobs);
+            run_lanes(jobs[0..count]);
+            for (jobs[0..count]) |job| {
+                job.done.store(1, .release);
+                _ = linux.futex_3arg(&job.done.raw, .{ .cmd = .WAKE, .private = true }, 1);
             }
-            job.done.store(1, .release);
-            _ = linux.futex_3arg(&job.done.raw, .{ .cmd = .WAKE, .private = true }, 1);
         } else unreachable;
     }
 
-    fn take(pool: *Pool) ?*Job {
+    /// Jobs of one cost, `lanes_max` of them, or fewer once the oldest has
+    /// waited `gather_ns`.
+    fn gather(pool: *Pool, jobs: *[lanes_max]*Job) usize {
+        var count: usize = 0;
+        // Bounded only to say so: it returns once a job has come.
+        for (0..std.math.maxInt(u64)) |_| {
+            const seen = pool.queued.load(.acquire);
+            const rounds_log: ?u6 = if (count > 0) jobs[0].rounds_log else null;
+            while (count < lanes_max) {
+                jobs[count] = pool.take(rounds_log orelse null) orelse break;
+                count += 1;
+            }
+            if (count == lanes_max) return count;
+            var wait: linux.timespec = .{ .sec = 1, .nsec = 0 };
+            if (count > 0) {
+                const left = jobs[0].queued_ns + gather_ns - now_ns();
+                if (left <= 0) return count;
+                wait = .{ .sec = 0, .nsec = @intCast(left) };
+            }
+            _ = linux.futex_4arg(&pool.queued.raw, .{ .cmd = .WAIT, .private = true }, seen, &wait);
+        } else unreachable;
+    }
+
+    /// The oldest job, of the given cost when one is given (a later job of
+    /// another cost waits for a batch of its own).
+    fn take(pool: *Pool, rounds_log: ?u6) ?*Job {
         pool.acquire();
         defer pool.release();
-        const job = pool.head orelse return null;
-        pool.head = job.next;
-        if (pool.head == null) pool.tail = null;
-        job.next = null;
-        return job;
+        var previous: ?*Job = null;
+        var cursor = pool.head;
+        while (cursor) |job| : ({
+            previous = job;
+            cursor = job.next;
+        }) {
+            if (rounds_log) |rounds| if (job.rounds_log != rounds) continue;
+            if (previous) |before| before.next = job.next else pool.head = job.next;
+            if (pool.tail == job) pool.tail = previous;
+            job.next = null;
+            return job;
+        }
+        return null;
     }
 
     /// A spin lock: what it guards is a pointer or two.

@@ -6,6 +6,13 @@
 //! query, in the statement's snapshot, while it is served; nothing outlives
 //! the statement.
 //!
+//! Writes in groups (`Writes`): the requests waiting for a write
+//! connection go out together under one Sync, one implicit transaction,
+//! so one commit and one flush of the WAL serve them all, and each
+//! response waits for that commit. If any fails, the transaction is
+//! rolled back whole, and each request is sent again alone, to get its own
+//! answer.
+//!
 //! No timer: a read waits in its kind's queue only while every read
 //! connection has a batch in flight. A connection that finishes its batch
 //! sends the kind whose oldest read has waited longest, all of it (32 at
@@ -24,6 +31,7 @@ pub const Kind = enum(u8) {
     comments,
     profile,
     user,
+    login,
     tags,
     list_all,
     list_tag,
@@ -33,6 +41,115 @@ pub const Kind = enum(u8) {
 };
 
 const kinds_count = @typeInfo(Kind).@"enum".field_names.len;
+
+/// A request waiting for its write group, on its fiber's stack.
+pub const Write = struct {
+    waiter: pg.Waiter,
+    /// Its statements, encoded (`pg.Encoded`).
+    encoded: []const u8,
+    statements: u8,
+    /// Sent again alone, after a group it was in failed.
+    alone: bool = false,
+    /// It went out with others: a failure may have been theirs.
+    grouped: bool = false,
+    next: ?*Write = null,
+};
+
+/// Bytes a write group carries at most: well within a connection's output.
+const write_group_bytes_max = 256 * 1024;
+
+pub const Writes = struct {
+    io: Io,
+    connections: []pg.Connection,
+    head: ?*Write = null,
+    tail: ?*Write = null,
+
+    /// In place: each connection calls back here when it is idle.
+    pub fn init(writes: *Writes, io: Io, connections: []pg.Connection) void {
+        writes.* = .{ .io = io, .connections = connections };
+        for (connections) |*connection| connection.idle = .{ .context = writes, .function = on_idle };
+    }
+
+    /// Queue the request, send what can go, wait for its commit; if its
+    /// group failed, once more alone.
+    pub fn write(writes: *Writes, pending: *Write) pg.Results {
+        writes.wait(pending);
+        const failed = pending.waiter.failure orelse return .{ .waiter = &pending.waiter };
+        if (failed != .sql or !pending.grouped) return .{ .waiter = &pending.waiter };
+        pending.waiter = .{ .rows = pending.waiter.rows };
+        pending.alone = true;
+        pending.grouped = false;
+        writes.wait(pending);
+        return .{ .waiter = &pending.waiter };
+    }
+
+    fn wait(writes: *Writes, pending: *Write) void {
+        pending.next = null;
+        if (writes.tail) |tail| tail.next = pending else writes.head = pending;
+        writes.tail = pending;
+        writes.dispatch();
+        if (!pending.waiter.done) Evented.park(writes.io, &pending.waiter.parked);
+        assert(pending.waiter.done);
+    }
+
+    fn on_idle(context: *anyopaque, connection: *pg.Connection) void {
+        const writes: *Writes = @ptrCast(@alignCast(context));
+        _ = connection;
+        writes.dispatch();
+    }
+
+    fn dispatch(writes: *Writes) void {
+        // Bounded: each pass fills a connection, or ends.
+        for (0..writes.connections.len + 1) |_| {
+            if (writes.head == null) return;
+            const connection = for (writes.connections) |*connection| {
+                if (!connection.broken and connection.load() == 0) break connection;
+            } else {
+                for (writes.connections) |*connection| if (!connection.broken) return;
+                writes.fail_all();
+                return;
+            };
+            writes.send(connection);
+        } else unreachable;
+    }
+
+    fn fail_all(writes: *Writes) void {
+        while (writes.head) |pending| {
+            writes.head = pending.next;
+            pending.waiter.failure = .broken;
+            pending.waiter.done = true;
+            _ = Evented.unpark(writes.io, &pending.waiter.parked);
+        }
+        writes.tail = null;
+    }
+
+    /// The queue's head, and those after it while they fit: one group. A
+    /// request sent again alone goes alone.
+    fn send(writes: *Writes, connection: *pg.Connection) void {
+        const batch = &connection.batch;
+        batch.* = .{};
+        var parts: [pg.batch_max][]const u8 = undefined;
+        var bytes: usize = 0;
+        // Bounded: a group is `batch_max` requests at most.
+        for (0..pg.batch_max) |position| {
+            const pending = writes.head orelse break;
+            if (position > 0 and (pending.alone or bytes + pending.encoded.len > write_group_bytes_max)) break;
+            writes.head = pending.next;
+            parts[position] = pending.encoded;
+            bytes += pending.encoded.len;
+            batch.waiters[position] = &pending.waiter;
+            batch.statements[position] = pending.statements;
+            batch.count += 1;
+            if (pending.alone) break;
+        }
+        if (writes.head == null) writes.tail = null;
+        for (batch.waiters[0..batch.count]) |waiter| {
+            const pending: *Write = @alignCast(@fieldParentPtr("waiter", waiter));
+            pending.grouped = batch.count > 1;
+        }
+        _ = connection.send_parts(batch, &.{}, parts[0..batch.count]);
+    }
+};
 
 /// A read waiting for its batch, on its fiber's stack.
 pub const Pending = struct {
@@ -180,6 +297,7 @@ pub const Reads = struct {
             }),
             .profile => connection.send(batch, &.{call(.batch_profile, &.{ i, v, k })}),
             .user => connection.send(batch, &.{call(.batch_user, &.{ i, v })}),
+            .login => connection.send(batch, &.{call(.batch_login, &.{ i, v, k })}),
             .tags => connection.send(batch, &.{call(.batch_tags, &.{i})}),
             .list_all => connection.send(batch, &.{
                 call(.batch_list_all, &.{ i, v, l, o, k }),
