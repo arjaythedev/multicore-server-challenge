@@ -75,6 +75,27 @@ the SQL.
   and page cache for the 2.3 GB of data; there is no swap, and a heap that doesn't grow after start can't push the box
   into the OOM killer mid-run.
 
+### Would a bigger heap help, especially the concurrent collectors?
+
+The question: with more headroom, ZGC and Shenandoah run fewer cycles, so would they catch up, and is the JVM
+wasting memory the box has? Postgres's own memory can't be taken (its config, `shared_buffers` 4 GB included, is fixed
+by `box/pg-conf.sh`, and rule 2 forbids server-wide changes); what a bigger heap takes is the OS's page cache and
+free memory. 75% (12 GB, pre-touched) plus `shared_buffers` in use, 40 backends, JVM non-heap and the OS adds up to
+the whole 16 GB, with no swap: an OOM kill risk. So the test was 45% vs 60%, interleaved, at 7,500 users:
+
+| GC | heap | app µs/req (two runs) | p95 ms | p99 ms |
+|---|---|---|---|---|
+| **Parallel** | **45%** | **486 / 501** | 202 / 323 | 318 / 517 |
+| Parallel | 60% | 495 / 487 | 227 / 223 | 352 / 336 |
+| ZGC | 45% | 559 / 555 | 475 / 444 | 750 / 700 |
+| ZGC | 60% | 542 / 556 | 398 / 437 | 628 / 684 |
+| Shenandoah (generational) | 60% | 573 | 489 | 791 |
+
+ZGC gains a little from the extra headroom (fewer cycles), but it stays ~12% more CPU per request than Parallel with
+twice the tail: its per-reference load barriers cost the same at any heap size, and the GC itself was only ~3% of the
+app's CPU with Parallel. Parallel doesn't change between 45% and 60%. So the heap stays at 45%: the memory above that
+buys nothing measurable and moves the box toward the OOM killer.
+
 ### Batching (the DataLoader pattern, with fs2)
 
 The two top entries merge concurrent same-kind reads into one statement. Here that is `Batcher`: a request puts its
