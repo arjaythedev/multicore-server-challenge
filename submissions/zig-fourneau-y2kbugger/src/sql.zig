@@ -76,6 +76,25 @@ fn batch_page(comptime page: []const u8, comptime follow: []const u8) []const u8
         list_select_of("r.v", "r.l", page, follow) ++ ") x";
 }
 
+/// A page every request of the batch shares with the others asking for
+/// the same one (`k`, `l`, `o`): its articles, their tags, favorite counts
+/// and authors read once in the statement, the viewer's flags per request.
+/// `page` names `q.k` and `q.o`. The rows come out by request, newest first.
+fn shared_page(comptime page: []const u8) []const u8 {
+    return "WITH r AS (SELECT * " ++ batch_pages ++ "), " ++
+        "q AS (SELECT DISTINCT r.k, r.l, r.o FROM r), " ++
+        "x AS MATERIALIZED (SELECT q.k, q.l, q.o, y.* FROM q CROSS JOIN LATERAL (" ++
+        "SELECT a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at, " ++
+        tag_list ++ " AS tag_list, (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites, " ++
+        "u.username, u.bio, u.image FROM (" ++ page ++ ") p JOIN articles a ON a.id = p.id " ++
+        "JOIN users u ON u.id = a.author_id ORDER BY p.id DESC LIMIT q.l) y) " ++
+        "SELECT r.i, x.slug, x.title, x.description, x.created_at, x.updated_at, x.tag_list, x.favorites, " ++
+        "EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = x.id AND f.user_id = r.v), " ++
+        "x.username, x.bio, x.image, " ++
+        "EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.v AND fo.followee_id = x.author_id) " ++
+        "FROM r JOIN x ON x.k = r.k AND x.l = r.l AND x.o = r.o ORDER BY r.i, x.id DESC";
+}
+
 /// A capped count per request: the subquery names `r`, so it is run for
 /// each request, not once for the statement.
 fn batch_count(comptime counted: []const u8) []const u8 {
@@ -352,25 +371,27 @@ pub const statements = std.enums.EnumArray(S, pg.Statement).init(.{
             batch_keys ++ " JOIN users u ON u.email = r.k",
         .params = batch_key_params,
     },
-    // `r.i >= 0` names the request: the tags are read for each.
+    // What no viewer changes (the tags, the global count) is read once for
+    // the batch's requests, all of them waiting before the statement runs;
+    // nothing is kept after it.
     .batch_tags = .{
-        .sql = "SELECT r.i, x.name FROM unnest($1::int4[]) AS r(i) CROSS JOIN LATERAL " ++
-            "(SELECT t.name FROM tags t WHERE r.i >= 0 ORDER BY t.name) x",
+        .sql = "SELECT r.i, x.name FROM unnest($1::int4[]) AS r(i) CROSS JOIN " ++
+            "(SELECT t.name FROM tags t ORDER BY t.name) x",
         .params = &.{.int4_array},
     },
     .batch_list_all = .{
-        .sql = batch_page("SELECT a.id FROM articles a WHERE r.i >= 0 " ++
-            "ORDER BY a.id DESC OFFSET r.o LIMIT 100", following_of("r.v")),
+        .sql = shared_page("SELECT a.id FROM articles a ORDER BY a.id DESC OFFSET q.o LIMIT 100"),
         .params = batch_page_params,
     },
     .batch_count_all = .{
-        .sql = batch_count("SELECT 1 FROM articles a WHERE r.i >= 0"),
+        .sql = "SELECT r.i, c.n " ++ batch_keys ++
+            " CROSS JOIN (SELECT count(*) AS n FROM (SELECT 1 FROM articles a LIMIT 1000) s) c",
         .params = batch_key_params,
     },
     .batch_list_tag = .{
-        .sql = batch_page("SELECT at.article_id AS id FROM article_tags at " ++
-            "WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = r.k) " ++
-            "ORDER BY at.article_id DESC OFFSET r.o LIMIT 100", following_of("r.v")),
+        .sql = shared_page("SELECT at.article_id AS id FROM article_tags at " ++
+            "WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = q.k) " ++
+            "ORDER BY at.article_id DESC OFFSET q.o LIMIT 100"),
         .params = batch_page_params,
     },
     .batch_count_tag = .{
@@ -379,9 +400,9 @@ pub const statements = std.enums.EnumArray(S, pg.Statement).init(.{
         .params = batch_key_params,
     },
     .batch_list_author = .{
-        .sql = batch_page("SELECT a.id FROM articles a " ++
-            "WHERE a.author_id = (SELECT au.id FROM users au WHERE au.username = r.k) " ++
-            "ORDER BY a.id DESC OFFSET r.o LIMIT 100", following_of("r.v")),
+        .sql = shared_page("SELECT a.id FROM articles a " ++
+            "WHERE a.author_id = (SELECT au.id FROM users au WHERE au.username = q.k) " ++
+            "ORDER BY a.id DESC OFFSET q.o LIMIT 100"),
         .params = batch_page_params,
     },
     .batch_count_author = .{
@@ -390,9 +411,9 @@ pub const statements = std.enums.EnumArray(S, pg.Statement).init(.{
         .params = batch_key_params,
     },
     .batch_list_favorited = .{
-        .sql = batch_page("SELECT f.article_id AS id FROM favorites f " ++
-            "WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = r.k) " ++
-            "ORDER BY f.article_id DESC OFFSET r.o LIMIT 100", following_of("r.v")),
+        .sql = shared_page("SELECT f.article_id AS id FROM favorites f " ++
+            "WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = q.k) " ++
+            "ORDER BY f.article_id DESC OFFSET q.o LIMIT 100"),
         .params = batch_page_params,
     },
     .batch_count_favorited = .{
