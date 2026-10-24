@@ -298,7 +298,7 @@ pub const Reads = struct {
             .profile => connection.send(batch, &.{call(.batch_profile, &.{ i, v, k })}),
             .user => connection.send(batch, &.{call(.batch_user, &.{ i, v })}),
             .login => connection.send(batch, &.{call(.batch_login, &.{ i, v, k })}),
-            .tags => connection.send(batch, &.{call(.batch_tags, &.{i})}),
+            .tags => connection.send(batch, &.{call(.batch_tags, &.{})}),
             .list_all => connection.send(batch, &.{
                 call(.batch_list_all, &.{ i, v, l, o, k }),
                 call(.batch_count_all, &.{ i, v, k }),

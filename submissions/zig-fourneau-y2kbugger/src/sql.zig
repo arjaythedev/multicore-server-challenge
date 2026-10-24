@@ -393,12 +393,12 @@ pub const statements = std.enums.EnumArray(S, pg.Statement).init(.{
     // What no viewer changes (the tags, the global count) is read once for
     // the batch's requests, all of them waiting before the statement runs;
     // nothing is kept after it.
-    // One row a request, the names as one array: 200 rows a request were
-    // 200 messages to send and read.
+    // The names as one array, in one row (`-1`) every request of the batch
+    // keeps: 200 rows a request were 200 messages to send and read, and a
+    // row a request had Postgres write the 200 names out for each.
     .batch_tags = .{
-        .sql = "SELECT r.i, x.names FROM unnest($1::int4[]) AS r(i) CROSS JOIN " ++
-            "(SELECT array_agg(t.name ORDER BY t.name) AS names FROM tags t) x",
-        .params = &.{.int4_array},
+        .sql = "SELECT -1, array_agg(t.name ORDER BY t.name) FROM tags t",
+        .params = &.{},
     },
     .batch_list_all = .{
         .sql = shared_page("SELECT a.id FROM articles a ORDER BY a.id DESC OFFSET q.o LIMIT 100"),
