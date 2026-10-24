@@ -141,18 +141,21 @@ process, and the Postgres client backends.
 
 | Users | req/s | p50 / p95 / p99 ms | BEAM cores | Postgres cores | BEAM RSS |
 |---:|---:|---|---:|---:|---:|
-| 40,000 | 10,608 | 0.2 / 0.6 / 0.7 | 2.15 | 1.47 | 1.2 GB |
-| 60,000 | 15,910 | 0.3 / 0.7 / 0.9 | 3.28 | 2.66 | 2.3 GB |
-| 80,000 | 21,178 | 0.5 / 2.5 / 4.8 | 3.59 | 4.08 | 3.7 GB |
+| 40,000 | 10,593 | 0.3 / 0.6 / 0.9 | 1.64 | 1.26 | 1.3 GB |
+| 60,000 | 15,886 | 0.3 / 0.5 / 0.7 | 2.19 | 2.03 | 1.8 GB |
+| 80,000 | 21,192 | 0.3 / 0.7 / 0.9 | 2.89 | 2.91 | 2.6 GB |
 
-80,000 users leaves about 0.3 of the 8 cores idle, so the ceiling here is near 85,000; an M-series core is
-faster than the box's x86 vCPU, so expect less on the box. Before the lane-interleaved bcrypt the BEAM took
-4.14 cores at 80,000 users (about one core of it hashing ~21 logins/s). Under `pg_stat_statements` at 40,000
-users the personal feed was 32% of Postgres time (0.58 ms, ~380 buffers: the page ids per followee, the
+The same runs a day earlier, before the generic plans, the C helpers, the rendering in the connection process
+and the heap sizing, took 3.59 BEAM and 4.08 Postgres cores at 80,000 users with 3.7 GB of RSS and a p99 of
+4.8 ms. 80,000 users now leaves about two of the 8 cores idle; at 100,000 users the two load generators
+saturate the laptop itself (load average near 50), so the stand-in cannot say where this server's ceiling is.
+An M-series core is faster than the box's x86 vCPU, so expect less on the box. Under `pg_stat_statements` at
+40,000 users the personal feed was 32% of Postgres time (0.58 ms, ~380 buffers: the page ids per followee, the
 capped count, and ten rendered articles), comments 15%, the global list 13%, an article by slug 12%.
 
-The same laptop running Postgres.app 17 natively does about 0.16 ms of BEAM CPU and 0.15 ms of Postgres CPU per
-request at 5,300 req/s, with p99 around 1 ms. macOS caps native runs at ~15k connections (ephemeral ports).
+The same laptop running Postgres.app 17 natively does about 0.13 ms of BEAM CPU per request at 5,300 req/s
+(0.155 ms before the rendering moved into the connection process). macOS caps native runs at ~15k connections
+(ephemeral ports).
 
 ## Credits
 
