@@ -39,7 +39,8 @@ static void *start_connection(void *data) {
                         NULL};
   const char *values[] = {job->host, job->port, job->user, job->password,
                           job->database, "disable", "disable",
-                          "-c timezone=UTC -c datestyle=ISO,YMD",
+                          "-c timezone=UTC -c datestyle=ISO,YMD -c jit=off "
+                          "-c plan_cache_mode=force_generic_plan",
                           "scram-sha-256", NULL};
   PGconn *conn = PQconnectStartParams(keys, values, 0);
   ssize_t sent;
