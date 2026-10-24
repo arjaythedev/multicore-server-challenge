@@ -50,7 +50,10 @@ abstract class Exchange {
     /** Request body bytes (empty array if none). */
     abstract val body: ByteArray
 
-    /** Response body buffer. */
+    /**
+     * Response body buffer. Append only: it starts at `out.len` = a reserved header area (not 0), so the engine can
+     * put the status line and headers right in front of the body and send both with one write. Never reset() it.
+     */
     abstract val out: ByteBuf
     /** JSON writer over [out]. */
     abstract val json: JsonWriter
@@ -71,18 +74,22 @@ abstract class Exchange {
 
 /**
  * The common HTTP/1.1 engine: request parsing, keep-alive, the per-connection state machine, response writing,
- * coroutine launch. Platform loops call these four methods on the owning loop thread.
+ * coroutine launch. Platform loops call these four methods on the owning loop thread, never reentrantly: the
+ * engine calls [HttpConn.execute], [HttpConn.close] and [HttpConn.requestWritable] from inside them, so a platform
+ * must queue that work for later, never run it inline. See Engine.kt for the state machine.
  */
-class HttpEngine(private val handler: suspend (Exchange) -> Unit) {
+class HttpEngine(handler: suspend (Exchange) -> Unit) {
+    private val core = EngineCore(handler)
+
     /** A new connection was accepted. */
-    fun onOpen(conn: HttpConn): Unit = TODO("http: HttpEngine.onOpen")
+    fun onOpen(conn: HttpConn) = core.onOpen(conn)
 
     /** [len] bytes were read into [buf] at [off]. [buf] is the loop's scratch and is reused after this returns. */
-    fun onData(conn: HttpConn, buf: ByteArray, off: Int, len: Int): Unit = TODO("http: HttpEngine.onData")
+    fun onData(conn: HttpConn, buf: ByteArray, off: Int, len: Int) = core.onData(conn, buf, off, len)
 
     /** The socket is writable again after [HttpConn.requestWritable]. */
-    fun onWritable(conn: HttpConn): Unit = TODO("http: HttpEngine.onWritable")
+    fun onWritable(conn: HttpConn) = core.onWritable(conn)
 
     /** EOF, error or [HttpConn.close]; called exactly once per connection. */
-    fun onClosed(conn: HttpConn): Unit = TODO("http: HttpEngine.onClosed")
+    fun onClosed(conn: HttpConn) = core.onClosed(conn)
 }
