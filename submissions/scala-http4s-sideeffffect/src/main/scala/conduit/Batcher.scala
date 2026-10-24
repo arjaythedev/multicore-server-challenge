@@ -1,6 +1,6 @@
 package conduit
 
-import cats.effect.std.Queue
+import cats.effect.std.{Console, Queue}
 import cats.effect.{Deferred, IO, Resource}
 import cats.syntax.all.*
 import fs2.{Chunk, Stream}
@@ -24,12 +24,16 @@ object Batcher:
   def apply[K, V](maxBatch: Int, concurrency: Int)(lookup: List[K] => IO[Map[Int, V]]): Resource[IO, Batcher[K, V]] =
     for
       queue <- Resource.eval(Queue.unbounded[IO, (K, Deferred[IO, Either[Throwable, Option[V]]])])
+      // The stream only ends if something fails outside `run` (which handles lookup errors itself). Callers wait in
+      // the queue, which outlives the stream, so restart it rather than leave them waiting.
       _ <- Stream
         .fromQueueUnterminated(queue, maxBatch)
         .chunks
         .parEvalMapUnordered(concurrency)(run(lookup))
         .compile
         .drain
+        .handleErrorWith(error => Console[IO].errorln(s"Batcher stream failed, restarting it: $error"))
+        .foreverM
         .background
     yield new Batcher(queue)
 
@@ -39,8 +43,12 @@ object Batcher:
     lookup(batch.map(_._1).toList).attempt.flatMap {
       case Right(found) =>
         batch.zipWithIndex.traverse_ { case ((_, result), i) => result.complete(Right(found.get(i))) }
-      case Left(error) =>
+      case Left(error) if batch.size == 1 =>
         batch.traverse_((_, result) => result.complete(Left(error)))
+      case Left(_) =>
+        // One bad key (a slug Postgres rejects, say) fails the whole statement. Run each key on its own, so every
+        // caller gets only its own result or error, not a failure caused by an unrelated request.
+        batch.parTraverse_(entry => run(lookup)(Chunk.singleton(entry)))
     }
 
 /** The lookups that go through a [[Batcher]]: an article, an article's comments (`None`: no such article), and a

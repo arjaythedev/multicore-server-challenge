@@ -270,7 +270,7 @@ object Sql:
                 FROM articles a JOIN users u ON u.id = a.author_id
                WHERE a.id IN (SELECT x.id FROM follows fo CROSS JOIN LATERAL
                    (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id
-                     ORDER BY a2.id DESC LIMIT r.lim + r.off) x
+                     ORDER BY a2.id DESC LIMIT r.lim::int8 + r.off) x
                   WHERE fo.follower_id = r.viewer ORDER BY x.id DESC LIMIT r.lim OFFSET r.off)) p ON true
            ORDER BY r.ord, p.id DESC""".query(int4 *: counted)
 
