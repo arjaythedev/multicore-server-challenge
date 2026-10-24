@@ -154,17 +154,24 @@ process, and the Postgres client backends.
 
 | Users | req/s | p50 / p95 / p99 ms | BEAM cores | Postgres cores | BEAM RSS |
 |---:|---:|---|---:|---:|---:|
-| 40,000 | 10,593 | 0.3 / 0.6 / 0.9 | 1.64 | 1.26 | 1.3 GB |
-| 60,000 | 15,886 | 0.3 / 0.5 / 0.7 | 2.19 | 2.03 | 1.8 GB |
-| 80,000 | 21,192 | 0.3 / 0.7 / 0.9 | 2.89 | 2.91 | 2.6 GB |
+| 40,000 | 10,583 | 2.1 / 5.3 / 7.4 | 1.15 | 0.85 | 1.0 GB |
+| 60,000 | 15,866 | 1.8 / 6.4 / 9.0 | 1.73 | 1.49 | 1.6 GB |
+| 80,000 | 21,210 | 1.7 / 6.8 / 9.0 | 2.28 | 2.56 | 2.2 GB |
 
-The same runs a day earlier, before the generic plans, the C helpers, the rendering in the connection process
-and the heap sizing, took 3.59 BEAM and 4.08 Postgres cores at 80,000 users with 3.7 GB of RSS and a p99 of
-4.8 ms. 80,000 users now leaves about two of the 8 cores idle; at 100,000 users the two load generators
-saturate the laptop itself (load average near 50), so the stand-in cannot say where this server's ceiling is.
-An M-series core is faster than the box's x86 vCPU, so expect less on the box. Under `pg_stat_statements` at
-40,000 users the personal feed was 32% of Postgres time (0.58 ms, ~380 buffers: the page ids per followee, the
-capped count, and ten rendered articles), comments 15%, the global list 13%, an article by slug 12%.
+The latencies carry the 2 ms batch window (p50 was 0.3 ms without it); 77–85 % of the requests ran in a
+batched statement. The same runs earlier the same day, before the connection groups and the window, the
+request-head, JWT and array NIFs and the lower hibernation threshold, took 1.64 / 1.26 cores at 40,000 and
+2.89 / 2.91 at 80,000 with 2.6 GB; a day before that, 3.59 / 4.08 cores and 3.7 GB at 80,000. In the stand-in
+about 40 % of the BEAM's CPU is kernel time (the container's virtual network), and Postgres's is dominated by
+the personal feed (per-followee index probes and the capped count, about a third) and the list pages.
+Measured through psql on the stand-in, a cheap statement's backend cost is mostly per-statement overhead
+(about 40 µs): eight batched tags, article-by-slug or comments requests cost 50 %, 70 % and 80 % less than
+eight single ones, the list pages 14–21 % less. Load runs also make the database dirtier (favorites and
+comments on hot articles land on pages the visibility map does not cover, so counting them fetches heap
+tuples), which is why the 80,000 run, third in the sequence, gains less than the first. 80,000 users leaves
+about three of the 8 cores idle; at 100,000 users the two load generators saturate the laptop itself (load
+average near 50), so the stand-in cannot say where this server's ceiling is. An M-series core is faster than
+the box's x86 vCPU, so expect less on the box.
 
 The same laptop running Postgres.app 17 natively does about 0.13 ms of BEAM CPU per request at 5,300 req/s
 (0.155 ms before the rendering moved into the connection process). macOS caps native runs at ~15k connections
