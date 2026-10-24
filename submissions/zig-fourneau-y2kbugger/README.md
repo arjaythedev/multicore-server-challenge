@@ -5,10 +5,26 @@ Front: direct
 | | |
 |---|---|
 | Language | Zig 0.17.0 (official tarball, sha256-checked in `install.sh`) |
-| HTTP | [fourneau](https://github.com/Eldhus/fourneau): HTTP/1.1 on io_uring, a fiber per connection, shards |
+| HTTP | [fourneau](https://github.com/Eldhus/fourneau), modified: its branch [`fourneau-multicore-tuned`](https://github.com/Eldhus/fourneau/tree/fourneau-multicore-tuned). HTTP/1.1 on io_uring, a fiber per connection, shards |
 | Postgres driver | its own: protocol 3.0, SCRAM-SHA-256, prepared statements, binary parameters and results, pipelining |
 | JSON, JWT (HS256), bcrypt | in `src/`, on Zig's standard library (`std.json`, `std.crypto`) |
-| Dependencies | fourneau, pinned by commit and hash in `build.zig.zon`; nothing else |
+| Dependencies | fourneau `fourneau-multicore-tuned`, pinned by commit and hash in `build.zig.zon`; nothing else |
+
+## fourneau, modified
+
+[fourneau](https://github.com/Eldhus/fourneau) is an HTTP server in Zig: io_uring under a fiber per
+connection (a port of `std.Io.Evented`), shards that share nothing, and a limit, deadline or
+eviction on everything a client can hold. It races Go's net/http, axum and others every night it
+changes on the [fourneau HTTP drag race](https://fourneau.y2kbugger.com/), a site fourneau itself
+serves with nothing in front. On the race of 2026-10-21, plaintext over HTTP/1.1 on 2 dedicated
+vCPUs: fourneau's Zig app 168,318 requests a second, axum 72,542, Go's net/http 39,600.
+
+This server is built on its branch
+[`fourneau-multicore-tuned`](https://github.com/Eldhus/fourneau/tree/fourneau-multicore-tuned):
+fourneau cut down to what an HTTP/1.1 application server on plain sockets needs (TLS, ACME,
+HTTP/2, compression, static files and streamed responses taken out), plus what this server needed:
+fibers of one thread that park and unpark each other (a request waits for its batch that way),
+slabs past 4 GiB, and a full server evicting its longest idle connections a batch at a time.
 
 ## Design
 
@@ -21,8 +37,9 @@ but the JWT key and the bcrypt workers. A connection is a fiber: handlers are pl
 that waits for Postgres the way it waits for its socket. An idle connection holds ~28 KB; the
 server keeps as many as its descriptor limit allows less 1,024 (198,976 under the box's 200,000),
 the longest idle closed first once every slot is taken, so a new client never meets a failing
-`accept`. At 120,000 users on 4 CPUs, twice what it can serve there, it kept serving 14,400
-requests a second (15,100 at its limit), and was idle again 2 s after the load stopped.
+`accept`. At 128,000 users on 4 CPUs, twice what it can serve there, it held all 128,013
+connections in 4.0 GB, 36 of 693,499 requests timed out, and it was idle again 1 s after the load
+stopped.
 
 **Reads in batches.** A cheap read's cost in Postgres is mostly the statement's own (Bind, executor
 start and end, the transaction), not its rows. Reads of one kind waiting together are sent as one
@@ -33,11 +50,15 @@ of 10. There is no timer: a read waits only while every read connection has a st
 and the kind whose oldest read has waited longest goes next (up to 128 requests), to the idle
 connection that last ran that kind if there is one, so a backend keeps one kind's plan and index
 pages warm (p50 -5%, p99 -10%). At low load every batch is one request; under load batches grow by
-themselves.
+themselves. At saturation the queue is the batch, and a request past a full one waits a whole
+statement more: on a database aged by the load, one shard with the box's 5 read and 2 write
+connections on 4 CPUs, a cap of 64 against 32 took p95 at 52k users from 160 ms to 90, and 128
+against 64 at 56k from 215 to 195.
 
 **What no viewer changes is read once per statement.** In a batch, the tags, the global
 `articlesCount`, each distinct page of the global, tag, author and favorited lists (its articles,
-their tags, favorite counts and authors), and each distinct capped count by tag, author or user are
+their tags, favorite counts and authors), each distinct article by slug (most are clicked from the
+list a user just saw), and each distinct capped count by tag, author or user are
 read once for the requests that ask for the same one, all of them already waiting before the
 statement runs; the tags come back as one row that every request of the batch keeps. `favorited`
 and `following` are always the request's own. Nothing outlives the statement: no result is kept for
