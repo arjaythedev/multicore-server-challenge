@@ -435,11 +435,23 @@ pub const statements = std.enums.EnumArray(S, pg.Statement).init(.{
     },
     // Every author of the feed is one the viewer follows, in the same
     // snapshot: `following` is true.
+    // Feeds overlap (the authors most followed write the most): each
+    // request's ids picked on its own, each distinct article read once.
     .batch_list_feed = .{
-        .sql = batch_page("SELECT x.id FROM follows fo CROSS JOIN LATERAL " ++
+        .sql = "WITH r AS (SELECT * " ++ batch_pages ++ "), " ++
+            "ids AS MATERIALIZED (SELECT r.i, r.v, p.id FROM r CROSS JOIN LATERAL (" ++
+            "SELECT x.id FROM follows fo CROSS JOIN LATERAL " ++
             "(SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id " ++
             "ORDER BY a2.id DESC LIMIT (r.l + r.o)) x " ++
-            "WHERE fo.follower_id = r.v ORDER BY x.id DESC OFFSET r.o LIMIT 100", "true"),
+            "WHERE fo.follower_id = r.v ORDER BY x.id DESC OFFSET r.o LIMIT r.l) p), " ++
+            "x AS MATERIALIZED (SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, " ++
+            tag_list ++ " AS tag_list, (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites, " ++
+            "u.username, u.bio, u.image FROM (SELECT DISTINCT ids.id FROM ids) d " ++
+            "JOIN articles a ON a.id = d.id JOIN users u ON u.id = a.author_id) " ++
+            "SELECT ids.i, x.slug, x.title, x.description, x.created_at, x.updated_at, x.tag_list, x.favorites, " ++
+            "EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = x.id AND f.user_id = ids.v), " ++
+            "x.username, x.bio, x.image, true " ++
+            "FROM ids JOIN x ON x.id = ids.id ORDER BY ids.i, ids.id DESC",
         .params = batch_page_params,
     },
     .batch_count_feed = .{
