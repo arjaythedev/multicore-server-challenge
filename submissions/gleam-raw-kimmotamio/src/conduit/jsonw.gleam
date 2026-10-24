@@ -1,5 +1,5 @@
-//// JSON output written straight into iodata (a StringTree): no intermediate maps. String escaping and
-//// timestamp formatting are the two C helpers in native/conduit_nif.c.
+//// JSON output written straight into iodata (a StringTree): no intermediate maps. String escaping, string
+//// arrays and timestamp formatting are C helpers in native/conduit_nif.c.
 
 import conduit/util
 import gleam/int
@@ -37,7 +37,12 @@ pub fn bool(b: Bool) -> StringTree {
 @external(erlang, "conduit_nif", "json_rfc3339")
 pub fn ts(micros: Int) -> StringTree
 
-pub fn str_array(items: List(BitArray)) -> StringTree {
+/// A JSON array of strings as one binary (a NIF): the 200-name tags list is one term, not 600.
+@external(erlang, "conduit_nif", "json_string_array")
+pub fn str_array(items: List(BitArray)) -> StringTree
+
+/// The same in Gleam, the tests' reference.
+pub fn str_array_gleam(items: List(BitArray)) -> StringTree {
   list.map(items, str)
   |> list.intersperse(string_tree.from_string(","))
   |> string_tree.concat

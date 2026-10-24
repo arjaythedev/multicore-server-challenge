@@ -38,6 +38,22 @@ pub fn rfc3339_nif_test() {
   assert string_tree.to_string(jsonw.ts(0)) == "\"2000-01-01T00:00:00.000Z\""
 }
 
+// The C array writer agrees with the Gleam one, escapes included.
+pub fn json_string_array_test() {
+  let cases = [
+    [],
+    [<<>>],
+    [<<"a":utf8>>],
+    [<<"a":utf8>>, <<"b":utf8>>],
+    [<<"q\"q":utf8>>, <<"back\\slash":utf8>>, <<"nl\n":utf8>>, <<0, 1, 31>>, <<"\u{e9}":utf8>>, <<"tab\t\r\u{8}\u{c}":utf8>>],
+    list.repeat(<<"tag-name":utf8>>, 200),
+  ]
+  list.each(cases, fn(items) {
+    assert string_tree.to_string(jsonw.str_array(items)) == string_tree.to_string(jsonw.str_array_gleam(items))
+  })
+  assert string_tree.to_string(jsonw.str_array([<<"a":utf8>>, <<"b\"":utf8>>])) == "[\"a\",\"b\\\"\"]"
+}
+
 pub fn json_string_test() {
   assert string_tree.to_string(jsonw.str(<<"plain":utf8>>)) == "\"plain\""
   assert string_tree.to_string(jsonw.str(<<>>)) == "\"\""

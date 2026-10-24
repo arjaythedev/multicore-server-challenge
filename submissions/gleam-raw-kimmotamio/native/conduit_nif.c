@@ -665,6 +665,54 @@ static ERL_NIF_TERM nif_parse_request(ErlNifEnv *env, int argc, const ERL_NIF_TE
     return enif_make_tuple8(env, atom_request, method, segments, query, auth, body, rest, close ? atom_true : atom_false);
 }
 
+
+/*
+ * json_string_array([Bin]) -> binary: `["a","b"]` with every element escaped as json_string escapes it, built
+ * in one binary. The tags list is 200 names: as a nested iolist it was 600 small terms for the writer to walk.
+ */
+static ERL_NIF_TERM nif_json_string_array(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    ERL_NIF_TERM list, head, tail, out;
+    ErlNifBinary bin;
+    size_t total = 2, i;
+    unsigned n = 0;
+    unsigned char *o;
+    static const char hex[] = "0123456789abcdef";
+    if (argc != 1 || !enif_is_list(env, argv[0])) return enif_make_badarg(env);
+    for (list = argv[0]; enif_get_list_cell(env, list, &head, &tail); list = tail) {
+        if (!enif_inspect_binary(env, head, &bin)) return enif_make_badarg(env);
+        total += bin.size + 3; /* quotes and a comma */
+        for (i = 0; i < bin.size; i++) total += escape_extra[bin.data[i]];
+        n++;
+    }
+    if (!enif_is_empty_list(env, list)) return enif_make_badarg(env);
+    o = enif_make_new_binary(env, total - (n ? 1 : 0), &out);
+    *o++ = '[';
+    for (list = argv[0]; enif_get_list_cell(env, list, &head, &tail); list = tail) {
+        enif_inspect_binary(env, head, &bin);
+        if (list != argv[0]) *o++ = ',';
+        *o++ = '"';
+        for (i = 0; i < bin.size; i++) {
+            unsigned char c = bin.data[i];
+            if (!escape_extra[c]) { *o++ = c; continue; }
+            *o++ = '\\';
+            switch (c) {
+            case '"': *o++ = '"'; break;
+            case '\\': *o++ = '\\'; break;
+            case '\n': *o++ = 'n'; break;
+            case '\r': *o++ = 'r'; break;
+            case '\t': *o++ = 't'; break;
+            case '\b': *o++ = 'b'; break;
+            case '\f': *o++ = 'f'; break;
+            default:
+                *o++ = 'u'; *o++ = '0'; *o++ = '0'; *o++ = hex[c >> 4]; *o++ = hex[c & 15];
+            }
+        }
+        *o++ = '"';
+    }
+    *o++ = ']';
+    return out;
+}
+
 static ErlNifFunc funcs[] = {
     {"json_string", 1, nif_json_string, 0},
     {"rfc3339", 1, nif_rfc3339, 0},
@@ -674,6 +722,7 @@ static ErlNifFunc funcs[] = {
     {"jwt_verify", 3, nif_jwt_verify, 0},
     {"hmac_sha256", 2, nif_hmac_sha256, 0},
     {"parse_request", 1, nif_parse_request, 0},
+    {"json_string_array", 1, nif_json_string_array, 0},
 };
 
 ERL_NIF_INIT(conduit_nif, funcs, load, NULL, NULL, NULL)

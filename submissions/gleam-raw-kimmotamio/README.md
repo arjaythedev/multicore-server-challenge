@@ -16,7 +16,7 @@ NIFs. One BEAM process per keep-alive connection, one BEAM process per Postgres 
 | Gleam | 1.19.2 (official release tarball, sha256-pinned) |
 | gleam_stdlib / gleam_erlang / gleam_json | 1.0.5 / 1.3.0 / 3.1.0 (pinned in `manifest.toml`; gleam_json is used for request bodies only) |
 | bcrypt | the OpenBSD `bcrypt.c`/`blowfish.c` as packaged by erlang-bcrypt, vendored in `native/` with its licence, plus a lane-interleaved variant (`native/bcrypt_lanes.c`) and a small NIF (`native/bcrypt_nif.c`), all built by `build.sh`; cost 10 |
-| C helpers | `native/conduit_nif.c`: JSON string escaping, RFC 3339 timestamps, DataRow and `text[]` splitting, the HTTP request head, HS256 JWT verification with its own SHA-256 (about 600 lines, no dependencies; the Gleam and Erlang versions stay as the tests' reference) |
+| C helpers | `native/conduit_nif.c`: JSON string escaping and string arrays, RFC 3339 timestamps, DataRow and `text[]` splitting, the HTTP request head, HS256 JWT verification with its own SHA-256 (about 650 lines, no dependencies; the Gleam and Erlang versions stay as the tests' reference) |
 
 `build.sh` compiles the NIFs with the system C compiler, downloads the three pinned Gleam packages and runs
 `gleam export erlang-shipment`. `start.sh` runs `erl` on the shipment in the foreground.
@@ -85,6 +85,8 @@ NIFs. One BEAM process per keep-alive connection, one BEAM process per Postgres 
   nothing needs escaping (the common case: no copy), otherwise one escaped copy. A timestamp is one NIF call that
   writes the quoted RFC 3339 string (truncated to milliseconds); the Gleam formatter it replaced stays as the
   test oracle. The two together were about a tenth of the BEAM's time per request as Erlang pattern matching.
+  A string array (`tagList`, and the 200-name `/api/tags` answer) is one NIF call that returns one binary, so
+  the tags response is one term for the socket writer to walk instead of 600.
 - **JWT**: a token in the shape every issuer here produces (the standard header, a flat
   `{"sub","iat","exp"}` payload, a 43-character signature) is verified by one NIF call: HMAC-SHA256 over the
   signed part with a SHA-256 written out in C (no OpenSSL round trip per request), the expected signature
