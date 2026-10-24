@@ -5,7 +5,7 @@
 A deliberately plain submission: CHICKEN Scheme compiled to C, the stock Spiffy web server, and off-the-shelf
 eggs for everything else (Postgres, JSON, bcrypt, HMAC). It runs the reference SQL from `SPEC.md` verbatim.
 There is no hand-written HTTP parser, JWT library or connection pool trickery. One file, `conduit.scm`, about
-650 lines. Passes `bench/cmd/conformance` 197/197.
+680 lines. Passes `bench/cmd/conformance` 197/197.
 
 | Piece | Version |
 |---|---|
@@ -52,7 +52,7 @@ Three things in the stack's defaults hurt badly under load. Fixing them was plum
 - **Read the body before routing.** An early 401/422/404 that never read the request body left those bytes
   on the keep-alive connection, where they were then parsed as the next request.
 
-## The one performance change: a direct JSON writer
+## Performance change 1: a direct JSON writer
 
 To find the biggest cost, I timed each part of a typical request in a compiled microbenchmark. For a
 10-article list page, in the server's own CPU:
@@ -77,6 +77,24 @@ same machine, so these numbers are only good for comparison):
 |---|---|---|---|---|
 | medea writer | 1.95 ms | 2,230 | 1,270 ms | 2,148 ms |
 | direct writer | 1.29 ms | 3,187 | 101 ms | 229 ms |
+
+## Performance change 2: prepared statements
+
+After the JSON fix, the largest remaining cost was Postgres parsing and planning every query on every
+request (about 1 ms of database CPU per request; the article queries have several subqueries). Now each
+connection `PREPARE`s a SQL string the first time it runs it and `EXECUTE`s it by name after that. That's
+what pgx does for the Go example. The SQL stays inline in the handlers; only the `execute` /
+`query-row` / `query-rows` helpers know about it. Statements hold query plans, never data, so this is
+within rule 5. Plan choice is left at Postgres's default (`plan_cache_mode = auto`).
+
+Same A/B setup as above:
+
+| | Postgres CPU per request (1,200 users) | 3,000 users: req/s | p95 | p99 |
+|---|---|---|---|---|
+| unnamed statements | 1.07 ms | 2,986 | 853 ms | 1,412 ms |
+| prepared statements | 0.66 ms | 3,285 | 511 ms | 904 ms |
+
+The server's own CPU per request is unchanged (~1.3 ms), as expected.
 
 ## Other details
 

@@ -11,7 +11,7 @@
         (only (chicken file posix) port->fileno file-control fcntl/getfl fcntl/setfl open/nonblock)
         (only srfi-1 every)
         (only srfi-13 string-null? string-prefix?)
-        srfi-18 matchable
+        srfi-18 srfi-69 matchable
         spiffy intarweb uri-common
         postgresql sql-null (only medea read-json) crypt
         hmac sha2 base64)
@@ -77,13 +77,34 @@
       (query c "SET TIME ZONE 'UTC'")
       (give-conn! c))))
 
+;; Prepared statements: a connection PREPAREs each SQL string the first time it runs it, then
+;; EXECUTEs it by name, so Postgres parses and plans each query once per connection instead of on
+;; every request (what pgx does for the Go example). Only plans are kept, never data.
+;; connection -> (hash table: SQL -> statement name). An alist rather than an eq? hash table:
+;; those hash by address, which the garbage collector changes, and a worker has only a few connections.
+(define statement-names '())
+
+(define (statement-name db sql)
+  (let ((names (cond ((assq db statement-names) => cdr)
+                     (else (let ((names (make-hash-table string=? string-hash)))
+                             (set! statement-names (cons (cons db names) statement-names))
+                             names)))))
+    (or (hash-table-ref/default names sql #f)
+        (let ((name (string->symbol (conc "s" (hash-table-size names)))))
+          (query db (conc "PREPARE " name " AS " sql))
+          (hash-table-set! names sql name)
+          name))))
+
+(define (execute db sql . params)
+  (query* db (statement-name db sql) params))
+
 ;; First row as a list, or #f.
 (define (query-row db sql . params)
-  (let ((r (query* db sql params)))
+  (let ((r (apply execute db sql params)))
     (and (> (row-count r) 0) (row-values r 0))))
 
 (define (query-rows db sql . params)
-  (row-map identity (query* db sql params)))
+  (row-map identity (apply execute db sql params)))
 
 (define (null->json v) (if (sql-null? v) 'null v))
 (define (json->param v) (if (or (not v) (eq? v 'null)) (sql-null) v))
@@ -402,8 +423,8 @@ RETURNING id, username, email, bio, image"
        (match (query-row db "SELECT id, username, bio, image FROM users WHERE username = $1" username)
          ((id name bio image)
           (if follow?
-              (query db "INSERT INTO follows (follower_id, followee_id) VALUES ($1, $2) ON CONFLICT DO NOTHING" viewer id)
-              (query db "DELETE FROM follows WHERE follower_id = $1 AND followee_id = $2" viewer id))
+              (execute db "INSERT INTO follows (follower_id, followee_id) VALUES ($1, $2) ON CONFLICT DO NOTHING" viewer id)
+              (execute db "DELETE FROM follows WHERE follower_id = $1 AND followee_id = $2" viewer id))
           (respond 200 `((profile . ,(profile-json name bio image follow?)))))
          (#f (fail 404 "profile not found")))))))
 
@@ -485,8 +506,8 @@ SELECT n.id, " slugify " || '-' || n.id, $1, $2, $3, $4
   FROM (SELECT nextval(pg_get_serial_sequence('articles', 'id')) AS id) n
 RETURNING id") viewer title description body))))
                       (when (> (vector-length tags) 0)
-                        (query db "INSERT INTO tags (name) SELECT DISTINCT unnest($1::text[]) ON CONFLICT (name) DO NOTHING" tags)
-                        (query db "INSERT INTO article_tags (article_id, tag_id) SELECT $1, t.id FROM tags t WHERE t.name = ANY($2::text[])" id tags))
+                        (execute db "INSERT INTO tags (name) SELECT DISTINCT unnest($1::text[]) ON CONFLICT (name) DO NOTHING" tags)
+                        (execute db "INSERT INTO article_tags (article_id, tag_id) SELECT $1, t.id FROM tags t WHERE t.name = ANY($2::text[])" id tags))
                       id)))))
          (respond 201 `((article . ,(full-article db viewer id)))))))))
 
@@ -499,7 +520,7 @@ RETURNING id") viewer title description body))))
     (with-db
      (lambda (db)
        (let ((id (owned-article-id db slug viewer)))
-         (query db (string-append "UPDATE articles SET title = COALESCE($2, title), description = COALESCE($3, description), body = COALESCE($4, body),
+         (execute db (string-append "UPDATE articles SET title = COALESCE($2, title), description = COALESCE($3, description), body = COALESCE($4, body),
        slug = CASE WHEN $2::text IS NULL THEN slug ELSE " slugify " || '-' || id END,
        updated_at = now()
  WHERE id = $1")
@@ -510,7 +531,7 @@ RETURNING id") viewer title description body))))
   (let ((viewer (viewer-required)))
     (with-db
      (lambda (db)
-       (query db "DELETE FROM articles WHERE id = $1" (owned-article-id db slug viewer))
+       (execute db "DELETE FROM articles WHERE id = $1" (owned-article-id db slug viewer))
        (no-content)))))
 
 (define (favorite slug favorite?)
@@ -519,8 +540,8 @@ RETURNING id") viewer title description body))))
      (lambda (db)
        (let ((id (article-id-by-slug db slug)))
          (if favorite?
-             (query db "INSERT INTO favorites (user_id, article_id) VALUES ($1, $2) ON CONFLICT DO NOTHING" viewer id)
-             (query db "DELETE FROM favorites WHERE user_id = $1 AND article_id = $2" viewer id))
+             (execute db "INSERT INTO favorites (user_id, article_id) VALUES ($1, $2) ON CONFLICT DO NOTHING" viewer id)
+             (execute db "DELETE FROM favorites WHERE user_id = $1 AND article_id = $2" viewer id))
          (respond 200 `((article . ,(full-article db viewer id)))))))))
 
 ;;; Handlers: comments
@@ -566,7 +587,7 @@ SELECT c.id, c.body, " (ts "c.created_at") ", " (ts "c.updated_at") ", u.usernam
  WHERE c.id = $1 AND a.slug = $2" comment-id slug)
          ((author)
           (unless (= author viewer) (fail 403 "not your comment"))
-          (query db "DELETE FROM comments WHERE id = $1" comment-id)
+          (execute db "DELETE FROM comments WHERE id = $1" comment-id)
           (no-content))
          (#f (fail 404 "comment not found")))))))
 
