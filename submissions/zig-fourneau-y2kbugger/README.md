@@ -117,6 +117,19 @@ huge pages are switched off for the process, so a connection's few touched pages
 Response bodies are written into a result slot of the shard (2,048 of them, requests in flight at
 most), straight from the binary rows.
 
+## Against the leaderboard's #1, on one machine
+
+Unofficial, not the box: rust-tokio-Scooter1337 built from its folder and started as its
+`start.sh` starts it, and this server at its defaults, each on the same 4 CPUs and a fresh copy of
+the full seed, interleaved twice, 58,000 users (a 30 s ramp, 60 s measured):
+
+| | requests a second | p95 | p99 | Postgres CPU a request |
+|---|--:|--:|--:|--:|
+| this server | 14,225 / 14,629 | 638 / 421 ms | 761 / 517 ms | 176 / 171 us |
+| rust-tokio-Scooter1337 | 9,804 / 9,674 | 2,904 / 3,228 ms | 3,023 / 3,394 ms | 249 / 251 us |
+
+1.45-1.51 times the requests on the same CPUs, each costing Postgres about 30% less CPU.
+
 ## The rules, where they bite
 
 - 5, no caching: nothing read for one request is kept for another. Sharing happens only inside one
