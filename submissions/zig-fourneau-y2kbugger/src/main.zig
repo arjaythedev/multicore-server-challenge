@@ -18,7 +18,9 @@ const shard_module = @import("shard.zig");
 /// (start.sh sets none).
 const Tuning = struct {
     shards: u32 = 2,
-    bcrypt_workers: u32 = 2,
+    /// With Postgres saturating the CPUs, two had too small a share: logins
+    /// queued past their 10 s (91% of them, 55k users on 4 CPUs).
+    bcrypt_workers: u32 = 4,
     /// Per shard: Postgres connections for reads and for writes (writes
     /// wait for their commit's flush, so reads never queue behind one).
     /// 6 and 9 measured alike on 4 CPUs (13,904 and 13,947 req/s at

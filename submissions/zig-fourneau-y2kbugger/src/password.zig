@@ -313,6 +313,7 @@ pub const Pool = struct {
     tail: ?*Job = null,
     /// Bumped per job queued: idle workers wait on it.
     queued: std.atomic.Value(u32) = .init(0),
+    gatherer: std.atomic.Value(u32) = .init(0),
 
     pub fn start(pool: *Pool, workers: u32) !void {
         assert(workers > 0);
@@ -345,7 +346,12 @@ pub const Pool = struct {
         var jobs: [lanes_max]*Job = undefined;
         // Bounded only to say so: workers run for good.
         for (0..std.math.maxInt(u64)) |_| {
+            // One worker gathers at a time, so the others' batches are not
+            // split from its: it hashes once its batch is full or old enough,
+            // and the next gathers meanwhile.
+            pool.gatherer_acquire();
             const count = pool.gather(&jobs);
+            pool.gatherer_release();
             run_lanes(jobs[0..count]);
             for (jobs[0..count]) |job| {
                 job.done.store(1, .release);
@@ -395,6 +401,20 @@ pub const Pool = struct {
             return job;
         }
         return null;
+    }
+
+    /// The gatherer's place: 0 free, 1 held; workers waiting sleep on it.
+    fn gatherer_acquire(pool: *Pool) void {
+        // Bounded only to say so: the holder releases once it has a batch.
+        for (0..std.math.maxInt(u64)) |_| {
+            if (pool.gatherer.cmpxchgStrong(0, 1, .acquire, .monotonic) == null) return;
+            _ = linux.futex_4arg(&pool.gatherer.raw, .{ .cmd = .WAIT, .private = true }, 1, null);
+        } else unreachable;
+    }
+
+    fn gatherer_release(pool: *Pool) void {
+        pool.gatherer.store(0, .release);
+        _ = linux.futex_3arg(&pool.gatherer.raw, .{ .cmd = .WAKE, .private = true }, 1);
     }
 
     /// A spin lock: what it guards is a pointer or two.
