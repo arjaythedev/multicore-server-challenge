@@ -1,0 +1,33 @@
+MIT License
+
+Copyright (c) 2026 arjaythedev and the challenge contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---------------------------------------------------------------------------
+
+This submission builds on, with thanks:
+
+- elixir-raw-foovoo by @FooVoo (MIT, this repository): the HTTP server, request
+  handling, JSON output, JWT and the SQL statements this submission started from.
+- rust-tokio-Scooter1337 by @Scooter1337 (MIT, this repository): native/
+  crypt-port.h, byteorder.h, bcrypt-batch.c and bcrypt-batch-impl.h, unchanged.
+- crypt_blowfish by Solar Designer, via libxcrypt 4.4.36: native/crypt-bcrypt.c,
+  unchanged, in the public domain (see the notice at the top of that file,
+  which also grants a permissive license where public domain doesn't apply).
