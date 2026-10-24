@@ -8,7 +8,7 @@ import io.avaje.http.api.Get;
 import io.avaje.http.api.Post;
 import io.avaje.http.api.Produces;
 import io.avaje.http.api.Put;
-import io.avaje.jex.http.Context;
+import io.helidon.webserver.http.ServerRequest;
 import org.ethelred.kiwiproc.exception.UncheckedSQLException;
 
 /** Users and auth: register, login, current user, update user. */
@@ -48,8 +48,8 @@ class UserController {
 
     @Post("/api/users")
     @Produces(statusCode = 201)
-    Dto.UserResponse register(Context ctx) {
-        Map<String, Object> user = body.object(ctx, "user");
+    Dto.UserResponse register(ServerRequest req) {
+        Map<String, Object> user = body.object(req, "user");
         String username = Body.required(user, "username");
         String email = Body.required(user, "email");
         String password = Body.required(user, "password");
@@ -65,8 +65,8 @@ class UserController {
 
     @Post("/api/users/login")
     @Produces(statusCode = 200)
-    Dto.UserResponse login(Context ctx) {
-        Map<String, Object> user = body.object(ctx, "user");
+    Dto.UserResponse login(ServerRequest req) {
+        Map<String, Object> user = body.object(req, "user");
         String email = Body.required(user, "email");
         String password = Body.required(user, "password");
         UserDao.LoginRow row = users.findByEmail(email);
@@ -78,8 +78,8 @@ class UserController {
     }
 
     @Get("/api/user")
-    Dto.UserResponse current(Context ctx) {
-        Auth.User caller = auth.user(ctx);
+    Dto.UserResponse current(ServerRequest req) {
+        Auth.User caller = auth.user(req);
         UserDao.UserRow row = users.findById(caller.id());
         if (row == null) {
             throw ApiException.unauthorized();
@@ -88,9 +88,9 @@ class UserController {
     }
 
     @Put("/api/user")
-    Dto.UserResponse update(Context ctx) {
-        Auth.User caller = auth.user(ctx);
-        Map<String, Object> user = body.object(ctx, "user");
+    Dto.UserResponse update(ServerRequest req) {
+        Auth.User caller = auth.user(req);
+        Map<String, Object> user = body.object(req, "user");
         String email = Body.optionalNonEmpty(user, "email");
         String username = Body.optionalNonEmpty(user, "username");
         String password = Body.optionalNonEmpty(user, "password");

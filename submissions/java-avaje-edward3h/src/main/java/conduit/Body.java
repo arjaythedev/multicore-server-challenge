@@ -5,7 +5,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
-import io.avaje.jex.http.Context;
+import io.helidon.webserver.http.ServerRequest;
 import io.avaje.jsonb.JsonType;
 import io.avaje.jsonb.Jsonb;
 import jakarta.inject.Singleton;
@@ -25,10 +25,10 @@ final class Body {
 
     /** The object under {@code key} in the request body; 422 if the body isn't {"key": {...}}. */
     @SuppressWarnings("unchecked")
-    Map<String, Object> object(Context ctx, String key) {
+    Map<String, Object> object(ServerRequest req, String key) {
         Object root;
         try {
-            root = type.fromJson(ctx.bodyAsBytes());
+            root = type.fromJson(req.content().as(byte[].class));
         } catch (RuntimeException ex) {
             throw ApiException.invalid("malformed JSON body");
         }

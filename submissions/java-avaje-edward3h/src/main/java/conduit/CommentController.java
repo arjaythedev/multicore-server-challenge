@@ -6,7 +6,7 @@ import io.avaje.http.api.Controller;
 import io.avaje.http.api.Delete;
 import io.avaje.http.api.Get;
 import io.avaje.http.api.Post;
-import io.avaje.jex.http.Context;
+import io.helidon.webserver.http.ServerRequest;
 
 /** Comments on an article. */
 @Controller
@@ -33,8 +33,8 @@ class CommentController {
     }
 
     @Get("/api/articles/{slug}/comments")
-    Dto.CommentList list(String slug, Context ctx) {
-        long viewer = auth.viewer(ctx);
+    Dto.CommentList list(String slug, ServerRequest req) {
+        long viewer = auth.viewer(req);
         long articleId = articleId(slug);
         return new Dto.CommentList(comments.list(viewer, articleId).stream()
                 .map(r -> new Dto.Comment(r.id(), Dto.timestamp(r.createdAt()), Dto.timestamp(r.updatedAt()),
@@ -43,9 +43,9 @@ class CommentController {
     }
 
     @Post("/api/articles/{slug}/comments")
-    Dto.CommentResponse create(String slug, Context ctx) {
-        Auth.User caller = auth.user(ctx);
-        String text = Body.required(body.object(ctx, "comment"), "body");
+    Dto.CommentResponse create(String slug, ServerRequest req) {
+        Auth.User caller = auth.user(req);
+        String text = Body.required(body.object(req, "comment"), "body");
         long articleId = articleId(slug);
         CommentDao.NewCommentRow r = comments.insert(articleId, caller.id(), text);
         return new Dto.CommentResponse(new Dto.Comment(r.id(), Dto.timestamp(r.createdAt()),
@@ -53,8 +53,8 @@ class CommentController {
     }
 
     @Delete("/api/articles/{slug}/comments/{id}")
-    void delete(String slug, String id, Context ctx) {
-        Auth.User caller = auth.user(ctx);
+    void delete(String slug, String id, ServerRequest req) {
+        Auth.User caller = auth.user(req);
         long commentId = Body.parseUint(id);
         Long author = commentId < 0 ? null : comments.authorOf(commentId, slug);
         if (author == null) {

@@ -9,7 +9,7 @@ import io.avaje.http.api.Get;
 import io.avaje.http.api.Post;
 import io.avaje.http.api.Produces;
 import io.avaje.http.api.Put;
-import io.avaje.jex.http.Context;
+import io.helidon.webserver.http.ServerRequest;
 
 /** Articles, the feed, and favorites. */
 @Controller
@@ -29,15 +29,19 @@ class ArticleController {
     }
 
     /** limit (default 20, 1..100) and offset (default 0, >= 0); a parameter that is present, even empty, must be valid. */
-    private static Page page(Context ctx) {
-        String limit = ctx.queryParam("limit");
-        String offset = ctx.queryParam("offset");
+    private static Page page(ServerRequest req) {
+        String limit = query(req, "limit");
+        String offset = query(req, "offset");
         long l = limit == null ? 20 : Body.parseUint(limit);
         long o = offset == null ? 0 : Body.parseUint(offset);
         if (l < 1 || l > 100 || o < 0) {
             throw ApiException.invalid("limit must be 1-100 and offset >= 0");
         }
         return new Page(l, o);
+    }
+
+    private static String query(ServerRequest req, String name) {
+        return req.query().first(name).orElse(null);
     }
 
     private static boolean given(String s) {
@@ -66,12 +70,12 @@ class ArticleController {
     }
 
     @Get("/api/articles")
-    Dto.ArticleList list(Context ctx) {
-        long viewer = auth.viewer(ctx);
-        Page p = page(ctx);
-        String tag = ctx.queryParam("tag");
-        String author = ctx.queryParam("author");
-        String favorited = ctx.queryParam("favorited");
+    Dto.ArticleList list(ServerRequest req) {
+        long viewer = auth.viewer(req);
+        Page p = page(req);
+        String tag = query(req, "tag");
+        String author = query(req, "author");
+        String favorited = query(req, "favorited");
         if (given(tag)) {
             return summaries(articles.listByTag(viewer, p.limit(), p.offset(), tag), articles.countByTag(tag));
         } else if (given(author)) {
@@ -85,21 +89,21 @@ class ArticleController {
     }
 
     @Get("/api/articles/feed")
-    Dto.ArticleList feed(Context ctx) {
-        Auth.User caller = auth.user(ctx);
-        Page p = page(ctx);
+    Dto.ArticleList feed(ServerRequest req) {
+        Auth.User caller = auth.user(req);
+        Page p = page(req);
         return summaries(articles.feed(caller.id(), p.limit(), p.offset()), articles.countFeed(caller.id()));
     }
 
     @Get("/api/articles/{slug}")
-    Dto.ArticleResponse get(String slug, Context ctx) {
-        return full(articles.findBySlug(auth.viewer(ctx), slug));
+    Dto.ArticleResponse get(String slug, ServerRequest req) {
+        return full(articles.findBySlug(auth.viewer(req), slug));
     }
 
     @Post("/api/articles")
-    Dto.ArticleResponse create(Context ctx) {
-        Auth.User caller = auth.user(ctx);
-        Map<String, Object> article = body.object(ctx, "article");
+    Dto.ArticleResponse create(ServerRequest req) {
+        Auth.User caller = auth.user(req);
+        Map<String, Object> article = body.object(req, "article");
         String title = Body.required(article, "title");
         String description = Body.required(article, "description");
         String text = Body.required(article, "body");
@@ -117,9 +121,9 @@ class ArticleController {
     }
 
     @Put("/api/articles/{slug}")
-    Dto.ArticleResponse update(String slug, Context ctx) {
-        Auth.User caller = auth.user(ctx);
-        Map<String, Object> article = body.object(ctx, "article");
+    Dto.ArticleResponse update(String slug, ServerRequest req) {
+        Auth.User caller = auth.user(req);
+        Map<String, Object> article = body.object(req, "article");
         String title = Body.optionalNonEmpty(article, "title");
         String description = Body.optionalNonEmpty(article, "description");
         String text = Body.optionalNonEmpty(article, "body");
@@ -129,21 +133,21 @@ class ArticleController {
     }
 
     @Delete("/api/articles/{slug}")
-    void delete(String slug, Context ctx) {
-        Auth.User caller = auth.user(ctx);
+    void delete(String slug, ServerRequest req) {
+        Auth.User caller = auth.user(req);
         articles.delete(owner(caller, slug).id());
     }
 
     @Post("/api/articles/{slug}/favorite")
     @Produces(statusCode = 200)
-    Dto.ArticleResponse favorite(String slug, Context ctx) {
-        return setFavorite(auth.user(ctx), slug, true);
+    Dto.ArticleResponse favorite(String slug, ServerRequest req) {
+        return setFavorite(auth.user(req), slug, true);
     }
 
     @Delete("/api/articles/{slug}/favorite")
     @Produces(statusCode = 200)
-    Dto.ArticleResponse unfavorite(String slug, Context ctx) {
-        return setFavorite(auth.user(ctx), slug, false);
+    Dto.ArticleResponse unfavorite(String slug, ServerRequest req) {
+        return setFavorite(auth.user(req), slug, false);
     }
 
     private Dto.ArticleResponse setFavorite(Auth.User caller, String slug, boolean favorite) {

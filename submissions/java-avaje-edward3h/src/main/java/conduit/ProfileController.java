@@ -5,7 +5,7 @@ import io.avaje.http.api.Delete;
 import io.avaje.http.api.Get;
 import io.avaje.http.api.Post;
 import io.avaje.http.api.Produces;
-import io.avaje.jex.http.Context;
+import io.helidon.webserver.http.ServerRequest;
 
 /** Profiles and follows. */
 @Controller
@@ -20,8 +20,8 @@ class ProfileController {
     }
 
     @Get("/api/profiles/{username}")
-    Dto.ProfileResponse get(String username, Context ctx) {
-        long viewer = auth.viewer(ctx);
+    Dto.ProfileResponse get(String username, ServerRequest req) {
+        long viewer = auth.viewer(req);
         UserDao.ProfileRow row = users.profile(viewer, username);
         if (row == null) {
             throw ApiException.notFound("profile");
@@ -31,18 +31,18 @@ class ProfileController {
 
     @Post("/api/profiles/{username}/follow")
     @Produces(statusCode = 200)
-    Dto.ProfileResponse follow(String username, Context ctx) {
-        return setFollow(username, ctx, true);
+    Dto.ProfileResponse follow(String username, ServerRequest req) {
+        return setFollow(username, req, true);
     }
 
     @Delete("/api/profiles/{username}/follow")
     @Produces(statusCode = 200)
-    Dto.ProfileResponse unfollow(String username, Context ctx) {
-        return setFollow(username, ctx, false);
+    Dto.ProfileResponse unfollow(String username, ServerRequest req) {
+        return setFollow(username, req, false);
     }
 
-    private Dto.ProfileResponse setFollow(String username, Context ctx, boolean follow) {
-        Auth.User caller = auth.user(ctx);
+    private Dto.ProfileResponse setFollow(String username, ServerRequest req, boolean follow) {
+        Auth.User caller = auth.user(req);
         UserDao.FolloweeRow row = users.findByUsername(username);
         if (row == null) {
             throw ApiException.notFound("profile");

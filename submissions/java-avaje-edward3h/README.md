@@ -1,8 +1,8 @@
-# Conduit: Java 26 (Avaje, Jex, kiwiproc)
+# Conduit: Java 26 (Avaje, Helidon SE, kiwiproc)
 
 **Front: nginx**
 
-Plain Java on the [Avaje](https://avaje.io/) stack with [kiwiproc](https://edward3h.github.io/kiwiproc/) for SQL.
+Plain Java on the [Avaje](https://avaje.io/) stack with [Helidon SE](https://helidon.io/) as the HTTP server with [kiwiproc](https://edward3h.github.io/kiwiproc/) for SQL.
 The package layout follows `examples/java` (one controller per area, `Auth`, `Jwt`, `Body`, `Dto`, `ApiException`),
 with Avaje replacing Spring. One JVM; every request runs on its own virtual thread.
 
@@ -11,7 +11,7 @@ with Avaje replacing Spring. One JVM; every request runs on its own virtual thre
 | JDK | Eclipse Temurin 26.0.2.1+1 (`install.sh` -> `/opt/jdk`), `--release 26` |
 | Build | Gradle 9.5.1 via the checked-in wrapper (`./gradlew`) |
 | DI | avaje-inject 12.7 |
-| HTTP | avaje-http 3.12.1 annotations and `jex` generator, on avaje-jex 3.6 (the JDK's built-in `HttpServer`) |
+| HTTP | avaje-http 3.12.1 annotations and `helidon` generator, on Helidon SE (WebServer) 4.5.6 |
 | JSON | avaje-jsonb 3.16 |
 | SQL | kiwiproc 1.0 (Gradle plugin), reference SQL from `SPEC.md` |
 | Driver and pool | pgjdbc 42.7.14, HikariCP 7.1.0 (10 connections per core, set in `start.sh`) |
@@ -37,8 +37,16 @@ time and never touches the real database.
 
 - Every statement is the reference SQL from `SPEC.md`, in the same order. `POST /api/articles` runs its inserts in
   one transaction with kiwiproc's `TransactionalDAO.call`.
-- The JDK HTTP server closes idle keep-alive connections after 30 s and keeps at most 200 of them; `start.sh`
-  sets `sun.net.httpserver.idleInterval=75` (longer than Nginx's 60 s) and `maxIdleConnections`.
+- Helidon runs every request on its own virtual thread. Its connection read timeout is 75 s, which also bounds an
+  idle keep-alive connection, so it outlasts Nginx's 60 s upstream keep-alive. The listen backlog is 1024.
+- The first version used Jex on the JDK's built-in `HttpServer`; Helidon replaced it after load testing (below).
+
 - Request bodies are parsed as a JSON tree so `{"title": 123}` is a 422, not coerced. Passwords over 72 bytes are a 422.
 - Timestamps are formatted with `uuuu-MM-dd'T'HH:mm:ss.SSS'Z'` in UTC, which truncates.
 - Nulls are serialised explicitly (`bio` and `image` are JSON `null`).
+
+## Load test (not the benchmark box)
+
+A 4-core mini PC running the server, Postgres 18 (pgtune settings) and the load generator together, full seed, no
+Nginx, 60 s probes and a 5-minute hold. Users held for 5 minutes: JDK `HttpServer` 9,200 (JDK 26) and 9,300 (JDK 27);
+Helidon 9,500 (JDK 27); the Spring example 10,000 (JDK 27). Not comparable with the leaderboard.

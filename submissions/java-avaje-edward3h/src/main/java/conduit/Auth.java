@@ -1,6 +1,7 @@
 package conduit;
 
-import io.avaje.jex.http.Context;
+import io.helidon.http.HeaderNames;
+import io.helidon.webserver.http.ServerRequest;
 import jakarta.inject.Singleton;
 
 /**
@@ -23,8 +24,8 @@ final class Auth {
         this.jwt = jwt;
     }
 
-    User user(Context ctx) {
-        String token = token(ctx);
+    User user(ServerRequest req) {
+        String token = token(req);
         if (token == null) {
             throw ApiException.unauthorized();
         }
@@ -32,8 +33,8 @@ final class Auth {
     }
 
     /** The caller's user id, or 0 when anonymous. */
-    long viewer(Context ctx) {
-        String token = token(ctx);
+    long viewer(ServerRequest req) {
+        String token = token(req);
         return token == null ? 0 : verify(token);
     }
 
@@ -45,8 +46,8 @@ final class Auth {
         return id;
     }
 
-    private static String token(Context ctx) {
-        String header = ctx.header("Authorization");
+    private static String token(ServerRequest req) {
+        String header = req.headers().first(HeaderNames.AUTHORIZATION).orElse(null);
         if (header == null || header.isEmpty()) {
             return null;
         }
