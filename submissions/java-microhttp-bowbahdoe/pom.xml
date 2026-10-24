@@ -6,7 +6,7 @@
 
     <packaging>jar</packaging>
     <groupId>dev.mccue</groupId>
-    <artifactId>microhttp-vertx-pgjson-realworld</artifactId>
+    <artifactId>microhttp-realworld</artifactId>
     <version>1.0-SNAPSHOT</version>
 
     <properties>
