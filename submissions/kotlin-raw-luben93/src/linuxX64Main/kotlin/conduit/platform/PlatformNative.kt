@@ -278,6 +278,4 @@ private object ThreadScratch {
 
 actual fun threadScratch(): Scratch = ThreadScratch.scratch
 
-actual fun startHttpServer(host: String, port: Int, loops: Int, engine: conduit.http.HttpEngine): Unit =
-    TODO("native: epoll event loops")
 
