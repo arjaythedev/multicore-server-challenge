@@ -35,10 +35,17 @@ time and never touches the real database.
 
 ## Notes
 
-- Every statement is the reference SQL from `SPEC.md`, in the same order. `POST /api/articles` runs its inserts in
+- The SQL is the reference SQL from `SPEC.md`, in the same order, except that article queries first pick their page
+  of ids (a `page` CTE with the reference query's filter, order and limit) and then join one aggregate of those
+  articles' tags, instead of running a tag subquery per article. The result is identical; in Postgres the list
+  query ran about twice as fast (pgbench, 4 clients). `POST /api/articles` runs its inserts in
   one transaction with kiwiproc's `TransactionalDAO.call`.
 - Helidon runs every request on its own virtual thread. Its connection read timeout is 75 s, which also bounds an
   idle keep-alive connection, so it outlasts Nginx's 60 s upstream keep-alive. The listen backlog is 1024.
+- `tcpNoDelay` is on. Without it, a response written in two pieces (headers, then a larger body) waited for the
+  client's delayed ACK, about 40 ms on the list endpoints.
+- bcrypt (about 70 ms of CPU per hash) runs on a small pool of platform threads (`Passwords.java`, half the cores),
+  so a few simultaneous logins can't occupy every virtual-thread carrier.
 - The first version used Jex on the JDK's built-in `HttpServer`; Helidon replaced it after load testing (below).
 
 - Request bodies are parsed as a JSON tree so `{"title": 123}` is a 422, not coerced. Passwords over 72 bytes are a 422.
@@ -49,4 +56,4 @@ time and never touches the real database.
 
 A 4-core mini PC running the server, Postgres 18 (pgtune settings) and the load generator together, full seed, no
 Nginx, 60 s probes and a 5-minute hold. Users held for 5 minutes: JDK `HttpServer` 9,200 (JDK 26) and 9,300 (JDK 27);
-Helidon 9,500 (JDK 27); the Spring example 10,000 (JDK 27). Not comparable with the leaderboard.
+Helidon 9,500, then 9,800 with the page-first SQL and 10,000 with `tcpNoDelay` as well (JDK 27); the Spring example 10,000 (JDK 27). Not comparable with the leaderboard.

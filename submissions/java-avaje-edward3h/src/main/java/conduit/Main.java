@@ -36,6 +36,9 @@ public class Main {
                 .port(Integer.parseInt(Config.env("PORT", "3000")))
                 .backlog(1024)
                 .connectionConfig(c -> c.readTimeout(Duration.ofSeconds(75)))
+                // without this a response written in two pieces (headers, then a larger body) waits for the
+                // client's delayed ACK: about 40 ms on the list endpoints
+                .connectionOptions(o -> o.tcpNoDelay(true))
                 .addRouting(routing)
                 .build()
                 .start();

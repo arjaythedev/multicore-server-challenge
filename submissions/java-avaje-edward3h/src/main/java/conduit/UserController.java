@@ -2,7 +2,6 @@ package conduit;
 
 import java.util.Map;
 
-import at.favre.lib.crypto.bcrypt.BCrypt;
 import io.avaje.http.api.Controller;
 import io.avaje.http.api.Get;
 import io.avaje.http.api.Post;
@@ -15,23 +14,18 @@ import org.ethelred.kiwiproc.exception.UncheckedSQLException;
 @Controller
 class UserController {
 
-    /** bcrypt cost 10 for every new hash; verification uses the cost stored in the hash. */
-    private static final int BCRYPT_COST = 10;
-
     private final UserDao users;
     private final Auth auth;
     private final Jwt jwt;
+    private final Passwords passwords;
     private final Body body;
 
-    UserController(UserDao users, Auth auth, Jwt jwt, Body body) {
+    UserController(UserDao users, Auth auth, Jwt jwt, Passwords passwords, Body body) {
         this.users = users;
         this.auth = auth;
         this.jwt = jwt;
+        this.passwords = passwords;
         this.body = body;
-    }
-
-    static String hash(String password) {
-        return BCrypt.withDefaults().hashToString(BCRYPT_COST, Body.hashable(password).toCharArray());
     }
 
     private static Dto.UserResponse wrap(UserDao.UserRow r, String token) {
@@ -53,7 +47,7 @@ class UserController {
         String username = Body.required(user, "username");
         String email = Body.required(user, "email");
         String password = Body.required(user, "password");
-        String hash = hash(password);
+        String hash = passwords.hash(password);
         UserDao.UserRow row;
         try {
             row = users.insert(username, email, hash);
@@ -70,7 +64,7 @@ class UserController {
         String email = Body.required(user, "email");
         String password = Body.required(user, "password");
         UserDao.LoginRow row = users.findByEmail(email);
-        if (row == null || !BCrypt.verifyer().verify(password.toCharArray(), row.passwordHash()).verified) {
+        if (row == null || !passwords.verify(password, row.passwordHash())) {
             throw new ApiException(401, "email or password is invalid");
         }
         return wrap(new UserDao.UserRow(row.id(), row.username(), row.email(), row.bio(), row.image()),
@@ -96,7 +90,7 @@ class UserController {
         String password = Body.optionalNonEmpty(user, "password");
         String bio = Body.optional(user, "bio");
         String image = Body.optional(user, "image");
-        String hash = password == null ? null : hash(password);
+        String hash = password == null ? null : passwords.hash(password);
         UserDao.UserRow row;
         try {
             row = users.update(caller.id(), email, username, hash, bio, image);
