@@ -110,7 +110,7 @@ const slugify = "trim(both '-' from lower(regexp_replace($6, '[^A-Za-z0-9]+', '-
 
 pub const defs = blk: {
     var d: [std.meta.fieldNames(Stmt).len]Def = undefined;
-    d[@intFromEnum(Stmt.tags)] = .{ .sql = "SELECT name FROM tags WHERE $1 IS NOT NULL ORDER BY name", .params = &.{I8} }; // $1: the viewer, unused; it keeps each request's run separate when batched
+    d[@intFromEnum(Stmt.tags)] = .{ .sql = "SELECT name FROM tags WHERE $1 IS NOT NULL ORDER BY name", .params = &.{I8} }; // $1: the viewer, unused. (Waiting `tags` requests are answered from one execution of this statement; see flushReads.)
     d[@intFromEnum(Stmt.user_by_id)] = .{ .sql = "SELECT id, username, email, bio, image FROM users WHERE id = $1", .params = &.{I8} };
     d[@intFromEnum(Stmt.user_login)] = .{ .sql = "SELECT id, username, email, bio, image, password_hash FROM users WHERE email = $1", .params = &.{TX} };
     d[@intFromEnum(Stmt.user_insert)] = .{
@@ -314,7 +314,9 @@ fn arrayOid(comptime oid: u32) u32 {
     };
 }
 
-fn batchedSql(comptime d: Def) []const u8 {
+/// The batched form of a single-request statement. The reply splitter relies on the rows arriving grouped by ordinal in
+/// ascending order, which only an explicit ORDER BY guarantees (`inner_order` repeats the statement's own row order).
+fn batchedSql(comptime d: Def, comptime inner_order: []const u8) []const u8 {
     comptime {
         @setEvalBranchQuota(2_000_000);
         var un: []const u8 = "";
@@ -324,7 +326,7 @@ fn batchedSql(comptime d: Def) []const u8 {
             un = un ++ (if (k > 0) ", " else "") ++ "$" ++ n ++ "::" ++ arrayType(o);
             names = names ++ "p" ++ n ++ ", ";
         }
-        return "SELECT r.i, x.* FROM unnest(" ++ un ++ ") WITH ORDINALITY AS r(" ++ names ++ "i) CROSS JOIN LATERAL (" ++ rewrite(d.sql) ++ ") x";
+        return "SELECT r.i, x.* FROM unnest(" ++ un ++ ") WITH ORDINALITY AS r(" ++ names ++ "i) CROSS JOIN LATERAL (" ++ rewrite(d.sql) ++ ") x ORDER BY r.i" ++ inner_order;
     }
 }
 
@@ -353,7 +355,7 @@ pub const bdefs = blk: {
             .article => b_article,
             else => null,
         };
-        d[@intFromEnum(k)] = .{ .sql = shared_sql orelse batchedSql(base), .params = batchedParams(base) };
+        d[@intFromEnum(k)] = .{ .sql = shared_sql orelse batchedSql(base, if (k == .comments) ", x.created_at DESC, x.id DESC" else ""), .params = batchedParams(base) };
     }
     break :blk d;
 };

@@ -57,8 +57,12 @@ const P = struct {
             if (c < 0x20) return error.Invalid;
         }
         if (i >= p.src.len) return error.Invalid;
-        // Slow path: unescape into scratch memory.
-        var out = try p.sc.alloc(p.src.len - start);
+        // Slow path: unescape into scratch memory. The string ends at the first quote that no backslash escapes, and an
+        // escape never decodes to more bytes than it takes, so that length is enough.
+        var end = i;
+        while (end < p.src.len and p.src[end] != '"') end += if (p.src[end] == '\\') 2 else 1;
+        if (end >= p.src.len) return error.Invalid;
+        var out = try p.sc.alloc(end - start);
         var n: usize = 0;
         @memcpy(out[0 .. i - start], p.src[start..i]);
         n = i - start;
@@ -127,6 +131,37 @@ const P = struct {
         return error.Invalid;
     }
 
+    /// Validates a string and moves past it without decoding it (skipped keys and values cost no scratch memory).
+    fn skipString(p: *P) Error!void {
+        try p.expect('"');
+        const start = p.pos;
+        var i = start;
+        while (i < p.src.len) {
+            const c = p.src[i];
+            if (c == '"') {
+                if (!std.unicode.utf8ValidateSlice(p.src[start..i])) return error.Invalid;
+                p.pos = i + 1;
+                return;
+            }
+            if (c < 0x20) return error.Invalid;
+            if (c != '\\') {
+                i += 1;
+                continue;
+            }
+            i += 1;
+            if (i >= p.src.len) return error.Invalid;
+            switch (p.src[i]) {
+                '"', '\\', '/', 'b', 'f', 'n', 'r', 't' => i += 1,
+                'u' => {
+                    _ = try hex4(p.src, i + 1);
+                    i += 5;
+                },
+                else => return error.Invalid,
+            }
+        }
+        return error.Invalid;
+    }
+
     fn hex4(src: []const u8, at: usize) Error!u21 {
         if (at + 4 > src.len) return error.Invalid;
         var v: u21 = 0;
@@ -177,7 +212,7 @@ const P = struct {
         p.ws();
         const c = p.peek() orelse return error.Invalid;
         switch (c) {
-            '"' => _ = try p.string(),
+            '"' => try p.skipString(),
             '{' => {
                 p.pos += 1;
                 p.ws();
@@ -187,7 +222,7 @@ const P = struct {
                 }
                 while (true) {
                     p.ws();
-                    _ = try p.string();
+                    try p.skipString();
                     p.ws();
                     try p.expect(':');
                     try p.skip(depth + 1);
@@ -409,4 +444,27 @@ test "wrapped objects" {
     try parseWrapped("{\"user\":{\"username\":123,\"tagList\":[1]}}", &sc, "user", &names, &arrs, &out);
     try std.testing.expectEqual(Kind.number, out[0].kind);
     try std.testing.expectEqual(Kind.other, out[2].kind);
+}
+
+test "many escaped strings do not exhaust the scratch memory" {
+    var sc = try Scratch.init(4096);
+    var doc = std.ArrayList(u8).empty;
+    defer doc.deinit(std.testing.allocator);
+    try doc.appendSlice(std.testing.allocator, "{\"user\": {\"username\": \"hi\\n\", \"pad\": [");
+    for (0..400) |k| {
+        if (k != 0) try doc.append(std.testing.allocator, ',');
+        try doc.appendSlice(std.testing.allocator, "\"a\\/b\\u00e9c\"");
+    }
+    try doc.appendSlice(std.testing.allocator, "], \"also\\n\": 1}}");
+    var out: [1]Field = undefined;
+    try parseWrapped(doc.items, &sc, "user", &.{"username"}, &.{}, &out);
+    try std.testing.expectEqualStrings("hi\n", out[0].s);
+    var big = std.ArrayList(u8).empty;
+    defer big.deinit(std.testing.allocator);
+    try big.appendSlice(std.testing.allocator, "{\"user\": {\"username\": \"");
+    for (0..1000) |_| try big.appendSlice(std.testing.allocator, "x\\n");
+    try big.appendSlice(std.testing.allocator, "\"}}");
+    sc.reset();
+    try parseWrapped(big.items, &sc, "user", &.{"username"}, &.{}, &out);
+    try std.testing.expectEqual(@as(usize, 2000), out[0].s.len);
 }

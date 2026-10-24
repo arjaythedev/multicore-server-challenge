@@ -45,9 +45,11 @@ pub fn main(init: std.process.Init) !void {
     // Workers are shared-nothing, so they can be threads of one process or separate processes. A process is limited to
     // LimitNOFILE open files (200,000 on the benchmark box), so by default every worker is its own process: the
     // number of connections is then bounded by memory and CPU, not by a per-process limit.
-    const workers = envInt(init, "WORKERS", @max(1, (cpus + 3) / 4));
-    const procs = @max(1, @min(envInt(init, "PROCS", workers), workers));
-    const threads = (workers + procs - 1) / procs; // workers (threads) per process
+    const workers_wanted = @max(1, envInt(init, "WORKERS", @max(1, (cpus + 3) / 4)));
+    const procs = @max(1, @min(envInt(init, "PROCS", workers_wanted), workers_wanted));
+    const threads = (workers_wanted + procs - 1) / procs; // workers (threads) per process
+    // The number actually started (WORKERS rounded up to a multiple of PROCS): connection counts are per started worker.
+    const workers = procs * threads;
     // Postgres connections: about one per CPU in total. More backends than cores only add context switches and cache
     // pressure inside Postgres (measured: 36 connections cost ~25% of the throughput of 6 on 6 CPUs); depth, not
     // width, keeps each backend busy. A quarter of them (at least one per worker) are for writes.

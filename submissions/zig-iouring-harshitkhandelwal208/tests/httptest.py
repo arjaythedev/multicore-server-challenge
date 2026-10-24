@@ -139,5 +139,34 @@ s = conn(); s.sendall(GET * 2); s.shutdown(socket.SHUT_WR)
 st1, h, b, rest = read_resp(s); st2, h, b, rest = read_resp(s, rest)
 check("two pipelined requests + FIN both answered", st1 == 200 and st2 == 200, (st1, st2))
 
+# chunked framing that would make the parser rescan a lot is refused, and the server stays responsive
+t0 = time.time()
+s = conn(); s.sendall(b"POST /api/users HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\n")
+try:
+    for _ in range(3000): s.sendall(b"a:b\r\n" * 40)
+except OSError:
+    pass
+st, *_ = read_resp(s); check("endless trailer lines are refused", st == 400, st); s.close()
+s = conn(); s.sendall(b"POST /api/users HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5;" + b"e=" * 200 + b"\r\nhello\r\n0\r\n\r\n")
+st, *_ = read_resp(s); check("a size line with a huge extension is refused", st == 400, st); s.close()
+s = conn(); s.sendall(b"POST /api/users HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" + b"1\r\nx\r\n" * 1100)
+st, *_ = read_resp(s); check("more than 1024 chunks is refused", st in (400, 413), st); s.close()
+s = conn(); s.sendall(GET); st, *_ = read_resp(s); check("server responsive after chunk abuse (%.1fs)" % (time.time() - t0), st == 200 and time.time() - t0 < 10, st); s.close()
+
+# a large pipelined burst on one connection (consuming each request used to move the whole remaining buffer)
+N = 60000
+burst = GET * N
+t0 = time.time()
+s = conn(); s.settimeout(60)
+sender = __import__("threading").Thread(target=lambda: s.sendall(burst)); sender.start()
+got = 0; buf = b""
+while got < N:
+    d = s.recv(1 << 20)
+    if not d: break
+    buf += d
+    got = buf.count(b"HTTP/1.1 200 OK")
+sender.join(); el = time.time() - t0
+check("%d pipelined requests on one connection all answered in %.1fs" % (N, el), got == N and el < 30, (got, el)); s.close()
+
 print("\n%d failures" % fails)
 sys.exit(1 if fails else 0)

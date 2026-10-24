@@ -92,7 +92,8 @@ const Conn = struct {
     tracked: bool = false, // listed in Worker.partials
     since: u32 = 0, // seconds (worker clock) at which an incomplete request started waiting
     pend: [*]u8 = undefined,
-    pend_len: u32 = 0,
+    pend_len: u32 = 0, // end of the buffered bytes
+    pend_off: u32 = 0, // start of the bytes not yet parsed (requests are consumed from the front without moving the rest)
     pend_cap: u32 = 0,
     out: [*]u8 = undefined,
     out_len: u32 = 0,
@@ -105,7 +106,7 @@ const max_pend = http.max_body + http.max_head + 4096;
 const Tag = enum(u8) { accept = 1, recv, poll, send, pg_recv, pg_send, event, close, shut, timer };
 
 inline fn ud(tag: Tag, gen: u32, idx: u32) u64 {
-    return (@as(u64, @intFromEnum(tag)) << 56) | (@as(u64, gen & 0xffffff) << 32) | idx;
+    return (@as(u64, @backingInt(tag)) << 56) | (@as(u64, gen & 0xffffff) << 32) | idx;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -269,7 +270,8 @@ pub const Worker = struct {
     ring: IoUring = undefined,
     listener: i32 = -1,
     conns: []Conn = &.{},
-    now: i64 = 0,
+    now: i64 = 0, // wall clock, seconds: only for token expiry
+    mono: u32 = 0, // monotonic seconds: timeouts are measured on this, so a clock step cannot expire or extend one
     out: Buf = .{},
     enc: Buf = .{},
     scratch: Scratch = undefined,
@@ -372,6 +374,7 @@ pub const Worker = struct {
         if (res < 0) {
             self.freeOut(c);
             self.closeConn(fd);
+            self.maybeFinishClose(fd); // closeConn does nothing when the connection was already closing
             return;
         }
         c.out_off += @intCast(res);
@@ -440,6 +443,7 @@ pub const Worker = struct {
         c.closing = true;
         if (c.pend_cap != 0) gpa.free(c.pend[0..c.pend_cap]);
         c.pend_len = 0;
+        c.pend_off = 0;
         c.pend_cap = 0;
         if (self.pbuf_ring == null and c.recv_live) {
             // Poll + recv fallback: a multishot poll does not end on shutdown, so remove it explicitly (its final
@@ -500,7 +504,7 @@ pub const Worker = struct {
         if (res == 0 and c.open and c.busy) {
             c.eof = true; // half-close: the response to the request in flight is still owed
         } else if (res <= 0 and c.open) {
-            const err: linux.E = @enumFromInt(@as(u16, @intCast(-res)));
+            const err: linux.E = @fromBackingInt(@intCast(@as(u16, @intCast(-res))));
             if (res == 0 or (err != .NOBUFS and err != .AGAIN and err != .INTR)) {
                 self.closeConn(fd);
             } else if (!c.recv_live) {
@@ -555,25 +559,35 @@ pub const Worker = struct {
     }
 
     fn stash(self: *Worker, fd: i32, c: *Conn, data: []const u8) void {
-        const need = c.pend_len + data.len;
-        if (need > max_pend) {
+        const live = c.pend_len - c.pend_off; // bytes waiting to be parsed
+        if (live + data.len > max_pend) {
             self.closeConn(fd);
             return;
         }
-        if (need > c.pend_cap) {
-            var ncap: usize = @max(512, c.pend_cap);
-            while (ncap < need) ncap *= 2;
-            const m = gpa.alloc(u8, ncap) catch {
-                self.closeConn(fd);
-                return;
-            };
-            if (c.pend_len != 0) @memcpy(m[0..c.pend_len], c.pend[0..c.pend_len]);
-            if (c.pend_cap != 0) gpa.free(c.pend[0..c.pend_cap]);
-            c.pend = m.ptr;
-            c.pend_cap = @intCast(ncap);
+        if (c.pend_len + data.len > c.pend_cap) {
+            if (c.pend_off >= c.pend_cap / 2 and live + data.len <= c.pend_cap) {
+                // at least half of the buffer is already consumed: slide the rest down (every byte moves at most
+                // once per half buffer consumed, so the cost stays linear)
+                std.mem.copyForwards(u8, c.pend[0..live], c.pend[c.pend_off..c.pend_len]);
+                c.pend_off = 0;
+                c.pend_len = @intCast(live);
+            } else {
+                var ncap: usize = @max(512, c.pend_cap);
+                while (ncap < live + data.len) ncap *= 2;
+                const m = gpa.alloc(u8, ncap) catch {
+                    self.closeConn(fd);
+                    return;
+                };
+                if (live != 0) @memcpy(m[0..live], c.pend[c.pend_off..c.pend_len]);
+                if (c.pend_cap != 0) gpa.free(c.pend[0..c.pend_cap]);
+                c.pend = m.ptr;
+                c.pend_cap = @intCast(ncap);
+                c.pend_off = 0;
+                c.pend_len = @intCast(live);
+            }
         }
         @memcpy(c.pend[c.pend_len..][0..data.len], data);
-        if (c.pend_len == 0) c.since = @intCast(self.now & 0x7fffffff);
+        if (live == 0) c.since = self.mono;
         c.pend_len += @intCast(data.len);
         if (!c.tracked) {
             c.tracked = true;
@@ -585,7 +599,7 @@ pub const Worker = struct {
     /// pin memory indefinitely. Runs from the 1 s timer.
     fn sweepPartials(self: *Worker) void {
         const limit_s = 30;
-        const now: u32 = @intCast(self.now & 0x7fffffff);
+        const now = self.mono;
         var i: usize = 0;
         while (i < self.partials.items.len) {
             const fd = self.partials.items[i];
@@ -603,16 +617,18 @@ pub const Worker = struct {
     }
 
     fn parsePend(self: *Worker, fd: i32, c: *Conn) void {
-        const data = c.pend[0..c.pend_len];
+        const data = c.pend[c.pend_off..c.pend_len];
         const used = self.parseLoop(fd, c, data);
         if (!c.open) return;
         if (used >= data.len) {
             gpa.free(c.pend[0..c.pend_cap]);
             c.pend_len = 0;
+            c.pend_off = 0;
             c.pend_cap = 0;
         } else if (used > 0) {
-            std.mem.copyForwards(u8, c.pend[0 .. data.len - used], c.pend[used..data.len]);
-            c.pend_len = @intCast(data.len - used);
+            // the requests before the tail were consumed: the tail is a new request, whose wait starts now
+            c.pend_off += @intCast(used);
+            c.since = self.mono;
         }
     }
 
@@ -672,13 +688,13 @@ pub const Worker = struct {
         const n = range.hi - range.lo;
         if (n != 0) {
             var i: usize = 0;
-            const start = self.rr[@intFromEnum(class)];
+            const start = self.rr[@backingInt(class)];
             while (i < n) : (i += 1) {
                 const p = &self.pgs[range.lo + (start + i) % n];
                 if (!p.alive or p.depth >= cap) continue;
                 if (best == null or p.depth < best.?.depth) best = p;
             }
-            self.rr[@intFromEnum(class)] = (start + 1) % n;
+            self.rr[@backingInt(class)] = (start + 1) % n;
         }
         if (best) |p| {
             self.pgPush(p, @intFromPtr(r), bytes);
@@ -688,7 +704,7 @@ pub const Worker = struct {
         for (self.pgs[range.lo..range.hi]) |*p| any_alive = any_alive or p.alive;
         if (!any_alive) return api.onPgFailure(self, r);
         const copy = gpa.dupe(u8, bytes) catch return api.onPgFailure(self, r);
-        const f = &self.fifo[@intFromEnum(class)];
+        const f = &self.fifo[@backingInt(class)];
         f.push(.{ .r = r, .bytes = copy });
         if (f.len > self.stats.fifo_max) self.stats.fifo_max = f.len;
     }
@@ -774,7 +790,7 @@ pub const Worker = struct {
 
     /// Move queued batches onto connections that have room.
     fn pgDrain(self: *Worker, class: Class) void {
-        const f = &self.fifo[@intFromEnum(class)];
+        const f = &self.fifo[@backingInt(class)];
         const range = self.classRange(class);
         const cap = self.shared.cfg.pg_depth;
         while (f.len != 0) {
@@ -817,7 +833,7 @@ pub const Worker = struct {
         var any = false;
         for (self.pgs[range.lo..range.hi]) |*x| any = any or x.alive;
         if (!any) {
-            const f = &self.fifo[@intFromEnum(p.class)];
+            const f = &self.fifo[@backingInt(p.class)];
             while (f.pop()) |q| {
                 gpa.free(q.bytes);
                 api.onPgFailure(self, q.r);
@@ -893,7 +909,7 @@ pub const Worker = struct {
     pub fn readSubmit(self: *Worker, stmt: sql.Stmt, r: *Req, a: ReadArgs) void {
         const text = gpa.dupe(u8, a.text) catch return api.onPgFailure(self, r);
         self.seq += 1;
-        self.stages[@intFromEnum(stmt)].push(.{ .r = r, .seq = self.seq, .viewer = a.viewer, .limit = a.limit, .offset = a.offset, .text = text });
+        self.stages[@backingInt(stmt)].push(.{ .r = r, .seq = self.seq, .viewer = a.viewer, .limit = a.limit, .offset = a.offset, .text = text });
         self.staged += 1;
     }
 
@@ -942,7 +958,7 @@ pub const Worker = struct {
                 }
             }
             const st = &self.stages[kind];
-            const stmt: sql.Stmt = @enumFromInt(kind);
+            const stmt: sql.Stmt = @fromBackingInt(@intCast(kind));
             const n: usize = if (st.front().single_only) 1 else if (isBatchable(stmt) or stmt == .tags) st.batchableRun(batch_max) else 1;
             self.enc.reset();
             var e = pg.Enc.init(&self.enc);
@@ -1036,7 +1052,7 @@ pub const Worker = struct {
             for (rec.items[0..rec.n]) |it| {
                 var again = it;
                 again.single_only = true;
-                self.stages[@intFromEnum(rec.stmt)].push(again);
+                self.stages[@backingInt(rec.stmt)].push(again);
                 self.staged += 1;
             }
             return;
@@ -1052,10 +1068,7 @@ pub const Worker = struct {
             while (true) {
                 const m = pending orelse (rd.next() orelse break);
                 pending = null;
-                if (m.kind != 'D') {
-                    if (m.kind == 'C' or m.kind == 'Z') continue;
-                    continue;
-                }
+                if (m.kind != 'D') continue;
                 const ord = std.mem.readInt(i64, m.body[6..14], .big);
                 if (ord != want) {
                     pending = m;
@@ -1236,7 +1249,7 @@ pub const Worker = struct {
     }
 
     fn dispatch(self: *Worker, cqe: linux.io_uring_cqe) void {
-        const tag: Tag = @enumFromInt(@as(u8, @intCast(cqe.user_data >> 56)));
+        const tag: Tag = @fromBackingInt(@intCast(@as(u8, @intCast(cqe.user_data >> 56))));
         const gen: u32 = @intCast((cqe.user_data >> 32) & 0xffffff);
         const idx: u32 = @truncate(cqe.user_data);
         switch (tag) {
@@ -1275,6 +1288,7 @@ pub const Worker = struct {
                 },
             };
             self.now = sys.nowUnix();
+            self.mono = monoSecs();
             while (true) {
                 const n = self.ring.copy_cqes(&cqes, 0) catch 0;
                 if (n == 0) break;
@@ -1289,6 +1303,10 @@ pub const Worker = struct {
 // ---------------------------------------------------------------------------------------------
 // Start-up
 // ---------------------------------------------------------------------------------------------
+
+fn monoSecs() u32 {
+    return @intCast((sys.nowNs() / 1_000_000_000) & 0x7fffffff);
+}
 
 fn setNonblock(fd: i32) void {
     const fl = linux.fcntl(fd, linux.F.GETFL, 0);
@@ -1368,6 +1386,7 @@ fn workerInit(shared: *Shared, id: usize) !void {
     w.ring = try initRing();
     if (!cfg.no_pbuf) setupPbufRing(w);
     w.now = sys.nowUnix();
+    w.mono = monoSecs();
 
     // connection table, indexed by fd (lazily committed by the kernel)
     var rl: linux.rlimit = undefined;

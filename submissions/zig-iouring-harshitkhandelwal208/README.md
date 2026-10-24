@@ -124,3 +124,13 @@ bcrypt result; the process keeps only connections, prepared statements and the H
 its response (rule 6). bcrypt cost 10 on every hash and verify; HS256 signature, `alg` and `exp` checked on every request
 (rule 7). Postgres is only configured through session settings; no schema, index, function or extension is touched
 (rules 2, 3). Nothing detects the load test (rule 8). Needs Linux ≥ 5.19 with `io_uring` enabled (Ubuntu 24.04's 6.8 qualifies).
+
+## Known limits
+
+- Chunked request bodies may have at most 1024 chunks, size lines of at most 64 bytes and 4 KiB of trailers (the framing is
+  re-checked whenever more bytes arrive, so what it scans is bounded). Bodies over 8 MB and heads over 16 KB are refused.
+- Favoriting or unfavoriting an article looks it up by slug twice (the write, then the response). If its author renames it
+  (which changes the slug) between the two statements, the favorite is stored but the response is a 404; the SPEC reference
+  selects by id instead. Fixing it would need one combined statement, and a data-modifying CTE cannot see its own writes in the
+  main query, so the counts would have to be adjusted by hand; it was left as is.
+- Needs Linux 5.19 or newer for the provided-buffer ring; older kernels use the poll + `recv` path.

@@ -123,13 +123,15 @@ pub fn takeBody(h: *const Head, rest: []const u8, sc: *Scratch) Body {
         return .{ .ok = .{ .data = rest[0..h.content_length], .consumed = h.content_length } };
     }
     // Chunked: validate the framing first (sizes), then copy the payload into scratch memory.
-    // Framing is re-checked from the start whenever more bytes arrive, so the number of chunks is capped: a body of
-    // thousands of tiny chunks would otherwise cost quadratic work.
+    // Framing is re-checked from the start whenever more bytes arrive, so everything that is scanned is bounded: at most
+    // `max_chunks` chunks, size lines of at most 64 bytes (extensions included) and 4 KiB of trailers. Payload bytes are
+    // jumped over by their size, never scanned.
     var pos: usize = 0;
     var total: usize = 0;
     var n_chunks: usize = 0;
     while (true) {
-        const le = std.mem.indexOfPos(u8, rest, pos, "\r\n") orelse return if (rest.len - pos > 1024) .{ .bad = 400 } else .need_more;
+        const le = std.mem.indexOfPos(u8, rest, pos, "\r\n") orelse return if (rest.len - pos > 64) .{ .bad = 400 } else .need_more;
+        if (le - pos > 64) return .{ .bad = 400 };
         var size_s = rest[pos..le];
         if (std.mem.indexOfScalar(u8, size_s, ';')) |sc_i| size_s = size_s[0..sc_i];
         size_s = trimOws(size_s);
@@ -138,7 +140,9 @@ pub fn takeBody(h: *const Head, rest: []const u8, sc: *Scratch) Body {
         pos = le + 2;
         if (size == 0) {
             // trailers until an empty line
+            const trailers_at = pos;
             while (true) {
+                if (pos - trailers_at > 4096) return .{ .bad = 400 };
                 const te = std.mem.indexOfPos(u8, rest, pos, "\r\n") orelse return if (rest.len - pos > 4096) .{ .bad = 400 } else .need_more;
                 const empty = te == pos;
                 pos = te + 2;
@@ -282,4 +286,21 @@ test "pct" {
     try std.testing.expectEqualStrings("a b c", pctDecode(&b, "a+b%20c", true).?);
     try std.testing.expect(pctDecode(&b, "a%2", false) == null);
     try std.testing.expect(pctDecode(&b, "a%zz", false) == null);
+}
+
+test "chunk framing is bounded" {
+    var sc = try Scratch.init(1 << 16);
+    const h = Head{ .method = .post, .path = "/", .query = "", .chunked = true };
+    var buf: [10000]u8 = undefined;
+    var n: usize = 3;
+    @memcpy(buf[0..3], "0\r\n");
+    while (n + 6 < buf.len) : (n += 5) @memcpy(buf[n..][0..5], "a:b\r\n");
+    try std.testing.expectEqual(@as(u16, 400), takeBody(&h, buf[0..n], &sc).bad);
+    var ext: [200]u8 = undefined;
+    @memcpy(ext[0..4], "5;x=");
+    @memset(ext[4..190], 'y');
+    @memcpy(ext[190..194], "\r\nab");
+    try std.testing.expectEqual(@as(u16, 400), takeBody(&h, ext[0..194], &sc).bad);
+    const ok = takeBody(&h, "5;name=v\r\nhello\r\n0\r\nX-T: 1\r\n\r\nNEXT", &sc);
+    try std.testing.expectEqualStrings("hello", ok.ok.data);
 }
