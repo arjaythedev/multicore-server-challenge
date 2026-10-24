@@ -56,4 +56,5 @@ time and never touches the real database.
 
 A 4-core mini PC running the server, Postgres 18 (pgtune settings) and the load generator together, full seed, no
 Nginx, 60 s probes and a 5-minute hold. Users held for 5 minutes: JDK `HttpServer` 9,200 (JDK 26) and 9,300 (JDK 27);
-Helidon 9,500, then 9,800 with the page-first SQL and 10,000 with `tcpNoDelay` as well (JDK 27); the Spring example 10,000 (JDK 27). Not comparable with the leaderboard.
+Helidon 9,500, then 9,800 with the page-first SQL and 10,000 with `tcpNoDelay` as well (JDK 27); the Spring example 10,000 (JDK 27). Adding the bcrypt pool kept 10,000 but cut
+the hold's p95 from 108 ms to 5.4 ms and CPU from 79% to 69%. 11,000 failed. Not comparable with the leaderboard.
