@@ -19,7 +19,10 @@ little per request and, above all, to make each request cost Postgres little.
 (`SO_REUSEPORT`), its own Postgres connections and its own buffers: nothing is shared between them
 but the JWT key and the bcrypt workers. A connection is a fiber: handlers are plain sequential code
 that waits for Postgres the way it waits for its socket. An idle connection holds ~28 KB; the
-server keeps up to 196,000 of them, the longest idle closed first once every slot is taken.
+server keeps as many as its descriptor limit allows less 1,024 (198,976 under the box's 200,000),
+the longest idle closed first once every slot is taken, so a new client never meets a failing
+`accept`. At 120,000 users on 4 CPUs, twice what it can serve there, it kept serving 14,400
+requests a second (15,100 at its limit), and was idle again 2 s after the load stopped.
 
 **Reads in batches.** A cheap read's cost in Postgres is mostly the statement's own (Bind, executor
 start and end, the transaction), not its rows. Reads of one kind waiting together are sent as one
@@ -43,6 +46,10 @@ after that commit (`ReadyForQuery`). If any statement fails, Postgres rolls the 
 each of its requests is sent again alone, to get its own answer (a duplicate username is a 422 for
 that request only). A request whose commit is uncertain (the connection lost) is never retried.
 
+**A lost Postgres connection connects again.** Its waiting requests fail (500), batches skip it,
+and it reconnects at once, then every second until Postgres accepts. All 20 backends terminated
+twice under 6,000 users: 16 requests failed.
+
 **Lean SQL, same answers.** Pages pick their ids on the bare index first, with a constant inner
 limit (100, the API's ceiling) so the generic plan expects a page, and the per-article subqueries run
 only for the page's rows, not for those `OFFSET` skips. Tag names are looked up by key rather than
@@ -54,10 +61,11 @@ concurrent reads (every list filter, deep offsets, feeds, articles, comments, pr
 and logged in) to the Go example and to this server on the full seed: no difference.
 
 **bcrypt four at a time.** A Blowfish round is a chain of dependent table loads, so one hash leaves
-most of a core idle. Two worker threads each take up to four queued hashes of the same cost and run
-them in lockstep, every round kept: 21 ms of a core per hash against 51 alone. A worker holding fewer
-than four waits up to 150 ms after the oldest's arrival for more; logins are about a thousandth of
-the requests. Hashes are verified on every login, written `$2b$` at cost 10.
+most of a core idle. A worker thread takes up to four queued hashes of the same cost and runs them
+in lockstep, every round kept: 21 ms of a core per hash against 51 alone. Holding fewer than four,
+it waits up to 150 ms after the oldest's arrival for more (a second measured no cheaper); logins are
+about a thousandth of the requests. Four workers, one gathering at a time: with Postgres taking the
+CPUs, two left logins queued past their 10 s. Hashes are verified on every login, written `$2b$` at cost 10.
 
 **Memory.** Every buffer is allocated at startup and its pages left untouched until used; transparent
 huge pages are switched off for the process, so a connection's few touched pages are not 2 MiB each.
@@ -76,5 +84,6 @@ DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=... HO
 ```
 
 `CONDUIT_SHARDS`, `CONDUIT_READS`, `CONDUIT_WRITES` and `CONDUIT_BCRYPT_WORKERS` override the
-defaults (2 shards of 8 read and 2 write connections, 2 bcrypt workers) for measuring; `start.sh`
-sets none of them.
+defaults (2 shards of 8 read and 2 write connections, 4 bcrypt workers) for measuring; `start.sh`
+sets none of them. One shard of 16 and 4 measured the same as two (Postgres's CPU per request
+equal, p95 a little worse).
