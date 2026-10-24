@@ -54,7 +54,8 @@ pub const Slots = struct {
 
     const Waiting = struct { parked: Evented.Parked = .{}, slot: u32 = undefined };
 
-    pub fn init(gpa: std.mem.Allocator, count: u32, slot_bytes: u32, rows_bytes: u32) !Slots {
+    /// `waiting_max`: every connection of the shard may wait for a slot.
+    pub fn init(gpa: std.mem.Allocator, count: u32, slot_bytes: u32, rows_bytes: u32, waiting_max: u32) !Slots {
         assert(rows_bytes < slot_bytes);
         const free = try gpa.alloc(u32, count);
         // Lowest first: the slots in use stay few and warm.
@@ -65,7 +66,7 @@ pub const Slots = struct {
             .rows_bytes = rows_bytes,
             .free = free,
             .free_count = count,
-            .waiting = try gpa.alloc(*Waiting, 64 * 1024),
+            .waiting = try gpa.alloc(*Waiting, waiting_max),
         };
     }
 
@@ -169,7 +170,7 @@ fn run_or_fail(options: Options) !noreturn {
         .passwords = options.passwords,
         .read_connections = try gpa.alloc(pg.Connection, options.reads),
         .write_connections = try gpa.alloc(pg.Connection, options.writes),
-        .slots = try .init(gpa, options.slots, 256 * 1024, 128 * 1024),
+        .slots = try .init(gpa, options.slots, 256 * 1024, 128 * 1024, options.connections_max),
         .jwt_memory = try gpa.alloc(u8, jwt.memory_bytes),
         .json_memory = try gpa.alloc(u8, 256 * 1024),
     };
