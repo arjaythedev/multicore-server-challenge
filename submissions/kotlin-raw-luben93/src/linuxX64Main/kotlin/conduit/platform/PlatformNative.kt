@@ -271,6 +271,8 @@ actual class HmacSha256 actual constructor(key: ByteArray) {
 
 actual fun sha256(data: ByteArray): ByteArray = Sha256.digest(data)
 
+actual fun loadLongLE(b: ByteArray, p: Int): Long = b.getLongAt(p) // unaligned native load (x86-64: little-endian)
+
 @ThreadLocal
 private object ThreadScratch {
     val scratch = Scratch()

@@ -81,6 +81,12 @@ expect class HmacSha256(key: ByteArray) {
 /** SHA-256 digest (one-shot; SCRAM only, not on hot paths). */
 expect fun sha256(data: ByteArray): ByteArray
 
+/**
+ * The 8 bytes b[p, p+8) as a little-endian Long, in one (unaligned) load where the platform has one: lets hot
+ * scanners (JSON string escaping) test 8 bytes per step. The caller guarantees p + 8 <= b.size.
+ */
+expect fun loadLongLE(b: ByteArray, p: Int): Long
+
 /** Per-thread scratch objects (one per OS thread, created lazily). */
 class Scratch {
     /** HMAC keyed with JWT_SECRET; set by [conduit.auth.Jwt]. */

@@ -1,9 +1,12 @@
 package conduit.platform
 
+import java.lang.invoke.MethodHandles
+import java.lang.invoke.VarHandle
 import java.net.InetSocketAddress
 import java.net.SocketTimeoutException
 import java.net.StandardSocketOptions
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.nio.channels.SelectionKey
 import java.nio.channels.Selector
 import java.nio.channels.SocketChannel
@@ -137,6 +140,10 @@ actual class HmacSha256 actual constructor(key: ByteArray) {
 }
 
 actual fun sha256(data: ByteArray): ByteArray = MessageDigest.getInstance("SHA-256").digest(data)
+
+private val LONG_LE: VarHandle = MethodHandles.byteArrayViewVarHandle(LongArray::class.java, ByteOrder.LITTLE_ENDIAN)
+
+actual fun loadLongLE(b: ByteArray, p: Int): Long = LONG_LE.get(b, p) as Long // one intrinsic 8-byte load
 
 private val scratch = ThreadLocal.withInitial { Scratch() }
 

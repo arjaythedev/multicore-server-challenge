@@ -3,6 +3,8 @@ package conduit.http
 // HTTP/1.1 request parsing (RFC 9112), in place over the input bytes. Only the headers the server acts on are
 // looked at: Content-Length, Transfer-Encoding, Connection, Expect and Authorization; Host and the rest are skipped.
 
+import conduit.platform.loadLongLE
+
 internal const val MAX_HEAD = 64 * 1024
 internal const val MAX_BODY = 1 shl 20
 
@@ -34,8 +36,21 @@ private val CONTINUE = "100-continue".encodeToByteArray()
 private val CLOSE_TOKEN = "close".encodeToByteArray()
 private val KEEP_ALIVE = "keep-alive".encodeToByteArray()
 
+private const val ONES = 0x0101010101010101L
+private const val HIGHS = -0x7f7f7f7f7f7f7f80L // 0x8080808080808080
+
+/** First index of [c] in b[from, end), or -1. Tests 8 bytes per step (SWAR zero-byte test on x xor c...c). */
 internal fun indexOf(b: ByteArray, c: Byte, from: Int, end: Int): Int {
     var i = from
+    val pattern = (c.toLong() and 0xFF) * ONES
+    while (i + 8 <= end) {
+        val x = loadLongLE(b, i) xor pattern
+        // the lowest flagged byte is exact (a borrow only flags bytes above a real match); little-endian: lowest
+        // byte = lowest address
+        val m = (x - ONES) and x.inv() and HIGHS
+        if (m != 0L) return i + (m.countTrailingZeroBits() ushr 3)
+        i += 8
+    }
     while (i < end) {
         if (b[i] == c) return i
         i++
@@ -49,20 +64,19 @@ internal fun indexOf(b: ByteArray, c: Byte, from: Int, end: Int): Int {
  */
 internal fun headEnd(b: ByteArray, from: Int, end: Int): Int {
     var i = from
-    while (i < end) {
-        if (b[i] == LF) {
-            val n = i + 1
-            if (n >= end) return -1
-            val c = b[n]
-            if (c == LF) return n + 1
-            if (c == CR) {
-                if (n + 1 >= end) return -1
-                if (b[n + 1] == LF) return n + 2
-            }
+    while (true) {
+        i = indexOf(b, LF, i, end)
+        if (i < 0) return -1
+        val n = i + 1
+        if (n >= end) return -1
+        val c = b[n]
+        if (c == LF) return n + 1
+        if (c == CR) {
+            if (n + 1 >= end) return -1
+            if (b[n + 1] == LF) return n + 2
         }
-        i++
+        i = n
     }
-    return -1
 }
 
 /** [b] at [p] equals the lowercase ASCII [lower], ignoring case. Only for letters and '-'. */
