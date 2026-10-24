@@ -91,7 +91,7 @@ primitive \nodoc\ _FailedPasswordStartup is _PasswordStartupCheck
 
 actor \nodoc\ _PasswordProbe is
   (_PasswordObserver & _PasswordApplicationObserver & _QueryClient &
-    _PasswordStartupObserver & _PasswordComputeOwner & _PoolStateReceiver)
+    _PasswordStartupObserver & _PasswordComputeOwner)
   let _env: Env
   var _passwords: (_PasswordDispatcher | None) = None
   var _listener: (_Listener | None) = None
@@ -109,16 +109,16 @@ actor \nodoc\ _PasswordProbe is
   var _quitting: Bool = false
 
   new create(env: Env, options: _PasswordOptions,
-    config: ((_Config, _SessionAllocation) | None) = None)
+    config: (_Config | None) = None)
   =>
     _env = env
     _passwords = _PasswordDispatcher(options, _HeldPasswordFactory(this), this)
     for index in Range(0, 2) do _clients.push(_PasswordProbeClient(this, index))
     end
     match config
-    | (let c: _Config, let allocation: _SessionAllocation) =>
-      let worker = _Worker(TCPConnectAuth(env.root), c, Timers, env.err,
-        allocation where password_observer = this)
+    | let c: _Config =>
+      let worker = _Worker(TCPConnectAuth(env.root), c, Timers, env.err, 1
+        where password_observer = this)
       _workers = recover val [worker] end
       _listener = _Listener(TCPListenAuth(env.root), c, _workers, env,
         recover val Array[_DiagReporter] end, _passwords, this)
@@ -127,8 +127,6 @@ actor \nodoc\ _PasswordProbe is
     _emit("started")
 
   new startup(env: Env) => _env = env
-
-  be state(value: _PoolTestState) => _env.out.print(value.string())
 
   fun _emit(event: String, fields: String = "") =>
     _env.out.print("{\"event\":\"" + event + "\"" + fields + "}")
@@ -370,8 +368,6 @@ actor \nodoc\ _PasswordProbe is
     | "job" => (_passwords as _PasswordDispatcher).submit(_job(w)?)
     | "release" => _computes(w(1)?.usize()?)?.release(w(2)?)
     | "state" => (_passwords as _PasswordDispatcher)._test_state(w(1)?.u64()?)
-    | "database-state" =>
-      _workers(w(1)?.usize()?)?._test_state(w(2)?.u64()?, this)
     | "clients" =>
       for client in _clients.values() do client.checkpoint(w(1)?.u64()?) end
     | "stop" => (_passwords as _PasswordDispatcher).stop()

@@ -11,7 +11,6 @@ class \nodoc\ _SelfTest
     try
       decimal()?
       configuration()?
-      statement_classes()?
       fields()?
       query_params()?
       _OutputTest(env)?
@@ -46,9 +45,7 @@ class \nodoc\ _SelfTest
     for pair in [(USize(1), USize(1)); (USize(2), USize(2))
       (USize(7), USize(7)); (USize(8), USize(8)); (USize(9), USize(8))
       (USize.max_value(), USize(8))].values() do
-      let selection = _DatabaseOptions(["conduit"], pair._1)
-        as _DatabaseSelection
-      let defaults = selection.production() as _DatabaseLayout
+      let defaults = _DatabaseOptions(["conduit"], pair._1) as _DatabaseLayout
       _sizes(defaults.sizes, _DatabaseLayout.production(pair._2)?.sizes)?
     end
     for count in Range[USize](1, 96) do
@@ -73,8 +70,7 @@ class \nodoc\ _SelfTest
           ["conduit"; "--db-worker-count=" + count.string()] end
         recover val ["conduit"; "--db-worker-count"; count.string()] end
       ].values() do
-        let selection = _DatabaseOptions(args, 1) as _DatabaseSelection
-        let parsed = selection.production() as _DatabaseLayout
+        let parsed = _DatabaseOptions(args, 1) as _DatabaseLayout
         _sizes(parsed.sizes, layout.sizes)?
       end
     end
@@ -96,9 +92,8 @@ class \nodoc\ _SelfTest
     _assert(_DatabaseOptions(["conduit"; "--db-worker-count=2"
       "--db-worker-count"; "2"], 1) is _WorkerCountError)?
     let padded = _DatabaseOptions(["conduit"; "--unrelated"
-      "--db-worker-count=008"; "--ponymaxthreads=1"], 1) as _DatabaseSelection
-    _sizes((padded.production() as _DatabaseLayout).sizes,
-      _DatabaseLayout.production(8)?.sizes)?
+      "--db-worker-count=008"; "--ponymaxthreads=1"], 1) as _DatabaseLayout
+    _sizes(padded.sizes, _DatabaseLayout.production(8)?.sizes)?
     _assert(_DatabaseLayout.production(95)?.pool_size(94) == 1)?
     for count in [as USize: 0; 96].values() do
       _assert(try _DatabaseLayout.production(count)?; false else true end)?
@@ -116,179 +111,6 @@ class \nodoc\ _SelfTest
     let fixture = _TestDatabaseLayout(base, 4)?
     _sizes(fixture.sizes, recover val [as USize: 1; 1; 1; 1] end)?
     _assert(fixture.total == 4)?
-    var production_cases: USize = 0
-    var fixture_cases: USize = 0
-    for count in Range[USize](1, 96) do
-      for writes in Range[USize](0, 96) do
-        let accepted = (writes == 0) or
-          ((writes >= count) and ((writes + count) <= 95))
-        let actual = try _DatabaseLayout.production(count, writes)?
-          else None end
-        _assert((actual isnt None) == accepted)?
-        match actual
-        | let layout: _DatabaseLayout =>
-          _allocation(layout, count, 95, writes)?
-        end
-        production_cases = production_cases + 1
-      end
-      for size in Range[USize](1, (95 / count) + 1) do
-        for writes in Range[USize](0, 96) do
-          let total = count * size
-          let accepted = (writes == 0) or
-            ((writes >= count) and ((writes + count) <= total))
-          let actual = try _DatabaseLayout.fixture(count, size, writes)?
-            else None end
-          _assert((actual isnt None) == accepted)?
-          match actual
-          | let layout: _DatabaseLayout =>
-            _allocation(layout, count, total, writes)?
-            for index in Range[USize](0, count) do
-              _assert(layout.pool_size(index) == size)?
-            end
-          end
-          fixture_cases = fixture_cases + 1
-        end
-      end
-    end
-    _assert(production_cases == 9_120)?
-    _assert(fixture_cases == 42_912)?
-    for value in [as USize: 0; 96; USize.max_value()].values() do
-      _assert(try _SharedSessions(value)?; false else true end)?
-      _assert(try _DatabaseLayout.production(value)?; false else true end)?
-      _assert(try _DatabaseLayout.fixture(value, 1)?; false else true end)?
-      _assert(try _DatabaseLayout.fixture(1, value)?; false else true end)?
-    end
-    for value in [as USize: 96; USize.max_value()].values() do
-      _assert(try _DatabaseLayout.production(1, value)?
-        false else true end)?
-      _assert(try _DatabaseLayout.fixture(1, 95, value)?
-        false else true end)?
-    end
-    _assert(_SharedSessions(1)?.total == 1)?
-    _assert(_SharedSessions(95)?.total == 95)?
-    for pair in [(USize(1), USize(1)); (USize(1), USize(94))
-      (USize(94), USize(1))].values() do
-      let sessions = _SplitSessions(pair._1, pair._2)?
-      _assert(sessions.reads == pair._1)?
-      _assert(sessions.writes == pair._2)?
-      _assert(sessions.total == (pair._1 + pair._2))?
-    end
-    for pair in [(USize(0), USize(0)); (USize(0), USize(1))
-      (USize(1), USize(0)); (USize(1), USize(95))
-      (USize(95), USize(1)); (USize.max_value(), USize(1))
-      (USize(1), USize.max_value())
-      (USize.max_value(), USize.max_value())].values() do
-      _assert(try _SplitSessions(pair._1, pair._2)?
-        false else true end)?
-    end
-    _allocation_vector(_DatabaseLayout.production(8, 32)?,
-      [as USize: 8; 8; 8; 8; 8; 8; 8; 7],
-      [as USize: 4; 4; 4; 4; 4; 4; 4; 4])?
-    _allocation_vector(_DatabaseLayout.production(2, 3)?,
-      [as USize: 46; 46], [as USize: 2; 1])?
-    _allocation_vector(_DatabaseLayout.fixture(4, 3, 5)?,
-      [as USize: 1; 2; 2; 2], [as USize: 2; 1; 1; 1])?
-
-  fun _allocation(layout: _DatabaseLayout, count: USize, total: USize,
-    writes: USize) ?
-  =>
-    _assert(layout.sizes.size() == count)?
-    _assert(layout.total == total)?
-    var actual_total: USize = 0
-    var actual_writes: USize = 0
-    var actual_reads: USize = 0
-    var previous_writes: USize = 95
-    var largest_writes: USize = 0
-    var smallest_writes: USize = 95
-    for index in Range[USize](0, count) do
-      let size = layout.pool_size(index)
-      _assert(size > 0)?
-      actual_total = actual_total + size
-      match layout.sessions(index)
-      | let shared: _SharedSessions =>
-        _assert(writes == 0)?
-        _assert(shared.total == size)?
-      | let split: _SplitSessions =>
-        _assert(writes > 0)?
-        _assert(split.total == size)?
-        _assert(split.reads > 0)?
-        _assert(split.writes > 0)?
-        _assert((split.reads + split.writes) == size)?
-        _assert(split.writes <= previous_writes)?
-        previous_writes = split.writes
-        largest_writes = largest_writes.max(split.writes)
-        smallest_writes = smallest_writes.min(split.writes)
-        actual_writes = actual_writes + split.writes
-        actual_reads = actual_reads + split.reads
-      end
-    end
-    _assert(actual_total == total)?
-    _assert(actual_writes == writes)?
-    if writes != 0 then
-      _assert(actual_reads == (total - writes))?
-      _assert((largest_writes - smallest_writes) <= 1)?
-    end
-
-  fun _allocation_vector(layout: _DatabaseLayout, reads: Array[USize] val,
-    writes: Array[USize] val) ?
-  =>
-    _assert(layout.sizes.size() == reads.size())?
-    for index in Range[USize](0, reads.size()) do
-      let split = layout.sessions(index) as _SplitSessions
-      _assert(split.reads == reads(index)?)?
-      _assert(split.writes == writes(index)?)?
-    end
-
-  fun statement_classes() ? =>
-    let expected: Array[(_RequestStatement, String, _StatementClass)] val = [
-      (_Tags, "tags", _ReadClass)
-      (_RegisterUser, "register_user", _WriteClass)
-      (_LoginUser, "login_user", _ReadClass)
-      (_CurrentUser, "current_user", _ReadClass)
-      (_UpdateUser, "update_user", _WriteClass)
-      (_Profile, "profile", _ReadClass)
-      (_FollowTarget, "follow_target", _ReadClass)
-      (_FollowInsert, "follow_insert", _WriteClass)
-      (_FollowDelete, "follow_delete", _WriteClass)
-      (_ArticlePageAll, "article_page_all", _ReadClass)
-      (_ArticlePageFeed, "article_page_feed", _ReadClass)
-      (_ArticlePageTag, "article_page_tag", _ReadClass)
-      (_ArticlePageAuthor, "article_page_author", _ReadClass)
-      (_ArticlePageFavorited, "article_page_favorited", _ReadClass)
-      (_ArticleFullBySlug, "article_full_by_slug", _ReadClass)
-      (_ArticleFullById, "article_full_by_id", _ReadClass)
-      (_ArticleInsert, "article_insert", _WriteClass)
-      (_ArticleIdAndAuthorBySlug, "article_id_and_author_by_slug", _ReadClass)
-      (_ArticleUpdateInput, "article_update_input", _ReadClass)
-      (_ArticleUpdate, "article_update", _WriteClass)
-      (_ArticleDelete, "article_delete", _WriteClass)
-      (_ArticleIdBySlug, "article_id_by_slug", _ReadClass)
-      (_FavoriteInsert, "favorite_insert", _WriteClass)
-      (_FavoriteDelete, "favorite_delete", _WriteClass)
-      (_CommentsBySlug, "comments_by_slug", _ReadClass)
-      (_CommentInput, "comment_input", _ReadClass)
-      (_CommentInsert, "comment_insert", _WriteClass)
-      (_CommentOwner, "comment_owner", _ReadClass)
-      (_CommentDelete, "comment_delete", _WriteClass)]
-    var reads: USize = 0
-    var writes: USize = 0
-    for (kind, entry) in expected.pairs() do
-      (let statement, let name, let role) = entry
-      _assert(_Catalog.statement_class(statement) is role)?
-      _assert(_Catalog.name(statement) == name)?
-      _assert(_Catalog.kind(statement) == kind)?
-      let selected = _PoolStatement(name)?
-      _assert(selected is statement)?
-      _assert(_Catalog.name(selected) == name)?
-      _assert(_Catalog.kind(selected) == kind)?
-      if role is _ReadClass then reads = reads + 1
-      else writes = writes + 1 end
-    end
-    _assert(expected.size() == 29)?
-    _assert(reads == 18)?
-    _assert(writes == 11)?
-    _assert(_Catalog.all().size() == 30)?
-    _assert(_Catalog.all()(29)? is _Rollback)?
 
   fun _sizes(actual: Array[USize] val, expected: Array[USize] val) ? =>
     _assert(actual.size() == expected.size())?

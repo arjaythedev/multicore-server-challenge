@@ -15,7 +15,7 @@ actor \nodoc\ _WorkerDataErrorTest is (_QueryClient & _WorkerBarrier)
   =>
     _env = env
     _decode = decode
-    _worker = _Worker(auth, config, Timers, env.err, layout.sessions(0))
+    _worker = _Worker(auth, config, Timers, env.err, layout.pool_size(0))
     let bad = pg.PgArray(26,
       recover val [as (pg.FieldData | None): "not-an-oid"] end)
     let params: Array[_Param] val = if decode then _P.none()

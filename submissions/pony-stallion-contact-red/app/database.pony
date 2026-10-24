@@ -258,22 +258,14 @@ class _StoppedSlot is _SlotPhase
   fun ref retry(slot: _PoolSlot ref, token: _RetryToken) => None
   fun ref close(slot: _PoolSlot ref) => None
 
-primitive _SharedRole
-primitive _ReadRole
-primitive _WriteRole
-
-type _SessionRole is (_SharedRole | _ReadRole | _WriteRole)
-
 class _PoolSlot
   let index: USize
-  let role: _SessionRole
   let owner: _Worker ref
   var generation: U64 = 0
   var phase: _SlotPhase = _StoppedSlot
 
-  new create(index': USize, role': _SessionRole, owner': _Worker ref) =>
+  new create(index': USize, owner': _Worker ref) =>
     index = index'
-    role = role'
     owner = owner'
 
 class iso _Retry is TimerNotify
@@ -304,10 +296,6 @@ actor _Worker is (AsioEventNotify & _PGOwner)
   embed _slots: Array[_PoolSlot] = Array[_PoolSlot]
   embed _pending: _PendingJobs = _PendingJobs
   embed _idle: Array[USize]
-  embed _write_pending: _PendingJobs = _PendingJobs
-  embed _write_idle: Array[USize]
-  let _split: Bool
-  var _prefer_write: Bool = false
   embed _recipients: MapIs[_QueryClient, _Recipient] =
     MapIs[_QueryClient, _Recipient]
   var _stopped: Bool = false
@@ -321,11 +309,9 @@ actor _Worker is (AsioEventNotify & _PGOwner)
   var _csv_timer: (Timer tag | None) = None
   var _sampling: Bool = false
   let _password_observer: (_PasswordApplicationObserver | None)
-  var _test_previous: (_PGConnection ref | None) = None
 
   new create(auth: TCPConnectAuth, config: _Config, timers: Timers,
-    err: OutStream, allocation: _SessionAllocation,
-    retry_delay: U64 = 1_000_000_000,
+    err: OutStream, pool_size: USize, retry_delay: U64 = 1_000_000_000,
     csv: (_WorkerCSV | None) = None, worker_id: USize = 0,
     password_observer: (_PasswordApplicationObserver | None) = None)
   =>
@@ -337,19 +323,11 @@ actor _Worker is (AsioEventNotify & _PGOwner)
     _csv = csv
     _worker_id = worker_id
     _password_observer = password_observer
-    (let pool_size, let reads, let writes) = match allocation
-    | let shared: _SharedSessions => (shared.total, shared.total, USize(0))
-    | let split: _SplitSessions => (split.total, split.reads, split.writes)
-    end
-    _split = writes > 0
-    _idle = Array[USize](reads)
-    _write_idle = Array[USize](writes)
+    _idle = Array[USize](pool_size)
     _events = _PGEvents(this)
     ifdef "conduit_diagnostic" then _diag = pg.DiagState(10, 33) end
     for index in Range(0, pool_size) do
-      let role: _SessionRole = if not _split then _SharedRole
-        elseif index < reads then _ReadRole else _WriteRole end
-      let current = _PoolSlot(index, role, this)
+      let current = _PoolSlot(index, this)
       _slots.push(current)
       connect(current)
     end
@@ -373,7 +351,7 @@ actor _Worker is (AsioEventNotify & _PGOwner)
     let phases = _phase_counts()
     try
       _WorkerSample(now, _worker_id, phases(0)?, phases(1)?, phases(2)?,
-        phases(3)?, phases(4)?, phases(5)?, _pending_size())
+        phases(3)?, phases(4)?, phases(5)?, _pending.size())
     else
       _Unreachable()
       _csv_snapshot()
@@ -464,46 +442,31 @@ actor _Worker is (AsioEventNotify & _PGOwner)
     end
 
   fun ref available(slot: _PoolSlot ref) =>
-    if slot.role is _WriteRole then _write_idle.push(slot.index)
-    else _idle.push(slot.index) end
+    _idle.push(slot.index)
     _dispatch()
-
-  fun _pending_size(): USize => _pending.size() + _write_pending.size()
-
-  fun _can_dispatch(): Bool =>
-    ((_pending.size() > 0) and (_idle.size() > 0)) or
-      ((_write_pending.size() > 0) and (_write_idle.size() > 0))
 
   fun ref _dispatch() =>
     if _stopped or _dispatching then return end
     _dispatching = true
     var budget: USize = 64
-    while _can_dispatch() and (budget > 0) do
+    while (_pending.size() > 0) and (_idle.size() > 0) and (budget > 0) do
       budget = budget - 1
-      let write = (_write_pending.size() > 0) and
-        (_write_idle.size() > 0) and (_prefer_write or
-          (_pending.size() == 0) or (_idle.size() == 0))
-      _prefer_write = not write
-      if write then _dispatch_one(_write_pending, _write_idle)
-      else _dispatch_one(_pending, _idle) end
+      try
+        let job = _pending.shift()?
+        let slot = _slots(_idle.pop()?)?
+        job.started = _now()
+        _count(1)
+        _inflight = _inflight + 1
+        _observe(1, job.enqueued, job.started)
+        slot.phase.dispatch(slot, job)
+      else _Unreachable() end
     end
     _dispatching = false
-    if (budget == 0) and _can_dispatch() and
+    if (budget == 0) and (_pending.size() > 0) and (_idle.size() > 0) and
       (not _continuation) then
       _continuation = true
       this._resume()
     end
-
-  fun ref _dispatch_one(pending: _PendingJobs ref, idle: Array[USize] ref) =>
-    try
-      let job = pending.shift()?
-      let slot = _slots(idle.pop()?)?
-      job.started = _now()
-      _count(1)
-      _inflight = _inflight + 1
-      _observe(1, job.enqueued, job.started)
-      slot.phase.dispatch(slot, job)
-    else _Unreachable() end
 
   be _resume() =>
     _continuation = false
@@ -532,11 +495,11 @@ actor _Worker is (AsioEventNotify & _PGOwner)
     end
     _enqueue(client, id,
       pg.NamedPreparedQuery(_Catalog.name(statement), params),
-      _Catalog.kind(statement), now, _Catalog.statement_class(statement))
+      _Catalog.kind(statement), now)
     _dispatch()
 
   fun ref _enqueue(client: _QueryClient, id: U64, query': pg.Query,
-    kind: USize, now: U64, statement_class: _StatementClass)
+    kind: USize, now: U64)
   =>
     match _password_observer
     | let observer: _PasswordApplicationObserver =>
@@ -549,12 +512,9 @@ actor _Worker is (AsioEventNotify & _PGOwner)
         fresh
       end
     recipient.outstanding = recipient.outstanding + 1
-    let job = _Job(recipient, id, query', kind, now)
-    if _split and (statement_class is _WriteClass) then
-      _write_pending.push(job)
-    else _pending.push(job) end
+    _pending.push(_Job(recipient, id, query', kind, now))
     _count(0)
-    _pending_peak = _pending_peak.max(_pending_size().u64())
+    _pending_peak = _pending_peak.max(_pending.size().u64())
 
   fun ref _reject(client: _QueryClient, id: U64) =>
     _count(4)
@@ -579,7 +539,7 @@ actor _Worker is (AsioEventNotify & _PGOwner)
     end
 
   be barrier(probe: _WorkerBarrier) =>
-    probe.worker_barrier(_pending_size())
+    probe.worker_barrier(_pending.size())
 
   fun ref notify_failed(job: _Job ref, failure: _DBFailure) =>
     match job.recipient.client
@@ -622,13 +582,12 @@ actor _Worker is (AsioEventNotify & _PGOwner)
       end
     end
 
-  fun ref _remove_idle(slot: _PoolSlot box) =>
-    let idle = if slot.role is _WriteRole then _write_idle else _idle end
-    for (position, candidate) in idle.pairs() do
-      if candidate == slot.index then
+  fun ref _remove_idle(index: USize) =>
+    for (position, candidate) in _idle.pairs() do
+      if candidate == index then
         try
-          idle(position)? = idle(idle.size() - 1)?
-          idle.pop()?
+          _idle(position)? = _idle(_idle.size() - 1)?
+          _idle.pop()?
         else _Unreachable() end
         return
       end
@@ -639,7 +598,7 @@ actor _Worker is (AsioEventNotify & _PGOwner)
     match old.connection()
     | None => return
     end
-    _remove_idle(slot)
+    _remove_idle(slot.index)
     try slot.generation = slot.generation +? 1
     else _Unreachable() end
     let token = _RetryToken
@@ -668,7 +627,7 @@ actor _Worker is (AsioEventNotify & _PGOwner)
   fun ref stop_slot(slot: _PoolSlot ref) =>
     let old = slot.phase
     slot.phase = _StoppedSlot
-    _remove_idle(slot)
+    _remove_idle(slot.index)
     _finish_lost(old)
     match old
     | let live: _ConnectingSlot => live.conn.close()
@@ -691,20 +650,16 @@ actor _Worker is (AsioEventNotify & _PGOwner)
     _stopped = true
     _stop_sampling()
     for slot in _slots.values() do slot.phase.close(slot) end
-    _close_pending(_pending)
-    _close_pending(_write_pending)
-    _recipients.clear()
-
-  fun ref _close_pending(pending: _PendingJobs ref) =>
-    while pending.size() > 0 do
+    while _pending.size() > 0 do
       try
-        let job = pending.shift()?
+        let job = _pending.shift()?
         _count(3)
         _inflight = _inflight + 1
         job.outcome = _ConnectionLost
         settle(job)
       else _Unreachable() end
     end
+    _recipients.clear()
 
   fun ref log_failure(failure: (pg.ErrorResponseMessage |
     pg.ClientQueryError))
@@ -750,12 +705,10 @@ actor _Worker is (AsioEventNotify & _PGOwner)
     ifdef "conduit_diagnostic" then
       let now = Time.nanos()
       let phases = _phase_counts()
-      let pending = _pending_size().u64()
+      let pending = _pending.size().u64()
       let peak = _pending_peak
       let inflight = _inflight
-      let read_age = try now - _pending.front()?.enqueued else 0 end
-      let write_age = try now - _write_pending.front()?.enqueued else 0 end
-      let oldest = read_age.max(write_age)
+      let oldest = try now - _pending.front()?.enqueued else 0 end
       let gauges: Array[U64] iso = recover iso Array[U64] end
       gauges.>push(pending).>push(inflight).>push(oldest).>push(peak)
       for value in phases.values() do gauges.push(value) end
@@ -795,15 +748,8 @@ actor _Worker is (AsioEventNotify & _PGOwner)
       else _Unreachable() end
     end
 
-  be _test_state(request: U64, receiver: _PoolStateReceiver) =>
-    receiver.state(_test_snapshot(request))
-
-  fun _test_snapshot(request: U64): _PoolTestState =>
+  be _test_state(request: U64, receiver: _PoolProbe) =>
     let queued: Array[U64] iso = recover iso Array[U64] end
-    let write_queued: Array[U64] iso = recover iso Array[U64] end
-    let roles: Array[U64] iso = recover iso Array[U64] end
-    let read_idle: Array[USize] iso = recover iso Array[USize] end
-    let write_idle: Array[USize] iso = recover iso Array[USize] end
     let active: Array[(USize, U64, U64)] iso =
       recover iso Array[(USize, U64, U64)] end
     let idle: Array[USize] iso = recover iso Array[USize] end
@@ -816,20 +762,11 @@ actor _Worker is (AsioEventNotify & _PGOwner)
       queued.push(job.id)
       recipients.set(job.recipient)
     end
-    for job in _write_pending.values() do
-      write_queued.push(job.id)
-      recipients.set(job.recipient)
-    end
     for slot in _slots.values() do
-      roles.push(match slot.role
-        | _SharedRole => 0
-        | _ReadRole => 1
-        | _WriteRole => 2
-        end)
       phases.push(slot.phase.code())
       generations.push(slot.generation)
       match slot.phase
-      | let backoff: _BackoffSlot box => tokens.push(backoff.token)
+      | let backoff: _BackoffSlot => tokens.push(backoff.token)
       else tokens.push(None)
       end
       match slot.phase.job()
@@ -845,22 +782,14 @@ actor _Worker is (AsioEventNotify & _PGOwner)
         recipients.set(job.recipient)
       end
     end
-    for index in _idle.values() do
-      idle.push(index)
-      read_idle.push(index)
-    end
-    for index in _write_idle.values() do
-      idle.push(index)
-      write_idle.push(index)
-    end
+    for index in _idle.values() do idle.push(index) end
     var outstanding: USize = 0
     for recipient in recipients.values() do
       outstanding = outstanding + recipient.outstanding
     end
-    _PoolTestState(request, consume queued, consume active,
+    receiver.state(_PoolTestState(request, consume queued, consume active,
       consume idle, consume phases, consume generations, consume tokens,
-      _recipients.size(), outstanding, _worker_id, consume write_queued,
-      consume roles, consume read_idle, consume write_idle)
+      _recipients.size(), outstanding))
 
   be _test_fence(request: U64, clients: Array[_PoolClient] val) =>
     for client in clients.values() do client.fence(request) end
@@ -868,43 +797,14 @@ actor _Worker is (AsioEventNotify & _PGOwner)
   be _test_retire(index: USize) =>
     try retire(_slots(index)?) else _Unreachable() end
 
-  be _test_save_connection(index: USize) =>
-    try
-      match _slots(index)?.phase
-      | let live: _ConnectingSlot => _test_previous = live.conn
-      | let live: _PreparingSlot => _test_previous = live.conn
-      | let live: _IdleSlot => _test_previous = live.conn
-      | let live: _BusySlot => _test_previous = live.conn
-      else _Unreachable() end
-    else _Unreachable() end
-
-  be _test_stale_callbacks(index: USize, same_generation: Bool,
-    request: U64, receiver: _PoolProbe, clients: Array[_PoolClient] val)
-  =>
-    try
-      let conn = if same_generation then
-        _PGConnection(this, _events, index, _slots(index)?.generation)
-      else _test_previous as _PGConnection ref end
-      pg_ready(conn)
-      pg_prepared(conn)
-      pg_result(conn, pg.SimpleResult(pg.PreparedQuery("SELECT 1", _P.none())))
-      pg_failed(conn, pg.DataError)
-      pg_complete(conn, pg.TransactionIdle)
-      pg_shutdown(conn)
-      receiver.state(_test_snapshot(request))
-      for client in clients.values() do client.fence(request) end
-    else _Unreachable() end
-
-  be _test_query(client: _QueryClient, id: U64, query': pg.Query,
-    statement_class: _StatementClass)
-  =>
+  be _test_query(client: _QueryClient, id: U64, query': pg.Query) =>
     if _stopped then
       _count(4)
       _count(5)
       client.db_failed(id, _ConnectionLost)
       return
     end
-    _enqueue(client, id, query', 29, _now(), statement_class)
+    _enqueue(client, id, query', 29, _now())
     _dispatch()
 
   be _test_bad_batch(count: USize, client: _QueryClient,
@@ -913,83 +813,7 @@ actor _Worker is (AsioEventNotify & _PGOwner)
     if _stopped then _Unreachable(); return end
     for index in Range(0, count) do
       _enqueue(client, 100_000 + index.u64(),
-        pg.PreparedQuery("bad\0query", _P.none()), 29, _now(), _ReadClass)
+        pg.PreparedQuery("bad\0query", _P.none()), 29, _now())
     end
     this._test_state(request, receiver)
-    _dispatch()
-
-  fun ref _test_enqueue_bad(reads: USize, writes: USize, first: U64,
-    client: _QueryClient)
-  =>
-    var remaining_reads = reads
-    var remaining_writes = writes
-    for index in Range[USize](0, reads + writes) do
-      let read = (remaining_reads > 0) and
-        (((index % 2) == 0) or (remaining_writes == 0))
-      let statement_class: _StatementClass = if read then
-        remaining_reads = remaining_reads - 1
-        _ReadClass
-      else
-        remaining_writes = remaining_writes - 1
-        _WriteClass
-      end
-      _enqueue(client, first + index.u64(),
-        pg.PreparedQuery("bad\0query", _P.none()), 29, _now(), statement_class)
-    end
-
-  be _test_split_batch(reads: USize, writes: USize, first: U64,
-    request: U64, receiver: _PoolProbe, clients: Array[_PoolClient] val,
-    close_before: Bool = false)
-  =>
-    if _stopped then _Unreachable(); return end
-    try _test_enqueue_bad(reads, writes, first, clients(0)?)
-    else _Unreachable() end
-    if close_before then this.close() end
-    this._test_checkpoint(request, receiver, clients)
-    _dispatch()
-
-  be _test_checkpoint(request: U64, receiver: _PoolProbe,
-    clients: Array[_PoolClient] val, next: U64 = 0)
-  =>
-    receiver.state(_test_snapshot(request))
-    for client in clients.values() do client.fence(request) end
-    if next != 0 then this._test_checkpoint(next, receiver, clients) end
-
-  be _test_coalescing(request: U64, receiver: _PoolProbe,
-    clients: Array[_PoolClient] val)
-  =>
-    try _test_enqueue_bad(128, 128, 100_000, clients(0)?)
-    else _Unreachable() end
-    this._test_checkpoint(request, receiver, clients)
-    this._test_coalescing_second(request + 1, receiver, clients)
-    _dispatch()
-
-  be _test_coalescing_second(request: U64, receiver: _PoolProbe,
-    clients: Array[_PoolClient] val)
-  =>
-    try _test_enqueue_bad(128, 128, 100_256, clients(0)?)
-    else _Unreachable() end
-    this._test_checkpoint(request, receiver, clients, request + 1)
-    _dispatch()
-
-  be _test_incompatible(statement_class: _StatementClass, request: U64,
-    receiver: _PoolProbe, clients: Array[_PoolClient] val)
-  =>
-    try
-      if statement_class is _ReadClass then
-        _test_enqueue_bad(64, 0, 100_000, clients(0)?)
-      else _test_enqueue_bad(0, 64, 100_000, clients(0)?) end
-    else _Unreachable() end
-    this._test_incompatible_second(statement_class, request, receiver, clients)
-    _dispatch()
-
-  be _test_incompatible_second(statement_class: _StatementClass,
-    request: U64, receiver: _PoolProbe, clients: Array[_PoolClient] val)
-  =>
-    try
-      if statement_class is _ReadClass then
-        _test_enqueue_bad(256, 0, 100_064, clients(0)?)
-      else _test_enqueue_bad(0, 256, 100_064, clients(0)?) end
-    else _Unreachable() end
-    this._test_checkpoint(request, receiver, clients)
     _dispatch()
