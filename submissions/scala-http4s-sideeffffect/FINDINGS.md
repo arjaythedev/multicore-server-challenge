@@ -130,3 +130,22 @@ The most users passing on the laptop setup, at each stage:
 | One `GET /api/tags` result for all waiting requests | sharing a result between requests is caching (rule 5) |
 | Nginx in front | ~11% of the box; direct is affordable with a 7 GB heap |
 | Oracle GraalVM (Graal JIT) | the brief is the newest stable OpenJDK |
+
+## Robustness
+
+Fixes from an independent review. Each was tested on a live server; conformance stays 197/197.
+
+| Problem | Fix |
+|---|---|
+| One failing batched lookup failed every request in its chunk (up to 64 → 500), e.g. a NUL in a slug (Postgres 22021) | `Batcher` reruns each key of a failed batch on its own: only the bad request fails (tested: 80 concurrent lookups plus two NUL slugs → 80 × 200, 2 × 500) |
+| Feed `LIMIT lim + off` overflowed int4 for an offset near `Int.MaxValue` | computed as `int8` (offset 2147483647 → 200) |
+| If the batch stream ever ended, later callers waited forever | the stream restarts (and logs the error); callers wait in a queue that outlives it |
+| `SessionPool` retried reconnecting forever inside the uncancelable release: during a Postgres outage releases hung | a dead session leaves an empty slot (close bounded to 5 s); whoever takes an empty slot reopens it while acquiring (cancelable, errors fail only that request). Startup opens every session but leaks nothing and still starts if some fail. Tested by killing the database's backends and blocking connections: requests failed in 3–37 ms, then all succeeded once connections were allowed again |
+| `token.split('.')` dropped trailing empty parts, so `h.p.s.` was accepted | `split("\\.", -1)`, exactly three parts |
+| An empty `Authorization:` header was treated as anonymous | a present header must hold a valid token, empty or not (401) |
+| Request bodies were read without a limit | at most 1 MiB is read; a larger body is a 422 |
+| `start.sh` failed with "JAVA_HOME: unbound variable" without /opt/jdk-27 | a clear message |
+
+Not changed: passwords over 72 UTF-8 bytes stay a 422 on register and update. SPEC says any non-empty string, but the
+conformance suite requires the 422 (`users.register.password-over-72-bytes`), and the suite wins. Logins don't check
+the length; Bouncy Castle uses the first 72 bytes the same way when hashing and verifying.

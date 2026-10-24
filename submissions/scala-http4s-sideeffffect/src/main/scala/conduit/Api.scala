@@ -42,9 +42,11 @@ final class Api(
 
   private def now: IO[Long] = IO.realTime.map(_.toSeconds)
 
-  /** `None` when there is no (or an empty) Authorization header; a header that is present must hold a valid token. */
+  /** `None` when there is no Authorization header; a header that is present (even an empty one) must hold a valid
+    * token.
+    */
   private def caller(request: Request[IO]): IO[Option[Caller]] =
-    request.headers.get(ci"Authorization").map(_.head.value).filter(_.nonEmpty) match
+    request.headers.get(ci"Authorization").map(_.head.value) match
       case None         => IO.none
       case Some(header) =>
         val token = header.stripPrefix("Token ")

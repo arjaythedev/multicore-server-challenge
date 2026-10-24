@@ -8,15 +8,18 @@ import org.http4s.Request
 import java.nio.charset.StandardCharsets.UTF_8
 
 /** Request bodies are read as a JSON tree whatever the Content-Type. Strings must be JSON strings (`{"body": 123}` is
-  * not coerced to `"123"`). Anything malformed is a 422.
+  * not coerced to `"123"`). Anything malformed is a 422, and so is a body over 1 MiB (read no further than that).
   */
 object Body:
   type Result[A] = Either[ApiError, A]
 
+  private val maxBytes = 1024 * 1024
+
   /** The object under `key` in the request body: 422 unless the body is `{"key": {...}}`. */
   def wrapped(request: Request[IO], key: String): IO[JsonObject] =
-    request.body.compile.to(Array).flatMap { bytes =>
+    request.body.take(maxBytes + 1L).compile.to(Array).flatMap { bytes =>
       val inner = for
+        _ <- Either.cond(bytes.length <= maxBytes, (), ApiError.invalid("request body is too large"))
         root <- jawn.parseByteArray(bytes).leftMap(_ => ApiError.invalid("malformed JSON body"))
         obj <- root.asObject.toRight(ApiError.invalid("body must be a JSON object"))
         in <- obj(key).flatMap(_.asObject).toRight(ApiError.invalid(s"$key must be an object"))
@@ -54,7 +57,10 @@ object Body:
 
   private def nonEmptyString(json: Json): Option[String] = json.asString.filter(_.nonEmpty)
 
-  /** bcrypt hashes only the first 72 bytes, so longer passwords are refused (as Go's and Spring's bcrypt do). */
+  /** bcrypt uses only the first 72 bytes of a password, so a new password over 72 UTF-8 bytes is a 422: the conformance
+    * suite requires it (`users.register.password-over-72-bytes`), and it wins over SPEC's "non-empty string". Logins
+    * don't check this; Bouncy Castle truncates to 72 bytes the same way when hashing and verifying.
+    */
   def hashable(password: String): Result[String] =
     Either.cond(password.getBytes(UTF_8).length <= 72, password, ApiError.invalid("password is too long"))
 

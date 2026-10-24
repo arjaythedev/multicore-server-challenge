@@ -4,7 +4,8 @@
 # half the cores each).
 set -euo pipefail
 cd "$(dirname "$0")"
-if [ -x /opt/jdk-27/bin/java ]; then JAVA=/opt/jdk-27/bin/java; else JAVA="$JAVA_HOME/bin/java"; fi
+if [ -x /opt/jdk-27/bin/java ]; then JAVA=/opt/jdk-27/bin/java
+else JAVA="${JAVA_HOME:?no JDK in /opt/jdk-27 (run install.sh) and JAVA_HOME is not set}/bin/java"; fi
 # Parallel GC: the best CPU per request and tail latency in a sweep of G1, Parallel, ZGC and Shenandoah (FINDINGS.md).
 # Heap: 45% of RAM (about 7 GB of 16 GB), fixed and pre-touched. Postgres gets shared_buffers (25%), its backends and
 #   the page cache; there is no swap, so the heap must not grow later. Every open connection costs Ember ~35 KB, so

@@ -38,7 +38,8 @@ final class Jwt(secret: String):
     * not in the future, and `sub` a string of digits naming a positive id.
     */
   def verify(token: String, nowSeconds: Long): Option[Long] =
-    token.split('.') match
+    // -1 keeps trailing empty parts, so "h.p.s." is four parts (and rejected), not three.
+    token.split("\\.", -1) match
       case Array(h, p, s) =>
         for
           headerJson <- unb64(h).flatMap(bytes => jawn.parseByteArray(bytes).toOption)
