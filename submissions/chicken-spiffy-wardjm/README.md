@@ -5,14 +5,14 @@
 A deliberately plain submission: CHICKEN Scheme compiled to C, the stock Spiffy web server, and off-the-shelf
 eggs for everything else (Postgres, JSON, bcrypt, HMAC). It runs the reference SQL from `SPEC.md` verbatim.
 There is no hand-written HTTP parser, JWT library or connection pool trickery. One file, `conduit.scm`, about
-600 lines. Passes `bench/cmd/conformance` 197/197.
+650 lines. Passes `bench/cmd/conformance` 197/197.
 
 | Piece | Version |
 |---|---|
 | Language | CHICKEN Scheme 5.4.0, official release tarball (sha256-checked) built into `/opt/chicken` by `install.sh` |
 | HTTP | [spiffy](https://wiki.call-cc.org/eggref/5/spiffy) 6.5.2 (with intarweb 2.1.0, uri-common 2.0) |
 | Postgres | [postgresql](https://wiki.call-cc.org/eggref/5/postgresql) 4.1.6, libpq bindings that wait on the socket through CHICKEN's scheduler, so a query only blocks its own green thread |
-| JSON | [medea](https://wiki.call-cc.org/eggref/5/medea) 4 |
+| JSON | [medea](https://wiki.call-cc.org/eggref/5/medea) 4 for parsing request bodies; responses use a ~40-line writer in `conduit.scm` (see below) |
 | bcrypt | [crypt](https://wiki.call-cc.org/eggref/5/crypt) 1.0.1 (system libcrypt `crypt()`; salts from its bundled crypt_blowfish gensalt, cost 10) |
 | JWT | HS256 from [hmac](https://wiki.call-cc.org/eggref/5/hmac) 7.2.0 + [sha2](https://wiki.call-cc.org/eggref/5/sha2) 4.2.6 + [base64](https://wiki.call-cc.org/eggref/5/base64) 1.0; header `alg` must be `HS256`, `exp` is required |
 
@@ -38,7 +38,7 @@ matter how many users are connected.
 
 ## Things that had to be fixed to make it work
 
-Three things in the stack's defaults hurt badly under load. Fixing them is plumbing, not optimization:
+Three things in the stack's defaults hurt badly under load. Fixing them was plumbing, not optimization:
 
 - **Non-blocking listener.** CHICKEN's `tcp-listen` leaves the socket in blocking mode. With several
   processes polling it, they all wake for each new connection; one wins `accept()` and the others **block
@@ -51,6 +51,32 @@ Three things in the stack's defaults hurt badly under load. Fixing them is plumb
   one write when Spiffy flushes it, and accepted sockets get `TCP_NODELAY`.
 - **Read the body before routing.** An early 401/422/404 that never read the request body left those bytes
   on the keep-alive connection, where they were then parsed as the next request.
+
+## The one performance change: a direct JSON writer
+
+To find the biggest cost, I timed each part of a typical request in a compiled microbenchmark. For a
+10-article list page, in the server's own CPU:
+
+| Step | CPU |
+|---|---|
+| medea `json->string` (5.5 KB) | 0.99 ms |
+| Postgres query + row parsing (client side) | 0.18 ms |
+| intarweb request parse + response write | 0.11 ms |
+
+Encoding the response cost about three times everything else combined. medea re-binds the current output
+port for every nested value, finds each value's type by scanning a list of predicates, and copies every
+string through `string-translate*` before writing it. `conduit.scm` has a small replacement that walks the
+same data (alists → objects, vectors → arrays, `'null`) and writes straight to one string port, escaping
+strings in runs. Its output is byte-identical to medea's (checked on list pages, full articles and an
+escape/control-character/UTF-8 test), and it takes 0.26 ms for that page.
+
+End to end, A/B behind the box's Nginx config on my 16-core machine (16 workers, load generator on the
+same machine, so these numbers are only good for comparison):
+
+| | Server CPU per request (1,200 users) | 2,500 users: req/s | p95 | p99 |
+|---|---|---|---|---|
+| medea writer | 1.95 ms | 2,230 | 1,270 ms | 2,148 ms |
+| direct writer | 1.29 ms | 3,187 | 101 ms | 229 ms |
 
 ## Other details
 

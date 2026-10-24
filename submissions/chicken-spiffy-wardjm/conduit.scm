@@ -5,7 +5,7 @@
 ;; and keeps its own small pool of libpq connections.
 
 (import scheme
-        (chicken base) (chicken string) (chicken condition) (chicken io)
+        (chicken base) (chicken string) (chicken condition) (chicken io) (chicken port)
         (chicken process) (chicken process-context) (chicken tcp)
         (chicken time) (chicken bitwise) (chicken foreign)
         (only (chicken file posix) port->fileno file-control fcntl/getfl fcntl/setfl open/nonblock)
@@ -13,7 +13,7 @@
         (only srfi-13 string-null? string-prefix?)
         srfi-18 matchable
         spiffy intarweb uri-common
-        postgresql sql-null medea crypt
+        postgresql sql-null (only medea read-json) crypt
         hmac sha2 base64)
 
 ;;; Config
@@ -202,6 +202,66 @@
     (cond ((not v) default)
           ((and (all-digits? v) (<= lo (string->number v) hi)) (string->number v))
           (else (fail 422 (conc name " out of range"))))))
+
+;;; JSON output
+;;
+;; medea's writer costs about 1 ms of CPU for a 10-article list page, several times the rest of
+;; the request: it re-binds the output port and copies every string for each value it writes.
+;; This writer emits the same JSON (alists as objects, vectors as arrays, 'null) straight to one
+;; port. medea still parses request bodies.
+
+(define (json-escape c)
+  (case c
+    ((#\") "\\\"")
+    ((#\\) "\\\\")
+    ((#\newline) "\\n")
+    ((#\return) "\\r")
+    ((#\tab) "\\t")
+    (else (and (char<? c #\space)
+               (string-append (if (< (char->integer c) 16) "\\u000" "\\u00")
+                              (number->string (char->integer c) 16))))))
+
+;; Strings are written in runs between escapes; bytes >= 0x80 (UTF-8) pass through untouched.
+(define (write-json-string s out)
+  (write-char #\" out)
+  (let ((n (string-length s)))
+    (let loop ((start 0) (i 0))
+      (cond ((= i n)
+             (write-string (if (= start 0) s (substring s start n)) #f out))
+            ((json-escape (string-ref s i))
+             => (lambda (esc)
+                  (write-string (substring s start i) #f out)
+                  (write-string esc #f out)
+                  (loop (add1 i) (add1 i))))
+            (else (loop start (add1 i))))))
+  (write-char #\" out))
+
+(define (write-json v out)
+  (cond ((string? v) (write-json-string v out))
+        ((number? v) (write-string (number->string v) #f out))
+        ((eq? v #t) (write-string "true" #f out))
+        ((eq? v #f) (write-string "false" #f out))
+        ((eq? v 'null) (write-string "null" #f out))
+        ((vector? v)
+         (write-char #\[ out)
+         (do ((i 0 (add1 i))) ((= i (vector-length v)))
+           (unless (= i 0) (write-char #\, out))
+           (write-json (vector-ref v i) out))
+         (write-char #\] out))
+        ((list? v)
+         (write-char #\{ out)
+         (let loop ((members v) (first? #t))
+           (unless (null? members)
+             (unless first? (write-char #\, out))
+             (write-json-string (symbol->string (caar members)) out)
+             (write-char #\: out)
+             (write-json (cdar members) out)
+             (loop (cdr members) #f)))
+         (write-char #\} out))
+        (else (error 'write-json "cannot write as JSON" v))))
+
+(define (json->string v)
+  (call-with-output-string (lambda (out) (write-json v out))))
 
 ;;; Responses
 
