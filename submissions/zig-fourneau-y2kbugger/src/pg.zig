@@ -50,9 +50,11 @@ pub const Param = union(enum) {
 /// Requests a batch holds at most. Past ~10 a statement's own cost is all
 /// but gone (52.7 us of Postgres per request at 32, 53.4 at 10, 161 one
 /// at a time; the article by slug), but a request past a full batch waits
-/// a whole statement more: a box shard's load on an aged database filled
-/// 32 (the article 31.8 a batch), and at 64 (48.9) p95 was 90 ms, not 160.
-pub const batch_max = 64;
+/// a whole statement more. A box shard's load on an aged database filled
+/// 32 at 52k users (the article 31.8 a batch): 64 took p95 from 160 ms to
+/// 90. At 56k every batch of 64 was full: 128 (119.6) took p95 from 215
+/// to 195, 14.39k req/s to 14.55k, Postgres from 185 us a request to 180.
+pub const batch_max = 128;
 
 /// A group's requests: one; or a batch of reads, whose rows each name
 /// their request by their first column (an int4, its index into

@@ -30,7 +30,7 @@ statement: the request's query is the inner side of a `LATERAL` join over `unnes
 waiting requests' parameters, and each row comes back tagged with its request's index. Measured
 on the article by slug: 161 us of Postgres CPU per request sent alone, 53 us per request in batches
 of 10. There is no timer: a read waits only while every read connection has a statement in flight,
-and the kind whose oldest read has waited longest goes next (up to 64 requests), to the idle
+and the kind whose oldest read has waited longest goes next (up to 128 requests), to the idle
 connection that last ran that kind if there is one, so a backend keeps one kind's plan and index
 pages warm (p50 -5%, p99 -10%). At low load every batch is one request; under load batches grow by
 themselves.
