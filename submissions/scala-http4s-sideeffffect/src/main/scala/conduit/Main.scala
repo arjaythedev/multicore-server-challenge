@@ -105,7 +105,14 @@ object Main extends IOApp.Simple:
       reads <- SessionPool(config.readSessions, session(config.databaseUrl))
       writes <- SessionPool(config.writeSessions, session(config.databaseUrl))
       bcryptPool <- fixedThreadPool(config.bcryptThreads)
-      api = Api(Db(reads, writes), Jwt(config.jwtSecret), bcryptPool)
+      // The two lookups of an article page, the most common page: merged across concurrent requests (Batcher).
+      articles <- Batcher(maxBatch = 64, concurrency = 8)((keys: List[(Long, String)]) =>
+        reads.use(Sql.articlesBySlug(_)(keys))
+      )
+      comments <- Batcher(maxBatch = 64, concurrency = 8)((keys: List[(Long, String)]) =>
+        reads.use(Sql.commentsBySlugs(_)(keys))
+      )
+      api = Api(Db(reads, writes), Jwt(config.jwtSecret), bcryptPool, Lookups(articles(_), comments(_)))
       _ <- EmberServerBuilder
         .default[IO]
         .withHost(config.host)

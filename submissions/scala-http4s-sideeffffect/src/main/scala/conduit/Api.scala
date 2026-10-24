@@ -24,7 +24,12 @@ import Sql.{Filter, Page}
   * @param bcryptPool
   *   bcrypt runs here, a few threads, so logins can't take over the CPUs the event loop needs
   */
-final class Api(db: Db, jwt: Jwt, bcryptPool: ExecutionContext):
+final class Api(
+    db: Db,
+    jwt: Jwt,
+    bcryptPool: ExecutionContext,
+    lookups: Lookups
+):
 
   // Bouncy Castle's bcrypt: about 6% faster than at.favre's on this JVM (median 53.6 vs 56.8 ms per verify at cost
   // 10), and the hashes are the same `$2a$` format both ways.
@@ -217,7 +222,7 @@ final class Api(db: Db, jwt: Jwt, bcryptPool: ExecutionContext):
 
     case request @ GET -> Root / "api" / "articles" / slug =>
       viewer(request)
-        .flatMap(viewer => db.read.use(_.option(Sql.articleBySlug)((viewer, slug))))
+        .flatMap(viewer => lookups.article((viewer, slug)))
         .flatMap(found("article"))
         .flatMap(row => ok("article", row.toArticle))
 
@@ -273,9 +278,7 @@ final class Api(db: Db, jwt: Jwt, bcryptPool: ExecutionContext):
     case request @ GET -> Root / "api" / "articles" / slug / "comments" =>
       for
         viewer <- viewer(request)
-        rows <- db.read.use(_.execute(Sql.commentsBySlug)((viewer, slug)))
-        _ <- IO.raiseWhen(rows.isEmpty)(ApiError.notFound("article"))
-        comments = rows.flatMap(_._2)
+        comments <- lookups.comments((viewer, slug)).flatMap(found("article"))
         response <- ok("comments", comments.map(_.toComment))
       yield response
 

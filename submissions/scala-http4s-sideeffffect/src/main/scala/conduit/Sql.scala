@@ -115,10 +115,8 @@ object Sql:
 
   private val listColumns = articleColumns(withBody = false)
 
-  /** `ARTICLE_LIST_SELECT` and `ARTICLE_FULL_SELECT`. */
+  /** `ARTICLE_LIST_SELECT`. */
   private val listSelect: Fragment[Long] = sql"$listColumns FROM articles a JOIN users u ON u.id = a.author_id"
-  private val fullSelect: Fragment[Long] =
-    sql"${articleColumns(withBody = true)} FROM articles a JOIN users u ON u.id = a.author_id"
 
   private val slugified = "trim(both '-' from lower(regexp_replace"
 
@@ -278,7 +276,23 @@ object Sql:
   def feed(session: Session[IO], viewer: Long, p: Page): IO[(List[ArticleRow], Long)] =
     session.execute(feedPage)((viewer, p.limit, p.offset)).map(page)
 
-  val articleBySlug: Query[(Long, String), ArticleRow] = sql"$fullSelect WHERE a.slug = $text".query(article)
+  /** `ARTICLE_FULL_SELECT WHERE a.slug = $2` for many (viewer, slug) pairs in one statement, for [[Batcher]]: each pair
+    * keeps its position in the arrays (`ord`, from 1), so every request gets back its own row, computed for its own
+    * viewer, and a slug without an article gets no row (404).
+    */
+  val articlesBySlug: Query[(List[Long], List[String]), (Int, ArticleRow)] =
+    sql"""SELECT r.ord::int4 - 1, #${articleData(withBody = true)},
+                 EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = r.viewer) AS favorited,
+                 u.username, u.bio, u.image,
+                 EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.viewer AND fo.followee_id = a.author_id)
+                   AS following
+            FROM unnest(${_int8.contramap[List[Long]](Arr(_*))}, ${_text.contramap[List[String]](Arr(_*))})
+                   WITH ORDINALITY AS r(viewer, slug, ord)
+            JOIN articles a ON a.slug = r.slug
+            JOIN users u ON u.id = a.author_id""".query(int4 *: article)
+
+  def articlesBySlug(session: Session[IO])(keys: List[(Long, String)]): IO[Map[Int, ArticleRow]] =
+    session.execute(articlesBySlug)((keys.map(_._1), keys.map(_._2))).map(_.toMap)
 
   /** Create an article with its tags and read it back, in one statement (so in one transaction, as the spec asks).
     * Replaces the reference's five statements (BEGIN, article, tags, article_tags, COMMIT) and the read-back after.
@@ -376,21 +390,28 @@ object Sql:
 
   // Comments
 
-  /** The article and its newest 100 comments in one statement: no row means no such article (404), a single row without
-    * a comment means no comments. Replaces the reference's article-id lookup followed by the comments query.
+  /** The article's newest 100 comments for many (viewer, slug) pairs in one statement, for [[Batcher]]. Replaces the
+    * reference's article-id lookup followed by the comments query: a pair whose article exists gets its comments,
+    * newest first, possibly none (one row without a comment); a pair without an article gets no row at all (404).
     */
-  val commentsBySlug: Query[(Long, String), (Long, Option[CommentRow])] =
-    sql"""SELECT a.id, c.*
-            FROM articles a
+  val commentsBySlugs: Query[(List[Long], List[String]), (Int, Option[CommentRow])] =
+    sql"""SELECT r.ord::int4 - 1, c.*
+            FROM unnest(${_int8.contramap[List[Long]](Arr(_*))}, ${_text.contramap[List[String]](Arr(_*))})
+                   WITH ORDINALITY AS r(viewer, slug, ord)
+            JOIN articles a ON a.slug = r.slug
             LEFT JOIN LATERAL (
               SELECT c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image,
-                     EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $int8 AND fo.followee_id = c.author_id)
+                     EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.viewer AND fo.followee_id = c.author_id)
                 FROM comments c JOIN users u ON u.id = c.author_id
                WHERE c.article_id = a.id
                ORDER BY c.created_at DESC, c.id DESC
                LIMIT 100) c ON true
-           WHERE a.slug = $text
-           ORDER BY c.created_at DESC, c.id DESC""".query(int8 *: comment.opt)
+           ORDER BY r.ord, c.created_at DESC, c.id DESC""".query(int4 *: comment.opt)
+
+  def commentsBySlugs(session: Session[IO])(keys: List[(Long, String)]): IO[Map[Int, List[CommentRow]]] =
+    session
+      .execute(commentsBySlugs)((keys.map(_._1), keys.map(_._2)))
+      .map(_.groupMap(_._1)(_._2).view.mapValues(_.flatten).toMap)
 
   /** Comment on an article (no row: no such article). Replaces the reference's article lookup + insert. */
   val insertComment: Query[(String, Long, String), CommentRow] =
