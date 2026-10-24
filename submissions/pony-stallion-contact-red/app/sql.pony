@@ -32,8 +32,9 @@ primitive _SQL
       + (if full then "a.body, " else "" end)
       + """
         a.created_at, a.updated_at,
-        ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id
-          WHERE at.article_id = a.id ORDER BY t.name) AS tag_list,
+        ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) AS name
+          FROM article_tags at WHERE at.article_id = a.id
+          ORDER BY name) AS tag_list,
         (SELECT count(*) FROM favorites f WHERE f.article_id = a.id)
           AS favorites_count,
         EXISTS(SELECT 1 FROM favorites f
