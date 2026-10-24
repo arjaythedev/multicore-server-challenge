@@ -91,5 +91,5 @@ private val scratch = ThreadLocal.withInitial { Scratch() }
 
 actual fun threadScratch(): Scratch = scratch.get()
 
-actual fun startHttpServer(host: String, port: Int, loops: Int, engine: conduit.http.HttpEngine): Unit =
-    TODO("jvm: NIO event loops")
+actual fun startHttpServer(host: String, port: Int, loops: Int, engine: conduit.http.HttpEngine) =
+    startNioServer(host, port, loops, engine) // NioHttp.kt
