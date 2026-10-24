@@ -88,15 +88,30 @@ object Sql:
     * article's columns. Lists read `NULL` for the body they leave out.
     */
   private def articleColumns(withBody: Boolean): Fragment[Long] =
-    val body = if withBody then "a.body" else "NULL::text"
-    sql"""SELECT a.id, a.slug, a.title, a.description, #$body, a.created_at, a.updated_at,
-                 ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id
-                        WHERE at.article_id = a.id ORDER BY t.name) AS tag_list,
-                 (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
+    sql"""SELECT #${articleData(withBody)},
                  EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $int8) AS favorited,
                  u.username, u.bio, u.image,
                  EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $int8 AND fo.followee_id = a.author_id)
                    AS following""".contramap[Long](viewer => (viewer, viewer))
+
+  /** The article's own columns, tags and favorite count: the part of the article columns that doesn't depend on who
+    * asks.
+    */
+  private def articleData(withBody: Boolean): String =
+    val body = if withBody then "a.body" else "NULL::text"
+    s"""a.id, a.slug, a.title, a.description, $body, a.created_at, a.updated_at,
+        ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id
+               WHERE at.article_id = a.id ORDER BY t.name) AS tag_list,
+        (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count"""
+
+  /** The list columns for the feed. Every article in the feed is by someone the viewer follows: the feed selects them
+    * through `follows` in the same statement, so the same snapshot, which makes the `following` EXISTS always true.
+    */
+  private val feedColumns: Fragment[Long] =
+    sql"""SELECT #${articleData(withBody = false)},
+                 EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $int8) AS favorited,
+                 u.username, u.bio, u.image,
+                 true AS following"""
 
   private val listColumns = articleColumns(withBody = false)
 
@@ -173,10 +188,13 @@ object Sql:
 
   private val counted: Decoder[Counted] = int8 *: article.opt
 
-  /** The global list. Replaces `ARTICLE_LIST_SELECT ORDER_PAGE` and its count. */
+  /** The global list. Replaces `ARTICLE_LIST_SELECT ORDER_PAGE` and its count. The capped count asks whether a 1000th
+    * article exists (one index probe) and counts only when there are fewer: min(count, 1000) either way.
+    */
   private val listAll: Query[(Long, Int, Int), Counted] =
     sql"""SELECT c.total, p.*
-            FROM (SELECT count(*) FROM (SELECT 1 FROM articles a LIMIT 1000) s) c(total)
+            FROM (SELECT CASE WHEN EXISTS (SELECT 1 FROM articles a ORDER BY a.id OFFSET 999) THEN 1000
+                              ELSE (SELECT count(*) FROM articles) END) c(total)
             LEFT JOIN LATERAL (
               $listColumns
                 FROM (SELECT id, slug, title, description, created_at, updated_at, author_id
@@ -229,13 +247,15 @@ object Sql:
       .query(counted)
       .contramap[(Long, String, Int, Int)]((viewer, user, limit, offset) => (user, viewer, user, limit, offset))
 
-  /** The feed (already page first in the reference). Replaces its page and count statements. */
+  /** The feed (already page first in the reference). Replaces its page and count statements. The count matches
+    * `author_id = ANY(ARRAY(...))` instead of `IN (...)`: the followees are read once, the same set.
+    */
   private val feedPage: Query[(Long, Int, Int), Counted] =
     sql"""SELECT c.total, p.*
-            FROM (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id IN
-                    (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $int8) LIMIT 1000) s) c(total)
+            FROM (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = ANY (ARRAY(
+                    SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $int8)) LIMIT 1000) s) c(total)
             LEFT JOIN LATERAL (
-              $listSelect WHERE a.id IN (SELECT x.id FROM follows fo CROSS JOIN LATERAL
+              $feedColumns FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id IN (SELECT x.id FROM follows fo CROSS JOIN LATERAL
                   (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id
                     ORDER BY a2.id DESC LIMIT ($int4::int + $int4::int)) x
                  WHERE fo.follower_id = $int8 ORDER BY x.id DESC LIMIT $int4 OFFSET $int4)) p ON true
