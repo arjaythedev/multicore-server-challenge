@@ -5,6 +5,7 @@ import conduit/bcrypt
 import conduit/handler.{Ctx}
 import conduit/http
 import conduit/pg/conn.{type Config, Config}
+import conduit/sql
 import conduit/util
 import gleam/erlang/process
 import gleam/int
@@ -18,7 +19,11 @@ fn getenv(name: String) -> Result(String, Nil)
 fn log(msg: String) -> Nil
 
 @external(erlang, "conduit_ffi", "pool_init")
-fn pool_init(reads: List(process.Subject(conn.Request)), writes: List(process.Subject(conn.Request))) -> Nil
+fn pool_init(
+  reads: List(process.Subject(conn.Request)),
+  writes: List(process.Subject(conn.Request)),
+  read_group_weights: List(Int),
+) -> Nil
 
 @external(erlang, "erlang", "halt")
 fn halt(code: Int) -> Nil
@@ -63,7 +68,8 @@ pub fn main() {
   let acceptors = env_int("ACCEPTORS", 16)
   let hibernate_words = env_int("HIB_WORDS", 4500)
   let min_heap_words = env_int("MIN_HEAP", 1598)
-  let bcrypt_window = env_int("BCRYPT_BATCH_MS", 120)
+  let bcrypt_window = env_int("BCRYPT_BATCH_MS", 250)
+  let batch_wait = env_int("BATCH_WAIT_MS", 2)
   case database_url == "" || secret == "" {
     True -> {
       log("DATABASE_URL and JWT_SECRET are required")
@@ -81,11 +87,13 @@ pub fn main() {
   let config = parse_database_url(database_url)
   bcrypt.start(bcrypt_window)
 
+  // Read connections hold a batch open for BATCH_WAIT_MS when requests are coming in fast; writes never wait.
   let register = process.new_subject()
-  list.each(list.repeat(Nil, read_conns + write_conns), fn(_) { conn.start(config, register) })
-  let subjects = list.map(list.repeat(Nil, read_conns + write_conns), fn(_) { process.receive_forever(register) })
-  let #(reads, writes) = list.split(subjects, read_conns)
-  pool_init(reads, writes)
+  list.each(list.repeat(Nil, read_conns), fn(_) { conn.start(Config(..config, batch_window: batch_wait), register) })
+  let reads = list.map(list.repeat(Nil, read_conns), fn(_) { process.receive_forever(register) })
+  list.each(list.repeat(Nil, write_conns), fn(_) { conn.start(Config(..config, batch_window: 0), register) })
+  let writes = list.map(list.repeat(Nil, write_conns), fn(_) { process.receive_forever(register) })
+  pool_init(reads, writes, sql.read_group_weights)
 
   case http.start(host, port, acceptors, Ctx(util.to_bits(secret), hibernate_words, min_heap_words)) {
     Ok(_) ->
@@ -145,6 +153,7 @@ fn parse_database_url(url: String) -> Config {
     password: pct(password),
     database: database,
     options: "-c jit=off -c max_parallel_workers_per_gather=0 -c enable_memoize=off -c plan_cache_mode=force_generic_plan",
+    batch_window: 0,
   )
 }
 

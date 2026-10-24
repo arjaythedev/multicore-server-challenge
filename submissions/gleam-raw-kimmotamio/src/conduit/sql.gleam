@@ -288,6 +288,25 @@ pub fn read_only(index: Int) -> Bool {
   }
 }
 
+/// Read connections are split into groups by statement kind, so that the requests waiting on one connection are
+/// mostly of one kind and batch together (`conn`). Group 0: tags. 1: an article by slug, a profile, a user.
+/// 2: comments. 3: the list pages. 4: the feed and the reads without a batched form.
+pub const read_groups = 5
+
+/// How the read connections are shared out among the groups (greedy proportional fill in `pool_init`): the
+/// cheap single-row kinds need one connection each and batch best on one, the lists and the feed take the rest.
+pub const read_group_weights = [1, 2, 1, 4, 4]
+
+pub fn read_group(index: Int) -> Int {
+  case index {
+    0 -> 0
+    6 | 8 | 24 -> 1
+    7 -> 2
+    1 | 2 | 3 | 4 -> 3
+    _ -> 4
+  }
+}
+
 pub fn batchable(index: Int) -> Bool {
   case index {
     0 | 1 | 2 | 3 | 4 | 6 | 7 | 8 | 24 -> True

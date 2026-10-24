@@ -39,7 +39,7 @@ pub type Outcome {
 }
 
 @external(erlang, "conduit_ffi", "pick_read")
-fn pick_read() -> Subject(Request)
+fn pick_read(group: Int) -> Subject(Request)
 
 @external(erlang, "conduit_ffi", "pick_write")
 fn pick_write() -> Subject(Request)
@@ -114,7 +114,7 @@ fn exec(pool: Subject(Request), statements: List(#(Int, List(Param)))) -> Result
 }
 
 fn read(statement: Int, params: List(Param)) -> Result(List(Row), Response) {
-  case exec(pick_read(), [#(statement, params)]) {
+  case exec(pick_read(sql.read_group(statement)), [#(statement, params)]) {
     Ok([rows]) -> Ok(rows)
     Ok(_) -> Error(fail(500, "database error"))
     Error(e) -> Error(e)
@@ -131,7 +131,7 @@ fn write(statement: Int, params: List(Param)) -> Result(List(Row), Response) {
 
 /// Runs one statement on a read connection, which renders the rows with `render` and writes the response.
 fn read_then(r: Req, statement: Int, params: List(Param), render: fn(List(Row)) -> Response) -> Result(Outcome, Response) {
-  defer(r, pick_read(), statement, params, render)
+  defer(r, pick_read(sql.read_group(statement)), statement, params, render)
 }
 
 fn write_then(r: Req, statement: Int, params: List(Param), render: fn(List(Row)) -> Response) -> Result(Outcome, Response) {

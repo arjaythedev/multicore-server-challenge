@@ -5,7 +5,7 @@
          xor_bytes/2, has_nul/1, is_utf8/1, base64url_encode/1, base64url_decode/1,
          listen/2, accept/1, connect/3, recv/1, recv_timeout/2, send/2, send_nosuspend/2, close/1, parse_request/1, spawn_connection/2,
          hibernate_http/3, heap_words/0, mailbox_len/0, safe/1, log/1,
-         pool_init/2, pick_read/0, pick_write/0, sleep/1, stat_add/2, stats/0,
+         pool_init/3, pick_read/1, pick_write/0, sleep/1, stat_add/2, stats/0,
          split_segments/1, split_target/1, bcrypt_init/1, bcrypt_collector/0]).
 
 %% ---------------------------------------------------------------- misc
@@ -211,19 +211,36 @@ safe(Fun) ->
 
 %% ---------------------------------------------------------------- connection pools
 
-pool_init(Reads, Writes) ->
-    persistent_term:put({?MODULE, reads}, list_to_tuple(Reads)),
+%% The read connections are split into groups by statement kind (conduit@sql:read_group/1), each group chosen
+%% round-robin through its own atomics counter.
+pool_init(Reads, Writes, Weights) ->
+    Groups = assign(Reads, Weights),
+    persistent_term:put({?MODULE, reads}, list_to_tuple([list_to_tuple(G) || G <- Groups])),
     persistent_term:put({?MODULE, writes}, list_to_tuple(Writes)),
-    persistent_term:put({?MODULE, counters}, atomics:new(2, [])),
+    persistent_term:put({?MODULE, counters}, atomics:new(length(Weights) + 1, [])),
     nil.
 
-pick_read() -> pick(reads, 1).
-pick_write() -> pick(writes, 2).
+%% Greedy proportional fill: each connection goes to the group furthest behind its weight share, so any number
+%% of connections works. A group left with no connection of its own uses all of them.
+assign(Reads, Weights) ->
+    N = length(Weights),
+    Assigned = assign_loop(Reads, Weights, lists:duplicate(N, 0), []),
+    [case [R || {R, G} <- Assigned, G =:= I] of [] -> Reads; L -> L end || I <- lists:seq(1, N)].
 
-pick(Key, Ix) ->
-    T = persistent_term:get({?MODULE, Key}),
-    C = persistent_term:get({?MODULE, counters}),
-    N = atomics:add_get(C, Ix, 1),
+assign_loop([], _, _, Acc) -> lists:reverse(Acc);
+assign_loop([R | Rest], Weights, Counts, Acc) ->
+    {_, Best} = lists:min([{(C + 1) / W, I} || {I, {C, W}} <- lists:enumerate(lists:zip(Counts, Weights))]),
+    Counts2 = [case I of Best -> C + 1; _ -> C end || {I, C} <- lists:enumerate(Counts)],
+    assign_loop(Rest, Weights, Counts2, [{R, Best} | Acc]).
+
+pick_read(Group) ->
+    T = element(Group + 1, persistent_term:get({?MODULE, reads})),
+    pick(T, Group + 2).
+
+pick_write() -> pick(persistent_term:get({?MODULE, writes}), 1).
+
+pick(T, Ix) ->
+    N = atomics:add_get(persistent_term:get({?MODULE, counters}), Ix, 1),
     element((N rem tuple_size(T)) + 1, T).
 
 %% ---------------------------------------------------------------- bcrypt collector registry

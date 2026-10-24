@@ -6,6 +6,12 @@
 //// A `Render` request ends here too: the rows are decoded, rendered to JSON and written to the client socket by
 //// this process, so the response never crosses a process boundary and the connection process that asked keeps
 //// a tiny heap.
+////
+//// Reads of one kind that are waiting here at the same moment go to Postgres as one batched statement (`sql`).
+//// The read connections are grouped by statement kind so that what waits on one connection is mostly of one
+//// kind, and when requests are arriving fast (the previous one came within two windows) a connection holds the
+//// batch open for up to `batch_window` ms before sending it: most of a cheap statement's backend cost is
+//// per-statement overhead, so a batch of four costs Postgres about half of four single statements.
 
 import conduit/pg/proto.{type Param, type Row}
 import conduit/response.{type Response}
@@ -68,6 +74,8 @@ pub type Config {
     password: String,
     database: String,
     options: String,
+    /// How long (ms) to hold a batch open for company when requests are arriving fast; 0 never waits.
+    batch_window: Int,
   )
 }
 
@@ -128,7 +136,7 @@ pub fn start(config: Config, register: Subject(Subject(Request))) -> Nil {
 
 fn serve(config: Config, subject: Subject(Request), queue: List(Request), failures: Int) -> Nil {
   case open(config) {
-    Ok(sock) -> loop(config, subject, sock, queue)
+    Ok(sock) -> loop(config, subject, sock, queue, 0)
     Error(reason) -> {
       case failures < 3 || failures % 20 == 0 {
         True -> log("postgres: " <> reason)
@@ -147,23 +155,37 @@ fn statement_name(index: Int) -> String {
 /// Requests drained from the mailbox beyond the one being served wait in `queue`, oldest first.
 const drain_limit = 64
 
-fn loop(config: Config, subject: Subject(Request), sock: Socket, queue: List(Request)) -> Nil {
+/// A batch this big is sent without waiting for more company.
+const target_batch = 8
+
+/// `last` is when the previous cycle started: a request arriving within two windows of it counts as fast traffic.
+fn loop(config: Config, subject: Subject(Request), sock: Socket, queue: List(Request), last: Int) -> Nil {
   let #(first, queue) = case queue {
     [] -> #(process.receive_forever(subject), [])
     [head, ..rest] -> #(head, rest)
   }
+  let now = monotonic_ms()
   let queue = drain(subject, queue, drain_limit - list.length(queue))
+  let queue = case
+    config.batch_window > 0
+    && now - last <= 2 * config.batch_window
+    && batch_key(first) != None
+    && list.length(queue) < target_batch - 1
+  {
+    True -> collect(subject, queue, now + config.batch_window, target_batch - 1 - list.length(queue))
+    False -> queue
+  }
   case first.deadline < monotonic_ms() {
     True -> {
       stat_add(4, 1)
       complete(first, Error(PgError("57014", "queued too long")))
-      loop(config, subject, sock, queue)
+      loop(config, subject, sock, queue, now)
     }
-    False -> serve_first(config, subject, sock, first, queue)
+    False -> serve_first(config, subject, sock, first, queue, now)
   }
 }
 
-fn serve_first(config: Config, subject: Subject(Request), sock: Socket, first: Request, queue: List(Request)) -> Nil {
+fn serve_first(config: Config, subject: Subject(Request), sock: Socket, first: Request, queue: List(Request), now: Int) -> Nil {
   case batch_key(first) {
     // Not batched: a write or a multi-statement request is never retried, since its commit state would be
     // unknown; a read that has no batched form (the feed, the probes, the user lookups) is.
@@ -171,7 +193,7 @@ fn serve_first(config: Config, subject: Subject(Request), sock: Socket, first: R
       stat_add(1, 1)
       let reads = list.all(first.statements, fn(s) { sql.read_only(s.0) })
       case run(sock, first.statements, [first], reads) {
-        True -> loop(config, subject, sock, queue)
+        True -> loop(config, subject, sock, queue, now)
         False ->
           case reads {
             True -> reconnect(config, subject, sock, [first, ..queue])
@@ -203,7 +225,7 @@ fn serve_first(config: Config, subject: Subject(Request), sock: Socket, first: R
         }
       }
       case ok {
-        True -> loop(config, subject, sock, others)
+        True -> loop(config, subject, sock, others, now)
         False -> reconnect(config, subject, sock, list.append(batch, others))
       }
     }
@@ -233,6 +255,19 @@ fn drain(subject: Subject(Request), queue: List(Request), room: Int) -> List(Req
     False ->
       case process.receive(subject, 0) {
         Ok(r) -> drain(subject, list.append(queue, [r]), room - 1)
+        Error(_) -> queue
+      }
+  }
+}
+
+/// Waits for more requests until `until` (a monotonic ms) or `room` more have arrived.
+fn collect(subject: Subject(Request), queue: List(Request), until: Int, room: Int) -> List(Request) {
+  let remaining = until - monotonic_ms()
+  case room <= 0 || remaining <= 0 {
+    True -> queue
+    False ->
+      case process.receive(subject, remaining) {
+        Ok(r) -> collect(subject, list.append(queue, [r]), until, room - 1)
         Error(_) -> queue
       }
   }
