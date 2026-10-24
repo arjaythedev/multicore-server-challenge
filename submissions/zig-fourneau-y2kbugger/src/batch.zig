@@ -185,7 +185,7 @@ pub const Reads = struct {
         pending.sequence = reads.sequence;
         reads.sequence += 1;
         pending.next = null;
-        const queue = &reads.queues[@intFromEnum(kind)];
+        const queue = &reads.queues[@backingInt(kind)];
         if (queue.tail) |tail| tail.next = pending else queue.head = pending;
         queue.tail = pending;
         queue.count += 1;
@@ -221,7 +221,7 @@ pub const Reads = struct {
             const head = queue.head orelse continue;
             if (head.sequence < best_sequence) {
                 best_sequence = head.sequence;
-                best = @enumFromInt(index);
+                best = @fromBackingInt(@intCast(index));
             }
         }
         return best;
@@ -254,7 +254,7 @@ pub const Reads = struct {
 
     /// Up to `batch_max` of a kind's reads, oldest first, as one group.
     fn send(reads: *Reads, connection: *pg.Connection, kind: Kind) void {
-        const queue = &reads.queues[@intFromEnum(kind)];
+        const queue = &reads.queues[@backingInt(kind)];
         assert(queue.count > 0);
         var index: [pg.batch_max]i32 = undefined;
         var viewer: [pg.batch_max]i64 = undefined;
@@ -286,7 +286,7 @@ pub const Reads = struct {
         const S = sql.S;
         const call = struct {
             fn of(statement: S, params: []const pg.Param) pg.Call {
-                return .{ .statement = @intFromEnum(statement), .params = params };
+                return .{ .statement = @backingInt(statement), .params = params };
             }
         }.of;
         _ = switch (kind) {

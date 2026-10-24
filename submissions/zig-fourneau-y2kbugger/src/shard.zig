@@ -179,7 +179,7 @@ fn run_or_fail(options: Options) !noreturn {
     for ([_][]pg.Connection{ shard.read_connections, shard.write_connections }) |connections| {
         for (connections) |*connection| {
             const fd = try pg.connect_blocking(options.url, statements);
-            connection.* = try .init(gpa, io, fd, statements);
+            connection.* = try .init(gpa, io, fd, options.url, statements);
         }
     }
     shard.reads.init(io, shard.read_connections);

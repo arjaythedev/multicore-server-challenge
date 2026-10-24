@@ -10,7 +10,7 @@
 //! and unparks the request at the group's ReadyForQuery. No lock, no
 //! futex: a shard is one thread (fourneau's server), and so is everything
 //! here. Startup (connect, authenticate, prepare) blocks: it runs before
-//! the shard serves.
+//! the shard serves, and again only for a connection that broke.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -232,6 +232,8 @@ pub fn alloc_untouched(gpa: std.mem.Allocator, bytes: usize) ![]u8 {
 pub const Connection = struct {
     io: Io,
     fd: linux.fd_t,
+    /// Where it connects again when it breaks.
+    url: Url,
     /// Statements by their index into the program's table: `s<index>`.
     statements: []const Statement,
     /// Two buffers: requests append to the one filling while the other is
@@ -252,10 +254,11 @@ pub const Connection = struct {
     /// at a time.
     batch: Batch = .{},
 
-    pub fn init(gpa: std.mem.Allocator, io: Io, fd: linux.fd_t, statements: []const Statement) !Connection {
+    pub fn init(gpa: std.mem.Allocator, io: Io, fd: linux.fd_t, url: Url, statements: []const Statement) !Connection {
         return .{
             .io = io,
             .fd = fd,
+            .url = url,
             .statements = statements,
             .output = .{ try alloc_untouched(gpa, output_bytes), try alloc_untouched(gpa, output_bytes) },
             .input = try alloc_untouched(gpa, input_bytes),
@@ -305,9 +308,51 @@ pub const Connection = struct {
         return connection.queue_count;
     }
 
-    /// The reader fiber's body: answers, in order, to their requests, until
-    /// the connection fails; then every request waiting fails with it.
+    /// The reader fiber's body, for good: answers, in order, to their
+    /// requests, until the connection fails; then every request waiting
+    /// fails with it, and the connection is made again (a backend gone, a
+    /// Postgres restarted), its batches failing at once meanwhile.
     pub fn read_loop(connection: *Connection) void {
+        // Bounded only to say so: it serves for good.
+        for (0..std.math.maxInt(u64)) |_| {
+            connection.read_until_broken();
+            connection.reconnect() catch return; // canceled
+            if (connection.idle) |idle| idle.function(idle.context, connection);
+        } else unreachable;
+    }
+
+    /// Connect again, a second between tries, once no fiber writes to the
+    /// old descriptor (its number may come back as the new one's).
+    fn reconnect(connection: *Connection) error{Canceled}!void {
+        assert(connection.broken);
+        assert(connection.queue_count == 0);
+        const second: Io.Duration = .fromSeconds(1);
+        _ = linux.shutdown(connection.fd, linux.SHUT.RDWR);
+        // Bounded only to say so: a writer's write fails once shut.
+        for (0..std.math.maxInt(u64)) |_| {
+            if (!connection.writing) break;
+            try connection.io.sleep(.fromMilliseconds(1), .awake);
+        } else unreachable;
+        _ = linux.close(connection.fd);
+        connection.output_used = .{ 0, 0 };
+        connection.input_start = 0;
+        connection.input_end = 0;
+        // Bounded only to say so: Postgres may be gone for a while. At once
+        // first: a backend ended alone leaves Postgres up.
+        for (0..std.math.maxInt(u64)) |_| {
+            const fd = connect_blocking(connection.url, connection.statements) catch |err| {
+                log.err("reconnect: {t}", .{err});
+                try connection.io.sleep(second, .awake);
+                continue;
+            };
+            connection.fd = fd;
+            connection.broken = false;
+            log.err("reconnected", .{});
+            return;
+        } else unreachable;
+    }
+
+    fn read_until_broken(connection: *Connection) void {
         // Bounded only to say so: it reads until the connection fails.
         for (0..std.math.maxInt(u64)) |_| {
             connection.dispatch() catch break;
@@ -569,7 +614,7 @@ const Writer = struct {
         out.int32(@intCast(header_bytes + items.len * (4 + element_bytes)));
         out.int32(if (items.len == 0) 0 else 1);
         out.int32(0); // no nulls
-        out.int32(@intCast(@intFromEnum(oid)));
+        out.int32(@intCast(@backingInt(oid)));
         if (items.len > 0) {
             out.int32(@intCast(items.len));
             out.int32(1); // lower bound
@@ -607,7 +652,7 @@ const Writer = struct {
                 const dimensions: i32 = if (items.len == 0) 0 else 1;
                 out.int32(dimensions);
                 out.int32(0); // no nulls
-                out.int32(@intCast(@intFromEnum(Oid.text)));
+                out.int32(@intCast(@backingInt(Oid.text)));
                 if (items.len > 0) {
                     out.int32(@intCast(items.len));
                     out.int32(1); // lower bound
@@ -734,6 +779,13 @@ pub fn connect_blocking(url: Url, statements: []const Statement) !linux.fd_t {
         .port = std.mem.nativeToBig(u16, url.port),
         .addr = @bitCast(url.host),
     };
+    // Bounded: a Postgres that accepts and never answers (a reconnect runs
+    // on the shard's thread) stalls it seconds, not for good.
+    const timeout: linux.timeval = .{ .sec = 2, .usec = 0 };
+    const none: linux.timeval = .{ .sec = 0, .usec = 0 };
+    for ([_]u32{ linux.SO.RCVTIMEO, linux.SO.SNDTIMEO }) |option| {
+        _ = linux.setsockopt(fd, linux.SOL.SOCKET, option, std.mem.asBytes(&timeout), @sizeOf(linux.timeval));
+    }
     const connected = linux.connect(fd, @ptrCast(&address), @sizeOf(linux.sockaddr.in));
     if (linux.errno(connected) != .SUCCESS) return error.Connect;
     const one: u32 = 1;
@@ -742,6 +794,9 @@ pub fn connect_blocking(url: Url, statements: []const Statement) !linux.fd_t {
     try stream.startup(url);
     try stream.authenticate(url);
     try stream.prepare(statements);
+    for ([_]u32{ linux.SO.RCVTIMEO, linux.SO.SNDTIMEO }) |option| {
+        _ = linux.setsockopt(fd, linux.SOL.SOCKET, option, std.mem.asBytes(&none), @sizeOf(linux.timeval));
+    }
     return fd;
 }
 
@@ -868,7 +923,7 @@ const Blocking = struct {
             out.statement_name(@intCast(index));
             out.cstring(statement.sql);
             out.int16(@intCast(statement.params.len));
-            for (statement.params) |oid| out.int32(@intCast(@intFromEnum(oid)));
+            for (statement.params) |oid| out.int32(@intCast(@backingInt(oid)));
             out.end(message);
         }
         const sync = out.begin('S');

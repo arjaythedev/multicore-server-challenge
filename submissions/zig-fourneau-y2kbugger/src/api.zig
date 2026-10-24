@@ -234,7 +234,7 @@ const Group = struct {
     }
 
     fn run(group: *Group, statement: S, params: []const pg.Param) void {
-        group.encoded.run(&sql.statements.values, @intFromEnum(statement), params);
+        group.encoded.run(&sql.statements.values, @backingInt(statement), params);
     }
 
     /// In place: the group's queue points at `pending`.
@@ -659,7 +659,7 @@ fn favorite_toggle(context: *Context, slug: []const u8, statement: S) Response {
     group.run(.article_by_slug, &.{ .{ .int8 = context.viewer }, .{ .text = slug } });
     const results = group.wait();
     if (results.waiter.failure != null) return group.finish(internal);
-    return respond_article(group.slot,results, 1, 200);
+    return respond_article(group.slot, results, 1, 200);
 }
 
 fn create_article(context: *Context, _: []const u8) Response {
@@ -678,7 +678,7 @@ fn create_article(context: *Context, _: []const u8) Response {
     group.run(.article_by_current, &.{.{ .int8 = context.viewer }});
     const results = group.wait();
     if (results.waiter.failure != null) return group.finish(internal);
-    return respond_article(group.slot,results, if (tag_list.len > 0) 3 else 1, 201);
+    return respond_article(group.slot, results, if (tag_list.len > 0) 3 else 1, 201);
 }
 
 fn update_article(context: *Context, slug: []const u8) Response {
@@ -703,7 +703,7 @@ fn update_article(context: *Context, slug: []const u8) Response {
     group.run(.article_by_id, &.{ .{ .int8 = context.viewer }, .{ .int8 = id } });
     const results = group.wait();
     if (results.waiter.failure != null) return group.finish(internal);
-    return respond_article(group.slot,results, 1, 200);
+    return respond_article(group.slot, results, 1, 200);
 }
 
 fn delete_article(context: *Context, slug: []const u8) Response {
