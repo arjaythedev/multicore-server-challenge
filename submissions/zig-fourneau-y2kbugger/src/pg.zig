@@ -50,7 +50,7 @@ pub const Param = union(enum) {
 /// Requests a batch holds at most: past ~10, a statement's own cost is
 /// all but gone (52.7 us of Postgres per request at 32, 53.4 at 10, 161
 /// one at a time; the article by slug, 2026-10-23).
-pub const batch_max = 32;
+pub const batch_max = 64;
 
 /// A group's requests: one; or a batch of reads, whose rows each name
 /// their request by their first column (an int4, its index into
