@@ -1,5 +1,5 @@
-//// JSON output written straight into iodata (a StringTree): no intermediate maps, and a string takes a
-//// `binary:match` fast path when nothing in it needs escaping.
+//// JSON output written straight into iodata (a StringTree): no intermediate maps. String escaping and
+//// timestamp formatting are the two C helpers in native/conduit_nif.c.
 
 import conduit/util
 import gleam/int
@@ -7,8 +7,8 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/string_tree.{type StringTree}
 
-/// A JSON string literal, escaped (an iodata-building Erlang helper: the hot path of every response).
-@external(erlang, "conduit_ffi", "json_string")
+/// A JSON string literal, escaped: `[$", s, $"]` around the original binary when nothing needs escaping.
+@external(erlang, "conduit_nif", "json_string")
 pub fn str(s: BitArray) -> StringTree
 
 pub fn str_s(s: String) -> StringTree {
@@ -33,9 +33,9 @@ pub fn bool(b: Bool) -> StringTree {
   }
 }
 
-pub fn ts(micros: Int) -> StringTree {
-  string_tree.from_strings(["\"", util.rfc3339(micros), "\""])
-}
+/// A Postgres binary `timestamptz` (microseconds since 2000-01-01) as a quoted RFC 3339 string, milliseconds.
+@external(erlang, "conduit_nif", "json_rfc3339")
+pub fn ts(micros: Int) -> StringTree
 
 pub fn str_array(items: List(BitArray)) -> StringTree {
   list.map(items, str)

@@ -4,7 +4,9 @@ import conduit/jwt
 import conduit/pg/proto
 import conduit/util
 import gleam/bit_array
+import gleam/list
 import gleam/option.{None, Some}
+import gleam/string
 import gleam/string_tree
 import gleeunit
 
@@ -20,8 +22,30 @@ pub fn rfc3339_test() {
   assert util.rfc3339(951_782_400_000_000) == "2030-02-28T00:00:00.000Z"
 }
 
+@external(erlang, "conduit_nif", "rfc3339")
+fn nif_rfc3339(micros: Int) -> String
+
+// The C formatter agrees with the Gleam one on ordinary, negative, leap-day and far-future values.
+pub fn rfc3339_nif_test() {
+  list.each(
+    [
+      0, -1, 1, 999, 1000, -1000, 762_525_296_789_999, 951_782_400_000_000, -946_684_800_000_000,
+      -946_684_800_000_001, 1_000_000_000_000_000, 1_234_567_891_234_567, 4_102_444_800_000_000, 86_399_999_999,
+      86_400_000_000, -86_400_000_000, 252_460_800_000_000, 2_000_000_000_000_000,
+    ],
+    fn(m) { assert nif_rfc3339(m) == util.rfc3339(m) },
+  )
+  assert string_tree.to_string(jsonw.ts(0)) == "\"2000-01-01T00:00:00.000Z\""
+}
+
 pub fn json_string_test() {
   assert string_tree.to_string(jsonw.str(<<"plain":utf8>>)) == "\"plain\""
+  assert string_tree.to_string(jsonw.str(<<>>)) == "\"\""
+  assert string_tree.to_string(jsonw.str(<<"\"":utf8>>)) == "\"\\\"\""
+  assert string_tree.to_string(jsonw.str(<<"tab\tend":utf8>>)) == "\"tab\\tend\""
+  assert string_tree.to_string(jsonw.str(<<0, 31, 32, 127, 8, 12, 13>>)) == "\"\\u0000\\u001f \u{7f}\\b\\f\\r\""
+  let long = string.repeat("x", 5000) <> "\\" <> string.repeat("y", 5000)
+  assert string_tree.to_string(jsonw.str(util.to_bits(long))) == "\"" <> string.repeat("x", 5000) <> "\\\\" <> string.repeat("y", 5000) <> "\""
   assert string_tree.to_string(jsonw.str(<<"a\"b\\c\nd\te":utf8, 1, "f":utf8>>)) == "\"a\\\"b\\\\c\\nd\\te\\u0001f\""
   assert string_tree.to_string(jsonw.str(<<"ünï":utf8>>)) == "\"ünï\""
   assert string_tree.to_string(jsonw.opt_str(None)) == "null"
@@ -37,7 +61,32 @@ pub fn jwt_round_trip_test() {
   assert jwt.check("Bearer " <> token, secret, 1_700_000_001) == jwt.Invalid
   assert jwt.check("", secret, 1_700_000_001) == jwt.Anonymous
   assert jwt.check("Token not.a.jwt", secret, 1_700_000_001) == jwt.Invalid
+  // A tampered signature, a tampered payload, an extra segment.
+  let n = string.length(token)
+  let flipped = case string.slice(token, n - 1, 1) {
+    "A" -> "B"
+    _ -> "A"
+  }
+  assert jwt.check("Token " <> string.slice(token, 0, n - 1) <> flipped, secret, 1_700_000_001) == jwt.Invalid
+  assert jwt.check("Token " <> string.replace(token, "eyJzdWIiOiIxNTAi", "eyJzdWIiOiIxNTEi"), secret, 1_700_000_001) == jwt.Invalid
+  assert jwt.check("Token " <> token <> ".x", secret, 1_700_000_001) == jwt.Invalid
+  assert jwt.check("Token " <> token, secret, 1_700_000_001) == jwt.User(150, token)
+  // Another header spelling and a padded signature take the general path and are accepted too.
+  let header = bit_array.base64_url_encode(<<"{\"typ\":\"JWT\",\"alg\":\"HS256\"}":utf8>>, False)
+  let payload = bit_array.base64_url_encode(<<"{\"sub\":\"7\",\"iat\":1700000000,\"exp\":1700000600,\"nbf\":1700000000}":utf8>>, False)
+  let signing = header <> "." <> payload
+  let sig = bit_array.base64_url_encode(hmac_sha256(secret, util.to_bits(signing)), True)
+  let other = signing <> "." <> sig
+  assert jwt.check("Token " <> other, secret, 1_700_000_001) == jwt.User(7, other)
+  assert jwt.check("Token " <> other, secret, 1_700_000_600) == jwt.Invalid
+  let hs512_header = bit_array.base64_url_encode(<<"{\"typ\":\"JWT\",\"alg\":\"HS512\"}":utf8>>, False)
+  let signing2 = hs512_header <> "." <> payload
+  let bad = signing2 <> "." <> bit_array.base64_url_encode(hmac_sha256(secret, util.to_bits(signing2)), False)
+  assert jwt.check("Token " <> bad, secret, 1_700_000_001) == jwt.Invalid
 }
+
+@external(erlang, "conduit_ffi", "hmac_sha256")
+fn hmac_sha256(key: BitArray, data: BitArray) -> BitArray
 
 pub fn page_test() {
   assert util.page(util.parse_query("")) == Ok(#(20, 0))

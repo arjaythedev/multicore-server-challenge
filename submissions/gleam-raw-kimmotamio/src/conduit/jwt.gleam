@@ -20,6 +20,12 @@ fn hmac(key: BitArray, data: BitArray) -> BitArray
 @external(erlang, "conduit_ffi", "hash_equals")
 fn hash_equals(a: BitArray, b: BitArray) -> Bool
 
+@external(erlang, "conduit_ffi", "base64url_encode")
+fn b64_encode(data: BitArray) -> BitArray
+
+@external(erlang, "conduit_ffi", "base64url_decode")
+fn b64_decode(data: BitArray) -> Result(BitArray, Nil)
+
 pub type Auth {
   Anonymous
   User(id: Int, token: String)
@@ -29,8 +35,8 @@ pub type Auth {
 pub fn issue(secret: BitArray, user_id: Int, now: Int) -> String {
   let claims =
     "{\"sub\":\"" <> int.to_string(user_id) <> "\",\"iat\":" <> int.to_string(now) <> ",\"exp\":" <> int.to_string(now + ttl) <> "}"
-  let signing = std_header <> "." <> bit_array.base64_url_encode(util.to_bits(claims), False)
-  signing <> "." <> bit_array.base64_url_encode(hmac(secret, util.to_bits(signing)), False)
+  let signing = std_header <> "." <> util.unsafe_to_string(b64_encode(util.to_bits(claims)))
+  signing <> "." <> util.unsafe_to_string(b64_encode(hmac(secret, util.to_bits(signing))))
 }
 
 /// A missing or empty header is anonymous; anything else must be a valid `Token <jwt>`.
@@ -46,32 +52,68 @@ pub fn check(header: String, secret: BitArray, now: Int) -> Auth {
   }
 }
 
+/// Fast path for the shape every issuer here produces: the standard header, then the payload, then a 43-character
+/// signature (32 bytes of HMAC in unpadded base64url). The signature is checked by encoding the expected HMAC and
+/// comparing in constant time, so nothing is decoded before the token is known to be genuine. Any other shape goes
+/// through the general path, which accepts the same tokens more slowly.
 pub fn verify(token: String, secret: BitArray, now: Int) -> Result(Int, Nil) {
+  let bits = util.to_bits(token)
+  let signed_len = bit_array.byte_size(bits) - 44
+  let parts = case signed_len > 37 {
+    True ->
+      case bits {
+        <<signed:bytes-size(signed_len), ".":utf8, sig:bytes>> ->
+          case signed {
+            <<"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.":utf8, payload:bytes>> -> Some(#(signed, payload, sig))
+            _ -> None
+          }
+        _ -> None
+      }
+    False -> None
+  }
+  case parts {
+    Some(#(signed, payload, sig)) ->
+      case hash_equals(b64_encode(hmac(secret, signed)), sig) {
+        False -> Error(Nil)
+        True ->
+          case b64_decode(payload) {
+            Ok(claims) -> check_claims(claims, now)
+            Error(_) -> Error(Nil)
+          }
+      }
+    None -> verify_general(token, secret, now)
+  }
+}
+
+fn verify_general(token: String, secret: BitArray, now: Int) -> Result(Int, Nil) {
   case string.split(token, ".") {
     [header, payload, sig] ->
-      case header_ok(header), bit_array.base64_url_decode(sig) {
+      case header_ok(header), b64_decode(util.to_bits(sig)) {
         True, Ok(sig_bytes) -> {
           let signed = util.to_bits(header <> "." <> payload)
           case bit_array.byte_size(sig_bytes) == 32 && hash_equals(hmac(secret, signed), sig_bytes) {
             False -> Error(Nil)
             True ->
-              case bit_array.base64_url_decode(payload) {
+              case b64_decode(util.to_bits(payload)) {
                 Error(_) -> Error(Nil)
-                Ok(claims) ->
-                  case parse_claims(claims) {
-                    Ok(#(sub, exp, nbf)) ->
-                      case exp > now && nbf_ok(nbf, now) {
-                        True -> Ok(sub)
-                        False -> Error(Nil)
-                      }
-                    Error(_) -> Error(Nil)
-                  }
+                Ok(claims) -> check_claims(claims, now)
               }
           }
         }
         _, _ -> Error(Nil)
       }
     _ -> Error(Nil)
+  }
+}
+
+fn check_claims(claims: BitArray, now: Int) -> Result(Int, Nil) {
+  case parse_claims(claims) {
+    Ok(#(sub, exp, nbf)) ->
+      case exp > now && nbf_ok(nbf, now) {
+        True -> Ok(sub)
+        False -> Error(Nil)
+      }
+    Error(_) -> Error(Nil)
   }
 }
 
@@ -86,7 +128,7 @@ fn header_ok(header: String) -> Bool {
   case header == std_header {
     True -> True
     False ->
-      case bit_array.base64_url_decode(header) {
+      case b64_decode(util.to_bits(header)) {
         Error(_) -> False
         Ok(bytes) -> {
           let decoder = {

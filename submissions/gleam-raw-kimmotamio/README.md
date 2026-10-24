@@ -4,8 +4,9 @@
 
 No web framework, no database driver library: the HTTP/1.1 server, the PostgreSQL wire-protocol client, the
 JSON writer and the JWT code are all written in Gleam, with a thin Erlang module underneath for sockets,
-`erlang:decode_packet`, crypto and a few process tricks. One BEAM process per keep-alive connection, one BEAM
-process per Postgres connection, bcrypt as a dirty-CPU NIF.
+`erlang:decode_packet`, crypto and a few process tricks, and two small C libraries: bcrypt as a dirty-CPU NIF,
+and JSON string escaping plus timestamp formatting as plain NIFs. One BEAM process per keep-alive connection,
+one BEAM process per Postgres connection.
 
 ## Stack
 
@@ -15,8 +16,9 @@ process per Postgres connection, bcrypt as a dirty-CPU NIF.
 | Gleam | 1.19.2 (official release tarball, sha256-pinned) |
 | gleam_stdlib / gleam_erlang / gleam_json | 1.0.5 / 1.3.0 / 3.1.0 (pinned in `manifest.toml`; gleam_json is used for request bodies only) |
 | bcrypt | the OpenBSD `bcrypt.c`/`blowfish.c` as packaged by erlang-bcrypt, vendored in `native/` with its licence, plus a lane-interleaved variant (`native/bcrypt_lanes.c`) and a small NIF (`native/bcrypt_nif.c`), all built by `build.sh`; cost 10 |
+| C helpers | `native/conduit_nif.c`: JSON string escaping and RFC 3339 timestamps (about 150 lines, no dependencies) |
 
-`build.sh` compiles the NIF with the system C compiler, downloads the three pinned Gleam packages and runs
+`build.sh` compiles the NIFs with the system C compiler, downloads the three pinned Gleam packages and runs
 `gleam export erlang-shipment`. `start.sh` runs `erl` on the shipment in the foreground.
 
 ## Design
@@ -58,14 +60,19 @@ process per Postgres connection, bcrypt as a dirty-CPU NIF.
   Article creation with tags is two statements in one Sync group (one implicit transaction, one commit): missing
   tags are inserted first in name order (no deadlocks, no sequence burn for existing tags), then the article is
   inserted, linked and read back; a deadlock/serialization failure is retried once.
-- **JSON output** is iodata built directly from the decoded columns (`src/conduit/jsonw.gleam`); strings go
-  through one `binary:match` for the common case of nothing to escape, otherwise they are copied in chunks
-  between the special bytes. Timestamps are formatted with integer arithmetic straight into a binary
-  (truncated to milliseconds).
-- **JWT**: `crypto:mac(hmac, sha256, …)` and `crypto:hash_equals`; the standard header is recognised by equality
-  (any other header is decoded and must say HS256); the flat `{"sub","iat","exp"}` payload is scanned with
-  bit-array patterns, anything else goes through the JSON parser so both agree. `exp` (and `nbf` if present) are
-  checked on every request. Nothing is remembered between requests.
+- **JSON output** is iodata built directly from the decoded columns (`src/conduit/jsonw.gleam`). A string
+  literal is one NIF call that scans the binary and returns `[$", Bin, $"]` around the original sub-binary when
+  nothing needs escaping (the common case: no copy), otherwise one escaped copy. A timestamp is one NIF call that
+  writes the quoted RFC 3339 string (truncated to milliseconds); the Gleam formatter it replaced stays as the
+  test oracle. The two together were about a tenth of the BEAM's time per request as Erlang pattern matching.
+- **JWT**: `crypto:mac(hmac, sha256, …)` and `crypto:hash_equals`. A token in the shape every issuer here
+  produces (the standard header, a payload, a 43-character signature) is taken apart with one bit-array pattern;
+  the signature is checked by base64url-encoding the expected HMAC and comparing it in constant time, so nothing
+  is decoded before the token is known to be genuine; then the payload is decoded and the flat
+  `{"sub","iat","exp"}` claims are scanned with bit-array patterns. Any other shape (another header spelling, a
+  padded signature, extra claims) goes through the general path: split, decode, the header must say HS256, the
+  JSON parser reads the claims. `exp` (and `nbf` if present) are checked on every request. Nothing is remembered
+  between requests.
 - **bcrypt, four at a time.** A Blowfish round is a chain of dependent S-box loads, so one hash leaves much of
   a core idle. A collector process gathers the hash jobs that arrive within `BCRYPT_BATCH_MS` (120 ms, or
   sooner when four are waiting) and hands them to one dirty-CPU NIF call that computes them in lockstep,
@@ -104,8 +111,8 @@ request/batch/expired counters every 10 s).
 
 ## Tests
 
-`gleam test` runs unit tests (no database): timestamp formatting, JSON escaping, JWT issue/verify, query and
-page validation, percent-decoding, Postgres message encoding/decoding, bcrypt hash/verify through the
+`gleam test` runs unit tests (no database): timestamp formatting (the C formatter against the Gleam one),
+JSON escaping, JWT issue/verify (fast and general paths, tampering), query and page validation, percent-decoding, Postgres message encoding/decoding, bcrypt hash/verify through the
 collector. `test/run.sh` passes 197/197 and the normalized transcript is byte-identical to
 `bench/cmd/conformance/golden-dev.jsonl`, also when replayed on a clean Ubuntu 24.04 container
 (`install.sh`, then `test/run.sh`, OTP 28).

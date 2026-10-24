@@ -2,11 +2,11 @@
 %% C BIF), crypto, environment, process tricks (hibernate, persistent_term, atomics) and try/catch.
 -module(conduit_ffi).
 -export([getenv/1, now_seconds/0, monotonic_ms/0, hmac_sha256/2, sha256/1, md5_hex/1, hash_equals/2, pbkdf2_sha256/3, random_bytes/1,
-         xor_bytes/2, has_nul/1, needs_json_escape/1, is_utf8/1,
+         xor_bytes/2, has_nul/1, is_utf8/1, base64url_encode/1, base64url_decode/1,
          listen/2, accept/1, connect/3, recv/1, recv_passive/2, send/2, close/1, parse_request/1,
          hibernate_http/3, heap_words/0, mailbox_len/0, safe/1, log/1,
          pool_init/2, pick_read/0, pick_write/0, sleep/1, stat_add/2, stats/0,
-         json_string/1, split_segments/1, split_target/1, bcrypt_init/1, bcrypt_collector/0]).
+         split_segments/1, split_target/1, bcrypt_init/1, bcrypt_collector/0]).
 
 %% ---------------------------------------------------------------- misc
 
@@ -42,53 +42,12 @@ is_utf8(Bin) ->
         _ -> false
     end.
 
-%% True when the string needs JSON escaping: a double quote, a backslash or a control character.
-needs_json_escape(Bin) ->
-    binary:match(Bin, json_pattern()) =/= nomatch.
+base64url_encode(Bin) -> base64:encode(Bin, #{mode => urlsafe, padding => false}).
 
-json_pattern() ->
-    case persistent_term:get({?MODULE, json_pattern}, undefined) of
-        undefined ->
-            P = binary:compile_pattern([<<C>> || C <- lists:seq(0, 31) ++ [$", $\\]]),
-            persistent_term:put({?MODULE, json_pattern}, P),
-            P;
-        P -> P
+base64url_decode(Bin) ->
+    try {ok, base64:decode(Bin, #{mode => urlsafe, padding => false})}
+    catch _:_ -> {error, nil}
     end.
-
-%% A JSON string literal as iodata. The common case (nothing to escape) is one binary:match; otherwise the
-%% string is copied in chunks between the special bytes, so the cost follows the number of escapes, not the
-%% length.
-json_string(Bin) ->
-    Pat = json_pattern(),
-    case binary:match(Bin, Pat) of
-        nomatch -> [$", Bin, $"];
-        {P, 1} -> [$", json_escape(Bin, 0, P, byte_size(Bin), Pat, []), $"]
-    end.
-
-json_escape(Bin, Pos, P, Len, Pat, Acc) ->
-    Chunk = binary_part(Bin, Pos, P - Pos),
-    Acc2 = [json_esc(binary:at(Bin, P)), Chunk | Acc],
-    Next = P + 1,
-    case Next >= Len of
-        true -> lists:reverse(Acc2);
-        false ->
-            case binary:match(Bin, Pat, [{scope, {Next, Len - Next}}]) of
-                nomatch -> lists:reverse([binary_part(Bin, Next, Len - Next) | Acc2]);
-                {P2, 1} -> json_escape(Bin, Next, P2, Len, Pat, Acc2)
-            end
-    end.
-
-json_esc($") -> <<"\\\"">>;
-json_esc($\\) -> <<"\\\\">>;
-json_esc($\n) -> <<"\\n">>;
-json_esc($\r) -> <<"\\r">>;
-json_esc($\t) -> <<"\\t">>;
-json_esc(8) -> <<"\\b">>;
-json_esc(12) -> <<"\\f">>;
-json_esc(C) -> <<"\\u00", (hex(C bsr 4)), (hex(C band 15))>>.
-
-hex(N) when N < 10 -> $0 + N;
-hex(N) -> $a + N - 10.
 
 split_segments(Path) -> binary:split(Path, <<"/">>, [global]).
 
