@@ -373,13 +373,17 @@ fn tags(context: *Context) Response {
     var read: Read = undefined;
     const results = read.run(context, .tags, .{ .waiter = undefined });
     if (results.waiter.failure != null) return read.slot.finish(internal);
+    const row = results.rows(0).first() orelse return read.slot.finish(internal);
     var out = read.slot.out();
     out.bytes("{\"tags\":[");
-    var rows = results.rows(0);
-    var index: usize = 0;
-    while (rows.next()) |row| : (index += 1) {
-        if (index > 0) out.bytes(",");
-        out.string(row.text(0));
+    // `array_agg` of no rows is null: no tags.
+    if (row.text_or_null(0) != null) {
+        var names = row.text_array(0);
+        var index: usize = 0;
+        while (names.next()) |name| : (index += 1) {
+            if (index > 0) out.bytes(",");
+            out.string(name);
+        }
     }
     out.bytes("]}");
     return read.slot.respond(200, &out);

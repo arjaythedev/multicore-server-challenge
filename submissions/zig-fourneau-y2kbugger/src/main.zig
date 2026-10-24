@@ -13,17 +13,34 @@ const jwt = @import("jwt.zig");
 const password = @import("password.zig");
 const shard_module = @import("shard.zig");
 
-/// The box: 8 vCPUs shared with Postgres, which does most of the work.
-const shards_count = 2;
-const bcrypt_workers = 2;
-/// Per shard: Postgres connections for reads and for writes (writes wait
-/// for their commit's flush, so reads never queue behind one), and the
-/// requests in flight at most.
-const reads_per_shard = 6;
-const writes_per_shard = 2;
+/// The box: 8 vCPUs shared with Postgres, which does most of the work. The
+/// defaults are the box's; `CONDUIT_*` overrides them for measuring only
+/// (start.sh sets none).
+const Tuning = struct {
+    shards: u32 = 2,
+    bcrypt_workers: u32 = 2,
+    /// Per shard: Postgres connections for reads and for writes (writes
+    /// wait for their commit's flush, so reads never queue behind one).
+    reads: u32 = 6,
+    writes: u32 = 2,
+
+    fn from(environ: std.process.Environ) !Tuning {
+        var tuning: Tuning = .{};
+        inline for (.{ "shards", "bcrypt_workers", "reads", "writes" }) |name| {
+            var key: [64]u8 = undefined;
+            const upper = std.ascii.upperString(&key, "CONDUIT_" ++ name);
+            if (environ.getPosix(upper)) |text| @field(tuning, name) = try std.fmt.parseInt(u32, text, 10);
+        }
+        if (tuning.shards == 0 or tuning.reads == 0 or tuning.writes == 0) return error.Tuning;
+        // Postgres's 100 connections, 95 ours at most.
+        if (tuning.shards * (tuning.reads + tuning.writes) > 95) return error.TooManyConnections;
+        return tuning;
+    }
+};
+/// Per shard: requests in flight at most.
 const slots_per_shard = 2048;
-/// Per shard: the service's 200,000 descriptors, less Postgres's and a margin.
-const connections_per_shard = 98 * 1024;
+/// All shards: the service's 200,000 descriptors, less Postgres's and a margin.
+const connections_max = 196 * 1024;
 
 pub fn main(init: std.process.Init.Minimal) !void {
     const environ = init.environ;
@@ -43,24 +60,27 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const gpa = std.heap.page_allocator;
     const key = try gpa.create(jwt.Key);
     key.* = .init(secret);
+    const tuning: Tuning = try .from(environ);
     const passwords = try gpa.create(password.Pool);
     passwords.* = .{};
-    try passwords.start(bcrypt_workers);
+    try passwords.start(tuning.bcrypt_workers);
     const options: shard_module.Options = .{
         .url = url,
-        .reads = reads_per_shard,
-        .writes = writes_per_shard,
+        .reads = tuning.reads,
+        .writes = tuning.writes,
         .slots = slots_per_shard,
-        .connections_max = connections_per_shard,
+        .connections_max = connections_max / tuning.shards,
         .address = try std.Io.net.IpAddress.parse(host, port),
         .key = key,
         .passwords = passwords,
     };
-    for (1..shards_count) |_| {
+    for (1..tuning.shards) |_| {
         const thread = try std.Thread.spawn(.{}, shard_module.run, .{options});
         thread.detach();
     }
-    std.debug.print("conduit on {s}:{d}: {d} shards\n", .{ host, port, shards_count });
+    std.debug.print("conduit on {s}:{d}: {d} shards of {d} reads and {d} writes, {d} bcrypt workers\n", .{
+        host, port, tuning.shards, tuning.reads, tuning.writes, tuning.bcrypt_workers,
+    });
     shard_module.run(options);
 }
 

@@ -95,6 +95,14 @@ fn shared_page(comptime page: []const u8) []const u8 {
         "FROM r JOIN x ON x.k = r.k AND x.l = r.l AND x.o = r.o ORDER BY r.i, x.id DESC";
 }
 
+/// A capped count each distinct key of the batch's requests reads once
+/// (`counted` names `q.k`), for every request with that key.
+fn shared_count(comptime counted: []const u8) []const u8 {
+    return "WITH r AS (SELECT * " ++ batch_keys ++ "), q AS (SELECT DISTINCT r.k FROM r), " ++
+        "c AS MATERIALIZED (SELECT q.k, (SELECT count(*) FROM (" ++ counted ++ " LIMIT 1000) s) AS n FROM q) " ++
+        "SELECT r.i, c.n FROM r JOIN c ON c.k = r.k";
+}
+
 /// A capped count per request: the subquery names `r`, so it is run for
 /// each request, not once for the statement.
 fn batch_count(comptime counted: []const u8) []const u8 {
@@ -374,9 +382,11 @@ pub const statements = std.enums.EnumArray(S, pg.Statement).init(.{
     // What no viewer changes (the tags, the global count) is read once for
     // the batch's requests, all of them waiting before the statement runs;
     // nothing is kept after it.
+    // One row a request, the names as one array: 200 rows a request were
+    // 200 messages to send and read.
     .batch_tags = .{
-        .sql = "SELECT r.i, x.name FROM unnest($1::int4[]) AS r(i) CROSS JOIN " ++
-            "(SELECT t.name FROM tags t ORDER BY t.name) x",
+        .sql = "SELECT r.i, x.names FROM unnest($1::int4[]) AS r(i) CROSS JOIN " ++
+            "(SELECT array_agg(t.name ORDER BY t.name) AS names FROM tags t) x",
         .params = &.{.int4_array},
     },
     .batch_list_all = .{
@@ -395,8 +405,8 @@ pub const statements = std.enums.EnumArray(S, pg.Statement).init(.{
         .params = batch_page_params,
     },
     .batch_count_tag = .{
-        .sql = batch_count("SELECT 1 FROM article_tags at " ++
-            "WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = r.k)"),
+        .sql = shared_count("SELECT 1 FROM article_tags at " ++
+            "WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = q.k)"),
         .params = batch_key_params,
     },
     .batch_list_author = .{
@@ -406,8 +416,8 @@ pub const statements = std.enums.EnumArray(S, pg.Statement).init(.{
         .params = batch_page_params,
     },
     .batch_count_author = .{
-        .sql = batch_count("SELECT 1 FROM articles a " ++
-            "WHERE a.author_id = (SELECT u.id FROM users u WHERE u.username = r.k)"),
+        .sql = shared_count("SELECT 1 FROM articles a " ++
+            "WHERE a.author_id = (SELECT u.id FROM users u WHERE u.username = q.k)"),
         .params = batch_key_params,
     },
     .batch_list_favorited = .{
@@ -417,8 +427,8 @@ pub const statements = std.enums.EnumArray(S, pg.Statement).init(.{
         .params = batch_page_params,
     },
     .batch_count_favorited = .{
-        .sql = batch_count("SELECT 1 FROM favorites f " ++
-            "WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = r.k)"),
+        .sql = shared_count("SELECT 1 FROM favorites f " ++
+            "WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = q.k)"),
         .params = batch_key_params,
     },
     // Every author of the feed is one the viewer follows, in the same
