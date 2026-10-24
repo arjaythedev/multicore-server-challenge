@@ -22,7 +22,7 @@ object App {
             Route.LOGIN -> return Handlers.login(ex)
             Route.NOT_FOUND -> return ex.sendError(404, "not found")
         }
-        val auth = Auth.check(ex)
+        val auth = Auth.check(ex, keepToken = m.route == Route.USER_GET || m.route == Route.USER_PUT)
         when (m.route) {
             // Auth optional: no header = anonymous (viewer 0), a present but invalid one = 401.
             Route.PROFILE, Route.LIST, Route.ARTICLE_GET, Route.COMMENTS_GET ->

@@ -27,11 +27,16 @@ actual fun getenv(name: String): String? = System.getenv(name)
 
 actual fun cpuCount(): Int = Runtime.getRuntime().availableProcessors()
 
+/** Our own threads carry their [Scratch] in a field: no ThreadLocal lookup on hot paths. */
+internal class ConduitThread(name: String, body: Runnable) : Thread(body, name) {
+    @JvmField val scratch = Scratch()
+}
+
 actual fun startThread(name: String, nice: Int, body: () -> Unit) {
-    val t = Thread({
+    val t = ConduitThread(name) {
         if (nice > 0) Nice.set(nice)
         body()
-    }, name)
+    }
     t.isDaemon = true
     t.start()
 }
@@ -89,7 +94,7 @@ actual fun sha256(data: ByteArray): ByteArray = MessageDigest.getInstance("SHA-2
 
 private val scratch = ThreadLocal.withInitial { Scratch() }
 
-actual fun threadScratch(): Scratch = scratch.get()
+actual fun threadScratch(): Scratch = (Thread.currentThread() as? ConduitThread)?.scratch ?: scratch.get()
 
 actual fun startHttpServer(host: String, port: Int, loops: Int, engine: conduit.http.HttpEngine) =
     startNioServer(host, port, loops, engine) // NioHttp.kt

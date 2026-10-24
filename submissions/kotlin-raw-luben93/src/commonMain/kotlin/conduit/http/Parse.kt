@@ -127,7 +127,11 @@ internal fun parseHead(ex: Ex, b: ByteArray, start: Int, he: Int): Int {
                 if (n < 0 || (contentLength >= 0 && contentLength != n)) return 400
                 contentLength = n
             }
-            13 -> if (eqLower(b, p, AUTHORIZATION) && ex.authorization == null) ex.authorization = b.decodeToString(vs, ve)
+            13 -> if (eqLower(b, p, AUTHORIZATION) && ex.authBuf == null) { // the first one counts
+                ex.authBuf = b // zero-copy; [EngineCore] copies it if the request waits for its body
+                ex.authOff = vs
+                ex.authLen = ve - vs
+            }
             10 -> if (eqLower(b, p, CONNECTION)) {
                 var s = vs
                 while (s < ve) {

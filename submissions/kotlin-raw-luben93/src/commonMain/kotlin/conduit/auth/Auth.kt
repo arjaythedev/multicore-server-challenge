@@ -24,7 +24,7 @@ object Jwt {
     private val HEADER_BYTES = HEADER.encodeToByteArray()
     private const val TTL = 30L * 24 * 3600
 
-    /** Longest token accepted; the token's bytes and its decoded payload share [Scratch.tmp]. */
+    /** Longest token accepted (its decoded payload goes to [Scratch.tmp]). */
     private const val MAX_TOKEN = 2048
 
     /** 32 bytes of HMAC-SHA256 are 43 base64url characters (no padding). */
@@ -68,29 +68,35 @@ object Jwt {
      * Uses this thread's [Scratch.tmp] and [Scratch.mac].
      */
     fun verify(token: String, nowSec: Long): Long {
-        val n = token.length
-        if (n < 3 + SIG_CHARS || n > MAX_TOKEN) return 0
-        val s = threadScratch()
-        val t = s.tmp
+        if (token.length > MAX_TOKEN) return 0
+        val b = token.encodeToByteArray() // non-ASCII chars become bytes >= 0x80, which are rejected
+        return verify(b, 0, b.size, nowSec)
+    }
+
+    /** [verify] of the token in b[off, off + len), in place (the per-request path: no String, no copy). */
+    fun verify(b: ByteArray, off: Int, len: Int, nowSec: Long): Long {
+        if (len < 3 + SIG_CHARS || len > MAX_TOKEN) return 0
+        val end = off + len
         var d1 = -1
         var d2 = -1
-        for (i in 0 until n) {
-            val c = token[i].code
+        for (i in off until end) {
+            val c = b[i].toInt()
             if (c == '.'.code) {
                 if (d1 < 0) d1 = i else if (d2 < 0) d2 = i else return 0
-            } else if (c >= 128 || DECODE[c] < 0) {
+            } else if (c < 0 || DECODE[c] < 0) {
                 return 0
             }
-            t[i] = c.toByte()
         }
-        if (d1 < 1 || d2 < d1 + 2 || n - d2 - 1 != SIG_CHARS) return 0
+        if (d1 < off + 1 || d2 < d1 + 2 || end - d2 - 1 != SIG_CHARS) return 0
+        val s = threadScratch()
         val mac = s.mac
-        hmac(s).mac(t, 0, d2, mac, 0)
-        if (!signatureMatches(t, d2 + 1, mac)) return 0
-        if (!(d1 == HEADER.length && sameBytes(t, 0, HEADER_BYTES)) && !headerIsHs256(t, d1)) return 0
-        val plen = decode(t, d1 + 1, d2, t, MAX_TOKEN)
+        hmac(s).mac(b, off, d2 - off, mac, 0)
+        if (!signatureMatches(b, d2 + 1, mac)) return 0
+        if (!(d1 - off == HEADER.length && sameBytes(b, off, HEADER_BYTES)) && !headerIsHs256(b, off, d1)) return 0
+        val t = s.tmp
+        val plen = decode(b, d1 + 1, d2, t, 0)
         if (plen < 0) return 0
-        return claims(t, MAX_TOKEN, MAX_TOKEN + plen, nowSec)
+        return claims(t, 0, plen, nowSec)
     }
 
     /** Decodes 43 chars at t[p] (all valid base64url) and compares them with [mac] without an early exit. */
@@ -118,9 +124,9 @@ object Jwt {
     }
 
     /** Any other header encoding (key order, whitespace, extra fields): parsed, alg must be "HS256". */
-    private fun headerIsHs256(t: ByteArray, end: Int): Boolean {
-        val h = ByteArray(end * 3 / 4 + 3)
-        val len = decode(t, 0, end, h, 0)
+    private fun headerIsHs256(t: ByteArray, off: Int, end: Int): Boolean {
+        val h = ByteArray((end - off) * 3 / 4 + 3)
+        val len = decode(t, off, end, h, 0)
         if (len < 0) return false
         val v = JsonReader.parse(h, 0, len) as? JsonValue.Obj ?: return false
         return (v["alg"] as? JsonValue.Str)?.value == "HS256"
