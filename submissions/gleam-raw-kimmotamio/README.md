@@ -49,8 +49,10 @@ one BEAM process per Postgres connection.
   every statement prepared once per connection at startup (`Parse`), then one `Bind`/`Execute` per statement and
   one `Sync` per request. Results come back in binary format; a DataRow and a `text[]` are split into
   sub-binaries of the socket buffer by two small NIFs (never copied), and the scalar columns (int8, bool,
-  timestamptz as microseconds) are read with bit-array patterns. Two pools: `DB_READ_CONNS` (12) and `DB_WRITE_CONNS` (8) connection processes, chosen round-robin
-  through an `atomics` counter. A connection serves one Sync group at a time; a lost connection is reopened and
+  timestamptz as microseconds) are read with bit-array patterns. Two pools: `DB_READ_CONNS` (12) and `DB_WRITE_CONNS` (8) connection processes. The read
+  connections are split into five groups by statement kind (tags; an article, a profile, a user; comments; the
+  list pages; the feed and the reads without a batched form) with weights 1/2/1/4/4, each group chosen
+  round-robin through its own `atomics` counter, so that what waits on one connection is mostly of one kind. A connection serves one Sync group at a time; a lost connection is reopened and
   the requests waiting in the process mailbox are served after the reconnect. A request carries its deadline; a
   response is never written after it, so the connection process's own 503 can't be followed by a late one.
 - **Batched reads.** When a read connection becomes free it drains its mailbox; requests of the same kind as the
@@ -59,8 +61,12 @@ one BEAM process per Postgres connection.
   row comes back tagged with its request's ordinal (`WITH ORDINALITY`). Each request's rows are still produced by
   its own execution of its own query, in that statement's snapshot; nothing is shared between requests, and
   subqueries that use no request parameter are tied to the request row (`WHERE r.i >= 0`) so they run once per
-  request. There is no timer: at low load every batch has one request. Batches are capped at 64. The personal
-  feed is not batched (its batched plan was no cheaper).
+  request. When requests are arriving fast (the previous one came within two windows), a connection holds the
+  batch open for up to `BATCH_WAIT_MS` (2 ms) or until eight are waiting; at low load nothing waits and every
+  batch has one request. Batches are capped at 64. Most of a cheap statement's backend cost is per-statement
+  overhead: measured through psql on the stand-in, eight batched tags, article-by-slug or comments requests cost
+  Postgres 50 %, 70 % and 80 % less than eight single statements, and on a full box without the window only
+  1–9 % of requests were batched. The personal feed is not batched (its batched plan was no cheaper).
 - **SQL** (`src/conduit/sql.gleam`): same results as SPEC.md's reference SQL in fewer statements. A list page and
   its capped count are one statement; slug lookups fold into the statement that needs them; follow/unfollow and
   favorite/unfavorite are single data-modifying CTE statements that return the response row; ownership-checked
@@ -86,13 +92,14 @@ one BEAM process per Postgres connection.
   JSON parser reads the claims. `exp` (and `nbf` if present) are checked on every request. Nothing is remembered
   between requests.
 - **bcrypt, four at a time.** A Blowfish round is a chain of dependent S-box loads, so one hash leaves much of
-  a core idle. A collector process gathers the hash jobs that arrive within `BCRYPT_BATCH_MS` (120 ms, or
+  a core idle. A collector process gathers the hash jobs that arrive within `BCRYPT_BATCH_MS` (250 ms, or
   sooner when four are waiting) and hands them to one dirty-CPU NIF call that computes them in lockstep,
   round by round (`native/bcrypt_lanes.c`): every lane runs the full cost-10 schedule and produces the
   reference output (checked against the OpenBSD routine on random inputs and the seed's hashes,
   `native/test_lanes.c`), only the instruction interleaving differs. On an M-series core a batch of four
   takes 48 ms against 44 ms for a single reference hash, so hashing throughput is about 3.5× higher and the
-  login tail grows by the collection window. Lanes whose salts disagree on the cost fall back to one-by-one.
+  login tail grows by the collection window. The window is sized to fill the lanes at a full box's login rate
+  (about 20 a second); logins are 0.1 % of requests, so it moves only their own latency. Lanes whose salts disagree on the cost fall back to one-by-one.
   A login verifies the first 72 bytes of the password against the stored hash; registration and password
   changes reject longer passwords with 422.
 - **Overload behaviour.** A handler waits at most 10 s for its database result and answers 503 after that;
@@ -120,7 +127,7 @@ one BEAM process per Postgres connection.
 `DATABASE_URL`, `JWT_SECRET` (required), `HOST`, `PORT`. Optional: `SCHEDULERS`, `DIRTY_CPU`, `DB_READ_CONNS`
 (12), `DB_WRITE_CONNS` (8), `ACCEPTORS` (16), `MIN_HEAP` (1598 words: a connection process's starting heap),
 `HIB_WORDS` (4500: a connection process hibernates after a request that grew its heap past this),
-`BCRYPT_BATCH_MS` (120), `STATS=1` (log request/batch/expired counters every 10 s).
+`BCRYPT_BATCH_MS` (250), `BATCH_WAIT_MS` (2: how long a read connection holds a batch open under load), `STATS=1` (log request/batch/expired counters every 10 s).
 
 ## Tests
 

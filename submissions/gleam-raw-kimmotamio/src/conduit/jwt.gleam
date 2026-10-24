@@ -26,6 +26,18 @@ fn b64_encode(data: BitArray) -> BitArray
 @external(erlang, "conduit_ffi", "base64url_decode")
 fn b64_decode(data: BitArray) -> Result(BitArray, Nil)
 
+/// What the C fast path (native/conduit_nif.c) made of a token.
+pub type Fast {
+  Fast(id: Int)
+  /// Bad signature, undecodable payload or expired.
+  Rejected
+  /// Not the one shape the fast path covers: the general path decides.
+  General
+}
+
+@external(erlang, "conduit_nif", "jwt_verify")
+fn fast_verify(token: BitArray, secret: BitArray, now: Int) -> Fast
+
 pub type Auth {
   Anonymous
   User(id: Int, token: String)
@@ -52,36 +64,15 @@ pub fn check(header: String, secret: BitArray, now: Int) -> Auth {
   }
 }
 
-/// Fast path for the shape every issuer here produces: the standard header, then the payload, then a 43-character
-/// signature (32 bytes of HMAC in unpadded base64url). The signature is checked by encoding the expected HMAC and
-/// comparing in constant time, so nothing is decoded before the token is known to be genuine. Any other shape goes
-/// through the general path, which accepts the same tokens more slowly.
+/// The C fast path takes the one shape every issuer here produces (the standard header, a flat
+/// `{"sub":"<id>","iat":<n>,"exp":<n>}` payload, a 43-character unpadded signature): HMAC-SHA256 over the signed
+/// part, the expected signature encoded and compared in constant time, and only then the payload decoded and
+/// read. Any other shape goes through the general path, which accepts the same tokens more slowly.
 pub fn verify(token: String, secret: BitArray, now: Int) -> Result(Int, Nil) {
-  let bits = util.to_bits(token)
-  let signed_len = bit_array.byte_size(bits) - 44
-  let parts = case signed_len > 37 {
-    True ->
-      case bits {
-        <<signed:bytes-size(signed_len), ".":utf8, sig:bytes>> ->
-          case signed {
-            <<"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.":utf8, payload:bytes>> -> Some(#(signed, payload, sig))
-            _ -> None
-          }
-        _ -> None
-      }
-    False -> None
-  }
-  case parts {
-    Some(#(signed, payload, sig)) ->
-      case hash_equals(b64_encode(hmac(secret, signed)), sig) {
-        False -> Error(Nil)
-        True ->
-          case b64_decode(payload) {
-            Ok(claims) -> check_claims(claims, now)
-            Error(_) -> Error(Nil)
-          }
-      }
-    None -> verify_general(token, secret, now)
+  case fast_verify(util.to_bits(token), secret, now) {
+    Fast(id) -> Ok(id)
+    Rejected -> Error(Nil)
+    General -> verify_general(token, secret, now)
   }
 }
 

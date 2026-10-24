@@ -56,20 +56,13 @@ const db_timeout_ms = 10_000
 @external(erlang, "conduit_ffi", "log")
 fn log(msg: String) -> Nil
 
-@external(erlang, "conduit_ffi", "split_segments")
-fn split_segments(path: String) -> List(String)
-
-@external(erlang, "conduit_ffi", "split_target")
-fn split_target(target: String) -> #(String, String)
-
 type Req {
   Req(ctx: Ctx, sock: Socket, query: String, auth: String, body: BitArray, now: Int)
 }
 
-pub fn handle(ctx: Ctx, sock: Socket, method: String, target: String, auth: String, body: BitArray) -> Outcome {
-  let #(path, query) = split_target(target)
+pub fn handle(ctx: Ctx, sock: Socket, method: String, segments: List(String), query: String, auth: String, body: BitArray) -> Outcome {
   let r = Req(ctx, sock, query, auth, body, now())
-  let outcome = case split_segments(path) {
+  let outcome = case segments {
     ["", "api", ..rest] -> route(method, rest, r)
     _ -> Error(fail(404, "not found"))
   }

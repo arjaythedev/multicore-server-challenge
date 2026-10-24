@@ -1,6 +1,7 @@
-%% Loads priv/conduit_nif.so (built by build.sh): JSON string escaping and timestamp formatting in C.
+%% Loads priv/conduit_nif.so (built by build.sh): JSON string escaping, timestamp formatting, row decoding and
+%% JWT verification in C.
 -module(conduit_nif).
--export([json_string/1, rfc3339/1, json_rfc3339/1, decode_row/1, decode_text_array/1]).
+-export([json_string/1, rfc3339/1, json_rfc3339/1, decode_row/1, decode_text_array/1, jwt_verify/3, hmac_sha256/2, parse_request/1]).
 -on_load(init/0).
 
 init() ->
@@ -25,4 +26,16 @@ decode_row(_Payload) ->
 
 %% A one-dimensional text[] in binary format -> [SubBinary]; a NULL element is <<>>.
 decode_text_array(_Bin) ->
+    erlang:nif_error(nif_not_loaded).
+
+%% HS256 JWT fast path: {fast, Sub} | rejected | general (any shape the fast path does not cover).
+jwt_verify(_Token, _Secret, _Now) ->
+    erlang:nif_error(nif_not_loaded).
+
+%% The NIF's own HMAC-SHA256, for the tests.
+hmac_sha256(_Key, _Data) ->
+    erlang:nif_error(nif_not_loaded).
+
+%% The HTTP request head: {request, Method, Segments, Query, Authorization, Body, Rest, Close} | more | bad.
+parse_request(_Buf) ->
     erlang:nif_error(nif_not_loaded).

@@ -1,5 +1,5 @@
 //// A minimal HTTP/1.1 server on gen_tcp. Every connection is one process: the process that accepted it. It
-//// parses with erlang:decode_packet (a C BIF) and runs the handler inline. For most requests the response is
+//// parses the request head with one NIF call (native/conduit_nif.c) and runs the handler inline. For most requests the response is
 //// rendered and written by the Postgres connection process that ran the query (`conn.Render`), so this process
 //// never holds the rows or the JSON and its heap stays small; it writes the response itself only when there was
 //// no query, on errors, or when the socket was busy. Between requests the process holds only the socket, and
@@ -14,7 +14,8 @@ import gleam/string_tree
 pub type Listener
 
 pub type Parsed {
-  Request(method: String, target: String, auth: String, body: BitArray, rest: BitArray, close: Bool)
+  /// `segments` is the path split on `/`; every piece is a sub-binary of the buffer.
+  Request(method: String, segments: List(String), query: String, auth: String, body: BitArray, rest: BitArray, close: Bool)
   More
   Bad
 }
@@ -31,7 +32,7 @@ fn recv(sock: Socket) -> Result(BitArray, Nil)
 @external(erlang, "conduit_ffi", "close")
 fn close(sock: Socket) -> Nil
 
-@external(erlang, "conduit_ffi", "parse_request")
+@external(erlang, "conduit_nif", "parse_request")
 fn parse_request(buf: BitArray) -> Parsed
 
 @external(erlang, "conduit_ffi", "hibernate_http")
@@ -105,8 +106,8 @@ fn handle(sock: Socket, buf: BitArray, ctx: Ctx) -> Nil {
       let _ = response.send(sock, response.render(400, string_tree.from_string("{\"errors\":{\"body\":[\"bad request\"]}}")))
       close(sock)
     }
-    Request(method, target, auth, body, rest, close_after) -> {
-      let outcome = case safe(fn() { handler.handle(ctx, sock, method, target, auth, body) }) {
+    Request(method, segments, query, auth, body, rest, close_after) -> {
+      let outcome = case safe(fn() { handler.handle(ctx, sock, method, segments, query, auth, body) }) {
         Ok(outcome) -> outcome
         Error(_) -> handler.Reply(#(500, string_tree.from_string("{\"errors\":{\"body\":[\"internal error\"]}}")))
       }

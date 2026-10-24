@@ -1,9 +1,10 @@
-%% The thin Erlang layer under the Gleam code: sockets, the HTTP request parser (erlang:decode_packet is a
-%% C BIF), crypto, environment, process tricks (hibernate, persistent_term, atomics) and try/catch.
+%% The thin Erlang layer under the Gleam code: sockets, crypto, environment, process tricks (hibernate,
+%% persistent_term, atomics), try/catch, and the decode_packet request parser the NIF replaced, kept as the
+%% reference the tests hold the NIF to.
 -module(conduit_ffi).
 -export([getenv/1, now_seconds/0, monotonic_ms/0, hmac_sha256/2, sha256/1, md5_hex/1, hash_equals/2, pbkdf2_sha256/3, random_bytes/1,
          xor_bytes/2, has_nul/1, is_utf8/1, base64url_encode/1, base64url_decode/1,
-         listen/2, accept/1, connect/3, recv/1, recv_timeout/2, send/2, send_nosuspend/2, close/1, parse_request/1, spawn_connection/2,
+         listen/2, accept/1, connect/3, recv/1, recv_timeout/2, send/2, send_nosuspend/2, close/1, parse_request_ref/1, spawn_connection/2,
          hibernate_http/3, heap_words/0, mailbox_len/0, safe/1, log/1,
          pool_init/3, pick_read/1, pick_write/0, sleep/1, stat_add/2, stats/0,
          split_segments/1, split_target/1, bcrypt_init/1, bcrypt_collector/0]).
@@ -137,12 +138,20 @@ spawn_connection(Fun, MinHeap) ->
 
 close(Sock) -> gen_tcp:close(Sock), nil.
 
-%% ---------------------------------------------------------------- HTTP request parsing
+%% ---------------------------------------------------------------- HTTP request parsing (reference)
 
 -define(DECODE_OPTS, [{packet_size, 16384}, {line_length, 16384}]).
 
-%% {request, Method, Target, Authorization, Body, Rest, Close} | more | bad
-parse_request(Buf) ->
+%% {request, Method, Target, Authorization, Body, Rest, Close} | more | bad: the decode_packet parser that served
+%% until conduit_nif:parse_request/1 took over; the tests compare the two.
+parse_request_ref(Buf) ->
+    case parse_request_old(Buf) of
+        {request, M, T, A, B, R, C} -> {ref_request, M, T, A, B, R, C};
+        more -> ref_more;
+        bad -> ref_bad
+    end.
+
+parse_request_old(Buf) ->
     case erlang:decode_packet(http_bin, Buf, ?DECODE_OPTS) of
         {ok, {http_request, Method, {abs_path, Target}, _}, Rest} ->
             case is_utf8(Target) of

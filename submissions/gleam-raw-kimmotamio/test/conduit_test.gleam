@@ -88,6 +88,162 @@ pub fn jwt_round_trip_test() {
 @external(erlang, "conduit_ffi", "hmac_sha256")
 fn hmac_sha256(key: BitArray, data: BitArray) -> BitArray
 
+type Ref {
+  RefRequest(method: String, target: String, auth: String, body: BitArray, rest: BitArray, close: Bool)
+  RefMore
+  RefBad
+}
+
+@external(erlang, "conduit_ffi", "parse_request_ref")
+fn parse_request_ref(buf: BitArray) -> Ref
+
+@external(erlang, "conduit_ffi", "split_segments")
+fn split_segments(path: String) -> List(String)
+
+@external(erlang, "conduit_ffi", "split_target")
+fn split_target(target: String) -> #(String, String)
+
+// The C request parser agrees with the decode_packet one on every request shape below (well-formed, pipelined,
+// partial, LF-only, odd spacing, odd case) and on what is refused; obs-fold continuation lines are the one
+// documented difference (the reference joins them, the NIF refuses them).
+pub fn parse_request_nif_test() {
+  let inputs = [
+    "GET /api/tags HTTP/1.1\r\nHost: x\r\n\r\n",
+    "GET /api/articles?limit=5&offset=10 HTTP/1.1\r\nHost: x\r\nAuthorization: Token abc.def.ghi\r\n\r\n",
+    "GET /api/articles/a-slug/comments HTTP/1.1\r\nauthorization:   Token t   \r\nConnection: Close\r\n\r\n",
+    "POST /api/users/login HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 13\r\n\r\n{\"user\":{}}  GET /x HTTP/1.1\r\n\r\n",
+    "POST /api/users/login HTTP/1.1\r\nContent-Length: 13\r\n\r\n{\"user\":{}}",
+    "POST /api/users/login HTTP/1.1\r\nContent-Length: 13\r\n\r\n{\"user\"",
+    "POST /api/x HTTP/1.1\r\nContent-Length: +3\r\n\r\nabc",
+    "POST /api/x HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\nabc",
+    "POST /api/x HTTP/1.1\r\nContent-Length: x\r\n\r\nabc",
+    "POST /api/x HTTP/1.1\r\nContent-Length: 1048577\r\n\r\n",
+    "POST /api/x HTTP/1.1\r\nContent-Length: 1048576\r\n\r\n",
+    "POST /api/x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+    "GET /x HTTP/1.1\n\n",
+    "GET /x HTTP/1.1\nX-A: b\n\r\n",
+    "GET  /x  HTTP/1.1 \r\n\r\n",
+    "GET /x HTTP/2.0\r\n\r\n",
+    "GET /x HTTP/1\r\n\r\n",
+    "GET /x\r\n\r\n",
+    "GET * HTTP/1.1\r\n\r\n",
+    "GET http://h/x HTTP/1.1\r\n\r\n",
+    "GET /a\tb HTTP/1.1\r\n\r\n",
+    "GET /a%ff HTTP/1.1\r\n\r\n",
+    "GET /\u{e9}/ HTTP/1.1\r\n\r\n",
+    "GET /api/profiles/%C3%A9?x=1?y=2 HTTP/1.1\r\nX-A:\r\n\r\n",
+    "GET /api/articles/ HTTP/1.1\r\n\r\n",
+    "\r\nGET /x HTTP/1.1\r\n\r\n",
+    "GET /x HTTP/1.1\r\nNo-Colon\r\n\r\n",
+    "GET /x HTTP/1.1\r\n: v\r\n\r\n",
+    "GET /x HTTP/1.1\r\nX Y: v\r\n\r\n",
+    "GET /x HTTP/1.1\r\nHost: x\r\n",
+    "GET /x HTTP/1.1\r\nHos",
+    "GE",
+    "",
+    "get /x HTTP/1.1\r\n\r\n",
+    "OPTIONS /x HTTP/1.0\r\nConnection: keep-alive\r\n\r\n",
+  ]
+  list.each(inputs, fn(text) {
+    let bits = util.to_bits(text)
+    let nif = parse_request_nif(bits)
+    let want = case parse_request_ref(bits) {
+      RefRequest(method, target, auth, body, rest, close) -> {
+        let #(path, query) = split_target(target)
+        Request(method, split_segments(path), query, auth, body, rest, close)
+      }
+      RefMore -> More
+      RefBad -> Bad
+    }
+    assert nif == want
+  })
+  // Raw bytes that are not UTF-8 in the target are refused by both.
+  assert parse_request_nif(<<"GET /a":utf8, 0xff, " HTTP/1.1\r\n\r\n":utf8>>) == Bad
+  assert parse_request_nif(<<"GET /a":utf8, 0xc3, 0xa9, " HTTP/1.1\r\n\r\n":utf8>>) == Request("GET", ["", "a\u{e9}"], "", "", <<>>, <<>>, False)
+  // A head that never ends is refused once it passes 16 KB, not before.
+  assert parse_request_nif(util.to_bits("GET /x HTTP/1.1\r\nX: " <> string.repeat("a", 16_000))) == More
+  assert parse_request_nif(util.to_bits("GET /x HTTP/1.1\r\nX: " <> string.repeat("a", 16_400))) == Bad
+}
+
+type Parsed {
+  Request(method: String, segments: List(String), query: String, auth: String, body: BitArray, rest: BitArray, close: Bool)
+  More
+  Bad
+}
+
+@external(erlang, "conduit_nif", "parse_request")
+fn parse_request_nif(buf: BitArray) -> Parsed
+
+@external(erlang, "conduit_nif", "hmac_sha256")
+fn nif_hmac_sha256(key: BitArray, data: BitArray) -> BitArray
+
+@external(erlang, "conduit_nif", "jwt_verify")
+fn nif_jwt_verify(token: BitArray, secret: BitArray, now: Int) -> jwt.Fast
+
+@external(erlang, "crypto", "strong_rand_bytes")
+fn random_bytes(n: Int) -> BitArray
+
+@external(erlang, "rand", "uniform")
+fn random_int(n: Int) -> Int
+
+// The C HMAC-SHA256 agrees with OTP's crypto on keys shorter and longer than a block and on every message length
+// around the block boundaries.
+pub fn hmac_nif_test() {
+  list.each(list.repeat(Nil, 300), fn(_) {
+    let key = random_bytes(random_int(130) - 1)
+    let data = random_bytes(random_int(400) - 1)
+    assert nif_hmac_sha256(key, data) == hmac_sha256(key, data)
+  })
+  list.index_map(list.repeat(Nil, 141), fn(_, n) {
+    let key = random_bytes(n)
+    let data = random_bytes(n)
+    assert nif_hmac_sha256(key, data) == hmac_sha256(key, data)
+  })
+}
+
+// What the C fast path takes and what it leaves to the general path, and that both agree.
+pub fn jwt_fast_path_test() {
+  let secret = <<"multicore-server-challenge":utf8>>
+  let token = jwt.issue(secret, 150, 1_700_000_000)
+  assert nif_jwt_verify(util.to_bits(token), secret, 1_700_000_001) == jwt.Fast(150)
+  assert nif_jwt_verify(util.to_bits(token), secret, 1_700_000_000 + 2_592_000) == jwt.Rejected
+  assert nif_jwt_verify(util.to_bits(token), <<"other":utf8>>, 1_700_000_001) == jwt.Rejected
+  assert nif_jwt_verify(<<"not.a.jwt":utf8>>, secret, 1) == jwt.General
+  assert nif_jwt_verify(util.to_bits(token <> ".x"), secret, 1) == jwt.General
+  let signed = fn(claims: String) -> String {
+    let signing = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." <> bit_array.base64_url_encode(util.to_bits(claims), False)
+    signing <> "." <> bit_array.base64_url_encode(hmac_sha256(secret, util.to_bits(signing)), False)
+  }
+  // Other claim shapes are the general path's, and it accepts or rejects them the same way.
+  let numeric = signed("{\"sub\":\"7\",\"exp\":1700000600}")
+  assert nif_jwt_verify(util.to_bits(numeric), secret, 1_700_000_001) == jwt.General
+  assert jwt.verify(numeric, secret, 1_700_000_001) == Ok(7)
+  let nbf = signed("{\"sub\":\"7\",\"iat\":1700000000,\"exp\":1700000600,\"nbf\":1700000100}")
+  assert nif_jwt_verify(util.to_bits(nbf), secret, 1_700_000_001) == jwt.General
+  assert jwt.verify(nbf, secret, 1_700_000_001) == Error(Nil)
+  assert jwt.verify(nbf, secret, 1_700_000_101) == Ok(7)
+  let zero = signed("{\"sub\":\"0\",\"iat\":1700000000,\"exp\":1700000600}")
+  assert nif_jwt_verify(util.to_bits(zero), secret, 1_700_000_001) == jwt.General
+  assert jwt.verify(zero, secret, 1_700_000_001) == Error(Nil)
+  let big = signed("{\"sub\":\"123456789012345678\",\"iat\":1700000000,\"exp\":1700000600}")
+  assert nif_jwt_verify(util.to_bits(big), secret, 1_700_000_001) == jwt.Fast(123_456_789_012_345_678)
+  let huge = signed("{\"sub\":\"1234567890123456789\",\"iat\":1700000000,\"exp\":1700000600}")
+  assert nif_jwt_verify(util.to_bits(huge), secret, 1_700_000_001) == jwt.General
+  assert jwt.verify(huge, secret, 1_700_000_001) == Ok(1_234_567_890_123_456_789)
+  // A signed payload that is not base64url is rejected by both.
+  let signing = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.!!!!"
+  let junk = signing <> "." <> bit_array.base64_url_encode(hmac_sha256(secret, util.to_bits(signing)), False)
+  assert nif_jwt_verify(util.to_bits(junk), secret, 1) == jwt.Rejected
+  assert jwt.verify(junk, secret, 1) == Error(Nil)
+  // Random tokens never verify, and the fast path never claims one the general path would reject.
+  list.each(list.repeat(Nil, 200), fn(_) {
+    let t = bit_array.base64_url_encode(random_bytes(random_int(120)), False)
+    let t = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." <> t <> "." <> bit_array.base64_url_encode(random_bytes(32), False)
+    assert nif_jwt_verify(util.to_bits(t), secret, 1) != jwt.Fast(1)
+    assert jwt.verify(t, secret, 1) == Error(Nil)
+  })
+}
+
 pub fn page_test() {
   assert util.page(util.parse_query("")) == Ok(#(20, 0))
   assert util.page(util.parse_query("limit=05&offset=005")) == Ok(#(5, 5))
