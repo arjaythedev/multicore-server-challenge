@@ -1,6 +1,6 @@
 # Conduit: Java (microhttp server + Vert.x PostgreSQL client)
 
-**Front: direct.**
+**Front: nginx.**
 
 This entry is similar in structure to the one I submitted for the JDK HTTP Server with two major changes.
 
