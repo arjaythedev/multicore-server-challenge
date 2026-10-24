@@ -112,7 +112,15 @@ object Main extends IOApp.Simple:
       comments <- Batcher(maxBatch = 64, concurrency = 8)((keys: List[(Long, String)]) =>
         reads.use(Sql.commentsBySlugs(_)(keys))
       )
-      api = Api(Db(reads, writes), Jwt(config.jwtSecret), bcryptPool, Lookups(articles(_), comments(_)))
+      // A feed depends only on its viewer, so feeds batch the same way. (The global list doesn't: requests for the same
+      // page would share one result, which is caching between requests.)
+      feeds <- Batcher(maxBatch = 64, concurrency = 8)((keys: List[(Long, Sql.Page)]) => reads.use(Sql.feeds(_)(keys)))
+      api = Api(
+        Db(reads, writes),
+        Jwt(config.jwtSecret),
+        bcryptPool,
+        Lookups(articles(_), comments(_), feeds(_).map(_.getOrElse((Nil, 0L))))
+      )
       _ <- EmberServerBuilder
         .default[IO]
         .withHost(config.host)

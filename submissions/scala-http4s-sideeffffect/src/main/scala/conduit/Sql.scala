@@ -104,15 +104,6 @@ object Sql:
                WHERE at.article_id = a.id ORDER BY t.name) AS tag_list,
         (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count"""
 
-  /** The list columns for the feed. Every article in the feed is by someone the viewer follows: the feed selects them
-    * through `follows` in the same statement, so the same snapshot, which makes the `following` EXISTS always true.
-    */
-  private val feedColumns: Fragment[Long] =
-    sql"""SELECT #${articleData(withBody = false)},
-                 EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $int8) AS favorited,
-                 u.username, u.bio, u.image,
-                 true AS following"""
-
   private val listColumns = articleColumns(withBody = false)
 
   /** `ARTICLE_LIST_SELECT`. */
@@ -245,22 +236,6 @@ object Sql:
       .query(counted)
       .contramap[(Long, String, Int, Int)]((viewer, user, limit, offset) => (user, viewer, user, limit, offset))
 
-  /** The feed (already page first in the reference). Replaces its page and count statements. The count matches
-    * `author_id = ANY(ARRAY(...))` instead of `IN (...)`: the followees are read once, the same set.
-    */
-  private val feedPage: Query[(Long, Int, Int), Counted] =
-    sql"""SELECT c.total, p.*
-            FROM (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = ANY (ARRAY(
-                    SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $int8)) LIMIT 1000) s) c(total)
-            LEFT JOIN LATERAL (
-              $feedColumns FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id IN (SELECT x.id FROM follows fo CROSS JOIN LATERAL
-                  (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id
-                    ORDER BY a2.id DESC LIMIT ($int4::int + $int4::int)) x
-                 WHERE fo.follower_id = $int8 ORDER BY x.id DESC LIMIT $int4 OFFSET $int4)) p ON true
-           ORDER BY p.id DESC"""
-      .query(counted)
-      .contramap[(Long, Int, Int)]((viewer, limit, offset) => (viewer, viewer, limit, offset, viewer, limit, offset))
-
   private def page(rows: List[Counted]): (List[ArticleRow], Long) =
     (rows.flatMap(_._2), rows.headOption.fold(0L)(_._1))
 
@@ -273,8 +248,36 @@ object Sql:
       case Filter.Favorited(username) => session.execute(listByFavorited)((viewer, username, p.limit, p.offset))
     rows.map(page)
 
-  def feed(session: Session[IO], viewer: Long, p: Page): IO[(List[ArticleRow], Long)] =
-    session.execute(feedPage)((viewer, p.limit, p.offset)).map(page)
+  /** The feed page and its capped count for many (viewer, page) requests in one statement, for [[Batcher]]. Everything
+    * in a feed depends on its viewer, so each request's count and rows are computed for it alone; nothing is shared
+    * between requests. The reference's feed is already page-first; this replaces its page and count statements. The
+    * count matches `author_id = ANY(ARRAY(...))` instead of `IN (...)` (the followees are read once, the same set), and
+    * `following` is `true`: every article in a feed is by someone the viewer follows, selected through `follows` in the
+    * same statement, so the same snapshot.
+    */
+  val feedPages: Query[(List[Long], List[Int], List[Int]), (Int, Long, Option[ArticleRow])] =
+    sql"""SELECT r.ord::int4 - 1, c.total, p.*
+            FROM unnest(${_int8.contramap[List[Long]](Arr(_*))}, ${_int4.contramap[List[Int]](Arr(_*))},
+                        ${_int4.contramap[List[Int]](Arr(_*))}) WITH ORDINALITY AS r(viewer, lim, off, ord)
+            CROSS JOIN LATERAL (
+              SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = ANY (ARRAY(
+                SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.viewer)) LIMIT 1000) s) c(total)
+            LEFT JOIN LATERAL (
+              SELECT #${articleData(withBody = false)},
+                     EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = r.viewer) AS favorited,
+                     u.username, u.bio, u.image,
+                     true AS following
+                FROM articles a JOIN users u ON u.id = a.author_id
+               WHERE a.id IN (SELECT x.id FROM follows fo CROSS JOIN LATERAL
+                   (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id
+                     ORDER BY a2.id DESC LIMIT r.lim + r.off) x
+                  WHERE fo.follower_id = r.viewer ORDER BY x.id DESC LIMIT r.lim OFFSET r.off)) p ON true
+           ORDER BY r.ord, p.id DESC""".query(int4 *: counted)
+
+  def feeds(session: Session[IO])(keys: List[(Long, Page)]): IO[Map[Int, (List[ArticleRow], Long)]] =
+    session
+      .execute(feedPages)((keys.map(_._1), keys.map(_._2.limit), keys.map(_._2.offset)))
+      .map(_.groupMap(_._1)((_, total, row) => (total, row)).view.mapValues(page).toMap)
 
   /** `ARTICLE_FULL_SELECT WHERE a.slug = $2` for many (viewer, slug) pairs in one statement, for [[Batcher]]: each pair
     * keeps its position in the arrays (`ord`, from 1), so every request gets back its own row, computed for its own

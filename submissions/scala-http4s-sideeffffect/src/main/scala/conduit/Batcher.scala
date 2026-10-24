@@ -43,8 +43,11 @@ object Batcher:
         batch.traverse_((_, result) => result.complete(Left(error)))
     }
 
-/** The lookups that go through a [[Batcher]]: an article, and an article's comments (`None`: no such article). */
+/** The lookups that go through a [[Batcher]]: an article, an article's comments (`None`: no such article), and a
+  * viewer's feed page with its capped count.
+  */
 final case class Lookups(
     article: ((Long, String)) => IO[Option[Sql.ArticleRow]],
-    comments: ((Long, String)) => IO[Option[List[Sql.CommentRow]]]
+    comments: ((Long, String)) => IO[Option[List[Sql.CommentRow]]],
+    feed: ((Long, Sql.Page)) => IO[(List[Sql.ArticleRow], Long)]
 )

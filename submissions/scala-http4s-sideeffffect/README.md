@@ -12,11 +12,16 @@ Front: direct
 | JSON | circe 0.14.17 (derived encoders, jawn parser) |
 | bcrypt | Bouncy Castle 1.86 (`bcprov-jdk18on`, `OpenBSDBCrypt`), cost 10, `$2a$` |
 | JWT | HS256 by hand with the JDK's `Mac` (about 40 lines, `Jwt.scala`) |
+| GC / heap | Parallel GC, 45% of RAM, pre-touched; Cats Effect compute threads = half the cores |
 | **Front** | **direct**: Ember serves `0.0.0.0:80` itself |
 
 This is ordinary Typelevel code: a `HttpRoutes[IO]` with one case per endpoint, the reference SQL from
 [SPEC.md](../../SPEC.md) as skunk queries and commands, and circe case-class encoders. There is no hand-written HTTP parser
-or event loop.
+or event loop. Concurrent article-page lookups are merged into one statement with a small fs2 "DataLoader"
+(`Batcher.scala`).
+
+**[FINDINGS.md](FINDINGS.md)** has every decision with its measurements, and the ideas that were rejected.
+**[RESEARCH.md](RESEARCH.md)** is the survey of the other submissions (merged and open PRs) it started from.
 
 ## Running it
 
@@ -26,8 +31,8 @@ bash build.sh          # sbt compile, writes target/classpath.txt
 DATABASE_URL=... JWT_SECRET=... HOST=0.0.0.0 PORT=80 bash start.sh
 ```
 
-Optional knobs (env): `DB_READ_SESSIONS` (default 16), `DB_WRITE_SESSIONS` (default 4), `BCRYPT_THREADS`
-(default half the cores), `MAX_CONNECTIONS` (default 150,000).
+Optional knobs (env): `DB_READ_SESSIONS` (default 32), `DB_WRITE_SESSIONS` (default 8), `COMPUTE_THREADS` and
+`BCRYPT_THREADS` (default half the cores each), `MAX_CONNECTIONS` (default 150,000).
 
 ## Layout
 
@@ -35,6 +40,7 @@ Optional knobs (env): `DB_READ_SESSIONS` (default 16), `DB_WRITE_SESSIONS` (defa
 |---|---|
 | `Main.scala` | Config from env, the skunk sessions, the bcrypt pool, the Ember server |
 | `SessionPool.scala` | Lends long-lived skunk sessions from a Cats Effect `Queue` |
+| `Batcher.scala` | Merges concurrent lookups of one kind into one statement (fs2 `Queue` → chunks → `Deferred`s) |
 | `ListenBacklog.scala` | Raises the listen backlog (see below) |
 | `Api.scala` | The 19 routes, auth, pagination, the error mapping |
 | `Sql.scala` | The reference SQL as skunk `Query`/`Command` values |
@@ -47,7 +53,7 @@ Optional knobs (env): `DB_READ_SESSIONS` (default 16), `DB_WRITE_SESSIONS` (defa
 - **Direct instead of Nginx.** Nginx used about 11% of the box in the video. Ember holds every keep-alive
   connection as a fiber. It accepts up to 150,000 connections (`LimitNOFILE` is 200,000). An open connection costs
   about 35 KB of heap (fs2's 8 KB socket buffer, plus about ten fibers and twenty fs2 scopes, measured with a heap
-  histogram), so the 4 GB heap holds about 100,000 of them.
+  histogram), so the ~7 GB heap holds well over 100,000 of them.
 - **Idle connections stay open** until the client closes them. A virtual user keeps its connection for the whole
   session and thinks for up to 70 s. With a finite idle timeout, Ember races a timer against every socket read
   (about 4% more CPU per request in a local A/B test).
@@ -65,9 +71,15 @@ Optional knobs (env): `DB_READ_SESSIONS` (default 16), `DB_WRITE_SESSIONS` (defa
   verifies of the seed hash on one core, JDK 27): median 53.6 ms vs 56.8 ms per verify (5.0–7.6% per round), 53.5
   vs 56.8 ms per hash. It verifies the seed's `$2a$10$` hashes, and a hash from either library verifies with the
   other.
-- **JVM**: G1 with a fixed, pre-touched 4 GB heap (Postgres needs the rest of the 16 GB). Cats Effect fiber
-  tracing is off (`cats.effect.tracing.mode=none`), because it records a frame for every `IO` step. The CPU
-  starvation checker is off, because its warnings only add noise under load.
+- **JVM**: Parallel GC with a fixed, pre-touched heap of 45% of RAM (~7 GB; Postgres needs `shared_buffers`, its
+  backends and the page cache), chosen in a sweep against G1, ZGC and Shenandoah ([FINDINGS.md](FINDINGS.md)).
+  Cats Effect gets half the cores as compute threads, leaving the rest to Postgres. Fiber tracing is off
+  (`cats.effect.tracing.mode=none`), because it records a frame for every `IO` step. The CPU starvation checker is
+  off, because its warnings only add noise under load.
+- **Article-page lookups batched.** `GET /api/articles/:slug` and `GET /api/articles/:slug/comments` go through
+  `Batcher`: the lookups that arrive while earlier batches run become one `unnest(...) WITH ORDINALITY` statement,
+  each request still getting its own row from a statement that started after it asked. +5-10% req/s and a much lower
+  tail at 6,000 users ([FINDINGS.md](FINDINGS.md#batching-the-dataloader-pattern-with-fs2)).
 - **No caches** (rule 5). Every token's signature and `exp` are checked on every request. Every login verifies
   bcrypt against the stored hash. Every response is read from Postgres.
 
@@ -79,8 +91,9 @@ Optional knobs (env): `DB_READ_SESSIONS` (default 16), `DB_WRITE_SESSIONS` (defa
   `SessionPool` opens a fixed set of sessions at startup (`Session.Builder...single`) and lends them from a Cats
   Effect `Queue`. A returned session only has to be healthy and outside a transaction (skunk tracks both without
   I/O); otherwise it is closed and replaced.
-- **Separate read and write sessions** (16 + 4). A request that writes runs its statement on a write session, so a
-  burst of reads can't queue the writes. 20 connections in total, well under the 95 limit.
+- **Separate read and write sessions** (32 + 8, from a sweep of 8 + 4, 16 + 4, 32 + 8 and 48 + 8). A request that
+  writes runs its statement on a write session, so a burst of reads can't queue the writes. 40 connections in total,
+  well under the 95 limit.
 - **Prepared once per session.** Each statement is a `val`; skunk parses and describes it the first time a session
   runs it, caches that, and after that sends only Bind/Execute. That caches plans, not data (rule 5).
 - **Session settings** (rule 2 allows session-level ones), sent in the startup packet and checked with

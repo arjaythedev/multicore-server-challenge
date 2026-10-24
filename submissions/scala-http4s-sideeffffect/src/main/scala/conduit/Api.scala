@@ -216,7 +216,7 @@ final class Api(
       for
         caller <- required(request)
         page <- page(request)
-        list <- db.read.use(Sql.feed(_, caller.id, page))
+        list <- lookups.feed((caller.id, page))
         response <- Ok(ArticleList(list._1.map(_.toArticle), list._2))
       yield response
 
