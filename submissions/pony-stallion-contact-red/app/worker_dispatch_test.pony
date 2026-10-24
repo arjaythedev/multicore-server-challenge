@@ -24,7 +24,7 @@ actor \nodoc\ _WorkerOverlapTest is (_QueryClient & _WorkerBarrier)
   new create(auth: TCPConnectAuth, config: _Config, env: Env,
     layout: _DatabaseLayout) =>
     _env = env
-    _worker = _Worker(auth, config, Timers, env.err, layout.pool_size(0))
+    _worker = _Worker(auth, config, Timers, env.err, layout.sessions(0))
     _first = _CanceledQueryClient(this)
     _worker.query(this, 0, _CurrentUser, _P.one(I64(0)))
 
@@ -84,7 +84,7 @@ actor \nodoc\ _WorkerCloseTest is (_QueryClient & _WorkerBarrier)
   new create(auth: TCPConnectAuth, config: _Config, env: Env,
     layout: _DatabaseLayout) =>
     _env = env
-    _worker = _Worker(auth, config, Timers, env.err, layout.pool_size(0))
+    _worker = _Worker(auth, config, Timers, env.err, layout.sessions(0))
     _worker.query(this, 0, _CurrentUser, _P.one(I64(0)))
 
   be db_result(id: U64, result: pg.Result) =>
@@ -155,7 +155,7 @@ actor \nodoc\ _WorkerPendingCancelTest is (_QueryClient & _WorkerBarrier)
   new create(auth: TCPConnectAuth, config: _Config, env: Env,
     layout: _DatabaseLayout) =>
     _env = env
-    _worker = _Worker(auth, config, Timers, env.err, layout.pool_size(0))
+    _worker = _Worker(auth, config, Timers, env.err, layout.sessions(0))
     _first = _PendingCanceledClient(this)
     _worker.query(_first, 1, _Tags, _P.none())
     _worker.query(this, 1, _Tags, _P.none())

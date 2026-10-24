@@ -296,7 +296,9 @@ class ProtocolProxy(socketserver.ThreadingTCPServer):
     daemon_threads = True
     request_queue_size = 128
 
-    def __init__(self, database_host, database_port, frame_timeout=15, capacity=128):
+    def __init__(self, database_host, database_port, frame_timeout=15, capacity=128,
+                 complete_capture=False, record_limit=4096,
+                 name_bytes_limit=1048576, name_limit=128):
         self.database_host = database_host
         self.database_port = int(database_port)
         self.frame_timeout = frame_timeout
@@ -304,6 +306,13 @@ class ProtocolProxy(socketserver.ThreadingTCPServer):
         self.frame_gates = []
         self.failures = []
         self.capacity = capacity
+        self.complete_capture = complete_capture
+        self.record_limit = record_limit
+        self.name_bytes_limit = name_bytes_limit
+        self.name_limit = name_limit
+        self.name_bytes = 0
+        self.handlers = set()
+        self.requests = set()
         self.backends = []
         self.frontends = []
         self.mutate_next_row = False
@@ -349,6 +358,32 @@ class ProtocolProxy(socketserver.ThreadingTCPServer):
     def snapshot(self):
         with self.lock:
             return [list(messages) for messages in self.messages]
+
+    def capture(self, messages, kind, payload):
+        with self.lock:
+            names = payload.split(b"\0", 2)
+            needed = 1 if kind == b"P" else 2
+            if self.complete_capture:
+                if len(names) <= needed:
+                    self.failures.append("unterminated captured name")
+                    raise EOFError
+                fields = names[:needed]
+                if any(len(name) > self.name_limit for name in fields):
+                    self.failures.append("captured name length limit")
+                    raise EOFError
+                captured = b"".join(name + b"\0" for name in fields)
+                if len(messages) >= self.record_limit:
+                    self.failures.append("capture record limit")
+                    raise EOFError
+                if self.name_bytes + len(captured) > self.name_bytes_limit:
+                    self.failures.append("capture total name bytes limit")
+                    raise EOFError
+                self.name_bytes += len(captured)
+                messages.append((kind, captured))
+            elif len(messages) < 1024:
+                captured = b"".join(name[:128] + b"\0"
+                                    for name in names[:needed])
+                messages.append((kind, captured))
 
     def drop_backend(self, index=-1):
         with self.lock:
@@ -477,9 +512,15 @@ class ProtocolProxy(socketserver.ThreadingTCPServer):
         return not self.reject_new and self.connections.acquire(blocking=False)
 
     def process_request_thread(self, request, client_address):
+        thread = threading.current_thread()
+        with self.lock:
+            self.handlers.add(thread)
+            self.requests.add(request)
         try:
             super().process_request_thread(request, client_address)
         finally:
+            with self.lock:
+                self.requests.discard(request)
             self.connections.release()
 
     def stop(self):
@@ -490,6 +531,18 @@ class ProtocolProxy(socketserver.ThreadingTCPServer):
         self.shutdown()
         self.server_close()
         self.thread.join(timeout=5)
+        with self.lock:
+            sockets = list(self.requests) + list(self.backends)
+            handlers = list(self.handlers)
+        for connection in sockets:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        for handler in handlers:
+            handler.join(timeout=5)
+        if self.thread.is_alive() or any(h.is_alive() for h in handlers):
+            raise AssertionError("proxy did not stop all handlers")
 
 
 class ProtocolConnection(socketserver.BaseRequestHandler):
@@ -510,7 +563,8 @@ class ProtocolConnection(socketserver.BaseRequestHandler):
 
     def handle(self):
         with socket.create_connection((self.server.database_host,
-                                       self.server.database_port)) as backend:
+                                       self.server.database_port), timeout=5) as backend:
+            backend.settimeout(None)
             messages = []
             with self.server.lock:
                 index = len(self.server.messages)
@@ -518,6 +572,9 @@ class ProtocolConnection(socketserver.BaseRequestHandler):
                     self.server.messages.append(messages)
                     self.server.backends.append(backend)
                     self.server.frontends.append(self.request)
+                elif self.server.complete_capture:
+                    self.server.failures.append("capture connection lifetime limit")
+                    return
 
             def downstream():
                 try:
@@ -610,17 +667,7 @@ class ProtocolConnection(socketserver.BaseRequestHandler):
                                               deadline)
                     self.request.settimeout(None)
                     if kind in (b"P", b"B"):
-                        names = payload.split(b"\0", 2)
-                        if kind == b"P":
-                            captured = names[0][:128] + b"\0"
-                        elif len(names) > 1:
-                            captured = (names[0][:128] + b"\0" +
-                                        names[1][:128] + b"\0")
-                        else:
-                            captured = b""
-                        with self.server.lock:
-                            if len(messages) < 1024:
-                                messages.append((kind, captured))
+                        self.server.capture(messages, kind, payload)
                     backend.sendall(kind + size + payload)
             except (EOFError, OSError):
                 pass
@@ -634,10 +681,14 @@ class ProtocolConnection(socketserver.BaseRequestHandler):
                 except OSError:
                     pass
                 thread.join(timeout=5)
+                if thread.is_alive():
+                    with self.server.lock:
+                        self.server.failures.append("proxy downstream did not stop")
 
 
 class PoolRun:
-    def __init__(self, case, process, proxy, csv=False, count=2, actors=1):
+    def __init__(self, case, process, proxy, csv=False, count=2, actors=1,
+                 deadline=None):
         self.case = case
         self.process = process
         self.proxy = proxy
@@ -645,20 +696,36 @@ class PoolRun:
         self.events = []
         self.history = []
         self.sequence = 0
+        self.deadline = deadline
         self.csv = WorkerCSV(dict.fromkeys(range(actors), count)) if csv else None
         self.selector = selectors.DefaultSelector()
         self.selector.register(process.stdout, selectors.EVENT_READ)
         self.receive(lambda event: event.get("event") == "started")
 
     def send(self, *commands):
+        self.remaining(10, "send pool command")
         self.process.stdin.write(("\n".join(commands) + "\n").encode())
         self.process.stdin.flush()
+        self.remaining(10, "sent pool command")
 
-    def receive(self, predicate, timeout=10):
-        deadline = time.monotonic() + timeout
+    def remaining(self, timeout, event):
+        if self.deadline is not None:
+            timeout = min(timeout, self.deadline - time.monotonic())
+        if timeout <= 0:
+            raise AssertionError("scenario deadline: " + event)
+        return timeout
+
+    def receive(self, predicate, timeout=10, deadline=None,
+                event_name="pool probe response"):
+        end = time.monotonic() + self.remaining(timeout, event_name)
+        if deadline is not None:
+            end = min(end, deadline)
         while True:
+            if time.monotonic() >= end:
+                raise AssertionError(event_name + " timed out")
             for index, event in enumerate(self.events):
                 if predicate(event):
+                    self.remaining(end - time.monotonic(), event_name)
                     return self.events.pop(index)
             while b"\n" in self.buffer:
                 line, self.buffer = self.buffer.split(b"\n", 1)
@@ -672,26 +739,31 @@ class PoolRun:
                 self.history.append(event)
             if any(predicate(event) for event in self.events):
                 continue
-            remaining = deadline - time.monotonic()
+            remaining = end - time.monotonic()
             if remaining <= 0 or not self.selector.select(remaining):
-                raise AssertionError("pool probe response timed out")
+                raise AssertionError(event_name + " timed out")
             chunk = os.read(self.process.stdout.fileno(), 65536)
             if not chunk:
                 raise AssertionError("pool probe exited before response")
             self.buffer += chunk
 
-    def state(self):
+    def state(self, worker=0, deadline=None):
         self.sequence += 1
         request = self.sequence
-        self.send(f"state {request}")
+        self.send(f"state {request} {worker}")
         state = self.receive(lambda event: event.get("event") == "state"
-                             and event["request"] == request)
+                             and event["request"] == request,
+                             deadline=deadline,
+                             event_name=f"worker {worker} state {request}")
+        self.case.assertEqual(state["worker"], worker)
         idle = state["idle"]
         self.case.assertEqual(len(idle), len(set(idle)))
         self.case.assertEqual(set(idle), {index for index, code in
                               enumerate(state["phases"]) if code == 2})
         self.case.assertEqual(state["outstanding"],
-                              len(state["queued"]) + len(state["active"]))
+                              len(state["queued"]) + len(state["write_queued"])
+                              + len(state["active"]))
+        self.remaining(10, "state assertions")
         return state
 
     def csv_sample(self):
@@ -710,13 +782,14 @@ class PoolRun:
         return self.receive(lambda event: event.get("event") == "csv_fence"
                             and event["request"] == self.sequence)
 
-    def wait_state(self, predicate, timeout=10):
-        deadline = time.monotonic() + timeout
+    def wait_state(self, predicate, timeout=10, worker=0):
+        deadline = time.monotonic() + self.remaining(timeout, "wait state")
         while time.monotonic() < deadline:
-            state = self.state()
+            state = self.state(worker=worker, deadline=deadline)
             if predicate(state):
+                self.remaining(deadline - time.monotonic(), "state condition")
                 return state
-            time.sleep(0.01)
+            time.sleep(min(0.01, max(0, deadline - time.monotonic())))
         raise AssertionError("pool state condition timed out")
 
     def ready(self, count):
@@ -1070,9 +1143,11 @@ class Integration(unittest.TestCase):
 
     @contextmanager
     def pool_run(self, count=2, configure=None, retry_ns=None, csv=False,
-                 listener=False):
+                 listener=False, writes=None, complete_capture=False,
+                 deadline=None):
         proxy = ProtocolProxy(self.proxy.database_host,
-                              self.proxy.database_port)
+                              self.proxy.database_port,
+                              complete_capture=complete_capture)
         if configure is not None:
             configure(proxy)
         env = self.server_env.copy()
@@ -1086,16 +1161,19 @@ class Integration(unittest.TestCase):
                 listener_socket.bind(("127.0.0.1", 0))
                 env["PORT"] = str(listener_socket.getsockname()[1])
         with tempfile.TemporaryFile(mode="w+b") as errors:
-            process = subprocess.Popen(
-                [str(_executable()),
+            args = [str(_executable()),
                  ("--test-listener-csv" if listener else
                   "--test-pool-csv" if csv else "--test-pool"),
-                 "--ponymaxthreads=1"],
+                 "--ponymaxthreads=1"]
+            if writes is not None:
+                args.append(f"--db-write-sessions={writes}")
+            process = subprocess.Popen(args,
                 env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=errors)
             run = None
             try:
-                run = PoolRun(self, process, proxy, csv, count, 4 if listener else 1)
+                run = PoolRun(self, process, proxy, csv, count,
+                              4 if listener else 1, deadline)
                 yield run
             finally:
                 for gate in proxy.frame_gates:
@@ -1118,6 +1196,225 @@ class Integration(unittest.TestCase):
                 errors.seek(0)
                 self.assertEqual(process.returncode, 0,
                                  _failure_output(errors.read().decode()))
+
+    def split_hold(self, run, command, query_id, role, held=()):
+        before = run.proxy.snapshot()
+        excluded = {entry["connection"] for entry in held}
+        gates = {index: run.proxy.hold_frame(b"Z", index, timeout=60)
+                 for index in range(len(before)) if index not in excluded}
+        run.send(command)
+        state = run.wait_state(lambda value: any(
+            item[1:] == [query_id, 1] for item in value["active"]))
+        active = [item for item in state["active"] if item[1] == query_id]
+        self.assertEqual(len(active), 1)
+        slot = active[0][0]
+        self.assertEqual(state["roles"][slot], role)
+        after = run.proxy.snapshot()
+        candidates = [(index, name) for index, messages in enumerate(after)
+                      for kind, name in messages[len(before[index]):]
+                      if kind == b"B"]
+        self.assertEqual(len(candidates), 1)
+        connection, name = candidates[0]
+        self.assertIn(connection, gates)
+        self.assertTrue(gates[connection].reached.wait(
+            run.remaining(5, f"query {query_id} ReadyForQuery gate")))
+        run.proxy.assert_healthy()
+        with run.proxy.lock:
+            for index, gate in gates.items():
+                if index != connection:
+                    gate.claimed = True
+                    gate.release.set()
+        return dict(connection=connection, slot=slot,
+                    generation=state["generations"][slot],
+                    gate=gates[connection], name=name, id=query_id)
+
+    def split_successor(self, run, predecessor, query_id, role, queued,
+                        predecessor_callback=True):
+        gate = run.proxy.hold_frame(b"Z", predecessor["connection"], timeout=60)
+        predecessor["gate"].release.set()
+        if predecessor_callback:
+            run.result(predecessor["id"])
+        self.assertTrue(gate.reached.wait(
+            run.remaining(5, f"successor {query_id} ReadyForQuery gate")))
+        state = run.wait_state(lambda value:
+            [predecessor["slot"], query_id, 1] in value["active"])
+        run.proxy.assert_healthy()
+        self.assertEqual(state["roles"][predecessor["slot"]], role)
+        self.assertEqual(state["generations"][predecessor["slot"]],
+                         predecessor["generation"])
+        self.assertEqual(state["write_queued" if role == 2 else "queued"], queued)
+        return dict(predecessor, gate=gate, id=query_id)
+
+    def test_split_catalog_enqueue_placement(self):
+        table = [
+            ("tags", 1), ("register_user", 2), ("login_user", 1),
+            ("current_user", 1), ("update_user", 2), ("profile", 1),
+            ("follow_target", 1), ("follow_insert", 2), ("follow_delete", 2),
+            ("article_page_all", 1), ("article_page_feed", 1),
+            ("article_page_tag", 1), ("article_page_author", 1),
+            ("article_page_favorited", 1), ("article_full_by_slug", 1),
+            ("article_full_by_id", 1), ("article_insert", 2),
+            ("article_id_and_author_by_slug", 1), ("article_update_input", 1),
+            ("article_update", 2), ("article_delete", 2),
+            ("article_id_by_slug", 1), ("favorite_insert", 2),
+            ("favorite_delete", 2), ("comments_by_slug", 1),
+            ("comment_input", 1), ("comment_insert", 2),
+            ("comment_owner", 1), ("comment_delete", 2)]
+        for writes in (1, None, 0):
+            with self.subTest(writes=writes), self.pool_run(
+                    writes=writes, complete_capture=True) as run:
+                state = run.ready(2)
+                self.assertEqual(state["roles"], [1, 2] if writes else [0, 0])
+                read = self.split_hold(run, "tags 1 3", 1, 1 if writes else 0)
+                write = self.split_hold(run,
+                    f"register 2 3 split_{uuid.uuid4().hex}", 2,
+                    2 if writes else 0, [read])
+                self.assertEqual(read["name"], b"\0tags\0")
+                self.assertEqual(write["name"], b"\0register_user\0")
+                before = run.proxy.snapshot()
+                run.send(*(f"typed {101 + i} 0 {name}"
+                           for i, (name, _) in enumerate(table)))
+                state = run.state()
+                read_ids = [101 + i for i, (_, role) in enumerate(table)
+                            if role == 1 or not writes]
+                write_ids = [101 + i for i, (_, role) in enumerate(table)
+                             if role == 2 and writes]
+                self.assertEqual(state["queued"], read_ids)
+                self.assertEqual(state["write_queued"], write_ids)
+                self.assertEqual(sorted(item[1] for item in state["active"]),
+                                 [1, 2])
+                self.assertEqual(state["outstanding"], 31)
+                self.assertEqual(state["recipients"], 2)
+                run.send("close")
+                for query_id in range(101, 130):
+                    self.assertEqual(run.result(query_id, "lost")["client"], 0)
+                for query_id in (1, 2):
+                    self.assertEqual(run.result(query_id, "lost")["client"], 3)
+                state = run.wait_state(lambda value: value["phases"] == [5, 5])
+                self.assertEqual(state["queued"], [])
+                self.assertEqual(state["write_queued"], [])
+                self.assertEqual(state["outstanding"], 0)
+                self.assertEqual(run.fence(), {0: 29, 1: 0, 2: 0, 3: 2})
+                run.proxy.assert_healthy()
+                self.assertEqual(run.proxy.snapshot(), before)
+
+    def test_split_saturation_progress_fifo(self):
+        for roles in ([1, 1, 2], [1, 2, 2], [1, 2]):
+            for blocked in (1, 2):
+                with self.subTest(roles=roles, blocked=blocked), self.pool_run(
+                        count=len(roles), writes=roles.count(2),
+                        complete_capture=True) as run:
+                    self.assertEqual(run.ready(len(roles))["roles"], roles)
+                    def command(query_id, role):
+                        return (f"tags {query_id} 0" if role == 1 else
+                                f"register {query_id} 0 s_{uuid.uuid4().hex}")
+                    held = []
+                    for i, role in enumerate(roles):
+                        held.append(self.split_hold(run, command(i + 1, role),
+                                                    i + 1, role, held))
+                    blocked_entries = [entry for entry in held
+                                       if roles[entry["slot"]] == blocked]
+                    for entry in held:
+                        if roles[entry["slot"]] != blocked:
+                            entry["gate"].release.set()
+                            run.result(entry["id"])
+                    run.send(*(command(i, blocked) for i in (11, 12, 13)),
+                             command(21, 3 - blocked))
+                    run.result(21)
+                    state = run.state()
+                    key = "write_queued" if blocked == 2 else "queued"
+                    self.assertEqual(state[key], [11, 12, 13])
+                    selected = blocked_entries[0]
+                    selected = self.split_successor(run, selected, 11, blocked,
+                                                    [12, 13])
+                    run.send(command(27, blocked))
+                    self.assertEqual(run.state()[key], [12, 13, 27])
+                    for query_id, suffix in ((12, [13, 27]), (13, [27]), (27, [])):
+                        selected = self.split_successor(run, selected, query_id,
+                                                        blocked, suffix)
+                    selected["gate"].release.set()
+                    run.result(27)
+                    for entry in blocked_entries[1:]:
+                        entry["gate"].release.set()
+                        run.result(entry["id"])
+                    state = run.ready(len(roles))
+                    self.assertEqual(state["outstanding"], 0)
+                    self.assertEqual(run.fence()[0], len(roles) + 5)
+                    run.proxy.assert_healthy()
+
+    def test_split_cancel_cohorts_across_queues(self):
+        with self.pool_run(writes=1, complete_capture=True) as run:
+            self.assertEqual(run.ready(2)["roles"], [1, 2])
+            read = self.split_hold(run, "tags 10 0", 10, 1)
+            write = self.split_hold(run,
+                f"register 11 0 s_{uuid.uuid4().hex}", 11, 2, [read])
+            cancelled_name = "s_" + uuid.uuid4().hex
+            run.send("tags 12 0", f"register 13 0 {cancelled_name}", "cancel 0",
+                     "tags 20 0", f"register 21 0 s_{uuid.uuid4().hex}",
+                     "tags 30 1", f"register 31 1 s_{uuid.uuid4().hex}")
+            state = run.state()
+            self.assertEqual(state["queued"], [12, 20, 30])
+            self.assertEqual(state["write_queued"], [13, 21, 31])
+            self.assertEqual(state["outstanding"], 8)
+            self.assertEqual(state["recipients"], 2)
+            self.assertEqual(run.fence(), {0: 0, 1: 0, 2: 0, 3: 0})
+            read = self.split_successor(run, read, 12, 1, [20, 30], False)
+            write = self.split_successor(run, write, 13, 2, [21, 31], False)
+            self.assertEqual(run.fence(), {0: 0, 1: 0, 2: 0, 3: 0})
+            self.assertEqual(self.db("SELECT count(*) FROM users WHERE username="
+                                     + self.literal(cancelled_name)), "1")
+            read = self.split_successor(run, read, 20, 1, [30], False)
+            write = self.split_successor(run, write, 21, 2, [31], False)
+            self.assertEqual(run.fence(), {0: 0, 1: 0, 2: 0, 3: 0})
+            self.assertEqual(run.state()["recipients"], 2)
+            read = self.split_successor(run, read, 30, 1, [])
+            write = self.split_successor(run, write, 31, 2, [])
+            self.assertEqual(run.fence(), {0: 2, 1: 0, 2: 0, 3: 0})
+            for entry in (read, write):
+                entry["gate"].release.set()
+                self.assertEqual(run.result(entry["id"])["client"], 1)
+            state = run.ready(2)
+            self.assertEqual(state["recipients"], 0)
+            self.assertEqual(run.fence(), {0: 2, 1: 2, 2: 0, 3: 0})
+            completed = [(event["client"], event["id"]) for event in run.history
+                         if event["event"] == "result"]
+            self.assertEqual(sorted(completed), [(0, 20), (0, 21), (1, 30), (1, 31)])
+            run.proxy.assert_healthy()
+            binds = [name for messages in run.proxy.snapshot()
+                     for kind, name in messages if kind == b"B"]
+            self.assertEqual(binds.count(b"\0tags\0"), 4)
+            self.assertEqual(binds.count(b"\0register_user\0"), 4)
+
+    def test_split_close_drains_both_queues(self):
+        with self.pool_run(writes=1, complete_capture=True) as run:
+            self.assertEqual(run.ready(2)["roles"], [1, 2])
+            read = self.split_hold(run, "tags 1 0", 1, 1)
+            self.split_hold(run, f"register 2 0 s_{uuid.uuid4().hex}",
+                            2, 2, [read])
+            queued_name = "s_" + uuid.uuid4().hex
+            cancelled_name = "s_" + uuid.uuid4().hex
+            run.send("tags 3 0", f"register 4 0 {queued_name}",
+                     "tags 5 1", f"register 6 1 {cancelled_name}", "cancel 1")
+            state = run.state()
+            self.assertEqual(state["queued"], [3, 5])
+            self.assertEqual(state["write_queued"], [4, 6])
+            self.assertEqual(state["outstanding"], 6)
+            before = run.proxy.snapshot()
+            run.send("close", "close", "tags 7 0",
+                     f"register 8 0 s_{uuid.uuid4().hex}")
+            for query_id in (1, 2, 3, 4, 7, 8):
+                self.assertEqual(run.result(query_id, "lost")["client"], 0)
+            state = run.wait_state(lambda value: value["phases"] == [5, 5])
+            for key in ("queued", "write_queued", "idle", "active"):
+                self.assertEqual(state[key], [], key)
+            self.assertEqual(state["recipients"], 0)
+            self.assertEqual(state["outstanding"], 0)
+            self.assertEqual(run.fence(), {0: 6, 1: 0, 2: 0, 3: 0})
+            self.assertEqual(self.db("SELECT count(*) FROM users WHERE username IN ("
+                + self.literal(queued_name) + "," + self.literal(cancelled_name)
+                + ")"), "0")
+            run.proxy.assert_healthy()
+            self.assertEqual(run.proxy.snapshot(), before)
 
     def test_pool_uses_idle_connection_while_another_is_blocked(self):
         with self.pool_run() as run:

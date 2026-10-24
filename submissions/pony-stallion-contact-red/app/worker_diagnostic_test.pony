@@ -14,7 +14,7 @@ actor \nodoc\ _WorkerDiagnosticTest is
   new create(auth: TCPConnectAuth, config: _Config, env: Env,
     layout: _DatabaseLayout) =>
     _env = env
-    _worker = _Worker(auth, config, Timers, env.err, layout.pool_size(0))
+    _worker = _Worker(auth, config, Timers, env.err, layout.sessions(0))
     _worker.query(this, 1, _Tags, _P.none())
     _worker.query(this, 2, _Tags, _P.none())
     _worker.barrier(this)

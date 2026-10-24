@@ -1,15 +1,21 @@
-type _RequestStatement is (
-  _Tags | _RegisterUser | _LoginUser | _CurrentUser | _UpdateUser |
-  _Profile | _FollowTarget | _FollowInsert | _FollowDelete |
+type _ReadStatement is (
+  _Tags | _LoginUser | _CurrentUser | _Profile | _FollowTarget |
   _ArticlePageAll | _ArticlePageFeed | _ArticlePageTag |
   _ArticlePageAuthor | _ArticlePageFavorited |
   _ArticleFullBySlug | _ArticleFullById |
-  _ArticleInsert | _ArticleIdAndAuthorBySlug | _ArticleUpdateInput |
-  _ArticleUpdate |
-  _ArticleDelete |
-  _ArticleIdBySlug | _FavoriteInsert | _FavoriteDelete |
-  _CommentsBySlug | _CommentInput | _CommentInsert |
-  _CommentOwner | _CommentDelete)
+  _ArticleIdAndAuthorBySlug | _ArticleUpdateInput | _ArticleIdBySlug |
+  _CommentsBySlug | _CommentInput | _CommentOwner)
+
+type _WriteStatement is (
+  _RegisterUser | _UpdateUser | _FollowInsert | _FollowDelete |
+  _ArticleInsert | _ArticleUpdate | _ArticleDelete |
+  _FavoriteInsert | _FavoriteDelete | _CommentInsert | _CommentDelete)
+
+type _RequestStatement is (_ReadStatement | _WriteStatement)
+
+primitive _ReadClass
+primitive _WriteClass
+type _StatementClass is (_ReadClass | _WriteClass)
 
 type _Statement is (_RequestStatement | _Rollback)
 
@@ -45,6 +51,12 @@ primitive _CommentDelete
 primitive _Rollback
 
 primitive _Catalog
+  fun statement_class(statement: _RequestStatement): _StatementClass =>
+    match \exhaustive\ statement
+    | let _: _ReadStatement => _ReadClass
+    | let _: _WriteStatement => _WriteClass
+    end
+
   fun kind(statement: _RequestStatement): USize =>
     match statement
     | _Tags => 0

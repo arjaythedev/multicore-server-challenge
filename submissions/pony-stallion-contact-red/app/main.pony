@@ -11,10 +11,10 @@ actor Main
   """Runs the Conduit API server."""
   new create(env: Env) =>
     """Run a requested test mode or start the HTTP listener."""
-    let production = match _DatabaseOptions(env.args,
+    let selection = match _DatabaseOptions(env.args,
       runtime.Scheduler.schedulers(runtime.SchedulerInfoAuth(env.root)).usize())
-    | let layout: _DatabaseLayout => layout
-    | let failure: _WorkerCountError =>
+    | let options: _DatabaseSelection => options
+    | let failure: (_WorkerCountError | _WriteSessionsError) =>
       env.err.print(failure.string())
       env.exitcode(1)
       return
@@ -44,8 +44,10 @@ actor Main
         elseif (arg == "--test-pool") or (arg == "--test-pool-csv") or
           (arg == "--test-listener-csv") then
           let config = _Config(env.vars)?
-          let layout = _TestDatabaseLayout(env.vars,
-            if arg == "--test-listener-csv" then 4 else 1 end)?
+          let layout = match _layout(env, selection.fixture(env.vars,
+            if arg == "--test-listener-csv" then 4 else 1 end))
+          | let value: _DatabaseLayout => value
+          else return end
           _PoolProbe(TCPConnectAuth(env.root), config, env, layout,
             arg != "--test-pool", arg == "--test-listener-csv")
           return
@@ -95,28 +97,43 @@ actor Main
           return
         elseif arg == "--test-worker-data-error" then
           let config = _Config(env.vars)?
+          let layout = match _layout(env, selection.fixture(env.vars, 1))
+          | let value: _DatabaseLayout => value
+          else return end
           _WorkerDataErrorTest(TCPConnectAuth(env.root), config, env,
-            _TestDatabaseLayout(env.vars, 1)?, false)
+            layout, false)
           return
         elseif arg == "--test-worker-decode-error" then
           let config = _Config(env.vars)?
+          let layout = match _layout(env, selection.fixture(env.vars, 1))
+          | let value: _DatabaseLayout => value
+          else return end
           _WorkerDataErrorTest(TCPConnectAuth(env.root), config, env,
-            _TestDatabaseLayout(env.vars, 1)?, true)
+            layout, true)
           return
         elseif arg == "--test-worker-overlap" then
           let config = _Config(env.vars)?
+          let layout = match _layout(env, selection.fixture(env.vars, 1))
+          | let value: _DatabaseLayout => value
+          else return end
           _WorkerOverlapTest(TCPConnectAuth(env.root), config, env,
-            _TestDatabaseLayout(env.vars, 1)?)
+            layout)
           return
         elseif arg == "--test-worker-close-drain" then
           let config = _Config(env.vars)?
+          let layout = match _layout(env, selection.fixture(env.vars, 1))
+          | let value: _DatabaseLayout => value
+          else return end
           _WorkerCloseTest(TCPConnectAuth(env.root), config, env,
-            _TestDatabaseLayout(env.vars, 1)?)
+            layout)
           return
         elseif arg == "--test-worker-pending-cancel" then
           let config = _Config(env.vars)?
+          let layout = match _layout(env, selection.fixture(env.vars, 1))
+          | let value: _DatabaseLayout => value
+          else return end
           _WorkerPendingCancelTest(TCPConnectAuth(env.root), config, env,
-            _TestDatabaseLayout(env.vars, 1)?)
+            layout)
           return
         elseif arg == "--test-http" then
           test_http = true
@@ -125,9 +142,13 @@ actor Main
           let options = _PasswordOptions(env.vars,
             runtime.Scheduler.schedulers(runtime.SchedulerInfoAuth(env.root))
               .usize())?
-          _PasswordProbe(env, options,
-            if arg == "--test-password-http" then _Config(env.vars)?
-            else None end)
+          if arg == "--test-password-http" then
+            let layout = match _layout(env, selection.fixed(1, 1))
+            | let value: _DatabaseLayout => value
+            else return end
+            _PasswordProbe(env, options,
+              (_Config(env.vars)?, layout.sessions(0)))
+          else _PasswordProbe(env, options) end
           return
         elseif (arg == "--test-password-startup") or
           (arg == "--test-password-startup-failure") then
@@ -136,8 +157,11 @@ actor Main
         elseif arg == "--test-worker-diagnostic" then
           ifdef "conduit_diagnostic" then
             let config = _Config(env.vars)?
+            let layout = match _layout(env, selection.fixture(env.vars, 1))
+            | let value: _DatabaseLayout => value
+            else return end
             _WorkerDiagnosticTest(TCPConnectAuth(env.root), config, env,
-              _TestDatabaseLayout(env.vars, 1)?)
+              layout)
           else
             env.err.print("This test requires a diagnostic build")
             env.exitcode(1)
@@ -145,9 +169,12 @@ actor Main
           return
         end
       end
-      let layout = if test_http then
-        _TestDatabaseLayout(env.vars, production.sizes.size())?
-      else production end
+      let selected = if test_http then
+        selection.fixture(env.vars, selection.workers)
+      else selection.production() end
+      let layout = match _layout(env, selected)
+      | let value: _DatabaseLayout => value
+      else return end
       if password_startup then
         _start(env, _Config(env.vars)?, layout, test_http,
           _PasswordProbe.startup(env) where password_check =
@@ -160,6 +187,17 @@ actor Main
         + "test modes, CONDUIT_TEST_POOL_SIZE must be 1..95 (default 1), "
         + "with at most 95 total connections.")
       env.exitcode(1)
+    end
+
+  fun _layout(env: Env, result: _DatabaseLayoutResult):
+    (_DatabaseLayout | None)
+  =>
+    match result
+    | let layout: _DatabaseLayout => layout
+    | let failure: (_FixtureSizeError | _ReservationError) =>
+      env.err.print(failure.string())
+      env.exitcode(1)
+      None
     end
 
   fun _start(env: Env, config: _Config, layout: _DatabaseLayout,
@@ -206,7 +244,7 @@ actor Main
     let actor_count = layout.sizes.size()
     for index in Range(0, actor_count) do
       let worker = _Worker(db_auth, config, timers, env.err,
-        layout.pool_size(index) where csv = csv, worker_id = index)
+        layout.sessions(index) where csv = csv, worker_id = index)
       workers.push(worker)
       ifdef "conduit_diagnostic" then
         let reporter = _DiagReporter(env.out, timers, layout.pool_size(index),

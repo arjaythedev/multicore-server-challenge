@@ -4,9 +4,51 @@ use "net"
 use "time"
 use pg = "postgres"
 
+interface tag _PoolStateReceiver
+  be state(value: _PoolTestState)
+
+primitive \nodoc\ _PoolStatement
+  fun apply(name: String): _RequestStatement ? =>
+    match name
+    | "tags" => _Tags
+    | "register_user" => _RegisterUser
+    | "login_user" => _LoginUser
+    | "current_user" => _CurrentUser
+    | "update_user" => _UpdateUser
+    | "profile" => _Profile
+    | "follow_target" => _FollowTarget
+    | "follow_insert" => _FollowInsert
+    | "follow_delete" => _FollowDelete
+    | "article_page_all" => _ArticlePageAll
+    | "article_page_feed" => _ArticlePageFeed
+    | "article_page_tag" => _ArticlePageTag
+    | "article_page_author" => _ArticlePageAuthor
+    | "article_page_favorited" => _ArticlePageFavorited
+    | "article_full_by_slug" => _ArticleFullBySlug
+    | "article_full_by_id" => _ArticleFullById
+    | "article_insert" => _ArticleInsert
+    | "article_id_and_author_by_slug" => _ArticleIdAndAuthorBySlug
+    | "article_update_input" => _ArticleUpdateInput
+    | "article_update" => _ArticleUpdate
+    | "article_delete" => _ArticleDelete
+    | "article_id_by_slug" => _ArticleIdBySlug
+    | "favorite_insert" => _FavoriteInsert
+    | "favorite_delete" => _FavoriteDelete
+    | "comments_by_slug" => _CommentsBySlug
+    | "comment_input" => _CommentInput
+    | "comment_insert" => _CommentInsert
+    | "comment_owner" => _CommentOwner
+    | "comment_delete" => _CommentDelete
+    else error end
+
 class \nodoc\ val _PoolTestState
   let request: U64
+  let worker: USize
   let queued: Array[U64] val
+  let write_queued: Array[U64] val
+  let roles: Array[U64] val
+  let read_idle: Array[USize] val
+  let write_idle: Array[USize] val
   let active: Array[(USize, U64, U64)] val
   let idle: Array[USize] val
   let phases: Array[U64] val
@@ -19,9 +61,16 @@ class \nodoc\ val _PoolTestState
     active': Array[(USize, U64, U64)] val, idle': Array[USize] val,
     phases': Array[U64] val, generations': Array[U64] val,
     tokens': Array[(_RetryToken | None)] val, recipients': USize,
-    outstanding': USize)
+    outstanding': USize, worker': USize, write_queued': Array[U64] val,
+    roles': Array[U64] val, read_idle': Array[USize] val,
+    write_idle': Array[USize] val)
   =>
     request = request'
+    worker = worker'
+    write_queued = write_queued'
+    roles = roles'
+    read_idle = read_idle'
+    write_idle = write_idle'
     queued = queued'
     active = active'
     idle = idle'
@@ -30,6 +79,41 @@ class \nodoc\ val _PoolTestState
     tokens = tokens'
     recipients = recipients'
     outstanding = outstanding'
+
+  fun string(): String =>
+    let line = String
+      .>append("{\"event\":\"state\",\"request\":")
+      .>append(request.string())
+      .>append(",\"worker\":" + worker.string())
+      .>append(",\"queued\":" + _numbers[U64](queued))
+      .>append(",\"write_queued\":" + _numbers[U64](write_queued))
+      .>append(",\"roles\":" + _numbers[U64](roles))
+      .>append(",\"read_idle\":" + _numbers[USize](read_idle))
+      .>append(",\"write_idle\":" + _numbers[USize](write_idle))
+      .>append(",\"idle\":" + _numbers[USize](idle))
+      .>append(",\"phases\":" + _numbers[U64](phases))
+      .>append(",\"generations\":" + _numbers[U64](generations))
+      .>append(",\"active\":[")
+    var first = true
+    for (slot, id, outcome) in active.values() do
+      if not first then line.append(",") end
+      first = false
+      line.append("[" + slot.string() + "," + id.string() + "," +
+        outcome.string() + "]")
+    end
+    line.append("],\"recipients\":" + recipients.string() +
+      ",\"outstanding\":" + outstanding.string() + "}")
+    line.clone()
+
+  fun _numbers[A: Stringable #read](values: Array[A] val): String =>
+    let line = String.>append("[")
+    var first = true
+    for value in values.values() do
+      if not first then line.append(",") end
+      first = false
+      line.append(value.string())
+    end
+    line.>append("]").clone()
 
 class \nodoc\ iso _PoolInput is InputNotify
   let _owner: _PoolProbe
@@ -61,7 +145,7 @@ actor \nodoc\ _PoolClient is _QueryClient
   be fence(request: U64) =>
     _owner.fenced(request, _index, _callbacks)
 
-actor \nodoc\ _PoolProbe
+actor \nodoc\ _PoolProbe is _PoolStateReceiver
   let _env: Env
   let _worker: _Worker
   let _workers: Array[_Worker] val
@@ -78,14 +162,14 @@ actor \nodoc\ _PoolProbe
         EnvVars(env.vars)("CONDUIT_TEST_RETRY_NS")?.u64()?
       else 1_000_000_000 end
     let sink = if csv then _WorkerCSV(env.out) else None end
-    _worker = _Worker(auth, config, Timers, env.err, layout.pool_size(0),
+    _worker = _Worker(auth, config, Timers, env.err, layout.sessions(0),
       delay, sink)
     let workers = recover iso Array[_Worker] end
     workers.push(_worker)
     if listener then
       for index in Range(1, 4) do
         workers.push(_Worker(auth, config, Timers, env.err,
-          layout.pool_size(index), delay, sink, index))
+          layout.sessions(index), delay, sink, index))
       end
     end
     _workers = consume workers
@@ -112,6 +196,9 @@ actor \nodoc\ _PoolProbe
     try
       let words = line.split()
       match words(0)?
+      | "typed" =>
+        _worker.query(_clients(_number(words(2)?)?.usize())?,
+          _number(words(1)?)?, _PoolStatement(words(3)?)?, _P.none())
       | "tags" | "user" | "register" | "invalid" =>
         let kind = words(0)?
         let id = _number(words(1)?)?
@@ -131,14 +218,17 @@ actor \nodoc\ _PoolProbe
         let sql = if words(0)? == "begin" then "BEGIN"
           else "DEALLOCATE ALL" end
         _worker._test_query(_clients(_number(words(2)?)?.usize())?,
-          _number(words(1)?)?, pg.PreparedQuery(sql, _P.none()))
+          _number(words(1)?)?, pg.PreparedQuery(sql, _P.none()), _ReadClass)
       | "badbatch" =>
         _worker._test_bad_batch(_number(words(1)?)?.usize(),
           _clients(0)?, _number(words(2)?)?, this)
       | "cancel" =>
         _worker.cancel(_clients(_number(words(1)?)?.usize())?)
       | "state" =>
-        _worker._test_state(_number(words(1)?)?, this)
+        let worker = if words.size() > 2 then
+          _workers(_number(words(2)?)?.usize())?
+        else _worker end
+        worker._test_state(_number(words(1)?)?, this)
       | "fence" =>
         _worker._test_fence(_number(words(1)?)?, _clients)
       | "retire" =>
@@ -188,48 +278,7 @@ actor \nodoc\ _PoolProbe
 
   be state(value: _PoolTestState) =>
     _states(value.request) = value
-    let line = String
-    line.append("{\"event\":\"state\",\"request\":")
-    line.append(value.request.string())
-    line.append(",\"queued\":[")
-    var first = true
-    for id in value.queued.values() do
-      if not first then line.append(",") end
-      first = false
-      line.append(id.string())
-    end
-    line.append("],\"active\":[")
-    first = true
-    for (slot, id, outcome) in value.active.values() do
-      if not first then line.append(",") end
-      first = false
-      line.append("[" + slot.string() + "," + id.string() + "," +
-        outcome.string() + "]")
-    end
-    line.append("],\"idle\":[")
-    first = true
-    for index in value.idle.values() do
-      if not first then line.append(",") end
-      first = false
-      line.append(index.string())
-    end
-    line.append("],\"phases\":[")
-    first = true
-    for code in value.phases.values() do
-      if not first then line.append(",") end
-      first = false
-      line.append(code.string())
-    end
-    line.append("],\"generations\":[")
-    first = true
-    for generation in value.generations.values() do
-      if not first then line.append(",") end
-      first = false
-      line.append(generation.string())
-    end
-    line.append("],\"recipients\":" + value.recipients.string() +
-      ",\"outstanding\":" + value.outstanding.string() + "}")
-    _env.out.print(line.clone())
+    _env.out.print(value.string())
 
   be result(client: USize, id: U64, kind: String) =>
     _env.out.print("{\"event\":\"result\",\"client\":" + client.string() +
