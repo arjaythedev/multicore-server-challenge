@@ -8,6 +8,8 @@ First, I swapped the server implementation for microhttp. This seemed to give be
 locally. Second, I swapped the postgres JDBC client for the Vert.x Postgres client that the higher ranking Kotlin submission
 uses.
 
+Microhttp is designed to be used behind a proxy, so a front of nginx is appropriate.
+
 I hope to get close in performance to that Kotlin implementation. Just like with the JDK http server submission,
 the goal here is to demonstrate a good effort+mental overhead to performance ratio.
 
