@@ -65,6 +65,11 @@ every Bind asks for binary results. Startup packet `options`:
   segment are plain fields, not `ThreadLocal` lookups.
 - **Per request**, the Authorization header is verified in place in the input buffer (`Exchange.authBuf`: no
   String, no copy); the token String exists only for `/api/user`, which echoes it.
+- **JVM flags** (start.sh): `-XX:+UseTransparentHugePages -XX:+UseSystemMemoryBarrier -XX:-UsePerfData` on G1 with
+  a fixed, pre-touched 1 GB heap. In the lab at saturation (13000 users, think-scale 0.2; 5 runs without, 2 with)
+  they took the app from 50.3 to 48.0 us/req, total CPU from 138.7 to 134.5 us/req and req/s from 14266 to 14735.
+  ParallelGC failed p95 in one of two runs there (642 ms): its pauses.
+  GC itself is negligible (two ~10 ms young collections per 45 s at 8k req/s).
 
 ## Contracts (read the KDoc in these files; they are the source of truth)
 
