@@ -1,0 +1,13 @@
+.{
+    .name = .zig_zix_prothegee,
+    .version = "0.0.1",
+    .dependencies = .{
+        .zix = .{
+            .url = "git+https://codeberg.org/prothegee/zix?ref=main#fc1da77e2b7efac962f9910b318c01f24e169708",
+            .hash = "zix-0.6.0-rc0-C6KT3FXpiwDdNHR1mEMf1lfu7RZnjYx3uwOvQof9N3_V",
+        },
+    },
+    .minimum_zig_version = "0.17.0",
+    .paths = .{""},
+    .fingerprint = 0xd4a8beda7afb1be9,
+}
