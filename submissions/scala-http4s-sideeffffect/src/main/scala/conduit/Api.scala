@@ -2,7 +2,6 @@ package conduit
 
 import cats.effect.IO
 import cats.syntax.all.*
-import skunk.SqlState
 import io.circe.{Encoder, Json}
 import io.circe.syntax.*
 import org.bouncycastle.crypto.generators.OpenBSDBCrypt
@@ -10,6 +9,7 @@ import org.http4s.*
 import org.http4s.circe.CirceEntityEncoder.*
 import org.http4s.dsl.io.*
 import org.typelevel.ci.*
+import skunk.SqlState
 
 import java.security.SecureRandom
 import scala.concurrent.ExecutionContext

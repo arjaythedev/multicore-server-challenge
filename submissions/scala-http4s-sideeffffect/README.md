@@ -10,7 +10,7 @@ Front: direct
 | HTTP server | http4s 0.23.38, Ember backend (`http4s-ember-server`), routes in `http4s-dsl` |
 | Database access | skunk 2.0.0-RC3 (`skunk-core`, the Typelevel Postgres driver on fs2 sockets; no JDBC), otel4s 1.1.0 no-op providers |
 | JSON | circe 0.14.17 (derived encoders, jawn parser) |
-| bcrypt | `at.favre.lib:bcrypt` 0.10.2, cost 10 |
+| bcrypt | Bouncy Castle 1.86 (`bcprov-jdk18on`, `OpenBSDBCrypt`), cost 10, `$2a$` |
 | JWT | HS256 by hand with the JDK's `Mac` (about 40 lines, `Jwt.scala`) |
 | **Front** | **direct**: Ember serves `0.0.0.0:80` itself |
 
@@ -59,35 +59,72 @@ Optional knobs (env): `DB_READ_SESSIONS` (default 16), `DB_WRITE_SESSIONS` (defa
   24.04).
 - **A small read buffer (8 KB).** Requests are small. Ember's default is 256 KB per read, which multiplied over tens
   of thousands of open connections would use too much heap.
-- **skunk, sessions lent from a queue.** `Session.pooled` returns every session through its "full" recycler, which
-  runs `UNLISTEN *` and `RESET ALL`: two extra round trips and two extra statements for Postgres on every request.
-  `SessionPool` opens a fixed set of sessions at startup and lends them from a Cats Effect `Queue`. A returned
-  session only has to be healthy and outside a transaction (skunk tracks both without I/O); otherwise it is closed
-  and replaced.
-- **Separate read and write sessions** (16 + 4). A request that writes runs all its statements on a write session,
-  so a burst of reads can't queue the writes. 20 connections in total, well under the 95 limit.
-- **Autocommit for single statements.** Skunk runs each statement on its own unless asked for a transaction. Only
-  `POST /api/articles` (article + tags) runs in one (`session.transaction`), as the spec says.
-- **Prepared once per session.** Each query is a `val`; skunk parses and describes it the first time a session runs
-  it, caches that, and after that sends only Bind/Execute. That caches plans, not data (rule 5).
-- **Session settings** (rule 2 allows session-level ones), sent in the startup packet: `plan_cache_mode =
-  force_generic_plan` (one generic plan per prepared statement instead of five custom plans first), `jit = off`,
-  `max_parallel_workers_per_gather = 0` (these are short index lookups).
-- **Telemetry off.** Skunk instruments every statement through otel4s. The no-op tracer and meter providers, with
-  query capture and pool/protocol spans disabled, make that free.
-- **A bounded bcrypt pool.** bcrypt (about 60–70 ms of CPU at cost 10) runs on a fixed pool with half the cores,
+- **A bounded bcrypt pool.** bcrypt (about 55 ms of CPU at cost 10) runs on a fixed pool with half the cores,
   through `IO.evalOn`. A login burst cannot take every compute thread away from the other requests.
+- **Bouncy Castle's bcrypt** instead of at.favre's: faster in all of 6 alternating rounds (20 warm-up + 50 timed
+  verifies of the seed hash on one core, JDK 27): median 53.6 ms vs 56.8 ms per verify (5.0–7.6% per round), 53.5
+  vs 56.8 ms per hash. It verifies the seed's `$2a$10$` hashes, and a hash from either library verifies with the
+  other.
 - **JVM**: G1 with a fixed, pre-touched 4 GB heap (Postgres needs the rest of the 16 GB). Cats Effect fiber
   tracing is off (`cats.effect.tracing.mode=none`), because it records a frame for every `IO` step. The CPU
   starvation checker is off, because its warnings only add noise under load.
 - **No caches** (rule 5). Every token's signature and `exp` are checked on every request. Every login verifies
   bcrypt against the stored hash. Every response is read from Postgres.
 
+## Postgres access
+
+- **skunk, sessions lent from a queue.** `Session.pooled` returns every session through its "full" recycler, which
+  runs `UNLISTEN *` and `RESET ALL`: two extra round trips and two extra statements for Postgres on every request,
+  and the builder has no way to change it (skunk's `Pool` needs a `Telemetry`, which is `private[skunk]`).
+  `SessionPool` opens a fixed set of sessions at startup (`Session.Builder...single`) and lends them from a Cats
+  Effect `Queue`. A returned session only has to be healthy and outside a transaction (skunk tracks both without
+  I/O); otherwise it is closed and replaced.
+- **Separate read and write sessions** (16 + 4). A request that writes runs its statement on a write session, so a
+  burst of reads can't queue the writes. 20 connections in total, well under the 95 limit.
+- **Prepared once per session.** Each statement is a `val`; skunk parses and describes it the first time a session
+  runs it, caches that, and after that sends only Bind/Execute. That caches plans, not data (rule 5).
+- **Session settings** (rule 2 allows session-level ones), sent in the startup packet and checked with
+  `current_setting()`: `plan_cache_mode = force_generic_plan` (one generic plan per prepared statement instead of
+  five custom plans first), `jit = off`, `max_parallel_workers_per_gather = 0` (these are short index lookups).
+- **Telemetry off.** Skunk instruments every statement through otel4s. The no-op tracer and meter providers, with
+  query capture and pool/protocol spans disabled, make that free.
+- **One statement per request, in autocommit.** Every endpoint now runs exactly one statement (see below), so there
+  is no `BEGIN`/`COMMIT` anywhere. `POST /api/articles` stays atomic because it is one statement.
+
+## SQL
+
+Every statement in `Sql.scala` is a named `val` with a comment saying what it replaces. Each rewrite was checked to
+return the same rows as the reference SQL on the dev seed (including an offset past the end and an unknown tag), and
+timed there: the median `EXPLAIN (ANALYZE, TIMING OFF)` of the generic plan, old and new alternating in one
+session, 80 runs each, with the session settings above; or `pgbench` (1 client, prepared) per request where the
+point is fewer statements.
+
+| Rewrite | Replaces | Why | Measured |
+|---|---|---|---|
+| Page first (global and author lists) | `ARTICLE_LIST_SELECT ... ORDER_PAGE` | the reference decorates (tags, favorite count, following) every row that `OFFSET` skips too; cut the ids from `articles` alone, decorate only the page | page 1: 1.02x; page 5: 3.97x (global), 3.43x (author) |
+| Constant inner `LIMIT 100` in those | `LIMIT $2` | with a parameter the generic plan guesses a big page and picks a worse plan for the author list; `limit` is at most 100, so the rows are the same | author, limit 5: 1.02x vs 0.46x with `LIMIT $2` |
+| Page + capped count in one statement (all lists, feed) | the page, then the count | the count is the single outer row and the page joins it laterally, so an empty page still carries the count | Postgres: 0.99-1.02x (same work); one skunk exchange less for the app |
+| Comments with the slug lookup | article-id lookup, then comments | `LEFT JOIN LATERAL` from the article: no row is 404, one row without a comment is "no comments" | one statement instead of two |
+| Follow / unfollow + profile | user lookup, then insert/delete | data-modifying CTE | 1.12x |
+| Favorite / unfavorite + read-back | lookup, insert/delete, `ARTICLE_FULL_SELECT` | CTE; the main query can't see the CTE's own change, so the count adds `(SELECT count(*) FROM changed)` and `favorited` is known | 1.24x |
+| Create comment | article lookup, then insert | CTE | 1.21x |
+| Create article + tags + read-back | `BEGIN`, article, tags, article_tags, `COMMIT`, read-back | one statement (so atomic); tags inserted sorted, so concurrent creates lock shared tag rows in the same order; `ON CONFLICT DO UPDATE ... RETURNING` returns a tag committed after the snapshot, which `DO NOTHING` would drop | 1.58x |
+| Update / delete article, delete comment | owner lookup, then update/delete (+ read-back) | CTE that returns the owner: no row is 404, someone else's is 403 and nothing changed | delete: 1.09x |
+| Global count | `count(*) FROM (... LIMIT 1000)` | `EXISTS (... OFFSET 999)` is one index probe; count only when there are fewer than 1,000 | 1.08x |
+| Feed count | `author_id IN (SELECT followee_id ...)` | `= ANY(ARRAY(...))` reads the followees once | 1.11-1.16x |
+| Feed `following = true` | the `EXISTS` on `follows` | the feed picks articles through `follows` in the same statement (same snapshot), so it is always true | 1.01-1.05x |
+
+Measured and not adopted:
+
+| Idea | Measured | Why not |
+|---|---|---|
+| Tag names by primary key (`ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) ... ORDER BY 1)`) | 0.75-0.81x (slower), stable over three parameter sets | with 200 tags the hash join reads two pages per article; a primary-key lookup per tag reads more. Same order and collation (checked on all 10,000 dev articles) |
+| Page first for the tag, favorited and feed lists | 1.00-1.05x | the reference already cuts those ids first |
+
 ## Local numbers
 
-All 197 conformance steps pass. Load numbers for the skunk version are still to come; the doobie version held 8,000
-users locally (16-thread laptop shared with Postgres 18 in Docker and the load generator, dev seed,
-`-think-scale 0.2`): 10,458 req/s, p95 36 ms, p99 60 ms, 0 errors.
+All 197 conformance steps pass. Only a smoke run so far (2 cores shared by the server and the load generator,
+Postgres 18 in Docker, dev seed, `-think-scale 0.2`): 1,000 users, 1,330 req/s, p95 3.4 ms, p99 7.7 ms, 0 errors.
 
 ## License
 
