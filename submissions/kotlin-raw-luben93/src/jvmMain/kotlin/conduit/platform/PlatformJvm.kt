@@ -1,9 +1,12 @@
 package conduit.platform
 
-import java.io.InputStream
-import java.io.OutputStream
 import java.net.InetSocketAddress
-import java.net.Socket
+import java.net.SocketTimeoutException
+import java.net.StandardSocketOptions
+import java.nio.ByteBuffer
+import java.nio.channels.SelectionKey
+import java.nio.channels.Selector
+import java.nio.channels.SocketChannel
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.concurrent.locks.LockSupport
@@ -59,24 +62,67 @@ actual class Monitor actual constructor() {
     actual fun signalAll() = cond.signalAll()
 }
 
-actual class BlockingSocket private constructor(private val s: Socket) {
-    private val input: InputStream = s.getInputStream()
-    private val output: OutputStream = s.getOutputStream()
+/**
+ * A truly blocking socket channel. (java.net.Socket after a timed connect stays in non-blocking mode for good, so
+ * every read that has to wait costs read -> EAGAIN, poll, read: three syscalls per Postgres round trip instead of
+ * one.) The channel connects with a timeout through a selector, then switches to blocking mode. I/O goes through
+ * one direct buffer per direction (reads: the connection's worker thread; writes: serialized by PgConn).
+ */
+actual class BlockingSocket private constructor(private val ch: SocketChannel) {
+    private val rb: ByteBuffer = ByteBuffer.allocateDirect(IO_CHUNK)
+    private val wb: ByteBuffer = ByteBuffer.allocateDirect(IO_CHUNK)
 
-    actual fun read(b: ByteArray, off: Int, len: Int): Int = input.read(b, off, len)
+    actual fun read(b: ByteArray, off: Int, len: Int): Int {
+        val bb = rb
+        bb.clear()
+        if (len < IO_CHUNK) bb.limit(len)
+        val n = ch.read(bb) // blocks until at least one byte (or EOF: -1)
+        if (n > 0) {
+            bb.flip()
+            bb.get(b, off, n)
+        }
+        return n
+    }
 
-    actual fun writeFully(b: ByteArray, off: Int, len: Int) = output.write(b, off, len)
+    actual fun writeFully(b: ByteArray, off: Int, len: Int) {
+        val bb = wb
+        var p = off
+        val end = off + len
+        while (p < end) {
+            val n = minOf(end - p, IO_CHUNK)
+            bb.clear()
+            bb.put(b, p, n)
+            bb.flip()
+            while (bb.hasRemaining()) ch.write(bb)
+            p += n
+        }
+    }
 
-    actual fun close() = s.close()
+    actual fun close() = ch.close()
 
     actual companion object {
+        private const val IO_CHUNK = 64 * 1024
+
         actual fun connect(host: String, port: Int): BlockingSocket {
-            val s = Socket()
-            s.tcpNoDelay = true
-            s.receiveBufferSize = 1 shl 20
-            s.sendBufferSize = 1 shl 20
-            s.connect(InetSocketAddress(host, port), 10_000)
-            return BlockingSocket(s)
+            val ch = SocketChannel.open()
+            try {
+                ch.setOption(StandardSocketOptions.TCP_NODELAY, true)
+                ch.setOption(StandardSocketOptions.SO_RCVBUF, 1 shl 20)
+                ch.setOption(StandardSocketOptions.SO_SNDBUF, 1 shl 20)
+                ch.configureBlocking(false)
+                if (!ch.connect(InetSocketAddress(host, port))) {
+                    Selector.open().use { sel ->
+                        ch.register(sel, SelectionKey.OP_CONNECT)
+                        if (sel.select(10_000L) == 0) throw SocketTimeoutException("connect to $host:$port timed out")
+                    }
+                    if (!ch.finishConnect()) throw SocketTimeoutException("connect to $host:$port timed out")
+                }
+                ch.configureBlocking(true) // (the selector is closed, so the channel is deregistered)
+                return BlockingSocket(ch)
+            } catch (e: Throwable) {
+                ch.close()
+                throw e
+            }
         }
     }
 }
