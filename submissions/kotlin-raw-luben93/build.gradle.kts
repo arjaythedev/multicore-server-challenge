@@ -6,7 +6,11 @@ plugins {
 
 kotlin {
     jvm {
-        compilerOptions { jvmTarget.set(JvmTarget.JVM_25) }
+        compilerOptions {
+            jvmTarget.set(JvmTarget.JVM_25)
+            // no Intrinsics.checkNotNull* calls on every parameter, call result and receiver (all Kotlin callers)
+            freeCompilerArgs.addAll("-Xno-param-assertions", "-Xno-call-assertions", "-Xno-receiver-assertions")
+        }
     }
     linuxX64 {
         // src/nativeInterop/cinterop/bcrypt.def: the C bcrypt kernel (native/), compiled in by Kotlin/Native's clang

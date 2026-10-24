@@ -69,7 +69,8 @@ internal class Ex(@JvmField val engine: EngineCore, @JvmField val cs: ConnState)
     override var method: Method = Method.OTHER
     override var path: String = ""
     override var query: String? = null
-    override var authorization: String? = null
+    override val authorization: String?
+        get() = authBuf?.decodeToString(authOff, authOff + authLen)
     override var body: ByteArray = EMPTY
 
     /** [KEEP], [CLOSE] or [KEEP_10]. */
@@ -81,7 +82,11 @@ internal class Ex(@JvmField val engine: EngineCore, @JvmField val cs: ConnState)
 
     @JvmField var res: Out? = null
     private var jsonReady = false
-    private val answered = AtomicInt(0)
+    /**
+     * The handler and this completion run as one coroutine (sequentially, handed between threads through the db and
+     * bcrypt queues, which publish), so a plain field suffices: no atomic object per request.
+     */
+    private var answered = false
 
     override val out: ByteBuf
         get() = (res ?: error("exchange already answered")).buf
@@ -118,7 +123,8 @@ internal class Ex(@JvmField val engine: EngineCore, @JvmField val cs: ConnState)
 
     /** First answer wins; later ones (and answers after the engine's 500) are ignored. */
     private fun claim(): Out? {
-        if (!answered.compareAndSet(0, 1)) return null
+        if (answered) return null
+        answered = true
         val o = res
         res = null
         return o
@@ -135,7 +141,7 @@ internal class Ex(@JvmField val engine: EngineCore, @JvmField val cs: ConnState)
     override fun resumeWith(result: Result<Unit>) {
         val e = result.exceptionOrNull()
         if (e != null) logHandlerError(e)
-        if (answered.load() == 0) sendError(500, "internal server error")
+        if (!answered) sendError(500, "internal server error")
     }
 }
 

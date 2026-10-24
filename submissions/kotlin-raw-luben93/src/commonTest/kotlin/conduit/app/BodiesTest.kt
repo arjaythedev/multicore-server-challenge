@@ -1,6 +1,11 @@
 package conduit.app
 
+import conduit.auth.Jwt
+import conduit.http.Exchange
+import conduit.http.Method
 import conduit.json.JsonValue
+import conduit.json.JsonWriter
+import conduit.util.ByteBuf
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
@@ -136,10 +141,37 @@ class BodiesTest {
 
     @Test
     fun authHeader() {
-        assertEquals("abc.def.ghi", Auth.tokenOf("Token abc.def.ghi"))
-        assertNull(Auth.tokenOf("Bearer abc.def.ghi"))
-        assertNull(Auth.tokenOf("token abc"))
-        assertNull(Auth.tokenOf("abc.def.ghi"))
-        assertEquals("", Auth.tokenOf("Token "))
+        Jwt.init("multicore-server-challenge")
+        val t = Jwt.sign(42, nowSec())
+        // raw header bytes (as the engine passes them, here at an offset) and the String-only fallback
+        fun bytes(h: String, keep: Boolean = true): Pair<Int, AuthEx> {
+            val ex = AuthEx(null)
+            val b = "xx$h".encodeToByteArray()
+            ex.authBuf = b; ex.authOff = 2; ex.authLen = b.size - 2
+            return Auth.check(ex, keep) to ex
+        }
+        fun string(h: String?): Int = Auth.check(AuthEx(h), true)
+        val (ok, ex) = bytes("Token $t")
+        assertEquals(Auth.VALID, ok); assertEquals(42, ex.viewer); assertEquals(t, ex.token)
+        assertNull(bytes("Token $t", keep = false).second.token)
+        assertEquals(Auth.VALID, string("Token $t"))
+        assertEquals(Auth.NONE, string(null)); assertEquals(Auth.NONE, string("")); assertEquals(Auth.NONE, bytes("").first)
+        for (bad in listOf("Bearer $t", "token $t", t, "Token", "Token ", "Token ${t}x", "Token  $t")) {
+            assertEquals(Auth.INVALID, bytes(bad).first, bad)
+            assertEquals(Auth.INVALID, string(bad), bad)
+        }
     }
+}
+
+/** Just enough of an Exchange for [Auth.check]. */
+private class AuthEx(override val authorization: String?) : Exchange() {
+    override val method = Method.GET
+    override val path = "/"
+    override val query: String? = null
+    override val body = ByteArray(0)
+    override val out = ByteBuf(16)
+    override val json = JsonWriter(out)
+    override fun send(status: Int) {}
+    override fun sendEmpty(status: Int) {}
+    override fun sendError(status: Int, message: String) {}
 }

@@ -168,7 +168,9 @@ private class EpollLoop(val index: Int, val listenFd: Int, val engine: HttpEngin
                 val flags = ev.events
                 when (fd) {
                     listenFd -> acceptAll()
-                    wakeFd -> recv(wakeFd, wakeBuf.addressOf(0), 8u, 0)
+                    // read(), not recv(): an eventfd is not a socket (recv fails with ENOTSOCK, the counter
+                    // stays set and every epoll_wait returns at once: the loop would spin)
+                    wakeFd -> platform.posix.read(wakeFd, wakeBuf.addressOf(0), 8u)
                     else -> {
                         val c = if (fd < conns.size) conns[fd] else null
                         if (c != null) {

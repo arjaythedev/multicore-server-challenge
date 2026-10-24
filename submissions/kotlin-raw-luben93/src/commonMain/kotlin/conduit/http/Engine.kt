@@ -144,7 +144,7 @@ internal class EngineCore(private val handler: suspend (Exchange) -> Unit) {
             if (ex.chunked) {
                 val r = scanChunked(cs, b, pos, end)
                 when (r) {
-                    NEED -> return waitBody(cs, ex, pos)
+                    NEED -> return waitBody(cs, ex, b, pos)
                     BAD -> return reject(cs, 400, "malformed chunked body", end)
                     TOO_BIG -> return reject(cs, 413, "request body too large", end)
                 }
@@ -154,7 +154,7 @@ internal class EngineCore(private val handler: suspend (Exchange) -> Unit) {
                 pos = r
             } else {
                 val n = ex.bodyLen
-                if (end - pos < n) return waitBody(cs, ex, pos)
+                if (end - pos < n) return waitBody(cs, ex, b, pos)
                 ex.body = b.copyOfRange(pos, pos + n)
                 pos += n
             }
@@ -163,7 +163,13 @@ internal class EngineCore(private val handler: suspend (Exchange) -> Unit) {
         }
     }
 
-    private fun waitBody(cs: ConnState, ex: Ex, pos: Int): Int {
+    private fun waitBody(cs: ConnState, ex: Ex, b: ByteArray, pos: Int): Int {
+        // the head's bytes are not kept with the body: the Authorization value must not point into them
+        val a = ex.authBuf
+        if (a === b) {
+            ex.authBuf = b.copyOfRange(ex.authOff, ex.authOff + ex.authLen)
+            ex.authOff = 0
+        }
         if (ex.expect) { // the client waits for this before it sends the body
             ex.expect = false
             if (cs.conn.tryWrite(CONTINUE_100, 0, CONTINUE_100.size) != CONTINUE_100.size) {
