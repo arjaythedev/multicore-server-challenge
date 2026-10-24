@@ -1,10 +1,14 @@
-//// Routing, validation and the per-endpoint flows. `handle` returns the status and the response body.
+//// Routing, validation and the per-endpoint flows. `handle` returns what the connection process should do next:
+//// write a response, or nothing because the Postgres connection process that ran the query has already rendered
+//// and written it (`conn.Render`). The hot endpoints all take that second path; the handler only parses,
+//// authenticates, validates and chooses the statement, and the rows never reach this process.
 
 import conduit/bcrypt
 import conduit/jsonw
 import conduit/jwt
-import conduit/pg/conn.{type PgError, type Request, Exec, PgError}
+import conduit/pg/conn.{type PgError, type Request, Exec, PgError, Render}
 import conduit/pg/proto.{type Param, type Row}
+import conduit/response.{type Response, type Socket}
 import conduit/sql
 import conduit/util
 import gleam/bit_array
@@ -20,8 +24,19 @@ pub type Ctx {
   Ctx(secret: BitArray, hibernate_words: Int)
 }
 
-pub type Response =
-  #(Int, StringTree)
+/// What the connection process does after `handle`.
+pub type Outcome {
+  /// Write this response.
+  Reply(response: Response)
+  /// Write these already framed bytes (a Postgres connection process rendered them but found the socket busy).
+  Prepared(data: StringTree)
+  /// Nothing: a Postgres connection process wrote the response.
+  Done
+  /// The client socket failed while the response was being written: close it.
+  Broken
+  /// Write this and close: a late result for this request must not reach the client.
+  ReplyAndClose(response: Response)
+}
 
 @external(erlang, "conduit_ffi", "pick_read")
 fn pick_read() -> Subject(Request)
@@ -48,23 +63,28 @@ fn split_segments(path: String) -> List(String)
 fn split_target(target: String) -> #(String, String)
 
 type Req {
-  Req(ctx: Ctx, query: String, auth: String, body: BitArray, now: Int)
+  Req(ctx: Ctx, sock: Socket, query: String, auth: String, body: BitArray, now: Int)
 }
 
-pub fn handle(ctx: Ctx, method: String, target: String, auth: String, body: BitArray) -> Response {
+pub fn handle(ctx: Ctx, sock: Socket, method: String, target: String, auth: String, body: BitArray) -> Outcome {
   let #(path, query) = split_target(target)
-  let r = Req(ctx, query, auth, body, now())
+  let r = Req(ctx, sock, query, auth, body, now())
   let outcome = case split_segments(path) {
     ["", "api", ..rest] -> route(method, rest, r)
     _ -> Error(fail(404, "not found"))
   }
   case outcome {
-    Ok(resp) | Error(resp) -> resp
+    Ok(outcome) -> outcome
+    Error(resp) -> Reply(resp)
   }
 }
 
 fn fail(status: Int, msg: String) -> Response {
   #(status, jsonw.error(msg))
+}
+
+fn reply(status: Int, body: StringTree) -> Result(Outcome, Response) {
+  Ok(Reply(#(status, body)))
 }
 
 fn pg_error(e: PgError) -> Response {
@@ -82,9 +102,10 @@ fn pg_error(e: PgError) -> Response {
 
 // ---------------------------------------------------------------- database
 
+/// Runs statements and gets the rows back here (the flows that need them for a follow-up).
 fn exec(pool: Subject(Request), statements: List(#(Int, List(Param)))) -> Result(List(List(Row)), Response) {
   let reply = process.new_subject()
-  process.send(pool, Exec(statements, reply, monotonic_ms() + db_timeout_ms))
+  process.send(pool, Exec(monotonic_ms() + db_timeout_ms, statements, reply))
   case process.receive(reply, db_timeout_ms) {
     Ok(Ok(results)) -> Ok(results)
     Ok(Error(e)) -> Error(pg_error(e))
@@ -108,11 +129,42 @@ fn write(statement: Int, params: List(Param)) -> Result(List(Row), Response) {
   }
 }
 
+/// Runs one statement on a read connection, which renders the rows with `render` and writes the response.
+fn read_then(r: Req, statement: Int, params: List(Param), render: fn(List(Row)) -> Response) -> Result(Outcome, Response) {
+  defer(r, pick_read(), statement, params, render)
+}
+
+fn write_then(r: Req, statement: Int, params: List(Param), render: fn(List(Row)) -> Response) -> Result(Outcome, Response) {
+  defer(r, pick_write(), statement, params, render)
+}
+
+fn defer(r: Req, pool: Subject(Request), statement: Int, params: List(Param), render: fn(List(Row)) -> Response) -> Result(Outcome, Response) {
+  let notify = process.new_subject()
+  let deadline = monotonic_ms() + db_timeout_ms
+  let render_results = fn(results: List(List(Row))) -> Response {
+    case results {
+      [rows] -> render(rows)
+      _ -> fail(500, "database error")
+    }
+  }
+  process.send(pool, Render(deadline, [#(statement, params)], render_results, r.sock, notify))
+  // The connection process never writes past the deadline, so once this wait is over nothing can trail it.
+  case process.receive(notify, db_timeout_ms + 1000) {
+    Ok(conn.Written) -> Ok(Done)
+    Ok(conn.Busy(data)) -> Ok(Prepared(data))
+    Ok(conn.Gone) -> Ok(Broken)
+    Ok(conn.Crashed) -> Error(fail(500, "internal error"))
+    Ok(conn.Expired) -> Error(fail(503, "database timeout"))
+    Ok(conn.Failed(e)) -> Error(pg_error(e))
+    Error(_) -> Ok(ReplyAndClose(fail(503, "database timeout")))
+  }
+}
+
 // ---------------------------------------------------------------- routes
 
-fn route(method: String, segments: List(String), r: Req) -> Result(Response, Response) {
+fn route(method: String, segments: List(String), r: Req) -> Result(Outcome, Response) {
   case method, segments {
-    "GET", ["tags"] -> tags()
+    "GET", ["tags"] -> tags(r)
     "POST", ["users"] -> register(r)
     "POST", ["users", "login"] -> login(r)
     "GET", ["user"] -> current_user(r)
@@ -135,17 +187,17 @@ fn route(method: String, segments: List(String), r: Req) -> Result(Response, Res
   }
 }
 
-fn tags() -> Result(Response, Response) {
-  use rows <- result.try(read(sql.tags, []))
+fn tags(r: Req) -> Result(Outcome, Response) {
+  use rows <- read_then(r, sql.tags, [])
   case rows {
     [[names]] ->
-      Ok(#(
+      #(
         200,
         string_tree.from_string("{\"tags\":")
           |> string_tree.append_tree(jsonw.str_array(proto.col_text_array(names)))
           |> string_tree.append("}"),
-      ))
-    _ -> Error(fail(500, "database error"))
+      )
+    _ -> fail(500, "database error")
   }
 }
 
@@ -155,7 +207,7 @@ type Credentials {
   Credentials(username: Option(String), email: String, password: String)
 }
 
-fn register(r: Req) -> Result(Response, Response) {
+fn register(r: Req) -> Result(Outcome, Response) {
   let decoder = {
     use username <- decode.field("username", decode.string)
     use email <- decode.field("email", decode.string)
@@ -177,15 +229,15 @@ fn register(r: Req) -> Result(Response, Response) {
   ]))
   case rows {
     [[id, username, email, bio, image]] ->
-      Ok(#(
+      reply(
         201,
         user_json(proto.col_text(email), jwt.issue(r.ctx.secret, proto.col_int(id), r.now), proto.col_text(username), bio, image),
-      ))
+      )
     _ -> Error(fail(500, "database error"))
   }
 }
 
-fn login(r: Req) -> Result(Response, Response) {
+fn login(r: Req) -> Result(Outcome, Response) {
   let decoder = {
     use email <- decode.field("email", decode.string)
     use password <- decode.field("password", decode.string)
@@ -200,23 +252,23 @@ fn login(r: Req) -> Result(Response, Response) {
     [[id, username, email, bio, image, hash]] ->
       case bcrypt.verify(util.to_bits(password), proto.col_text(hash)) {
         True ->
-          Ok(#(
+          reply(
             200,
             user_json(proto.col_text(email), jwt.issue(r.ctx.secret, proto.col_int(id), r.now), proto.col_text(username), bio, image),
-          ))
+          )
         False -> Error(fail(401, "invalid email or password"))
       }
     _ -> Error(fail(401, "invalid email or password"))
   }
 }
 
-fn current_user(r: Req) -> Result(Response, Response) {
+fn current_user(r: Req) -> Result(Outcome, Response) {
   use #(viewer, token) <- result.try(required(r))
-  use rows <- result.try(read(sql.user_by_id, [proto.int_param(viewer)]))
+  use rows <- read_then(r, sql.user_by_id, [proto.int_param(viewer)])
   case rows {
     [[_id, username, email, bio, image]] ->
-      Ok(#(200, user_json(proto.col_text(email), token, proto.col_text(username), bio, image)))
-    _ -> Error(fail(401, "unauthorized"))
+      #(200, user_json(proto.col_text(email), token, proto.col_text(username), bio, image))
+    _ -> fail(401, "unauthorized")
   }
 }
 
@@ -230,7 +282,7 @@ type UserUpdate {
   )
 }
 
-fn update_user(r: Req) -> Result(Response, Response) {
+fn update_user(r: Req) -> Result(Outcome, Response) {
   use #(viewer, token) <- result.try(required(r))
   let decoder = {
     use email <- opt_field("email")
@@ -265,41 +317,41 @@ fn update_user(r: Req) -> Result(Response, Response) {
   ]))
   case rows {
     [[_id, username, email, bio, image]] ->
-      Ok(#(200, user_json(proto.col_text(email), token, proto.col_text(username), bio, image)))
+      reply(200, user_json(proto.col_text(email), token, proto.col_text(username), bio, image))
     _ -> Error(fail(401, "unauthorized"))
   }
 }
 
 // ---------------------------------------------------------------- profiles
 
-fn get_profile(r: Req, u: String) -> Result(Response, Response) {
+fn get_profile(r: Req, u: String) -> Result(Outcome, Response) {
   use u <- result.try(segment(u, "not found"))
   use viewer <- result.try(optional(r))
-  use rows <- result.try(read(sql.profile, [proto.int_param(viewer), proto.text_param(u)]))
+  use rows <- read_then(r, sql.profile, [proto.int_param(viewer), proto.text_param(u)])
   case rows {
     [[_id, username, bio, image, following]] ->
-      Ok(#(200, wrap("profile", profile(proto.col_text(username), bio, image, proto.col_bool(following)))))
-    _ -> Error(fail(404, "profile not found"))
+      #(200, wrap("profile", profile(proto.col_text(username), bio, image, proto.col_bool(following))))
+    _ -> fail(404, "profile not found")
   }
 }
 
-fn follow(r: Req, u: String, following: Bool) -> Result(Response, Response) {
+fn follow(r: Req, u: String, following: Bool) -> Result(Outcome, Response) {
   use #(viewer, _) <- result.try(required(r))
   use u <- result.try(segment(u, "not found"))
   let statement = case following {
     True -> sql.follow
     False -> sql.unfollow
   }
-  use rows <- result.try(write(statement, [proto.int_param(viewer), proto.text_param(u)]))
+  use rows <- write_then(r, statement, [proto.int_param(viewer), proto.text_param(u)])
   case rows {
-    [[username, bio, image]] -> Ok(#(200, wrap("profile", profile(proto.col_text(username), bio, image, following))))
-    _ -> Error(fail(404, "profile not found"))
+    [[username, bio, image]] -> #(200, wrap("profile", profile(proto.col_text(username), bio, image, following)))
+    _ -> fail(404, "profile not found")
   }
 }
 
 // ---------------------------------------------------------------- articles
 
-fn list_articles(r: Req) -> Result(Response, Response) {
+fn list_articles(r: Req) -> Result(Outcome, Response) {
   use viewer <- result.try(optional(r))
   let q = util.parse_query(r.query)
   use #(limit, offset) <- result.try(page(q))
@@ -310,8 +362,7 @@ fn list_articles(r: Req) -> Result(Response, Response) {
     None, None, Some(f) -> #(sql.list_favorited, list.append(base, [proto.text_param(filter_value(f))]))
     None, None, None -> #(sql.list_all, base)
   }
-  use rows <- result.try(read(statement, params))
-  Ok(article_list(rows))
+  read_then(r, statement, params, article_list)
 }
 
 // Postgres text can't hold NUL, so a filter containing one can't match a tag or user; U+FFFD matches nothing either.
@@ -322,20 +373,19 @@ fn filter_value(v: String) -> String {
   }
 }
 
-fn feed(r: Req) -> Result(Response, Response) {
+fn feed(r: Req) -> Result(Outcome, Response) {
   use #(viewer, _) <- result.try(required(r))
   use #(limit, offset) <- result.try(page(util.parse_query(r.query)))
   let window = case offset > util.max_i64 - limit {
     True -> util.max_i64
     False -> limit + offset
   }
-  use rows <- result.try(read(sql.feed, [
-    proto.int_param(viewer),
-    proto.int_param(limit),
-    proto.int_param(offset),
-    proto.int_param(window),
-  ]))
-  Ok(article_list(rows))
+  read_then(
+    r,
+    sql.feed,
+    [proto.int_param(viewer), proto.int_param(limit), proto.int_param(offset), proto.int_param(window)],
+    article_list,
+  )
 }
 
 fn page(q: util.Query) -> Result(#(Int, Int), Response) {
@@ -368,13 +418,13 @@ fn article_list(rows: List(Row)) -> Response {
   )
 }
 
-fn get_article(r: Req, slug: String) -> Result(Response, Response) {
+fn get_article(r: Req, slug: String) -> Result(Outcome, Response) {
   use slug <- result.try(segment(slug, "not found"))
   use viewer <- result.try(optional(r))
-  use rows <- result.try(read(sql.article_by_slug, [proto.int_param(viewer), proto.text_param(slug)]))
+  use rows <- read_then(r, sql.article_by_slug, [proto.int_param(viewer), proto.text_param(slug)])
   case rows {
-    [row] -> Ok(#(200, wrap("article", full_article(row))))
-    _ -> Error(fail(404, "article not found"))
+    [row] -> #(200, wrap("article", full_article(row)))
+    _ -> fail(404, "article not found")
   }
 }
 
@@ -382,7 +432,7 @@ type NewArticle {
   NewArticle(title: String, description: String, body: String, tags: Option(List(String)))
 }
 
-fn create_article(r: Req) -> Result(Response, Response) {
+fn create_article(r: Req) -> Result(Outcome, Response) {
   use #(viewer, _) <- result.try(required(r))
   let decoder = {
     use title <- decode.field("title", decode.string)
@@ -398,7 +448,7 @@ fn create_article(r: Req) -> Result(Response, Response) {
   use text <- result.try(nonempty(a.body, msg))
   use tags <- result.try(tag_list(a.tags))
   use row <- result.try(create_article_rows(viewer, title, description, text, tags, 0))
-  Ok(#(201, wrap("article", full_article(row))))
+  reply(201, wrap("article", full_article(row)))
 }
 
 // With tags the insert is two statements in one Sync group (one transaction); a deadlock or serialization
@@ -420,9 +470,9 @@ fn create_article_rows(
       process.send(
         pick_write(),
         Exec(
+          monotonic_ms() + db_timeout_ms,
           [#(sql.tags_upsert, [tag_param]), #(sql.article_create_tagged, list.append(article, [tag_param]))],
           reply,
-          monotonic_ms() + db_timeout_ms,
         ),
       )
       case process.receive(reply, db_timeout_ms) {
@@ -463,7 +513,7 @@ type ArticleUpdate {
   ArticleUpdate(title: Option(String), description: Option(String), body: Option(String))
 }
 
-fn update_article(r: Req, slug: String) -> Result(Response, Response) {
+fn update_article(r: Req, slug: String) -> Result(Outcome, Response) {
   use #(viewer, _) <- result.try(required(r))
   let decoder = {
     use title <- opt_field("title")
@@ -485,23 +535,23 @@ fn update_article(r: Req, slug: String) -> Result(Response, Response) {
     proto.opt_text_param(text),
   ]))
   case rows {
-    [row] -> Ok(#(200, wrap("article", full_article(row))))
+    [row] -> reply(200, wrap("article", full_article(row)))
     _ -> probe(sql.article_probe, [proto.text_param(slug)], viewer)
   }
 }
 
-fn delete_article(r: Req, slug: String) -> Result(Response, Response) {
+fn delete_article(r: Req, slug: String) -> Result(Outcome, Response) {
   use #(viewer, _) <- result.try(required(r))
   use slug <- result.try(segment(slug, "not found"))
   use rows <- result.try(write(sql.article_delete, [proto.int_param(viewer), proto.text_param(slug)]))
   case rows {
     [] -> probe(sql.article_probe, [proto.text_param(slug)], viewer)
-    _ -> Ok(#(204, string_tree.new()))
+    _ -> reply(204, string_tree.new())
   }
 }
 
 // After a 0-row ownership-checked write: either it doesn't exist (404) or it isn't the viewer's (403).
-fn probe(statement: Int, params: List(Param), viewer: Int) -> Result(Response, Response) {
+fn probe(statement: Int, params: List(Param), viewer: Int) -> Result(Outcome, Response) {
   use rows <- result.try(read(statement, params))
   case rows {
     [[author]] ->
@@ -515,28 +565,28 @@ fn probe(statement: Int, params: List(Param), viewer: Int) -> Result(Response, R
 
 // ---------------------------------------------------------------- favorites
 
-fn favorite(r: Req, slug: String, favorited: Bool) -> Result(Response, Response) {
+fn favorite(r: Req, slug: String, favorited: Bool) -> Result(Outcome, Response) {
   use #(viewer, _) <- result.try(required(r))
   use slug <- result.try(segment(slug, "not found"))
   let statement = case favorited {
     True -> sql.favorite
     False -> sql.unfavorite
   }
-  use rows <- result.try(write(statement, [proto.int_param(viewer), proto.text_param(slug)]))
+  use rows <- write_then(r, statement, [proto.int_param(viewer), proto.text_param(slug)])
   case rows {
-    [row] -> Ok(#(200, wrap("article", full_article(row))))
-    _ -> Error(fail(404, "article not found"))
+    [row] -> #(200, wrap("article", full_article(row)))
+    _ -> fail(404, "article not found")
   }
 }
 
 // ---------------------------------------------------------------- comments
 
-fn list_comments(r: Req, slug: String) -> Result(Response, Response) {
+fn list_comments(r: Req, slug: String) -> Result(Outcome, Response) {
   use slug <- result.try(segment(slug, "not found"))
   use viewer <- result.try(optional(r))
-  use rows <- result.try(read(sql.comments, [proto.int_param(viewer), proto.text_param(slug)]))
+  use rows <- read_then(r, sql.comments, [proto.int_param(viewer), proto.text_param(slug)])
   case rows {
-    [] -> Error(fail(404, "article not found"))
+    [] -> fail(404, "article not found")
     _ -> {
       let items =
         list.filter_map(rows, fn(row) {
@@ -547,17 +597,17 @@ fn list_comments(r: Req, slug: String) -> Result(Response, Response) {
             _ -> Error(Nil)
           }
         })
-      Ok(#(
+      #(
         200,
         string_tree.from_string("{\"comments\":[")
           |> string_tree.append_tree(string_tree.join(items, ","))
           |> string_tree.append("]}"),
-      ))
+      )
     }
   }
 }
 
-fn create_comment(r: Req, slug: String) -> Result(Response, Response) {
+fn create_comment(r: Req, slug: String) -> Result(Outcome, Response) {
   use #(viewer, _) <- result.try(required(r))
   // Body before article: an invalid body on an unknown article is 422.
   let decoder = {
@@ -567,19 +617,19 @@ fn create_comment(r: Req, slug: String) -> Result(Response, Response) {
   use text <- result.try(body(r, "comment", decoder, "body is required"))
   use text <- result.try(nonempty(text, "body is required"))
   use slug <- result.try(segment(slug, "article not found"))
-  use rows <- result.try(write(sql.comment_create, [
+  use rows <- write_then(r, sql.comment_create, [
     proto.int_param(viewer),
     proto.text_param(slug),
     proto.text_param(text),
-  ]))
+  ])
   case rows {
     [[id, body, created, updated, username, bio, image]] ->
-      Ok(#(201, wrap("comment", comment(id, body, created, updated, username, bio, image, False))))
-    _ -> Error(fail(404, "article not found"))
+      #(201, wrap("comment", comment(id, body, created, updated, username, bio, image, False)))
+    _ -> fail(404, "article not found")
   }
 }
 
-fn delete_comment(r: Req, slug: String, id: String) -> Result(Response, Response) {
+fn delete_comment(r: Req, slug: String, id: String) -> Result(Outcome, Response) {
   use #(viewer, _) <- result.try(required(r))
   case util.parse_digits(id), util.decode_segment(slug) {
     Ok(id), Ok(slug) -> {
@@ -590,7 +640,7 @@ fn delete_comment(r: Req, slug: String, id: String) -> Result(Response, Response
       ]))
       case rows {
         [] -> probe(sql.comment_probe, [proto.int_param(id), proto.text_param(slug)], viewer)
-        _ -> Ok(#(204, string_tree.new()))
+        _ -> reply(204, string_tree.new())
       }
     }
     _, _ -> Error(fail(404, "comment not found"))

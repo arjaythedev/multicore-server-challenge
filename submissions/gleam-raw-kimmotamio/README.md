@@ -26,10 +26,18 @@ one BEAM process per Postgres connection.
 - **Front: direct.** Nginx would cost ~11% of the box and gzip nearly every response.
 - **HTTP** (`src/conduit/http.gleam`): `gen_tcp` in active mode. 16 acceptor processes block in `accept`; the one
   that gets a connection spawns its replacement and *becomes* the connection process, so there is no socket
-  hand-off. Requests are parsed with `erlang:decode_packet` (a C BIF), the handler runs inline, the response is
-  written as one iodata with its `Content-Length`. Pipelined requests are served from the same buffer. Between
-  requests a connection process hibernates when its heap has grown past `HIB_WORDS` (2048 words), so an idle
-  keep-alive connection costs about 20 KB; connections are never closed by the server (keep-alive forever).
+  hand-off. Requests are parsed with `erlang:decode_packet` (a C BIF) and the handler runs inline: it parses,
+  authenticates, validates, picks the statement and hands the Postgres connection process the parameters, the
+  client socket and a rendering function (`conn.Render`). That process decodes the rows, renders the JSON and
+  writes the response, framed with its `Content-Length`, straight to the client socket, then tells the
+  connection process it is done. So the rows and the JSON never cross a process boundary, the connection
+  process's heap holds only the request, and the Postgres side's long-lived heaps absorb the garbage with cheap
+  generational collections. The connection process writes a response itself when no query was needed (errors,
+  bad tokens), for the few flows that need the rows for a follow-up statement (login, ownership probes, article
+  creation), and when the Postgres side found the client socket busy and handed the bytes back rather than wait
+  on a client (the socket watermarks are set so that never happens for a client that reads). Pipelined requests
+  are served from the same buffer. Between requests a connection process hibernates when its heap has grown
+  past `HIB_WORDS` words; connections are never closed by the server (keep-alive forever).
 - **Postgres** (`src/conduit/pg/`): a minimal protocol 3.0 client. Startup with session options
   (`jit=off`, `max_parallel_workers_per_gather=0`, `enable_memoize=off`, `plan_cache_mode=force_generic_plan`;
   the generic plan of every statement has the same shape as its custom plan, checked with `EXPLAIN` for all 35,
@@ -40,7 +48,8 @@ one BEAM process per Postgres connection.
   (int8, bool, timestamptz as microseconds, `text[]`); text columns are sub-binaries of the socket buffer, never
   copied. Two pools: `DB_READ_CONNS` (12) and `DB_WRITE_CONNS` (8) connection processes, chosen round-robin
   through an `atomics` counter. A connection serves one Sync group at a time; a lost connection is reopened and
-  the requests waiting in the process mailbox are served after the reconnect.
+  the requests waiting in the process mailbox are served after the reconnect. A request carries its deadline; a
+  response is never written after it, so the connection process's own 503 can't be followed by a late one.
 - **Batched reads.** When a read connection becomes free it drains its mailbox; requests of the same kind as the
   oldest one (an article by slug, a comments list, a page of the global list, ...) are sent as one statement:
   the per-request query becomes the inner side of a `LATERAL` join over the unnested parameter arrays, and every

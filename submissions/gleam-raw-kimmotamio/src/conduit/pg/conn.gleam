@@ -1,9 +1,14 @@
-//// One Postgres connection = one BEAM process owning one socket. It serves `Exec` requests from its mailbox
-//// one Sync group at a time: every statement of a request is sent as Bind/Execute, then one Sync, so a
-//// multi-statement request is one implicit transaction with one commit. Every statement in `sql.all()` is
-//// prepared once when the connection opens. If the socket breaks the process reconnects and keeps serving.
+//// One Postgres connection = one BEAM process owning one socket. It serves requests from its mailbox one Sync
+//// group at a time: every statement of a request is sent as Bind/Execute, then one Sync, so a multi-statement
+//// request is one implicit transaction with one commit. Every statement in `sql.all()` is prepared once when
+//// the connection opens. If the socket breaks the process reconnects and keeps serving.
+////
+//// A `Render` request ends here too: the rows are decoded, rendered to JSON and written to the client socket by
+//// this process, so the response never crosses a process boundary and the connection process that asked keeps
+//// a tiny heap.
 
 import conduit/pg/proto.{type Param, type Row}
+import conduit/response.{type Response}
 import conduit/sql
 import gleam/bit_array
 import gleam/dict
@@ -12,6 +17,7 @@ import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/string
+import gleam/string_tree.{type StringTree}
 
 pub type Socket
 
@@ -24,9 +30,34 @@ pub type Reply =
   Result(List(List(Row)), PgError)
 
 pub type Request {
-  /// `deadline` is a monotonic millisecond timestamp: a request still queued past it is dropped with an error
-  /// instead of being executed for a client that has already given up (the handler waits 10 s).
-  Exec(statements: List(#(Int, List(Param))), reply: Subject(Reply), deadline: Int)
+  /// The results go back to `reply`. `deadline` is a monotonic millisecond timestamp: a request still queued past
+  /// it is dropped with an error instead of being executed for a client that has already given up (the handler
+  /// waits 10 s).
+  Exec(deadline: Int, statements: List(#(Int, List(Param))), reply: Subject(Reply))
+  /// The connection process renders the results with `render` and writes the HTTP response to the client socket
+  /// itself; `notify` only hears how that went. It never blocks on the client (a busy socket hands the bytes
+  /// back to the owner) and never writes past the deadline.
+  Render(
+    deadline: Int,
+    statements: List(#(Int, List(Param))),
+    render: fn(List(List(Row))) -> Response,
+    sock: response.Socket,
+    notify: Subject(Rendered),
+  )
+}
+
+/// How a `Render` request ended.
+pub type Rendered {
+  Written
+  /// The client socket was busy: here is the framed response for its owner to write.
+  Busy(data: StringTree)
+  /// The client socket failed.
+  Gone
+  /// `render` raised; the owner answers 500.
+  Crashed
+  /// The results arrived after the deadline, so nothing was written.
+  Expired
+  Failed(error: PgError)
 }
 
 pub type Config {
@@ -63,6 +94,9 @@ fn stat_add(index: Int, n: Int) -> Nil
 
 @external(erlang, "conduit_ffi", "monotonic_ms")
 fn monotonic_ms() -> Int
+
+@external(erlang, "conduit_ffi", "safe")
+fn safe(f: fn() -> a) -> Result(a, Nil)
 
 @external(erlang, "conduit_ffi", "hmac_sha256")
 fn hmac(key: BitArray, data: BitArray) -> BitArray
@@ -122,7 +156,7 @@ fn loop(config: Config, subject: Subject(Request), sock: Socket, queue: List(Req
   case first.deadline < monotonic_ms() {
     True -> {
       stat_add(4, 1)
-      process.send(first.reply, Error(PgError("57014", "queued too long")))
+      complete(first, Error(PgError("57014", "queued too long")))
       loop(config, subject, sock, queue)
     }
     False -> serve_first(config, subject, sock, first, queue)
@@ -133,9 +167,8 @@ fn serve_first(config: Config, subject: Subject(Request), sock: Socket, first: R
   case batch_key(first) {
     // A write (or a multi-statement request): never retried, since its commit state would be unknown.
     None -> {
-      let Exec(statements, reply, _) = first
       stat_add(1, 1)
-      case run(sock, statements, [reply], False) {
+      case run(sock, first.statements, [first], False) {
         True -> loop(config, subject, sock, queue)
         False -> reconnect(config, subject, sock, queue)
       }
@@ -146,20 +179,21 @@ fn serve_first(config: Config, subject: Subject(Request), sock: Socket, first: R
       let batch = [first, ..same]
       let ok = case same {
         [] -> {
-          let Exec(statements, reply, _) = first
           stat_add(1, 1)
-          run(sock, statements, [reply], True)
+          run(sock, first.statements, [first], True)
         }
         _ -> {
           stat_add(1, list.length(batch))
           stat_add(2, 1)
           stat_add(3, list.length(batch))
-          let params = list.map(batch, fn(r) {
-            let assert Exec([#(_, p)], _, _) = r
-            p
-          })
-          let replies = list.map(batch, fn(r) { r.reply })
-          run(sock, [#(index + sql.batch_offset, sql.batch_params(index, params))], replies, True)
+          let params =
+            list.map(batch, fn(r) {
+              case r.statements {
+                [#(_, p)] -> p
+                _ -> []
+              }
+            })
+          run(sock, [#(index + sql.batch_offset, sql.batch_params(index, params))], batch, True)
         }
       }
       case ok {
@@ -177,8 +211,8 @@ fn reconnect(config: Config, subject: Subject(Request), sock: Socket, queue: Lis
 
 /// The statement index when a request is a single batchable read.
 fn batch_key(r: Request) -> Option(Int) {
-  case r {
-    Exec([#(index, _)], _, _) ->
+  case r.statements {
+    [#(index, _)] ->
       case sql.batchable(index) {
         True -> Some(index)
         False -> None
@@ -198,10 +232,10 @@ fn drain(subject: Subject(Request), queue: List(Request), room: Int) -> List(Req
   }
 }
 
-/// Sends one Sync group and distributes the results. With several replies the statement is a batched variant
-/// whose rows carry the request ordinal in their first column. Returns False when the connection is gone; the
-/// requests are then answered with an error unless `retry` says the caller will run them again.
-fn run(sock: Socket, statements: List(#(Int, List(Param))), replies: List(Subject(Reply)), retry: Bool) -> Bool {
+/// Sends one Sync group and completes the requests with the results. With several requests the statement is a
+/// batched variant whose rows carry the request ordinal in their first column. Returns False when the connection
+/// is gone; the requests are then answered with an error unless `retry` says the caller will run them again.
+fn run(sock: Socket, statements: List(#(Int, List(Param))), requests: List(Request), retry: Bool) -> Bool {
   let message =
     list.map(statements, fn(s) {
       let #(index, params) = s
@@ -212,7 +246,7 @@ fn run(sock: Socket, statements: List(#(Int, List(Param))), replies: List(Subjec
   let lost = fn() {
     case retry {
       True -> Nil
-      False -> reply_all(replies, Error(PgError("08000", "connection lost")))
+      False -> complete_all(requests, Error(PgError("08000", "connection lost")))
     }
     False
   }
@@ -222,13 +256,13 @@ fn run(sock: Socket, statements: List(#(Int, List(Param))), replies: List(Subjec
       case read_results(sock, <<>>, [], [], None) {
         Disconnected -> lost()
         Done(_, Some(error)) -> {
-          reply_all(replies, Error(error))
+          complete_all(requests, Error(error))
           True
         }
         Done(results, None) -> {
-          case replies {
-            [reply] -> process.send(reply, Ok(results))
-            _ -> demux(results, replies)
+          case requests {
+            [r] -> complete(r, Ok(results))
+            _ -> demux(results, requests)
           }
           True
         }
@@ -236,12 +270,39 @@ fn run(sock: Socket, statements: List(#(Int, List(Param))), replies: List(Subjec
   }
 }
 
-fn reply_all(replies: List(Subject(Reply)), reply: Reply) -> Nil {
-  list.each(replies, fn(r) { process.send(r, reply) })
+fn complete_all(requests: List(Request), result: Reply) -> Nil {
+  list.each(requests, fn(r) { complete(r, result) })
+}
+
+/// Hands a request its result: to the requester for `Exec`; rendered and written to the client for `Render`.
+fn complete(r: Request, result: Reply) -> Nil {
+  case r {
+    Exec(_, _, reply) -> process.send(reply, result)
+    Render(deadline, _, render, sock, notify) ->
+      case result {
+        Error(e) -> process.send(notify, Failed(e))
+        Ok(results) ->
+          case safe(fn() { render(results) }) {
+            Error(_) -> process.send(notify, Crashed)
+            Ok(#(status, body)) ->
+              case monotonic_ms() > deadline {
+                True -> process.send(notify, Expired)
+                False -> {
+                  let data = response.render(status, body)
+                  case response.send_nosuspend(sock, data) {
+                    response.Sent -> process.send(notify, Written)
+                    response.Busy -> process.send(notify, Busy(data))
+                    response.Gone -> process.send(notify, Gone)
+                  }
+                }
+              }
+          }
+      }
+  }
 }
 
 // Rows of a batched statement are grouped by their ordinal column, in order; a request with no rows gets [].
-fn demux(results: List(List(Row)), replies: List(Subject(Reply))) -> Nil {
+fn demux(results: List(List(Row)), requests: List(Request)) -> Nil {
   let rows = case results {
     [rows] -> rows
     _ -> []
@@ -261,12 +322,12 @@ fn demux(results: List(List(Row)), replies: List(Subject(Reply))) -> Nil {
         _ -> acc
       }
     })
-  list.index_map(replies, fn(reply, k) {
+  list.index_map(requests, fn(r, k) {
     let own = case dict.get(groups, k + 1) {
       Ok(list) -> list.reverse(list)
       Error(_) -> []
     }
-    process.send(reply, Ok([own]))
+    complete(r, Ok([own]))
   })
   Nil
 }

@@ -1,17 +1,17 @@
 //// A minimal HTTP/1.1 server on gen_tcp. Every connection is one process: the process that accepted it. It
-//// parses with erlang:decode_packet (a C BIF), runs the handler inline and writes the response. Between
-//// requests the process holds only the socket, and hibernates if the last request grew its heap, so tens of
-//// thousands of idle keep-alive connections stay cheap.
+//// parses with erlang:decode_packet (a C BIF) and runs the handler inline. For most requests the response is
+//// rendered and written by the Postgres connection process that ran the query (`conn.Render`), so this process
+//// never holds the rows or the JSON and its heap stays small; it writes the response itself only when there was
+//// no query, on errors, or when the socket was busy. Between requests the process holds only the socket, and
+//// hibernates if the last request grew its heap, so tens of thousands of idle keep-alive connections stay cheap.
 
 import conduit/handler.{type Ctx}
+import conduit/response.{type Socket}
 import gleam/bit_array
 import gleam/erlang/process
-import gleam/int
-import gleam/string_tree.{type StringTree}
+import gleam/string_tree
 
 pub type Listener
-
-pub type Socket
 
 pub type Parsed {
   Request(method: String, target: String, auth: String, body: BitArray, rest: BitArray, close: Bool)
@@ -27,9 +27,6 @@ fn accept(listener: Listener) -> Result(Socket, String)
 
 @external(erlang, "conduit_ffi", "recv")
 fn recv(sock: Socket) -> Result(BitArray, Nil)
-
-@external(erlang, "conduit_ffi", "send")
-fn send(sock: Socket, data: StringTree) -> Result(Nil, Nil)
 
 @external(erlang, "conduit_ffi", "close")
 fn close(sock: Socket) -> Nil
@@ -102,15 +99,25 @@ fn handle(sock: Socket, buf: BitArray, ctx: Ctx) -> Nil {
   case parse_request(buf) {
     More -> wait(sock, buf, ctx)
     Bad -> {
-      let _ = send(sock, render(400, string_tree.from_string("{\"errors\":{\"body\":[\"bad request\"]}}")))
+      let _ = response.send(sock, response.render(400, string_tree.from_string("{\"errors\":{\"body\":[\"bad request\"]}}")))
       close(sock)
     }
     Request(method, target, auth, body, rest, close_after) -> {
-      let #(status, body) = case safe(fn() { handler.handle(ctx, method, target, auth, body) }) {
-        Ok(resp) -> resp
-        Error(_) -> #(500, string_tree.from_string("{\"errors\":{\"body\":[\"internal error\"]}}"))
+      let outcome = case safe(fn() { handler.handle(ctx, sock, method, target, auth, body) }) {
+        Ok(outcome) -> outcome
+        Error(_) -> handler.Reply(#(500, string_tree.from_string("{\"errors\":{\"body\":[\"internal error\"]}}")))
       }
-      case send(sock, render(status, body)) {
+      let written = case outcome {
+        handler.Reply(#(status, body)) -> response.send(sock, response.render(status, body))
+        handler.Prepared(data) -> response.send(sock, data)
+        handler.Done -> Ok(Nil)
+        handler.Broken -> Error(Nil)
+        handler.ReplyAndClose(#(status, body)) -> {
+          let _ = response.send(sock, response.render(status, body))
+          Error(Nil)
+        }
+      }
+      case written {
         Error(_) -> close(sock)
         Ok(_) ->
           case close_after {
@@ -127,33 +134,5 @@ fn wait(sock: Socket, buf: BitArray, ctx: Ctx) -> Nil {
   case buf == <<>> && heap_words() > ctx.hibernate_words && mailbox_len() == 0 {
     True -> hibernate(sock, buf, ctx)
     False -> loop(sock, buf, ctx)
-  }
-}
-
-fn render(status: Int, body: StringTree) -> StringTree {
-  case status {
-    204 -> string_tree.from_string("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
-    _ ->
-      string_tree.from_strings([
-        status_line(status),
-        "Content-Type: application/json\r\nContent-Length: ",
-        int.to_string(string_tree.byte_size(body)),
-        "\r\n\r\n",
-      ])
-      |> string_tree.append_tree(body)
-  }
-}
-
-fn status_line(status: Int) -> String {
-  case status {
-    200 -> "HTTP/1.1 200 OK\r\n"
-    201 -> "HTTP/1.1 201 Created\r\n"
-    400 -> "HTTP/1.1 400 Bad Request\r\n"
-    401 -> "HTTP/1.1 401 Unauthorized\r\n"
-    403 -> "HTTP/1.1 403 Forbidden\r\n"
-    404 -> "HTTP/1.1 404 Not Found\r\n"
-    422 -> "HTTP/1.1 422 Unprocessable Entity\r\n"
-    503 -> "HTTP/1.1 503 Service Unavailable\r\n"
-    _ -> "HTTP/1.1 500 Internal Server Error\r\n"
   }
 }
