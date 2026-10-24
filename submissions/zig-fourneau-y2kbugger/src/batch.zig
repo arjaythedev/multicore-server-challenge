@@ -15,8 +15,8 @@
 //!
 //! No timer: a read waits in its kind's queue only while every read
 //! connection has a batch in flight. A connection that finishes its batch
-//! sends the kind whose oldest read has waited longest, all of it (32 at
-//! most). At low load every batch is one read and nothing waits; under load
+//! sends the kind whose oldest read has waited longest, all of it (up to
+//! `pg.batch_max`). At low load every batch is one read and nothing waits; under load
 //! batches grow by themselves.
 
 const std = @import("std");

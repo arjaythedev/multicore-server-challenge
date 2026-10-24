@@ -336,9 +336,9 @@ pub const statements = std.enums.EnumArray(S, pg.Statement).init(.{
     // Feeds overlap (the authors most followed write the most): each
     // request's ids picked on its own, each distinct article read once.
     // An article's tags as their ids, and the first row (`-1`, every
-    // request's) the batch's tags, ids and names, in Postgres's order of the
-    // names: a lookup of each name by its key was a fifth of the feed's
-    // index descents (-13% of its time, a batch of 9).
+    // request's) every tag's id and name, in Postgres's order of the names,
+    // as `/api/tags` reads them: a lookup of each name by its key was a
+    // fifth of the feed's index descents (-13% of its time, a batch of 9).
     .batch_list_feed = .{
         .sql = "WITH r AS (SELECT * " ++ batch_pages ++ "), " ++
             "ids AS MATERIALIZED (SELECT r.i, r.v, p.id FROM r CROSS JOIN LATERAL (" ++
