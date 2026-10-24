@@ -20,7 +20,7 @@ lazy val root = (project in file("."))
       "io.circe" %% "circe-jawn" % circeVersion,
       "org.tpolecat" %% "skunk-core" % "2.0.0-RC3",
       "org.typelevel" %% "otel4s-core" % "1.1.0",
-      "at.favre.lib" % "bcrypt" % "0.10.2"
+      "org.bouncycastle" % "bcprov-jdk18on" % "1.86"
     ),
     writeClasspath := {
       val converter = fileConverter.value
