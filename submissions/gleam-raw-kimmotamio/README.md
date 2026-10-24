@@ -41,7 +41,9 @@ NIFs. One BEAM process per keep-alive connection, one BEAM process per Postgres 
   driver answers at once, so a client that stops reading blocks its own connection process and nothing else, as
   before. Pipelined requests are served from the same buffer. A connection process is spawned with a 1598-word
   heap (`MIN_HEAP`), enough for a request without growing in collected steps, and hibernates only after a request
-  that grew it past `HIB_WORDS` (4500): about 28 KB per idle connection all told. Connections are never closed by
+  that grew it past `HIB_WORDS` (2500, i.e. after any growth: with the C request parser a heap rarely grows, and
+  4500 left heaps sitting at their grown size for 40 % more memory at the same CPU): about 27 KB per idle
+  connection all told. Connections are never closed by
   the server (keep-alive forever).
 - **Postgres** (`src/conduit/pg/`): a minimal protocol 3.0 client. Startup with session options
   (`jit=off`, `max_parallel_workers_per_gather=0`, `enable_memoize=off`, `plan_cache_mode=force_generic_plan`;
@@ -129,7 +131,7 @@ NIFs. One BEAM process per keep-alive connection, one BEAM process per Postgres 
 
 `DATABASE_URL`, `JWT_SECRET` (required), `HOST`, `PORT`. Optional: `SCHEDULERS`, `DIRTY_CPU`, `DB_READ_CONNS`
 (12), `DB_WRITE_CONNS` (8), `ACCEPTORS` (16), `MIN_HEAP` (1598 words: a connection process's starting heap),
-`HIB_WORDS` (4500: a connection process hibernates after a request that grew its heap past this),
+`HIB_WORDS` (2500: a connection process hibernates after a request that grew its heap past this),
 `BCRYPT_BATCH_MS` (250), `BATCH_WAIT_MS` (2: how long a read connection holds a batch open under load), `STATS=1` (log request/batch/expired counters every 10 s).
 
 ## Tests

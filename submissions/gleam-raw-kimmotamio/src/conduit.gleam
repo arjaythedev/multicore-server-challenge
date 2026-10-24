@@ -66,7 +66,7 @@ pub fn main() {
   let read_conns = env_int("DB_READ_CONNS", 12)
   let write_conns = env_int("DB_WRITE_CONNS", 8)
   let acceptors = env_int("ACCEPTORS", 16)
-  let hibernate_words = env_int("HIB_WORDS", 4500)
+  let hibernate_words = env_int("HIB_WORDS", 2500)
   let min_heap_words = env_int("MIN_HEAP", 1598)
   let bcrypt_window = env_int("BCRYPT_BATCH_MS", 250)
   let batch_wait = env_int("BATCH_WAIT_MS", 2)
