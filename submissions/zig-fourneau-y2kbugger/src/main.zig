@@ -33,6 +33,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const port = try std.fmt.parseInt(u16, environ.getPosix("PORT") orelse "80", 10);
 
     raise_descriptor_limit();
+    // No transparent huge pages in this process: a connection touches a few
+    // pages of each slab, and a 2 MiB page per touch would hold tens of KiB
+    // per idle connection where THP is `always` (Ubuntu's `madvise` gives
+    // none anyway).
+    const thp = linux.prctl(@intFromEnum(linux.PR.SET_THP_DISABLE), 1, 0, 0, 0);
+    if (linux.errno(thp) != .SUCCESS) return error.ThpDisable;
     const url = try pg.parse_url(database_url);
     const gpa = std.heap.page_allocator;
     const key = try gpa.create(jwt.Key);
