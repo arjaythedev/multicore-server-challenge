@@ -765,14 +765,17 @@ fn list_comments(context: *Context, slug: []const u8) Response {
     const fields: batch.Pending = .{ .waiter = undefined, .viewer = context.viewer, .key = slug };
     const results = read.run(context, .comments, fields);
     if (results.waiter.failure != null) return read.slot.finish(internal);
+    // No row: no such article; one of nulls: no comments (sql.zig).
     if (results.rows(0).first() == null) return read.slot.finish(failure(404, "article not found"));
     var out = read.slot.out();
     out.bytes("{\"comments\":[");
-    var rows = results.rows(1);
+    var rows = results.rows(0);
     var index: usize = 0;
-    while (rows.next()) |row| : (index += 1) {
+    while (rows.next()) |row| {
+        if (row.text_or_null(0) == null) continue;
         if (index > 0) out.bytes(",");
         write_comment(&out, row, row.boolean(7));
+        index += 1;
     }
     out.bytes("]}");
     return read.slot.respond(200, &out);

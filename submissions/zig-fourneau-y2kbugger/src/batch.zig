@@ -298,10 +298,7 @@ pub const Reads = struct {
         }.of;
         _ = switch (kind) {
             .article => connection.send(batch, &.{call(.batch_article, &.{ i, v, k })}),
-            .comments => connection.send(batch, &.{
-                call(.batch_article_exists, &.{ i, k }),
-                call(.batch_comments, &.{ i, v, k }),
-            }),
+            .comments => connection.send(batch, &.{call(.batch_comments, &.{ i, v, k })}),
             .profile => connection.send(batch, &.{call(.batch_profile, &.{ i, v, k })}),
             .user => connection.send(batch, &.{call(.batch_user, &.{ i, v })}),
             .login => connection.send(batch, &.{call(.batch_login, &.{ i, v, k })}),
