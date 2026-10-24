@@ -36,6 +36,10 @@ internal class KindQueue(@JvmField val kind: ReadKind, @JvmField val stmtName: B
     /** Batches of this kind on a connection right now. */
     @JvmField var inflight = 0
 
+    // statistics
+    @JvmField var requests = 0L
+    @JvmField var batches = 0L
+
     fun add(r: ReadReq) {
         if (size == ring.size) {
             val bigger = arrayOfNulls<ReadReq>(size * 2)
@@ -62,8 +66,16 @@ internal class KindQueue(@JvmField val kind: ReadKind, @JvmField val stmtName: B
 internal class ReadBatch(cap: Int) {
     @JvmField var q: KindQueue? = null
     @JvmField var n = 0
-    @JvmField val reqs = arrayOfNulls<ReadReq>(cap)
-    @JvmField val results = Array(cap) { Result() }
+    @JvmField var reqs = arrayOfNulls<ReadReq>(cap)
+    @JvmField var results = Array(cap) { Result() }
+
+    /** Room for [n] requests (broadcast kinds may take more than the usual cap). Under the pool lock. */
+    fun ensure(n: Int) {
+        if (n <= reqs.size) return
+        val old = results
+        reqs = reqs.copyOf(n)
+        results = Array(n) { if (it < old.size) old[it] else Result() }
+    }
 }
 
 internal class ReadWorker(pool: ReadPool, index: Int, cap: Int) : Worker(pool, index) {
@@ -79,6 +91,7 @@ internal class ReadWorker(pool: ReadPool, index: Int, cap: Int) : Worker(pool, i
         val batch = flight!!
         val n = batch.n
         val res = batch.results
+        val broadcast = batch.q!!.kind.broadcast
         for (j in 0 until n) res[j].clear()
         var err: PgError? = null
         var status = 'I'.code
@@ -86,6 +99,10 @@ internal class ReadWorker(pool: ReadPool, index: Int, cap: Int) : Worker(pool, i
             val t = c.next()
             if (t == 'D'.code) {
                 if (err != null) continue
+                if (broadcast) {
+                    res[0].addRow(c.rbuf, c.mstart)
+                    continue
+                }
                 // DataRow: Int16 ncols, then column 0 = r.i as Int32 length 4 + Int32 value
                 val buf = c.rbuf
                 val p = c.mstart
@@ -102,6 +119,11 @@ internal class ReadWorker(pool: ReadPool, index: Int, cap: Int) : Worker(pool, i
             // BindComplete, CommandComplete, NoticeResponse, ParameterStatus: nothing to do
         }
         val buf = c.rbuf // it may have grown (same offsets) since the first rows were added
+        if (broadcast && err == null) {
+            // every request of the batch gets the one execution's rows (views into the same receive buffer)
+            val first = res[0]
+            for (j in 1 until n) for (k in 0 until first.rowCount) res[j].addRow(buf, first.rowStarts[k])
+        }
         for (j in 0 until n) {
             val r = res[j]
             if (err != null) {
@@ -223,6 +245,7 @@ internal class ReadPool(
         }
         val batch = w.spare()
         val n = minOf(best.size, best.maxBatch)
+        batch.ensure(n)
         for (j in 0 until n) batch.reqs[j] = best.poll()
         batch.n = n
         batch.q = best
@@ -233,14 +256,24 @@ internal class ReadPool(
         encode(batch, w.conn!!.out)
         batches++
         requests += n
+        best.batches++
+        best.requests += n
         if (n > largest) largest = n
         sizes[minOf(6, 31 - n.countLeadingZeroBits())]++
         return true
     }
 
-    /** Bind(s<id>, $1 int4[] i, $2 int8[] v, $3 int4[] l, $4 int8[] o, $5 text[] k) + Execute + Sync. */
+    /**
+     * Bind(s<id>, $1 int4[] i, $2 int8[] v, $3 int4[] l, $4 int8[] o, $5 text[] k) + Execute + Sync; a broadcast
+     * kind binds no parameters.
+     */
     private fun encode(batch: ReadBatch, o: ByteBuf) {
         o.reset()
+        if (batch.q!!.kind.broadcast) {
+            o.endBindExecute(o.beginBind(batch.q!!.stmtName, 0))
+            o.sync()
+            return
+        }
         val n = batch.n
         val reqs = batch.reqs
         val lp = o.beginBind(batch.q!!.stmtName, 5)
@@ -316,6 +349,7 @@ internal class ReadPool(
         "reads: $requests requests in $batches batches (avg ${(avg * 100).toLong() / 100.0}, max $largest; " +
             "sizes 1:${sizes[0]} 2-3:${sizes[1]} 4-7:${sizes[2]} 8-15:${sizes[3]} 16-31:${sizes[4]} " +
             "32-63:${sizes[5]} 64+:${sizes[6]}), queued $queued, healthy $healthy/${workers.size}, " +
-            "reconnects $reconnects"
+            "reconnects $reconnects; per kind (requests/batches):" +
+            queues.joinToString("") { " ${it.kind.name} ${it.requests}/${it.batches}" }
     }
 }

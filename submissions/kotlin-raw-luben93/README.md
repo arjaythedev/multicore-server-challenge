@@ -25,3 +25,5 @@ DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=... HO
 Optional process settings (defaults sized from the CPU count): `HTTP_THREADS`, `DB_READ_CONNS`, `DB_WRITE_CONNS`,
 `BCRYPT_THREADS`, `BCRYPT_BATCH_MS`, `DB_OPTIONS`, `HTTP_IO` (`nio`: JVM HTTP loops on java.nio instead of epoll).
 `BCRYPT_IMPL=kotlin` forces the pure-Kotlin bcrypt.
+`APP_SORT_TAGS=0` leaves tag-list sorting to SQL even under a byte-order collation; `DB_STATS_S=<seconds>` logs
+batching statistics.

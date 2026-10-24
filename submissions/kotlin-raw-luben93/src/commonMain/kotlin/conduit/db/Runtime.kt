@@ -39,7 +39,7 @@ internal class DbRuntime(@JvmField val config: DbConfig, reads: List<ReadKind>, 
         val list = ArrayList<PgStatement>()
         reads.forEachIndexed { i, k ->
             k.id = i
-            list.add(PgStatement("s$i", k.sql, READ_OIDS, "read kind '${k.name}'"))
+            list.add(PgStatement("s$i", k.sql, if (k.broadcast) IntArray(0) else READ_OIDS, "read kind '${k.name}'"))
         }
         writes.forEachIndexed { j, w ->
             w.id = j
@@ -90,38 +90,7 @@ internal class DbRuntime(@JvmField val config: DbConfig, reads: List<ReadKind>, 
         for (i in workers.indices) workers[i].start(conns[i])
     }
 
-    private fun connectFirst(): PgConn {
-        val deadline = nanoTime() + FIRST_CONNECT_NANOS
-        var attempts = 0
-        while (true) {
-            val failure: Throwable
-            try {
-                val c = PgConn.connect(
-                    config.host, config.port, config.user, config.password, config.database, config.options,
-                )
-                try {
-                    c.prepare(statements)
-                } catch (e: Throwable) {
-                    c.close()
-                    throw IllegalStateException("database $where: ${e.message}", e)
-                }
-                if (attempts > 0) println("db: connected to $where after ${attempts + 1} attempts")
-                return c
-            } catch (e: PgException) {
-                if (!retryable(e.error.code)) throw IllegalStateException("database $where: ${e.message}", e)
-                failure = e
-            } catch (e: IllegalStateException) {
-                throw e
-            } catch (e: Throwable) {
-                failure = e // connection refused, reset while starting up, ...
-            }
-            if (attempts++ == 0) println("db: waiting for $where: ${failure.message}")
-            if (nanoTime() > deadline) {
-                throw IllegalStateException("database $where not reachable after 50 s: ${failure.message}", failure)
-            }
-            sleepNanos(sleeper, FIRST_RETRY_NANOS)
-        }
-    }
+    private fun connectFirst(): PgConn = connectPatiently(config, statements, sleeper)
 
     private fun connectMore(): PgConn {
         var attempt = 0
@@ -176,12 +145,50 @@ internal class DbRuntime(@JvmField val config: DbConfig, reads: List<ReadKind>, 
     companion object {
         /** $1 int4[] i, $2 int8[] v, $3 int4[] l, $4 int8[] o, $5 text[] k. */
         private val READ_OIDS = intArrayOf(Oid.INT4_ARRAY, Oid.INT8_ARRAY, Oid.INT4_ARRAY, Oid.INT8_ARRAY, Oid.TEXT_ARRAY)
-        private const val FIRST_CONNECT_NANOS = 50_000_000_000L
-        private const val FIRST_RETRY_NANOS = 500_000_000L
+        const val FIRST_CONNECT_NANOS = 50_000_000_000L
+        const val FIRST_RETRY_NANOS = 500_000_000L
 
         /** Worth waiting for: connection trouble, starting up / shutting down, too many clients, no database yet. */
         fun retryable(sqlstate: String): Boolean =
             sqlstate.startsWith("08") || sqlstate.startsWith("57") || sqlstate.startsWith("53") || sqlstate == "3D000"
+    }
+}
+
+/**
+ * Connects and prepares [statements] (none: a plain session), retrying for up to 50 s while Postgres may still be
+ * starting; bad credentials or SQL fail at once.
+ */
+internal fun connectPatiently(config: DbConfig, statements: List<PgStatement>, sleeper: Monitor): PgConn {
+    val where = "${config.user}@${config.host}:${config.port}/${config.database}"
+    val deadline = nanoTime() + DbRuntime.FIRST_CONNECT_NANOS
+    var attempts = 0
+    while (true) {
+        val failure: Throwable
+        try {
+            val c = PgConn.connect(
+                config.host, config.port, config.user, config.password, config.database, config.options,
+            )
+            try {
+                c.prepare(statements)
+            } catch (e: Throwable) {
+                c.close()
+                throw IllegalStateException("database $where: ${e.message}", e)
+            }
+            if (attempts > 0) println("db: connected to $where after ${attempts + 1} attempts")
+            return c
+        } catch (e: PgException) {
+            if (!DbRuntime.retryable(e.error.code)) throw IllegalStateException("database $where: ${e.message}", e)
+            failure = e
+        } catch (e: IllegalStateException) {
+            throw e
+        } catch (e: Throwable) {
+            failure = e // connection refused, reset while starting up, ...
+        }
+        if (attempts++ == 0) println("db: waiting for $where: ${failure.message}")
+        if (nanoTime() > deadline) {
+            throw IllegalStateException("database $where not reachable after 50 s: ${failure.message}", failure)
+        }
+        sleepNanos(sleeper, DbRuntime.FIRST_RETRY_NANOS)
     }
 }
 

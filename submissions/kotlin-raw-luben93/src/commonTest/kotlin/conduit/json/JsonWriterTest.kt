@@ -233,6 +233,34 @@ class JsonWriterTest {
     }
 
     @Test
+    fun textArraysSortedByBytes() {
+        val many = (0 until 40).map { "t" + (39 - it).toString().padStart(2, '0') }
+        val row = rowOf(
+            textArrayBytes(listOf("zz", "dragons", "a\"b", "é", "Z", "", "dragon")),
+            textArrayBytes(listOf("x", null, "a")),
+            textArrayBytes(listOf("only")),
+            textArrayBytes(null),
+            textArrayBytes(many),
+        )
+        assertEquals(
+            // unsigned bytes: "" < "Z" < "a\"b" < "dragon" < "dragons" < "zz" < "é" (0xC3)
+            """[["","Z","a\"b","dragon","dragons","zz","é"],[null,"a","x"],["only"],[]]""",
+            json {
+                beginArray()
+                textArray(row, 0, sortBytes = true)
+                textArray(row, 1, sortBytes = true)
+                textArray(row, 2, sortBytes = true)
+                textArray(row, 3, sortBytes = true)
+                endArray()
+            },
+        )
+        assertEquals(
+            many.sorted().joinToString(",", "[", "]") { "\"$it\"" },
+            json { textArray(row, 4, sortBytes = true) },
+        )
+    }
+
+    @Test
     fun twoDimensionalTextArrayIsFlattened() {
         val b = ByteBuf()
         b.putIntBE(2); b.putIntBE(0); b.putIntBE(25)

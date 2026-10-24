@@ -18,6 +18,11 @@ class SqlTest {
         val names = HashSet<String>()
         for (k in Sql.reads) {
             assertTrue(names.add(k.name), "duplicate kind ${k.name}")
+            if (k.broadcast) {
+                // one execution answers the whole batch: no parameters, nothing per request
+                assertEquals(0, param.findAll(k.sql).count(), "${k.name}: broadcast kinds take no parameters")
+                continue
+            }
             assertTrue(k.sql.startsWith("SELECT r.i, "), "${k.name}: first column must be r.i")
             assertTrue(k.sql.contains(unnest), "${k.name}: uniform 5-array unnest")
             // the arrays are referenced only by the unnest: everything else uses request columns
@@ -31,8 +36,9 @@ class SqlTest {
 
     @Test
     fun uncorrelatedSubqueriesAreTiedToTheRequest() {
-        // Without `r.i >= 0` these subqueries are InitPlans run once per statement and shared (rule 5).
-        assertTrue(Sql.TAGS.sql.contains("WHERE r.i >= 0 ORDER BY t.name"))
+        // Without `r.i >= 0` these subqueries are InitPlans run once per statement and shared (rule 5). Only the
+        // tags list (request-independent) is deliberately shared: a broadcast kind.
+        assertEquals(listOf(Sql.TAGS), Sql.reads.filter { it.broadcast })
         for (k in listOf(Sql.LIST_ALL, Sql.LIST_ALL_DEEP)) {
             assertTrue(k.sql.contains("FROM articles c WHERE r.i >= 0 ORDER BY c.id OFFSET 999"), k.name)
             assertTrue(k.sql.contains("(SELECT count(*) FROM articles c WHERE r.i >= 0)"), k.name)
@@ -51,6 +57,18 @@ class SqlTest {
             assertTrue(k.sql.contains("WHERE at.article_id = a.id ORDER BY 1)"), k.name)
         }
         assertTrue(Sql.ARTICLE_CREATE.sql.contains("ARRAY(SELECT g.name FROM g ORDER BY 1)"))
+    }
+
+    @Test
+    fun byteOrderCollations() {
+        assertTrue(TagOrder.isByteOrder("c", "C", ""))
+        assertTrue(TagOrder.isByteOrder("c", "POSIX", ""))
+        assertTrue(TagOrder.isByteOrder("c", "C.UTF-8", ""))
+        assertTrue(TagOrder.isByteOrder("b", "C", "C.UTF-8"))
+        assertTrue(TagOrder.isByteOrder("b", "C", "C"))
+        assertFalse(TagOrder.isByteOrder("c", "en_US.UTF-8", ""))
+        assertFalse(TagOrder.isByteOrder("b", "C", "PG_UNICODE_FAST"))
+        assertFalse(TagOrder.isByteOrder("i", "und", "und"))
     }
 
     @Test

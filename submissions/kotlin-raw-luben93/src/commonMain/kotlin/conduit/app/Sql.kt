@@ -19,19 +19,39 @@ import conduit.pg.Oid
 private const val U =
     "unnest(\$1::int4[], \$2::int8[], \$3::int4[], \$4::int8[], \$5::text[]) AS r(i, v, l, o, k)"
 
-private const val TAG_NAMES =
-    "ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at " +
-        "WHERE at.article_id = a.id ORDER BY 1)"
+/**
+ * Who sorts tag lists. Set once at startup, before [Sql] is first touched: when the database collation is byte order
+ * (C / POSIX / C.UTF-8) the app sorts each article's tag names itself (JsonWriter.textArray(sortBytes)), which saves
+ * Postgres a Sort node per article; otherwise SQL sorts them (`ORDER BY 1` follows the collation, as the reference).
+ */
+internal object TagOrder {
+    var appSorts = false
+
+    /** pg_database probe for [isByteOrder]: provider, datcollate, datlocale. */
+    const val PROBE =
+        "SELECT datlocprovider::text, datcollate, coalesce(datlocale, '') FROM pg_database WHERE datname = current_database()"
+
+    /** True when `ORDER BY` on text is plain byte order: libc C/POSIX/C.*, or the builtin C / C.UTF-8 locales. */
+    fun isByteOrder(provider: String, collate: String, locale: String): Boolean = when (provider) {
+        "c" -> collate == "C" || collate == "POSIX" || collate.startsWith("C.")
+        "b" -> locale == "C" || locale == "C.UTF-8"
+        else -> false
+    }
+}
+
+private val TAG_NAMES: String
+    get() = "ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at " +
+        "WHERE at.article_id = a.id" + (if (TagOrder.appSorts) ")" else " ORDER BY 1)")
 private const val FAV_COUNT = "(SELECT count(*) FROM favorites f WHERE f.article_id = a.id)"
 private const val FAVORITED = "(SELECT true FROM favorites f WHERE f.user_id = r.v AND f.article_id = a.id) IS NOT NULL"
 private const val FOLLOWING =
     "(SELECT true FROM follows fo WHERE fo.follower_id = r.v AND fo.followee_id = a.author_id) IS NOT NULL"
 
 /** Article columns after the key columns: see [Cols]. */
-private const val TAIL =
-    "a.created_at, a.updated_at, $TAG_NAMES, $FAV_COUNT, $FAVORITED, u.username, u.bio, u.image"
-private const val LIST_COLS = "a.slug, a.title, a.description, $TAIL"
-private const val FULL_COLS = "a.slug, a.title, a.description, a.body, $TAIL"
+private val TAIL: String
+    get() = "a.created_at, a.updated_at, $TAG_NAMES, $FAV_COUNT, $FAVORITED, u.username, u.bio, u.image"
+private val LIST_COLS: String get() = "a.slug, a.title, a.description, $TAIL"
+private val FULL_COLS: String get() = "a.slug, a.title, a.description, a.body, $TAIL"
 
 /** A page of article ids (column `id`, newest first) -> list columns. */
 private fun listOf(ids: String, following: String) =
@@ -54,10 +74,15 @@ internal object Cols {
 }
 
 internal object Sql {
-    /** Row: i, names text[] (sorted by name). */
+    /**
+     * Row: names text[] (sorted by name; an index-only scan of tags_name_key). Broadcast: every tags request queued
+     * when a read connection frees is answered by one execution (see [ReadKind.broadcast]).
+     */
     val TAGS = ReadKind(
         "tags",
-        "SELECT r.i, ARRAY(SELECT t.name FROM tags t WHERE r.i >= 0 ORDER BY t.name) FROM $U",
+        "SELECT ARRAY(SELECT t.name FROM tags t ORDER BY t.name)",
+        maxBatch = 1024,
+        broadcast = true,
     )
 
     /** k = slug. Row: i, full article. No row: 404. */

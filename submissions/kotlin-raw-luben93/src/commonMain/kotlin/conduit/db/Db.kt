@@ -2,6 +2,7 @@ package conduit.db
 
 import conduit.pg.Params
 import conduit.pg.Result
+import conduit.platform.Monitor
 import conduit.util.ByteBuf
 import kotlin.concurrent.Volatile
 
@@ -32,6 +33,13 @@ class ReadKind(
     val maxBatch: Int = 64,
     /** Most read connections this kind may occupy at once (0 = no limit beyond the pool). */
     val maxInflight: Int = 0,
+    /**
+     * A request-independent statement (no parameters, no r.i column; rows start at column 0): every request queued
+     * when a connection frees is answered by ONE execution, whose rows are delivered to each of them. Nothing outlives
+     * the batch, and every recipient was already waiting when the statement started, so each still reads Postgres
+     * while being served (GET /api/tags; the #1 entry does the same).
+     */
+    val broadcast: Boolean = false,
 ) {
     /** Assigned by [Db.start]: index into the kind table. */
     var id: Int = -1
@@ -174,6 +182,19 @@ object Db {
      */
     suspend fun write(stmt: WriteStmt, params: Params, isolated: Boolean = false): Result =
         rt().write(stmt, params, isolated)
+
+    /**
+     * Runs one simple query on a short-lived connection and returns its rows as text (startup probes, before
+     * [start]); waits for Postgres the way [start] does.
+     */
+    fun query(config: DbConfig, sql: String): List<List<String?>> {
+        val c = connectPatiently(config, emptyList(), Monitor())
+        try {
+            return c.simpleQuery(sql)
+        } finally {
+            c.close()
+        }
+    }
 
     /** One line of batching / group-commit / connection statistics, for logs. */
     fun stats(): String = runtime?.stats() ?: "db: not started"

@@ -32,9 +32,10 @@ The box is CPU-bound with Postgres taking ~70% of the CPU at the top, so the lev
 ```
 HTTP loop thread (x HTTP_THREADS, default ceil(cpus/4)=2)       PG read thread (x DB_READ_CONNS, default 6)
   epoll/NIO: accept, read into loop scratch                       loop:
-  HttpEngine.onData: parse request                                  take a batch (oldest kind first, <= 64 reqs)
-  Jwt.verify (HMAC, every request)                                  send one Bind/Execute/Sync, read to 'Z'
-  start handler coroutine ──► Db.read(kind, ...) suspends ───────►  route rows by r.i to each request's Result
+  HttpEngine.onData: parse request                                  take a batch (oldest kind first, <= 64 reqs;
+  Jwt.verify (HMAC, every request)                                    tags: every queued one, see "broadcast")
+  start handler coroutine ──► Db.read(kind, ...) suspends ───────►  send one Bind/Execute/Sync, read to 'Z',
+                                                                     route rows by r.i to each request's Result
                                                                      (send next batch first, then:)
                                handler resumes HERE  ◄────────────  resume each request's continuation:
                                writes JSON into Exchange.out          handler builds JSON, Exchange.send()
@@ -75,6 +76,19 @@ every Bind asks for binary results. Startup packet `options`:
   ParallelGC failed p95 in one of two runs there (642 ms): its pauses.
   GC itself is negligible (two ~10 ms young collections per 45 s at 8k req/s).
 
+## Postgres-side savings
+
+Two Postgres-side savings beyond batching (measured in the lab, see the commit messages):
+- **Broadcast for GET /api/tags** (`ReadKind.broadcast`): the tag list does not depend on the request, so all tags
+  requests queued when a read connection frees are answered by ONE execution of
+  `SELECT ARRAY(SELECT name FROM tags ORDER BY name)`, whose single row is handed to each of them (the #1 entry does
+  the same). Every recipient was waiting before the statement was sent and nothing is kept after the batch, so each
+  request still reads Postgres while being served. At saturation a tags batch holds 60-150 requests.
+- **Tag lists sorted by the app** when the database collation is byte order (startup probe of `pg_database`:
+  libc `C`/`POSIX`/`C.*`, builtin `C`/`C.UTF-8`): the per-article `ARRAY(... ORDER BY 1)` drops its Sort node
+  (-3 to -7% on article/list statements) and `JsonWriter.textArray(sortBytes = true)` insertion-sorts the 1-4 names
+  by bytes. With any other collation SQL keeps sorting (the reference's order). `APP_SORT_TAGS=0` turns it off.
+
 ## Contracts (read the KDoc in these files; they are the source of truth)
 
 | File | What |
@@ -83,7 +97,7 @@ every Bind asks for binary results. Startup packet `options`:
 | `util/ByteBuf.kt` | growable write buffer + big-endian helpers (done) |
 | `crypto/Sha256.kt` | pure-Kotlin SHA-256 + HMAC (done; Native's HMAC; SCRAM uses `HmacSha256`/`sha256`) |
 | `pg/Types.kt` | `Row` (binary column views), `Result`, `Params` (binary encoder), `PgError`, `Oid` (done) |
-| `db/Db.kt` | `ReadKind` (batched read statement, uniform 5-array layout), `WriteStmt`, `Db.start/read/write` |
+| `db/Db.kt` | `ReadKind` (batched read statement, uniform 5-array layout, or a parameterless broadcast), `WriteStmt`, `Db.start/read/write/query` |
 | `http/Http.kt` | `HttpConn` (platform I/O), `HttpEngine` (common engine), `Exchange` (handler API) |
 | `json/Json.kt` | `JsonWriter` (streaming, pre-encoded `JsonName`s), `JsonReader` (request bodies) |
 | `auth/Auth.kt` | `Jwt` (HS256 sign/verify), `Passwords` (bcrypt pool, suspend hash/verify) |
@@ -104,7 +118,9 @@ Concurrency rules everybody relies on:
 ## Rules of the challenge we must keep (README.md "Rules")
 No caching across requests of any kind (no result caches, no remembered JWT or bcrypt results); every request
 reads Postgres while being served. Batching shares a STATEMENT, never a result: per-request subqueries must be
-tied to the request row so they run once per request. bcrypt cost 10 for every hash, every login verifies.
+tied to the request row so they run once per request. The one exception is the request-independent tag list
+(broadcast above: one execution for the requests already waiting, as the #1 entry does, nothing retained).
+bcrypt cost 10 for every hash, every login verifies.
 Every request verifies the HS256 signature and `exp`. Writes are committed before responding. No schema or
 server-config changes; session settings only. <= 95 Postgres connections total.
 
@@ -125,6 +141,9 @@ server-config changes; session settings only. <= 95 Postgres connections total.
   checks). Binary also at `/opt/tools/conformance -base http://127.0.0.1:3000 -secret multicore-server-challenge`.
 - Load: `SRV_CPUS=0-1 LG_CPUS=2-3 TAG=x /opt/tools/bench.sh submissions/kotlin-raw-luben93 <users> <think-scale>`
   prints req/s, p95/p99, CPU µs per request for app and Postgres. Only ONE load test may run at a time.
+  `DB_STATS_S=20` makes the server log batching statistics (requests per batch per kind, round trips) every 20 s.
+  Compare Postgres µs/req at a fixed load with care: faster code means fewer queued requests, smaller batches and
+  so more executions per request; the ceiling runs (13000 users at think-scale 0.2 and up) are the real test.
 - Local fd limit is 20000 per process (cannot be raised); the box gives 200000.
 - Research notes (verbatim SQL of the top entries, conformance checklist, bcrypt details):
   `/tmp/claude-0/-home-user-multicore-server-challenge/99796a5c-b120-524c-822d-dc73b94b523b/scratchpad/research/`

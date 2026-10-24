@@ -275,9 +275,10 @@ class JsonWriter(@JvmField val out: ByteBuf) {
      * A binary text[] column as a JSON array of strings, in array order (NULL column or empty array -> `[]`).
      * Binary array format: Int32 ndim (0 = empty), Int32 has-null flag, Int32 element OID, ndim x (Int32 size,
      * Int32 lower bound), then per element Int32 length (-1 = NULL element, written as `null`) + UTF-8 bytes.
-     * Multi-dimensional arrays are flattened.
+     * Multi-dimensional arrays are flattened. [sortBytes]: in ascending unsigned-byte order instead (the app sorts tag
+     * lists itself when the database collation is byte order; NULL elements first).
      */
-    fun textArray(row: Row, col: Int) {
+    fun textArray(row: Row, col: Int, sortBytes: Boolean = false) {
         sep()
         val o = out
         o.put('['.code)
@@ -292,6 +293,7 @@ class JsonWriter(@JvmField val out: ByteBuf) {
                 count *= b.intBE(p)
                 p += 8
             }
+            if (sortBytes && count > 1) return sortedElements(b, p, count)
             for (e in 0 until count) {
                 if (e > 0) o.put(','.code)
                 val n = b.intBE(p)
@@ -305,6 +307,52 @@ class JsonWriter(@JvmField val out: ByteBuf) {
             }
         }
         o.put(']'.code)
+    }
+
+    // (offset, length) of each element for [sortedElements]; grown on demand, kept per writer
+    private var elemOff = IntArray(16)
+    private var elemLen = IntArray(16)
+
+    /** The [count] elements starting at [p] (after the array header), insertion-sorted by bytes, then `]`. */
+    private fun sortedElements(b: ByteArray, start: Int, count: Int) {
+        if (count > elemOff.size) {
+            elemOff = IntArray(count)
+            elemLen = IntArray(count)
+        }
+        val offs = elemOff
+        val lens = elemLen
+        var p = start
+        for (e in 0 until count) {
+            val n = b.intBE(p)
+            p += 4
+            // insertion sort: tag lists are short (1-4 per seed article)
+            var j = e
+            while (j > 0 && compareBytes(b, p, n, offs[j - 1], lens[j - 1]) < 0) {
+                offs[j] = offs[j - 1]
+                lens[j] = lens[j - 1]
+                j--
+            }
+            offs[j] = p
+            lens[j] = n
+            if (n > 0) p += n
+        }
+        val o = out
+        for (e in 0 until count) {
+            if (e > 0) o.put(','.code)
+            if (lens[e] < 0) o.put(NULL) else quoted(b, offs[e], lens[e])
+        }
+        o.put(']'.code)
+    }
+
+    /** Unsigned lexicographic comparison of two byte ranges of [b]; a length of -1 (NULL) sorts first. */
+    private fun compareBytes(b: ByteArray, p1: Int, n1: Int, p2: Int, n2: Int): Int {
+        if (n1 < 0 || n2 < 0) return n1.coerceAtMost(0) - n2.coerceAtMost(0)
+        val n = minOf(n1, n2)
+        for (i in 0 until n) {
+            val d = (b[p1 + i].toInt() and 0xFF) - (b[p2 + i].toInt() and 0xFF)
+            if (d != 0) return d
+        }
+        return n1 - n2
     }
 
     private companion object {

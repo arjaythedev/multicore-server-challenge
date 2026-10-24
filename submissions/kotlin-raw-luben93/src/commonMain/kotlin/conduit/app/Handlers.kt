@@ -73,7 +73,7 @@ internal object Handlers {
         val j = ex.json
         j.beginObject()
         j.name(N_TAGS)
-        if (res.rowCount > 0) j.textArray(res.row(0), 1) else { j.beginArray(); j.endArray() }
+        if (res.rowCount > 0) j.textArray(res.row(0), 0) else { j.beginArray(); j.endArray() }
         j.endObject()
         ex.send(200)
     }

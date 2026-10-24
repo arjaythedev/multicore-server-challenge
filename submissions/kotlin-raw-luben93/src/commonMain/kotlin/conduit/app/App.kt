@@ -6,6 +6,21 @@ import conduit.http.Exchange
 
 /** The Conduit API: routing, auth, validation, SQL and JSON for all 19 endpoints. */
 object App {
+    /**
+     * Startup settings, before [reads] is first used. [collation] is the database's (provider, datcollate,
+     * datlocale) from [COLLATION_PROBE]; with a byte-order collation the app sorts tag lists itself, unless
+     * [appSortsTags] is false.
+     */
+    fun configure(collation: List<String?>?, appSortsTags: Boolean = true) {
+        TagOrder.appSorts = appSortsTags && collation != null &&
+            TagOrder.isByteOrder(collation[0] ?: "", collation[1] ?: "", collation[2] ?: "")
+    }
+
+    /** Who sorts tag lists (for the startup log line). */
+    val tagOrder: String get() = if (TagOrder.appSorts) "app" else "sql"
+
+    const val COLLATION_PROBE = TagOrder.PROBE
+
     /** Every batched read statement, prepared on every connection at startup. */
     val reads: List<ReadKind> get() = Sql.reads
 
