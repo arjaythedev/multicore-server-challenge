@@ -84,8 +84,10 @@ object Sql:
 
   // Fragments
 
-  /** `ARTICLE_LIST_SELECT`, or `ARTICLE_FULL_SELECT` with `withBody`. Lists read `NULL` for the body they leave out. */
-  private def articleSelect(withBody: Boolean): Fragment[Long] =
+  /** The columns of `ARTICLE_LIST_SELECT`, or of `ARTICLE_FULL_SELECT` with `withBody`, over a row source `a` with the
+    * article's columns. Lists read `NULL` for the body they leave out.
+    */
+  private def articleColumns(withBody: Boolean): Fragment[Long] =
     val body = if withBody then "a.body" else "NULL::text"
     sql"""SELECT a.id, a.slug, a.title, a.description, #$body, a.created_at, a.updated_at,
                  ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id
@@ -94,12 +96,14 @@ object Sql:
                  EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $int8) AS favorited,
                  u.username, u.bio, u.image,
                  EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $int8 AND fo.followee_id = a.author_id)
-                   AS following
-            FROM articles a
-            JOIN users u ON u.id = a.author_id""".contramap[Long](viewer => (viewer, viewer))
+                   AS following""".contramap[Long](viewer => (viewer, viewer))
 
-  private val listSelect = articleSelect(withBody = false)
-  private val fullSelect = articleSelect(withBody = true)
+  private val listColumns = articleColumns(withBody = false)
+
+  /** `ARTICLE_LIST_SELECT` and `ARTICLE_FULL_SELECT`. */
+  private val listSelect: Fragment[Long] = sql"$listColumns FROM articles a JOIN users u ON u.id = a.author_id"
+  private val fullSelect: Fragment[Long] =
+    sql"${articleColumns(withBody = true)} FROM articles a JOIN users u ON u.id = a.author_id"
 
   private val slugified = "trim(both '-' from lower(regexp_replace"
 
@@ -143,8 +147,20 @@ object Sql:
 
   // Articles
 
+  // Page first: the global and author lists cut the page from `articles` alone, then decorate only those rows. The
+  // reference (`ARTICLE_LIST_SELECT ... ORDER_PAGE`) also decorates every row that OFFSET skips (tags, favorite
+  // count, following): about 4x the time on page 5. The inner `LIMIT 100` is a constant on purpose (`limit` is at
+  // most 100, so the rows are the same): with `LIMIT $n` the generic plan picks a 2x slower plan for the author list.
+
+  /** The global list, page first. Replaces `ARTICLE_LIST_SELECT ORDER_PAGE`. */
   private val listAll: Query[(Long, Int, Int), ArticleRow] =
-    sql"$listSelect ORDER BY a.id DESC LIMIT $int4 OFFSET $int4".query(article)
+    sql"""$listColumns
+            FROM (SELECT id, slug, title, description, created_at, updated_at, author_id
+                    FROM articles ORDER BY id DESC OFFSET $int4 LIMIT 100) a
+            JOIN users u ON u.id = a.author_id
+           ORDER BY a.id DESC LIMIT $int4"""
+      .query(article)
+      .contramap[(Long, Int, Int)]((viewer, limit, offset) => (viewer, offset, limit))
 
   private val listByTag: Query[(Long, String, Int, Int), ArticleRow] =
     sql"""$listSelect WHERE a.id IN (SELECT at.article_id FROM article_tags at
@@ -152,9 +168,16 @@ object Sql:
                         ORDER BY at.article_id DESC LIMIT $int4 OFFSET $int4)
           ORDER BY a.id DESC""".query(article)
 
+  /** The author's list, page first. Replaces `ARTICLE_LIST_SELECT WHERE a.author_id = ... ORDER_PAGE`. */
   private val listByAuthor: Query[(Long, String, Int, Int), ArticleRow] =
-    sql"""$listSelect WHERE a.author_id = (SELECT au.id FROM users au WHERE au.username = $text)
-          ORDER BY a.id DESC LIMIT $int4 OFFSET $int4""".query(article)
+    sql"""$listColumns
+            FROM (SELECT id, slug, title, description, created_at, updated_at, author_id
+                    FROM articles WHERE author_id = (SELECT au.id FROM users au WHERE au.username = $text)
+                   ORDER BY id DESC OFFSET $int4 LIMIT 100) a
+            JOIN users u ON u.id = a.author_id
+           ORDER BY a.id DESC LIMIT $int4"""
+      .query(article)
+      .contramap[(Long, String, Int, Int)]((viewer, author, limit, offset) => (viewer, author, offset, limit))
 
   private val listByFavorited: Query[(Long, String, Int, Int), ArticleRow] =
     sql"""$listSelect WHERE a.id IN (SELECT f.article_id FROM favorites f
