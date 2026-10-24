@@ -1,6 +1,7 @@
 package conduit
 
 import cats.effect.*
+import cats.effect.std.Console
 import cats.syntax.all.*
 import com.comcast.ip4s.{Host, Port}
 import com.zaxxer.hikari.HikariConfig
@@ -80,11 +81,14 @@ object Main extends IOApp.Simple:
         .withPort(config.port)
         .withHttpApp(api.app)
         .withMaxConnections(config.maxConnections)
-        // Load-test users think for up to 70 s between pages; keep their keep-alive connections open.
-        .withIdleTimeout(5.minutes)
+        // Users think for up to 70 s between pages; keep their keep-alive connections open until they close them.
+        // A finite idle timeout would race a timer against every socket read.
+        .withIdleTimeout(Duration.Inf)
         // Requests are small; a small read buffer keeps tens of thousands of idle connections cheap.
         .withReceiveBufferSize(8 * 1024)
         .withShutdownTimeout(1.second)
         .build
+      raised <- Resource.eval(ListenBacklog.raise(config.port.value, 65535))
+      _ <- Resource.eval(IO.unlessA(raised)(Console[IO].errorln("could not raise the listen backlog")))
     yield ()
     server.useForever.void

@@ -34,6 +34,7 @@ Optional knobs (env): `DB_POOL_SIZE` (default 4 per core, so 32 on the 8-core bo
 | File | What |
 |---|---|
 | `Main.scala` | Config from env, the Hikari transactor, the bcrypt pool, the Ember server |
+| `ListenBacklog.scala` | Raises the listen backlog (see below) |
 | `Api.scala` | The 19 routes, auth, pagination, the error mapping |
 | `Sql.scala` | The reference SQL as doobie `ConnectionIO` programs |
 | `Body.scala` | Request-body validation (strict JSON types, 422 on anything malformed) |
@@ -43,8 +44,18 @@ Optional knobs (env): `DB_POOL_SIZE` (default 4 per core, so 32 on the 8-core bo
 ## Optimizations, and why
 
 - **Direct instead of Nginx.** Nginx used about 11% of the box in the video. Ember holds every keep-alive
-  connection as a fiber. It accepts up to 150,000 connections (`LimitNOFILE` is 200,000) and keeps idle ones for
-  5 minutes, which is longer than the 70 s maximum think time.
+  connection as a fiber. It accepts up to 150,000 connections (`LimitNOFILE` is 200,000). An open connection costs
+  about 35 KB of heap (fs2's 8 KB socket buffer, plus about ten fibers and twenty fs2 scopes, measured with a heap
+  histogram), so the 4 GB heap holds about 100,000 of them.
+- **Idle connections stay open** until the client closes them. A virtual user keeps its connection for the whole
+  session and thinks for up to 70 s. With a finite idle timeout, Ember races a timer against every socket read
+  (about 4% more CPU per request in a local A/B test).
+- **A listen backlog of 4,096 instead of 50.** fs2 binds with Java's default backlog of 50, and neither fs2 nor Ember
+  has a setting for it. When users arrive faster than the accept loop takes them, the kernel's accept queue
+  overflows, and each dropped handshake comes back as a 1–3 s retransmit. On Linux, calling `listen()` again on a
+  listening socket changes its backlog, so `ListenBacklog.scala` finds the socket among the process's descriptors
+  and does that through the JDK's foreign function API. The kernel caps it at `net.core.somaxconn` (4,096 on Ubuntu
+  24.04).
 - **A small read buffer (8 KB).** Requests are small. Ember's default is 256 KB per read, which multiplied over tens
   of thousands of open connections would use too much heap.
 - **Autocommit for single statements.** Most endpoints run one or two statements. The transactor for them uses
