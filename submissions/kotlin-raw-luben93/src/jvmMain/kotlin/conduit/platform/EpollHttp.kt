@@ -185,7 +185,11 @@ private const val EP_READ_CHUNK = 64 * 1024
 private const val EP_TASKS_PER_TURN = 4096
 
 internal class EpollLoop(private val index: Int, private val listenFd: Int, private val engine: HttpEngine) {
-    private val arena = Arena.ofShared() // lives as long as the loop (forever)
+    /**
+     * The global arena: these segments live as long as the loop (forever), and a downcall taking a global segment
+     * does not acquire/release a shared session (an atomic op per call: ~1% of the app CPU samples with ofShared).
+     */
+    private val arena = Arena.global()
     private val epfd = Sys.epollCreate()
     private val wakeFd = Sys.eventFd()
     private val events: MemorySegment = arena.allocate(Sys.EVENT_SIZE * EVENTS)
