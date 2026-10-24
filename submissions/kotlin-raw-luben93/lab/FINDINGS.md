@@ -1,7 +1,7 @@
 # Findings so far (paused 2026-10-24)
 
 Everything we measured and learned while building the two Kotlin submissions, so work can resume anywhere.
-Full research notes (verbatim SQL of the top entries, conformance checklist, every study's raw tables) are on the
+Every experiment with its outcome (kept / rejected / not done and why) is in TRIED.md. Full research notes (verbatim SQL of the top entries, conformance checklist, every study's raw tables) are on the
 branch `research-notes` (folder `research/`).
 
 ## Branches
