@@ -16,6 +16,11 @@ fn envInt(init: std.process.Init, name: []const u8, default: u32) u32 {
 }
 
 pub fn main(init: std.process.Init) !void {
+    // A write to a connection the peer has closed must fail with EPIPE, not kill the process (the Postgres handshake
+    // uses plain writes; everything else already passes MSG_NOSIGNAL).
+    const ignore: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.IGN }, .mask = linux.sigemptyset(), .flags = 0 };
+    _ = linux.sigaction(.PIPE, &ignore, null);
+
     const gpa = @import("buf.zig").gpa;
     const url = init.environ_map.get("DATABASE_URL") orelse "postgres://conduit:conduit@127.0.0.1:5432/conduit";
     const secret = init.environ_map.get("JWT_SECRET") orelse return error.MissingJwtSecret;
@@ -56,10 +61,10 @@ pub fn main(init: std.process.Init) !void {
         .threads = threads,
         .pg_read = @max(1, (total_conns -| writes_total) / workers),
         .pg_write = @max(1, writes_total / workers),
-        .pg_depth = @min(envInt(init, "PG_DEPTH", 4), 64),
+        .pg_depth = std.math.clamp(envInt(init, "PG_DEPTH", 4), 1, 32), // a group commit may go one past the cap; the reply ring holds 64
         .batch_max = @max(1, @min(envInt(init, "BATCH_MAX", 64), 64)),
-        .bc_threads = envInt(init, "BCRYPT_THREADS", @max(1, (cpus / 4 + procs - 1) / procs)),
-        .bc_lanes = @min(envInt(init, "BCRYPT_LANES", 4), bcrypt.max_lanes),
+        .bc_threads = @max(1, envInt(init, "BCRYPT_THREADS", @max(1, (cpus / 4 + procs - 1) / procs))),
+        .bc_lanes = std.math.clamp(envInt(init, "BCRYPT_LANES", 4), 1, bcrypt.max_lanes),
         .bc_wait_ms = envInt(init, "BCRYPT_WAIT_MS", 250),
         .stats = init.environ_map.get("STATS") != null,
         .no_pbuf = init.environ_map.get("NO_PBUF") != null,

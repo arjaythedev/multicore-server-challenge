@@ -17,10 +17,12 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
+    // The bcrypt kernel is hand-written assembly that needs the register allocator of an optimized build, so a Debug
+    // `zig build test` is run as a safe-optimized build (bounds and overflow checks stay on).
     const tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/all_tests.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = if (optimize == .debug) .safe else optimize,
     }) });
     const bc = b.createModule(.{ .root_source_file = b.path("src/bcrypt.zig"), .target = target, .optimize = optimize });
     const bench = b.addExecutable(.{ .name = "bench-bcrypt", .root_module = b.createModule(.{

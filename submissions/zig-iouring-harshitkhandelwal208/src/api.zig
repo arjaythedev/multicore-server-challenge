@@ -525,7 +525,8 @@ fn login(c: *Ctx) RouteError!void {
     jp.parseWrapped(c.body, &w.scratch, "user", &.{ "email", "password" }, &.{}, &f) catch return unprocessable(c, "invalid request body");
     const email = jp.needString(f[0]) orelse return unprocessable(c, "email can't be blank");
     const pw = jp.needString(f[1]) orelse return unprocessable(c, "password can't be blank");
-    if (pw.len > 72) return unprocessable(c, "password must be at most 72 bytes");
+    // bcrypt only uses 72 bytes, and no registered password is longer: a longer one cannot match.
+    if (pw.len > 72) return fail(c, 401, "invalid email or password");
     var e = beginBatch(w);
     e.bind(sql.id(.user_login));
     e.pText(email);
@@ -919,6 +920,9 @@ fn onArticleUpdated(w: *Worker, r: *Req, batch: []const u8) void {
         errorBody(w, "forbidden");
         return doneReq(w, r, 403);
     }
+    // The author's UPDATE found nothing to change (the article was deleted or renamed after the statement's
+    // snapshot): the updated-row columns are all NULL.
+    if (col[2] == null) return notFound(w, r, "article not found");
     w.out.putSlice("{\"article\":");
     writeArticle(w, col[2..16], true);
     w.out.put('}');
@@ -1017,8 +1021,10 @@ fn onCommentCreated(w: *Worker, r: *Req, batch: []const u8) void {
 fn commentDelete(c: *Ctx, raw_slug: []const u8, raw_id: []const u8) RouteError!void {
     try authenticate(c, true);
     const w = c.w;
+    // ASCII digits only (parseInt would also take a sign and `_` separators)
+    if (raw_id.len == 0 or raw_id.len > 18) return fail(c, 404, "comment not found");
+    for (raw_id) |ch| if (ch < '0' or ch > '9') return fail(c, 404, "comment not found");
     const id = std.fmt.parseInt(i64, raw_id, 10) catch return fail(c, 404, "comment not found");
-    if (raw_id.len == 0 or raw_id[0] == '+') return fail(c, 404, "comment not found");
     const slug = try decodeSeg(c, raw_slug);
     var e = beginBatch(w);
     e.bind(sql.id(.comment_delete));

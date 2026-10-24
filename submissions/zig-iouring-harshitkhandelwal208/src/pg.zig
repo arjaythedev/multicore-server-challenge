@@ -134,12 +134,25 @@ pub const session_params = [_][2][]const u8{
     .{ "application_name", "conduit-zig" },
 };
 
+fn setTimeouts(fd: i32, secs: i64) void {
+    const tv: linux.timeval = .{ .sec = secs, .usec = 0 };
+    inline for (.{ linux.SO.RCVTIMEO, linux.SO.SNDTIMEO }) |o| {
+        _ = linux.setsockopt(fd, linux.SOL.SOCKET, o, @ptrCast(&tv), @sizeOf(linux.timeval));
+    }
+}
+
+/// Removes the handshake timeouts once the connection is ready (the event loop owns it from then on).
+pub fn clearTimeouts(fd: i32) void {
+    setTimeouts(fd, 0);
+}
+
 /// Connects, authenticates and returns a connected socket (blocking mode) once ReadyForQuery arrives.
 pub fn connect(cfg: Config) !i32 {
     const s = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
     if (sys.errnoOf(s) != .SUCCESS) return error.SocketFailed;
     const fd: i32 = @intCast(s);
     errdefer _ = linux.close(fd);
+    setTimeouts(fd, 5); // a stalled server must not hang the handshake (connect honours SO_SNDTIMEO)
     var sa: linux.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, cfg.port), .addr = @bitCast(cfg.addr) };
     if (sys.errnoOf(linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.ConnectFailed;
     const one: c_int = 1;

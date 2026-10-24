@@ -290,6 +290,8 @@ pub const Worker = struct {
     pbuf_tail: u16 = 0,
     scratch_rx: []u8 = &.{},
     accept_live: bool = false,
+    rc_busy: u32 = 0, // a reconnect thread is running (atomic)
+    rc_fd: i32 = -1, // a connected, prepared socket waiting for the loop to adopt (atomic)
     partials: std.ArrayList(i32) = .empty,
     tick: linux.kernel_timespec = .{ .sec = 1, .nsec = 0 },
     stats: struct { reqs: u64 = 0, pg_batches: u64 = 0, fifo_max: usize = 0, batched_reqs: u64 = 0, batches: u64 = 0 } = .{},
@@ -439,6 +441,14 @@ pub const Worker = struct {
         if (c.pend_cap != 0) gpa.free(c.pend[0..c.pend_cap]);
         c.pend_len = 0;
         c.pend_cap = 0;
+        if (self.pbuf_ring == null and c.recv_live) {
+            // Poll + recv fallback: a multishot poll does not end on shutdown, so remove it explicitly (its final
+            // completion carries this connection's generation and is ignored).
+            const rm = self.sqe();
+            rm.prep_poll_remove(ud(.poll, c.gen, @intCast(fd)));
+            rm.user_data = ud(.shut, 0, 0);
+            c.recv_live = false;
+        }
         if (c.recv_live or c.send_live) {
             const s = self.sqe();
             s.prep_rw(.SHUTDOWN, fd, 0, 0, 0);
@@ -565,7 +575,7 @@ pub const Worker = struct {
         @memcpy(c.pend[c.pend_len..][0..data.len], data);
         if (c.pend_len == 0) c.since = @intCast(self.now & 0x7fffffff);
         c.pend_len += @intCast(data.len);
-        if (!c.tracked and !c.busy) {
+        if (!c.tracked) {
             c.tracked = true;
             self.partials.append(gpa, fd) catch {};
         }
@@ -815,22 +825,46 @@ pub const Worker = struct {
         }
     }
 
+    /// Dead Postgres connections are replaced by a helper thread, so a slow or stalled server cannot freeze the loop;
+    /// the loop adopts the finished socket from `onEvent`.
     fn pgReconnect(self: *Worker) void {
+        var dead = false;
+        for (self.pgs) |*p| dead = dead or !p.alive;
+        if (!dead) return;
+        if (@cmpxchgStrong(u32, &self.rc_busy, 0, 1, .acq_rel, .monotonic) != null) return;
+        const t = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, Worker.reconnectMain, .{self}) catch {
+            @atomicStore(u32, &self.rc_busy, 0, .release);
+            return;
+        };
+        t.detach();
+    }
+
+    fn reconnectMain(self: *Worker) void {
+        if (pg.connect(self.shared.cfg.db)) |fd| {
+            if (pg.prepareAll(fd, &prepare_list)) {
+                pg.clearTimeouts(fd);
+                setNonblock(fd);
+                @atomicStore(i32, &self.rc_fd, fd, .release);
+                var one: u64 = 1;
+                _ = linux.write(self.sink.efd, std.mem.asBytes(&one), 8);
+                return;
+            } else |_| _ = linux.close(fd);
+        } else |_| {}
+        @atomicStore(u32, &self.rc_busy, 0, .release);
+    }
+
+    fn adoptReconnected(self: *Worker, fd: i32) void {
         for (self.pgs) |*p| {
             if (p.alive) continue;
-            const fd = pg.connect(self.shared.cfg.db) catch continue;
-            pg.prepareAll(fd, &prepare_list) catch {
-                _ = linux.close(fd);
-                continue;
-            };
-            setNonblock(fd);
             p.fd = fd;
             p.alive = true;
             log.info("postgres connection re-established", .{});
             self.pgArmRecv(p);
             self.pgDrain(p.class);
             self.flushReads();
+            return;
         }
+        _ = linux.close(fd);
     }
 
     fn failToken(self: *Worker, token: usize) void {
@@ -1171,6 +1205,12 @@ pub const Worker = struct {
                 api.onBcrypt(self, r, d);
             }
         }
+        const rfd = @atomicLoad(i32, &self.rc_fd, .acquire);
+        if (rfd >= 0) {
+            @atomicStore(i32, &self.rc_fd, -1, .release);
+            self.adoptReconnected(rfd);
+            @atomicStore(u32, &self.rc_busy, 0, .release);
+        }
         self.armEvent();
     }
 
@@ -1346,6 +1386,7 @@ fn workerInit(shared: *Shared, id: usize) !void {
     for (w.pgs, 0..) |*p, i| {
         const fd = try pg.connect(cfg.db);
         try pg.prepareAll(fd, &prepare_list);
+        pg.clearTimeouts(fd);
         setNonblock(fd);
         p.* = .{ .fd = fd, .class = if (i < cfg.pg_read) .read else .write, .alive = true };
         p.rs = try pg.Stream.init(64 * 1024);

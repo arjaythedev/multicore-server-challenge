@@ -4,6 +4,7 @@ const Scratch = @import("scratch.zig").Scratch;
 
 pub const max_head = 16 * 1024;
 pub const max_body = 8 * 1024 * 1024;
+pub const max_chunks = 1024;
 
 pub const Method = enum { get, post, put, delete, other };
 
@@ -77,7 +78,7 @@ pub fn parseHead(data: []const u8) Parsed {
         const val = trimOws(l[colon + 1 ..]);
         switch (name.len) {
             13 => if (std.ascii.eqlIgnoreCase(name, "authorization")) {
-                h.auth = val;
+                h.auth = if (val.len == 0) null else val; // an empty header is no credential
             },
             14 => if (std.ascii.eqlIgnoreCase(name, "content-length")) {
                 if (val.len == 0 or val.len > 12) return .{ .bad = 400 };
@@ -122,8 +123,11 @@ pub fn takeBody(h: *const Head, rest: []const u8, sc: *Scratch) Body {
         return .{ .ok = .{ .data = rest[0..h.content_length], .consumed = h.content_length } };
     }
     // Chunked: validate the framing first (sizes), then copy the payload into scratch memory.
+    // Framing is re-checked from the start whenever more bytes arrive, so the number of chunks is capped: a body of
+    // thousands of tiny chunks would otherwise cost quadratic work.
     var pos: usize = 0;
     var total: usize = 0;
+    var n_chunks: usize = 0;
     while (true) {
         const le = std.mem.indexOfPos(u8, rest, pos, "\r\n") orelse return if (rest.len - pos > 1024) .{ .bad = 400 } else .need_more;
         var size_s = rest[pos..le];
@@ -143,6 +147,8 @@ pub fn takeBody(h: *const Head, rest: []const u8, sc: *Scratch) Body {
             break;
         }
         total += size;
+        n_chunks += 1;
+        if (n_chunks > max_chunks) return .{ .bad = 413 };
         if (total > max_body) return .{ .bad = 413 };
         if (pos + size + 2 > rest.len) return .need_more;
         if (rest[pos + size] != '\r' or rest[pos + size + 1] != '\n') return .{ .bad = 400 };
