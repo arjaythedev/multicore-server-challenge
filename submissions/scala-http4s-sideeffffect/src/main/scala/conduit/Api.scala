@@ -3,7 +3,7 @@ package conduit
 import at.favre.lib.crypto.bcrypt.BCrypt
 import cats.effect.IO
 import cats.syntax.all.*
-import skunk.{Session, SqlState}
+import skunk.SqlState
 import io.circe.{Encoder, Json}
 import io.circe.syntax.*
 import org.http4s.*
@@ -94,42 +94,26 @@ final class Api(db: Db, jwt: Jwt, bcryptPool: ExecutionContext):
       .orElse(present("favorited").map(Filter.Favorited(_)))
       .getOrElse(Filter.All)
 
-  private def articleById(session: Session[IO], viewer: Long, id: Long): IO[Article] =
-    session.option(Sql.articleById)((viewer, id)).flatMap(found("article")).map(_.toArticle)
-
-  private def articleId(session: Session[IO], slug: String): IO[Long] =
-    session.option(Sql.articleId)(slug).flatMap(found("article"))
-
-  /** The article's id, if the caller wrote it: 404 if there is no such article, 403 if it is someone else's. */
-  private def owned(session: Session[IO], caller: Caller, slug: String): IO[Long] =
-    session.option(Sql.articleOwner)(slug).flatMap(found("article")).flatMap { (id, author) =>
-      IO.raiseUnless(author == caller.id)(ApiError.forbidden).as(id)
-    }
+  /** 404 if the owner lookup found nothing, 403 if the row belongs to someone else (the statement changed nothing). */
+  private def ownedBy(caller: Caller, what: String)(author: Option[Long]): IO[Unit] =
+    found(what)(author).flatMap(author => IO.raiseUnless(author == caller.id)(ApiError.forbidden))
 
   private def setFavorite(request: Request[IO], slug: String, on: Boolean): IO[Response[IO]] =
     for
       caller <- required(request)
-      article <- db.write.use { session =>
-        for
-          id <- articleId(session, slug)
-          _ <- session.execute(if on then Sql.favorite else Sql.unfavorite)((caller.id, id))
-          article <- articleById(session, caller.id, id)
-        yield article
-      }
-      response <- ok("article", article)
+      article <- db.write
+        .use(_.option(if on then Sql.favorite else Sql.unfavorite)((caller.id, slug)))
+        .flatMap(found("article"))
+      response <- ok("article", article.toArticle)
     yield response
 
   private def setFollow(request: Request[IO], username: String, on: Boolean): IO[Response[IO]] =
     for
       caller <- required(request)
-      profile <- db.write.use { session =>
-        for
-          target <- session.option(Sql.userByUsername)(username).flatMap(found("profile"))
-          (id, profile) = target
-          _ <- session.execute(if on then Sql.follow else Sql.unfollow)((caller.id, id))
-        yield profile.copy(following = on)
-      }
-      response <- ok("profile", profile)
+      profile <- db.write
+        .use(_.option(if on then Sql.follow else Sql.unfollow)((caller.id, username)))
+        .flatMap(found("profile"))
+      response <- ok("profile", profile.copy(following = on))
     yield response
 
   val routes: HttpRoutes[IO] = HttpRoutes.of[IO] {
@@ -243,16 +227,8 @@ final class Api(db: Db, jwt: Jwt, bcryptPool: ExecutionContext):
           ).tupled
         )
         (title, description, body, tags) = fields
-        article <- db.write.use { session =>
-          session.transaction
-            .surround(
-              session
-                .unique(Sql.insertArticle)((caller.id, title, description, body))
-                .flatTap(id => Sql.insertTags(session, id, tags).whenA(tags.nonEmpty))
-            )
-            .flatMap(articleById(session, caller.id, _))
-        }
-        response <- created("article", article)
+        article <- db.write.use(_.unique(Sql.createArticle)((caller.id, title, description, body, tags)))
+        response <- created("article", article.toArticle)
       yield response
 
     case request @ PUT -> Root / "api" / "articles" / slug =>
@@ -267,20 +243,16 @@ final class Api(db: Db, jwt: Jwt, bcryptPool: ExecutionContext):
           ).tupled
         )
         (title, description, body) = fields
-        updated <- db.write.use { session =>
-          for
-            id <- owned(session, caller, slug)
-            _ <- session.execute(Sql.updateArticle)((title, description, body, id))
-            updated <- articleById(session, caller.id, id)
-          yield updated
-        }
-        response <- ok("article", updated)
+        result <- db.write.use(_.option(Sql.updateArticle)((title, description, body, caller.id, slug)))
+        _ <- ownedBy(caller, "article")(result.map(_._1))
+        updated <- found("article")(result.flatMap(_._2))
+        response <- ok("article", updated.toArticle)
       yield response
 
     case request @ DELETE -> Root / "api" / "articles" / slug =>
       for
         caller <- required(request)
-        _ <- db.write.use(session => owned(session, caller, slug).flatMap(session.execute(Sql.deleteArticle)))
+        _ <- db.write.use(_.option(Sql.deleteArticle)((caller.id, slug))).flatMap(ownedBy(caller, "article"))
       yield Response(Status.NoContent)
 
     // Favorites
@@ -305,9 +277,7 @@ final class Api(db: Db, jwt: Jwt, bcryptPool: ExecutionContext):
         caller <- required(request)
         comment <- Body.wrapped(request, "comment")
         body <- IO.fromEither(Body.required(comment, "body"))
-        row <- db.write.use(session =>
-          articleId(session, slug).flatMap(id => session.unique(Sql.insertComment)((id, caller.id, body)))
-        )
+        row <- db.write.use(_.option(Sql.insertComment)((slug, caller.id, body))).flatMap(found("article"))
         response <- created("comment", row.toComment)
       yield response
 
@@ -315,13 +285,7 @@ final class Api(db: Db, jwt: Jwt, bcryptPool: ExecutionContext):
       for
         caller <- required(request)
         id <- IO.fromOption(Body.unsigned(commentId))(ApiError.notFound("comment"))
-        _ <- db.write.use { session =>
-          for
-            author <- session.option(Sql.commentAuthor)((id, slug)).flatMap(found("comment"))
-            _ <- IO.raiseWhen(author != caller.id)(ApiError.forbidden)
-            _ <- session.execute(Sql.deleteComment)(id)
-          yield ()
-        }
+        _ <- db.write.use(_.option(Sql.deleteComment)((id, slug, caller.id))).flatMap(ownedBy(caller, "comment"))
       yield Response(Status.NoContent)
 
     // Tags

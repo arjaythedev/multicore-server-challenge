@@ -134,16 +134,29 @@ object Sql:
                  EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $int8 AND fo.followee_id = u.id)
             FROM users u WHERE u.username = $text""".query(profile)
 
-  val userByUsername: Query[String, (Long, Profile)] =
-    sql"SELECT id, username, bio, image FROM users WHERE username = $text"
-      .query(int8 *: text *: text.opt *: text.opt)
-      .map((id, name, bio, image) => (id, Profile(name, bio, image, following = false)))
+  // Writes: one statement each, with data-modifying CTEs. A CTE runs once and to completion whether or not the main
+  // query reads it, and the statement is atomic. The main query sees the snapshot from before the CTEs ran, so a
+  // read-back adds the CTE's own change where it matters.
 
-  val follow: Command[(Long, Long)] =
-    sql"INSERT INTO follows (follower_id, followee_id) VALUES ($int8, $int8) ON CONFLICT DO NOTHING".command
+  private val followee: Decoder[Profile] =
+    (text *: text.opt *: text.opt).map((name, bio, image) => Profile(name, bio, image, following = false))
 
-  val unfollow: Command[(Long, Long)] =
-    sql"DELETE FROM follows WHERE follower_id = $int8 AND followee_id = $int8".command
+  /** Follow and return the followee's profile (no row: no such user). Replaces the reference's user lookup + insert. */
+  val follow: Query[(Long, String), Profile] =
+    sql"""WITH target AS (SELECT id, username, bio, image FROM users WHERE username = $text),
+               changed AS (INSERT INTO follows (follower_id, followee_id) SELECT $int8, id FROM target
+                           ON CONFLICT DO NOTHING)
+          SELECT username, bio, image FROM target"""
+      .query(followee)
+      .contramap[(Long, String)]((viewer, username) => (username, viewer))
+
+  /** Unfollow and return the profile (no row: no such user). Replaces the reference's user lookup + delete. */
+  val unfollow: Query[(Long, String), Profile] =
+    sql"""WITH target AS (SELECT id, username, bio, image FROM users WHERE username = $text),
+               changed AS (DELETE FROM follows WHERE follower_id = $int8 AND followee_id = (SELECT id FROM target))
+          SELECT username, bio, image FROM target"""
+      .query(followee)
+      .contramap[(Long, String)]((viewer, username) => (username, viewer))
 
   // Articles
 
@@ -247,53 +260,99 @@ object Sql:
 
   val articleBySlug: Query[(Long, String), ArticleRow] = sql"$fullSelect WHERE a.slug = $text".query(article)
 
-  val articleById: Query[(Long, Long), ArticleRow] = sql"$fullSelect WHERE a.id = $int8".query(article)
+  /** Create an article with its tags and read it back, in one statement (so in one transaction, as the spec asks).
+    * Replaces the reference's five statements (BEGIN, article, tags, article_tags, COMMIT) and the read-back after.
+    * Tags are inserted sorted, so concurrent creates lock shared tag rows in the same order. `DO UPDATE` (to the same
+    * name) returns the id of a tag that already exists, even one committed after this statement's snapshot, which `DO
+    * NOTHING` would skip. A new article has no favorites, and its tags come straight from the insert.
+    */
+  val createArticle: Query[(Long, String, String, String, List[String]), ArticleRow] =
+    sql"""WITH n AS (SELECT nextval(pg_get_serial_sequence('articles', 'id')) AS id),
+               a AS (INSERT INTO articles (id, slug, author_id, title, description, body)
+                     SELECT n.id, #$slugified($text, '[^A-Za-z0-9]+', '-', 'g'))) || '-' || n.id, $int8, $text, $text,
+                            $text
+                       FROM n
+                     RETURNING id, slug, title, description, body, created_at, updated_at, author_id),
+               t AS (INSERT INTO tags (name) SELECT DISTINCT unnest($_text::text[]) ORDER BY 1
+                     ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+                     RETURNING id, name),
+               at AS (INSERT INTO article_tags (article_id, tag_id) SELECT a.id, t.id FROM a, t)
+          SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at,
+                 ARRAY(SELECT name FROM t ORDER BY name), 0::int8, false,
+                 u.username, u.bio, u.image,
+                 EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = a.author_id AND fo.followee_id = a.author_id)
+            FROM a JOIN users u ON u.id = a.author_id"""
+      .query(article)
+      .contramap[(Long, String, String, String, List[String])]((author, title, description, body, tags) =>
+        (title, author, title, description, body, Arr.fromFoldable(tags))
+      )
 
-  /** `$2` (the title) appears twice: once slugified, once as the title. */
-  val insertArticle: Query[(Long, String, String, String), Long] =
-    sql"""INSERT INTO articles (id, slug, author_id, title, description, body)
-          SELECT n.id, #$slugified($text, '[^A-Za-z0-9]+', '-', 'g'))) || '-' || n.id, $int8, $text, $text, $text
-            FROM (SELECT nextval(pg_get_serial_sequence('articles', 'id')) AS id) n
-          RETURNING id"""
+  /** Update an article the caller owns and read it back. `None`: no such article; `Some((author, None))`: someone
+    * else's (nothing changed). Replaces the reference's owner lookup + update + read-back. The read-back decorates the
+    * updated row from `RETURNING`; tags and favorites don't change here.
+    */
+  val updateArticle: Query[(Option[String], Option[String], Option[String], Long, String), (Long, Option[ArticleRow])] =
+    sql"""WITH target AS (SELECT id, author_id FROM articles WHERE slug = $text),
+               updated AS (
+                 UPDATE articles SET title = COALESCE(${text.opt}, title),
+                                     description = COALESCE(${text.opt}, description),
+                                     body = COALESCE(${text.opt}, body),
+                                     slug = CASE WHEN ${text.opt}::text IS NULL THEN slug
+                                                 ELSE #$slugified(${text.opt}, '[^A-Za-z0-9]+', '-', 'g'))) || '-' || id
+                                            END,
+                                     updated_at = now()
+                  WHERE id = (SELECT id FROM target) AND author_id = $int8
+                 RETURNING id, slug, title, description, body, created_at, updated_at, author_id)
+          SELECT target.author_id, p.*
+            FROM target
+            LEFT JOIN LATERAL (
+              ${articleColumns(withBody = true)} FROM updated a JOIN users u ON u.id = a.author_id) p ON true"""
+      .query(int8 *: article.opt)
+      .contramap[(Option[String], Option[String], Option[String], Long, String)](
+        (title, description, body, viewer, slug) => (slug, title, description, body, title, title, viewer, viewer)
+      )
+
+  /** Delete an article the caller owns. `None`: no such article; otherwise its author (nothing deleted unless it is the
+    * caller). Replaces the reference's owner lookup + delete.
+    */
+  val deleteArticle: Query[(Long, String), Long] =
+    sql"""WITH target AS (SELECT id, author_id FROM articles WHERE slug = $text),
+               gone AS (DELETE FROM articles WHERE id = (SELECT id FROM target) AND author_id = $int8)
+          SELECT author_id FROM target"""
       .query(int8)
-      .contramap[(Long, String, String, String)]((author, title, description, body) =>
-        (title, author, title, description, body)
-      )
+      .contramap[(Long, String)]((viewer, slug) => (slug, viewer))
 
-  private val insertTagNames: Command[Arr[String]] =
-    sql"INSERT INTO tags (name) SELECT DISTINCT unnest($_text::text[]) ON CONFLICT (name) DO NOTHING".command
+  /** The read-back of a favorite toggle: `ARTICLE_FULL_SELECT` for `target`, with the toggle's own change added to the
+    * count (`changed` returns one row if it changed anything) and `favorited` known.
+    */
+  private def toggledArticle(sign: String, favorited: Boolean): Fragment[Long] =
+    sql"""SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at,
+                 ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id
+                        WHERE at.article_id = a.id ORDER BY t.name),
+                 (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) #$sign (SELECT count(*) FROM changed),
+                 #${favorited.toString},
+                 u.username, u.bio, u.image,
+                 EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $int8 AND fo.followee_id = a.author_id)
+            FROM articles a JOIN users u ON u.id = a.author_id
+           WHERE a.id = (SELECT id FROM target)"""
 
-  private val insertArticleTags: Command[(Long, Arr[String])] =
-    sql"""INSERT INTO article_tags (article_id, tag_id)
-          SELECT $int8, t.id FROM tags t WHERE t.name = ANY($_text::text[])""".command
+  /** Favorite and read the article back (no row: no such article). Replaces lookup + insert + read-back. */
+  val favorite: Query[(Long, String), ArticleRow] =
+    sql"""WITH target AS (SELECT id FROM articles WHERE slug = $text),
+               changed AS (INSERT INTO favorites (user_id, article_id) SELECT $int8, id FROM target
+                           ON CONFLICT DO NOTHING RETURNING 1)
+          ${toggledArticle("+", favorited = true)}"""
+      .query(article)
+      .contramap[(Long, String)]((viewer, slug) => (slug, viewer, viewer))
 
-  def insertTags(session: Session[IO], articleId: Long, tags: List[String]): IO[Unit] =
-    val names = Arr.fromFoldable(tags)
-    session.execute(insertTagNames)(names) *> session.execute(insertArticleTags)((articleId, names)).void
-
-  val articleOwner: Query[String, (Long, Long)] =
-    sql"SELECT id, author_id FROM articles WHERE slug = $text".query(int8 *: int8)
-
-  val updateArticle: Command[(Option[String], Option[String], Option[String], Long)] =
-    sql"""UPDATE articles SET title = COALESCE(${text.opt}, title), description = COALESCE(${text.opt}, description),
-                 body = COALESCE(${text.opt}, body),
-                 slug = CASE WHEN ${text.opt}::text IS NULL THEN slug
-                             ELSE #$slugified(${text.opt}, '[^A-Za-z0-9]+', '-', 'g'))) || '-' || id END,
-                 updated_at = now()
-           WHERE id = $int8""".command
-      .contramap[(Option[String], Option[String], Option[String], Long)]((title, description, body, id) =>
-        (title, description, body, title, title, id)
-      )
-
-  val deleteArticle: Command[Long] = sql"DELETE FROM articles WHERE id = $int8".command
-
-  val articleId: Query[String, Long] = sql"SELECT id FROM articles WHERE slug = $text".query(int8)
-
-  val favorite: Command[(Long, Long)] =
-    sql"INSERT INTO favorites (user_id, article_id) VALUES ($int8, $int8) ON CONFLICT DO NOTHING".command
-
-  val unfavorite: Command[(Long, Long)] =
-    sql"DELETE FROM favorites WHERE user_id = $int8 AND article_id = $int8".command
+  /** Unfavorite and read the article back (no row: no such article). Replaces lookup + delete + read-back. */
+  val unfavorite: Query[(Long, String), ArticleRow] =
+    sql"""WITH target AS (SELECT id FROM articles WHERE slug = $text),
+               changed AS (DELETE FROM favorites WHERE user_id = $int8 AND article_id = (SELECT id FROM target)
+                           RETURNING 1)
+          ${toggledArticle("-", favorited = false)}"""
+      .query(article)
+      .contramap[(Long, String)]((viewer, slug) => (slug, viewer, viewer))
 
   // Comments
 
@@ -313,17 +372,22 @@ object Sql:
            WHERE a.slug = $text
            ORDER BY c.created_at DESC, c.id DESC""".query(int8 *: comment.opt)
 
-  val insertComment: Query[(Long, Long, String), CommentRow] =
-    sql"""WITH c AS (INSERT INTO comments (article_id, author_id, body) VALUES ($int8, $int8, $text)
+  /** Comment on an article (no row: no such article). Replaces the reference's article lookup + insert. */
+  val insertComment: Query[(String, Long, String), CommentRow] =
+    sql"""WITH target AS (SELECT id FROM articles WHERE slug = $text),
+               c AS (INSERT INTO comments (article_id, author_id, body) SELECT id, $int8, $text FROM target
                      RETURNING id, body, created_at, updated_at, author_id)
           SELECT c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image, false
             FROM c JOIN users u ON u.id = c.author_id""".query(comment)
 
-  val commentAuthor: Query[(Long, String), Long] =
-    sql"""SELECT c.author_id FROM comments c JOIN articles a ON a.id = c.article_id
-           WHERE c.id = $int8 AND a.slug = $text""".query(int8)
-
-  val deleteComment: Command[Long] = sql"DELETE FROM comments WHERE id = $int8".command
+  /** Delete a comment the caller wrote. `None`: no such comment on that article; otherwise its author (nothing deleted
+    * unless it is the caller). Replaces the reference's owner lookup + delete.
+    */
+  val deleteComment: Query[(Long, String, Long), Long] =
+    sql"""WITH target AS (SELECT c.id, c.author_id FROM comments c JOIN articles a ON a.id = c.article_id
+                           WHERE c.id = $int8 AND a.slug = $text),
+               gone AS (DELETE FROM comments WHERE id = (SELECT id FROM target) AND author_id = $int8)
+          SELECT author_id FROM target""".query(int8)
 
   // Tags
 
