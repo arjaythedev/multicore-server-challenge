@@ -30,15 +30,18 @@ statement: the request's query is the inner side of a `LATERAL` join over `unnes
 waiting requests' parameters, and each row comes back tagged with its request's index. Measured
 on the article by slug: 161 us of Postgres CPU per request sent alone, 53 us per request in batches
 of 10. There is no timer: a read waits only while every read connection has a statement in flight,
-and the kind whose oldest read has waited longest goes next (up to 32 requests). At low load every
-batch is one request; under load batches grow by themselves.
+and the kind whose oldest read has waited longest goes next (up to 32 requests), to the idle
+connection that last ran that kind if there is one, so a backend keeps one kind's plan and index
+pages warm (p50 -5%, p99 -10%). At low load every batch is one request; under load batches grow by
+themselves.
 
 **What no viewer changes is read once per statement.** In a batch, the tags, the global
 `articlesCount`, each distinct page of the global, tag, author and favorited lists (its articles,
 their tags, favorite counts and authors), and each distinct capped count by tag, author or user are
 read once for the requests that ask for the same one, all of them already waiting before the
-statement runs. `favorited` and `following` are always the request's own. Nothing outlives the
-statement: no result is kept for a later request.
+statement runs; the tags come back as one row that every request of the batch keeps. `favorited`
+and `following` are always the request's own. Nothing outlives the statement: no result is kept for
+a later request.
 
 **Writes in groups of one commit.** Writes waiting for a write connection go out together under one
 Sync: one implicit transaction, one commit, one WAL flush for all of them. Each response is sent only
@@ -53,16 +56,22 @@ twice under 6,000 users: 16 requests failed.
 **Lean SQL, same answers.** Pages pick their ids on the bare index first, with a constant inner
 limit (100, the API's ceiling) so the generic plan expects a page, and the per-article subqueries run
 only for the page's rows, not for those `OFFSET` skips. Tag names are looked up by key rather than
-by a join that hashed all 200 tags per article. Every statement is prepared once per connection;
-the session sets `plan_cache_mode = force_generic_plan`, `jit = off`,
-`max_parallel_workers_per_gather = 0` and `enable_memoize = off` (a generic page plan put a Memoize
-node on the users join, which clears a hash table every execution). A differential test sent 40,000
+by a join that hashed all 200 tags per article. A request's `favorited` and `following` for a whole
+page are one probe of each index (`user_id = $v AND article_id = ANY(page)`), not one per article:
+half a page statement's buffer reads, p95 -10%. A feed's articles carry their tags as ids, named by
+one row of the batch's tags in Postgres's own order of the names, which saves a fifth of a feed's
+index descents (p95 -9%). Comments and their article's existence are one statement. Every
+statement is prepared once per connection; the session sets `plan_cache_mode = force_generic_plan`,
+`jit = off`, `max_parallel_workers_per_gather = 0` and `enable_memoize = off` (a generic page plan
+put a Memoize node on the users join, which clears a hash table every execution). A differential test sent 40,000
 concurrent reads (every list filter, deep offsets, feeds, articles, comments, profiles, anonymous
 and logged in) to the Go example and to this server on the full seed: no difference.
 
 **bcrypt four at a time.** A Blowfish round is a chain of dependent table loads, so one hash leaves
 most of a core idle. A worker thread takes up to four queued hashes of the same cost and runs them
-in lockstep, every round kept: 21 ms of a core per hash against 51 alone. Holding fewer than four,
+in lockstep, every round kept: 21 ms of a core per hash against 51 alone. Four lanes' rounds are
+x86-64 assembly, 13 instructions a round where the compiler's spills made 15: 13% less time a hash
+with both hyperthreads of a core busy, as under load. Holding fewer than four,
 it waits up to 150 ms after the oldest's arrival for more (a second measured no cheaper); logins are
 about a thousandth of the requests. Four workers, one gathering at a time: with Postgres taking the
 CPUs, two left logins queued past their 10 s. Hashes are verified on every login, written `$2b$` at cost 10.
@@ -84,6 +93,10 @@ DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=... HO
 ```
 
 `CONDUIT_SHARDS`, `CONDUIT_READS`, `CONDUIT_WRITES` and `CONDUIT_BCRYPT_WORKERS` override the
-defaults (2 shards of 8 read and 2 write connections, 4 bcrypt workers) for measuring; `start.sh`
-sets none of them. One shard of 16 and 4 measured the same as two (Postgres's CPU per request
-equal, p95 a little worse).
+defaults (2 shards; read connections a shard 5/8 of the CPUs the process may run on, at least 2,
+so 5 on the box; 2 write connections a shard; 4 bcrypt workers) for measuring; `start.sh` sets none
+of them. Fewer read connections measured better for as long as they keep Postgres busy: a statement
+in flight past that is contention, and batches shrink. On 4 CPUs at 58k users, 2 a shard against 8:
+p95 105-148 ms against 139-234 (and on a database aged by 20 minutes of writes, 146-187 against 4
+a shard's 191-267); 1 a shard left CPUs idle. One shard measured the same as two (Postgres's CPU
+per request equal, p95 a little worse).
