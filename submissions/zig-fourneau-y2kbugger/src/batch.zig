@@ -180,8 +180,15 @@ pub const Reads = struct {
         for (connections) |*connection| connection.idle = .{ .context = reads, .function = on_idle };
     }
 
-    /// Queue the read, send what can go, and wait for its answers.
+    /// Queue the read, send what can go, and wait for its answers. What
+    /// Postgres would refuse fails here, alone, with Postgres's own code:
+    /// in a batch its error would fail every request of the statement.
     pub fn read(reads: *Reads, kind: Kind, pending: *Pending) pg.Results {
+        if (refused(pending)) |code| {
+            pending.waiter.failure = .{ .sql = code };
+            pending.waiter.done = true;
+            return .{ .waiter = &pending.waiter };
+        }
         pending.sequence = reads.sequence;
         reads.sequence += 1;
         pending.next = null;
@@ -193,6 +200,16 @@ pub const Reads = struct {
         if (!pending.waiter.done) Evented.park(reads.io, &pending.waiter.parked);
         assert(pending.waiter.done);
         return .{ .waiter = &pending.waiter };
+    }
+
+    /// A key that is not text to Postgres (not UTF-8, or a NUL in it:
+    /// 22021), or a page past what int8 holds (the feed adds the limit
+    /// to the offset: 22003).
+    fn refused(pending: *const Pending) ?[5]u8 {
+        if (!std.unicode.utf8ValidateSlice(pending.key)) return "22021".*;
+        if (std.mem.indexOfScalar(u8, pending.key, 0) != null) return "22021".*;
+        _ = std.math.add(i64, pending.limit, pending.offset) catch return "22003".*;
+        return null;
     }
 
     fn on_idle(context: *anyopaque, connection: *pg.Connection) void {
