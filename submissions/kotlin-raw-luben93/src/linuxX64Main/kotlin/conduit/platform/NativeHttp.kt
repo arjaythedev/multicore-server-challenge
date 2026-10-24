@@ -171,7 +171,14 @@ private class EpollLoop(val index: Int, val listenFd: Int, val engine: HttpEngin
                     wakeFd -> recv(wakeFd, wakeBuf.addressOf(0), 8u, 0)
                     else -> {
                         val c = if (fd < conns.size) conns[fd] else null
-                        if (c != null) handle(c, flags)
+                        if (c != null) {
+                            try {
+                                handle(c, flags)
+                            } catch (e: Throwable) { // never let one connection kill the loop and all its sockets
+                                println("http-$index: connection error: $e")
+                                c.close()
+                            }
+                        }
                     }
                 }
             }
@@ -220,7 +227,12 @@ private class EpollLoop(val index: Int, val listenFd: Int, val engine: HttpEngin
             val c = NativeConn(fd, this)
             conns[fd] = c
             ctl(EPOLL_CTL_ADD, fd, EPOLLIN.toUInt())
-            engine.onOpen(c)
+            try {
+                engine.onOpen(c)
+            } catch (e: Throwable) {
+                println("http-$index: onOpen error: $e")
+                c.close()
+            }
         }
     }
 
