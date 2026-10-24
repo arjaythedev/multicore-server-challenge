@@ -9,6 +9,7 @@
 # loopback target addresses (127.0.0.1, .2, ...) so no (src,dst) pair runs out of ephemeral ports.
 # env: TEMPLATE (conduit_seed) SRV_CPUS (0-7) LG_CPUS (8-15) PORT (3000) TAG WARM_USERS (2000) WARM_S (60)
 #      LOADGEN (bench/cmd/loadgen binary; built if missing) RESULTS (lab/results) KEEP=1 (leave server up)
+#      PG_CGROUP (Postgres in a container: its cgroup dir) PG_USER (host user owning the Postgres processes)
 # Needs: root or a high hard nofile limit (the server gets 200000 like the box; loadgen gets 1048576),
 #        Postgres superuser via PGHOST/PGPORT/PGUSER, Postgres itself pinned with lab/pin-postgres.sh.
 set -euo pipefail
@@ -35,7 +36,11 @@ echo "app pid $APP ($(cat /proc/$APP/comm)), nofile: $(awk '/open files/{print $
 NT=$(( (USERS + 49999) / 50000 )); TARGETS=""
 for i in $(seq 1 $NT); do TARGETS="${TARGETS:+$TARGETS,}http://127.0.0.$i:$PORT"; done
 ticks() { awk '{print $14+$15}' /proc/$1/stat 2>/dev/null || echo 0; }
-pgticks() { local s=0 t; for p in $(pgrep -u postgres 2>/dev/null); do t=$(awk '{print $14+$15}' /proc/$p/stat 2>/dev/null || echo 0); s=$((s+t)); done; echo $s; }
+# Postgres CPU: summed over host processes of user postgres, or (Postgres in a container) from its cgroup:
+#   PG_CGROUP=/sys/fs/cgroup/system.slice/docker-<full id>.scope   (cpu.stat usage_usec, converted to ticks)
+pgticks() {
+  if [ -n "${PG_CGROUP:-}" ]; then awk -v hz=$(getconf CLK_TCK) '/^usage_usec/{printf "%d\n", $2*hz/1e6}' "$PG_CGROUP/cpu.stat"; return; fi
+  local s=0 t; for p in $(pgrep -u "${PG_USER:-postgres}" 2>/dev/null); do t=$(awk '{print $14+$15}' /proc/$p/stat 2>/dev/null || echo 0); s=$((s+t)); done; echo $s; }
 LG() { ulimit -n 1048576 2>/dev/null || true; taskset -c $LG_CPUS "$LOADGEN" "$@"; }
 if [ "$WARM_S" -gt 0 ]; then
   LG run -target "$TARGETS" -users $WARM_USERS -ramp 10s -measure ${WARM_S}s -tail 2s -secret $JWT_SECRET \
