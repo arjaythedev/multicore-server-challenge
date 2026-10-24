@@ -344,6 +344,8 @@ pub const statements = std.enums.EnumArray(S, pg.Statement).init(.{
             "AND a.slug = $2 AND c.author_id = $3",
         .params = &.{ .int8, .text, .int8 },
     },
+    // Not shared by slug: a batch repeats an article too seldom for the
+    // materialized set to pay (14,652 req/s against 14,835, 60k users).
     .batch_article = .{
         .sql = "SELECT r.i, x.* " ++ batch_keys ++ " CROSS JOIN LATERAL (" ++
             article_full_select_of("r.v") ++ " WHERE a.slug = r.k) x",
