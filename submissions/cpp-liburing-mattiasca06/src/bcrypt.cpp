@@ -9,6 +9,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -22,6 +23,7 @@
 namespace {
 
 constexpr int kMaxLanes = 4;
+constexpr auto kCollectWindow = std::chrono::milliseconds(20);
 
 struct Lane {
     uint32_t P[18];
@@ -259,9 +261,15 @@ void loop() {
         {
             std::unique_lock lk(g_mu);
             g_cv.wait(lk, [] { return !g_jobs.empty(); });
-            while (n < kMaxLanes && !g_jobs.empty()) {
-                jobs[n++].a = g_jobs.front();
-                g_jobs.pop_front();
+            // A lone hash is a serial chain (~40 ms); four in lockstep cost little more than two. Wait briefly for
+            // company, far below the latency budget of a login.
+            auto deadline = std::chrono::steady_clock::now() + kCollectWindow;
+            for (;;) {
+                while (n < kMaxLanes && !g_jobs.empty()) {
+                    jobs[n++].a = g_jobs.front();
+                    g_jobs.pop_front();
+                }
+                if (n == kMaxLanes || !g_cv.wait_until(lk, deadline, [] { return !g_jobs.empty(); })) break;
             }
         }
         for (int i = 0; i < n; i++) jobs[i].valid = prepare(jobs[i]);
