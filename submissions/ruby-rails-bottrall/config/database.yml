@@ -1,0 +1,14 @@
+# One pool per Falcon worker process. start.sh sizes DB_POOL so that workers x DB_POOL stays within the
+# box's 95-connection budget; a request leases one connection for its duration.
+default: &default
+  adapter: postgresql
+  url: <%= ENV.fetch("DATABASE_URL") %>
+  pool: <%= ENV.fetch("DB_POOL", 5) %>
+  checkout_timeout: 10
+  prepared_statements: true
+
+development:
+  <<: *default
+
+production:
+  <<: *default
