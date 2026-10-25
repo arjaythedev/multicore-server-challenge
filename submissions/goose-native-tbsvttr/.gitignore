@@ -1,0 +1,5 @@
+bin/
+.goose/
+.goose-home/
+.build/
+.deps/
