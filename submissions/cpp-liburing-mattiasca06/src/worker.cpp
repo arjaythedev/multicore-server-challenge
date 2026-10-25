@@ -278,6 +278,7 @@ void Worker::respond(Conn &c, uint32_t idx, int status, const std::string &body)
                      "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n%s\r\n", status,
                      reason(status), body.size(), c.close_after ? "Connection: close\r\n" : "");
     }
+    c.out.reserve(c.out.size() + size_t(n) + body.size());
     c.out.append(head, size_t(n));
     if (status != 204) c.out += body;
     start_send(idx);

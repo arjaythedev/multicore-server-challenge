@@ -351,7 +351,9 @@ Task<Reply> Worker::route(const Request &rq) {
 Task<Reply> Worker::h_tags() {
     Rows rows = co_await db({Query("tags", {})});
     if (!rows.all_ok(1)) co_return db_error();
-    std::string body = R"({"tags":[)";
+    std::string body;
+    body.reserve(32 + size_t(rows[0].rows()) * 16);
+    body = R"({"tags":[)";
     const Res &r = rows[0];
     for (int i = 0; i < r.rows(); i++) {
         if (i) body += ',';
@@ -503,7 +505,9 @@ Task<Reply> Worker::h_list(const Request &rq, int64_t viewer, bool feed) {
     } else {
         total = i64(rows[1], 0, 0);
     }
-    std::string body = R"({"articles":[)";
+    std::string body;
+    body.reserve(128 + size_t(page.rows()) * 700);  // ~one allocation instead of ~10 doublings
+    body = R"({"articles":[)";
     bool first = true;
     for (int i = 0; i < page.rows(); i++) {
         if (feed && page.null(i, 0)) continue;
@@ -562,7 +566,9 @@ Task<Reply> Worker::h_create_article(const Request &rq, int64_t viewer) {
     if (!ins.all_ok(nq + 1)) co_return db_error();
     const Res &res = ins[nq];
     if (res.rows() == 0) co_return db_error();
-    std::string out = R"({"article":)";
+    std::string out;
+    out.reserve(1536);
+    out = R"({"article":)";
     article_json(out, res, 0, true);
     out += '}';
     co_return Reply{201, std::move(out)};
@@ -581,7 +587,9 @@ Task<Reply> Worker::h_update_article(const Request &rq, std::string slug, int64_
                                    Query("article_owner", {slug})});
     if (!rows.all_ok(2)) co_return db_error();
     if (rows[0].rows() == 0) co_return rows[1].rows() == 0 ? err(404, "article not found") : err(403, "forbidden");
-    std::string out = R"({"article":)";
+    std::string out;
+    out.reserve(1536);
+    out = R"({"article":)";
     article_json(out, rows[0], 0, true);
     out += '}';
     co_return Reply{200, std::move(out)};
@@ -602,7 +610,9 @@ Task<Reply> Worker::h_favorite(std::string slug, int64_t viewer, bool add) {
         {Query(add ? "fav_add_slug" : "fav_del_slug", {viewer, slug}), Query("article_by_slug", {viewer, slug})});
     if (!rows.all_ok(2)) co_return db_error();
     if (rows[1].rows() == 0) co_return err(404, "article not found");
-    std::string out = R"({"article":)";
+    std::string out;
+    out.reserve(1536);
+    out = R"({"article":)";
     article_json(out, rows[1], 0, true);
     out += '}';
     co_return Reply{200, std::move(out)};
@@ -613,7 +623,9 @@ Task<Reply> Worker::h_comments(std::string slug, int64_t viewer) {
     if (!rows.all_ok(1)) co_return db_error();
     const Res &r = rows[0];
     if (r.rows() == 0) co_return err(404, "article not found");
-    std::string out = R"({"comments":[)";
+    std::string out;
+    out.reserve(64 + size_t(r.rows()) * 450);
+    out = R"({"comments":[)";
     for (int i = 0; i < r.rows() && !is_null(r, i, 0); i++) {
         if (i) out += ',';
         comment_json(out, r, i, boolean(r, i, 7));
@@ -632,7 +644,9 @@ Task<Reply> Worker::h_add_comment(const Request &rq, std::string slug, int64_t v
     Rows rows = co_await db_write({Query("comment_insert_slug", {slug, viewer, body.v})});
     if (!rows.all_ok(1)) co_return db_error();
     if (rows[0].rows() == 0) co_return err(404, "article not found");
-    std::string out = R"({"comment":)";
+    std::string out;
+    out.reserve(512);
+    out = R"({"comment":)";
     comment_json(out, rows[0], 0, false);
     out += '}';
     co_return Reply{201, std::move(out)};
