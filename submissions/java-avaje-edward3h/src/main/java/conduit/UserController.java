@@ -1,6 +1,5 @@
 package conduit;
 
-import java.util.Map;
 
 import io.avaje.http.api.Controller;
 import io.avaje.http.api.Get;
@@ -43,10 +42,10 @@ class UserController {
     @Post("/api/users")
     @Produces(statusCode = 201)
     Dto.UserResponse register(ServerRequest req) {
-        Map<String, Object> user = body.object(req, "user");
-        String username = Body.required(user, "username");
-        String email = Body.required(user, "email");
-        String password = Body.required(user, "password");
+        Requests.Register.Registration user = Body.object(body.read(req, Requests.Register.class).user(), "user");
+        String username = Body.required(user.username(), "username");
+        String email = Body.required(user.email(), "email");
+        String password = Body.required(user.password(), "password");
         String hash = passwords.hash(password);
         UserDao.UserRow row;
         try {
@@ -60,9 +59,9 @@ class UserController {
     @Post("/api/users/login")
     @Produces(statusCode = 200)
     Dto.UserResponse login(ServerRequest req) {
-        Map<String, Object> user = body.object(req, "user");
-        String email = Body.required(user, "email");
-        String password = Body.required(user, "password");
+        Requests.Login.Credentials user = Body.object(body.read(req, Requests.Login.class).user(), "user");
+        String email = Body.required(user.email(), "email");
+        String password = Body.required(user.password(), "password");
         UserDao.LoginRow row = users.findByEmail(email);
         if (row == null || !passwords.verify(password, row.passwordHash())) {
             throw new ApiException(401, "email or password is invalid");
@@ -84,12 +83,12 @@ class UserController {
     @Put("/api/user")
     Dto.UserResponse update(ServerRequest req) {
         Auth.User caller = auth.user(req);
-        Map<String, Object> user = body.object(req, "user");
-        String email = Body.optionalNonEmpty(user, "email");
-        String username = Body.optionalNonEmpty(user, "username");
-        String password = Body.optionalNonEmpty(user, "password");
-        String bio = Body.optional(user, "bio");
-        String image = Body.optional(user, "image");
+        Requests.UpdateUser.Changes user = Body.object(body.read(req, Requests.UpdateUser.class).user(), "user");
+        String email = Body.optionalNonEmpty(user.email(), "email");
+        String username = Body.optionalNonEmpty(user.username(), "username");
+        String password = Body.optionalNonEmpty(user.password(), "password");
+        String bio = user.bio();
+        String image = user.image();
         String hash = password == null ? null : passwords.hash(password);
         UserDao.UserRow row;
         try {

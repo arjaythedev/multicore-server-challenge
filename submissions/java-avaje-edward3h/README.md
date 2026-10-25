@@ -48,7 +48,8 @@ time and never touches the real database.
   so a few simultaneous logins can't occupy every virtual-thread carrier.
 - The first version used Jex on the JDK's built-in `HttpServer`; Helidon replaced it after load testing (below).
 
-- Request bodies are parsed as a JSON tree so `{"title": 123}` is a 422, not coerced. Passwords over 72 bytes are a 422.
+- Request bodies are bound to records (`Requests.java`) by Jsonb, which rejects a value of the wrong JSON type, so
+  `{"title": 123}` is a 422, not coerced. `Body.java` turns missing, null and blank values into 422s. Passwords over 72 bytes are a 422.
 - Timestamps are formatted with `uuuu-MM-dd'T'HH:mm:ss.SSS'Z'` in UTC, which truncates.
 - Nulls are serialised explicitly (`bio` and `image` are JSON `null`).
 

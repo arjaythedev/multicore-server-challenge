@@ -1,6 +1,5 @@
 package conduit;
 
-import java.util.Map;
 
 import io.avaje.http.api.Controller;
 import io.avaje.http.api.Delete;
@@ -45,7 +44,8 @@ class CommentController {
     @Post("/api/articles/{slug}/comments")
     Dto.CommentResponse create(String slug, ServerRequest req) {
         Auth.User caller = auth.user(req);
-        String text = Body.required(body.object(req, "comment"), "body");
+        String text = Body.required(
+                Body.object(body.read(req, Requests.CreateComment.class).comment(), "comment").body(), "body");
         long articleId = articleId(slug);
         CommentDao.NewCommentRow r = comments.insert(articleId, caller.id(), text);
         return new Dto.CommentResponse(new Dto.Comment(r.id(), Dto.timestamp(r.createdAt()),

@@ -1,7 +1,6 @@
 package conduit;
 
 import java.util.List;
-import java.util.Map;
 
 import io.avaje.http.api.Controller;
 import io.avaje.http.api.Delete;
@@ -103,11 +102,12 @@ class ArticleController {
     @Post("/api/articles")
     Dto.ArticleResponse create(ServerRequest req) {
         Auth.User caller = auth.user(req);
-        Map<String, Object> article = body.object(req, "article");
-        String title = Body.required(article, "title");
-        String description = Body.required(article, "description");
-        String text = Body.required(article, "body");
-        List<String> tags = Body.stringList(article, "tagList");
+        Requests.CreateArticle.NewArticle article =
+                Body.object(body.read(req, Requests.CreateArticle.class).article(), "article");
+        String title = Body.required(article.title(), "title");
+        String description = Body.required(article.description(), "description");
+        String text = Body.required(article.body(), "body");
+        List<String> tags = Body.stringList(article.tagList(), "tagList");
 
         long id = articles.call(d -> {
             long newId = d.insert(caller.id(), title, description, text);
@@ -123,10 +123,11 @@ class ArticleController {
     @Put("/api/articles/{slug}")
     Dto.ArticleResponse update(String slug, ServerRequest req) {
         Auth.User caller = auth.user(req);
-        Map<String, Object> article = body.object(req, "article");
-        String title = Body.optionalNonEmpty(article, "title");
-        String description = Body.optionalNonEmpty(article, "description");
-        String text = Body.optionalNonEmpty(article, "body");
+        Requests.UpdateArticle.Changes article =
+                Body.object(body.read(req, Requests.UpdateArticle.class).article(), "article");
+        String title = Body.optionalNonEmpty(article.title(), "title");
+        String description = Body.optionalNonEmpty(article.description(), "description");
+        String text = Body.optionalNonEmpty(article.body(), "body");
         ArticleDao.OwnerRow owner = owner(caller, slug);
         articles.update(owner.id(), title, description, text);
         return full(articles.findById(caller.id(), owner.id()));

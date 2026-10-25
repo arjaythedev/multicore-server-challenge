@@ -1,9 +1,8 @@
 package conduit;
 
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 import io.helidon.webserver.http.ServerRequest;
 import io.avaje.jsonb.JsonType;
@@ -11,83 +10,72 @@ import io.avaje.jsonb.Jsonb;
 import jakarta.inject.Singleton;
 
 /**
- * Request bodies are read as a JSON tree whatever the Content-Type, after auth has run. Strings must be
- * JSON strings (no coercing {"body": 123} to "123"). Anything malformed is a 422.
+ * Request bodies are read whatever the Content-Type, after auth has run. Jsonb rejects a value of the wrong JSON
+ * type (no coercing {"body": 123} to "123"), and reads a missing or null field as null. Anything malformed, missing
+ * or blank is a 422.
  */
 @Singleton
 final class Body {
 
-    private final JsonType<Object> type;
+    private final Jsonb jsonb;
+    private final ConcurrentHashMap<Class<?>, JsonType<?>> types = new ConcurrentHashMap<>();
 
     Body(Jsonb jsonb) {
-        this.type = jsonb.type(Object.class);
+        this.jsonb = jsonb;
     }
 
-    /** The object under {@code key} in the request body; 422 if the body isn't {"key": {...}}. */
+    /** The request body bound to {@code type}; 422 if it isn't valid JSON of that shape. */
     @SuppressWarnings("unchecked")
-    Map<String, Object> object(ServerRequest req, String key) {
-        Object root;
+    <T> T read(ServerRequest req, Class<T> type) {
+        JsonType<T> json = (JsonType<T>) types.computeIfAbsent(type, jsonb::type);
         try {
-            root = type.fromJson(req.content().as(byte[].class));
+            T root = json.fromJson(req.content().as(byte[].class));
+            if (root == null) {
+                throw ApiException.invalid("body must be a JSON object");
+            }
+            return root;
+        } catch (ApiException ex) {
+            throw ex;
         } catch (RuntimeException ex) {
             throw ApiException.invalid("malformed JSON body");
         }
-        if (!(root instanceof Map<?, ?> map)) {
-            throw ApiException.invalid("body must be a JSON object");
-        }
-        if (!(map.get(key) instanceof Map<?, ?> inner)) {
+    }
+
+    /** The wrapper object ({@code user}, {@code article}, ...); 422 when absent or null. */
+    static <T> T object(T value, String key) {
+        if (value == null) {
             throw ApiException.invalid(key + " must be an object");
         }
-        return (Map<String, Object>) inner;
+        return value;
     }
 
     /** A required non-empty string field. */
-    static String required(Map<String, Object> obj, String field) {
-        String s = optional(obj, field);
-        if (s == null || s.isEmpty()) {
+    static String required(String value, String field) {
+        if (value == null || value.isEmpty()) {
             throw ApiException.invalid(field + " can't be blank");
         }
-        return s;
+        return value;
     }
 
-    /** An optional non-empty string field: null when absent or JSON null; 422 when empty or not a string. */
-    static String optionalNonEmpty(Map<String, Object> obj, String field) {
-        String s = optional(obj, field);
-        if (s != null && s.isEmpty()) {
+    /** An optional non-empty string field: null when absent or JSON null; 422 when empty. */
+    static String optionalNonEmpty(String value, String field) {
+        if (value != null && value.isEmpty()) {
             throw ApiException.invalid(field + " can't be blank");
         }
-        return s;
-    }
-
-    /** An optional string field: null when absent or JSON null; 422 when it isn't a string. */
-    static String optional(Map<String, Object> obj, String field) {
-        Object v = obj.get(field);
-        if (v == null) {
-            return null;
-        }
-        if (!(v instanceof String s)) {
-            throw ApiException.invalid(field + " must be a string");
-        }
-        return s;
+        return value;
     }
 
     /** An optional array of non-empty strings: empty when absent or null. */
-    static List<String> stringList(Map<String, Object> obj, String field) {
-        Object v = obj.get(field);
-        if (v == null) {
+    static List<String> stringList(List<String> value, String field) {
+        if (value == null) {
             return List.of();
         }
-        if (!(v instanceof List<?> list)) {
-            throw ApiException.invalid(field + " must be an array");
-        }
-        List<String> out = new ArrayList<>(list.size());
-        for (Object e : list) {
-            if (!(e instanceof String s) || s.isEmpty()) {
+        for (String s : value) {
+            if (s == null || s.isEmpty()) {
                 throw ApiException.invalid(field + " must contain non-empty strings");
             }
-            out.add(s);
         }
-        return out;
+        return value;
     }
 
     /** bcrypt only hashes the first 72 bytes; longer passwords are refused: 422. */
