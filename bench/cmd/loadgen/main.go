@@ -33,10 +33,6 @@ func main() {
 	switch os.Args[1] {
 	case "run":
 		os.Exit(cmdRun(args))
-	case "seeddump":
-		os.Exit(cmdSeedDump(args))
-	case "import":
-		os.Exit(cmdImport(args))
 	case "merge":
 		os.Exit(cmdMerge(args))
 	case "search":

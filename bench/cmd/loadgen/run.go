@@ -164,10 +164,6 @@ func sample(rec *Recorder, t0, stopAt time.Time, allDone <-chan struct{}) []Seco
 		}
 		lastProc, lastWall = pc, now
 		tl = append(tl, s)
-		if os.Getenv("LG_PROGRESS") != "" {
-			fmt.Fprintf(os.Stderr, "PROG t=%d active=%d rps=%d err=%d p95=%.0f p99=%.0f lgcpu=%.0f\n",
-				k, s.Active, s.Completed, s.Errors, s.P95Ms, s.P99Ms, s.ProcCPU*ncpu)
-		}
 		if done || now.After(hard) {
 			break
 		}
