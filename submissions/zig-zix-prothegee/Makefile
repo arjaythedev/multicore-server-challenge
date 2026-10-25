@@ -57,7 +57,7 @@ postgres-primary-logs: ## Tail postgres primary logs
 
 .PHONY: sync-project-deps
 sync-project-deps: ## Syncronize root project requirements
-	cp -rf ../../schema.sql ./containers/postgres-primary/init;
+	cp -rf ../../schema.sql ./containers/postgres-primary/init/schema.sql;
 
 # --------------------------------------------------------- #
 
@@ -89,8 +89,8 @@ install: ## Install the dependencies for this conduit
 build: ## Build the backend for this conduit
 	sh ./build.sh;
 
-##@ Build
+##@ Start
 
 .PHONY: start
-build: ## Start the backend for this conduit
+start: ## Start the backend for this conduit
 	sh ./start.sh;
