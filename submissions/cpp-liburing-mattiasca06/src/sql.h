@@ -51,6 +51,32 @@
     "favorited, pg.username, pg.bio, pg.image, EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.v AND "      \
     "fo.followee_id = pg.author_id) AS following FROM req r JOIN pg ON " join_on " ORDER BY r.ord, pg.id DESC"
 
+// The home feed. Page ids: the newest (limit + offset) articles of every followee, merged and cut to the page. The
+// page's tags, favorite counts and authors are fetched once per distinct article of the whole batch. `following` is
+// always true (a feed only holds followed authors). The count is min(count, 1000); a page that ends before `limit`
+// already tells the total, anything else counts through the follows (capped) in this same execution.
+#define FEED(arrays, ord_col)                                                                                         \
+    "WITH req AS (SELECT * FROM unnest(" arrays ") WITH ORDINALITY AS r(v, lm, ofs, ord)), "                          \
+    "pages AS MATERIALIZED (SELECT r.ord, r.v, p.id FROM req r LEFT JOIN LATERAL ("                                   \
+    "SELECT x.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id = "             \
+    "fo.followee_id ORDER BY a2.id DESC LIMIT (r.lm + r.ofs)) x WHERE fo.follower_id = r.v "                          \
+    "ORDER BY x.id DESC LIMIT r.lm OFFSET r.ofs) p ON true), "                                                        \
+    "cnt AS MATERIALIZED (SELECT r.ord, CASE WHEN pc.k < r.lm AND (pc.k > 0 OR r.ofs = 0) THEN LEAST(1000, r.ofs + "  \
+    "pc.k) ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id IN (SELECT fo.followee_id FROM "    \
+    "follows fo WHERE fo.follower_id = r.v) LIMIT 1000) s) END AS n FROM req r JOIN (SELECT ord, count(id) AS k "     \
+    "FROM pages GROUP BY ord) pc ON pc.ord = r.ord), "                                                                \
+    "ids AS MATERIALIZED (SELECT DISTINCT id FROM pages WHERE id IS NOT NULL), "                                      \
+    "pt AS MATERIALIZED (SELECT at.article_id AS id, array_agg(t.name ORDER BY t.name) AS tag_list FROM ids i "       \
+    "JOIN article_tags at ON at.article_id = i.id JOIN tags t ON t.id = at.tag_id GROUP BY at.article_id), "         \
+    "e AS MATERIALIZED (SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, "                    \
+    "COALESCE(pt.tag_list, ARRAY[]::text[]) AS tag_list, "                                                            \
+    "(SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count, u.username, u.bio, u.image "    \
+    "FROM ids i JOIN articles a ON a.id = i.id JOIN users u ON u.id = a.author_id LEFT JOIN pt ON pt.id = a.id) "     \
+    "SELECT " ord_col "c.n, e.id, e.slug, e.title, e.description, e.created_at, e.updated_at, e.tag_list, "          \
+    "e.favorites_count, (fv.user_id IS NOT NULL) AS favorited, e.username, e.bio, e.image, "                          \
+    "(e.id IS NOT NULL) AS following FROM pages p JOIN cnt c ON c.ord = p.ord LEFT JOIN e ON e.id = p.id "            \
+    "LEFT JOIN favorites fv ON fv.user_id = p.v AND fv.article_id = p.id ORDER BY p.ord, p.id DESC NULLS LAST"
+
 #define SLUGIFY(x) "trim(both '-' from lower(regexp_replace(" x ", '[^A-Za-z0-9]+', '-', 'g')))"
 
 struct Stmt {
@@ -99,14 +125,9 @@ inline constexpr Stmt kStatements[] = {
     {"count_fav",
      "SELECT count(*) FROM (SELECT 1 FROM favorites f WHERE f.user_id = "
      "(SELECT fu.id FROM users fu WHERE fu.username = $1) LIMIT 1000) s"},
-    {"feed",
-     ARTICLE_LIST("SELECT " ARTICLE_PAGE_COLS "FROM articles a WHERE a.id IN (SELECT x.id FROM follows fo "
-                  "CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id "
-                  "ORDER BY a2.id DESC LIMIT ($2::int + $3::int)) x WHERE fo.follower_id = $1 "
-                  "ORDER BY x.id DESC LIMIT $2 OFFSET $3)")},
-    {"count_feed",
-     "SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id IN "
-     "(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $1) LIMIT 1000) s"},
+    // The feed page and its capped count come back together: every row starts with the count (n), a viewer whose page is
+    // empty gets one row with a NULL id. The single statement is the batched one with arrays of length one.
+    {"feed", FEED("ARRAY[$1::bigint], ARRAY[$2::bigint], ARRAY[$3::bigint]", "")},
 
     {"article_by_slug", ARTICLE_FULL_SELECT "WHERE a.slug = $2"},
     {"article_by_id", ARTICLE_FULL_SELECT "WHERE a.id = $2"},
@@ -207,6 +228,8 @@ inline constexpr Stmt kStatements[] = {
      REQ("$1::bigint[], $2::bigint[], $3::bigint[]", "v, lm, ofs")
      PAGE_BATCH("lm, ofs", "ORDER BY a.id DESC LIMIT d.lm OFFSET d.ofs")
      PAGE_BATCH_OUT("pg.lm = r.lm AND pg.ofs = r.ofs")},
+    {"feed_b",  // v bigint[], limit bigint[], offset bigint[]
+     FEED("$1::bigint[], $2::bigint[], $3::bigint[]", "p.ord::int4, ")},
     {"list_tag_b",  // v bigint[], limit bigint[], offset bigint[], tag text[]
      REQ("$1::bigint[], $2::bigint[], $3::bigint[], $4::text[]", "v, lm, ofs, tag")
      PAGE_BATCH("lm, ofs, tag",

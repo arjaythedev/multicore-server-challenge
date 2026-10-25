@@ -43,6 +43,7 @@ constexpr BatchSpec kBatch[] = {
     {"comments_by_slug", "comments_by_slug_b", "bt"},
     {"list_all", "list_all_b", "bbb"},
     {"list_tag", "list_tag_b", "bbbt"},
+    {"feed", "feed_b", "bbb"},
 };
 inline int batch_of(const char *stmt) {
     for (size_t i = 0; i < sizeof kBatch / sizeof kBatch[0]; i++)
@@ -80,6 +81,8 @@ void DbAwait::await_suspend(std::coroutine_handle<> c) {
 }
 
 Worker::Worker(const Config &cfg, int id) : cfg_(cfg), id_(id) {
+    if (cfg_.read_total > 0)
+        cfg_.read_conns = std::max(1, cfg_.read_total / cfg_.workers + (id < cfg_.read_total % cfg_.workers ? 1 : 0));
     for (int i = 0; i < cfg_.read_conns; i++) {
         auto pg = std::make_unique<PgConn>();
         pg->connect(cfg_.database_url.c_str());
@@ -654,7 +657,17 @@ void Worker::on_pg(uint32_t pg_idx) {
         h.resume();
     }
     if (is_write) dispatch_writes();
-    dispatch();
+    if (cfg_.read_batch_us > 0 && !waitq_.empty()) {
+        // keep gathering: what queued while the connections were busy goes out together at the next tick
+        if (!timer_armed_) {
+            io_uring_sqe *s = sqe();
+            io_uring_prep_timeout(s, &batch_ts_, 0, 0);
+            io_uring_sqe_set_data64(s, pack(kTimer, 0));
+            timer_armed_ = true;
+        }
+    } else {
+        dispatch();
+    }
 }
 
 void Worker::post_done(BcryptAwait *j) {

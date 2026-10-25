@@ -472,7 +472,6 @@ Task<Reply> Worker::h_list(const Request &rq, int64_t viewer, bool feed) {
     std::vector<Query> qs;
     if (feed) {
         qs.push_back(Query("feed", {viewer, limit, offset}));
-        qs.push_back(Query("count_feed", {viewer}));
     } else if (!tag.empty()) {
         qs.push_back(Query("list_tag", {viewer, limit, offset, tag}));
         qs.push_back(Query("count_tag", {tag}));
@@ -487,15 +486,26 @@ Task<Reply> Worker::h_list(const Request &rq, int64_t viewer, bool feed) {
         qs.push_back(Query("count_all", {}));
     }
     Rows rows = co_await db(std::move(qs));
-    if (!rows.all_ok(2)) co_return db_error();
-    const Res &page = rows[0];
+    if (!rows.all_ok(feed ? 1 : 2)) co_return db_error();
+    Res page = rows[0];
+    int64_t total;
+    if (feed) {
+        // every feed row leads with the count; an empty page is one row whose id is NULL
+        total = rows[0].rows() ? i64(rows[0], 0, 0) : 0;
+        page.col0 += 1;
+    } else {
+        total = i64(rows[1], 0, 0);
+    }
     std::string body = R"({"articles":[)";
+    bool first = true;
     for (int i = 0; i < page.rows(); i++) {
-        if (i) body += ',';
+        if (feed && page.null(i, 0)) continue;
+        if (!first) body += ',';
+        first = false;
         article_json(body, page, i, false);
     }
     body += R"(],"articlesCount":)";
-    body += std::to_string(i64(rows[1], 0, 0));
+    body += std::to_string(total);
     body += '}';
     co_return Reply{200, std::move(body)};
 }

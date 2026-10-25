@@ -17,8 +17,9 @@
 
 struct Config {
     std::string host, database_url, jwt_secret;
-    int port = 3000, workers = 4, read_conns = 3, bcrypt_threads = 2;
-    int read_batch_us = 300;  // reads wait this long for company before going out (0 = send at once)
+    int port = 3000, workers = 4, read_conns = 2, bcrypt_threads = 2;
+    int read_total = 0;       // if > 0: this many read connections in all, spread over the workers (overrides read_conns)
+    int read_batch_us = 6000;  // reads wait this long for company before going out (0 = send at once)
 };
 
 struct Request {
