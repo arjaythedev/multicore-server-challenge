@@ -49,10 +49,13 @@ module Conduit
       string = env["QUERY_STRING"]
       return EMPTY if string.nil? || string.empty?
 
-      string.split("&").reject(&:empty?).map { |pair|
+      string.split("&").each_with_object({}) { |pair, params|
+        next if pair.empty?
+
         name, value = pair.split("=", 2)
-        [form_decode(name), form_decode(value || "")]
-      }.reverse.to_h
+        name = form_decode(name)
+        params[name] = form_decode(value || "") unless params.key?(name)
+      }
     end
 
     # [limit, offset] from the query: limit 1..100 (default 20), offset >= 0 (default 0), both plain decimal

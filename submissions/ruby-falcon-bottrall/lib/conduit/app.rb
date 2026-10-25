@@ -33,7 +33,7 @@ module Conduit
       path = env["PATH_INFO"]
       return NOT_FOUND unless path.start_with?("/api/")
 
-      segments = path.split("/").drop(2).map { Input.segment(it) }
+      segments = path.byteslice(5, path.bytesize).split("/").map! { Input.segment(it) }
       return NOT_FOUND unless segments.all?
 
       case [env["REQUEST_METHOD"], *segments]

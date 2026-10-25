@@ -12,12 +12,12 @@ export WEB_CONCURRENCY="${WEB_CONCURRENCY:-$(nproc)}"
 export DB_POOL="${DB_POOL:-2}"
 export RUBYOPT="-W:no-experimental"   # async-container uses IO::Buffer, which warns once per worker
 # Start each worker with a heap that has room for a lot of requests' garbage. Every GC, even a minor one,
-# scans the stack of every connection's fiber (thousands per worker), so it costs ~9 ms however little
+# scans the stack of every connection's fiber (thousands per worker), so it costs 10-50 ms however little
 # garbage there is: at the default heap size a worker spent 20% of its CPU in GC, 200 times a minute. Slots
 # per size pool (40, 80, 160 and 320 bytes), in proportion to what a request allocates.
-export RUBY_GC_HEAP_0_INIT_SLOTS="${RUBY_GC_HEAP_0_INIT_SLOTS:-1000000}"
-export RUBY_GC_HEAP_1_INIT_SLOTS="${RUBY_GC_HEAP_1_INIT_SLOTS:-300000}"
-export RUBY_GC_HEAP_2_INIT_SLOTS="${RUBY_GC_HEAP_2_INIT_SLOTS:-100000}"
-export RUBY_GC_HEAP_3_INIT_SLOTS="${RUBY_GC_HEAP_3_INIT_SLOTS:-15000}"
+export RUBY_GC_HEAP_0_INIT_SLOTS="${RUBY_GC_HEAP_0_INIT_SLOTS:-2000000}"
+export RUBY_GC_HEAP_1_INIT_SLOTS="${RUBY_GC_HEAP_1_INIT_SLOTS:-600000}"
+export RUBY_GC_HEAP_2_INIT_SLOTS="${RUBY_GC_HEAP_2_INIT_SLOTS:-200000}"
+export RUBY_GC_HEAP_3_INIT_SLOTS="${RUBY_GC_HEAP_3_INIT_SLOTS:-20000}"
 
 exec bundle exec falcon host falcon.rb
