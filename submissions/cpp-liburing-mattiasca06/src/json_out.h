@@ -14,7 +14,7 @@ inline constexpr char kHex[] = "0123456789abcdef";
 // Appends a string literal. std::string::append is an out-of-line libstdc++ call (strlen + memcpy through the PLT); with the
 // length known at compile time this writes the bytes inline instead.
 template <size_t N> inline void lit(std::string &o, const char (&s)[N]) {
-#if defined(_GLIBCXX_RELEASE) && _GLIBCXX_RELEASE >= 13
+#if defined(_GLIBCXX_RELEASE) && _GLIBCXX_RELEASE >= 15
     const size_t at = o.size();
     o.__resize_and_overwrite(at + N - 1, [&](char *p, size_t) {
         memcpy(p + at, s, N - 1);
@@ -70,7 +70,7 @@ inline size_t next_special(const char *s, size_t i, size_t n) {
 // Appends `s` as a quoted JSON string. Only `"`, `\` and bytes < 0x20 are escaped; other bytes (UTF-8) pass through.
 inline void str(std::string &o, const char *s, size_t n) {
     size_t i = next_special(s, 0, n);
-#if defined(_GLIBCXX_RELEASE) && _GLIBCXX_RELEASE >= 13
+#if defined(_GLIBCXX_RELEASE) && _GLIBCXX_RELEASE >= 15
     if (i == n) [[likely]] {  // nothing to escape (the common case): quotes and bytes in one write
         const size_t at = o.size();
         o.__resize_and_overwrite(at + n + 2, [&](char *p, size_t) {
