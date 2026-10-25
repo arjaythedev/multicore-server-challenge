@@ -256,21 +256,28 @@ Task<Reply> Worker::route(const Request &rq) {
     std::string_view path = rq.path;
     if (path.substr(0, 5) != "/api/") co_return err(404, "not found");
     path.remove_prefix(5);
-    std::vector<std::string> seg;
+    // Segments are views into the path; only one with a % escape gets a decoded copy.
+    constexpr size_t kMaxSeg = 8;
+    std::string_view seg[kMaxSeg];
+    std::string decoded[kMaxSeg];
+    size_t n = 0;
     while (true) {
         size_t s = path.find('/');
-        seg.push_back(codec::pct_decode(path.substr(0, s), false));
+        std::string_view part = path.substr(0, s);
+        if (n == kMaxSeg) co_return err(404, "not found");  // no route has this many segments
+        if (part.find('%') == std::string_view::npos) seg[n] = part;
+        else seg[n] = decoded[n] = codec::pct_decode(part, false);
+        n++;
         if (s == std::string_view::npos) break;
         path.remove_prefix(s + 1);
     }
-    if (seg.size() > 1 && seg.back().empty()) seg.pop_back();
+    if (n > 1 && seg[n - 1].empty()) n--;
 
     int64_t viewer = 0;
     AuthState st = authenticate(rq, viewer);
     const std::string &m = rq.method;
     bool get = m == "GET", post = m == "POST", put_ = m == "PUT", del = m == "DELETE";
-    size_t n = seg.size();
-    const std::string &s0 = seg[0];
+    std::string_view s0 = seg[0];
 
     // Auth-required endpoints answer 401 unless a valid token came with the request; optional ones only reject a
     // token that is present but invalid.
@@ -290,11 +297,11 @@ Task<Reply> Worker::route(const Request &rq) {
     } else if (s0 == "profiles" && n >= 2) {
         if (n == 2 && get) {
             if (bad_auth()) co_return err(401, "unauthorized");
-            co_return co_await h_profile(rq, seg[1], viewer);
+            co_return co_await h_profile(rq, std::string(seg[1]), viewer);
         }
         if (n == 3 && seg[2] == "follow" && (post || del)) {
             if (need_auth()) co_return err(401, "unauthorized");
-            co_return co_await h_follow(rq, seg[1], viewer, post);
+            co_return co_await h_follow(rq, std::string(seg[1]), viewer, post);
         }
     } else if (s0 == "articles") {
         if (n == 1) {
@@ -313,29 +320,29 @@ Task<Reply> Worker::route(const Request &rq) {
             }
             if (get) {
                 if (bad_auth()) co_return err(401, "unauthorized");
-                co_return co_await h_article(seg[1], viewer);
+                co_return co_await h_article(std::string(seg[1]), viewer);
             }
             if (put_ || del) {
                 if (need_auth()) co_return err(401, "unauthorized");
                 // (no co_await inside ?: — GCC evaluates both arms)
-                if (put_) co_return co_await h_update_article(rq, seg[1], viewer);
-                co_return co_await h_delete_article(seg[1], viewer);
+                if (put_) co_return co_await h_update_article(rq, std::string(seg[1]), viewer);
+                co_return co_await h_delete_article(std::string(seg[1]), viewer);
             }
         } else if (n == 3 && seg[2] == "favorite" && (post || del)) {
             if (need_auth()) co_return err(401, "unauthorized");
-            co_return co_await h_favorite(seg[1], viewer, post);
+            co_return co_await h_favorite(std::string(seg[1]), viewer, post);
         } else if (n == 3 && seg[2] == "comments") {
             if (get) {
                 if (bad_auth()) co_return err(401, "unauthorized");
-                co_return co_await h_comments(seg[1], viewer);
+                co_return co_await h_comments(std::string(seg[1]), viewer);
             }
             if (post) {
                 if (need_auth()) co_return err(401, "unauthorized");
-                co_return co_await h_add_comment(rq, seg[1], viewer);
+                co_return co_await h_add_comment(rq, std::string(seg[1]), viewer);
             }
         } else if (n == 4 && seg[2] == "comments" && del) {
             if (need_auth()) co_return err(401, "unauthorized");
-            co_return co_await h_delete_comment(seg[1], seg[3], viewer);
+            co_return co_await h_delete_comment(std::string(seg[1]), std::string(seg[3]), viewer);
         }
     }
     co_return err(404, "not found");
