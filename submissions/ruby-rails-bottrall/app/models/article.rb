@@ -29,7 +29,7 @@ class Article < ApplicationRecord
 
   scope :newest_first, -> { order(id: :desc) }
   scope :page, ->(limit, offset) { newest_first.limit(limit).offset(offset) }
-  scope :by_author, ->(username) { where(author_id: User.where(username:).select(:id)) }
+  scope :by_author, ->(username) { where_scalar(author_id: User.where(username:).select(:id)) }
 
   # Slugs are the slugified title plus the id, which the insert takes from the sequence up front.
   def self.publish(author_id:, title:, description:, body:, tag_names: [])

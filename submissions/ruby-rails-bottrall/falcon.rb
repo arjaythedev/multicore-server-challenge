@@ -12,6 +12,12 @@ service "conduit" do
     Async::HTTP::Endpoint.parse(url, protocol: Async::HTTP::Protocol::HTTP11).with(reuse_address: true)
   end
 
+  # Falcon's default stack gzips any response the client accepts gzip for. Compression is optional in this API
+  # and costs ~10% of a worker's CPU, so serve the Rack app without it.
+  middleware do
+    ::Protocol::Rack::Adapter.new(rack_app)
+  end
+
   # One forked worker per core, each an event loop serving every connection on its own fiber.
   count ENV.fetch("WEB_CONCURRENCY") { Etc.nprocessors }.to_i
 

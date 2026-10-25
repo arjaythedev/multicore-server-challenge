@@ -41,7 +41,7 @@ module ArticleListing
   end
 
   def favorited_by(username, limit:, offset:)
-    joined = Favorite.where(user_id: User.where(username:).select(:id))
+    joined = Favorite.where_scalar(user_id: User.where(username:).select(:id))
     page_through(joined, :article_id, limit:, offset:)
   end
 

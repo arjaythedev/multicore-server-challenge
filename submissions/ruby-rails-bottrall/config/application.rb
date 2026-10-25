@@ -27,6 +27,9 @@ module Conduit
     # Foreign keys already guarantee these; validating them would cost a SELECT per association on every insert.
     config.active_record.belongs_to_required_by_default = false
 
+    # Rails' defaults guard HTML pages against framing and XSS; a JSON API only needs nosniff.
+    config.action_dispatch.default_headers = { "X-Content-Type-Options" => "nosniff" }
+
     config.x.jwt_secret = ENV.fetch("JWT_SECRET")
   end
 end
