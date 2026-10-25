@@ -8,15 +8,14 @@ import subprocess
 import sys
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
-from pgss import name, psql  # noqa: E402
+from pgss import our_statements  # noqa: E402
 
 RUNS = 5
 
 db, stmt, params = sys.argv[1], sys.argv[2], sys.argv[3:]
-out = psql(db, "select query from pg_stat_statements where calls > 0 and query not like '%pg_stat_statements%' and query !~* '^\\s*(prepare|explain) '")
-query = next((q for q in out.split("\n") if q and name(q) == stmt), None)
+query = our_statements().get(stmt)  # the exact SQL the server prepares
 if query is None:
-    sys.exit(f"no statement named {stmt!r} in pg_stat_statements")
+    sys.exit(f"no statement named {stmt!r} in src/sql.mojo")
 args = ", ".join("'" + p.replace("'", "''") + "'" for p in params)
 print(f"{stmt}({args})")
 for mode in ("force_custom_plan", "force_generic_plan"):

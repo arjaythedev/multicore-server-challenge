@@ -22,6 +22,11 @@ normalized transcript is identical to `bench/cmd/conformance/golden-dev.jsonl`. 
 - `src/jwt.mojo`: HS256 sign/verify, every request. `src/jsonin.mojo`: a strict JSON tokenizer for request bodies.
 - `src/http.mojo`, `src/json.mojo`, `src/crypto.mojo`, `src/linux.mojo`, `src/buf.mojo`.
 
+Toolchain: `install.sh` installs Mojo 1.2.0's compiler from PyPI (Modular's official wheels, `mojo-compiler` and
+`mojo-compiler-mojo-libs`), pinned by version and SHA-256 in `mojo-requirements.txt`, into a venv at `/opt/mojo`;
+`build.sh` uses it. The binary links Mojo's runtime libraries from there. Checked on a clean `ubuntu:24.04` (x86_64)
+through `tools/run_submission.sh`, which runs any submission the way the box does: 197/197.
+
 Settings: `WORKERS` (default 2), `PG_CONNS` per worker (default 8), `BCRYPT_WORKERS` (default 2),
 `PG_GENERIC_PLANS` (default 1).
 
@@ -42,6 +47,13 @@ Settings: `WORKERS` (default 2), `PG_CONNS` per worker (default 8), `BCRYPT_WORK
   rounds: Postgres CPU per request −3.9% (lower or equal in every round); per list request, global −22%,
   favorited −6%, feed unchanged, tag and author +4% (within noise). The tag, favorited and feed reference queries
   already picked their ids first.
+
+- **Tag names by primary key** (`sql.TAG_LIST`): `ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id =
+  at.tag_id) FROM article_tags at WHERE at.article_id = a.id ORDER BY 1)` instead of the reference join, whose
+  generic plan seq-scans and hashes all 200 tags for every article. `tools/diff_lists.py`: 480 cases (lists and
+  single articles) identical. 5 interleaved A/B rounds (one discarded: the baseline stalled): Postgres CPU per
+  request −7 to −10%; per call, global list −23% and tag list −15% in every round, the others within the ±6%
+  that unchanged statements moved.
 
 Profiling tools (on a scratch copy only, with `pg_stat_statements`): `tools/pgss.py`, `tools/explain.py`,
 `tools/plan_modes.py`, `tools/ab.sh` + `tools/ab_report.py`.

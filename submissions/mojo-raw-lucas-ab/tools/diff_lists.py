@@ -1,8 +1,7 @@
 """Differential test of our list statements against SPEC.md's reference SQL, on the same database: random
 filters, viewers, limits and offsets; every row, column and count must match.
 
-Our statements' text comes from pg_stat_statements (so run the server and hit each list endpoint once first);
-the reference text is SPEC.md's, below. Run it on an idle database (a concurrent write would differ legitimately).
+Our statements' text comes from src/sql.mojo (tools/print_sql.mojo); the reference text is SPEC.md's, below. Run it on an idle database (a concurrent write would differ legitimately).
 
     python3 tools/diff_lists.py <database> [cases]
 """
@@ -11,7 +10,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
-from pgss import name, psql  # noqa: E402
+from pgss import our_statements, psql  # noqa: E402
 
 LIST_SELECT = """SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at,
        ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id
@@ -23,6 +22,7 @@ LIST_SELECT = """SELECT a.id, a.slug, a.title, a.description, a.created_at, a.up
   FROM articles a
   JOIN users u ON u.id = a.author_id"""
 ORDER_PAGE = "ORDER BY a.id DESC LIMIT $2 OFFSET $3"
+FULL_SELECT = LIST_SELECT.replace("a.description,", "a.description, a.body,", 1)
 REFERENCE = {  # SPEC.md: list name -> (page, count, count's parameters as indexes into (viewer, limit, offset, filter))
     "global list": (f"{LIST_SELECT} {ORDER_PAGE}", "SELECT count(*) FROM (SELECT 1 FROM articles a LIMIT 1000) s", []),
     "tag list": (f"{LIST_SELECT} WHERE a.id IN (SELECT at.article_id FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = $4) ORDER BY at.article_id DESC LIMIT $2 OFFSET $3) ORDER BY a.id DESC",
@@ -54,13 +54,10 @@ def run(sql_text, params):
 
 db = sys.argv[1]
 cases = int(sys.argv[2]) if len(sys.argv) > 2 else 300
-ours = {}
-for q in psql(db, "select query from pg_stat_statements where calls > 0 and query !~* '^\\s*(prepare|explain) '").split("\n"):
-    if q and name(q) in REFERENCE:
-        ours[name(q)] = q
-missing = set(REFERENCE) - set(ours)
+ours = our_statements()  # the exact SQL the server prepares
+missing = (set(REFERENCE) | {"article by slug"}) - set(ours)
 if missing:
-    sys.exit(f"hit these endpoints once first so pg_stat_statements has our statements: {sorted(missing)}")
+    sys.exit(f"statements not found in src/sql.mojo: {sorted(missing)}")
 
 rnd = random.Random(42)
 tags = psql(db, "select name from tags order by id").split()
@@ -93,5 +90,15 @@ for k in range(cases):
         if bad <= 5:
             print(f"MISMATCH {lst} {params}: reference {len(ref_rows)} rows count {ref_count}, ours {len(got_rows)} rows"
                   f" count {got_count}")
-print(f"{cases} cases over {len(REFERENCE)} lists: " + ("all identical" if bad == 0 else f"{bad} mismatches"))
+# single articles (ARTICLE_FULL_SELECT WHERE a.slug = $2): random ones, and the ones with the most tags
+slugs = psql(db, "(select slug from articles order by random() limit 60) union all (select a.slug from articles a"
+                 " join article_tags at on at.article_id = a.id group by a.slug order by count(*) desc limit 20)").split()
+for slug in slugs:
+    viewer = rnd.choice([0] + users + followers)
+    ref = run(f"{FULL_SELECT} WHERE a.slug = $2", [viewer, slug])
+    if ref != run(ours["article by slug"], [viewer, slug]):
+        bad += 1
+        print(f"MISMATCH article by slug {viewer} {slug}")
+cases += len(slugs)
+print(f"{cases} cases over {len(REFERENCE)} lists and single articles: " + ("all identical" if bad == 0 else f"{bad} mismatches"))
 sys.exit(1 if bad else 0)

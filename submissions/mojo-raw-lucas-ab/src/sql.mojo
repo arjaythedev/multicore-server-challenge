@@ -41,12 +41,21 @@ comptime STMT_COMMENT_DELETE = 28
 
 comptime LIST_COUNT_COLUMN = 13
 
+# An article's tag names, sorted. Each name is a primary-key lookup: the reference ARRAY(SELECT t.name FROM
+# article_tags at JOIN tags t ON ... ORDER BY t.name) gets a generic plan that seq-scans and hashes all 200 tags for
+# every article. Same array: (article_id, tag_id) is the primary key, names are NOT NULL, and ORDER BY 1 sorts the
+# same text values with the same collation.
+comptime TAG_LIST = (
+    " ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at"
+    " WHERE at.article_id = a.id ORDER BY 1)"
+)
+
 # ARTICLE_LIST_SELECT's columns ($1 = viewer): 0 id, 1 slug, 2 title, 3 description, 4 created_at, 5 updated_at,
 # 6 tag_list, 7 favorites_count, 8 favorited, 9 username, 10 bio, 11 image, 12 following.
 comptime LIST_COLUMNS = (
     "SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at,"
-    " ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id"
-    " WHERE at.article_id = a.id ORDER BY t.name) AS tag_list,"
+    + TAG_LIST
+    + " AS tag_list,"
     " (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,"
     " EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1) AS favorited,"
     " u.username, u.bio, u.image,"
@@ -57,8 +66,8 @@ comptime LIST_COLUMNS = (
 # 13 following.
 comptime FULL_SELECT = (
     "SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at,"
-    " ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id"
-    " WHERE at.article_id = a.id ORDER BY t.name) AS tag_list,"
+    + TAG_LIST
+    + " AS tag_list,"
     " (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,"
     " EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1) AS favorited,"
     " u.username, u.bio, u.image,"

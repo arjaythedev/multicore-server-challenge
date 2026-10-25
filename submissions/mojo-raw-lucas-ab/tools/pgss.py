@@ -61,6 +61,24 @@ def name(q):
     return "? " + " ".join(q.split())[:40]
 
 
+def our_statements():
+    """{name: sql} for every statement in src/sql.mojo, as the server prepares it (via tools/print_sql.mojo)."""
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    sub = os.path.dirname(here)
+    exe = "/tmp/print_sql"
+    srcs = [os.path.join(sub, "src", "sql.mojo"), os.path.join(here, "print_sql.mojo")]
+    if not os.path.exists(exe) or any(os.path.getmtime(f) > os.path.getmtime(exe) for f in srcs):
+        mojo = os.environ.get("MOJO", os.path.expanduser("~/mojo-env/bin/mojo"))
+        subprocess.run([mojo, "build", "-I", os.path.join(sub, "src"), os.path.join(here, "print_sql.mojo"), "-o", exe],
+                       check=True)
+    out = {}
+    for line in subprocess.run([exe], capture_output=True, text=True, check=True).stdout.splitlines():
+        _, q = line.split("\t", 1)
+        out[name(q)] = q
+    return out
+
+
 def psql(db, sql):
     return subprocess.run(["psql", "-X", "-At", "-F", "\t", "-d", db, "-c", sql], capture_output=True, text=True,
                           check=True).stdout

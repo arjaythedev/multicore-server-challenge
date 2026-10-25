@@ -95,3 +95,26 @@ if len(arms) >= 2:
         if na and nb:
             ua, ub = 1000 * ma / na, 1000 * mb / nb
             print(f"{kind:22s} {ua:8.0f} {ub:8.0f}   {100 * (ub / ua - 1):+6.1f}%")
+
+# Per-statement time per call, round by round, with the median change: statements whose SQL didn't change show
+# how much of a difference is just noise.
+if "--per-round" in sys.argv and len(arms) >= 2:
+    def per_call(path):
+        out = {}
+        for line in open(path).read().splitlines()[1:-1]:
+            m = re.match(r"(.{20}) +(\d+) +(\d+) +(\d+) +([\d.]+)% +(\d+)", line)
+            if m:
+                out[m.group(1).strip()] = (int(m.group(6)), float(m.group(3)) + float(m.group(4)))  # us/call, total ms
+        return out
+    rounds = sorted({r["rnd"] for r in runs[arms[0]]} & {r["rnd"] for r in runs[arms[1]]}, key=int)
+    skip = [x for x in sys.argv if x.startswith("--skip=")]
+    skip = skip[0].split("=", 1)[1].split(",") if skip else []
+    rounds = [r for r in rounds if r not in skip]
+    per = {arm: {r: per_call(f"{d}/{r}-{arm}.pgss") for r in rounds} for arm in arms[:2]}
+    names = sorted(per[arms[0]][rounds[0]], key=lambda n: -per[arms[0]][rounds[0]][n][1])[:10]  # busiest first
+    print(f"\nus per call, {arms[0]} -> {arms[1]}, rounds {','.join(rounds)} (median change)")
+    for n in names:
+        us = {arm: {r: per[arm][r].get(n, (0, 0))[0] for r in rounds} for arm in arms[:2]}
+        changes = sorted(100 * (us[arms[1]][r] / us[arms[0]][r] - 1) for r in rounds if us[arms[0]][r])
+        cells = "  ".join(f"{us[arms[0]][r]:4d}->{us[arms[1]][r]:4d}" for r in rounds)
+        print(f"  {n:18s} {cells}   {changes[len(changes) // 2]:+6.1f}%")
