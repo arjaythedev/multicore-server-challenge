@@ -20,7 +20,7 @@ JWTs and bcrypt, all on the Zig standard library.
 | Dependencies | none (`install.sh` only unpacks the pinned Zig toolchain) |
 
 `build.sh` runs `zig build -Doptimize=ReleaseFast -Dcpu=native` (built on the box, so SHA-NI / BMI2 paths follow the CPU); the
-binary is about 670 KB.
+binary is about 760 KB.
 
 See [COMPETITIVE_ANALYSIS.md](COMPETITIVE_ANALYSIS.md) for a head-on architectural and efficiency comparison against current leaderboard leaders (Rust #1, C# #2, C #3) and competing Zig PRs.
 
@@ -39,14 +39,17 @@ See [COMPETITIVE_ANALYSIS.md](COMPETITIVE_ANALYSIS.md) for a head-on architectur
   come from a shared provided-buffer ring and belong to a connection only while one of its requests is incomplete.
   100,000 idle connections: ~23 MB RSS for the whole service; 50,000 busy users: 11 MB per worker process.
 - bcrypt runs on its own threads at normal priority (`BCRYPT_THREADS`, default CPUs/4 in total). A login waits up to
-  250 ms (`BCRYPT_WAIT_MS`) for company, then up to four hashes run interleaved; a job that waited 15 s is dropped.
+  250 ms (`BCRYPT_WAIT_MS`) for company, then up to four hashes run interleaved; a job that waited 9.5 s is dropped
+  with a 503 to avoid computing expired work past the load generator's 10.0 s deadline.
   At a lower priority the threads starve while Postgres saturates the CPUs and logins time out.
 - At the saturation point measured on the rig (one Postgres thread, one server thread; see Results), the Postgres thread is
   at 80–90% and the server thread at about half: the batch planner moves the limit to Postgres CPU per request.
 
 ## Optimizations and why
 
-- **Front: direct.** No Nginx hop, no gzip; one `send` per response (head and body in one buffer).
+- **Front: direct.** No Nginx hop, no gzip; one `send` per response (head and body in one buffer). Responses >= 256
+  bytes use zero-copy `io_uring` sends (`IORING_OP_SEND_ZC`) to avoid copying into the kernel socket buffer, with
+  automatic fallback to standard `send` if the kernel does not support it.
 - **One statement, one round trip per request**, prepared once per connection, binary in and out (Postgres never formats a
   timestamp or integer). Favorite toggles are two statements, publishing an article up to four, each in one transaction.
   Session settings only: `plan_cache_mode=force_generic_plan`, `jit=off`, `max_parallel_workers_per_gather=0`.
@@ -57,7 +60,9 @@ See [COMPETITIVE_ANALYSIS.md](COMPETITIVE_ANALYSIS.md) for a head-on architectur
   still carries the count; follow / comment / delete / update fold lookup and write into one CTE; comment threads (up to
   100 rows) test "does the viewer follow this author" against the viewer's followee set hashed once (-27% on a hot thread).
 - **Reads are batched by a two-phase planner, and what requests share is done once.** A waiting read is held for up to
-  100 ms (`READ_WINDOW_US`) for company, or until 8,192 reads are waiting. The batch (at most 2,048 reads, oldest first)
+  100 ms (`READ_WINDOW_US`) for company, or until 2,048 reads are waiting (`READ_HOLD_MIN`). Under high concurrency
+  the window contracts adaptively (`ADAPTIVE_WINDOW=1`): >= 1,024 staged reads shortens it to 10 ms, >= 512 to 25 ms,
+  >= 256 to 50 ms; idle Postgres backends with >= 64 staged reads trigger 15 ms. The batch (at most 2,048 reads, oldest first)
   goes out as a plan: phase A runs one statement per kind of request present, each over the batch's distinct keys (capped
   counts and page rows, `unnest(...) WITH ORDINALITY`); phase B enriches the union of the articles phase A returned, once
   each (author, favourite count, tag names), and resolves each viewer's favourited / following flags with one `= ANY` range
