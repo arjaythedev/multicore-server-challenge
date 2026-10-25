@@ -20,7 +20,13 @@ class User < ApplicationRecord
     bound_sql("users.username AS author_username, users.bio AS author_bio, users.image AS author_image")
   end
 
-  def followed_by?(viewer_id)
-    Follow.exists?(follower_id: viewer_id, followee_id: id)
+  # bcrypt takes tens of milliseconds and releases the GVL, so hash on a short-lived thread: under Falcon's fiber
+  # scheduler only this request waits for it, while the worker's event loop keeps serving everyone else's.
+  def password=(unencrypted_password)
+    Thread.new { super(unencrypted_password) }.join
+  end
+
+  def authenticate_password(unencrypted_password)
+    Thread.new { super(unencrypted_password) }.value
   end
 end

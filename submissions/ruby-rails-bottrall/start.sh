@@ -8,12 +8,13 @@ RUBY_BIN=/opt/ruby-4.0.9/bin
 export PATH="$RUBY_BIN:$PATH"
 
 export RAILS_ENV=production
+export LANG="${LANG:-C.UTF-8}"
 export WEB_CONCURRENCY="${WEB_CONCURRENCY:-$(nproc)}"
 # 90 of Postgres's 100 connections, split evenly across the workers.
 export DB_POOL="${DB_POOL:-$(( 90 / WEB_CONCURRENCY ))}"
 # Nothing in an API without cookies or sessions signs anything with it, but Rails wants one to boot.
 export SECRET_KEY_BASE="${SECRET_KEY_BASE:-$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
-export RUBY_YJIT_ENABLE=1
+# YJIT is switched on by Rails (config.yjit) once the app has booted, before Falcon forks the workers.
 # Start each worker with a heap big enough for a busy request mix, rather than growing it one GC at a time:
 # this halves the time spent in GC. (Slots per size pool: 40, 80 and 160 bytes.)
 export RUBY_GC_HEAP_0_INIT_SLOTS="${RUBY_GC_HEAP_0_INIT_SLOTS:-600000}"

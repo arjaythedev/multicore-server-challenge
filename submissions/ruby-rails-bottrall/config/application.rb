@@ -12,6 +12,10 @@ module Conduit
     config.load_defaults 8.1
     config.api_only = true
 
+    # Rails' default, spelled out because it's the biggest single win here: YJIT is enabled after boot, so it
+    # compiles only code that runs while serving requests (in config/preload.rb's parent, inherited by workers).
+    config.yjit = true
+
     # Falcon serves each request on its own fiber, so per-request state (the leased database connection,
     # CurrentAttributes, the query cache) must be fiber-local rather than thread-local.
     config.active_support.isolation_level = :fiber

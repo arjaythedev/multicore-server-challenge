@@ -6,6 +6,8 @@ default: &default
   pool: <%= ENV.fetch("DB_POOL", 5) %>
   checkout_timeout: 10
   prepared_statements: true
+  # No request here runs the same SELECT twice, so the per-request query cache would only spend CPU on keys.
+  query_cache: false
 
 development:
   <<: *default
