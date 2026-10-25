@@ -12,6 +12,10 @@
 #include <thread>
 #include <vector>
 
+#ifdef USE_MIMALLOC
+#include <mimalloc.h>
+#endif
+
 #include "auth.h"
 #include "prof.h"
 #include "worker.h"
@@ -46,6 +50,12 @@ static bool pg_is_local(const char *url) {
 }
 
 int main() {
+#ifdef USE_MIMALLOC
+    // Defaults only: MIMALLOC_* environment variables still win (used to A/B these).
+    mi_option_set_default(mi_option_purge_delay, -1);            // never madvise freed pages back; steady-state RSS is bounded
+    mi_option_set_default(mi_option_allow_large_os_pages, 1);    // 2 MB pages (THP) for arenas -> fewer TLB misses
+    mi_option_set_default(mi_option_arena_eager_commit, 1);
+#endif
 #ifdef PROF
     prof::start_dumper();
 #endif
