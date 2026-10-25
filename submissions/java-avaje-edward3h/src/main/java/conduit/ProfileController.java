@@ -9,7 +9,7 @@ import io.helidon.webserver.http.ServerRequest;
 
 /** Profiles and follows. */
 @Controller
-class ProfileController {
+class ProfileController implements ApiController {
 
     private final UserDao users;
     private final Auth auth;
@@ -19,6 +19,7 @@ class ProfileController {
         this.auth = auth;
     }
 
+    @Access(Access.Level.OPTIONAL)
     @Get("/api/profiles/{username}")
     Dto.ProfileResponse get(String username, ServerRequest req) {
         long viewer = auth.viewer(req);

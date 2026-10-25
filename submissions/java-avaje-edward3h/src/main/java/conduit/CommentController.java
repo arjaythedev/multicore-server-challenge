@@ -9,7 +9,7 @@ import io.helidon.webserver.http.ServerRequest;
 
 /** Comments on an article. */
 @Controller
-class CommentController {
+class CommentController implements ApiController {
 
     private final CommentDao comments;
     private final ArticleDao articles;
@@ -29,6 +29,7 @@ class CommentController {
         return id;
     }
 
+    @Access(Access.Level.OPTIONAL)
     @Get("/api/articles/{slug}/comments")
     Dto.CommentList list(String slug, ServerRequest req) {
         long viewer = auth.viewer(req);

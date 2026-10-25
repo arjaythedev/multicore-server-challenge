@@ -52,8 +52,10 @@ time and never touches the real database.
   Jsonb, which rejects a value of the wrong JSON type, so `{"title": 123}` is a 422, not coerced. A parse error is a 422
   through the `JsonException` handler in `Main.java`; `Body.java` turns missing, null and blank values into 422s. Passwords over 72 bytes are a 422.
 - Auth is a `@Filter` (`AuthFilter.java`) that runs before the body is bound, so a missing or invalid token is a 401 even
-  when the body is also malformed. Routes are protected unless listed there as optional or none; the caller is passed to
-  the handlers through the request context (`Auth.java`).
+  when the body is also malformed. Each controller method declares what it needs with `@Access` (`NONE`, `OPTIONAL`, or
+  `REQUIRED`, the default, so a new endpoint is protected until it says otherwise). `AccessTable` reads those at startup
+  and matches the request path against the route templates; a path that matches no route is left for Helidon's 404. The
+  caller is passed to the handlers through the request context (`Auth.java`).
 - Timestamps are formatted with `uuuu-MM-dd'T'HH:mm:ss.SSS'Z'` in UTC, which truncates.
 - Nulls are serialised explicitly (`bio` and `image` are JSON `null`).
 

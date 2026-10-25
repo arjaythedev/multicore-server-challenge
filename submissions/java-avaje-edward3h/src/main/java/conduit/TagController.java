@@ -4,7 +4,7 @@ import io.avaje.http.api.Controller;
 import io.avaje.http.api.Get;
 
 @Controller
-class TagController {
+class TagController implements ApiController {
 
     private final TagDao tags;
 
@@ -12,6 +12,7 @@ class TagController {
         this.tags = tags;
     }
 
+    @Access(Access.Level.NONE)
     @Get("/api/tags")
     Dto.TagList tags() {
         return new Dto.TagList(tags.allNames());

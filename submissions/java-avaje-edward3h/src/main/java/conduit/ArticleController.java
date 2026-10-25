@@ -12,7 +12,7 @@ import io.helidon.webserver.http.ServerRequest;
 
 /** Articles, the feed, and favorites. */
 @Controller
-class ArticleController {
+class ArticleController implements ApiController {
 
     private final ArticleDao articles;
     private final Auth auth;
@@ -66,6 +66,7 @@ class ArticleController {
                 author(r.username(), r.bio(), r.image(), r.following())));
     }
 
+    @Access(Access.Level.OPTIONAL)
     @Get("/api/articles")
     Dto.ArticleList list(ServerRequest req) {
         long viewer = auth.viewer(req);
@@ -92,6 +93,7 @@ class ArticleController {
         return summaries(articles.feed(caller.id(), p.limit(), p.offset()), articles.countFeed(caller.id()));
     }
 
+    @Access(Access.Level.OPTIONAL)
     @Get("/api/articles/{slug}")
     Dto.ArticleResponse get(String slug, ServerRequest req) {
         return full(articles.findBySlug(auth.viewer(req), slug));

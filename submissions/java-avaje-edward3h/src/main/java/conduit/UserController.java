@@ -11,7 +11,7 @@ import org.ethelred.kiwiproc.exception.UncheckedSQLException;
 
 /** Users and auth: register, login, current user, update user. */
 @Controller
-class UserController {
+class UserController implements ApiController {
 
     private final UserDao users;
     private final Auth auth;
@@ -37,6 +37,7 @@ class UserController {
         return ex;
     }
 
+    @Access(Access.Level.NONE)
     @Post("/api/users")
     @Produces(statusCode = 201)
     Dto.UserResponse register(Requests.Register request) {
@@ -54,6 +55,7 @@ class UserController {
         return wrap(row, jwt.sign(row.id()));
     }
 
+    @Access(Access.Level.NONE)
     @Post("/api/users/login")
     @Produces(statusCode = 200)
     Dto.UserResponse login(Requests.Login request) {
