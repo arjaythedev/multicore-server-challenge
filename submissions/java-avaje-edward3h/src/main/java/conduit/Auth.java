@@ -5,9 +5,9 @@ import io.helidon.webserver.http.ServerRequest;
 import jakarta.inject.Singleton;
 
 /**
- * {@code Authorization: Token <jwt>} (an empty header counts as absent). {@link #user} makes auth required
- * (missing or invalid token: 401); {@link #viewer} makes it optional (no header: viewer 0; a header
- * that is present but invalid: 401). Called first in each handler, so auth runs before anything else.
+ * {@code Authorization: Token <jwt>} (an empty header counts as absent). {@link AuthFilter} calls
+ * {@link #authenticate} before routing, so a bad token is a 401 before the body is read; handlers then read the
+ * caller with {@link #user} (auth required) or {@link #viewer} (auth optional).
  */
 @Singleton
 final class Auth {
@@ -17,6 +17,7 @@ final class Auth {
     }
 
     private static final String PREFIX = "Token ";
+    private static final String CALLER = "conduit.caller";
 
     private final Jwt jwt;
 
@@ -24,26 +25,33 @@ final class Auth {
         this.jwt = jwt;
     }
 
-    User user(ServerRequest req) {
+    /**
+     * Verifies the token, if there is one, and records the caller on the request. A token that is present but
+     * invalid is a 401; so is a missing token when {@code required}.
+     */
+    void authenticate(ServerRequest req, boolean required) {
         String token = token(req);
         if (token == null) {
-            throw ApiException.unauthorized();
+            if (required) {
+                throw ApiException.unauthorized();
+            }
+            return;
         }
-        return new User(verify(token), token);
-    }
-
-    /** The caller's user id, or 0 when anonymous. */
-    long viewer(ServerRequest req) {
-        String token = token(req);
-        return token == null ? 0 : verify(token);
-    }
-
-    private long verify(String token) {
         long id = jwt.verify(token);
         if (id == 0) {
             throw ApiException.unauthorized();
         }
-        return id;
+        req.context().register(CALLER, new User(id, token));
+    }
+
+    /** The authenticated caller; 401 if {@link #authenticate} didn't find one. */
+    User user(ServerRequest req) {
+        return req.context().get(CALLER, User.class).orElseThrow(ApiException::unauthorized);
+    }
+
+    /** The caller's user id, or 0 when anonymous. */
+    long viewer(ServerRequest req) {
+        return req.context().get(CALLER, User.class).map(User::id).orElse(0L);
     }
 
     private static String token(ServerRequest req) {
