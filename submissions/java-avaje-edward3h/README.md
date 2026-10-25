@@ -51,6 +51,8 @@ time and never touches the real database.
 - Controller methods take the request record (`Requests.java`) as a parameter and the generated route binds it with
   Jsonb, which rejects a value of the wrong JSON type, so `{"title": 123}` is a 422, not coerced. A parse error is a 422
   through the `JsonException` handler in `Main.java`; `Body.java` turns missing, null and blank values into 422s. Passwords over 72 bytes are a 422.
+- JWTs are verified on every request with no cache. Only the initialised `Mac` objects are reused (a lock-free pool), and
+  claims are read with Jsonb's streaming reader. This took JWT from 6.0% to 2.5% of the JVM's profile samples.
 - Auth is a `@Filter` (`AuthFilter.java`) that runs before the body is bound, so a missing or invalid token is a 401 even
   when the body is also malformed. Each controller method declares what it needs with `@Access` (`NONE`, `OPTIONAL`, or
   `REQUIRED`, the default, so a new endpoint is protected until it says otherwise). `AccessTable` reads those at startup
