@@ -30,18 +30,5 @@
 	"lflags-osx": [
 		"-L/opt/homebrew/opt/libpq/lib",
 		"-L/opt/homebrew/opt/openssl@3/lib"
-	],
-	"configurations": [
-		{
-			"name": "portable",
-			"targetType": "executable"
-		},
-		{
-			"name": "native",
-			"targetType": "executable",
-			"dflags": [
-				"-mcpu=native"
-			]
-		}
 	]
 }

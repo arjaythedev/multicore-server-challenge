@@ -9,5 +9,5 @@ command -v ldc2 >/dev/null || { echo "install.sh did not put ldc2 on PATH"; exit
 mkdir -p bin
 # dub.selections.json pins every dependency, including the one git package
 # (dpq2 pins derelict-pq by commit), so this is a reproducible build.
-dub build --build=release --compiler=ldc2 --config="${CONFIG:-native}"
+dub build --build=release --compiler=ldc2
 echo "built bin/server with $(ldc2 --version | head -1)"

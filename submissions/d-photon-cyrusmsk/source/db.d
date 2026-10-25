@@ -44,7 +44,9 @@ RETURNING id, username, email, bio, image`;
     enum deleteFollow = `DELETE FROM follows WHERE follower_id = $1 AND followee_id = $2`;
 
     // -- article lists: SPEC.md's ARTICLE_LIST_SELECT, one prepared statement
-    // per filter, each with its capped count --
+    // per filter, each with its capped count. Paginate ids first: evaluating
+    // the tag/favorite/follow subqueries for every skipped row makes a huge
+    // OFFSET take longer than the statement timeout.
     enum listAll = `SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at,
        ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id
               WHERE at.article_id = a.id ORDER BY t.name) AS tag_list,
@@ -111,6 +113,71 @@ RETURNING id, username, email, bio, image`;
     (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT ($2::int8 + $3::int8)) x
   WHERE fo.follower_id = $1 ORDER BY x.id DESC LIMIT $2 OFFSET $3) ORDER BY a.id DESC`;
     enum countFeed = `SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $1) LIMIT 1000) s`;
+
+    // Large OFFSETs: paginate ids first, then fetch the full rows.
+    enum listAllPage = `WITH page AS (
+    SELECT id FROM articles ORDER BY id DESC LIMIT $2 OFFSET $3
+)
+SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at,
+       ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id
+              WHERE at.article_id = a.id ORDER BY t.name) AS tag_list,
+       (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
+       EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1) AS favorited,
+       u.username, u.bio, u.image,
+       EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = a.author_id) AS following
+  FROM articles a
+  JOIN users u ON u.id = a.author_id
+ WHERE a.id IN (SELECT id FROM page)
+ ORDER BY a.id DESC`;
+    enum listByTagPage = `WITH page AS (
+    SELECT at.article_id AS id FROM article_tags at
+     WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = $4)
+     ORDER BY at.article_id DESC LIMIT $2 OFFSET $3
+)
+SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at,
+       ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id
+              WHERE at.article_id = a.id ORDER BY t.name) AS tag_list,
+       (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
+       EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1) AS favorited,
+       u.username, u.bio, u.image,
+       EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = a.author_id) AS following
+  FROM articles a
+  JOIN users u ON u.id = a.author_id
+ WHERE a.id IN (SELECT id FROM page)
+ ORDER BY a.id DESC`;
+    enum listByAuthorPage = `WITH page AS (
+    SELECT a.id FROM articles a
+     WHERE a.author_id = (SELECT au.id FROM users au WHERE au.username = $4)
+     ORDER BY a.id DESC LIMIT $2 OFFSET $3
+)
+SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at,
+       ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id
+              WHERE at.article_id = a.id ORDER BY t.name) AS tag_list,
+       (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
+       EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1) AS favorited,
+       u.username, u.bio, u.image,
+       EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = a.author_id) AS following
+  FROM articles a
+  JOIN users u ON u.id = a.author_id
+ WHERE a.id IN (SELECT id FROM page)
+ ORDER BY a.id DESC`;
+    enum listByFavoritePage = `WITH page AS (
+    SELECT f.article_id AS id FROM favorites f
+     WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = $4)
+     ORDER BY f.article_id DESC LIMIT $2 OFFSET $3
+)
+SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at,
+       ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id
+              WHERE at.article_id = a.id ORDER BY t.name) AS tag_list,
+       (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
+       EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1) AS favorited,
+       u.username, u.bio, u.image,
+       EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = a.author_id) AS following
+  FROM articles a
+  JOIN users u ON u.id = a.author_id
+ WHERE a.id IN (SELECT id FROM page)
+ ORDER BY a.id DESC`;
+
 
     // -- a single article, with body --
     enum articleBySlug = `SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at,

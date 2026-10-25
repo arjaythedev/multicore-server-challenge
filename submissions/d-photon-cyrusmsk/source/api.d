@@ -1113,27 +1113,28 @@ private void listArticles(HTTPServerRequest req, HTTPServerResponse res)
         kind = ListKind.all;
 
     QueryParams page, count;
+    const usePage = offset > 1024;
     final switch (kind)
     {
     case ListKind.all:
-        page.preparedStatementName = Name.listAll;
+        page.preparedStatementName = usePage ? Name.listAllPage : Name.listAll;
         page.argsVariadic(viewer, limit, offset);
         count.preparedStatementName = Name.countAll;
         break;
     case ListKind.tag:
-        page.preparedStatementName = Name.listByTag;
+        page.preparedStatementName = usePage ? Name.listByTagPage : Name.listByTag;
         page.argsVariadic(viewer, limit, offset, dbArg(filter));
         count.preparedStatementName = Name.countByTag;
         count.argsVariadic(dbArg(filter));
         break;
     case ListKind.author:
-        page.preparedStatementName = Name.listByAuthor;
+        page.preparedStatementName = usePage ? Name.listByAuthorPage : Name.listByAuthor;
         page.argsVariadic(viewer, limit, offset, dbArg(filter));
         count.preparedStatementName = Name.countByAuthor;
         count.argsVariadic(dbArg(filter));
         break;
     case ListKind.favorited:
-        page.preparedStatementName = Name.listByFavorite;
+        page.preparedStatementName = usePage ? Name.listByFavoritePage : Name.listByFavorite;
         page.argsVariadic(viewer, limit, offset, dbArg(filter));
         count.preparedStatementName = Name.countByFavorite;
         count.argsVariadic(dbArg(filter));
