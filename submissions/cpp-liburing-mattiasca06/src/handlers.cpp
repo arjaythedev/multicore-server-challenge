@@ -360,8 +360,11 @@ Task<Reply> Worker::route(const Request &rq) {
     co_return err(404, "not found");
 }
 
+// The query list of every db()/db_write() call is built in its own statement: GCC 13 (Ubuntu 24.04) hits an internal
+// compiler error on a braced list of Query temporaries inside a co_await expression.
 Task<Reply> Worker::h_tags() {
-    Rows rows = co_await db({Query("tags", {})});
+    QVec qv1{Query("tags", {})};
+    Rows rows = co_await db(std::move(qv1));
     if (!rows.all_ok(1)) [[unlikely]] co_return db_error();
     std::string body;
     take_buf(body); body.reserve(32 + size_t(rows[0].rows()) * 16);
@@ -386,7 +389,8 @@ Task<Reply> Worker::h_register(const Request &rq) {
 
     BcryptResult br = co_await bcrypt_hash(password.v);
     if (!br.ok) co_return err(500, "hashing failed");
-    Rows rows = co_await db_write({Query("user_register", {username.v, email.v, br.hash})}, true);
+    QVec qv2{Query("user_register", {username.v, email.v, br.hash})};
+    Rows rows = co_await db_write(std::move(qv2), true);
     if (!rows.ok || rows.r.size() != 1) [[unlikely]] co_return db_error();
     const Res &r = rows[0];
     if (PQresultStatus(r) != PGRES_TUPLES_OK)
@@ -403,7 +407,8 @@ Task<Reply> Worker::h_login(const Request &rq) {
     StrField email = str_field(u, "email"), password = str_field(u, "password");
     if (!email.present_nonempty() || !password.present_nonempty()) co_return err(422, "email and password are required");
 
-    Rows rows = co_await db({Query("user_login", {email.v})});
+    QVec qv3{Query("user_login", {email.v})};
+    Rows rows = co_await db(std::move(qv3));
     if (!rows.all_ok(1)) [[unlikely]] co_return db_error();
     const Res &r = rows[0];
     if (r.rows() == 0) co_return err(401, "invalid credentials");
@@ -415,7 +420,8 @@ Task<Reply> Worker::h_login(const Request &rq) {
 }
 
 Task<Reply> Worker::h_get_user(const Request &rq, int64_t viewer) {
-    Rows rows = co_await db({Query("user_by_id", {viewer})});
+    QVec qv4{Query("user_by_id", {viewer})};
+    Rows rows = co_await db(std::move(qv4));
     if (!rows.all_ok(1)) [[unlikely]] co_return db_error();
     if (rows[0].rows() == 0) co_return err(401, "unauthorized");
     std::string body;
@@ -441,8 +447,8 @@ Task<Reply> Worker::h_put_user(const Request &rq, int64_t viewer) {
         if (!br.ok) co_return err(500, "hashing failed");
         hash = Param(br.hash);
     }
-    Rows rows = co_await db_write(
-        {Query("user_update", {viewer, email.param(), username.param(), hash, bio.param(), image.param()})}, true);
+    QVec qv5{Query("user_update", {viewer, email.param(), username.param(), hash, bio.param(), image.param()})};
+    Rows rows = co_await db_write(std::move(qv5), true);
     if (!rows.ok || rows.r.size() != 1) [[unlikely]] co_return db_error();
     const Res &r = rows[0];
     if (PQresultStatus(r) != PGRES_TUPLES_OK)
@@ -454,7 +460,8 @@ Task<Reply> Worker::h_put_user(const Request &rq, int64_t viewer) {
 }
 
 Task<Reply> Worker::h_profile(const Request &, std::string name, int64_t viewer) {
-    Rows rows = co_await db({Query("profile", {viewer, name})});
+    QVec qv6{Query("profile", {viewer, name})};
+    Rows rows = co_await db(std::move(qv6));
     if (!rows.all_ok(1)) [[unlikely]] co_return db_error();
     const Res &r = rows[0];
     if (r.rows() == 0) co_return err(404, "profile not found");
@@ -464,7 +471,8 @@ Task<Reply> Worker::h_profile(const Request &, std::string name, int64_t viewer)
 }
 
 Task<Reply> Worker::h_follow(const Request &, std::string name, int64_t viewer, bool follow) {
-    Rows rows = co_await db_write({Query(follow ? "follow_slug" : "unfollow_slug", {viewer, name})});
+    QVec qv7{Query(follow ? "follow_slug" : "unfollow_slug", {viewer, name})};
+    Rows rows = co_await db_write(std::move(qv7));
     if (!rows.all_ok(1)) [[unlikely]] co_return db_error();
     const Res &r = rows[0];
     if (r.rows() == 0) co_return err(404, "profile not found");
@@ -534,7 +542,8 @@ Task<Reply> Worker::h_list(const Request &rq, int64_t viewer, bool feed) {
 }
 
 Task<Reply> Worker::h_article(std::string slug, int64_t viewer) {
-    Rows rows = co_await db({Query("article_by_slug", {viewer, slug})});
+    QVec qv8{Query("article_by_slug", {viewer, slug})};
+    Rows rows = co_await db(std::move(qv8));
     if (!rows.all_ok(1)) [[unlikely]] co_return db_error();
     if (rows[0].rows() == 0) co_return err(404, "article not found");
     std::string body = R"({"article":)";
@@ -595,8 +604,9 @@ Task<Reply> Worker::h_update_article(const Request &rq, std::string slug, int64_
         if (f->st == StrField::Bad || (f->st == StrField::Ok && f->v.empty())) co_return err(422, "invalid field");
 
     // The update only matches the author's own article; the owner lookup in the same segment tells 403 from 404.
-    Rows rows = co_await db_write({Query("article_update_full", {viewer, slug, title.param(), description.param(), body.param()}),
-                                   Query("article_owner", {slug})});
+    QVec qv9{Query("article_update_full", {viewer, slug, title.param(), description.param(), body.param()}),
+                                   Query("article_owner", {slug})};
+    Rows rows = co_await db_write(std::move(qv9));
     if (!rows.all_ok(2)) [[unlikely]] co_return db_error();
     if (rows[0].rows() == 0) co_return rows[1].rows() == 0 ? err(404, "article not found") : err(403, "forbidden");
     std::string out;
@@ -608,7 +618,8 @@ Task<Reply> Worker::h_update_article(const Request &rq, std::string slug, int64_
 }
 
 Task<Reply> Worker::h_delete_article(std::string slug, int64_t viewer) {
-    Rows rows = co_await db_write({Query("article_delete_slug", {slug, viewer})});
+    QVec qv10{Query("article_delete_slug", {slug, viewer})};
+    Rows rows = co_await db_write(std::move(qv10));
     if (!rows.all_ok(1)) [[unlikely]] co_return db_error();
     const Res &r = rows[0];
     if (i64(r, 0, 0) > 0) co_return Reply{204, {}};
@@ -618,8 +629,8 @@ Task<Reply> Worker::h_delete_article(std::string slug, int64_t viewer) {
 
 Task<Reply> Worker::h_favorite(std::string slug, int64_t viewer, bool add) {
     // The read-back runs in the same segment, so it sees this request's own write; no row means no such article.
-    Rows rows = co_await db_write(
-        {Query(add ? "fav_add_slug" : "fav_del_slug", {viewer, slug}), Query("article_by_slug", {viewer, slug})});
+    QVec qv11{Query(add ? "fav_add_slug" : "fav_del_slug", {viewer, slug}), Query("article_by_slug", {viewer, slug})};
+    Rows rows = co_await db_write(std::move(qv11));
     if (!rows.all_ok(2)) [[unlikely]] co_return db_error();
     if (rows[1].rows() == 0) co_return err(404, "article not found");
     std::string out;
@@ -631,7 +642,8 @@ Task<Reply> Worker::h_favorite(std::string slug, int64_t viewer, bool add) {
 }
 
 Task<Reply> Worker::h_comments(std::string slug, int64_t viewer) {
-    Rows rows = co_await db({Query("comments_by_slug", {viewer, slug})});
+    QVec qv12{Query("comments_by_slug", {viewer, slug})};
+    Rows rows = co_await db(std::move(qv12));
     if (!rows.all_ok(1)) [[unlikely]] co_return db_error();
     const Res &r = rows[0];
     if (r.rows() == 0) co_return err(404, "article not found");
@@ -653,7 +665,8 @@ Task<Reply> Worker::h_add_comment(const Request &rq, std::string slug, int64_t v
     StrField body = str_field(c, "body");
     if (!body.present_nonempty()) co_return err(422, "body is required");
 
-    Rows rows = co_await db_write({Query("comment_insert_slug", {slug, viewer, body.v})});
+    QVec qv13{Query("comment_insert_slug", {slug, viewer, body.v})};
+    Rows rows = co_await db_write(std::move(qv13));
     if (!rows.all_ok(1)) [[unlikely]] co_return db_error();
     if (rows[0].rows() == 0) co_return err(404, "article not found");
     std::string out;
@@ -667,7 +680,8 @@ Task<Reply> Worker::h_add_comment(const Request &rq, std::string slug, int64_t v
 Task<Reply> Worker::h_delete_comment(std::string slug, std::string id, int64_t viewer) {
     int64_t cid;
     if (!parse_i64(id, cid) || cid < 0) co_return err(404, "comment not found");
-    Rows rows = co_await db_write({Query("comment_delete_slug", {cid, slug, viewer})});
+    QVec qv14{Query("comment_delete_slug", {cid, slug, viewer})};
+    Rows rows = co_await db_write(std::move(qv14));
     if (!rows.all_ok(1)) [[unlikely]] co_return db_error();
     const Res &r = rows[0];
     if (i64(r, 0, 0) > 0) co_return Reply{204, {}};
