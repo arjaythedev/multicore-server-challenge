@@ -94,6 +94,7 @@ struct Worker:
     var out: ByteBuf  # the response(s) being written, sent with one send
     var conns: ConnTable
     var pgs: List[PgConn]
+    var n_read: Int  # pgs[:n_read] are for reads, the rest for writes (see pg_read)
     var next_gen: Int
     var rr: Int  # round-robin start for picking a Postgres connection
     var bcs: List[Int]  # sockets to the bcrypt workers
@@ -115,6 +116,7 @@ struct Worker:
         self.out = ByteBuf(64 * 1024)
         self.conns = ConnTable()
         self.pgs = List[PgConn]()
+        self.n_read = 0
         self.next_gen = 1
         self.rr = 0
         self.bcs = List[Int]()
@@ -250,13 +252,25 @@ struct Worker:
 
     # --- Postgres connections ---
 
-    def pg_pick(mut self) -> Int:
-        """The connection with the fewest batches in flight, rotating among ties."""
-        var n = len(self.pgs)
-        var best = self.rr % n
+    # Reads and writes use separate connections (pgs[:n_read] and pgs[n_read:]). A batch on a connection waits for
+    # every batch pipelined before it, so a commit that stalls (a slow WAL flush, a lock) would otherwise hold up
+    # every read queued behind it on its connection.
+
+    def pg_read(mut self) -> Int:
+        """A connection for a batch that only reads."""
+        return self.pg_pick(0, self.n_read)
+
+    def pg_write(mut self) -> Int:
+        """A connection for a batch that writes (INSERT, UPDATE or DELETE)."""
+        return self.pg_pick(self.n_read, len(self.pgs))
+
+    def pg_pick(mut self, lo: Int, hi: Int) -> Int:
+        """The connection in pgs[lo:hi] with the fewest batches in flight, rotating among ties."""
+        var n = hi - lo
+        var best = lo + self.rr % n
         var best_load = self.pgs[best].in_flight()
         for k in range(1, n):
-            var i = (self.rr + k) % n
+            var i = lo + (self.rr + k) % n
             var load = self.pgs[i].in_flight()
             if load < best_load:
                 best = i

@@ -56,7 +56,7 @@ def route(mut w: Worker, fd: Int, p: BytePtr, req: Request) -> Bool:
         if m != METHOD_GET:
             return not_found(w, keep)
         w.conn(fd).ctx.len = 0
-        var i = w.pg_pick()
+        var i = w.pg_read()
         w.pgs[i].bind_begin(sql.STMT_TAGS, 0)
         w.pgs[i].bind_end()
         return send_batch(w, i, fd, K_TAGS)
@@ -69,7 +69,7 @@ def route(mut w: Worker, fd: Int, p: BytePtr, req: Request) -> Bool:
             return False
         if m == METHOD_PUT:
             return update_user(w, fd, p, req)
-        var i = w.pg_pick()
+        var i = w.pg_read()
         w.pgs[i].bind_begin(sql.STMT_USER_BY_ID, 1)
         w.pgs[i].param_int(w.conn(fd).uid)
         w.pgs[i].bind_end()
@@ -175,7 +175,7 @@ def login(mut w: Worker, fd: Int, p: BytePtr, req: Request) -> Bool:
     var el = string_field(json, u, "email", w.tmp)
     if pl <= 0 or el <= 0:
         return unprocessable(w, req.keep_alive, "email and password must be non-empty strings")
-    var i = w.pg_pick()
+    var i = w.pg_read()
     w.pgs[i].bind_begin(sql.STMT_USER_BY_EMAIL, 1)
     w.pgs[i].param_text(w.tmp.ptr, w.tmp.len)
     w.pgs[i].bind_end()
@@ -212,7 +212,7 @@ def update_user(mut w: Worker, fd: Int, p: BytePtr, req: Request) -> Bool:
 
 
 def run_user_update(mut w: Worker, fd: Int, hash: BytePtr, hash_len: Int):
-    var i = w.pg_pick()
+    var i = w.pg_write()
     w.pgs[i].bind_begin(sql.STMT_USER_UPDATE, 6)
     w.pgs[i].param_int(w.conn(fd).uid)
     param_ctx(w, i, fd, 1)  # email
@@ -261,7 +261,7 @@ def respond_user_row(mut w: Worker, fd: Int, status: Int, res: Results, fresh_to
 def get_profile(mut w: Worker, fd: Int, p: BytePtr, req: Request, user: BytePtr, user_len: Int) -> Bool:
     if not auth_optional(w, fd, p, req):
         return False
-    var i = w.pg_pick()
+    var i = w.pg_read()
     w.pgs[i].bind_begin(sql.STMT_PROFILE, 2)
     w.pgs[i].param_int(w.conn(fd).uid)
     bind_segment(w, i, user, user_len)
@@ -273,7 +273,7 @@ def follow(mut w: Worker, fd: Int, p: BytePtr, req: Request, user: BytePtr, user
     if not auth_required(w, fd, p, req):
         return False
     w.conn(fd).aux = 1 if add else 0
-    var i = w.pg_pick()
+    var i = w.pg_read()
     w.pgs[i].bind_begin(sql.STMT_USER_BY_USERNAME, 1)
     bind_segment(w, i, user, user_len)
     w.pgs[i].bind_end()
@@ -293,7 +293,7 @@ def list_articles(mut w: Worker, fd: Int, p: BytePtr, req: Request, feed: Bool) 
     if not parse_query(p, req, w.qbuf, q):
         return unprocessable(w, req.keep_alive, "limit must be 1..100 and offset >= 0")
     var viewer = w.conn(fd).uid
-    var i = w.pg_pick()
+    var i = w.pg_read()
     var list_stmt = sql.STMT_LIST_ALL
     var f_off = 0
     var f_len = -1
@@ -325,7 +325,7 @@ def list_articles(mut w: Worker, fd: Int, p: BytePtr, req: Request, feed: Bool) 
 def get_article(mut w: Worker, fd: Int, p: BytePtr, req: Request, slug: BytePtr, slug_len: Int) -> Bool:
     if not auth_optional(w, fd, p, req):
         return False
-    var i = w.pg_pick()
+    var i = w.pg_read()
     w.pgs[i].bind_begin(sql.STMT_ARTICLE_BY_SLUG, 2)
     w.pgs[i].param_int(w.conn(fd).uid)
     bind_segment(w, i, slug, slug_len)
@@ -364,7 +364,7 @@ def create_article(mut w: Worker, fd: Int, p: BytePtr, req: Request) -> Bool:
         ctx_put(c.ctx, p, -1)
 
     # One batch, so one implicit transaction: the article and its tags commit together or not at all.
-    var i = w.pg_pick()
+    var i = w.pg_write()
     w.pgs[i].bind_begin(sql.STMT_ARTICLE_INSERT, 4)
     w.pgs[i].param_int(c.uid)
     param_ctx(w, i, fd, 1)
@@ -406,7 +406,7 @@ def delete_article(mut w: Worker, fd: Int, p: BytePtr, req: Request, slug: ByteP
 
 
 def owner_lookup(mut w: Worker, fd: Int, slug: BytePtr, slug_len: Int, kind: Int) -> Bool:
-    var i = w.pg_pick()
+    var i = w.pg_read()
     w.pgs[i].bind_begin(sql.STMT_ARTICLE_OWNER, 1)
     bind_segment(w, i, slug, slug_len)
     w.pgs[i].bind_end()
@@ -421,7 +421,7 @@ def favorite(mut w: Worker, fd: Int, p: BytePtr, req: Request, slug: BytePtr, sl
 
 
 def article_id_lookup(mut w: Worker, fd: Int, slug: BytePtr, slug_len: Int, kind: Int) -> Bool:
-    var i = w.pg_pick()
+    var i = w.pg_read()
     w.pgs[i].bind_begin(sql.STMT_ARTICLE_ID, 1)
     bind_segment(w, i, slug, slug_len)
     w.pgs[i].bind_end()
@@ -458,7 +458,7 @@ def delete_comment(mut w: Worker, fd: Int, p: BytePtr, req: Request, slug: ByteP
     if cid <= 0:
         return not_found(w, req.keep_alive)  # a non-integer id names no comment
     w.conn(fd).aux = cid
-    var i = w.pg_pick()
+    var i = w.pg_read()
     w.pgs[i].bind_begin(sql.STMT_COMMENT_OWNER, 2)
     w.pgs[i].param_int(cid)
     bind_segment(w, i, slug, slug_len)
@@ -619,7 +619,7 @@ def on_result(mut w: Worker, fd: Int, kind: Int, mut res: Results) -> Bool:
         var start = c.ctx.len
         put_profile_fields(c.ctx, res, 1)
         ctx_set_len(c.ctx, at, c.ctx.len - start)
-        var i = w.pg_pick()
+        var i = w.pg_write()
         w.pgs[i].bind_begin(sql.STMT_FOLLOW if c.aux == 1 else sql.STMT_UNFOLLOW, 2)
         w.pgs[i].param_int(c.uid)
         w.pgs[i].param_int(res.column_int(0))
@@ -655,7 +655,7 @@ def on_result(mut w: Worker, fd: Int, kind: Int, mut res: Results) -> Bool:
         if res.error_state != 0:
             db_error(w, fd, res.error_state)
             return True
-        var i = w.pg_pick()
+        var i = w.pg_read()
         article_by_id(w, i, fd, id)
         _ = send_batch(w, i, fd, K_ARTICLE_CREATED)
         return False
@@ -667,7 +667,7 @@ def on_result(mut w: Worker, fd: Int, kind: Int, mut res: Results) -> Bool:
             error_response(w.out, 403, keep, "not your article")
             return True
         var id = res.column_int(0)
-        var i = w.pg_pick()
+        var i = w.pg_write()
         if kind == K_ARTICLE_DELETE_LOOKUP:
             w.pgs[i].bind_begin(sql.STMT_ARTICLE_DELETE, 1)
             w.pgs[i].param_int(id)
@@ -692,7 +692,7 @@ def on_result(mut w: Worker, fd: Int, kind: Int, mut res: Results) -> Bool:
             error_response(w.out, 404, keep, "no such article")
             return True
         var id = res.column_int(0)
-        var i = w.pg_pick()
+        var i = w.pg_write()
         w.pgs[i].bind_begin(sql.STMT_FAVORITE if w.conn(fd).aux == 1 else sql.STMT_UNFAVORITE, 2)
         w.pgs[i].param_int(w.conn(fd).uid)
         w.pgs[i].param_int(id)
@@ -704,7 +704,7 @@ def on_result(mut w: Worker, fd: Int, kind: Int, mut res: Results) -> Bool:
         if not row:
             error_response(w.out, 404, keep, "no such article")
             return True
-        var i = w.pg_pick()
+        var i = w.pg_read()
         w.pgs[i].bind_begin(sql.STMT_COMMENTS, 2)
         w.pgs[i].param_int(w.conn(fd).uid)
         w.pgs[i].param_int(res.column_int(0))
@@ -715,7 +715,7 @@ def on_result(mut w: Worker, fd: Int, kind: Int, mut res: Results) -> Bool:
         if not row:
             error_response(w.out, 404, keep, "no such article")
             return True
-        var i = w.pg_pick()
+        var i = w.pg_write()
         w.pgs[i].bind_begin(sql.STMT_COMMENT_INSERT, 3)
         w.pgs[i].param_int(res.column_int(0))
         w.pgs[i].param_int(w.conn(fd).uid)
@@ -740,7 +740,7 @@ def on_result(mut w: Worker, fd: Int, kind: Int, mut res: Results) -> Bool:
         if res.column_int(0) != w.conn(fd).uid:
             error_response(w.out, 403, keep, "not your comment")
             return True
-        var i = w.pg_pick()
+        var i = w.pg_write()
         w.pgs[i].bind_begin(sql.STMT_COMMENT_DELETE, 1)
         w.pgs[i].param_int(w.conn(fd).aux)
         w.pgs[i].bind_end()
@@ -777,7 +777,7 @@ def on_bcrypt(mut w: Worker, fd: Int, ok: Bool, hash: BytePtr, hash_len: Int) ->
         error_response(w.out, 500, keep, "hashing failed")
         return True
     if stage == S_REGISTER_HASH:
-        var i = w.pg_pick()
+        var i = w.pg_write()
         w.pgs[i].bind_begin(sql.STMT_USER_INSERT, 3)
         param_ctx(w, i, fd, 1)  # username
         param_ctx(w, i, fd, 2)  # email

@@ -43,7 +43,9 @@ def main():
     var host = getenv("HOST", "127.0.0.1")
     var port = env_int("PORT", 3000)
     var workers = env_int("WORKERS", 2)
-    var pg_conns = env_int("PG_CONNS", 8)  # per worker; keep workers * PG_CONNS <= 95 (SPEC.md)
+    # Postgres connections per worker, for reads and for writes; keep workers * (both) <= 95 (SPEC.md)
+    var read_conns = max(1, env_int("PG_READ_CONNS", 6))
+    var write_conns = max(1, env_int("PG_WRITE_CONNS", 2))
     var cfg = parse_database_url(getenv("DATABASE_URL", "postgres://conduit:conduit@127.0.0.1:5432/conduit"))
     cfg.generic_plans = env_int("PG_GENERIC_PLANS", 1) != 0
     var addr = parse_ipv4(host)
@@ -88,7 +90,7 @@ def main():
                         _ = sys_close(pair_fds[k])
                         _ = sys_close(pair_fds[k + 1])
             if id < workers:
-                _ = sys_exit_group(run_worker(id, UInt32(addr), port, cfg, pg_conns, mine))
+                _ = sys_exit_group(run_worker(id, UInt32(addr), port, cfg, read_conns, write_conns, mine))
             _ = sys_exit_group(run_bcrypt_worker(id - workers, mine))
         if pid < 0:
             log("fork failed: errno " + String(-pid))

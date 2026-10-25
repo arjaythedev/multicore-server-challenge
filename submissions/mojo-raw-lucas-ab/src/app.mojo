@@ -37,7 +37,8 @@ def sleep_ms(ms: Int):
     ts.unsafe_free()
 
 
-def run_worker(id: Int, addr: UInt32, port: Int, cfg: PgConfig, pg_conns: Int, bcrypt_fds: List[Int]) -> Int:
+def run_worker(id: Int, addr: UInt32, port: Int, cfg: PgConfig, read_conns: Int, write_conns: Int,
+               bcrypt_fds: List[Int]) -> Int:
     var lfd = make_listener(addr, port)
     if lfd < 0:
         log("worker " + String(id) + ": cannot listen on port " + String(port) + ": errno " + String(-lfd))
@@ -49,7 +50,8 @@ def run_worker(id: Int, addr: UInt32, port: Int, cfg: PgConfig, pg_conns: Int, b
     var w = Worker(id, lfd, epfd, getenv("JWT_SECRET", ""))
 
     var stmts = sql.statements()
-    for i in range(pg_conns):
+    w.n_read = read_conns
+    for i in range(read_conns + write_conns):
         var conn = PgConn()
         var err = String("")
         for attempt in range(PG_CONNECT_ATTEMPTS):

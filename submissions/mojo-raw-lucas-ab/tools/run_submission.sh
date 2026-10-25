@@ -29,8 +29,9 @@ if ! docker inspect "$NAME" >/dev/null 2>&1; then
   echo "== $NAME: new ubuntu:24.04 container"
   # seccomp=unconfined: the box runs servers without seccomp. Docker's default profile blocks io_uring (so
   # io_uring servers can't start) and filters every syscall (a cost syscall-heavy servers would pay unevenly).
+  # CPUSET (e.g. 0-7) pins the container, so nproc inside matches the box and submissions size their pools as there.
   docker run -d --name "$NAME" --network host --ulimit nofile=200000:200000 --security-opt seccomp=unconfined \
-    ubuntu:24.04 sleep infinity >/dev/null
+    ${CPUSET:+--cpuset-cpus "$CPUSET"} ubuntu:24.04 sleep infinity >/dev/null
   # What box/setup-box.sh installs before any submission, and the box's user
   docker exec -e DEBIAN_FRONTEND=noninteractive "$NAME" bash -c \
     'apt-get update -q && apt-get install -y -q build-essential pkg-config git curl jq sysstat rsync unzip ca-certificates gnupg lsb-release' \

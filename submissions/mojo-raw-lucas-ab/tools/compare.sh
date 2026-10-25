@@ -15,6 +15,7 @@ USERS=$1 MEASURE=$2 ROUNDS=$3
 shift 3
 OUT=/tmp/compare
 PORT=3300
+export CPUSET="${CPUSET:-0-7}"  # new containers get the box's 8 CPUs (run_submission.sh)
 mkdir -p "$OUT"
 rm -f "$OUT"/*
 ulimit -n 200000
