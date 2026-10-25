@@ -7,20 +7,33 @@
 | Language | C++20, g++ from Ubuntu 24.04 (`build-essential`) |
 | I/O | raw io_uring via liburing (Ubuntu 24.04 `liburing-dev`) |
 | HTTP parsing | picohttpparser, pinned commit, SHA-256 checked in `build.sh` |
+| JSON input | yyjson 0.10.0, SHA-256 checked in `build.sh` |
 | Postgres driver | libpq (Ubuntu 24.04 `libpq-dev`) in pipeline mode, binary results, prepared statements |
+| Password hashing | bcrypt cost 10 via libcrypt (`crypt_r`, `$2b$`) |
+| JWT | HS256, hand-written on OpenSSL HMAC |
 
-## Status
-
-Work in progress. Milestone 2: all 19 endpoints are implemented and the conformance suite passes (197/197). Not yet tuned: writes still share the read connections, and there is no group commit or read batching.
+Conformance: 197/197 on `test/run.sh`. No benchmark numbers yet.
 
 ## Design
 
 - One io_uring per worker thread (`SINGLE_ISSUER | DEFER_TASKRUN`), multishot accept on a per-worker `SO_REUSEPORT`
   listener, multishot recv with a provided buffer ring (idle connections hold no receive buffer).
+- Each request is a C++20 coroutine that awaits Postgres segments and bcrypt jobs, so a worker never blocks.
 - Each worker owns its Postgres connections; the sockets are polled through the same ring. Nothing on the request path
   is shared between workers.
+- **Reads batch naturally:** requests that queue while the read connections are busy go out as one pipeline segment
+  (one Sync). No timer window, so batches are size 1 at low load.
+- **Writes** use a dedicated connection per worker and group-commit naturally: writes queue while a segment is in
+  flight and then share one Sync (one implicit transaction). Register, PUT user and POST article always go alone. A
+  failed group is replayed request by request; a connection lost after the Sync returns 500 and is never retried.
+  Responses are released only after the commit.
+- **One round trip per request:** lookup and action are merged into one statement (or one segment with a read-back),
+  and 404/403 are told apart from the result. POST article takes its id from the sequence and finds it again with
+  `currval()` inside one segment.
+- bcrypt runs on a small pool of low-priority threads, so hashing never stalls an event loop.
+- Slugs are generated in SQL; no caching of any kind.
 - Session settings on every Postgres connection: `SET jit = off`, `SET max_parallel_workers_per_gather = 0`.
 - Postgres connection budget: `WORKERS x (DB_CONNS + 1) <= 95`, checked at startup (defaults: 4 x (3 + 1) = 16).
 
 Environment: `DATABASE_URL`, `JWT_SECRET`, `HOST`, `PORT`; optional `WORKERS` (default 4), `DB_CONNS` (read
-connections per worker, default 3).
+connections per worker, default 3), `BCRYPT_THREADS` (default 2).
