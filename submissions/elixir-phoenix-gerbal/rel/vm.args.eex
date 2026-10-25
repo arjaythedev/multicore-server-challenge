@@ -1,0 +1,13 @@
+## Customize flags given to the VM: https://www.erlang.org/doc/man/erl.html
+## -mode/-name/-sname/-setcookie are configured via env vars, do not set them here
+
+## Serving directly, every user's keep-alive connection is a BEAM port, and the default limit of 65,536 would cap
+## the number of users.
++Q 1000000
+
+## Process heaps and binaries on the "good fit" allocation strategy instead of the default address-order first fit
+## (aoffcbf), which also turns off carrier migration between schedulers. A perf profile put a tenth of the CPU in the
+## allocators; at real pacing (37,000 and 39,000 users, interleaved) gf took app CPU per request down ~3% in both
+## batches, and peak memory 2,474 -> 2,237 MB.
++MHas gf
++MBas gf
