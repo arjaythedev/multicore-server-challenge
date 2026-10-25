@@ -10,4 +10,4 @@ mkdir -p bin
 # dub.selections.json pins every dependency, including the one git package
 # (dpq2 pins derelict-pq by commit), so this is a reproducible build.
 dub build --build=release --compiler=ldc2
-echo "built bin/conduit-vibed with $(ldc2 --version | head -1)"
+echo "built bin/server with $(ldc2 --version | head -1)"

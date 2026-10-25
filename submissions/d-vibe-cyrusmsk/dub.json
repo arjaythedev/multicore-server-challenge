@@ -17,7 +17,6 @@
         "jwtlited:openssl": "~>1.4.0",
         "openssl": "~>3.4.0"
     },
-    "dflags": ["-mcpu=native", "-flto=full"],
     "libs": ["ssl", "crypto"],
     "versions": [
       "VibeManualMemoryManagement",
