@@ -96,6 +96,18 @@ twice the tail: its per-reference load barriers cost the same at any heap size, 
 app's CPU with Parallel. Parallel doesn't change between 45% and 60%. So the heap stays at 45%: the memory above that
 buys nothing measurable and moves the box toward the OOM killer.
 
+G1, the JVM's default, measured the same way (two interleaved rounds at 7,500 users, current code):
+
+| GC | heap | req/s | p95 ms | p99 ms | app µs/req |
+|---|---|---|---|---|---|
+| **Parallel** | **45%** | **9,078 / 9,038** | **210 / 219** | **331 / 335** | **484 / 487** |
+| G1 | 45% | 8,845 / 8,734 | 273 / 301 | 427 / 464 | 502 / 518 |
+| G1 | 60% | 8,710 / 8,779 | 322 / 284 | 493 / 440 | 519 / 511 |
+
+G1 costs 4-7% more CPU per request with a ~30% worse tail, and more heap doesn't help it either: its write barriers
+and concurrent marking threads compete with Postgres for the same cores, while Parallel's short stop-the-world young
+collections don't.
+
 ### Batching (the DataLoader pattern, with fs2)
 
 The two top entries merge concurrent same-kind reads into one statement. Here that is `Batcher`: a request puts its
