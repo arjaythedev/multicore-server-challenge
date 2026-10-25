@@ -5,7 +5,8 @@ cd "$(dirname "$0")"
 PREFIX="${CHICKEN_PREFIX:-/opt/chicken}"
 export PATH="$PREFIX/bin:$PATH"
 SYSREPO="$(env -u CHICKEN_INSTALL_REPOSITORY chicken-install -repository)"
-export CHICKEN_INSTALL_REPOSITORY="$PWD/eggs"
+# Eggs go in ./eggs; the prefix also covers files some eggs put in share/ (the CHICKEN prefix is root-owned).
+export CHICKEN_INSTALL_REPOSITORY="$PWD/eggs" CHICKEN_INSTALL_PREFIX="$PWD/eggs"
 export CHICKEN_REPOSITORY_PATH="$PWD/eggs:$SYSREPO"
 mkdir -p eggs bin
 EGGS=(
@@ -15,6 +16,9 @@ EGGS=(
 )
 # chicken-install checks the egg server even for eggs it already has, so skip it once they are in.
 STAMP="eggs/.installed-$(echo "${EGGS[*]}" | sha256sum | cut -c1-16)"
-[ -f "$STAMP" ] || { chicken-install "${EGGS[@]}" && touch "$STAMP"; }
+if [ ! -f "$STAMP" ]; then
+  chicken-install "${EGGS[@]}"
+  touch "$STAMP"
+fi
 csc -O3 conduit.scm -o bin/conduit
 echo "built bin/conduit ($(csi -release))"
