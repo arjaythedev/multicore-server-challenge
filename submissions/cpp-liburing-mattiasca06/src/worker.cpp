@@ -16,6 +16,7 @@
 #include <string_view>
 
 #include "picohttpparser.h"
+#include "prof.h"
 
 namespace {
 
@@ -126,6 +127,7 @@ void Worker::arm_efd() {
 }
 
 void Worker::on_accept(int fd) {
+    PROF_SCOPE(kAccept);
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     uint32_t idx;
@@ -168,6 +170,7 @@ void Worker::kill(uint32_t idx) {
 }
 
 void Worker::on_recv(uint32_t idx, uint32_t gen, io_uring_cqe *cqe) {
+    PROF_SCOPE(kRecv);
     Conn &c = conns_[idx];
     unsigned bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
     bool has_buf = cqe->flags & IORING_CQE_F_BUFFER;
@@ -205,6 +208,7 @@ void Worker::start_send(uint32_t idx) {
 }
 
 void Worker::on_send(uint32_t idx, uint32_t gen, int res) {
+    PROF_SCOPE(kSendDone);
     Conn &c = conns_[idx];
     if (c.gen != gen) return;
     c.sending = false;
@@ -227,6 +231,7 @@ void Worker::on_send(uint32_t idx, uint32_t gen, int res) {
 }
 
 void Worker::respond(Conn &c, uint32_t idx, int status, const std::string &body) {
+    PROF_SCOPE(kRespond);
     char head[192];
     int n;
     if (status == 204) {
@@ -261,6 +266,7 @@ void Worker::process(uint32_t idx) {
 // Parses and starts as many buffered requests as it can, strictly in order: while one is running the rest stay
 // buffered.
 void Worker::process_one(uint32_t idx) {
+    PROF_SCOPE(kHttp);
     for (;;) {
         Conn &c = conns_[idx];
         if (c.fd < 0 || c.busy || c.closing || c.in.empty()) return;
@@ -315,7 +321,10 @@ void Worker::process_one(uint32_t idx) {
         rq.body.assign(c.in, size_t(pr), content_len);
         c.in.erase(0, size_t(pr) + content_len);
         c.busy = true;
-        serve(idx, c.gen, std::move(rq));
+        {
+            PROF_SCOPE(kHandler);
+            serve(idx, c.gen, std::move(rq));
+        }
     }
 }
 
@@ -330,6 +339,7 @@ Detached Worker::serve(uint32_t idx, uint32_t gen, Request rq) {
 }
 
 void Worker::finish(uint32_t idx, uint32_t gen, Reply r) {
+    PROF_REQUEST_DONE();
     Conn &c = conns_[idx];
     if (c.gen != gen) return;  // client went away while the request ran
     c.busy = false;
@@ -350,6 +360,7 @@ void Worker::enqueue(DbAwait *a) {
 // Natural group commit: while a write segment is in flight, writes queue; the queue then goes out as one segment
 // with a single Sync (one implicit transaction). Solo requests always travel alone.
 void Worker::dispatch_writes() {
+    PROF_SCOPE(kPgSend);
     const uint32_t wi = uint32_t(cfg_.read_conns);
     PgConn &pg = *pgs_[wi];
     if (writeq_.empty()) return;
@@ -378,11 +389,15 @@ void Worker::dispatch_writes() {
         for (DbAwait *a : ms) a->h.resume();
         return;
     }
-    if (pg.flush()) arm_pg_out(wi);
+    {
+        PROF_SCOPE(kPgFlush);
+        if (pg.flush()) arm_pg_out(wi);
+    }
 }
 
 // Hands queued segments to idle Postgres connections (one segment in flight per connection).
 void Worker::dispatch() {
+    PROF_SCOPE(kPgSend);
     std::vector<DbAwait *> failed;
     while (!waitq_.empty()) {
         PgConn *pg = nullptr;
@@ -426,14 +441,21 @@ void Worker::dispatch() {
             delete g;
             continue;
         }
-        if (pg->flush()) arm_pg_out(pi);
+        {
+            PROF_SCOPE(kPgFlush);
+            if (pg->flush()) arm_pg_out(pi);
+        }
     }
     for (DbAwait *a : failed) a->h.resume();
 }
 
 void Worker::on_pg(uint32_t pg_idx) {
     std::vector<PgConn::Seg> done;
-    pgs_[pg_idx]->drain(done);
+    {
+        PROF_SCOPE(kPgRecv);
+        pgs_[pg_idx]->drain(done);
+    }
+    PROF_SCOPE(kPgDone);
     std::vector<std::coroutine_handle<>> ready;
     const bool is_write = pg_idx == uint32_t(cfg_.read_conns);
     for (PgConn::Seg &s : done) {
@@ -470,7 +492,10 @@ void Worker::on_pg(uint32_t pg_idx) {
             }
         }
     }
-    for (auto h : ready) h.resume();
+    for (auto h : ready) {
+        PROF_SCOPE(kHandler);
+        h.resume();
+    }
     if (is_write) dispatch_writes();
     dispatch();
 }
@@ -485,6 +510,7 @@ void Worker::post_done(BcryptAwait *j) {
 }
 
 void Worker::on_efd() {
+    PROF_SCOPE(kEfd);
     uint64_t v;
     if (read(efd_, &v, sizeof v) < 0) {}
     std::vector<BcryptAwait *> js;
@@ -494,7 +520,10 @@ void Worker::on_efd() {
     }
     std::vector<std::coroutine_handle<>> hs;
     for (BcryptAwait *j : js) hs.push_back(j->h);
-    for (auto h : hs) h.resume();
+    for (auto h : hs) {
+        PROF_SCOPE(kHandler);
+        h.resume();
+    }
 }
 
 void Worker::run() {
@@ -537,10 +566,18 @@ void Worker::run() {
 
     arm_accept();
     arm_efd();
+#ifdef PROF
+    prof::attach();
+    prof::enter(prof::kLoop);
+#endif
 
     io_uring_cqe *cqes[256];
     for (;;) {
-        int w = io_uring_submit_and_wait(&ring_, 1);
+        int w;
+        {
+            PROF_SCOPE(kWait);
+            w = io_uring_submit_and_wait(&ring_, 1);
+        }
         if (w < 0 && w != -EINTR && w != -EBUSY) {
             fprintf(stderr, "worker %d: io_uring_submit_and_wait: %s\n", id_, strerror(-w));
             exit(1);
@@ -563,6 +600,7 @@ void Worker::run() {
             case kPgOut: {
                 PgConn &pg = *pgs_[idx_of(u)];
                 pg.want_out = false;
+                PROF_SCOPE(kPgFlush);
                 if (pg.flush()) arm_pg_out(idx_of(u));
                 break;
             }

@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "codec.h"
+#include "prof.h"
 #include "yyjson.h"
 
 Jwt g_jwt;
@@ -49,6 +50,7 @@ std::string Jwt::sign(int64_t sub, int64_t now) const {
 }
 
 bool Jwt::verify(std::string_view token, int64_t now, int64_t &sub) const {
+    PROF_SCOPE(kJwt);
     size_t d1 = token.find('.');
     if (d1 == std::string_view::npos) return false;
     size_t d2 = token.find('.', d1 + 1);

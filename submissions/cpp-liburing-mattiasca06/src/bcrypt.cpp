@@ -2,6 +2,7 @@
 // L1 load latency; interleaving up to 4 chains keeps the load ports busy. Hashing is rare next to the rest of the
 // traffic, so the pool threads run at low priority.
 #include "bcrypt.h"
+#include "prof.h"
 
 #include <openssl/crypto.h>
 #include <sys/random.h>
@@ -252,29 +253,51 @@ void process(Job *jobs, int n) {
 std::mutex g_mu;
 std::condition_variable g_cv;
 std::deque<BcryptAwait *> g_jobs;
+bool g_collecting = false;  // one leader at a time waits for company; the other threads only take backlog
 
 void loop() {
-    setpriority(PRIO_PROCESS, pid_t(syscall(SYS_gettid)), 10);
+    const pid_t tid = pid_t(syscall(SYS_gettid));
+    setpriority(PRIO_PROCESS, tid, 10);
     for (;;) {
         Job jobs[kMaxLanes];
         int n = 0;
+        bool backlog;
         {
             std::unique_lock lk(g_mu);
-            g_cv.wait(lk, [] { return !g_jobs.empty(); });
-            // A lone hash is a serial chain (~40 ms); four in lockstep cost little more than two. Wait briefly for
-            // company, far below the latency budget of a login.
-            auto deadline = std::chrono::steady_clock::now() + kCollectWindow;
-            for (;;) {
-                while (n < kMaxLanes && !g_jobs.empty()) {
-                    jobs[n++].a = g_jobs.front();
-                    g_jobs.pop_front();
-                }
-                if (n == kMaxLanes || !g_cv.wait_until(lk, deadline, [] { return !g_jobs.empty(); })) break;
+            // Work for a thread that is not the leader exists only once a whole batch is already queued.
+            g_cv.wait(lk, [] { return !g_jobs.empty() && (!g_collecting || g_jobs.size() >= size_t(kMaxLanes)); });
+            backlog = g_collecting || g_jobs.size() >= size_t(kMaxLanes);
+            if (!backlog) g_collecting = true;
+            while (n < kMaxLanes && !g_jobs.empty()) {
+                jobs[n++].a = g_jobs.front();
+                g_jobs.pop_front();
             }
+            if (!backlog) {
+                // A lone hash is a serial chain (~40 ms); four in lockstep cost little more than two. Wait briefly for
+                // company, far below the latency budget of a login.
+                auto deadline = std::chrono::steady_clock::now() + kCollectWindow;
+                while (n < kMaxLanes && g_cv.wait_until(lk, deadline, [] { return !g_jobs.empty(); })) {
+                    while (n < kMaxLanes && !g_jobs.empty()) {
+                        jobs[n++].a = g_jobs.front();
+                        g_jobs.pop_front();
+                    }
+                }
+                g_collecting = false;
+            }
+            if (!g_jobs.empty()) g_cv.notify_all();
         }
+        // Under backlog the logins gate everything else users do, so hash at normal priority.
+        if (backlog) setpriority(PRIO_PROCESS, tid, 0);
         for (int i = 0; i < n; i++) jobs[i].valid = prepare(jobs[i]);
+#ifdef PROF
+        uint64_t prof_t0 = __rdtsc();
+#endif
         process(jobs, n);
+#ifdef PROF
+        prof::bcrypt_done(__rdtsc() - prof_t0, n);
+#endif
         for (int i = 0; i < n; i++) jobs[i].a->w.post_done(jobs[i].a);
+        if (backlog) setpriority(PRIO_PROCESS, tid, 10);
     }
 }
 
@@ -286,7 +309,7 @@ void BcryptAwait::await_suspend(std::coroutine_handle<> c) {
         std::lock_guard lk(g_mu);
         g_jobs.push_back(this);
     }
-    g_cv.notify_one();
+    g_cv.notify_all();  // the leader and the backlog takers wait on different predicates
 }
 
 void bcrypt_pool::start(int threads) {

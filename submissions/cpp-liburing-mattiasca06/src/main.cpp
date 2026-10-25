@@ -3,6 +3,7 @@
 #include <signal.h>
 #include <sys/resource.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -12,6 +13,7 @@
 #include <vector>
 
 #include "auth.h"
+#include "prof.h"
 #include "worker.h"
 
 static const char *env(const char *k, const char *def) {
@@ -44,6 +46,9 @@ static bool pg_is_local(const char *url) {
 }
 
 int main() {
+#ifdef PROF
+    prof::start_dumper();
+#endif
     signal(SIGPIPE, SIG_IGN);
     rlimit rl;
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
@@ -58,7 +63,7 @@ int main() {
     cfg.jwt_secret = env("JWT_SECRET", "multicore-server-challenge");
     cfg.workers = atoi(env("WORKERS", "4"));
     cfg.read_conns = atoi(env("DB_CONNS", "3"));
-    cfg.bcrypt_threads = atoi(env("BCRYPT_THREADS", "1"));
+    cfg.bcrypt_threads = atoi(env("BCRYPT_THREADS", std::to_string(std::clamp(int(std::thread::hardware_concurrency()) / 2, 2, 4)).c_str()));
     // Same-box Postgres: skip libpq's default TLS negotiation (an explicit sslmode in the URL still wins).
     if (pg_is_local(cfg.database_url.c_str())) setenv("PGSSLMODE", "disable", 0);
     g_jwt.init(cfg.jwt_secret);

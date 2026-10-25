@@ -10,6 +10,7 @@
 #include "auth.h"
 #include "codec.h"
 #include "json_out.h"
+#include "prof.h"
 #include "worker.h"
 #include "yyjson.h"
 
@@ -55,7 +56,11 @@ AuthState authenticate(const Request &rq, int64_t &viewer) {
 
 struct Doc {
     yyjson_doc *d;
-    explicit Doc(const std::string &s) : d(yyjson_read(s.data(), s.size(), 0)) {}
+    explicit Doc(const std::string &s) : d(parse(s)) {}
+    static yyjson_doc *parse(const std::string &s) {
+        PROF_SCOPE(kJsonIn);
+        return yyjson_read(s.data(), s.size(), 0);
+    }
     ~Doc() { yyjson_doc_free(d); }
     Doc(const Doc &) = delete;
     // The object under the given top-level key, or null.
