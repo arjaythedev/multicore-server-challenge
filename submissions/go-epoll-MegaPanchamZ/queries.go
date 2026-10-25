@@ -880,9 +880,9 @@ var sqlCatalog = [sqlOpCount]struct{ id, query string }{
 		     SELECT fo.fid
 		     FROM rf, unnest(rf.fols) AS fo(fid)
 		     GROUP BY fo.fid
-		     HAVING count(*) >= 2
+		     HAVING count(*) >= 3
 		     ORDER BY count(*) DESC
-		     LIMIT 32
+		     LIMIT 10
 		   ) d
 		   WHERE EXISTS (
 		     SELECT 1 FROM articles a
