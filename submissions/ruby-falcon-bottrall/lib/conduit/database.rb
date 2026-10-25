@@ -22,10 +22,12 @@ module Conduit
 
     def self.connect(url) = PG.connect(url, options: OPTIONS)
 
-    # `reads` names the statements that only read, which can share the pipeline.
-    def initialize(url:, statements:, reads:, pool_size:)
+    # `reads` names the statements that only read, which can share the pipeline; `merged` holds the merged
+    # forms of those that concurrent requests can share an execution of (see SQL.merged), and `window` is how
+    # long the pipeline collects requests before sending them.
+    def initialize(url:, statements:, reads:, merged:, window:, pool_size:)
       @reads = reads
-      @pipeline = Pipeline.new(-> { Database.connect(url) }, statements.slice(*reads))
+      @pipeline = Pipeline.new(-> { Database.connect(url) }, statements.slice(*reads), merged:, window:)
       @pool = Pool.new(-> { Database.connect(url) }, statements, size: pool_size)
     end
 
@@ -36,58 +38,88 @@ module Conduit
 
     # The first column of the first row, or nil if there are no rows.
     def value(name, *params)
-      result = query(name, *params)
+      return @pipeline.value(name, params) if @reads.include?(name)
+
+      result = @pool.query(name, params)
       result.ntuples.zero? ? nil : result.getvalue(0, 0)
     end
 
     # Runs the block in a transaction on one connection; it gets a callable that runs statements.
     def transaction(&) = @pool.transaction(&)
 
-    # One connection in pipeline mode, shared by every fiber in the worker. Each query goes out as soon as
-    # it's asked for, followed by its own Sync, so it's still its own implicit transaction; a reader fiber
-    # collects the results, which come back in the order the queries were sent, and hands each to its fiber.
+    # One connection in pipeline mode, shared by every fiber in the worker. The first read asked for waits a
+    # moment (`window`) while other requests ask for theirs, then sends them all as one group: one write, and
+    # one implicit transaction under a single Sync instead of one each. Requests in the group for the same
+    # mergeable statement share one execution of its merged form, each getting its own row of the result.
+    # A reader fiber collects the results, which come back in the order they were sent, and hands each request
+    # its row.
+    #
+    # Everything in a group is a read, and in READ COMMITTED each statement still sees the data as of when it
+    # starts. Nothing is kept once the group's requests have their answers.
     class Pipeline
-      # A pipelined connection and the reply queues of its queries in flight, in the order they were sent.
-      Line = Data.define(:pg, :replies)
+      # A pipelined connection: the requests waiting to go out, and for each execution in flight, in the order
+      # they were sent, the replies waiting on it and whether the group's Sync follows it.
+      Line = Data.define(:pg, :pending, :replies)
 
-      def initialize(connect, statements)
-        @connect = connect
-        @statements = statements
-        @line = nil
-      end
+      # A request for a read: its statement and parameters, and the queue its answer comes back on.
+      Request = Data.define(:name, :params, :reply)
 
       # Errors that mean the connection is gone, rather than anything wrong with the query.
       DISCONNECTED = [PG::ConnectionBad, PG::UnableToSend, PG::AdminShutdown, ClosedQueueError].freeze
 
-      # Reads are safe to repeat, so a query that finds its connection gone runs once more on a new one.
-      def query(name, params, retried: false)
-        line = @line || open
-        reply = Thread::Queue.new
-        # Queue the reply and both messages before anything can yield, so they stay in order across fibers.
-        line.replies << reply
-        line.pg.send_query_prepared(name.name, params)
-        line.pg.pipeline_sync
-        line.pg.socket_io.wait_writable until line.pg.flush
-        result = reply.pop
-        raise result if result.is_a?(Exception)
+      def initialize(connect, statements, merged:, window:)
+        @connect = connect
+        @statements = statements
+        @merged = merged
+        @window = window
+        @line = nil
+      end
 
-        result.check
+      # The rows of a read.
+      def query(name, params)
+        result, = submit(name, params)
         result
-      rescue *DISCONNECTED
-        raise if retried
+      end
 
-        @line = nil if @line.equal?(line)
-        query(name, params, retried: true)
+      # The first column of a read's first row, or nil if there are no rows.
+      def value(name, params)
+        result, row = submit(name, params)
+        result.getvalue(row, 0) if row < result.ntuples
       end
 
       private
 
+      # [result, row]: the result holding the request's answer, and the row it's in. Reads are safe to repeat,
+      # so a request that finds its connection gone runs once more on a new one, and one skipped because
+      # another statement in its group failed runs again.
+      def submit(name, params, retried: false)
+        line = @line || open
+        reply = Thread::Queue.new
+        line.pending << Request.new(name:, params:, reply:)
+        if line.pending.size == 1
+          sleep(@window)
+          send_pending(line)
+        end
+        result, row = reply.pop
+        raise result if result.is_a?(Exception)
+        return submit(name, params, retried:) if result.result_status == PG::PGRES_PIPELINE_ABORTED
+
+        result.check
+        [result, row]
+      rescue *DISCONNECTED
+        raise if retried
+
+        @line = nil if @line.equal?(line)
+        submit(name, params, retried: true)
+      end
+
       def open
         pg = @connect.call
         @statements.each { |name, sql| pg.prepare(name.name, sql) }
-        pg.setnonblocking(true) # sends only buffer, and query flushes
+        @merged.each { |name, sql| pg.prepare(merged_name(name), sql) }
+        pg.setnonblocking(true) # sends only buffer, and send_pending flushes
         pg.enter_pipeline_mode
-        line = Line.new(pg:, replies: Thread::Queue.new)
+        line = Line.new(pg:, pending: [], replies: Thread::Queue.new)
         @line = line
         # The reader is a task of its own under the event loop, not a child of the request that happened to
         # open the connection: Async stops a task's children with it, as when that request's client hangs up.
@@ -95,31 +127,67 @@ module Conduit
         line
       end
 
-      # Each query's results are its result, then nil, then the result marking its Sync.
+      def merged_name(name) = "#{name}*"
+
+      # Sends the waiting requests as one group. Queues every reply and sends every message before anything
+      # can yield, so the replies stay in the order the results will come back in.
+      def send_pending(line)
+        group = line.pending.dup
+        return if group.empty? # the connection was retired while the group waited, failing it already
+
+        line.pending.clear
+        executions = group.group_by(&:name).flat_map { |name, requests| executions(name, requests) }
+        executions.each_with_index do |(statement, params, replies), index|
+          line.replies << [replies, index == executions.size - 1]
+          line.pg.send_query_prepared(statement, params)
+        end
+        line.pg.pipeline_sync
+        line.pg.socket_io.wait_writable until line.pg.flush
+      rescue *DISCONNECTED => error
+        # Every request in the group gets the error, and each runs again on a new connection.
+        group.each { it.reply << error }
+        retire(line, nil, error)
+      end
+
+      # [statement, params, [[reply, row], ...]] for each execution that answers `requests`: one merged
+      # execution if the statement can be merged and more than one request wants it, otherwise one each.
+      def executions(name, requests)
+        return requests.map { [name.name, it.params, [[it.reply, 0]]] } unless requests.size > 1 && @merged.key?(name)
+
+        arrays = requests.map(&:params).transpose.map { ARRAY.encode(it) }
+        shared = arrays.empty? # the same statement for every request: they all read its one row
+        replies = requests.each_with_index.map { |request, row| [request.reply, shared ? 0 : row] }
+        [[merged_name(name), arrays, replies]]
+      end
+
+      # Each execution's results are its result, then nil; the last in a group is followed by the result
+      # marking the group's Sync.
       def read(line)
-        reply = nil
+        replies = nil
         loop do
-          reply = line.replies.pop
+          replies, synced = line.replies.pop
           result = line.pg.get_result
           line.pg.get_result
-          line.pg.get_result
-          reply << result
-          reply = nil
+          line.pg.get_result if synced
+          replies.each { |reply, row| reply << [result, row] }
+          replies = nil
         end
       rescue PG::Error, IOError => error
         nil
       ensure
-        retire(line, reply, error || PG::ConnectionBad.new("pipeline closed"))
+        retire(line, replies, error || PG::ConnectionBad.new("pipeline closed"))
       end
 
-      # Takes a connection out of service, failing the queries waiting on it; the next query opens a new one.
-      def retire(line, reply, error)
+      # Takes a connection out of service, failing the requests waiting on it; the next request opens a new one.
+      def retire(line, replies, error)
         @line = nil if @line.equal?(line)
         line.replies.close
-        reply&.push(error)
-        while (waiting = line.replies.pop)
-          waiting << error
+        replies&.each { |reply, _| reply << error }
+        while (waiting, = line.replies.pop)
+          waiting.each { |reply, _| reply << error }
         end
+        line.pending.each { it.reply << error }
+        line.pending.clear
         line.pg.close unless line.pg.finished?
       end
     end

@@ -231,5 +231,38 @@ module Conduit
     READS = %i[
       tags login current_user profile list_all list_tag list_author list_favorited feed article article_by_id comments
     ].freeze
+
+    # The reads that concurrent requests can share an execution of, with the types of their parameters. Each
+    # returns at most one row of one column.
+    MERGEABLE = {
+      tags: [],
+      profile: %w[bigint text],
+      list_all: %w[bigint bigint bigint],
+      list_tag: %w[bigint bigint bigint text],
+      list_author: %w[bigint bigint bigint text],
+      list_favorited: %w[bigint bigint bigint text],
+      feed: %w[bigint bigint bigint],
+      article: %w[bigint text],
+      comments: %w[bigint text],
+    }.freeze
+
+    # `sql` run once for each request in a batch, in one execution: its parameters become arrays, one element
+    # per request, and the result has a row per request, in order, holding what `sql` would have returned for
+    # it (null where it would have returned no row). Parts of `sql` that don't depend on a request's parameters,
+    # such as the count of all articles, run once for the batch. A statement without parameters is the same
+    # for every request, so it simply runs once.
+    def merged(sql, types)
+      return sql if types.empty?
+
+      columns = types.each_index.map { "p#{it + 1}" }
+      arrays = types.each_with_index.map { |type, index| "$#{index + 1}::#{type}[]" }
+      <<~SQL
+        SELECT (#{sql.strip.gsub(/\$(\d+)/, 'req.p\1')})
+          FROM unnest(#{arrays.join(", ")}) WITH ORDINALITY AS req(#{columns.join(", ")}, ord)
+         ORDER BY req.ord
+      SQL
+    end
+
+    MERGED = MERGEABLE.to_h { |name, types| [name, merged(STATEMENTS.fetch(name), types).freeze] }.freeze
   end
 end
