@@ -1,3 +1,4 @@
+#include <libpq-fe.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sys/resource.h>
@@ -18,6 +19,30 @@ static const char *env(const char *k, const char *def) {
     return v && *v ? v : def;
 }
 
+// True if every host of the URL is this machine: a unix socket directory, localhost or a loopback address.
+static bool pg_is_local(const char *url) {
+    PQconninfoOption *o = PQconninfoParse(url, nullptr);
+    if (!o) return false;
+    std::string hosts;
+    for (PQconninfoOption *p = o; p->keyword; p++)
+        if (p->val && (!strcmp(p->keyword, "host") || !strcmp(p->keyword, "hostaddr"))) hosts += std::string(p->val) + ",";
+    PQconninfoFree(o);
+    if (hosts.empty()) {
+        const char *e = getenv("PGHOST");
+        hosts = e ? std::string(e) + "," : "";
+    }
+    if (hosts.empty()) return true;  // libpq's default: the local unix socket
+    size_t pos = 0;
+    while (pos < hosts.size()) {
+        size_t end = hosts.find(',', pos);
+        std::string h = hosts.substr(pos, end - pos);
+        pos = end + 1;
+        if (h.empty()) continue;
+        if (!(h[0] == '/' || h == "localhost" || h == "::1" || h.rfind("127.", 0) == 0)) return false;
+    }
+    return true;
+}
+
 int main() {
     signal(SIGPIPE, SIG_IGN);
     rlimit rl;
@@ -34,6 +59,8 @@ int main() {
     cfg.workers = atoi(env("WORKERS", "4"));
     cfg.read_conns = atoi(env("DB_CONNS", "3"));
     cfg.bcrypt_threads = atoi(env("BCRYPT_THREADS", "2"));
+    // Same-box Postgres: skip libpq's default TLS negotiation (an explicit sslmode in the URL still wins).
+    if (pg_is_local(cfg.database_url.c_str())) setenv("PGSSLMODE", "disable", 0);
     g_jwt.init(cfg.jwt_secret);
     bcrypt_pool::start(cfg.bcrypt_threads < 1 ? 1 : cfg.bcrypt_threads);
 

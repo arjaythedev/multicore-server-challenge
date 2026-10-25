@@ -160,7 +160,8 @@ inline constexpr Stmt kStatements[] = {
     {"article_tags_curr",
      "INSERT INTO article_tags (article_id, tag_id) "
      "SELECT currval(pg_get_serial_sequence('articles', 'id')), t.id FROM tags t WHERE t.name = ANY($1::text[])"},
+    // currval() is volatile: compared directly it forces a scan of articles, so evaluate it once in a CTE and join.
     {"article_by_curr",
-     ARTICLE_FULL_COLS "FROM articles a JOIN users u ON u.id = a.author_id "
-     "WHERE a.id = currval(pg_get_serial_sequence('articles', 'id'))"},
+     "WITH c AS MATERIALIZED (SELECT currval(pg_get_serial_sequence('articles', 'id')) AS id) "
+     ARTICLE_FULL_COLS "FROM c JOIN articles a ON a.id = c.id JOIN users u ON u.id = a.author_id"},
 };
