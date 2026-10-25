@@ -2,7 +2,7 @@
 # (Article.presented_for, Comment.thread_for, User.profile_for), with the author's profile columns prefixed.
 # Computed columns are read with record[:name]: Active Record only defines reader methods for table columns.
 module ConduitJson
-  module_function
+  extend self
 
   # RFC 3339 in UTC with exactly three fractional digits, truncated.
   def timestamp(time) = time.utc.iso8601(3)

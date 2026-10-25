@@ -2,6 +2,8 @@
 # relation its capped `articlesCount` counts. Lists filtered through another table (tags, favorites, follows)
 # page inside the id subquery, so Postgres walks one index newest-first and stops after a page.
 module ArticleListing
+  extend self
+
   Listing = Data.define(:page, :counted) do
     def articles_for(viewer_id) = page.presented_for(viewer_id)
     def total = ApplicationRecord.capped_count(counted)
@@ -14,8 +16,6 @@ module ArticleListing
       ) x
       WHERE fo.follower_id = :viewer_id ORDER BY x.id DESC LIMIT :limit OFFSET :offset)
   SQL
-
-  module_function
 
   # Only the first of tag, author and favorited applies.
   def filtered(tag: nil, author: nil, favorited: nil, limit:, offset:)
@@ -49,6 +49,8 @@ module ArticleListing
     page = Article.where(Arel.sql(FEED_IDS, viewer_id:, window: limit + offset, limit:, offset:)).newest_first
     Listing.new(page:, counted: Article.where(author_id: Follow.where(follower_id: viewer_id).select(:followee_id)))
   end
+
+  private
 
   def page_through(joined, article_column, limit:, offset:)
     ids = joined.order(article_column => :desc).limit(limit).offset(offset).select(article_column)
