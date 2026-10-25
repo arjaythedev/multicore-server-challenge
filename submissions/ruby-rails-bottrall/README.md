@@ -1,41 +1,39 @@
-# Conduit API: Ruby on Rails 8.1 + Falcon + YJIT
+# Ruby on Rails 8.1 + Falcon + YJIT
 
-**Front: direct.** Falcon serves port 80 itself: one forked worker per core, each an event loop with a fiber per connection.
+Front: direct
 
-This is not an attempt to win. It's an answer to a different question: how far does a Rails app get if it is written the way you'd want to maintain it (models, scopes, resourceful controllers, `has_secure_password`, about 600 lines of app code) and then given the handful of optimizations a production Rails team would reasonably make? Every optimization below is a config setting, a scope written like the reference SQL, or a few lines with a comment saying why, and each one was measured before it went in.
+I don't expect Rails to get anywhere near the top of this leaderboard. What I wanted to see is how a fairly normal Rails app holds up if you give it YJIT, Falcon and a few modest optimizations, the kind you'd be happy to keep in a codebase you actually have to maintain. It's ActiveRecord models and scopes, resourceful controllers and `has_secure_password`, and the app code is about 600 lines.
 
 ## Versions
 
-| Piece | Version |
+| | |
 |---|---|
-| Ruby | CRuby 4.0.9, built from source by `install.sh` with YJIT and jemalloc |
-| Rails | 8.1.4: Active Record and Action Controller (`api_only`) only |
-| Server | Falcon 0.57.0 (async 2.46, protocol-http1 0.41) |
-| Postgres driver | pg 1.7.0 (compiled against libpq, fiber-scheduler aware) |
-| bcrypt | bcrypt 3.1.22 via `has_secure_password`, cost 10 |
-| JWT | jwt 3.3.0, HS256 |
+| Ruby | 4.0.9, built from source by `install.sh` with YJIT and jemalloc |
+| Rails | 8.1.4, API only (ActiveRecord and ActionController) |
+| Server | Falcon 0.57.0 |
+| Postgres driver | pg 1.7.0 |
+| bcrypt | bcrypt 3.1.22 through `has_secure_password`, cost 10 |
+| JWT | jwt 3.3.0 |
 
-Every gem is pinned in `Gemfile.lock` (platform `ruby`), and `build.sh` compiles native extensions from source (`force_ruby_platform`).
+Gems are pinned in `Gemfile.lock`, and `build.sh` compiles the native ones from source.
 
-## How it uses the cores
+## How it runs
 
-- `falcon host falcon.rb` boots Rails once in the parent (`config/preload.rb`, then `Process.warmup`) and forks `nproc` workers, so they share the booted heap copy-on-write. Crashed workers are not restarted (`restart: false`).
-- Each worker is one thread running an event loop. Every connection is a fiber, and the pg gem yields to the fiber scheduler while a query is in flight. One worker can therefore keep its whole Active Record pool busy without threads or the GVL getting involved. `config.active_support.isolation_level = :fiber` makes Rails' per-request state (the leased connection, `CurrentAttributes`) fiber-local.
-- Each worker has a pool of `90 / workers` connections (88 in total on 8 cores, within the 95 budget). A request leases one connection for its duration.
+Falcon boots Rails once and forks a worker per core, so the workers share the booted app's memory. Each worker is a single thread running an event loop with a fiber per connection. The pg gem hands control back to the event loop while a query is running, so one worker can keep its whole connection pool busy without threads. Rails is set to `isolation_level = :fiber` so per-request state like the leased connection stays with its request.
 
-## Layout
+Each worker gets `90 / workers` database connections, which is 88 on the 8 core box. Falcon is configured not to restart crashed workers.
+
+## Code
 
 ```
-app/models/          User, Article, Comment, Tag, ArticleTag, Favorite, Follow: associations and scopes
-app/models/article_listing.rb   the five list variants (global, tag, author, favorited, feed) as page + count
-app/controllers/     one resourceful controller per resource (users, sessions, current_users, profiles,
-                     follows, articles, favorites, comments, tags)
-app/controllers/concerns/       Authentication (token auth, `allow_anonymous`) and RequestInput (strict 422s)
-app/serializers/conduit_json.rb pure functions from records to the API's JSON
-lib/access_tokens.rb            JWT issue/verify, built once at boot and injected through config
+app/models/                     the models, plus ArticleListing for the five list variants
+app/controllers/                one controller per resource
+app/controllers/concerns/       token auth and request body validation
+app/serializers/conduit_json.rb turns records into the API's JSON
+lib/access_tokens.rb            JWT issue and verify
 ```
 
-The SQL is the reference SQL from `SPEC.md`, expressed as Active Record scopes. `Article.presented_for(viewer_id)` is the shared `ARTICLE_LIST_SELECT`, and the list filters compose onto it:
+The queries are the reference SQL from `SPEC.md` written as ActiveRecord scopes. `Article.presented_for(viewer_id)` is `ARTICLE_LIST_SELECT`, and the list filters chain onto it:
 
 ```ruby
 listing = ArticleListing.filtered(tag:, author:, favorited:, limit:, offset:)
@@ -43,72 +41,52 @@ render json: { articles: listing.articles_for(viewer_id).map { ConduitJson.artic
                articlesCount: listing.total }
 ```
 
-## Optimizations, with what each one bought
+## Optimizations
 
-Measured on the full seed. See "Local numbers" below for the setup.
+All the numbers here are from my machine on the full seed (setup further down).
 
-1. **YJIT.** Same app, same requests, in process: **730 → 451 µs per request** (−38%, and that figure includes time spent waiting on Postgres). Rails turns YJIT on after boot (`config.yjit`, spelled out in `config/application.rb`), so it compiles only code that runs while serving requests. Forked workers inherit it.
-2. **Every hot query is a prepared statement.** Active Record declines to prepare any statement that contains a raw SQL string, in case values were interpolated into it. The projection's subqueries go through `ApplicationRecord.bound_sql`, constant fragments that take values only as `?` binds, so they stay prepared and Postgres skips the parse on every request.
-3. **Scalar subqueries, as in the reference SQL.** `where(author_id: User.where(username:).select(:id))` writes `IN (subquery)`. Postgres plans that as a join, fetches *every* article by that author, and runs the per-row subqueries on all of them before applying `LIMIT 5`. `where_scalar` writes `= (subquery)` instead, which walks `articles_author_idx` and stops. The author list went from **1,330 to 138 µs** of Postgres time per call (it had been 27% of all database time), and the tag list from 587 to 255 µs. Postgres CPU per request dropped 19%.
-4. **No gzip.** Falcon's default middleware compresses any response the client accepts gzip for, which was **~10% of a worker's CPU**. Compression is optional in this API, so `falcon.rb` serves the Rack app without that layer.
-5. **bcrypt off the event loop.** bcrypt releases the GVL, but a worker is a single-threaded event loop, so a ~40 ms hash still stalled every other request on it. `User#password=` and `#authenticate_password` hash on a short-lived thread instead, and under the fiber scheduler only the request that needs the hash waits for it. With 16 concurrent logins on one worker, the logins took 748 → 239 ms and the worst `/api/tags` latency alongside them went from 360 → 100 ms.
-6. **GC heap pre-sizing.** `RUBY_GC_HEAP_{0,1,2}_INIT_SLOTS` in `start.sh` start each worker with a heap sized for the request mix, which **halves the time spent in GC**. Larger heaps, malloc limits and old-object factors measured as no better.
-7. **Small Rails trims, each a line of config:**
-   - Drop the middleware an API doesn't use (ETag, which hashes every body; Runtime; RequestId; RemoteIp; the request logger).
-   - Turn off the per-request query cache, since no request repeats a SELECT.
-   - Set `belongs_to_required_by_default = false`. The foreign keys already enforce it, and otherwise every `create!` runs a SELECT per association.
-   - Plain `Time` instead of `TimeWithZone`.
-   - Read computed columns as `record[:tag_list]`. Active Record only defines reader methods for table columns, so `record.tag_list` goes through `method_missing`, which was 7.5% of CPU.
-8. **jemalloc** as Ruby's allocator (`--with-jemalloc`), as in Rails' own production Dockerfile.
+- YJIT is the biggest win by far. Running the same request mix in process, time per request went from 730 µs to 451 µs, and that includes time spent waiting on Postgres. Rails turns YJIT on after the app boots, so it only compiles code that runs while serving requests, and the forked workers inherit it.
+- Every hot query is a prepared statement. ActiveRecord won't prepare a statement that has raw SQL in it, so the subqueries in the article projection go through a small `bound_sql` helper that keeps them preparable.
+- The list filters use `= (subquery)` like the reference SQL does. ActiveRecord's `where(author_id: subquery)` generates `IN (subquery)`, and Postgres was planning that as a join that loaded every article by the author before applying the limit. Switching to `where_scalar` took the author list from 1,330 µs to 138 µs of database time per call and the tag list from 587 µs to 255 µs.
+- No gzip. Falcon compresses responses by default, which was costing about 10% of each worker's CPU. Compression is optional here so I turned it off.
+- bcrypt runs on its own thread. bcrypt releases the GVL, but that doesn't help much when the worker is a single threaded event loop, so a login used to stall every other request on that worker for around 40 ms. Now the hash runs on a short lived thread and only the request that needs it waits. With 16 logins at once on one worker, they finished in 239 ms instead of 748 ms.
+- A bigger starting heap. Setting `RUBY_GC_HEAP_*_INIT_SLOTS` in `start.sh` roughly halved the time spent in GC. Going bigger than that didn't help.
+- Some small Rails settings. I dropped middleware an API doesn't need (ETag, Runtime, RequestId, RemoteIp and the request logger) and turned off the query cache, since no request runs the same query twice. I also turned off `belongs_to_required_by_default`, because the foreign keys already cover it and otherwise every insert runs extra SELECTs. Computed columns are read with `record[:tag_list]`, because `record.tag_list` goes through `method_missing`.
+- jemalloc as the allocator.
 
-Tried and rejected:
+A couple of things I tried that didn't help:
 
-- **Nginx in front.** It saves the app ~7% CPU per request (fewer connection fibers for the GC to scan) and costs ~70 µs/request of its own. At 27k users locally it lost: p95 202 ms vs 27 ms direct.
-- **`plan_cache_mode = force_generic_plan`.** The list queries' parameterized `LIMIT`/`OFFSET` make Postgres re-plan them on every execution, but the generic plan for the global list took 1.8 s per call.
-
-## Why Falcon, not Puma
-
-Same app, same 8 workers, same pool and GC settings, with Puma 8.0.2 set up to match Falcon's keep-alive behaviour: unlimited requests per connection and a 120 s idle timeout.
-
-| Server | Users | req/s | p95 | p99 | CPU (of 8): app + Postgres (+ Nginx) | App CPU/request |
-|---|--:|--:|--:|--:|---|--:|
-| **Falcon, direct** | 20,000 | 5,303 | 5 ms | 25 ms | 3.05 + 1.49 | 575 µs |
-| Puma, direct (5 threads) | 20,000 | 5,280 | 10 ms | 22 ms | 4.77 + 1.63 | 904 µs |
-| Puma + Nginx (5 threads) | 20,000 | 5,273 | 52 ms | 144 ms | 3.37 + 1.63 + 0.39 | 639 µs |
-| **Falcon, direct** | 27,000 | 7,156 | 23 ms | 54 ms | 4.48 + 2.30 | 626 µs |
-| Puma + Nginx (5 threads) | 27,000 | 6,850 | 253 ms | 292 ms | 4.71 + 2.29 + 0.56 | 688 µs |
-| Puma, direct (5 threads) | 27,000 | 5,856 | 1,461 ms | 1,703 ms | 5.49 + 2.03 | 938 µs |
-
-Puma serving direct pays for every idle connection. Each time a keep-alive connection returns to its reactor, Puma re-sorts the reactor's whole timeout list, and a worker here holds ~3,000 idle browser connections. Two or three threads per worker made no difference (~900 µs per request at each). Behind Nginx, which is Puma's usual deployment, that cost goes away, but the thread hand-offs and Nginx's own CPU still leave it ~10% more expensive per request than Falcon serving direct, with a 5× worse tail at 27k.
+- Nginx in front. It made the app slightly cheaper per request, but at 27k users p95 was 202 ms compared to 27 ms serving direct.
+- Forcing generic query plans so Postgres stops re-planning the list queries. The generic plan for the global article list took 1.8 seconds.
 
 ## Rules
 
-- No caching across requests: every request reads Postgres, and there is no response cache, no query-result cache (the per-request query cache is off too), and no memoized token or bcrypt results.
-- Passwords are bcrypt cost 10 (`BCrypt::Engine.cost = 10`; `has_secure_password` would otherwise use 12). Every login verifies against the stored hash.
-- Every request verifies the token's HS256 signature and `exp` (the `jwt` gem with `algorithm: "HS256"` and `required_claims: %w[exp sub]`). `sub` must be a decimal string.
-- Writes commit before the response. Article creation is one transaction.
+- Nothing is cached between requests. Every request reads from Postgres, and the per-request query cache is off as well.
+- Passwords are bcrypt cost 10 and every login checks the stored hash. `has_secure_password` defaults to 12, so the cost is set explicitly.
+- Every request verifies the token's HS256 signature and `exp` with the jwt gem.
+- Writes are committed before the response goes out. Creating an article is one transaction.
 
-## Local numbers
+## Local results
 
-These numbers come from an AMD Ryzen 5 7600 (6 cores / 12 threads). Postgres 18 (with the box's pgtune settings) and the app were pinned to 8 hardware threads, and the load generator (`loadgen run`, two processes on separate loopback addresses) ran on the other 4. Each run is the scorer's probe: 60 s ramp + 60 s measured, full seed.
+This was on a Ryzen 5 7600, with Postgres and the app pinned to 8 of its threads and the load generator on the other 4. Each run is a 60 s ramp and then 60 s measured, same as the scorer's probes.
 
-| Users | req/s | p95 | p99 | CPU: app + Postgres (of 8) | Result |
+| Users | req/s | p95 | p99 | CPU (app + Postgres, of 8) | |
 |--:|--:|--:|--:|---|---|
 | 20,000 | 5,303 | 5 ms | 25 ms | 3.05 + 1.49 | pass |
 | 27,000 | 7,156 | 23 ms | 54 ms | 4.48 + 2.30 | pass |
-| 29,000 | 7,284 | 557 ms | 738 ms | 5.18 + 2.61 | fail (CPU saturated) |
-| 27,000, 5-minute hold | 7,138 | 46 ms | 123 ms | 4.60 + 2.44 | pass (2.1M requests, 0 errors, app RSS 3.5 GB) |
+| 29,000 | 7,284 | 557 ms | 738 ms | 5.18 + 2.61 | fail |
+| 27,000 for 5 minutes | 7,138 | 46 ms | 123 ms | 4.60 + 2.44 | pass, 0 errors |
 
-Under load the app spends ~600 µs of CPU per request and Postgres ~320 µs.
+Under load the app uses about 600 µs of CPU per request and Postgres about 320 µs.
 
-For calibration, the Go example (24,000 on the leaderboard) passed 30,000 users on this same setup at 143 µs app + 217 µs Postgres per request. Its leaderboard CPU split implies requests cost ~2.5× more CPU on the benchmark box than here, so expect this server to land around **11–13k users** there. That's an estimate, not a measurement.
+My machine is a lot faster per core than the benchmark box though. The Go example passes 30k users on my setup and scored 24k on the real box, and its CPU numbers on the leaderboard suggest each request costs roughly 2.5x more CPU there. If that holds for Ruby too, I'd guess this lands somewhere around 11-13k. We'll see.
 
 ## Build and run
 
 ```bash
-sudo bash install.sh   # once: Ruby 4.0.9 + YJIT + jemalloc into /opt/ruby-4.0.9, plus libpq/tzdata
-bash build.sh          # gems into ./vendor/bundle
+sudo bash install.sh   # once: builds Ruby 4.0.9 into /opt/ruby-4.0.9
+bash build.sh          # installs gems into ./vendor/bundle
 DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=... HOST=0.0.0.0 PORT=80 bash start.sh
 ```
 
-`WEB_CONCURRENCY` (default `nproc`) and `DB_POOL` (default `90 / WEB_CONCURRENCY`) override the worker and pool sizes.
+`WEB_CONCURRENCY` and `DB_POOL` override the worker count and pool size.
