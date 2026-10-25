@@ -44,6 +44,12 @@ constexpr BatchSpec kBatch[] = {
     {"list_all", "list_all_b", "bbb"},
     {"list_tag", "list_tag_b", "bbbt"},
     {"feed", "feed_b", "bbb"},
+    {"list_author", "list_author_b", "bbbt"},
+    {"list_fav", "list_fav_b", "bbbt"},
+    {"count_tag", "count_tag_b", "t"},
+    {"count_author", "count_author_b", "t"},
+    {"count_fav", "count_fav_b", "t"},
+    {"profile", "profile_b", "bt"},
 };
 inline int batch_of(const char *stmt) {
     for (size_t i = 0; i < sizeof kBatch / sizeof kBatch[0]; i++)

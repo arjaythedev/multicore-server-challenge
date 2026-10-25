@@ -228,6 +228,36 @@ inline constexpr Stmt kStatements[] = {
      REQ("$1::bigint[], $2::bigint[], $3::bigint[]", "v, lm, ofs")
      PAGE_BATCH("lm, ofs", "ORDER BY a.id DESC LIMIT d.lm OFFSET d.ofs")
      PAGE_BATCH_OUT("pg.lm = r.lm AND pg.ofs = r.ofs")},
+    {"list_author_b",  // v bigint[], limit bigint[], offset bigint[], username text[]
+     REQ("$1::bigint[], $2::bigint[], $3::bigint[], $4::text[]", "v, lm, ofs, author")
+     PAGE_BATCH("lm, ofs, author",
+                "WHERE a.author_id = (SELECT au.id FROM users au WHERE au.username = d.author) "
+                "ORDER BY a.id DESC LIMIT d.lm OFFSET d.ofs")
+     PAGE_BATCH_OUT("pg.lm = r.lm AND pg.ofs = r.ofs AND pg.author = r.author")},
+    {"list_fav_b",  // v bigint[], limit bigint[], offset bigint[], username text[]
+     REQ("$1::bigint[], $2::bigint[], $3::bigint[], $4::text[]", "v, lm, ofs, fav")
+     PAGE_BATCH("lm, ofs, fav",
+                "WHERE a.id IN (SELECT f.article_id FROM favorites f WHERE f.user_id = "
+                "(SELECT fu.id FROM users fu WHERE fu.username = d.fav) "
+                "ORDER BY f.article_id DESC LIMIT d.lm OFFSET d.ofs)")
+     PAGE_BATCH_OUT("pg.lm = r.lm AND pg.ofs = r.ofs AND pg.fav = r.fav")},
+    {"count_tag_b",  // tag text[]; one row per request
+     REQ("$1::text[]", "tag")
+     "SELECT r.ord::int4, (SELECT count(*) FROM (SELECT 1 FROM article_tags at WHERE at.tag_id = "
+     "(SELECT t.id FROM tags t WHERE t.name = r.tag) LIMIT 1000) s) FROM req r ORDER BY r.ord"},
+    {"count_author_b",  // username text[]
+     REQ("$1::text[]", "name")
+     "SELECT r.ord::int4, (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = "
+     "(SELECT u.id FROM users u WHERE u.username = r.name) LIMIT 1000) s) FROM req r ORDER BY r.ord"},
+    {"count_fav_b",  // username text[]
+     REQ("$1::text[]", "name")
+     "SELECT r.ord::int4, (SELECT count(*) FROM (SELECT 1 FROM favorites f WHERE f.user_id = "
+     "(SELECT fu.id FROM users fu WHERE fu.username = r.name) LIMIT 1000) s) FROM req r ORDER BY r.ord"},
+    {"profile_b",  // v bigint[], username text[]; zero rows for an unknown user
+     REQ("$1::bigint[], $2::text[]", "v, name")
+     "SELECT r.ord::int4, u.id, u.username, u.bio, u.image, EXISTS (SELECT 1 FROM follows fo WHERE "
+     "fo.follower_id = r.v AND fo.followee_id = u.id) AS following FROM req r JOIN users u ON u.username = r.name "
+     "ORDER BY r.ord"},
     {"feed_b",  // v bigint[], limit bigint[], offset bigint[]
      FEED("$1::bigint[], $2::bigint[], $3::bigint[]", "p.ord::int4, ")},
     {"list_tag_b",  // v bigint[], limit bigint[], offset bigint[], tag text[]
