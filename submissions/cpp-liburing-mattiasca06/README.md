@@ -33,7 +33,6 @@ Conformance: 197/197 on `test/run.sh`. No benchmark numbers yet.
 - bcrypt runs on a small pool of low-priority threads, so hashing never stalls an event loop.
 - Session settings on every Postgres connection (rule 2): `jit = off`, `max_parallel_workers_per_gather = 0`, `plan_cache_mode = force_generic_plan` (statements are prepared once, so no per-call planning) and `enable_seqscan = off` (every query has an index path; the planner otherwise scans the 200-row `tags` table once per listed article). Tags are looked up by primary key for the same reason.
 - Slugs are generated in SQL; no caching of any kind.
-- Session settings on every Postgres connection: `SET jit = off`, `SET max_parallel_workers_per_gather = 0`.
 - Postgres connection budget: `WORKERS x (DB_CONNS + 1) <= 95`, checked at startup (defaults: 4 x (3 + 1) = 16).
 
 Environment: `DATABASE_URL`, `JWT_SECRET`, `HOST`, `PORT`; optional `WORKERS` (default 4), `DB_CONNS` (read
