@@ -4,6 +4,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.function.Function;
 
+import org.jspecify.annotations.Nullable;
 
 /**
  * Checks on the request records in {@link Requests}, which the generated routes bind from the body whatever the
@@ -16,8 +17,8 @@ final class Body {
     }
 
     /** The wrapper object ({@code user}, {@code article}, ...) of a request; 422 when the body or the wrapper is null. */
-    static <R, T> T inner(R root, Function<R, T> wrapper, String key) {
-        T value = root == null ? null : wrapper.apply(root);
+    static <R, T> T inner(@Nullable R root, Function<R, @Nullable T> wrapper, String key) {
+        @Nullable T value = root == null ? null : wrapper.apply(root);
         if (value == null) {
             throw ApiException.invalid(key + " must be an object");
         }
@@ -25,7 +26,7 @@ final class Body {
     }
 
     /** A required non-empty string field. */
-    static String required(String value, String field) {
+    static String required(@Nullable String value, String field) {
         if (value == null || value.isEmpty()) {
             throw ApiException.invalid(field + " can't be blank");
         }
@@ -33,7 +34,7 @@ final class Body {
     }
 
     /** An optional non-empty string field: null when absent or JSON null; 422 when empty. */
-    static String optionalNonEmpty(String value, String field) {
+    static @Nullable String optionalNonEmpty(@Nullable String value, String field) {
         if (value != null && value.isEmpty()) {
             throw ApiException.invalid(field + " can't be blank");
         }
@@ -41,7 +42,7 @@ final class Body {
     }
 
     /** An optional array of non-empty strings: empty when absent or null. */
-    static List<String> stringList(List<String> value, String field) {
+    static List<String> stringList(@Nullable List<@Nullable String> value, String field) {
         if (value == null) {
             return List.of();
         }
@@ -62,7 +63,7 @@ final class Body {
     }
 
     /** ASCII digits only (no sign, no spaces) that fit in a long; -1 otherwise. */
-    static long parseUint(String s) {
+    static long parseUint(@Nullable String s) {
         if (s == null || s.isEmpty()) {
             return -1;
         }

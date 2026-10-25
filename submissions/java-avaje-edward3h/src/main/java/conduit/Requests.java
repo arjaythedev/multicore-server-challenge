@@ -3,6 +3,7 @@ package conduit;
 import java.util.List;
 
 import io.avaje.jsonb.Json;
+import org.jspecify.annotations.Nullable;
 
 /**
  * Request body shapes from SPEC.md. Jsonb rejects a value of the wrong JSON type (a number where a string is
@@ -14,44 +15,46 @@ final class Requests {
     }
 
     @Json
-    record Register(Registration user) {
+    record Register(@Nullable Registration user) {
         @Json
-        record Registration(String username, String email, String password) {
+        record Registration(@Nullable String username, @Nullable String email, @Nullable String password) {
         }
     }
 
     @Json
-    record Login(Credentials user) {
+    record Login(@Nullable Credentials user) {
         @Json
-        record Credentials(String email, String password) {
+        record Credentials(@Nullable String email, @Nullable String password) {
         }
     }
 
     @Json
-    record UpdateUser(Changes user) {
+    record UpdateUser(@Nullable Changes user) {
         @Json
-        record Changes(String email, String username, String password, String bio, String image) {
+        record Changes(@Nullable String email, @Nullable String username, @Nullable String password, @Nullable String bio,
+                @Nullable String image) {
         }
     }
 
     @Json
-    record CreateArticle(NewArticle article) {
+    record CreateArticle(@Nullable NewArticle article) {
         @Json
-        record NewArticle(String title, String description, String body, List<String> tagList) {
+        record NewArticle(@Nullable String title, @Nullable String description, @Nullable String body,
+                @Nullable List<@Nullable String> tagList) {
         }
     }
 
     @Json
-    record UpdateArticle(Changes article) {
+    record UpdateArticle(@Nullable Changes article) {
         @Json
-        record Changes(String title, String description, String body) {
+        record Changes(@Nullable String title, @Nullable String description, @Nullable String body) {
         }
     }
 
     @Json
-    record CreateComment(NewComment comment) {
+    record CreateComment(@Nullable NewComment comment) {
         @Json
-        record NewComment(String body) {
+        record NewComment(@Nullable String body) {
         }
     }
 }

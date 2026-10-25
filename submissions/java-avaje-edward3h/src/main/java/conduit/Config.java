@@ -13,6 +13,7 @@ import io.avaje.inject.Bean;
 import io.avaje.inject.Factory;
 import io.avaje.jsonb.Jsonb;
 import jakarta.inject.Named;
+import org.jspecify.annotations.Nullable;
 
 /**
  * Configuration comes from the environment only (DATABASE_URL, JWT_SECRET, HOST, PORT), plus DB_POOL_SIZE
@@ -53,7 +54,7 @@ class Config {
         return new Jwt(env("JWT_SECRET", null), jsonb);
     }
 
-    static String env(String name, String fallback) {
+    static String env(String name, @Nullable String fallback) {
         String value = System.getenv(name);
         if (value == null || value.isEmpty()) {
             if (fallback == null) {

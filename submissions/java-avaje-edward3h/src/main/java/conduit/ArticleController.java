@@ -9,6 +9,7 @@ import io.avaje.http.api.Post;
 import io.avaje.http.api.Produces;
 import io.avaje.http.api.Put;
 import io.helidon.webserver.http.ServerRequest;
+import org.jspecify.annotations.Nullable;
 
 /** Articles, the feed, and favorites. */
 @Controller
@@ -37,11 +38,11 @@ class ArticleController implements ApiController {
         return new Page(l, o);
     }
 
-    private static String query(ServerRequest req, String name) {
+    private static @Nullable String query(ServerRequest req, String name) {
         return req.query().first(name).orElse(null);
     }
 
-    private static boolean given(String s) {
+    private static boolean given(@Nullable String s) {
         return s != null && !s.isEmpty();
     }
 
@@ -57,7 +58,7 @@ class ArticleController implements ApiController {
                 .toList(), count);
     }
 
-    private static Dto.ArticleResponse full(ArticleDao.ArticleFullRow r) {
+    private static Dto.ArticleResponse full(ArticleDao.@Nullable ArticleFullRow r) {
         if (r == null) {
             throw ApiException.notFound("article");
         }

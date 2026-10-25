@@ -7,6 +7,7 @@ import java.util.List;
 import java.util.Map;
 
 import io.avaje.jsonb.Json;
+import org.jspecify.annotations.Nullable;
 
 /** Response shapes from SPEC.md. */
 final class Dto {
@@ -23,7 +24,7 @@ final class Dto {
     }
 
     @Json
-    record User(String email, String token, String username, String bio, String image) {
+    record User(String email, String token, String username, @Nullable String bio, @Nullable String image) {
     }
 
     @Json
@@ -31,7 +32,7 @@ final class Dto {
     }
 
     @Json
-    record Profile(String username, String bio, String image, boolean following) {
+    record Profile(String username, @Nullable String bio, @Nullable String image, boolean following) {
     }
 
     @Json

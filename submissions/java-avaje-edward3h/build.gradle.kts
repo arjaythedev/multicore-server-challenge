@@ -27,6 +27,7 @@ dependencies {
     implementation("com.zaxxer:HikariCP:7.1.0")
     implementation("org.postgresql:postgresql:42.7.14")
     implementation("at.favre.lib:bcrypt:0.10.2")
+    implementation("org.jspecify:jspecify:1.0.0")
 
     annotationProcessor("io.avaje:avaje-http-helidon-generator:$avajeHttp")
     annotationProcessor("io.avaje:avaje-inject-generator:$avajeInject")

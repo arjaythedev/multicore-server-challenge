@@ -3,6 +3,7 @@ package conduit;
 import io.helidon.http.HeaderNames;
 import io.helidon.webserver.http.ServerRequest;
 import jakarta.inject.Singleton;
+import org.jspecify.annotations.Nullable;
 
 /**
  * {@code Authorization: Token <jwt>} (an empty header counts as absent). {@link AuthFilter} calls
@@ -54,7 +55,7 @@ final class Auth {
         return req.context().get(CALLER, User.class).map(User::id).orElse(0L);
     }
 
-    private static String token(ServerRequest req) {
+    private static @Nullable String token(ServerRequest req) {
         String header = req.headers().first(HeaderNames.AUTHORIZATION).orElse(null);
         if (header == null || header.isEmpty()) {
             return null;

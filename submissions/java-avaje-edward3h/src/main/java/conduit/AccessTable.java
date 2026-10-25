@@ -9,6 +9,7 @@ import io.avaje.http.api.Get;
 import io.avaje.http.api.Post;
 import io.avaje.http.api.Put;
 import jakarta.inject.Singleton;
+import org.jspecify.annotations.Nullable;
 
 /**
  * The {@link Access} level of every route, read once from the controllers' annotations. The filter runs before
@@ -20,7 +21,7 @@ import jakarta.inject.Singleton;
 final class AccessTable {
 
     /** A route template: {@code segments} holds the literal text of each segment, or null for a {name} parameter. */
-    private record Route(String method, String[] segments, Access.Level level, int literals) {
+    private record Route(String method, @Nullable String[] segments, Access.Level level, int literals) {
 
         boolean matches(String requestMethod, String path) {
             if (!method.equals(requestMethod)) {
@@ -61,12 +62,12 @@ final class AccessTable {
         }
     }
 
-    private void add(String method, String template, Access.Level level) {
+    private void add(String method, @Nullable String template, Access.Level level) {
         if (template == null) {
             return;
         }
         String[] parts = template.substring(1).split("/");
-        String[] segments = new String[parts.length];
+        @Nullable String[] segments = new String[parts.length];
         int literals = 0;
         for (int i = 0; i < parts.length; i++) {
             if (!parts[i].startsWith("{")) {
