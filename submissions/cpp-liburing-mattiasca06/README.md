@@ -36,4 +36,4 @@ Conformance: 197/197 on `test/run.sh`. No benchmark numbers yet.
 - Postgres connection budget: `WORKERS x (DB_CONNS + 1) <= 95`, checked at startup (defaults: 4 x (3 + 1) = 16).
 
 Environment: `DATABASE_URL`, `JWT_SECRET`, `HOST`, `PORT`; optional `WORKERS` (default 4), `DB_CONNS` (read
-connections per worker, default 3), `BCRYPT_THREADS` (default 2).
+connections per worker, default 3), `BCRYPT_THREADS` (default 1: one thread fills the lockstep batches best).
