@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "auth.h"
+#include "bufpool.h"
 #include "codec.h"
 #include "json_out.h"
 #include "prof.h"
@@ -357,7 +358,7 @@ Task<Reply> Worker::h_tags() {
     Rows rows = co_await db({Query("tags", {})});
     if (!rows.all_ok(1)) co_return db_error();
     std::string body;
-    body.reserve(32 + size_t(rows[0].rows()) * 16);
+    take_buf(body); body.reserve(32 + size_t(rows[0].rows()) * 16);
     body = R"({"tags":[)";
     const Res &r = rows[0];
     for (int i = 0; i < r.rows(); i++) {
@@ -511,7 +512,7 @@ Task<Reply> Worker::h_list(const Request &rq, int64_t viewer, bool feed) {
         total = i64(rows[1], 0, 0);
     }
     std::string body;
-    body.reserve(128 + size_t(page.rows()) * 700);  // ~one allocation instead of ~10 doublings
+    take_buf(body); body.reserve(128 + size_t(page.rows()) * 700);  // ~one allocation instead of ~10 doublings
     body = R"({"articles":[)";
     bool first = true;
     for (int i = 0; i < page.rows(); i++) {
@@ -572,7 +573,7 @@ Task<Reply> Worker::h_create_article(const Request &rq, int64_t viewer) {
     const Res &res = ins[nq];
     if (res.rows() == 0) co_return db_error();
     std::string out;
-    out.reserve(1536);
+    take_buf(out); out.reserve(1536);
     out = R"({"article":)";
     article_json(out, res, 0, true);
     out += '}';
@@ -593,7 +594,7 @@ Task<Reply> Worker::h_update_article(const Request &rq, std::string slug, int64_
     if (!rows.all_ok(2)) co_return db_error();
     if (rows[0].rows() == 0) co_return rows[1].rows() == 0 ? err(404, "article not found") : err(403, "forbidden");
     std::string out;
-    out.reserve(1536);
+    take_buf(out); out.reserve(1536);
     out = R"({"article":)";
     article_json(out, rows[0], 0, true);
     out += '}';
@@ -616,7 +617,7 @@ Task<Reply> Worker::h_favorite(std::string slug, int64_t viewer, bool add) {
     if (!rows.all_ok(2)) co_return db_error();
     if (rows[1].rows() == 0) co_return err(404, "article not found");
     std::string out;
-    out.reserve(1536);
+    take_buf(out); out.reserve(1536);
     out = R"({"article":)";
     article_json(out, rows[1], 0, true);
     out += '}';
@@ -629,7 +630,7 @@ Task<Reply> Worker::h_comments(std::string slug, int64_t viewer) {
     const Res &r = rows[0];
     if (r.rows() == 0) co_return err(404, "article not found");
     std::string out;
-    out.reserve(64 + size_t(r.rows()) * 450);
+    take_buf(out); out.reserve(64 + size_t(r.rows()) * 450);
     out = R"({"comments":[)";
     for (int i = 0; i < r.rows() && !is_null(r, i, 0); i++) {
         if (i) out += ',';
@@ -650,7 +651,7 @@ Task<Reply> Worker::h_add_comment(const Request &rq, std::string slug, int64_t v
     if (!rows.all_ok(1)) co_return db_error();
     if (rows[0].rows() == 0) co_return err(404, "article not found");
     std::string out;
-    out.reserve(512);
+    take_buf(out); out.reserve(512);
     out = R"({"comment":)";
     comment_json(out, rows[0], 0, false);
     out += '}';

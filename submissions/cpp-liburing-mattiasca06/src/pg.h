@@ -60,7 +60,7 @@ struct ResultSet {
 };
 
 struct Rows {
-    std::vector<Res> r;
+    SmallVec<Res, 3> r;
     std::shared_ptr<ResultSet> shared;  // when set, owns the PGresults (requests of one segment may point at the same one)
     bool ok = true;  // false if the connection failed before the segment completed
     Rows() = default;

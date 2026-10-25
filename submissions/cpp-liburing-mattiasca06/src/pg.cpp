@@ -51,6 +51,7 @@ bool PgConn::send_segment(void *tag, const std::vector<Query> &qs) {
         return false;
     }
     inflight.push_back({tag, {}, false});
+    inflight.back().res.reserve(qs.size());
     return true;
 }
 

@@ -1,4 +1,5 @@
 #include "worker.h"
+#include "bufpool.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -57,30 +58,6 @@ inline int batch_of(const char *stmt) {
     return -1;
 }
 
-// Hand a buffer's storage back to the allocator once it has grown past a small size (clear() would keep it).
-// Spare buffers per worker thread: an idle connection keeps nothing (80k keep-alive connections would otherwise pin
-// their largest response each), a busy one picks a warm buffer up again without going through malloc.
-inline std::vector<std::string> &spare_bufs() {
-    thread_local std::vector<std::string> v;
-    return v;
-}
-inline void release_big(std::string &s) {
-    if (!s.empty() || s.capacity() <= 15) return;
-    auto &sp = spare_bufs();
-    if (s.capacity() <= 32768 && sp.size() < 1024) {
-        sp.push_back(std::move(s));
-        s = std::string();
-    } else {
-        std::string().swap(s);
-    }
-}
-inline void take_buf(std::string &s) {
-    auto &sp = spare_bufs();
-    if (s.capacity() <= 15 && !sp.empty()) {
-        s = std::move(sp.back());
-        sp.pop_back();
-    }
-}
 
 const char *reason(int status) {
     switch (status) {
@@ -360,6 +337,7 @@ void Worker::process_one(uint32_t idx) {
                 close_hdr = ieq(h.value, h.value_len, "close");
             } else if (ieq(h.name, h.name_len, "authorization")) {
                 rq.has_auth = true;
+                take_buf(rq.auth);
                 rq.auth.assign(h.value, h.value_len);
             }
         }
@@ -375,8 +353,10 @@ void Worker::process_one(uint32_t idx) {
         rq.method.assign(method, mlen);
         std::string_view target(path, plen);
         size_t q = target.find('?');
+        take_buf(rq.path);
         rq.path.assign(target.substr(0, q));
         if (q != std::string_view::npos) rq.query.assign(target.substr(q + 1));
+        if (content_len) take_buf(rq.body);
         rq.body.assign(c.in, size_t(pr), content_len);
         c.in.erase(0, size_t(pr) + content_len);
         c.busy = true;
@@ -394,6 +374,9 @@ Detached Worker::serve(uint32_t idx, uint32_t gen, Request rq) {
     } catch (const std::exception &) {
         r = {500, R"({"errors":{"body":["internal error"]}})"};
     }
+    recycle(rq.auth);
+    recycle(rq.path);
+    recycle(rq.body);
     finish(idx, gen, std::move(r));
 }
 
@@ -403,6 +386,7 @@ void Worker::finish(uint32_t idx, uint32_t gen, Reply r) {
     if (c.gen != gen) return;  // client went away while the request ran
     c.busy = false;
     respond(c, idx, r.status, r.body);
+    recycle(r.body);
     process(idx);
 }
 
@@ -439,7 +423,7 @@ void Worker::dispatch_writes() {
         return;
     }
     if (!pg.inflight.empty()) return;
-    auto *g = new Group;
+    Group *g = new_group();
     g->members.push_back(writeq_.front());
     writeq_.pop_front();
     if (!g->members[0]->solo)
@@ -447,11 +431,13 @@ void Worker::dispatch_writes() {
             g->members.push_back(writeq_.front());
             writeq_.pop_front();
         }
-    std::vector<Query> all;
+    std::vector<Query> &all = all_;
+    all.clear();
     for (DbAwait *a : g->members) all.insert(all.end(), a->qs.begin(), a->qs.end());
     if (!pg.send_segment(g, all)) {
         std::vector<DbAwait *> ms = std::move(g->members);
-        delete g;
+        g->members.clear();
+        free_group(g);
         for (DbAwait *a : ms) a->rows.ok = false;
         for (DbAwait *a : ms) a->h.resume();
         return;
@@ -570,7 +556,7 @@ void Worker::dispatch() {
         if (!pg) break;
         // Natural batching: everything that queued while the connections were busy goes out as one segment
         // (one Sync, one implicit read-only transaction).
-        auto *g = new Group;
+        Group *g = new_group();
         g->members.push_back(waitq_.front());
         waitq_.pop_front();
         if (!g->members[0]->solo)
@@ -578,7 +564,8 @@ void Worker::dispatch() {
                 g->members.push_back(waitq_.front());
                 waitq_.pop_front();
             }
-        std::vector<Query> all;
+        std::vector<Query> &all = all_;
+        all.clear();
         build_read(*g, all);
         PROF_READ_GROUP(g->members.size(), all.size());
         if (!pg->send_segment(g, all)) {
@@ -586,7 +573,7 @@ void Worker::dispatch() {
                 m->rows.ok = false;
                 failed.push_back(m);
             }
-            delete g;
+            free_group(g);
             continue;
         }
         {
@@ -598,16 +585,19 @@ void Worker::dispatch() {
 }
 
 void Worker::on_pg(uint32_t pg_idx) {
-    std::vector<PgConn::Seg> done;
+    std::vector<PgConn::Seg> &done = seg_done_;
+    done.clear();
     {
         PROF_SCOPE(kPgRecv);
         pgs_[pg_idx]->drain(done);
     }
     PROF_SCOPE(kPgDone);
-    std::vector<std::coroutine_handle<>> ready;
+    std::vector<std::coroutine_handle<>> &ready = ready_;
+    ready.clear();
     const bool is_write = pg_idx == uint32_t(cfg_.read_conns);
     for (PgConn::Seg &s : done) {
-        std::unique_ptr<Group> g(static_cast<Group *>(s.tag));
+        Group *g = static_cast<Group *>(s.tag);
+        struct Free { Worker *w; Group *g; ~Free() { w->free_group(g); } } free_g{this, g};
         size_t total = 0;
         for (DbAwait *a : g->members) total += a->qs.size();
         if (g->sent) total = g->sent;
@@ -633,7 +623,8 @@ void Worker::on_pg(uint32_t pg_idx) {
             auto set = std::make_shared<ResultSet>(std::move(s.res));
             const bool whole = set->r.size() == g->sent;
             // A batched result holds every request's rows, ordered by position; find where each request's rows start.
-            std::vector<std::vector<int>> starts(g->batches.size());
+            if (starts_.size() < g->batches.size()) starts_.resize(g->batches.size());
+            std::vector<std::vector<int>> &starts = starts_;
             bool split_ok = whole;
             for (size_t b = 0; b < g->batches.size() && split_ok; b++) {
                 PGresult *pr = set->r[g->batches[b].first];
@@ -673,7 +664,7 @@ void Worker::on_pg(uint32_t pg_idx) {
             for (DbAwait *a : g->members) {
                 size_t n = a->qs.size();
                 if (pos + n <= s.res.size())
-                    a->rows.r.assign(s.res.begin() + long(pos), s.res.begin() + long(pos + n));
+                    for (size_t i = pos; i < pos + n; i++) a->rows.r.push_back(Res(s.res[i]));
                 a->rows.ok = true;
                 pos += n;
                 ready.push_back(a->h);
@@ -823,4 +814,20 @@ void Worker::run() {
             if (!pg.inflight.empty()) arm_pg(i);
         }
     }
+}
+
+Worker::Group *Worker::new_group() {
+    if (group_pool_.empty()) return new Group;
+    Group *g = group_pool_.back();
+    group_pool_.pop_back();
+    return g;
+}
+
+void Worker::free_group(Group *g) {
+    g->members.clear();
+    g->map.clear();
+    g->batches.clear();
+    g->sent = 0;
+    if (group_pool_.size() < 64) group_pool_.push_back(g);
+    else delete g;
 }

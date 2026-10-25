@@ -145,6 +145,13 @@ struct alignas(64) Worker {
     };
     static constexpr size_t kMaxReadGroup = 32;
     static constexpr size_t kMaxGroup = 48;  // stays well below 64 in-flight xids per transaction
+    std::vector<Group *> group_pool_;  // spare Groups with their vectors' capacity
+    std::vector<Query> all_;           // scratch: statements of the segment being built
+    std::vector<PgConn::Seg> seg_done_;  // scratch for on_pg
+    std::vector<std::coroutine_handle<>> ready_;
+    std::vector<std::vector<int>> starts_;
+    Group *new_group();
+    void free_group(Group *g);
     bool timer_armed_ = false;
     __kernel_timespec batch_ts_{};
     bool in_process_ = false;
