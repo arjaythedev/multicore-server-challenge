@@ -1,0 +1,645 @@
+// Routing and the 19 endpoints. Each handler is a coroutine that awaits Postgres segments and bcrypt jobs.
+#include <ctime>
+#include <cstdlib>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include "auth.h"
+#include "codec.h"
+#include "json_out.h"
+#include "worker.h"
+#include "yyjson.h"
+
+namespace {
+
+using codec::i64;
+using codec::is_null;
+using codec::text;
+
+Reply err(int status, const char *msg) {
+    return {status, std::string(R"({"errors":{"body":[")") + msg + R"("]}})"};
+}
+Reply db_error() { return err(500, "database error"); }
+
+void put(std::string &o, std::string_view s) { json::str(o, s.data(), s.size()); }
+void put_nullable(std::string &o, PGresult *r, int row, int col) {
+    if (is_null(r, row, col)) o += "null";
+    else put(o, text(r, row, col));
+}
+
+// ---- authentication ----
+
+enum class AuthState { Anon, Ok, Bad };
+
+std::string_view token_of(const Request &rq) {
+    std::string_view a = rq.auth;
+    if (a.size() < 6 || strncasecmp(a.data(), "Token ", 6) != 0) return {};
+    a.remove_prefix(6);
+    while (!a.empty() && a.front() == ' ') a.remove_prefix(1);
+    while (!a.empty() && a.back() == ' ') a.remove_suffix(1);
+    return a;
+}
+
+AuthState authenticate(const Request &rq, int64_t &viewer) {
+    viewer = 0;
+    if (!rq.has_auth) return AuthState::Anon;
+    std::string_view t = token_of(rq);
+    if (t.empty() || !g_jwt.verify(t, time(nullptr), viewer)) return AuthState::Bad;
+    return AuthState::Ok;
+}
+
+// ---- request JSON ----
+
+struct Doc {
+    yyjson_doc *d;
+    explicit Doc(const std::string &s) : d(yyjson_read(s.data(), s.size(), 0)) {}
+    ~Doc() { yyjson_doc_free(d); }
+    Doc(const Doc &) = delete;
+    // The object under the given top-level key, or null.
+    yyjson_val *inner(const char *key) const {
+        yyjson_val *root = d ? yyjson_doc_get_root(d) : nullptr;
+        if (!yyjson_is_obj(root)) return nullptr;
+        yyjson_val *o = yyjson_obj_get(root, key);
+        return yyjson_is_obj(o) ? o : nullptr;
+    }
+};
+
+// An optional string field: absent or null -> Missing; a string without NUL bytes -> Ok; anything else -> Bad.
+struct StrField {
+    enum { Missing, Ok, Bad } st = Missing;
+    std::string v;
+    bool present_nonempty() const { return st == Ok && !v.empty(); }
+    Param param() const { return st == Ok ? Param(v) : Param(nullptr); }
+};
+
+StrField str_field(yyjson_val *obj, const char *key) {
+    StrField f;
+    yyjson_val *v = yyjson_obj_get(obj, key);
+    if (!v || yyjson_is_null(v)) return f;
+    if (!yyjson_is_str(v)) {
+        f.st = StrField::Bad;
+        return f;
+    }
+    const char *s = yyjson_get_str(v);
+    size_t n = yyjson_get_len(v);
+    if (memchr(s, 0, n)) {
+        f.st = StrField::Bad;
+        return f;
+    }
+    f.st = StrField::Ok;
+    f.v.assign(s, n);
+    return f;
+}
+
+// ---- response JSON ----
+
+void user_json(std::string &o, PGresult *r, int row, std::string_view token) {
+    o += R"({"user":{"email":)";
+    put(o, text(r, row, 2));
+    o += R"(,"token":)";
+    put(o, token);
+    o += R"(,"username":)";
+    put(o, text(r, row, 1));
+    o += R"(,"bio":)";
+    put_nullable(o, r, row, 3);
+    o += R"(,"image":)";
+    put_nullable(o, r, row, 4);
+    o += "}}";
+}
+
+void author_json(std::string &o, PGresult *r, int row, int c_username, bool following) {
+    o += R"("author":{"username":)";
+    put(o, text(r, row, c_username));
+    o += R"(,"bio":)";
+    put_nullable(o, r, row, c_username + 1);
+    o += R"(,"image":)";
+    put_nullable(o, r, row, c_username + 2);
+    o += R"(,"following":)";
+    o += following ? "true" : "false";
+    o += '}';
+}
+
+void profile_json(std::string &o, PGresult *r, int row, int c_username, bool following) {
+    o += R"({"profile":{"username":)";
+    put(o, text(r, row, c_username));
+    o += R"(,"bio":)";
+    put_nullable(o, r, row, c_username + 1);
+    o += R"(,"image":)";
+    put_nullable(o, r, row, c_username + 2);
+    o += R"(,"following":)";
+    o += following ? "true" : "false";
+    o += "}}";
+}
+
+// Columns: id, slug, title, description, [body,] created_at, updated_at, tag_list, favorites_count, favorited,
+// username, bio, image, following.
+void article_json(std::string &o, PGresult *r, int row, bool full) {
+    int c = 1;
+    o += R"({"slug":)";
+    put(o, text(r, row, c++));
+    o += R"(,"title":)";
+    put(o, text(r, row, c++));
+    o += R"(,"description":)";
+    put(o, text(r, row, c++));
+    if (full) {
+        o += R"(,"body":)";
+        put(o, text(r, row, c++));
+    }
+    o += R"(,"createdAt":")";
+    codec::append_ts(o, i64(r, row, c++));
+    o += R"(","updatedAt":")";
+    codec::append_ts(o, i64(r, row, c++));
+    o += R"(","tagList":[)";
+    {
+        const char *p = PQgetvalue(r, row, c++);  // binary text[]: ndim, hasnull, elemtype, then dims, then elements
+        int32_t ndim = codec::be32(p);
+        if (ndim > 0) {
+            int32_t n = codec::be32(p + 12);
+            const char *e = p + 12 + 8 * ndim;
+            for (int32_t i = 0; i < n; i++) {
+                int32_t len = codec::be32(e);
+                e += 4;
+                if (i) o += ',';
+                put(o, std::string_view(e, size_t(len)));
+                e += len;
+            }
+        }
+    }
+    o += R"(],"favorited":)";
+    int favcount = c++;
+    int favorited = c++;
+    o += codec::boolean(r, row, favorited) ? "true" : "false";
+    o += R"(,"favoritesCount":)";
+    o += std::to_string(i64(r, row, favcount));
+    o += ',';
+    int c_user = c;
+    author_json(o, r, row, c_user, codec::boolean(r, row, c_user + 3));
+    o += '}';
+}
+
+void comment_json(std::string &o, PGresult *r, int row, bool following) {
+    o += R"({"id":)";
+    o += std::to_string(i64(r, row, 0));
+    o += R"(,"createdAt":")";
+    codec::append_ts(o, i64(r, row, 2));
+    o += R"(","updatedAt":")";
+    codec::append_ts(o, i64(r, row, 3));
+    o += R"(","body":)";
+    put(o, text(r, row, 1));
+    o += ',';
+    author_json(o, r, row, 4, following);
+    o += '}';
+}
+
+// ---- small helpers ----
+
+bool parse_i64(std::string_view s, int64_t &out) {
+    if (s.empty() || s.size() > 18) return false;
+    size_t i = 0;
+    bool neg = false;
+    if (s[0] == '-') {
+        neg = true;
+        i = 1;
+        if (s.size() == 1) return false;
+    }
+    int64_t v = 0;
+    for (; i < s.size(); i++) {
+        if (s[i] < '0' || s[i] > '9') return false;
+        v = v * 10 + (s[i] - '0');
+    }
+    out = neg ? -v : v;
+    return true;
+}
+
+std::vector<std::pair<std::string, std::string>> parse_query(std::string_view q) {
+    std::vector<std::pair<std::string, std::string>> out;
+    while (!q.empty()) {
+        size_t amp = q.find('&');
+        std::string_view part = q.substr(0, amp);
+        q = amp == std::string_view::npos ? std::string_view() : q.substr(amp + 1);
+        if (part.empty()) continue;
+        size_t eq = part.find('=');
+        std::string k = codec::pct_decode(part.substr(0, eq), true);
+        std::string v = eq == std::string_view::npos ? "" : codec::pct_decode(part.substr(eq + 1), true);
+        out.emplace_back(std::move(k), std::move(v));
+    }
+    return out;
+}
+
+std::string pg_text_array(const std::vector<std::string> &v) {
+    std::string o = "{";
+    for (size_t i = 0; i < v.size(); i++) {
+        if (i) o += ',';
+        o += '"';
+        for (char ch : v[i]) {
+            if (ch == '"' || ch == '\\') o += '\\';
+            o += ch;
+        }
+        o += '"';
+    }
+    o += '}';
+    return o;
+}
+
+}  // namespace
+
+Task<Reply> Worker::route(const Request &rq) {
+    std::string_view path = rq.path;
+    if (path.substr(0, 5) != "/api/") co_return err(404, "not found");
+    path.remove_prefix(5);
+    std::vector<std::string> seg;
+    while (true) {
+        size_t s = path.find('/');
+        seg.push_back(codec::pct_decode(path.substr(0, s), false));
+        if (s == std::string_view::npos) break;
+        path.remove_prefix(s + 1);
+    }
+    if (seg.size() > 1 && seg.back().empty()) seg.pop_back();
+
+    int64_t viewer = 0;
+    AuthState st = authenticate(rq, viewer);
+    const std::string &m = rq.method;
+    bool get = m == "GET", post = m == "POST", put_ = m == "PUT", del = m == "DELETE";
+    size_t n = seg.size();
+    const std::string &s0 = seg[0];
+
+    // Auth-required endpoints answer 401 unless a valid token came with the request; optional ones only reject a
+    // token that is present but invalid.
+    auto need_auth = [&] { return st != AuthState::Ok; };
+    auto bad_auth = [&] { return st == AuthState::Bad; };
+
+    if (s0 == "tags" && n == 1 && get) co_return co_await h_tags();
+    if (s0 == "users") {
+        if (n == 1 && post) co_return co_await h_register(rq);
+        if (n == 2 && seg[1] == "login" && post) co_return co_await h_login(rq);
+    } else if (s0 == "user" && n == 1) {
+        if (get || put_) {
+            if (need_auth()) co_return err(401, "unauthorized");
+            if (get) co_return co_await h_get_user(rq, viewer);
+            co_return co_await h_put_user(rq, viewer);
+        }
+    } else if (s0 == "profiles" && n >= 2) {
+        if (n == 2 && get) {
+            if (bad_auth()) co_return err(401, "unauthorized");
+            co_return co_await h_profile(rq, seg[1], viewer);
+        }
+        if (n == 3 && seg[2] == "follow" && (post || del)) {
+            if (need_auth()) co_return err(401, "unauthorized");
+            co_return co_await h_follow(rq, seg[1], viewer, post);
+        }
+    } else if (s0 == "articles") {
+        if (n == 1) {
+            if (get) {
+                if (bad_auth()) co_return err(401, "unauthorized");
+                co_return co_await h_list(rq, viewer, false);
+            }
+            if (post) {
+                if (need_auth()) co_return err(401, "unauthorized");
+                co_return co_await h_create_article(rq, viewer);
+            }
+        } else if (n == 2) {
+            if (seg[1] == "feed" && get) {
+                if (need_auth()) co_return err(401, "unauthorized");
+                co_return co_await h_list(rq, viewer, true);
+            }
+            if (get) {
+                if (bad_auth()) co_return err(401, "unauthorized");
+                co_return co_await h_article(seg[1], viewer);
+            }
+            if (put_ || del) {
+                if (need_auth()) co_return err(401, "unauthorized");
+                // (no co_await inside ?: — GCC evaluates both arms)
+                if (put_) co_return co_await h_update_article(rq, seg[1], viewer);
+                co_return co_await h_delete_article(seg[1], viewer);
+            }
+        } else if (n == 3 && seg[2] == "favorite" && (post || del)) {
+            if (need_auth()) co_return err(401, "unauthorized");
+            co_return co_await h_favorite(seg[1], viewer, post);
+        } else if (n == 3 && seg[2] == "comments") {
+            if (get) {
+                if (bad_auth()) co_return err(401, "unauthorized");
+                co_return co_await h_comments(seg[1], viewer);
+            }
+            if (post) {
+                if (need_auth()) co_return err(401, "unauthorized");
+                co_return co_await h_add_comment(rq, seg[1], viewer);
+            }
+        } else if (n == 4 && seg[2] == "comments" && del) {
+            if (need_auth()) co_return err(401, "unauthorized");
+            co_return co_await h_delete_comment(seg[1], seg[3], viewer);
+        }
+    }
+    co_return err(404, "not found");
+}
+
+Task<Reply> Worker::h_tags() {
+    Rows rows = co_await db({Query("tags", {})});
+    if (!rows.all_ok(1)) co_return db_error();
+    std::string body = R"({"tags":[)";
+    PGresult *r = rows[0];
+    for (int i = 0; i < PQntuples(r); i++) {
+        if (i) body += ',';
+        put(body, text(r, i, 0));
+    }
+    body += "]}";
+    co_return Reply{200, std::move(body)};
+}
+
+Task<Reply> Worker::h_register(const Request &rq) {
+    Doc doc(rq.body);
+    yyjson_val *u = doc.inner("user");
+    if (!u) co_return err(422, "invalid body");
+    StrField username = str_field(u, "username"), email = str_field(u, "email"), password = str_field(u, "password");
+    if (!username.present_nonempty() || !email.present_nonempty() || !password.present_nonempty())
+        co_return err(422, "username, email and password are required");
+    if (password.v.size() > 72) co_return err(422, "password too long");
+
+    BcryptResult br = co_await bcrypt_hash(password.v);
+    if (!br.ok) co_return err(500, "hashing failed");
+    Rows rows = co_await db({Query("user_register", {username.v, email.v, br.hash})});
+    if (!rows.ok || rows.r.size() != 1) co_return db_error();
+    PGresult *r = rows[0];
+    if (PQresultStatus(r) != PGRES_TUPLES_OK)
+        co_return sqlstate(r) == "23505" ? err(422, "username or email already taken") : db_error();
+    std::string body;
+    user_json(body, r, 0, g_jwt.sign(i64(r, 0, 0), time(nullptr)));
+    co_return Reply{201, std::move(body)};
+}
+
+Task<Reply> Worker::h_login(const Request &rq) {
+    Doc doc(rq.body);
+    yyjson_val *u = doc.inner("user");
+    if (!u) co_return err(422, "invalid body");
+    StrField email = str_field(u, "email"), password = str_field(u, "password");
+    if (!email.present_nonempty() || !password.present_nonempty()) co_return err(422, "email and password are required");
+
+    Rows rows = co_await db({Query("user_login", {email.v})});
+    if (!rows.all_ok(1)) co_return db_error();
+    PGresult *r = rows[0];
+    if (PQntuples(r) == 0) co_return err(401, "invalid credentials");
+    BcryptResult br = co_await bcrypt_verify(password.v, std::string(text(r, 0, 5)));
+    if (!br.ok) co_return err(401, "invalid credentials");
+    std::string body;
+    user_json(body, r, 0, g_jwt.sign(i64(r, 0, 0), time(nullptr)));
+    co_return Reply{200, std::move(body)};
+}
+
+Task<Reply> Worker::h_get_user(const Request &rq, int64_t viewer) {
+    Rows rows = co_await db({Query("user_by_id", {viewer})});
+    if (!rows.all_ok(1)) co_return db_error();
+    if (PQntuples(rows[0]) == 0) co_return err(401, "unauthorized");
+    std::string body;
+    user_json(body, rows[0], 0, token_of(rq));
+    co_return Reply{200, std::move(body)};
+}
+
+Task<Reply> Worker::h_put_user(const Request &rq, int64_t viewer) {
+    Doc doc(rq.body);
+    yyjson_val *u = doc.inner("user");
+    if (!u) co_return err(422, "invalid body");
+    StrField email = str_field(u, "email"), username = str_field(u, "username"), password = str_field(u, "password"),
+             bio = str_field(u, "bio"), image = str_field(u, "image");
+    for (const StrField *f : {&email, &username, &password, &bio, &image})
+        if (f->st == StrField::Bad) co_return err(422, "invalid field");
+    for (const StrField *f : {&email, &username, &password})
+        if (f->st == StrField::Ok && f->v.empty()) co_return err(422, "must not be empty");
+    if (password.v.size() > 72) co_return err(422, "password too long");
+
+    Param hash = nullptr;
+    if (password.st == StrField::Ok) {
+        BcryptResult br = co_await bcrypt_hash(password.v);
+        if (!br.ok) co_return err(500, "hashing failed");
+        hash = Param(br.hash);
+    }
+    Rows rows = co_await db({Query("user_update", {viewer, email.param(), username.param(), hash, bio.param(), image.param()})});
+    if (!rows.ok || rows.r.size() != 1) co_return db_error();
+    PGresult *r = rows[0];
+    if (PQresultStatus(r) != PGRES_TUPLES_OK)
+        co_return sqlstate(r) == "23505" ? err(422, "username or email already taken") : db_error();
+    if (PQntuples(r) == 0) co_return err(401, "unauthorized");
+    std::string body;
+    user_json(body, r, 0, token_of(rq));
+    co_return Reply{200, std::move(body)};
+}
+
+Task<Reply> Worker::h_profile(const Request &, std::string name, int64_t viewer) {
+    Rows rows = co_await db({Query("profile", {viewer, name})});
+    if (!rows.all_ok(1)) co_return db_error();
+    PGresult *r = rows[0];
+    if (PQntuples(r) == 0) co_return err(404, "profile not found");
+    std::string body;
+    profile_json(body, r, 0, 1, codec::boolean(r, 0, 4));
+    co_return Reply{200, std::move(body)};
+}
+
+Task<Reply> Worker::h_follow(const Request &, std::string name, int64_t viewer, bool follow) {
+    Rows rows = co_await db({Query("user_by_name", {name})});
+    if (!rows.all_ok(1)) co_return db_error();
+    PGresult *r = rows[0];
+    if (PQntuples(r) == 0) co_return err(404, "profile not found");
+    int64_t target = i64(r, 0, 0);
+    Rows act = co_await db({Query(follow ? "follow_add" : "follow_del", {viewer, target})});
+    if (!act.all_ok(1)) co_return db_error();
+    std::string body;
+    profile_json(body, r, 0, 1, follow);
+    co_return Reply{200, std::move(body)};
+}
+
+Task<Reply> Worker::h_list(const Request &rq, int64_t viewer, bool feed) {
+    int64_t limit = 20, offset = 0;
+    std::string tag, author, favorited;
+    for (auto &[k, v] : parse_query(rq.query)) {
+        if (k == "limit") {
+            if (!parse_i64(v, limit) || limit < 1 || limit > 100) co_return err(422, "invalid limit");
+        } else if (k == "offset") {
+            if (!parse_i64(v, offset) || offset < 0) co_return err(422, "invalid offset");
+        } else if (k == "tag") {
+            tag = v;
+        } else if (k == "author") {
+            author = v;
+        } else if (k == "favorited") {
+            favorited = v;
+        }
+    }
+
+    std::vector<Query> qs;
+    if (feed) {
+        qs.push_back(Query("feed", {viewer, limit, offset}));
+        qs.push_back(Query("count_feed", {viewer}));
+    } else if (!tag.empty()) {
+        qs.push_back(Query("list_tag", {viewer, limit, offset, tag}));
+        qs.push_back(Query("count_tag", {tag}));
+    } else if (!author.empty()) {
+        qs.push_back(Query("list_author", {viewer, limit, offset, author}));
+        qs.push_back(Query("count_author", {author}));
+    } else if (!favorited.empty()) {
+        qs.push_back(Query("list_fav", {viewer, limit, offset, favorited}));
+        qs.push_back(Query("count_fav", {favorited}));
+    } else {
+        qs.push_back(Query("list_all", {viewer, limit, offset}));
+        qs.push_back(Query("count_all", {}));
+    }
+    Rows rows = co_await db(std::move(qs));
+    if (!rows.all_ok(2)) co_return db_error();
+    PGresult *page = rows[0];
+    std::string body = R"({"articles":[)";
+    for (int i = 0; i < PQntuples(page); i++) {
+        if (i) body += ',';
+        article_json(body, page, i, false);
+    }
+    body += R"(],"articlesCount":)";
+    body += std::to_string(i64(rows[1], 0, 0));
+    body += '}';
+    co_return Reply{200, std::move(body)};
+}
+
+Task<Reply> Worker::h_article(std::string slug, int64_t viewer) {
+    Rows rows = co_await db({Query("article_by_slug", {viewer, slug})});
+    if (!rows.all_ok(1)) co_return db_error();
+    if (PQntuples(rows[0]) == 0) co_return err(404, "article not found");
+    std::string body = R"({"article":)";
+    article_json(body, rows[0], 0, true);
+    body += '}';
+    co_return Reply{200, std::move(body)};
+}
+
+Task<Reply> Worker::h_create_article(const Request &rq, int64_t viewer) {
+    Doc doc(rq.body);
+    yyjson_val *a = doc.inner("article");
+    if (!a) co_return err(422, "invalid body");
+    StrField title = str_field(a, "title"), description = str_field(a, "description"), body = str_field(a, "body");
+    if (!title.present_nonempty() || !description.present_nonempty() || !body.present_nonempty())
+        co_return err(422, "title, description and body are required");
+    std::vector<std::string> tags;
+    yyjson_val *tl = yyjson_obj_get(a, "tagList");
+    if (tl && !yyjson_is_null(tl)) {
+        if (!yyjson_is_arr(tl)) co_return err(422, "tagList must be an array");
+        size_t i, max;
+        yyjson_val *t;
+        yyjson_arr_foreach(tl, i, max, t) {
+            if (!yyjson_is_str(t) || yyjson_get_len(t) == 0 || memchr(yyjson_get_str(t), 0, yyjson_get_len(t)))
+                co_return err(422, "tags must be non-empty strings");
+            tags.emplace_back(yyjson_get_str(t), yyjson_get_len(t));
+        }
+    }
+
+    Rows idr = co_await db({Query("article_nextval", {})});
+    if (!idr.all_ok(1)) co_return db_error();
+    int64_t id = i64(idr[0], 0, 0);
+
+    // One segment, one implicit transaction: the article and its tags commit together.
+    std::vector<Query> qs;
+    qs.push_back(Query("article_insert", {id, title.v, viewer, description.v, body.v}));
+    if (!tags.empty()) {
+        std::string lit = pg_text_array(tags);
+        qs.push_back(Query("tags_insert", {lit}));
+        qs.push_back(Query("article_tags_insert", {id, lit}));
+    }
+    size_t nq = qs.size();
+    Rows ins = co_await db(std::move(qs));
+    if (!ins.all_ok(nq)) co_return db_error();
+
+    Rows rows = co_await db({Query("article_by_id", {viewer, id})});
+    if (!rows.all_ok(1) || PQntuples(rows[0]) == 0) co_return db_error();
+    std::string out = R"({"article":)";
+    article_json(out, rows[0], 0, true);
+    out += '}';
+    co_return Reply{201, std::move(out)};
+}
+
+Task<Reply> Worker::h_update_article(const Request &rq, std::string slug, int64_t viewer) {
+    Doc doc(rq.body);
+    yyjson_val *a = doc.inner("article");
+    if (!a) co_return err(422, "invalid body");
+    StrField title = str_field(a, "title"), description = str_field(a, "description"), body = str_field(a, "body");
+    for (const StrField *f : {&title, &description, &body})
+        if (f->st == StrField::Bad || (f->st == StrField::Ok && f->v.empty())) co_return err(422, "invalid field");
+
+    Rows own = co_await db({Query("article_owner", {slug})});
+    if (!own.all_ok(1)) co_return db_error();
+    if (PQntuples(own[0]) == 0) co_return err(404, "article not found");
+    int64_t id = i64(own[0], 0, 0);
+    if (i64(own[0], 0, 1) != viewer) co_return err(403, "forbidden");
+
+    Rows rows = co_await db({Query("article_update", {id, title.param(), description.param(), body.param()}),
+                             Query("article_by_id", {viewer, id})});
+    if (!rows.all_ok(2) || PQntuples(rows[1]) == 0) co_return db_error();
+    std::string out = R"({"article":)";
+    article_json(out, rows[1], 0, true);
+    out += '}';
+    co_return Reply{200, std::move(out)};
+}
+
+Task<Reply> Worker::h_delete_article(std::string slug, int64_t viewer) {
+    Rows own = co_await db({Query("article_owner", {slug})});
+    if (!own.all_ok(1)) co_return db_error();
+    if (PQntuples(own[0]) == 0) co_return err(404, "article not found");
+    int64_t id = i64(own[0], 0, 0);
+    if (i64(own[0], 0, 1) != viewer) co_return err(403, "forbidden");
+    Rows rows = co_await db({Query("article_delete", {id})});
+    if (!rows.all_ok(1)) co_return db_error();
+    co_return Reply{204, {}};
+}
+
+Task<Reply> Worker::h_favorite(std::string slug, int64_t viewer, bool add) {
+    Rows idr = co_await db({Query("article_id", {slug})});
+    if (!idr.all_ok(1)) co_return db_error();
+    if (PQntuples(idr[0]) == 0) co_return err(404, "article not found");
+    int64_t id = i64(idr[0], 0, 0);
+    // The read-back runs in the same segment, so it sees this request's own write.
+    Rows rows = co_await db({Query(add ? "fav_add" : "fav_del", {viewer, id}), Query("article_by_id", {viewer, id})});
+    if (!rows.all_ok(2) || PQntuples(rows[1]) == 0) co_return db_error();
+    std::string out = R"({"article":)";
+    article_json(out, rows[1], 0, true);
+    out += '}';
+    co_return Reply{200, std::move(out)};
+}
+
+Task<Reply> Worker::h_comments(std::string slug, int64_t viewer) {
+    Rows idr = co_await db({Query("article_id", {slug})});
+    if (!idr.all_ok(1)) co_return db_error();
+    if (PQntuples(idr[0]) == 0) co_return err(404, "article not found");
+    Rows rows = co_await db({Query("comments_list", {viewer, i64(idr[0], 0, 0)})});
+    if (!rows.all_ok(1)) co_return db_error();
+    PGresult *r = rows[0];
+    std::string out = R"({"comments":[)";
+    for (int i = 0; i < PQntuples(r); i++) {
+        if (i) out += ',';
+        comment_json(out, r, i, codec::boolean(r, i, 7));
+    }
+    out += "]}";
+    co_return Reply{200, std::move(out)};
+}
+
+Task<Reply> Worker::h_add_comment(const Request &rq, std::string slug, int64_t viewer) {
+    Doc doc(rq.body);
+    yyjson_val *c = doc.inner("comment");
+    if (!c) co_return err(422, "invalid body");
+    StrField body = str_field(c, "body");
+    if (!body.present_nonempty()) co_return err(422, "body is required");
+
+    Rows idr = co_await db({Query("article_id", {slug})});
+    if (!idr.all_ok(1)) co_return db_error();
+    if (PQntuples(idr[0]) == 0) co_return err(404, "article not found");
+    Rows rows = co_await db({Query("comment_insert", {i64(idr[0], 0, 0), viewer, body.v})});
+    if (!rows.all_ok(1) || PQntuples(rows[0]) == 0) co_return db_error();
+    std::string out = R"({"comment":)";
+    comment_json(out, rows[0], 0, false);
+    out += '}';
+    co_return Reply{201, std::move(out)};
+}
+
+Task<Reply> Worker::h_delete_comment(std::string slug, std::string id, int64_t viewer) {
+    int64_t cid;
+    if (!parse_i64(id, cid) || cid < 0) co_return err(404, "comment not found");
+    Rows own = co_await db({Query("comment_owner", {cid, slug})});
+    if (!own.all_ok(1)) co_return db_error();
+    if (PQntuples(own[0]) == 0) co_return err(404, "comment not found");
+    if (i64(own[0], 0, 0) != viewer) co_return err(403, "forbidden");
+    Rows rows = co_await db({Query("comment_delete", {cid})});
+    if (!rows.all_ok(1)) co_return db_error();
+    co_return Reply{204, {}};
+}

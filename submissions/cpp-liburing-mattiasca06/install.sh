@@ -3,6 +3,6 @@
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
-apt-get install -y -q build-essential curl ca-certificates liburing-dev libpq-dev
+apt-get install -y -q build-essential curl ca-certificates liburing-dev libpq-dev libssl-dev libcrypt-dev
 g++ --version | head -1
-dpkg-query -W liburing-dev libpq-dev
+dpkg-query -W liburing-dev libpq-dev libssl-dev libcrypt-dev

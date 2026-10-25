@@ -4,6 +4,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -14,19 +15,18 @@
 #include <stdexcept>
 #include <string_view>
 
-#include "json_out.h"
 #include "picohttpparser.h"
 
 namespace {
 
-enum Op : uint64_t { kAccept, kRecv, kSend, kPgIn, kPgOut, kIgnore };
+enum Op : uint64_t { kAccept, kRecv, kSend, kPgIn, kPgOut, kEfd };
 
 // user_data: op in bits 0..3, slot index in bits 4..35, generation in bits 36..63
 constexpr uint64_t pack(Op op, uint32_t idx, uint32_t gen = 0) {
     return uint64_t(op) | (uint64_t(idx) << 4) | (uint64_t(gen) << 36);
 }
 constexpr Op op_of(uint64_t u) { return Op(u & 15); }
-constexpr uint32_t idx_of(uint64_t u) { return uint32_t(u >> 4); }
+constexpr uint32_t idx_of(uint64_t u) { return uint32_t((u >> 4) & 0xffffffffu); }
 constexpr uint32_t gen_of(uint64_t u) { return uint32_t(u >> 36); }
 
 constexpr size_t kMaxRequest = 1 << 20;
@@ -37,17 +37,23 @@ const char *reason(int status) {
     case 201: return "Created";
     case 204: return "No Content";
     case 400: return "Bad Request";
+    case 401: return "Unauthorized";
+    case 403: return "Forbidden";
     case 404: return "Not Found";
     case 413: return "Payload Too Large";
+    case 422: return "Unprocessable Entity";
     default: return "Internal Server Error";
     }
 }
 
-bool ieq(const char *a, size_t n, const char *lit) {
-    return n == strlen(lit) && strncasecmp(a, lit, n) == 0;
-}
+bool ieq(const char *a, size_t n, const char *lit) { return n == strlen(lit) && strncasecmp(a, lit, n) == 0; }
 
 }  // namespace
+
+void DbAwait::await_suspend(std::coroutine_handle<> c) {
+    h = c;
+    w.enqueue(this);
+}
 
 Worker::Worker(const Config &cfg, int id) : cfg_(cfg), id_(id) {
     for (int i = 0; i < cfg_.read_conns; i++) {
@@ -55,6 +61,8 @@ Worker::Worker(const Config &cfg, int id) : cfg_(cfg), id_(id) {
         pg->connect(cfg_.database_url.c_str());
         pgs_.push_back(std::move(pg));
     }
+    efd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (efd_ < 0) throw std::runtime_error("eventfd");
 }
 
 Worker::~Worker() {
@@ -101,6 +109,12 @@ void Worker::arm_pg_out(uint32_t pg_idx) {
     io_uring_sqe_set_data64(s, pack(kPgOut, pg_idx));
 }
 
+void Worker::arm_efd() {
+    io_uring_sqe *s = sqe();
+    io_uring_prep_poll_multishot(s, efd_, POLLIN);
+    io_uring_sqe_set_data64(s, pack(kEfd, 0));
+}
+
 void Worker::on_accept(int fd) {
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
@@ -145,21 +159,21 @@ void Worker::kill(uint32_t idx) {
 
 void Worker::on_recv(uint32_t idx, uint32_t gen, io_uring_cqe *cqe) {
     Conn &c = conns_[idx];
+    unsigned bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
+    bool has_buf = cqe->flags & IORING_CQE_F_BUFFER;
+    auto give_back = [&] {
+        io_uring_buf_ring_add(br_, &bufs_[size_t(bid) * kBufSize], kBufSize, uint16_t(bid),
+                              io_uring_buf_ring_mask(kBufCount), 0);
+        io_uring_buf_ring_advance(br_, 1);
+    };
     if (c.gen != gen) {  // stale completion for a reused slot: only give the buffer back
-        if (cqe->flags & IORING_CQE_F_BUFFER) {
-            unsigned bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
-            io_uring_buf_ring_add(br_, &bufs_[size_t(bid) * kBufSize], kBufSize, bid,
-                                  io_uring_buf_ring_mask(kBufCount), 0);
-            io_uring_buf_ring_advance(br_, 1);
-        }
+        if (has_buf) give_back();
         return;
     }
     if (!(cqe->flags & IORING_CQE_F_MORE)) c.recv_active = false;
-    if (cqe->flags & IORING_CQE_F_BUFFER) {
-        unsigned bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
+    if (has_buf) {
         if (cqe->res > 0 && !c.closing) c.in.append(&bufs_[size_t(bid) * kBufSize], size_t(cqe->res));
-        io_uring_buf_ring_add(br_, &bufs_[size_t(bid) * kBufSize], kBufSize, bid, io_uring_buf_ring_mask(kBufCount), 0);
-        io_uring_buf_ring_advance(br_, 1);
+        give_back();
     }
     if (cqe->res <= 0 && cqe->res != -ENOBUFS) {
         kill(idx);
@@ -197,24 +211,49 @@ void Worker::on_send(uint32_t idx, uint32_t gen, int res) {
         start_send(idx);
     } else if (c.close_after) {
         kill(idx);
+    } else {
+        maybe_free(idx);
     }
 }
 
 void Worker::respond(Conn &c, uint32_t idx, int status, const std::string &body) {
-    char head[160];
-    int n = snprintf(head, sizeof head, "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n%s\r\n",
-                     status, reason(status), body.size(), c.close_after ? "Connection: close\r\n" : "");
+    char head[192];
+    int n;
+    if (status == 204) {
+        n = snprintf(head, sizeof head, "HTTP/1.1 204 No Content\r\n%s\r\n", c.close_after ? "Connection: close\r\n" : "");
+    } else {
+        n = snprintf(head, sizeof head,
+                     "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n%s\r\n", status,
+                     reason(status), body.size(), c.close_after ? "Connection: close\r\n" : "");
+    }
     c.out.append(head, size_t(n));
-    c.out += body;
+    if (status != 204) c.out += body;
     start_send(idx);
 }
 
-// Parses and routes as many buffered requests as it can, strictly in order: while one waits on Postgres the rest stay
-// buffered.
+// Handlers may complete synchronously (inside process_one) or later from the event loop. `in_process_` keeps a
+// completion that happens inside process_one from starting a nested parse; those connections are revisited afterwards.
 void Worker::process(uint32_t idx) {
+    if (in_process_) {
+        deferred_.push_back(idx);
+        return;
+    }
+    in_process_ = true;
+    process_one(idx);
+    while (!deferred_.empty()) {
+        uint32_t d = deferred_.back();
+        deferred_.pop_back();
+        process_one(d);
+    }
+    in_process_ = false;
+}
+
+// Parses and starts as many buffered requests as it can, strictly in order: while one is running the rest stay
+// buffered.
+void Worker::process_one(uint32_t idx) {
     for (;;) {
         Conn &c = conns_[idx];
-        if (c.busy || c.closing || c.in.empty()) return;
+        if (c.fd < 0 || c.busy || c.closing || c.in.empty()) return;
         const char *method, *path;
         size_t mlen, plen;
         int minor;
@@ -224,6 +263,7 @@ void Worker::process(uint32_t idx) {
         if (pr == -2) {
             if (c.in.size() > kMaxRequest) {
                 c.close_after = true;
+                c.in.clear();
                 respond(c, idx, 413, R"({"errors":{"body":["request too large"]}})");
             }
             return;
@@ -234,13 +274,18 @@ void Worker::process(uint32_t idx) {
             respond(c, idx, 400, R"({"errors":{"body":["bad request"]}})");
             return;
         }
+        Request rq;
         size_t content_len = 0;
         bool close_hdr = minor == 0;
         for (size_t i = 0; i < nh; i++) {
-            if (ieq(hdrs[i].name, hdrs[i].name_len, "content-length")) {
-                content_len = strtoull(std::string(hdrs[i].value, hdrs[i].value_len).c_str(), nullptr, 10);
-            } else if (ieq(hdrs[i].name, hdrs[i].name_len, "connection")) {
-                close_hdr = ieq(hdrs[i].value, hdrs[i].value_len, "close");
+            const phr_header &h = hdrs[i];
+            if (ieq(h.name, h.name_len, "content-length")) {
+                content_len = strtoull(std::string(h.value, h.value_len).c_str(), nullptr, 10);
+            } else if (ieq(h.name, h.name_len, "connection")) {
+                close_hdr = ieq(h.value, h.value_len, "close");
+            } else if (ieq(h.name, h.name_len, "authorization")) {
+                rq.has_auth = true;
+                rq.auth.assign(h.value, h.value_len);
             }
         }
         if (content_len > kMaxRequest) {
@@ -252,64 +297,112 @@ void Worker::process(uint32_t idx) {
         if (c.in.size() < size_t(pr) + content_len) return;  // body still arriving
         if (close_hdr) c.close_after = true;
 
-        // route before erasing: method and path point into c.in
-        bool is_tags = std::string_view(method, mlen) == "GET" && std::string_view(path, plen) == "/api/tags";
+        rq.method.assign(method, mlen);
+        std::string_view target(path, plen);
+        size_t q = target.find('?');
+        rq.path.assign(target.substr(0, q));
+        if (q != std::string_view::npos) rq.query.assign(target.substr(q + 1));
+        rq.body.assign(c.in, size_t(pr), content_len);
         c.in.erase(0, size_t(pr) + content_len);
-        if (is_tags) {
-            c.busy = true;
-            waitq_.push_back({idx, c.gen});
-            dispatch();
-        } else {
-            respond(c, idx, 404, R"({"errors":{"body":["not found"]}})");
-        }
+        c.busy = true;
+        serve(idx, c.gen, std::move(rq));
     }
 }
 
-void Worker::dispatch() {
-    while (!waitq_.empty()) {
-        uint32_t pi = 0;
-        for (; pi < pgs_.size(); pi++)
-            if (pgs_[pi]->inflight.empty()) break;
-        if (pi == pgs_.size()) return;
-        Waiting w = waitq_.front();
-        waitq_.pop_front();
-        if (conns_[w.idx].gen != w.gen) continue;  // client went away while queued
-        PgConn &pg = *pgs_[pi];
-        if (!pg.send_prepared(pack(kIgnore, w.idx, w.gen), "tags", 0, nullptr, nullptr, nullptr)) {
-            Conn &c = conns_[w.idx];
-            c.busy = false;
-            respond(c, w.idx, 500, R"({"errors":{"body":["database error"]}})");
-            continue;
-        }
-        if (pg.flush()) arm_pg_out(pi);
+Detached Worker::serve(uint32_t idx, uint32_t gen, Request rq) {
+    Reply r;
+    try {
+        r = co_await route(rq);
+    } catch (const std::exception &) {
+        r = {500, R"({"errors":{"body":["internal error"]}})"};
     }
+    finish(idx, gen, std::move(r));
 }
 
-void Worker::finish_tags(uint32_t idx, uint32_t gen, PGresult *res) {
+void Worker::finish(uint32_t idx, uint32_t gen, Reply r) {
     Conn &c = conns_[idx];
-    if (c.gen != gen) return;
+    if (c.gen != gen) return;  // client went away while the request ran
     c.busy = false;
-    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
-        respond(c, idx, 500, R"({"errors":{"body":["database error"]}})");
-    } else {
-        std::string body = R"({"tags":[)";
-        int n = PQntuples(res);
-        for (int i = 0; i < n; i++) {
-            if (i) body.push_back(',');
-            json::str(body, PQgetvalue(res, i, 0), size_t(PQgetlength(res, i, 0)));
-        }
-        body += "]}";
-        respond(c, idx, 200, body);
-    }
+    respond(c, idx, r.status, r.body);
     process(idx);
 }
 
-void Worker::on_pg(uint32_t pg_idx) {
-    pgs_[pg_idx]->drain([&](uint64_t tag, PGresult *res) {
-        finish_tags(idx_of(tag), gen_of(tag), res);
-        if (res) PQclear(res);
-    });
+void Worker::enqueue(DbAwait *a) {
+    waitq_.push_back(a);
     dispatch();
+}
+
+// Hands queued segments to idle Postgres connections (one segment in flight per connection).
+void Worker::dispatch() {
+    std::vector<DbAwait *> failed;
+    while (!waitq_.empty()) {
+        PgConn *pg = nullptr;
+        uint32_t pi = 0;
+        bool any_alive = false;
+        for (uint32_t i = 0; i < pgs_.size(); i++) {
+            if (pgs_[i]->dead) continue;
+            any_alive = true;
+            if (pgs_[i]->inflight.empty()) {
+                pg = pgs_[i].get();
+                pi = i;
+                break;
+            }
+        }
+        if (!any_alive) {
+            for (DbAwait *a : waitq_) {
+                a->rows.ok = false;
+                failed.push_back(a);
+            }
+            waitq_.clear();
+            break;
+        }
+        if (!pg) break;
+        DbAwait *a = waitq_.front();
+        waitq_.pop_front();
+        if (!pg->send_segment(a, a->qs)) {
+            a->rows.ok = false;
+            failed.push_back(a);
+            continue;
+        }
+        if (pg->flush()) arm_pg_out(pi);
+    }
+    for (DbAwait *a : failed) a->h.resume();
+}
+
+void Worker::on_pg(uint32_t pg_idx) {
+    std::vector<PgConn::Seg> done;
+    pgs_[pg_idx]->drain(done);
+    std::vector<std::coroutine_handle<>> ready;
+    for (PgConn::Seg &s : done) {
+        auto *a = static_cast<DbAwait *>(s.tag);
+        a->rows.r = std::move(s.res);
+        a->rows.ok = !s.failed;
+        ready.push_back(a->h);
+    }
+    for (auto h : ready) h.resume();
+    dispatch();
+}
+
+void Worker::post_done(BcryptAwait *j) {
+    {
+        std::lock_guard lk(done_mu_);
+        done_.push_back(j);
+    }
+    uint64_t one = 1;
+    if (write(efd_, &one, sizeof one) < 0) {}
+}
+
+void Worker::on_efd() {
+    uint64_t v;
+    if (read(efd_, &v, sizeof v) < 0) {}
+    std::vector<BcryptAwait *> js;
+    {
+        std::lock_guard lk(done_mu_);
+        js.swap(done_);
+    }
+    std::vector<std::coroutine_handle<>> hs;
+    for (BcryptAwait *j : js) hs.push_back(j->h);
+    for (auto h : hs) h.resume();
 }
 
 void Worker::run() {
@@ -346,10 +439,12 @@ void Worker::run() {
     }
     bufs_.resize(size_t(kBufCount) * kBufSize);
     for (unsigned i = 0; i < kBufCount; i++)
-        io_uring_buf_ring_add(br_, &bufs_[size_t(i) * kBufSize], kBufSize, uint16_t(i), io_uring_buf_ring_mask(kBufCount), int(i));
+        io_uring_buf_ring_add(br_, &bufs_[size_t(i) * kBufSize], kBufSize, uint16_t(i),
+                              io_uring_buf_ring_mask(kBufCount), int(i));
     io_uring_buf_ring_advance(br_, int(kBufCount));
 
     arm_accept();
+    arm_efd();
     for (uint32_t i = 0; i < pgs_.size(); i++) arm_pg(i);
 
     io_uring_cqe *cqes[256];
@@ -370,18 +465,20 @@ void Worker::run() {
                 break;
             case kRecv: on_recv(idx_of(u), gen_of(u), cqe); break;
             case kSend: on_send(idx_of(u), gen_of(u), cqe->res); break;
-            case kPgIn: {
+            case kPgIn:
                 on_pg(idx_of(u));
                 if (!(cqe->flags & IORING_CQE_F_MORE)) arm_pg(idx_of(u));
                 break;
-            }
             case kPgOut: {
                 PgConn &pg = *pgs_[idx_of(u)];
                 pg.want_out = false;
                 if (pg.flush()) arm_pg_out(idx_of(u));
                 break;
             }
-            case kIgnore: break;
+            case kEfd:
+                on_efd();
+                if (!(cqe->flags & IORING_CQE_F_MORE)) arm_efd();
+                break;
             }
         }
         io_uring_cq_advance(&ring_, n);

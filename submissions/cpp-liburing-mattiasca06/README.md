@@ -11,7 +11,7 @@
 
 ## Status
 
-Work in progress. Milestone 1 (skeleton): only `GET /api/tags` is implemented; every other route answers 404.
+Work in progress. Milestone 2: all 19 endpoints are implemented and the conformance suite passes (197/197). Not yet tuned: writes still share the read connections, and there is no group commit or read batching.
 
 ## Design
 

@@ -6,21 +6,29 @@ cd "$(dirname "$0")"
 PICO_COMMIT=465a7ff09fbd3432fe56c673451f5460154d1f07
 PICO_C_SHA=6480689711996bc9a219e26df27ac32ebbb7dce2f24a63a316d041b08f646199
 PICO_H_SHA=1fc9074dd12418b2b91e55ef3a8279bccf8d3577b790dea6f2f908ab2a157f1c
+YYJSON_TAG=0.10.0
+YYJSON_C_SHA=98489c068ab65298320710e5be4c1090af1b5676e41301a3525b2e732641aace
+YYJSON_H_SHA=adce02aef5dfd868f7c0b632bd23bc0e79fa710b70d93bfe334c2bd15b21a41d
 
-fetch() { # name sha256
-  local f="third_party/picohttpparser/$1"
-  if [ -f "$f" ] && echo "$2  $f" | sha256sum -c --quiet 2>/dev/null; then return; fi
-  mkdir -p third_party/picohttpparser
-  curl -fsSL --retry 3 -o "$f" "https://raw.githubusercontent.com/h2o/picohttpparser/$PICO_COMMIT/$1"
-  echo "$2  $f" | sha256sum -c --quiet
+fetch() { # dir file sha256 url
+  local f="third_party/$1/$2"
+  if [ -f "$f" ] && echo "$3  $f" | sha256sum -c --quiet 2>/dev/null; then return; fi
+  mkdir -p "third_party/$1"
+  curl -fsSL --retry 3 -o "$f" "$4"
+  echo "$3  $f" | sha256sum -c --quiet
 }
-fetch picohttpparser.c "$PICO_C_SHA"
-fetch picohttpparser.h "$PICO_H_SHA"
+PICO_URL="https://raw.githubusercontent.com/h2o/picohttpparser/$PICO_COMMIT"
+YY_URL="https://raw.githubusercontent.com/ibireme/yyjson/$YYJSON_TAG/src"
+fetch picohttpparser picohttpparser.c "$PICO_C_SHA" "$PICO_URL/picohttpparser.c"
+fetch picohttpparser picohttpparser.h "$PICO_H_SHA" "$PICO_URL/picohttpparser.h"
+fetch yyjson yyjson.c "$YYJSON_C_SHA" "$YY_URL/yyjson.c"
+fetch yyjson yyjson.h "$YYJSON_H_SHA" "$YY_URL/yyjson.h"
 
 mkdir -p bin build
 CC="${CC:-gcc}"; CXX="${CXX:-g++}"
 "$CC" -std=gnu11 -O3 -march=native -flto -c -o build/picohttpparser.o third_party/picohttpparser/picohttpparser.c
-"$CXX" -std=c++20 -O3 -march=native -flto -pthread -Wall -Wextra -Wno-unused-parameter \
-  -Ithird_party/picohttpparser -I"$(pg_config --includedir 2>/dev/null || echo /usr/include/postgresql)" \
-  -o bin/conduit src/*.cpp build/picohttpparser.o -luring -lpq
+"$CC" -std=gnu11 -O3 -march=native -flto -c -o build/yyjson.o third_party/yyjson/yyjson.c
+"$CXX" -std=c++20 -O3 -march=native -flto -pthread -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations \
+  -Ithird_party/picohttpparser -Ithird_party/yyjson -I"$(pg_config --includedir 2>/dev/null || echo /usr/include/postgresql)" \
+  -o bin/conduit src/*.cpp build/picohttpparser.o build/yyjson.o -luring -lpq -lcrypto -lcrypt
 echo "built bin/conduit ($("$CXX" --version | head -1))"

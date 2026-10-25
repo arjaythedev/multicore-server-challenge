@@ -2,9 +2,7 @@
 
 #include <stdexcept>
 
-static const char *const kStatements[][2] = {
-    {"tags", "SELECT name FROM tags ORDER BY name"},
-};
+#include "sql.h"
 
 void PgConn::connect(const char *url) {
     c = PQconnectdb(url);
@@ -15,29 +13,68 @@ void PgConn::connect(const char *url) {
         PQclear(r);
         if (!ok) throw std::runtime_error(std::string("postgres: ") + sql + ": " + PQerrorMessage(c));
     }
-    for (auto &s : kStatements) {
-        PGresult *r = PQprepare(c, s[0], s[1], 0, nullptr);
+    for (const Stmt &s : kStatements) {
+        PGresult *r = PQprepare(c, s.name, s.sql, 0, nullptr);
         bool ok = PQresultStatus(r) == PGRES_COMMAND_OK;
         PQclear(r);
-        if (!ok) throw std::runtime_error(std::string("postgres: prepare ") + s[0] + ": " + PQerrorMessage(c));
+        if (!ok) throw std::runtime_error(std::string("postgres: prepare ") + s.name + ": " + PQerrorMessage(c));
     }
     sock = PQsocket(c);
     if (PQsetnonblocking(c, 1) != 0 || PQenterPipelineMode(c) != 1) throw std::runtime_error("postgres: pipeline mode");
 }
 
-bool PgConn::send_prepared(uint64_t tag, const char *stmt, int nparams, const char *const *values,
-                           const int *lengths, const int *formats) {
-    if (!PQsendQueryPrepared(c, stmt, nparams, values, lengths, formats, 1)) return false;
+bool PgConn::send_segment(void *tag, const std::vector<Query> &qs) {
+    std::vector<const char *> values;
+    for (const Query &q : qs) {
+        values.clear();
+        for (const Param &p : q.params) values.push_back(p.v ? p.v->c_str() : nullptr);
+        if (!PQsendQueryPrepared(c, q.stmt, int(values.size()), values.data(), nullptr, nullptr, 1)) {
+            dead = true;
+            return false;
+        }
+    }
 #if PG_VERSION_NUM >= 170000
-    if (!PQsendPipelineSync(c)) return false;
+    if (!PQsendPipelineSync(c)) {
 #else
-    if (!PQpipelineSync(c)) return false;
+    if (!PQpipelineSync(c)) {
 #endif
-    inflight.push_back({tag, nullptr});
+        dead = true;
+        return false;
+    }
+    inflight.push_back({tag, {}, false});
     return true;
 }
 
-bool PgConn::flush() { return PQflush(c) == 1; }
+bool PgConn::flush() {
+    int rc = PQflush(c);
+    if (rc < 0) dead = true;
+    return rc == 1;
+}
+
+void PgConn::drain(std::vector<Seg> &done) {
+    if (!PQconsumeInput(c)) dead = true;
+    if (dead) {
+        for (Seg &s : inflight) {
+            for (PGresult *r : s.res) PQclear(r);
+            s.res.clear();
+            s.failed = true;
+            done.push_back(std::move(s));
+        }
+        inflight.clear();
+        return;
+    }
+    while (!inflight.empty() && !PQisBusy(c)) {
+        PGresult *r = PQgetResult(c);
+        if (!r) continue;  // separator after a statement's result
+        if (PQresultStatus(r) == PGRES_PIPELINE_SYNC) {
+            PQclear(r);
+            done.push_back(std::move(inflight.front()));
+            inflight.pop_front();
+        } else {
+            inflight.front().res.push_back(r);
+        }
+    }
+}
 
 void PgConn::close() {
     if (c) PQfinish(c);

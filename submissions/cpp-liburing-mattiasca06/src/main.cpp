@@ -10,6 +10,7 @@
 #include <thread>
 #include <vector>
 
+#include "auth.h"
 #include "worker.h"
 
 static const char *env(const char *k, const char *def) {
@@ -32,6 +33,9 @@ int main() {
     cfg.jwt_secret = env("JWT_SECRET", "multicore-server-challenge");
     cfg.workers = atoi(env("WORKERS", "4"));
     cfg.read_conns = atoi(env("DB_CONNS", "3"));
+    cfg.bcrypt_threads = atoi(env("BCRYPT_THREADS", "2"));
+    g_jwt.init(cfg.jwt_secret);
+    bcrypt_pool::start(cfg.bcrypt_threads < 1 ? 1 : cfg.bcrypt_threads);
 
     // Postgres allows 100 connections in total; the rules cap us at 95.
     constexpr int kWriteConnsPerWorker = 1, kMaxConns = 95;
