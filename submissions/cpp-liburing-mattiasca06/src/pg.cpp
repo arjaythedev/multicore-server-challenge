@@ -1,13 +1,22 @@
 #include "pg.h"
 
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
 
 #include "sql.h"
 
 void PgConn::connect(const char *url) {
     c = PQconnectdb(url);
     if (PQstatus(c) != CONNECTION_OK) throw std::runtime_error(std::string("postgres: ") + PQerrorMessage(c));
-    for (const char *sql : {"SET jit = off", "SET max_parallel_workers_per_gather = 0"}) {
+    // Prepared statements reuse one generic plan: re-planning every execution was a large share of backend CPU.
+    const char *pcm = getenv("PG_PLAN_CACHE");  // override for A/B runs (auto, force_custom_plan, ...)
+    if (!pcm) pcm = "force_generic_plan";
+    std::string pcm_sql = std::string("SET plan_cache_mode = ") + pcm;
+    // The 200-row tags table is cheaper to seq-scan per planner costs, but that is one scan per listed article;
+    // every query here has an index path, so keep the planner off sequential scans.
+    const char *seq_sql = getenv("PG_SEQSCAN") ? "SET enable_seqscan = on" : "SET enable_seqscan = off";
+    for (const char *sql : {"SET jit = off", "SET max_parallel_workers_per_gather = 0", pcm_sql.c_str(), seq_sql}) {
         PGresult *r = PQexec(c, sql);
         bool ok = PQresultStatus(r) == PGRES_COMMAND_OK;
         PQclear(r);

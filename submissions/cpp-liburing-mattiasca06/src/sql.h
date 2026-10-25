@@ -3,8 +3,8 @@
 
 #define ARTICLE_LIST_SELECT                                                                                           \
     "SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, "                                       \
-    "ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE at.article_id = a.id "            \
-    "ORDER BY t.name) AS tag_list, "                                                                                  \
+    "ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at "                           \
+    "WHERE at.article_id = a.id ORDER BY 1) AS tag_list, "                                                            \
     "(SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count, "                               \
     "EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1) AS favorited, "                  \
     "u.username, u.bio, u.image, "                                                                                    \
@@ -15,8 +15,8 @@
 
 #define ARTICLE_FULL_COLS                                                                                             \
     "SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at, "                               \
-    "ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE at.article_id = a.id "            \
-    "ORDER BY t.name) AS tag_list, "                                                                                  \
+    "ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at "                           \
+    "WHERE at.article_id = a.id ORDER BY 1) AS tag_list, "                                                            \
     "(SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count, "                               \
     "EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1) AS favorited, "                  \
     "u.username, u.bio, u.image, "                                                                                    \
