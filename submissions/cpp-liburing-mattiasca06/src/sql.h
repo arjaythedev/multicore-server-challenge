@@ -11,15 +11,16 @@
     "EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = a.author_id) AS following "      \
     "FROM articles a JOIN users u ON u.id = a.author_id "
 
-#define ARTICLE_FULL_SELECT                                                                                           \
+#define ARTICLE_FULL_SELECT ARTICLE_FULL_COLS "FROM articles a JOIN users u ON u.id = a.author_id "
+
+#define ARTICLE_FULL_COLS                                                                                             \
     "SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at, "                               \
     "ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE at.article_id = a.id "            \
     "ORDER BY t.name) AS tag_list, "                                                                                  \
     "(SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count, "                               \
     "EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1) AS favorited, "                  \
     "u.username, u.bio, u.image, "                                                                                    \
-    "EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = a.author_id) AS following "      \
-    "FROM articles a JOIN users u ON u.id = a.author_id "
+    "EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = a.author_id) AS following "
 
 #define SLUGIFY(x) "trim(both '-' from lower(regexp_replace(" x ", '[^A-Za-z0-9]+', '-', 'g')))"
 
@@ -109,4 +110,57 @@ inline constexpr Stmt kStatements[] = {
     {"comment_owner",
      "SELECT c.author_id FROM comments c JOIN articles a ON a.id = c.article_id WHERE c.id = $1 AND a.slug = $2"},
     {"comment_delete", "DELETE FROM comments WHERE id = $1"},
+
+    // ---- single-round-trip variants (lookup and action in one statement) ----
+    {"follow_slug",  // $1 viewer, $2 username; one row (username, bio, image) if the user exists
+     "WITH t AS (SELECT id, username, bio, image FROM users WHERE username = $2), "
+     "i AS (INSERT INTO follows (follower_id, followee_id) SELECT $1, t.id FROM t ON CONFLICT DO NOTHING) "
+     "SELECT username, bio, image FROM t"},
+    {"unfollow_slug",
+     "WITH t AS (SELECT id, username, bio, image FROM users WHERE username = $2), "
+     "d AS (DELETE FROM follows WHERE follower_id = $1 AND followee_id IN (SELECT id FROM t)) "
+     "SELECT username, bio, image FROM t"},
+    {"article_update_full",  // $1 viewer(=author), $2 slug, $3 title, $4 description, $5 body; zero rows if not the author
+     "WITH upd AS (UPDATE articles SET title = COALESCE($3, title), description = COALESCE($4, description), "
+     "body = COALESCE($5, body), slug = CASE WHEN $3::text IS NULL THEN slug ELSE " SLUGIFY("$3::text")
+     " || '-' || id END, updated_at = now() WHERE slug = $2 AND author_id = $1 "
+     "RETURNING id, slug, title, description, body, created_at, updated_at, author_id) "
+     ARTICLE_FULL_COLS "FROM upd a JOIN users u ON u.id = a.author_id"},
+    {"article_delete_slug",  // $1 slug, $2 viewer -> (deleted count, author_id or NULL if no such article)
+     "WITH d AS (DELETE FROM articles WHERE slug = $1 AND author_id = $2 RETURNING 1) "
+     "SELECT (SELECT count(*) FROM d), (SELECT author_id FROM articles WHERE slug = $1)"},
+    {"fav_add_slug",
+     "INSERT INTO favorites (user_id, article_id) SELECT $1, a.id FROM articles a WHERE a.slug = $2 "
+     "ON CONFLICT DO NOTHING"},
+    {"fav_del_slug",
+     "DELETE FROM favorites WHERE user_id = $1 AND article_id IN (SELECT id FROM articles WHERE slug = $2)"},
+    {"comments_by_slug",  // $1 viewer, $2 slug; zero rows = no article, one row with NULL id = no comments
+     "SELECT c.id, c.body, c.created_at, c.updated_at, c.username, c.bio, c.image, c.following "
+     "FROM articles a LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image, "
+     "EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = c.author_id) AS following "
+     "FROM comments c JOIN users u ON u.id = c.author_id WHERE c.article_id = a.id "
+     "ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true WHERE a.slug = $2 "
+     "ORDER BY c.created_at DESC NULLS LAST, c.id DESC"},
+    {"comment_insert_slug",  // $1 slug, $2 author, $3 body; zero rows if no such article
+     "WITH a AS (SELECT id FROM articles WHERE slug = $1), "
+     "c AS (INSERT INTO comments (article_id, author_id, body) SELECT a.id, $2, $3 FROM a "
+     "RETURNING id, body, created_at, updated_at, author_id) "
+     "SELECT c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image FROM c JOIN users u ON u.id = c.author_id"},
+    {"comment_delete_slug",  // $1 comment id, $2 slug, $3 viewer -> (deleted count, author_id or NULL if not found)
+     "WITH d AS (DELETE FROM comments c USING articles a WHERE c.id = $1 AND a.id = c.article_id AND a.slug = $2 "
+     "AND c.author_id = $3 RETURNING 1) "
+     "SELECT (SELECT count(*) FROM d), (SELECT c.author_id FROM comments c JOIN articles a ON a.id = c.article_id "
+     "WHERE c.id = $1 AND a.slug = $2)"},
+
+    // POST /articles in one segment: the id comes from the sequence, later statements use currval() of this session.
+    {"article_create",  // $1 title, $2 author, $3 description, $4 body
+     "WITH n AS (SELECT nextval(pg_get_serial_sequence('articles', 'id')) AS id) "
+     "INSERT INTO articles (id, slug, author_id, title, description, body) "
+     "SELECT n.id, " SLUGIFY("$1::text") " || '-' || n.id, $2::bigint, $1::text, $3::text, $4::text FROM n"},
+    {"article_tags_curr",
+     "INSERT INTO article_tags (article_id, tag_id) "
+     "SELECT currval(pg_get_serial_sequence('articles', 'id')), t.id FROM tags t WHERE t.name = ANY($1::text[])"},
+    {"article_by_curr",
+     ARTICLE_FULL_COLS "FROM articles a JOIN users u ON u.id = a.author_id "
+     "WHERE a.id = currval(pg_get_serial_sequence('articles', 'id'))"},
 };
