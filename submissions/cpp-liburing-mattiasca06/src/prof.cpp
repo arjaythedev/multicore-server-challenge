@@ -16,6 +16,7 @@ thread_local Counters *tl = nullptr;
 static std::mutex g_mu;
 static std::vector<Counters *> g_all;
 static std::atomic<uint64_t> g_bc_cyc{0}, g_bc_n{0};
+static std::atomic<uint64_t> g_rg{0}, g_rg_members{0}, g_rg_sent{0}, g_rg_hist[8];
 
 void attach() {
     auto *c = new Counters;
@@ -28,6 +29,13 @@ void attach() {
 void bcrypt_done(uint64_t cyc, int n) {
     g_bc_cyc += cyc;
     g_bc_n += uint64_t(n);
+}
+
+void read_group(size_t members, size_t sent) {
+    g_rg++;
+    g_rg_members += members;
+    g_rg_sent += sent;
+    g_rg_hist[members >= 8 ? 7 : members - 1]++;
 }
 
 static double tsc_ghz() {
@@ -86,6 +94,13 @@ void start_dumper() {
                             (unsigned long long)dbn, double(bc - prev_bc) / ghz / 1000.0 / double(dbn),
                             double(bc - prev_bc) / ghz / 1000.0 / double(dreq));
             }
+            if (g_rg)
+                fprintf(stderr, "PROF read segments: %llu, %.2f requests per segment, %.2f statements sent per segment; size histogram 1..8+: %llu %llu %llu %llu %llu %llu %llu %llu\n",
+                        (unsigned long long)g_rg, double(g_rg_members) / double(g_rg), double(g_rg_sent) / double(g_rg),
+                        (unsigned long long)g_rg_hist[0], (unsigned long long)g_rg_hist[1],
+                        (unsigned long long)g_rg_hist[2], (unsigned long long)g_rg_hist[3],
+                        (unsigned long long)g_rg_hist[4], (unsigned long long)g_rg_hist[5],
+                        (unsigned long long)g_rg_hist[6], (unsigned long long)g_rg_hist[7]);
             fflush(stderr);
             for (int i = 0; i < kCount; i++) prev[i] = cur[i];
             prev_req = req;

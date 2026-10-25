@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <deque>
 #include <initializer_list>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -25,32 +26,63 @@ struct Query {
     const char *stmt;
     std::vector<Param> params;
     Query(const char *s, std::initializer_list<Param> p) : stmt(s), params(p) {}
+    Query(const char *s, std::vector<Param> p) : stmt(s), params(std::move(p)) {}
 };
 
-// Owns the results of one pipeline segment (one PGresult per statement).
-struct Rows {
+// One request's view of a result: a row range of a PGresult. A batched statement answers several requests with one
+// result (first column = the request's position); each request then sees only its own rows and no ord column.
+struct Res {
+    PGresult *p = nullptr;
+    int lo = 0, n = 0, col0 = 0;
+    Res() = default;
+    Res(PGresult *r) : p(r), n(PQntuples(r)) {}
+    Res(PGresult *r, int lo, int n, int col0) : p(r), lo(lo), n(n), col0(col0) {}
+    operator PGresult *() const { return p; }
+    int rows() const { return n; }
+    bool null(int row, int col) const { return PQgetisnull(p, lo + row, col0 + col) != 0; }
+    const char *raw(int row, int col) const { return PQgetvalue(p, lo + row, col0 + col); }
+    std::string_view text(int row, int col) const {
+        return {PQgetvalue(p, lo + row, col0 + col), size_t(PQgetlength(p, lo + row, col0 + col))};
+    }
+};
+
+// Results of one pipeline segment, cleared together once every request that shares one has let go of it.
+struct ResultSet {
     std::vector<PGresult *> r;
+    explicit ResultSet(std::vector<PGresult *> v) : r(std::move(v)) {}
+    ResultSet(const ResultSet &) = delete;
+    ~ResultSet() {
+        for (PGresult *p : r) PQclear(p);
+    }
+};
+
+struct Rows {
+    std::vector<Res> r;
+    std::shared_ptr<ResultSet> shared;  // when set, owns the PGresults (requests of one segment may point at the same one)
     bool ok = true;  // false if the connection failed before the segment completed
     Rows() = default;
-    Rows(Rows &&o) noexcept : r(std::move(o.r)), ok(o.ok) { o.r.clear(); }
+    Rows(Rows &&o) noexcept : r(std::move(o.r)), shared(std::move(o.shared)), ok(o.ok) { o.r.clear(); }
     Rows &operator=(Rows &&o) noexcept {
         clear();
         r = std::move(o.r);
+        shared = std::move(o.shared);
         ok = o.ok;
         o.r.clear();
         return *this;
     }
     ~Rows() { clear(); }
     void clear() {
-        for (PGresult *p : r) PQclear(p);
+        if (!shared)
+            for (Res &x : r) PQclear(x.p);
+        shared.reset();
         r.clear();
     }
-    PGresult *operator[](size_t i) const { return r[i]; }
+    const Res &operator[](size_t i) const { return r[i]; }
     // True if the segment produced `n` results and every one of them succeeded.
     bool all_ok(size_t n) const {
         if (!ok || r.size() != n) return false;
-        for (PGresult *p : r) {
-            ExecStatusType st = PQresultStatus(p);
+        for (const Res &x : r) {
+            ExecStatusType st = PQresultStatus(x.p);
             if (st != PGRES_TUPLES_OK && st != PGRES_COMMAND_OK) return false;
         }
         return true;

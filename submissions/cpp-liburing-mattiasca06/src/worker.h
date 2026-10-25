@@ -18,6 +18,7 @@
 struct Config {
     std::string host, database_url, jwt_secret;
     int port = 3000, workers = 4, read_conns = 3, bcrypt_threads = 2;
+    int read_batch_us = 300;  // reads wait this long for company before going out (0 = send at once)
 };
 
 struct Request {
@@ -84,6 +85,8 @@ struct alignas(64) Worker {
     void maybe_free(uint32_t idx);
     void dispatch();
     void dispatch_writes();
+    struct Group;
+    void build_read(Group &g, std::vector<Query> &all);
     Detached serve(uint32_t idx, uint32_t gen, Request rq);
     void finish(uint32_t idx, uint32_t gen, Reply r);
 
@@ -131,9 +134,18 @@ struct alignas(64) Worker {
     std::deque<DbAwait *> waitq_, writeq_;
     struct Group {
         std::vector<DbAwait *> members;
+        struct Slot {
+            uint32_t res;  // index of the sent statement that answers this member query
+            int32_t ord;   // batched statement: the request's 0-based position in its arrays; -1: the whole result
+        };
+        std::vector<Slot> map;  // reads: one per member query, in member order
+        std::vector<std::pair<uint32_t, uint32_t>> batches;  // reads: (sent statement index, requests in it)
+        size_t sent = 0;        // reads: statements actually sent (after merging and batching)
     };
     static constexpr size_t kMaxReadGroup = 32;
     static constexpr size_t kMaxGroup = 48;  // stays well below 64 in-flight xids per transaction
+    bool timer_armed_ = false;
+    __kernel_timespec batch_ts_{};
     bool in_process_ = false;
     std::vector<uint32_t> deferred_;
     std::mutex done_mu_;

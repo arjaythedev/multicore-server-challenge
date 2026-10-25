@@ -16,11 +16,12 @@
 #include <string_view>
 
 #include "picohttpparser.h"
+#include "codec.h"
 #include "prof.h"
 
 namespace {
 
-enum Op : uint64_t { kAccept, kRecv, kSend, kPgIn, kPgOut, kEfd };
+enum Op : uint64_t { kAccept, kRecv, kSend, kPgIn, kPgOut, kEfd, kTimer };
 
 // user_data: op in bits 0..3, slot index in bits 4..35, generation in bits 36..63
 constexpr uint64_t pack(Op op, uint32_t idx, uint32_t gen = 0) {
@@ -31,6 +32,28 @@ constexpr uint32_t idx_of(uint64_t u) { return uint32_t((u >> 4) & 0xffffffffu);
 constexpr uint32_t gen_of(uint64_t u) { return uint32_t(u >> 36); }
 
 constexpr size_t kMaxRequest = 1 << 20;
+
+// Reads that can travel as one batched statement: the single statement, its batched twin, and the parameter kinds
+// (b = number, t = text) so that the arrays can be written as Postgres array literals.
+struct BatchSpec {
+    const char *single, *batch, *kinds;
+};
+constexpr BatchSpec kBatch[] = {
+    {"article_by_slug", "article_by_slug_b", "bt"},
+    {"comments_by_slug", "comments_by_slug_b", "bt"},
+    {"list_all", "list_all_b", "bbb"},
+    {"list_tag", "list_tag_b", "bbbt"},
+};
+inline int batch_of(const char *stmt) {
+    for (size_t i = 0; i < sizeof kBatch / sizeof kBatch[0]; i++)
+        if (strcmp(kBatch[i].single, stmt) == 0) return int(i);
+    return -1;
+}
+
+// Hand a buffer's storage back to the allocator once it has grown past a small size (clear() would keep it).
+inline void release_big(std::string &s) {
+    if (s.empty() && s.capacity() > 1024) std::string().swap(s);
+}
 
 const char *reason(int status) {
     switch (status) {
@@ -194,6 +217,7 @@ void Worker::on_recv(uint32_t idx, uint32_t gen, io_uring_cqe *cqe) {
     }
     if (!c.recv_active && !c.closing) arm_recv(idx);
     if (cqe->res > 0 && !c.closing) process(idx);
+    release_big(conns_[idx].in);
     maybe_free(idx);
 }
 
@@ -221,6 +245,10 @@ void Worker::on_send(uint32_t idx, uint32_t gen, int res) {
         c.out.insert(0, c.sendbuf);
         c.sendbuf.clear();
     }
+    // An idle keep-alive connection must not hold on to its largest response: with ~100k connections the retained
+    // capacity of sendbuf/out (swapped back and forth) added up to over a gigabyte.
+    release_big(c.sendbuf);
+    if (c.out.empty()) release_big(c.out);
     if (!c.out.empty()) {
         start_send(idx);
     } else if (c.close_after) {
@@ -353,7 +381,15 @@ void Worker::enqueue(DbAwait *a) {
         dispatch_writes();
     } else {
         waitq_.push_back(a);
-        dispatch();
+        // Hold the read briefly so concurrent requests share one segment (and identical statements merge).
+        if (cfg_.read_batch_us <= 0 || a->solo || waitq_.size() >= kMaxReadGroup) {
+            dispatch();
+        } else if (!timer_armed_) {
+            io_uring_sqe *s = sqe();
+            io_uring_prep_timeout(s, &batch_ts_, 0, 0);
+            io_uring_sqe_set_data64(s, pack(kTimer, 0));
+            timer_armed_ = true;
+        }
     }
 }
 
@@ -395,6 +431,86 @@ void Worker::dispatch_writes() {
     }
 }
 
+// Read segments shrink in two ways before they are sent:
+//  - requests of one kind that wait together (e.g. several article pages) go out as ONE batched statement whose
+//    parameters are arrays (see sql.h); the answer comes back in one result that is split by request position;
+//  - other requests that ask the very same question (same statement, same parameters, e.g. the capped count every list
+//    page needs) are answered by one statement.
+// Everything runs in one snapshot, and every request still gets its data from Postgres while it is being served.
+void Worker::build_read(Group &g, std::vector<Query> &all) {
+    constexpr size_t kN = sizeof kBatch / sizeof kBatch[0];
+    struct Open {
+        uint32_t at = 0;
+        std::vector<const Query *> qs;
+    };
+    uint32_t count[kN] = {};
+    for (DbAwait *m : g.members)
+        for (const Query &q : m->qs)
+            if (int b = batch_of(q.stmt); b >= 0) count[b]++;
+    Open open[kN];
+    bool is_open[kN] = {};
+    for (DbAwait *m : g.members) {
+        for (const Query &q : m->qs) {
+            int b = batch_of(q.stmt);
+            if (b >= 0 && count[b] >= 2) {
+                Open &o = open[b];
+                if (!is_open[b]) {
+                    is_open[b] = true;
+                    o.at = uint32_t(all.size());
+                    all.push_back(Query(kBatch[b].batch, std::vector<Param>{}));
+                }
+                uint32_t k = uint32_t(o.qs.size());
+                for (uint32_t i = 0; i < o.qs.size() && k == o.qs.size(); i++) {  // the same request twice: one row range
+                    bool same = true;
+                    for (size_t p = 0; p < q.params.size() && same; p++) same = o.qs[i]->params[p].v == q.params[p].v;
+                    if (same) k = i;
+                }
+                if (k == o.qs.size()) o.qs.push_back(&q);
+                g.map.push_back({o.at, int32_t(k)});
+                continue;
+            }
+            uint32_t at = uint32_t(all.size());
+            for (uint32_t i = 0; i < all.size(); i++) {
+                if (all[i].stmt != q.stmt || all[i].params.size() != q.params.size()) continue;
+                bool same = true;
+                for (size_t p = 0; p < q.params.size() && same; p++) same = all[i].params[p].v == q.params[p].v;
+                if (same) {
+                    at = i;
+                    break;
+                }
+            }
+            if (at == all.size()) all.push_back(q);
+            g.map.push_back({at, -1});
+        }
+    }
+    for (size_t b = 0; b < kN; b++) {
+        if (!is_open[b]) continue;
+        Open &o = open[b];
+        for (size_t p = 0; kBatch[b].kinds[p]; p++) {
+            const bool is_text = kBatch[b].kinds[p] == 't';
+            std::string lit = "{";
+            for (size_t i = 0; i < o.qs.size(); i++) {
+                if (i) lit += ',';
+                const std::string &v = *o.qs[i]->params[p].v;
+                if (!is_text) {
+                    lit += v;
+                    continue;
+                }
+                lit += '"';
+                for (char ch : v) {
+                    if (ch == '"' || ch == '\\') lit += '\\';
+                    lit += ch;
+                }
+                lit += '"';
+            }
+            lit += '}';
+            all[o.at].params.push_back(Param(lit));
+        }
+        g.batches.push_back({o.at, uint32_t(o.qs.size())});
+    }
+    g.sent = all.size();
+}
+
 // Hands queued segments to idle Postgres connections (one segment in flight per connection).
 void Worker::dispatch() {
     PROF_SCOPE(kPgSend);
@@ -432,7 +548,8 @@ void Worker::dispatch() {
                 waitq_.pop_front();
             }
         std::vector<Query> all;
-        for (DbAwait *m : g->members) all.insert(all.end(), m->qs.begin(), m->qs.end());
+        build_read(*g, all);
+        PROF_READ_GROUP(g->members.size(), all.size());
         if (!pg->send_segment(g, all)) {
             for (DbAwait *m : g->members) {
                 m->rows.ok = false;
@@ -462,6 +579,7 @@ void Worker::on_pg(uint32_t pg_idx) {
         std::unique_ptr<Group> g(static_cast<Group *>(s.tag));
         size_t total = 0;
         for (DbAwait *a : g->members) total += a->qs.size();
+        if (g->sent) total = g->sent;
         bool clean = !s.failed && s.res.size() == total;
         for (PGresult *r : s.res) {
             ExecStatusType st = PQresultStatus(r);
@@ -479,6 +597,45 @@ void Worker::on_pg(uint32_t pg_idx) {
             for (auto it = g->members.rbegin(); it != g->members.rend(); ++it) {
                 (*it)->solo = true;
                 q.push_front(*it);
+            }
+        } else if (g->sent) {  // read segment: members may share a result
+            auto set = std::make_shared<ResultSet>(std::move(s.res));
+            const bool whole = set->r.size() == g->sent;
+            // A batched result holds every request's rows, ordered by position; find where each request's rows start.
+            std::vector<std::vector<int>> starts(g->batches.size());
+            bool split_ok = whole;
+            for (size_t b = 0; b < g->batches.size() && split_ok; b++) {
+                PGresult *pr = set->r[g->batches[b].first];
+                std::vector<int> &st = starts[b];
+                st.assign(g->batches[b].second + 1, 0);
+                int prev = 0;
+                for (int i = 0, rows = PQntuples(pr); i < rows && split_ok; i++) {
+                    int ord = codec::be32(PQgetvalue(pr, i, 0)) - 1;
+                    if (ord < prev || ord >= int(g->batches[b].second)) split_ok = false;
+                    else st[size_t(ord) + 1]++, prev = ord;
+                }
+                for (size_t k = 1; k < st.size(); k++) st[k] += st[k - 1];
+            }
+            size_t pos = 0;
+            for (DbAwait *a : g->members) {
+                size_t n = a->qs.size();
+                if (split_ok)
+                    for (size_t i = 0; i < n; i++) {
+                        const Group::Slot &sl = g->map[pos + i];
+                        PGresult *pr = set->r[sl.res];
+                        if (sl.ord < 0) {
+                            a->rows.r.push_back(Res(pr));
+                            continue;
+                        }
+                        size_t b = 0;
+                        while (g->batches[b].first != sl.res) b++;
+                        int lo = starts[b][size_t(sl.ord)];
+                        a->rows.r.push_back(Res(pr, lo, starts[b][size_t(sl.ord) + 1] - lo, 1));
+                    }
+                a->rows.shared = set;
+                a->rows.ok = true;
+                pos += n;
+                ready.push_back(a->h);
             }
         } else {
             size_t pos = 0;
@@ -564,6 +721,8 @@ void Worker::run() {
                               io_uring_buf_ring_mask(kBufCount), int(i));
     io_uring_buf_ring_advance(br_, int(kBufCount));
 
+    batch_ts_.tv_sec = cfg_.read_batch_us / 1000000;
+    batch_ts_.tv_nsec = (cfg_.read_batch_us % 1000000) * 1000L;
     arm_accept();
     arm_efd();
 #ifdef PROF
@@ -604,6 +763,10 @@ void Worker::run() {
                 if (pg.flush()) arm_pg_out(idx_of(u));
                 break;
             }
+            case kTimer:
+                timer_armed_ = false;
+                dispatch();
+                break;
             case kEfd:
                 on_efd();
                 if (!(cqe->flags & IORING_CQE_F_MORE)) arm_efd();

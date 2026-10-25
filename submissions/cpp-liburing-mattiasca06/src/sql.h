@@ -11,8 +11,8 @@
     "u.username, u.bio, u.image, "                                                                                    \
     "EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = a.author_id) AS following "      \
     "FROM (" page ") a JOIN users u ON u.id = a.author_id "                                                           \
-    "CROSS JOIN LATERAL (SELECT ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id "            \
-    "WHERE at.article_id = a.id ORDER BY t.name) AS tag_list) tg ORDER BY a.id DESC"
+    "CROSS JOIN LATERAL (SELECT ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) "                     \
+    "FROM article_tags at WHERE at.article_id = a.id ORDER BY 1) AS tag_list) tg ORDER BY a.id DESC"
 
 #define ARTICLE_FULL_SELECT ARTICLE_FULL_COLS "FROM articles a JOIN users u ON u.id = a.author_id "
 
@@ -24,6 +24,32 @@
     "EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1) AS favorited, "                  \
     "u.username, u.bio, u.image, "                                                                                    \
     "EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = a.author_id) AS following "
+
+// ---- batched read variants ----
+// Requests that wait in the same read segment and ask the same kind of question go out as ONE statement: every
+// parameter becomes an array and the result carries the request's position (ord, 1-based) as its first column, rows
+// of one request contiguous and in the request's own order. Work that does not depend on the viewer (the page of
+// articles with tags/counts/authors, the comments of a slug) is computed once per distinct page/slug inside this
+// one execution; the per-viewer flags (favorited, following) are computed per request. Nothing outlives the execution.
+#define REQ(types, cols) "WITH req AS (SELECT * FROM unnest(" types ") WITH ORDINALITY AS r(" cols ", ord)) "
+
+#define TAG_LIST_COL                                                                                                  \
+    "ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at "                           \
+    "WHERE at.article_id = a.id ORDER BY 1) AS tag_list"
+
+// pages(d): the viewer-independent part of a list page. `d` yields one row per distinct page.
+#define PAGE_BATCH(keys, from_where)                                                                                  \
+    ", pg AS MATERIALIZED (SELECT d.*, a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, "            \
+    "a.author_id, " TAG_LIST_COL ", (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count, " \
+    "u.username, u.bio, u.image FROM (SELECT DISTINCT " keys " FROM req) d CROSS JOIN LATERAL ("                      \
+    "SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, a.author_id FROM articles a "           \
+    from_where ") a JOIN users u ON u.id = a.author_id) "
+
+#define PAGE_BATCH_OUT(join_on)                                                                                       \
+    "SELECT r.ord::int4, pg.id, pg.slug, pg.title, pg.description, pg.created_at, pg.updated_at, pg.tag_list, "       \
+    "pg.favorites_count, EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = pg.id AND f.user_id = r.v) AS "       \
+    "favorited, pg.username, pg.bio, pg.image, EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.v AND "      \
+    "fo.followee_id = pg.author_id) AS following FROM req r JOIN pg ON " join_on " ORDER BY r.ord, pg.id DESC"
 
 #define SLUGIFY(x) "trim(both '-' from lower(regexp_replace(" x ", '[^A-Za-z0-9]+', '-', 'g')))"
 
@@ -154,6 +180,39 @@ inline constexpr Stmt kStatements[] = {
      "AND c.author_id = $3 RETURNING 1) "
      "SELECT (SELECT count(*) FROM d), (SELECT c.author_id FROM comments c JOIN articles a ON a.id = c.article_id "
      "WHERE c.id = $1 AND a.slug = $2)"},
+
+    // Batched variants (see above). Same parameters as the single versions, each one an array.
+    {"article_by_slug_b",  // v bigint[], slug text[]
+     REQ("$1::bigint[], $2::text[]", "v, slug")
+     ", b AS MATERIALIZED (SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at, a.author_id, "
+     TAG_LIST_COL ", (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count, "
+     "u.username, u.bio, u.image FROM (SELECT DISTINCT slug FROM req) d JOIN articles a ON a.slug = d.slug "
+     "JOIN users u ON u.id = a.author_id) "
+     "SELECT r.ord::int4, b.id, b.slug, b.title, b.description, b.body, b.created_at, b.updated_at, b.tag_list, "
+     "b.favorites_count, EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = b.id AND f.user_id = r.v) AS favorited, "
+     "b.username, b.bio, b.image, EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.v AND "
+     "fo.followee_id = b.author_id) AS following FROM req r JOIN b ON b.slug = r.slug ORDER BY r.ord"},
+    {"comments_by_slug_b",  // v bigint[], slug text[]
+     REQ("$1::bigint[], $2::text[]", "v, slug")
+     ", cm AS MATERIALIZED (SELECT d.slug, c.id, c.body, c.created_at, c.updated_at, c.author_id, c.username, c.bio, "
+     "c.image FROM (SELECT DISTINCT slug FROM req) d JOIN articles a ON a.slug = d.slug LEFT JOIN LATERAL ("
+     "SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id, u.username, u.bio, u.image FROM comments c "
+     "JOIN users u ON u.id = c.author_id WHERE c.article_id = a.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c "
+     "ON true) "
+     "SELECT r.ord::int4, cm.id, cm.body, cm.created_at, cm.updated_at, cm.username, cm.bio, cm.image, "
+     "(cm.id IS NOT NULL AND EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.v AND "
+     "fo.followee_id = cm.author_id)) AS following FROM req r JOIN cm ON cm.slug = r.slug "
+     "ORDER BY r.ord, cm.created_at DESC NULLS LAST, cm.id DESC"},
+    {"list_all_b",  // v bigint[], limit bigint[], offset bigint[]
+     REQ("$1::bigint[], $2::bigint[], $3::bigint[]", "v, lm, ofs")
+     PAGE_BATCH("lm, ofs", "ORDER BY a.id DESC LIMIT d.lm OFFSET d.ofs")
+     PAGE_BATCH_OUT("pg.lm = r.lm AND pg.ofs = r.ofs")},
+    {"list_tag_b",  // v bigint[], limit bigint[], offset bigint[], tag text[]
+     REQ("$1::bigint[], $2::bigint[], $3::bigint[], $4::text[]", "v, lm, ofs, tag")
+     PAGE_BATCH("lm, ofs, tag",
+                "WHERE a.id IN (SELECT at.article_id FROM article_tags at WHERE at.tag_id = "
+                "(SELECT t.id FROM tags t WHERE t.name = d.tag) ORDER BY at.article_id DESC LIMIT d.lm OFFSET d.ofs)")
+     PAGE_BATCH_OUT("pg.lm = r.lm AND pg.ofs = r.ofs AND pg.tag = r.tag")},
 
     // POST /articles in one segment: the id comes from the sequence, later statements use currval() of this session.
     {"article_create",  // $1 title, $2 author, $3 description, $4 body

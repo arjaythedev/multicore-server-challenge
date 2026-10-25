@@ -2,6 +2,7 @@
 // Each worker keeps a stack of phases and charges TSC cycles to the innermost one (exclusive time).
 // SIGUSR1 prints the delta since the previous SIGUSR1: CPU microseconds per request, split by phase.
 #pragma once
+#include <cstddef>
 #include <cstdint>
 
 #ifdef PROF
@@ -45,6 +46,7 @@ extern thread_local Counters *tl;
 void attach();                 // registers this thread's counters (call at the top of the event loop)
 void start_dumper();           // thread printing a report on every SIGUSR1; call before creating threads
 void bcrypt_done(uint64_t cyc, int n);
+void read_group(size_t members, size_t sent);  // one read segment: requests in it, statements actually sent
 
 inline void enter(Phase p) {
     if (!tl) return;
@@ -73,7 +75,9 @@ inline void request_done() {
 #define PROF_CAT(a, b) PROF_CAT2(a, b)
 #define PROF_SCOPE(p) ::prof::Scope PROF_CAT(prof_scope_, __LINE__)(::prof::p)
 #define PROF_REQUEST_DONE() ::prof::request_done()
+#define PROF_READ_GROUP(m, s) ::prof::read_group((m), (s))
 #else
+#define PROF_READ_GROUP(m, s) ((void)0)
 #define PROF_SCOPE(p) ((void)0)
 #define PROF_REQUEST_DONE() ((void)0)
 #endif

@@ -63,6 +63,7 @@ int main() {
     cfg.jwt_secret = env("JWT_SECRET", "multicore-server-challenge");
     cfg.workers = atoi(env("WORKERS", "4"));
     cfg.read_conns = atoi(env("DB_CONNS", "3"));
+    cfg.read_batch_us = atoi(env("READ_BATCH_US", "0"));
     cfg.bcrypt_threads = atoi(env("BCRYPT_THREADS", std::to_string(std::clamp(int(std::thread::hardware_concurrency()) / 2, 2, 4)).c_str()));
     // Same-box Postgres: skip libpq's default TLS negotiation (an explicit sslmode in the URL still wins).
     if (pg_is_local(cfg.database_url.c_str())) setenv("PGSSLMODE", "disable", 0);
