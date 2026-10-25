@@ -24,7 +24,7 @@
 namespace {
 
 constexpr int kMaxLanes = 4;
-constexpr auto kCollectWindow = std::chrono::milliseconds(20);
+constexpr auto kCollectWindow = std::chrono::milliseconds(100);
 
 struct Lane {
     uint32_t P[18];

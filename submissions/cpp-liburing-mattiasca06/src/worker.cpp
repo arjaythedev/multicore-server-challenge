@@ -735,7 +735,7 @@ void Worker::run() {
 
     // The ring is created here so that this thread is its single issuer.
     io_uring_params params{};
-    params.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
+    params.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_COOP_TASKRUN;
     int rc = io_uring_queue_init_params(4096, &ring_, &params);
     if (rc < 0) {
         fprintf(stderr, "io_uring_queue_init_params: %s\n", strerror(-rc));
