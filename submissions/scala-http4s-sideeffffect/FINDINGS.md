@@ -108,6 +108,25 @@ G1 costs 4-7% more CPU per request with a ~30% worse tail, and more heap doesn't
 and concurrent marking threads compete with Postgres for the same cores, while Parallel's short stop-the-world young
 collections don't.
 
+**At what heap size would G1, ZGC or Shenandoah win? None, on this workload.** Profiling with the CPU split by thread
+(7,500 users) separates what more heap can shrink (the collector's own threads: fewer cycles) from what it can't (the
+barriers each collector adds to the application's own code, on every reference store for G1 or load for ZGC and
+Shenandoah):
+
+| GC | app CPU µs/req | of which application threads | of which GC threads |
+|---|---|---|---|
+| **Parallel** (45%) | **479** | 464 | 12 |
+| G1 (45%) | 515 | 491 | 22 |
+| ZGC (60%) | 542 | 496 | 44 |
+| Shenandoah, generational (60%) | 589 | ~513 | ~73 |
+
+Even with an infinite heap, so no GC-thread time at all, their application threads alone cost more than Parallel's
+total: G1 by 12 µs (within run-to-run noise, so a tie at best), ZGC by 17, Shenandoah by 34. They would win on a
+different axis, the **live set**: Parallel's full collection is stop-the-world over everything long-lived, which here
+is mostly Ember's ~35 KB per open connection. At around 100,000+ open connections (several GB live) a full GC would
+take seconds and break p99, and a concurrent collector would win on latency despite the CPU. This server runs out of
+CPU long before that (its GC threads use 2.6% of the CPU, and the tail shows no long pauses).
+
 ### Batching (the DataLoader pattern, with fs2)
 
 The two top entries merge concurrent same-kind reads into one statement. Here that is `Batcher`: a request puts its
