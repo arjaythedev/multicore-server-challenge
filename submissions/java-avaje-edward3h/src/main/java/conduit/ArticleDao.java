@@ -31,6 +31,9 @@ public interface ArticleDao extends TransactionalDAO<ArticleDao> {
     // Every article query first picks the ids it will return (the "page" CTE, the same rows and order as the
     // reference SQL's ORDER_PAGE), then joins one aggregate of those articles' tags. That replaces a correlated
     // tag subquery per article, which was the most expensive part of a list in Postgres.
+    //
+    // The CTE is referenced twice (here and in the final join), so Postgres 18 materialises it anyway: EXPLAIN
+    // gives the same plan with and without MATERIALIZED. The keyword only makes that intent explicit.
 
     String TAGS = """
             , tg AS (SELECT at.article_id, array_agg(t.name ORDER BY t.name) AS names
