@@ -61,6 +61,7 @@ struct PgConn {
     PGconn *c = nullptr;
     int sock = -1;
     bool want_out = false;  // one-shot POLLOUT armed
+    bool in_armed = false;  // one-shot POLLIN armed
     bool dead = false;
     // One entry per pipeline segment in flight (FIFO); `tag` is owned by the caller.
     struct Seg {

@@ -99,9 +99,14 @@ void Worker::arm_recv(uint32_t idx) {
     c.recv_active = true;
 }
 
+// One-shot (level-checked at arm time) rather than multishot: a multishot poll can miss data that was already
+// readable, which left requests waiting forever. Armed whenever a segment is in flight.
 void Worker::arm_pg(uint32_t pg_idx) {
+    PgConn &pg = *pgs_[pg_idx];
+    if (pg.in_armed) return;
+    pg.in_armed = true;
     io_uring_sqe *s = sqe();
-    io_uring_prep_poll_multishot(s, pgs_[pg_idx]->sock, POLLIN);
+    io_uring_prep_poll_add(s, pg.sock, POLLIN);
     io_uring_sqe_set_data64(s, pack(kPgIn, pg_idx));
 }
 
@@ -401,11 +406,24 @@ void Worker::dispatch() {
             break;
         }
         if (!pg) break;
-        DbAwait *a = waitq_.front();
+        // Natural batching: everything that queued while the connections were busy goes out as one segment
+        // (one Sync, one implicit read-only transaction).
+        auto *g = new Group;
+        g->members.push_back(waitq_.front());
         waitq_.pop_front();
-        if (!pg->send_segment(a, a->qs)) {
-            a->rows.ok = false;
-            failed.push_back(a);
+        if (!g->members[0]->solo)
+            while (!waitq_.empty() && !waitq_.front()->solo && g->members.size() < kMaxReadGroup) {
+                g->members.push_back(waitq_.front());
+                waitq_.pop_front();
+            }
+        std::vector<Query> all;
+        for (DbAwait *m : g->members) all.insert(all.end(), m->qs.begin(), m->qs.end());
+        if (!pg->send_segment(g, all)) {
+            for (DbAwait *m : g->members) {
+                m->rows.ok = false;
+                failed.push_back(m);
+            }
+            delete g;
             continue;
         }
         if (pg->flush()) arm_pg_out(pi);
@@ -419,13 +437,6 @@ void Worker::on_pg(uint32_t pg_idx) {
     std::vector<std::coroutine_handle<>> ready;
     const bool is_write = pg_idx == uint32_t(cfg_.read_conns);
     for (PgConn::Seg &s : done) {
-        if (!is_write) {
-            auto *a = static_cast<DbAwait *>(s.tag);
-            a->rows.r = std::move(s.res);
-            a->rows.ok = !s.failed;
-            ready.push_back(a->h);
-            continue;
-        }
         std::unique_ptr<Group> g(static_cast<Group *>(s.tag));
         size_t total = 0;
         for (DbAwait *a : g->members) total += a->qs.size();
@@ -440,11 +451,12 @@ void Worker::on_pg(uint32_t pg_idx) {
                 a->rows.ok = false;
                 ready.push_back(a->h);
             }
-        } else if (!clean && g->members.size() > 1) {  // the group rolled back: replay each request alone
+        } else if (!clean && g->members.size() > 1) {  // the group failed (writes: rolled back): replay each alone
             for (PGresult *r : s.res) PQclear(r);
+            std::deque<DbAwait *> &q = is_write ? writeq_ : waitq_;
             for (auto it = g->members.rbegin(); it != g->members.rend(); ++it) {
                 (*it)->solo = true;
-                writeq_.push_front(*it);
+                q.push_front(*it);
             }
         } else {
             size_t pos = 0;
@@ -525,7 +537,6 @@ void Worker::run() {
 
     arm_accept();
     arm_efd();
-    for (uint32_t i = 0; i < pgs_.size(); i++) arm_pg(i);
 
     io_uring_cqe *cqes[256];
     for (;;) {
@@ -546,8 +557,8 @@ void Worker::run() {
             case kRecv: on_recv(idx_of(u), gen_of(u), cqe); break;
             case kSend: on_send(idx_of(u), gen_of(u), cqe->res); break;
             case kPgIn:
+                pgs_[idx_of(u)]->in_armed = false;
                 on_pg(idx_of(u));
-                if (!(cqe->flags & IORING_CQE_F_MORE)) arm_pg(idx_of(u));
                 break;
             case kPgOut: {
                 PgConn &pg = *pgs_[idx_of(u)];
@@ -562,5 +573,12 @@ void Worker::run() {
             }
         }
         io_uring_cq_advance(&ring_, n);
+        // libpq may have read results into its own buffer while sending; no socket event follows for those.
+        for (uint32_t i = 0; i < pgs_.size(); i++) {
+            PgConn &pg = *pgs_[i];
+            if (pg.dead || pg.inflight.empty()) continue;
+            if (!PQisBusy(pg.c)) on_pg(i);
+            if (!pg.inflight.empty()) arm_pg(i);
+        }
     }
 }

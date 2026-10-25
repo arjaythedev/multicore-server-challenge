@@ -132,6 +132,7 @@ struct alignas(64) Worker {
     struct Group {
         std::vector<DbAwait *> members;
     };
+    static constexpr size_t kMaxReadGroup = 32;
     static constexpr size_t kMaxGroup = 48;  // stays well below 64 in-flight xids per transaction
     bool in_process_ = false;
     std::vector<uint32_t> deferred_;
