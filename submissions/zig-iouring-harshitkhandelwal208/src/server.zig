@@ -18,6 +18,7 @@ const Buf = @import("buf.zig").Buf;
 const gpa = @import("buf.zig").gpa;
 const Scratch = @import("scratch.zig").Scratch;
 
+const plan = @import("plan.zig");
 const log = std.log.scoped(.server);
 
 pub const Config = struct {
@@ -30,6 +31,11 @@ pub const Config = struct {
     pg_write: u32,
     pg_depth: u32, // batches in flight per connection
     batch_max: u32, // reads of one kind that may run as one statement (1 = no batching)
+    read_window_us: u32, // staged reads wait up to this long for company before they are sent (0 = send at once)
+    read_hold_min: u32, // ... unless this many are staged already
+    plan_min: u32, // this many staged reads (of any kind) are answered by the two-phase planner instead of per kind (0 = never)
+    plan_max: u32, // reads per planned batch
+    plan_split: bool, // share the staged reads over the connections with room, instead of one plan taking up to plan_max
     bc_threads: u32,
     bc_lanes: u32,
     bc_wait_ms: u32,
@@ -103,7 +109,7 @@ const Conn = struct {
 const max_pend = http.max_body + http.max_head + 4096;
 
 // user_data layout: tag (8) | gen (24) | index (32)
-const Tag = enum(u8) { accept = 1, recv, poll, send, pg_recv, pg_send, event, close, shut, timer };
+const Tag = enum(u8) { accept = 1, recv, poll, send, pg_recv, pg_send, event, close, shut, timer, hold };
 
 inline fn ud(tag: Tag, gen: u32, idx: u32) u64 {
     return (@as(u64, @backingInt(tag)) << 56) | (@as(u64, gen & 0xffffff) << 32) | idx;
@@ -169,7 +175,7 @@ const Fifo = struct {
 
 /// A read request waiting to be sent: its parameters, kept until a connection has room (so same-kind requests can be
 /// merged into one statement).
-const StageItem = struct { r: *Req, seq: u64, viewer: i64, limit: i32, offset: i32, text: []u8, single_only: bool = false };
+pub const StageItem = struct { r: *Req, seq: u64, viewer: i64, limit: i32, offset: i32, text: []u8, single_only: bool = false };
 
 pub const ReadArgs = struct { viewer: i64 = 0, limit: i32 = 0, offset: i32 = 0, text: []const u8 = "" };
 
@@ -232,7 +238,7 @@ fn isBatchable(k: sql.Stmt) bool {
     return false;
 }
 
-const max_batch = 64;
+const max_batch = 256;
 
 /// One write request inside a group commit: its encoded statements (with their own trailing Sync, used if the group
 /// has to be retried member by member) and how many statements it contributes.
@@ -296,6 +302,9 @@ pub const Worker = struct {
     rc_fd: i32 = -1, // a connected, prepared socket waiting for the loop to adopt (atomic)
     partials: std.ArrayList(i32) = .empty,
     tick: linux.kernel_timespec = .{ .sec = 1, .nsec = 0 },
+    hold_ts: linux.kernel_timespec = .{ .sec = 0, .nsec = 0 },
+    hold_armed: bool = false,
+    staged_since: u64 = 0, // nowNs() when `staged` last went from 0
     stats: struct { reqs: u64 = 0, pg_batches: u64 = 0, fifo_max: usize = 0, batched_reqs: u64 = 0, batches: u64 = 0 } = .{},
 
     // ---- small helpers ----------------------------------------------------------------------
@@ -774,7 +783,8 @@ pub const Worker = struct {
             switch (token & 3) {
                 0 => api.onPg(self, @ptrFromInt(token), batch),
                 1 => self.onBatchReply(@ptrFromInt(token & ~@as(usize, 3)), batch),
-                else => self.onGroupReply(p, @ptrFromInt(token & ~@as(usize, 3)), batch),
+                2 => self.onGroupReply(p, @ptrFromInt(token & ~@as(usize, 3)), batch),
+                else => self.onPlanReply(p, @ptrFromInt(token & ~@as(usize, 3)), batch),
             }
             p.rs.done();
         }
@@ -892,13 +902,18 @@ pub const Worker = struct {
                 if (!rec.fanout) for (rec.items[0..rec.n]) |it| gpa.free(it.text);
                 gpa.destroy(rec);
             },
-            else => {
+            2 => {
                 const rec: *WRec = @ptrFromInt(token & ~@as(usize, 3));
                 for (rec.m[0..rec.n]) |mem| {
                     api.onPgFailure(self, mem.r);
                     gpa.free(mem.bytes);
                 }
                 gpa.destroy(rec);
+            },
+            else => {
+                const rec: *plan.Plan = @ptrFromInt(token & ~@as(usize, 3));
+                for (rec.items) |it| api.onPgFailure(self, it.r);
+                plan.destroy(rec, true);
             },
         }
     }
@@ -909,6 +924,7 @@ pub const Worker = struct {
     pub fn readSubmit(self: *Worker, stmt: sql.Stmt, r: *Req, a: ReadArgs) void {
         const text = gpa.dupe(u8, a.text) catch return api.onPgFailure(self, r);
         self.seq += 1;
+        if (self.staged == 0) self.staged_since = sys.nowNs();
         self.stages[@backingInt(stmt)].push(.{ .r = r, .seq = self.seq, .viewer = a.viewer, .limit = a.limit, .offset = a.offset, .text = text });
         self.staged += 1;
     }
@@ -931,6 +947,22 @@ pub const Worker = struct {
     /// Send staged reads to connections with room, oldest kind first.
     pub fn flushReads(self: *Worker) void {
         if (self.staged == 0) return;
+        const window_ns = @as(u64, self.shared.cfg.read_window_us) * 1000;
+        if (window_ns != 0 and self.staged < self.shared.cfg.read_hold_min) {
+            // Young and few: wait for company. One timeout wakes the loop when the oldest has waited the window out.
+            const waited = sys.nowNs() -| self.staged_since;
+            if (waited < window_ns) {
+                if (!self.hold_armed) {
+                    const left = window_ns - waited;
+                    self.hold_ts = .{ .sec = @intCast(left / 1_000_000_000), .nsec = @intCast(left % 1_000_000_000) };
+                    const e = self.sqe();
+                    e.prep_timeout(&self.hold_ts, 0, 0);
+                    e.user_data = ud(.hold, 0, 0);
+                    self.hold_armed = true;
+                }
+                return;
+            }
+        }
         const batch_max = @min(self.shared.cfg.batch_max, max_batch);
         while (self.staged != 0) {
             var any_alive = false;
@@ -946,6 +978,13 @@ pub const Worker = struct {
                 }
                 self.staged = 0;
                 return;
+            }
+            if (self.shared.cfg.plan_min != 0 and self.staged >= self.shared.cfg.plan_min) {
+                switch (self.startPlan()) {
+                    .started => continue,
+                    .no_conn => return,
+                    .declined => {},
+                }
             }
             const p = self.bestReadConn() orelse return;
             // oldest waiting kind
@@ -1028,6 +1067,85 @@ pub const Worker = struct {
                 e.sync();
                 self.pgPush(p, @intFromPtr(rec) | 1, self.enc.slice());
             }
+        }
+    }
+
+    const PlanStart = enum { started, no_conn, declined };
+
+    /// Answer every staged read (all kinds) with one planned batch: see plan.zig.
+    fn startPlan(self: *Worker) PlanStart {
+        const p = self.bestReadConn() orelse return .no_conn;
+        var taken: std.ArrayList(plan.Taken) = .empty;
+        defer taken.deinit(gpa);
+        var kept: std.ArrayList(plan.Taken) = .empty; // single-only retries stay on the per-kind path
+        defer kept.deinit(gpa);
+        // How many reads this plan takes. Without a split it takes up to the cap, so one connection gets the whole backlog
+        // and the others sit idle; with a split the staged reads are shared over the connections that have room.
+        const cap: usize = self.shared.cfg.plan_max;
+        var want: usize = cap;
+        if (self.shared.cfg.plan_split) {
+            const free = self.freeReadConns();
+            want = std.math.clamp((self.staged + free - 1) / free, @as(usize, self.shared.cfg.plan_min), cap);
+        }
+        // Oldest first across every kind: a capped plan must not leave the older reads of a late-arriving kind behind.
+        while (taken.items.len < want) {
+            var best: ?usize = null;
+            var best_seq: u64 = std.math.maxInt(u64);
+            for (&self.stages, 0..) |*st, k| {
+                if (st.len != 0 and st.front().seq < best_seq) {
+                    best_seq = st.front().seq;
+                    best = k;
+                }
+            }
+            const k = best orelse break;
+            const stmt: sql.Stmt = @fromBackingInt(@intCast(k));
+            const it = self.stages[k].pop();
+            const t = plan.Taken{ .stmt = stmt, .it = it };
+            if (it.single_only) kept.append(gpa, t) catch return self.unstage(&taken, &kept) else taken.append(gpa, t) catch return self.unstage(&taken, &kept);
+        }
+        if (taken.items.len < self.shared.cfg.plan_min) return self.unstage(&taken, &kept);
+        const rec = plan.start(self, taken.items) orelse return self.unstage(&taken, &kept);
+        for (kept.items) |t| self.stages[@backingInt(t.stmt)].push(t.it);
+        self.staged -= taken.items.len;
+        self.pgPush(p, @intFromPtr(rec) | 3, self.enc.slice());
+        return .started;
+    }
+
+    /// Read connections that are alive and have room for another batch.
+    fn freeReadConns(self: *Worker) usize {
+        var n: usize = 0;
+        for (self.pgs[0..self.n_read]) |*p| {
+            if (p.alive and p.depth < self.shared.cfg.pg_depth) n += 1;
+        }
+        return @max(n, 1);
+    }
+
+    /// Put taken reads back on their stages (the plan was not started).
+    fn unstage(self: *Worker, taken: *std.ArrayList(plan.Taken), kept: *std.ArrayList(plan.Taken)) PlanStart {
+        for (taken.items) |t| self.stages[@backingInt(t.stmt)].push(t.it);
+        for (kept.items) |t| self.stages[@backingInt(t.stmt)].push(t.it);
+        return .declined;
+    }
+
+    fn onPlanReply(self: *Worker, p: *PgConn, rec: *plan.Plan, batch: []const u8) void {
+        switch (plan.onReply(self, rec, batch)) {
+            .send_b => self.pgPush(p, @intFromPtr(rec) | 3, self.enc.slice()),
+            .done => {
+                self.stats.batched_reqs += rec.items.len;
+                self.stats.batches += 1;
+                plan.destroy(rec, true);
+            },
+            .failed => {
+                // Run every member alone: a request that cannot be answered fails by itself instead of taking the batch down.
+                log.warn("planned batch failed; retrying its {d} requests one by one", .{rec.items.len});
+                for (rec.items, rec.stmts) |it, stmt| {
+                    var again = it;
+                    again.single_only = true;
+                    self.stages[@backingInt(stmt)].push(again);
+                    self.staged += 1;
+                }
+                plan.destroy(rec, false);
+            },
         }
     }
 
@@ -1260,6 +1378,7 @@ pub const Worker = struct {
             .pg_recv => self.onPgRecv(idx, cqe.res),
             .pg_send => self.onPgSend(idx, cqe.res),
             .event => self.onEvent(),
+            .hold => self.hold_armed = false,
             .timer => {
                 if (!self.accept_live) self.armAccept();
                 self.pgReconnect();

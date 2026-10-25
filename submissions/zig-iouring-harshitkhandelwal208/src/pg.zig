@@ -129,6 +129,7 @@ pub const session_params = [_][2][]const u8{
     .{ "client_encoding", "UTF8" },
     .{ "plan_cache_mode", "force_generic_plan" },
     .{ "jit", "off" },
+    .{ "enable_memoize", "off" },
     .{ "max_parallel_workers_per_gather", "0" },
     .{ "client_min_messages", "warning" },
     .{ "application_name", "conduit-zig" },
@@ -443,6 +444,14 @@ pub const Enc = struct {
 
     pub fn pInt8Array(self: *Enc, items: []const i64) void {
         const b = self.b;
+        if (items.len == 0) {
+            b.putInt(i32, 12, .big);
+            b.putInt(i32, 0, .big); // ndim
+            b.putInt(i32, 0, .big);
+            b.putInt(i32, oid.int8, .big);
+            self.nparams += 1;
+            return;
+        }
         const total: i32 = @intCast(20 + items.len * 12);
         b.ensure(4 + @as(usize, @intCast(total)));
         b.putInt(i32, total, .big);

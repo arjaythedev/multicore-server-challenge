@@ -39,7 +39,8 @@ binary is about 670 KB.
 - bcrypt runs on its own threads at normal priority (`BCRYPT_THREADS`, default CPUs/4 in total). A login waits up to
   250 ms (`BCRYPT_WAIT_MS`) for company, then up to four hashes run interleaved; a job that waited 15 s is dropped.
   At a lower priority the threads starve while Postgres saturates the CPUs and logins time out.
-- At saturation Postgres uses ~70% of the CPU and this process ~25% (about a third of that bcrypt).
+- At the saturation point measured on the rig (one Postgres thread, one server thread; see Results), the Postgres thread is
+  at 80–90% and the server thread at about half: the batch planner moves the limit to Postgres CPU per request.
 
 ## Optimizations and why
 
@@ -53,15 +54,15 @@ binary is about 670 KB.
   a list and its capped count are one statement (`WITH c AS (count) SELECT … LEFT JOIN LATERAL (page)`) so an empty page
   still carries the count; follow / comment / delete / update fold lookup and write into one CTE; comment threads (up to
   100 rows) test "does the viewer follow this author" against the viewer's followee set hashed once (-27% on a hot thread).
-- **Reads are batched, and what requests share is done once.** Reads waiting for a Postgres connection at the same moment
-  go out as one statement (`unnest(...) WITH ORDINALITY`). There is no timer and no added wait: at light load a batch has one
-  request, as Postgres saturates requests queue and batches grow (up to `BATCH_MAX`, 64). Inside a batch the capped count
-  of each distinct filter (the global one is the same for everybody) and the tags / favorite count / author of each distinct
-  article are computed once; each request's own page of ids and its favorited/following flags are computed per request.
-  `GET /api/tags` is one execution whose rows answer every waiting request. Nothing is kept after the statement: its rows are
-  rendered into the responses of the requests that were waiting for it. If a batched statement fails, its requests are
-  re-run one by one. (On a 32-request global-list batch: 54 µs per request, against 118 µs for the same 32 as separate
-  per-request statements.)
+- **Reads are batched by a two-phase planner, and what requests share is done once.** A waiting read is held for up to
+  150 ms (`READ_WINDOW_US`) for company, or until 8,192 reads are waiting. The batch (at most 2,048 reads, oldest first)
+  goes out as a plan: phase A runs one statement per kind of request present, each over the batch's distinct keys (capped
+  counts and page rows, `unnest(...) WITH ORDINALITY`); phase B enriches the union of the articles phase A returned, once
+  each (author, favourite count, tag names), and resolves each viewer's favourited / following flags with one `= ANY` range
+  scan per viewer. Every request's reply is assembled from those rows, in the layout its handler already reads. Nothing
+  outlives its plan. If a plan fails, its requests are re-run one by one. Reads that a plan does not take (fewer than
+  `PLAN_MIN`) use the per-kind path with `BATCH_MAX`. `GET /api/tags` is one execution whose rows answer every waiting
+  request.
 - **Group commit.** A write connection runs one transaction at a time; writes that arrive while it commits wait and then
   go out together as one transaction, one WAL flush for all of them. Every response is sent after its commit. A failed group
   rolled back as a whole, so each member is retried alone (nothing is replayed after a commit). Sign-ups and profile
@@ -81,8 +82,15 @@ binary is about 670 KB.
 
 `DATABASE_URL`, `JWT_SECRET`, `HOST`, `PORT` as in SPEC.md. Optional: `WORKERS` (default CPUs/4), `PROCS` (default = `WORKERS`;
 `1` runs the workers as threads of one process), `DB_CONNS` (default CPUs, max 95), `DB_WRITE_CONNS`, `PG_DEPTH` (4),
-`BATCH_MAX` (64; `1` turns batching off), `BCRYPT_THREADS`, `BCRYPT_LANES` (4), `BCRYPT_WAIT_MS` (250), `STATS=1`.
-Test hooks (off by default): `NO_PBUF`, `TEST_FAIL_GROUPS`, `TEST_FAIL_BATCHES`.
+`BCRYPT_THREADS`, `BCRYPT_LANES` (4), `BCRYPT_WAIT_MS` (250), `STATS=1`.
+
+Read batching: `READ_WINDOW_US` (150000: longest a read waits for company), `READ_HOLD_MIN` (8192: a plan goes out at once
+when this many reads are waiting), `PLAN_MIN` (16: smallest batch the planner takes; `0` turns the planner off, leaving
+per-kind batches only), `PLAN_MAX` (2048: reads per plan), `PLAN_SPLIT` (0: when `1`, the waiting reads are shared over the
+connections that have room instead of one plan taking up to `PLAN_MAX`; measured not to help, see Results), `BATCH_MAX`
+(64: reads of one kind per statement on the per-kind path; `1` turns that batching off).
+
+Test hooks (off by default): `NO_PBUF`, `TEST_FAIL_GROUPS`, `TEST_FAIL_BATCHES` (poisons per-kind batches and planner plans).
 
 ## Tests
 
@@ -92,6 +100,8 @@ Test hooks (off by default): `NO_PBUF`, `TEST_FAIL_GROUPS`, `TEST_FAIL_BATCHES`.
   (deep and out-of-range offsets, the heaviest followers): thousands of cases, no differences (`zig build sqldump` first).
 - `tests/batchdiff.py`: ~1,800 read requests fired 64–200-way concurrently at a batching server and compared byte for byte
   with a non-batching one (`HOT=1` makes the batches full of duplicates); also with `TEST_FAIL_BATCHES=1`.
+- `tests/planner_check.sh`: the planner against a non-batching reference, on spread-out and on duplicate-heavy requests, and
+  with every plan forced to fail once (the retried requests must still match the reference byte for byte).
 - `tests/writetest.py`: 200 concurrent clients each posting a comment, a favorite, a follow and an article, exact final
   counts; also with `TEST_FAIL_GROUPS=1`.
 - `tests/httptest.py`: raw-socket HTTP: pipelining, byte-at-a-time requests, split and chunked bodies, `Connection: close`,
@@ -99,23 +109,78 @@ Test hooks (off by default): `NO_PBUF`, `TEST_FAIL_GROUPS`, `TEST_FAIL_BATCHES`.
 - Also run: soaks of several minutes (no errors, flat RSS), a ReleaseSafe build (bounds and overflow checks) through the same
   suites, and killing every Postgres backend mid-run.
 
-## Local results (not the official box)
+## Results (local rig, not the official box)
 
-Ryzen 7 7445HS, Postgres 18.6 built from source, full seed, the repo's `loadgen` on other cores of the same machine, fresh
-database copy and warm buffers per run. Numbers do not transfer to the benchmark box; they show what each technique buys on
-the same machine. One run per cell, with ±30% noise in p95 at the edge of saturation. Server and Postgres are confined to one
-physical core (2 threads) so that they saturate before the load generator does. "Aged" is a database where the hot articles'
-comment threads are already at the 100-row cap, as they are a minute into a real run.
+**Setup.** Ryzen 7 7445HS (6 cores, 12 threads); Postgres 18.6 built from source; the full seed (500,000 articles, about
+5 M favourites, 2.5 M comments); a fresh copy of the database and a restarted Postgres before every run. Load: the
+challenge's `loadgen`, closed loop, think time scaled to 0.5 (3.5 s mean), 22,000 users unless stated, a 10 s ramp and a
+40 s window. **Layout:** server on CPUs 0 and 6 (one core), Postgres on CPUs 1–3 and 7–9, load generator on CPUs 4, 5, 10
+and 11. A run the load generator flags as limited by its own CPU is not counted (none in these tables). "Steady" drops
+the first 5 seconds of the window: every submission has a start-up spike when the last users become active at the end of
+the ramp (the full-window column includes it). "App" is this server's CPU per request, "Postgres" the CPU of all Postgres
+processes per request, both in microseconds; raw runs are in `benchmarks/results/`.
 
-| aged database, 22,000 virtual users at half think time | req/s | p50 | p95 |
+### At 22,000 users (two rounds each)
+
+| contender | steady p95 ms | steady p99 ms | full p95 ms | app µs/req | Postgres µs/req | total µs/req | req/s |
+|---|---|---|---|---|---|---|---|
+| **this branch, defaults** | 201 | 214 | 206 | 33 | 45 | **77** | 10,859 |
+| previous commit (`ed2e521`) | 1.0 | 1.8 | 1.8 | 34 | 147 | 181 | 11,658 |
+| #47 (WorriedArrow), default window | 32 | 38 | 42 | 37 | 55 | 92 | 11,528 |
+| #47, 2 ms window | 7.9 | 9.4 | 8.9 | 37 | 79 | 116 | 11,629 |
+| this branch, planner off | 1.0 | 1.9 | 1.9 | 33 | 144 | 177 | 11,666 |
+| #7 (Scooter1337) | 2.1 | 3.1 | 2.7 | 38 | 124 | 162 | 11,672 |
+| #59 (semyonfox) | 3.3 | 4.5 | 12.5 | 36 | 105 | 141 | 11,614 |
+| #64 (touhidsiddiqueeraj-bit) | 2.1 | 3.1 | 4.2 | 39 | 124 | 163 | 11,653 |
+| #53 (fourneau) | 1.1 | 1.8 | 18.3 | 38 | 199 | 238 | 11,591 |
+| #61 (MegaPanchamZ) | 1.9 | 4.5 | 3.2 | 58 | 161 | 218 | 11,636 |
+| #58 (gilnett) | 0.9 | 2.1 | 6.9 | 41 | 172 | 214 | 11,606 |
+| #52 (umitaltintas) | 1.2 | 2.6 | 1.9 | 56 | 156 | 211 | 11,664 |
+| #10 (tigokraft) | 0.9 | 1.5 | 37.7 | 44 | 188 | 232 | 11,618 |
+| #22 (jh-d) | 1.0 | 2.1 | 2.0 | 43 | 213 | 256 | 11,658 |
+
+The shipped defaults have the lowest CPU per request of the submissions measured at this load (77 µs, against 92 for
+#47's default window). They pay for it in latency: a read waits for its batch, so the steady p95 is about 200 ms, where
+the low-latency submissions are at 1–3 ms. Nothing here is a measurement on the official 8-vCPU box.
+
+### The window trade-off (planner, 22,000 users, two rounds each)
+
+| read window | steady p95 ms | steady p99 ms | Postgres µs/req | total µs/req |
+|---|---|---|---|---|
+| 20 ms | 31 | 34 | 55 | 87 |
+| 50 ms | 72 | 77 | 48 | 79 |
+| 100 ms | 136 | 144 | 45 | 76 |
+| 150 ms (default) | 199 | 211 | 43 | 74 |
+
+### Saturation: how many users each build holds
+
+Same budget for every build: one server thread (CPU 0), one Postgres thread (CPU 1), load generator on eight threads. A
+user count passes when p95 < 500 ms, p99 < 1 s and errors < 1%. One round per probe. Beyond 28,000 connections from one
+address the ephemeral port range is widened (`net.ipv4.ip_local_port_range`) for the test and restored after.
+
+| build | last pass | first fail | estimated knee |
 |---|---|---|---|
-| `BATCH_MAX=1` (every read is its own statement) | 9.6 k | 425 ms | 525 ms |
-| default (shared-work batching) | 11.5 k | 24 ms | 52–59 ms |
+| previous commit (`ed2e521`) | 28,000 users: p95 291 ms, 13.6 k req/s | 32,000 users: p95 623 ms | ~29,500 |
+| this branch, defaults | 38,000 users: p95 487 ms, p99 573 ms, 17.6 k req/s | 40,000 users: p95 699 ms, load generator flagged | ~38,500 |
+| #47, default window | 38,000 users: p95 397 ms, p99 477 ms, 17.9 k req/s | 40,000 users: p95 813 ms, p99 1,408 ms | ~39,000 |
+| #64 | 20,000 users: p95 218 ms | not measured above 20,000 | not measured |
 
-The default configuration also serves 13.2 k req/s on the aged database at p95 151 ms, and 13.7 k req/s on the fresh seed at
-p95 31–37 ms. 50,000 users with real 7 s think times (6 CPUs for server + Postgres): 13.3 k req/s, p95 1.7 ms, p99 3.5 ms,
-0 errors. Other measured effects: Postgres connections 36 → 6 on a 6-CPU slice, -20% Postgres CPU at equal throughput;
-hashed followee set in comment threads, -27% on a hot thread; group commit, write p95 1.1 s → 9 ms; bcrypt 39 ms → 13.7 ms per hash.
+On this budget, this branch and #47's default window hold about the same number of users (within the noise of single
+rounds: 1–2%). This branch uses about 10% less CPU per request at that point; #47 has the lower p95 at matched load (295
+ms against 432 ms at 36,000 users). This branch holds about 1.3 times the users of the previous commit.
+
+### What was tried and not kept
+
+- **Balanced split of a plan over the free read connections (`PLAN_SPLIT=1`)** lowers p95 at 22,000 users (to about 4 ms with
+  a 16-request hold and 2 ms cap, against 9 ms for the 5 ms window it was tried on) but costs about a third more Postgres time,
+  because small plans carry more work each.
+  Not the default; it is a knob.
+- **Capping plans at 64 requests** (tried with the earlier 5 ms window) gave the same Postgres cost as that window (71 µs) and a
+  p95 of 8 ms against 9 ms: no real latency gain.
+- **Merging the planner's statements into fewer statements**: measured per-statement overhead is 1–3 µs (the largest,
+  the global count, 60 µs per plan), so merging would save little. Not done.
+- **Oldest-first selection across kinds** is kept (it prevents a late kind from waiting behind a capped batch), though it
+  made no measurable difference on its own.
 
 ## Rules
 
@@ -134,3 +199,9 @@ its response (rule 6). bcrypt cost 10 on every hash and verify; HS256 signature,
   selects by id instead. Fixing it would need one combined statement, and a data-modifying CTE cannot see its own writes in the
   main query, so the counts would have to be adjusted by hand; it was left as is.
 - Needs Linux 5.19 or newer for the provided-buffer ring; older kernels use the poll + `recv` path.
+- Latency is a deliberate trade: a read waits up to `READ_WINDOW_US` (150 ms) for company, so the steady p95 at 22,000 users
+  is about 200 ms and p99 about 210 ms, well inside the 500 ms / 1 s limits but two orders of magnitude above the
+  low-latency submissions. `PLAN_MIN=0` gives the lowest latency (p95 about 1 ms) at about three times the Postgres cost (144 µs per request).
+- The saturation numbers come from a single-thread budget on a 12-thread desktop. The load generator on that budget
+  saturates at about 13 k req/s, so user counts above about 40,000 were not measured cleanly.
+

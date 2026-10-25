@@ -212,15 +212,32 @@ const dec_cols_common =
 const flag_favorited = "COALESCE((SELECT true FROM favorites f WHERE f.user_id = r.viewer AND f.article_id = dec.id), false)";
 const flag_following = "COALESCE((SELECT true FROM follows fo WHERE fo.follower_id = r.viewer AND fo.followee_id = dec.author_id), false)";
 
-fn listBatch(comptime has_key: bool, comptime cnt: []const u8, comptime cnt_join: []const u8, comptime sel: []const u8, comptime following: []const u8) []const u8 {
+/// `pk` is the column that, with `lim` and `off`, identifies a page ("" when every request asks the same list). Requests
+/// of the batch that ask for the same page share one run of `page` (a lateral subquery over `r`, selecting `id`); what is
+/// specific to a request, whether the viewer favourited / follows, takes one probe of each index for the request's whole
+/// page (`fl`), not one per article.
+fn listBatch(comptime has_key: bool, comptime cnt: []const u8, comptime cnt_join: []const u8, comptime pk: []const u8, comptime page: []const u8, comptime follow_flags: bool) []const u8 {
+    const pk_cols = if (pk.len != 0) pk ++ ", " else "";
+    const pk_r = if (pk.len != 0) "r." ++ pk ++ ", " else "";
+    const same_page = "sel.lim = r.lim AND sel.off = r.off" ++ (if (pk.len != 0) " AND sel." ++ pk ++ " = r." ++ pk else "");
+    const same_pgi = "pgi.lim = r.lim AND pgi.off = r.off" ++ (if (pk.len != 0) " AND pgi." ++ pk ++ " = r." ++ pk else "");
     return "WITH r AS MATERIALIZED (SELECT * FROM unnest($1::int8[], $2::int4[], $3::int4[]" ++ (if (has_key) ", $4::text[]" else "") ++
         ") WITH ORDINALITY AS r(viewer, lim, off, " ++ (if (has_key) "key, " else "") ++ "i)), " ++
-        cnt ++ ", " ++ sel ++ ", " ++
+        cnt ++ ", " ++
+        "pg0 AS MATERIALIZED (SELECT DISTINCT " ++ pk_cols ++ "lim, off FROM r), " ++
+        "sel AS MATERIALIZED (SELECT " ++ pk_r ++ "r.lim, r.off, q.id FROM pg0 r CROSS JOIN LATERAL (" ++ page ++ ") q), " ++
         "dec AS MATERIALIZED (SELECT x.* FROM (SELECT DISTINCT id FROM sel) d CROSS JOIN LATERAL (SELECT " ++ dec_cols_common ++
-        " FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id = d.id OFFSET 0) x) " ++
+        " FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id = d.id OFFSET 0) x), " ++
+        "pgi AS MATERIALIZED (SELECT " ++ (if (pk.len != 0) "sel." ++ pk ++ ", " else "") ++ "sel.lim, sel.off, array_agg(sel.id) AS ids, array_agg(DISTINCT dec.author_id) AS authors " ++
+        "FROM sel JOIN dec ON dec.id = sel.id GROUP BY " ++ (if (pk.len != 0) "sel." ++ pk ++ ", " else "") ++ "sel.lim, sel.off), " ++
+        "fl AS MATERIALIZED (SELECT r.i, " ++
+        "ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id = r.viewer AND f.article_id = ANY(pgi.ids)) AS fav" ++
+        (if (follow_flags) ", ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.viewer AND fo.followee_id = ANY(pgi.authors)) AS fol" else "") ++
+        " FROM r LEFT JOIN pgi ON " ++ same_pgi ++ ") " ++
         "SELECT r.i, cnt.n, dec.id, dec.slug, dec.title, dec.description, dec.created_at, dec.updated_at, dec.tag_list, dec.fav_count, " ++
-        flag_favorited ++ ", dec.username, dec.bio, dec.image, " ++ following ++
-        " FROM r " ++ cnt_join ++ " LEFT JOIN sel ON sel.i = r.i LEFT JOIN dec ON dec.id = sel.id ORDER BY r.i, sel.id DESC";
+        "COALESCE(dec.id = ANY(fl.fav), false), dec.username, dec.bio, dec.image, " ++
+        (if (follow_flags) "COALESCE(dec.author_id = ANY(fl.fol), false)" else "true") ++
+        " FROM r " ++ cnt_join ++ " JOIN fl ON fl.i = r.i LEFT JOIN sel ON " ++ same_page ++ " LEFT JOIN dec ON dec.id = sel.id ORDER BY r.i, sel.id DESC";
 }
 
 fn countPerKey(comptime key_col: []const u8, comptime from_where: []const u8) []const u8 {
@@ -232,40 +249,46 @@ const b_list_global = listBatch(
     false,
     "cnt AS MATERIALIZED (SELECT count(*)::int8 AS n FROM (SELECT 1 FROM articles LIMIT 1000) s)",
     "CROSS JOIN cnt",
-    "sel AS MATERIALIZED (SELECT r.i, q.id FROM r CROSS JOIN LATERAL (SELECT id FROM articles ORDER BY id DESC OFFSET r.off LIMIT r.lim) q)",
-    flag_following,
+    "",
+    "SELECT id FROM articles ORDER BY id DESC OFFSET r.off LIMIT r.lim",
+    true,
 );
 
 const b_list_tag = listBatch(
     true,
     countPerKey("key", "FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = k.key)"),
     "JOIN cnt ON cnt.key = r.key",
-    "sel AS MATERIALIZED (SELECT r.i, q.article_id AS id FROM r CROSS JOIN LATERAL (SELECT at.article_id FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = r.key) ORDER BY at.article_id DESC OFFSET r.off LIMIT r.lim) q)",
-    flag_following,
+    "key",
+    "SELECT at.article_id AS id FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = r.key) ORDER BY at.article_id DESC OFFSET r.off LIMIT r.lim",
+    true,
 );
 
 const b_list_author = listBatch(
     true,
     countPerKey("key", "FROM articles a WHERE a.author_id = (SELECT au.id FROM users au WHERE au.username = k.key)"),
     "JOIN cnt ON cnt.key = r.key",
-    "sel AS MATERIALIZED (SELECT r.i, q.id FROM r CROSS JOIN LATERAL (SELECT id FROM articles WHERE author_id = (SELECT au.id FROM users au WHERE au.username = r.key) ORDER BY id DESC OFFSET r.off LIMIT r.lim) q)",
-    flag_following,
+    "key",
+    "SELECT id FROM articles WHERE author_id = (SELECT au.id FROM users au WHERE au.username = r.key) ORDER BY id DESC OFFSET r.off LIMIT r.lim",
+    true,
 );
 
 const b_list_fav = listBatch(
     true,
     countPerKey("key", "FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = k.key)"),
     "JOIN cnt ON cnt.key = r.key",
-    "sel AS MATERIALIZED (SELECT r.i, q.article_id AS id FROM r CROSS JOIN LATERAL (SELECT f.article_id FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = r.key) ORDER BY f.article_id DESC OFFSET r.off LIMIT r.lim) q)",
-    flag_following,
+    "key",
+    "SELECT f.article_id AS id FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = r.key) ORDER BY f.article_id DESC OFFSET r.off LIMIT r.lim",
+    true,
 );
 
+// the feed is the viewer's own: its pages are per viewer and every article on it is by someone the viewer follows
 const b_feed = listBatch(
     false,
     countPerKey("viewer", "FROM articles a WHERE a.author_id = ANY(ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = k.viewer))"),
     "JOIN cnt ON cnt.viewer = r.viewer",
-    "sel AS MATERIALIZED (SELECT r.i, q.id FROM r CROSS JOIN LATERAL (SELECT x.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT (r.lim + r.off)) x WHERE fo.follower_id = r.viewer ORDER BY x.id DESC OFFSET r.off LIMIT r.lim) q)",
-    "true",
+    "viewer",
+    "SELECT x.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT (r.lim + r.off)) x WHERE fo.follower_id = r.viewer ORDER BY x.id DESC OFFSET r.off LIMIT r.lim",
+    false,
 );
 
 const b_article =
@@ -369,15 +392,136 @@ pub inline fn id(s: Stmt) u16 {
     return @intFromEnum(s);
 }
 
+// --- the batch planner's statements ---------------------------------------------------------------------------------
+// A planned batch runs in two phases. Phase A has one statement per kind of request present; each takes arrays of the
+// batch's DISTINCT keys and returns lean rows tagged with the key's 1-based ordinal `k` (counts: k <= 0, -k is the count
+// key's ordinal, the count in column 1). Phase B enriches the union of every article phase A returned, once (author,
+// favourite count, tag names) and resolves the viewers' favourited / following flags with one `= ANY` range scan per
+// viewer. Rows are assembled into each request's reply in the server.
+
+/// Proof that a count reaches the 1,000 cap without aggregating, else the exact count.
+fn capped(comptime rows: []const u8) []const u8 {
+    return "CASE WHEN EXISTS (" ++ rows ++ " OFFSET 999) THEN 1000::int8 ELSE (SELECT count(*) FROM (" ++ rows ++ " LIMIT 1000) s) END";
+}
+
+/// Article row columns after `k`: id, author_id, slug, title, description, created_at, updated_at.
+const plan_cols = "a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at";
+/// NULL padding of a count row (matches plan_cols after the count).
+const plan_pad = "NULL::int8, NULL::text, NULL::text, NULL::text, NULL::timestamptz, NULL::timestamptz";
+
+pub const PlanStmt = enum(u8) {
+    a_global,
+    a_tag,
+    a_author,
+    a_fav,
+    a_feed,
+    a_slug,
+    a_cmts,
+    a_prof,
+    b_artx,
+    b_fc,
+    b_names,
+    b_flags,
+};
+
+pub const plan_defs = blk: {
+    var d: [std.meta.fieldNames(PlanStmt).len]Def = undefined;
+    d[@intFromEnum(PlanStmt.a_global)] = .{
+        .sql = "SELECT 0::int8, (SELECT count(*) FROM (SELECT 1 FROM articles ORDER BY id LIMIT 1000) s), " ++ plan_pad ++
+            " UNION ALL SELECT r.k, " ++ plan_cols ++ " FROM unnest($1::int8[], $2::int8[]) WITH ORDINALITY r(lim, off, k) " ++
+            "CROSS JOIN LATERAL (SELECT * FROM articles a ORDER BY a.id DESC LIMIT r.lim OFFSET r.off) a",
+        .params = &.{ I8A, I8A },
+    };
+    d[@intFromEnum(PlanStmt.a_tag)] = .{
+        .sql = "SELECT -r.k, " ++ capped("SELECT 1 FROM article_tags at WHERE at.tag_id = t.id") ++ ", " ++ plan_pad ++
+            " FROM unnest($1::text[]) WITH ORDINALITY r(tag, k) LEFT JOIN tags t ON t.name = r.tag UNION ALL " ++
+            "SELECT r.k, " ++ plan_cols ++ " FROM unnest($2::text[], $3::int8[], $4::int8[]) WITH ORDINALITY r(tag, lim, off, k) " ++
+            "JOIN tags t ON t.name = r.tag CROSS JOIN LATERAL (SELECT at.article_id FROM article_tags at WHERE at.tag_id = t.id " ++
+            "ORDER BY at.article_id DESC LIMIT r.lim OFFSET r.off) p JOIN articles a ON a.id = p.article_id",
+        .params = &.{ TA, TA, I8A, I8A },
+    };
+    d[@intFromEnum(PlanStmt.a_author)] = .{
+        .sql = "SELECT -r.k, " ++ capped("SELECT 1 FROM articles a WHERE a.author_id = u.id") ++ ", " ++ plan_pad ++
+            " FROM unnest($1::text[]) WITH ORDINALITY r(username, k) LEFT JOIN users u ON u.username = r.username UNION ALL " ++
+            "SELECT r.k, " ++ plan_cols ++ " FROM unnest($2::text[], $3::int8[], $4::int8[]) WITH ORDINALITY r(username, lim, off, k) " ++
+            "JOIN users u ON u.username = r.username CROSS JOIN LATERAL (SELECT * FROM articles a WHERE a.author_id = u.id " ++
+            "ORDER BY a.id DESC LIMIT r.lim OFFSET r.off) a",
+        .params = &.{ TA, TA, I8A, I8A },
+    };
+    d[@intFromEnum(PlanStmt.a_fav)] = .{
+        .sql = "SELECT -r.k, " ++ capped("SELECT 1 FROM favorites f WHERE f.user_id = u.id") ++ ", " ++ plan_pad ++
+            " FROM unnest($1::text[]) WITH ORDINALITY r(username, k) LEFT JOIN users u ON u.username = r.username UNION ALL " ++
+            "SELECT r.k, " ++ plan_cols ++ " FROM unnest($2::text[], $3::int8[], $4::int8[]) WITH ORDINALITY r(username, lim, off, k) " ++
+            "JOIN users u ON u.username = r.username CROSS JOIN LATERAL (SELECT f.article_id FROM favorites f WHERE f.user_id = u.id " ++
+            "ORDER BY f.article_id DESC LIMIT r.lim OFFSET r.off) p JOIN articles a ON a.id = p.article_id",
+        .params = &.{ TA, TA, I8A, I8A },
+    };
+    d[@intFromEnum(PlanStmt.a_feed)] = .{
+        .sql = "SELECT -r.k, " ++
+            capped("SELECT 1 FROM articles a WHERE a.author_id = ANY(ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.v)) ORDER BY a.author_id, a.id DESC") ++
+            ", " ++ plan_pad ++ " FROM unnest($1::int8[]) WITH ORDINALITY r(v, k) UNION ALL " ++
+            "SELECT r.k, " ++ plan_cols ++ " FROM unnest($2::int8[], $3::int8[], $4::int8[]) WITH ORDINALITY r(v, lim, off, k) " ++
+            "CROSS JOIN LATERAL (SELECT y.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id " ++
+            "ORDER BY a2.id DESC LIMIT r.lim + r.off) y WHERE fo.follower_id = r.v ORDER BY y.id DESC LIMIT r.lim OFFSET r.off) x " ++
+            "JOIN articles a ON a.id = x.id",
+        .params = &.{ I8A, I8A, I8A, I8A },
+    };
+    // k, id, author_id, slug, title, description, created_at, updated_at, body
+    d[@intFromEnum(PlanStmt.a_slug)] = .{
+        .sql = "SELECT r.k, " ++ plan_cols ++ ", a.body FROM unnest($1::text[]) WITH ORDINALITY r(slug, k) JOIN articles a ON a.slug = r.slug",
+        .params = &.{TA},
+    };
+    // k, article id, comment id, body, created_at, updated_at, author_id, username, bio, image (one all-NULL comment row for an article without comments)
+    d[@intFromEnum(PlanStmt.a_cmts)] = .{
+        .sql = "SELECT r.k, a.id, c.id, c.body, c.created_at, c.updated_at, c.author_id, u.username, u.bio, u.image " ++
+            "FROM unnest($1::text[]) WITH ORDINALITY r(slug, k) JOIN articles a ON a.slug = r.slug " ++
+            "LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id FROM comments c WHERE c.article_id = a.id " ++
+            "ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true LEFT JOIN users u ON u.id = c.author_id",
+        .params = &.{TA},
+    };
+    d[@intFromEnum(PlanStmt.a_prof)] = .{
+        .sql = "SELECT r.k, u.id, u.username, u.bio, u.image FROM unnest($1::text[]) WITH ORDINALITY r(username, k) JOIN users u ON u.username = r.username",
+        .params = &.{TA},
+    };
+    // id, username, bio, image of each distinct article's author
+    d[@intFromEnum(PlanStmt.b_artx)] = .{
+        .sql = "SELECT r.id, u.username, u.bio, u.image FROM unnest($1::int8[], $2::int8[]) r(id, author) JOIN users u ON u.id = r.author",
+        .params = &.{ I8A, I8A },
+    };
+    d[@intFromEnum(PlanStmt.b_fc)] = .{
+        .sql = "SELECT f.article_id, count(*) FROM favorites f WHERE f.article_id = ANY($1::int8[]) GROUP BY f.article_id",
+        .params = &.{I8A},
+    };
+    d[@intFromEnum(PlanStmt.b_names)] = .{
+        .sql = "SELECT at.article_id, t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE at.article_id = ANY($1::int8[]) ORDER BY at.article_id, t.name",
+        .params = &.{I8A},
+    };
+    // (0, viewer, article) per favourited pair asked about, (1, viewer, followee) per followed pair
+    d[@intFromEnum(PlanStmt.b_flags)] = .{
+        .sql = "WITH p AS (SELECT x.v, array_agg(x.a) AS aa FROM unnest($1::int8[], $2::int8[]) x(v, a) GROUP BY x.v), " ++
+            "q AS (SELECT x.v, array_agg(x.u) AS uu FROM unnest($3::int8[], $4::int8[]) x(v, u) GROUP BY x.v) " ++
+            "SELECT 0::int8, p.v, f.article_id FROM p CROSS JOIN LATERAL (SELECT f.article_id FROM favorites f WHERE f.user_id = p.v AND f.article_id = ANY(p.aa)) f " ++
+            "UNION ALL SELECT 1::int8, q.v, fo.followee_id FROM q CROSS JOIN LATERAL (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = q.v AND fo.followee_id = ANY(q.uu)) fo",
+        .params = &.{ I8A, I8A, I8A, I8A },
+    };
+    break :blk d;
+};
+
+/// Statement id of a planner statement. Batched statements use ids defs.len + <statement kind>, so these start past all of them.
+pub inline fn planId(s: PlanStmt) u16 {
+    return @as(u16, @intCast(2 * defs.len)) + @as(u16, @intFromEnum(s));
+}
+
 pub const Prep = struct { id: u16, sql: []const u8, params: []const u32 };
 
-/// Every statement to prepare on a new connection: the single-request statements, then the batched variants.
+/// Every statement to prepare on a new connection: the single-request statements, the batched variants, the planner's.
 pub const prepared = blk: {
-    var out: [defs.len + batchable.len]Prep = undefined;
+    var out: [defs.len + batchable.len + plan_defs.len]Prep = undefined;
     for (defs, 0..) |d, i| out[i] = .{ .id = @intCast(i), .sql = d.sql, .params = d.params };
     for (batchable, 0..) |k, j| {
         const b = bdefs[@intFromEnum(k)].?;
         out[defs.len + j] = .{ .id = batchId(k), .sql = b.sql, .params = b.params };
     }
+    for (plan_defs, 0..) |d, j| out[defs.len + batchable.len + j] = .{ .id = planId(@enumFromInt(j)), .sql = d.sql, .params = d.params };
     break :blk out;
 };
