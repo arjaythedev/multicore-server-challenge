@@ -92,12 +92,13 @@ struct Rows {
     }
 };
 
-struct PgConn {
+struct alignas(64) PgConn {
     PGconn *c = nullptr;
     int sock = -1;
     bool want_out = false;  // one-shot POLLOUT armed
     bool in_armed = false;  // one-shot POLLIN armed
     bool dead = false;
+    bool maybe_ready = false;  // queried or flushed since the last check: libpq may have read results while writing
     // One entry per pipeline segment in flight (FIFO); `tag` is owned by the caller.
     struct Seg {
         void *tag;

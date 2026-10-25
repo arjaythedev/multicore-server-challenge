@@ -21,6 +21,7 @@ inline void *alloc(size_t n) {
     if (h) {
         Node *r = h;
         h = r->next;
+        if (h) __builtin_prefetch(h, 1);  // the next frame's first line is touched by the following alloc
         return r;
     }
     return ::operator new(c * kClass);

@@ -106,7 +106,7 @@ Worker::~Worker() {
 
 io_uring_sqe *Worker::sqe() {
     io_uring_sqe *s = io_uring_get_sqe(&ring_);
-    if (!s) {
+    if (!s) [[unlikely]] {
         io_uring_submit(&ring_);
         s = io_uring_get_sqe(&ring_);
     }
@@ -208,7 +208,7 @@ void Worker::on_recv(uint32_t idx, uint32_t gen, io_uring_cqe *cqe) {
                               io_uring_buf_ring_mask(kBufCount), 0);
         io_uring_buf_ring_advance(br_, 1);
     };
-    if (c.gen != gen) {  // stale completion for a reused slot: only give the buffer back
+    if (c.gen != gen) [[unlikely]] {  // stale completion for a reused slot: only give the buffer back
         if (has_buf) give_back();
         return;
     }
@@ -217,7 +217,7 @@ void Worker::on_recv(uint32_t idx, uint32_t gen, io_uring_cqe *cqe) {
         if (cqe->res > 0 && !c.closing) take_buf(c.in), c.in.append(&bufs_[size_t(bid) * kBufSize], size_t(cqe->res));
         give_back();
     }
-    if (cqe->res <= 0 && cqe->res != -ENOBUFS) {
+    if (cqe->res <= 0 && cqe->res != -ENOBUFS) [[unlikely]] {
         kill(idx);
         return;
     }
@@ -240,14 +240,14 @@ void Worker::start_send(uint32_t idx) {
 void Worker::on_send(uint32_t idx, uint32_t gen, int res) {
     PROF_SCOPE(kSendDone);
     Conn &c = conns_[idx];
-    if (c.gen != gen) return;
+    if (c.gen != gen) [[unlikely]] return;
     c.sending = false;
-    if (res <= 0) {
+    if (res <= 0) [[unlikely]] {
         kill(idx);
         return;
     }
     c.sendbuf.erase(0, size_t(res));
-    if (!c.sendbuf.empty()) {  // partial send: keep the rest ahead of anything newer
+    if (!c.sendbuf.empty()) [[unlikely]] {  // partial send: keep the rest ahead of anything newer
         c.out.insert(0, c.sendbuf);
         c.sendbuf.clear();
     }
@@ -284,7 +284,7 @@ void Worker::respond(Conn &c, uint32_t idx, int status, const std::string &body)
     PROF_SCOPE(kRespond);
     char head[192];
     char *p = head;
-    if (status == 204) {
+    if (status == 204) [[unlikely]] {
         p = put(p, "HTTP/1.1 204 No Content\r\n");
     } else {
         p = put(p, "HTTP/1.1 ");
@@ -335,7 +335,7 @@ void Worker::process_one(uint32_t idx) {
         phr_header hdrs[64];
         size_t nh = 64;
         int pr = phr_parse_request(c.in.data(), c.in.size(), &method, &mlen, &path, &plen, &minor, hdrs, &nh, 0);
-        if (pr == -2) {
+        if (pr == -2) [[unlikely]] {
             if (c.in.size() > kMaxRequest) {
                 c.close_after = true;
                 c.in.clear();
@@ -343,7 +343,7 @@ void Worker::process_one(uint32_t idx) {
             }
             return;
         }
-        if (pr < 0) {
+        if (pr < 0) [[unlikely]] {
             c.close_after = true;
             c.in.clear();
             respond(c, idx, 400, R"({"errors":{"body":["bad request"]}})");
@@ -364,13 +364,13 @@ void Worker::process_one(uint32_t idx) {
                 rq.auth.assign(h.value, h.value_len);
             }
         }
-        if (content_len > kMaxRequest) {
+        if (content_len > kMaxRequest) [[unlikely]] {
             c.close_after = true;
             c.in.clear();
             respond(c, idx, 413, R"({"errors":{"body":["request too large"]}})");
             return;
         }
-        if (c.in.size() < size_t(pr) + content_len) return;  // body still arriving
+        if (c.in.size() < size_t(pr) + content_len) [[unlikely]] return;  // body still arriving
         if (close_hdr) c.close_after = true;
 
         rq.method.assign(method, mlen);
@@ -406,7 +406,7 @@ Detached Worker::serve(uint32_t idx, uint32_t gen, Request rq) {
 void Worker::finish(uint32_t idx, uint32_t gen, Reply r) {
     PROF_REQUEST_DONE();
     Conn &c = conns_[idx];
-    if (c.gen != gen) return;  // client went away while the request ran
+    if (c.gen != gen) [[unlikely]] return;  // client went away while the request ran
     c.busy = false;
     respond(c, idx, r.status, r.body);
     recycle(r.body);
@@ -792,11 +792,23 @@ void Worker::run() {
             PROF_SCOPE(kWait);
             w = io_uring_submit_and_wait(&ring_, 1);
         }
-        if (w < 0 && w != -EINTR && w != -EBUSY) {
+        if (w < 0 && w != -EINTR && w != -EBUSY) [[unlikely]] {
             fprintf(stderr, "worker %d: io_uring_submit_and_wait: %s\n", id_, strerror(-w));
             exit(1);
         }
         unsigned n = io_uring_peek_batch_cqe(&ring_, cqes, 256);
+        // With ~100k connections a connection's state is almost never in cache when its completion arrives. The whole
+        // batch is known up front, so start loading all of those lines now and the misses overlap instead of queueing.
+        for (unsigned i = 0; i < n; i++) {
+            uint64_t u = cqes[i]->user_data;
+            if (op_of(u) == kRecv || op_of(u) == kSend) {
+                size_t k = idx_of(u);
+                if (k < conns_.size()) {
+                    __builtin_prefetch(&conns_[k]);
+                    __builtin_prefetch(reinterpret_cast<const char *>(&conns_[k]) + 64);
+                }
+            }
+        }
         for (unsigned i = 0; i < n; i++) {
             io_uring_cqe *cqe = cqes[i];
             uint64_t u = cqe->user_data;
@@ -833,7 +845,10 @@ void Worker::run() {
         for (uint32_t i = 0; i < pgs_.size(); i++) {
             PgConn &pg = *pgs_[i];
             if (pg.dead || pg.inflight.empty()) continue;
-            if (!PQisBusy(pg.c)) on_pg(i);
+            if (pg.maybe_ready) {
+                pg.maybe_ready = false;
+                if (!PQisBusy(pg.c)) on_pg(i);
+            }
             if (!pg.inflight.empty()) arm_pg(i);
         }
     }

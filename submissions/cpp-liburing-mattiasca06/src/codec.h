@@ -35,29 +35,37 @@ inline std::string b64url_encode(const unsigned char *d, size_t n) {
     return o;
 }
 
-inline int b64val(char c) {
-    if (c >= 'A' && c <= 'Z') return c - 'A';
-    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-    if (c >= '0' && c <= '9') return c - '0' + 52;
-    if (c == '-') return 62;
-    if (c == '_') return 63;
-    return -1;
-}
+// 0..63 for base64url characters, -1 otherwise.
+struct B64Table {
+    int8_t v[256];
+    constexpr B64Table() : v() {
+        for (int i = 0; i < 256; i++) v[i] = -1;
+        for (int i = 0; i < 26; i++) v['A' + i] = int8_t(i), v['a' + i] = int8_t(26 + i);
+        for (int i = 0; i < 10; i++) v['0' + i] = int8_t(52 + i);
+        v[int('-')] = 62;
+        v[int('_')] = 63;
+    }
+};
+alignas(64) inline constexpr B64Table kB64{};
+
+inline int b64val(char c) { return kB64.v[static_cast<unsigned char>(c)]; }
 
 // Unpadded base64url; returns false on any invalid character or length.
 inline bool b64url_decode(std::string_view s, std::string &out) {
     out.clear();
     if (s.size() % 4 == 1) return false;
+    out.resize(s.size() * 6 / 8);
+    char *w = out.data();
     uint32_t acc = 0;
     int bits = 0;
     for (char c : s) {
         int v = b64val(c);
-        if (v < 0) return false;
+        if (v < 0) [[unlikely]] return false;
         acc = acc << 6 | uint32_t(v);
         bits += 6;
         if (bits >= 8) {
             bits -= 8;
-            out.push_back(char(acc >> bits & 0xff));
+            *w++ = char(acc >> bits & 0xff);
         }
     }
     return true;
@@ -120,6 +128,20 @@ inline void append_ts(std::string &o, int64_t us) {
     int64_t d = doy - (153 * mp + 2) / 5 + 1;
     int64_t m = mp < 10 ? mp + 3 : mp - 9;
     if (m <= 2) y++;
+    if (y >= 0 && y <= 9999) {  // fixed-width fast path, same bytes as the snprintf below
+        char b[24];
+        auto two = [&](int at, int64_t v) {
+            b[at] = char('0' + v / 10);
+            b[at + 1] = char('0' + v % 10);
+        };
+        two(0, y / 100), two(2, y % 100);
+        b[4] = '-', two(5, m), b[7] = '-', two(8, d), b[10] = 'T';
+        two(11, sod / 3600), b[13] = ':', two(14, sod % 3600 / 60), b[16] = ':', two(17, sod % 60), b[19] = '.';
+        int64_t ms = rem / 1000;
+        b[20] = char('0' + ms / 100), two(21, ms % 100), b[23] = 'Z';
+        o.append(b, 24);
+        return;
+    }
     char b[40];
     int n = snprintf(b, sizeof b, "%04lld-%02lld-%02lldT%02lld:%02lld:%02lld.%03lldZ", (long long)y, (long long)m,
                      (long long)d, (long long)(sod / 3600), (long long)(sod % 3600 / 60), (long long)(sod % 60),

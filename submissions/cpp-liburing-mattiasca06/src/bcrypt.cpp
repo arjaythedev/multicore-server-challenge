@@ -24,7 +24,9 @@
 namespace {
 
 constexpr int kMaxLanes = 4;
-constexpr auto kCollectWindow = std::chrono::milliseconds(100);
+// Measured per hash (cost 10): 1 lane 40 ms, 2 lanes 23 ms, 3 lanes 17 ms, 4 lanes 17 ms. Logins arrive ~20/s, so a longer
+// window fills the batches (less CPU per hash) and stays far below the latency budget of a login.
+constexpr auto kCollectWindow = std::chrono::milliseconds(200);
 
 struct Lane {
     uint32_t P[18];
@@ -250,7 +252,7 @@ void process(Job *jobs, int n) {
     }
 }
 
-std::mutex g_mu;
+alignas(64) std::mutex g_mu;  // shared by the bcrypt threads and the enqueuing workers: keep it off other globals' lines
 std::condition_variable g_cv;
 std::deque<BcryptAwait *> g_jobs;
 bool g_collecting = false;  // one leader at a time waits for company; the other threads only take backlog

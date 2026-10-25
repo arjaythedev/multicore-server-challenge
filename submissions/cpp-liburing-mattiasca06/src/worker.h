@@ -5,6 +5,8 @@
 
 #include <coroutine>
 #include <cstdint>
+#include <cstdlib>
+#include <new>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -14,6 +16,20 @@
 #include "bcrypt.h"
 #include "coro.h"
 #include "pg.h"
+
+// Allocator for page-aligned storage.
+template <class T> struct Aligned4k {
+    using value_type = T;
+    Aligned4k() = default;
+    template <class U> Aligned4k(const Aligned4k<U> &) {}
+    T *allocate(size_t n) {
+        void *p = std::aligned_alloc(4096, (n * sizeof(T) + 4095) / 4096 * 4096);
+        if (!p) throw std::bad_alloc();
+        return static_cast<T *>(p);
+    }
+    void deallocate(T *p, size_t) { std::free(p); }
+    template <class U> bool operator==(const Aligned4k<U> &) const { return true; }
+};
 
 struct Config {
     std::string host, database_url, jwt_secret;
@@ -59,7 +75,7 @@ struct alignas(64) Worker {
     void post_done(BcryptAwait *j);  // called from bcrypt threads
 
   private:
-    struct Conn {
+    struct alignas(64) Conn {  // two cache lines per connection, never straddling a third
         int fd = -1;
         uint32_t gen = 0;
         bool recv_active = false, sending = false, busy = false, closing = false, close_after = false;
@@ -128,7 +144,7 @@ struct alignas(64) Worker {
     int listen_fd_ = -1, efd_ = -1;
     io_uring ring_{};
     io_uring_buf_ring *br_ = nullptr;
-    std::vector<char> bufs_;
+    std::vector<char, Aligned4k<char>> bufs_;  // page-aligned: every 4 KiB receive buffer starts on a cache line
     std::vector<Conn> conns_;
     std::vector<uint32_t> free_;
     std::vector<std::unique_ptr<PgConn>> pgs_;
@@ -156,7 +172,8 @@ struct alignas(64) Worker {
     __kernel_timespec batch_ts_{};
     bool in_process_ = false;
     std::vector<uint32_t> deferred_;
-    std::mutex done_mu_;
+    // Written by the bcrypt threads, so on a cache line of their own (mutex 40 B + vector 24 B = exactly one line).
+    alignas(64) std::mutex done_mu_;
     std::vector<BcryptAwait *> done_;
     static constexpr unsigned kBufCount = 4096, kBufSize = 4096, kBgid = 1;
 };

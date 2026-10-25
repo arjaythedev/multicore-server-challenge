@@ -29,7 +29,7 @@ Reply db_error() { return err(500, "database error"); }
 
 void put(std::string &o, std::string_view s) { json::str(o, s.data(), s.size()); }
 void put_nullable(std::string &o, const Res &r, int row, int col) {
-    if (is_null(r, row, col)) o += "null";
+    if (is_null(r, row, col)) json::lit(o, "null");
     else put(o, text(r, row, col));
 }
 
@@ -109,62 +109,62 @@ StrField str_field(yyjson_val *obj, const char *key) {
 // ---- response JSON ----
 
 void user_json(std::string &o, const Res &r, int row, std::string_view token) {
-    o += R"({"user":{"email":)";
+    json::lit(o, R"({"user":{"email":)");
     put(o, text(r, row, 2));
-    o += R"(,"token":)";
+    json::lit(o, R"(,"token":)");
     put(o, token);
-    o += R"(,"username":)";
+    json::lit(o, R"(,"username":)");
     put(o, text(r, row, 1));
-    o += R"(,"bio":)";
+    json::lit(o, R"(,"bio":)");
     put_nullable(o, r, row, 3);
-    o += R"(,"image":)";
+    json::lit(o, R"(,"image":)");
     put_nullable(o, r, row, 4);
-    o += "}}";
+    json::lit(o, "}}");
 }
 
 void author_json(std::string &o, const Res &r, int row, int c_username, bool following) {
-    o += R"("author":{"username":)";
+    json::lit(o, R"("author":{"username":)");
     put(o, text(r, row, c_username));
-    o += R"(,"bio":)";
+    json::lit(o, R"(,"bio":)");
     put_nullable(o, r, row, c_username + 1);
-    o += R"(,"image":)";
+    json::lit(o, R"(,"image":)");
     put_nullable(o, r, row, c_username + 2);
-    o += R"(,"following":)";
+    json::lit(o, R"(,"following":)");
     o += following ? "true" : "false";
     o += '}';
 }
 
 void profile_json(std::string &o, const Res &r, int row, int c_username, bool following) {
-    o += R"({"profile":{"username":)";
+    json::lit(o, R"({"profile":{"username":)");
     put(o, text(r, row, c_username));
-    o += R"(,"bio":)";
+    json::lit(o, R"(,"bio":)");
     put_nullable(o, r, row, c_username + 1);
-    o += R"(,"image":)";
+    json::lit(o, R"(,"image":)");
     put_nullable(o, r, row, c_username + 2);
-    o += R"(,"following":)";
+    json::lit(o, R"(,"following":)");
     o += following ? "true" : "false";
-    o += "}}";
+    json::lit(o, "}}");
 }
 
 // Columns: id, slug, title, description, [body,] created_at, updated_at, tag_list, favorites_count, favorited,
 // username, bio, image, following.
 void article_json(std::string &o, const Res &r, int row, bool full) {
     int c = 1;
-    o += R"({"slug":)";
+    json::lit(o, R"({"slug":)");
     put(o, text(r, row, c++));
-    o += R"(,"title":)";
+    json::lit(o, R"(,"title":)");
     put(o, text(r, row, c++));
-    o += R"(,"description":)";
+    json::lit(o, R"(,"description":)");
     put(o, text(r, row, c++));
     if (full) {
-        o += R"(,"body":)";
+        json::lit(o, R"(,"body":)");
         put(o, text(r, row, c++));
     }
-    o += R"(,"createdAt":")";
+    json::lit(o, R"(,"createdAt":")");
     codec::append_ts(o, i64(r, row, c++));
-    o += R"(","updatedAt":")";
+    json::lit(o, R"(","updatedAt":")");
     codec::append_ts(o, i64(r, row, c++));
-    o += R"(","tagList":[)";
+    json::lit(o, R"(","tagList":[)");
     {
         const char *p = r.raw(row, c++);  // binary text[]: ndim, hasnull, elemtype, then dims, then elements
         int32_t ndim = codec::be32(p);
@@ -180,11 +180,11 @@ void article_json(std::string &o, const Res &r, int row, bool full) {
             }
         }
     }
-    o += R"(],"favorited":)";
+    json::lit(o, R"(],"favorited":)");
     int favcount = c++;
     int favorited = c++;
     o += boolean(r, row, favorited) ? "true" : "false";
-    o += R"(,"favoritesCount":)";
+    json::lit(o, R"(,"favoritesCount":)");
     o += std::to_string(i64(r, row, favcount));
     o += ',';
     int c_user = c;
@@ -193,13 +193,13 @@ void article_json(std::string &o, const Res &r, int row, bool full) {
 }
 
 void comment_json(std::string &o, const Res &r, int row, bool following) {
-    o += R"({"id":)";
+    json::lit(o, R"({"id":)");
     o += std::to_string(i64(r, row, 0));
-    o += R"(,"createdAt":")";
+    json::lit(o, R"(,"createdAt":")");
     codec::append_ts(o, i64(r, row, 2));
-    o += R"(","updatedAt":")";
+    json::lit(o, R"(","updatedAt":")");
     codec::append_ts(o, i64(r, row, 3));
-    o += R"(","body":)";
+    json::lit(o, R"(","body":)");
     put(o, text(r, row, 1));
     o += ',';
     author_json(o, r, row, 4, following);
@@ -262,17 +262,23 @@ Task<Reply> Worker::route(const Request &rq) {
     std::string_view path = rq.path;
     if (path.substr(0, 5) != "/api/") co_return err(404, "not found");
     path.remove_prefix(5);
-    // Segments are views into the path; only one with a % escape gets a decoded copy.
+    // Segments are views into the path; one with a % escape is decoded into `decoded`, which is reserved up front
+    // (a decoded segment is never longer than the path) so the views stay valid.
     constexpr size_t kMaxSeg = 8;
     std::string_view seg[kMaxSeg];
-    std::string decoded[kMaxSeg];
+    std::string decoded;
+    if (path.find('%') != std::string_view::npos) decoded.reserve(path.size());
     size_t n = 0;
     while (true) {
         size_t s = path.find('/');
         std::string_view part = path.substr(0, s);
         if (n == kMaxSeg) co_return err(404, "not found");  // no route has this many segments
         if (part.find('%') == std::string_view::npos) seg[n] = part;
-        else seg[n] = decoded[n] = codec::pct_decode(part, false);
+        else {
+            size_t at = decoded.size();
+            decoded += codec::pct_decode(part, false);
+            seg[n] = std::string_view(decoded).substr(at);
+        }
         n++;
         if (s == std::string_view::npos) break;
         path.remove_prefix(s + 1);
@@ -356,7 +362,7 @@ Task<Reply> Worker::route(const Request &rq) {
 
 Task<Reply> Worker::h_tags() {
     Rows rows = co_await db({Query("tags", {})});
-    if (!rows.all_ok(1)) co_return db_error();
+    if (!rows.all_ok(1)) [[unlikely]] co_return db_error();
     std::string body;
     take_buf(body); body.reserve(32 + size_t(rows[0].rows()) * 16);
     body = R"({"tags":[)";
@@ -365,7 +371,7 @@ Task<Reply> Worker::h_tags() {
         if (i) body += ',';
         put(body, text(r, i, 0));
     }
-    body += "]}";
+    json::lit(body, "]}");
     co_return Reply{200, std::move(body)};
 }
 
@@ -381,7 +387,7 @@ Task<Reply> Worker::h_register(const Request &rq) {
     BcryptResult br = co_await bcrypt_hash(password.v);
     if (!br.ok) co_return err(500, "hashing failed");
     Rows rows = co_await db_write({Query("user_register", {username.v, email.v, br.hash})}, true);
-    if (!rows.ok || rows.r.size() != 1) co_return db_error();
+    if (!rows.ok || rows.r.size() != 1) [[unlikely]] co_return db_error();
     const Res &r = rows[0];
     if (PQresultStatus(r) != PGRES_TUPLES_OK)
         co_return sqlstate(r) == "23505" ? err(422, "username or email already taken") : db_error();
@@ -398,7 +404,7 @@ Task<Reply> Worker::h_login(const Request &rq) {
     if (!email.present_nonempty() || !password.present_nonempty()) co_return err(422, "email and password are required");
 
     Rows rows = co_await db({Query("user_login", {email.v})});
-    if (!rows.all_ok(1)) co_return db_error();
+    if (!rows.all_ok(1)) [[unlikely]] co_return db_error();
     const Res &r = rows[0];
     if (r.rows() == 0) co_return err(401, "invalid credentials");
     BcryptResult br = co_await bcrypt_verify(password.v, std::string(text(r, 0, 5)));
@@ -410,7 +416,7 @@ Task<Reply> Worker::h_login(const Request &rq) {
 
 Task<Reply> Worker::h_get_user(const Request &rq, int64_t viewer) {
     Rows rows = co_await db({Query("user_by_id", {viewer})});
-    if (!rows.all_ok(1)) co_return db_error();
+    if (!rows.all_ok(1)) [[unlikely]] co_return db_error();
     if (rows[0].rows() == 0) co_return err(401, "unauthorized");
     std::string body;
     user_json(body, rows[0], 0, token_of(rq));
@@ -437,7 +443,7 @@ Task<Reply> Worker::h_put_user(const Request &rq, int64_t viewer) {
     }
     Rows rows = co_await db_write(
         {Query("user_update", {viewer, email.param(), username.param(), hash, bio.param(), image.param()})}, true);
-    if (!rows.ok || rows.r.size() != 1) co_return db_error();
+    if (!rows.ok || rows.r.size() != 1) [[unlikely]] co_return db_error();
     const Res &r = rows[0];
     if (PQresultStatus(r) != PGRES_TUPLES_OK)
         co_return sqlstate(r) == "23505" ? err(422, "username or email already taken") : db_error();
@@ -449,7 +455,7 @@ Task<Reply> Worker::h_put_user(const Request &rq, int64_t viewer) {
 
 Task<Reply> Worker::h_profile(const Request &, std::string name, int64_t viewer) {
     Rows rows = co_await db({Query("profile", {viewer, name})});
-    if (!rows.all_ok(1)) co_return db_error();
+    if (!rows.all_ok(1)) [[unlikely]] co_return db_error();
     const Res &r = rows[0];
     if (r.rows() == 0) co_return err(404, "profile not found");
     std::string body;
@@ -459,7 +465,7 @@ Task<Reply> Worker::h_profile(const Request &, std::string name, int64_t viewer)
 
 Task<Reply> Worker::h_follow(const Request &, std::string name, int64_t viewer, bool follow) {
     Rows rows = co_await db_write({Query(follow ? "follow_slug" : "unfollow_slug", {viewer, name})});
-    if (!rows.all_ok(1)) co_return db_error();
+    if (!rows.all_ok(1)) [[unlikely]] co_return db_error();
     const Res &r = rows[0];
     if (r.rows() == 0) co_return err(404, "profile not found");
     std::string body;
@@ -501,7 +507,7 @@ Task<Reply> Worker::h_list(const Request &rq, int64_t viewer, bool feed) {
         qs.push_back(Query("count_all", {}));
     }
     Rows rows = co_await db(std::move(qs));
-    if (!rows.all_ok(feed ? 1 : 2)) co_return db_error();
+    if (!rows.all_ok(feed ? 1 : 2)) [[unlikely]] co_return db_error();
     Res page = rows[0];
     int64_t total;
     if (feed) {
@@ -521,7 +527,7 @@ Task<Reply> Worker::h_list(const Request &rq, int64_t viewer, bool feed) {
         first = false;
         article_json(body, page, i, false);
     }
-    body += R"(],"articlesCount":)";
+    json::lit(body, R"(],"articlesCount":)");
     body += std::to_string(total);
     body += '}';
     co_return Reply{200, std::move(body)};
@@ -529,7 +535,7 @@ Task<Reply> Worker::h_list(const Request &rq, int64_t viewer, bool feed) {
 
 Task<Reply> Worker::h_article(std::string slug, int64_t viewer) {
     Rows rows = co_await db({Query("article_by_slug", {viewer, slug})});
-    if (!rows.all_ok(1)) co_return db_error();
+    if (!rows.all_ok(1)) [[unlikely]] co_return db_error();
     if (rows[0].rows() == 0) co_return err(404, "article not found");
     std::string body = R"({"article":)";
     article_json(body, rows[0], 0, true);
@@ -569,9 +575,9 @@ Task<Reply> Worker::h_create_article(const Request &rq, int64_t viewer) {
     size_t nq = qs.size();
     qs.push_back(Query("article_by_curr", {viewer}));  // read-back in the same segment sees the insert
     Rows ins = co_await db_write(std::move(qs), true);
-    if (!ins.all_ok(nq + 1)) co_return db_error();
+    if (!ins.all_ok(nq + 1)) [[unlikely]] co_return db_error();
     const Res &res = ins[nq];
-    if (res.rows() == 0) co_return db_error();
+    if (res.rows() == 0) [[unlikely]] co_return db_error();
     std::string out;
     take_buf(out); out.reserve(1536);
     out = R"({"article":)";
@@ -591,7 +597,7 @@ Task<Reply> Worker::h_update_article(const Request &rq, std::string slug, int64_
     // The update only matches the author's own article; the owner lookup in the same segment tells 403 from 404.
     Rows rows = co_await db_write({Query("article_update_full", {viewer, slug, title.param(), description.param(), body.param()}),
                                    Query("article_owner", {slug})});
-    if (!rows.all_ok(2)) co_return db_error();
+    if (!rows.all_ok(2)) [[unlikely]] co_return db_error();
     if (rows[0].rows() == 0) co_return rows[1].rows() == 0 ? err(404, "article not found") : err(403, "forbidden");
     std::string out;
     take_buf(out); out.reserve(1536);
@@ -603,7 +609,7 @@ Task<Reply> Worker::h_update_article(const Request &rq, std::string slug, int64_
 
 Task<Reply> Worker::h_delete_article(std::string slug, int64_t viewer) {
     Rows rows = co_await db_write({Query("article_delete_slug", {slug, viewer})});
-    if (!rows.all_ok(1)) co_return db_error();
+    if (!rows.all_ok(1)) [[unlikely]] co_return db_error();
     const Res &r = rows[0];
     if (i64(r, 0, 0) > 0) co_return Reply{204, {}};
     if (is_null(r, 0, 1)) co_return err(404, "article not found");
@@ -614,7 +620,7 @@ Task<Reply> Worker::h_favorite(std::string slug, int64_t viewer, bool add) {
     // The read-back runs in the same segment, so it sees this request's own write; no row means no such article.
     Rows rows = co_await db_write(
         {Query(add ? "fav_add_slug" : "fav_del_slug", {viewer, slug}), Query("article_by_slug", {viewer, slug})});
-    if (!rows.all_ok(2)) co_return db_error();
+    if (!rows.all_ok(2)) [[unlikely]] co_return db_error();
     if (rows[1].rows() == 0) co_return err(404, "article not found");
     std::string out;
     take_buf(out); out.reserve(1536);
@@ -626,7 +632,7 @@ Task<Reply> Worker::h_favorite(std::string slug, int64_t viewer, bool add) {
 
 Task<Reply> Worker::h_comments(std::string slug, int64_t viewer) {
     Rows rows = co_await db({Query("comments_by_slug", {viewer, slug})});
-    if (!rows.all_ok(1)) co_return db_error();
+    if (!rows.all_ok(1)) [[unlikely]] co_return db_error();
     const Res &r = rows[0];
     if (r.rows() == 0) co_return err(404, "article not found");
     std::string out;
@@ -636,7 +642,7 @@ Task<Reply> Worker::h_comments(std::string slug, int64_t viewer) {
         if (i) out += ',';
         comment_json(out, r, i, boolean(r, i, 7));
     }
-    out += "]}";
+    json::lit(out, "]}");
     co_return Reply{200, std::move(out)};
 }
 
@@ -648,7 +654,7 @@ Task<Reply> Worker::h_add_comment(const Request &rq, std::string slug, int64_t v
     if (!body.present_nonempty()) co_return err(422, "body is required");
 
     Rows rows = co_await db_write({Query("comment_insert_slug", {slug, viewer, body.v})});
-    if (!rows.all_ok(1)) co_return db_error();
+    if (!rows.all_ok(1)) [[unlikely]] co_return db_error();
     if (rows[0].rows() == 0) co_return err(404, "article not found");
     std::string out;
     take_buf(out); out.reserve(512);
@@ -662,7 +668,7 @@ Task<Reply> Worker::h_delete_comment(std::string slug, std::string id, int64_t v
     int64_t cid;
     if (!parse_i64(id, cid) || cid < 0) co_return err(404, "comment not found");
     Rows rows = co_await db_write({Query("comment_delete_slug", {cid, slug, viewer})});
-    if (!rows.all_ok(1)) co_return db_error();
+    if (!rows.all_ok(1)) [[unlikely]] co_return db_error();
     const Res &r = rows[0];
     if (i64(r, 0, 0) > 0) co_return Reply{204, {}};
     if (is_null(r, 0, 1)) co_return err(404, "comment not found");

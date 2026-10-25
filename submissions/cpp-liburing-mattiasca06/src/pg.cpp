@@ -33,6 +33,7 @@ void PgConn::connect(const char *url) {
 }
 
 bool PgConn::send_segment(void *tag, const std::vector<Query> &qs) {
+    maybe_ready = true;
     thread_local std::vector<const char *> values;
     for (const Query &q : qs) {
         values.clear();
@@ -56,6 +57,7 @@ bool PgConn::send_segment(void *tag, const std::vector<Query> &qs) {
 }
 
 bool PgConn::flush() {
+    maybe_ready = true;
     int rc = PQflush(c);
     if (rc < 0) dead = true;
     return rc == 1;
@@ -63,7 +65,7 @@ bool PgConn::flush() {
 
 void PgConn::drain(std::vector<Seg> &done) {
     if (!PQconsumeInput(c)) dead = true;
-    if (dead) {
+    if (dead) [[unlikely]] {
         for (Seg &s : inflight) {
             for (PGresult *r : s.res) PQclear(r);
             s.res.clear();

@@ -1,6 +1,7 @@
 // Hand-written JSON output helpers.
 #pragma once
 #include <cstdint>
+#include <cstring>
 #include <string>
 #if defined(__x86_64__)
 #include <immintrin.h>
@@ -9,6 +10,20 @@
 namespace json {
 
 inline constexpr char kHex[] = "0123456789abcdef";
+
+// Appends a string literal. std::string::append is an out-of-line libstdc++ call (strlen + memcpy through the PLT); with the
+// length known at compile time this writes the bytes inline instead.
+template <size_t N> inline void lit(std::string &o, const char (&s)[N]) {
+#if defined(_GLIBCXX_RELEASE) && _GLIBCXX_RELEASE >= 13
+    const size_t at = o.size();
+    o.__resize_and_overwrite(at + N - 1, [&](char *p, size_t) {
+        memcpy(p + at, s, N - 1);
+        return at + N - 1;
+    });
+#else
+    o.append(s, N - 1);
+#endif
+}
 
 // First index >= i whose byte needs escaping (`"`, `\`, or < 0x20); n if none.
 // x86-64: SSE2 (always present) 16 bytes at a time, AVX2 32 bytes at a time when the CPU has it (checked at run time,
@@ -54,9 +69,22 @@ inline size_t next_special(const char *s, size_t i, size_t n) {
 
 // Appends `s` as a quoted JSON string. Only `"`, `\` and bytes < 0x20 are escaped; other bytes (UTF-8) pass through.
 inline void str(std::string &o, const char *s, size_t n) {
+    size_t i = next_special(s, 0, n);
+#if defined(_GLIBCXX_RELEASE) && _GLIBCXX_RELEASE >= 13
+    if (i == n) [[likely]] {  // nothing to escape (the common case): quotes and bytes in one write
+        const size_t at = o.size();
+        o.__resize_and_overwrite(at + n + 2, [&](char *p, size_t) {
+            p[at] = '"';
+            memcpy(p + at + 1, s, n);
+            p[at + n + 1] = '"';
+            return at + n + 2;
+        });
+        return;
+    }
+#endif
     o.push_back('"');
     size_t run = 0;
-    for (size_t i = next_special(s, 0, n); i < n; i = next_special(s, i + 1, n)) {
+    for (; i < n; i = next_special(s, i + 1, n)) {
         unsigned char ch = static_cast<unsigned char>(s[i]);
         o.append(s + run, i - run);
         run = i + 1;
