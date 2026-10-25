@@ -65,6 +65,7 @@ pub fn parseHead(data: []const u8) Parsed {
         h.query = target[q + 1 ..];
     }
     var have_cl = false;
+    var has_close = false;
     var pos = line_end;
     while (pos + 2 <= head.len) {
         pos += 2; // skip CRLF
@@ -78,7 +79,7 @@ pub fn parseHead(data: []const u8) Parsed {
         const val = trimOws(l[colon + 1 ..]);
         switch (name.len) {
             13 => if (std.ascii.eqlIgnoreCase(name, "authorization")) {
-                h.auth = if (val.len == 0) null else val; // an empty header is no credential
+                h.auth = val;
             },
             14 => if (std.ascii.eqlIgnoreCase(name, "content-length")) {
                 if (val.len == 0 or val.len > 12) return .{ .bad = 400 };
@@ -94,8 +95,12 @@ pub fn parseHead(data: []const u8) Parsed {
             10 => if (std.ascii.eqlIgnoreCase(name, "connection")) {
                 var it = std.mem.tokenizeAny(u8, val, ", \t");
                 while (it.next()) |tok| {
-                    if (std.ascii.eqlIgnoreCase(tok, "close")) h.keep_alive = false;
-                    if (std.ascii.eqlIgnoreCase(tok, "keep-alive")) h.keep_alive = true;
+                    if (std.ascii.eqlIgnoreCase(tok, "close")) {
+                        has_close = true;
+                        h.keep_alive = false;
+                    } else if (std.ascii.eqlIgnoreCase(tok, "keep-alive")) {
+                        if (!has_close) h.keep_alive = true;
+                    }
                 }
             },
             17 => if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
@@ -268,6 +273,30 @@ test "parse head" {
     try std.testing.expectEqualStrings("Token abc.def.ghi", p.ok.auth.?);
     try std.testing.expect(parseHead("GET / HTTP/1.1\r\nHost: x\r\n") == .need_more);
     try std.testing.expectEqual(@as(u16, 400), parseHead("GET\r\n\r\n").bad);
+
+    // Empty authorization header preserves presence (empty string)
+    const p_empty_auth = parseHead("GET /api/articles HTTP/1.1\r\nHost: x\r\nAuthorization:\r\n\r\n");
+    try std.testing.expect(p_empty_auth == .ok);
+    try std.testing.expect(p_empty_auth.ok.auth != null);
+    try std.testing.expectEqualStrings("", p_empty_auth.ok.auth.?);
+
+    // Absent authorization header is null
+    const p_no_auth = parseHead("GET /api/articles HTTP/1.1\r\nHost: x\r\n\r\n");
+    try std.testing.expect(p_no_auth == .ok);
+    try std.testing.expect(p_no_auth.ok.auth == null);
+
+    // Connection: close takes precedence regardless of token order
+    const p_close_first = parseHead("GET / HTTP/1.1\r\nHost: x\r\nConnection: close, keep-alive\r\n\r\n");
+    try std.testing.expect(p_close_first == .ok);
+    try std.testing.expect(!p_close_first.ok.keep_alive);
+
+    const p_keepalive_first = parseHead("GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive, close\r\n\r\n");
+    try std.testing.expect(p_keepalive_first == .ok);
+    try std.testing.expect(!p_keepalive_first.ok.keep_alive);
+
+    const p_multi_conn = parseHead("GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n");
+    try std.testing.expect(p_multi_conn == .ok);
+    try std.testing.expect(!p_multi_conn.ok.keep_alive);
 }
 
 test "chunked" {

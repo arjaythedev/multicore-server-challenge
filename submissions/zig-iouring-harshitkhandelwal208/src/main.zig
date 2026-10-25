@@ -66,7 +66,7 @@ pub fn main(init: std.process.Init) !void {
         .pg_depth = std.math.clamp(envInt(init, "PG_DEPTH", 4), 1, 32), // a group commit may go one past the cap; the reply ring holds 64
         .batch_max = @max(1, @min(envInt(init, "BATCH_MAX", 64), 256)),
         .read_window_us = envInt(init, "READ_WINDOW_US", 100000), // a staged read waits at most this long for company
-        .read_hold_min = envInt(init, "READ_HOLD_MIN", 8192), // ... unless this many are staged already
+        .read_hold_min = envInt(init, "READ_HOLD_MIN", 2048), // ... unless this many are staged already (a full plan batch)
         .plan_min = envInt(init, "PLAN_MIN", 16), // batches of at least this many reads are answered by the planner (0 = never)
         .plan_max = @max(1, @min(envInt(init, "PLAN_MAX", 2048), 2048)),
         .plan_split = envInt(init, "PLAN_SPLIT", 0) != 0,

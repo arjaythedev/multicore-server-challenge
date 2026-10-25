@@ -70,7 +70,8 @@ pub const Sink = struct {
 };
 
 const qcap = 4096;
-const stale_ns: u64 = 15 * std.time.ns_per_s;
+/// Challenge generator client timeout is 10 s; drop work that waited >= 9.5 s to avoid wasting hashing CPU.
+const stale_ns: u64 = 9500 * std.time.ns_per_ms;
 
 pub const Pool = struct {
     mu: sync.Mutex = .{},

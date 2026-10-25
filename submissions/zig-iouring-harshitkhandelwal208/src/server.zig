@@ -267,7 +267,7 @@ const BatchRec = struct {
 // ---------------------------------------------------------------------------------------------
 
 const buf_size = 2048;
-const n_bufs = 2048;
+const n_bufs = 8192;
 const bgid = 1;
 
 pub const Worker = struct {

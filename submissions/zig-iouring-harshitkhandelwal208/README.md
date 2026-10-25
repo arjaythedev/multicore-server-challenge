@@ -22,6 +22,8 @@ JWTs and bcrypt, all on the Zig standard library.
 `build.sh` runs `zig build -Doptimize=ReleaseFast -Dcpu=native` (built on the box, so SHA-NI / BMI2 paths follow the CPU); the
 binary is about 670 KB.
 
+See [COMPETITIVE_ANALYSIS.md](COMPETITIVE_ANALYSIS.md) for a head-on architectural and efficiency comparison against current leaderboard leaders (Rust #1, C# #2, C #3) and competing Zig PRs.
+
 ## How it uses the cores
 
 - `WORKERS` workers, by default one per four CPUs (2 on the 8-vCPU box). **Each worker is its own process**: its own
