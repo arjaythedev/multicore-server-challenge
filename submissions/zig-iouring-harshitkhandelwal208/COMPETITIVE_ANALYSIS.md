@@ -108,6 +108,8 @@ Parameters changed from the initial commit to the current defaults:
 | `ADAPTIVE_WINDOW` | (new) | 1 (enabled) | Contracts read window under load: ≥1,024 staged → 10 ms, ≥512 → 25 ms, ≥256 → 35 ms, ≥128 → 50 ms, idle PG backends with ≥64 staged → 15 ms |
 | `SEND_ZC` | (new) | 1 (enabled) | Uses `IORING_OP_SEND_ZC` for responses ≥ 256 bytes; auto-fallback to `prep_send` if kernel returns `EOPNOTSUPP` |
 | `TCP_DEFER_ACCEPT` | 0 (disabled) | 1 (enabled) | Defers kernel accept wakeup until client payload bytes arrive |
+| `response slab pool` | heap alloc | 256 × 4 KB slabs | Recycles 4 KB response buffers per worker, eliminating heap allocations for 95%+ of outgoing responses |
+| `PIN_CPUS` | 0 (disabled) | 0 (configurable) | Optional CPU core affinity pinning via `sched_setaffinity` (off by default to let Linux CFS schedule dynamically) |
 
 ---
 

@@ -45,6 +45,18 @@ pub fn unmap(mem: []align(4096) u8) void {
     _ = linux.munmap(mem.ptr, mem.len);
 }
 
+pub fn cpuCount() usize {
+    return std.Thread.getCpuCount() catch 1;
+}
+
+pub fn pinCpu(cpu: usize) void {
+    var set: linux.cpu_set_t = std.mem.zeroes(linux.cpu_set_t);
+    const word_idx = cpu / (@sizeOf(usize) * 8);
+    const bit_idx: u6 = @intCast(cpu % (@sizeOf(usize) * 8));
+    set[word_idx] |= (@as(usize, 1) << bit_idx);
+    linux.sched_setaffinity(0, &set) catch {};
+}
+
 pub fn envGet(environ: [*:null]const ?[*:0]const u8, name: []const u8) ?[]const u8 {
     var i: usize = 0;
     while (environ[i]) |e| : (i += 1) {

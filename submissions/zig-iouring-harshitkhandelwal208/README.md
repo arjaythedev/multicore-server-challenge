@@ -89,7 +89,7 @@ See [COMPETITIVE_ANALYSIS.md](COMPETITIVE_ANALYSIS.md) for a head-on architectur
 
 `DATABASE_URL`, `JWT_SECRET`, `HOST`, `PORT` as in SPEC.md. Optional: `WORKERS` (default CPUs/4), `PROCS` (default = `WORKERS`;
 `1` runs the workers as threads of one process), `DB_CONNS` (default CPUs, max 95), `DB_WRITE_CONNS`, `PG_DEPTH` (4),
-`BCRYPT_THREADS`, `BCRYPT_LANES` (4), `BCRYPT_WAIT_MS` (250), `STATS=1`.
+`BCRYPT_THREADS`, `BCRYPT_LANES` (4), `BCRYPT_WAIT_MS` (250), `PIN_CPUS` (0: optional CPU pinning), `STATS=1`.
 
 Read batching: `READ_WINDOW_US` (100000: longest a read waits for company), `READ_HOLD_MIN` (2048: a plan goes out at once
 when this many reads are waiting), `ADAPTIVE_WINDOW` (1: dynamically scales the read hold timer based on staged depth and

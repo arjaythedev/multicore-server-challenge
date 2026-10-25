@@ -38,6 +38,7 @@ pub const Config = struct {
     plan_split: bool, // share the staged reads over the connections with room, instead of one plan taking up to plan_max
     adaptive_window: bool, // dynamic read window scaling under load
     send_zc: bool, // zero-copy network sends via IORING_OP_SEND_ZC
+    pin_cpus: bool, // pin worker threads/processes to CPUs
     bc_threads: u32,
     bc_lanes: u32,
     bc_wait_ms: u32,
@@ -106,6 +107,7 @@ const Conn = struct {
     out: [*]u8 = undefined,
     out_len: u32 = 0,
     out_off: u32 = 0,
+    out_cap: u32 = 0,
     zc_waiting: bool = false,
 };
 
@@ -272,6 +274,8 @@ const BatchRec = struct {
 const buf_size = 2048;
 const n_bufs = 16384;
 const bgid = 1;
+const slab_size = 4096;
+const slab_pool_cap = 256;
 
 pub const Worker = struct {
     shared: *Shared,
@@ -285,6 +289,8 @@ pub const Worker = struct {
     enc: Buf = .{},
     scratch: Scratch = undefined,
     free_reqs: ?*Req = null,
+    slabs: [slab_pool_cap][*]u8 = undefined,
+    slab_count: usize = 0,
     pgs: []PgConn = &.{},
     n_read: usize = 0,
     rr: [2]usize = .{ 0, 0 },
@@ -359,13 +365,28 @@ pub const Worker = struct {
         const ufd: usize = @intCast(fd);
         const c = &self.conns[ufd];
         if (!c.open or c.gen != gen) return;
-        const owned = gpa.alloc(u8, resp.len) catch {
-            self.closeConn(fd);
-            return;
+
+        const owned: []u8 = if (resp.len <= slab_size and self.slab_count > 0) blk: {
+            self.slab_count -= 1;
+            break :blk self.slabs[self.slab_count][0..slab_size];
+        } else if (resp.len <= slab_size) blk: {
+            const m = gpa.alloc(u8, slab_size) catch {
+                self.closeConn(fd);
+                return;
+            };
+            break :blk m;
+        } else blk: {
+            const m = gpa.alloc(u8, resp.len) catch {
+                self.closeConn(fd);
+                return;
+            };
+            break :blk m;
         };
-        @memcpy(owned, resp);
+
+        @memcpy(owned[0..resp.len], resp);
         c.out = owned.ptr;
         c.out_len = @intCast(resp.len);
+        c.out_cap = @intCast(owned.len);
         c.out_off = 0;
         c.close_after = !keep_alive;
         self.stats.reqs += 1;
@@ -448,11 +469,16 @@ pub const Worker = struct {
     }
 
     fn freeOut(self: *Worker, c: *Conn) void {
-        _ = self;
         if (c.zc_waiting or c.send_live) return;
-        if (c.out_len != 0) gpa.free(c.out[0..c.out_len]);
+        if (c.out_cap == slab_size and self.slab_count < slab_pool_cap) {
+            self.slabs[self.slab_count] = c.out;
+            self.slab_count += 1;
+        } else if (c.out_cap != 0) {
+            gpa.free(c.out[0..c.out_cap]);
+        }
         c.out_len = 0;
         c.out_off = 0;
+        c.out_cap = 0;
     }
 
     // ---- connection lifecycle ---------------------------------------------------------------
@@ -1557,6 +1583,10 @@ pub fn workerMain(shared: *Shared, id: usize) void {
 
 fn workerInit(shared: *Shared, id: usize) !void {
     const cfg = &shared.cfg;
+    if (cfg.pin_cpus) {
+        const cpus = @max(1, sys.cpuCount());
+        sys.pinCpu(id % cpus);
+    }
     const w = try gpa.create(Worker);
     w.* = .{ .shared = shared, .id = id };
     w.scratch = try Scratch.init(64 * 1024);
