@@ -1,3 +1,4 @@
+require "async"
 require "pg"
 
 module Conduit
@@ -55,7 +56,11 @@ module Conduit
         @line = nil
       end
 
-      def query(name, params)
+      # Errors that mean the connection is gone, rather than anything wrong with the query.
+      DISCONNECTED = [PG::ConnectionBad, PG::UnableToSend, PG::AdminShutdown, ClosedQueueError].freeze
+
+      # Reads are safe to repeat, so a query that finds its connection gone runs once more on a new one.
+      def query(name, params, retried: false)
         line = @line || open
         reply = Thread::Queue.new
         # Queue the reply and both messages before anything can yield, so they stay in order across fibers.
@@ -68,6 +73,11 @@ module Conduit
 
         result.check
         result
+      rescue *DISCONNECTED
+        raise if retried
+
+        @line = nil if @line.equal?(line)
+        query(name, params, retried: true)
       end
 
       private
@@ -77,9 +87,11 @@ module Conduit
         @statements.each { |name, sql| pg.prepare(name.name, sql) }
         pg.setnonblocking(true) # sends only buffer, and query flushes
         pg.enter_pipeline_mode
-        @line = Line.new(pg:, replies: Thread::Queue.new)
-        line = @line
-        Fiber.schedule { read(line) }
+        line = Line.new(pg:, replies: Thread::Queue.new)
+        @line = line
+        # The reader is a task of its own under the event loop, not a child of the request that happened to
+        # open the connection: Async stops a task's children with it, as when that request's client hangs up.
+        Async::Task.new(Fiber.scheduler) { read(line) }.run
         line
       end
 
@@ -95,7 +107,13 @@ module Conduit
           reply = nil
         end
       rescue PG::Error, IOError => error
-        # The connection is gone: fail the queries waiting on it; the next query opens a new one.
+        nil
+      ensure
+        retire(line, reply, error || PG::ConnectionBad.new("pipeline closed"))
+      end
+
+      # Takes a connection out of service, failing the queries waiting on it; the next query opens a new one.
+      def retire(line, reply, error)
         @line = nil if @line.equal?(line)
         line.replies.close
         reply&.push(error)
@@ -148,24 +166,46 @@ module Conduit
         conn = checkout
         begin
           yield conn
-        rescue PG::ConnectionBad, PG::UnableToSend
-          conn.pg.close
-          @open -= 1
-          conn = nil
+        rescue PG::Error
+          # A connection the server has dropped (it may say so with an error of its own, such as
+          # admin_shutdown) won't work again: replace it rather than return it to the pool.
+          unless conn.pg.status == PG::CONNECTION_OK
+            conn.pg.close unless conn.pg.finished?
+            @open -= 1
+            conn = nil
+          end
           raise
         ensure
           @idle.push(conn) if conn
         end
       end
 
+      # An idle connection, checked first: one the server dropped while it sat in the pool is replaced before
+      # a write is sent down it, so writes never need retrying.
       def checkout
-        return @idle.pop unless @idle.empty? && @open < @size
+        if @idle.empty? && @open < @size
+          @open += 1
+          return connect
+        end
 
-        @open += 1
-        Connection.new(pg: @connect.call, prepared: Set.new)
+        conn = @idle.pop
+        return conn if alive?(conn.pg)
+
+        conn.pg.close unless conn.pg.finished?
+        connect
       rescue PG::Error
         @open -= 1
         raise
+      end
+
+      def connect = Connection.new(pg: @connect.call, prepared: Set.new)
+
+      # Reads anything the server sent while the connection was idle, such as the error it sends as it hangs up.
+      def alive?(pg)
+        pg.consume_input
+        pg.status == PG::CONNECTION_OK
+      rescue PG::Error
+        false
       end
     end
   end
