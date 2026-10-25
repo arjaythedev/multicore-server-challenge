@@ -66,6 +66,21 @@ Tried and rejected:
 - **Nginx in front.** It saves the app ~7% CPU per request (fewer connection fibers for the GC to scan) and costs ~70 µs/request of its own. At 27k users locally it lost: p95 202 ms vs 27 ms direct.
 - **`plan_cache_mode = force_generic_plan`.** The list queries' parameterized `LIMIT`/`OFFSET` make Postgres re-plan them on every execution, but the generic plan for the global list took 1.8 s per call.
 
+## Why Falcon, not Puma
+
+Same app, same 8 workers, same pool and GC settings, with Puma 8.0.2 set up to match Falcon's keep-alive behaviour: unlimited requests per connection and a 120 s idle timeout.
+
+| Server | Users | req/s | p95 | p99 | CPU (of 8): app + Postgres (+ Nginx) | App CPU/request |
+|---|--:|--:|--:|--:|---|--:|
+| **Falcon, direct** | 20,000 | 5,303 | 5 ms | 25 ms | 3.05 + 1.49 | 575 µs |
+| Puma, direct (5 threads) | 20,000 | 5,280 | 10 ms | 22 ms | 4.77 + 1.63 | 904 µs |
+| Puma + Nginx (5 threads) | 20,000 | 5,273 | 52 ms | 144 ms | 3.37 + 1.63 + 0.39 | 639 µs |
+| **Falcon, direct** | 27,000 | 7,156 | 23 ms | 54 ms | 4.48 + 2.30 | 626 µs |
+| Puma + Nginx (5 threads) | 27,000 | 6,850 | 253 ms | 292 ms | 4.71 + 2.29 + 0.56 | 688 µs |
+| Puma, direct (5 threads) | 27,000 | 5,856 | 1,461 ms | 1,703 ms | 5.49 + 2.03 | 938 µs |
+
+Puma serving direct pays for every idle connection. Each time a keep-alive connection returns to its reactor, Puma re-sorts the reactor's whole timeout list, and a worker here holds ~3,000 idle browser connections. Two or three threads per worker made no difference (~900 µs per request at each). Behind Nginx, which is Puma's usual deployment, that cost goes away, but the thread hand-offs and Nginx's own CPU still leave it ~10% more expensive per request than Falcon serving direct, with a 5× worse tail at 27k.
+
 ## Rules
 
 - No caching across requests: every request reads Postgres, and there is no response cache, no query-result cache (the per-request query cache is off too), and no memoized token or bcrypt results.
