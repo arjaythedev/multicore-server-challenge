@@ -224,3 +224,44 @@ pub const USER_UPDATE: &str =
  password_hash = COALESCE($4, password_hash), bio = COALESCE($5, bio), image = COALESCE($6, image)
 WHERE id = $1
 RETURNING id, username, email, bio, image";
+
+/// The statement Postgres should prepare. Under a byte-order collation the app sorts tag names
+/// (`json::SORT_TAGS`), so the per-article and tag-list sorts are dropped from the SQL.
+pub fn prepared(sql: &str) -> std::borrow::Cow<'_, str> {
+    if !crate::json::SORT_TAGS.load(std::sync::atomic::Ordering::Relaxed) {
+        return sql.into();
+    }
+    unsorted_tags(sql).into()
+}
+
+fn unsorted_tags(sql: &str) -> String {
+    sql.replace("WHERE at.article_id = a.id ORDER BY 1)", "WHERE at.article_id = a.id)")
+        .replace("array_agg(t.name ORDER BY t.name)", "array_agg(t.name)")
+        .replace("ARRAY(SELECT name FROM tags ORDER BY name)", "ARRAY(SELECT name FROM tags)")
+}
+
+/// C and C.UTF-8 compare by code point, which for UTF-8 text is byte order.
+pub const COLLATION: &str = "SELECT datlocprovider::text, datcollate, datlocale FROM pg_database WHERE datname = current_database()";
+
+pub fn byte_order(provider: &str, collate: &str, locale: Option<&str>) -> bool {
+    match provider {
+        "c" => matches!(collate, "C" | "POSIX" | "C.UTF-8" | "C.utf8"),
+        "b" => matches!(locale, Some("C" | "C.UTF-8")),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_order_drops_every_tag_sort() {
+        for sql in [LIST_ALL, LIST_TAG, LIST_AUTHOR, LIST_FAVORITED, LIST_FEED, ARTICLE_BY_SLUG, ARTICLE_BY_ID, TAGS] {
+            let unsorted = unsorted_tags(sql);
+            assert!(!unsorted.contains("ORDER BY 1)") && !unsorted.contains("FROM tags ORDER BY"), "{sql}");
+        }
+        assert!(byte_order("c", "C.UTF-8", None) && byte_order("b", "", Some("C.UTF-8")));
+        assert!(!byte_order("c", "en_US.utf8", None) && !byte_order("i", "C", Some("und")));
+    }
+}

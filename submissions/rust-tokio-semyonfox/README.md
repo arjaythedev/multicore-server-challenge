@@ -37,6 +37,13 @@ DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=exampl
   read once. Viewer-specific flags stay separate. Batches of three or more personal feeds share article
   enrichment the same way, while each feed keeps its own page and count. Small or mixed batches use the
   baseline queries. Results never survive an execution.
+- Shared batches look tag names up once per execution. All the page's tags are joined to one small hash of
+  the 200-row `tags` table, instead of two index reads per tag. On aged data this cut feed buffer reads
+  by about 7%.
+- At startup the server reads the database collation. Under `C` or `C.UTF-8`, which order text like its
+  UTF-8 bytes, Postgres no longer sorts tag names per article or for the tag list, and the server sorts
+  them while writing the JSON. Any other collation keeps the sorts in SQL. In a profile these sorts were
+  about 2% of Postgres CPU, and the tag list alone sorted all 200 names on every call.
 - Comments route to connections already holding comment requests, like the other batched families.
 - Personal feeds return `following: true` because their article selection already joins the viewer's
   follows in the same statement snapshot. This removes a redundant index probe per returned article.
@@ -65,7 +72,7 @@ two write connections and one bcrypt worker. Existing process settings are docum
 ## Validation
 
 The candidate passes all 197 official conformance checks on both dev and full seeds. Both generated
-seeds match the upstream fingerprints. Concurrent read comparison covers 464 cases, including different
+seeds match the upstream fingerprints. Concurrent read comparison covers 470 cases, including different
 viewers, ordering, missing articles and empty pages. The database regression test compares batched
 rows against individual queries, including both comment-follow query variants. Clippy passes with warnings denied.
 
@@ -132,7 +139,27 @@ lower tails. Postgres CPU per request did not move outside the noise of a satura
 
 Measured and dropped in this iteration: weighting connection load by family cost (more Postgres CPU and
 lower throughput in both runs), looking articles up by the id in their slug (25% slower with a regex, no
-difference with the id parsed in the app), building tag names with one grouped join per batch (no
-difference), and read batch size 64 (one good and one very bad run). A 0 or 2 ms read wait was within noise
+difference with the id parsed in the app), building tag names with one grouped join for a single request
+(no difference, though the same join over a whole shared batch helps, as above), and read batch size 64 (one good and one very bad run). A 0 or 2 ms read wait was within noise
 of the default. Seven read connections gave the best tails locally (p95 66 and 71 ms against about 110 ms)
 at equal CPU. That is worth testing on the real box but is not the default.
+
+### Third iteration, profile-guided
+
+A `perf` profile of the Postgres backends under load on the aged database put 90% of Postgres CPU in the
+executor and 10% in the kernel. Most of it went to index lookups the queries need. Two changes came out of it.
+
+Tag names per shared batch: in three interleaved pairs on aged data, buffer accesses per request fell from
+101.5, 101.6 and 99.0 to 100.2, 99.9 and 96.8, and throughput rose 3 to 5% in every pair. Postgres CPU per
+request moved by -3% to +1%, within the noise of a fully busy host.
+
+Tag sorting under a byte-order collation, measured with pgbench on a `C.UTF-8` copy of the full seed, best
+of three runs: the tag list statement took 0.065 ms instead of 0.081 ms, and tags for a 10-article page
+0.174 ms instead of 0.180 ms. Three interleaved end-to-end pairs on that copy averaged 317 and 316 µs of
+Postgres CPU per request, so the gain is below what this machine can resolve. Conformance and the
+concurrent read comparison pass under both `en_US.utf8` and `C.UTF-8`, and the batched-read regression
+test runs on both.
+
+Measured and dropped: five bcrypt lanes instead of four and XORing each round key in before the S-box
+loads (both within noise of the current code on an i7-8750H), and sharing comment lists within a batch
+(only 0.4% of batched comment requests repeated an article).

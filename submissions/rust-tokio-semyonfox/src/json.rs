@@ -1,6 +1,7 @@
 //! Response JSON, written straight into a byte buffer (no intermediate structs), and Postgres timestamps.
 
 use std::error::Error;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use postgres_types::{FromSql, Type};
 
@@ -169,6 +170,10 @@ impl<'a> FromSql<'a> for Tags<'a> {
         *ty == Type::TEXT_ARRAY
     }
 }
+/// Set at startup when the database collation orders text like its UTF-8 bytes. Tag arrays then arrive
+/// unsorted and are sorted here, which is the same order `ORDER BY name` gives under that collation.
+pub static SORT_TAGS: AtomicBool = AtomicBool::new(false);
+
 impl Tags<'_> {
     pub fn write(&self, out: &mut Vec<u8>) {
         let raw = self.0;
@@ -179,21 +184,32 @@ impl Tags<'_> {
             assert_eq!(dims, 1, "one-dimensional tags");
             let n = int(12);
             let mut at = 20;
-            for i in 0..n {
+            let mut names = (0..n).map(|_| {
                 let len = int(at);
-                at += 4;
                 assert!(len >= 0, "non-null tag");
-                if i != 0 {
-                    out.push(b',');
-                }
-                str(
-                    out,
-                    std::str::from_utf8(&raw[at..at + len as usize]).expect("UTF-8 tag"),
-                );
-                at += len as usize;
+                let name = std::str::from_utf8(&raw[at + 4..at + 4 + len as usize]).expect("UTF-8 tag");
+                at += 4 + len as usize;
+                name
+            });
+            if SORT_TAGS.load(Ordering::Relaxed) {
+                // articles carry a handful of tags and the tag list about 200
+                let mut sorted: Vec<&str> = names.collect();
+                sorted.sort_unstable();
+                list(out, sorted.into_iter());
+            } else {
+                list(out, &mut names);
             }
         }
         out.push(b']');
+    }
+}
+
+fn list<'a>(out: &mut Vec<u8>, names: impl Iterator<Item = &'a str>) {
+    for (i, name) in names.enumerate() {
+        if i != 0 {
+            out.push(b',');
+        }
+        str(out, name);
     }
 }
 

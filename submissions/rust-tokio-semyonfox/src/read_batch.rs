@@ -80,12 +80,12 @@ pub async fn prepare(
             query.push_str("(article_id, comment_id, body, created_at, updated_at, username, bio, image, following) ORDER BY r.ord, q.created_at DESC, q.comment_id DESC");
         }
         let shared = match shared_list(text, &args, &names) {
-            Some(shared) => Some(client.prepare_typed(&shared, &types).await?),
+            Some(shared) => Some(client.prepare_typed(&sql::prepared(&shared), &types).await?),
             None => None,
         };
         batches.push(Batch {
             original: original.clone(),
-            statement: client.prepare_typed(&query, &types).await?,
+            statement: client.prepare_typed(&sql::prepared(&query), &types).await?,
             shared,
             feed: text == sql::LIST_FEED,
             broadcast: false,
@@ -258,14 +258,18 @@ fn shared_list(text: &str, args: &[String], names: &[String]) -> Option<String> 
         "WITH requests AS MATERIALIZED (
          SELECT * FROM unnest({}) WITH ORDINALITY AS r({},ord)),
          {pages}
-         article_ids AS (SELECT DISTINCT id FROM pages WHERE id IS NOT NULL),
+         article_ids AS MATERIALIZED (SELECT DISTINCT id FROM pages WHERE id IS NOT NULL),
+         page_tags AS MATERIALIZED (
+         SELECT at.article_id AS id, array_agg(t.name ORDER BY t.name) AS tags
+         FROM article_ids i JOIN article_tags at ON at.article_id = i.id JOIN tags t ON t.id = at.tag_id
+         GROUP BY at.article_id),
          enriched AS MATERIALIZED (
          SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, a.author_id,
-         ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) AS name
-               FROM article_tags at WHERE at.article_id = a.id ORDER BY 1) AS tags,
+         pt.tags,
          (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS fc,
          u.username, u.bio, u.image
-         FROM article_ids i JOIN articles a ON a.id = i.id JOIN users u ON u.id = a.author_id),
+         FROM article_ids i JOIN articles a ON a.id = i.id JOIN users u ON u.id = a.author_id
+         LEFT JOIN page_tags pt ON pt.id = a.id),
          viewer_pages AS MATERIALIZED (
          SELECT viewer, array_agg(id) AS ids FROM pages WHERE id IS NOT NULL GROUP BY viewer),
          favorited AS MATERIALIZED (
@@ -432,9 +436,17 @@ mod tests {
         struct Raw(Vec<u8>);
         impl<'a> FromSql<'a> for Raw {
             fn from_sql(
-                _: &Type,
+                ty: &Type,
                 raw: &'a [u8],
             ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+                // under a byte-order collation tag arrays come unsorted and the response sorts them
+                if *ty == Type::TEXT_ARRAY
+                    && crate::json::SORT_TAGS.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    let mut tags = Vec::<String>::from_sql(ty, raw)?;
+                    tags.sort_unstable();
+                    return Ok(Self(tags.join("\0").into_bytes()));
+                }
                 Ok(Self(raw.to_vec()))
             }
             fn accepts(_: &Type) -> bool {

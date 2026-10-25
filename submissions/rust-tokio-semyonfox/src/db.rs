@@ -314,7 +314,15 @@ async fn connect_one(url: &str, _write: bool) -> Result<Conn, tokio_postgres::Er
         .batch_execute("SET plan_cache_mode = force_generic_plan; SET jit = off")
         .await?;
 
-    let p = |sql: &'static str, types: &'static [Type]| client.prepare_typed(sql, types);
+    let row = client.query_one(sql::COLLATION, &[]).await?;
+    let sorted = sql::byte_order(row.get(0), row.get(1), row.get(2));
+    crate::json::SORT_TAGS.store(sorted, Ordering::Relaxed);
+
+    let c = &client;
+    let p = |sql: &'static str, types: &'static [Type]| {
+        let text = sql::prepared(sql).into_owned();
+        async move { c.prepare_typed(&text, types).await }
+    };
     let st = Stmts {
         list_all: p(sql::LIST_ALL, &[Type::INT8, Type::INT8, Type::INT8]).await?,
         list_tag: p(
