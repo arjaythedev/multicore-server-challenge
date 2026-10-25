@@ -2,6 +2,7 @@ package conduit;
 
 
 import io.avaje.http.api.Controller;
+import io.avaje.http.api.Valid;
 import io.avaje.http.api.Get;
 import io.avaje.http.api.Post;
 import io.avaje.http.api.Produces;
@@ -10,6 +11,7 @@ import io.helidon.webserver.http.ServerRequest;
 import org.ethelred.kiwiproc.exception.UncheckedSQLException;
 
 /** Users and auth: register, login, current user, update user. */
+@Valid
 @Controller
 class UserController implements ApiController {
 
@@ -41,14 +43,11 @@ class UserController implements ApiController {
     @Post("/api/users")
     @Produces(statusCode = 201)
     Dto.UserResponse register(Requests.Register request) {
-        Requests.Register.Registration user = Body.inner(request, Requests.Register::user, "user");
-        String username = Body.required(user.username(), "username");
-        String email = Body.required(user.email(), "email");
-        String password = Body.required(user.password(), "password");
-        String hash = passwords.hash(password);
+        Requests.Register.Registration user = request.user();
+        String hash = passwords.hash(user.password());
         UserDao.UserRow row;
         try {
-            row = users.insert(username, email, hash);
+            row = users.insert(user.username(), user.email(), hash);
         } catch (UncheckedSQLException ex) {
             throw translate(ex);
         }
@@ -59,11 +58,9 @@ class UserController implements ApiController {
     @Post("/api/users/login")
     @Produces(statusCode = 200)
     Dto.UserResponse login(Requests.Login request) {
-        Requests.Login.Credentials user = Body.inner(request, Requests.Login::user, "user");
-        String email = Body.required(user.email(), "email");
-        String password = Body.required(user.password(), "password");
-        UserDao.LoginRow row = users.findByEmail(email);
-        if (row == null || !passwords.verify(password, row.passwordHash())) {
+        Requests.Login.Credentials user = request.user();
+        UserDao.LoginRow row = users.findByEmail(user.email());
+        if (row == null || !passwords.verify(user.password(), row.passwordHash())) {
             throw new ApiException(401, "email or password is invalid");
         }
         return wrap(new UserDao.UserRow(row.id(), row.username(), row.email(), row.bio(), row.image()),
@@ -83,16 +80,12 @@ class UserController implements ApiController {
     @Put("/api/user")
     Dto.UserResponse update(ServerRequest req, Requests.UpdateUser request) {
         Auth.User caller = auth.user(req);
-        Requests.UpdateUser.Changes user = Body.inner(request, Requests.UpdateUser::user, "user");
-        String email = Body.optionalNonEmpty(user.email(), "email");
-        String username = Body.optionalNonEmpty(user.username(), "username");
-        String password = Body.optionalNonEmpty(user.password(), "password");
-        String bio = user.bio();
-        String image = user.image();
+        Requests.UpdateUser.Changes user = request.user();
+        String password = user.password();
         String hash = password == null ? null : passwords.hash(password);
         UserDao.UserRow row;
         try {
-            row = users.update(caller.id(), email, username, hash, bio, image);
+            row = users.update(caller.id(), user.email(), user.username(), hash, user.bio(), user.image());
         } catch (UncheckedSQLException ex) {
             throw translate(ex);
         }

@@ -2,12 +2,18 @@ package conduit;
 
 import java.util.List;
 
-import io.avaje.jsonb.Json;
 import org.jspecify.annotations.Nullable;
+
+import io.avaje.jsonb.Json;
+import io.avaje.validation.constraints.NotEmpty;
+import io.avaje.validation.constraints.NotNull;
+import io.avaje.validation.constraints.Valid;
 
 /**
  * Request body shapes from SPEC.md. Jsonb rejects a value of the wrong JSON type (a number where a string is
- * expected), and reads a missing or null field as null; {@link Body} turns both into a 422.
+ * expected) and reads a missing or null field as null. Validation runs before the controller method: a constraint
+ * without {@code @Nullable} makes the field required, and one with it applies only when the field is present.
+ * A violation is a 422 (see {@code Main}).
  */
 final class Requests {
 
@@ -15,46 +21,59 @@ final class Requests {
     }
 
     @Json
-    record Register(@Nullable Registration user) {
+    @Valid
+    record Register(@NotNull @Valid Registration user) {
         @Json
-        record Registration(@Nullable String username, @Nullable String email, @Nullable String password) {
+        @Valid
+        record Registration(@NotEmpty String username, @NotEmpty String email, @NotEmpty String password) {
         }
     }
 
     @Json
-    record Login(@Nullable Credentials user) {
+    @Valid
+    record Login(@NotNull @Valid Credentials user) {
         @Json
-        record Credentials(@Nullable String email, @Nullable String password) {
+        @Valid
+        record Credentials(@NotEmpty String email, @NotEmpty String password) {
         }
     }
 
     @Json
-    record UpdateUser(@Nullable Changes user) {
+    @Valid
+    record UpdateUser(@NotNull @Valid Changes user) {
         @Json
-        record Changes(@Nullable String email, @Nullable String username, @Nullable String password, @Nullable String bio,
-                @Nullable String image) {
+        @Valid
+        record Changes(@Nullable @NotEmpty String email, @Nullable @NotEmpty String username,
+                @Nullable @NotEmpty String password, @Nullable String bio, @Nullable String image) {
         }
     }
 
     @Json
-    record CreateArticle(@Nullable NewArticle article) {
+    @Valid
+    record CreateArticle(@NotNull @Valid NewArticle article) {
         @Json
-        record NewArticle(@Nullable String title, @Nullable String description, @Nullable String body,
-                @Nullable List<@Nullable String> tagList) {
+        @Valid
+        record NewArticle(@NotEmpty String title, @NotEmpty String description, @NotEmpty String body,
+                @Nullable List<@NotEmpty String> tagList) {
         }
     }
 
     @Json
-    record UpdateArticle(@Nullable Changes article) {
+    @Valid
+    record UpdateArticle(@NotNull @Valid Changes article) {
         @Json
-        record Changes(@Nullable String title, @Nullable String description, @Nullable String body) {
+        @Valid
+        record Changes(@Nullable @NotEmpty String title, @Nullable @NotEmpty String description,
+                @Nullable @NotEmpty String body) {
         }
     }
 
     @Json
-    record CreateComment(@Nullable NewComment comment) {
+    @Valid
+    record CreateComment(@NotNull @Valid NewComment comment) {
         @Json
-        record NewComment(@Nullable String body) {
+        @Valid
+        record NewComment(@NotEmpty String body) {
         }
     }
 }

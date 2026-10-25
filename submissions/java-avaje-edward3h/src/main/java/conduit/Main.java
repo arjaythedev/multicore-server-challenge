@@ -4,6 +4,7 @@ import java.time.Duration;
 import java.util.List;
 
 import io.avaje.inject.BeanScope;
+import io.avaje.http.api.ValidationException;
 import io.avaje.json.JsonException;
 import io.helidon.http.HeaderNames;
 import io.helidon.http.HttpException;
@@ -27,6 +28,11 @@ public class Main {
         routing.error(JsonException.class, (req, res, ex) -> res.status(Status.create(422))
                 .header(HeaderNames.CONTENT_TYPE, "application/json")
                 .send(errors.toJson(Dto.Errors.of("malformed JSON body"))));
+        routing.error(ValidationException.class, (req, res, ex) -> res.status(Status.create(422))
+                .header(HeaderNames.CONTENT_TYPE, "application/json")
+                .send(errors.toJson(Dto.Errors.of(ex.getErrors().stream()
+                        .map(v -> v.getPath() + " " + v.getMessage())
+                        .collect(java.util.stream.Collectors.joining("; "))))));
         routing.error(HttpException.class, (req, res, ex) -> res.status(ex.status())
                 .header(HeaderNames.CONTENT_TYPE, "application/json")
                 .send(errors.toJson(Dto.Errors.of(ex.getMessage()))));

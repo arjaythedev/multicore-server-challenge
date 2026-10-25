@@ -17,6 +17,7 @@ java {
 val avajeHttp = "3.12.1"
 val avajeInject = "12.7"
 val avajeJsonb = "3.16"
+val avajeValidator = "2.18"
 
 dependencies {
     implementation("io.avaje:avaje-http-api:$avajeHttp")
@@ -28,10 +29,13 @@ dependencies {
     implementation("org.postgresql:postgresql:42.7.14")
     implementation("at.favre.lib:bcrypt:0.10.2")
     implementation("org.jspecify:jspecify:1.0.0")
+    implementation("io.avaje:avaje-validator:$avajeValidator")
+    implementation("io.avaje:avaje-validator-constraints:$avajeValidator")
 
     annotationProcessor("io.avaje:avaje-http-helidon-generator:$avajeHttp")
     annotationProcessor("io.avaje:avaje-inject-generator:$avajeInject")
     annotationProcessor("io.avaje:avaje-jsonb-generator:$avajeJsonb")
+    annotationProcessor("io.avaje:avaje-validator-generator:$avajeValidator")
 }
 
 application {

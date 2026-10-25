@@ -13,6 +13,7 @@ with Avaje replacing Spring. One JVM; every request runs on its own virtual thre
 | DI | avaje-inject 12.7 |
 | HTTP | avaje-http 3.12.1 annotations and `helidon` generator, on Helidon SE (WebServer) 4.5.6 |
 | JSON | avaje-jsonb 3.16 |
+| Validation | avaje-validator 2.18 |
 | SQL | kiwiproc 1.0 (Gradle plugin), reference SQL from `SPEC.md` |
 | Driver and pool | pgjdbc 42.7.14, HikariCP 7.1.0 (10 connections per core, capped at 95, set in `start.sh`) |
 | bcrypt | `at.favre.lib:bcrypt` 0.10.2, cost 10 |
@@ -50,7 +51,10 @@ time and never touches the real database.
 
 - Controller methods take the request record (`Requests.java`) as a parameter and the generated route binds it with
   Jsonb, which rejects a value of the wrong JSON type, so `{"title": 123}` is a 422, not coerced. A parse error is a 422
-  through the `JsonException` handler in `Main.java`; `Body.java` turns missing, null and blank values into 422s. Passwords over 72 bytes are a 422.
+  through the `JsonException` handler in `Main.java`. Required and non-empty fields are checked by
+  [avaje-validator](https://avaje.io/validator/) constraints on the records (`@NotEmpty`; `@Nullable` plus `@NotEmpty` for
+  fields that are optional but can't be empty), which the generated route runs before the method; a violation is a 422
+  through the `ValidationException` handler. Only the password length in bytes (over 72 is a 422) is checked by hand.
 - JWTs are verified on every request with no cache: the signature is recomputed and the header and claims are parsed each
   time. Only the initialised `Mac` objects are reused (a lock-free pool).
 - Auth is a `@Filter` (`AuthFilter.java`) that runs before the body is bound, so a missing or invalid token is a 401 even

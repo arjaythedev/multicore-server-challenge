@@ -3,6 +3,7 @@ package conduit;
 import java.util.List;
 
 import io.avaje.http.api.Controller;
+import io.avaje.http.api.Valid;
 import io.avaje.http.api.Delete;
 import io.avaje.http.api.Get;
 import io.avaje.http.api.Post;
@@ -12,6 +13,7 @@ import io.helidon.webserver.http.ServerRequest;
 import org.jspecify.annotations.Nullable;
 
 /** Articles, the feed, and favorites. */
+@Valid
 @Controller
 class ArticleController implements ApiController {
 
@@ -103,14 +105,11 @@ class ArticleController implements ApiController {
     @Post("/api/articles")
     Dto.ArticleResponse create(ServerRequest req, Requests.CreateArticle request) {
         Auth.User caller = auth.user(req);
-        Requests.CreateArticle.NewArticle article = Body.inner(request, Requests.CreateArticle::article, "article");
-        String title = Body.required(article.title(), "title");
-        String description = Body.required(article.description(), "description");
-        String text = Body.required(article.body(), "body");
-        List<String> tags = Body.stringList(article.tagList(), "tagList");
+        Requests.CreateArticle.NewArticle article = request.article();
+        List<String> tags = article.tagList() == null ? List.of() : article.tagList();
 
         long id = articles.call(d -> {
-            long newId = d.insert(caller.id(), title, description, text);
+            long newId = d.insert(caller.id(), article.title(), article.description(), article.body());
             if (!tags.isEmpty()) {
                 d.insertTags(tags);
                 d.tagArticle(newId, tags);
@@ -123,12 +122,9 @@ class ArticleController implements ApiController {
     @Put("/api/articles/{slug}")
     Dto.ArticleResponse update(String slug, ServerRequest req, Requests.UpdateArticle request) {
         Auth.User caller = auth.user(req);
-        Requests.UpdateArticle.Changes article = Body.inner(request, Requests.UpdateArticle::article, "article");
-        String title = Body.optionalNonEmpty(article.title(), "title");
-        String description = Body.optionalNonEmpty(article.description(), "description");
-        String text = Body.optionalNonEmpty(article.body(), "body");
+        Requests.UpdateArticle.Changes article = request.article();
         ArticleDao.OwnerRow owner = owner(caller, slug);
-        articles.update(owner.id(), title, description, text);
+        articles.update(owner.id(), article.title(), article.description(), article.body());
         return full(articles.findById(caller.id(), owner.id()));
     }
 

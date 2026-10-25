@@ -2,12 +2,14 @@ package conduit;
 
 
 import io.avaje.http.api.Controller;
+import io.avaje.http.api.Valid;
 import io.avaje.http.api.Delete;
 import io.avaje.http.api.Get;
 import io.avaje.http.api.Post;
 import io.helidon.webserver.http.ServerRequest;
 
 /** Comments on an article. */
+@Valid
 @Controller
 class CommentController implements ApiController {
 
@@ -43,9 +45,8 @@ class CommentController implements ApiController {
     @Post("/api/articles/{slug}/comments")
     Dto.CommentResponse create(String slug, ServerRequest req, Requests.CreateComment request) {
         Auth.User caller = auth.user(req);
-        String text = Body.required(Body.inner(request, Requests.CreateComment::comment, "comment").body(), "body");
         long articleId = articleId(slug);
-        CommentDao.NewCommentRow r = comments.insert(articleId, caller.id(), text);
+        CommentDao.NewCommentRow r = comments.insert(articleId, caller.id(), request.comment().body());
         return new Dto.CommentResponse(new Dto.Comment(r.id(), Dto.timestamp(r.createdAt()),
                 Dto.timestamp(r.updatedAt()), r.body(), new Dto.Profile(r.username(), r.bio(), r.image(), false)));
     }
