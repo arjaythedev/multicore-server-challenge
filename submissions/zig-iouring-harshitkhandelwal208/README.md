@@ -86,11 +86,13 @@ See [COMPETITIVE_ANALYSIS.md](COMPETITIVE_ANALYSIS.md) for a head-on architectur
 `1` runs the workers as threads of one process), `DB_CONNS` (default CPUs, max 95), `DB_WRITE_CONNS`, `PG_DEPTH` (4),
 `BCRYPT_THREADS`, `BCRYPT_LANES` (4), `BCRYPT_WAIT_MS` (250), `STATS=1`.
 
-Read batching: `READ_WINDOW_US` (100000: longest a read waits for company), `READ_HOLD_MIN` (8192: a plan goes out at once
-when this many reads are waiting), `PLAN_MIN` (16: smallest batch the planner takes; `0` turns the planner off, leaving
-per-kind batches only), `PLAN_MAX` (2048: reads per plan), `PLAN_SPLIT` (0: when `1`, the waiting reads are shared over the
-connections that have room instead of one plan taking up to `PLAN_MAX`; measured not to help, see Results), `BATCH_MAX`
-(64: reads of one kind per statement on the per-kind path; `1` turns that batching off).
+Read batching: `READ_WINDOW_US` (100000: longest a read waits for company), `READ_HOLD_MIN` (2048: a plan goes out at once
+when this many reads are waiting), `ADAPTIVE_WINDOW` (1: dynamically scales the read hold timer based on staged depth and
+idle Postgres connections to minimize p95 latency under high concurrency), `SEND_ZC` (1: zero-copy network sends via
+`IORING_OP_SEND_ZC` for responses >= 256 bytes with automatic fallback to standard `prep_send`), `PLAN_MIN` (16: smallest
+batch the planner takes; `0` turns the planner off, leaving per-kind batches only), `PLAN_MAX` (2048: reads per plan),
+`PLAN_SPLIT` (0: when `1`, the waiting reads are shared over the connections that have room instead of one plan taking up
+to `PLAN_MAX`), `BATCH_MAX` (64: reads of one kind per statement on the per-kind path; `1` turns that batching off).
 
 Test hooks (off by default): `NO_PBUF`, `TEST_FAIL_GROUPS`, `TEST_FAIL_BATCHES` (poisons per-kind batches and planner plans).
 

@@ -178,6 +178,15 @@ Configuration parameters tuned across the codebase to maximize concurrency and t
 | read_hold_min     | 8,192 requests  | 2,048 requests  | Matches plan_max (2,048); dispatches immediately   |
 |                   |                 |                 | on full batch, cutting p95 latency by up to 40 ms  |
 +-------------------+-----------------+-----------------+----------------------------------------------------+
+| ADAPTIVE_WINDOW   | 0 (Disabled)    | 1 (Enabled)     | Dynamically contracts read hold timer based on     |
+|                   |                 |                 | staged queue depth (1024->10ms, 512->25ms,         |
+|                   |                 |                 | 256->50ms) and PG idle backends (depth=0 -> 15ms), |
+|                   |                 |                 | eliminating p95 latency spikes under surge loads   |
++-------------------+-----------------+-----------------+----------------------------------------------------+
+| SEND_ZC           | 0 (Disabled)    | 1 (Enabled)     | Uses IORING_OP_SEND_ZC on responses >= 256 B,      |
+|                   |                 |                 | eliminating socket buffer copy in server userspace |
+|                   |                 |                 | with auto-fallback to prep_send if unsupported     |
++-------------------+-----------------+-----------------+----------------------------------------------------+
 | read_window_us    | 150,000 µs      | 100,000 µs      | 46.8 µs Postgres CPU/req; holds 39k users on rig   |
 +-------------------+-----------------+-----------------+----------------------------------------------------+
 | stale_ns          | 15,000,000,000  | 9,500,000,000   | Discards jobs >= 9.5s; saves 40.0 ms CPU per dead  |

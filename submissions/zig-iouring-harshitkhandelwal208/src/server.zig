@@ -36,6 +36,8 @@ pub const Config = struct {
     plan_min: u32, // this many staged reads (of any kind) are answered by the two-phase planner instead of per kind (0 = never)
     plan_max: u32, // reads per planned batch
     plan_split: bool, // share the staged reads over the connections with room, instead of one plan taking up to plan_max
+    adaptive_window: bool, // dynamic read window scaling under load
+    send_zc: bool, // zero-copy network sends via IORING_OP_SEND_ZC
     bc_threads: u32,
     bc_lanes: u32,
     bc_wait_ms: u32,
@@ -104,6 +106,7 @@ const Conn = struct {
     out: [*]u8 = undefined,
     out_len: u32 = 0,
     out_off: u32 = 0,
+    zc_waiting: bool = false,
 };
 
 const max_pend = http.max_body + http.max_head + 4096;
@@ -371,16 +374,49 @@ pub const Worker = struct {
 
     fn submitSend(self: *Worker, fd: i32, c: *Conn) void {
         const s = self.sqe();
-        s.prep_send(fd, (c.out + c.out_off)[0 .. c.out_len - c.out_off], linux.MSG.NOSIGNAL);
+        const to_send = (c.out + c.out_off)[0 .. c.out_len - c.out_off];
+        if (self.shared.cfg.send_zc and to_send.len >= 256 and c.out_off == 0) {
+            s.prep_send_zc(fd, to_send, linux.MSG.NOSIGNAL, 0);
+        } else {
+            s.prep_send(fd, to_send, linux.MSG.NOSIGNAL);
+        }
         s.user_data = ud(.send, c.gen, @intCast(fd));
         c.send_live = true;
     }
 
-    fn onSend(self: *Worker, fd: i32, gen: u32, res: i32) void {
+    fn onSend(self: *Worker, fd: i32, gen: u32, res: i32, flags: u32) void {
         const c = &self.conns[@intCast(fd)];
         if (c.gen & 0xffffff != gen) return;
+
+        // io_uring zero-copy buffer release notification (IORING_CQE_F_NOTIF)
+        if (flags & linux.IORING_CQE_F_NOTIF != 0) {
+            c.zc_waiting = false;
+            if (c.send_live) return;
+            self.freeOut(c);
+            if (!c.open or c.closing) {
+                self.maybeFinishClose(fd);
+                return;
+            }
+            c.busy = false;
+            if (c.close_after) {
+                self.closeConn(fd);
+                return;
+            }
+            if (c.pend_len != 0) self.parsePend(fd, c);
+            if (c.eof and c.open and !c.busy) self.closeConn(fd);
+            return;
+        }
+
         c.send_live = false;
         if (res < 0) {
+            const err_num = -res;
+            if (self.shared.cfg.send_zc and (err_num == @as(i32, @intFromEnum(linux.E.OPNOTSUPP)) or err_num == @as(i32, @intFromEnum(linux.E.INVAL)))) {
+                self.shared.cfg.send_zc = false;
+                if (c.open) {
+                    self.submitSend(fd, c);
+                    return;
+                }
+            }
             self.freeOut(c);
             self.closeConn(fd);
             self.maybeFinishClose(fd); // closeConn does nothing when the connection was already closing
@@ -391,22 +427,29 @@ pub const Worker = struct {
             self.submitSend(fd, c);
             return;
         }
-        self.freeOut(c);
-        if (!c.open) {
-            self.maybeFinishClose(fd);
-            return;
+
+        if (flags & linux.IORING_CQE_F_MORE != 0) {
+            c.zc_waiting = true;
+            if (!c.open) return;
+        } else {
+            self.freeOut(c);
+            if (!c.open) {
+                self.maybeFinishClose(fd);
+                return;
+            }
+            c.busy = false;
+            if (c.close_after) {
+                self.closeConn(fd);
+                return;
+            }
+            if (c.pend_len != 0) self.parsePend(fd, c);
+            if (c.eof and c.open and !c.busy) self.closeConn(fd);
         }
-        c.busy = false;
-        if (c.close_after) {
-            self.closeConn(fd);
-            return;
-        }
-        if (c.pend_len != 0) self.parsePend(fd, c);
-        if (c.eof and c.open and !c.busy) self.closeConn(fd);
     }
 
     fn freeOut(self: *Worker, c: *Conn) void {
         _ = self;
+        if (c.zc_waiting or c.send_live) return;
         if (c.out_len != 0) gpa.free(c.out[0..c.out_len]);
         c.out_len = 0;
         c.out_off = 0;
@@ -473,7 +516,7 @@ pub const Worker = struct {
 
     fn maybeFinishClose(self: *Worker, fd: i32) void {
         const c = &self.conns[@intCast(fd)];
-        if (!c.closing or c.recv_live or c.send_live) return;
+        if (!c.closing or c.recv_live or c.send_live or c.zc_waiting) return;
         self.freeOut(c);
         c.closing = false;
         c.busy = false;
@@ -948,12 +991,29 @@ pub const Worker = struct {
     pub fn flushReads(self: *Worker) void {
         if (self.staged == 0) return;
         const window_ns = @as(u64, self.shared.cfg.read_window_us) * 1000;
-        if (window_ns != 0 and self.staged < self.shared.cfg.read_hold_min) {
+        const effective_window_ns: u64 = if (!self.shared.cfg.adaptive_window) window_ns else blk: {
+            if (self.staged >= self.shared.cfg.read_hold_min) break :blk 0;
+            if (self.staged >= 1024) break :blk 10 * std.time.ns_per_ms;
+            if (self.staged >= 512) break :blk 25 * std.time.ns_per_ms;
+            if (self.staged >= 256) break :blk 50 * std.time.ns_per_ms;
+
+            var has_idle_pg = false;
+            for (self.pgs[0..self.n_read]) |*p| {
+                if (p.alive and p.depth == 0) {
+                    has_idle_pg = true;
+                    break;
+                }
+            }
+            if (has_idle_pg and self.staged >= 64) break :blk 15 * std.time.ns_per_ms;
+            break :blk window_ns;
+        };
+
+        if (effective_window_ns != 0 and self.staged < self.shared.cfg.read_hold_min) {
             // Young and few: wait for company. One timeout wakes the loop when the oldest has waited the window out.
             const waited = sys.nowNs() -| self.staged_since;
-            if (waited < window_ns) {
+            if (waited < effective_window_ns) {
                 if (!self.hold_armed) {
-                    const left = window_ns - waited;
+                    const left = effective_window_ns - waited;
                     self.hold_ts = .{ .sec = @intCast(left / 1_000_000_000), .nsec = @intCast(left % 1_000_000_000) };
                     const e = self.sqe();
                     e.prep_timeout(&self.hold_ts, 0, 0);
@@ -1373,7 +1433,7 @@ pub const Worker = struct {
         switch (tag) {
             .recv => self.onRecv(@intCast(idx), gen, cqe.res, cqe.flags),
             .poll => self.onPoll(@intCast(idx), gen, cqe.res, cqe.flags),
-            .send => self.onSend(@intCast(idx), gen, cqe.res),
+            .send => self.onSend(@intCast(idx), gen, cqe.res, cqe.flags),
             .accept => self.onAccept(cqe.res, cqe.flags),
             .pg_recv => self.onPgRecv(idx, cqe.res),
             .pg_send => self.onPgSend(idx, cqe.res),

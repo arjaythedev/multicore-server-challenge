@@ -70,6 +70,8 @@ pub fn main(init: std.process.Init) !void {
         .plan_min = envInt(init, "PLAN_MIN", 16), // batches of at least this many reads are answered by the planner (0 = never)
         .plan_max = @max(1, @min(envInt(init, "PLAN_MAX", 2048), 2048)),
         .plan_split = envInt(init, "PLAN_SPLIT", 0) != 0,
+        .adaptive_window = envInt(init, "ADAPTIVE_WINDOW", 1) != 0,
+        .send_zc = envInt(init, "SEND_ZC", 1) != 0,
         .bc_threads = @max(1, envInt(init, "BCRYPT_THREADS", @max(1, (cpus / 4 + procs - 1) / procs))),
         .bc_lanes = std.math.clamp(envInt(init, "BCRYPT_LANES", 4), 1, bcrypt.max_lanes),
         .bc_wait_ms = envInt(init, "BCRYPT_WAIT_MS", 250),
