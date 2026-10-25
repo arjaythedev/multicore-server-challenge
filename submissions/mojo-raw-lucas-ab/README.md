@@ -28,7 +28,7 @@ Toolchain: `install.sh` installs Mojo 1.2.0's compiler from PyPI (Modular's offi
 through `tools/run_submission.sh`, which runs any submission the way the box does: 197/197.
 
 Settings: `WORKERS` (default 2), Postgres connections per worker `PG_READ_CONNS` (default 6) and `PG_WRITE_CONNS` (default 2), `BCRYPT_WORKERS` (default 2),
-`PG_GENERIC_PLANS` (default 1).
+`PG_GENERIC_PLANS` (default 1), `PG_GROUP_STATS=N` (log commit-group counters every N groups).
 
 ## Optimizations
 
@@ -61,6 +61,15 @@ Settings: `WORKERS` (default 2), Postgres connections per worker `PG_READ_CONNS`
   UPDATE or DELETE goes to a write connection; the lookups before writes, and the re-reads after them, are reads.
   `tools/stall_test.sh` (writes to `favorites` locked 3 s in every 10, ~4k req/s): read p95 2.3 s → 0.3 ms
   (max 7 ms); overall p95 1.9 s → 1.3 ms. Writes still wait for the lock, as they must.
+
+- **Group commit on the write connections** (`PgConn.begin_member` / `close_group`, `app.on_group`). A write
+  connection has one batch in flight; requests that arrive meanwhile wait and then go out together, all their
+  statements before one Sync, so one implicit transaction and one WAL flush commit them (at most 128). A slow
+  flush makes the next group bigger instead of growing a queue of commits. Each response is still sent only after
+  its commit (rule 6). If any statement in a group fails, the whole transaction has rolled back, so each member is
+  resent alone and gets the result it would have had by itself; a lost connection ends the server, so an uncertain
+  commit is never retried. `tests/group_commit_check.py`: 60 registrations with duplicate usernames, piled up behind
+  a lock into groups that fail and are retried member by member: one 201 per username, the rest 422.
 
 Profiling tools (on a scratch copy only, with `pg_stat_statements`): `tools/pgss.py`, `tools/explain.py`,
 `tools/plan_modes.py`, `tools/ab.sh` + `tools/ab_report.py`.

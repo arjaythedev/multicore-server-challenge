@@ -323,6 +323,26 @@ struct Pending(ImplicitlyCopyable):
         self.a1 = 0
 
 
+# Pending.kind of a write connection's group-commit batch (see PgConn.close_group)
+comptime K_GROUP = -1
+comptime MAX_GROUP = 128
+
+
+struct Member(ImplicitlyCopyable):
+    """One request in a write group: who waits, where its messages are in the group's bytes, how many statements."""
+
+    var p: Pending
+    var off: Int
+    var len: Int
+    var stmts: Int
+
+    def __init__(out self, p: Pending, off: Int, len: Int, stmts: Int):
+        self.p = p
+        self.off = off
+        self.len = len
+        self.stmts = stmts
+
+
 struct PgConn(Copyable):
     var fd: Int
     var out: ByteBuf  # frontend messages not yet sent
@@ -332,6 +352,16 @@ struct PgConn(Copyable):
     var want_out: Bool
     var broken: Bool
     var _bind_at: Int  # length slot of the Bind being written
+    var _stmts: Int  # statements bound since begin_member
+
+    # Group commit, on write connections. Requests' statements collect in `group` (begin_member / end_member)
+    # while a group is in flight; close_group sends them all before one Sync, so one implicit transaction and one
+    # WAL flush commit them together. A slow flush makes the next group bigger instead of growing a queue.
+    var group: ByteBuf
+    var members: List[Member]
+    var sent: ByteBuf  # the in-flight group's messages, kept to retry its members one by one if it fails
+    var sent_members: List[Member]
+    var _member_at: Int
 
     def __init__(out self):
         self.fd = -1
@@ -342,9 +372,68 @@ struct PgConn(Copyable):
         self.want_out = False
         self.broken = False
         self._bind_at = 0
+        self._stmts = 0
+        self.group = ByteBuf()
+        self.members = List[Member]()
+        self.sent = ByteBuf()
+        self.sent_members = List[Member]()
+        self._member_at = 0
 
     def in_flight(self) -> Int:
         return len(self.queue) - self.head
+
+    def load(self) -> Int:
+        """Batches in flight plus requests waiting for the next group."""
+        return self.in_flight() + len(self.members)
+
+    def begin_member(mut self):
+        """The next statements bound (bind_begin ... bind_end) belong to a request for the next group."""
+        var t = self.out
+        self.out = self.group
+        self.group = t
+        self._member_at = self.out.len
+        self._stmts = 0
+
+    def end_member(mut self, p: Pending):
+        self.members.append(Member(p, self._member_at, self.out.len - self._member_at, self._stmts))
+        var t = self.out
+        self.out = self.group
+        self.group = t
+
+    def group_ready(self) -> Bool:
+        """Requests are waiting and nothing is in flight: time to send a group."""
+        return len(self.members) > 0 and self.in_flight() == 0
+
+    def close_group(mut self):
+        """Sends up to MAX_GROUP waiting requests before one Sync, as one transaction."""
+        var n = min(len(self.members), MAX_GROUP)
+        var cut = self.members[n - 1].off + self.members[n - 1].len
+        self.out.put_bytes(self.group.ptr, cut)
+        self.sync()
+        self.push(Pending(-1, 0, K_GROUP, True))
+        self.sent.len = 0
+        self.sent.put_bytes(self.group.ptr, cut)
+        self.sent_members.clear()
+        var rest = List[Member]()
+        for k in range(len(self.members)):
+            var m = self.members[k]
+            if k < n:
+                self.sent_members.append(m)
+            else:
+                m.off -= cut
+                rest.append(m)
+        self.members = rest^
+        self.group.consume(cut)
+
+    def retry_sent(mut self):
+        """The in-flight group failed and rolled back as a whole: resend each member alone (its own Sync), so it
+        gets the result it would have had by itself. Called when the group's ReadyForQuery arrives, so nothing else
+        is in flight on this connection."""
+        for k in range(len(self.sent_members)):
+            var m = self.sent_members[k]
+            self.out.put_bytes(self.sent.ptr.unsafe_offset(m.off), m.len)
+            self.sync()
+            self.push(m.p)
 
     def push(mut self, p: Pending):
         if self.head > 0 and self.head == len(self.queue):
@@ -388,6 +477,7 @@ struct PgConn(Copyable):
         put_be32(self.out, -1 & 0xFFFFFFFF)
 
     def bind_end(mut self):
+        self._stmts += 1
         put_be16(self.out, 0)  # all results in text format
         end_msg(self.out, self._bind_at)
         # Execute the unnamed portal, all rows

@@ -71,9 +71,14 @@ def param_ctx(mut w: Worker, pi: Int, fd: Int, idx: Int):
 
 
 def send_batch(mut w: Worker, i: Int, fd: Int, kind: Int) -> Bool:
-    """Ends the batch being written on connection `i` and records who waits for it."""
-    w.pgs[i].sync()
-    w.pgs[i].push(Pending(fd, w.conn(fd).gen, kind, w.conn(fd).keep_alive))
+    """Ends the batch being written on connection `i` and records who waits for it. On a write connection the
+    batch is a member of the next commit group (Worker.pg_write), sent with the others at the end of the round."""
+    var p = Pending(fd, w.conn(fd).gen, kind, w.conn(fd).keep_alive)
+    if i >= w.n_read:
+        w.pgs[i].end_member(p)
+    else:
+        w.pgs[i].sync()
+        w.pgs[i].push(p)
     return True
 
 

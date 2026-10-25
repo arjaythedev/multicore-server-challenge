@@ -95,6 +95,10 @@ struct Worker:
     var conns: ConnTable
     var pgs: List[PgConn]
     var n_read: Int  # pgs[:n_read] are for reads, the rest for writes (see pg_read)
+    var groups: Int  # commit groups sent, their members, and members retried alone after a failed group
+    var group_members: Int
+    var group_retries: Int
+    var log_groups_every: Int  # PG_GROUP_STATS=N: log the counters every N groups (0: never)
     var next_gen: Int
     var rr: Int  # round-robin start for picking a Postgres connection
     var bcs: List[Int]  # sockets to the bcrypt workers
@@ -117,6 +121,10 @@ struct Worker:
         self.conns = ConnTable()
         self.pgs = List[PgConn]()
         self.n_read = 0
+        self.groups = 0
+        self.group_members = 0
+        self.group_retries = 0
+        self.log_groups_every = 0
         self.next_gen = 1
         self.rr = 0
         self.bcs = List[Int]()
@@ -261,17 +269,20 @@ struct Worker:
         return self.pg_pick(0, self.n_read)
 
     def pg_write(mut self) -> Int:
-        """A connection for a batch that writes (INSERT, UPDATE or DELETE)."""
-        return self.pg_pick(self.n_read, len(self.pgs))
+        """A connection for a request that writes (INSERT, UPDATE or DELETE). Its statements join the connection's
+        next commit group (PgConn.begin_member); send_batch ends the member."""
+        var i = self.pg_pick(self.n_read, len(self.pgs))
+        self.pgs[i].begin_member()
+        return i
 
     def pg_pick(mut self, lo: Int, hi: Int) -> Int:
-        """The connection in pgs[lo:hi] with the fewest batches in flight, rotating among ties."""
+        """The connection in pgs[lo:hi] with the least work queued, rotating among ties."""
         var n = hi - lo
         var best = lo + self.rr % n
-        var best_load = self.pgs[best].in_flight()
+        var best_load = self.pgs[best].load()
         for k in range(1, n):
             var i = lo + (self.rr + k) % n
-            var load = self.pgs[i].in_flight()
+            var load = self.pgs[i].load()
             if load < best_load:
                 best = i
                 best_load = load
@@ -305,6 +316,10 @@ struct Worker:
 
     def pg_flush_all(mut self) -> Bool:
         for i in range(len(self.pgs)):
+            if self.pgs[i].group_ready():  # write connections: the requests that waited become one commit
+                self.pgs[i].close_group()
+                self.groups += 1
+                self.group_members += len(self.pgs[i].sent_members)
             if not self.pgs[i].want_out and not self.pg_flush(i):
                 return False
         return True

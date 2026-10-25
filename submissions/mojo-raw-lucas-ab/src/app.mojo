@@ -20,7 +20,19 @@ from http import (
     MAX_BODY_BYTES,
 )
 from server import Worker, make_listener, MAX_EVENTS, SCRATCH_BYTES, PG_TAG, BC_TAG, FD_BITS
-from pg import PgConn, PgConfig, Pending, Results, pg_connect, be32, MSG_READY
+from pg import (
+    PgConn,
+    PgConfig,
+    Pending,
+    Results,
+    pg_connect,
+    be32,
+    MSG_READY,
+    MSG_ERROR,
+    MSG_COMMAND_COMPLETE,
+    MSG_EMPTY_QUERY,
+    K_GROUP,
+)
 from bcrypt_worker import get_u64, REPLY_BYTES
 from api import route, on_result, on_bcrypt, S_NONE
 import sql
@@ -48,6 +60,10 @@ def run_worker(id: Int, addr: UInt32, port: Int, cfg: PgConfig, read_conns: Int,
         log("worker " + String(id) + ": epoll_create1 failed: " + String(epfd))
         return 1
     var w = Worker(id, lfd, epfd, getenv("JWT_SECRET", ""))
+    try:
+        w.log_groups_every = Int(getenv("PG_GROUP_STATS", "0"))
+    except:
+        w.log_groups_every = 0
 
     var stmts = sql.statements()
     w.n_read = read_conns
@@ -247,10 +263,45 @@ def pg_on_readable(mut w: Worker, i: Int) -> Bool:
                 log("worker " + String(w.id) + ": ReadyForQuery with nothing in flight")
                 return False
             var pending = w.pgs[i].pop()
-            complete(w, pending, Results(base.unsafe_offset(start), pos - start))
+            if pending.kind == K_GROUP:
+                on_group(w, i, base.unsafe_offset(start), pos - start)
+            else:
+                complete(w, pending, Results(base.unsafe_offset(start), pos - start))
             start = pos
     w.pgs[i].inb.consume(start)
     return True
+
+
+def on_group(mut w: Worker, i: Int, p: BytePtr, n: Int):
+    """A commit group's batch is done. If any statement failed, the whole implicit transaction rolled back: its
+    members are resent one by one. Otherwise each member gets its own slice of the replies (its statements' results,
+    up to its last CommandComplete) as if it had been its own batch."""
+    var failed = False
+    var pos = 0
+    while pos + 5 <= n:
+        if p[unsafe_offset=pos] == MSG_ERROR:
+            failed = True
+            w.group_retries += len(w.pgs[i].sent_members)
+            break
+        pos += 1 + be32(p.unsafe_offset(pos + 1))
+    if w.log_groups_every > 0 and w.groups % w.log_groups_every == 0:
+        log("worker " + String(w.id) + ": " + String(w.groups) + " commit groups, " + String(w.group_members)
+            + " writes, " + String(w.group_retries) + " retried alone")
+    if failed:
+        w.pgs[i].retry_sent()
+        return
+    pos = 0
+    var start = 0
+    for k in range(len(w.pgs[i].sent_members)):
+        var m = w.pgs[i].sent_members[k]
+        var done = 0
+        while pos + 5 <= n and done < m.stmts:
+            var kind = p[unsafe_offset=pos]
+            pos += 1 + be32(p.unsafe_offset(pos + 1))
+            if kind == MSG_COMMAND_COMPLETE or kind == MSG_EMPTY_QUERY:
+                done += 1
+        complete(w, m.p, Results(p.unsafe_offset(start), pos - start))
+        start = pos
 
 
 def complete(mut w: Worker, p: Pending, res: Results):
