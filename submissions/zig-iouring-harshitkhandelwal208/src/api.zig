@@ -127,87 +127,103 @@ fn route(c: *Ctx) RouteError!void {
     if (!std.mem.startsWith(u8, path, "/api/")) return fail(c, 404, "not found");
     const rest = path[5..];
     const m = c.head.method;
-    if (std.mem.eql(u8, rest, "tags")) {
-        if (m != .get) return fail(c, 405, "method not allowed");
-        return tags(c);
-    }
-    if (std.mem.eql(u8, rest, "users")) {
-        if (m != .post) return fail(c, 405, "method not allowed");
-        return register(c);
-    }
-    if (std.mem.eql(u8, rest, "users/login")) {
-        if (m != .post) return fail(c, 405, "method not allowed");
-        return login(c);
-    }
-    if (std.mem.eql(u8, rest, "user")) {
-        return switch (m) {
-            .get => userGet(c),
-            .put => userUpdate(c),
-            else => fail(c, 405, "method not allowed"),
-        };
-    }
-    if (std.mem.startsWith(u8, rest, "profiles/")) {
-        const seg = rest[9..];
-        if (std.mem.endsWith(u8, seg, "/follow")) {
-            const name = seg[0 .. seg.len - 7];
-            if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null) return fail(c, 404, "not found");
-            return switch (m) {
-                .post => follow(c, name, true),
-                .delete => follow(c, name, false),
-                else => fail(c, 405, "method not allowed"),
-            };
-        }
-        if (seg.len == 0 or std.mem.indexOfScalar(u8, seg, '/') != null) return fail(c, 404, "not found");
-        if (m != .get) return fail(c, 405, "method not allowed");
-        return profile(c, seg);
-    }
-    if (std.mem.eql(u8, rest, "articles")) {
-        return switch (m) {
-            .get => articleList(c),
-            .post => articleCreate(c),
-            else => fail(c, 405, "method not allowed"),
-        };
-    }
-    if (std.mem.startsWith(u8, rest, "articles/")) {
-        const seg = rest[9..];
-        if (std.mem.eql(u8, seg, "feed")) {
+    if (rest.len < 4) return fail(c, 404, "not found");
+
+    const pfx = std.mem.readInt(u32, rest[0..4], .little);
+    switch (pfx) {
+        std.mem.readInt(u32, "tags", .little) => {
+            if (rest.len != 4) return fail(c, 404, "not found");
             if (m != .get) return fail(c, 405, "method not allowed");
-            return feed(c);
-        }
-        const slash = std.mem.indexOfScalar(u8, seg, '/');
-        const slug = if (slash) |s| seg[0..s] else seg;
-        if (slug.len == 0) return fail(c, 404, "not found");
-        if (slash == null) {
-            return switch (m) {
-                .get => articleGet(c, slug),
-                .put => articleUpdate(c, slug),
-                .delete => articleDelete(c, slug),
-                else => fail(c, 405, "method not allowed"),
-            };
-        }
-        const tail = seg[slash.? + 1 ..];
-        if (std.mem.eql(u8, tail, "favorite")) {
-            return switch (m) {
-                .post => favorite(c, slug, true),
-                .delete => favorite(c, slug, false),
-                else => fail(c, 405, "method not allowed"),
-            };
-        }
-        if (std.mem.eql(u8, tail, "comments")) {
-            return switch (m) {
-                .get => commentsList(c, slug),
-                .post => commentCreate(c, slug),
-                else => fail(c, 405, "method not allowed"),
-            };
-        }
-        if (std.mem.startsWith(u8, tail, "comments/")) {
-            const id = tail[9..];
-            if (std.mem.indexOfScalar(u8, id, '/') != null) return fail(c, 404, "not found");
-            if (m != .delete) return fail(c, 405, "method not allowed");
-            return commentDelete(c, slug, id);
-        }
+            return tags(c);
+        },
+        std.mem.readInt(u32, "user", .little) => {
+            if (rest.len == 4) {
+                return switch (m) {
+                    .get => userGet(c),
+                    .put => userUpdate(c),
+                    else => fail(c, 405, "method not allowed"),
+                };
+            }
+            if (rest[4] == 's') {
+                if (rest.len == 5) {
+                    if (m != .post) return fail(c, 405, "method not allowed");
+                    return register(c);
+                }
+                if (std.mem.eql(u8, rest[5..], "/login")) {
+                    if (m != .post) return fail(c, 405, "method not allowed");
+                    return login(c);
+                }
+            }
+            return fail(c, 404, "not found");
+        },
+        std.mem.readInt(u32, "prof", .little) => {
+            if (!std.mem.startsWith(u8, rest[4..], "iles/")) return fail(c, 404, "not found");
+            const seg = rest[9..];
+            if (std.mem.endsWith(u8, seg, "/follow")) {
+                const name = seg[0 .. seg.len - 7];
+                if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null) return fail(c, 404, "not found");
+                return switch (m) {
+                    .post => follow(c, name, true),
+                    .delete => follow(c, name, false),
+                    else => fail(c, 405, "method not allowed"),
+                };
+            }
+            if (seg.len == 0 or std.mem.indexOfScalar(u8, seg, '/') != null) return fail(c, 404, "not found");
+            if (m != .get) return fail(c, 405, "method not allowed");
+            return profile(c, seg);
+        },
+        std.mem.readInt(u32, "arti", .little) => {
+            if (!std.mem.startsWith(u8, rest[4..], "cles")) return fail(c, 404, "not found");
+            const after = rest[8..];
+            if (after.len == 0) {
+                return switch (m) {
+                    .get => articleList(c),
+                    .post => articleCreate(c),
+                    else => fail(c, 405, "method not allowed"),
+                };
+            }
+            if (after[0] != '/') return fail(c, 404, "not found");
+            const seg = after[1..];
+            if (std.mem.eql(u8, seg, "feed")) {
+                if (m != .get) return fail(c, 405, "method not allowed");
+                return feed(c);
+            }
+            const slash = std.mem.indexOfScalar(u8, seg, '/');
+            const slug = if (slash) |s| seg[0..s] else seg;
+            if (slug.len == 0) return fail(c, 404, "not found");
+            if (slash == null) {
+                return switch (m) {
+                    .get => articleGet(c, slug),
+                    .put => articleUpdate(c, slug),
+                    .delete => articleDelete(c, slug),
+                    else => fail(c, 405, "method not allowed"),
+                };
+            }
+            const tail = seg[slash.? + 1 ..];
+            if (std.mem.eql(u8, tail, "favorite")) {
+                return switch (m) {
+                    .post => favorite(c, slug, true),
+                    .delete => favorite(c, slug, false),
+                    else => fail(c, 405, "method not allowed"),
+                };
+            }
+            if (std.mem.eql(u8, tail, "comments")) {
+                return switch (m) {
+                    .get => commentsList(c, slug),
+                    .post => commentCreate(c, slug),
+                    else => fail(c, 405, "method not allowed"),
+                };
+            }
+            if (std.mem.startsWith(u8, tail, "comments/")) {
+                const id = tail[9..];
+                if (std.mem.indexOfScalar(u8, id, '/') != null) return fail(c, 404, "not found");
+                if (m != .delete) return fail(c, 405, "method not allowed");
+                return commentDelete(c, slug, id);
+            }
+            return fail(c, 404, "not found");
+        },
+        else => return fail(c, 404, "not found"),
     }
-    return fail(c, 404, "not found");
 }
 
 fn decodeSeg(c: *Ctx, raw: []const u8) RouteError![]const u8 {
@@ -778,7 +794,6 @@ fn onArticle(w: *Worker, r: *Req, batch: []const u8) void {
 fn onFavorite(w: *Worker, r: *Req, batch: []const u8) void {
     var rep = Reply.init(batch);
     if (!beginOk(w, r, &rep)) return;
-    rep.drain(); // the INSERT/DELETE statement
     renderArticle(w, r, &rep, 200);
 }
 
@@ -788,10 +803,6 @@ fn favorite(c: *Ctx, raw_slug: []const u8, on: bool) RouteError!void {
     const w = c.w;
     var e = beginBatch(w);
     e.bind(sql.id(if (on) .fav_add else .fav_del));
-    e.pInt8(c.viewer);
-    e.pText(slug);
-    e.exec();
-    e.bind(sql.id(.article));
     e.pInt8(c.viewer);
     e.pText(slug);
     e.exec();

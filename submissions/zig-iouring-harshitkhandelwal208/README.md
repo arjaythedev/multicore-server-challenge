@@ -49,10 +49,22 @@ See [COMPETITIVE_ANALYSIS.md](COMPETITIVE_ANALYSIS.md) for a head-on architectur
 
 - **Front: direct.** No Nginx hop, no gzip; one `send` per response (head and body in one buffer). Responses >= 256
   bytes use zero-copy `io_uring` sends (`IORING_OP_SEND_ZC`) to avoid copying into the kernel socket buffer, with
-  automatic fallback to standard `send` if the kernel does not support it.
+  automatic fallback to standard `send` if the kernel does not support it. Response assembly uses a 256-entry 4 KB slab pool,
+  recycling response buffers in $O(1)$ without general allocator churn.
+- **Fast SWAR integer prefix router.** HTTP request paths are routed in 1-2 CPU cycles via 32-bit integer matching on
+  little-endian route prefixes (`tags`, `user`, `prof`, `arti`), eliminating sequential string comparisons.
+- **Zero-allocation request staging.** Both `StageItem` (reads) and `Member` (writes) embed small-size inline buffers (128 B
+  and 256 B respectively) with heap fallback only for oversized bodies. Write group commit records (`WRec`) are statically
+  embedded in each `PgConn`, and `BatchRec`s cycle through a pre-allocated worker slab pool, eliminating heap allocations
+  across hot staging and group-commit paths.
 - **One statement, one round trip per request**, prepared once per connection, binary in and out (Postgres never formats a
-  timestamp or integer). Favorite toggles are two statements, publishing an article up to four, each in one transaction.
-  Session settings only: `plan_cache_mode=force_generic_plan`, `jit=off`, `max_parallel_workers_per_gather=0`.
+  timestamp or integer). Favorite and unfavorite toggles fold the modifying `INSERT`/`DELETE` and article decoration into a
+  single modifying CTE with delta counters (`favCols`), cutting statement execution and lock holding times in half.
+  Publishing an article uses up to four statements, each in one transaction. Session settings only:
+  `plan_cache_mode=force_generic_plan`, `jit=off`, `max_parallel_workers_per_gather=0`.
+- **Query plan & buffer cache affinity (`READ_ROUTE_SLACK`).** Connection routing prefers the PostgreSQL backend that
+  recently executed the same statement kind when its queue depth is within slack ($\le 2$) of the least-loaded connection,
+  keeping execution plans and PostgreSQL shared buffer cache pages warm.
 - **SQL shaped for generic plans** (checked equal to the SPEC reference SQL, see Tests): list pages pick their ids first
   and decorate only the rows returned; per-row favorited/following checks are index probes, not hashed sub-plans over the
   viewer's whole set; tag names come from the `tags` primary key instead of a join that hashes all 200 tags per article;

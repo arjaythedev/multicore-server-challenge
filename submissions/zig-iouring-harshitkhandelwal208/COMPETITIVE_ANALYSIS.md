@@ -71,7 +71,7 @@ Both hold about the same number of users (~39,000) on this budget. This branch u
 
 ## 4. Memory: Connection Overhead
 
-Idle keep-alive connections on this branch cost 48 bytes each (one struct slot indexed by fd). Receive buffers come from an 8,192-slot shared provided-buffer ring and are not per-connection. Measured on the rig:
+Idle keep-alive connections on this branch cost 48 bytes each (one struct slot indexed by fd). Receive buffers come from an 16,384-slot shared provided-buffer ring and are not per-connection. Measured on the rig:
 
 | Connections | RSS |
 |--:|--:|
@@ -109,6 +109,11 @@ Parameters changed from the initial commit to the current defaults:
 | `SEND_ZC` | (new) | 1 (enabled) | Uses `IORING_OP_SEND_ZC` for responses ≥ 256 bytes; auto-fallback to `prep_send` if kernel returns `EOPNOTSUPP` |
 | `TCP_DEFER_ACCEPT` | 0 (disabled) | 1 (enabled) | Defers kernel accept wakeup until client payload bytes arrive |
 | `response slab pool` | heap alloc | 256 × 4 KB slabs | Recycles 4 KB response buffers per worker, eliminating heap allocations for 95%+ of outgoing responses |
+| `request staging` | heap alloc | zero-alloc inline slabs | 128 B inline buffer for `StageItem` text, 256 B inline buffer for `Member` bytes, static `WRec` in `PgConn`, 64-entry `BatchRec` slab pool |
+| `favorite SQL CTE` | 2 statements | 1 modifying CTE | Folds `INSERT`/`DELETE` and article decoration into a single modifying CTE with delta counters (`favCols`), halving write statement count |
+| `router SWAR` | sequential `eql` | 32-bit integer switch | Dispatches route prefixes (`tags`, `user`, `prof`, `arti`) in 1-2 CPU cycles via little-endian integer matching |
+| `connection affinity` | pure round-robin | `READ_ROUTE_SLACK = 2` | Routes same statement kinds to recent PostgreSQL backends when queue depth is within slack, keeping query plans warm |
+| `bcrypt sink ring` | 256 items | 1,024 items | Absorbs registration/login spikes without triggering thread backpressure nanosleep |
 | `PIN_CPUS` | 0 (disabled) | 0 (configurable) | Optional CPU core affinity pinning via `sched_setaffinity` (off by default to let Linux CFS schedule dynamically) |
 
 ---

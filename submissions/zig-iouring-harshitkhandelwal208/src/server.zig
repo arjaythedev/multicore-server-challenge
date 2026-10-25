@@ -132,6 +132,48 @@ const prepare_list = blk: {
     break :blk out;
 };
 
+const max_group = 32;
+
+/// One write request inside a group commit: its encoded statements (with their own trailing Sync, used if the group
+/// has to be retried member by member) and how many statements it contributes.
+const Member = struct {
+    r: *Req,
+    k: u8,
+    buf: [256]u8 = undefined,
+    len: u16 = 0,
+    heap: ?[]u8 = null,
+
+    pub fn init(r: *Req, k: u8, bytes: []const u8) ?Member {
+        var m = Member{
+            .r = r,
+            .k = k,
+        };
+        if (bytes.len <= 256) {
+            @memcpy(m.buf[0..bytes.len], bytes);
+            m.len = @intCast(bytes.len);
+            m.heap = null;
+        } else {
+            m.heap = gpa.dupe(u8, bytes) catch return null;
+            m.len = @intCast(bytes.len);
+        }
+        return m;
+    }
+
+    pub fn slice(self: *const Member) []const u8 {
+        if (self.heap) |h| return h else return self.buf[0..self.len];
+    }
+
+    pub fn deinit(self: *Member) void {
+        if (self.heap) |h| gpa.free(h);
+        self.heap = null;
+    }
+};
+
+const WRec = struct {
+    n: u32,
+    m: [max_group]Member,
+};
+
 const PgConn = struct {
     fd: i32 = -1,
     class: Class = .read,
@@ -147,6 +189,8 @@ const PgConn = struct {
     depth: u32 = 0,
     ginflight: bool = false, // a group commit is in flight on this (write) connection
     staged: std.ArrayList(Member) = .empty, // writes waiting for the in-flight group to commit
+    wrec: WRec = undefined,
+    last_stmt: ?sql.Stmt = null,
 };
 
 const Queued = struct { r: *Req, bytes: []u8 };
@@ -180,7 +224,45 @@ const Fifo = struct {
 
 /// A read request waiting to be sent: its parameters, kept until a connection has room (so same-kind requests can be
 /// merged into one statement).
-pub const StageItem = struct { r: *Req, seq: u64, viewer: i64, limit: i32, offset: i32, text: []u8, single_only: bool = false };
+pub const StageItem = struct {
+    r: *Req,
+    seq: u64,
+    viewer: i64,
+    limit: i32,
+    offset: i32,
+    buf: [128]u8 = undefined,
+    len: u16 = 0,
+    heap: ?[]u8 = null,
+    single_only: bool = false,
+
+    pub fn init(r: *Req, seq: u64, viewer: i64, limit: i32, offset: i32, s: []const u8) ?StageItem {
+        var it = StageItem{
+            .r = r,
+            .seq = seq,
+            .viewer = viewer,
+            .limit = limit,
+            .offset = offset,
+        };
+        if (s.len <= 128) {
+            @memcpy(it.buf[0..s.len], s);
+            it.len = @intCast(s.len);
+            it.heap = null;
+        } else {
+            it.heap = gpa.dupe(u8, s) catch return null;
+            it.len = @intCast(s.len);
+        }
+        return it;
+    }
+
+    pub fn text(self: *const StageItem) []const u8 {
+        if (self.heap) |h| return h else return self.buf[0..self.len];
+    }
+
+    pub fn deinit(self: *StageItem) void {
+        if (self.heap) |h| gpa.free(h);
+        self.heap = null;
+    }
+};
 
 pub const ReadArgs = struct { viewer: i64 = 0, limit: i32 = 0, offset: i32 = 0, text: []const u8 = "" };
 
@@ -244,17 +326,6 @@ fn isBatchable(k: sql.Stmt) bool {
 }
 
 const max_batch = 256;
-
-/// One write request inside a group commit: its encoded statements (with their own trailing Sync, used if the group
-/// has to be retried member by member) and how many statements it contributes.
-const Member = struct { r: *Req, k: u8, bytes: []u8 };
-const max_group = 32;
-
-const WRec = struct {
-    n: u32,
-    m: [max_group]Member,
-};
-
 const sync_len = 5;
 
 const BatchRec = struct {
@@ -291,6 +362,8 @@ pub const Worker = struct {
     free_reqs: ?*Req = null,
     slabs: [slab_pool_cap][*]u8 = undefined,
     slab_count: usize = 0,
+    batch_rec_pool: [64]*BatchRec = undefined,
+    batch_rec_count: usize = 0,
     pgs: []PgConn = &.{},
     n_read: usize = 0,
     rr: [2]usize = .{ 0, 0 },
@@ -356,6 +429,23 @@ pub const Worker = struct {
         r.blob = &.{};
         r.next = self.free_reqs;
         self.free_reqs = r;
+    }
+
+    pub fn allocBatchRec(self: *Worker) ?*BatchRec {
+        if (self.batch_rec_count > 0) {
+            self.batch_rec_count -= 1;
+            return self.batch_rec_pool[self.batch_rec_count];
+        }
+        return gpa.create(BatchRec) catch null;
+    }
+
+    pub fn freeBatchRec(self: *Worker, rec: *BatchRec) void {
+        if (self.batch_rec_count < self.batch_rec_pool.len) {
+            self.batch_rec_pool[self.batch_rec_count] = rec;
+            self.batch_rec_count += 1;
+        } else {
+            gpa.destroy(rec);
+        }
     }
 
     // ---- sending responses ------------------------------------------------------------------
@@ -897,9 +987,9 @@ pub const Worker = struct {
         p.depth = 0;
         p.qh = 0;
         p.ginflight = false;
-        for (p.staged.items) |mem| {
+        for (p.staged.items) |*mem| {
             api.onPgFailure(self, mem.r);
-            gpa.free(mem.bytes);
+            mem.deinit();
         }
         p.staged.clearRetainingCapacity();
         p.wa.reset();
@@ -968,16 +1058,15 @@ pub const Worker = struct {
             1 => {
                 const rec: *BatchRec = @ptrFromInt(token & ~@as(usize, 3));
                 for (rec.reqs[0..rec.n]) |r| api.onPgFailure(self, r);
-                if (!rec.fanout) for (rec.items[0..rec.n]) |it| gpa.free(it.text);
-                gpa.destroy(rec);
+                if (!rec.fanout) for (rec.items[0..rec.n]) |*it| it.deinit();
+                self.freeBatchRec(rec);
             },
             2 => {
                 const rec: *WRec = @ptrFromInt(token & ~@as(usize, 3));
-                for (rec.m[0..rec.n]) |mem| {
+                for (rec.m[0..rec.n]) |*mem| {
                     api.onPgFailure(self, mem.r);
-                    gpa.free(mem.bytes);
+                    mem.deinit();
                 }
-                gpa.destroy(rec);
             },
             else => {
                 const rec: *plan.Plan = @ptrFromInt(token & ~@as(usize, 3));
@@ -991,26 +1080,44 @@ pub const Worker = struct {
 
     /// Queue a read; it is sent when a connection has room, merged with waiting reads of the same kind.
     pub fn readSubmit(self: *Worker, stmt: sql.Stmt, r: *Req, a: ReadArgs) void {
-        const text = gpa.dupe(u8, a.text) catch return api.onPgFailure(self, r);
         self.seq += 1;
+        const it = StageItem.init(r, self.seq, a.viewer, a.limit, a.offset, a.text) orelse return api.onPgFailure(self, r);
         if (self.staged == 0) self.staged_since = sys.nowNs();
-        self.stages[@backingInt(stmt)].push(.{ .r = r, .seq = self.seq, .viewer = a.viewer, .limit = a.limit, .offset = a.offset, .text = text });
+        self.stages[@backingInt(stmt)].push(it);
         self.staged += 1;
     }
 
-    fn bestReadConn(self: *Worker) ?*PgConn {
+    fn bestReadConn(self: *Worker, hint: ?sql.Stmt) ?*PgConn {
         const cap = self.shared.cfg.pg_depth;
         const n = self.n_read;
-        var best: ?*PgConn = null;
+        if (n == 0) return null;
+        var min_conn: ?*PgConn = null;
+        var min_depth: u32 = std.math.maxInt(u32);
+        var affinity_conn: ?*PgConn = null;
+
         var i: usize = 0;
         const start = self.rr[0];
         while (i < n) : (i += 1) {
             const p = &self.pgs[(start + i) % n];
             if (!p.alive or p.depth >= cap) continue;
-            if (best == null or p.depth < best.?.depth) best = p;
+            if (p.depth < min_depth) {
+                min_depth = p.depth;
+                min_conn = p;
+            }
+            if (hint != null and p.last_stmt == hint.? and affinity_conn == null) {
+                affinity_conn = p;
+            }
         }
-        self.rr[0] = (start + 1) % @max(n, 1);
-        return best;
+        self.rr[0] = (start + 1) % n;
+
+        // If a connection has warm query cache affinity and its depth is within slack of the minimum, prefer it.
+        const slack: u32 = 2;
+        if (affinity_conn) |ac| {
+            if (ac.depth <= min_depth + slack and ac.depth < cap) {
+                return ac;
+            }
+        }
+        return min_conn;
     }
 
     /// Send staged reads to connections with room, oldest kind first.
@@ -1058,8 +1165,8 @@ pub const Worker = struct {
                 // nothing can serve them: fail everything staged
                 for (&self.stages) |*st| {
                     while (st.len != 0) {
-                        const it = st.pop();
-                        gpa.free(it.text);
+                        var it = st.pop();
+                        it.deinit();
                         api.onPgFailure(self, it.r);
                     }
                 }
@@ -1073,7 +1180,6 @@ pub const Worker = struct {
                     .declined => {},
                 }
             }
-            const p = self.bestReadConn() orelse return;
             // oldest waiting kind
             var kind: usize = 0;
             var best_seq: u64 = std.math.maxInt(u64);
@@ -1085,19 +1191,21 @@ pub const Worker = struct {
             }
             const st = &self.stages[kind];
             const stmt: sql.Stmt = @fromBackingInt(@intCast(kind));
+            const p = self.bestReadConn(stmt) orelse return;
+            p.last_stmt = stmt;
             const n: usize = if (st.front().single_only) 1 else if (isBatchable(stmt) or stmt == .tags) st.batchableRun(batch_max) else 1;
             self.enc.reset();
             var e = pg.Enc.init(&self.enc);
             if (stmt == .tags and n > 1) {
                 // One execution answers all of them: they were all waiting before it started, and nothing is kept after.
-                const rec = gpa.create(BatchRec) catch return;
+                const rec = self.allocBatchRec() orelse return;
                 rec.n = @intCast(n);
                 rec.fanout = true;
                 rec.stmt = .tags;
                 for (0..n) |i| {
-                    const it = st.pop();
+                    var it = st.pop();
                     rec.reqs[i] = it.r;
-                    gpa.free(it.text);
+                    it.deinit();
                 }
                 self.staged -= n;
                 e.bind(sql.id(.tags));
@@ -1106,7 +1214,7 @@ pub const Worker = struct {
                 e.sync();
                 self.pgPush(p, @intFromPtr(rec) | 1, self.enc.slice());
             } else if (n == 1) {
-                const it = st.pop();
+                var it = st.pop();
                 self.staged -= 1;
                 e.bind(sql.id(stmt));
                 e.pInt8(it.viewer);
@@ -1114,13 +1222,13 @@ pub const Worker = struct {
                     e.pInt4(it.limit);
                     e.pInt4(it.offset);
                 }
-                if (shapeText(stmt)) e.pText(it.text);
+                if (shapeText(stmt)) e.pText(it.text());
                 e.exec();
                 e.sync();
-                gpa.free(it.text);
+                it.deinit();
                 self.pgPush(p, @intFromPtr(it.r), self.enc.slice());
             } else {
-                const rec = gpa.create(BatchRec) catch return;
+                const rec = self.allocBatchRec() orelse return;
                 rec.n = @intCast(n);
                 rec.fanout = false; // create() does not apply field defaults
                 var viewers: [max_batch]i64 = undefined;
@@ -1135,7 +1243,7 @@ pub const Worker = struct {
                     viewers[i] = it.viewer;
                     limits[i] = it.limit;
                     offsets[i] = it.offset;
-                    texts[i] = it.text;
+                    texts[i] = it.text();
                 }
                 self.staged -= n;
                 e.bind(sql.batchId(stmt));
@@ -1161,7 +1269,8 @@ pub const Worker = struct {
 
     /// Answer every staged read (all kinds) with one planned batch: see plan.zig.
     fn startPlan(self: *Worker) PlanStart {
-        const p = self.bestReadConn() orelse return .no_conn;
+        const p = self.bestReadConn(null) orelse return .no_conn;
+        p.last_stmt = null;
         var taken: std.ArrayList(plan.Taken) = .empty;
         defer taken.deinit(gpa);
         var kept: std.ArrayList(plan.Taken) = .empty; // single-only retries stay on the per-kind path
@@ -1239,7 +1348,7 @@ pub const Worker = struct {
     /// Reply to a batched statement: rows are tagged with the request's 1-based ordinal in their first column.
     /// Each request gets a synthetic single-statement reply (rows without that column) so handlers are unchanged.
     fn onBatchReply(self: *Worker, rec: *BatchRec, batch: []const u8) void {
-        defer gpa.destroy(rec);
+        defer self.freeBatchRec(rec);
         self.stats.batched_reqs += rec.n;
         self.stats.batches += 1;
         if (rec.fanout) {
@@ -1262,7 +1371,7 @@ pub const Worker = struct {
             }
             return;
         }
-        defer for (rec.items[0..rec.n]) |it| gpa.free(it.text);
+        defer for (rec.items[0..rec.n]) |*it| it.deinit();
         var rd = pg.Reader{ .data = batch };
         var pending: ?pg.Msg = null;
         const syn = &self.synth;
@@ -1310,9 +1419,10 @@ pub const Worker = struct {
             }
         }
         const p = best orelse return api.onPgFailure(self, r);
-        const copy = gpa.dupe(u8, bytes) catch return api.onPgFailure(self, r);
-        p.staged.append(gpa, .{ .r = r, .k = k, .bytes = copy }) catch {
-            gpa.free(copy);
+        const mem = Member.init(r, k, bytes) orelse return api.onPgFailure(self, r);
+        p.staged.append(gpa, mem) catch {
+            var m = mem;
+            m.deinit();
             return api.onPgFailure(self, r);
         };
         if (!p.ginflight) self.sendGroup(p);
@@ -1321,12 +1431,13 @@ pub const Worker = struct {
     fn sendGroup(self: *Worker, p: *PgConn) void {
         const n = @min(p.staged.items.len, max_group);
         if (n == 0) return;
-        const rec = gpa.create(WRec) catch return;
+        const rec = &p.wrec;
         rec.n = @intCast(n);
         self.enc.reset();
         for (0..n) |i| {
             rec.m[i] = p.staged.items[i];
-            self.enc.putSlice(rec.m[i].bytes[0 .. rec.m[i].bytes.len - sync_len]); // members' statements, no Sync
+            const s = rec.m[i].slice();
+            self.enc.putSlice(s[0 .. s.len - sync_len]); // members' statements, no Sync
         }
         if (self.shared.cfg.test_fail_groups and n >= 2) {
             // Bind to a statement that does not exist: the server answers with an error and rolls the group back.
@@ -1350,9 +1461,9 @@ pub const Worker = struct {
         }
         if (errored) {
             // Rolled back as a whole (nothing committed): run each member on its own.
-            for (rec.m[0..rec.n]) |mem| {
-                self.soloWrite(mem.r, mem.bytes);
-                gpa.free(mem.bytes);
+            for (rec.m[0..rec.n]) |*mem| {
+                self.soloWrite(mem.r, mem.slice());
+                mem.deinit();
             }
         } else {
             var rd = pg.Reader{ .data = batch };
@@ -1370,17 +1481,16 @@ pub const Worker = struct {
                 syn.putSlice("Z\x00\x00\x00\x05I");
                 start = rd.pos;
                 seen = 0;
-                const mem = rec.m[idx];
+                var mem = rec.m[idx];
                 idx += 1;
                 api.onPg(self, mem.r, syn.slice());
-                gpa.free(mem.bytes);
+                mem.deinit();
             }
             while (idx < rec.n) : (idx += 1) { // reply shorter than expected: should not happen
                 api.onPgFailure(self, rec.m[idx].r);
-                gpa.free(rec.m[idx].bytes);
+                rec.m[idx].deinit();
             }
         }
-        gpa.destroy(rec);
         if (p.staged.items.len != 0) self.sendGroup(p);
     }
 

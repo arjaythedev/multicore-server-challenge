@@ -63,6 +63,17 @@ fn cols(comptime following: []const u8, comptime body: bool) []const u8 {
         following ++ (if (body) ", a.body AS c13" else "");
 }
 
+fn favCols(comptime on: bool) []const u8 {
+    const fav_count = if (on)
+        "(SELECT count(*) FROM favorites f WHERE f.article_id = a.id) + (SELECT count(*) FROM ins) AS c7"
+    else
+        "(SELECT count(*) FROM favorites f WHERE f.article_id = a.id) - (SELECT count(*) FROM del) AS c7";
+    const favorited = if (on) "true AS c8" else "false AS c8";
+    return "a.id AS c0, a.slug AS c1, a.title AS c2, a.description AS c3, a.created_at AS c4, a.updated_at AS c5, " ++
+        decor_tags ++ ", " ++ fav_count ++ ", " ++ favorited ++ ", u.username AS c9, u.bio AS c10, u.image AS c11, " ++
+        decor_following ++ ", a.body AS c13";
+}
+
 const list_cols = cols(decor_following, false);
 const full_cols = cols(decor_following, true);
 const feed_cols = cols("true AS c12", false);
@@ -187,11 +198,11 @@ pub const defs = blk: {
         .params = &.{ I8, TX },
     };
     d[@intFromEnum(Stmt.fav_add)] = .{
-        .sql = "INSERT INTO favorites (user_id, article_id) SELECT $1, id FROM articles WHERE slug = $2 ON CONFLICT DO NOTHING",
+        .sql = "WITH a0 AS (SELECT id FROM articles WHERE slug = $2), ins AS (INSERT INTO favorites (user_id, article_id) SELECT $1, id FROM a0 ON CONFLICT DO NOTHING RETURNING 1) SELECT " ++ favCols(true) ++ " FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id = (SELECT id FROM a0)",
         .params = &.{ I8, TX },
     };
     d[@intFromEnum(Stmt.fav_del)] = .{
-        .sql = "DELETE FROM favorites WHERE user_id = $1 AND article_id = (SELECT id FROM articles WHERE slug = $2)",
+        .sql = "WITH a0 AS (SELECT id FROM articles WHERE slug = $2), del AS (DELETE FROM favorites WHERE user_id = $1 AND article_id = (SELECT id FROM a0) RETURNING 1) SELECT " ++ favCols(false) ++ " FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id = (SELECT id FROM a0)",
         .params = &.{ I8, TX },
     };
     break :blk d;

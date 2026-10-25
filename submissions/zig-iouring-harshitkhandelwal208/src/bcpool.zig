@@ -36,7 +36,7 @@ pub const Done = struct {
 /// Per-event-loop mailbox for finished jobs; the loop is woken through `efd`.
 pub const Sink = struct {
     mu: sync.Mutex = .{},
-    items: [256]Done = undefined,
+    items: [1024]Done = undefined,
     n: usize = 0,
     efd: i32 = -1,
 

@@ -135,7 +135,7 @@ pub const Result = enum { send_b, done, failed };
 
 /// Free a finished (or abandoned) plan. `free_text`: the staged items' parameter text is released too.
 pub fn destroy(p: *Plan, free_text: bool) void {
-    if (free_text) for (p.items) |it| gpa.free(it.text);
+    if (free_text) for (p.items) |*it| it.deinit();
     p.arena.deinit();
     gpa.destroy(p);
 }
@@ -166,10 +166,10 @@ fn startInner(w: *Worker, taken: []const Taken) !*Plan {
                 slot.kord = try page(al, g, "", t.it.limit, t.it.offset);
             },
             .tag, .author, .fav => {
-                const c = try g.ckeys.get(al, t.it.text);
-                if (c.fresh) try g.c_text.append(al, t.it.text);
+                const c = try g.ckeys.get(al, t.it.text());
+                if (c.fresh) try g.c_text.append(al, t.it.text());
                 slot.cord = c.ord;
-                slot.kord = try page(al, g, t.it.text, t.it.limit, t.it.offset);
+                slot.kord = try page(al, g, t.it.text(), t.it.limit, t.it.offset);
             },
             .feed => {
                 const vb = try al.dupe(u8, std.mem.asBytes(&t.it.viewer));
@@ -179,8 +179,8 @@ fn startInner(w: *Worker, taken: []const Taken) !*Plan {
                 slot.kord = try page(al, g, vb, t.it.limit, t.it.offset);
             },
             .slug, .cmts, .prof => {
-                const k = try g.pkeys.get(al, t.it.text);
-                if (k.fresh) try g.p_text.append(al, t.it.text);
+                const k = try g.pkeys.get(al, t.it.text());
+                if (k.fresh) try g.p_text.append(al, t.it.text());
                 slot.kord = k.ord;
             },
         }
