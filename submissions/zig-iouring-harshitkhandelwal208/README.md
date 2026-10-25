@@ -55,7 +55,7 @@ binary is about 670 KB.
   still carries the count; follow / comment / delete / update fold lookup and write into one CTE; comment threads (up to
   100 rows) test "does the viewer follow this author" against the viewer's followee set hashed once (-27% on a hot thread).
 - **Reads are batched by a two-phase planner, and what requests share is done once.** A waiting read is held for up to
-  150 ms (`READ_WINDOW_US`) for company, or until 8,192 reads are waiting. The batch (at most 2,048 reads, oldest first)
+  100 ms (`READ_WINDOW_US`) for company, or until 8,192 reads are waiting. The batch (at most 2,048 reads, oldest first)
   goes out as a plan: phase A runs one statement per kind of request present, each over the batch's distinct keys (capped
   counts and page rows, `unnest(...) WITH ORDINALITY`); phase B enriches the union of the articles phase A returned, once
   each (author, favourite count, tag names), and resolves each viewer's favourited / following flags with one `= ANY` range
@@ -84,7 +84,7 @@ binary is about 670 KB.
 `1` runs the workers as threads of one process), `DB_CONNS` (default CPUs, max 95), `DB_WRITE_CONNS`, `PG_DEPTH` (4),
 `BCRYPT_THREADS`, `BCRYPT_LANES` (4), `BCRYPT_WAIT_MS` (250), `STATS=1`.
 
-Read batching: `READ_WINDOW_US` (150000: longest a read waits for company), `READ_HOLD_MIN` (8192: a plan goes out at once
+Read batching: `READ_WINDOW_US` (100000: longest a read waits for company), `READ_HOLD_MIN` (8192: a plan goes out at once
 when this many reads are waiting), `PLAN_MIN` (16: smallest batch the planner takes; `0` turns the planner off, leaving
 per-kind batches only), `PLAN_MAX` (2048: reads per plan), `PLAN_SPLIT` (0: when `1`, the waiting reads are shared over the
 connections that have room instead of one plan taking up to `PLAN_MAX`; measured not to help, see Results), `BATCH_MAX`
@@ -124,7 +124,7 @@ processes per request, both in microseconds; raw runs are in `benchmarks/results
 
 | contender | steady p95 ms | steady p99 ms | full p95 ms | app µs/req | Postgres µs/req | total µs/req | req/s |
 |---|---|---|---|---|---|---|---|
-| **this branch, defaults** | 201 | 214 | 206 | 33 | 45 | **77** | 10,859 |
+| **this branch, defaults** (100 ms window) | 138 | 147 | 138 | 33 | 46 | **79** | 11,112 |
 | previous commit (`ed2e521`) | 1.0 | 1.8 | 1.8 | 34 | 147 | 181 | 11,658 |
 | #47 (WorriedArrow), default window | 32 | 38 | 42 | 37 | 55 | 92 | 11,528 |
 | #47, 2 ms window | 7.9 | 9.4 | 8.9 | 37 | 79 | 116 | 11,629 |
@@ -139,35 +139,53 @@ processes per request, both in microseconds; raw runs are in `benchmarks/results
 | #10 (tigokraft) | 0.9 | 1.5 | 37.7 | 44 | 188 | 232 | 11,618 |
 | #22 (jh-d) | 1.0 | 2.1 | 2.0 | 43 | 213 | 256 | 11,658 |
 
-The shipped defaults have the lowest CPU per request of the submissions measured at this load (77 µs, against 92 for
-#47's default window). They pay for it in latency: a read waits for its batch, so the steady p95 is about 200 ms, where
-the low-latency submissions are at 1–3 ms. Nothing here is a measurement on the official 8-vCPU box.
+The shipped defaults have the lowest CPU per request of the submissions measured at this load (79 µs, against 92 for
+#47's default window). They pay for it in latency: a read waits for its batch, so the steady p95 is about 140 ms, where
+the low-latency submissions are at 1–3 ms. (With the earlier 150 ms window the same build measured 77 µs and a p95 of about
+200 ms; see the window tables.) Nothing here is a measurement on the official 8-vCPU box.
 
-### The window trade-off (planner, 22,000 users, two rounds each)
+### The window trade-off
+
+At 22,000 users (planner, two rounds each):
 
 | read window | steady p95 ms | steady p99 ms | Postgres µs/req | total µs/req |
 |---|---|---|---|---|
 | 20 ms | 31 | 34 | 55 | 87 |
 | 50 ms | 72 | 77 | 48 | 79 |
 | 100 ms | 136 | 144 | 45 | 76 |
-| 150 ms (default) | 199 | 211 | 43 | 74 |
+| 150 ms (earlier default) | 199 | 211 | 43 | 74 |
 
 ### Saturation: how many users each build holds
 
 Same budget for every build: one server thread (CPU 0), one Postgres thread (CPU 1), load generator on eight threads. A
-user count passes when p95 < 500 ms, p99 < 1 s and errors < 1%. One round per probe. Beyond 28,000 connections from one
-address the ephemeral port range is widened (`net.ipv4.ip_local_port_range`) for the test and restored after.
+user count passes when p95 < 500 ms, p99 < 1 s and errors < 1%. Beyond 28,000 connections from one address the ephemeral
+port range is widened (`net.ipv4.ip_local_port_range`) for the test and restored after. The load generator on this budget
+cannot drive much beyond 40,000 users, so the knees are bracketed, not measured exactly.
 
-| build | last pass | first fail | estimated knee |
+The read window, at 38,000 users (two rounds each):
+
+| read window | steady p95 ms | steady p99 ms | full-window p95 ms | Postgres µs/req | total µs/req | req/s | passes |
+|---|---|---|---|---|---|---|---|
+| 80 ms | 357 | 373 | 390 | 47 | 76 | 18,086 | 2/2 |
+| **100 ms (default)** | **279** | **284** | **360** | 47 | 76 | 18,155 | 2/2 |
+| 120 ms | 338 | 351 | 365 | 47 | 75 | 17,972 | 2/2 |
+| 150 ms (earlier default) | 415 | 425 | 502 | 46 | 75 | 17,480 | 1/2 |
+
+The builds, at the knee:
+
+| build | last pass | first fail | knee (estimate) |
 |---|---|---|---|
 | previous commit (`ed2e521`) | 28,000 users: p95 291 ms, 13.6 k req/s | 32,000 users: p95 623 ms | ~29,500 |
-| this branch, defaults | 38,000 users: p95 487 ms, p99 573 ms, 17.6 k req/s | 40,000 users: p95 699 ms, load generator flagged | ~38,500 |
-| #47, default window | 38,000 users: p95 397 ms, p99 477 ms, 17.9 k req/s | 40,000 users: p95 813 ms, p99 1,408 ms | ~39,000 |
+| this branch, 100 ms window (default) | 38,000 users: p95 360 ms (both rounds pass) | 40,000 users: p95 526 and 567 ms (both rounds fail) | ~39,000 |
+| this branch, 150 ms window (earlier default) | 38,000 users: p95 477 and 527 ms (one round passes) | 40,000 users: flagged by the load generator | ~37,500 |
+| #47, default window | 38,000 users: p95 397 ms, p99 477 ms, one round | 40,000 users: p95 813 ms, p99 1,408 ms, one round | ~39,000 |
 | #64 | 20,000 users: p95 218 ms | not measured above 20,000 | not measured |
 
-On this budget, this branch and #47's default window hold about the same number of users (within the noise of single
-rounds: 1–2%). This branch uses about 10% less CPU per request at that point; #47 has the lower p95 at matched load (295
-ms against 432 ms at 36,000 users). This branch holds about 1.3 times the users of the previous commit.
+On this budget the 100 ms build and #47's default window hold about the same number of users, about 39,000, within the
+noise of one or two rounds. At 38,000 users this build's p95 (360 ms, two rounds) is below #47's (397 ms, one round). At
+36,000 users the earlier 150 ms build had 432 ms against #47's 295 ms, also one round each, so which build has the lower
+p95 depends on the load and is not settled. At that point this build uses about 10% less CPU per request. It holds about
+1.3 times the users of the previous commit.
 
 ### What was tried and not kept
 
@@ -199,9 +217,9 @@ its response (rule 6). bcrypt cost 10 on every hash and verify; HS256 signature,
   selects by id instead. Fixing it would need one combined statement, and a data-modifying CTE cannot see its own writes in the
   main query, so the counts would have to be adjusted by hand; it was left as is.
 - Needs Linux 5.19 or newer for the provided-buffer ring; older kernels use the poll + `recv` path.
-- Latency is a deliberate trade: a read waits up to `READ_WINDOW_US` (150 ms) for company, so the steady p95 at 22,000 users
-  is about 200 ms and p99 about 210 ms, well inside the 500 ms / 1 s limits but two orders of magnitude above the
-  low-latency submissions. `PLAN_MIN=0` gives the lowest latency (p95 about 1 ms) at about three times the Postgres cost (144 µs per request).
+- Latency is a deliberate trade: a read waits up to `READ_WINDOW_US` (100 ms) for company, so the steady p95 at 22,000 users
+  is about 140 ms and p99 about 150 ms, inside the 500 ms / 1 s limits but far above the low-latency submissions.
+  `PLAN_MIN=0` gives the lowest latency (p95 about 1 ms) at about three times the Postgres cost (144 µs per request).
 - The saturation numbers come from a single-thread budget on a 12-thread desktop. The load generator on that budget
   saturates at about 13 k req/s, so user counts above about 40,000 were not measured cleanly.
 

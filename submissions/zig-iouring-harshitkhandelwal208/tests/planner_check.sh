@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Differential check of the batch planner. Three servers on the same copy of the seed:
 #   reference  one statement per request (BATCH_MAX=1, planner off)           port 3101
-#   planner    the defaults (planner on, 150 ms window)                       port 3102
+#   planner    the defaults (planner on, 100 ms window)                       port 3102
 #   failing    the defaults with TEST_FAIL_BATCHES=1: every plan fails once   port 3103
 # batchdiff.py fires concurrent reads at a server and compares every response byte for byte with the reference, both on
 # spread-out and on hot (duplicate-heavy) requests. The failing server must also log planned batches that failed.
