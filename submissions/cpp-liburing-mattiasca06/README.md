@@ -9,7 +9,7 @@
 | HTTP parsing | picohttpparser, pinned commit, SHA-256 checked in `build.sh` |
 | JSON input | yyjson 0.10.0, SHA-256 checked in `build.sh` |
 | Postgres driver | libpq (Ubuntu 24.04 `libpq-dev`) in pipeline mode, binary results, prepared statements |
-| Password hashing | bcrypt cost 10 via libcrypt (`crypt_r`, `$2b$`) |
+| Password hashing | bcrypt cost 10 (`$2b$`), own Blowfish implementation, up to 4 hashes advanced in lockstep per thread |
 | JWT | HS256, hand-written on OpenSSL HMAC |
 
 Conformance: 197/197 on `test/run.sh`. No benchmark numbers yet.
