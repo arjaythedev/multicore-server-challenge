@@ -1,0 +1,50 @@
+includes:
+    - tools/vendor/phpat/phpat/extension.neon
+
+parameters:
+    level: max
+    paths:
+        - src
+        - config
+        - tests/Architecture
+        - tests/PHPStan
+        - tests/bootstrap.php
+        - tests/phpstan-bootstrap.php
+    excludePaths:
+        analyse:
+            # Written by the framework whenever the container builds.
+            - config/reference.php
+    # Registers the namespaces the rules and the architecture tests live in (see the file).
+    bootstrapFiles:
+        - tests/phpstan-bootstrap.php
+    # The Swoole classes the code names; the extension provides the real ones.
+    scanFiles:
+        - tests/stubs/swoole.php
+    phpat:
+        ignore_built_in_classes: false
+
+services:
+    -
+        class: App\Tests\Architecture\HexagonalArchitectureTestCase
+        tags:
+            - phpat.test
+    -
+        class: App\Tests\PHPStan\HandlerAuthorizationRule
+        tags:
+            - phpstan.rules.rule
+    -
+        class: App\Tests\PHPStan\HandlerNoReadRule
+        tags:
+            - phpstan.rules.rule
+    -
+        class: App\Tests\PHPStan\MapperTakesNoNullRule
+        tags:
+            - phpstan.rules.rule
+    -
+        class: App\Tests\PHPStan\MutableServiceStateRule
+        tags:
+            - phpstan.rules.rule
+    -
+        class: App\Tests\PHPStan\BuiltByItsMapperRule
+        tags:
+            - phpstan.rules.rule

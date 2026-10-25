@@ -1,0 +1,39 @@
+{
+  "name": "crossy-l/conduit-php-symfony-tools",
+  "description": "Test and analysis tools for the server in the parent folder. A separate project, so that installing the server's production dependencies never removes them.",
+  "type": "project",
+  "license": "MIT",
+  "minimum-stability": "stable",
+  "prefer-stable": true,
+  "require": {
+    "php": ">=8.5",
+    "ext-ctype": "*",
+    "ext-iconv": "*",
+    "ext-mbstring": "*",
+    "friendsofphp/php-cs-fixer": "3.95.*",
+    "phpat/phpat": "0.12.*",
+    "phpmd/phpmd": "3.0.*",
+    "phpstan/phpstan": "2.3.*",
+    "phpunit/phpunit": "13.4.*"
+  },
+  "config": {
+    "platform": {
+      "php": "8.5.12"
+    },
+    "sort-packages": true
+  },
+  "replace": {
+    "symfony/polyfill-ctype": "*",
+    "symfony/polyfill-iconv": "*",
+    "symfony/polyfill-mbstring": "*",
+    "symfony/polyfill-php72": "*",
+    "symfony/polyfill-php73": "*",
+    "symfony/polyfill-php74": "*",
+    "symfony/polyfill-php80": "*",
+    "symfony/polyfill-php81": "*",
+    "symfony/polyfill-php82": "*",
+    "symfony/polyfill-php83": "*",
+    "symfony/polyfill-php84": "*",
+    "symfony/polyfill-php85": "*"
+  }
+}

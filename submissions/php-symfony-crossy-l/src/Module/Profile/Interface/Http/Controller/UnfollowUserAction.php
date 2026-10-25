@@ -1,0 +1,36 @@
+<?php
+
+declare(strict_types=1);
+
+namespace App\Module\Profile\Interface\Http\Controller;
+
+use App\Module\Profile\Application\Command\UnfollowUser\UnfollowUserCommand;
+use App\Module\Profile\Application\Command\UnfollowUser\UnfollowUserCommandHandler;
+use App\Module\Profile\Interface\Http\Mapper\ProfileEnvelopeResponseMapper;
+use App\Shared\Domain\Security\CallerContext;
+use App\Shared\Interface\Http\JsonResponder;
+use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\HttpKernel\Attribute\AsController;
+use Symfony\Component\Routing\Attribute\Route;
+
+#[AsController]
+final class UnfollowUserAction
+{
+    public function __construct(
+        private readonly UnfollowUserCommandHandler $handler,
+        private readonly ProfileEnvelopeResponseMapper $responseMapper,
+        private readonly JsonResponder $json,
+    ) {
+    }
+
+    #[Route('/api/profiles/{username}/follow', name: 'profile_unfollow', methods: ['DELETE'])]
+    public function __invoke(CallerContext $caller, string $username): Response
+    {
+        $result = $this->handler->handle(new UnfollowUserCommand(caller: $caller, username: $username));
+
+        return $this->json->respond(
+            $this->responseMapper->toResponse($result),
+            Response::HTTP_OK,
+        );
+    }
+}

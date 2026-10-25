@@ -1,0 +1,6 @@
+# The image needs four files from the repository root; nothing else is sent to the builder.
+*
+!box/pg-conf.sh
+!submissions/php-symfony-crossy-l/install.sh
+!submissions/php-symfony-crossy-l/.devcontainer/box-pg-conf.sh
+!submissions/php-symfony-crossy-l/.devcontainer/devdb-up

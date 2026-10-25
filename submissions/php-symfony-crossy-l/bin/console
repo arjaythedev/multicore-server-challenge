@@ -1,0 +1,13 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+use App\Kernel;
+use Symfony\Bundle\FrameworkBundle\Console\Application;
+
+require_once dirname(__DIR__) . '/vendor/autoload_runtime.php';
+
+return static function (array $context): Application {
+    return new Application(Kernel::fromContext($context));
+};

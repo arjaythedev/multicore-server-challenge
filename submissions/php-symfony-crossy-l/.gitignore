@@ -1,0 +1,9 @@
+/vendor/
+/tools/vendor/
+/var/
+/.phpunit.cache/
+/.php-cs-fixer.cache
+/composer.phar
+/config/reference.php
+/.idea/
+/.vscode/

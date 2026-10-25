@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Starts the local PostgreSQL 18 cluster and makes the logins the challenge scripts expect:
+#   role conduit / password conduit      what the server connects as
+#   role postgres / password postgres    so PGHOST=127.0.0.1 PGUSER=postgres PGPASSWORD=postgres works
+#                                        the way it does in CI (seed/make-seed.sh, test/run.sh)
+# Safe to run repeatedly.
+#
+# PG_SHARED_BUFFERS (for example 1GB) lowers shared_buffers for machines with less memory than the
+# box's 16 GB; unset, the box's value stands. A change restarts the cluster.
+set -euo pipefail
+
+VERSION=18
+CLUSTER=main
+OVERRIDE="/etc/postgresql/$VERSION/$CLUSTER/conf.d/99-local.conf"
+
+as_root() { if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi; }
+# Superuser psql over the Unix socket (peer auth). The container's PGHOST, PGUSER and PGPASSWORD also
+# reach sudo through /etc/environment, and over TCP they need the postgres password this script sets.
+pg_super() { as_root runuser -u postgres -- psql -h /var/run/postgresql -qX "$@"; }
+
+want=""
+if [ -n "${PG_SHARED_BUFFERS:-}" ]; then want="shared_buffers = ${PG_SHARED_BUFFERS}"; fi
+have="$(cat "$OVERRIDE" 2>/dev/null || true)"
+
+restart=0
+if [ "$want" != "$have" ]; then
+  if [ -n "$want" ]; then
+    printf '%s\n' "$want" | as_root tee "$OVERRIDE" >/dev/null
+  else
+    as_root rm -f "$OVERRIDE"
+  fi
+  restart=1
+fi
+
+state="$(pg_lsclusters -h | awk -v v="$VERSION" -v c="$CLUSTER" '$1 == v && $2 == c {print $4}')"
+if [ "$state" != online ]; then
+  as_root pg_ctlcluster "$VERSION" "$CLUSTER" start
+elif [ "$restart" -eq 1 ]; then
+  as_root pg_ctlcluster "$VERSION" "$CLUSTER" restart
+fi
+
+for _ in $(seq 60); do
+  pg_isready -q -h 127.0.0.1 && break
+  sleep 1
+done
+pg_isready -q -h 127.0.0.1 || { echo "postgres did not come up on 127.0.0.1:5432" >&2; exit 1; }
+
+pg_super -v ON_ERROR_STOP=1 <<'SQL'
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'conduit') THEN
+    CREATE ROLE conduit LOGIN PASSWORD 'conduit';
+  ELSE
+    ALTER ROLE conduit LOGIN PASSWORD 'conduit';
+  END IF;
+END $$;
+ALTER ROLE postgres PASSWORD 'postgres';
+SQL
+
+echo "postgres $(pg_super -tAc 'show server_version') on 127.0.0.1:5432," \
+     "shared_buffers $(pg_super -tAc 'show shared_buffers')"

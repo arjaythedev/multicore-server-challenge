@@ -1,0 +1,72 @@
+version: '3'
+
+# Run from this folder. The challenge's own scripts (seed, conformance, load generator) live two levels up.
+
+vars:
+  TOOLS: tools/vendor/bin
+  ROOT: ../..
+  # Database user and host come from the PG* variables the devcontainer sets.
+  DEV_DB_URL: postgres://conduit:conduit@127.0.0.1:5432/conduit_dev
+
+tasks:
+  install:
+    desc: Install the server's dependencies and the test and analysis tools
+    cmds:
+      - composer install --no-interaction --no-progress
+      - composer install --working-dir=tools --no-interaction --no-progress
+
+  fix:
+    desc: Apply php-cs-fixer
+    cmds:
+      - "{{.TOOLS}}/php-cs-fixer fix --verbose"
+
+  lint:
+    desc: Check style with php-cs-fixer (no changes)
+    cmds:
+      - "{{.TOOLS}}/php-cs-fixer fix --dry-run --diff --verbose"
+
+  stan:
+    desc: PHPStan at its highest level, with the architecture tests and the custom rules
+    cmds:
+      - "{{.TOOLS}}/phpstan analyse --memory-limit=1G --autoload-file tests/phpstan-bootstrap.php"
+
+  md:
+    desc: PHPMD mess detector over src
+    cmds:
+      - "{{.TOOLS}}/phpmd analyze src --format text --ruleset phpmd.xml"
+
+  test-db:
+    desc: Create the integration-test database from the dev seed, if it is not there yet
+    cmds:
+      - bash tests/bin/create-test-database.sh
+
+  test-db-rebuild:
+    desc: Drop the integration-test database and copy the dev seed again
+    cmds:
+      - bash tests/bin/create-test-database.sh --rebuild
+
+  test:
+    desc: Unit and integration tests
+    deps: [test-db]
+    cmds:
+      - "php -d extension=swoole {{.TOOLS}}/phpunit --configuration phpunit.dist.xml {{.CLI_ARGS}}"
+
+  ci:
+    desc: What CI-style checking needs - lint, stan, md and the tests
+    cmds:
+      - task: lint
+      - task: stan
+      - task: md
+      - task: test
+
+  seed-dev:
+    desc: Build the 2% dev seed database (conduit_dev)
+    dir: '{{.ROOT}}'
+    cmds:
+      - bash seed/make-seed.sh --dev
+
+  conformance:
+    desc: Build, start and run the official 197-check conformance suite against this server
+    dir: '{{.ROOT}}'
+    cmds:
+      - bash test/run.sh submissions/php-symfony-crossy-l

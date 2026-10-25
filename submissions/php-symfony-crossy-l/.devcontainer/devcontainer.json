@@ -1,0 +1,42 @@
+{
+  "name": "PHP + Symfony + Swoole: Multicore Server Challenge",
+  // The image runs the submission's install.sh; the build context is the repository root.
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "../../.."
+  },
+  // The whole repository is mounted, because the seed, conformance and load-generator scripts the
+  // Taskfile calls live above this folder; the editor opens on the submission.
+  "workspaceMount": "source=${localWorkspaceFolder}/../..,target=/workspaces/multicore-server-challenge,type=bind",
+  "workspaceFolder": "/workspaces/multicore-server-challenge/submissions/php-symfony-crossy-l",
+  "remoteUser": "vscode",
+  // Postgres allocates the shared memory of parallel queries from /dev/shm, which Docker sizes at 64 MB by default.
+  "runArgs": ["--init", "--shm-size=1g"],
+  "containerEnv": {
+    // The same variables CI sets, so seed/make-seed.sh and test/run.sh run unchanged.
+    "PGHOST": "127.0.0.1",
+    "PGPORT": "5432",
+    "PGUSER": "postgres",
+    "PGPASSWORD": "postgres",
+    // Optional: set it on the host (for example 1GB) to run on a machine with less than the box's 16 GB.
+    "PG_SHARED_BUFFERS": "${localEnv:PG_SHARED_BUFFERS}"
+  },
+  // The database files live in a volume, so the full seed (2.4 GB) survives rebuilding the container.
+  "mounts": [
+    "source=multicore-challenge-pgdata,target=/var/lib/postgresql,type=volume"
+  ],
+  // Starts Postgres and creates the logins.
+  "postStartCommand": "/usr/local/bin/devdb-up",
+  "forwardPorts": [3000],
+  "portsAttributes": {
+    "3000": { "label": "Conduit API" }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": ["bmewburn.vscode-intelephense-client"],
+      "settings": {
+        "php.validate.executablePath": "/usr/local/bin/php"
+      }
+    }
+  }
+}
