@@ -8,7 +8,7 @@ Front: direct
 | HTTP/1.1, JSON, JWT (HS256), routing | hand-written, in `src/` |
 | Postgres driver | libpq (`libpq-dev`, 18.x from the PGDG repo that the box already has; 14+ works) in pipeline mode |
 | HMAC-SHA256 | OpenSSL 3.0 SHA-256 (`libssl-dev`) |
-| bcrypt | libxcrypt 4.4.36 (`libcrypt-dev`), cost 10 |
+| bcrypt | `src/bcrypt.c` (several hashes interleaved in one thread, see below), cost 10; libxcrypt 4.4.36 (`libcrypt-dev`) for salts and other hash formats |
 
 `install.sh` installs `gcc libc6-dev libpq-dev libssl-dev libcrypt-dev` with apt. `build.sh` is one `gcc` call
 (`-O2 -march=native`, no other dependencies). `start.sh` runs `bin/conduit`, configured by `DATABASE_URL`,
@@ -79,8 +79,17 @@ pipelined connection, and concurrent commits share flushes.
 **Binary results, text parameters.** Rows are read from libpq's result as binary (int8, bool, timestamptz as
 microseconds since 2000, `text[]` arrays) and written straight into the JSON response.
 
-**bcrypt** runs on its own threads (one per CPU, at a lower scheduling priority than the event loops and Postgres),
-so a ~40 ms hash never blocks a loop; the finished job comes back to its loop through a mailbox and an eventfd.
+**bcrypt** runs on its own threads (at a lower scheduling priority than the event loops and Postgres), so a hash
+never blocks a loop; the finished job comes back to its loop through a mailbox and an eventfd. A cost-10 hash is
+about a million Blowfish encryptions, each a chain of dependent S-box loads, so one hash at a time leaves the core
+mostly waiting on load latency. `src/bcrypt.c` computes up to 4 hashes at once in one thread, each step done for
+all of them back to back, so their chains overlap: on the test machine 13 ms of CPU per hash with 4 at once
+instead of libxcrypt's 37 ms (on a core shared with its hyper-thread sibling: 24 ms instead of 40 ms). Every hash
+is still full bcrypt at cost 10 with a fresh salt from libxcrypt, and every login is verified against its stored
+hash. One worker takes whatever is queued, so a batch fills up while it is busy and nobody waits for one; the
+other workers only start when two full batches are waiting. `bin/conduit --bcrypt-selftest` checks the output
+against libxcrypt on random passwords, salts and `$2a$`/`$2b$`/`$2y$` settings. `$2a$` with password bytes
+>= 0x80 (where libxcrypt applies a countermeasure for an old bug) and other formats go to libxcrypt.
 
 ## Rules
 
@@ -95,7 +104,8 @@ so a ~40 ms hash never blocks a loop; the finished job comes back to its loop th
 ## Configuration (env, optional)
 
 `THREADS` (event loops, default CPUs/4), `PG_READ_PER_LOOP` (3), `PG_WRITE_PER_LOOP` (16), `PG_DEPTH` (batches in
-flight per read connection, 1), `BATCH_MAX` (256), `BCRYPT_THREADS` (CPUs), `BCRYPT_NICE` (10).
+flight per read connection, 1), `BATCH_MAX` (256), `BCRYPT_THREADS` (CPUs; all but one are spare capacity), `BCRYPT_LANES` (hashes computed together, 4, at most 8),
+`BCRYPT_NICE` (10).
 `SHARE_READS` (default 0): if 1, tag-list requests that are all waiting when the statement goes out share one
 execution (the result is never kept for later requests).
 
@@ -106,11 +116,12 @@ Ideas taken from the write-ups of other submissions, implemented here from scrat
 separate write connections), [c-iouring-tigokraft](../c-iouring-tigokraft) (tag names by primary key, page ids
 before per-article work, the bounded inner `LIMIT 100`, generic plans, no TLS on the loopback connection, few
 connections), [rust-tokio-Scooter1337](../rust-tokio-Scooter1337) (sharing one execution among waiting tag-list
-requests, off by default here).
+requests, off by default here; interleaving several bcrypt hashes in one thread, also in c-iouring-tigokraft).
 
 ## Local results (not official)
 
 On a local emulation of the box (8 CPUs of a 16-thread desktop, Postgres 18 with the box's config, full seed, load
 generator on the other 8 CPUs over loopback), 2-minute probes: 145,000 users pass (38,000 req/s, p95 ~100 ms,
-p99 ~200 ms); a 5-minute hold passes at 140,000 users. Under the same setup the current leader passes about the
+p99 ~200 ms); a 5-minute hold passes at 150,000 users (37,600 req/s, p95 463 ms, p99 562 ms; 140,000 before
+the interleaved bcrypt). Under the same setup the current leader passes about the
 same number of users, so these numbers only compare submissions on that machine.

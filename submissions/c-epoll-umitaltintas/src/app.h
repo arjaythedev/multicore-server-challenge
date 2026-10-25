@@ -163,6 +163,21 @@ void bcrypt_hash(job_t *j, str_t pw, job_fn fn);                    // -> j->has
 void bcrypt_check(job_t *j, str_t pw, const char *hash, job_fn fn); // -> j->ok
 void mbx_drain(loop_t *L);
 
+// ---- bcrypt.c ----
+#define BC_MAXLANES 8
+typedef struct {
+  int cost;
+  char prefix[7];     // "$2b$10$"
+  char salt_txt[22];  // salt as libxcrypt writes it
+  uint32_t salt[4];
+  uint32_t key[18];
+  char out[61];       // result
+  char setting[30];   // self-test only
+} bc_req_t;
+int bc_prepare(bc_req_t *q, const char *pw, const char *setting);  // 0 = can be computed here
+void bc_compute(bc_req_t *q, int n);  // n prepared requests with one cost
+int bc_selftest(int rounds);
+
 // ---- json.c ----
 // Parse body as {"<wrap>": {...}}; for each name in keys, fill out[i]: n >= 0 for a string (decoded into
 // *sb), JSON_NULL for absent/null, JSON_BAD for another type. Array fields (arr_key) are returned as a
