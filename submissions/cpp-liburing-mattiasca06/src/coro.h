@@ -1,12 +1,46 @@
 // Minimal coroutine types. Everything runs on one worker thread, so no synchronization is needed.
 #pragma once
 #include <coroutine>
+#include <cstddef>
+#include <new>
 #include <exception>
 #include <utility>
+// Coroutine frames come from per-thread free lists (64-byte size classes up to 2 KiB) instead of malloc: a request
+// allocates and frees several frames, and they are all the same few sizes.
+namespace frame_pool {
+inline constexpr size_t kClass = 64, kClasses = 32;  // 64 .. 2048 bytes
+struct Node { Node *next; };
+inline Node *&head(size_t c) {
+    thread_local Node *heads[kClasses] = {};
+    return heads[c];
+}
+inline void *alloc(size_t n) {
+    size_t c = (n + kClass - 1) / kClass;
+    if (c == 0 || c > kClasses) return ::operator new(n);
+    Node *&h = head(c - 1);
+    if (h) {
+        Node *r = h;
+        h = r->next;
+        return r;
+    }
+    return ::operator new(c * kClass);
+}
+inline void release(void *p, size_t n) {
+    size_t c = (n + kClass - 1) / kClass;
+    if (c == 0 || c > kClasses) return ::operator delete(p);
+    Node *&h = head(c - 1);
+    Node *nd = static_cast<Node *>(p);
+    nd->next = h;
+    h = nd;
+}
+}  // namespace frame_pool
+
 
 // Lazy awaitable task: starts when awaited, resumes its awaiter on completion.
 template <class T> struct Task {
     struct promise_type {
+        static void *operator new(size_t n) { return frame_pool::alloc(n); }
+        static void operator delete(void *p, size_t n) { frame_pool::release(p, n); }
         T value{};
         std::exception_ptr ex;
         std::coroutine_handle<> cont;
@@ -48,6 +82,8 @@ template <class T> struct Task {
 // Fire-and-forget root coroutine; its frame is freed when it finishes.
 struct Detached {
     struct promise_type {
+        static void *operator new(size_t n) { return frame_pool::alloc(n); }
+        static void operator delete(void *p, size_t n) { frame_pool::release(p, n); }
         Detached get_return_object() { return {}; }
         std::suspend_never initial_suspend() noexcept { return {}; }
         std::suspend_never final_suspend() noexcept { return {}; }

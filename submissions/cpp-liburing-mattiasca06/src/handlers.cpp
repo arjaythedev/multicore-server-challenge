@@ -56,10 +56,15 @@ AuthState authenticate(const Request &rq, int64_t &viewer) {
 // ---- request JSON ----
 
 struct Doc {
+    // Small bodies are parsed in this inline pool (no malloc); anything bigger falls back to the heap.
+    alignas(8) char pool[4096];
+    yyjson_alc alc;
     yyjson_doc *d;
     explicit Doc(const std::string &s) : d(parse(s)) {}
-    static yyjson_doc *parse(const std::string &s) {
+    yyjson_doc *parse(const std::string &s) {
         PROF_SCOPE(kJsonIn);
+        if (yyjson_read_max_memory_usage(s.size(), 0) <= sizeof pool && yyjson_alc_pool_init(&alc, pool, sizeof pool))
+            return yyjson_read_opts(const_cast<char *>(s.data()), s.size(), 0, &alc, nullptr);
         return yyjson_read(s.data(), s.size(), 0);
     }
     ~Doc() { yyjson_doc_free(d); }

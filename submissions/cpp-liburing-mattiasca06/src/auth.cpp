@@ -56,9 +56,11 @@ bool Jwt::verify(std::string_view token, int64_t now, int64_t &sub) const {
     size_t d2 = token.find('.', d1 + 1);
     if (d2 == std::string_view::npos || token.find('.', d2 + 1) != std::string_view::npos) return false;
 
-    std::string hdr, sig, payload;
-    if (!codec::b64url_decode(token.substr(0, d1), hdr)) return false;
-    {
+    // reused per thread: verify() runs on the worker threads only, one call at a time
+    thread_local std::string hdr, sig, payload;
+    static constexpr std::string_view kStdHdr = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";  // what sign() emits
+    if (token.substr(0, d1) != kStdHdr) {  // anyone else's header: check the algorithm the slow way
+        if (!codec::b64url_decode(token.substr(0, d1), hdr)) return false;
         yyjson_doc *doc = yyjson_read(hdr.data(), hdr.size(), 0);
         if (!doc) return false;
         yyjson_val *alg = yyjson_obj_get(yyjson_doc_get_root(doc), "alg");
@@ -73,7 +75,14 @@ bool Jwt::verify(std::string_view token, int64_t now, int64_t &sub) const {
     if (CRYPTO_memcmp(m, sig.data(), 32) != 0) return false;
 
     if (!codec::b64url_decode(token.substr(d1 + 1, d2 - d1 - 1), payload)) return false;
-    yyjson_doc *doc = yyjson_read(payload.data(), payload.size(), 0);
+    // the payload is tiny: parse it in stack memory instead of the heap
+    char pool[2048];
+    yyjson_alc alc;
+    yyjson_doc *doc;
+    if (yyjson_read_max_memory_usage(payload.size(), 0) <= sizeof pool && yyjson_alc_pool_init(&alc, pool, sizeof pool))
+        doc = yyjson_read_opts(payload.data(), payload.size(), 0, &alc, nullptr);
+    else
+        doc = yyjson_read(payload.data(), payload.size(), 0);
     if (!doc) return false;
     yyjson_val *root = yyjson_doc_get_root(doc);
     yyjson_val *s = yyjson_obj_get(root, "sub");
