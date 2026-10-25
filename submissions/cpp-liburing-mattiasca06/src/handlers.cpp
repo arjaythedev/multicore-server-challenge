@@ -359,7 +359,7 @@ Task<Reply> Worker::h_register(const Request &rq) {
 
     BcryptResult br = co_await bcrypt_hash(password.v);
     if (!br.ok) co_return err(500, "hashing failed");
-    Rows rows = co_await db({Query("user_register", {username.v, email.v, br.hash})});
+    Rows rows = co_await db_write({Query("user_register", {username.v, email.v, br.hash})}, true);
     if (!rows.ok || rows.r.size() != 1) co_return db_error();
     PGresult *r = rows[0];
     if (PQresultStatus(r) != PGRES_TUPLES_OK)
@@ -414,7 +414,8 @@ Task<Reply> Worker::h_put_user(const Request &rq, int64_t viewer) {
         if (!br.ok) co_return err(500, "hashing failed");
         hash = Param(br.hash);
     }
-    Rows rows = co_await db({Query("user_update", {viewer, email.param(), username.param(), hash, bio.param(), image.param()})});
+    Rows rows = co_await db_write(
+        {Query("user_update", {viewer, email.param(), username.param(), hash, bio.param(), image.param()})}, true);
     if (!rows.ok || rows.r.size() != 1) co_return db_error();
     PGresult *r = rows[0];
     if (PQresultStatus(r) != PGRES_TUPLES_OK)
@@ -441,7 +442,7 @@ Task<Reply> Worker::h_follow(const Request &, std::string name, int64_t viewer, 
     PGresult *r = rows[0];
     if (PQntuples(r) == 0) co_return err(404, "profile not found");
     int64_t target = i64(r, 0, 0);
-    Rows act = co_await db({Query(follow ? "follow_add" : "follow_del", {viewer, target})});
+    Rows act = co_await db_write({Query(follow ? "follow_add" : "follow_del", {viewer, target})});
     if (!act.all_ok(1)) co_return db_error();
     std::string body;
     profile_json(body, r, 0, 1, follow);
@@ -539,13 +540,13 @@ Task<Reply> Worker::h_create_article(const Request &rq, int64_t viewer) {
         qs.push_back(Query("article_tags_insert", {id, lit}));
     }
     size_t nq = qs.size();
-    Rows ins = co_await db(std::move(qs));
-    if (!ins.all_ok(nq)) co_return db_error();
-
-    Rows rows = co_await db({Query("article_by_id", {viewer, id})});
-    if (!rows.all_ok(1) || PQntuples(rows[0]) == 0) co_return db_error();
+    qs.push_back(Query("article_by_id", {viewer, id}));  // read-back in the same segment sees the insert
+    Rows ins = co_await db_write(std::move(qs), true);
+    if (!ins.all_ok(nq + 1)) co_return db_error();
+    PGresult *res = ins[nq];
+    if (PQntuples(res) == 0) co_return db_error();
     std::string out = R"({"article":)";
-    article_json(out, rows[0], 0, true);
+    article_json(out, res, 0, true);
     out += '}';
     co_return Reply{201, std::move(out)};
 }
@@ -564,8 +565,8 @@ Task<Reply> Worker::h_update_article(const Request &rq, std::string slug, int64_
     int64_t id = i64(own[0], 0, 0);
     if (i64(own[0], 0, 1) != viewer) co_return err(403, "forbidden");
 
-    Rows rows = co_await db({Query("article_update", {id, title.param(), description.param(), body.param()}),
-                             Query("article_by_id", {viewer, id})});
+    Rows rows = co_await db_write({Query("article_update", {id, title.param(), description.param(), body.param()}),
+                                   Query("article_by_id", {viewer, id})});
     if (!rows.all_ok(2) || PQntuples(rows[1]) == 0) co_return db_error();
     std::string out = R"({"article":)";
     article_json(out, rows[1], 0, true);
@@ -579,7 +580,7 @@ Task<Reply> Worker::h_delete_article(std::string slug, int64_t viewer) {
     if (PQntuples(own[0]) == 0) co_return err(404, "article not found");
     int64_t id = i64(own[0], 0, 0);
     if (i64(own[0], 0, 1) != viewer) co_return err(403, "forbidden");
-    Rows rows = co_await db({Query("article_delete", {id})});
+    Rows rows = co_await db_write({Query("article_delete", {id})});
     if (!rows.all_ok(1)) co_return db_error();
     co_return Reply{204, {}};
 }
@@ -590,7 +591,8 @@ Task<Reply> Worker::h_favorite(std::string slug, int64_t viewer, bool add) {
     if (PQntuples(idr[0]) == 0) co_return err(404, "article not found");
     int64_t id = i64(idr[0], 0, 0);
     // The read-back runs in the same segment, so it sees this request's own write.
-    Rows rows = co_await db({Query(add ? "fav_add" : "fav_del", {viewer, id}), Query("article_by_id", {viewer, id})});
+    Rows rows =
+        co_await db_write({Query(add ? "fav_add" : "fav_del", {viewer, id}), Query("article_by_id", {viewer, id})});
     if (!rows.all_ok(2) || PQntuples(rows[1]) == 0) co_return db_error();
     std::string out = R"({"article":)";
     article_json(out, rows[1], 0, true);
@@ -624,7 +626,7 @@ Task<Reply> Worker::h_add_comment(const Request &rq, std::string slug, int64_t v
     Rows idr = co_await db({Query("article_id", {slug})});
     if (!idr.all_ok(1)) co_return db_error();
     if (PQntuples(idr[0]) == 0) co_return err(404, "article not found");
-    Rows rows = co_await db({Query("comment_insert", {i64(idr[0], 0, 0), viewer, body.v})});
+    Rows rows = co_await db_write({Query("comment_insert",{i64(idr[0], 0, 0), viewer, body.v})});
     if (!rows.all_ok(1) || PQntuples(rows[0]) == 0) co_return db_error();
     std::string out = R"({"comment":)";
     comment_json(out, rows[0], 0, false);
@@ -639,7 +641,7 @@ Task<Reply> Worker::h_delete_comment(std::string slug, std::string id, int64_t v
     if (!own.all_ok(1)) co_return db_error();
     if (PQntuples(own[0]) == 0) co_return err(404, "comment not found");
     if (i64(own[0], 0, 0) != viewer) co_return err(403, "forbidden");
-    Rows rows = co_await db({Query("comment_delete", {cid})});
+    Rows rows = co_await db_write({Query("comment_delete", {cid})});
     if (!rows.all_ok(1)) co_return db_error();
     co_return Reply{204, {}};
 }

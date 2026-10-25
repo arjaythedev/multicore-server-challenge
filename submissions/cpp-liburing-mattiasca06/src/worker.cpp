@@ -61,6 +61,11 @@ Worker::Worker(const Config &cfg, int id) : cfg_(cfg), id_(id) {
         pg->connect(cfg_.database_url.c_str());
         pgs_.push_back(std::move(pg));
     }
+    {  // the dedicated write connection is always the last one
+        auto pg = std::make_unique<PgConn>();
+        pg->connect(cfg_.database_url.c_str());
+        pgs_.push_back(std::move(pg));
+    }
     efd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (efd_ < 0) throw std::runtime_error("eventfd");
 }
@@ -328,8 +333,47 @@ void Worker::finish(uint32_t idx, uint32_t gen, Reply r) {
 }
 
 void Worker::enqueue(DbAwait *a) {
-    waitq_.push_back(a);
-    dispatch();
+    if (a->write) {
+        writeq_.push_back(a);
+        dispatch_writes();
+    } else {
+        waitq_.push_back(a);
+        dispatch();
+    }
+}
+
+// Natural group commit: while a write segment is in flight, writes queue; the queue then goes out as one segment
+// with a single Sync (one implicit transaction). Solo requests always travel alone.
+void Worker::dispatch_writes() {
+    const uint32_t wi = uint32_t(cfg_.read_conns);
+    PgConn &pg = *pgs_[wi];
+    if (writeq_.empty()) return;
+    if (pg.dead) {
+        std::deque<DbAwait *> q;
+        q.swap(writeq_);
+        for (DbAwait *a : q) a->rows.ok = false;
+        for (DbAwait *a : q) a->h.resume();
+        return;
+    }
+    if (!pg.inflight.empty()) return;
+    auto *g = new Group;
+    g->members.push_back(writeq_.front());
+    writeq_.pop_front();
+    if (!g->members[0]->solo)
+        while (!writeq_.empty() && !writeq_.front()->solo && g->members.size() < kMaxGroup) {
+            g->members.push_back(writeq_.front());
+            writeq_.pop_front();
+        }
+    std::vector<Query> all;
+    for (DbAwait *a : g->members) all.insert(all.end(), a->qs.begin(), a->qs.end());
+    if (!pg.send_segment(g, all)) {
+        std::vector<DbAwait *> ms = std::move(g->members);
+        delete g;
+        for (DbAwait *a : ms) a->rows.ok = false;
+        for (DbAwait *a : ms) a->h.resume();
+        return;
+    }
+    if (pg.flush()) arm_pg_out(wi);
 }
 
 // Hands queued segments to idle Postgres connections (one segment in flight per connection).
@@ -339,7 +383,7 @@ void Worker::dispatch() {
         PgConn *pg = nullptr;
         uint32_t pi = 0;
         bool any_alive = false;
-        for (uint32_t i = 0; i < pgs_.size(); i++) {
+        for (uint32_t i = 0; i < uint32_t(cfg_.read_conns); i++) {
             if (pgs_[i]->dead) continue;
             any_alive = true;
             if (pgs_[i]->inflight.empty()) {
@@ -373,13 +417,49 @@ void Worker::on_pg(uint32_t pg_idx) {
     std::vector<PgConn::Seg> done;
     pgs_[pg_idx]->drain(done);
     std::vector<std::coroutine_handle<>> ready;
+    const bool is_write = pg_idx == uint32_t(cfg_.read_conns);
     for (PgConn::Seg &s : done) {
-        auto *a = static_cast<DbAwait *>(s.tag);
-        a->rows.r = std::move(s.res);
-        a->rows.ok = !s.failed;
-        ready.push_back(a->h);
+        if (!is_write) {
+            auto *a = static_cast<DbAwait *>(s.tag);
+            a->rows.r = std::move(s.res);
+            a->rows.ok = !s.failed;
+            ready.push_back(a->h);
+            continue;
+        }
+        std::unique_ptr<Group> g(static_cast<Group *>(s.tag));
+        size_t total = 0;
+        for (DbAwait *a : g->members) total += a->qs.size();
+        bool clean = !s.failed && s.res.size() == total;
+        for (PGresult *r : s.res) {
+            ExecStatusType st = PQresultStatus(r);
+            if (st != PGRES_TUPLES_OK && st != PGRES_COMMAND_OK) clean = false;
+        }
+        if (s.failed) {  // connection lost: the commit may or may not have happened, so never retry
+            for (PGresult *r : s.res) PQclear(r);
+            for (DbAwait *a : g->members) {
+                a->rows.ok = false;
+                ready.push_back(a->h);
+            }
+        } else if (!clean && g->members.size() > 1) {  // the group rolled back: replay each request alone
+            for (PGresult *r : s.res) PQclear(r);
+            for (auto it = g->members.rbegin(); it != g->members.rend(); ++it) {
+                (*it)->solo = true;
+                writeq_.push_front(*it);
+            }
+        } else {
+            size_t pos = 0;
+            for (DbAwait *a : g->members) {
+                size_t n = a->qs.size();
+                if (pos + n <= s.res.size())
+                    a->rows.r.assign(s.res.begin() + long(pos), s.res.begin() + long(pos + n));
+                a->rows.ok = true;
+                pos += n;
+                ready.push_back(a->h);
+            }
+        }
     }
     for (auto h : ready) h.resume();
+    if (is_write) dispatch_writes();
     dispatch();
 }
 

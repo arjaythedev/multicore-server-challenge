@@ -41,6 +41,8 @@ struct DbAwait {
 
     Worker &w;
     std::vector<Query> qs;
+    bool write = false;  // goes to the dedicated write connection
+    bool solo = false;   // never shares a segment with other requests
     Rows rows;
     std::coroutine_handle<> h;
 };
@@ -81,6 +83,7 @@ struct alignas(64) Worker {
     void kill(uint32_t idx);
     void maybe_free(uint32_t idx);
     void dispatch();
+    void dispatch_writes();
     Detached serve(uint32_t idx, uint32_t gen, Request rq);
     void finish(uint32_t idx, uint32_t gen, Reply r);
 
@@ -104,6 +107,13 @@ struct alignas(64) Worker {
     Task<Reply> h_tags();
 
     DbAwait db(std::vector<Query> qs) { return DbAwait(*this, std::move(qs)); }
+    // Writes commit before the awaiting request resumes. Group-able ones share one Sync with their neighbours.
+    DbAwait db_write(std::vector<Query> qs, bool solo = false) {
+        DbAwait a(*this, std::move(qs));
+        a.write = true;
+        a.solo = solo;
+        return a;
+    }
     BcryptAwait bcrypt_hash(std::string pw) { return BcryptAwait(*this, true, std::move(pw)); }
     BcryptAwait bcrypt_verify(std::string pw, std::string stored) {
         return BcryptAwait(*this, false, std::move(pw), std::move(stored));
@@ -118,7 +128,11 @@ struct alignas(64) Worker {
     std::vector<Conn> conns_;
     std::vector<uint32_t> free_;
     std::vector<std::unique_ptr<PgConn>> pgs_;
-    std::deque<DbAwait *> waitq_;
+    std::deque<DbAwait *> waitq_, writeq_;
+    struct Group {
+        std::vector<DbAwait *> members;
+    };
+    static constexpr size_t kMaxGroup = 48;  // stays well below 64 in-flight xids per transaction
     bool in_process_ = false;
     std::vector<uint32_t> deferred_;
     std::mutex done_mu_;
