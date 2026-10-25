@@ -11,6 +11,8 @@
 #include <string_view>
 #include <vector>
 
+#include "smallvec.h"
+
 // A text-format statement parameter; nullptr is SQL NULL.
 struct Param {
     std::optional<std::string> v;
@@ -24,10 +26,11 @@ struct Param {
 
 struct Query {
     const char *stmt;
-    std::vector<Param> params;
+    SmallVec<Param, 6> params;
     Query(const char *s, std::initializer_list<Param> p) : stmt(s), params(p) {}
-    Query(const char *s, std::vector<Param> p) : stmt(s), params(std::move(p)) {}
 };
+
+using QVec = SmallVec<Query, 2>;  // the statements of one request
 
 // One request's view of a result: a row range of a PGresult. A batched statement answers several requests with one
 // result (first column = the request's position); each request then sees only its own rows and no ord column.

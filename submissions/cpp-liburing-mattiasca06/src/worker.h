@@ -36,13 +36,13 @@ struct Worker;
 
 // co_await'ed from a request coroutine: one pipeline segment on any free Postgres connection.
 struct DbAwait {
-    DbAwait(Worker &w, std::vector<Query> qs) : w(w), qs(std::move(qs)) {}
+    DbAwait(Worker &w, QVec qs) : w(w), qs(std::move(qs)) {}
     bool await_ready() const noexcept { return false; }
     void await_suspend(std::coroutine_handle<> c);
     Rows await_resume() { return std::move(rows); }
 
     Worker &w;
-    std::vector<Query> qs;
+    QVec qs;
     bool write = false;  // goes to the dedicated write connection
     bool solo = false;   // never shares a segment with other requests
     Rows rows;
@@ -110,9 +110,9 @@ struct alignas(64) Worker {
     Task<Reply> h_delete_comment(std::string slug, std::string id, int64_t viewer);
     Task<Reply> h_tags();
 
-    DbAwait db(std::vector<Query> qs) { return DbAwait(*this, std::move(qs)); }
+    DbAwait db(QVec qs) { return DbAwait(*this, std::move(qs)); }
     // Writes commit before the awaiting request resumes. Group-able ones share one Sync with their neighbours.
-    DbAwait db_write(std::vector<Query> qs, bool solo = false) {
+    DbAwait db_write(QVec qs, bool solo = false) {
         DbAwait a(*this, std::move(qs));
         a.write = true;
         a.solo = solo;

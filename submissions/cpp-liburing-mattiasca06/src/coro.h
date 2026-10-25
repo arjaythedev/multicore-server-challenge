@@ -5,10 +5,10 @@
 #include <new>
 #include <exception>
 #include <utility>
-// Coroutine frames come from per-thread free lists (64-byte size classes up to 2 KiB) instead of malloc: a request
+// Coroutine frames come from per-thread free lists (64-byte size classes up to 8 KiB) instead of malloc: a request
 // allocates and frees several frames, and they are all the same few sizes.
 namespace frame_pool {
-inline constexpr size_t kClass = 64, kClasses = 32;  // 64 .. 2048 bytes
+inline constexpr size_t kClass = 64, kClasses = 128;  // 64 .. 8192 bytes
 struct Node { Node *next; };
 inline Node *&head(size_t c) {
     thread_local Node *heads[kClasses] = {};

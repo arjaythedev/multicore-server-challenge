@@ -33,7 +33,7 @@ void PgConn::connect(const char *url) {
 }
 
 bool PgConn::send_segment(void *tag, const std::vector<Query> &qs) {
-    std::vector<const char *> values;
+    thread_local std::vector<const char *> values;
     for (const Query &q : qs) {
         values.clear();
         for (const Param &p : q.params) values.push_back(p.v ? p.v->c_str() : nullptr);

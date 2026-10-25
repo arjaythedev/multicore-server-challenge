@@ -483,7 +483,7 @@ Task<Reply> Worker::h_list(const Request &rq, int64_t viewer, bool feed) {
         }
     }
 
-    std::vector<Query> qs;
+    QVec qs;
     if (feed) {
         qs.push_back(Query("feed", {viewer, limit, offset}));
     } else if (!tag.empty()) {
@@ -558,7 +558,7 @@ Task<Reply> Worker::h_create_article(const Request &rq, int64_t viewer) {
 
     // One segment, one implicit transaction: the article and its tags commit together. The later statements find
     // the new id through currval(), which is safe because a solo segment owns the write connection.
-    std::vector<Query> qs;
+    QVec qs;
     qs.push_back(Query("article_create", {title.v, viewer, description.v, body.v}));
     if (!tags.empty()) {
         std::string lit = pg_text_array(tags);

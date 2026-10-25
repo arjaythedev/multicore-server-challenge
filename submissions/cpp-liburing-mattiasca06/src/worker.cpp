@@ -467,7 +467,7 @@ void Worker::build_read(Group &g, std::vector<Query> &all) {
                 if (!is_open[b]) {
                     is_open[b] = true;
                     o.at = uint32_t(all.size());
-                    all.push_back(Query(kBatch[b].batch, std::vector<Param>{}));
+                    all.push_back(Query(kBatch[b].batch, {}));
                 }
                 uint32_t k = uint32_t(o.qs.size());
                 for (uint32_t i = 0; i < o.qs.size() && k == o.qs.size(); i++) {  // the same request twice: one row range
