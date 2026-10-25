@@ -101,12 +101,13 @@ Parameters changed from the initial commit to the current defaults:
 
 | Knob | Old Default | Current Default | Why |
 |---|---|---|---|
-| `n_bufs` | 2,048 | 8,192 | 4× provided-buffer ring headroom; eliminates `ENOBUFS` drops under burst load |
+| `n_bufs` | 2,048 | 16,384 | 8× provided-buffer ring headroom; eliminates `ENOBUFS` drops under burst load |
 | `READ_HOLD_MIN` | 8,192 | 2,048 | Matches `PLAN_MAX`; dispatches a full batch immediately instead of waiting |
 | `READ_WINDOW_US` | 150,000 µs | 100,000 µs | Better latency/efficiency balance (see README window table) |
 | `stale_ns` | 15.0 s | 9.5 s | Drops dead bcrypt jobs before the 10.0 s client timeout |
-| `ADAPTIVE_WINDOW` | (new) | 1 (enabled) | Contracts read window under load: ≥1,024 staged → 10 ms, ≥512 → 25 ms, ≥256 → 50 ms, idle PG backends with ≥64 staged → 15 ms |
+| `ADAPTIVE_WINDOW` | (new) | 1 (enabled) | Contracts read window under load: ≥1,024 staged → 10 ms, ≥512 → 25 ms, ≥256 → 35 ms, ≥128 → 50 ms, idle PG backends with ≥64 staged → 15 ms |
 | `SEND_ZC` | (new) | 1 (enabled) | Uses `IORING_OP_SEND_ZC` for responses ≥ 256 bytes; auto-fallback to `prep_send` if kernel returns `EOPNOTSUPP` |
+| `TCP_DEFER_ACCEPT` | 0 (disabled) | 1 (enabled) | Defers kernel accept wakeup until client payload bytes arrive |
 
 ---
 

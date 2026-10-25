@@ -270,7 +270,7 @@ const BatchRec = struct {
 // ---------------------------------------------------------------------------------------------
 
 const buf_size = 2048;
-const n_bufs = 8192;
+const n_bufs = 16384;
 const bgid = 1;
 
 pub const Worker = struct {
@@ -995,7 +995,8 @@ pub const Worker = struct {
             if (self.staged >= self.shared.cfg.read_hold_min) break :blk 0;
             if (self.staged >= 1024) break :blk 10 * std.time.ns_per_ms;
             if (self.staged >= 512) break :blk 25 * std.time.ns_per_ms;
-            if (self.staged >= 256) break :blk 50 * std.time.ns_per_ms;
+            if (self.staged >= 256) break :blk 35 * std.time.ns_per_ms;
+            if (self.staged >= 128) break :blk 50 * std.time.ns_per_ms;
 
             var has_idle_pg = false;
             for (self.pgs[0..self.n_read]) |*p| {
@@ -1531,7 +1532,7 @@ fn makeListener(cfg: *const Config) !i32 {
     if (sys.errnoOf(s) != .SUCCESS) return error.SocketFailed;
     const fd: i32 = @intCast(s);
     const one: c_int = 1;
-    inline for (.{ .{ linux.SOL.SOCKET, linux.SO.REUSEADDR }, .{ linux.SOL.SOCKET, linux.SO.REUSEPORT }, .{ linux.IPPROTO.TCP, linux.TCP.NODELAY }, .{ linux.SOL.SOCKET, linux.SO.KEEPALIVE } }) |o| {
+    inline for (.{ .{ linux.SOL.SOCKET, linux.SO.REUSEADDR }, .{ linux.SOL.SOCKET, linux.SO.REUSEPORT }, .{ linux.IPPROTO.TCP, linux.TCP.NODELAY }, .{ linux.SOL.SOCKET, linux.SO.KEEPALIVE }, .{ linux.IPPROTO.TCP, linux.TCP.DEFER_ACCEPT } }) |o| {
         _ = linux.setsockopt(fd, o[0], o[1], @ptrCast(&one), @sizeOf(c_int));
     }
     // Accepted sockets inherit these: probe idle peers after 10 min, so vanished clients do not hold sockets forever.
