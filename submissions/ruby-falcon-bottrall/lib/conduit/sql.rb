@@ -226,5 +226,10 @@ module Conduit
         SELECT author_id = $1 FROM target
       SQL
     }.transform_values(&:freeze).freeze
+
+    # The statements that only read, which can share a worker's pipelined connection.
+    READS = %i[
+      tags login current_user profile list_all list_tag list_author list_favorited feed article article_by_id comments
+    ].freeze
   end
 end
