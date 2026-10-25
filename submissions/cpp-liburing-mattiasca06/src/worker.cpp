@@ -264,20 +264,43 @@ void Worker::on_send(uint32_t idx, uint32_t gen, int res) {
     }
 }
 
+// Response head by hand: no format-string parsing on the hot path. Same bytes the snprintf version produced.
+static inline char *put(char *p, std::string_view s) {
+    memcpy(p, s.data(), s.size());
+    return p + s.size();
+}
+static inline char *put_uint(char *p, size_t v) {
+    char t[20];
+    int n = 0;
+    do {
+        t[n++] = char('0' + v % 10);
+        v /= 10;
+    } while (v);
+    while (n) *p++ = t[--n];
+    return p;
+}
+
 void Worker::respond(Conn &c, uint32_t idx, int status, const std::string &body) {
     PROF_SCOPE(kRespond);
     char head[192];
-    int n;
+    char *p = head;
     if (status == 204) {
-        n = snprintf(head, sizeof head, "HTTP/1.1 204 No Content\r\n%s\r\n", c.close_after ? "Connection: close\r\n" : "");
+        p = put(p, "HTTP/1.1 204 No Content\r\n");
     } else {
-        n = snprintf(head, sizeof head,
-                     "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n%s\r\n", status,
-                     reason(status), body.size(), c.close_after ? "Connection: close\r\n" : "");
+        p = put(p, "HTTP/1.1 ");
+        p = put_uint(p, size_t(status));
+        *p++ = ' ';
+        p = put(p, reason(status));
+        p = put(p, "\r\nContent-Type: application/json\r\nContent-Length: ");
+        p = put_uint(p, body.size());
+        p = put(p, "\r\n");
     }
+    if (c.close_after) p = put(p, "Connection: close\r\n");
+    p = put(p, "\r\n");
+    const size_t n = size_t(p - head);
     take_buf(c.out);
-    c.out.reserve(c.out.size() + size_t(n) + body.size());
-    c.out.append(head, size_t(n));
+    c.out.reserve(c.out.size() + n + body.size());
+    c.out.append(head, n);
     if (status != 204) c.out += body;
     start_send(idx);
 }

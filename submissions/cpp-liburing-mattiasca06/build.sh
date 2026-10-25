@@ -24,11 +24,27 @@ fetch picohttpparser picohttpparser.h "$PICO_H_SHA" "$PICO_URL/picohttpparser.h"
 fetch yyjson yyjson.c "$YYJSON_C_SHA" "$YY_URL/yyjson.c"
 fetch yyjson yyjson.h "$YYJSON_H_SHA" "$YY_URL/yyjson.h"
 
+# mimalloc replaces malloc/free for the whole process (libpq included) when linked in (USE_MIMALLOC=1); measured no gain here, so off by default.
+MI_VER=2.1.7
+MI_SHA=0eed39319f139afde8515010ff59baf24de9e47ea316a315398e8027d198202d
+MI_OBJ=
+if [ "${USE_MIMALLOC:-0}" = 1 ]; then
+  if [ ! -f third_party/mimalloc/src/static.c ]; then
+    mkdir -p third_party/mimalloc
+    curl -fsSL --retry 3 -o third_party/mimalloc.tgz "https://github.com/microsoft/mimalloc/archive/refs/tags/v$MI_VER.tar.gz"
+    echo "$MI_SHA  third_party/mimalloc.tgz" | sha256sum -c --quiet
+    tar -xzf third_party/mimalloc.tgz -C third_party/mimalloc --strip-components=1
+    rm -f third_party/mimalloc.tgz
+  fi
+  MI_OBJ=build/mimalloc.o
+fi
+
 mkdir -p bin build
 CC="${CC:-gcc}"; CXX="${CXX:-g++}"
 "$CC" -std=gnu11 -O3 -march=native -flto -c -o build/picohttpparser.o third_party/picohttpparser/picohttpparser.c
 "$CC" -std=gnu11 -O3 -march=native -flto -c -o build/yyjson.o third_party/yyjson/yyjson.c
+[ -n "$MI_OBJ" ] && "$CC" -std=gnu11 -O3 -march=native -DNDEBUG -DMI_MALLOC_OVERRIDE -Ithird_party/mimalloc/include -c -o build/mimalloc.o third_party/mimalloc/src/static.c
 "$CXX" -std=c++20 -O3 -march=native -flto -pthread -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations \
   -Ithird_party/picohttpparser -Ithird_party/yyjson -I"$(pg_config --includedir 2>/dev/null || echo /usr/include/postgresql)" \
-  -o bin/conduit src/*.cpp build/picohttpparser.o build/yyjson.o -luring -lpq -lcrypto -lcrypt
+  -o bin/conduit src/*.cpp build/picohttpparser.o build/yyjson.o $MI_OBJ -luring -lpq -lcrypto -lcrypt
 echo "built bin/conduit ($("$CXX" --version | head -1))"
