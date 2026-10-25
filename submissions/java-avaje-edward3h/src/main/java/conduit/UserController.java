@@ -17,14 +17,12 @@ class UserController {
     private final Auth auth;
     private final Jwt jwt;
     private final Passwords passwords;
-    private final Body body;
 
-    UserController(UserDao users, Auth auth, Jwt jwt, Passwords passwords, Body body) {
+    UserController(UserDao users, Auth auth, Jwt jwt, Passwords passwords) {
         this.users = users;
         this.auth = auth;
         this.jwt = jwt;
         this.passwords = passwords;
-        this.body = body;
     }
 
     private static Dto.UserResponse wrap(UserDao.UserRow r, String token) {
@@ -41,8 +39,8 @@ class UserController {
 
     @Post("/api/users")
     @Produces(statusCode = 201)
-    Dto.UserResponse register(ServerRequest req) {
-        Requests.Register.Registration user = Body.object(body.read(req, Requests.Register.class).user(), "user");
+    Dto.UserResponse register(Requests.Register request) {
+        Requests.Register.Registration user = Body.inner(request, Requests.Register::user, "user");
         String username = Body.required(user.username(), "username");
         String email = Body.required(user.email(), "email");
         String password = Body.required(user.password(), "password");
@@ -58,8 +56,8 @@ class UserController {
 
     @Post("/api/users/login")
     @Produces(statusCode = 200)
-    Dto.UserResponse login(ServerRequest req) {
-        Requests.Login.Credentials user = Body.object(body.read(req, Requests.Login.class).user(), "user");
+    Dto.UserResponse login(Requests.Login request) {
+        Requests.Login.Credentials user = Body.inner(request, Requests.Login::user, "user");
         String email = Body.required(user.email(), "email");
         String password = Body.required(user.password(), "password");
         UserDao.LoginRow row = users.findByEmail(email);
@@ -81,9 +79,9 @@ class UserController {
     }
 
     @Put("/api/user")
-    Dto.UserResponse update(ServerRequest req) {
+    Dto.UserResponse update(ServerRequest req, Requests.UpdateUser request) {
         Auth.User caller = auth.user(req);
-        Requests.UpdateUser.Changes user = Body.object(body.read(req, Requests.UpdateUser.class).user(), "user");
+        Requests.UpdateUser.Changes user = Body.inner(request, Requests.UpdateUser::user, "user");
         String email = Body.optionalNonEmpty(user.email(), "email");
         String username = Body.optionalNonEmpty(user.username(), "username");
         String password = Body.optionalNonEmpty(user.password(), "password");

@@ -14,13 +14,11 @@ class CommentController {
     private final CommentDao comments;
     private final ArticleDao articles;
     private final Auth auth;
-    private final Body body;
 
-    CommentController(CommentDao comments, ArticleDao articles, Auth auth, Body body) {
+    CommentController(CommentDao comments, ArticleDao articles, Auth auth) {
         this.comments = comments;
         this.articles = articles;
         this.auth = auth;
-        this.body = body;
     }
 
     private long articleId(String slug) {
@@ -42,10 +40,9 @@ class CommentController {
     }
 
     @Post("/api/articles/{slug}/comments")
-    Dto.CommentResponse create(String slug, ServerRequest req) {
+    Dto.CommentResponse create(String slug, ServerRequest req, Requests.CreateComment request) {
         Auth.User caller = auth.user(req);
-        String text = Body.required(
-                Body.object(body.read(req, Requests.CreateComment.class).comment(), "comment").body(), "body");
+        String text = Body.required(Body.inner(request, Requests.CreateComment::comment, "comment").body(), "body");
         long articleId = articleId(slug);
         CommentDao.NewCommentRow r = comments.insert(articleId, caller.id(), text);
         return new Dto.CommentResponse(new Dto.Comment(r.id(), Dto.timestamp(r.createdAt()),

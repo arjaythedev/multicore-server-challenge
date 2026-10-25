@@ -2,47 +2,22 @@ package conduit;
 
 import java.nio.charset.StandardCharsets;
 import java.util.List;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Function;
 
-import io.helidon.webserver.http.ServerRequest;
-import io.avaje.jsonb.JsonType;
-import io.avaje.jsonb.Jsonb;
-import jakarta.inject.Singleton;
 
 /**
- * Request bodies are read whatever the Content-Type, after auth has run. Jsonb rejects a value of the wrong JSON
- * type (no coercing {"body": 123} to "123"), and reads a missing or null field as null. Anything malformed, missing
- * or blank is a 422.
+ * Checks on the request records in {@link Requests}, which the generated routes bind from the body whatever the
+ * Content-Type. Jsonb rejects a value of the wrong JSON type (no coercing {"body": 123} to "123"), and reads a
+ * missing or null field as null. Anything malformed, missing or blank is a 422.
  */
-@Singleton
 final class Body {
 
-    private final Jsonb jsonb;
-    private final ConcurrentHashMap<Class<?>, JsonType<?>> types = new ConcurrentHashMap<>();
-
-    Body(Jsonb jsonb) {
-        this.jsonb = jsonb;
+    private Body() {
     }
 
-    /** The request body bound to {@code type}; 422 if it isn't valid JSON of that shape. */
-    @SuppressWarnings("unchecked")
-    <T> T read(ServerRequest req, Class<T> type) {
-        JsonType<T> json = (JsonType<T>) types.computeIfAbsent(type, jsonb::type);
-        try {
-            T root = json.fromJson(req.content().as(byte[].class));
-            if (root == null) {
-                throw ApiException.invalid("body must be a JSON object");
-            }
-            return root;
-        } catch (ApiException ex) {
-            throw ex;
-        } catch (RuntimeException ex) {
-            throw ApiException.invalid("malformed JSON body");
-        }
-    }
-
-    /** The wrapper object ({@code user}, {@code article}, ...); 422 when absent or null. */
-    static <T> T object(T value, String key) {
+    /** The wrapper object ({@code user}, {@code article}, ...) of a request; 422 when the body or the wrapper is null. */
+    static <R, T> T inner(R root, Function<R, T> wrapper, String key) {
+        T value = root == null ? null : wrapper.apply(root);
         if (value == null) {
             throw ApiException.invalid(key + " must be an object");
         }

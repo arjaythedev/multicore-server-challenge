@@ -4,6 +4,7 @@ import java.time.Duration;
 import java.util.List;
 
 import io.avaje.inject.BeanScope;
+import io.avaje.json.JsonException;
 import io.helidon.http.HeaderNames;
 import io.helidon.http.Status;
 import io.helidon.webserver.WebServer;
@@ -22,6 +23,9 @@ public class Main {
         routing.error(ApiException.class, (req, res, ex) -> res.status(Status.create(ex.status))
                 .header(HeaderNames.CONTENT_TYPE, "application/json")
                 .send(errors.toJson(Dto.Errors.of(ex.getMessage()))));
+        routing.error(JsonException.class, (req, res, ex) -> res.status(Status.create(422))
+                .header(HeaderNames.CONTENT_TYPE, "application/json")
+                .send(errors.toJson(Dto.Errors.of("malformed JSON body"))));
         routing.error(Exception.class, (req, res, ex) -> {
             System.err.println("unhandled: " + ex);
             res.status(Status.INTERNAL_SERVER_ERROR_500)

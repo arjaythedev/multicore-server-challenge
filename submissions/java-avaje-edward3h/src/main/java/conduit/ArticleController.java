@@ -16,12 +16,10 @@ class ArticleController {
 
     private final ArticleDao articles;
     private final Auth auth;
-    private final Body body;
 
-    ArticleController(ArticleDao articles, Auth auth, Body body) {
+    ArticleController(ArticleDao articles, Auth auth) {
         this.articles = articles;
         this.auth = auth;
-        this.body = body;
     }
 
     private record Page(long limit, long offset) {
@@ -100,10 +98,9 @@ class ArticleController {
     }
 
     @Post("/api/articles")
-    Dto.ArticleResponse create(ServerRequest req) {
+    Dto.ArticleResponse create(ServerRequest req, Requests.CreateArticle request) {
         Auth.User caller = auth.user(req);
-        Requests.CreateArticle.NewArticle article =
-                Body.object(body.read(req, Requests.CreateArticle.class).article(), "article");
+        Requests.CreateArticle.NewArticle article = Body.inner(request, Requests.CreateArticle::article, "article");
         String title = Body.required(article.title(), "title");
         String description = Body.required(article.description(), "description");
         String text = Body.required(article.body(), "body");
@@ -121,10 +118,9 @@ class ArticleController {
     }
 
     @Put("/api/articles/{slug}")
-    Dto.ArticleResponse update(String slug, ServerRequest req) {
+    Dto.ArticleResponse update(String slug, ServerRequest req, Requests.UpdateArticle request) {
         Auth.User caller = auth.user(req);
-        Requests.UpdateArticle.Changes article =
-                Body.object(body.read(req, Requests.UpdateArticle.class).article(), "article");
+        Requests.UpdateArticle.Changes article = Body.inner(request, Requests.UpdateArticle::article, "article");
         String title = Body.optionalNonEmpty(article.title(), "title");
         String description = Body.optionalNonEmpty(article.description(), "description");
         String text = Body.optionalNonEmpty(article.body(), "body");
