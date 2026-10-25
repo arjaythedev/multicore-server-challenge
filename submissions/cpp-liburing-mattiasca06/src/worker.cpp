@@ -58,8 +58,28 @@ inline int batch_of(const char *stmt) {
 }
 
 // Hand a buffer's storage back to the allocator once it has grown past a small size (clear() would keep it).
+// Spare buffers per worker thread: an idle connection keeps nothing (80k keep-alive connections would otherwise pin
+// their largest response each), a busy one picks a warm buffer up again without going through malloc.
+inline std::vector<std::string> &spare_bufs() {
+    thread_local std::vector<std::string> v;
+    return v;
+}
 inline void release_big(std::string &s) {
-    if (s.empty() && s.capacity() > 1024) std::string().swap(s);
+    if (!s.empty() || s.capacity() <= 15) return;
+    auto &sp = spare_bufs();
+    if (s.capacity() <= 32768 && sp.size() < 1024) {
+        sp.push_back(std::move(s));
+        s = std::string();
+    } else {
+        std::string().swap(s);
+    }
+}
+inline void take_buf(std::string &s) {
+    auto &sp = spare_bufs();
+    if (s.capacity() <= 15 && !sp.empty()) {
+        s = std::move(sp.back());
+        sp.pop_back();
+    }
 }
 
 const char *reason(int status) {
@@ -217,7 +237,7 @@ void Worker::on_recv(uint32_t idx, uint32_t gen, io_uring_cqe *cqe) {
     }
     if (!(cqe->flags & IORING_CQE_F_MORE)) c.recv_active = false;
     if (has_buf) {
-        if (cqe->res > 0 && !c.closing) c.in.append(&bufs_[size_t(bid) * kBufSize], size_t(cqe->res));
+        if (cqe->res > 0 && !c.closing) take_buf(c.in), c.in.append(&bufs_[size_t(bid) * kBufSize], size_t(cqe->res));
         give_back();
     }
     if (cqe->res <= 0 && cqe->res != -ENOBUFS) {
@@ -278,6 +298,7 @@ void Worker::respond(Conn &c, uint32_t idx, int status, const std::string &body)
                      "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n%s\r\n", status,
                      reason(status), body.size(), c.close_after ? "Connection: close\r\n" : "");
     }
+    take_buf(c.out);
     c.out.reserve(c.out.size() + size_t(n) + body.size());
     c.out.append(head, size_t(n));
     if (status != 204) c.out += body;
