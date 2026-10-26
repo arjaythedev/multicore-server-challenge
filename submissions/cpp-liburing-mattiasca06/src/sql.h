@@ -204,15 +204,14 @@ inline constexpr Stmt kStatements[] = {
 
     // Batched variants (see above). Same parameters as the single versions, each one an array.
     {"article_by_slug_b",  // v bigint[], slug text[]
-     REQ("$1::bigint[], $2::text[]", "v, slug")
-     ", b AS MATERIALIZED (SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at, a.author_id, "
+     // One lateral probe per request, no shared CTE: cheaper at the batch sizes of 1-6 this sees.
+     "SELECT r.ord::int4, q.* FROM unnest($1::bigint[], $2::text[]) WITH ORDINALITY AS r(v, slug, ord) "
+     "CROSS JOIN LATERAL (SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at, "
      TAG_LIST_COL ", (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count, "
-     "u.username, u.bio, u.image FROM (SELECT DISTINCT slug FROM req) d JOIN articles a ON a.slug = d.slug "
-     "JOIN users u ON u.id = a.author_id) "
-     "SELECT r.ord::int4, b.id, b.slug, b.title, b.description, b.body, b.created_at, b.updated_at, b.tag_list, "
-     "b.favorites_count, EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = b.id AND f.user_id = r.v) AS favorited, "
-     "b.username, b.bio, b.image, EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.v AND "
-     "fo.followee_id = b.author_id) AS following FROM req r JOIN b ON b.slug = r.slug ORDER BY r.ord"},
+     "EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = r.v) AS favorited, "
+     "u.username, u.bio, u.image, EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.v AND "
+     "fo.followee_id = a.author_id) AS following FROM articles a JOIN users u ON u.id = a.author_id "
+     "WHERE a.slug = r.slug) q ORDER BY r.ord"},
     {"comments_by_slug_b",  // v bigint[], slug text[]
      REQ("$1::bigint[], $2::text[]", "v, slug")
      ", cm AS MATERIALIZED (SELECT d.slug, c.id, c.body, c.created_at, c.updated_at, c.author_id, c.username, c.bio, "
