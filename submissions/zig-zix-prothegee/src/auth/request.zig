@@ -47,6 +47,23 @@ pub fn authenticate(
     return .{ .id = user_id, .token = raw };
 }
 
+/// Verify the request token when one is present, returning 0 for anonymous.
+///
+/// Note:
+/// - A missing header is anonymous.
+/// - A header that is present but malformed or invalid is an error.
+pub fn optionalViewer(
+    req: *zix.Http1.Request,
+    secret: []const u8,
+    now: i64,
+    allocator: std.mem.Allocator,
+) Error!i64 {
+    const header = req.header("authorization") orelse return 0;
+    const raw = tokenFromHeader(header) orelse return error.Unauthorized;
+
+    return token.verify(secret, raw, now, allocator) catch return error.Unauthorized;
+}
+
 // --------------------------------------------------------- //
 
 test "request: a Token header yields the raw token" {
@@ -76,4 +93,54 @@ test "request: an empty header is rejected" {
 
 test "request: a tab separator is accepted" {
     try std.testing.expectEqualStrings("abc", tokenFromHeader("Token\tabc").?);
+}
+
+// --------------------------------------------------------- //
+
+const TEST_SECRET = "multicore-server-challenge";
+const TEST_NOW: i64 = 1_700_000_000;
+
+test "request: optionalViewer returns zero without a header" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw = "GET /api/profiles/ada HTTP/1.1\r\nHost: t\r\n\r\n";
+    var req = try zix.Http1.Request.fromRaw(raw, arena.allocator());
+
+    const viewer = try optionalViewer(&req, TEST_SECRET, TEST_NOW, arena.allocator());
+
+    try std.testing.expectEqual(@as(i64, 0), viewer);
+}
+
+test "request: optionalViewer rejects an invalid header" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw = "GET /api/profiles/ada HTTP/1.1\r\nHost: t\r\nAuthorization: Token bad\r\n\r\n";
+    var req = try zix.Http1.Request.fromRaw(raw, arena.allocator());
+
+    try std.testing.expectError(
+        error.Unauthorized,
+        optionalViewer(&req, TEST_SECRET, TEST_NOW, arena.allocator()),
+    );
+}
+
+test "request: optionalViewer returns the token user id" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var token_buf: [token.TOKEN_MAX]u8 = undefined;
+    const signed = try token.sign(TEST_SECRET, 7, TEST_NOW, &token_buf);
+
+    var raw_buf: [512]u8 = undefined;
+    const raw = try std.fmt.bufPrint(
+        &raw_buf,
+        "GET /api/profiles/ada HTTP/1.1\r\nHost: t\r\nAuthorization: Token {s}\r\n\r\n",
+        .{signed},
+    );
+    var req = try zix.Http1.Request.fromRaw(raw, arena.allocator());
+
+    const viewer = try optionalViewer(&req, TEST_SECRET, TEST_NOW, arena.allocator());
+
+    try std.testing.expectEqual(@as(i64, 7), viewer);
 }
