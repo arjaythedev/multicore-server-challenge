@@ -3561,6 +3561,61 @@ class Integration(unittest.TestCase):
             proxy.stop()
             self.sql(f"DROP DATABASE {database} WITH (FORCE)")
 
+    def reconnect_snapshot(self, metrics, server, counter, minimum, after=None):
+        deadline = time.monotonic() + 25
+        latest = []
+        while time.monotonic() < deadline:
+            self.assertIsNone(server.poll())
+            data = os.pread(metrics.fileno(),
+                            os.fstat(metrics.fileno()).st_size, 0)
+            data = data[:data.rfind(b"\n") + 1]
+            latest = [record for record in _metric_records(io.BytesIO(data))
+                      if record.get("owner") in (1, 2) and
+                      not record.get("missing")]
+            active = {r["worker_id"] for r in latest
+                      if r["owner"] == 1 and r["counters"][0] > 0}
+            if active:
+                self.assertEqual(len(active), 1)
+                worker_id = next(iter(active))
+                if after is not None:
+                    self.assertEqual(worker_id, after["worker_id"])
+                transports = {(r["worker_id"], r["slot"], r["request"],
+                               r["observed_ns"]): r for r in latest
+                              if r["owner"] == 2}
+                for worker in reversed(latest):
+                    if (worker["owner"] != 1 or
+                            worker["worker_id"] != worker_id or
+                            worker["request"] <= (after["request"]
+                                                  if after else 0) or
+                            worker["counters"][counter] < minimum):
+                        continue
+                    identity = (worker_id, worker["slot"], worker["request"],
+                                worker["observed_ns"])
+                    if identity in transports:
+                        return worker, transports[identity]
+            time.sleep(0.05)
+        self.fail(f"missing reconnect snapshot for counter {counter} >= "
+                  f"{minimum}; latest records: {latest[-8:]}")
+
+    def assert_reconnect_snapshot(self, pair, generation, prepares,
+                                  accepted, started, settled, succeeded,
+                                  failed, retired, inflight):
+        worker, transport = pair
+        self.assertEqual(worker["slot"], 0)
+        self.assertEqual(transport["generation"], generation)
+        for index, expected in zip((0, 1, 2, 7, 8, 9),
+                (accepted, started, settled, succeeded, failed, retired)):
+            self.assertEqual(worker["counters"][index], expected,
+                             f"generation {generation} worker counter {index}")
+        self.assertEqual(worker["gauges"][0], 0)
+        self.assertEqual(worker["gauges"][1], inflight)
+        completed = prepares + 1
+        for index, expected in enumerate(
+                (completed + inflight, completed, 0, 0)):
+            self.assertEqual(transport["counters"][index], expected,
+                f"generation {generation} transport counter {index}")
+        self.assertEqual(transport["histograms"][6]["count"], completed)
+
     def test_worker_reconnect_preserves_http_session(self):
         proxy = ProtocolProxy(self.proxy.database_host,
                               self.proxy.database_port)
@@ -3595,14 +3650,30 @@ class Integration(unittest.TestCase):
                         "127.0.0.1", port, timeout=10)
                     try:
                         connection.request("GET", "/api/tags")
+                        original_socket = connection.sock
+                        self.assertIsNotNone(original_socket)
+
+                        def check_socket():
+                            self.assertIs(connection.sock, original_socket)
+                            self.assertGreaterEqual(original_socket.fileno(), 0)
+
                         response = connection.getresponse()
                         self.assertEqual(response.status, 200)
                         self.assertIn("tags", json.loads(response.read()))
+                        check_socket()
                         sessions = proxy.snapshot()
                         self.assertEqual(len(sessions), 4)
                         serving = [index for index, session in enumerate(sessions)
                                    if any(kind == b"B" for kind, _ in session)]
                         self.assertEqual(len(serving), 1)
+                        if _diagnostic_mode():
+                            initial = self.reconnect_snapshot(
+                                metrics, server, 2, 1)
+                            prepares = sum(kind == b"P" for kind, _
+                                           in sessions[serving[0]])
+                            self.assert_reconnect_snapshot(initial, 0, prepares,
+                                1, 1, 1, 1, 0, 0, 0)
+                            check_socket()
                         proxy.drop_backend(serving[0])
                         deadline = time.monotonic() + 5
                         while time.monotonic() < deadline:
@@ -3614,9 +3685,11 @@ class Integration(unittest.TestCase):
                         else:
                             self.fail("worker did not prepare a replacement connection")
                         connection.request("GET", "/api/tags")
+                        check_socket()
                         response = connection.getresponse()
                         self.assertEqual(response.status, 200)
                         self.assertIn("tags", json.loads(response.read()))
+                        check_socket()
                         sessions = proxy.snapshot()
                         self.assertEqual(len(sessions), 5)
                         self.assertEqual(sum(kind == b"P" for kind, _
@@ -3629,6 +3702,7 @@ class Integration(unittest.TestCase):
                             try:
                                 before = self.routing_binds(proxy)
                                 connection.request("GET", "/api/tags")
+                                check_socket()
                                 deadline = time.monotonic() + 5
                                 while time.monotonic() < deadline:
                                     after = self.routing_binds(proxy)
@@ -3640,12 +3714,22 @@ class Integration(unittest.TestCase):
                                 else:
                                     self.fail("blocked query was not submitted")
                                 self.assertEqual(changed, [4])
+                                if _diagnostic_mode():
+                                    blocked = self.reconnect_snapshot(
+                                        metrics, server, 1, 3, initial[0])
+                                    prepares = sum(kind == b"P" for kind, _
+                                                   in proxy.snapshot()[4])
+                                    self.assert_reconnect_snapshot(
+                                        blocked, 1, prepares,
+                                        3, 3, 2, 2, 0, 1, 1)
+                                    check_socket()
                                 proxy.drop_backend(changed[0])
                                 response = connection.getresponse()
                                 self.assertEqual(response.status, 500)
                                 body = json.loads(response.read())
                                 self.assertEqual(body["errors"]["body"],
                                                  ["connection lost"])
+                                check_socket()
                             finally:
                                 holder.execute("ROLLBACK;")
                         deadline = time.monotonic() + 5
@@ -3659,9 +3743,22 @@ class Integration(unittest.TestCase):
                         self.assertFalse(any(kind == b"B" for kind, _
                                              in sessions[5]))
                         connection.request("GET", "/api/tags")
+                        check_socket()
                         response = connection.getresponse()
                         self.assertEqual(response.status, 200)
-                        response.read()
+                        self.assertIn("tags", json.loads(response.read()))
+                        check_socket()
+                        sessions = proxy.snapshot()
+                        self.assertIn(b"tags", [payload.split(b"\0", 2)[1]
+                            for kind, payload in sessions[5] if kind == b"B"])
+                        if _diagnostic_mode():
+                            final = self.reconnect_snapshot(
+                                metrics, server, 2, 4, blocked[0])
+                            prepares = sum(kind == b"P" for kind, _
+                                           in sessions[5])
+                            self.assert_reconnect_snapshot(final, 2, prepares,
+                                4, 4, 4, 3, 1, 2, 0)
+                            check_socket()
                     finally:
                         connection.close()
                 finally:
@@ -3673,32 +3770,6 @@ class Integration(unittest.TestCase):
                         server.wait(timeout=5)
                     _check_metric_output(metrics if _diagnostic_mode()
                                          else None)
-                    if _diagnostic_mode():
-                        metrics.seek(0)
-                        final = [record for record in
-                                 _metric_records(metrics)
-                                 if record.get("owner") == 2 and
-                                 record.get("request") == 0]
-                        self.assertEqual({record["generation"] for record
-                                          in final}, {0, 1})
-                        worker_ids = {record["worker_id"] for record in final}
-                        self.assertEqual(len(worker_ids), 1)
-                        worker_id = next(iter(worker_ids))
-                        self.assertTrue(all(record["counters"][11] == 1
-                                            for record in final))
-                        by_generation = {(record["worker_id"],
-                                          record["generation"]): record
-                                         for record in final}
-                        original = by_generation[worker_id, 0]
-                        replacement = by_generation[worker_id, 1]
-                        self.assertEqual(original["counters"][1], 1)
-                        self.assertEqual(original["counters"][3], 1)
-                        self.assertEqual(replacement["counters"][1], 2)
-                        self.assertEqual(replacement["counters"][3], 2)
-                        self.assertEqual(original["histograms"][2][
-                            "count"], 31)
-                        self.assertEqual(replacement["histograms"][2][
-                            "count"], 32)
         finally:
             proxy.stop()
 
