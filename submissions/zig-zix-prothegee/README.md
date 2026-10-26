@@ -29,11 +29,13 @@ Implemented:
 | `POST /api/users/login` | done |
 | `GET /api/user` | done |
 | `PUT /api/user` | done |
+| `GET /api/profiles/:username` | done |
+| `POST /api/profiles/:username/follow` | done |
+| `DELETE /api/profiles/:username/follow` | done |
 | `GET /api/tags` | done, also the health check |
 
 Pending:
 
-- Profiles: `GET /api/profiles/:username`, follow and unfollow.
 - Articles: list, feed, detail, create, update, delete.
 - Favorites: favorite and unfavorite.
 - Comments: list, create, delete.
@@ -44,6 +46,7 @@ Pending:
 - One PostgreSQL connection per worker, opened on first use. No shared pool and no cross-thread handoff.
 - `JWT_SECRET` is read at startup and passed to every sign and verify call with the 26-byte minimum.
 - Every new password is hashed with bcrypt cost 10. Login verifies against the stored hash.
+- Profile reads are auth optional: a missing token is viewer 0, while a present invalid token is 401. Follow and unfollow require a token.
 - `GET /api/tags` is served through the zix L1 response cache with a 2 second TTL.
 
 ## Optimizations
@@ -54,7 +57,7 @@ Pending:
 | per-worker PostgreSQL connection | no locks and no cross-core handoff |
 | keep-alive responses | matches the load generator's long-lived connections |
 | L1 cache on `GET /api/tags` | the tag list is viewer-independent and changes only when an article adds a tag |
-| no cache on user responses | the user row and its auth fields are per-viewer or write-driven |
+| no cache on per-viewer responses | the user row and the `following` flag are viewer-dependent |
 | comptime router | path dispatch is resolved at compile time |
 | release default `0.0.0.0:80` | direct front, while `HOST` and `PORT` always override it |
 
@@ -116,7 +119,7 @@ The integration suite needs the local database. It skips when the database is do
 
 ## Status
 
-The conformance suite has not been run against all 197 checks. Only users, auth, and tags are implemented, so the remaining endpoints still answer 404.
+The conformance suite has not been run against all 197 checks. Users, auth, profiles, and tags are implemented, so the remaining endpoints still answer 404.
 
 ## Notes
 
