@@ -15,8 +15,19 @@ pub const UserView = struct {
     image: ?[]const u8,
 };
 
+pub const ProfileView = struct {
+    username: []const u8,
+    bio: ?[]const u8,
+    image: ?[]const u8,
+    following: bool,
+};
+
 const UserEnvelope = struct {
     user: UserView,
+};
+
+const ProfileEnvelope = struct {
+    profile: ProfileView,
 };
 
 const ErrorBody = struct {
@@ -48,6 +59,11 @@ pub fn renderError(buf: []u8, message: []const u8) !usize {
 /// Render `{"tags": ["name", ...]}`.
 pub fn renderTags(buf: []u8, names: []const []const u8) !usize {
     return jzon.serialize(buf, TagsEnvelope{ .tags = names }, .{});
+}
+
+/// Render `{"profile": Profile}`.
+pub fn renderProfile(buf: []u8, profile: ProfileView) !usize {
+    return jzon.serialize(buf, ProfileEnvelope{ .profile = profile }, .{});
 }
 
 // --------------------------------------------------------- //
@@ -134,4 +150,37 @@ test "json: an empty tag list renders an empty array" {
     const len = try renderTags(&buf, &names);
 
     try std.testing.expectEqualStrings("{\"tags\":[]}", buf[0..len]);
+}
+
+test "json: a profile renders with the following flag" {
+    var buf: [512]u8 = undefined;
+
+    const len = try renderProfile(&buf, .{
+        .username = "ada",
+        .bio = null,
+        .image = null,
+        .following = true,
+    });
+    const text = buf[0..len];
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"profile\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"username\":\"ada\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"bio\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"image\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"following\":true") != null);
+}
+
+test "json: a profile with text fields and a false flag" {
+    var buf: [512]u8 = undefined;
+
+    const len = try renderProfile(&buf, .{
+        .username = "zoe",
+        .bio = "hello",
+        .image = "https://example.com/zoe.png",
+        .following = false,
+    });
+    const text = buf[0..len];
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"bio\":\"hello\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"following\":false") != null);
 }
