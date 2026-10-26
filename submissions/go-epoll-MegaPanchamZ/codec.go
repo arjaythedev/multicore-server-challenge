@@ -118,14 +118,63 @@ func encodePGInt8(buf *[8]byte, v int64) []byte {
 	return buf[:]
 }
 
+const digits100 = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899"
+
 func writePGTimestamp(dst, raw []byte) []byte {
-	us := decodePGInt8(raw)
+	us := decodePGInt8(raw) + pgEpochOffsetMicros
 	ms := us / 1000
 	if us%1000 < 0 {
 		ms--
 	}
-	ts := time.UnixMilli(ms + pgEpochOffsetMicros/1000).UTC()
-	return ts.AppendFormat(dst, `"2006-01-02T15:04:05.000Z"`)
+	if ms < -62135596800_000 || ms >= 253402300800_000 {
+		return time.UnixMilli(ms).UTC().AppendFormat(dst, `"2006-01-02T15:04:05.000Z"`)
+	}
+	totalMs := uint64(ms + 62162035200_000)
+	days := totalMs / 86400_000
+	remMs := totalMs % 86400_000
+
+	era := days / 146097
+	doe := days - era*146097
+	yoe := (doe - doe/1460 + doe/36524 - doe/146096) / 365
+	y := yoe + era*400
+	doy := doe - (365*yoe + yoe/4 - yoe/100)
+	mp := (5*doy + 2) / 153
+	d := doy - (153*mp+2)/5 + 1
+	var m uint64
+	if mp < 10 {
+		m = mp + 3
+	} else {
+		m = mp - 9
+		y++
+	}
+
+	msec := remMs % 1000
+	remSec := remMs / 1000
+	sec := remSec % 60
+	remMin := remSec / 60
+	min := remMin % 60
+	hour := remMin / 60
+
+	yHi := (y / 100) * 2
+	yLo := (y % 100) * 2
+	m2 := m * 2
+	d2 := d * 2
+	h2 := hour * 2
+	min2 := min * 2
+	s2 := sec * 2
+	msHi := byte('0' + msec/100)
+	msLo := (msec % 100) * 2
+
+	return append(dst,
+		'"',
+		digits100[yHi], digits100[yHi+1], digits100[yLo], digits100[yLo+1], '-',
+		digits100[m2], digits100[m2+1], '-',
+		digits100[d2], digits100[d2+1], 'T',
+		digits100[h2], digits100[h2+1], ':',
+		digits100[min2], digits100[min2+1], ':',
+		digits100[s2], digits100[s2+1], '.',
+		msHi, digits100[msLo], digits100[msLo+1], 'Z', '"',
+	)
 }
 
 func writeTimestamps(dst, createdRaw, updatedRaw []byte) []byte {

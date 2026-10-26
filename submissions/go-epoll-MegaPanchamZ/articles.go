@@ -269,7 +269,7 @@ func (s *pgSession) decodeBatchArticle(batch []*reqCtx, rr *pgconn.ResultReader)
 	}
 	for rr.NextRow() {
 		cols := rr.Values()
-		slot := int(decodePGInt8(cols[14])) - 1
+		slot := int(decodePGInt8(cols[13])) - 1
 		if uint(slot) < uint(count) {
 			t := batch[slot]
 			qp := &t.plan
@@ -304,7 +304,7 @@ func (s *pgSession) decodeBatchArticleList(batch []*reqCtx, rr *pgconn.ResultRea
 	}
 	for rr.NextRow() {
 		cols := rr.Values()
-		slot := int(decodePGInt8(cols[14])) - 1
+		slot := int(decodePGInt8(cols[13])) - 1
 		if uint(slot) < uint(count) {
 			t := batch[slot]
 			qp := &t.plan
@@ -343,7 +343,7 @@ func (s *pgSession) decodeBatchFavoriteWrite(batch []*reqCtx, rr *pgconn.ResultR
 	}
 	for rr.NextRow() {
 		cols := rr.Values()
-		slot := int(decodePGInt8(cols[14])) - 1
+		slot := int(decodePGInt8(cols[13])) - 1
 		if uint(slot) < uint(count) {
 			t := batch[slot]
 			qp := &t.plan
@@ -367,7 +367,7 @@ func (s *pgSession) decodeBatchFavoriteWrite(batch []*reqCtx, rr *pgconn.ResultR
 }
 
 func writeArticleObject(dst []byte, cols [][]byte, offset int, includeBody bool) []byte {
-	idx := offset + 1
+	idx := offset
 	dst = append(dst, `{"slug":`...)
 	dst = writeJSONStr(dst, cols[idx])
 	dst = append(dst, `,"title":`...)
