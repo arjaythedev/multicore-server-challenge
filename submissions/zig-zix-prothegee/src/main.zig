@@ -15,6 +15,8 @@ const api_articles = @import("handlers/api_articles.zig");
 const api_articles_feed = @import("handlers/api_articles_feed.zig");
 const api_articles_slug = @import("handlers/api_articles_slug.zig");
 const api_articles_slug_favorite = @import("handlers/api_articles_slug_favorite.zig");
+const api_articles_slug_comments = @import("handlers/api_articles_slug_comments.zig");
+const api_articles_slug_comments_id = @import("handlers/api_articles_slug_comments_id.zig");
 const api_tags = @import("handlers/api_tags.zig");
 
 // --------------------------------------------------------- //
@@ -79,6 +81,16 @@ const Routes = zix.Http1.Router(&[_]zix.Http1.Route{
         .kind = .PARAM,
     },
     // Comments
+    .{
+        .path = api_articles_slug_comments_id.PATH,
+        .handler = api_articles_slug_comments_id.RESPONSE,
+        .kind = .PARAM,
+    },
+    .{
+        .path = api_articles_slug_comments.PATH,
+        .handler = api_articles_slug_comments.RESPONSE,
+        .kind = .PARAM,
+    },
     // Tags
     .{
         .path = api_tags.PATH,
