@@ -13,9 +13,9 @@ if [ -x /opt/jdk-27/bin/java ]; then JAVA_HOME=/opt/jdk-27; fi
 # Fiber tracing is off: it records a stack frame per IO step, which costs CPU on every request.
 SCALA_CLI=/opt/scala-cli/scala-cli; [ -x "$SCALA_CLI" ] || SCALA_CLI=scala-cli
 # scala-cli runs the classes build.sh compiled (target/classpath.txt) without compiling them again: --java because
-# the Scala library is already on that class path. --offline: nothing is fetched, only build.sh downloads. It replaces
-# itself with the JVM, so the server keeps its PID.
-exec "$SCALA_CLI" run --server=false --offline --java-home "$JAVA_HOME" --java -cp "$(cat target/classpath.txt)" \
+# the Scala library is already on that class path. --offline (needs --power): nothing is fetched, only build.sh
+# downloads. It replaces itself with the JVM, so the server keeps its PID.
+exec "$SCALA_CLI" --power run --server=false --offline --java-home "$JAVA_HOME" --java -cp "$(cat target/classpath.txt)" \
   --main-class conduit.Main \
   --java-opt=-XX:+UseParallelGC --java-opt=-XX:MaxRAMPercentage=45 --java-opt=-XX:InitialRAMPercentage=45 \
   --java-opt=-XX:+AlwaysPreTouch --java-opt=-XX:-UsePerfData --java-opt=-Dcats.effect.tracing.mode=none \
