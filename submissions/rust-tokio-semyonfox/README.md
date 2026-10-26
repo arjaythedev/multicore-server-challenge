@@ -89,7 +89,7 @@ The localhost URLs and key above are examples for disposable development data.
 
 ## Local measurements
 
-Postgres is about 70% of the benchmark box under the leader, so the number that matters is Postgres CPU per
+Postgres is about 70% of the benchmark box under the base, so the number that matters is Postgres CPU per
 request. Locally Postgres 18 runs in its own container (four-CPU quota, 3 GiB, 512 MiB shared buffers), so its
 cgroup CPU time over the measured window, divided by requests served, isolates that cost from the load
 generator sharing the host. Each run uses a fresh full-seed copy, 3,000 users at think scale 0.1 (about
