@@ -6,4 +6,6 @@ test {
     _ = @import("pg.zig");
     _ = @import("http.zig");
     _ = @import("bcpool.zig");
+    _ = @import("server.zig");
+    _ = @import("plan.zig");
 }

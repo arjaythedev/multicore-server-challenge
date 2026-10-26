@@ -1,7 +1,7 @@
 //! The event loop: one thread per worker, each with its own io_uring, SO_REUSEPORT listener, connection table and
 //! Postgres connections. Nothing on the request path is shared between workers.
 //!
-//! Idle keep-alive connections cost one 48-byte table slot (indexed by fd) plus the kernel socket: receive buffers
+//! Idle keep-alive connections cost one 64-byte table slot (indexed by fd) plus the kernel socket: receive buffers
 //! come from a shared provided-buffer ring and are only attached to a connection while a request is incomplete.
 const std = @import("std");
 const linux = std.os.linux;
@@ -109,6 +109,16 @@ const Conn = struct {
     out_off: u32 = 0,
     out_cap: u32 = 0,
     zc_waiting: bool = false,
+    send_zc: bool = false,
+
+    fn completeSend(self: *Conn, res: i32, flags: u32) bool {
+        const was_zc = self.send_zc;
+        self.send_live = false;
+        self.send_zc = false;
+        if (flags & linux.IORING_CQE_F_MORE != 0) self.zc_waiting = true;
+        if (res > 0) self.out_off += @intCast(res);
+        return was_zc;
+    }
 };
 
 const max_pend = http.max_body + http.max_head + 4096;
@@ -154,7 +164,6 @@ const Member = struct {
             m.heap = null;
         } else {
             m.heap = gpa.dupe(u8, bytes) catch return null;
-            m.len = @intCast(bytes.len);
         }
         return m;
     }
@@ -184,7 +193,7 @@ const PgConn = struct {
     wa: Buf = .{}, // in flight (immutable while `sending`)
     ws: Buf = .{}, // staging
     wsent: usize = 0,
-    q: [max_depth_cap]usize = undefined, // *Req, or *BatchRec | 1
+    q: [max_depth_cap]usize = undefined, // tagged request/record pointer; 0 is an internal ROLLBACK
     qh: u32 = 0,
     depth: u32 = 0,
     ginflight: bool = false, // a group commit is in flight on this (write) connection
@@ -336,7 +345,47 @@ const BatchRec = struct {
     /// The requests' parameters, kept (text owned) until the reply: if the statement fails, each request is re-run alone.
     items: [max_batch]StageItem,
     stmt: sql.Stmt,
+
+    fn encode(self: *const BatchRec, e: *pg.Enc) void {
+        var viewers: [max_batch]i64 = undefined;
+        var limits: [max_batch]i32 = undefined;
+        var offsets: [max_batch]i32 = undefined;
+        var texts: [max_batch][]const u8 = undefined;
+        for (self.items[0..self.n], 0..) |*it, i| {
+            viewers[i] = it.viewer;
+            limits[i] = it.limit;
+            offsets[i] = it.offset;
+            // Inline text must be borrowed from the stored item, not a loop-local copy.
+            texts[i] = it.text();
+        }
+        e.bind(sql.batchId(self.stmt));
+        e.pInt8Array(viewers[0..self.n]);
+        if (shapeLo(self.stmt)) {
+            e.pInt4Array(limits[0..self.n]);
+            e.pInt4Array(offsets[0..self.n]);
+        }
+        if (shapeText(self.stmt)) e.pTextArray(texts[0..self.n]);
+        e.exec();
+    }
 };
+
+fn readWindowNs(cfg: *const Config, staged: usize, has_idle_pg: bool) u64 {
+    const window_ns = @as(u64, cfg.read_window_us) * std.time.ns_per_us;
+    if (!cfg.adaptive_window) return window_ns;
+    // Batch what is already waiting, rather than leaving an idle backend behind a timer.
+    if (has_idle_pg or staged >= cfg.read_hold_min) return 0;
+    const adaptive_ns: u64 = if (staged >= 1024)
+        10 * std.time.ns_per_ms
+    else if (staged >= 512)
+        25 * std.time.ns_per_ms
+    else if (staged >= 256)
+        35 * std.time.ns_per_ms
+    else if (staged >= 128)
+        50 * std.time.ns_per_ms
+    else
+        window_ns;
+    return @min(window_ns, adaptive_ns);
+}
 
 // ---------------------------------------------------------------------------------------------
 // Worker
@@ -362,6 +411,7 @@ pub const Worker = struct {
     free_reqs: ?*Req = null,
     slabs: [slab_pool_cap][*]u8 = undefined,
     slab_count: usize = 0,
+    send_zc_enabled: bool = false, // detected capability is worker-local; Shared.cfg stays immutable
     batch_rec_pool: [64]*BatchRec = undefined,
     batch_rec_count: usize = 0,
     pgs: []PgConn = &.{},
@@ -490,7 +540,8 @@ pub const Worker = struct {
     fn submitSend(self: *Worker, fd: i32, c: *Conn) void {
         const s = self.sqe();
         const to_send = (c.out + c.out_off)[0 .. c.out_len - c.out_off];
-        if (self.shared.cfg.send_zc and to_send.len >= 256 and c.out_off == 0) {
+        c.send_zc = self.send_zc_enabled and to_send.len >= 256 and c.out_off == 0;
+        if (c.send_zc) {
             s.prep_send_zc(fd, to_send, linux.MSG.NOSIGNAL, 0);
         } else {
             s.prep_send(fd, to_send, linux.MSG.NOSIGNAL);
@@ -503,63 +554,49 @@ pub const Worker = struct {
         const c = &self.conns[@intCast(fd)];
         if (c.gen & 0xffffff != gen) return;
 
-        // io_uring zero-copy buffer release notification (IORING_CQE_F_NOTIF)
         if (flags & linux.IORING_CQE_F_NOTIF != 0) {
             c.zc_waiting = false;
-            if (c.send_live) return;
-            self.freeOut(c);
-            if (!c.open or c.closing) {
-                self.maybeFinishClose(fd);
-                return;
-            }
-            c.busy = false;
-            if (c.close_after) {
-                self.closeConn(fd);
-                return;
-            }
-            if (c.pend_len != 0) self.parsePend(fd, c);
-            if (c.eof and c.open and !c.busy) self.closeConn(fd);
+            self.finishSend(fd, c);
             return;
         }
 
-        c.send_live = false;
-        if (res < 0) {
+        // MORE promises a release notification even on partial or failed sends.
+        const was_zc = c.completeSend(res, flags);
+        if (res <= 0) {
             const err_num = -res;
-            if (self.shared.cfg.send_zc and (err_num == @as(i32, @intFromEnum(linux.E.OPNOTSUPP)) or err_num == @as(i32, @intFromEnum(linux.E.INVAL)))) {
-                self.shared.cfg.send_zc = false;
+            if (was_zc and (err_num == @as(i32, @backingInt(linux.E.OPNOTSUPP)) or err_num == @as(i32, @backingInt(linux.E.INVAL)))) {
+                self.send_zc_enabled = false;
                 if (c.open) {
                     self.submitSend(fd, c);
                     return;
                 }
             }
-            self.freeOut(c);
             self.closeConn(fd);
-            self.maybeFinishClose(fd); // closeConn does nothing when the connection was already closing
+            self.finishSend(fd, c);
             return;
         }
-        c.out_off += @intCast(res);
         if (c.out_off < c.out_len and c.open) {
             self.submitSend(fd, c);
             return;
         }
+        self.finishSend(fd, c);
+    }
 
-        if (flags & linux.IORING_CQE_F_MORE != 0) {
-            c.zc_waiting = true;
-            if (!c.open) return;
-        } else {
-            self.freeOut(c);
-            if (!c.open) {
-                self.maybeFinishClose(fd);
-                return;
-            }
-            c.busy = false;
-            if (c.close_after) {
-                self.closeConn(fd);
-                return;
-            }
-            if (c.pend_len != 0) self.parsePend(fd, c);
-            if (c.eof and c.open and !c.busy) self.closeConn(fd);
+    fn finishSend(self: *Worker, fd: i32, c: *Conn) void {
+        // A tail SEND and the original SEND_ZC notification may complete in either order.
+        if (c.send_live or c.zc_waiting) return;
+        self.freeOut(c);
+        if (!c.open or c.closing) {
+            self.maybeFinishClose(fd);
+            return;
         }
+        c.busy = false;
+        if (c.close_after) {
+            self.closeConn(fd);
+            return;
+        }
+        if (c.pend_len != 0) self.parsePend(fd, c);
+        if (c.eof and c.open and !c.busy) self.closeConn(fd);
     }
 
     fn freeOut(self: *Worker, c: *Conn) void {
@@ -706,20 +743,24 @@ pub const Worker = struct {
             self.closeConn(fd);
             return;
         }
-        const rc = linux.recvfrom(fd, self.scratch_rx.ptr, self.scratch_rx.len, linux.MSG.DONTWAIT, null, null);
-        switch (sys.errnoOf(rc)) {
-            .SUCCESS => {
-                if (rc == 0) {
-                    if (c.busy) c.eof = true else self.closeConn(fd);
+        // Multishot poll is edge-triggered: unread bytes need not produce another CQE.
+        while (c.open) {
+            const rc = linux.recvfrom(fd, self.scratch_rx.ptr, self.scratch_rx.len, linux.MSG.DONTWAIT, null, null);
+            switch (sys.errnoOf(rc)) {
+                .SUCCESS => {
+                    if (rc == 0) {
+                        if (c.busy) c.eof = true else self.closeConn(fd);
+                        break;
+                    }
+                    self.onData(fd, c, self.scratch_rx[0..rc]);
+                },
+                .AGAIN => break,
+                .INTR => continue,
+                else => {
+                    self.closeConn(fd);
                     return;
-                }
-                self.onData(fd, c, self.scratch_rx[0..rc]);
-            },
-            .AGAIN, .INTR => {},
-            else => {
-                self.closeConn(fd);
-                return;
-            },
+                },
+            }
         }
         if (c.open and !c.recv_live) self.armRecv(fd, c);
     }
@@ -868,7 +909,8 @@ pub const Worker = struct {
             const start = self.rr[@backingInt(class)];
             while (i < n) : (i += 1) {
                 const p = &self.pgs[range.lo + (start + i) % n];
-                if (!p.alive or p.depth >= cap) continue;
+                // A group may need ROLLBACK; never pipeline unrelated writes behind its outcome.
+                if (!p.alive or p.ginflight or p.depth >= cap) continue;
                 if (best == null or p.depth < best.?.depth) best = p;
             }
             self.rr[@backingInt(class)] = (start + 1) % n;
@@ -887,6 +929,7 @@ pub const Worker = struct {
     }
 
     fn pgPush(self: *Worker, p: *PgConn, token: usize, bytes: []const u8) void {
+        std.debug.assert(p.depth < self.shared.cfg.pg_depth and p.depth < max_depth_cap);
         p.ws.putSlice(bytes);
         p.q[(p.qh + p.depth) % max_depth_cap] = token;
         p.depth += 1;
@@ -948,7 +991,13 @@ pub const Worker = struct {
             p.qh = (p.qh + 1) % max_depth_cap;
             p.depth -= 1;
             self.stats.pg_batches += 1;
-            switch (token & 3) {
+            if (token == 0) {
+                if (batch[batch.len - 1] != 'I') {
+                    p.rs.done();
+                    self.pgFail(p);
+                    return;
+                }
+            } else switch (token & 3) {
                 0 => api.onPg(self, @ptrFromInt(token), batch),
                 1 => self.onBatchReply(@ptrFromInt(token & ~@as(usize, 3)), batch),
                 2 => self.onGroupReply(p, @ptrFromInt(token & ~@as(usize, 3)), batch),
@@ -974,13 +1023,16 @@ pub const Worker = struct {
         while (f.len != 0) {
             var best: ?*PgConn = null;
             for (self.pgs[range.lo..range.hi]) |*p| {
-                if (!p.alive or p.depth >= cap) continue;
+                if (!p.alive or p.ginflight or p.depth >= cap) continue;
                 if (best == null or p.depth < best.?.depth) best = p;
             }
             const p = best orelse return;
             const q = f.pop().?;
             self.pgPush(p, @intFromPtr(q.r), q.bytes);
             gpa.free(q.bytes);
+        }
+        if (class == .write) {
+            for (self.pgs[range.lo..range.hi]) |*p| self.sendGroup(p);
         }
     }
 
@@ -1062,6 +1114,7 @@ pub const Worker = struct {
     }
 
     fn failToken(self: *Worker, token: usize) void {
+        if (token == 0) return;
         switch (token & 3) {
             0 => api.onPgFailure(self, @ptrFromInt(token)),
             1 => {
@@ -1122,7 +1175,7 @@ pub const Worker = struct {
         // If a connection has warm query cache affinity and its depth is within slack of the minimum, prefer it.
         const slack: u32 = 2;
         if (affinity_conn) |ac| {
-            if (ac.depth <= min_depth + slack and ac.depth < cap) {
+            if (ac.depth == min_depth or (min_depth != 0 and ac.depth <= min_depth + slack)) {
                 return ac;
             }
         }
@@ -1158,7 +1211,6 @@ pub const Worker = struct {
     /// Send staged reads to connections with room, oldest kind first.
     pub fn flushReads(self: *Worker) void {
         if (self.staged == 0) return;
-        const window_ns = @as(u64, self.shared.cfg.read_window_us) * 1000;
         var has_idle_pg = false;
         for (self.pgs[0..self.n_read]) |*p| {
             if (p.alive and p.depth == 0) {
@@ -1166,19 +1218,7 @@ pub const Worker = struct {
                 break;
             }
         }
-        const effective_window_ns: u64 = if (!self.shared.cfg.adaptive_window) window_ns else blk: {
-            // Do not manufacture 100 ms of latency for an isolated request
-            // when a backend is waiting.  There is no batch to form yet.
-            if (self.staged == 1 and has_idle_pg) break :blk 0;
-            if (self.staged >= self.shared.cfg.read_hold_min) break :blk 0;
-            if (self.staged >= 1024) break :blk 10 * std.time.ns_per_ms;
-            if (self.staged >= 512) break :blk 25 * std.time.ns_per_ms;
-            if (self.staged >= 256) break :blk 35 * std.time.ns_per_ms;
-            if (self.staged >= 128) break :blk 50 * std.time.ns_per_ms;
-
-            if (has_idle_pg and self.staged >= 64) break :blk 15 * std.time.ns_per_ms;
-            break :blk window_ns;
-        };
+        const effective_window_ns = readWindowNs(&self.shared.cfg, self.staged, has_idle_pg);
 
         if (effective_window_ns != 0 and self.staged < self.shared.cfg.read_hold_min) {
             // Young and few: wait for company. One timeout wakes the loop when the oldest has waited the window out.
@@ -1263,29 +1303,13 @@ pub const Worker = struct {
                 const rec = self.allocBatchRec() orelse return;
                 rec.n = @intCast(n);
                 rec.fanout = false; // create() does not apply field defaults
-                var viewers: [max_batch]i64 = undefined;
-                var limits: [max_batch]i32 = undefined;
-                var offsets: [max_batch]i32 = undefined;
-                var texts: [max_batch][]const u8 = undefined;
                 rec.stmt = stmt;
                 for (0..n) |i| {
-                    const it = st.pop();
-                    rec.reqs[i] = it.r;
-                    rec.items[i] = it;
-                    viewers[i] = it.viewer;
-                    limits[i] = it.limit;
-                    offsets[i] = it.offset;
-                    texts[i] = it.text();
+                    rec.items[i] = st.pop();
+                    rec.reqs[i] = rec.items[i].r;
                 }
                 self.staged -= n;
-                e.bind(sql.batchId(stmt));
-                e.pInt8Array(viewers[0..n]);
-                if (shapeLo(stmt)) {
-                    e.pInt4Array(limits[0..n]);
-                    e.pInt4Array(offsets[0..n]);
-                }
-                if (shapeText(stmt)) e.pTextArray(texts[0..n]);
-                e.exec();
+                rec.encode(&e);
                 if (self.shared.cfg.test_fail_batches) {
                     // a Bind to a statement that does not exist: the whole batch errors, as a poisoned request would
                     self.enc.putSlice("B\x00\x00\x00\x11\x00s9999\x00\x00\x00\x00\x00\x00\x00");
@@ -1461,6 +1485,7 @@ pub const Worker = struct {
     }
 
     fn sendGroup(self: *Worker, p: *PgConn) void {
+        if (!p.alive or p.ginflight or p.depth >= self.shared.cfg.pg_depth) return;
         const n = @min(p.staged.items.len, max_group);
         if (n == 0) return;
         const rec = &p.wrec;
@@ -1500,7 +1525,10 @@ pub const Worker = struct {
             if (m.kind == 'E') errored = true;
         }
         if (errored) {
-            // Rolled back as a whole (nothing committed): run each member on its own.
+            // Extended-protocol errors skip COMMIT until Sync, leaving the transaction aborted.
+            // Queue ROLLBACK before any retries or later groups can reuse this connection.
+            log.warn("write group failed; rolling back and retrying its {d} requests one by one", .{rec.n});
+            self.pgPush(p, 0, "Q\x00\x00\x00\x0dROLLBACK\x00");
             for (rec.m[0..rec.n]) |*mem| {
                 self.soloWrite(mem.r, mem.slice());
                 mem.deinit();
@@ -1540,7 +1568,7 @@ pub const Worker = struct {
                 rec.m[idx].deinit();
             }
         }
-        if (p.staged.items.len != 0) self.sendGroup(p);
+        self.pgDrain(.write);
     }
 
     /// One write as its own transaction (unique-violation-prone statements and group retries).
@@ -1751,7 +1779,7 @@ fn workerInit(shared: *Shared, id: usize) !void {
         sys.pinCpu(id % cpus);
     }
     const w = try gpa.create(Worker);
-    w.* = .{ .shared = shared, .id = id };
+    w.* = .{ .shared = shared, .id = id, .send_zc_enabled = cfg.send_zc };
     w.scratch = try Scratch.init(64 * 1024);
     w.out = try Buf.init(64 * 1024);
     w.enc = try Buf.init(16 * 1024);
@@ -1798,4 +1826,306 @@ fn workerInit(shared: *Shared, id: usize) !void {
     for (w.pgs) |*p| w.pgArmRecv(p);
     _ = @atomicRmw(u32, &shared.ready, .Add, 1, .release);
     w.run();
+}
+
+test "idle connection metadata stays within one cache line" {
+    try std.testing.expect(@sizeOf(Conn) <= 64);
+}
+
+test "adaptive reads dispatch every queued batch when a backend is idle" {
+    var cfg = std.mem.zeroes(Config);
+    cfg.read_window_us = 100000;
+    cfg.read_hold_min = 2048;
+    cfg.adaptive_window = true;
+    for ([_]usize{ 1, 2, 63, 64, 127, 128, 256, 512, 1024, 2048 }) |n| {
+        try std.testing.expectEqual(@as(u64, 0), readWindowNs(&cfg, n, true));
+    }
+    try std.testing.expectEqual(@as(u64, 100 * std.time.ns_per_ms), readWindowNs(&cfg, 2, false));
+    try std.testing.expectEqual(@as(u64, 50 * std.time.ns_per_ms), readWindowNs(&cfg, 128, false));
+    try std.testing.expectEqual(@as(u64, 10 * std.time.ns_per_ms), readWindowNs(&cfg, 1024, false));
+    cfg.read_window_us = 1000;
+    for ([_]usize{ 1, 64, 128, 256, 512, 1024 }) |n| {
+        try std.testing.expectEqual(@as(u64, std.time.ns_per_ms), readWindowNs(&cfg, n, false));
+    }
+    cfg.read_window_us = 0;
+    for ([_]usize{ 1, 64, 128, 256, 512, 1024 }) |n| {
+        try std.testing.expectEqual(@as(u64, 0), readWindowNs(&cfg, n, false));
+    }
+    cfg.read_window_us = 100000;
+    cfg.adaptive_window = false;
+    try std.testing.expectEqual(@as(u64, 100 * std.time.ns_per_ms), readWindowNs(&cfg, 2, true));
+}
+
+test "read connection affinity never bypasses an idle backend" {
+    var shared: Shared = undefined;
+    shared.cfg = std.mem.zeroes(Config);
+    shared.cfg.pg_depth = 4;
+    var pgs = [_]PgConn{
+        .{ .alive = true, .depth = 2, .last_stmt = .article },
+        .{ .alive = true, .depth = 0, .last_stmt = .profile },
+    };
+    var w = Worker{ .shared = &shared, .id = 0, .pgs = &pgs, .n_read = pgs.len };
+    try std.testing.expectEqual(&pgs[1], w.bestReadConn(.article).?);
+    pgs[1].depth = 1;
+    try std.testing.expectEqual(&pgs[0], w.bestReadConn(.article).?);
+    pgs[0].alive = false;
+    try std.testing.expectEqual(&pgs[1], w.bestReadConn(.article).?);
+}
+
+test "staged reads flush as soon as an in-flight backend becomes idle" {
+    for ([_]usize{ 2, 63, 64, 128 }) |n| {
+        var shared: Shared = undefined;
+        shared.cfg = std.mem.zeroes(Config);
+        shared.cfg.pg_depth = 4;
+        shared.cfg.batch_max = 64;
+        shared.cfg.read_window_us = 100000;
+        shared.cfg.read_hold_min = 2048;
+        shared.cfg.adaptive_window = true;
+        // Sending is already armed, so this test records queued wire bytes without kernel I/O.
+        var pgs = [_]PgConn{.{ .alive = true, .sending = true, .depth = 1 }};
+        defer pgs[0].ws.deinit();
+        var w = Worker{ .shared = &shared, .id = 0, .pgs = &pgs, .n_read = 1 };
+        defer w.enc.deinit();
+        defer for (&w.stages) |*st| {
+            while (st.len != 0) {
+                var it = st.pop();
+                it.deinit();
+            }
+            if (st.items.len != 0) gpa.free(st.items);
+        };
+        var req: Req = .{};
+        for (0..n) |_| w.readSubmit(.tags, &req, .{});
+        try std.testing.expect(readWindowNs(&shared.cfg, w.staged, false) != 0);
+        pgs[0].depth = 0;
+        w.flushReads();
+        defer for (pgs[0].q[0..pgs[0].depth]) |token| {
+            const rec: *BatchRec = @ptrFromInt(token & ~@as(usize, 3));
+            gpa.destroy(rec);
+        };
+        try std.testing.expectEqual(@as(usize, 0), w.staged);
+        try std.testing.expect(!w.hold_armed);
+        try std.testing.expect(pgs[0].depth > 0);
+        try std.testing.expect(pgs[0].ws.len > 0);
+    }
+}
+
+test "per-kind batch encodes keys from stable stored inline and heap items" {
+    const a127: [127]u8 = @splat('a');
+    const b128: [128]u8 = @splat('b');
+    const c129: [129]u8 = @splat('c');
+    const texts = [_][]const u8{ "slug-alpha", "slug-bravo", &a127, &b128, &c129, "slug-alpha" };
+    var reqs: [texts.len]Req = @splat(.{});
+    const rec = try gpa.create(BatchRec);
+    defer gpa.destroy(rec);
+    rec.n = texts.len;
+    var viewers: [texts.len]i64 = undefined;
+    var limits: [texts.len]i32 = undefined;
+    var offsets: [texts.len]i32 = undefined;
+    for (texts, 0..) |text, i| {
+        viewers[i] = @intCast(i);
+        limits[i] = @intCast(i + 1);
+        offsets[i] = @intCast(i * 2);
+        var it = StageItem.init(&reqs[i], i, viewers[i], limits[i], offsets[i], text).?;
+        rec.items[i] = it;
+        rec.reqs[i] = it.r;
+        @memset(&it.buf, 0xa5);
+    }
+    defer for (rec.items[0..rec.n]) |*it| it.deinit();
+    var actual: Buf = .{};
+    defer actual.deinit();
+    var expected: Buf = .{};
+    defer expected.deinit();
+    for ([_]sql.Stmt{ .article, .comments, .profile, .list_tag, .list_author, .list_fav }) |stmt| {
+        rec.stmt = stmt;
+        actual.reset();
+        expected.reset();
+        var e = pg.Enc.init(&actual);
+        rec.encode(&e);
+        e.sync();
+        var ref = pg.Enc.init(&expected);
+        ref.bind(sql.batchId(stmt));
+        ref.pInt8Array(&viewers);
+        if (shapeLo(stmt)) {
+            ref.pInt4Array(&limits);
+            ref.pInt4Array(&offsets);
+        }
+        ref.pTextArray(&texts);
+        ref.exec();
+        ref.sync();
+        try std.testing.expectEqualSlices(u8, expected.slice(), actual.slice());
+    }
+}
+
+test "large grouped writes retain their full heap-backed wire payload" {
+    const bytes = try gpa.alloc(u8, 128 * 1024);
+    defer gpa.free(bytes);
+    @memset(bytes, 0x5a);
+    var req: Req = .{};
+    var member = Member.init(&req, 1, bytes).?;
+    defer member.deinit();
+    try std.testing.expectEqualSlices(u8, bytes, member.slice());
+}
+
+test "partial zero-copy sends retain output until both tail and notification complete" {
+    for ([_]bool{ false, true }) |notification_first| {
+        const bytes = try gpa.alloc(u8, slab_size);
+        defer gpa.free(bytes);
+        var shared: Shared = undefined;
+        var conns = [_]Conn{.{
+            .gen = 7,
+            .open = true,
+            .busy = true,
+            .send_live = true,
+            .send_zc = true,
+            .out = bytes.ptr,
+            .out_len = slab_size,
+            .out_cap = slab_size,
+        }};
+        var w = Worker{ .shared = &shared, .id = 0, .conns = &conns };
+        const c = &conns[0];
+        try std.testing.expect(c.completeSend(1024, linux.IORING_CQE_F_MORE));
+        try std.testing.expect(c.zc_waiting);
+        try std.testing.expectEqual(@as(u32, 1024), c.out_off);
+        w.finishSend(0, c);
+        try std.testing.expect(c.busy);
+        try std.testing.expectEqual(@as(u32, slab_size), c.out_cap);
+        c.send_live = true; // the remaining bytes use ordinary SEND
+        if (notification_first) {
+            w.onSend(0, 7, 0, linux.IORING_CQE_F_NOTIF);
+            try std.testing.expect(c.busy and c.send_live);
+            try std.testing.expectEqual(@as(u32, slab_size), c.out_cap);
+        }
+        w.onSend(0, 7, slab_size - 1024, 0);
+        if (!notification_first) {
+            try std.testing.expect(c.busy and c.zc_waiting);
+            try std.testing.expectEqual(@as(u32, slab_size), c.out_cap);
+            w.onSend(0, 7, 0, linux.IORING_CQE_F_NOTIF);
+        }
+        try std.testing.expect(!c.busy and !c.zc_waiting and !c.send_live);
+        try std.testing.expectEqual(@as(u32, 0), c.out_cap);
+        try std.testing.expectEqual(@as(usize, 1), w.slab_count);
+    }
+}
+
+test "failed zero-copy sends still honor promised release notifications" {
+    const bytes = try gpa.alloc(u8, slab_size);
+    defer gpa.free(bytes);
+    var shared: Shared = undefined;
+    var w = Worker{ .shared = &shared, .id = 0 };
+    var c = Conn{ .busy = true, .send_live = true, .send_zc = true, .out = bytes.ptr, .out_len = slab_size, .out_cap = slab_size };
+    try std.testing.expect(c.completeSend(-@as(i32, @backingInt(linux.E.PIPE)), linux.IORING_CQE_F_MORE));
+    w.freeOut(&c);
+    try std.testing.expect(c.zc_waiting and c.busy);
+    try std.testing.expectEqual(@as(u32, slab_size), c.out_cap);
+    c.zc_waiting = false;
+    w.freeOut(&c);
+    try std.testing.expectEqual(@as(u32, 0), c.out_cap);
+}
+
+test "standalone writes cannot pipeline behind an unresolved write group" {
+    var shared: Shared = undefined;
+    shared.cfg = std.mem.zeroes(Config);
+    shared.cfg.pg_depth = 4;
+    var pgs = [_]PgConn{.{ .alive = true, .class = .write, .ginflight = true, .sending = true }};
+    defer pgs[0].ws.deinit();
+    var w = Worker{ .shared = &shared, .id = 0, .pgs = &pgs };
+    const fifo = &w.fifo[@backingInt(Class.write)];
+    defer {
+        while (fifo.pop()) |q| gpa.free(q.bytes);
+        if (fifo.items.len != 0) gpa.free(fifo.items);
+    }
+    var req: Req = .{};
+    w.soloWrite(&req, "wire bytes");
+    try std.testing.expectEqual(@as(usize, 1), fifo.len);
+    try std.testing.expectEqual(@as(u32, 0), pgs[0].depth);
+    w.pgDrain(.write);
+    try std.testing.expectEqual(@as(usize, 1), fifo.len);
+    pgs[0].ginflight = false;
+    w.pgDrain(.write);
+    try std.testing.expectEqual(@as(usize, 0), fifo.len);
+    try std.testing.expectEqual(@as(u32, 1), pgs[0].depth);
+    try std.testing.expectEqualStrings("wire bytes", pgs[0].ws.slice());
+}
+
+test "grouped writes wait without overwriting a full PostgreSQL token ring" {
+    for ([_]u32{ 1, 4, 32, max_depth_cap }) |cap| {
+        var shared: Shared = undefined;
+        shared.cfg = std.mem.zeroes(Config);
+        shared.cfg.pg_depth = cap;
+        var pgs = [_]PgConn{.{ .alive = true, .class = .write, .sending = true, .q = @splat(0), .qh = max_depth_cap - 1 }};
+        const p = &pgs[0];
+        defer p.ws.deinit();
+        defer p.staged.deinit(gpa);
+        var w = Worker{ .shared = &shared, .id = 0, .pgs = &pgs };
+        defer w.enc.deinit();
+        var reqs: [max_depth_cap]Req = @splat(.{});
+        for (reqs[0..cap]) |*r| w.pgPush(p, @intFromPtr(r), "standalone");
+        const before = p.q;
+        const wire_len = p.ws.len;
+        var grouped: Req = .{};
+        w.writeSubmit(&grouped, "memberS\x00\x00\x00\x04", 1);
+        try std.testing.expectEqual(cap, p.depth);
+        try std.testing.expectEqualSlices(usize, &before, &p.q);
+        try std.testing.expectEqual(wire_len, p.ws.len);
+        try std.testing.expect(!p.ginflight);
+        try std.testing.expectEqual(@as(usize, 1), p.staged.items.len);
+    }
+}
+
+test "deferred groups resume after standalone completions and rollback releases capacity" {
+    for ([_]u32{ 1, 4, 32, max_depth_cap }) |cap| {
+        var shared: Shared = undefined;
+        shared.cfg = std.mem.zeroes(Config);
+        shared.cfg.pg_depth = cap;
+        var pgs = [_]PgConn{.{ .alive = true, .class = .write, .sending = true, .qh = max_depth_cap - 1 }};
+        const p = &pgs[0];
+        defer p.ws.deinit();
+        defer p.staged.deinit(gpa);
+        var w = Worker{ .shared = &shared, .id = 0, .pgs = &pgs };
+        defer w.enc.deinit();
+        const fifo = &w.fifo[@backingInt(Class.write)];
+        defer {
+            while (fifo.pop()) |q| gpa.free(q.bytes);
+            if (fifo.items.len != 0) gpa.free(fifo.items);
+        }
+        w.pgPush(p, 0, "Q\x00\x00\x00\x0dROLLBACK\x00");
+        var grouped: Req = .{};
+        try p.staged.append(gpa, Member.init(&grouped, 1, "memberS\x00\x00\x00\x04").?);
+        var reqs: [max_depth_cap]Req = @splat(.{});
+        for (reqs[0..cap]) |*r| fifo.push(.{ .r = r, .bytes = try gpa.dupe(u8, "standalone") });
+        w.pgDrain(.write);
+        try std.testing.expectEqual(cap, p.depth);
+        try std.testing.expectEqual(@as(usize, 1), fifo.len);
+        try std.testing.expectEqual(@as(usize, 0), p.q[p.qh]);
+        // A successful ROLLBACK frees one slot, which the oldest standalone write gets first.
+        p.qh = (p.qh + 1) % max_depth_cap;
+        p.depth -= 1;
+        w.pgDrain(.write);
+        try std.testing.expectEqual(cap, p.depth);
+        try std.testing.expectEqual(@as(usize, 0), fifo.len);
+        try std.testing.expect(!p.ginflight);
+        for (reqs[0..cap], 0..) |*r, i| try std.testing.expectEqual(@intFromPtr(r), p.q[(p.qh + i) % max_depth_cap]);
+        // The next completion must resume the staged group without another incoming request.
+        p.qh = (p.qh + 1) % max_depth_cap;
+        p.depth -= 1;
+        w.pgDrain(.write);
+        try std.testing.expectEqual(cap, p.depth);
+        try std.testing.expect(p.ginflight);
+        try std.testing.expectEqual(@as(usize, 0), p.staged.items.len);
+        for (reqs[1..cap], 0..) |*r, i| try std.testing.expectEqual(@intFromPtr(r), p.q[(p.qh + i) % max_depth_cap]);
+        try std.testing.expectEqual(@intFromPtr(&p.wrec) | 2, p.q[(p.qh + p.depth - 1) % max_depth_cap]);
+        try std.testing.expectEqual(&grouped, p.wrec.m[0].r);
+    }
+}
+
+test "outstanding unsupported zero-copy sends retain their own attempt identity" {
+    var shared: Shared = undefined;
+    var w = Worker{ .shared = &shared, .id = 0, .send_zc_enabled = true };
+    var a = Conn{ .send_live = true, .send_zc = true };
+    var b = Conn{ .send_live = true, .send_zc = true };
+    try std.testing.expect(a.completeSend(-@as(i32, @backingInt(linux.E.OPNOTSUPP)), 0));
+    w.send_zc_enabled = false;
+    try std.testing.expect(b.completeSend(-@as(i32, @backingInt(linux.E.INVAL)), 0));
+    try std.testing.expect(!w.send_zc_enabled);
+    try std.testing.expect(!a.send_zc and !b.send_zc);
 }

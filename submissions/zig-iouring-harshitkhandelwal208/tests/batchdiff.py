@@ -14,12 +14,20 @@ def token(uid):
     return f"{h}.{p}.{s}"
 def get(port, path, tok=None):
     c = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
-    c.request("GET", path, headers={"Authorization": "Token " + tok} if tok else {})
-    r = c.getresponse(); body = r.read(); c.close()
-    return r.status, body
-st, body = get(REF, "/api/tags"); tags = json.loads(body)["tags"]
-st, body = get(REF, "/api/articles?limit=100"); arts = json.loads(body)["articles"]
-slugs = [a["slug"] for a in arts]; authors = list({a["author"]["username"] for a in arts})
+    try:
+        c.request("GET", path, headers={"Authorization": "Token " + tok} if tok else {})
+        r = c.getresponse()
+        return r.status, r.read()
+    finally:
+        c.close()
+st, body = get(REF, "/api/tags")
+if st != 200: sys.exit("reference tags returned %d" % st)
+tags = json.loads(body)["tags"]
+st, body = get(REF, "/api/articles?limit=100")
+if st != 200: sys.exit("reference article list returned %d" % st)
+arts = json.loads(body)["articles"]
+if not arts: sys.exit("reference article list is empty; seed fixtures are required")
+slugs = [a["slug"] for a in arts]; authors = sorted({a["author"]["username"] for a in arts})
 if HOT: slugs = slugs[:6]; authors = authors[:4]; tags = tags[:3]
 reqs = []
 for _ in range(1200 if HOT else 600):
@@ -39,15 +47,25 @@ for _ in range(1200 if HOT else 600):
     else: path = "/api/tags"
     reqs.append((path, tok))
 ref = [get(REF, p, t) for p, t in reqs]
-res = [None] * len(reqs)
-def worker(ids):
+def worker(ids, res, errors):
     for i in ids:
-        res[i] = get(TST, *reqs[i])
+        try:
+            res[i] = get(TST, *reqs[i])
+        except Exception as exc:
+            errors[i] = "%s: %s" % (type(exc).__name__, exc)
 for rnd in range(3):
+    res: list[tuple[int, bytes] | None] = [None] * len(reqs)
+    errors: list[str | None] = [None] * len(reqs)
     NT = 200 if HOT else 64
-    ts = [threading.Thread(target=worker, args=(list(range(i, len(reqs), NT)),)) for i in range(NT)]
+    ts = [threading.Thread(target=worker, args=(list(range(i, len(reqs), NT)), res, errors)) for i in range(NT)]
     [t.start() for t in ts]; [t.join() for t in ts]
-    bad = [(reqs[i][0], ref[i][0], res[i][0]) for i in range(len(reqs)) if ref[i] != res[i]]
+    completed = sum(r is not None for r in res)
+    failed = [(i, reqs[i][0], errors[i] or "request did not complete")
+              for i in range(len(reqs)) if errors[i] is not None or res[i] is None]
+    print("round", rnd, "completed: %d/%d" % (completed, len(reqs)), "errors:", len(failed), failed[:3])
+    if failed or completed != len(reqs): sys.exit(1)
+    bad = [(req[0], expected[0], actual[0] if actual is not None else None)
+           for req, expected, actual in zip(reqs, ref, res) if expected != actual]
     print("round", rnd, "mismatches:", len(bad), bad[:3])
     if bad: sys.exit(1)
 print("OK: %d requests identical" % len(reqs))

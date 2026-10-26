@@ -63,7 +63,7 @@ pub fn main(init: std.process.Init) !void {
         .threads = threads,
         .pg_read = @max(1, (total_conns -| writes_total) / workers),
         .pg_write = @max(1, writes_total / workers),
-        .pg_depth = std.math.clamp(envInt(init, "PG_DEPTH", 4), 1, 32), // a group commit may go one past the cap; the reply ring holds 64
+        .pg_depth = std.math.clamp(envInt(init, "PG_DEPTH", 4), 1, 32), // standalone and grouped writes share this bounded depth
         .batch_max = @max(1, @min(envInt(init, "BATCH_MAX", 64), 256)),
         .read_window_us = envInt(init, "READ_WINDOW_US", 100000), // a staged read waits at most this long for company
         .read_hold_min = envInt(init, "READ_HOLD_MIN", 2048), // ... unless this many are staged already (a full plan batch)
@@ -94,7 +94,7 @@ pub fn main(init: std.process.Init) !void {
             if (sys.errnoOf(rc) != .SUCCESS) return error.ForkFailed;
             if (rc == 0) {
                 // child: die with the supervisor
-                _ = linux.prctl(1, @intFromEnum(linux.SIG.KILL), 0, 0, 0); // PR_SET_PDEATHSIG
+                _ = linux.prctl(1, @backingInt(linux.SIG.KILL), 0, 0, 0); // PR_SET_PDEATHSIG
                 if (linux.getppid() == 1) linux.exit(1);
                 return runProcess(cfg, secret, n * threads);
             }

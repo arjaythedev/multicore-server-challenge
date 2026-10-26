@@ -155,32 +155,34 @@ fn startInner(w: *Worker, taken: []const Taken) !*Plan {
     p.slots = try al.alloc(Slot, taken.len);
     for (taken, 0..) |t, i| {
         p.items[i] = t.it;
+        // Retained text must borrow the plan's item, not the loop capture's inline buffer.
+        const it = &p.items[i];
         p.stmts[i] = t.stmt;
         const gk = groupOf(t.stmt);
-        const g = &p.gs[@intFromEnum(gk)];
+        const g = &p.gs[@backingInt(gk)];
         try g.members.append(al, @intCast(i));
         var slot = Slot{ .g = gk };
         switch (gk) {
             .tags => {},
             .global => {
-                slot.kord = try page(al, g, "", t.it.limit, t.it.offset);
+                slot.kord = try page(al, g, "", it.limit, it.offset);
             },
             .tag, .author, .fav => {
-                const c = try g.ckeys.get(al, t.it.text());
-                if (c.fresh) try g.c_text.append(al, t.it.text());
+                const c = try g.ckeys.get(al, it.text());
+                if (c.fresh) try g.c_text.append(al, it.text());
                 slot.cord = c.ord;
-                slot.kord = try page(al, g, t.it.text(), t.it.limit, t.it.offset);
+                slot.kord = try page(al, g, it.text(), it.limit, it.offset);
             },
             .feed => {
-                const vb = try al.dupe(u8, std.mem.asBytes(&t.it.viewer));
+                const vb = try al.dupe(u8, std.mem.asBytes(&it.viewer));
                 const c = try g.ckeys.get(al, vb);
                 if (c.fresh) try g.c_text.append(al, vb);
                 slot.cord = c.ord;
-                slot.kord = try page(al, g, vb, t.it.limit, t.it.offset);
+                slot.kord = try page(al, g, vb, it.limit, it.offset);
             },
             .slug, .cmts, .prof => {
-                const k = try g.pkeys.get(al, t.it.text());
-                if (k.fresh) try g.p_text.append(al, t.it.text());
+                const k = try g.pkeys.get(al, it.text());
+                if (k.fresh) try g.p_text.append(al, it.text());
                 slot.kord = k.ord;
             },
         }
@@ -190,7 +192,7 @@ fn startInner(w: *Worker, taken: []const Taken) !*Plan {
     w.enc.reset();
     for (&p.gs, 0..) |*g, gi| {
         if (g.members.items.len == 0) continue;
-        const gk: Group = @enumFromInt(gi);
+        const gk: Group = @fromBackingInt(@intCast(gi));
         p.order[p.norder] = gk;
         p.norder += 1;
         switch (gk) {
@@ -317,7 +319,7 @@ fn onReplyInner(w: *Worker, p: *Plan, batch: []const u8) !Result {
         p.abuf = try al.dupe(u8, batch); // the reply buffer is recycled when this returns; B and the assembly still need these bytes
         const sts = (try splitStatements(al, p.abuf, p.norder)) orelse return .failed;
         for (p.order[0..p.norder], 0..) |gk, si| {
-            const g = &p.gs[@intFromEnum(gk)];
+            const g = &p.gs[@backingInt(gk)];
             const bodies = sts[si].items;
             switch (gk) {
                 .tags => {
@@ -452,7 +454,7 @@ fn collect(p: *Plan) !void {
     const al = p.a();
     for (p.slots, 0..) |slot, i| {
         const it = &p.items[i];
-        const g = &p.gs[@intFromEnum(slot.g)];
+        const g = &p.gs[@backingInt(slot.g)];
         switch (slot.g) {
             .tags => {},
             .global, .tag, .author, .fav, .feed, .slug => {
@@ -615,7 +617,7 @@ fn assemble(w: *Worker, p: *Plan) !void {
     const syn = &w.synth;
     for (p.slots, 0..) |slot, i| {
         const it = &p.items[i];
-        const g = &p.gs[@intFromEnum(slot.g)];
+        const g = &p.gs[@backingInt(slot.g)];
         syn.reset();
         switch (slot.g) {
             .tags => {
@@ -685,4 +687,190 @@ fn assemble(w: *Worker, p: *Plan) !void {
         finishReply(syn);
         api.onPg(w, it.r, syn.slice());
     }
+}
+
+const PlannerTest = struct {
+    const Input = struct {
+        stmt: sql.Stmt,
+        text: []const u8,
+        viewer: i64 = 0,
+        limit: i32 = 20,
+        offset: i32 = 0,
+        cord: u32 = 0,
+        kord: u32,
+    };
+
+    fn expectBorrowed(expected: []const u8, actual: []const u8) !void {
+        try std.testing.expectEqual(@intFromPtr(expected.ptr), @intFromPtr(actual.ptr));
+        try std.testing.expectEqualStrings(expected, actual);
+    }
+
+    fn expectKey(keys: *const Interner, ord: u32, expected: []const u8, borrowed: bool) !void {
+        var it = keys.map.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* != ord) continue;
+            if (borrowed) try expectBorrowed(expected, entry.key_ptr.*) else try std.testing.expectEqualStrings(expected, entry.key_ptr.*);
+            try std.testing.expectEqual(@as(?u32, ord), keys.map.get(expected));
+            return;
+        }
+        return error.TestExpectedEqual;
+    }
+
+    fn check(inputs: []const Input) !void {
+        var shared: server.Shared = .{ .cfg = std.mem.zeroes(server.Config), .jwt = undefined, .bc = undefined };
+        var w = Worker{ .shared = &shared, .id = 0 };
+        defer w.enc.deinit();
+        const reqs = try std.testing.allocator.alloc(server.Req, inputs.len);
+        defer std.testing.allocator.free(reqs);
+        for (reqs) |*r| r.* = .{};
+        const taken = try std.testing.allocator.alloc(Taken, inputs.len);
+        defer std.testing.allocator.free(taken);
+        var initialized: usize = 0;
+        defer for (taken[0..initialized]) |*t| t.it.deinit();
+        for (inputs, 0..) |input, i| {
+            taken[i] = .{ .stmt = input.stmt, .it = server.StageItem.init(&reqs[i], @intCast(i), input.viewer, input.limit, input.offset, input.text) orelse return error.OutOfMemory };
+            initialized += 1;
+        }
+        const p = start(&w, taken) orelse return error.OutOfMemory;
+        initialized = 0; // The plan now owns the items, including heap-backed text.
+        defer destroy(p, true);
+        // Borrowing the caller's items is also wrong, even if their bytes happened to survive start().
+        for (taken) |*t| @memset(&t.it.buf, 0xa5);
+
+        for (inputs, 0..) |input, i| {
+            const item = &p.items[i];
+            const gk = groupOf(input.stmt);
+            const g = &p.gs[@backingInt(gk)];
+            const filtered = gk == .tag or gk == .author or gk == .fav;
+            try std.testing.expectEqual(input.stmt, p.stmts[i]);
+            try std.testing.expectEqual(&reqs[i], item.r);
+            try std.testing.expectEqualStrings(input.text, item.text());
+            try std.testing.expectEqual(input.text.len > 128, item.heap != null);
+            try std.testing.expectEqual(input.viewer, item.viewer);
+            try std.testing.expectEqual(input.limit, item.limit);
+            try std.testing.expectEqual(input.offset, item.offset);
+            try std.testing.expectEqual(gk, p.slots[i].g);
+            try std.testing.expectEqual(input.cord, p.slots[i].cord);
+            try std.testing.expectEqual(input.kord, p.slots[i].kord);
+
+            var first_count = true;
+            var first_page = true;
+            for (inputs[0..i]) |earlier| {
+                if (groupOf(earlier.stmt) != gk) continue;
+                if (earlier.cord == input.cord) first_count = false;
+                if (earlier.kord == input.kord) first_page = false;
+            }
+            if (filtered and first_count) {
+                try expectBorrowed(item.text(), g.c_text.items[input.cord - 1]);
+                try expectKey(&g.ckeys, input.cord, item.text(), true);
+            }
+            if (first_page) {
+                try expectBorrowed(item.text(), g.p_text.items[input.kord - 1]);
+                if (filtered) {
+                    try std.testing.expectEqual(@as(i64, input.limit), g.p_lim.items[input.kord - 1]);
+                    try std.testing.expectEqual(@as(i64, input.offset), g.p_off.items[input.kord - 1]);
+                    var key: [24 + 129]u8 = undefined;
+                    std.mem.writeInt(i64, key[0..8], input.limit, .little);
+                    std.mem.writeInt(i64, key[8..16], input.offset, .little);
+                    std.mem.writeInt(u64, key[16..24], input.text.len, .little);
+                    @memcpy(key[24..][0..input.text.len], input.text);
+                    try expectKey(&g.pkeys, input.kord, key[0 .. 24 + input.text.len], false);
+                } else try expectKey(&g.pkeys, input.kord, item.text(), true);
+            }
+            try std.testing.expectEqualStrings(input.text, g.p_text.items[input.kord - 1]);
+            if (filtered) try std.testing.expectEqualStrings(input.text, g.c_text.items[input.cord - 1]);
+        }
+
+        var expected = Buf{};
+        defer expected.deinit();
+        var e = pg.Enc.init(&expected);
+        var norder: usize = 0;
+        for (&p.gs, 0..) |*g, gi| {
+            if (g.members.items.len == 0) continue;
+            const gk: Group = @fromBackingInt(@intCast(gi));
+            var counts: u32 = 0;
+            var pages: u32 = 0;
+            var members: usize = 0;
+            for (inputs, 0..) |input, i| {
+                if (groupOf(input.stmt) != gk) continue;
+                counts = @max(counts, input.cord);
+                pages = @max(pages, input.kord);
+                try std.testing.expectEqual(@as(u32, @intCast(i)), g.members.items[members]);
+                members += 1;
+            }
+            try std.testing.expectEqual(members, g.members.items.len);
+            try std.testing.expectEqual(counts, g.ckeys.n);
+            try std.testing.expectEqual(counts, g.ckeys.map.count());
+            try std.testing.expectEqual(@as(usize, counts), g.c_text.items.len);
+            try std.testing.expectEqual(pages, g.pkeys.n);
+            try std.testing.expectEqual(pages, g.pkeys.map.count());
+            try std.testing.expectEqual(@as(usize, pages), g.p_text.items.len);
+            try std.testing.expectEqual(gk, p.order[norder]);
+            norder += 1;
+            const filtered = gk == .tag or gk == .author or gk == .fav;
+            try std.testing.expectEqual(if (filtered) @as(usize, pages) else 0, g.p_lim.items.len);
+            try std.testing.expectEqual(g.p_lim.items.len, g.p_off.items.len);
+            e.bind(sql.planId(switch (gk) {
+                .tag => .a_tag,
+                .author => .a_author,
+                .fav => .a_fav,
+                .slug => .a_slug,
+                .cmts => .a_cmts,
+                .prof => .a_prof,
+                else => unreachable,
+            }));
+            if (filtered) e.pTextArray(g.c_text.items);
+            e.pTextArray(g.p_text.items);
+            if (filtered) {
+                e.pInt8Array(g.p_lim.items);
+                e.pInt8Array(g.p_off.items);
+            }
+            e.exec();
+        }
+        e.sync();
+        try std.testing.expectEqual(norder, p.norder);
+        try std.testing.expectEqualSlices(u8, expected.slice(), w.enc.slice());
+    }
+};
+
+test "planner owns distinct and duplicate text across lookup and filter kinds" {
+    try PlannerTest.check(&.{
+        .{ .stmt = .article, .text = "slug-alpha", .kord = 1 },
+        .{ .stmt = .profile, .text = "alice", .kord = 1 },
+        .{ .stmt = .list_tag, .text = "zig", .cord = 1, .kord = 1 },
+        .{ .stmt = .comments, .text = "slug-alpha", .kord = 1 },
+        .{ .stmt = .list_author, .text = "alice", .cord = 1, .kord = 1 },
+        .{ .stmt = .list_fav, .text = "alice", .cord = 1, .kord = 1 },
+        .{ .stmt = .article, .text = "slug-bravo", .kord = 2 },
+        .{ .stmt = .list_tag, .text = "rust", .cord = 2, .kord = 2 },
+        .{ .stmt = .profile, .text = "carol", .kord = 2 },
+        .{ .stmt = .comments, .text = "a-longer-slug", .kord = 2 },
+        .{ .stmt = .list_author, .text = "carol", .cord = 2, .kord = 2 },
+        .{ .stmt = .list_fav, .text = "carol", .cord = 2, .kord = 2 },
+        .{ .stmt = .article, .text = "slug-alpha", .viewer = 17, .kord = 1 },
+        .{ .stmt = .comments, .text = "slug-alpha", .viewer = 18, .kord = 1 },
+        .{ .stmt = .profile, .text = "alice", .viewer = 19, .kord = 1 },
+        .{ .stmt = .list_tag, .text = "zig", .viewer = 20, .cord = 1, .kord = 1 },
+        .{ .stmt = .list_author, .text = "alice", .limit = 5, .offset = 3, .cord = 1, .kord = 3 },
+        .{ .stmt = .list_fav, .text = "alice", .offset = 7, .cord = 1, .kord = 3 },
+        .{ .stmt = .list_tag, .text = "zig", .limit = 10, .cord = 1, .kord = 3 },
+    });
+}
+
+test "planner preserves text identity at the 127 128 129 byte storage boundary" {
+    const kinds = [_]sql.Stmt{ .article, .comments, .profile, .list_tag, .list_author, .list_fav };
+    const a127: [127]u8 = @splat('a');
+    const b128: [128]u8 = @splat('b');
+    const c129: [129]u8 = @splat('c');
+    const d127: [127]u8 = @splat('d');
+    const texts = [_][]const u8{ &a127, &b128, &a127, &c129, &d127, &b128, &c129, &d127 };
+    const ords = [_]u32{ 1, 2, 1, 3, 4, 2, 3, 4 };
+    var inputs: [kinds.len * texts.len]PlannerTest.Input = undefined;
+    for (texts, ords, 0..) |text, ord, ti| {
+        for (kinds, 0..) |stmt, ki| {
+            const i = ti * kinds.len + ki;
+            inputs[i] = .{ .stmt = stmt, .text = text, .viewer = @intCast(i), .cord = if (ki >= 3) ord else 0, .kord = ord };
+        }
+    }
+    try PlannerTest.check(&inputs);
 }
