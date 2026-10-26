@@ -81,7 +81,15 @@ zig build -Doptimize=ReleaseFast
 
 The binary is `zig-out/bin/conduit`.
 
-`install.sh`, `build.sh` and `start.sh` are the CI wrappers and are the next step.
+## Scripts
+
+| Script | What it does |
+| :- | :- |
+| `install.sh` | installs Zig 0.17.0 from the official sha256-checked tarball into `/usr/local/zig` |
+| `build.sh` | builds `zig-out/bin/conduit` with `ReleaseFast` |
+| `start.sh` | runs the server in the foreground with the runtime environment |
+
+The root `test/run.sh` runs `build.sh` and `start.sh` and passes all 197 conformance checks.
 
 ## Run
 
