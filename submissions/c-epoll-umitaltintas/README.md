@@ -47,8 +47,10 @@ CROSS JOIN LATERAL (<the per-request query, with r.v as the viewer and r.k as th
 Each request still gets its own execution of its own query, in the statement's snapshot, while it is being served:
 the inner queries are correlated with their request row (by their parameters, or `r.i > 0` where nothing else ties
 them to it), and Memoize is off for the session, so no request is ever handed a row cached from another request's
-lookup. At low load a batch holds one request and nothing waits; under load the queues fill while the connections
-are busy, so batches grow by themselves (100-250 requests at the limit). Six read connections in total turned out to
+lookup. Each kind collects its requests for up to 20 ms (or until 256 are waiting) before it goes out, so batches
+are large at any load, not only when the connections are busy: at 68,000 users on the test machine this took
+Postgres from 2.9 to 1.9 cores for the same traffic, for ~25 ms of added latency (the idea is from
+rust-epoll-WorriedArrow's batch clock). Six read connections in total turned out to
 be the best trade between filling batches and keeping Postgres's cores busy. Rows are handed out by ordinal, and a
 batch whose rows don't come back grouped per request in order fails with 500 instead of mixing anything up.
 
@@ -86,8 +88,9 @@ mostly waiting on load latency. `src/bcrypt.c` computes up to 4 hashes at once i
 all of them back to back, so their chains overlap: on the test machine 13 ms of CPU per hash with 4 at once
 instead of libxcrypt's 37 ms (on a core shared with its hyper-thread sibling: 24 ms instead of 40 ms). Every hash
 is still full bcrypt at cost 10 with a fresh salt from libxcrypt, and every login is verified against its stored
-hash. One worker takes whatever is queued, so a batch fills up while it is busy and nobody waits for one; the
-other workers only start when two full batches are waiting. `bin/conduit --bcrypt-selftest` checks the output
+hash. The first worker lets its batch fill for up to 150 ms (at moderate load logins are too rare to fill it
+otherwise: 1.2 hashes per batch on average without the wait, 3.3 with it); the other workers only start when two
+full batches are waiting. `bin/conduit --bcrypt-selftest` checks the output
 against libxcrypt on random passwords, salts and `$2a$`/`$2b$`/`$2y$` settings. `$2a$` with password bytes
 >= 0x80 (where libxcrypt applies a countermeasure for an old bug) and other formats go to libxcrypt.
 
@@ -104,7 +107,8 @@ against libxcrypt on random passwords, salts and `$2a$`/`$2b$`/`$2y$` settings. 
 ## Configuration (env, optional)
 
 `THREADS` (event loops, default CPUs/4), `PG_READ_PER_LOOP` (3), `PG_WRITE_PER_LOOP` (16), `PG_DEPTH` (batches in
-flight per read connection, 1), `BATCH_MAX` (256), `BCRYPT_THREADS` (CPUs; all but one are spare capacity), `BCRYPT_LANES` (hashes computed together, 4, at most 8),
+flight per read connection, 1), `BATCH_MAX` (256), `READ_WINDOW_US` (how long a read kind collects a batch, 20000), `BCRYPT_THREADS` (CPUs; all but one are spare capacity), `BCRYPT_LANES` (hashes computed together, 4, at most 8), `BCRYPT_WINDOW_MS` (how long the first worker waits
+for its lanes to fill, 150),
 `BCRYPT_NICE` (10).
 `SHARE_READS` (default 0): if 1, tag-list requests that are all waiting when the statement goes out share one
 execution (the result is never kept for later requests).

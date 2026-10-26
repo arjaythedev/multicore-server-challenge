@@ -366,7 +366,10 @@ static void *loop_main(void *arg) {
   time_t dbg_t = time(NULL);
   bool dbg = getenv("DEBUG_LOOP") != NULL;
   for (;;) {
-    int n = epoll_wait(L->ep, evs, 512, L->paused ? 200 : -1);
+    int64_t wus = pg_wait_us(L);
+    if (L->paused && (wus < 0 || wus > 200000)) wus = 200000;
+    struct timespec wts = {wus / 1000000, (wus % 1000000) * 1000};
+    int n = epoll_pwait2(L->ep, evs, 512, wus < 0 ? NULL : &wts, NULL);
     if (dbg) {
       dbg_w++;
       for (int i = 0; i < n; i++) {
@@ -471,10 +474,14 @@ int main(int argc, char **argv) {
   extern int pg_depth, batch_max;
   pg_depth = env_int("PG_DEPTH", pg_depth);
   batch_max = env_int("BATCH_MAX", batch_max);
+  extern int read_window_us;
+  read_window_us = env_int("READ_WINDOW_US", read_window_us);
   extern int bcrypt_nice;
   bcrypt_nice = env_int("BCRYPT_NICE", bcrypt_nice);
   extern int bcrypt_lanes;
   bcrypt_lanes = env_int("BCRYPT_LANES", bcrypt_lanes);
+  extern int bcrypt_window_ms;
+  bcrypt_window_ms = env_int("BCRYPT_WINDOW_MS", bcrypt_window_ms);
   if (bcrypt_lanes < 1) bcrypt_lanes = 1;
   if (bcrypt_lanes > BC_MAXLANES) bcrypt_lanes = BC_MAXLANES;
   share_reads = env_int("SHARE_READS", share_reads);

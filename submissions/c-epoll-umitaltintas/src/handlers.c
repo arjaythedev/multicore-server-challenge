@@ -138,9 +138,10 @@ const stmt_t STMTS[] = {
   [SB_LFAV] = {BLIST(UNNEST_L4, "SELECT 1 FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = r.k)",
                      "SELECT f.article_id AS id FROM favorites f WHERE f.user_id = "
                      "(SELECT fu.id FROM users fu WHERE fu.username = r.k) ORDER BY f.article_id DESC"), 4},
-  // every feed article's author is followed in this same snapshot, so `following` is true
+  // every feed article's author is followed in this same snapshot, so `following` is true. Most feeds
+  // reach the count cap (85% on the seed), hence COUNT_CAP_BIG.
   [SB_FEED] = {BLIST_X(UNNEST_L3,
-                       COUNT_CAP("SELECT 1 FROM articles a WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.v)"),
+                       COUNT_CAP_BIG("SELECT 1 FROM articles a WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.v)"),
                        "SELECT x.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 "
                        "WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT (r.l + r.o)) x "
                        "WHERE fo.follower_id = r.v ORDER BY x.id DESC", "true"), 3},

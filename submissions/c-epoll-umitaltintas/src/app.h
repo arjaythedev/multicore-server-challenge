@@ -92,6 +92,7 @@ struct job {
   int r0, rn;
   struct batch *bat;
   long seq;                 // arrival number in the batch queue
+  int64_t t_us;             // arrival time in the batch queue (CLOCK_MONOTONIC)
   char *bc_pw;              // bcrypt task: password (owned, NUL-terminated)
   char *bc_set;             // stored hash to verify against (owned), or NULL to make a new hash
   job_fn next;              // called when the results (or the bcrypt result) are in
@@ -127,6 +128,8 @@ struct loop {
   job_t *bq_head[NBK], *bq_tail[NBK];  // reads waiting to be batched
   long seq;
   int bq_n;                             // total waiting
+  int bq_cnt[NBK];                      // waiting per kind
+  int64_t next_due;                     // when a waiting kind's window ends (0: nothing waits on a timer)
   int ndirty;
   pgc_t **dirty;             // Postgres connections with queued output
 };
@@ -151,6 +154,7 @@ void pg_end(job_t *j, job_fn fn);
 // Batched read: fill j->bv per BKINDS[kind].types, then fn runs with j->R / r0 / rn set.
 void pg_read(job_t *j, int kind, job_fn fn);
 void pg_schedule(loop_t *L);
+int64_t pg_wait_us(loop_t *L);  // how long the loop may sleep (-1: no limit)
 void batch_release(struct batch *b);
 
 // ---- auth.c ----

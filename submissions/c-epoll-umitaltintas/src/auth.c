@@ -167,12 +167,13 @@ int jwt_verify(const char *tok, int len, int64_t *uid) {
 // ---- bcrypt pool ----
 
 static pthread_mutex_t bq_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t bq_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t bq_cv;  // CLOCK_MONOTONIC, set up in bcrypt_start
 static job_t *bq_head, *bq_tail;
 static int bq_n;
 
 int bcrypt_nice = 10;
 int bcrypt_lanes = 4;
+int bcrypt_window_ms = 150;
 long dbg_bc_groups, dbg_bc_hashes;  // DEBUG_LOOP counters
 
 // libxcrypt, for hashes bcrypt.c doesn't take (other formats, $2a$ with 8-bit passwords)
@@ -213,6 +214,13 @@ static void *bcrypt_worker(void *arg) {
     int nj = 0;
     pthread_mutex_lock(&bq_mu);
     while (helper ? bq_n < 2 * bcrypt_lanes : bq_n == 0) pthread_cond_wait(&bq_cv, &bq_mu);
+    if (!helper && bq_n < bcrypt_lanes && bcrypt_window_ms > 0) {
+      // let the batch fill: the oldest job waits up to bcrypt_window_ms for others (logins are ~0.1% of
+      // requests, so at moderate load a batch would otherwise nearly always run one lane)
+      int64_t dl = bq_head->t_us + (int64_t)bcrypt_window_ms * 1000;
+      struct timespec ts = {dl / 1000000, (dl % 1000000) * 1000};
+      while (bq_n < bcrypt_lanes && pthread_cond_timedwait(&bq_cv, &bq_mu, &ts) == 0) {}
+    }
     while (bq_head && nj < bcrypt_lanes) {
       jobs[nj++] = bq_head;
       bq_head = bq_head->link;
@@ -262,6 +270,10 @@ static void *bcrypt_worker(void *arg) {
 }
 
 void bcrypt_start(int n) {
+  pthread_condattr_t ca;
+  pthread_condattr_init(&ca);
+  pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+  pthread_cond_init(&bq_cv, &ca);
   for (int i = 0; i < n; i++) {
     pthread_t t;
     pthread_create(&t, NULL, bcrypt_worker, (void *)(intptr_t)i);
@@ -274,6 +286,9 @@ static void bq_push(job_t *j) {
   if (bq_tail) bq_tail->link = j;
   else bq_head = j;
   bq_tail = j;
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  j->t_us = (int64_t)now.tv_sec * 1000000 + now.tv_nsec / 1000;
   bq_n++;
   pthread_cond_broadcast(&bq_cv);
   pthread_mutex_unlock(&bq_mu);
