@@ -8,7 +8,7 @@ Front: direct
 | Framework | none: our own HTTP/1.1 server on raw io_uring |
 | Database driver | none: our own PostgreSQL v3 wire client (SCRAM-SHA-256, prepared statements, binary rows) |
 | Database | PostgreSQL 18 |
-| Other dependencies | none. JSON, JWT, HMAC-SHA-256 (with SHA-NI) and bcrypt (with hand-written assembly kernels) are written here |
+| Other dependencies | libdeflate 1.19, vendored, for gzip compression only. JSON, JWT, HMAC-SHA-256 (with SHA-NI) and bcrypt (with hand-written assembly kernels) are written here |
 | Score on our rig | **150,000 users**, held in two official-style searches with both flags at their defaults. The same build with `ackdelay=off` held 140,000 |
 
 ```sh
@@ -51,11 +51,12 @@ changes, no host tuning.
 9. [bcrypt](#bcrypt)
 10. [Overload shedding](#overload-shedding)
 11. [ACK delay](#ack-delay)
-12. [Startup checks and correctness](#startup-checks-and-correctness)
-13. [The wall, and why the score is 150k](#the-wall-and-why-the-score-is-150k)
-14. [How we measured](#how-we-measured)
-15. [What we tried that didn't make it](#what-we-tried-that-didnt-make-it)
-16. [Credits](#credits)
+12. [Two-segment gzip](#two-segment-gzip)
+13. [Startup checks and correctness](#startup-checks-and-correctness)
+14. [The wall, and why the score is 150k](#the-wall-and-why-the-score-is-150k)
+15. [How we measured](#how-we-measured)
+16. [What we tried that didn't make it](#what-we-tried-that-didnt-make-it)
+17. [Credits](#credits)
 
 ---
 
@@ -544,6 +545,38 @@ ACKs per request at 20,000 users. At 140,000 they were 0.86.
 
 ---
 
+## Two-segment gzip
+
+gzip here is aimed at the receive CPU, not at bandwidth. A client ACKs at once when two full segments are
+unacknowledged, and otherwise on its delayed-ACK timer. So an answer of three or more segments draws about 1.5 ACKs
+from the client, and an answer of two or fewer draws about 1. Every one of those ACKs lands on the CPU that takes the
+NIC's interrupts (see [the wall](#the-wall-and-why-the-score-is-150k)).
+
+**The rule.** A response is gzipped only when the client sends `Accept-Encoding: gzip`, the identity response needs
+more than two segments (2 × 1,428 bytes, the payload of a 1,500-byte IPv6 packet with TCP timestamps), and the body
+is at most 7 KB. Above 7 KB, level-1 gzip of our JSON can't reach two segments. The gzip form is kept only if the
+whole response, head included, then fits in two segments. Otherwise the identity body goes out. Such responses carry
+`Vary: Accept-Encoding`. The encoder is libdeflate level 1 with an 8 KB hash table, and each response is its own gzip
+member, so nothing carries from one response to the next.
+
+**Measured**, in an ABBA at 154,000 users against the build without it:
+
+| Per request | Without | With |
+|---|--:|--:|
+| Receive-CPU softirq | 16.73 / 17.01 µs | 14.38 / 14.29 µs (−15%) |
+| Receive-CPU softirq, cores | 0.66 / 0.67 | 0.56 / 0.56 |
+| Incoming pure ACKs (nstat) | 1.77 / 1.79 | 1.43 / 1.43 |
+| Box CPU | 189.6 / 190.9 µs | 193.6 / 193.6 µs |
+| Throughput, p95, p99 | 39,239 / 39,125 req/s, 325 / 353 ms, 481 / 507 ms | 39,112 / 39,085 req/s, 348 / 353 ms, 462 / 468 ms |
+| Retransmits | 1.47% / 1.66% | 1.04% / 0.96% |
+
+The CPU that decides the collapse does 2.5 µs less per request, about nine times the spread between the two runs
+without it. The compression costs about 3.4 µs per request of total CPU, which is spare at the knee. Gzipping every
+large body was tried earlier and lost (see the losers), because it paid the codec on every response without a packet
+to show for it.
+
+---
+
 ## Startup checks and correctness
 
 - **Result types.** At startup every statement is prepared and described against the live database. The server
@@ -706,6 +739,9 @@ source of the per-endpoint costs in the shed order. The ideas are reimplemented 
 - **#45**: zero-copy send, which ships there and lost here.
 - **#18**: the SIGILL that made us build for x86-64-v3.
 - **#31**: the precedent for sharing work across concurrent requests within one execution.
+
+[libdeflate](https://github.com/ebiggers/libdeflate) (MIT, vendored in `vendor/libdeflate` with its licence) does the
+gzip compression.
 
 Openwall, the Rust `bcrypt` crate and Go's `golang.org/x/crypto/bcrypt` supplied the test vectors. The Go reference
 server was the oracle for every byte we send.

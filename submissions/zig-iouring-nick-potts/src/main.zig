@@ -188,6 +188,7 @@ test {
     _ = @import("jwt.zig");
     _ = @import("bcrypt.zig");
     _ = @import("buf.zig");
+    _ = @import("gzip.zig");
     _ = @import("sha256.zig");
     _ = @import("mega.zig");
     _ = @import("shared.zig");

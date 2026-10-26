@@ -1,5 +1,5 @@
 //! HTTP/1.1 request heads, routes and query strings. Only what the API needs: method, target, Authorization,
-//! Content-Length and Connection. Routing mirrors the reference server's Go 1.22 ServeMux patterns.
+//! Content-Length, Connection and Accept-Encoding. Routing mirrors the reference server's Go 1.22 ServeMux patterns.
 const std = @import("std");
 
 pub const Method = enum { get, post, put, delete, other };
@@ -10,6 +10,8 @@ pub const Head = struct {
     auth: ?[]const u8 = null,
     content_length: usize = 0,
     keep_alive: bool = true,
+    /// The client accepts a gzip response body.
+    gzip: bool = false,
     /// Bytes up to and including the blank line.
     len: usize,
 };
@@ -41,6 +43,7 @@ pub fn parseHead(buf: []const u8) Parsed {
         h.keep_alive = false;
     } else if (!std.mem.eql(u8, version, "HTTP/1.1")) return .bad;
 
+    var accept: AcceptGzip = .{};
     var p = line_end + 2;
     while (p < end) {
         const e = std.mem.indexOfPos(u8, buf[0 .. end + 2], p, "\r\n") orelse end;
@@ -60,11 +63,60 @@ pub fn parseHead(buf: []const u8) Parsed {
                 if (std.ascii.eqlIgnoreCase(value, "close")) h.keep_alive = false;
                 if (std.ascii.eqlIgnoreCase(value, "keep-alive")) h.keep_alive = true;
             },
+            15 => if (std.ascii.eqlIgnoreCase(name, "accept-encoding")) accept.add(value),
             17 => if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) return .bad,
             else => {},
         }
     }
+    h.gzip = accept.ok();
     return .{ .head = h };
+}
+
+/// What the Accept-Encoding lines say about gzip (RFC 9110 12.5.3). Several lines read as one comma-separated list.
+/// gzip (or its alias x-gzip) is acceptable when listed with a nonzero weight, or, when neither is listed, when `*`
+/// has a nonzero weight. An element whose weight does not parse is ignored. Anything else means identity.
+const AcceptGzip = struct {
+    listed: bool = false,
+    listed_ok: bool = false,
+    star_ok: bool = false,
+
+    fn add(a: *AcceptGzip, value: []const u8) void {
+        var it = std.mem.splitScalar(u8, value, ',');
+        while (it.next()) |elem| {
+            var parts = std.mem.splitScalar(u8, elem, ';');
+            const coding = std.mem.trim(u8, parts.first(), " \t");
+            var nonzero = true;
+            const valid = while (parts.next()) |param| {
+                const eq = std.mem.indexOfScalar(u8, param, '=') orelse break false;
+                if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, param[0..eq], " \t"), "q")) continue;
+                nonzero = weightNonzero(std.mem.trim(u8, param[eq + 1 ..], " \t")) orelse break false;
+            } else true;
+            if (!valid) continue;
+            if (std.ascii.eqlIgnoreCase(coding, "gzip") or std.ascii.eqlIgnoreCase(coding, "x-gzip")) {
+                a.listed = true;
+                a.listed_ok = a.listed_ok or nonzero;
+            } else if (std.mem.eql(u8, coding, "*")) {
+                a.star_ok = a.star_ok or nonzero;
+            }
+        }
+    }
+
+    fn ok(a: AcceptGzip) bool {
+        return if (a.listed) a.listed_ok else a.star_ok;
+    }
+};
+
+/// Whether a qvalue ("0" or "1", then up to three decimals, at most 1) is above zero; null if it is not one.
+fn weightNonzero(q: []const u8) ?bool {
+    if (q.len == 0 or q.len > 5) return null;
+    if (q.len > 1 and q[1] != '.') return null;
+    const frac = if (q.len > 2) q[2..] else "";
+    for (frac) |c| if (!std.ascii.isDigit(c)) return null;
+    return switch (q[0]) {
+        '0' => std.mem.indexOfNone(u8, frac, "0") != null,
+        '1' => if (std.mem.indexOfNone(u8, frac, "0") == null) true else null,
+        else => null,
+    };
 }
 
 fn method(m: []const u8) Method {
@@ -241,6 +293,59 @@ test "head" {
     try std.testing.expectEqualStrings("Token abc", p.head.auth.?);
     try std.testing.expectEqual(req.len, p.head.len);
     try std.testing.expect(parseHead("GET / HTTP/1.1\r\nHost") == .incomplete);
+}
+
+test "accept-encoding" {
+    const cases = [_]struct { []const u8, bool }{
+        .{ "gzip", true },
+        .{ "GZIP", true },
+        .{ "x-gzip", true },
+        .{ "X-Gzip;Q=1", true },
+        .{ "gzip, deflate, br", true },
+        .{ "br ,  gzip ", true },
+        .{ "gzip;q=0", false },
+        .{ "gzip;q=0.0", false },
+        .{ "gzip;q=0.00", false },
+        .{ "gzip; q=0.000", false },
+        .{ "gzip ; q = 0", false },
+        .{ "gzip;q=0.", false },
+        .{ "gzip;q=1.", true },
+        .{ "gzip;q=0.5", true },
+        .{ "gzip;q=0.001", true },
+        .{ "gzip;q=1.000", true },
+        .{ "gzip;q=0, x-gzip", true },
+        .{ "*", true },
+        .{ "*;q=0.5", true },
+        .{ "*;q=0", false },
+        .{ "gzip;q=0, *", false },
+        .{ "br", false },
+        .{ "identity", false },
+        .{ "xgzip", false },
+        .{ "gzipx", false },
+        .{ "", false },
+        .{ ",, ,", false },
+        .{ "gzip;q=", false },
+        .{ "gzip;q=1.5", false },
+        .{ "gzip;q=0.0001", false },
+        .{ "gzip;q=.5", false },
+        .{ "gzip;q=2", false },
+        .{ "gzip;q", false },
+        .{ "gzip;q=abc, br", false },
+        .{ "gzip;q=bad, *", true },
+        .{ "gzip;level=9", true },
+    };
+    for (cases) |c| {
+        var buf: [128]u8 = undefined;
+        const req = try std.fmt.bufPrint(&buf, "GET / HTTP/1.1\r\nAccept-Encoding: {s}\r\n\r\n", .{c[0]});
+        const p = parseHead(req);
+        std.testing.expectEqual(c[1], p.head.gzip) catch |e| {
+            std.debug.print("Accept-Encoding: {s}\n", .{c[0]});
+            return e;
+        };
+    }
+    try std.testing.expect(!parseHead("GET / HTTP/1.1\r\nHost: x\r\n\r\n").head.gzip);
+    try std.testing.expect(parseHead("GET / HTTP/1.1\r\nAccept-Encoding: br\r\naccept-encoding: gzip\r\n\r\n").head.gzip);
+    try std.testing.expect(!parseHead("GET / HTTP/1.1\r\nAccept-Encoding: *\r\nAccept-Encoding: gzip;q=0\r\n\r\n").head.gzip);
 }
 
 test "route" {
