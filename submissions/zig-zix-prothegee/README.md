@@ -40,11 +40,10 @@ Implemented:
 | `DELETE /api/articles/:slug` | done |
 | `POST /api/articles/:slug/favorite` | done |
 | `DELETE /api/articles/:slug/favorite` | done |
+| `GET /api/articles/:slug/comments` | done |
+| `POST /api/articles/:slug/comments` | done |
+| `DELETE /api/articles/:slug/comments/:id` | done |
 | `GET /api/tags` | done, also the health check |
-
-Pending:
-
-- Comments: list, create, delete.
 
 ## Architecture
 
@@ -57,7 +56,8 @@ Pending:
 - Article tag lists are assembled as `jsonb` in SQL and parsed into the response model.
 - Article lists run the page query and the capped count query, newest first.
 - Favorites are an insert or delete edge, and the article response reports the viewer's favorited state and the total count.
-- `GET /api/tags` is served through the zix L1 response cache with a 2 second TTL.
+- Comments are listed newest first, capped at 100, and each comment embeds the author profile.
+- `GET /api/tags` reads the tags table on every request, so a new tag is visible on the next request.
 
 ## Optimizations
 
@@ -66,7 +66,7 @@ Pending:
 | `.URING` dispatch | one ring per worker, no shared event loop |
 | per-worker PostgreSQL connection | no locks and no cross-core handoff |
 | keep-alive responses | matches the load generator's long-lived connections |
-| L1 cache on `GET /api/tags` | the tag list is viewer-independent and changes only when an article adds a tag |
+| direct tag query | a new tag must be visible on the next request, and rule 5 forbids cross-request caches |
 | no cache on per-viewer responses | the user row, the `following` flag, and article `favorited` state are viewer-dependent |
 | comptime router | path dispatch is resolved at compile time |
 | release default `0.0.0.0:80` | direct front, while `HOST` and `PORT` always override it |
@@ -124,9 +124,9 @@ The integration suite needs the local database. It skips when the database is do
 
 ## Status
 
-The real conformance suite runs 141 steps before the comments section aborts: 129 pass and 12 fail, all on the unimplemented comments endpoints. The full 197 checks wait for comments.
+The real conformance suite passes all 197 checks against the seeded database.
 
 ## Notes
 
 - Debug builds enable the console logger. Release builds write the access log to `logs/<date>/conduit-000000.log` only.
-- The L1 tag cache conflicts with the challenge rule that forbids response caches across requests. Removing the `sendFromCache` and `sendCached` calls in `src/handlers/api_tags.zig` makes the submission rule-compliant.
+- `GET /api/tags` reads PostgreSQL on every request to satisfy the rule that forbids response caches across requests.
