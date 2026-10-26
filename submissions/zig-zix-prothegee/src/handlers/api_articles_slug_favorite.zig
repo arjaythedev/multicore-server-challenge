@@ -32,7 +32,7 @@ fn apply(
         return;
     };
 
-    const maybe_article_id = favorite_domain.findArticleId(conn, ctx.allocator, slug) catch {
+    const maybe_article_id = article_domain.idBySlug(conn, ctx.allocator, slug) catch {
         try respond.sendError(res, .INTERNAL_SERVER_ERROR, "database error");
         return;
     };
