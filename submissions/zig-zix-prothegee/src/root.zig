@@ -1,0 +1,34 @@
+//! Public module surface for the test suites.
+//!
+//! The edge, behaviour, and integration suites import this module by name, the
+//! same way they import `zix`. Keeping the re-exports here means the suites do
+//! not reach across the module path with `../../src` imports.
+
+pub const app = @import("app.zig");
+pub const clock = @import("clock.zig");
+pub const config = @import("config.zig");
+pub const db = @import("db.zig");
+
+pub const auth = struct {
+    pub const password = @import("auth/password.zig");
+    pub const request = @import("auth/request.zig");
+    pub const token = @import("auth/token.zig");
+};
+
+pub const domain = struct {
+    pub const tag = @import("domain/tag.zig");
+    pub const user = @import("domain/user.zig");
+    pub const user_input = @import("domain/user_input.zig");
+};
+
+pub const http = struct {
+    pub const json = @import("http/json.zig");
+    pub const respond = @import("http/respond.zig");
+};
+
+pub const handlers = struct {
+    pub const api_tags = @import("handlers/api_tags.zig");
+    pub const api_user = @import("handlers/api_user.zig");
+    pub const api_users = @import("handlers/api_users.zig");
+    pub const api_users_login = @import("handlers/api_users_login.zig");
+};
