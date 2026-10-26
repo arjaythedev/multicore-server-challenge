@@ -11,7 +11,7 @@ esac
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
-apt-get install -y -q --no-install-recommends curl jq xz-utils ca-certificates
+apt-get install -y -q --no-install-recommends curl git jq xz-utils ca-certificates
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
