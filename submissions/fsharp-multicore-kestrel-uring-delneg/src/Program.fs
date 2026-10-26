@@ -45,11 +45,28 @@ let main _ =
         | "b" -> codePoint col.[2] // builtin C / C.UTF-8
         | _ -> false // ICU: Postgres sorts
     Sql.define ()
+    // experiments: write the batched statements out (for replays) and stop
+    match Environment.GetEnvironmentVariable "MC_DUMP_SQL" with
+    | null
+    | "" -> ()
+    | path ->
+        let sb = Text.StringBuilder()
+        for k in Sql.kinds do
+            sb.Append("-- ").Append(k.Name).Append('\n').Append(k.Stmt.Sql).Append("\n\n") |> ignore
+            if not (isNull k.Shared) then
+                sb.Append("-- ").Append(k.Name).Append(" shared\n").Append(k.Shared.Sql).Append("\n\n") |> ignore
+            if not (isNull k.Packed) then
+                sb.Append("-- ").Append(k.Name).Append(" packed\n").Append(k.Packed.Sql).Append("\n\n") |> ignore
+        IO.File.WriteAllText(path, sb.ToString())
+        exit 0
     let batch = envNum "BATCH_MAX" 64
     let inflight = envNum "BATCH_INFLIGHT" 6
+    // packed lists pay off from these batch sizes (replay: global list from 4, the others from 8-16)
+    let packedMin = envNum "PACKED_MIN" 8
     for k in Sql.kinds do
         k.MaxBatch <- batch
         k.MaxInflight <- inflight
+        k.PackedMin <- packedMin
         match Environment.GetEnvironmentVariable("BATCH_" + k.Name.ToUpperInvariant()) with
         | null
         | "" -> ()
@@ -57,6 +74,7 @@ let main _ =
             let p = s.Split ':'
             k.MaxBatch <- int p.[0]
             if p.Length > 1 then k.MaxInflight <- int p.[1]
+    Sql.ListAll.PackedMin <- envNum "LIST_PACKED_MIN" 4
     Jwt.init (env "JWT_SECRET" "multicore-server-challenge")
     Bcrypt.selfTest ()
     Bcrypt.init (envNum "BCRYPT_THREADS" 2) (envNum "BCRYPT_WAIT_MS" 150)
@@ -69,7 +87,8 @@ let main _ =
               PgOptions = options
               Reads = reads
               Writes = writes
-              Depth = envNum "DISPATCH_DEPTH" 1 }
+              Depth = envNum "DISPATCH_DEPTH" 1
+              WaitUs = envNum "BATCH_WAIT_US" 3000 }
         )
     Http.loopCount <- envNum "LOOPS" 2
 

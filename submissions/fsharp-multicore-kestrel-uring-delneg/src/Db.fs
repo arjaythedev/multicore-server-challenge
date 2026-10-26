@@ -1,15 +1,22 @@
 /// The Postgres side: ONE thread owns every Postgres connection in its own io_uring ring, and the batch queues
 /// shared by all I/O loops (one queue per kind for the whole box: a bigger drain shares more work, #79, #82, #22).
 ///
-/// Batching (#22's policy, no timer): read requests wait in their kind's queue until a read connection has room
-/// (fewer than Depth statements in Postgres); then the kind whose oldest request has waited longest sends what it
-/// has queued (up to MaxBatch) as ONE statement. At low load every batch has one request; under load requests stay
-/// queued until a backend is free, so batches grow. A kind holds at most MaxInflight connections.
+/// Batching (#22's policy plus a clock, #79): read requests wait in their kind's queue until the oldest has waited
+/// WaitUs (3 ms by default) or MaxBatch are queued, and a read connection has room (fewer than Depth statements in
+/// Postgres); then the kind whose oldest request has waited longest sends what it has queued (up to MaxBatch) as
+/// ONE statement. A kind holds at most MaxInflight connections. Without the clock, batches at a moderate load
+/// average ~2 requests and Postgres pays its per-statement cost for each; with 3 ms the box spent 23% less CPU
+/// per request (experiments/worklog.md).
 /// Writes go to their own connections (a read never waits behind a commit), to the one with the fewest in flight.
 module Db
 
 open System
+open System.Buffers
+open System.Buffers.Binary
+open System.Buffers.Text
 open System.Collections.Generic
+open System.Text.Encodings.Web
+open System.Text.Json
 open System.Threading
 open Pg
 open Ring
@@ -25,18 +32,190 @@ let private OpRecv = 6UL
 [<Literal>]
 let private OpSend = 7UL
 
+[<Struct>]
+type private Art =
+    { Id: int64
+      Author: int64
+      Start: int
+      Fav: int // the "false" after "favorited":
+      Fol: int // the "false" after "following":
+      End: int }
+
+[<Struct>]
+type private Head =
+    { I: int
+      Count: int64
+      Ids: int
+      NIds: int
+      Favs: int
+      NFavs: int
+      Fols: int
+      NFols: int }
+
+/// Packed list results (Sql: #82's form): each distinct article's JSON is written once per batch with both flags
+/// false, then every request's response is assembled from those pieces and its own page ids and flag arrays.
+/// Nothing outlives the batch.
+[<Sealed>]
+type Packer() =
+    let buf = ArrayBufferWriter<byte>(64 * 1024)
+    let w = new Utf8JsonWriter(buf, JsonWriterOptions(Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping, SkipValidation = true))
+    let arts = List<Art>()
+    let index = Dictionary<int64, int>()
+    let heads = List<Head>()
+    let longs = List<int64>()
+    static let open' = "{\"articles\":["B
+    static let close' = "],\"articlesCount\":"B
+    static let tru = "true"B
+    static let fals = "false"B
+
+    /// appends an int8[] (binary) to longs; returns how many
+    let readLongs (b: ReadOnlySpan<byte>) =
+        if b.Length < 20 || BinaryPrimitives.ReadInt32BigEndian b <> 1 then 0
+        else
+            let count = BinaryPrimitives.ReadInt32BigEndian(b.Slice 12)
+            let mutable pos = 20
+            let mutable added = 0
+            for _ in 1..count do
+                let len = BinaryPrimitives.ReadInt32BigEndian(b.Slice pos)
+                pos <- pos + 4
+                if len = 8 then
+                    longs.Add(BinaryPrimitives.ReadInt64BigEndian(b.Slice pos))
+                    added <- added + 1
+                if len > 0 then pos <- pos + len
+            added
+
+    let contains (start: int) (n: int) (v: int64) =
+        let mutable found = false
+        let mutable k = start
+        while not found && k < start + n do
+            if longs.[k] = v then found <- true
+            k <- k + 1
+        found
+
+    static let put (o: IBufferWriter<byte>) (src: ReadOnlySpan<byte>) =
+        let s = o.GetSpan src.Length
+        src.CopyTo s
+        o.Advance src.Length
+
+    member _.Clear() =
+        buf.ResetWrittenCount()
+        arts.Clear()
+        index.Clear()
+        heads.Clear()
+        longs.Clear()
+
+    member _.Row(r: PgRow) =
+        let i = r.Int4 0
+        if i < 0 then
+            let id = r.Int8 2
+            w.Reset()
+            let start = buf.WrittenCount
+            w.WriteStartObject()
+            Json.text w Json.N.slug r 3
+            Json.text w Json.N.title r 4
+            Json.text w Json.N.description r 5
+            Json.time w Json.N.createdAt (r.Micros 6)
+            Json.time w Json.N.updatedAt (r.Micros 7)
+            Json.tagList w r 8
+            w.WriteNumber(Json.N.favoritesCount, r.Int8 9)
+            w.WriteBoolean(Json.N.favorited, false)
+            w.Flush()
+            let fav = buf.WrittenCount - 5
+            w.WritePropertyName Json.N.author
+            w.WriteStartObject()
+            Json.text w Json.N.username r 10
+            Json.nullableText w Json.N.bio r 11
+            Json.nullableText w Json.N.image r 12
+            w.WriteBoolean(Json.N.following, false)
+            w.Flush()
+            let fol = buf.WrittenCount - 5
+            w.WriteEndObject()
+            w.WriteEndObject()
+            w.Flush()
+            index.[id] <- arts.Count
+            arts.Add { Id = id; Author = r.Int8 13; Start = start; Fav = fav; Fol = fol; End = buf.WrittenCount }
+        else
+            let ids = longs.Count
+            let nIds = readLongs (r.Bytes 14)
+            let favs = longs.Count
+            let nFavs = readLongs (r.Bytes 15)
+            let fols = longs.Count
+            let nFols = readLongs (r.Bytes 16)
+            heads.Add { I = i; Count = r.Int8 1; Ids = ids; NIds = nIds; Favs = favs; NFavs = nFavs; Fols = fols; NFols = nFols }
+
+    member _.Heads = heads.Count
+    member _.HeadIndex(k: int) = heads.[k].I
+
+    /// writes the k-th request's response body into c; false when an article is missing (then nothing is usable)
+    member _.Write(k: int, c: Ctx) =
+        let h = heads.[k]
+        let o = c.Out :> IBufferWriter<byte>
+        put o (ReadOnlySpan open')
+        let src = buf.WrittenSpan
+        let mutable ok = true
+        for j in 0 .. h.NIds - 1 do
+            let id = longs.[h.Ids + j]
+            let mutable ai = 0
+            if index.TryGetValue(id, &ai) then
+                let a = arts.[ai]
+                if j > 0 then put o (ReadOnlySpan ","B)
+                put o (src.Slice(a.Start, a.Fav - a.Start))
+                put o (ReadOnlySpan(if contains h.Favs h.NFavs id then tru else fals))
+                put o (src.Slice(a.Fav + 5, a.Fol - a.Fav - 5))
+                put o (ReadOnlySpan(if contains h.Fols h.NFols a.Author then tru else fals))
+                put o (src.Slice(a.Fol + 5, a.End - a.Fol - 5))
+            else ok <- false
+        put o (ReadOnlySpan close')
+        let s = o.GetSpan 24
+        let mutable n = 0
+        Utf8Formatter.TryFormat(h.Count, s, &n) |> ignore
+        s.[n] <- '}'B
+        o.Advance(n + 1)
+        ok
+
 /// One batched statement: the requests of one kind, their parameters as arrays.
 [<Sealed; AllowNullLiteral>]
 type BatchQuery(k: Sql.Kind, release: BatchQuery -> unit) =
     inherit PgQuery()
     let items = Array.zeroCreate<Ctx> k.MaxBatch
     let finished = Array.zeroCreate<Ctx> k.MaxBatch
+    let packed = Array.zeroCreate<bool> k.MaxBatch
+    let mutable packer: Packer = Unchecked.defaultof<_>
+    let mutable packing = false
     member val N = 0 with get, set
     member _.Items = items
     member _.Kind = k
-    override b.Write(w) =
+    /// at most half of the batch's pages are distinct (#7's rule): the shared form pays off
+    member private b.Overlapping() =
         let n = b.N
-        w.Bind k.Stmt
+        if n < 2 then false
+        else
+            let mutable unique = 0
+            for i in 0 .. n - 1 do
+                let a = items.[i]
+                let mutable seen = false
+                let mutable j = 0
+                while not seen && j < i do
+                    let x = items.[j]
+                    if x.Limit = a.Limit && x.Offset = a.Offset && x.Key.SequenceEqual a.Key then seen <- true
+                    j <- j + 1
+                if not seen then unique <- unique + 1
+            unique <= n / 2
+    override b.Write(w) =
+        packing <- not (isNull k.Packed) && b.N >= k.PackedMin
+        if packing then
+            if isNull (box packer) then packer <- Packer()
+            packer.Clear()
+        w.Bind(
+            if packing then k.Packed
+            elif not (isNull k.Shared) && b.Overlapping() then k.Shared
+            else k.Stmt
+        )
+        if not k.Broadcast then b.Params w
+        w.EndBind()
+        w.Sync()
+    member private b.Params(w: PgWriter) =
+        let n = b.N
         w.BeginArray Oid.Int4
         for i in 0 .. n - 1 do w.Int4 i
         w.EndArray n
@@ -56,13 +235,30 @@ type BatchQuery(k: Sql.Kind, release: BatchQuery -> unit) =
             w.BeginArray Oid.Text
             for i in 0 .. n - 1 do w.Text items.[i].Key
             w.EndArray n
-        w.EndBind()
-        w.Sync()
     override b.Row(_, row) =
-        let i = row.Int4 0
-        if uint32 i < uint32 b.N then Handlers.batchRow items.[i] row
+        if packing then packer.Row row
+        elif k.Broadcast then
+            for i in 0 .. b.N - 1 do Handlers.batchRow items.[i] row
+        else
+            let i = row.Int4 0
+            if uint32 i < uint32 b.N then Handlers.batchRow items.[i] row
     override b.Done(err) =
         let n = b.N
+        if packing && isNull err then
+            try
+                for h in 0 .. packer.Heads - 1 do
+                    let i = packer.HeadIndex h
+                    if uint32 i < uint32 n && not packed.[i] then
+                        let c = items.[i]
+                        packed.[i] <- true
+                        if not (packer.Write(h, c)) then
+                            eprintfn "packed %O: an article is missing" c.Route
+                            c.Error(500, "internal error")
+            with e ->
+                eprintfn "packed: %O" e
+                for i in 0 .. n - 1 do
+                    packed.[i] <- true
+                    items.[i].Error(500, "internal error")
         Array.Copy(items, finished, n)
         Array.Clear(items, 0, n)
         b.N <- 0
@@ -70,7 +266,15 @@ type BatchQuery(k: Sql.Kind, release: BatchQuery -> unit) =
         for i in 0 .. n - 1 do
             let c = finished.[i]
             finished.[i] <- null
-            try Handlers.batchDone c err
+            try
+                if packed.[i] then
+                    packed.[i] <- false
+                    c.Finish()
+                elif packing && isNull err then
+                    eprintfn "packed %O: no row for the request" c.Route
+                    c.Error(500, "internal error")
+                    c.Finish()
+                else Handlers.batchDone c err
             with e ->
                 eprintfn "%O" e
                 c.Error(500, "internal error")
@@ -90,7 +294,9 @@ type Options =
       PgOptions: string
       Reads: int
       Writes: int
-      Depth: int }
+      Depth: int
+      /// a kind's batch waits until its oldest request has waited this long (or the batch is full); 0 = no clock
+      WaitUs: int }
 
 [<Sealed>]
 type PgThread(o: Options) as this =
@@ -106,7 +312,7 @@ type PgThread(o: Options) as this =
     let inflight = Array.zeroCreate<int> kinds.Length
     let free = kinds |> Array.map (fun _ -> Stack<BatchQuery>())
     let cqes = List<Cqe>(4096)
-    let mutable seq = 0L
+    let waitTicks = int64 o.WaitUs * Diagnostics.Stopwatch.Frequency / 1_000_000L
     let mutable needPump = false
     let mutable thread: Thread = null
     let ready = new ManualResetEventSlim(false)
@@ -120,6 +326,8 @@ type PgThread(o: Options) as this =
     let stats = not (isNull (Environment.GetEnvironmentVariable "MC_STATS"))
     let mutable stBatches = 0L
     let mutable stItems = 0L
+    let stKB = Array.zeroCreate<int64> 64
+    let stKI = Array.zeroCreate<int64> 64
     let mutable stLast = Environment.TickCount64
 
     do
@@ -154,8 +362,11 @@ type PgThread(o: Options) as this =
         else c.Submit q |> ignore
 
     /// fill free read connections, the kind whose oldest request waited longest first
-    member private _.Pump() =
+    /// Returns the ticks until the next batch window closes (0 = none waiting).
+    member private _.Pump() : int64 =
         needPump <- false
+        let now = if waitTicks > 0L then Diagnostics.Stopwatch.GetTimestamp() else 0L
+        let mutable next = Int64.MaxValue
         let mutable go = true
         while go do
             let mutable best = -1
@@ -164,7 +375,9 @@ type PgThread(o: Options) as this =
                 let p = pending.[k]
                 if p.Count > 0 && inflight.[k] < kinds.[k].MaxInflight then
                     let t = p.Peek().Queued
-                    if t < oldest then
+                    if waitTicks > 0L && p.Count < kinds.[k].MaxBatch && now - t < waitTicks then
+                        next <- min next (t + waitTicks - now)
+                    elif t < oldest then
                         oldest <- t
                         best <- k
             if best < 0 then go <- false
@@ -184,15 +397,17 @@ type PgThread(o: Options) as this =
                     if stats then
                         stBatches <- stBatches + 1L
                         stItems <- stItems + int64 n
+                        stKB.[best] <- stKB.[best] + 1L
+                        stKI.[best] <- stKI.[best] + int64 n
                     conn.Submit b |> ignore
+        if next = Int64.MaxValue then 0L else max 1L next
 
     member private this.Drain() =
         let mutable m = Unchecked.defaultof<Msg>
         while inbox.TryTake(&m) do
             match m.Op with
             | 0 ->
-                m.C.Queued <- seq
-                seq <- seq + 1L
+                m.C.Queued <- Diagnostics.Stopwatch.GetTimestamp()
                 pending.[m.Kind].Enqueue m.C
                 needPump <- true
             | 1 -> this.Submit(reads, m.Q)
@@ -245,14 +460,17 @@ type PgThread(o: Options) as this =
         finally
             ready.Set()
         if isNull initError then
+            let mutable waitNs = 0L
             while true do
-                ring.Enter(1u, 0L) |> ignore
+                ring.Enter(1u, waitNs) |> ignore
                 cqes.Clear()
                 ring.Reap(cqes, Int32.MaxValue) |> ignore
                 for i in 0 .. cqes.Count - 1 do
                     try this.Handle cqes.[i] with e -> eprintfn "%O" e
                 (try this.Drain() with e -> eprintfn "%O" e)
-                if needPump then (try this.Pump() with e -> eprintfn "%O" e)
+                if needPump || waitTicks > 0L then
+                    let t = (try this.Pump() with e -> eprintfn "%O" e; 0L)
+                    waitNs <- if t > 0L then max 20_000L (t * 1_000_000_000L / Diagnostics.Stopwatch.Frequency) else 0L
                 this.Flush()
                 if stats && Environment.TickCount64 - stLast > 5000L then
                     stLast <- Environment.TickCount64
@@ -260,6 +478,9 @@ type PgThread(o: Options) as this =
                     eprintfn "pg batches=%d items=%d avg=%.1f queued=%d inflight=%s" stBatches stItems
                         (if stBatches > 0L then float stItems / float stBatches else 0.0) q
                         (String.Join(",", conns |> Seq.map (fun c -> string c.Inflight)))
+                    eprintfn "pg kinds %s" (String.Join(" ", kinds |> Seq.filter (fun k -> stKB.[k.Id] > 0L) |> Seq.map (fun k -> sprintf "%s=%d/%.1f" k.Name stKB.[k.Id] (float stKI.[k.Id] / float stKB.[k.Id]))))
+                    Array.Clear stKB
+                    Array.Clear stKI
                     stBatches <- 0L
                     stItems <- 0L
 

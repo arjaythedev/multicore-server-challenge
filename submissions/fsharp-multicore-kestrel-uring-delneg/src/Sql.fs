@@ -28,6 +28,16 @@ type Kind(id: int, name: string, stmt: Stmt, layout: Layout) =
     member _.Layout = layout
     member val MaxBatch = 64 with get, set
     member val MaxInflight = 6 with get, set
+    /// one execution answers every request in the batch (the same for every viewer: GET /api/tags, as #48 and #7)
+    member val Broadcast = false with get, set
+    /// lists: the same rows from one enrichment per distinct article of the batch (#7), for batches whose pages
+    /// overlap; null = none
+    member val Shared: Stmt = null with get, set
+    /// lists: each distinct article of the batch once, then one row per request with its page ids and flags
+    /// (#82's packed results; Db.Packer builds the responses); null = none
+    member val Packed: Stmt = null with get, set
+    /// the smallest batch that uses Packed (its CTEs cost more than they save on tiny batches)
+    member val PackedMin = 4 with get, set
 
 let kinds = List<Kind>()
 
@@ -124,6 +134,146 @@ let private batchedList name page count l =
         ))
         l
 
+/// The shared form of a batched list (#7's shared enrichment): requests -> capped counts -> page ids, then each
+/// distinct article of the batch is enriched once (tags, favorite count, author); viewer flags stay per request.
+/// Only requests already queued when the statement starts share it; nothing outlives the statement (rule 5).
+/// A page subquery under a constant LIMIT 100 (limit is 1-100): a generic plan otherwise guesses that LIMIT $n keeps
+/// a tenth of the table and joins the batch's pages to articles and users with sequential scans (#7's bounded pages).
+let private bounded (page: string) = "SELECT * FROM (" + page + ") pg0 LIMIT 100"
+
+let private sharedList (count: string) (pageIds: string) (l: Layout) (feed: bool) =
+    Stmt.Define(
+        "WITH r AS MATERIALIZED (SELECT * FROM " + unnest l + "), "
+        + "c AS MATERIALIZED (SELECT r.*, (" + bindParams count l + ") AS n FROM r), "
+        + "p AS MATERIALIZED (SELECT r.i, r.v, r.n, pg.id FROM c r LEFT JOIN LATERAL (" + bindParams (bounded pageIds) l + ") pg ON true), "
+        + "e AS MATERIALIZED (SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, a.author_id, "
+        + "ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at WHERE at.article_id = a.id" + tagOrder () + ") AS tags, "
+        + "(SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS fc, u.username, u.bio, u.image "
+        + "FROM (SELECT DISTINCT id FROM p WHERE id IS NOT NULL) d JOIN articles a ON a.id = d.id JOIN users u ON u.id = a.author_id) "
+        + "SELECT p.i, p.n, e.id, e.slug, e.title, e.description, e.created_at, e.updated_at, e.tags, e.fc, "
+        + "(SELECT true FROM favorites f WHERE f.user_id = p.v AND f.article_id = e.id) IS NOT NULL, "
+        + "e.username, e.bio, e.image, "
+        + (if feed then "e.id IS NOT NULL " // the viewer follows every feed author
+           else "(SELECT true FROM follows fo WHERE fo.follower_id = p.v AND fo.followee_id = e.author_id) IS NOT NULL ")
+        + "FROM p LEFT JOIN e ON e.id = p.id ORDER BY p.i, e.id DESC",
+        oids l
+    )
+
+/// Packed lists (from #82, rust-tokio-nickita-khylkouski, MIT; on #7's shared lists). Columns:
+/// 0 i (-1 for an article row), 1 count, 2 id, 3 slug, 4 title, 5 description, 6 created_at, 7 updated_at, 8 tags,
+/// 9 favorites count, 10 username, 11 bio, 12 image, 13 author id, 14 page ids (newest first), 15 the viewer's
+/// favorited ids among them, 16 the viewer's followees among their authors. Article rows come first (UNION ALL,
+/// no parallel plans). Every distinct article is enriched once per statement; flags stay per viewer.
+let private enrichSet () =
+    "tg AS MATERIALIZED (SELECT at.article_id, array_agg(t.name" + (if Json.appSortsTags then "" else " ORDER BY t.name")
+    + ") AS tags FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE at.article_id = ANY (ARRAY(SELECT id FROM d)) GROUP BY 1), "
+    + "fc AS MATERIALIZED (SELECT f.article_id, count(*) AS n FROM favorites f WHERE f.article_id = ANY (ARRAY(SELECT id FROM d)) GROUP BY 1), "
+    + "e AS MATERIALIZED (SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, a.author_id, "
+    + "COALESCE(tg.tags, '{}') AS tags, COALESCE(fc.n, 0) AS fc, u.username, u.bio, u.image "
+    + "FROM d JOIN articles a ON a.id = d.id JOIN users u ON u.id = a.author_id "
+    + "LEFT JOIN tg ON tg.article_id = a.id LEFT JOIN fc ON fc.article_id = a.id)"
+
+let private packedHead =
+    " SELECT -1, NULL::int8, e.id, e.slug, e.title, e.description, e.created_at, e.updated_at, e.tags, e.fc, "
+    + "e.username, e.bio, e.image, e.author_id, NULL::int8[], NULL::int8[], NULL::int8[] FROM e UNION ALL "
+    + "SELECT q.i, c.n, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, "
+
+/// global list: one count, pages per distinct (limit, offset), each viewer's flags read once for the batch's id window
+let private packedAll () =
+    Stmt.Define(
+        "WITH q AS MATERIALIZED (SELECT * FROM " + unnest Layout.List + "), "
+        + "c AS MATERIALIZED (SELECT count(*) AS n FROM (SELECT 1 FROM articles ORDER BY id LIMIT 1000) s), "
+        + "p AS MATERIALIZED (SELECT r.l, r.o, x.id FROM (SELECT DISTINCT l, o FROM q) r "
+        + "CROSS JOIN LATERAL (" + bounded "SELECT a.id FROM articles a ORDER BY a.id DESC LIMIT r.l OFFSET r.o" + ") x), "
+        + "d AS MATERIALIZED (SELECT DISTINCT id FROM p), "
+        + enrichSet ()
+        + ", b AS MATERIALIZED (SELECT min(id) AS lo, max(id) AS hi, array_agg(DISTINCT author_id) AS au FROM e), "
+        + "pa AS MATERIALIZED (SELECT l, o, array_agg(id ORDER BY id DESC) AS ids FROM p GROUP BY l, o), "
+        + "vf AS MATERIALIZED (SELECT f.user_id, array_agg(f.article_id) AS ids FROM favorites f "
+        + "WHERE f.user_id = ANY (ARRAY(SELECT DISTINCT v FROM q WHERE v <> 0)) "
+        + "AND f.article_id BETWEEN (SELECT lo FROM b) AND (SELECT hi FROM b) GROUP BY 1), "
+        + "vo AS MATERIALIZED (SELECT fo.follower_id, array_agg(fo.followee_id) AS ids FROM follows fo "
+        + "WHERE fo.follower_id = ANY (ARRAY(SELECT DISTINCT v FROM q WHERE v <> 0)) AND fo.followee_id = ANY ((SELECT au FROM b)::int8[]) GROUP BY 1)"
+        + packedHead
+        + "COALESCE(pa.ids, '{}'), COALESCE(vf.ids, '{}'), COALESCE(vo.ids, '{}') FROM q CROSS JOIN c "
+        + "LEFT JOIN pa ON pa.l = q.l AND pa.o = q.o LEFT JOIN vf ON vf.user_id = q.v LEFT JOIN vo ON vo.follower_id = q.v",
+        oids Layout.List
+    )
+
+/// filtered lists: a count per distinct key, a page per distinct (limit, offset, key), flags by one = ANY (page)
+/// read per request
+let private packedKey (count: string) (pageIds: string) =
+    let l = Layout.ListKey
+    Stmt.Define(
+        "WITH q AS MATERIALIZED (SELECT * FROM " + unnest l + "), "
+        + "c AS MATERIALIZED (SELECT r.k, (" + bindParams count l + ") AS n FROM (SELECT DISTINCT k FROM q) r), "
+        + "p AS MATERIALIZED (SELECT r.l, r.o, r.k, x.id FROM (SELECT DISTINCT l, o, k FROM q) r "
+        + "CROSS JOIN LATERAL (" + bindParams (bounded pageIds) l + ") x), "
+        + "d AS MATERIALIZED (SELECT DISTINCT id FROM p), "
+        + enrichSet ()
+        + ", pa AS MATERIALIZED (SELECT p.l, p.o, p.k, array_agg(p.id ORDER BY p.id DESC) AS ids, array_agg(DISTINCT e.author_id) AS au "
+        + "FROM p JOIN e ON e.id = p.id GROUP BY p.l, p.o, p.k)"
+        + packedHead
+        + "COALESCE(pa.ids, '{}'), "
+        + "CASE WHEN q.v = 0 OR pa.ids IS NULL THEN '{}'::int8[] ELSE ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id = q.v AND f.article_id = ANY (pa.ids)) END, "
+        + "CASE WHEN q.v = 0 OR pa.ids IS NULL THEN '{}'::int8[] ELSE ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = q.v AND fo.followee_id = ANY (pa.au)) END "
+        + "FROM q JOIN c ON c.k = q.k LEFT JOIN pa ON pa.l = q.l AND pa.o = q.o AND pa.k = q.k",
+        oids l
+    )
+
+/// feed: each request's followees read once for its count and page; every page article's author is followed
+let private packedFeed () =
+    Stmt.Define(
+        "WITH q AS MATERIALIZED (SELECT r.*, ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.v) AS fl FROM "
+        + unnest Layout.List + "), "
+        + "c AS MATERIALIZED (SELECT q.i, CASE WHEN EXISTS (SELECT 1 FROM articles a3 WHERE a3.author_id = ANY (q.fl) "
+        + "ORDER BY a3.author_id, a3.id DESC OFFSET 999 LIMIT 1) THEN 1000::int8 "
+        + "ELSE (SELECT count(*) FROM articles a3 WHERE a3.author_id = ANY (q.fl)) END AS n FROM q), "
+        + "p AS MATERIALIZED (SELECT q.i, x.id FROM q CROSS JOIN LATERAL ("
+        + bounded (
+            "SELECT y.id FROM unnest(q.fl) AS f(a) "
+            + "CROSS JOIN LATERAL (SELECT a3.id FROM articles a3 WHERE a3.author_id = f.a ORDER BY a3.id DESC LIMIT (q.l + q.o)) y "
+            + "ORDER BY y.id DESC LIMIT q.l OFFSET q.o")
+        + ") x), "
+        + "d AS MATERIALIZED (SELECT DISTINCT id FROM p), "
+        + enrichSet ()
+        + ", pa AS MATERIALIZED (SELECT p.i, array_agg(p.id ORDER BY p.id DESC) AS ids, "
+        + "array_agg(p.id) FILTER (WHERE EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = p.id AND f.user_id = q.v)) AS favs, "
+        + "array_agg(DISTINCT e.author_id) AS fols FROM p JOIN q ON q.i = p.i JOIN e ON e.id = p.id GROUP BY p.i)"
+        + packedHead
+        + "COALESCE(pa.ids, '{}'), COALESCE(pa.favs, '{}'), COALESCE(pa.fols, '{}') FROM q JOIN c ON c.i = q.i LEFT JOIN pa ON pa.i = q.i",
+        oids Layout.List
+    )
+
+/// Article and comments by slug when at least half of a batch repeats a slug (#82): each distinct slug's article (or
+/// comment list) is read once; the viewer flags stay per request. Same rows as the per-request forms.
+let private sharedArticle () =
+    Stmt.Define(
+        "WITH q AS MATERIALIZED (SELECT * FROM " + unnest Layout.ViewerKey + "), "
+        + "e AS MATERIALIZED (SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at, a.author_id, "
+        + "ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at WHERE at.article_id = a.id" + tagOrder () + ") AS tags, "
+        + "(SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS fc, u.username, u.bio, u.image "
+        + "FROM articles a JOIN users u ON u.id = a.author_id WHERE a.slug = ANY (ARRAY(SELECT DISTINCT k FROM q))) "
+        + "SELECT q.i, e.id, e.slug, e.title, e.description, e.body, e.created_at, e.updated_at, e.tags, e.fc, "
+        + "(SELECT true FROM favorites f WHERE f.user_id = q.v AND f.article_id = e.id) IS NOT NULL, e.username, e.bio, e.image, "
+        + "(SELECT true FROM follows fo WHERE fo.follower_id = q.v AND fo.followee_id = e.author_id) IS NOT NULL "
+        + "FROM q JOIN e ON e.slug = q.k",
+        oids Layout.ViewerKey
+    )
+
+let private sharedComments () =
+    Stmt.Define(
+        "WITH q AS MATERIALIZED (SELECT * FROM " + unnest Layout.ViewerKey + "), "
+        + "e AS MATERIALIZED (SELECT a.slug, a.id AS aid, c.id, c.body, c.created_at, c.updated_at, c.author_id, u.username, u.bio, u.image "
+        + "FROM articles a LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id FROM comments c "
+        + "WHERE c.article_id = a.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true "
+        + "LEFT JOIN users u ON u.id = c.author_id WHERE a.slug = ANY (ARRAY(SELECT DISTINCT k FROM q))), "
+        + "fl AS MATERIALIZED (SELECT q.i, ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = q.v) AS ids FROM q) "
+        + "SELECT q.i, e.aid, e.id, e.body, e.created_at, e.updated_at, e.username, e.bio, e.image, e.author_id = ANY (fl.ids) "
+        + "FROM q JOIN fl ON fl.i = q.i JOIN e ON e.slug = q.k ORDER BY q.i, e.created_at DESC, e.id DESC",
+        oids Layout.ViewerKey
+    )
+
 /// "at least 1000?" is answered by whether a 1000th row exists (OFFSET 999); the exact count only below that
 [<Literal>]
 let private CountAll =
@@ -173,6 +323,11 @@ let private ProfileSql =
 [<Literal>]
 let private UserById = "SELECT id, username, email, bio, image FROM users WHERE id = $1"
 
+/// the feed page: the newest (limit + offset) of each followee, merged
+[<Literal>]
+let private FeedPage =
+    "SELECT x.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT ($2::bigint + $3::bigint)) x WHERE fo.follower_id = $1 ORDER BY x.id DESC LIMIT $2 OFFSET $3"
+
 let mutable Tags: Kind = Unchecked.defaultof<_>
 let mutable Article: Kind = Unchecked.defaultof<_>
 let mutable Comments: Kind = Unchecked.defaultof<_>
@@ -209,12 +364,19 @@ let define () =
     let T = Oid.Text
     // the names as a text[] (in name order, from the index); the app writes the JSON
     Tags <-
-        addKind "tags" (Stmt.Define("SELECT r.i, ARRAY(SELECT t.name FROM tags t WHERE r.i >= 0 ORDER BY t.name) FROM " + unnest Layout.None, oids Layout.None)) Layout.None
+        if Environment.GetEnvironmentVariable "TAGS_BROADCAST" = "0" then
+            addKind "tags" (Stmt.Define("SELECT r.i, ARRAY(SELECT t.name FROM tags t WHERE r.i >= 0 ORDER BY t.name) FROM " + unnest Layout.None, oids Layout.None)) Layout.None
+        else
+            // one execution for all the tag requests queued when the statement starts; nothing is kept after it
+            let k = addKind "tags" (Stmt.Define("SELECT 0, ARRAY(SELECT t.name FROM tags t ORDER BY t.name)")) Layout.None
+            k.Broadcast <- true
+            k
     Article <- batched "article" (fullSelect () + " WHERE a.slug = $2") Layout.ViewerKey
     Comments <- batched "comments" CommentsSql Layout.ViewerKey
     Profile <- batched "profile" ProfileSql Layout.ViewerKey
     User <- batched "user" UserById Layout.Viewer
     let at = articleTail ()
+    let shared = Environment.GetEnvironmentVariable "LIST_SHARED" = "1"
     ListAll <-
         batchedList "list" ("SELECT " + ListCols + at + " FROM (" + PageCols + " ORDER BY a.id DESC LIMIT $2 OFFSET $3) a JOIN users u ON u.id = a.author_id ORDER BY a.id DESC") CountAll Layout.List
     ListAuthor <-
@@ -237,14 +399,36 @@ let define () =
             (listOf "SELECT f.article_id AS id FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = $4) ORDER BY f.article_id DESC LIMIT $2 OFFSET $3" at)
             CountFavorited
             Layout.ListKey
+    if shared then
+        ListAll.Shared <- sharedList CountAll "SELECT a.id FROM articles a ORDER BY a.id DESC LIMIT $2 OFFSET $3" Layout.List false
+        ListAuthor.Shared <-
+            sharedList CountAuthor "SELECT a.id FROM articles a WHERE a.author_id = (SELECT au.id FROM users au WHERE au.username = $4) ORDER BY a.id DESC LIMIT $2 OFFSET $3" Layout.ListKey false
+        ListTag.Shared <-
+            sharedList CountTag "SELECT at.article_id AS id FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = $4) ORDER BY at.article_id DESC LIMIT $2 OFFSET $3" Layout.ListKey false
+        ListFavorited.Shared <-
+            sharedList CountFavorited "SELECT f.article_id AS id FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = $4) ORDER BY f.article_id DESC LIMIT $2 OFFSET $3" Layout.ListKey false
     ListFeed <-
         batchedList
             "feed"
-            (listOf
-                "SELECT x.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT ($2::bigint + $3::bigint)) x WHERE fo.follower_id = $1 ORDER BY x.id DESC LIMIT $2 OFFSET $3"
-                (feedTail ()))
+            (listOf FeedPage (feedTail ()))
             CountFeed
             Layout.List
+
+    if shared && Environment.GetEnvironmentVariable "FEED_SHARED" <> "0" then
+        ListFeed.Shared <- sharedList CountFeed FeedPage Layout.List true
+
+    if Environment.GetEnvironmentVariable "SLUG_SHARED" = "1" then
+        Article.Shared <- sharedArticle ()
+        Comments.Shared <- sharedComments ()
+    if Environment.GetEnvironmentVariable "LIST_PACKED" <> "0" then
+        ListAll.Packed <- packedAll ()
+        ListAuthor.Packed <-
+            packedKey CountAuthor "SELECT a.id FROM articles a WHERE a.author_id = (SELECT au.id FROM users au WHERE au.username = $4) ORDER BY a.id DESC LIMIT $2 OFFSET $3"
+        ListTag.Packed <-
+            packedKey CountTag "SELECT at.article_id AS id FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = $4) ORDER BY at.article_id DESC LIMIT $2 OFFSET $3"
+        ListFavorited.Packed <-
+            packedKey CountFavorited "SELECT f.article_id AS id FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = $4) ORDER BY f.article_id DESC LIMIT $2 OFFSET $3"
+        if Environment.GetEnvironmentVariable "FEED_PACKED" <> "0" then ListFeed.Packed <- packedFeed ()
 
     ArticleBySlug <- Stmt.Define(fullSelect () + " WHERE a.slug = $2", I8, T)
     // $1 viewer, $2 slug prefix ("<slugified title>-"), $3 title, $4 description, $5 body
