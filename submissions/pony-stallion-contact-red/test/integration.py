@@ -4326,8 +4326,10 @@ class Integration(unittest.TestCase):
                                     "title": special if i == 3 else f"title{i}",
                                     "description": special + "description"
                                         if i == 3 else f"description{i}",
-                                    "createdAt": f"2024-01-0{4-i}T00:00:00.000Z",
-                                    "updatedAt": f"2024-02-0{4-i}T00:00:00.000Z",
+                                    "createdAt":
+                                        f"2024-01-0{4-i}T00:00:00.000Z",
+                                    "updatedAt":
+                                        f"2024-02-0{4-i}T00:00:00.000Z",
                                     "tagList": [t for t in tag_order
                                         if t != "selected"] if i == 3
                                         else ["selected"],
@@ -4340,8 +4342,8 @@ class Integration(unittest.TestCase):
                                         and i != 2}}
                                 self.assertEqual(set(article), set(expected))
                                 for key in expected:
-                                    self.assertEqual(article[key], expected[key],
-                                                     key)
+                                    self.assertEqual(article[key],
+                                                     expected[key], key)
 
     def test_direct_json_count_boundaries(self):
         variants = [("/api/articles?", "all"),
@@ -4398,6 +4400,26 @@ class Integration(unittest.TestCase):
                     self.assertEqual(article["createdAt"], expected)
                     self.assertEqual(article["updatedAt"],
                                      "2025-01-02T03:04:05.987Z")
+
+    def test_pool_tags_output_failure(self):
+        with self.pool_run(1) as run:
+            run.ready(1)
+            expected = self.tag_snapshot(run)
+            run.proxy.replace_scalar_field(0, 0, 0, 1009, None)
+            run.send("tags 1 0")
+            result = run.result(1, "data", client=0)
+            self.assertIsNone(result["payload"])
+            receipts = run.proxy.scalar_mutations()
+            self.assertEqual(len(receipts), 1)
+            self.assertEqual(receipts[0]["oid"], 1009)
+            self.assertEqual(receipts[0]["after"], (None,))
+            self.assert_pool_drained(run)
+            self.assertEqual(run.fence(), {0: 1, 1: 0, 2: 0, 3: 0})
+            run.send("tags 2 0")
+            self.assertEqual(json.loads(run.result(2, client=0)["payload"]),
+                             {"tags": expected})
+            self.assert_pool_drained(run)
+            self.assertEqual(run.fence(), {0: 2, 1: 0, 2: 0, 3: 0})
 
     def test_sql_json_input_validation(self):
         token = self.token(self.author())
