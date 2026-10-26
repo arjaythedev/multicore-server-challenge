@@ -1,0 +1,73 @@
+Lever: Sync overlap (steal report row 20). When a read connection's results for a group arrive, the next group is
+encoded in the same pass, so the connection is never idle between groups. Base: 5a6ee6c (before the gather queue).
+
+Measured (lv2 on t1, cap 3, 42,000 users, paired against HEAD in the same round, µs/request from monitor.sh):
+  round 1: HEAD 246, sync 242 (sync ran under the per-cgroup perf counters: left out)
+  round 2: HEAD 247, sync 242: total -5, PG -3; retired instructions +25k per request (1,223k -> 1,248k)
+Not taken: no gain beyond noise, more instructions, and the gather queue (825c365) now drains at depth 1 on a clock,
+which leaves no idle gap to fill.
+
+diff --git a/server/src/db.zig b/server/src/db.zig
+index 3870737..bc796c5 100644
+--- a/server/src/db.zig
++++ b/server/src/db.zig
+@@ -322,14 +322,36 @@ fn encodeParam(o: *pg.Out, p: Param) void {
+ 
+ /// Fills every connection that has room with new Sync groups, encoded into its pending bytes.
+ pub fn pump() void {
+-    for (conns) |*c| {
+-        const limit: u8 = if (c.write) 1 else cfg.depth;
+-        while (c.in_len < limit) {
+-            const g = (if (c.write) buildWrite() else buildRead()) orelse break;
+-            encodeGroup(&c.pending, g);
+-            c.pushGroup(g);
+-        }
++    for (conns) |*c| _ = fill(c, 0);
++}
++
++/// Encodes new Sync groups into the connection's pending bytes while it has room, counting `done` groups whose
++/// results already arrived as gone. Returns whether it added any.
++fn fill(c: *Conn, done: u8) bool {
++    const limit: u8 = if (c.write) 1 else cfg.depth;
++    var added = false;
++    while (c.in_len - done < limit) {
++        const g = (if (c.write) buildWrite() else buildRead()) orelse break;
++        encodeGroup(&c.pending, g);
++        c.pushGroup(g);
++        added = true;
++    }
++    return added;
++}
++
++/// Before the received results are rendered, gives the read connection its next groups for the ones whose
++/// ReadyForQuery already arrived, so Postgres starts on them while this worker renders. Returns whether it added any.
++pub fn refill(c: *Conn) bool {
++    if (c.write) return false;
++    var done: u8 = 0;
++    var at = c.rstart;
++    while (c.rend - at >= 5) {
++        const len: usize = @intCast(std.mem.readInt(i32, c.rbuf[at + 1 ..][0..4], .big));
++        if (c.rend - at < 1 + len) break;
++        if (c.rbuf[at] == 'Z') done += 1;
++        at += 1 + len;
+     }
++    return done > 0 and fill(c, done);
+ }
+ 
+ // ---------------------------------------------------------------- results
+diff --git a/server/src/loop.zig b/server/src/loop.zig
+index 7a50f37..d14a21a 100644
+--- a/server/src/loop.zig
++++ b/server/src/loop.zig
+@@ -285,6 +285,11 @@ fn armPgRecv(c: *db.Conn) void {
+ fn onPgRecv(c: *db.Conn, cqe: *const linux.io_uring_cqe) void {
+     if (cqe.res <= 0) sys.fatal("postgres connection {d} lost ({d})", .{ c.index, cqe.res });
+     c.rend += @intCast(cqe.res);
++    // A send still in flight carries the new groups when it completes; only an idle connection is worth a submit.
++    if (!c.in_send and db.refill(c)) {
++        flushPg(c);
++        _ = ring.submit() catch |e| sys.fatal("io_uring submit: {s}", .{@errorName(e)});
++    }
+     db.onRecv(c);
+     armPgRecv(c);
+ }

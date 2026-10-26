@@ -1,0 +1,20 @@
+Lever: one worker at 8 CPUs (steal report row 2, sizing): 1 worker x (6 read + 1 write) connections instead of 4 x
+(2 + 1). Base: 5a6ee6c (before the gather queue).
+
+Measured (sz on t3, uncapped, 42,000 users, 2 rounds, paired against HEAD in the same round, µs/request):
+  total +11 [-4, +26], PG +12, event loop -4.0; p99 297 ms in round 1 (HEAD 70 ms)
+Not taken: one event loop is cheaper per request but Postgres costs more and the tail grows; at 250k users one
+loop would need ~1 core on its own (inferred from ~15 µs/req at ~66k req/s). w2 (2 x (3 + 1)) won in the same
+queue: -10 [-16, -4].
+
+--- a/server/src/main.zig	2026-10-24 12:02:18.846612850 +0000
++++ b/server/src/main.zig	2026-10-24 12:02:18.848612812 +0000
+@@ -23,7 +23,7 @@
+ /// Postgres connections in total stay near #7's 3/4 of the cores for reads; each worker has at least one read and
+ /// one write connection.
+ fn sizing(cpus: usize) Sizing {
+-    const workers = @max(1, cpus / 2);
++    const workers = 1;
+     const reads = @max(1, std.math.divCeil(usize, (3 * cpus + 3) / 4, workers) catch 1);
+     return .{
+         .workers = workers,

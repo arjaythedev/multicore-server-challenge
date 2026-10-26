@@ -1,0 +1,1 @@
+SELECT id, username, email, bio, image FROM users WHERE id = $1

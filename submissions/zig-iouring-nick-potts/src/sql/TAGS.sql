@@ -1,0 +1,1 @@
+SELECT ARRAY(SELECT name FROM tags ORDER BY name)

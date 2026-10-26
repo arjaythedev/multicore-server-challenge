@@ -1,0 +1,1 @@
+SELECT id, username, email, bio, image, password_hash FROM users WHERE email = $1

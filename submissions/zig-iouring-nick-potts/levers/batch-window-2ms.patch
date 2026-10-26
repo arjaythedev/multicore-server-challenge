@@ -1,0 +1,157 @@
+Lever: shorter read batch windows under the old cost budget (steal report row 15, first try): reads wait 500 µs or
+2 ms for company, still capped at an estimated 3 ms of Postgres per group. Base: 5a6ee6c. This file is the 2 ms
+arm; the 500 µs arm differs only in the constant.
+
+Measured (lv2 on t1, cap 3, 42,000 users, paired against HEAD in the same round, µs/request from monitor.sh):
+  2 ms:   round 1 -38 (PG -34), round 2 -6 (PG -5; instructions -61k per request): -22 [-38, -6]
+  500 µs: round 1 -80 (PG -67; HEAD ran first after the target's reboot); round 2 under the per-cgroup perf
+          counters, left out
+Superseded by the gather queue (825c365: one queue, a 5 ms clock, no cost budget, depth 1), which measured
+-22.5 [-24, -21] with 2 pairs on t5 and is the shape sql-proto measured.
+
+diff --git a/server/src/api.zig b/server/src/api.zig
+index 8568717..cf06e34 100644
+--- a/server/src/api.zig
++++ b/server/src/api.zig
+@@ -25,6 +25,8 @@ pub const Req = struct {
+     // Owned by db while queued or executing.
+     next: ?*Req = null,
+     seq: u64 = 0,
++    /// When it was queued (monotonic ns).
++    queued_ns: u64 = 0,
+     solo: bool = false,
+     stmt: Stmt = .tags,
+     params: [6]db.Param = undefined,
+diff --git a/server/src/db.zig b/server/src/db.zig
+index 3870737..3a85ad4 100644
+--- a/server/src/db.zig
++++ b/server/src/db.zig
+@@ -3,8 +3,8 @@
+ //! Every queued request waits in its statement's FIFO. When a connection has room (fewer than `depth` Sync groups
+ //! in flight), it takes work oldest-first into one Sync group: same-statement requests become one batched
+ //! execution (`unnest ... CROSS JOIN LATERAL`, rows tagged with the request ordinal), tag reads already waiting
+-//! share one execution, and everything rides one Sync. No timer: batches are whatever queued up while the
+-//! connections were busy, so they grow with load.
++//! share one execution, and everything rides one Sync. Reads wait for company: a group is built only once the oldest
++//! queued read has waited `window_ns` or a full budget's worth is queued, so batches grow at moderate load too.
+ //!
+ //! Writes go to their own connections. All writes in a group run in the group's one implicit transaction and are
+ //! answered only after its ReadyForQuery, so the commit is durable before any response (group commit). A failed
+@@ -31,6 +31,8 @@ pub const Config = struct {
+     /// Estimated Postgres µs per Sync group of reads; a free connection stops taking work past this.
+     budget_us: u32 = 3000,
+     batch_cap: u16 = 64,
++    /// How long the oldest queued read may wait for others to join its group.
++    window_ns: u64 = 2_000_000,
+ };
+ 
+ pub var cfg: Config = .{};
+@@ -60,6 +62,8 @@ const Queue = struct {
+ var reads: [sql.count]Queue = @splat(.{});
+ var writes: Queue = .{};
+ var seq: u64 = 0;
++/// Monotonic ns at the start of the loop iteration.
++pub var now_ns: u64 = 0;
+ 
+ /// Rough Postgres cost per request (µs), from #7's per-statement pgbench in phase0.
+ const cost_us = blk: {
+@@ -82,6 +86,7 @@ const cost_us = blk: {
+ pub fn enqueue(r: *Req) void {
+     seq += 1;
+     r.seq = seq;
++    r.queued_ns = now_ns;
+     if (r.stmt.def().write) writes.push(r) else reads[@intFromEnum(r.stmt)].push(r);
+ }
+ 
+@@ -320,16 +325,29 @@ fn encodeParam(o: *pg.Out, p: Param) void {
+     }
+ }
+ 
+-/// Fills every connection that has room with new Sync groups, encoded into its pending bytes.
+-pub fn pump() void {
++/// Fills every connection that has room with new Sync groups, encoded into its pending bytes. Returns when the
++/// reads it held back are due (monotonic ns), if it held any.
++pub fn pump() ?u64 {
+     for (conns) |*c| {
+         const limit: u8 = if (c.write) 1 else cfg.depth;
+         while (c.in_len < limit) {
++            if (!c.write and readsDue() != null) break;
+             const g = (if (c.write) buildWrite() else buildRead()) orelse break;
+             encodeGroup(&c.pending, g);
+             c.pushGroup(g);
+         }
+     }
++    return readsDue();
++}
++
++/// When the queued reads should go out, or null if they may go now (or none are queued).
++fn readsDue() ?u64 {
++    const s = oldestRead() orelse return null;
++    const due = reads[@intFromEnum(s)].head.?.queued_ns + cfg.window_ns;
++    if (due <= now_ns) return null;
++    var cost: u32 = 0;
++    for (&reads, 0..) |*q, i| cost += cost_us[i] * q.len;
++    return if (cost >= cfg.budget_us) null else due;
+ }
+ 
+ // ---------------------------------------------------------------- results
+diff --git a/server/src/loop.zig b/server/src/loop.zig
+index 7a50f37..bb8ec08 100644
+--- a/server/src/loop.zig
++++ b/server/src/loop.zig
+@@ -7,7 +7,7 @@
+ //! time, so pipelined requests are answered in order. A response leaves in one send from the buffer it was built in.
+ //!
+ //! Each iteration handles every completion that is ready, then fills the Postgres connections (db.pump) and sends
+-//! what they queued, so the batches are whatever accumulated during one iteration.
++//! what they queued. While db holds reads back for its batch window, the wait ends when they are due.
+ const std = @import("std");
+ const linux = std.os.linux;
+ const IoUring = linux.IoUring;
+@@ -80,18 +80,17 @@ pub fn run(fd: i32) noreturn {
+     armBcrypt();
+ 
+     var cqes: [512]linux.io_uring_cqe = undefined;
++    var due: ?u64 = null;
+     while (true) {
+-        _ = ring.submit_and_wait(1) catch |e| switch (e) {
+-            error.SignalInterrupt => continue,
+-            else => sys.fatal("io_uring enter: {s}", .{@errorName(e)}),
+-        };
++        wait(due);
+         now = sys.nowSec();
++        db.now_ns = sys.monoNs();
+         while (true) {
+             const n = ring.copy_cqes(&cqes, 0) catch |e| sys.fatal("io_uring cqes: {s}", .{@errorName(e)});
+             if (n == 0) break;
+             for (cqes[0..n]) |*c| complete(c);
+         }
+-        db.pump();
++        due = db.pump();
+         for (db.conns) |*c| flushPg(c);
+         for (returned.items) |bid| {
+             const s = sqe();
+@@ -105,6 +104,23 @@ pub fn run(fd: i32) noreturn {
+     }
+ }
+ 
++/// Waits for the first completion, or until `due` (monotonic ns) if that comes first.
++fn wait(due: ?u64) void {
++    const to_submit = ring.flush_sq();
++    const rc = if (due) |d| blk: {
++        const left = d -| sys.monoNs();
++        var ts: linux.kernel_timespec = .{ .sec = @intCast(left / std.time.ns_per_s), .nsec = @intCast(left % std.time.ns_per_s) };
++        var arg: linux.io_uring_getevents_arg = .{ .sigmask = 0, .sigmask_sz = 0, .pad = 0, .ts = @intFromPtr(&ts) };
++        break :blk linux.syscall6(.io_uring_enter, @as(u32, @bitCast(ring.fd)), to_submit, 1,
++            linux.IORING_ENTER_GETEVENTS | linux.IORING_ENTER_EXT_ARG, @intFromPtr(&arg), @sizeOf(linux.io_uring_getevents_arg));
++    } else linux.io_uring_enter(ring.fd, to_submit, 1, linux.IORING_ENTER_GETEVENTS, null);
++    switch (linux.errno(rc)) {
++        // A timeout or a signal only ends the wait early.
++        .SUCCESS, .TIME, .INTR => {},
++        else => |e| sys.fatal("io_uring enter: {s}", .{@tagName(e)}),
++    }
++}
++
+ fn complete(cqe: *const linux.io_uring_cqe) void {
+     const tag_bits: u3 = @truncate(cqe.user_data);
+     if (tag_bits == 0) {

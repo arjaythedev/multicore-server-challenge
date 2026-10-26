@@ -1,0 +1,1 @@
+SELECT q.*, r.ord::bigint AS __request_id FROM unnest($1::text[]) WITH ORDINALITY AS r(p1,ord) CROSS JOIN LATERAL (SELECT id, username, email, bio, image, password_hash FROM users WHERE email = r.p1) q
