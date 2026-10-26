@@ -2,33 +2,27 @@ const std = @import("std");
 const zix = @import("zix");
 const builtin = @import("builtin");
 
+const app = @import("app.zig");
+const config = @import("config.zig");
+const db = @import("db.zig");
+
 const api_users = @import("handlers/api_users.zig");
 const api_users_login = @import("handlers/api_users_login.zig");
 const api_user = @import("handlers/api_user.zig");
-
-const api_profiles_username = @import("handlers/api_profiles_username.zig");
-const api_profiles_username_follow = @import("handlers/api_profiles_username_follow.zig");
+const api_tags = @import("handlers/api_tags.zig");
 
 // --------------------------------------------------------- //
 
-const IP = if (builtin.mode == .debug) "127.0.0.1" else "0.0.0.0";
-const PORT: u16 = if (builtin.mode == .debug) 3000 else 80;
 const DEFAULT_CPU: usize = 8;
 const DIR_LOG_PATH: []const u8 = "./logs";
 const ALLOW_DEBUG = builtin.mode == .debug;
 
 // --------------------------------------------------------- //
 
-fn createLogDir(io: std.Io, force_fail: bool) void {
-    var err: bool = false;
-    std.Io.Dir.cwd().createDirPath(io, DIR_LOG_PATH) catch |e| {
-        std.debug.print("ERROR: create log dir path {any}\n", .{e});
-    err = true;
+fn createLogDir(io: std.Io) void {
+    std.Io.Dir.cwd().createDirPath(io, DIR_LOG_PATH) catch |err| {
+        std.debug.print("ERROR: create log dir path {any}\n", .{err});
     };
-
-    if (err and force_fail) {
-        return;
-    }
 }
 
 // --------------------------------------------------------- //
@@ -48,28 +42,39 @@ const Routes = zix.Http1.Router(&[_]zix.Http1.Route{
         .handler = api_user.RESPONSE,
     },
     // Profiles
-    .{
-        .path = api_profiles_username.PATH,
-        .handler = api_profiles_username.RESPONSE,
-        .kind = .PARAM,
-    },
-    .{
-        .path = api_profiles_username_follow.PATH,
-        .handler = api_profiles_username_follow.RESPONSE,
-        .kind = .PARAM,
-    },
     // Articles
     // Favorites
     // Comments
     // Tags
+    .{
+        .path = api_tags.PATH,
+        .handler = api_tags.RESPONSE,
+    },
 });
 
+// --------------------------------------------------------- //
+
 pub fn main(init: std.process.Init) !void {
-    std.debug.print("zix entry: conduit\n", .{});
+    // Debug runs stay on the loopback port, release falls back to the box
+    // contract. The environment always wins.
+    const defaults = config.Defaults{
+        .host = if (builtin.mode == .debug) "127.0.0.1" else "0.0.0.0",
+        .port = if (builtin.mode == .debug) "3000" else "80",
+    };
+
+    const cfg = config.load(init.environ_map, defaults) catch |err| {
+        std.debug.print("conduit: configuration error: {s}\n", .{@errorName(err)});
+
+        return err;
+    };
+
+    app.init(cfg);
+    try db.init(cfg.database_url, init.io);
+
     const cpus = std.Thread.getCpuCount() catch DEFAULT_CPU;
     const park_len = @max(512, 16 * 1024 / cpus);
 
-    createLogDir(init.io, true);
+    createLogDir(init.io);
 
     var allocator_logger = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
     defer allocator_logger.deinit();
@@ -77,14 +82,14 @@ pub fn main(init: std.process.Init) !void {
         .save_path = DIR_LOG_PATH,
         .save_file = "conduit",
         .save_min_level = .INFO,
-        .console = if(ALLOW_DEBUG) .ALWAYS else .OFF,
+        .console = if (ALLOW_DEBUG) .ALWAYS else .OFF,
     });
     defer logger.deinit();
 
     var server = zix.Http1.Server.init(Routes.dispatch, .{
         .io = init.io,
-        .ip = IP,
-        .port = PORT,
+        .ip = cfg.host,
+        .port = cfg.port,
         .logger = &logger,
         //
         .workers = 0,
@@ -109,6 +114,8 @@ pub fn main(init: std.process.Init) !void {
         .process_queue_len = park_len,
     });
     defer server.deinit();
+
+    std.debug.print("conduit: listening on {s}:{d}\n", .{ cfg.host, cfg.port });
 
     try server.run();
 }
