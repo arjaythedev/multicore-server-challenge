@@ -130,3 +130,10 @@ fixed seeded inputs in one backend and read its CPU from /proc: SQL shape A/B wi
   batched article or profile read answers each request, all in one transaction on a write connection. If the
   batch fails, each request runs again alone (the old path). 189.5 / 190.4 / 188.3 vs 207.1 / 196.2 us/req;
   write connections 0.349 -> 0.217 cores. Conformance 197/197 (dev, seed), responses identical. Kept.
+- **27 high load with group commit**: 12,000 users, 29.5k req/s, 177.3 us/req, p95 84 ms (was 184.0, p95 96).
+- **28 group commit for new comments**: `INSERT ... RETURNING` cannot name the request, so the new rows are matched
+  back by (author, article, body) and their rank among identical ones (identical posts get distinct comments).
+  189.4 / 184.0 vs 196.8 / 198.8 with `COMMENT_BATCH=0`. Conformance 197/197. Kept.
+- **29 feed in one walk** (replay): the followees' article ids once (capped at 1000) for both count and page:
+  433-442 vs 375-425 us. The per-followee probes are cheaper than sorting the whole set. Discarded.
+- **Candidate (e19)**: 185.2 us/req (app 65.4, PG 121.2), p95 37.3 ms, 0 errors; overload PASS. Committed.

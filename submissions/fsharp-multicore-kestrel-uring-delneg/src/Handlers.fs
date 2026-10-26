@@ -306,6 +306,21 @@ let batchRow (c: Ctx) (r: PgRow) =
         if not c.Found then
             user w r 1 c.Token
             c.Found <- true
+    | Route.CreateComment ->
+        if not c.Found then
+            c.Status <- 201
+            w.WriteStartObject()
+            w.WritePropertyName N.comment
+            w.WriteStartObject()
+            w.WriteNumber(N.id, r.Int8 1)
+            time w N.createdAt (r.Micros 3)
+            time w N.updatedAt (r.Micros 4)
+            text w N.body r 2
+            w.WritePropertyName N.author
+            profile w r 5 0
+            w.WriteEndObject()
+            w.WriteEndObject()
+            c.Found <- true
     | _ ->
         // lists: (i, count, article columns or NULLs for an empty page)
         if not c.Found then
@@ -320,7 +335,7 @@ let batchRow (c: Ctx) (r: PgRow) =
 let mutable private retryAlone: Ctx -> unit = ignore
 
 let private batchedWrite (r: Route) =
-    r = Route.Favorite || r = Route.Unfavorite || r = Route.Follow || r = Route.Unfollow
+    r = Route.Favorite || r = Route.Unfavorite || r = Route.Follow || r = Route.Unfollow || r = Route.CreateComment
 
 let batchDone (c: Ctx) (err: PgError) =
     if not (isNull err) && batchedWrite c.Route then
@@ -337,7 +352,8 @@ let batchDone (c: Ctx) (err: PgError) =
         | Route.Tags -> if not c.Found then c.Error(500, "no tags row")
         | Route.Article
         | Route.Favorite
-        | Route.Unfavorite -> if not c.Found then c.Error(404, "article not found")
+        | Route.Unfavorite
+        | Route.CreateComment -> if not c.Found then c.Error(404, "article not found")
         | Route.Comments ->
             if not c.Found then c.Error(404, "article not found")
             else
@@ -674,7 +690,8 @@ let private createComment (c: Ctx) (slug: ReadOnlySpan<byte>) (body: ReadOnlySpa
     if isNull b || not (b.Required("body", &text)) then unprocessable c "body is required"
     else
         c.S1 <- text
-        writeSingleRoute c Route.CreateComment slug
+        if Sql.CommentBatch then read c Route.CreateComment Sql.CommentW slug
+        else writeSingleRoute c Route.CreateComment slug
 
 let private register (c: Ctx) (body: ReadOnlySpan<byte>) =
     let msg = "username, email and password are required"

@@ -19,6 +19,7 @@ type Layout =
     | Viewer = 2 // (viewer bigint)
     | List = 3 // (viewer bigint, limit int, offset bigint)
     | ListKey = 4 // (viewer bigint, limit int, offset bigint, key text)
+    | ViewerKeyText = 5 // (viewer bigint, key text, text): new comments
 
 /// A kind of batched read: its statement, parameter layout and limits.
 type Kind(id: int, name: string, stmt: Stmt, layout: Layout) =
@@ -93,6 +94,7 @@ let private unnest (l: Layout) =
     | Layout.Viewer -> "unnest($1::int4[], $2::int8[]) AS r(i, v)"
     | Layout.ViewerKey -> "unnest($1::int4[], $2::int8[], $3::text[]) AS r(i, v, k)"
     | Layout.List -> "unnest($1::int4[], $2::int8[], $3::int4[], $4::int8[]) AS r(i, v, l, o)"
+    | Layout.ViewerKeyText -> "unnest($1::int4[], $2::int8[], $3::text[], $4::text[]) AS r(i, v, k, b)"
     | _ -> "unnest($1::int4[], $2::int8[], $3::int4[], $4::int8[], $5::text[]) AS r(i, v, l, o, k)"
 
 let private oids (l: Layout) : uint32[] =
@@ -101,6 +103,7 @@ let private oids (l: Layout) : uint32[] =
     | Layout.Viewer -> [| Oid.Int4Array; Oid.Int8Array |]
     | Layout.ViewerKey -> [| Oid.Int4Array; Oid.Int8Array; Oid.TextArray |]
     | Layout.List -> [| Oid.Int4Array; Oid.Int8Array; Oid.Int4Array; Oid.Int8Array |]
+    | Layout.ViewerKeyText -> [| Oid.Int4Array; Oid.Int8Array; Oid.TextArray; Oid.TextArray |]
     | _ -> [| Oid.Int4Array; Oid.Int8Array; Oid.Int4Array; Oid.Int8Array; Oid.TextArray |]
 
 let private paramRef = Regex(@"\$(\d+)")
@@ -347,8 +350,11 @@ let mutable FavoriteW: Kind = Unchecked.defaultof<_>
 let mutable UnfavoriteW: Kind = Unchecked.defaultof<_>
 let mutable FollowW: Kind = Unchecked.defaultof<_>
 let mutable UnfollowW: Kind = Unchecked.defaultof<_>
+let mutable CommentW: Kind = Unchecked.defaultof<_>
 /// favorites and follows go through the write kinds (WRITE_BATCH, default on)
 let mutable WriteBatch = false
+/// new comments go through CommentW (COMMENT_BATCH, default on with WRITE_BATCH)
+let mutable CommentBatch = false
 
 let mutable ArticleBySlug: Stmt = null
 let mutable ArticleInsert: Stmt = null
@@ -408,6 +414,27 @@ let define () =
         UnfollowW <-
             writeKind "unfollow" ("DELETE FROM follows fo USING (SELECT r.v, u.id" + r
                                   + " JOIN users u ON u.username = r.k) x WHERE fo.follower_id = x.v AND fo.followee_id = x.id") Profile
+        // new comments: RETURNING cannot name the request, so each new row is matched back to its request by
+        // (author, article, body) and its rank among identical ones (identical requests get distinct comments)
+        if Environment.GetEnvironmentVariable "COMMENT_BATCH" <> "0" then
+            CommentW <-
+                addKind
+                    "comment"
+                    (Stmt.Define(
+                        "WITH r AS MATERIALIZED (SELECT r.i, r.v, r.b, a.id AS aid FROM " + unnest Layout.ViewerKeyText
+                        + " JOIN articles a ON a.slug = r.k), "
+                        + "c AS (INSERT INTO comments (article_id, author_id, body) SELECT aid, v, b FROM r ORDER BY i "
+                        + "RETURNING id, article_id, author_id, body, created_at, updated_at) "
+                        + "SELECT r.i, c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image "
+                        + "FROM (SELECT r.*, row_number() OVER (PARTITION BY r.v, r.aid, r.b ORDER BY r.i) AS n FROM r) r "
+                        + "JOIN (SELECT c.*, row_number() OVER (PARTITION BY c.author_id, c.article_id, c.body ORDER BY c.id) AS n FROM c) c "
+                        + "ON c.author_id = r.v AND c.article_id = r.aid AND c.body = r.b AND c.n = r.n "
+                        + "JOIN users u ON u.id = r.v",
+                        oids Layout.ViewerKeyText
+                    ))
+                    Layout.ViewerKeyText
+            CommentW.Write <- true
+            CommentBatch <- true
         WriteBatch <- true
     let at = articleTail ()
     let shared = Environment.GetEnvironmentVariable "LIST_SHARED" = "1"

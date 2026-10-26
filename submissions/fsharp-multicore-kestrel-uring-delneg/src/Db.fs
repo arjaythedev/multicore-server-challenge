@@ -235,9 +235,13 @@ type BatchQuery(k: Sql.Kind, release: BatchQuery -> unit) =
             w.BeginArray Oid.Int8
             for i in 0 .. n - 1 do w.Int8 items.[i].Offset
             w.EndArray n
-        if l = Sql.Layout.ViewerKey || l = Sql.Layout.ListKey then
+        if l = Sql.Layout.ViewerKey || l = Sql.Layout.ListKey || l = Sql.Layout.ViewerKeyText then
             w.BeginArray Oid.Text
             for i in 0 .. n - 1 do w.Text items.[i].Key
+            w.EndArray n
+        if l = Sql.Layout.ViewerKeyText then
+            w.BeginArray Oid.Text
+            for i in 0 .. n - 1 do w.Text items.[i].S1
             w.EndArray n
     override b.Row(_, row) =
         if packing then packer.Row row
