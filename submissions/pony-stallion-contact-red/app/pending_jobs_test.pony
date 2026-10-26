@@ -27,6 +27,7 @@ class \nodoc\ _PendingJobsTest
   new create(env: Env) ? =>
     _env = env
     _recipient = _Recipient(_PendingClient)
+    _TagScanTest(env)?
     var width: USize = 1
     for length in Range[USize](0, 8) do
       for history in Range[USize](0, width) do

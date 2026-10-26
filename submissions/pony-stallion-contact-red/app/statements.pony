@@ -45,6 +45,35 @@ primitive _CommentDelete
 primitive _Rollback
 
 primitive _Catalog
+  fun tag_scan_safe(statement: _RequestStatement,
+    params: Array[_Param] val): Bool
+  =>
+    let shape: (USize, USize) = match statement
+      | _CurrentUser => (1, 0)
+      | _Profile | _ArticleFullBySlug | _CommentsBySlug => (1, 1)
+      | _ArticleFullById => (2, 0)
+      | _ArticlePageAll | _ArticlePageFeed => (3, 0)
+      | _ArticlePageTag | _ArticlePageAuthor | _ArticlePageFavorited => (3, 1)
+      else return false
+      end
+    if params.size() != (shape._1 + shape._2) then return false end
+    var index: USize = 0
+    for param in params.values() do
+      if index < shape._1 then
+        match param
+        | let _: I64 => None
+        else return false
+        end
+      else
+        match param
+        | let _: String => None
+        else return false
+        end
+      end
+      index = index + 1
+    end
+    true
+
   fun kind(statement: _RequestStatement): USize =>
     match statement
     | _Tags => 0

@@ -1,15 +1,9 @@
 class _TagFollowers
   embed _jobs: Array[_Job] = Array[_Job]
 
-  new create(pending: _PendingJobs ref, limit: USize) =>
-    var remaining = limit
-    while (remaining > 0) and (pending.size() > 0) do
-      try
-        if not pending.front()?.is_tags() then break end
-        _jobs.push(pending.shift()?)
-        remaining = remaining - 1
-      else _Unreachable() end
-    end
+  new create(first: _Job ref) => _jobs.push(first)
+
+  fun ref push(job: _Job ref) => _jobs.push(job)
 
   fun size(): USize => _jobs.size()
 

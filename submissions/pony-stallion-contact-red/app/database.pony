@@ -44,25 +44,29 @@ class _Job
   let query: _QueuedQuery
   let kind: USize
   let enqueued: U64
+  let scan_read: Bool
   var started: U64 = 0
   var _next: (_Job ref | None) = None
 
   new create(recipient': _Recipient, id': U64, query': _QueuedQuery,
-    kind': USize, enqueued': U64)
+    kind': USize, enqueued': U64, scan_read': Bool = false)
   =>
     recipient = recipient'
     id = id'
     query = query'
     kind = kind'
     enqueued = enqueued'
+    scan_read = scan_read'
 
   fun is_tags(): Bool => query is _TagsQuery
 
-  fun ref _pending_link(next': _Job ref) => _next = next'
+  fun ref _pending_link(next': (_Job ref | None)) => _next = next'
 
   fun ref _pending_take_next(): (_Job ref | None) => _next = None
 
   fun _pending_next(): (_Job box | None) => _next
+
+  fun ref _pending_next_ref(): (_Job ref | None) => _next
 
 trait ref _SlotPhase
   fun connection(): (_PGConnection box | None)
@@ -493,10 +497,10 @@ actor _Worker is (AsioEventNotify & _PGOwner)
         let slot = _slots(_idle.pop()?)?
         var followers: (_TagFollowers ref | None) = None
         if job.is_tags() and (budget > 0) and (_pending.size() > 0) then
-          if _pending.front()?.is_tags() then
-            let jobs = _TagFollowers(_pending, budget.min(31))
+          followers = _pending.take_tags(budget.min(31))
+          match followers
+          | let jobs: _TagFollowers =>
             budget = budget - jobs.size()
-            followers = jobs
           end
         end
         let started = _now()
@@ -555,11 +559,12 @@ actor _Worker is (AsioEventNotify & _PGOwner)
     let query': _QueuedQuery =
       if (statement is _Tags) and (params.size() == 0) then _TagsQuery
       else pg.NamedPreparedQuery(_Catalog.name(statement), params) end
-    _enqueue(client, id, query', _Catalog.kind(statement), now)
+    _enqueue(client, id, query', _Catalog.kind(statement), now,
+      _Catalog.tag_scan_safe(statement, params))
     _dispatch()
 
   fun ref _enqueue(client: _QueryClient, id: U64, query': _QueuedQuery,
-    kind: USize, now: U64)
+    kind: USize, now: U64, scan_read: Bool = false)
   =>
     match _password_observer
     | let observer: _PasswordApplicationObserver =>
@@ -572,7 +577,7 @@ actor _Worker is (AsioEventNotify & _PGOwner)
         fresh
       end
     recipient.outstanding = recipient.outstanding + 1
-    _pending.push(_Job(recipient, id, query', kind, now))
+    _pending.push(_Job(recipient, id, query', kind, now, scan_read))
     _count(0)
     _pending_peak = _pending_peak.max(_pending.size().u64())
 

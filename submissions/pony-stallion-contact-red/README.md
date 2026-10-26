@@ -63,7 +63,7 @@ On creation, the Client Connection actor is told about a single Database Worker 
 
 A query comes in, the database actor knows the State (Connecting / Authenticating / Idle / Busy etc…) for each connection it is responsible for, so immediately farms the query out right to an idle connection if available.  If all database connections are busy, it queues it.
 
-Up to 32 consecutive tag requests already queued in one database actor share a fresh SQL execution, including its result or failure. Requests keep their individual cancellation attachments. Dispatch does not wait for a batch, and later arrivals cannot join an executing query or reuse its completed result. Worker request counters and duration histograms count each request; the busy-connection count counts physical connections.
+Up to 32 tag requests already queued in one database actor share a fresh SQL execution, including its result or failure. After selecting the oldest tag request, dispatch scans up to 31 queued entries for other tag requests, passing approved endpoint reads and stopping at writes, mutation-precondition reads, login queries, or unsupported parameter shapes. Unselected requests retain their relative order; selected tags can execute ahead of reads they pass. Requests keep their individual cancellation attachments. Dispatch does not wait for a batch, and later arrivals cannot join an executing query or reuse its completed result. Worker request counters and duration histograms count each request; the busy-connection count counts physical connections.
 
 If a database worker loses a connection, or has a connection error out - it disconnects it and reconnects it.
 

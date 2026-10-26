@@ -1286,6 +1286,96 @@ class Integration(unittest.TestCase):
                 self.assertEqual(diagnostic["counters"][:9],
                                  [65, 65, 65, 0, 0, 65, 0, 2, 63])
 
+    def test_pool_tags_read_scan(self):
+        with self.pool_run(1) as run:
+            holder = self.tag_holder(run)
+            expected = self.tag_snapshot(run)
+            run.send("tags 1 0", "user 2 1", "tags 3 2", "user 4 1", "tags 5 0")
+            run.wait_state(lambda s: s["queued"] == [1, 2, 3, 4, 5])
+            tags = run.proxy.hold_frame(b"Z", 0, timeout=120)
+            holder.release.set()
+            run.result(90000, client=3)
+            run.reached(tags)
+            state = run.wait_state(lambda s: [0, 1, 1] in s["active"])
+            self.assertEqual(state["active"], [[0, 1, 1], [0, 3, 1], [0, 5, 1]])
+            self.assertEqual(state["queued"], [2, 4])
+            self.assertEqual(state["outstanding"], 5)
+            self.assertEqual(state["recipients"], 3)
+            self.assertEqual(self.routing_binds(run.proxy), [[b"current_user", b"tags"]])
+            self.assertEqual(run.fence(), {0: 0, 1: 0, 2: 0, 3: 1})
+            first_read = run.proxy.hold_frame(b"Z", 0, timeout=120)
+            tags.release.set()
+            for id, client in ((1, 0), (3, 2), (5, 0)):
+                self.assertEqual(json.loads(run.result(id, client=client)["payload"])["tags"], expected)
+            run.reached(first_read)
+            state = run.wait_state(lambda s: [0, 2, 1] in s["active"])
+            self.assertEqual(state["active"], [[0, 2, 1]])
+            self.assertEqual(state["queued"], [4])
+            last_read = run.proxy.hold_frame(b"Z", 0, timeout=120)
+            first_read.release.set()
+            run.result(2, client=1)
+            run.reached(last_read)
+            state = run.wait_state(lambda s: [0, 4, 1] in s["active"])
+            self.assertEqual(state["active"], [[0, 4, 1]])
+            self.assertEqual(state["queued"], [])
+            last_read.release.set()
+            run.result(4, client=1)
+            self.assert_pool_drained(run)
+            self.assertEqual(self.routing_binds(run.proxy),
+                             [[b"current_user", b"tags", b"current_user", b"current_user"]])
+            self.assertEqual(run.fence(), {0: 2, 1: 2, 2: 1, 3: 1})
+
+    def test_pool_tags_read_scan_cancellation(self):
+        for phase in ("queued", "active"):
+            with self.subTest(phase=phase), self.pool_run(1) as run:
+                holder = self.tag_holder(run)
+                expected = self.tag_snapshot(run)
+                run.send("tags 1 0", "user 2 1", "tags 3 2")
+                run.wait_state(lambda s: s["queued"] == [1, 2, 3])
+                if phase == "queued":
+                    run.send("cancel 1", "cancel 2")
+                    run.state()
+                tags = run.proxy.hold_frame(b"Z", 0, timeout=120)
+                holder.release.set()
+                run.result(90000, client=3)
+                run.reached(tags)
+                state = run.wait_state(lambda s: [0, 1, 1] in s["active"])
+                self.assertEqual(state["active"], [[0, 1, 1], [0, 3, 1]])
+                self.assertEqual(state["queued"], [2])
+                self.assertEqual(state["outstanding"], 3)
+                if phase == "active":
+                    run.send("cancel 1", "cancel 2")
+                    state = run.state()
+                self.assertEqual(state["recipients"], 1)
+                run.send("tags 4 2", "tags 5 1")
+                state = run.state()
+                self.assertEqual(state["active"], [[0, 1, 1], [0, 3, 1]])
+                self.assertEqual(state["queued"], [2, 4, 5])
+                self.assertEqual(state["outstanding"], 5)
+                self.assertEqual(state["recipients"], 3)
+                self.assertEqual(run.fence(), {0: 0, 1: 0, 2: 0, 3: 1})
+                read = run.proxy.hold_frame(b"Z", 0, timeout=120)
+                tags.release.set()
+                self.assertEqual(json.loads(run.result(1, client=0)["payload"])["tags"], expected)
+                run.reached(read)
+                state = run.wait_state(lambda s: [0, 2, 1] in s["active"])
+                self.assertEqual(state["active"], [[0, 2, 1]])
+                self.assertEqual(state["queued"], [4, 5])
+                self.assertEqual(run.fence(), {0: 1, 1: 0, 2: 0, 3: 1})
+                fresh = run.proxy.hold_frame(b"Z", 0, timeout=120)
+                read.release.set()
+                run.reached(fresh)
+                state = run.wait_state(lambda s: [0, 4, 1] in s["active"])
+                self.assertEqual(state["active"], [[0, 4, 1], [0, 5, 1]])
+                self.assertEqual(state["queued"], [])
+                self.assertEqual(self.routing_binds(run.proxy),
+                                 [[b"current_user", b"tags", b"current_user", b"tags"]])
+                fresh.release.set()
+                for id, client in ((4, 2), (5, 1)):
+                    self.assertEqual(json.loads(run.result(id, client=client)["payload"])["tags"], expected)
+                self.assert_pool_drained(run)
+                self.assertEqual(run.fence(), {0: 1, 1: 1, 2: 1, 3: 1})
+
     def test_pool_tags_compatibility_preserves_fifo(self):
         for barrier, sql_name, kind in (("user", b"current_user", "ok"),
                 ("register", b"register_user", "ok"),
@@ -1298,8 +1388,11 @@ class Integration(unittest.TestCase):
                     commands = ([command, "tags 4 0", "tags 5 1"] if leading else
                                 ["tags 1 0", "tags 2 1", command, "tags 4 0", "tags 5 1"])
                     groups = ([[3], [4, 5]] if leading else [[1, 2], [3], [4, 5]])
+                    queued = sum(groups, [])
+                    if barrier == "user":
+                        groups = [[1, 2, 4, 5], [3]]
                     run.send(*commands)
-                    run.wait_state(lambda s: s["queued"] == sum(groups, []))
+                    run.wait_state(lambda s: s["queued"] == queued)
                     previous = holder
                     for index, ids in enumerate(groups):
                         gate = run.proxy.hold_frame(b"Z", 0, timeout=120)
@@ -1315,9 +1408,11 @@ class Integration(unittest.TestCase):
                     for id in sum(groups, []):
                         run.result(id, kind if id == 3 else "ok",
                                    client=2 if id == 3 else (0 if id in (1, 4) else 1))
-                    self.assertEqual(self.routing_binds(run.proxy)[0],
-                                     [b"current_user"] + ([] if leading else [b"tags"])
-                                     + [sql_name, b"tags"])
+                    expected_binds = ([b"current_user", b"tags", b"current_user"]
+                                      if barrier == "user" else
+                                      [b"current_user"] + ([] if leading else [b"tags"])
+                                      + [sql_name, b"tags"])
+                    self.assertEqual(self.routing_binds(run.proxy)[0], expected_binds)
                     if barrier == "register":
                         self.assertEqual(self.db("SELECT count(*) FROM users WHERE username="
                                                  + self.literal(name), run.time_left(30)), "1")
