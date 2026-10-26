@@ -31,20 +31,23 @@ class _Recipient
 primitive _AwaitingResult
 primitive _ReportedDataFailure
 
-type _JobOutcome is
+type _ExecutionOutcome is
   (_AwaitingResult | pg.Result | _DBFailure | _ReportedDataFailure)
+
+primitive _TagsQuery
+
+type _QueuedQuery is (pg.Query | _TagsQuery)
 
 class _Job
   let recipient: _Recipient
   let id: U64
-  let query: pg.Query
+  let query: _QueuedQuery
   let kind: USize
   let enqueued: U64
   var started: U64 = 0
-  var outcome: _JobOutcome = _AwaitingResult
   var _next: (_Job ref | None) = None
 
-  new create(recipient': _Recipient, id': U64, query': pg.Query,
+  new create(recipient': _Recipient, id': U64, query': _QueuedQuery,
     kind': USize, enqueued': U64)
   =>
     recipient = recipient'
@@ -52,6 +55,8 @@ class _Job
     query = query'
     kind = kind'
     enqueued = enqueued'
+
+  fun is_tags(): Bool => query is _TagsQuery
 
   fun ref _pending_link(next': _Job ref) => _next = next'
 
@@ -69,7 +74,8 @@ trait ref _SlotPhase
   fun ref failed(slot: _PoolSlot ref,
     failure: (pg.ErrorResponseMessage | pg.ClientQueryError))
   fun ref complete(slot: _PoolSlot ref, status: pg.TransactionStatus)
-  fun ref dispatch(slot: _PoolSlot ref, job': _Job ref)
+  fun ref dispatch(slot: _PoolSlot ref, job': _Job ref,
+    followers: (_TagFollowers ref | None))
   fun ref retry(slot: _PoolSlot ref, token: _RetryToken)
   fun ref close(slot: _PoolSlot ref)
 
@@ -95,7 +101,8 @@ class _ConnectingSlot is _LiveSlot
     slot.owner.retire(slot)
   fun ref complete(slot: _PoolSlot ref, status: pg.TransactionStatus) =>
     slot.owner.retire(slot)
-  fun ref dispatch(slot: _PoolSlot ref, job': _Job ref) =>
+  fun ref dispatch(slot: _PoolSlot ref, job': _Job ref,
+    followers: (_TagFollowers ref | None)) =>
     _Unreachable()
 
 primitive _PrepareAwaiting
@@ -134,7 +141,8 @@ class _PreparingSlot is _LiveSlot
     slot.owner.retire(slot)
   fun ref result(slot: _PoolSlot ref, value: pg.Result) =>
     slot.owner.retire(slot)
-  fun ref dispatch(slot: _PoolSlot ref, job': _Job ref) =>
+  fun ref dispatch(slot: _PoolSlot ref, job': _Job ref,
+    followers: (_TagFollowers ref | None)) =>
     _Unreachable()
 
 class _IdleSlot is _LiveSlot
@@ -142,9 +150,10 @@ class _IdleSlot is _LiveSlot
   new create(conn': _PGConnection ref) => conn = conn'
   fun connection(): _PGConnection box => conn
   fun code(): U64 => 2
-  fun ref dispatch(slot: _PoolSlot ref, job': _Job ref) =>
-    slot.phase = _BusySlot(this, job')
-    conn.execute(job'.query)
+  fun ref dispatch(slot: _PoolSlot ref, job': _Job ref,
+    followers: (_TagFollowers ref | None)) =>
+    slot.phase = _BusySlot(this, job', followers)
+    conn.execute(slot.owner._query(job'))
 
   fun job(): None => None
   fun ref ready(slot: _PoolSlot ref) =>
@@ -163,57 +172,81 @@ class _BusySlot is _LiveSlot
   let idle: _IdleSlot ref
   let conn: _PGConnection ref
   let active: _Job ref
+  let _followers: (_TagFollowers ref | None)
+  var outcome: _ExecutionOutcome = _AwaitingResult
 
-  new create(idle': _IdleSlot ref, job': _Job ref) =>
+  new create(idle': _IdleSlot ref, job': _Job ref,
+    followers': (_TagFollowers ref | None)) =>
     idle = idle'
     conn = idle'.conn
     active = job'
+    _followers = followers'
 
   fun connection(): _PGConnection box => conn
   fun job(): _Job box => active
   fun code(): U64 => 3
+  fun followers(): (_TagFollowers box | None) => _followers
 
   fun ref result(slot: _PoolSlot ref, value: pg.Result) =>
-    if active.outcome is _AwaitingResult then active.outcome = value
+    if outcome is _AwaitingResult then outcome = value
     else slot.owner.retire(slot) end
 
   fun ref failed(slot: _PoolSlot ref,
     failure: (pg.ErrorResponseMessage | pg.ClientQueryError))
   =>
-    if not (active.outcome is _AwaitingResult) then
+    if not (outcome is _AwaitingResult) then
       slot.owner.retire(slot)
       return
     end
     match failure
     | let server: pg.ErrorResponseMessage =>
-      active.outcome = _SQLFailure(server.code)
+      outcome = _SQLFailure(server.code)
       slot.owner.log_failure(server)
     | pg.DataError =>
-      active.outcome = _ReportedDataFailure
+      outcome = _ReportedDataFailure
       slot.owner.notify_failed(active, _DataFailure)
+      match _followers
+      | let jobs: _TagFollowers =>
+        for member in jobs.jobs() do
+          slot.owner.notify_failed(member, _DataFailure)
+        end
+      end
     else slot.owner.retire(slot)
     end
 
   fun ref complete(slot: _PoolSlot ref, status: pg.TransactionStatus) =>
     if (not (status is pg.TransactionIdle)) or
-      (active.outcome is _AwaitingResult) then
+      (outcome is _AwaitingResult) then
       slot.owner.retire(slot)
       return
     end
-    let missing_statement = match active.outcome
+    let missing_statement = match outcome
       | let failure: _SQLFailure => failure.code == "26000"
       else false
       end
     slot.phase = idle
-    slot.owner.settle(active)
+    _settle(slot.owner)
     if missing_statement then slot.owner.retire(slot)
     else slot.owner.available(slot) end
+
+  fun ref lost(owner: _Worker ref) =>
+    if not (outcome is _ReportedDataFailure) then outcome = _ConnectionLost end
+    _settle(owner)
+
+  fun ref _settle(owner: _Worker ref) =>
+    let result' = outcome
+    owner.settle(active, result')
+    match _followers
+    | let jobs: _TagFollowers =>
+      for member in jobs.jobs() do owner.settle(member, result') end
+    end
 
   fun ref ready(slot: _PoolSlot ref) =>
     slot.owner.retire(slot)
   fun ref prepared(slot: _PoolSlot ref) =>
     slot.owner.retire(slot)
-  fun ref dispatch(slot: _PoolSlot ref, job': _Job ref) =>
+  fun ref dispatch(slot: _PoolSlot ref, job': _Job ref,
+    followers': (_TagFollowers ref | None)) =>
     _Unreachable()
 
 class val _RetryToken
@@ -234,7 +267,8 @@ class _BackoffSlot is _SlotPhase
   fun ref failed(slot: _PoolSlot ref,
     failure: (pg.ErrorResponseMessage | pg.ClientQueryError)) => None
   fun ref complete(slot: _PoolSlot ref, status: pg.TransactionStatus) => None
-  fun ref dispatch(slot: _PoolSlot ref, job': _Job ref) => _Unreachable()
+  fun ref dispatch(slot: _PoolSlot ref, job': _Job ref,
+    followers: (_TagFollowers ref | None)) => _Unreachable()
   fun ref retry(slot: _PoolSlot ref, token': _RetryToken) =>
     if token' is token then
       slot.owner.cancel_timer(timer)
@@ -254,7 +288,8 @@ class _StoppedSlot is _SlotPhase
   fun ref failed(slot: _PoolSlot ref,
     failure: (pg.ErrorResponseMessage | pg.ClientQueryError)) => None
   fun ref complete(slot: _PoolSlot ref, status: pg.TransactionStatus) => None
-  fun ref dispatch(slot: _PoolSlot ref, job': _Job ref) => _Unreachable()
+  fun ref dispatch(slot: _PoolSlot ref, job': _Job ref,
+    followers: (_TagFollowers ref | None)) => _Unreachable()
   fun ref retry(slot: _PoolSlot ref, token: _RetryToken) => None
   fun ref close(slot: _PoolSlot ref) => None
 
@@ -295,6 +330,8 @@ actor _Worker is (AsioEventNotify & _PGOwner)
   embed _events: _PGEvents
   embed _slots: Array[_PoolSlot] = Array[_PoolSlot]
   embed _pending: _PendingJobs = _PendingJobs
+  let _tags_query: pg.NamedPreparedQuery =
+    pg.NamedPreparedQuery(_Catalog.name(_Tags), _P.none())
   embed _idle: Array[USize]
   embed _recipients: MapIs[_QueryClient, _Recipient] =
     MapIs[_QueryClient, _Recipient]
@@ -454,11 +491,21 @@ actor _Worker is (AsioEventNotify & _PGOwner)
       try
         let job = _pending.shift()?
         let slot = _slots(_idle.pop()?)?
-        job.started = _now()
-        _count(1)
-        _inflight = _inflight + 1
-        _observe(1, job.enqueued, job.started)
-        slot.phase.dispatch(slot, job)
+        var followers: (_TagFollowers ref | None) = None
+        if job.is_tags() and (budget > 0) and (_pending.size() > 0) then
+          if _pending.front()?.is_tags() then
+            let jobs = _TagFollowers(_pending, budget.min(31))
+            budget = budget - jobs.size()
+            followers = jobs
+          end
+        end
+        let started = _now()
+        _start_job(job, started)
+        match followers
+        | let jobs: _TagFollowers =>
+          for member in jobs.jobs() do _start_job(member, started) end
+        end
+        slot.phase.dispatch(slot, job, followers)
       else _Unreachable() end
     end
     _dispatching = false
@@ -466,6 +513,18 @@ actor _Worker is (AsioEventNotify & _PGOwner)
       (not _continuation) then
       _continuation = true
       this._resume()
+    end
+
+  fun ref _start_job(job: _Job ref, started: U64) =>
+    job.started = started
+    _count(1)
+    _inflight = _inflight + 1
+    _observe(1, job.enqueued, started)
+
+  fun _query(job: _Job box): pg.Query =>
+    match job.query
+    | _TagsQuery => _tags_query
+    | let query': pg.Query => query'
     end
 
   be _resume() =>
@@ -493,12 +552,13 @@ actor _Worker is (AsioEventNotify & _PGOwner)
         return
       end
     end
-    _enqueue(client, id,
-      pg.NamedPreparedQuery(_Catalog.name(statement), params),
-      _Catalog.kind(statement), now)
+    let query': _QueuedQuery =
+      if (statement is _Tags) and (params.size() == 0) then _TagsQuery
+      else pg.NamedPreparedQuery(_Catalog.name(statement), params) end
+    _enqueue(client, id, query', _Catalog.kind(statement), now)
     _dispatch()
 
-  fun ref _enqueue(client: _QueryClient, id: U64, query': pg.Query,
+  fun ref _enqueue(client: _QueryClient, id: U64, query': _QueuedQuery,
     kind: USize, now: U64)
   =>
     match _password_observer
@@ -548,13 +608,13 @@ actor _Worker is (AsioEventNotify & _PGOwner)
       client.db_failed(job.id, failure)
     end
 
-  fun ref settle(job: _Job ref) =>
+  fun ref settle(job: _Job ref, outcome: _ExecutionOutcome) =>
     _count(2)
     _inflight = _inflight - 1
     let now = _now()
     _observe(2, job.enqueued, now)
     if job.started != 0 then _observe(3 + job.kind, job.started, now) end
-    match job.outcome
+    match outcome
     | let result: pg.Result =>
       match job.recipient.client
       | let client: _QueryClient =>
@@ -617,11 +677,7 @@ actor _Worker is (AsioEventNotify & _PGOwner)
 
   fun ref _finish_lost(phase: _SlotPhase ref) =>
     match phase
-    | let busy: _BusySlot =>
-      if not (busy.active.outcome is _ReportedDataFailure) then
-        busy.active.outcome = _ConnectionLost
-      end
-      settle(busy.active)
+    | let busy: _BusySlot => busy.lost(this)
     end
 
   fun ref stop_slot(slot: _PoolSlot ref) =>
@@ -655,8 +711,7 @@ actor _Worker is (AsioEventNotify & _PGOwner)
         let job = _pending.shift()?
         _count(3)
         _inflight = _inflight + 1
-        job.outcome = _ConnectionLost
-        settle(job)
+        settle(job, _ConnectionLost)
       else _Unreachable() end
     end
     _recipients.clear()
@@ -769,17 +824,24 @@ actor _Worker is (AsioEventNotify & _PGOwner)
       | let backoff: _BackoffSlot => tokens.push(backoff.token)
       else tokens.push(None)
       end
-      match slot.phase.job()
-      | let job: _Job box =>
-        let outcome: U64 = match job.outcome
+      match slot.phase
+      | let busy: _BusySlot box =>
+        let outcome: U64 = match busy.outcome
           | _AwaitingResult => 0
           | let _: pg.Result => 1
           | let _: _SQLFailure => 2
           | _ReportedDataFailure => 3
           else 4
           end
-        active.push((slot.index, job.id, outcome))
-        recipients.set(job.recipient)
+        active.push((slot.index, busy.active.id, outcome))
+        recipients.set(busy.active.recipient)
+        match busy.followers()
+        | let jobs: _TagFollowers box =>
+          for job in jobs.values() do
+            active.push((slot.index, job.id, outcome))
+            recipients.set(job.recipient)
+          end
+        end
       end
     end
     for index in _idle.values() do idle.push(index) end
@@ -816,4 +878,37 @@ actor _Worker is (AsioEventNotify & _PGOwner)
         pg.PreparedQuery("bad\0query", _P.none()), 29, _now())
     end
     this._test_state(request, receiver)
+    _dispatch()
+
+  be _test_tag_batch(count: USize, prefix: Bool, client: _QueryClient,
+    request: U64, receiver: _PoolProbe)
+  =>
+    if _stopped then _Unreachable(); return end
+    if prefix then
+      _enqueue(client, 99_999,
+        pg.NamedPreparedQuery(_Catalog.name(_CurrentUser), _P.one(I64(0))),
+        _Catalog.kind(_CurrentUser), _now())
+    end
+    for index in Range(0, count) do
+      _enqueue(client, 100_000 + index.u64(), _TagsQuery,
+        _Catalog.kind(_Tags), _now())
+    end
+    this._test_state(request, receiver)
+    this.diag_snapshot(request, receiver)
+    _dispatch()
+
+  be _test_tag_zero_budget(client: _QueryClient, request: U64,
+    receiver: _PoolProbe)
+  =>
+    if _stopped then _Unreachable(); return end
+    for index in Range(0, 63) do
+      _enqueue(client, 100_000 + index.u64(),
+        pg.PreparedQuery("bad\0query", _P.none()), 29, _now())
+    end
+    for index in Range(63, 65) do
+      _enqueue(client, 100_000 + index.u64(), _TagsQuery,
+        _Catalog.kind(_Tags), _now())
+    end
+    this._test_state(request, receiver)
+    this.diag_snapshot(request, receiver)
     _dispatch()

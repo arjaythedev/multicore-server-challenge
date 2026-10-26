@@ -47,7 +47,10 @@ actor \nodoc\ _PoolClient is _QueryClient
 
   be db_result(id: U64, result: pg.Result) =>
     _callbacks = _callbacks + 1
-    _owner.result(_index, id, "ok")
+    let payload = try
+      (_Output.first(result)? as pg.Row).fields(0)? as String
+    else None end
+    _owner.result(_index, id, "ok", payload)
 
   be db_failed(id: U64, failure: _DBFailure) =>
     _callbacks = _callbacks + 1
@@ -61,7 +64,7 @@ actor \nodoc\ _PoolClient is _QueryClient
   be fence(request: U64) =>
     _owner.fenced(request, _index, _callbacks)
 
-actor \nodoc\ _PoolProbe
+actor \nodoc\ _PoolProbe is _DiagRecordReceiver
   let _env: Env
   let _worker: _Worker
   let _workers: Array[_Worker] val
@@ -112,12 +115,14 @@ actor \nodoc\ _PoolProbe
     try
       let words = line.split()
       match words(0)?
-      | "tags" | "user" | "register" | "invalid" =>
+      | "tags" | "tags-extra-parameter" | "user" | "register" | "invalid" =>
         let kind = words(0)?
         let id = _number(words(1)?)?
         let client = _clients(_number(words(2)?)?.usize())?
         if kind == "tags" then
           _worker.query(client, id, _Tags, _P.none())
+        elseif kind == "tags-extra-parameter" then
+          _worker.query(client, id, _Tags, _P.one(I64(0)))
         elseif kind == "user" then
           _worker.query(client, id, _CurrentUser, _P.one(I64(0)))
         elseif kind == "invalid" then
@@ -127,14 +132,32 @@ actor \nodoc\ _PoolProbe
           _worker.query(client, id, _RegisterUser,
             _P.three(name, name + "@pool.test", "test-hash"))
         end
-      | "begin" | "deallocate" =>
-        let sql = if words(0)? == "begin" then "BEGIN"
-          else "DEALLOCATE ALL" end
+      | "tags-nul" | "tags-array" =>
+        let param: _Param = if words(0)? == "tags-nul" then "bad\0value"
+          else pg.PgArray(25, [as pg.FieldData: "unsupported"]) end
+        _worker.query(_clients(_number(words(2)?)?.usize())?,
+          _number(words(1)?)?, _Tags, _P.one(param))
+      | "begin" | "deallocate" | "tags-error-deallocate"
+      | "tags-error-prepare" =>
+        let sql = match words(0)?
+          | "begin" => "BEGIN"
+          | "tags-error-deallocate" => "DEALLOCATE tags"
+          | "tags-error-prepare" => "PREPARE tags AS SELECT 1 / 0"
+          else "DEALLOCATE ALL"
+          end
         _worker._test_query(_clients(_number(words(2)?)?.usize())?,
           _number(words(1)?)?, pg.PreparedQuery(sql, _P.none()))
       | "badbatch" =>
         _worker._test_bad_batch(_number(words(1)?)?.usize(),
           _clients(0)?, _number(words(2)?)?, this)
+      | "tagbatch" =>
+        _worker._test_tag_batch(_number(words(1)?)?.usize(),
+          _number(words(2)?)? == 1, _clients(0)?,
+          _number(words(3)?)?, this)
+      | "tagzero" =>
+        _worker._test_tag_zero_budget(_clients(0)?,
+          _number(words(1)?)?, this)
+      | "diag" => _worker.diag_snapshot(_number(words(1)?)?, this)
       | "cancel" =>
         _worker.cancel(_clients(_number(words(1)?)?.usize())?)
       | "state" =>
@@ -231,9 +254,47 @@ actor \nodoc\ _PoolProbe
       ",\"outstanding\":" + value.outstanding.string() + "}")
     _env.out.print(line.clone())
 
-  be result(client: USize, id: U64, kind: String) =>
-    _env.out.print("{\"event\":\"result\",\"client\":" + client.string() +
-      ",\"id\":" + id.string() + ",\"kind\":\"" + kind + "\"}")
+  be result(client: USize, id: U64, kind: String,
+    payload: (String | None) = None)
+  =>
+    let line = String
+    line.append("{\"event\":\"result\",\"client\":" + client.string() +
+      ",\"id\":" + id.string() + ",\"kind\":\"" + kind + "\",\"payload\":")
+    match payload
+    | let value: String => _Output._quoted(line, value)
+    else line.append("null")
+    end
+    line.append("}")
+    _env.out.print(line.clone())
+
+  be diag_record(value: pg.DiagSnapshot) =>
+    if value.owner != 1 then return end
+    let line = String
+    line.append("{\"event\":\"diag\",\"request\":" + value.request.string())
+    for (name, values) in [as (String, Array[U64] val):
+      ("counters", value.counters); ("gauges", value.gauges)].values()
+    do
+      line.append(",\"" + name + "\":[")
+      var first = true
+      for number in values.values() do
+        if not first then line.append(",") end
+        first = false
+        line.append(number.string())
+      end
+      line.append("]")
+    end
+    line.append(",\"histograms\":[")
+    var first = true
+    for histogram in value.histograms.values() do
+      if not first then line.append(",") end
+      first = false
+      line.append(histogram.count.string())
+    end
+    line.append("]}")
+    _env.out.print(line.clone())
+
+  be diag_missing(slot: USize, generation: U64, request: U64,
+    reason: String) => None
 
   be fenced(request: U64, client: USize, callbacks: USize) =>
     _env.out.print("{\"event\":\"fence\",\"request\":" + request.string() +

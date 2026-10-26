@@ -219,7 +219,8 @@ def _check_metric_output(stream, require_activity=False):
                         raise AssertionError("accepted work is not conserved")
                     if c[1] + c[3] != c[2] + g[1] or c[7] + c[8] != c[2]:
                         raise AssertionError("terminal work is not conserved")
-                    if sum(g[4:10]) != connection_count or g[7] != g[1]:
+                    if (sum(g[4:10]) != connection_count
+                            or not g[7] <= g[1] <= 32 * g[7]):
                         raise AssertionError("physical slot states are inconsistent")
                     identity = (worker_id, record["slot"], record["request"])
                     if identity in pool_snapshots:
@@ -645,6 +646,7 @@ class PoolRun:
         self.events = []
         self.history = []
         self.sequence = 0
+        self.deadline = None
         self.csv = WorkerCSV(dict.fromkeys(range(actors), count)) if csv else None
         self.selector = selectors.DefaultSelector()
         self.selector.register(process.stdout, selectors.EVENT_READ)
@@ -655,7 +657,7 @@ class PoolRun:
         self.process.stdin.flush()
 
     def receive(self, predicate, timeout=10):
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + self.time_left(timeout)
         while True:
             for index, event in enumerate(self.events):
                 if predicate(event):
@@ -674,18 +676,35 @@ class PoolRun:
                 continue
             remaining = deadline - time.monotonic()
             if remaining <= 0 or not self.selector.select(remaining):
+                self.proxy.assert_healthy()
                 raise AssertionError("pool probe response timed out")
             chunk = os.read(self.process.stdout.fileno(), 65536)
             if not chunk:
                 raise AssertionError("pool probe exited before response")
             self.buffer += chunk
 
-    def state(self):
+    def time_left(self, maximum=10):
+        if self.deadline is None:
+            return maximum
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            self.proxy.assert_healthy()
+            raise AssertionError("held pool phase deadline expired")
+        return min(maximum, remaining)
+
+    def reached(self, gate):
+        reached = gate.reached.wait(self.time_left())
+        if not reached:
+            self.proxy.assert_healthy()
+        self.case.assertTrue(reached, (gate.kind, gate.connection,
+                             gate.release.is_set(), self.history[-5:]))
+
+    def state(self, timeout=10):
         self.sequence += 1
         request = self.sequence
         self.send(f"state {request}")
         state = self.receive(lambda event: event.get("event") == "state"
-                             and event["request"] == request)
+                             and event["request"] == request, timeout)
         idle = state["idle"]
         self.case.assertEqual(len(idle), len(set(idle)))
         self.case.assertEqual(set(idle), {index for index, code in
@@ -711,9 +730,9 @@ class PoolRun:
                             and event["request"] == self.sequence)
 
     def wait_state(self, predicate, timeout=10):
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + self.time_left(timeout)
         while time.monotonic() < deadline:
-            state = self.state()
+            state = self.state(timeout=min(10, deadline - time.monotonic()))
             if predicate(state):
                 return state
             time.sleep(0.01)
@@ -722,23 +741,33 @@ class PoolRun:
     def ready(self, count):
         return self.wait_state(lambda state: state["phases"] == [2] * count)
 
-    def result(self, id, kind="ok"):
+    def result(self, id, kind="ok", client=None, timeout=10):
         result = self.receive(lambda event: event.get("event") == "result"
-                              and event["id"] == id)
+                              and event["id"] == id
+                              and (client is None or event["client"] == client),
+                              timeout)
         self.case.assertEqual(result["kind"], kind)
         return result
 
-    def fence(self):
+    def fence(self, timeout=10):
+        deadline = time.monotonic() + timeout
         self.sequence += 1
         request = self.sequence
         self.send(f"fence {request}")
         values = {}
         for _ in range(4):
             event = self.receive(lambda event: event.get("event") == "fence"
-                                 and event["request"] == request)
+                                 and event["request"] == request,
+                                 max(0, deadline - time.monotonic()))
             self.case.assertNotIn(event["client"], values)
             values[event["client"]] = event["callbacks"]
         return values
+
+    def diagnostic(self):
+        self.sequence += 1
+        self.send(f"diag {self.sequence}")
+        return self.receive(lambda e: e.get("event") == "diag"
+                            and e["request"] == self.sequence)
 
 
 class SQLSession:
@@ -1118,6 +1147,638 @@ class Integration(unittest.TestCase):
                 errors.seek(0)
                 self.assertEqual(process.returncode, 0,
                                  _failure_output(errors.read().decode()))
+
+    def tag_snapshot(self, run):
+        return json.loads(self.db("SELECT coalesce(json_agg(name ORDER BY name),"
+                                  "'[]') FROM tags", run.time_left(30)))
+
+    def tag_holder(self, run, command="user"):
+        run.ready(1)
+        run.deadline = time.monotonic() + 90
+        gate = run.proxy.hold_frame(b"Z", 0, timeout=120)
+        run.send(f"{command} 90000 3")
+        run.reached(gate)
+        run.wait_state(lambda state: state["active"] == [[0, 90000, 1]])
+        return gate
+
+    def assert_pool_drained(self, run, count=1):
+        state = run.ready(count)
+        self.assertEqual(state["active"], [])
+        self.assertEqual(state["queued"], [])
+        self.assertEqual(state["outstanding"], 0)
+        self.assertEqual(state["recipients"], 0)
+
+    def test_pool_tags_batch_boundaries(self):
+        for count in (0, 1, 2, 31, 32, 33, 63, 64, 65):
+            with self.subTest(count=count), self.pool_run(1) as run:
+                holder = self.tag_holder(run)
+                expected = self.tag_snapshot(run)
+                pairs = [(index + 1, index % 4) for index in range(count)]
+                if pairs:
+                    run.send(*(f"tags {id} {client}" for id, client in pairs))
+                run.wait_state(lambda s: s["queued"] == [p[0] for p in pairs])
+                callbacks = {0: 0, 1: 0, 2: 0, 3: 1}
+                gate = (run.proxy.hold_frame(b"Z", 0, timeout=120)
+                        if count else None)
+                holder.release.set()
+                run.result(90000, client=3)
+                for start in range(0, count, 32):
+                    run.reached(gate)
+                    batch = pairs[start:start + 32]
+                    state = run.wait_state(lambda s: s["active"] ==
+                                           [[0, id, 1] for id, _ in batch])
+                    self.assertEqual(state["queued"],
+                                     [id for id, _ in pairs[start + 32:]])
+                    self.assertEqual(run.fence(), callbacks)
+                    self.assertEqual(self.routing_binds(run.proxy)[0],
+                                     [b"current_user"] + [b"tags"] * (start // 32 + 1))
+                    next_gate = (run.proxy.hold_frame(b"Z", 0, timeout=120)
+                                 if start + 32 < count else None)
+                    gate.release.set()
+                    for id, client in batch:
+                        result = run.result(id, client=client)
+                        self.assertEqual(json.loads(result["payload"])["tags"], expected)
+                        callbacks[client] += 1
+                    gate = next_gate
+                self.assert_pool_drained(run)
+                self.assertEqual(run.fence(), callbacks)
+                self.assertEqual(self.routing_binds(run.proxy)[0].count(b"tags"),
+                                 (count + 31) // 32)
+        with self.pool_run(1) as run:
+            run.ready(1)
+            expected = self.tag_snapshot(run)
+            run.send("tags 1 0")
+            self.assertEqual(json.loads(run.result(1, client=0)["payload"])["tags"],
+                             expected)
+            self.assert_pool_drained(run)
+
+    def test_pool_tags_dispatch_budget_is_logical(self):
+        for count, prefix, slots, sizes in ((63, 0, 3, [31, 32]),
+                (64, 0, 3, [32, 32]), (65, 0, 3, [32, 32]),
+                (64, 1, 4, [1, 31, 32])):
+            with self.subTest(count=count, prefix=prefix), self.pool_run(slots) as run:
+                run.ready(slots)
+                run.deadline = time.monotonic() + 90
+                gates = [run.proxy.hold_frame(b"Z", index, timeout=120)
+                         for index in range(slots)]
+                run.send(f"tagbatch {count} {prefix} 70000")
+                first = run.receive(lambda e: e.get("event") == "state"
+                                    and e["request"] == 70000)
+                active_ids = [item[1] for item in first["active"]]
+                expected = ([99999] if prefix else []) + list(range(100000, 100000 + count))
+                self.assertCountEqual(active_ids, expected[:64])
+                self.assertEqual(first["queued"], expected[64:])
+                self.assertEqual(first["outstanding"], len(expected))
+                self.assertEqual(len(first["idle"]), slots - len(sizes))
+                self.assertEqual(set(first["idle"]),
+                                 {i for i, phase in enumerate(first["phases"]) if phase == 2})
+                self.assertEqual(len(first["idle"]), len(set(first["idle"])))
+                self.assertEqual(sorted(sum(item[0] == slot for item in first["active"])
+                                        for slot in range(slots)
+                                        if any(item[0] == slot for item in first["active"])), sizes)
+                state = run.wait_state(lambda s: len(s["active"]) == len(expected)
+                                       and all(item[2] == 1 for item in s["active"]))
+                self.assertEqual(state["queued"], [])
+                for gate, binds in zip(gates, self.routing_binds(run.proxy)):
+                    if binds:
+                        run.reached(gate)
+                        gate.release.set()
+                for id in expected:
+                    run.result(id, client=0)
+                self.assert_pool_drained(run, slots)
+                self.assertEqual(run.fence(), {0: len(expected), 1: 0, 2: 0, 3: 0})
+        with self.pool_run(2) as run:
+            run.ready(2)
+            run.deadline = time.monotonic() + 90
+            gates = [run.proxy.hold_frame(b"Z", index, timeout=120) for index in range(2)]
+            run.send("tagzero 70000")
+            first = run.receive(lambda e: e.get("event") == "state" and e["request"] == 70000)
+            self.assertEqual([item[1:] for item in first["active"]], [[100063, 0]])
+            self.assertEqual(first["queued"], [100064])
+            self.assertEqual(first["outstanding"], 2)
+            self.assertEqual(len(first["idle"]), 1)
+            self.assertEqual(set(first["idle"]),
+                             {i for i, phase in enumerate(first["phases"]) if phase == 2})
+            if _diagnostic_mode():
+                diagnostic = run.receive(lambda e: e.get("event") == "diag"
+                                         and e["request"] == 70000)
+                self.assertEqual(diagnostic["gauges"][:2], [1, 1])
+                self.assertEqual(diagnostic["counters"][:9],
+                                 [65, 64, 63, 0, 0, 63, 0, 0, 63])
+            run.wait_state(lambda s: len(s["active"]) == 2)
+            for gate in gates:
+                run.reached(gate)
+                gate.release.set()
+            for id in range(100000, 100063):
+                run.result(id, "data", client=0)
+            for id in (100063, 100064):
+                run.result(id, client=0)
+            self.assertEqual(self.routing_binds(run.proxy), [[b"tags"], [b"tags"]])
+            self.assert_pool_drained(run, 2)
+            self.assertEqual(run.fence(), {0: 65, 1: 0, 2: 0, 3: 0})
+            if _diagnostic_mode():
+                diagnostic = run.diagnostic()
+                self.assertEqual(diagnostic["counters"][:9],
+                                 [65, 65, 65, 0, 0, 65, 0, 2, 63])
+
+    def test_pool_tags_compatibility_preserves_fifo(self):
+        for barrier, sql_name, kind in (("user", b"current_user", "ok"),
+                ("register", b"register_user", "ok"),
+                ("tags-extra-parameter", b"tags", "08P01")):
+            for leading in ((False, True) if kind != "ok" else (False,)):
+                with self.subTest(barrier=barrier, leading=leading), self.pool_run(1) as run:
+                    holder = self.tag_holder(run)
+                    name = "tagbarrier" + uuid.uuid4().hex
+                    command = f"{barrier} 3 2" + (f" {name}" if barrier == "register" else "")
+                    commands = ([command, "tags 4 0", "tags 5 1"] if leading else
+                                ["tags 1 0", "tags 2 1", command, "tags 4 0", "tags 5 1"])
+                    groups = ([[3], [4, 5]] if leading else [[1, 2], [3], [4, 5]])
+                    run.send(*commands)
+                    run.wait_state(lambda s: s["queued"] == sum(groups, []))
+                    previous = holder
+                    for index, ids in enumerate(groups):
+                        gate = run.proxy.hold_frame(b"Z", 0, timeout=120)
+                        previous.release.set()
+                        if index == 0:
+                            run.result(90000, client=3)
+                        run.reached(gate)
+                        outcome = 2 if ids == [3] and kind != "ok" else 1
+                        state = run.wait_state(lambda s: s["active"] == [[0, id, outcome] for id in ids])
+                        self.assertEqual(state["queued"], sum(groups[index + 1:], []))
+                        previous = gate
+                    previous.release.set()
+                    for id in sum(groups, []):
+                        run.result(id, kind if id == 3 else "ok",
+                                   client=2 if id == 3 else (0 if id in (1, 4) else 1))
+                    self.assertEqual(self.routing_binds(run.proxy)[0],
+                                     [b"current_user"] + ([] if leading else [b"tags"])
+                                     + [sql_name, b"tags"])
+                    if barrier == "register":
+                        self.assertEqual(self.db("SELECT count(*) FROM users WHERE username="
+                                                 + self.literal(name), run.time_left(30)), "1")
+                    self.assert_pool_drained(run)
+                    run.send("tags 6 0")
+                    run.result(6, client=0)
+                    self.assert_pool_drained(run)
+                    self.assertEqual(run.fence(),
+                                     {0: 2 if leading else 3,
+                                      1: 1 if leading else 2, 2: 1, 3: 1})
+        with self.pool_run(1) as run:
+            run.ready(1)
+            run.send("tags-nul 1 0", "tags-array 2 1")
+            run.result(1, "data", client=0)
+            run.result(2, "data", client=1)
+            self.assert_pool_drained(run)
+            self.assertEqual(self.routing_binds(run.proxy), [[]])
+            self.assertEqual(run.fence(), {0: 1, 1: 1, 2: 0, 3: 0})
+            if _diagnostic_mode():
+                diagnostic = run.diagnostic()
+                self.assertEqual(diagnostic["counters"][:9],
+                                 [0, 0, 0, 0, 2, 2, 0, 0, 0])
+
+    def test_pool_tags_cancellation_preserves_cohorts(self):
+        for phase in ("queued", "active"):
+            for mask in range(16):
+                with self.subTest(phase=phase, mask=mask), self.pool_run(1) as run:
+                    holder = self.tag_holder(run)
+                    run.send(*(f"tags {client + 1} {client}" for client in range(4)))
+                    run.wait_state(lambda s: s["queued"] == [1, 2, 3, 4])
+                    commands = [f"cancel {client}" for client in range(4) if mask & (1 << client)]
+                    if phase == "queued" and commands:
+                        run.send(*commands)
+                    gate = run.proxy.hold_frame(b"Z", 0, timeout=120)
+                    holder.release.set()
+                    holder_canceled = phase == "queued" and bool(mask & 8)
+                    if not holder_canceled:
+                        run.result(90000, client=3)
+                    run.reached(gate)
+                    run.wait_state(lambda s: s["active"] == [[0, id, 1] for id in range(1, 5)])
+                    if phase == "active" and commands:
+                        run.send(*commands)
+                    state = run.state()
+                    self.assertEqual(state["outstanding"], 4)
+                    self.assertEqual(state["recipients"], 4 - mask.bit_count())
+                    gate.release.set()
+                    counts = {0: 0, 1: 0, 2: 0, 3: int(not holder_canceled)}
+                    for client in range(4):
+                        if not mask & (1 << client):
+                            run.result(client + 1, client=client)
+                            counts[client] += 1
+                    self.assert_pool_drained(run)
+                    self.assertEqual(run.fence(), counts)
+                    self.assertEqual(self.routing_binds(run.proxy)[0], [b"current_user", b"tags"])
+        for pairs, cancel in (([(1, 0), (2, 0), (3, 1)], True),
+                              ([(1, 0), (1, 1)], False)):
+            with self.subTest(pairs=pairs), self.pool_run(1) as run:
+                holder = self.tag_holder(run)
+                run.send(*(f"tags {id} {client}" for id, client in pairs))
+                run.wait_state(lambda s: s["queued"] == [id for id, _ in pairs])
+                if cancel:
+                    run.send("cancel 0")
+                holder.release.set()
+                run.result(90000, client=3)
+                counts = {0: 0, 1: 0, 2: 0, 3: 1}
+                for id, client in pairs:
+                    if not cancel or client != 0:
+                        run.result(id, client=client)
+                        counts[client] += 1
+                self.assert_pool_drained(run)
+                self.assertEqual(run.fence(), counts)
+        with self.pool_run(1) as run:
+            holder = self.tag_holder(run)
+            run.send("tags 1 0", "tags 2 1")
+            run.wait_state(lambda s: s["queued"] == [1, 2])
+            gate = run.proxy.hold_frame(b"Z", 0, timeout=120)
+            holder.release.set()
+            run.result(90000, client=3)
+            run.reached(gate)
+            run.send("cancel 0", "tags 3 0")
+            state = run.wait_state(lambda s: s["queued"] == [3])
+            self.assertEqual(state["outstanding"], 3)
+            next_gate = run.proxy.hold_frame(b"Z", 0, timeout=120)
+            gate.release.set()
+            run.result(2, client=1)
+            run.reached(next_gate)
+            state = run.wait_state(lambda s: s["active"] == [[0, 3, 1]])
+            self.assertEqual(state["recipients"], 1)
+            self.assertEqual(run.fence(), {0: 0, 1: 1, 2: 0, 3: 1})
+            next_gate.release.set()
+            run.result(3, client=0)
+            self.assert_pool_drained(run)
+            self.assertEqual(run.fence(), {0: 1, 1: 1, 2: 0, 3: 1})
+        with self.pool_run(1) as run:
+            holder = self.tag_holder(run)
+            run.send(*(f"tags {id} 0" for id in range(1, 33)), "cancel 0", "tags 33 1")
+            run.wait_state(lambda s: s["queued"] == list(range(1, 34)))
+            gate = run.proxy.hold_frame(b"Z", 0, timeout=120)
+            holder.release.set()
+            run.result(90000, client=3)
+            run.reached(gate)
+            state = run.wait_state(lambda s: len(s["active"]) == 32)
+            self.assertEqual(state["queued"], [33])
+            self.assertEqual(state["outstanding"], 33)
+            gate.release.set()
+            run.result(33, client=1)
+            self.assert_pool_drained(run)
+            self.assertEqual(run.fence(), {0: 0, 1: 1, 2: 0, 3: 1})
+            self.assertEqual(self.routing_binds(run.proxy)[0].count(b"tags"), 2)
+
+    def test_pool_tags_sql_failure_fans_out_at_readiness(self):
+        for kind in ("26000", "22012"):
+            for canceled in (False, True):
+                with self.subTest(kind=kind, canceled=canceled), self.pool_run(1) as run:
+                    run.ready(1)
+                    if kind == "22012":
+                        run.send("tags-error-deallocate 80000 3")
+                        run.result(80000, client=3)
+                        run.send("tags-error-prepare 80001 3")
+                        run.result(80001, client=3)
+                    holder = self.tag_holder(run, "deallocate" if kind == "26000" else "user")
+                    before = run.state()
+                    run.send("tags 1 0", "tags 2 1", "tags 3 2")
+                    if canceled:
+                        run.send("cancel 1")
+                    run.wait_state(lambda s: s["queued"] == [1, 2, 3])
+                    gate = run.proxy.hold_frame(b"Z", 0, timeout=120)
+                    holder.release.set()
+                    run.result(90000, client=3)
+                    run.reached(gate)
+                    run.wait_state(lambda s: s["active"] == [[0, id, 2] for id in (1, 2, 3)])
+                    counts = {0: 0, 1: 0, 2: 0, 3: 1 if kind == "26000" else 3}
+                    self.assertEqual(run.fence(), counts)
+                    gate.release.set()
+                    for client in range(3):
+                        if not canceled or client != 1:
+                            run.result(client + 1, kind, client=client)
+                            counts[client] += 1
+                    self.assert_pool_drained(run)
+                    self.assertEqual(run.state()["generations"],
+                                     [before["generations"][0] + (kind == "26000")])
+                    self.assertEqual(sum(b.count(b"tags") for b in self.routing_binds(run.proxy)), 1)
+                    self.assertEqual(run.fence(), counts)
+                    run.send("user 4 0")
+                    run.result(4, client=0)
+                    counts[0] += 1
+                    if kind == "26000":
+                        expected = self.tag_snapshot(run)
+                        run.send("tags 5 0")
+                        self.assertEqual(json.loads(run.result(5, client=0)["payload"])["tags"],
+                                         expected)
+                        self.assertEqual(sum(b.count(b"tags") for b in self.routing_binds(run.proxy)), 2)
+                        counts[0] += 1
+                    self.assert_pool_drained(run)
+                    self.assertEqual(len(run.proxy.snapshot()), 2 if kind == "26000" else 1)
+                    self.assertEqual(run.fence(), counts)
+
+    def test_pool_tags_data_error_reports_once_while_draining(self):
+        for ending in ("drain", "loss", "close"):
+            with self.subTest(ending=ending), self.pool_run(1) as run:
+                holder = self.tag_holder(run)
+                run.send("tags 1 0", "tags 2 1", "tags 3 2", "cancel 1")
+                run.wait_state(lambda s: s["queued"] == [1, 2, 3])
+                run.proxy.corrupt_next_data_row()
+                gate = run.proxy.hold_frame(b"Z", 0, timeout=120)
+                holder.release.set()
+                run.result(90000, client=3)
+                run.reached(gate)
+                run.result(1, "data", client=0)
+                run.result(3, "data", client=2)
+                state = run.wait_state(lambda s: s["active"] == [[0, id, 3] for id in (1, 2, 3)])
+                self.assertEqual(state["outstanding"], 3)
+                self.assertEqual(run.fence(), {0: 1, 1: 0, 2: 1, 3: 1})
+                run.send("cancel 0", "tags 4 0")
+                run.wait_state(lambda s: s["queued"] == [4])
+                if ending == "close":
+                    run.send("close", "close")
+                    run.result(4, "lost", client=0)
+                    state = run.state()
+                    self.assertEqual(state["phases"], [5])
+                else:
+                    if ending == "loss":
+                        gate.abort = True
+                    gate.release.set()
+                    run.result(4, client=0)
+                    self.assert_pool_drained(run)
+                state = run.state()
+                self.assertEqual(state["outstanding"], 0)
+                self.assertEqual(state["recipients"], 0)
+                self.assertEqual(run.fence(), {0: 2, 1: 0, 2: 1, 3: 1})
+                self.assertEqual(sum(b.count(b"tags") for b in self.routing_binds(run.proxy)),
+                                 1 if ending == "close" else 2)
+
+        with self.pool_run(1) as run:
+            holder = self.tag_holder(run)
+            run.send("tags 1 0", "tags 2 0", "tags 3 1", "user 4 2")
+            run.wait_state(lambda s: s["queued"] == [1, 2, 3, 4])
+            run.proxy.corrupt_next_data_row()
+            gate = run.proxy.hold_frame(b"Z", 0, timeout=120)
+            holder.release.set()
+            run.result(90000, client=3)
+            run.reached(gate)
+            for id, client in ((1, 0), (2, 0), (3, 1)):
+                run.result(id, "data", client=client)
+            state = run.wait_state(lambda s: s["active"] == [[0, id, 3] for id in (1, 2, 3)])
+            self.assertEqual(state["queued"], [4])
+            self.assertEqual(state["outstanding"], 4)
+            gate.release.set()
+            run.result(4, client=2)
+            self.assert_pool_drained(run)
+            self.assertEqual(run.fence(), {0: 2, 1: 1, 2: 1, 3: 1})
+
+    def tag_two_holders(self, run):
+        run.ready(2)
+        run.deadline = time.monotonic() + 90
+        gates = [run.proxy.hold_frame(b"Z", connection, timeout=120)
+                 for connection in range(2)]
+        holders = []
+        for id in (90000, 90001):
+            before = self.routing_binds(run.proxy)
+            run.send(f"user {id} 3")
+            state = run.wait_state(lambda s: any(item[1:] == [id, 1] for item in s["active"]))
+            after = self.routing_binds(run.proxy)
+            connections = [i for i in range(2) if len(after[i]) == len(before[i]) + 1]
+            self.assertEqual(len(connections), 1)
+            connection = connections[0]
+            slot = next(item[0] for item in state["active"] if item[1] == id)
+            run.reached(gates[connection])
+            holders.append((slot, connection, gates[connection], id))
+        self.assertNotEqual(holders[0][0], holders[1][0])
+        self.assertNotEqual(holders[0][1], holders[1][1])
+        return holders
+
+    def test_pool_tags_loss_settles_members_without_replay(self):
+        for outcome, trigger in ((0, "abort"), (0, "retire"),
+                                 (1, "abort"), (1, "retire"), (2, "abort")):
+            with self.subTest(outcome=outcome, trigger=trigger), self.pool_run(1) as run:
+                run.ready(1)
+                if outcome == 2:
+                    run.send("tags-error-deallocate 80000 3")
+                    run.result(80000, client=3)
+                    run.send("tags-error-prepare 80001 3")
+                    run.result(80001, client=3)
+                holder = self.tag_holder(run)
+                generation = run.state()["generations"][0]
+                run.send("tags 1 0", "tags 2 1", "tags 3 2", "cancel 1")
+                run.wait_state(lambda s: s["queued"] == [1, 2, 3])
+                gate = run.proxy.hold_frame(b"D" if outcome == 0 else b"Z", 0, timeout=120)
+                holder.release.set()
+                run.result(90000, client=3)
+                run.reached(gate)
+                run.wait_state(lambda s: s["active"] == [[0, id, outcome] for id in (1, 2, 3)])
+                counts = {0: 0, 1: 0, 2: 0, 3: 3 if outcome == 2 else 1}
+                self.assertEqual(run.fence(), counts)
+                if trigger == "retire":
+                    run.send("retire 0")
+                gate.abort = True
+                gate.release.set()
+                run.result(1, "lost", client=0)
+                run.result(3, "lost", client=2)
+                self.assert_pool_drained(run)
+                self.assertEqual(run.state()["generations"], [generation + 1])
+                self.assertEqual(sum(b.count(b"tags") for b in self.routing_binds(run.proxy)), 1)
+                counts.update({0: 1, 2: 1})
+                self.assertEqual(run.fence(), counts)
+                run.send("user 4 0")
+                run.result(4, client=0)
+        with self.pool_run(2) as run:
+            target, survivor = self.tag_two_holders(run)
+            target_slot, target_connection, target_gate, target_id = target
+            survivor_slot, survivor_connection, survivor_gate, survivor_id = survivor
+            run.send("tags 1 0", "tags 2 1")
+            run.wait_state(lambda s: s["queued"] == [1, 2])
+            group = run.proxy.hold_frame(b"Z", target_connection, timeout=120)
+            target_gate.release.set()
+            run.result(target_id, client=3)
+            run.reached(group)
+            run.wait_state(lambda s: [item for item in s["active"] if item[0] == target_slot]
+                           == [[target_slot, 1, 1], [target_slot, 2, 1]])
+            survivor_gate.release.set()
+            run.result(survivor_id, client=3)
+            before = run.wait_state(lambda s: s["idle"] == [survivor_slot])
+            self.assertEqual(before["queued"], [])
+            replacement = len(run.proxy.snapshot())
+            preparation = run.proxy.hold_frame(b"1", replacement, timeout=120)
+            run.send(f"retire {target_slot}")
+            run.result(1, "lost", client=0)
+            run.result(2, "lost", client=1)
+            run.reached(preparation)
+            self.assertEqual(len(run.proxy.snapshot()), replacement + 1)
+            run.send("user 4 2")
+            run.result(4, client=2)
+            binds = self.routing_binds(run.proxy)
+            self.assertEqual(binds[survivor_connection], [b"current_user", b"current_user"])
+            self.assertEqual(binds[replacement], [])
+            self.assertFalse(preparation.release.is_set())
+            state = run.state()
+            expected_generations = before["generations"].copy()
+            expected_generations[target_slot] += 1
+            self.assertEqual(state["generations"], expected_generations)
+            self.assertEqual(state["phases"][target_slot], 1)
+            group.abort = True
+            group.release.set()
+            preparation.release.set()
+            self.assert_pool_drained(run, 2)
+            self.assertEqual(run.fence(), {0: 1, 1: 1, 2: 1, 3: 2})
+
+    def test_pool_tags_close_settles_active_and_queued_once(self):
+        for outcome in (0, 1):
+            with self.subTest(outcome=outcome), self.pool_run(1) as run:
+                holder = self.tag_holder(run)
+                run.send("tags 1 0", "tags 2 1", "tags 3 2", "cancel 1")
+                run.wait_state(lambda s: s["queued"] == [1, 2, 3])
+                gate = run.proxy.hold_frame(b"D" if outcome == 0 else b"Z", 0, timeout=120)
+                holder.release.set()
+                run.result(90000, client=3)
+                run.reached(gate)
+                run.wait_state(lambda s: s["active"] == [[0, id, outcome] for id in (1, 2, 3)])
+                run.send("tags 4 1", "user 5 0", "user 6 3", "cancel 3")
+                run.wait_state(lambda s: s["queued"] == [4, 5, 6])
+                run.send("close", "close", "tags 7 0")
+                for id, client in ((1, 0), (3, 2), (4, 1), (5, 0), (7, 0)):
+                    run.result(id, "lost", client=client)
+                state = run.state()
+                self.assertEqual(state["phases"], [5])
+                self.assertEqual(state["queued"], [])
+                self.assertEqual(state["active"], [])
+                self.assertEqual(state["outstanding"], 0)
+                self.assertEqual(state["recipients"], 0)
+                gate.abort = True
+                gate.release.set()
+                self.assertEqual(run.fence(), {0: 3, 1: 1, 2: 1, 3: 1})
+                self.assertEqual(self.routing_binds(run.proxy)[0], [b"current_user", b"tags"])
+
+    def test_pool_tags_freshness_after_frozen_result(self):
+        names = ["shared-" + uuid.uuid4().hex for _ in range(3)]
+        try:
+            with self.pool_run(1) as run:
+                holder = self.tag_holder(run)
+                initial = self.tag_snapshot(run)
+                run.send("tags 1 0", "tags 2 1")
+                run.wait_state(lambda s: s["queued"] == [1, 2])
+                gate = run.proxy.hold_frame(b"Z", 0, timeout=120)
+                holder.release.set()
+                run.result(90000, client=3)
+                run.reached(gate)
+                run.wait_state(lambda s: s["active"] == [[0, 1, 1], [0, 2, 1]])
+                self.db("INSERT INTO tags(name) VALUES (" + self.literal(names[0]) + ")", run.time_left(30))
+                newer = self.tag_snapshot(run)
+                self.assertNotIn(names[0], initial)
+                self.assertIn(names[0], newer)
+                run.send("tags 3 2")
+                state = run.wait_state(lambda s: s["queued"] == [3])
+                self.assertEqual([item[1] for item in state["active"]], [1, 2])
+                gate.release.set()
+                for id, client in ((1, 0), (2, 1)):
+                    self.assertEqual(json.loads(run.result(id, client=client)["payload"])["tags"], initial)
+                self.assertEqual(json.loads(run.result(3, client=2)["payload"])["tags"], newer)
+                self.assert_pool_drained(run)
+                self.db("INSERT INTO tags(name) VALUES (" + self.literal(names[1]) + ")", run.time_left(30))
+                newest = self.tag_snapshot(run)
+                self.assertIn(names[1], newest)
+                run.send("tags 4 0")
+                self.assertEqual(json.loads(run.result(4, client=0)["payload"])["tags"], newest)
+                self.assertEqual(self.routing_binds(run.proxy)[0].count(b"tags"), 3)
+                self.assert_pool_drained(run)
+                self.assertEqual(run.fence(), {0: 2, 1: 1, 2: 1, 3: 1})
+            with self.pool_run(2) as run:
+                old, new = self.tag_two_holders(run)
+                initial = self.tag_snapshot(run)
+                run.send("tags 1 0", "tags 2 1")
+                run.wait_state(lambda s: s["queued"] == [1, 2])
+                old_gate = run.proxy.hold_frame(b"Z", old[1], timeout=120)
+                old[2].release.set()
+                run.result(old[3], client=3)
+                run.reached(old_gate)
+                run.wait_state(lambda s: [item for item in s["active"] if item[0] == old[0]]
+                               == [[old[0], 1, 1], [old[0], 2, 1]])
+                self.db("INSERT INTO tags(name) VALUES (" + self.literal(names[2]) + ")", run.time_left(30))
+                newer = self.tag_snapshot(run)
+                self.assertNotIn(names[2], initial)
+                self.assertIn(names[2], newer)
+                run.send("tags 3 0", "tags 4 1")
+                run.wait_state(lambda s: s["queued"] == [3, 4])
+                new_gate = run.proxy.hold_frame(b"Z", new[1], timeout=120)
+                new[2].release.set()
+                run.result(new[3], client=3)
+                run.reached(new_gate)
+                run.wait_state(lambda s: [item for item in s["active"] if item[0] == new[0]]
+                               == [[new[0], 3, 1], [new[0], 4, 1]])
+                new_gate.release.set()
+                for id, client in ((3, 0), (4, 1)):
+                    self.assertEqual(json.loads(run.result(id, client=client)["payload"])["tags"], newer)
+                self.assertEqual(run.fence(), {0: 1, 1: 1, 2: 0, 3: 2})
+                old_gate.release.set()
+                for id, client in ((1, 0), (2, 1)):
+                    self.assertEqual(json.loads(run.result(id, client=client)["payload"])["tags"], initial)
+                self.assert_pool_drained(run, 2)
+                self.assertEqual(run.fence(), {0: 2, 1: 2, 2: 0, 3: 2})
+                self.assertEqual(self.routing_binds(run.proxy),
+                                 [[b"current_user", b"tags"], [b"current_user", b"tags"]])
+        finally:
+            self.db("DELETE FROM tags WHERE name IN (" + ",".join(map(self.literal, names)) + ")")
+
+    @unittest.skipUnless(_diagnostic_mode(), "diagnostic build only")
+    def test_pool_tags_logical_diagnostics(self):
+        for ending in ("success", "cancel", "sql", "data", "close"):
+            with self.subTest(ending=ending), self.pool_run(1, csv=True) as run:
+                holder = self.tag_holder(run, "deallocate" if ending == "sql" else "user")
+                baseline = run.diagnostic()
+                run.send("tags 1 0", "tags 2 1", "tags 3 2")
+                run.wait_state(lambda s: s["queued"] == [1, 2, 3])
+                queued = run.diagnostic()
+                self.assertEqual(queued["counters"][0] - baseline["counters"][0], 3)
+                self.assertEqual(queued["gauges"][:2], [3, 1])
+                self.assertEqual(run.csv_sample()["pending"], 3)
+                if ending == "cancel":
+                    run.send("cancel 1")
+                if ending == "data":
+                    run.proxy.corrupt_next_data_row()
+                gate = run.proxy.hold_frame(b"Z", 0, timeout=120)
+                holder.release.set()
+                run.result(90000, client=3)
+                run.reached(gate)
+                outcome = 2 if ending == "sql" else 3 if ending == "data" else 1
+                run.wait_state(lambda s: s["active"] == [[0, id, outcome] for id in (1, 2, 3)])
+                if ending == "data":
+                    for client in range(3):
+                        run.result(client + 1, "data", client=client)
+                active = run.diagnostic()
+                self.assertEqual(active["gauges"][:2], [0, 3])
+                self.assertEqual(active["gauges"][7], 1)
+                self.assertEqual(run.csv_sample()["busy"], 1)
+                self.assertEqual(active["counters"][1] - baseline["counters"][1], 3)
+                self.assertEqual(active["counters"][2] - baseline["counters"][2], 1)
+                self.assertEqual(active["counters"][5] - baseline["counters"][5],
+                                 4 if ending == "data" else 1)
+                self.assertEqual(active["histograms"][1] - baseline["histograms"][1], 3)
+                if ending == "close":
+                    run.send("tags 4 0", "user 5 1")
+                    run.wait_state(lambda s: s["queued"] == [4, 5])
+                    run.send("close")
+                    for id, client in ((1, 0), (2, 1), (3, 2), (4, 0), (5, 1)):
+                        run.result(id, "lost", client=client)
+                else:
+                    gate.release.set()
+                    if ending != "data":
+                        for client in range(3):
+                            if ending != "cancel" or client != 1:
+                                run.result(client + 1, "26000" if ending == "sql" else "ok", client=client)
+                    self.assert_pool_drained(run)
+                final = run.diagnostic()
+                accepted = 5 if ending == "close" else 3
+                success = 4 if ending in ("success", "cancel") else 1
+                failures = accepted if ending in ("sql", "data", "close") else 0
+                delivered = accepted + 1 - (ending == "cancel")
+                deltas = [a - b for a, b in zip(final["counters"], baseline["counters"])]
+                self.assertEqual(deltas[:9], [accepted, 3, accepted + 1,
+                    2 if ending == "close" else 0, 0, delivered,
+                    int(ending == "cancel"), success, failures])
+                self.assertEqual(final["gauges"][:2], [0, 0])
+                self.assertEqual(final["histograms"][1] - baseline["histograms"][1], 3)
+                self.assertEqual(final["histograms"][2] - baseline["histograms"][2], accepted + 1)
+                self.assertEqual(final["histograms"][3] - baseline["histograms"][3], 3)
+                self.assertEqual(sum(final["histograms"][4:]) - sum(baseline["histograms"][4:]), 1)
+                self.assertEqual(final["histograms"][0], baseline["histograms"][0])
 
     def test_pool_uses_idle_connection_while_another_is_blocked(self):
         with self.pool_run() as run:
@@ -3718,6 +4379,26 @@ class WorkerCSVParser(unittest.TestCase):
 
 
 class DiagnosticParser(unittest.TestCase):
+    def test_shared_worker_inflight_bounds(self):
+        for busy in range(5):
+            for inflight in range(32 * busy + 2):
+                with self.subTest(busy=busy, inflight=inflight):
+                    records = self.records([4])
+                    for record in records:
+                        if record["owner"] == 1:
+                            record["counters"] = [inflight, inflight, 0,
+                                                  0, 0, 0, 0, 0, 0, 0]
+                            record["gauges"] = [0, inflight, 0, 0, 0, 0,
+                                                4 - busy, busy, 0, 0]
+                    if busy <= inflight <= 32 * busy:
+                        _check_metric_output(self.stream(records),
+                                             require_activity=False)
+                    else:
+                        with self.assertRaisesRegex(AssertionError,
+                                "physical slot states"):
+                            _check_metric_output(self.stream(records),
+                                                 require_activity=False)
+
     @staticmethod
     def records(actor_count=2):
         sizes = ([1] * actor_count if isinstance(actor_count, int)
