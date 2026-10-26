@@ -268,6 +268,13 @@ and [<Sealed; AllowNullLiteral>] Ctx(owner: Owner, id: int) as this =
         w.WriteEndObject()
         w.WriteEndObject()
 
+    /// drops what was written of the response (a batch that failed is retried)
+    member c.ClearBody() =
+        out.Reset()
+        w.Reset(out)
+        c.Status <- 200
+        c.Found <- false
+
     member c.NoContent() =
         out.Reset()
         w.Reset(out)

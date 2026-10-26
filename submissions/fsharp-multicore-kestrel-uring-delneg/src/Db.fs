@@ -206,6 +206,10 @@ type BatchQuery(k: Sql.Kind, release: BatchQuery -> unit) =
         if packing then
             if isNull (box packer) then packer <- Packer()
             packer.Clear()
+        if not (isNull k.Pre) then
+            w.Bind k.Pre
+            b.Params w
+            w.EndBind()
         w.Bind(
             if packing then k.Packed
             elif not (isNull k.Shared) && b.Overlapping() then k.Shared
@@ -363,17 +367,43 @@ type PgThread(o: Options) as this =
 
     /// fill free read connections, the kind whose oldest request waited longest first
     /// Returns the ticks until the next batch window closes (0 = none waiting).
-    member private _.Pump() : int64 =
+    member private this.Batch(k: int, conn: PgConn) =
+        let kind = kinds.[k]
+        let b = if free.[k].Count > 0 then free.[k].Pop() else BatchQuery(kind, releaseBatch)
+        let p = pending.[k]
+        let n = min p.Count kind.MaxBatch
+        for i in 0 .. n - 1 do b.Items.[i] <- p.Dequeue()
+        b.N <- n
+        inflight.[k] <- inflight.[k] + 1
+        if stats then
+            stBatches <- stBatches + 1L
+            stItems <- stItems + int64 n
+            stKB.[k] <- stKB.[k] + 1L
+            stKI.[k] <- stKI.[k] + int64 n
+        if isNull conn then b.Done(PgError("08006", "no postgres connection")) else conn.Submit b |> ignore
+
+    member private this.Pump() : int64 =
         needPump <- false
         let now = if waitTicks > 0L then Diagnostics.Stopwatch.GetTimestamp() else 0L
         let mutable next = Int64.MaxValue
+        // write kinds: to the write connection with the fewest in flight, by the same clock
+        for k in 0 .. kinds.Length - 1 do
+            if kinds.[k].Write then
+                let p = pending.[k]
+                let mutable more = true
+                while more && p.Count > 0 && inflight.[k] < kinds.[k].MaxInflight do
+                    let t = p.Peek().Queued
+                    if waitTicks > 0L && p.Count < kinds.[k].MaxBatch && now - t < waitTicks then
+                        next <- min next (t + waitTicks - now)
+                        more <- false
+                    else this.Batch(k, this.Least writes)
         let mutable go = true
         while go do
             let mutable best = -1
             let mutable oldest = Int64.MaxValue
             for k in 0 .. kinds.Length - 1 do
                 let p = pending.[k]
-                if p.Count > 0 && inflight.[k] < kinds.[k].MaxInflight then
+                if p.Count > 0 && inflight.[k] < kinds.[k].MaxInflight && not kinds.[k].Write then
                     let t = p.Peek().Queued
                     if waitTicks > 0L && p.Count < kinds.[k].MaxBatch && now - t < waitTicks then
                         next <- min next (t + waitTicks - now)
@@ -386,20 +416,7 @@ type PgThread(o: Options) as this =
                 for c in reads do
                     if not c.Broken && c.Inflight < o.Depth && (isNull conn || c.Inflight < conn.Inflight) then conn <- c
                 if isNull conn then go <- false
-                else
-                    let kind = kinds.[best]
-                    let b = if free.[best].Count > 0 then free.[best].Pop() else BatchQuery(kind, releaseBatch)
-                    let p = pending.[best]
-                    let n = min p.Count kind.MaxBatch
-                    for i in 0 .. n - 1 do b.Items.[i] <- p.Dequeue()
-                    b.N <- n
-                    inflight.[best] <- inflight.[best] + 1
-                    if stats then
-                        stBatches <- stBatches + 1L
-                        stItems <- stItems + int64 n
-                        stKB.[best] <- stKB.[best] + 1L
-                        stKI.[best] <- stKI.[best] + int64 n
-                    conn.Submit b |> ignore
+                else this.Batch(best, conn)
         if next = Int64.MaxValue then 0L else max 1L next
 
     member private this.Drain() =

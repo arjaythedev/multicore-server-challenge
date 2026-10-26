@@ -38,6 +38,10 @@ type Kind(id: int, name: string, stmt: Stmt, layout: Layout) =
     member val Packed: Stmt = null with get, set
     /// the smallest batch that uses Packed (its CTEs cost more than they save on tiny batches)
     member val PackedMin = 4 with get, set
+    /// writes: this statement runs first, in the same transaction as Stmt (which reads the responses back); the
+    /// batch goes to a write connection
+    member val Pre: Stmt = null with get, set
+    member val Write = false with get, set
 
 let kinds = List<Kind>()
 
@@ -339,6 +343,13 @@ let mutable ListAuthor: Kind = Unchecked.defaultof<_>
 let mutable ListFavorited: Kind = Unchecked.defaultof<_>
 let mutable ListFeed: Kind = Unchecked.defaultof<_>
 
+let mutable FavoriteW: Kind = Unchecked.defaultof<_>
+let mutable UnfavoriteW: Kind = Unchecked.defaultof<_>
+let mutable FollowW: Kind = Unchecked.defaultof<_>
+let mutable UnfollowW: Kind = Unchecked.defaultof<_>
+/// favorites and follows go through the write kinds (WRITE_BATCH, default on)
+let mutable WriteBatch = false
+
 let mutable ArticleBySlug: Stmt = null
 let mutable ArticleInsert: Stmt = null
 let mutable TagsInsert: Stmt = null
@@ -375,6 +386,29 @@ let define () =
     Comments <- batched "comments" CommentsSql Layout.ViewerKey
     Profile <- batched "profile" ProfileSql Layout.ViewerKey
     User <- batched "user" UserById Layout.Viewer
+    // Group commit for favorites and follows (rule 6 allows it: each response waits for its batch's commit). The
+    // batch's inserts or deletes are one statement, then the batched article or profile read gives the responses,
+    // in one transaction. Rows are written in key order, so two concurrent batches lock in the same order.
+    if Environment.GetEnvironmentVariable "WRITE_BATCH" <> "0" then
+        let r = " FROM " + unnest Layout.ViewerKey
+        let writeKind name (pre: string) (read: Kind) =
+            let k = addKind name read.Stmt Layout.ViewerKey
+            k.Pre <- Stmt.Define(pre, oids Layout.ViewerKey)
+            k.Write <- true
+            k
+        FavoriteW <-
+            writeKind "favorite" ("INSERT INTO favorites (user_id, article_id) SELECT r.v, a.id" + r
+                                  + " JOIN articles a ON a.slug = r.k ORDER BY 1, 2 ON CONFLICT DO NOTHING") Article
+        UnfavoriteW <-
+            writeKind "unfavorite" ("DELETE FROM favorites f USING (SELECT r.v, a.id" + r
+                                    + " JOIN articles a ON a.slug = r.k) x WHERE f.user_id = x.v AND f.article_id = x.id") Article
+        FollowW <-
+            writeKind "follow" ("INSERT INTO follows (follower_id, followee_id) SELECT r.v, u.id" + r
+                                + " JOIN users u ON u.username = r.k ORDER BY 1, 2 ON CONFLICT DO NOTHING") Profile
+        UnfollowW <-
+            writeKind "unfollow" ("DELETE FROM follows fo USING (SELECT r.v, u.id" + r
+                                  + " JOIN users u ON u.username = r.k) x WHERE fo.follower_id = x.v AND fo.followee_id = x.id") Profile
+        WriteBatch <- true
     let at = articleTail ()
     let shared = Environment.GetEnvironmentVariable "LIST_SHARED" = "1"
     ListAll <-

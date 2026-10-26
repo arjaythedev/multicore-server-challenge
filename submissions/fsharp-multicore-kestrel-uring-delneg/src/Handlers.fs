@@ -269,7 +269,9 @@ let batchRow (c: Ctx) (r: PgRow) =
         textArray w (r.Bytes 1)
         w.WriteEndObject()
         c.Found <- true
-    | Route.Article ->
+    | Route.Article
+    | Route.Favorite
+    | Route.Unfavorite ->
         if not c.Found then
             w.WriteStartObject()
             w.WritePropertyName N.article
@@ -291,7 +293,9 @@ let batchRow (c: Ctx) (r: PgRow) =
             w.WritePropertyName N.author
             profile w r 6 -1
             w.WriteEndObject()
-    | Route.Profile ->
+    | Route.Profile
+    | Route.Follow
+    | Route.Unfollow ->
         if not c.Found then
             w.WriteStartObject()
             w.WritePropertyName N.profile
@@ -312,21 +316,36 @@ let batchRow (c: Ctx) (r: PgRow) =
             c.Found <- true
         if not (r.IsNull 2) then article w r 2 false
 
+/// a write batch whose transaction failed: each of its requests again on its own (set below, after `single`)
+let mutable private retryAlone: Ctx -> unit = ignore
+
+let private batchedWrite (r: Route) =
+    r = Route.Favorite || r = Route.Unfavorite || r = Route.Follow || r = Route.Unfollow
+
 let batchDone (c: Ctx) (err: PgError) =
-    if not (isNull err) then
+    if not (isNull err) && batchedWrite c.Route then
+        eprintfn "batched %O: %O; retrying alone" c.Route err
+        c.ClearBody()
+        retryAlone c
+    elif not (isNull err) then
         eprintfn "batched %O: %O" c.Route err
         c.Error(500, "internal error")
+        c.Finish()
     else
         let w = c.W
         match c.Route with
         | Route.Tags -> if not c.Found then c.Error(500, "no tags row")
-        | Route.Article -> if not c.Found then c.Error(404, "article not found")
+        | Route.Article
+        | Route.Favorite
+        | Route.Unfavorite -> if not c.Found then c.Error(404, "article not found")
         | Route.Comments ->
             if not c.Found then c.Error(404, "article not found")
             else
                 w.WriteEndArray()
                 w.WriteEndObject()
-        | Route.Profile -> if not c.Found then c.Error(404, "profile not found")
+        | Route.Profile
+        | Route.Follow
+        | Route.Unfollow -> if not c.Found then c.Error(404, "profile not found")
         | Route.User -> if not c.Found then c.Error(401, "unauthorized")
         | _ ->
             if not c.Found then
@@ -336,7 +355,7 @@ let batchDone (c: Ctx) (err: PgError) =
             w.WriteEndArray()
             w.WriteNumber(N.articlesCount, c.Count)
             w.WriteEndObject()
-    c.Finish()
+        c.Finish()
 
 // ---------- writes and logins ----------
 
@@ -576,6 +595,8 @@ and single (c: Ctx) : PgQuery =
     if isNull c.Single then c.Single <- SingleQuery(c, writeSingle, singleRow, singleComplete, singleDone)
     c.Single
 
+do retryAlone <- fun c -> backend().Write(single c)
+
 /// on the Postgres thread (Backend.Post), with c.Job computed
 let afterBcrypt (c: Ctx) =
     let j = c.Job
@@ -782,7 +803,10 @@ let private route (c: Ctx) (meth: ReadOnlySpan<byte>) (path: ReadOnlySpan<byte>)
                                 writeSingleRoute c Route.DeleteComment s1
                     else notFound c
                 elif n = 3 && s2.SequenceEqual bFavorite && (m = Post || m = Delete) then
-                    if required c a then writeSingleRoute c (if m = Post then Route.Favorite else Route.Unfavorite) s1
+                    if required c a then
+                        if Sql.WriteBatch then
+                            if m = Post then read c Route.Favorite Sql.FavoriteW s1 else read c Route.Unfavorite Sql.UnfavoriteW s1
+                        else writeSingleRoute c (if m = Post then Route.Favorite else Route.Unfavorite) s1
                 else notFound c
             elif s0.SequenceEqual bTags && n = 1 && m = Get then
                 c.Route <- Route.Tags
@@ -790,7 +814,10 @@ let private route (c: Ctx) (meth: ReadOnlySpan<byte>) (path: ReadOnlySpan<byte>)
             elif s0.SequenceEqual bProfiles && n >= 2 then
                 if n = 2 && m = Get then (if optional c a then read c Route.Profile Sql.Profile s1)
                 elif n = 3 && s2.SequenceEqual bFollow && (m = Post || m = Delete) then
-                    if required c a then writeSingleRoute c (if m = Post then Route.Follow else Route.Unfollow) s1
+                    if required c a then
+                        if Sql.WriteBatch then
+                            if m = Post then read c Route.Follow Sql.FollowW s1 else read c Route.Unfollow Sql.UnfollowW s1
+                        else writeSingleRoute c (if m = Post then Route.Follow else Route.Unfollow) s1
                 else notFound c
             elif s0.SequenceEqual bUser && n = 1 then
                 if m = Get then

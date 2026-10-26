@@ -112,3 +112,21 @@ fixed seeded inputs in one backend and read its CPU from /proc: SQL shape A/B wi
   starts to crowd L1); x86-64-v3 the same; -O2 much worse (33.0). Not worth the change.
 - **Candidate (e14)**: 20 ms clock, bcrypt helper: 197.2 us/req (app 68.4, PG 131.4), p95 37.0 ms, 0 errors.
   Overload PASS, 197/197 on dev and seed. Committed.
+- **19 four read connections, replicated**: 205.1 / 196.7 vs 198.2 / 194.6. The single 187.1 was noise; the
+  screen's spread is about +-4 us, so small effects go to the SQL replays instead.
+- **20** DB_CONNS 3: 196.7; DB_CONNS 4 + BATCH_INFLIGHT 3: 193.7. Noise band; defaults stay.
+- **21 high load** (6 read connections): 10,000 users at think-scale 0.1, 25.1k req/s, 186.0 us/req, p95 60 ms;
+  12,000 users, 29.1k req/s, 184.0 us/req, p95 96 ms, 5.36 cores (+1.5 for the load generator). With 4 read
+  connections p95 at 12,000 was 138 ms: fewer connections cost parallelism at high load.
+- **22 feed count** (replay): one capped walk instead of `EXISTS ... OFFSET 999` then `count(*)`: 360-367 vs 365
+  at batch 16, worse at 8. The first replay of a run is cold (r1 numbers dropped).
+- **23 comments**: a follow probe per comment instead of the viewer's followee array: 52.1 vs 47.9. Discarded.
+- **24 Postgres split** (60 s of a screen, by backend): read connections 1.74 cores, write connections 0.35
+  (~23 us/req: ~405 us per write request at ~860 writes/s), background processes ~0. Group commit is next.
+- **25 write replay** (`scripts/wreplay/`, psql pipelines like the app's): a favorite (insert + article read +
+  commit) costs Postgres 375-442 us alone; batched 4: 175-217, 8: 144-167, 16: 115-133 per request.
+- **26 group commit** for favorite, unfavorite, follow, unfollow: write kinds on the same 20 ms clock; the batch's
+  insert or delete is one statement (rows in key order, so concurrent batches lock in the same order), then the
+  batched article or profile read answers each request, all in one transaction on a write connection. If the
+  batch fails, each request runs again alone (the old path). 189.5 / 190.4 / 188.3 vs 207.1 / 196.2 us/req;
+  write connections 0.349 -> 0.217 cores. Conformance 197/197 (dev, seed), responses identical. Kept.
