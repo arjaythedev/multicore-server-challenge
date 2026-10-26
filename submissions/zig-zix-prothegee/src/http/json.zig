@@ -22,12 +22,46 @@ pub const ProfileView = struct {
     following: bool,
 };
 
+pub const ArticleSummaryView = struct {
+    slug: []const u8,
+    title: []const u8,
+    description: []const u8,
+    tagList: []const []const u8,
+    createdAt: []const u8,
+    updatedAt: []const u8,
+    favorited: bool,
+    favoritesCount: i64,
+    author: ProfileView,
+};
+
+pub const ArticleView = struct {
+    slug: []const u8,
+    title: []const u8,
+    description: []const u8,
+    body: []const u8,
+    tagList: []const []const u8,
+    createdAt: []const u8,
+    updatedAt: []const u8,
+    favorited: bool,
+    favoritesCount: i64,
+    author: ProfileView,
+};
+
 const UserEnvelope = struct {
     user: UserView,
 };
 
 const ProfileEnvelope = struct {
     profile: ProfileView,
+};
+
+const ArticlesEnvelope = struct {
+    articles: []const ArticleSummaryView,
+    articlesCount: i64,
+};
+
+const ArticleEnvelope = struct {
+    article: ArticleView,
 };
 
 const ErrorBody = struct {
@@ -64,6 +98,16 @@ pub fn renderTags(buf: []u8, names: []const []const u8) !usize {
 /// Render `{"profile": Profile}`.
 pub fn renderProfile(buf: []u8, profile: ProfileView) !usize {
     return jzon.serialize(buf, ProfileEnvelope{ .profile = profile }, .{});
+}
+
+/// Render `{"articles": [Article], "articlesCount": count}`.
+pub fn renderArticles(buf: []u8, articles: []const ArticleSummaryView, count: i64) !usize {
+    return jzon.serialize(buf, ArticlesEnvelope{ .articles = articles, .articlesCount = count }, .{});
+}
+
+/// Render `{"article": Article}`.
+pub fn renderArticle(buf: []u8, article: ArticleView) !usize {
+    return jzon.serialize(buf, ArticleEnvelope{ .article = article }, .{});
 }
 
 // --------------------------------------------------------- //
@@ -183,4 +227,74 @@ test "json: a profile with text fields and a false flag" {
 
     try std.testing.expect(std.mem.indexOf(u8, text, "\"bio\":\"hello\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "\"following\":false") != null);
+}
+
+test "json: an article list omits the body" {
+    var buf: [1024]u8 = undefined;
+    const tags = [_][]const u8{ "alpha", "beta" };
+    const articles = [_]ArticleSummaryView{.{
+        .slug = "hello-1",
+        .title = "Hello",
+        .description = "Short",
+        .tagList = &tags,
+        .createdAt = "2025-04-01T12:00:00.000Z",
+        .updatedAt = "2025-04-01T12:00:00.000Z",
+        .favorited = false,
+        .favoritesCount = 0,
+        .author = .{
+            .username = "ada",
+            .bio = null,
+            .image = null,
+            .following = false,
+        },
+    }};
+
+    const len = try renderArticles(&buf, &articles, 1);
+    const text = buf[0..len];
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"articles\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"articlesCount\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"tagList\":[\"alpha\",\"beta\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"createdAt\":\"2025-04-01T12:00:00.000Z\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"body\"") == null);
+}
+
+test "json: an article includes the body and the author" {
+    var buf: [2048]u8 = undefined;
+    const tags = [_][]const u8{"alpha"};
+    const article = ArticleView{
+        .slug = "hello-1",
+        .title = "Hello",
+        .description = "Short",
+        .body = "Text",
+        .tagList = &tags,
+        .createdAt = "2025-04-01T12:00:00.000Z",
+        .updatedAt = "2025-04-01T12:00:00.000Z",
+        .favorited = true,
+        .favoritesCount = 3,
+        .author = .{
+            .username = "ada",
+            .bio = "bio",
+            .image = null,
+            .following = true,
+        },
+    };
+
+    const len = try renderArticle(&buf, article);
+    const text = buf[0..len];
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"body\":\"Text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"favorited\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"favoritesCount\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"author\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"following\":true") != null);
+}
+
+test "json: an empty article list renders the count" {
+    var buf: [128]u8 = undefined;
+    const empty = [_]ArticleSummaryView{};
+
+    const len = try renderArticles(&buf, &empty, 0);
+
+    try std.testing.expectEqualStrings("{\"articles\":[],\"articlesCount\":0}", buf[0..len]);
 }
