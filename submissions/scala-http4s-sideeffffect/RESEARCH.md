@@ -112,7 +112,7 @@ Native entries write JSON bytes by hand from PG rows. vertx/ktor: "writing JSON 
 Use **2.0.0-RC3** if pre-release is acceptable: PR https://github.com/typelevel/skunk/pull/1356 "Optimize protocol round trips"
 cuts exchanges: `execute(query)(args)` 4→**1**, `unique`/`option` 3→**1**, parameterized command 3→**1** (inside explicit xact: 2).
 On loopback the latency win is small, but every exchange is a PG wakeup + socket write/read + fiber hop: fewer exchanges = less app and kernel CPU.
-RC3 also fixes "don't hand out errored/closed sessions from pool" (https://github.com/typelevel/skunk/pull/1354). Pin it in build.sbt (rule 11).
+RC3 also fixes "don't hand out errored/closed sessions from pool" (https://github.com/typelevel/skunk/pull/1354). Pin it in project.scala (rule 11).
 Deps: fs2 3.14.0, otel4s 1.1.0 (matches our fs2).
 
 **Architecture limits**
