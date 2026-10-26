@@ -96,44 +96,44 @@ const TagsEnvelope = struct {
 
 /// Render `{"user": User}`.
 pub fn renderUser(buf: []u8, user: UserView) !usize {
-    return jzon.serialize(buf, UserEnvelope{ .user = user }, .{});
+    return jzon.serialize(buf, UserEnvelope{ .user = user }, .{ .strategy = .GENERATED });
 }
 
 /// Render `{"errors": {"body": ["message"]}}`.
 pub fn renderError(buf: []u8, message: []const u8) !usize {
     const messages = [_][]const u8{message};
 
-    return jzon.serialize(buf, ErrorEnvelope{ .errors = .{ .body = &messages } }, .{});
+    return jzon.serialize(buf, ErrorEnvelope{ .errors = .{ .body = &messages } }, .{ .strategy = .GENERATED });
 }
 
 /// Render `{"tags": ["name", ...]}`.
 pub fn renderTags(buf: []u8, names: []const []const u8) !usize {
-    return jzon.serialize(buf, TagsEnvelope{ .tags = names }, .{});
+    return jzon.serialize(buf, TagsEnvelope{ .tags = names }, .{ .strategy = .GENERATED });
 }
 
 /// Render `{"profile": Profile}`.
 pub fn renderProfile(buf: []u8, profile: ProfileView) !usize {
-    return jzon.serialize(buf, ProfileEnvelope{ .profile = profile }, .{});
+    return jzon.serialize(buf, ProfileEnvelope{ .profile = profile }, .{ .strategy = .GENERATED });
 }
 
 /// Render `{"articles": [Article], "articlesCount": count}`.
 pub fn renderArticles(buf: []u8, articles: []const ArticleSummaryView, count: i64) !usize {
-    return jzon.serialize(buf, ArticlesEnvelope{ .articles = articles, .articlesCount = count }, .{});
+    return jzon.serialize(buf, ArticlesEnvelope{ .articles = articles, .articlesCount = count }, .{ .strategy = .GENERATED });
 }
 
 /// Render `{"article": Article}`.
 pub fn renderArticle(buf: []u8, article: ArticleView) !usize {
-    return jzon.serialize(buf, ArticleEnvelope{ .article = article }, .{});
+    return jzon.serialize(buf, ArticleEnvelope{ .article = article }, .{ .strategy = .GENERATED });
 }
 
 /// Render `{"comments": [Comment]}`.
 pub fn renderComments(buf: []u8, comments: []const CommentView) !usize {
-    return jzon.serialize(buf, CommentsEnvelope{ .comments = comments }, .{});
+    return jzon.serialize(buf, CommentsEnvelope{ .comments = comments }, .{ .strategy = .GENERATED });
 }
 
 /// Render `{"comment": Comment}`.
 pub fn renderComment(buf: []u8, comment: CommentView) !usize {
-    return jzon.serialize(buf, CommentEnvelope{ .comment = comment }, .{});
+    return jzon.serialize(buf, CommentEnvelope{ .comment = comment }, .{ .strategy = .GENERATED });
 }
 
 // --------------------------------------------------------- //
