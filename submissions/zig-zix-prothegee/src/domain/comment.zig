@@ -26,35 +26,51 @@ const AuthorId = struct {
 
 // --------------------------------------------------------- //
 
-const COMMENT_SELECT = "SELECT c.id, c.body, " ++
-    "to_char(c.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS created_at, " ++
-    "to_char(c.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS updated_at, " ++
-    "u.username, u.bio, u.image, " ++
-    "EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = c.author_id) AS following " ++
-    "FROM comments c JOIN users u ON u.id = c.author_id ";
+const SQL_LIST =
+    \\SELECT c.id, c.body,
+    \\to_char(c.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+    \\to_char(c.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
+    \\u.username, u.bio, u.image,
+    \\EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = c.author_id) AS following
+    \\FROM comments c JOIN users u ON u.id = c.author_id
+    \\WHERE c.article_id = $2
+    \\ORDER BY c.created_at DESC, c.id DESC LIMIT 100
+;
 
-const SQL_LIST = COMMENT_SELECT ++ "WHERE c.article_id = $2 ORDER BY c.created_at DESC, c.id DESC LIMIT 100";
+const SQL_LIST_BY_SLUG =
+    \\SELECT c.id, c.body,
+    \\to_char(c.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+    \\to_char(c.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
+    \\u.username, u.bio, u.image,
+    \\EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = c.author_id) AS following
+    \\FROM comments c JOIN articles a ON a.id = c.article_id
+    \\JOIN users u ON u.id = c.author_id
+    \\WHERE a.slug = $2
+    \\ORDER BY c.created_at DESC, c.id DESC LIMIT 100
+;
 
-const SQL_BY_ID = COMMENT_SELECT ++ "WHERE c.id = $2";
+const SQL_BY_ID =
+    \\SELECT c.id, c.body,
+    \\to_char(c.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+    \\to_char(c.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
+    \\u.username, u.bio, u.image,
+    \\EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = c.author_id) AS following
+    \\FROM comments c JOIN users u ON u.id = c.author_id
+    \\WHERE c.id = $2
+;
 
 const SQL_INSERT = "INSERT INTO comments (article_id, author_id, body) VALUES ($1, $2, $3) RETURNING id";
 
-const SQL_OWNER = "SELECT c.author_id FROM comments c JOIN articles a ON a.id = c.article_id " ++
-    "WHERE c.id = $1 AND a.slug = $2";
+const SQL_OWNER =
+    \\SELECT c.author_id FROM comments c JOIN articles a ON a.id = c.article_id
+    \\WHERE c.id = $1 AND a.slug = $2
+;
 
 const SQL_DELETE = "DELETE FROM comments WHERE id = $1";
 
 // --------------------------------------------------------- //
 
-fn runList(
-    conn: *postgrez.Conn,
-    allocator: std.mem.Allocator,
-    sql: []const u8,
-    args: anytype,
-) Error![]Comment {
-    var result = conn.rows(sql, args) catch return error.Database;
-    defer result.deinit();
-
+fn parseList(result: *postgrez.Result, allocator: std.mem.Allocator) Error![]Comment {
     var comments: std.ArrayList(Comment) = .empty;
     errdefer comments.deinit(allocator);
 
@@ -69,15 +85,7 @@ fn runList(
     return comments.toOwnedSlice(allocator) catch error.Database;
 }
 
-fn runOne(
-    conn: *postgrez.Conn,
-    allocator: std.mem.Allocator,
-    sql: []const u8,
-    args: anytype,
-) Error!?Comment {
-    var result = conn.rows(sql, args) catch return error.Database;
-    defer result.deinit();
-
+fn parseOne(result: *postgrez.Result, allocator: std.mem.Allocator) Error!?Comment {
     const maybe_row = result.next() catch return error.Database;
     const row = maybe_row orelse return null;
 
@@ -86,14 +94,68 @@ fn runOne(
 
 // --------------------------------------------------------- //
 
-/// The newest 100 comments on one article.
+/// A prepared comment list by article slug. The server-side statement keeps
+/// the plan, not the rows.
+pub const ListQuery = struct {
+    statement: postgrez.Statement,
+
+    /// Prepare the statement once on this connection.
+    pub fn init(conn: *postgrez.Conn) Error!ListQuery {
+        return .{ .statement = conn.prepare(SQL_LIST_BY_SLUG) catch return error.Database };
+    }
+
+    /// Close the server-side statement (best effort).
+    pub fn deinit(self: *ListQuery) void {
+        self.statement.deinit();
+    }
+
+    /// The newest 100 comments on the article with this slug.
+    pub fn listBySlug(
+        self: *ListQuery,
+        allocator: std.mem.Allocator,
+        viewer: i64,
+        slug: []const u8,
+    ) Error![]Comment {
+        var result = self.statement.rows(.{ viewer, slug }) catch return error.Database;
+        defer result.deinit();
+
+        return parseList(&result, allocator);
+    }
+};
+
+threadlocal var tl_query: ?ListQuery = null;
+threadlocal var tl_query_conn: ?*postgrez.Conn = null;
+
+/// The prepared list query for this worker's connection, prepared once.
+pub fn prepared(conn: *postgrez.Conn) Error!*ListQuery {
+    if (tl_query != null and tl_query_conn == conn) {
+        return &tl_query.?;
+    }
+
+    if (tl_query) |*query| {
+        query.deinit();
+        tl_query = null;
+    }
+
+    tl_query = try ListQuery.init(conn);
+    tl_query_conn = conn;
+
+    return &tl_query.?;
+}
+
+// --------------------------------------------------------- //
+
+/// The newest 100 comments on one article, via the unnamed statement.
 pub fn list(
     conn: *postgrez.Conn,
     allocator: std.mem.Allocator,
     viewer: i64,
     article_id: i64,
 ) Error![]Comment {
-    return runList(conn, allocator, SQL_LIST, .{ viewer, article_id });
+    var result = conn.rows(SQL_LIST, .{ viewer, article_id }) catch return error.Database;
+    defer result.deinit();
+
+    return parseList(&result, allocator);
 }
 
 /// One comment by id.
@@ -103,7 +165,10 @@ pub fn findById(
     viewer: i64,
     id: i64,
 ) Error!?Comment {
-    return runOne(conn, allocator, SQL_BY_ID, .{ viewer, id });
+    var result = conn.rows(SQL_BY_ID, .{ viewer, id }) catch return error.Database;
+    defer result.deinit();
+
+    return parseOne(&result, allocator);
 }
 
 /// The author of a comment on the named article, for the delete check.
