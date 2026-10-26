@@ -21,7 +21,12 @@ fn list(
         return;
     };
 
-    const names = tag_domain.list(conn, ctx.allocator) catch {
+    const query = tag_domain.prepared(conn) catch {
+        try respond.sendError(res, .INTERNAL_SERVER_ERROR, "database error");
+        return;
+    };
+
+    const names = query.list(ctx.allocator) catch {
         try respond.sendError(res, .INTERNAL_SERVER_ERROR, "database error");
         return;
     };
