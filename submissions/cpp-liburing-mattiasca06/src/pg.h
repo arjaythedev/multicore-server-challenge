@@ -2,6 +2,7 @@
 #pragma once
 #include <libpq-fe.h>
 
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <initializer_list>
@@ -12,6 +13,9 @@
 #include <vector>
 
 #include "smallvec.h"
+
+// True when tag arrays come back unsorted from SQL (byte-order collation) and the app sorts them.
+extern std::atomic<bool> g_sort_tags_in_app;
 
 // A text-format statement parameter; nullptr is SQL NULL.
 struct Param {

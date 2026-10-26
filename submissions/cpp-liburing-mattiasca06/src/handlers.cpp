@@ -171,12 +171,32 @@ void article_json(std::string &o, const Res &r, int row, bool full) {
         if (ndim > 0) {
             int32_t n = codec::be32(p + 12);
             const char *e = p + 12 + 8 * ndim;
-            for (int32_t i = 0; i < n; i++) {
-                int32_t len = codec::be32(e);
-                e += 4;
-                if (i) o += ',';
-                put(o, std::string_view(e, size_t(len)));
-                e += len;
+            if (n > 1 && g_sort_tags_in_app.load(std::memory_order_relaxed)) {
+                std::string_view small[16];
+                std::vector<std::string_view> big;
+                std::string_view *tags = small;
+                if (n > 16) big.resize(size_t(n)), tags = big.data();
+                for (int32_t i = 0; i < n; i++) {
+                    int32_t len = codec::be32(e);
+                    e += 4;
+                    std::string_view t(e, size_t(len));
+                    e += len;
+                    int32_t j = i;  // insertion sort, byte order
+                    for (; j > 0 && tags[j - 1] > t; j--) tags[j] = tags[j - 1];
+                    tags[j] = t;
+                }
+                for (int32_t i = 0; i < n; i++) {
+                    if (i) o += ',';
+                    put(o, tags[i]);
+                }
+            } else {
+                for (int32_t i = 0; i < n; i++) {
+                    int32_t len = codec::be32(e);
+                    e += 4;
+                    if (i) o += ',';
+                    put(o, std::string_view(e, size_t(len)));
+                    e += len;
+                }
             }
         }
     }

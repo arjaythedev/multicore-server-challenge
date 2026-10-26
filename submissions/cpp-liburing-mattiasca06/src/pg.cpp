@@ -6,6 +6,14 @@
 
 #include "sql.h"
 
+std::atomic<bool> g_sort_tags_in_app{false};
+
+namespace {
+void replace_all(std::string &s, const std::string &from, const std::string &to) {
+    for (size_t at = 0; (at = s.find(from, at)) != std::string::npos; at += to.size()) s.replace(at, from.size(), to);
+}
+}  // namespace
+
 void PgConn::connect(const char *url) {
     c = PQconnectdb(url);
     if (PQstatus(c) != CONNECTION_OK) throw std::runtime_error(std::string("postgres: ") + PQerrorMessage(c));
@@ -22,8 +30,26 @@ void PgConn::connect(const char *url) {
         PQclear(r);
         if (!ok) throw std::runtime_error(std::string("postgres: ") + sql + ": " + PQerrorMessage(c));
     }
+    // With byte-order collation the database's tag sort equals a byte sort of the names, which the app does for free on
+    // a handful of strings; the per-article Sort node in the plan is then dropped. Any other collation keeps SQL sorting.
+    bool app_sort = false;
+    if (!getenv("PG_SQL_TAG_SORT")) {
+        PGresult *r = PQexec(c,
+            "SELECT (SELECT datlocprovider IN ('c', 'b') AND datcollate IN ('C', 'POSIX', 'C.UTF-8', 'C.utf8') "
+            "FROM pg_database WHERE datname = current_database()) AND "
+            "COALESCE((SELECT collation_name IN ('C', 'POSIX') FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = 'tags' AND column_name = 'name'), true)");
+        app_sort = PQresultStatus(r) == PGRES_TUPLES_OK && PQntuples(r) == 1 && PQgetvalue(r, 0, 0)[0] == 't';
+        PQclear(r);
+    }
+    g_sort_tags_in_app.store(app_sort, std::memory_order_relaxed);
     for (const Stmt &s : kStatements) {
-        PGresult *r = PQprepare(c, s.name, s.sql, 0, nullptr);
+        std::string sql = s.sql;
+        if (app_sort) {
+            replace_all(sql, "ORDER BY 1) AS tag_list", ") AS tag_list");
+            replace_all(sql, "array_agg(t.name ORDER BY t.name)", "array_agg(t.name)");
+        }
+        PGresult *r = PQprepare(c, s.name, sql.c_str(), 0, nullptr);
         bool ok = PQresultStatus(r) == PGRES_COMMAND_OK;
         PQclear(r);
         if (!ok) throw std::runtime_error(std::string("postgres: prepare ") + s.name + ": " + PQerrorMessage(c));
