@@ -3,6 +3,13 @@ SHELL := /bin/bash
 
 .DEFAULT_GOAL := help
 
+# Local Postgres and Go cache used by the seed targets.
+PGHOST ?= 127.0.0.1
+PGPORT ?= 5432
+PGUSER ?= conduit
+PGPASSWORD ?= conduit
+GOCACHE ?= $(CURDIR)/.cache/go-build
+
 # --------------------------------------------------------- #
 
 ##@ Info
@@ -58,6 +65,15 @@ postgres-primary-logs: ## Tail postgres primary logs
 .PHONY: sync-project-deps
 sync-project-deps: ## Syncronize root project requirements
 	cp -rf ../../schema.sql ./containers/postgres-primary/init/schema.sql;
+
+# Generate the seed databases from the root seed script.
+.PHONY: sync-seed-dev
+sync-seed-dev: ## Generate the 2% seed database (conduit_dev)
+	PGHOST=$(PGHOST) PGPORT=$(PGPORT) PGUSER=$(PGUSER) PGPASSWORD=$(PGPASSWORD) GOCACHE=$(GOCACHE) bash ../../seed/make-seed.sh --dev;
+
+.PHONY: sync-seed-full
+sync-seed-full: ## Generate the full seed database (conduit_seed)
+	PGHOST=$(PGHOST) PGPORT=$(PGPORT) PGUSER=$(PGUSER) PGPASSWORD=$(PGPASSWORD) GOCACHE=$(GOCACHE) bash ../../seed/make-seed.sh;
 
 # --------------------------------------------------------- #
 
