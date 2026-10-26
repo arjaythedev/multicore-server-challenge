@@ -1,0 +1,32 @@
+CWD := justfile_directory()
+SUBMISSIONS_DIR := parent_directory(CWD)
+REPO_ROOT := parent_directory(SUBMISSIONS_DIR)
+
+# list just commands
+default:
+  @just --list
+
+# test submission (needs go,psql and curl)
+test:
+  @cd {{REPO_ROOT}} && bash test/run.sh submissions/python-rawsocket-shawal-mbalire
+
+# show paths  resolution
+paths:
+  @echo {{ CWD }}
+  @echo {{ SUBMISSIONS_DIR }}
+  @echo {{ REPO_ROOT }}
+
+# create or recreate the local virtualenv with pinned deps
+venv:
+  python3 -m venv .venv
+  .venv/bin/pip -q install --upgrade pip
+  .venv/bin/pip -q install 'psycopg[binary]' psycopg_pool bcrypt pyjwt
+  @echo "venv ready: .venv"
+
+# lint: compile-check all sources (syntax) — fast static gate
+lint:
+  .venv/bin/python -m py_compile $(find conduit_server -name '*.py') && echo LINT_OK
+
+# check: lint + import wiring (composition root imports cleanly, routes registered)
+check: lint
+  .venv/bin/python scripts/check.py

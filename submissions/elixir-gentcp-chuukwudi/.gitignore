@@ -1,0 +1,4 @@
+_build/
+deps/
+priv/*.so
+erl_crash.dump
