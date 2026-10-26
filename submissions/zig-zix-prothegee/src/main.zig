@@ -9,6 +9,8 @@ const db = @import("db.zig");
 const api_users = @import("handlers/api_users.zig");
 const api_users_login = @import("handlers/api_users_login.zig");
 const api_user = @import("handlers/api_user.zig");
+const api_profiles_username = @import("handlers/api_profiles_username.zig");
+const api_profiles_username_follow = @import("handlers/api_profiles_username_follow.zig");
 const api_tags = @import("handlers/api_tags.zig");
 
 // --------------------------------------------------------- //
@@ -42,6 +44,16 @@ const Routes = zix.Http1.Router(&[_]zix.Http1.Route{
         .handler = api_user.RESPONSE,
     },
     // Profiles
+    .{
+        .path = api_profiles_username_follow.PATH,
+        .handler = api_profiles_username_follow.RESPONSE,
+        .kind = .PARAM,
+    },
+    .{
+        .path = api_profiles_username.PATH,
+        .handler = api_profiles_username.RESPONSE,
+        .kind = .PARAM,
+    },
     // Articles
     // Favorites
     // Comments
