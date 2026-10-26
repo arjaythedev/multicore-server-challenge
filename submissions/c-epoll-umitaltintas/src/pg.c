@@ -31,10 +31,12 @@ static void pg_watch(pgc_t *pc, bool w) {
 }
 
 // Session settings (rule 2 allows them on our own connections): every statement here has a generic plan as
-// good as a custom one, so skip re-planning; no JIT or parallel workers for these small queries. Memoize is
-// off so that, in a batched read, no request is ever handed a row cached from another request's lookup.
+// good as a custom one, so skip re-planning; no JIT or parallel workers for these small queries. No hash
+// aggregation: a generic plan can't see how few distinct keys a batch has and sized each DISTINCT's hash
+// table for thousands (8 MB per statement); sorting a few hundred keys is cheaper.
 static const char *SESSION_OPTS =
-    "-c plan_cache_mode=force_generic_plan -c jit=off -c max_parallel_workers_per_gather=0 -c enable_memoize=off";
+    "-c plan_cache_mode=force_generic_plan -c jit=off -c max_parallel_workers_per_gather=0 -c enable_memoize=off "
+    "-c enable_hashagg=off";
 
 int pg_depth = 1;     // batches in flight per read connection
 int batch_max = 256;  // requests per batched statement
@@ -205,14 +207,14 @@ void pg_event(pgc_t *pc, uint32_t ev) {
 // oldest request has waited read_window_us (or batch_max requests are waiting) and a read connection has
 // fewer than pg_depth statements in flight: the per-request query is the inner side of a LATERAL join over
 // the unnested parameters of every waiting request, and each row carries its request's ordinal.
-// Postgres pays a fixed cost per statement, so the window keeps batches large at any load, for a few ms
-// of latency. (Without it, batches only grow when the connections are busy: at moderate load nearly every
+// Postgres pays a fixed cost per statement, so the window keeps batches large at any load, for a few tens
+// of ms of latency. (Without it, batches only grow when the connections are busy: at moderate load nearly every
 // request went out alone, at ~25% more Postgres CPU per request.)
 
-// SHARE_READS=1: viewer-independent reads (the tag list) that are all waiting when the statement goes out
-// share one execution, and every one of them gets its row. The result is never kept for later requests.
-int share_reads = 0;
-int read_window_us = 20000;
+// The tag list doesn't depend on the viewer: every request waiting when the statement goes out shares one
+// execution and gets its row. The result is never kept for later requests. (SHARE_READS=0: one row each.)
+int share_reads = 1;
+int read_window_us = 40000;
 
 static int64_t now_us(void) {
   struct timespec ts;
