@@ -382,7 +382,7 @@ func writeArticleObject(dst []byte, cols [][]byte, offset int, includeBody bool)
 	}
 	createdRaw, updatedRaw, tagsRaw, favCountRaw, favFlagRaw := cols[idx], cols[idx+1], cols[idx+2], cols[idx+3], cols[idx+4]
 	dst = append(dst, `,"tagList":`...)
-	dst = writeSortedPGTextArray(dst, tagsRaw)
+	dst = writePGTextArray(dst, tagsRaw)
 	dst = writeTimestamps(dst, createdRaw, updatedRaw)
 	dst = append(dst, `,"favorited":`...)
 	dst = writeJSONBool(dst, favFlagRaw)

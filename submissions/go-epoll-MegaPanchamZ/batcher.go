@@ -330,15 +330,17 @@ func newPGEngine(srv *netServer, opts batcherOptions, pgCfg *pgconn.Config, hmac
 	return eng
 }
 
-var startupWarmSQL = [8]string{
-	"SET enable_indexonlyscan = off; SET enable_indexscan = off; SET enable_bitmapscan = off; SELECT count(body) FROM comments; RESET enable_indexonlyscan; RESET enable_indexscan; RESET enable_bitmapscan;",
-	"SET enable_indexonlyscan = off; SET enable_indexscan = off; SET enable_bitmapscan = off; SELECT count(body) FROM articles; RESET enable_indexonlyscan; RESET enable_indexscan; RESET enable_bitmapscan;",
-	"SET enable_indexonlyscan = off; SET enable_indexscan = off; SET enable_bitmapscan = off; SELECT count(bio) FROM users; SELECT count(name) FROM tags; RESET enable_indexonlyscan; RESET enable_indexscan; RESET enable_bitmapscan; SET enable_seqscan = off; SELECT count(*) FROM (SELECT user_id FROM favorites ORDER BY user_id, article_id) s; RESET enable_seqscan;",
-	"SET enable_seqscan = off; SELECT count(*) FROM (SELECT article_id FROM comments ORDER BY article_id, id) s; SELECT count(*) FROM (SELECT id FROM comments ORDER BY id) s; SELECT count(*) FROM (SELECT author_id FROM comments ORDER BY author_id) s; RESET enable_seqscan;",
-	"SET enable_seqscan = off; SELECT count(*) FROM (SELECT follower_id FROM follows ORDER BY follower_id, followee_id) s; SELECT count(*) FROM (SELECT followee_id FROM follows ORDER BY followee_id) s; SELECT count(*) FROM (SELECT article_id FROM favorites ORDER BY article_id) s; RESET enable_seqscan;",
-	"SET enable_seqscan = off; SELECT count(*) FROM (SELECT article_id FROM article_tags ORDER BY article_id, tag_id) s; SELECT count(*) FROM (SELECT tag_id FROM article_tags ORDER BY tag_id, article_id) s; RESET enable_seqscan;",
-	"SET enable_seqscan = off; SELECT count(*) FROM (SELECT slug FROM articles ORDER BY slug) s; SELECT count(*) FROM (SELECT author_id FROM articles ORDER BY author_id, id) s; SELECT count(*) FROM (SELECT id FROM articles ORDER BY id) s; RESET enable_seqscan;",
-	"SET enable_seqscan = off; SELECT count(*) FROM (SELECT id FROM users ORDER BY id) s; SELECT count(*) FROM (SELECT username FROM users ORDER BY username) s; SELECT count(*) FROM (SELECT email FROM users ORDER BY email) s; RESET enable_seqscan; SET enable_indexonlyscan = off; SET enable_indexscan = off; SET enable_bitmapscan = off; SELECT count(*) FROM favorites; SELECT count(*) FROM follows; SELECT count(*) FROM article_tags; RESET enable_indexonlyscan; RESET enable_indexscan; RESET enable_bitmapscan;",
+var startupWarmSQL = [10]string{
+	"SET statement_timeout = 0; SET enable_indexonlyscan = off; SET enable_indexscan = off; SET enable_bitmapscan = off; SELECT count(body) FROM comments;",
+	"SET statement_timeout = 0; SET enable_indexonlyscan = off; SET enable_indexscan = off; SET enable_bitmapscan = off; SELECT count(body) FROM articles;",
+	"SET statement_timeout = 0; SET enable_indexonlyscan = off; SET enable_indexscan = off; SET enable_bitmapscan = off; SELECT count(*) FROM favorites;",
+	"SET statement_timeout = 0; SET enable_seqscan = off; SELECT count(*) FROM (SELECT user_id FROM favorites ORDER BY user_id, article_id) s;",
+	"SET statement_timeout = 0; SET enable_indexonlyscan = off; SET enable_indexscan = off; SET enable_bitmapscan = off; SELECT count(*) FROM follows; SELECT count(*) FROM article_tags;",
+	"SET statement_timeout = 0; SET enable_seqscan = off; SELECT count(*) FROM (SELECT article_id FROM comments ORDER BY article_id, created_at DESC, id DESC) s; SELECT count(*) FROM (SELECT id FROM comments ORDER BY id) s;",
+	"SET statement_timeout = 0; SET enable_seqscan = off; SELECT count(*) FROM (SELECT follower_id FROM follows ORDER BY follower_id, followee_id) s; SELECT count(*) FROM (SELECT article_id FROM favorites ORDER BY article_id) s; SELECT count(*) FROM (SELECT followee_id FROM follows ORDER BY followee_id) s;",
+	"SET statement_timeout = 0; SET enable_seqscan = off; SELECT count(*) FROM (SELECT slug FROM articles ORDER BY slug) s; SELECT count(*) FROM (SELECT author_id FROM articles ORDER BY author_id, id DESC) s; SELECT count(*) FROM (SELECT id FROM articles ORDER BY id) s;",
+	"SET statement_timeout = 0; SET enable_seqscan = off; SELECT count(*) FROM (SELECT article_id FROM article_tags ORDER BY article_id, tag_id) s; SELECT count(*) FROM (SELECT tag_id FROM article_tags ORDER BY tag_id, article_id) s;",
+	"SET statement_timeout = 0; SET enable_indexonlyscan = off; SET enable_indexscan = off; SET enable_bitmapscan = off; SELECT count(bio) FROM users; SELECT count(name) FROM tags; RESET enable_indexonlyscan; RESET enable_indexscan; RESET enable_bitmapscan; SET enable_seqscan = off; SELECT count(*) FROM (SELECT author_id FROM comments ORDER BY author_id) s; SELECT count(*) FROM (SELECT id FROM users ORDER BY id) s; SELECT count(*) FROM (SELECT username FROM users ORDER BY username) s; SELECT count(*) FROM (SELECT email FROM users ORDER BY email) s;",
 }
 
 func (eng *pgEngine) openPoolWithRetry(ctx context.Context, maxWait time.Duration) error {
@@ -373,7 +375,7 @@ func (eng *pgEngine) openAllSessions(ctx context.Context) error {
 			continue
 		}
 		var warmSQL string
-		if !s.isWriter && i < len(startupWarmSQL) {
+		if i < len(startupWarmSQL) {
 			warmSQL = startupWarmSQL[i]
 		}
 		go func(sess *pgSession, wsql string) {
@@ -1429,12 +1431,12 @@ func (s *pgSession) openConnection(ctx context.Context, warmSQL string) error {
 	if err != nil {
 		return fmt.Errorf("pg connect: %w", err)
 	}
-	if err := conn.Exec(ctx, "SET plan_cache_mode = force_generic_plan; SET jit = off; SET work_mem = '32MB'").Close(); err != nil {
+	if warmSQL != "" {
+		_ = conn.Exec(ctx, "SET jit = off; "+warmSQL).Close()
+	}
+	if err := conn.Exec(ctx, "RESET enable_indexonlyscan; RESET enable_indexscan; RESET enable_bitmapscan; RESET enable_seqscan; SET statement_timeout = 5000; SET plan_cache_mode = force_generic_plan; SET jit = off; SET work_mem = '32MB'").Close(); err != nil {
 		conn.Close(ctx)
 		return fmt.Errorf("pg session init: %w", err)
-	}
-	if warmSQL != "" {
-		_ = conn.Exec(ctx, warmSQL).Close()
 	}
 	for op := sqlOp(0); op < sqlOpCount; op++ {
 		writeOp := (op >= firstWriteOp && op < firstBatchReadOp) || op >= firstBatchWriteOp
