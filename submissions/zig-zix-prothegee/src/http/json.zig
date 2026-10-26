@@ -47,6 +47,14 @@ pub const ArticleView = struct {
     author: ProfileView,
 };
 
+pub const CommentView = struct {
+    id: i64,
+    body: []const u8,
+    createdAt: []const u8,
+    updatedAt: []const u8,
+    author: ProfileView,
+};
+
 const UserEnvelope = struct {
     user: UserView,
 };
@@ -62,6 +70,14 @@ const ArticlesEnvelope = struct {
 
 const ArticleEnvelope = struct {
     article: ArticleView,
+};
+
+const CommentsEnvelope = struct {
+    comments: []const CommentView,
+};
+
+const CommentEnvelope = struct {
+    comment: CommentView,
 };
 
 const ErrorBody = struct {
@@ -108,6 +124,16 @@ pub fn renderArticles(buf: []u8, articles: []const ArticleSummaryView, count: i6
 /// Render `{"article": Article}`.
 pub fn renderArticle(buf: []u8, article: ArticleView) !usize {
     return jzon.serialize(buf, ArticleEnvelope{ .article = article }, .{});
+}
+
+/// Render `{"comments": [Comment]}`.
+pub fn renderComments(buf: []u8, comments: []const CommentView) !usize {
+    return jzon.serialize(buf, CommentsEnvelope{ .comments = comments }, .{});
+}
+
+/// Render `{"comment": Comment}`.
+pub fn renderComment(buf: []u8, comment: CommentView) !usize {
+    return jzon.serialize(buf, CommentEnvelope{ .comment = comment }, .{});
 }
 
 // --------------------------------------------------------- //
@@ -297,4 +323,38 @@ test "json: an empty article list renders the count" {
     const len = try renderArticles(&buf, &empty, 0);
 
     try std.testing.expectEqualStrings("{\"articles\":[],\"articlesCount\":0}", buf[0..len]);
+}
+
+test "json: a comment renders with its author" {
+    var buf: [1024]u8 = undefined;
+    const comment = CommentView{
+        .id = 25093,
+        .body = "Hello",
+        .createdAt = "2025-04-01T12:00:00.000Z",
+        .updatedAt = "2025-04-01T12:00:00.000Z",
+        .author = .{
+            .username = "ada",
+            .bio = null,
+            .image = null,
+            .following = false,
+        },
+    };
+
+    const len = try renderComment(&buf, comment);
+    const text = buf[0..len];
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"comment\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"id\":25093") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"body\":\"Hello\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"author\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"following\":false") != null);
+}
+
+test "json: an empty comment list renders no count" {
+    var buf: [64]u8 = undefined;
+    const empty = [_]CommentView{};
+
+    const len = try renderComments(&buf, &empty);
+
+    try std.testing.expectEqualStrings("{\"comments\":[]}", buf[0..len]);
 }
