@@ -1376,20 +1376,20 @@ class Integration(unittest.TestCase):
                 self.assert_pool_drained(run)
                 self.assertEqual(run.fence(), {0: 1, 1: 1, 2: 1, 3: 1})
 
-    def test_pool_tags_compatibility_preserves_fifo(self):
-        for barrier, sql_name, kind in (("user", b"current_user", "ok"),
+    def test_pool_tags_scan_preserves_write_boundaries(self):
+        for query_kind, sql_name, kind in (("user", b"current_user", "ok"),
                 ("register", b"register_user", "ok"),
                 ("tags-extra-parameter", b"tags", "08P01")):
             for leading in ((False, True) if kind != "ok" else (False,)):
-                with self.subTest(barrier=barrier, leading=leading), self.pool_run(1) as run:
+                with self.subTest(query_kind=query_kind, leading=leading), self.pool_run(1) as run:
                     holder = self.tag_holder(run)
                     name = "tagbarrier" + uuid.uuid4().hex
-                    command = f"{barrier} 3 2" + (f" {name}" if barrier == "register" else "")
+                    command = f"{query_kind} 3 2" + (f" {name}" if query_kind == "register" else "")
                     commands = ([command, "tags 4 0", "tags 5 1"] if leading else
                                 ["tags 1 0", "tags 2 1", command, "tags 4 0", "tags 5 1"])
                     groups = ([[3], [4, 5]] if leading else [[1, 2], [3], [4, 5]])
                     queued = sum(groups, [])
-                    if barrier == "user":
+                    if query_kind == "user":
                         groups = [[1, 2, 4, 5], [3]]
                     run.send(*commands)
                     run.wait_state(lambda s: s["queued"] == queued)
@@ -1409,11 +1409,11 @@ class Integration(unittest.TestCase):
                         run.result(id, kind if id == 3 else "ok",
                                    client=2 if id == 3 else (0 if id in (1, 4) else 1))
                     expected_binds = ([b"current_user", b"tags", b"current_user"]
-                                      if barrier == "user" else
+                                      if query_kind == "user" else
                                       [b"current_user"] + ([] if leading else [b"tags"])
                                       + [sql_name, b"tags"])
                     self.assertEqual(self.routing_binds(run.proxy)[0], expected_binds)
-                    if barrier == "register":
+                    if query_kind == "register":
                         self.assertEqual(self.db("SELECT count(*) FROM users WHERE username="
                                                  + self.literal(name), run.time_left(30)), "1")
                     self.assert_pool_drained(run)
