@@ -13,6 +13,12 @@ const BODY_MAX: usize = 8 * 1024;
 /// Room for one rendered error document.
 const ERROR_BODY_MAX: usize = 256;
 
+/// Room for one rendered article list. A page holds at most 20 summaries.
+const ARTICLE_LIST_BODY_MAX: usize = 64 * 1024;
+
+/// Room for one rendered full article.
+const ARTICLE_BODY_MAX: usize = 32 * 1024;
+
 // --------------------------------------------------------- //
 
 /// Send a JSON `{"user": ...}` response.
@@ -33,6 +39,37 @@ pub fn sendProfile(res: *zix.Http1.Response, profile: json.ProfileView, status: 
     var buf: [BODY_MAX]u8 = undefined;
 
     const len = json.renderProfile(&buf, profile) catch {
+        return sendError(res, .INTERNAL_SERVER_ERROR, "could not render response");
+    };
+
+    res.setStatus(status);
+
+    try res.sendJson(buf[0..len]);
+}
+
+/// Send a JSON `{"articles": ..., "articlesCount": ...}` response.
+pub fn sendArticles(
+    res: *zix.Http1.Response,
+    articles: []const json.ArticleSummaryView,
+    count: i64,
+    status: zix.Http1.Status.Code,
+) !void {
+    var buf: [ARTICLE_LIST_BODY_MAX]u8 = undefined;
+
+    const len = json.renderArticles(&buf, articles, count) catch {
+        return sendError(res, .INTERNAL_SERVER_ERROR, "could not render response");
+    };
+
+    res.setStatus(status);
+
+    try res.sendJson(buf[0..len]);
+}
+
+/// Send a JSON `{"article": ...}` response.
+pub fn sendArticle(res: *zix.Http1.Response, article: json.ArticleView, status: zix.Http1.Status.Code) !void {
+    var buf: [ARTICLE_BODY_MAX]u8 = undefined;
+
+    const len = json.renderArticle(&buf, article) catch {
         return sendError(res, .INTERNAL_SERVER_ERROR, "could not render response");
     };
 
