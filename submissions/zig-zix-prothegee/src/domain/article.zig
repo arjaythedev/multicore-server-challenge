@@ -52,6 +52,10 @@ const Count = struct {
     count: i64,
 };
 
+const ArticleId = struct {
+    id: i64,
+};
+
 // --------------------------------------------------------- //
 
 fn columns(comptime with_body: bool) []const u8 {
@@ -109,6 +113,8 @@ const SQL_FEED_COUNT = "SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.a
 const SQL_BY_SLUG = ARTICLE_FULL_SELECT ++ "WHERE a.slug = $2";
 
 const SQL_BY_ID = ARTICLE_FULL_SELECT ++ "WHERE a.id = $2";
+
+const SQL_ARTICLE_ID = "SELECT id FROM articles WHERE slug = $1";
 
 const SQL_INSERT = "INSERT INTO articles (id, slug, author_id, title, description, body) " ++
     "SELECT n.id, trim(both '-' from lower(regexp_replace($2, '[^A-Za-z0-9]+', '-', 'g'))) || '-' || n.id, $1, $2, $3, $4 " ++
@@ -266,6 +272,24 @@ pub fn ownerBySlug(
     const row = maybe_row orelse return null;
 
     return postgrez.row.parseRow(Owner, allocator, row.columns, row.cells, .{}) catch error.Database;
+}
+
+/// The article id for a slug, or null when the article is missing.
+pub fn idBySlug(
+    conn: *postgrez.Conn,
+    allocator: std.mem.Allocator,
+    slug: []const u8,
+) Error!?i64 {
+    var result = conn.rows(SQL_ARTICLE_ID, .{slug}) catch return error.Database;
+    defer result.deinit();
+
+    const maybe_row = result.next() catch return error.Database;
+    const row = maybe_row orelse return null;
+    const found = postgrez.row.parseRow(ArticleId, allocator, row.columns, row.cells, .{}) catch {
+        return error.Database;
+    };
+
+    return found.id;
 }
 
 // --------------------------------------------------------- //
