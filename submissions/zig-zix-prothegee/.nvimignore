@@ -15,6 +15,7 @@
 .zig-cache
 .zig-out
 .zig-pkg
+.zig-global
 
 bin
 tmp
@@ -29,6 +30,7 @@ node_modules
 zig-cache
 zig-out
 zig-pkg
+zig-global
 
 ##
 ## extension
