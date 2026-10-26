@@ -45,8 +45,12 @@ fn list(
         return;
     };
 
-    const page = article_domain.list(
-        conn,
+    const prepared = article_domain.prepared(conn) catch {
+        try respond.sendError(res, .INTERNAL_SERVER_ERROR, "database error");
+        return;
+    };
+
+    const page = prepared.list(
         ctx.allocator,
         viewer,
         article_filter.parse(req.queryParam("tag"), req.queryParam("author"), req.queryParam("favorited")),
