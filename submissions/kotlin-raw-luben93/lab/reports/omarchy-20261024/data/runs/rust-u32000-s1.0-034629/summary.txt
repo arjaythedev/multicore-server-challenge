@@ -1,0 +1,1 @@
+rust users=32000 scale=1.0 rps=8446 p50=0.2 p95=15.7 p99=31.9 err=0.0000 | app=38%cpu pg=108%cpu | app_us/req=44.5 pg_us/req=128.3 total_us/req=172.8 | rss=38MB fds=32018 pass=True lgcpu=4% lg_limited=False 

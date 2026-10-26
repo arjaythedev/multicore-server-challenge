@@ -1,0 +1,1 @@
+knat-h4 users=120000 scale=1.0 rps=25715 p50=1008.6 p95=1209.3 p99=1286.1 err=0.0010 | app=389%cpu pg=383%cpu | app_us/req=151.2 pg_us/req=148.8 total_us/req=300.1 | rss=2019MB fds=120021 pass=False lgcpu=13% lg_limited=False p95 1209 ms >= 500;p99 1286 ms >= 1000

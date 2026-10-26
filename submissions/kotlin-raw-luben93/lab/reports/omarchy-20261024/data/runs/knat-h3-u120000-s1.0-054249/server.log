@@ -1,0 +1,1 @@
+conduit: listening on 0.0.0.0:3000 (cpus=8 http=3 db=6+2 bcrypt=1; kotlin/native, RLIMIT_NOFILE 200000)

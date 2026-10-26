@@ -1,0 +1,129 @@
+conduit: listening on 0.0.0.0:3000 (cpus=8 http=2 db=4+2 bcrypt=2; jvm OpenJDK 64-Bit Server VM 27, heap max 1024 MB)
+http: engine error, closing connection: java.lang.OutOfMemoryError: Java heap space
+	at conduit.util.ByteBuf.<init>(ByteBuf.kt:10)
+	at conduit.http.Out.<init>(Exchange.kt:29)
+	at conduit.http.OutPool.get(Exchange.kt:50)
+	at conduit.http.EngineCore.dispatch(Engine.kt:179)
+	at conduit.http.EngineCore.parse(Engine.kt:138)
+	at conduit.http.EngineCore.onData(Engine.kt:60)
+	at conduit.http.HttpEngine.onData(Http.kt:88)
+	at conduit.platform.NioLoop.read(NioHttp.kt:134)
+	at conduit.platform.NioLoop.handle(NioHttp.kt:117)
+	at conduit.platform.NioLoop.onKey$lambda$0(NioHttp.kt:65)
+	at conduit.platform.NioLoop$$Lambda/0x000000005d09f800.accept(Unknown Source)
+	at java.base/sun.nio.ch.SelectorImpl.processReadyEvents(SelectorImpl.java:298)
+	at java.base/sun.nio.ch.EPollSelectorImpl.processEvents(EPollSelectorImpl.java:229)
+	at java.base/sun.nio.ch.EPollSelectorImpl.doSelect(EPollSelectorImpl.java:135)
+	at java.base/sun.nio.ch.SelectorImpl.lockAndDoSelect(SelectorImpl.java:130)
+	at java.base/sun.nio.ch.SelectorImpl.select(SelectorImpl.java:162)
+	at conduit.platform.NioLoop.turn(NioHttp.kt:98)
+	at conduit.platform.NioLoop.run(NioHttp.kt:81)
+	at conduit.platform.NioHttpKt.startNioServer$lambda$1(NioHttp.kt:44)
+	at conduit.platform.NioHttpKt$$Lambda/0x000000005d09fc00.invoke(Unknown Source)
+	at conduit.platform.PlatformJvmKt.startThread$lambda$0(PlatformJvm.kt:33)
+	at conduit.platform.PlatformJvmKt$$Lambda/0x000000005d04a400.run(Unknown Source)
+	at java.base/java.lang.Thread.runWith(Thread.java:1540)
+	at java.base/java.lang.Thread.run(Thread.java:1527)
+
+http: engine error, closing connection: java.lang.OutOfMemoryError: Java heap space
+	at conduit.util.ByteBuf.<init>(ByteBuf.kt:10)
+	at conduit.http.Out.<init>(Exchange.kt:29)
+	at conduit.http.OutPool.get(Exchange.kt:50)
+	at conduit.http.EngineCore.dispatch(Engine.kt:179)
+	at conduit.http.EngineCore.parse(Engine.kt:138)
+	at conduit.http.EngineCore.onData(Engine.kt:60)
+	at conduit.http.HttpEngine.onData(Http.kt:88)
+	at conduit.platform.NioLoop.read(NioHttp.kt:134)
+	at conduit.platform.NioLoop.handle(NioHttp.kt:117)
+	at conduit.platform.NioLoop.onKey$lambda$0(NioHttp.kt:65)
+	at conduit.platform.NioLoop$$Lambda/0x000000005d09f800.accept(Unknown Source)
+	at java.base/sun.nio.ch.SelectorImpl.processReadyEvents(SelectorImpl.java:298)
+	at java.base/sun.nio.ch.EPollSelectorImpl.processEvents(EPollSelectorImpl.java:229)
+	at java.base/sun.nio.ch.EPollSelectorImpl.doSelect(EPollSelectorImpl.java:135)
+	at java.base/sun.nio.ch.SelectorImpl.lockAndDoSelect(SelectorImpl.java:130)
+	at java.base/sun.nio.ch.SelectorImpl.select(SelectorImpl.java:162)
+	at conduit.platform.NioLoop.turn(NioHttp.kt:98)
+	at conduit.platform.NioLoop.run(NioHttp.kt:81)
+	at conduit.platform.NioHttpKt.startNioServer$lambda$1(NioHttp.kt:44)
+	at conduit.platform.NioHttpKt$$Lambda/0x000000005d09fc00.invoke(Unknown Source)
+	at conduit.platform.PlatformJvmKt.startThread$lambda$0(PlatformJvm.kt:33)
+	at conduit.platform.PlatformJvmKt$$Lambda/0x000000005d04a400.run(Unknown Source)
+	at java.base/java.lang.Thread.runWith(Thread.java:1540)
+	at java.base/java.lang.Thread.run(Thread.java:1527)
+
+
+Exception: java.lang.OutOfMemoryError thrown from the UncaughtExceptionHandler in thread "http-0"
+
+Exception: java.lang.OutOfMemoryError thrown from the UncaughtExceptionHandler in thread "http-1"
+Exception in thread "pg-read-0" java.lang.OutOfMemoryError: Java heap space
+http: handler failed: java.lang.OutOfMemoryError: Java heap space
+
+db: write continuation threw: java.lang.OutOfMemoryError: Java heap space
+db: write continuation threw: java.lang.OutOfMemoryError: Java heap space
+Exception in thread "pg-read-3" java.lang.OutOfMemoryError: Java heap space
+db: read-2: database connection lost: Java heap space; reconnecting
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+conduit: database error: 08006 database connection lost: Java heap space
+db: read-2: reconnected after 1 attempt(s)

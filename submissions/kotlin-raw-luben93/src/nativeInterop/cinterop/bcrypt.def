@@ -1,0 +1,9 @@
+package = conduit.cbcrypt
+headers = conduit-bcrypt.h
+headerFilter = conduit-bcrypt.h
+compilerOpts = -O3
+---
+/* native/conduit-bcrypt.c (the Openwall bcrypt core with interleaved lanes) compiled into the Kotlin/Native binary
+ * by Kotlin/Native's clang; build.gradle.kts puts native/ on the include path. -O3 matters (the interleave relies on
+ * unrolling); no -m flags, the box's CPU is unknown. */
+#include "conduit-bcrypt.c"

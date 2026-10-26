@@ -1,0 +1,1 @@
+conduit: listening on 0.0.0.0:3000 (cpus=8 http=2 db=6+2 bcrypt=3; jvm OpenJDK 64-Bit Server VM 27, heap max 1024 MB)

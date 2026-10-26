@@ -1,0 +1,12 @@
+search-kraw-jvm  (lang search-kraw-jvm, target http://127.0.0.1:3000,http://127.0.0.2:3000,http://127.0.0.3:3000,http://127.0.0.4:3000,http://127.0.0.5:3000,http://127.0.0.6:3000,http://127.0.0.7:3000,http://127.0.0.8:3000)
+LG-LIMITED at 160000 users (the load boxes, not the server, were the limit); highest clean passing probe 128000
+probes: highest pass 128000, lowest fail none
+
+
+phase         users   pass  lg     req/s     p50     p95     p99   err%
+probe-8000     8000   true  false    2129     0.2     7.9    21.0   0.00
+probe-16000   16000   true  false    4227     0.2     8.3    24.6   0.00
+probe-32000   32000   true  false    8466     0.2    15.8    33.0   0.00
+probe-64000   64000   true  false   16951     0.3    16.7    41.1   0.00
+probe-128000 128000   true  false   32162   220.8   332.0   367.4   0.04
+probe-160000 160000   false true     6954 10076.2 11567.1 12681.2  92.88

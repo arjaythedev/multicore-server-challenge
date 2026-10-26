@@ -1,0 +1,32 @@
+Running as unit: mcsc-app.scope; invocation ID: 3ee6cc6c9a9c49b29ab3778b4b2bdca6
+conduit: listening on 0.0.0.0:3000 (cpus=8 http=2 db=6+2 bcrypt=1; jvm OpenJDK 64-Bit Server VM 27, heap max 1024 MB)
+db: read continuation threw: java.lang.OutOfMemoryError: Java heap space
+db: write continuation threw: java.lang.OutOfMemoryError: Java heap space
+http: handler failed: java.lang.OutOfMemoryError: Java heap space
+
+http: handler failed: java.lang.OutOfMemoryError: Java heap space
+
+http-1: loop error: java.lang.OutOfMemoryError: Java heap space
+
+http-0: loop error: java.lang.OutOfMemoryError: Java heap space
+
+http: engine error, closing connection: java.lang.OutOfMemoryError: Java heap space
+
+http: engine error, closing connection: java.lang.OutOfMemoryError: Java heap space
+
+http: handler failed: java.lang.OutOfMemoryError: Java heap space
+
+http-0: loop error: java.lang.OutOfMemoryError: Java heap space
+
+
+Exception: java.lang.OutOfMemoryError thrown from the UncaughtExceptionHandler in thread "http-0"
+
+Exception: java.lang.OutOfMemoryError thrown from the UncaughtExceptionHandler in thread "pg-read-3"
+
+Exception: java.lang.OutOfMemoryError thrown from the UncaughtExceptionHandler in thread "pg-read-1"
+
+Exception: java.lang.OutOfMemoryError thrown from the UncaughtExceptionHandler in thread "http-1"
+
+Exception: java.lang.OutOfMemoryError thrown from the UncaughtExceptionHandler in thread "pg-read-4"
+
+Exception: java.lang.OutOfMemoryError thrown from the UncaughtExceptionHandler in thread "pg-read-0"

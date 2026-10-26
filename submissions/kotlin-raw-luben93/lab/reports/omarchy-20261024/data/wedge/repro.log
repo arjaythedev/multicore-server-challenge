@@ -1,0 +1,12 @@
+app up on :3000 (db conduit_run from conduit_seed)
+jvm pid 1338435
+t~50s jvm cpu 20% of one core, curl: 200 0.000156s
+t~60s jvm cpu 56% of one core, curl: 200 0.000328s
+t~70s jvm cpu 110% of one core, curl: 200 0.000389s
+t~80s jvm cpu 169% of one core, curl: 200 0.001105s
+t~90s jvm cpu 190% of one core, curl: 200 0.049687s
+lg160 done: 
+30 s after load: jvm cpu 0%, curl: 000 5.002170s
+ALL                                            3070    153.5  10002.4  10002.4  10002.4  10002.4    10002  100.00
+verdict: FAIL (p95 10002 ms >= 500, p99 10002 ms >= 1000, errors 100.00% >= 1%)   [p95 < 500 ms, p99 < 1000 ms, errors < 1%]
+### done 05:27:42

@@ -1,0 +1,1 @@
+kraw-native users=90000 scale=1.0 rps=23844 p50=1.4 p95=16.1 p99=50.1 err=0.0000 | app=320%cpu pg=414%cpu | app_us/req=134.2 pg_us/req=173.7 total_us/req=307.9 | rss=128MB fds=90016 pass=True lgcpu=12% lg_limited=False 

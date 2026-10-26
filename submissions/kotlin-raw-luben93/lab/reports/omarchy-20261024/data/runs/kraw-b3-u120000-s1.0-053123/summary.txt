@@ -1,0 +1,1 @@
+kraw-b3 users=120000 scale=1.0 rps=31747 p50=4.8 p95=35.0 p99=70.0 err=0.0000 | app=192%cpu pg=519%cpu | app_us/req=60.5 pg_us/req=163.4 total_us/req=223.9 | rss=1156MB fds=120024 pass=True lgcpu=16% lg_limited=False 

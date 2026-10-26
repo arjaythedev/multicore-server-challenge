@@ -1,0 +1,30 @@
+{
+    "name": "conduit-vibed",
+    "description": "RealWorld Conduit API server in D on vibe.d (multicore server challenge)",
+    "license": "MIT",
+    "copyright": "Copyright (c) 2026 cyrusmsk",
+    "authors": ["cyrusmsk"],
+    "targetType": "executable",
+    "targetPath": "bin",
+    "targetName": "server",
+    "sourcePaths": ["source"],
+    "dependencies": {
+        "vibe-core": "~>2.14.0",
+        "vibe-http": "~>1.5.1",
+        "vibe-d-postgresql": "~>3.5.0",
+        "vibe-stream:tls": "~>1.4.1",
+        "passwd": "~>0.3.0",
+        "jwtlited:openssl": "~>1.4.0",
+        "openssl": "~>3.4.0"
+    },
+    "libs": ["ssl", "crypto"],
+    "versions": [
+      "VibeManualMemoryManagement",
+      "VibeHighEventPriority",
+      "VibeDisableCommandLineParsing"
+    ],
+    "subConfigurations": {
+        "vibe-stream:tls": "notls",
+    },
+    "lflags-osx": ["-L/opt/homebrew/opt/libpq/lib", "-L/opt/homebrew/opt/openssl@3/lib"]
+}

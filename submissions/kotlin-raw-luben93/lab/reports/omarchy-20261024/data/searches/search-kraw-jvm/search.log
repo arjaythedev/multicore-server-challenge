@@ -1,0 +1,32 @@
+[02:34:56] === search search-kraw-jvm: lang search-kraw-jvm, target http://127.0.0.1:3000,http://127.0.0.2:3000,http://127.0.0.3:3000,http://127.0.0.4:3000,http://127.0.0.5:3000,http://127.0.0.6:3000,http://127.0.0.7:3000,http://127.0.0.8:3000 (local), boxes [{local 1}]
+[02:34:56] target: tz +0200, 20 cores
+[02:34:56] warmup       8000 users [8000], ramp 1m0s + 2m0s, start 02:35:01
+[02:38:17] warmup         8000 users     2119 req/s  p50    0.2  p95     8.1  p99    21.7 ms  err  0.00%  lgCPU 5%  PASS
+[02:38:24] probe-8000   8000 users [8000], ramp 1m0s + 1m0s, start 02:38:29
+[02:40:45] probe-8000     8000 users     2129 req/s  p50    0.2  p95     7.9  p99    21.0 ms  err  0.00%  lgCPU 4%  PASS
+[02:40:52] probe-16000  16000 users [16000], ramp 1m0s + 1m0s, start 02:40:57
+[02:43:13] probe-16000   16000 users     4227 req/s  p50    0.2  p95     8.3  p99    24.6 ms  err  0.00%  lgCPU 7%  PASS
+[02:43:20] probe-32000  32000 users [32000], ramp 1m0s + 1m0s, start 02:43:25
+[02:45:42] probe-32000   32000 users     8466 req/s  p50    0.2  p95    15.8  p99    33.0 ms  err  0.00%  lgCPU 14%  PASS
+[02:45:49] probe-64000  64000 users [64000], ramp 1m0s + 1m0s, start 02:45:54
+[02:48:10] probe-64000   64000 users    16951 req/s  p50    0.3  p95    16.7  p99    41.1 ms  err  0.00%  lgCPU 28%  PASS
+[02:48:17] probe-128000 128000 users [128000], ramp 1m0s + 1m0s, start 02:48:22
+[02:50:48] probe-128000 128000 users    32162 req/s  p50  220.8  p95   332.0  p99   367.4 ms  err  0.04%  lgCPU 51%  PASS
+[02:50:55] probe-160000 160000 users [160000], ramp 1m0s + 1m0s, start 02:51:00
+[02:53:30] probe-160000 160000 users     6954 req/s  p50 10076.2  p95 11567.1  p99 12681.2 ms  err 92.88%  lgCPU 42%  FAIL LG-LIMITED
+[02:53:30]   LG-limited: box 0 fell behind: 42 of 60 seconds had mean timer wake-up lag > 50 ms; sampler tick 46211 ms late
+[02:53:30]   fail: p95 11567 ms >= 500, p99 12681 ms >= 1000, errors 92.88% >= 1%
+[02:53:30] RESULT: LG-limited at 160000 users (not a server failure); highest clean pass 128000
+
+search-kraw-jvm  (lang search-kraw-jvm, target http://127.0.0.1:3000,http://127.0.0.2:3000,http://127.0.0.3:3000,http://127.0.0.4:3000,http://127.0.0.5:3000,http://127.0.0.6:3000,http://127.0.0.7:3000,http://127.0.0.8:3000)
+LG-LIMITED at 160000 users (the load boxes, not the server, were the limit); highest clean passing probe 128000
+probes: highest pass 128000, lowest fail none
+
+
+phase         users   pass  lg     req/s     p50     p95     p99   err%
+probe-8000     8000   true  false    2129     0.2     7.9    21.0   0.00
+probe-16000   16000   true  false    4227     0.2     8.3    24.6   0.00
+probe-32000   32000   true  false    8466     0.2    15.8    33.0   0.00
+probe-64000   64000   true  false   16951     0.3    16.7    41.1   0.00
+probe-128000 128000   true  false   32162   220.8   332.0   367.4   0.04
+probe-160000 160000   false true     6954 10076.2 11567.1 12681.2  92.88

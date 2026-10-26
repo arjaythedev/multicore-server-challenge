@@ -1,0 +1,1 @@
+kraw-jvm users=32000 scale=1.0 rps=8465 p50=0.2 p95=15.0 p99=32.8 err=0.0000 | app=44%cpu pg=123%cpu | app_us/req=52.3 pg_us/req=145.0 total_us/req=197.3 | rss=1141MB fds=32025 pass=True lgcpu=3% lg_limited=False 

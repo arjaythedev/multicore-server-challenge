@@ -1,0 +1,1 @@
+kraw-h2-r8 users=120000 scale=1.0 rps=31666 p50=2.0 p95=20.7 p99=66.3 err=0.0002 | app=174%cpu pg=584%cpu | app_us/req=54.8 pg_us/req=184.4 total_us/req=239.1 | rss=1152MB fds=120026 pass=True lgcpu=17% lg_limited=False 

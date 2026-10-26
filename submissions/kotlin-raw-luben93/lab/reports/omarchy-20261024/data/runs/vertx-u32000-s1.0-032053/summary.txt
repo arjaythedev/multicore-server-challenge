@@ -1,0 +1,1 @@
+vertx users=32000 scale=1.0 rps=8351 p50=44.7 p95=176.3 p99=240.6 err=0.0000 | app=106%cpu pg=127%cpu | app_us/req=126.4 pg_us/req=152.0 total_us/req=278.4 | rss=2300MB fds=32104 pass=True lgcpu=4% lg_limited=False 
