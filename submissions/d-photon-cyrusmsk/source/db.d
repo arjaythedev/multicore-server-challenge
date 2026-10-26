@@ -48,8 +48,8 @@ RETURNING id, username, email, bio, image`;
     // the tag/favorite/follow subqueries for every skipped row makes a huge
     // OFFSET take longer than the statement timeout.
     enum listAll = `SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at,
-       ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id
-              WHERE at.article_id = a.id ORDER BY t.name) AS tag_list,
+       ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) AS name
+              FROM article_tags at WHERE at.article_id = a.id ORDER BY 1) AS tag_list,
        (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
        EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1) AS favorited,
        u.username, u.bio, u.image,
@@ -62,8 +62,8 @@ RETURNING id, username, email, bio, image`;
     // fetches. Same answer either way: min(count, 1000).
     enum countAll = `SELECT count(*) FROM (SELECT 1 FROM articles a ORDER BY a.id LIMIT 1000) s`;
     enum listByTag = `SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at,
-       ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id
-              WHERE at.article_id = a.id ORDER BY t.name) AS tag_list,
+       ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) AS name
+              FROM article_tags at WHERE at.article_id = a.id ORDER BY 1) AS tag_list,
        (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
        EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1) AS favorited,
        u.username, u.bio, u.image,
@@ -74,8 +74,8 @@ RETURNING id, username, email, bio, image`;
  ORDER BY a.id DESC`;
     enum countByTag = `SELECT count(*) FROM (SELECT 1 FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = $1) LIMIT 1000) s`;
     enum listByAuthor = `SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at,
-       ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id
-              WHERE at.article_id = a.id ORDER BY t.name) AS tag_list,
+       ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) AS name
+              FROM article_tags at WHERE at.article_id = a.id ORDER BY 1) AS tag_list,
        (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
        EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1) AS favorited,
        u.username, u.bio, u.image,
@@ -86,8 +86,8 @@ RETURNING id, username, email, bio, image`;
  ORDER BY a.id DESC LIMIT $2 OFFSET $3`;
     enum countByAuthor = `SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = (SELECT u.id FROM users u WHERE u.username = $1) LIMIT 1000) s`;
     enum listByFavorite = `SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at,
-       ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id
-              WHERE at.article_id = a.id ORDER BY t.name) AS tag_list,
+       ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) AS name
+              FROM article_tags at WHERE at.article_id = a.id ORDER BY 1) AS tag_list,
        (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
        EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1) AS favorited,
        u.username, u.bio, u.image,
@@ -101,8 +101,8 @@ RETURNING id, username, email, bio, image`;
     // so the reference $2::int + $3::int would reject their format; ::int8
     // computes the same sum and LIMIT accepts it.
     enum listFeed = `SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at,
-       ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id
-              WHERE at.article_id = a.id ORDER BY t.name) AS tag_list,
+       ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) AS name
+              FROM article_tags at WHERE at.article_id = a.id ORDER BY 1) AS tag_list,
        (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
        EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1) AS favorited,
        u.username, u.bio, u.image,
@@ -119,8 +119,8 @@ RETURNING id, username, email, bio, image`;
     SELECT id FROM articles ORDER BY id DESC LIMIT $2 OFFSET $3
 )
 SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at,
-       ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id
-              WHERE at.article_id = a.id ORDER BY t.name) AS tag_list,
+       ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) AS name
+              FROM article_tags at WHERE at.article_id = a.id ORDER BY 1) AS tag_list,
        (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
        EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1) AS favorited,
        u.username, u.bio, u.image,
@@ -135,8 +135,8 @@ SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at,
      ORDER BY at.article_id DESC LIMIT $2 OFFSET $3
 )
 SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at,
-       ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id
-              WHERE at.article_id = a.id ORDER BY t.name) AS tag_list,
+       ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) AS name
+              FROM article_tags at WHERE at.article_id = a.id ORDER BY 1) AS tag_list,
        (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
        EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1) AS favorited,
        u.username, u.bio, u.image,
@@ -151,8 +151,8 @@ SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at,
      ORDER BY a.id DESC LIMIT $2 OFFSET $3
 )
 SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at,
-       ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id
-              WHERE at.article_id = a.id ORDER BY t.name) AS tag_list,
+       ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) AS name
+              FROM article_tags at WHERE at.article_id = a.id ORDER BY 1) AS tag_list,
        (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
        EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1) AS favorited,
        u.username, u.bio, u.image,
@@ -167,8 +167,8 @@ SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at,
      ORDER BY f.article_id DESC LIMIT $2 OFFSET $3
 )
 SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at,
-       ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id
-              WHERE at.article_id = a.id ORDER BY t.name) AS tag_list,
+       ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) AS name
+              FROM article_tags at WHERE at.article_id = a.id ORDER BY 1) AS tag_list,
        (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
        EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1) AS favorited,
        u.username, u.bio, u.image,
@@ -181,8 +181,8 @@ SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at,
 
     // -- a single article, with body --
     enum articleBySlug = `SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at,
-       ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id
-              WHERE at.article_id = a.id ORDER BY t.name) AS tag_list,
+       ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) AS name
+              FROM article_tags at WHERE at.article_id = a.id ORDER BY 1) AS tag_list,
        (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
        EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1) AS favorited,
        u.username, u.bio, u.image,
@@ -191,8 +191,8 @@ SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at,
   JOIN users u ON u.id = a.author_id
  WHERE a.slug = $2`;
     enum articleById = `SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at,
-       ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id
-              WHERE at.article_id = a.id ORDER BY t.name) AS tag_list,
+       ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) AS name
+              FROM article_tags at WHERE at.article_id = a.id ORDER BY 1) AS tag_list,
        (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
        EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1) AS favorited,
        u.username, u.bio, u.image,
