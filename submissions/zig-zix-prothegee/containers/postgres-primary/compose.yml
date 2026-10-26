@@ -9,6 +9,45 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_INITDB_ARGS: ${POSTGRES_INITDB_ARGS}
       POSTGRES_HOST_AUTH_METHOD: ${POSTGRES_HOST_AUTH_METHOD}
+    # The pgtune "Web application" values box/pg-conf.sh writes on the
+    # 8 vCPU / 16 GB benchmark box. Passed as -c so they override
+    # postgresql.conf without touching the data volume.
+    command:
+      - postgres
+      - -c
+      - max_connections=100
+      - -c
+      - shared_buffers=4096MB
+      - -c
+      - effective_cache_size=12288MB
+      - -c
+      - maintenance_work_mem=1024MB
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - wal_buffers=16MB
+      - -c
+      - default_statistics_target=100
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+      - -c
+      - work_mem=9709kB
+      - -c
+      - huge_pages=try
+      - -c
+      - min_wal_size=1GB
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - max_worker_processes=8
+      - -c
+      - max_parallel_workers=8
+      - -c
+      - max_parallel_workers_per_gather=4
+      - -c
+      - max_parallel_maintenance_workers=4
     ports:
       - "0.0.0.0:5432:5432"
     volumes:
