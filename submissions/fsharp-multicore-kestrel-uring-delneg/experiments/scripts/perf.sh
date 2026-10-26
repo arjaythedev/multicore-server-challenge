@@ -3,7 +3,7 @@
 # measure window; top symbols to /root/mc/screens/<label>/perf.txt. Profiling costs CPU: the screen numbers of
 # this run are not comparable to others.
 L=$1; ENVF=$2
-T=/root/mc/env/perf-$L.env; { cat $ENVF; echo DOTNET_PerfMapEnabled=1; } > $T
+T=/root/mc/env/perf-$L.env; { cat $ENVF; echo DOTNET_PerfMapEnabled=1; echo DOTNET_EnableWriteXorExecute=0; } > $T
 /root/mc/screen.sh fsharp-multicore-kestrel-uring-delneg $L 6000 0.1 $T &
 S=$!
 sleep 100

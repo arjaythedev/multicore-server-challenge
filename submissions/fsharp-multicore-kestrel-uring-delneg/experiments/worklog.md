@@ -86,3 +86,29 @@ fixed seeded inputs in one backend and read its CPU from /proc: SQL shape A/B wi
 - Profile (perf, 30 s): bcrypt is 43% of the app's samples. Lanes, one thread, cost 10: 1 lane 60.1 ms per
   hash, 2 lanes 36.8, 3 lanes 26.4, 4 lanes 23.8. Logins run at ~16/s and mostly batch already (p50 login 148 ms:
   they wait for company); the average is ~26 ms per hash, so ~24 us of every request is the bcrypt floor.
+- Commit 3e85e34 pushed; upstream PR #87 opened (local numbers marked as not official).
+- **9 clock length** (env only): 6 ms 221.0; 10 ms 213.4 / 213.0; 20 ms 197.8 / 196.6 (p95 35-36 ms, far under
+  the 500 ms limit). 30 / 50 ms and a batch cap of 256 queued.
+- **10 bcrypt batching**: logins at ~16/s. Waiting up to 150 ms for company even when the hashers are idle: app
+  73.3 -> 69.5. With one hasher thread as well (more lanes filled): app 66.1, box 200.0 vs 207.6. One thread
+  hashes ~42 logins/s at 4 lanes; ~120k users would ask ~33/s on a busy box, too tight, so the second thread now
+  helps only while 4 or more jobs are queued (`BCRYPT_HELP_AT`).
+- **11 clock 30 / 50 ms**: 193.2 / 190.8 us/req, p95 48 / 61 ms. Diminishing: 20 ms takes most of it at p95 35 ms.
+  The clock only matters below saturation; at full load batches fill on their own.
+- **12 batch cap 256** (20 ms): 204.6 vs 197 at 64. Discarded.
+- Article EXPLAIN (batch 16): only index lookups (slug, user, tags, favorites count, flags); nothing to cut in the
+  plan. Unix socket to Postgres: no, the box's pg_hba allows scram on 127.0.0.1 only (and `$DATABASE_URL` is TCP).
+- **13 shared slugs at 20 ms**: 198.7 vs 198.5. Still nothing; stays off.
+- **14 FEED_BIG** (the batch's most shared followees checked once for a 1000th article, from #82/#61): same
+  responses (cmp 603 requests, 0 differ), 192.9 / 193.8 vs 192.2 / 197.4. Within noise on this DB, where few
+  authors reach 1000 articles. Code removed.
+- **15 bcrypt helper**: hasher 0 always runs, hasher 1 joins only while 4+ logins are queued, and a login waits up
+  to 150 ms for company even when idle. 196.3 / 193.8 vs 208.1 / 201.9 (app 68.2 vs 74.7). Kept: a burst of logins
+  still gets both threads.
+- **16 knobs at 20 ms** (one screen each, base ~194): BATCH_INFLIGHT 3 192.7, DB_CONNS 4 **187.1**, server GC
+  189.5, LOOPS 1 186.5 (app 62.9). One I/O thread would have to carry ~25k req/s at 100k users: no. Four read
+  connections next, at 6,000 users and at high load (fewer connections = bigger batches, but less parallelism).
+- **17 bcrypt lanes** (bench): 4 lanes 22.8 ms per hash, 5 lanes 21.5, 6-8 no better (the 4 KB state per lane
+  starts to crowd L1); x86-64-v3 the same; -O2 much worse (33.0). Not worth the change.
+- **Candidate (e14)**: 20 ms clock, bcrypt helper: 197.2 us/req (app 68.4, PG 131.4), p95 37.0 ms, 0 errors.
+  Overload PASS, 197/197 on dev and seed. Committed.

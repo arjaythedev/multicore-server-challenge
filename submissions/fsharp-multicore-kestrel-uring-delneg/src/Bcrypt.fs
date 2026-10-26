@@ -67,6 +67,8 @@ type Job() =
 let private queue = new BlockingCollection<Job>(ConcurrentQueue<Job>())
 let private collecting = obj ()
 let mutable private waitMs = 150
+/// how long a job waits for company when the hashers are idle (0 = start at once)
+let mutable private idleWaitMs = 0
 /// workers hashing right now
 let mutable private hashing = 0
 
@@ -79,7 +81,11 @@ let private compute (jobs: Job[]) (n: int) (pw: byte[]) (st: byte[]) (out: byte[
     use op = fixed out
     bc_batch (n, NativePtr.toNativeInt pp, NativePtr.toNativeInt sp, NativePtr.toNativeInt op)
 
-let private loop () =
+/// Hasher 0 always runs; the others help only while a backlog of HelpAt jobs is queued (one hasher fills more
+/// lanes: 4 lanes cost 23.8 ms per hash, 1 lane 60.1 ms), so a burst of logins still gets every thread.
+let mutable private helpAt = 4
+
+let private loop (index: int) () =
     let batch = Array.zeroCreate<Job> 4
     let pw = Array.zeroCreate<byte> (4 * 73)
     let st = Array.zeroCreate<byte> (4 * 64)
@@ -87,6 +93,8 @@ let private loop () =
     let one = Array.zeroCreate<Job> 1
     let gone = System.Collections.Generic.List<Job>()
     while true do
+        if index > 0 then
+            while queue.Count < helpAt do Thread.Sleep 5
         let mutable n = 0
         Monitor.Enter collecting
         try
@@ -97,7 +105,7 @@ let private loop () =
                 n <- 1
             // wait for company only when busy: another batch is hashing or more jobs are queued (#79)
             let busy = queue.Count > 0 || Volatile.Read &hashing > 0
-            let deadline = Environment.TickCount64 + (if busy then int64 waitMs else 0L)
+            let deadline = Environment.TickCount64 + int64 (if busy then waitMs else idleWaitMs)
             let mutable go = true
             while go && n < 4 do
                 let left = int (max 0L (deadline - Environment.TickCount64))
@@ -136,10 +144,12 @@ let private loop () =
             try j.Completed() with e -> eprintfn "%O" e
         gone.Clear()
 
-let init (threads: int) (wait: int) =
+let init (threads: int) (wait: int) (idleWait: int) (help: int) =
+    helpAt <- max 1 help
     waitMs <- wait
+    idleWaitMs <- idleWait
     for i in 0 .. max 1 threads - 1 do
-        Thread(loop, IsBackground = true, Name = "bcrypt-" + string i).Start()
+        Thread((fun () -> loop i ()), IsBackground = true, Name = "bcrypt-" + string i).Start()
 
 /// queues a job; Completed runs on a bcrypt thread
 let run (j: Job) = queue.Add j

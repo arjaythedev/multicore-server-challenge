@@ -2,11 +2,11 @@
 /// shared by all I/O loops (one queue per kind for the whole box: a bigger drain shares more work, #79, #82, #22).
 ///
 /// Batching (#22's policy plus a clock, #79): read requests wait in their kind's queue until the oldest has waited
-/// WaitUs (3 ms by default) or MaxBatch are queued, and a read connection has room (fewer than Depth statements in
+/// WaitUs (20 ms by default) or MaxBatch are queued, and a read connection has room (fewer than Depth statements in
 /// Postgres); then the kind whose oldest request has waited longest sends what it has queued (up to MaxBatch) as
 /// ONE statement. A kind holds at most MaxInflight connections. Without the clock, batches at a moderate load
-/// average ~2 requests and Postgres pays its per-statement cost for each; with 3 ms the box spent 23% less CPU
-/// per request (experiments/worklog.md).
+/// average ~2 requests and Postgres pays its per-statement cost for each; with 20 ms the box spent ~38% less CPU
+/// per request, for ~30 ms more p95 (experiments/worklog.md). Under full load batches fill before the clock.
 /// Writes go to their own connections (a read never waits behind a commit), to the one with the fewest in flight.
 module Db
 
