@@ -38,11 +38,12 @@ Implemented:
 | `POST /api/articles` | done |
 | `PUT /api/articles/:slug` | done |
 | `DELETE /api/articles/:slug` | done |
+| `POST /api/articles/:slug/favorite` | done |
+| `DELETE /api/articles/:slug/favorite` | done |
 | `GET /api/tags` | done, also the health check |
 
 Pending:
 
-- Favorites: favorite and unfavorite.
 - Comments: list, create, delete.
 
 ## Architecture
@@ -55,6 +56,7 @@ Pending:
 - Article timestamps are formatted in SQL with `to_char`, UTC, exactly 3 fractional digits.
 - Article tag lists are assembled as `jsonb` in SQL and parsed into the response model.
 - Article lists run the page query and the capped count query, newest first.
+- Favorites are an insert or delete edge, and the article response reports the viewer's favorited state and the total count.
 - `GET /api/tags` is served through the zix L1 response cache with a 2 second TTL.
 
 ## Optimizations
@@ -96,20 +98,15 @@ A debug build binds `127.0.0.1:3000` by default and writes console records plus 
 
 ## Local database
 
-Both commands run from this submission directory.
+These commands run from this submission directory.
 
 ```bash
 make postgres-primary-up
 make sync-seed-dev
+make sync-app
 ```
 
-`make sync-seed-dev` runs the seed script in the challenge repository root. `make sync-seed-full` builds the full seed instead (about 2.4 GB, 5 to 10 minutes). The dev seed creates `conduit_dev` with 100,000 users and 10,000 articles. The container also creates an empty `conduit` database from the schema at first start. Either point `DATABASE_URL` at `conduit_dev`, or copy the seed into `conduit` (stop the server first):
-
-```bash
-PGPASSWORD=conduit psql -h 127.0.0.1 -U conduit -d postgres \
-  -c "DROP DATABASE IF EXISTS conduit WITH (FORCE)" \
-  -c "CREATE DATABASE conduit TEMPLATE conduit_dev"
-```
+`make sync-seed-dev` runs the seed script in the challenge repository root and creates `conduit_dev` with 100,000 users and 10,000 articles. `make sync-app` then refreshes `conduit`, the database `DATABASE_URL` names, from that seed. Stop the server before `sync-app`, because the drop terminates its connections. For the full seed, use `make sync-seed-full` and `make sync-app SEED_TEMPLATE=conduit_seed` (about 2.4 GB, 5 to 10 minutes).
 
 The benchmark and `test/run.sh` create their own fresh copy, so this copy is only for a manual run.
 
@@ -127,7 +124,7 @@ The integration suite needs the local database. It skips when the database is do
 
 ## Status
 
-The conformance suite has not been run against all 197 checks. Users, auth, profiles, articles, and tags are implemented, so the remaining endpoints still answer 404.
+The real conformance suite runs 141 steps before the comments section aborts: 129 pass and 12 fail, all on the unimplemented comments endpoints. The full 197 checks wait for comments.
 
 ## Notes
 
