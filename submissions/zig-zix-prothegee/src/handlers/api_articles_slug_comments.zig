@@ -44,19 +44,33 @@ fn list(
         return;
     };
 
-    const maybe_article_id = article_domain.idBySlug(conn, ctx.allocator, slug) catch {
+    const comment_prepared = comment_domain.prepared(conn) catch {
         try respond.sendError(res, .INTERNAL_SERVER_ERROR, "database error");
-        return;
-    };
-    const article_id = maybe_article_id orelse {
-        try respond.sendError(res, .NOT_FOUND, "article not found");
         return;
     };
 
-    const comments = comment_domain.list(conn, ctx.allocator, viewer, article_id) catch {
+    const comments = comment_prepared.listBySlug(ctx.allocator, viewer, slug) catch {
         try respond.sendError(res, .INTERNAL_SERVER_ERROR, "database error");
         return;
     };
+
+    // An empty list could mean a missing article. Check only then, so the
+    // common case stays one round-trip.
+    if (comments.len == 0) {
+        const article_prepared = article_domain.prepared(conn) catch {
+            try respond.sendError(res, .INTERNAL_SERVER_ERROR, "database error");
+            return;
+        };
+
+        const maybe_article_id = article_prepared.idBySlug(ctx.allocator, slug) catch {
+            try respond.sendError(res, .INTERNAL_SERVER_ERROR, "database error");
+            return;
+        };
+        if (maybe_article_id == null) {
+            try respond.sendError(res, .NOT_FOUND, "article not found");
+            return;
+        }
+    }
     const shapes = comment_view.views(ctx.allocator, comments) catch {
         try respond.sendError(res, .INTERNAL_SERVER_ERROR, "could not render response");
         return;
