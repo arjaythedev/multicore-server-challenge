@@ -1,9 +1,6 @@
 require "json"
 
 module Conduit
-  # The Rack app: routes each request to its endpoint, which runs its statement and responds with the JSON that
-  # Postgres built. Collaborators come in from config.ru: `db` (Database), `tokens` (Tokens) and `passwords`
-  # (Passwords).
   App = Data.define(:db, :tokens, :passwords)
 
   class App
@@ -28,7 +25,6 @@ module Conduit
 
     private
 
-    # [status, body], where body is the response's JSON or nil for no body.
     def route(env)
       path = env["PATH_INFO"]
       return NOT_FOUND unless path.start_with?("/api/")
@@ -60,21 +56,16 @@ module Conduit
       end
     end
 
-    # Authentication. RealWorld's scheme is "Authorization: Token <jwt>".
-
-    # Yields the viewer's id and token; 401 without a valid token.
     def signed_in(env)
       viewer, token = authenticate(env)
       viewer&.positive? ? yield(viewer, token) : UNAUTHORIZED
     end
 
-    # Yields the viewer's id, or 0 when there's no Authorization header; 401 if there's one and it's invalid.
     def maybe_signed_in(env)
       viewer, = authenticate(env)
       viewer ? yield(viewer) : UNAUTHORIZED
     end
 
-    # [id, token]; ANONYMOUS without a header; nil when the header is invalid.
     def authenticate(env)
       header = env["HTTP_AUTHORIZATION"]
       return ANONYMOUS unless header
@@ -85,14 +76,10 @@ module Conduit
       [id, token] if id
     end
 
-    # Responses.
-
     def ok(body) = [200, body]
 
-    # 200 with the statement's JSON, or 404 when it found nothing.
     def found(body) = body ? [200, body] : NOT_FOUND
 
-    # For the delete statements: no row means nothing to delete, false means it isn't the viewer's.
     def deleted(result)
       return NOT_FOUND if result.ntuples.zero?
 
@@ -103,8 +90,6 @@ module Conduit
       json = { email: row["email"], token:, username: row["username"], bio: row["bio"], image: row["image"] }
       [status, JSON.generate({ user: json })]
     end
-
-    # Users and auth.
 
     def register(env)
       fields = Input.string_fields(Input.body(env, "user"), required: %w[username email password])
@@ -148,16 +133,13 @@ module Conduit
       row ? user(200, row, token) : UNAUTHORIZED
     end
 
-    # The statement's result, or nil if it would have taken a unique username or email.
     def unless_taken
       yield
     rescue PG::UniqueViolation
       nil
     end
 
-    # Articles.
-
-    # Only the first of tag, author and favorited applies; an empty one counts as not given.
+    # In the order the spec gives them: only the first filter given applies.
     FILTERS = { "tag" => :list_tag, "author" => :list_author, "favorited" => :list_favorited }.freeze
 
     def list_articles(env, viewer)
@@ -203,8 +185,6 @@ module Conduit
       body ? ok(body) : FORBIDDEN
     end
 
-    # Comments.
-
     COMMENT_ID = /\A[0-9]{1,18}\z/
 
     def add_comment(env, viewer, slug)
@@ -215,7 +195,6 @@ module Conduit
       body ? [201, body] : NOT_FOUND
     end
 
-    # Only a plain decimal id can name a comment; anything else is a comment that doesn't exist.
     def delete_comment(viewer, slug, id)
       id.match?(COMMENT_ID) ? deleted(db.query(:delete_comment, viewer, slug, id)) : NOT_FOUND
     end

@@ -7,25 +7,21 @@ service "conduit" do
 
   url "http://#{ENV.fetch("HOST", "127.0.0.1")}:#{ENV.fetch("PORT", "3000")}"
 
-  # Plain HTTP/1.1 with keep-alive, and no idle timeout: the client decides when to close.
   endpoint do
     Async::HTTP::Endpoint.parse(url, protocol: Async::HTTP::Protocol::HTTP11).with(reuse_address: true)
   end
 
-  # Falcon's default stack gzips any response the client accepts gzip for. Compression is optional in this API
-  # and costs ~10% of a worker's CPU, so serve the Rack app without it.
+  # Without Falcon's default stack, which gzips responses: compression is optional here and cost ~10% of the CPU.
   middleware do
     ::Protocol::Rack::Adapter.new(rack_app)
   end
 
-  # One forked worker per core, each an event loop serving every connection on its own fiber.
   count ENV.fetch("WEB_CONCURRENCY") { Etc.nprocessors }.to_i
 
-  # The challenge doesn't restart a crashed server, so neither does the container.
+  # The challenge doesn't restart a crashed server.
   container_options do
     super().merge(restart: false)
   end
 
-  # Load the code once in the parent; workers fork from it and share its memory copy-on-write.
   preload "preload.rb"
 end

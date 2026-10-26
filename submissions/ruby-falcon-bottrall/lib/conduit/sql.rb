@@ -1,24 +1,13 @@
-# Every statement the server runs, by name. Each is prepared once per connection and runs with a generic plan.
-#
-# Postgres builds the response JSON itself, so most endpoints are a single statement whose one text column is
-# the finished body: JSON assembled in C is about 40 µs per list cheaper than decoding rows and generating it
-# in Ruby, and Postgres spends no more CPU producing JSON than producing rows. Endpoints that check or change
-# something (follows, favorites, comments, edits) do it in the same statement with data-modifying CTEs, so each
-# request is one round trip.
-#
-# Parameters are cast explicitly: json_build_object takes `any`, so Postgres can't infer them from context.
 module Conduit
   module SQL
     module_function
 
-    # RFC 3339 in UTC with exactly three fractional digits. to_char's MS truncates rather than rounds.
+    # MS truncates rather than rounds, as the spec wants.
     def timestamp(column) = %(to_char(#{column} AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'))
 
-    # SLUGIFY(x) from the spec.
     def slugify(text) = "trim(both '-' from lower(regexp_replace(#{text}, '[^A-Za-z0-9]+', '-', 'g')))"
 
-    # Tag names sorted by name. Looking each name up by primary key is cheaper than the hash join over all 200
-    # tags that Postgres picks for the reference join.
+    # Looking each name up by primary key, because for a join Postgres picks a hash join over all 200 tags.
     def tag_list(article) = <<~SQL
       ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at
              WHERE at.article_id = #{article}.id ORDER BY 1)
@@ -30,8 +19,6 @@ module Conduit
     def profile(user, following:) =
       "json_build_object('username', #{user}.username, 'bio', #{user}.bio, 'image', #{user}.image, 'following', #{following})"
 
-    # The Article object for row `a` joined to its author `u`. Favorite toggles pass their own favorited and
-    # favoritesCount: their change isn't visible to the statement's own snapshot.
     def article(viewer:, body:,
                 favorited: "EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = #{viewer})",
                 favorites_count: "(SELECT count(*) FROM favorites f WHERE f.article_id = a.id)")
@@ -45,11 +32,9 @@ module Conduit
       SQL
     end
 
-    # The columns a list needs: everything but the body.
     LIST_COLUMNS = "a.id, a.slug, a.title, a.description, a.author_id, a.created_at, a.updated_at"
 
-    # {"articles": [...], "articlesCount": n} from a page of articles (newest first) and a count.
-    # $1 viewer, $2 limit, $3 offset, $4 the filter's value.
+    # Parameters going into json_build_object are cast, since it takes `any` and Postgres can't infer their type.
     def listing(page, count) = <<~SQL
       SELECT json_build_object(
         'articles', COALESCE((SELECT json_agg(#{article(viewer: "$1::bigint", body: false)} ORDER BY a.id DESC)
@@ -57,7 +42,6 @@ module Conduit
         'articlesCount', (SELECT count(*) FROM (#{count}) s))::text
     SQL
 
-    # What a User object needs, less the token.
     USER_COLUMNS = "id, username, email, bio, image"
 
     STATEMENTS = {
@@ -65,7 +49,7 @@ module Conduit
         SELECT json_build_object('tags', COALESCE(json_agg(name ORDER BY name), '[]'))::text FROM tags
       SQL
 
-      # Users and auth. Ruby builds these responses: each needs a token.
+      # Ruby builds the user responses, since they include a token.
       register: "INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3) RETURNING #{USER_COLUMNS}",
       login: "SELECT #{USER_COLUMNS}, password_hash FROM users WHERE email = $1",
       current_user: "SELECT #{USER_COLUMNS} FROM users WHERE id = $1",
@@ -76,7 +60,6 @@ module Conduit
         RETURNING #{USER_COLUMNS}
       SQL
 
-      # Profiles. $1 viewer, $2 username.
       profile: <<~SQL,
         SELECT json_build_object('profile', #{profile("u", following: following("$1::bigint", "u.id"))})::text
           FROM users u WHERE u.username = $2
@@ -92,7 +75,6 @@ module Conduit
         SELECT json_build_object('profile', #{profile("u", following: "false")})::text FROM u
       SQL
 
-      # Lists. Filtered lists page inside the index they filter on, then fetch just that page of articles.
       list_all: listing(
         "SELECT #{LIST_COLUMNS} FROM articles a ORDER BY a.id DESC LIMIT $2 OFFSET $3",
         "SELECT 1 FROM articles a LIMIT 1000"
@@ -137,18 +119,14 @@ module Conduit
         COUNT
       ),
 
-      # Articles. $1 viewer, $2 slug.
       article: <<~SQL,
         SELECT json_build_object('article', #{article(viewer: "$1::bigint", body: true)})::text
           FROM articles a JOIN users u ON u.id = a.author_id WHERE a.slug = $2
       SQL
-      # $1 viewer, $2 id. Read after the publishing transaction commits.
       article_by_id: <<~SQL,
         SELECT json_build_object('article', #{article(viewer: "$1::bigint", body: true)})::text
           FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id = $2
       SQL
-      # The three statements of the publishing transaction, as in the spec. $1 author, $2 title, $3 description,
-      # $4 body.
       insert_article: <<~SQL,
         INSERT INTO articles (id, slug, author_id, title, description, body)
         SELECT n.id, #{slugify("$2")} || '-' || n.id, $1, $2, $3, $4
@@ -157,8 +135,6 @@ module Conduit
       SQL
       insert_tags: "INSERT INTO tags (name) SELECT DISTINCT unnest($1::text[]) ON CONFLICT (name) DO NOTHING",
       tag_article: "INSERT INTO article_tags (article_id, tag_id) SELECT $1, t.id FROM tags t WHERE t.name = ANY($2::text[])",
-      # One row (the viewer's own article, updated) if the viewer wrote it, one row with no article if someone
-      # else did, none if there's no such article. $1 viewer, $2 slug, $3 title, $4 description, $5 body.
       update_article: <<~SQL,
         WITH target AS (SELECT id, author_id FROM articles WHERE slug = $2),
              a AS (UPDATE articles SET title = COALESCE($3, title), description = COALESCE($4, description),
@@ -171,15 +147,13 @@ module Conduit
                   FROM a JOIN users u ON u.id = a.author_id)
           FROM target
       SQL
-      # One row, true if the viewer wrote it and it's now deleted; false if someone else did; none if no article.
       delete_article: <<~SQL,
         WITH target AS (SELECT id, author_id FROM articles WHERE slug = $2),
              d AS (DELETE FROM articles WHERE id = (SELECT id FROM target WHERE author_id = $1))
         SELECT author_id = $1 FROM target
       SQL
 
-      # Favorites. $1 viewer, $2 slug. The new favorite isn't visible to this statement's snapshot, so the
-      # response adds it (or takes away the one deleted) itself.
+      # The statement's own snapshot can't see the favorite it adds or removes, so the count adjusts for it.
       favorite: <<~SQL,
         WITH target AS (SELECT id FROM articles WHERE slug = $2),
              f AS (INSERT INTO favorites (user_id, article_id) SELECT $1, id FROM target ON CONFLICT DO NOTHING
@@ -196,7 +170,6 @@ module Conduit
           FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id = (SELECT id FROM target)
       SQL
 
-      # Comments. $1 viewer, $2 slug. No row means no such article.
       comments: <<~SQL,
         SELECT json_build_object('comments', COALESCE((
           SELECT json_agg(json_build_object(
@@ -207,7 +180,6 @@ module Conduit
             JOIN users u ON u.id = c.author_id), '[]'))::text
           FROM articles a WHERE a.slug = $2
       SQL
-      # $1 viewer, $2 slug, $3 body.
       add_comment: <<~SQL,
         WITH target AS (SELECT id FROM articles WHERE slug = $2),
              c AS (INSERT INTO comments (article_id, author_id, body) SELECT id, $1, $3 FROM target
@@ -217,8 +189,6 @@ module Conduit
                  'body', c.body, 'author', #{profile("u", following: "false")}))::text
           FROM c JOIN users u ON u.id = c.author_id
       SQL
-      # One row, true if the viewer wrote it and it's now deleted; false if someone else did; none if no such
-      # comment on that article. $1 viewer, $2 slug, $3 comment id.
       delete_comment: <<~SQL,
         WITH target AS (SELECT c.id, c.author_id FROM comments c JOIN articles a ON a.id = c.article_id
                          WHERE c.id = $3 AND a.slug = $2),
@@ -227,14 +197,11 @@ module Conduit
       SQL
     }.transform_values(&:freeze).freeze
 
-    # The statements that only read, which can share a worker's pipelined connection.
     READS = %i[
       tags login current_user profile list_all list_tag list_author list_favorited feed article article_by_id comments
     ].freeze
 
-    # The reads that concurrent requests can share an execution of, with the types of their parameters. Each
-    # returns at most one row of one column.
-    MERGEABLE = {
+    MERGEABLE_PARAM_TYPES = {
       tags: [],
       profile: %w[bigint text],
       list_all: %w[bigint bigint bigint],
@@ -246,16 +213,13 @@ module Conduit
       comments: %w[bigint text],
     }.freeze
 
-    # `sql` run once for each request in a batch, in one execution: its parameters become arrays, one element
-    # per request, and the result has a row per request, in order, holding what `sql` would have returned for
-    # it (null where it would have returned no row). Parts of `sql` that don't depend on a request's parameters,
-    # such as the count of all articles, run once for the batch. A statement without parameters is the same
-    # for every request, so it simply runs once.
-    def merged(sql, types)
-      return sql if types.empty?
+    def merged(sql, param_types)
+      return sql if param_types.empty?
 
-      columns = types.each_index.map { "p#{it + 1}" }
-      arrays = types.each_with_index.map { |type, index| "$#{index + 1}::#{type}[]" }
+      columns = param_types.each_index.map { "p#{it + 1}" }
+      arrays = param_types.each_with_index.map { |type, index| "$#{index + 1}::#{type}[]" }
+      # Each mergeable statement returns at most one row, so it works as a scalar subquery, and anything in it
+      # that doesn't depend on the request (like the count of all articles) runs once for the whole batch.
       <<~SQL
         SELECT (#{sql.strip.gsub(/\$(\d+)/, 'req.p\1')})
           FROM unnest(#{arrays.join(", ")}) WITH ORDINALITY AS req(#{columns.join(", ")}, ord)
@@ -263,6 +227,6 @@ module Conduit
       SQL
     end
 
-    MERGED = MERGEABLE.to_h { |name, types| [name, merged(STATEMENTS.fetch(name), types).freeze] }.freeze
+    MERGED = MERGEABLE_PARAM_TYPES.to_h { |name, types| [name, merged(STATEMENTS.fetch(name), types).freeze] }.freeze
   end
 end

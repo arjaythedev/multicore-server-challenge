@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Runs once as root on a clean Ubuntu 24.04: builds CRuby 4.0.9 from the official tarball into /opt/ruby-4.0.9,
-# with YJIT (needs rustc, which apt provides) and jemalloc as the allocator. libpq-dev is for the pg gem.
 set -euo pipefail
 RUBY_VERSION=4.0.9
 RUBY_SHA256=c35350682ff050b79702d57ade4516e7336063f510155d19fb2fb5b3f3909511
@@ -8,6 +6,7 @@ PREFIX=/opt/ruby-$RUBY_VERSION
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
+# rustc is for building YJIT.
 apt-get install -y -q --no-install-recommends build-essential pkg-config curl ca-certificates rustc \
   libssl-dev libyaml-dev zlib1g-dev libffi-dev libgmp-dev libreadline-dev libjemalloc-dev libpq-dev tzdata
 
