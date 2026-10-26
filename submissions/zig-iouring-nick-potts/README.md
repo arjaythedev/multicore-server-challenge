@@ -8,7 +8,7 @@ Front: direct
 | Framework | none: our own HTTP/1.1 server on raw io_uring |
 | Database driver | none: our own PostgreSQL v3 wire client (SCRAM-SHA-256, prepared statements, binary rows) |
 | Database | PostgreSQL 18 |
-| Other dependencies | libdeflate 1.19, vendored, for gzip compression only. JSON, JWT, HMAC-SHA-256 (with SHA-NI) and bcrypt (with hand-written assembly kernels) are written here |
+| Other dependencies | none. JSON, JWT, HMAC-SHA-256 (with SHA-NI), bcrypt (with hand-written assembly kernels) and the gzip encoder are written here |
 | Score on our rig | **150,000 users**, held in two official-style searches with both flags at their defaults. The same build with `ackdelay=off` held 140,000 |
 
 ```sh
@@ -31,6 +31,7 @@ a feature that is `off` costs nothing.
 | Flag | Default | What it does |
 |---|---|---|
 | `shed` | on | Under CPU saturation the server refuses whole route classes, heaviest first, with an immediate `503` and `Retry-After: 1`, within an error budget of 0.9% of requests. **Sign-ups and logins are refused first.** That is a policy choice about which users wait. We think it is within the rules, but it needs a maintainer ruling (rule 8), which is why it is behind a flag. See [Overload shedding](#overload-shedding). |
+| `gzip` | on | A response that needs three or more TCP segments is gzipped for a client that accepts gzip, and sent that way only if it then needs fewer segments. Fewer segments mean fewer client ACKs on the CPU that takes the network interrupts. Off sends every body as identity. See [Two-segment gzip](#two-segment-gzip). |
 | `ackdelay` | on | After each response the server turns `TCP_QUICKACK` off on that client's socket, through io_uring, so the next request's ACK rides on its response instead of leaving as a packet of its own. It only sets an option on the server's own sockets. Worth the last 10,000 users. See [ACK delay](#ack-delay). |
 
 No result, token or password caches: every request reads Postgres. No schema changes, no Postgres configuration
@@ -152,7 +153,7 @@ copied into the client's own buffer. A client has one request in flight at a tim
 in order.
 
 **One send per response.** The response body is built first, behind a reserved gap for the header. The header is
-then written into the gap, and the whole thing leaves in one `send`. The header is 72–73 bytes.
+then written into the gap, and the whole thing leaves in one `send`. The header is 70–71 bytes: header values follow their colon with no space, which HTTP/1.1 allows.
 
 **No per-connection buffers.** Response buffers come from size-class free lists and go back as soon as the send
 completes. An idle keep-alive connection costs a small struct and nothing else. Server memory grows by about 7 KB per
@@ -547,22 +548,44 @@ ACKs per request at 20,000 users. At 140,000 they were 0.86.
 
 ## Two-segment gzip
 
-gzip here is aimed at the receive CPU, not at bandwidth. A client ACKs at once when two full segments are
-unacknowledged, and otherwise on its delayed-ACK timer. So an answer of three or more segments draws about 1.5 ACKs
-from the client, and an answer of two or fewer draws about 1. Every one of those ACKs lands on the CPU that takes the
-NIC's interrupts (see [the wall](#the-wall-and-why-the-score-is-150k)).
+Flag `gzip`, default on. gzip here is aimed at the receive CPU, not at bandwidth. A client ACKs at once when two full
+segments are unacknowledged, and otherwise on its delayed-ACK timer. So an answer of three or more segments draws
+about 1.5 ACKs or more from the client, and an answer of two or fewer draws about 1. Every one of those ACKs lands on
+the CPU that takes the NIC's interrupts (see [the wall](#the-wall-and-why-the-score-is-150k)). A 10-article list is
+about 5 KB, four segments.
 
-**The rule.** A response is gzipped only when the client sends `Accept-Encoding: gzip`, the identity response needs
-more than two segments (2 × 1,428 bytes, the payload of a 1,500-byte IPv6 packet with TCP timestamps), and the body
-is at most 7 KB. Above 7 KB, level-1 gzip of our JSON can't reach two segments. The gzip form is kept only if the
-whole response, head included, then fits in two segments. Otherwise the identity body goes out. Such responses carry
-`Vary: Accept-Encoding`. The encoder is libdeflate level 1 with an 8 KB hash table, and each response is its own gzip
-member, so nothing carries from one response to the next.
+**The rule.** Segments are counted in each connection's own MSS, read once at accept (`TCP_MAXSEG`: 1,448 bytes on
+IPv4, 1,428 on IPv6 with timestamps). A response is gzipped only when the client sends `Accept-Encoding: gzip` and
+the identity response needs three or more segments. The gzip form is sent only if the whole response, head included,
+then needs fewer segments. Otherwise the identity body goes out. A 10-article list goes from about 4.7 KB to 2.7 KB,
+two segments.
 
-**Measured**, in an ABBA at 154,000 users against the build without it:
+**The encoder** (`src/pz.zig`) is written for this. Each response is one gzip member with one dynamic-Huffman block.
+Its code lengths are a static code table compiled into the binary, trained offline on seed-shaped JSON and sent in
+every response's block header, so nothing is cached and nothing carries from one response to the next. Matches are
+looked for only at closing quotes and where each match ends. Every other byte is a literal, coded two per table
+lookup. Once the rest of the body fits the two-segment budget as stored bytes, the Huffman block ends and the rest
+goes out stored. The CRC-32 folds with PCLMULQDQ. On a CPU without it the server logs `gzip off` and sends identity
+bodies. A 5.4 KB list codes in about 3 µs, about 4.6 times faster than libdeflate level 1, and every test output
+decodes byte-exact with Go's `compress/gzip`.
 
-| Per request | Without | With |
-|---|--:|--:|
+**Measured.** An ABBA at 154,000 users, first against the build without gzip, then pz against the libdeflate version
+of the same rule:
+
+| Per request | No gzip | libdeflate level 1 | pz |
+|---|--:|--:|--:|
+| Receive-CPU softirq | 16.73 / 17.01 µs | 14.58 / 14.52 µs | 13.09 / 13.14 µs |
+| Incoming pure ACKs (nstat) | 1.77 / 1.79 | 1.43 / 1.42 | 1.28 / 1.27 |
+| Box CPU | 189.6 / 190.9 µs | 194.7 / 194.8 µs | 188.8 / 189.4 µs |
+| Throughput | 39,239 / 39,125 req/s | 39,013 / 38,964 req/s | 39,347 / 39,264 req/s |
+| p95 / p99 | 325–353 / 481–507 ms | 369–377 / 495–499 ms | 291–309 / 410–411 ms |
+
+Each pair is a separate ABBA, so compare within a pair. Against no gzip, libdeflate cut the receive CPU by 15% but
+cost 3.4 µs per request of total CPU. pz cut the receive CPU by another 10% and total CPU by 5.7 µs per request
+against libdeflate, with higher throughput and shorter tails. Gzipping every large body was tried earlier and lost
+(see the losers), because it paid the codec on every response without a packet to show for it.
+
+---|--:|--:|
 | Receive-CPU softirq | 16.73 / 17.01 µs | 14.38 / 14.29 µs (−15%) |
 | Receive-CPU softirq, cores | 0.66 / 0.67 | 0.56 / 0.56 |
 | Incoming pure ACKs (nstat) | 1.77 / 1.79 | 1.43 / 1.43 |
@@ -739,9 +762,6 @@ source of the per-endpoint costs in the shed order. The ideas are reimplemented 
 - **#45**: zero-copy send, which ships there and lost here.
 - **#18**: the SIGILL that made us build for x86-64-v3.
 - **#31**: the precedent for sharing work across concurrent requests within one execution.
-
-[libdeflate](https://github.com/ebiggers/libdeflate) (MIT, vendored in `vendor/libdeflate` with its licence) does the
-gzip compression.
 
 Openwall, the Rust `bcrypt` crate and Go's `golang.org/x/crypto/bcrypt` supplied the test vectors. The Go reference
 server was the oracle for every byte we send.

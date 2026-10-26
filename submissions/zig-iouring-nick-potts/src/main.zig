@@ -11,6 +11,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const sys = @import("sys.zig");
+const pz = @import("pz.zig");
 const pg = @import("pg.zig");
 const db = @import("db.zig");
 const jwt = @import("jwt.zig");
@@ -62,6 +63,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     jwt.init(secret);
     ignoreSigpipe();
     raiseFileLimit();
+    pz.detectCpu();
 
     // Refuse to start unless every statement prepares and describes the expected types.
     for ([_]bool{ false, true }) |write| {
@@ -75,8 +77,10 @@ pub fn main(init: std.process.Init.Minimal) void {
 
     const sz = sizing(sys.cpuCount());
     var fbuf: [64]u8 = undefined;
-    sys.log("{d} workers x ({d} read + {d} write postgres connections, {d} bcrypt threads), sha-ni {}, flags {s}", .{
-        sz.workers, sz.read_conns, sz.write_conns, sz.bcrypt_threads, jwt.usingShaNi(), flags.format(fl, &fbuf),
+    sys.log("{d} workers x ({d} read + {d} write postgres connections, {d} bcrypt threads), sha-ni {}, gzip {s}, flags {s}", .{
+        sz.workers, sz.read_conns, sz.write_conns, sz.bcrypt_threads, jwt.usingShaNi(),
+        if (!pz.has_pclmul) "off (no pclmulqdq)" else if (pz.has_vpclmul) "on (vpclmulqdq crc)" else "on (pclmulqdq crc)",
+        flags.format(fl, &fbuf),
     });
     flags.dispatch(fl, serve, .{ url, host, port, sz });
 }
@@ -188,7 +192,7 @@ test {
     _ = @import("jwt.zig");
     _ = @import("bcrypt.zig");
     _ = @import("buf.zig");
-    _ = @import("gzip.zig");
+    _ = @import("pz.zig");
     _ = @import("sha256.zig");
     _ = @import("mega.zig");
     _ = @import("shared.zig");

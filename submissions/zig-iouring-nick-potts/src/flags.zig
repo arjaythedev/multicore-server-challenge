@@ -11,6 +11,9 @@ pub const Flags = struct {
     /// Delayed ACK: each sent response puts its socket back in delayed-ACK mode (TCP_QUICKACK off), so the next
     /// request's ACK leaves with its response instead of alone.
     ackdelay: bool = true,
+    /// gzip (pz.zig, a fixed code table) for responses that need 3+ TCP segments, when the client accepts it and
+    /// it saves a segment: fewer segments draw fewer client ACKs on the receive CPU.
+    gzip: bool = true,
 };
 
 const names = std.meta.fieldNames(Flags);
@@ -90,7 +93,7 @@ test "defaults, overrides, and the errors that stop the server" {
     try testing.expectError(error.BadValue, parse("shed=yes", &bad));
     try testing.expectError(error.BadValue, parse("shed", &bad));
     var buf: [64]u8 = undefined;
-    try testing.expectEqualStrings("shed=off,ackdelay=on", format(.{ .shed = false }, &buf));
+    try testing.expectEqualStrings("shed=off,ackdelay=on,gzip=on", format(.{ .shed = false }, &buf));
 }
 
 test "dispatch passes the runtime flags as a comptime value" {

@@ -202,6 +202,10 @@ fn onAccept(cqe: *const linux.io_uring_cqe) void {
     c.closing = false;
     c.sending = "";
     c.next_free = null;
+    // The segment size the gzip rule counts in: 1448 on IPv4 and 1428 on IPv6 with timestamps.
+    var mss: c_int = 0;
+    var len: linux.socklen_t = @sizeOf(c_int);
+    c.req.mss = if (linux.errno(linux.getsockopt(fd, linux.IPPROTO.TCP, linux.TCP.MAXSEG, std.mem.asBytes(&mss), &len)) == .SUCCESS and mss >= 536 and mss <= 9000) @intCast(mss) else 1448;
     armRecv(c);
 }
 
@@ -294,7 +298,7 @@ fn ackDelayFailed(cqe: *const linux.io_uring_cqe) void {
 fn badRequest(c: *Client) void {
     c.busy = true;
     c.req.keep_alive = false;
-    sendBytes(c, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    sendBytes(c, "HTTP/1.1 400 Bad Request\r\nContent-Length:0\r\nConnection:close\r\n\r\n");
 }
 
 /// Called by api with the finished response.

@@ -30,6 +30,8 @@ pub const Req = struct {
     q: db.Query = .{},
 
     keep_alive: bool = true,
+    /// The connection's TCP payload per segment, read once at accept.
+    mss: u16 = 1448,
     gzip: bool = false,
     viewer: i64 = 0,
     /// The caller's token, echoed in user responses.
@@ -66,7 +68,7 @@ fn errorBody(comptime msg: []const u8) []const u8 {
 }
 
 fn done(r: *Req, status: Status) void {
-    loop.respond(r, r.out.finish(status, r.keep_alive, r.gzip));
+    loop.respond(r, r.out.finish(status, r.keep_alive, r.gzip, r.mss));
 }
 
 fn fail(r: *Req, status: Status, comptime msg: []const u8) void {
@@ -228,7 +230,7 @@ fn authenticate(r: *Req, head: *const http.Head, now: i64) Auth {
 /// Called once the head and the whole body are in memory. Nothing in `head` or `body` is used after it returns.
 pub fn start(comptime F: Flags, r: *Req, head: *const http.Head, body: []const u8, now: i64) void {
     r.keep_alive = head.keep_alive;
-    r.gzip = head.gzip;
+    r.gzip = F.gzip and head.gzip;
     if (!r.out.active()) r.out = Buf.init() else r.out.resetBody();
     r.scratch.clearRetainingCapacity();
     r.scratch.ensureTotalCapacity(gpa, head.target.len + 3 * body.len + 1024) catch @panic("oom");
