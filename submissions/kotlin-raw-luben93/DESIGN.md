@@ -129,7 +129,7 @@ server-config changes; session settings only. <= 95 Postgres connections total.
 - Hot paths avoid allocation where it is easy (reuse buffers, `@JvmField`, `IntArray` over boxed collections), but
   correctness and clarity first; we optimize with measurements.
 - KDoc on public declarations: say *why*, briefly. Match the existing style.
-- Tests in `src/commonTest/kotlin` (kotlin-test). Run: `./gradlew --no-daemon -q jvmTest` (fast) and
+- Tests in `src/commonTest/kotlin` (kotlin-test). Run: `gradle --no-daemon -q jvmTest` (fast) and
   `linuxX64Test`.
 
 ## Lab (this machine)

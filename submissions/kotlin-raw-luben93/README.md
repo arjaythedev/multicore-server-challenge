@@ -10,6 +10,7 @@ Front: direct
 | JSON, JWT | own: streaming JSON writer straight from binary rows, HS256 |
 | bcrypt | cost 10, up to 8 logins per batch with their rounds interleaved (12.7 ms CPU per hash; 23.4 ms in pure Kotlin): the public-domain Openwall C core, vendored as source in `native/`, built by `build.sh` with gcc `-O3`, called through the FFM API. Pure-Kotlin lanes are the fallback |
 | Coroutines | Kotlin `suspend` with stdlib intrinsics only; continuations resume on the thread that did the I/O |
+| Build | Gradle 9.8.2 (checksum-verified by `install.sh`) and Temurin JDK 27, build-time only |
 | Dependencies | none besides the Kotlin stdlib (and the vendored bcrypt C source, compiled on the box) |
 
 The same sources also build a Kotlin/Native (linuxX64) binary; see DESIGN.md for the architecture and the rules
