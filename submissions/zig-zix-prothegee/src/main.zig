@@ -14,6 +14,7 @@ const api_profiles_username_follow = @import("handlers/api_profiles_username_fol
 const api_articles = @import("handlers/api_articles.zig");
 const api_articles_feed = @import("handlers/api_articles_feed.zig");
 const api_articles_slug = @import("handlers/api_articles_slug.zig");
+const api_articles_slug_favorite = @import("handlers/api_articles_slug_favorite.zig");
 const api_tags = @import("handlers/api_tags.zig");
 
 // --------------------------------------------------------- //
@@ -72,6 +73,11 @@ const Routes = zix.Http1.Router(&[_]zix.Http1.Route{
         .kind = .PARAM,
     },
     // Favorites
+    .{
+        .path = api_articles_slug_favorite.PATH,
+        .handler = api_articles_slug_favorite.RESPONSE,
+        .kind = .PARAM,
+    },
     // Comments
     // Tags
     .{
