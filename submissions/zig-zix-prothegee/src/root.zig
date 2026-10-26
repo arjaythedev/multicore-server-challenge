@@ -16,6 +16,8 @@ pub const auth = struct {
 };
 
 pub const domain = struct {
+    pub const article = @import("domain/article.zig");
+    pub const article_input = @import("domain/article_input.zig");
     pub const profile = @import("domain/profile.zig");
     pub const tag = @import("domain/tag.zig");
     pub const user = @import("domain/user.zig");
@@ -23,11 +25,16 @@ pub const domain = struct {
 };
 
 pub const http = struct {
+    pub const article_view = @import("http/article_view.zig");
     pub const json = @import("http/json.zig");
+    pub const paging = @import("http/paging.zig");
     pub const respond = @import("http/respond.zig");
 };
 
 pub const handlers = struct {
+    pub const api_articles = @import("handlers/api_articles.zig");
+    pub const api_articles_feed = @import("handlers/api_articles_feed.zig");
+    pub const api_articles_slug = @import("handlers/api_articles_slug.zig");
     pub const api_profiles_username = @import("handlers/api_profiles_username.zig");
     pub const api_profiles_username_follow = @import("handlers/api_profiles_username_follow.zig");
     pub const api_tags = @import("handlers/api_tags.zig");
