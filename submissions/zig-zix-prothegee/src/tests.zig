@@ -10,6 +10,7 @@ test {
     _ = @import("domain/article_input.zig");
     _ = @import("domain/user.zig");
     _ = @import("domain/user_input.zig");
+    _ = @import("http/article_filter.zig");
     _ = @import("http/json.zig");
     _ = @import("http/paging.zig");
     _ = @import("http/respond.zig");
