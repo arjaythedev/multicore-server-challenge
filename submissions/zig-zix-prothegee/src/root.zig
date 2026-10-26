@@ -16,6 +16,7 @@ pub const auth = struct {
 };
 
 pub const domain = struct {
+    pub const profile = @import("domain/profile.zig");
     pub const tag = @import("domain/tag.zig");
     pub const user = @import("domain/user.zig");
     pub const user_input = @import("domain/user_input.zig");
@@ -27,6 +28,8 @@ pub const http = struct {
 };
 
 pub const handlers = struct {
+    pub const api_profiles_username = @import("handlers/api_profiles_username.zig");
+    pub const api_profiles_username_follow = @import("handlers/api_profiles_username_follow.zig");
     pub const api_tags = @import("handlers/api_tags.zig");
     pub const api_user = @import("handlers/api_user.zig");
     pub const api_users = @import("handlers/api_users.zig");
