@@ -41,7 +41,12 @@ fn get(
         return;
     };
 
-    const found = profile_domain.findByUsername(conn, ctx.allocator, viewer, username) catch {
+    const query = profile_domain.prepared(conn) catch {
+        try respond.sendError(res, .INTERNAL_SERVER_ERROR, "database error");
+        return;
+    };
+
+    const found = query.findByUsername(ctx.allocator, viewer, username) catch {
         try respond.sendError(res, .INTERNAL_SERVER_ERROR, "database error");
         return;
     };
