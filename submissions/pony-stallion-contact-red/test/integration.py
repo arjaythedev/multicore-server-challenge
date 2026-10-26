@@ -2205,19 +2205,20 @@ class Integration(unittest.TestCase):
             holder.execute("BEGIN; LOCK TABLE tags IN ACCESS EXCLUSIVE MODE;")
             for connection, count in zip(connections, sizes):
                 before = self.routing_binds(proxy)
-                connection.sock.sendall(request * count)
                 deadline = time.monotonic() + 10
-                while time.monotonic() < deadline:
-                    after = self.routing_binds(proxy)
-                    self.assertEqual(len(after), len(before))
-                    changes = {index: names[len(before[index]):]
-                               for index, names in enumerate(after)
-                               if names != before[index]}
-                    if sum(map(len, changes.values())) >= count:
-                        break
-                    time.sleep(0.01)
-                else:
-                    self.fail("pool capacity timed out: " + repr(changes))
+                for submitted in range(1, count + 1):
+                    connection.sock.sendall(request)
+                    while time.monotonic() < deadline:
+                        after = self.routing_binds(proxy)
+                        self.assertEqual(len(after), len(before))
+                        changes = {index: names[len(before[index]):]
+                                   for index, names in enumerate(after)
+                                   if names != before[index]}
+                        if sum(map(len, changes.values())) >= submitted:
+                            break
+                        time.sleep(0.01)
+                    else:
+                        self.fail("pool capacity timed out: " + repr(changes))
                 self.assertEqual(len(changes), count)
                 self.assertTrue(all(names == [b"tags"]
                                     for names in changes.values()))
@@ -3330,7 +3331,7 @@ class Integration(unittest.TestCase):
         self.assertEqual(len(sessions), 1)
         bound = [payload.split(b"\0", 2)[1] for kind, payload
                  in sessions[0] if kind == b"B"]
-        self.assertEqual(bound, [b"tags", b"tags"])
+        self.assertEqual(bound, [b"tags", b"current_user"])
 
     def test_missing_query_completion_fails_request(self):
         connection = http.client.HTTPConnection("127.0.0.1", self.port,
@@ -3551,7 +3552,7 @@ class Integration(unittest.TestCase):
                 bound = [payload.split(b"\0", 2)[1]
                          for session in proxy.snapshot()
                          for kind, payload in session if kind == b"B"]
-                self.assertEqual(bound, [b"tags", b"tags"])
+                self.assertEqual(bound, [b"tags"])
             finally:
                 if process.poll() is None:
                     process.kill()
