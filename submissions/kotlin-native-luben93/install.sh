@@ -10,7 +10,9 @@ curl -fsSLo /tmp/jdk.tgz "$URL"
 echo "$SHA  /tmp/jdk.tgz" | sha256sum -c -
 rm -rf /opt/jdk && mkdir -p /opt/jdk && tar -C /opt/jdk --strip-components=1 -xzf /tmp/jdk.tgz && rm /tmp/jdk.tgz
 chmod -R a+rX /opt/jdk
-/opt/jdk/bin/java -version
+export JAVA_HOME=/opt/jdk
+export PATH="$JAVA_HOME/bin:$PATH"
+java -version
 
 GRADLE_VERSION=9.8.2
 GRADLE_SHA256=21bd5da2de49b642904077f38c0efdc7778e92b3ed0889392dca61b97e389607
