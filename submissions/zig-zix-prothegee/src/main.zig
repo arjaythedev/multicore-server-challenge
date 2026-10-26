@@ -118,7 +118,7 @@ pub fn main(init: std.process.Init) !void {
     try db.init(cfg.database_url, init.io);
 
     const cpus = std.Thread.getCpuCount() catch DEFAULT_CPU;
-    const park_len = @max(512, 16 * 1024 / cpus);
+    const park_len = @max(512, 8 * 1024 / cpus);
 
     createLogDir(init.io);
 
@@ -127,7 +127,7 @@ pub fn main(init: std.process.Init) !void {
     var logger = try zix.Logger.init(allocator_logger.allocator(), .{
         .save_path = DIR_LOG_PATH,
         .save_file = "conduit",
-        .save_min_level = .INFO,
+        .save_min_level = .WARN,
         .console = if (ALLOW_DEBUG) .ALWAYS else .OFF,
     });
     defer logger.deinit();
@@ -137,17 +137,13 @@ pub fn main(init: std.process.Init) !void {
         .ip = cfg.host,
         .port = cfg.port,
         .logger = &logger,
-        //
         .workers = 0,
         .dispatch_model = .URING,
-        //
-        .send_date_header = true,
-        .max_response_headers = .MINIMAL,
-        //
+        .send_date_header = false,
+        .max_response_headers = .{ .CUSTOM = 4 },
         .kernel_backlog = 16 * 1024,
-        .max_recv_buf = 6 * 1024,
-        .max_request_body = 16 * 1024 * 1024,
-        //
+        .max_recv_buf = 8 * 1024,
+        .max_request_body = 8 * 1024,
         .uring_send_buf_size = 16 * 1024,
         .uring_idle_pool_floor = 16,
         .uring_idle_pool_ceiling = 1 * 1024,
