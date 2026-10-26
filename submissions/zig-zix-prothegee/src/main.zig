@@ -148,12 +148,6 @@ pub fn main(init: std.process.Init) !void {
         .max_recv_buf = 6 * 1024,
         .max_request_body = 16 * 1024 * 1024,
         //
-        .response_cache = true,
-        .cache_max_entries = 256,
-        .cache_max_value_bytes = 16 * 1024,
-        .cache_ttl_ms = 2_000,
-        .cache_max_total_bytes = 16 * 1024,
-        //
         .uring_send_buf_size = 16 * 1024,
         .uring_idle_pool_floor = 16,
         .uring_idle_pool_ceiling = 1 * 1024,
