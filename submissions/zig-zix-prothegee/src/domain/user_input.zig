@@ -64,6 +64,8 @@ pub fn parseRegister(allocator: std.mem.Allocator, body: []const u8) Error!Regis
     if (parsed.user.username.len == 0) return error.InvalidBody;
     if (parsed.user.email.len == 0) return error.InvalidBody;
     if (parsed.user.password.len == 0) return error.InvalidBody;
+    // bcrypt only uses the first 72 bytes.
+    if (parsed.user.password.len > 72) return error.InvalidBody;
 
     return .{
         .username = parsed.user.username,
@@ -92,6 +94,14 @@ pub fn parseUpdate(allocator: std.mem.Allocator, body: []const u8) Error!Update 
     const parsed = jzon.deserialize(UpdateBody, allocator, body, .{ .unknown = .SKIP, .strings = .BORROW }) catch {
         return error.InvalidBody;
     };
+
+    if (parsed.user.email) |email| {
+        if (email.len == 0) return error.InvalidBody;
+    }
+
+    if (parsed.user.password) |password| {
+        if (password.len > 72) return error.InvalidBody;
+    }
 
     return parsed.user;
 }
@@ -201,4 +211,61 @@ test "user_input: an unknown field is skipped" {
     );
 
     try std.testing.expectEqualStrings("hi", input.bio.?);
+}
+
+test "user_input: a 72 byte password is accepted and 73 is rejected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const short = try allocator.alloc(u8, 72);
+    @memset(short, 'p');
+    const short_body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"user\":{{\"username\":\"ada\",\"email\":\"ada@example.com\",\"password\":\"{s}\"}}}}",
+        .{short},
+    );
+    const input = try parseRegister(allocator, short_body);
+    try std.testing.expectEqual(@as(usize, 72), input.password.len);
+
+    const long = try allocator.alloc(u8, 73);
+    @memset(long, 'p');
+    const long_body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"user\":{{\"username\":\"ada\",\"email\":\"ada@example.com\",\"password\":\"{s}\"}}}}",
+        .{long},
+    );
+    try std.testing.expectError(error.InvalidBody, parseRegister(allocator, long_body));
+}
+
+test "user_input: an update rejects an empty email" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.InvalidBody, parseUpdate(
+        arena.allocator(),
+        "{\"user\":{\"email\":\"\"}}",
+    ));
+}
+
+test "user_input: an update accepts a null email" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const input = try parseUpdate(
+        arena.allocator(),
+        "{\"user\":{\"email\":null}}",
+    );
+
+    try std.testing.expect(input.email == null);
+}
+
+test "user_input: an update rejects a password over 72 bytes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const long = try allocator.alloc(u8, 73);
+    @memset(long, 'p');
+    const body = try std.fmt.allocPrint(allocator, "{{\"user\":{{\"password\":\"{s}\"}}}}", .{long});
+
+    try std.testing.expectError(error.InvalidBody, parseUpdate(allocator, body));
 }
