@@ -5,7 +5,7 @@ Front: direct
 | | |
 |---|---|
 | Language | Scala 3.10.0 on Temurin JDK 27 (`27+35`, the newest OpenJDK release; official tarball, checksum-verified) |
-| Build | Scala CLI 1.18.0 (official release binary, checksum-verified); build definition in `project.scala` |
+| Build | Scala CLI 1.18.0 (official release binary, checksum-verified); build definition in `project.scala`; `start.sh` runs the app through it too |
 | Effect system / streaming | Cats Effect 3.7.1, fs2 3.14.0 |
 | HTTP server | http4s 0.23.38, Ember backend (`http4s-ember-server`), routes in `http4s-dsl` |
 | Database access | skunk 2.0.0-RC3 (`skunk-core`, the Typelevel Postgres driver on fs2 sockets; no JDBC), otel4s 1.1.0 no-op providers |
