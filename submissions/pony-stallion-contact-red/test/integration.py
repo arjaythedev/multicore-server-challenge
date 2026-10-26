@@ -677,7 +677,8 @@ class PoolRun:
             remaining = deadline - time.monotonic()
             if remaining <= 0 or not self.selector.select(remaining):
                 self.proxy.assert_healthy()
-                raise AssertionError("pool probe response timed out")
+                raise AssertionError(("pool probe response timed out",
+                                      self.history[-5:]))
             chunk = os.read(self.process.stdout.fileno(), 65536)
             if not chunk:
                 raise AssertionError("pool probe exited before response")
@@ -731,12 +732,16 @@ class PoolRun:
 
     def wait_state(self, predicate, timeout=10):
         deadline = time.monotonic() + self.time_left(timeout)
+        state = None
         while time.monotonic() < deadline:
             state = self.state(timeout=min(10, deadline - time.monotonic()))
             if predicate(state):
                 return state
             time.sleep(0.01)
-        raise AssertionError("pool state condition timed out")
+        self.proxy.assert_healthy()
+        gates = [(g.kind, g.connection, g.reached.is_set(), g.release.is_set())
+                 for g in self.proxy.frame_gates]
+        raise AssertionError(("pool state condition timed out", state, gates))
 
     def ready(self, count):
         return self.wait_state(lambda state: state["phases"] == [2] * count)
