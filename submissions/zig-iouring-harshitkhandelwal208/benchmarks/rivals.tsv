@@ -1,0 +1,11 @@
+# label	PR	author	submission directory in the PR	PR head (first 12)	build command (run inside the extracted directory)	extra environment for start.sh
+p7	7	Scooter1337	rust-tokio-Scooter1337	dc7c249229bd	bash build.sh	
+p10	10	tigokraft	c-iouring-tigokraft	19d78b3a694f	bash build.sh	
+p22	22	jh-d	csharp-sockets-jh-d	4aee3c3053aa	DOTNET=$DOTNET10/dotnet bash build.sh	DOTNET_ROOT=$DOTNET10
+p47	47	WorriedArrow	rust-epoll-WorriedArrow	884815dd6734	bash build.sh	
+p52	52	umitaltintas	c-epoll-umitaltintas	fe3742a35a9c	bash build.sh	
+p53	53	y2kbugger	zig-fourneau-y2kbugger	fdc37b33ded8	ZIG=$(command -v zig) bash build.sh	
+p58	58	gilnett	c-iouring-gilnett	25bf93ff971c	bash build.sh	
+p59	59	semyonfox	rust-tokio-semyonfox	7871e8de5a4b	bash build.sh	
+p61	61	MegaPanchamZ	go-epoll-MegaPanchamZ	3627ec410a67	bash build.sh	
+p64	64	touhidsiddiqueeraj-bit	rust-tokio-touhidsiddiqueeraj-bit	4b72a8f2dc78	bash build.sh	
