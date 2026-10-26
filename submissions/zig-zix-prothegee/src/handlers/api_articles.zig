@@ -9,6 +9,7 @@ const db = @import("../db.zig");
 const auth_request = @import("../auth/request.zig");
 const article_domain = @import("../domain/article.zig");
 const article_input = @import("../domain/article_input.zig");
+const article_filter = @import("../http/article_filter.zig");
 const article_view = @import("../http/article_view.zig");
 const paging = @import("../http/paging.zig");
 const respond = @import("../http/respond.zig");
@@ -18,14 +19,6 @@ const respond = @import("../http/respond.zig");
 pub const PATH = "/api/articles";
 
 // --------------------------------------------------------- //
-
-fn filterFrom(req: *zix.Http1.Request) article_domain.Filter {
-    if (req.queryParam("tag")) |tag| return .{ .TAG = tag };
-    if (req.queryParam("author")) |author| return .{ .AUTHOR = author };
-    if (req.queryParam("favorited")) |favorited| return .{ .FAVORITED = favorited };
-
-    return .NONE;
-}
 
 fn list(
     req: *zix.Http1.Request,
@@ -56,7 +49,7 @@ fn list(
         conn,
         ctx.allocator,
         viewer,
-        filterFrom(req),
+        article_filter.parse(req.queryParam("tag"), req.queryParam("author"), req.queryParam("favorited")),
         page_params.limit,
         page_params.offset,
     ) catch {
