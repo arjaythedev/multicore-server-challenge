@@ -32,11 +32,16 @@ Implemented:
 | `GET /api/profiles/:username` | done |
 | `POST /api/profiles/:username/follow` | done |
 | `DELETE /api/profiles/:username/follow` | done |
+| `GET /api/articles` | done |
+| `GET /api/articles/feed` | done |
+| `GET /api/articles/:slug` | done |
+| `POST /api/articles` | done |
+| `PUT /api/articles/:slug` | done |
+| `DELETE /api/articles/:slug` | done |
 | `GET /api/tags` | done, also the health check |
 
 Pending:
 
-- Articles: list, feed, detail, create, update, delete.
 - Favorites: favorite and unfavorite.
 - Comments: list, create, delete.
 
@@ -47,6 +52,9 @@ Pending:
 - `JWT_SECRET` is read at startup and passed to every sign and verify call with the 26-byte minimum.
 - Every new password is hashed with bcrypt cost 10. Login verifies against the stored hash.
 - Profile reads are auth optional: a missing token is viewer 0, while a present invalid token is 401. Follow and unfollow require a token.
+- Article timestamps are formatted in SQL with `to_char`, UTC, exactly 3 fractional digits.
+- Article tag lists are assembled as `jsonb` in SQL and parsed into the response model.
+- Article lists run the page query and the capped count query, newest first.
 - `GET /api/tags` is served through the zix L1 response cache with a 2 second TTL.
 
 ## Optimizations
@@ -57,7 +65,7 @@ Pending:
 | per-worker PostgreSQL connection | no locks and no cross-core handoff |
 | keep-alive responses | matches the load generator's long-lived connections |
 | L1 cache on `GET /api/tags` | the tag list is viewer-independent and changes only when an article adds a tag |
-| no cache on per-viewer responses | the user row and the `following` flag are viewer-dependent |
+| no cache on per-viewer responses | the user row, the `following` flag, and article `favorited` state are viewer-dependent |
 | comptime router | path dispatch is resolved at compile time |
 | release default `0.0.0.0:80` | direct front, while `HOST` and `PORT` always override it |
 
@@ -119,7 +127,7 @@ The integration suite needs the local database. It skips when the database is do
 
 ## Status
 
-The conformance suite has not been run against all 197 checks. Users, auth, profiles, and tags are implemented, so the remaining endpoints still answer 404.
+The conformance suite has not been run against all 197 checks. Users, auth, profiles, articles, and tags are implemented, so the remaining endpoints still answer 404.
 
 ## Notes
 
