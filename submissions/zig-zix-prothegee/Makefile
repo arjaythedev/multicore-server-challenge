@@ -9,6 +9,7 @@ PGPORT ?= 5432
 PGUSER ?= conduit
 PGPASSWORD ?= conduit
 GOCACHE ?= $(CURDIR)/.cache/go-build
+SEED_TEMPLATE ?= conduit_dev
 
 # --------------------------------------------------------- #
 
@@ -74,6 +75,13 @@ sync-seed-dev: ## Generate the 2% seed database (conduit_dev)
 .PHONY: sync-seed-full
 sync-seed-full: ## Generate the full seed database (conduit_seed)
 	PGHOST=$(PGHOST) PGPORT=$(PGPORT) PGUSER=$(PGUSER) PGPASSWORD=$(PGPASSWORD) GOCACHE=$(GOCACHE) bash ../../seed/make-seed.sh;
+
+# Refresh the database the app reads from the seed template.
+.PHONY: sync-app
+sync-app: ## Refresh conduit from SEED_TEMPLATE (default conduit_dev)
+	PGPASSWORD=$(PGPASSWORD) psql -h $(PGHOST) -p $(PGPORT) -U $(PGUSER) -d postgres \
+		-c "DROP DATABASE IF EXISTS conduit WITH (FORCE)" \
+		-c "CREATE DATABASE conduit TEMPLATE $(SEED_TEMPLATE)";
 
 # --------------------------------------------------------- #
 
