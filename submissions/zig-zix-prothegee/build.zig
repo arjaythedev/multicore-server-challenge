@@ -113,6 +113,7 @@ pub fn build(b: *std.Build) void {
         target,
         optimize,
         &.{
+            "tests/behaviour/articles_test.zig",
             "tests/behaviour/profiles_test.zig",
             "tests/behaviour/tags_test.zig",
             "tests/behaviour/users_auth_test.zig",
@@ -129,6 +130,7 @@ pub fn build(b: *std.Build) void {
         target,
         optimize,
         &.{
+            "tests/integration/articles_test.zig",
             "tests/integration/profiles_test.zig",
             "tests/integration/tags_test.zig",
             "tests/integration/users_auth_test.zig",
