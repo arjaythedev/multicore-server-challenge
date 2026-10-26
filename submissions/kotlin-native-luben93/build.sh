@@ -9,7 +9,12 @@
 # binary is built for Kotlin/Native's portable x86-64 default.
 set -euo pipefail
 cd "$(dirname "$0")"
-if [ -x /opt/jdk/bin/java ]; then export JAVA_HOME=/opt/jdk; fi
+if [ ! -x /opt/jdk/bin/java ]; then
+    echo "build.sh: install the bundled JDK with install.sh before building" >&2
+    exit 1
+fi
+export JAVA_HOME=/opt/jdk
+export PATH="/opt/jdk/bin:$PATH"
 
 # the cinterop step makes Gradle fetch the Kotlin/Native toolchain (its clang included) on a first build
 gradle --no-daemon -q cinteropBcryptLinuxX64
