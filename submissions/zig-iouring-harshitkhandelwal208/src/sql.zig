@@ -16,6 +16,8 @@ const I8A = pg.oid.int8_array;
 const I4A = pg.oid.int4_array;
 
 pub const Stmt = enum(u16) {
+    tx_begin,
+    tx_commit,
     tags,
     user_by_id,
     user_login,
@@ -121,6 +123,8 @@ const slugify = "trim(both '-' from lower(regexp_replace($6, '[^A-Za-z0-9]+', '-
 
 pub const defs = blk: {
     var d: [std.meta.fieldNames(Stmt).len]Def = undefined;
+    d[@intFromEnum(Stmt.tx_begin)] = .{ .sql = "BEGIN", .params = &.{} };
+    d[@intFromEnum(Stmt.tx_commit)] = .{ .sql = "COMMIT", .params = &.{} };
     d[@intFromEnum(Stmt.tags)] = .{ .sql = "SELECT name FROM tags WHERE $1 IS NOT NULL ORDER BY name", .params = &.{I8} }; // $1: the viewer, unused. (Waiting `tags` requests are answered from one execution of this statement; see flushReads.)
     d[@intFromEnum(Stmt.user_by_id)] = .{ .sql = "SELECT id, username, email, bio, image FROM users WHERE id = $1", .params = &.{I8} };
     d[@intFromEnum(Stmt.user_login)] = .{ .sql = "SELECT id, username, email, bio, image, password_hash FROM users WHERE email = $1", .params = &.{TX} };

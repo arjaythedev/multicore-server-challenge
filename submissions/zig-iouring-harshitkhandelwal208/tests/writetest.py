@@ -24,9 +24,14 @@ def worker(i):
     s2, d2 = call("POST", "/api/articles/%s/favorite" % slug, uid)
     s3, d3 = call("POST", "/api/profiles/%s/follow" % author, uid)
     s4, d4 = call("POST", "/api/articles", uid, {"article": {"title": "T %d" % i, "description": "d", "body": "b", "tagList": ["gc%d" % (i % 7), "common"]}})
+    # A 201 must mean the article is committed and immediately visible to the
+    # next page view, including its initially empty comment thread.
+    created = d4.get("article", {}).get("slug") if isinstance(d4, dict) else None
+    s5, _ = call("GET", "/api/articles/" + created) if created else (0, None)
+    s6, _ = call("GET", "/api/articles/%s/comments" % created) if created else (0, None)
     ok = (s1, s2, s3, s4) == (201, 200, 200, 201) and d2["article"]["favorited"] is True and d3["profile"]["following"] is True \
-         and sorted(d4["article"]["tagList"]) == sorted(["gc%d" % (i % 7), "common"])
-    if not ok: bad.append((i, s1, s2, s3, s4))
+         and sorted(d4["article"]["tagList"]) == sorted(["gc%d" % (i % 7), "common"]) and (s5, s6) == (200, 200)
+    if not ok: bad.append((i, s1, s2, s3, s4, s5, s6))
 t0 = time.time()
 ts = [threading.Thread(target=worker, args=(i,)) for i in range(N)]
 [t.start() for t in ts]; [t.join() for t in ts]

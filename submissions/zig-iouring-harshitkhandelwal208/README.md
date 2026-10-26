@@ -71,10 +71,12 @@ See [COMPETITIVE_ANALYSIS.md](COMPETITIVE_ANALYSIS.md) for a head-on architectur
   a list and its capped count are one statement (`WITH c AS (count) SELECT … LEFT JOIN LATERAL (page)`) so an empty page
   still carries the count; follow / comment / delete / update fold lookup and write into one CTE; comment threads (up to
   100 rows) test "does the viewer follow this author" against the viewer's followee set hashed once (-27% on a hot thread).
-- **Reads are batched by a two-phase planner, and what requests share is done once.** A waiting read is held for up to
-  100 ms (`READ_WINDOW_US`) for company, or until 2,048 reads are waiting (`READ_HOLD_MIN`). Under high concurrency
-  the window contracts adaptively (`ADAPTIVE_WINDOW=1`): >= 1,024 staged reads shortens it to 10 ms, >= 512 to 25 ms,
-  >= 256 to 50 ms; idle Postgres backends with >= 64 staged reads trigger 15 ms. The batch (at most 2,048 reads, oldest first)
+- **Reads are batched by a two-phase planner, and what requests share is done once.** A lone read goes straight to an
+  idle Postgres backend; otherwise a waiting read is held for up to 100 ms (`READ_WINDOW_US`) for company, or until
+  2,048 reads are waiting (`READ_HOLD_MIN`). Under high concurrency the deadline contracts adaptively
+  (`ADAPTIVE_WINDOW=1`): >= 1,024 staged reads shortens it to 10 ms, >= 512 to 25 ms, >= 256 to 35 ms, >= 128 to
+  50 ms; idle Postgres backends with >= 64 staged reads trigger 15 ms. The deadline is rescheduled when the queue
+  crosses a threshold. The batch (at most 2,048 reads, oldest first)
   goes out as a plan: phase A runs one statement per kind of request present, each over the batch's distinct keys (capped
   counts and page rows, `unnest(...) WITH ORDINALITY`); phase B enriches the union of the articles phase A returned, once
   each (author, favourite count, tag names), and resolves each viewer's favourited / following flags with one `= ANY` range
@@ -103,9 +105,9 @@ See [COMPETITIVE_ANALYSIS.md](COMPETITIVE_ANALYSIS.md) for a head-on architectur
 `1` runs the workers as threads of one process), `DB_CONNS` (default CPUs, max 95), `DB_WRITE_CONNS`, `PG_DEPTH` (4),
 `BCRYPT_THREADS`, `BCRYPT_LANES` (4), `BCRYPT_WAIT_MS` (250), `PIN_CPUS` (0: optional CPU pinning), `STATS=1`.
 
-Read batching: `READ_WINDOW_US` (100000: longest a read waits for company), `READ_HOLD_MIN` (2048: a plan goes out at once
-when this many reads are waiting), `ADAPTIVE_WINDOW` (1: dynamically scales the read hold timer based on staged depth and
-idle Postgres connections to minimize p95 latency under high concurrency), `SEND_ZC` (1: zero-copy network sends via
+Read batching: `READ_WINDOW_US` (100000: longest a queued read waits for company), `READ_HOLD_MIN` (2048: a plan goes out at once
+when this many reads are waiting), `ADAPTIVE_WINDOW` (1: sends a lone read to an idle backend immediately and dynamically
+shortens the queued-read deadline based on staged depth and idle Postgres connections), `SEND_ZC` (1: zero-copy network sends via
 `IORING_OP_SEND_ZC` for responses >= 256 bytes with automatic fallback to standard `prep_send`), `PLAN_MIN` (16: smallest
 batch the planner takes; `0` turns the planner off, leaving per-kind batches only), `PLAN_MAX` (2048: reads per plan),
 `PLAN_SPLIT` (0: when `1`, the waiting reads are shared over the connections that have room instead of one plan taking up

@@ -114,7 +114,7 @@ const Conn = struct {
 const max_pend = http.max_body + http.max_head + 4096;
 
 // user_data layout: tag (8) | gen (24) | index (32)
-const Tag = enum(u8) { accept = 1, recv, poll, send, pg_recv, pg_send, event, close, shut, timer, hold };
+const Tag = enum(u8) { accept = 1, recv, poll, send, pg_recv, pg_send, event, close, shut, timer, hold, hold_cancel };
 
 inline fn ud(tag: Tag, gen: u32, idx: u32) u64 {
     return (@as(u64, @backingInt(tag)) << 56) | (@as(u64, gen & 0xffffff) << 32) | idx;
@@ -384,8 +384,12 @@ pub const Worker = struct {
     rc_fd: i32 = -1, // a connected, prepared socket waiting for the loop to adopt (atomic)
     partials: std.ArrayList(i32) = .empty,
     tick: linux.kernel_timespec = .{ .sec = 1, .nsec = 0 },
-    hold_ts: linux.kernel_timespec = .{ .sec = 0, .nsec = 0 },
+    // Keep two timeout payloads: a timeout may still be completing while a shorter
+    // replacement is submitted, so its timespec must not be overwritten.
+    hold_ts: [2]linux.kernel_timespec = @splat(.{ .sec = 0, .nsec = 0 }),
     hold_armed: bool = false,
+    hold_gen: u32 = 0,
+    hold_deadline: u64 = 0,
     staged_since: u64 = 0, // nowNs() when `staged` last went from 0
     stats: struct { reqs: u64 = 0, pg_batches: u64 = 0, fifo_max: usize = 0, batched_reqs: u64 = 0, batches: u64 = 0 } = .{},
 
@@ -583,6 +587,11 @@ pub const Worker = struct {
             s.user_data = ud(.close, 0, 0);
             return;
         }
+        // Linux normally inherits this from the listener, but set it on the
+        // accepted socket as well.  A small HTTP reply must never wait for a
+        // delayed ACK because an inherited listener option was not honoured.
+        const one: c_int = 1;
+        _ = linux.setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, @ptrCast(&one), @sizeOf(c_int));
         const c = &self.conns[@intCast(fd)];
         c.* = .{ .gen = c.gen +% 1, .open = true };
         self.armRecv(fd, c);
@@ -1120,24 +1129,53 @@ pub const Worker = struct {
         return min_conn;
     }
 
+    fn cancelHold(self: *Worker) void {
+        if (!self.hold_armed) return;
+        const old = ud(.hold, self.hold_gen, 0);
+        const e = self.sqe();
+        e.prep_timeout_remove(old, 0);
+        e.user_data = ud(.hold_cancel, self.hold_gen, 0);
+        self.hold_armed = false;
+        self.hold_deadline = 0;
+    }
+
+    /// Arm the hold timer at `deadline`, replacing it only when the new window
+    /// is sooner.  This is what makes an adaptive window actually contract.
+    fn armHold(self: *Worker, deadline: u64) void {
+        if (self.hold_armed and deadline >= self.hold_deadline) return;
+        self.cancelHold();
+        self.hold_gen +%= 1;
+        const ts = &self.hold_ts[self.hold_gen & 1];
+        const left = deadline -| sys.nowNs();
+        ts.* = .{ .sec = @intCast(left / std.time.ns_per_s), .nsec = @intCast(left % std.time.ns_per_s) };
+        const e = self.sqe();
+        e.prep_timeout(ts, 0, 0);
+        e.user_data = ud(.hold, self.hold_gen, 0);
+        self.hold_armed = true;
+        self.hold_deadline = deadline;
+    }
+
     /// Send staged reads to connections with room, oldest kind first.
     pub fn flushReads(self: *Worker) void {
         if (self.staged == 0) return;
         const window_ns = @as(u64, self.shared.cfg.read_window_us) * 1000;
+        var has_idle_pg = false;
+        for (self.pgs[0..self.n_read]) |*p| {
+            if (p.alive and p.depth == 0) {
+                has_idle_pg = true;
+                break;
+            }
+        }
         const effective_window_ns: u64 = if (!self.shared.cfg.adaptive_window) window_ns else blk: {
+            // Do not manufacture 100 ms of latency for an isolated request
+            // when a backend is waiting.  There is no batch to form yet.
+            if (self.staged == 1 and has_idle_pg) break :blk 0;
             if (self.staged >= self.shared.cfg.read_hold_min) break :blk 0;
             if (self.staged >= 1024) break :blk 10 * std.time.ns_per_ms;
             if (self.staged >= 512) break :blk 25 * std.time.ns_per_ms;
             if (self.staged >= 256) break :blk 35 * std.time.ns_per_ms;
             if (self.staged >= 128) break :blk 50 * std.time.ns_per_ms;
 
-            var has_idle_pg = false;
-            for (self.pgs[0..self.n_read]) |*p| {
-                if (p.alive and p.depth == 0) {
-                    has_idle_pg = true;
-                    break;
-                }
-            }
             if (has_idle_pg and self.staged >= 64) break :blk 15 * std.time.ns_per_ms;
             break :blk window_ns;
         };
@@ -1146,17 +1184,11 @@ pub const Worker = struct {
             // Young and few: wait for company. One timeout wakes the loop when the oldest has waited the window out.
             const waited = sys.nowNs() -| self.staged_since;
             if (waited < effective_window_ns) {
-                if (!self.hold_armed) {
-                    const left = effective_window_ns - waited;
-                    self.hold_ts = .{ .sec = @intCast(left / 1_000_000_000), .nsec = @intCast(left % 1_000_000_000) };
-                    const e = self.sqe();
-                    e.prep_timeout(&self.hold_ts, 0, 0);
-                    e.user_data = ud(.hold, 0, 0);
-                    self.hold_armed = true;
-                }
+                self.armHold(self.staged_since + effective_window_ns);
                 return;
             }
         }
+        self.cancelHold();
         const batch_max = @min(self.shared.cfg.batch_max, max_batch);
         while (self.staged != 0) {
             var any_alive = false;
@@ -1434,6 +1466,12 @@ pub const Worker = struct {
         const rec = &p.wrec;
         rec.n = @intCast(n);
         self.enc.reset();
+        var e = pg.Enc.init(&self.enc);
+        // A Sync only ends an extended-protocol cycle; it is not a database
+        // commit.  Keep every grouped write in one real transaction so a 2xx
+        // response makes its effects visible to the following request.
+        e.bind(sql.id(.tx_begin));
+        e.exec();
         for (0..n) |i| {
             rec.m[i] = p.staged.items[i];
             const s = rec.m[i].slice();
@@ -1444,7 +1482,9 @@ pub const Worker = struct {
             self.enc.putSlice("B\x00\x00\x00\x11\x00s9999\x00\x00\x00\x00\x00\x00\x00");
             self.enc.putSlice("E\x00\x00\x00\x09\x00\x00\x00\x00\x00");
         }
-        self.enc.putSlice("S\x00\x00\x00\x04");
+        e.bind(sql.id(.tx_commit));
+        e.exec();
+        e.sync();
         const rest = p.staged.items.len - n;
         std.mem.copyForwards(Member, p.staged.items[0..rest], p.staged.items[n..]);
         p.staged.shrinkRetainingCapacity(rest);
@@ -1470,10 +1510,19 @@ pub const Worker = struct {
             var start: usize = 0;
             var idx: usize = 0;
             var seen: u32 = 0;
+            var began = false;
             const syn = &self.synth;
             while (idx < rec.n) {
                 const m = rd.next() orelse break;
                 if (m.kind != 'C') continue;
+                if (!began) {
+                    // Exclude BEGIN from every synthetic member reply.  The
+                    // full batch has already reached ReadyForQuery, so the
+                    // COMMIT below it completed before a response is sent.
+                    began = true;
+                    start = rd.pos;
+                    continue;
+                }
                 seen += 1;
                 if (seen < rec.m[idx].k) continue;
                 syn.reset();
@@ -1575,7 +1624,11 @@ pub const Worker = struct {
             .pg_recv => self.onPgRecv(idx, cqe.res),
             .pg_send => self.onPgSend(idx, cqe.res),
             .event => self.onEvent(),
-            .hold => self.hold_armed = false,
+            .hold => if (gen == self.hold_gen) {
+                self.hold_armed = false;
+                self.hold_deadline = 0;
+            },
+            .hold_cancel => {},
             .timer => {
                 if (!self.accept_live) self.armAccept();
                 self.pgReconnect();
