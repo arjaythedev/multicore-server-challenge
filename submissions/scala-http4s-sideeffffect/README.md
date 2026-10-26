@@ -36,6 +36,8 @@ Optional knobs (env): `DB_READ_SESSIONS` (default 32), `DB_WRITE_SESSIONS` (defa
 
 ## Layout
 
+The sources are in `src/`. `project.scala` holds the Scala version, the compiler options and the pinned dependencies.
+
 | File | What |
 |---|---|
 | `Main.scala` | Config from env, the skunk sessions, the bcrypt pool, the Ember server |
@@ -57,12 +59,12 @@ Optional knobs (env): `DB_READ_SESSIONS` (default 32), `DB_WRITE_SESSIONS` (defa
 - **Idle connections stay open** until the client closes them. A virtual user keeps its connection for the whole
   session and thinks for up to 70 s. With a finite idle timeout, Ember races a timer against every socket read
   (about 4% more CPU per request in a local A/B test).
-- **A listen backlog of 4,096 instead of 50.** fs2 binds with Java's default backlog of 50, and neither fs2 nor Ember
+- **A listen backlog of 65,535 instead of 50.** fs2 binds with Java's default backlog of 50, and neither fs2 nor Ember
   has a setting for it. When users arrive faster than the accept loop takes them, the kernel's accept queue
   overflows, and each dropped handshake comes back as a 1–3 s retransmit. On Linux, calling `listen()` again on a
   listening socket changes its backlog, so `ListenBacklog.scala` finds the socket among the process's descriptors
-  and does that through the JDK's foreign function API. The kernel caps it at `net.core.somaxconn` (4,096 on Ubuntu
-  24.04).
+  and does that through the JDK's foreign function API. The kernel caps it at `net.core.somaxconn`, which
+  the box sets to 65,535 ([`box/sysctl.conf`](../../box/sysctl.conf)).
 - **A small read buffer (8 KB).** Requests are small. Ember's default is 256 KB per read, which multiplied over tens
   of thousands of open connections would use too much heap.
 - **A bounded bcrypt pool.** bcrypt (about 55 ms of CPU at cost 10) runs on a fixed pool with half the cores,
