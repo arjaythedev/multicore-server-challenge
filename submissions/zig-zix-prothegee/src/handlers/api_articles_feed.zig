@@ -43,8 +43,12 @@ fn feed(
         return;
     };
 
-    const page = article_domain.feed(
-        conn,
+    const prepared = article_domain.prepared(conn) catch {
+        try respond.sendError(res, .INTERNAL_SERVER_ERROR, "database error");
+        return;
+    };
+
+    const page = prepared.feed(
         ctx.allocator,
         viewer.id,
         page_params.limit,
