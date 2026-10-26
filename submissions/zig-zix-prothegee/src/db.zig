@@ -19,6 +19,8 @@ threadlocal var tl_conn: ?*postgrez.Conn = null;
 /// Store the database target once at startup.
 pub fn init(database_url: []const u8, io: std.Io) !void {
     g_config = try postgrez.parseUrl(database_url);
+    g_config.tls = .OFF;
+    g_config.dispatch_model = .URING;
     g_io = io;
     g_ready = true;
 }
