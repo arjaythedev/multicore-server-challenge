@@ -1,0 +1,9 @@
+libdeflate 1.19 by Eric Biggers (MIT, see COPYING), only the files gzip compression needs.
+
+Source: https://github.com/ebiggers/libdeflate/releases/download/v1.19/libdeflate-1.19.tar.gz
+SHA-256: d9bb9bdd8cc5a8c1f7f6226fa0053dd72861e15f366e7ff7d0d191eac16d66f3
+
+Files are copied unchanged from the tarball, at the same paths, except lib/utils.c: its FREESTANDING fallback
+memset/memcpy/memmove/memcmp are removed. They are weak symbols, as Zig's compiler_rt versions are, so the linker
+could pick these byte-at-a-time loops for the whole server. build.sh compiles the five .c files with -DFREESTANDING
+and no libc; the server passes its own malloc and free to libdeflate_alloc_compressor_ex (src/gzip.zig).
