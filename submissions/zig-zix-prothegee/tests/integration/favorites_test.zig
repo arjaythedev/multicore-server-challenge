@@ -61,7 +61,7 @@ test "integration: favorite and unfavorite an article" {
     try std.testing.expect(created != null);
     const article = created.?;
 
-    const maybe_article_id = try favorite_domain.findArticleId(conn, allocator, article.slug);
+    const maybe_article_id = try article_domain.idBySlug(conn, allocator, article.slug);
     try std.testing.expect(maybe_article_id != null);
     const article_id = maybe_article_id.?;
     try std.testing.expectEqual(article.id, article_id);
@@ -96,5 +96,5 @@ test "integration: favorite and unfavorite an article" {
     try std.testing.expectEqual(@as(i64, 0), after_second_remove.?.favorites_count);
 
     // A missing slug has no article id.
-    try std.testing.expect((try favorite_domain.findArticleId(conn, allocator, "zix-no-such-article")) == null);
+    try std.testing.expect((try article_domain.idBySlug(conn, allocator, "zix-no-such-article")) == null);
 }
