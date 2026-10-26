@@ -41,9 +41,15 @@ const SQL_FIND_BY_ID =
     "SELECT id, username, email, bio, image FROM users WHERE id = $1";
 
 const SQL_UPDATE =
-    "UPDATE users SET email = COALESCE($2, email), username = COALESCE($3, username), " ++
-    "password_hash = COALESCE($4, password_hash), bio = COALESCE($5, bio), image = COALESCE($6, image) " ++
-    "WHERE id = $1 RETURNING id, username, email, bio, image";
+    \\UPDATE users SET
+    \\  email = COALESCE($2, email),
+    \\  username = COALESCE($3, username),
+    \\  password_hash = COALESCE($4, password_hash),
+    \\  bio = COALESCE($5, bio),
+    \\  image = COALESCE($6, image)
+    \\WHERE id = $1
+    \\RETURNING id, username, email, bio, image
+;
 
 // --------------------------------------------------------- //
 
