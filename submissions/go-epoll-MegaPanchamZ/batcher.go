@@ -227,12 +227,11 @@ type pgEngine struct {
 	readSignal   chan struct{}
 	stopSignal   chan struct{}
 
-	writeQueue      chan *reqCtx
-	hashQ           hashDeque
-	hashBaseCh      chan *hashWorkBatch
-	hashBurst       chan *hashWorkBatch
-	hashPool        chan *hashWorkBatch
-	busyHashWorkers atomic.Int32
+	writeQueue chan *reqCtx
+	hashQ      hashDeque
+	hashBaseCh chan *hashWorkBatch
+	hashBurst  chan *hashWorkBatch
+	hashPool   chan *hashWorkBatch
 
 	sessions []*pgSession
 	dbGroup  sync.WaitGroup
@@ -1442,7 +1441,7 @@ func (s *pgSession) openConnection(ctx context.Context, warmSQL string) error {
 	if warmSQL != "" {
 		_ = conn.Exec(ctx, "SET jit = off; "+warmSQL).Close()
 	}
-	if err := conn.Exec(ctx, "RESET enable_indexonlyscan; RESET enable_indexscan; RESET enable_bitmapscan; RESET enable_seqscan; SET statement_timeout = 5000; SET plan_cache_mode = force_generic_plan; SET jit = off; SET work_mem = '32MB'; SET random_page_cost = 1.1; SET effective_io_concurrency = 200").Close(); err != nil {
+	if err := conn.Exec(ctx, "RESET enable_indexonlyscan; RESET enable_indexscan; RESET enable_bitmapscan; RESET enable_seqscan; SET statement_timeout = 5000; SET plan_cache_mode = force_generic_plan; SET jit = off; SET work_mem = '32MB'").Close(); err != nil {
 		conn.Close(ctx)
 		return fmt.Errorf("pg session init: %w", err)
 	}
@@ -1513,10 +1512,10 @@ func (eng *pgEngine) launchHashWorkers() {
 	}
 	eng.hashWG.Go(eng.collectHashBatches)
 	for range eng.opts.hashThreads {
-		eng.hashWG.Go(func() { eng.runHashWorker(eng.hashBaseCh, true) })
+		eng.hashWG.Go(func() { eng.runHashWorker(eng.hashBaseCh) })
 	}
 	for range burstThreads {
-		eng.hashWG.Go(func() { eng.runHashWorker(eng.hashBurst, false) })
+		eng.hashWG.Go(func() { eng.runHashWorker(eng.hashBurst) })
 	}
 }
 
@@ -1611,10 +1610,8 @@ func (eng *pgEngine) collectHashBatches() {
 		if wb.count < blowfish8.Lanes && !closed {
 			now := clockNano()
 			coalesceNs := int64(eng.opts.hashCoalesce)
-			if eng.busyHashWorkers.Load() < int32(eng.opts.hashThreads) {
-				coalesceNs = min(coalesceNs, int64(3*time.Millisecond))
-			} else if now-lastBatchAt < int64(200*time.Millisecond) && coalesceNs < int64(25*time.Millisecond) {
-				coalesceNs = int64(25 * time.Millisecond)
+			if now-lastBatchAt < int64(200*time.Millisecond) && coalesceNs < int64(45*time.Millisecond) {
+				coalesceNs = int64(45 * time.Millisecond)
 			}
 			coalesceUntil := now + coalesceNs
 			for wb.count < blowfish8.Lanes {
@@ -1635,7 +1632,7 @@ func (eng *pgEngine) collectHashBatches() {
 				case <-waitTimer.C:
 				}
 				_, closed = eng.pullNextHashBatch(wb, clockNano(), maxAge)
-				if closed || (eng.busyHashWorkers.Load() < int32(eng.opts.hashThreads) && wb.count >= 2) || clockNano() >= coalesceUntil {
+				if closed || clockNano() >= coalesceUntil {
 					break
 				}
 			}
@@ -1653,18 +1650,12 @@ func (eng *pgEngine) collectHashBatches() {
 	}
 }
 
-func (eng *pgEngine) runHashWorker(inCh <-chan *hashWorkBatch, isBase bool) {
+func (eng *pgEngine) runHashWorker(inCh <-chan *hashWorkBatch) {
 	var bfEng blowfish8.Engine
 	var jobs [blowfish8.Lanes]blowfish8.HashJob
 	signer := newTokenSigner(eng.hmacKey)
 	for wb := range inCh {
-		if isBase {
-			eng.busyHashWorkers.Add(1)
-		}
 		eng.executeHashBatch(&bfEng, &jobs, signer, wb)
-		if isBase {
-			eng.busyHashWorkers.Add(-1)
-		}
 	}
 }
 
