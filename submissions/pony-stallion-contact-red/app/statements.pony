@@ -134,8 +134,7 @@ primitive _Catalog
   fun sql(statement: _Statement): String =>
     match statement
     | _Tags =>
-      "SELECT json_build_object('tags', COALESCE(" +
-        "json_agg(name ORDER BY name), '[]'::json))::text FROM tags"
+      "SELECT ARRAY(SELECT name FROM tags ORDER BY name)"
     | _RegisterUser =>
       """
       INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3)

@@ -47,6 +47,16 @@ actor \nodoc\ _PoolClient is _QueryClient
 
   be db_result(id: U64, result: pg.Result) =>
     _callbacks = _callbacks + 1
+    match result.query()
+    | let query: pg.NamedPreparedQuery if query.name == "tags" =>
+      try
+        _owner.result(_index, id, "ok",
+          _Output.tags_body(_Output.first(result)? as pg.Row)?)
+      else
+        _owner.result(_index, id, "data")
+      end
+      return
+    end
     let payload = try
       (_Output.first(result)? as pg.Row).fields(0)? as String
     else None end

@@ -25,14 +25,7 @@ primitive _Output
     | let n: I32 => out.append(n.string())
     | let b: Bool => out.append(if b then "true" else "false" end)
     | None => out.append("null")
-    | let a: pg.PgArray =>
-      out.push('[')
-      var first_element = true
-      for v in a.elements.values() do
-        if first_element then first_element = false else out.push(',') end
-        _quoted(out, v as String)
-      end
-      out.push(']')
+    | let a: pg.PgArray => _array(out, a)?
     | let t: pg.PgTimestamp =>
       let us = t.microseconds + 946_684_800_000_000
       let seconds = us.fld(1_000_000)
@@ -79,27 +72,39 @@ primitive _Output
   fun article_body(row: pg.Row): String ? =>
     recover val
       let out = String(512)
-      out.append("{\"article\":{\"slug\":")
-      _field(out, row, 1)?
-      out.append(",\"title\":")
-      _field(out, row, 2)?
-      out.append(",\"description\":")
-      _field(out, row, 3)?
-      out.append(",\"body\":")
-      _field(out, row, 4)?
-      out.append(",\"createdAt\":")
-      _field(out, row, 5)?
-      out.append(",\"updatedAt\":")
-      _field(out, row, 6)?
-      out.append(",\"tagList\":")
-      _field(out, row, 7)?
-      out.append(",\"favoritesCount\":")
-      _field(out, row, 8)?
-      out.append(",\"favorited\":")
-      _field(out, row, 9)?
-      out.append(",\"author\":")
-      _profile(out, row, 10, None)?
-      out.append("}}")
+      out.append("{\"article\":")
+      _article(out, row, true)?
+      out.push('}')
+      out
+    end
+
+  fun articles_body(rows': pg.Rows): String ? =>
+    let total = rows'(0)?.fields(13)? as I64
+    recover val
+      let out = String(512)
+      out.append("{\"articles\":[")
+      var first_element = true
+      for row in rows'.values() do
+        match row.fields(0)?
+        | None => if rows'.size() != 1 then error end
+        | let _: I64 =>
+          if first_element then first_element = false else out.push(',') end
+          _article(out, row, false)?
+        else error
+        end
+      end
+      out.append("],\"articlesCount\":")
+      out.append(total.string())
+      out.push('}')
+      out
+    end
+
+  fun tags_body(row: pg.Row): String ? =>
+    recover val
+      let out = String(256)
+      out.append("{\"tags\":")
+      _array(out, row.fields(0)? as pg.PgArray)?
+      out.push('}')
       out
     end
 
@@ -124,6 +129,41 @@ primitive _Output
       out.append("]}")
       out
     end
+
+  fun _article(out: String ref, row: pg.Row, full: Bool) ? =>
+    out.append("{\"slug\":")
+    _field(out, row, 1)?
+    out.append(",\"title\":")
+    _field(out, row, 2)?
+    out.append(",\"description\":")
+    _field(out, row, 3)?
+    if full then
+      out.append(",\"body\":")
+      _field(out, row, 4)?
+    end
+    let i: USize = if full then 5 else 4 end
+    out.append(",\"createdAt\":")
+    _field(out, row, i)?
+    out.append(",\"updatedAt\":")
+    _field(out, row, i + 1)?
+    out.append(",\"tagList\":")
+    _field(out, row, i + 2)?
+    out.append(",\"favoritesCount\":")
+    _field(out, row, i + 3)?
+    out.append(",\"favorited\":")
+    _field(out, row, i + 4)?
+    out.append(",\"author\":")
+    _profile(out, row, i + 5, None)?
+    out.push('}')
+
+  fun _array(out: String ref, values: pg.PgArray) ? =>
+    out.push('[')
+    var first_element = true
+    for value in values.elements.values() do
+      if first_element then first_element = false else out.push(',') end
+      _quoted(out, value as String)
+    end
+    out.push(']')
 
   fun _profile(out: String ref, row: pg.Row, i: USize,
     following: (Bool | None)) ?
