@@ -132,6 +132,9 @@ class _Operation
   fun ref reply(status: U16, body: String = "") =>
     _outcome = (status, if status == 204 then "" else body end)
 
+  fun ref reply_json(status: U16, row: pg.Row) ? =>
+    _outcome = (status, row.fields(0)? as String)
+
   fun ref error_reply(status: U16, message: String) =>
     reply(status, _Output.error_body(message))
 
@@ -166,7 +169,7 @@ class _Operation
       | "/api/tags" if _method == "GET" =>
         query(_Tags, _P.none(),
           {ref(w': _Operation ref, r: pg.Result) ? =>
-            w'.reply(200, _Output.tags_body(_Output.first(r)? as pg.Row)?)
+            w'.reply_json(200, _Output.first(r)? as pg.Row)?
           })
       | "/api/users" if _method == "POST" => register()?
       | "/api/users/login" if _method == "POST" => login()?
@@ -347,7 +350,7 @@ class _Operation
       end
     end
     query(page, args, {ref(w': _Operation ref, r: pg.Result) ? =>
-      w'.reply(200, _Output.articles_body(_Output.rows(r)?)?)
+      w'.reply_json(200, _Output.first(r)? as pg.Row)?
     })
 
   fun ref full_article(statement: _RequestStatement,

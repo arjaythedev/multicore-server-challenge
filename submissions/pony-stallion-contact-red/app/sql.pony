@@ -53,14 +53,19 @@ primitive _SQL
 
   fun article_list(page: String, count': String): String =>
     "WITH page AS (" + page + "), total AS (" + count' + ") " +
-      "SELECT p.id, p.slug, p.title, p.description, " +
-      "to_char(p.created_at AT TIME ZONE 'UTC', " +
+      "SELECT json_build_object('articles', COALESCE((SELECT " +
+      "json_agg(json_build_object(" +
+      "'slug', p.slug, 'title', p.title, " +
+      "'description', p.description, " +
+      "'createdAt', to_char(p.created_at AT TIME ZONE 'UTC', " +
       "'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), " +
-      "to_char(p.updated_at AT TIME ZONE 'UTC', " +
+      "'updatedAt', to_char(p.updated_at AT TIME ZONE 'UTC', " +
       "'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), " +
-      "p.tag_list, p.favorites_count, p.favorited, p.username, p.bio, " +
-      "p.image, p.following, total.total " +
-      "FROM total LEFT JOIN page p ON true ORDER BY p.id DESC"
+      "'tagList', p.tag_list, 'favoritesCount', p.favorites_count, " +
+      "'favorited', p.favorited, 'author', json_build_object(" +
+      "'username', p.username, 'bio', p.bio, 'image', p.image, " +
+      "'following', p.following)) ORDER BY p.id DESC) FROM page p), " +
+      "'[]'::json), 'articlesCount', (SELECT total FROM total))::text"
 
   fun valid_json(param: String): String =>
     "(CASE WHEN pg_input_is_valid(" + param +
