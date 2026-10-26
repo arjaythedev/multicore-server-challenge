@@ -77,6 +77,10 @@ pub fn parseUpdate(allocator: std.mem.Allocator, body: []const u8) Error!Update 
         return error.InvalidBody;
     };
 
+    if (parsed.article.title) |title| {
+        if (title.len == 0) return error.InvalidBody;
+    }
+
     return .{
         .title = parsed.article.title,
         .description = parsed.article.description,
@@ -184,4 +188,14 @@ test "article_input: an update with null fields is unchanged" {
     try std.testing.expect(input.title == null);
     try std.testing.expect(input.description == null);
     try std.testing.expect(input.body == null);
+}
+
+test "article_input: an empty update title is rejected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try std.testing.expectError(error.InvalidBody, parseUpdate(
+        arena.allocator(),
+        "{\"article\":{\"title\":\"\"}}",
+    ));
 }
