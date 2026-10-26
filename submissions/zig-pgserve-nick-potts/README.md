@@ -170,12 +170,31 @@ servers alternate:
 This run used the earlier asynchronous commit, without gzip. The two-vCPU load box tops out near 60k
 users.
 
-## Open question: CI
+## CI
 
-The repository's CI runs Postgres as a `postgres:18` service container. pgserve can't be tested there as
-designed: the runner has no `postgresql-18` package for `install.sh` to build against, and `pgengine.so`
-couldn't reach the container's `$libdir/plugins` anyway. This needs the maintainer's view before
-submitting.
+The repository's CI runs Postgres as a `postgres:18` service container, and the runner has no Postgres
+server. pgserve's workers are Postgres processes, so in CI the engine has to go into that container.
+`ci.sh` does this, and runs only in CI.
+
+`install.sh` and `start.sh` choose CI mode by what they find, and each logs its choice. If the
+`postgresql-18` package is installed, as on the box, they do exactly what is described above. If it is
+not, and exactly one running container comes from the `postgres:18` image (`docker ps --filter
+ancestor=postgres:18`), they hand over to `ci.sh`:
+
+- `install.sh` uses the container's own apt to fetch `postgresql-server-dev-18` at the container's
+  `postgresql-18` version, which gives the same headers the box gets. It builds the engine on the runner
+  against them and copies `pgengine.so` into the container's `$(pg_config --pkglibdir)/plugins`
+  (`docker cp`).
+- `start.sh` copies the launcher into the container and runs it with `sudo nsenter -m`. The launcher joins
+  only the container's mount namespace. It sees the container's `/tmp` and `/var/run/postgresql`, so the
+  workers reach its Unix socket and the owner check matches their user. It stays on the runner's network,
+  so it binds `HOST:PORT` where `test/run.sh` connects, and its `psql` reaches Postgres through the
+  published port. The listening sockets it hands over belong to the runner's network, so the workers in
+  the container accept connections made to the runner's `127.0.0.1:3000`. `sudo` passes on
+  `test/run.sh`'s SIGTERM, and the launcher stops the workers as usual.
+
+launcher.c and the engine are unchanged. On the box, `ci.sh` only checks for the `postgresql-18` package,
+logs that it found it, and returns.
 
 ## Files
 
@@ -184,3 +203,4 @@ submitting.
   statements (`shim/http_write.c`). It is copied from `../pgengine` by `vendor.sh`.
 - `install.sh` (root) installs Zig and the Postgres 18 server headers, then builds and installs the engine.
 - `build.sh` (as `challenge`) builds the launcher. `start.sh` runs it.
+- `ci.sh` is CI only. It puts the engine and the launcher into CI's Postgres container (see CI).

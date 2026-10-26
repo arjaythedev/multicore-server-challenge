@@ -5,6 +5,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 bash engine/install-zig.sh
+# CI only: no local Postgres server, Postgres in a postgres:18 container (README "CI").
+if C=$(bash ci.sh container); then exec bash ci.sh install "$C"; fi
 # The headers only, of exactly the installed server: postgresql-server-dev-18 at postgresql-18's version, from the
 # PGDG repo box/setup-box.sh adds, unpacked into a temporary folder. Installing the package would also pull in
 # clang-19 and llvm-19-dev, which the build doesn't use.
