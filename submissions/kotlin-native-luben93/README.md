@@ -9,7 +9,7 @@ Front: direct
 | Postgres | own wire-protocol 3.0 client (SCRAM-SHA-256, extended protocol, binary results), batched reads, group commit |
 | JSON, JWT, bcrypt | own: streaming JSON writer straight from binary rows, HS256, bcrypt cost 10 with interleaved lanes |
 | Coroutines | Kotlin `suspend` with stdlib intrinsics only; continuations resume on the thread that did the I/O |
-| Build | Gradle 9.8.2 (wrapper, checksummed) on Temurin JDK 27 (`install.sh`), used at build time only |
+| Build | Gradle 9.8.2 (checksum-verified by `install.sh`) on Temurin JDK 27, used at build time only |
 | Dependencies | none besides the Kotlin stdlib |
 
 This is the Kotlin/Native build of the same Kotlin Multiplatform code as `kotlin-raw-luben93` (the JVM build);

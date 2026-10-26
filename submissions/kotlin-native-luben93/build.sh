@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Builds the Kotlin/Native server, build/bin/linuxX64/releaseExecutable/conduit.kexe, as a normal user. Idempotent.
-# Gradle (pinned, checksummed wrapper) runs on the JDK from install.sh and downloads the Kotlin/Native toolchain
-# (compiler + LLVM) itself; the first build takes several minutes. cinterop compiles native/ (the vendored Openwall
-# bcrypt core) into the binary with that toolchain's clang, so no system C compiler is needed.
+# Gradle installed by install.sh runs on its JDK and downloads the Kotlin/Native toolchain (compiler + LLVM) itself;
+# the first build takes several minutes. cinterop compiles native/ (the vendored Openwall bcrypt core) into the
+# binary with that toolchain's clang, so no system C compiler is needed.
 #
 # Codegen targets this machine's CPU (the box builds what it runs): Kotlin/Native's clang reports the CPU name and
 # its full +/- feature list for -march=native, passed to the compiler via build.gradle.kts. If that fails, the
@@ -12,7 +12,7 @@ cd "$(dirname "$0")"
 if [ -x /opt/jdk/bin/java ]; then export JAVA_HOME=/opt/jdk; fi
 
 # the cinterop step makes Gradle fetch the Kotlin/Native toolchain (its clang included) on a first build
-./gradlew --no-daemon -q cinteropBcryptLinuxX64
+gradle --no-daemon -q cinteropBcryptLinuxX64
 
 cpu_args=()
 detect_cpu() {
@@ -34,5 +34,5 @@ if [ "${CONDUIT_GENERIC_CPU:-0}" = 1 ] || ! detect_cpu; then
     echo "build.sh: codegen for generic x86-64 (CPU detection off or failed)"
 fi
 
-./gradlew --no-daemon -q linkReleaseExecutableLinuxX64 "${cpu_args[@]}"
+gradle --no-daemon -q linkReleaseExecutableLinuxX64 "${cpu_args[@]}"
 ls -l build/bin/linuxX64/releaseExecutable/conduit.kexe
