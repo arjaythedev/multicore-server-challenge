@@ -19,6 +19,15 @@ const ARTICLE_LIST_BODY_MAX: usize = 64 * 1024;
 /// Room for one rendered full article.
 const ARTICLE_BODY_MAX: usize = 32 * 1024;
 
+/// Room for one rendered comment list. The list returns at most 100 comments.
+const COMMENTS_BODY_MAX: usize = 128 * 1024;
+
+/// Room for one rendered comment.
+const COMMENT_BODY_MAX: usize = 16 * 1024;
+
+/// Room for one rendered tag list.
+const TAGS_BODY_MAX: usize = 16 * 1024;
+
 // --------------------------------------------------------- //
 
 /// Send a JSON `{"user": ...}` response.
@@ -39,6 +48,19 @@ pub fn sendProfile(res: *zix.Http1.Response, profile: json.ProfileView, status: 
     var buf: [BODY_MAX]u8 = undefined;
 
     const len = json.renderProfile(&buf, profile) catch {
+        return sendError(res, .INTERNAL_SERVER_ERROR, "could not render response");
+    };
+
+    res.setStatus(status);
+
+    try res.sendJson(buf[0..len]);
+}
+
+/// Send a JSON `{"tags": [...]}` response.
+pub fn sendTags(res: *zix.Http1.Response, tags: []const []const u8, status: zix.Http1.Status.Code) !void {
+    var buf: [TAGS_BODY_MAX]u8 = undefined;
+
+    const len = json.renderTags(&buf, tags) catch {
         return sendError(res, .INTERNAL_SERVER_ERROR, "could not render response");
     };
 
@@ -70,6 +92,36 @@ pub fn sendArticle(res: *zix.Http1.Response, article: json.ArticleView, status: 
     var buf: [ARTICLE_BODY_MAX]u8 = undefined;
 
     const len = json.renderArticle(&buf, article) catch {
+        return sendError(res, .INTERNAL_SERVER_ERROR, "could not render response");
+    };
+
+    res.setStatus(status);
+
+    try res.sendJson(buf[0..len]);
+}
+
+/// Send a JSON `{"comments": [...]}` response.
+pub fn sendComments(
+    res: *zix.Http1.Response,
+    comments: []const json.CommentView,
+    status: zix.Http1.Status.Code,
+) !void {
+    var buf: [COMMENTS_BODY_MAX]u8 = undefined;
+
+    const len = json.renderComments(&buf, comments) catch {
+        return sendError(res, .INTERNAL_SERVER_ERROR, "could not render response");
+    };
+
+    res.setStatus(status);
+
+    try res.sendJson(buf[0..len]);
+}
+
+/// Send a JSON `{"comment": ...}` response.
+pub fn sendComment(res: *zix.Http1.Response, comment: json.CommentView, status: zix.Http1.Status.Code) !void {
+    var buf: [COMMENT_BODY_MAX]u8 = undefined;
+
+    const len = json.renderComment(&buf, comment) catch {
         return sendError(res, .INTERNAL_SERVER_ERROR, "could not render response");
     };
 
