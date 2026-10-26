@@ -43,7 +43,12 @@ fn detail(
         return;
     };
 
-    const found = article_domain.findBySlug(conn, ctx.allocator, viewer, slug) catch {
+    const prepared = article_domain.prepared(conn) catch {
+        try respond.sendError(res, .INTERNAL_SERVER_ERROR, "database error");
+        return;
+    };
+
+    const found = prepared.findBySlug(ctx.allocator, viewer, slug) catch {
         try respond.sendError(res, .INTERNAL_SERVER_ERROR, "database error");
         return;
     };
