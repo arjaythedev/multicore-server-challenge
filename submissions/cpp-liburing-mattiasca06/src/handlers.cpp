@@ -413,7 +413,7 @@ Task<Reply> Worker::h_register(const Request &rq) {
     Rows rows = co_await db_write(std::move(qv2), true);
     if (!rows.ok || rows.r.size() != 1) [[unlikely]] co_return db_error();
     const Res &r = rows[0];
-    if (PQresultStatus(r) != PGRES_TUPLES_OK)
+    if (r.p->status != PgStatus::Ok)
         co_return sqlstate(r) == "23505" ? err(422, "username or email already taken") : db_error();
     std::string body;
     user_json(body, r, 0, g_jwt.sign(i64(r, 0, 0), time(nullptr)));
@@ -471,7 +471,7 @@ Task<Reply> Worker::h_put_user(const Request &rq, int64_t viewer) {
     Rows rows = co_await db_write(std::move(qv5), true);
     if (!rows.ok || rows.r.size() != 1) [[unlikely]] co_return db_error();
     const Res &r = rows[0];
-    if (PQresultStatus(r) != PGRES_TUPLES_OK)
+    if (r.p->status != PgStatus::Ok)
         co_return sqlstate(r) == "23505" ? err(422, "username or email already taken") : db_error();
     if (r.rows() == 0) co_return err(401, "unauthorized");
     std::string body;

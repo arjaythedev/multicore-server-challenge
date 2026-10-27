@@ -1,6 +1,6 @@
 // Small encoders/decoders: base64url, percent-decoding, binary Postgres values, RFC 3339 timestamps.
 #pragma once
-#include <libpq-fe.h>
+#include "pgres.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -150,11 +150,11 @@ inline void append_ts(std::string &o, int64_t us) {
 }
 
 // Accessors for binary-format result columns.
-inline bool is_null(PGresult *r, int row, int col) { return PQgetisnull(r, row, col) != 0; }
-inline std::string_view text(PGresult *r, int row, int col) {
-    return {PQgetvalue(r, row, col), size_t(PQgetlength(r, row, col))};
+inline bool is_null(const PgResult *r, int row, int col) { return r->null(row, col); }
+inline std::string_view text(const PgResult *r, int row, int col) {
+    return {r->value(row, col), size_t(r->length(row, col))};
 }
-inline int64_t i64(PGresult *r, int row, int col) { return be64(PQgetvalue(r, row, col)); }
-inline bool boolean(PGresult *r, int row, int col) { return PQgetvalue(r, row, col)[0] != 0; }
+inline int64_t i64(const PgResult *r, int row, int col) { return be64(r->value(row, col)); }
+inline bool boolean(const PgResult *r, int row, int col) { return r->value(row, col)[0] != 0; }
 
 }  // namespace codec

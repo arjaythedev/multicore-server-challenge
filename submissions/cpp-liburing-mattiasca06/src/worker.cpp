@@ -19,6 +19,7 @@
 
 #include "picohttpparser.h"
 #include "codec.h"
+#include "diag.h"
 #include "prof.h"
 
 namespace {
@@ -135,18 +136,24 @@ void Worker::arm_recv(uint32_t idx) {
 void Worker::arm_pg(uint32_t pg_idx) {
     PgConn &pg = *pgs_[pg_idx];
     if (pg.in_armed) return;
+    DIAG_ASSERT(!pg.dead, "arm_pg on dead connection", pg_idx);
+    if (pg.in.size() - pg.in_len < 4096) pg.in.resize(pg.in.size() * 2);
+    DIAG_EV("arm_pg", pg_idx, pg.in_len, pg.in.size());
     pg.in_armed = true;
     io_uring_sqe *s = sqe();
-    io_uring_prep_poll_add(s, pg.sock, POLLIN);
+    io_uring_prep_recv(s, pg.sock, pg.in.data() + pg.in_len, pg.in.size() - pg.in_len, 0);
     io_uring_sqe_set_data64(s, pack(kPgIn, pg_idx));
 }
 
+// Queues the unsent part of the connection's output as an io_uring send (no syscall of its own: it goes out with the
+// next submit, together with the recv armed for the answer).
 void Worker::arm_pg_out(uint32_t pg_idx) {
     PgConn &pg = *pgs_[pg_idx];
-    if (pg.want_out) return;
-    pg.want_out = true;
+    if (pg.sending || pg.out_off >= pg.out_len) return;
+    DIAG_EV("arm_pg_out", pg_idx, pg.out_off, pg.out_len);
+    pg.sending = true;
     io_uring_sqe *s = sqe();
-    io_uring_prep_poll_add(s, pg.sock, POLLOUT);
+    io_uring_prep_send(s, pg.sock, pg.out.data() + pg.out_off, pg.out_len - pg.out_off, MSG_NOSIGNAL);
     io_uring_sqe_set_data64(s, pack(kPgOut, pg_idx));
 }
 
@@ -421,7 +428,7 @@ void Worker::enqueue(DbAwait *a) {
     } else {
         waitq_.push_back(a);
         // Hold the read briefly so concurrent requests share one segment (and identical statements merge).
-        if (cfg_.read_batch_us <= 0 || a->solo || waitq_.size() >= kMaxReadGroup) {
+        if (cfg_.read_batch_us <= 0 || a->solo || waitq_.size() >= size_t(cfg_.read_group_max)) {
             dispatch();
         } else if (!timer_armed_) {
             io_uring_sqe *s = sqe();
@@ -468,7 +475,7 @@ void Worker::dispatch_writes() {
     }
     {
         PROF_SCOPE(kPgFlush);
-        if (pg.flush()) arm_pg_out(wi);
+        arm_pg_out(wi);
     }
 }
 
@@ -584,7 +591,7 @@ void Worker::dispatch() {
         g->members.push_back(waitq_.front());
         waitq_.pop_front();
         if (!g->members[0]->solo)
-            while (!waitq_.empty() && !waitq_.front()->solo && g->members.size() < kMaxReadGroup) {
+            while (!waitq_.empty() && !waitq_.front()->solo && g->members.size() < size_t(cfg_.read_group_max)) {
                 g->members.push_back(waitq_.front());
                 waitq_.pop_front();
             }
@@ -602,18 +609,18 @@ void Worker::dispatch() {
         }
         {
             PROF_SCOPE(kPgFlush);
-            if (pg->flush()) arm_pg_out(pi);
+            arm_pg_out(pi);
         }
     }
     for (DbAwait *a : failed) a->h.resume();
 }
 
-void Worker::on_pg(uint32_t pg_idx) {
+void Worker::on_pg(uint32_t pg_idx, long res) {
     std::vector<PgConn::Seg> &done = seg_done_;
     done.clear();
     {
         PROF_SCOPE(kPgRecv);
-        pgs_[pg_idx]->drain(done);
+        pgs_[pg_idx]->on_data(res, done);
     }
     PROF_SCOPE(kPgDone);
     std::vector<std::coroutine_handle<>> &ready = ready_;
@@ -626,18 +633,16 @@ void Worker::on_pg(uint32_t pg_idx) {
         for (DbAwait *a : g->members) total += a->qs.size();
         if (g->sent) total = g->sent;
         bool clean = !s.failed && s.res.size() == total;
-        for (PGresult *r : s.res) {
-            ExecStatusType st = PQresultStatus(r);
-            if (st != PGRES_TUPLES_OK && st != PGRES_COMMAND_OK) clean = false;
-        }
+        for (PgResult *r : s.res)
+            if (r->status != PgStatus::Ok) clean = false;
         if (s.failed) {  // connection lost: the commit may or may not have happened, so never retry
-            for (PGresult *r : s.res) PQclear(r);
+            for (PgResult *r : s.res) pgres_free(r);
             for (DbAwait *a : g->members) {
                 a->rows.ok = false;
                 ready.push_back(a->h);
             }
         } else if (!clean && g->members.size() > 1) {  // the group failed (writes: rolled back): replay each alone
-            for (PGresult *r : s.res) PQclear(r);
+            for (PgResult *r : s.res) pgres_free(r);
             std::deque<DbAwait *> &q = is_write ? writeq_ : waitq_;
             for (auto it = g->members.rbegin(); it != g->members.rend(); ++it) {
                 (*it)->solo = true;
@@ -651,12 +656,12 @@ void Worker::on_pg(uint32_t pg_idx) {
             std::vector<std::vector<int>> &starts = starts_;
             bool split_ok = whole;
             for (size_t b = 0; b < g->batches.size() && split_ok; b++) {
-                PGresult *pr = set->r[g->batches[b].first];
+                PgResult *pr = set->r[g->batches[b].first];
                 std::vector<int> &st = starts[b];
                 st.assign(g->batches[b].second + 1, 0);
                 int prev = 0;
-                for (int i = 0, rows = PQntuples(pr); i < rows && split_ok; i++) {
-                    int ord = codec::be32(PQgetvalue(pr, i, 0)) - 1;
+                for (int i = 0, rows = pr->nrows; i < rows && split_ok; i++) {
+                    int ord = codec::be32(pr->value(i, 0)) - 1;
                     if (ord < prev || ord >= int(g->batches[b].second)) split_ok = false;
                     else st[size_t(ord) + 1]++, prev = ord;
                 }
@@ -668,7 +673,7 @@ void Worker::on_pg(uint32_t pg_idx) {
                 if (split_ok)
                     for (size_t i = 0; i < n; i++) {
                         const Group::Slot &sl = g->map[pos + i];
-                        PGresult *pr = set->r[sl.res];
+                        PgResult *pr = set->r[sl.res];
                         if (sl.ord < 0) {
                             a->rows.r.push_back(Res(pr));
                             continue;
@@ -851,14 +856,28 @@ void Worker::run() {
             case kRecv: on_recv(idx_of(u), gen_of(u), cqe); break;
             case kSend: on_send(idx_of(u), gen_of(u), cqe->res); break;
             case kPgIn:
+                DIAG_EV("cqe_pg_in", idx_of(u), cqe->res, pgs_[idx_of(u)]->inflight.empty() ? 0 : 1);
+                DIAG_ASSERT(pgs_[idx_of(u)]->in_armed, "recv CQE without an armed recv", idx_of(u), cqe->res);
+                if (cqe->res < 0 && cqe->res != -EINTR && cqe->res != -EAGAIN)
+                    DIAG_WARN(50, "PG recv CQE error", idx_of(u), cqe->res);
                 pgs_[idx_of(u)]->in_armed = false;
-                on_pg(idx_of(u));
+                on_pg(idx_of(u), cqe->res);
                 break;
             case kPgOut: {
                 PgConn &pg = *pgs_[idx_of(u)];
-                pg.want_out = false;
-                PROF_SCOPE(kPgFlush);
-                if (pg.flush()) arm_pg_out(idx_of(u));
+                DIAG_EV("cqe_pg_out", idx_of(u), cqe->res, pg.out_len);
+                DIAG_ASSERT(pg.sending, "send CQE without a send in flight", idx_of(u), cqe->res);
+                if (cqe->res <= 0) DIAG_WARN(50, "PG send CQE not positive", idx_of(u), cqe->res);
+                pg.sending = false;
+                if (cqe->res > 0) {
+                    pg.out_off += size_t(cqe->res);
+                    if (pg.out_off >= pg.out_len) pg.out_len = pg.out_off = 0;
+                    else arm_pg_out(idx_of(u));
+                } else if (cqe->res != -EINTR && cqe->res != -EAGAIN) {
+                    pg.dead = true;
+                } else {
+                    arm_pg_out(idx_of(u));
+                }
                 break;
             }
             case kTimer:
@@ -872,15 +891,13 @@ void Worker::run() {
             }
         }
         io_uring_cq_advance(&ring_, n);
-        // libpq may have read results into its own buffer while sending; no socket event follows for those.
         for (uint32_t i = 0; i < pgs_.size(); i++) {
             PgConn &pg = *pgs_[i];
-            if (pg.dead || pg.inflight.empty()) continue;
-            if (pg.maybe_ready) {
-                pg.maybe_ready = false;
-                if (!PQisBusy(pg.c)) on_pg(i);
-            }
-            if (!pg.inflight.empty()) arm_pg(i);
+            if (pg.inflight.empty()) continue;
+            if (pg.dead) {
+                DIAG_EV("dead_on_pg", i, pg.in_armed, pg.sending);
+                on_pg(i, 0);  // a failed send: on_data() fails the segments in flight
+            } else arm_pg(i);
         }
     }
 }

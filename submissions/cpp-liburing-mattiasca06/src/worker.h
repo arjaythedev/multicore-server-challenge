@@ -35,7 +35,8 @@ struct Config {
     std::string host, database_url, jwt_secret;
     int port = 3000, workers = 4, read_conns = 2, bcrypt_threads = 2;
     int read_total = 0;       // if > 0: this many read connections in all, spread over the workers (overrides read_conns)
-    int read_batch_us = 6000;  // reads wait this long for company before going out (0 = send at once)
+    int read_batch_us = 20000;  // reads wait this long for company before going out (0 = send at once)
+    int read_group_max = 512;  // most requests one read segment carries; a full queue goes out without waiting for the timer
 };
 
 struct Request {
@@ -92,7 +93,7 @@ struct alignas(64) Worker {
     void on_accept(int fd);
     void on_recv(uint32_t idx, uint32_t gen, io_uring_cqe *cqe);
     void on_send(uint32_t idx, uint32_t gen, int res);
-    void on_pg(uint32_t pg_idx);
+    void on_pg(uint32_t pg_idx, long res);
     void on_efd();
     void process(uint32_t idx);
     void process_one(uint32_t idx);
@@ -159,7 +160,6 @@ struct alignas(64) Worker {
         std::vector<std::pair<uint32_t, uint32_t>> batches;  // reads: (sent statement index, requests in it)
         size_t sent = 0;        // reads: statements actually sent (after merging and batching)
     };
-    static constexpr size_t kMaxReadGroup = 32;
     static constexpr size_t kMaxGroup = 48;  // stays well below 64 in-flight xids per transaction
     std::vector<Group *> group_pool_;  // spare Groups with their vectors' capacity
     std::vector<Query> all_;           // scratch: statements of the segment being built

@@ -19,9 +19,9 @@ enum Phase : int {
     kHandler,   // coroutine bodies: routing, SQL param build, row decode, JSON output
     kJwt,       // Jwt::verify
     kJsonIn,    // yyjson parse of the request body
-    kPgSend,    // dispatch(): batching + libpq PQsendQueryPrepared (parameter encoding)
-    kPgFlush,   // PQflush: the write() to the Postgres socket
-    kPgRecv,    // PgConn::drain: PQconsumeInput + PQgetResult
+    kPgSend,    // dispatch(): batching + libpq wire-protocol Bind encoding
+    kPgFlush,   // PgConn::flush: the send() to the Postgres socket
+    kPgRecv,    // PgConn::drain: recv + message decoding
     kPgDone,    // on_pg bookkeeping (group fan-out)
     kRespond,   // response header + queueing the send
     kSendDone,  // on_send
@@ -31,7 +31,7 @@ enum Phase : int {
 
 inline constexpr const char *kNames[kCount] = {"idle (wait)", "loop glue",   "accept",    "recv copy",   "http parse",
                                                "handler (route/sql/decode/json out)", "jwt verify", "json parse (body)",
-                                               "pg send (batch+encode)", "pg flush (write syscall)", "pg recv (libpq)", "pg fan-out", "respond/send",
+                                               "pg send (batch+encode)", "pg flush (write syscall)", "pg recv (decode)", "pg fan-out", "respond/send",
                                                "send done", "bcrypt done"};
 
 struct Counters {
