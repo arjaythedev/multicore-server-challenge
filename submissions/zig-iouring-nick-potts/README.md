@@ -569,6 +569,16 @@ goes out stored. The CRC-32 folds with PCLMULQDQ. On a CPU without it the server
 bodies. A 5.4 KB list codes in about 3 µs, about 4.6 times faster than libdeflate level 1, and every test output
 decodes byte-exact with Go's `compress/gzip`.
 
+**Where the table comes from.** `src/pz_table_anchor.zig` holds static Huffman code lengths (286 literal/length and
+30 distance codes) and the block header that sends them, nothing else: no body, no string, no request data.
+`tools/mk_table.py` generates it from `tools/counts.txt`, which is 316 symbol totals: pz's own parse run over 2,000
+response bodies of three or more segments, captured with a patched copy of the official loadgen (300 users, the
+WORKLOAD.md mix) from an earlier build of this server running on a throwaway Postgres filled by `seed/make-seed.sh`. So the training data
+was seed-shaped JSON, and the server learns nothing at run time. To regenerate the table, from this folder:
+`python3 -I tools/mk_table.py tools/counts.txt`. The capture (175 MB) and the counting harness are not shipped. To
+retrain from scratch, dump the 2xx bodies of 3+ segments from a load run and count the literal, length and distance
+symbols pz's parse emits for them into the same one-line format (`all`, then the 316 counts).
+
 **Measured.** An ABBA at 154,000 users, first against the build without gzip, then pz against the libdeflate version
 of the same rule:
 
@@ -584,19 +594,6 @@ Each pair is a separate ABBA, so compare within a pair. Against no gzip, libdefl
 cost 3.4 µs per request of total CPU. pz cut the receive CPU by another 10% and total CPU by 5.7 µs per request
 against libdeflate, with higher throughput and shorter tails. Gzipping every large body was tried earlier and lost
 (see the losers), because it paid the codec on every response without a packet to show for it.
-
----|--:|--:|
-| Receive-CPU softirq | 16.73 / 17.01 µs | 14.38 / 14.29 µs (−15%) |
-| Receive-CPU softirq, cores | 0.66 / 0.67 | 0.56 / 0.56 |
-| Incoming pure ACKs (nstat) | 1.77 / 1.79 | 1.43 / 1.43 |
-| Box CPU | 189.6 / 190.9 µs | 193.6 / 193.6 µs |
-| Throughput, p95, p99 | 39,239 / 39,125 req/s, 325 / 353 ms, 481 / 507 ms | 39,112 / 39,085 req/s, 348 / 353 ms, 462 / 468 ms |
-| Retransmits | 1.47% / 1.66% | 1.04% / 0.96% |
-
-The CPU that decides the collapse does 2.5 µs less per request, about nine times the spread between the two runs
-without it. The compression costs about 3.4 µs per request of total CPU, which is spare at the knee. Gzipping every
-large body was tried earlier and lost (see the losers), because it paid the codec on every response without a packet
-to show for it.
 
 ---
 
