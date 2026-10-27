@@ -10,6 +10,11 @@ endif()
 # No functional-test venv: we don't use userver's testsuite.
 set(USERVER_FEATURE_TESTSUITE OFF CACHE BOOL "" FORCE)
 find_package(userver 3.2 REQUIRED COMPONENTS core)
+# Link the PostgreSQL 16 libpq/libpgcommon the userver package was built against (see install.sh), ahead of a newer
+# libpq a PGDG repo may have installed system-wide. Paths that don't exist (a local dev machine) are just skipped.
+set(CONDUIT_LIBPQ16_DIR "/opt/conduit/libpq16" CACHE PATH "Unpacked libpq-dev 16 (install.sh)")
+list(PREPEND CMAKE_LIBRARY_PATH "${CONDUIT_LIBPQ16_DIR}/usr/lib/x86_64-linux-gnu" "/usr/lib/postgresql/16/lib")
+list(PREPEND CMAKE_INCLUDE_PATH "${CONDUIT_LIBPQ16_DIR}/usr/include/postgresql")
 # What find_package(... postgresql) does, minus UserverSql.cmake: that only sets up a pip venv for SQL code
 # generation, which we don't use, and would download unpinned Python packages at configure time.
 include("${USERVER_CMAKE_DIR}/SetupPostgresqlDeps.cmake")

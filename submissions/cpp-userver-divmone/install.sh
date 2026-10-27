@@ -19,6 +19,21 @@ echo "$USERVER_SHA256  $TMP/$USERVER_DEB" | sha256sum -c -
 chmod a+r "$TMP" "$TMP/$USERVER_DEB"   # apt's sandbox user must be able to read the local .deb
 apt-get install -y -q --no-install-recommends "$TMP/$USERVER_DEB" libcrypt-dev
 
+# userver links libpq statically and uses its internals (PGconn), so the libpq it links must be the major version
+# the package was built against: 16, from the Ubuntu archive. With the PGDG repo (the benchmark box, GitHub's
+# runners) apt installs libpq 18 instead, which can't be mixed with the PostgreSQL 16 libpgcommon/userver objects.
+# So unpack Ubuntu's libpq-dev 16 next to it (not installed: libpq5 18 stays as it is) for CMakeLists.txt to use.
+LIBPQ16_DIR=/opt/conduit/libpq16
+LIBPQ16_VERSION="$(apt-cache madison libpq-dev | awk -F'|' '$2 ~ /^ *16\..*ubuntu/ {gsub(/ /, "", $2); print $2; exit}')"
+[ -n "$LIBPQ16_VERSION" ] || { echo "no libpq-dev 16 in the Ubuntu archive"; exit 1; }
+(cd "$TMP" && apt-get download -q "libpq-dev=$LIBPQ16_VERSION")
+rm -rf "$LIBPQ16_DIR" && mkdir -p "$LIBPQ16_DIR"
+dpkg-deb -x "$TMP"/libpq-dev_*.deb "$LIBPQ16_DIR"
+chmod -R a+rX /opt/conduit
+test -f "$LIBPQ16_DIR/usr/lib/x86_64-linux-gnu/libpq.a"
+test -f /usr/lib/postgresql/16/lib/libpgcommon.a   # postgresql-server-dev-16, a dependency of the userver package
+
 g++ --version | head -1
 cmake --version | head -1
-dpkg-query -W libuserver-all-dev libpq-dev libssl-dev libcrypt-dev
+dpkg-query -W libuserver-all-dev libpq-dev postgresql-server-dev-16 libssl-dev libcrypt-dev
+echo "libpq for userver: libpq-dev $LIBPQ16_VERSION in $LIBPQ16_DIR"
