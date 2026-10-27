@@ -3,7 +3,6 @@
 #   build.sh            -> zig-out/$NAME.so (NAME defaults to pgengine)
 #   build.sh install    -> also installs into $libdir/plugins/ (needs sudo)
 #                          (PKGLIBDIR overrides pg_config --pkglibdir, for a box without pg_config)
-#   build.sh test       -> runs the Zig unit tests
 # The C shim is compiled by `zig cc` in the same build, so there is one toolchain.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -25,23 +24,7 @@ V3=(-O ReleaseFast -fllvm -fPIC -target x86_64-linux -mcpu=x86_64_v3+fast_bextr 
 "$ZIG" build-obj src/web/bcrypt/kernels.zig "${V3[@]}" --name bcrypt_kernels -femit-bin=zig-out/bcrypt_kernels.o
 "$ZIG" build-obj src/web/bcrypt/kernels_port.zig -O ReleaseFast -fllvm -fPIC -target x86_64-linux -mcpu=x86_64 -fstrip \
   --name bcrypt_port -femit-bin=zig-out/bcrypt_port.o
-# libdeflate (vendor/libdeflate, from the server; gzip compression only), freestanding as the server builds it: no
-# libc, no stack protector. It picks its CRC kernel at run time and gets its memory from src/web/gzip.zig.
-LD=vendor/libdeflate/lib
-"$ZIG" build-obj -O ReleaseFast -fPIC -target x86_64-linux-none -mcpu=x86_64_v3 -fstrip \
-  -cflags -std=c99 -ffreestanding -DFREESTANDING -fno-stack-protector -- \
-  "$LD"/deflate_compress.c "$LD"/gzip_compress.c "$LD"/crc32.c "$LD"/utils.c "$LD"/x86/cpu_features.c \
-  --name libdeflate -femit-bin=zig-out/libdeflate.o
-OBJS=(zig-out/bcrypt_kernels.o zig-out/bcrypt_expand0.o zig-out/bcrypt_port.o zig-out/libdeflate.o)
-if [ "${1:-}" = test ]; then
-  for f in src/jsonbuf.zig src/rels.zig src/schema.zig src/idmap.zig src/collate.zig src/btree.zig; do
-    "$ZIG" test -lc -I shim test/unit_stubs.c --dep pg_c "-Mroot=$f" -Mpg_c=zig-out/pg_c.zig
-  done
-  # the HTTP workers' own tests (the web code they import is the server's, tested there)
-  "$ZIG" test -lc -I shim test/unit_stubs.c "${OBJS[@]}" --test-filter serve.test --dep pg_c -Mroot=src/serve.zig \
-    -Mpg_c=zig-out/pg_c.zig
-  exit 0
-fi
+OBJS=(zig-out/bcrypt_kernels.o zig-out/bcrypt_expand0.o zig-out/bcrypt_port.o)
 # -fPIC + -dynamic + -lc: a shared object Postgres can dlopen. Postgres symbols stay undefined
 # (resolved against the postgres binary at load); Zig builds shared libs that way by default.
 "$ZIG" build-lib -dynamic -fPIC -lc -O "$OPT" --name "$NAME" -femit-bin=zig-out/$NAME.so \

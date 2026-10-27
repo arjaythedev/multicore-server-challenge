@@ -377,7 +377,7 @@ fn order(comptime K: type, t: Tuple, key: K) std.math.Order {
     return std.math.order(t.col(K, KEY), key);
 }
 
-/// A pinned page of a descent; `kept` when its pin belongs to the index's pin cache.
+/// A pinned page of a descent; `kept` when its pin is one of the index's held pins.
 const Held = struct { buf: c.Buffer, kept: bool };
 
 /// Page `blk` pinned, through the execution's pin on it if there is one. Not locked.
@@ -387,7 +387,7 @@ fn pinPage(idx: *pg.Index, blk: u32) Held {
 }
 
 /// Share-locks a page pinPage pinned; a page newly read is checked as _bt_getbuf checks it, and its pin
-/// goes to the cache if keep takes it.
+/// is held if keep takes it.
 fn lockPinned(idx: *pg.Index, blk: u32, h: Held) Held {
     c._bt_lockbuf(idx.rel, h.buf, c.BT_READ);
     if (h.kept) return h;
@@ -417,7 +417,7 @@ fn getRoot(idx: *pg.Index, heap: pg.Relation) c.Buffer {
     return c._bt_getroot(idx.rel, heap, c.BT_READ);
 }
 
-/// Hands an internal page's pin to the cache while there is room. Leaf pins are never kept: the walk
+/// Holds an internal page's pin for the next descents while there is room. Leaf pins are never kept: the walk
 /// releases them as it goes, and VACUUM needs leaves unpinned to clean them.
 fn keep(idx: *pg.Index, blk: u32, buf: c.Buffer) Held {
     if (idx.descents < 2 or Page.of(buf).leaf() or idx.npins == idx.pins.len) return .{ .buf = buf, .kept = false };

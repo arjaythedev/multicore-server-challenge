@@ -16,7 +16,6 @@ const json = @import("web/json.zig");
 const bcrypt = @import("web/bcrypt.zig");
 const buf = @import("web/buf.zig");
 const Buf = buf.Buf;
-const gzip = @import("web/gzip.zig");
 const linux = std.os.linux;
 
 const gpa = std.heap.c_allocator;

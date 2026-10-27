@@ -161,8 +161,7 @@ HTTP parsing, routing, the JWT check (HS256 with SHA-NI, `exp` on every request)
 also our Zig entry's code, vendored unchanged.
 
 **Answers go out uncompressed.** SPEC makes compression optional, and gzip lost every test we gave it (see
-"What we tried"). The Zig entry's gzip code (`src/web/gzip.zig`, `vendor/libdeflate`) is still in the folder
-and still linked, but nothing calls it.
+"What we tried"). The Zig entry's gzip code and its vendored libdeflate are not in this folder.
 
 **No load shedding.** Every request is served and none is refused. Under overload, requests wait, latency
 grows, and memory stays bounded by the kernel's socket buffers. Three shedding designs were built and dropped
@@ -709,8 +708,29 @@ Small regressions we accepted for larger gains elsewhere:
   several writes.
 
 The oracle, stress and soak harnesses drive the engine through its marker form against a scratch database.
-They aren't part of this folder. The batch counter test is, with the marker encoder it needs
+They aren't part of this folder, and neither are the Postgres stubs the unit tests link against. The batch counter test is, with the marker encoder it needs
 (`engine/test/markers.py`).
+
+## CI
+
+`ci.sh` runs only in GitHub Actions, and CI does not exercise the box path. The repository's CI runs Postgres as a
+`postgres:18` service container and installs no Postgres server on the runner. pgserve's workers are Postgres
+processes, so there the engine has to go into that container.
+
+`install.sh` and `start.sh` first call `ci.sh container`. If the `postgresql-18` package is installed, as on the
+box, it fails and they go on to the box path described in "How to run" and "How it starts": `install.sh` lines 11-20
+unpack the installed server's headers, build the engine and install it into `$libdir/plugins`, and `start.sh` runs
+`./launcher`. That is what runs on the real machine. If the package is missing and exactly one running container
+comes from the `postgres:18` image, they hand over to `ci.sh` instead:
+
+- `ci.sh install` fetches `postgresql-server-dev-18` at the container's `postgresql-18` version through
+  `docker exec` and the container's own apt, builds the engine on the runner against those headers, and copies
+  `pgengine.so` into the container's `$(pg_config --pkglibdir)/plugins` (`docker cp`, `docker exec`).
+- `ci.sh start` copies the launcher into the container and runs it with `sudo nsenter -m`. The launcher joins only
+  the container's mount namespace, so its Unix socket and `/var/run/postgresql` are the ones the workers see, and it
+  stays on the runner's network, so it binds `HOST:PORT` where `test/run.sh` connects.
+
+launcher.c and the engine are the same in both paths.
 
 ## Files
 
@@ -726,6 +746,7 @@ They aren't part of this folder. The batch counter test is, with the marker enco
 - `engine/test/batchcount.py`: the batch favorites counter against SQL on a churned copy of the seed.
 - `engine/test/markers.py`: the marker encoder batchcount.py drives the engine with.
 - `install.sh`, `build.sh`, `start.sh`, `engine/build.sh`, `engine/install-zig.sh`: as described in "How to run".
+- `ci.sh`: CI only, see "CI".
 
 ## Credits
 
