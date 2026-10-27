@@ -45,7 +45,7 @@ DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit \
   `pgengine`).
 - `PGSERVE_HASH_NICE=N` (default 19) runs the bcrypt threads at nice `N`; 0 keeps them at the worker's.
 - `PGSERVE_THIN_TO=1` (the default; 0 turns it off) sets `TCP_THIN_LINEAR_TIMEOUTS` on every accepted connection.
-- `PGSERVE_DWELL_US=N` (0, off, by default; at most 50,000) turns on a batch clock, with `PGSERVE_DWELL_CAP`
+- `PGSERVE_DWELL_US=N` (default 5,000; 0 turns it off; at most 50,000) is the batch clock, with `PGSERVE_DWELL_CAP`
   (default 256) and `PGSERVE_DWELL_MIN` (default 2). `PGSERVE_STATS_S=N` (off by default) logs each worker's batch
   sizes every `N` seconds. Both are under "How a request is served".
 - `PGSERVE_SHED=1` (the default; 0 turns it off) is load shedding. A worker answers logins, sign-ups and password
@@ -146,16 +146,18 @@ Each worker is one thread running an epoll loop, plus one bcrypt thread. Each tu
    starts. Nothing is kept from one turn to the next (rule 5).
 4. **Answer.** Every answer of the turn was built back to back in one buffer. Each goes out in one `write`.
 
-By default there is no batch clock: a batch is whatever arrived during one turn. At low load that's one
-request, and under load it grows by itself.
+Without a batch clock (`PGSERVE_DWELL_US=0`) a batch is whatever arrived during one turn. At 300,000 users that
+was a mean of 4 article reads per batch, and 1.2-3.9 for the other endpoints.
 
-`PGSERVE_DWELL_US` turns on a batch clock, an experiment that is off by default. A turn is then held: the worker
-keeps reading sockets, answering what needs no data and queueing reads and writes, but runs the turn's writes and
-reads (steps 2 and 3) only once its oldest queued request has waited `PGSERVE_DWELL_US` µs or it holds
-`PGSERVE_DWELL_CAP` requests. A held worker sleeps in `epoll_pwait2` until that deadline, so the clock costs no
-spinning. Writes are still answered only after their commit, and requests still share work only inside one
-batch. The clock stays off after a batch smaller than `PGSERVE_DWELL_MIN`, so at light load a lone request runs
-at once instead of waiting for company. The dwell is capped at 50 ms.
+`PGSERVE_DWELL_US` (default 5,000) is the batch clock. A turn is held: the worker keeps reading sockets, answering
+what needs no data and queueing reads and writes, but runs the turn's writes and reads (steps 2 and 3) only once
+its oldest queued request has waited `PGSERVE_DWELL_US` µs or it holds `PGSERVE_DWELL_CAP` requests. A held worker
+sleeps in `epoll_pwait2` until that deadline, so the clock costs no spinning. Writes are still answered only after
+their commit, and requests still share work only inside one batch. The clock stays off after a batch smaller than
+`PGSERVE_DWELL_MIN`, so at light load a lone request runs at once instead of waiting for company. The dwell is
+capped at 50 ms. At 300,000 users on an aged database, 5 ms raised the mean article batch from 4 to 41 and cut the
+box's CPU per request from 79 to 63 µs and p99 from 93 to 30 ms, against no clock (2 ms: batch 20, 64 µs,
+p99 30 ms).
 
 `PGSERVE_STATS_S` logs one line per worker every that many seconds (`pgserve stats ...` in the Postgres log): how
 many turns ran and why (`now`: clock off or cold; `deadline`; `cap`), how long a turn's oldest request waited,
