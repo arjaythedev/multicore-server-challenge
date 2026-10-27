@@ -54,6 +54,8 @@ pub fn listener(host: &str, port: u16) -> io::Result<RawFd> {
         for opt in [libc::SO_REUSEADDR, libc::SO_REUSEPORT] {
             cvt(libc::setsockopt(fd, libc::SOL_SOCKET, opt, &one as *const _ as *const libc::c_void, 4))?;
         }
+        let defer: libc::c_int = 1;
+        let _ = libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_DEFER_ACCEPT, &defer as *const _ as *const libc::c_void, 4);
         match ip {
             std::net::IpAddr::V4(v4) => {
                 let addr = libc::sockaddr_in {
