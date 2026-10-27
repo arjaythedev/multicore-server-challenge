@@ -1,0 +1,12 @@
+zig-out/
+.zig-cache/
+bin/
+.local/
+
+# Local integration runs and Python bytecode
+__pycache__/
+*.py[cod]
+
+# Publish only sanitized aggregate benchmark evidence.
+!benchmarks/results/
+!benchmarks/results/article-groups.json

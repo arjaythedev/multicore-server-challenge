@@ -1,0 +1,239 @@
+{
+  "date": "2026-10-25",
+  "scope": "Native macOS ARM64, Apple A18 Pro, 6 CPU cores, 8 GiB; co-located application, PostgreSQL and unchanged load generator. Not official capacity.",
+  "settings": {
+    "order": "ABBABA",
+    "users": 512,
+    "think_scale": 0.005,
+    "ramp": "10s",
+    "measure": "30s",
+    "tail": "3s",
+    "template": "conduit_seed"
+  },
+  "binaries": {
+    "A": "e4ccfa8880ef90231527429fda38b8f7d65ae92ed6b36f4ddb04df46ba083ffd",
+    "B": "53d72a988ce67c0f8d442571a22cb1e767861a9fa532da166f2a92cd14ddddac"
+  },
+  "loadgen_sha256": "05906775a045f83fccbba97251385d27fe47836b2feede9ba4dd9ad9b45c006b",
+  "runs": [
+    {
+      "run": "01-A",
+      "build": "A",
+      "overall": {
+        "count": 113543,
+        "rps": 3784.766666666667,
+        "p50_ms": 83.839,
+        "p90_ms": 155.647,
+        "p95_ms": 220.287,
+        "p99_ms": 526.335,
+        "max_ms": 7294.975,
+        "mean_ms": 116.66486817329124,
+        "errors": 465,
+        "error_rate": 0.00409536475167998,
+        "statuses": {
+          "200": 111100,
+          "201": 1925,
+          "204": 53,
+          "503": 465
+        },
+        "error_classes": {
+          "http_503": 465
+        }
+      },
+      "reported_lg_limited": false
+    },
+    {
+      "run": "02-B",
+      "build": "B",
+      "overall": {
+        "count": 109054,
+        "rps": 3635.133333333333,
+        "p50_ms": 83.455,
+        "p90_ms": 157.823,
+        "p95_ms": 195.455,
+        "p99_ms": 752.127,
+        "max_ms": 8347.647,
+        "mean_ms": 123.82055868652195,
+        "errors": 430,
+        "error_rate": 0.00394300071524199,
+        "statuses": {
+          "200": 106782,
+          "201": 1789,
+          "204": 53,
+          "503": 430
+        },
+        "error_classes": {
+          "http_503": 430
+        }
+      },
+      "reported_lg_limited": false
+    },
+    {
+      "run": "03-B",
+      "build": "B",
+      "overall": {
+        "count": 113030,
+        "rps": 3767.6666666666665,
+        "p50_ms": 87.551,
+        "p90_ms": 166.655,
+        "p95_ms": 199.679,
+        "p99_ms": 272.127,
+        "max_ms": 8642.559,
+        "mean_ms": 116.76651322657716,
+        "errors": 499,
+        "error_rate": 0.004414757144121029,
+        "statuses": {
+          "200": 110526,
+          "201": 1953,
+          "204": 52,
+          "503": 499
+        },
+        "error_classes": {
+          "http_503": 499
+        }
+      },
+      "reported_lg_limited": false
+    },
+    {
+      "run": "04-A",
+      "build": "A",
+      "overall": {
+        "count": 89598,
+        "rps": 2986.6,
+        "p50_ms": 105.791,
+        "p90_ms": 185.983,
+        "p95_ms": 238.079,
+        "p99_ms": 987.135,
+        "max_ms": 10002.431,
+        "mean_ms": 152.81814915511498,
+        "errors": 605,
+        "error_rate": 0.006752382865688966,
+        "statuses": {
+          "200": 87455,
+          "201": 1499,
+          "204": 39,
+          "503": 592
+        },
+        "error_classes": {
+          "http_503": 592,
+          "timeout": 13
+        },
+        "error_example": "request timeout"
+      },
+      "reported_lg_limited": false
+    },
+    {
+      "run": "05-B",
+      "build": "B",
+      "overall": {
+        "count": 86359,
+        "rps": 2878.633333333333,
+        "p50_ms": 121.919,
+        "p90_ms": 195.327,
+        "p95_ms": 235.647,
+        "p99_ms": 605.183,
+        "max_ms": 10027.007,
+        "mean_ms": 159.43502674880446,
+        "errors": 683,
+        "error_rate": 0.007908845632765548,
+        "statuses": {
+          "200": 84194,
+          "201": 1451,
+          "204": 31,
+          "503": 658
+        },
+        "error_classes": {
+          "http_503": 658,
+          "timeout": 25
+        },
+        "error_example": "request timeout"
+      },
+      "reported_lg_limited": false
+    },
+    {
+      "run": "06-A",
+      "build": "A",
+      "overall": {
+        "count": 92999,
+        "rps": 3099.9666666666667,
+        "p50_ms": 105.791,
+        "p90_ms": 206.591,
+        "p95_ms": 259.839,
+        "p99_ms": 489.471,
+        "max_ms": 8724.479,
+        "mean_ms": 145.2465158119977,
+        "errors": 488,
+        "error_rate": 0.005247368251271519,
+        "statuses": {
+          "200": 90854,
+          "201": 1618,
+          "204": 39,
+          "503": 488
+        },
+        "error_classes": {
+          "http_503": 488
+        }
+      },
+      "reported_lg_limited": false
+    }
+  ],
+  "medians": {
+    "A": {
+      "rps": 3099.9666666666667,
+      "p95_ms": 238.079,
+      "p99_ms": 526.335,
+      "error_rate": 0.005247368251271519
+    },
+    "B": {
+      "rps": 3635.133333333333,
+      "p95_ms": 199.679,
+      "p99_ms": 605.183,
+      "error_rate": 0.004414757144121029
+    }
+  },
+  "median_rps_change_pct": 17.26362649060742,
+  "limitations": [
+    "Two active VM processes were subsequently observed; elapsed process times place their startup after the first control run. The comparison is confounded and does not establish a throughput gain caused by the code.",
+    "Background activity and thermal/memory drift; large run-to-run variation.",
+    "Not every adjacent comparison improves; median p99 worsens.",
+    "All HTTP 503s remain counted; the errors are not filtered.",
+    "Host-wide generator CPU sampling is unavailable on macOS.",
+    "Changes are not compounded with earlier experiments."
+  ],
+  "release_hold_8000": {
+    "settings": {
+      "order": "B",
+      "users": 8000,
+      "think_scale": 1.0,
+      "ramp": "30s",
+      "measure": "300s",
+      "tail": "15s",
+      "template": "conduit_seed"
+    },
+    "release_sha256": "f67e073f6aad770eeecbc26eb4abfcbbb554fb1760d62a5d2fa12858d47b140b",
+    "overall": {
+      "count": 562572,
+      "rps": 1875.24,
+      "p50_ms": 77.567,
+      "p90_ms": 1473.535,
+      "p95_ms": 2127.871,
+      "p99_ms": 3901.439,
+      "max_ms": 8740.863,
+      "mean_ms": 489.65419203408584,
+      "errors": 54987,
+      "error_rate": 0.09774215567074081,
+      "statuses": {
+        "200": 498164,
+        "201": 9153,
+        "204": 268,
+        "503": 54987
+      },
+      "error_classes": {
+        "http_503": 54987
+      }
+    },
+    "reported_lg_limited": false,
+    "passes_thresholds": false,
+    "environment_observation": "Two active preexisting VMware VM processes; 5295 MiB swap used. Not an isolated host. No causal code-only throughput inference."
+  }
+}
