@@ -19,6 +19,9 @@ const gpa = @import("buf.zig").gpa;
 const Scratch = @import("scratch.zig").Scratch;
 
 const plan = @import("plan.zig");
+const pack = @import("packed.zig");
+const hubm = @import("hub.zig");
+const mutations = @import("mutation.zig");
 const log = std.log.scoped(.server);
 
 pub const Config = struct {
@@ -27,9 +30,21 @@ pub const Config = struct {
     db: pg.Config,
     secret: []const u8,
     threads: u32,
+    hub: ?*hubm.Hub = null,
+    coordinator: bool = false,
     pg_read: u32, // connections per worker
     pg_write: u32,
-    pg_depth: u32, // batches in flight per connection
+    pg_depth: u32, // standalone and grouped write depth
+    read_depth: u32, // independent read depth, allowing coalescing experiments without changing writes
+    packed_reads: bool,
+    ack_delay: bool,
+    gzip_mode: u32, // 0 identity; 1 save bytes; 2 save TCP segments
+    gzip_min: u32,
+    comments_shared_pct: u32,
+    send_zc_min: u32,
+    write_group_max: u32,
+    write_window_us: u32,
+    write_arrays: bool,
     batch_max: u32, // reads of one kind that may run as one statement (1 = no batching)
     read_window_us: u32, // staged reads wait up to this long for company before they are sent (0 = send at once)
     read_hold_min: u32, // ... unless this many are staged already
@@ -42,6 +57,9 @@ pub const Config = struct {
     bc_threads: u32,
     bc_lanes: u32,
     bc_wait_ms: u32,
+    bc_auto: bool,
+    bc_idle_ms: u32,
+    bc_stale_ms: u32,
     stats: bool,
     no_pbuf: bool, // test hook: use the poll + recv path even when provided buffer rings work
     test_fail_groups: bool, // test hook: poison every multi-member write group so the retry path runs
@@ -68,6 +86,8 @@ pub const Req = struct {
     kind: api.Kind = .tags,
     keep_alive: bool = true,
     tok_len: u8 = 0,
+    remote_owner: u16 = std.math.maxInt(u16),
+    remote_token: u64 = 0,
     viewer: i64 = 0,
     aux: u64 = 0,
     blob: []u8 = &.{},
@@ -110,6 +130,11 @@ const Conn = struct {
     out_cap: u32 = 0,
     zc_waiting: bool = false,
     send_zc: bool = false,
+    shutdown_live: bool = false,
+    ack_live: bool = false,
+    gzip: bool = false,
+    identity: bool = true,
+    mss: u16 = 1448,
 
     fn completeSend(self: *Conn, res: i32, flags: u32) bool {
         const was_zc = self.send_zc;
@@ -124,7 +149,7 @@ const Conn = struct {
 const max_pend = http.max_body + http.max_head + 4096;
 
 // user_data layout: tag (8) | gen (24) | index (32)
-const Tag = enum(u8) { accept = 1, recv, poll, send, pg_recv, pg_send, event, close, shut, timer, hold, hold_cancel };
+const Tag = enum(u8) { accept = 1, recv, poll, send, pg_recv, pg_send, event, close, shut, timer, hold, hold_cancel, cancel, write_hold, ack, hub };
 
 inline fn ud(tag: Tag, gen: u32, idx: u32) u64 {
     return (@as(u64, @backingInt(tag)) << 56) | (@as(u64, gen & 0xffffff) << 32) | idx;
@@ -138,11 +163,11 @@ const max_depth_cap = 64;
 
 const prepare_list = blk: {
     var out: [sql.prepared.len]pg.Prep = undefined;
-    for (sql.prepared, 0..) |x, i| out[i] = .{ .id = x.id, .sql = x.sql, .params = x.params };
+    for (sql.prepared, 0..) |x, i| out[i] = .{ .id = x.id, .sql = x.sql, .params = x.params, .results = sql.resultOids(x.id) };
     break :blk out;
 };
 
-const max_group = 32;
+const max_group = 128;
 
 /// One write request inside a group commit: its encoded statements (with their own trailing Sync, used if the group
 /// has to be retried member by member) and how many statements it contributes.
@@ -180,11 +205,13 @@ const Member = struct {
 
 const WRec = struct {
     n: u32,
+    array: bool = false,
     m: [max_group]Member,
 };
 
 const PgConn = struct {
     fd: i32 = -1,
+    gen: u32 = 0,
     class: Class = .read,
     alive: bool = false,
     sending: bool = false,
@@ -200,6 +227,7 @@ const PgConn = struct {
     staged: std.ArrayList(Member) = .empty, // writes waiting for the in-flight group to commit
     wrec: WRec = undefined,
     last_stmt: ?sql.Stmt = null,
+    staged_since: u64 = 0,
 };
 
 const Queued = struct { r: *Req, bytes: []u8 };
@@ -394,6 +422,7 @@ fn readWindowNs(cfg: *const Config, staged: usize, has_idle_pg: bool) u64 {
 const buf_size = 2048;
 const n_bufs = 16384;
 const bgid = 1;
+const quick_ack_zero: i32 = 0;
 const slab_size = 4096;
 const slab_pool_cap = 256;
 
@@ -406,12 +435,19 @@ pub const Worker = struct {
     now: i64 = 0, // wall clock, seconds: only for token expiry
     mono: u32 = 0, // monotonic seconds: timeouts are measured on this, so a clock step cannot expire or extend one
     out: Buf = .{},
+    response_pool: @import("buf.zig").Pool = .{},
+    gzip_encoder: @import("gzip.zig").Encoder = .{},
+    zip: Buf = .{},
+    gzip_mode: u32 = 0,
+    gzip_min: u32 = 1024,
+    ack_enabled: bool = false,
     enc: Buf = .{},
     scratch: Scratch = undefined,
     free_reqs: ?*Req = null,
     slabs: [slab_pool_cap][*]u8 = undefined,
     slab_count: usize = 0,
     send_zc_enabled: bool = false, // detected capability is worker-local; Shared.cfg stays immutable
+    send_zc_min: u32 = 256,
     batch_rec_pool: [64]*BatchRec = undefined,
     batch_rec_count: usize = 0,
     pgs: []PgConn = &.{},
@@ -424,6 +460,9 @@ pub const Worker = struct {
     synth: Buf = .{},
     sink: bcpool.Sink = .{},
     efd_val: u64 = 0,
+    hub_val: u64 = 0,
+    ipc_data: Buf = .{},
+    ipc_reply: Buf = .{},
     // provided-buffer ring (null => poll + recv fallback)
     pbuf_ring: ?[*]linux.io_uring_buf = null,
     pbuf_mem: [*]u8 = undefined,
@@ -441,11 +480,20 @@ pub const Worker = struct {
     hold_gen: u32 = 0,
     hold_deadline: u64 = 0,
     staged_since: u64 = 0, // nowNs() when `staged` last went from 0
-    stats: struct { reqs: u64 = 0, pg_batches: u64 = 0, fifo_max: usize = 0, batched_reqs: u64 = 0, batches: u64 = 0 } = .{},
+    write_hold_ts: linux.kernel_timespec = .{ .sec = 0, .nsec = 0 },
+    write_hold_armed: bool = false,
+    stats: struct { reqs: u64 = 0, pg_batches: u64 = 0, fifo_max: usize = 0, batched_reqs: u64 = 0, batches: u64 = 0, zc_nomem: u64 = 0, send_errors: u64 = 0, array_groups: u64 = 0 } = .{},
 
     // ---- small helpers ----------------------------------------------------------------------
 
     pub fn beginBody(self: *Worker) void {
+        if (self.out.cap == 0) {
+            const mem = if (self.slab_count != 0) blk: {
+                self.slab_count -= 1;
+                break :blk self.slabs[self.slab_count][0..slab_size];
+            } else self.response_pool.take(slab_size);
+            self.out = .{ .ptr = mem.ptr, .cap = mem.len, .pool = &self.response_pool };
+        }
         self.out.len = 0;
         self.out.ensure(http.head_room + 1024);
         self.out.len = http.head_room;
@@ -504,7 +552,60 @@ pub const Worker = struct {
 
     // ---- sending responses ------------------------------------------------------------------
 
-    /// Copy `resp` into an owned buffer and send it on `fd` (if that connection is still the same one).
+    pub fn negotiateEncoding(self: *Worker, fd: i32, gzip: bool, identity: bool) void {
+        const c = &self.conns[@intCast(fd)];
+        c.gzip = gzip;
+        c.identity = identity;
+    }
+
+    pub fn finishResponse(self: *Worker, fd: i32, gen: u32, code: u16, keep_alive: bool) void {
+        const c = &self.conns[@intCast(fd)];
+        if (!c.open or c.gen != gen) return;
+        var response_code = code;
+        var body_len = self.out.len - http.head_room;
+        var compressed = false;
+        if (self.gzip_mode != 0 and c.gzip and code != 204 and (body_len >= self.gzip_min or !c.identity)) {
+            if (self.gzip_encoder.encode(self.out.slice()[http.head_room..], &self.zip, http.head_room)) |z| {
+                const mss = @max(@as(usize, 536), c.mss);
+                const saves = if (self.gzip_mode == 1) z.len < body_len else (z.len + 200 + mss - 1) / mss < (body_len + 200 + mss - 1) / mss;
+                if (saves or !c.identity) {
+                    const old = self.out;
+                    self.out = self.zip;
+                    self.zip = old;
+                    body_len = z.len;
+                    compressed = true;
+                }
+            }
+        }
+        if (code != 204 and !c.identity and !compressed) {
+            response_code = 406;
+            body_len = 0;
+        }
+        const resp = http.finishEncodedResponse(self.out.slice(), body_len, response_code, keep_alive, compressed, self.gzip_mode != 0 or !c.identity);
+        self.sendOwned(fd, gen, resp, keep_alive);
+        if (self.zip.cap > 4 * 1024 * 1024) {
+            self.zip.deinit();
+            self.zip.pool = &self.response_pool;
+        }
+    }
+
+    /// Transfer the rendering allocation, including its unused header prefix, to the send lifetime.
+    pub fn sendOwned(self: *Worker, fd: i32, gen: u32, resp: []const u8, keep_alive: bool) void {
+        const c = &self.conns[@intCast(fd)];
+        if (!c.open or c.gen != gen) return;
+        std.debug.assert(c.out_cap == 0);
+        const start = @intFromPtr(resp.ptr) - @intFromPtr(self.out.ptr);
+        c.out = self.out.ptr;
+        c.out_off = @intCast(start);
+        c.out_len = @intCast(start + resp.len);
+        c.out_cap = @intCast(self.out.cap);
+        self.out = .{};
+        c.close_after = !keep_alive;
+        self.stats.reqs += 1;
+        self.submitSend(fd, c, true);
+    }
+
+    /// Used for externally owned bytes; ordinary API rendering uses sendOwned.
     pub fn sendCopy(self: *Worker, fd: i32, gen: u32, resp: []const u8, keep_alive: bool) void {
         const ufd: usize = @intCast(fd);
         const c = &self.conns[ufd];
@@ -534,13 +635,13 @@ pub const Worker = struct {
         c.out_off = 0;
         c.close_after = !keep_alive;
         self.stats.reqs += 1;
-        self.submitSend(fd, c);
+        self.submitSend(fd, c, true);
     }
 
-    fn submitSend(self: *Worker, fd: i32, c: *Conn) void {
+    fn submitSend(self: *Worker, fd: i32, c: *Conn, allow_zc: bool) void {
         const s = self.sqe();
         const to_send = (c.out + c.out_off)[0 .. c.out_len - c.out_off];
-        c.send_zc = self.send_zc_enabled and to_send.len >= 256 and c.out_off == 0;
+        c.send_zc = allow_zc and self.send_zc_enabled and to_send.len >= self.send_zc_min and !c.zc_waiting;
         if (c.send_zc) {
             s.prep_send_zc(fd, to_send, linux.MSG.NOSIGNAL, 0);
         } else {
@@ -564,19 +665,28 @@ pub const Worker = struct {
         const was_zc = c.completeSend(res, flags);
         if (res <= 0) {
             const err_num = -res;
-            if (was_zc and (err_num == @as(i32, @backingInt(linux.E.OPNOTSUPP)) or err_num == @as(i32, @backingInt(linux.E.INVAL)))) {
-                self.send_zc_enabled = false;
+            const unsupported = err_num == @as(i32, @backingInt(linux.E.OPNOTSUPP)) or err_num == @as(i32, @backingInt(linux.E.INVAL));
+            const no_memory = err_num == @as(i32, @backingInt(linux.E.NOMEM));
+            if (was_zc and (unsupported or no_memory)) {
+                if (unsupported) self.send_zc_enabled = false;
+                if (no_memory) {
+                    self.stats.zc_nomem += 1;
+                    if (self.stats.zc_nomem == 1) log.warn("SEND_ZC returned ENOMEM; falling back to copied SEND", .{});
+                }
+                // ZC page accounting can exhaust MEMLOCK without breaking the socket.
+                // Retry once without ZC; a failed copied attempt follows the normal close path.
                 if (c.open) {
-                    self.submitSend(fd, c);
+                    self.submitSend(fd, c, false);
                     return;
                 }
             }
+            if (c.open) self.stats.send_errors += 1;
             self.closeConn(fd);
             self.finishSend(fd, c);
             return;
         }
         if (c.out_off < c.out_len and c.open) {
-            self.submitSend(fd, c);
+            self.submitSend(fd, c, false);
             return;
         }
         self.finishSend(fd, c);
@@ -595,6 +705,12 @@ pub const Worker = struct {
             self.closeConn(fd);
             return;
         }
+        if (self.ack_enabled and !c.ack_live and !c.eof) {
+            const s = self.sqe();
+            s.prep_cmd_sock(.SETSOCKOPT, fd, linux.IPPROTO.TCP, linux.TCP.QUICKACK, @intFromPtr(&quick_ack_zero), @sizeOf(i32));
+            s.user_data = ud(.ack, c.gen, @intCast(fd));
+            c.ack_live = true;
+        }
         if (c.pend_len != 0) self.parsePend(fd, c);
         if (c.eof and c.open and !c.busy) self.closeConn(fd);
     }
@@ -605,7 +721,7 @@ pub const Worker = struct {
             self.slabs[self.slab_count] = c.out;
             self.slab_count += 1;
         } else if (c.out_cap != 0) {
-            gpa.free(c.out[0..c.out_cap]);
+            self.response_pool.release(c.out[0..c.out_cap]);
         }
         c.out_len = 0;
         c.out_off = 0;
@@ -631,6 +747,12 @@ pub const Worker = struct {
         _ = linux.setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, @ptrCast(&one), @sizeOf(c_int));
         const c = &self.conns[@intCast(fd)];
         c.* = .{ .gen = c.gen +% 1, .open = true };
+        if (self.gzip_mode == 2) {
+            var mss: i32 = 1448;
+            var len: linux.socklen_t = @sizeOf(i32);
+            if (sys.errnoOf(linux.getsockopt(fd, linux.IPPROTO.TCP, linux.TCP.MAXSEG, @ptrCast(&mss), &len)) == .SUCCESS)
+                c.mss = @intCast(std.math.clamp(mss, 536, 65535));
+        }
         self.armRecv(fd, c);
     }
 
@@ -664,21 +786,42 @@ pub const Worker = struct {
             // completion carries this connection's generation and is ignored).
             const rm = self.sqe();
             rm.prep_poll_remove(ud(.poll, c.gen, @intCast(fd)));
-            rm.user_data = ud(.shut, 0, 0);
+            rm.user_data = ud(.cancel, 0, 0);
             c.recv_live = false;
         }
         if (c.recv_live or c.send_live) {
+            // SHUTDOWN can resolve its numeric fd on an async worker; keep it open until the CQE.
             const s = self.sqe();
             s.prep_rw(.SHUTDOWN, fd, 0, 0, 0);
             s.len = linux.SHUT.RDWR;
-            s.user_data = ud(.shut, 0, 0);
+            s.user_data = ud(.shut, c.gen, @intCast(fd));
+            c.shutdown_live = true;
         }
+        self.maybeFinishClose(fd);
+    }
+
+    fn onAck(self: *Worker, fd: i32, gen: u32, res: i32) void {
+        const c = &self.conns[@intCast(fd)];
+        if (c.gen & 0xffffff != gen) return;
+        c.ack_live = false;
+        if (res == -@as(i32, @backingInt(linux.E.INVAL)) or res == -@as(i32, @backingInt(linux.E.OPNOTSUPP)) or res == -@as(i32, @backingInt(linux.E.NOSYS))) {
+            if (self.ack_enabled) log.info("async TCP_QUICKACK unavailable; disabling ACK delay", .{});
+            self.ack_enabled = false;
+        }
+        self.maybeFinishClose(fd);
+    }
+
+    fn onShutdown(self: *Worker, fd: i32, gen: u32) void {
+        const c = &self.conns[@intCast(fd)];
+        if (c.gen & 0xffffff != gen) return;
+        // Failure also retires the operation: its fd lookup is finished.
+        c.shutdown_live = false;
         self.maybeFinishClose(fd);
     }
 
     fn maybeFinishClose(self: *Worker, fd: i32) void {
         const c = &self.conns[@intCast(fd)];
-        if (!c.closing or c.recv_live or c.send_live or c.zc_waiting) return;
+        if (!c.closing or c.recv_live or c.send_live or c.zc_waiting or c.shutdown_live or c.ack_live) return;
         self.freeOut(c);
         c.closing = false;
         c.busy = false;
@@ -885,7 +1028,7 @@ pub const Worker = struct {
         self.out.putSlice("{\"errors\":{\"body\":[\"bad request\"]}}");
         const body_len = self.out.len - http.head_room;
         const resp = http.finishResponse(self.out.ptr[0..self.out.len], body_len, code, false);
-        self.sendCopy(fd, c.gen, resp, false);
+        self.sendOwned(fd, c.gen, resp, false);
     }
 
     // ---- Postgres pool ----------------------------------------------------------------------
@@ -899,8 +1042,11 @@ pub const Worker = struct {
 
     /// Queue an encoded batch (Bind/Execute.../Sync) for `r`; the reply is delivered to `api.onPg`.
     pub fn pgSubmit(self: *Worker, class: Class, r: *Req, bytes: []const u8) void {
+        if (class == .read and self.shared.cfg.hub != null and !self.shared.cfg.coordinator) {
+            return self.askHub(r, .{ .format = 1 }, bytes);
+        }
         const range = self.classRange(class);
-        const cap = self.shared.cfg.pg_depth;
+        const cap = if (class == .read) self.shared.cfg.read_depth else self.shared.cfg.pg_depth;
         // least-loaded live connection with room; rotate the start so ties spread out
         var best: ?*PgConn = null;
         const n = range.hi - range.lo;
@@ -929,7 +1075,8 @@ pub const Worker = struct {
     }
 
     fn pgPush(self: *Worker, p: *PgConn, token: usize, bytes: []const u8) void {
-        std.debug.assert(p.depth < self.shared.cfg.pg_depth and p.depth < max_depth_cap);
+        const cap = if (p.class == .read) self.shared.cfg.read_depth else self.shared.cfg.pg_depth;
+        std.debug.assert(p.depth < cap and p.depth < max_depth_cap);
         p.ws.putSlice(bytes);
         p.q[(p.qh + p.depth) % max_depth_cap] = token;
         p.depth += 1;
@@ -937,7 +1084,7 @@ pub const Worker = struct {
     }
 
     fn pgFlush(self: *Worker, p: *PgConn) void {
-        if (p.ws.len == 0 or p.sending) return;
+        if (!p.alive or p.ws.len == 0 or p.sending) return;
         const t = p.wa;
         p.wa = p.ws;
         p.ws = t;
@@ -947,19 +1094,21 @@ pub const Worker = struct {
         const idx: u32 = @intCast(p - self.pgs.ptr);
         const s = self.sqe();
         s.prep_send(p.fd, p.wa.slice(), linux.MSG.NOSIGNAL);
-        s.user_data = ud(.pg_send, 0, idx);
+        s.user_data = ud(.pg_send, p.gen, idx);
     }
 
-    fn onPgSend(self: *Worker, idx: u32, res: i32) void {
+    fn onPgSend(self: *Worker, idx: u32, gen: u32, res: i32) void {
         const p = &self.pgs[idx];
+        if (p.gen & 0xffffff != gen) return;
         p.sending = false;
+        if (!p.alive) return self.pgFinishClose(p);
         if (res <= 0) return self.pgFail(p);
         p.wsent += @intCast(res);
         if (p.wsent < p.wa.len) {
             p.sending = true;
             const s = self.sqe();
             s.prep_send(p.fd, p.wa.slice()[p.wsent..], linux.MSG.NOSIGNAL);
-            s.user_data = ud(.pg_send, 0, idx);
+            s.user_data = ud(.pg_send, p.gen, idx);
             return;
         }
         p.wa.reset();
@@ -972,13 +1121,15 @@ pub const Worker = struct {
         const space = p.rs.space(16 * 1024);
         const s = self.sqe();
         s.prep_recv(p.fd, space, 0);
-        s.user_data = ud(.pg_recv, 0, @intCast(p - self.pgs.ptr));
+        s.user_data = ud(.pg_recv, p.gen, @intCast(p - self.pgs.ptr));
         p.recving = true;
     }
 
-    fn onPgRecv(self: *Worker, idx: u32, res: i32) void {
+    fn onPgRecv(self: *Worker, idx: u32, gen: u32, res: i32) void {
         const p = &self.pgs[idx];
+        if (p.gen & 0xffffff != gen) return;
         p.recving = false;
+        if (!p.alive) return self.pgFinishClose(p);
         if (res <= 0) return self.pgFail(p);
         p.rs.received(@intCast(res));
         while (p.rs.nextBatch()) |batch| {
@@ -997,11 +1148,13 @@ pub const Worker = struct {
                     self.pgFail(p);
                     return;
                 }
-            } else switch (token & 3) {
+            } else switch (token & 7) {
                 0 => api.onPg(self, @ptrFromInt(token), batch),
-                1 => self.onBatchReply(@ptrFromInt(token & ~@as(usize, 3)), batch),
-                2 => self.onGroupReply(p, @ptrFromInt(token & ~@as(usize, 3)), batch),
-                else => self.onPlanReply(p, @ptrFromInt(token & ~@as(usize, 3)), batch),
+                1 => self.onBatchReply(@ptrFromInt(token & ~@as(usize, 7)), batch),
+                2 => self.onGroupReply(p, @ptrFromInt(token & ~@as(usize, 7)), batch),
+                3 => self.onPlanReply(p, @ptrFromInt(token & ~@as(usize, 7)), batch),
+                4 => self.onPackedReply(@ptrFromInt(token & ~@as(usize, 7)), batch),
+                else => unreachable,
             }
             p.rs.done();
         }
@@ -1019,7 +1172,7 @@ pub const Worker = struct {
     fn pgDrain(self: *Worker, class: Class) void {
         const f = &self.fifo[@backingInt(class)];
         const range = self.classRange(class);
-        const cap = self.shared.cfg.pg_depth;
+        const cap = if (class == .read) self.shared.cfg.read_depth else self.shared.cfg.pg_depth;
         while (f.len != 0) {
             var best: ?*PgConn = null;
             for (self.pgs[range.lo..range.hi]) |*p| {
@@ -1038,10 +1191,11 @@ pub const Worker = struct {
 
     fn pgFail(self: *Worker, p: *PgConn) void {
         if (!p.alive) return;
-        log.err("postgres connection {d} lost", .{@as(usize, @intCast(p - self.pgs.ptr))});
+        if (!@import("builtin").is_test) log.err("postgres connection {d} lost", .{@as(usize, @intCast(p - self.pgs.ptr))});
         p.alive = false;
-        _ = linux.close(p.fd);
-        p.fd = -1;
+        // Wake pending I/O without releasing the numeric fd or its buffers. Queued SQEs
+        // can still resolve this descriptor until their send/receive CQEs have retired.
+        _ = linux.shutdown(p.fd, linux.SHUT.RDWR);
         // Fail what was in flight on this connection; nothing is replayed (a write may have committed).
         var i: u32 = 0;
         while (i < p.depth) : (i += 1) self.failToken(p.q[(p.qh + i) % max_depth_cap]);
@@ -1053,11 +1207,8 @@ pub const Worker = struct {
             mem.deinit();
         }
         p.staged.clearRetainingCapacity();
-        p.wa.reset();
         p.ws.reset();
-        p.rs.start = 0;
-        p.rs.scan = 0;
-        p.rs.end = 0;
+        self.pgFinishClose(p);
         // Anything waiting for this class can still be served by the surviving connections, else it fails.
         const range = self.classRange(p.class);
         var any = false;
@@ -1071,14 +1222,26 @@ pub const Worker = struct {
         }
     }
 
+    fn pgFinishClose(self: *Worker, p: *PgConn) void {
+        _ = self;
+        if (p.alive or p.sending or p.recving or p.fd < 0) return;
+        _ = linux.close(p.fd);
+        p.fd = -1;
+        p.wa.reset();
+        p.wsent = 0;
+        p.rs.start = 0;
+        p.rs.scan = 0;
+        p.rs.end = 0;
+    }
+
     /// Dead Postgres connections are replaced by a helper thread, so a slow or stalled server cannot freeze the loop;
-    /// the loop adopts the finished socket from `onEvent`.
+    /// the loop adopts the finished socket from `onEvent` after the failed socket's I/O retires.
     fn pgReconnect(self: *Worker) void {
         var dead = false;
-        for (self.pgs) |*p| dead = dead or !p.alive;
+        for (self.pgs) |*p| dead = dead or (!p.alive and p.fd < 0 and !p.sending and !p.recving);
         if (!dead) return;
         if (@cmpxchgStrong(u32, &self.rc_busy, 0, 1, .acq_rel, .monotonic) != null) return;
-        const t = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, Worker.reconnectMain, .{self}) catch {
+        const t = std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, Worker.reconnectMain, .{self}) catch {
             @atomicStore(u32, &self.rc_busy, 0, .release);
             return;
         };
@@ -1101,8 +1264,9 @@ pub const Worker = struct {
 
     fn adoptReconnected(self: *Worker, fd: i32) void {
         for (self.pgs) |*p| {
-            if (p.alive) continue;
+            if (p.alive or p.fd >= 0 or p.sending or p.recving) continue;
             p.fd = fd;
+            p.gen +%= 1;
             p.alive = true;
             log.info("postgres connection re-established", .{});
             self.pgArmRecv(p);
@@ -1115,7 +1279,7 @@ pub const Worker = struct {
 
     fn failToken(self: *Worker, token: usize) void {
         if (token == 0) return;
-        switch (token & 3) {
+        switch (token & 7) {
             0 => api.onPgFailure(self, @ptrFromInt(token)),
             1 => {
                 const rec: *BatchRec = @ptrFromInt(token & ~@as(usize, 3));
@@ -1130,11 +1294,17 @@ pub const Worker = struct {
                     mem.deinit();
                 }
             },
-            else => {
-                const rec: *plan.Plan = @ptrFromInt(token & ~@as(usize, 3));
+            3 => {
+                const rec: *plan.Plan = @ptrFromInt(token & ~@as(usize, 7));
                 for (rec.items) |it| api.onPgFailure(self, it.r);
                 plan.destroy(rec, true);
             },
+            4 => {
+                const rec: *pack.Batch = @ptrFromInt(token & ~@as(usize, 7));
+                for (rec.items) |it| api.onPgFailure(self, it.r);
+                pack.destroy(rec, true);
+            },
+            else => unreachable,
         }
     }
 
@@ -1142,6 +1312,9 @@ pub const Worker = struct {
 
     /// Queue a read; it is sent when a connection has room, merged with waiting reads of the same kind.
     pub fn readSubmit(self: *Worker, stmt: sql.Stmt, r: *Req, a: ReadArgs) void {
+        if (self.shared.cfg.hub != null and !self.shared.cfg.coordinator) {
+            return self.askHub(r, .{ .stmt = @backingInt(stmt), .viewer = a.viewer, .limit = a.limit, .offset = a.offset }, a.text);
+        }
         self.seq += 1;
         const it = StageItem.init(r, self.seq, a.viewer, a.limit, a.offset, a.text) orelse return api.onPgFailure(self, r);
         if (self.staged == 0) self.staged_since = sys.nowNs();
@@ -1150,7 +1323,7 @@ pub const Worker = struct {
     }
 
     fn bestReadConn(self: *Worker, hint: ?sql.Stmt) ?*PgConn {
-        const cap = self.shared.cfg.pg_depth;
+        const cap = self.shared.cfg.read_depth;
         const n = self.n_read;
         if (n == 0) return null;
         var min_conn: ?*PgConn = null;
@@ -1211,6 +1384,7 @@ pub const Worker = struct {
     /// Send staged reads to connections with room, oldest kind first.
     pub fn flushReads(self: *Worker) void {
         if (self.staged == 0) return;
+        if (self.shared.cfg.coordinator and self.shared.cfg.hub.?.blocked()) return;
         var has_idle_pg = false;
         for (self.pgs[0..self.n_read]) |*p| {
             if (p.alive and p.depth == 0) {
@@ -1339,7 +1513,8 @@ pub const Worker = struct {
             const free = self.freeReadConns();
             want = std.math.clamp((self.staged + free - 1) / free, @as(usize, self.shared.cfg.plan_min), cap);
         }
-        // Oldest first across every kind: a capped plan must not leave the older reads of a late-arriving kind behind.
+        const share_comments = self.sharedComments();
+        // Oldest first across eligible kinds; dedicated comments and isolated retries remain independent.
         while (taken.items.len < want) {
             var best: ?usize = null;
             var best_seq: u64 = std.math.maxInt(u64);
@@ -1353,21 +1528,60 @@ pub const Worker = struct {
             const stmt: sql.Stmt = @fromBackingInt(@intCast(k));
             const it = self.stages[k].pop();
             const t = plan.Taken{ .stmt = stmt, .it = it };
-            if (it.single_only) kept.append(gpa, t) catch return self.unstage(&taken, &kept) else taken.append(gpa, t) catch return self.unstage(&taken, &kept);
+            if (it.single_only or (self.shared.cfg.packed_reads and pack.kind(stmt) == null) or (stmt == .comments and !share_comments))
+                kept.append(gpa, t) catch return self.unstage(&taken, &kept)
+            else
+                taken.append(gpa, t) catch return self.unstage(&taken, &kept);
         }
         if (taken.items.len < self.shared.cfg.plan_min) return self.unstage(&taken, &kept);
-        const rec = plan.start(self, taken.items) orelse return self.unstage(&taken, &kept);
+        const token: usize = if (self.shared.cfg.packed_reads) blk: {
+            const rec = pack.start(self, taken.items) orelse return self.unstage(&taken, &kept);
+            break :blk @intFromPtr(rec) | 4;
+        } else blk: {
+            const rec = plan.start(self, taken.items) orelse return self.unstage(&taken, &kept);
+            break :blk @intFromPtr(rec) | 3;
+        };
         for (kept.items) |t| self.stages[@backingInt(t.stmt)].push(t.it);
         self.staged -= taken.items.len;
-        self.pgPush(p, @intFromPtr(rec) | 3, self.enc.slice());
+        self.pgPush(p, token, self.enc.slice());
         return .started;
+    }
+
+    fn sharedComments(self: *Worker) bool {
+        const st = &self.stages[@backingInt(sql.Stmt.comments)];
+        const n = @min(st.len, self.shared.cfg.plan_max);
+        if (n < 2) return false;
+        var keys: std.StringHashMapUnmanaged(void) = .empty;
+        defer keys.deinit(gpa);
+        for (0..n) |i| {
+            const it = &st.items[(st.head + i) % st.items.len];
+            keys.put(gpa, it.text(), {}) catch return false;
+        }
+        return keys.count() * 100 <= n * self.shared.cfg.comments_shared_pct;
+    }
+
+    fn onPackedReply(self: *Worker, rec: *pack.Batch, batch: []const u8) void {
+        if (pack.onReply(self, rec, batch)) {
+            self.stats.batched_reqs += rec.items.len;
+            self.stats.batches += 1;
+            pack.destroy(rec, true);
+        } else {
+            log.warn("planned batch failed (packed); retrying its {d} requests one by one", .{rec.items.len});
+            for (rec.items, rec.stmts) |it, stmt| {
+                var again = it;
+                again.single_only = true;
+                self.stages[@backingInt(stmt)].push(again);
+                self.staged += 1;
+            }
+            pack.destroy(rec, false);
+        }
     }
 
     /// Read connections that are alive and have room for another batch.
     fn freeReadConns(self: *Worker) usize {
         var n: usize = 0;
         for (self.pgs[0..self.n_read]) |*p| {
-            if (p.alive and p.depth < self.shared.cfg.pg_depth) n += 1;
+            if (p.alive and p.depth < self.shared.cfg.read_depth) n += 1;
         }
         return @max(n, 1);
     }
@@ -1428,11 +1642,15 @@ pub const Worker = struct {
             return;
         }
         defer for (rec.items[0..rec.n]) |*it| it.deinit();
+        self.deliverOrdinals(rec.reqs[0..rec.n], batch);
+    }
+
+    fn deliverOrdinals(self: *Worker, reqs: []const *Req, batch: []const u8) void {
         var rd = pg.Reader{ .data = batch };
         var pending: ?pg.Msg = null;
         const syn = &self.synth;
         var idx: u32 = 0;
-        while (idx < rec.n) : (idx += 1) {
+        while (idx < reqs.len) : (idx += 1) {
             syn.reset();
             const want: i64 = @as(i64, idx) + 1;
             while (true) {
@@ -1453,7 +1671,7 @@ pub const Worker = struct {
             }
             syn.putSlice("C\x00\x00\x00\x0dSELECT 0\x00");
             syn.putSlice("Z\x00\x00\x00\x05I");
-            api.onPg(self, rec.reqs[idx], syn.slice());
+            api.onPg(self, reqs[idx], syn.slice());
         }
     }
 
@@ -1476,6 +1694,7 @@ pub const Worker = struct {
         }
         const p = best orelse return api.onPgFailure(self, r);
         const mem = Member.init(r, k, bytes) orelse return api.onPgFailure(self, r);
+        if (p.staged.items.len == 0) p.staged_since = sys.nowNs();
         p.staged.append(gpa, mem) catch {
             var m = mem;
             m.deinit();
@@ -1486,8 +1705,22 @@ pub const Worker = struct {
 
     fn sendGroup(self: *Worker, p: *PgConn) void {
         if (!p.alive or p.ginflight or p.depth >= self.shared.cfg.pg_depth) return;
-        const n = @min(p.staged.items.len, max_group);
+        const cap = std.math.clamp(self.shared.cfg.write_group_max, 1, max_group);
+        const n = @min(p.staged.items.len, cap);
         if (n == 0) return;
+        const deadline = p.staged_since + @as(u64, self.shared.cfg.write_window_us) * std.time.ns_per_us;
+        const now = sys.nowNs();
+        if (n < cap and now < deadline) {
+            if (!self.write_hold_armed) {
+                const left = deadline - now;
+                self.write_hold_ts = .{ .sec = @intCast(left / std.time.ns_per_s), .nsec = @intCast(left % std.time.ns_per_s) };
+                const s = self.sqe();
+                s.prep_timeout(&self.write_hold_ts, 0, 0);
+                s.user_data = ud(.write_hold, 0, 0);
+                self.write_hold_armed = true;
+            }
+            return;
+        }
         const rec = &p.wrec;
         rec.n = @intCast(n);
         self.enc.reset();
@@ -1497,11 +1730,13 @@ pub const Worker = struct {
         // response makes its effects visible to the following request.
         e.bind(sql.id(.tx_begin));
         e.exec();
-        for (0..n) |i| {
-            rec.m[i] = p.staged.items[i];
-            const s = rec.m[i].slice();
-            self.enc.putSlice(s[0 .. s.len - sync_len]); // members' statements, no Sync
-        }
+        for (0..n) |i| rec.m[i] = p.staged.items[i];
+        rec.array = self.shared.cfg.write_arrays and mutations.encode(&e, rec.m[0..n]);
+        if (rec.array) self.stats.array_groups += 1;
+        if (!rec.array) for (rec.m[0..n]) |*m| {
+            const bytes = m.slice();
+            self.enc.putSlice(bytes[0 .. bytes.len - sync_len]);
+        };
         if (self.shared.cfg.test_fail_groups and n >= 2) {
             // Bind to a statement that does not exist: the server answers with an error and rolls the group back.
             self.enc.putSlice("B\x00\x00\x00\x11\x00s9999\x00\x00\x00\x00\x00\x00\x00");
@@ -1533,6 +1768,11 @@ pub const Worker = struct {
                 self.soloWrite(mem.r, mem.slice());
                 mem.deinit();
             }
+        } else if (rec.array) {
+            var reqs: [max_group]*Req = undefined;
+            for (rec.m[0..rec.n], 0..) |m, i| reqs[i] = m.r;
+            self.deliverOrdinals(reqs[0..rec.n], batch);
+            for (rec.m[0..rec.n]) |*m| m.deinit();
         } else {
             var rd = pg.Reader{ .data = batch };
             var start: usize = 0;
@@ -1625,6 +1865,84 @@ pub const Worker = struct {
         s.user_data = ud(.event, 0, 0);
     }
 
+    // ---- service-wide read transport --------------------------------------------------------
+
+    fn askHub(self: *Worker, r: *Req, input: hubm.Header, bytes: []const u8) void {
+        const h = self.shared.cfg.hub.?;
+        const c = &h.channels[self.id];
+        if (c.ask_sender.bytes + bytes.len > 16 * 1024 * 1024 or c.ask_sender.pending.items.len - c.ask_sender.head >= 65536) return api.onPgFailure(self, r);
+        var header = input;
+        header.token = @intFromPtr(r);
+        header.kind = @backingInt(r.kind);
+        c.ask_sender.send(c.ask, h.efd, header, bytes);
+    }
+
+    pub fn proxyReply(self: *Worker, r: *Req, format: u8, code: u16, bytes: []const u8) void {
+        const c = &self.shared.cfg.hub.?.channels[r.remote_owner];
+        c.answer_sender.send(c.answer, c.efd, .{ .token = r.remote_token, .format = format, .code = code }, bytes);
+        self.freeReq(r);
+    }
+
+    pub fn proxyBody(self: *Worker, r: *Req, code: u16) void {
+        self.proxyReply(r, 1, code, self.out.slice()[http.head_room..]);
+    }
+
+    fn armHub(self: *Worker) void {
+        const h = self.shared.cfg.hub orelse return;
+        const fd = if (self.shared.cfg.coordinator) h.efd else h.channels[self.id].efd;
+        const s = self.sqe();
+        s.prep_read(fd, std.mem.asBytes(&self.hub_val), 0);
+        s.user_data = ud(.hub, 0, 0);
+    }
+
+    fn onHub(self: *Worker) void {
+        const h = self.shared.cfg.hub.?;
+        var header: hubm.Header = undefined;
+        if (self.shared.cfg.coordinator) {
+            for (h.channels) |*c| c.answer_sender.flush(c.answer, c.efd);
+            for (h.channels, 0..) |*c, owner| {
+                if (h.blocked()) break;
+                var consumed = false;
+                var records: usize = 0;
+                while (records < 512) : (records += 1) {
+                    const part = c.ask.pop(&self.ipc_data, &header) orelse break;
+                    consumed = true;
+                    c.input.putSlice(part);
+                    if (header.more != 0) continue;
+                    const r = self.newReq(-1, 0, @fromBackingInt(@intCast(header.kind)), true, header.viewer);
+                    r.remote_owner = @intCast(owner);
+                    r.remote_token = header.token;
+                    if (header.format == 1) self.pgSubmit(.read, r, c.input.slice()) else self.readSubmit(@fromBackingInt(@intCast(header.stmt)), r, .{ .viewer = header.viewer, .limit = header.limit, .offset = header.offset, .text = c.input.slice() });
+                    c.input.reset();
+                }
+                if (records == 512) hubm.notify(h.efd);
+                if (consumed) hubm.notify(c.efd); // room for the HTTP producer's pending asks
+            }
+        } else {
+            const c = &h.channels[self.id];
+            c.ask_sender.flush(c.ask, h.efd);
+            var consumed = false;
+            while (c.answer.pop(&self.ipc_data, &header)) |part| {
+                consumed = true;
+                self.ipc_reply.putSlice(part);
+                if (header.more != 0) continue;
+                const r: *Req = @ptrFromInt(header.token);
+                switch (header.format) {
+                    0 => api.onPg(self, r, self.ipc_reply.slice()),
+                    1 => {
+                        self.beginBody();
+                        self.out.putSlice(self.ipc_reply.slice());
+                        api.doneReq(self, r, header.code);
+                    },
+                    else => api.onPgFailure(self, r),
+                }
+                self.ipc_reply.reset();
+            }
+            if (consumed) hubm.notify(h.efd); // room for pending drain replies
+        }
+        self.armHub();
+    }
+
     // ---- main loop --------------------------------------------------------------------------
 
     fn armAccept(self: *Worker) void {
@@ -1648,28 +1966,39 @@ pub const Worker = struct {
             .recv => self.onRecv(@intCast(idx), gen, cqe.res, cqe.flags),
             .poll => self.onPoll(@intCast(idx), gen, cqe.res, cqe.flags),
             .send => self.onSend(@intCast(idx), gen, cqe.res, cqe.flags),
+            .ack => self.onAck(@intCast(idx), gen, cqe.res),
+            .shut => self.onShutdown(@intCast(idx), gen),
             .accept => self.onAccept(cqe.res, cqe.flags),
-            .pg_recv => self.onPgRecv(idx, cqe.res),
-            .pg_send => self.onPgSend(idx, cqe.res),
+            .pg_recv => self.onPgRecv(idx, gen, cqe.res),
+            .pg_send => self.onPgSend(idx, gen, cqe.res),
             .event => self.onEvent(),
+            .hub => self.onHub(),
             .hold => if (gen == self.hold_gen) {
                 self.hold_armed = false;
                 self.hold_deadline = 0;
             },
             .hold_cancel => {},
+            .write_hold => {
+                self.write_hold_armed = false;
+                for (self.pgs[self.n_read..]) |*p| self.sendGroup(p);
+            },
             .timer => {
-                if (!self.accept_live) self.armAccept();
+                if (self.listener >= 0 and !self.accept_live) self.armAccept();
                 self.pgReconnect();
                 self.sweepPartials();
                 if (self.shared.cfg.stats) self.printStats();
                 self.armTimer();
             },
-            .close, .shut => {},
+            .close, .cancel => {},
         }
     }
 
     fn printStats(self: *Worker) void {
-        std.debug.print("[w{d}] reqs={d} pg_syncs={d} batched_reqs={d} in {d} statements fifo_max={d}\n", .{ self.id, self.stats.reqs, self.stats.pg_batches, self.stats.batched_reqs, self.stats.batches, self.stats.fifo_max });
+        if (self.shared.cfg.coordinator) {
+            for (self.shared.cfg.hub.?.channels, 0..) |c, i| std.debug.print("[hub{d}] ask={d}/{d} answer={d}/{d}\n", .{ i, @atomicLoad(u64, &c.ask.state.head, .acquire), @atomicLoad(u64, &c.ask.state.tail, .acquire), @atomicLoad(u64, &c.answer.state.head, .acquire), @atomicLoad(u64, &c.answer.state.tail, .acquire) });
+        }
+        if (self.shared.cfg.write_arrays) std.debug.print("[mutations{d}] array_groups={d}\n", .{ self.id, self.stats.array_groups });
+        std.debug.print("[w{d}] reqs={d} pg_syncs={d} batched_reqs={d} in {d} statements fifo_max={d} zc_nomem={d} send_errors={d}\n", .{ self.id, self.stats.reqs, self.stats.pg_batches, self.stats.batched_reqs, self.stats.batches, self.stats.fifo_max, self.stats.zc_nomem, self.stats.send_errors });
     }
 
     fn run(self: *Worker) void {
@@ -1779,13 +2108,17 @@ fn workerInit(shared: *Shared, id: usize) !void {
         sys.pinCpu(id % cpus);
     }
     const w = try gpa.create(Worker);
-    w.* = .{ .shared = shared, .id = id, .send_zc_enabled = cfg.send_zc };
+    w.* = .{ .shared = shared, .id = id, .send_zc_enabled = cfg.send_zc, .send_zc_min = cfg.send_zc_min };
+    w.gzip_mode = cfg.gzip_mode;
+    w.gzip_min = cfg.gzip_min;
+    w.ack_enabled = cfg.ack_delay;
+    w.zip = .{ .pool = &w.response_pool };
     w.scratch = try Scratch.init(64 * 1024);
-    w.out = try Buf.init(64 * 1024);
+    w.out = .{ .pool = &w.response_pool };
     w.enc = try Buf.init(16 * 1024);
     w.scratch_rx = try gpa.alloc(u8, 64 * 1024);
     w.ring = try initRing();
-    if (!cfg.no_pbuf) setupPbufRing(w);
+    if (!cfg.no_pbuf and !cfg.coordinator) setupPbufRing(w);
     w.now = sys.nowUnix();
     w.mono = monoSecs();
 
@@ -1795,8 +2128,10 @@ fn workerInit(shared: *Shared, id: usize) !void {
     rl.cur = rl.max;
     _ = linux.setrlimit(.NOFILE, &rl);
     const nfds: usize = @intCast(@min(rl.max, 1 << 21));
-    const cmem = try sys.mapAnon(nfds * @sizeOf(Conn));
-    w.conns = @as([*]Conn, @ptrCast(@alignCast(cmem.ptr)))[0..nfds];
+    if (!cfg.coordinator) {
+        const cmem = try sys.mapAnon(nfds * @sizeOf(Conn));
+        w.conns = @as([*]Conn, @ptrCast(@alignCast(cmem.ptr)))[0..nfds];
+    }
 
     // Postgres connections, prepared, then switched to non-blocking
     const total = cfg.pg_read + cfg.pg_write;
@@ -1819,8 +2154,11 @@ fn workerInit(shared: *Shared, id: usize) !void {
     if (sys.errnoOf(efd) != .SUCCESS) return error.EventfdFailed;
     w.sink.efd = @intCast(efd);
 
-    w.listener = try makeListener(cfg);
-    w.armAccept();
+    if (!cfg.coordinator) {
+        w.listener = try makeListener(cfg);
+        w.armAccept();
+    }
+    w.armHub();
     w.armEvent();
     w.armTimer();
     for (w.pgs) |*p| w.pgArmRecv(p);
@@ -1828,8 +2166,183 @@ fn workerInit(shared: *Shared, id: usize) !void {
     w.run();
 }
 
+test "failed postgres sockets retain fd and buffers until both I/O completions retire" {
+    for ([_]bool{ false, true }) |receive_first| {
+        const raw_fd = linux.eventfd(0, linux.EFD.CLOEXEC);
+        try std.testing.expectEqual(linux.E.SUCCESS, sys.errnoOf(raw_fd));
+        const fd: i32 = @intCast(raw_fd);
+        var shared: Shared = undefined;
+        shared.cfg = std.mem.zeroes(Config);
+        var pgs = [_]PgConn{.{ .fd = fd, .alive = true, .rs = try pg.Stream.init(64) }};
+        const p = &pgs[0];
+        defer if (p.fd >= 0) {
+            _ = linux.close(p.fd);
+        };
+        defer p.rs.buf.deinit();
+        defer p.wa.deinit();
+        defer p.ws.deinit();
+        var w: Worker = .{ .shared = &shared, .id = 0, .pgs = &pgs, .n_read = 1 };
+        var ring: SendTestRing = .{};
+        ring.attach(&w);
+        p.ws.putSlice("pending PostgreSQL payload");
+        w.pgFlush(p);
+        w.pgArmRecv(p);
+        p.rs.start = 1;
+        p.rs.scan = 2;
+        p.rs.end = 3;
+        w.pgFail(p);
+        try std.testing.expect(!p.alive and p.sending and p.recving);
+        try std.testing.expectEqual(fd, p.fd);
+        try std.testing.expectEqual(linux.E.SUCCESS, sys.errnoOf(linux.fcntl(fd, linux.F.GETFD, 0)));
+        try std.testing.expectEqualStrings("pending PostgreSQL payload", p.wa.slice());
+        try std.testing.expectEqual(@as(usize, 3), p.rs.end);
+        if (receive_first) w.onPgRecv(0, 0, 1) else w.onPgSend(0, 0, 1);
+        try std.testing.expectEqual(fd, p.fd);
+        try std.testing.expectEqualStrings("pending PostgreSQL payload", p.wa.slice());
+        try std.testing.expectEqual(@as(usize, 3), p.rs.end);
+        try std.testing.expectEqual(@as(u32, 2), w.ring.sq.sqe_tail);
+        if (receive_first) w.onPgSend(0, 0, 1) else w.onPgRecv(0, 0, 1);
+        try std.testing.expectEqual(@as(i32, -1), p.fd);
+        try std.testing.expect(!p.sending and !p.recving);
+        try std.testing.expectEqual(@as(usize, 0), p.wa.len);
+        try std.testing.expectEqual(@as(usize, 0), p.rs.end);
+        try std.testing.expectEqual(@as(u32, 2), w.ring.sq.sqe_tail);
+    }
+}
+
+test "postgres replacement waits for retirement and ignores old-generation completions" {
+    const level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = level;
+    const old_raw = linux.eventfd(0, linux.EFD.CLOEXEC);
+    try std.testing.expectEqual(linux.E.SUCCESS, sys.errnoOf(old_raw));
+    const old_fd: i32 = @intCast(old_raw);
+    var shared: Shared = undefined;
+    shared.cfg = std.mem.zeroes(Config);
+    var pgs = [_]PgConn{.{ .fd = old_fd, .gen = 7, .sending = true, .recving = true, .rs = try pg.Stream.init(64) }};
+    const p = &pgs[0];
+    defer if (p.fd >= 0) {
+        _ = linux.close(p.fd);
+    };
+    defer p.rs.buf.deinit();
+    defer p.wa.deinit();
+    defer p.ws.deinit();
+    var w: Worker = .{ .shared = &shared, .id = 0, .pgs = &pgs, .n_read = 1 };
+    var ring: SendTestRing = .{};
+    ring.attach(&w);
+    const early_raw = linux.eventfd(0, linux.EFD.CLOEXEC);
+    try std.testing.expectEqual(linux.E.SUCCESS, sys.errnoOf(early_raw));
+    w.adoptReconnected(@intCast(early_raw));
+    try std.testing.expectEqual(old_fd, p.fd);
+    try std.testing.expect(!p.alive and p.sending and p.recving);
+    try std.testing.expectEqual(@as(u32, 0), w.ring.sq.sqe_tail);
+    w.onPgSend(0, 7, 0);
+    w.onPgRecv(0, 7, 0);
+    try std.testing.expectEqual(@as(i32, -1), p.fd);
+    const replacement_raw = linux.eventfd(0, linux.EFD.CLOEXEC);
+    try std.testing.expectEqual(linux.E.SUCCESS, sys.errnoOf(replacement_raw));
+    w.adoptReconnected(@intCast(replacement_raw));
+    try std.testing.expect(p.alive and p.recving);
+    try std.testing.expectEqual(@as(u32, 8), p.gen);
+    try std.testing.expectEqual(ud(.pg_recv, 8, 0), ring.sqes[0].user_data);
+    p.ws.putSlice("replacement payload");
+    w.pgFlush(p);
+    try std.testing.expectEqual(ud(.pg_send, 8, 0), ring.sqes[1].user_data);
+    w.onPgSend(0, 7, 2);
+    w.onPgRecv(0, 7, -@as(i32, @backingInt(linux.E.CONNRESET)));
+    try std.testing.expect(p.alive and p.sending and p.recving);
+    try std.testing.expectEqualStrings("replacement payload", p.wa.slice());
+    try std.testing.expectEqual(@as(usize, 0), p.wsent);
+    try std.testing.expectEqual(@as(usize, 0), p.rs.end);
+    w.onPgSend(0, 8, 2);
+    try std.testing.expectEqual(ud(.pg_send, 8, 0), ring.sqes[2].user_data);
+    w.onPgSend(0, 8, @intCast(p.wa.len - 2));
+    w.onPgRecv(0, 8, 0);
+    try std.testing.expectEqual(@as(i32, -1), p.fd);
+    try std.testing.expect(!p.alive and !p.sending and !p.recving);
+}
+
+test "response encoding honors identity exclusion without imposing a compression threshold" {
+    for ([_]u32{ 0, 1, 2 }) |mode| {
+        for ([_]bool{ false, true }) |identity| {
+            for ([_]bool{ false, true }) |gzip| {
+                for ([_]u16{ 200, 204 }) |code| {
+                    var shared: Shared = undefined;
+                    var conns = [_]Conn{.{ .gen = 9, .open = true, .busy = true, .gzip = gzip, .identity = identity }};
+                    var w: Worker = .{ .shared = &shared, .id = 0, .conns = &conns, .gzip_mode = mode, .gzip_min = 1024 };
+                    var ring: SendTestRing = .{};
+                    ring.attach(&w);
+                    defer w.response_pool.deinit();
+                    defer for (w.slabs[0..w.slab_count]) |p| gpa.free(p[0..slab_size]);
+                    defer w.out.deinit();
+                    defer w.zip.deinit();
+                    defer w.gzip_encoder.deinit();
+                    w.beginBody();
+                    w.out.putSlice("{}");
+                    w.finishResponse(0, 9, code, true);
+                    const c = &conns[0];
+                    const response = (c.out + c.out_off)[0 .. c.out_len - c.out_off];
+                    const rejected = code != 204 and !identity and (mode == 0 or !gzip);
+                    try std.testing.expect(std.mem.startsWith(u8, response, http.statusLine(if (rejected) 406 else code)));
+                    const compressed = code != 204 and !identity and mode != 0 and gzip;
+                    try std.testing.expectEqual(compressed, std.mem.indexOf(u8, response, "Content-Encoding: gzip\r\n") != null);
+                    if (rejected) try std.testing.expect(std.mem.indexOf(u8, response, "Content-Length: 0\r\n") != null);
+                    if (rejected or code == 204) try std.testing.expectEqual(response.len, std.mem.indexOf(u8, response, "\r\n\r\n").? + 4);
+                    c.send_live = false;
+                    w.freeOut(c);
+                }
+            }
+        }
+    }
+}
+
+test "owned responses retain their allocation base through partial sends and notifications" {
+    var shared: Shared = undefined;
+    var conns = [_]Conn{.{ .gen = 9, .open = true, .busy = true, .recv_live = true }};
+    var w: Worker = .{ .shared = &shared, .id = 0, .conns = &conns, .send_zc_enabled = true };
+    var ring: SendTestRing = .{};
+    ring.attach(&w);
+    defer w.response_pool.deinit();
+    defer for (w.slabs[0..w.slab_count]) |p| gpa.free(p[0..slab_size]);
+    w.beginBody();
+    w.out.putSlice("{\"test\":true}");
+    const base = w.out.ptr;
+    const resp = http.finishResponse(w.out.slice(), w.out.len - http.head_room, 200, true);
+    const size = resp.len;
+    w.sendOwned(0, 9, resp, true);
+    try std.testing.expectEqual(base, conns[0].out);
+    try std.testing.expect(conns[0].out_off > 0 and w.out.cap == 0);
+    w.onSend(0, 9, 7, linux.IORING_CQE_F_MORE);
+    try std.testing.expectEqual(@as(usize, 0), w.slab_count);
+    try std.testing.expectEqual(@intFromPtr(resp.ptr + 7), ring.sqes[1].addr);
+    w.onSend(0, 9, 0, linux.IORING_CQE_F_NOTIF);
+    try std.testing.expectEqual(@as(usize, 0), w.slab_count);
+    w.onSend(0, 9, @intCast(size - 7), 0);
+    try std.testing.expectEqual(@as(usize, 1), w.slab_count);
+    try std.testing.expectEqual(base, w.slabs[0]);
+}
+
+test "async ACK options hold fd lifetime and unsupported commands disable the feature" {
+    var shared: Shared = undefined;
+    var conns = [_]Conn{.{ .gen = 3, .open = true, .ack_live = true }};
+    var w: Worker = .{ .shared = &shared, .id = 0, .conns = &conns, .ack_enabled = true };
+    var ring: SendTestRing = .{};
+    ring.attach(&w);
+    w.closeConn(0);
+    try std.testing.expect(conns[0].closing);
+    try std.testing.expectEqual(@as(u32, 0), w.ring.sq.sqe_tail);
+    w.onAck(0, 2, 0);
+    try std.testing.expect(conns[0].ack_live);
+    const level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = level;
+    w.onAck(0, 3, -@as(i32, @backingInt(linux.E.INVAL)));
+    try std.testing.expect(!w.ack_enabled and !conns[0].closing);
+    try std.testing.expectEqual(linux.IORING_OP.CLOSE, ring.sqes[0].opcode);
+}
+
 test "idle connection metadata stays within one cache line" {
-    try std.testing.expect(@sizeOf(Conn) <= 64);
+    try std.testing.expectEqual(@as(usize, 64), @sizeOf(Conn));
 }
 
 test "adaptive reads dispatch every queued batch when a backend is idle" {
@@ -1860,6 +2373,7 @@ test "read connection affinity never bypasses an idle backend" {
     var shared: Shared = undefined;
     shared.cfg = std.mem.zeroes(Config);
     shared.cfg.pg_depth = 4;
+    shared.cfg.read_depth = 4;
     var pgs = [_]PgConn{
         .{ .alive = true, .depth = 2, .last_stmt = .article },
         .{ .alive = true, .depth = 0, .last_stmt = .profile },
@@ -1877,6 +2391,7 @@ test "staged reads flush as soon as an in-flight backend becomes idle" {
         var shared: Shared = undefined;
         shared.cfg = std.mem.zeroes(Config);
         shared.cfg.pg_depth = 4;
+        shared.cfg.read_depth = 4;
         shared.cfg.batch_max = 64;
         shared.cfg.read_window_us = 100000;
         shared.cfg.read_hold_min = 2048;
@@ -2115,6 +2630,398 @@ test "deferred groups resume after standalone completions and rollback releases 
         for (reqs[1..cap], 0..) |*r, i| try std.testing.expectEqual(@intFromPtr(r), p.q[(p.qh + i) % max_depth_cap]);
         try std.testing.expectEqual(@intFromPtr(&p.wrec) | 2, p.q[(p.qh + p.depth - 1) % max_depth_cap]);
         try std.testing.expectEqual(&grouped, p.wrec.m[0].r);
+    }
+}
+
+const SendTestRing = struct {
+    head: u32 = 0,
+    sqes: [16]linux.io_uring_sqe = undefined,
+
+    fn attach(self: *SendTestRing, w: *Worker) void {
+        w.ring = undefined;
+        w.ring.sq = undefined;
+        w.ring.sq.head = &self.head;
+        w.ring.sq.mask = self.sqes.len - 1;
+        w.ring.sq.sqes = &self.sqes;
+        w.ring.sq.sqe_tail = 0;
+    }
+};
+
+test "terminal receive waits for shutdown completion before closing the fd" {
+    for ([_]i32{ 0, -@as(i32, @backingInt(linux.E.NOTCONN)) }) |shutdown_result| {
+        var shared: Shared = undefined;
+        var pbuf: [1]linux.io_uring_buf = undefined;
+        var conns = [_]Conn{.{ .gen = 7, .open = true, .recv_live = true }};
+        const c = &conns[0];
+        var w = Worker{ .shared = &shared, .id = 0, .conns = &conns, .pbuf_ring = &pbuf };
+        var ring = SendTestRing{};
+        ring.attach(&w);
+        w.closeConn(0);
+        try std.testing.expectEqual(@as(u32, 1), w.ring.sq.sqe_tail);
+        try std.testing.expectEqual(linux.IORING_OP.SHUTDOWN, ring.sqes[0].opcode);
+
+        w.onRecv(0, 7, 0, 0);
+        try std.testing.expect(!c.recv_live);
+        try std.testing.expectEqual(@as(u32, 1), w.ring.sq.sqe_tail);
+        try std.testing.expect(c.closing);
+
+        w.dispatch(.{ .user_data = ring.sqes[0].user_data, .res = shutdown_result, .flags = 0 });
+        try std.testing.expectEqual(@as(u32, 2), w.ring.sq.sqe_tail);
+        try std.testing.expectEqual(linux.IORING_OP.CLOSE, ring.sqes[1].opcode);
+        try std.testing.expect(!c.closing);
+        w.maybeFinishClose(0);
+        try std.testing.expectEqual(@as(u32, 2), w.ring.sq.sqe_tail);
+    }
+}
+
+test "stale shutdown completions do not release the current fd" {
+    var shared: Shared = undefined;
+    var pbuf: [1]linux.io_uring_buf = undefined;
+    var conns = [_]Conn{ .{}, .{ .gen = 0x01000008, .open = true, .recv_live = true } };
+    const fd: i32 = 1;
+    const c = &conns[1];
+    var w = Worker{ .shared = &shared, .id = 0, .conns = &conns, .pbuf_ring = &pbuf };
+    var ring = SendTestRing{};
+    ring.attach(&w);
+    w.closeConn(fd);
+    try std.testing.expectEqual(@as(u32, 1), w.ring.sq.sqe_tail);
+    try std.testing.expectEqual(fd, ring.sqes[0].fd);
+    try std.testing.expectEqual(ud(.shut, 8, 1), ring.sqes[0].user_data);
+    w.onRecv(fd, 8, 0, 0);
+    try std.testing.expect(c.closing and c.shutdown_live and !c.recv_live);
+
+    w.dispatch(.{ .user_data = ud(.shut, 7, 1), .res = 0, .flags = 0 });
+    try std.testing.expect(c.closing and c.shutdown_live);
+    try std.testing.expectEqual(@as(u32, 1), w.ring.sq.sqe_tail);
+    w.dispatch(.{ .user_data = ring.sqes[0].user_data, .res = 0, .flags = 0 });
+    try std.testing.expect(!c.closing and !c.shutdown_live);
+    try std.testing.expectEqual(@as(u32, 2), w.ring.sq.sqe_tail);
+    try std.testing.expectEqual(linux.IORING_OP.CLOSE, ring.sqes[1].opcode);
+    try std.testing.expectEqual(fd, ring.sqes[1].fd);
+}
+
+test "poll removal completion cannot retire a live shutdown at generation zero" {
+    const bytes = try gpa.alloc(u8, slab_size);
+    defer gpa.free(bytes);
+    var shared: Shared = undefined;
+    var conns = [_]Conn{.{ .open = true, .busy = true, .recv_live = true, .send_live = true, .out = bytes.ptr, .out_len = slab_size, .out_cap = slab_size }};
+    const c = &conns[0];
+    var w = Worker{ .shared = &shared, .id = 0, .conns = &conns };
+    var ring = SendTestRing{};
+    ring.attach(&w);
+    w.closeConn(0);
+    try std.testing.expect(!c.open and c.closing and c.busy and !c.recv_live and c.send_live and c.shutdown_live);
+    try std.testing.expectEqual(@as(u32, 2), w.ring.sq.sqe_tail);
+    try std.testing.expectEqual(linux.IORING_OP.POLL_REMOVE, ring.sqes[0].opcode);
+    try std.testing.expectEqual(ud(.poll, 0, 0), ring.sqes[0].addr);
+    try std.testing.expectEqual(ud(.cancel, 0, 0), ring.sqes[0].user_data);
+    try std.testing.expectEqual(linux.IORING_OP.SHUTDOWN, ring.sqes[1].opcode);
+    try std.testing.expectEqual(ud(.shut, 0, 0), ring.sqes[1].user_data);
+
+    w.onSend(0, 0, 1024, 0);
+    try std.testing.expect(c.closing and c.busy and !c.send_live and c.shutdown_live);
+    try std.testing.expectEqual(@as(u32, 0), c.out_cap);
+    try std.testing.expectEqual(@as(usize, 1), w.slab_count);
+    try std.testing.expectEqual(@as(u32, 2), w.ring.sq.sqe_tail);
+    w.dispatch(.{ .user_data = ring.sqes[0].user_data, .res = 0, .flags = 0 });
+    try std.testing.expect(c.closing and c.shutdown_live);
+    try std.testing.expectEqual(@as(u32, 2), w.ring.sq.sqe_tail);
+    w.dispatch(.{ .user_data = ring.sqes[0].addr, .res = -@as(i32, @backingInt(linux.E.CANCELED)), .flags = 0 });
+    try std.testing.expect(c.closing and c.shutdown_live);
+    try std.testing.expectEqual(@as(u32, 2), w.ring.sq.sqe_tail);
+    w.dispatch(.{ .user_data = ring.sqes[1].user_data, .res = -@as(i32, @backingInt(linux.E.NOTCONN)), .flags = 0 });
+    try std.testing.expect(!c.closing and !c.busy and !c.shutdown_live);
+    try std.testing.expectEqual(@as(u32, 3), w.ring.sq.sqe_tail);
+    try std.testing.expectEqual(linux.IORING_OP.CLOSE, ring.sqes[2].opcode);
+    w.maybeFinishClose(0);
+    try std.testing.expectEqual(@as(usize, 1), w.slab_count);
+    try std.testing.expectEqual(@as(u32, 3), w.ring.sq.sqe_tail);
+}
+
+test "poll-only close does not wait for the ignored cancellation completion" {
+    var shared: Shared = undefined;
+    var conns = [_]Conn{.{ .open = true, .recv_live = true }};
+    const c = &conns[0];
+    var w = Worker{ .shared = &shared, .id = 0, .conns = &conns };
+    var ring = SendTestRing{};
+    ring.attach(&w);
+    w.closeConn(0);
+    try std.testing.expect(!c.open and !c.recv_live and !c.closing and !c.shutdown_live);
+    try std.testing.expectEqual(@as(u32, 2), w.ring.sq.sqe_tail);
+    try std.testing.expectEqual(linux.IORING_OP.POLL_REMOVE, ring.sqes[0].opcode);
+    try std.testing.expectEqual(ud(.cancel, 0, 0), ring.sqes[0].user_data);
+    try std.testing.expectEqual(linux.IORING_OP.CLOSE, ring.sqes[1].opcode);
+    w.dispatch(.{ .user_data = ring.sqes[0].user_data, .res = -@as(i32, @backingInt(linux.E.NOENT)), .flags = 0 });
+    w.dispatch(.{ .user_data = ring.sqes[0].addr, .res = -@as(i32, @backingInt(linux.E.CANCELED)), .flags = 0 });
+    try std.testing.expectEqual(@as(u32, 2), w.ring.sq.sqe_tail);
+}
+
+test "zero-copy ENOMEM retries copied send without closing or releasing the response early" {
+    const log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = log_level;
+    const Order = enum { no_notification, notification_first, send_first };
+    for ([_]Order{ .no_notification, .notification_first, .send_first }) |order| {
+        const bytes = try gpa.alloc(u8, slab_size);
+        defer gpa.free(bytes);
+        @memset(bytes, 0x5a);
+        var shared: Shared = undefined;
+        var conns = [_]Conn{.{
+            .gen = 7,
+            .open = true,
+            .busy = true,
+            .recv_live = true,
+            .send_live = true,
+            .send_zc = true,
+            .out = bytes.ptr,
+            .out_len = slab_size,
+            .out_cap = slab_size,
+        }};
+        const c = &conns[0];
+        var w = Worker{ .shared = &shared, .id = 0, .conns = &conns, .send_zc_enabled = true };
+        var ring = SendTestRing{};
+        ring.attach(&w);
+        const more: u32 = if (order == .no_notification) 0 else linux.IORING_CQE_F_MORE;
+        w.onSend(0, 7, -@as(i32, @backingInt(linux.E.NOMEM)), more);
+        try std.testing.expect(c.open and c.busy and c.send_live and !c.send_zc);
+        try std.testing.expectEqual(@as(u32, 1), w.ring.sq.sqe_tail);
+        try std.testing.expectEqual(linux.IORING_OP.SEND, ring.sqes[0].opcode);
+        try std.testing.expectEqual(@intFromPtr(bytes.ptr), ring.sqes[0].addr);
+        try std.testing.expectEqual(@as(u32, slab_size), ring.sqes[0].len);
+        try std.testing.expectEqual(@as(u32, 0), c.out_off);
+        try std.testing.expect(w.send_zc_enabled);
+        if (order == .notification_first) {
+            w.onSend(0, 7, 0, linux.IORING_CQE_F_NOTIF);
+            try std.testing.expect(c.busy and c.send_live);
+            try std.testing.expectEqual(@as(u32, slab_size), c.out_cap);
+        }
+        w.onSend(0, 7, 1024, 0);
+        try std.testing.expect(c.open and c.busy and c.send_live and !c.send_zc);
+        try std.testing.expectEqual(@as(u32, 2), w.ring.sq.sqe_tail);
+        try std.testing.expectEqual(linux.IORING_OP.SEND, ring.sqes[1].opcode);
+        try std.testing.expectEqual(@intFromPtr(bytes.ptr + 1024), ring.sqes[1].addr);
+        try std.testing.expectEqual(@as(u32, slab_size - 1024), ring.sqes[1].len);
+        w.onSend(0, 7, slab_size - 1024, 0);
+        if (order == .send_first) {
+            try std.testing.expect(c.open and c.busy and c.zc_waiting);
+            try std.testing.expectEqual(@as(u32, slab_size), c.out_cap);
+            w.onSend(0, 7, 0, linux.IORING_CQE_F_NOTIF);
+        }
+        try std.testing.expect(c.open and !c.busy and !c.send_live and !c.zc_waiting);
+        try std.testing.expectEqual(@as(u32, 0), c.out_cap);
+        try std.testing.expectEqual(@as(usize, 1), w.slab_count);
+        try std.testing.expectEqual(@as(u32, 2), w.ring.sq.sqe_tail);
+        try std.testing.expect(w.send_zc_enabled);
+        try std.testing.expectEqual(@as(u64, 1), w.stats.zc_nomem);
+        try std.testing.expectEqual(@as(u64, 0), w.stats.send_errors);
+    }
+}
+
+test "a failed copied fallback is not retried and still waits for the original notification" {
+    const log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = log_level;
+    for ([_]bool{ false, true }) |notification| {
+        const bytes = try gpa.alloc(u8, slab_size);
+        defer gpa.free(bytes);
+        var shared: Shared = undefined;
+        var conns = [_]Conn{.{ .gen = 7, .open = true, .busy = true, .send_live = true, .send_zc = true, .out = bytes.ptr, .out_len = slab_size, .out_cap = slab_size }};
+        const c = &conns[0];
+        var w = Worker{ .shared = &shared, .id = 0, .conns = &conns, .send_zc_enabled = true };
+        var ring = SendTestRing{};
+        ring.attach(&w);
+        const more: u32 = if (notification) linux.IORING_CQE_F_MORE else 0;
+        w.onSend(0, 7, -@as(i32, @backingInt(linux.E.NOMEM)), more);
+        try std.testing.expect(c.open and c.send_live and !c.send_zc);
+        try std.testing.expectEqual(linux.IORING_OP.SEND, ring.sqes[0].opcode);
+        w.onSend(0, 7, -@as(i32, @backingInt(linux.E.NOMEM)), 0);
+        try std.testing.expect(!c.open and !c.send_live);
+        if (notification) {
+            try std.testing.expect(c.zc_waiting);
+            try std.testing.expectEqual(@as(u32, slab_size), c.out_cap);
+            try std.testing.expectEqual(@as(u32, 1), w.ring.sq.sqe_tail);
+            w.onSend(0, 7, 0, linux.IORING_CQE_F_NOTIF);
+        }
+        try std.testing.expectEqual(@as(u32, 0), c.out_cap);
+        try std.testing.expectEqual(@as(u32, 2), w.ring.sq.sqe_tail);
+        try std.testing.expectEqual(linux.IORING_OP.CLOSE, ring.sqes[1].opcode);
+        try std.testing.expectEqual(@as(u64, 1), w.stats.zc_nomem);
+        try std.testing.expectEqual(@as(u64, 1), w.stats.send_errors);
+    }
+}
+
+test "closing during copied ENOMEM fallback waits for receive, send, notification and shutdown" {
+    const log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = log_level;
+    const Completion = enum { recv, send, notification, shutdown };
+    const orders = [24][4]Completion{
+        .{ .recv, .send, .notification, .shutdown },
+        .{ .recv, .send, .shutdown, .notification },
+        .{ .recv, .notification, .send, .shutdown },
+        .{ .recv, .notification, .shutdown, .send },
+        .{ .recv, .shutdown, .send, .notification },
+        .{ .recv, .shutdown, .notification, .send },
+        .{ .send, .recv, .notification, .shutdown },
+        .{ .send, .recv, .shutdown, .notification },
+        .{ .send, .notification, .recv, .shutdown },
+        .{ .send, .notification, .shutdown, .recv },
+        .{ .send, .shutdown, .recv, .notification },
+        .{ .send, .shutdown, .notification, .recv },
+        .{ .notification, .recv, .send, .shutdown },
+        .{ .notification, .recv, .shutdown, .send },
+        .{ .notification, .send, .recv, .shutdown },
+        .{ .notification, .send, .shutdown, .recv },
+        .{ .notification, .shutdown, .recv, .send },
+        .{ .notification, .shutdown, .send, .recv },
+        .{ .shutdown, .recv, .send, .notification },
+        .{ .shutdown, .recv, .notification, .send },
+        .{ .shutdown, .send, .recv, .notification },
+        .{ .shutdown, .send, .notification, .recv },
+        .{ .shutdown, .notification, .recv, .send },
+        .{ .shutdown, .notification, .send, .recv },
+    };
+    for (orders) |order| {
+        const bytes = try gpa.alloc(u8, slab_size);
+        defer gpa.free(bytes);
+        var shared: Shared = undefined;
+        // A provided-buffer receive stays live until its terminal CQE. None of
+        // the injected completions selects a buffer, so this ring is not read.
+        var pbuf: [1]linux.io_uring_buf = undefined;
+        var conns = [_]Conn{.{
+            .gen = 7,
+            .open = true,
+            .busy = true,
+            .recv_live = true,
+            .send_live = true,
+            .send_zc = true,
+            .out = bytes.ptr,
+            .out_len = slab_size,
+            .out_cap = slab_size,
+        }};
+        const c = &conns[0];
+        var w = Worker{ .shared = &shared, .id = 0, .conns = &conns, .send_zc_enabled = true, .pbuf_ring = &pbuf };
+        var ring = SendTestRing{};
+        ring.attach(&w);
+        w.onSend(0, 7, -@as(i32, @backingInt(linux.E.NOMEM)), linux.IORING_CQE_F_MORE);
+        try std.testing.expect(c.open and c.recv_live and c.send_live and c.zc_waiting and !c.send_zc);
+        try std.testing.expectEqual(@as(u32, 1), w.ring.sq.sqe_tail);
+        try std.testing.expectEqual(linux.IORING_OP.SEND, ring.sqes[0].opcode);
+        try std.testing.expectEqual(@as(usize, 0), w.slab_count);
+
+        w.closeConn(0);
+        try std.testing.expect(!c.open and c.closing and c.busy);
+        try std.testing.expect(c.recv_live and c.send_live and c.zc_waiting and c.shutdown_live);
+        try std.testing.expectEqual(@as(u32, slab_size), c.out_cap);
+        try std.testing.expectEqual(@as(usize, 0), w.slab_count);
+        try std.testing.expectEqual(@as(u32, 2), w.ring.sq.sqe_tail);
+        try std.testing.expectEqual(linux.IORING_OP.SHUTDOWN, ring.sqes[1].opcode);
+
+        var recv_pending = true;
+        var send_pending = true;
+        var notification_pending = true;
+        var shutdown_pending = true;
+        for (order) |completion| {
+            switch (completion) {
+                .recv => {
+                    w.onRecv(0, 7, 0, 0);
+                    recv_pending = false;
+                },
+                .send => {
+                    // A short copied send after close must not submit its unsent tail.
+                    w.onSend(0, 7, 1024, 0);
+                    send_pending = false;
+                },
+                .notification => {
+                    w.onSend(0, 7, 0, linux.IORING_CQE_F_NOTIF);
+                    notification_pending = false;
+                },
+                .shutdown => {
+                    w.dispatch(.{ .user_data = ring.sqes[1].user_data, .res = 0, .flags = 0 });
+                    shutdown_pending = false;
+                },
+            }
+            const retained = send_pending or notification_pending;
+            const closing = recv_pending or retained or shutdown_pending;
+            try std.testing.expect(!c.open and !c.send_zc);
+            try std.testing.expectEqual(recv_pending, c.recv_live);
+            try std.testing.expectEqual(send_pending, c.send_live);
+            try std.testing.expectEqual(notification_pending, c.zc_waiting);
+            try std.testing.expectEqual(shutdown_pending, c.shutdown_live);
+            try std.testing.expectEqual(closing, c.closing);
+            try std.testing.expectEqual(closing, c.busy);
+            try std.testing.expectEqual(@as(u32, if (retained) slab_size else 0), c.out_cap);
+            try std.testing.expectEqual(@as(u32, if (!send_pending and retained) 1024 else 0), c.out_off);
+            try std.testing.expectEqual(@as(usize, if (retained) 0 else 1), w.slab_count);
+            try std.testing.expectEqual(@as(u32, if (closing) 2 else 3), w.ring.sq.sqe_tail);
+        }
+        try std.testing.expectEqual(linux.IORING_OP.CLOSE, ring.sqes[2].opcode);
+        try std.testing.expectEqual(@intFromPtr(bytes.ptr), @intFromPtr(w.slabs[0]));
+
+        w.closeConn(0);
+        w.finishSend(0, c);
+        w.maybeFinishClose(0);
+        try std.testing.expectEqual(@as(usize, 1), w.slab_count);
+        try std.testing.expectEqual(@as(u32, 0), c.out_cap);
+        try std.testing.expectEqual(@as(u32, 3), w.ring.sq.sqe_tail);
+    }
+}
+
+test "late zero-copy ENOMEM cannot resurrect a closed connection" {
+    const log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = log_level;
+    const bytes = try gpa.alloc(u8, slab_size);
+    defer gpa.free(bytes);
+    var shared: Shared = undefined;
+    var conns = [_]Conn{.{ .gen = 7, .closing = true, .busy = true, .send_live = true, .send_zc = true, .out = bytes.ptr, .out_len = slab_size, .out_cap = slab_size }};
+    const c = &conns[0];
+    var w = Worker{ .shared = &shared, .id = 0, .conns = &conns, .send_zc_enabled = true };
+    var ring = SendTestRing{};
+    ring.attach(&w);
+    w.onSend(0, 7, -@as(i32, @backingInt(linux.E.NOMEM)), linux.IORING_CQE_F_MORE);
+    try std.testing.expect(!c.open and !c.send_live and c.zc_waiting);
+    try std.testing.expectEqual(@as(u32, 0), w.ring.sq.sqe_tail);
+    try std.testing.expectEqual(@as(u32, slab_size), c.out_cap);
+    w.onSend(0, 7, 0, linux.IORING_CQE_F_NOTIF);
+    try std.testing.expect(!c.open and !c.send_live and !c.zc_waiting);
+    try std.testing.expectEqual(@as(u32, 1), w.ring.sq.sqe_tail);
+    try std.testing.expectEqual(linux.IORING_OP.CLOSE, ring.sqes[0].opcode);
+    try std.testing.expectEqual(@as(u32, 0), c.out_cap);
+}
+
+test "memory pressure preserves future zero-copy eligibility but unsupported kernels disable it" {
+    const log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = log_level;
+    for ([_]linux.E{ .NOMEM, .INVAL, .OPNOTSUPP }) |err| {
+        const bytes = try gpa.alloc(u8, slab_size);
+        defer gpa.free(bytes);
+        var shared: Shared = undefined;
+        var conns = [_]Conn{.{ .gen = 7, .open = true, .busy = true, .send_live = true, .send_zc = true, .out = bytes.ptr, .out_len = slab_size, .out_cap = slab_size }};
+        const c = &conns[0];
+        var w = Worker{ .shared = &shared, .id = 0, .conns = &conns, .send_zc_enabled = true };
+        var ring = SendTestRing{};
+        ring.attach(&w);
+        w.onSend(0, 7, -@as(i32, @backingInt(err)), linux.IORING_CQE_F_MORE);
+        try std.testing.expect(c.open and c.send_live and !c.send_zc);
+        try std.testing.expectEqual(linux.IORING_OP.SEND, ring.sqes[0].opcode);
+        const enabled = err == .NOMEM;
+        try std.testing.expectEqual(enabled, w.send_zc_enabled);
+        w.onSend(0, 7, slab_size, 0);
+        try std.testing.expect(c.busy and c.zc_waiting);
+        w.onSend(0, 7, 0, linux.IORING_CQE_F_NOTIF);
+        try std.testing.expect(c.open and !c.busy);
+        const next: [512]u8 = @splat('x');
+        c.busy = true;
+        w.sendCopy(0, 7, &next, true);
+        try std.testing.expectEqual(enabled, c.send_zc);
+        try std.testing.expectEqual(if (enabled) linux.IORING_OP.SEND_ZC else linux.IORING_OP.SEND, ring.sqes[1].opcode);
+        w.onSend(0, 7, next.len, if (enabled) linux.IORING_CQE_F_MORE else 0);
+        if (enabled) w.onSend(0, 7, 0, linux.IORING_CQE_F_NOTIF);
+        try std.testing.expect(c.open and !c.busy and !c.zc_waiting);
+        try std.testing.expectEqual(@as(u32, 0), c.out_cap);
+        try std.testing.expectEqual(@as(u32, 2), w.ring.sq.sqe_tail);
     }
 }
 

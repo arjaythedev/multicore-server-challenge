@@ -46,7 +46,6 @@ inline fn f(s: *const [4][256]u32, x: u32) u32 {
     return ((a +% b) ^ c) +% d;
 }
 
-
 // ---- hand-written x86-64 kernel: 4 lanes in registers ---------------------------------------------------------
 //
 // The compiler spills at four or more interleaved lanes. Written by hand, four lanes fit in the 15 usable registers:
@@ -363,6 +362,26 @@ pub fn hashBatch(jobs: []Job) void {
     std.crypto.secureZero(u8, std.mem.asBytes(&kb));
 }
 
+/// Optional startup calibration, using independent real cost-10 hashes. This is
+/// not a password/result cache and never substitutes for hashing a request.
+pub fn calibrate() struct { lanes: usize, ns_per_hash: u64 } {
+    var jobs: [max_lanes]Job = undefined;
+    for (&jobs, 0..) |*j, i| j.* = .{ .password = "startup calibration", .salt = @splat(@intCast(i + 1)), .cost = 10 };
+    hashBatch(jobs[0..1]);
+    var best: usize = 1;
+    var best_ns: u64 = std.math.maxInt(u64);
+    for (1..max_lanes + 1) |n| {
+        const start = @import("sys.zig").nowNs();
+        for (0..3) |_| hashBatch(jobs[0..n]);
+        const elapsed = (@import("sys.zig").nowNs() - start) / (3 * n);
+        if (elapsed < best_ns) {
+            best_ns = elapsed;
+            best = n;
+        }
+    }
+    return .{ .lanes = best, .ns_per_hash = best_ns };
+}
+
 // ---- modular crypt format ($2b$10$<22 salt chars><31 hash chars>) ----
 
 const alphabet = "./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -427,4 +446,3 @@ test "known vectors and equivalence with the standard library" {
         }
     }
 }
-

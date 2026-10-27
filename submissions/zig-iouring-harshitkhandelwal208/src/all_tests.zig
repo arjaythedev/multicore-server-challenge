@@ -8,4 +8,7 @@ test {
     _ = @import("bcpool.zig");
     _ = @import("server.zig");
     _ = @import("plan.zig");
+    _ = @import("packed.zig");
+    _ = @import("buf.zig");
+    _ = @import("hub.zig");
 }

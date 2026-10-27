@@ -6,6 +6,7 @@ Run against an already-running server on a disposable seed database:
 Requires seeded user 5000. JWT_SECRET defaults to the challenge secret.
 """
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import hmac
 import http.client
@@ -86,6 +87,34 @@ def main():
                     require(status == 200 and isinstance(tags["tags"], list), "pipelined second response differs")
                     require(stream.read(1) == b"", "Connection: close not honored after large response")
             print("PASS slow-reader partial send and ordered pipeline %d/3" % (iteration + 1), flush=True)
+
+        def reuse_large_response(_):
+            client = http.client.HTTPConnection(host, port, timeout=30)
+            connection_socket = None
+            try:
+                for endpoint in (path, "/api/tags", path):
+                    client.request("GET", endpoint)
+                    if connection_socket is None:
+                        connection_socket = client.sock
+                    require(connection_socket is not None and client.sock is connection_socket,
+                            "concurrent client reconnected instead of retaining its socket")
+                    response = client.getresponse()
+                    actual = json.loads(response.read())
+                    require(not response.will_close and client.sock is connection_socket,
+                            "large/small/large sequence did not retain one keep-alive socket")
+                    require(response.status == 200, "concurrent keep-alive response returned %d" % response.status)
+                    if endpoint == path:
+                        require(actual["article"] == article, "concurrent large response bytes differ")
+                    else:
+                        require(isinstance(actual["tags"], list), "small response after large send differs")
+                return True
+            finally:
+                client.close()
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            completed = list(pool.map(reuse_large_response, range(16)))
+        require(len(completed) == 16 and all(completed), "not every concurrent keep-alive client completed")
+        print("PASS 16 concurrent keep-alive clients: large/small/large responses without retries or EOFs", flush=True)
         for _ in range(10):
             client = socket.create_connection((host, port), timeout=5)
             try:

@@ -66,9 +66,7 @@ fn errorBody(w: *Worker, msg: []const u8) void {
 
 /// Send the body currently in `w.out` (after the reserved head room).
 fn finish(w: *Worker, fd: i32, gen: u32, code: u16, keep_alive: bool) void {
-    const body_len = w.out.len - http.head_room;
-    const resp = http.finishResponse(w.out.ptr[0..w.out.len], body_len, code, keep_alive);
-    w.sendCopy(fd, gen, resp, keep_alive);
+    w.finishResponse(fd, gen, code, keep_alive);
 }
 
 fn fail(c: *const Ctx, code: u16, msg: []const u8) void {
@@ -80,11 +78,11 @@ fn fail(c: *const Ctx, code: u16, msg: []const u8) void {
 fn failReq(w: *Worker, r: *Req, code: u16, msg: []const u8) void {
     w.beginBody();
     errorBody(w, msg);
-    finish(w, r.fd, r.gen, code, r.keep_alive);
-    w.freeReq(r);
+    doneReq(w, r, code);
 }
 
-fn doneReq(w: *Worker, r: *Req, code: u16) void {
+pub fn doneReq(w: *Worker, r: *Req, code: u16) void {
+    if (r.remote_owner != std.math.maxInt(u16)) return w.proxyBody(r, code);
     finish(w, r.fd, r.gen, code, r.keep_alive);
     w.freeReq(r);
 }
@@ -113,6 +111,7 @@ fn authenticate(c: *Ctx, required: bool) AuthError!void {
 // ---------------------------------------------------------------------------------------------
 
 pub fn handle(w: *Worker, fd: i32, gen: u32, head: http.Head, body: []const u8) void {
+    w.negotiateEncoding(fd, head.gzip, head.identity);
     var c = Ctx{ .w = w, .fd = fd, .gen = gen, .head = head, .body = body };
     route(&c) catch |e| switch (e) {
         error.Unauthorized => fail(&c, 401, "unauthorized"),
@@ -320,7 +319,7 @@ fn writeUser(w: *Worker, id_unused: void, row: [5]?[]const u8, token: []const u8
     o.putSlice("}}");
 }
 
-fn writeProfile(w: *Worker, username: []const u8, bio: ?[]const u8, image: ?[]const u8, following: bool) void {
+pub fn writeProfile(w: *Worker, username: []const u8, bio: ?[]const u8, image: ?[]const u8, following: bool) void {
     const o = &w.out;
     o.putSlice("{\"username\":");
     jw.str(o, username);
@@ -333,7 +332,7 @@ fn writeProfile(w: *Worker, username: []const u8, bio: ?[]const u8, image: ?[]co
 
 /// Article object from the 13/14-column layout starting at `c[0]` (id, slug, title, description, created_at,
 /// updated_at, tag_list, favorites_count, favorited, username, bio, image, following [, body]).
-fn writeArticle(w: *Worker, c: []const ?[]const u8, full: bool) void {
+pub fn writeArticle(w: *Worker, c: []const ?[]const u8, full: bool) void {
     const o = &w.out;
     o.ensure(512 + (c[3].?.len + (if (full) c[13].?.len else 0)) * 2);
     o.putSlice("{\"slug\":");
@@ -479,7 +478,7 @@ fn handleDbError(w: *Worker, r: *Req, rep: *Reply) bool {
     return false;
 }
 
-fn notFound(w: *Worker, r: *Req, msg: []const u8) void {
+pub fn notFound(w: *Worker, r: *Req, msg: []const u8) void {
     w.out.len = http.head_room;
     errorBody(w, msg);
     doneReq(w, r, 404);
@@ -1053,6 +1052,7 @@ fn commentDelete(c: *Ctx, raw_slug: []const u8, raw_id: []const u8) RouteError!v
 // ---------------------------------------------------------------------------------------------
 
 pub fn onPg(w: *Worker, r: *Req, batch: []const u8) void {
+    if (r.remote_owner != std.math.maxInt(u16)) return w.proxyReply(r, 0, 200, batch);
     switch (r.kind) {
         .tags => onTags(w, r, batch),
         .login_sql => onLoginRow(w, r, batch),
@@ -1085,5 +1085,6 @@ pub fn onBcrypt(w: *Worker, r: *Req, d: bcpool.Done) void {
 
 /// The database connection failed while this request was in flight.
 pub fn onPgFailure(w: *Worker, r: *Req) void {
+    if (r.remote_owner != std.math.maxInt(u16)) return w.proxyReply(r, 2, 503, "");
     failReq(w, r, 503, "database unavailable");
 }
