@@ -64,9 +64,9 @@ const SQL_LIST_NONE =
     \\to_char(a.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
     \\jsonb_build_object('tags', ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE at.article_id = a.id ORDER BY t.name)) AS tag_list,
     \\(SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
-    \\EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1) AS favorited,
+    \\a.id IN (SELECT article_id FROM favorites WHERE user_id = $1) AS favorited,
     \\u.username, u.bio, u.image,
-    \\EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = a.author_id) AS following
+    \\a.author_id IN (SELECT followee_id FROM follows WHERE follower_id = $1) AS following
     \\FROM articles a JOIN users u ON u.id = a.author_id
     \\ORDER BY a.id DESC LIMIT $2 OFFSET $3
 ;
@@ -77,9 +77,9 @@ const SQL_LIST_TAG =
     \\to_char(a.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
     \\jsonb_build_object('tags', ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE at.article_id = a.id ORDER BY t.name)) AS tag_list,
     \\(SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
-    \\EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1) AS favorited,
+    \\a.id IN (SELECT article_id FROM favorites WHERE user_id = $1) AS favorited,
     \\u.username, u.bio, u.image,
-    \\EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = a.author_id) AS following
+    \\a.author_id IN (SELECT followee_id FROM follows WHERE follower_id = $1) AS following
     \\FROM articles a JOIN users u ON u.id = a.author_id
     \\WHERE a.id IN (
     \\  SELECT at.article_id FROM article_tags at
@@ -95,9 +95,9 @@ const SQL_LIST_AUTHOR =
     \\to_char(a.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
     \\jsonb_build_object('tags', ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE at.article_id = a.id ORDER BY t.name)) AS tag_list,
     \\(SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
-    \\EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1) AS favorited,
+    \\a.id IN (SELECT article_id FROM favorites WHERE user_id = $1) AS favorited,
     \\u.username, u.bio, u.image,
-    \\EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = a.author_id) AS following
+    \\a.author_id IN (SELECT followee_id FROM follows WHERE follower_id = $1) AS following
     \\FROM articles a JOIN users u ON u.id = a.author_id
     \\WHERE a.author_id = (SELECT au.id FROM users au WHERE au.username = $4)
     \\ORDER BY a.id DESC LIMIT $2 OFFSET $3
@@ -109,9 +109,9 @@ const SQL_LIST_FAVORITED =
     \\to_char(a.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
     \\jsonb_build_object('tags', ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE at.article_id = a.id ORDER BY t.name)) AS tag_list,
     \\(SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
-    \\EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1) AS favorited,
+    \\a.id IN (SELECT article_id FROM favorites WHERE user_id = $1) AS favorited,
     \\u.username, u.bio, u.image,
-    \\EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = a.author_id) AS following
+    \\a.author_id IN (SELECT followee_id FROM follows WHERE follower_id = $1) AS following
     \\FROM articles a JOIN users u ON u.id = a.author_id
     \\WHERE a.id IN (
     \\  SELECT f.article_id FROM favorites f
@@ -153,20 +153,12 @@ const SQL_FEED =
     \\to_char(a.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
     \\jsonb_build_object('tags', ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE at.article_id = a.id ORDER BY t.name)) AS tag_list,
     \\(SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
-    \\EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1) AS favorited,
+    \\a.id IN (SELECT article_id FROM favorites WHERE user_id = $1) AS favorited,
     \\u.username, u.bio, u.image,
-    \\EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = a.author_id) AS following
+    \\TRUE AS following
     \\FROM articles a JOIN users u ON u.id = a.author_id
-    \\WHERE a.id IN (
-    \\  SELECT x.id FROM follows fo CROSS JOIN LATERAL (
-    \\    SELECT a2.id FROM articles a2
-    \\    WHERE a2.author_id = fo.followee_id
-    \\    ORDER BY a2.id DESC LIMIT ($2::int + $3::int)
-    \\  ) x
-    \\  WHERE fo.follower_id = $1
-    \\  ORDER BY x.id DESC LIMIT $2 OFFSET $3
-    \\)
-    \\ORDER BY a.id DESC
+    \\WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $1)
+    \\ORDER BY a.id DESC LIMIT $2 OFFSET $3
 ;
 
 const SQL_FEED_COUNT =
