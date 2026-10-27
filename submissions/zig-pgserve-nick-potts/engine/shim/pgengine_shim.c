@@ -147,6 +147,12 @@ shim_ereport_str(const char *msg)
 }
 
 void
+shim_log(const char *msg)
+{
+	ereport(LOG, (errmsg_internal("%s", msg)));
+}
+
+void
 shim_ereport_schema(const char *reason)
 {
 	ereport(ERROR, (errcode(ERRCODE_INVALID_TABLE_DEFINITION),

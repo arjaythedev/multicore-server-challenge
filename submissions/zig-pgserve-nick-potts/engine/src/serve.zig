@@ -208,22 +208,155 @@ const Turn = struct {
     reads: [N_EP]std.ArrayListUnmanaged(*Req) = @splat(.empty),
     writes: std.ArrayListUnmanaged(*Req) = .empty,
     touched: std.ArrayListUnmanaged(*Conn) = .empty,
+    /// Requests queued on `reads` and `writes`.
+    n: u32 = 0,
+    /// When the oldest of them was queued (monotonic ns), once the loop has dated it.
+    since: ?i64 = null,
 
     fn read(t: *Turn, r: *Req, ep: c_int) void {
         r.stage = .read;
         r.ep = ep;
         t.reads[@intCast(ep)].append(gpa, r) catch @panic("out of memory");
+        t.n += 1;
     }
 
     fn write(t: *Turn, r: *Req, kind: c_int) void {
         r.stage = .write;
         r.w.kind = kind;
         t.writes.append(gpa, r) catch @panic("out of memory");
+        t.n += 1;
     }
 
     fn pending(t: *const Turn) bool {
-        for (t.reads) |l| if (l.items.len > 0) return true;
-        return t.writes.items.len > 0;
+        return t.n > 0;
+    }
+
+    fn date(t: *Turn, now: i64) void {
+        if (t.n > 0 and t.since == null) t.since = now;
+    }
+
+    /// Takes a queued request off the turn: its connection closed while the turn was held.
+    fn drop(t: *Turn, r: *Req) void {
+        const l = switch (r.stage) {
+            .read => &t.reads[@intCast(r.ep)],
+            .write => &t.writes,
+            .hash => return,
+        };
+        const i = std.mem.indexOfScalar(*Req, l.items, r) orelse return;
+        _ = l.orderedRemove(i);
+        t.n -= 1;
+        if (t.n == 0) t.since = null;
+    }
+
+    /// The conns of every queued request, so that the turn's end flushes their answers.
+    fn touchAll(t: *Turn) void {
+        for (t.writes.items) |r| touch(r.conn, &t.touched);
+        for (t.reads) |l| for (l.items) |r| touch(r.conn, &t.touched);
+    }
+};
+
+/// The batch clock (PGSERVE_DWELL_US, PGSERVE_DWELL_CAP, PGSERVE_DWELL_MIN through the launcher). A held turn
+/// keeps reading sockets and queueing requests, and runs its writes and reads only once its oldest request has
+/// waited `dwell_ns` or it holds `cap` requests. A dwell of 0 runs every turn at once.
+const Clock = struct {
+    dwell_ns: i64 = 0,
+    cap: u32 = 256,
+    /// The smallest batch that keeps the clock on for the next turn. A smaller one means light load: the next
+    /// turn runs at once, so a lone request is not held for company that isn't coming.
+    min: u32 = 2,
+    hot: bool = false,
+
+    const Fire = enum { now, deadline, cap };
+
+    /// Why the turn runs now, or null to hold it until `deadline`.
+    fn due(k: *const Clock, t: *const Turn, now: i64) ?Fire {
+        if (k.dwell_ns == 0 or !k.hot) return .now;
+        if (t.n >= k.cap) return .cap;
+        if (now >= k.deadline(t)) return .deadline;
+        return null;
+    }
+
+    fn deadline(k: *const Clock, t: *const Turn) i64 {
+        return t.since.? + k.dwell_ns;
+    }
+
+    fn fired(k: *Clock, n: u32) void {
+        k.hot = n >= k.min;
+    }
+};
+
+/// Batch sizes: exact below 64, then one bucket per power of two up to 32,768.
+const Hist = struct {
+    turns: [64 + 10]u32 = @splat(0),
+    reqs: u64 = 0,
+
+    fn add(h: *Hist, k: usize) void {
+        h.turns[bucket(k)] += 1;
+        h.reqs += k;
+    }
+
+    fn bucket(k: usize) usize {
+        if (k < 64) return k;
+        return @min(64 + @as(usize, std.math.log2_int(usize, k)) - 6, 64 + 9);
+    }
+
+    fn floor(b: usize) usize {
+        return if (b < 64) b else @as(usize, 1) << @intCast(b - 64 + 6);
+    }
+
+    fn count(h: *const Hist) u64 {
+        var s: u64 = 0;
+        for (h.turns) |n| s += n;
+        return s;
+    }
+
+    /// The batch size at quantile `q` of the batches, or of the requests when `by_req` (the size of batch a
+    /// request was served in). Sizes past 63 come out as their power of two.
+    fn quantile(h: *const Hist, q: f64, by_req: bool) usize {
+        var total: f64 = 0;
+        for (h.turns, 0..) |n, b| total += @as(f64, @floatFromInt(n)) * if (by_req) @as(f64, @floatFromInt(floor(b))) else 1;
+        var acc: f64 = 0;
+        for (h.turns, 0..) |n, b| {
+            acc += @as(f64, @floatFromInt(n)) * if (by_req) @as(f64, @floatFromInt(floor(b))) else 1;
+            if (n > 0 and acc >= q * total) return floor(b);
+        }
+        return 0;
+    }
+};
+
+/// Reads per batch per endpoint and writes per commit, logged every `every_ns` (PGSERVE_STATS_S; 0 keeps them
+/// unlogged).
+const Stats = struct {
+    reads: [N_EP]Hist = @splat(.{}),
+    writes: Hist = .{},
+    fires: std.EnumArray(Clock.Fire, u32) = .initFill(0),
+    /// Sum over turns of how long the oldest request waited for its turn to run.
+    waited_ns: u64 = 0,
+    from: i64 = 0,
+    every_ns: i64 = 0,
+
+    const names = [N_EP][]const u8{ "article", "list_all", "list_tag", "list_author", "list_favorited", "feed", "comments", "profile", "user", "tags" };
+
+    fn log(s: *Stats, now: i64) void {
+        var line: [4096]u8 = undefined;
+        var w: std.Io.Writer = .fixed(line[0 .. line.len - 1]);
+        const turns = s.fires.get(.now) + s.fires.get(.deadline) + s.fires.get(.cap);
+        if (turns == 0) return;
+        w.print("pgserve stats secs={d:.1} turns={d} now={d} deadline={d} cap={d} wait_ms={d:.2}", .{
+            @as(f64, @floatFromInt(now - s.from)) / 1e9, turns,
+            s.fires.get(.now),                           s.fires.get(.deadline),
+            s.fires.get(.cap),                           @as(f64, @floatFromInt(s.waited_ns)) / @as(f64, @floatFromInt(turns)) / 1e6,
+        }) catch {};
+        if (s.writes.reqs > 0) hist(&w, "writes", &s.writes);
+        for (&s.reads, names) |*h, name| if (h.reqs > 0) hist(&w, name, h);
+        line[w.end] = 0;
+        c.shim_log(&line);
+    }
+
+    fn hist(w: *std.Io.Writer, name: []const u8, h: *const Hist) void {
+        w.print(" | {s} turns={d} reqs={d} p50={d} p90={d} rp50={d} rp90={d}", .{
+            name, h.count(), h.reqs, h.quantile(0.5, false), h.quantile(0.9, false), h.quantile(0.5, true), h.quantile(0.9, true),
+        }) catch {};
     }
 };
 
@@ -775,7 +908,21 @@ fn knob(setting: []const u8) void {
     if (std.mem.eql(u8, name, "PGSERVE_HASH_NICE"))
         bcrypt.nice = std.fmt.parseInt(i32, value, 10) catch c.shim_ereport_str("pgengine http: PGSERVE_HASH_NICE is not an integer");
     if (std.mem.eql(u8, name, "PGSERVE_THIN_TO")) thin_to = std.mem.eql(u8, value, "1");
+    if (std.mem.eql(u8, name, "PGSERVE_DWELL_US")) clock.dwell_ns = @as(i64, knobInt("PGSERVE_DWELL_US", value, 0, 50_000)) * std.time.ns_per_us;
+    if (std.mem.eql(u8, name, "PGSERVE_DWELL_CAP")) clock.cap = knobInt("PGSERVE_DWELL_CAP", value, 1, 1 << 20);
+    if (std.mem.eql(u8, name, "PGSERVE_DWELL_MIN")) clock.min = knobInt("PGSERVE_DWELL_MIN", value, 1, 1 << 20);
+    if (std.mem.eql(u8, name, "PGSERVE_STATS_S")) stats.every_ns = @as(i64, knobInt("PGSERVE_STATS_S", value, 0, 86_400)) * std.time.ns_per_s;
 }
+
+fn knobInt(comptime name: []const u8, value: []const u8, min: u32, max: u32) u32 {
+    const v = std.fmt.parseInt(u32, value, 10) catch c.shim_ereport_str("pgengine http: " ++ name ++ " is not a whole number");
+    if (v < min or v > max) c.shim_ereport_str("pgengine http: " ++ name ++ " is out of range");
+    return v;
+}
+
+/// The batch clock and the stats, as the knobs set them.
+var clock: Clock = .{};
+var stats: Stats = .{};
 
 /// PGSERVE_THIN_TO=1: TCP_THIN_LINEAR_TIMEOUTS on every connection. An answer is 2-3 segments, so the kernel
 /// sees a thin stream and backs its retransmission timeout off linearly, not exponentially.
@@ -927,6 +1074,18 @@ fn wallSeconds() i64 {
     return ts.sec;
 }
 
+fn monoNs() i64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    return ts.sec * std.time.ns_per_s + ts.nsec;
+}
+
+/// epoll_wait for up to `ns`, to the nanosecond (epoll_pwait2, Linux 5.11): a dwell of 2 ms can't round to 1 or 3.
+fn waitNs(ep: i32, events: []linux.epoll_event, ns: i64) usize {
+    const ts: linux.timespec = .{ .sec = @divTrunc(ns, std.time.ns_per_s), .nsec = @rem(ns, std.time.ns_per_s) };
+    return linux.syscall6(.epoll_pwait2, @as(u32, @bitCast(ep)), @intFromPtr(events.ptr), events.len, @intFromPtr(&ts), 0, linux.NSIG / 8);
+}
+
 /// The worker's loop, from pgengine_http_main once it has joined the database. `launcher` is the Unix
 /// socket path pgserve's launcher listens on.
 export fn engine_http_serve(launcher: [*:0]const u8) callconv(.c) void {
@@ -935,6 +1094,17 @@ export fn engine_http_serve(launcher: [*:0]const u8) callconv(.c) void {
     var fields = std.mem.splitScalar(u8, body.items, 0);
     jwt.init(fields.first());
     while (fields.next()) |setting| knob(setting);
+    // with neither the clock nor the stats on, no turn reads the clock (a syscall where the vDSO can't read it)
+    const timed = clock.dwell_ns > 0 or stats.every_ns > 0;
+    var mono: i64 = if (timed) monoNs() else 0;
+    stats.from = mono;
+    {
+        var line: [128:0]u8 = @splat(0);
+        _ = std.fmt.bufPrint(line[0 .. line.len - 1], "pgengine http: dwell {d} us, cap {d}, min {d}, stats every {d} s", .{
+            @divTrunc(clock.dwell_ns, std.time.ns_per_us), clock.cap, clock.min, @divTrunc(stats.every_ns, std.time.ns_per_s),
+        }) catch {};
+        c.shim_log(&line);
+    }
     startHashers();
     conns = gpa.alloc(?*Conn, MAX_FDS) catch @panic("out of memory");
     @memset(conns, null);
@@ -950,9 +1120,14 @@ export fn engine_http_serve(launcher: [*:0]const u8) callconv(.c) void {
     while (true) {
         c.shim_check_interrupts();
         const busy = carry.items.len > 0 or t.pending();
-        const rc = linux.epoll_wait(ep, &events, events.len, if (busy) 0 else 1000);
+        // a held turn sleeps until its deadline, unless an answer is waiting to go out
+        const rc = if (carry.items.len == 0 and t.pending() and clock.due(&t, mono) == null)
+            waitNs(ep, &events, clock.deadline(&t) - mono)
+        else
+            linux.epoll_wait(ep, &events, events.len, if (busy) 0 else 1000);
         const got: usize = if (linux.errno(rc) == .SUCCESS) rc else 0;
         const now = wallSeconds();
+        if (timed) mono = monoNs();
         std.mem.swap(std.ArrayListUnmanaged(*Conn), &t.touched, &carry);
         carry.clearRetainingCapacity();
         for (events[0..got]) |ev| {
@@ -979,39 +1154,56 @@ export fn engine_http_serve(launcher: [*:0]const u8) callconv(.c) void {
                 received(conn, now, &t);
             touch(conn, &t.touched);
         }
-        // writes first, in one transaction, so the reads that answer them see them
-        if (t.writes.items.len > 0) {
-            c.shim_write_begin();
-            for (t.writes.items) |r| c.shim_write(&r.w);
-            // before the commit: the rows' texts live in SPI memory until then
-            for (t.writes.items) |r| written(r, &t);
-            c.shim_write_end();
-            t.writes.clearRetainingCapacity();
-        }
-        var any = false;
-        for (t.reads) |l| any = any or l.items.len > 0;
-        if (any) {
-            var snap = c.shim_http_begin();
-            for (&t.reads, 0..) |*l, k| if (l.items.len > 0) {
-                if (!runReads(@intCast(k), l.items, snap)) snap = c.shim_http_begin();
-                l.clearRetainingCapacity();
-            };
-            c.shim_http_end();
-        }
+        t.date(mono);
+        if (t.pending()) if (clock.due(&t, mono)) |why| {
+            const n = t.n;
+            stats.fires.getPtr(why).* += 1;
+            stats.waited_ns += @intCast(mono - t.since.?);
+            t.touchAll();
+            // writes first, in one transaction, so the reads that answer them see them
+            if (t.writes.items.len > 0) {
+                stats.writes.add(t.writes.items.len);
+                c.shim_write_begin();
+                for (t.writes.items) |r| c.shim_write(&r.w);
+                // before the commit: the rows' texts live in SPI memory until then
+                for (t.writes.items) |r| written(r, &t);
+                c.shim_write_end();
+                t.writes.clearRetainingCapacity();
+            }
+            var any = false;
+            for (t.reads) |l| any = any or l.items.len > 0;
+            if (any) {
+                var snap = c.shim_http_begin();
+                for (&t.reads, &stats.reads, 0..) |*l, *h, k| if (l.items.len > 0) {
+                    h.add(l.items.len);
+                    if (!runReads(@intCast(k), l.items, snap)) snap = c.shim_http_begin();
+                    l.clearRetainingCapacity();
+                };
+                c.shim_http_end();
+            }
+            t.n = 0;
+            t.since = null;
+            clock.fired(n);
+        };
         for (t.touched.items) |conn| {
             conn.touched = false;
             if (!conn.closed and !flush(ep, conn)) conn.closed = true;
             if (!conn.keep_alive and conn.req == null and conn.out.len == 0) conn.closed = true;
             if (conn.closed) {
+                if (conn.req) |r| t.drop(r);
                 close(conn);
                 continue;
             }
             // its next request may be in the buffer already; an answer to it goes out next turn
             pump(conn, now, &t);
             if (conn.ans.len > 0) stash(conn);
-            const queued = if (conn.req) |r| r.stage != .hash else false;
             // a connection waiting for EPOLLOUT is woken by it; carrying it would spin the loop at timeout 0
-            if (queued or (conn.out.len > 0 and !conn.waiting)) touch(conn, &carry);
+            if (conn.out.len > 0 and !conn.waiting) touch(conn, &carry);
+        }
+        t.date(mono);
+        if (stats.every_ns > 0 and mono - stats.from >= stats.every_ns) {
+            stats.log(mono);
+            stats = .{ .from = mono, .every_ns = stats.every_ns };
         }
         // one turn of unusually large answers must not stay allocated for the worker's life
         if (answers.capacity > answers_keep) answers.clearAndFree(gpa) else answers.clearRetainingCapacity();
@@ -1082,6 +1274,8 @@ const Pair = struct {
         respond(&p.conn, .ok, "{\"tags\":[]}");
         finish(p.conn.req.?);
         for (&p.t.reads) |*l| l.clearRetainingCapacity();
+        p.t.n = 0;
+        p.t.since = null;
     }
 };
 
@@ -1160,4 +1354,65 @@ test "an answer the socket can't take at once is kept until it is sent, then fre
     const head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1048576\r\n\r\n";
     try testing.expectEqualStrings(head, got.items[0..head.len]);
     try testing.expect(std.mem.eql(u8, body, got.items[head.len..]));
+}
+
+test "a held turn runs at its deadline or at its cap; a dwell of 0 or a cold clock runs it at once" {
+    var p = try Pair.init();
+    defer p.deinit();
+    var k: Clock = .{ .dwell_ns = 10 * std.time.ns_per_ms, .cap = 2 };
+    try p.send("GET /api/tags HTTP/1.1\r\n\r\n");
+    received(&p.conn, 0, &p.t);
+    p.t.date(1000);
+    try testing.expectEqual(.now, k.due(&p.t, 1000).?);
+    k.fired(1);
+    try testing.expectEqual(.now, k.due(&p.t, 1000).?);
+    k.fired(2);
+    try testing.expectEqual(null, k.due(&p.t, 1000));
+    try testing.expectEqual(null, k.due(&p.t, 1000 + 10 * std.time.ns_per_ms - 1));
+    try testing.expectEqual(.deadline, k.due(&p.t, 1000 + 10 * std.time.ns_per_ms).?);
+    p.t.n = 2;
+    try testing.expectEqual(.cap, k.due(&p.t, 1000).?);
+    p.t.n = 1;
+    k.dwell_ns = 0;
+    try testing.expectEqual(.now, k.due(&p.t, 1000).?);
+    p.answerTags();
+}
+
+test "a connection that closes while its turn is held takes its request off the turn" {
+    var a = try Pair.init();
+    defer a.deinit();
+    var b = try Pair.init();
+    defer b.deinit();
+    try a.send("GET /api/tags HTTP/1.1\r\n\r\n");
+    try b.send("GET /api/tags HTTP/1.1\r\n\r\n");
+    received(&a.conn, 0, &a.t);
+    received(&b.conn, 0, &a.t);
+    a.t.date(5);
+    const tags = &a.t.reads[@intCast(c.EP_TAGS)];
+    try testing.expectEqual(2, a.t.n);
+    a.t.drop(a.conn.req.?);
+    destroy(a.conn.req.?);
+    a.conn.req = null;
+    try testing.expectEqual(1, a.t.n);
+    try testing.expectEqual(5, a.t.since.?);
+    try testing.expectEqual(&b.conn, tags.items[0].conn);
+    a.t.drop(b.conn.req.?);
+    destroy(b.conn.req.?);
+    b.conn.req = null;
+    try testing.expectEqual(0, a.t.n);
+    try testing.expectEqual(null, a.t.since);
+    try testing.expectEqual(0, tags.items.len);
+}
+
+test "batch sizes by batch and by request" {
+    var h: Hist = .{};
+    for (0..9) |_| h.add(1);
+    h.add(100);
+    try testing.expectEqual(10, h.count());
+    try testing.expectEqual(109, h.reqs);
+    try testing.expectEqual(1, h.quantile(0.5, false));
+    try testing.expectEqual(1, h.quantile(0.9, false));
+    // 100 lands in the 64-127 bucket: by request, most requests were served in it
+    try testing.expectEqual(64, h.quantile(0.5, true));
+    try testing.expectEqual(Hist.bucket(1 << 20), Hist.bucket(1 << 15));
 }

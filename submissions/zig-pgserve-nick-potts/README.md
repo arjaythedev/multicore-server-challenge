@@ -45,6 +45,9 @@ DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit \
   `pgengine`).
 - `PGSERVE_HASH_NICE=N` (off by default) runs the bcrypt threads at nice `N`.
 - `PGSERVE_THIN_TO=1` (off by default) sets `TCP_THIN_LINEAR_TIMEOUTS` on every accepted connection.
+- `PGSERVE_DWELL_US=N` (0, off, by default; at most 50,000) turns on a batch clock, with `PGSERVE_DWELL_CAP`
+  (default 256) and `PGSERVE_DWELL_MIN` (default 2). `PGSERVE_STATS_S=N` (off by default) logs each worker's batch
+  sizes every `N` seconds. Both are under "How a request is served".
 - `GET /api/tags` answered 5.6-8.6 s after a cold Postgres restart in our runs. Most of that is bcrypt's
   self-test and calibration.
 
@@ -107,7 +110,9 @@ holds the port and nothing else.
    (below), and connects to the launcher's socket.
 5. For each worker the launcher binds `HOST:PORT` with `SO_REUSEPORT` (backlog 65,535, `TCP_NODELAY` on the
    listener; an IPv6 `HOST` such as `::` gets a dual-stack socket). It passes that listening socket over the
-   Unix socket with `SCM_RIGHTS`, and `JWT_SECRET` as the message body. It only deals with peers whose UID owns
+   Unix socket with `SCM_RIGHTS`, with `JWT_SECRET` and then each optional `PGSERVE_` setting that is set (as
+   NUL-separated `NAME=value`) as the message body. Postgres starts the workers with its own environment, not the
+   launcher's, so this is the only way a setting reaches them. It only deals with peers whose UID owns
    `/var/run/postgresql`, which means Postgres's own processes. A worker that hasn't collected its socket
    within 30 s fails the start.
 6. The launcher sleeps. On `SIGTERM` it ends the workers with `pg_terminate_backend`, which a role may do to
@@ -137,8 +142,22 @@ Each worker is one thread running an epoll loop, plus one bcrypt thread. Each tu
    starts. Nothing is kept from one turn to the next (rule 5).
 4. **Answer.** Every answer of the turn was built back to back in one buffer. Each goes out in one `write`.
 
-There is no batch clock: a batch is whatever arrived during one turn. At low load that's one request, and
-under load it grows by itself.
+By default there is no batch clock: a batch is whatever arrived during one turn. At low load that's one
+request, and under load it grows by itself.
+
+`PGSERVE_DWELL_US` turns on a batch clock, an experiment that is off by default. A turn is then held: the worker
+keeps reading sockets, answering what needs no data and queueing reads and writes, but runs the turn's writes and
+reads (steps 2 and 3) only once its oldest queued request has waited `PGSERVE_DWELL_US` µs or it holds
+`PGSERVE_DWELL_CAP` requests. A held worker sleeps in `epoll_pwait2` until that deadline, so the clock costs no
+spinning. Writes are still answered only after their commit, and requests still share work only inside one
+batch. The clock stays off after a batch smaller than `PGSERVE_DWELL_MIN`, so at light load a lone request runs
+at once instead of waiting for company. The dwell is capped at 50 ms.
+
+`PGSERVE_STATS_S` logs one line per worker every that many seconds (`pgserve stats ...` in the Postgres log): how
+many turns ran and why (`now`: clock off or cold; `deadline`; `cap`), how long a turn's oldest request waited,
+and for the writes and each endpoint the batches, requests and batch sizes (`p50`/`p90` over batches,
+`rp50`/`rp90` over requests, the batch a request was served in). The counters are always kept; only the line is
+optional.
 
 Errors:
 
@@ -485,7 +504,8 @@ and logins used #7's statements.
 | engine, one per drain, 5 / 20 / 50 ms | 41.8 / 36.3 / 33.4 | 14.1 / 40.8 / 81.1 ms | 0.235 / 0.199 / 0.209 | 0.158 / 0.140 / 0.128 |
 
 So in the replay the engine costs 0.19-0.31 of #7's Postgres CPU per request, depending on the clock. These are
-replay figures, not pgserve's. pgserve has no clock and no wire, so its batches are whatever one turn holds. Note
+replay figures, not pgserve's. pgserve has no wire, and by default no clock, so its batches are whatever one
+turn holds. Note
 also that instructions fall 6-8x while CPU falls 3-5x: the engine retires about 0.4-0.55 instructions per cycle, because
 it spends its time waiting on memory. That is why the last third of the work went to cache misses.
 
@@ -706,8 +726,9 @@ Small regressions we accepted for larger gains elsewhere:
   moved (10/10).
 - **Session locks:** 11/11 cases for abort, reload and exit.
 - **HTTP worker unit tests:** these drive the real loop over a socket pair. They cover a request split across
-  two reads, two pipelined requests in one read, a 400 with `Connection: close`, and a 1 MB answer sent over
-  several writes.
+  two reads, two pipelined requests in one read, a 400 with `Connection: close`, a 1 MB answer sent over
+  several writes, when a held turn runs, a connection that closes while its turn is held, and the batch-size
+  histogram.
 
 The oracle, stress and soak harnesses drive the engine through its marker form against a scratch database.
 They aren't part of this folder, and neither are the Postgres stubs the unit tests link against. The batch counter test is, with the marker encoder it needs
@@ -757,7 +778,7 @@ launcher.c and the engine are the same in both paths.
   against and what its per-batch sharing imitates. Its Openwall bcrypt kernel is what our lanes engine was
   measured against.
 - PR #47's two-phase gather is the shape of the shared read queue and batch clock that the replay scored the
-  engine under.
+  engine under, and of pgserve's optional batch clock.
 - #7, #10 and #52 hold no buffers for idle connections. We arrived at the same place later.
 - The vendored HTTP, JWT and bcrypt code carries our Zig entry's credits:
   - #11 and #15 for reading the JWT claims in one pass;

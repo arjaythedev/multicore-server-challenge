@@ -74,6 +74,8 @@ void shim_check_interrupts(void); /* (untranslatable: CHECK_FOR_INTERRUPTS) */
 /* ---- error reporting (longjmp): raise a Postgres ERROR from Zig ---- */
 void shim_ereport_str(const char *msg) __attribute__((noreturn)); /* (longjmp) */
 void shim_ereport_schema(const char *reason) __attribute__((noreturn)); /* (longjmp) */
+/* a LOG line in the server log */
+void shim_log(const char *msg);
 
 /* ---- per-query memory (palloc in the current context; reclaimed on abort) ---- */
 void *shim_palloc(uint64_t size); /* (magic: MemoryContext current) */
