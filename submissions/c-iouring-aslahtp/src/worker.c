@@ -623,7 +623,8 @@ static void on_eventfd(struct worker *w, struct io_uring_cqe *cqe) {
     struct req *r = bcrypt_pool_take_done(w->bp);
     while (r) {
         struct req *next = r->next;
-        r->fn(r, EV_HASHED, NULL);
+        if (r->bc.stale) req_error(r, 503, "server busy, try again");
+        else r->fn(r, EV_HASHED, NULL);
         r = next;
     }
     arm_eventfd(w);

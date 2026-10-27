@@ -43,7 +43,9 @@ enum { BC_VERIFY = 1, BC_HASH };
 struct bc_job {
     uint8_t kind;
     bool ok;
+    bool stale;            /* waited too long: answered 503, not hashed */
     uint8_t pwlen;
+    int64_t t_us;          /* when it was queued (CLOCK_MONOTONIC) */
     char pw[BCRYPT_MAX_PW];
     char hash[BCRYPT_LEN + 1];  /* VERIFY: the stored hash; HASH: the result */
 };
@@ -140,7 +142,10 @@ struct req *bcrypt_pool_take_done(struct bcrypt_pool *bp);
 struct config {
     struct pg_url pg;
     const char *host, *port;
-    int workers, read_conns, write_conns, bcrypt_threads;  /* read_conns: the drain's, for the box */
+    int workers, read_conns, write_conns, bcrypt_threads;
+    int bcrypt_wait_ms;
+    int bcrypt_batch;      /* most jobs per kernel run (1: one hash at a time) */    /* how long a lone hash job waits for others to share its kernel run */
+    int bcrypt_nice;  /* read_conns: the drain's, for the box */
     uint32_t pg_pipeline;  /* units in flight per Postgres read connection */
     uint32_t write_group;  /* most writes committed by one Sync */
     uint32_t plan_max;     /* most planned reads in one plan */

@@ -235,6 +235,22 @@ static void test_bcrypt(void) {
     for (size_t i = 0; i < ARRAY_LEN(malformed); i++)
         CHECK(!bcrypt_verify(LIT("password123"), malformed[i], strlen(malformed[i])), "malformed hash %zu", i);
     CHECK(!bcrypt_verify("x", 73, bcrypt_vecs[0].hash, strlen(bcrypt_vecs[0].hash)), "73-byte password refused");
+
+    /* The interleaved kernels against the reference, every batch size, lanes of different passwords and salts. */
+    struct bcrypt_lane in[BCRYPT_LANES_MAX + 3];
+    struct bcrypt_setting set[BCRYPT_LANES_MAX + 3];
+    uint8_t ref[BCRYPT_LANES_MAX + 3][BCRYPT_RAW], got[BCRYPT_LANES_MAX + 3][BCRYPT_RAW];
+    for (int k = 0; k < BCRYPT_LANES_MAX + 3; k++) {
+        const struct bcrypt_vec *v = &bcrypt_vecs[(size_t)k % ARRAY_LEN(bcrypt_vecs)];
+        bcrypt_parse(v->hash, strlen(v->hash), &set[k]);
+        in[k] = (struct bcrypt_lane){v->pw, v->pwlen, set[k].salt};
+        bcrypt_raw(v->pw, v->pwlen, set[k].salt, 4, ref[k]);
+    }
+    for (int n = 1; n <= BCRYPT_LANES_MAX + 3; n++) {
+        memset(got, 0, sizeof got);
+        bcrypt_raw_lanes(in, n, 4, got);
+        CHECK(memcmp(got, ref, (size_t)n * BCRYPT_RAW) == 0, "bcrypt lanes, batch of %d", n);
+    }
 }
 
 static void test_util(void) {

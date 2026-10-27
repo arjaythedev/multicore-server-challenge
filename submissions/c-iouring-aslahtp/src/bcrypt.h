@@ -23,6 +23,15 @@ bool bcrypt_parse(const char *h, size_t n, struct bcrypt_setting *s);
 /* The core: 2^cost rounds of the expensive key schedule, then 64 encryptions of "OrpheanBeholderScryDoubt". */
 void bcrypt_raw(const char *pw, size_t pwlen, const uint8_t salt[BCRYPT_SALT], int cost, uint8_t out[BCRYPT_RAW]);
 
+/* The same for several hashes of one cost at once (bcrypt_lanes.c): out[i] is bcrypt_raw of in[i]. */
+#define BCRYPT_LANES_MAX 8
+struct bcrypt_lane {
+    const char *pw;
+    size_t pwlen;
+    const uint8_t *salt;
+};
+void bcrypt_raw_lanes(const struct bcrypt_lane *in, int n, int cost, uint8_t (*out)[BCRYPT_RAW]);
+
 /* Formats "$2a$CC$<salt><hash>" (60 characters, NUL-terminated). */
 void bcrypt_hash(const char *pw, size_t pwlen, int cost, const uint8_t salt[BCRYPT_SALT], char out[BCRYPT_LEN + 1]);
 
