@@ -9,7 +9,8 @@
 //! Byte layout of one Article (SPEC key order, the reference server's):
 //!   head   {"slug":..,"title":..,"description":..[,"body":..],"tagList":[..],"createdAt":..,"updatedAt":..
 //!   flag   ,"favorited":true|false
-//!   mid    ,"favoritesCount":N,"author":{"username":..,"bio":..,"image":..
+//!   count  ,"favoritesCount":N
+//!   mid    ,"author":{"username":..,"bio":..,"image":..
 //!   flag   ,"following":true|false
 //!   tail   }}
 
@@ -35,6 +36,8 @@ pub const Shared = struct {
     author_id: i64,
     head: []const u8,
     mid: []const u8,
+    /// Visible favorites, counted under the execution's snapshot (Memo.fill counts a batch's together).
+    count: i64,
 };
 
 /// A tag's name as stored (its sort key), whether it is plain (collate.zig), and the name as JSON.
@@ -237,6 +240,8 @@ pub const PageFlags = struct {
 pub fn write(buf: *J.Buf, a: *const Shared, f: Flags) void {
     buf.raw(a.head);
     buf.raw(if (f.favorited) ",\"favorited\":true" else ",\"favorited\":false");
+    buf.raw(",\"favoritesCount\":");
+    buf.int(a.count);
     buf.raw(a.mid);
     buf.raw(if (f.following) ",\"following\":true}}" else ",\"following\":false}}");
 }
@@ -304,36 +309,57 @@ pub const Memo = struct {
         fav_leaf: u32 = undefined,
         part: ?Part = null,
         author: *?[]const u8 = undefined,
+
+        fn before(_: void, a: Pending, b: Pending) bool {
+            return a.id < b.id;
+        }
     };
 
     /// Reads every article of `ids` the memo lacks, as get, or getAt where `tids` (empty, or one per id)
-    /// gives its heap pointer, would read it, but staged over up to 64 articles at a time: first every
-    /// index leaf they need is found (Bt.leafOf: at_pkey's for the tags, fav_article's for the count,
-    /// articles_pkey's where there is no heap pointer) and their rows requested, then the rows read and
-    /// each new author's users_pkey leaf found, then the authors read and the fragments written. Each
-    /// stage's pages load together instead of one after another.
+    /// gives its heap pointer, would read it, but in id order and staged over up to 64 articles at a time:
+    /// first every index leaf they need is found (Bt.leafOf: at_pkey's for the tags, fav_article's for the
+    /// count, articles_pkey's where there is no heap pointer) and their rows requested, then the rows read
+    /// and each new author's users_pkey leaf found, then the authors read and the fragments written. Each
+    /// stage's pages load together instead of one after another. The favorites are counted by one
+    /// Bt.Counter over the whole batch: in id order its counts move through fav_article's leaves left to
+    /// right, mostly without descents, and the heap blocks they owe are each visited once at the end.
     pub fn fill(self: *Memo, r: *R.Rels, snap: pg.Snapshot, ids: []const i64, tids: []const c.ItemPointerData) void {
-        var ps: [64]Pending = undefined;
-        var i: usize = 0;
-        while (i < ids.len) {
-            c.shim_check_interrupts();
-            self.map.reserve(ps.len);
-            var n: usize = 0;
-            while (i < ids.len and n < ps.len) : (i += 1) {
-                const e = self.map.claim(ids[i]);
-                if (e.hit) continue;
-                ps[n] = .{ .slot = e.v, .id = ids[i], .tid = if (tids.len > 0) tids[i] else no_tid };
-                n += 1;
-            }
-            self.stage(r, snap, ps[0..n]);
+        self.map.reserve(ids.len); // no claim below moves a slot: each pending article keeps a pointer to its own
+        const ps = A.alloc(Pending, ids.len);
+        var n: usize = 0;
+        for (ids, 0..) |id, i| {
+            const e = self.map.claim(id);
+            if (e.hit) continue;
+            ps[n] = .{ .slot = e.v, .id = id, .tid = if (tids.len > 0) tids[i] else no_tid };
+            n += 1;
         }
+        const all = ps[0..n];
+        std.sort.pdq(Pending, all, {}, Pending.before);
+        var ctr = Bt.Counter(i64).init(&r.favorites, &r.fav_article, snap, n);
+        var i: usize = 0;
+        while (i < all.len) : (i += 64) {
+            c.shim_check_interrupts();
+            self.stage(r, snap, all[i..@min(all.len, i + 64)], &ctr, i);
+        }
+        ctr.drain();
+        for (all, ctr.out) |p, count| if (p.slot.*) |*a| {
+            a.count = count;
+        };
     }
 
-    fn stage(self: *Memo, r: *R.Rels, snap: pg.Snapshot, ps: []Pending) void {
+    /// One stage of fill: `ps` in id order, counted into `ctr` from slot `base` on.
+    fn stage(self: *Memo, r: *R.Rels, snap: pg.Snapshot, ps: []Pending, ctr: *Bt.Counter(i64), base: usize) void {
+        // in id order, a key within the last leaf's bound (Bt.Span) starts on that leaf without a descent
+        var at: ?Bt.Span = null;
+        var fav = ctr.last;
         for (ps) |*p| {
             if (pg.tidBlock(&p.tid) == c.InvalidBlockNumber) p.art_leaf = Bt.leafOf(&r.articles_pkey, r.articles.rel, i64, p.id);
-            p.at_leaf = Bt.leafOf(&r.at_pkey, r.article_tags.rel, i64, p.id);
-            p.fav_leaf = Bt.leafOf(&r.fav_article, r.favorites.rel, i64, p.id);
+            if (at == null or p.id > at.?.hi) at = Bt.leafSpan(&r.at_pkey, r.article_tags.rel, i64, p.id);
+            p.at_leaf = at.?.blk;
+            if (fav == null or p.id > fav.?.hi) {
+                fav = Bt.leafSpan(&r.fav_article, r.favorites.rel, i64, p.id);
+            }
+            p.fav_leaf = fav.?.blk;
         }
         pg.prefetchRows(r.articles.rel, ps);
         for (0..Bt.AIM_STEPS) |s| for (ps) |*p| {
@@ -364,19 +390,22 @@ pub const Memo = struct {
 
         for (0..Bt.AIM_STEPS) |s| for (authors[0..na]) |a| Bt.aim(&r.users_pkey, a.leaf, i64, a.id, @intCast(s));
         for (authors[0..na]) |a| a.slot.* = Authors.read(r, snap, a.id, a.leaf);
-        for (ps) |*p| {
+        for (ps, base..) |*p, slot| {
             const part = &(p.part orelse continue);
             self.writeTags(&part.head, r, snap, p.id, p.at_leaf);
-            p.slot.* = finish(r, snap, part, p.author.*, p.fav_leaf);
+            p.slot.* = finish(part, p.author.*, 0);
+            if (p.slot.* == null) continue;
+            ctr.add(p.id, p.fav_leaf, slot);
         }
     }
 
-    /// Writes the fragments of the article just read into r.articles. null if the author is gone
-    /// (unreachable under one snapshot by the FK).
+    /// Writes the fragments of the article just read into r.articles, its favorites counted at once. null
+    /// if the author is gone (unreachable under one snapshot by the FK).
     fn fromRow(self: *Memo, r: *R.Rels, snap: pg.Snapshot) ?Shared {
         var part = self.begin(r);
         self.writeTags(&part.head, r, snap, part.id, null);
-        return finish(r, snap, &part, self.authors.get(r, snap, part.author_id), null);
+        const count = Bt.countAt(&r.favorites, &r.fav_article, snap, i64, part.id, std.math.maxInt(i64), null);
+        return finish(&part, self.authors.get(r, snap, part.author_id), count);
     }
 
     /// An article's head up to its tag list, and the columns the rest of its fragments need.
@@ -408,19 +437,15 @@ pub const Memo = struct {
     }
 
     /// The fragments of `part`, its tag list written, given its author's fragment (null: the author is not
-    /// visible, and neither is the article), its fav_article count starting at `fav_leaf` unless it is null.
-    fn finish(r: *R.Rels, snap: pg.Snapshot, part: *Part, author: ?[]const u8, fav_leaf: anytype) ?Shared {
+    /// visible, and neither is the article) and its favorites count (0 until fill's counter sets it).
+    fn finish(part: *Part, author: ?[]const u8, count: i64) ?Shared {
         part.head.raw(",\"createdAt\":");
         J.writeTimestamp(&part.head, part.created);
         part.head.raw(",\"updatedAt\":");
         J.writeTimestamp(&part.head, part.updated);
 
         const au = author orelse return null;
-        var mid = J.Buf.init(au.len + 32);
-        mid.raw(",\"favoritesCount\":");
-        mid.int(Bt.countAt(&r.favorites, &r.fav_article, snap, i64, part.id, std.math.maxInt(i64), fav_leaf));
-        mid.raw(au);
-        return .{ .id = part.id, .author_id = part.author_id, .head = part.head.slice(), .mid = mid.slice() };
+        return .{ .id = part.id, .author_id = part.author_id, .head = part.head.slice(), .mid = au, .count = count };
     }
 
     /// `"tagList":[...]`, names sorted with varstr_cmp under tags.name's collation (what ORDER BY t.name

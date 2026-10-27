@@ -57,7 +57,7 @@ pub fn run(x: *c.EngineExec, r: *R.Rels, snap: pg.Snapshot) void {
             x.out[i] = .{ .status = c.ST_NOT_FOUND, .body = 0 };
             continue;
         });
-        var buf = J.Buf.initBytea(a.head.len + a.mid.len + 64);
+        var buf = J.Buf.initBytea(a.head.len + a.mid.len + 96);
         buf.raw("{\"article\":");
         E.write(&buf, a, E.flagsAt(r, snap, @bitCast(viewers.values[i]), a, leaves[i]));
         buf.byte('}');

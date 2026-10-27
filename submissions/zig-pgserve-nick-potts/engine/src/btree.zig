@@ -19,6 +19,7 @@ const std = @import("std");
 const c = @import("pg_c");
 const pg = @import("pg.zig");
 const Coll = @import("collate.zig");
+const A = @import("alloc.zig");
 
 const HEADER = 24; // SizeOfPageHeaderData; the line pointers follow
 const PD_LOWER = 12;
@@ -433,7 +434,9 @@ fn unlockPage(idx: *pg.Index, h: Held) void {
 /// page is being deleted), go down to `down`, stop at this leaf, or nothing (a page being deleted with no
 /// right sibling, which a locked read reports as an error).
 const Step = union(enum) { right: u32, down: Down, leaf, stuck };
-const Down = struct { blk: u32, leaf: bool };
+/// `hi`: for a forward descent with an integer key to a leaf, an upper bound of the leaf's keys as its
+/// parent gave it (childHigh); no bound (minInt) otherwise.
+const Down = struct { blk: u32, leaf: bool, hi: i64 = std.math.minInt(i64) };
 
 /// The descent's step at `page`, as _bt_search takes it: right while `key` is past the high key
 /// (backward, while it is not below it), then the child left of the first pivot >= key (backward, > key).
@@ -447,7 +450,24 @@ inline fn stepAt(page: anytype, comptime K: type, key: ?K, comptime dir: Dir) St
     if (page.leaf()) return .leaf;
     const fk = page.firstKey();
     const child = if (!keyed) (if (back) page.maxOff() else fk) else if (back) page.upperBound(fk + 1, K, key.?) - 1 else page.lowerBound(fk + 1, K, key.?) - 1;
-    return .{ .down = .{ .blk = page.tuple(child).block(), .leaf = page.opq().btpo_level == 1 } };
+    const to_leaf = page.opq().btpo_level == 1;
+    const hi = if (comptime intKey(K) and !back) (if (to_leaf and keyed) childHigh(page, K, child) else std.math.minInt(i64)) else std.math.minInt(i64);
+    return .{ .down = .{ .blk = page.tuple(child).block(), .leaf = to_leaf, .hi = hi } };
+}
+
+/// Whether K is a single integer column, whose first value lead reads and Span bounds.
+fn intKey(comptime K: type) bool {
+    return K == i64 or K == i32;
+}
+
+/// An upper bound of the keys on the child at item `child` of internal `page`: the next downlink's key,
+/// which was the child's high key when the two split (a split since leaves the child's high key below it,
+/// and a walk landing there moves right); the page's own high key for its last child; none for the last
+/// child of the rightmost page.
+inline fn childHigh(page: anytype, comptime K: type, child: u16) i64 {
+    if (child < page.maxOff()) return lead(K, page.tuple(child + 1));
+    if (!page.rightmost()) return lead(K, page.tuple(1));
+    return std.math.maxInt(i64);
 }
 
 /// Runs `r.read(page)` on pinned page `buf` without its content lock and says whether what it read can be
@@ -505,7 +525,7 @@ fn StepRead(comptime K: type, comptime dir: Dir) type {
 fn descend(idx: *pg.Index, heap: pg.Relation, comptime K: type, key: ?K, comptime dir: Dir) c.Buffer {
     return switch (descendTo(idx, heap, K, key, dir)) {
         .empty => c.InvalidBuffer,
-        .leaf => |blk| pinLeaf(idx, blk),
+        .leaf => |span| pinLeaf(idx, span.blk),
         .root => |buf| buf,
     };
 }
@@ -530,7 +550,13 @@ fn keepLeaf(idx: *pg.Index, buf: c.Buffer) void {
 
 /// Where a descent ends: the leaf it lands on, not yet pinned; the root, pinned, when the root is the only
 /// level; nothing, in an empty index.
-const Landing = union(enum) { empty, leaf: u32, root: c.Buffer };
+const Landing = union(enum) { empty, leaf: Span, root: c.Buffer };
+
+/// A leaf and an upper bound of the keys on it, as a descent's last step saw them (leafSpan) or as a
+/// count that ended there read them (Counted). A walk for a key up to `hi`, made after one for a lower
+/// key that started on or passed `blk`, may start on `blk` without a descent: entries left of it are
+/// below the lower key, and a split since only moves entries right, where the walk follows them.
+pub const Span = struct { blk: u32, hi: i64 };
 
 /// The leaf a forward descent for `key` lands on, as descend finds it, not pinned, with the lines its reader
 /// needs first requested (pg.prefetchIndexPage). Walks of several keys known in advance descend for all of
@@ -539,16 +565,22 @@ const Landing = union(enum) { empty, leaf: u32, root: c.Buffer };
 /// walk from it takes the descent's last step there, moving right past any split since, and a page deleted
 /// meanwhile is not recycled while the execution's snapshot holds back the oldest xmin.
 pub fn leafOf(idx: *pg.Index, heap: pg.Relation, comptime K: type, key: K) u32 {
+    return leafSpan(idx, heap, K, key).blk;
+}
+
+/// leafOf's leaf with the bound its parent gave it (Down.hi): every key up to it starts on this leaf. An
+/// empty index spans every key (InvalidBlockNumber, where a count is 0); the root as the only leaf too.
+pub fn leafSpan(idx: *pg.Index, heap: pg.Relation, comptime K: type, key: K) Span {
     switch (descendTo(idx, heap, K, key, .forward)) {
-        .empty => return c.InvalidBlockNumber,
-        .leaf => |blk| {
-            pg.prefetchIndexPage(idx.rel, blk);
-            return blk;
+        .empty => return .{ .blk = c.InvalidBlockNumber, .hi = std.math.maxInt(i64) },
+        .leaf => |span| {
+            pg.prefetchIndexPage(idx.rel, span.blk);
+            return span;
         },
         .root => |buf| {
             const blk = c.BufferGetBlockNumber(buf);
             c.ReleaseBuffer(buf);
-            return blk;
+            return .{ .blk = blk, .hi = std.math.maxInt(i64) };
         },
     }
 }
@@ -580,7 +612,7 @@ fn descendTo(idx: *pg.Index, heap: pg.Relation, comptime K: type, key: ?K, compt
             .leaf => return .{ .root = h.buf }, // never a kept pin: keep takes no leaf
             .right => |n| blk = n,
             .down => |d| {
-                if (d.leaf) return .{ .leaf = d.blk };
+                if (d.leaf) return .{ .leaf = .{ .blk = d.blk, .hi = d.hi } };
                 blk = d.blk;
             },
             .stuck => pg.ereport("btree walk fell off the end of an index"),
@@ -888,10 +920,32 @@ pub fn count(tbl: *pg.Table, idx: *pg.Index, snap: pg.Snapshot, comptime K: type
 
 /// count, starting from leaf `start` (leafOf's, for `key`, in this execution) unless it is null.
 pub fn countAt(tbl: *pg.Table, idx: *pg.Index, snap: pg.Snapshot, comptime K: type, key: ?K, cap: i64, start: anytype) i64 {
+    var now: Now = .{ .tbl = tbl, .snap = snap };
+    return countWith(tbl, idx, K, key, cap, start, &now).n;
+}
+
+/// countAt's sink: the entries a leaf page owes the heap are checked as the page is left.
+const Now = struct {
+    tbl: *pg.Table,
+    snap: pg.Snapshot,
+
+    fn rest(self: *Now, es: []const Entry(void)) i64 {
+        return countOffVisible(self.tbl, self.snap, es);
+    }
+};
+
+/// Where a count ended: its tally, and the leaf it ended on with that leaf's high key (an integer key's
+/// first column; no leaf, or no bound, when the count ended on a page being deleted or the key is not an
+/// integer), a Span a count of a greater key may start from.
+pub const Counted = struct { n: i64, leaf: u32 = c.InvalidBlockNumber, hi: i64 = std.math.minInt(i64) };
+
+/// countAt, with the entries on heap blocks not all-visible handed to `sink.rest` as each leaf is left,
+/// which returns how many of them count now (countOffVisible, or none when the sink keeps them).
+fn countWith(tbl: *pg.Table, idx: *pg.Index, comptime K: type, key: ?K, cap: i64, start: anytype, sink: anytype) Counted {
     var buf = if (@TypeOf(start) == @TypeOf(null))
         descend(idx, tbl.rel, K, key, .forward)
-    else if (start == c.InvalidBlockNumber) return 0 else pinLeaf(idx, start);
-    if (buf == c.InvalidBuffer) return 0;
+    else if (start == c.InvalidBlockNumber) return .{ .n = 0 } else pinLeaf(idx, start);
+    if (buf == c.InvalidBuffer) return .{ .n = 0 };
     var rest: [MAX_TIDS]Entry(void) = undefined;
     var ta: Tally = .{ .tbl = tbl, .cap = cap, .rest = &rest };
     var landing = true;
@@ -907,16 +961,17 @@ pub fn countAt(tbl: *pg.Table, idx: *pg.Index, snap: pg.Snapshot, comptime K: ty
             },
             .end => {
                 keepLeaf(idx, buf);
-                return ta.n;
+                return .{ .n = ta.n };
             },
             .stuck => unreachable,
         }
         // a count reads its range to the end (or the cap): the next leaf loads while this one's heap checks run
         if (!r.done and ta.n < cap) pg.prefetchIndexPage(idx.rel, r.next);
-        if (ta.m > 0 and ta.n < cap) ta.n += countOffVisible(tbl, snap, rest[0..ta.m]);
+        if (ta.m > 0 and ta.n < cap) ta.n += sink.rest(rest[0..ta.m]);
         if (ta.n >= cap or r.done) {
+            const blk = c.BufferGetBlockNumber(buf);
             keepLeaf(idx, buf);
-            return @min(ta.n, cap);
+            return .{ .n = @min(ta.n, cap), .leaf = blk, .hi = r.hi };
         }
         c.ReleaseBuffer(buf);
         buf = pg.readBuffer(idx.rel, r.next, .index);
@@ -935,6 +990,7 @@ fn Counting(comptime K: type) type {
         got: Take = undefined,
         done: bool = false,
         next: u32 = 0,
+        hi: i64 = std.math.minInt(i64),
 
         fn read(self: *@This(), page: anytype) bool {
             const peeking = @TypeOf(page).peeking;
@@ -947,6 +1003,7 @@ fn Counting(comptime K: type) type {
             if (self.got != .entries) return self.got != .stuck;
             self.done = page.rightmost();
             self.next = page.opq().btpo_next;
+            if (comptime intKey(K)) self.hi = if (self.done) std.math.maxInt(i64) else lead(K, page.tuple(1));
             var off = if (self.landing and keyed) page.lowerBound(page.firstKey(), K, self.key.?) else page.firstKey();
             const max = page.maxOff();
             while (off <= max) : (off += 1) {
@@ -1020,6 +1077,144 @@ noinline fn countOffVisible(tbl: *pg.Table, snap: pg.Snapshot, es: []const Entry
         i = j;
     }
     return n;
+}
+
+/// Counter keeps at most this many entries for the heap before it checks them (64 KB, with its scratch).
+pub const PEND_CAP = 8192;
+/// Counter packs a slot into 16 bits; more keys than that count one at a time (countAt).
+pub const MAX_SLOTS = 1 << 16;
+/// Entries whose heap lines a drain requests ahead, then checks.
+const DRAIN_WINDOW = 256;
+
+/// Counts of several keys of one execution, each what countAt would count under the same snapshot, but
+/// with the heap asked once per block: `add` tallies a key's entries on all-visible heap blocks as the
+/// leaves are read and keeps the rest as (heap block, offset, slot); `drain` sorts those by block and
+/// offset and checks each block's run in one read (pg.Table.visibleOn, from each entry's own TID, the
+/// HOT chain's root), adding to the slot's count. A page an execution's counts keep returning to is
+/// visited once. Keys added in index order start each count on the leaf the one before ended on while
+/// they are within its high key (`last`, a Span), without a descent. Memory is bounded: the pending
+/// entries drain when they would pass their array, and nothing outlives the execution's context.
+pub fn Counter(comptime K: type) type {
+    return struct {
+        tbl: *pg.Table,
+        idx: *pg.Index,
+        snap: pg.Snapshot,
+        /// A count per slot, final after drain.
+        out: []i64,
+        pend: []u64,
+        scratch: []u64,
+        n: usize = 0,
+        slot: usize = 0,
+        /// Where the last count ended.
+        last: ?Span = null,
+
+        const Self = @This();
+
+        /// A counter for `slots` keys. Past MAX_SLOTS every count takes countAt's path at once.
+        pub fn init(tbl: *pg.Table, idx: *pg.Index, snap: pg.Snapshot, slots: usize) Self {
+            const out = A.alloc(i64, slots);
+            @memset(out, 0);
+            const cap = if (slots > MAX_SLOTS) 0 else @min(PEND_CAP, 1024 + 64 * slots);
+            return .{ .tbl = tbl, .idx = idx, .snap = snap, .out = out, .pend = A.alloc(u64, cap), .scratch = A.alloc(u64, cap) };
+        }
+
+        /// Counts `key` from leaf `start` (leafOf's or last's) into out[slot].
+        pub fn add(self: *Self, key: K, start: u32, slot: usize) void {
+            if (self.pend.len == 0) {
+                self.out[slot] = countAt(self.tbl, self.idx, self.snap, K, key, std.math.maxInt(i64), start);
+                return;
+            }
+            self.slot = slot;
+            const got = countWith(self.tbl, self.idx, K, key, std.math.maxInt(i64), start, self);
+            self.out[slot] += got.n;
+            self.last = if (got.leaf == c.InvalidBlockNumber) null else .{ .blk = got.leaf, .hi = got.hi };
+        }
+
+        /// countWith's sink: the entries are kept for drain, which runs early when they fill the array.
+        fn rest(self: *Self, es: []const Entry(void)) i64 {
+            for (es) |e| {
+                if (self.n == self.pend.len) self.drain();
+                self.pend[self.n] = pack(e.tid, @intCast(self.slot));
+                self.n += 1;
+            }
+            return 0;
+        }
+
+        /// Checks every pending entry against the heap, a block at a time, and clears them.
+        pub fn drain(self: *Self) void {
+            if (self.n == 0) return;
+            const keys = sortTids(self.pend[0..self.n], self.scratch[0..self.n]);
+            var es: [DRAIN_WINDOW]Entry(void) = undefined;
+            var ok: [DRAIN_WINDOW]bool = undefined;
+            var w: usize = 0;
+            while (w < keys.len) : (w += DRAIN_WINDOW) {
+                const win = keys[w..@min(keys.len, w + DRAIN_WINDOW)];
+                for (win, 0..) |k, i| es[i] = .{ .tid = tidOf(k), .val = {} };
+                pg.prefetchRows(self.tbl.rel, es[0..win.len]);
+                for (es[0..win.len]) |e| pg.prefetchTuple(self.tbl.rel, e.tid);
+                var i: usize = 0;
+                while (i < win.len) {
+                    const b = blockOf(win[i]);
+                    var j = i + 1;
+                    while (j < win.len and blockOf(win[j]) == b) j += 1;
+                    self.tbl.visibleOn(self.snap, b, es[i..j], ok[i..j]);
+                    for (win[i..j], ok[i..j]) |k, vis| self.out[slotOf(k)] += @intFromBool(vis);
+                    i = j;
+                }
+            }
+            self.n = 0;
+        }
+    };
+}
+
+/// A pending entry: heap block, offset, then the slot, so that sorting the words sorts by heap TID.
+fn pack(tid: c.ItemPointerData, slot: u16) u64 {
+    return @as(u64, pg.tidBlock(&tid)) << 32 | @as(u64, tid.ip_posid) << 16 | slot;
+}
+fn blockOf(k: u64) u32 {
+    return @intCast(k >> 32);
+}
+fn slotOf(k: u64) u16 {
+    return @truncate(k);
+}
+fn tidOf(k: u64) c.ItemPointerData {
+    const b = blockOf(k);
+    return .{ .ip_blkid = .{ .bi_hi = @intCast(b >> 16), .bi_lo = @truncate(b) }, .ip_posid = @truncate(k >> 16) };
+}
+
+/// `keys` (pack's) in heap TID order, in `keys` or `scratch` (the same length): a radix sort on the 48
+/// bits above the slot, a byte a pass, low byte first, skipping a byte every key shares (a table's blocks
+/// mostly do, in their high bytes).
+fn sortTids(keys: []u64, scratch: []u64) []u64 {
+    var src = keys;
+    var dst = scratch;
+    var shift: u6 = 16;
+    while (true) : (shift += 8) {
+        var hist: [256]usize = @splat(0);
+        for (src) |k| hist[@as(u8, @truncate(k >> shift))] += 1;
+        var one = false;
+        for (hist) |h| if (h == src.len) {
+            one = true;
+            break;
+        };
+        if (!one) {
+            var sum: usize = 0;
+            for (&hist) |*h| {
+                const n = h.*;
+                h.* = sum;
+                sum += n;
+            }
+            for (src) |k| {
+                const d = @as(u8, @truncate(k >> shift));
+                dst[hist[d]] = k;
+                hist[d] += 1;
+            }
+            const t = src;
+            src = dst;
+            dst = t;
+        }
+        if (shift == 56) return src;
+    }
 }
 
 /// The second column of the entries in `range` visible under `snap`, in index order, written to `out`;
@@ -1152,4 +1347,37 @@ test "bound finds what a linear scan finds, for every key shape and spread" {
     try checkBounds(i64, prng.random());
     try checkBounds(i32, prng.random());
     try checkBounds([2]i64, prng.random());
+}
+
+test "sortTids orders by heap block then offset, whatever the spread of blocks" {
+    var prng = std.Random.DefaultPrng.init(7);
+    const rnd = prng.random();
+    var keys: [3000]u64 = undefined;
+    var orig: [3000]u64 = undefined;
+    var scratch: [3000]u64 = undefined;
+    for ([_]u32{ 1, 200, 70000, 0xffffffff }) |spread| {
+        for ([_]usize{ 0, 1, 2, 17, 3000 }) |n| {
+            for (keys[0..n], 0..) |*k, i| {
+                const b = rnd.uintLessThan(u32, spread);
+                const tid: c.ItemPointerData = .{ .ip_blkid = .{ .bi_hi = @intCast(b >> 16), .bi_lo = @truncate(b) }, .ip_posid = rnd.intRangeAtMost(u16, 1, 291) };
+                k.* = pack(tid, @intCast(i % 65536));
+            }
+            @memcpy(orig[0..n], keys[0..n]);
+            const sorted = sortTids(keys[0..n], scratch[0..n]);
+            try std.testing.expectEqual(n, sorted.len);
+            var i: usize = 1;
+            while (i < n) : (i += 1) try std.testing.expect(sorted[i - 1] >> 16 <= sorted[i] >> 16);
+            for (sorted) |k| {
+                const t = tidOf(k);
+                try std.testing.expectEqual(pack(t, slotOf(k)), k);
+                try std.testing.expectEqual(blockOf(k), pg.tidBlock(&t));
+            }
+            // the same keys, as a multiset
+            var a: [3000]u64 = undefined;
+            @memcpy(a[0..n], sorted);
+            std.mem.sort(u64, a[0..n], {}, std.sort.asc(u64));
+            std.mem.sort(u64, orig[0..n], {}, std.sort.asc(u64));
+            try std.testing.expectEqualSlices(u64, orig[0..n], a[0..n]);
+        }
+    }
 }

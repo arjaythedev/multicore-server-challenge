@@ -261,6 +261,19 @@ Counts are tallied on the leaf page itself under its share lock. Entries on all-
 they lie, and only the rest are copied out for heap checks. Off all-visible blocks, a run of entries on the same
 heap block takes one share lock for the whole run.
 
+The favorites counts of a batch's articles are taken together, by one counter per batch (`Bt.Counter`). The
+articles go in id order. A leaf reached for one key serves the next keys within its bound, the parent's pivot or
+the leaf's own high key, with no descent: a split only moves entries right, and the landing walk steps right.
+Entries on all-visible blocks are tallied on the leaf as before. The rest are packed as (heap block, offset,
+article) across the whole batch, radix-sorted at its end, and checked once per heap block under the batch's
+snapshot, so a heap page that several articles' favorites share is visited about once per batch instead of once per
+article. The packed entry keeps the index's own pointer, and the HOT chain is followed per check from a copy.
+The pending array is bounded (8,192 entries, 65,536 articles): full, it drains in place; past the slot limit a
+count takes the per-article path. It lives in the execution's memory context and dies with it. On the dev box,
+counting CPU per 20 counted articles fell by 17% with favorites in random heap order, 31% on a loadgen-aged
+copy and 25% on a churned one, mostly from `favorites_article_idx` descents (102 → 70 per turn); heap block
+visits fell 9-16%, because on this seed favorites cluster by article and 20 articles rarely share a page.
+
 Heap rows are read **in place** in the pinned block, with no tuple slot. The engine runs
 `heap_hot_search_buffer` under the block's share lock and deforms the tuple in Zig the way
 `slot_deform_heap_tuple` does, getting attributes that a row written before an `ADD COLUMN` lacks through
@@ -349,6 +362,8 @@ of the same idea:
 - heap tuples are requested as soon as their line pointers have loaded;
 - an index keeps the leaf its last walk ended on pinned for the next walk;
 - a count requests its next leaf before it checks the current leaf's heap rows;
+- a batch's favorites counts run in article id order, so most keys start on the leaf the previous key ended on,
+  and their heap checks are deferred, sorted by block and done once per block at the end of the batch;
 - `aim` replays each leaf search a step at a time across the whole batch (line pointers, then the two anchor
   items, then one probe per step), so the batch's misses at each depth of the search land together.
 
@@ -393,6 +408,8 @@ the execution's memory context and die with it.
   CPU -11.1% / -29.1% / -30.0%). A viewer with more links in range than 16 per item, plus 16, is probed per
   flag instead.
 - **The feed:** every author on the page is followed by construction, so only favorites are read.
+- **Favorites counts:** one counter per batch of articles, sharing leaves between consecutive ids and heap
+  blocks between every article's remaining entries.
 - **Tag names and authors:** read once per execution (list_tag -7.8% / -14.1% / -18.3%, feed -9.9% to -16.3%).
 - **Comment threads and profiles:** read once per distinct article or username.
 - **Tags:** built once and every row points at the same bytes.
@@ -669,6 +686,13 @@ Small regressions we accepted for larger gains elsewhere:
   pages get deleted and recycled. Readers check that every count is either the before or the after value, and
   that all members of one execution agree. Over 10 minutes: 1,440,832 executions at the lock-free-leaves
   build, 0 violations.
+- **Batch counter against SQL** (`engine/test/batchcount.py`): a copy of the seed is churned (favorites inserted,
+  deleted and re-inserted, HOT updates on favorites and articles, one article grown to 5,000 favorites so its
+  leaves split, `VACUUM` between rounds so heap pages are a mix of all-visible and not). Every `favoritesCount`
+  the engine answers (every list page, 500 articles by slug, list_favorited, list_author, list_tag) is then
+  compared with `SELECT count(*)` in the same `REPEATABLE READ` transaction after another connection wrote,
+  some of it still uncommitted. Three passes per build, about 23,000 counts each, for the engine and for builds
+  with the pending bound at 3 and the slot limit at 4, so the fallbacks run: 0 wrong.
 - **Soaks:** three readers ran random batches of every endpoint, one writer ran SPEC's writes, `ANALYZE` ran
   every minute, and the oracle spot-checked every 5 minutes.
   - 60 minutes at an early direct-walk build: 10,973,964 executions, 181,082,697 requests, 0 errors, 0 bad
@@ -685,7 +709,8 @@ Small regressions we accepted for larger gains elsewhere:
   several writes.
 
 The oracle, stress and soak harnesses drive the engine through its marker form against a scratch database.
-They aren't part of this folder.
+They aren't part of this folder. The batch counter test is, with the marker encoder it needs
+(`engine/test/markers.py`).
 
 ## Files
 
@@ -698,6 +723,8 @@ They aren't part of this folder.
 - `engine/shim/pgengine_shim.c`: `_PG_init`, the worker registration, the planner and executor hooks.
 - `engine/shim/http_write.c`: the write statements and their subtransactions.
 - `engine/src/web/`: HTTP, JWT, JSON and bcrypt, vendored from our Zig entry.
+- `engine/test/batchcount.py`: the batch favorites counter against SQL on a churned copy of the seed.
+- `engine/test/markers.py`: the marker encoder batchcount.py drives the engine with.
 - `install.sh`, `build.sh`, `start.sh`, `engine/build.sh`, `engine/install-zig.sh`: as described in "How to run".
 
 ## Credits
