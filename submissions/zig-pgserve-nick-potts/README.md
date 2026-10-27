@@ -44,6 +44,7 @@ DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit \
   `DATABASE_URL`. Two optional variables exist: `PGSERVE_WORKERS` (default 6) and `PGSERVE_LIB` (default
   `pgengine`).
 - `PGSERVE_HASH_NICE=N` (off by default) runs the bcrypt threads at nice `N`.
+- `PGSERVE_THIN_TO=1` (off by default) sets `TCP_THIN_LINEAR_TIMEOUTS` on every accepted connection.
 - `GET /api/tags` answered 5.6-8.6 s after a cold Postgres restart in our runs. Most of that is bcrypt's
   self-test and calibration.
 

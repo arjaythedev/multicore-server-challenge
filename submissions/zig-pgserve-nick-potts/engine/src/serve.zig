@@ -774,7 +774,12 @@ fn knob(setting: []const u8) void {
     const value = setting[eq + 1 ..];
     if (std.mem.eql(u8, name, "PGSERVE_HASH_NICE"))
         bcrypt.nice = std.fmt.parseInt(i32, value, 10) catch c.shim_ereport_str("pgengine http: PGSERVE_HASH_NICE is not an integer");
+    if (std.mem.eql(u8, name, "PGSERVE_THIN_TO")) thin_to = std.mem.eql(u8, value, "1");
 }
+
+/// PGSERVE_THIN_TO=1: TCP_THIN_LINEAR_TIMEOUTS on every connection. An answer is 2-3 segments, so the kernel
+/// sees a thin stream and backs its retransmission timeout off linearly, not exponentially.
+var thin_to = false;
 
 fn watch(ep: i32, op: u32, fd: i32, events: u32, data: u64) void {
     var ev: linux.epoll_event = .{ .events = events, .data = .{ .u64 = data } };
@@ -790,6 +795,7 @@ fn acceptAll(ep: i32, lfd: i32) void {
             _ = linux.close(fd);
             continue;
         }
+        if (thin_to) _ = linux.setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.THIN_LINEAR_TIMEOUTS, std.mem.asBytes(&@as(i32, 1)), 4);
         const conn = gpa.create(Conn) catch @panic("out of memory");
         conn.* = .{ .fd = fd };
         conns[@intCast(fd)] = conn;
