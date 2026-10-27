@@ -108,12 +108,38 @@ internal sealed partial class Api
     // GET /api/articles
     private Task ListArticles(HttpContext ctx, long viewer, string _)
     {
-        if (!Http.LimitOffset(ctx.Request, out var limit, out var offset))
+        var valid = true;
+        long limit = 20, offset = 0;
+        string? tag = null, author = null, favorited = null;
+
+        // One pass over the query string. Names match exactly (case-sensitive), a repeated name uses its first value,
+        // and limit/offset must be plain digits: no sign, no spaces.
+        foreach (var (key, value) in ctx.Request.Query)
+        {
+            switch (key)
+            {
+                case "limit":
+                    valid &= Http.ParseUint(value, out limit) && limit is >= 1 and <= 100;
+                    break;
+                case "offset":
+                    valid &= Http.ParseUint(value, out offset);
+                    break;
+                case "tag":
+                    tag = value;
+                    break;
+                case "author":
+                    author = value;
+                    break;
+                case "favorited":
+                    favorited = value;
+                    break;
+            }
+        }
+
+        if (!valid)
             return Http.Error(ctx, 422, "limit must be 1-100 and offset >= 0");
-        // The first non-empty filter in the order tag, author, favorited applies.
-        var tag = Http.Query(ctx.Request, "tag");
-        var author = Http.Query(ctx.Request, "author");
-        var favorited = Http.Query(ctx.Request, "favorited");
+
+        // The first non-empty filter in the order tag, author, favorited applies, whatever the order in the URL.
         if (!string.IsNullOrEmpty(tag))
             return WriteList(ctx, Sql.ListByTag, Sql.CountByTag, viewer, limit, offset, tag);
         if (!string.IsNullOrEmpty(author))
@@ -126,8 +152,25 @@ internal sealed partial class Api
     // GET /api/articles/feed
     private Task Feed(HttpContext ctx, long viewer, string _)
     {
-        if (!Http.LimitOffset(ctx.Request, out var limit, out var offset))
+        long limit = 20, offset = 0;
+        var valid = true;
+
+        foreach (var (key, value) in ctx.Request.Query)
+        {
+            switch (key)
+            {
+                case "limit":
+                    valid &= Http.ParseUint(value, out limit) && limit is >= 1 and <= 100;
+                    break;
+                case "offset":
+                    valid &= Http.ParseUint(value, out offset);
+                    break;
+            }
+        }
+
+        if (!valid)
             return Http.Error(ctx, 422, "limit must be 1-100 and offset >= 0");
+
         return WriteList(ctx, Sql.ListFeed, Sql.CountFeed, viewer, limit, offset, null, feed: true);
     }
 

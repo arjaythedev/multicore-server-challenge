@@ -46,23 +46,7 @@ internal static class Http
         return Task.CompletedTask;
     }
 
-    // ---------- query string ----------
-
-    /// <summary>First value of a query parameter (case-sensitive name), or null when absent.</summary>
-    internal static string? Query(HttpRequest req, string key)
-    {
-        var qs = req.QueryString.Value;
-        if (string.IsNullOrEmpty(qs)) return null;
-        foreach (var pair in qs.TrimStart('?').Split('&'))
-        {
-            var eq = pair.IndexOf('=');
-            if (Decode(eq < 0 ? pair : pair[..eq]) != key) continue;
-            return eq < 0 ? "" : Decode(pair[(eq + 1)..]);
-        }
-        return null;
-    }
-
-    private static string Decode(string s) => Uri.UnescapeDataString(s.Replace('+', ' '));
+    // ---------- parsing ----------
 
     /// <summary>Only ASCII digits (no sign, no spaces) that fit in an int64.</summary>
     internal static bool ParseUint(string? s, out long n)
@@ -72,24 +56,6 @@ internal static class Http
         foreach (var c in s)
             if (c < '0' || c > '9') return false;
         return long.TryParse(s, NumberStyles.None, CultureInfo.InvariantCulture, out n);
-    }
-
-    /// <summary>limit (default 20, 1..100) and offset (default 0, >= 0). A parameter that is present must be valid.</summary>
-    internal static bool LimitOffset(HttpRequest req, out long limit, out long offset)
-    {
-        limit = 20;
-        offset = 0;
-        var l = Query(req, "limit");
-        if (l != null)
-        {
-            if (!ParseUint(l, out limit) || limit < 1 || limit > 100) return false;
-        }
-        var o = Query(req, "offset");
-        if (o != null)
-        {
-            if (!ParseUint(o, out offset)) return false;
-        }
-        return true;
     }
 
     // ---------- request bodies ----------
