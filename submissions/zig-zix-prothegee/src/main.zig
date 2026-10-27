@@ -36,7 +36,7 @@ fn createLogDir(io: std.Io) void {
 fn setupFileLimit() void {
     std.process.raiseFileDescriptorLimit();
 
-    const limits = std.posix.getrlimit(.NOFILE) catch {};
+    const limits = std.posix.getrlimit(.NOFILE) catch return;
     std.debug.print("conduit: open file limit {d} (hard {d})\n", .{ limits.cur, limits.max });
 
     if (limits.cur < 2048) {
