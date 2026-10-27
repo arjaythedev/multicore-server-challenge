@@ -68,7 +68,7 @@ int main(int argc, char **argv) {
     cfg.read_conns = env_int("READ_CONNS", 5, 1, 64);
     cfg.write_conns = env_int("WRITE_CONNS", 1, 1, 8);
     cfg.bcrypt_threads = env_int("BCRYPT_THREADS", 1, 1, 64);
-    cfg.bcrypt_wait_ms = env_int("BCRYPT_WAIT_MS", 300, 0, 5000);
+    cfg.bcrypt_wait_ms = env_int("BCRYPT_WAIT_MS", 1000, 0, 5000);
     cfg.bcrypt_batch = env_int("BCRYPT_BATCH", 8, 1, 8);
     cfg.bcrypt_nice = env_int("BCRYPT_NICE", 10, 0, 19);
     cfg.pg_pipeline = (uint32_t)env_int("PG_PIPELINE", 16, 1, 1024);
