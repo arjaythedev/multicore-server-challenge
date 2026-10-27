@@ -356,7 +356,7 @@ actor _Connection is
   embed _operations: Map[U64, _Operation] = Map[U64, _Operation]
   embed _responders: Map[U64, stallion.Responder] =
     Map[U64, stallion.Responder]
-  var _body: Array[U8] iso = recover iso Array[U8] end
+  var _body: Array[U8] iso = recover iso Array[U8](1024) end
   var _id: U64 = 0
 
   new create(auth: TCPServerAuth, fd: U32, config: stallion.ServerConfig,
@@ -382,7 +382,7 @@ actor _Connection is
     responder: stallion.Responder)
   =>
     if _transport_closed then return end
-    let body = _body = recover iso Array[U8] end
+    let body = _body = recover iso Array[U8](1024) end
     let text: String val = String.from_iso_array(consume body)
     _id = _id + 1
     _responders(_id) = responder
@@ -632,7 +632,7 @@ actor _Connection is
     if _transport_closed then return end
     _transport_closed = true
     _responders.clear()
-    _body = recover iso Array[U8] end
+    _body.clear()
     match _password_observer
     | let observer: _PasswordApplicationObserver =>
       observer.application_physical_close(this, _operations.size(),
