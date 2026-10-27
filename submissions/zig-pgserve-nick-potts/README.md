@@ -43,6 +43,7 @@ DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit \
 - `start.sh` runs the launcher in the foreground. It reads SPEC's `HOST`, `PORT`, `JWT_SECRET` and
   `DATABASE_URL`. Two optional variables exist: `PGSERVE_WORKERS` (default 6) and `PGSERVE_LIB` (default
   `pgengine`).
+- `PGSERVE_HASH_NICE=N` (off by default) runs the bcrypt threads at nice `N`.
 - `GET /api/tags` answered 5.6-8.6 s after a cold Postgres restart in our runs. Most of that is bcrypt's
   self-test and calibration.
 

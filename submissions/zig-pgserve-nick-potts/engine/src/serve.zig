@@ -743,8 +743,9 @@ fn check(rc: usize, what: []const u8) usize {
 }
 
 /// The listening socket and the JWT secret, from the launcher at `path`: one message whose bytes are the
-/// secret and whose SCM_RIGHTS control message carries the socket.
-fn handoff(path: []const u8, secret: *std.ArrayListUnmanaged(u8)) i32 {
+/// secret, then "\0NAME=value" per setting the launcher forwards, and whose SCM_RIGHTS control message
+/// carries the socket.
+fn handoff(path: []const u8, body: *std.ArrayListUnmanaged(u8)) i32 {
     const s: i32 = @intCast(check(linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0), "socket(AF_UNIX)"));
     defer _ = linux.close(s);
     var addr: linux.sockaddr.un = .{ .path = @splat(0) };
@@ -762,8 +763,17 @@ fn handoff(path: []const u8, secret: *std.ArrayListUnmanaged(u8)) i32 {
     const typ = std.mem.readInt(i32, ctl[12..16], .little);
     if (msg.controllen < 20 or len < 20 or level != linux.SOL.SOCKET or typ != 1) // SCM_RIGHTS
         c.shim_ereport_str("pgengine http: the launcher sent no socket");
-    secret.appendSlice(gpa, data[0..n]) catch @panic("out of memory");
+    body.appendSlice(gpa, data[0..n]) catch @panic("out of memory");
     return std.mem.readInt(i32, ctl[16..20], .little);
+}
+
+/// A setting the launcher forwarded from its env (launcher.c, `knobs`).
+fn knob(setting: []const u8) void {
+    const eq = std.mem.indexOfScalar(u8, setting, '=') orelse return;
+    const name = setting[0..eq];
+    const value = setting[eq + 1 ..];
+    if (std.mem.eql(u8, name, "PGSERVE_HASH_NICE"))
+        bcrypt.nice = std.fmt.parseInt(i32, value, 10) catch c.shim_ereport_str("pgengine http: PGSERVE_HASH_NICE is not an integer");
 }
 
 fn watch(ep: i32, op: u32, fd: i32, events: u32, data: u64) void {
@@ -914,9 +924,11 @@ fn wallSeconds() i64 {
 /// The worker's loop, from pgengine_http_main once it has joined the database. `launcher` is the Unix
 /// socket path pgserve's launcher listens on.
 export fn engine_http_serve(launcher: [*:0]const u8) callconv(.c) void {
-    var secret: std.ArrayListUnmanaged(u8) = .empty;
-    const lfd = handoff(std.mem.span(launcher), &secret);
-    jwt.init(secret.items);
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    const lfd = handoff(std.mem.span(launcher), &body);
+    var fields = std.mem.splitScalar(u8, body.items, 0);
+    jwt.init(fields.first());
+    while (fields.next()) |setting| knob(setting);
     startHashers();
     conns = gpa.alloc(?*Conn, MAX_FDS) catch @panic("out of memory");
     @memset(conns, null);

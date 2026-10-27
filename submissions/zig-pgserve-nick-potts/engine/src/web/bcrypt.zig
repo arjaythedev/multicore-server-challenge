@@ -26,6 +26,9 @@ pub const cost = bc.cost;
 /// wait at all (conformance, a nearly idle server).
 pub const fill_ns = std.time.ns_per_s;
 
+/// The hasher threads' nice value (PGSERVE_HASH_NICE); null leaves them at the worker's. Set before `start`.
+pub var nice: ?i32 = null;
+
 pub const Kind = enum { hash, verify };
 
 pub const Job = struct {
@@ -147,6 +150,8 @@ pub fn finished() ?*Job {
 fn worker() void {
     // Named so their CPU time can be told apart from the event loop's (/proc/<pid>/task/*/comm).
     _ = linux.prctl(@intFromEnum(linux.PR.SET_NAME), @intFromPtr("bcrypt"), 0, 0, 0);
+    // Nice, not SCHED_IDLE: `List.lock` spins, and a SCHED_IDLE holder could keep a worker spinning on it.
+    if (nice) |n| _ = linux.syscall3(.setpriority, 0, @intCast(linux.gettid()), @bitCast(@as(isize, n))); // PRIO_PROCESS
     var buf: [bc.max_lanes]*Job = undefined;
     while (true) {
         const batch = collect(&buf);

@@ -9,7 +9,8 @@
  *
  * Env: HOST, PORT, JWT_SECRET, DATABASE_URL (SPEC's runtime contract); PGSERVE_WORKERS (default 6 of the
  * seven max_worker_processes slots the logical replication launcher leaves), PGSERVE_LIB (default pgengine,
- * the library in $libdir/plugins).
+ * the library in $libdir/plugins). The workers' env is the postmaster's, so the launcher forwards the `knobs`
+ * that are set along with JWT_SECRET.
  */
 #define _GNU_SOURCE 1
 #include <arpa/inet.h>
@@ -91,11 +92,14 @@ static int listener(const char *host, int port)
 	return fd;
 }
 
-/* Sends `secret` with `fd` attached. */
-static void hand(int conn, int fd, const char *secret)
+/* Optional worker settings, each sent as NAME=value when set. */
+static const char *const knobs[] = {"PGSERVE_HASH_NICE"};
+
+/* Sends `msg` with `fd` attached. */
+static void hand(int conn, int fd, const char *msg, size_t len)
 {
 	char		ctl[CMSG_SPACE(sizeof(int))] = {0};
-	struct iovec iov = {.iov_base = (void *) secret, .iov_len = strlen(secret)};
+	struct iovec iov = {.iov_base = (void *) msg, .iov_len = len};
 	struct msghdr m = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = ctl, .msg_controllen = sizeof(ctl)};
 	struct cmsghdr *h = CMSG_FIRSTHDR(&m);
 
@@ -117,14 +121,29 @@ int main(void)
 {
 	const char *host = env("HOST", "0.0.0.0"), *secret = env("JWT_SECRET", "");
 	int			port = atoi(env("PORT", "80")), n = atoi(env("PGSERVE_WORKERS", "6"));
-	char		path[64], options[256];
+	char		path[64], options[256], msg[1024];
 	struct sockaddr_un ua = {.sun_family = AF_UNIX};
 	struct stat pgrun;
 	int			us;
+	size_t		msglen;
 
 	if (secret[0] == '\0' || port <= 0 || n <= 0)
 	{
 		fprintf(stderr, "pgserve: JWT_SECRET, PORT and PGSERVE_WORKERS must be set\n");
+		return 1;
+	}
+	/* the secret, then "\0NAME=value" per knob that is set */
+	msglen = (size_t) snprintf(msg, sizeof(msg), "%s", secret);
+	for (size_t i = 0; i < sizeof(knobs) / sizeof(knobs[0]) && msglen < sizeof(msg); i++)
+	{
+		const char *v = env(knobs[i], NULL);
+
+		if (v != NULL)
+			msglen += (size_t) snprintf(msg + msglen + 1, sizeof(msg) - msglen - 1, "%s=%s", knobs[i], v) + 1;
+	}
+	if (msglen >= sizeof(msg))
+	{
+		fprintf(stderr, "pgserve: JWT_SECRET and the PGSERVE_ settings exceed %zu bytes\n", sizeof(msg));
 		return 1;
 	}
 	/* the workers run as the owner of the Postgres socket directory; only they may collect a socket */
@@ -166,7 +185,7 @@ int main(void)
 			continue;
 		}
 		fd = listener(host, port);
-		hand(conn, fd, secret);
+		hand(conn, fd, msg, msglen);
 		close(fd);
 		close(conn);
 	}
