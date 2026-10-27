@@ -1,0 +1,17 @@
+{
+  "app": {
+    "threads_num": 6,
+    "max_connections": 666666,
+    "max_connections_per_ip": 0,
+    "idle_connection_timeout": 120,
+    "keepalive_requests": 0,
+    "pipelining_requests": 0,
+    "enable_session": false,
+    "use_gzip": false,
+    "client_max_body_size": "1M",
+    "client_max_memory_body_size": "64K",
+    "log": {
+      "log_level": "WARN"
+    }
+  }
+}
