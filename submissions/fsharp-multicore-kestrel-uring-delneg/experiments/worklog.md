@@ -326,3 +326,8 @@ feed count proof adopted, #91's hashagg off measured (no effect).
 - **Postgres profile at 14k** (perf over all backends): index descents dominate (`_bt_first` 35% inclusive,
   `_bt_search` 18%, `_bt_compare` 10% self), subplans 20%, heap fetches 16%, buffer lookups 4.5% self; the wire
   protocol does not show. Fewer separate index scans is the only lever left on the Postgres side.
+- **60 one I/O loop, batch cap 256** (rotated order): `LOOPS=1` 14k 143.1 / 146.5 / 153.8 vs 150.9 / 162.0 / 146.9
+  us/req, 12k 153.3 / 148.0 / 153.2 vs 154.9 / 151.0 / 152.3; app lower in every pair (60.5-63.3 vs 63.1-67.0).
+  **Not adopted**: one ring at ~23 us/req tops out near 42k req/s, below the ~53k that 8 cores allow at this
+  CPU per request, and the score is the most users held with every core busy. `BATCH_MAX=256` 149.0 / 147.4 /
+  150.8: noise.
