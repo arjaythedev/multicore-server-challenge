@@ -26,8 +26,9 @@ pub const cost = bc.cost;
 /// wait at all (conformance, a nearly idle server).
 pub const fill_ns = std.time.ns_per_s;
 
-/// The hasher threads' nice value (PGSERVE_HASH_NICE); null leaves them at the worker's. Set before `start`.
-pub var nice: ?i32 = null;
+/// The hasher threads' nice value (PGSERVE_HASH_NICE, default 19), so logins and sign-ups yield the CPU to the
+/// event loops. Set before `start`.
+pub var nice: ?i32 = 19;
 
 pub const Kind = enum { hash, verify };
 

@@ -928,9 +928,9 @@ fn knobInt(comptime name: []const u8, value: []const u8, min: u32, max: u32) u32
 var clock: Clock = .{};
 var stats: Stats = .{};
 
-/// PGSERVE_THIN_TO=1: TCP_THIN_LINEAR_TIMEOUTS on every connection. An answer is 2-3 segments, so the kernel
+/// PGSERVE_THIN_TO (default 1; 0 turns it off): TCP_THIN_LINEAR_TIMEOUTS on every connection. An answer is 2-3 segments, so the kernel
 /// sees a thin stream and backs its retransmission timeout off linearly, not exponentially.
-var thin_to = false;
+var thin_to = true;
 
 fn watch(ep: i32, op: u32, fd: i32, events: u32, data: u64) void {
     var ev: linux.epoll_event = .{ .events = events, .data = .{ .u64 = data } };
@@ -1090,11 +1090,11 @@ fn waitNs(ep: i32, events: []linux.epoll_event, ns: i64) usize {
     return linux.syscall6(.epoll_pwait2, @as(u32, @bitCast(ep)), @intFromPtr(events.ptr), events.len, @intFromPtr(&ts), 0, linux.NSIG / 8);
 }
 
-/// Load shedding (PGSERVE_SHED=1, off by default): while this worker's loop is saturated, logins, sign-ups and
+/// Load shedding (PGSERVE_SHED, default 1; 0 turns it off): while this worker's loop is saturated, logins, sign-ups and
 /// password changes get 503 instead of a bcrypt job. Saturated means a 1 s window with under 2% of it spent in
 /// epoll_wait; it ends with a window above 10%, and no sooner than 10 s after it began. Each worker decides alone.
 const Shed = struct {
-    enabled: bool = false,
+    enabled: bool = true,
     /// When the current window began, and its ns spent in epoll_wait so far.
     window: i64 = 0,
     idle: i64 = 0,
