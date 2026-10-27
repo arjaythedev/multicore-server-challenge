@@ -137,3 +137,64 @@ fixed seeded inputs in one backend and read its CPU from /proc: SQL shape A/B wi
 - **29 feed in one walk** (replay): the followees' article ids once (capped at 1000) for both count and page:
   433-442 vs 375-425 us. The per-followee probes are cheaper than sorting the whole set. Discarded.
 - **Candidate (e19)**: 185.2 us/req (app 65.4, PG 121.2), p95 37.3 ms, 0 errors; overload PASS. Committed.
+- **31 ring waits** (`MC_WAIT_N` 4 / 16): 180.2; 184.9 / 196.9 vs 181.8 / 183.3. Noise. Off.
+- **32 batch sizes at 20 ms** (MC_STATS): tags 59, article 59, comments 59 (near the 64 cap), list 42, feed 33,
+  profile 18, author 15, tag 14, favorite 7, comment 5, favorited 4, follow 3, user 2.4.
+- Feed EXPLAIN (batch 16): viewers follow ~21 authors with ~900 articles between them; 13 of 16 reach the
+  1000 cap. Count walk 0.17 ms, page 0.26 ms (21 probes, ~360 ids sorted), enrichment ~0.1 ms per request.
+  Viewers in a batch share only ~9% of their followees, so per-batch sharing can't save much there.
+
+## Overnight batch (box, us/req; 12k = 12,000 users, 6k = 6,000 users, think-scale 0.1)
+
+- **33 I/O loops** at 12k: on 185.3 / 175.0 / 174.8; `LOOPS=1` 178.5 / 171.9 / 173.3 (app 57.6 / 55.9 / 56.5,
+  p95 100 / 76 / 69 ms); `LOOPS=4` 179.0 / 185.9 / 190.0. One loop is maybe 3-5 us cheaper with a worse p95;
+  four are worse. Pending replicates.
+- **34 server GC** (`DOTNET_gcServer=1`, 2 heaps): 12k 172.5 / 176.0 / 178.5, 6k 186.4 vs on 192.6. A small gain is
+  possible, p95 mixed. Pending replicates (m1).
+- **35 no spin** (spin0): 175.6 / 176.4 / 176.8, 6k 191.5. Neutral. Off.
+- **36 ring waits** `MC_WAIT_N=32` (1 ms): 178.8 / 173.7 / 181.6. Neutral. Off.
+- **37 clock** 10 ms: 191.2 / 186.5 / 192.1 (worse); 30 ms: 178.2 / 177.8 / 174.9 (same as 20 ms, more latency).
+  20 ms stays.
+- **38 counts that walk the oldest end** (`COUNT_OLDEST`, cmp 0 differ): 6k 190.9 / 188.9 / 189.8 vs
+  183.3 / 198.8 / 196.7; 12k 176.9 / 178.7 vs 172.2 / 184.3. Replay on an aged DB (620k articles, made by
+  age-mc.sh): feed 394-422 vs 422-441 (worse), author 200-212 vs 197-209; on the seed no gain. Discarded, code
+  removed.
+- **39 bcrypt 5 lanes + `-funroll-loops`** (rbench, ms/hash on the box): `-O3` 4 lanes 22.44, 5 lanes 21.18,
+  6-8 worse; `-funroll-loops` 4 lanes 22.03, 5 lanes 20.87 (-7% in all); `-fno-tree-vectorize` no change.
+  Screens: 6k 195.7 / 182.9 / 175.2, 12k 179.1 / 173.7 (noise band). Pending replicates (m1).
+- **40 buffer ring** (`MC_BUFRING=1`, e24): kernel 6.8.0-147 refuses the register with EINVAL; the retry with
+  `resv[0]=1` works ("io: receive buffers from a buffer ring"), the same EINVAL that made #10 / #79 / #45 drop
+  buffer rings. 6k 185.7 / 177.5 / 191.2 vs on 187.3 / 179.0 / 189.0; 12k 179.4 / 175.5 vs 179.4 / 183.2. Within
+  noise. Discarded: the code is removed (keep only if it wins beyond noise).
+- **41 aged-DB costs** (replay, PG us/req at real batch sizes): article 43.9 (b59), comments 147.5, list packed
+  87.6, tag packed 354.
+
+## Ideas from other PRs (2026-10-27 scan; LEADERBOARD.md, official box)
+
+- #47 rust-epoll-WorriedArrow, 120,000 (30,189 req/s, app 28% / PG 60%, about 159 PG core-us/req): one queue of
+  every read kind per lane; phase A per kind over distinct keys, phase B enriches the union of the batch's
+  articles once (tags, favorite count, author), viewer flags as one `= ANY` scan per viewer. Batches up to 4096.
+- #99 (follow-up to #61, 110,000): batch ordered by (filter, offset, limit, viewer); tags sorted in the app
+  instead of `ORDER BY` in the tag subquery; reports a 130,000 hold on the official DO setup.
+- #91 (follow-up to #52): `enable_hashagg = off` for the session ("generic plans oversized the DISTINCT hash
+  tables"); a 40 ms / 256 read window.
+- #95: batches up to 512 in one read-only snapshot; #97: #47 plus batch-local JSON, 128,000 locally.
+- #100 (follow-up to #45): a single packed statement for list, feed, article, profile and tag reads; feed count
+  proofs.
+
+## Morning (2026-10-27)
+
+- **42 hashagg off** (#91; replay, PG us/req, warm round): feed 347 vs 356, author 190 vs 190, tag 329 vs 332,
+  article 38 vs 39, comments 44 vs 44, list 55 vs 54. The first round looked like a win only because the default
+  ran cold first. No effect on our plans. Discarded (screens dropped).
+- **Seed feed facts**: 28 authors have >= 1000 articles (max 14,419); 78,628 of 99,932 viewers follow one of them;
+  83,172 have >= 1000 feed articles (capped count). Followers per author: median 28, p90 99, p99 616, max 35,515.
+- **43 feed count proof** (`FEED_PROOF`, idea from #100): per batch, the up to 8 followees that at least two
+  viewers share are probed once for a 1000th article; a viewer following one gets count 1000 without its own
+  walk (same statement, same snapshot). Replay (PG us/req): b16 394 / 391 -> 391 / 372, b33 367 / 355 -> 315 / 312,
+  b64 339 / 319 -> 278 / 289. Row diff vs the current statement over 60 batches: 0 of 12,970 rows differ.
+  Screens (e25, 12k): on 170.7 / 170.0 / 169.5 (PG 112.8 / 112.4 / 113.4) vs `FEED_PROOF=0` 174.4 / 186.4 / 176.6
+  (PG 117.8 / 125.1 / 120.3). About -5 us of PG per request. Kept, on by default.
+- **References on this box** (12k): #47 rust-epoll-WorriedArrow 183.8 us/req (app 77.4, PG 108.2), 24,836 req/s,
+  p95 175 ms; #61 go-epoll-MegaPanchamZ 225.9 (app 75.6, PG 150.6), 28,270 req/s, p95 127 ms. Earlier (6k):
+  #7 300.6, #22 374.1. Ours runs ~175-185 (app ~57-65, PG ~118): cheaper app, ~10 us more PG than #47.

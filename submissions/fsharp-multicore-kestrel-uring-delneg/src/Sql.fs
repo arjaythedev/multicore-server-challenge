@@ -54,6 +54,12 @@ let private addKind name stmt layout =
 let Collation =
     "SELECT datlocprovider::text, datcollate, coalesce(datlocale, '') FROM pg_database WHERE datname = current_database()"
 
+let private feedProof = Environment.GetEnvironmentVariable "FEED_PROOF" <> "0"
+let private feedProofN =
+    match Environment.GetEnvironmentVariable "FEED_PROOF_N" with
+    | null | "" -> 8
+    | s -> int s
+
 let private tagOrder () = if Json.appSortsTags then "" else " ORDER BY 1"
 
 [<Literal>]
@@ -233,7 +239,16 @@ let private packedFeed () =
     Stmt.Define(
         "WITH q AS MATERIALIZED (SELECT r.*, ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.v) AS fl FROM "
         + unnest Layout.List + "), "
-        + "c AS MATERIALIZED (SELECT q.i, CASE WHEN EXISTS (SELECT 1 FROM articles a3 WHERE a3.author_id = ANY (q.fl) "
+        + (if feedProof then
+               // count proof shared by the batch (#100): the followees most viewers share are probed once for a
+               // 1000th article; a viewer who follows one has the capped count 1000 without walking its own
+               "h AS MATERIALIZED (SELECT ARRAY(SELECT t.a FROM (SELECT f.a FROM q, unnest(q.fl) AS f(a) GROUP BY f.a "
+               + "HAVING count(*) >= 2 ORDER BY count(*) DESC LIMIT " + string feedProofN + ") t "
+               + "WHERE EXISTS (SELECT 1 FROM articles a3 WHERE a3.author_id = t.a OFFSET 999 LIMIT 1)) AS ha), "
+           else "")
+        + "c AS MATERIALIZED (SELECT q.i, CASE "
+        + (if feedProof then "WHEN q.fl && (SELECT ha FROM h) THEN 1000::int8 " else "")
+        + "WHEN EXISTS (SELECT 1 FROM articles a3 WHERE a3.author_id = ANY (q.fl) "
         + "ORDER BY a3.author_id, a3.id DESC OFFSET 999 LIMIT 1) THEN 1000::int8 "
         + "ELSE (SELECT count(*) FROM articles a3 WHERE a3.author_id = ANY (q.fl)) END AS n FROM q), "
         + "p AS MATERIALIZED (SELECT q.i, x.id FROM q CROSS JOIN LATERAL ("
