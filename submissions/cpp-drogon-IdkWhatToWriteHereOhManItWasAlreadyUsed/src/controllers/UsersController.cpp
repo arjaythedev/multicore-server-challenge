@@ -15,17 +15,16 @@ namespace {
         auto promise = std::make_shared<std::promise<std::string>>();
         auto fut = promise->get_future();
         BcryptPool::instance().hashAsync(password,
-            [promise](std::string h) { promise->set_value(std::move(h)); });
-        co_return co_await multicore::FutureAwaiter<std::string>{std::move(fut)};
-    }
-
-    Task<bool> AsyncCheck(const std::string& password, const std::string& stored)
-    {
-        auto promise = std::make_shared<std::promise<bool>>();
-        auto fut = promise->get_future();
-        BcryptPool::instance().verifyAsync(password, stored,
-            [promise](const bool ok) { promise->set_value(ok); });
-        co_return co_await multicore::FutureAwaiter<bool>{std::move(fut)};
+            [promise](std::string h) {
+                if (h.empty()) LOG_WARN << "bcrypt hash failed (empty result)";
+                promise->set_value(std::move(h));
+            });
+        try {
+            co_return co_await multicore::FutureAwaiter<std::string>{std::move(fut)};
+        } catch (const std::exception& e) {
+            LOG_ERROR << "bcrypt hash exception: " << e.what();
+            throw;
+        }
     }
 
     constexpr auto kDummyHash = "$2a$10$ZSfEoPvlcsj2XfvsSeK25em4NZ9Jm7ntGqXuLgQfHEeZPYB8899wq";
