@@ -1,0 +1,6 @@
+build/
+bin/
+deps/
+third_party/
+*.gcda
+*.gcno
