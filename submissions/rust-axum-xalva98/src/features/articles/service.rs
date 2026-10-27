@@ -35,9 +35,7 @@ pub async fn by_slug(ctx: &AppState, viewer: i64, slug: &str) -> Result<Article,
 }
 
 pub async fn create(ctx: &AppState, author: i64, new: NewArticle) -> Result<Article, AppError> {
-    let id = data::create(&ctx.db, author, &new).await?;
-    let row = data::by_id(&ctx.db, author, id).await?;
-    row.map(Article::from).ok_or_else(|| AppError::internal_server_error(format!("article {id} gone right after its commit")))
+    data::create(&ctx.db, author, &new).await.map(Article::from)
 }
 
 pub async fn update(ctx: &AppState, author: i64, slug: &str, changes: ArticleChanges) -> Result<Article, AppError> {

@@ -1,18 +1,14 @@
 //! Database access. A few shared connections per pool, each carrying many requests' statements at once
 //! (tokio-postgres pipelines them), so a Postgres backend works through a queue instead of waking once per
-//! query. Every request is one autocommitting statement; only a transaction gets a connection to itself.
+//! query. Every request is one autocommitting statement, so no request needs a connection to itself.
 
 use std::collections::HashMap;
-use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_postgres::types::{FromSql, ToSql, Type};
 use tokio_postgres::{Client, Config, NoTls, Row, Statement};
-
-use crate::error::AppError;
 
 pub type PgError = tokio_postgres::Error;
 pub type Params<'a> = &'a [&'a (dyn ToSql + Sync)];
@@ -31,8 +27,6 @@ pub trait FromRow: Sized {
 pub struct Settings {
     pub read_connections: usize,
     pub write_connections: usize,
-    pub transaction_connections: usize,
-    pub acquire_timeout: Duration,
     pub statement_timeout_ms: u64,
     pub plan_cache_mode: String,
 }
@@ -43,7 +37,6 @@ pub struct Settings {
 pub struct Db {
     reads: Arc<Shared>,
     writes: Arc<Shared>,
-    transactions: Arc<Exclusive>,
 }
 
 impl Db {
@@ -56,12 +49,10 @@ impl Db {
                 settings.statement_timeout_ms,
                 setting_word(&settings.plan_cache_mode)
             ),
-            acquire_timeout: settings.acquire_timeout,
         });
         Ok(Db {
             reads: Arc::new(Shared::open(session.clone(), settings.read_connections, statements).await?),
-            writes: Arc::new(Shared::open(session.clone(), settings.write_connections, statements).await?),
-            transactions: Arc::new(Exclusive::open(session, settings.transaction_connections).await?),
+            writes: Arc::new(Shared::open(session, settings.write_connections, statements).await?),
         })
     }
 
@@ -72,11 +63,6 @@ impl Db {
     pub fn write(&self) -> &Shared {
         &self.writes
     }
-
-    /// A connection of its own, for a transaction of several statements.
-    pub async fn transaction_connection(&self) -> Result<Leased, AppError> {
-        self.transactions.acquire().await
-    }
 }
 
 fn setting_word(value: &str) -> String {
@@ -86,7 +72,6 @@ fn setting_word(value: &str) -> String {
 struct Session {
     config: Config,
     setup: String,
-    acquire_timeout: Duration,
 }
 
 impl Session {
@@ -239,68 +224,5 @@ impl Shared {
     /// The first column of the row, if there is one.
     pub async fn scalar<T: for<'a> FromSql<'a>>(&self, stmt: &'static Stmt, params: Params<'_>) -> Result<Option<T>, PgError> {
         self.rows(stmt, params, true).await?.first().map(|row| row.try_get(0)).transpose()
-    }
-}
-
-/// Connections held by one request at a time, for transactions.
-struct Exclusive {
-    idle: Mutex<Vec<Client>>,
-    permits: Arc<Semaphore>,
-    session: Arc<Session>,
-}
-
-impl Exclusive {
-    async fn open(session: Arc<Session>, size: usize) -> Result<Exclusive, PgError> {
-        let mut idle = Vec::with_capacity(size.max(1));
-        for _ in 0..size.max(1) {
-            idle.push(session.open().await?);
-        }
-        Ok(Exclusive { permits: Arc::new(Semaphore::new(idle.len())), idle: Mutex::new(idle), session })
-    }
-
-    async fn acquire(self: &Arc<Self>) -> Result<Leased, AppError> {
-        let permit = tokio::time::timeout(self.session.acquire_timeout, self.permits.clone().acquire_owned())
-            .await
-            .map_err(|_| AppError::internal_server_error("no transaction connection within the acquire timeout"))?
-            .map_err(|e| AppError::internal_server_error(format!("pool closed: {e}")))?;
-        let idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner).pop();
-        let client = match idle {
-            Some(client) if !client.is_closed() => client,
-            _ => self.session.open().await.map_err(AppError::db("open a transaction connection"))?,
-        };
-        Ok(Leased { client, pool: self.clone(), permit })
-    }
-}
-
-/// An exclusive connection. Dropped without `release` (a cancelled request), it is closed, never reused.
-pub struct Leased {
-    client: Client,
-    pool: Arc<Exclusive>,
-    permit: OwnedSemaphorePermit,
-}
-
-impl Leased {
-    /// Hands the connection back once its transaction ended, unless the connection itself broke.
-    pub fn release<T>(self, result: Result<T, PgError>) -> Result<T, PgError> {
-        let Leased { client, pool, permit } = self;
-        if !client.is_closed() {
-            pool.idle.lock().unwrap_or_else(PoisonError::into_inner).push(client);
-        }
-        drop(permit);
-        result
-    }
-}
-
-impl Deref for Leased {
-    type Target = Client;
-
-    fn deref(&self) -> &Client {
-        &self.client
-    }
-}
-
-impl DerefMut for Leased {
-    fn deref_mut(&mut self) -> &mut Client {
-        &mut self.client
     }
 }

@@ -6,7 +6,6 @@ mod features;
 mod services;
 
 use std::net::SocketAddr;
-use std::time::Duration;
 
 use anyhow::Context;
 use axum::serve::ListenerExt;
@@ -73,8 +72,6 @@ async fn connect(url: &str) -> anyhow::Result<Db> {
     let settings = db::Settings {
         read_connections: config::env_usize("DB_READ_CONNECTIONS", config::cores() * 2),
         write_connections: config::env_usize("DB_WRITE_CONNECTIONS", config::cores() * 2),
-        transaction_connections: config::env_usize("DB_TRANSACTION_CONNECTIONS", 2),
-        acquire_timeout: Duration::from_secs(config::env_u64("DB_ACQUIRE_TIMEOUT_SECS", 8)),
         statement_timeout_ms: config::env_u64("DB_STATEMENT_TIMEOUT_SECS", 30) * 1000,
         plan_cache_mode: config::env_string("DB_PLAN_CACHE_MODE", "force_generic_plan"),
     };
