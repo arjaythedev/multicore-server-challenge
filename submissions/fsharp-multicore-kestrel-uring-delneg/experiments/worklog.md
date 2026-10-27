@@ -336,3 +336,9 @@ feed count proof adopted, #91's hashagg off measured (no effect).
 - **artx split with distinct ids** (seed, 700 per batch): 6.7-7.2 ms/batch; without the favorite count 3.4-3.6,
   without the author 4.2-4.3, without tag ids 4.4-4.5. The author by `LATERAL ... OFFSET 0` read 5.8-6.6 but has
   the same generic plan (it ran last, warmer): no change possible there.
+- **Overload check on the committed build** (p4 reinstalled): PASS (tags 200; after: 15,463 requests, 0 errors,
+  p99 26 ms).
+- **62 planner clock** (`PLANNER_WAIT_US`, rotated, 14k): 10 ms 156.0 / 172.3 / 174.6 us/req (PG 97-109: smaller
+  batches), 15 ms 146.5 / 147.6 / 160.6, 20 ms (default) 157.7 / 152.9 / 149.9. Shorter clocks raise req/s at a
+  fixed user count and lower p95 (142-150 ms in their fast runs vs 173-182), but not CPU per request.
+  **Discarded**; the clock stays 20 ms.
