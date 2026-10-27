@@ -4,8 +4,9 @@
 ///
 /// - phase A: one statement per kind present, over arrays of DISTINCT keys (one page per (limit, offset), one count
 ///   per tag / author / viewer, one row per slug or username), rows tagged with the key's ordinal k;
-/// - phase B: the union of every article phase A returned, across all endpoints, is enriched once (tag names,
-///   favorite count, author), and the viewer flags are one primary-key scan per viewer (`= ANY`).
+/// - phase B: the union of every article phase A returned, across all endpoints, is enriched once (tag ids,
+///   favorite count, author; the tag names come from one read of all tags, after #47's tag ids + names split), and
+///   the viewer flags are one primary-key scan per viewer (`= ANY`).
 ///
 /// Each distinct article's JSON is written once per batch with both flags false; every response is assembled from
 /// those pieces and its own flags. Only requests already waiting share a batch, and nothing outlives it (rule 5).
@@ -13,6 +14,7 @@ module Planner
 
 open System
 open System.Buffers
+open System.Buffers.Binary
 open System.Buffers.Text
 open System.Collections.Generic
 open System.Text.Encodings.Web
@@ -21,6 +23,8 @@ open Pg
 open Ctx
 
 let enabled = Environment.GetEnvironmentVariable "PLANNER" <> "0"
+/// artx returns tag ids and phase B reads every tag's name once (PLANNER_TAGIDS=0: names per article in artx)
+let private tagIds = Environment.GetEnvironmentVariable "PLANNER_TAGIDS" <> "0"
 
 // ---------- SQL ----------
 
@@ -45,12 +49,12 @@ let mutable SFav: Stmt = null
 let mutable SFeed: Stmt = null
 let mutable SArtx: Stmt = null
 let mutable SFlags: Stmt = null
+let mutable STagAll: Stmt = null
 
 /// an article looked up by id, never folded into a join the generic plan could turn into a scan
 let private byId (id: string) = "CROSS JOIN LATERAL (SELECT a.* FROM articles a WHERE a.id = " + id + " OFFSET 0) a"
 
 let define (feedProof: bool) (feedProofN: int) =
-    let tagOrder = if Json.appSortsTags then "" else " ORDER BY 1"
     SArt <-
         Stmt.Define(
             "SELECT r.k, " + Cols + ", a.body FROM unnest($1::text[]) WITH ORDINALITY r(slug, k) JOIN articles a ON a.slug = r.slug",
@@ -130,11 +134,17 @@ let define (feedProof: bool) (feedProofN: int) =
         )
     SArtx <-
         Stmt.Define(
-            "SELECT r.id, ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at WHERE at.article_id = r.id"
-            + tagOrder + "), (SELECT count(*) FROM favorites f WHERE f.article_id = r.id), u.username, u.bio, u.image "
+            "SELECT r.id, "
+            + (if tagIds then "ARRAY(SELECT at.tag_id FROM article_tags at WHERE at.article_id = r.id), "
+               else "ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at WHERE at.article_id = r.id"
+                    + (if Json.appSortsTags then "" else " ORDER BY 1") + "), ")
+            + "(SELECT count(*) FROM favorites f WHERE f.article_id = r.id), u.username, u.bio, u.image "
             + "FROM unnest($1::int8[], $2::int8[]) r(id, author) JOIN users u ON u.id = r.author",
             I, I
         )
+    // every tag's name in name order, read after artx (a later snapshot: tags are never deleted); the batch maps
+    // its articles' tag ids to names and ranks, so tagList comes out in Postgres's name order
+    STagAll <- Stmt.Define("SELECT t.id::int8, t.name FROM tags t ORDER BY t.name")
     SFlags <-
         Stmt.Define(
             "WITH p AS (SELECT x.v, array_agg(x.a) AS aa FROM unnest($1::int8[], $2::int8[]) x(v, a) GROUP BY x.v), "
@@ -338,6 +348,10 @@ type MegaQuery(cap: int, release: MegaQuery -> unit) =
     let favA = List<int64>()
     let folV = List<int64>()
     let folU = List<int64>()
+    let tagRank = Dictionary<int64, int>() // tag id -> rank in name order
+    let tagOff = List<int>() // by rank: the name in abuf
+    let tagLen = List<int>()
+    let mutable ranks = Array.zeroCreate<int> 64
     let mutable ok = true
 
     let copy (r: PgRow) (i: int) (off: byref<int>) (len: byref<int>) =
@@ -379,6 +393,37 @@ type MegaQuery(cap: int, release: MegaQuery -> unit) =
     let ensure (arr: byref<int[]>) (n: int) =
         if arr.Length < n then arr <- Array.zeroCreate (max n (arr.Length * 2))
 
+    /// tagList: the article's tag ids (an int4[] in binary) mapped to name ranks, sorted, written as names
+    let writeTagIds (a: Art) =
+        jw.WritePropertyName Json.N.tagList
+        jw.WriteStartArray()
+        if a.TagsL >= 20 then
+            let b = aspan a.Tags a.TagsL
+            if BinaryPrimitives.ReadInt32BigEndian b = 1 then
+                let count = BinaryPrimitives.ReadInt32BigEndian(b.Slice 12)
+                if ranks.Length < count then ranks <- Array.zeroCreate (max 64 count)
+                let mutable pos = 20
+                let mutable n = 0
+                for _ in 0 .. count - 1 do
+                    let len = BinaryPrimitives.ReadInt32BigEndian(b.Slice pos)
+                    pos <- pos + 4
+                    if len > 0 then
+                        let id =
+                            if len = 4 then int64 (BinaryPrimitives.ReadInt32BigEndian(b.Slice pos))
+                            else BinaryPrimitives.ReadInt64BigEndian(b.Slice pos)
+                        pos <- pos + len
+                        let mutable rk = 0
+                        if tagRank.TryGetValue(id, &rk) then
+                            let mutable j = n
+                            while j > 0 && ranks.[j - 1] > rk do
+                                ranks.[j] <- ranks.[j - 1]
+                                j <- j - 1
+                            ranks.[j] <- rk
+                            n <- n + 1
+                for j in 0 .. n - 1 do
+                    jw.WriteStringValue(aspan tagOff.[ranks.[j]] tagLen.[ranks.[j]])
+        jw.WriteEndArray()
+
     let fragment (ai: int) (full: bool) =
         let a = arts.[ai]
         jw.Reset()
@@ -390,7 +435,7 @@ type MegaQuery(cap: int, release: MegaQuery -> unit) =
         if full then jw.WriteString(Json.N.body, aspan a.Body (max 0 a.BodyL))
         Json.time jw Json.N.createdAt a.Created
         Json.time jw Json.N.updatedAt a.Updated
-        Json.tagListBytes jw (aspan a.Tags (max 0 a.TagsL))
+        if tagIds then writeTagIds a else Json.tagListBytes jw (aspan a.Tags (max 0 a.TagsL))
         jw.WriteNumber(Json.N.favoritesCount, a.Fc)
         jw.WriteBoolean(Json.N.favorited, false)
         jw.Flush()
@@ -521,6 +566,9 @@ type MegaQuery(cap: int, release: MegaQuery -> unit) =
         favA.Clear()
         folV.Clear()
         folU.Clear()
+        tagRank.Clear()
+        tagOff.Clear()
+        tagLen.Clear()
         ok <- true
         phase <- 0
 
@@ -594,6 +642,10 @@ type MegaQuery(cap: int, release: MegaQuery -> unit) =
                 w.EndArray arts.Count
                 w.EndBind()
                 add 0
+                if tagIds then
+                    w.Bind STagAll
+                    w.EndBind()
+                    add 2
             if favV.Count + folV.Count > 0 then
                 w.Bind SFlags
                 b.LongList(w, favV)
@@ -669,6 +721,13 @@ type MegaQuery(cap: int, release: MegaQuery -> unit) =
                         copy r 4 &a.Bio &a.BioL
                         copy r 5 &a.Img &a.ImgL
                         arts.[ai] <- a
+                elif q = 2 then
+                    let mutable off = 0
+                    let mutable len = 0
+                    copy r 1 &off &len
+                    tagRank.[r.Int8 0] <- tagOff.Count
+                    tagOff.Add off
+                    tagLen.Add(max 0 len)
                 else
                     let t = r.Int8 0
                     if t = 0L then favs.Add(struct (r.Int8 1, r.Int8 2)) |> ignore

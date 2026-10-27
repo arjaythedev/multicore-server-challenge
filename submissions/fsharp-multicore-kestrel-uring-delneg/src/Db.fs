@@ -245,8 +245,7 @@ type BatchQuery(k: Sql.Kind, release: BatchQuery -> unit) =
             w.EndArray n
     override b.Row(_, row) =
         if packing then packer.Row row
-        elif k.Broadcast then
-            for i in 0 .. b.N - 1 do Handlers.batchRow items.[i] row
+        elif k.Broadcast then Handlers.tagsRows items b.N row // the only broadcast kind
         else
             let i = row.Int4 0
             if uint32 i < uint32 b.N then Handlers.batchRow items.[i] row

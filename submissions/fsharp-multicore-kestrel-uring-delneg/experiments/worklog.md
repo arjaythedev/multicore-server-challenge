@@ -262,3 +262,22 @@ feed count proof adopted, #91's hashagg off measured (no effect).
   pieces). Closed-loop req/s at 14k 29.4-29.7k vs 32.0-33.3k, p95 183-210 vs 130-158 ms (one 20 ms clock for all
   eight kinds, then two round trips). Overload check PASS (tags 200, after: 15,433 requests, 0 errors). **Kept, on
   by default** (`PLANNER=0` falls back).
+- **Planner pg_stat_statements** (12k, PLANNER=1): 366 s exec at ~26.4k req/s (13.9 ms/req; #47 13.1). Feed 97 s
+  (18.5 ms/call, below #47's 19.4: the count proof), artx 95 s (15.7 ms; #47 artx 70 + tagnames 9), comments
+  54 s, flags 29 s, tag list 24 s, article 15 s, author list 11 s.
+- **Per-thread app CPU** (perf, 12k): planner postgres thread 13.0 us/req vs 10.3, I/O threads 23.5 vs 20.8,
+  bcrypt 29.6 vs 29.0. On the postgres thread, writing `/api/tags` bodies (one per request, the full tag list)
+  was ~1.5% of the app's samples: now written once per broadcast batch and copied (`Handlers.tagsRows`).
+- **artx replay** (`scripts/artx.sh`, 700 newest-skewed articles per batch, generic plans, backend CPU, 3 runs):
+  names by per-tag subquery (ours) 12.6-13.1 ms; #47's tag ids + tagnames 11.9-12.6; names by join 19.5-20.7
+  (worse); tag ids alone 10.3-10.9. 200 tags in the seed and after a run, so reading all `(id, name)` once per
+  batch is nearly free. Split of the tag-id form: no favorite count 3.7-3.9, no author join 8.2-9.0, no tags
+  8.3-8.5: the exact favorite count is ~65% (the newest 700 articles carry ~21k favorites, max 1,578 on one).
+- **Feed page cutoff replay** (`scripts/feedpl.sh`, 44 feed pages per batch over random followers, limit 10,
+  offset 0 or 10-40): current planner feed 11.3-11.8 ms per batch (counts alone 3.2); with #102's cutoff (the
+  batch's most shared followees' (limit + offset)-th newest id bounds every follower's per-followee scan): 2 of
+  8 followees 8.0-8.4, 2/32 8.6-9.0, 1/64 9.1-10.1, 1/1000 18.9-20.4. Rows equal on 30 batches.
+- **52 tag ids in artx** (p3; A,B alternating x3, `PLANNER_TAGIDS=0` as the old arm): 14k 153.3 / 153.8 / 150.2
+  vs 154.3 / 157.5 / 163.4 us/req (mean -3.8%, PG 89-93 vs 94-101); 12k 170.1 / 162.4 / 152.7 vs 172.7 / 174.9
+  / 158.4 (-4.1%). cmp 603 requests 0 differ (tag order included), 197/197 dev and seed. **Kept.** The 12k
+  screens of the planner are bimodal (PG ~92-100 or ~105-109 per run, in both arms); 14k is steadier.

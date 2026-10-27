@@ -260,6 +260,25 @@ let private feed (c: Ctx) (query: ReadOnlySpan<byte>) =
 
 // ---------- batched reads: rows and completion (Postgres thread) ----------
 
+let private tagsBuf = System.Buffers.ArrayBufferWriter<byte>(4096)
+let private tagsW =
+    new Utf8JsonWriter(tagsBuf, JsonWriterOptions(Encoder = Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping, SkipValidation = true))
+
+/// GET /api/tags, broadcast: the body is written once per batch and copied into each waiting response
+let tagsRows (items: Ctx[]) (n: int) (r: PgRow) =
+    tagsBuf.ResetWrittenCount()
+    tagsW.Reset tagsBuf
+    tagsW.WriteStartObject()
+    tagsW.WritePropertyName N.tags
+    textArray tagsW (r.Bytes 1)
+    tagsW.WriteEndObject()
+    tagsW.Flush()
+    let body = tagsBuf.WrittenSpan
+    for i in 0 .. n - 1 do
+        let c = items.[i]
+        c.W.WriteRawValue(body, true)
+        c.Found <- true
+
 let batchRow (c: Ctx) (r: PgRow) =
     let w = c.W
     match c.Route with

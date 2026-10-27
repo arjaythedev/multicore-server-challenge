@@ -35,13 +35,14 @@ from #22). Every statement takes the requests as arrays (`unnest(...)`), and not
 tag, author, favorited, feed) goes into one batch, answered in two pipelined round trips on one read connection.
 Phase A runs one statement per kind present, over the DISTINCT keys: one page per (key, limit, offset), one count
 per tag, author or viewer, one row per slug or username. Phase B enriches the union of every article phase A
-returned once (tag names, favorite count, author), and reads the viewer flags with one primary-key scan per
-viewer (`= ANY`). Each article's JSON is written once per batch; each response is put together from those pieces
+returned once (tag ids, favorite count, author; the tag names come from one read of every `(id, name)` in name
+order, in the same round trip), and reads the viewer flags with one primary-key scan per viewer (`= ANY`). Each article's JSON is written once per batch; each response is put together from those pieces
 and its own flags. `PLANNER=0` falls back to the per-kind statements below.
 
 **Packed lists (#82)** (planner off). For lists above a small batch size, each distinct page is read once and each distinct
 article once (tags, favorite count, author); then each request gets one row with its page ids and its
-`favorited` and `following` flags. `GET /api/tags` is one execution for everyone queued (#48).
+`favorited` and `following` flags. `GET /api/tags` is one execution for everyone queued (#48), its body written
+once and copied into each response.
 
 **Feed counts.** Most feeds hit the 1000 cap. In each feed batch, the followees that at least two viewers share
 (up to 8) are probed once for a 1000th article, in the same statement. A viewer who follows one gets the capped
@@ -72,6 +73,7 @@ All optional; the defaults suit the 8-vCPU box.
 | `BATCH_MAX`, `BATCH_INFLIGHT` | 64, 6 | batch cap, statements in flight per kind |
 | `BCRYPT_LANES`, `BCRYPT_THREADS` | 5, 2 | hashes in lockstep, hasher threads |
 | `PLANNER`, `PLANNER_MAX` | on, 2048 | `0` turns the batch planner off; requests per planner batch |
+| `PLANNER_TAGIDS` | on | `0`: tag names per article in the enrichment statement |
 | `FEED_PROOF` | on | `0` turns the shared feed count probe off |
 | `MC_STATS` | off | `1` logs batch sizes every 5 s |
 
