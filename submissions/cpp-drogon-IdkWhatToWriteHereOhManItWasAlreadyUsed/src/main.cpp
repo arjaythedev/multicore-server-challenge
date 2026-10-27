@@ -72,6 +72,7 @@ int main()
 
     drogon::app().enableServerHeader(false);
     drogon::app().enableDateHeader(false);
+    drogon::app().disableSigtermHandling();
 
     const char* host = envOr("HOST", "127.0.0.1");
     const char* port = envOr("PORT", "3000");
