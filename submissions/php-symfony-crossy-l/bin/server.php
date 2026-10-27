@@ -6,6 +6,7 @@ use App\Kernel;
 use App\Shared\Infrastructure\Server\ConnectionLimit;
 use App\Shared\Infrastructure\Server\RequestHandler;
 use App\Shared\Infrastructure\Worker\OpenWorkerConnections;
+use App\Shared\Infrastructure\Worker\TaskWorkers;
 use Swoole\Http\Request;
 use Swoole\Http\Response;
 use Swoole\Http\Server;
@@ -57,11 +58,20 @@ $server->set([
     'http_parse_cookie' => false,
     'http_parse_files' => false,
     'log_level' => SWOOLE_LOG_WARNING,
+    // Password hashing runs here (see TaskWorkers), one job at a time per task worker.
+    'task_worker_num' => (int) $setting('PHP_TASK_WORKERS'),
+    'task_enable_coroutine' => false,
+    'task_max_request' => 0,
 ]);
 
 $handler = null;
 
-$server->on('workerStart', static function () use (&$handler, $setting): void {
+$server->on('workerStart', static function (Server $server) use (&$handler, $setting): void {
+    // A task worker only runs jobs; it needs neither the kernel nor Postgres.
+    if ($server->taskworker) {
+        return;
+    }
+
     $kernel = Kernel::fromContext(['APP_ENV' => $setting('APP_ENV'), 'APP_DEBUG' => $setting('APP_DEBUG')]);
     $kernel->boot();
 
@@ -70,23 +80,45 @@ $server->on('workerStart', static function () use (&$handler, $setting): void {
     \assert($startup instanceof OpenWorkerConnections);
     $startup();
 
+    if ($server->setting['task_worker_num'] > 0) {
+        $taskWorkers = $container->get(TaskWorkers::class);
+        \assert($taskWorkers instanceof TaskWorkers);
+        $taskWorkers->attach($server);
+    }
+
     $http = $container->get('http_kernel');
     \assert($http instanceof \Symfony\Component\HttpKernel\HttpKernelInterface);
     $handler = new RequestHandler($http);
 });
 
+$server->on('task', static fn (Server $server, int $taskId, int $workerId, mixed $job): array => TaskWorkers::perform($job));
+
+$crashed = false;
+
+// A worker that dies stops the server, instead of Swoole's manager starting a new one in its place.
+$server->on('workerError', static function (Server $server, int $workerId, int $workerPid, int $exitCode, int $signal) use (&$crashed): void {
+    $crashed = true;
+    fwrite(STDERR, "worker $workerId (pid $workerPid) died with exit code $exitCode, signal $signal; stopping the server\n");
+    $server->shutdown();
+});
+
 $served = 0;
 
 $server->on('request', static function (Request $request, Response $response) use (&$handler, &$served): void {
-    $reply = $handler->handle($request->server ?? [], $request->header ?? [], $request->get ?? [], (string) $request->rawContent());
+    // Nothing a request throws may end the worker.
+    try {
+        $reply = $handler->handle($request->server ?? [], $request->header ?? [], $request->get ?? [], (string) $request->rawContent());
 
-    $response->status($reply->status);
+        $response->status($reply->status);
 
-    foreach ($reply->headers as [$name, $value]) {
-        $response->header($name, $value);
+        foreach ($reply->headers as [$name, $value]) {
+            $response->header($name, $value);
+        }
+
+        $response->end($reply->body);
+    } catch (Throwable $failure) {
+        error_log((string) $failure);
     }
-
-    $response->end($reply->body);
 
     if (++$served % COLLECT_EVERY === 0) {
         gc_collect_cycles();
@@ -94,3 +126,5 @@ $server->on('request', static function (Request $request, Response $response) us
 });
 
 $server->start();
+
+exit($crashed ? 1 : 0);

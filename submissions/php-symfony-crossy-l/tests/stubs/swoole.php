@@ -9,6 +9,19 @@ namespace {
 }
 
 namespace Swoole {
+    class Server
+    {
+        /**
+         * @param list<mixed> $tasks
+         *
+         * @return array<int, mixed>|false
+         */
+        public function taskCo(array $tasks, float $timeout = 0.5): array|false
+        {
+            return [];
+        }
+    }
+
     class Coroutine
     {
         public static function getCid(): int

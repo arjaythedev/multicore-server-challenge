@@ -13,17 +13,18 @@ layers with command and query handlers, checked by static analysis, and no trick
 cached between requests, every token and password is checked in full, writes are committed before the response).
 
 It is not the fastest design possible. Where speed and structure pulled apart, the structure stayed unless the cost
-showed in measurements. Known limits: a worker is single-threaded, so slow work such as hashing delays that worker's
-other requests; TLS needs a proxy in front; there is no metrics endpoint.
+showed in measurements. Known limits: a worker is single-threaded, so any slow work added to a request would delay
+that worker's other requests (password hashing runs in task workers for that reason); TLS needs a proxy in front; there
+is no metrics endpoint.
 
 | Piece | Version |
 |---|---|
 | Language | PHP 8.5.12, from the php.net tarball (sha256-checked) |
 | Server | Swoole 6.2.0 (a PHP extension), built from its release tag, checked against its commit; one single-threaded event loop per worker process |
 | Framework | Symfony 8.1 (`framework-bundle`, `runtime`, `console`), nothing else |
-| Postgres driver | `ext-pgsql` (libpq), a small pool of connections per worker that the worker's requests wait on without blocking each other, every statement prepared once per connection |
+| Postgres driver | `ext-pgsql` (libpq), one connection per worker by default, which the worker's requests wait on without blocking each other, every statement prepared once per connection |
 | Tokens | HS256 JSON Web Tokens, signed and verified in `src/Shared/Infrastructure/Security` (no library) |
-| Passwords | `password_hash` / `password_verify`, bcrypt cost 10 |
+| Passwords | `password_hash` / `password_verify`, bcrypt cost 10, in Swoole task workers |
 | Composer | 2.10.3 |
 
 `install.sh` installs and pins all of it. `build.sh` installs the production dependencies and builds the
@@ -43,18 +44,21 @@ DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=multic
 | `DATABASE_URL`, `JWT_SECRET` | Required |
 | `HOST`, `PORT` | Listen address (default `127.0.0.1:3000`; `0.0.0.0:80` to serve the internet directly) |
 | `PHP_WORKERS` | Worker processes (default: the number of CPUs) |
-| `PG_CONNECTIONS` | Postgres connections each worker keeps (default 2) |
+| `PG_CONNECTIONS` | Postgres connections each worker keeps (default 1) |
+| `PHP_TASK_WORKERS` | Processes that hash passwords for the workers (default: the number of CPUs) |
 
 `PHP_WORKERS * PG_CONNECTIONS` is the number of connections the server holds. `start.sh` refuses to start above 90,
 which leaves room under the box's limit of 95.
 
 Every user's connection is an open file, so `start.sh` raises the soft limit on open files to the hard limit, and the
-server holds as many connections as that allows, up to 200,000. A stop request (SIGTERM or SIGINT to `start.sh`) is
-passed on to the server and repeated until it has stopped.
+server holds as many connections as that allows, up to 200,000. Swoole also gives every connection a 64 KB receive
+buffer from the worker's PHP heap, of which a request writes only the first few KB, so `php.ini` sets `memory_limit`
+to 2G per worker: a worker holding 10,000 connections counts about 700 MB there and uses about 70 MB. A stop request
+(SIGTERM or SIGINT to `start.sh`) is passed on to the server and repeated until it has stopped.
 
 Every worker is a process that accepts connections on the shared port itself (`SO_REUSEPORT`) and stops only with the
-server. A request that throws is answered with a JSON 500 and the worker carries on. Swoole's manager would start a
-worker again if one did exit; the server never asks one to stop (`max_request` is 0) and nothing in the code exits.
+server. A request that throws is answered with a JSON 500 and the worker carries on. If a worker dies anyway, the
+server stops and `start.sh` exits with 1, instead of Swoole's manager starting a replacement.
 
 ## Test it
 
@@ -124,6 +128,8 @@ connection's transaction helper).
   in one round trip. The statement is the single request's own, run once per request as a lateral subquery over
   arrays of their parameters, so each request gets exactly its own rows and nothing is shared or kept between
   requests. If a batch fails, its requests run one by one and only the one at fault is told.
+- **Hashing off the event loop.** A bcrypt hash takes about 40 ms. Task workers do it, so the worker that received a
+  login keeps answering its other requests meanwhile.
 - **No TLS to Postgres.** The database is on this machine, so `start.sh` sets `PGSSLMODE=disable`.
 - **Tracing JIT.** `opcache.jit = tracing` compiles the hot paths of the framework and of the application.
 - **Prepared once.** Every statement is prepared once per connection and executed by name.

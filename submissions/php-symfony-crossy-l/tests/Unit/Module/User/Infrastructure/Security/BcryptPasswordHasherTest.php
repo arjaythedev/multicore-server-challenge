@@ -6,6 +6,7 @@ namespace App\Tests\Unit\Module\User\Infrastructure\Security;
 
 use App\Module\User\Infrastructure\Security\BcryptPasswordHasher;
 use App\Shared\Domain\Model\Exception\ValidationException;
+use App\Shared\Infrastructure\Worker\TaskWorkers;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
@@ -13,7 +14,7 @@ final class BcryptPasswordHasherTest extends TestCase
 {
     public function testHashesTheWholePasswordWithCostTenAndAFreshSalt(): void
     {
-        $hasher = new BcryptPasswordHasher();
+        $hasher = new BcryptPasswordHasher(new TaskWorkers());
         $password = str_repeat('a', 72);
         $hash = $hasher->hash($password);
 
@@ -36,6 +37,6 @@ final class BcryptPasswordHasherTest extends TestCase
     public function testRejectsPasswordsBcryptCannotRepresent(string $password): void
     {
         $this->expectException(ValidationException::class);
-        new BcryptPasswordHasher()->hash($password);
+        new BcryptPasswordHasher(new TaskWorkers())->hash($password);
     }
 }

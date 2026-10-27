@@ -44,6 +44,7 @@ use App\Shared\Domain\Security\AccessTokenServiceInterface;
 use App\Shared\Infrastructure\Persistence\Pg\PgConnection;
 use App\Shared\Infrastructure\Security\Hs256AccessTokenService;
 use App\Shared\Infrastructure\Worker\OpenWorkerConnections;
+use App\Shared\Infrastructure\Worker\TaskWorkers;
 use App\Shared\Interface\Http\LeanHttpKernel;
 
 return static function (ContainerConfigurator $container): void {
@@ -88,6 +89,10 @@ return static function (ContainerConfigurator $container): void {
 
     // The server script starts each worker through this one.
     $services->set(OpenWorkerConnections::class)
+        ->public();
+
+    // The server script hands it the server, whose task workers run the jobs.
+    $services->set(TaskWorkers::class)
         ->public();
 
     // The server script gets the kernel by this name.
