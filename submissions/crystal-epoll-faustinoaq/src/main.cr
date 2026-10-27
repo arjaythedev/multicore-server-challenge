@@ -23,7 +23,7 @@ workers = (Sys.env("WORKERS") || Sys.ncpu.clamp(1, 2).to_s).to_i
 per_worker = (Sys.env("PG_CONNS") || (95 // workers).clamp(1, 4).to_s).to_i
 bcrypt_threads = (Sys.env("BCRYPT_THREADS") || "2").to_i
 depth = (Sys.env("PG_DEPTH") || "2").to_i
-window = (Sys.env("BATCH_WINDOW_US") || "20000").to_i
+window = (Sys.env("BATCH_WINDOW_US") || "50000").to_i
 Jwt.init(secret)
 nofile = Sys.raise_nofile
 nofile = 1_u64 << 21 if nofile > (1_u64 << 21)

@@ -74,6 +74,80 @@ module Sql
   TAG_ID    = "(SELECT t.id FROM tags t WHERE t.name = k.s)"
   USER_NAME = "(SELECT uu.id FROM users uu WHERE uu.username = k.s)"
 
+  # A round shares enrichment across global/tag/author/favorite pages, feeds and
+  # article lookups. Page and count keys are independently deduplicated. Viewer
+  # flags scan each viewer's relevant primary-key ranges once for the union.
+  # Counts contain exactly the request keys: FULL JOIN preserves the left-join
+  # semantics while preventing a nested scan under generic-plan estimates.
+  MIXED = <<-SQL
+    WITH r AS MATERIALIZED (
+      SELECT *, CASE WHEN t = 4 THEN v ELSE 0 END AS kv
+      FROM unnest($1::int8[], $2::int8[], $3::int8[], $4::text[], $5::int4[])
+        WITH ORDINALITY r(v,l,o,s,t,n)
+    ), k AS MATERIALIZED (SELECT DISTINCT t,l,o,s,kv FROM r),
+    p AS MATERIALIZED (
+      SELECT k.*, x.id FROM k CROSS JOIN LATERAL (
+        (SELECT a.id FROM articles a WHERE k.t = 0 ORDER BY a.id DESC LIMIT k.l OFFSET k.o)
+        UNION ALL
+        (SELECT at.article_id FROM article_tags at WHERE k.t = 1 AND at.tag_id =
+          (SELECT id FROM tags WHERE name = k.s) ORDER BY at.article_id DESC LIMIT k.l OFFSET k.o)
+        UNION ALL
+        (SELECT a.id FROM articles a WHERE k.t = 2 AND a.author_id =
+          (SELECT id FROM users WHERE username = k.s) ORDER BY a.id DESC LIMIT k.l OFFSET k.o)
+        UNION ALL
+        (SELECT f.article_id FROM favorites f WHERE k.t = 3 AND f.user_id =
+          (SELECT id FROM users WHERE username = k.s) ORDER BY f.article_id DESC LIMIT k.l OFFSET k.o)
+        UNION ALL
+        (SELECT x.id FROM follows fo CROSS JOIN LATERAL
+          (SELECT a.id FROM articles a WHERE a.author_id = fo.followee_id ORDER BY a.id DESC LIMIT k.l+k.o) x
+          WHERE k.t = 4 AND fo.follower_id = k.kv ORDER BY x.id DESC LIMIT k.l OFFSET k.o)
+        UNION ALL
+        SELECT a.id FROM articles a WHERE k.t = 5 AND a.slug = k.s
+      ) x
+    ), ck AS MATERIALIZED (SELECT DISTINCT t,s,kv FROM r),
+    counts AS MATERIALIZED (
+      SELECT ck.*, CASE t
+        WHEN 0 THEN (SELECT count(*) FROM (SELECT 1 FROM articles LIMIT 1000) z)
+        WHEN 1 THEN (SELECT count(*) FROM (SELECT 1 FROM article_tags WHERE tag_id =
+          (SELECT id FROM tags WHERE name = ck.s) LIMIT 1000) z)
+        WHEN 2 THEN (SELECT count(*) FROM (SELECT 1 FROM articles WHERE author_id =
+          (SELECT id FROM users WHERE username = ck.s) LIMIT 1000) z)
+        WHEN 3 THEN (SELECT count(*) FROM (SELECT 1 FROM favorites WHERE user_id =
+          (SELECT id FROM users WHERE username = ck.s) LIMIT 1000) z)
+        WHEN 4 THEN (SELECT count(*) FROM (SELECT 1 FROM articles WHERE author_id IN
+          (SELECT followee_id FROM follows WHERE follower_id = ck.kv) LIMIT 1000) z)
+        ELSE 0 END AS total FROM ck
+    )
+    SELECT r.n, p.id, counts.total
+    FROM r FULL JOIN counts ON counts.t = r.t AND counts.s = r.s AND counts.kv = r.kv
+    LEFT JOIN p ON p.t = r.t AND p.l = r.l AND p.o = r.o AND p.s = r.s AND p.kv = r.kv
+    ORDER BY r.n, p.id DESC
+    SQL
+
+  # Phase B returns each article once. The application fans rows out to requests;
+  # PostgreSQL never serializes the same article once per overlapping page.
+  SHARED_ENRICH = <<-SQL
+    SELECT x.* FROM (SELECT DISTINCT unnest($1::int8[]) AS id) d CROSS JOIN LATERAL (
+      SELECT a.id, a.slug, a.title, a.description,
+        CASE WHEN a.id = ANY($2::int8[]) THEN a.body ELSE '' END,
+        a.created_at, a.updated_at,
+        ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) AS name
+          FROM article_tags at WHERE at.article_id = a.id ORDER BY 1),
+        (SELECT count(*) FROM favorites f WHERE f.article_id = a.id),
+        false, u.username, u.bio, u.image, false, a.author_id
+      FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id = d.id OFFSET 0
+    ) x ORDER BY x.id
+    SQL
+  SHARED_FAVORITES = <<-SQL
+    SELECT user_id, article_id FROM favorites
+    WHERE user_id = ANY($2::int8[]) AND article_id = ANY($1::int8[])
+    SQL
+  SHARED_FOLLOWS = <<-SQL
+    WITH authors AS MATERIALIZED (SELECT ARRAY(SELECT DISTINCT author_id FROM articles WHERE id = ANY($1::int8[])) AS ids)
+    SELECT f.follower_id, f.followee_id FROM authors CROSS JOIN follows f
+    WHERE f.follower_id = ANY($2::int8[]) AND f.followee_id = ANY(authors.ids)
+    SQL
+
   ALL = [
     # 0 TAGS
     "SELECT name FROM tags ORDER BY name",
@@ -198,6 +272,7 @@ module Sql
     "SELECT r.n, c.id, c.body, c.created_at, c.updated_at, c.username, c.bio, c.image, " \
     "EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.v AND fo.followee_id = c.author_id) " \
     "FROM r JOIN c ON c.s = r.s ORDER BY r.n, c.created_at DESC, c.id DESC",
+    MIXED, SHARED_ENRICH, SHARED_FAVORITES, SHARED_FOLLOWS,
   ]
 
   TAGS            =  0
@@ -235,4 +310,8 @@ module Sql
   B_ARTICLE       = 44
   B_ARTICLE_ID    = 45
   B_COMMENTS      = 46
+  B_MIXED         = 47
+  SHARED_ARTICLES = 48
+  SHARED_FAV      = 49
+  SHARED_FOLLOW   = 50
 end

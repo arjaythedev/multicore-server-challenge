@@ -82,6 +82,9 @@ class Job
   property row = Pointer(UInt8).null # login: the user row, kept across the bcrypt check
   property sub = Pointer(Job).null    # a read batch: its requests
   property nsub = 0
+  property ids = Pointer(Int64).null
+  property nids = 0
+  property solo = false
   property read = false # a read sent on its own: counts as a read batch in flight
 
   def initialize(cap : Int32)
@@ -127,6 +130,7 @@ class Job
     LibC.free(@tag_off) unless @tag_off.null?
     LibC.free(@tag_len) unless @tag_len.null?
     LibC.free(@row) unless @row.null?
+    LibC.free(@ids) unless @ids.null?
     LibC.free(@sub.as(Void*)) unless @sub.null?
     GC.free(self.as(Void*))
   end
@@ -152,6 +156,7 @@ module App
   K_COMMENTS         = 17
   K_ADD_COMMENT      = 18
   K_DELETE_COMMENT   = 19
+  K_WRITE_BATCH      = 21
   K_BATCH            = 20
 
   # Read batch classes: reads of one class share statements.
@@ -162,20 +167,23 @@ module App
   B_FEED     = 7
   B_ARTICLE  = 8
   B_COMMENTS = 9
-  NB         = 10
-  BATCH_MAX  = 256
+  B_MIXED    = 10
+  NB         = 11
+  BATCH_MAX  = 1024
 
   GZIP_MIN = 1024
 
   @@body = Buf.new(16)
   @@deflate = Pointer(Void).null
 
+  @@shared : Bool = Sys.env("SHARED_READS") != "0"
   @@synth = Buf.new(16)
   @@bq = Pointer(Pointer(Job)).null # per class, the reads waiting for a connection
   @@bn = Pointer(Int32).null
   @@bcap = Pointer(Int32).null
   @@rr = 0
   @@depth = 2
+  @@clock : Bool = Sys.env("READ_CLOCK") != "0"
   @@window = 0_i64 # ns
   @@last = 0_i64
   @@rinf = 0       # read batches in flight
@@ -232,6 +240,9 @@ module App
   end
 
   private def self.bclass(j : Job) : Int32
+    if @@shared && (j.kind == K_LIST || j.kind == K_FEED || j.kind == K_ARTICLE)
+      return B_MIXED
+    end
     case j.kind
     when K_TAGS     then B_TAGS
     when K_USER_GET then B_USER
@@ -244,17 +255,16 @@ module App
     end
   end
 
-  # End of an event-loop round: the reads that piled up go out as batches, one per class.
-  # While earlier read batches are still running, a new round waits until `window` has
-  # passed since the last one, so batches stay big under load (more requests share each
-  # statement and each looked-up row); with nothing in flight a read goes out at once.
+  # End of an event-loop round: dispatch the waiting reads on one process clock.
+  # The clock also runs when Postgres is idle, allowing larger batches after a
+  # fast query. READ_CLOCK=0 restores the earlier in-flight-only collection window.
   # Each connection takes at most `depth` requests at a time.
   def self.dispatch : Nil
     any = false
     NB.times { |b| any = true if @@bn[b] > 0 }
     return unless any
     now = Sys.now_ns(Sys::CLOCK_MONOTONIC)
-    if @@rinf > 0 && now &- @@last < @@window
+    if (@@clock || @@rinf > 0) && now &- @@last < @@window
       Uring.arm_timer(@@last &+ @@window &- now)
       return
     end
@@ -275,7 +285,7 @@ module App
       q = @@bq[b]
       sent = true
       @@rinf &+= 1
-      if take == 1
+      if take == 1 && b != B_MIXED
         q[0].read = true
         step(q[0])
       else
@@ -330,6 +340,26 @@ module App
     n = bj.nsub
     b = bj.step
     case b
+    when B_MIXED
+      at = Pg.bind(c, Sql::B_MIXED, 5)
+      arr_pages(c, s, n)
+      key = Pg.arr_begin(c)
+      n.times do |i|
+        j = s[i]
+        if j.kind == K_LIST && j.filter == 0 || j.kind == K_FEED
+          Pg.arr_str(c, i, "".to_unsafe, 0)
+        else
+          Pg.arr_str(c, i, j.ptr(Job::F_FILTER), j.len[Job::F_FILTER])
+        end
+      end
+      Pg.arr_done(c, key)
+      key = Pg.arr_begin(c)
+      n.times do |i|
+        j = s[i]
+        Pg.arr_int(c, i, j.kind == K_FEED ? 4_i64 : j.kind == K_ARTICLE ? 5_i64 : j.filter.to_i64)
+      end
+      Pg.arr_done(c, key)
+      Pg.execute(c, at)
     when B_TAGS
       Pg.execute(c, Pg.bind(c, Sql::TAGS, 0))
     when B_USER
@@ -391,6 +421,9 @@ module App
         s[i].read = true
         step(s[i])
       end
+    elsif bj.step == B_MIXED
+      on_shared(bj, r)
+      return
     elsif bj.step == B_TAGS
       n.times { |i| on_result(s[i], res) }
     else
@@ -407,6 +440,156 @@ module App
         on_result(s[i], pointerof(sub))
       end
     end
+    bj.free
+  end
+
+  private def self.shared_ids(c : Pg::Conn, bj : Job) : Nil
+    at = Pg.arr_begin(c)
+    bj.nids.times { |i| Pg.arr_int(c, i, bj.ids[i]) }
+    Pg.arr_done(c, at)
+  end
+
+  # Phase A keeps only the request/page mapping and counts. Phase B reads the
+  # union once, then the application assembles each request's normal result rows.
+  private def self.on_shared(bj : Job, r : Pg::Result) : Nil
+    if bj.id == 0
+      c = Pg.pick
+      unless c
+        bj.nsub.times { |i| fixed(bj.sub[i], Resp::INTERNAL) }
+        bj.free
+        return
+      end
+      bj.row = LibC.malloc(r.size).as(UInt8*)
+      bj.row.copy_from(r.ptr, r.size)
+      bj.id = r.size.to_i64
+      # ANY scans must receive the distinct union too. Sending repeated page IDs
+      # makes PostgreSQL sort a large duplicate array again for every viewer.
+      nrows = r.count(0)
+      bj.ids = LibC.malloc((nrows + 1) * 8).as(Int64*)
+      cap = 8_u64
+      while cap < nrows * 2
+        cap *= 2
+      end
+      seen = LibSys.calloc(cap, 8).as(Int64*)
+      r.each(0) do |row|
+        row.skip
+        id = row.int
+        if id > 0
+          slot = (id.to_u64! &* 0x9e3779b97f4a7c15_u64) & (cap - 1)
+          while seen[slot] != 0 && seen[slot] != id
+            slot = (slot + 1) & (cap - 1)
+          end
+          if seen[slot] == 0
+            seen[slot] = id
+            bj.ids[bj.nids] = id
+            bj.nids += 1
+          end
+        end
+      end
+      LibC.free(seen)
+      at = Pg.bind(c, Sql::SHARED_ARTICLES, 2)
+      shared_ids(c, bj)
+      full = Pg.arr_begin(c)
+      n = 0
+      r.each(0) do |row|
+        ord = row.int.to_i32 - 1
+        id = row.int
+        if id > 0 && bj.sub[ord].kind == K_ARTICLE
+          Pg.arr_int(c, n, id)
+          n += 1
+        end
+      end
+      Pg.arr_done(c, full)
+      Pg.execute(c, at)
+      {Sql::SHARED_FAV, Sql::SHARED_FOLLOW}.each do |stmt|
+        at = Pg.bind(c, stmt, 2)
+        shared_ids(c, bj)
+        arr_viewers(c, bj.sub, bj.nsub)
+        Pg.execute(c, at)
+      end
+      @@rinf += 1
+      Pg.sync(c, bj)
+      return
+    end
+
+    count = r.count(0)
+    ids = LibC.malloc((count + 1) * 8).as(Int64*)
+    authors = LibC.malloc((count + 1) * 8).as(Int64*)
+    rows = LibC.malloc((count + 1) * sizeof(Pointer(UInt8))).as(UInt8**)
+    idx = 0
+    r.each(0) do |row|
+      rows[idx] = row.ptr
+      ids[idx] = row.int
+      13.times { row.skip }
+      authors[idx] = row.int
+      idx += 1
+    end
+    fav = FlagSet.new(r, 1)
+    follows = FlagSet.new(r, 2)
+    off = 0
+    bj.nsub.times do |i|
+      sy = @@synth
+      sy.clear
+      j = bj.sub[i]
+      list = j.kind != K_ARTICLE
+      countptr = Pointer(UInt8).null
+      while off < bj.id
+        size = (bj.row + off + 1).as(Int32*).value
+        row = Pg::Row.new(bj.row + off + 7)
+        ord = row.int.to_i32
+        break if ord != i + 1
+        id = row.int
+        countptr = row.ptr
+        # Phase-B rows are ordered by id; a binary search avoids a mutable cache.
+        lo = 0
+        hi = count
+        while lo < hi
+          mid = (lo + hi) // 2
+          if ids[mid] < id
+            lo = mid + 1
+          else
+            hi = mid
+          end
+        end
+        if lo < count && ids[lo] == id
+          p = rows[lo]
+          start = sy.len
+          sy << 0_u8
+          sy.reserve(6)
+          sy.len += 4
+          sy << 0_u8 << (list ? 13_u8 : 14_u8)
+          14.times do |col|
+            len = Pg.u32(p)
+            bytes = 4 + (len < 0 ? 0 : len)
+            if col == 9 || col == 13
+              flag = col == 9 ? fav.has?(j.viewer, id) : follows.has?(j.viewer, authors[lo])
+              sy << 0_u8 << 0_u8 << 0_u8 << 1_u8 << (flag ? 116_u8 : 102_u8)
+            elsif !(list && col == 4)
+              sy.write(p, bytes)
+            end
+            p += bytes
+          end
+          (sy.ptr + start + 1).as(Int32*).value = sy.len - start - 5
+        end
+        off += size + 5
+      end
+      if list && !countptr.null?
+        start = sy.len
+        sy << 1_u8
+        sy.reserve(6)
+        sy.len += 4
+        sy << 0_u8 << 1_u8
+        sy.write(countptr, 4 + Pg.u32(countptr))
+        (sy.ptr + start + 1).as(Int32*).value = sy.len - start - 5
+      end
+      sub = Pg::Result.new(sy.ptr, sy.len, false, 0_u64)
+      on_result(j, pointerof(sub))
+    end
+    fav.free
+    follows.free
+    LibC.free(ids)
+    LibC.free(authors)
+    LibC.free(rows)
     bj.free
   end
 
@@ -437,6 +620,49 @@ module App
     off
   end
 
+  def self.write?(j : Job) : Bool
+    case j.kind
+    when K_USER_PUT, K_REGISTER, K_FOLLOW, K_UNFOLLOW, K_CREATE_ARTICLE,
+         K_UPDATE_ARTICLE, K_DELETE_ARTICLE, K_FAVORITE, K_UNFAVORITE,
+         K_ADD_COMMENT, K_DELETE_COMMENT
+      true
+    else
+      false
+    end
+  end
+
+  private def self.on_write_batch(group : Job, res : Pg::Result*) : Nil
+    r = res.value
+    if r.err
+      # A Sync closes the failed implicit transaction: all its writes rolled back.
+      # Retry each request alone, preserving ordinary per-request errors.
+      group.nsub.times do |i|
+        j = group.sub[i]
+        j.solo = true
+        step(j)
+      end
+    else
+      off = 0
+      group.nsub.times do |i|
+        sy = @@synth
+        sy.clear
+        lo = group.tag_off[i]
+        hi = group.tag_off[i + 1]
+        while off < r.size
+          set = r.ptr[off].to_i32
+          break if set >= hi
+          len = (r.ptr + off + 1).as(Int32*).value
+          sy << (set - lo).to_u8
+          sy.write(r.ptr + off + 1, len + 4)
+          off += len + 5
+        end
+        sub = Pg::Result.new(sy.ptr, sy.len, false, 0_u64)
+        on_result(group.sub[i], pointerof(sub))
+      end
+    end
+    group.free
+  end
+
   private def self.step(j : Job) : Nil
     if j.kind == K_REGISTER || (j.kind == K_USER_PUT && j.step == 0 && j.has?(Job::F_PASSWORD))
       if j.step == 0
@@ -446,7 +672,7 @@ module App
         return
       end
     end
-    c = Pg.pick
+    c = write?(j) && !j.solo ? Pg.write_pick : Pg.pick
     unless c
       fail(j)
       return
@@ -613,6 +839,10 @@ module App
 
   def self.on_result(j : Job, res : Pg::Result*) : Nil
     read_done(j)
+    if j.kind == K_WRITE_BATCH
+      on_write_batch(j, res)
+      return
+    end
     if j.kind == K_BATCH
       on_batch(j, res)
       return
@@ -944,7 +1174,7 @@ module App
 
   def self.fail(j : Job) : Nil
     read_done(j)
-    if j.kind == K_BATCH
+    if j.kind == K_BATCH || j.kind == K_WRITE_BATCH
       j.nsub.times { |i| fixed(j.sub[i], Resp::INTERNAL) }
       j.free
       return
@@ -1025,4 +1255,43 @@ lib LibDeflate
   fun alloc_compressor = libdeflate_alloc_compressor(level : LibC::Int) : Void*
   fun gzip_compress = libdeflate_gzip_compress(c : Void*, input : Void*, n : LibC::SizeT, output : Void*, avail : LibC::SizeT) : LibC::SizeT
   fun gzip_bound = libdeflate_gzip_compress_bound(c : Void*, n : LibC::SizeT) : LibC::SizeT
+end
+
+struct FlagSet
+  @pairs : Int64*
+  @mask : UInt64
+  def initialize(r : Pg::Result, set : Int32)
+    cap = 8_u64
+    n = r.count(set)
+    while cap < n * 4
+      cap *= 2
+    end
+    @mask = cap - 1
+    @pairs = LibSys.calloc(cap * 2, 8).as(Int64*)
+    r.each(set) do |row|
+      viewer = row.int
+      target = row.int
+      at = slot(viewer, target)
+      @pairs[at * 2] = viewer
+      @pairs[at * 2 + 1] = target
+    end
+  end
+
+  private def slot(viewer : Int64, target : Int64) : UInt64
+    at = ((viewer.to_u64! &* 0x9e3779b97f4a7c15_u64) ^ (target.to_u64! &* 0xbf58476d1ce4e5b9_u64)) & @mask
+    while @pairs[at * 2] != 0 && (@pairs[at * 2] != viewer || @pairs[at * 2 + 1] != target)
+      at = (at + 1) & @mask
+    end
+    at
+  end
+
+  def has?(viewer : Int64, target : Int64) : Bool
+    return false if viewer == 0
+    at = slot(viewer, target)
+    @pairs[at * 2] == viewer && @pairs[at * 2 + 1] == target
+  end
+
+  def free : Nil
+    LibC.free(@pairs)
+  end
 end

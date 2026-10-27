@@ -8,12 +8,10 @@ require "openssl/hmac"
 require "openssl/pkcs5"
 require "random/secure"
 
-# A Postgres wire-protocol client written for this server: a few connections per worker,
-# each a pipeline. A request's statements go out as Bind/Execute pairs on prepared
-# statements followed by one Sync (one implicit transaction per request, so a failing
-# request never touches another), appended to the connection's output during a batch and
-# sent in one write at its end. Replies come back in order, so each connection keeps a
-# FIFO of the jobs waiting on it; at ReadyForQuery the job gets the rows it asked for.
+# Postgres v3 prepared statements and pipelining. Reads end with their own Sync.
+# The write connection groups a round's Bind/Execute pairs before a single Sync:
+# PostgreSQL commits that implicit transaction before sending ReadyForQuery.
+# Rows stay buffered until then; failed groups are retried as individual requests.
 module Pg
   struct Query
     getter job : Job
@@ -37,6 +35,9 @@ module Pg
     property qhead = 0_u32
     property qtail = 0_u32
     property qcap = 1024_u32
+    property group_at = 0_i64
+    property group : Job? = nil
+    property statements = 0
     property set = 0_u8 # result set (statement) of the front job the next DataRow belongs to
     property err = false
     property code = 0_u64          # SQLSTATE, 5 bytes packed
@@ -74,6 +75,8 @@ module Pg
     end
   end
 
+  @@group_commit : Bool = Sys.env("GROUP_COMMIT") != "0"
+  @@write_window : Int64 = (Sys.env("WRITE_WINDOW_US") || "20000").to_i64.clamp(0_i64, 50000_i64) * 1000
   @@conns = Pointer(Conn).null
   @@n = 0
   @@rr = 0
@@ -174,7 +177,8 @@ module Pg
       # session settings: timestamps come back as "YYYY-MM-DD HH:MM:SS.ffffff+00"
       {"user" => user, "database" => db, "client_encoding" => "UTF8", "TimeZone" => "UTC",
        "DateStyle" => "ISO, MDY", "application_name" => "conduit-crystal", "jit" => "off",
-       "plan_cache_mode" => "force_generic_plan", "max_parallel_workers_per_gather" => "0"}.each { |k, v| cstr(io, k); cstr(io, v) }
+       "plan_cache_mode" => "force_generic_plan", "max_parallel_workers_per_gather" => "0",
+       "enable_seqscan" => (Sys.env("PG_INDEX_LOOKUPS") == "0" ? "on" : "off")}.each { |k, v| cstr(io, k); cstr(io, v) }
       io.write_byte(0_u8)
     })
     nonce = client_first = ""
@@ -268,9 +272,29 @@ module Pg
       @@rr &+= 1
       @@rr = 0 if @@rr == @@n
       next unless c.alive
+      next if @@group_commit && @@n > 1 && c.idx == 0
+      finish_group(c) if @@group_commit && @@n == 1
       best = c if best.nil? || c.pending < best.pending
     end
     best
+  end
+
+  # Writes have one connection so a round can share one implicit transaction.
+  def self.write_pick : Conn?
+    return pick unless @@group_commit
+    c = @@conns[0]
+    return nil unless c.alive
+    finish_group(c) if c.group.try { |g| g.nsub >= 48 }
+    c
+  end
+
+  private def self.finish_group(c : Conn) : Nil
+    if group = c.group
+      c.group = nil
+      c.qbuf << "S\0\0\0\x04"
+      c.push(Query.new(group))
+      c.statements = 0
+    end
   end
 
   @[AlwaysInline]
@@ -376,16 +400,34 @@ module Pg
 
   # Result formats (all text), then Execute (all rows); fixes the Bind length.
   def self.execute(c : Conn, at : Int32) : Nil
+    c.statements += 1
     o = c.qbuf
     o << 0_u8 << 0_u8
     be32(o.ptr + (at &+ 1), o.len &- at &- 1)
     o << "E\0\0\0\x09\0\0\0\0\0"
   end
 
-  # Ends the job's statements: one Sync, and the job waits for its ReadyForQuery.
+  # End a read/retry with Sync, or append a write to this round's transaction.
   def self.sync(c : Conn, job : Job) : Nil
+    if @@group_commit && App.write?(job) && !job.solo
+      group = c.group
+      unless group
+        group = Job.new(8)
+        group.kind = App::K_WRITE_BATCH
+        group.sub = LibC.malloc(48 * sizeof(Job)).as(Job*)
+        group.tag_off = LibC.malloc(49 * 4).as(Int32*)
+        group.tag_off[0] = 0
+        c.group = group
+        c.group_at = Sys.now_ns(Sys::CLOCK_MONOTONIC)
+      end
+      group.sub[group.nsub] = job
+      group.nsub += 1
+      group.tag_off[group.nsub] = c.statements
+      return
+    end
     c.qbuf << "S\0\0\0\x04"
     c.push(Query.new(job))
+    c.statements = 0
   end
 
   # End of a batch: each connection's queued queries go out in one send.
@@ -393,6 +435,14 @@ module Pg
     @@n.times do |i|
       c = @@conns[i]
       next if c.sending || c.qbuf.len == 0 || !c.alive
+      if group = c.group
+        remaining = @@write_window - (Sys.now_ns(Sys::CLOCK_MONOTONIC) - c.group_at)
+        if remaining > 0 && group.nsub < 48
+          Uring.arm_timer(remaining)
+          next
+        end
+        finish_group(c)
+      end
       t = c.sbuf
       c.sbuf = c.qbuf
       c.qbuf = t
@@ -422,6 +472,10 @@ module Pg
   def self.lost(c : Conn) : Nil
     return unless c.alive
     c.alive = false
+    if group = c.group
+      c.group = nil
+      App.fail(group)
+    end
     STDERR.puts "postgres connection #{c.idx} lost"
     while c.pending > 0
       job = c.front.value.job
