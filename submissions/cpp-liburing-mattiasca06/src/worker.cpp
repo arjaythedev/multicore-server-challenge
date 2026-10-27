@@ -6,6 +6,7 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/eventfd.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -738,6 +739,36 @@ void Worker::on_efd() {
     }
 }
 
+// Registers the provided-buffer ring. Ubuntu 24.04 kernels 6.8.0-1xx carry a backport whose reserved-field check is
+// inverted (`if (!memchr_inv(reg.resv, 0, ...)) return -EINVAL`), so every registration with zeroed reserved fields
+// fails with EINVAL, liburing's included. On EINVAL, register again by hand with a non-zero reserved byte, which that
+// kernel accepts. A correct kernel never reaches the retry: it accepts the first call.
+static io_uring_buf_ring *setup_buf_ring(io_uring *ring, unsigned entries, int bgid, int *err) {
+    if (io_uring_buf_ring *br = io_uring_setup_buf_ring(ring, entries, bgid, 0, err)) return br;
+    if (*err != -EINVAL) return nullptr;
+    const size_t sz = size_t(entries) * sizeof(io_uring_buf);
+    void *m = mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    if (m == MAP_FAILED) {
+        *err = -errno;
+        return nullptr;
+    }
+    io_uring_buf_reg reg{};
+    reg.ring_addr = reinterpret_cast<uintptr_t>(m);
+    reg.ring_entries = entries;
+    reg.bgid = uint16_t(bgid);
+    reg.resv[0] = 1;
+    int rc = io_uring_register_buf_ring(ring, &reg, 0);
+    if (rc < 0) {
+        munmap(m, sz);
+        *err = rc;
+        return nullptr;
+    }
+    auto *br = static_cast<io_uring_buf_ring *>(m);
+    io_uring_buf_ring_init(br);
+    *err = 0;
+    return br;
+}
+
 void Worker::run() {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     int one = 1;
@@ -765,7 +796,7 @@ void Worker::run() {
         exit(1);
     }
     int err = 0;
-    br_ = io_uring_setup_buf_ring(&ring_, kBufCount, kBgid, 0, &err);
+    br_ = setup_buf_ring(&ring_, kBufCount, kBgid, &err);
     if (!br_) {
         fprintf(stderr, "io_uring_setup_buf_ring: %s\n", strerror(-err));
         exit(1);
