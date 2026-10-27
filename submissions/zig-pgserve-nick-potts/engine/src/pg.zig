@@ -38,6 +38,9 @@ pub const Table = struct {
     /// records as predicate locks).
     peek: bool,
     buf: c.Buffer = c.InvalidBuffer,
+    /// `buf`'s block, so moveTo tells whether a row is on the pinned block without BufferGetBlockNumber, a
+    /// call that reads the buffer's descriptor, a line every backend pinning the block writes.
+    blk: u32 = c.InvalidBlockNumber,
     /// The visibility-map page last read for this table, kept pinned until close, its map block and its
     /// bytes: every index walk over the table reads the map, and one map page covers 32,672 heap pages.
     vm: c.Buffer = c.InvalidBuffer,
@@ -166,10 +169,11 @@ pub const Table = struct {
     /// Pins heap block `blk` unless it is pinned already; true when it moved.
     fn moveTo(self: *Table, blk: u32, row: u16) bool {
         if (self.buf != c.InvalidBuffer) {
-            if (c.BufferGetBlockNumber(self.buf) == blk) return false;
+            if (self.blk == blk) return false;
             c.ReleaseBuffer(self.buf);
         }
         self.buf = readBuffer(self.rel, blk, .{ .row = row });
+        self.blk = blk;
         return true;
     }
     /// VM_ALL_VISIBLE for heap block `blk`. The bit is read off the pinned map page, unlocked, as

@@ -459,6 +459,12 @@ the execution's memory context and die with it.
   where no temporary relation can be.
 - **Lazy tuple slots.** A table's slot is made on its first heap fetch, so tables only walked for visibility
   never make one.
+- **A table remembers which heap block it has pinned.** Whether the next row is on that block is a compare of
+  block numbers, not a call to `BufferGetBlockNumber`, which reads the buffer's descriptor (a line every other
+  backend pinning the block writes). `BufferGetBlockNumber` was 0.42% of the box's CPU at 300,000 users, from
+  every caller; this one runs per heap row and per visibility check, the rest once per walk. Six backends on an
+  aged copy, 5 rounds: instructions per request on the request mix -0.2% at batch 8 (4 of 5 rounds lower) and
+  -0.3% at batch 32 (5 of 5), feed -0.6% / -0.7%. Cycles were within the noise.
 
 ### State kept per backend, and rule 5
 
@@ -675,6 +681,8 @@ same build in the same series. Engine rows are dev-seed instructions per request
 | a page's first lines requested before its pin | replay cycles 1.035 (3 of 8 rounds lower) | Unresolved, kept. |
 | `aim` (staged leaf searches) | +6-26% instructions on the dev seed; a build without it: list_all -11 to -14% instructions, -6 to -13% CPU | Shipped. Not measured alone on the full seed. This is the one we'd test next. |
 | byte order for every text comparison | profile -22% to -61% | Wrong under some collations. We used it as an upper bound for the collation self-test. |
+| a backend's pins held to Postgres's 8-entry refcount array: past 8 pins, every pin and unpin also pays a hash lookup (`hash_search_with_hash_value` and `GetPrivateRefCountEntry` were 3.9% of the box at 300,000 users). Index pages were kept only while fewer than 6 pins were held, and a table's new pin took a kept page back | batch 8, six backends, aged copy: hash lookups per article request 28 → 2, but pins 15 → 18 and list_tag's 109 → 236; instructions on the request mix +1.5%, list_tag +7.4% | Each hash lookup saved came back as an extra pin and unpin, and on a busy box a pin is the dearer of the two: an atomic on a descriptor other backends write. |
+| ...keeping no index page at all; keeping only internal pages | +1.5% and +0.6% instructions on the request mix | |
 
 Small regressions we accepted for larger gains elsewhere:
 
