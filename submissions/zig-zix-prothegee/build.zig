@@ -75,6 +75,11 @@ pub fn build(b: *std.Build) void {
 
     exec_main.root_module.addImport("zix", zix_module);
 
+    if (optimize != .debug) {
+        exec_main.lto = .full;
+        exec_main.root_module.strip = true;
+    }
+
     b.installArtifact(exec_main);
 
     // --------------------------------------------------------- //
