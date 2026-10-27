@@ -239,3 +239,26 @@ Kept this session: the batch-shared feed count proof (3093246) and 5 bcrypt lane
 (ed47939). Addendum items: buffer ring with the resv retry measured and dropped (noise); loops, server GC, clock,
 spin and ring-wait knobs re-measured (defaults stay); PR ideas from #47, #91, #95, #97, #99, #100 reviewed, #100's
 feed count proof adopted, #91's hashagg off measured (no effect).
+
+## Run 2 ([McscFs2], from 27 Oct; budget 100 experiments from n=51)
+
+- **Baselines** (ed47939, 12k): 168.9 / 167.1 us/req (app 58.7 / 56.6, PG 112.0 / 112.0); #47 on the same box 184.2 /
+  190.7 (app 78.6 / 77.9, PG 107.5 / 114.0) at 24.8k req/s (its 400 ms bcrypt window and 20 ms lane clock add
+  ~85 ms of p50, so its closed-loop users send less). **Heavy screen = 14,000 users** at think-scale 0.1: 32.3k
+  req/s, 174.1 us/req, p95 140 ms; the load generator's process used 81% of its 2 CPUs and never fell behind
+  (box 7.2 of 8 cores busy). 12k and 14k from here on.
+- **pg_stat_statements at 12k** (pgss.sh: extension on for one run, reset at 75 s, dropped after; one window
+  each). Ours (on.env, 29.7k req/s): 460 s of exec time; feed packed 184 s (33.4 ms x 5,526 calls, ~40%), article
+  76 s (6.6 ms), comments 54 s (2.6 ms), author/tag packed lists 50 + 40 s, global packed 16 s, favorited 13 s,
+  writes ~15 s. #47 (25.2k req/s): 331 s; feed 105 s (19.4 ms, pages only, no enrichment), artx 70 s
+  (11.4 ms), comments 49 s, flags 29 s, tag list 20 s, article base 13 s, author list 10 s, tagnames 9 s. Per
+  request ~15.5 ms ours vs ~13.1 ms #47: the planner (phase A pages + phase B artx/flags once per article) is
+  where #47 saves Postgres time.
+- **n=51 planner stats** (PLANNER=1, MC_STATS, 12k): 163.8 us/req (app 64.2, PG 100.2) but 26.4k req/s, p50 75 ms
+  (all eight read kinds wait for one 20 ms clock, then two phases in a row); ~48 planner batches/s of ~410 requests.
+- **51 batch planner** (#47, `src/Planner.fs`; A,B alternating x3): 12k 164.3 / 172.6 / 159.7 vs 167.6 / 168.1 /
+  168.1 us/req (mean -1.4%); 14k 160.2 / 158.4 / 162.4 vs 166.8 / 170.9 / 174.1 (mean -6.0%). Postgres drops
+  ~15 us/req (96-99 vs 111-116 at 14k), the app gains ~7 (64-65 vs 57-59: per-batch key tables, row copies, JSON
+  pieces). Closed-loop req/s at 14k 29.4-29.7k vs 32.0-33.3k, p95 183-210 vs 130-158 ms (one 20 ms clock for all
+  eight kinds, then two round trips). Overload check PASS (tags 200, after: 15,433 requests, 0 errors). **Kept, on
+  by default** (`PLANNER=0` falls back).

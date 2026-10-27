@@ -25,6 +25,7 @@
     <Compile Include="Sql.fs" />
     <Compile Include="Ctx.fs" />
     <Compile Include="Handlers.fs" />
+    <Compile Include="Planner.fs" />
     <Compile Include="Ring.fs" />
     <Compile Include="Db.fs" />
     <Compile Include="Http.fs" />

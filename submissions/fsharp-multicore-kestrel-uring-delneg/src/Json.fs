@@ -68,10 +68,11 @@ let private greater (b: ReadOnlySpan<byte>) (struct (xo: int, xl: int)) (struct 
 
 /// "tagList": a text[] column decoded from its binary form (ndim, has-null flag, element type, per dimension size
 /// and lower bound, then per element a length (-1 = NULL) and the UTF-8 bytes).
-let tagList (w: Utf8JsonWriter) (r: PgRow) (i: int) =
+let rec tagList (w: Utf8JsonWriter) (r: PgRow) (i: int) = tagListBytes w (r.Bytes i)
+
+and tagListBytes (w: Utf8JsonWriter) (b: ReadOnlySpan<byte>) =
     w.WritePropertyName N.tagList
     w.WriteStartArray()
-    let b = r.Bytes i
     if b.Length >= 12 && BinaryPrimitives.ReadInt32BigEndian b = 1 then
         let count = BinaryPrimitives.ReadInt32BigEndian(b.Slice 12)
         if isNull Tls.Items || Tls.Items.Length < count then Tls.Items <- Array.zeroCreate (max 64 count)

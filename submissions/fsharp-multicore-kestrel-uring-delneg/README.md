@@ -31,7 +31,15 @@ profile, ...) has one queue for the whole box.
 pays its per-statement cost once per batch, not once per request (the clock is from #79, the batching policy
 from #22). Every statement takes the requests as arrays (`unnest(...)`), and nothing outlives its statement.
 
-**Packed lists (#82).** For lists above a small batch size, each distinct page is read once and each distinct
+**Batch planner (#47).** Every waiting GET of an article, its comments, a profile or an article list (global,
+tag, author, favorited, feed) goes into one batch, answered in two pipelined round trips on one read connection.
+Phase A runs one statement per kind present, over the DISTINCT keys: one page per (key, limit, offset), one count
+per tag, author or viewer, one row per slug or username. Phase B enriches the union of every article phase A
+returned once (tag names, favorite count, author), and reads the viewer flags with one primary-key scan per
+viewer (`= ANY`). Each article's JSON is written once per batch; each response is put together from those pieces
+and its own flags. `PLANNER=0` falls back to the per-kind statements below.
+
+**Packed lists (#82)** (planner off). For lists above a small batch size, each distinct page is read once and each distinct
 article once (tags, favorite count, author); then each request gets one row with its page ids and its
 `favorited` and `following` flags. `GET /api/tags` is one execution for everyone queued (#48).
 
@@ -63,6 +71,7 @@ All optional; the defaults suit the 8-vCPU box.
 | `BATCH_WAIT_US` | 20000 | batch clock |
 | `BATCH_MAX`, `BATCH_INFLIGHT` | 64, 6 | batch cap, statements in flight per kind |
 | `BCRYPT_LANES`, `BCRYPT_THREADS` | 5, 2 | hashes in lockstep, hasher threads |
+| `PLANNER`, `PLANNER_MAX` | on, 2048 | `0` turns the batch planner off; requests per planner batch |
 | `FEED_PROOF` | on | `0` turns the shared feed count probe off |
 | `MC_STATS` | off | `1` logs batch sizes every 5 s |
 
@@ -79,10 +88,14 @@ them), `-think-scale 0.1`, fresh database per run:
 
 | Users | req/s | box CPU per request | app | Postgres | p95 |
 |--:|--:|--:|--:|--:|--:|
-| 12,000 | ~29,700 | 163-168 us | 55-57 us | 110-112 us | 64-77 ms |
-| 6,000 | ~15,160 | 172-176 us | 63-65 us | 110-114 us | 35 ms |
+| 14,000 | ~29,600 | 158-162 us | 64-65 us | 95-99 us | 183-210 ms |
+| 12,000 | ~26,400 | 160-173 us | 64-66 us | 96-107 us | ~150 ms |
+| 12,000, `PLANNER=0` | ~29,700 | 163-168 us | 55-57 us | 110-112 us | 64-77 ms |
+| 14,000, `PLANNER=0` | ~32,500 | 167-174 us | 57-60 us | 111-116 us | 130-158 ms |
 
-12,000 users at `-think-scale 0.1` is about the request rate of 120,000 real users. Measured the same way:
+12,000 users at `-think-scale 0.1` is about the request rate of 120,000 real users. The load generator's users
+are closed-loop, so the planner's longer waits (two round trips after the 20 ms clock) lower its req/s at a fixed
+user count. Measured the same way:
 rust-epoll-WorriedArrow (#47) 184-191 us/req, go-epoll-MegaPanchamZ (#61) 217-226. About half of the app's CPU
 is bcrypt. Holds at real think time with tens of thousands of users are limited by the load generator on this
 box, so they say nothing about the server here.
@@ -93,6 +106,7 @@ Every experiment, kept or not, with its numbers: `experiments/worklog.md` and `e
 
 - csharp-sockets-jh-d (#22): the SQL, routing and JSON this started from, and the batching policy.
 - rust-tokio-Scooter1337 (#7): shared list SQL; c-iouring-tigokraft (#10): the bcrypt core (MIT).
+- rust-epoll-WorriedArrow (#47): the two-phase batch planner and its flags statement.
 - #82: packed list results; #79: the 20 ms batch clock; #48: tags broadcast; #100: the feed count probe.
 - rust-epoll-WorriedArrow (#47), go-epoll-MegaPanchamZ (#61), c-epoll-umitaltintas (#91) and others: ideas
   measured here (see the worklog), most of them as references on the same box.

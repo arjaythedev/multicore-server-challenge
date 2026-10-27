@@ -337,6 +337,24 @@ type PgThread(o: Options) as this =
     let stKB = Array.zeroCreate<int64> 64
     let stKI = Array.zeroCreate<int64> 64
     let mutable stLast = Environment.TickCount64
+    // the planner (default on, PLANNER=0 off): these kinds' requests go out together, as one MegaQuery (Planner.fs, #47)
+    let mega =
+        kinds |> Array.map (fun k ->
+            Planner.enabled
+            && (k.Id = Sql.Article.Id || k.Id = Sql.Comments.Id || k.Id = Sql.Profile.Id || k.Id = Sql.ListAll.Id
+                || k.Id = Sql.ListTag.Id || k.Id = Sql.ListAuthor.Id || k.Id = Sql.ListFavorited.Id || k.Id = Sql.ListFeed.Id))
+    let megaMax =
+        match Environment.GetEnvironmentVariable "PLANNER_MAX" with
+        | null | "" -> 2048
+        | s -> int s
+    let megaFree = Stack<Planner.MegaQuery>()
+    let mutable megaInflight = 0
+    let mutable stMega = 0L
+    let mutable stMegaItems = 0L
+    let releaseMega = fun (b: Planner.MegaQuery) ->
+        megaInflight <- megaInflight - 1
+        megaFree.Push b
+        needPump <- true
 
     do
         for i in 0 .. o.Reads + o.Writes - 1 do
@@ -386,6 +404,33 @@ type PgThread(o: Options) as this =
             stKI.[k] <- stKI.[k] + int64 n
         if isNull conn then b.Done(PgError("08006", "no postgres connection")) else conn.Submit b |> ignore
 
+    member private this.Mega(conn: PgConn) =
+        let b = if megaFree.Count > 0 then megaFree.Pop() else Planner.MegaQuery(megaMax, releaseMega)
+        let mutable n = 0
+        // oldest kinds first, until the batch is full
+        let mutable more = true
+        while more && n < megaMax do
+            let mutable kb = -1
+            let mutable tb = Int64.MaxValue
+            for k in 0 .. kinds.Length - 1 do
+                if mega.[k] && pending.[k].Count > 0 && pending.[k].Peek().Queued < tb then
+                    tb <- pending.[k].Peek().Queued
+                    kb <- k
+            if kb < 0 then more <- false
+            else
+                let p = pending.[kb]
+                while n < megaMax && p.Count > 0 do
+                    b.Items.[n] <- p.Dequeue()
+                    n <- n + 1
+        b.N <- n
+        b.Conn <- conn
+        megaInflight <- megaInflight + 1
+        if stats then
+            stMega <- stMega + 1L
+            stMegaItems <- stMegaItems + int64 n
+        b.Plan()
+        conn.Submit b |> ignore
+
     member private this.Pump() : int64 =
         needPump <- false
         let now = if waitTicks > 0L then Diagnostics.Stopwatch.GetTimestamp() else 0L
@@ -405,9 +450,21 @@ type PgThread(o: Options) as this =
         while go do
             let mutable best = -1
             let mutable oldest = Int64.MaxValue
+            if Planner.enabled && megaInflight < reads.Count then
+                let mutable total = 0
+                let mutable t0 = Int64.MaxValue
+                for k in 0 .. kinds.Length - 1 do
+                    if mega.[k] && pending.[k].Count > 0 then
+                        total <- total + pending.[k].Count
+                        t0 <- min t0 (pending.[k].Peek().Queued)
+                if total > 0 then
+                    if waitTicks > 0L && total < megaMax && now - t0 < waitTicks then next <- min next (t0 + waitTicks - now)
+                    else
+                        oldest <- t0
+                        best <- kinds.Length // the planner batch
             for k in 0 .. kinds.Length - 1 do
                 let p = pending.[k]
-                if p.Count > 0 && inflight.[k] < kinds.[k].MaxInflight && not kinds.[k].Write then
+                if p.Count > 0 && inflight.[k] < kinds.[k].MaxInflight && not kinds.[k].Write && not mega.[k] then
                     let t = p.Peek().Queued
                     if waitTicks > 0L && p.Count < kinds.[k].MaxBatch && now - t < waitTicks then
                         next <- min next (t + waitTicks - now)
@@ -420,6 +477,7 @@ type PgThread(o: Options) as this =
                 for c in reads do
                     if not c.Broken && c.Inflight < o.Depth && (isNull conn || c.Inflight < conn.Inflight) then conn <- c
                 if isNull conn then go <- false
+                elif best = kinds.Length then this.Mega conn
                 else this.Batch(best, conn)
         if next = Int64.MaxValue then 0L else max 1L next
 
@@ -500,6 +558,10 @@ type PgThread(o: Options) as this =
                         (if stBatches > 0L then float stItems / float stBatches else 0.0) q
                         (String.Join(",", conns |> Seq.map (fun c -> string c.Inflight)))
                     eprintfn "pg kinds %s" (String.Join(" ", kinds |> Seq.filter (fun k -> stKB.[k.Id] > 0L) |> Seq.map (fun k -> sprintf "%s=%d/%.1f" k.Name stKB.[k.Id] (float stKI.[k.Id] / float stKB.[k.Id]))))
+                    if Planner.enabled then
+                        eprintfn "pg planner batches=%d avg=%.1f" stMega (if stMega > 0L then float stMegaItems / float stMega else 0.0)
+                        stMega <- 0L
+                        stMegaItems <- 0L
                     Array.Clear stKB
                     Array.Clear stKI
                     stBatches <- 0L

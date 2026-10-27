@@ -45,6 +45,8 @@ let main _ =
         | "b" -> codePoint col.[2] // builtin C / C.UTF-8
         | _ -> false // ICU: Postgres sorts
     Sql.define ()
+    if Planner.enabled then
+        Planner.define (Environment.GetEnvironmentVariable "FEED_PROOF" <> "0") (envNum "FEED_PROOF_N" 8)
     // experiments: write the batched statements out (for replays) and stop
     match Environment.GetEnvironmentVariable "MC_DUMP_SQL" with
     | null
