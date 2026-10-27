@@ -315,3 +315,14 @@ feed count proof adopted, #91's hashagg off measured (no effect).
   everything is cached, shared_buffers 4 GB). Same copy, distinct ids: artx per-article counts 7.2-7.4 vs grouped
   7.7-8.0, as n=55 found. `age-mc.sh` now looks authors up by row number (47 s instead of 30+ min) and
   refuses to start under 5.5 GB free (the copy and its WAL took the box to 1.1 GB once; dropped at once).
+- **58 `enable_memoize = on`** (session setting, off since the start): generic plans add Memoize over the feed and
+  tag pages' article fetch and the comments' users lookup. 14k 149.2 / 151.5 / 165.2 vs 145.9 / 151.9 / 157.5;
+  12k 156.3 / 159.9 / 152.6 vs 150.6 / 155.7 / 146.5. **Discarded.**
+- **59 v1's knobs on the planner build** (14k, one round each of on, `LOOPS=1`, `BATCH_MAX=256`, 4 read
+  connections with dispatch depth 2, bcrypt waits 400 ms, `PLANNER_WAIT_US=30000`): on 149.7 / 164.7 / 156.5,
+  l1 145.3 / 143.5 / 145.5, b256 145.8 / 142.6 / 146.9, c4d2 150.4 / 143.2 / 145.6, bw400 153.2 / 144.0 / 146.4,
+  pw30 153.0 / 146.9 / 146.2. The on arm always ran first in its round: inconclusive. One I/O loop had less
+  kernel time in every round (sys 18.0-18.2 vs 19.5-20); l1 and b256 re-tested in rotated order (v2r2).
+- **Postgres profile at 14k** (perf over all backends): index descents dominate (`_bt_first` 35% inclusive,
+  `_bt_search` 18%, `_bt_compare` 10% self), subplans 20%, heap fetches 16%, buffer lookups 4.5% self; the wire
+  protocol does not show. Fewer separate index scans is the only lever left on the Postgres side.
