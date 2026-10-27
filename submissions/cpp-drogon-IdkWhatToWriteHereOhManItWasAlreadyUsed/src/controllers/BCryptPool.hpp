@@ -108,7 +108,7 @@ private:
                 }
                 if (!q_.empty()) cv_.notify_one();
             }
-
+            LOG_DEBUG << "bcrypt batch size=" << set.size();
             jobs.resize(set.size());
             jobPtrs.resize(set.size());
             for (size_t i = 0; i < set.size(); ++i) {
