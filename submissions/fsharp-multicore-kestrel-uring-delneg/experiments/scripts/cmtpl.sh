@@ -23,6 +23,7 @@ A="$HEAD, u.username, u.bio, u.image $FROM LEFT JOIN users u ON u.id = c.author_
 B="$HEAD, u.username, u.bio, u.image $FROM LEFT JOIN users u ON u.id = c.author_id"
 C="$HEAD, u.username, u.bio, u.image $FROM LEFT JOIN LATERAL (SELECT u.username, u.bio, u.image FROM users u WHERE u.id = c.author_id OFFSET 0) u ON true $ORD"
 D="$HEAD, NULL::text, NULL::text, NULL::text $FROM $ORD"
+E="WITH c AS MATERIALIZED (SELECT r.k, a.id AS aid, c.id, c.body, c.created_at, c.updated_at, c.author_id $FROM), u AS MATERIALIZED (SELECT u.id, u.username, u.bio, u.image FROM users u WHERE u.id = ANY (ARRAY(SELECT DISTINCT c.author_id FROM c WHERE c.author_id IS NOT NULL))) SELECT c.k, c.aid, c.id, c.body, c.created_at, c.updated_at, c.author_id, u.username, u.bio, u.image FROM c LEFT JOIN u ON u.id = c.author_id ORDER BY c.k, c.created_at DESC, c.id DESC"
 STAT="(string_to_array(split_part(pg_read_file('/proc/' || :pid || '/stat'), ') ', 2), ' '))[12:13]::int8[]"
 ex() { awk '{print "EXECUTE q('\''" $0 "'\'');"}' "$@"; }
 run() {
@@ -37,10 +38,32 @@ run() {
   } > $f
   echo "$1: $(sudo -u postgres psql -X -At -d $DB -f $f 2>&1 | tail -1) ms/batch"
 }
-# B's row order equals A's?
+if [ "${U:-0}" = 1 ]; then
+  # U: comment authors as one users-by-id statement (distinct, sorted ids), timed alone; D + U vs A
+  UIN=$W/uin-$DB-$N-$R.txt
+  awk '{print "SELECT coalesce(array_agg(DISTINCT c.author_id ORDER BY c.author_id), '\''{}'\'')::text FROM unnest('\''" $0 "'\''::text[]) r(slug) JOIN articles a ON a.slug = r.slug CROSS JOIN LATERAL (SELECT c.author_id FROM comments c WHERE c.article_id = a.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c;"}' $IN > $W/uin.sql
+  sudo -u postgres psql -X -At -d $DB -f $W/uin.sql > $UIN
+  echo "authors per batch: $(awk -F, '{s+=NF} END {printf "%.0f", s/NR}' $UIN)"
+  runu() {
+    local f=$W/run-$1.sql
+    { echo "SET plan_cache_mode = force_generic_plan; SET jit = off; SET max_parallel_workers_per_gather = 0;"
+      echo "PREPARE q(int8[]) AS $2;"
+      echo "SELECT pg_backend_pid() AS pid \\gset"
+      echo "\\o /dev/null"; head -10 $UIN | ex; echo "\\o"
+      echo "SELECT x[1] + x[2] AS t0 FROM (SELECT $STAT AS x) s \\gset"
+      echo "\\o /dev/null"; ex $UIN; echo "\\o"
+      echo "SELECT round((x[1] + x[2] - :t0) * 10.0 / $R, 2) AS ms_per_batch FROM (SELECT $STAT AS x) s;"
+    } > $f
+    echo "$1: $(sudo -u postgres psql -X -At -d $DB -f $f 2>&1 | tail -1) ms/batch"
+  }
+  for r in 1 2 3; do run A "$A"; run D "$D"; runu U "SELECT u.id, u.username, u.bio, u.image FROM users u WHERE u.id = ANY (\$1)"; done
+  exit 0
+fi
+# B's and E's rows equal A's, in order?
 { echo "SET plan_cache_mode = force_generic_plan; SET jit = off; SET enable_memoize = off;"
-  echo "PREPARE a(text[]) AS $A;"; echo "PREPARE b(text[]) AS $B;"
-  head -20 $IN | awk '{print "\\o /tmp/cmtpl/a.out\nEXECUTE a('\''" $0 "'\'');\n\\o /tmp/cmtpl/b.out\nEXECUTE b('\''" $0 "'\'');\n\\! cmp -s /tmp/cmtpl/a.out /tmp/cmtpl/b.out || echo ORDER-DIFF"}'
+  echo "PREPARE a(text[]) AS $A;"; echo "PREPARE b(text[]) AS $B;"; echo "PREPARE e(text[]) AS $E;"
+  head -20 $IN | awk '{print "\\o /tmp/cmtpl/a.out\nEXECUTE a('\''" $0 "'\'');\n\\o /tmp/cmtpl/b.out\nEXECUTE b('\''" $0 "'\'');\n\\o /tmp/cmtpl/e.out\nEXECUTE e('\''" $0 "'\'');\n\\o\n\\! cmp -s /tmp/cmtpl/a.out /tmp/cmtpl/b.out || echo B-DIFF\n\\! cmp -s /tmp/cmtpl/a.out /tmp/cmtpl/e.out || echo E-DIFF"}'
 } > $W/ord.sql
-echo "order check: $(sudo -u postgres psql -X -At -d $DB -f $W/ord.sql 2>&1 | grep -c ORDER-DIFF) of 20 batches differ; rows/batch $(wc -l < $W/a.out)"
-for r in 1 2 3; do run A "$A"; run B "$B"; run C "$C"; run D "$D"; done
+sudo -u postgres psql -X -At -d $DB -f $W/ord.sql > $W/ord.out 2>&1
+echo "order check: B $(grep -c B-DIFF $W/ord.out), E $(grep -c E-DIFF $W/ord.out) of 20 batches differ; errors $(grep -c ERROR $W/ord.out); rows/batch $(wc -l < $W/a.out)"
+for r in 1 2 3; do run A "$A"; run B "$B"; run E "$E"; run D "$D"; done

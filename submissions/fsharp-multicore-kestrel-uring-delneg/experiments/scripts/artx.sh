@@ -5,12 +5,12 @@
 set -euo pipefail
 DB=${1:-conduit_seed}; N=${2:-700}; R=${3:-100}
 W=/tmp/artx; mkdir -p $W; chmod 777 $W
-IN=$W/in-$DB-$N-$R.txt
+IN=$W/ind-$DB-$N-$R.txt
 if [ ! -f $IN ]; then
   sudo -u postgres psql -X -At -d $DB > $IN <<SQL
 SELECT setseed(0.42);
-SELECT array_agg(a.id)::text || '|' || array_agg(a.author_id)::text
-FROM (SELECT b, (SELECT max(id) FROM articles) - floor(power(random(), 3) * 20000)::int8 AS s
+SELECT array_agg(a.id ORDER BY a.id)::text || '|' || array_agg(a.author_id ORDER BY a.id)::text
+FROM (SELECT DISTINCT b, (SELECT max(id) FROM articles) - floor(power(random(), 3) * 20000)::int8 AS s
       FROM generate_series(1, $R) b, generate_series(1, $N) g) x
 JOIN articles a ON a.id = x.s GROUP BY x.b ORDER BY x.b;
 SQL
@@ -39,7 +39,27 @@ run() { # name, select-list column, with-tagnames(0/1)
   } > $f
   echo "$1: $(sudo -u postgres psql -X -At -d $DB -f $f 2>&1 | tail -1) ms/batch"
 }
-if [ "${FC:-0}" = 1 ]; then
+if [ "${FC:-0}" = 2 ]; then
+  REST0="$REST"
+  GRP="coalesce(fc.c, 0), u.username, u.bio, u.image FROM unnest(\$1::int8[], \$2::int8[]) r(id, author) JOIN users u ON u.id = r.author LEFT JOIN (SELECT f.article_id, count(*) AS c FROM favorites f WHERE f.article_id = ANY (\$1::int8[]) GROUP BY f.article_id) fc ON fc.article_id = r.id"
+  TGJ="LEFT JOIN (SELECT at.article_id, array_agg(at.tag_id) AS tg FROM article_tags at WHERE at.article_id = ANY (\$1::int8[]) GROUP BY at.article_id) tg ON tg.article_id = r.id"
+  GRPT="coalesce(fc.c, 0), u.username, u.bio, u.image FROM unnest(\$1::int8[], \$2::int8[]) r(id, author) JOIN users u ON u.id = r.author LEFT JOIN (SELECT f.article_id, count(*) AS c FROM favorites f WHERE f.article_id = ANY (\$1::int8[]) GROUP BY f.article_id) fc ON fc.article_id = r.id $TGJ"
+  GRPTU="coalesce(fc.c, 0), u.username, u.bio, u.image FROM unnest(\$1::int8[], \$2::int8[]) r(id, author) JOIN (SELECT u.id, u.username, u.bio, u.image FROM users u WHERE u.id = ANY (\$2::int8[])) u ON u.id = r.author LEFT JOIN (SELECT f.article_id, count(*) AS c FROM favorites f WHERE f.article_id = ANY (\$1::int8[]) GROUP BY f.article_id) fc ON fc.article_id = r.id $TGJ"
+  TG="coalesce(tg.tg, '{}')"
+  for r in 1 2 3; do
+    REST="$REST0"; run D "$IDS" 0
+    REST="$GRP"; run D-grp "$IDS" 0
+    REST="$GRPT"; run D-grp-tg "$TG" 0
+    REST="$GRPTU"; run D-grp-tg-u "$TG" 0
+  done
+  for i in 1 2 3 4 5; do L=$(sed -n ${i}p $IN); a=${L%%|*}; b=${L#*|}
+    for v in "$IDS|$REST0" "$TG|$GRPT" "$TG|$GRPTU"; do
+      q="SELECT md5(string_agg(t::text, ',' ORDER BY t.id)) FROM (SELECT r.id, ${v%%|*}, ${v#*|}) t"
+      q=${q//\$1/\'$a\'}; q=${q//\$2/\'$b\'}
+      sudo -u postgres psql -X -At -d $DB -c "$q"
+    done | uniq | wc -l | sed "s/^/rows-check batch $i distinct-md5s=/"
+  done
+elif [ "${FC:-0}" = 1 ]; then
   REST0="$REST"
   GRP="coalesce(fc.c, 0), u.username, u.bio, u.image FROM unnest(\$1::int8[], \$2::int8[]) r(id, author) JOIN users u ON u.id = r.author LEFT JOIN (SELECT f.article_id, count(*) AS c FROM favorites f WHERE f.article_id = ANY (\$1::int8[]) GROUP BY f.article_id) fc ON fc.article_id = r.id"
   for r in 1 2 3; do

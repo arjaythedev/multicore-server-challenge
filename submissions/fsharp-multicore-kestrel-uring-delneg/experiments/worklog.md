@@ -294,3 +294,24 @@ feed count proof adopted, #91's hashagg off measured (no effect).
   vs 153.0 / 154.3 / 152.2 us/req (mean -2.1%, PG 87-89 vs 91-92); 12k 151.3 / 147.6 / 151.4 vs 161.1 / 155.3
   / 152.9 (-4.0%). 197/197 dev and seed. **Kept.** p4 also adds `PLANNER_WAIT_US` (the planner's own clock,
   default the batch clock: no change).
+- **56 comments statement** (`scripts/cmtpl.sh`, 60 slugs per batch): no final ORDER BY 1.85-1.90 ms/batch vs
+  1.90-1.95 on the seed (aged, one round: 7.25 vs 7.65); authors read once by `= ANY` and hash-joined 2.45-2.60
+  (worse); without authors 1.0-1.1. **Discarded** (B's order is not guaranteed by SQL). A `tee /dev/stderr` in
+  a replay truncated the box's queue log, which lost the other aged rounds.
+- **Profiles at 12k**: #47's app 82.3 us/req, bcrypt 51.8% of its samples (~42.6 us/req; ours ~29). Our
+  Postgres at 14k (pgsplit): read connections 2.27 cores, write 0.26.
+- **55 grouped favorite counts** (p5, `PLANNER_FAVGRP`): 14k 143.6 / 145.3 / 146.9 vs 143.1 / 143.3 / 153.1
+  us/req; 12k 154.7 / 153.3 / 143.9 vs 146.7 / 157.3 / 148.8. No change. **Discarded.** The artx replay that
+  suggested it (-40%) drew article ids with repeats, which the per-article form counts again and again; the app's
+  artx gets distinct ids. With distinct inputs: 5.9-6.2 vs 5.7-6.0 ms/batch (tag ids and authors by `= ANY`
+  too: no change). The earlier artx replay numbers (n=52 and the aged copy) carry the same bias; n=52 stands on
+  its screens. artx.sh now draws distinct ids.
+- **pg_stat_statements on p5 at 14k** (350 s of execution): artx 85 s (809 rows/call, 14.1 ms), feed 85 s
+  (16.3 ms), comments 57 s (1,392 rows/call, 10.8 ms), flags 32 s, tag list 26 s, article 15 s, author list
+  11 s, writes ~25 s.
+- **57 comment authors in phase B** (replay, aged copy: 60 slugs, 1,592 comments, 1,488 distinct authors per
+  batch): comments as now 7.0-7.85 ms/batch; without the users join 3.35-3.5 plus one users-by-id `= ANY`
+  statement 3.1-3.35. ~-10% of comments, ~1.5% of Postgres. **Discarded** (a user row costs ~2.1 us either way;
+  everything is cached, shared_buffers 4 GB). Same copy, distinct ids: artx per-article counts 7.2-7.4 vs grouped
+  7.7-8.0, as n=55 found. `age-mc.sh` now looks authors up by row number (47 s instead of 30+ min) and
+  refuses to start under 5.5 GB free (the copy and its WAL took the box to 1.1 GB once; dropped at once).
