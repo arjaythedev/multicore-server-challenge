@@ -2,9 +2,9 @@
 
 Front: direct
 
-The C# server of [`csharp-epoll-gichamba`](../csharp-epoll-gichamba), built for the .NET JIT instead of Native AOT. The
-source is identical; only the build differs. On our rig the two builds held the same load, so this entry lets the
-benchmark decide which one is faster.
+The C# server of [`csharp-epoll-aot-gichamba`](../csharp-epoll-aot-gichamba), built for the .NET JIT instead of
+Native AOT. The source is identical; only the build differs. On our rig the two builds held the same load, so this
+entry lets the benchmark decide which one is faster.
 
 | | |
 |---|---|
@@ -28,7 +28,7 @@ at 136,000 users, one run each:
 | | p95 | p99 |
 |---|---:|---:|
 | this entry (JIT) | 316 ms | 452 ms |
-| `csharp-epoll-gichamba` (Native AOT) | 253 ms | 395 ms |
+| `csharp-epoll-aot-gichamba` (Native AOT) | 253 ms | 395 ms |
 | `rust-epoll-WorriedArrow` | 293 ms | 398 ms |
 
 All three passed. At 145,000 the load VMs fell behind, so the rig could not find the ceiling. Only comparisons within
@@ -38,8 +38,8 @@ run-to-run noise.
 
 ## Design, rules, settings and credits
 
-All as in [`csharp-epoll-gichamba`](../csharp-epoll-gichamba/README.md): how a request flows, how each rule is met, the
-latency trade-offs, behaviour under overload, the settings and the credits to other entries.
+All as in [`csharp-epoll-aot-gichamba`](../csharp-epoll-aot-gichamba/README.md): how a request flows, how each rule
+is met, the latency trade-offs, behaviour under overload, the settings and the credits to other entries.
 
 ## Build
 
