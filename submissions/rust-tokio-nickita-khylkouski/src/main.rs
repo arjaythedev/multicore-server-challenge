@@ -3,6 +3,7 @@
 
 mod api;
 mod auth;
+mod col;
 mod db;
 mod http;
 mod json;

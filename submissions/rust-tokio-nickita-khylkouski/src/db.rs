@@ -406,7 +406,7 @@ fn shared_reads() -> Option<(usize, bool)> {
     let cap = std::env::var("READ_BATCH_SIZE")
         .ok()
         .map(|s| s.parse().expect("READ_BATCH_SIZE"))
-        .unwrap_or(256);
+        .unwrap_or(512);
     Some((
         cap,
         std::env::var("READ_SCHED_MODE").ok().as_deref() == Some("mixed"),

@@ -18,7 +18,7 @@ fn escaped(b: u8) -> ([u8; 6], usize) {
     }
 }
 
-/// Quote and escape bytes that are already valid UTF-8.
+/// Quote and escape bytes that are already valid UTF-8 with SSE2.
 ///
 /// One pass on x86-64: each 16-byte block is stored to the output as it is checked, so clean text is copied by
 /// the scan itself (SSE2 is part of the x86-64 baseline). The last partial block is the input's last 16 bytes,
@@ -26,7 +26,7 @@ fn escaped(b: u8) -> ([u8; 6], usize) {
 /// with two overlapping 8- or 4-byte loads. Every load is inside the input; every store is inside the reserved
 /// capacity, past the output's length until it is extended over them.
 #[cfg(all(feature = "simd-json", target_arch = "x86_64"))]
-pub fn utf8(out: &mut Vec<u8>, bytes: &[u8]) {
+pub(super) fn utf8_sse2(out: &mut Vec<u8>, bytes: &[u8]) {
     use std::arch::x86_64::*;
     let n = bytes.len();
     // The quotes and one 16-byte store past the copied text; an escape reserves again for its extra bytes.
@@ -109,6 +109,89 @@ pub fn utf8(out: &mut Vec<u8>, bytes: &[u8]) {
     }
 }
 
+/// Quote and escape bytes that are already valid UTF-8: with AVX-512BW/VL when the CPU has it, else SSE2.
+#[cfg(all(feature = "simd-json", target_arch = "x86_64"))]
+#[inline]
+pub fn utf8(out: &mut Vec<u8>, bytes: &[u8]) {
+    if avx512() {
+        // SAFETY: the CPU supports the features `utf8_avx512` is compiled for.
+        unsafe { utf8_avx512(out, bytes) }
+    } else {
+        utf8_sse2(out, bytes)
+    }
+}
+
+/// AVX-512BW + VL + BMI2, detected once (`JSON_AVX512=0` keeps SSE2).
+#[cfg(all(feature = "simd-json", target_arch = "x86_64"))]
+#[inline]
+fn avx512() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+    static HAS: AtomicU8 = AtomicU8::new(0);
+    match HAS.load(Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let yes = std::is_x86_feature_detected!("avx512bw")
+                && std::is_x86_feature_detected!("avx512vl")
+                && std::is_x86_feature_detected!("bmi2")
+                && std::env::var("JSON_AVX512").ok().as_deref() != Some("0");
+            HAS.store(1 + u8::from(yes), Relaxed);
+            yes
+        }
+    }
+}
+
+/// `utf8` in 32-byte steps with masked loads and stores: the last partial step reads and writes only its own
+/// lanes (masked-off lanes neither fault nor store), so a string of any length needs no padding or overlap, and
+/// most strings (tags, names, slugs, titles) are one step. Only the copied bytes are stored.
+#[cfg(all(feature = "simd-json", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,bmi2")]
+pub(super) unsafe fn utf8_avx512(out: &mut Vec<u8>, bytes: &[u8]) {
+    use std::arch::x86_64::*;
+    let n = bytes.len();
+    out.reserve(n + 2);
+    let control = _mm256_set1_epi8(32);
+    let quote = _mm256_set1_epi8(b'"' as i8);
+    let slash = _mm256_set1_epi8(b'\\' as i8);
+    let src = bytes.as_ptr();
+    // SAFETY: each load's mask covers only bytes inside `bytes`; before each store, capacity - len >= n - at + 1
+    // (the `reserve` above and after each escape), and a store writes at most n - at bytes at `len`.
+    unsafe {
+        let mut len = out.len();
+        *out.as_mut_ptr().add(len) = b'"';
+        len += 1;
+        let mut at = 0;
+        while at < n {
+            let take = (n - at).min(32);
+            let m = _bzhi_u32(u32::MAX, take as u32);
+            let v = _mm256_maskz_loadu_epi8(m, src.add(at).cast());
+            let special = (_mm256_cmplt_epu8_mask(v, control)
+                | _mm256_cmpeq_epi8_mask(v, quote)
+                | _mm256_cmpeq_epi8_mask(v, slash))
+                & m;
+            let dst = out.as_mut_ptr().add(len);
+            if special == 0 {
+                _mm256_mask_storeu_epi8(dst.cast(), m, v);
+                len += take;
+                at += take;
+                continue;
+            }
+            let i = special.trailing_zeros();
+            _mm256_mask_storeu_epi8(dst.cast(), _bzhi_u32(u32::MAX, i), v);
+            len += i as usize;
+            at += i as usize;
+            let (esc, k) = escaped(*src.add(at));
+            at += 1;
+            out.set_len(len);
+            out.extend_from_slice(&esc[..k]);
+            out.reserve(n - at + 1);
+            len = out.len();
+        }
+        *out.as_mut_ptr().add(len) = b'"';
+        out.set_len(len + 1);
+    }
+}
+
 /// The last `rem` (< 16) input bytes at `src`, through a space-padded copy: stored at `dst`, with their mask.
 #[cfg(all(feature = "simd-json", target_arch = "x86_64"))]
 #[inline]
@@ -164,7 +247,31 @@ pub fn ts_raw(out: &mut Vec<u8>, micros: i64) {
     let ms = micros.div_euclid(1000) + PG_EPOCH_MS;
     let days = ms.div_euclid(86_400_000);
     let rem = ms.rem_euclid(86_400_000);
-    // Howard Hinnant's civil_from_days.
+    // 0000-03-01 through 9999-12-31, as days since 1970-01-01; anything else takes the general path.
+    if !(-719_468..=2_932_896).contains(&days) {
+        return ts_far(out, days, rem);
+    }
+    // Neri and Schneider's to_date ("Euclidean affine functions", 2022) in u32: days shifted by 82 eras so
+    // every value is non-negative, and the divisions by 1461 and 153 replaced by multiply-shifts.
+    const ERAS: u32 = 82;
+    let n = (days + (719_468 + 146_097 * ERAS) as i64) as u32;
+    let n1 = 4 * n + 3;
+    let century = n1 / 146_097;
+    let n2 = n1 % 146_097 | 3;
+    let p2 = 2_939_745 * n2 as u64;
+    let yoc = (p2 >> 32) as u32;
+    let doy = p2 as u32 / 2_939_745 / 4;
+    let n3 = 2141 * doy + 197_913;
+    let jan_feb = doy >= 306;
+    let y = 100 * century + yoc - 400 * ERAS + jan_feb as u32;
+    let m = (n3 >> 16) - if jan_feb { 12 } else { 0 };
+    let d = (n3 & 0xffff) / 2141 + 1;
+    digits(out, y, m, d, rem as u32);
+}
+
+/// Days outside 0000-03-01..=9999-12-31, with Howard Hinnant's civil_from_days in i64.
+#[cold]
+pub(super) fn ts_far(out: &mut Vec<u8>, days: i64, rem: i64) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -177,7 +284,12 @@ pub fn ts_raw(out: &mut Vec<u8>, micros: i64) {
     if !(0..=9999).contains(&y) {
         return ts_wide(out, y, m, d, rem);
     }
-    let rem = rem as u32;
+    digits(out, y as u32, m as u32, d as u32, rem as u32);
+}
+
+/// The quoted timestamp for a year in 0..=9999 and `rem` milliseconds into the day.
+#[inline]
+fn digits(out: &mut Vec<u8>, y: u32, m: u32, d: u32, rem: u32) {
     let (h, mi, s, milli) = (
         rem / 3_600_000,
         rem / 60_000 % 60,
@@ -188,11 +300,10 @@ pub fn ts_raw(out: &mut Vec<u8>, micros: i64) {
         let i = v as usize * 2;
         [PAIRS[i], PAIRS[i + 1]]
     };
-    let y = y as u32;
     let [y0, y1] = pair(y / 100);
     let [y2, y3] = pair(y % 100);
-    let [m0, m1] = pair(m as u32);
-    let [d0, d1] = pair(d as u32);
+    let [m0, m1] = pair(m);
+    let [d0, d1] = pair(d);
     let [h0, h1] = pair(h);
     let [i0, i1] = pair(mi);
     let [s0, s1] = pair(s);

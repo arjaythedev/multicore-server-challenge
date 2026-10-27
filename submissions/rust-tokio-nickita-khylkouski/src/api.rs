@@ -7,7 +7,7 @@ use http::{Method, StatusCode};
 use serde_json::{Map, Value};
 use tokio_postgres::{Row, error::SqlState};
 
-use crate::{app, json, parse_uint, read_batch::Ids};
+use crate::{app, col::Col, json, parse_uint, read_batch::Ids};
 
 pub struct Resp {
     pub status: u16,
@@ -91,12 +91,13 @@ impl<'a> Auth<'a> {
     /// Auth-required endpoints: the user id and the presented token.
     fn user(&self) -> Result<(i64, &'a str)> {
         let raw = self.0.ok_or(ApiError::Unauthorized)?;
-        let token = std::str::from_utf8(raw)
-            .ok()
-            .and_then(|v| v.strip_prefix("Token "))
-            .ok_or(ApiError::Unauthorized)?;
+        let token = raw.strip_prefix(b"Token ").ok_or(ApiError::Unauthorized)?;
         let id = app().jwt.verify(token).ok_or(ApiError::Unauthorized)?;
-        Ok((id, token))
+        // SAFETY: a token that verifies is ASCII (see `Jwt::verify`): it is three dot-separated parts, the
+        // signature and payload decode as base64url, which rejects every other byte, and the header is either the
+        // standard ASCII header or decodes as base64url too.
+        debug_assert!(token.is_ascii());
+        Ok((id, unsafe { std::str::from_utf8_unchecked(token) }))
     }
 }
 
@@ -117,7 +118,18 @@ impl<'a> Query<'a> {
     fn parse(q: Option<&'a str>) -> Self {
         let mut values = [const { None }; 5];
         if let Some(q) = q {
-            for (key, value) in form_urlencoded::parse(q.as_bytes()) {
+            // `form_urlencoded::parse` pair by pair; a pair without `%` or `+` decodes to itself, so it is
+            // borrowed as is (the query is already a str) instead of going through the decoder's UTF-8 check.
+            for pair in q.split('&').filter(|p| !p.is_empty()) {
+                let (key, value) = if pair.bytes().any(|b| b == b'%' || b == b'+') {
+                    match form_urlencoded::parse(pair.as_bytes()).next() {
+                        Some(kv) => kv,
+                        None => continue,
+                    }
+                } else {
+                    let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+                    (Cow::Borrowed(k), Cow::Borrowed(v))
+                };
                 if let Some(i) = Self::index(&key)
                     && values[i].is_none()
                 {
@@ -196,9 +208,14 @@ pub async fn route(
         if n == 4 {
             return Err(ApiError::NotFound);
         }
-        segs[n] = percent_encoding::percent_decode_str(s)
-            .decode_utf8()
-            .map_err(|_| ApiError::NotFound)?;
+        // Without a `%` the segment decodes to itself.
+        segs[n] = if s.as_bytes().contains(&b'%') {
+            percent_encoding::percent_decode_str(s)
+                .decode_utf8()
+                .map_err(|_| ApiError::NotFound)?
+        } else {
+            Cow::Borrowed(s)
+        };
         n += 1;
     }
     let s: [&str; 4] = std::array::from_fn(|i| segs[i].as_ref());
@@ -248,11 +265,11 @@ pub async fn route(
 
 fn write_profile(out: &mut Vec<u8>, row: &Row, k: usize, following: bool) {
     out.extend_from_slice(b"{\"username\":");
-    json::text(out, row.get(k));
+    json::text(out, row.text(k));
     out.extend_from_slice(b",\"bio\":");
-    json::opt_text(out, row.get(k + 1));
+    json::opt_text(out, row.opt_text(k + 1));
     out.extend_from_slice(b",\"image\":");
-    json::opt_text(out, row.get(k + 2));
+    json::opt_text(out, row.opt_text(k + 2));
     out.extend_from_slice(b",\"following\":");
     json::bool(out, following);
     out.push(b'}');
@@ -268,25 +285,25 @@ fn write_article(
     flags: Option<(bool, bool)>,
 ) {
     out.extend_from_slice(b"{\"slug\":");
-    json::text(out, row.get(b + 1));
+    json::text(out, row.text(b + 1));
     out.extend_from_slice(b",\"title\":");
-    json::text(out, row.get(b + 2));
+    json::text(out, row.text(b + 2));
     out.extend_from_slice(b",\"description\":");
-    json::text(out, row.get(b + 3));
+    json::text(out, row.text(b + 3));
     let mut k = b + 4;
     if with_body {
         out.extend_from_slice(b",\"body\":");
-        json::text(out, row.get(k));
+        json::text(out, row.text(k));
         k += 1;
     }
     out.extend_from_slice(b",\"tagList\":");
-    row.get::<_, json::Tags<'_>>(k + 2).write(out);
-    json::times(out, &row.get(k), &row.get(k + 1));
-    let (favorited, following) = flags.unwrap_or_else(|| (row.get(k + 4), row.get(k + 8)));
+    json::tags(out, row.bytes(k + 2));
+    json::times(out, row.ts(k), row.ts(k + 1));
+    let (favorited, following) = flags.unwrap_or_else(|| (row.flag(k + 4), row.flag(k + 8)));
     out.extend_from_slice(b",\"favorited\":");
     json::bool(out, favorited);
     out.extend_from_slice(b",\"favoritesCount\":");
-    json::int(out, row.get(k + 3));
+    json::int(out, row.int(k + 3));
     out.extend_from_slice(b",\"author\":");
     write_profile(out, row, k + 5, following);
     out.push(b'}');
@@ -317,18 +334,18 @@ fn article_list(rows: &[Row]) -> Vec<u8> {
     };
     match rows.split_first() {
         Some((header, articles)) if header.len() == crate::read_batch::LIST_PACKED_COLS => {
-            count = header.get(0);
-            let favs: Ids<'_> = header.get(16);
-            let fols: Ids<'_> = header.get(17);
+            count = header.int(0);
+            let favs = Ids::of(header, 16);
+            let fols = Ids::of(header, 17);
             for row in articles {
-                let flags = (favs.contains(row.get(1)), fols.contains(row.get(14)));
+                let flags = (favs.contains(row.int(1)), fols.contains(row.int(14)));
                 put(&mut out, row, Some(flags));
             }
         }
         _ => {
             for row in rows {
-                count = row.get(0);
-                if row.get::<_, Option<i64>>(1).is_some() {
+                count = row.int(0);
+                if row.opt_int(1).is_some() {
                     put(&mut out, row, None);
                 }
             }
@@ -344,15 +361,15 @@ fn article_list(rows: &[Row]) -> Vec<u8> {
 fn user_envelope(row: &Row, token: &str) -> Vec<u8> {
     let mut out = crate::http::take();
     out.extend_from_slice(b"{\"user\":{\"email\":");
-    json::text(&mut out, row.get(2));
+    json::text(&mut out, row.text(2));
     out.extend_from_slice(b",\"token\":");
     json::str(&mut out, token);
     out.extend_from_slice(b",\"username\":");
-    json::text(&mut out, row.get(1));
+    json::text(&mut out, row.text(1));
     out.extend_from_slice(b",\"bio\":");
-    json::opt_text(&mut out, row.get(3));
+    json::opt_text(&mut out, row.opt_text(3));
     out.extend_from_slice(b",\"image\":");
-    json::opt_text(&mut out, row.get(4));
+    json::opt_text(&mut out, row.opt_text(4));
     out.extend_from_slice(b"}}");
     out
 }
@@ -360,10 +377,10 @@ fn user_envelope(row: &Row, token: &str) -> Vec<u8> {
 /// A Comment from (id, body, created_at, updated_at, username, bio, image) starting at column `b`.
 fn write_comment(out: &mut Vec<u8>, row: &Row, b: usize, following: bool) {
     out.extend_from_slice(b"{\"id\":");
-    json::int(out, row.get(b));
-    json::times(out, &row.get(b + 2), &row.get(b + 3));
+    json::int(out, row.int(b));
+    json::times(out, row.ts(b + 2), row.ts(b + 3));
     out.extend_from_slice(b",\"body\":");
-    json::text(out, row.get(b + 1));
+    json::text(out, row.text(b + 1));
     out.extend_from_slice(b",\"author\":");
     write_profile(out, row, b + 4, following);
     out.push(b'}');
@@ -440,7 +457,7 @@ async fn register(body: &[u8]) -> Result<Resp> {
         .query_one(&c.st.user_insert, &[&username, &email, &hash])
         .await
         .map_err(unique_to_422)?;
-    let token = app().jwt.issue(row.get(0));
+    let token = app().jwt.issue(row.int(0));
     Ok(respond(StatusCode::CREATED, user_envelope(&row, &token)))
 }
 
@@ -459,7 +476,7 @@ async fn login(body: &[u8]) -> Result<Resp> {
     if !verify_password(password, hash).await? {
         return Err(ApiError::Unauthorized);
     }
-    let token = app().jwt.issue(row.get(0));
+    let token = app().jwt.issue(row.int(0));
     ok(user_envelope(&row, &token))
 }
 
@@ -511,7 +528,7 @@ async fn profile(auth: Auth<'_>, username: &str) -> Result<Resp> {
         .ok_or(ApiError::NotFound)?;
     let mut out = crate::http::take();
     out.extend_from_slice(b"{\"profile\":");
-    write_profile(&mut out, &row, 0, row.get(3));
+    write_profile(&mut out, &row, 0, row.flag(3));
     out.push(b'}');
     ok(out)
 }
@@ -603,7 +620,7 @@ async fn get_article(auth: Auth<'_>, slug: &str) -> Result<Resp> {
                 row,
                 0,
                 true,
-                Some((header.get(9), header.get(13))),
+                Some((header.flag(9), header.flag(13))),
             );
             out.push(b'}');
             ok(out)
@@ -662,7 +679,7 @@ async fn update_article(auth: Auth<'_>, slug: &str, body: &[u8]) -> Result<Resp>
         )
         .await?
         .ok_or(ApiError::NotFound)?;
-    let (id, author): (i64, i64) = (row.get(0), row.get(1));
+    let (id, author) = (row.int(0), row.int(1));
     if author != viewer {
         return Err(ApiError::Forbidden);
     }
@@ -685,7 +702,7 @@ async fn delete_article(auth: Auth<'_>, slug: &str) -> Result<Resp> {
         .query_opt(&c.st.article_delete, &[&slug, &viewer])
         .await?
         .ok_or(ApiError::NotFound)?;
-    if row.get::<_, i64>(0) != viewer {
+    if row.int(0) != viewer {
         return Err(ApiError::Forbidden);
     }
     no_content()
@@ -700,7 +717,7 @@ async fn favorite(auth: Auth<'_>, slug: &str, on: bool) -> Result<Resp> {
         .query_opt(st, &[&viewer, &slug])
         .await?
         .ok_or(ApiError::NotFound)?;
-    let id: i64 = row.get(0);
+    let id = row.int(0);
     drop(c);
     let c = app().db.read(crate::db::ReadKind::ArticleId);
     let row = c
@@ -727,15 +744,15 @@ async fn comments(auth: Auth<'_>, slug: &str) -> Result<Resp> {
     let packed = rows
         .first()
         .filter(|h| h.len() == crate::read_batch::COMMENTS_PACKED_COLS);
-    if rows.is_empty() || packed.is_some_and(|h| h.get::<_, Option<i64>>(0).is_none()) {
+    if rows.is_empty() || packed.is_some_and(|h| h.opt_int(0).is_none()) {
         return Err(ApiError::NotFound);
     }
-    let fols: Option<Ids<'_>> = packed.map(|h| h.get(10));
+    let fols: Option<Ids<'_>> = packed.map(|h| Ids::of(h, 10));
     let mut out = crate::http::take();
     out.extend_from_slice(b"{\"comments\":[");
     let mut first = true;
     for row in &rows[usize::from(packed.is_some())..] {
-        if row.get::<_, Option<i64>>(1).is_none() {
+        if row.opt_int(1).is_none() {
             continue;
         }
         if !first {
@@ -743,8 +760,8 @@ async fn comments(auth: Auth<'_>, slug: &str) -> Result<Resp> {
         }
         first = false;
         let following = match &fols {
-            Some(fols) => fols.contains(row.get(9)),
-            None => row.get(8),
+            Some(fols) => fols.contains(row.int(9)),
+            None => row.flag(8),
         };
         write_comment(&mut out, row, 1, following);
     }
@@ -778,7 +795,7 @@ async fn delete_comment(auth: Auth<'_>, slug: &str, id: &str) -> Result<Resp> {
         .query_opt(&c.st.comment_delete, &[&id, &slug, &viewer])
         .await?
         .ok_or(ApiError::NotFound)?;
-    if row.get::<_, i64>(0) != viewer {
+    if row.int(0) != viewer {
         return Err(ApiError::Forbidden);
     }
     no_content()
@@ -792,7 +809,7 @@ async fn tags() -> Result<Resp> {
     drop(c);
     let mut out = crate::http::take();
     out.extend_from_slice(b"{\"tags\":");
-    row.get::<_, json::Tags<'_>>(0).write(&mut out);
+    json::tags(&mut out, row.bytes(0));
     out.push(b'}');
     ok(out)
 }

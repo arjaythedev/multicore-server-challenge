@@ -1,6 +1,5 @@
 //! One execution for compatible concurrent reads, with no data retained afterward.
 use bytes::{Bytes, BytesMut};
-use postgres_types::FromSql;
 use tokio_postgres::{Row, Statement, types::Type};
 
 use std::collections::HashMap;
@@ -55,27 +54,27 @@ pub enum RowSort {
     CommentsDesc,
 }
 
-/// An int8 or timestamptz column as its raw 8-byte value: both order as signed integers.
-struct Key(i64);
-
-impl<'a> FromSql<'a> for Key {
-    fn from_sql(_: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-        Ok(Key(i64::from_be_bytes(raw.try_into()?)))
+/// An int8 or timestamptz column (NULL = None) as its raw 8-byte value: both order as signed integers.
+fn key(r: &Row, i: usize) -> Result<Option<i64>, Error> {
+    if i >= r.len() {
+        return Err(Error::Rows);
     }
-
-    fn accepts(ty: &Type) -> bool {
-        *ty == Type::INT8 || *ty == Type::TIMESTAMPTZ || *ty == Type::TIMESTAMP
+    match r.raw(i) {
+        None => Ok(None),
+        Some(raw) => Ok(Some(i64::from_be_bytes(raw.try_into().map_err(|_| Error::Rows)?))),
     }
 }
 
+/// A non-NULL int8 column.
+fn int(r: &Row, i: usize) -> Result<i64, Error> {
+    key(r, i)?.ok_or(Error::Rows)
+}
+
 impl RowSort {
-    pub fn apply(self, rows: &mut [Row]) -> Result<(), tokio_postgres::Error> {
+    pub fn apply(self, rows: &mut [Row]) -> Result<(), Error> {
         if rows.len() < 2 {
             return Ok(());
         }
-        let key = |r: &Row, i: usize| -> Result<Option<i64>, tokio_postgres::Error> {
-            Ok(r.try_get::<_, Option<Key>>(i)?.map(|k| k.0))
-        };
         let mut keyed = Vec::with_capacity(rows.len());
         for (i, r) in rows.iter().enumerate() {
             let k = match self {
@@ -820,7 +819,7 @@ fn followee_list() -> bool {
 pub fn demux(rows: Vec<Row>, n: usize, sort: RowSort, pack: Pack) -> Result<Vec<Vec<Row>>, Error> {
     let mut out: Vec<Vec<Row>> = (0..n).map(|_| Vec::new()).collect();
     let route = |row: &Row| -> Result<Option<usize>, Error> {
-        let id: i64 = row.try_get(row.len() - 1)?;
+        let id = int(row, row.len() - 1)?;
         if id == 0 && pack != Pack::No {
             return Ok(None);
         }
@@ -850,7 +849,7 @@ pub fn demux(rows: Vec<Row>, n: usize, sort: RowSort, pack: Pack) -> Result<Vec<
         for row in rows {
             match route(&row)? {
                 Some(pos) => headers.push((pos, row)),
-                None => shared.entry(row.try_get(key_col)?).or_default().push(row),
+                None => shared.entry(int(&row, key_col)?).or_default().push(row),
             }
         }
         if headers.len() != n {
@@ -860,7 +859,7 @@ pub fn demux(rows: Vec<Row>, n: usize, sort: RowSort, pack: Pack) -> Result<Vec<
             sort.apply(comments)?;
         }
         for (pos, header) in headers {
-            let article: Option<i64> = header.try_get(0)?;
+            let article = key(&header, 0)?;
             let rows = &mut out[pos];
             if !rows.is_empty() {
                 return Err(Error::Rows);
@@ -880,7 +879,7 @@ pub fn demux(rows: Vec<Row>, n: usize, sort: RowSort, pack: Pack) -> Result<Vec<
         match route(&row)? {
             Some(pos) => headers.push((pos, row)),
             None => {
-                if shared.insert(row.try_get(key_col)?, row).is_some() {
+                if shared.insert(int(&row, key_col)?, row).is_some() {
                     return Err(Error::Rows);
                 }
             }
@@ -895,7 +894,11 @@ pub fn demux(rows: Vec<Row>, n: usize, sort: RowSort, pack: Pack) -> Result<Vec<
             return Err(Error::Rows);
         }
         if pack == Pack::List {
-            let ids: Ids<'_> = header.try_get(15)?;
+            let ids = (header.len() > 15)
+                .then(|| header.raw(15))
+                .flatten()
+                .and_then(Ids::parse)
+                .ok_or(Error::Rows)?;
             rows.reserve(ids.len() + 1);
             for id in ids.iter() {
                 rows.push(shared.get(&id).ok_or(Error::Rows)?.clone());
@@ -905,7 +908,7 @@ pub fn demux(rows: Vec<Row>, n: usize, sort: RowSort, pack: Pack) -> Result<Vec<
             rows.rotate_right(1);
         } else {
             // A request for a missing slug has no header and gets no rows.
-            let id: i64 = header.try_get(0)?;
+            let id = int(&header, 0)?;
             let article = shared.get(&id).ok_or(Error::Rows)?.clone();
             rows.extend([header, article]);
         }
@@ -939,36 +942,38 @@ impl std::hash::Hasher for IdHasher {
 /// collected into a Vec. Rejects what `Vec<i64>` would: more than one dimension, another element type, NULLs.
 pub struct Ids<'a>(&'a [u8]);
 
-impl<'a> FromSql<'a> for Ids<'a> {
-    fn from_sql(_: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-        let int = |at: usize| -> Result<i32, Box<dyn std::error::Error + Sync + Send>> {
-            Ok(i32::from_be_bytes(raw.get(at..at + 4).ok_or("short array")?.try_into()?))
+impl<'a> Ids<'a> {
+    pub fn parse(raw: &'a [u8]) -> Option<Self> {
+        let int = |at: usize| -> Option<i32> {
+            Some(i32::from_be_bytes(raw.get(at..at + 4)?.try_into().ok()?))
         };
         let dims = int(0)?;
         if int(8)? as u32 != Type::INT8.oid() {
-            return Err("not an int8 array".into());
+            return None;
         }
         let elements = match dims {
             0 => &raw[12..],
-            1 => raw.get(20..).ok_or("short array")?,
-            _ => return Err("array contains too many dimensions".into()),
+            1 => raw.get(20..)?,
+            _ => return None,
         };
         let n = if dims == 0 { 0 } else { int(12)? };
         if n < 0 || elements.len() != n as usize * 12 {
-            return Err("bad array length".into());
+            return None;
         }
         if elements.chunks_exact(12).any(|e| e[..4] != 8i32.to_be_bytes()) {
-            return Err("a Postgres value was `NULL`".into());
+            return None;
         }
-        Ok(Ids(elements))
+        Some(Ids(elements))
     }
 
-    fn accepts(ty: &Type) -> bool {
-        *ty == Type::INT8_ARRAY
+    /// Column `k` of `row`, which must be a non-NULL int8[] without NULLs.
+    #[track_caller]
+    pub fn of(row: &'a Row, k: usize) -> Self {
+        row.raw(k)
+            .and_then(Self::parse)
+            .unwrap_or_else(|| panic!("error retrieving column {k}: not an int8[] of ids"))
     }
-}
 
-impl Ids<'_> {
     pub fn len(&self) -> usize {
         self.0.len() / 12
     }

@@ -97,15 +97,20 @@ where
 
 /// A row of data returned from the database by a query.
 ///
-/// The column offsets of all the rows of one result live in one shared allocation (see `Row::group`), so a
-/// clone is three reference-count increments and allocates nothing.
+/// All the rows of one result share one allocation (`Group`: the statement, the DataRow bodies and their column
+/// offsets), so a clone or drop is a single reference-count update.
 #[derive(Clone)]
 pub struct Row {
+    group: Arc<Group>,
+    /// This row's position in `group.bodies`.
+    index: usize,
+}
+
+struct Group {
     statement: Statement,
-    body: DataRowBody,
-    ranges: Arc<[Field]>,
-    /// This row's first entry in `ranges`; it has one per column.
-    first: usize,
+    bodies: Vec<DataRowBody>,
+    /// One entry per (row, column), row-major.
+    ranges: Vec<Field>,
 }
 
 /// A column's byte range within its DataRow body; `start == u32::MAX` is NULL. A DataRow's length is an
@@ -162,14 +167,16 @@ impl Row {
         let mut ranges = Vec::with_capacity(statement.columns().len());
         push_ranges(&mut ranges, &body, statement.columns().len())?;
         Ok(Row {
-            statement,
-            body,
-            ranges: ranges.into(),
-            first: 0,
+            group: Arc::new(Group {
+                statement,
+                bodies: vec![body],
+                ranges,
+            }),
+            index: 0,
         })
     }
 
-    /// The rows of one result (drained from `bodies`), with one allocation for all their column offsets.
+    /// The rows of one result (drained from `bodies`), sharing one `Group`.
     pub(crate) fn group(statement: &Statement, bodies: &mut Vec<DataRowBody>) -> Result<Vec<Row>, Error> {
         let columns = statement.columns().len();
         let mut ranges = Vec::with_capacity(bodies.len() * columns);
@@ -179,22 +186,23 @@ impl Row {
                 return Err(e);
             }
         }
-        let ranges: Arc<[Field]> = ranges.into();
-        Ok(bodies
-            .drain(..)
-            .enumerate()
-            .map(|(i, body)| Row {
-                statement: statement.clone(),
-                body,
-                ranges: ranges.clone(),
-                first: i * columns,
+        let n = bodies.len();
+        let group = Arc::new(Group {
+            statement: statement.clone(),
+            bodies: std::mem::take(bodies),
+            ranges,
+        });
+        Ok((0..n)
+            .map(|index| Row {
+                group: group.clone(),
+                index,
             })
             .collect())
     }
 
     /// Returns information about the columns of data in the row.
     pub fn columns(&self) -> &[Column] {
-        self.statement.columns()
+        self.group.statement.columns()
     }
 
     /// Determines if the row contains no values.
@@ -258,16 +266,36 @@ impl Row {
 
     /// Returns the raw size of the row in bytes.
     pub fn raw_size_bytes(&self) -> usize {
-        self.body.buffer_bytes().len()
+        self.body().buffer_bytes().len()
     }
 
-    /// Get the raw bytes for the column at the given index.
+    /// The binary value of column `idx` as Postgres sent it (None for NULL), without `get`'s type check: for
+    /// callers that know the statement's column types.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `idx` is out of bounds.
+    #[inline]
+    pub fn raw(&self, idx: usize) -> Option<&[u8]> {
+        assert!(idx < self.len(), "column index out of bounds");
+        self.col_buffer(idx)
+    }
+
+    #[inline]
+    fn body(&self) -> &DataRowBody {
+        &self.group.bodies[self.index]
+    }
+
+    /// Get the raw bytes for the column at the given index (`idx < self.len()`).
+    #[inline]
     fn col_buffer(&self, idx: usize) -> Option<&[u8]> {
-        let Field { start, end } = self.ranges[self.first + idx];
+        let group = &*self.group;
+        let Field { start, end } = group.ranges[self.index * group.statement.columns().len() + idx];
         if start == u32::MAX {
             return None;
         }
-        Some(&self.body.buffer()[start as usize..end as usize])
+        // `push_ranges` took both offsets from this body's own field lengths.
+        Some(&group.bodies[self.index].buffer()[start as usize..end as usize])
     }
 }
 

@@ -428,9 +428,35 @@ pub async fn query_group(
     }
 }
 
+/// The same bytes as `encode_bind` + Execute, written in one pass: no per-call Vecs for the formats and values.
 pub fn encode_group_query(statement: &Statement, params: &[&(dyn crate::types::ToSql + Sync)]) -> Result<Bytes, Error> {
+    let types = statement.params();
+    if params.len() != types.len() {
+        return Err(Error::parameters(params.len(), types.len()));
+    }
     let mut buf = BytesMut::with_capacity(128);
-    encode_bind(statement, params.iter().copied(), "", &mut buf)?;
+    let mut error_idx = 0;
+    let r = frontend::bind(
+        "",
+        statement.name(),
+        params.iter().zip(types).map(|(p, ty)| p.encode_format(ty) as i16),
+        params.iter().zip(types).enumerate(),
+        |(idx, (param, ty)), buf| match param.to_sql_checked(ty, buf) {
+            Ok(IsNull::No) => Ok(postgres_protocol::IsNull::No),
+            Ok(IsNull::Yes) => Ok(postgres_protocol::IsNull::Yes),
+            Err(e) => {
+                error_idx = idx;
+                Err(e)
+            }
+        },
+        Some(1),
+        &mut buf,
+    );
+    match r {
+        Ok(()) => {}
+        Err(frontend::BindError::Conversion(e)) => return Err(Error::to_sql(e, error_idx)),
+        Err(frontend::BindError::Serialization(e)) => return Err(Error::encode(e)),
+    }
     frontend::execute("", 0, &mut buf).map_err(Error::encode)?;
     Ok(buf.freeze())
 }

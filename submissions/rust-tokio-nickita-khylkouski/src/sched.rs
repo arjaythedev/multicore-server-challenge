@@ -19,7 +19,8 @@ pub struct ReadJob {
     pub frame: Bytes,
     pub reply: oneshot::Sender<Result<Vec<Row>, Error>>,
     seq: u64,
-    queued: Instant,
+    /// Only with `BATCH_STATS` (the clock read is per request).
+    queued: Option<Instant>,
 }
 
 struct State {
@@ -72,7 +73,7 @@ impl Sched {
                 frame,
                 reply,
                 seq,
-                queued: Instant::now(),
+                queued: stats::on().then(Instant::now),
             });
             s.idle.pop()
         };
@@ -198,11 +199,16 @@ pub mod stats {
         });
     }
 
+    #[inline]
+    pub(super) fn on() -> bool {
+        ON.load(Relaxed)
+    }
+
     /// Queue wait of the jobs a connection just took.
     pub(super) fn waited(jobs: &[super::ReadJob]) {
         if ON.load(Relaxed) {
-            for job in jobs {
-                let ns = job.queued.elapsed().as_nanos() as u64;
+            for job in jobs.iter().filter_map(|j| j.queued) {
+                let ns = job.elapsed().as_nanos() as u64;
                 WAIT_NS.fetch_add(ns, Relaxed);
                 WAIT_MAX_NS.fetch_max(ns, Relaxed);
             }
