@@ -94,7 +94,7 @@ static int listener(const char *host, int port)
 
 /* Optional worker settings, each sent as NAME=value when set. */
 static const char *const knobs[] = {"PGSERVE_HASH_NICE", "PGSERVE_THIN_TO", "PGSERVE_DWELL_US", "PGSERVE_DWELL_CAP",
-	"PGSERVE_DWELL_MIN", "PGSERVE_STATS_S"};
+	"PGSERVE_DWELL_MIN", "PGSERVE_STATS_S", "PGSERVE_SHED"};
 
 /* Sends `msg` with `fd` attached. */
 static void hand(int conn, int fd, const char *msg, size_t len)

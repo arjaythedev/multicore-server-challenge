@@ -122,6 +122,7 @@ const Status = enum(u16) {
     not_found = 404,
     unprocessable = 422,
     internal = 500,
+    unavailable = 503,
 
     fn line(s: Status) []const u8 {
         return switch (s) {
@@ -134,6 +135,7 @@ const Status = enum(u16) {
             .not_found => "404 Not Found",
             .unprocessable => "422 Unprocessable Entity",
             .internal => "500 Internal Server Error",
+            .unavailable => "503 Service Unavailable",
         };
     }
 };
@@ -516,8 +518,8 @@ fn start(conn: *Conn, head: *const http.Head, body: []const u8, now: i64, t: *Tu
             r.arg(2, .{ .int = r.viewer });
             t.write(r, c.W_COMMENT_DELETE);
         },
-        .register => register(r, body),
-        .login => login(r, body, t),
+        .register => if (shed.since != null) refuse(r, .register) else register(r, body),
+        .login => if (shed.since != null) refuse(r, .login) else login(r, body, t),
         .user_put => updateUser(r, body, t),
         .article_create => createArticle(r, body, t),
         .article_update => updateArticle(r, m.a, body, t),
@@ -621,6 +623,7 @@ fn updateUser(r: *Req, body: []const u8, t: *Turn) void {
     switch (password) {
         .value => |p| {
             if (p.len > 72) return reject(r, .unprocessable, "password is too long");
+            if (shed.since != null) return refuse(r, .user_put);
             hash(r, .hash, p, "");
         },
         else => t.write(r, c.W_USER_UPDATE),
@@ -912,6 +915,7 @@ fn knob(setting: []const u8) void {
     if (std.mem.eql(u8, name, "PGSERVE_DWELL_CAP")) clock.cap = knobInt("PGSERVE_DWELL_CAP", value, 1, 1 << 20);
     if (std.mem.eql(u8, name, "PGSERVE_DWELL_MIN")) clock.min = knobInt("PGSERVE_DWELL_MIN", value, 1, 1 << 20);
     if (std.mem.eql(u8, name, "PGSERVE_STATS_S")) stats.every_ns = @as(i64, knobInt("PGSERVE_STATS_S", value, 0, 86_400)) * std.time.ns_per_s;
+    if (std.mem.eql(u8, name, "PGSERVE_SHED")) shed.enabled = std.mem.eql(u8, value, "1");
 }
 
 fn knobInt(comptime name: []const u8, value: []const u8, min: u32, max: u32) u32 {
@@ -1086,6 +1090,67 @@ fn waitNs(ep: i32, events: []linux.epoll_event, ns: i64) usize {
     return linux.syscall6(.epoll_pwait2, @as(u32, @bitCast(ep)), @intFromPtr(events.ptr), events.len, @intFromPtr(&ts), 0, linux.NSIG / 8);
 }
 
+/// Load shedding (PGSERVE_SHED=1, off by default): while this worker's loop is saturated, logins, sign-ups and
+/// password changes get 503 instead of a bcrypt job. Saturated means a 1 s window with under 2% of it spent in
+/// epoll_wait; it ends with a window above 10%, and no sooner than 10 s after it began. Each worker decides alone.
+const Shed = struct {
+    enabled: bool = false,
+    /// When the current window began, and its ns spent in epoll_wait so far.
+    window: i64 = 0,
+    idle: i64 = 0,
+    /// When shedding began; null while it is off.
+    since: ?i64 = null,
+    logged: i64 = 0,
+    refused: std.EnumArray(Refused, u64) = .initFill(0),
+
+    const Refused = enum { login, register, user_put };
+    const window_ns = std.time.ns_per_s;
+
+    /// Once per turn, with the ns the turn waited in epoll_wait with no turn work pending.
+    fn tick(s: *Shed, now: i64, waited: i64) void {
+        s.idle += waited;
+        const span = now - s.window;
+        if (span < window_ns) return;
+        const idle = @as(f64, @floatFromInt(s.idle)) / @as(f64, @floatFromInt(span));
+        s.window = now;
+        s.idle = 0;
+        const since = s.since orelse {
+            if (idle < 0.02) {
+                s.since = now;
+                s.logged = now;
+                log("pgserve[{d}]: shed on, idle {d:.1}%\n", .{ linux.getpid(), idle * 100 });
+            }
+            return;
+        };
+        if (idle > 0.10 and now - since >= 10 * window_ns) {
+            s.report("shed off after", now, since, idle);
+            s.since = null;
+            s.refused = .initFill(0);
+        } else if (now - s.logged >= 10 * window_ns) {
+            s.logged = now;
+            s.report("shed on", now, since, idle);
+        }
+    }
+
+    fn report(s: *const Shed, what: []const u8, now: i64, since: i64, idle: f64) void {
+        const n = s.refused.values;
+        log("pgserve[{d}]: {s} {d:.1}s, refused {d} (login {d}, register {d}, user_put {d}), idle {d:.1}%\n", .{
+            linux.getpid(), what, @as(f64, @floatFromInt(now - since)) / 1e9, n[0] + n[1] + n[2], n[0], n[1], n[2], idle * 100,
+        });
+    }
+};
+var shed: Shed = .{};
+
+fn log(comptime fmt: []const u8, args: anytype) void {
+    if (@import("builtin").is_test) return;
+    std.debug.print(fmt, args);
+}
+
+fn refuse(r: *Req, k: Shed.Refused) void {
+    shed.refused.getPtr(k).* += 1;
+    reject(r, .unavailable, "server busy");
+}
+
 /// The worker's loop, from pgengine_http_main once it has joined the database. `launcher` is the Unix
 /// socket path pgserve's launcher listens on.
 export fn engine_http_serve(launcher: [*:0]const u8) callconv(.c) void {
@@ -1117,14 +1182,21 @@ export fn engine_http_serve(launcher: [*:0]const u8) callconv(.c) void {
     var t: Turn = .{};
     // connections with a request or an answer left over from the last turn, touched again this one
     var carry: std.ArrayListUnmanaged(*Conn) = .empty;
+    shed.window = monoNs();
     while (true) {
         c.shim_check_interrupts();
         const busy = carry.items.len > 0 or t.pending();
+        const waiting = if (shed.enabled) monoNs() else 0;
         // a held turn sleeps until its deadline, unless an answer is waiting to go out
         const rc = if (carry.items.len == 0 and t.pending() and clock.due(&t, mono) == null)
             waitNs(ep, &events, clock.deadline(&t) - mono)
         else
             linux.epoll_wait(ep, &events, events.len, if (busy) 0 else 1000);
+        if (shed.enabled) {
+            const woke = monoNs();
+            // idle is only a wait with no turn work pending; a held turn's sleep is busy
+            shed.tick(woke, if (busy) 0 else woke - waiting);
+        }
         const got: usize = if (linux.errno(rc) == .SUCCESS) rc else 0;
         const now = wallSeconds();
         if (timed) mono = monoNs();
@@ -1415,4 +1487,64 @@ test "batch sizes by batch and by request" {
     // 100 lands in the 64-127 bucket: by request, most requests were served in it
     try testing.expectEqual(64, h.quantile(0.5, true));
     try testing.expectEqual(Hist.bucket(1 << 20), Hist.bucket(1 << 15));
+}
+
+test "while shedding, a login, a sign-up and a password change get 503 and the connection stays open" {
+    var p = try Pair.init();
+    defer p.deinit();
+    shed.since = 0;
+    defer shed = .{};
+    jwt.init("secret");
+    var tok: [256]u8 = undefined;
+    const token = jwt.issue(1, wallSeconds(), &tok);
+    const login_body = "{\"user\":{\"email\":\"a@b.c\",\"password\":\"password123\"}}";
+    const register_body = "{\"user\":{\"username\":\"a\",\"email\":\"a@b.c\",\"password\":\"password123\"}}";
+    const put_body = "{\"user\":{\"password\":\"password456\"}}";
+    var put: [512]u8 = undefined;
+    const requests = [_][]const u8{
+        std.fmt.comptimePrint("POST /api/users/login HTTP/1.1\r\nContent-Length: {d}\r\n\r\n{s}", .{ login_body.len, login_body }),
+        std.fmt.comptimePrint("POST /api/users HTTP/1.1\r\nContent-Length: {d}\r\n\r\n{s}", .{ register_body.len, register_body }),
+        try std.fmt.bufPrint(&put, "PUT /api/user HTTP/1.1\r\nAuthorization: Token {s}\r\nContent-Length: {d}\r\n\r\n{s}", .{
+            token, put_body.len, put_body,
+        }),
+    };
+    for (requests) |req| {
+        try p.send(req);
+        received(&p.conn, wallSeconds(), &p.t);
+        try testing.expect(p.conn.req == null and p.conn.keep_alive);
+        try testing.expect(flush(-1, &p.conn));
+        try p.expectAnswer("HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 35\r\n\r\n" ++
+            "{\"errors\":{\"body\":[\"server busy\"]}}");
+        answers.clearRetainingCapacity();
+    }
+    try testing.expectEqualSlices(u64, &.{ 1, 1, 1 }, &shed.refused.values);
+    try testing.expectEqual(0, p.t.writes.items.len);
+}
+
+test "with shedding off, a login is queued as usual" {
+    var p = try Pair.init();
+    defer p.deinit();
+    defer p.t.writes.deinit(gpa);
+    const body = "{\"user\":{\"email\":\"a@b.c\",\"password\":\"password123\"}}";
+    try p.send(std.fmt.comptimePrint("POST /api/users/login HTTP/1.1\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }));
+    received(&p.conn, 0, &p.t);
+    try testing.expectEqual(1, p.t.writes.items.len);
+    finish(p.conn.req.?);
+}
+
+test "shedding starts on a window under 2% idle and ends on one above 10%, no sooner than 10 s on" {
+    var s: Shed = .{};
+    const sec = std.time.ns_per_s;
+    s.tick(sec / 2, sec / 2);
+    try testing.expect(s.since == null);
+    s.tick(sec, 0);
+    try testing.expect(s.since == null);
+    s.tick(2 * sec, sec / 100);
+    try testing.expectEqual(2 * sec, s.since.?);
+    s.tick(7 * sec, 5 * sec);
+    try testing.expect(s.since != null);
+    s.tick(13 * sec, sec / 20);
+    try testing.expect(s.since != null);
+    s.tick(14 * sec, sec / 2);
+    try testing.expect(s.since == null);
 }

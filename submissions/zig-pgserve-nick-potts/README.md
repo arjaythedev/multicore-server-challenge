@@ -48,6 +48,10 @@ DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit \
 - `PGSERVE_DWELL_US=N` (0, off, by default; at most 50,000) turns on a batch clock, with `PGSERVE_DWELL_CAP`
   (default 256) and `PGSERVE_DWELL_MIN` (default 2). `PGSERVE_STATS_S=N` (off by default) logs each worker's batch
   sizes every `N` seconds. Both are under "How a request is served".
+- `PGSERVE_SHED=1` (off by default) turns on load shedding. A worker then answers logins, sign-ups and password
+  changes with 503 from the first 1 s window in which its loop spent under 2% of the time in `epoll_wait`,
+  until a window above 10%, and for at least 10 s. Only time in `epoll_wait` with no turn work pending counts
+  as idle, so a turn held by `PGSERVE_DWELL_US` counts as busy.
 - `GET /api/tags` answered 5.6-8.6 s after a cold Postgres restart in our runs. Most of that is bcrypt's
   self-test and calibration.
 
@@ -184,9 +188,13 @@ also our Zig entry's code, vendored unchanged.
 **Answers go out uncompressed.** SPEC makes compression optional, and gzip lost every test we gave it (see
 "What we tried"). The Zig entry's gzip code and its vendored libdeflate are not in this folder.
 
-**No load shedding.** Every request is served and none is refused. Under overload, requests wait, latency
-grows, and memory stays bounded by the kernel's socket buffers. Three shedding designs were built and dropped
-(see "What we tried").
+**Load shedding is off by default.** Every request is served and none is refused. Under overload, requests
+wait, latency grows, and memory stays bounded by the kernel's socket buffers. Three shedding designs were built
+and dropped (see "What we tried"). None ever refused enough to change a run. At the knee the box is bound by one
+CPU's softirq, not by the event loops, so a loop-idle trigger rarely fires there. `PGSERVE_SHED=1` turns on the
+simplest of them, described under "How to run". Each worker decides alone from its own loop, already-queued
+hashes still finish, and a refusal is a 503 on a connection that stays open. Each worker logs to stderr when
+it starts and stops shedding, and every 10 s while it sheds, with its refusal counts.
 
 ## The read engine
 
