@@ -16,6 +16,7 @@
 #include "controllers/CommentsController.hpp"
 #include "controllers/TagsController.hpp"
 #include "middleware/AuthCheckMiddleware.hpp"
+#include "controllers/Common.hpp"
 
 static std::string exeDir()
 {
@@ -39,12 +40,38 @@ static int envInt(const char* name, int def) {
     try { return std::stoi(v); } catch (...) { return def; }
 }
 
+static void primeSessionSettings(const drogon::orm::DbClientPtr& db, int conns)
+{
+    static auto kSet =
+        "SET jit = off;"
+        "SET max_parallel_workers_per_gather = 0;"
+        "SET enable_memoize = off;"
+        "SET synchronous_commit = on;";
+
+    if (!db) return;
+    for (int i = 0; i < conns * 2 + 4; ++i)
+    {
+        try { db->execSqlSync(kSet); }
+        catch (...) { /* ignore */ }
+    }
+}
+
 int main()
 {
     ::signal(SIGPIPE, SIG_IGN);
 
     const std::string appCfg = exeDir() + "/config/config.json";
     drogon::app().loadConfigFile(appCfg);
+
+    drogon::app().setIdleConnectionTimeout(120);
+    drogon::app().setClientMaxBodySize(1024 * 1024);
+    drogon::app().setClientMaxMemoryBodySize(64 * 1024);
+
+    drogon::app().setCustom404Page(
+        multicore::common::MakeError(drogon::k404NotFound, "Not found"), true);
+
+    drogon::app().enableServerHeader(false);
+    drogon::app().enableDateHeader(false);
 
     const char* host = envOr("HOST", "127.0.0.1");
     const char* port = envOr("PORT", "3000");
@@ -116,6 +143,9 @@ int main()
 
     auto readDb  = drogon::app().getDbClient();
     auto writeDb = drogon::app().getDbClient("write");
+
+    primeSessionSettings(readDb,  readConns);
+    primeSessionSettings(writeDb, writeConns);
 
     drogon::app().registerMiddleware(std::make_shared<multicore::AuthRequiredMiddleware>());
     drogon::app().registerMiddleware(std::make_shared<multicore::AuthOptionalMiddleware>());

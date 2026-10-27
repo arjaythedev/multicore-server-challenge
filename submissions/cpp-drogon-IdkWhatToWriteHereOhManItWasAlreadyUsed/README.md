@@ -1,39 +1,55 @@
-
 # C++ / Drogon, split read/write pools
 
 Front: direct
 
-| |                                                                                     |
-|---|-------------------------------------------------------------------------------------|
-| Language | C++20, Drogon (coroutines, `HttpController`); GCC, pinned in the build              |
-| HTTP | Drogon's built-in HTTP/1.1 server, keep-alive, `Content-Length` bodies              |
-| Postgres | Drogon `orm::DbClient` over `libpq` — extended query protocol, text results         |
-| JSON | `Json::Value` / `Json::FastWriter` for responses, `req->getJsonObject()` for bodies |
-| JWT, bcrypt | HS256 via `jwt-cpp`; own bcrypt (`$2b$`, cost 10, `Lanes<N>` interleaved)           |
-| Allocator | `jemalloc`                                                                          |
-| Dependencies | Drogon, `jwt-cpp`, `robin_hood` (header-only), Postgres client library              |
+| | |
+|---|---|
+| Language | C++20, Drogon (coroutines, `HttpController`); GCC |
+| HTTP | Drogon's HTTP/1.1 server, keep-alive, `Content-Length` |
+| Postgres | Drogon `orm::DbClient` over `libpq` — extended query protocol, text results |
+| JSON | `Json::Value` / `Json::FastWriter`; `req->getJsonObject()` for bodies |
+| JWT, bcrypt | HS256 via `jwt-cpp`; own bcrypt (`$2b$`, cost 10, `Lanes<N>`) |
+| Allocator | `jemalloc`, `-O3 -march=native` |
+| Dependencies | Drogon, `jwt-cpp`, `robin_hood` (header-only), libpq |
 
 ## Design
 
-Postgres uses most of the box's CPU, so most of the work goes into spending less Postgres time per request.
+Postgres is the bottleneck (most of the box's CPU), so most of the work is spent making each request cost less Postgres time.
 
-- **Two pools.** Reads and writes go to different `DbClient`s — 12 read connections, 16 write connections. A slow `INSERT` waiting for its WAL flush never blocks a `SELECT` queued on the same connection, and Postgres's own group commit handles the write side. Both pools are ordinary `DbClient`s (`isFast = false`): `FastDbClient` would give `(threads_num + 1) × connectionNumber` connections, uneven per IO thread, which under direct mode is 72 uneven connections instead of 28 predictable ones.
-- **One statement per request, where it counts.** 
-- Replace 80 correlated subqueries per page with 5 batched `WHERE … = ANY($1::bigint[])` scans for tags, favorites, and follows. Use short-lived robin_hood unordered maps/sets (20–100 entries, open addressing, no allocations) for side lookups. This cuts Postgres CPU dramatically, keeping the read pool at 12 connections.
-- **The feed takes the newest `limit + offset` per followed author.** `CROSS JOIN LATERAL` per followee, not the newest `limit + offset` overall and then a sort. With 100 follows × 100 articles each, the old shape sorted 10,000 rows per request; the new one touches at most `follows × (limit + offset)` and sorts only the survivors.
-- **Runtime.** `SIGPIPE` ignored — a client that closes its keep-alive socket mid-response must not kill the process. `threads_num = 6` on an 8-core box, leaving two cores for Postgres. `LimitNOFILE=200000` for direct mode's tens of thousands of keep-alive sockets.
+- **Two pools.** 12 read + 16 write connections. A slow `INSERT` waiting for WAL flush never blocks a `SELECT` queued behind it. Both are plain `DbClient`s (`isFast = false`): `FastDbClient` would give `(threads_num + 1) × connectionNumber` connections, uneven per IO thread — 72 unpredictable instead of 28.
+- **One statement per request, where it counts.** Follow/unfollow, favorite/unfavorite, create/delete comment, update/delete article fold lookup, ownership check and write into one data-modifying CTE.
+- **Lists cut the page first.** Every list (global, by tag, by author, by favorited) does an index-only scan of its page before joining `users` or computing anything per row.
+- **Per-row work is batched, not correlated.** The naive list runs 80 correlated subqueries for a 20-article page; here the page select returns only `articles` + `users`, and four `WHERE … = ANY($1::bigint[])` statements fill in tags, 
+- favorite counts, favorited and following for the whole page. 5 index scans instead of 80 lookups. 
+- Side maps are `robin_hood::unordered_flat_map` / `_set` — short-lived, no per-node allocations.
+- **Feed takes the newest `limit + offset` per followed author** via `CROSS JOIN LATERAL`, not the newest overall and then a sort.
+- **bcrypt cost 10.** Hash on register/change, verify on every login — against a dummy hash for unknown emails, so response times do not leak which emails exist. @ threads
+- **Runtime.** `SIGPIPE` ignored; `threads_num = 6` (two cores left for Postgres); session settings pinned per connection.
 
 ## Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `DB_READ_CONNS` | `12` | Read pool size (`default` client) |
-| `DB_WRITE_CONNS` | `16` | Write pool size (`write` client) |
+| `DB_READ_CONNS` | `12` | Read pool (`default`) |
+| `DB_WRITE_CONNS` | `16` | Write pool (`write`) |
 | `HOST`, `PORT` | `127.0.0.1`, `3000` | Listen address |
 | `DATABASE_URL` | — | `postgres://user:pass@host:port/dbname` (required) |
 | `JWT_SECRET` | — | HS256 secret (required) |
 
+`threads_num = 6` lives in `config/config.json`. `gzip` / `brotli` off, `max_connections_per_ip = 0`, `keepalive_requests = 0`, `idle_connection_timeout = 120` (think time up to 70 s), `client_max_body_size = 1M`.
 
+## Session settings
+
+At startup, a `SET` batch runs enough times to hit every connection in both pools:
+
+```
+jit                        = off
+max_parallel_workers_per_gather = 0
+enable_memoize             = off
+synchronous_commit         = on
+```
+
+`plan_cache_mode` stays at `auto` — a generic plan can be catastrophically worse than a custom one when the planner cannot see parameter values.
 
 ## Build and run
 
@@ -42,4 +58,22 @@ sudo bash install.sh && bash build.sh
 DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=... HOST=0.0.0.0 PORT=80 bash start.sh
 ```
 
+## What this is not
 
+It is not the 120k-user submission. That one has its own Postgres client, batches 666 reads per sync and up to 777 writes per transaction, and writes JSON straight from Postgres's binary rows into pooled buffers.
+Drogon does not let us do any of those things without replacing Drogon, and replacing Drogon is a story for another time.
+(Could rebuild drogon with AI by replacing std containers with robin_hood and jsoncpp with simdjson though but ... just no)
+I dare call it a relatively prod-safe implementation. 
+Was pretty curious, how far is it possible to get with bare drogon, without resorting to libpq or iourings and epolls.
+Failure is always an option... 
+But real failre is when you stop trying.
+
+
+
+## Rules we follow
+
+- No cross-request caching. Every request reads Postgres while served; only connections and prepared statements are reused.
+- Every login verifies bcrypt cost 10 against the stored hash; every registration and password change hashes with cost 10; every request verifies JWT signature, `alg` and `exp`.
+- Writes committed before responding (`synchronous_commit = on`).
+- Nothing in the database is created or altered; only session settings are used.
+- 28 connections total, headroom inside `max_connections = 100`.

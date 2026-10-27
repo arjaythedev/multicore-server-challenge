@@ -1,9 +1,36 @@
 #include "UsersController.hpp"
 #include "Common.hpp"
 #include "db/Sql.hpp"
+#include "BCryptPool.hpp"
+
+#include <future>
 
 using namespace multicore;
 using namespace multicore::common;
+
+namespace {
+
+    Task<std::string> AsyncHash(const std::string& password)
+    {
+        auto promise = std::make_shared<std::promise<std::string>>();
+        auto fut = promise->get_future();
+        BcryptPool::instance().hashAsync(password,
+            [promise](std::string h) { promise->set_value(std::move(h)); });
+        co_return co_await multicore::FutureAwaiter<std::string>{std::move(fut)};
+    }
+
+    Task<bool> AsyncCheck(const std::string& password, const std::string& stored)
+    {
+        auto promise = std::make_shared<std::promise<bool>>();
+        auto fut = promise->get_future();
+        BcryptPool::instance().verifyAsync(password, stored,
+            [promise](const bool ok) { promise->set_value(ok); });
+        co_return co_await multicore::FutureAwaiter<bool>{std::move(fut)};
+    }
+
+    constexpr auto kDummyHash = "$2a$10$ZSfEoPvlcsj2XfvsSeK25em4NZ9Jm7ntGqXuLgQfHEeZPYB8899wq";
+
+}
 
 Task<HttpResponsePtr> UsersController::Register(HttpRequestPtr req)
 {
@@ -22,16 +49,21 @@ Task<HttpResponsePtr> UsersController::Register(HttpRequestPtr req)
     if (password.size() > 72) co_return Unprocessable();
 
     std::string hash;
-    try { hash = BcryptHash(password); }
-    catch (...) { co_return ServerError(); }
+    try {
+        hash = co_await AsyncHash(password);
+    } catch (...) {
+        co_return ServerError();
+    }
+    if (hash.empty()) co_return ServerError();
 
     const auto secret = JwtSecret();
     if (secret.empty()) co_return ServerError();
-    auto db = drogon::app().getDbClient();
+    const auto db = drogon::app().getDbClient("write");
     try
     {
-        auto r = co_await db->execSqlCoro(sql::kInsertUser, username, email, hash);
-        if (r.empty()) co_return ServerError();
+        const auto r = co_await db->execSqlCoro(sql::kInsertUser, username, email, hash);
+        if (r.empty())
+            co_return ServerError();
         const int64_t id = r[0]["id"].as<int64_t>();
         Json::Value root;
         root["user"] = UserJson(r[0], MakeToken(id, secret));
@@ -62,14 +94,20 @@ Task<HttpResponsePtr> UsersController::Login(HttpRequestPtr req)
 
     const auto secret = JwtSecret();
     if (secret.empty()) co_return ServerError();
-    auto db = drogon::app().getDbClient();
+    const auto db = drogon::app().getDbClient("default");
     try
     {
         auto r = co_await db->execSqlCoro(sql::kSelectUserByEmail, email);
-        if (r.empty()) co_return Unauthorized();
+        if (r.empty())
+        {
+            // Keep timing uniform for non-existent emails.
+            try { (void) co_await AsyncCheck(password, kDummyHash); } catch (...) {}
+            co_return Unauthorized();
+        }
         const auto stored = r[0]["password_hash"].as<std::string>();
         bool ok = false;
-        try { ok = BcryptCheck(password, stored); } catch (...) { co_return ServerError(); }
+        try { ok = co_await AsyncCheck(password, stored); }
+        catch (...) { co_return ServerError(); }
         if (!ok) co_return Unauthorized();
         const int64_t id = r[0]["id"].as<int64_t>();
         Json::Value root;
@@ -83,7 +121,7 @@ Task<HttpResponsePtr> UsersController::GetCurrentUser(HttpRequestPtr req)
 {
     const int64_t viewer = Viewer(req);
     const std::string token = req->getHeader("Authorization").substr(std::string("Token ").size());
-    auto db = drogon::app().getDbClient();
+    auto db = drogon::app().getDbClient("default");
     try
     {
         auto r = co_await db->execSqlCoro(sql::kSelectUserById, viewer);
@@ -132,9 +170,16 @@ Task<HttpResponsePtr> UsersController::UpdateCurrentUser(HttpRequestPtr req)
     auto image    = optStr("image");
 
     std::optional<std::string> hash;
-    if (password) hash = BcryptHash(*password);
+    if (password) {
+        try {
+            auto h = co_await AsyncHash(*password);
+            if (!h.empty()) hash = std::move(h);
+        } catch (...) {
+            co_return ServerError();
+        }
+    }
 
-    auto db = drogon::app().getDbClient();
+    auto db = drogon::app().getDbClient("write");
     try
     {
         auto r = co_await db->execSqlCoro(

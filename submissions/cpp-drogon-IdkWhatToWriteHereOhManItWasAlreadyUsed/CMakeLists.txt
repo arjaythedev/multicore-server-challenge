@@ -32,6 +32,7 @@ add_executable(${PROJECT_NAME}
         src/db/Sql.cpp
         src/db/Sql.hpp
         src/controllers/robin_hood.h
+        src/controllers/BCryptPool.hpp
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE
