@@ -217,3 +217,25 @@ fixed seeded inputs in one backend and read its CPU from /proc: SQL shape A/B wi
 - Harness: `conf.sh` sometimes failed with errno 98 on 127.0.0.1:3000. The load generator's ephemeral ports on
   this box can include 3000, so a leftover loopback connection blocks the bind (not an issue on the official box,
   where the load comes from other machines). conf.sh now waits until no socket uses :3000 and retries once.
+- **Profile at 12k** (perf, e28): bcrypt is ~49% of the app's CPU samples (`eks5` 44.7%, partial batches
+  `eks4` 1.7, `eks3` 1.35, `eks2` 0.6): at this rate the lanes are full, and hashing is about half of the app's
+  ~57 us per request. Next: JSON text arrays 1.7%, memmove 1.4%, kernel copies.
+- **49 bcrypt `-march=native`** (rbench, Xeon Platinum 8260): 5 lanes 21.09 vs 20.93 ms/hash with
+  `-O3 -funroll-loops`; `-O3 -march=native` 21.38; `-O2` much worse. Discarded.
+- **Holds at real think time** (60,000 users, hold.sh): both runs "fail" with 62-75% timeouts, but they are
+  limited by the load generator: it falls behind in 292-300 of 300 s, its users stall at ~42k, and the box sits at
+  ~27% CPU. An independent probe during the second run (curl every 2 s, holdprobe.sh) got 200 from
+  `/api/tags` and the article list in 9-34 ms throughout, with 35-58k established connections. The local box
+  can't drive real-think holds this large; the 12k / think-scale 0.1 screens (the same request rate as ~120k
+  real users) stay the proxy.
+- **Final candidate** (ed47939): 12k 163.0 / 166.4 / 167.9 us/req (app 55.3 / 57.3 / 57.1, PG 109.5 / 110.7 /
+  112.3), ~29.7k req/s, p95 64-77 ms, 0 errors; 6k 171.7 / 175.7 / 176.4, p95 35 ms.
+- **50 bcrypt lane-state padding** (rbench, 0-496 pad words after each 4,168-byte lane state, against L1 set and
+  4K aliasing between lanes): 5 lanes 20.91-21.41 vs 20.96 unpadded; 6-8 lanes stay worse. Discarded.
+
+## Stop (budget of 50 reached)
+
+Kept this session: the batch-shared feed count proof (3093246) and 5 bcrypt lanes with `-funroll-loops`
+(ed47939). Addendum items: buffer ring with the resv retry measured and dropped (noise); loops, server GC, clock,
+spin and ring-wait knobs re-measured (defaults stay); PR ideas from #47, #91, #95, #97, #99, #100 reviewed, #100's
+feed count proof adopted, #91's hashagg off measured (no effect).
