@@ -31,7 +31,7 @@ const SQL_LIST =
     \\to_char(c.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
     \\to_char(c.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
     \\u.username, u.bio, u.image,
-    \\EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = c.author_id) AS following
+    \\c.author_id IN (SELECT followee_id FROM follows WHERE follower_id = $1) AS following
     \\FROM comments c JOIN users u ON u.id = c.author_id
     \\WHERE c.article_id = $2
     \\ORDER BY c.created_at DESC, c.id DESC LIMIT 100
@@ -42,7 +42,7 @@ const SQL_LIST_BY_SLUG =
     \\to_char(c.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
     \\to_char(c.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
     \\u.username, u.bio, u.image,
-    \\EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = c.author_id) AS following
+    \\c.author_id IN (SELECT followee_id FROM follows WHERE follower_id = $1) AS following
     \\FROM comments c JOIN articles a ON a.id = c.article_id
     \\JOIN users u ON u.id = c.author_id
     \\WHERE a.slug = $2
