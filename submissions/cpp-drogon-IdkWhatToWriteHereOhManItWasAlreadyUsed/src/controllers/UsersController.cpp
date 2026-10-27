@@ -16,13 +16,11 @@ namespace {
         auto fut = promise->get_future();
         BcryptPool::instance().hashAsync(password,
             [promise](std::string h) {
-                if (h.empty()) LOG_WARN << "bcrypt hash failed (empty result)";
                 promise->set_value(std::move(h));
             });
         try {
             co_return co_await multicore::FutureAwaiter<std::string>{fut.share()};
         } catch (const std::exception& e) {
-            LOG_ERROR << "bcrypt hash exception: " << e.what();
             throw;
         }
     }
