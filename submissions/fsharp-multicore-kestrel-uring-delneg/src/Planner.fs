@@ -55,6 +55,13 @@ let mutable STagAll: Stmt = null
 let private byId (id: string) = "CROSS JOIN LATERAL (SELECT a.* FROM articles a WHERE a.id = " + id + " OFFSET 0) a"
 
 let define (feedProof: bool) (feedProofN: int) =
+    let env (name: string) (d: int) =
+        match Int32.TryParse(Environment.GetEnvironmentVariable name) with
+        | true, v -> v
+        | _ -> d
+    let feedCut = Environment.GetEnvironmentVariable "FEED_CUT" <> "0"
+    let feedCutMin = env "FEED_CUT_MIN" 2 // viewers in the batch who follow it
+    let feedCutN = env "FEED_CUT_N" 8 // followees probed per batch
     SArt <-
         Stmt.Define(
             "SELECT r.k, " + Cols + ", a.body FROM unnest($1::text[]) WITH ORDINALITY r(slug, k) JOIN articles a ON a.slug = r.slug",
@@ -121,13 +128,31 @@ let define (feedProof: bool) (feedProofN: int) =
                    + "HAVING count(*) >= 2 ORDER BY count(*) DESC LIMIT " + string feedProofN + ") t "
                    + "WHERE EXISTS (SELECT 1 FROM articles a3 WHERE a3.author_id = t.a OFFSET 999 LIMIT 1))"
                else "'{}'::int8[]")
-            + " AS ha) "
+            + " AS ha)"
+            + (if feedCut then
+                   // #102's page cutoff: a followee's (limit + offset)-th newest article id bounds every page of a
+                   // viewer who follows it (that followee alone fills the page at or above it); the batch's most
+                   // shared followees are probed once, and each followee scan stops at the viewer's best bound
+                   ", pv AS MATERIALIZED (SELECT p.k, p.v, p.lim, p.off, q.fl FROM unnest($2::int8[], $3::int8[], $4::int8[]) "
+                   + "WITH ORDINALITY p(v, lim, off, k) JOIN q ON q.v = p.v), "
+                   + "bd AS MATERIALIZED (SELECT b.a, (SELECT a3.id FROM articles a3 WHERE a3.author_id = b.a "
+                   + "ORDER BY a3.id DESC OFFSET b.take - 1 LIMIT 1) AS cut FROM (SELECT f.a, greatest(max(pv.lim + pv.off), 1) AS take "
+                   + "FROM pv, unnest(pv.fl) AS f(a) GROUP BY f.a HAVING count(*) >= " + string feedCutMin
+                   + " ORDER BY count(*) DESC LIMIT " + string feedCutN + ") b) "
+               else " ")
             + "SELECT -q.k, CASE WHEN q.fl && (SELECT ha FROM h) THEN 1000::int8 "
             + "WHEN EXISTS (SELECT 1 FROM articles a3 WHERE a3.author_id = ANY (q.fl) ORDER BY a3.author_id, a3.id DESC OFFSET 999 LIMIT 1) THEN 1000::int8 "
             + "ELSE (SELECT count(*) FROM articles a3 WHERE a3.author_id = ANY (q.fl)) END, " + Pad + " FROM q "
-            + "UNION ALL SELECT p.k, " + Cols + " FROM unnest($2::int8[], $3::int8[], $4::int8[]) WITH ORDINALITY p(v, lim, off, k) "
-            + "JOIN q ON q.v = p.v CROSS JOIN LATERAL (SELECT * FROM (SELECT y.id FROM unnest(q.fl) AS f(a) "
-            + "CROSS JOIN LATERAL (SELECT a3.id FROM articles a3 WHERE a3.author_id = f.a ORDER BY a3.id DESC LIMIT (p.lim + p.off)) y "
+            + (if feedCut then
+                   "UNION ALL SELECT p.k, " + Cols + " FROM pv p "
+                   + "CROSS JOIN LATERAL (SELECT coalesce(max(bd.cut), 0) AS cut FROM bd WHERE bd.a = ANY (p.fl)) c "
+                   + "CROSS JOIN LATERAL (SELECT * FROM (SELECT y.id FROM unnest(p.fl) AS f(a) "
+                   + "CROSS JOIN LATERAL (SELECT a3.id FROM articles a3 WHERE a3.author_id = f.a AND a3.id >= c.cut "
+                   + "ORDER BY a3.id DESC LIMIT (p.lim + p.off)) y "
+               else
+                   "UNION ALL SELECT p.k, " + Cols + " FROM unnest($2::int8[], $3::int8[], $4::int8[]) WITH ORDINALITY p(v, lim, off, k) "
+                   + "JOIN q ON q.v = p.v CROSS JOIN LATERAL (SELECT * FROM (SELECT y.id FROM unnest(q.fl) AS f(a) "
+                   + "CROSS JOIN LATERAL (SELECT a3.id FROM articles a3 WHERE a3.author_id = f.a ORDER BY a3.id DESC LIMIT (p.lim + p.off)) y ")
             + "ORDER BY y.id DESC LIMIT p.lim OFFSET p.off) x0 LIMIT 100) x "
             + byId "x.id",
             I, I, I, I

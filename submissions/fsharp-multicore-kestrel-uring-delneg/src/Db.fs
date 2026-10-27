@@ -346,6 +346,11 @@ type PgThread(o: Options) as this =
         match Environment.GetEnvironmentVariable "PLANNER_MAX" with
         | null | "" -> 2048
         | s -> int s
+    // the planner's own batch clock (PLANNER_WAIT_US, default the batch clock)
+    let megaWait =
+        match Environment.GetEnvironmentVariable "PLANNER_WAIT_US" with
+        | null | "" -> waitTicks
+        | s -> int64 (int s) * Diagnostics.Stopwatch.Frequency / 1_000_000L
     let megaFree = Stack<Planner.MegaQuery>()
     let mutable megaInflight = 0
     let mutable stMega = 0L
@@ -457,7 +462,7 @@ type PgThread(o: Options) as this =
                         total <- total + pending.[k].Count
                         t0 <- min t0 (pending.[k].Peek().Queued)
                 if total > 0 then
-                    if waitTicks > 0L && total < megaMax && now - t0 < waitTicks then next <- min next (t0 + waitTicks - now)
+                    if megaWait > 0L && total < megaMax && now - t0 < megaWait then next <- min next (t0 + megaWait - now)
                     else
                         oldest <- t0
                         best <- kinds.Length // the planner batch

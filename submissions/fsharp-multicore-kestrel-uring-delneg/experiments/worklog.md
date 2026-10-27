@@ -281,3 +281,16 @@ feed count proof adopted, #91's hashagg off measured (no effect).
   vs 154.3 / 157.5 / 163.4 us/req (mean -3.8%, PG 89-93 vs 94-101); 12k 170.1 / 162.4 / 152.7 vs 172.7 / 174.9
   / 158.4 (-4.1%). cmp 603 requests 0 differ (tag order included), 197/197 dev and seed. **Kept.** The 12k
   screens of the planner are bimodal (PG ~92-100 or ~105-109 per run, in both arms); 14k is steadier.
+- **53 #79's asm bcrypt kernel** (`asm_gen.zig` ported to Python, 11 instructions per lane-round, `ah` and
+  `bextr` forms; rbench3: one pinned core, best of 3, two rounds, all hashes checked): ms/hash at lanes 1-5,
+  C 56.6 / 34.8 / 25.5 / 22.1 / 20.95; ah 63.9 / 33.9 / 25.1 / 21.5 / 20.2; bextr 62.8 / 35.1 / 27.3 / 24.2 /
+  23.1. -3.6% at our 5 lanes, under 1 us/req. **Discarded.** The box is a Xeon 8260 (Cascade Lake, 2 load
+  ports); the S-box loads bound the C core already, #79's 7.9 ms/hash is on Zen 5.
+- **Aged-copy replays** (`age-mc.sh`: seed + a run's worth of writes, autovacuum on): artx names by subquery
+  21.8-22.1 ms/batch, tag ids + tagnames 20.6-22.0, names by join 28.6-29.2, tag ids 18.3-19.5; without the
+  favorite count 4.1 (the count is ~78% of artx on the aged copy). Feed page bound P0 12.1-12.6, 2 of 8
+  8.9-9.3, 2/32 8.9-10.2, 1/64 9.5-10.5, 1/1000 20.0-21.8; rows equal.
+- **54 feed page bound** (#102; p4, A,B alternating x3, `FEED_CUT=0` as the old arm): 14k 148.4 / 149.0 / 152.3
+  vs 153.0 / 154.3 / 152.2 us/req (mean -2.1%, PG 87-89 vs 91-92); 12k 151.3 / 147.6 / 151.4 vs 161.1 / 155.3
+  / 152.9 (-4.0%). 197/197 dev and seed. **Kept.** p4 also adds `PLANNER_WAIT_US` (the planner's own clock,
+  default the batch clock: no change).

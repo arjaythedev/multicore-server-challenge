@@ -39,7 +39,22 @@ run() { # name, select-list column, with-tagnames(0/1)
   } > $f
   echo "$1: $(sudo -u postgres psql -X -At -d $DB -f $f 2>&1 | tail -1) ms/batch"
 }
-if [ "${SPLIT:-0}" = 1 ]; then
+if [ "${FC:-0}" = 1 ]; then
+  REST0="$REST"
+  GRP="coalesce(fc.c, 0), u.username, u.bio, u.image FROM unnest(\$1::int8[], \$2::int8[]) r(id, author) JOIN users u ON u.id = r.author LEFT JOIN (SELECT f.article_id, count(*) AS c FROM favorites f WHERE f.article_id = ANY (\$1::int8[]) GROUP BY f.article_id) fc ON fc.article_id = r.id"
+  for r in 1 2 3; do
+    REST="$REST0"; run D "$IDS" 0
+    REST="$GRP"; run D-grp "$IDS" 0
+  done
+  REST="$GRP"
+  for i in 1 2 3 4 5; do L=$(sed -n ${i}p $IN); a=${L%%|*}; b=${L#*|}
+    for v in "$REST0" "$GRP"; do
+      q="SELECT md5(string_agg(t::text, ',' ORDER BY t.id)) FROM (SELECT r.id, $IDS, $v) t"
+      q=${q//\$1/\'$a\'}; q=${q//\$2/\'$b\'}
+      sudo -u postgres psql -X -At -d $DB -c "$q"
+    done | uniq | wc -l | sed "s/^/rows-check batch $i distinct-md5s=/"
+  done
+elif [ "${SPLIT:-0}" = 1 ]; then
   for r in 1 2 3; do
     run D "$IDS" 0
     REST0="$REST"

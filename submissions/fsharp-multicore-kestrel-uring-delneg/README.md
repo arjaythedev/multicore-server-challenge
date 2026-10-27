@@ -37,7 +37,10 @@ Phase A runs one statement per kind present, over the DISTINCT keys: one page pe
 per tag, author or viewer, one row per slug or username. Phase B enriches the union of every article phase A
 returned once (tag ids, favorite count, author; the tag names come from one read of every `(id, name)` in name
 order, in the same round trip), and reads the viewer flags with one primary-key scan per viewer (`= ANY`). Each article's JSON is written once per batch; each response is put together from those pieces
-and its own flags. `PLANNER=0` falls back to the per-kind statements below.
+and its own flags. Feed pages are bounded first (#102): for the followees most shared by the batch's feed viewers,
+one index probe finds their (limit + offset)-th newest article, and each viewer's per-followee scan stops at the
+newest such bound among its followees; the page and its order are unchanged. `PLANNER=0` falls back to the
+per-kind statements below.
 
 **Packed lists (#82)** (planner off). For lists above a small batch size, each distinct page is read once and each distinct
 article once (tags, favorite count, author); then each request gets one row with its page ids and its
@@ -74,6 +77,8 @@ All optional; the defaults suit the 8-vCPU box.
 | `BCRYPT_LANES`, `BCRYPT_THREADS` | 5, 2 | hashes in lockstep, hasher threads |
 | `PLANNER`, `PLANNER_MAX` | on, 2048 | `0` turns the batch planner off; requests per planner batch |
 | `PLANNER_TAGIDS` | on | `0`: tag names per article in the enrichment statement |
+| `PLANNER_WAIT_US` | `BATCH_WAIT_US` | the planner batch's clock |
+| `FEED_CUT`, `FEED_CUT_MIN`, `FEED_CUT_N` | on, 2, 8 | feed page bounds; viewers sharing a followee; followees probed |
 | `FEED_PROOF` | on | `0` turns the shared feed count probe off |
 | `MC_STATS` | off | `1` logs batch sizes every 5 s |
 
@@ -90,8 +95,8 @@ them), `-think-scale 0.1`, fresh database per run:
 
 | Users | req/s | box CPU per request | app | Postgres | p95 |
 |--:|--:|--:|--:|--:|--:|
-| 14,000 | ~29,600 | 158-162 us | 64-65 us | 95-99 us | 183-210 ms |
-| 12,000 | ~26,400 | 160-173 us | 64-66 us | 96-107 us | ~150 ms |
+| 14,000 | ~29,900 | 148-152 us | 63-64 us | 87-89 us | 176-196 ms |
+| 12,000 | ~26,800 | 148-151 us | 63-64 us | 86-90 us | 130-139 ms |
 | 12,000, `PLANNER=0` | ~29,700 | 163-168 us | 55-57 us | 110-112 us | 64-77 ms |
 | 14,000, `PLANNER=0` | ~32,500 | 167-174 us | 57-60 us | 111-116 us | 130-158 ms |
 
@@ -110,6 +115,7 @@ Every experiment, kept or not, with its numbers: `experiments/worklog.md` and `e
 - rust-tokio-Scooter1337 (#7): shared list SQL; c-iouring-tigokraft (#10): the bcrypt core (MIT).
 - rust-epoll-WorriedArrow (#47): the two-phase batch planner and its flags statement.
 - #82: packed list results; #79: the 20 ms batch clock; #48: tags broadcast; #100: the feed count probe.
+- rust-tokio-batch-Scooter1337 (#102): the shared feed page bound.
 - rust-epoll-WorriedArrow (#47), go-epoll-MegaPanchamZ (#61), c-epoll-umitaltintas (#91) and others: ideas
   measured here (see the worklog), most of them as references on the same box.
 
