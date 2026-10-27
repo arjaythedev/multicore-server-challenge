@@ -1,0 +1,18 @@
+# Gems installed by build.sh, and local Bundler config
+/vendor/bundle
+/.bundle
+
+# Logs and temp files, keeping the empty directories Rails expects
+/log/*
+!/log/.keep
+/tmp/*
+!/tmp/.keep
+/tmp/pids/*
+!/tmp/pids/.keep
+/storage/*
+!/storage/.keep
+
+.DS_Store
+
+# Rails secret key: never commit it (the app runs from SECRET_KEY_BASE in start.sh instead)
+/config/master.key
