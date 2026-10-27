@@ -12,7 +12,7 @@ request: reads are answered in large batches, where everything concurrent reques
 
 | | |
 |---|---|
-| Runtime | JDK 27 (Temurin, `install.sh`), compiled with `--release 25`; G1 with a fixed 2 GB heap |
+| Runtime | JDK 27 (Temurin, `install.sh`), compiled with `--release 25`; G1 with a fixed 4 GB heap |
 | HTTP | Vert.x core 5.2.2: one HTTP server per event loop, Netty 4.2.19.Final native epoll |
 | Database | Vert.x PostgreSQL client 5.2.2, pipelined, prepared statements cached; SCRAM-SHA-256 login via `com.ongres.scram:scram-client` 3.4 |
 | JSON | `dev.mccue:json` 2024.11.20 for request bodies; responses written by hand straight into a buffer |
