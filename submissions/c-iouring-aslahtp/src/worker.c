@@ -14,7 +14,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "ipc.h"
+#include "json_out.h"
 #include "pg_conn.h"
+#include "plan.h"
 
 #define BGID 1
 #define RING_ENTRIES 4096
@@ -55,8 +58,9 @@ struct req *req_alloc(struct worker *w, int fd, uint32_t gen) {
     r->fd = fd;
     r->gen = gen;
     r->keep_alive = true;
-    r->pg_error = r->write = false;
+    r->pg_error = r->write = r->solo = false;
     r->step = 0;
+    r->nexec = 0;
     r->stmt = 0;
     r->sqlstate[0] = 0;
     r->viewer = 0;
@@ -330,7 +334,11 @@ static void pg_start_send(struct worker *w, struct pgc *pc) {
     io_uring_sqe_set_data64(s, UD_MAKE_PTR(pc, OP_PG_SEND));
 }
 
+static void pg_start_group(struct worker *w, struct pgc *pc);
+
 static void pg_flush_all(struct worker *w) {
+    for (int i = w->nread; i < w->npg && w->wait_write; i++)
+        if (!w->pg[i].head) pg_start_group(w, &w->pg[i]);
     while (w->dirty) {
         struct pgc *pc = w->dirty;
         w->dirty = pc->next_dirty;
@@ -339,13 +347,7 @@ static void pg_flush_all(struct worker *w) {
     }
 }
 
-static void pg_send_unit(struct pgc *pc, struct req *r) {
-    buf_put(&pc->out, r->q.p, r->q.len);
-    r->next = NULL;
-    if (pc->tail) pc->tail->next = r;
-    else pc->head = r;
-    pc->tail = r;
-    pc->inflight++;
+static void mark_dirty(struct pgc *pc) {
     if (!pc->dirty) {
         pc->dirty = true;
         pc->next_dirty = pc->w->dirty;
@@ -353,85 +355,216 @@ static void pg_send_unit(struct pgc *pc, struct req *r) {
     }
 }
 
+/* Writes: an idle write connection takes the queued writes (up to write_group, or one solo write) and sends
+ * them as one transaction ended by one Sync, so one WAL flush commits them all. Every response still waits
+ * for that ReadyForQuery (rule 6). */
+static void pg_start_group(struct worker *w, struct pgc *pc) {
+    uint32_t n = 0;
+    pc->group_failed = false;
+    while (w->wait_write && n < cfg.write_group) {
+        struct req *r = w->wait_write;
+        if (n && r->solo) break;
+        w->wait_write = r->next;
+        r->next = NULL;
+        r->stmt = 0;
+        r->pg_error = false;
+        r->sqlstate[0] = 0;
+        buf_put(&pc->out, r->q.p, r->q.len);
+        if (pc->tail) pc->tail->next = r;
+        else pc->head = r;
+        pc->tail = r;
+        n++;
+        if (r->solo) break;
+    }
+    if (!w->wait_write) w->wait_write_tail = NULL;
+    pg_sync(&pc->out);
+    pc->cur = pc->head;
+    pc->inflight = n;
+    mark_dirty(pc);
+}
+
+static bool to_drain(struct worker *w, struct req *r) {
+    struct ring *ring = ipc.to_drain[w->id];
+    void *dst = ipc_reserve(ring, r->ipc_kind, (uint32_t)r->q.len, (uint64_t)(uintptr_t)r);
+    if (!dst) return false;
+    memcpy(dst, r->q.p, r->q.len);
+    ipc_commit(ring);
+    w->wake_drain = true;
+    return true;
+}
+
 void unit_submit(struct req *r, bool write) {
     struct worker *w = r->w;
-    pg_sync(&r->q);
     r->write = write;
     r->stmt = 0;
     r->pg_error = false;
     r->sqlstate[0] = 0;
-
-    /* The least busy connection of the right kind; past the pipeline cap, wait in arrival order. */
-    int lo = write ? w->nread : 0, hi = write ? w->npg : w->nread;
-    struct pgc *best = NULL;
-    for (int i = 0; i < hi - lo; i++) {
-        struct pgc *pc = &w->pg[lo + (int)((w->rr + (unsigned)i) % (unsigned)(hi - lo))];
-        if (!best || pc->inflight < best->inflight) best = pc;
-    }
-    w->rr++;
-    if (best->inflight < cfg.pg_pipeline) {
-        pg_send_unit(best, r);
-        return;
-    }
     r->next = NULL;
+
     if (write) {
+        /* Queued; pg_flush_all starts a group on an idle write connection once this batch of completions has
+         * been handled, so every write that arrived in it shares the commit. */
+        r->resp_mark = r->resp.len;
         if (w->wait_write_tail) w->wait_write_tail->next = r;
         else w->wait_write = r;
         w->wait_write_tail = r;
-    } else {
-        if (w->wait_read_tail) w->wait_read_tail->next = r;
-        else w->wait_read = r;
-        w->wait_read_tail = r;
+        return;
+    }
+
+    /* Reads go to the drain process; if its ring is full they wait here, in order. */
+    pg_sync(&r->q);
+    r->ipc_kind = IPC_PG;
+    if (!w->wait_read && to_drain(w, r)) return;
+    if (w->wait_read_tail) w->wait_read_tail->next = r;
+    else w->wait_read = r;
+    w->wait_read_tail = r;
+}
+
+/* A planned read: the drain batches it with others and answers with the finished body. */
+void plan_submit(struct req *r, int kind, int filter, int64_t limit, int64_t offset, const char *key, uint32_t keylen) {
+    struct worker *w = r->w;
+    r->q.len = 0;
+    struct plan_req *pr = (struct plan_req *)buf_reserve(&r->q, sizeof *pr + keylen);
+    memset(pr, 0, sizeof *pr);
+    pr->kind = (uint8_t)kind;
+    pr->filter = (uint8_t)filter;
+    pr->keylen = keylen;
+    pr->viewer = r->viewer;
+    pr->limit = limit;
+    pr->offset = offset;
+    memcpy(pr->key, key, keylen);
+    r->q.len = sizeof *pr + keylen;
+    r->ipc_kind = IPC_PLAN;
+    r->next = NULL;
+    if (!w->wait_read && to_drain(w, r)) return;
+    if (w->wait_read_tail) w->wait_read_tail->next = r;
+    else w->wait_read = r;
+    w->wait_read_tail = r;
+}
+
+static void flush_wait_read(struct worker *w) {
+    while (w->wait_read && to_drain(w, w->wait_read)) {
+        w->wait_read = w->wait_read->next;
+        if (!w->wait_read) w->wait_read_tail = NULL;
     }
 }
 
-static void pg_refill(struct worker *w, struct pgc *pc) {
-    struct req **head = pc->write ? &w->wait_write : &w->wait_read;
-    struct req **tail = pc->write ? &w->wait_write_tail : &w->wait_read_tail;
-    struct req *r = *head;
-    if (!r || pc->inflight >= cfg.pg_pipeline) return;
-    *head = r->next;
-    if (!*head) *tail = NULL;
-    pg_send_unit(pc, r);
+static void pg_error_msg(struct worker *w, const struct pg_msg *m, struct pg_error *e) {
+    pg_parse_error(m, e);
+    if (strcmp(e->sqlstate, "23505") != 0)
+        fprintf(stderr, "worker %d: postgres error %s: %s\n", w->id, e->sqlstate, e->message);
 }
 
-static void pg_dispatch(struct worker *w, struct pgc *pc, const struct pg_msg *m) {
-    struct req *r = pc->head;
+/* One message of a read unit's reply, relayed by the drain. */
+static void read_reply_msg(struct worker *w, struct req *r, const struct pg_msg *m) {
     switch (m->type) {
     case 'D':
-        if (unlikely(!r)) die("postgres: row without a request");
         if (!r->pg_error) r->fn(r, EV_ROW, m);
         break;
     case 'C':
     case 'I':
-        if (r) r->stmt++;
+        r->stmt++;
         break;
     case 'E': {
         struct pg_error e;
-        pg_parse_error(m, &e);
-        if (unlikely(!r)) die("postgres: %s %s", e.sqlstate, e.message);
+        pg_error_msg(w, m, &e);
         if (!r->pg_error) {
             r->pg_error = true;
             memcpy(r->sqlstate, e.sqlstate, 6);
-            if (strcmp(e.sqlstate, "23505") != 0)
-                fprintf(stderr, "worker %d: postgres error %s: %s\n", w->id, e.sqlstate, e.message);
         }
         break;
     }
     case 'Z':
-        if (unlikely(!r)) die("postgres: ReadyForQuery without a request");
-        pc->head = r->next;
-        if (!pc->head) pc->tail = NULL;
-        pc->inflight--;
-        pg_refill(w, pc);
         r->fn(r, EV_READY, NULL);
         break;
+    default:
+        break;
+    }
+}
+
+static void on_drain_replies(struct worker *w) {
+    struct ring *ring = ipc.to_worker[w->id];
+    const struct ipc_hdr *h;
+    bool any = false;
+    while ((h = ipc_peek(ring))) {
+        any = true;
+        struct req *r = (struct req *)(uintptr_t)h->token;
+        if (h->kind == IPC_PLAN) {
+            const struct plan_reply *rp = (const struct plan_reply *)(h + 1);
+            http_begin(&r->resp);
+            buf_put(&r->resp, rp->body, rp->len);
+            req_respond(r, rp->status);
+            continue;
+        }
+        if (h->kind != IPC_PG) die("worker %d: unknown reply kind %u", w->id, h->kind);
+        const uint8_t *p = (const uint8_t *)(h + 1);
+        size_t n = h->len;
+        while (n) {
+            struct pg_msg m;
+            ptrdiff_t k = pg_next(p, n, &m);
+            if (k <= 0) die("worker %d: malformed reply from the drain", w->id);
+            p += k, n -= (size_t)k;
+            read_reply_msg(w, r, &m);
+        }
+    }
+    if (any) ipc_release(ring);
+}
+
+static void pg_dispatch_write(struct worker *w, struct pgc *pc, const struct pg_msg *m) {
+    struct req *r = pc->cur;
+    switch (m->type) {
+    case 'D':
+        if (unlikely(!r)) die("postgres: row without a write");
+        if (!pc->group_failed) r->fn(r, EV_ROW, m);
+        break;
+    case 'C':
+    case 'I':
+        if (unlikely(!r)) die("postgres: completion without a write");
+        if (++r->stmt == r->nexec) pc->cur = r->next;
+        break;
+    case 'E': {
+        struct pg_error e;
+        pg_error_msg(w, m, &e);
+        pc->group_failed = true;
+        r = r ? r : pc->head;  /* an error at commit time belongs to the group; a lone write owns it */
+        if (r && !r->pg_error) {
+            r->pg_error = true;
+            memcpy(r->sqlstate, e.sqlstate, 6);
+        }
+        break;
+    }
+    case 'Z': {
+        struct req *list = pc->head, *tail = pc->tail;
+        if (unlikely(!list)) die("postgres: ReadyForQuery without a write group");
+        pc->head = pc->tail = pc->cur = NULL;
+        pc->inflight = 0;
+        if (pc->group_failed && list->next) {
+            /* The whole group rolled back, so none of it happened: retry each write alone, first in line. */
+            for (struct req *x = list; x; x = x->next) {
+                x->solo = true;
+                x->rows = 0;
+                x->resp.len = x->resp_mark;
+            }
+            tail->next = w->wait_write;
+            if (!w->wait_write) w->wait_write_tail = tail;
+            w->wait_write = list;
+            break;
+        }
+        while (list) {
+            struct req *next = list->next;
+            list->fn(list, EV_READY, NULL);
+            list = next;
+        }
+        break;
+    }
     case '1': case '2': case '3': case 'n': case 't': case 'T': case 'N': case 'S': case 'A':
         break;
     default:
         die("postgres: unexpected message '%c'", m->type);
     }
 }
+
+static void pg_dispatch(struct worker *w, struct pgc *pc, const struct pg_msg *m) { pg_dispatch_write(w, pc, m); }
 
 static void on_pg_recv(struct worker *w, struct io_uring_cqe *cqe) {
     struct pgc *pc = UD_PTR(io_uring_cqe_get_data64(cqe));
@@ -486,6 +619,7 @@ static void arm_eventfd(struct worker *w) {
 
 static void on_eventfd(struct worker *w, struct io_uring_cqe *cqe) {
     if (cqe->res < 0 && cqe->res != -EAGAIN && cqe->res != -EINTR) die("eventfd read: %s", strerror(-cqe->res));
+    on_drain_replies(w);
     struct req *r = bcrypt_pool_take_done(w->bp);
     while (r) {
         struct req *next = r->next;
@@ -542,13 +676,13 @@ static void buffers_init(struct worker *w) {
 
 static void pg_init(struct worker *w) {
     char err[256];
-    w->nread = cfg.read_conns;
-    w->npg = cfg.read_conns + cfg.write_conns;
+    w->nread = 0;  /* reads go through the drain */
+    w->npg = cfg.write_conns;
     w->pg = xcalloc((size_t)w->npg, sizeof *w->pg);
     for (int i = 0; i < w->npg; i++) {
         struct pgc *pc = &w->pg[i];
         pc->w = w;
-        pc->write = i >= w->nread;
+        pc->write = true;
         pc->fd = pg_open(&cfg.pg, err, sizeof err);
         if (pc->fd < 0) die("worker %d: postgres: %s", w->id, err);
         buf_init(&pc->out, 16384);
@@ -593,19 +727,23 @@ void worker_run(int id) {
     ring_init(w);
     buffers_init(w);
     w->listen_fd = listen_socket(cfg.host, cfg.port);
-    w->efd = eventfd(0, EFD_CLOEXEC);
-    if (w->efd < 0) die("eventfd: %s", strerror(errno));
+    w->efd = ipc.worker_efd[id];  /* replies from the drain and finished bcrypt jobs */
     w->bp = bcrypt_pool_start(w, cfg.bcrypt_threads);
 
     arm_accept(w);
     arm_eventfd(w);
     for (int i = 0; i < w->npg; i++) pg_arm_recv(w, &w->pg[i]);
-    fprintf(stderr, "worker %d: listening on %s:%s with %d+%d postgres connections\n", id, cfg.host, cfg.port,
-            w->nread, w->npg - w->nread);
+    fprintf(stderr, "worker %d: listening on %s:%s with %d postgres write connection(s)\n", id, cfg.host, cfg.port,
+            w->npg);
 
     for (;;) {
         pg_flush_all(w);
         if (w->norecv_len) rearm_starved(w);
+        if (w->wait_read) flush_wait_read(w);
+        if (w->wake_drain) {
+            w->wake_drain = false;
+            ipc_wake(ipc.drain_efd);
+        }
         int rc = io_uring_submit_and_wait(&w->ring, 1);
         if (rc < 0 && rc != -EINTR && rc != -EBUSY && rc != -EAGAIN) die("io_uring_submit_and_wait: %s", strerror(-rc));
         w->now = wall_now();

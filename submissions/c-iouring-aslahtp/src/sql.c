@@ -27,6 +27,9 @@
 #define FULL_COLTYPES {I8, T, T, T, T, TZ, TZ, TA, I8, B, T, T, T, B}
 #define SLUGIFY(x) "trim(both '-' from lower(regexp_replace(" x ", '[^A-Za-z0-9]+', '-', 'g')))"
 #define CURRVAL "currval(pg_get_serial_sequence('articles', 'id'))"
+#define I8A OID_INT8_ARRAY
+#define LEAN_COLS "a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at"
+#define LEAN_TYPES {I8, I8, I8, T, T, T, TZ, TZ}
 
 const struct stmt_def stmts[S_COUNT] = {
     [S_TAGS] = {"SELECT name FROM tags ORDER BY name", 0, 1, {0}, {T}},
@@ -98,7 +101,9 @@ const struct stmt_def stmts[S_COUNT] = {
     [S_ARTICLE_TAGS_INSERT] = {"INSERT INTO article_tags (article_id, tag_id) SELECT " CURRVAL ", t.id "
                                "FROM tags t WHERE t.name = ANY($1::text[])",
                                1, 0, {TA}, {0}},
-    [S_ARTICLE_BY_CURRVAL] = {FULL_SELECT "WHERE a.id = " CURRVAL, 1, 14, {I8}, FULL_COLTYPES},
+    /* currval is volatile: compared directly it would be re-evaluated per row (a scan of every article); as a
+     * sub-select it runs once and the lookup uses the primary key. */
+    [S_ARTICLE_BY_CURRVAL] = {FULL_SELECT "WHERE a.id = (SELECT " CURRVAL ")", 1, 14, {I8}, FULL_COLTYPES},
 
     [S_ARTICLE_OWNER] = {"SELECT id, author_id FROM articles WHERE slug = $1", 1, 2, {T}, {I8, I8}},
     [S_ARTICLE_UPDATE] = {"UPDATE articles SET title = COALESCE($2, title), description = COALESCE($3, description), "
@@ -130,14 +135,112 @@ const struct stmt_def stmts[S_COUNT] = {
                          "WHERE c.id = $1 AND a.slug = $2",
                          2, 1, {I8, T}, {I8}},
     [S_COMMENT_DELETE] = {"DELETE FROM comments WHERE id = $1", 1, 0, {I8}, {0}},
+
+    /* Writes that find their target themselves, so a request is one statement (plus its read-back) in one
+     * round trip instead of a lookup, then a write. A missing target writes nothing and returns no row. */
+    [S_FAVORITE_SLUG] = {"INSERT INTO favorites (user_id, article_id) SELECT $1, a.id FROM articles a "
+                         "WHERE a.slug = $2 ON CONFLICT DO NOTHING",
+                         2, 0, {I8, T}, {0}},
+    [S_UNFAVORITE_SLUG] = {"DELETE FROM favorites WHERE user_id = $1 AND article_id = "
+                           "(SELECT a.id FROM articles a WHERE a.slug = $2)",
+                           2, 0, {I8, T}, {0}},
+    [S_FOLLOW_NAME] = {"WITH u AS (SELECT id, username, bio, image FROM users WHERE username = $2), "
+                       "w AS (INSERT INTO follows (follower_id, followee_id) SELECT $1, id FROM u ON CONFLICT DO NOTHING) "
+                       "SELECT username, bio, image FROM u",
+                       2, 3, {I8, T}, {T, T, T}},
+    [S_UNFOLLOW_NAME] = {"WITH u AS (SELECT id, username, bio, image FROM users WHERE username = $2), "
+                         "w AS (DELETE FROM follows WHERE follower_id = $1 AND followee_id IN (SELECT id FROM u)) "
+                         "SELECT username, bio, image FROM u",
+                         2, 3, {I8, T}, {T, T, T}},
+
+    /* ---- the drain's planner (see planner.c). Every page statement returns lean article rows:
+     * k, id, author_id, slug, title, description, created_at, updated_at; the page's ids are cut first from the
+     * narrowest index, and only those rows are read from articles. Rows come back in any order; the planner
+     * sorts each page by id. The constant LIMIT 100 around each page is a no-op (limit <= 100) that keeps the
+     * generic plan's estimate small: LIMIT with a parameter is estimated at 10% of the rows, and 50,000 rows
+     * per page would make it hash-join a scan of every article. */
+    [P_GLOBAL_PAGES] = {"SELECT r.k, " LEAN_COLS " FROM unnest($1::int8[], $2::int8[]) WITH ORDINALITY r(lim, off, k) "
+                        "CROSS JOIN LATERAL (SELECT z.id FROM (SELECT a.id FROM articles a ORDER BY a.id DESC LIMIT r.lim OFFSET r.off) z "
+                        "LIMIT 100) p "
+                        "JOIN articles a ON a.id = p.id",
+                        2, 8, {I8A, I8A}, LEAN_TYPES},
+    /* Walks the primary key from the oldest end: those pages are all-visible, so this stays an index-only scan
+     * while new inserts keep the newest pages dirty. */
+    [P_GLOBAL_COUNT] = {"SELECT count(*) FROM (SELECT 1 FROM articles a ORDER BY a.id LIMIT 1000) s", 0, 1, {0}, {I8}},
+    [P_TAG_PAGES] = {"SELECT r.k, " LEAN_COLS " FROM unnest($1::text[], $2::int8[], $3::int8[]) WITH ORDINALITY "
+                     "r(name, lim, off, k) CROSS JOIN LATERAL (SELECT z.id FROM (SELECT at.article_id AS id FROM article_tags at "
+                     "WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = r.name) "
+                     "ORDER BY at.article_id DESC LIMIT r.lim OFFSET r.off) z LIMIT 100) p JOIN articles a ON a.id = p.id",
+                     3, 8, {TA, I8A, I8A}, LEAN_TYPES},
+    [P_TAG_COUNTS] = {"SELECT r.k, (SELECT count(*) FROM (SELECT 1 FROM article_tags at WHERE at.tag_id = "
+                      "(SELECT t.id FROM tags t WHERE t.name = r.name) LIMIT 1000) s) "
+                      "FROM unnest($1::text[]) WITH ORDINALITY r(name, k)",
+                      1, 2, {TA}, {I8, I8}},
+    [P_AUTHOR_PAGES] = {"SELECT r.k, " LEAN_COLS " FROM unnest($1::text[], $2::int8[], $3::int8[]) WITH ORDINALITY "
+                        "r(name, lim, off, k) CROSS JOIN LATERAL (SELECT z.id FROM (SELECT a2.id FROM articles a2 WHERE a2.author_id = "
+                        "(SELECT u.id FROM users u WHERE u.username = r.name) "
+                        "ORDER BY a2.id DESC LIMIT r.lim OFFSET r.off) z LIMIT 100) p JOIN articles a ON a.id = p.id",
+                        3, 8, {TA, I8A, I8A}, LEAN_TYPES},
+    [P_AUTHOR_COUNTS] = {"SELECT r.k, (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = "
+                         "(SELECT u.id FROM users u WHERE u.username = r.name) LIMIT 1000) s) "
+                         "FROM unnest($1::text[]) WITH ORDINALITY r(name, k)",
+                         1, 2, {TA}, {I8, I8}},
+    [P_FAV_PAGES] = {"SELECT r.k, " LEAN_COLS " FROM unnest($1::text[], $2::int8[], $3::int8[]) WITH ORDINALITY "
+                     "r(name, lim, off, k) CROSS JOIN LATERAL (SELECT z.id FROM (SELECT f.article_id AS id FROM favorites f "
+                     "WHERE f.user_id = (SELECT u.id FROM users u WHERE u.username = r.name) "
+                     "ORDER BY f.article_id DESC LIMIT r.lim OFFSET r.off) z LIMIT 100) p JOIN articles a ON a.id = p.id",
+                     3, 8, {TA, I8A, I8A}, LEAN_TYPES},
+    [P_FAV_COUNTS] = {"SELECT r.k, (SELECT count(*) FROM (SELECT 1 FROM favorites f WHERE f.user_id = "
+                      "(SELECT u.id FROM users u WHERE u.username = r.name) LIMIT 1000) s) "
+                      "FROM unnest($1::text[]) WITH ORDINALITY r(name, k)",
+                      1, 2, {TA}, {I8, I8}},
+    /* The feed page: each followee contributes at most lim+off of its newest ids (from the (author_id, id)
+     * index) before the merge, so a prolific author costs no more than a quiet one. */
+    [P_FEED_PAGES] = {"SELECT r.k, " LEAN_COLS " FROM unnest($1::int8[], $2::int8[], $3::int8[]) WITH ORDINALITY "
+                      "r(viewer, lim, off, k) CROSS JOIN LATERAL (SELECT z.id FROM (SELECT x.id FROM follows fo CROSS JOIN LATERAL "
+                      "(SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC "
+                      "LIMIT r.lim + r.off) x WHERE fo.follower_id = r.viewer ORDER BY x.id DESC "
+                      "LIMIT r.lim OFFSET r.off) z LIMIT 100) p JOIN articles a ON a.id = p.id",
+                      3, 8, {I8A, I8A, I8A}, LEAN_TYPES},
+    [P_FEED_COUNTS] = {"SELECT r.k, (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id IN "
+                       "(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.viewer) LIMIT 1000) s) "
+                       "FROM unnest($1::int8[]) WITH ORDINALITY r(viewer, k)",
+                       1, 2, {I8A}, {I8, I8}},
+    [P_ARTICLES] = {"SELECT r.k, " LEAN_COLS ", a.body FROM unnest($1::text[]) WITH ORDINALITY r(slug, k) "
+                    "JOIN articles a ON a.slug = r.slug",
+                    1, 9, {TA}, {I8, I8, I8, T, T, T, TZ, TZ, T}},
+    /* One row per comment (or one row with NULL comment columns: the article exists but has no comments). */
+    [P_COMMENTS] = {"SELECT r.k, a.id, c.id, c.body, c.created_at, c.updated_at, c.author_id, c.username, c.bio, "
+                    "c.image FROM unnest($1::text[]) WITH ORDINALITY r(slug, k) JOIN articles a ON a.slug = r.slug "
+                    "LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id, u.username, "
+                    "u.bio, u.image FROM comments c JOIN users u ON u.id = c.author_id WHERE c.article_id = a.id "
+                    "ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true",
+                    1, 10, {TA}, {I8, I8, I8, T, TZ, TZ, I8, T, T, T}},
+    [P_PROFILES] = {"SELECT r.k, u.id, u.username, u.bio, u.image FROM unnest($1::text[]) WITH ORDINALITY "
+                    "r(name, k) JOIN users u ON u.username = r.name",
+                    1, 5, {TA}, {I8, I8, T, T, T}},
+    /* Tag names by primary key: the generic plan for a tags join hashes all 200 tags per article. */
+    [P_ARTX] = {"SELECT r.id, ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) AS name "
+                "FROM article_tags at WHERE at.article_id = r.id ORDER BY 1), "
+                "(SELECT count(*) FROM favorites f WHERE f.article_id = r.id), u.username, u.bio, u.image "
+                "FROM unnest($1::int8[], $2::int8[]) r(id, author) JOIN users u ON u.id = r.author",
+                2, 6, {I8A, I8A}, {I8, TA, I8, T, T, T}},
+    /* Which (viewer, article) pairs are favorites and which (viewer, user) pairs are follows: one primary-key
+     * range scan per viewer instead of one probe per article. */
+    [P_FLAGS] = {"WITH p AS (SELECT v, array_agg(x) AS xs FROM unnest($1::int8[], $2::int8[]) t(v, x) GROUP BY v), "
+                 "q AS (SELECT v, array_agg(x) AS xs FROM unnest($3::int8[], $4::int8[]) t(v, x) GROUP BY v) "
+                 "SELECT 0::int8, p.v, f.article_id FROM p CROSS JOIN LATERAL (SELECT f.article_id FROM favorites f "
+                 "WHERE f.user_id = p.v AND f.article_id = ANY (p.xs)) f "
+                 "UNION ALL SELECT 1::int8, q.v, fo.followee_id FROM q CROSS JOIN LATERAL (SELECT fo.followee_id "
+                 "FROM follows fo WHERE fo.follower_id = q.v AND fo.followee_id = ANY (q.xs)) fo",
+                 4, 3, {I8A, I8A, I8A, I8A}, {I8, I8, I8}},
 };
 
-const char *const stmt_names[S_COUNT] = {
-    "s0",  "s1",  "s2",  "s3",  "s4",  "s5",  "s6",  "s7",  "s8",  "s9",  "s10", "s11",
-    "s12", "s13", "s14", "s15", "s16", "s17", "s18", "s19", "s20", "s21", "s22", "s23",
-    "s24", "s25", "s26", "s27", "s28", "s29", "s30", "s31", "s32", "s33", "s34",
-};
-_Static_assert(S_COUNT == 35, "update stmt_names");
+char stmt_names[S_COUNT][8];
+
+__attribute__((constructor)) static void name_stmts(void) {
+    for (int i = 0; i < S_COUNT; i++) snprintf(stmt_names[i], sizeof stmt_names[i], "s%d", i);
+}
 
 const char *const session_sql[] = {
     "SET plan_cache_mode = force_generic_plan",

@@ -7,6 +7,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "drain.h"
+#include "ipc.h"
 #include "jwt.h"
 #include "sha256.h"
 #include "worker.h"
@@ -41,8 +43,17 @@ static void on_term(int sig) {
     _exit(0);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     setvbuf(stderr, NULL, _IOLBF, 0);
+    if (argc > 1 && strcmp(argv[1], "--sql") == 0) {
+        /* Every prepared statement, for EXPLAIN work: name<TAB>parameter types<TAB>SQL */
+        for (int i = 0; i < S_COUNT; i++) {
+            printf("%s\t", stmt_names[i]);
+            for (int j = 0; j < stmts[i].nparams; j++) printf("%s%u", j ? "," : "", stmts[i].params[j]);
+            printf("\t%s\n", stmts[i].sql);
+        }
+        return 0;
+    }
     const char *url = getenv("DATABASE_URL");
     const char *secret = getenv("JWT_SECRET");
     if (!url || !*url) die("DATABASE_URL is not set");
@@ -54,24 +65,32 @@ int main(void) {
     cfg.host = env_str("HOST", "0.0.0.0");
     cfg.port = env_str("PORT", "3000");
     cfg.workers = env_int("WORKERS", cpus >= 2 ? (int)(cpus / 2) : 1, 1, MAX_WORKERS);
-    cfg.read_conns = env_int("READ_CONNS", 2, 1, 16);
+    cfg.read_conns = env_int("READ_CONNS", 5, 1, 64);
     cfg.write_conns = env_int("WRITE_CONNS", 1, 1, 8);
     cfg.bcrypt_threads = env_int("BCRYPT_THREADS", (int)((cpus + cfg.workers - 1) / cfg.workers), 1, 64);
     cfg.pg_pipeline = (uint32_t)env_int("PG_PIPELINE", 16, 1, 1024);
-    if (cfg.workers * (cfg.read_conns + cfg.write_conns) > 95) die("more than 95 postgres connections");
+    cfg.write_group = (uint32_t)env_int("WRITE_GROUP", 128, 1, 4096);
+    cfg.plan_max = (uint32_t)env_int("PLAN_MAX", 4096, 1, 65536);
+    cfg.plan_wait_us = env_int("PLAN_WAIT_US", 5000, 0, 1000000);
+    cfg.planner = env_int("PLANNER", 1, 0, 1);
+    if (cfg.read_conns + cfg.workers * cfg.write_conns > 95) die("more than 95 postgres connections");
 
     sha256_select();
     jwt_init(secret, strlen(secret));
     signal(SIGPIPE, SIG_IGN);
 
+    ipc_setup(cfg.workers, (size_t)env_int("RING_MB", 32, 1, 1024) << 20);
+
+    /* Process 0 is the drain; then the workers. */
     pid_t parent = getpid();
-    for (int i = 0; i < cfg.workers; i++) {
+    for (int i = -1; i < cfg.workers; i++) {
         pid_t pid = fork();
         if (pid < 0) die("fork: %s", strerror(errno));
         if (pid == 0) {
             prctl(PR_SET_PDEATHSIG, SIGKILL);
             if (getppid() != parent) _exit(1);
-            worker_run(i);
+            if (i < 0) drain_run();
+            else worker_run(i);
             _exit(1);
         }
         children[nchildren++] = pid;

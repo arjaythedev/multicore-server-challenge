@@ -3,6 +3,7 @@
  * Responses are rendered straight from binary DataRows into the response buffer. */
 #include "json_in.h"
 #include "json_out.h"
+#include "plan.h"
 #include "util.h"
 #include "worker.h"
 
@@ -26,14 +27,21 @@ static void keep_slot(struct req *r, int slot, const char *s, size_t n) {
 
 static void unit_begin(struct req *r) {
     r->q.len = 0;
+    r->nexec = 0;
     r->rows = 0;
 }
 
-static void bind_begin(struct req *r, struct pg_bind *pb, enum stmt s) { pg_bind_begin(pb, &r->q, stmt_names[s]); }
+static struct req *bind_req;  /* the request whose unit bind_exec is extending */
+
+static void bind_begin(struct req *r, struct pg_bind *pb, enum stmt s) {
+    bind_req = r;
+    pg_bind_begin(pb, &r->q, stmt_names[s]);
+}
 
 static void bind_exec(struct pg_bind *pb) {
     pg_bind_end(pb);
     pg_execute(pb->b);
+    bind_req->nexec++;
 }
 
 static void bind_opt_text(struct pg_bind *pb, const char *s, uint32_t n) {
@@ -189,22 +197,22 @@ static const struct jval *body_wrapper(struct req *r, const struct http_req *hr,
     return inner && inner->type == J_OBJ ? inner : NULL;
 }
 
-enum { F_ABSENT, F_OK, F_BAD };
+enum { FIELD_ABSENT, FIELD_OK, FIELD_BAD };
 
-/* Absent or null: F_ABSENT. A string (non-empty if required, without NUL): F_OK. Anything else: F_BAD. */
+/* Absent or null: FIELD_ABSENT. A string (non-empty if required, without NUL): FIELD_OK. Anything else: FIELD_BAD. */
 static int opt_str(const struct jval *obj, const char *key, bool non_empty, const char **s, uint32_t *n) {
     const struct jval *v = json_get(obj, key, strlen(key));
     *s = NULL;
     *n = 0;
-    if (!v || v->type == J_NULL) return F_ABSENT;
-    if (v->type != J_STR || (v->flags & JF_NUL) || (non_empty && v->len == 0)) return F_BAD;
+    if (!v || v->type == J_NULL) return FIELD_ABSENT;
+    if (v->type != J_STR || (v->flags & JF_NUL) || (non_empty && v->len == 0)) return FIELD_BAD;
     *s = v->s;
     *n = v->len;
-    return F_OK;
+    return FIELD_OK;
 }
 
 static bool req_str(const struct jval *obj, const char *key, const char **s, uint32_t *n) {
-    return opt_str(obj, key, true, s, n) == F_OK;
+    return opt_str(obj, key, true, s, n) == FIELD_OK;
 }
 
 /* ---- auth ---- */
@@ -240,6 +248,7 @@ static void h_tags(struct req *r, int ev, const struct pg_msg *m) {
 
 static void start_tags(struct req *r) {
     struct pg_bind pb;
+    if (cfg.planner) return plan_submit(r, PK_TAGS, PF_NONE, 0, 0, NULL, 0);
     r->fn = h_tags;
     unit_begin(r);
     bind_begin(r, &pb, S_TAGS);
@@ -264,6 +273,7 @@ static void h_register(struct req *r, int ev, const struct pg_msg *m) {
         pg_bind_text(&pb, r->bc.hash, BCRYPT_LEN);
         bind_exec(&pb);
         http_begin(&r->resp);
+        r->solo = true;  /* may fail on a taken name; must not take other writes down with it */
         unit_submit(r, true);
         break;
     case EV_ROW: {
@@ -368,6 +378,7 @@ static void h_user(struct req *r, int ev, const struct pg_msg *m) {
         bind_opt_text(&pb, r->s[4], r->sl[4]);
         bind_exec(&pb);
         http_begin(&r->resp);
+        r->solo = true;
         unit_submit(r, true);
         break;
     case EV_ROW:
@@ -403,7 +414,7 @@ static void start_put_user(struct req *r, const struct http_req *hr) {
     struct pg_bind pb;
     if (!u) return req_error(r, 422, "invalid body");
     bool bad = false;
-    for (int i = 0; i < 5; i++) bad |= opt_str(u, fields[i], i < 3, &s[i], &n[i]) == F_BAD;
+    for (int i = 0; i < 5; i++) bad |= opt_str(u, fields[i], i < 3, &s[i], &n[i]) == FIELD_BAD;
     if (bad) return req_error(r, 422, "invalid user fields");
     if (s[2] && n[2] > BCRYPT_MAX_PW) return req_error(r, 422, "password is too long");
     for (int i = 0; i < 5; i++)
@@ -422,6 +433,7 @@ static void start_put_user(struct req *r, const struct http_req *hr) {
     for (int i = 0; i < 5; i++) bind_opt_text(&pb, r->s[i], r->sl[i]);
     bind_exec(&pb);
     http_begin(&r->resp);
+    r->solo = true;
     unit_submit(r, true);
 }
 
@@ -446,6 +458,7 @@ static void h_profile(struct req *r, int ev, const struct pg_msg *m) {
 
 static void start_profile(struct req *r, const char *name, size_t nl) {
     struct pg_bind pb;
+    if (cfg.planner) return plan_submit(r, PK_PROFILE, PF_NONE, 0, 0, name, (uint32_t)nl);
     r->fn = h_profile;
     unit_begin(r);
     bind_begin(r, &pb, S_PROFILE);
@@ -456,31 +469,20 @@ static void start_profile(struct req *r, const char *name, size_t nl) {
     unit_submit(r, false);
 }
 
-/* POST/DELETE /api/profiles/:username/follow. n[0]: follow?, n[1]: followee id. */
+/* POST/DELETE /api/profiles/:username/follow: the lookup and the write are one statement; it returns the
+ * profile, or no row (404). n[0]: follow? */
 static void h_follow(struct req *r, int ev, const struct pg_msg *m) {
     struct cols c;
-    struct pg_bind pb;
     if (ev == EV_ROW) {
-        if (!row_cols(r, m, &c, 4)) return;
-        r->n[1] = col_i64(&c, 0);
+        if (!row_cols(r, m, &c, 3)) return;
         buf_lit(&r->resp, "{\"profile\":");
-        put_author(&r->resp, &c, 1, false, r->n[0]);
+        put_author(&r->resp, &c, 0, false, r->n[0]);
         buf_putc(&r->resp, '}');
         r->rows++;
         return;
     }
     if (r->pg_error) return pg_failed(r);
-    if (r->step == 0) {
-        if (!r->rows) return req_error(r, 404, "profile not found");
-        r->step = 1;
-        r->q.len = 0;
-        bind_begin(r, &pb, r->n[0] ? S_FOLLOW : S_UNFOLLOW);
-        pg_bind_i64(&pb, r->viewer);
-        pg_bind_i64(&pb, r->n[1]);
-        bind_exec(&pb);
-        unit_submit(r, true);
-        return;
-    }
+    if (!r->rows) return req_error(r, 404, "profile not found");
     req_respond(r, 200);
 }
 
@@ -489,11 +491,12 @@ static void start_follow(struct req *r, const char *name, size_t nl, bool follow
     r->fn = h_follow;
     r->n[0] = follow;
     unit_begin(r);
-    bind_begin(r, &pb, S_USER_BY_NAME);
+    bind_begin(r, &pb, follow ? S_FOLLOW_NAME : S_UNFOLLOW_NAME);
+    pg_bind_i64(&pb, r->viewer);
     pg_bind_text(&pb, name, nl);
     bind_exec(&pb);
     http_begin(&r->resp);
-    unit_submit(r, false);
+    unit_submit(r, true);
 }
 
 /* ---- article lists ---- */
@@ -568,6 +571,12 @@ static void start_list(struct req *r, const struct http_req *hr, bool feed) {
     struct list_query lq;
     struct pg_bind pb;
     if (!parse_list_query(r, hr, &lq)) return req_error(r, 422, "limit must be 1-100 and offset >= 0");
+    if (cfg.planner) {
+        if (feed) return plan_submit(r, PK_FEED, PF_NONE, lq.limit, lq.offset, NULL, 0);
+        for (int i = 0; i < 3; i++)  /* the first non-empty filter, in the order tag, author, favorited */
+            if (lq.flen[i]) return plan_submit(r, PK_LIST, PF_TAG + i, lq.limit, lq.offset, lq.filter[i], lq.flen[i]);
+        return plan_submit(r, PK_LIST, PF_NONE, lq.limit, lq.offset, NULL, 0);
+    }
     r->fn = h_list;
     unit_begin(r);
 
@@ -614,6 +623,7 @@ static void h_article(struct req *r, int ev, const struct pg_msg *m) {
 
 static void start_get_article(struct req *r, const char *slug, size_t sl) {
     struct pg_bind pb;
+    if (cfg.planner) return plan_submit(r, PK_ARTICLE, PF_NONE, 0, 0, slug, (uint32_t)sl);
     r->fn = h_article;
     r->n[2] = 200;
     unit_begin(r);
@@ -722,7 +732,7 @@ static void start_update_article(struct req *r, const struct http_req *hr, const
     const char *s[3];
     uint32_t n[3];
     bool bad = false;
-    for (int i = 0; i < 3; i++) bad |= opt_str(a, fields[i], true, &s[i], &n[i]) == F_BAD;
+    for (int i = 0; i < 3; i++) bad |= opt_str(a, fields[i], true, &s[i], &n[i]) == FIELD_BAD;
     if (bad) return req_error(r, 422, "title, description and body must be non-empty strings");
     for (int i = 0; i < 3; i++) keep_slot(r, i, s[i], n[i]);
     r->fn = h_update_article;
@@ -761,42 +771,24 @@ static void start_delete_article(struct req *r, const char *slug, size_t sl) {
     unit_submit(r, false);
 }
 
-/* POST/DELETE /api/articles/:slug/favorite: look up the id (404), then write and read back. n[1]: favorite? */
-static void h_favorite(struct req *r, int ev, const struct pg_msg *m) {
-    struct cols c;
+/* POST/DELETE /api/articles/:slug/favorite: the write finds the article by slug, and the read-back in the same
+ * transaction sees it; no row from the read-back is 404. */
+static void start_favorite(struct req *r, const char *slug, size_t sl, bool fav) {
     struct pg_bind pb;
-    if (ev == EV_ROW) {
-        if (row_cols(r, m, &c, 1)) r->n[0] = col_i64(&c, 0), r->rows++;
-        return;
-    }
-    if (r->pg_error) return pg_failed(r);
-    if (!r->rows) return req_error(r, 404, "article not found");
     r->fn = h_article;
     r->n[2] = 200;
     r->n[3] = 1;
-    int64_t id = r->n[0];
     unit_begin(r);
-    bind_begin(r, &pb, r->n[1] ? S_FAVORITE : S_UNFAVORITE);
+    bind_begin(r, &pb, fav ? S_FAVORITE_SLUG : S_UNFAVORITE_SLUG);
     pg_bind_i64(&pb, r->viewer);
-    pg_bind_i64(&pb, id);
+    pg_bind_text(&pb, slug, sl);
     bind_exec(&pb);
-    bind_begin(r, &pb, S_ARTICLE_BY_ID);
+    bind_begin(r, &pb, S_ARTICLE_BY_SLUG);
     pg_bind_i64(&pb, r->viewer);
-    pg_bind_i64(&pb, id);
+    pg_bind_text(&pb, slug, sl);
     bind_exec(&pb);
     http_begin(&r->resp);
     unit_submit(r, true);
-}
-
-static void start_favorite(struct req *r, const char *slug, size_t sl, bool fav) {
-    struct pg_bind pb;
-    r->fn = h_favorite;
-    r->n[1] = fav;
-    unit_begin(r);
-    bind_begin(r, &pb, S_ARTICLE_ID);
-    pg_bind_text(&pb, slug, sl);
-    bind_exec(&pb);
-    unit_submit(r, false);
 }
 
 /* ---- comments ---- */
@@ -820,6 +812,7 @@ static void h_comments(struct req *r, int ev, const struct pg_msg *m) {
 
 static void start_comments(struct req *r, const char *slug, size_t sl) {
     struct pg_bind pb;
+    if (cfg.planner) return plan_submit(r, PK_COMMENTS, PF_NONE, 0, 0, slug, (uint32_t)sl);
     r->fn = h_comments;
     unit_begin(r);
     bind_begin(r, &pb, S_ARTICLE_ID);

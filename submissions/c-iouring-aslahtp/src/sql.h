@@ -40,6 +40,29 @@ enum stmt {
     S_COMMENT_INSERT,
     S_COMMENT_OWNER,
     S_COMMENT_DELETE,
+    S_FAVORITE_SLUG,
+    S_UNFAVORITE_SLUG,
+    S_FOLLOW_NAME,
+    S_UNFOLLOW_NAME,
+
+    /* The drain's planner: phase A, one statement per family, keys as arrays, rows tagged with the key's
+     * ordinal k (1-based) ... */
+    P_GLOBAL_PAGES,
+    P_GLOBAL_COUNT,
+    P_TAG_PAGES,
+    P_TAG_COUNTS,
+    P_AUTHOR_PAGES,
+    P_AUTHOR_COUNTS,
+    P_FAV_PAGES,
+    P_FAV_COUNTS,
+    P_FEED_PAGES,
+    P_FEED_COUNTS,
+    P_ARTICLES,
+    P_COMMENTS,
+    P_PROFILES,
+    /* ... and phase B: each distinct article enriched once, and every viewer's flags. */
+    P_ARTX,
+    P_FLAGS,
     S_COUNT
 };
 
@@ -54,7 +77,7 @@ struct stmt_def {
 };
 
 extern const struct stmt_def stmts[S_COUNT];
-extern const char *const stmt_names[S_COUNT];
+extern char stmt_names[S_COUNT][8];  /* "s<index>" */
 
 /* Session settings sent once on every connection (rule 2 allows session-level SET). */
 extern const char *const session_sql[];

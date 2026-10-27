@@ -298,7 +298,7 @@ static int sasl_start(struct pg_auth *a, const struct pg_msg *m, struct buf *out
 
 static int sasl_continue(struct pg_auth *a, const struct pg_msg *m, struct buf *out) {
     const char *sf = (const char *)m->body + 4;
-    size_t sflen = m->len - 4, rlen, slen, ilen;
+    size_t sflen = m->len - 4, rlen = 0, slen = 0, ilen = 0;
     const char *r = scram_attr(sf, sflen, 'r', &rlen), *s = scram_attr(sf, sflen, 's', &slen);
     const char *it = scram_attr(sf, sflen, 'i', &ilen);
     size_t cnl = strlen(a->client_nonce);

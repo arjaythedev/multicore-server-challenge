@@ -56,8 +56,11 @@ struct req {
     int fd;
     uint32_t gen;
     bool keep_alive, pg_error, write;
+    bool solo;             /* a write that may fail on its own (unique names): never grouped with others */
+    uint8_t ipc_kind;      /* reads: what q holds for the drain (IPC_PG unit or IPC_PLAN request) */
     uint8_t step;
     uint16_t stmt;         /* statement index within the running unit */
+    uint16_t nexec;        /* statements (Executes) in the unit */
     char sqlstate[6];
     int64_t viewer;
     int64_t n[4];          /* handler scratch */
@@ -71,6 +74,7 @@ struct req {
     struct buf q;          /* the unit being built: Bind/Execute pairs, then Sync */
     struct buf resp;       /* the response; body starts at HDR_GAP */
     size_t resp_off, resp_sent;
+    size_t resp_mark;      /* response length when the unit was submitted (a retried write rewinds to it) */
     struct bc_job bc;
 };
 
@@ -83,6 +87,8 @@ struct pgc {
     struct buf in;
     struct req *head, *tail;  /* units in flight, in order */
     uint32_t inflight;
+    struct req *cur;          /* write connections: the unit of the running group receiving messages */
+    bool group_failed;
     struct pgc *next_dirty;
 };
 
@@ -98,23 +104,26 @@ struct worker {
     uint32_t nbufs, bufsz;
     int *norecv;           /* connections whose receive stopped for lack of buffers */
     uint32_t norecv_len;
-    struct pgc *pg;        /* [0, nread) read connections, then the write connection */
+    struct pgc *pg;        /* write connections (reads go through the drain process) */
     int npg, nread;
     unsigned rr;
     struct pgc *dirty;
-    struct req *wait_read, *wait_read_tail, *wait_write, *wait_write_tail;
+    struct req *wait_read, *wait_read_tail;
+    struct req *wait_write, *wait_write_tail;  /* writes waiting for the next group */
     struct req *free_reqs;
     struct arena scratch;
     int efd;
     uint64_t efd_val;
     struct bcrypt_pool *bp;
     double now;            /* wall clock (Unix seconds) at the start of this batch of completions */
+    bool wake_drain;       /* reads were queued for the drain in this iteration */
 };
 
 /* worker.c */
 struct req *req_alloc(struct worker *w, int fd, uint32_t gen);
 struct io_uring_sqe *sqe_get(struct worker *w);
 void unit_submit(struct req *r, bool write);
+void plan_submit(struct req *r, int kind, int filter, int64_t limit, int64_t offset, const char *key, uint32_t keylen);
 void req_respond(struct req *r, int status);
 void req_error(struct req *r, int status, const char *msg);
 void bcrypt_submit(struct req *r);
@@ -131,8 +140,12 @@ struct req *bcrypt_pool_take_done(struct bcrypt_pool *bp);
 struct config {
     struct pg_url pg;
     const char *host, *port;
-    int workers, read_conns, write_conns, bcrypt_threads;
-    uint32_t pg_pipeline;  /* units in flight per Postgres connection */
+    int workers, read_conns, write_conns, bcrypt_threads;  /* read_conns: the drain's, for the box */
+    uint32_t pg_pipeline;  /* units in flight per Postgres read connection */
+    uint32_t write_group;  /* most writes committed by one Sync */
+    uint32_t plan_max;     /* most planned reads in one plan */
+    int64_t plan_wait_us;  /* how long the oldest planned read may wait for company */
+    bool planner;          /* hot reads go to the planner (else as plain units) */
 };
 extern struct config cfg;
 
