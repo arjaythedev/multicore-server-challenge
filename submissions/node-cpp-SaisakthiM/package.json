@@ -1,0 +1,8 @@
+{
+  "name": "conduit-node-libuv",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Conduit API: Node.js event loop + C++ libuv/libpq addon (pipelined Postgres, native bcrypt, ring buffers)",
+  "license": "MIT",
+  "engines": { "node": ">=24" }
+}
