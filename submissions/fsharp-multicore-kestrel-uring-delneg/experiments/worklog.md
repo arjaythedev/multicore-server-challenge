@@ -331,3 +331,8 @@ feed count proof adopted, #91's hashagg off measured (no effect).
   **Not adopted**: one ring at ~23 us/req tops out near 42k req/s, below the ~53k that 8 cores allow at this
   CPU per request, and the score is the most users held with every core busy. `BATCH_MAX=256` 149.0 / 147.4 /
   150.8: noise.
+- **61 write connections** (`DB_WRITE_CONNS`, rotated order, 14k): 4: 156.3 / 147.8 / 153.0, 2: 160.1 / 152.4 /
+  150.0, 8 (default): 155.1 / 155.3 / 153.3. Noise. **Discarded.**
+- **artx split with distinct ids** (seed, 700 per batch): 6.7-7.2 ms/batch; without the favorite count 3.4-3.6,
+  without the author 4.2-4.3, without tag ids 4.4-4.5. The author by `LATERAL ... OFFSET 0` read 5.8-6.6 but has
+  the same generic plan (it ran last, warmer): no change possible there.
