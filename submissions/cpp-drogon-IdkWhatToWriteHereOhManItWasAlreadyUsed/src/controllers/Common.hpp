@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <algorithm>
 #include "bcrypt.hpp"
 #include "robin_hood.h"
 #include "db/Sql.hpp"
@@ -287,7 +288,10 @@ namespace multicore::common
                     ex.tags[aid].push_back(row["name"].as<std::string>());
                 }
 
-                auto counts = co_await db->execSqlCoro(sql::kFavoriteCountsForArticles, articleIdsLiteral);
+                for (auto& kv : ex.tags)
+                    std::ranges::sort(kv.second);
+
+                const auto counts = co_await db->execSqlCoro(sql::kFavoriteCountsForArticles, articleIdsLiteral);
                 for (const auto& row : counts)
                     ex.favoriteCounts[row["article_id"].as<int64_t>()] = row["cnt"].as<int64_t>();
 

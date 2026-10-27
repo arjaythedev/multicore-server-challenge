@@ -119,7 +119,8 @@ namespace multicore::sql
 
     // tags
     inline constexpr auto kSelectTags =
-        "SELECT name FROM tags ORDER BY name";
+        //"SELECT name FROM tags ORDER BY name";
+            "SELECT name FROM tags";
 
 
 
@@ -254,7 +255,8 @@ namespace multicore::sql
         "SELECT at.article_id, t.name "
         "  FROM article_tags at JOIN tags t ON t.id = at.tag_id "
         " WHERE at.article_id = ANY($1::bigint[]) "
-        " ORDER BY at.article_id, t.name";
+        ;
+        //" ORDER BY at.article_id, t.name";
 
     inline constexpr auto kFavoriteCountsForArticles =
         "SELECT article_id, count(*) AS cnt "
