@@ -33,6 +33,17 @@ fn createLogDir(io: std.Io) void {
     };
 }
 
+fn setupFileLimit() void {
+    std.process.raiseFileDescriptorLimit();
+
+    const limits = std.posix.getrlimit(.NOFILE) catch {};
+    std.debug.print("conduit: open file limit {d} (hard {d})\n", .{ limits.cur, limits.max });
+
+    if (limits.cur < 2048) {
+        std.debug.print("conduit: WARNING: open file limit {d} is below the 2048 budget\n", .{limits.cur});
+    }
+}
+
 // --------------------------------------------------------- //
 
 const Routes = zix.Http1.Router(&[_]zix.Http1.Route{
@@ -101,8 +112,9 @@ const Routes = zix.Http1.Router(&[_]zix.Http1.Route{
 // --------------------------------------------------------- //
 
 pub fn main(init: std.process.Init) !void {
-    // Debug runs stay on the loopback port, release falls back to the box
-    // contract. The environment always wins.
+    setupFileLimit();
+    createLogDir(init.io);
+
     const defaults = config.Defaults{
         .host = if (builtin.mode == .debug) "127.0.0.1" else "0.0.0.0",
         .port = if (builtin.mode == .debug) "3000" else "80",
@@ -120,14 +132,12 @@ pub fn main(init: std.process.Init) !void {
     const cpus = std.Thread.getCpuCount() catch DEFAULT_CPU;
     const park_len = @max(512, 8 * 1024 / cpus);
 
-    createLogDir(init.io);
-
     var allocator_logger = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
     defer allocator_logger.deinit();
     var logger = try zix.Logger.init(allocator_logger.allocator(), .{
         .save_path = DIR_LOG_PATH,
         .save_file = "conduit",
-        .save_min_level = .WARN,
+        .save_min_level = .INFO,
         .console = if (ALLOW_DEBUG) .ALWAYS else .OFF,
     });
     defer logger.deinit();
