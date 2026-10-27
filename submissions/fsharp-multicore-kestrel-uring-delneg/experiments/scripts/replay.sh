@@ -8,7 +8,7 @@ W=/tmp/replay; mkdir -p $W
 SQL=$(awk -v k="-- $K" '$0==k{f=1;next} /^-- /{f=0} f' "$F" | sed '/^$/d')
 [ -n "$SQL" ] || { echo "no section $K in $F"; exit 1; }
 # inputs: deterministic per (kind, NB, B)
-KB=${K%% *}; IN=$W/in-$KB-$NB-$B.sql
+KB=${K%% *}; IN=$W/in-$DB-$KB-$NB-$B.sql
 if [ ! -f $IN ]; then
   q() { local o=""; for e in "$@"; do o="$o${o:+, }quote_literal(array_agg($e)::text)"; done; echo "$o"; }
   ART="(SELECT slug FROM articles WHERE id = s)"
@@ -37,7 +37,7 @@ SQL
   sed -i '/^EXECUTE/!d' $IN
 fi
 {
-  echo "SET plan_cache_mode = force_generic_plan; SET jit = off; SET max_parallel_workers_per_gather = 0; SET enable_memoize = off;"
+  echo "SET plan_cache_mode = force_generic_plan; SET jit = off; SET max_parallel_workers_per_gather = 0; SET enable_memoize = off; ${EXTRA_SET:-}"
   echo "PREPARE q AS $SQL;"
   echo "SELECT pg_backend_pid() AS pid \\gset"
   echo "\\o /dev/null"

@@ -77,7 +77,7 @@ let main _ =
     Sql.ListAll.PackedMin <- envNum "LIST_PACKED_MIN" 4
     Jwt.init (env "JWT_SECRET" "multicore-server-challenge")
     Bcrypt.selfTest ()
-    Bcrypt.init (envNum "BCRYPT_THREADS" 2) (envNum "BCRYPT_WAIT_MS" 150) (envNum "BCRYPT_IDLE_WAIT_MS" 150) (envNum "BCRYPT_HELP_AT" 4)
+    Bcrypt.init (envNum "BCRYPT_THREADS" 2) (envNum "BCRYPT_WAIT_MS" 150) (envNum "BCRYPT_IDLE_WAIT_MS" 150) (envNum "BCRYPT_HELP_AT" 4) (envNum "BCRYPT_LANES" 5)
     Ctx.HttpDate.keep ()
     let reads = envNum "DB_CONNS" 6
     let writes = envNum "DB_WRITE_CONNS" 8

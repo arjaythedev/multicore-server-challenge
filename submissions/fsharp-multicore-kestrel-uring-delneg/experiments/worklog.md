@@ -198,3 +198,22 @@ fixed seeded inputs in one backend and read its CPU from /proc: SQL shape A/B wi
 - **References on this box** (12k): #47 rust-epoll-WorriedArrow 183.8 us/req (app 77.4, PG 108.2), 24,836 req/s,
   p95 175 ms; #61 go-epoll-MegaPanchamZ 225.9 (app 75.6, PG 150.6), 28,270 req/s, p95 127 ms. Earlier (6k):
   #7 300.6, #22 374.1. Ours runs ~175-185 (app ~57-65, PG ~118): cheaper app, ~10 us more PG than #47.
+- **44 feed clock 40 ms** (per-kind `WAIT_FEED`, e26): 12k 170.6 / 175.0 / 170.1 vs on 168.0 / 170.4 / 173.8; p95 95 / 98
+  vs 73-85 ms. Bigger feed batches don't pay at this load. Discarded, code removed.
+- **45 tag pages in one walk** (replay): one newest-first array of up to 1000 ids per distinct tag gives both the
+  capped count and the page: b14 329-339 vs 318-321, b28 284-289 vs 273. Building the array costs more than the
+  second walk. Discarded (never in the code).
+- **43b proof width** (replay, `FEED_PROOF_N` 4 / 8 / 16): b33 312-442 / 306-341 / 330-339, b64 298-338 / 280-286
+  / 288-302. 8 stays.
+- **46 server GC** replicates (6k, e27): 188.4 / 192.6 / 173.9 vs on 206.6 / 175.2 / 178.8; app 66.0 / 69.9 / 65.6
+  vs 71.2 / 65.1 / 66.4. No consistent gain. Discarded (workstation GC stays).
+- **47 batch cap 128 for article and comments** (`BATCH_ARTICLE` / `BATCH_COMMENTS`, e28, 12k): 164.3 / 163.5 / 166.7
+  vs on 163.6 / 166.5 / 169.2 (PG 108.6 / 107.5 / 110.5 vs 109.7 / 111.0 / 112.4), p50 25-27 vs 19-21 ms. About
+  -1.5 us inside the noise, for more latency. Discarded (64 stays).
+- **48 bcrypt 5 lanes + `-funroll-loops`** (e28, 5 is now the default): 12k on 167.5 / 173.9 / 169.5 (app 57.5 /
+  58.3 / 57.9) vs `BCRYPT_LANES=4` 172.6 / 167.6 / 173.8 (app 59.8 / 58.2 / 59.9); with the h1 "on" runs (also
+  5 lanes) 163.6 / 166.5 / 169.2. 6k (m1) 189.3 / 171.7 / 181.1 vs 206.6 / 175.2 / 178.8. rbench: 22.44 -> 20.87
+  ms per hash. About -1.5 us of app per request. Kept. Conformance 197/197 dev and seed, overload PASS.
+- Harness: `conf.sh` sometimes failed with errno 98 on 127.0.0.1:3000. The load generator's ephemeral ports on
+  this box can include 3000, so a leftover loopback connection blocks the bind (not an issue on the official box,
+  where the load comes from other machines). conf.sh now waits until no socket uses :3000 and retries once.

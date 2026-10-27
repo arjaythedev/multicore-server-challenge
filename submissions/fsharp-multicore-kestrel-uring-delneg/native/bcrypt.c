@@ -1,4 +1,4 @@
-// bcrypt ($2a$ / $2b$ / $2y$), up to 4 hashes at once in one thread (interleaved lanes).
+// bcrypt ($2a$ / $2b$ / $2y$), up to 5 hashes at once in one thread (interleaved lanes).
 // Taken from c-iouring-tigokraft (PR #10, MIT, this repo's license): src/bcrypt.c and src/bf_pi.h, with a flat
 // C ABI for .NET added at the end (bc_batch). Compiled from source by build.sh.
 #include <stdbool.h>
@@ -7,7 +7,7 @@
 #include <string.h>
 #include <sys/random.h>
 #include "bf_pi.h"
-#define BC_LANES 4
+#define BC_LANES 5
 typedef struct { uint32_t P[18]; uint32_t S[4][256]; } bf_t;
 
 #define F(st, x) ((((st)->S[0][(x) >> 24] + (st)->S[1][((x) >> 16) & 0xff]) ^ (st)->S[2][((x) >> 8) & 0xff]) + \
@@ -94,6 +94,7 @@ EKS_N(1)
 EKS_N(2)
 EKS_N(3)
 EKS_N(4)
+EKS_N(5)
 
 // ---------- bcrypt's base64 and setting strings ----------
 
@@ -187,7 +188,8 @@ void bc_hash_n(int n, const char *const *pw, const char *const *setting, char (*
     case 1: eks1((const uint32_t(*)[18])kw, (const uint32_t(*)[4])sw, cost, ct); break;
     case 2: eks2((const uint32_t(*)[18])kw, (const uint32_t(*)[4])sw, cost, ct); break;
     case 3: eks3((const uint32_t(*)[18])kw, (const uint32_t(*)[4])sw, cost, ct); break;
-    default: eks4((const uint32_t(*)[18])kw, (const uint32_t(*)[4])sw, cost, ct); break;
+    case 4: eks4((const uint32_t(*)[18])kw, (const uint32_t(*)[4])sw, cost, ct); break;
+    default: eks5((const uint32_t(*)[18])kw, (const uint32_t(*)[4])sw, cost, ct); break;
     }
     for (int l = 0; l < n; l++) {
         memcpy(out[l], setting[l], 29); // "$2b$10$" + 22 salt chars, as given
@@ -203,7 +205,7 @@ int bc_cost(const char *setting) {
 }
 
 // ---------- flat ABI for .NET (P/Invoke) ----------
-// n jobs (1..4, same cost): pw = n NUL-terminated passwords of up to 72 bytes, each in a 73-byte slot;
+// n jobs (1..5, same cost): pw = n NUL-terminated passwords of up to 72 bytes, each in a 73-byte slot;
 // setting = n settings ("$2b$10$" + 22 salt chars, more is ignored), each in a 64-byte slot, NUL-terminated;
 // out = n 64-byte slots, each gets the 60-char hash and a NUL. Returns 0, or -1 if a setting is not bcrypt.
 int bc_batch(int n, const char *pw, const char *setting, char *out) {

@@ -85,11 +85,14 @@ let private compute (jobs: Job[]) (n: int) (pw: byte[]) (st: byte[]) (out: byte[
 /// lanes: 4 lanes cost 23.8 ms per hash, 1 lane 60.1 ms), so a burst of logins still gets every thread.
 let mutable private helpAt = 4
 
+/// hashes per batch (the C core does up to 5)
+let mutable private lanes = 4
+
 let private loop (index: int) () =
-    let batch = Array.zeroCreate<Job> 4
-    let pw = Array.zeroCreate<byte> (4 * 73)
-    let st = Array.zeroCreate<byte> (4 * 64)
-    let out = Array.zeroCreate<byte> (4 * 64)
+    let batch = Array.zeroCreate<Job> 5
+    let pw = Array.zeroCreate<byte> (5 * 73)
+    let st = Array.zeroCreate<byte> (5 * 64)
+    let out = Array.zeroCreate<byte> (5 * 64)
     let one = Array.zeroCreate<Job> 1
     let gone = System.Collections.Generic.List<Job>()
     while true do
@@ -107,7 +110,7 @@ let private loop (index: int) () =
             let busy = queue.Count > 0 || Volatile.Read &hashing > 0
             let deadline = Environment.TickCount64 + int64 (if busy then waitMs else idleWaitMs)
             let mutable go = true
-            while go && n < 4 do
+            while go && n < lanes do
                 let left = int (max 0L (deadline - Environment.TickCount64))
                 let mutable more: Job = null
                 if queue.TryTake(&more, left) then
@@ -144,7 +147,8 @@ let private loop (index: int) () =
             try j.Completed() with e -> eprintfn "%O" e
         gone.Clear()
 
-let init (threads: int) (wait: int) (idleWait: int) (help: int) =
+let init (threads: int) (wait: int) (idleWait: int) (help: int) (nLanes: int) =
+    lanes <- min 5 (max 1 nLanes)
     helpAt <- max 1 help
     waitMs <- wait
     idleWaitMs <- idleWait

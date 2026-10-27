@@ -16,12 +16,12 @@ RAMP=30; MEAS=150; SKIP=30
 OUT="/root/mc/screens/$LABEL"; rm -rf "$OUT"; mkdir -p "$OUT"
 DROP=/etc/systemd/system/challenge.service.d/zz-exp.conf
 mkdir -p "$(dirname "$DROP")"
-{ echo "[Service]"; if [ -n "$ENVF" ]; then { grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$ENVF" || true; } | sed 's/^/Environment=/'; fi; } > "$DROP"
+{ echo "[Service]"; if [ -n "$ENVF" ]; then { grep -E '^"?[A-Za-z_][A-Za-z0-9_]*=' "$ENVF" || true; } | sed 's/^/Environment=/'; fi; } > "$DROP"
 cp "$DROP" "$OUT/env.conf"
 systemctl daemon-reload
 /opt/conduit-tools/switch.sh "$NAME" --no-conformance > "$OUT/switch.log" 2>&1 || { tail -20 "$OUT/switch.log"; exit 1; }
 START=$(( $(date +%s%3N) + 3000 ))
-taskset -c 6,7 /usr/local/bin/conduit-loadgen run -target http://127.0.0.1 -users "$USERS" -think-scale "$SCALE" \
+taskset -c ${LGCPUS:-6,7} /usr/local/bin/conduit-loadgen run -target "${TARGET:-http://127.0.0.1}" -users "$USERS" -think-scale "$SCALE" \
   -ramp ${RAMP}s -measure ${MEAS}s -tail 5s -start-at "$START" -secret multicore-server-challenge \
   -run-id "s$(date +%s)" -q -out "$OUT/lg.json" > "$OUT/lg.log" 2>&1 &
 LG=$!
