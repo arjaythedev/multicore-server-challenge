@@ -20,7 +20,7 @@ namespace {
                 promise->set_value(std::move(h));
             });
         try {
-            co_return co_await multicore::FutureAwaiter<std::string>{std::move(fut)};
+            co_return co_await multicore::FutureAwaiter<std::string>{fut.share()};
         } catch (const std::exception& e) {
             LOG_ERROR << "bcrypt hash exception: " << e.what();
             throw;
@@ -33,7 +33,7 @@ namespace {
         auto fut = promise->get_future();
         BcryptPool::instance().verifyAsync(password, stored,
             [promise](const bool ok) { promise->set_value(ok); });
-        co_return co_await multicore::FutureAwaiter<bool>{std::move(fut)};
+        co_return co_await multicore::FutureAwaiter<bool>{fut.share()};
     }
 
     constexpr auto kDummyHash = "$2a$10$ZSfEoPvlcsj2XfvsSeK25em4NZ9Jm7ntGqXuLgQfHEeZPYB8899wq";

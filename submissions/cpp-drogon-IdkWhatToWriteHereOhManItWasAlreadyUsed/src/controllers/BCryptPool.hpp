@@ -133,20 +133,19 @@ private:
 
     template <typename T>
     struct FutureAwaiter {
-        std::future<T> fut;
+        std::shared_future<T> fut;
 
-        [[nodiscard]] bool await_ready() const noexcept {
+        bool await_ready() const noexcept {
             return fut.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
         }
 
         void await_suspend(std::coroutine_handle<> h) {
-            std::thread([fut = std::move(fut), h]() mutable {
-                fut.wait();
+            std::thread([f = fut, h]() mutable {
+                f.wait();
                 h.resume();
             }).detach();
         }
 
         T await_resume() { return fut.get(); }
     };
-
 } // namespace multicore
