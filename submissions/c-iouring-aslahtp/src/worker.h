@@ -13,7 +13,8 @@
 
 /* Operation tag in the low 3 bits of a CQE's user_data; the rest is a pointer (8-byte aligned) or, for client
  * receives, the connection's fd and generation. */
-enum op { OP_ACCEPT, OP_RECV, OP_SEND, OP_PG_RECV, OP_PG_SEND, OP_EVENTFD, OP_IGNORE };
+/* OP_QUIET: like OP_IGNORE, but a failure is expected too (shutting down a socket the client already reset). */
+enum op { OP_ACCEPT, OP_RECV, OP_SEND, OP_PG_RECV, OP_PG_SEND, OP_EVENTFD, OP_IGNORE, OP_QUIET };
 #define UD_OP(ud) ((unsigned)((ud) & 7))
 #define UD_PTR(ud) ((void *)(uintptr_t)((ud) & ~(uint64_t)7))
 #define UD_MAKE_PTR(p, op) ((uint64_t)(uintptr_t)(p) | (op))
@@ -102,6 +103,7 @@ struct worker {
     int listen_fd;
     struct hconn *conns;
     uint32_t nconns;
+    bool direct;           /* client sockets are io_uring direct descriptors: "fd" is a slot in the ring's table */
     char *bufs;            /* provided receive buffers */
     uint32_t nbufs, bufsz;
     int *norecv;           /* connections whose receive stopped for lack of buffers */
@@ -151,6 +153,7 @@ struct config {
     uint32_t plan_max;     /* most planned reads in one plan */
     int64_t plan_wait_us;  /* how long the oldest planned read may wait for company */
     bool planner;          /* hot reads go to the planner (else as plain units) */
+    bool direct_fds;       /* accept client sockets as io_uring direct descriptors (off: no measured gain on loopback) */
 };
 extern struct config cfg;
 

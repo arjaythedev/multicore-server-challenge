@@ -32,11 +32,64 @@ void sha256_blocks_generic(uint32_t h[8], const uint8_t *p, size_t n) {
     }
 }
 
+#if defined(__x86_64__)
+#include <cpuid.h>
+#include <immintrin.h>
+
+/* The same compression with the SHA extensions (recent Intel, every AMD Zen). Each sha256rnds2 does two rounds,
+ * on the state held as ABEF / CDGH. Per group of 4 rounds (Intel's reference order): msg2 finishes the next
+ * message block, msg1 starts the one after. */
+__attribute__((target("sha,sse4.1"))) static void sha256_blocks_shani(uint32_t h[8], const uint8_t *p, size_t n) {
+    const __m128i bswap = _mm_set_epi64x(0x0c0d0e0f08090a0bULL, 0x0405060700010203ULL);
+    __m128i t = _mm_loadu_si128((const __m128i *)&h[0]);       /* DCBA */
+    __m128i s1 = _mm_loadu_si128((const __m128i *)&h[4]);      /* HGFE */
+    t = _mm_shuffle_epi32(t, 0xB1);                             /* CDAB */
+    s1 = _mm_shuffle_epi32(s1, 0x1B);                           /* EFGH */
+    __m128i s0 = _mm_alignr_epi8(t, s1, 8);                     /* ABEF */
+    s1 = _mm_blend_epi16(s1, t, 0xF0);                          /* CDGH */
+
+    for (; n; n--, p += 64) {
+        __m128i a0 = s0, c0 = s1, w[4];
+        for (int i = 0; i < 4; i++) w[i] = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(p + 16 * i)), bswap);
+        for (int i = 0; i < 16; i++) {
+            __m128i cur = w[i & 3];
+            __m128i m = _mm_add_epi32(cur, _mm_loadu_si128((const __m128i *)&K[4 * i]));
+            s1 = _mm_sha256rnds2_epu32(s1, s0, m);
+            if (i >= 3 && i <= 14) {
+                __m128i *next = &w[(i + 1) & 3];
+                *next = _mm_add_epi32(*next, _mm_alignr_epi8(cur, w[(i - 1) & 3], 4));
+                *next = _mm_sha256msg2_epu32(*next, cur);
+            }
+            m = _mm_shuffle_epi32(m, 0x0E);
+            s0 = _mm_sha256rnds2_epu32(s0, s1, m);
+            if (i >= 1 && i <= 12) w[(i - 1) & 3] = _mm_sha256msg1_epu32(w[(i - 1) & 3], cur);
+        }
+        s0 = _mm_add_epi32(s0, a0);
+        s1 = _mm_add_epi32(s1, c0);
+    }
+
+    t = _mm_shuffle_epi32(s0, 0x1B);                            /* FEBA */
+    s1 = _mm_shuffle_epi32(s1, 0xB1);                           /* DCHG */
+    s0 = _mm_blend_epi16(t, s1, 0xF0);                          /* DCBA */
+    s1 = _mm_alignr_epi8(s1, t, 8);                             /* HGFE */
+    _mm_storeu_si128((__m128i *)&h[0], s0);
+    _mm_storeu_si128((__m128i *)&h[4], s1);
+}
+
+static bool cpu_has_shani(void) {
+    unsigned a, b, c, d;
+    if (!__get_cpuid_count(7, 0, &a, &b, &c, &d) || !(b & bit_SHA)) return false;
+    return __get_cpuid(1, &a, &b, &c, &d) && (c & bit_SSE4_1) && (c & bit_SSSE3);
+}
+#endif
+
 sha256_blocks_fn sha256_blocks = sha256_blocks_generic;
 
 void sha256_select(void) {
-    /* The SHA-NI block function arrives with the app-side CPU work (plan M9). */
     sha256_blocks = sha256_blocks_generic;
+#if defined(__x86_64__)
+    if (cpu_has_shani()) sha256_blocks = sha256_blocks_shani;
+#endif
 }
 
 void sha256_init(struct sha256 *s) {

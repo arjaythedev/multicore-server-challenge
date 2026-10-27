@@ -76,6 +76,7 @@ int main(int argc, char **argv) {
     cfg.plan_max = (uint32_t)env_int("PLAN_MAX", 4096, 1, 65536);
     cfg.plan_wait_us = env_int("PLAN_WAIT_US", 5000, 0, 1000000);
     cfg.planner = env_int("PLANNER", 1, 0, 1);
+    cfg.direct_fds = env_int("DIRECT_FDS", 0, 0, 1);
     if (cfg.read_conns + cfg.workers * cfg.write_conns > 95) die("more than 95 postgres connections");
 
     sha256_select();

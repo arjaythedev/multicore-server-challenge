@@ -109,7 +109,7 @@ static void arm_recv(struct worker *w, int fd) {
     struct hconn *c = &w->conns[fd];
     struct io_uring_sqe *s = sqe_get(w);
     io_uring_prep_recv_multishot(s, fd, NULL, 0, 0);
-    s->flags |= IOSQE_BUFFER_SELECT;
+    s->flags |= IOSQE_BUFFER_SELECT | (w->direct ? IOSQE_FIXED_FILE : 0);
     s->buf_group = BGID;
     io_uring_sqe_set_data64(s, UD_MAKE_CONN(fd, c->gen, OP_RECV));
     c->recv_armed = true;
@@ -117,7 +117,8 @@ static void arm_recv(struct worker *w, int fd) {
 
 static void arm_accept(struct worker *w) {
     struct io_uring_sqe *s = sqe_get(w);
-    io_uring_prep_multishot_accept(s, w->listen_fd, NULL, NULL, SOCK_CLOEXEC);
+    if (w->direct) io_uring_prep_multishot_accept_direct(s, w->listen_fd, NULL, NULL, 0);
+    else io_uring_prep_multishot_accept(s, w->listen_fd, NULL, NULL, SOCK_CLOEXEC);
     io_uring_sqe_set_data64(s, OP_ACCEPT);
 }
 
@@ -130,6 +131,20 @@ static void conn_close(struct worker *w, int fd) {
     free(c->pend);
     c->pend = NULL;
     c->plen = c->pcap = 0;
+    if (w->direct) {
+        /* Both go through the ring after anything already queued for this slot, and an operation's file is
+         * fixed when it is issued, so the slot cannot be reused under an earlier send. The shutdown ends the
+         * multishot receive, which keeps the socket alive until then. */
+        struct io_uring_sqe *s = sqe_get(w);
+        io_uring_prep_shutdown(s, fd, SHUT_RDWR);
+        s->flags |= IOSQE_FIXED_FILE | IOSQE_CQE_SKIP_SUCCESS;
+        io_uring_sqe_set_data64(s, OP_QUIET);
+        s = sqe_get(w);
+        io_uring_prep_close_direct(s, (unsigned)fd);
+        s->flags |= IOSQE_CQE_SKIP_SUCCESS;
+        io_uring_sqe_set_data64(s, OP_IGNORE);
+        return;
+    }
     /* Queued but unsubmitted operations on this fd must reach the kernel before the number can be reused. */
     io_uring_submit(&w->ring);
     shutdown(fd, SHUT_RDWR);  /* ends the multishot receive, which holds its own file reference */
@@ -206,7 +221,7 @@ static void on_accept(struct worker *w, struct io_uring_cqe *cqe) {
     if (cqe->res >= 0) {
         int fd = cqe->res;
         if ((uint32_t)fd >= w->nconns) {
-            close(fd);
+            if (!w->direct) close(fd);  /* a direct slot is always inside the table, which is nconns long */
         } else {
             struct hconn *c = &w->conns[fd];
             c->open = true;
@@ -264,6 +279,7 @@ static void send_resp(struct req *r) {
     struct io_uring_sqe *s = sqe_get(r->w);
     size_t off = r->resp_off + r->resp_sent;
     io_uring_prep_send(s, r->fd, r->resp.p + off, r->resp.len - off, MSG_NOSIGNAL);
+    if (r->w->direct) s->flags |= IOSQE_FIXED_FILE;
     io_uring_sqe_set_data64(s, UD_MAKE_PTR(r, OP_SEND));
 }
 
@@ -704,6 +720,8 @@ static void on_cqe(struct worker *w, struct io_uring_cqe *cqe) {
     case OP_IGNORE:
         if (cqe->res < 0) fprintf(stderr, "worker %d: ring op failed: %s\n", w->id, strerror(-cqe->res));
         break;
+    case OP_QUIET:
+        break;
     }
 }
 
@@ -726,6 +744,14 @@ void worker_run(int id) {
 
     pg_init(w);
     ring_init(w);
+    if (cfg.direct_fds) {
+        /* Accepted sockets live only in the ring's file table: no fd-table lookup and reference count per send
+         * and receive. The kernel caps a table at 2^20 slots. */
+        if (w->nconns > (1u << 20)) w->nconns = 1u << 20;
+        int rc = io_uring_register_files_sparse(&w->ring, w->nconns);
+        if (rc == 0) w->direct = true;
+        else fprintf(stderr, "worker %d: no direct descriptors (%s); using plain fds\n", id, strerror(-rc));
+    }
     buffers_init(w);
     w->listen_fd = listen_socket(cfg.host, cfg.port);
     w->efd = ipc.worker_efd[id];  /* replies from the drain and finished bcrypt jobs */

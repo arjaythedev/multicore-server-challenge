@@ -58,6 +58,21 @@ static void test_sha256(void) {
     }
 }
 
+/* The selected block function (SHA-NI where the CPU has it) against the generic one, 1..8 blocks of varied data. */
+static void test_sha256_blocks(void) {
+    uint8_t data[8 * SHA256_BLOCK];
+    uint32_t x = 12345;
+    for (int round = 0; round < 64; round++) {
+        for (size_t i = 0; i < sizeof data; i++) data[i] = (uint8_t)((x = x * 1103515245 + 12345) >> 16);
+        size_t nb = (size_t)round % 8 + 1;
+        uint32_t a[8], b[8];
+        for (int i = 0; i < 8; i++) a[i] = b[i] = x ^ (uint32_t)(i * 0x9e3779b9u);
+        sha256_blocks_generic(a, data, nb);
+        sha256_blocks(b, data, nb);
+        CHECK(memcmp(a, b, sizeof a) == 0, "sha256 block function matches generic, round %d", round);
+    }
+}
+
 static void test_hmac(void) {
     uint8_t m[200], k[100], kr[100], d[32];
     char h[65];
@@ -418,6 +433,7 @@ int main(void) {
     arena_init(&A, 4096);
     sha256_select();
     test_sha256();
+    test_sha256_blocks();
     test_hmac();
     test_base64();
     test_json_in();
