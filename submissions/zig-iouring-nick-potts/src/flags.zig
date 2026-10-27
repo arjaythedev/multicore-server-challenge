@@ -5,9 +5,9 @@
 const std = @import("std");
 
 pub const Flags = struct {
-    /// Overload shedding (shed.zig): under CPU saturation (below 3% idle, hasher CPU counted as idle) refuse route
-    /// classes in a fixed, measured cost order, heaviest first, within an error budget of 0.9% of requests.
-    shed: bool = true,
+    /// Overload shedding (shed.zig): while the CPU is saturated (a second below 3% idle, hasher CPU counted as idle)
+    /// refuse sign-ups and logins with an immediate 503.
+    shed: bool = false,
     /// Delayed ACK: each sent response puts its socket back in delayed-ACK mode (TCP_QUICKACK off), so the next
     /// request's ACK leaves with its response instead of alone.
     ackdelay: bool = true,
@@ -85,7 +85,7 @@ const testing = std.testing;
 test "defaults, overrides, and the errors that stop the server" {
     var bad: []const u8 = "";
     try testing.expectEqual(Flags{}, try parse("", &bad));
-    try testing.expectEqual(Flags{ .shed = false }, try parse("shed=off", &bad));
+    try testing.expectEqual(Flags{ .shed = true }, try parse("shed=on", &bad));
     try testing.expectEqual(Flags{ .shed = true }, try parse(" shed=off , shed=on,", &bad));
     try testing.expectEqual(Flags{ .ackdelay = false }, try parse("ackdelay=off", &bad));
     try testing.expectError(error.UnknownFlag, parse("shed=on,sheds=off", &bad));
@@ -93,7 +93,7 @@ test "defaults, overrides, and the errors that stop the server" {
     try testing.expectError(error.BadValue, parse("shed=yes", &bad));
     try testing.expectError(error.BadValue, parse("shed", &bad));
     var buf: [64]u8 = undefined;
-    try testing.expectEqualStrings("shed=off,ackdelay=on,gzip=on", format(.{ .shed = false }, &buf));
+    try testing.expectEqualStrings("shed=off,ackdelay=on,gzip=on", format(.{}, &buf));
 }
 
 test "dispatch passes the runtime flags as a comptime value" {
@@ -106,6 +106,6 @@ test "dispatch passes the runtime flags as a comptime value" {
     };
     dispatch(.{ .shed = false }, Probe.run, .{@as(u8, 7)});
     try testing.expectEqual(false, Probe.got);
-    dispatch(.{}, Probe.run, .{@as(u8, 7)});
+    dispatch(.{ .shed = true }, Probe.run, .{@as(u8, 7)});
     try testing.expectEqual(true, Probe.got);
 }

@@ -5,7 +5,7 @@
 //! statement (`onDone`) either answers or queues the next step. Status codes, messages and validation order follow
 //! the reference server (examples/go).
 //!
-//! With `shed` (shed.zig), a request is admitted or shed right after routing, before any other work.
+//! With `shed` (shed.zig), a sign-up or login is refused under overload right after routing, before any other work.
 const std = @import("std");
 const db = @import("db.zig");
 const sql = @import("sql.zig");
@@ -47,8 +47,6 @@ pub const Req = struct {
     /// receive buffer can move on. Sized once per request, so slices into it stay valid.
     scratch: std.ArrayList(u8) = .empty,
     job: bcrypt.Job = undefined,
-    /// With `shed`: what the overload controller knows of it.
-    ticket: shed.Ticket = .{},
     /// A body string is text Postgres rejects. The request runs only the lookup the reference makes before its
     /// write, and answers its 404 or 403, or else the 500 of the reference's failed write.
     bad_text: bool = false,
@@ -242,13 +240,7 @@ pub fn start(comptime F: Flags, r: *Req, head: *const http.Head, body: []const u
     r.bad_text = false;
 
     const m = http.route(head.method, head.target);
-    if (F.shed) {
-        r.ticket = .{};
-        if (shed.ctl.admit(m.route)) {
-            r.ticket.counted = true;
-            return fail(r, .unavailable, "server overloaded");
-        }
-    }
+    if (F.shed and shed.ctl.refuse(m.route)) return fail(r, .unavailable, "server overloaded");
     switch (m.route) {
         .not_found => return fail(r, .not_found, "not found"),
         .register => return register(r, body),

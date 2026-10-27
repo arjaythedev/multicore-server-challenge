@@ -11,8 +11,8 @@
 //! then fills the Postgres connections (db.pump), sends what they queued and publishes to the other side. While reads
 //! wait for their batch clock, the wait ends when their drain is due.
 //!
-//! With `shed`, a worker's controller (shed.zig) ticks every iteration and hears of every error response as it is sent;
-//! worker 0's wakes for its tick at least every interval, as it reads the box's CPU.
+//! With `shed`, a worker's controller (shed.zig) ticks every iteration; worker 0's wakes for its tick at least every
+//! interval, as it reads the box's CPU.
 //!
 //! With `ackdelay`, each sent response turns TCP_QUICKACK off on its socket through the ring (a socket uring_cmd,
 //! kernel 6.7+), so the next request's ACK waits for its response instead of leaving alone. The kernel picks quick or
@@ -315,20 +315,12 @@ fn sendBytes(c: *Client, bytes: []const u8) void {
 }
 
 fn onSend(comptime F: Flags, c: *Client, cqe: *const linux.io_uring_cqe) void {
-    // The first send of a response holds its status line, "HTTP/1.1 " and the code.
-    if (F.shed and !c.req.ticket.counted) {
-        c.req.ticket.counted = true;
-        std.debug.assert(c.sending.len > 9);
-        if (c.sending[9] >= '4') shed.ctl.failed();
-    }
     if (cqe.res < 0) {
         c.closing = true;
     } else {
         c.sending = c.sending[@intCast(cqe.res)..];
         if (c.sending.len > 0) return sendBytes(c, c.sending);
     }
-    // A 400 that follows sends without a new ticket.
-    if (F.shed) c.req.ticket = .{};
     c.req.out.release();
     c.busy = false;
     if (!c.req.keep_alive) c.closing = true;

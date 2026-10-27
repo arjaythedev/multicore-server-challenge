@@ -406,7 +406,8 @@ fn randomBytes(buf: []u8) void {
 var test_owner: u8 = 0;
 
 fn startOnce() !void {
-    if (done_efd == -1) try start(.{}, 2);
+    // With `shed`, so the hashers record their tids for the priority test.
+    if (done_efd == -1) try start(.{ .shed = true }, 2);
 }
 
 /// Runs the event loop's side until `want` jobs are answered.

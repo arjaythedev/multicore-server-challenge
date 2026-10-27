@@ -9,7 +9,7 @@ Front: direct
 | Database driver | none: our own PostgreSQL v3 wire client (SCRAM-SHA-256, prepared statements, binary rows) |
 | Database | PostgreSQL 18 |
 | Other dependencies | none. JSON, JWT, HMAC-SHA-256 (with SHA-NI), bcrypt (with hand-written assembly kernels) and the gzip encoder are written here |
-| Score on our rig | **150,000 users**, held in two official-style searches with both flags at their defaults. The same build with `ackdelay=off` held 140,000 |
+| Score on our rig | **150,000 users**, held in two official-style searches with `shed=on,ackdelay=on`. The same build with `ackdelay=off` held 140,000 |
 
 ```sh
 sudo bash install.sh     # Zig 0.17.0 to /opt/zig-0.17.0, checked against its SHA-256
@@ -30,7 +30,7 @@ a feature that is `off` costs nothing.
 
 | Flag | Default | What it does |
 |---|---|---|
-| `shed` | on | Under CPU saturation the server refuses whole route classes, heaviest first, with an immediate `503` and `Retry-After: 1`, within an error budget of 0.9% of requests. **Sign-ups and logins are refused first.** That is a policy choice about which users wait. We think it is within the rules, but it needs a maintainer ruling (rule 8), which is why it is behind a flag. See [Overload shedding](#overload-shedding). |
+| `shed` | off | While the box's CPU is saturated (a second below 3% idle) the server refuses sign-ups and logins with an immediate `503` and `Retry-After: 1`, and nothing else. A policy choice about which users wait, so it is off unless turned on. See [Overload shedding](#overload-shedding). |
 | `gzip` | on | A response that needs three or more TCP segments is gzipped for a client that accepts gzip, and sent that way only if it then needs fewer segments. Fewer segments mean fewer client ACKs on the CPU that takes the network interrupts. Off sends every body as identity. See [Two-segment gzip](#two-segment-gzip). |
 | `ackdelay` | on | After each response the server turns `TCP_QUICKACK` off on that client's socket, through io_uring, so the next request's ACK rides on its response instead of leaving as a packet of its own. It only sets an option on the server's own sockets. Worth the last 10,000 users. See [ACK delay](#ack-delay). |
 
@@ -118,8 +118,8 @@ We read the other entries. As far as we can tell, these are new to this challeng
   keys and viewer flags.
 - **bcrypt at SCHED_IDLE with a watchdog.** Password hashing only uses CPU nothing else wants. A normal-priority
   watchdog thread takes over any job starved for too long.
-- **CPU-idle shedding with an error budget.** Load is refused by route class based on the box's measured idle CPU,
-  within a hard cap on the share of errors.
+- **CPU-idle shedding, off by default.** With `shed=on`, sign-ups and logins are refused while the box's measured
+  idle CPU stays under 3%.
 - **Startup result-type validation.** Every statement is described against the live database, and the server
   refuses to start unless each one returns exactly the column types its decoder was written for.
 
@@ -453,42 +453,28 @@ scalar lanes. The largest single effect we found in anyone's bcrypt was a compil
 
 ## Overload shedding
 
-Flag `shed`, default on. **It refuses route classes heaviest first, which means sign-ups and logins are the first
-requests refused when the box saturates.** A user trying to log in during overload gets a 503 while a user already
-logged in still reads articles. We think this is a fair reading of the rules, since every refusal is immediate, honest
-and counted as an error, but it is a judgement call. It needs a maintainer ruling (rule 8), and it can be turned off
-with `CONDUIT_FLAGS=shed=off`.
+Flag `shed`, **default off**; `CONDUIT_FLAGS=shed=on` turns it on. While the box's CPU is saturated it refuses
+sign-ups and logins with an immediate `503`, and nothing else. A user trying to log in during overload waits while a
+user already logged in still reads articles. That is a policy choice about which users wait, and it did not raise the
+score (below), so the server ships without it.
 
 **Signal.** Every 100 ms the first worker reads the box's idle and iowait time from `/proc/stat`. It adds back the CPU
 time of every idle-priority bcrypt hasher, read from `/proc/<tid>/schedstat` (the hashers record their thread ids in a
 page all processes share), because CPU spent at idle priority is CPU nobody else wanted. The watchdog hasher is not
-counted. Worker 0 publishes a **depth** in the shared page:
-
-- the first class is refused as soon as idle falls below 3%;
-- one more class each further second below 3%;
-- one fewer each second above 8%;
-- in between, the depth holds.
-
-**Order.** Register, login, feed, article create, list, favorite, comments, comment create, article, profile, tags,
-then the routes we never measured (unfavorite, article update and delete, comment delete, follow, unfollow, user update,
-user get). An unknown route is never refused. Register (17.6 ms) and login (15.5 ms) costs are what an earlier,
-self-learning version of the shed measured on this server. The rest follow #7's measured Postgres time per request of
-each endpoint at 100,000 users.
+counted. A full second of readings below 3% idle turns refusals on, a full second above 8% turns them off, and in
+between they hold. Worker 0 publishes the state in the shared page, and every worker reads it.
 
 **Refusal.** An immediate `503` with `Retry-After: 1`, right after routing and before any other work, with the
-connection kept open.
+connection kept open. Each worker logs a line every 10 s in which it was overloaded or refused anything.
 
-**Budget.** Each request earns 0.9% of an error and each refusal spends a whole one, so refusals never exceed 0.9%
-of requests. Refusing the class at place *r* (from 0) needs credit for *r* + 1 errors, so the heavier classes get the
-budget first. A request the budget doesn't pay for is served. Every other response with status ≥ 400 spends one too,
-into a debt of at most ten seconds' earnings. Unspent credit is capped at what the last second earned, so a calm hour
-doesn't bank a burst of refusals. Each worker logs a line every 10 s in which it refused anything.
+**No error budget.** Sign-ups and logins were 0.07% of requests in a hold at 183,000 users, so refusing every one of
+them stays far below the 1% error limit on its own.
 
-**Result.** In a hold at 183,000 users it refused 233 of 246 sign-ups and 9,951 of 10,218 logins and nothing else,
-for 0.067% errors (47,227 req/s, p95 246 ms, p99 401 ms). Refusals stopped on ramp-down. **It did not raise the
-score**: the step-up climb reached 174,000 with it, the same as with the previous shed. Logins are cheap for the box
-precisely because their hashing already runs at idle priority, so refusing them mostly frees idle-class CPU. Below
-the knee its overhead measured +3.7 µs per request [−20, +31], which is noise.
+**Result.** The previous design (v3 below) refused 233 of 246 sign-ups and 9,951 of 10,218 logins and nothing else
+in that hold, for 0.067% errors (47,227 req/s, p95 246 ms, p99 401 ms). **It did not raise the score**: the step-up
+climb reached 174,000 with it, the same as with the shed before it. Logins are cheap for the box precisely because
+their hashing already runs at idle priority, so refusing them mostly frees idle-class CPU. At the knee the box is
+88–93% busy, so the 3% trigger doesn't fire there at all.
 
 Earlier designs, all dropped:
 
@@ -498,6 +484,7 @@ Earlier designs, all dropped:
 | v2 | Kernel receive timestamps (`SO_TIMESTAMPNS` via multishot `recvmsg`), a CPU-wait signal, a p99 back-off, budget 0.5% | Refused 0.49% of requests while serving every request in 5 ms |
 | v2 + level cap | Capped the level at what the budget pays | Superseded by the CPU-idle design |
 | Queue-age cap | Refused reads older than a bound, 0.5% against 0.8% budget | Bought nothing; about 12M reads were served over age anyway |
+| v3 | The same CPU-idle signal, refusing route classes in a fixed cost order (register, login, feed, article create, list, …; costs from an earlier shed and #7), heaviest first, within a fixed error budget | No score gain: at the loads that decide the score it only ever reached sign-ups and logins. Replaced by the simpler shed above. Overhead below the knee +3.7 µs per request [−20, +31], noise |
 
 ---
 
@@ -746,7 +733,7 @@ Measured on the development box with 3 CPUs at 42,000 users, against the gather 
 The SQL starts from [#7](https://github.com/arjaythedev/multicore-server-challenge/pull/7) (rank 1): list page and
 capped count in one statement, tag names by primary key, write CTEs that fold the slug lookup into the mutation, and
 the `unnest ... WITH ORDINALITY CROSS JOIN LATERAL` read batching. #7 is also the yardstick for our SQL numbers and the
-source of the per-endpoint costs in the shed order. The ideas are reimplemented here; no code is copied.
+source of the per-endpoint costs in an earlier shed design. The ideas are reimplemented here; no code is copied.
 
 - **#47**: the two-phase gather behind the batch clock, and the idea of one statement for many reads that MEGA grew
   from. #47 also runs 9 Postgres connections.
