@@ -25,8 +25,19 @@ struct conn {
     int fd;
     uint8_t state;        /* 0 unused, 1 connecting, 2 open, 3 dead */
     uint8_t waiting;      /* a request is out */
-    double next_send, sent_at;
+    int next;             /* the next connection in the same timing-wheel slot */
+    double sent_at;
 };
+
+/* Sends are scheduled on a wheel of 10 ms slots, so a pass touches only the connections that are due. */
+#define TICK 0.01
+static int *wheel, nslots;
+
+static void schedule(struct conn *c, int i, double t0, double at) {
+    int s = (int)((at - t0) / TICK) % nslots;
+    c[i].next = wheel[s];
+    wheel[s] = i;
+}
 
 static double now(void) {
     struct timespec t;
@@ -51,7 +62,11 @@ int main(int argc, char **argv) {
     int opened = 0, open = 0;
     double t0 = now(), report = t0 + 5;
     srand(1);
-    struct epoll_event evs[1024];
+    static struct epoll_event evs[16384];
+    nslots = (int)(interval / TICK) + 2;
+    wheel = malloc((size_t)nslots * sizeof *wheel);
+    for (int i = 0; i < nslots; i++) wheel[i] = -1;
+    long tick = 0;  /* wheel slots handled so far */
     char buf[65536];
 
     while (now() - t0 < seconds) {
@@ -61,6 +76,13 @@ int main(int argc, char **argv) {
         while (opened < n && opened < due) {
             int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
             if (fd < 0) { errors++; opened++; continue; }
+            /* An explicit, unique source address and port: past ~100k connections the kernel's own port search
+             * in connect() gets slow enough to stall this single-threaded client. */
+            struct sockaddr_in src = {.sin_family = AF_INET, .sin_port = htons((uint16_t)(10000 + opened % 50000))};
+            src.sin_addr.s_addr = htonl(0x7f000101u + (uint32_t)(opened / 50000));  /* 127.0.1.1, .2, ... */
+            int one = 1;
+            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+            if (bind(fd, (struct sockaddr *)&src, sizeof src) < 0) { errors++; close(fd); opened++; continue; }
             struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port)};
             a.sin_addr.s_addr = htonl(0x7f000001u + (uint32_t)(opened % ips));
             int r = connect(fd, (struct sockaddr *)&a, sizeof a);
@@ -68,12 +90,12 @@ int main(int argc, char **argv) {
             struct conn *x = &c[opened];
             x->fd = fd;
             x->state = 1;
-            x->next_send = t + (double)rand() / RAND_MAX * interval;  /* spread the first requests */
+            schedule(c, opened, t0, t + (double)rand() / RAND_MAX * interval);  /* spread the first requests */
             struct epoll_event e = {.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP, .data.u32 = (uint32_t)opened};
             epoll_ctl(ep, EPOLL_CTL_ADD, fd, &e);
             opened++;
         }
-        int k = epoll_wait(ep, evs, 1024, 5);
+        int k = epoll_wait(ep, evs, 16384, 5);
         for (int i = 0; i < k; i++) {
             struct conn *x = &c[evs[i].data.u32];
             if (x->state == 3) continue;
@@ -101,16 +123,25 @@ int main(int argc, char **argv) {
                 }
             }
         }
-        /* each open connection sends one request every INTERVAL */
+        /* each open connection sends one request every INTERVAL: run the wheel up to now */
         t = now();
-        for (int i = 0; i < opened; i++) {
-            struct conn *x = &c[i];
-            if (x->state != 2 || t < x->next_send) continue;
-            if (x->waiting) { late++; x->waiting = 0; }  /* no answer within a whole interval */
-            if (write(x->fd, REQ, sizeof REQ - 1) != (ssize_t)(sizeof REQ - 1)) { errors++; continue; }
-            x->waiting = 1;
-            x->sent_at = t;
-            x->next_send = t + interval;
+        long target = (long)((t - t0) / TICK);
+        for (; tick <= target; tick++) {
+            int s = (int)(tick % nslots), i = wheel[s];
+            wheel[s] = -1;
+            while (i >= 0) {
+                struct conn *x = &c[i];
+                int next = x->next;
+                if (x->state == 1) {
+                    schedule(c, i, t0, t + 1);  /* not connected yet: try again in a second */
+                } else if (x->state == 2) {
+                    if (x->waiting) { late++; x->waiting = 0; }  /* no answer within a whole interval */
+                    if (write(x->fd, REQ, sizeof REQ - 1) != (ssize_t)(sizeof REQ - 1)) errors++;
+                    else x->waiting = 1, x->sent_at = t;
+                    schedule(c, i, t0, t + interval);
+                }
+                i = next;
+            }
         }
         if (t >= report) {
             printf("t=%3.0fs opened %d open %d refused %ld closed_by_server %ld errors %ld answers %ld unanswered %ld "

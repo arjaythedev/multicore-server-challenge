@@ -18,7 +18,7 @@
 #include "worker.h"
 
 #define BCRYPT_COST 10
-#define BCRYPT_BATCH 8               /* jobs per run: two 4-lane kernels when that many are waiting */
+#define BCRYPT_BATCH 8               /* most jobs one run can take (cfg.bcrypt_batch picks, default 4) */
 #define BCRYPT_FULL 4                /* a batch this big starts without waiting */
 #define BCRYPT_STALE_US 8000000
 

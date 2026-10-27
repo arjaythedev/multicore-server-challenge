@@ -126,6 +126,14 @@ __attribute__((noinline)) static void kernel8(const struct bcrypt_lane *in, int 
 }
 
 void bcrypt_raw_lanes(const struct bcrypt_lane *in, int n, int cost, uint8_t (*out)[BCRYPT_RAW]) {
+    if (n == 3) {
+        /* Three hashes in the 4-lane kernel with the first repeated (about 60 ms) beat 2 + 1 lanes (about 92). */
+        struct bcrypt_lane pad[4] = {in[0], in[1], in[2], in[0]};
+        uint8_t tmp[4][BCRYPT_RAW];
+        kernel4(pad, cost, tmp);
+        memcpy(out, tmp, 3 * sizeof tmp[0]);
+        return;
+    }
     while (n > 0) {
         int k = n >= 8 && BCRYPT_LANES_MAX >= 8 ? 8 : n >= 4 ? 4 : n >= 2 ? 2 : 1;
         if (k == 8) kernel8(in, cost, out);
