@@ -4,8 +4,10 @@ import conduit.pg.PgConn
 import conduit.pg.PgError
 import conduit.pg.PgStatement
 import conduit.platform.Monitor
+import conduit.platform.isOutOfMemory
 import conduit.platform.locked
 import conduit.platform.startThread
+import kotlin.concurrent.Volatile
 import kotlin.jvm.JvmField
 
 /**
@@ -23,6 +25,8 @@ internal abstract class Pool(
     private val config: DbConfig,
     private val statements: List<PgStatement>,
     size: Int,
+    /** Queued requests at which [saturated] is set (0: never). */
+    private val queueMax: Int,
 ) {
     @JvmField val lock = Monitor()
     private val idle = arrayOfNulls<Worker>(size)
@@ -34,6 +38,22 @@ internal abstract class Pool(
 
     /** Set by [DbRuntime.stop] (tests): workers exit instead of reconnecting. */
     @JvmField var stopping = false
+
+    /**
+     * The queue is full: set at [queueMax] requests, cleared again at 75% of it. The app reads it per request and
+     * answers 503 at once instead of queueing more; the pool itself never refuses work (read and write always suspend).
+     */
+    @JvmField @Volatile var saturated = false
+
+    /** Under [lock], after the queue length changed to [n]. */
+    fun noteQueuedLocked(n: Int) {
+        if (queueMax <= 0) return
+        if (saturated) {
+            if (n <= queueMax / 4 * 3) saturated = false
+        } else if (n >= queueMax) {
+            saturated = true
+        }
+    }
 
     /** Opens and prepares one connection (any thread; blocks). */
     fun connect(): PgConn {
@@ -144,8 +164,16 @@ internal abstract class Worker(@JvmField val pool: Pool, @JvmField val index: In
             try {
                 serve(c)
             } catch (e: Throwable) {
-                c.close()
-                lost(e)
+                // Whatever this thread caught (an OutOfMemoryError too), nothing here may throw: the only way out of
+                // run() is reconnect(), which returns only once [Pool.stopping].
+                try {
+                    c.close()
+                } catch (_: Throwable) {
+                }
+                try {
+                    lost(e)
+                } catch (_: Throwable) {
+                }
                 c = reconnect() ?: return
             }
         }
@@ -177,45 +205,91 @@ internal abstract class Worker(@JvmField val pool: Pool, @JvmField val index: In
         if (c.next() == 'E'.code) println("db: ${pool.name}-$index: server error while idle: ${c.error()}")
     }
 
+    /**
+     * The connection died (or [serve] failed): takes it out of the pool and fails what it was running. Idempotent: a
+     * worker that is already without a connection does nothing. Allocation-free for an OutOfMemoryError.
+     */
     private fun lost(e: Throwable) {
-        val err = PgError(CONNECTION_FAILURE, "database connection lost: ${e.message ?: e}")
         var had = false
-        val drained = pool.lock.locked {
+        var drained: List<Any>? = null
+        pool.lock.locked {
+            if (conn == null) return
             conn = null
             pool.removeIdleLocked(this)
             pool.healthy--
             had = abandonLocked()
-            if (pool.healthy == 0) pool.drainLocked() else null
+            if (pool.healthy == 0) {
+                try {
+                    drained = pool.drainLocked()
+                } catch (_: Throwable) { // out of memory: the requests stay queued, for whichever connection returns
+                }
+            }
         }
-        println("db: ${pool.name}-$index: ${err.message}; reconnecting")
+        val err = errorFor("database connection lost", e, LOST_OOM)
+        try {
+            println(if (isOutOfMemory(e)) LOST_OOM_LINE else "db: ${pool.name}-$index: ${err.message}; reconnecting")
+        } catch (_: Throwable) {
+        }
         if (had) resumeAbandoned(err)
-        if (drained != null) pool.failDrained(drained, err)
+        val d = drained
+        if (d != null) pool.failDrained(d, err)
     }
 
-    /** Retries every second until connected and prepared again, then takes queued work. Null once stopping. */
+    /** SQLSTATE 08006 for [e]: the preallocated [fallback] for an OutOfMemoryError (or if this one cannot be built). */
+    private fun errorFor(what: String, e: Throwable, fallback: PgError): PgError {
+        if (isOutOfMemory(e)) return fallback
+        return try {
+            PgError(CONNECTION_FAILURE, "$what: ${e.message ?: e}")
+        } catch (_: Throwable) {
+            fallback
+        }
+    }
+
+    /**
+     * Retries every second until connected and prepared again, then takes queued work. Null once stopping. Nothing
+     * thrown in here (an OutOfMemoryError included) ends the loop: it is the worker thread's only way back.
+     */
     private fun reconnect(): PgConn? {
         var attempt = 0
         while (true) {
-            if (attempt > 0) sleepNanos(sleeper, RECONNECT_NANOS)
-            if (pool.lock.locked { pool.stopping }) return null
+            var c: PgConn? = null
             try {
-                val c = pool.connect()
+                if (attempt > 0) sleepNanos(sleeper, RECONNECT_NANOS)
+                if (pool.lock.locked { pool.stopping }) return null
+                val fresh = pool.connect()
+                c = fresh
                 val more = pool.lock.locked {
-                    conn = c
+                    conn = fresh
                     pool.healthy++
                     pool.reconnects++
                     pool.assignLocked(this)
                 }
-                if (more) pool.send(c)
-                println("db: ${pool.name}-$index: reconnected after ${attempt + 1} attempt(s)")
-                return c
+                if (more) pool.send(fresh)
+                try {
+                    println("db: ${pool.name}-$index: reconnected after ${attempt + 1} attempt(s)")
+                } catch (_: Throwable) {
+                }
+                return fresh
             } catch (e: Throwable) {
-                if (attempt % 30 == 0) println("db: ${pool.name}-$index: reconnect failed: ${e.message ?: e}")
+                try {
+                    c?.close()
+                } catch (_: Throwable) {
+                }
+                try {
+                    lost(e) // does nothing unless the failure came after the connection joined the pool
+                } catch (_: Throwable) {
+                }
+                try {
+                    if (attempt % 30 == 0) println("db: ${pool.name}-$index: reconnect failed: ${e.message ?: e}")
+                } catch (_: Throwable) {
+                }
                 attempt++
-                val drained = pool.lock.locked { if (pool.healthy == 0) pool.drainLocked() else null }
-                // nothing can serve queued requests: fail them now rather than let them hang
-                if (drained != null) {
-                    pool.failDrained(drained, PgError(CONNECTION_FAILURE, "database unavailable: ${e.message ?: e}"))
+                val err = errorFor("database unavailable", e, UNAVAILABLE_OOM)
+                try {
+                    val drained = pool.lock.locked { if (pool.healthy == 0) pool.drainLocked() else null }
+                    // nothing can serve queued requests: fail them now rather than let them hang
+                    if (drained != null) pool.failDrained(drained, err)
+                } catch (_: Throwable) {
                 }
             }
         }
@@ -225,5 +299,10 @@ internal abstract class Worker(@JvmField val pool: Pool, @JvmField val index: In
         /** SQLSTATE connection_failure, given to requests whose connection died. */
         const val CONNECTION_FAILURE = "08006"
         private const val RECONNECT_NANOS = 1_000_000_000L
+
+        // Preallocated: building these after an OutOfMemoryError could fail again.
+        private val LOST_OOM = PgError(CONNECTION_FAILURE, "database connection lost: out of memory")
+        private val UNAVAILABLE_OOM = PgError(CONNECTION_FAILURE, "database unavailable: out of memory")
+        private const val LOST_OOM_LINE = "db: connection lost (out of memory); reconnecting"
     }
 }

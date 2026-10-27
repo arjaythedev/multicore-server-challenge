@@ -16,6 +16,12 @@ expect fun nanoTime(): Long
 /** Wall clock, milliseconds since the Unix epoch. */
 expect fun currentTimeMillis(): Long
 
+/**
+ * Whether [e] is an OutOfMemoryError (which common Kotlin has no type for). Error paths ask before they build any
+ * message: with the heap exhausted, every allocation there can throw again.
+ */
+expect fun isOutOfMemory(e: Throwable): Boolean
+
 /** Fills [dst] with cryptographically secure random bytes (bcrypt salts, SCRAM nonces). */
 expect fun secureRandomBytes(dst: ByteArray)
 

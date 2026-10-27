@@ -9,7 +9,8 @@ if [ -x /opt/jdk/bin/java ]; then JAVA=/opt/jdk/bin/java; else JAVA="${JAVA_HOME
 # Measured cheaper per request (DESIGN.md): transparent huge pages for the heap (madvise, process-local), membarrier
 # instead of a fence in every Java<->native thread-state transition, no hsperfdata file. G1 stays: ParallelGC's
 # pauses failed p95 at saturation.
-exec "$JAVA" -Xms1g -Xmx1g -XX:+AlwaysPreTouch \
+# Heap 3g (JAVA_HEAP overrides; 1g filled up in the 120k-user overload), 4m regions: no humongous Postgres buffers.
+exec "$JAVA" -Xms${JAVA_HEAP:-3g} -Xmx${JAVA_HEAP:-3g} -XX:+AlwaysPreTouch -XX:G1HeapRegionSize=4m \
     -XX:+UseTransparentHugePages -XX:+UseSystemMemoryBarrier -XX:-UsePerfData \
     --enable-native-access=ALL-UNNAMED \
     -cp "build/jvm/conduit.jar:build/jvm/lib/*" conduit.MainKt

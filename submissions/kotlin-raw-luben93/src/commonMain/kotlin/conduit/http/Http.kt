@@ -77,6 +77,16 @@ abstract class Exchange {
     /** Sends {"errors":{"body":[message]}} with [status] (discards anything written to [out]). */
     abstract fun sendError(status: Int, message: String)
 
+    /**
+     * True once nobody is left to read the answer: the client closed the connection, or the request is older than the
+     * client's own 10 s timeout (the server-side age is never more than the client's). A queue the handler waits in
+     * may then drop the request without resuming it, after [abandon]. Only engine exchanges are ever abandoned.
+     */
+    open val abandoned: Boolean get() = false
+
+    /** Releases the connection of an [abandoned] exchange dropped unanswered. Idempotent; never blocks or throws. */
+    open fun abandon() {}
+
     /** Application scratch: the authenticated viewer (0 = anonymous) and the presented token. */
     @JvmField var viewer: Long = 0
     @JvmField var token: String? = null

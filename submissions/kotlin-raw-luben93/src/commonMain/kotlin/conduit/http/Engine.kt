@@ -1,5 +1,6 @@
 package conduit.http
 
+import conduit.util.logSafe
 import kotlin.concurrent.atomics.AtomicInt
 import kotlin.coroutines.startCoroutine
 import kotlin.jvm.JvmField
@@ -98,9 +99,9 @@ internal class EngineCore(private val handler: suspend (Exchange) -> Unit) {
     }
 
     private fun fail(cs: ConnState, e: Throwable) {
-        println("http: engine error, closing connection: ${e.stackTraceToString()}")
-        cs.st.store(CLOSED)
+        cs.st.store(CLOSED) // state and socket first: logging allocates, and may fail
         cs.conn.close()
+        logSafe({ "http: engine error, closing connection" }, e)
     }
 
     /**
@@ -182,10 +183,12 @@ internal class EngineCore(private val handler: suspend (Exchange) -> Unit) {
     }
 
     private fun dispatch(cs: ConnState, ex: Ex) {
-        ex.res = pool.get()
         cs.st.store(BUSY) // before the handler can answer on another thread
         handler.startCoroutine(ex, ex)
     }
+
+    /** A response buffer for [Ex] (any thread): taken when the response is rendered, not when the request is parsed. */
+    internal fun takeOut(): Out = pool.get()
 
     /** Answers [status] with Connection: close and drops all input. Returns [end] (everything consumed). */
     private fun reject(cs: ConnState, status: Int, message: String, end: Int): Int {
