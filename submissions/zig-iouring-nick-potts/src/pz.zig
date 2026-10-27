@@ -1,4 +1,4 @@
-//! pz: gzip for small JSON answers (Zig port of research/gzip-fast/pz.c, anchor mode only).
+//! pz: gzip for small JSON answers (Zig port of research/gzip-fast/v2/pz2.c with PZ_HBYTES=8, anchor mode only).
 //!
 //! One dynamic-Huffman block whose header is precomputed (pz_table_anchor.zig, trained offline by mk_table.py),
 //! so there is no per-call tree building. Matches are looked for only at closing quotes (a '"' followed by
@@ -73,8 +73,10 @@ inline fn load32(p: [*]const u8) u32 {
 inline fn load64(p: [*]const u8) u64 {
     return std.mem.readInt(u64, p[0..8], .little);
 }
-inline fn hash(v: u32) u32 {
-    return (v *% 0x9E3779B1) >> (32 - hash_bits);
+/// Hashes the 8 bytes at p. At a closing quote 4 bytes are only `","` plus a key's first letter, so title and
+/// tagList, or slug and status, would share a slot and give short matches of the wrong key.
+inline fn hash(p: [*]const u8) u32 {
+    return @intCast((load64(p) *% 0x9E3779B97F4A7C15) >> (64 - hash_bits));
 }
 const hash_bits = 10;
 
@@ -190,9 +192,9 @@ pub fn encode(in: []const u8, out: []u8, budget: usize) usize {
         }
         // At the anchor, then where each match ends (a value start right after "key":"), chained while they hit.
         var pos = i;
-        while (pos + 4 <= n) {
+        while (pos + 8 <= n) {
             const v = load32(src + pos);
-            const h = hash(v);
+            const h = hash(src + pos);
             const cand: u32 = ht[h];
             ht[h] = @intCast(pos);
             const d: u32 = @as(u32, @intCast(pos)) -% cand;
@@ -214,7 +216,7 @@ pub fn encode(in: []const u8, out: []u8, budget: usize) usize {
                 }
                 b = (bw << 6) + @ctz(bm);
                 if (b >= e) break;
-                if (b + 4 <= n) ht[hash(load32(src + b))] = @intCast(b);
+                if (b + 8 <= n) ht[hash(src + b)] = @intCast(b);
                 b += 1;
             }
             pos = e;
