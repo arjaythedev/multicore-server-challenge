@@ -4,7 +4,8 @@
 #
 #   bash tests/bench/measure.sh USERS [SECONDS] [THINK_SCALE]
 #
-# Env: TEMPLATE (conduit_seed), PORT (3110), ARTICLES (500000 for the full seed, 10000 for dev), plus any server
+# Env: TEMPLATE (conduit_seed), PORT (3110), ARTICLES (500000 for the full seed, 10000 for dev), IPS (4: the users
+# spread over 127.0.0.1..IPS, as the official run spreads them over 4 IPs; one IP has only ~28k ports), plus any server
 # tuning variables (WORKERS, READ_CONNS, ...), which pass through. Run from the repo root of a Linux clone.
 # Compare variants in ABBA order: machine noise drifts, and an A-B-B-A sequence cancels linear drift.
 set -euo pipefail
@@ -29,7 +30,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/$DB JWT_SECRET=dev-secret HOST=127.0.0.1 PORT=$PORT \
+DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/$DB JWT_SECRET=dev-secret HOST=0.0.0.0 PORT=$PORT \
   "$SUB/bin/conduit" > "$OUT/server.log" 2>&1 &
 SPID=$!
 for _ in $(seq 60); do curl -sf -o /dev/null "http://127.0.0.1:$PORT/api/tags" && break; sleep 0.5; done
@@ -47,7 +48,8 @@ ticks() {
 }
 
 (cd "$ROOT/bench" && go build -o "$OUT/loadgen" ./cmd/loadgen)
-"$OUT/loadgen" run -target "http://127.0.0.1:$PORT" -users "$USERS" -ramp ${RAMP}s -measure "${SECONDS_MEASURE}s" \
+TARGETS=$(seq -s, -f "http://127.0.0.%g:$PORT" 1 "${IPS:-4}")
+"$OUT/loadgen" run -target "$TARGETS" -users "$USERS" -ramp ${RAMP}s -measure "${SECONDS_MEASURE}s" \
   -tail 3s -secret dev-secret -articles "$ARTICLES" -think-scale "$THINK" -run-id "m$$" -out "$OUT/lg.json" \
   > "$OUT/lg.txt" 2>&1 &
 LG=$!
