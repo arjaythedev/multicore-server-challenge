@@ -31,6 +31,7 @@ public final class Main {
             Statement.describeAll().forEach(System.out::println);
             return;
         }
+        Logging.install();
         DatabaseUrl database = DatabaseUrl.parse(required("DATABASE_URL"));
         Jwt.init(required("JWT_SECRET"));
         String host = setting("HOST", "127.0.0.1");
@@ -45,6 +46,8 @@ public final class Main {
         // At ~27 logins/s (100,000 users) a 400 ms window fills a six-hash batch about 98% of the time
         int bcryptWindowMillis = Integer.parseInt(setting("BCRYPT_BATCH_WINDOW_MS", "400"));
         int bcryptNice = Integer.parseInt(setting("BCRYPT_NICE", "10"));
+        // Client connections at most: the file descriptor limit, less a reserve (beyond it, accepting waits)
+        int maxConnections = Integer.parseInt(setting("MAX_CONNECTIONS", String.valueOf(HttpServer.defaultMaxConnections())));
 
         // Session settings only (rule 2). Generic plans: every statement here plans as well generically as with its
         // parameters, so planning per execution is skipped. No JIT and no parallel workers for these short queries.
@@ -74,11 +77,12 @@ public final class Main {
         ReadDispatcher.start(readPool.connections(), reads);
         Writes.start(writePool);
 
-        HttpServer.start(httpLoops, host, port);
+        HttpServer.start(httpLoops, host, port, maxConnections);
         System.out.printf("conduit listening on %s:%d (%s, %d http + %d postgres threads, %d read + %d write connections,"
-                        + " batches up to %d, %d bcrypt threads at nice %d, bcrypt in %s, tags sorted by %s)%n",
+                        + " batches up to %d, %d bcrypt threads at nice %d, bcrypt in %s, tags sorted by %s,"
+                        + " up to %d client connections)%n",
                 host, port, Transport.name(), httpThreads, postgresThreads, readConnections, writeConnections, maxBatch,
-                bcryptThreads, bcryptNice, bcrypt, ArticleSql.serverSortsTags ? "the server" : "Postgres");
+                bcryptThreads, bcryptNice, bcrypt, ArticleSql.serverSortsTags ? "the server" : "Postgres", maxConnections);
         Thread.currentThread().join();
     }
 

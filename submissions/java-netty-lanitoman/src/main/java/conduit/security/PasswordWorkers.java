@@ -64,18 +64,36 @@ public final class PasswordWorkers {
                 return;
             }
             for (int i = 0; i < count; i++) jobs[i] = batch[i].job;
-            BCrypt.compute(jobs, count);
+            boolean computed = false;
+            try {
+                BCrypt.compute(jobs, count);
+                computed = true;
+            } catch (Throwable e) {                          // a worker must outlive any failure, or logins stop
+                e.printStackTrace();
+            }
             for (int i = 0; i < count; i++) {
                 Task task = batch[i];
                 batch[i] = null;
                 jobs[i] = null;
+                if (!computed) {
+                    fail(task);
+                    continue;
+                }
                 try {
                     task.then.run();
-                } catch (RuntimeException e) {
+                } catch (Throwable e) {
                     e.printStackTrace();
-                    task.exchange.respondError(500, "internal error");
+                    fail(task);
                 }
             }
+        }
+    }
+
+    private static void fail(Task task) {
+        try {
+            task.exchange.respondError(500, "internal error");
+        } catch (Throwable ignored) {
+            // the response was already sent, or can't be: nothing more to do for this request
         }
     }
 

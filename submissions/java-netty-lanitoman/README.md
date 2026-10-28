@@ -62,6 +62,15 @@ Java's foreign function API; without a C compiler, or if it disagrees with the J
 lanes are used instead. A self-test checks against a known hash at startup. The workers run at nice 10, so
 Postgres and the event loops get the CPU first.
 
+## Overload
+
+- Client connections are capped below the file descriptor limit (the limit less 1% and 1000): at the cap the
+  server stops accepting until some connections close, so it never runs out of descriptors. A failed accept pauses
+  accepting for 100 ms.
+- Nothing opens files while serving: the time-zone data and logging configuration are loaded at startup, and log
+  records go to stderr through a handler that never throws, so an error report can't end an event loop.
+- bcrypt workers survive any failure and answer 500 instead.
+
 ## Rules
 
 - No caching: every response is read from Postgres while the request is served.
@@ -82,5 +91,6 @@ Required: `DATABASE_URL`, `JWT_SECRET`, `HOST`, `PORT` (see [.env.example](.env.
 | `BCRYPT_THREADS` | 2 | bcrypt workers |
 | `BCRYPT_BATCH_WINDOW_MS` | 400 | how long a worker waits to fill a batch |
 | `BCRYPT_NICE` | 10 | worker CPU priority (0: normal) |
+| `MAX_CONNECTIONS` | fd limit − 1% − 1000 | client connections at most |
 
 `java -jar target/conduit.jar --print-sql` prints every prepared statement.
