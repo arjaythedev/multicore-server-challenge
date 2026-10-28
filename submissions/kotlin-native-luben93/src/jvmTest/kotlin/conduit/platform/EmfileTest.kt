@@ -12,13 +12,20 @@ import kotlin.test.assertTrue
 /** Out of descriptors: accept must back off (not spin) and recover once fds are free again. */
 class EmfileTest {
     @Test
-    fun acceptBacksOffAndRecovers() {
+    fun acceptBacksOffAndRecovers() = probe("nio")
+
+    @Test
+    fun acceptBacksOffAndRecoversOnEpoll() = probe("epoll")
+
+    private fun probe(io: String) {
         val port = NioHttpTest.freePort(3171)
         val java = File(System.getProperty("java.home"), "bin/java").path
         val cp = System.getProperty("java.class.path")
         // ulimit -n sets soft and hard, so the JVM cannot raise it back (MaxFDLimit)
-        val p = ProcessBuilder("bash", "-c", "ulimit -n 256 && exec \"$java\" -cp \"$cp\" conduit.platform.EmfileProbe $port")
-            .redirectErrorStream(true).start()
+        val pb = ProcessBuilder("bash", "-c",
+            "ulimit -n 256 && exec \"$java\" --enable-native-access=ALL-UNNAMED -cp \"$cp\" conduit.platform.EmfileProbe $port")
+        pb.environment()["HTTP_IO"] = io
+        val p = pb.redirectErrorStream(true).start()
         assertTrue(p.waitFor(60, TimeUnit.SECONDS), "probe hung")
         val out = p.inputStream.bufferedReader().readText()
         val pauses = out.lines().count { it.contains("pausing accepts") }

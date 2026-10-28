@@ -23,6 +23,7 @@ class DbIntegrationTest {
 
     private class Fixture(val db: String) {
         val tags = ReadKind("tags", UNNEST + "(SELECT t.name FROM tags t WHERE r.i >= 0 ORDER BY t.name) x")
+        val tagsAll = ReadKind("tagsAll", "SELECT t.name FROM tags t ORDER BY t.name", broadcast = true)
         val bySlug = ReadKind("bySlug", UNNEST + "(SELECT a.id, a.slug, a.title FROM articles a WHERE a.slug = r.k) x")
         val page = ReadKind("page", UNNEST + "(SELECT a.id FROM articles a ORDER BY a.id DESC LIMIT r.l OFFSET r.o) x")
         val user = ReadKind(
@@ -50,7 +51,7 @@ class DbIntegrationTest {
         )
 
         val rt = DbRuntime(
-            TestPg.config(db, 3, 2), listOf(tags, bySlug, page, user, divide, settings, slow),
+            TestPg.config(db, 3, 2), listOf(tags, tagsAll, bySlug, page, user, divide, settings, slow),
             listOf(sleep, follow, userInsert, setBio),
         ).also { it.start() }
 
@@ -90,7 +91,7 @@ class DbIntegrationTest {
             Thread {
                 val rnd = Random(t)
                 repeat(total / 4) { k ->
-                    val which = (t + k) % 5
+                    val which = (t + k) % 6
                     val a = f.articles[rnd.nextInt(f.articles.size)]
                     val limit = 1 + rnd.nextInt(20)
                     val offset = rnd.nextInt(300)
@@ -128,6 +129,15 @@ class DbIntegrationTest {
                                 val row = r.row(0)
                                 check(row.int8(1) == u.id && row.str(2) == u.username && row.str(3) == u.bio) {
                                     "user ${u.id}: got ${row.int8(1)} ${row.str(2)}"
+                                }
+                            }
+                            5 -> {
+                                // broadcast: one execution's rows (from column 0) go to every request of the batch
+                                val r = rt.read(f.tagsAll, 0, 0, 0, "")
+                                r.expectOk("tagsAll")
+                                check(r.rowCount == f.expectedTags.size) { "tagsAll: ${r.rowCount} rows" }
+                                for (i in 0 until r.rowCount) {
+                                    check(r.row(i).str(0) == f.expectedTags[i]) { "tagsAll[$i]: ${r.row(i).str(0)}" }
                                 }
                             }
                             else -> {

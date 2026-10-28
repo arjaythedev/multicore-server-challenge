@@ -2,6 +2,7 @@ package conduit.json
 
 import kotlin.jvm.JvmField
 import conduit.pg.Row
+import conduit.platform.loadLongLE
 import conduit.util.ByteBuf
 import conduit.util.intBE
 
@@ -130,6 +131,9 @@ class JsonWriter(@JvmField val out: ByteBuf) {
         var i = off
         while (true) {
             val start = i
+            // 16, then 8 bytes per step while none of them needs an escape (the byte loop then finds the exact one)
+            while (i + 16 <= end && (escapes(loadLongLE(src, i)) or escapes(loadLongLE(src, i + 8))) == 0L) i += 16
+            while (i + 8 <= end && escapes(loadLongLE(src, i)) == 0L) i += 8
             while (i < end && ESC[src[i].toInt() and 0xFF].toInt() == 0) i++
             val run = i - start
             if (run > 0) {
@@ -271,9 +275,10 @@ class JsonWriter(@JvmField val out: ByteBuf) {
      * A binary text[] column as a JSON array of strings, in array order (NULL column or empty array -> `[]`).
      * Binary array format: Int32 ndim (0 = empty), Int32 has-null flag, Int32 element OID, ndim x (Int32 size,
      * Int32 lower bound), then per element Int32 length (-1 = NULL element, written as `null`) + UTF-8 bytes.
-     * Multi-dimensional arrays are flattened.
+     * Multi-dimensional arrays are flattened. [sortBytes]: in ascending unsigned-byte order instead (the app sorts tag
+     * lists itself when the database collation is byte order; NULL elements first).
      */
-    fun textArray(row: Row, col: Int) {
+    fun textArray(row: Row, col: Int, sortBytes: Boolean = false) {
         sep()
         val o = out
         o.put('['.code)
@@ -288,6 +293,7 @@ class JsonWriter(@JvmField val out: ByteBuf) {
                 count *= b.intBE(p)
                 p += 8
             }
+            if (sortBytes && count > 1) return sortedElements(b, p, count)
             for (e in 0 until count) {
                 if (e > 0) o.put(','.code)
                 val n = b.intBE(p)
@@ -301,6 +307,52 @@ class JsonWriter(@JvmField val out: ByteBuf) {
             }
         }
         o.put(']'.code)
+    }
+
+    // (offset, length) of each element for [sortedElements]; grown on demand, kept per writer
+    private var elemOff = IntArray(16)
+    private var elemLen = IntArray(16)
+
+    /** The [count] elements starting at [p] (after the array header), insertion-sorted by bytes, then `]`. */
+    private fun sortedElements(b: ByteArray, start: Int, count: Int) {
+        if (count > elemOff.size) {
+            elemOff = IntArray(count)
+            elemLen = IntArray(count)
+        }
+        val offs = elemOff
+        val lens = elemLen
+        var p = start
+        for (e in 0 until count) {
+            val n = b.intBE(p)
+            p += 4
+            // insertion sort: tag lists are short (1-4 per seed article)
+            var j = e
+            while (j > 0 && compareBytes(b, p, n, offs[j - 1], lens[j - 1]) < 0) {
+                offs[j] = offs[j - 1]
+                lens[j] = lens[j - 1]
+                j--
+            }
+            offs[j] = p
+            lens[j] = n
+            if (n > 0) p += n
+        }
+        val o = out
+        for (e in 0 until count) {
+            if (e > 0) o.put(','.code)
+            if (lens[e] < 0) o.put(NULL) else quoted(b, offs[e], lens[e])
+        }
+        o.put(']'.code)
+    }
+
+    /** Unsigned lexicographic comparison of two byte ranges of [b]; a length of -1 (NULL) sorts first. */
+    private fun compareBytes(b: ByteArray, p1: Int, n1: Int, p2: Int, n2: Int): Int {
+        if (n1 < 0 || n2 < 0) return n1.coerceAtMost(0) - n2.coerceAtMost(0)
+        val n = minOf(n1, n2)
+        for (i in 0 until n) {
+            val d = (b[p1 + i].toInt() and 0xFF) - (b[p2 + i].toInt() and 0xFF)
+            if (d != 0) return d
+        }
+        return n1 - n2
     }
 
     private companion object {
@@ -322,6 +374,21 @@ class JsonWriter(@JvmField val out: ByteBuf) {
             t['\t'.code] = 't'.code.toByte()
             t['"'.code] = '"'.code.toByte()
             t['\\'.code] = '\\'.code.toByte()
+        }
+
+        private const val ONES = 0x0101010101010101L
+        private const val HIGHS = -0x7f7f7f7f7f7f7f80L // 0x8080808080808080
+
+        /**
+         * Nonzero iff any of the 8 bytes packed in [x] needs an escape: < 0x20, '"' or '\' (SWAR: a byte b < n sets the
+         * high bit of (b - n) & ~b; the borrow chain can only flag bytes above an already flagged one, so the
+         * answer is exact). Bytes >= 0x80 (UTF-8) never do.
+         */
+        fun escapes(x: Long): Long {
+            val ctl = (x - 0x20 * ONES) and x.inv()
+            val q = x xor (0x22 * ONES)
+            val bs = x xor (0x5C * ONES)
+            return (ctl or ((q - ONES) and q.inv()) or ((bs - ONES) and bs.inv())) and HIGHS
         }
 
         /** Writes the escape for byte [c] (which needs one) at b[p]; returns the new position. */

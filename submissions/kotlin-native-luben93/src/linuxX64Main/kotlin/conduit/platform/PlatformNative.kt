@@ -98,7 +98,8 @@ actual fun platformInit(): String {
 /**
  * The GC's heap target defaults to 10 MiB, so a server allocating tens of MB/s would collect many times a second
  * (each collection marks the whole live heap: every connection's state). GC_HEAP_MB (default 512) raises the floor
- * of the autotuned target; GC_LOG=1 prints collections per 10 s with the last pause.
+ * of the autotuned target; GC_LOG=1 prints collections per 10 s with the last pause. (The collector itself, the
+ * allocator and the inliner are build-time options: build.gradle.kts, CONDUIT_GC and friends.)
  */
 @OptIn(kotlin.native.runtime.NativeRuntimeApi::class)
 private fun gcInit(): String {
@@ -142,6 +143,8 @@ actual fun currentTimeMillis(): Long = memScoped {
     clock_gettime(CLOCK_REALTIME, ts.ptr)
     ts.tv_sec * 1000L + ts.tv_nsec / 1_000_000
 }
+
+actual fun isOutOfMemory(e: Throwable): Boolean = e is OutOfMemoryError
 
 private val urandom: Int by lazy { open("/dev/urandom", O_RDONLY).also { check(it >= 0) { "open /dev/urandom" } } }
 
@@ -307,6 +310,8 @@ actual class HmacSha256 actual constructor(key: ByteArray) {
 }
 
 actual fun sha256(data: ByteArray): ByteArray = Sha256.digest(data)
+
+actual fun loadLongLE(b: ByteArray, p: Int): Long = b.getLongAt(p) // unaligned native load (x86-64: little-endian)
 
 @ThreadLocal
 private object ThreadScratch {

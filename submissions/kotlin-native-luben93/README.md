@@ -22,5 +22,30 @@ bash build.sh
 DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=... HOST=0.0.0.0 PORT=80 bash start.sh
 ```
 
-Optional process settings (defaults sized from the CPU count): `HTTP_THREADS`, `DB_READ_CONNS`, `DB_WRITE_CONNS`,
-`BCRYPT_THREADS`, `BCRYPT_BATCH_MS`, `DB_OPTIONS`.
+Optional process settings (defaults sized from the CPU count): `HTTP_THREADS`, `DB_READ_CONNS`, `DB_WRITE_CONNS`
+(8 + 4 on the box), `BCRYPT_THREADS`, `BCRYPT_BATCH_MS`, `DB_OPTIONS`, `APP_SORT_TAGS`, `DB_STATS_S`, `OVERLOAD_GUARD`
+(`READ_QUEUE_MAX`, `WRITE_QUEUE_MAX`, `BCRYPT_QUEUE_MAX`), `READ_SHARE`, `READ_GATHER_MS`, `READ_MAX_BATCH`,
+`READ_VIEWER_FLAGS`, `READ_FEED_MAX_BATCH` (default 32: feeds share nothing, so they leave in small batches and no
+long feed execution holds a read connection; 0 = `READ_MAX_BATCH`): see the JVM build's README for what they do, they
+are the same code.
+Native-only: `GC_HEAP_MB` (floor of the GC heap target, default 512), `GC_LOG=1` (collections per 10 s).
+Build-time (read by `build.gradle.kts` from the environment, defaults are what the submission has always built):
+`CONDUIT_GC` (`pmcs` | `cms` | `stwms`), `CONDUIT_ALLOCATOR` (`custom` | `std`), `CONDUIT_INLINE` (default 40),
+`CONDUIT_LLVM_INLINE`, `CONDUIT_BINARY` (`key=value,...` for any other `-Xbinary` option, e.g. `gcMarkSingleThreaded=true`),
+`CONDUIT_GENERIC_CPU=1` (build.sh: generic x86-64 instead of this CPU).
+
+## Lab results (2026-10-28)
+
+Box simulation on an i7-13700H: server + Postgres 18 on 8 of its CPUs (Postgres in a container with the box's
+pg-conf values for 8 cores / 16 GB), the challenge's own load generator on the others, full seed; the scorer's search
+with its start and cap scaled x1.2 (this machine's speed relative to the box), so 144,000 here ~ 120,000 on the box.
+
+| at 120,000 users | app us/req | Postgres us/req | p95 / p99 ms | RSS |
+|---|--:|--:|---|--:|
+| this version | 42 | 117 | 56 / 83 | 360 MB |
+| the JVM build (kotlin-raw-luben93, same code) | 42 | 128 | 67 / 103 | 3.2 GB |
+| the previous Native submission | 59 | 174 | 192 / 1,601 | 1 GB |
+
+The scorer's search held its 144,000-user cap (5-minute hold: 37,672 req/s, p95 112 ms, p99 188 ms, 0.06% errors).
+Same as the JVM build: batch-shared reads, 8 read + 4 write connections, the overload guard (requests whose client is
+gone are dropped, queue caps answer 503), and the feed batch cap.

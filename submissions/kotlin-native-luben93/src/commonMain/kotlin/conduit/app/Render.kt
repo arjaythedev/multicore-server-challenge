@@ -54,7 +54,7 @@ internal fun JsonWriter.article(r: Row, c: Int, withBody: Boolean) {
     name(N_DESCRIPTION); text(r, c + 2)
     var p = c + 3
     if (withBody) { name(N_BODY); text(r, p); p++ }
-    name(N_TAG_LIST); textArray(r, p + 2)
+    name(N_TAG_LIST); textArray(r, p + 2, TagOrder.appSorts)
     name(N_CREATED_AT); timestamp(r.micros(p))
     name(N_UPDATED_AT); timestamp(r.micros(p + 1))
     name(N_FAVORITED); bool(r.bool(p + 4))

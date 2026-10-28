@@ -34,7 +34,8 @@ enum class Method { GET, POST, PUT, DELETE, OTHER }
 /**
  * One request/response. Built by the engine when a complete request has been parsed, handed to the application's
  * suspend handler, and answered exactly once with [send], [sendEmpty] or [sendError]. If the handler returns
- * without answering, or throws, the engine answers 500.
+ * without answering, or throws, the engine answers 500. The answer may come from any thread the handler runs on,
+ * but only from the handler's own (sequential) coroutine, never from a thread racing it.
  *
  * Response bodies are JSON written into [out] via [json]; the engine adds the status line and headers
  * (Content-Type: application/json, Content-Length) and writes headers + body with one write where possible.
@@ -45,8 +46,17 @@ abstract class Exchange {
     abstract val path: String
     /** Raw query string after '?', still percent-encoded; null if none. */
     abstract val query: String?
-    /** Raw Authorization header value; null if absent. */
+    /** Raw Authorization header value; null if absent. Engine exchanges decode it from [authBuf] on each call. */
     abstract val authorization: String?
+
+    /**
+     * The Authorization header value as raw bytes, authBuf[authOff, authOff + authLen), set by the engine (null when
+     * absent, or for exchanges that only offer [authorization]). Zero-copy: it may point into the connection's input
+     * buffer, so it is valid only until the handler first suspends (the JWT check runs before that).
+     */
+    @JvmField var authBuf: ByteArray? = null
+    @JvmField var authOff: Int = 0
+    @JvmField var authLen: Int = 0
     /** Request body bytes (empty array if none). */
     abstract val body: ByteArray
 
@@ -66,6 +76,16 @@ abstract class Exchange {
 
     /** Sends {"errors":{"body":[message]}} with [status] (discards anything written to [out]). */
     abstract fun sendError(status: Int, message: String)
+
+    /**
+     * True once nobody is left to read the answer: the client closed the connection, or the request is older than the
+     * client's own 10 s timeout (the server-side age is never more than the client's). A queue the handler waits in
+     * may then drop the request without resuming it, after [abandon]. Only engine exchanges are ever abandoned.
+     */
+    open val abandoned: Boolean get() = false
+
+    /** Releases the connection of an [abandoned] exchange dropped unanswered. Idempotent; never blocks or throws. */
+    open fun abandon() {}
 
     /** Application scratch: the authenticated viewer (0 = anonymous) and the presented token. */
     @JvmField var viewer: Long = 0

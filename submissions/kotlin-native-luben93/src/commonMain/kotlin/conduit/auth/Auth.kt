@@ -1,5 +1,6 @@
 package conduit.auth
 
+import kotlin.concurrent.Volatile
 import kotlin.coroutines.Continuation
 import kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED
 import kotlin.coroutines.intrinsics.suspendCoroutineUninterceptedOrReturn
@@ -7,6 +8,9 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.jvm.JvmField
 import conduit.crypto.Bcrypt
+import conduit.crypto.BcryptKernel
+import conduit.http.Exchange
+import conduit.http.RequestKey
 import conduit.json.JsonReader
 import conduit.json.JsonValue
 import conduit.platform.HmacSha256
@@ -16,6 +20,8 @@ import conduit.platform.nanoTime
 import conduit.platform.secureRandomBytes
 import conduit.platform.startThread
 import conduit.platform.threadScratch
+import conduit.util.Timing
+import conduit.util.logSafe
 
 /** JWT HS256 with the claims the spec requires: {"sub":"<id>","iat":<now>,"exp":<now+30d>}. No caching (rule 7). */
 object Jwt {
@@ -24,7 +30,7 @@ object Jwt {
     private val HEADER_BYTES = HEADER.encodeToByteArray()
     private const val TTL = 30L * 24 * 3600
 
-    /** Longest token accepted; the token's bytes and its decoded payload share [Scratch.tmp]. */
+    /** Longest token accepted (its decoded payload goes to [Scratch.tmp]). */
     private const val MAX_TOKEN = 2048
 
     /** 32 bytes of HMAC-SHA256 are 43 base64url characters (no padding). */
@@ -68,29 +74,35 @@ object Jwt {
      * Uses this thread's [Scratch.tmp] and [Scratch.mac].
      */
     fun verify(token: String, nowSec: Long): Long {
-        val n = token.length
-        if (n < 3 + SIG_CHARS || n > MAX_TOKEN) return 0
-        val s = threadScratch()
-        val t = s.tmp
+        if (token.length > MAX_TOKEN) return 0
+        val b = token.encodeToByteArray() // non-ASCII chars become bytes >= 0x80, which are rejected
+        return verify(b, 0, b.size, nowSec)
+    }
+
+    /** [verify] of the token in b[off, off + len), in place (the per-request path: no String, no copy). */
+    fun verify(b: ByteArray, off: Int, len: Int, nowSec: Long): Long {
+        if (len < 3 + SIG_CHARS || len > MAX_TOKEN) return 0
+        val end = off + len
         var d1 = -1
         var d2 = -1
-        for (i in 0 until n) {
-            val c = token[i].code
+        for (i in off until end) {
+            val c = b[i].toInt()
             if (c == '.'.code) {
                 if (d1 < 0) d1 = i else if (d2 < 0) d2 = i else return 0
-            } else if (c >= 128 || DECODE[c] < 0) {
+            } else if (c < 0 || DECODE[c] < 0) {
                 return 0
             }
-            t[i] = c.toByte()
         }
-        if (d1 < 1 || d2 < d1 + 2 || n - d2 - 1 != SIG_CHARS) return 0
+        if (d1 < off + 1 || d2 < d1 + 2 || end - d2 - 1 != SIG_CHARS) return 0
+        val s = threadScratch()
         val mac = s.mac
-        hmac(s).mac(t, 0, d2, mac, 0)
-        if (!signatureMatches(t, d2 + 1, mac)) return 0
-        if (!(d1 == HEADER.length && sameBytes(t, 0, HEADER_BYTES)) && !headerIsHs256(t, d1)) return 0
-        val plen = decode(t, d1 + 1, d2, t, MAX_TOKEN)
+        hmac(s).mac(b, off, d2 - off, mac, 0)
+        if (!signatureMatches(b, d2 + 1, mac)) return 0
+        if (!(d1 - off == HEADER.length && sameBytes(b, off, HEADER_BYTES)) && !headerIsHs256(b, off, d1)) return 0
+        val t = s.tmp
+        val plen = decode(b, d1 + 1, d2, t, 0)
         if (plen < 0) return 0
-        return claims(t, MAX_TOKEN, MAX_TOKEN + plen, nowSec)
+        return claims(t, 0, plen, nowSec)
     }
 
     /** Decodes 43 chars at t[p] (all valid base64url) and compares them with [mac] without an early exit. */
@@ -118,9 +130,9 @@ object Jwt {
     }
 
     /** Any other header encoding (key order, whitespace, extra fields): parsed, alg must be "HS256". */
-    private fun headerIsHs256(t: ByteArray, end: Int): Boolean {
-        val h = ByteArray(end * 3 / 4 + 3)
-        val len = decode(t, 0, end, h, 0)
+    private fun headerIsHs256(t: ByteArray, off: Int, end: Int): Boolean {
+        val h = ByteArray((end - off) * 3 / 4 + 3)
+        val len = decode(t, off, end, h, 0)
         if (len < 0) return false
         val v = JsonReader.parse(h, 0, len) as? JsonValue.Obj ?: return false
         return (v["alg"] as? JsonValue.Str)?.value == "HS256"
@@ -350,8 +362,9 @@ object Jwt {
 
 /**
  * bcrypt cost 10 (rule 7), run on a small pool of low-priority threads so logins never take CPU from requests.
- * Several queued jobs are computed together with interleaved lanes (bcrypt's S-box lookups are latency-bound,
- * so 2-4 independent hashes in one loop run in about the time of one).
+ * Several queued jobs are computed together with interleaved lanes (bcrypt's S-box lookups are latency-bound, so
+ * independent hashes in one loop overlap): up to 8 per batch with the C kernel, 4 with the Kotlin one
+ * ([BcryptKernel]).
  */
 object Passwords {
     /** Cost of every new hash (rule 7). */
@@ -372,25 +385,64 @@ object Passwords {
         @JvmField val out = ByteArray(24)
         @JvmField var onHash: Continuation<String>? = null
         @JvmField var onVerify: Continuation<Boolean>? = null
+        /** The HTTP request this job is for (null: none, or the guard is off); dropped unhashed once abandoned. */
+        @JvmField var owner: Exchange? = null
+        /** When it was created ([nanoTime]), for the statistics. */
+        @JvmField val born = nanoTime()
     }
 
     private val lock = Monitor()
     private val queue = ArrayList<Job>()
+
+    // statistics of the current DB_STATS_S interval: jobs, batches, queue wait per job (guarded by lock)
+    private var iJobs = 0L
+    private var iBatches = 0L
+    private val wait = Timing()
     /** A worker is waiting for its batch to fill; the others take only full batches meanwhile. */
     private var gathering = false
     private var windowNanos = 0L
     private var started = false
+    private var skipAbandoned = false
+    private var queueMax = 0
 
-    /** Starts [threads] bcrypt workers. [batchWindowMs]: how long a worker waits to collect lanes before starting. */
-    fun start(threads: Int, batchWindowMs: Long) {
+    /**
+     * The queue is full: set at [start]'s queueMax jobs, cleared again at 75% of it. The app reads it per login and
+     * register and answers 503 at once instead of queueing more.
+     */
+    @Volatile
+    var saturated = false
+        private set
+
+    /** The DB_STATS_S interval just ended: jobs/batches, queue wait per job (mean/max ms, window included), queued. */
+    fun intervalStats(): String {
+        lock.lock()
+        try {
+            val s = "bcrypt $iJobs/$iBatches wait ${wait.take()}, queued ${queue.size}"
+            iJobs = 0
+            iBatches = 0
+            return s
+        } finally {
+            lock.unlock()
+        }
+    }
+
+    /**
+     * Starts [threads] bcrypt workers. [batchWindowMs]: how long a worker waits to collect lanes before starting.
+     * [queueMax]: queued jobs that make [saturated] (0: never). [skipAbandoned]: drop queued jobs whose HTTP client is
+     * gone ([Exchange.abandoned]) instead of hashing them (about 12.6 ms of CPU each); their handlers never resume.
+     */
+    fun start(threads: Int, batchWindowMs: Long, queueMax: Int = 0, skipAbandoned: Boolean = false) {
         lock.lock()
         try {
             if (started) return // (tests may call it more than once)
             started = true
             windowNanos = batchWindowMs * 1_000_000
+            this.queueMax = queueMax
+            this.skipAbandoned = skipAbandoned
         } finally {
             lock.unlock()
         }
+        println("bcrypt: ${BcryptKernel.init()}")
         for (i in 0 until maxOf(1, threads)) startThread("bcrypt-$i", nice = 10) { worker(warm = i == 0) }
     }
 
@@ -404,6 +456,7 @@ object Passwords {
         )
         return suspendCoroutineUninterceptedOrReturn { c ->
             job.onHash = c
+            if (skipAbandoned) job.owner = c.context[RequestKey]
             enqueue(job)
             COROUTINE_SUSPENDED
         }
@@ -420,6 +473,7 @@ object Passwords {
         }
         return suspendCoroutineUninterceptedOrReturn { c ->
             job.onVerify = c
+            if (skipAbandoned) job.owner = c.context[RequestKey]
             enqueue(job)
             COROUTINE_SUSPENDED
         }
@@ -432,35 +486,66 @@ object Passwords {
         lock.lock()
         try {
             queue.add(job)
+            noteQueued()
             lock.signalAll() // wakes the gatherer (batch may be full now) and idle workers
         } finally {
             lock.unlock()
         }
     }
 
+    /** Under [lock], after the queue length changed: sets or clears [saturated] (hysteresis, like the db pools). */
+    private fun noteQueued() {
+        if (queueMax <= 0) return
+        val n = queue.size
+        if (saturated) {
+            if (n <= queueMax / 4 * 3) saturated = false
+        } else if (n >= queueMax) {
+            saturated = true
+        }
+    }
+
+    /** Under [lock]: removes the jobs whose client is gone, unresumed: each one saves a lane of bcrypt. */
+    private fun dropAbandoned() {
+        var k = 0
+        for (i in queue.indices) {
+            val j = queue[i]
+            val o = j.owner
+            if (o != null && o.abandoned) o.abandon() else queue[k++] = j
+        }
+        if (k == queue.size) return
+        while (queue.size > k) queue.removeAt(queue.size - 1)
+        noteQueued()
+    }
+
     private fun worker(warm: Boolean) {
-        if (warm) warmUp()
-        val batch = arrayOfNulls<Job>(Bcrypt.MAX_LANES)
-        while (true) {
-            val n = take(batch)
+        if (warm && !BcryptKernel.native) {
             try {
-                run(batch, n)
+                warmUp()
             } catch (t: Throwable) {
-                println("bcrypt worker: $t")
+                logSafe({ "bcrypt warm-up" }, t) // the worker must still start
+            }
+        }
+        val batch = arrayOfNulls<Job>(BcryptKernel.MAX_LANES)
+        while (true) {
+            try {
+                run(batch, take(batch))
+            } catch (t: Throwable) {
+                logSafe({ "bcrypt worker" }, t)
             }
             batch.fill(null)
         }
     }
 
     /**
-     * Blocks until a batch is ready: up to [Bcrypt.MAX_LANES] jobs of the oldest job's cost, taken once the batch is
-     * full or the oldest job is due. One worker gathers at a time; the others take only full batches meanwhile.
+     * Blocks until a batch is ready: up to [BcryptKernel.maxLanes] jobs of the oldest job's cost, taken once the batch
+     * is full or the oldest job is due. One worker gathers at a time; the others take only full batches meanwhile.
      */
     private fun take(batch: Array<Job?>): Int {
-        val max = Bcrypt.MAX_LANES
+        val max = BcryptKernel.maxLanes
         lock.lock()
         try {
             while (true) {
+                if (skipAbandoned) dropAbandoned() // so that the batch size below counts live jobs only
                 if (queue.isEmpty() || (gathering && queue.size < max)) {
                     lock.await()
                     continue
@@ -476,7 +561,8 @@ object Passwords {
                     } finally {
                         gathering = false
                     }
-                    if (queue.isEmpty()) continue // a full batch was taken by another worker meanwhile
+                    if (skipAbandoned) dropAbandoned() // clients can leave while the batch fills
+                    if (queue.isEmpty()) continue // a full batch was taken by another worker meanwhile (or all left)
                 }
                 val cost = queue[0].cost
                 var n = 0
@@ -490,6 +576,11 @@ object Passwords {
                         i++
                     }
                 }
+                noteQueued()
+                val now = nanoTime()
+                for (k in 0 until n) wait.add(now - batch[k]!!.born)
+                iJobs += n
+                iBatches++
                 lock.signalAll() // leftovers need a new gatherer
                 return n
             }
@@ -507,7 +598,7 @@ object Passwords {
                 val keys = Array(n) { batch[it]!!.key }
                 val salts = Array(n) { batch[it]!!.salt }
                 val outs = Array(n) { batch[it]!!.out }
-                Bcrypt.hashLanes(n, keys, salts, first.cost, outs)
+                BcryptKernel.hashLanes(n, keys, salts, first.cost, outs)
             } catch (t: Throwable) {
                 failure = t
             }
@@ -526,7 +617,7 @@ object Passwords {
                     v.resume(j.cost >= 0 && Bcrypt.matches(j.out, j.expected!!))
                 }
             } catch (t: Throwable) {
-                println("bcrypt: resumed handler threw: $t") // must not kill the worker or skip other lanes
+                logSafe({ "bcrypt: resumed handler threw" }, t) // must not kill the worker or skip other lanes
             }
         }
     }

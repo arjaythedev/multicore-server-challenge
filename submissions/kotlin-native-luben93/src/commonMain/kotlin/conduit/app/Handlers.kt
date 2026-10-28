@@ -17,20 +17,32 @@ internal object Auth {
     const val VALID = 1
     const val INVALID = -1
 
-    /** The token of a "Token <jwt>" header (the only scheme accepted, exact case), or null. */
-    fun tokenOf(header: String): String? = if (header.startsWith("Token ")) header.substring(6) else null
-
-    /** Verifies the Authorization header (every request that uses it: no caching) and sets ex.viewer / ex.token. */
-    fun check(ex: Exchange): Int {
+    /**
+     * Verifies a "Token <jwt>" Authorization header (the only scheme accepted, exact case; every request that uses
+     * it: no caching) and sets ex.viewer, and ex.token when [keepToken] (the user endpoints echo it). Reads the
+     * header's raw bytes in place: call it before the handler's first suspension (see [Exchange.authBuf]).
+     */
+    fun check(ex: Exchange, keepToken: Boolean): Int {
         ex.viewer = 0
         ex.token = null
-        val h = ex.authorization
-        if (h.isNullOrEmpty()) return NONE
-        val token = tokenOf(h) ?: return INVALID
-        val id = Jwt.verify(token, nowSec())
+        var b = ex.authBuf
+        var off = ex.authOff
+        var len = ex.authLen
+        if (b == null) { // an exchange that only has the String (tests)
+            val h = ex.authorization ?: return NONE
+            b = h.encodeToByteArray()
+            off = 0
+            len = b.size
+        }
+        if (len == 0) return NONE
+        if (len < 6 || b[off] != 'T'.code.toByte() || b[off + 1] != 'o'.code.toByte() ||
+            b[off + 2] != 'k'.code.toByte() || b[off + 3] != 'e'.code.toByte() || b[off + 4] != 'n'.code.toByte() ||
+            b[off + 5] != ' '.code.toByte()
+        ) return INVALID
+        val id = Jwt.verify(b, off + 6, len - 6, nowSec())
         if (id <= 0) return INVALID
         ex.viewer = id
-        ex.token = token
+        if (keepToken) ex.token = b.decodeToString(off + 6, off + len)
         return VALID
     }
 }
@@ -61,7 +73,7 @@ internal object Handlers {
         val j = ex.json
         j.beginObject()
         j.name(N_TAGS)
-        if (res.rowCount > 0) j.textArray(res.row(0), 1) else { j.beginArray(); j.endArray() }
+        if (res.rowCount > 0) j.textArray(res.row(0), 0) else { j.beginArray(); j.endArray() }
         j.endObject()
         ex.send(200)
     }

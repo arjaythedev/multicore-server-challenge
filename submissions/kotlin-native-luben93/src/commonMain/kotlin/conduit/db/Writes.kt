@@ -9,7 +9,10 @@ import conduit.pg.beginBind
 import conduit.pg.endBindExecute
 import conduit.pg.sync
 import conduit.platform.locked
+import conduit.platform.nanoTime
 import conduit.util.ByteBuf
+import conduit.util.Timing
+import conduit.util.logSafe
 import kotlin.coroutines.Continuation
 import kotlin.coroutines.resume
 import kotlin.jvm.JvmField
@@ -25,6 +28,9 @@ internal class WriteJob(
 
     /** Its outcome is final: the ReadyForQuery ending its own transaction was seen. */
     @JvmField var settled = false
+
+    /** When it was queued ([nanoTime]), for the statistics. */
+    @JvmField val born = nanoTime()
 }
 
 /** FIFO ring of write jobs (power-of-two capacity). Guarded by the pool lock. */
@@ -62,6 +68,9 @@ internal class WriteTrip(cap: Int) {
     @JvmField val jobs = arrayOfNulls<WriteJob>(cap)
     @JvmField var nIso = 0
     @JvmField var n = 0
+
+    /** When it was handed to its connection ([nanoTime]), for the statistics. */
+    @JvmField var sentAt = 0L
 }
 
 internal class WriteWorker(pool: WritePool, index: Int) : Worker(pool, index) {
@@ -173,6 +182,9 @@ internal class WriteWorker(pool: WritePool, index: Int) : Worker(pool, index) {
     }
 
     override fun completeLocked() {
+        val rt = nanoTime() - flight!!.sentAt
+        wpool.rtt.add(rt)
+        wpool.busyNanos += rt
         done = flight
         flight = null
         inFlight = false
@@ -206,8 +218,8 @@ internal class WriteWorker(pool: WritePool, index: Int) : Worker(pool, index) {
             t.jobs[j] = null
             try {
                 job.cont.resume(job.res)
-            } catch (e: Throwable) {
-                println("db: write continuation threw: $e")
+            } catch (e: Throwable) { // one handler failing must not skip the rest of the trip
+                logSafe({ "db: write continuation threw" }, e)
             }
         }
     }
@@ -225,7 +237,7 @@ internal class WritePool(
     statements: List<PgStatement>,
     private val stmts: List<WriteStmt>,
     private val stmtNames: List<ByteArray>,
-) : Pool("write", config, statements, config.writeConns) {
+) : Pool("write", config, statements, config.writeConns, config.writeQueueMax) {
     @JvmField val workers = Array(config.writeConns) { WriteWorker(this, it) }
     private val isoQ = JobQueue()
     private val groupQ = JobQueue()
@@ -234,6 +246,13 @@ internal class WritePool(
     @JvmField var trips = 0L
     @JvmField var jobs = 0L
     @JvmField var groups = 0L
+
+    // statistics of the current DB_STATS_S interval, as for reads (see ReadPool.intervalStats)
+    @JvmField var iJobs = 0L
+    @JvmField var iTrips = 0L
+    @JvmField var busyNanos = 0L
+    @JvmField val wait = Timing()
+    @JvmField val rtt = Timing()
     @JvmField var groupedJobs = 0L
     @JvmField var largestGroup = 0
     @JvmField var reruns = 0L
@@ -245,6 +264,7 @@ internal class WritePool(
         val job = WriteJob(stmt, params, isolated, cont)
         val c = lock.locked {
             if (isolated) isoQ.add(job) else groupQ.add(job)
+            noteQueuedLocked(isoQ.size + groupQ.size)
             dispatchLocked()
         }
         if (c != null) send(c)
@@ -262,6 +282,12 @@ internal class WritePool(
         t.nIso = k
         while (groupQ.size > 0 && k - t.nIso < MAX_GROUP) t.jobs[k++] = groupQ.poll()
         t.n = k
+        noteQueuedLocked(isoQ.size + groupQ.size)
+        val now = nanoTime()
+        for (j in 0 until k) wait.add(now - t.jobs[j]!!.born)
+        t.sentAt = now
+        iJobs += k
+        iTrips++
         w.flight = t
         w.inFlight = true
         encode(t, w.conn!!.out)
@@ -307,6 +333,7 @@ internal class WritePool(
         val all = ArrayList<Any>(isoQ.size + groupQ.size)
         while (isoQ.size > 0) all.add(isoQ.poll())
         while (groupQ.size > 0) all.add(groupQ.poll())
+        noteQueuedLocked(0)
         return all
     }
 
@@ -317,9 +344,20 @@ internal class WritePool(
             try {
                 job.cont.resume(job.res)
             } catch (e: Throwable) {
-                println("db: write continuation threw: $e")
+                logSafe({ "db: write continuation threw" }, e)
             }
         }
+    }
+
+    /** The statistics interval just ended: utilization, jobs/round trips, queue wait per job, round trip (mean/max ms). */
+    fun intervalStats(intervalNanos: Long): String = lock.locked {
+        val util = if (intervalNanos > 0) 100 * busyNanos / (intervalNanos * workers.size) else 0
+        val s = "writes util $util%, queued ${isoQ.size + groupQ.size} | $iJobs/$iTrips wait ${wait.take()} " +
+            "rt ${rtt.take()}"
+        busyNanos = 0
+        iJobs = 0
+        iTrips = 0
+        s
     }
 
     fun stats(): String = lock.locked {
