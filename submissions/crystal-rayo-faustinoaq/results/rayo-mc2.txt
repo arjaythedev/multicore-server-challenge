@@ -1,0 +1,15 @@
+POST /api/profiles/:username/follow            1802     30.0    141.7    201.3    218.5    258.0      325    0.00
+POST /api/articles                             1375     22.9    274.4    362.0    388.1    440.8      497    0.00
+DELETE /api/articles/:slug/favorite             679     11.3    264.2    352.0    376.3    417.3      497    0.00
+DELETE /api/profiles/:username/follow           622     10.4    144.9    202.8    219.6    256.6      282    0.00
+POST /api/users/login                           552      9.2    833.0   1095.7   1182.7   1414.1     1558    0.00
+PUT /api/user                                   524      8.7    144.0    196.7    212.6    274.4      304    0.00
+DELETE /api/articles/:slug/comments/:id         245      4.1    138.2    202.5    221.4    252.7      288    0.00
+PUT /api/articles/:slug                         127      2.1    266.8    350.0    382.0    441.6      452    0.00
+POST /api/users                                  14      0.2    713.2    977.9    977.9   1131.5     1132    0.00
+ALL                                          315293   5254.9    179.5    313.9    346.9    410.1     1558    0.00
+mix: 1.86 calls/page, 1.752 req/s per user, 5.0% writes, 169446 page views
+box 0 (DESKTOP-MTLQ7TM): 3000 users, CPU avg 38% max 40%, loadgen proc 20%, RSS peak 141 MB, 3000 TCP connects, behind=false
+verdict: PASS   [p95 < 500 ms, p99 < 1000 ms, errors < 1%]
+lg_limited: no
+box cpu-seconds: postgres 187 app 71 total 258; peak mem 3071 MB; oom 0

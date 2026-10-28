@@ -90,3 +90,56 @@ Built and tested inside `crdev`, with Crystal 1.22.1:
 - `python3 test/concurrency.py http://HOST:PORT`: 24 concurrent logins, disconnects with pending password jobs, ordered HTTP pipelining, 800 concurrent article requests, gzip/identity equivalence and explicit gzip `q=0`.
 
 The HTTP tests use isolated scratch databases. Drop those databases after testing.
+
+## Rayo integration notes
+
+These observations apply to the pinned Rayo commit; the framework repository was
+left unchanged.
+
+- `src/rayo/json.cr:603`: the custom-value branch calls `v.to_json(self)` on a
+  struct writer copy. `j.object { j.field("custom", custom_value) }` raises
+  `Rayo::JSON::Error: missing field value`, even when the custom method calls
+  `j.value("value")`. The original writer retains its pending-field flag. The
+  application avoids custom JSON values and returns NamedTuples containing
+  ordinary byte slices and slices of tag names instead.
+- `src/rayo/app.cr:93`: `App#run` forks workers with `LibC.fork`. With Crystal
+  1.22.1's default runtime and GC enabled, the concurrent article test reproducibly
+  crashes in serialization (`Buf#grow`/`realloc` or `Array#clear`). The same test
+  passes with one worker, with collection disabled for diagnosis, and with three
+  workers built with `-Dwithout_mt`. The shipped build uses the last option and
+  keeps GC enabled. The underlying fork/GC interaction still needs investigation;
+  the observed crash alone does not establish its internal cause.
+- `src/rayo/pg/worker_pool.cr:78`: a PG callback completes the HTTP response when
+  `ctx.db_pending` reaches zero, even if that callback calls `ctx.defer` for
+  external work. The bcrypt adapter temporarily increments this counter and
+  releases it after the password result or a chained query. A public way to
+  compose database and external asynchronous deferrals would remove this use of
+  framework bookkeeping.
+
+Candidates to upstream: the threaded multi-lane bcrypt adapter in
+`src/passwords.cr`/`src/bcrypt_lanes.cr`, gzip middleware in `src/compression.cr`,
+and a public external-work deferral guard. Application validation and Conduit SQL
+remain specific to this submission.
+
+## Local mc2 comparison
+
+Same-session full-seed runs on October 28, 2026, using the supplied `mcbox.sh`
+helper and the shared `flock` lock: **3,000 connections/users**, think scale 0.1,
+30 s ramp, 60 s measured, 5 s tail. mc2 exposed three CPUs (3–5), shared with
+Postgres. Defaults were used: Rayo had three workers/12 database connections;
+the epoll entry had two workers/eight database connections.
+
+| Entry | req/s | p95 (ms) | p99 (ms) | Errors | PG CPU-s | App CPU-s | Verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| Crystal epoll | 5,614.6 | 741.9 | 1,119.2 | 0% | 72 | 56 | FAIL: latency |
+| Crystal Rayo | 5,254.9 | 346.9 | 410.1 | 0% | 187 | 71 | PASS |
+
+CPU seconds cover the whole traffic run. Total mc2 cgroup peak memory was
+3,070 MiB for epoll and 3,071 MiB for Rayo, including Postgres and file cache;
+neither run had an OOM. The load generator was not limited in either run.
+Rayo sustained less throughput with lower tail latency in this comparison, and
+used substantially more database CPU. The hand-rolled entry shares article
+lookups/enrichment across waiting requests; this application uses Rayo's query
+pipelining with per-request statements. These short runs are not official scores.
+
+See [results/](results/) for commands, source snapshot and captured summaries.
