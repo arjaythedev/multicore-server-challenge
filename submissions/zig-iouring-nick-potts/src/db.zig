@@ -2,17 +2,18 @@
 //!
 //! Every queued request waits in its statement's FIFO; the process's read connections share them. With one worker
 //! that is the worker itself; with more, every read goes to the drain process (drain.zig), which runs the read path
-//! below for all of them and hands each result back to the worker that asked. Reads drain on two lanes: feeds on
-//! the feed lane, every other read on the shared lane (`laneOf`). Each lane goes out on a batch clock (PR #47's
+//! below for all of them and hands each result back to the worker that asked. Reads drain on three lanes: feeds,
+//! comments, and every other read on the shared lane (`laneOf`). Each lane goes out on a batch clock (PR #47's
 //! two-phase gather, measured on branch sql-proto as proto-gather5ms): once the oldest queued read of the lane has
-//! waited `window_ns` and the lane's gap (`gap_ns`, `feed_gap_ns`) has passed since the lane's previous drain
-//! started, a free read connection takes every queued read of the lane into one Sync group, so each drain holds
-//! everything that arrived on its lane since the last one. A full queue (`max_members`, both lanes together) starts
-//! every lane's drain at once. Same-statement requests become one batched execution (one array per parameter, rows
-//! tagged with the request ordinal), tag reads share one execution, and the whole drain rides one Sync. A drain
-//! with two or more reads that MEGA serves sends those as one execution of it instead, last in the Sync group
-//! (mega.zig); a feed drain is one MEGA execution of feeds alone. Comments stay out of MEGA: one runs
-//! COMMENTS_LIST_SET, two or more its batched form, which reads each distinct thread once (threads.zig).
+//! waited `window_ns` and the lane's gap (`gap_ns`, `feed_gap_ns`, `comments_gap_ns`) has passed since the lane's
+//! previous drain started, a free read connection takes every queued read of the lane into one Sync group, so each
+//! drain holds everything that arrived on its lane since the last one. A full queue (`max_members`, all lanes
+//! together) starts every lane's drain at once. Same-statement requests become one batched execution (one array per
+//! parameter, rows tagged with the request ordinal), tag reads share one execution, and the whole drain rides one
+//! Sync. A drain with two or more reads that MEGA serves sends those as one execution of it instead, last in the
+//! Sync group (mega.zig); a feed drain is one MEGA execution of feeds alone. Comments stay out of MEGA: a comments
+//! drain runs COMMENTS_LIST_SET for one read, its batched form for more, which reads each distinct thread once
+//! (threads.zig).
 //!
 //! Writes go to their own connection (sql-writes' writes-1conn). An idle write connection takes the first queued
 //! write; when nothing else is queued it waits `write_wait_ns` first. Then it takes up to `max_writes` into one Sync
@@ -51,10 +52,13 @@ const gap_ns = 20 * std.time.ns_per_ms;
 /// shares the most within one execution, so feeds drain on a lane of their own with a longer gap: four times the feeds
 /// per execution, and no other read's drain waits for the feed work.
 const feed_gap_ns = 80 * std.time.ns_per_ms;
+/// The comments lane's gap. Comments are one batched execution that reads each distinct thread once, so a longer gap
+/// puts twice the comment reads in each, and the shared drain no longer waits on them.
+const comments_gap_ns = 40 * std.time.ns_per_ms;
 
 /// The read lanes, in the order a free connection serves them.
-const LaneId = enum(u8) { feed, shared };
-const lane_order = [_]LaneId{ .feed, .shared };
+const LaneId = enum(u8) { feed, comments, shared };
+const lane_order = [_]LaneId{ .feed, .comments, .shared };
 
 const Lane = struct {
     gap_ns: u64,
@@ -62,7 +66,7 @@ const Lane = struct {
     last_ns: u64 = 0,
 };
 
-var lanes = [_]Lane{ .{ .gap_ns = feed_gap_ns }, .{ .gap_ns = gap_ns } };
+var lanes = [_]Lane{ .{ .gap_ns = feed_gap_ns }, .{ .gap_ns = comments_gap_ns }, .{ .gap_ns = gap_ns } };
 
 fn lane(l: LaneId) *Lane {
     return &lanes[@intFromEnum(l)];
@@ -70,7 +74,11 @@ fn lane(l: LaneId) *Lane {
 
 /// The lane a statement's reads drain on. Every statement is on one lane.
 fn laneOf(s: Stmt) LaneId {
-    return if (s == .list_feed) .feed else .shared;
+    return switch (s) {
+        .list_feed => .feed,
+        .comments_list_set => .comments,
+        else => .shared,
+    };
 }
 /// How long an idle write connection holding a lone write waits for others before it sends it (sql-writes'
 /// delay_us). Writes that arrive meanwhile join it; the wait does not end early.
@@ -327,7 +335,7 @@ fn readsDue(l: LaneId, is_full: bool) ?u64 {
     return @max(reads[@intFromEnum(s)].head.?.queued_ns + window_ns, lane(l).last_ns + lane(l).gap_ns);
 }
 
-/// Whether the queues are full: `max_members` reads over both lanes, which starts every lane's drain at once.
+/// Whether the queues are full: `max_members` reads over all lanes, which starts every lane's drain at once.
 fn full() bool {
     return queuedReads() >= max_members;
 }
@@ -779,9 +787,17 @@ test "a read group flushes after every unit but the last, so each unit's results
     var o: pg.Out = .{};
     defer o.deinit();
     encodeGroup(&o, g);
-    // Batched comments, the login's lookup, then MEGA: Bind and Execute each.
-    try testing.expectEqual(3, g.nunits);
-    try testing.expectEqualStrings("BEHBEHBES", messageTypes(&buf, &o));
+    // The login's lookup, then MEGA: Bind and Execute each.
+    try testing.expectEqual(2, g.nunits);
+    try testing.expectEqualStrings("BEHBES", messageTypes(&buf, &o));
+
+    const cg = buildRead(.comments).?;
+    defer freeGroup(cg);
+    var co: pg.Out = .{};
+    defer co.deinit();
+    encodeGroup(&co, cg);
+    try testing.expectEqual(1, cg.nunits);
+    try testing.expectEqualStrings("BES", messageTypes(&buf, &co));
 
     var favs = [_]Query{ .{ .stmt = .favorite }, .{ .stmt = .follow }, .{ .stmt = .favorite } };
     for (&favs) |*r| {

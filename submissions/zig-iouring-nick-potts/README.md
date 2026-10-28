@@ -87,7 +87,7 @@ At 8 CPUs:
      ┌───────────────────────────────────────┐
      │ drain process (one io_uring)          │
      │ one read queue for the whole box      │
-     │ two lanes: feeds 80 ms, rest 20 ms    │──► 8 read connections ──► Postgres
+     │ lanes: feeds 80, comments 40, rest 20 │──► 8 read connections ──► Postgres
      │ MEGA + batched statements, one Sync   │    (one per CPU)           (8 read backends)
      │ answers rows in DataRow layout        │
      └───────────────────────────────────────┘
@@ -238,11 +238,15 @@ execution of feeds alone (`feed_gap_ns` in db.zig). A feed is the dearest read, 
 counts of the articles it returns, and it is the read that shares most within one execution, since viewers follow
 the same popular authors. The previous version carried feeds in the shared drain, about 58 per drain at 135,000
 users on an aged database, where they were 54–63% of MEGA's time, so every article, profile and tag read waited for
-the feed work. Now the shared drain's round trip no longer includes feeds, and every second tick about twice the
+the feed work. Now the shared drain's round trip no longer includes feeds, and every fourth tick about four times the
 feeds share one execution, as #82 runs its slow family on a lane of its own. The shared drain loses the article
 rows it had in common with the feeds, a small cost. Sharing starts with the requests already queued for one fresh
-execution and nothing survives it, as everywhere else here. A full queue (4,096 reads over both lanes) starts both
-drains at once.
+execution and nothing survives it, as everywhere else here. A full queue (4,096 reads over all lanes) starts every
+lane's drain at once.
+
+**The comments lane.** Comment reads drain on a third lane with a 40 ms gap (`comments_gap_ns`), as one batched
+execution that reads each distinct thread once. Twice the comment reads share each execution, and the shared drain
+no longer waits for them, so it carries MEGA alone.
 
 **Coalescing inside a drain.** Requests for the same statement run as one execution with one array per parameter:
 `unnest(...) WITH ORDINALITY` joined `CROSS JOIN LATERAL` to the per-row query (from #7), with rows routed back by
