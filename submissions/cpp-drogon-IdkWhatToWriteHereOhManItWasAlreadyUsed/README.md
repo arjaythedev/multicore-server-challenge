@@ -2,15 +2,15 @@
 
 Front: direct
 
-| | |
-|---|---|
-| Language | C++20, Drogon (coroutines, `HttpController`); GCC |
-| HTTP | Drogon's HTTP/1.1 server, keep-alive, `Content-Length` |
+| |                                                                             |
+|---|-----------------------------------------------------------------------------|
+| Language | C++20, Drogon commit  360980c9cd7205b94a0728a10eaa8cff19656977 ; GCC                                                  |
+| HTTP | Drogon's HTTP/1.1 server, keep-alive, `Content-Length`                      |
 | Postgres | Drogon `orm::DbClient` over `libpq` — extended query protocol, text results |
-| JSON | `Json::Value` / `Json::FastWriter`; `req->getJsonObject()` for bodies |
-| JWT, bcrypt | HS256 via `jwt-cpp`; own bcrypt (`$2b$`, cost 10, `Lanes<N>`) |
-| Allocator | `jemalloc`, `-O3 -march=native` |
-| Dependencies | Drogon, `jwt-cpp`, `robin_hood` (header-only), libpq |
+| JSON | `Json::Value` / `Json::FastWriter`; `req->getJsonObject()` for bodies       |
+| JWT, bcrypt | HS256 via `jwt-cpp`; own bcrypt (`$2b$`, cost 10, `Lanes<N>`)               |
+| Allocator | `jemalloc`, `-O3 -march=native`                                             |
+| Dependencies | Drogon, `jwt-cpp`, `robin_hood` (header-only), libpq                        |
 
 ## Design
 

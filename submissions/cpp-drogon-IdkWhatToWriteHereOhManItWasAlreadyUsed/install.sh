@@ -38,7 +38,8 @@ sudo cp -r jwt-cpp/include/jwt-cpp /usr/local/include/
 
 git clone https://github.com/drogonframework/drogon.git && \
     cd drogon &&                     \
-    git submodule update --init &&    \
+    git checkout 360980c9cd7205b94a0728a10eaa8cff19656977 && \
+    git submodule update --init --recursive && \
     mkdir build && cd build &&         \
     cmake .. -DCMAKE_BUILD_TYPE=Release \
              -DBUILD_EXAMPLES=OFF        \
