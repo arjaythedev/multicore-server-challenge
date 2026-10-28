@@ -126,13 +126,13 @@ module Sql
 
   # Phase B returns each article once. The application fans rows out to requests;
   # PostgreSQL never serializes the same article once per overlapping page.
-  # Tag names come from one join over the batch's article_tags rows (tags hashed once),
-  # not a tags lookup per tag per article.
+  # Tag names come from one join over the batch's article_tags rows; `t.id + 0` keeps the
+  # 200 tags in one hash instead of an index probe per tag row.
   SHARED_ENRICH = <<-SQL
     WITH d AS MATERIALIZED (SELECT DISTINCT unnest($1::int8[]) AS id),
     tg AS MATERIALIZED (
       SELECT at.article_id, array_agg(t.name ORDER BY t.name) AS names
-      FROM article_tags at JOIN tags t ON t.id = at.tag_id
+      FROM article_tags at JOIN tags t ON t.id + 0 = at.tag_id
       WHERE at.article_id = ANY($1::int8[]) GROUP BY at.article_id
     )
     SELECT x.id, x.slug, x.title, x.description, x.body, x.created_at, x.updated_at,
