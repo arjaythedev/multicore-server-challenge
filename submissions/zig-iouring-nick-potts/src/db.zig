@@ -48,9 +48,9 @@ const window_ns = 5 * std.time.ns_per_ms;
 /// one started, so below saturation the reads of the whole gap share one drain instead of ~5 ms worth each.
 const gap_ns = 20 * std.time.ns_per_ms;
 /// The feed lane's gap. A feed is the dearest read (its page walk and the favorite counts of what it returns) and
-/// shares the most within one execution, so feeds drain on a lane of their own with a longer gap: twice the feeds
+/// shares the most within one execution, so feeds drain on a lane of their own with a longer gap: four times the feeds
 /// per execution, and no other read's drain waits for the feed work.
-const feed_gap_ns = 40 * std.time.ns_per_ms;
+const feed_gap_ns = 80 * std.time.ns_per_ms;
 
 /// The read lanes, in the order a free connection serves them.
 const LaneId = enum(u8) { feed, shared };
@@ -835,36 +835,36 @@ test "feeds drain on their own lane and gap while the shared lane keeps the drai
     readAt(&article, .article_by_slug, 111 * ms);
 
     now_ns = 115 * ms;
-    try testing.expectEqual(120 * ms, readsDue(.shared, false).?);
-    try testing.expectEqual(140 * ms, readsDue(.feed, false).?);
+    try testing.expectEqual(100 * ms + gap_ns, readsDue(.shared, false).?);
+    try testing.expectEqual(100 * ms + feed_gap_ns, readsDue(.feed, false).?);
     try testing.expectEqual(null, dueRead(false));
-    try testing.expectEqual(120 * ms, pump().?);
+    try testing.expectEqual(100 * ms + gap_ns, pump().?);
 
-    now_ns = 120 * ms;
+    now_ns = 100 * ms + gap_ns;
     const g = dueRead(false).?;
     defer freeGroup(g);
     try testing.expectEqual(1, g.nunits);
     try testing.expectEqual(.mega, g.units[0].kind);
     try testing.expectEqual(2, g.nmembers);
     try testing.expectEqual(&feed, feed_q.head.?);
-    try testing.expectEqual(120 * ms, lane(.shared).last_ns);
+    try testing.expectEqual(100 * ms + gap_ns, lane(.shared).last_ns);
     try testing.expectEqual(100 * ms, lane(.feed).last_ns);
 
     // Only the feed is left: the next drain is the feed lane's, when its gap ends, and nothing drains before then.
     try testing.expect(readsQueued());
     try testing.expectEqual(null, dueRead(false));
-    try testing.expectEqual(140 * ms, pump().?);
-    now_ns = 139 * ms;
+    try testing.expectEqual(100 * ms + feed_gap_ns, pump().?);
+    now_ns = 100 * ms + feed_gap_ns - 1;
     try testing.expectEqual(null, dueRead(false));
 
-    now_ns = 140 * ms;
+    now_ns = 100 * ms + feed_gap_ns;
     const g2 = dueRead(false).?;
     defer freeGroup(g2);
     try testing.expectEqual(1, g2.nmembers);
     try testing.expectEqual(&feed, g2.members[0]);
     try testing.expectEqual(.single, g2.units[0].kind);
     try testing.expectEqual(.list_feed, g2.units[0].stmt);
-    try testing.expectEqual(140 * ms, lane(.feed).last_ns);
+    try testing.expectEqual(100 * ms + feed_gap_ns, lane(.feed).last_ns);
     try testing.expect(!readsQueued());
     try testing.expectEqual(null, pump());
 }
