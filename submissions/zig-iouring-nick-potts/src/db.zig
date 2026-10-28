@@ -60,7 +60,7 @@ const gap_ns = 80 * std.time.ns_per_ms;
 const feed_gap_ns = 80 * std.time.ns_per_ms;
 /// The comments lane's gap. Comments are one batched execution that reads each distinct thread once, so a longer gap
 /// puts twice the comment reads in each, and the shared drain no longer waits on them.
-const comments_gap_ns = 40 * std.time.ns_per_ms;
+const comments_gap_ns = 100 * std.time.ns_per_ms;
 /// Drains of the shared lane in flight at most. Near saturation an execution outlasts the gap, so a free connection
 /// starts another drain as the gap ends and up to eight stretched executions of one lane contend for the cores. At
 /// the cap the lane waits for one to finish, and its next drain takes everything that arrived meanwhile, so under
@@ -70,7 +70,7 @@ const comments_gap_ns = 40 * std.time.ns_per_ms;
 const max_inflight = 3;
 /// The feed lane's cap. Feed executions run 150-230 ms against the 80 ms gap at 135,000 users, two to three in
 /// flight, and the lane needs about 1.9 backends at the knee at its largest batches, so one or two would starve it.
-const feed_max_inflight = 3;
+const feed_max_inflight = 2;
 /// The comments lane's cap. A comments execution runs about as long as its gap (34 ms against 40 at 135,000 users),
 /// so one or two are in flight and the lane needs under one backend at the knee.
 const comments_max_inflight = 2;

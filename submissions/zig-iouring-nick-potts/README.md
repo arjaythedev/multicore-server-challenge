@@ -87,7 +87,7 @@ At 8 CPUs:
      ┌───────────────────────────────────────┐
      │ drain process (one io_uring)          │
      │ one read queue for the whole box      │
-     │ lanes: feeds 80, comments 40, rest 80 │──► 8 read connections ──► Postgres
+     │ lanes: feeds 80, comments 100, rest 80 │──► 8 read connections ──► Postgres
      │ MEGA + batched statements, one Sync   │    (one per CPU)           (8 read backends)
      │ answers rows in DataRow layout        │
      └───────────────────────────────────────┘
@@ -245,8 +245,8 @@ rows it had in common with the feeds, a small cost. Sharing starts with the requ
 execution and nothing survives it, as everywhere else here. A full queue (4,096 reads over all lanes) starts every
 lane's drain at once.
 
-**The comments lane.** Comment reads drain on a third lane with a 40 ms gap (`comments_gap_ns`), as one batched
-execution that reads each distinct thread once. Twice the comment reads share each execution, and the shared drain
+**The comments lane.** Comment reads drain on a third lane with a 100 ms gap (`comments_gap_ns`), as one batched
+execution that reads each distinct thread once, and the shared drain
 no longer waits for them.
 
 **The in-flight cap.** A lane with its cap of drains in flight starts no new one until one of them finishes, full
