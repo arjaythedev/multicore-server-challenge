@@ -87,7 +87,7 @@ At 8 CPUs:
      ┌───────────────────────────────────────┐
      │ drain process (one io_uring)          │
      │ one read queue for the whole box      │
-     │ lanes: feeds 80, comments 40, rest 20 │──► 8 read connections ──► Postgres
+     │ lanes: feeds 80, comments 40, rest 30 │──► 8 read connections ──► Postgres
      │ MEGA + batched statements, one Sync   │    (one per CPU)           (8 read backends)
      │ answers rows in DataRow layout        │
      └───────────────────────────────────────┘
@@ -222,7 +222,7 @@ saturation, and five read backends would cap how much Postgres the reads can use
 
 ## The batch clock and coalescing
 
-**The clock.** Reads wait in the queue until the oldest has waited 5 ms and 20 ms have passed since the previous
+**The clock.** Reads wait in the queue until the oldest has waited 5 ms and 30 ms have passed since the previous
 drain started (the drain gap, as in #47's gather). Then a free read connection takes every queued read of every
 worker, up to 4,096, and sends them as one Sync group. 4,096 queued reads start a drain at once, gap or not. Each
 connection has one group in flight at a time (depth 1). This is #47's two-phase gather, and #37 and #50 batch
@@ -273,7 +273,7 @@ The final stack at 5 ms costs 1.5–1.7x what it costs at 50 ms. The previous ve
 rig, the search failed on p99 latency before it failed on CPU, and the longer clocks we tried live hurt the tail more
 than they saved (see the losers). Those runs were limited by the receive CPU, not by Postgres. Our
 reproduction of the official run put the previous version's limit at its five read backends, so this version
-takes the bigger drains: the gap adds up to 20 ms
+takes the bigger drains: the gap adds up to 30 ms
 to a read's wait in exchange for cheaper reads.
 
 ---
@@ -718,7 +718,7 @@ Measured on the development box with 3 CPUs at 42,000 users, against the gather 
 | 1–2 read connections per worker | Fewer backends, bigger batches | −33 / −22 µs/req at 42,000 users | Collapsed at 90,000: 7.7–9.1k and 11.8–16.5k req/s against 17.2–22.2k |
 | No clock on the drain | Send reads inline as they arrive | +37 µs/req on the dev box; on the scoring-sized box +18.7 (Postgres +17.5) | Pure ACKs fell 0.33 → 0.13 but receive CPU didn't change |
 | 20 ms clock + "alone" gate | Long clock, but send a lone read at once | Postgres −15 on the dev box; at 158,000 on the scoring-sized box −1.2% req/s, +70 ms p95 | Tail. Its p99 hit 1,164 ms (fail) |
-| 10 / 20 / 50 / 100 ms clocks | | Cheaper Postgres, longer tails | p99 was the binding limit on our receive-CPU-bound rig. This version ships a 20 ms drain gap |
+| 10 / 20 / 50 / 100 ms clocks | | Cheaper Postgres, longer tails | p99 was the binding limit on our receive-CPU-bound rig. This version ships a 30 ms drain gap |
 | Load-adaptive clock | Clock follows the arrival rate | −1.5 µs/req | Noise |
 | 3 event loops instead of 4 | | About −2 µs/req | Under the spread, and it collapsed in 1 of 2 holds |
 | Two parallel MEGAs | 10 ms clock, feeds in one MEGA and the rest in another, on two connections | About 0 µs/req | Collapsed in 2 of 2 holds at 154,000 on the receive-CPU-bound rig with five lanes. Back in this version as the feed lane (80 ms gap, eight lanes), to be judged on a Postgres-bound rig |

@@ -47,7 +47,7 @@ const depth = 1;
 const window_ns = 5 * std.time.ns_per_ms;
 /// The drain gap (#47's gather): a lane's read drain starts only once this long has passed since the lane's previous
 /// one started, so below saturation the reads of the whole gap share one drain instead of ~5 ms worth each.
-const gap_ns = 20 * std.time.ns_per_ms;
+const gap_ns = 30 * std.time.ns_per_ms;
 /// The feed lane's gap. A feed is the dearest read (its page walk and the favorite counts of what it returns) and
 /// shares the most within one execution, so feeds drain on a lane of their own with a longer gap: four times the feeds
 /// per execution, and no other read's drain waits for the feed work.
