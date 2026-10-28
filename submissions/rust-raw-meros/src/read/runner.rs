@@ -44,6 +44,8 @@ pub struct Runner {
     spent: Vec<Vec<u8>>,
     /// Replies grouped by owning io thread, so each owner is woken once.
     per_owner: Vec<Vec<Reply>>,
+    /// Jobs of a group whose shared statement failed: each is run alone, so one bad request cannot fail the others.
+    retry: Vec<u32>,
 }
 
 impl Runner {
@@ -72,6 +74,11 @@ impl Runner {
     /// Answers every job with `status` (no usable connection).
     pub fn fail_all(&mut self, jobs: &[ReadJob], status: Status) {
         self.sink.clear();
+        self.fail_jobs(jobs, status);
+    }
+
+    /// Like [`fail_all`](Self::fail_all) but keeps the replies already produced.
+    fn fail_jobs(&mut self, jobs: &[ReadJob], status: Status) {
         let message = if status == Status::ServiceUnavailable {
             "database unavailable"
         } else {
@@ -92,13 +99,39 @@ impl Runner {
         passwords: &dyn PasswordSink,
     ) -> Health {
         self.sink.clear();
+        let health = self.execute(conn, stmts, jobs, passwords);
+        if health == Health::Good && !self.retry.is_empty() {
+            let retry = std::mem::take(&mut self.retry);
+            for &index in &retry {
+                let one = &mut jobs[index as usize..=index as usize];
+                if self.execute(conn, stmts, one, passwords) == Health::Poisoned {
+                    self.retry = retry;
+                    self.retry.clear();
+                    return Health::Poisoned;
+                }
+            }
+            self.retry = retry;
+            self.retry.clear();
+        }
+        health
+    }
+
+    /// One round trip for `jobs`; replies are appended to the sink. A group of several jobs whose statement failed is
+    /// not answered here: its jobs are queued in `retry`.
+    fn execute(
+        &mut self,
+        conn: &mut Connection,
+        stmts: &Statements,
+        jobs: &mut [ReadJob],
+        passwords: &dyn PasswordSink,
+    ) -> Health {
         self.plan.assign(jobs);
         self.plan.push_all(conn, stmts, jobs);
         self.results.clear();
         if let Err(e) = conn.flush_and_collect(&mut self.results) {
             eprintln!("read lane: batch of {} failed: {e}", jobs.len());
             let poisoned = conn.is_poisoned();
-            self.fail_all(
+            self.fail_jobs(
                 jobs,
                 if poisoned {
                     Status::ServiceUnavailable
@@ -126,6 +159,7 @@ impl Runner {
             tag_names,
             tag_ranks,
             tags_body,
+            retry,
             ..
         } = self;
         let mut names = recycle(std::mem::take(tag_names));
@@ -142,6 +176,10 @@ impl Runner {
             let stmt = plan.statement_of(group).map(|at| results.statement(at));
             if let Some(error) = stmt.and_then(|s| s.error()) {
                 eprintln!("read lane: {group:?} statement failed: {error}");
+                if members.len() > 1 {
+                    retry.extend_from_slice(members);
+                    continue;
+                }
             }
             let usable = !group.needs_tag_table() || tags_ok;
             if usable {

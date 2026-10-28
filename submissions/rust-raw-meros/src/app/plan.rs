@@ -108,7 +108,7 @@ fn plan_inner(jwt: &Jwt, now: u64, buf: &[u8], req: &Request<'_>, scratch: &mut 
         (_, Auth::User { id, token }) => (id, token),
         (_, Auth::Anonymous) => (0, &[]),
     };
-    let segment = |scratch: &mut Scratch, raw: &[u8]| -> Field { scratch.field(buf, &percent_decode(raw)) };
+    let segment = |scratch: &mut Scratch, raw: &[u8]| -> Field { lookup_key(buf, scratch, &percent_decode(raw)) };
 
     Ok(match found {
         Route::NotFound => return Err(NOT_FOUND),
@@ -242,12 +242,19 @@ fn paging(query: &[u8]) -> Result<(i64, i64), Rejection> {
     Ok((number("limit", DEFAULT_LIMIT, 1..=MAX_LIMIT)?, number("offset", 0, 0..=i64::MAX)?))
 }
 
+/// A path segment or query value used to look something up. Postgres rejects NUL in text, which would fail the whole
+/// batch the lookup travels in, so such a key becomes the empty key, which names nothing (no slug, username or tag is
+/// empty) and gives 404 or an empty list as it should.
+fn lookup_key(buf: &[u8], scratch: &mut Scratch, decoded: &std::borrow::Cow<'_, [u8]>) -> Field {
+    if decoded.contains(&0) { Field::default() } else { scratch.field(buf, decoded) }
+}
+
 /// The list filter. If several are given only the first of tag, author, favorited applies. A filter with an empty
 /// value is ignored (conformance step "empty-tag-ignored").
 fn list_filter(buf: &[u8], query: &[u8], scratch: &mut Scratch) -> (ListKind, Field) {
     for (name, kind) in [("tag", ListKind::Tag), ("author", ListKind::Author), ("favorited", ListKind::Favorited)] {
         if let Some(value) = query_param(query, name).filter(|value| !value.is_empty()) {
-            return (kind, scratch.field(buf, &value));
+            return (kind, lookup_key(buf, scratch, &value));
         }
     }
     (ListKind::All, Field::default())

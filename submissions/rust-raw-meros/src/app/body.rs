@@ -25,9 +25,13 @@ fn wrapper<'v, 'a>(root: &'v Value<'a>, name: &'static str) -> Result<&'v Value<
     }
 }
 
+/// Postgres text cannot hold NUL: such a value would fail the statement (and every request batched with it).
+const HAS_NUL: Invalid = "strings must not contain NUL";
+
 /// A string member that must be present and non-empty.
 fn required<'v, 'a>(object: &'v Value<'a>, key: &str, message: Invalid) -> Result<&'v Cow<'a, str>, Invalid> {
     match object.get(key) {
+        Some(Value::String(text)) if text.contains('\0') => Err(HAS_NUL),
         Some(Value::String(text)) if !text.is_empty() => Ok(text),
         _ => Err(message),
     }
@@ -37,6 +41,7 @@ fn required<'v, 'a>(object: &'v Value<'a>, key: &str, message: Invalid) -> Resul
 fn optional<'v, 'a>(object: &'v Value<'a>, key: &str, message: Invalid) -> Result<Option<&'v Cow<'a, str>>, Invalid> {
     match object.get(key) {
         None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) if text.contains('\0') => Err(HAS_NUL),
         Some(Value::String(text)) => Ok(Some(text)),
         Some(_) => Err(message),
     }
@@ -140,7 +145,7 @@ pub fn new_article(base: &[u8], body: &[u8], scratch: &mut Scratch) -> Result<Ne
         Some(Value::Array(items)) => {
             for item in items {
                 match item {
-                    Value::String(tag) if !tag.is_empty() => tags.push(scratch.field_str(base, tag)),
+                    Value::String(tag) if !tag.is_empty() && !tag.contains('\0') => tags.push(scratch.field_str(base, tag)),
                     _ => return Err("tagList must contain non-empty strings"),
                 }
             }
