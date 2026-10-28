@@ -87,7 +87,7 @@ At 8 CPUs:
      ┌───────────────────────────────────────┐
      │ drain process (one io_uring)          │
      │ one read queue for the whole box      │
-     │ 5 ms clock + 20 ms gap, ≤4,096 reads  │──► 8 read connections ──► Postgres
+     │ two lanes: feeds 40 ms, rest 20 ms    │──► 8 read connections ──► Postgres
      │ MEGA + batched statements, one Sync   │    (one per CPU)           (8 read backends)
      │ answers rows in DataRow layout        │
      └───────────────────────────────────────┘
@@ -114,8 +114,9 @@ We read the other entries. As far as we can tell, these are new to this challeng
 
 - **A separate drain process with SPSC rings.** One process owns every read connection and one read queue for the
   whole box. Workers reach it through lock-free single-producer single-consumer rings in shared memory.
-- **One MEGA statement.** Every list, feed, article, profile, user and tag read in a drain runs as one execution of
-  one statement. That statement returns each article entity and the tag list once per drain, beside each read's own
+- **One MEGA statement.** Every list, article, profile, user and tag read in a drain runs as one execution of
+  one statement, and the feeds of a drain run as another execution of the same statement on a lane of their own.
+  That statement returns each article entity and the tag list once per execution, beside each read's own
   keys and viewer flags.
 - **bcrypt at SCHED_IDLE with a watchdog.** Password hashing only uses CPU nothing else wants. A normal-priority
   watchdog thread takes over any job starved for too long.
@@ -231,6 +232,17 @@ soon as it completes. Without it Postgres holds the results until the Sync or a 
 which goes last. The previous version had the 5 ms clock alone. Against sending reads as they
 come, that clock measured −22.5 µs per request [−24, −21], of which −17.5 was Postgres. Instructions per request went from
 1,316k to 1,156k.
+
+**The feed lane.** Feeds have a clock of their own: a 40 ms gap instead of 20, and a drain of their own, one MEGA
+execution of feeds alone (`feed_gap_ns` in db.zig). A feed is the dearest read, its page walk and the favorite
+counts of the articles it returns, and it is the read that shares most within one execution, since viewers follow
+the same popular authors. The previous version carried feeds in the shared drain, about 58 per drain at 135,000
+users on an aged database, where they were 54–63% of MEGA's time, so every article, profile and tag read waited for
+the feed work. Now the shared drain's round trip no longer includes feeds, and every second tick about twice the
+feeds share one execution, as #82 runs its slow family on a lane of its own. The shared drain loses the article
+rows it had in common with the feeds, a small cost. Sharing starts with the requests already queued for one fresh
+execution and nothing survives it, as everywhere else here. A full queue (4,096 reads over both lanes) starts both
+drains at once.
 
 **Coalescing inside a drain.** Requests for the same statement run as one execution with one array per parameter:
 `unnest(...) WITH ORDINALITY` joined `CROSS JOIN LATERAL` to the per-row query (from #7), with rows routed back by
@@ -694,7 +706,7 @@ Measured on the development box with 3 CPUs at 42,000 users, against the gather 
 | 10 / 20 / 50 / 100 ms clocks | | Cheaper Postgres, longer tails | p99 was the binding limit on our receive-CPU-bound rig. This version ships a 20 ms drain gap |
 | Load-adaptive clock | Clock follows the arrival rate | −1.5 µs/req | Noise |
 | 3 event loops instead of 4 | | About −2 µs/req | Under the spread, and it collapsed in 1 of 2 holds |
-| Two parallel MEGAs | 10 ms clock, feeds in one MEGA and the rest in another, on two connections | About 0 µs/req | Collapsed in 2 of 2 holds at 154,000 |
+| Two parallel MEGAs | 10 ms clock, feeds in one MEGA and the rest in another, on two connections | About 0 µs/req | Collapsed in 2 of 2 holds at 154,000 on the receive-CPU-bound rig with five lanes. Back in this version as the feed lane (40 ms gap, eight lanes), to be judged on a Postgres-bound rig |
 | Key-sharded drains (offline) | Split each drain by key across connections | Kept 7–15% of the sharing gain, against a bar of ⅓ | Sharding by key destroys what MEGA shares. Sharding by kind kept 70–81% (−6 to −8% of MEGA CPU) but was the two-MEGA idea above |
 | Drain cap 1,024 | Smaller maximum drain | No gain | Kept 4,096 |
 | bcrypt watchdog without duplicates | Stop the watchdog re-hashing a job an idle thread holds | Watchdog hashed only 17 of 14,113 jobs; +0.5 µs/req | Nothing to save |
