@@ -70,3 +70,21 @@ Unit tests live next to the code (`#[cfg(test)] mod tests`).
 - No `unwrap`/`expect` on data that comes from the network or Postgres. Errors are values (`Result`, enums).
 - No allocation per request on the steady-state path where a reusable buffer works.
 - `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check` must pass.
+
+## Zero-copy rules (user requirement: minimise memory traffic, borrow instead of copy)
+
+1. **A request is read once.** The io thread reads the socket straight into a pooled buffer. The parsed `Request`
+   borrows from it. If the request is answered at once the buffer goes back to the pool; if it becomes a job, the
+   buffer itself moves into the job (a move, not a copy) and the job keeps `Field` ranges into it. Lane threads hand
+   `&str` slices of that buffer to Postgres as parameters. Only a JSON string with escape sequences needs its own
+   decoded copy (`Cow`).
+2. **A response is rendered once.** A lane renders JSON straight from the borrowed Postgres row bytes into a pooled
+   response buffer that reserves room for the headers in front (`http::ResponseBuf`). The same `Vec` travels through
+   the mailbox to the io thread, which writes it with a single `write` and returns it to the pool. No intermediate
+   `String`, no per-field `to_owned`.
+3. **Rows are not materialised.** `pg::Results` is one reusable arena; a `Row` is a view into it. Decoding a value
+   (`i64`, `&str`, timestamp, array) reads the wire bytes in place. Article rows are decoded once per batch and
+   shared by borrow between the responses of that batch (the batch-sharing ruling).
+4. **Queues carry ownership, not clones.** Jobs and replies are moved between threads. Buffers are recycled through
+   per-thread pools with a hard cap, so memory stays bounded and `malloc` stays off the steady-state path.
+5. **Idle connections own nothing**: no buffer, no pending response (only a ~100 byte table entry).
