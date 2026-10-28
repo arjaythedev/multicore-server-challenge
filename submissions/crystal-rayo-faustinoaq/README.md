@@ -4,7 +4,7 @@ Front: direct
 
 | Component | Version / implementation |
 |---|---|
-| Crystal | 1.22.1, release build, x86-64-v3 CPU target |
+| Crystal | 1.22.1, release build, `-Dwithout_mt`, x86-64-v3 CPU target |
 | Framework | [Rayo](https://github.com/faustinoaq/rayo), commit `e0006c8b773dae7b75d78eedab314419fb08c0e9` |
 | PostgreSQL driver | Rayo::PG, prepared statements and pipelining |
 | Network I/O | Rayo io_uring, `SO_REUSEPORT`; Linux 6.1+ with io_uring allowed |
@@ -54,6 +54,9 @@ Gzip is response middleware using `app.after`. JSON of at least 1,024 bytes is
 compressed only when accepted and smaller; explicit gzip `q=0` is respected.
 No compressed response is cached across requests.
 
+The build selects Crystal's single-thread runtime with `-Dwithout_mt`; bcrypt
+still uses explicitly managed pthreads. This avoids a reproducible multiworker
+GC failure with the default Crystal runtime (see integration notes below).
 The normal garbage collector remains enabled. Validation deliberately raises
 exceptions for malformed JSON, invalid tokens and invalid fields; those paths
 allocate. Connection state and bcrypt job pools also grow on first use. Building
@@ -84,6 +87,6 @@ Built and tested inside `crdev`, with Crystal 1.22.1:
 - `bash test/run.sh submissions/crystal-rayo-faustinoaq`: **197/197 checks passed** on a fresh development-seed copy, three workers, port 3291.
 - `crystal build --release --mcpu x86-64-v3 test/bcrypt.cr -o bin/test-bcrypt && bin/test-bcrypt`: **1,000 cost-10 hashes match libcrypt**, including 1/2/3/4/5/6/8 lanes, random salts, 0–72 byte passwords and the seed hash.
 - `DATABASE_URL=... python3 test/bcrypt_fallback.py http://HOST:PORT`: high-bit `$2a$`, UTF-8 `$2b$`, `$2y$` and 72-byte passwords; matching passwords accepted and wrong passwords rejected.
-- `python3 test/concurrency.py http://HOST:PORT`: 24 concurrent logins, disconnects with pending password jobs, ordered HTTP pipelining, gzip/identity equivalence and explicit gzip `q=0`.
+- `python3 test/concurrency.py http://HOST:PORT`: 24 concurrent logins, disconnects with pending password jobs, ordered HTTP pipelining, 800 concurrent article requests, gzip/identity equivalence and explicit gzip `q=0`.
 
 The HTTP tests use isolated scratch databases. Drop those databases after testing.

@@ -49,6 +49,16 @@ with socket.create_connection((url.hostname, url.port), timeout=30) as sock:
         result = json.loads(stream.read(int(headers['content-length'])))
         assert expected in result
 
+# Repeated concurrent result serialization also exercises collection after fork.
+def articles(_):
+    for _ in range(20):
+        page, _ = request('/api/articles?limit=20')
+        assert len(page['articles']) == 20
+
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=40) as pool:
+    list(pool.map(articles, range(40)))
+
 plain, compressed = request('/api/articles?limit=20')
 assert not compressed
 zipped, compressed = request('/api/articles?limit=20', encoding='gzip')
@@ -56,4 +66,4 @@ assert compressed and plain == zipped
 for encoding in ('gzip;q=0', 'gzip;q=0.000', 'br, gzip; q=0'):
     same, compressed = request('/api/articles?limit=20', encoding=encoding)
     assert not compressed and same == plain
-print('PASS: 24 concurrent logins, pending-job disconnects, ordered pipeline, gzip and q=0')
+print('PASS: 24 concurrent logins, pending-job disconnects, ordered pipeline, 800 article requests, gzip and q=0')
