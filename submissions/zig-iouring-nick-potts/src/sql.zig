@@ -54,16 +54,27 @@ pub const Def = struct {
 /// MEGA (branch sql-stack, stack-14-fcset: sql-proto's MEGA2 with the stack's count, feed, tag, list-count, list-flag and favorite-count edits, without comments):
 /// every mega-able read of a drain in one execution. It takes one array element per read in six arrays, kind int4
 /// and the slots v, i1, i2, i3 int8 and t1 text, and returns the read's 1-based position as the last column. Each
-/// article comes once, as an entity row with ordinal -1 keyed by `keys`; a read's own rows carry only its keys,
-/// counts and viewer flags (a feed row's following is true from the SQL: the feed only holds followed authors).
-/// Comments, tags, profiles and users stay out of it, so the article is the only entity type, and columns 15 and 16
-/// are always NULL.
+/// article comes once, as an entity row with ordinal -1 keyed by `keys`. A slug or by-id read's row carries its key
+/// and viewer flags. A list read comes as one row: its count and the page's article ids, their authors, and the
+/// viewer's favorites and followees among them as int8 arrays (`page`); mega.zig turns it into one row per article
+/// with the flags (a feed row's followees array is NULL: the feed only holds followed authors, so following is true).
+/// Comments, tags, profiles and users stay out of it, so the article is the only entity type.
 pub const mega = struct {
     pub const sql = std.mem.trimEnd(u8, @embedFile("sql/MEGA.sql"), "\n; ");
     pub const params = [_]Oid{ .int4_array, .int8_array, .int8_array, .int8_array, .int8_array, .text_array };
-    pub const cols = [_]Oid{ .int8, .int8, .text, .text, .text, .text, .timestamptz, .timestamptz, .text_array, .int8, .bool, .text, .text, .text, .bool, .int8, .text, .int8 };
+    pub const cols = [_]Oid{ .int8, .int8, .text, .text, .text, .text, .timestamptz, .timestamptz, .text_array, .int8, .bool, .text, .text, .text, .bool, .int8_array, .int8_array, .int8_array, .int8_array, .int8 };
     pub const keys = [_]u8{1};
     pub const ordinal = cols.len - 1;
+    /// A list read's page arrays and the columns filled per article from them.
+    pub const page = struct {
+        pub const ids = 15;
+        pub const aus = 16;
+        pub const fa = 17;
+        pub const fw = 18;
+        pub const id = 1;
+        pub const favorited = 10;
+        pub const following = 14;
+    };
 };
 
 pub const Slot = enum { v, i1, i2, i3, t1 };

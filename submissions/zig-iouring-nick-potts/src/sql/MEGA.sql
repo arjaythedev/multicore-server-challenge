@@ -10,20 +10,22 @@ la AS MATERIALIZED (
   FROM lk),
 tf AS MATERIALIZED (
   SELECT x.f FROM la CROSS JOIN LATERAL unnest(la.a) x(f) GROUP BY x.f HAVING count(*) > 1
-  ORDER BY count(*) DESC, x.f LIMIT 10),
+  ORDER BY count(*) DESC, x.f LIMIT 20),
 big AS MATERIALIZED (
   SELECT ARRAY(SELECT tf.f FROM tf WHERE EXISTS (SELECT 1 FROM articles a3 WHERE a3.author_id = tf.f
     ORDER BY a3.author_id DESC, a3.id OFFSET 999)) AS a),
-lc AS MATERIALIZED (
-  SELECT ck.k, ck.fv, ck.lim, ck.off, ck.lpo, ck.t1, ck.a, CASE ck.k
+lc1 AS MATERIALIZED (
+  SELECT ck.k, ck.fv, ck.lim, ck.off, ck.lpo, ck.t1, ck.a, CASE WHEN row_number() OVER (PARTITION BY ck.k, ck.fv, ck.t1 ORDER BY ck.lim, ck.off, ck.lpo) = 1 THEN CASE ck.k
     WHEN 1 THEN (SELECT CASE WHEN EXISTS (SELECT id FROM articles ORDER BY id OFFSET 999) THEN 1000::bigint ELSE (SELECT count(*) FROM articles) END)
     WHEN 2 THEN (SELECT CASE WHEN EXISTS (SELECT at.tag_id, at.article_id FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = ck.t1) OFFSET 999 LIMIT 1) THEN 1000::bigint
                   ELSE (SELECT count(*) FROM (SELECT 1 FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = ck.t1) LIMIT 1000) s) END)
     WHEN 3 THEN (SELECT count(*) FROM (SELECT 1 FROM articles WHERE author_id = (SELECT au.id FROM users au WHERE au.username = ck.t1) LIMIT 1000) s)
     WHEN 4 THEN (SELECT count(*) FROM (SELECT 1 FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = ck.t1) LIMIT 1000) s)
     WHEN 5 THEN CASE WHEN ck.a && (SELECT big.a FROM big) THEN 1000::bigint ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a3 WHERE a3.author_id = ANY(ck.a) ORDER BY a3.author_id DESC, a3.id LIMIT 1000) s) END
-  END AS n
+  END END AS n
   FROM la ck),
+lc AS MATERIALIZED (
+  SELECT k, fv, lim, off, lpo, t1, a, max(n) OVER (PARTITION BY k, fv, t1) AS n FROM lc1),
 pg AS MATERIALIZED (
   SELECT lk.k, lk.fv, lk.lim, lk.off, lk.lpo, lk.t1, lk.n, p.id
   FROM lc lk LEFT JOIN LATERAL (
@@ -39,10 +41,12 @@ pg AS MATERIALIZED (
        ORDER BY f.article_id DESC LIMIT lk.lim OFFSET lk.off)
     UNION ALL
       (SELECT x.id FROM unnest(lk.a) fo(followee_id) CROSS JOIN LATERAL (SELECT a3.id FROM articles a3 WHERE a3.author_id = fo.followee_id ORDER BY a3.id DESC LIMIT lk.lpo) x
-       WHERE lk.k = 5 ORDER BY x.id DESC LIMIT lk.lim OFFSET lk.off)
+       ORDER BY x.id DESC LIMIT lk.lim OFFSET lk.off)
   ) p ON true),
 art AS MATERIALIZED (
-  SELECT r.ord, r.v, a.id FROM r JOIN articles a ON a.slug = r.t1 WHERE r.k = 6
+  SELECT x.ord, x.v, a.id
+  FROM (SELECT r.t1, array_agg(r.ord) AS ords, array_agg(r.v) AS vs FROM r WHERE r.k = 6 GROUP BY r.t1) g
+  JOIN articles a ON a.slug = g.t1 CROSS JOIN LATERAL unnest(g.ords, g.vs) x(ord, v)
   UNION ALL
   SELECT r.ord, r.v, r.i1 FROM r WHERE r.k = 7),
 ids AS MATERIALIZED (
@@ -74,19 +78,16 @@ rl AS MATERIALIZED (
     AND pa.lpo = COALESCE(r.i3, 0) AND pa.t1 = COALESCE(r.t1, '')
   WHERE r.k BETWEEN 1 AND 5)
 SELECT NULL::int8, e.id, e.slug, e.title, e.description, e.body, e.created_at, e.updated_at, e.tags, e.fc, NULL::bool,
-  e.username, e.bio, e.image, NULL::bool, NULL::int8, NULL::text, -1::int8
+  e.username, e.bio, e.image, NULL::bool, NULL::int8[], NULL::int8[], NULL::int8[], NULL::int8[], -1::int8
 FROM e
 UNION ALL
-SELECT rl.n, x.id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-  COALESCE(x.id = ANY (rl.fa), false),
-  NULL, NULL, NULL,
-  CASE WHEN rl.k = 5 THEN x.id IS NOT NULL ELSE COALESCE(x.au = ANY (rl.fw), false) END,
-  NULL, NULL, rl.ord
-FROM rl LEFT JOIN LATERAL unnest(rl.ids, rl.aus) x(id, au) ON true
+SELECT rl.n, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+  rl.ids, rl.aus, rl.fa, rl.fw, rl.ord
+FROM rl
 UNION ALL
 SELECT NULL, e.id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
   EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = e.id AND f.user_id = x.v),
   NULL, NULL, NULL,
   EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = x.v AND fo.followee_id = e.author_id),
-  NULL, NULL, x.ord
+  NULL, NULL, NULL, NULL, x.ord
 FROM art x JOIN e ON e.id = x.id
