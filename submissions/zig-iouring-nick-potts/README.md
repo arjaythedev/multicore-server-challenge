@@ -322,9 +322,12 @@ statement**. Its input is six binary arrays, one element per job:
 | i1, i2, i3 | int8 | limit, offset and the kind's key |
 | t1 | text | slug, tag or username |
 
-It returns 18 columns. A row's ordinal says what it is: ≥ 1 is a job's own row (its keys, counts and viewer flags),
-and −1 is an article entity. Each article is sent **once per drain**, however many jobs refer to it. The worker side
-(`mega.zig`) keeps the rows until the result is complete, fills each job's rows from the entities, sorts them per
+It returns 20 columns. A row's ordinal says what it is: ≥ 1 is a job's own row, and −1 is an article entity. An
+article job's row carries its key and viewer flags. A list job comes as one row: its count and the page's article
+ids, their authors, and the viewer's favorites and followees among them, as int8 arrays. Each article is sent **once
+per drain**, however many jobs refer to it. The worker side (`mega.zig`) expands each page row into one row per
+article, computing `favorited` and `following` from the arrays (a feed's followees array is NULL: every feed author
+is followed), keeps the rows until the result is complete, fills each job's rows from the entities, sorts them per
 job, and hands them to the same JSON writers a single statement would use.
 
 A drain with fewer than two MEGA jobs uses the ordinary single statements. MEGA has a fixed cost of about 1.7M
@@ -379,7 +382,7 @@ Each was measured on replay against the version before it.
   - the capped count is *proved* rather than counted where it can be. The drain's 10 most-followed authors get an
     `OFFSET 999` probe each (credit #10, #22, #11 and #4 for the probe), and a viewer who follows one with 1,000+
     articles has a capped count without walking anything. This covers 202 of 275 capped feeds and removes 65–67% of
-    feed rows.
+    feed rows. Round 2 below raised the 10 to 20.
 - **Counts carried per distinct list request in the page CTE.** This one fixed a plan, not just a cost. Under the
   generic plan every CTE was estimated at 1 row, so Postgres chose a nested loop that compared each read against
   every other: 93 comparisons per read, 598,000 on the largest drain, about 5.2M over the whole replay. Carrying the
@@ -388,6 +391,40 @@ Each was measured on replay against the version before it.
 - **List flags from one array-key probe per read** (favorited and following together): 0.951.
 - **Favorite counts from one grouped scan** of the favorites index: +0.7–1.8% instructions on small drains, but fewer
   buffers, and it pays off on large drains.
+
+**Round 2, from the Synteq rig's profile.** At 180,000 users on that rig Postgres took 47% of the box and MEGA 75%
+of Postgres's CPU. The single statements an earlier profile pointed at (four correlated subplans per article) do not
+run at the knee: the 80 ms gap sends nearly every read through MEGA, which already builds tags and favorite counts
+set-wise over the drain's article ids. What is left per read is index descents and output rows. Each edit was
+measured as the retired instructions of one backend (`perf stat`, deterministic to 0.01%) on a fresh-seed replay of
+one drain of each lane at that load, 1,500 shared reads and 300 feeds, against the version before:
+
+- **Page arrays.** A list read returns one row: its count, the page's ids, their authors, and the viewer's favorites
+  and followees among them. The worker makes the rows and the flags. −9.7% on the shared drain, −3.8% on the feed
+  drain: the row-per-article output was 50M of the shared drain's 455M instructions.
+- **Capped counts once per count key** (kind, tag or username, the viewer for a feed), through a window over the
+  distinct page keys: the first page key of a count computes it, the others take it. −1.3% shared, +0.6% feed.
+- **Slug lookups once per distinct slug.** 693 slug reads in the shared drain name 368 slugs. −0.8% shared.
+- **The feed branch without its kind test**, which the NULL followee array of every other kind already implies.
+  −1.6% feed.
+- **20 proved authors instead of 10.** −2.7% feed, nothing on the shared drain.
+
+Together: 455.3M → 401.9M instructions on the shared drain (−11.7%) and 524.0M → 485.4M on the feed drain (−7.4%),
+with byte-identical output on both replays.
+
+On the Synteq rig (Xeon 8260, 8 shared vCPUs, 16 GB; Postgres 18 with the official settings) at 180,000 users, ABAB
+against the version before, a fresh seed before every run, 60 s ramp and 120 s measured:
+
+| Build | req/s | p50 / p95 / p99 ms | box CPU % | app % of box | Postgres % of box |
+|---|--:|--:|--:|--:|--:|
+| before, run A1 | 46,202 | 131.5 / 215.6 / 252.9 | 83.2 | 32.8 | 46.5 |
+| round 2, run B1 | 46,311 | 124.5 / 206.7 / 234.4 | 81.1 | 32.7 | 44.8 |
+| before, run A2 | 46,196 | 131.8 / 215.4 / 249.1 | 83.6 | 33.0 | 46.8 |
+| round 2, run B2 | 46,278 | 124.2 / 200.6 / 230.3 | 81.5 | 32.8 | 45.0 |
+
+Postgres gives back 1.7 to 1.8 points of the box (−3.8% of its CPU), p99 about 19 ms, at the same goodput. Modest,
+as expected: the set-wise work the profile asked for was already in MEGA, and these edits take the per-read
+remainder down to index descents and entity rows.
 
 **Comments left MEGA.** An earlier MEGA also served comments (kind 8). On their own statements they cost 520.8k
 instructions per comments request against 704.7k inside MEGA (−26%).
@@ -751,7 +788,11 @@ Measured on the development box with 3 CPUs at 42,000 users, against the gather 
 | Shared feed walks per followee | +4.6% to +37.6%; a second version tied | |
 | Feed counts per distinct followee | 4.05–4.46x the tuples; 1.26–1.30x even with the count proof | |
 | Feed paged from its count | +1% | |
-| Per-list output arrays | Task-clock not better | |
+| Per-list output arrays | Task-clock not better | An earlier shape. The page arrays that shipped in round 2 carry the ids and the keys and leave the flags to the worker: −11.7% instructions on a 1,500-read drain |
+| Feed: each distinct followee's newest ids once per drain, pages from that | 191 ms against 52 ms (replay of a 300-feed drain) | The generic plan rescans the CTE for every feed. Even an ideal prefetch would save 6 of the 41 ms the page walk costs; the per-feed top-N merge is the cost, not the index descents |
+| Feed: recency window on the page walk | Exact only at the start | New articles push the seed's down within a run, so the window's cut-off is not stable |
+| Lists: the authors' user rows once per drain | About 0 | The wide rows have to be materialized once anyway |
+| Output as jsonb or `width_bucket` assembly | Slower | Executor work per element costs more than the rows it saves |
 | Per-column result formats | About 0.1% at best | Not worth the code |
 | Feed: k-way merge-append | +22% | |
 | Feed: tags joined in the spec | +9% | |
