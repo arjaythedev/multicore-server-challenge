@@ -28,7 +28,9 @@ Required environment: `DATABASE_URL`, `JWT_SECRET`. Optional: `HOST` (default `1
 - **No runtime.** `_start` (`src/main.s`) reads the environment, parses `DATABASE_URL`, initialises the JWT
   HMAC context from `JWT_SECRET`, raises `RLIMIT_NOFILE`, ignores `SIGPIPE`, then spawns the bcrypt thread(s)
   and one worker thread per `APP_THREADS` and parks. Threads are raw `clone` (`rt.s`); memory comes from a
-  per-worker size-classed allocator over `mmap` (`rt.s`), never libc `malloc`.
+  per-worker size-classed allocator over `mmap` (`rt.s`), never libc `malloc`. Freed blocks up to 1 MB are kept
+  for reuse, at most 64 per size class above 64 KB, so a list response's 128 KB+ buffer is not mapped and
+  unmapped on every request. The clock is read through the vDSO.
 - **One epoll loop per worker** (`src/server.s`). Each worker owns its listen socket (`SO_REUSEPORT`), its
   client connections, its read Postgres connections and one write connection. A request is parsed (`http.s`),
   turned into a job (`J_*`), and routed (`api.s`) to an endpoint. Endpoints that need the database hand the job
@@ -38,10 +40,15 @@ Required environment: `DATABASE_URL`, `JWT_SECRET`. Optional: `HOST` (default `1
 - **Postgres** (`pg.s`, `pgio.s`, `sql.s`): blocking connect with SCRAM-SHA-256 at startup, then non-blocking
   extended-query protocol. Statements are prepared once per connection.
 - **Read batching** (`readb.s`, `readr.s`; a port of the Rust `read_batch.rs`): each read joins a per-family
-  queue; whenever a read connection is idle it takes the oldest family's queued jobs (up to 512) and runs them as
-  one statement whose parameters are arrays, the same SQL text as Rust. A lone job runs its own statement. Lists,
-  and article / comment reads with repeated slugs, use Rust's shared ("packed") forms and are rendered from the
-  shared rows by `readr.s`; tags run once for every waiter. If a batch fails, each job is retried on its own.
+  queue shared by all workers, as Rust's queues are shared by its tasks; whenever a read connection is idle it
+  takes the oldest family's queued jobs (up to 512) and runs them as one statement whose parameters are arrays,
+  the same SQL text as Rust. A lone job runs its own statement. Lists, and article / comment reads with repeated
+  slugs, use Rust's shared ("packed") forms and are rendered from the shared rows by `readr.s`; tags run once for
+  every waiter. If a batch fails, each job is retried on its own. A batch can hold other workers' jobs: their
+  reply bytes are copied once into a reference-counted block, and each job is handed back to its own worker on a
+  lock-free stack (the way bcrypt results come back), which renders and sends it, so client sockets, gzip and
+  allocations stay with their worker. A block freed on another worker goes back to the worker that allocated it.
+  One spinlock guards the queues and is held only to link or unlink jobs.
 - **Writes** use durable group commit on the worker's write connection (`writer.s`, a port of the Rust
   `writer.rs`): up to 128 queued writes run as one pipelined `BEGIN` … `COMMIT`, and each reply is released only
   after the `COMMIT` returns. If a statement fails, the group has rolled back, so every write in it is retried
@@ -53,6 +60,12 @@ Required environment: `DATABASE_URL`, `JWT_SECRET`. Optional: `HOST` (default `1
   accepts gzip and the adaptive controller (a port of Rust's `egress`) says so, i.e. only while the box is sending
   over 100 MB/s with TCP retransmits, and kept only if smaller. Each worker has its own compressor state.
 - **JWT** (`crypto.s`): HS256, verified on every authenticated request.
+- **Failures** (`server.s`, `pgio.s`): if `accept4` fails for any reason other than `EAGAIN`, for example
+  `EMFILE` at the open-file limit, the worker stops watching its listen socket for 10 ms, as Rust's accept loop
+  sleeps 10 ms. Otherwise the level-triggered listen socket would wake the loop again at once and spin. A
+  Postgres connection that fails or is closed by the server, including an idle one, is marked down, and the
+  requests waiting on it fail. New reads go to the other read connections. The loop reconnects it,
+  with its prepared statements and session settings, trying at most every 500 ms.
 
 ## Optimizations and why
 
@@ -66,11 +79,13 @@ exactly the work the Rust entry sends it, and spend less CPU on everything else.
 - **No runtime.** No libc, no async runtime, no allocator library: one epoll loop per worker thread, a size-class
   allocator per worker, and raw syscalls. From 32k users up (think scale 0.2) the server used 0.89-0.93x the Rust
   entry's app CPU at the same request rate. On a box where the CPU is the limit, that CPU goes to Postgres instead.
-- **Nothing shared between workers.** Each worker owns its listen socket (`SO_REUSEPORT`), its connections, its
-  Postgres connections and its allocator; the bcrypt queue is the only structure the workers share. We tried one
-  read queue shared by all workers: it cut the wait for a free read connection (our p50 at 32k users is 3.3 ms
-  against Rust's 2.1 ms), but it cost about 4% of capacity at saturation (72k against 75k req/s). We kept
-  per-worker.
+- **Shared read queues, nothing else shared.** Each worker owns its listen socket (`SO_REUSEPORT`), its client
+  connections, its Postgres connections and its allocator; the read queues and the bcrypt queue are the only
+  structures the workers share. With a read queue per worker, each worker ran its own batch of every family on
+  its own two read connections, so it paid each statement's fixed cost once per worker: at 200,000 users all six
+  read connections were busy and a read waited for one about three times as long as in Rust, whose queues are
+  shared. With one set of queues over all six connections, the 200,000-user p95 went from 133 to 70 ms (table
+  below), and at saturation on the same box the two were within 1% (one pair, 51.5k against 52.1k req/s).
 - **6-lane bcrypt.** Login is the one CPU-heavy endpoint: every hash is cost 10. The bcrypt thread runs up to 6
   queued jobs as one interleaved call. Six independent Blowfish states hide each other's table-lookup latency,
   so a batch of 6 costs 13.3 ms per hash against 14.6 ms with 5 lanes. At 8k users the login p50 was 62 ms against
@@ -80,10 +95,28 @@ exactly the work the Rust entry sends it, and spend less CPU on everything else.
 
 ## Measurements
 
-These are not official scores. The official run puts the load generator on separate machines; these numbers are
-same-box: an AWS c7i.2xlarge, 8 vCPUs, Xeon 8488C (Ubuntu 24.04, PostgreSQL 18, the 2% dev seed), the repo's
-loadgen niced on the same box with `-think-scale 0.2` or `0.05`, 10 s ramp, 30 s measured, a fresh database per
-run, two runs per point, against that Rust entry on the same box.
+These are not official scores. Closest to the official run: an AWS c7i.2xlarge target (8 vCPUs, Xeon 8488C,
+15.7 GB) set up with the repo's `box/setup-box.sh`, the full seed, and the repo's `conduit-loadgen` on a separate
+c7i.4xlarge over the target's four addresses, at its default think time. Each run starts from a fresh database
+that is first aged by 128,000 users for 300 s (the official search reaches high loads on a database its earlier
+steps have written to), then holds 200,000 users: a 60 s ramp and 300 s measured. 200,000 is as high as the
+harness goes (the service's `LimitNOFILE` is 200000), so what is left to compare is the margin under the limits.
+Rust is the same entry as below, on the same boxes in the same session.
+
+| build, 200,000 users | req/s | p50 (ms) | p95 (ms) | p99 (ms) | errors | app / Postgres CPU (cores) | box CPU busy |
+|---|---|---|---|---|---|---|---|
+| this server | 52,547 | 18 | 70 | 127 | 0.03% | 1.72 / 5.76 | 94.5% |
+| this server with a read queue per worker | 52,162 | 46 | 133 | 192 | 0.03% | 1.70 / 5.61 | 92.7% |
+| Rust | 52,438 | 25 | 89 | 158 | 0.03% | 1.94 / 5.58 | 94.9% |
+
+All three pass. Nearly all the errors are logins: about 30% of them (22% for Rust) wait 8 s for the one bcrypt
+thread and are shed with a 503, but logins are about 0.1% of the requests. The process's memory stayed flat at
+154-158 MB through the measured window.
+
+The tables below were measured on an earlier build, before the read queues were shared and before the fixes
+under **Failures**. They are same-box numbers: an AWS c7i.2xlarge, 8 vCPUs, Xeon 8488C (Ubuntu 24.04,
+PostgreSQL 18, the 2% dev seed), the repo's loadgen niced on the same box with `-think-scale 0.2` or `0.05`,
+10 s ramp, 30 s measured, a fresh database per run, two runs per point, against that Rust entry on the same box.
 
 | users, think scale | this server req/s | Rust req/s | p95 (ms) this / Rust | app CPU (cores) this / Rust |
 |---|---|---|---|---|

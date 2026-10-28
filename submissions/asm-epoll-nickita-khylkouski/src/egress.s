@@ -330,6 +330,25 @@ egress_init_path:
 9:  xor eax, eax
     ret
 
+# egress_clock_gettime(clockid, ts) -> rax = 0 or -errno: clock_gettime through the vDSO found by egress_init
+# (the syscall before egress_init or without a vDSO). Clobbers the caller-saved registers. Aligns the stack
+# itself.
+.globl egress_clock_gettime
+.type egress_clock_gettime, @function
+egress_clock_gettime:
+    mov rax, [rip + eg_cgt]
+    test rax, rax
+    jz 1f
+    push rbp
+    mov rbp, rsp
+    and rsp, -16
+    call rax
+    leave
+    ret
+1:  SYS SYS_clock_gettime
+    ret
+.size egress_clock_gettime, .-egress_clock_gettime
+
 # .Lnow_ns -> rax = CLOCK_MONOTONIC in ns. Clobbers the caller-saved registers. Aligns the stack itself, so
 # callers that do not keep the ABI alignment are fine.
 .Lnow_ns:
@@ -352,6 +371,7 @@ egress_init_path:
     add rax, [rsp + 8]
     leave
     ret
+    .skip 32, 0xcc                     # padding: keeps the code after this at its previous 64-byte alignment
 
 # ------------------------------------------------------------------------------------------------ hot path
 # egress_compress(turn) -> eax: Off 0, Always 1, Above: share != 0 && ++*turn % 256 < share.

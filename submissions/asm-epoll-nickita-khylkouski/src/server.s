@@ -9,6 +9,7 @@
 
 .equ IN_INIT, 4096
 .equ ACCEPT_BURST, 256
+.equ ACCEPT_BACKOFF_MS, 10                # pause after a failed accept4, as Rust's 10 ms back-off
 
 .section .rodata
 DEFSTR .Lmsg_listen, "[server] listening\n"
@@ -96,17 +97,30 @@ worker_main:
     mov rsi, [r15 + W_EVENTS]
     mov edx, EV_BATCH
     mov r10, -1
-    SYS SYS_epoll_wait
+    cmp qword ptr [r15 + W_NDEAD], 0
+    je 1f
+    mov r10d, 250                        # a Postgres connection is down: wake up to reconnect it
+1:  cmp qword ptr [r15 + W_ACCOFF], 0
+    je 1f
+    mov r10d, ACCEPT_BACKOFF_MS          # accepting is paused: wake up to resume it
+1:  SYS SYS_epoll_wait
     test rax, rax
-    jle .Lwm_loop                        # EINTR (or nothing)
-    mov r14, rax                         # events
+    jg 2f
+    mov rcx, [r15 + W_NDEAD]
+    or rcx, [r15 + W_ACCOFF]
+    jz .Lwm_loop                         # EINTR (or nothing)
+    xor eax, eax
+2:  mov r14, rax                         # events
     call rt_now_sec
     mov [r15 + W_NOW], rax
     mov r12, [r15 + W_EVENTS]
     xor r13d, r13d
 .Lwm_ev:
+    cmp qword ptr [r15 + W_DONE], 0
+    jne .Lwm_drain
+.Lwm_ev1:
     cmp r13, r14
-    jae .Lwm_after
+    jae .Lwm_revive
     lea rax, [r13 + r13*2]
     lea rax, [r12 + rax*4]               # event i (12 bytes, packed)
     mov esi, [rax]
@@ -131,9 +145,19 @@ worker_main:
 .Lwm_done:
     call srv_completions
     jmp .Lwm_ev
+.Lwm_drain:                              # jobs answered by another worker: resume them between events
+    call srv_drain
+    jmp .Lwm_ev1
 .Lwm_timer:
     call wr_timer
     jmp .Lwm_ev
+.Lwm_revive:
+    cmp qword ptr [r15 + W_ACCOFF], 0
+    je 1f
+    call srv_accept_resume
+1:  cmp qword ptr [r15 + W_NDEAD], 0
+    je .Lwm_after
+    call pgio_revive_due
 .Lwm_after:
     # run requests that became ready, then send Postgres output; repeat until both are quiet
     call srv_run_ready
@@ -152,6 +176,7 @@ worker_main:
     lea rdi, [rip + .Lmsg_listenf]
     mov esi, .Lmsg_listenf_len
     jmp srv_die_errno
+    .skip 48, 0xcc                     # padding: keeps the code after this at its previous 64-byte alignment
 
 # epoll_add(fd, events, data)
 .globl epoll_add
@@ -241,7 +266,7 @@ srv_accept:
     mov r10d, SOCK_NONBLOCK | SOCK_CLOEXEC
     SYS SYS_accept4
     test rax, rax
-    js .Lsa_ret
+    js .Lsa_fail
     mov ebx, eax
     mov dword ptr [rsp], 1
     mov edi, ebx
@@ -270,11 +295,18 @@ srv_accept:
     mov esi, EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET
     call epoll_add
     jmp .Lsa_loop
+.Lsa_fail:
+    cmp rax, -EAGAIN
+    je .Lsa_ret
+    cmp rax, -EINTR
+    je .Lsa_ret
+    call srv_accept_pause                # out of descriptors (EMFILE, ENFILE) and the like
 .Lsa_ret:
     add rsp, 24
     pop r12
     pop rbx
     ret
+    .skip 47, 0xcc                     # padding: keeps the code after this at its previous 64-byte alignment
 
 # client_event(conn, events)
 client_event:
@@ -343,7 +375,9 @@ client_read:
     mov edi, [rbx + C_FD]
     mov rsi, [rbx + C_IN]
     add rsi, [rbx + C_INLEN]
-    SYS SYS_read
+    xor r10d, r10d                       # flags; recvfrom skips the VFS layer read() goes through
+    xor r8d, r8d                         # no source address
+    SYS SYS_recvfrom
     test rax, rax
     jg .Lcr_got
     jz .Lcr_eof
@@ -377,6 +411,7 @@ client_read:
     pop r12
     pop rbx
     ret
+    .skip 58, 0xcc                     # padding: keeps the code after this at its previous 64-byte alignment
 
 # client_process(conn): the connection is idle (no job, no parked output): parse and start the next request.
 # As the Rust read_request, "100 Continue" goes out once per request as soon as its head is complete (even
@@ -409,7 +444,9 @@ client_process:
     mov edi, [rbx + C_FD]
     lea rsi, [rip + .Lcontinue]
     mov edx, 25
-    SYS SYS_write
+    xor r10d, r10d
+    xor r8d, r8d
+    SYS SYS_sendto
     cmp rax, -EINTR
     je .Lcp_cont
     cmp rax, 25
@@ -455,6 +492,7 @@ client_process:
     add rsp, REQ_SIZE + 16
     pop rbx
     ret
+    .skip 58, 0xcc                     # padding: keeps the code after this at its previous 64-byte alignment
 
 # srv_respond(job): the job's response is rendered (J_OUT[J_OUTSTART..J_OUTEND]); free the job, consume its
 # request bytes and send. The connection becomes ready for its next request once everything is written.
@@ -506,7 +544,9 @@ srv_respond:
     sub rdx, r14
 .Lrs_write:
     mov edi, [rbx + C_FD]
-    SYS SYS_write
+    xor r10d, r10d                       # flags; sendto skips the VFS layer write() goes through
+    xor r8d, r8d                         # no destination address
+    SYS SYS_sendto
     cmp rax, -EINTR
     je .Lrs_write_again
     mov rdx, rbp
@@ -564,6 +604,7 @@ srv_respond:
     pop r12
     pop rbx
     ret
+    .skip 58, 0xcc                     # padding: keeps the code after this at its previous 64-byte alignment
 
 # client_after_send(conn): a response went out completely.
 client_after_send:
@@ -602,7 +643,9 @@ client_flush:
     add rsi, [rbx + C_OUTPOS]
     mov rdx, [rbx + C_OUTEND]
     sub rdx, [rbx + C_OUTPOS]
-    SYS SYS_write
+    xor r10d, r10d
+    xor r8d, r8d
+    SYS SYS_sendto
     cmp rax, -EINTR
     je .Lcf_write
     cmp rax, -EAGAIN
@@ -626,6 +669,7 @@ client_flush:
 .Lcf_ret:
     pop rbx
     ret
+    .skip 58, 0xcc                     # padding: keeps the code after this at its previous 64-byte alignment
 
 # client_close(conn): close the socket. The struct is freed at the end of the loop iteration (events for it may
 # still be pending in this batch), or when its in-flight job finishes.
@@ -704,7 +748,13 @@ srv_completions:
     mov rsi, rsp
     mov edx, 8
     SYS SYS_read
-    xor eax, eax
+    jmp 4f
+# srv_drain(): srv_completions without reading the eventfd (its count only causes one spurious wakeup later).
+srv_drain:
+    push rbx
+    push r12
+    sub rsp, 24
+4:  xor eax, eax
     xchg rax, [r15 + W_DONE]
     xor r12d, r12d
 1:  test rax, rax
@@ -743,5 +793,47 @@ job_free:
     call rt_free
     pop rbx
     ret
+
+# srv_accept_pause(): accept4 failed with something other than EAGAIN. The listening socket stays readable
+# while its backlog is non-empty, so it leaves epoll for ACCEPT_BACKOFF_MS rather than wake this worker over
+# and over (at the descriptor limit that spin took a core from Postgres).
+srv_accept_pause:
+    cmp qword ptr [r15 + W_ACCOFF], 0
+    jne 1f
+    sub rsp, 8
+    call rt_mono_ms
+    add rsp, 8
+    add rax, ACCEPT_BACKOFF_MS
+    mov [r15 + W_ACCOFF], rax
+    xor esi, esi
+    jmp srv_listen_mod
+1:  ret
+
+# srv_accept_resume(): puts the listening socket back in epoll once the pause has passed.
+srv_accept_resume:
+    sub rsp, 8
+    call rt_mono_ms
+    add rsp, 8
+    cmp rax, [r15 + W_ACCOFF]
+    jb 1f
+    mov qword ptr [r15 + W_ACCOFF], 0
+    mov esi, EPOLLIN
+    jmp srv_listen_mod
+1:  ret
+
+# srv_listen_mod(events): EPOLL_CTL_MOD of this worker's listening socket.
+srv_listen_mod:
+    sub rsp, 24
+    mov [rsp], esi
+    mov qword ptr [rsp + 4], TAG_LISTEN
+    mov rdi, [r15 + W_EPFD]
+    mov esi, EPOLL_CTL_MOD
+    mov edx, [r15 + W_LFD]
+    mov r10, rsp
+    SYS SYS_epoll_ctl
+    add rsp, 24
+    ret
+
+    .skip 4, 0xcc                      # padding: keeps the code after this at its previous 64-byte alignment
 
 .section .note.GNU-stack,"",@progbits

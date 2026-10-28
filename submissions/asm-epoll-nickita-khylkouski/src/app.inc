@@ -59,8 +59,11 @@
 .equ W_TFD, 904                         # writer.s: batch-delay timerfd
 .equ W_GZ, 912                          # gzip_compress context (GZ_CTX_SIZE; 0 when HTTP_GZIP=0)
 .equ W_TURN, 920                        # egress_compress turn counter (worker-local)
-.equ W_RIDLE, 928                       # readb.s: idle read connections on this worker (atomic)
-.equ W_RWAKE, 936                       # readb.s: wake pending (atomic xchg)
+.equ W_NDEAD, 944                       # pgio.s: this worker's Postgres connections that are down
+.equ W_RETRY, 952                       # pgio.s: monotonic ms before which no reconnect is tried
+.equ W_RSIG, 960                        # readb.s: workers whose eventfd rb_signal writes (bit = W_ID, worker-local)
+.equ W_ACCOFF, 976                      # server.s: monotonic ms when accepting resumes after accept4 failed (0 = on)
+.equ W_KEEPN, 984                       # rt.s: blocks on the class 17..20 free lists (4 dwords, 984..999)
 .equ W_SIZE, 1024
 
 # ---------------------------------------------------------------- client connection (C_*), 128 B
@@ -176,9 +179,14 @@
 .equ J_WNEXT, 904                       # writer.s: pending / group link
 .equ J_WSEG, 912                        # writer.s: copied reply segment of a grouped write (block; cap at +0)
 .equ J_WSEGLEN, 920                     # its length (-1 conn died, -2 the statement failed)
-.equ J_RSEG, 928                        # readb.s: copied reply rows of a job read on another worker (block; cap at +0)
-.equ J_RSEGLEN, 936                     # its length (-1 conn died: retry on the owner)
-.equ J_RORD, 944                        # readb.s: ordinal / shared flag for the owner-side trampoline
+.equ J_RCONT, 928                       # readb.s, a job answered on another worker: its J_CONT while rb_remote holds it
+.equ J_RACT, 936                        # what rb_remote does (RA_*)
+.equ J_RA, 944                          # its argument: the reply / rows (in a block or the shared copy)
+.equ J_RCAP, 952                        # cap of the block J_RA to free (0 = none)
+.equ J_RB, 960                          # length / row count
+.equ J_RFN, 968                         # renderer (RA_RENDER)
+.equ J_RSH, 976                         # shared reply copy to drop (0 = none)
+.equ J_RW, 984                          # the worker that posted it (allocated J_RA)
 .equ J_INL, 1024                        # inline scratch (JOB_INLINE_SCR bytes)
 .equ J_SIZE, 2048
 

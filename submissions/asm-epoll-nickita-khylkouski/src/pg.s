@@ -15,6 +15,7 @@
 .equ PG_ECONNRESET, 104
 .equ MSG_NOSIGNAL, 0x4000
 .equ MSG_MORE, 0x8000
+.equ PG_IO_TIMEOUT, 5
 
 # blocking reader state (internal)
 .equ RD_FD, 0
@@ -601,6 +602,24 @@ pg_connect:
     test rax, rax
     js .Lpc_ret
     mov r12, rax
+    # the handshake and the prepares block: give up after PG_IO_TIMEOUT s rather than hang a worker (the send
+    # timeout also bounds connect)
+    mov qword ptr [rsp + CF_SA], PG_IO_TIMEOUT    # timeval {sec, usec}
+    mov qword ptr [rsp + CF_SA + 8], 0
+    mov rdi, r12
+    mov esi, SOL_SOCKET
+    mov edx, SO_RCVTIMEO
+    lea r10, [rsp + CF_SA]
+    mov r8d, 16
+    mov eax, SYS_setsockopt
+    syscall
+    mov rdi, r12
+    mov esi, SOL_SOCKET
+    mov edx, SO_SNDTIMEO
+    lea r10, [rsp + CF_SA]
+    mov r8d, 16
+    mov eax, SYS_setsockopt
+    syscall
     mov word ptr [rsp + CF_SA], AF_INET
     mov eax, [rbx + PGC_PORT]
     xchg al, ah
@@ -1044,6 +1063,7 @@ pg_connect:
     inc rax
     jmp 1b
 2:  ret
+    .skip 48, 0xcc                     # padding: keeps the code after this at its previous 64-byte alignment
 
 # ================================================================ pg_exec_simple(fd, sql, len) -> 0 | -1
 .globl pg_exec_simple

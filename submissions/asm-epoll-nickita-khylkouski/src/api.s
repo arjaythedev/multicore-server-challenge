@@ -655,25 +655,33 @@ optional:
     ret
 
 # ================================================================ Postgres handoff
-# db_read(job): put the job on the read connection with the fewest queued ops.
+# db_read(job): put the job on the live read connection with the fewest queued ops (the first one if all are
+# down: the enqueue then fails the job at once).
 .globl db_read
 db_read:
     push r12
     push r13
     sub rsp, 8
     mov r12, rdi
-    mov r13, [r15 + W_RDS]
-    mov r8d, 1
+    xor r13d, r13d
+    xor r8d, r8d
 1:  cmp r8, [r15 + W_NRD]
     jae 2f
     mov rcx, [r15 + W_RDS + r8*8]
+    inc r8
+    test qword ptr [rcx + PC_FLAGS], PCF_DEAD
+    jnz 1b
+    test r13, r13
+    jz 3f
     mov rax, [rcx + PC_NQ]
     cmp rax, [r13 + PC_NQ]
-    jae 3f
-    mov r13, rcx
-3:  inc r8
+    jae 1b
+3:  mov r13, rcx
     jmp 1b
-2:  mov rdi, r13
+2:  test r13, r13
+    jnz 4f
+    mov r13, [r15 + W_RDS]
+4:  mov rdi, r13
     mov rsi, r12
     call pgio_put_job
     mov rdi, r13
@@ -683,6 +691,7 @@ db_read:
     pop r13
     pop r12
     ret
+    .skip 44, 0xcc                     # padding: keeps the code after this at its previous 64-byte alignment
 
 # db_write(job) lives in writer.s (group commit).
 

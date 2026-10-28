@@ -10,6 +10,7 @@
 DEFSTR .Lmsg_connect, "[db] connect failed, retrying: "
 DEFSTR .Lmsg_nodb, "fatal: could not connect to Postgres\n"
 DEFSTR .Lmsg_lost, "[db] connection lost\n"
+DEFSTR .Lmsg_back, "[db] reconnected\n"
 DEFSTR .Lmsg_pgerr, "[db] error: "
 DEFSTR .Lmsg_nl, "\n"
 
@@ -129,10 +130,19 @@ pgio_event:
     jnz 1f
     mov rdi, rbx
     call pgio_read
+    # Postgres closed the connection (a terminated backend): pgio_read stops at the short read before the
+    # EOF, and an idle connection gets no further event, so it is down now
+    test r12d, EPOLLERR | EPOLLHUP | EPOLLRDHUP
+    jz 1f
+    test qword ptr [rbx + PC_FLAGS], PCF_DEAD
+    jnz 1f
+    mov rdi, rbx
+    call pgio_dead
 1:  add rsp, 8
     pop r12
     pop rbx
     ret
+    .skip 37, 0xcc                     # padding: keeps the code after this at its previous 64-byte alignment
 
 # pgio_read(pc): read everything available and dispatch complete replies.
 pgio_read:
@@ -170,7 +180,9 @@ pgio_read:
     mov rdx, [rbx + PC_INCAP]
     sub rdx, [rbx + PC_INLEN]
     mov r12, rdx                         # requested
-    SYS SYS_read
+    xor r10d, r10d                       # recvfrom: no VFS layer, unlike read()
+    xor r8d, r8d
+    SYS SYS_recvfrom
     test rax, rax
     jg .Lpr_got
     cmp rax, -EINTR
@@ -200,6 +212,7 @@ pgio_read:
     pop r12
     pop rbx
     ret
+    .skip 58, 0xcc                     # padding: keeps the code after this at its previous 64-byte alignment
 
 # pgio_compact(pc): move the unprocessed input to the start of the buffer.
 pgio_compact:
@@ -255,7 +268,16 @@ pgio_dispatch:
     jnz 1f
     mov qword ptr [rbx + PC_QTAIL], 0
 1:  dec qword ptr [rbx + PC_NQ]
-    mov rdi, r12
+    jnz 2f
+    cmp qword ptr [rbx + PC_KIND], 0
+    jne 2f
+    push rsi                             # a read connection just went idle: give it its next take and send it
+    push rdx                             # now, so Postgres runs it while this reply is rendered
+    call readb_service
+    call pgio_flush_dirty
+    pop rdx
+    pop rsi
+2:  mov rdi, r12
     call [r12 + OP_CONT]
     jmp .Lpd_loop
 .Lpd_ret:
@@ -274,6 +296,7 @@ pgio_dead:
     test qword ptr [rbx + PC_FLAGS], PCF_DEAD
     jnz .Lpx_fail
     or qword ptr [rbx + PC_FLAGS], PCF_DEAD
+    inc qword ptr [r15 + W_NDEAD]        # the event loop reconnects it (pgio_revive_due)
     mov edi, [rbx + PC_FD]
     SYS SYS_close
     lea rdi, [rip + .Lmsg_lost]
@@ -293,10 +316,13 @@ pgio_dead:
     jmp .Lpx_fail
 .Lpx_ret:
     mov qword ptr [rbx + PC_QTAIL], 0
+    mov qword ptr [rbx + PC_OUT + PGB_LEN], 0    # output for failed ops is never sent
+    mov qword ptr [rbx + PC_OUTSENT], 0
     add rsp, 8
     pop r12
     pop rbx
     ret
+    .skip 41, 0xcc                     # padding: keeps the code after this at its previous 64-byte alignment
 
 # pgio_reserve(pc, n): make sure the output buffer has n free bytes.
 .globl pgio_reserve
@@ -357,7 +383,9 @@ pgio_flush:
     mov edi, [rbx + PC_FD]
     mov rsi, [rbx + PC_OUT + PGB_PTR]
     add rsi, [rbx + PC_OUTSENT]
-    SYS SYS_write
+    xor r10d, r10d                       # sendto: no VFS layer, unlike write()
+    xor r8d, r8d
+    SYS SYS_sendto
     test rax, rax
     jle .Lpf_err
     add [rbx + PC_OUTSENT], rax
@@ -377,6 +405,7 @@ pgio_flush:
 .Lpf_ret:
     pop rbx
     ret
+    .skip 58, 0xcc                     # padding: keeps the code after this at its previous 64-byte alignment
 
 # pgio_flush_dirty(): flush every connection that got output this iteration.
 .globl pgio_flush_dirty
@@ -641,5 +670,106 @@ seg_log_error:
 1:  add rsp, 32
     pop rbx
     ret
+
+# pgio_revive(pc) -> rax = 0, or < 0 if Postgres is still unreachable: reconnect a dead connection in place (the
+# same struct, so W_RDS / W_WR stay valid). Its FIFO is empty: pgio_dead failed every op.
+pgio_revive:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi
+    lea rdi, [rip + g_pgcfg]
+    call pg_connect
+    test rax, rax
+    js .Lpv_ret
+    mov r12d, eax
+    mov edi, r12d
+    call sql_prepare_all
+    test rax, rax
+    js .Lpv_close
+    cmp qword ptr [rbx + PC_KIND], 0
+    jne 1f
+    mov edi, r12d
+    call readb_prepare
+    test rax, rax
+    js .Lpv_close
+1:  mov edi, r12d
+    mov esi, F_GETFL
+    SYS SYS_fcntl
+    mov edx, eax
+    or edx, O_NONBLOCK
+    mov edi, r12d
+    mov esi, F_SETFL
+    SYS SYS_fcntl
+    xor eax, eax
+    mov [rbx + PC_OUT + PGB_LEN], rax
+    mov [rbx + PC_OUTSENT], rax
+    mov [rbx + PC_INLEN], rax
+    mov [rbx + PC_INPOS], rax
+    mov [rbx + PC_SCAN], rax
+    sub rsp, 16
+    mov dword ptr [rsp], EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET
+    mov [rsp + 4], rbx
+    mov rdi, [r15 + W_EPFD]
+    mov esi, EPOLL_CTL_ADD
+    mov edx, r12d
+    mov r10, rsp
+    SYS SYS_epoll_ctl
+    add rsp, 16
+    test rax, rax
+    js .Lpv_close                        # not watched, so its replies would never be read: stay dead
+    mov [rbx + PC_FD], r12d
+    and qword ptr [rbx + PC_FLAGS], ~PCF_DEAD
+    lea rdi, [rip + .Lmsg_back]
+    mov esi, .Lmsg_back_len
+    call rt_log
+    xor eax, eax
+    jmp .Lpv_ret
+.Lpv_close:
+    mov r13, rax
+    mov edi, r12d
+    SYS SYS_close
+    mov rax, r13
+.Lpv_ret:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+# pgio_revive_due(): called by the event loop while W_NDEAD > 0. At most every 500 ms, reconnect the dead
+# connections (write conn first); stop at the first failure and try again next time.
+.globl pgio_revive_due
+pgio_revive_due:
+    push rbx
+    push r12
+    sub rsp, 8
+    call rt_mono_ms
+    cmp rax, [r15 + W_RETRY]
+    jl .Lrv_ret
+    add rax, 500
+    mov [r15 + W_RETRY], rax
+    mov r12, -1                          # -1 = the write conn, then read conns 0..W_NRD-1
+.Lrv_next:
+    mov rdi, [r15 + W_WR]
+    test r12, r12
+    js 1f
+    cmp r12, [r15 + W_NRD]
+    jae .Lrv_ret
+    mov rdi, [r15 + W_RDS + r12*8]
+1:  inc r12
+    test qword ptr [rdi + PC_FLAGS], PCF_DEAD
+    jz .Lrv_next
+    call pgio_revive
+    test rax, rax
+    js .Lrv_ret
+    dec qword ptr [r15 + W_NDEAD]
+    jmp .Lrv_next
+.Lrv_ret:
+    add rsp, 8
+    pop r12
+    pop rbx
+    ret
+
+    .skip 48, 0xcc                     # padding: keeps the code after this at its previous 64-byte alignment
 
 .section .note.GNU-stack,"",@progbits

@@ -1,9 +1,10 @@
 # readb.s: the read scheduler, a port of the Rust read_batch.rs / sched.rs read path (default flags: packed
 # lists, shared article/comment sets, tag broadcast).
 #
-# Every read job joins its family's FIFO (12 families = RK_*, one per read statement). Whenever a read connection
-# has nothing in flight, it takes the family whose head is the oldest and up to RB_CAP (512) of its jobs, as
-# Rust's scheduler does with READ_BATCH_US=0 (flush whatever has arrived):
+# Every read job joins its family's FIFO (12 families = RK_*, one per read statement). The FIFOs are process-wide
+# (one spinlock), as Rust's one scheduler over all read conns: whenever a read connection of any worker has
+# nothing in flight, it takes the family whose head is the oldest and up to RB_CAP (512) of its jobs, as Rust's
+# scheduler does with READ_BATCH_US=0 (flush whatever has arrived):
 #   n == 1          the job's own statement (pgio_put_job), answered by its own continuation.
 #   tags, n > 1     one execution of the tag statement; the reply goes to every job.
 #   otherwise       one Bind of the batched statement: param p of every job, in order, becomes element i of
@@ -14,14 +15,70 @@
 # row (or no row); packed lists / article / comments are rendered by readr.s. An ErrorResponse or a reply of an
 # unexpected shape re-runs every job of the batch on its own (db_read), as Rust retries them individually.
 #
+# A take can hold other workers' jobs. Their answers go back to the owner (J_WORKER) the way bcrypt results do:
+# the job is pushed on the owner's W_DONE with J_CONT = rb_remote, and rb_remote runs the job's continuation /
+# renderer / retry there, so client sockets, gzip and allocations stay with their worker. The reply bytes they
+# need are copied once per batch into a shared block (reference counted). A batch
+# answers its other workers' jobs first, writes each such worker's eventfd once (only if its W_DONE was empty),
+# then renders its own. A job is freed only by its owner after its answer (srv_respond), and a closed client
+# keeps its job (CF_DEAD), so a queued or remotely batched job stays valid until rb_remote has run.
+# Blocks go back to the free lists of the worker that allocated them: the shared copy (its last reference) and
+# the owner's block J_RA are pushed on that worker's rb_wk RW_FREE stack when freed elsewhere, and it frees them
+# (rb_reclaim) at its next readb_service. Freed into another worker's lists they would pile up there while the
+# allocating worker keeps carving new chunks.
+# A worker whose connections are all busy (or all down) while jobs wait wakes the workers that said they have an
+# idle one (rb_wk RW_IDLE); a worker with no live read connection takes nothing while another worker has one.
+#
 # readb_enqueue(job), readb_service() and readb_prepare(fd) are the hooks (api.s, server.s, pgio.s).
 .include "defs.inc"
 .include "app.inc"
 
 .equ RB_CAP, 512
-.equ RB_Q, W_BQ                         # 12 queues {head, tail, count, pad} (32 B each)
-.equ RB_SEQ, W_BQ + RK_COUNT * 32       # arrival counter (J_ORD while queued)
 .equ RB_NSTMT, 13                       # batched statements b00..b12
+
+# rb_remote actions (J_RACT)
+.equ RA_CONT, 0                         # cont(job, J_RA, J_RB)
+.equ RA_RENDER, 1                       # rb_render(J_RFN, J_RA, J_RB)
+.equ RA_READ, 2                         # db_read(job)
+.equ RA_404, 3
+.equ RA_500, 4
+
+.equ RB_SPINS, 256                      # lock spins before sched_yield
+
+# queue {head, tail, count, key}: key = ~J_ORD of the head (0 = empty), so the oldest head has the largest key
+.equ Q_HEAD, 0
+.equ Q_TAIL, 8
+.equ Q_COUNT, 16
+.equ Q_KEY, 24
+
+# per-worker wake flags, one cache line each (rb_wk + W_ID * 64)
+.equ RW_IDLE, 0                         # 1: this worker has an idle read connection and saw nothing queued
+.equ RW_WAKE, 8                         # 1: its eventfd was written for that (xchg)
+.equ RW_FREE, 16                        # blocks of this worker's freed on others: {next, cap} (rb_free_to)
+
+.bss
+.align 64
+rb_lock: .quad 0
+rb_seq: .quad 0                         # arrival counter (J_ORD while queued)
+rb_count: .quad 0                       # queued jobs, all families (also read without the lock, as a hint)
+.align 64
+rb_q: .zero RK_COUNT * 32               # 12 queues
+.align 64
+rb_wk: .zero MAX_WORKERS * 64
+
+# RB_LOCK / RB_UNLOCK: the queue spinlock. Clobbers eax and the flags. Nothing that can block or allocate runs
+# while it is held.
+.macro RB_LOCK
+    mov eax, 1
+    xchg eax, [rip + rb_lock]
+    test eax, eax
+    jz .Llkd\@
+    call rb_lock_wait
+.Llkd\@:
+.endm
+.macro RB_UNLOCK
+    mov dword ptr [rip + rb_lock], 0
+.endm
 
 # batch op (rt_alloc'd, 64 B): OP_NEXT/OP_CONT, then
 .equ BO_FIRST, 16                       # first job (J_BNEXT chain, in ordinal order)
@@ -59,7 +116,9 @@
 .equ RD_TMP, 152
 .equ RD_COLS, 160
 .equ RD_NCOLS, 20
-.equ RD_SIZE, RD_COLS + RD_NCOLS * 16   # 480
+.equ RD_SH, RD_COLS + RD_NCOLS * 16     # shared copy of the reply for other workers' jobs (0 = none yet)
+.equ RD_PASS, RD_SH + 8                 # pass 3: 0 = other workers' jobs, 1 = this worker's
+.equ RD_SIZE, RD_PASS + 8               # 496
 
 .section .rodata
 # per family: batched stmt, its kind, shared stmt (0xff none), its kind, text-param mask (bit p: param p is text)
@@ -77,6 +136,9 @@ rb_fam:
     .byte 11, K_COM, 12, K_PCOM, 2, 0, 0, 0        # RK_COMMENTS
 # columns per row of each packed kind (0 = not checked here)
 rb_kind_cols: .byte 0, 0, 19, 16, 12, 10
+.align 8
+rb_one: .quad 1                         # eventfd increment
+rb_none: .quad 0                        # the segment of an empty reply handed to another worker
 .align 4
 rb_names:
     .irp i, 00,01,02,03,04,05,06,07,08,09,10,11,12
@@ -139,26 +201,35 @@ readb_enqueue:
     cmp rax, RK_COUNT
     jae db_read
     mov [rdi + J_FAM], rax
-    mov rcx, [r15 + RB_SEQ]
-    inc rcx
-    mov [r15 + RB_SEQ], rcx
-    mov [rdi + J_ORD], rcx
+    mov [rdi + J_WORKER], r15
     mov qword ptr [rdi + J_BNEXT], 0
     shl rax, 5
-    lea rdx, [r15 + RB_Q + rax]
-    mov rcx, [rdx + 8]
-    test rcx, rcx
+    lea rdx, [rip + rb_q]
+    add rdx, rax
+    RB_LOCK
+    mov rcx, [rip + rb_seq]
+    inc rcx
+    mov [rip + rb_seq], rcx
+    mov [rdi + J_ORD], rcx
+    mov rax, [rdx + Q_TAIL]
+    test rax, rax
     jz 1f
-    mov [rcx + J_BNEXT], rdi
+    mov [rax + J_BNEXT], rdi
     jmp 2f
-1:  mov [rdx], rdi
-2:  mov [rdx + 8], rdi
-    inc qword ptr [rdx + 16]
+1:  mov [rdx + Q_HEAD], rdi
+    not rcx
+    mov [rdx + Q_KEY], rcx
+2:  mov [rdx + Q_TAIL], rdi
+    inc qword ptr [rdx + Q_COUNT]
+    inc qword ptr [rip + rb_count]
+    RB_UNLOCK
     ret
 
-# readb_service(): while some family has queued jobs and some read connection is idle (nothing in flight),
-# give the oldest family's next take to that connection. If every read connection is dead, the takes go to the
-# first one, where they fail at once (500).
+# readb_service(): while some family has queued jobs and some read connection of this worker is idle (nothing
+# in flight), give the oldest family's next take to that connection. If jobs still wait once every connection
+# is busy, wake the workers with an idle one. A worker whose read connections are all down leaves the jobs to
+# the others; only when no worker has a live one do its takes go to its first connection, where they fail at
+# once (500).
 .globl readb_service
 readb_service:
     push rbx
@@ -166,28 +237,20 @@ readb_service:
     push r13
     push r14
     push rbp
+    mov rbp, [r15 + W_ID]
+    shl rbp, 6
+    lea rax, [rip + rb_wk]
+    add rbp, rax                        # this worker's wake flags
+    cmp qword ptr [rbp + RW_FREE], 0
+    je 1f
+    mov rdi, rbp
+    call rb_reclaim
+1:  cmp qword ptr [rbp + RW_WAKE], 0
+    je .Lsv_loop
+    mov qword ptr [rbp + RW_WAKE], 0
 .Lsv_loop:
-    xor r12d, r12d                      # queue of the oldest head
-    mov r14, -1
-    xor ecx, ecx
-1:  mov rax, rcx
-    shl rax, 5
-    mov rdx, [r15 + RB_Q + rax]
-    test rdx, rdx
-    jz 2f
-    mov rdx, [rdx + J_ORD]
-    cmp rdx, r14
-    jae 2f
-    mov r14, rdx
-    lea r12, [r15 + RB_Q + rax]
-    mov r13, rcx                        # family
-2:  inc ecx
-    cmp ecx, RK_COUNT
-    jb 1b
-    test r12, r12
-    jz .Lsv_ret
     xor ebx, ebx                        # idle connection
-    xor ebp, ebp                        # 1 if any connection is alive
+    xor edx, edx                        # 1 if any connection is alive
     xor ecx, ecx
 3:  cmp rcx, [r15 + W_NRD]
     jae 4f
@@ -195,47 +258,184 @@ readb_service:
     inc rcx
     test qword ptr [rax + PC_FLAGS], PCF_DEAD
     jnz 3b
-    mov ebp, 1
+    mov edx, 1
     cmp qword ptr [rax + PC_NQ], 0
     jne 3b
     mov rbx, rax
 4:  test rbx, rbx
-    jnz 5f
-    test ebp, ebp
-    jnz .Lsv_ret                        # all busy
+    jnz .Lsv_idle
+    test edx, edx
+    jnz .Lsv_busy
+    cmp qword ptr [rip + rb_count], 0   # every connection is down
+    je .Lsv_ret
+    call rb_any_live
+    test eax, eax
+    jnz .Lsv_busy                       # another worker can run them
     mov rbx, [r15 + W_RDS]
-5:  mov rdi, [r12]                      # take min(count, RB_CAP) from the head
-    mov rcx, [r12 + 16]
-    mov edx, RB_CAP
-    cmp rcx, rdx
-    cmova rcx, rdx
-    sub [r12 + 16], rcx
-    mov r14, rcx
-    mov rsi, rdi
-    lea rax, [rcx - 1]
-6:  test rax, rax
-    jz 7f
-    mov rsi, [rsi + J_BNEXT]
-    dec rax
-    jmp 6b
-7:  mov rax, [rsi + J_BNEXT]
-    mov [r12], rax
+    jmp .Lsv_take
+.Lsv_idle:
+    cmp qword ptr [rip + rb_count], 0
+    jne .Lsv_take
+    # nothing queued: say so, then look again (a worker with jobs waiting reads RW_IDLE after queueing them)
+    mov qword ptr [rbp + RW_IDLE], 1
+    mfence
+    cmp qword ptr [rip + rb_count], 0
+    je .Lsv_ret
+.Lsv_take:
+    RB_LOCK
+    xor r12d, r12d                      # queue of the oldest head (the largest key)
+    xor r14d, r14d
+    xor ecx, ecx
+    lea r8, [rip + rb_q]
+1:  mov rax, rcx
+    shl rax, 5
+    mov rdx, [r8 + rax + Q_KEY]
+    cmp rdx, r14
+    jbe 2f
+    mov r14, rdx
+    lea r12, [r8 + rax]
+    mov r13, rcx                        # family
+2:  inc ecx
+    cmp ecx, RK_COUNT
+    jb 1b
+    test r12, r12
+    jnz 5f
+    RB_UNLOCK                           # emptied by another worker
+    jmp .Lsv_loop
+5:  mov rdi, [r12 + Q_HEAD]             # detach the whole queue
+    mov rsi, [r12 + Q_TAIL]
+    mov r14, [r12 + Q_COUNT]
+    xor eax, eax
+    mov [r12 + Q_HEAD], rax
+    mov [r12 + Q_TAIL], rax
+    mov [r12 + Q_COUNT], rax
+    mov [r12 + Q_KEY], rax
+    sub [rip + rb_count], r14
+    RB_UNLOCK
+    cmp qword ptr [rbp + RW_IDLE], 0
+    je 6f
+    mov qword ptr [rbp + RW_IDLE], 0
+6:  cmp r14, RB_CAP
+    jbe 8f
+    # more than RB_CAP: cut after RB_CAP jobs (outside the lock), then put the rest back in front: it is older
+    # than anything queued meanwhile
+    mov rax, rdi
+    mov ecx, RB_CAP - 1
+7:  mov rax, [rax + J_BNEXT]
+    dec ecx
+    jnz 7b
+    mov rdx, [rax + J_BNEXT]            # the rest: rdx .. rsi
+    mov qword ptr [rax + J_BNEXT], 0
+    mov r8, [rdx + J_ORD]
+    not r8
+    sub r14, RB_CAP
+    RB_LOCK
+    mov rax, [r12 + Q_HEAD]
+    mov [rsi + J_BNEXT], rax
+    mov [r12 + Q_HEAD], rdx
     test rax, rax
-    jnz 8f
-    mov qword ptr [r12 + 8], 0
-8:  mov qword ptr [rsi + J_BNEXT], 0
-    mov rdx, rdi
+    jnz 9f
+    mov [r12 + Q_TAIL], rsi
+9:  mov [r12 + Q_KEY], r8
+    add [r12 + Q_COUNT], r14
+    add [rip + rb_count], r14
+    RB_UNLOCK
+    mov r14d, RB_CAP
+8:  mov rdx, rdi
     mov rdi, rbx
     mov rsi, r13
     mov rcx, r14
     call rb_issue
     jmp .Lsv_loop
+.Lsv_busy:
+    cmp qword ptr [rbp + RW_IDLE], 0
+    je 1f
+    mov qword ptr [rbp + RW_IDLE], 0
+1:  cmp qword ptr [rip + rb_count], 0
+    je .Lsv_ret
+    mfence                              # pairs with the idle worker's RW_IDLE store + mfence
+    xor r12d, r12d
+2:  cmp r12, [rip + g_nworkers]
+    jae .Lsv_ret
+    lea rax, [rip + g_workers]
+    mov r13, [rax + r12*8]
+    mov r14, r12
+    inc r12
+    test r13, r13
+    jz 2b
+    cmp r13, r15
+    je 2b
+    shl r14, 6
+    lea rax, [rip + rb_wk]
+    add r14, rax
+    cmp qword ptr [r14 + RW_IDLE], 0
+    je 2b
+    cmp qword ptr [r14 + RW_WAKE], 0
+    jne 2b                              # already woken
+    mov eax, 1
+    xchg rax, [r14 + RW_WAKE]
+    test rax, rax
+    jnz 2b
+    mov rdi, [r13 + W_EVFD]
+    lea rsi, [rip + rb_one]
+    mov edx, 8
+    SYS SYS_write
+    jmp 2b
 .Lsv_ret:
     pop rbp
     pop r14
     pop r13
     pop r12
     pop rbx
+    ret
+
+# rb_lock_wait(): RB_LOCK's slow path. Spins (pause) while the lock is held; after RB_SPINS rounds it yields the
+# CPU, since the holder may have been preempted. Returns holding the lock. Clobbers eax and the flags only.
+rb_lock_wait:
+    push rcx
+    push rdx
+    push r11
+    mov edx, RB_SPINS
+1:  pause
+    cmp dword ptr [rip + rb_lock], 0
+    je 2f
+    dec edx
+    jnz 1b
+    SYS SYS_sched_yield
+    mov edx, RB_SPINS
+    jmp 1b
+2:  mov eax, 1
+    xchg eax, [rip + rb_lock]
+    test eax, eax
+    jnz 1b
+    pop r11
+    pop rdx
+    pop rcx
+    ret
+
+# rb_any_live() -> eax = 1 if another worker has a live read connection (read without its owner's ordering: a
+# hint). Leaf: clobbers rax, rcx, rdx, r8.
+rb_any_live:
+    xor ecx, ecx
+1:  cmp rcx, [rip + g_nworkers]
+    jae 3f
+    lea rax, [rip + g_workers]
+    mov r8, [rax + rcx*8]
+    inc rcx
+    test r8, r8
+    jz 1b
+    cmp r8, r15
+    je 1b
+    xor edx, edx
+2:  cmp rdx, [r8 + W_NRD]
+    jae 1b
+    mov rax, [r8 + W_RDS + rdx*8]
+    inc rdx
+    test qword ptr [rax + PC_FLAGS], PCF_DEAD
+    jnz 2b
+    mov eax, 1
+    ret
+3:  xor eax, eax
     ret
 
 # rb_issue(pc, family, first, n): write one take to the connection and queue its op.
@@ -257,8 +457,16 @@ rb_issue:
     mov rdi, rbx
     mov rsi, r13
     call pgio_put_job
-    mov rdi, rbx
     mov rsi, r13
+    cmp [r13 + J_WORKER], r15
+    je 1f
+    mov edi, BO_SIZE                    # another worker's job: its reply goes through rb_one_done
+    call rt_alloc
+    lea rcx, [rip + rb_one_done]
+    mov [rax + OP_CONT], rcx
+    mov [rax + BO_FIRST], r13
+    mov rsi, rax
+1:  mov rdi, rbx
     call pgio_enqueue
     jmp .Lis_ret
 .Lis_batch:
@@ -558,6 +766,18 @@ rb_hslot:
 .Lkd_e\@:
 .endm
 
+# RENDER: rb_render(fn, rows, n) for the job in rbx inside readb_done's pass 3 (pass 0: another worker's job).
+.macro RENDER
+    cmp qword ptr [rsp + RD_PASS], 0
+    jne .Lrl\@
+    mov rcx, rsp
+    call rb_far_render
+    jmp .Lre\@
+.Lrl\@:
+    call rb_render
+.Lre\@:
+.endm
+
 # readb_done(op, seg, len): a batch's reply.
 .globl readb_done
 readb_done:
@@ -569,6 +789,7 @@ readb_done:
     sub rsp, RD_SIZE
     mov [rsp + RD_SEG], rsi
     mov [rsp + RD_SEGLEN], rdx
+    mov qword ptr [rsp + RD_SH], 0
     mov rax, [rdi + BO_FIRST]
     mov [rsp + RD_FIRST], rax
     mov r13, [rdi + BO_N]
@@ -635,11 +856,15 @@ readb_done:
     shr rcx, 3
     xor eax, eax
     rep stosq
-    mov rax, [rsp + RD_SCR]             # jobs[]
+    mov rax, [rsp + RD_SCR]             # jobs[], bit 0 set for this worker's (none is answered yet)
     mov rcx, [rsp + RD_FIRST]
 3:  test rcx, rcx
     jz 4f
-    mov [rax], rcx
+    xor edx, edx
+    cmp [rcx + J_WORKER], r15
+    sete dl
+    or rdx, rcx
+    mov [rax], rdx
     add rax, 8
     mov rcx, [rcx + J_BNEXT]
     jmp 3b
@@ -883,15 +1108,23 @@ readb_done:
     jmp .Ld_isort_g
 
 # ---------------------------------------------------------------- pass 3: answer every job, in order
+# (other workers' jobs first, so their workers can start on them while this one renders its own)
 .Ld_render:
+    mov qword ptr [rsp + RD_PASS], 0
+.Ld_rpass:
     mov qword ptr [rsp + RD_I], 0
 .Ld_rn:
     mov rax, [rsp + RD_I]
     cmp rax, r13
-    jae .Ld_free
+    jae .Ld_rnext
     inc qword ptr [rsp + RD_I]
     mov rcx, [rsp + RD_SCR]
-    mov rbx, [rcx + rax*8]              # the job
+    mov rbx, [rcx + rax*8]              # the job | this worker's
+    mov rdx, rbx
+    and edx, 1
+    cmp rdx, [rsp + RD_PASS]
+    jne .Ld_rn
+    and rbx, -2
     mov rcx, [rsp + RD_HDR]
     mov r12, [rcx + rax*8]              # its header / row (0 = none)
     cmp r14, K_ROWS
@@ -911,7 +1144,7 @@ readb_done:
     lea rdi, [rip + readr_comments]
     mov rsi, [rsp + RD_ROWS]
     mov rdx, rax
-    call rb_render
+    RENDER
     jmp .Ld_rn
 .Ld_a_rows:
     mov rsi, r12
@@ -924,7 +1157,12 @@ readb_done:
 1:  mov rsi, [rsp + RD_SEG]
     xor edx, edx
 2:  mov rdi, rbx
-    call [rbx + J_CONT]
+    cmp qword ptr [rsp + RD_PASS], 0
+    jne 3f
+    mov rcx, rsp
+    call rb_far_cont
+    jmp .Ld_rn
+3:  call [rdi + J_CONT]
     jmp .Ld_rn
 .Ld_a_list:
     mov rdi, r12
@@ -933,7 +1171,7 @@ readb_done:
     lea rdi, [rip + readr_list]
     mov rsi, [rsp + RD_ROWS]
     mov rdx, rax
-    call rb_render
+    RENDER
     jmp .Ld_rn
 .Ld_a_part:
     test r12, r12
@@ -952,7 +1190,7 @@ readb_done:
     lea rdi, [rip + readr_article]
     mov rsi, rcx
     mov edx, 2
-    call rb_render
+    RENDER
     jmp .Ld_rn
 .Ld_a_pcom:
     mov rdi, r12
@@ -977,21 +1215,32 @@ readb_done:
     lea rdi, [rip + readr_comments]
     mov rsi, [rsp + RD_ROWS]
     mov rdx, rax
-    call rb_render
+    RENDER
     jmp .Ld_rn
 .Ld_a_404:
-    call api_404
+    call rb_404
     jmp .Ld_rn
 .Ld_a_500:
-    call api_500
+    call rb_500
     jmp .Ld_rn
 
+.Ld_rnext:
+    cmp qword ptr [rsp + RD_PASS], 0
+    jne .Ld_free
+    call rb_signal                      # the other workers' answers are posted
+    mov qword ptr [rsp + RD_PASS], 1
+    jmp .Ld_rpass
 .Ld_free:
     mov rdi, [rsp + RD_SCR]
     mov rsi, [rsp + RD_SCRCAP]
     call rt_free
 .Ld_ret:
-    add rsp, RD_SIZE
+    call rb_signal
+    mov rdi, [rsp + RD_SH]              # readb_done's reference to the shared copy
+    test rdi, rdi
+    jz 1f
+    call rb_drop
+1:  add rsp, RD_SIZE
     pop rbp
     pop r14
     pop r13
@@ -999,10 +1248,36 @@ readb_done:
     pop rbx
     ret
 
-# a dead connection (cont(job, 0, -1)) or a tag broadcast (cont(job, seg, len)): every job gets the segment
+# a dead connection (cont(job, 0, -1)) or a tag broadcast (cont(job, seg, len)): every job gets the segment.
+# Other workers' jobs are posted first (each read before it is posted); this worker's are chained in r13.
 .Ld_each:
     mov rbx, [rsp + RD_FIRST]
+    xor r13d, r13d
+    xor r14d, r14d                      # tail of the chain
 1:  test rbx, rbx
+    jz 3f
+    mov r12, [rbx + J_BNEXT]
+    cmp [rbx + J_WORKER], r15
+    je 2f
+    mov rdi, rbx
+    mov rsi, [rsp + RD_SEG]
+    mov rdx, [rsp + RD_SEGLEN]
+    mov rcx, rsp
+    call rb_far_cont
+    mov rbx, r12
+    jmp 1b
+2:  mov qword ptr [rbx + J_BNEXT], 0
+    test r14, r14
+    jz 4f
+    mov [r14 + J_BNEXT], rbx
+    jmp 5f
+4:  mov r13, rbx
+5:  mov r14, rbx
+    mov rbx, r12
+    jmp 1b
+3:  call rb_signal
+    mov rbx, r13
+6:  test rbx, rbx
     jz .Ld_ret
     mov r12, [rbx + J_BNEXT]
     mov rdi, rbx
@@ -1010,7 +1285,7 @@ readb_done:
     mov rdx, [rsp + RD_SEGLEN]
     call [rbx + J_CONT]
     mov rbx, r12
-    jmp 1b
+    jmp 6b
 
 # the batch failed or its reply is not what the demux expects: run every job on its own
 .Ld_bad:
@@ -1023,7 +1298,7 @@ readb_done:
     jz .Ld_ret
     mov r12, [rbx + J_BNEXT]
     mov rdi, rbx
-    call db_read
+    call rb_read
     mov rbx, r12
     jmp 1b
 
@@ -1109,7 +1384,7 @@ readb_done:
     ret
 
 # rb_render(fn, rows, n): answer the job in rbx with fn(dst, rows, n) (a readr_* renderer): 200 with the body,
-# or 404 / 500 when fn returns 0 / -1.
+# or 404 / 500 when fn returns 0 / -1. Runs on the job's worker.
 rb_render:
     push r12
     push r13
@@ -1145,6 +1420,319 @@ rb_render:
 3:  pop r14
     pop r13
     pop r12
+    ret
+
+# ---------------------------------------------------------------- answers for other workers' jobs
+# rb_share(frame) -> rax = copy - reply, rdx = block: readb_done's shared copy of its reply, a block
+# {refs, cap, worker, 0, bytes}, made on first use with one reference (readb_done's own, dropped at its end).
+rb_share:
+    mov rdx, [rdi + RD_SH]
+    test rdx, rdx
+    jz 1f
+    lea rax, [rdx + 32]
+    sub rax, [rdi + RD_SEG]
+    ret
+1:  push rbx
+    mov rbx, rdi
+    mov rdi, [rbx + RD_SEGLEN]
+    add rdi, 32
+    call rt_alloc
+    mov qword ptr [rax], 1
+    mov [rax + 8], rdx
+    mov [rax + 16], r15
+    mov [rbx + RD_SH], rax
+    lea rdi, [rax + 32]
+    mov rsi, [rbx + RD_SEG]
+    mov rdx, [rbx + RD_SEGLEN]
+    call rt_memcpy
+    mov rdx, [rbx + RD_SH]
+    lea rax, [rdx + 32]
+    sub rax, [rbx + RD_SEG]
+    pop rbx
+    ret
+
+# rb_drop(block): drop a reference to a shared reply copy; the last one frees it (to the worker that made it).
+rb_drop:
+    lock dec qword ptr [rdi]
+    jz 1f
+    ret
+1:  mov rsi, [rdi + 8]
+    mov rdx, [rdi + 16]
+    jmp rb_free_to
+
+# rb_free_to(ptr, cap, worker): rt_free(ptr, cap) for a block worker allocated: here if it is this worker,
+# else pushed on its RW_FREE stack ({next, cap} in the block) for rb_reclaim. Leaf.
+rb_free_to:
+    cmp rdx, r15
+    je rt_free
+    mov [rdi + 8], rsi
+    mov rdx, [rdx + W_ID]
+    shl rdx, 6
+    lea rax, [rip + rb_wk]
+    add rdx, rax
+    mov rax, [rdx + RW_FREE]
+1:  mov [rdi], rax
+    lock cmpxchg [rdx + RW_FREE], rdi
+    jnz 1b
+    ret
+
+# rb_reclaim(flags): free the blocks other workers returned on this worker's RW_FREE stack (flags = its rb_wk
+# line). Pushes only add, and the stack is taken whole, so there is no ABA.
+rb_reclaim:
+    push rbx
+    xor eax, eax
+    xchg rax, [rdi + RW_FREE]
+1:  test rax, rax
+    jz 2f
+    mov rbx, [rax]
+    mov rdi, rax
+    mov rsi, [rax + 8]
+    call rt_free
+    mov rax, rbx
+    jmp 1b
+2:  pop rbx
+    ret
+
+# rb_far_cont(job, ptr, len, frame): post cont(job, ptr, len) to the job's worker, ptr moved into the frame's
+# shared copy (len 0: rb_none; len -1, a dead connection: ptr as given, no bytes).
+rb_far_cont:
+    mov qword ptr [rdi + J_RCAP], 0
+    mov qword ptr [rdi + J_RSH], 0
+    mov [rdi + J_RB], rdx
+    test rdx, rdx
+    jg 1f
+    lea rax, [rip + rb_none]
+    cmovs rax, rsi
+    mov [rdi + J_RA], rax
+    jmp 2f
+1:  push rdi
+    push rsi
+    sub rsp, 8
+    mov rdi, rcx
+    call rb_share
+    add rsp, 8
+    pop rsi
+    pop rdi
+    add rsi, rax
+    mov [rdi + J_RA], rsi
+    lock inc qword ptr [rdx]
+    mov [rdi + J_RSH], rdx
+2:  mov esi, RA_CONT
+    jmp rb_post
+
+# rb_far_render(fn, rows, n, frame): post rb_render(fn, rows', n) to the worker of the job in rbx; rows' (an
+# rt_alloc'd array the owner frees) are the rows moved into the frame's shared copy.
+rb_far_render:
+    push r12
+    push r13
+    push r14
+    mov [rbx + J_RFN], rdi
+    mov [rbx + J_RB], rdx
+    mov r12, rsi
+    mov r13, rdx
+    mov rdi, rcx
+    call rb_share
+    lock inc qword ptr [rdx]
+    mov [rbx + J_RSH], rdx
+    mov r14, rax
+    lea rdi, [r13*8]
+    call rt_alloc
+    mov [rbx + J_RA], rax
+    mov [rbx + J_RCAP], rdx
+    xor ecx, ecx
+1:  cmp rcx, r13
+    jae 2f
+    mov rdx, [r12 + rcx*8]
+    add rdx, r14
+    mov [rax + rcx*8], rdx
+    inc rcx
+    jmp 1b
+2:  mov rdi, rbx
+    mov esi, RA_RENDER
+    call rb_post
+    pop r14
+    pop r13
+    pop r12
+    ret
+
+# rb_cont(job, seg, len): cont(job, seg, len) on the job's worker, for rb_one_done: another worker's job gets
+# its own copy of the segment (an empty one: rb_none; a dead connection, len -1: seg as given).
+rb_cont:
+    cmp [rdi + J_WORKER], r15
+    jne 1f
+    jmp [rdi + J_CONT]
+1:  push rbx
+    mov rbx, rdi
+    mov [rbx + J_RA], rsi
+    mov qword ptr [rbx + J_RCAP], 0
+    mov qword ptr [rbx + J_RSH], 0
+    mov [rbx + J_RB], rdx
+    test rdx, rdx
+    js 3f
+    jnz 2f
+    lea rax, [rip + rb_none]
+    mov [rbx + J_RA], rax
+    jmp 3f
+2:  push rsi
+    push rdx
+    mov rdi, rdx
+    call rt_alloc
+    mov [rbx + J_RA], rax
+    mov [rbx + J_RCAP], rdx
+    pop rcx
+    pop rsi
+    mov rdi, rax
+    rep movsb
+3:  mov rdi, rbx
+    mov esi, RA_CONT
+    call rb_post
+    pop rbx
+    ret
+
+# rb_read(job): db_read(job) on the job's worker (the retry of a failed take).
+rb_read:
+    cmp [rdi + J_WORKER], r15
+    je db_read
+    mov qword ptr [rdi + J_RCAP], 0
+    mov qword ptr [rdi + J_RSH], 0
+    mov esi, RA_READ
+    jmp rb_post
+
+# rb_404 / rb_500: api_404 / api_500 for the job in rbx, on its worker.
+rb_404:
+    cmp [rbx + J_WORKER], r15
+    je api_404
+    mov esi, RA_404
+    jmp 1f
+rb_500:
+    cmp [rbx + J_WORKER], r15
+    je api_500
+    mov esi, RA_500
+1:  mov qword ptr [rbx + J_RCAP], 0
+    mov qword ptr [rbx + J_RSH], 0
+    mov rdi, rbx
+    jmp rb_post
+
+# rb_post(job, action): push the job on its worker's W_DONE with J_CONT = rb_remote. If the stack was empty,
+# rb_signal writes that worker's eventfd (otherwise whoever made it non-empty does). The job is not touched
+# after the push. Leaf.
+rb_post:
+    mov rax, [rdi + J_CONT]
+    mov [rdi + J_RCONT], rax
+    lea rax, [rip + rb_remote]
+    mov [rdi + J_CONT], rax
+    mov [rdi + J_RACT], rsi
+    mov [rdi + J_RW], r15
+    mov rdx, [rdi + J_WORKER]
+    mov rcx, [rdx + W_ID]
+    mov rax, [rdx + W_DONE]
+1:  mov [rdi + J_NEXT], rax
+    lock cmpxchg [rdx + W_DONE], rdi
+    jnz 1b
+    test rax, rax
+    jnz 2f
+    bts qword ptr [r15 + W_RSIG], rcx
+2:  ret
+
+# rb_signal(): write the eventfd of every worker rb_post asked to since the last call.
+rb_signal:
+    mov rax, [r15 + W_RSIG]
+    test rax, rax
+    jnz 1f
+    ret
+1:  push rbx
+    push r12
+    sub rsp, 8
+    mov qword ptr [r15 + W_RSIG], 0
+    mov rbx, rax
+2:  bsf r12, rbx
+    btr rbx, r12
+    lea rax, [rip + g_workers]
+    mov rax, [rax + r12*8]
+    mov rdi, [rax + W_EVFD]
+    lea rsi, [rip + rb_one]
+    mov edx, 8
+    SYS SYS_write
+    test rbx, rbx
+    jnz 2b
+    add rsp, 8
+    pop r12
+    pop rbx
+    ret
+
+# rb_one_done(op, seg, len): the reply of another worker's single job (rb_issue, n = 1).
+rb_one_done:
+    push rbx
+    push rsi
+    push rdx
+    mov rbx, [rdi + BO_FIRST]
+    mov esi, BO_SIZE
+    call rt_free
+    pop rdx
+    pop rsi
+    mov rdi, rbx
+    call rb_cont
+    call rb_signal
+    pop rbx
+    ret
+
+# rb_remote(job, 0, 0): srv_completions on the job's worker: restore J_CONT and do what rb_post was asked to,
+# then free the job's block (to the worker that posted it) and drop its shared copy (read first: the job may be
+# gone by then).
+rb_remote:
+    push rbx
+    push r12
+    push r13
+    push r14
+    sub rsp, 8
+    mov rbx, rdi
+    mov rax, [rbx + J_RCONT]
+    mov [rbx + J_CONT], rax
+    mov r12, [rbx + J_RA]
+    mov r13, [rbx + J_RCAP]
+    mov r14, [rbx + J_RSH]
+    mov rax, [rbx + J_RW]
+    mov [rsp], rax
+    mov rax, [rbx + J_RACT]
+    cmp eax, RA_CONT
+    jne 1f
+    mov rdi, rbx
+    mov rsi, r12
+    mov rdx, [rbx + J_RB]
+    call [rbx + J_CONT]
+    jmp 5f
+1:  cmp eax, RA_RENDER
+    jne 2f
+    mov rdi, [rbx + J_RFN]
+    mov rsi, r12
+    mov rdx, [rbx + J_RB]
+    call rb_render
+    jmp 5f
+2:  cmp eax, RA_READ
+    jne 3f
+    mov rdi, rbx
+    call db_read
+    jmp 5f
+3:  cmp eax, RA_404
+    jne 4f
+    call api_404
+    jmp 5f
+4:  call api_500
+5:  test r13, r13
+    jz 6f
+    mov rdi, r12
+    mov rsi, r13
+    mov rdx, [rsp]
+    call rb_free_to
+6:  test r14, r14
+    jz 7f
+    mov rdi, r14
+    call rb_drop
+7:  add rsp, 8
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 # ---------------------------------------------------------------- SQL (verbatim from Rust, see test/pg/batch)

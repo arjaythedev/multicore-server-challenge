@@ -300,16 +300,18 @@ rt_die:
 
 # ---------------------------------------------------------------- time
 
-# rt_now_sec() -> rax = unix seconds (CLOCK_REALTIME).
+# rt_now_sec() -> rax = unix seconds (CLOCK_REALTIME), from the vDSO (no syscall). Clobbers the caller-saved
+# registers.
 .globl rt_now_sec
 rt_now_sec:
     sub rsp, 24
     mov edi, CLOCK_REALTIME
     mov rsi, rsp
-    SYS SYS_clock_gettime
+    call egress_clock_gettime
     mov rax, [rsp]
     add rsp, 24
     ret
+    .skip 2, 0xcc                      # padding: keeps the code after this at its previous 64-byte alignment
 
 # rt_mono_ms() -> rax = CLOCK_MONOTONIC in milliseconds.
 .globl rt_mono_ms
@@ -348,9 +350,15 @@ rt_mmap:
 
 # Size classes: class k holds blocks of 2^k bytes (k >= 6). Free lists live in the worker (r15 + W_CLS + 8k);
 # a free block's first qword links to the next. Classes up to 64 KB are carved from 1 MB chunks; bigger
-# blocks are mapped one by one and unmapped when freed.
+# blocks are mapped one by one. Freed blocks up to 1 MB go back on their free list (a list response's output
+# buffer is 128 KB+, and a map + unmap + page faults per request is the cost otherwise), at most KEEP_MAX_BLOCKS
+# per class above 64 KB (counted in W_KEEPN) so a peak's blocks do not stay mapped forever; the rest, and
+# anything bigger, are unmapped.
 .equ CHUNK, 1048576
 .equ CARVE_MAX_CLASS, 16
+.equ KEEP_MAX_CLASS, 20
+.equ KEEP_MAX_BLOCKS, 64
+.equ KEEPN_BASE, W_KEEPN - 4 * (CARVE_MAX_CLASS + 1)   # W_KEEPN dword for class k is at KEEPN_BASE + 4k
 
 # rt_alloc(size) -> rax = block, rdx = its capacity (2^k >= size). Uses r15 (worker). Not zeroed.
 .globl rt_alloc
@@ -366,7 +374,10 @@ rt_alloc:
     jz .Lal_refill
     mov rdx, [rax]
     mov [r15 + W_CLS + rcx*8], rdx
-    mov edx, 1
+    cmp ecx, CARVE_MAX_CLASS
+    jbe 2f
+    dec dword ptr [r15 + KEEPN_BASE + rcx*4]
+2:  mov edx, 1
     shl rdx, cl
     ret
 .Lal_refill:
@@ -406,6 +417,7 @@ rt_alloc:
     pop r12
     pop rbx
     ret
+    .skip 51, 0xcc                     # padding: keeps the code after this at its previous 64-byte alignment
 
 # rt_free(ptr, cap): return a block from rt_alloc (cap = the capacity it returned). ptr 0 is ignored.
 .globl rt_free
@@ -414,13 +426,19 @@ rt_free:
     jz 2f
     bsr rcx, rsi
     cmp ecx, CARVE_MAX_CLASS
+    jbe 3f
+    cmp ecx, KEEP_MAX_CLASS
     ja 1f
-    mov rax, [r15 + W_CLS + rcx*8]
+    cmp dword ptr [r15 + KEEPN_BASE + rcx*4], KEEP_MAX_BLOCKS
+    jae 1f
+    inc dword ptr [r15 + KEEPN_BASE + rcx*4]
+3:  mov rax, [r15 + W_CLS + rcx*8]
     mov [rdi], rax
     mov [r15 + W_CLS + rcx*8], rdi
 2:  ret
 1:  SYS SYS_munmap                       # rdi = ptr, rsi = len
     ret
+    .skip 40, 0xcc                     # padding: keeps the code after this at its previous 64-byte alignment
 
 # rt_grow(ptr, len, cap, need) -> rax = new ptr, rdx = new cap. Keeps the first `len` bytes; frees the old
 # block. If cap >= need, returns the block unchanged.

@@ -60,6 +60,8 @@
 .equ SOL_SOCKET, 1
 .equ SO_REUSEADDR, 2
 .equ SO_REUSEPORT, 15
+.equ SO_RCVTIMEO, 20
+.equ SO_SNDTIMEO, 21
 .equ TCP_NODELAY, 1
 .equ F_GETFL, 3
 .equ F_SETFL, 4
