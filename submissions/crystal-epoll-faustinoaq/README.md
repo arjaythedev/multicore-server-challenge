@@ -4,7 +4,7 @@ Front: direct
 
 | Component | Version / implementation |
 |---|---|
-| Crystal | 1.22.1, release build, `-Dgc_none`, native CPU target |
+| Crystal | 1.22.1, release build, `-Dgc_none`, x86-64-v3 CPU target |
 | HTTP framework | None; custom HTTP/1.1 parser and JSON reader/writer |
 | Network I/O | Raw Linux io_uring, `SO_REUSEPORT`; Linux 6.1+ required |
 | PostgreSQL driver | Custom v3 wire client with SCRAM-SHA-256, prepared statements and pipelining |
@@ -110,7 +110,7 @@ normal operation does not log individual batches.
 
 - `bash test/run.sh submissions/crystal-epoll-faustinoaq`: 197/197 conformance checks.
 - A local script comparing the same GETs sent concurrently (batched) and one by one: three rounds, 0 differences.
-- `crystal build --release --mcpu native test/bcrypt.cr -o bin/test-bcrypt && bin/test-bcrypt`:
+- `crystal build --release --mcpu x86-64-v3 test/bcrypt.cr -o bin/test-bcrypt && bin/test-bcrypt`:
   1,000 cost-10 hashes checked against libcrypt, with random salts and 0–72 byte
   passwords: ASCII `$2a$`, arbitrary non-NUL bytes for `$2b$`, 1/2/3/4/5/6/8 lanes
   and the seed hash. The production fast path sends high-bit `$2a$` to libcrypt.
