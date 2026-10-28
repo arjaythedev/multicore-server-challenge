@@ -275,16 +275,21 @@ module Sql
     "e AS MATERIALIZED (SELECT x.* FROM (SELECT DISTINCT s FROM r) k CROSS JOIN LATERAL " \
     "(SELECT #{ENRICH} FROM articles a JOIN users u ON u.id = a.author_id WHERE a.slug = k.s OFFSET 0) x) " \
     "SELECT #{FULL_OUT} FROM r JOIN e ON e.slug = r.s ORDER BY r.n",
-    # 45 B_ARTICLE_ID ($1 slugs), 46 B_COMMENTS ($1 viewers, $2 slugs)
+    # 45 B_ARTICLE_ID ($1 slugs), 46 B_COMMENTS ($1 viewers, $2 slugs; following flags in one
+    # follows range scan per viewer)
     "SELECT r.n, a.id FROM unnest($1::text[]) WITH ORDINALITY r(s, n) JOIN articles a ON a.slug = r.s ORDER BY r.n",
     "WITH r AS (SELECT * FROM unnest($1::int8[], $2::text[]) WITH ORDINALITY r(v, s, n)), " \
     "c AS MATERIALIZED (SELECT k.s, c.id, c.body, c.created_at, c.updated_at, c.author_id, u.username, u.bio, u.image " \
     "FROM (SELECT DISTINCT s FROM r) k CROSS JOIN LATERAL (SELECT a.id FROM articles a WHERE a.slug = k.s OFFSET 0) a " \
     "CROSS JOIN LATERAL (SELECT * FROM comments c WHERE c.article_id = a.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c " \
-    "CROSS JOIN LATERAL (SELECT u.username, u.bio, u.image FROM users u WHERE u.id = c.author_id OFFSET 0) u) " \
-    "SELECT r.n, c.id, c.body, c.created_at, c.updated_at, c.username, c.bio, c.image, " \
-    "EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.v AND fo.followee_id = c.author_id) " \
-    "FROM r JOIN c ON c.s = r.s ORDER BY r.n, c.created_at DESC, c.id DESC",
+    "CROSS JOIN LATERAL (SELECT u.username, u.bio, u.image FROM users u WHERE u.id = c.author_id OFFSET 0) u), " \
+    "p AS MATERIALIZED (SELECT r.v, array_agg(DISTINCT c.author_id) AS aa FROM r JOIN c ON c.s = r.s " \
+    "WHERE r.v > 0 GROUP BY r.v), " \
+    "f AS MATERIALIZED (SELECT p.v, fo.followee_id FROM p CROSS JOIN LATERAL (SELECT fo.followee_id FROM follows fo " \
+    "WHERE fo.follower_id = p.v AND fo.followee_id = ANY(p.aa)) fo) " \
+    "SELECT r.n, c.id, c.body, c.created_at, c.updated_at, c.username, c.bio, c.image, f.v IS NOT NULL " \
+    "FROM r JOIN c ON c.s = r.s LEFT JOIN f ON f.v = r.v AND f.followee_id = c.author_id " \
+    "ORDER BY r.n, c.created_at DESC, c.id DESC",
     MIXED, SHARED_ENRICH, SHARED_FAVORITES, SHARED_FOLLOWS,
   ]
 
