@@ -449,6 +449,21 @@ module App
     Pg.arr_done(c, at)
   end
 
+  # The (article, viewer) pairs of signed-in requests: article ids, or with `viewers` their viewers.
+  private def self.flag_pairs(c : Pg::Conn, bj : Job, r : Pg::Result, viewers : Bool) : Nil
+    at = Pg.arr_begin(c)
+    n = 0
+    r.each(0) do |row|
+      v = bj.sub[row.int.to_i32 - 1].viewer
+      id = row.int
+      if v > 0 && id > 0
+        Pg.arr_int(c, n, viewers ? v : id)
+        n += 1
+      end
+    end
+    Pg.arr_done(c, at)
+  end
+
   # Phase A keeps only the request/page mapping and counts. Phase B reads the
   # union once, then the application assembles each request's normal result rows.
   private def self.on_shared(bj : Job, r : Pg::Result) : Nil
@@ -503,8 +518,8 @@ module App
       Pg.execute(c, at)
       {Sql::SHARED_FAV, Sql::SHARED_FOLLOW}.each do |stmt|
         at = Pg.bind(c, stmt, 2)
-        shared_ids(c, bj)
-        arr_viewers(c, bj.sub, bj.nsub)
+        flag_pairs(c, bj, r, false)
+        flag_pairs(c, bj, r, true)
         Pg.execute(c, at)
       end
       @@rinf += 1

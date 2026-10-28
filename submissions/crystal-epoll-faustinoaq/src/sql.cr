@@ -126,26 +126,39 @@ module Sql
 
   # Phase B returns each article once. The application fans rows out to requests;
   # PostgreSQL never serializes the same article once per overlapping page.
+  # Tag names come from one join over the batch's article_tags rows (tags hashed once),
+  # not a tags lookup per tag per article.
   SHARED_ENRICH = <<-SQL
-    SELECT x.* FROM (SELECT DISTINCT unnest($1::int8[]) AS id) d CROSS JOIN LATERAL (
+    WITH d AS MATERIALIZED (SELECT DISTINCT unnest($1::int8[]) AS id),
+    tg AS MATERIALIZED (
+      SELECT at.article_id, array_agg(t.name ORDER BY t.name) AS names
+      FROM article_tags at JOIN tags t ON t.id = at.tag_id
+      WHERE at.article_id = ANY($1::int8[]) GROUP BY at.article_id
+    )
+    SELECT x.id, x.slug, x.title, x.description, x.body, x.created_at, x.updated_at,
+      COALESCE(tg.names, '{}'::text[]), x.favs, false, x.username, x.bio, x.image, false, x.author_id
+    FROM d CROSS JOIN LATERAL (
       SELECT a.id, a.slug, a.title, a.description,
-        CASE WHEN a.id = ANY($2::int8[]) THEN a.body ELSE '' END,
+        CASE WHEN a.id = ANY($2::int8[]) THEN a.body ELSE '' END AS body,
         a.created_at, a.updated_at,
-        ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) AS name
-          FROM article_tags at WHERE at.article_id = a.id ORDER BY 1),
-        (SELECT count(*) FROM favorites f WHERE f.article_id = a.id),
-        false, u.username, u.bio, u.image, false, a.author_id
+        (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favs,
+        u.username, u.bio, u.image, a.author_id
       FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id = d.id OFFSET 0
-    ) x ORDER BY x.id
+    ) x LEFT JOIN tg ON tg.article_id = x.id
+    ORDER BY x.id
     SQL
+  # Viewer flags take (article, viewer) pairs: each viewer probes only the articles
+  # on its own pages, in one index range scan (= ANY), not every viewer x article.
   SHARED_FAVORITES = <<-SQL
-    SELECT user_id, article_id FROM favorites
-    WHERE user_id = ANY($2::int8[]) AND article_id = ANY($1::int8[])
+    WITH p AS (SELECT x.v, array_agg(x.a) AS aa FROM unnest($1::int8[], $2::int8[]) x(a, v) GROUP BY x.v)
+    SELECT p.v, f.article_id FROM p CROSS JOIN LATERAL
+      (SELECT f.article_id FROM favorites f WHERE f.user_id = p.v AND f.article_id = ANY(p.aa)) f
     SQL
   SHARED_FOLLOWS = <<-SQL
-    WITH authors AS MATERIALIZED (SELECT ARRAY(SELECT DISTINCT author_id FROM articles WHERE id = ANY($1::int8[])) AS ids)
-    SELECT f.follower_id, f.followee_id FROM authors CROSS JOIN follows f
-    WHERE f.follower_id = ANY($2::int8[]) AND f.followee_id = ANY(authors.ids)
+    WITH p AS (SELECT x.v, array_agg(x.a) AS aa FROM unnest($1::int8[], $2::int8[]) x(a, v) GROUP BY x.v)
+    SELECT p.v, fo.followee_id FROM p CROSS JOIN LATERAL
+      (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = p.v AND fo.followee_id =
+        ANY(ARRAY(SELECT a.author_id FROM articles a WHERE a.id = ANY(p.aa)))) fo
     SQL
 
   ALL = [
