@@ -1,0 +1,5 @@
+/bin/
+/lib/
+/.shards/
+
+/test/__pycache__/
