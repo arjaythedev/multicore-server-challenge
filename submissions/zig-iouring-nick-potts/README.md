@@ -114,10 +114,9 @@ We read the other entries. As far as we can tell, these are new to this challeng
 
 - **A separate drain process with SPSC rings.** One process owns every read connection and one read queue for the
   whole box. Workers reach it through lock-free single-producer single-consumer rings in shared memory.
-- **One MEGA statement.** Every list, article, profile, user and tag read in a drain runs as one execution of
-  one statement, and the feeds of a drain run as another execution of the same statement on a lane of their own.
-  That statement returns each article entity and the tag list once per execution, beside each read's own
-  keys and viewer flags.
+- **One MEGA statement.** Every list and article read in a drain runs as one execution of one statement, and the
+  feeds of a drain run as another execution of the same statement on a lane of their own. That statement returns
+  each article entity once per execution, beside each read's own keys and viewer flags.
 - **bcrypt at SCHED_IDLE with a watchdog.** Password hashing only uses CPU nothing else wants. A normal-priority
   watchdog thread takes over any job starved for too long.
 - **CPU-idle shedding, off by default.** With `shed=on`, sign-ups and logins are refused while the box's measured
@@ -246,7 +245,15 @@ lane's drain at once.
 
 **The comments lane.** Comment reads drain on a third lane with a 40 ms gap (`comments_gap_ns`), as one batched
 execution that reads each distinct thread once. Twice the comment reads share each execution, and the shared drain
-no longer waits for them, so it carries MEGA alone.
+no longer waits for them.
+
+**Cheap reads ahead of MEGA.** Tag, profile and current-user reads, about a quarter of all requests, stay out of
+MEGA. In the shared drain each of these families is one execution of its own ahead of MEGA: the tag list once for
+all of them, profiles and users as batched statements. The Flush after each answers its requests before MEGA runs,
+where inside MEGA they waited for it to finish. They shared no work with MEGA's articles. On 20 replayed shared
+drains of about 430 reads each, Postgres backend CPU stayed flat for about 2.9 more executions per drain: −0.2%
+(95% CI ±1.8%) over 7 interleaved rounds and −1.4% (±4.1%) over 20 more. Every read's rows were identical to the
+ones MEGA returned.
 
 **Coalescing inside a drain.** Requests for the same statement run as one execution with one array per parameter:
 `unnest(...) WITH ORDINALITY` joined `CROSS JOIN LATERAL` to the per-row query (from #7), with rows routed back by
@@ -294,33 +301,34 @@ in executor run and 7.7% in executor start. The SQL itself is where the time is.
 
 ### MEGA
 
-Above two qualifying reads per drain, everything except comments and logins becomes **one execution of one
+Above two qualifying reads per drain, every list and article read becomes **one execution of one
 statement**. Its input is six binary arrays, one element per job:
 
 | Array | Type | Meaning |
 |---|---|---|
-| kind | int4 | 1 list all, 2 by tag, 3 by author, 4 favorited by, 5 feed, 6 article by slug, 7 article re-read by id, 9 profile, 10 current user, 12 tags |
+| kind | int4 | 1 list all, 2 by tag, 3 by author, 4 favorited by, 5 feed, 6 article by slug, 7 article re-read by id |
 | viewer | int8 | the viewer's user id, or 0 |
 | i1, i2, i3 | int8 | limit, offset and the kind's key |
 | t1 | text | slug, tag or username |
 
 It returns 18 columns. A row's ordinal says what it is: ≥ 1 is a job's own row (its keys, counts and viewer flags),
-−1 is an article entity, and −3 is the tag list. Each article and the tag list is sent **once per drain**, however
-many jobs refer to it. The worker side (`mega.zig`) keeps the rows until the result is complete, fills each job's rows
-from the entities, sorts them per job, and hands them to the same JSON writers a single statement would use.
+and −1 is an article entity. Each article is sent **once per drain**, however many jobs refer to it. The worker side
+(`mega.zig`) keeps the rows until the result is complete, fills each job's rows from the entities, sorts them per
+job, and hands them to the same JSON writers a single statement would use.
 
 A drain with fewer than two MEGA jobs uses the ordinary single statements. MEGA has a fixed cost of about 1.7M
 instructions per execution, 13x a one-row statement.
 
-Logins look users up by email with a batched statement. Comments use `COMMENTS_LIST_SET` for one request and
-`BATCH_COMMENTS_LIST_SET` for two or more. Both run beside MEGA in the same Sync group. The batched form returns one
-row per request (its viewer's followee ids and the first request in the drain for the same article), then each
-distinct article's thread once, newest first, up to 100 comments. `threads.zig` hands the thread's rows to every
-request for that article and sets `following` for each request from its own viewer's followees. As with MEGA, the
-thread is shared only among requests already queued for one fresh query, within one execution, and is not kept
-after it. If a drain's group fails, each
-of its jobs is retried alone, so one bad request can't fail its neighbours. MEGA shares work only among reads that
-were queued before it started, inside one execution. No returned data is retained across requests (in #7's wording).
+Logins look users up by email with a batched statement, and tags, profiles and the current user use `TAGS`, `PROFILE`
+and `USER_BY_ID` (batched for two or more). They run ahead of MEGA in the same Sync group. Comments use
+`COMMENTS_LIST_SET` for one request and `BATCH_COMMENTS_LIST_SET` for two or more, on a lane of their own. The batched
+form returns one row per request (its viewer's followee ids and the first request in the drain for the same article),
+then each distinct article's thread once, newest first, up to 100 comments. `threads.zig` hands the thread's rows to
+every request for that article and sets `following` for each request from its own viewer's followees. As with MEGA,
+the thread is shared only among requests already queued for one fresh query, within one execution, and is not kept
+after it. If a drain's group fails, each of its jobs is retried alone, so one bad request can't fail its neighbours.
+MEGA shares work only among reads that were queued before it started, inside one execution. No returned data is
+retained across requests (in #7's wording).
 
 **What it is worth.** In the server, MEGA saved 79k instructions per request (−6.8%) on top of the gather alone; #7's
 statements used 1,368k per request in the same rounds. On replay, the final statement stack against #7's statements,
@@ -627,9 +635,12 @@ against libdeflate, with higher throughput and shorter tails. Gzipping every lar
 
 Checks on the previous version: an oracle run of 3,000 of 3,000 request pairs identical to the Go reference server
 (32 pairs in flight). Checks on this version, on the full seed: the conformance suite 197/197 on a fresh database;
-56 unit tests, including the ring wrap sweep, the spill regression and the comments fan-out; and 40 rounds of 58
+61 unit tests, including the ring wrap sweep, the spill regression and the comments fan-out; 40 rounds of 58
 concurrent comment reads over shared and missing articles, beside comment creates and deletes, each sent as one
-batched execution and each byte-identical to the same read sent alone.
+batched execution and each byte-identical to the same read sent alone; and 40 rounds of 130 concurrent tag, profile,
+current-user, article and list reads, beside an article with a new tag, a follow or unfollow and a profile update.
+Each round's profiles and users ran as one batched execution each and its tag reads as one, ahead of a MEGA that held
+only the article and list reads, and all 5,200 responses were byte-identical to the same read sent alone.
 
 ---
 

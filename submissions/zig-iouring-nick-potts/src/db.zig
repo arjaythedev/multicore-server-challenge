@@ -11,9 +11,9 @@
 //! together) starts every lane's drain at once. Same-statement requests become one batched execution (one array per
 //! parameter, rows tagged with the request ordinal), tag reads share one execution, and the whole drain rides one
 //! Sync. A drain with two or more reads that MEGA serves sends those as one execution of it instead, last in the
-//! Sync group (mega.zig); a feed drain is one MEGA execution of feeds alone. Comments stay out of MEGA: a comments
-//! drain runs COMMENTS_LIST_SET for one read, its batched form for more, which reads each distinct thread once
-//! (threads.zig).
+//! Sync group (mega.zig), so the cheap reads it does not serve (tags, profiles, users, logins) are answered before it
+//! runs; a feed drain is one MEGA execution of feeds alone. Comments stay out of MEGA: a comments drain runs
+//! COMMENTS_LIST_SET for one read, its batched form for more, which reads each distinct thread once (threads.zig).
 //!
 //! Writes go to their own connection (sql-writes' writes-1conn). An idle write connection takes the first queued
 //! write; when nothing else is queued it waits `write_wait_ns` first. Then it takes up to `max_writes` into one Sync
@@ -810,6 +810,38 @@ test "a read group flushes after every unit but the last, so each unit's results
     defer wo.deinit();
     encodeGroup(&wo, w);
     try testing.expectEqualStrings("BEBES", messageTypes(&buf, &wo));
+}
+
+test "tag, profile and user reads run as units of their own ahead of MEGA, each answered before MEGA runs" {
+    clearQueuesForTest();
+    defer clearQueuesForTest();
+    const stmts = [_]Stmt{ .article_by_slug, .tags, .profile, .user_by_id, .article_by_id, .tags, .profile };
+    var reqs: [stmts.len]Query = undefined;
+    for (&reqs, stmts) |*r, s| r.* = .{ .stmt = s, .params = @splat(Param{ .int = 1 }) };
+    for (&reqs) |*r| enqueue(r);
+
+    const g = buildRead(.shared).?;
+    defer freeGroup(g);
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(testing.allocator);
+    for (g.units[0..g.nunits]) |*u| {
+        try got.print(testing.allocator, "{s} {s}", .{ @tagName(u.kind), @tagName(u.stmt) });
+        for (g.unitMembers(u)) |r| try got.print(testing.allocator, " {d}", .{(@intFromPtr(r) - @intFromPtr(&reqs)) / @sizeOf(Query)});
+        try got.append(testing.allocator, '\n');
+    }
+    try testing.expectEqualStrings(
+        \\broadcast tags 1 5
+        \\batched profile 2 6
+        \\single user_by_id 3
+        \\mega article_by_slug 0 4
+        \\
+    , got.items);
+
+    var o: pg.Out = .{};
+    defer o.deinit();
+    encodeGroup(&o, g);
+    var buf: [32]u8 = undefined;
+    try testing.expectEqualStrings("BEHBEHBEHBES", messageTypes(&buf, &o));
 }
 
 test "a lone write waits for company, and the wait does not end early" {

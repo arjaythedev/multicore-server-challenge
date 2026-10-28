@@ -82,7 +82,7 @@ pub const Result = struct {
             if (ord < 0) {
                 if (-ord > sql.mega.keys.len) return error.MegaOrdinal;
                 const t: usize = @intCast(-ord - 1);
-                const col = sql.mega.keys[t] orelse return error.MegaOrdinal;
+                const col = sql.mega.keys[t];
                 const key = m.int(c, col) orelse return error.MegaEntityKey;
                 try m.entities[t].put(gpa, key, @intCast(i));
             } else {
@@ -117,7 +117,7 @@ pub const Result = struct {
     fn assemble(m: *const Result, spec: sql.Mega, c: *const Cols) pg.Row {
         var e: *const Cols = c;
         if (spec.fill != 0) {
-            if (m.int(c, sql.mega.keys[spec.fill - 1].?)) |key| {
+            if (m.int(c, sql.mega.keys[spec.fill - 1])) |key| {
                 if (m.entities[spec.fill - 1].get(key)) |i| e = &m.rows.items[i];
             }
         }
@@ -197,11 +197,11 @@ fn readArray(out: *std.ArrayList(u8), b: []const u8, p: *usize) !void {
 test "encode lays reads out as six arrays in order, NULL where a read has no value" {
     var reqs = [_]Query{
         testReq(.list_tag, &.{ .{ .int = 0 }, .{ .int = 20 }, .{ .int = 40 }, .{ .text = "dragons" } }),
-        testReq(.user_by_id, &.{.{ .int = 7 }}),
+        testReq(.article_by_slug, &.{ .{ .int = 7 }, .{ .text = "how-to" } }),
         testReq(.list_feed, &.{ .{ .int = 7 }, .{ .int = 10 }, .{ .int = 5 }, .{ .int = 15 } }),
         testReq(.article_by_id, &.{ .{ .int = 3 }, .{ .int = 42 } }),
-        testReq(.tags, &.{}),
-        testReq(.profile, &.{ .{ .int = 0 }, .{ .text = "jake" } }),
+        testReq(.list_all, &.{ .{ .int = 0 }, .{ .int = 20 }, .{ .int = 0 } }),
+        testReq(.list_author, &.{ .{ .int = 0 }, .{ .int = 20 }, .{ .int = 0 }, .{ .text = "jake" } }),
     };
     var ptrs: [reqs.len]*Query = undefined;
     for (&reqs, &ptrs) |*r, *p| p.* = r;
@@ -216,12 +216,12 @@ test "encode lays reads out as six arrays in order, NULL where a read has no val
     defer got.deinit(testing.allocator);
     for (0..6) |_| try readArray(&got, b, &p);
     try testing.expectEqualStrings(
-        \\2 10 5 7 12 9
+        \\2 6 5 7 1 3
         \\- 7 7 3 - -
-        \\20 - 10 42 - -
-        \\40 - 5 - - -
+        \\20 - 10 42 20 20
+        \\40 - 5 - 0 0
         \\- - 15 - - -
-        \\'dragons' - - - - 'jake'
+        \\'dragons' 'how-to' - - - 'jake'
         \\
     , got.items);
     try testing.expectEqualSlices(u8, "\x00\x01\x00\x01E\x00\x00\x00\x09\x00\x00\x00\x00\x00", b[p..]);
@@ -317,12 +317,9 @@ const Recorder = struct {
 test "deliver hands each read its own statement's rows, filled from entity rows and sorted" {
     var reqs = [_]Query{
         testReq(.list_all, &.{ .{ .int = 0 }, .{ .int = 20 }, .{ .int = 0 } }),
-        testReq(.tags, &.{}),
         testReq(.article_by_slug, &.{ .{ .int = 0 }, .{ .text = "missing" } }),
-        testReq(.profile, &.{ .{ .int = 4 }, .{ .text = "bob" } }),
         testReq(.list_author, &.{ .{ .int = 0 }, .{ .int = 20 }, .{ .int = 0 }, .{ .text = "nobody" } }),
         testReq(.article_by_id, &.{ .{ .int = 4 }, .{ .int = 9 } }),
-        testReq(.user_by_id, &.{.{ .int = 4 }}),
     };
     var ptrs: [reqs.len]*Query = undefined;
     for (&reqs, &ptrs) |*r, *p| p.* = r;
@@ -330,15 +327,11 @@ test "deliver hands each read its own statement's rows, filled from entity rows 
     var m: Result = .{};
     // The reads' own rows first, unsorted; every entity row after them.
     try addRow(&m, 1, &.{ .{ 0, .{ .int = 2 } }, .{ 1, .{ .int = 5 } }, .{ 10, .{ .boolean = false } }, .{ 14, .{ .boolean = true } } });
-    try addRow(&m, 6, &.{ .{ 1, .{ .int = 9 } }, .{ 10, .{ .boolean = true } }, .{ 14, .{ .boolean = false } } });
+    try addRow(&m, 4, &.{ .{ 1, .{ .int = 9 } }, .{ 10, .{ .boolean = true } }, .{ 14, .{ .boolean = false } } });
     try addRow(&m, 1, &.{ .{ 0, .{ .int = 2 } }, .{ 1, .{ .int = 9 } }, .{ 10, .{ .boolean = true } }, .{ 14, .{ .boolean = false } } });
-    try addRow(&m, 2, &.{.{ 0, .{ .int = 0 } }});
-    try addRow(&m, 4, &.{ .{ 11, .{ .text = "bob" } }, .{ 12, .{ .text = "hi" } }, .{ 14, .{ .boolean = true } } });
-    try addRow(&m, 5, &.{ .{ 0, .{ .int = 0 } }, .{ 10, .{ .boolean = false } }, .{ 14, .{ .boolean = false } } });
-    try addRow(&m, 7, &.{ .{ 1, .{ .int = 4 } }, .{ 11, .{ .text = "amy" } }, .{ 16, .{ .text = "amy@x" } } });
+    try addRow(&m, 3, &.{ .{ 0, .{ .int = 0 } }, .{ 10, .{ .boolean = false } }, .{ 14, .{ .boolean = false } } });
     try addRow(&m, -1, &.{ .{ 1, .{ .int = 9 } }, .{ 2, .{ .text = "s9" } }, .{ 3, .{ .text = "T9" } }, .{ 4, .{ .text = "D9" } }, .{ 5, .{ .text = "B9" } }, .{ 6, .{ .int = 90 } }, .{ 7, .{ .int = 91 } }, .{ 8, .{ .tags = &.{ "a", "b" } } }, .{ 9, .{ .int = 3 } }, .{ 11, .{ .text = "amy" } } });
     try addRow(&m, -1, &.{ .{ 1, .{ .int = 5 } }, .{ 2, .{ .text = "s5" } }, .{ 3, .{ .text = "T5" } }, .{ 4, .{ .text = "D5" } }, .{ 6, .{ .int = 50 } }, .{ 7, .{ .int = 51 } }, .{ 8, .{ .tags = &.{} } }, .{ 9, .{ .int = 0 } }, .{ 11, .{ .text = "bob" } }, .{ 12, .{ .text = "hi" } } });
-    try addRow(&m, -3, &.{ .{ 0, .{ .int = 0 } }, .{ 8, .{ .tags = &.{ "a", "b", "c" } } } });
 
     var got: std.ArrayList(u8) = .empty;
     defer got.deinit(testing.allocator);
@@ -347,27 +340,21 @@ test "deliver hands each read its own statement's rows, filled from entity rows 
         \\list_all 2 9 's9' 'T9' 'D9' 90 91 [a,b] 3 t 'amy' - - f
         \\list_all 2 5 's5' 'T5' 'D5' 50 51 [] 0 f 'bob' 'hi' - t
         \\list_all done
-        \\tags [a,b,c]
-        \\tags done
         \\article_by_slug done
-        \\profile 'bob' 'hi' - t
-        \\profile done
         \\list_author 0 - - - - - - - - f - - - f
         \\list_author done
         \\article_by_id 9 's9' 'T9' 'D9' 'B9' 90 91 [a,b] 3 t 'amy' - - f
         \\article_by_id done
-        \\user_by_id 4 'amy' 'amy@x' - -
-        \\user_by_id done
         \\
     , got.items);
 }
 
-test "deliver refuses an entity type the statement has no key for" {
-    var reqs = [_]Query{testReq(.tags, &.{})};
+test "deliver refuses an entity type other than the article" {
+    var reqs = [_]Query{testReq(.list_all, &.{ .{ .int = 0 }, .{ .int = 20 }, .{ .int = 0 } })};
     var ptrs: [reqs.len]*Query = undefined;
     for (&reqs, &ptrs) |*r, *p| p.* = r;
     var m: Result = .{};
-    try addRow(&m, -2, &.{.{ 15, .{ .int = 100 } }});
+    try addRow(&m, -3, &.{.{ 0, .{ .int = 0 } }});
     var got: std.ArrayList(u8) = .empty;
     defer got.deinit(testing.allocator);
     try testing.expectError(error.MegaOrdinal, m.deliver(&ptrs, Recorder{ .out = &got }));

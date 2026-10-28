@@ -54,14 +54,15 @@ pub const Def = struct {
 /// MEGA (branch sql-stack, stack-14-fcset: sql-proto's MEGA2 with the stack's count, feed, tag, list-count, list-flag and favorite-count edits, without comments):
 /// every mega-able read of a drain in one execution. It takes one array element per read in six arrays, kind int4
 /// and the slots v, i1, i2, i3 int8 and t1 text, and returns the read's 1-based position as the last column. Each
-/// article and the tag list come once, as entity rows with ordinal -1 and -3 keyed by `keys`; a read's own rows
-/// carry only its keys, counts and viewer flags (a feed row's following is true from the SQL: the feed only holds
-/// followed authors). Comments stay out of it, so entity type -2 (a comment) is not expected.
+/// article comes once, as an entity row with ordinal -1 keyed by `keys`; a read's own rows carry only its keys,
+/// counts and viewer flags (a feed row's following is true from the SQL: the feed only holds followed authors).
+/// Comments, tags, profiles and users stay out of it, so the article is the only entity type, and columns 15 and 16
+/// are always NULL.
 pub const mega = struct {
     pub const sql = std.mem.trimEnd(u8, @embedFile("sql/MEGA.sql"), "\n; ");
     pub const params = [_]Oid{ .int4_array, .int8_array, .int8_array, .int8_array, .int8_array, .text_array };
     pub const cols = [_]Oid{ .int8, .int8, .text, .text, .text, .text, .timestamptz, .timestamptz, .text_array, .int8, .bool, .text, .text, .text, .bool, .int8, .text, .int8 };
-    pub const keys = [_]?u8{ 1, null, 0 };
+    pub const keys = [_]u8{1};
     pub const ordinal = cols.len - 1;
 };
 
@@ -154,7 +155,8 @@ fn file(comptime prefix: []const u8, comptime s: Stmt) []const u8 {
 //   Its batched form reads each distinct article's thread once, in that order (a parameterized LATERAL, which the
 //   plan can only run as a nested loop's inner side: sql-articlepage's contract), after one row per request with
 //   the viewer's followee ids; threads.zig hands every request its thread's rows.
-//   USER_BY_EMAIL stays out of MEGA: it reads the password hash.
+//   USER_BY_EMAIL stays out of MEGA: it reads the password hash. PROFILE, USER_BY_ID and TAGS stay out too: each is
+//   a few index lookups, so they run as units of their own ahead of MEGA and are answered before it runs.
 const defs = [count]Def{
     // lists (branch sql-lists)
     .{ .sql = text(.list_all), .params = &.{ .int8, .int8, .int8 }, .cols = &list_cols, .batch = .arrays, .order = ", q.id DESC", .mega = listMega(1, &.{ .v, .i1, .i2 }) },
@@ -167,11 +169,11 @@ const defs = [count]Def{
     .{ .sql = text(.article_by_slug), .params = &.{ .int8, .text }, .cols = &full_cols, .batch = .arrays, .mega = .{ .kind = 6, .args = &.{ .v, .t1 }, .cols = &full_mega_cols, .fill = 1 } },
     .{ .sql = text(.article_by_id), .params = &.{ .int8, .int8 }, .cols = &full_cols, .batch = .arrays, .mega = .{ .kind = 7, .args = &.{ .v, .i1 }, .cols = &full_mega_cols, .fill = 1 } },
     .{ .sql = text(.comments_list_set), .params = &.{ .int8, .text }, .cols = &.{ .int8, .text, .timestamptz, .timestamptz, .text, .text, .text, .bool }, .batch = .arrays, .batched = batchText(.comments_list_set), .thread_cols = &threads.cols },
-    .{ .sql = text(.profile), .params = &.{ .int8, .text }, .cols = &.{ .text, .text, .text, .bool }, .batch = .arrays, .mega = .{ .kind = 9, .args = &.{ .v, .t1 }, .cols = &.{ 11, 12, 13, 14 } } },
+    .{ .sql = text(.profile), .params = &.{ .int8, .text }, .cols = &.{ .text, .text, .text, .bool }, .batch = .arrays },
     // users and tags
-    .{ .sql = text(.user_by_id), .params = &.{.int8}, .cols = &user_cols, .batch = .arrays, .mega = .{ .kind = 10, .args = &.{.v}, .cols = &.{ 1, 11, 16, 12, 13 } } },
+    .{ .sql = text(.user_by_id), .params = &.{.int8}, .cols = &user_cols, .batch = .arrays },
     .{ .sql = text(.user_by_email), .params = &.{.text}, .cols = &.{ .int8, .text, .text, .text, .text, .text }, .batch = .arrays, .batched = batchText(.user_by_email) },
-    .{ .sql = text(.tags), .params = &.{}, .cols = &.{.text_array}, .batch = .broadcast, .mega = .{ .kind = 12, .args = &.{}, .cols = &.{8}, .fill = 3 } },
+    .{ .sql = text(.tags), .params = &.{}, .cols = &.{.text_array}, .batch = .broadcast },
     // writes (branch sql-writes): a group's writes of one of these statements share one execution of its batched form
     .{ .write = true, .sql = text(.favorite), .params = &.{ .int8, .text }, .cols = &.{.int8}, .batch = .arrays, .batched = batchText(.favorite) },
     .{ .write = true, .sql = text(.unfavorite), .params = &.{ .int8, .text }, .cols = &.{.int8}, .batch = .arrays, .batched = batchText(.unfavorite) },

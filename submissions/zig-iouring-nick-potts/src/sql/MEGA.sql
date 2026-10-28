@@ -90,24 +90,3 @@ SELECT NULL, e.id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
   EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = x.v AND fo.followee_id = e.author_id),
   NULL, NULL, x.ord
 FROM art x JOIN e ON e.id = x.id
-UNION ALL
-SELECT NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, u.username, u.bio, u.image,
-  EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.v AND fo.followee_id = u.id),
-  NULL, NULL, r.ord
-FROM r JOIN users u ON u.username = r.t1
-WHERE r.k = 9
-UNION ALL
-SELECT NULL, u.id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, u.username, u.bio, u.image, NULL,
-  NULL, u.email, r.ord
-FROM r JOIN users u ON u.id = r.v
-WHERE r.k = 10
-UNION ALL
-(SELECT 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ARRAY(SELECT name FROM tags ORDER BY name), NULL, NULL,
-  NULL, NULL, NULL, NULL, NULL, NULL, -3
- FROM r
- WHERE r.k = 12
- LIMIT 1)
-UNION ALL
-SELECT 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, r.ord
-FROM r
-WHERE r.k = 12
