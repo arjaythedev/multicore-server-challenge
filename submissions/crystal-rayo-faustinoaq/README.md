@@ -5,7 +5,7 @@ Front: direct
 | Component | Version / implementation |
 |---|---|
 | Crystal | 1.22.1, `--release --mcpu x86-64-v3 -Dwithout_mt` |
-| Framework | [Rayo](https://github.com/faustinoaq/rayo), commit `c5358eda5b209dec85eda8dc4ca703e727065b6f` |
+| Framework | [Rayo](https://github.com/faustinoaq/rayo), commit `c9553d94583fe2a56ab299e3788fe40dcd0e72b2` |
 | PostgreSQL driver | Rayo::PG, prepared statements, pipelining and application read batches |
 | Network I/O | Rayo io_uring, `SO_REUSEPORT`; Linux 6.1+ with io_uring allowed |
 | JWT | Rayo::JWT, HS256 through OpenSSL libcrypto |
@@ -31,7 +31,8 @@ pipelining and worker supervision. `App#run` starts one worker per available CPU
 `app.gzip` enables response compression. Custom tag serialization uses Rayo's
 shared JSON writer directly.
 
-Read batches port the hand-rolled entry's SQL and shared enrichment approach:
+Read batches port the hand-rolled entry's SQL and shared enrichment approach,
+scheduled by Rayo's `PG::Coalescer`:
 
 - Up to 128 waiting article requests share page selection and capped counts.
   Identical page/count keys are deduplicated within that round.
@@ -44,10 +45,11 @@ Read batches port the hand-rolled entry's SQL and shared enrichment approach:
 - Waiting tag requests share one database read. Results are discarded after
   answering the round. There are no caches across requests.
 
-Two dedicated Rayo::PG connections per worker serve these rounds; ordinary
-`ctx.db.query` connections handle auth, profiles and writes. Each connection has
-at most one read round in flight, so waiting requests collect while Postgres is
-busy. Read sessions use the epoll entry's session-local planner settings:
+Two dedicated Rayo::PG connections per worker serve these rounds through eight
+reusable round slots; ordinary `ctx.db.query` connections handle auth and writes.
+User and profile reads use ordinal array queries like the epoll entry. The
+coalescer dispatches idle arrivals in the same loop turn and otherwise collects
+for 17.5 ms per in-flight group, capped at 35 ms. Read sessions use the epoll entry's session-local planner settings:
 `jit=off`, `plan_cache_mode=force_generic_plan`,
 `max_parallel_workers_per_gather=0` and `enable_seqscan=off`.
 No schema or global database settings change.
@@ -111,15 +113,28 @@ No new framework bug was found. Two application pieces remain:
 - Conduit requires UTC timestamps with exactly three fractional digits; Rayo's
   `JSON::Timestamp` emits six. The small millisecond formatter remains. Optional
   timestamp precision would be a useful generic API addition.
-- Rayo::PG::Batch builds reusable array parameters but does not schedule and fan
-  out cross-request reads. `src/reads.cr` owns that policy using Rayo's public
-  deferred handles, loop flusher and PG ring transport. A generic coordinator
-  could move upstream; the Conduit SQL and response shapes belong here.
+- Cross-request read scheduling now lives in Rayo (`PG::Coalescer`); the Conduit
+  SQL, enrichment and response shapes stay in `src/reads.cr`.
 
 SQLite, multiple ports and affected-row hooks are not needed by this API.
-Remaining differences from epoll include its adaptive read collection windows,
-user/profile batching, optional write group commit and allocation-free data
+Remaining differences from epoll include optional write group commit and allocation-free data
 structures. This entry prioritizes ordinary framework routes and serialization.
+
+## Final comparison (Rayo c9553d9)
+
+Three alternating rounds, 2026-10-28, on the local mc1 box (3 CPUs, Postgres
+sharing them), 3,000 users, `mcbox.sh` defaults, against
+`crystal-epoll-faustinoaq`. All six runs passed with zero errors.
+
+| Round | epoll req/s | epoll p95 / p99 | Rayo req/s | Rayo p95 / p99 |
+|---|---:|---:|---:|---:|
+| 1 | 7,078 | 78.2 / 83.7 ms | 7,065 | 61.2 / 76.2 ms |
+| 2 | 7,102 | 75.0 / 79.6 ms | 7,319 | 52.5 / 56.7 ms |
+| 3 | 7,079 | 76.7 / 81.2 ms | 7,093 | 63.5 / 80.9 ms |
+
+CPU-seconds (Postgres / app, including ramp and tail): epoll 84/58, 77/58, 76/60;
+Rayo 88/65, 91/66, 90/66, about 15% more in total. Before the coalescer Rayo used
+171/83. Earlier measurements below describe older revisions.
 
 ## Local mc2 sanity comparison
 
