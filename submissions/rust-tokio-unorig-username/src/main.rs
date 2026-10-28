@@ -34,7 +34,7 @@ fn main() {
     rt.block_on(async {
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
         let wait = std::time::Duration::from_micros(env_n("READ_BATCH_US", 20_000) as u64);
-        db::init(&url, env_n("DB_READ_CONNS", 8), env_n("DB_WRITE_CONNS", 6), wait, env_n("READ_CROSS", 1) == 1).await;
+        db::init(&url, env_n("DB_READ_CONNS", 8), env_n("DB_WRITE_CONNS", 2), wait, env_n("READ_CROSS", 1) == 1).await;
         let addr: SocketAddr = format!("{}:{}", env("HOST", "0.0.0.0"), env("PORT", "3000")).parse().expect("HOST:PORT");
         let sock = if addr.is_ipv4() { TcpSocket::new_v4() } else { TcpSocket::new_v6() }.unwrap();
         sock.set_reuseaddr(true).unwrap();

@@ -1,4 +1,4 @@
-//! Postgres: read connections fed by a batching queue, pipelined write connections, prepared statements.
+//! Postgres: read connections fed by a batching queue, group-commit write connections, prepared statements.
 //!
 //! Reads of one kind that wait together go out as ONE statement: the per-request query is the inner side of
 //! a LATERAL join over `unnest()` of the waiting requests' parameters, and each row carries its request's
@@ -7,11 +7,14 @@
 //! (viewer, n1, n2, s), so one code path serves them all.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::future::Future;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Notify, oneshot};
+use tokio_postgres::types::private::BytesMut;
+use tokio_postgres::types::{IsNull, ToSql, Type, to_sql_checked};
 use tokio_postgres::{Client, NoTls, Row, Statement};
 
 pub struct Q {
@@ -267,11 +270,39 @@ struct Queue {
     claimed: Vec<bool>,       // a reader is collecting this kind
 }
 
+/// A write parameter already encoded (binary) for its statement's parameter type, so a queued write owns it.
+#[derive(Debug)]
+struct Raw(Option<Vec<u8>>);
+
+impl ToSql for Raw {
+    fn to_sql(&self, _: &Type, out: &mut BytesMut) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        match &self.0 {
+            None => Ok(IsNull::Yes),
+            Some(b) => {
+                out.extend_from_slice(b);
+                Ok(IsNull::No)
+            }
+        }
+    }
+    fn accepts(_: &Type) -> bool {
+        true
+    }
+    to_sql_checked!();
+}
+
+/// Err(None): the parameters didn't encode (a bug); Err(Some(e)): Postgres refused the write.
+pub type WriteResult = Result<Option<Row>, Option<tokio_postgres::Error>>;
+type WJob = (usize, Vec<Raw>, oneshot::Sender<WriteResult>);
+
+/// Most writes one group-commit transaction carries.
+const WRITE_MAX: usize = 256;
+
 pub struct Db {
     queue: Mutex<Queue>,
     wake: Notify,
-    writes: Vec<Conn>,
-    wr: AtomicUsize,
+    wq: Mutex<VecDeque<WJob>>,
+    wwake: Notify,
+    wtypes: Vec<Vec<Type>>, // each write statement's parameter types
 }
 
 static DB: OnceLock<Db> = OnceLock::new();
@@ -289,8 +320,20 @@ impl Db {
         rx.await.unwrap_or(Err(()))
     }
 
-    pub fn write(&self) -> &Conn {
-        &self.writes[self.wr.fetch_add(1, Ordering::Relaxed) % self.writes.len()]
+    /// Queues a write for the next free write connection; answers once its transaction has committed.
+    pub async fn write(&self, st: usize, params: &[&(dyn ToSql + Sync)]) -> WriteResult {
+        let mut raw = Vec::with_capacity(params.len());
+        for (p, ty) in params.iter().zip(&self.wtypes[st]) {
+            let mut b = BytesMut::new();
+            raw.push(Raw(match p.to_sql_checked(ty, &mut b).map_err(|_| None)? {
+                IsNull::Yes => None,
+                IsNull::No => Some(b.to_vec()),
+            }));
+        }
+        let (tx, rx) = oneshot::channel();
+        self.wq.lock().unwrap().push_back((st, raw, tx));
+        self.wwake.notify_one();
+        rx.await.unwrap_or(Err(None))
     }
 }
 
@@ -327,8 +370,12 @@ pub async fn init(url: &str, n_read: usize, n_write: usize, wait: Duration, cros
     for _ in 0..n_write {
         writes.push(connect(url, &WRITES, false).await);
     }
+    let wtypes = writes[0].st.iter().map(|s| s.params().to_vec()).collect();
     let queue = Mutex::new(Queue { jobs: (0..READS.len()).map(|_| VecDeque::new()).collect(), claimed: vec![false; READS.len()] });
-    let _ = DB.set(Db { queue, wake: Notify::new(), writes, wr: AtomicUsize::new(0) });
+    let _ = DB.set(Db { queue, wake: Notify::new(), wq: Mutex::new(VecDeque::new()), wwake: Notify::new(), wtypes });
+    for c in writes {
+        tokio::spawn(writer(c));
+    }
     for _ in 0..n_read {
         tokio::spawn(reader(connect(url, &READS, cross).await, wait));
     }
@@ -429,6 +476,102 @@ async fn reader(c: Conn, wait: Duration) {
             }
         }
     }
+}
+
+/// One per write connection: takes every write waiting (up to WRITE_MAX) and commits them as ONE transaction,
+/// pipelined (BEGIN, the writes, COMMIT), so a commit's WAL flush is shared by the whole group and the write
+/// rate no longer depends on the flush latency. Each write is answered only after COMMIT returns. If any write
+/// in a group fails, the group is rolled back and each write runs again in its own transaction, so one bad write
+/// can't fail the others. A lone write runs as its own implicit transaction.
+async fn writer(c: Conn) {
+    let db = db();
+    loop {
+        let jobs: Vec<WJob> = loop {
+            {
+                let mut q = db.wq.lock().unwrap();
+                if !q.is_empty() {
+                    let n = q.len().min(WRITE_MAX);
+                    let jobs = q.drain(..n).collect();
+                    if !q.is_empty() {
+                        db.wwake.notify_one();
+                    }
+                    break jobs;
+                }
+            }
+            db.wwake.notified().await;
+        };
+        if jobs.len() > 1 {
+            let (ok, rows) = group(&c, &jobs).await;
+            if ok {
+                for ((_, _, tx), r) in jobs.into_iter().zip(rows) {
+                    let _ = tx.send(Ok(r));
+                }
+                continue;
+            }
+            if c.c.is_closed() {
+                // the commit's outcome is unknown: never retried
+                for (_, _, tx) in jobs {
+                    let _ = tx.send(Err(None));
+                }
+                continue;
+            }
+        }
+        for (st, p, tx) in jobs {
+            let p: Vec<&(dyn ToSql + Sync)> = p.iter().map(|x| x as _).collect();
+            let r = c.c.query_opt(&c.st[st], &p).await;
+            if let Err(e) = &r {
+                if e.code().is_none() {
+                    eprintln!("write {st}: {e}");
+                }
+            }
+            let _ = tx.send(r.map_err(Some));
+        }
+    }
+}
+
+/// BEGIN, every job's statement and COMMIT, pipelined on `c` in that order. (true, rows) only if every write
+/// succeeded and the COMMIT did; otherwise the transaction is gone (rolled back or aborted).
+async fn group(c: &Conn, jobs: &[WJob]) -> (bool, Vec<Option<Row>>) {
+    let params: Vec<Vec<&(dyn ToSql + Sync)>> = jobs.iter().map(|(_, p, _)| p.iter().map(|x| x as _).collect()).collect();
+    let mut begin = Box::pin(c.c.batch_execute("BEGIN"));
+    let mut qs: Vec<_> = jobs.iter().zip(&params).map(|((st, _, _), p)| Box::pin(c.c.query_opt(&c.st[*st], p))).collect();
+    let mut commit = Box::pin(c.c.batch_execute("COMMIT"));
+    let (mut b, mut out, mut cm) = (None, (0..qs.len()).map(|_| None).collect::<Vec<_>>(), None);
+    // Each future sends its message on its first poll, so polling in this order pipelines them in this order.
+    std::future::poll_fn(|cx| {
+        let mut done = true;
+        if b.is_none() {
+            match begin.as_mut().poll(cx) {
+                Poll::Ready(r) => b = Some(r),
+                Poll::Pending => done = false,
+            }
+        }
+        for (f, o) in qs.iter_mut().zip(out.iter_mut()) {
+            if o.is_none() {
+                match f.as_mut().poll(cx) {
+                    Poll::Ready(r) => *o = Some(r),
+                    Poll::Pending => done = false,
+                }
+            }
+        }
+        if cm.is_none() {
+            match commit.as_mut().poll(cx) {
+                Poll::Ready(r) => cm = Some(r),
+                Poll::Pending => done = false,
+            }
+        }
+        if done { Poll::Ready(()) } else { Poll::Pending }
+    })
+    .await;
+    // A failed write aborts the transaction, and COMMIT then answers ROLLBACK without an error: check every write.
+    let ok = matches!(b, Some(Ok(()))) && matches!(cm, Some(Ok(()))) && out.iter().all(|r| matches!(r, Some(Ok(_))));
+    if !ok {
+        if let Some(Err(e)) = &cm {
+            eprintln!("write group commit: {e}");
+        }
+        return (false, Vec::new());
+    }
+    (true, out.into_iter().map(|r| r.unwrap().unwrap()).collect())
 }
 
 /// Runs `jobs` (any mix of cross kinds) as the one cross-kind statement and answers each with its body.

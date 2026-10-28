@@ -34,6 +34,8 @@ struct Job {
 }
 
 static POOL: OnceLock<Sender<Job>> = OnceLock::new();
+// Opened once at startup: opening it per sign-up fails (and panicked) once the process is out of descriptors.
+static URANDOM: OnceLock<std::fs::File> = OnceLock::new();
 
 /// `threads` workers; a worker holding a job waits up to `window` for more to fill its lanes.
 pub fn init(threads: usize, window: Duration) {
@@ -51,6 +53,7 @@ pub fn init(threads: usize, window: Duration) {
         });
     }
     let _ = POOL.set(tx);
+    let _ = URANDOM.set(std::fs::File::open("/dev/urandom").expect("/dev/urandom"));
 }
 
 fn take(rx: &Mutex<Receiver<Job>>, window: Duration) -> Option<Vec<Job>> {
@@ -81,7 +84,7 @@ async fn raw(cost: u32, salt: [u8; 16], password: &str) -> [u8; 24] {
 /// A new `$2b$10$` hash with a random salt.
 pub async fn hash(password: &str) -> String {
     let mut salt = [0u8; 16];
-    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut salt)).expect("/dev/urandom");
+    (&mut &*URANDOM.get().unwrap()).read_exact(&mut salt).expect("/dev/urandom");
     let h = raw(COST, salt, password).await;
     format!("$2b${COST}${}{}", B64.encode(salt), B64.encode(&h[..23]))
 }

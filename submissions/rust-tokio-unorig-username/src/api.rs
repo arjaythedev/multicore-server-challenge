@@ -201,10 +201,10 @@ fn found(b: Vec<u8>) -> R {
 }
 
 async fn write(st: usize, params: &[&(dyn ToSql + Sync)]) -> Result<Option<Row>, Resp> {
-    let c = db().write();
-    match c.c.query_opt(&c.st[st], params).await {
+    match db().write(st, params).await {
         Ok(r) => Ok(r),
-        Err(e) => match e.code() {
+        Err(None) => Err(e500()),
+        Err(Some(e)) => match e.code() {
             Some(&SqlState::UNIQUE_VIOLATION) => Err(e422()),
             Some(&SqlState::FOREIGN_KEY_VIOLATION) => Err(e401()), // the token's user no longer exists
             _ => {

@@ -72,9 +72,20 @@ statement now carries every kind).
 - session settings only: `plan_cache_mode = force_generic_plan`, `jit = off`, `enable_memoize = off`,
   `max_parallel_workers_per_gather = 0`.
 
-**Writes.** Six write connections, round robin, pipelined by tokio-postgres. Each mutation is one implicit
-transaction, committed (synchronous commit) before its response. Reads after a write (favorite, article edit)
-are a new statement, whose snapshot sees the commit. A unique violation is 422.
+**Writes: group commit.** Two write connections (`DB_WRITE_CONNS`), each driven by a writer task. A free writer
+takes every write that is waiting (up to 256) and commits them as one transaction, pipelined: `BEGIN`, the writes,
+`COMMIT`. Every response waits for that `COMMIT` (synchronous commit), so one WAL flush covers the whole group and
+the write rate no longer depends on how fast the disk flushes. A lone write runs as its own implicit transaction. If
+any write in a group fails (a unique violation is 422), the group rolls back and each write runs again in its own
+transaction, so one bad write can't fail the others; a group whose commit outcome is unknown (connection lost) is
+never retried. Reads after a write (favorite, article edit) are a new statement, whose snapshot sees the commit.
+
+This replaced six connections with one implicit transaction (and one WAL flush) per write. Those capped commits at
+about six per flush, and in 5-minute holds a burst of WAL (the first minutes after each checkpoint write full-page
+images, and autovacuum right after a checkpoint wrote 110 MB of WAL in one second) queued every write behind the
+flushes: write p99 700-860 ms against 58-65 ms with group commit, same load and disk (110,000 users, Postgres
+write IOPS capped at 700 to stand in for a slower disk than the test rig's). With the cap at 400, the old path fell
+behind for good (writes timing out at 10 s, 9% errors) and group commit held the 5-minute hold (p99 264 ms, no errors).
 
 **HTTP.** One task per connection. The read buffer exists only while a request is arriving or in flight; the
 request head is parsed into offsets, so nothing borrowed from httparse lives across the handler's await, and the
@@ -99,7 +110,7 @@ required and in the future, `sub` a decimal string. Nothing is remembered betwee
   Within a statement, the tag list, the global count and per-article data are shared by the requests in it.
   Only connections and prepared statements are reused.
 - Every password is hashed with bcrypt cost 10, and every login verifies against the stored hash.
-- Writes are committed before the response; no schema or server-wide changes; 14 Postgres connections in all.
+- Writes are committed before the response; no schema or server-wide changes; 10 Postgres connections in all.
 
 ## Local results (not the challenge box)
 
@@ -123,7 +134,7 @@ bash build.sh            # -> target/release/conduit
 DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=... HOST=0.0.0.0 PORT=80 bash start.sh
 ```
 
-Optional process settings (none are needed): `APP_THREADS` (3), `DB_READ_CONNS` (8), `DB_WRITE_CONNS` (6),
+Optional process settings (none are needed): `APP_THREADS` (3), `DB_READ_CONNS` (8), `DB_WRITE_CONNS` (2),
 `READ_BATCH_US` (20000), `READ_CROSS` (1), `BCRYPT_THREADS` (2), `BCRYPT_BATCH_MS` (250).
 
 Passes `test/run.sh` (197/197) on the dev and the full seed, and its transcript is byte-identical to
