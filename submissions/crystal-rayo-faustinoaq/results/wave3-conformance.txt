@@ -1,0 +1,11 @@
+== conformance suite
+== fresh database challenge_test_32630 from conduit_dev
+== build
+I: Resolving dependencies
+I: Fetching https://github.com/faustinoaq/rayo.git
+I: Using rayo (0.1.0 at c5358ed)
+== start
+== test
+
+197 steps, 197 passed, 0 failed (3.4s)
+RESULT: PASS

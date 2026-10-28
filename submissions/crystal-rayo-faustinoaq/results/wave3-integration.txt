@@ -1,0 +1,3 @@
+libcrypt $2a$ high-bit / $2y$ fallbacks and $2b$ inputs: matching passwords accepted, wrong passwords rejected
+PASS: 24 concurrent logins, pending-job disconnects, ordered pipeline, 800 article requests, gzip and q=0
+PASS: 540 mixed reads match isolated reads; viewer flags, empty pages, missing articles, disconnects

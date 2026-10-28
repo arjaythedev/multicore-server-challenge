@@ -1,0 +1,32 @@
+NOTICE:  database "conduit" does not exist, skipping
+POST /api/profiles/:username/follow             289     28.9    179.8    250.0    263.7    289.3      327    0.00
+POST /api/articles                              203     20.3    348.4    462.1    488.2    556.0      579    0.00
+POST /api/users/login                            87      8.7    970.2   1289.2   1401.9   1837.1     1841    0.00
+DELETE /api/articles/:slug/favorite              87      8.7    337.2    418.6    446.7    466.9      472    0.00
+PUT /api/user                                    81      8.1    179.2    260.5    290.0    304.4      331    0.00
+DELETE /api/profiles/:username/follow            74      7.4    194.7    263.2    278.8    291.6      303    0.00
+DELETE /api/articles/:slug/comments/:id           9      0.9    163.7    228.4    244.5    244.5      244    0.00
+PUT /api/articles/:slug                           5      0.5    348.4    508.7    508.7    508.7      509    0.00
+POST /api/users                                   1      0.1    794.6    794.6    794.6    794.6      795    0.00
+ALL                                           47414   4741.4    240.4    404.2    443.9    514.8     1841    0.00
+mix: 1.87 calls/page, 1.580 req/s per user, 4.9% writes, 25422 page views
+box 0 (DESKTOP-MTLQ7TM): 3000 users, CPU avg 51% max 61%, loadgen proc 19%, RSS peak 142 MB, 3000 TCP connects, behind=false
+verdict: PASS   [p95 < 500 ms, p99 < 1000 ms, errors < 1%]
+lg_limited: no
+box cpu-seconds: postgres 36 app 15 total 51; peak mem 3070 MB; oom 0
+ calls |  ms   | mean  | blk_per_call |  blks   |                                                       q                                                        
+-------+-------+-------+--------------+---------+----------------------------------------------------------------------------------------------------------------
+ 18226 | 27439 | 1.505 |           23 |  428111 | SELECT c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image, EXISTS (SELECT $3 FROM follows fo
+  6943 | 18156 | 2.615 |          297 | 2066040 | SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, ARRAY(SELECT (SELECT t.name FROM tags
+ 10273 | 14107 | 1.373 |          274 | 2821547 | SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, ARRAY(SELECT (SELECT t.name FROM tags
+ 20138 | 14017 | 0.696 |           27 |  547404 | SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at, ARRAY(SELECT (SELECT t.name F
+  3681 |  9211 | 2.502 |           72 |  265542 | SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, ARRAY(SELECT (SELECT t.name FROM tags
+  1151 |  6219 | 5.403 |           31 |   36352 | WITH a AS (SELECT id FROM articles WHERE slug = $1), c AS (INSERT INTO comments (article_id, author_id, body) 
+  3706 |  4695 | 1.267 |          215 |  798829 | SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, ARRAY(SELECT (SELECT t.name FROM tags
+   938 |  4619 | 4.924 |          108 |  102232 | SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, ARRAY(SELECT (SELECT t.name FROM tags
+ 17217 |  4063 | 0.236 |           49 |  853806 | SELECT name FROM tags ORDER BY name
+ 10273 |  3898 | 0.379 |            6 |   61638 | SELECT count(*) FROM (SELECT $1 FROM articles a LIMIT $2) s
+  6943 |  3264 | 0.470 |           39 |  274206 | SELECT count(*) FROM (SELECT $2 FROM articles a WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WH
+  3706 |  3118 | 0.841 |            9 |   35340 | SELECT count(*) FROM (SELECT $2 FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name =
+(12 rows)
+

@@ -1,19 +1,15 @@
 require "./api"
 require "./passwords"
+require "./reads"
 
 app = Rayo::App.new
 app.gzip = ENV["GZIP"]? != "0"
-app.on_worker_start { |_index| Passwords.start }
-
-app.get "/api/tags" do |ctx|
-  ctx.db.query(Sql::TAGS) do |res, ctx|
-    unless res.error?
-      ctx.json do |j|
-        j.object { j.field("tags") { j.array { res.each { |row| j.value(row.str(0)) } } } }
-      end
-    end
-  end
+app.on_worker_start do |_index|
+  Passwords.start
+  Conduit::Reads.start
 end
+
+app.get("/api/tags") { |ctx| Conduit::Reads.enqueue(ctx, 7, 0_i64) }
 
 app.post "/api/users" do |ctx|
   Conduit.handle(ctx) do
@@ -109,13 +105,8 @@ app.get "/api/articles" do |ctx|
         kind = i + 1
       end
     end
-    Conduit.state(ctx).count_kind = 12 + kind
-    if kind == 0
-      ctx.db.query(Sql::LIST_ALL, viewer, limit, offset) { |res, ctx| Conduit.list(ctx, res) }
-    else
-      value = Conduit.decode(ctx, ctx.query({"tag", "author", "favorited"}[kind - 1]))
-      ctx.db.query(Sql::LISTS[kind], viewer, limit, offset, value) { |res, ctx| Conduit.list(ctx, res) }
-    end
+    value = kind == 0 ? Bytes.empty : Conduit.decode(ctx, ctx.query({"tag", "author", "favorited"}[kind - 1]))
+    Conduit::Reads.enqueue(ctx, kind, viewer, limit, offset, value)
   end
 end
 
@@ -123,15 +114,14 @@ app.get "/api/articles/feed" do |ctx|
   Conduit.handle(ctx) do
     viewer = Conduit.auth(ctx)
     limit, offset = Conduit.page(ctx)
-    Conduit.state(ctx).count_kind = 17
-    ctx.db.query(Sql::FEED, viewer, limit, offset) { |res, ctx| Conduit.list(ctx, res) }
+    Conduit::Reads.enqueue(ctx, 4, viewer, limit, offset)
   end
 end
 
 app.get "/api/articles/:slug" do |ctx|
   Conduit.handle(ctx) do
-    Conduit.auth(ctx, false)
-    Conduit.fetch_slug(ctx)
+    viewer = Conduit.auth(ctx, false)
+    Conduit::Reads.enqueue(ctx, 5, viewer, key: Conduit.decode(ctx, ctx.param("slug")))
   end
 end
 
@@ -215,21 +205,7 @@ end
 app.get "/api/articles/:slug/comments" do |ctx|
   Conduit.handle(ctx) do
     Conduit.auth(ctx, false)
-    ctx.db.query(Sql::ARTICLE_ID, Conduit.decode(ctx, ctx.param("slug"))) do |res, ctx|
-      unless res.error?
-        if res.first?
-          ctx.db.query(Sql::COMMENTS, Conduit.state(ctx).viewer, Conduit.decode(ctx, ctx.param("slug"))) do |res, ctx|
-            unless res.error?
-              ctx.json do |j|
-                j.object { j.field("comments") { j.array(res) { |row| Conduit.comment(ctx, row, row.bool(7)) } } }
-              end
-            end
-          end
-        else
-          Conduit.error(ctx, 404)
-        end
-      end
-    end
+    Conduit::Reads.enqueue(ctx, 6, Conduit.state(ctx).viewer, key: Conduit.decode(ctx, ctx.param("slug")))
   end
 end
 
@@ -260,8 +236,8 @@ app.delete "/api/articles/:slug/comments/:id" do |ctx|
 end
 
 workers = (ENV["WORKERS"]? || Rayo::Sys.ncpu.to_s).to_i
-raise "WORKERS must be between 1 and 95" unless 1 <= workers <= 95
-pool = (ENV["PG_CONNS"]? || (95 // workers).clamp(1, 4).to_s).to_i
-raise "connection budget exceeds 95" unless pool > 0 && workers * pool <= 95
+raise "WORKERS must be between 1 and 31" unless 1 <= workers <= 31
+pool = (ENV["PG_CONNS"]? || (95 // workers - 2).clamp(1, 2).to_s).to_i
+raise "connection budget exceeds 95" unless pool > 0 && workers * (pool + 2) <= 95
 app.run host: ENV.fetch("HOST", "127.0.0.1"), port: ENV.fetch("PORT", "3000").to_i,
   workers: workers, database: ENV["DATABASE_URL"], pool: pool

@@ -18,13 +18,11 @@ module Conduit
   class State
     getter scratch = Rayo::Buf.new(1024)
     getter tags = Rayo::PG::Batch.new
-    getter tag_names = [] of Bytes
     getter array_scratch = Rayo::Buf.new(1024)
     getter token = Bytes.new(4096)
     getter claims = Bytes.new(4096)
     getter payload = Rayo::Buf.new(128)
     property viewer = 0_i64
-    property count_kind = 12
     property fresh = false
   end
 
@@ -199,7 +197,7 @@ module Conduit
     ctx.json user: {email: row.str(2), token: tok, username: row.str(1), bio: nullable(row, 3), image: nullable(row, 4)}
   end
 
-  # Build ordinary NamedTuples; PG views stay valid throughout serialization.
+  # Conduit requires millisecond precision; Rayo timestamps emit microseconds.
   def self.timestamp(ctx, bytes)
     b = state(ctx).scratch
     p = b.reserve(24)
@@ -215,28 +213,28 @@ module Conduit
     Bytes.new(p, 24)
   end
 
-  def self.article_fields(ctx, row, full)
-    s = state(ctx)
-    s.scratch.clear
-    n = full ? 1 : 0
-    s.scratch.reserve(row.str(6 + n).size + 48)
-    s.tag_names.clear
-    s.array_scratch.clear
-    s.array_scratch.reserve(row.str(6 + n).size)
-    row.each_array(6 + n, Bytes.new(s.array_scratch.ptr, s.array_scratch.cap)) do |tag|
-      if tag
-        # Copy each decoded tag before the array parser reuses its scratch.
-        dst = s.scratch.tail
-        dst.copy_from(tag.to_unsafe, tag.size)
-        s.tag_names << Bytes.new(dst, tag.size)
-        s.scratch.len += tag.size
+  struct TagList
+    def initialize(@row : Row, @col : Int32, @scratch : Rayo::Buf)
+    end
+
+    def to_json(j : Rayo::JSON::Writer)
+      @scratch.reserve(@row.str(@col).size)
+      j.array do
+        @row.each_array(@col, Bytes.new(@scratch.ptr, @scratch.cap)) { |tag| j.value(tag) }
       end
     end
+  end
+
+  def self.article_fields(ctx, row, full, favorited = row.bool(8 + (full ? 1 : 0)), following = row.bool(12 + (full ? 1 : 0)), include_body = full)
+    s = state(ctx)
+    s.scratch.clear
+    s.scratch.reserve(48)
+    n = full ? 1 : 0
     fields = {slug: row.str(1), title: row.str(2), description: row.str(3),
               createdAt: timestamp(ctx, row.str(4 + n)), updatedAt: timestamp(ctx, row.str(5 + n)),
-              tagList: Slice.new(s.tag_names.to_unsafe, s.tag_names.size), favoritesCount: row.i64(7 + n), favorited: row.bool(8 + n),
-              author: profile(row, 9 + n, row.bool(12 + n))}
-    full ? fields.merge({body: row.str(4)}) : fields
+              tagList: TagList.new(row, 6 + n, s.array_scratch), favoritesCount: row.i64(7 + n), favorited: favorited,
+              author: profile(row, 9 + n, following)}
+    include_body ? fields.merge({body: row.str(4)}) : fields
   end
 
   def self.article(ctx, res)
@@ -256,39 +254,10 @@ module Conduit
     ctx.db.query(Sql::ARTICLE_BY_SLUG, state(ctx).viewer, decode(ctx, ctx.param("slug"))) { |res, ctx| Conduit.article(ctx, res) }
   end
 
-  def self.list(ctx, res)
-    return if res.error?
-    ctx.json do |j|
-      j.object do
-        j.field("articles") { j.array(res) { |row| article_fields(ctx, row, false) } }
-      end
-    end
-    # Keep the page in ctx.output while its count query runs. The same request
-    # stays deferred and the page result is never retained beyond this callback.
-    ctx.output.len -= 1
-    k = state(ctx).count_kind
-    case k
-    when 12
-      ctx.db.query(Sql::COUNT_ALL) { |res, ctx| Conduit.count(ctx, res) }
-    when 17
-      ctx.db.query(Sql::COUNT_FEED, state(ctx).viewer) { |res, ctx| Conduit.count(ctx, res) }
-    else
-      key = {"tag", "author", "favorited"}[k - 13]
-      ctx.db.query(Sql::COUNTS[k - 12], decode(ctx, ctx.query(key))) { |res, ctx| Conduit.count(ctx, res) }
-    end
-  end
-
-  def self.count(ctx, res)
-    return error(ctx, 500) if res.error?
-    if row = res.first?
-      ctx.output << ",\"articlesCount\":" << row.i64(0) << "}"
-    end
-  end
-
-  def self.comment(ctx, row, following)
+  def self.comment(ctx, row, following, col = 0)
     state(ctx).scratch.clear
     state(ctx).scratch.reserve(48)
-    {id: row.i64(0), body: row.str(1), createdAt: timestamp(ctx, row.str(2)), updatedAt: timestamp(ctx, row.str(3)), author: profile(row, 4, following)}
+    {id: row.i64(col), body: row.str(col + 1), createdAt: timestamp(ctx, row.str(col + 2)), updatedAt: timestamp(ctx, row.str(col + 3)), author: profile(row, col + 4, following)}
   end
 
   def self.deleted(ctx, res)

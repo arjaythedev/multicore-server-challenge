@@ -4,15 +4,15 @@ Front: direct
 
 | Component | Version / implementation |
 |---|---|
-| Crystal | 1.22.1, release build, `-Dwithout_mt`, x86-64-v3 CPU target |
-| Framework | [Rayo](https://github.com/faustinoaq/rayo), commit `e0006c8b773dae7b75d78eedab314419fb08c0e9` |
-| PostgreSQL driver | Rayo::PG, prepared statements and pipelining |
+| Crystal | 1.22.1, `--release --mcpu x86-64-v3 -Dwithout_mt` |
+| Framework | [Rayo](https://github.com/faustinoaq/rayo), commit `c5358eda5b209dec85eda8dc4ca703e727065b6f` |
+| PostgreSQL driver | Rayo::PG, prepared statements, pipelining and application read batches |
 | Network I/O | Rayo io_uring, `SO_REUSEPORT`; Linux 6.1+ with io_uring allowed |
 | JWT | Rayo::JWT, HS256 through OpenSSL libcrypto |
-| Password hashing | Interleaved Crystal EksBlowfish, cost 10; libcrypt salts and compatibility fallback |
-| Compression | Application middleware, libdeflate gzip level 1 |
+| Password hashing | Rayo::Bcrypt::Pool, cost 10, interleaved lanes and libcrypt fallback |
+| Compression | Rayo gzip, libdeflate |
 
-The shard manifest and lockfile pin Rayo. `install.sh` pins Crystal and checks the
+The manifest and lockfile pin Rayo. `install.sh` pins Crystal and checks the
 SHA-256 digest of its official archive. System libraries use Ubuntu packages.
 
 ```bash
@@ -24,45 +24,48 @@ JWT_SECRET=multicore-server-challenge HOST=0.0.0.0 PORT=80 bash start.sh
 
 ## Design
 
-This is a Rayo application: routes use `ctx.db.query`, `ctx.json`, streaming JSON
-arrays, borrowed request-body readers and `Rayo::JWT`. Rayo owns HTTP parsing,
-routing, io_uring, prepared statements, database pipelining and worker supervision.
-`App#run` starts one worker per available CPU by default. Each worker owns its
-listener, database connections, reusable buffers and bcrypt thread.
+Routes use `ctx.db.query`, `ctx.json`, streaming JSON arrays, borrowed JSON body
+readers and `Rayo::JWT`. Rayo owns HTTP parsing, routing, io_uring, database
+pipelining and worker supervision. `App#run` starts one worker per available CPU.
+`app.on_worker_start` creates each worker's bcrypt pool and read coordinator;
+`app.gzip` enables response compression. Custom tag serialization uses Rayo's
+shared JSON writer directly.
 
-The SQL comes from the hand-rolled Crystal entry: indexed tag lookups, bounded
-feed queries, capped counts and CTEs for dependent writes. Article creation,
-tag upserts and article/tag links commit in one statement; responses wait for
-Postgres ReadyForQuery. Follow-up article reads see the committed write.
-Rayo pipelines independent queries within each event-loop turn. This entry
-uses per-request SQL, without the hand-rolled entry's shared article enrichment,
-cross-request read batches or optional group commit.
+Read batches port the hand-rolled entry's SQL and shared enrichment approach:
 
-Each authenticated request verifies HS256 and expiry. Every login reads its hash
-from Postgres and verifies it with cost-10 bcrypt. There is no result, response,
-password or token-verification cache. Request arenas and serialization scratch
-are reused, but their contents are read only for the current request.
+- Up to 128 waiting article requests share page selection and capped counts.
+  Identical page/count keys are deduplicated within that round.
+- The distinct article union is enriched once, including sorted tags and favorite
+  counts. Bodies are fetched only for full-article requests.
+- Viewer/article pairs share indexed favorite and follow lookups. Application
+  fan-out applies the correct flags to each request using borrowed PG rows.
+- Comment reads share slug lookups and comment enrichment, with follow flags
+  grouped by viewer. Empty threads and missing articles remain distinct.
+- Waiting tag requests share one database read. Results are discarded after
+  answering the round. There are no caches across requests.
 
-Bcrypt runs in pthreads outside the event loop. Each thread gathers up to six
-jobs for at most 200 ms, interleaves independent EksBlowfish states, and returns
-results through a socket watched by Rayo. Underfilled groups compute only their
-actual lane count. libcrypt handles unusual formats, noncanonical salts and
-high-bit `$2a$` compatibility cases. Completed jobs return to a retained pool;
-deferred handles protect disconnected or reused HTTP slots.
+Two dedicated Rayo::PG connections per worker serve these rounds; ordinary
+`ctx.db.query` connections handle auth, profiles and writes. Each connection has
+at most one read round in flight, so waiting requests collect while Postgres is
+busy. Read sessions use the epoll entry's session-local planner settings:
+`jit=off`, `plan_cache_mode=force_generic_plan`,
+`max_parallel_workers_per_gather=0` and `enable_seqscan=off`.
+No schema or global database settings change.
 
-Gzip is response middleware using `app.after`. JSON of at least 1,024 bytes is
-compressed only when accepted and smaller; explicit gzip `q=0` is respected.
-No compressed response is cached across requests.
+Writes use the original indexed queries and CTEs. Article creation, tag upserts
+and article/tag links commit together; follow-up reads happen after ReadyForQuery.
+Responses wait for committed writes. Write group commit is not implemented.
 
-The build selects Crystal's single-thread runtime with `-Dwithout_mt`; bcrypt
-still uses explicitly managed pthreads. This avoids a reproducible multiworker
-GC failure with the default Crystal runtime (see integration notes below).
-The normal garbage collector remains enabled. Validation deliberately raises
-exceptions for malformed JSON, invalid tokens and invalid fields; those paths
-allocate. Connection state and bcrypt job pools also grow on first use. Building
-this application with `-Dgc_none` would retain exception allocations on repeated
-invalid requests. Reused byte arenas avoid string building on warmed successful
-requests without making a zero-allocation claim.
+Every authenticated request verifies HS256 and expiry. Every login reads its
+hash from Postgres and performs bcrypt verification. Rayo's bounded password
+pool runs helper threads after fork and composes password/database callbacks
+without touching framework completion counters. No password or token result is
+cached. Gzip is negotiated by Rayo for responses of at least 1,024 bytes.
+
+The build keeps the garbage collector enabled: malformed input uses exceptions,
+and retained connection state and batch collections can grow. This application
+does not claim zero allocation per request. `-Dwithout_mt` satisfies Rayo's
+multiworker fork guard; bcrypt still runs its explicitly managed native threads.
 
 ## Settings
 
@@ -70,76 +73,54 @@ requests without making a zero-allocation claim.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `WORKERS` | Available CPU count | Rayo worker processes |
-| `PG_CONNS` | `(95 // WORKERS).clamp(1, 4)` | Connections per worker |
-| `BCRYPT_THREADS` | 1 | Bcrypt pthreads per worker |
-| `BCRYPT_WINDOW_MS` | 200 | Maximum lane collection wait, clamped to 0–400 ms |
-| `BCRYPT_LANES` | 6 | Set to 1 for libcrypt instead of the lane implementation |
-| `GZIP` | 1 | Set to 0 to disable gzip middleware |
+| `WORKERS` | Available CPU count | Rayo workers, valid 1–31 |
+| `PG_CONNS` | `(95 // WORKERS - 2).clamp(1, 2)` | Ordinary connections per worker, plus two read connections |
+| `BCRYPT_THREADS` | 1 | Bcrypt helpers per worker |
+| `BCRYPT_WINDOW_MS` | 200 | Rayo lane collection wait, clamped to 0–400 ms |
+| `GZIP` | 1 | Set to 0 to disable Rayo gzip |
 
-Startup rejects worker/pool settings that exceed 95 total database connections.
-No schema or global Postgres settings change.
+Startup enforces `WORKERS * (PG_CONNS + 2) <= 95`. Each worker's bcrypt queue
+has capacity 1,024 and uses cost 10. `BCRYPT_LANES` was removed with the local
+bcrypt engine; Rayo chooses its fast lanes or compatibility fallback.
 
 ## Validation
 
-Built and tested inside `crdev`, with Crystal 1.22.1:
+Inside `crdev`, Crystal 1.22.1, three workers, port 3391:
 
-- `bash test/run.sh submissions/crystal-rayo-faustinoaq`: **197/197 checks passed** on a fresh development-seed copy, three workers, port 3291.
-- `crystal build --release --mcpu x86-64-v3 test/bcrypt.cr -o bin/test-bcrypt && bin/test-bcrypt`: **1,000 cost-10 hashes match libcrypt**, including 1/2/3/4/5/6/8 lanes, random salts, 0–72 byte passwords and the seed hash.
-- `DATABASE_URL=... python3 test/bcrypt_fallback.py http://HOST:PORT`: high-bit `$2a$`, UTF-8 `$2b$`, `$2y$` and 72-byte passwords; matching passwords accepted and wrong passwords rejected.
-- `python3 test/concurrency.py http://HOST:PORT`: 24 concurrent logins, disconnects with pending password jobs, ordered HTTP pipelining, 800 concurrent article requests, gzip/identity equivalence and explicit gzip `q=0`.
+- Challenge harness: **197/197 checks passed** after the migration and after read batching.
+- `bash test/integration.sh`: bcrypt compatibility, 24 concurrent logins,
+  pending-job disconnects, ordered HTTP pipelining, 800 concurrent article
+  requests and gzip negotiation passed. Another **540 mixed reads** matched
+  isolated reads across anonymous and authenticated viewers, including follow
+  and favorite flags, empty pages, missing articles and disconnected readers.
+- `crystal build --release --mcpu x86-64-v3 -Dwithout_mt test/bcrypt.cr -o bin/test-bcrypt && bin/test-bcrypt`:
+  **1,000 cost-10 hashes match libcrypt**, exercising Rayo's 1/2/3/4/5/6/8 lanes.
 
-The HTTP tests use isolated scratch databases. Drop those databases after testing.
+The test scripts use isolated databases and drop them afterward. Captured output
+is in [results/](results/).
 
 ## Rayo integration notes
 
-These observations apply to the pinned Rayo commit; the framework repository was
-left unchanged.
+The previous local bcrypt engine/adapter, gzip middleware and completion-counter
+workaround were deleted. Rayo's shared writer also removes the need to copy
+individual decoded tags into a separate list before serialization. Production
+`src/*.cr` decreased from **1,305 to 1,105 lines**, including SQL and blank lines.
 
-- `src/rayo/json.cr:603`: the custom-value branch calls `v.to_json(self)` on a
-  struct writer copy. `j.object { j.field("custom", custom_value) }` raises
-  `Rayo::JSON::Error: missing field value`, even when the custom method calls
-  `j.value("value")`. The original writer retains its pending-field flag. The
-  application avoids custom JSON values and returns NamedTuples containing
-  ordinary byte slices and slices of tag names instead.
-- `src/rayo/app.cr:93`: `App#run` forks workers with `LibC.fork`. With Crystal
-  1.22.1's default runtime and GC enabled, the concurrent article test reproducibly
-  crashes in serialization (`Buf#grow`/`realloc` or `Array#clear`). The same test
-  passes with one worker, with collection disabled for diagnosis, and with three
-  workers built with `-Dwithout_mt`. The shipped build uses the last option and
-  keeps GC enabled. The underlying fork/GC interaction still needs investigation;
-  the observed crash alone does not establish its internal cause.
-- `src/rayo/pg/worker_pool.cr:78`: a PG callback completes the HTTP response when
-  `ctx.db_pending` reaches zero, even if that callback calls `ctx.defer` for
-  external work. The bcrypt adapter temporarily increments this counter and
-  releases it after the password result or a chained query. A public way to
-  compose database and external asynchronous deferrals would remove this use of
-  framework bookkeeping.
+No new framework bug was found. Two application pieces remain:
 
-Candidates to upstream: the threaded multi-lane bcrypt adapter in
-`src/passwords.cr`/`src/bcrypt_lanes.cr`, gzip middleware in `src/compression.cr`,
-and a public external-work deferral guard. Application validation and Conduit SQL
-remain specific to this submission.
+- Conduit requires UTC timestamps with exactly three fractional digits; Rayo's
+  `JSON::Timestamp` emits six. The small millisecond formatter remains. Optional
+  timestamp precision would be a useful generic API addition.
+- Rayo::PG::Batch builds reusable array parameters but does not schedule and fan
+  out cross-request reads. `src/reads.cr` owns that policy using Rayo's public
+  deferred handles, loop flusher and PG ring transport. A generic coordinator
+  could move upstream; the Conduit SQL and response shapes belong here.
 
-## Local mc2 comparison
+SQLite, multiple ports and affected-row hooks are not needed by this API.
+Remaining differences from epoll include its adaptive read collection windows,
+user/profile batching, optional write group commit and allocation-free data
+structures. This entry prioritizes ordinary framework routes and serialization.
 
-Same-session full-seed runs on October 28, 2026, using the supplied `mcbox.sh`
-helper and the shared `flock` lock: **3,000 connections/users**, think scale 0.1,
-30 s ramp, 60 s measured, 5 s tail. mc2 exposed three CPUs (3–5), shared with
-Postgres. Defaults were used: Rayo had three workers/12 database connections;
-the epoll entry had two workers/eight database connections.
+## Local mc2 sanity comparison
 
-| Entry | req/s | p95 (ms) | p99 (ms) | Errors | PG CPU-s | App CPU-s | Verdict |
-|---|---:|---:|---:|---:|---:|---:|---|
-| Crystal epoll | 5,614.6 | 741.9 | 1,119.2 | 0% | 72 | 56 | FAIL: latency |
-| Crystal Rayo | 5,254.9 | 346.9 | 410.1 | 0% | 187 | 71 | PASS |
-
-CPU seconds cover the whole traffic run. Total mc2 cgroup peak memory was
-3,070 MiB for epoll and 3,071 MiB for Rayo, including Postgres and file cache;
-neither run had an OOM. The load generator was not limited in either run.
-Rayo sustained less throughput with lower tail latency in this comparison, and
-used substantially more database CPU. The hand-rolled entry shares article
-lookups/enrichment across waiting requests; this application uses Rayo's query
-pipelining with per-request statements. These short runs are not official scores.
-
-See [results/](results/) for commands, source snapshot and captured summaries.
+Pending results. The final clean comparison will be run separately.

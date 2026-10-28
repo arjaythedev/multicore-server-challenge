@@ -1,0 +1,7 @@
+80 hashes at cost 10, 1 lanes: match libcrypt
+40 hashes at cost 10, 2 lanes: match libcrypt
+60 hashes at cost 10, 3 lanes: match libcrypt
+100 hashes at cost 10, 5 lanes: match libcrypt
+160 hashes at cost 10, 4 lanes: match libcrypt
+240 hashes at cost 10, 6 lanes: match libcrypt
+320 hashes at cost 10, 8 lanes: match libcrypt
