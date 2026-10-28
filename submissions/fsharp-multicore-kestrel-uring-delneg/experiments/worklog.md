@@ -345,3 +345,6 @@ feed count proof adopted, #91's hashagg off measured (no effect).
 - **63 planner clock off the batch clock** (18 and 25 ms, rotated, 14k): 18 ms 152.7 / 155.1 / 145.9, 25 ms
   156.1 / 144.6 / 141.5, 20 ms 151.4 / 159.2 / 145.2. None reached n=62's fast mode (all 29.1-30.7k req/s), so
   the two clocks firing together was not its cause. **Discarded.**
+- **64 planner clock 30 ms** (order flipped per round): 14k 151.2 / 151.6 / 148.3 / 154.2 vs 151.8 / 154.5 /
+  155.4 / 155.9 (-2.0%: PG -4, app +2); 12k 167.0 / 161.9 / 161.3 vs 158.8 / 160.5 / 159.1 (+2.5%); req/s -4%,
+  p95 +30-50 ms. **Discarded**: the clock stays 20 ms (10, 15, 18, 25 and 30 ms all measured).
