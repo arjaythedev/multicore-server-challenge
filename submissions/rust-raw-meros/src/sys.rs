@@ -39,7 +39,13 @@ mod ffi {
 
     unsafe extern "C" {
         pub fn socket(domain: c_int, ty: c_int, protocol: c_int) -> c_int;
-        pub fn setsockopt(fd: c_int, level: c_int, name: c_int, value: *const c_void, len: c_uint) -> c_int;
+        pub fn setsockopt(
+            fd: c_int,
+            level: c_int,
+            name: c_int,
+            value: *const c_void,
+            len: c_uint,
+        ) -> c_int;
         pub fn bind(fd: c_int, addr: *const SockAddrIn, len: c_uint) -> c_int;
         pub fn listen(fd: c_int, backlog: c_int) -> c_int;
         pub fn accept4(fd: c_int, addr: *mut c_void, len: *mut c_uint, flags: c_int) -> c_int;
@@ -47,7 +53,12 @@ mod ffi {
         pub fn write(fd: c_int, buf: *const c_void, len: usize) -> isize;
         pub fn epoll_create1(flags: c_int) -> c_int;
         pub fn epoll_ctl(epfd: c_int, op: c_int, fd: c_int, event: *mut EpollEvent) -> c_int;
-        pub fn epoll_wait(epfd: c_int, events: *mut EpollEvent, max: c_int, timeout_ms: c_int) -> c_int;
+        pub fn epoll_wait(
+            epfd: c_int,
+            events: *mut EpollEvent,
+            max: c_int,
+            timeout_ms: c_int,
+        ) -> c_int;
         pub fn eventfd(initval: c_uint, flags: c_int) -> c_int;
         pub fn getrlimit(resource: c_int, rlim: *mut RLimit) -> c_int;
         pub fn setrlimit(resource: c_int, rlim: *const RLimit) -> c_int;
@@ -89,12 +100,24 @@ pub const EPOLLRDHUP: u32 = 0x2000;
 pub const EPOLLET: u32 = 1 << 31;
 
 fn check(ret: i32) -> io::Result<i32> {
-    if ret < 0 { Err(io::Error::last_os_error()) } else { Ok(ret) }
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(ret)
+    }
 }
 
 fn set_int_option(fd: RawFd, level: i32, name: i32, value: i32) -> io::Result<()> {
     // SAFETY: `value` outlives the call and the length matches its type.
-    let ret = unsafe { ffi::setsockopt(fd, level, name, (&raw const value).cast(), size_of::<i32>() as u32) };
+    let ret = unsafe {
+        ffi::setsockopt(
+            fd,
+            level,
+            name,
+            (&raw const value).cast(),
+            size_of::<i32>() as u32,
+        )
+    };
     check(ret).map(|_| ())
 }
 
@@ -109,7 +132,12 @@ pub fn listen_reuseport(ip: [u8; 4], port: u16, backlog: i32) -> io::Result<Owne
     set_int_option(fd, SOL_SOCKET, SO_REUSEPORT, 1)?;
     // Accepted sockets inherit this: every response leaves in one write, so Nagle only adds delay.
     set_int_option(fd, IPPROTO_TCP, TCP_NODELAY, 1)?;
-    let addr = ffi::SockAddrIn { family: AF_INET as u16, port: port.to_be(), addr: u32::from_ne_bytes(ip), zero: [0; 8] };
+    let addr = ffi::SockAddrIn {
+        family: AF_INET as u16,
+        port: port.to_be(),
+        addr: u32::from_ne_bytes(ip),
+        zero: [0; 8],
+    };
     // SAFETY: `addr` is a valid `sockaddr_in` and the length is its size.
     check(unsafe { ffi::bind(fd, &addr, size_of::<ffi::SockAddrIn>() as u32) })?;
     // SAFETY: plain system call on an owned descriptor.
@@ -120,7 +148,14 @@ pub fn listen_reuseport(ip: [u8; 4], port: u16, backlog: i32) -> io::Result<Owne
 /// Accepts one connection, non-blocking. `Ok(None)` when the queue is empty.
 pub fn accept(listener: RawFd) -> io::Result<Option<OwnedFd>> {
     // SAFETY: null address pointers are allowed; the flags make the new descriptor non-blocking and close-on-exec.
-    let ret = unsafe { ffi::accept4(listener, std::ptr::null_mut(), std::ptr::null_mut(), SOCK_NONBLOCK | SOCK_CLOEXEC) };
+    let ret = unsafe {
+        ffi::accept4(
+            listener,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            SOCK_NONBLOCK | SOCK_CLOEXEC,
+        )
+    };
     if ret >= 0 {
         // SAFETY: `ret` is a fresh descriptor that nothing else owns.
         return Ok(Some(unsafe { OwnedFd::from_raw_fd(ret) }));
@@ -233,7 +268,10 @@ impl Epoll {
     }
 
     fn control(&self, op: i32, fd: RawFd, events: u32, token: u64) -> io::Result<()> {
-        let mut event = ffi::EpollEvent { events, data: token };
+        let mut event = ffi::EpollEvent {
+            events,
+            data: token,
+        };
         // SAFETY: `event` is valid for the duration of the call.
         check(unsafe { ffi::epoll_ctl(self.fd.as_raw_fd(), op, fd, &mut event) }).map(|_| ())
     }
@@ -257,12 +295,26 @@ impl Epoll {
     pub fn wait(&mut self, timeout_ms: i32, out: &mut Vec<Event>) -> io::Result<()> {
         out.clear();
         // SAFETY: `raw` has room for `raw.len()` events.
-        let n = unsafe { ffi::epoll_wait(self.fd.as_raw_fd(), self.raw.as_mut_ptr(), self.raw.len() as i32, timeout_ms) };
+        let n = unsafe {
+            ffi::epoll_wait(
+                self.fd.as_raw_fd(),
+                self.raw.as_mut_ptr(),
+                self.raw.len() as i32,
+                timeout_ms,
+            )
+        };
         if n < 0 {
             let err = io::Error::last_os_error();
-            return if err.kind() == io::ErrorKind::Interrupted { Ok(()) } else { Err(err) };
+            return if err.kind() == io::ErrorKind::Interrupted {
+                Ok(())
+            } else {
+                Err(err)
+            };
         }
-        out.extend(self.raw[..n as usize].iter().map(|e| Event { token: e.data, bits: e.events }));
+        out.extend(self.raw[..n as usize].iter().map(|e| Event {
+            token: e.data,
+            bits: e.events,
+        }));
         Ok(())
     }
 }
@@ -369,13 +421,22 @@ mod tests {
         }
         let accepted = accepted.expect("a connection");
         let mut buf = [0u8; 16];
-        assert_eq!(read_nonblocking(accepted.as_raw_fd(), &mut buf).unwrap(), Io::WouldBlock);
+        assert_eq!(
+            read_nonblocking(accepted.as_raw_fd(), &mut buf).unwrap(),
+            Io::WouldBlock
+        );
         use std::io::Write;
         client.write_all(b"hello").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        assert_eq!(read_nonblocking(accepted.as_raw_fd(), &mut buf).unwrap(), Io::Done(5));
+        assert_eq!(
+            read_nonblocking(accepted.as_raw_fd(), &mut buf).unwrap(),
+            Io::Done(5)
+        );
         assert_eq!(&buf[..5], b"hello");
-        assert_eq!(write_nonblocking(accepted.as_raw_fd(), b"ok").unwrap(), Io::Done(2));
+        assert_eq!(
+            write_nonblocking(accepted.as_raw_fd(), b"ok").unwrap(),
+            Io::Done(2)
+        );
     }
 
     #[test]

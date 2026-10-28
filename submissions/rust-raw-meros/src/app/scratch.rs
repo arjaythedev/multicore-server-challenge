@@ -21,12 +21,16 @@ pub struct Scratch {
 /// The range of `part` inside `base`. `part` must be a subslice of `base`.
 pub fn field_of(base: &[u8], part: &[u8]) -> Field {
     let start = (part.as_ptr() as usize).wrapping_sub(base.as_ptr() as usize);
-    debug_assert!(start <= base.len() && start + part.len() <= base.len(), "not a subslice");
+    debug_assert!(
+        start <= base.len() && start + part.len() <= base.len(),
+        "not a subslice"
+    );
     Field::new(start..start + part.len())
 }
 
 impl Scratch {
     /// A field for `text`, which is either a subslice of `base` (free) or newly decoded (copied once).
+    #[allow(clippy::ptr_arg)] // the Borrowed/Owned variant is the point: borrowed text is free
     pub fn field(&mut self, base: &[u8], text: &Cow<'_, [u8]>) -> Field {
         match text {
             Cow::Borrowed(part) => field_of(base, part),
@@ -35,6 +39,7 @@ impl Scratch {
     }
 
     /// Like [`Scratch::field`] for a JSON string.
+    #[allow(clippy::ptr_arg)] // as above
     pub fn field_str(&mut self, base: &[u8], text: &Cow<'_, str>) -> Field {
         match text {
             Cow::Borrowed(part) => field_of(base, part.as_bytes()),
@@ -45,7 +50,10 @@ impl Scratch {
     fn stash(&mut self, decoded: &[u8]) -> Field {
         let start = self.bytes.len() as u32;
         self.bytes.extend_from_slice(decoded);
-        Field { start: start | SCRATCH_BIT, end: (start + decoded.len() as u32) | SCRATCH_BIT }
+        Field {
+            start: start | SCRATCH_BIT,
+            end: (start + decoded.len() as u32) | SCRATCH_BIT,
+        }
     }
 
     /// Appends the decoded bytes to `buf` and points the stashed fields at them.

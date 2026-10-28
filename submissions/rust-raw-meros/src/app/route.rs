@@ -10,18 +10,39 @@ pub enum Route<'a> {
     Login,
     CurrentUser,
     UpdateUser,
-    Profile { username: &'a [u8] },
-    Follow { username: &'a [u8], follow: bool },
+    Profile {
+        username: &'a [u8],
+    },
+    Follow {
+        username: &'a [u8],
+        follow: bool,
+    },
     ListArticles,
     Feed,
-    Article { slug: &'a [u8] },
+    Article {
+        slug: &'a [u8],
+    },
     CreateArticle,
-    UpdateArticle { slug: &'a [u8] },
-    DeleteArticle { slug: &'a [u8] },
-    Favorite { slug: &'a [u8], favorite: bool },
-    Comments { slug: &'a [u8] },
-    AddComment { slug: &'a [u8] },
-    DeleteComment { slug: &'a [u8], id: &'a [u8] },
+    UpdateArticle {
+        slug: &'a [u8],
+    },
+    DeleteArticle {
+        slug: &'a [u8],
+    },
+    Favorite {
+        slug: &'a [u8],
+        favorite: bool,
+    },
+    Comments {
+        slug: &'a [u8],
+    },
+    AddComment {
+        slug: &'a [u8],
+    },
+    DeleteComment {
+        slug: &'a [u8],
+        id: &'a [u8],
+    },
     Tags,
     /// No such path, or a method the path does not support.
     NotFound,
@@ -51,9 +72,14 @@ pub fn route<'a>(method: Method, path: &'a [u8]) -> Route<'a> {
             Put => Route::UpdateUser,
             _ => Route::NotFound,
         },
-        (b"profiles", Some(name), None, _, Get) if !name.is_empty() => Route::Profile { username: name },
+        (b"profiles", Some(name), None, _, Get) if !name.is_empty() => {
+            Route::Profile { username: name }
+        }
         (b"profiles", Some(name), Some(b"follow"), None, Post | Delete) if !name.is_empty() => {
-            Route::Follow { username: name, follow: method == Post }
+            Route::Follow {
+                username: name,
+                follow: method == Post,
+            }
         }
         (b"articles", None, ..) => match method {
             Get => Route::ListArticles,
@@ -68,7 +94,10 @@ pub fn route<'a>(method: Method, path: &'a [u8]) -> Route<'a> {
             _ => Route::NotFound,
         },
         (b"articles", Some(slug), Some(b"favorite"), None, Post | Delete) if !slug.is_empty() => {
-            Route::Favorite { slug, favorite: method == Post }
+            Route::Favorite {
+                slug,
+                favorite: method == Post,
+            }
         }
         (b"articles", Some(slug), Some(b"comments"), None, _) if !slug.is_empty() => match method {
             Get => Route::Comments { slug },
@@ -94,20 +123,68 @@ mod tests {
         assert_eq!(route(Post, b"/api/users/login"), Route::Login);
         assert_eq!(route(Get, b"/api/user"), Route::CurrentUser);
         assert_eq!(route(Put, b"/api/user"), Route::UpdateUser);
-        assert_eq!(route(Get, b"/api/profiles/ann"), Route::Profile { username: b"ann" });
-        assert_eq!(route(Post, b"/api/profiles/ann/follow"), Route::Follow { username: b"ann", follow: true });
-        assert_eq!(route(Delete, b"/api/profiles/ann/follow"), Route::Follow { username: b"ann", follow: false });
+        assert_eq!(
+            route(Get, b"/api/profiles/ann"),
+            Route::Profile { username: b"ann" }
+        );
+        assert_eq!(
+            route(Post, b"/api/profiles/ann/follow"),
+            Route::Follow {
+                username: b"ann",
+                follow: true
+            }
+        );
+        assert_eq!(
+            route(Delete, b"/api/profiles/ann/follow"),
+            Route::Follow {
+                username: b"ann",
+                follow: false
+            }
+        );
         assert_eq!(route(Get, b"/api/articles"), Route::ListArticles);
         assert_eq!(route(Get, b"/api/articles/feed"), Route::Feed);
         assert_eq!(route(Post, b"/api/articles"), Route::CreateArticle);
-        assert_eq!(route(Get, b"/api/articles/a-1"), Route::Article { slug: b"a-1" });
-        assert_eq!(route(Put, b"/api/articles/a-1"), Route::UpdateArticle { slug: b"a-1" });
-        assert_eq!(route(Delete, b"/api/articles/a-1"), Route::DeleteArticle { slug: b"a-1" });
-        assert_eq!(route(Post, b"/api/articles/a-1/favorite"), Route::Favorite { slug: b"a-1", favorite: true });
-        assert_eq!(route(Delete, b"/api/articles/a-1/favorite"), Route::Favorite { slug: b"a-1", favorite: false });
-        assert_eq!(route(Get, b"/api/articles/a-1/comments"), Route::Comments { slug: b"a-1" });
-        assert_eq!(route(Post, b"/api/articles/a-1/comments"), Route::AddComment { slug: b"a-1" });
-        assert_eq!(route(Delete, b"/api/articles/a-1/comments/7"), Route::DeleteComment { slug: b"a-1", id: b"7" });
+        assert_eq!(
+            route(Get, b"/api/articles/a-1"),
+            Route::Article { slug: b"a-1" }
+        );
+        assert_eq!(
+            route(Put, b"/api/articles/a-1"),
+            Route::UpdateArticle { slug: b"a-1" }
+        );
+        assert_eq!(
+            route(Delete, b"/api/articles/a-1"),
+            Route::DeleteArticle { slug: b"a-1" }
+        );
+        assert_eq!(
+            route(Post, b"/api/articles/a-1/favorite"),
+            Route::Favorite {
+                slug: b"a-1",
+                favorite: true
+            }
+        );
+        assert_eq!(
+            route(Delete, b"/api/articles/a-1/favorite"),
+            Route::Favorite {
+                slug: b"a-1",
+                favorite: false
+            }
+        );
+        assert_eq!(
+            route(Get, b"/api/articles/a-1/comments"),
+            Route::Comments { slug: b"a-1" }
+        );
+        assert_eq!(
+            route(Post, b"/api/articles/a-1/comments"),
+            Route::AddComment { slug: b"a-1" }
+        );
+        assert_eq!(
+            route(Delete, b"/api/articles/a-1/comments/7"),
+            Route::DeleteComment {
+                slug: b"a-1",
+                id: b"7"
+            }
+        );
         assert_eq!(route(Get, b"/api/tags"), Route::Tags);
     }
 
@@ -126,6 +203,9 @@ mod tests {
     #[test]
     fn the_feed_is_not_an_article_slug() {
         assert_eq!(route(Get, b"/api/articles/feed"), Route::Feed);
-        assert_eq!(route(Get, b"/api/articles/feed2"), Route::Article { slug: b"feed2" });
+        assert_eq!(
+            route(Get, b"/api/articles/feed2"),
+            Route::Article { slug: b"feed2" }
+        );
     }
 }

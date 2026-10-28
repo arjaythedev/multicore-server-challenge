@@ -41,10 +41,19 @@ pub struct IoThread {
 }
 
 impl IoThread {
-    pub fn new(index: u16, listener: OwnedFd, mailboxes: Mailboxes, app: Arc<App>) -> io::Result<IoThread> {
+    pub fn new(
+        index: u16,
+        listener: OwnedFd,
+        mailboxes: Mailboxes,
+        app: Arc<App>,
+    ) -> io::Result<IoThread> {
         let epoll = Epoll::new(EVENTS_PER_WAIT)?;
         epoll.add(listener.as_raw_fd(), EPOLLIN | EPOLLET, LISTENER_TOKEN)?;
-        epoll.add(mailboxes.get(index as usize).wake_fd(), EPOLLIN | EPOLLET, WAKE_TOKEN)?;
+        epoll.add(
+            mailboxes.get(index as usize).wake_fd(),
+            EPOLLIN | EPOLLET,
+            WAKE_TOKEN,
+        )?;
         Ok(IoThread {
             index,
             epoll,
@@ -110,7 +119,9 @@ impl IoThread {
 
     fn read_ready(&mut self, slot: u32) {
         loop {
-            let Some(conn) = self.slab.get_mut(slot) else { return };
+            let Some(conn) = self.slab.get_mut(slot) else {
+                return;
+            };
             let Some(fd) = conn.fd() else { return };
             let mut buf = std::mem::take(&mut conn.input);
             if buf.capacity() == 0 {
@@ -151,13 +162,22 @@ impl IoThread {
                 POOL.put(buf);
                 return;
             };
-            let id = ConnId { io: self.index, slot, generation };
+            let id = ConnId {
+                io: self.index,
+                slot,
+                generation,
+            };
             match self.app.handle(buf, id, &mut self.response) {
                 Step::NeedMore(buf) => {
                     self.keep_or_recycle(slot, buf);
                     return;
                 }
-                Step::Answered { buf: mut rest, consumed, start, keep_alive } => {
+                Step::Answered {
+                    buf: mut rest,
+                    consumed,
+                    start,
+                    keep_alive,
+                } => {
                     let more = consumed < rest.len();
                     let still_open = self.send_response(slot, start, !keep_alive);
                     if !still_open || !more || self.phase_of(slot) != Some(Phase::Reading) {
@@ -206,7 +226,9 @@ impl IoThread {
     /// Writes the shared response buffer from `start`. Returns false when the connection was closed.
     fn send_response(&mut self, slot: u32, start: usize, close: bool) -> bool {
         let bytes = self.response.bytes_from(start);
-        let Some(conn) = self.slab.get_mut(slot) else { return false };
+        let Some(conn) = self.slab.get_mut(slot) else {
+            return false;
+        };
         match Self::write_all_or_park(&self.epoll, conn, slot, bytes, close) {
             WriteOutcome::Finished => true,
             WriteOutcome::Parked => true,
@@ -218,8 +240,16 @@ impl IoThread {
     }
 
     /// Writes as much as the socket takes; parks the rest on the connection with `EPOLLOUT` interest.
-    fn write_all_or_park(epoll: &Epoll, conn: &mut super::conn::Conn, slot: u32, bytes: &[u8], close: bool) -> WriteOutcome {
-        let Some(fd) = conn.fd() else { return WriteOutcome::Closed };
+    fn write_all_or_park(
+        epoll: &Epoll,
+        conn: &mut super::conn::Conn,
+        slot: u32,
+        bytes: &[u8],
+        close: bool,
+    ) -> WriteOutcome {
+        let Some(fd) = conn.fd() else {
+            return WriteOutcome::Closed;
+        };
         let mut written = 0;
         while written < bytes.len() {
             match sys::write_nonblocking(fd, &bytes[written..]) {
@@ -229,7 +259,11 @@ impl IoThread {
             }
         }
         if written == bytes.len() {
-            return if close { WriteOutcome::Closed } else { WriteOutcome::Finished };
+            return if close {
+                WriteOutcome::Closed
+            } else {
+                WriteOutcome::Finished
+            };
         }
         // The socket is full: keep the rest (a copy, but only for big responses to slow readers).
         conn.output.clear();
@@ -237,14 +271,17 @@ impl IoThread {
         conn.output_offset = 0;
         conn.close_after_write = close;
         conn.phase = Phase::Writing;
-        if conn.interest != WRITE_INTEREST && epoll.modify(fd, WRITE_INTEREST, slot as u64).is_ok() {
+        if conn.interest != WRITE_INTEREST && epoll.modify(fd, WRITE_INTEREST, slot as u64).is_ok()
+        {
             conn.interest = WRITE_INTEREST;
         }
         WriteOutcome::Parked
     }
 
     fn write_ready(&mut self, slot: u32) {
-        let Some(conn) = self.slab.get_mut(slot) else { return };
+        let Some(conn) = self.slab.get_mut(slot) else {
+            return;
+        };
         if conn.phase != Phase::Writing {
             return;
         }
@@ -276,7 +313,9 @@ impl IoThread {
 
     fn deliver_replies(&mut self) {
         let mut replies = std::mem::take(&mut self.replies);
-        self.mailboxes.get(self.index as usize).take_all(&mut replies);
+        self.mailboxes
+            .get(self.index as usize)
+            .take_all(&mut replies);
         let mut spent = Vec::with_capacity(replies.len());
         for reply in replies.drain(..) {
             self.deliver(reply, &mut spent);
@@ -307,7 +346,9 @@ impl IoThread {
 
     /// After a response left, handle request bytes that arrived while the connection was busy.
     fn resume_buffered_input(&mut self, slot: u32) {
-        let Some(conn) = self.slab.get_mut(slot) else { return };
+        let Some(conn) = self.slab.get_mut(slot) else {
+            return;
+        };
         if conn.phase != Phase::Reading || conn.input.is_empty() {
             return;
         }
@@ -331,4 +372,3 @@ enum WriteOutcome {
     /// Written (with close requested) or failed: close the connection.
     Closed,
 }
-

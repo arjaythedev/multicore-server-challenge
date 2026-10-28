@@ -14,7 +14,10 @@ pub struct Mailbox {
 
 impl Mailbox {
     pub fn new() -> std::io::Result<Mailbox> {
-        Ok(Mailbox { inbox: Mutex::new(Vec::new()), wake: EventFd::new()? })
+        Ok(Mailbox {
+            inbox: Mutex::new(Vec::new()),
+            wake: EventFd::new()?,
+        })
     }
 
     /// The descriptor an io thread registers with its epoll.
@@ -53,7 +56,9 @@ pub struct Mailboxes(Arc<Vec<Mailbox>>);
 
 impl Mailboxes {
     pub fn new(count: usize) -> std::io::Result<Mailboxes> {
-        let boxes = (0..count).map(|_| Mailbox::new()).collect::<std::io::Result<Vec<_>>>()?;
+        let boxes = (0..count)
+            .map(|_| Mailbox::new())
+            .collect::<std::io::Result<Vec<_>>>()?;
         Ok(Mailboxes(Arc::new(boxes)))
     }
 

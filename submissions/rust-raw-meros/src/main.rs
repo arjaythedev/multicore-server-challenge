@@ -46,7 +46,13 @@ fn run() -> Result<(), String> {
         password_queue.clone(),
         jwt.clone(),
     ));
-    threads.extend(write::spawn_lanes(config.write_lanes, &config, write_queue.clone(), mailboxes.clone(), jwt.clone()));
+    threads.extend(write::spawn_lanes(
+        config.write_lanes,
+        &config,
+        write_queue.clone(),
+        mailboxes.clone(),
+        jwt.clone(),
+    ));
     threads.extend(conduit::password::spawn_threads(
         config.bcrypt_threads,
         &config,
@@ -76,8 +82,15 @@ fn run() -> Result<(), String> {
     }
     eprintln!(
         "conduit: listening on {}.{}.{}.{}:{} ({} io, {} read lanes, {} write lanes, {} bcrypt)",
-        config.host[0], config.host[1], config.host[2], config.host[3], config.port,
-        config.io_threads, config.read_lanes, config.write_lanes, config.bcrypt_threads
+        config.host[0],
+        config.host[1],
+        config.host[2],
+        config.host[3],
+        config.port,
+        config.io_threads,
+        config.read_lanes,
+        config.write_lanes,
+        config.bcrypt_threads
     );
     for handle in threads {
         let _ = handle.join();

@@ -22,7 +22,10 @@ pub struct Field {
 
 impl Field {
     pub fn new(range: Range<usize>) -> Field {
-        Field { start: range.start as u32, end: range.end as u32 }
+        Field {
+            start: range.start as u32,
+            end: range.end as u32,
+        }
     }
 
     /// The field's text. The app validated UTF-8 once when it built the job, so this is cheap in release builds.
@@ -75,15 +78,52 @@ pub struct ReadJob {
 
 /// A request that writes. Optional fields are `None` when the request left them out or sent `null`.
 pub enum WriteKind {
-    Register { username: Field, email: Field, password_hash: [u8; 60] },
-    UpdateUser { email: Option<Field>, username: Option<Field>, password_hash: Option<[u8; 60]>, bio: Option<Field>, image: Option<Field>, token: Field },
-    Follow { username: Field, follow: bool },
-    CreateArticle { slug_base: String, title: Field, description: Field, body: Field, tags: Vec<Field> },
-    UpdateArticle { slug: Field, slug_base: Option<String>, title: Option<Field>, description: Option<Field>, body: Option<Field> },
-    DeleteArticle { slug: Field },
-    Favorite { slug: Field, favorite: bool },
-    AddComment { slug: Field, body: Field },
-    DeleteComment { slug: Field, comment_id: i64 },
+    Register {
+        username: Field,
+        email: Field,
+        password_hash: [u8; 60],
+    },
+    UpdateUser {
+        email: Option<Field>,
+        username: Option<Field>,
+        password_hash: Option<[u8; 60]>,
+        bio: Option<Field>,
+        image: Option<Field>,
+        token: Field,
+    },
+    Follow {
+        username: Field,
+        follow: bool,
+    },
+    CreateArticle {
+        slug_base: String,
+        title: Field,
+        description: Field,
+        body: Field,
+        tags: Vec<Field>,
+    },
+    UpdateArticle {
+        slug: Field,
+        slug_base: Option<String>,
+        title: Option<Field>,
+        description: Option<Field>,
+        body: Option<Field>,
+    },
+    DeleteArticle {
+        slug: Field,
+    },
+    Favorite {
+        slug: Field,
+        favorite: bool,
+    },
+    AddComment {
+        slug: Field,
+        body: Field,
+    },
+    DeleteComment {
+        slug: Field,
+        comment_id: i64,
+    },
 }
 
 pub struct WriteJob {

@@ -17,10 +17,17 @@ const SCHEME: &[u8] = b"Token ";
 
 /// Checks signature and `exp` on every call: there is no verification cache.
 pub fn authenticate<'a>(jwt: &Jwt, header: Option<&'a [u8]>, now_seconds: u64) -> Auth<'a> {
-    let Some(value) = header else { return Auth::Anonymous };
-    let Some(token) = value.strip_prefix(SCHEME) else { return Auth::Invalid };
+    let Some(value) = header else {
+        return Auth::Anonymous;
+    };
+    let Some(token) = value.strip_prefix(SCHEME) else {
+        return Auth::Invalid;
+    };
     match jwt.verify(token, now_seconds) {
-        Ok(id) if id <= i64::MAX as u64 && id != 0 => Auth::User { id: id as i64, token },
+        Ok(id) if id <= i64::MAX as u64 && id != 0 => Auth::User {
+            id: id as i64,
+            token,
+        },
         _ => Auth::Invalid,
     }
 }
@@ -59,9 +66,15 @@ mod tests {
         let header = token(&jwt, 42, 2_000);
         let bearer: Vec<u8> = [b"Bearer ".as_slice(), &header[6..]].concat();
         assert_eq!(authenticate(&jwt, Some(&bearer), 1_500), Auth::Invalid);
-        assert_eq!(authenticate(&Jwt::new(b"other"), Some(&header), 1_500), Auth::Invalid);
+        assert_eq!(
+            authenticate(&Jwt::new(b"other"), Some(&header), 1_500),
+            Auth::Invalid
+        );
         assert_eq!(authenticate(&jwt, Some(&header), 2_000), Auth::Invalid);
         assert_eq!(authenticate(&jwt, Some(b"Token"), 1_500), Auth::Invalid);
-        assert_eq!(authenticate(&jwt, Some(&token(&jwt, 0, 2_000)), 1_500), Auth::Invalid);
+        assert_eq!(
+            authenticate(&jwt, Some(&token(&jwt, 0, 2_000)), 1_500),
+            Auth::Invalid
+        );
     }
 }

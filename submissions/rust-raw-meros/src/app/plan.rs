@@ -17,9 +17,16 @@ pub enum Plan {
     /// Answer now with this status and message.
     Reject(Status, &'static str),
     Read(ReadPlan),
-    Write { viewer: i64, kind: WriteKind },
+    Write {
+        viewer: i64,
+        kind: WriteKind,
+    },
     /// Hash `password` on a password thread, then continue as `then`.
-    Hash { viewer: i64, password: Field, then: WriteKind },
+    Hash {
+        viewer: i64,
+        password: Field,
+        then: WriteKind,
+    },
 }
 
 /// The fields of a `ReadJob` that the request decides.
@@ -35,7 +42,15 @@ pub struct ReadPlan {
 
 impl ReadPlan {
     fn new(kind: ReadKind, viewer: i64) -> ReadPlan {
-        ReadPlan { kind, viewer, key: Field::default(), token: Field::default(), password: Field::default(), limit: 0, offset: 0 }
+        ReadPlan {
+            kind,
+            viewer,
+            key: Field::default(),
+            token: Field::default(),
+            password: Field::default(),
+            limit: 0,
+            offset: 0,
+        }
     }
 
     pub fn fields_mut(&mut self) -> [&mut Field; 3] {
@@ -46,19 +61,40 @@ impl ReadPlan {
 /// Every `Field` of a write that may point into the scratch area.
 pub fn write_fields_mut(kind: &mut WriteKind) -> Vec<&mut Field> {
     match kind {
-        WriteKind::Register { username, email, .. } => vec![username, email],
-        WriteKind::UpdateUser { email, username, bio, image, token, .. } => {
+        WriteKind::Register {
+            username, email, ..
+        } => vec![username, email],
+        WriteKind::UpdateUser {
+            email,
+            username,
+            bio,
+            image,
+            token,
+            ..
+        } => {
             let mut fields: Vec<&mut Field> = vec![token];
             fields.extend([email, username, bio, image].into_iter().flatten());
             fields
         }
         WriteKind::Follow { username, .. } => vec![username],
-        WriteKind::CreateArticle { title, description, body, tags, .. } => {
+        WriteKind::CreateArticle {
+            title,
+            description,
+            body,
+            tags,
+            ..
+        } => {
             let mut fields: Vec<&mut Field> = vec![title, description, body];
             fields.extend(tags.iter_mut());
             fields
         }
-        WriteKind::UpdateArticle { slug, title, description, body, .. } => {
+        WriteKind::UpdateArticle {
+            slug,
+            title,
+            description,
+            body,
+            ..
+        } => {
             let mut fields: Vec<&mut Field> = vec![slug];
             fields.extend([title, description, body].into_iter().flatten());
             fields
@@ -89,7 +125,13 @@ enum Access {
     None,
 }
 
-fn plan_inner(jwt: &Jwt, now: u64, buf: &[u8], req: &Request<'_>, scratch: &mut Scratch) -> Result<Plan, Rejection> {
+fn plan_inner(
+    jwt: &Jwt,
+    now: u64,
+    buf: &[u8],
+    req: &Request<'_>,
+    scratch: &mut Scratch,
+) -> Result<Plan, Rejection> {
     let found = route(req.method, req.path);
     let access = match found {
         Route::Register | Route::Login | Route::Tags | Route::NotFound => Access::None,
@@ -108,7 +150,9 @@ fn plan_inner(jwt: &Jwt, now: u64, buf: &[u8], req: &Request<'_>, scratch: &mut 
         (_, Auth::User { id, token }) => (id, token),
         (_, Auth::Anonymous) => (0, &[]),
     };
-    let segment = |scratch: &mut Scratch, raw: &[u8]| -> Field { lookup_key(buf, scratch, &percent_decode(raw)) };
+    let segment = |scratch: &mut Scratch, raw: &[u8]| -> Field {
+        lookup_key(buf, scratch, &percent_decode(raw))
+    };
 
     Ok(match found {
         Route::NotFound => return Err(NOT_FOUND),
@@ -118,7 +162,11 @@ fn plan_inner(jwt: &Jwt, now: u64, buf: &[u8], req: &Request<'_>, scratch: &mut 
             Plan::Hash {
                 viewer: 0,
                 password: r.password,
-                then: WriteKind::Register { username: r.username, email: r.email, password_hash: [0; 60] },
+                then: WriteKind::Register {
+                    username: r.username,
+                    email: r.email,
+                    password_hash: [0; 60],
+                },
             }
         }
         Route::Login => {
@@ -144,7 +192,11 @@ fn plan_inner(jwt: &Jwt, now: u64, buf: &[u8], req: &Request<'_>, scratch: &mut 
                 token: field_of(buf, token),
             };
             match u.password {
-                Some(password) => Plan::Hash { viewer, password, then: kind },
+                Some(password) => Plan::Hash {
+                    viewer,
+                    password,
+                    then: kind,
+                },
                 None => Plan::Write { viewer, kind },
             }
         }
@@ -153,9 +205,13 @@ fn plan_inner(jwt: &Jwt, now: u64, buf: &[u8], req: &Request<'_>, scratch: &mut 
             read.key = segment(scratch, username);
             Plan::Read(read)
         }
-        Route::Follow { username, follow } => {
-            Plan::Write { viewer, kind: WriteKind::Follow { username: segment(scratch, username), follow } }
-        }
+        Route::Follow { username, follow } => Plan::Write {
+            viewer,
+            kind: WriteKind::Follow {
+                username: segment(scratch, username),
+                follow,
+            },
+        },
         Route::ListArticles => {
             let (limit, offset) = paging(req.query)?;
             let (kind, key) = list_filter(buf, req.query, scratch);
@@ -208,19 +264,38 @@ fn plan_inner(jwt: &Jwt, now: u64, buf: &[u8], req: &Request<'_>, scratch: &mut 
                 },
             }
         }
-        Route::DeleteArticle { slug } => {
-            Plan::Write { viewer, kind: WriteKind::DeleteArticle { slug: segment(scratch, slug) } }
-        }
-        Route::Favorite { slug, favorite } => {
-            Plan::Write { viewer, kind: WriteKind::Favorite { slug: segment(scratch, slug), favorite } }
-        }
+        Route::DeleteArticle { slug } => Plan::Write {
+            viewer,
+            kind: WriteKind::DeleteArticle {
+                slug: segment(scratch, slug),
+            },
+        },
+        Route::Favorite { slug, favorite } => Plan::Write {
+            viewer,
+            kind: WriteKind::Favorite {
+                slug: segment(scratch, slug),
+                favorite,
+            },
+        },
         Route::AddComment { slug } => {
             let text = body::comment(buf, req.body, scratch).map_err(unprocessable)?;
-            Plan::Write { viewer, kind: WriteKind::AddComment { slug: segment(scratch, slug), body: text } }
+            Plan::Write {
+                viewer,
+                kind: WriteKind::AddComment {
+                    slug: segment(scratch, slug),
+                    body: text,
+                },
+            }
         }
         Route::DeleteComment { slug, id } => {
             let comment_id = parse_int(id).filter(|&n| n >= 0).ok_or(NOT_FOUND)?;
-            Plan::Write { viewer, kind: WriteKind::DeleteComment { slug: segment(scratch, slug), comment_id } }
+            Plan::Write {
+                viewer,
+                kind: WriteKind::DeleteComment {
+                    slug: segment(scratch, slug),
+                    comment_id,
+                },
+            }
         }
     })
 }
@@ -231,28 +306,44 @@ fn unprocessable(message: &'static str) -> Rejection {
 
 /// `limit` (default 20, 1..=100) and `offset` (default 0, >= 0) must be integers in range, otherwise 422.
 fn paging(query: &[u8]) -> Result<(i64, i64), Rejection> {
-    let number = |name: &str, default: i64, valid: std::ops::RangeInclusive<i64>| -> Result<i64, Rejection> {
+    let number = |name: &str,
+                  default: i64,
+                  valid: std::ops::RangeInclusive<i64>|
+     -> Result<i64, Rejection> {
         match query_param(query, name) {
             None => Ok(default),
-            Some(raw) => parse_int(&raw)
-                .filter(|n| valid.contains(n))
-                .ok_or((Status::Unprocessable, "limit and offset must be integers in range")),
+            Some(raw) => parse_int(&raw).filter(|n| valid.contains(n)).ok_or((
+                Status::Unprocessable,
+                "limit and offset must be integers in range",
+            )),
         }
     };
-    Ok((number("limit", DEFAULT_LIMIT, 1..=MAX_LIMIT)?, number("offset", 0, 0..=i64::MAX)?))
+    Ok((
+        number("limit", DEFAULT_LIMIT, 1..=MAX_LIMIT)?,
+        number("offset", 0, 0..=i64::MAX)?,
+    ))
 }
 
 /// A path segment or query value used to look something up. Postgres rejects NUL in text, which would fail the whole
 /// batch the lookup travels in, so such a key becomes the empty key, which names nothing (no slug, username or tag is
 /// empty) and gives 404 or an empty list as it should.
+#[allow(clippy::ptr_arg)] // `Scratch::field` needs the Cow variant
 fn lookup_key(buf: &[u8], scratch: &mut Scratch, decoded: &std::borrow::Cow<'_, [u8]>) -> Field {
-    if decoded.contains(&0) { Field::default() } else { scratch.field(buf, decoded) }
+    if decoded.contains(&0) {
+        Field::default()
+    } else {
+        scratch.field(buf, decoded)
+    }
 }
 
 /// The list filter. If several are given only the first of tag, author, favorited applies. A filter with an empty
 /// value is ignored (conformance step "empty-tag-ignored").
 fn list_filter(buf: &[u8], query: &[u8], scratch: &mut Scratch) -> (ListKind, Field) {
-    for (name, kind) in [("tag", ListKind::Tag), ("author", ListKind::Author), ("favorited", ListKind::Favorited)] {
+    for (name, kind) in [
+        ("tag", ListKind::Tag),
+        ("author", ListKind::Author),
+        ("favorited", ListKind::Favorited),
+    ] {
         if let Some(value) = query_param(query, name).filter(|value| !value.is_empty()) {
             return (kind, lookup_key(buf, scratch, &value));
         }

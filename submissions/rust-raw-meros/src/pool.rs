@@ -21,7 +21,9 @@ pub struct BufPool {
 
 impl BufPool {
     pub const fn new() -> BufPool {
-        BufPool { free: Mutex::new(Vec::new()) }
+        BufPool {
+            free: Mutex::new(Vec::new()),
+        }
     }
 
     /// An empty buffer with at least [`DEFAULT_CAPACITY`] bytes of capacity.

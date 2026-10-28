@@ -38,7 +38,12 @@ pub enum Step {
     NeedMore(Vec<u8>),
     /// Answered at once: the response is in the io thread's `ResponseBuf` from `start`. `consumed` bytes of the buffer
     /// were the request; the rest (a pipelined request) stays in the buffer for the next round.
-    Answered { buf: Vec<u8>, consumed: usize, start: usize, keep_alive: bool },
+    Answered {
+        buf: Vec<u8>,
+        consumed: usize,
+        start: usize,
+        keep_alive: bool,
+    },
     /// The request became a job and the buffer moved into it (zero-copy). `rest` holds any bytes that followed the
     /// request (almost always empty and allocation-free). A [`Reply`] arrives later.
     Queued { rest: Vec<u8> },

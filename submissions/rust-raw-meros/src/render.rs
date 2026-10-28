@@ -142,7 +142,12 @@ mod tests {
 
     #[test]
     fn profile_has_nulls_for_missing_bio_and_image() {
-        let p = Profile { username: "ann", bio: None, image: Some("i.png"), following: true };
+        let p = Profile {
+            username: "ann",
+            bio: None,
+            image: Some("i.png"),
+            following: true,
+        };
         assert_eq!(
             render(|w| profile_object(w, &p)),
             r#"{"username":"ann","bio":null,"image":"i.png","following":true}"#
@@ -151,7 +156,12 @@ mod tests {
 
     #[test]
     fn article_in_a_list_has_no_body() {
-        let author = Profile { username: "ann", bio: None, image: None, following: false };
+        let author = Profile {
+            username: "ann",
+            bio: None,
+            image: None,
+            following: false,
+        };
         let tags = ["a", "b"];
         let a = Article {
             slug: "s-1",

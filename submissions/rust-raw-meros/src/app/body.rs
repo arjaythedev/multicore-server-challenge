@@ -29,7 +29,11 @@ fn wrapper<'v, 'a>(root: &'v Value<'a>, name: &'static str) -> Result<&'v Value<
 const HAS_NUL: Invalid = "strings must not contain NUL";
 
 /// A string member that must be present and non-empty.
-fn required<'v, 'a>(object: &'v Value<'a>, key: &str, message: Invalid) -> Result<&'v Cow<'a, str>, Invalid> {
+fn required<'v, 'a>(
+    object: &'v Value<'a>,
+    key: &str,
+    message: Invalid,
+) -> Result<&'v Cow<'a, str>, Invalid> {
     match object.get(key) {
         Some(Value::String(text)) if text.contains('\0') => Err(HAS_NUL),
         Some(Value::String(text)) if !text.is_empty() => Ok(text),
@@ -38,7 +42,11 @@ fn required<'v, 'a>(object: &'v Value<'a>, key: &str, message: Invalid) -> Resul
 }
 
 /// A string member that may be absent or `null` (both mean "unchanged").
-fn optional<'v, 'a>(object: &'v Value<'a>, key: &str, message: Invalid) -> Result<Option<&'v Cow<'a, str>>, Invalid> {
+fn optional<'v, 'a>(
+    object: &'v Value<'a>,
+    key: &str,
+    message: Invalid,
+) -> Result<Option<&'v Cow<'a, str>>, Invalid> {
     match object.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(text)) if text.contains('\0') => Err(HAS_NUL),
@@ -52,7 +60,11 @@ const MAX_PASSWORD_BYTES: usize = 72;
 const PASSWORD_TOO_LONG: Invalid = "password must be at most 72 bytes";
 
 /// Like [`optional`], but a present value must not be empty (email, username, password, title...).
-fn optional_non_empty<'v, 'a>(object: &'v Value<'a>, key: &str, message: Invalid) -> Result<Option<&'v Cow<'a, str>>, Invalid> {
+fn optional_non_empty<'v, 'a>(
+    object: &'v Value<'a>,
+    key: &str,
+    message: Invalid,
+) -> Result<Option<&'v Cow<'a, str>>, Invalid> {
     match optional(object, key, message)? {
         Some(text) if text.is_empty() => Err(message),
         found => Ok(found),
@@ -60,7 +72,11 @@ fn optional_non_empty<'v, 'a>(object: &'v Value<'a>, key: &str, message: Invalid
 }
 
 fn password_within_limit(password: &str) -> Result<(), Invalid> {
-    if password.len() > MAX_PASSWORD_BYTES { Err(PASSWORD_TOO_LONG) } else { Ok(()) }
+    if password.len() > MAX_PASSWORD_BYTES {
+        Err(PASSWORD_TOO_LONG)
+    } else {
+        Ok(())
+    }
 }
 
 pub struct Register {
@@ -145,7 +161,9 @@ pub fn new_article(base: &[u8], body: &[u8], scratch: &mut Scratch) -> Result<Ne
         Some(Value::Array(items)) => {
             for item in items {
                 match item {
-                    Value::String(tag) if !tag.is_empty() && !tag.contains('\0') => tags.push(scratch.field_str(base, tag)),
+                    Value::String(tag) if !tag.is_empty() && !tag.contains('\0') => {
+                        tags.push(scratch.field_str(base, tag))
+                    }
                     _ => return Err("tagList must contain non-empty strings"),
                 }
             }
@@ -169,7 +187,11 @@ pub struct ArticleEdit {
     pub body: Option<Field>,
 }
 
-pub fn article_edit(base: &[u8], body: &[u8], scratch: &mut Scratch) -> Result<ArticleEdit, Invalid> {
+pub fn article_edit(
+    base: &[u8],
+    body: &[u8],
+    scratch: &mut Scratch,
+) -> Result<ArticleEdit, Invalid> {
     let root = parse(body)?;
     let article = wrapper(&root, "article")?;
     let title = optional_non_empty(article, "title", "title can't be blank")?;
@@ -204,7 +226,8 @@ mod tests {
 
     #[test]
     fn register_fields_are_ranges_of_the_buffer() {
-        let (buf, body) = with_body(r#"{"user":{"username":"ann","email":"a@x.io","password":"pw"}}"#);
+        let (buf, body) =
+            with_body(r#"{"user":{"username":"ann","email":"a@x.io","password":"pw"}}"#);
         let mut scratch = Scratch::default();
         let r = register(&buf, &buf[body], &mut scratch).unwrap();
         assert_eq!(r.username.text(&buf), "ann");
@@ -222,7 +245,10 @@ mod tests {
             "not json",
         ] {
             let (buf, range) = with_body(body);
-            assert!(register(&buf, &buf[range], &mut Scratch::default()).is_err(), "{body}");
+            assert!(
+                register(&buf, &buf[range], &mut Scratch::default()).is_err(),
+                "{body}"
+            );
         }
     }
 
@@ -246,7 +272,9 @@ mod tests {
 
     #[test]
     fn new_article_requires_text_and_valid_tags() {
-        let (buf, body) = with_body(r#"{"article":{"title":"T","description":"D","body":"B","tagList":["a","b"]}}"#);
+        let (buf, body) = with_body(
+            r#"{"article":{"title":"T","description":"D","body":"B","tagList":["a","b"]}}"#,
+        );
         let a = new_article(&buf, &buf[body], &mut Scratch::default()).unwrap();
         assert_eq!(a.tags.len(), 2);
         assert_eq!(a.slug_base, "t");
@@ -256,7 +284,10 @@ mod tests {
             r#"{"article":{"title":"T","description":"","body":"B"}}"#,
         ] {
             let (buf, range) = with_body(bad);
-            assert!(new_article(&buf, &buf[range], &mut Scratch::default()).is_err(), "{bad}");
+            assert!(
+                new_article(&buf, &buf[range], &mut Scratch::default()).is_err(),
+                "{bad}"
+            );
         }
     }
 }

@@ -51,7 +51,7 @@ impl Config {
             write_window: Duration::from_micros(optional_num("WRITE_WINDOW_US", 1_000)?),
             write_batch_max: optional_num("WRITE_BATCH_MAX", 256)?,
             bcrypt_threads: optional_num("BCRYPT_THREADS", (cpus / 8).max(1))?,
-            bcrypt_window: Duration::from_micros(optional_num("BCRYPT_WINDOW_US", 100_000)?),
+            bcrypt_window: Duration::from_micros(optional_num("BCRYPT_WINDOW_US", 400_000)?),
         })
     }
 }
@@ -62,13 +62,17 @@ fn required(name: &str) -> Result<String, String> {
 
 fn optional_num<T: std::str::FromStr>(name: &str, default: T) -> Result<T, String> {
     match std::env::var(name) {
-        Ok(text) if !text.is_empty() => text.parse().map_err(|_| format!("{name}={text} is not a valid number")),
+        Ok(text) if !text.is_empty() => text
+            .parse()
+            .map_err(|_| format!("{name}={text} is not a valid number")),
         _ => Ok(default),
     }
 }
 
 fn parse_ipv4(text: &str) -> Result<[u8; 4], String> {
-    let addr: std::net::Ipv4Addr = text.parse().map_err(|_| format!("HOST={text} is not an IPv4 address"))?;
+    let addr: std::net::Ipv4Addr = text
+        .parse()
+        .map_err(|_| format!("HOST={text} is not an IPv4 address"))?;
     Ok(addr.octets())
 }
 

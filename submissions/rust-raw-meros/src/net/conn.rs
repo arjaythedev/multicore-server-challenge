@@ -70,7 +70,10 @@ pub struct Slab {
 
 impl Slab {
     pub fn new() -> Slab {
-        Slab { conns: Vec::new(), free: Vec::new() }
+        Slab {
+            conns: Vec::new(),
+            free: Vec::new(),
+        }
     }
 
     /// Stores a new connection and returns its slot.
@@ -89,7 +92,9 @@ impl Slab {
     }
 
     pub fn get_mut(&mut self, slot: u32) -> Option<&mut Conn> {
-        self.conns.get_mut(slot as usize).filter(|c| c.socket.is_some())
+        self.conns
+            .get_mut(slot as usize)
+            .filter(|c| c.socket.is_some())
     }
 
     /// Closes the connection and recycles the slot.
@@ -101,5 +106,4 @@ impl Slab {
             self.free.push(slot);
         }
     }
-
 }
