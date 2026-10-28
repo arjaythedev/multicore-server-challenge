@@ -75,7 +75,7 @@ module Pg
     end
   end
 
-  @@group_commit : Bool = Sys.env("GROUP_COMMIT") != "0"
+  @@group_commit : Bool = Sys.env("GROUP_COMMIT") == "1"
   @@write_window : Int64 = (Sys.env("WRITE_WINDOW_US") || "20000").to_i64.clamp(0_i64, 50000_i64) * 1000
   @@conns = Pointer(Conn).null
   @@n = 0

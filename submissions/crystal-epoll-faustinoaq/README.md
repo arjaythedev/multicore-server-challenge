@@ -52,7 +52,7 @@ repeated scans of the materialized capped counts. Tags, comments, profiles and
 current-user reads also batch within their endpoint. The clock continues while
 Postgres is idle so faster queries do not fragment subsequent batches.
 
-Writes use a 20 ms collection window on the write connection and share one implicit
+With `GROUP_COMMIT=1`, writes use a 20 ms collection window on the write connection and share one implicit
 PostgreSQL transaction, up to 48 requests. Their Bind/Execute messages
 end with one Sync; responses stay buffered until ReadyForQuery confirms commit.
 A SQL error rolls back the whole group, then each request retries independently.
@@ -93,7 +93,7 @@ Optional tuning variables and their defaults:
 | `READ_CLOCK` | 1 | Set to 0 for the previous in-flight-only window |
 | `SHARED_READS` | 1 | Set to 0 for separate article endpoint batches |
 | `PG_INDEX_LOOKUPS` | 1 | Set to 0 to restore ordinary scan selection |
-| `GROUP_COMMIT` | 1 | Set to 0 for individual write transactions |
+| `GROUP_COMMIT` | 0 | Set to 1 to group writes into shared transactions (experimental) |
 | `WRITE_WINDOW_US` | 20000 | Write collection window in microseconds (0–50000) |
 | `BCRYPT_THREADS` | 2 | Bcrypt pthreads per worker |
 | `BCRYPT_WINDOW_MS` | 200 | Maximum wait to fill bcrypt lanes (0–400) |
