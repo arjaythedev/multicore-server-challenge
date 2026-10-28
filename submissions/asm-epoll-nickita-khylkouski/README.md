@@ -19,9 +19,9 @@ HTTP/1.1 server and the Postgres wire protocol (SCRAM-SHA-256, extended query) a
 ```
 
 Required environment: `DATABASE_URL`, `JWT_SECRET`. Optional: `HOST` (default `127.0.0.1`), `PORT` (`3000`),
-`APP_THREADS` (`min(ceil(3*cores/8), 8)`), `DB_READ_CONNS` (read connections per worker, `2`), `BCRYPT_THREADS`
+`APP_THREADS` (`min(ceil(cores/4), 8)`), `DB_READ_CONNS` (read connections per worker, `3`), `BCRYPT_THREADS`
 (`ceil(cores/8)`), `WRITE_BATCH_US` (group-commit wait when a single write is pending, `1000`; `0` = none),
-`HTTP_GZIP` (`0` never, `1` always, unset = adaptive). Postgres connections total `APP_THREADS * (DB_READ_CONNS + 1)` and must be at most 95 (startup fails otherwise); on 8 cores that is 3 * 3 = 9. `GET /api/tags` returning 200 is the health check and answers within 60 s of `start.sh`.
+`HTTP_GZIP` (`0` never, `1` always, unset = adaptive). Postgres connections total `APP_THREADS * (DB_READ_CONNS + 1)` and must be at most 95 (startup fails otherwise); on 8 cores that is 2 * 4 = 8. `GET /api/tags` returning 200 is the health check and answers within 60 s of `start.sh`.
 
 ## How it works
 
@@ -105,13 +105,21 @@ Rust is the same entry as below, on the same boxes in the same session.
 
 | build, 200,000 users | req/s | p50 (ms) | p95 (ms) | p99 (ms) | errors | app / Postgres CPU (cores) | box CPU busy |
 |---|---|---|---|---|---|---|---|
-| this server | 52,547 | 18 | 70 | 127 | 0.03% | 1.72 / 5.76 | 94.5% |
-| this server with a read queue per worker | 52,162 | 46 | 133 | 192 | 0.03% | 1.70 / 5.61 | 92.7% |
+| this server (2 workers, 3 read connections each) | 52,595 | 16 | 61 | 104 | 0.03% | 1.67 / 5.75 | 93.8% |
+| this server, 3 workers with 2 read connections each | 52,575 | 18 | 71 | 133 | 0.03% | 1.72 / 5.76 | 94.5% |
+| 3 workers, a read queue per worker | 52,162 | 46 | 133 | 192 | 0.03% | 1.70 / 5.61 | 92.7% |
 | Rust | 52,438 | 25 | 89 | 158 | 0.03% | 1.94 / 5.58 | 94.9% |
 
-All three pass. Nearly all the errors are logins: about 30% of them (22% for Rust) wait 8 s for the one bcrypt
-thread and are shed with a 503, but logins are about 0.1% of the requests. The process's memory stayed flat at
-154-158 MB through the measured window.
+All four pass. The first two rows were each run twice; the repeats were within 1.2 ms on p95 and 5.2 ms on
+p99. Both use six read connections and the same Postgres CPU; with two workers every read endpoint's p50 and p95
+were 5-13% lower. About 90% of the errors are logins: about 28% of them (22% for Rust)
+wait 8 s for the one bcrypt thread and are shed with a 503, but logins are about 0.1% of the requests. The rest
+are about 450 reads per run that hit the load generator's 10 s timeout, about the same for Rust. The process's
+memory stayed flat (135-138 MB with two workers) through the measured window.
+
+The repo's own search (`score/chain.sh`, the official scoring script) on the same boxes: score 200,000, every
+probe passing; its 5-minute hold at 200,000 users ran 52,542 req/s, p50 18 ms, p95 67 ms, p99 111 ms, 0.03%
+errors (with three workers: 52,524 req/s, p95 80 ms, p99 156 ms).
 
 The tables below were measured on an earlier build, before the read queues were shared and before the fixes
 under **Failures**. They are same-box numbers: an AWS c7i.2xlarge, 8 vCPUs, Xeon 8488C (Ubuntu 24.04,

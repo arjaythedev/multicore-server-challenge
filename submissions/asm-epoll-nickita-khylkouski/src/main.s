@@ -2,7 +2,7 @@
 # then starts the bcrypt thread(s) and the worker threads and parks the main thread.
 #
 # Environment: DATABASE_URL, JWT_SECRET (required); HOST (127.0.0.1), PORT (3000); tuning: APP_THREADS
-# (min(ceil(3*cores/8), 8)), DB_READ_CONNS (read connections per worker, 2), BCRYPT_THREADS (ceil(cores/8)),
+# (min(ceil(cores/4), 8)), DB_READ_CONNS (read connections per worker, 3), BCRYPT_THREADS (ceil(cores/8)),
 # WRITE_BATCH_US (group-commit wait for a lone write, 1000; 0 = none).
 .include "defs.inc"
 .include "app.inc"
@@ -322,8 +322,8 @@ main:
     # thread counts
     call count_cpus
     mov [rip + g_cores], rax
-    lea rdx, [rax + rax*2 + 7]
-    shr rdx, 3                           # ceil(3*cores/8), at most 8 (the Rust APP_THREADS default)
+    lea rdx, [rax + 3]
+    shr rdx, 2                           # ceil(cores/4), at most 8
     cmp rdx, 8
     jbe 6f
     mov edx, 8
@@ -336,7 +336,7 @@ main:
 7:  mov [rip + g_nworkers], rax
     lea rdi, [rip + .Lenv_nread]
     mov esi, 13
-    mov edx, 2
+    mov edx, 3
     call env_uint
     cmp rax, MAX_RCONNS
     jbe 8f
