@@ -95,15 +95,15 @@ them), `-think-scale 0.1`, fresh database per run:
 
 | Users | req/s | box CPU per request | app | Postgres | p95 |
 |--:|--:|--:|--:|--:|--:|
-| 14,000 | ~29,900 | 148-152 us | 63-64 us | 87-89 us | 176-196 ms |
-| 12,000 | ~26,800 | 148-151 us | 63-64 us | 86-90 us | 130-139 ms |
+| 14,000 | ~30,000 | 148-160 us | 63-67 us | 87-95 us | 166-205 ms |
+| 12,000 | ~26,800 | 148-156 us | 63-65 us | 86-92 us | 130-143 ms |
 | 12,000, `PLANNER=0` | ~29,700 | 163-168 us | 55-57 us | 110-112 us | 64-77 ms |
 | 14,000, `PLANNER=0` | ~32,500 | 167-174 us | 57-60 us | 111-116 us | 130-158 ms |
 
 12,000 users at `-think-scale 0.1` is about the request rate of 120,000 real users. The load generator's users
 are closed-loop, so the planner's longer waits (two round trips after the 20 ms clock) lower its req/s at a fixed
 user count. Measured the same way:
-rust-epoll-WorriedArrow (#47) 184-191 us/req, go-epoll-MegaPanchamZ (#61) 217-226. About half of the app's CPU
+rust-epoll-WorriedArrow (#47) 181-190 us/req at 12,000 users and 189-193 at 14,000 (alternating with ours), go-epoll-MegaPanchamZ (#61) 217-226. About half of the app's CPU
 is bcrypt. Holds at real think time with tens of thousands of users are limited by the load generator on this
 box, so they say nothing about the server here.
 

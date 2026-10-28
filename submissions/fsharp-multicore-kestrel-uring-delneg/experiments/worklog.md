@@ -348,3 +348,7 @@ feed count proof adopted, #91's hashagg off measured (no effect).
 - **64 planner clock 30 ms** (order flipped per round): 14k 151.2 / 151.6 / 148.3 / 154.2 vs 151.8 / 154.5 /
   155.4 / 155.9 (-2.0%: PG -4, app +2); 12k 167.0 / 161.9 / 161.3 vs 158.8 / 160.5 / 159.1 (+2.5%); req/s -4%,
   p95 +30-50 ms. **Discarded**: the clock stays 20 ms (10, 15, 18, 25 and 30 ms all measured).
+- **65 reference vs #47** (committed build, alternating x3): 12k ours 154.3 / 149.1 / 156.1 us/req vs #47 181.4 /
+  190.2 / 183.4 (-17%; req/s 26.6-26.9k vs 24.6-24.9k, p95 131-143 vs 173-188 ms); 14k ours 147.9 / 160.4 / 148.8
+  vs 192.7 / 191.8 / 189.1 (-20%; 29.1-30.3k vs 27.0-27.2k, p95 166-205 vs 238-247). 0 errors. README and PR
+  numbers updated to these runs.
