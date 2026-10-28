@@ -69,10 +69,13 @@ private fun list(count: String, page: String) =
  * joins them back to every request row in the same layout ([Cols]); favorited/following stay per request row. Only
  * requests already waiting when the statement starts share it, and nothing outlives it: the #1 entry's reading of
  * rule 5, the same as [Sql.TAGS]'s broadcast. [maxBatch]: most requests per execution while sharing.
+ * [viewerFlags] (READ_VIEWER_FLAGS=1): shared lists look up favorited/following once per viewer, `user_id = v AND
+ * article_id = ANY (the viewer's page)`, instead of two primary-key probes per row (the #1 entry's technique).
  */
 internal object ReadShare {
     var on = false
     var maxBatch = 256
+    var viewerFlags = false
 }
 
 /** The batch's requests, materialized once and referenced by several CTEs. */
@@ -106,9 +109,33 @@ private fun artCols(withBody: Boolean, following: String) =
  * with a NULL slug, as in [list].
  */
 private fun sharedList(ctes: String, countJoin: String, pageOn: String, following: String) =
-    "WITH $R, $ctes, ${art("(SELECT DISTINCT pp.id FROM pp) d", "a.id = d.id", withBody = false)} " +
-        "SELECT r.i, cn.n, ${artCols(withBody = false, following)} FROM r $countJoin LEFT JOIN pp ON $pageOn " +
-        "LEFT JOIN art ON art.id = pp.id ORDER BY r.i, pp.id DESC"
+    if (ReadShare.viewerFlags && following == ART_FOLLOWING) {
+        viewerFlagsList(ctes, countJoin, pageOn)
+    } else {
+        "WITH $R, $ctes, ${art("(SELECT DISTINCT pp.id FROM pp) d", "a.id = d.id", withBody = false)} " +
+            "SELECT r.i, cn.n, ${artCols(withBody = false, following)} FROM r $countJoin LEFT JOIN pp ON $pageOn " +
+            "LEFT JOIN art ON art.id = pp.id ORDER BY r.i, pp.id DESC"
+    }
+
+/**
+ * [sharedList] with favorited/following per viewer ([ReadShare.viewerFlags]): `fl` holds each signed-in viewer's page
+ * articles and their authors, `fav`/`fol` the ones they favorite/follow (one favorites_pkey and one follows_pkey scan
+ * per viewer, `= ANY`), joined back to the rows. A viewer's (viewer, article) and (viewer, author) pairs are unique
+ * (primary keys), so no row is duplicated; anonymous viewers (0) and empty pages get false.
+ */
+private fun viewerFlagsList(ctes: String, countJoin: String, pageOn: String) =
+    "WITH $R, $ctes, ${art("(SELECT DISTINCT pp.id FROM pp) d", "a.id = d.id", withBody = false)}, " +
+        "fl AS MATERIALIZED (SELECT r.v, array_agg(DISTINCT art.id) AS aids, array_agg(DISTINCT art.author_id) AS uids " +
+        "FROM r JOIN pp ON $pageOn JOIN art ON art.id = pp.id WHERE r.v > 0 GROUP BY r.v), " +
+        "fav AS MATERIALIZED (SELECT fl.v, x.article_id FROM fl CROSS JOIN LATERAL (SELECT f.article_id FROM favorites f " +
+        "WHERE f.user_id = fl.v AND f.article_id = ANY (fl.aids) OFFSET 0) x), " +
+        "fol AS MATERIALIZED (SELECT fl.v, x.followee_id FROM fl CROSS JOIN LATERAL (SELECT fo.followee_id FROM follows fo " +
+        "WHERE fo.follower_id = fl.v AND fo.followee_id = ANY (fl.uids) OFFSET 0) x) " +
+        "SELECT r.i, cn.n, art.slug, art.title, art.description, art.created_at, art.updated_at, art.tags, art.fc, " +
+        "fav.article_id IS NOT NULL, art.username, art.bio, art.image, fol.followee_id IS NOT NULL " +
+        "FROM r $countJoin LEFT JOIN pp ON $pageOn LEFT JOIN art ON art.id = pp.id " +
+        "LEFT JOIN fav ON fav.v = r.v AND fav.article_id = art.id " +
+        "LEFT JOIN fol ON fol.v = r.v AND fol.followee_id = art.author_id ORDER BY r.i, pp.id DESC"
 
 /** Distinct page keys (key columns + limit + offset) of a filtered list, and the id of the filter's row as `fk.id`. */
 private fun pageKeys(lookup: String) =

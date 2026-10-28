@@ -34,6 +34,8 @@ dropped unrun, and a full queue answers 503 "server busy" (`READ_QUEUE_MAX` 6553
 Batched reads: `READ_SHARE=0` makes every request of a batch compute its own rows (default 1: the requests of one
 execution share counts, pages and article columns, see DESIGN.md "Shared reads"); `READ_GATHER_MS` (default 20) is how
 long a read kind waits for more requests before it is sent (0: as soon as a connection is free); `READ_MAX_BATCH`
-(default 256) caps one execution while sharing. With `DB_STATS_S` the log also gets, per interval, each read kind's
+(default 256) caps one execution while sharing; `READ_VIEWER_FLAGS=0` makes shared lists check favorited/following
+per row instead of once per viewer. Postgres connections default to one read connection per CPU and one write
+connection per two (`DB_READ_CONNS`, `DB_WRITE_CONNS`: 8 + 4 on the box). With `DB_STATS_S` the log also gets, per interval, each read kind's
 queue wait and round trip, the read and write connections' utilization, and the bcrypt queue wait.
 `SQL_PRINT=1` prints every read statement and exits (diagnostics).

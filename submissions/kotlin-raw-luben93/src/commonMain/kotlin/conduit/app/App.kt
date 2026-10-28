@@ -18,18 +18,22 @@ object App {
         appSortsTags: Boolean = true,
         shareReads: Boolean = false,
         shareMaxBatch: Int = ReadShare.maxBatch,
+        viewerFlags: Boolean = false,
     ) {
         TagOrder.appSorts = appSortsTags && collation != null &&
             TagOrder.isByteOrder(collation[0] ?: "", collation[1] ?: "", collation[2] ?: "")
         ReadShare.on = shareReads
         ReadShare.maxBatch = shareMaxBatch
+        ReadShare.viewerFlags = viewerFlags
     }
 
     /** Who sorts tag lists (for the startup log line). */
     val tagOrder: String get() = if (TagOrder.appSorts) "app" else "sql"
 
     /** How batched reads work (for the startup log line), see [ReadShare]. */
-    val readMode: String get() = if (ReadShare.on) "shared, up to ${ReadShare.maxBatch} per batch" else "per request"
+    val readMode: String
+        get() = if (!ReadShare.on) "per request" else "shared, up to ${ReadShare.maxBatch} per batch" +
+            if (ReadShare.viewerFlags) ", flags per viewer" else ""
 
     const val COLLATION_PROBE = TagOrder.PROBE
 

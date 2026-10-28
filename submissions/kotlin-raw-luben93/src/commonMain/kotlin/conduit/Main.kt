@@ -33,8 +33,10 @@ fun main() {
     // Sizing for the box's 8 cores shared with Postgres: few runnable threads, few Postgres backends.
     val cpus = cpuCount()
     val httpThreads = envInt("HTTP_THREADS", maxOf(1, (cpus + 3) / 4))
-    val readConns = envInt("DB_READ_CONNS", maxOf(2, (cpus * 3 + 3) / 4))
-    val writeConns = envInt("DB_WRITE_CONNS", maxOf(1, (cpus + 3) / 4))
+    // 8 read + 4 write on the box: with 6 + 2 the write connections sat at ~100% waiting on the WAL flush and their
+    // backlog broke p99, and Postgres had idle cores while the read connections queued (lab, 2026-10-28)
+    val readConns = envInt("DB_READ_CONNS", maxOf(2, cpus))
+    val writeConns = envInt("DB_WRITE_CONNS", maxOf(2, cpus / 2))
     val bcryptThreads = envInt("BCRYPT_THREADS", maxOf(1, (cpus + 7) / 8))
     // ~28 logins/s at 100k users: 400 ms fills 93% of 8-lane batches (mean 7.9 jobs). Logins are ~0.1% of requests,
     // so their latency can't move p95/p99.
@@ -64,6 +66,8 @@ fun main() {
         appSortsTags = envInt("APP_SORT_TAGS", 1) != 0,
         shareReads = shareReads,
         shareMaxBatch = envInt("READ_MAX_BATCH", 256),
+        // READ_VIEWER_FLAGS (default on): shared lists check favorited/following once per viewer, not twice per row
+        viewerFlags = envInt("READ_VIEWER_FLAGS", 1) != 0,
     )
     // SQL_PRINT=1 (diagnostics, .tmp/lab/explain.sh): prints every read statement as "sql<TAB>name<TAB>sql" and exits
     if (envInt("SQL_PRINT", 0) != 0) {

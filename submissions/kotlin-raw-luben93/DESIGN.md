@@ -114,7 +114,10 @@ equal). #1 (rust-epoll-WorriedArrow) gathers reads for 20 ms and answers each di
 does the same inside each kind's batched statement (`ReadShare` in app/Sql.kt), with the same columns and JSON:
 - the requests are a MATERIALIZED CTE; each list's capped count runs once per distinct key (the global count once per
   execution), each page once per distinct (key, limit, offset), and each distinct article is decorated once (`art`:
-  tags, favorites count, author), then joined back to every request row. favorited/following stay per request row.
+  tags, favorites count, author), then joined back to every request row.
+- favorited/following in the shared lists (`READ_VIEWER_FLAGS`, default on): one favorites_pkey and one follows_pkey
+  scan per signed-in viewer (`= ANY` of the viewer's page articles / authors) instead of two probes per row
+  (60 workload-shaped requests: global list 6.3 -> 3.2 ms, author list 7.6 -> 3.8, tag list 12.9 -> 10.7).
 - article, article read-back, comments (each distinct slug's newest 100 with authors, each distinct viewer's
   followees once) and profile share by key. Feed and the favorited list stay per request (nothing repeats; the
   shared shape cost more there).
@@ -122,6 +125,10 @@ does the same inside each kind's batched statement (`ReadShare` in app/Sql.kt), 
   for 10% of the table) hashed all of articles and users per execution (278 ms per 60 requests).
 - `ReadPool` sends a kind once its oldest request has waited `READ_GATHER_MS` or its batch is full
   (`READ_MAX_BATCH`, 256); a `db-gather` clock thread hands kinds whose window passed to idle connections.
+
+Connections: 8 read + 4 write on the box (one per CPU, one per two). With 6 + 2, the write connections were ~100%
+busy at 120k users waiting on the WAL flush, and the writes' backlog (5% of requests) broke p99; the read connections
+queued while Postgres had idle cores. With 8 + 4 the scorer's search held its 144k cap here (p99 489 ms at the hold).
 
 Lab (2026-10-27, box simulation on 8 of 20 laptop CPUs, lab/reports/omarchy-20261027.md): at 120k users Postgres
 went from 170 to 127 us/req (statement execution 5.4 -> 4.1 cores; the global list 127 -> 44 s per 2 minutes), the
