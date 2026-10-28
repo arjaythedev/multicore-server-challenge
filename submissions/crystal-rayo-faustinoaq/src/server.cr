@@ -1,9 +1,9 @@
 require "./api"
 require "./passwords"
-require "./compression"
 
 app = Rayo::App.new
-app.after { |ctx| Conduit::Compression.apply(ctx) } unless ENV["GZIP"]? == "0"
+app.gzip = ENV["GZIP"]? != "0"
+app.on_worker_start { |_index| Passwords.start }
 
 app.get "/api/tags" do |ctx|
   ctx.db.query(Sql::TAGS) do |res, ctx|

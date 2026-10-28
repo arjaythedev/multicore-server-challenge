@@ -1,4 +1,4 @@
-require "../src/bcrypt_lanes"
+require "rayo/bcrypt"
 require "random/secure"
 @[Link("crypt")]
 lib TestCrypt
@@ -6,7 +6,7 @@ lib TestCrypt
   fun crypt_gensalt_rn(prefix : UInt8*, count : LibC::ULong, bytes : UInt8*, n : Int32, output : UInt8*, size : Int32) : UInt8*
 end
 
-def check_lanes(engine : BcryptLanes::Engine(N), rounds : Int32) forall N
+def check_lanes(engine : Rayo::Bcrypt::Lanes::Engine(N), rounds : Int32) forall N
   passwords = Array(String).new(N) { "" }
   settings = Array(Bytes).new(N) { Bytes.new(64) }
   ptrs = Array(UInt8*).new(N, Pointer(UInt8).null)
@@ -45,10 +45,10 @@ def check_lanes(engine : BcryptLanes::Engine(N), rounds : Int32) forall N
   puts "#{N * rounds} hashes at cost 10, #{N} lanes: match libcrypt"
 end
 
-check_lanes(BcryptLanes::Engine(1).new, 80)
-check_lanes(BcryptLanes::Engine(2).new, 20)
-check_lanes(BcryptLanes::Engine(3).new, 20)
-check_lanes(BcryptLanes::Engine(5).new, 20)
-check_lanes(BcryptLanes::Engine(4).new, 40)
-check_lanes(BcryptLanes::Engine(6).new, 40)
-check_lanes(BcryptLanes::Engine(8).new, 40)
+check_lanes(Rayo::Bcrypt::Lanes::Engine(1).new, 80)
+check_lanes(Rayo::Bcrypt::Lanes::Engine(2).new, 20)
+check_lanes(Rayo::Bcrypt::Lanes::Engine(3).new, 20)
+check_lanes(Rayo::Bcrypt::Lanes::Engine(5).new, 20)
+check_lanes(Rayo::Bcrypt::Lanes::Engine(4).new, 40)
+check_lanes(Rayo::Bcrypt::Lanes::Engine(6).new, 40)
+check_lanes(Rayo::Bcrypt::Lanes::Engine(8).new, 40)
