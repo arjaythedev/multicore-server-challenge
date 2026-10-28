@@ -37,6 +37,7 @@ module Pg
     property qcap = 1024_u32
     property group_at = 0_i64
     property group : Job? = nil
+    property group_ready = false # a closed write group in qbuf must not wait for a newer group
     property statements = 0
     property set = 0_u8 # result set (statement) of the front job the next DataRow belongs to
     property err = false
@@ -293,6 +294,7 @@ module Pg
       c.group = nil
       c.qbuf << "S\0\0\0\x04"
       c.push(Query.new(group))
+      c.group_ready = true
       c.statements = 0
     end
   end
@@ -437,7 +439,7 @@ module Pg
       next if c.sending || c.qbuf.len == 0 || !c.alive
       if group = c.group
         remaining = @@write_window - (Sys.now_ns(Sys::CLOCK_MONOTONIC) - c.group_at)
-        if remaining > 0 && group.nsub < 48
+        if remaining > 0 && group.nsub < 48 && !c.group_ready
           Uring.arm_timer(remaining)
           next
         end
@@ -447,6 +449,7 @@ module Pg
       c.sbuf = c.qbuf
       c.qbuf = t
       c.qbuf.clear
+      c.group_ready = false
       c.soff = 0
       c.sending = true
       Uring.pg_send(c.idx, c.fd, c.sbuf.ptr, c.sbuf.len)

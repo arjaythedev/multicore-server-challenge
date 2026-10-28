@@ -59,6 +59,8 @@ A SQL error rolls back the whole group, then each request retries independently.
 Connection loss fails the affected requests without retrying an unknown commit.
 Article creation and tag insertion remain atomic. A single-connection setting
 closes any write group before appending a read.
+Once a group closes, the next flush sends it together with any trailing partial
+group. A newer group's collection window cannot postpone already closed groups.
 
 Bcrypt pthreads collect up to six jobs, waiting at most 200 ms to fill a set.
 Collection is serialized within each process so waiting threads do not split a
@@ -119,6 +121,8 @@ normal operation does not log individual batches.
   passwords succeed and wrong passwords fail.
 - `python3 test/group_commit.py http://HOST:PORT`: concurrent conflicting and
   successful registrations; successful writes must be visible after the response.
+- `GROUP_COMMIT=1 crystal run test/group_flush.cr`: a full group followed by a
+  partial group flushes immediately; a fresh partial group still waits for its window.
 
 Local measurements (development seed, 3,500 users, think scale 0.05, the repo's loadgen with a 10 s ramp, 30 s
 measurement and 5 s tail, app limited to four CPUs, loadgen and Postgres on the same machine; not official
