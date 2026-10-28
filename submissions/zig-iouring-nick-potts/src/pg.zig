@@ -133,6 +133,11 @@ pub fn sync(o: *Out) void {
     o.bytes(&.{ 'S', 0, 0, 0, 4 });
 }
 
+/// Has Postgres send the results it holds so far; unlike Sync, the pipeline goes on.
+pub fn flush(o: *Out) void {
+    o.bytes(&.{ 'H', 0, 0, 0, 4 });
+}
+
 /// Bind with every parameter and every result column in binary. Returns the offset after the parameter count,
 /// where the caller writes each parameter, then calls `bindEnd`.
 pub fn bindBegin(o: *Out, stmt_name: []const u8, nparams: u16) usize {

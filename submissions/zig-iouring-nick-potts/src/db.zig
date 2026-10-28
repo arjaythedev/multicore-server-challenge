@@ -428,7 +428,10 @@ fn buildWrite() ?*Group {
 
 fn encodeGroup(o: *pg.Out, g: *Group) void {
     var name: [8]u8 = undefined;
-    for (g.units[0..g.nunits]) |*u| {
+    for (g.units[0..g.nunits], 0..) |*u, i| {
+        // Postgres keeps a finished unit's results until the Sync or a full send buffer, so a read unit would wait
+        // behind the units after it (MEGA, the slow one, is last). Writes are answered at ReadyForQuery anyway.
+        if (i > 0 and !g.write) pg.flush(o);
         const d = u.stmt.def();
         const members = g.unitMembers(u);
         switch (u.kind) {
@@ -697,6 +700,47 @@ test "a write drain batches by statement in first-write order and leaves writes 
     defer freeGroup(solo);
     try testing.expectEqual(1, solo.nmembers);
     try testing.expectEqual(null, writes.head);
+}
+
+/// The type of every message in `o`, in order.
+fn messageTypes(buf: []u8, o: *const pg.Out) []const u8 {
+    const b = o.list.items;
+    var n: usize = 0;
+    var at: usize = 0;
+    while (at < b.len) : (n += 1) {
+        buf[n] = b[at];
+        at += 1 + @as(usize, @intCast(std.mem.readInt(i32, b[at + 1 ..][0..4], .big)));
+    }
+    return buf[0..n];
+}
+
+test "a read group flushes after every unit but the last, so each unit's results come back as it completes; a write group does not" {
+    const stmts = [_]Stmt{ .comments_list_set, .user_by_email, .article_by_slug, .comments_list_set, .article_by_slug };
+    var reqs: [stmts.len]Query = undefined;
+    for (&reqs, stmts) |*r, s| r.* = .{ .stmt = s, .params = @splat(Param{ .int = 1 }) };
+    for (&reqs) |*r| enqueue(r);
+    var buf: [32]u8 = undefined;
+
+    const g = buildRead().?;
+    defer freeGroup(g);
+    var o: pg.Out = .{};
+    defer o.deinit();
+    encodeGroup(&o, g);
+    // Batched comments, the login's lookup, then MEGA: Bind and Execute each.
+    try testing.expectEqual(3, g.nunits);
+    try testing.expectEqualStrings("BEHBEHBES", messageTypes(&buf, &o));
+
+    var favs = [_]Query{ .{ .stmt = .favorite }, .{ .stmt = .follow }, .{ .stmt = .favorite } };
+    for (&favs) |*r| {
+        r.params = @splat(Param{ .int = 1 });
+        enqueue(r);
+    }
+    const w = buildWrite().?;
+    defer freeGroup(w);
+    var wo: pg.Out = .{};
+    defer wo.deinit();
+    encodeGroup(&wo, w);
+    try testing.expectEqualStrings("BEBES", messageTypes(&buf, &wo));
 }
 
 test "a lone write waits for company, and the wait does not end early" {

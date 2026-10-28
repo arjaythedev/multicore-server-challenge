@@ -226,7 +226,9 @@ saturation, and five read backends would cap how much Postgres the reads can use
 drain started (the drain gap, as in #47's gather). Then a free read connection takes every queued read of every
 worker, up to 4,096, and sends them as one Sync group. 4,096 queued reads start a drain at once, gap or not. Each
 connection has one group in flight at a time (depth 1). This is #47's two-phase gather, and #37 and #50 batch
-similarly. The previous version had the 5 ms clock alone. Against sending reads as they
+similarly. A Flush follows every execution in a read group but the last, so each one's requests are answered as
+soon as it completes. Without it Postgres holds the results until the Sync or a full 8 KB send buffer, behind MEGA,
+which goes last. The previous version had the 5 ms clock alone. Against sending reads as they
 come, that clock measured −22.5 µs per request [−24, −21], of which −17.5 was Postgres. Instructions per request went from
 1,316k to 1,156k.
 
