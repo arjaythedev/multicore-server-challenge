@@ -4,14 +4,15 @@ Front: direct
 
 | Component | Version |
 |---|---|
-| Crystal | 1.22.1, release build, native CPU target |
+| Crystal | 1.22.1, release build, x86-64-v3 CPU target |
 | HTTP framework | Kemal 1.15.0 |
 | PostgreSQL driver | crystal-pg 0.31.0 / crystal-db 0.15.0 |
 | JWT | crystal-community/jwt 1.7.2 |
 | Password hashing | Crystal standard library `Crypto::Bcrypt`, cost 10 |
 
 Dependencies, including transitive shards, are pinned in `shard.lock`. The installer
-checks the official Crystal toolchain archive's SHA-256 digest.
+checks the official Crystal toolchain archive's SHA-256 digest. The fixed x86-64-v3
+(AVX2) baseline avoids SIGILL from native CPU detection on some CI runners.
 
 ```bash
 sudo bash install.sh
