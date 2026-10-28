@@ -242,10 +242,11 @@ fn paging(query: &[u8]) -> Result<(i64, i64), Rejection> {
     Ok((number("limit", DEFAULT_LIMIT, 1..=MAX_LIMIT)?, number("offset", 0, 0..=i64::MAX)?))
 }
 
-/// The list filter. If several are given only the first of tag, author, favorited applies.
+/// The list filter. If several are given only the first of tag, author, favorited applies. A filter with an empty
+/// value is ignored (conformance step "empty-tag-ignored").
 fn list_filter(buf: &[u8], query: &[u8], scratch: &mut Scratch) -> (ListKind, Field) {
     for (name, kind) in [("tag", ListKind::Tag), ("author", ListKind::Author), ("favorited", ListKind::Favorited)] {
-        if let Some(value) = query_param(query, name) {
+        if let Some(value) = query_param(query, name).filter(|value| !value.is_empty()) {
             return (kind, scratch.field(buf, &value));
         }
     }

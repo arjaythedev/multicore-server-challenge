@@ -42,6 +42,22 @@ fn optional<'v, 'a>(object: &'v Value<'a>, key: &str, message: Invalid) -> Resul
     }
 }
 
+/// bcrypt reads at most 72 bytes of a password; the conformance suite wants longer ones rejected when they are set.
+const MAX_PASSWORD_BYTES: usize = 72;
+const PASSWORD_TOO_LONG: Invalid = "password must be at most 72 bytes";
+
+/// Like [`optional`], but a present value must not be empty (email, username, password, title...).
+fn optional_non_empty<'v, 'a>(object: &'v Value<'a>, key: &str, message: Invalid) -> Result<Option<&'v Cow<'a, str>>, Invalid> {
+    match optional(object, key, message)? {
+        Some(text) if text.is_empty() => Err(message),
+        found => Ok(found),
+    }
+}
+
+fn password_within_limit(password: &str) -> Result<(), Invalid> {
+    if password.len() > MAX_PASSWORD_BYTES { Err(PASSWORD_TOO_LONG) } else { Ok(()) }
+}
+
 pub struct Register {
     pub username: Field,
     pub email: Field,
@@ -51,10 +67,12 @@ pub struct Register {
 pub fn register(base: &[u8], body: &[u8], scratch: &mut Scratch) -> Result<Register, Invalid> {
     let root = parse(body)?;
     let user = wrapper(&root, "user")?;
+    let password = required(user, "password", "password can't be blank")?;
+    password_within_limit(password)?;
     Ok(Register {
         username: scratch.field_str(base, required(user, "username", "username can't be blank")?),
         email: scratch.field_str(base, required(user, "email", "email can't be blank")?),
-        password: scratch.field_str(base, required(user, "password", "password can't be blank")?),
+        password: scratch.field_str(base, password),
     })
 }
 
@@ -83,15 +101,22 @@ pub struct UpdateUser {
 pub fn update_user(base: &[u8], body: &[u8], scratch: &mut Scratch) -> Result<UpdateUser, Invalid> {
     let root = parse(body)?;
     let user = wrapper(&root, "user")?;
-    let mut field = |key: &str| -> Result<Option<Field>, Invalid> {
-        Ok(optional(user, key, "user fields must be strings")?.map(|text| scratch.field_str(base, text)))
-    };
+    let email = optional_non_empty(user, "email", "email can't be blank")?;
+    let username = optional_non_empty(user, "username", "username can't be blank")?;
+    let password = optional_non_empty(user, "password", "password can't be blank")?;
+    if let Some(password) = password {
+        password_within_limit(password)?;
+    }
+    // bio and image may be set to the empty string.
+    let bio = optional(user, "bio", "bio must be a string")?;
+    let image = optional(user, "image", "image must be a string")?;
+    let mut field = |text: Option<&Cow<'_, str>>| text.map(|text| scratch.field_str(base, text));
     Ok(UpdateUser {
-        email: field("email")?,
-        username: field("username")?,
-        password: field("password")?,
-        bio: field("bio")?,
-        image: field("image")?,
+        email: field(email),
+        username: field(username),
+        password: field(password),
+        bio: field(bio),
+        image: field(image),
     })
 }
 
@@ -142,9 +167,9 @@ pub struct ArticleEdit {
 pub fn article_edit(base: &[u8], body: &[u8], scratch: &mut Scratch) -> Result<ArticleEdit, Invalid> {
     let root = parse(body)?;
     let article = wrapper(&root, "article")?;
-    let title = optional(article, "title", "article fields must be strings")?;
-    let description = optional(article, "description", "article fields must be strings")?;
-    let text = optional(article, "body", "article fields must be strings")?;
+    let title = optional_non_empty(article, "title", "title can't be blank")?;
+    let description = optional_non_empty(article, "description", "description can't be blank")?;
+    let text = optional_non_empty(article, "body", "body can't be blank")?;
     Ok(ArticleEdit {
         slug_base: title.map(|t| slugify(t)),
         title: title.map(|t| scratch.field_str(base, t)),
