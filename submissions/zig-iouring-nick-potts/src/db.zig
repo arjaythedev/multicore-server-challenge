@@ -4,12 +4,13 @@
 //! that is the worker itself; with more, every read goes to the drain process (drain.zig), which runs the read path
 //! below for all of them and hands each result back to the worker that asked. Reads go out on a
 //! batch clock (PR #47's two-phase gather, measured on branch sql-proto as proto-gather5ms): once the oldest queued
-//! read has waited `window_ns`, a free read connection takes every queued read into one Sync group, so each drain
-//! holds everything that arrived during the window. Same-statement requests become one batched execution (one array
+//! read has waited `window_ns` and `gap_ns` has passed since the previous drain started, a free read connection takes
+//! every queued read into one Sync group, so each drain holds everything that arrived since the last one. A full
+//! queue (`max_members`) starts a drain at once. Same-statement requests become one batched execution (one array
 //! per parameter, rows tagged with the request ordinal), tag reads share one execution, and the whole drain rides one
-//! Sync. The next drain's clock starts with the next read to arrive. A drain with two or more reads that MEGA
+//! Sync. A drain with two or more reads that MEGA
 //! serves sends those as one execution of it instead, last in the Sync group (mega.zig). Comments stay out of MEGA:
-//! one runs COMMENTS_LIST_SET, two or more its batched form.
+//! one runs COMMENTS_LIST_SET, two or more its batched form, which reads each distinct thread once (threads.zig).
 //!
 //! Writes go to their own connection (sql-writes' writes-1conn). An idle write connection takes the first queued
 //! write; when nothing else is queued it waits `write_wait_ns` first. Then it takes up to `max_writes` into one Sync
@@ -24,6 +25,7 @@ const pg = @import("pg.zig");
 const sys = @import("sys.zig");
 const api = @import("api.zig");
 const mega = @import("mega.zig");
+const threads = @import("threads.zig");
 const drain = @import("drain.zig");
 const Stmt = sql.Stmt;
 
@@ -38,9 +40,13 @@ pub const Param = union(enum) {
 /// Sync groups in flight per read connection.
 const depth = 1;
 /// The batch clock: how long the oldest queued read waits for others before its drain goes out. Longer clocks make
-/// bigger drains, which cost Postgres less per read and add up to the clock to every read's latency; arms sweep it
-/// end to end (rig/zig-arms.sh) and read p95/p99 at the knee.
+/// bigger drains, which cost Postgres less per read and add up to the clock to every read's latency.
 const window_ns = 5 * std.time.ns_per_ms;
+/// The drain gap (#47's gather): a read drain starts only once this long has passed since the previous one started,
+/// so below saturation the reads of the whole gap share one drain instead of ~5 ms worth each.
+const gap_ns = 20 * std.time.ns_per_ms;
+/// When the last read drain started (monotonic ns).
+var last_read_ns: u64 = 0;
 /// How long an idle write connection holding a lone write waits for others before it sends it (sql-writes'
 /// delay_us). Writes that arrive meanwhile join it; the wait does not end early.
 const write_wait_ns = 3 * std.time.ns_per_ms;
@@ -183,6 +189,7 @@ pub const Conn = struct {
     in_len: u8 = 0,
     row: pg.Row = .{},
     mega: mega.Result = .{},
+    fan: threads.Fan = .{},
     /// A write connection's next drain time (monotonic ns), set once it is idle with writes queued.
     write_due: ?u64 = null,
 
@@ -216,12 +223,14 @@ fn stmtName(buf: *[8]u8, prefix: u8, s: Stmt) []const u8 {
 
 /// Connects and prepares every statement this connection runs, checking each against the live schema.
 pub fn openConn(url: pg.Url, write: bool, index: u16) !Conn {
+    // Read connections also get 32 MB of work_mem: a big drain's MEGA sorts and hashes stay in memory.
     const gucs = [_][2][]const u8{
         .{ "plan_cache_mode", "force_generic_plan" },
         .{ "jit", "off" },
         .{ "application_name", "conduit-zig" },
+        .{ "work_mem", "32MB" },
     };
-    const b = try pg.connect(url, &gucs);
+    const b = try pg.connect(url, if (write) gucs[0..3] else &gucs);
     defer std.heap.smp_allocator.destroy(b);
     var name: [8]u8 = undefined;
     for (0..sql.count) |i| {
@@ -283,7 +292,7 @@ fn readsDue() ?u64 {
     var queued: u32 = 0;
     for (&reads) |*q| queued += q.len;
     if (queued >= max_members) return now_ns;
-    return reads[@intFromEnum(s)].head.?.queued_ns + window_ns;
+    return @max(reads[@intFromEnum(s)].head.?.queued_ns + window_ns, last_read_ns + gap_ns);
 }
 
 /// Whether the queues hold at least `mega_min` reads that may ride in MEGA: those with a mega form, except
@@ -475,6 +484,7 @@ pub fn pump() ?u64 {
         while (c.in_len < depth) {
             if (readsDue()) |due| if (due > now_ns) break;
             const g = buildRead() orelse break;
+            last_read_ns = now_ns;
             encodeGroup(&c.pending, g);
             c.pushGroup(g);
         }
@@ -549,6 +559,8 @@ fn message(c: *Conn, t: u8, body: []const u8) void {
                 .single => results.row(members[0], &c.row),
                 .broadcast => for (members) |r| results.row(r, &c.row),
                 .batched => {
+                    if (u.stmt.def().thread_cols != null)
+                        return c.fan.row(&c.row, members, results) catch |e| sys.fatal("comments result: {s}", .{@errorName(e)});
                     c.row.n -= 1;
                     const ord = c.row.int(c.row.n);
                     if (ord < 1 or ord > members.len) sys.fatal("batched row ordinal {d} out of range", .{ord});
@@ -567,6 +579,7 @@ fn message(c: *Conn, t: u8, body: []const u8) void {
             } else if (!g.write) {
                 for (g.unitMembers(u)) |r| results.done(r);
             }
+            c.fan.reset();
             g.cur += 1;
         },
         'E' => {
@@ -574,6 +587,7 @@ fn message(c: *Conn, t: u8, body: []const u8) void {
             g.failed_at = g.cur;
             g.err = pg.ErrorInfo.parse(body);
             c.mega.reset();
+            c.fan.reset();
         },
         'Z' => {
             const g = c.popGroup();

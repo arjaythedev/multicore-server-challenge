@@ -8,6 +8,7 @@
 //! connection, and startup refuses to serve unless every one prepares and describes exactly these result types.
 //! `$1` is the viewer (0 = anonymous) wherever `favorited` / `following` are computed.
 const std = @import("std");
+const threads = @import("threads.zig");
 
 pub const Oid = enum(u32) {
     bool = 16,
@@ -43,6 +44,9 @@ pub const Def = struct {
     order: []const u8 = "",
     /// A batched form written by hand (`sql/BATCH_<NAME>.sql`), used instead of the generic wrap.
     batched: ?[]const u8 = null,
+    /// The batched form's columns when it returns each distinct thread once instead of `cols` and the ordinal per
+    /// request; threads.zig rebuilds each request's rows.
+    thread_cols: ?[]const Oid = null,
     /// How the statement's requests ride in the mega statement; null: never.
     mega: ?Mega = null,
 };
@@ -147,8 +151,9 @@ fn file(comptime prefix: []const u8, comptime s: Stmt) []const u8 {
 //   stays an index-only scan while new articles keep the newest pages dirty (#7).
 //   COMMENTS_LIST_SET returns up to 100 comments newest first (one row of NULL comment columns when there are
 //   none; no row means no article): comment id, body, created_at, updated_at, username, bio, image, following.
-//   Its batched form keeps each request's rows in that order: they come from a parameterized LATERAL, which the
-//   plan can only run as a nested loop's inner side (sql-articlepage's contract).
+//   Its batched form reads each distinct article's thread once, in that order (a parameterized LATERAL, which the
+//   plan can only run as a nested loop's inner side: sql-articlepage's contract), after one row per request with
+//   the viewer's followee ids; threads.zig hands every request its thread's rows.
 //   USER_BY_EMAIL stays out of MEGA: it reads the password hash.
 const defs = [count]Def{
     // lists (branch sql-lists)
@@ -161,7 +166,7 @@ const defs = [count]Def{
     // article page (branch sql-articlepage)
     .{ .sql = text(.article_by_slug), .params = &.{ .int8, .text }, .cols = &full_cols, .batch = .arrays, .mega = .{ .kind = 6, .args = &.{ .v, .t1 }, .cols = &full_mega_cols, .fill = 1 } },
     .{ .sql = text(.article_by_id), .params = &.{ .int8, .int8 }, .cols = &full_cols, .batch = .arrays, .mega = .{ .kind = 7, .args = &.{ .v, .i1 }, .cols = &full_mega_cols, .fill = 1 } },
-    .{ .sql = text(.comments_list_set), .params = &.{ .int8, .text }, .cols = &.{ .int8, .text, .timestamptz, .timestamptz, .text, .text, .text, .bool }, .batch = .arrays, .batched = batchText(.comments_list_set) },
+    .{ .sql = text(.comments_list_set), .params = &.{ .int8, .text }, .cols = &.{ .int8, .text, .timestamptz, .timestamptz, .text, .text, .text, .bool }, .batch = .arrays, .batched = batchText(.comments_list_set), .thread_cols = &threads.cols },
     .{ .sql = text(.profile), .params = &.{ .int8, .text }, .cols = &.{ .text, .text, .text, .bool }, .batch = .arrays, .mega = .{ .kind = 9, .args = &.{ .v, .t1 }, .cols = &.{ 11, 12, 13, 14 } } },
     // users and tags
     .{ .sql = text(.user_by_id), .params = &.{.int8}, .cols = &user_cols, .batch = .arrays, .mega = .{ .kind = 10, .args = &.{.v}, .cols = &.{ 1, 11, 16, 12, 13 } } },
@@ -223,6 +228,7 @@ pub fn batchedSql(gpa: std.mem.Allocator, s: Stmt) ![]u8 {
 
 pub fn batchedCols(gpa: std.mem.Allocator, s: Stmt) ![]Oid {
     const d = s.def();
+    if (d.thread_cols) |t| return gpa.dupe(Oid, t);
     const cols = try gpa.alloc(Oid, d.cols.len + 1);
     @memcpy(cols[0..d.cols.len], d.cols);
     cols[d.cols.len] = .int8;

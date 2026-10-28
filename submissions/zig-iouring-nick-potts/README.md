@@ -9,7 +9,8 @@ Front: direct
 | Database driver | none: our own PostgreSQL v3 wire client (SCRAM-SHA-256, prepared statements, binary rows) |
 | Database | PostgreSQL 18 |
 | Other dependencies | none. JSON, JWT, HMAC-SHA-256 (with SHA-NI), bcrypt (with hand-written assembly kernels) and the gzip encoder are written here |
-| Score on our rig | **150,000 users**, held in two official-style searches with `shed=on,ackdelay=on`. The same build with `ackdelay=off` held 140,000 |
+| Official score | **110,000 users**, for the previous version of this folder (#79). This version changes the read path (below) and has not been scored |
+| Previous version on our rig | 150,000 users, held in two official-style searches with `shed=on,ackdelay=on`. The same build with `ackdelay=off` held 140,000 |
 
 ```sh
 sudo bash install.sh     # Zig 0.17.0 to /opt/zig-0.17.0, checked against its SHA-256
@@ -86,19 +87,19 @@ At 8 CPUs:
      ┌───────────────────────────────────────┐
      │ drain process (one io_uring)          │
      │ one read queue for the whole box      │
-     │ 5 ms batch clock, ≤4,096 reads/drain  │──► 5 read connections ──► Postgres
-     │ MEGA + batched statements, one Sync   │    (5/8 of the CPUs)       (5 read backends)
+     │ 5 ms clock + 20 ms gap, ≤4,096 reads  │──► 8 read connections ──► Postgres
+     │ MEGA + batched statements, one Sync   │    (one per CPU)           (8 read backends)
      │ answers rows in DataRow layout        │
      └───────────────────────────────────────┘
 ```
 
-That is 9 Postgres connections in all (5 read, 4 write). A worker turns the drain's raw rows into JSON itself, so the
+That is 12 Postgres connections in all (8 read, 4 write). A worker turns the drain's raw rows into JSON itself, so the
 drain process never touches HTTP or JSON. The parent process forks everything, sets `PR_SET_PDEATHSIG` on its
 children, and if any process dies it kills the rest and exits, so a crash stays visible instead of leaving a
 half-working server. Several processes are needed anyway: the run's `LimitNOFILE` is 200,000 per process.
 
 With one worker (2–3 CPUs) there is no drain process and the worker keeps its own read connections. Sizing comes from
-the CPU count: workers = cpus/2, read connections = (5·cpus + 4)/8, bcrypt threads per worker = ⌈cpus/workers⌉.
+the CPU count: workers = cpus/2, read connections = cpus, bcrypt threads per worker = ⌈cpus/workers⌉.
 
 Where the CPU goes at 150,000 users (about 39,000 requests a second, an earlier build without ACK delay): the four
 event loops together use about 1.34 cores, which is 34 µs per request, and Postgres about 4.3 cores, which is
@@ -211,18 +212,22 @@ total. On the scoring-sized box, the drain plus the SQL changes below plus the 3
 to 117 µs per request against the previous version (per-worker queues). The p95 at 130,000 users fell from 417 ms to
 117 ms.
 
-**How many read connections.** Five on 8 CPUs, 5/8 of the cores, measured at −9 µs per request against six at 154,000
-users. Fewer backends make bigger drains, and they contend less for buffer pins and locks. Read backends spend 28–33%
-of their cycles on those. #56 and #53 also landed on 5/8.
+**How many read connections.** Eight on 8 CPUs, one per core, as #47 runs. The previous version ran five (5/8 of
+the cores, where #56 and #53 also landed): on our rig, before the drain gap, fewer backends made bigger drains and
+contended less for buffer pins and locks. That comparison came from a box limited by its receive CPU (see
+[the wall](#the-wall-and-why-the-score-is-150k)). With the drain gap, the gap sets drain size below
+saturation, and five read backends would cap how much Postgres the reads can use.
 
 ---
 
 ## The batch clock and coalescing
 
-**The clock.** Reads wait in the queue until the oldest has waited 5 ms. Then a free read connection takes every
-queued read of every worker, up to 4,096, and sends them as one Sync group. Each connection has one group in flight
-at a time (depth 1). This is #47's two-phase gather, and #37 and #50 batch similarly. Against sending reads as they
-come, it measured −22.5 µs per request [−24, −21], of which −17.5 was Postgres. Instructions per request went from
+**The clock.** Reads wait in the queue until the oldest has waited 5 ms and 20 ms have passed since the previous
+drain started (the drain gap, as in #47's gather). Then a free read connection takes every queued read of every
+worker, up to 4,096, and sends them as one Sync group. 4,096 queued reads start a drain at once, gap or not. Each
+connection has one group in flight at a time (depth 1). This is #47's two-phase gather, and #37 and #50 batch
+similarly. The previous version had the 5 ms clock alone. Against sending reads as they
+come, that clock measured −22.5 µs per request [−24, −21], of which −17.5 was Postgres. Instructions per request went from
 1,316k to 1,156k.
 
 **Coalescing inside a drain.** Requests for the same statement run as one execution with one array per parameter:
@@ -239,9 +244,12 @@ are shared.
 | 50 ms | 1,264 | 245 ms | 0.511 |
 | 100 ms | 2,377 | 445 ms | 0.496 |
 
-The final stack at 5 ms costs 1.5–1.7x what it costs at 50 ms. We ship 5 ms because the official search fails on p99
-latency well before it fails on CPU, and every longer clock we tried live hurt the tail more than it saved (see the
-losers).
+The final stack at 5 ms costs 1.5–1.7x what it costs at 50 ms. The previous version shipped 5 ms because, on our
+rig, the search failed on p99 latency before it failed on CPU, and the longer clocks we tried live hurt the tail more
+than they saved (see the losers). Those runs were limited by the receive CPU, not by Postgres. Our
+reproduction of the official run put the previous version's limit at its five read backends, so this version
+takes the bigger drains: the gap adds up to 20 ms
+to a read's wait in exchange for cheaper reads.
 
 ---
 
@@ -262,7 +270,8 @@ Before writing SQL we measured what the wire protocol costs on Postgres's side, 
 | TLS on the connection | 0.978 without it (we don't use it; the connection is TCP to 127.0.0.1) |
 
 So: named prepared statements, `plan_cache_mode = force_generic_plan`, `jit = off` (both session settings), binary
-parameters and results, and as few Syncs as possible. A profile of a read backend under #7's statements showed 73.5%
+parameters and results, and as few Syncs as possible. Read connections also set `work_mem = 32MB` for the session,
+so a big drain's sorts and hashes stay in memory; write connections keep the server default. A profile of a read backend under #7's statements showed 73.5%
 in executor run and 7.7% in executor start. The SQL itself is where the time is.
 
 ### MEGA
@@ -286,7 +295,12 @@ A drain with fewer than two MEGA jobs uses the ordinary single statements. MEGA 
 instructions per execution, 13x a one-row statement.
 
 Logins look users up by email with a batched statement. Comments use `COMMENTS_LIST_SET` for one request and
-`BATCH_COMMENTS_LIST_SET` for two or more. Both run beside MEGA in the same Sync group. If a drain's group fails, each
+`BATCH_COMMENTS_LIST_SET` for two or more. Both run beside MEGA in the same Sync group. The batched form returns one
+row per request (its viewer's followee ids and the first request in the drain for the same article), then each
+distinct article's thread once, newest first, up to 100 comments. `threads.zig` hands the thread's rows to every
+request for that article and sets `following` for each request from its own viewer's followees. As with MEGA, the
+thread is shared only among requests already queued for one fresh query, within one execution, and is not kept
+after it. If a drain's group fails, each
 of its jobs is retried alone, so one bad request can't fail its neighbours. MEGA shares work only among reads that
 were queued before it started, inside one execution. No returned data is retained across requests (in #7's wording).
 
@@ -494,7 +508,7 @@ Flag `ackdelay`, default on. It is the cheapest change in the entry and the last
 
 **The problem.** The load generator's clients pause between requests. When a connection has been idle longer than
 the retransmit timeout, Linux enters quick-ACK mode and ACKs the next incoming request immediately, in a packet of its
-own, before the server has even read it. Our reads then wait for the 5 ms clock, so the response follows a few
+own, before the server has even read it. Our reads then wait for the batch clock, so the response follows a few
 milliseconds later in a second packet. At 140,000 users, 63% of the server's pure ACKs left within 1 ms of the
 request. The receive CPU (one CPU takes every network interrupt; see [the wall](#the-wall-and-why-the-score-is-150k))
 was paying for a packet that carried nothing.
@@ -593,12 +607,19 @@ against libdeflate, with higher throughput and shorter tails. Gzipping every lar
 - **Flags** are validated before fork (above).
 - **SHA-NI** is detected once by CPUID and logged.
 
-Checks on the final build: the conformance suite 197/197; an oracle run of 3,000 of 3,000 request pairs identical to
-the Go reference server (32 pairs in flight); 54 unit tests, including the ring wrap sweep and the spill regression.
+Checks on the previous version: an oracle run of 3,000 of 3,000 request pairs identical to the Go reference server
+(32 pairs in flight). Checks on this version, on the full seed: the conformance suite 197/197 on a fresh database;
+56 unit tests, including the ring wrap sweep, the spill regression and the comments fan-out; and 40 rounds of 58
+concurrent comment reads over shared and missing articles, beside comment creates and deletes, each sent as one
+batched execution and each byte-identical to the same read sent alone.
 
 ---
 
 ## The wall, and why the score is 150k
+
+This section is about the previous version on our rig. The official run scored that version 110,000, and our
+reproduction of it found the five read backends busy, not the receive CPU. This version's read-path changes aim at
+that limit.
 
 **The wall is the NIC.** The scoring-sized box (like every VM we tried) has a single-queue NIC, so one CPU takes every
 receive interrupt. At 140,000 users, per request, the box takes in 1.0 request plus 1.56 client ACKs, and sends 1.76
@@ -668,7 +689,7 @@ Measured on the development box with 3 CPUs at 42,000 users, against the gather 
 | 1–2 read connections per worker | Fewer backends, bigger batches | −33 / −22 µs/req at 42,000 users | Collapsed at 90,000: 7.7–9.1k and 11.8–16.5k req/s against 17.2–22.2k |
 | No clock on the drain | Send reads inline as they arrive | +37 µs/req on the dev box; on the scoring-sized box +18.7 (Postgres +17.5) | Pure ACKs fell 0.33 → 0.13 but receive CPU didn't change |
 | 20 ms clock + "alone" gate | Long clock, but send a lone read at once | Postgres −15 on the dev box; at 158,000 on the scoring-sized box −1.2% req/s, +70 ms p95 | Tail. Its p99 hit 1,164 ms (fail) |
-| 10 / 20 / 50 / 100 ms clocks | | Cheaper Postgres, longer tails | p99 is the binding limit |
+| 10 / 20 / 50 / 100 ms clocks | | Cheaper Postgres, longer tails | p99 was the binding limit on our receive-CPU-bound rig. This version ships a 20 ms drain gap |
 | Load-adaptive clock | Clock follows the arrival rate | −1.5 µs/req | Noise |
 | 3 event loops instead of 4 | | About −2 µs/req | Under the spread, and it collapsed in 1 of 2 holds |
 | Two parallel MEGAs | 10 ms clock, feeds in one MEGA and the rest in another, on two connections | About 0 µs/req | Collapsed in 2 of 2 holds at 154,000 |
@@ -714,7 +735,7 @@ Measured on the development box with 3 CPUs at 42,000 users, against the gather 
 | Article page: lookup by slug and id | +1% to +2% | |
 | Article page: tags plus favorite count together | +10.5% | |
 | Article page: every follow flag from one hashed set | +11.7% | |
-| Comments: followee ids once, threads once per drain | 0.847–0.916 cycles offline; −0.45 µs/req on the box | Didn't survive the live box |
+| Comments: followee ids once, threads once per drain | 0.847–0.916 cycles offline; −0.45 µs/req on the box | Too small at 5 ms drains. Shipped in this version, with the drain gap's bigger drains |
 | MEGA tag ids instead of names | 0.984 cycles offline; 0.0 on the box | |
 | Tag list body built once (1,036 → 9.8 ns) | 0.0 on the box | Right, but too small to see |
 | Comment authors in one scan | +6% to +8% | |
@@ -735,12 +756,12 @@ capped count in one statement, tag names by primary key, write CTEs that fold th
 the `unnest ... WITH ORDINALITY CROSS JOIN LATERAL` read batching. #7 is also the yardstick for our SQL numbers and the
 source of the per-endpoint costs in an earlier shed design. The ideas are reimplemented here; no code is copied.
 
-- **#47**: the two-phase gather behind the batch clock, and the idea of one statement for many reads that MEGA grew
-  from. #47 also runs 9 Postgres connections.
+- **#47**: the two-phase gather behind the batch clock, the 20 ms drain gap and one read connection per core, and
+  the idea of one statement for many reads that MEGA grew from.
 - **#37, #50**: similar read batching. **#37, #4, #7**: group commit.
 - **#45, #53**: interleaved-lane assembly bcrypt. **#37**: calibrating the lane count.
 - **#10, #22, #11, #4**: the `OFFSET 999` capped-count probe.
-- **#56, #53**: read connections at 5/8 of the cores.
+- **#56, #53**: read connections at 5/8 of the cores, in the previous version.
 - **rust-epoll, #152, #45**: `TCP_NODELAY` set once on the listener.
 - **#11, rust-epoll, #15**: scanning JWT claims in one pass.
 - **#45**: zero-copy send, which ships there and lost here.

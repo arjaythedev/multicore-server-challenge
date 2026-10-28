@@ -32,11 +32,11 @@ const Sizing = struct {
     drain_reads: u16,
 };
 
-/// Read connections: 5/8 of the cores (#56 and #53 settled there); fewer backends make bigger drains and contend
-/// less for buffer pins and LWLocks. Each worker has one write connection.
+/// Read connections: one per core, as #47 runs 8 read lanes (#56 and #53 settled on 5/8 before the drain gap, when
+/// fewer backends meant bigger drains). Each worker has one write connection.
 fn sizing(cpus: usize) Sizing {
     const workers = @max(1, cpus / 2);
-    const reads: u16 = @intCast(@max(1, (5 * cpus + 4) / 8));
+    const reads: u16 = @intCast(@max(1, cpus));
     const one = workers == 1;
     return .{
         .workers = workers,
@@ -195,6 +195,7 @@ test {
     _ = @import("pz.zig");
     _ = @import("sha256.zig");
     _ = @import("mega.zig");
+    _ = @import("threads.zig");
     _ = @import("shared.zig");
     _ = @import("drain.zig");
     _ = @import("loop.zig");
