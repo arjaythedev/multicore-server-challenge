@@ -104,5 +104,7 @@ module Conduit::ReadSql
     FROM r JOIN c ON c.s = r.s LEFT JOIN f ON f.v = r.v AND f.followee_id = c.author_id
     ORDER BY r.n, c.created_at DESC, c.id DESC
     SQL
+  USERS    = Rayo::PG::Statement.new("SELECT r.n, u.id, u.username, u.email, u.bio, u.image FROM unnest($1::int8[]) WITH ORDINALITY r(v,n) JOIN users u ON u.id = r.v ORDER BY r.n")
+  PROFILES = Rayo::PG::Statement.new("SELECT r.n, u.id, u.username, u.bio, u.image, EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.v AND fo.followee_id = u.id) FROM unnest($1::int8[], $2::text[]) WITH ORDINALITY r(v,s,n) JOIN users u ON u.username = r.s ORDER BY r.n")
   SETTINGS = Rayo::PG::Statement.new("SELECT set_config('jit', 'off', false), set_config('plan_cache_mode', 'force_generic_plan', false), set_config('max_parallel_workers_per_gather', '0', false), set_config('enable_seqscan', 'off', false)")
 end

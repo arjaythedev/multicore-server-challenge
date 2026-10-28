@@ -1,4 +1,3 @@
-require "deque"
 require "set"
 require "./reads_sql"
 
@@ -10,6 +9,7 @@ module Conduit::Reads
   class Round
     getter transport : Rayo::PG::RingTransport
     getter? busy = false
+    @group : Rayo::PG::Coalescer::Group(Request)?
     @requests = Array(Request).new(128)
     @mapping = [] of Tuple(Int32, Int64, Int64)
     @ids = Set(Int64).new
@@ -22,22 +22,19 @@ module Conduit::Reads
     @pairs = Rayo::PG::Batch.new
     @viewers = Rayo::PG::Batch.new
 
-    def initialize
-      @transport = Rayo::PG::RingTransport.new(ENV["DATABASE_URL"], 1024)
-      @transport.conn.query(ReadSql::SETTINGS) { |res| raise "read session setup failed" if res.error? }
+    def initialize(@transport : Rayo::PG::RingTransport)
     end
 
-    def start(queue : Deque(Request))
+    def start(group : Rayo::PG::Coalescer::Group(Request))
+      @group = group
       @busy = true
       @mapping.clear
       @ids.clear
       @favorites.clear
       @follows.clear
       @args.each &.clear
-      while @requests.size < 128 && !queue.empty?
-        r = queue.shift
-        next unless r.handle.context
-        @requests << r
+      group.each { |r| @requests << r }
+      @requests.each do |r|
         @args[0].add(r.viewer)
         @args[1].add(r.limit)
         @args[2].add(r.offset)
@@ -46,9 +43,17 @@ module Conduit::Reads
       end
       if @requests.empty?
         @busy = false
+        group.done
         return
       end
       case @requests.first.kind
+      when 8, 9
+        stmt = @requests.first.kind == 8 ? ReadSql::USERS : ReadSql::PROFILES
+        if @requests.first.kind == 8
+          @transport.conn.query(stmt, @args[0].param, state: self.as(Void*)) { |res, state| state.as(Round).people(res) }
+        else
+          @transport.conn.query(stmt, @args[0].param, @args[3].param, state: self.as(Void*)) { |res, state| state.as(Round).people(res) }
+        end
       when 7
         @transport.conn.query(Sql::TAGS, state: self.as(Void*)) do |res, state|
           state.as(Round).tags(res)
@@ -63,6 +68,25 @@ module Conduit::Reads
           state.as(Round).pages(res)
         end
       end
+    end
+
+    def people(res)
+      return fail if res.error?
+      res.each_partition(@requests.size) do |part, i|
+        r = @requests[i]
+        r.handle.finish do |ctx|
+          if row = part.first?
+            if r.kind == 8
+              ctx.json user: {email: row.str(3), token: Conduit.token(ctx), username: row.str(2), bio: Conduit.nullable(row, 4), image: Conduit.nullable(row, 5)}
+            else
+              ctx.json profile: Conduit.profile(row, 2, row.bool(5))
+            end
+          else
+            Conduit.error(ctx, r.kind == 8 ? 401 : 404)
+          end
+        end
+      end
+      release
     end
 
     def tags(res)
@@ -219,29 +243,40 @@ module Conduit::Reads
       {@full, @pairs, @viewers}.each &.clear
       @failed = false
       @busy = false
+      @group.not_nil!.done
+      @group = nil
     end
   end
 
   class Driver
     include Rayo::Uring::Flusher
-    getter queues = StaticArray(Deque(Request), 3).new { Deque(Request).new }
-    @next = 0
-    @rounds = StaticArray(Round, 2).new { Round.new }
+    getter coordinator : Rayo::PG::Coalescer(Request)
+    @transports = StaticArray(Rayo::PG::RingTransport, 2).new { Rayo::PG::RingTransport.new(ENV["DATABASE_URL"], 1024) }
+    @rounds : Array(Round)
+
+    def initialize
+      @transports.each do |transport|
+        transport.conn.query(ReadSql::SETTINGS) { |res| raise "read session setup failed" if res.error? }
+      end
+      @rounds = Array(Round).new(8) { |i| Round.new(@transports[i % 2]) }
+      @coordinator = Rayo::PG::Coalescer(Request).new(batch_size: 1024, groups: 32, depth: 8,
+        parameters: 0, window_us: 17500, max_window_us: 35000) do |group|
+        Conduit::Reads.driver.not_nil!.dispatch(group)
+      end
+      @coordinator.attach
+    end
+
+    def dispatch(group)
+      round = @rounds.find { |r| !r.busy? }.not_nil!
+      begin
+        round.start(group)
+      rescue
+        round.fail
+      end
+    end
 
     def flush : Nil
-      @rounds.each do |round|
-        unless round.busy?
-          3.times do
-            queue = @queues[@next]
-            @next = (@next + 1) % 3
-            unless queue.empty?
-              round.start(queue)
-              break
-            end
-          end
-        end
-        round.transport.flush
-      end
+      @transports.each &.flush
     end
   end
 
@@ -253,6 +288,12 @@ module Conduit::Reads
   end
 
   def self.enqueue(ctx, kind, viewer, limit = 1_i64, offset = 0_i64, key = Bytes.empty)
-    driver.not_nil!.queues[kind < 6 ? 0 : kind - 5] << Request.new(ctx.defer, kind, viewer, limit, offset, key)
+    coordinator = driver.not_nil!.coordinator
+    queue = kind < 6 ? 0 : kind - 5
+    unless coordinator.available?(queue)
+      Conduit.error(ctx, 503)
+      return
+    end
+    coordinator.enqueue(Request.new(ctx.defer, kind, viewer, limit, offset, key), key: queue)
   end
 end

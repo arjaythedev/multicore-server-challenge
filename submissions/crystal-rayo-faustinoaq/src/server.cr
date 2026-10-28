@@ -43,7 +43,7 @@ end
 
 app.get "/api/user" do |ctx|
   Conduit.handle(ctx) do
-    ctx.db.query(Sql::USER_BY_ID, Conduit.auth(ctx)) { |res, ctx| Conduit.user(ctx, res) }
+    Conduit::Reads.enqueue(ctx, 8, Conduit.auth(ctx))
   end
 end
 
@@ -66,15 +66,7 @@ end
 app.get "/api/profiles/:username" do |ctx|
   Conduit.handle(ctx) do
     viewer = Conduit.auth(ctx, false)
-    ctx.db.query(Sql::PROFILE, viewer, Conduit.decode(ctx, ctx.param("username"))) do |res, ctx|
-      unless res.error?
-        if row = res.first?
-          ctx.json profile: Conduit.profile(row, 1, row.bool(4))
-        else
-          Conduit.error(ctx, 404)
-        end
-      end
-    end
+    Conduit::Reads.enqueue(ctx, 9, viewer, key: Conduit.decode(ctx, ctx.param("username")))
   end
 end
 
