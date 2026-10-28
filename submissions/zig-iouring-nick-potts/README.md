@@ -87,7 +87,7 @@ At 8 CPUs:
      ┌───────────────────────────────────────┐
      │ drain process (one io_uring)          │
      │ one read queue for the whole box      │
-     │ lanes: feeds 80, comments 40, rest 30 │──► 8 read connections ──► Postgres
+     │ lanes: feeds 80, comments 40, rest 80 │──► 8 read connections ──► Postgres
      │ MEGA + batched statements, one Sync   │    (one per CPU)           (8 read backends)
      │ answers rows in DataRow layout        │
      └───────────────────────────────────────┘
@@ -222,18 +222,20 @@ saturation, and five read backends would cap how much Postgres the reads can use
 
 ## The batch clock and coalescing
 
-**The clock.** Reads wait in the queue until the oldest has waited 5 ms and 30 ms have passed since the previous
+**The clock.** Reads wait in the queue until the oldest has waited 5 ms and 80 ms have passed since the previous
 drain started (the drain gap, as in #47's gather). Then a free read connection takes every queued read of every
-worker, up to 4,096, and sends them as one Sync group. 4,096 queued reads start a drain at once, gap or not. Each
-connection has one group in flight at a time (depth 1). This is #47's two-phase gather, and #37 and #50 batch
-similarly. A Flush follows every execution in a read group but the last, so each one's requests are answered as
-soon as it completes. Without it Postgres holds the results until the Sync or a full 8 KB send buffer, behind MEGA,
-which goes last. The previous version had the 5 ms clock alone. Against sending reads as they
+worker, up to 4,096, and sends them as one Sync group. 4,096 queued reads start a drain at once, gap or not. At
+130,000 users the 80 ms gap puts about 1,400 reads in a shared drain, where the measured cost curve flattens (cost
+per read against 215 per drain: 0.91 at 430, 0.73 at 860, 0.70 at 1,290), and the gap adds up to itself to a shared
+read's latency. Each connection has one group in flight at a time (depth 1). This is #47's two-phase gather, and
+#37 and #50 batch similarly. A Flush follows every execution in a read group but the last, so each one's requests
+are answered as soon as it completes. Without it Postgres holds the results until the Sync or a full 8 KB send
+buffer, behind MEGA, which goes last. The previous version had the 5 ms clock alone. Against sending reads as they
 come, that clock measured −22.5 µs per request [−24, −21], of which −17.5 was Postgres. Instructions per request went from
 1,316k to 1,156k.
 
-**The feed lane.** Feeds have a clock of their own: an 80 ms gap instead of 20, and a drain of their own, one MEGA
-execution of feeds alone (`feed_gap_ns` in db.zig). A feed is the dearest read, its page walk and the favorite
+**The feed lane.** Feeds have a clock of their own: an 80 ms gap (`feed_gap_ns` in db.zig) and a drain of their own,
+one MEGA execution of feeds alone. A feed is the dearest read, its page walk and the favorite
 counts of the articles it returns, and it is the read that shares most within one execution, since viewers follow
 the same popular authors. The previous version carried feeds in the shared drain, about 58 per drain at 135,000
 users on an aged database, where they were 54–63% of MEGA's time, so every article, profile and tag read waited for
@@ -246,6 +248,15 @@ lane's drain at once.
 **The comments lane.** Comment reads drain on a third lane with a 40 ms gap (`comments_gap_ns`), as one batched
 execution that reads each distinct thread once. Twice the comment reads share each execution, and the shared drain
 no longer waits for them.
+
+**The in-flight cap.** A lane with its cap of drains in flight starts no new one until one of them finishes, full
+queue or not: three for the shared lane (`max_inflight`), three for feeds (`feed_max_inflight`), two for comments
+(`comments_max_inflight`). Near saturation an execution outlasts its lane's gap, so without the cap a free connection
+starts another drain as each gap ends and up to eight stretched executions of one lane contend for the cores. At the
+cap the lane's next drain takes everything that arrived while it waited, so its batches grow with the load instead of
+its concurrency. The caps come from the lanes' needs at the knee on the rig (the shared lane about two backends'
+worth, feeds about two, comments under one), so below the knee they do not bind. PR #99 caps the same way on the
+official box: lists 2, feeds 5 and the cheap reads 1 of its 8 read connections.
 
 **Cheap reads ahead of MEGA.** Tag, profile and current-user reads, about a quarter of all requests, stay out of
 MEGA. In the shared drain each of these families is one execution of its own ahead of MEGA: the tag list once for
@@ -273,7 +284,7 @@ The final stack at 5 ms costs 1.5–1.7x what it costs at 50 ms. The previous ve
 rig, the search failed on p99 latency before it failed on CPU, and the longer clocks we tried live hurt the tail more
 than they saved (see the losers). Those runs were limited by the receive CPU, not by Postgres. Our
 reproduction of the official run put the previous version's limit at its five read backends, so this version
-takes the bigger drains: the gap adds up to 30 ms
+takes the bigger drains: the gap adds up to 80 ms
 to a read's wait in exchange for cheaper reads.
 
 ---
