@@ -342,3 +342,6 @@ feed count proof adopted, #91's hashagg off measured (no effect).
   batches), 15 ms 146.5 / 147.6 / 160.6, 20 ms (default) 157.7 / 152.9 / 149.9. Shorter clocks raise req/s at a
   fixed user count and lower p95 (142-150 ms in their fast runs vs 173-182), but not CPU per request.
   **Discarded**; the clock stays 20 ms.
+- **63 planner clock off the batch clock** (18 and 25 ms, rotated, 14k): 18 ms 152.7 / 155.1 / 145.9, 25 ms
+  156.1 / 144.6 / 141.5, 20 ms 151.4 / 159.2 / 145.2. None reached n=62's fast mode (all 29.1-30.7k req/s), so
+  the two clocks firing together was not its cause. **Discarded.**
