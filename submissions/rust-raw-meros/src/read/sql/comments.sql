@@ -1,7 +1,9 @@
 -- Comment threads by slug, many requests at once: the newest 100 comments once per distinct slug.
 -- $1 viewer int8[], $2 slug text[].
 -- Output (shape "comments"): kind 0 = a comment (article_id, comment fields, author fields); kind 1 = a request
--- (ord, article_id or NULL when the slug does not exist: 404, and the author ids of that thread the viewer follows).
+-- (ord, article_id or NULL when the slug does not exist: 404, and the ids the viewer follows: ALL of the viewer's
+-- followees, a superset of the thread's authors, because the renderer only tests membership and one index scan of ~20
+-- entries is much cheaper than intersecting with the batch's comment rows once per request).
 WITH req AS MATERIALIZED (
   SELECT r.viewer, r.slug, r.ord
     FROM unnest($1::int8[], $2::text[]) WITH ORDINALITY AS r(viewer, slug, ord)),
@@ -22,7 +24,6 @@ SELECT 0::int4 AS kind, NULL::int8 AS ord, article_id, id, body, created_at, upd
 UNION ALL
 SELECT 1, r.ord, a.article_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
        CASE WHEN r.viewer = 0 OR a.article_id IS NULL THEN '{}'::int8[]
-            ELSE ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.viewer
-                          AND fo.followee_id IN (SELECT t.author_id FROM thread t WHERE t.article_id = a.article_id)) END
+            ELSE ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.viewer) END
   FROM req r
   LEFT JOIN arts a ON a.slug = r.slug

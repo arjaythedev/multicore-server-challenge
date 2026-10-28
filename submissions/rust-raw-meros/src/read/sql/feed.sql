@@ -1,7 +1,11 @@
 -- Personal feed. The key is the viewer's id as text: every page depends on the viewer, so dedup finds little.
 -- $1 viewer int8[], $2 limit int8[], $3 offset int8[], $4 key text[] (one entry per request).
--- Output (shape "articles", see read/shape.rs): article rows (kind 0) once per distinct article, then one row per
--- request (kind 1) with its capped count, page ids in order, and the viewer's favorited / followed ids.
+-- Output (shape "articles", see read/articles.rs): article rows (kind 0) once per distinct article, then one row per
+-- request (kind 1) with its capped count, page ids in order, the page ids the viewer favorited, and the ids the viewer
+-- follows (ALL of the viewer's followees, a superset of the page's authors: the renderer only tests membership, and
+-- one index scan of ~20 entries is much cheaper than intersecting with the batch's article rows once per request).
+-- The count is min(n, 1000): probe for a 1000th row with OFFSET 999 (a bare scan, no aggregate on top) and count
+-- only when there is none (see list_tag.sql for the measurement).
 WITH req AS MATERIALIZED (
   SELECT r.viewer, r.lim, r.off, r.key, r.ord
     FROM unnest($1::int8[], $2::int8[], $3::int8[], $4::text[]) WITH ORDINALITY AS r(viewer, lim, off, key, ord)),
@@ -12,7 +16,9 @@ pages AS MATERIALIZED (
 totals AS MATERIALIZED (
   SELECT k.key, c.n
     FROM (SELECT DISTINCT key FROM req) k
-   CROSS JOIN LATERAL (SELECT count(*) AS n FROM (SELECT 1 FROM articles a3 WHERE a3.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = k.key::int8) LIMIT 1000) s) c),
+   CROSS JOIN LATERAL (SELECT CASE WHEN EXISTS (SELECT 1 FROM articles a3 WHERE a3.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = k.key::int8) OFFSET 999 LIMIT 1)
+                                   THEN 1000::int8
+                                   ELSE (SELECT count(*) FROM articles a4 WHERE a4.author_id IN (SELECT fo2.followee_id FROM follows fo2 WHERE fo2.follower_id = k.key::int8)) END AS n) c),
 ids AS MATERIALIZED (SELECT DISTINCT id FROM pages),
 art AS MATERIALIZED (
   SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, a.author_id,
@@ -32,8 +38,7 @@ SELECT 1, r.ord, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NUL
        CASE WHEN r.viewer = 0 OR pg.ids IS NULL THEN '{}'::int8[]
             ELSE ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id = r.viewer AND f.article_id = ANY(pg.ids)) END,
        CASE WHEN r.viewer = 0 OR pg.ids IS NULL THEN '{}'::int8[]
-            ELSE ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.viewer
-                          AND fo.followee_id IN (SELECT x.author_id FROM art x WHERE x.id = ANY(pg.ids))) END
+            ELSE ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.viewer) END
   FROM req r
   JOIN totals t ON t.key = r.key
  CROSS JOIN LATERAL (SELECT array_agg(p.id ORDER BY p.id DESC) AS ids FROM pages p

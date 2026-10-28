@@ -102,7 +102,4 @@ impl Slab {
         }
     }
 
-    pub fn open_count(&self) -> usize {
-        self.conns.len() - self.free.len()
-    }
 }
