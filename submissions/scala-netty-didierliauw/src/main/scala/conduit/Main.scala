@@ -68,10 +68,9 @@ object Main:
         )
         .option(ChannelOption.SO_REUSEADDR, java.lang.Boolean.TRUE)
         .handler(new ChannelInboundHandlerAdapter {
-          // Each accepted connection gets its Connection and is registered here, on the next loop in turn, instead
-          // of by Netty's acceptor (next in this pipeline, which it never reaches): that one adds a ChannelInitializer,
-          // which adds the handler and removes itself, a pipeline context, a set entry and a promise more per
-          // connection.
+          // Each accepted connection gets its Connection and is registered here, on the next loop in turn, before
+          // Netty's acceptor (next in this pipeline) sees it: that one adds a ChannelInitializer, which adds the
+          // handler and removes itself, a pipeline context, a set entry and a promise more per connection.
           override def channelRead(ctx: ChannelHandlerContext, msg: AnyRef): Unit =
             val child = msg.asInstanceOf[Channel]
             val (loop, connections, api) = servers(nextLoop)
@@ -102,7 +101,7 @@ object Main:
       val attempt = loops.zipWithIndex.map((loop, i) =>
         PgPool(loop, database, Sql.statements, share(Settings.pgConnections, i).max(1), Settings.pgDepth, transport.socketChannel,
           Settings.batchSize, Settings.pgWriteConnections, Settings.writeGroupSize, Settings.pgDrain,
-          Settings.pgRoundSize)
+          Settings.pgRoundSize, Settings.pgGatherMicros)
       )
       try
         attempt.map(_.start()).foreach(_.get(30, TimeUnit.SECONDS))

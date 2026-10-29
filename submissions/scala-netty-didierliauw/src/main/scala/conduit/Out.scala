@@ -57,6 +57,9 @@ final class Out:
     pos += length
     this
 
+  /** `length` bytes of another [[Out]]'s body, from `from` (one of its [[length]]s). */
+  def bytes(other: Out, from: Int, length: Int): Out = bytes(other.buf, Headroom + from, length)
+
   /** Bytes copied from a Netty buffer as they are: a value Postgres sent that needs no escaping. */
   def bytes(from: ByteBuf, index: Int, length: Int): Out =
     ensure(length)

@@ -13,6 +13,7 @@ import java.util.Base64
 import java.util.concurrent.{CompletableFuture, TimeUnit}
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
+import scala.annotation.unused
 import scala.util.control.NonFatal
 
 /** Where Postgres is, from `DATABASE_URL` (`postgres://user:password@host:port/database`). */
@@ -34,7 +35,7 @@ object PgConfig:
 final class Statement(val id: Int, val sql: String, val paramTypes: Array[Int]):
   private[conduit] val name: Array[Byte] = s"s$id".getBytes(US_ASCII)
 
-/** Postgres's types for the parameters the server sends (`pg_type.oid`). */
+/** Postgres's types for the parameters this client sends (`pg_type.oid`). */
 object Oid:
   val Bool = 16
   val Int8 = 20
@@ -54,6 +55,12 @@ object PgError:
   val ConnectionLost = PgError("08006", "the connection to Postgres was lost")
   /** The query's client went away while it waited: it was never sent. */
   val Abandoned = PgError("57014", "abandoned before it was sent")
+
+/** A packed batch's rows for all its queries ([[PgQuery.packed]]): kept for as long as the batch's answer lasts. */
+abstract class PgPacked:
+  def row(row: PgRow): Unit
+  /** The batch is answered. */
+  def release(): Unit
 
 /** What a request asks of Postgres: one or more statements sent with one Sync (so they run in one implicit
   * transaction, committed before Postgres says it is ready again), and what to do with the replies. Every callback
@@ -94,6 +101,14 @@ abstract class PgQuery:
 
   /** A row of the result of the query's `statement`-th statement, from 0. Valid during the call only. */
   def row(statement: Int, row: PgRow): Unit
+
+  /** For a packed batch ([[Sql.Batch]] `packed`), made by its first query when the first of the rows for all of
+    * them arrives: what holds those rows for the batch's queries.
+    */
+  def packed(): PgPacked = null
+
+  /** In a packed batch, the query's own row, with the batch's rows for all (null if there were none). */
+  def row(statement: Int, row: PgRow, @unused packed: PgPacked): Unit = this.row(statement, row)
 
   /** Postgres has answered all of the query and committed it: `error` is null, or why it failed, in which case
     * its transaction was rolled back.
@@ -138,6 +153,20 @@ final class PgRow:
 
   /** A `timestamptz` column as the spec's JSON timestamp. */
   def timestamp(i: Int, out: Out): Unit = out.timestamp(buf.getLong(offsets(i)))
+
+  /** How many elements a one-dimensional `int8[]` column has: 0 if it is null. */
+  def int8ArrayLength(i: Int): Int =
+    if lengths(i) < 0 || buf.getInt(offsets(i)) == 0 then 0 else buf.getInt(offsets(i) + 12)
+
+  /** Element `k` of a one-dimensional `int8[]` column without nulls (each element its length, then its 8 bytes). */
+  def int8ArrayAt(i: Int, k: Int): Long = buf.getLong(offsets(i) + 24 + 12 * k)
+
+  /** Whether a one-dimensional `int8[]` column without nulls has `value`. */
+  def int8ArrayHas(i: Int, value: Long): Boolean =
+    val n = int8ArrayLength(i)
+    var k = 0
+    while k < n && int8ArrayAt(i, k) != value do k += 1
+    k < n
 
   /** A one-dimensional `text[]` column as a JSON array of strings (Postgres's binary array: dimensions, a flag for
     * nulls, the element type, each dimension's size and lower bound, then the elements, each with its length).
@@ -424,7 +453,7 @@ final class PgConnection(pool: PgPool, config: PgConfig, statements: collection.
     buf.writeByte('p').writeInt(4 + bytes.length).writeBytes(bytes)
     ctx.writeAndFlush(buf)
 
-  /** The connection failed: fails the startup with `why` if it is still under way, else logs it; then closes. */
+  /** Startup failed: say why, and close. */
   private def fail(why: String): Unit =
     if !started.isDone then started.completeExceptionally(IllegalStateException(why))
     else Log.warn("Postgres connection failed", "error" -> why)
@@ -456,15 +485,17 @@ final class PgConnection(pool: PgPool, config: PgConfig, statements: collection.
     ctx.close()
 
 object PgConnection:
-  /** Settings for the server's own sessions, sent with the login (rule 2 allows session-level settings): every
-    * statement's generic plan instead of planning it again for the first executions, no JIT compilation or parallel
-    * workers, which cost more than they save on queries this small, and no Memoize, which in a batch ([[Sql.Batch]])
-    * would hand a request rows cached for another's identical look-up (rule 5).
+  /** Settings for this client's sessions, sent with the login (rule 2 allows session-level settings): every statement's
+    * generic plan instead of planning it again for the first executions, no JIT compilation or parallel workers,
+    * which cost more than they save on queries this small, and no Memoize (none of the server's plans had one
+    * before batches).
     */
   private val SessionSettings = Seq(
     "plan_cache_mode" -> "force_generic_plan",
     "jit" -> "off",
     "max_parallel_workers_per_gather" -> "0",
+    // In a batch ([[Sql.Batch]]) Memoize would hand a request rows cached for another's identical look-up: a batch
+    // shares only where it says so (`shared`).
     "enable_memoize" -> "off",
   )
 
@@ -486,19 +517,16 @@ object PgConnection:
       p = stop + 1
     PgError(code, message)
 
-/** A loop's connections to Postgres.
-  *
-  * With `drain`, a read goes to a read connection that has nothing in flight; if none is idle it waits in the pool's
-  * queue, and the next connection to finish takes the `roundSize` oldest reads that wait, whatever their kind (with 0,
-  * up to `batchSize` of every kind), each kind's together, up to `batchSize` of a kind in one statement
-  * ([[Sql.Batch]]): one round of statements in flight per connection. Without it, a read goes to the connection with
-  * the fewest in flight, up to `depth`, and a connection with room takes the oldest waiting read's kind. No timer
-  * either way: a batch is what accumulated while the connections were busy, and nothing waits for one at a light load.
-  *
-  * Writes ([[PgQuery.write]]) go to the `writers` write connections, one transaction in flight on each: those that
-  * wait go out together when one is free, up to `groupSize` of them in one transaction ([[WriteGroup]]), again no
-  * timer, so a group is what accumulated during the last one's commit. Without write connections, writes go as reads
-  * do. A lost connection is replaced; meanwhile the others serve.
+/** A loop's connections to Postgres. With `drain`, a read goes to a read connection that has nothing in flight; if
+  * none is idle it waits in the pool's queue, and the next connection to finish takes the `roundSize` oldest reads
+  * that wait, whatever their kind (with 0, up to `batchSize` of every kind), each kind's together, up to `batchSize`
+  * of a kind in one statement ([[Sql.Batch]]): one round of statements in flight per connection. Without it, a read goes to the connection with the fewest in flight, up to `depth`, and a
+  * connection with room takes the oldest waiting read's kind. No timer either way: a batch is what accumulated while
+  * the connections were busy, and nothing waits for one at a light load. Writes
+  * ([[PgQuery.write]]) go to the `writers` write connections, one transaction in flight on each: those that wait go out
+  * together when one is free, up to `groupSize` of them in one transaction ([[WriteGroup]]), again no timer, so a group
+  * is what accumulated during the last one's commit. Without write connections, writes go as reads do. A lost
+  * connection is replaced; meanwhile the others serve.
   */
 final class PgPool(
     loop: EventLoop,
@@ -512,12 +540,20 @@ final class PgPool(
     groupSize: Int = 1,
     drain: Boolean = false,
     roundSize: Int = 0,
+    gatherMicros: Int = 0,
 ):
   /** The `count` read connections, then the write connections. */
   private val connections = new Array[PgConnection](count + writers)
   /** The waiting reads: queue 0 for those that run alone, then one per kind of batch. */
   private val queues = Array.fill(Sql.batchKinds.length + 1)(PgPool.Queue())
   private var waiting = 0
+  /** With `gatherMicros` (and `drain` and `roundSize`): since when the oldest waiting read has waited
+    * (`System.nanoTime`), and whether a timer will look again.
+    */
+  private val gathering = drain && roundSize > 0 && gatherMicros > 0
+  private val gatherNanos = gatherMicros * 1000L
+  private var waitingSince = 0L
+  private var timer = false
   private var arrivals = 0L
   private val batch = new Array[PgQuery](math.max(1, batchSize))
   /** With `roundSize`: each queue's next query to count, and how many of each a round takes. */
@@ -530,7 +566,7 @@ final class PgPool(
 
   def size: Int = connections.length
 
-  // Counts since the last `stats()`: queries, those that waited, the batches they went out in and the queries in them,
+  // Counts since the last [[stats]]: queries, those that waited, the batches they went out in and the queries in them,
   // and the most waiting at once; the writes, the groups they went out in and the writes in them, and those sent again
   // after their group failed.
   private var submitted, queued, batches, batched, mostWaiting, writes, groups, grouped, retried = 0L
@@ -582,7 +618,7 @@ final class PgPool(
       if c.ready && (best == null || c.inFlight < best.inFlight) then best = c
       i += 1
     if best == null then q.done(PgError.Unavailable)
-    else if (if drain then best.inFlight == 0 else best.inFlight < depth) && waiting == 0 then best.submit(q)
+    else if !gathering && (if drain then best.inFlight == 0 else best.inFlight < depth) && waiting == 0 then best.submit(q)
     else
       queued += 1
       q.seq = arrivals
@@ -590,6 +626,9 @@ final class PgPool(
       queues(if q.batch == null || batchSize <= 1 then 0 else q.batch.id).add(q)
       waiting += 1
       if waiting > mostWaiting then mostWaiting = waiting
+      if gathering then
+        if waiting == 1 then waitingSince = System.nanoTime()
+        gather()
 
   /** Sends `q` on a free write connection, or queues it for the next group. */
   private def submitWrite(q: PgQuery): Unit =
@@ -616,6 +655,7 @@ final class PgPool(
     */
   private[conduit] def completed(c: PgConnection): Unit =
     if c.writes then sendWrites(c)
+    else if gathering then gather()
     else if drain then
       if c.ready && c.inFlight == 0 && waiting > 0 then
         if roundSize > 0 then sendOldest(c)
@@ -632,9 +672,32 @@ final class PgPool(
         i += 1
       sendKind(c, oldest, if oldest == 0 then 1 else batch.length)
 
+  /** With `gatherMicros`, a round goes out on an idle read connection once the oldest waiting read has waited
+    * `gatherMicros`, or once a round's worth waits ([[sendOldest]]). At a light load reads wait for company, so that
+    * batches are larger than what arrived while every connection was busy; at saturation they have waited that long
+    * for a connection already, and one that comes free takes them at once, as without a window. Reads left after a
+    * round have waited as long as the round's oldest. Called when a read waits, when a connection is free, and on
+    * the timer.
+    */
+  private def gather(): Unit =
+    while waiting > 0 do
+      var c: PgConnection = null
+      var i = 0
+      while i < count && c == null do
+        if connections(i).ready && connections(i).inFlight == 0 then c = connections(i)
+        i += 1
+      if c == null then return
+      val left = waitingSince + gatherNanos - System.nanoTime()
+      if left > 0 && waiting < roundSize then
+        if !timer then
+          timer = true
+          loop.schedule((() => { timer = false; gather() }): Runnable, left, TimeUnit.NANOSECONDS)
+        return
+      sendOldest(c)
+
   /** Sends the `roundSize` oldest waiting reads on `c`, whatever their kind, each kind's together, so that every kind
-    * waits alike. Taking every kind's, up to `batchSize` of each, let the most frequent kinds fall rounds behind the
-    * others under overload.
+    * waits alike. Taking every kind's, up to
+    * `batchSize` of each, let the most frequent kinds fall rounds behind the others under overload.
     */
   private def sendOldest(c: PgConnection): Unit =
     var i = 0
@@ -759,18 +822,19 @@ object PgPool:
       q.nextQuery = null
       q
 
-/** Queries of one kind sent as one statement ([[Sql.Batch]]). Each of the statement's parameters is an array holding
-  * that parameter from every query, and each row goes back to its query by the batch's last column: the query's place
-  * in the batch, from 1.
+/** Queries of one kind, sent as one statement: its parameters, an array each, from each query's, and each row back to
+  * its query by the batch's last column, the query's place in it from 1 ([[Sql.Batch]]); a shared batch's rows to
+  * every query; a packed batch's rows for all of them (0 in the last column, ahead of the queries' own) to what its
+  * first query keeps them in ([[PgQuery.packed]]), and each query's own with them.
   */
 private final class BatchQuery(kind: Sql.Batch, queries: Array[PgQuery]) extends PgQuery:
   private val n = queries.length
+  private var shared: PgPacked = null
 
   def send(w: PgWriter): Unit =
     w.bind(kind.batched)
     val types = kind.paramTypes
-    if types.isEmpty then w.int4(n)
-    else
+    if !kind.shared then
       var p = 0
       while p < types.length do
         val param = p
@@ -779,7 +843,19 @@ private final class BatchQuery(kind: Sql.Batch, queries: Array[PgQuery]) extends
         p += 1
     w.execute()
 
-  def row(statement: Int, row: PgRow): Unit = queries((row.int8(row.columns - 1) - 1).toInt).row(0, row)
+  def row(statement: Int, row: PgRow): Unit =
+    if kind.shared then
+      var i = 0
+      while i < n do
+        queries(i).row(0, row)
+        i += 1
+    else
+      val i = row.int8(row.columns - 1).toInt
+      if !kind.packed then queries(i - 1).row(0, row)
+      else if i > 0 then queries(i - 1).row(0, row, shared)
+      else
+        if shared == null then shared = queries(0).packed()
+        shared.row(row)
 
   def done(error: PgError): Unit =
     var i = 0
@@ -787,6 +863,7 @@ private final class BatchQuery(kind: Sql.Batch, queries: Array[PgQuery]) extends
       try queries(i).done(error)
       catch case NonFatal(t) => Log.error("request failed", t)
       i += 1
+    if shared != null then shared.release()
 
 /** Writes that waited for a write connection, sent as one transaction: their statements one after another and one
   * Sync, so one commit, and one WAL flush, for all of them (group commit); each row goes back to its query by its

@@ -10,8 +10,7 @@ import java.time.Instant
   * {"time":"2026-10-18T09:12:03.512Z","level":"error","msg":"group commit failed","requests":12,"error":"…","stack":"…"}
   * }}}
   *
-  * The server logs at startup and when something goes wrong, never for a request that succeeds, so none of this is on
-  * the hot path.
+  * The server logs at startup and when something goes wrong, never per request, so none of this is on the hot path.
   */
 object Log:
   def info(msg: String, fields: (String, Any)*): Unit = write("info", msg, fields)
