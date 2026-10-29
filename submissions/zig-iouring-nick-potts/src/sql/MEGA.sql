@@ -12,7 +12,9 @@ tf AS MATERIALIZED (
   SELECT x.f, GREATEST(max(la.lpo), 1) AS d FROM la CROSS JOIN LATERAL unnest(la.a) x(f) GROUP BY x.f HAVING count(*) > 1
   ORDER BY count(*) DESC, x.f LIMIT 20),
 hf AS MATERIALIZED (
-  SELECT tf.f, (SELECT a4.id FROM articles a4 WHERE a4.author_id = tf.f ORDER BY a4.id DESC OFFSET tf.d - 1 LIMIT 1) AS fl
+  SELECT tf.f,
+    ARRAY(SELECT a4.id FROM articles a4 WHERE a4.author_id = tf.f ORDER BY a4.id DESC LIMIT LEAST(tf.d, 100)) AS ids,
+    CASE WHEN tf.d > 100 THEN (SELECT a4.id FROM articles a4 WHERE a4.author_id = tf.f ORDER BY a4.id DESC OFFSET tf.d - 1 LIMIT 1) END AS fl
   FROM tf),
 big AS MATERIALIZED (
   SELECT ARRAY(SELECT tf.f FROM tf WHERE EXISTS (SELECT 1 FROM articles a3 WHERE a3.author_id = tf.f
@@ -29,7 +31,8 @@ lc1 AS MATERIALIZED (
   FROM la ck),
 lc AS MATERIALIZED (
   SELECT k, fv, lim, off, lpo, t1, a, max(n) OVER (PARTITION BY k, fv, t1) AS n,
-    CASE WHEN k = 5 THEN (SELECT max(hf.fl) FROM hf WHERE hf.f = ANY(lc1.a)) END AS fl FROM lc1),
+    CASE WHEN k = 5 THEN (SELECT max(CASE WHEN lc1.lpo <= 100 THEN hf.ids[GREATEST(lc1.lpo, 1)::int] ELSE hf.fl END)
+      FROM hf WHERE hf.f = ANY(lc1.a)) END AS fl FROM lc1),
 pg AS MATERIALIZED (
   SELECT lk.k, lk.fv, lk.lim, lk.off, lk.lpo, lk.t1, lk.n, p.id
   FROM lc lk LEFT JOIN LATERAL (
