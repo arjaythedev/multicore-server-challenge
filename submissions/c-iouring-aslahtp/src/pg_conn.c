@@ -117,6 +117,8 @@ static bool session_settings(struct conn_io *c, char *err, size_t errlen) {
     struct pg_msg m;
     int pending = 0;
     for (const char *const *q = session_sql; *q; q++, pending++) pg_query(&c->out, *q);
+    if (session_tune)
+        for (const char *const *q = session_tune_sql; *q; q++, pending++) pg_query(&c->out, *q);
     if (!flush(c)) goto io_error;
     while (pending) {
         if (!next_msg(c, &m)) goto io_error;

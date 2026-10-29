@@ -242,6 +242,14 @@ __attribute__((constructor)) static void name_stmts(void) {
     for (int i = 0; i < S_COUNT; i++) snprintf(stmt_names[i], sizeof stmt_names[i], "s%d", i);
 }
 
+/* Generic plans size hash aggregates and memoize caches for many keys; our statements group a few dozen rows. */
+const char *const session_tune_sql[] = {
+    "SET enable_memoize = off",
+    "SET enable_hashagg = off",
+    NULL,
+};
+bool session_tune;
+
 const char *const session_sql[] = {
     "SET plan_cache_mode = force_generic_plan",
     "SET jit = off",

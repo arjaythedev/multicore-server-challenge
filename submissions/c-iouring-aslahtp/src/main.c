@@ -65,7 +65,7 @@ int main(int argc, char **argv) {
     cfg.host = env_str("HOST", "0.0.0.0");
     cfg.port = env_str("PORT", "3000");
     cfg.workers = env_int("WORKERS", cpus >= 2 ? (int)(cpus / 2) : 1, 1, MAX_WORKERS);
-    cfg.read_conns = env_int("READ_CONNS", 5, 1, 64);
+    cfg.read_conns = env_int("READ_CONNS", 8, 1, 64);
     cfg.write_conns = env_int("WRITE_CONNS", 1, 1, 8);
     cfg.bcrypt_threads = env_int("BCRYPT_THREADS", 1, 1, 64);
     cfg.bcrypt_wait_ms = env_int("BCRYPT_WAIT_MS", 1000, 0, 5000);
@@ -76,6 +76,8 @@ int main(int argc, char **argv) {
     cfg.plan_max = (uint32_t)env_int("PLAN_MAX", 4096, 1, 65536);
     cfg.plan_wait_us = env_int("PLAN_WAIT_US", 5000, 0, 1000000);
     cfg.planner = env_int("PLANNER", 1, 0, 1);
+    cfg.plan_idle = env_int("PLAN_IDLE", 1, 0, 1);
+    session_tune = env_int("PG_TUNE", 0, 0, 1);
     cfg.direct_fds = env_int("DIRECT_FDS", 0, 0, 1);
     if (cfg.read_conns + cfg.workers * cfg.write_conns > 95) die("more than 95 postgres connections");
 

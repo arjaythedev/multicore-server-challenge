@@ -300,13 +300,22 @@ static void arm_timer(int64_t us) {
     io_uring_sqe_set_data64(s, D_TIMER);
 }
 
-/* Starts plans while requests are due and a connection has no plan running. */
+/* A connection with nothing in flight: Postgres has a backend doing nothing. */
+static bool idle_conn(void) {
+    for (int i = 0; i < D.npg; i++)
+        if (!D.pg[i].plan_active && D.pg[i].inflight == 0) return true;
+    return false;
+}
+
+/* Starts plans while requests are due and a connection has no plan running. Requests are due plan_wait_us after
+ * the oldest arrived; with plan_idle they are due at once while some backend is idle, since waiting then only
+ * adds latency. Under load every connection is busy, so requests still pile up into big plans. */
 static void schedule_plans(void) {
     int64_t now = mono_us();
     for (;;) {
         int64_t due = planner_due_in(now);
         if (due < 0) return;
-        if (due > 0) {
+        if (due > 0 && !(cfg.plan_idle && idle_conn())) {
             arm_timer(due);
             return;
         }

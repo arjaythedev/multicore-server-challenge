@@ -81,3 +81,6 @@ extern char stmt_names[S_COUNT][8];  /* "s<index>" */
 
 /* Session settings sent once on every connection (rule 2 allows session-level SET). */
 extern const char *const session_sql[];
+/* Extra planner settings, sent after session_sql when session_tune is set (PG_TUNE). */
+extern const char *const session_tune_sql[];
+extern bool session_tune;
