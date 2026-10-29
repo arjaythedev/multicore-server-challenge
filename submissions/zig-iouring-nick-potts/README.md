@@ -529,8 +529,10 @@ flag once a round of the cost loop. Jobs overdue in the queue go out in full bat
 oldest has been overdue for a whole fill window. An earlier version let the watchdog take single overdue jobs as they
 came and left the idle hashers finishing them too; whichever finished first answered. At 190,000 users on an aged
 database (a Synteq copy of the official box) that ran 1.7 cores of watchdog in short batches plus 0.6 cores of
-hashers on the same logins, kept the box at 100% and never let the feed lane recover, in one hold of two of the same
-build.
+hashers on the same logins, kept the box at 100% and never let the feed lane recover: p95 5,710 ms, in one hold of
+four of the same build. On that aged hold this version passed with p95 481 ms, p99 899 ms and no errors. The watchdog
+used 0.002 cores and answered 49 of 15,331 hash jobs, in 10 batches, each taken whole from a held-up hasher. There was
+no re-hash loop.
 
 **No locks between them.** The event loop owns the queue and hands each hasher its batch through a slot of its own,
 with an atomic state and a futex sleep. A starved idle thread holds nothing anyone else waits on, and nobody spins.
