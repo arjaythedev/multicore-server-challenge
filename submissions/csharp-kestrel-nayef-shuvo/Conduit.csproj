@@ -8,7 +8,7 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
-    <AllowUnsafeBlocks>true</AllowUnsafeBlocks> <!-- Bcrypt.cs calls libcrypt through pointers -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks> <!-- BcryptCore.cs and the generated BcryptLanes.g.cs work through pointers -->
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <!-- Benchmarks/ is its own project (BenchmarkDotNet); its files must not become part of the server. -->
