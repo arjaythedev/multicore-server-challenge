@@ -7,6 +7,7 @@
 //!    hashed once, instead of probing `follows` once per comment.
 const std = @import("std");
 const pg = @import("pg.zig");
+const mutations = @import("mutation.zig");
 
 const I8 = pg.oid.int8;
 const I4 = pg.oid.int4;
@@ -66,10 +67,11 @@ fn cols(comptime following: []const u8, comptime body: bool) []const u8 {
 }
 
 fn favCols(comptime on: bool) []const u8 {
-    const fav_count = if (on)
-        "(SELECT count(*) FROM favorites f WHERE f.article_id = a.id) + (SELECT count(*) FROM ins) AS c7"
-    else
-        "(SELECT count(*) FROM favorites f WHERE f.article_id = a.id) - (SELECT count(*) FROM del) AS c7";
+    // A concurrent idempotent conflict can finish without RETURNING a row.
+    // Reconcile the viewer's snapshot membership with the requested state instead.
+    const fav_count = "(SELECT count(*) FROM favorites f WHERE f.article_id = a.id) - " ++
+        "(SELECT count(*) FROM favorites f WHERE f.user_id = $1 AND f.article_id = a.id)" ++
+        (if (on) " + 1 AS c7" else " AS c7");
     const favorited = if (on) "true AS c8" else "false AS c8";
     return "a.id AS c0, a.slug AS c1, a.title AS c2, a.description AS c3, a.created_at AS c4, a.updated_at AS c5, " ++
         decor_tags ++ ", " ++ fav_count ++ ", " ++ favorited ++ ", u.username AS c9, u.bio AS c10, u.image AS c11, " ++
@@ -113,80 +115,81 @@ const list_fav_sql = list(
     list_cols,
 );
 
-const feed_sql = list(
-    "SELECT count(*)::int8 AS n FROM (SELECT 1 FROM articles a WHERE a.author_id = ANY(ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $1)) LIMIT 1000) s",
-    "(SELECT x.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT ($2::int + $3::int)) x WHERE fo.follower_id = $1 ORDER BY x.id DESC OFFSET $3 LIMIT $2) p0 JOIN articles a ON a.id = p0.id",
+const feed_base = list(
+    "SELECT count(*)::int8 AS n FROM ff CROSS JOIN LATERAL (SELECT 1 FROM articles a WHERE a.author_id = ANY(ff.ids) LIMIT 1000) s",
+    "(SELECT x.id FROM ff CROSS JOIN LATERAL unnest(ff.ids) fo(id) CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.id ORDER BY a2.id DESC LIMIT ($2::int + $3::int)) x ORDER BY x.id DESC OFFSET $3 LIMIT $2) p0 JOIN articles a ON a.id = p0.id",
     feed_cols,
 );
+const feed_sql = "WITH ff AS MATERIALIZED (SELECT ARRAY(SELECT f.followee_id FROM follows f WHERE f.follower_id = $1) AS ids), " ++ feed_base[5..];
 
 const slugify = "trim(both '-' from lower(regexp_replace($6, '[^A-Za-z0-9]+', '-', 'g')))";
 
 pub const defs = blk: {
     var d: [std.meta.fieldNames(Stmt).len]Def = undefined;
-    d[@intFromEnum(Stmt.tx_begin)] = .{ .sql = "BEGIN", .params = &.{} };
-    d[@intFromEnum(Stmt.tx_commit)] = .{ .sql = "COMMIT", .params = &.{} };
-    d[@intFromEnum(Stmt.tags)] = .{ .sql = "SELECT name FROM tags WHERE $1 IS NOT NULL ORDER BY name", .params = &.{I8} }; // $1: the viewer, unused. (Waiting `tags` requests are answered from one execution of this statement; see flushReads.)
-    d[@intFromEnum(Stmt.user_by_id)] = .{ .sql = "SELECT id, username, email, bio, image FROM users WHERE id = $1", .params = &.{I8} };
-    d[@intFromEnum(Stmt.user_login)] = .{ .sql = "SELECT id, username, email, bio, image, password_hash FROM users WHERE email = $1", .params = &.{TX} };
-    d[@intFromEnum(Stmt.user_insert)] = .{
+    d[@backingInt(Stmt.tx_begin)] = .{ .sql = "BEGIN", .params = &.{} };
+    d[@backingInt(Stmt.tx_commit)] = .{ .sql = "COMMIT", .params = &.{} };
+    d[@backingInt(Stmt.tags)] = .{ .sql = "SELECT name FROM tags WHERE $1 IS NOT NULL ORDER BY name", .params = &.{I8} }; // $1: the viewer, unused. (Waiting `tags` requests are answered from one execution of this statement; see flushReads.)
+    d[@backingInt(Stmt.user_by_id)] = .{ .sql = "SELECT id, username, email, bio, image FROM users WHERE id = $1", .params = &.{I8} };
+    d[@backingInt(Stmt.user_login)] = .{ .sql = "SELECT id, username, email, bio, image, password_hash FROM users WHERE email = $1", .params = &.{TX} };
+    d[@backingInt(Stmt.user_insert)] = .{
         .sql = "INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3) RETURNING id, username, email, bio, image",
         .params = &.{ TX, TX, TX },
     };
-    d[@intFromEnum(Stmt.user_update)] = .{
+    d[@backingInt(Stmt.user_update)] = .{
         .sql = "UPDATE users SET email = COALESCE($2, email), username = COALESCE($3, username), password_hash = COALESCE($4, password_hash), bio = COALESCE($5, bio), image = COALESCE($6, image) WHERE id = $1 RETURNING id, username, email, bio, image",
         .params = &.{ I8, TX, TX, TX, TX, TX },
     };
-    d[@intFromEnum(Stmt.profile)] = .{
+    d[@backingInt(Stmt.profile)] = .{
         .sql = "SELECT u.id, u.username, u.bio, u.image, COALESCE((SELECT true FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = u.id), false) FROM users u WHERE u.username = $2",
         .params = &.{ I8, TX },
     };
-    d[@intFromEnum(Stmt.follow)] = .{
+    d[@backingInt(Stmt.follow)] = .{
         .sql = "WITH u AS (SELECT id, username, bio, image FROM users WHERE username = $2), i AS (INSERT INTO follows (follower_id, followee_id) SELECT $1, id FROM u ON CONFLICT DO NOTHING) SELECT username, bio, image FROM u",
         .params = &.{ I8, TX },
     };
-    d[@intFromEnum(Stmt.unfollow)] = .{
+    d[@backingInt(Stmt.unfollow)] = .{
         .sql = "WITH u AS (SELECT id, username, bio, image FROM users WHERE username = $2), d AS (DELETE FROM follows WHERE follower_id = $1 AND followee_id = (SELECT id FROM u)) SELECT username, bio, image FROM u",
         .params = &.{ I8, TX },
     };
-    d[@intFromEnum(Stmt.list_global)] = .{ .sql = list_global_sql, .params = &.{ I8, I4, I4 } };
-    d[@intFromEnum(Stmt.list_tag)] = .{ .sql = list_tag_sql, .params = &.{ I8, I4, I4, TX } };
-    d[@intFromEnum(Stmt.list_author)] = .{ .sql = list_author_sql, .params = &.{ I8, I4, I4, TX } };
-    d[@intFromEnum(Stmt.list_fav)] = .{ .sql = list_fav_sql, .params = &.{ I8, I4, I4, TX } };
-    d[@intFromEnum(Stmt.feed)] = .{ .sql = feed_sql, .params = &.{ I8, I4, I4 } };
-    d[@intFromEnum(Stmt.article)] = .{
+    d[@backingInt(Stmt.list_global)] = .{ .sql = list_global_sql, .params = &.{ I8, I4, I4 } };
+    d[@backingInt(Stmt.list_tag)] = .{ .sql = list_tag_sql, .params = &.{ I8, I4, I4, TX } };
+    d[@backingInt(Stmt.list_author)] = .{ .sql = list_author_sql, .params = &.{ I8, I4, I4, TX } };
+    d[@backingInt(Stmt.list_fav)] = .{ .sql = list_fav_sql, .params = &.{ I8, I4, I4, TX } };
+    d[@backingInt(Stmt.feed)] = .{ .sql = feed_sql, .params = &.{ I8, I4, I4 } };
+    d[@backingInt(Stmt.article)] = .{
         .sql = "SELECT " ++ full_cols ++ " FROM articles a JOIN users u ON u.id = a.author_id WHERE a.slug = $2",
         .params = &.{ I8, TX },
     };
-    d[@intFromEnum(Stmt.comments)] = .{
+    d[@backingInt(Stmt.comments)] = .{
         .sql = "SELECT c.id, c.body, c.created_at, c.updated_at, c.username, c.bio, c.image, c.following FROM articles a LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image, (c.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $1)) AS following FROM comments c JOIN users u ON u.id = c.author_id WHERE c.article_id = a.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true WHERE a.slug = $2",
         .params = &.{ I8, TX },
     };
-    d[@intFromEnum(Stmt.comment_insert)] = .{
+    d[@backingInt(Stmt.comment_insert)] = .{
         .sql = "WITH a AS (SELECT id FROM articles WHERE slug = $2), c AS (INSERT INTO comments (article_id, author_id, body) SELECT id, $1, $3 FROM a RETURNING id, body, created_at, updated_at, author_id) SELECT c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image FROM c JOIN users u ON u.id = c.author_id",
         .params = &.{ I8, TX, TX },
     };
-    d[@intFromEnum(Stmt.comment_delete)] = .{
+    d[@backingInt(Stmt.comment_delete)] = .{
         .sql = "WITH c AS (SELECT c.id, c.author_id FROM comments c JOIN articles a ON a.id = c.article_id WHERE c.id = $2 AND a.slug = $3), d AS (DELETE FROM comments WHERE id = (SELECT id FROM c) AND author_id = $1 RETURNING id) SELECT c.author_id, EXISTS (SELECT 1 FROM d) FROM c",
         .params = &.{ I8, I8, TX },
     };
-    d[@intFromEnum(Stmt.art_insert)] = .{
+    d[@backingInt(Stmt.art_insert)] = .{
         .sql = "INSERT INTO articles (id, slug, author_id, title, description, body) SELECT n.id, $2 || '-' || n.id, $1, $3, $4, $5 FROM (SELECT nextval(pg_get_serial_sequence('articles', 'id')) AS id) n",
         .params = &.{ I8, TX, TX, TX, TX },
     };
-    d[@intFromEnum(Stmt.art_tags)] = .{
+    d[@backingInt(Stmt.art_tags)] = .{
         .sql = "INSERT INTO tags (name) SELECT DISTINCT unnest($1::text[]) ON CONFLICT (name) DO NOTHING",
         .params = &.{TA},
     };
-    d[@intFromEnum(Stmt.art_attach)] = .{
+    d[@backingInt(Stmt.art_attach)] = .{
         .sql = "INSERT INTO article_tags (article_id, tag_id) SELECT currval(pg_get_serial_sequence('articles', 'id')), t.id FROM tags t WHERE t.name = ANY($1::text[])",
         .params = &.{TA},
     };
-    d[@intFromEnum(Stmt.art_new)] = .{
+    d[@backingInt(Stmt.art_new)] = .{
         .sql = "SELECT " ++ full_cols ++ " FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id = (SELECT currval(pg_get_serial_sequence('articles', 'id')))",
         .params = &.{I8},
     };
     // $1 viewer, $2 slug, $3 title, $4 description, $5 body, $6 slug base (from the new title)
-    d[@intFromEnum(Stmt.art_update)] = .{
+    d[@backingInt(Stmt.art_update)] = .{
         .sql = "WITH a0 AS (SELECT id, author_id FROM articles WHERE slug = $2), u AS (UPDATE articles SET title = COALESCE($3, title), description = COALESCE($4, description), body = COALESCE($5, body), slug = CASE WHEN $3::text IS NULL THEN slug ELSE $6 || '-' || id END, updated_at = now() WHERE id = (SELECT id FROM a0) AND author_id = $1 RETURNING id, slug, title, description, body, created_at, updated_at, author_id) SELECT a0.id AS k0, a0.author_id AS k1, " ++
             "u.id AS c0, u.slug AS c1, u.title AS c2, u.description AS c3, u.created_at AS c4, u.updated_at AS c5, " ++
             "ARRAY(SELECT n FROM (SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) AS n FROM article_tags at WHERE at.article_id = a0.id) s ORDER BY n) AS c6, " ++
@@ -197,15 +200,15 @@ pub const defs = blk: {
             "FROM a0 LEFT JOIN u ON true LEFT JOIN users au ON au.id = a0.author_id",
         .params = &.{ I8, TX, TX, TX, TX, TX },
     };
-    d[@intFromEnum(Stmt.art_delete)] = .{
+    d[@backingInt(Stmt.art_delete)] = .{
         .sql = "WITH a0 AS (SELECT id, author_id FROM articles WHERE slug = $2), d AS (DELETE FROM articles WHERE id = (SELECT id FROM a0) AND author_id = $1 RETURNING id) SELECT a0.author_id, EXISTS (SELECT 1 FROM d) FROM a0",
         .params = &.{ I8, TX },
     };
-    d[@intFromEnum(Stmt.fav_add)] = .{
+    d[@backingInt(Stmt.fav_add)] = .{
         .sql = "WITH a0 AS (SELECT id FROM articles WHERE slug = $2), ins AS (INSERT INTO favorites (user_id, article_id) SELECT $1, id FROM a0 ON CONFLICT DO NOTHING RETURNING 1) SELECT " ++ favCols(true) ++ " FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id = (SELECT id FROM a0)",
         .params = &.{ I8, TX },
     };
-    d[@intFromEnum(Stmt.fav_del)] = .{
+    d[@backingInt(Stmt.fav_del)] = .{
         .sql = "WITH a0 AS (SELECT id FROM articles WHERE slug = $2), del AS (DELETE FROM favorites WHERE user_id = $1 AND article_id = (SELECT id FROM a0) RETURNING 1) SELECT " ++ favCols(false) ++ " FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id = (SELECT id FROM a0)",
         .params = &.{ I8, TX },
     };
@@ -299,10 +302,14 @@ const b_list_fav = listBatch(
 // the feed is the viewer's own: its pages are per viewer and every article on it is by someone the viewer follows
 const b_feed = listBatch(
     false,
-    countPerKey("viewer", "FROM articles a WHERE a.author_id = ANY(ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = k.viewer))"),
+    "ff AS MATERIALIZED (SELECT v.viewer, ARRAY(SELECT f.followee_id FROM follows f WHERE f.follower_id = v.viewer) AS ids FROM (SELECT DISTINCT viewer FROM r) v), " ++
+        "hc AS MATERIALIZED (SELECT x.id FROM ff CROSS JOIN LATERAL unnest(ff.ids) x(id) GROUP BY x.id ORDER BY count(*) DESC, x.id LIMIT 8), " ++
+        "heavy AS MATERIALIZED (SELECT hc.id FROM hc WHERE EXISTS (SELECT 1 FROM articles a WHERE a.author_id = hc.id OFFSET 999 LIMIT 1)), " ++
+        "cnt AS MATERIALIZED (SELECT ff.viewer, CASE WHEN EXISTS (SELECT 1 FROM heavy h WHERE h.id = ANY(ff.ids)) THEN 1000::int8 " ++
+        "ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = ANY(ff.ids) LIMIT 1000) s) END AS n FROM ff)",
     "JOIN cnt ON cnt.viewer = r.viewer",
     "viewer",
-    "SELECT x.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT (r.lim + r.off)) x WHERE fo.follower_id = r.viewer ORDER BY x.id DESC OFFSET r.off LIMIT r.lim",
+    "SELECT x.id FROM ff CROSS JOIN LATERAL unnest(ff.ids) fo(id) CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.id ORDER BY a2.id DESC LIMIT (r.lim + r.off)) x WHERE ff.viewer = r.viewer ORDER BY x.id DESC OFFSET r.off LIMIT r.lim",
     false,
 );
 
@@ -383,7 +390,7 @@ pub const batchable = [_]Stmt{ .list_global, .list_tag, .list_author, .list_fav,
 pub const bdefs = blk: {
     var d: [defs.len]?Def = @splat(null);
     for (batchable) |k| {
-        const base = defs[@intFromEnum(k)];
+        const base = defs[@backingInt(k)];
         const shared_sql: ?[]const u8 = switch (k) {
             .list_global => b_list_global,
             .list_tag => b_list_tag,
@@ -393,18 +400,18 @@ pub const bdefs = blk: {
             .article => b_article,
             else => null,
         };
-        d[@intFromEnum(k)] = .{ .sql = shared_sql orelse batchedSql(base, if (k == .comments) ", x.created_at DESC, x.id DESC" else ""), .params = batchedParams(base) };
+        d[@backingInt(k)] = .{ .sql = shared_sql orelse batchedSql(base, if (k == .comments) ", x.created_at DESC, x.id DESC" else ""), .params = batchedParams(base) };
     }
     break :blk d;
 };
 
 /// Statement id used for the batched variant of `s` (prepared after all the single statements).
 pub inline fn batchId(s: Stmt) u16 {
-    return @as(u16, @intCast(defs.len)) + @as(u16, @intFromEnum(s));
+    return @as(u16, @intCast(defs.len)) + @as(u16, @backingInt(s));
 }
 
 pub inline fn id(s: Stmt) u16 {
-    return @intFromEnum(s);
+    return @backingInt(s);
 }
 
 // --- the batch planner's statements ---------------------------------------------------------------------------------
@@ -441,13 +448,13 @@ pub const PlanStmt = enum(u8) {
 
 pub const plan_defs = blk: {
     var d: [std.meta.fieldNames(PlanStmt).len]Def = undefined;
-    d[@intFromEnum(PlanStmt.a_global)] = .{
+    d[@backingInt(PlanStmt.a_global)] = .{
         .sql = "SELECT 0::int8, (SELECT count(*) FROM (SELECT 1 FROM articles ORDER BY id LIMIT 1000) s), " ++ plan_pad ++
             " UNION ALL SELECT r.k, " ++ plan_cols ++ " FROM unnest($1::int8[], $2::int8[]) WITH ORDINALITY r(lim, off, k) " ++
             "CROSS JOIN LATERAL (SELECT * FROM articles a ORDER BY a.id DESC LIMIT r.lim OFFSET r.off) a",
         .params = &.{ I8A, I8A },
     };
-    d[@intFromEnum(PlanStmt.a_tag)] = .{
+    d[@backingInt(PlanStmt.a_tag)] = .{
         .sql = "SELECT -r.k, " ++ capped("SELECT 1 FROM article_tags at WHERE at.tag_id = t.id") ++ ", " ++ plan_pad ++
             " FROM unnest($1::text[]) WITH ORDINALITY r(tag, k) LEFT JOIN tags t ON t.name = r.tag UNION ALL " ++
             "SELECT r.k, " ++ plan_cols ++ " FROM unnest($2::text[], $3::int8[], $4::int8[]) WITH ORDINALITY r(tag, lim, off, k) " ++
@@ -455,7 +462,7 @@ pub const plan_defs = blk: {
             "ORDER BY at.article_id DESC LIMIT r.lim OFFSET r.off) p JOIN articles a ON a.id = p.article_id",
         .params = &.{ TA, TA, I8A, I8A },
     };
-    d[@intFromEnum(PlanStmt.a_author)] = .{
+    d[@backingInt(PlanStmt.a_author)] = .{
         .sql = "SELECT -r.k, " ++ capped("SELECT 1 FROM articles a WHERE a.author_id = u.id") ++ ", " ++ plan_pad ++
             " FROM unnest($1::text[]) WITH ORDINALITY r(username, k) LEFT JOIN users u ON u.username = r.username UNION ALL " ++
             "SELECT r.k, " ++ plan_cols ++ " FROM unnest($2::text[], $3::int8[], $4::int8[]) WITH ORDINALITY r(username, lim, off, k) " ++
@@ -463,7 +470,7 @@ pub const plan_defs = blk: {
             "ORDER BY a.id DESC LIMIT r.lim OFFSET r.off) a",
         .params = &.{ TA, TA, I8A, I8A },
     };
-    d[@intFromEnum(PlanStmt.a_fav)] = .{
+    d[@backingInt(PlanStmt.a_fav)] = .{
         .sql = "SELECT -r.k, " ++ capped("SELECT 1 FROM favorites f WHERE f.user_id = u.id") ++ ", " ++ plan_pad ++
             " FROM unnest($1::text[]) WITH ORDINALITY r(username, k) LEFT JOIN users u ON u.username = r.username UNION ALL " ++
             "SELECT r.k, " ++ plan_cols ++ " FROM unnest($2::text[], $3::int8[], $4::int8[]) WITH ORDINALITY r(username, lim, off, k) " ++
@@ -471,48 +478,50 @@ pub const plan_defs = blk: {
             "ORDER BY f.article_id DESC LIMIT r.lim OFFSET r.off) p JOIN articles a ON a.id = p.article_id",
         .params = &.{ TA, TA, I8A, I8A },
     };
-    d[@intFromEnum(PlanStmt.a_feed)] = .{
-        .sql = "SELECT -r.k, " ++
-            capped("SELECT 1 FROM articles a WHERE a.author_id = ANY(ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.v)) ORDER BY a.author_id, a.id DESC") ++
-            ", " ++ plan_pad ++ " FROM unnest($1::int8[]) WITH ORDINALITY r(v, k) UNION ALL " ++
-            "SELECT r.k, " ++ plan_cols ++ " FROM unnest($2::int8[], $3::int8[], $4::int8[]) WITH ORDINALITY r(v, lim, off, k) " ++
-            "CROSS JOIN LATERAL (SELECT y.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id " ++
-            "ORDER BY a2.id DESC LIMIT r.lim + r.off) y WHERE fo.follower_id = r.v ORDER BY y.id DESC LIMIT r.lim OFFSET r.off) x " ++
-            "JOIN articles a ON a.id = x.id",
+    d[@backingInt(PlanStmt.a_feed)] = .{
+        .sql = "WITH ff AS MATERIALIZED (SELECT v, ARRAY(SELECT f.followee_id FROM follows f WHERE f.follower_id = v) AS ids FROM (SELECT DISTINCT unnest($1::int8[] || $2::int8[]) AS v) q), " ++
+            "hc AS MATERIALIZED (SELECT x.id FROM ff CROSS JOIN LATERAL unnest(ff.ids) x(id) GROUP BY x.id ORDER BY count(*) DESC, x.id LIMIT 8), " ++
+            "heavy AS MATERIALIZED (SELECT hc.id FROM hc WHERE EXISTS (SELECT 1 FROM articles a WHERE a.author_id = hc.id OFFSET 999 LIMIT 1)) " ++
+            "SELECT -r.k, CASE WHEN EXISTS (SELECT 1 FROM heavy h WHERE h.id = ANY(ff.ids)) THEN 1000::int8 ELSE " ++
+            capped("SELECT 1 FROM articles a WHERE a.author_id = ANY(ff.ids) ORDER BY a.author_id, a.id DESC") ++
+            " END, " ++ plan_pad ++ " FROM unnest($1::int8[]) WITH ORDINALITY r(v, k) JOIN ff ON ff.v = r.v UNION ALL " ++
+            "SELECT r.k, " ++ plan_cols ++ " FROM unnest($2::int8[], $3::int8[], $4::int8[]) WITH ORDINALITY r(v, lim, off, k) JOIN ff ON ff.v = r.v " ++
+            "CROSS JOIN LATERAL (SELECT y.id FROM unnest(ff.ids) fo(id) CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.id " ++
+            "ORDER BY a2.id DESC LIMIT r.lim + r.off) y ORDER BY y.id DESC LIMIT r.lim OFFSET r.off) x JOIN articles a ON a.id = x.id",
         .params = &.{ I8A, I8A, I8A, I8A },
     };
     // k, id, author_id, slug, title, description, created_at, updated_at, body
-    d[@intFromEnum(PlanStmt.a_slug)] = .{
+    d[@backingInt(PlanStmt.a_slug)] = .{
         .sql = "SELECT r.k, " ++ plan_cols ++ ", a.body FROM unnest($1::text[]) WITH ORDINALITY r(slug, k) JOIN articles a ON a.slug = r.slug",
         .params = &.{TA},
     };
     // k, article id, comment id, body, created_at, updated_at, author_id, username, bio, image (one all-NULL comment row for an article without comments)
-    d[@intFromEnum(PlanStmt.a_cmts)] = .{
+    d[@backingInt(PlanStmt.a_cmts)] = .{
         .sql = "SELECT r.k, a.id, c.id, c.body, c.created_at, c.updated_at, c.author_id, u.username, u.bio, u.image " ++
             "FROM unnest($1::text[]) WITH ORDINALITY r(slug, k) JOIN articles a ON a.slug = r.slug " ++
             "LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id FROM comments c WHERE c.article_id = a.id " ++
             "ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true LEFT JOIN users u ON u.id = c.author_id",
         .params = &.{TA},
     };
-    d[@intFromEnum(PlanStmt.a_prof)] = .{
+    d[@backingInt(PlanStmt.a_prof)] = .{
         .sql = "SELECT r.k, u.id, u.username, u.bio, u.image FROM unnest($1::text[]) WITH ORDINALITY r(username, k) JOIN users u ON u.username = r.username",
         .params = &.{TA},
     };
     // id, username, bio, image of each distinct article's author
-    d[@intFromEnum(PlanStmt.b_artx)] = .{
+    d[@backingInt(PlanStmt.b_artx)] = .{
         .sql = "SELECT r.id, u.username, u.bio, u.image FROM unnest($1::int8[], $2::int8[]) r(id, author) JOIN users u ON u.id = r.author",
         .params = &.{ I8A, I8A },
     };
-    d[@intFromEnum(PlanStmt.b_fc)] = .{
+    d[@backingInt(PlanStmt.b_fc)] = .{
         .sql = "SELECT f.article_id, count(*) FROM favorites f WHERE f.article_id = ANY($1::int8[]) GROUP BY f.article_id",
         .params = &.{I8A},
     };
-    d[@intFromEnum(PlanStmt.b_names)] = .{
+    d[@backingInt(PlanStmt.b_names)] = .{
         .sql = "SELECT at.article_id, t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE at.article_id = ANY($1::int8[]) ORDER BY at.article_id, t.name",
         .params = &.{I8A},
     };
     // (0, viewer, article) per favourited pair asked about, (1, viewer, followee) per followed pair
-    d[@intFromEnum(PlanStmt.b_flags)] = .{
+    d[@backingInt(PlanStmt.b_flags)] = .{
         .sql = "WITH p AS (SELECT x.v, array_agg(x.a) AS aa FROM unnest($1::int8[], $2::int8[]) x(v, a) GROUP BY x.v), " ++
             "q AS (SELECT x.v, array_agg(x.u) AS uu FROM unnest($3::int8[], $4::int8[]) x(v, u) GROUP BY x.v) " ++
             "SELECT 0::int8, p.v, f.article_id FROM p CROSS JOIN LATERAL (SELECT f.article_id FROM favorites f WHERE f.user_id = p.v AND f.article_id = ANY(p.aa)) f " ++
@@ -524,19 +533,62 @@ pub const plan_defs = blk: {
 
 /// Statement id of a planner statement. Batched statements use ids defs.len + <statement kind>, so these start past all of them.
 pub inline fn planId(s: PlanStmt) u16 {
-    return @as(u16, @intCast(2 * defs.len)) + @as(u16, @intFromEnum(s));
+    return @as(u16, @intCast(2 * defs.len)) + @as(u16, @backingInt(s));
 }
+
+const TZ = 1184;
+const BO = pg.oid.bool_;
+const article_oids = [_]u32{ I8, TX, TX, TX, TZ, TZ, TA, I8, BO, TX, TX, TX, BO, TX };
+const profile_oids = [_]u32{ I8, TX, TX, TX, BO };
+const comment_oids = [_]u32{ I8, TX, TZ, TZ, TX, TX, TX, BO };
+
+pub fn resultOids(comptime statement: u16) []const u32 {
+    if (statement >= mutations.base_id) return mutations.resultOids(statement - mutations.base_id);
+    if (statement == packed_id) return &.{ I8, I8, I8, I8, TX, TX, TX, TZ, TZ, TX, TA, I8, TX, TX, TX, I8A, I8A, I8A };
+    if (statement >= 2 * defs.len) {
+        return switch (@as(PlanStmt, @fromBackingInt(@intCast(statement - 2 * defs.len)))) {
+            .a_global, .a_tag, .a_author, .a_fav, .a_feed => &.{ I8, I8, I8, TX, TX, TX, TZ, TZ },
+            .a_slug => &.{ I8, I8, I8, TX, TX, TX, TZ, TZ, TX },
+            .a_cmts => &.{ I8, I8, I8, TX, TZ, TZ, I8, TX, TX, TX },
+            .a_prof => &.{ I8, I8, TX, TX, TX },
+            .b_artx => &.{ I8, TX, TX, TX },
+            .b_fc => &.{ I8, I8 },
+            .b_names => &.{ I8, TX },
+            .b_flags => &.{ I8, I8, I8 },
+        };
+    }
+    if (statement >= defs.len) return &([_]u32{I8} ++ resultOids(statement - defs.len)[0..resultOids(statement - defs.len).len].*);
+    return switch (@as(Stmt, @fromBackingInt(@intCast(statement)))) {
+        .tx_begin, .tx_commit, .art_insert, .art_tags, .art_attach => &.{},
+        .tags => &.{TX},
+        .user_by_id, .user_insert, .user_update => &.{ I8, TX, TX, TX, TX },
+        .user_login => &.{ I8, TX, TX, TX, TX, TX },
+        .profile => &profile_oids,
+        .follow, .unfollow => &.{ TX, TX, TX },
+        .list_global, .list_tag, .list_author, .list_fav, .feed => &([_]u32{I8} ++ article_oids[0..13].*),
+        .article, .art_new, .fav_add, .fav_del => &article_oids,
+        .comments => &comment_oids,
+        .comment_insert => comment_oids[0..7],
+        .comment_delete, .art_delete => &.{ I8, BO },
+        .art_update => &([_]u32{ I8, I8 } ++ article_oids),
+    };
+}
+
+pub const packed_id: u16 = 2 * defs.len + plan_defs.len;
+pub const packed_sql = @embedFile("packed.sql");
 
 pub const Prep = struct { id: u16, sql: []const u8, params: []const u32 };
 
 /// Every statement to prepare on a new connection: the single-request statements, the batched variants, the planner's.
 pub const prepared = blk: {
-    var out: [defs.len + batchable.len + plan_defs.len]Prep = undefined;
+    var out: [defs.len + batchable.len + plan_defs.len + 1 + mutations.defs.len]Prep = undefined;
     for (defs, 0..) |d, i| out[i] = .{ .id = @intCast(i), .sql = d.sql, .params = d.params };
     for (batchable, 0..) |k, j| {
-        const b = bdefs[@intFromEnum(k)].?;
+        const b = bdefs[@backingInt(k)].?;
         out[defs.len + j] = .{ .id = batchId(k), .sql = b.sql, .params = b.params };
     }
-    for (plan_defs, 0..) |d, j| out[defs.len + batchable.len + j] = .{ .id = planId(@enumFromInt(j)), .sql = d.sql, .params = d.params };
+    for (plan_defs, 0..) |d, j| out[defs.len + batchable.len + j] = .{ .id = planId(@fromBackingInt(@intCast(j))), .sql = d.sql, .params = d.params };
+    out[defs.len + batchable.len + plan_defs.len] = .{ .id = packed_id, .sql = packed_sql, .params = &.{ I4A, I8A, I4A, I4A, TA } };
+    for (mutations.defs, 0..) |d, i| out[defs.len + batchable.len + plan_defs.len + 1 + i] = .{ .id = mutations.base_id + @as(u16, @intCast(i)), .sql = d.sql, .params = d.params };
     break :blk out;
 };

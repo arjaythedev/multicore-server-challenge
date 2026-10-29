@@ -233,10 +233,10 @@ func newNetServer(opts pollerOptions, makeRouter func(*netServer) taskRouter) (*
 		if id < slotTotal%opts.loopCount {
 			loopSlots++
 		}
-		initTable := min(opts.fdLimit, 65536)
+		initTable := opts.fdLimit
 		pw.table = make([]sockEntry, initTable)
 		pw.activeBitmap = make([]uint64, (initTable+63)/64)
-		ringSize := min(opts.fdLimit, 131072)
+		ringSize := opts.fdLimit
 		pw.readRing = make([]pendingFD, ringSize)
 		pw.parkRing = make([]pendingFD, ringSize)
 		pw.tasks = make([]reqCtx, loopSlots)
@@ -600,7 +600,7 @@ func (pw *pollWorker) updateInterest(fd int, mask uint32) {
 }
 
 func (pw *pollWorker) acceptConns() {
-	for range 256 {
+	for range 1024 {
 		if pw.srv.openConns.Load() >= int64(pw.srv.opts.maxSockets) {
 			pw.acceptPaused = true
 			pw.setListenerMask(0)

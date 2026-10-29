@@ -212,6 +212,57 @@ func writePGTextArray(dst, raw []byte) []byte {
 	return append(dst, ']')
 }
 
+func writeSortedPGTextArray(dst, raw []byte) []byte {
+	dst = append(dst, '[')
+	if len(raw) >= 20 && binary.BigEndian.Uint32(raw[:4]) == 1 {
+		elemCount := int(int32(binary.BigEndian.Uint32(raw[12:16])))
+		cursor := 20
+		if elemCount == 1 && cursor+4 <= len(raw) {
+			elemLen := int(int32(binary.BigEndian.Uint32(raw[cursor : cursor+4])))
+			cursor += 4
+			if elemLen >= 0 && cursor+elemLen <= len(raw) {
+				dst = writeJSONStr(dst, raw[cursor:cursor+elemLen])
+			} else {
+				dst = append(dst, "null"...)
+			}
+			return append(dst, ']')
+		}
+		var stack [16][]byte
+		var elems [][]byte
+		if elemCount <= len(stack) {
+			elems = stack[:0]
+		} else {
+			elems = make([][]byte, 0, elemCount)
+		}
+		for idx := 0; idx < elemCount && cursor+4 <= len(raw); idx++ {
+			elemLen := int(int32(binary.BigEndian.Uint32(raw[cursor : cursor+4])))
+			cursor += 4
+			if elemLen < 0 || cursor+elemLen > len(raw) {
+				continue
+			}
+			elems = append(elems, raw[cursor:cursor+elemLen])
+			cursor += elemLen
+		}
+		for i := 1; i < len(elems); i++ {
+			cur := elems[i]
+			curS := bytesToStr(cur)
+			j := i - 1
+			for j >= 0 && curS < bytesToStr(elems[j]) {
+				elems[j+1] = elems[j]
+				j--
+			}
+			elems[j+1] = cur
+		}
+		for idx, e := range elems {
+			if idx > 0 {
+				dst = append(dst, ',')
+			}
+			dst = writeJSONStr(dst, e)
+		}
+	}
+	return append(dst, ']')
+}
+
 func encodePGTextArray(dst []byte, elems []string) []byte {
 	var header [20]byte
 	if len(elems) == 0 {

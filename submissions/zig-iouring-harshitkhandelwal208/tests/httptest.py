@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Raw-socket HTTP/1.1 robustness checks against a running server (default 127.0.0.1:3000)."""
 import socket, sys, time, json, threading
+from concurrent.futures import ThreadPoolExecutor
 HOST, PORT = "127.0.0.1", int(sys.argv[1]) if len(sys.argv) > 1 else 3000
 fails = 0
 
@@ -196,6 +197,32 @@ st, *_ = read_resp(s); check("a size line with a huge extension is refused", st 
 s = conn(); s.sendall(b"POST /api/users HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" + b"1\r\nx\r\n" * 1100)
 st, *_ = read_resp(s); check("more than 1024 chunks is refused", st in (400, 413), st); s.close()
 s = conn(); s.sendall(GET); st, *_ = read_resp(s); check("server responsive after chunk abuse (%.1fs)" % (time.time() - t0), st == 200 and time.time() - t0 < 10, st); s.close()
+
+# Reuse server-side fd slots while asynchronous shutdowns and new accepts overlap.
+def close_churn_client(_):
+    for iteration in range(32):
+        payload, expected = ((b"BLAH\r\n\r\n", 400) if iteration % 2 else
+                             (b"GET /api/tags HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 200))
+        with conn() as client:
+            client.sendall(payload)
+            status, *_ = read_resp(client)
+            if status != expected:
+                raise RuntimeError("close-response status %s, expected %d" % (status, expected))
+        with conn() as client:
+            client.sendall(GET)
+            status, _, body, _ = read_resp(client)
+            if status != 200 or not isinstance(json.loads(body)["tags"], list):
+                raise RuntimeError("fresh connection after close returned %s" % status)
+    return 32
+
+completed = 0; churn_error = None
+try:
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        completed = sum(pool.map(close_churn_client, range(32)))
+except (OSError, EOFError, ValueError, RuntimeError) as exc:
+    churn_error = "%s: %s" % (type(exc).__name__, exc)
+check("32 concurrent close/reopen clients: 2048 responses without retries or EOFs",
+      completed == 1024 and churn_error is None, (completed, churn_error))
 
 # a large pipelined burst on one connection (consuming each request used to move the whole remaining buffer)
 N = 60000

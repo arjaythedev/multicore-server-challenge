@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds bin/conduit from source with the pinned Zig toolchain. No dependencies beyond the Zig standard library.
+# Builds bin/conduit with the pinned Zig toolchain and libdeflate (installed by install.sh).
 set -euo pipefail
 cd "$(dirname "$0")"
 ZIG="$(command -v zig || echo /opt/zig/zig)"

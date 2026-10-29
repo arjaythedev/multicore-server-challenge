@@ -289,11 +289,21 @@ func newPGEngine(srv *netServer, opts batcherOptions, pgCfg *pgconn.Config, hmac
 			notifyCh: make(chan struct{}, 1),
 		},
 	}
+	readOpConcurrency := [firstWriteOp]int{
+		opTags:        1,
+		opUserByID:    1,
+		opUserByEmail: 1,
+		opProfile:     1,
+		opArticle:     2,
+		opComments:    2,
+		opListAll:     2,
+		opListTag:     2,
+		opListAuthor:  2,
+		opListFav:     2,
+		opListFeed:    5,
+	}
 	for op := sqlOp(0); op < firstWriteOp; op++ {
-		limit := opts.readPoolSize
-		if op == opTags {
-			limit = 1
-		}
+		limit := min(readOpConcurrency[op], opts.readPoolSize)
 		eng.rings[op] = stmtRing{
 			items:       make([]*reqCtx, opts.readRingCap),
 			concurrency: limit,
@@ -569,9 +579,6 @@ func (s *pgSession) readWorkerLoop() {
 			clear(s.scratch)
 			for i := range units {
 				units[i].tasks = nil
-				if units[i].op != opTags {
-					s.engine.releaseReadSlot(units[i].op)
-				}
 			}
 		}
 	}
@@ -624,13 +631,10 @@ func (s *pgSession) drainReadyRings() []readBatchUnit {
 
 	for unitCount < len(s.unitBuf) && nonTagCount < maxTasks {
 		avail := eng.readyBitmask.Load()
-		if unitCount > 0 && (avail == 0 || eng.parkedReads.Load() > 0) {
+		if unitCount > 0 && (avail == 0 || (s.unitBuf[0].op != opTags && eng.parkedReads.Load() > 0)) {
 			break
 		}
 		candidates := avail &^ visited
-		if nonTagCount >= 64 {
-			candidates &^= uint32(1) << opListFeed
-		}
 		if candidates == 0 {
 			break
 		}
@@ -640,9 +644,6 @@ func (s *pgSession) drainReadyRings() []readBatchUnit {
 		} else if candidates&(uint32(1)<<opUserByEmail) != 0 {
 			chosen = opUserByEmail
 		} else {
-			if unitCount > 0 && maxTasks-nonTagCount < 16 {
-				break
-			}
 			earliest := int64(1<<63 - 1)
 			for off := 0; off < int(firstWriteOp); off++ {
 				op := sqlOp((int(s.cursorOp) + off) % int(firstWriteOp))
@@ -651,7 +652,7 @@ func (s *pgSession) drainReadyRings() []readBatchUnit {
 				}
 				ts := eng.rings[op].oldestAt.Load()
 				if op == opListFeed {
-					ts -= 40_000_000
+					ts -= 25_000_000
 				}
 				if ts < earliest {
 					earliest = ts
@@ -674,7 +675,7 @@ func (s *pgSession) drainReadyRings() []readBatchUnit {
 		if chosen == opTags {
 			budget = 1024
 		} else if chosen == opListFeed {
-			budget = min(budget, 128)
+			budget = min(budget, 64)
 		}
 		capLimit := min(fromIdx+budget, cap(s.scratch))
 		for ring.stored > 0 && len(s.scratch) < capLimit {
@@ -712,15 +713,8 @@ func (s *pgSession) drainReadyRings() []readBatchUnit {
 			tasks: s.scratch[fromIdx:len(s.scratch)],
 		}
 		unitCount++
-		if chosen == opListFeed {
+		if chosen != opTags {
 			break
-		}
-	}
-	for i := 1; i < unitCount; i++ {
-		if s.unitBuf[i].op == opTags {
-			u := s.unitBuf[i]
-			copy(s.unitBuf[1:i+1], s.unitBuf[0:i])
-			s.unitBuf[0] = u
 		}
 	}
 	return s.unitBuf[:unitCount]
@@ -759,15 +753,23 @@ func orderReadTasks(op sqlOp, batch []*reqCtx) {
 		item := batch[i]
 		keyA := item.plan.bindArgs[keyCol]
 		key0 := item.plan.bindArgs[0]
-		var key2 []byte
-		if keyCol == 3 {
-			key2 = item.plan.bindArgs[2]
+		var key2, key1 []byte
+		if keyCol >= 2 {
+			key1 = item.plan.bindArgs[1]
+			if keyCol == 3 {
+				key2 = item.plan.bindArgs[2]
+			}
 		}
 		pos := i - 1
 		for pos >= 0 {
 			cmp := bytes.Compare(keyA, batch[pos].plan.bindArgs[keyCol])
-			if cmp == 0 && keyCol == 3 {
-				cmp = bytes.Compare(key2, batch[pos].plan.bindArgs[2])
+			if cmp == 0 && keyCol >= 2 {
+				if keyCol == 3 {
+					cmp = bytes.Compare(key2, batch[pos].plan.bindArgs[2])
+				}
+				if cmp == 0 {
+					cmp = bytes.Compare(key1, batch[pos].plan.bindArgs[1])
+				}
 			}
 			if cmp > 0 || (cmp == 0 && (keyCol == 0 || bytes.Compare(key0, batch[pos].plan.bindArgs[0]) >= 0)) {
 				break
@@ -858,9 +860,7 @@ func (s *pgSession) execPipelinedReadUnits(units []readBatchUnit) {
 	if s.conn == nil || s.conn.IsClosed() || s.pipeline == nil {
 		for _, u := range units {
 			s.execSingleReadUnit(u.op, u.tasks)
-			if u.op == opTags {
-				s.engine.releaseReadSlot(opTags)
-			}
+			s.engine.releaseReadSlot(u.op)
 		}
 		return
 	}
@@ -884,9 +884,7 @@ func (s *pgSession) execPipelinedReadUnits(units []readBatchUnit) {
 		s.teardownReadConn(err)
 		for _, u := range units {
 			s.execSingleReadUnit(u.op, u.tasks)
-			if u.op == opTags {
-				s.engine.releaseReadSlot(opTags)
-			}
+			s.engine.releaseReadSlot(u.op)
 		}
 		return
 	}
@@ -907,6 +905,7 @@ func (s *pgSession) execPipelinedReadUnits(units []readBatchUnit) {
 				break
 			}
 			s.engine.routeFollowup(t, step)
+			s.engine.releaseReadSlot(u.op)
 			completedUnits = idx + 1
 		} else {
 			err, synced := s.pullBatchReadResult(u.op, u.tasks)
@@ -918,9 +917,7 @@ func (s *pgSession) execPipelinedReadUnits(units []readBatchUnit) {
 				completedUnits = idx
 				break
 			}
-			if u.op == opTags {
-				s.engine.releaseReadSlot(opTags)
-			}
+			s.engine.releaseReadSlot(u.op)
 			completedUnits = idx + 1
 		}
 	}
@@ -929,9 +926,7 @@ func (s *pgSession) execPipelinedReadUnits(units []readBatchUnit) {
 			s.teardownReadConn(connErr)
 			for i := completedUnits; i < len(units); i++ {
 				s.execSingleReadUnit(units[i].op, units[i].tasks)
-				if units[i].op == opTags {
-					s.engine.releaseReadSlot(opTags)
-				}
+				s.engine.releaseReadSlot(units[i].op)
 			}
 			return
 		}
@@ -949,15 +944,14 @@ func (s *pgSession) execPipelinedReadUnits(units []readBatchUnit) {
 		if i == completedUnits && len(u.tasks) == 1 && u.op != opTags && !isConnBroken(s.conn, firstErr) {
 			s.handleQueryError(u.tasks[0], firstErr)
 			s.engine.srv.completeAsync(u.tasks[0])
+			s.engine.releaseReadSlot(u.op)
 			continue
 		}
 		for _, t := range u.tasks {
 			s.soloSlice[0] = t
 			s.execSingleReadUnit(u.op, s.soloSlice[:])
 		}
-		if u.op == opTags {
-			s.engine.releaseReadSlot(opTags)
-		}
+		s.engine.releaseReadSlot(u.op)
 	}
 }
 
@@ -1610,8 +1604,8 @@ func (eng *pgEngine) collectHashBatches() {
 		if wb.count < blowfish8.Lanes && !closed {
 			now := clockNano()
 			coalesceNs := int64(eng.opts.hashCoalesce)
-			if now-lastBatchAt < int64(200*time.Millisecond) && coalesceNs < int64(45*time.Millisecond) {
-				coalesceNs = int64(45 * time.Millisecond)
+			if now-lastBatchAt < int64(250*time.Millisecond) && coalesceNs < int64(85*time.Millisecond) {
+				coalesceNs = int64(85 * time.Millisecond)
 			}
 			coalesceUntil := now + coalesceNs
 			for wb.count < blowfish8.Lanes {

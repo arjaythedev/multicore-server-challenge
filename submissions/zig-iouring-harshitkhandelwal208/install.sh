@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Installs the Zig toolchain (official tarball, checksum verified). Run once as root on a clean Ubuntu 24.04.
 set -euo pipefail
+# libdeflate's stable C API supplies optional, independently decodable gzip.
+export DEBIAN_FRONTEND=noninteractive
+apt-get install -y -q libdeflate-dev >/dev/null
 ZIG_VERSION=0.17.0
 ZIG_SHA256=1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
 ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"

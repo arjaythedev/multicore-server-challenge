@@ -71,7 +71,7 @@ pub const Sink = struct {
 
 const qcap = 4096;
 /// Challenge generator client timeout is 10 s; drop work that waited >= 9.5 s to avoid wasting hashing CPU.
-const stale_ns: u64 = 9500 * std.time.ns_per_ms;
+const default_stale_ns: u64 = 9500 * std.time.ns_per_ms;
 
 pub const Pool = struct {
     mu: sync.Mutex = .{},
@@ -81,6 +81,9 @@ pub const Pool = struct {
     count: usize = 0,
     lanes: usize,
     wait_ns: u64,
+    idle_ns: u64 = 0,
+    stale_ns: u64 = default_stale_ns,
+    last_done_ns: u64 = 0,
 
     pub fn submit(self: *Pool, job: Job) bool {
         var j = job;
@@ -130,7 +133,8 @@ pub const Pool = struct {
             };
             const lanes = @min(self.lanes, bcrypt.max_lanes);
             const age = sys.nowNs() -| self.at(0).enqueued_ns;
-            const ready = same >= lanes or age >= self.wait_ns;
+            const idle = self.idle_ns != 0 and sys.nowNs() -| self.last_done_ns >= self.idle_ns;
+            const ready = same >= lanes or age >= self.wait_ns or (index == 0 and idle);
             if (!ready) {
                 self.mu.unlock();
                 if (index == 0) self.sig.wait(seen, self.wait_ns - age) else self.sig.wait(seen, self.wait_ns);
@@ -154,7 +158,7 @@ pub const Pool = struct {
             const now = sys.nowNs();
             var live: usize = 0;
             for (0..n) |k| {
-                if (now -| batch[k].enqueued_ns > stale_ns) {
+                if (now -| batch[k].enqueued_ns > self.stale_ns) {
                     batch[k].sink.push(.{ .tag = batch[k].tag, .ok = false, .stale = true, .cost = batch[k].cost, .salt = batch[k].salt, .hash = undefined });
                 } else {
                     batch[live] = batch[k];
@@ -167,6 +171,9 @@ pub const Pool = struct {
                 bj[k] = .{ .password = batch[k].password[0..batch[k].plen], .salt = batch[k].salt, .cost = batch[k].cost };
             }
             bcrypt.hashBatch(bj[0..n]);
+            self.mu.lock();
+            self.last_done_ns = sys.nowNs();
+            self.mu.unlock();
             for (0..n) |k| {
                 const ok = switch (batch[k].kind) {
                     .hash => true,
@@ -179,7 +186,7 @@ pub const Pool = struct {
 
     pub fn start(self: *Pool, threads: usize) !void {
         for (0..threads) |i| {
-            const t = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, worker, .{ self, i });
+            const t = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, worker, .{ self, i });
             t.detach();
         }
     }
