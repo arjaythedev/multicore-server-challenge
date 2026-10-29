@@ -24,7 +24,9 @@ apt-get install -y -q --no-install-recommends "$TMP/$USERVER_DEB" libcrypt-dev
 # runners) apt installs libpq 18 instead, which can't be mixed with the PostgreSQL 16 libpgcommon/userver objects.
 # So unpack Ubuntu's libpq-dev 16 next to it (not installed: libpq5 18 stays as it is) for CMakeLists.txt to use.
 LIBPQ16_DIR=/opt/conduit/libpq16
-LIBPQ16_VERSION="$(apt-cache madison libpq-dev | awk -F'|' '$2 ~ /^ *16\..*ubuntu/ {gsub(/ /, "", $2); print $2; exit}')"
+# awk reads all of apt-cache's output (no early exit): quitting early would kill apt-cache with SIGPIPE, and
+# pipefail + set -e would then end this script silently.
+LIBPQ16_VERSION="$(apt-cache madison libpq-dev | awk -F'|' '!v && $2 ~ /^ *16\..*ubuntu/ {v = $2; gsub(/ /, "", v)} END {print v}')"
 [ -n "$LIBPQ16_VERSION" ] || { echo "no libpq-dev 16 in the Ubuntu archive"; exit 1; }
 (cd "$TMP" && apt-get download -q "libpq-dev=$LIBPQ16_VERSION")
 rm -rf "$LIBPQ16_DIR" && mkdir -p "$LIBPQ16_DIR"
@@ -33,7 +35,7 @@ chmod -R a+rX /opt/conduit
 test -f "$LIBPQ16_DIR/usr/lib/x86_64-linux-gnu/libpq.a"
 test -f /usr/lib/postgresql/16/lib/libpgcommon.a   # postgresql-server-dev-16, a dependency of the userver package
 
-g++ --version | head -1
-cmake --version | head -1
+g++ --version | sed -n 1p
+cmake --version | sed -n 1p
 dpkg-query -W libuserver-all-dev libpq-dev postgresql-server-dev-16 libssl-dev libcrypt-dev
 echo "libpq for userver: libpq-dev $LIBPQ16_VERSION in $LIBPQ16_DIR"
