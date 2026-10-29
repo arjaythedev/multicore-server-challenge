@@ -113,6 +113,8 @@ static BATCH_LOCK: Mutex<()> = Mutex::new(());
 static BUSY_READ_WORKERS: AtomicUsize = AtomicUsize::new(0);
 static EWMA_BATCH_US: AtomicUsize = AtomicUsize::new(0);
 static EWMA_BATCH_LEN: AtomicUsize = AtomicUsize::new(0);
+static CRYPTO_LOCK: Mutex<()> = Mutex::new(());
+static BUSY_CRYPTO_WORKERS: AtomicUsize = AtomicUsize::new(0);
 static EWMA_BCRYPT_US: AtomicUsize = AtomicUsize::new(0);
 pub static WRITE_QUEUE: WorkQueue<WriteTask> = WorkQueue::new();
 pub static CRYPTO_QUEUE: WorkQueue<CryptoTask> = WorkQueue::new();
@@ -752,7 +754,7 @@ impl ReadWorker {
                                 image: clone_cell_bytes(pa, r[5]),
                             };
                             let hash = clone_cell_bytes(pa, r[6]).unwrap_or_default();
-                            CRYPTO_QUEUE.push_broadcast(CryptoTask::VerifyLogin {
+                            CRYPTO_QUEUE.push(CryptoTask::VerifyLogin {
                                 password: pw,
                                 hash,
                                 user,
@@ -1978,40 +1980,38 @@ fn finalize_write_task(
     }
 }
 
-pub fn run_crypto_worker(cfg: &'static RuntimeConfig, worker_idx: usize) {
-    let mut batch: Vec<CryptoTask> = Vec::new();
+pub fn run_crypto_worker(cfg: &'static RuntimeConfig) {
+    let mut batch: Vec<CryptoTask> = Vec::with_capacity(cfg.bcrypt_lanes.max(1));
+    let mut non_std: Vec<CryptoTask> = Vec::new();
     let lanes = cfg.bcrypt_lanes.max(1);
     loop {
         batch.clear();
-        if worker_idx == 0 {
-            let tau_us = EWMA_BCRYPT_US.load(Ordering::Relaxed);
-            let wait_us = tau_us / (lanes * lanes);
-            CRYPTO_QUEUE.drain_coalesced(
+        {
+            let _token = CRYPTO_LOCK.lock().unwrap();
+            CRYPTO_QUEUE.drain_crypto_bbr(
                 lanes,
-                Duration::from_micros(wait_us as u64),
-                lanes,
+                &BUSY_CRYPTO_WORKERS,
+                &EWMA_BCRYPT_US,
                 &mut batch,
             );
-        } else {
-            CRYPTO_QUEUE.drain_exact(lanes, &mut batch);
+            BUSY_CRYPTO_WORKERS.fetch_add(1, Ordering::AcqRel);
         }
         let t0 = Instant::now();
-        let mut standard = std::mem::take(&mut batch);
-        let mut non_std: Vec<CryptoTask> = Vec::new();
+        non_std.clear();
         let mut i = 0;
-        while i < standard.len() {
-            let cost = match &standard[i] {
+        while i < batch.len() {
+            let cost = match &batch[i] {
                 CryptoTask::VerifyLogin { hash, .. } => auth::parse_bcrypt(hash).map(|p| p.cost),
                 CryptoTask::HashPassword { .. } => Some(10),
             };
             if cost != Some(10) {
-                non_std.push(standard.swap_remove(i));
+                non_std.push(batch.swap_remove(i));
             } else {
                 i += 1;
             }
         }
-        let had_std = !standard.is_empty();
-        execute_bcrypt_batch(standard, cfg, 10);
+        let had_std = !batch.is_empty();
+        execute_bcrypt_batch(&mut batch, cfg, 10);
         if had_std {
             let elapsed_us = t0.elapsed().as_micros() as usize;
             let prev = EWMA_BCRYPT_US.load(Ordering::Relaxed);
@@ -2022,13 +2022,18 @@ pub fn run_crypto_worker(cfg: &'static RuntimeConfig, worker_idx: usize) {
             };
             EWMA_BCRYPT_US.store(next, Ordering::Relaxed);
         }
-        for task in non_std {
+        let mut single: Vec<CryptoTask> = Vec::new();
+        for task in non_std.drain(..) {
             let cost = match &task {
                 CryptoTask::VerifyLogin { hash, .. } => auth::parse_bcrypt(hash).map(|p| p.cost),
                 _ => Some(10),
             };
             match cost {
-                Some(c) => execute_bcrypt_batch(vec![task], cfg, c),
+                Some(c) => {
+                    single.clear();
+                    single.push(task);
+                    execute_bcrypt_batch(&mut single, cfg, c);
+                }
                 None => {
                     if let CryptoTask::VerifyLogin { addr, .. } = task {
                         reactor::complete_one(addr, 401, reactor::make_error_json("invalid credentials"));
@@ -2036,16 +2041,19 @@ pub fn run_crypto_worker(cfg: &'static RuntimeConfig, worker_idx: usize) {
                 }
             }
         }
+        if BUSY_CRYPTO_WORKERS.fetch_sub(1, Ordering::AcqRel) == 1 {
+            CRYPTO_QUEUE.notify();
+        }
     }
 }
 
-fn execute_bcrypt_batch(tasks: Vec<CryptoTask>, cfg: &RuntimeConfig, cost: u32) {
+fn execute_bcrypt_batch(tasks: &mut Vec<CryptoTask>, cfg: &RuntimeConfig, cost: u32) {
     if tasks.is_empty() {
         return;
     }
     let mut salts: Vec<[u8; 16]> = Vec::with_capacity(tasks.len());
     let mut expected: Vec<Option<[u8; 23]>> = Vec::with_capacity(tasks.len());
-    for t in &tasks {
+    for t in tasks.iter() {
         match t {
             CryptoTask::VerifyLogin { hash, .. } => {
                 let parsed = auth::parse_bcrypt(hash).expect("validated hash");
@@ -2060,16 +2068,18 @@ fn execute_bcrypt_batch(tasks: Vec<CryptoTask>, cfg: &RuntimeConfig, cost: u32) 
             }
         }
     }
-    let passwords: Vec<&[u8]> = tasks
-        .iter()
-        .map(|t| match t {
-            CryptoTask::VerifyLogin { password, .. } | CryptoTask::HashPassword { password, .. } => {
-                password.as_slice()
-            }
-        })
-        .collect();
-    let digests = dispatch_lanes(&passwords, &salts, cost);
-    for (((task, digest), salt), exp) in tasks.into_iter().zip(digests).zip(salts).zip(expected) {
+    let digests = {
+        let passwords: Vec<&[u8]> = tasks
+            .iter()
+            .map(|t| match t {
+                CryptoTask::VerifyLogin { password, .. } | CryptoTask::HashPassword { password, .. } => {
+                    password.as_slice()
+                }
+            })
+            .collect();
+        dispatch_lanes(&passwords, &salts, cost)
+    };
+    for (((task, digest), salt), exp) in tasks.drain(..).zip(digests).zip(salts).zip(expected) {
         match task {
             CryptoTask::VerifyLogin { user, addr, .. } => {
                 if auth::ct_digest_eq(&digest, &exp.unwrap()) {

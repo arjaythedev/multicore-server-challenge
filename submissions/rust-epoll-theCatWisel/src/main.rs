@@ -28,7 +28,7 @@ fn main() {
     let io_workers: usize = env_parse("IO_THREADS", (cores / 2).max(2));
     let read_workers: usize = env_parse("READ_LANES", (cores + cores / 2).max(4));
     let write_workers: usize = env_parse("WRITE_LANES", 1);
-    let crypto_workers: usize = env_parse("BCRYPT_THREADS", (cores / 4).max(2));
+    let crypto_workers: usize = env_parse("BCRYPT_THREADS", cores.max(4));
 
     let signer: &'static auth::TokenSigner = Box::leak(Box::new(auth::TokenSigner::new(jwt_secret.as_bytes())));
     let cfg: &'static engine::RuntimeConfig = Box::leak(Box::new(engine::RuntimeConfig {
@@ -69,10 +69,10 @@ fn main() {
             .spawn(move || worker.run_loop())
             .unwrap();
     }
-    for idx in 0..crypto_workers {
+    for _ in 0..crypto_workers {
         std::thread::Builder::new()
             .name("crypto".into())
-            .spawn(move || engine::run_crypto_worker(cfg, idx))
+            .spawn(move || engine::run_crypto_worker(cfg))
             .unwrap();
     }
 

@@ -25,9 +25,8 @@ impl<T> WorkQueue<T> {
         self.ready.notify_one();
     }
 
-    pub fn push_broadcast(&self, item: T) {
-        self.items.lock().unwrap().push_back(item);
-        self.ready.notify_all();
+    pub fn notify(&self) {
+        self.ready.notify_one();
     }
 
     pub fn drain_up_to(&self, max_items: usize, dst: &mut Vec<T>) {
@@ -42,33 +41,35 @@ impl<T> WorkQueue<T> {
         }
     }
 
-    pub fn drain_exact(&self, target: usize, dst: &mut Vec<T>) {
-        let mut q = self.items.lock().unwrap();
-        while q.len() < target {
-            q = self.ready.wait(q).unwrap();
-        }
-        dst.extend(q.drain(..target));
-        if !q.is_empty() {
-            self.ready.notify_all();
-        }
-    }
-
-    pub fn drain_coalesced(&self, min_items: usize, window: Duration, max_items: usize, dst: &mut Vec<T>) {
+    pub fn drain_crypto_bbr(
+        &self,
+        lanes: usize,
+        busy_workers: &std::sync::atomic::AtomicUsize,
+        ewma_us: &std::sync::atomic::AtomicUsize,
+        dst: &mut Vec<T>,
+    ) {
+        use std::sync::atomic::Ordering;
         let mut q = self.items.lock().unwrap();
         while q.is_empty() {
             q = self.ready.wait(q).unwrap();
         }
-        if !window.is_zero() && q.len() < min_items {
-            let deadline = Instant::now() + window;
-            while q.len() < min_items {
-                let now = Instant::now();
-                if now >= deadline {
-                    break;
-                }
-                q = self.ready.wait_timeout(q, deadline - now).unwrap().0;
+        let first_at = Instant::now();
+        while q.len() < lanes {
+            let busy = busy_workers.load(Ordering::Acquire);
+            let tau_us = ewma_us.load(Ordering::Relaxed);
+            let target_us = if busy == 0 {
+                tau_us / (lanes * lanes)
+            } else {
+                tau_us.max(20_000)
+            };
+            let window = Duration::from_micros(target_us as u64);
+            let elapsed = first_at.elapsed();
+            if elapsed >= window {
+                break;
             }
+            q = self.ready.wait_timeout(q, window - elapsed).unwrap().0;
         }
-        let take_n = q.len().min(max_items);
+        let take_n = q.len().min(lanes);
         dst.extend(q.drain(..take_n));
         if !q.is_empty() {
             self.ready.notify_one();
@@ -578,7 +579,7 @@ fn handle_register(body: &[u8], addr: ReplyAddr) -> Dispatch {
         viewer: 0,
         addr,
     };
-    engine::CRYPTO_QUEUE.push_broadcast(CryptoTask::HashPassword {
+    engine::CRYPTO_QUEUE.push(CryptoTask::HashPassword {
         password: password.into_bytes(),
         write: task,
     });
@@ -630,7 +631,7 @@ fn handle_update_user(body: &[u8], uid: i64, token: String, addr: ReplyAddr) -> 
     match password {
         Some(pw) if pw.len() > BCRYPT_MAX_BYTES => fail_now(422, "password exceeds maximum length"),
         Some(pw) => {
-            engine::CRYPTO_QUEUE.push_broadcast(CryptoTask::HashPassword {
+            engine::CRYPTO_QUEUE.push(CryptoTask::HashPassword {
                 password: pw.into_bytes(),
                 write: WriteTask {
                     op,
