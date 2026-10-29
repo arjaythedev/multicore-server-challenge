@@ -56,13 +56,13 @@ internal sealed partial class Api
     // POST /api/articles/{slug}/comments
     private async Task CreateComment(HttpContext ctx, long viewer, string slug)
     {
-        var body = await Http.ReadWrapper(ctx, "comment");
-        if (body is null)
+        using var body = await Http.ReadWrapper(ctx, "comment");
+        if (!body.IsValid)
         {
             await Http.Error(ctx, 422, "invalid body");
             return;
         }
-        if (!Http.ReqString(body.Value, "body", out var text))
+        if (!Http.ReqString(body.Element, "body"u8, out var text))
         {
             await Http.Error(ctx, 422, "body is required");
             return;

@@ -6,12 +6,9 @@ using Microsoft.IdentityModel.Tokens;
 
 namespace Conduit;
 
-/// <summary>HS256 JWTs (Microsoft.IdentityModel.JsonWebTokens) and bcrypt cost 10 (BCrypt.Net-Next).</summary>
+/// <summary>HS256 JWTs (Microsoft.IdentityModel.JsonWebTokens). Passwords are in Bcrypt.cs.</summary>
 internal sealed class Auth
 {
-    private const int BcryptCost = 10;
-    private const int BcryptMaxBytes = 72;
-
     private readonly JsonWebTokenHandler handler = new();
     private readonly SigningCredentials credentials;
     private readonly TokenValidationParameters parameters;
@@ -73,24 +70,5 @@ internal sealed class Auth
         {
             return (0, "", true);
         }
-    }
-
-    /// <summary>False for passwords bcrypt cannot hash (over 72 bytes).</summary>
-    internal static bool TryHash(string password, out string hash)
-    {
-        if (Encoding.UTF8.GetByteCount(password) > BcryptMaxBytes)
-        {
-            hash = "";
-            return false;
-        }
-        hash = BCrypt.Net.BCrypt.HashPassword(password, BcryptCost);
-        return true;
-    }
-
-    internal static bool Verify(string password, string hash)
-    {
-        if (Encoding.UTF8.GetByteCount(password) > BcryptMaxBytes) return false;
-        try { return BCrypt.Net.BCrypt.Verify(password, hash); }
-        catch (Exception) { return false; }
     }
 }

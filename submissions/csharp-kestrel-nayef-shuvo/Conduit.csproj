@@ -8,8 +8,11 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks> <!-- Bcrypt.cs calls libcrypt through pointers -->
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <!-- Benchmarks/ is its own project (BenchmarkDotNet); its files must not become part of the server. -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);Benchmarks/**</DefaultItemExcludes>
   </PropertyGroup>
 
   <!-- Native AOT: `dotnet publish` produces one native executable (bin/conduit), no JIT, no runtime install needed.
@@ -36,7 +39,6 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="BCrypt.Net-Next" Version="4.2.0" />
     <PackageReference Include="Microsoft.IdentityModel.JsonWebTokens" Version="8.23.0" />
     <PackageReference Include="Npgsql" Version="10.0.3" />
   </ItemGroup>

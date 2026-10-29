@@ -2,17 +2,11 @@
   "version": 1,
   "dependencies": {
     "net10.0": {
-      "BCrypt.Net-Next": {
-        "type": "Direct",
-        "requested": "[4.2.0, )",
-        "resolved": "4.2.0",
-        "contentHash": "gwLD2KfCuwQesP17aVh4h6lpiMPEVt5Lbpndo0ej903hNUUTtyxt3ARdDjmuydBRTAUICc7OVKVbaOvc6SQYXA=="
-      },
       "Microsoft.DotNet.ILCompiler": {
         "type": "Direct",
         "requested": "[10.0.13, )",
         "resolved": "10.0.13",
-        "contentHash": "3LSxwg95jNRELGZreyIK84BivcXWHKZl8vdBy+rNRbYyCSR7Q9ElfrdOEIyuKDi+GWfNaSFN2xNGC7LOHoV3xg=="
+        "contentHash": "MnT222WlxhelguLZTQx9soBHKW7TeY6A9YUwVaprjUd+ARlhLAkfsXGFNX9w6kRq89/yxUcAQ/lzvmgndSFfOw=="
       },
       "Microsoft.IdentityModel.JsonWebTokens": {
         "type": "Direct",
@@ -27,7 +21,7 @@
         "type": "Direct",
         "requested": "[10.0.13, )",
         "resolved": "10.0.13",
-        "contentHash": "ai5IkEv0BKUr0CHVzKso6xrvXDF14IqMQi8GTU4TEjYS5yQWUSI1ubYi/sRsB1Akl5XExBzGzNcMHX4j88oBEA=="
+        "contentHash": "40yrBMsLEcjixBR4G+FiUaBPvxXIPSKJ2OgSrbOZcmSDBda4Sb0k7BWrfDpIvn3IvvDzwOL/tEPa6gDQfh6aRw=="
       },
       "Npgsql": {
         "type": "Direct",
@@ -63,6 +57,21 @@
         }
       }
     },
-    "net10.0/linux-x64": {}
+    "net10.0/linux-x64": {
+      "Microsoft.DotNet.ILCompiler": {
+        "type": "Direct",
+        "requested": "[10.0.13, )",
+        "resolved": "10.0.13",
+        "contentHash": "MnT222WlxhelguLZTQx9soBHKW7TeY6A9YUwVaprjUd+ARlhLAkfsXGFNX9w6kRq89/yxUcAQ/lzvmgndSFfOw==",
+        "dependencies": {
+          "runtime.linux-x64.Microsoft.DotNet.ILCompiler": "10.0.13"
+        }
+      },
+      "runtime.linux-x64.Microsoft.DotNet.ILCompiler": {
+        "type": "Transitive",
+        "resolved": "10.0.13",
+        "contentHash": "cyR6nLIi+teN7+T6pYDeeoVRTzz4RQYimON6CxqvRVTylz0XVCWj/wcfa1IsI4yR/3zKkX6hfR4E2cEuAit49A=="
+      }
+    }
   }
 }

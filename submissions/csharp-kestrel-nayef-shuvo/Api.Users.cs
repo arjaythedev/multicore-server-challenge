@@ -21,22 +21,23 @@ internal sealed partial class Api
     // POST /api/users
     private async Task Register(HttpContext ctx)
     {
-        var body = await Http.ReadWrapper(ctx, "user");
-        if (body is null)
+        using var body = await Http.ReadWrapper(ctx, "user");
+        if (!body.IsValid)
         {
             await Http.Error(ctx, 422, "invalid body");
             return;
         }
-        var u = body.Value;
-        var okUsername = Http.ReqString(u, "username", out var username);
-        var okEmail = Http.ReqString(u, "email", out var email);
-        var okPassword = Http.ReqString(u, "password", out var password);
+        var u = body.Element;
+        var okUsername = Http.ReqString(u, "username"u8, out var username);
+        var okEmail = Http.ReqString(u, "email"u8, out var email);
+        var okPassword = Http.ReqString(u, "password"u8, out var password);
         if (!okUsername || !okEmail || !okPassword)
         {
             await Http.Error(ctx, 422, "username, email and password are required");
             return;
         }
-        if (!Auth.TryHash(password, out var hash))
+        var hash = await Bcrypt.HashAsync(password);
+        if (hash is null)
         {
             await Http.Error(ctx, 422, "password is too long");
             return;
@@ -70,14 +71,14 @@ RETURNING id, username, email, bio, image");
     // POST /api/users/login
     private async Task Login(HttpContext ctx)
     {
-        var body = await Http.ReadWrapper(ctx, "user");
-        if (body is null)
+        using var body = await Http.ReadWrapper(ctx, "user");
+        if (!body.IsValid)
         {
             await Http.Error(ctx, 422, "invalid body");
             return;
         }
-        var okEmail = Http.ReqString(body.Value, "email", out var email);
-        var okPassword = Http.ReqString(body.Value, "password", out var password);
+        var okEmail = Http.ReqString(body.Element, "email"u8, out var email);
+        var okPassword = Http.ReqString(body.Element, "password"u8, out var password);
         if (!okEmail || !okPassword)
         {
             await Http.Error(ctx, 422, "email and password are required");
@@ -103,7 +104,7 @@ RETURNING id, username, email, bio, image");
             image = r.GetNullableString(4);
             hash = r.GetString(5);
         }
-        if (!Auth.Verify(password, hash))
+        if (!await Bcrypt.VerifyAsync(password, hash))
         {
             await Http.Error(ctx, 401, "invalid email or password");
             return;
@@ -128,25 +129,25 @@ RETURNING id, username, email, bio, image");
     // PUT /api/user
     private async Task UpdateUser(HttpContext ctx, long viewer, string token)
     {
-        var body = await Http.ReadWrapper(ctx, "user");
-        if (body is null)
+        using var body = await Http.ReadWrapper(ctx, "user");
+        if (!body.IsValid)
         {
             await Http.Error(ctx, 422, "invalid body");
             return;
         }
-        var u = body.Value;
-        var ok = Http.OptString(u, "email", true, out var email)
-               & Http.OptString(u, "username", true, out var username)
-               & Http.OptString(u, "password", true, out var password)
-               & Http.OptString(u, "bio", false, out var bio)
-               & Http.OptString(u, "image", false, out var image);
+        var u = body.Element;
+        var ok = Http.OptString(u, "email"u8, true, out var email)
+               & Http.OptString(u, "username"u8, true, out var username)
+               & Http.OptString(u, "password"u8, true, out var password)
+               & Http.OptString(u, "bio"u8, false, out var bio)
+               & Http.OptString(u, "image"u8, false, out var image);
         if (!ok)
         {
             await Http.Error(ctx, 422, "invalid user fields");
             return;
         }
         string? hash = null;
-        if (password != null && !Auth.TryHash(password, out hash))
+        if (password != null && (hash = await Bcrypt.HashAsync(password)) is null)
         {
             await Http.Error(ctx, 422, "password is too long");
             return;

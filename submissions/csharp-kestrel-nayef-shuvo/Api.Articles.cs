@@ -181,16 +181,16 @@ internal sealed partial class Api
     // POST /api/articles
     private async Task CreateArticle(HttpContext ctx, long viewer, string _)
     {
-        var body = await Http.ReadWrapper(ctx, "article");
-        if (body is null)
+        using var body = await Http.ReadWrapper(ctx, "article");
+        if (!body.IsValid)
         {
             await Http.Error(ctx, 422, "invalid body");
             return;
         }
-        var a = body.Value;
-        var okTitle = Http.ReqString(a, "title", out var title);
-        var okDescription = Http.ReqString(a, "description", out var description);
-        var okBody = Http.ReqString(a, "body", out var text);
+        var a = body.Element;
+        var okTitle = Http.ReqString(a, "title"u8, out var title);
+        var okDescription = Http.ReqString(a, "description"u8, out var description);
+        var okBody = Http.ReqString(a, "body"u8, out var text);
         if (!okTitle || !okDescription || !okBody)
         {
             await Http.Error(ctx, 422, "title, description and body are required");
@@ -199,7 +199,7 @@ internal sealed partial class Api
 
         // tagList is optional: an array of non-empty strings.
         var tags = new List<string>();
-        if (a.TryGetProperty("tagList", out var tagList) && tagList.ValueKind != JsonValueKind.Null)
+        if (a.TryGetProperty("tagList"u8, out var tagList) && tagList.ValueKind != JsonValueKind.Null)
         {
             if (tagList.ValueKind != JsonValueKind.Array)
             {
@@ -279,15 +279,15 @@ internal sealed partial class Api
     // PUT /api/articles/{slug}
     private async Task UpdateArticle(HttpContext ctx, long viewer, string slug)
     {
-        var body = await Http.ReadWrapper(ctx, "article");
-        if (body is null)
+        using var body = await Http.ReadWrapper(ctx, "article");
+        if (!body.IsValid)
         {
             await Http.Error(ctx, 422, "invalid body");
             return;
         }
-        var ok = Http.OptString(body.Value, "title", true, out var title)
-               & Http.OptString(body.Value, "description", true, out var description)
-               & Http.OptString(body.Value, "body", true, out var text);
+        var ok = Http.OptString(body.Element, "title"u8, true, out var title)
+               & Http.OptString(body.Element, "description"u8, true, out var description)
+               & Http.OptString(body.Element, "body"u8, true, out var text);
         if (!ok)
         {
             await Http.Error(ctx, 422, "title, description and body must be non-empty strings");

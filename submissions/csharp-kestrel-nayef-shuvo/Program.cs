@@ -24,6 +24,17 @@ if (!int.TryParse(EnvOr("DB_POOL_SIZE", defaultPool.ToString()), out var poolSiz
     return 1;
 }
 
+// Check our bcrypt against known answers now (every lane count), not on the first login.
+try
+{
+    Bcrypt.SelfTest();
+}
+catch (Exception e)
+{
+    Console.Error.WriteLine($"bcrypt is not usable: {e.Message}");
+    return 1;
+}
+
 var host = EnvOr("HOST", "127.0.0.1");
 var port = EnvOr("PORT", "3000");
 
