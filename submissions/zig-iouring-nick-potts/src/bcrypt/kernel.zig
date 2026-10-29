@@ -2,7 +2,9 @@
 //! dependent S-box lookups of every lane overlap. Each lane is full bcrypt at the batch's cost.
 const consts = @import("bf_consts.zig");
 
-pub const KernelFn = *const fn ([*]const [18]u32, [*]const [4]u32, u32, [*][6]u32) callconv(.c) void;
+/// Hashes N lanes. `stop`, if given, is read once a round of the cost loop: nonzero stops the hash, which returns false
+/// with `out` undefined.
+pub const KernelFn = *const fn ([*]const [18]u32, [*]const [4]u32, u32, [*][6]u32, ?*const u32) callconv(.c) bool;
 /// A hand-written expand0state over all N lanes' states (asm_gen.zig).
 pub const Expand0Fn = *const fn (*anyopaque) callconv(.c) void;
 
@@ -91,7 +93,7 @@ pub fn Kernel(comptime N: usize, comptime expand0: ?Expand0Fn) type {
         }
 
         /// `kw`, `sw` and `out` hold `N` entries.
-        pub fn run(kw: [*]const [18]u32, sw: [*]const [4]u32, cost: u32, out: [*][6]u32) callconv(.c) void {
+        pub fn run(kw: [*]const [18]u32, sw: [*]const [4]u32, cost: u32, out: [*][6]u32, stop: ?*const u32) callconv(.c) bool {
             @setEvalBranchQuota(1_000_000);
             var g: G = undefined;
             g.init(kw, sw);
@@ -99,6 +101,7 @@ pub fn Kernel(comptime N: usize, comptime expand0: ?Expand0Fn) type {
             const rounds = @as(u64, 1) << @intCast(cost);
             var r: u64 = 0;
             while (r < rounds) : (r += 1) {
+                if (stop) |f| if (@atomicLoad(u32, f, .monotonic) != 0) return false;
                 g.expand(false, false);
                 g.expand(true, false);
             }
@@ -119,6 +122,7 @@ pub fn Kernel(comptime N: usize, comptime expand0: ?Expand0Fn) type {
                 }
             }
             inline for (0..N) |u| out[u] = g.c[u];
+            return true;
         }
     };
 }

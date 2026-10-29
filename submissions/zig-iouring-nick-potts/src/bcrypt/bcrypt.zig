@@ -8,7 +8,7 @@
 const std = @import("std");
 pub const cpu = @import("cpu.zig");
 
-pub const KernelFn = *const fn ([*]const [18]u32, [*]const [4]u32, u32, [*][6]u32) callconv(.c) void;
+pub const KernelFn = *const fn ([*]const [18]u32, [*]const [4]u32, u32, [*][6]u32, ?*const u32) callconv(.c) bool;
 
 pub const max_lanes = 8;
 pub const min_calibrated_lanes = 4;
@@ -159,10 +159,11 @@ pub fn matches(computed: *const Hash, stored: []const u8) bool {
     return std.crypto.timing_safe.eql(Hash, computed.*, stored[0..60].*);
 }
 
-pub const HashError = error{MixedCost};
+pub const HashError = error{ MixedCost, Abandoned };
 
-/// Hashes `jobs` (1..max_lanes, one cost) in one call of `v`'s kernel of exactly that width.
-pub fn hashWith(v: *const Variant, jobs: []const Job, out: []Hash) HashError!void {
+/// Hashes `jobs` (1..max_lanes, one cost) in one call of `v`'s kernel of exactly that width. `stop`, if given, is read
+/// once a round: nonzero abandons the batch (error.Abandoned, `out` undefined).
+pub fn hashWith(v: *const Variant, jobs: []const Job, out: []Hash, stop: ?*const u32) HashError!void {
     std.debug.assert(jobs.len >= 1 and jobs.len <= max_lanes and out.len >= jobs.len);
     var kw: [max_lanes][18]u32 = undefined;
     var sw: [max_lanes][4]u32 = undefined;
@@ -173,7 +174,7 @@ pub fn hashWith(v: *const Variant, jobs: []const Job, out: []Hash) HashError!voi
         kw[l] = keyWords(job.password);
         sw[l] = job.setting.salt;
     }
-    v.width(jobs.len)(&kw, &sw, c, &ct);
+    if (!v.width(jobs.len)(&kw, &sw, c, &ct, stop)) return error.Abandoned;
     for (jobs, 0..) |job, l| {
         var raw: [24]u8 = undefined;
         for (0..6) |j| std.mem.writeInt(u32, raw[4 * j ..][0..4], ct[l][j], .big);
@@ -189,9 +190,9 @@ pub const Engine = struct {
     cpu_ms_per_hash: f64,
 
     /// `jobs.len` may be anything from 1 to `lanes`; a short batch runs the kernel of its own width.
-    pub fn hash(e: Engine, jobs: []const Job, out: []Hash) HashError!void {
+    pub fn hash(e: Engine, jobs: []const Job, out: []Hash, stop: ?*const u32) HashError!void {
         std.debug.assert(jobs.len <= e.lanes);
-        return hashWith(e.variant, jobs, out);
+        return hashWith(e.variant, jobs, out, stop);
     }
 };
 
@@ -223,7 +224,7 @@ pub fn selfTest(set: []const Variant, failure: *Failure) SelfTestError!void {
         for (known, 0..) |k, i| {
             const st = parseSetting(k.hash).?;
             var h: [1]Hash = undefined;
-            try hashWith(v, &.{.{ .password = k.pw, .setting = &st }}, &h);
+            try hashWith(v, &.{.{ .password = k.pw, .setting = &st }}, &h, null);
             if (!std.mem.eql(u8, &h[0], k.hash)) {
                 failure.* = .{ .variant = v.name, .width = 1, .case = i };
                 return error.KnownVectorMismatch;
@@ -244,7 +245,7 @@ pub fn selfTest(set: []const Variant, failure: *Failure) SelfTestError!void {
         jobs[l] = .{ .password = pwbuf[l][0..len], .setting = &settings[l] };
     }
     var expect: [max_lanes]Hash = undefined;
-    for (0..max_lanes) |l| try hashWith(&set[0], jobs[l..][0..1], expect[l..][0..1]);
+    for (0..max_lanes) |l| try hashWith(&set[0], jobs[l..][0..1], expect[l..][0..1], null);
     for (set) |*v| {
         for (1..max_lanes + 1) |n| {
             var got: [max_lanes]Hash = undefined;
@@ -256,7 +257,7 @@ pub fn selfTest(set: []const Variant, failure: *Failure) SelfTestError!void {
                     batch[l] = jobs[(l + shift) % max_lanes];
                     want[l] = expect[(l + shift) % max_lanes];
                 }
-                try hashWith(v, batch[0..n], got[0..n]);
+                try hashWith(v, batch[0..n], got[0..n], null);
                 for (0..n) |l| if (!std.mem.eql(u8, &got[l], &want[l])) {
                     failure.* = .{ .variant = v.name, .width = n, .case = l };
                     return error.WidthMismatch;
@@ -289,7 +290,7 @@ pub fn timeWidth(v: *const Variant, n: usize) f64 {
         random.bytes(std.mem.asBytes(&sw[l]));
     }
     const t0 = nowNs(.THREAD_CPUTIME_ID);
-    v.width(n)(&kw, &sw, cost, &ct);
+    _ = v.width(n)(&kw, &sw, cost, &ct, null);
     const ns = nowNs(.THREAD_CPUTIME_ID) - t0;
     return @as(f64, @floatFromInt(ns)) / 1e6 / @as(f64, @floatFromInt(n));
 }
@@ -348,7 +349,7 @@ test "the portable fallback hashes like the reference" {
     const k = known[6];
     const st = parseSetting(k.hash).?;
     var h: [1]Hash = undefined;
-    try e.hash(&.{.{ .password = k.pw, .setting = &st }}, &h);
+    try e.hash(&.{.{ .password = k.pw, .setting = &st }}, &h, null);
     try std.testing.expectEqualStrings(k.hash, &h[0]);
 }
 

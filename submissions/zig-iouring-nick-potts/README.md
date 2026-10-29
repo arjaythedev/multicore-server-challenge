@@ -524,7 +524,13 @@ not the event loops, not Postgres, not the kernel's network softirq. The catch i
 come back. `RLIMIT_NICE` is 0 and there is no `CAP_SYS_NICE`; if `SCHED_IDLE` fails, the thread falls back to nice 19.
 On a saturated box an idle thread could starve forever. So one more hasher per worker, the watchdog (`bcrypt-watch`),
 stays at normal priority and takes any job still unfinished after the fill window plus two batches' CPU time (about
-1.09 s on one test box). Whichever finishes first answers.
+1.09 s on one test box). It takes a held-up hasher's batch whole, and that hasher drops its copy: the kernel reads a
+flag once a round of the cost loop. Jobs overdue in the queue go out in full batches, or in a short one once the
+oldest has been overdue for a whole fill window. An earlier version let the watchdog take single overdue jobs as they
+came and left the idle hashers finishing them too; whichever finished first answered. At 190,000 users on an aged
+database (a Synteq copy of the official box) that ran 1.7 cores of watchdog in short batches plus 0.6 cores of
+hashers on the same logins, kept the box at 100% and never let the feed lane recover, in one hold of two of the same
+build.
 
 **No locks between them.** The event loop owns the queue and hands each hasher its batch through a slot of its own,
 with an atomic state and a futex sleep. A starved idle thread holds nothing anyone else waits on, and nobody spins.
@@ -772,7 +778,7 @@ Measured on the development box with 3 CPUs at 42,000 users, against the gather 
 | Two parallel MEGAs | 10 ms clock, feeds in one MEGA and the rest in another, on two connections | About 0 µs/req | Collapsed in 2 of 2 holds at 154,000 on the receive-CPU-bound rig with five lanes. Back in this version as the feed lane (80 ms gap, eight lanes), to be judged on a Postgres-bound rig |
 | Key-sharded drains (offline) | Split each drain by key across connections | Kept 7–15% of the sharing gain, against a bar of ⅓ | Sharding by key destroys what MEGA shares. Sharding by kind kept 70–81% (−6 to −8% of MEGA CPU) but was the two-MEGA idea above |
 | Drain cap 1,024 | Smaller maximum drain | No gain | Kept 4,096 |
-| bcrypt watchdog without duplicates | Stop the watchdog re-hashing a job an idle thread holds | Watchdog hashed only 17 of 14,113 jobs; +0.5 µs/req | Nothing to save |
+| bcrypt watchdog without duplicates | Stop the watchdog re-hashing a job an idle thread holds | Watchdog hashed only 17 of 14,113 jobs; +0.5 µs/req | Nothing to save at that load. Taken up in this version after the aged 190,000-user hold, where the watchdog ran 1.7 cores (bcrypt section) |
 
 ### SQL (replay, Postgres CPU against the version before unless noted)
 
