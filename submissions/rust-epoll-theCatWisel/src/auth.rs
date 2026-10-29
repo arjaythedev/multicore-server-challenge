@@ -705,9 +705,11 @@ const BCRYPT_DEC: [u8; 256] = {
 };
 
 #[derive(Clone, Copy)]
+#[repr(align(64))]
 struct BfState {
     p: [u32; 18],
     s: [[u32; 256]; 4],
+    _pad: [u32; 14],
 }
 
 #[inline(always)]
@@ -845,11 +847,11 @@ pub fn bcrypt_lanes<const N: usize>(inputs: &[BcryptInput; N], cost: u32) -> [[u
     let salt_p: [[u32; 18]; N] = std::array::from_fn(|k| mats[k].salt18);
     let salt4: [[u32; 4]; N] = std::array::from_fn(|k| mats[k].salt4);
 
-    let mut st: Box<[BfState; N]> = vec![BfState { p: BF_P, s: BF_S }; N]
-        .into_boxed_slice()
-        .try_into()
-        .ok()
-        .unwrap();
+    let mut st: [BfState; N] = [BfState {
+        p: BF_P,
+        s: BF_S,
+        _pad: [0; 14],
+    }; N];
 
     eks_expand::<N, true>(&mut st, &key_p, &salt4);
     let rounds = 1u64 << cost;
@@ -880,6 +882,54 @@ pub fn bcrypt_lanes<const N: usize>(inputs: &[BcryptInput; N], cost: u32) -> [[u
         digests[k].copy_from_slice(&raw[..23]);
     }
     digests
+}
+
+pub fn detect_l1d_kb() -> usize {
+    if let Ok(raw) = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cache/index0/size") {
+        let s = raw.trim();
+        if let Some(num) = s.strip_suffix('K').or_else(|| s.strip_suffix('k')) {
+            if let Ok(kb) = num.parse::<usize>() {
+                if kb >= 16 && kb <= 512 {
+                    return kb;
+                }
+            }
+        }
+    }
+    32
+}
+
+pub fn calibrate_bcrypt_hardware() -> (usize, usize, usize) {
+    let l1d_kb = detect_l1d_kb();
+    let warm_in = [BcryptInput {
+        password: b"calibrate-warmup",
+        salt: [0x5au8; 16],
+    }];
+    std::hint::black_box(bcrypt_lanes::<1>(&warm_in, 5));
+
+    macro_rules! probe_n {
+        ($n:literal) => {{
+            let inputs: [BcryptInput; $n] = std::array::from_fn(|k| BcryptInput {
+                password: b"calibrate-benchmark-pw",
+                salt: [(k as u8).wrapping_mul(17).wrapping_add(3); 16],
+            });
+            let t0 = std::time::Instant::now();
+            std::hint::black_box(bcrypt_lanes::<$n>(&inputs, 8));
+            let us_cost8 = t0.elapsed().as_micros() as usize;
+            let us_cost10 = (us_cost8 * 4).max(1_000);
+            let per_hash_us = us_cost10 / $n;
+            ($n, us_cost10, per_hash_us)
+        }};
+    }
+
+    let candidates = [probe_n!(2), probe_n!(3), probe_n!(4), probe_n!(6)];
+    let mut best = candidates[0];
+    for cand in &candidates[1..] {
+        let state_kb = (cand.0 * std::mem::size_of::<BfState>()) / 1024;
+        if state_kb <= l1d_kb && cand.2 * 103 < best.2 * 100 {
+            best = *cand;
+        }
+    }
+    (best.0, best.1, l1d_kb)
 }
 
 fn encode_bcrypt_b64(src: &[u8], dst: &mut Vec<u8>) {

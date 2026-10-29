@@ -25,7 +25,34 @@ impl<T> WorkQueue<T> {
         self.ready.notify_one();
     }
 
+    pub fn push_front(&self, item: T) {
+        self.items.lock().unwrap().push_front(item);
+        self.ready.notify_one();
+    }
+
     pub fn notify(&self) {
+        self.ready.notify_one();
+    }
+
+    pub fn push_batch(&self, batch: &mut Vec<T>) {
+        if batch.is_empty() {
+            return;
+        }
+        let mut q = self.items.lock().unwrap();
+        q.extend(batch.drain(..));
+        drop(q);
+        self.ready.notify_one();
+    }
+
+    pub fn push_batch_front(&self, batch: &mut Vec<T>) {
+        if batch.is_empty() {
+            return;
+        }
+        let mut q = self.items.lock().unwrap();
+        for item in batch.drain(..).rev() {
+            q.push_front(item);
+        }
+        drop(q);
         self.ready.notify_one();
     }
 
@@ -44,6 +71,7 @@ impl<T> WorkQueue<T> {
     pub fn drain_crypto_bbr(
         &self,
         lanes: usize,
+        total_workers: usize,
         busy_workers: &std::sync::atomic::AtomicUsize,
         ewma_us: &std::sync::atomic::AtomicUsize,
         dst: &mut Vec<T>,
@@ -57,10 +85,11 @@ impl<T> WorkQueue<T> {
         while q.len() < lanes {
             let busy = busy_workers.load(Ordering::Acquire);
             let tau_us = ewma_us.load(Ordering::Relaxed);
+            let min_wait_us = (tau_us >> 6).max(500);
             let target_us = if busy == 0 {
-                tau_us / (lanes * lanes)
+                min_wait_us
             } else {
-                tau_us.max(20_000)
+                ((tau_us * busy) / total_workers.max(1)).max(min_wait_us << 1)
             };
             let window = Duration::from_micros(target_us as u64);
             let elapsed = first_at.elapsed();
@@ -596,14 +625,15 @@ fn handle_login(body: &[u8], addr: ReplyAddr) -> Dispatch {
     if email.contains('\0') || password.len() > BCRYPT_MAX_BYTES {
         return fail_now(401, "invalid credentials");
     }
-    enqueue_read(
-        ReadOp::Login {
+    engine::READ_QUEUE.push_front(ReadTask {
+        op: ReadOp::Login {
             email,
             password: password.into_bytes(),
         },
-        0,
+        viewer: 0,
         addr,
-    )
+    });
+    Dispatch::Enqueued
 }
 
 fn handle_update_user(body: &[u8], uid: i64, token: String, addr: ReplyAddr) -> Dispatch {
@@ -667,6 +697,8 @@ fn handle_create_article(body: &[u8], viewer: i64, addr: ReplyAddr) -> Dispatch 
                     _ => return fail_now(422, "tagList must contain non-empty strings"),
                 }
             }
+            tags.sort_unstable();
+            tags.dedup();
         }
         Some(_) => return fail_now(422, "tagList must be an array"),
     }

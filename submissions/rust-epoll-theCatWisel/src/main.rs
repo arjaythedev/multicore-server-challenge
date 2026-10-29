@@ -30,12 +30,16 @@ fn main() {
     let write_workers: usize = env_parse("WRITE_LANES", 1);
     let crypto_workers: usize = env_parse("BCRYPT_THREADS", cores.max(4));
 
+    let (auto_lanes, seed_bcrypt_us, l1d_kb) = auth::calibrate_bcrypt_hardware();
+    let bcrypt_lanes: usize = env_parse("BCRYPT_LANES", auto_lanes);
+
     let signer: &'static auth::TokenSigner = Box::leak(Box::new(auth::TokenSigner::new(jwt_secret.as_bytes())));
     let cfg: &'static engine::RuntimeConfig = Box::leak(Box::new(engine::RuntimeConfig {
         db: wire::DbEndpoint::parse(&db_url).expect("invalid DATABASE_URL"),
         signer,
         read_workers,
-        bcrypt_lanes: 6,
+        crypto_workers,
+        bcrypt_lanes,
     }));
 
     {
@@ -51,6 +55,7 @@ fn main() {
         if let Err(err) = probe.prepare_batch(&refs) {
             panic!("PostgreSQL statement preparation failed: {err}");
         }
+        engine::seed_hardware_ewma((seed_bcrypt_us >> 7).max(600), seed_bcrypt_us);
     }
 
     reactor::init_outboxes(io_workers);
@@ -89,7 +94,7 @@ fn main() {
     }
 
     eprintln!(
-        "listening on {bind_host}:{bind_port} ({io_workers} io, {read_workers} read, {write_workers} write, {crypto_workers} crypto)"
+        "listening on {bind_host}:{bind_port} ({io_workers} io, {read_workers} read, {write_workers} write, {crypto_workers}x{bcrypt_lanes} crypto, L1D={l1d_kb}KB)"
     );
     for h in handles {
         let _ = h.join();

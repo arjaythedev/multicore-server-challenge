@@ -250,6 +250,8 @@ pub struct Reactor {
     slots: Vec<ClientSlot>,
     free_slots: Vec<u32>,
     scratch: Vec<u8>,
+    outbox_buf: Vec<OutgoingReply>,
+    pipelined_slots: Vec<u32>,
     signer: &'static TokenSigner,
 }
 
@@ -368,6 +370,8 @@ impl Reactor {
             slots: Vec::with_capacity(16384),
             free_slots: Vec::with_capacity(4096),
             scratch: vec![0; 256 * 1024],
+            outbox_buf: Vec::with_capacity(1024),
+            pipelined_slots: Vec::with_capacity(256),
             signer,
         };
         reactor.ep_ctl(sys::EPOLL_CTL_ADD, listen_fd, sys::EPOLLIN as u32, TOKEN_LISTENER)?;
@@ -672,9 +676,15 @@ impl Reactor {
         unsafe {
             sys::read(self.outbox_fd, &mut val as *mut u64 as *mut sys::c_void, 8);
         }
-        let replies = std::mem::take(&mut *worker_outbox(self.worker_id as usize).pending.lock().unwrap());
-        let mut check_pipelined: Vec<u32> = Vec::new();
-        for rep in replies {
+        let mut replies = std::mem::take(&mut self.outbox_buf);
+        replies.clear();
+        {
+            let mut pending = worker_outbox(self.worker_id as usize).pending.lock().unwrap();
+            std::mem::swap(&mut replies, &mut *pending);
+        }
+        let mut check_pipelined = std::mem::take(&mut self.pipelined_slots);
+        check_pipelined.clear();
+        for rep in &replies {
             let c = &self.slots[rep.addr.slot as usize];
             if c.fd < 0 || c.epoch != rep.addr.epoch || !c.in_flight {
                 continue;
@@ -685,9 +695,13 @@ impl Reactor {
                 check_pipelined.push(rep.addr.slot);
             }
         }
-        for slot in check_pipelined {
+        replies.clear();
+        self.outbox_buf = replies;
+        for &slot in &check_pipelined {
             self.drain_rx_buf(slot);
         }
+        check_pipelined.clear();
+        self.pipelined_slots = check_pipelined;
     }
 
     fn write_response(&mut self, slot: u32, status: u16, body: &[u8]) {

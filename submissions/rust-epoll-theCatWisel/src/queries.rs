@@ -72,7 +72,7 @@ pub fn read_catalog() -> Vec<PreparedDef> {
         def(
             "global",
             format!(
-                "SELECT 0::int8, CASE WHEN EXISTS (SELECT 1 FROM articles ORDER BY id LIMIT 1 OFFSET 999) \
+                "SELECT 0::int8, CASE WHEN EXISTS (SELECT 1 FROM articles LIMIT 1 OFFSET 999) \
                  THEN 1000 ELSE (SELECT count(*) FROM articles) END, {COUNT_PAD} \
                  UNION ALL \
                  SELECT r.k, {ART_COLS} FROM unnest($1::int8[], $2::int8[]) WITH ORDINALITY r(lim, off, k) \
@@ -149,15 +149,20 @@ pub fn read_catalog() -> Vec<PreparedDef> {
                    FROM unnest($1::int8[]) WITH ORDINALITY r(v, k) \
                  ), \
                  hubs AS MATERIALIZED ( \
-                   SELECT h.fid, \
-                     EXISTS (SELECT 1 FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC LIMIT 1 OFFSET 999) AS capped, \
-                     (SELECT a.id FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC LIMIT 1 OFFSET h.depth - 1) AS floor_id \
+                   SELECT f.fid, f.floor_id, \
+                     CASE WHEN f.floor_id IS NOT NULL THEN \
+                       EXISTS (SELECT 1 FROM articles a WHERE a.author_id = f.fid ORDER BY a.id DESC LIMIT 1 OFFSET 999) \
+                     ELSE false END AS capped \
                    FROM ( \
-                     SELECT f.fid, max(u.depth) AS depth \
-                     FROM u, unnest(u.fids) AS f(fid) \
-                     GROUP BY f.fid HAVING count(*) >= 2 \
-                     ORDER BY count(*) DESC, f.fid LIMIT 16 \
-                   ) h \
+                     SELECT h.fid, h.depth, \
+                       (SELECT a.id FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC LIMIT 1 OFFSET h.depth - 1) AS floor_id \
+                     FROM ( \
+                       SELECT f.fid, max(u.depth) AS depth \
+                       FROM u, unnest(u.fids) AS f(fid) \
+                       GROUP BY f.fid HAVING count(*) >= 2 \
+                       ORDER BY count(*) DESC, f.fid LIMIT 16 \
+                     ) h \
+                   ) f \
                  ), \
                  cap_authors AS MATERIALIZED ( \
                    SELECT ARRAY(SELECT fid FROM hubs WHERE capped) AS fids \
@@ -272,7 +277,6 @@ pub fn write_catalog() -> Vec<PreparedDef> {
              SELECT id FROM t",
             &[OID_INT8, OID_TEXT],
         ),
-        // Batched group-commit variants for high-frequency favorite/follow mutations.
         def(
             "fav_batch",
             "WITH r AS (SELECT x.k, x.uid, a.id AS aid FROM unnest($1::int8[], $2::text[]) WITH ORDINALITY x(uid, slug, k) \
@@ -309,7 +313,7 @@ pub fn write_catalog() -> Vec<PreparedDef> {
             "newart",
             "INSERT INTO articles (id, slug, author_id, title, description, body) \
              SELECT n.id, $5::text || '-' || n.id, $1, $2, $3, $4 \
-             FROM (SELECT nextval(pg_get_serial_sequence('articles', 'id')) AS id) n RETURNING id",
+             FROM (SELECT nextval('articles_id_seq'::regclass) AS id) n RETURNING id",
             &[OID_INT8, OID_TEXT, OID_TEXT, OID_TEXT, OID_TEXT],
         ),
         def(
@@ -320,7 +324,7 @@ pub fn write_catalog() -> Vec<PreparedDef> {
         def(
             "arttags",
             "INSERT INTO article_tags (article_id, tag_id) \
-             SELECT currval(pg_get_serial_sequence('articles', 'id')), t.id FROM tags t WHERE t.name = ANY($1::text[])",
+             SELECT currval('articles_id_seq'::regclass), t.id FROM tags t WHERE t.name = ANY($1::text[])",
             &[OID_TEXT_ARR],
         ),
         def(

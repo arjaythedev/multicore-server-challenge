@@ -123,7 +123,13 @@ pub struct RuntimeConfig {
     pub db: DbEndpoint,
     pub signer: &'static TokenSigner,
     pub read_workers: usize,
+    pub crypto_workers: usize,
     pub bcrypt_lanes: usize,
+}
+
+pub fn seed_hardware_ewma(batch_us: usize, bcrypt_us: usize) {
+    EWMA_BATCH_US.store(batch_us, Ordering::Relaxed);
+    EWMA_BCRYPT_US.store(bcrypt_us, Ordering::Relaxed);
 }
 
 #[derive(Default)]
@@ -290,7 +296,7 @@ enum PlanSlot {
 
 struct FilterDedup {
     counts: KeySet<String>,
-    pages: KeySet<(String, i64, i64)>,
+    pages: KeySet<(u32, i64, i64)>,
 }
 
 impl FilterDedup {
@@ -374,7 +380,7 @@ pub struct ReadWorker {
     pa: PipelineBuf,
     pb: PipelineBuf,
     arena: Vec<u8>,
-    tag_lut: Vec<(u32, Cell)>,
+    tag_lut: Vec<Cell>,
     k_uid: KeySet<i64>,
     k_uemail: KeySet<String>,
     k_prof: KeySet<String>,
@@ -384,7 +390,7 @@ pub struct ReadWorker {
     k_global: KeySet<(i64, i64)>,
     k_filters: [FilterDedup; 3],
     k_feed_cnt: KeySet<i64>,
-    k_feed_page: KeySet<(i64, i64, i64)>,
+    k_feed_page: KeySet<(u32, i64, i64)>,
     plan: Vec<PlanSlot>,
     distinct_arts: KeySet<i64>,
     distinct_authors: KeySet<i64>,
@@ -479,9 +485,6 @@ impl ReadWorker {
                 let idle = rw - busy;
                 let tau_us = EWMA_BATCH_US.load(Ordering::Relaxed);
                 let bar_n = EWMA_BATCH_LEN.load(Ordering::Relaxed).max(num_families * rw);
-                // Little's Law & BBR/CoDel Closed-Loop Pacing (Zero Hardcoded Magic Thresholds):
-                // - When idle == 1 (all peer workers are in-flight on PostgreSQL): idle - 1 == 0 -> window = 0 us (instant CoDel drain).
-                // - When peers are idle: pace the coalesce window to tau * (idle - 1) / rw^2 so batch completions stagger evenly.
                 let pace_us = (tau_us * (idle - 1)) / rw;
                 let dyn_min = bar_n.max(num_families * idle);
                 let dyn_cap = (bar_n * 2).max(num_families * rw * 4);
@@ -578,16 +581,15 @@ impl ReadWorker {
                         _ => 2,
                     };
                     let fd = &mut self.k_filters[kind];
-                    PlanSlot::Filtered(
-                        kind,
-                        fd.counts.intern(key.clone()),
-                        fd.pages.intern((key.clone(), *lim, *off)),
-                    )
+                    let c_ord = fd.counts.intern(key.clone());
+                    let p_ord = fd.pages.intern((c_ord, *lim, *off));
+                    PlanSlot::Filtered(kind, c_ord, p_ord)
                 }
-                ReadOp::Feed { lim, off } => PlanSlot::Feed(
-                    self.k_feed_cnt.intern(t.viewer),
-                    self.k_feed_page.intern((t.viewer, *lim, *off)),
-                ),
+                ReadOp::Feed { lim, off } => {
+                    let c_ord = self.k_feed_cnt.intern(t.viewer);
+                    let p_ord = self.k_feed_page.intern((c_ord, *lim, *off));
+                    PlanSlot::Feed(c_ord, p_ord)
+                }
             };
             self.plan.push(slot);
         }
@@ -644,11 +646,11 @@ impl ReadWorker {
             tx.bind_and_exec("cmts", &[BindParam::TextSlice(&self.k_cmts.items)]);
         }
         if st_global.is_some() {
-            self.enc_b.reset(OID_INT8, self.k_global.len());
-            self.enc_c.reset(OID_INT8, self.k_global.len());
-            for &(lim, off) in &self.k_global.items {
-                self.enc_b.push_i64(lim);
-                self.enc_c.push_i64(off);
+            self.enc_b.reset(OID_INT8, self.k_global.items.len());
+            self.enc_c.reset(OID_INT8, self.k_global.items.len());
+            for &(l, o) in &self.k_global.items {
+                self.enc_b.push_i64(l);
+                self.enc_c.push_i64(o);
             }
             tx.bind_and_exec(
                 "global",
@@ -661,13 +663,13 @@ impl ReadWorker {
         for i in 0..3 {
             if st_filters[i].is_some() {
                 let fd = &self.k_filters[i];
-                self.enc_a.reset(OID_TEXT, fd.pages.len());
-                self.enc_b.reset(OID_INT8, fd.pages.len());
-                self.enc_c.reset(OID_INT8, fd.pages.len());
-                for (key, lim, off) in &fd.pages.items {
-                    self.enc_a.push_bytes(key.as_bytes());
-                    self.enc_b.push_i64(*lim);
-                    self.enc_c.push_i64(*off);
+                self.enc_a.reset(OID_TEXT, fd.pages.items.len());
+                self.enc_b.reset(OID_INT8, fd.pages.items.len());
+                self.enc_c.reset(OID_INT8, fd.pages.items.len());
+                for &(c_ord, l, o) in &fd.pages.items {
+                    self.enc_a.push_bytes(fd.counts.items[c_ord as usize].as_bytes());
+                    self.enc_b.push_i64(l);
+                    self.enc_c.push_i64(o);
                 }
                 tx.bind_and_exec(
                     FILTER_STMT_NAMES[i],
@@ -681,13 +683,13 @@ impl ReadWorker {
             }
         }
         if st_feed.is_some() {
-            self.enc_a.reset(OID_INT8, self.k_feed_page.len());
-            self.enc_b.reset(OID_INT8, self.k_feed_page.len());
-            self.enc_c.reset(OID_INT8, self.k_feed_page.len());
-            for &(v, lim, off) in &self.k_feed_page.items {
-                self.enc_a.push_i64(v);
-                self.enc_b.push_i64(lim);
-                self.enc_c.push_i64(off);
+            self.enc_a.reset(OID_INT8, self.k_feed_page.items.len());
+            self.enc_b.reset(OID_INT8, self.k_feed_page.items.len());
+            self.enc_c.reset(OID_INT8, self.k_feed_page.items.len());
+            for &(c_ord, l, o) in &self.k_feed_page.items {
+                self.enc_a.push_i64(self.k_feed_cnt.items[c_ord as usize]);
+                self.enc_b.push_i64(l);
+                self.enc_c.push_i64(o);
             }
             tx.bind_and_exec(
                 "feed",
@@ -708,18 +710,20 @@ impl ReadWorker {
         if let Some(failed) = self.pa.results.iter().find(|r| r.error.is_some()) {
             return Err(PgError::Wire(format!("phase A error: {}", failed.error.as_ref().unwrap())));
         }
-        if let Some(s) = st_tags {
-            let r = &self.pa.results[s];
-            let (start, end) = (r.row_start as usize, (r.row_start + r.row_count) as usize);
-            let data = &self.pa.data;
-            let cols = &self.pa.cols;
-            self.pa.rows[start..end].sort_unstable_by(|&a, &b| {
-                let ca = cols[a.start as usize + 1];
-                let cb = cols[b.start as usize + 1];
-                let sa = &data[ca.offset as usize..ca.offset as usize + ca.len.max(0) as usize];
-                let sb = &data[cb.offset as usize..cb.offset as usize + cb.len.max(0) as usize];
-                sa.cmp(sb)
-            });
+        if need_tags_endpoint {
+            if let Some(s) = st_tags {
+                let r = &self.pa.results[s];
+                let (start, end) = (r.row_start as usize, (r.row_start + r.row_count) as usize);
+                let data = &self.pa.data;
+                let cols = &self.pa.cols;
+                self.pa.rows[start..end].sort_unstable_by(|&a, &b| {
+                    let ca = cols[a.start as usize + 1];
+                    let cb = cols[b.start as usize + 1];
+                    let sa = &data[ca.offset as usize..ca.offset as usize + ca.len.max(0) as usize];
+                    let sb = &data[cb.offset as usize..cb.offset as usize + cb.len.max(0) as usize];
+                    sa.cmp(sb)
+                });
+            }
         }
 
         self.distinct_arts.clear();
@@ -737,6 +741,7 @@ impl ReadWorker {
         // Hand login password checks to the crypto threads before running Phase B.
         if st_uemail.is_some() {
             let mut early_err: Vec<OutgoingReply> = Vec::new();
+            let mut login_tasks: Vec<CryptoTask> = Vec::new();
             for (task, &slot) in tasks.iter_mut().zip(self.plan.iter()) {
                 if let PlanSlot::Login(k) = slot {
                     let ReadOp::Login { password, .. } = &mut task.op else {
@@ -754,7 +759,7 @@ impl ReadWorker {
                                 image: clone_cell_bytes(pa, r[5]),
                             };
                             let hash = clone_cell_bytes(pa, r[6]).unwrap_or_default();
-                            CRYPTO_QUEUE.push(CryptoTask::VerifyLogin {
+                            login_tasks.push(CryptoTask::VerifyLogin {
                                 password: pw,
                                 hash,
                                 user,
@@ -764,6 +769,9 @@ impl ReadWorker {
                         None => early_err.push(reactor::error_reply(task.addr, 401, "invalid email or password")),
                     }
                 }
+            }
+            if !login_tasks.is_empty() {
+                CRYPTO_QUEUE.push_batch(&mut login_tasks);
             }
             if !early_err.is_empty() {
                 reactor::complete_batch(early_err);
@@ -805,6 +813,7 @@ impl ReadWorker {
             let mut counts = vec![0i64; n_cnt.max(1)];
             let mut pages: Vec<ArticlePage> = vec![Vec::new(); n_page];
             if let Some(idx) = s {
+                let mut raw_pages: Vec<Vec<(i64, i64, wire::RowSpan)>> = vec![Vec::new(); n_page];
                 for &span in pa.result_rows(idx) {
                     let r = pa.row(span);
                     let ord = pa.i64(r[0]);
@@ -815,12 +824,18 @@ impl ReadWorker {
                             counts[c_idx] = pa.i64(r[1]);
                         }
                     } else if (ord as usize) <= n_page {
-                        let aref = intern_art(pa.i64(r[1]), pa.i64(r[2]), span, Cell { offset: 0, len: -1 });
-                        pages[ord as usize - 1].push(aref);
+                        raw_pages[ord as usize - 1].push((pa.i64(r[1]), pa.i64(r[2]), span));
                     }
                 }
-                for page in &mut pages {
-                    page.sort_unstable_by(|a, b| b.aid.cmp(&a.aid));
+                for (p_idx, mut rp) in raw_pages.into_iter().enumerate() {
+                    if rp.len() > 1 {
+                        rp.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                    }
+                    let dst = &mut pages[p_idx];
+                    dst.reserve(rp.len());
+                    for (aid, author, span) in rp {
+                        dst.push(intern_art(aid, author, span, Cell { offset: 0, len: -1 }));
+                    }
                 }
             }
             (counts, pages)
@@ -828,7 +843,13 @@ impl ReadWorker {
 
         let (global_counts, global_pages) = unpack_list(st_global, 1, self.k_global.len());
         let filter_results: Vec<(Vec<i64>, Vec<ArticlePage>)> = (0..3)
-            .map(|i| unpack_list(st_filters[i], self.k_filters[i].counts.len(), self.k_filters[i].pages.len()))
+            .map(|i| {
+                unpack_list(
+                    st_filters[i],
+                    self.k_filters[i].counts.len(),
+                    self.k_filters[i].pages.len(),
+                )
+            })
             .collect();
         let (feed_counts, feed_pages) = unpack_list(st_feed, self.k_feed_cnt.len(), self.k_feed_page.len());
 
@@ -841,13 +862,14 @@ impl ReadWorker {
                 continue;
             }
             match *slot {
-                PlanSlot::BySlug(k) | PlanSlot::ById(k) => {
-                    let item = if let PlanSlot::BySlug(_) = slot {
-                        slug_rows[k as usize]
-                    } else {
-                        id_rows[k as usize]
-                    };
-                    if let Some(art) = item {
+                PlanSlot::BySlug(k) => {
+                    if let Some(art) = slug_rows[k as usize] {
+                        self.fav_pairs.push((viewer, art.aid));
+                        self.foll_pairs.push((viewer, art.author));
+                    }
+                }
+                PlanSlot::ById(k) => {
+                    if let Some(art) = id_rows[k as usize] {
                         self.fav_pairs.push((viewer, art.aid));
                         self.foll_pairs.push((viewer, art.author));
                     }
@@ -958,15 +980,14 @@ impl ReadWorker {
         self.tag_lut.clear();
         if let Some(s) = st_tags {
             let rows = pa.result_rows(s);
-            self.tag_lut
-                .resize(rows.len() + 64, (u32::MAX, Cell { offset: 0, len: -1 }));
-            for (rank, &span) in rows.iter().enumerate() {
+            self.tag_lut.resize(rows.len() + 64, Cell { offset: 0, len: -1 });
+            for &span in rows {
                 let r = pa.row(span);
                 let tid = pa.i64(r[0]) as usize;
                 if tid >= self.tag_lut.len() {
-                    self.tag_lut.resize(tid + 16, (u32::MAX, Cell { offset: 0, len: -1 }));
+                    self.tag_lut.resize(tid + 16, Cell { offset: 0, len: -1 });
                 }
-                self.tag_lut[tid] = (rank as u32, r[1]);
+                self.tag_lut[tid] = r[1];
             }
         }
 
@@ -977,7 +998,7 @@ impl ReadWorker {
         let arena = &mut self.arena;
         self.fav_hits.clear();
         self.foll_hits.clear();
-        let mut tag_sort_buf: Vec<(u32, Cell)> = Vec::with_capacity(8);
+        let mut tag_sort_buf: Vec<&[u8]> = Vec::with_capacity(8);
 
         if n_phase_b > 0 {
             self.author_spans.clear();
@@ -1020,19 +1041,21 @@ impl ReadWorker {
                             for elem in wire::iter_binary_array(raw_arr) {
                                 if let Ok(bytes) = elem.try_into() {
                                     let tid = i32::from_be_bytes(bytes) as usize;
-                                    if let Some(&entry) = self.tag_lut.get(tid) {
-                                        if entry.0 != u32::MAX {
-                                            tag_sort_buf.push(entry);
+                                    if let Some(&name_cell) = self.tag_lut.get(tid) {
+                                        if let Some(name_bytes) = pa.bytes(name_cell) {
+                                            tag_sort_buf.push(name_bytes);
                                         }
                                     }
                                 }
                             }
-                            tag_sort_buf.sort_unstable_by_key(|e| e.0);
-                            for (idx, &(_, name_cell)) in tag_sort_buf.iter().enumerate() {
+                            if tag_sort_buf.len() > 1 {
+                                tag_sort_buf.sort_unstable();
+                            }
+                            for (idx, &name_bytes) in tag_sort_buf.iter().enumerate() {
                                 if idx > 0 {
                                     arena.push(b',');
                                 }
-                                codec::write_str(arena, pa.bytes(name_cell).unwrap_or(b""));
+                                codec::write_str(arena, name_bytes);
                             }
                         }
                         arena.extend_from_slice(b"],\"createdAt\":");
@@ -1207,14 +1230,15 @@ impl ReadWorker {
                     None => replies.push(reactor::error_reply(addr, 404, "profile not found")),
                 },
                 PlanSlot::BySlug(k) | PlanSlot::ById(k) => {
-                    let item = if let PlanSlot::BySlug(_) = slot {
-                        slug_rows[k as usize]
-                    } else {
-                        id_rows[k as usize]
-                    };
-                    let status = match task.op {
-                        ReadOp::ArticleById { status, .. } => status,
-                        _ => 200,
+                    let (item, status) = match slot {
+                        PlanSlot::BySlug(_) => (slug_rows[k as usize], 200),
+                        PlanSlot::ById(_) => {
+                            let ReadOp::ArticleById { status, .. } = task.op else {
+                                unreachable!()
+                            };
+                            (id_rows[k as usize], status)
+                        }
+                        _ => unreachable!(),
                     };
                     let mut body = Vec::with_capacity(2048);
                     body.extend_from_slice(b"{\"article\":");
@@ -1569,10 +1593,17 @@ impl WriteWorker {
             }
         }
 
-        let batch_fav_on = fav_on_jobs.len() >= 2;
-        let batch_fav_off = fav_off_jobs.len() >= 2;
-        let batch_foll_on = foll_on_jobs.len() >= 2;
-        let batch_foll_off = foll_off_jobs.len() >= 2;
+        let fav_conflict = fav_on_jobs
+            .iter()
+            .any(|(_, s1)| fav_off_jobs.iter().any(|(_, s2)| s1 == s2));
+        let foll_conflict = foll_on_jobs
+            .iter()
+            .any(|(_, u1)| foll_off_jobs.iter().any(|(_, u2)| u1 == u2));
+
+        let batch_fav_on = !fav_conflict && fav_on_jobs.len() >= 2;
+        let batch_fav_off = !fav_conflict && fav_off_jobs.len() >= 2;
+        let batch_foll_on = !foll_conflict && foll_on_jobs.len() >= 2;
+        let batch_foll_off = !foll_conflict && foll_off_jobs.len() >= 2;
 
         let mut n_exec = 0usize;
         if !is_single_stmt {
@@ -1703,7 +1734,7 @@ impl WriteWorker {
         }
 
         let pipe = &self.pipe;
-        let decode_fav_batch = |slot: Option<usize>, len: usize| -> Vec<Option<i64>> {
+        let decode_ord_i64 = |slot: Option<usize>, len: usize| -> Vec<Option<i64>> {
             let mut out = vec![None; len];
             if let Some(s) = slot {
                 for &span in pipe.result_rows(s) {
@@ -1716,10 +1747,7 @@ impl WriteWorker {
             }
             out
         };
-        let fav_on_res = decode_fav_batch(slot_fav_on, c_fav_on);
-        let fav_off_res = decode_fav_batch(slot_fav_off, c_fav_off);
-
-        let decode_foll_batch = |slot: Option<usize>, len: usize| -> Vec<Option<&[Cell]>> {
+        let decode_ord_rows = |slot: Option<usize>, len: usize| -> Vec<Option<&[Cell]>> {
             let mut out = vec![None; len];
             if let Some(s) = slot {
                 for &span in pipe.result_rows(s) {
@@ -1732,14 +1760,17 @@ impl WriteWorker {
             }
             out
         };
-        let foll_on_res = decode_foll_batch(slot_foll_on, c_foll_on);
-        let foll_off_res = decode_foll_batch(slot_foll_off, c_foll_off);
+        let fav_on_res = decode_ord_i64(slot_fav_on, c_fav_on);
+        let fav_off_res = decode_ord_i64(slot_fav_off, c_fav_off);
+        let foll_on_res = decode_ord_rows(slot_foll_on, c_foll_on);
+        let foll_off_res = decode_ord_rows(slot_foll_off, c_foll_off);
 
         let mut replies = Vec::with_capacity(tasks.len());
+        let mut post_reads: Vec<ReadTask> = Vec::new();
         for (task, loc) in tasks.drain(..).zip(locs) {
             match loc {
                 WriteDispatchLoc::Direct { start, count } => {
-                    finalize_write_task(task, pipe, start, count, self.cfg, &mut replies);
+                    finalize_write_task(task, pipe, start, count, self.cfg, &mut replies, &mut post_reads);
                 }
                 WriteDispatchLoc::BatchedFav { on, ord } => {
                     let aid = if on {
@@ -1748,7 +1779,7 @@ impl WriteWorker {
                         fav_off_res[ord - 1]
                     };
                     match aid {
-                        Some(id) => READ_QUEUE.push(ReadTask {
+                        Some(id) => post_reads.push(ReadTask {
                             op: ReadOp::ArticleById { id, status: 200 },
                             viewer: task.viewer,
                             addr: task.addr,
@@ -1786,6 +1817,9 @@ impl WriteWorker {
             }
         }
 
+        if !post_reads.is_empty() {
+            READ_QUEUE.push_batch(&mut post_reads);
+        }
         reactor::complete_batch(replies);
         Ok(())
     }
@@ -1809,7 +1843,11 @@ impl WriteWorker {
         conn.flush()?;
         conn.read_pipeline_into(n_exec, &mut self.pipe)?;
         let mut replies = Vec::new();
-        finalize_write_task(task, &self.pipe, start, cnt, self.cfg, &mut replies);
+        let mut post_reads = Vec::new();
+        finalize_write_task(task, &self.pipe, start, cnt, self.cfg, &mut replies, &mut post_reads);
+        if !post_reads.is_empty() {
+            READ_QUEUE.push_batch(&mut post_reads);
+        }
         reactor::complete_batch(replies);
         Ok(())
     }
@@ -1822,6 +1860,7 @@ fn finalize_write_task(
     count: usize,
     cfg: &RuntimeConfig,
     replies: &mut Vec<OutgoingReply>,
+    post_reads: &mut Vec<ReadTask>,
 ) {
     let addr = task.addr;
     let viewer = task.viewer;
@@ -1898,7 +1937,7 @@ fn finalize_write_task(
             None => replies.push(reactor::error_reply(addr, 404, "profile not found")),
         },
         WriteOp::Favorite { .. } => match first_row {
-            Some(r) => READ_QUEUE.push(ReadTask {
+            Some(r) => post_reads.push(ReadTask {
                 op: ReadOp::ArticleById {
                     id: pipe.i64(r[0]),
                     status: 200,
@@ -1909,7 +1948,7 @@ fn finalize_write_task(
             None => replies.push(reactor::error_reply(addr, 404, "article not found")),
         },
         WriteOp::CreateArticle { .. } => match first_row {
-            Some(r) => READ_QUEUE.push(ReadTask {
+            Some(r) => post_reads.push(ReadTask {
                 op: ReadOp::ArticleById {
                     id: pipe.i64(r[0]),
                     status: 201,
@@ -1921,7 +1960,7 @@ fn finalize_write_task(
         },
         WriteOp::UpdateArticle { .. } => match first_row {
             Some(r) if pipe.i64(r[1]) != viewer => replies.push(reactor::error_reply(addr, 403, "forbidden")),
-            Some(r) => READ_QUEUE.push(ReadTask {
+            Some(r) => post_reads.push(ReadTask {
                 op: ReadOp::ArticleById {
                     id: pipe.i64(r[0]),
                     status: 200,
@@ -1984,12 +2023,14 @@ pub fn run_crypto_worker(cfg: &'static RuntimeConfig) {
     let mut batch: Vec<CryptoTask> = Vec::with_capacity(cfg.bcrypt_lanes.max(1));
     let mut non_std: Vec<CryptoTask> = Vec::new();
     let lanes = cfg.bcrypt_lanes.max(1);
+    let total_workers = cfg.crypto_workers.max(1);
     loop {
         batch.clear();
         {
             let _token = CRYPTO_LOCK.lock().unwrap();
             CRYPTO_QUEUE.drain_crypto_bbr(
                 lanes,
+                total_workers,
                 &BUSY_CRYPTO_WORKERS,
                 &EWMA_BCRYPT_US,
                 &mut batch,
@@ -2079,6 +2120,8 @@ fn execute_bcrypt_batch(tasks: &mut Vec<CryptoTask>, cfg: &RuntimeConfig, cost: 
             .collect();
         dispatch_lanes(&passwords, &salts, cost)
     };
+    let mut replies: Vec<OutgoingReply> = Vec::with_capacity(tasks.len());
+    let mut writes: Vec<WriteTask> = Vec::new();
     for (((task, digest), salt), exp) in tasks.drain(..).zip(digests).zip(salts).zip(expected) {
         match task {
             CryptoTask::VerifyLogin { user, addr, .. } => {
@@ -2093,9 +2136,13 @@ fn execute_bcrypt_batch(tasks: &mut Vec<CryptoTask>, cfg: &RuntimeConfig, cost: 
                         user.bio.as_deref(),
                         user.image.as_deref(),
                     );
-                    reactor::complete_one(addr, 200, body);
+                    replies.push(OutgoingReply {
+                        addr,
+                        status: 200,
+                        body,
+                    });
                 } else {
-                    reactor::complete_one(addr, 401, reactor::make_error_json("invalid credentials"));
+                    replies.push(reactor::error_reply(addr, 401, "invalid credentials"));
                 }
             }
             CryptoTask::HashPassword { mut write, .. } => {
@@ -2105,9 +2152,15 @@ fn execute_bcrypt_batch(tasks: &mut Vec<CryptoTask>, cfg: &RuntimeConfig, cost: 
                     WriteOp::UpdateUser { hash, .. } => *hash = Some(formatted),
                     _ => {}
                 }
-                WRITE_QUEUE.push(write);
+                writes.push(write);
             }
         }
+    }
+    if !replies.is_empty() {
+        reactor::complete_batch(replies);
+    }
+    if !writes.is_empty() {
+        WRITE_QUEUE.push_batch_front(&mut writes);
     }
 }
 
