@@ -6,8 +6,12 @@ namespace Conduit;
 
 internal static class Db
 {
-    /// <summary>Builds the pool from a postgres://user:password@host:port/database URL.</summary>
-    internal static NpgsqlDataSource Create(string url, int poolSize, ILoggerFactory loggerFactory)
+    /// <summary>
+    /// Builds the pool from a postgres://user:password@host:port/database URL. With <paramref name="maxAutoPrepare"/> above 0,
+    /// Npgsql prepares a statement on a connection once it has run <paramref name="autoPrepareMinUsages"/> times there, so
+    /// Postgres plans it once per connection instead of on every call (the plan is cached, never any data).
+    /// </summary>
+    internal static NpgsqlDataSource Create(string url, int poolSize, int maxAutoPrepare, int autoPrepareMinUsages, ILoggerFactory loggerFactory)
     {
         var u = new Uri(url);
         var userInfo = u.UserInfo.Split(':', 2);
@@ -19,6 +23,8 @@ internal static class Db
             Password = userInfo.Length > 1 ? Uri.UnescapeDataString(userInfo[1]) : null,
             Database = u.AbsolutePath.TrimStart('/'),
             MaxPoolSize = poolSize,
+            MaxAutoPrepare = maxAutoPrepare,
+            AutoPrepareMinUsages = autoPrepareMinUsages,
             SslMode = SslMode.Disable,
         };
         var dataSource = new NpgsqlDataSourceBuilder(b.ConnectionString);

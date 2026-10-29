@@ -8,6 +8,10 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <!-- packages.lock.json holds the hashes of the packages from nuget.org, as restored with the SDK that install.sh pins.
+         Any other SDK (a distro's source-built one carries its own copy of the AOT packs, with other hashes) restores into a
+         throwaway lock file under obj/ and leaves the committed one alone, so dotnet build, run and the IDE work on it too. -->
+    <NuGetLockFilePath Condition="'$(NETCoreSdkVersion)' != '10.0.402'">$(MSBuildProjectDirectory)/obj/local.packages.lock.json</NuGetLockFilePath>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks> <!-- BcryptCore.cs and the generated BcryptLanes.g.cs work through pointers -->
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>

@@ -9,10 +9,9 @@ DOTNET="$DOTNET_ROOT/dotnet"
 EXTRA=()
 command -v clang >/dev/null 2>&1 || EXTRA+=(-p:CppCompilerAndLinker=gcc)
 rm -rf bin
-# packages.lock.json holds the hashes of the packages from nuget.org, as restored with the SDK that install.sh pins. Other
-# SDKs (for example a distro's source-built one, which carries its own copy of the AOT packs) get other hashes, so
-# with those the restore writes its lock file under obj/ and leaves the committed one alone, instead of failing on it.
-if [ "$("$DOTNET" --version)" = "10.0.402" ]; then LOCK=(--locked-mode); else LOCK=("-p:NuGetLockFilePath=$PWD/obj/local.packages.lock.json"); fi
-"$DOTNET" restore Conduit.csproj "${LOCK[@]}" -v quiet
+# Restores exactly packages.lock.json under the SDK that install.sh pins (10.0.402); Conduit.csproj sends any other SDK to a
+# throwaway lock file under obj/, because its AOT packages have other hashes.
+if [ "$("$DOTNET" --version)" = "10.0.402" ]; then LOCK=(--locked-mode); else LOCK=(); fi
+"$DOTNET" restore Conduit.csproj ${LOCK[@]+"${LOCK[@]}"} -v quiet
 "$DOTNET" publish Conduit.csproj -c Release -o bin --no-restore -v quiet -nologo ${EXTRA[@]+"${EXTRA[@]}"}
 echo "built bin/conduit (.NET SDK $("$DOTNET" --version), Native AOT)"

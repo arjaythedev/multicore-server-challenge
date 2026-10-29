@@ -24,6 +24,14 @@ if (!int.TryParse(EnvOr("DB_POOL_SIZE", defaultPool.ToString()), out var poolSiz
     return 1;
 }
 
+// Automatic prepared statements: the server sends 34 distinct statements, so 64 keeps them all prepared on every connection.
+if (!int.TryParse(EnvOr("DB_MAX_AUTO_PREPARE", "64"), out var maxAutoPrepare) || maxAutoPrepare < 0
+    || !int.TryParse(EnvOr("DB_AUTO_PREPARE_MIN_USAGES", "5"), out var autoPrepareMinUsages) || autoPrepareMinUsages < 1)
+{
+    Console.Error.WriteLine("DB_MAX_AUTO_PREPARE must be 0 or more and DB_AUTO_PREPARE_MIN_USAGES 1 or more");
+    return 1;
+}
+
 // Check our bcrypt against known answers now (every lane count), not on the first login.
 try
 {
@@ -62,7 +70,7 @@ builder.WebHost.ConfigureKestrel(o =>
     o.ConfigureEndpointDefaults(l => l.Protocols = HttpProtocols.Http1); // HTTP/1.1 only: no h2c upgrade checks
 });
 
-builder.Services.AddSingleton(sp => Db.Create(dbUrl, poolSize, sp.GetRequiredService<ILoggerFactory>()));
+builder.Services.AddSingleton(sp => Db.Create(dbUrl, poolSize, maxAutoPrepare, autoPrepareMinUsages, sp.GetRequiredService<ILoggerFactory>()));
 builder.Services.AddSingleton(new Auth(secret));
 builder.Services.AddSingleton<Api>();
 

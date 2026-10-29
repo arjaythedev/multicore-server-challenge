@@ -41,6 +41,8 @@ bash test/run.sh submissions/csharp-kestrel-nayef-shuvo
 | `JWT_SECRET` | required | any length (a key under 32 bytes is zero-padded, which HMAC treats as the same key) |
 | `HOST`, `PORT` | `127.0.0.1`, `3000` | what the Nginx config expects |
 | `DB_POOL_SIZE` | 10 per core, at most 90 | Postgres allows 100 connections and the rules say 95 |
+| `DB_MAX_AUTO_PREPARE` | 64 | statements Npgsql keeps prepared per connection; 0 turns it off |
+| `DB_AUTO_PREPARE_MIN_USAGES` | 5 | runs of a statement on a connection before it is prepared there |
 | `BCRYPT_THREADS` | half the cores, at least 1 | worker threads for bcrypt |
 | `BCRYPT_BATCH_MS` | 100 | how long the first waiting hash waits for others to share its run |
 
@@ -64,8 +66,18 @@ and `LOG_SQL=1` for every SQL statement. All of it is compiled out of Release bu
 - **JSON without reflection.** Responses are written with `Utf8JsonWriter` into one reused buffer per thread (so there is a
   `Content-Length`) and copied into Kestrel's output pipe. Request bodies are parsed with `JsonDocument`, which the handler owns
   and disposes instead of cloning the element, and keys are looked up as UTF-8 literals. The query string is read in one pass.
-- **The reference SQL, unchanged**, run through Npgsql's pool. Statements are not prepared (Npgsql's default); nothing else is
-  kept between requests.
+- **The reference SQL, unchanged, with automatic prepared statements.** The server sends 34 distinct statements. Once a statement has
+  run 5 times on a connection, Npgsql prepares it there (`DB_MAX_AUTO_PREPARE`, default 64, keeps all of them), so Postgres plans
+  each statement once per connection instead of on every call. It is a plan cache, never data. The saving is the planning time of the
+  queries with subqueries: one connection, per query, 28 to 42% lower latency on the lists by tag, author or favorited, the feed and
+  the article read. Interleaved load runs against the same build with it off (64 connections, 3 rounds each, laptop):
+
+  | | requests per second | p99 | Postgres CPU per request |
+  |---|---|---|---|
+  | list-heavy mix, off | 1,704 to 1,782 | 88 to 96 ms | 4.2 ms |
+  | list-heavy mix, on | 2,125 to 2,224 (+24%) | 68 to 75 ms | 3.1 ms |
+  | feed, off | 2,112 to 2,303 | 63 to 76 ms | 3.2 ms |
+  | feed, on | 3,900 to 4,221 (+79%) | 30 to 32 ms | 1.5 ms |
 - **bcrypt (the largest CPU cost of any request).** One login is one hash at cost 10, about 50 to 65 ms with a standard library.
   Blowfish is a long chain of dependent steps, so one hash leaves most of a core's execution units idle. `BcryptCore.cs` runs 1 to
   4 independent hashes in lockstep, round by round, so the processor overlaps them (`BcryptLanes.g.cs` is written by
@@ -93,7 +105,7 @@ uses about 6 cores. Postgres, running the reference SQL, is the bottleneck there
 
 - **No caching of data.** Every response reads Postgres while it is being served. The one static table is the serialized bodies
   of our fixed error messages (`{"errors":{"body":["unauthorized"]}}` and the like), which contain no data. The per-thread JSON
-  buffers and pooled connections hold no data either. No JWT verification and no bcrypt result is remembered.
+  buffers and pooled connections and prepared statements (query plans) hold no data either. No JWT verification and no bcrypt result is remembered.
 - **Security stays real.** Every password is hashed with bcrypt cost 10 and every login runs a full hash against the stored one;
   every token's HS256 signature and `exp` are checked on every request, and any other `alg` is refused. A password over bcrypt's
   72 bytes or with a NUL character is refused (422 on register and on a password change; a login with one is a 401). A stored
