@@ -55,14 +55,15 @@ enum stmt {
     P_AUTHOR_COUNTS,
     P_FAV_PAGES,
     P_FAV_COUNTS,
-    P_FEED_PAGES,
-    P_FEED_COUNTS,
+    P_FEED,
     P_ARTICLES,
     P_COMMENTS,
     P_PROFILES,
     /* ... and phase B: each distinct article enriched once, and every viewer's flags. */
     P_ARTX,
     P_FLAGS,
+    P_TAGDICT,
+    P_AUTHORS,
     S_COUNT
 };
 

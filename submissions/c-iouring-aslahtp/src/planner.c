@@ -5,7 +5,8 @@
  *            and counts, articles by slug, comments, profiles, tags). Keys are deduplicated first: one page per
  *            distinct (filter, limit, offset), one count per distinct filter, one lookup per distinct slug or
  *            username. Pages come back as lean article rows.
- *   phase B: every distinct article in the batch is enriched once (tag names, favorites count, author), and one
+ *   phase B: every distinct article in the batch is enriched once (tag ids, favorites count), every distinct
+ *            author is read once, the tag dictionary (all tags in name order) turns tag ids into names, and one
  *            statement answers every viewer's favorited/following questions with a primary-key range scan per
  *            viewer instead of a probe per article.
  *
@@ -58,10 +59,10 @@ void planner_add(int worker, uint64_t token, const struct plan_req *pr, uint32_t
     wait_n++;
 }
 
-int64_t planner_due_in(int64_t now_us) {
+int64_t planner_due_in(int64_t now_us, int64_t wait_us) {
     if (!wait_head) return -1;
     if (wait_n >= cfg.plan_max) return 0;
-    int64_t due = wait_head->t_us + cfg.plan_wait_us - now_us;
+    int64_t due = wait_head->t_us + wait_us - now_us;
     return due > 0 ? due : 0;
 }
 
@@ -75,8 +76,8 @@ struct pstr {
 /* Families of phase A keys, each answered by one statement. */
 enum fam { F_GP, F_TP, F_AP, F_FP, F_FEP, F_TC, F_AC, F_FC, F_FEC, F_ART, F_CMT, F_PROF, F_NFAM };
 static const enum stmt fam_stmt[F_NFAM] = {
-    P_GLOBAL_PAGES, P_TAG_PAGES, P_AUTHOR_PAGES, P_FAV_PAGES, P_FEED_PAGES, P_TAG_COUNTS,
-    P_AUTHOR_COUNTS, P_FAV_COUNTS, P_FEED_COUNTS, P_ARTICLES, P_COMMENTS, P_PROFILES,
+    P_GLOBAL_PAGES, P_TAG_PAGES, P_AUTHOR_PAGES, P_FAV_PAGES, P_FEED, P_TAG_COUNTS,
+    P_AUTHOR_COUNTS, P_FAV_COUNTS, P_FEED, P_ARTICLES, P_COMMENTS, P_PROFILES,  /* F_FEP and F_FEC share P_FEED */
 };
 
 struct entry {
@@ -94,7 +95,14 @@ struct entry {
 struct art {
     int64_t id, author_id, created, updated, favcount;
     struct pstr slug, title, description, body, tags_json, username, bio, image;
+    int32_t *tag_ids;         /* from P_ARTX; rendered into tags_json once the dictionary is in */
+    uint32_t ntag_ids;
     bool has_body, enriched;
+};
+
+struct author {
+    int64_t id;
+    struct pstr username, bio, image;
 };
 
 struct cmt {
@@ -138,10 +146,15 @@ struct plan {
     uint32_t ncmts, cmts_cap;
     struct map flags;            /* kind 0: (viewer, article) favorited; kind 1: (viewer, user) followed */
 
+    struct author *authors;      /* P_AUTHORS rows, found by id through umap */
+    uint32_t nauthors, authors_cap;
+    struct map umap;
+
     bool want_count, want_tags;
     int64_t global_count;
-    struct pstr *tags;
-    uint32_t ntags, tags_cap;
+    struct pstr *tags;           /* every tag name in name order (P_TAGDICT) */
+    int32_t *tag_id;             /* tags[i]'s id */
+    uint32_t ntags, tags_cap, tag_id_cap;
     struct buf body;
 };
 
@@ -311,7 +324,7 @@ static void write_phase_a(struct plan *p, struct buf *out) {
     struct pg_bind pb;
     p->nsent = p->cur = 0;
     for (int f = 0; f < F_NFAM; f++) {
-        if (!p->fam_n[f]) continue;
+        if (!p->fam_n[f] || f == F_FEC) continue;  /* feed counts ride in P_FEED with the feed pages */
         stmt_start(p, &pb, out, fam_stmt[f]);
         switch (f) {
         case F_GP:
@@ -323,13 +336,11 @@ static void write_phase_a(struct plan *p, struct buf *out) {
             bind_i64_array(&pb, p, f, 0);
             bind_i64_array(&pb, p, f, 1);
             break;
-        case F_FEP:
+        case F_FEP:  /* every feed request has both a page and a count entry */
+            bind_i64_array(&pb, p, F_FEC, 0);
             bind_i64_array(&pb, p, f, 0);
             bind_i64_array(&pb, p, f, 1);
             bind_i64_array(&pb, p, f, 2);
-            break;
-        case F_FEC:
-            bind_i64_array(&pb, p, f, 0);
             break;
         default:  /* counts by name, slugs, usernames */
             bind_text_array(&pb, p, f);
@@ -342,7 +353,7 @@ static void write_phase_a(struct plan *p, struct buf *out) {
         stmt_end(&pb);
     }
     if (p->want_tags) {
-        stmt_start(p, &pb, out, S_TAGS);
+        stmt_start(p, &pb, out, P_TAGDICT);
         stmt_end(&pb);
     }
     pg_sync(out);
@@ -389,6 +400,20 @@ static bool row_cols(const struct pg_msg *m, struct cols *c, int want) {
 
 static int64_t i64(const struct cols *c, int i) { return c->n[i] == 8 ? pg_i64(c->v[i]) : 0; }
 
+/* One P_TAGDICT row (id, name): the tags come in name order, so the list doubles as the /api/tags answer. */
+static bool tag_row(struct plan *p, const struct pg_msg *m) {
+    struct cols c;
+    if (!row_cols(m, &c, 2) || c.n[0] != 4) return false;
+    GROW(p->tags, p->ntags, p->tags_cap);
+    if (p->tag_id_cap < p->tags_cap) {
+        p->tag_id_cap = p->tags_cap;
+        p->tag_id = xrealloc(p->tag_id, p->tag_id_cap * sizeof *p->tag_id);
+    }
+    p->tag_id[p->ntags] = pg_i32(c.v[0]);
+    p->tags[p->ntags++] = keep(p, c.v[1], c.n[1]);
+    return true;
+}
+
 /* The article for a lean row (k, id, author_id, slug, title, description, created_at, updated_at[, body]). */
 static uint32_t art_from_row(struct plan *p, const struct cols *c, bool with_body) {
     struct mkey k = {0, i64(c, 1), 0, 0, NULL, 0};
@@ -429,7 +454,24 @@ static bool row_phase_a(struct plan *p, enum stmt s, const struct pg_msg *m) {
     struct cols c;
     enum fam f = stmt_fam(s);
     switch (s) {
-    case P_GLOBAL_PAGES: case P_TAG_PAGES: case P_AUTHOR_PAGES: case P_FAV_PAGES: case P_FEED_PAGES: {
+    case P_FEED: {
+        /* Count rows carry -k (k: the viewer's F_FEC ordinal), page rows k (the request's F_FEP ordinal). */
+        if (!row_cols(m, &c, 8)) return false;
+        int64_t k = i64(&c, 0);
+        if (k < 0) {
+            struct entry *e = entry_k(p, F_FEC, -k);
+            if (!e) return false;
+            e->count = i64(&c, 1);
+            return true;
+        }
+        struct entry *e = entry_k(p, F_FEP, k);
+        if (!e) return false;
+        uint32_t ai = art_from_row(p, &c, false);
+        GROW(e->items, e->n, e->cap);
+        e->items[e->n++] = ai;
+        return true;
+    }
+    case P_GLOBAL_PAGES: case P_TAG_PAGES: case P_AUTHOR_PAGES: case P_FAV_PAGES: {
         if (!row_cols(m, &c, 8)) return false;
         struct entry *e = entry_k(p, f, i64(&c, 0));
         if (!e) return false;
@@ -438,7 +480,7 @@ static bool row_phase_a(struct plan *p, enum stmt s, const struct pg_msg *m) {
         e->items[e->n++] = ai;
         return true;
     }
-    case P_TAG_COUNTS: case P_AUTHOR_COUNTS: case P_FAV_COUNTS: case P_FEED_COUNTS: {
+    case P_TAG_COUNTS: case P_AUTHOR_COUNTS: case P_FAV_COUNTS: {
         if (!row_cols(m, &c, 2)) return false;
         struct entry *e = entry_k(p, f, i64(&c, 0));
         if (!e) return false;
@@ -487,11 +529,8 @@ static bool row_phase_a(struct plan *p, enum stmt s, const struct pg_msg *m) {
         e->image = keep(p, c.v[4], c.n[4]);
         return true;
     }
-    case S_TAGS:
-        if (!row_cols(m, &c, 1)) return false;
-        GROW(p->tags, p->ntags, p->tags_cap);
-        p->tags[p->ntags++] = keep(p, c.v[0], c.n[0]);
-        return true;
+    case P_TAGDICT:
+        return tag_row(p, m);
     default:
         return false;
     }
@@ -576,12 +615,30 @@ static bool write_phase_b(struct plan *p, struct buf *out) {
 
     p->nsent = p->cur = 0;
     if (p->narts) {
+        /* Articles once each, their authors once each, then the tag dictionary: it comes after P_ARTX, so every
+         * tag id P_ARTX returns is in it (tags are never deleted). It also answers this plan's /api/tags. */
         int64_t *ids = xmalloc(p->narts * sizeof *ids), *authors = xmalloc(p->narts * sizeof *authors);
-        for (uint32_t i = 0; i < p->narts; i++) ids[i] = p->arts[i].id, authors[i] = p->arts[i].author_id;
+        uint32_t nau = 0;
+        struct map seen;
+        map_init(&seen, p->narts);
+        for (uint32_t i = 0; i < p->narts; i++) {
+            ids[i] = p->arts[i].id;
+            struct mkey k = {0, p->arts[i].author_id, 0, 0, NULL, 0};
+            bool added;
+            map_get(&seen, &k, &added);
+            if (added) authors[nau++] = p->arts[i].author_id;
+        }
+        map_free(&seen);
         stmt_start(p, &pb, out, P_ARTX);
         bind_vec(&pb, ids, p->narts);
-        bind_vec(&pb, authors, p->narts);
         stmt_end(&pb);
+        stmt_start(p, &pb, out, P_AUTHORS);
+        bind_vec(&pb, authors, nau);
+        stmt_end(&pb);
+        stmt_start(p, &pb, out, P_TAGDICT);
+        stmt_end(&pb);
+        p->ntags = 0;  /* phase A's copy, if any, is replaced by this newer one */
+        map_init(&p->umap, nau);
         free(ids);
         free(authors);
     }
@@ -605,40 +662,42 @@ static bool write_phase_b(struct plan *p, struct buf *out) {
 static bool row_phase_b(struct plan *p, enum stmt s, const struct pg_msg *m) {
     struct cols c;
     if (s == P_ARTX) {
-        if (!row_cols(m, &c, 6)) return false;
+        if (!row_cols(m, &c, 3)) return false;
         struct mkey k = {0, i64(&c, 0), 0, 0, NULL, 0};
         bool added;
         uint32_t i = map_get(&p->amap, &k, &added);
         if (added) return false;  /* not an article we asked about */
         struct art *a = &p->arts[i];
-        /* The tag names, rendered once as the JSON array every response with this article shares. */
-        struct buf t;
-        buf_init(&t, 64);
-        buf_putc(&t, '[');
-        struct pg_array arr;
+        a->ntag_ids = 0;
         if (c.n[1] >= 0) {
-            if (!pg_array_init(&arr, c.v[1], c.n[1])) {
-                buf_free(&t);
-                return false;
-            }
+            struct pg_array arr;
+            if (!pg_array_init(&arr, c.v[1], c.n[1])) return false;
+            a->tag_ids = arena_alloc(&p->a, (arr.n ? arr.n : 1) * sizeof *a->tag_ids);
             for (uint32_t j = 0; j < arr.n; j++) {
                 const uint8_t *v;
                 int32_t n = pg_array_next(&arr, &v);
-                if (n < 0) continue;
-                if (t.len > 1) buf_putc(&t, ',');
-                json_str(&t, (const char *)v, (size_t)n);
+                if (n == 4) a->tag_ids[a->ntag_ids++] = pg_i32(v);
             }
         }
-        buf_putc(&t, ']');
-        a->tags_json = keep(p, (const uint8_t *)t.p, (int32_t)t.len);
-        buf_free(&t);
         a->favcount = i64(&c, 2);
-        a->username = keep(p, c.v[3], c.n[3]);
-        a->bio = keep(p, c.v[4], c.n[4]);
-        a->image = keep(p, c.v[5], c.n[5]);
         a->enriched = true;
         return true;
     }
+    if (s == P_AUTHORS) {
+        if (!row_cols(m, &c, 4)) return false;
+        struct mkey k = {0, i64(&c, 0), 0, 0, NULL, 0};
+        bool added;
+        map_get(&p->umap, &k, &added);
+        if (!added) return true;
+        GROW(p->authors, p->nauthors, p->authors_cap);
+        struct author *u = &p->authors[p->nauthors++];
+        u->id = k.a;
+        u->username = keep(p, c.v[1], c.n[1]);
+        u->bio = keep(p, c.v[2], c.n[2]);
+        u->image = keep(p, c.v[3], c.n[3]);
+        return true;
+    }
+    if (s == P_TAGDICT) return tag_row(p, m);
     if (s == P_FLAGS) {
         if (!row_cols(m, &c, 3)) return false;
         struct mkey k = {(uint8_t)i64(&c, 0), i64(&c, 1), i64(&c, 2), 0, NULL, 0};
@@ -811,12 +870,70 @@ static void plan_free(struct plan *p) {
     map_free(&p->emap);
     map_free(&p->amap);
     if (p->flags.slot) map_free(&p->flags);
+    if (p->umap.slot) map_free(&p->umap);
     free(p->arts);
     free(p->cmts);
+    free(p->authors);
     free(p->tags);
+    free(p->tag_id);
     buf_free(&p->body);
     arena_free(&p->a);
     free(p);
+}
+
+/* After phase B: each enriched article gets its author (an article whose author row is gone is treated as gone,
+ * as the old join did) and its tags as the JSON array every response with it shares, in name order: the
+ * dictionary is in name order, so a tag's position there is its rank. */
+static void finish_articles(struct plan *p) {
+    int32_t max_id = 0;
+    for (uint32_t i = 0; i < p->ntags; i++)
+        if (p->tag_id[i] > max_id) max_id = p->tag_id[i];
+    int32_t *rank = xmalloc(((size_t)max_id + 1) * sizeof *rank);
+    for (int32_t i = 0; i <= max_id; i++) rank[i] = -1;
+    for (uint32_t i = 0; i < p->ntags; i++)
+        if (p->tag_id[i] >= 0) rank[p->tag_id[i]] = (int32_t)i;
+
+    struct buf t;
+    buf_init(&t, 256);
+    for (uint32_t i = 0; i < p->narts; i++) {
+        struct art *a = &p->arts[i];
+        if (!a->enriched) continue;
+        struct mkey k = {0, a->author_id, 0, 0, NULL, 0};
+        if (!map_has(&p->umap, &k)) {
+            a->enriched = false;
+            continue;
+        }
+        bool added;
+        const struct author *u = &p->authors[map_get(&p->umap, &k, &added)];
+        a->username = u->username;
+        a->bio = u->bio;
+        a->image = u->image;
+
+        /* Ranks of this article's tags, insertion-sorted (an article usually has a handful). */
+        int32_t *r = arena_alloc(&p->a, (a->ntag_ids ? a->ntag_ids : 1) * sizeof *r);
+        uint32_t nr = 0;
+        for (uint32_t j = 0; j < a->ntag_ids; j++) {
+            int32_t id = a->tag_ids[j];
+            if (id < 0 || id > max_id || rank[id] < 0) continue;
+            int32_t x = rank[id];
+            uint32_t at = nr++;
+            while (at && r[at - 1] > x) {
+                r[at] = r[at - 1];
+                at--;
+            }
+            r[at] = x;
+        }
+        t.len = 0;
+        buf_putc(&t, '[');
+        for (uint32_t j = 0; j < nr; j++) {
+            if (j) buf_putc(&t, ',');
+            json_str(&t, p->tags[r[j]].p, p->tags[r[j]].n);
+        }
+        buf_putc(&t, ']');
+        a->tags_json = keep(p, (const uint8_t *)t.p, (int32_t)t.len);
+    }
+    buf_free(&t);
+    free(rank);
 }
 
 bool planner_msg(struct plan *p, const struct pg_msg *m, struct buf *out, bool *done) {
@@ -844,6 +961,7 @@ bool planner_msg(struct plan *p, const struct pg_msg *m, struct buf *out, bool *
             p->phase = 1;
             if (write_phase_b(p, out)) return true;
         }
+        if (p->phase == 1 && !p->failed && p->narts) finish_articles(p);
         answer_all(p);
         plan_free(p);
         *done = true;

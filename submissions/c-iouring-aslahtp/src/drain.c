@@ -37,6 +37,7 @@ struct dconn {
     int fd;
     struct buf out, sending, in;
     bool send_busy, plan_active;
+    int64_t plan_t0;              /* when the running plan started */
     size_t sent;
     size_t reply_start;           /* start of the head unit's reply in `in` */
     struct unit *head, *tail;     /* units in flight */
@@ -63,9 +64,12 @@ struct drain {
     struct pending_reply **overflow, **overflow_tail;
     bool timer_armed;
     struct __kernel_timespec timer_ts;
+    int64_t ewma_plan_us;              /* how long a plan takes, start to answer (EWMA, 1/4 weight) */
 };
 
 static struct drain D;
+
+static int64_t mono_us(void);
 
 static struct io_uring_sqe *dsqe(void) {
     struct io_uring_sqe *s = io_uring_get_sqe(&D.ring);
@@ -243,6 +247,8 @@ static void on_recv(struct dconn *c, int res) {
             c->inflight--;
             if (done) {
                 c->plan_active = false;
+                int64_t took = mono_us() - c->plan_t0;
+                D.ewma_plan_us = D.ewma_plan_us ? (3 * D.ewma_plan_us + took) / 4 : took;
                 unit_free(u);
             } else {
                 u->next = NULL;
@@ -300,22 +306,27 @@ static void arm_timer(int64_t us) {
     io_uring_sqe_set_data64(s, D_TIMER);
 }
 
-/* A connection with nothing in flight: Postgres has a backend doing nothing. */
-static bool idle_conn(void) {
-    for (int i = 0; i < D.npg; i++)
-        if (!D.pg[i].plan_active && D.pg[i].inflight == 0) return true;
-    return false;
+/* How long the oldest queued request may wait for company before a plan starts. With plan_pace the wait follows
+ * the load: a plan's typical duration times the share of the other connections that are free. When every other
+ * connection is busy it is zero (a backend is free and work is queued: start now); when most are free it is close
+ * to one plan's duration, so plans start staggered and each takes a full batch instead of a handful. Capped by
+ * plan_wait_us, which is the fixed wait without plan_pace. */
+static int64_t plan_wait(void) {
+    if (!cfg.plan_pace) return cfg.plan_wait_us;
+    int free_n = 0;
+    for (int i = 0; i < D.npg; i++) free_n += !D.pg[i].plan_active;
+    if (free_n <= 1) return 0;
+    int64_t w = D.ewma_plan_us * (free_n - 1) / D.npg;
+    return w < cfg.plan_wait_us ? w : cfg.plan_wait_us;
 }
 
-/* Starts plans while requests are due and a connection has no plan running. Requests are due plan_wait_us after
- * the oldest arrived; with plan_idle they are due at once while some backend is idle, since waiting then only
- * adds latency. Under load every connection is busy, so requests still pile up into big plans. */
+/* Starts plans while requests are due and a connection has no plan running. */
 static void schedule_plans(void) {
     int64_t now = mono_us();
     for (;;) {
-        int64_t due = planner_due_in(now);
+        int64_t due = planner_due_in(now, plan_wait());
         if (due < 0) return;
-        if (due > 0 && !(cfg.plan_idle && idle_conn())) {
+        if (due > 0) {
             arm_timer(due);
             return;
         }
@@ -332,6 +343,7 @@ static void schedule_plans(void) {
             return;
         }
         best->plan_active = true;
+        best->plan_t0 = now;
         u->next = NULL;
         if (best->tail) best->tail->next = u;
         else best->head = u;

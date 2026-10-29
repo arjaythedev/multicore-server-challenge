@@ -38,7 +38,7 @@ struct plan;
 void planner_init(void);
 void planner_add(int worker, uint64_t token, const struct plan_req *pr, uint32_t len);
 /* Microseconds until the oldest waiting request is due, 0 if one is due now, -1 if nothing waits. */
-int64_t planner_due_in(int64_t now_us);
+int64_t planner_due_in(int64_t now_us, int64_t wait_us);
 /* Takes up to the batch limit of waiting requests into a plan and writes its phase A to out; NULL if none. */
 struct plan *planner_start(struct buf *out);
 /* A message of the plan's current phase. On ReadyForQuery it returns true, after writing phase B to out (when

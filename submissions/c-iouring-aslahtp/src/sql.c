@@ -194,18 +194,37 @@ const struct stmt_def stmts[S_COUNT] = {
                       "(SELECT u.id FROM users u WHERE u.username = r.name) LIMIT 1000) s) "
                       "FROM unnest($1::text[]) WITH ORDINALITY r(name, k)",
                       1, 2, {TA}, {I8, I8}},
-    /* The feed page: each followee contributes at most lim+off of its newest ids (from the (author_id, id)
-     * index) before the merge, so a prolific author costs no more than a quiet one. */
-    [P_FEED_PAGES] = {"SELECT r.k, " LEAN_COLS " FROM unnest($1::int8[], $2::int8[], $3::int8[]) WITH ORDINALITY "
-                      "r(viewer, lim, off, k) CROSS JOIN LATERAL (SELECT z.id FROM (SELECT x.id FROM follows fo CROSS JOIN LATERAL "
-                      "(SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC "
-                      "LIMIT r.lim + r.off) x WHERE fo.follower_id = r.viewer ORDER BY x.id DESC "
-                      "LIMIT r.lim OFFSET r.off) z LIMIT 100) p JOIN articles a ON a.id = p.id",
-                      3, 8, {I8A, I8A, I8A}, LEAN_TYPES},
-    [P_FEED_COUNTS] = {"SELECT r.k, (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id IN "
-                       "(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.viewer) LIMIT 1000) s) "
-                       "FROM unnest($1::int8[]) WITH ORDINALITY r(viewer, k)",
-                       1, 2, {I8A}, {I8, I8}},
+    /* Feed counts and pages in one statement. Count rows: -k (k = the distinct viewer's ordinal in $1), then the
+     * count, padding NULLs. Page rows: k (the request's ordinal in $2..$4) and lean article columns.
+     *   hubs: followees that at least two viewers of the batch share (the 16 most shared) are looked at once.
+     *     A hub with 1000+ articles proves the capped count (1000) of every viewer following it, with no
+     *     counting. floor_id is the hub's article at the deepest page any of its followers needs: the hub alone
+     *     has that many articles at or above it, so a page needs nothing older, and every followee's walk stops
+     *     there.
+     *   Pages: each followee contributes at most lim+off of its newest ids (from the (author_id, id) index)
+     *     before the merge, so a prolific author costs no more than a quiet one. */
+    [P_FEED] = {"WITH reqs AS MATERIALIZED (SELECT p.v, p.lim, p.off, p.lim + p.off AS depth, p.k "
+                "FROM unnest($2::int8[], $3::int8[], $4::int8[]) WITH ORDINALITY p(v, lim, off, k)), "
+                "u AS MATERIALIZED (SELECT r.k, r.v, ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.v) AS fids, "
+                "COALESCE((SELECT max(q.depth) FROM reqs q WHERE q.v = r.v), 1) AS depth "
+                "FROM unnest($1::int8[]) WITH ORDINALITY r(v, k)), "
+                "hubs AS MATERIALIZED (SELECT h.fid, "
+                "EXISTS (SELECT 1 FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC LIMIT 1 OFFSET 999) AS capped, "
+                "(SELECT a.id FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC LIMIT 1 OFFSET h.depth - 1) AS floor_id "
+                "FROM (SELECT f.fid, max(u.depth) AS depth FROM u, unnest(u.fids) AS f(fid) "
+                "GROUP BY f.fid HAVING count(*) >= 2 ORDER BY count(*) DESC, f.fid LIMIT 16) h), "
+                "cap AS MATERIALIZED (SELECT ARRAY(SELECT fid FROM hubs WHERE capped) AS fids) "
+                "SELECT -u.k, CASE WHEN u.fids && (SELECT fids FROM cap) THEN 1000::int8 "
+                "ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = ANY (u.fids) LIMIT 1000) s) END, "
+                "NULL::int8, NULL::text, NULL::text, NULL::text, NULL::timestamptz, NULL::timestamptz FROM u "
+                "UNION ALL "
+                "SELECT p.k, " LEAN_COLS " FROM reqs p JOIN u ON u.v = p.v "
+                "CROSS JOIN LATERAL (SELECT max(h.floor_id) AS floor_id FROM hubs h WHERE h.fid = ANY (u.fids)) fl "
+                "CROSS JOIN LATERAL (SELECT z.id FROM (SELECT y.id FROM unnest(u.fids) AS f(fid) CROSS JOIN LATERAL "
+                "(SELECT a2.id FROM articles a2 WHERE a2.author_id = f.fid AND a2.id >= COALESCE(fl.floor_id, 0) "
+                "ORDER BY a2.id DESC LIMIT p.depth) y ORDER BY y.id DESC LIMIT p.lim OFFSET p.off) z LIMIT 100) x "
+                "JOIN articles a ON a.id = x.id",
+                4, 8, {I8A, I8A, I8A, I8A}, LEAN_TYPES},
     [P_ARTICLES] = {"SELECT r.k, " LEAN_COLS ", a.body FROM unnest($1::text[]) WITH ORDINALITY r(slug, k) "
                     "JOIN articles a ON a.slug = r.slug",
                     1, 9, {TA}, {I8, I8, I8, T, T, T, TZ, TZ, T}},
@@ -219,12 +238,17 @@ const struct stmt_def stmts[S_COUNT] = {
     [P_PROFILES] = {"SELECT r.k, u.id, u.username, u.bio, u.image FROM unnest($1::text[]) WITH ORDINALITY "
                     "r(name, k) JOIN users u ON u.username = r.name",
                     1, 5, {TA}, {I8, I8, T, T, T}},
-    /* Tag names by primary key: the generic plan for a tags join hashes all 200 tags per article. */
-    [P_ARTX] = {"SELECT r.id, ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) AS name "
-                "FROM article_tags at WHERE at.article_id = r.id ORDER BY 1), "
-                "(SELECT count(*) FROM favorites f WHERE f.article_id = r.id), u.username, u.bio, u.image "
-                "FROM unnest($1::int8[], $2::int8[]) r(id, author) JOIN users u ON u.id = r.author",
-                2, 6, {I8A, I8A}, {I8, TA, I8, T, T, T}},
+    /* Per distinct article: its tag ids (names come from P_TAGDICT, once per plan, instead of a tags lookup per
+     * tag per article) and its favorites count. Authors are fetched once per distinct author (P_AUTHORS). */
+    [P_ARTX] = {"SELECT r.id, ARRAY(SELECT at.tag_id FROM article_tags at WHERE at.article_id = r.id), "
+                "(SELECT count(*) FROM favorites f WHERE f.article_id = r.id) FROM unnest($1::int8[]) r(id)",
+                1, 3, {I8A}, {I8, OID_INT4_ARRAY, I8}},
+    /* Every tag in name order (the database's collation, as ORDER BY name per article was): a tag's position is
+     * its rank when an article's tags are put in order. 200 rows on 2 heap pages. Sent after P_ARTX in the same
+     * pipeline: tags are never deleted, so every id P_ARTX returned is here. */
+    [P_TAGDICT] = {"SELECT id, name FROM tags ORDER BY name", 0, 2, {0}, {I4, T}},
+    [P_AUTHORS] = {"SELECT u.id, u.username, u.bio, u.image FROM unnest($1::int8[]) r(id) JOIN users u ON u.id = r.id",
+                   1, 4, {I8A}, {I8, T, T, T}},
     /* Which (viewer, article) pairs are favorites and which (viewer, user) pairs are follows: one primary-key
      * range scan per viewer instead of one probe per article. */
     [P_FLAGS] = {"WITH p AS (SELECT v, array_agg(x) AS xs FROM unnest($1::int8[], $2::int8[]) t(v, x) GROUP BY v), "
@@ -246,6 +270,8 @@ __attribute__((constructor)) static void name_stmts(void) {
 const char *const session_tune_sql[] = {
     "SET enable_memoize = off",
     "SET enable_hashagg = off",
+    "SET work_mem = '32MB'",
+    "SET random_page_cost = 1.1",
     NULL,
 };
 bool session_tune;

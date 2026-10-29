@@ -153,7 +153,7 @@ struct config {
     uint32_t plan_max;     /* most planned reads in one plan */
     int64_t plan_wait_us;  /* how long the oldest planned read may wait for company */
     bool planner;          /* hot reads go to the planner (else as plain units) */
-    bool plan_idle;        /* start a plan at once when a read connection is idle, instead of waiting plan_wait_us */
+    bool plan_pace;        /* plan wait follows the load (drain.c plan_wait); plan_wait_us becomes its cap */
     bool direct_fds;       /* accept client sockets as io_uring direct descriptors (off: no measured gain on loopback) */
 };
 extern struct config cfg;
