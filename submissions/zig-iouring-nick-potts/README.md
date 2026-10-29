@@ -224,7 +224,7 @@ saturation, and five read backends would cap how much Postgres the reads can use
 
 **The clock.** Reads wait in the queue until the oldest has waited 5 ms and 80 ms have passed since the previous
 drain started (the drain gap, as in #47's gather). Then a free read connection takes every queued read of every
-worker, up to 4,096, and sends them as one Sync group. 4,096 queued reads start a drain at once, gap or not. At
+worker, up to 4,096, and sends them as one Sync group. 4,096 reads on one lane drain at once, gap or not. At
 130,000 users the 80 ms gap puts about 1,400 reads in a shared drain, where the measured cost curve flattens (cost
 per read against 215 per drain: 0.91 at 430, 0.73 at 860, 0.70 at 1,290), and the gap adds up to itself to a shared
 read's latency. Each connection has one group in flight at a time (depth 1). This is #47's two-phase gather, and
@@ -242,8 +242,12 @@ users on an aged database, where they were 54–63% of MEGA's time, so every art
 the feed work. Now the shared drain's round trip no longer includes feeds, and every fourth tick about four times the
 feeds share one execution, as #82 runs its slow family on a lane of its own. The shared drain loses the article
 rows it had in common with the feeds, a small cost. Sharing starts with the requests already queued for one fresh
-execution and nothing survives it, as everywhere else here. A full queue (4,096 reads over all lanes) starts every
-lane's drain at once.
+execution and nothing survives it, as everywhere else here. Each lane counts its own full queue. 4,096 reads on a
+lane start its drain at once, and the other lanes keep their gaps. The previous version counted every lane together
+and started every lane's drain past the mark. Under load the feed lane runs at its cap with a backlog, and that
+backlog plus the shared lane's gap of reads crossed the mark, so the shared and comments lanes drained early and
+small for as long as it lasted. At 190,000 users on an aged database (a Synteq copy of the official box) 30% of the
+comments drains and 26% of the shared drains started this way, every one of them with fewer reads than a full drain.
 
 **The comments lane.** Comment reads drain on a third lane with a 100 ms gap (`comments_gap_ns`), as one batched
 execution that reads each distinct thread once, and the shared drain
@@ -780,6 +784,7 @@ Measured on the development box with 3 CPUs at 42,000 users, against the gather 
 | Two parallel MEGAs | 10 ms clock, feeds in one MEGA and the rest in another, on two connections | About 0 µs/req | Collapsed in 2 of 2 holds at 154,000 on the receive-CPU-bound rig with five lanes. Back in this version as the feed lane (80 ms gap, eight lanes), to be judged on a Postgres-bound rig |
 | Key-sharded drains (offline) | Split each drain by key across connections | Kept 7–15% of the sharing gain, against a bar of ⅓ | Sharding by key destroys what MEGA shares. Sharding by kind kept 70–81% (−6 to −8% of MEGA CPU) but was the two-MEGA idea above |
 | Drain cap 1,024 | Smaller maximum drain | No gain | Kept 4,096 |
+| Full queue counted over all lanes | 4,096 reads queued on any lanes start every lane's drain at once | At 190,000 users on an aged database, 30% of comments drains and 26% of shared drains started early and small this way | Replaced in this version by a count per lane (batch clock section) |
 | bcrypt watchdog without duplicates | Stop the watchdog re-hashing a job an idle thread holds | Watchdog hashed only 17 of 14,113 jobs; +0.5 µs/req | Nothing to save at that load. Taken up in this version after the aged 190,000-user hold, where the watchdog ran 1.7 cores (bcrypt section) |
 
 ### SQL (replay, Postgres CPU against the version before unless noted)
