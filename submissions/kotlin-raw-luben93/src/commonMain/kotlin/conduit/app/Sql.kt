@@ -76,6 +76,13 @@ internal object ReadShare {
     var on = false
     var maxBatch = 256
     var viewerFlags = false
+
+    /**
+     * READ_FEED_MAX_BATCH (lab, 0 = the usual cap): most feeds per execution. Feeds share nothing, so a big batch only
+     * saves round trips, while one of 200 viewers (~0.3 ms of Postgres each) holds a read connection for 60-450 ms
+     * under load and everything queued behind it waits.
+     */
+    var feedMaxBatch = 0
 }
 
 /** The batch's requests, materialized once and referenced by several CTEs. */
@@ -398,7 +405,9 @@ internal object Sql {
      */
     val FEED = ReadKind(
         "feed",
-        // per request even with [ReadShare]: feeds are per viewer, so there is nothing to share (EXPLAIN: 361 vs 352 us)
+        // per request even with [ReadShare]: feeds are per viewer, so there is nothing to share (EXPLAIN: 361 vs 352 us).
+        // Tried and dropped (2026-10-28): taking the page from the count's id scan when below the cap. EXPLAIN 456 vs
+        // 327 us per feed: most viewers reach the 1000 cap (mean 893 ids), so the per-followee page runs anyway.
         list(
             "(SELECT count(*) FROM (SELECT 1 FROM articles c WHERE c.author_id = " +
                 "ANY (ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.v)) LIMIT 1000) s)",
@@ -409,7 +418,7 @@ internal object Sql {
                 "true",
             ),
         ),
-        maxBatch = batch,
+        maxBatch = ReadShare.feedMaxBatch.takeIf { it > 0 } ?: batch,
     )
 
     val reads: List<ReadKind> = listOf(

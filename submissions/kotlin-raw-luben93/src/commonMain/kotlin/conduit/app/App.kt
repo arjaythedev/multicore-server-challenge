@@ -19,12 +19,14 @@ object App {
         shareReads: Boolean = false,
         shareMaxBatch: Int = ReadShare.maxBatch,
         viewerFlags: Boolean = false,
+        feedMaxBatch: Int = 0,
     ) {
         TagOrder.appSorts = appSortsTags && collation != null &&
             TagOrder.isByteOrder(collation[0] ?: "", collation[1] ?: "", collation[2] ?: "")
         ReadShare.on = shareReads
         ReadShare.maxBatch = shareMaxBatch
         ReadShare.viewerFlags = viewerFlags
+        ReadShare.feedMaxBatch = feedMaxBatch
     }
 
     /** Who sorts tag lists (for the startup log line). */

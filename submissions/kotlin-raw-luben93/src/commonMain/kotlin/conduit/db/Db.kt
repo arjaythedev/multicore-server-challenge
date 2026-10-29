@@ -82,6 +82,12 @@ class DbConfig(
      * connection is free). Bigger batches cost Postgres less per request, the more so when they share work.
      */
     val gatherMicros: Int = 0,
+    /**
+     * Adaptive LIFO (0: off, plain oldest-first): while a kind's oldest waiting read is older than this, a free
+     * connection takes that kind's NEWEST requests. A backlog burst then delays only its own requests (they are served
+     * once it clears, or dropped unrun past the client's timeout) instead of every request behind it.
+     */
+    val lifoMicros: Int = 0,
 ) {
     companion object {
         /**
@@ -97,6 +103,7 @@ class DbConfig(
             writeQueueMax: Int = 0,
             skipAbandoned: Boolean = false,
             gatherMicros: Int = 0,
+            lifoMicros: Int = 0,
         ): DbConfig {
             val rest = when {
                 url.startsWith("postgres://") -> url.substring("postgres://".length)
@@ -131,7 +138,7 @@ class DbConfig(
             val database = percentDecode(path.trimEnd('/')).ifEmpty { user }
             return DbConfig(
                 host.ifEmpty { "localhost" }, port, user, password, database, readConns, writeConns, options,
-                readQueueMax, writeQueueMax, skipAbandoned, gatherMicros,
+                readQueueMax, writeQueueMax, skipAbandoned, gatherMicros, lifoMicros,
             )
         }
 
