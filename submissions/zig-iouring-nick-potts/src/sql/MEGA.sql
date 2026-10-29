@@ -9,8 +9,11 @@ la AS MATERIALIZED (
     CASE WHEN lk.k = 5 THEN ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = lk.fv) END AS a
   FROM lk),
 tf AS MATERIALIZED (
-  SELECT x.f FROM la CROSS JOIN LATERAL unnest(la.a) x(f) GROUP BY x.f HAVING count(*) > 1
+  SELECT x.f, GREATEST(max(la.lpo), 1) AS d FROM la CROSS JOIN LATERAL unnest(la.a) x(f) GROUP BY x.f HAVING count(*) > 1
   ORDER BY count(*) DESC, x.f LIMIT 20),
+hf AS MATERIALIZED (
+  SELECT tf.f, (SELECT a4.id FROM articles a4 WHERE a4.author_id = tf.f ORDER BY a4.id DESC OFFSET tf.d - 1 LIMIT 1) AS fl
+  FROM tf),
 big AS MATERIALIZED (
   SELECT ARRAY(SELECT tf.f FROM tf WHERE EXISTS (SELECT 1 FROM articles a3 WHERE a3.author_id = tf.f
     ORDER BY a3.author_id DESC, a3.id OFFSET 999)) AS a),
@@ -25,7 +28,8 @@ lc1 AS MATERIALIZED (
   END END AS n
   FROM la ck),
 lc AS MATERIALIZED (
-  SELECT k, fv, lim, off, lpo, t1, a, max(n) OVER (PARTITION BY k, fv, t1) AS n FROM lc1),
+  SELECT k, fv, lim, off, lpo, t1, a, max(n) OVER (PARTITION BY k, fv, t1) AS n,
+    CASE WHEN k = 5 THEN (SELECT max(hf.fl) FROM hf WHERE hf.f = ANY(lc1.a)) END AS fl FROM lc1),
 pg AS MATERIALIZED (
   SELECT lk.k, lk.fv, lk.lim, lk.off, lk.lpo, lk.t1, lk.n, p.id
   FROM lc lk LEFT JOIN LATERAL (
@@ -40,7 +44,8 @@ pg AS MATERIALIZED (
       (SELECT f.article_id FROM favorites f WHERE lk.k = 4 AND f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = lk.t1)
        ORDER BY f.article_id DESC LIMIT lk.lim OFFSET lk.off)
     UNION ALL
-      (SELECT x.id FROM unnest(lk.a) fo(followee_id) CROSS JOIN LATERAL (SELECT a3.id FROM articles a3 WHERE a3.author_id = fo.followee_id ORDER BY a3.id DESC LIMIT lk.lpo) x
+      (SELECT x.id FROM unnest(lk.a) fo(followee_id) CROSS JOIN LATERAL (SELECT a3.id FROM articles a3
+         WHERE a3.author_id = fo.followee_id AND a3.id >= COALESCE(lk.fl, 0) ORDER BY a3.id DESC LIMIT lk.lpo) x
        ORDER BY x.id DESC LIMIT lk.lim OFFSET lk.off)
   ) p ON true),
 art AS MATERIALIZED (

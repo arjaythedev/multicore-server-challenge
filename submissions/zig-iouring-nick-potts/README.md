@@ -387,6 +387,13 @@ Each was measured on replay against the version before it.
     `OFFSET 999` probe each (credit #10, #22, #11 and #4 for the probe), and a viewer who follows one with 1,000+
     articles has a capped count without walking anything. This covers 202 of 275 capped feeds and removes 65–67% of
     feed rows. Round 2 below raised the 10 to 20.
+  - each followee's walk stops at the drain's hub floor (credit #105 for the floor). `tf` also carries the deepest
+    page any viewer in the drain asks of each of its 20 most-shared followees, and `hf` looks up that page's last
+    article id per hub. A viewer's floor is the highest among the hubs it follows: that hub alone fills the viewer's
+    page down to there, so nothing below it can be on the page, and the walk reads ids at or above the floor only, as
+    an index condition. A viewer who follows no hub, or whose hubs have fewer articles than the page is deep, has no
+    floor and walks as before. −13 to −21% instructions on a feed drain of 300–450 feeds, nothing on the shared
+    drain, and byte-identical output across 270 replayed drains with and without deleted articles.
 - **Counts carried per distinct list request in the page CTE.** This one fixed a plan, not just a cost. Under the
   generic plan every CTE was estimated at 1 row, so Postgres chose a nested loop that compared each read against
   every other: 93 comparisons per read, 598,000 on the largest drain, about 5.2M over the whole replay. Carrying the
