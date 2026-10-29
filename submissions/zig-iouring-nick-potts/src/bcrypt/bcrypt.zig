@@ -7,10 +7,13 @@
 //! cheapest. `Engine.hash` then runs one batch.
 const std = @import("std");
 pub const cpu = @import("cpu.zig");
+const kernel = @import("kernel.zig");
 
-pub const KernelFn = *const fn ([*]const [18]u32, [*]const [4]u32, u32, [*][6]u32, ?*const u32) callconv(.c) bool;
+pub const KernelFn = kernel.KernelFn;
+pub const Progress = kernel.Progress;
+pub const save_every = kernel.save_every;
 
-pub const max_lanes = 8;
+pub const max_lanes = kernel.max_lanes;
 pub const min_calibrated_lanes = 4;
 /// Register and password change reject longer passwords with 422, as the Go reference does. Login does not:
 /// there the bytes past 72 are ignored, as `CompareHashAndPassword` ignores them.
@@ -161,9 +164,10 @@ pub fn matches(computed: *const Hash, stored: []const u8) bool {
 
 pub const HashError = error{ MixedCost, Abandoned };
 
-/// Hashes `jobs` (1..max_lanes, one cost) in one call of `v`'s kernel of exactly that width. `stop`, if given, is read
-/// once a round: nonzero abandons the batch (error.Abandoned, `out` undefined).
-pub fn hashWith(v: *const Variant, jobs: []const Job, out: []Hash, stop: ?*const u32) HashError!void {
+/// Hashes `jobs` (1..max_lanes, one cost) in one call of `v`'s kernel of exactly that width, the lanes in `jobs`'
+/// order. With `progress`, it starts and saves as that says, and error.Abandoned (`out` undefined) is a stop before the
+/// end.
+pub fn hashWith(v: *const Variant, jobs: []const Job, out: []Hash, progress: ?*Progress) HashError!void {
     std.debug.assert(jobs.len >= 1 and jobs.len <= max_lanes and out.len >= jobs.len);
     var kw: [max_lanes][18]u32 = undefined;
     var sw: [max_lanes][4]u32 = undefined;
@@ -174,7 +178,7 @@ pub fn hashWith(v: *const Variant, jobs: []const Job, out: []Hash, stop: ?*const
         kw[l] = keyWords(job.password);
         sw[l] = job.setting.salt;
     }
-    if (!v.width(jobs.len)(&kw, &sw, c, &ct, stop)) return error.Abandoned;
+    if (!v.width(jobs.len)(&kw, &sw, c, &ct, progress)) return error.Abandoned;
     for (jobs, 0..) |job, l| {
         var raw: [24]u8 = undefined;
         for (0..6) |j| std.mem.writeInt(u32, raw[4 * j ..][0..4], ct[l][j], .big);
@@ -190,9 +194,9 @@ pub const Engine = struct {
     cpu_ms_per_hash: f64,
 
     /// `jobs.len` may be anything from 1 to `lanes`; a short batch runs the kernel of its own width.
-    pub fn hash(e: Engine, jobs: []const Job, out: []Hash, stop: ?*const u32) HashError!void {
+    pub fn hash(e: Engine, jobs: []const Job, out: []Hash, progress: ?*Progress) HashError!void {
         std.debug.assert(jobs.len <= e.lanes);
-        return hashWith(e.variant, jobs, out, stop);
+        return hashWith(e.variant, jobs, out, progress);
     }
 };
 
@@ -351,6 +355,80 @@ test "the portable fallback hashes like the reference" {
     var h: [1]Hash = undefined;
     try e.hash(&.{.{ .password = k.pw, .setting = &st }}, &h, null);
     try std.testing.expectEqualStrings(k.hash, &h[0]);
+}
+
+/// Eight jobs at cost `c`, passwords of 0 to 21 random bytes.
+const Batch = struct {
+    pw: [max_lanes][21]u8 = undefined,
+    settings: [max_lanes]Setting = undefined,
+    jobs: [max_lanes]Job = undefined,
+    want: [max_lanes]Hash = undefined,
+
+    fn init(b: *Batch, c: u5, seed: u64) !void {
+        var prng = std.Random.DefaultPrng.init(seed);
+        for (0..max_lanes) |l| {
+            prng.random().bytes(&b.pw[l]);
+            b.settings[l] = newSettingCost(prng.random(), c);
+            b.jobs[l] = .{ .password = b.pw[l][0 .. 3 * l], .setting = &b.settings[l] };
+            try hashWith(&portable[0], b.jobs[l..][0..1], b.want[l..][0..1], null);
+        }
+    }
+};
+
+/// What a thread that takes `p` carries on from, as bcrypt.zig's watchdog does.
+fn carryOn(p: *Progress, n: usize) Progress {
+    var next: Progress = .{ .from = p.take(), .save = true };
+    const h = Progress.half(next.from);
+    @memcpy(next.saved[h][0..n], p.saved[h][0..n]);
+    return next;
+}
+
+test "a batch stopped after any round and finished from its newest saved state hashes as one run straight through" {
+    const sets: []const []const Variant = if (cpu.detect().v3) &.{ &variants, &portable } else &.{&portable};
+    const c = 6;
+    var b: Batch = .{};
+    try b.init(c, 0x0e5a17e);
+    for (sets) |set| for (set) |*v| for (1..max_lanes + 1) |n| for (0..(1 << c) + 1) |k| {
+        var first: Progress = .{ .save = true };
+        first.stopAfter(@intCast(k));
+        var got: [max_lanes]Hash = undefined;
+        const finished = if (hashWith(v, b.jobs[0..n], got[0..n], &first)) true else |e| switch (e) {
+            error.Abandoned => false,
+            else => return e,
+        };
+        try std.testing.expectEqual(k == 1 << c, finished);
+        var next = carryOn(&first, n);
+        const saved: u32 = if (k <= save_every) 0 else @intCast((k - 1) / save_every * save_every);
+        try std.testing.expectEqual(saved, next.from);
+        try hashWith(v, b.jobs[0..n], got[0..n], &next);
+        for (b.want[0..n], got[0..n]) |*w, *g| try std.testing.expectEqualStrings(w, g);
+    };
+}
+
+fn hashOn(v: *const Variant, jobs: []const Job, out: []Hash, p: *Progress) void {
+    hashWith(v, jobs, out, p) catch {};
+}
+
+test "a batch taken while its thread hashes finishes from the state that thread had saved" {
+    const v = if (cpu.detect().v3) &variants[2] else &portable[0];
+    const n = 5;
+    var b: Batch = .{};
+    try b.init(8, 0x7a4e);
+    var prng = std.Random.DefaultPrng.init(0x7a4f);
+    for (0..64) |i| {
+        var p: Progress = .{ .save = true };
+        var out: [max_lanes]Hash = undefined;
+        const t = try std.Thread.spawn(.{}, hashOn, .{ v, b.jobs[0..n], out[0..n], &p });
+        // Wait for some saved progress, then take the batch while the thread runs on, maybe mid-save.
+        const target: u32 = @intCast(i % 16 * save_every);
+        while (@as(u32, @truncate(p.at.load(.monotonic))) < target) std.atomic.spinLoopHint();
+        for (0..prng.random().uintLessThan(u32, 20_000)) |_| std.atomic.spinLoopHint();
+        var next = carryOn(&p, n);
+        t.join();
+        var got: [max_lanes]Hash = undefined;
+        try hashWith(v, b.jobs[0..n], got[0..n], &next);
+        for (b.want[0..n], got[0..n]) |*w, *g| try std.testing.expectEqualStrings(w, g);
+    }
 }
 
 test "setting round trip and too-long passwords" {

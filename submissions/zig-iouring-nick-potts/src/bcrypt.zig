@@ -13,9 +13,11 @@
 //! The hasher threads run at SCHED_IDLE (or the lowest nice they can reach), so hashing takes only CPU nothing else
 //! wants. Under saturation that can be none, and an unprivileged thread can never raise its priority again
 //! (RLIMIT_NICE is 0), so one more hasher, the watchdog, stays at normal priority and takes every job left unfinished
-//! `overdue_ns` after it was queued. A batch a hasher still holds past that goes to the watchdog whole, and the hasher
-//! drops it: the kernel reads a flag once a round and stops, so no batch is hashed to the end twice (a hasher that had
-//! just finished keeps its answer, and the watchdog's copy is dropped). Jobs overdue in the queue go `lanes` at a
+//! `overdue_ns` after it was queued. A batch a hasher still holds past that goes to the watchdog whole. The hasher's
+//! kernel saves its state every 16 rounds of the cost loop, and the watchdog carries on from the newest save with the
+//! same salts, so it redoes at most 16 of the 1,024 rounds; the hasher's kernel reads a flag once a round and stops.
+//! No batch is hashed to the end twice (a hasher that had just finished keeps its answer, and the watchdog's copy is
+//! dropped), and every hash is the one a straight run gives. Jobs overdue in the queue go `lanes` at a
 //! time, or fewer once the oldest has been overdue for `fill_ns`, since a short batch costs nearly a full one's CPU
 //! and the watchdog's CPU is CPU the rest of the box wanted.
 //!
@@ -71,12 +73,13 @@ const ready: u32 = 1;
 const finished_state: u32 = 2;
 
 /// One hasher thread's batch. The event loop fills it while `idle` and sets `ready`; the thread hashes it and sets
-/// `finished`; the event loop takes the results and sets `idle` again. The event loop sets `abandoned` once the
+/// `finished`; the event loop takes the results and sets `idle` again. The event loop takes `progress` once the
 /// watchdog has the batch; the thread's kernel reads it once a round and stops, leaving `complete` false. Nothing
 /// else is shared.
 const Slot = struct {
     state: std.atomic.Value(u32) = .init(idle),
-    abandoned: std.atomic.Value(u32) = .init(0),
+    /// The kernel's way through the batch: its newest saved state, and whether it must stop.
+    progress: bc.Progress = .{},
     /// Whether the thread hashed the batch to the end; its results count only then.
     complete: bool = false,
     n: usize = 0,
@@ -88,8 +91,13 @@ const Slot = struct {
     copy: [bc.max_lanes]Job = undefined,
     password: [bc.max_lanes][key_bytes]u8 = undefined,
     stored: [bc.max_lanes][hash_len]u8 = undefined,
+    /// What each job is hashed with: the thread picks a fresh salt for a `hash` job, unless the batch carries on from
+    /// another slot's progress, which brings that slot's settings.
+    settings: [bc.max_lanes]bc.Setting = undefined,
 
-    fn fill(s: *Slot, jobs: []const *Job) void {
+    /// Hands the thread `jobs`, to start from the setting, or from `from` rounds already done if the event loop put
+    /// that state and the settings it was made with into this slot.
+    fn fill(s: *Slot, jobs: []const *Job, from: u32) void {
         for (jobs, 0..) |j, i| {
             s.from[i] = j;
             s.seq[i] = j.seq;
@@ -103,16 +111,22 @@ const Slot = struct {
             s.copy[i] = .{ .kind = j.kind, .password = s.password[i][0..pw.len], .stored = stored, .owner = j.owner };
         }
         s.n = jobs.len;
+        s.progress.at.store(bc.Progress.no_stop, .monotonic);
+        s.progress.from = from;
         s.state.store(ready, .release);
         _ = linux.futex_3arg(&s.state.raw, .{ .cmd = .WAKE, .private = true }, 1);
     }
 
-    /// Hashes the batch it was given (on its thread), unless it is abandoned first.
+    /// Hashes the batch it was given (on its thread), unless it is taken first.
     fn work(s: *Slot) void {
+        s.complete = s.hash();
+        s.state.store(finished_state, .release);
+    }
+
+    fn hash(s: *Slot) bool {
         var batch: [bc.max_lanes]*Job = undefined;
         for (0..s.n) |i| batch[i] = &s.copy[i];
-        s.complete = run(batch[0..s.n], &s.abandoned.raw);
-        s.state.store(finished_state, .release);
+        return run(batch[0..s.n], &s.settings, &s.progress);
     }
 
     /// When the oldest job of the batch it holds was queued, if any is still waiting on it.
@@ -187,17 +201,17 @@ const Pool = struct {
             var batch: [bc.max_lanes]*Job = undefined;
             const n = @min(p.len, p.lanes);
             for (batch[0..n]) |*b| b.* = p.pop();
-            s.fill(batch[0..n]);
+            s.fill(batch[0..n], 0);
         }
         const watchdog = &p.slots[p.slots.len - 1];
         if (watchdog.state.load(.acquire) != idle) return next;
         var later: ?u64 = null;
         // A hasher whose batch is overdue is getting no CPU: the watchdog takes the whole batch, the oldest first,
-        // and the hasher drops its copy at its next round.
+        // and carries on from the hasher's newest saved state. The hasher stops at its next round.
         var stuck: ?*Slot = null;
         var stuck_at: u64 = std.math.maxInt(u64);
         for (hashers) |*s| {
-            if (s.state.load(.acquire) != ready or s.abandoned.load(.monotonic) != 0) continue;
+            if (s.state.load(.acquire) != ready or s.progress.taken()) continue;
             const at = (s.oldest() orelse continue) + p.overdue_ns;
             if (at > now) {
                 later = @min(later orelse at, at);
@@ -214,8 +228,16 @@ const Pool = struct {
                 batch[n] = j;
                 n += 1;
             }
-            s.abandoned.store(1, .release);
-            watchdog.fill(batch[0..n]);
+            // The saved state is the lanes of the hasher's whole batch, made with its salts: it goes with them unless
+            // a job was answered meanwhile. The half of `saved` it is in is never written again by the hasher.
+            var from = s.progress.take();
+            if (n < s.n) from = 0;
+            if (from != 0) {
+                const h = bc.Progress.half(from);
+                @memcpy(watchdog.progress.saved[h][0..n], s.progress.saved[h][0..n]);
+                watchdog.settings = s.settings;
+            }
+            watchdog.fill(batch[0..n], from);
             return next;
         }
         // Jobs overdue in the queue, behind hashers that are busy or held up, go `lanes` at a time, or fewer once the
@@ -231,7 +253,7 @@ const Pool = struct {
         }
         if (n > 0 and (n == p.lanes or batch[0].queued + p.overdue_ns + fill_ns <= now)) {
             for (0..n) |_| _ = p.pop();
-            watchdog.fill(batch[0..n]);
+            watchdog.fill(batch[0..n], 0);
             return next;
         }
         if (n > 0) {
@@ -264,7 +286,6 @@ const Pool = struct {
                 if (tail) |t| t.next = j else head = j;
                 tail = j;
             };
-            s.abandoned.store(0, .monotonic);
             s.state.store(idle, .release);
         }
         return head;
@@ -364,14 +385,15 @@ fn lowestPriority() bool {
 }
 
 /// Hashes a batch: one kernel call per cost among its jobs (all cost 10 in practice). A verify job whose stored
-/// hash doesn't parse fails without hashing. False once `*stop` turns nonzero, with the batch unfinished.
-fn run(batch: []*Job, stop: *const u32) bool {
-    var settings: [bc.max_lanes]bc.Setting = undefined;
+/// hash doesn't parse fails without hashing. A `hash` job gets a fresh salt in `settings`, unless the batch carries on
+/// from `progress.from`, saved with the salts already there. Only a batch hashed in one call saves its progress, which
+/// is that call's. False once the progress is taken, with the batch unfinished.
+fn run(batch: []*Job, settings: *[bc.max_lanes]bc.Setting, progress: *bc.Progress) bool {
     var pending: [bc.max_lanes]bool = undefined;
     for (batch, 0..) |j, i| {
         pending[i] = true;
         switch (j.kind) {
-            .hash => {
+            .hash => if (progress.from == 0) {
                 var salt: [16]u8 = undefined;
                 randomBytes(&salt);
                 settings[i] = bc.settingFromSalt(salt, cost);
@@ -385,6 +407,8 @@ fn run(batch: []*Job, stop: *const u32) bool {
             },
         }
     }
+    var all: usize = 0;
+    for (pending[0..batch.len]) |x| all += @intFromBool(x);
     for (0..batch.len) |first| {
         if (!pending[first]) continue;
         var jobs: [bc.max_lanes]bc.Job = undefined;
@@ -398,7 +422,9 @@ fn run(batch: []*Job, stop: *const u32) bool {
             n += 1;
         }
         var out: [bc.max_lanes]bc.Hash = undefined;
-        engine.hash(jobs[0..n], out[0..n], stop) catch |e| switch (e) {
+        std.debug.assert(progress.from == 0 or n == all);
+        progress.save = n == all;
+        engine.hash(jobs[0..n], out[0..n], progress) catch |e| switch (e) {
             error.Abandoned => return false,
             error.MixedCost => unreachable, // one cost per call
         };
@@ -560,11 +586,13 @@ test "a job a hasher holds without getting a CPU goes to the watchdog once overd
     // Not overdue yet: the watchdog waits.
     try std.testing.expectEqual(t0 + p.overdue_ns, p.pump(t0 + p.overdue_ns - 1));
     try std.testing.expectEqual(idle, slots[1].state.load(.monotonic));
-    // Overdue: the watchdog takes the batch, and the idle hasher is told to drop it.
+    // Overdue: the watchdog takes the batch, and the idle hasher is told to stop. It has saved nothing, so the
+    // watchdog starts from the setting.
     try std.testing.expectEqual(null, p.pump(t0 + p.overdue_ns));
     try std.testing.expectEqual(ready, slots[1].state.load(.monotonic));
     try std.testing.expectEqual(&j, slots[1].from[0]);
-    try std.testing.expectEqual(1, slots[0].abandoned.load(.monotonic));
+    try std.testing.expect(slots[0].progress.taken());
+    try std.testing.expectEqual(0, slots[1].progress.from);
     slots[1].work();
     const got = p.finished().?;
     try std.testing.expectEqual(&j, got);
@@ -577,7 +605,6 @@ test "a job a hasher holds without getting a CPU goes to the watchdog once overd
     try std.testing.expect(!slots[0].complete);
     try std.testing.expectEqual(null, p.finished());
     try std.testing.expectEqual(idle, slots[0].state.load(.monotonic));
-    try std.testing.expectEqual(0, slots[0].abandoned.load(.monotonic));
 }
 
 test "a hasher that finished its batch just before the watchdog took it keeps its answer" {
@@ -590,17 +617,152 @@ test "a hasher that finished its batch just before the watchdog took it keeps it
     _ = p.pump(t0);
     _ = p.pump(t0 + p.overdue_ns);
     try std.testing.expectEqual(ready, slots[1].state.load(.monotonic));
-    // The hasher had passed its last round before the flag was set: its result stands, the watchdog's is dropped.
-    slots[0].abandoned.store(0, .monotonic);
+    // The hasher had passed its last round before it was taken: its result stands, the watchdog's is dropped.
+    slots[0].progress.at.store(bc.Progress.no_stop, .monotonic);
     slots[0].work();
     try std.testing.expect(slots[0].complete);
-    slots[0].abandoned.store(1, .monotonic);
+    _ = slots[0].progress.take();
     try std.testing.expectEqual(&j, p.finished().?);
     try std.testing.expect(j.ok);
     slots[1].work();
     try std.testing.expectEqual(null, p.finished());
     try std.testing.expectEqual(idle, slots[0].state.load(.monotonic));
     try std.testing.expectEqual(idle, slots[1].state.load(.monotonic));
+}
+
+/// Verify jobs, one per cost in `costs`: the right password on even lanes, a wrong one on odd lanes.
+const Logins = struct {
+    pw: [bc.max_lanes][12]u8 = undefined,
+    stored: [bc.max_lanes]bc.Hash = undefined,
+    js: [bc.max_lanes]Job = undefined,
+
+    fn init(l: *Logins, costs: []const u5, seed: u64) !void {
+        var prng = std.Random.DefaultPrng.init(seed);
+        for (costs, 0..) |c, i| {
+            prng.random().bytes(&l.pw[i]);
+            const st = bc.newSettingCost(prng.random(), c);
+            try bc.hashWith(engine.variant, &.{.{ .password = &l.pw[i], .setting = &st }}, l.stored[i..][0..1], null);
+            l.js[i] = .{ .kind = .verify, .password = if (i % 2 == 0) &l.pw[i] else "wrong", .stored = &l.stored[i], .owner = &test_owner };
+        }
+    }
+
+    fn check(l: *const Logins, n: usize) !void {
+        for (l.js[0..n], 0..) |j, i| {
+            try std.testing.expectEqual(0, j.seq);
+            try std.testing.expectEqual(i % 2 == 0, j.ok);
+        }
+    }
+};
+
+const cost6: [bc.max_lanes]u5 = @splat(6);
+
+/// The rounds done in the newest state a kernel saved before it stopped after `k`.
+fn savedBefore(k: u32) u32 {
+    return if (k <= bc.save_every) 0 else (k - 1) / bc.save_every * bc.save_every;
+}
+
+test "the watchdog carries a hasher's batch on from the newest state the hasher saved, whatever round it got to" {
+    prepare();
+    const c = 6;
+    var l: Logins = .{};
+    try l.init(cost6[0..engine.lanes], 0x5701e);
+    for (1..1 << c) |k| {
+        var slots: [2]Slot = .{ .{}, .{} };
+        var p: Pool = .{ .lanes = engine.lanes, .overdue_ns = overdueNs(engine), .slots = &slots };
+        const t0 = 1000 * std.time.ns_per_s;
+        for (l.js[0..p.lanes]) |*j| p.submit(j, t0);
+        _ = p.pump(t0);
+        // The hasher gets `k` rounds in, then no CPU until the watchdog has the batch.
+        slots[0].progress.stopAfter(@intCast(k));
+        try std.testing.expect(!slots[0].hash());
+        try std.testing.expectEqual(null, p.pump(t0 + p.overdue_ns));
+        try std.testing.expectEqual(ready, slots[1].state.load(.monotonic));
+        try std.testing.expectEqual(p.lanes, slots[1].n);
+        try std.testing.expectEqual(savedBefore(@intCast(k)), slots[1].progress.from);
+        slots[1].work();
+        try std.testing.expectEqual(p.lanes, count(p.finished()));
+        try l.check(p.lanes);
+        // The hasher, running at last, stops at once and answers nothing.
+        slots[0].work();
+        try std.testing.expect(!slots[0].complete);
+        try std.testing.expectEqual(null, p.finished());
+    }
+}
+
+test "sign-ups the watchdog carries on keep the salts the hasher picked" {
+    prepare();
+    for ([_]u32{ 17, 512, 1009 }) |k| {
+        var slots: [2]Slot = .{ .{}, .{} };
+        var p: Pool = .{ .lanes = engine.lanes, .overdue_ns = overdueNs(engine), .slots = &slots };
+        var js: [bc.max_lanes]Job = undefined;
+        var pws: [bc.max_lanes][3]u8 = undefined;
+        const t0 = 1000 * std.time.ns_per_s;
+        // One login in the batch, at the same cost, so it is still one kernel call.
+        for (js[0..p.lanes], 0..) |*j, i| {
+            pws[i] = .{ 'p', 'w', '0' + @as(u8, @intCast(i)) };
+            j.* = if (i == 0)
+                .{ .kind = .verify, .password = "password123", .stored = bc.known[6].hash, .owner = &test_owner }
+            else
+                .{ .kind = .hash, .password = &pws[i], .owner = &test_owner };
+            p.submit(j, t0);
+        }
+        _ = p.pump(t0);
+        slots[0].progress.stopAfter(k);
+        try std.testing.expect(!slots[0].hash());
+        const salts = slots[0].settings;
+        _ = p.pump(t0 + p.overdue_ns);
+        try std.testing.expectEqual(savedBefore(k), slots[1].progress.from);
+        slots[1].work();
+        try std.testing.expectEqual(p.lanes, count(p.finished()));
+        try std.testing.expect(js[0].ok);
+        for (js[1..p.lanes], salts[1..p.lanes], 1..) |j, st, i| {
+            try std.testing.expectEqualStrings(&st.prefix, j.out[0..29]);
+            var straight: [1]bc.Hash = undefined;
+            try bc.hashWith(engine.variant, &.{.{ .password = &pws[i], .setting = &st }}, &straight, null);
+            try std.testing.expectEqualStrings(&straight[0], &j.out);
+        }
+    }
+}
+
+test "the watchdog starts from the setting when the hasher's saved state is not the whole batch's" {
+    prepare();
+    const t0 = 1000 * std.time.ns_per_s;
+    {
+        // A job answered meanwhile: the batch the watchdog takes is not the one the state was saved for.
+        var l: Logins = .{};
+        try l.init(cost6[0..engine.lanes], 0xa5);
+        var slots: [2]Slot = .{ .{}, .{} };
+        var p: Pool = .{ .lanes = engine.lanes, .overdue_ns = overdueNs(engine), .slots = &slots };
+        for (l.js[0..p.lanes]) |*j| p.submit(j, t0);
+        _ = p.pump(t0);
+        slots[0].progress.stopAfter(40);
+        try std.testing.expect(!slots[0].hash());
+        try std.testing.expectEqual(32, @as(u32, @truncate(slots[0].progress.at.load(.monotonic))));
+        l.js[1].seq = 0;
+        _ = p.pump(t0 + p.overdue_ns);
+        try std.testing.expectEqual(p.lanes - 1, slots[1].n);
+        try std.testing.expectEqual(0, slots[1].progress.from);
+        slots[1].work();
+        try std.testing.expectEqual(p.lanes - 1, count(p.finished()));
+        try l.check(p.lanes);
+    }
+    {
+        // Two costs: two kernel calls, and neither saves.
+        var l: Logins = .{};
+        try l.init(&.{ 4, 6, 4, 6 }, 0xa6);
+        var slots: [2]Slot = .{ .{}, .{} };
+        var p: Pool = .{ .lanes = 4, .overdue_ns = overdueNs(engine), .slots = &slots };
+        for (l.js[0..4]) |*j| p.submit(j, t0);
+        _ = p.pump(t0);
+        slots[0].progress.stopAfter(40);
+        try std.testing.expect(!slots[0].hash());
+        _ = p.pump(t0 + p.overdue_ns);
+        try std.testing.expectEqual(4, slots[1].n);
+        try std.testing.expectEqual(0, slots[1].progress.from);
+        slots[1].work();
+        try std.testing.expectEqual(4, count(p.finished()));
+        try l.check(4);
+    }
 }
 
 test "overdue jobs still queued go to the watchdog `lanes` at a time, or fewer once overdue for `fill_ns`" {

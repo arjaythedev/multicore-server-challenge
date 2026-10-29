@@ -535,15 +535,17 @@ not the event loops, not Postgres, not the kernel's network softirq. The catch i
 come back. `RLIMIT_NICE` is 0 and there is no `CAP_SYS_NICE`; if `SCHED_IDLE` fails, the thread falls back to nice 19.
 On a saturated box an idle thread could starve forever. So one more hasher per worker, the watchdog (`bcrypt-watch`),
 stays at normal priority and takes any job still unfinished after the fill window plus two batches' CPU time (about
-1.09 s on one test box). It takes a held-up hasher's batch whole, and that hasher drops its copy: the kernel reads a
-flag once a round of the cost loop. Jobs overdue in the queue go out in full batches, or in a short one once the
-oldest has been overdue for a whole fill window. An earlier version let the watchdog take single overdue jobs as they
-came and left the idle hashers finishing them too; whichever finished first answered. At 190,000 users on an aged
-database (a Synteq copy of the official box) that ran 1.7 cores of watchdog in short batches plus 0.6 cores of
-hashers on the same logins, kept the box at 100% and never let the feed lane recover: p95 5,710 ms, in one hold of
-four of the same build. On that aged hold this version passed with p95 481 ms, p99 899 ms and no errors. The watchdog
-used 0.002 cores and answered 49 of 15,331 hash jobs, in 10 batches, each taken whole from a held-up hasher. There was
-no re-hash loop.
+1.09 s on one test box). It takes a held-up hasher's batch whole and carries on where that hasher got to. The hasher's
+kernel saves its state every 16 rounds of the cost loop, and the watchdog starts from the newest save, with the same
+salts. The hasher reads a flag once a round and stops. So the watchdog redoes at most 16 of a batch's 1,024 rounds, not
+all of them, and every hash comes out the same as one hashed straight through. Saving costs under 1% of a batch's CPU.
+Jobs overdue in the queue go out in full batches, or in a short one once the oldest has been overdue for a whole fill
+window. An earlier version let the watchdog take single overdue jobs as they came and left the idle hashers finishing
+them too; whichever finished first answered. At 190,000 users on an aged database (a Synteq copy of the official box)
+that ran 1.7 cores of watchdog in short batches plus 0.6 cores of hashers on the same logins, kept the box at 100% and
+never let the feed lane recover: p95 5,710 ms, in one hold of four of the same build. On that aged hold this version
+passed with p95 481 ms, p99 899 ms and no errors. The watchdog used 0.002 cores and answered 49 of 15,331 hash jobs, in
+10 batches, each taken whole from a held-up hasher. There was no re-hash loop.
 
 **No locks between them.** The event loop owns the queue and hands each hasher its batch through a slot of its own,
 with an atomic state and a futex sleep. A starved idle thread holds nothing anyone else waits on, and nobody spins.
