@@ -25,6 +25,12 @@ keeping our own processes out of its way.
   connection owns no buffer: holding 200,000 idle keep-alive connections costs about 360 bytes each. A request is
   parsed where it lands; each response is one send (the body is written behind a reserved gap, the header goes in
   the gap).
+- **ACK delay.** After each response the worker turns `TCP_QUICKACK` off on that socket (an io_uring socket
+  command on kernel 6.7+, a plain `setsockopt` on older kernels), so the ACK of the next request leaves with its
+  response instead of as a packet of its own: fewer packets for the receiving CPU.
+- **`SCHED_BATCH=1`** (off by default) puts the parent under `SCHED_BATCH` before forking, so every process and
+  thread inherits it: our wakeups stop preempting busy Postgres backends. On a CPU-starved test machine it raised
+  response latency (event loops waited for their time slice), so it stays opt-in.
 - **The drain** owns every Postgres read connection (`READ_CONNS`). Workers hand it reads through shared-memory
   rings with eventfd wake-ups and get finished responses back the same way.
 
@@ -41,10 +47,14 @@ workers and answers each batch with two pipelined round trips of set-based SQL o
 - **The feed** is one statement for counts and pages. Followees shared by several viewers of the batch are looked
   at once: one with 1,000+ articles proves the capped count of everyone following it without counting, and its
   article at the deepest page any of them needs bounds every followee's walk.
-- **Pacing.** A plan starts when a connection is free and the oldest request has waited
-  `typical plan time x (free connections - 1) / connections` (capped at `PLAN_WAIT_US`): no wait at all once the
-  other connections are busy, close to one plan's time when most are idle, so batches stay large without a fixed
-  delay.
+- **Lanes.** Planned reads wait in three queues: feeds (the dearest read), comments, and everything else. A plan
+  takes requests of one lane only, so no list or article waits behind the feed statement. Each lane runs on its own
+  clock: a plan starts once the lane's oldest request has waited `LANE_WINDOW_US` and the lane's gap has passed
+  since its previous plan started (at once if the lane holds a full plan), and only while fewer than the lane's cap
+  of its plans are running. Below saturation a plan takes everything that arrived in one gap; near it, executions
+  outlast the gap, the cap binds, and the next plan takes everything that arrived meanwhile, so batches grow with
+  the load instead of the number of plans competing for the cores. Measured on the full seed at the same load, this
+  cut Postgres CPU per request by about 30% against starting a plan whenever a connection was free.
 - JSON is rendered in C from binary rows; fragments shared by many responses (an article's tag list) are rendered
   once per plan. Nothing outlives the plan: every result is dropped once its responses are sent (rule 5).
 - Generic plans are forced (`plan_cache_mode`), so page subqueries keep a constant `LIMIT 100` wrapper: a
@@ -77,10 +87,16 @@ Rare reads (login lookup, current user) go through the drain unplanned.
 | Variable | Default | Meaning |
 |---|---|---|
 | `WORKERS` | CPUs / 2 | worker processes |
-| `READ_CONNS` | 12 | drain read connections (one plan each at a time) |
+| `READ_CONNS` | 8 | drain read connections (one plan each at a time) |
 | `WRITE_CONNS` | 1 | write connections per worker |
-| `PLAN_PACE` | 1 | load-following plan wait (0: fixed `PLAN_WAIT_US`) |
-| `PLAN_WAIT_US` | 20000 | cap on (or, with `PLAN_PACE=0`, the) plan wait |
+| `LANES` | 1 | feeds, comments and the rest plan apart, each on its own clock (0: one queue, paced as below) |
+| `LANE_WINDOW_US` | 5000 | least time a lane's oldest request waits for company |
+| `FEED_GAP_US` / `CMT_GAP_US` / `SHARED_GAP_US` | 80000 / 100000 / 80000 | least time between a lane's plan starts |
+| `FEED_CAP` / `CMT_CAP` / `SHARED_CAP` | 2 / 2 / 3 | most plans of a lane running at once |
+| `PLAN_PACE` | 1 | with `LANES=0`: load-following plan wait (0: fixed `PLAN_WAIT_US`) |
+| `PLAN_WAIT_US` | 20000 | with `LANES=0`: cap on (or, with `PLAN_PACE=0`, the) plan wait |
+| `ACK_DELAY` | 1 | `TCP_QUICKACK` off after each response |
+| `SCHED_BATCH` | 0 | run under the `SCHED_BATCH` scheduling policy |
 | `PLAN_MAX` | 4096 | most requests in one plan |
 | `PLANNER` | 1 | 0: every read as a plain per-request query |
 | `WRITE_GROUP` | 128 | most writes per group commit |

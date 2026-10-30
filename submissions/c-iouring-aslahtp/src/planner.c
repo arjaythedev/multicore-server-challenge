@@ -36,13 +36,20 @@ struct preq {
     struct plan_req r;     /* followed by the key */
 };
 
-static struct preq *wait_head, *wait_tail;
-static uint32_t wait_n;
+static struct lane_q {
+    struct preq *head, *tail;
+    uint32_t n;
+} lanes[PL_N];
 
 static int64_t mono_us(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+static int lane_of(const struct plan_req *r) {
+    if (!cfg.lanes) return PL_SHARED;
+    return r->kind == PK_FEED ? PL_FEED : r->kind == PK_COMMENTS ? PL_CMT : PL_SHARED;
 }
 
 void planner_add(int worker, uint64_t token, const struct plan_req *pr, uint32_t len) {
@@ -53,18 +60,22 @@ void planner_add(int worker, uint64_t token, const struct plan_req *pr, uint32_t
     q->token = token;
     q->t_us = mono_us();
     memcpy(&q->r, pr, sizeof *pr + pr->keylen);
-    if (wait_tail) wait_tail->next = q;
-    else wait_head = q;
-    wait_tail = q;
-    wait_n++;
+    struct lane_q *l = &lanes[lane_of(pr)];
+    if (l->tail) l->tail->next = q;
+    else l->head = q;
+    l->tail = q;
+    l->n++;
 }
 
-int64_t planner_due_in(int64_t now_us, int64_t wait_us) {
-    if (!wait_head) return -1;
-    if (wait_n >= cfg.plan_max) return 0;
-    int64_t due = wait_head->t_us + wait_us - now_us;
+int64_t planner_due_in(int lane, int64_t now_us, int64_t wait_us) {
+    const struct lane_q *l = &lanes[lane];
+    if (!l->head) return -1;
+    if (l->n >= cfg.plan_max) return 0;
+    int64_t due = l->head->t_us + wait_us - now_us;
     return due > 0 ? due : 0;
 }
+
+uint32_t planner_waiting(int lane) { return lanes[lane].n; }
 
 /* ---- plan data ---- */
 
@@ -359,18 +370,19 @@ static void write_phase_a(struct plan *p, struct buf *out) {
     pg_sync(out);
 }
 
-struct plan *planner_start(struct buf *out) {
-    if (!wait_head) return NULL;
+struct plan *planner_start(int lane, struct buf *out) {
+    struct lane_q *l = &lanes[lane];
+    if (!l->head) return NULL;
     struct plan *p = xcalloc(1, sizeof *p);
     arena_init(&p->a, 1 << 16);
-    uint32_t n = wait_n < cfg.plan_max ? wait_n : cfg.plan_max;
-    p->reqs = wait_head;
-    struct preq *last = wait_head;
+    uint32_t n = l->n < cfg.plan_max ? l->n : cfg.plan_max;
+    p->reqs = l->head;
+    struct preq *last = l->head;
     for (uint32_t i = 1; i < n; i++) last = last->next;
-    wait_head = last->next;
-    if (!wait_head) wait_tail = NULL;
+    l->head = last->next;
+    if (!l->head) l->tail = NULL;
     last->next = NULL;
-    wait_n -= n;
+    l->n -= n;
     p->nreq = n;
 
     map_init(&p->emap, n * 2);
@@ -972,7 +984,4 @@ bool planner_msg(struct plan *p, const struct pg_msg *m, struct buf *out, bool *
     return false;
 }
 
-void planner_init(void) {
-    wait_head = wait_tail = NULL;
-    wait_n = 0;
-}
+void planner_init(void) { memset(lanes, 0, sizeof lanes); }

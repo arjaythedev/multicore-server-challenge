@@ -275,6 +275,36 @@ static void rearm_starved(struct worker *w) {
     }
 }
 
+/* ACK delay: after a response, TCP_QUICKACK off on its socket through the ring (a socket command, kernel 6.7+), so
+ * the next request's ACK leaves with that request's response instead of as a packet of its own. The kernel picks
+ * quick or delayed ACK as a request arrives and leaves delayed mode whenever its delayed-ACK timer fires (a response
+ * slower than about 40 ms), so this goes out after every response. Only a failure posts a completion; on a kernel
+ * without the command the worker makes the setsockopt call itself from then on. */
+static const int quickack_off __attribute__((aligned(8))) = 0;
+#define ACK_UD UD_MAKE_PTR(&quickack_off, OP_QUIET)
+static bool ack_delay, ack_syscall;
+
+/* SOCKET_URING_OP_SETSOCKOPT in the kernel's uapi (6.7+). liburing 2.5's header predates it, and its
+ * io_uring_prep_cmd_sock drops level, optname and optval, so the fields are set here by their uapi places: level and
+ * optname share the 64-bit addr word, optlen is the file_index word, optval the addr3 word. */
+#define URING_SETSOCKOPT 3
+
+static void delay_ack(struct worker *w, int fd) {
+    if (ack_syscall) {
+        if (!w->direct) setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &quickack_off, sizeof quickack_off);
+        return;
+    }
+    struct io_uring_sqe *s = sqe_get(w);
+    io_uring_prep_rw(IORING_OP_URING_CMD, s, fd, NULL, 0, 0);
+    s->cmd_op = URING_SETSOCKOPT;
+    s->addr = (uint64_t)(uint32_t)IPPROTO_TCP | (uint64_t)(uint32_t)TCP_QUICKACK << 32;
+    s->file_index = sizeof quickack_off;
+    s->addr3 = (uint64_t)(uintptr_t)&quickack_off;
+    s->flags |= IOSQE_CQE_SKIP_SUCCESS;
+    if (w->direct) s->flags |= IOSQE_FIXED_FILE;
+    io_uring_sqe_set_data64(s, ACK_UD);
+}
+
 static void send_resp(struct req *r) {
     struct io_uring_sqe *s = sqe_get(r->w);
     size_t off = r->resp_off + r->resp_sent;
@@ -326,6 +356,7 @@ static void on_send(struct worker *w, struct io_uring_cqe *cqe) {
         conn_close(w, fd);
         return;
     }
+    if (ack_delay) delay_ack(w, fd);
     if (c->plen) drain_pending(w, fd);
 }
 
@@ -721,6 +752,12 @@ static void on_cqe(struct worker *w, struct io_uring_cqe *cqe) {
         if (cqe->res < 0) fprintf(stderr, "worker %d: ring op failed: %s\n", w->id, strerror(-cqe->res));
         break;
     case OP_QUIET:
+        /* EBADF is a client closed in the same iteration, before the ring took the setsockopt. */
+        if (ud == ACK_UD && !ack_syscall && (cqe->res == -EINVAL || cqe->res == -EOPNOTSUPP)) {
+            ack_syscall = true;
+            fprintf(stderr, "worker %d: no TCP_QUICKACK through io_uring (%s); using setsockopt\n", w->id,
+                    strerror(-cqe->res));
+        }
         break;
     }
 }
@@ -757,6 +794,7 @@ void worker_run(int id) {
     w->efd = ipc.worker_efd[id];  /* replies from the drain and finished bcrypt jobs */
     w->bp = bcrypt_pool_start(w, cfg.bcrypt_threads);
 
+    ack_delay = cfg.ack_delay;
     arm_accept(w);
     arm_eventfd(w);
     for (int i = 0; i < w->npg; i++) pg_arm_recv(w, &w->pg[i]);

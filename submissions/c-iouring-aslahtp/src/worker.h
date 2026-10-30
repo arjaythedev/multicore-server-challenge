@@ -154,6 +154,12 @@ struct config {
     int64_t plan_wait_us;  /* how long the oldest planned read may wait for company */
     bool planner;          /* hot reads go to the planner (else as plain units) */
     bool plan_pace;        /* plan wait follows the load (drain.c plan_wait); plan_wait_us becomes its cap */
+    bool lanes;            /* feeds, comments and the rest plan apart, each on its own clock (drain.c) */
+    int64_t lane_window_us;          /* a lane's oldest read waits at least this long for company */
+    int64_t lane_gap_us[3];          /* by enum plan_lane: least time between a lane's plan starts */
+    int lane_cap[3];                 /* by enum plan_lane: most plans of a lane in flight */
+    bool ack_delay;        /* after each response, TCP_QUICKACK off: the next request's ACK rides on its response */
+    bool sched_batch;      /* every process and thread under SCHED_BATCH */
     bool direct_fds;       /* accept client sockets as io_uring direct descriptors (off: no measured gain on loopback) */
 };
 extern struct config cfg;
