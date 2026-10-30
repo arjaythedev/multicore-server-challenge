@@ -18,4 +18,9 @@ fi
 N=conduit_server/adapters/outbound/native
 .venv/bin/python $N/gen_pi.py $N/bf_init.h
 gcc -O3 -march=x86-64-v2 -fPIC -shared -Wall -o $N/libbcrypt_lanes.so $N/bcrypt_lanes.c
-echo "native build ok: $N/libbcrypt_lanes.so"
+# HS256 verification of our own tokens (native/jwt_verify.c): a CPython extension, SHA-NI when the CPU has it
+PYINC=$(.venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["include"])')
+EXT=$(.venv/bin/python -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')
+gcc -O3 -march=x86-64-v2 -fPIC -shared -Wall -I"$PYINC" -o "$N/_jwt_verify$EXT" $N/jwt_verify.c
+.venv/bin/python -c "import sys; sys.path.insert(0, '$N'); import _jwt_verify; print('jwt backend:', _jwt_verify.backend())"
+echo "native build ok: $N/libbcrypt_lanes.so $N/_jwt_verify$EXT"

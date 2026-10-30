@@ -19,7 +19,11 @@ from the previous challenge, i wondered whether sockets could remove all the ove
   (`gen_pi.py`). Cost 10, CPU per hash, single thread on the laptop: libxcrypt 38.4 ms; 1 lane 37.6, 2 lanes 19.8,
   4 lanes 11.3, 6 lanes 8.8, 8 lanes 9.3. Hashes are byte for byte libxcrypt's (checked when it loads, and on 139
   hashes across costs, lane counts, `$2a`/`$2b`/`$2y` and password lengths); without the library, libxcrypt is used
-- `PyJWT` 2.15.1 (only to derive the HS256 header; tokens are signed and verified with stdlib `hmac`)
+- `PyJWT` 2.15.1 (only to derive the HS256 header; tokens are signed with stdlib `hmac`)
+- Token verification: `conduit_server/adapters/outbound/native/jwt_verify.c`, a CPython extension built by `build.sh`.
+  It checks the signature (HMAC-SHA256, SHA-NI when the CPU has it) and `exp`/`iat` on every request, for tokens in
+  the form this server issues; any other token is checked by the Python code with stdlib `hmac`, with the same result.
+  1.8 → 0.24 µs per token, single thread. `JWT_NATIVE=0` turns it off
 - `orjson` 3.13.0: request bodies and the user responses
 
 All pins live in `constraints.txt` (transitives included); `build.sh` installs against it and `start.sh` runs the project `.venv`.

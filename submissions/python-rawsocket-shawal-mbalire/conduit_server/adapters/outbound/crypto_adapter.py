@@ -86,6 +86,34 @@ def _load_lanes():
 _lanes = _load_lanes()
 
 
+def _load_jwt_verify():
+    """native/jwt_verify.c (built by build.sh): HS256 verification of our own tokens in C, or None if not built
+    or JWT_NATIVE=0."""
+    if os.environ.get("JWT_NATIVE", "1") == "0":
+        return None
+    import importlib.machinery
+    import importlib.util
+
+    native = os.path.join(os.path.dirname(os.path.abspath(__file__)), "native")
+    for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+        path = os.path.join(native, "_jwt_verify" + suffix)
+        if os.path.exists(path):
+            spec = importlib.util.spec_from_file_location("_jwt_verify", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            break
+    else:
+        return None
+    for key in (b"", b"k", b"x" * 64, b"y" * 100):
+        for msg in (b"", b"m" * 55, b"m" * 56, b"m" * 200):
+            if mod.hmac_sha256(key, msg) != hmac.digest(key, msg, "sha256"):
+                return None
+    return mod
+
+
+_jwt_native = _load_jwt_verify()
+
+
 def _bcrypt_one(password: bytes, setting: bytes):
     """One hash without the lanes: libxcrypt, else pyca. None if `setting` isn't a bcrypt setting."""
     try:
@@ -216,6 +244,8 @@ class JoseBcryptCryptoAdapter(CryptoPort):
         self._hs256_header = hdr
         self._hs256_header_b = hdr.encode("ascii")
         self._hs256_prefix_b = self._hs256_header_b + b"."
+        if _jwt_native is not None:
+            _jwt_native.init(self._key, self._hs256_header_b)  # process-wide: one secret per server
 
     def hash_password(self, password: str) -> str:
         pw = password.encode("utf-8")
@@ -264,6 +294,15 @@ class JoseBcryptCryptoAdapter(CryptoPort):
         return (signing_input + b"." + sig_b64).decode("ascii")
 
     def verify_token(self, token: str) -> int:
+        """Verify HS256 signature + exp on every call (no caching). Returns user id. Tokens in our own form are
+        checked in C (`_jwt_native.verify`, same result as `_verify_token_py`); anything else in Python."""
+        if _jwt_native is not None:
+            user_id = _jwt_native.verify(token)
+            if user_id is not None:
+                return user_id
+        return self._verify_token_py(token)
+
+    def _verify_token_py(self, token: str) -> int:
         """Verify HS256 signature + exp on every call (no caching). Returns user id.
 
         Same checks PyJWT.decode(algorithms=["HS256"], require exp/iat/sub) makes, with stdlib hmac:
