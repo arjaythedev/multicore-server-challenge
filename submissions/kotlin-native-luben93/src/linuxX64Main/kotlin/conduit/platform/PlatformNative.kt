@@ -33,8 +33,11 @@ import platform.posix.SIGPIPE
 import platform.posix.SIG_IGN
 import platform.posix.SOCK_STREAM
 import platform.posix.SOL_SOCKET
+import platform.posix.SO_KEEPALIVE
 import platform.posix.SO_RCVBUF
+import platform.posix.SO_RCVTIMEO
 import platform.posix.SO_SNDBUF
+import platform.posix.SO_SNDTIMEO
 import platform.posix.TCP_NODELAY
 import platform.posix.addrinfo
 import platform.posix.clock_gettime
@@ -73,6 +76,7 @@ import platform.posix.syscall
 import platform.posix.sysconf
 import platform.posix._SC_NPROCESSORS_ONLN
 import platform.posix.timespec
+import platform.posix.timeval
 import kotlin.concurrent.AtomicInt
 import kotlin.native.concurrent.ThreadLocal
 
@@ -244,6 +248,9 @@ actual class Monitor actual constructor() {
     }
 }
 
+/** Seconds a Postgres socket may block in recv, send or connect (no query of the app takes anywhere near this). */
+private const val PG_IO_TIMEOUT_S = 15L
+
 actual class BlockingSocket private constructor(private val fd: Int) {
     private val closed = AtomicInt(0)
 
@@ -290,6 +297,12 @@ actual class BlockingSocket private constructor(private val fd: Int) {
             val big = alloc<kotlinx.cinterop.IntVar>().apply { value = 1 shl 20 }
             setsockopt(fd, SOL_SOCKET, SO_RCVBUF, big.ptr, sizeOf<kotlinx.cinterop.IntVar>().convert())
             setsockopt(fd, SOL_SOCKET, SO_SNDBUF, big.ptr, sizeOf<kotlinx.cinterop.IntVar>().convert())
+            // A Postgres that stops answering (frozen, partitioned without an RST) must fail the worker's recv/send/connect
+            // after a while instead of blocking its thread forever: the worker's error path then reconnects.
+            val tmo = alloc<timeval>().apply { tv_sec = PG_IO_TIMEOUT_S; tv_usec = 0 }
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, tmo.ptr, sizeOf<timeval>().convert())
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, tmo.ptr, sizeOf<timeval>().convert())
+            setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, one.ptr, sizeOf<kotlinx.cinterop.IntVar>().convert())
             val cr = connect(fd, ai.ai_addr, ai.ai_addrlen)
             freeaddrinfo(res.value)
             if (cr != 0) {

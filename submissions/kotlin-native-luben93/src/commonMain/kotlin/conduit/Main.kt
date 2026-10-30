@@ -33,11 +33,15 @@ fun main() {
     // Sizing for the box's 8 cores shared with Postgres: few runnable threads, few Postgres backends.
     val cpus = cpuCount()
     val httpThreads = envInt("HTTP_THREADS", maxOf(1, (cpus + 3) / 4))
-    // 8 read + 4 write on the box: with 6 + 2 the write connections sat at ~100% waiting on the WAL flush and their
-    // backlog broke p99, and Postgres had idle cores while the read connections queued (lab, 2026-10-28)
-    val readConns = envInt("DB_READ_CONNS", maxOf(2, cpus))
+    // 6 read + 4 write on the box. 2 write connections sat at ~100% waiting on the WAL flush and their backlog broke
+    // p99 (4 keep up). Reads: at the 144k-user cap 6 connections beat 8 (5-minute holds, 2026-10-28: Postgres 139 vs
+    // 151 us per request, p95 118 vs 125 ms, p99 210 vs 230): fewer backends compete for the 8 CPUs, batches grow.
+    val readConns = envInt("DB_READ_CONNS", maxOf(2, cpus)) // native: 8 + 4 (6 read connections failed 156k on native in the lab)
     val writeConns = envInt("DB_WRITE_CONNS", maxOf(2, cpus / 2))
-    val bcryptThreads = envInt("BCRYPT_THREADS", maxOf(1, (cpus + 7) / 8))
+    // 2 on 8 CPUs: one thread tops out near 36 logins/s on the busy box (bcrypt ~28 ms/hash there) and at 156k lab users (130k on
+    // the box) about 42/s arrive, so one thread lost most logins to the 10 s timeout. Idle threads cost nothing and extra
+    // threads only take full batches, so this is a cap, not a fixed cost.
+    val bcryptThreads = envInt("BCRYPT_THREADS", maxOf(2, (cpus + 3) / 4))
     // ~28 logins/s at 100k users: 400 ms fills 93% of 8-lane batches (mean 7.9 jobs). Logins are ~0.1% of requests,
     // so their latency can't move p95/p99.
     val bcryptWindow = envInt("BCRYPT_BATCH_MS", 400).toLong()
@@ -54,22 +58,38 @@ fun main() {
     // sent (0: as soon as a connection is free). Big batches are what make sharing pay: in the lab, 20 ms and sharing
     // took Postgres from 170 to 127 us per request at 120k users (lab/reports/omarchy-20261027.md).
     val shareReads = envInt("READ_SHARE", 1) != 0
-    val gatherMs = envInt("READ_GATHER_MS", 20)
+    val gatherMs = envInt("READ_GATHER_MS", 30)
+    // READ_LIFO_MS (lab, 0 = off): adaptive LIFO once a kind's oldest read has waited this long (see DbConfig)
+    val lifoMs = envInt("READ_LIFO_MS", 0)
 
     Jwt.init(secret)
-    Passwords.start(bcryptThreads, bcryptWindow, bcryptQueueMax, skipAbandoned = guard)
+    // Adaptive bcrypt flush (default 4 lanes / 150 ms like the leaders; BCRYPT_FLUSH_MIN=0 = the plain BCRYPT_BATCH_MS window): BCRYPT_FLUSH_MIN lanes queued and the oldest
+    // waiting BCRYPT_FLUSH_AGE_MS flushes a partial batch; BCRYPT_PRIO_LOAD reads queued for Postgres flushes at once.
+    val bcryptPrioLoad = envInt("BCRYPT_PRIO_LOAD", 0)
+    Passwords.loadProbe = { Db.readsQueued }
+    Passwords.start(
+        bcryptThreads, bcryptWindow, bcryptQueueMax, skipAbandoned = guard,
+        flushMin = envInt("BCRYPT_FLUSH_MIN", 4), flushAgeMs = envInt("BCRYPT_FLUSH_AGE_MS", 150).toLong(),
+        priorityLoad = bcryptPrioLoad, niceLevel = envInt("BCRYPT_NICE", 0),
+    )
     val dbConfig = DbConfig.fromUrl(
         dbUrl, readConns, writeConns, options, readQueueMax, writeQueueMax, guard, gatherMicros = gatherMs * 1000,
+        lifoMicros = lifoMs * 1000,
     )
     App.configure(
         Db.query(dbConfig, App.COLLATION_PROBE).firstOrNull(),
         appSortsTags = envInt("APP_SORT_TAGS", 1) != 0,
         shareReads = shareReads,
-        shareMaxBatch = envInt("READ_MAX_BATCH", 256),
+        shareMaxBatch = envInt("READ_MAX_BATCH", 1024),
         // READ_VIEWER_FLAGS (default on): shared lists check favorited/following once per viewer, not twice per row
         viewerFlags = envInt("READ_VIEWER_FLAGS", 1) != 0,
-        // READ_FEED_MAX_BATCH (default 32, 0 = READ_MAX_BATCH): feeds share nothing, so they leave in small batches
-        feedMaxBatch = envInt("READ_FEED_MAX_BATCH", 32),
+        // READ_FEED_MAX_BATCH (default 64, 0 = READ_MAX_BATCH; 128 raised p99 to 300 ms in the lab): feeds share nothing, so they leave in small batches
+        // (5-minute holds at 144k users: p95/p99 66/95 ms vs 107/175 ms uncapped, same Postgres CPU per request)
+        feedMaxBatch = envInt("READ_FEED_MAX_BATCH", 64),
+        // READ_FEED_HEAVY (default on; 0 = the plain capped count): skip the capped feed count for viewers who follow an author with 1000+ articles
+        feedHeavy = envInt("READ_FEED_HEAVY", 1) != 0,
+        // READ_FEED_FLOOR (default on, needs READ_FEED_HEAVY; 0 = off): per-batch floor ids of the shared hub followees bound the page probes
+        feedFloor = envInt("READ_FEED_FLOOR", 1) != 0,
     )
     // SQL_PRINT=1 (diagnostics, .tmp/lab/explain.sh): prints every read statement as "sql<TAB>name<TAB>sql" and exits
     if (envInt("SQL_PRINT", 0) != 0) {
@@ -80,7 +100,7 @@ fun main() {
     startHttpServer(host, port, httpThreads, HttpEngine { ex -> App.handle(ex) })
     println(
         "conduit: listening on $host:$port (cpus=$cpus http=$httpThreads db=$readConns+$writeConns " +
-            "bcrypt=$bcryptThreads; tags sorted by ${App.tagOrder}; reads ${App.readMode}, gather $gatherMs ms; " +
+            "bcrypt=$bcryptThreads; tags sorted by ${App.tagOrder}; reads ${App.readMode}, gather $gatherMs ms${if (lifoMs > 0) ", LIFO after $lifoMs ms" else ""}; " +
             "overload guard ${if (guard) "on, queue caps $readQueueMax/$writeQueueMax/$bcryptQueueMax" else "off"}; " +
             "$platform)",
     )

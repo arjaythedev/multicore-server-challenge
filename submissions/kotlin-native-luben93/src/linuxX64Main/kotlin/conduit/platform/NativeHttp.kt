@@ -373,9 +373,20 @@ private class NativeConn(val fd: Int, val loop: EpollLoop) : HttpConn() {
     override fun execute(task: () -> Unit) = loop.post(task)
 
     override fun close() {
-        if (isClosing()) return
+        // shutdown() touches the fd, so it runs under the same writer count as send(): the loop cannot close the fd
+        // (and accept() hand its number to another client) while we are inside. If the loop already started closing,
+        // there is nothing left to do.
+        while (true) {
+            val v = io.value
+            if (v and CLOSING != 0) return
+            if (io.compareAndSet(v, v + 1)) break
+        }
+        try {
+            shutdown(fd, SHUT_RDWR) // wakes the loop (EPOLLHUP) and stops further I/O; the loop closes the fd
+        } finally {
+            io.decrementAndGet()
+        }
         markClosing()
-        shutdown(fd, SHUT_RDWR) // wakes the loop (EPOLLHUP) and stops further I/O; the loop closes the fd
         loop.post { loop.finishClose(this) }
     }
 

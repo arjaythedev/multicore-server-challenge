@@ -78,6 +78,15 @@ internal class KindQueue(@JvmField val kind: ReadKind, @JvmField val stmtName: B
         return r
     }
 
+    /** The newest waiter ([DbConfig.lifoMicros]: served first while the queue is congested). */
+    fun pollLast(): ReadReq {
+        val i = (head + size - 1) and (ring.size - 1)
+        val r = ring[i]!!
+        ring[i] = null
+        size--
+        return r
+    }
+
     /**
      * Queued and below its maxInflight; with a gather window ([gather] ns, [now] = [nanoTime]) also full, or its oldest
      * request has waited out the window.
@@ -234,9 +243,13 @@ internal class ReadPool(
     @JvmField val workers = Array(config.readConns) { ReadWorker(this, it, cap) }
     private val skipAbandoned = config.skipAbandoned
     private val gatherNanos = config.gatherMicros * 1000L
+    private val lifoNanos = config.lifoMicros * 1000L
 
     private var seq = 0L
     private var queued = 0
+
+    /** Reads queued right now (a racy read, for a load signal: [Db.readsQueued]). */
+    val queuedNow: Int get() = queued
 
     // statistics (guarded by lock)
     @JvmField var batches = 0L
@@ -245,6 +258,9 @@ internal class ReadPool(
 
     /** Requests dropped unrun because their client was gone. */
     @JvmField var skipped = 0L
+
+    /** Batches taken newest-first ([DbConfig.lifoMicros]). */
+    @JvmField var lifoBatches = 0L
 
     /** Round-trip time of the current statistics interval, summed over connections (utilization, see [intervalStats]). */
     @JvmField var busyNanos = 0L
@@ -292,25 +308,44 @@ internal class ReadPool(
     override fun assignLocked(w: Worker): Boolean {
         w as ReadWorker
         val batch = w.spare()
-        val now = if (gatherNanos > 0) nanoTime() else 0L
+        val now = if (gatherNanos > 0 || lifoNanos > 0) nanoTime() else 0L
         var best: KindQueue? = null
         var n = 0
         while (n == 0 && queued > 0) {
             best = null
             var bestSeq = Long.MAX_VALUE
+            var oldestBorn = Long.MAX_VALUE
             for (q in queues) {
                 if (q.ready(now, gatherNanos)) {
-                    val s = q.ring[q.head]!!.seq
-                    if (s < bestSeq) {
-                        bestSeq = s
+                    val h = q.ring[q.head]!!
+                    if (h.born < oldestBorn) oldestBorn = h.born
+                    if (h.seq < bestSeq) {
+                        bestSeq = h.seq
                         best = q
                     }
                 }
             }
             if (best == null) break
-            batch.ensure(minOf(best.size, best.maxBatch))
-            while (n < best.maxBatch && best.size > 0) {
-                val r = best.poll()
+            // Adaptive LIFO: while the oldest ready read has waited past the threshold, serve the kind holding the
+            // newest request, newest first. Per kind it would starve the other kinds behind one stale head.
+            val lifo = lifoNanos > 0 && now - oldestBorn >= lifoNanos
+            if (lifo) {
+                var newest = Long.MIN_VALUE
+                for (q in queues) {
+                    if (q.ready(now, gatherNanos)) {
+                        val s = q.ring[(q.head + q.size - 1) and (q.ring.size - 1)]!!.seq
+                        if (s > newest) {
+                            newest = s
+                            best = q
+                        }
+                    }
+                }
+                lifoBatches++
+            }
+            val k = best!!
+            batch.ensure(minOf(k.size, k.maxBatch))
+            while (n < k.maxBatch && k.size > 0) {
+                val r = if (lifo) k.pollLast() else k.poll()
                 queued--
                 if (!dropAbandoned(r)) batch.reqs[n++] = r
             }
@@ -457,7 +492,7 @@ internal class ReadPool(
         "reads: $requests requests in $batches batches (avg ${(avg * 100).toLong() / 100.0}, max $largest; " +
             "sizes 1:${sizes[0]} 2-3:${sizes[1]} 4-7:${sizes[2]} 8-15:${sizes[3]} 16-31:${sizes[4]} " +
             "32-63:${sizes[5]} 64+:${sizes[6]}), queued $queued, skipped $skipped, healthy $healthy/${workers.size}, " +
-            "reconnects $reconnects; per kind (requests/batches):" +
+            "reconnects $reconnects, lifo batches $lifoBatches; per kind (requests/batches):" +
             queues.joinToString("") { " ${it.kind.name} ${it.requests}/${it.batches}" }
     }
 }

@@ -25,8 +25,11 @@ DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=... HO
 Optional process settings (defaults sized from the CPU count): `HTTP_THREADS`, `DB_READ_CONNS`, `DB_WRITE_CONNS`
 (8 + 4 on the box), `BCRYPT_THREADS`, `BCRYPT_BATCH_MS`, `DB_OPTIONS`, `APP_SORT_TAGS`, `DB_STATS_S`, `OVERLOAD_GUARD`
 (`READ_QUEUE_MAX`, `WRITE_QUEUE_MAX`, `BCRYPT_QUEUE_MAX`), `READ_SHARE`, `READ_GATHER_MS`, `READ_MAX_BATCH`,
-`READ_VIEWER_FLAGS`, `READ_FEED_MAX_BATCH` (default 32: feeds share nothing, so they leave in small batches and no
-long feed execution holds a read connection; 0 = `READ_MAX_BATCH`): see the JVM build's README for what they do, they
+`READ_VIEWER_FLAGS`, `READ_FEED_MAX_BATCH` (default 64: feeds share nothing, so they leave in small batches and no
+long feed execution holds a read connection; 0 = `READ_MAX_BATCH`), `READ_FEED_HEAVY`, `READ_FEED_FLOOR`, `BCRYPT_FLUSH_MIN`,
+`BCRYPT_FLUSH_AGE_MS`, `BCRYPT_PRIO_LOAD`, `BCRYPT_NICE` (bcrypt threads default to `max(2, cpus/4)` at nice 0: one thread lost most
+logins to the 10 s timeout above ~130k users on the box) (defaults: gather 30 ms, `READ_MAX_BATCH` 1024, feed shortcut on, bcrypt flush at 4
+waiting / 150 ms): see the JVM build's README for what they do, they
 are the same code.
 Native-only: `GC_HEAP_MB` (floor of the GC heap target, default 512), `GC_LOG=1` (collections per 10 s).
 Build-time (read by `build.gradle.kts` from the environment, defaults are what the submission has always built):

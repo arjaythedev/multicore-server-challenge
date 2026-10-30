@@ -401,6 +401,22 @@ object Passwords {
     /** A worker is waiting for its batch to fill; the others take only full batches meanwhile. */
     private var gathering = false
     private var windowNanos = 0L
+
+    /**
+     * Adaptive flush, off by default (BCRYPT_FLUSH_MIN / BCRYPT_FLUSH_AGE_MS / BCRYPT_PRIO_LOAD): the batch window above
+     * exists to fill the lanes (a 400 ms window is most of a login's latency), but a login is latency-critical while
+     * the other requests can sit in their own gather windows. So the gatherer stops waiting early when
+     *  - [flushMin] or more jobs are queued and the oldest has waited [flushAgeNanos] (a partial batch, not a tiny one), or
+     *  - the system is loaded: [priorityLoad] or more reads are queued for Postgres (logins go first, now).
+     * 0 keeps the plain window.
+     */
+    private var flushMin = 0
+    private var flushAgeNanos = 0L
+    @Volatile
+    private var priorityLoad = 0
+    /** Reads queued for Postgres right now, set by the app ([conduit.db.Db.readsQueued]); only used with [priorityLoad]. */
+    @Volatile
+    var loadProbe: (() -> Int)? = null
     private var started = false
     private var skipAbandoned = false
     private var queueMax = 0
@@ -431,19 +447,25 @@ object Passwords {
      * [queueMax]: queued jobs that make [saturated] (0: never). [skipAbandoned]: drop queued jobs whose HTTP client is
      * gone ([Exchange.abandoned]) instead of hashing them (about 12.6 ms of CPU each); their handlers never resume.
      */
-    fun start(threads: Int, batchWindowMs: Long, queueMax: Int = 0, skipAbandoned: Boolean = false) {
+    fun start(
+        threads: Int, batchWindowMs: Long, queueMax: Int = 0, skipAbandoned: Boolean = false,
+        flushMin: Int = 0, flushAgeMs: Long = 100, priorityLoad: Int = 0, niceLevel: Int = 10,
+    ) {
         lock.lock()
         try {
             if (started) return // (tests may call it more than once)
             started = true
             windowNanos = batchWindowMs * 1_000_000
+            this.flushMin = flushMin
+            this.flushAgeNanos = flushAgeMs * 1_000_000
+            this.priorityLoad = priorityLoad
             this.queueMax = queueMax
             this.skipAbandoned = skipAbandoned
         } finally {
             lock.unlock()
         }
         println("bcrypt: ${BcryptKernel.init()}")
-        for (i in 0 until maxOf(1, threads)) startThread("bcrypt-$i", nice = 10) { worker(warm = i == 0) }
+        for (i in 0 until maxOf(1, threads)) startThread("bcrypt-$i", nice = niceLevel) { worker(warm = i == 0) }
     }
 
     /** A new "$2b$10$..." hash with a fresh 16-byte random salt. Always suspends; resumes on a bcrypt thread. */
@@ -478,6 +500,8 @@ object Passwords {
             COROUTINE_SUSPENDED
         }
     }
+
+    private const val LOAD_POLL_NANOS = 20_000_000L // how often a waiting gatherer re-reads the load probe
 
     private val EMPTY_KEY = IntArray(18)
     private val EMPTY_SALT = IntArray(4)
@@ -554,8 +578,15 @@ object Passwords {
                     gathering = true
                     try {
                         while (queue.isNotEmpty() && queue.size < max) {
-                            val wait = queue[0].due - nanoTime()
+                            val now = nanoTime()
+                            var wait = queue[0].due - now
+                            if (flushMin > 0 && queue.size >= flushMin) wait = minOf(wait, queue[0].born + flushAgeNanos - now)
                             if (wait <= 0) break
+                            if (priorityLoad > 0) {
+                                // loaded: logins go first, now; the load can rise while we sleep, so poll it
+                                if ((loadProbe?.invoke() ?: 0) >= priorityLoad) break
+                                wait = minOf(wait, LOAD_POLL_NANOS)
+                            }
                             lock.awaitNanos(wait)
                         }
                     } finally {

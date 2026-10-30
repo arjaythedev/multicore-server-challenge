@@ -78,12 +78,29 @@ internal object ReadShare {
     var viewerFlags = false
 
     /**
-     * READ_FEED_MAX_BATCH (default 32): most feeds per execution. Feeds share nothing, so a big batch only saves round
-     * trips, while one of 200 viewers (~0.3 ms of Postgres each) held a read connection for 60-450 ms under load and
-     * everything queued behind it waited. 5-minute holds at 144k users (2026-10-28): p95/p99 66/95 ms vs 107/175 ms
-     * uncapped, the same Postgres CPU per request.
+     * READ_FEED_MAX_BATCH (lab, 0 = the usual cap): most feeds per execution. Feeds share nothing, so a big batch only
+     * saves round trips, while one of 200 viewers (~0.3 ms of Postgres each) holds a read connection for 60-450 ms
+     * under load and everything queued behind it waits.
      */
-    var feedMaxBatch = 32
+    var feedMaxBatch = 0
+
+    /**
+     * READ_FEED_HEAVY (lab, default off): a feed's count is capped at 1000, and most viewers follow an author with 1000+
+     * articles, which makes the capped count walk ~890 index entries per request (~37% of a feed's Postgres time). When on,
+     * each execution looks (once) at the up to 8 followees shared by >= 2 viewers of the batch and checks whether each has
+     * 1000+ articles; a viewer who follows one of them gets 1000 without the scan. Same result as the plain capped count
+     * (any followee with 1000+ articles means at least 1000 in total), so rows and JSON are identical.
+     */
+    var feedHeavy = false
+
+    /**
+     * READ_FEED_FLOOR (lab, default off; needs [feedHeavy]): per execution, each of the 16 followees shared by >= 2 viewers
+     * ("hubs") gets a floor id: the id of its depth-th newest article (depth = the deepest page any viewer of the batch asks
+     * of it). A viewer who follows a hub cannot have an article older than that floor in its first depth feed rows (the hub
+     * alone supplies depth newer ones), so the other followees' per-author probes stop at the floor instead of fetching
+     * depth rows each. Exact, as the Rust leader's "floor cutoffs" (#3 on the leaderboard).
+     */
+    var feedFloor = false
 }
 
 /** The batch's requests, materialized once and referenced by several CTEs. */
@@ -404,19 +421,65 @@ internal object Sql {
      * constant true: every row was selected through the viewer's follows in the same snapshot. The app clamps
      * offsets so r.l + r.o can't overflow.
      */
-    val FEED = ReadKind(
-        "feed",
-        // per request even with [ReadShare]: feeds are per viewer, so there is nothing to share (EXPLAIN: 361 vs 352 us)
-        list(
-            "(SELECT count(*) FROM (SELECT 1 FROM articles c WHERE c.author_id = " +
-                "ANY (ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.v)) LIMIT 1000) s)",
-            listOf(
-                "SELECT x.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 " +
+    private val FEED_PAGE: String get() = listOf(
+            "SELECT x.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 " +
                     "WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT (r.l::bigint + r.o)) x " +
                     "WHERE fo.follower_id = r.v ORDER BY x.id DESC LIMIT r.l OFFSET r.o",
                 "true",
-            ),
-        ),
+            )
+
+    /** [feedHeavy] plus the hub floors ([ReadShare.feedFloor]): `r` also carries each viewer's `depth` = l + o. */
+    private fun feedFloor() =
+        "WITH r0 AS MATERIALIZED (SELECT * FROM $U), " +
+            "r AS MATERIALIZED (SELECT r0.i, r0.v, r0.l, r0.o, GREATEST(r0.l::bigint + r0.o, 1) AS depth, " +
+            "ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r0.v) AS fids FROM r0), " +
+            "hubs AS MATERIALIZED (SELECT h.fid, " +
+            "(SELECT a.id FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC LIMIT 1 OFFSET h.depth - 1) AS floor_id, " +
+            "EXISTS (SELECT 1 FROM articles a WHERE a.author_id = h.fid OFFSET 999) AS capped " +
+            "FROM (SELECT x.fid, max(r.depth) AS depth FROM r, unnest(r.fids) AS x(fid) " +
+            "GROUP BY x.fid HAVING count(*) >= 2 ORDER BY count(*) DESC, x.fid LIMIT 16) h), " +
+            "cap AS MATERIALIZED (SELECT array_agg(hubs.fid) AS ids FROM hubs WHERE hubs.capped) " +
+            "SELECT r.i, c.n, x.* FROM r CROSS JOIN LATERAL (SELECT CASE WHEN r.fids && (SELECT cap.ids FROM cap) " +
+            "THEN 1000::bigint ELSE (SELECT count(*) FROM (SELECT 1 FROM articles c2 WHERE c2.author_id = ANY (r.fids) " +
+            "LIMIT 1000) s) END AS n OFFSET 0) c " +
+            "LEFT JOIN LATERAL (${listOf(FLOOR_IDS, "true")}) x ON true"
+
+    /** The page ids of [feedFloor]: per followee at most depth ids, none older than the viewer's hub floor. */
+    private const val FLOOR_IDS =
+        "SELECT y.id FROM (SELECT max(hb.floor_id) AS floor_id FROM hubs hb WHERE hb.fid = ANY (r.fids)) fl " +
+            "CROSS JOIN LATERAL (SELECT z.id FROM unnest(r.fids) AS u(fid) CROSS JOIN LATERAL " +
+            "(SELECT a2.id FROM articles a2 WHERE a2.author_id = u.fid AND a2.id >= COALESCE(fl.floor_id, 0::bigint) " +
+            "ORDER BY a2.id DESC LIMIT r.depth) z ORDER BY z.id DESC LIMIT r.l OFFSET r.o) y"
+
+    /** [FEED] with the heavy-author shortcut ([ReadShare.feedHeavy]): `r` carries each viewer's followee ids as `fids`. */
+    private fun feedHeavy(page: String) =
+        "WITH r0 AS MATERIALIZED (SELECT * FROM $U), " +
+            "r AS MATERIALIZED (SELECT r0.i, r0.v, r0.l, r0.o, " +
+            "ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r0.v) AS fids FROM r0), " +
+            "hc AS MATERIALIZED (SELECT x.id FROM r CROSS JOIN LATERAL unnest(r.fids) AS x(id) " +
+            "GROUP BY x.id HAVING count(*) >= 2 ORDER BY count(*) DESC LIMIT 8), " +
+            "heavy AS MATERIALIZED (SELECT array_agg(hc.id) AS ids FROM hc " +
+            "WHERE EXISTS (SELECT 1 FROM articles a WHERE a.author_id = hc.id OFFSET 999)) " +
+            "SELECT r.i, c.n, x.* FROM r CROSS JOIN LATERAL (SELECT CASE WHEN r.fids && (SELECT h.ids FROM heavy h) " +
+            "THEN 1000::bigint ELSE (SELECT count(*) FROM (SELECT 1 FROM articles c2 WHERE c2.author_id = ANY (r.fids) " +
+            "LIMIT 1000) s) END AS n OFFSET 0) c LEFT JOIN LATERAL ($page) x ON true"
+
+    val FEED = ReadKind(
+        "feed",
+        // per request even with [ReadShare]: feeds are per viewer, so there is nothing to share (EXPLAIN: 361 vs 352 us).
+        // Tried and dropped (2026-10-28): taking the page from the count's id scan when below the cap. EXPLAIN 456 vs
+        // 327 us per feed: most viewers reach the 1000 cap (mean 893 ids), so the per-followee page runs anyway.
+        if (ReadShare.feedHeavy && ReadShare.feedFloor) {
+            feedFloor()
+        } else if (ReadShare.feedHeavy) {
+            feedHeavy(FEED_PAGE)
+        } else {
+            list(
+                "(SELECT count(*) FROM (SELECT 1 FROM articles c WHERE c.author_id = " +
+                    "ANY (ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.v)) LIMIT 1000) s)",
+                FEED_PAGE,
+            )
+        },
         maxBatch = ReadShare.feedMaxBatch.takeIf { it > 0 } ?: batch,
     )
 
