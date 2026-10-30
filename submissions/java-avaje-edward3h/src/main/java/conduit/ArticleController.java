@@ -41,11 +41,13 @@ class ArticleController implements ApiController {
     }
 
     private static @Nullable String query(ServerRequest req, String name) {
-        return req.query().first(name).orElse(null);
+        var value = req.query().first(name);
+        return value.isPresent() ? value.get() : null;
     }
 
-    private static boolean given(@Nullable String s) {
-        return s != null && !s.isEmpty();
+    /** The value, or null when it is absent or empty (an empty filter is no filter). */
+    private static @Nullable String given(@Nullable String s) {
+        return s == null || s.isEmpty() ? null : s;
     }
 
     private static Dto.Profile author(String username, @Nullable String bio, @Nullable String image,
@@ -75,15 +77,15 @@ class ArticleController implements ApiController {
     Dto.ArticleList list(ServerRequest req) {
         long viewer = auth.viewer(req);
         Page p = page(req);
-        String tag = query(req, "tag");
-        String author = query(req, "author");
-        String favorited = query(req, "favorited");
-        if (given(tag)) {
+        String tag = given(query(req, "tag"));
+        String author = given(query(req, "author"));
+        String favorited = given(query(req, "favorited"));
+        if (tag != null) {
             return summaries(articles.listByTag(viewer, p.limit(), p.offset(), tag), articles.countByTag(tag));
-        } else if (given(author)) {
+        } else if (author != null) {
             return summaries(articles.listByAuthor(viewer, p.limit(), p.offset(), author),
                     articles.countByAuthor(author));
-        } else if (given(favorited)) {
+        } else if (favorited != null) {
             return summaries(articles.listFavorited(viewer, p.limit(), p.offset(), favorited),
                     articles.countFavorited(favorited));
         }

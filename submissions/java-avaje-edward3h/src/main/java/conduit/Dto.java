@@ -76,8 +76,8 @@ final class Dto {
 
     @Json
     record Errors(Map<String, List<String>> errors) {
-        static Errors of(String message) {
-            return new Errors(Map.of("body", List.of(message)));
+        static Errors of(@Nullable String message) {
+            return new Errors(Map.of("body", List.of(message == null ? "error" : message)));
         }
     }
 }
