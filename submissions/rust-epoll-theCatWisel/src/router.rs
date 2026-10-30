@@ -7,27 +7,57 @@ use crate::codec::{self, JsonMap, JsonVal};
 use crate::engine::{self, CryptoTask, ReadOp, ReadTask, WriteOp, WriteTask};
 use crate::reactor::{self, ReplyAddr};
 
+struct QueueInner<T> {
+    q: VecDeque<T>,
+    since: Option<Instant>,
+    hold: usize,
+    waiting: usize,
+}
+
 pub struct WorkQueue<T> {
-    items: Mutex<VecDeque<T>>,
+    inner: Mutex<QueueInner<T>>,
     ready: Condvar,
 }
 
 impl<T> WorkQueue<T> {
     pub const fn new() -> Self {
         WorkQueue {
-            items: Mutex::new(VecDeque::new()),
+            inner: Mutex::new(QueueInner {
+                q: VecDeque::new(),
+                since: None,
+                hold: 1,
+                waiting: 0,
+            }),
             ready: Condvar::new(),
         }
     }
 
     pub fn push(&self, item: T) {
-        self.items.lock().unwrap().push_back(item);
-        self.ready.notify_one();
+        let mut g = self.inner.lock().unwrap();
+        let was_empty = g.q.is_empty();
+        if was_empty {
+            g.since = Some(Instant::now());
+        }
+        g.q.push_back(item);
+        let notify = g.waiting > 0 && (was_empty || g.q.len() >= g.hold);
+        drop(g);
+        if notify {
+            self.ready.notify_one();
+        }
     }
 
     pub fn push_front(&self, item: T) {
-        self.items.lock().unwrap().push_front(item);
-        self.ready.notify_one();
+        let mut g = self.inner.lock().unwrap();
+        let was_empty = g.q.is_empty();
+        if was_empty {
+            g.since = Some(Instant::now());
+        }
+        g.q.push_front(item);
+        let notify = g.waiting > 0 && (was_empty || g.q.len() >= g.hold);
+        drop(g);
+        if notify {
+            self.ready.notify_one();
+        }
     }
 
     pub fn notify(&self) {
@@ -38,101 +68,95 @@ impl<T> WorkQueue<T> {
         if batch.is_empty() {
             return;
         }
-        let mut q = self.items.lock().unwrap();
-        q.extend(batch.drain(..));
-        drop(q);
-        self.ready.notify_one();
+        let mut g = self.inner.lock().unwrap();
+        let was_empty = g.q.is_empty();
+        if was_empty {
+            g.since = Some(Instant::now());
+        }
+        g.q.extend(batch.drain(..));
+        let notify = g.waiting > 0 && (was_empty || g.q.len() >= g.hold);
+        drop(g);
+        if notify {
+            self.ready.notify_one();
+        }
     }
 
     pub fn push_batch_front(&self, batch: &mut Vec<T>) {
         if batch.is_empty() {
             return;
         }
-        let mut q = self.items.lock().unwrap();
-        for item in batch.drain(..).rev() {
-            q.push_front(item);
+        let mut g = self.inner.lock().unwrap();
+        let was_empty = g.q.is_empty();
+        if was_empty {
+            g.since = Some(Instant::now());
         }
-        drop(q);
-        self.ready.notify_one();
+        for item in batch.drain(..).rev() {
+            g.q.push_front(item);
+        }
+        let notify = g.waiting > 0 && (was_empty || g.q.len() >= g.hold);
+        drop(g);
+        if notify {
+            self.ready.notify_one();
+        }
     }
 
     pub fn drain_up_to(&self, max_items: usize, dst: &mut Vec<T>) {
-        let mut q = self.items.lock().unwrap();
-        while q.is_empty() {
-            q = self.ready.wait(q).unwrap();
+        let mut g = self.inner.lock().unwrap();
+        while g.q.is_empty() {
+            g.hold = 1;
+            g.waiting += 1;
+            g = self.ready.wait(g).unwrap();
+            g.waiting -= 1;
         }
-        let take_n = q.len().min(max_items);
-        dst.extend(q.drain(..take_n));
-        if !q.is_empty() {
-            self.ready.notify_one();
-        }
-    }
-
-    pub fn drain_crypto_bbr(
-        &self,
-        lanes: usize,
-        total_workers: usize,
-        busy_workers: &std::sync::atomic::AtomicUsize,
-        ewma_us: &std::sync::atomic::AtomicUsize,
-        dst: &mut Vec<T>,
-    ) {
-        use std::sync::atomic::Ordering;
-        let mut q = self.items.lock().unwrap();
-        while q.is_empty() {
-            q = self.ready.wait(q).unwrap();
-        }
-        let first_at = Instant::now();
-        while q.len() < lanes {
-            let busy = busy_workers.load(Ordering::Acquire);
-            let tau_us = ewma_us.load(Ordering::Relaxed);
-            let min_wait_us = (tau_us >> 6).max(500);
-            let target_us = if busy == 0 {
-                min_wait_us
-            } else {
-                ((tau_us * busy) / total_workers.max(1)).max(min_wait_us << 1)
-            };
-            let window = Duration::from_micros(target_us as u64);
-            let elapsed = first_at.elapsed();
-            if elapsed >= window {
-                break;
+        let take_n = g.q.len().min(max_items);
+        dst.extend(g.q.drain(..take_n));
+        if g.q.is_empty() {
+            g.since = None;
+        } else {
+            g.since = Some(Instant::now());
+            if g.waiting > 0 {
+                self.ready.notify_one();
             }
-            q = self.ready.wait_timeout(q, window - elapsed).unwrap().0;
-        }
-        let take_n = q.len().min(lanes);
-        dst.extend(q.drain(..take_n));
-        if !q.is_empty() {
-            self.ready.notify_one();
         }
     }
 
-    pub fn drain_bbr_codel(
+    pub fn take_aged(
         &self,
-        idle_workers: usize,
-        min_items: usize,
-        window: Duration,
+        want: usize,
+        max_age: Duration,
         max_cap: usize,
         dst: &mut Vec<T>,
     ) {
-        let mut q = self.items.lock().unwrap();
-        while q.is_empty() {
-            q = self.ready.wait(q).unwrap();
+        let mut g = self.inner.lock().unwrap();
+        while g.q.is_empty() {
+            g.hold = 1;
+            g.waiting += 1;
+            g = self.ready.wait(g).unwrap();
+            g.waiting -= 1;
         }
-        if !window.is_zero() && q.len() < min_items {
-            let deadline = Instant::now() + window;
-            while q.len() < min_items {
+        if !max_age.is_zero() && g.q.len() < want {
+            let deadline = g.since.unwrap_or_else(Instant::now) + max_age;
+            while g.q.len() < want {
                 let now = Instant::now();
                 if now >= deadline {
                     break;
                 }
-                q = self.ready.wait_timeout(q, deadline - now).unwrap().0;
+                g.hold = want;
+                g.waiting += 1;
+                g = self.ready.wait_timeout(g, deadline - now).unwrap().0;
+                g.waiting -= 1;
+                g.hold = 1;
             }
         }
-        let q_len = q.len();
-        let fair_share = (q_len + idle_workers - 1) / idle_workers.max(1);
-        let take_n = fair_share.max(min_items).min(q_len).min(max_cap);
-        dst.extend(q.drain(..take_n));
-        if !q.is_empty() {
-            self.ready.notify_one();
+        let take_n = g.q.len().min(max_cap);
+        dst.extend(g.q.drain(..take_n));
+        if g.q.is_empty() {
+            g.since = None;
+        } else {
+            g.since = Some(Instant::now());
+            if g.waiting > 0 {
+                self.ready.notify_one();
+            }
         }
     }
 }
