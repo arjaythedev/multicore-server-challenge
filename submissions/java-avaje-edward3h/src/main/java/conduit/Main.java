@@ -41,6 +41,7 @@ public class Main {
                 HttpException.class,
                 (_, res, ex) -> send(res, errors, ex.status().code(), ex.getMessage()));
         routing.error(Exception.class, (_, res, ex) -> {
+            //noinspection CallToPrintStackTrace
             ex.printStackTrace();
             send(res, errors, 500, "internal server error");
         });

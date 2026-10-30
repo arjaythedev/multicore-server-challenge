@@ -36,7 +36,7 @@ final class Passwords {
 
     /** A password bcrypt can't take (over 72 bytes) can't match a hash made from one that it could. */
     boolean verify(String password, String hash) {
-        if (!Body.isHashable(password)) {
+        if (Body.isNotHashable(password)) {
             return false;
         }
         return await(pool.submit(() -> BCrypt.verifyer().verify(password.toCharArray(), hash).verified));

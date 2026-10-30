@@ -10,14 +10,14 @@ final class Body {
 
     /** bcrypt only hashes the first 72 bytes; longer passwords are refused: 422. */
     static String hashable(String password) {
-        if (!isHashable(password)) {
+        if (isNotHashable(password)) {
             throw ApiException.invalid("password is too long");
         }
         return password;
     }
 
-    static boolean isHashable(String password) {
-        return password.getBytes(StandardCharsets.UTF_8).length <= 72;
+    static boolean isNotHashable(String password) {
+        return password.getBytes(StandardCharsets.UTF_8).length > 72;
     }
 
     /** ASCII digits only (no sign, no spaces) that fit in a long; -1 otherwise. */
