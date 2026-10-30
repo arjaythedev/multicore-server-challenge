@@ -1,6 +1,7 @@
 import orjson
 from types import GeneratorType
-from typing import Callable, Dict, Tuple, Any, Optional, List, Pattern
+import sys
+from typing import Callable, Dict, Tuple, Any, Optional, List
 from urllib.parse import parse_qs
 import re
 
@@ -37,12 +38,16 @@ class HttpRequest:
 
 
 class _Route:
-    __slots__ = ("method", "pattern", "handler")
+    __slots__ = ("method", "pattern", "handler", "n_parts", "literals", "param_slots")
 
     def __init__(self, method: str, pattern: str, handler: Callable):
         self.method = method
         self.pattern = re.compile(_compile_path(pattern))
         self.handler = handler
+        parts = pattern.strip("/").split("/")
+        self.n_parts = len(parts)
+        self.literals = tuple((i, p) for i, p in enumerate(parts) if not p.startswith(":"))
+        self.param_slots = tuple((i, p[1:]) for i, p in enumerate(parts) if p.startswith(":"))
 
     def match(self, method: str, path: str) -> Optional[Dict[str, str]]:
         if method != self.method:
@@ -101,13 +106,17 @@ class SocketRouter:
         repository's Query objects first."""
         route = self._static.get((request.method, request.path))
         if route is None:
-            for candidate in self._by_method.get(request.method, ()):
-                m = candidate.pattern.fullmatch(request.path)
-                if m is not None:
-                    route, request.params = candidate, m.groupdict()
-                    break
-            else:
-                return self._build_response(404, {"errors": {"body": ["Not found"]}})
+            path = request.path
+            if len(path) > 1 and path[0] == "/" and "//" not in path and not path.endswith("/"):
+                parts = path[1:].split("/")
+                n_parts = len(parts)
+                for candidate in self._by_method.get(request.method, ()):
+                    if candidate.n_parts == n_parts and all(parts[i] == lit for i, lit in candidate.literals):
+                        route = candidate
+                        request.params = {name: parts[i] for i, name in candidate.param_slots}
+                        break
+            if route is None:
+                return self._build_response(404, _NOT_FOUND_BYTES)
         try:
             out = route.handler(request)
             if out.__class__ is GeneratorType:
@@ -116,9 +125,7 @@ class SocketRouter:
         except ApiError as e:
             return self._build_response(e.status, {"errors": {"body": [e.message]}})
         except Exception as e:
-            return self._build_response(
-                500, {"errors": {"body": [f"Internal error: {e}"]}}
-            )
+            return _internal_error(e)
 
     def resume(self, handler, value, error):
         """Continue a generator handler with its query's result (or raise `error` at its `yield`): response bytes
@@ -130,7 +137,7 @@ class SocketRouter:
         except ApiError as e:
             return self._build_response(e.status, {"errors": {"body": [e.message]}})
         except Exception as e:
-            return self._build_response(500, {"errors": {"body": [f"Internal error: {e}"]}})
+            return _internal_error(e)
         return handler, query
 
     def dispatch_sync(self, request: HttpRequest) -> bytes:
@@ -151,15 +158,26 @@ class SocketRouter:
         # 204 must carry no body: stray bytes would be read as the next keep-alive response
         # orjson serializes dataclasses natively, straight to UTF-8 bytes: about 4x the stdlib C encoder
         # (list page 19.3 → 4.7 µs, user response 0.7 → 0.2 µs, same JSON)
-        # bytes are an already-encoded JSON body (article lists, built by Postgres)
-        if data is None or status_code == 204:
+        # bytes are an already-encoded JSON body (built by Postgres)
+        if status_code == 204 or data is None:
+            if status_code == 204:
+                return _EMPTY_204
             body = b""
         elif data.__class__ is bytes:
             body = data
         else:
             body = orjson.dumps(data)
+        n = len(body)
+        if status_code == 200 and n < 16384:
+            return _OK_HEADERS[n] + body
         return b"".join((_STATUS_LINES.get(status_code) or _status_line(status_code),
-                         b"Content-Length: ", str(len(body)).encode(), _HEAD_TAIL, body))
+                         b"Content-Length: ", str(n).encode(), _HEAD_TAIL, body))
+
+
+def _internal_error(e: Exception) -> bytes:
+    """500 with a generic body: the exception's text (Postgres messages included) goes to the log, not the client."""
+    print(f"500: {e.__class__.__name__}: {e}", file=sys.stderr, flush=True)
+    return SocketRouter._build_response(500, _INTERNAL_ERROR_BYTES)
 
 
 def _status_line(status_code: int) -> bytes:
@@ -168,6 +186,13 @@ def _status_line(status_code: int) -> bytes:
 
 
 _HEAD_TAIL = b"\r\nConnection: keep-alive\r\n\r\n"
+_NOT_FOUND_BYTES = b'{"errors":{"body":["Not found"]}}'
+_INTERNAL_ERROR_BYTES = b'{"errors":{"body":["Internal error"]}}'
+_EMPTY_204 = b"HTTP/1.1 204 No Content\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+_OK_HEADERS = tuple(
+    f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {n}\r\nConnection: keep-alive\r\n\r\n".encode("latin1")
+    for n in range(16384)
+)
 
 
 _REASONS = {
@@ -188,21 +213,44 @@ _STATUS_LINES = {code: _status_line(code) for code in _REASONS}
 def parse_request(raw: bytes) -> HttpRequest:
     """Parse one HTTP/1.1 request from buffered bytes (assumes complete head)."""
     try:
-        end = raw.find(b"\r\n\r\n")
-        if end == -1:
-            head, body = raw.decode("latin1"), b""
+        i = raw.find(b"\r\n")
+        if raw[:4] == b"GET " and raw.endswith(b"\r\n\r\n"):
+            end = len(raw) - 4
+            body = b""
         else:
-            head, body = raw[:end].decode("latin1"), raw[end + 4 :]
-        lines = head.split("\r\n")
-        parts = lines[0].split(" ")
-        method, full_path = parts[0], parts[1]
-        path, _, qs = full_path.partition("?")
-        headers = {}
-        for line in lines[1:]:
-            if ":" in line:
-                k, _, v = line.partition(":")
-                headers[k.strip().lower()] = v.strip()
-        return HttpRequest(method, path, {}, _query(qs), headers, raw, body)
+            end = raw.find(b"\r\n\r\n", i)
+            if end == -1:
+                end = len(raw)
+                body = b""
+            else:
+                body = raw[end + 4 :]
+        line0 = raw[:i].decode("latin1")
+        s1 = line0.find(" ")
+        s2 = line0.find(" ", s1 + 1)
+        if s1 <= 0 or s2 <= s1 + 1:
+            raise ValueError
+        method = line0[:s1]
+        full_path = line0[s1 + 1 : s2]
+        if "?" in full_path:
+            path, _, qs = full_path.partition("?")
+            query = _query(qs)
+        else:
+            path = full_path
+            query = {}
+        a = raw.find(b"\r\nAuthorization:", i, end)
+        if a != -1:
+            ve = raw.find(b"\r\n", a + 16)
+            headers = {"authorization": raw[a + 16 : ve if ve != -1 else end].decode("latin1").strip()}
+        elif b"uthorization" not in raw and b"UTHORIZATION" not in raw:
+            headers = {}
+        else:
+            headers = {}
+            for line in raw[i + 2 : end].decode("latin1").split("\r\n"):
+                if ":" in line:
+                    k, _, v = line.partition(":")
+                    if k.strip().lower() == "authorization":
+                        headers["authorization"] = v.strip()
+        return HttpRequest(method, path, {}, query, headers, raw, body)
     except Exception:
         raise ApiError(400, "Bad request")
 

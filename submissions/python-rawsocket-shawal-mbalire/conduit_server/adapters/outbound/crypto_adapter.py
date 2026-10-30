@@ -1,5 +1,6 @@
-import base64
+import binascii
 import ctypes
+import hashlib
 import hmac
 import orjson
 import threading
@@ -18,6 +19,10 @@ _EXP_30_DAYS_SECONDS = 30 * 24 * 3600
 _BCRYPT_SLOTS = threading.BoundedSemaphore(2)
 _MAX_PASSWORD = 72  # bcrypt's key limit; longer passwords are rejected (pyca/bcrypt raises ValueError)
 _CRYPT_DATA = 65536  # >= sizeof(struct crypt_data) (~32 KiB); one zeroed buffer per call keeps crypt_rn reentrant
+_B64_DECODE_TR = bytes.maketrans(b"-_", b"+/")
+_B64_ENCODE_TR = bytes.maketrans(b"+/", b"-_")
+_B64_PAD = (b"", b"===", b"==", b"=")
+_NUM_TYPES = (int, float)
 
 
 def _load_crypt_rn():
@@ -52,10 +57,14 @@ class JoseBcryptCryptoAdapter(CryptoPort):
     def __init__(self, secret_key: str):
         self._secret = secret_key
         self._key = secret_key.encode("utf-8")
+        self._base_hmac = hmac.new(self._key, digestmod=hashlib.sha256)
         # PyJWT's header for every HS256 token we issue: a token carrying exactly this segment needs no decoding
         with warnings.catch_warnings():  # PyJWT warns about short keys; the secret is given by the spec
             warnings.simplefilter("ignore")
-            self._hs256_header = jwt.encode({}, secret_key, algorithm=_HS256).partition(".")[0]
+            hdr = jwt.encode({}, secret_key, algorithm=_HS256).partition(".")[0]
+        self._hs256_header = hdr
+        self._hs256_header_b = hdr.encode("ascii")
+        self._hs256_prefix_b = self._hs256_header_b + b"."
 
     def hash_password(self, password: str) -> str:
         pw = password.encode("utf-8")
@@ -81,42 +90,55 @@ class JoseBcryptCryptoAdapter(CryptoPort):
 
     def issue_token(self, user_id: int) -> str:
         now = int(time.time())
-        payload = {"sub": str(user_id), "iat": now, "exp": now + _EXP_30_DAYS_SECONDS}
-        return jwt.encode(payload, self._secret, algorithm=_HS256)
+        payload_b64 = (
+            binascii.b2a_base64(
+                orjson.dumps({"sub": str(user_id), "iat": now, "exp": now + _EXP_30_DAYS_SECONDS}),
+                newline=False,
+            )
+            .rstrip(b"=")
+            .translate(_B64_ENCODE_TR)
+        )
+        signing_input = self._hs256_prefix_b + payload_b64
+        h = self._base_hmac.copy()
+        h.update(signing_input)
+        sig_b64 = binascii.b2a_base64(h.digest(), newline=False).rstrip(b"=").translate(_B64_ENCODE_TR)
+        return (signing_input + b"." + sig_b64).decode("ascii")
 
     def verify_token(self, token: str) -> int:
         """Verify HS256 signature + exp on every call (no caching). Returns user id.
 
         Same checks PyJWT.decode(algorithms=["HS256"], require exp/iat/sub) makes, with stdlib hmac:
         PyJWT validates base64 one character at a time in Python, which dominated request CPU."""
-        signing_input, _, sig_b64 = token.rpartition(".")
-        header_b64, _, payload_b64 = signing_input.partition(".")
-        if not header_b64 or "." in payload_b64:
+        raw = token.encode("ascii")
+        signing_input, _, sig_b64 = raw.rpartition(b".")
+        header_b64, _, payload_b64 = signing_input.partition(b".")
+        if not header_b64 or b"." in payload_b64:
             raise ValueError("a JWT has exactly three segments")
-        expected = hmac.digest(self._key, signing_input.encode("ascii"), "sha256")
-        if not hmac.compare_digest(expected, _b64decode(sig_b64)):
+        h = self._base_hmac.copy()
+        h.update(signing_input)
+        if not hmac.compare_digest(h.digest(), _b64decode_b(sig_b64)):
             raise ValueError("bad signature")
-        if header_b64 != self._hs256_header and orjson.loads(_b64decode(header_b64)).get("alg") != _HS256:
-            raise ValueError("only HS256 is accepted")
-        payload = orjson.loads(_b64decode(payload_b64))
+        if header_b64 != self._hs256_header_b:
+            hdr = orjson.loads(_b64decode_b(header_b64))
+            if not isinstance(hdr, dict) or hdr.get("alg") != _HS256:
+                raise ValueError("only HS256 is accepted")
+        payload = orjson.loads(_b64decode_b(payload_b64))
         now = time.time()
         exp, iat = payload["exp"], payload["iat"]
-        if not _is_number(exp) or exp <= now:
+        if exp.__class__ not in _NUM_TYPES or exp <= now:
             raise ValueError("expired")
-        if not _is_number(iat) or iat > now:
+        if iat.__class__ not in _NUM_TYPES or iat > now:
             raise ValueError("issued in the future")
         nbf = payload.get("nbf")
-        if nbf is not None and (not _is_number(nbf) or nbf > now):
+        if nbf is not None and (nbf.__class__ not in _NUM_TYPES or nbf > now):
             raise ValueError("not yet valid")
         sub = payload["sub"]
-        if not isinstance(sub, str):
+        if sub.__class__ is not str:
             raise ValueError("sub must be a string")
         return int(sub)
 
 
-def _b64decode(segment: str) -> bytes:
-    return base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4))
-
-
-def _is_number(value) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+def _b64decode_b(segment: bytes) -> bytes:
+    """base64url without padding. strict_mode: any character outside the alphabet is an error (the default mode
+    skips them, so a signature with junk mixed in would still decode)."""
+    return binascii.a2b_base64(segment.translate(_B64_DECODE_TR) + _B64_PAD[len(segment) & 3], strict_mode=True)

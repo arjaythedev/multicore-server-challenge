@@ -1,31 +1,24 @@
-from typing import Tuple, List, Optional
+from typing import Tuple
 
 from conduit_server.adapters.inbound.errors import ApiError
 from conduit_server.adapters.inbound.router import HttpRequest, router
 from conduit_server.adapters.outbound.pg_repository import DuplicateError
-from conduit_server.domain.models import (
-    ProfileData,
-    ProfileResponse,
-    UserData,
-    UserResponse,
-    ArticleData,
-    SingleArticleResponse,
-    ArticlesResponse,
-    SingleCommentResponse,
-    CommentsResponse,
-    TagsResponse,
-    Empty,
-)
+from conduit_server.domain.models import UserData, UserResponse, Empty
 from conduit_server.domain import services
 
 # Controllers use the db and crypto ports injected from main.py.
-# The hot reads are generators: `row = yield db.q_...(...)` hands the query to the server, which runs it pipelined
-# (the worker keeps serving meanwhile) and resumes the handler with its result; writes call the db directly.
+# Every route but the three bcrypt ones is a generator: `body = yield db.q_...(...)` hands the query to the server,
+# which runs it pipelined (the worker keeps serving meanwhile) and resumes the handler with its result. Those
+# results are finished JSON bodies built by Postgres (the response shapes are in domain/models.py and checked by
+# scripts/diffsql.py). The bcrypt routes run on the offload helper thread and call the db directly.
 
 
 # Injected at startup by main.py (composition root).
 db = None  # type: ArticleRepositoryPort — no caching; every call hits Postgres
 crypto = None  # type: CryptoPort
+
+
+_MAX_BIGINT = 2**63 - 1
 
 
 def bootstrap(article_repository, crypto_adapter):
@@ -65,36 +58,6 @@ def _paging(query: dict) -> Tuple[int, int]:
         raise ApiError(422, "limit or offset out of range")
 
 
-def _profile(row: dict) -> ProfileData:
-    return ProfileData(
-        username=row["username"], bio=row["bio"], image=row["image"], following=row["following"]
-    )
-
-
-def _article(row: dict, include_body: bool) -> ArticleData:
-    if include_body:
-        body = row["body"]
-    else:
-        body = None
-    return ArticleData(
-        slug=row["slug"],
-        title=row["title"],
-        description=row["description"],
-        body=body,
-        tagList=row["tag_list"],
-        createdAt=row["created_at"],
-        updatedAt=row["updated_at"],
-        favorited=row["favorited"],
-        favoritesCount=row["favorites_count"],
-        author=ProfileData(
-            username=row["username"],
-            bio=row["bio"],
-            image=row["image"],
-            following=row["following"],
-        ),
-    )
-
-
 def _user_data(row: dict, token: str) -> UserData:
     return UserData(
         email=row["email"],
@@ -103,30 +66,6 @@ def _user_data(row: dict, token: str) -> UserData:
         bio=row["bio"],
         image=row["image"],
     )
-
-
-def _articles_response(rows: List[tuple], total: int) -> dict:
-    """The list response from rows. The routes get it built by Postgres (`list_articles_json`); scripts/diffsql.py
-    checks that body against this one. Rows in ARTICLE_ROW order (ports.outbound). List entries omit 'body'
-    entirely (RealWorld spec), unlike single-article responses: same keys and order as ArticleData minus body."""
-    return {
-        "articles": [
-            {
-                "slug": slug,
-                "title": title,
-                "description": description,
-                "tagList": tag_list,
-                "createdAt": created_at,
-                "updatedAt": updated_at,
-                "favorited": favorited,
-                "favoritesCount": favorites_count,
-                "author": ProfileData(username=username, bio=bio, image=image, following=following),
-            }
-            for (_id, slug, title, description, created_at, updated_at, tag_list, favorites_count,
-                 favorited, username, bio, image, following) in rows
-        ],
-        "articlesCount": total,
-    }
 
 
 # ---- users / auth --------------------------------------------------------
@@ -207,32 +146,28 @@ def update_user(request: HttpRequest):
 @router.get("/api/profiles/:username")
 def get_profile(request: HttpRequest):
     viewer = _viewer(request, required=False)
-    row = yield db.q_find_profile(viewer, request.params["username"])
-    if not row:
+    body = yield db.q_find_profile_json(viewer, request.params["username"])
+    if body is None:
         raise ApiError(404, "profile not found")
-    return 200, ProfileResponse(profile=_profile(row))
+    return 200, body
 
 
 @router.post("/api/profiles/:username/follow")
 def follow(request: HttpRequest):
     viewer = _viewer(request, required=True)
-    row = db.find_profile(viewer, request.params["username"])
-    if not row:
+    body = yield db.q_follow_json(viewer, request.params["username"])
+    if body is None:
         raise ApiError(404, "profile not found")
-    db.follow(viewer, row["id"])
-    row["following"] = True
-    return 200, ProfileResponse(profile=_profile(row))
+    return 200, body
 
 
 @router.delete("/api/profiles/:username/follow")
 def unfollow(request: HttpRequest):
     viewer = _viewer(request, required=True)
-    row = db.find_profile(viewer, request.params["username"])
-    if not row:
+    body = yield db.q_unfollow_json(viewer, request.params["username"])
+    if body is None:
         raise ApiError(404, "profile not found")
-    db.unfollow(viewer, row["id"])
-    row["following"] = False
-    return 200, ProfileResponse(profile=_profile(row))
+    return 200, body
 
 
 # ---- articles ------------------------------------------------------------
@@ -262,10 +197,10 @@ def feed(request: HttpRequest):
 @router.get("/api/articles/:slug")
 def get_article(request: HttpRequest):
     viewer = _viewer(request, required=False)
-    row = yield db.q_find_article(viewer, request.params["slug"])
-    if not row:
+    body = yield db.q_find_article_json(viewer, request.params["slug"])
+    if body is None:
         raise ApiError(404, "article not found")
-    return 200, SingleArticleResponse(article=_article(row, include_body=True))
+    return 200, body
 
 
 @router.post("/api/articles")
@@ -281,23 +216,17 @@ def create_article(request: HttpRequest):
         for f in ("title", "description", "body")
     ):
         raise ApiError(422, "title, description and body are required")
-    art_id = db.create_article(
+    body = yield db.q_create_article_json(
         viewer, payload["title"], payload["description"], payload["body"], tag_list
     )
-    row = db.find_article_by_id(viewer, art_id)
-    if not row:
+    if body is None:
         raise ApiError(404, "article not found")
-    return 201, SingleArticleResponse(article=_article(row, include_body=True))
+    return 201, body
 
 
 @router.put("/api/articles/:slug")
 def update_article(request: HttpRequest):
     viewer = _viewer(request, required=True)
-    art = db.article_for_write(request.params["slug"])
-    if not art:
-        raise ApiError(404, "article not found")
-    if art["author_id"] != viewer:
-        raise ApiError(403, "not the author")
     payload = request.json_wrapped("article")
     for k in ("title", "description", "body"):
         v = payload.get(k)
@@ -308,55 +237,47 @@ def update_article(request: HttpRequest):
         for k in ("title", "description", "body")
         if payload.get(k) is not None
     }
-    db.update_article(art["id"], fields)
-    row = db.find_article_by_id(viewer, art["id"])
-    return 200, SingleArticleResponse(article=_article(row, include_body=True))
+    res = yield db.q_update_article_by_slug_json(viewer, request.params["slug"], fields)
+    if res is None:
+        raise ApiError(404, "article not found")
+    author_id, body = res
+    if author_id != viewer:
+        raise ApiError(403, "not the author")
+    return 200, body
 
 
 @router.delete("/api/articles/:slug")
 def delete_article(request: HttpRequest):
     viewer = _viewer(request, required=True)
-    art = db.article_for_write(request.params["slug"])
-    if not art:
+    author_id = yield db.q_delete_article_by_slug(viewer, request.params["slug"])
+    if author_id is None:
         raise ApiError(404, "article not found")
-    if art["author_id"] != viewer:
+    if author_id != viewer:
         raise ApiError(403, "not the author")
-    db.delete_article(art["id"])
     return 204, Empty()
 
 
 # ---- favorites -----------------------------------------------------------
-
-
-def _favorite(request: HttpRequest) -> Tuple[int, SingleArticleResponse]:
-    viewer = _viewer(request, required=True)
-    art = db.article_for_write(request.params["slug"])
-    if not art:
-        raise ApiError(404, "article not found")
-    row = db.find_article_by_id(viewer, art["id"])
-    if not row:
-        raise ApiError(404, "article not found")
-    return 200, SingleArticleResponse(article=_article(row, include_body=True))
+# Each toggle is one statement (favorite/unfavorite): CTE `w` does the write, the same statement
+# returns the article JSON body. None = article not found (404).
 
 
 @router.post("/api/articles/:slug/favorite")
 def favorite(request: HttpRequest):
     viewer = _viewer(request, required=True)
-    art = db.article_for_write(request.params["slug"])
-    if not art:
+    body = yield db.q_favorite_json(viewer, request.params["slug"])
+    if body is None:
         raise ApiError(404, "article not found")
-    db.favorite(viewer, art["id"])
-    return _favorite(request)
+    return 200, body
 
 
 @router.delete("/api/articles/:slug/favorite")
 def unfavorite(request: HttpRequest):
     viewer = _viewer(request, required=True)
-    art = db.article_for_write(request.params["slug"])
-    if not art:
+    body = yield db.q_unfavorite_json(viewer, request.params["slug"])
+    if body is None:
         raise ApiError(404, "article not found")
-    db.unfavorite(viewer, art["id"])
-    return _favorite(request)
+    return 200, body
 
 
 # ---- comments ------------------------------------------------------------
@@ -365,56 +286,36 @@ def unfavorite(request: HttpRequest):
 @router.get("/api/articles/:slug/comments")
 def list_comments(request: HttpRequest):
     viewer = _viewer(request, required=False)
-    rows = yield db.q_list_comments_by_slug(viewer, request.params["slug"])
-    if rows is None:
+    body = yield db.q_list_comments_by_slug_json(viewer, request.params["slug"])
+    if body is None:
         raise ApiError(404, "article not found")
-    comments = [  # rows in COMMENT_ROW order
-        {
-            "id": id_,
-            "createdAt": created_at,
-            "updatedAt": updated_at,
-            "body": body,
-            "author": ProfileData(username=username, bio=bio, image=image, following=following),
-        }
-        for (id_, body, created_at, updated_at, username, bio, image, following) in rows
-    ]
-    return 200, CommentsResponse(comments=comments)
+    return 200, body
 
 
 @router.post("/api/articles/:slug/comments")
 def create_comment(request: HttpRequest):
     viewer = _viewer(request, required=True)
-    art = db.article_for_write(request.params["slug"])  # noqa: E302 — body validated first
     comment = request.json_wrapped("comment")
     if not services.is_non_empty_string(comment.get("body")):
         raise ApiError(422, "comment body is required")
-    if not art:
+    body = yield db.q_create_comment_by_slug_json(viewer, request.params["slug"], comment["body"])
+    if body is None:
         raise ApiError(404, "article not found")
-    row = db.create_comment(viewer, art["id"], comment["body"])
-    data = {
-        "id": row["id"],
-        "createdAt": row["created_at"],
-        "updatedAt": row["updated_at"],
-        "body": row["body"],
-        "author": ProfileData(
-            username=row["username"], bio=row["bio"], image=row["image"], following=False
-        ),
-    }
-    return 201, SingleCommentResponse(comment=data)
+    return 201, body
 
 
 @router.delete("/api/articles/:slug/comments/:comment_id")
 def delete_comment(request: HttpRequest):
     viewer = _viewer(request, required=True)
     raw_id = request.params["comment_id"]
-    if not raw_id.isdigit():
+    # ASCII digits only ("²".isdigit() is True, but int() rejects it), and within bigint: anything else can't be an id
+    if not (raw_id.isascii() and raw_id.isdigit()) or int(raw_id) > _MAX_BIGINT:
         raise ApiError(404, "comment not found")
-    row = db.comment_for_write(request.params["slug"], int(raw_id))
-    if not row:
+    author_id = yield db.q_delete_comment_by_slug(viewer, request.params["slug"], int(raw_id))
+    if author_id is None:
         raise ApiError(404, "comment not found")
-    if row["author_id"] != viewer:
+    if author_id != viewer:
         raise ApiError(403, "not the commenter")
-    db.delete_comment(int(raw_id))
     return 204, Empty()
 
 
@@ -423,4 +324,4 @@ def delete_comment(request: HttpRequest):
 
 @router.get("/api/tags")
 def tags(request: HttpRequest):
-    return 200, TagsResponse(tags=(yield db.q_list_tags()))
+    return 200, (yield db.q_list_tags_json())
