@@ -131,9 +131,9 @@ For comparison, the Spring example held 10,000 users on the same machine, and th
 9,200 to 10,000. Hold latency at 10,000 users varies by about 70 to 160 ms at p95 between runs: the machine is close to
 saturation there, so one run can pass or fail the same step.
 
-Where the CPU goes at 9,500 users (JFR samples): bcrypt about 40% of the JVM's samples (about 11% of the whole box,
-a fixed cost of every login), the database driver 17 to 18%, Helidon 16%, JSON 11%, GC and other 6%. Postgres used
-about 37% of the box, the JVM 27% and the load generator 7%.
+Where the CPU goes at 9,500 users (JFR samples of the JVM): bcrypt 39% (about 10% of the whole box, a fixed cost of
+every login), the database driver 19%, Helidon 16%, JSON 11%, GC and other JVM work 7%, JWT 4%, the DAOs 2%, auth and
+the access lookup 2%, validation under 1%. Postgres used about 36% of the box, the JVM 26% and the load generator 7%.
 
 ## Development
 
