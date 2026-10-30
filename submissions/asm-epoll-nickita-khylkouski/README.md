@@ -114,30 +114,33 @@ exactly the work the Rust entry sends it, and spend less CPU on everything else.
   3.6-4.9 s at p95. Now the helper sleeps until a full 6-job batch is waiting behind the running one, and then
   runs that batch. On the same box and load, login p95 went from 3.4-5.1 s to 0.41 s (two runs each) with no
   login errors either way. The 8 s shed rule for queued logins is the Rust entry's.
-- **Feed SQL.** For the followees that two or more viewers in a feed batch share (up to 16), the batch finds once
-  the `take`-th newest article of each, where `take` is the largest offset + limit asked for. That author alone
-  has `take` articles at or above that id, so no viewer following them can have an older article on the page,
-  and each viewer's walk over its followees' articles stops there. The capped count is one `LIMIT 1000` scan, and
+- **Feed SQL.** The feed statement is #124's, with the window below read lazily. For the followees that two or
+  more viewers in a feed batch share (up to 20), the batch reads once the newest `take` article ids of each, where
+  `take` is the largest offset + limit among the viewers who follow them. A viewer's cutoff is the highest of its
+  shared followees' (offset + limit)-th newest ids: that author alone has that many articles at or above it, so
+  the page can't hold an older article, and the viewer's walk over its followees' articles stops there. The capped
+  count is 1000 when one of those followees has 1000 or more articles and otherwise one `LIMIT 1000` scan, and
   `enable_memoize` is off for the session.
 - **Recent feeds from one window.** When a viewer's cutoff from those shared followees falls among the newest
-  32 × (batch size) article ids (at most 2,048, and only in batches of 32 or more), the batch reads that window of
-  newest articles once and takes the viewer's page from it; other viewers keep the walk over their followees.
-  Replayed on real captured batches, the feed statement took 16% less time, with identical rows.
+  32 × (batch size) article ids (at most 2,048, and only in batches of 32 or more), the batch reads the newest
+  articles once and takes the viewer's page from them; other viewers keep the walk over their followees. #124
+  reads the whole window; this reads it only down to the lowest cutoff that uses it. Replayed on real captured
+  batches, with identical rows, the feed statement took 3% less time than #124's and 4-7% less than ours before it.
 - **Shared reads where keys repeat.** Article-by-slug batches always use the shared statement, which reads each
   slug once (14% less Postgres time for that family, measured with a 20 ms wait). Comments keep Rust's rule
   (shared only when each slug is asked at least twice on average): a thread has about 1.5 comments, and the shared
   form cost 15% more when slugs did not repeat. Its shared form looks up the viewer's follows only among each
   article's own commenters. The per-request form checks each commenter with one `EXISTS` probe on `follows`
-  rather than building the viewer's whole followee array (10-17% less time on replayed batches, identical rows),
+  rather than building the viewer's whole followee array (identical rows on replayed batches),
   and the shared article-by-slug form aggregates the tag names of the batch's articles in one pass.
-- **Fewer lookups in the author and favorited lists.** An author list has one author, so whether the viewer
-  follows them is one `follows` probe per request instead of one per row. Both lists find the viewer's favorites
-  on the page with one `favorites` probe (`user_id` = the viewer and `article_id = ANY(page)`), and the favorited
-  list checks the follows of the page's distinct authors with one probe. Comment rows carry `updated_at` only
-  when it differs from `created_at`. On replayed batches, with identical rows, that is 3.9% less time for the
-  author list, 1.6% for the favorited list and 3-8% for comments. At 150,000 users on 5 vCPUs (120 s holds in two
-  interleaved before/after/after/before blocks), p95 went from 63 to 55 ms and from 50 to 45 ms, with 0.6-0.7%
-  less Postgres time.
+- **Fewer lookups in the author and favorited lists.** An author list has one author, so whether the viewer follows
+  them is one `follows` probe per request instead of one per row. Both lists find the viewer's favorites on the page
+  with one `favorites` probe (`user_id` = the viewer and `article_id = ANY(page)`), and the favorited list checks
+  the follows of the page's distinct authors with one probe, as #124's author list does. Comment rows carry
+  `updated_at` only when it differs from `created_at`. On replayed batches, with identical rows, that is 3.9% less
+  time for the author list, 1.6% for the favorited list and 3-8% for comments. At 150,000 users on 5 vCPUs (120 s
+  holds in two interleaved before/after/after/before blocks), p95 went from 63 to 55 ms and from 50 to 45 ms, with
+  0.6-0.7% less Postgres time.
 - **Where it counts.** These SQL changes matter most once the box is out of CPU. With the target held to 5 vCPUs
   at 165,000 users (aged database, 120 s holds, two runs each, interleaved), the previous build failed on p95
   (617 and 566 ms, p99 751 and 690) at 40.0-40.5k req/s, and this one passed (p95 353 and 359, p99 479 and 462) at
@@ -235,8 +238,9 @@ both servers, which the warm-up keeps out of the scored window.
   (#7) and cknutson12's rust-hyper submission (#1), both MIT-licensed. As that entry's README credits them, the
   per-family read queue comes from #22 (its batch cap from #52), the shared list/article SQL from #32, and the
   feed's cap for authors with 1000+ articles from #61.
-- The optional read gather wait follows #103 (gichamba, 20 ms) and #117 (nick-potts, a 20 ms drain gap); the
-  feed's per-author floor follows the feed page cutoffs of #102.
+- The optional read gather wait follows #103 (gichamba, 20 ms) and #117 (nick-potts, a 20 ms drain gap).
+- The feed statement and the lists' `= ANY` favorite and follow probes are #124's (dennisimoo), which credits the
+  feed cutoff from the most-shared followees to #102 and the per-viewer `= ANY` probes to #53, #47 and #95.
 - Merging same-type writes into one statement and giving logins more than one bcrypt thread follow #105
   (theCatWisel).
 - bcrypt follows OpenBSD/Openwall crypt_blowfish.
