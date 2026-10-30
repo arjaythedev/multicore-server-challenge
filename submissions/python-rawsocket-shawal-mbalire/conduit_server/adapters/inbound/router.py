@@ -67,7 +67,11 @@ def _compile_path(pattern: str) -> str:
 class SocketRouter:
     def __init__(self):
         self.routes: List[_Route] = []
-        self._by_method: Dict[str, List[_Route]] = {}  # routes with :params, regex-matched in order
+        self._by_method: Dict[str, List[_Route]] = {}  # routes with :params, in registration order
+        # routes with :params by shape: (method, segment count) -> the param positions of each shape there, and
+        # (method, segments with params blanked) -> route; one dict lookup per shape instead of a scan
+        self._shapes: Dict[Tuple[str, int], List[Tuple[int, ...]]] = {}
+        self._by_shape: Dict[Tuple[str, Tuple[str, ...]], _Route] = {}
         self._static: Dict[Tuple[str, str], _Route] = {}  # (method, path) -> route without params
         # b"METHOD /path" of routes that hold the CPU for tens of ms (bcrypt): the server runs them off its loop
         self.offload: set = set()
@@ -94,6 +98,14 @@ class SocketRouter:
             self.routes.append(route)
             if ":" in path:
                 self._by_method.setdefault(method, []).append(route)
+                slots = tuple(i for i, _ in route.param_slots)
+                shapes = self._shapes.setdefault((method, route.n_parts), [])
+                if slots not in shapes:
+                    shapes.append(slots)
+                key = [""] * route.n_parts
+                for i, lit in route.literals:
+                    key[i] = lit
+                self._by_shape.setdefault((method, tuple(key)), route)  # first registered wins, as before
             else:  # exact paths win over patterns (/api/articles/feed vs /api/articles/:slug)
                 self._static[(method, path)] = route
             return func
@@ -109,9 +121,12 @@ class SocketRouter:
             path = request.path
             if len(path) > 1 and path[0] == "/" and "//" not in path and not path.endswith("/"):
                 parts = path[1:].split("/")
-                n_parts = len(parts)
-                for candidate in self._by_method.get(request.method, ()):
-                    if candidate.n_parts == n_parts and all(parts[i] == lit for i, lit in candidate.literals):
+                for slots in self._shapes.get((request.method, len(parts)), ()):
+                    key = parts.copy()
+                    for i in slots:
+                        key[i] = ""
+                    candidate = self._by_shape.get((request.method, tuple(key)))
+                    if candidate is not None:
                         route = candidate
                         request.params = {name: parts[i] for i, name in candidate.param_slots}
                         break

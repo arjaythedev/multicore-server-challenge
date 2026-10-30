@@ -57,7 +57,10 @@ class JoseBcryptCryptoAdapter(CryptoPort):
     def __init__(self, secret_key: str):
         self._secret = secret_key
         self._key = secret_key.encode("utf-8")
-        self._base_hmac = hmac.new(self._key, digestmod=hashlib.sha256)
+        base = hmac.new(self._key, digestmod=hashlib.sha256)
+        # the C HMAC object inside the stdlib wrapper (same copy/update/digest): the wrapper's Python copy() cost
+        # ~0.4 µs per token
+        self._base_hmac = getattr(base, "_hmac", None) or base
         # PyJWT's header for every HS256 token we issue: a token carrying exactly this segment needs no decoding
         with warnings.catch_warnings():  # PyJWT warns about short keys; the secret is given by the spec
             warnings.simplefilter("ignore")
