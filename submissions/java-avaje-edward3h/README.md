@@ -65,6 +65,11 @@ time and never touches the real database.
 - Timestamps are formatted with `uuuu-MM-dd'T'HH:mm:ss.SSS'Z'` in UTC, which truncates.
 - Nulls are serialised explicitly (`bio` and `image` are JSON `null`).
 
+## Nullness check (optional)
+
+`./gradlew checkNullness` runs the Checker Framework's Nullness Checker (4.3.1) over `src/main/java`, using the jspecify
+annotations (`@NullMarked` in `package-info.java`, `@Nullable`). It is not part of `build`, `check` or `build.sh`.
+
 ## Load test (not the benchmark box)
 
 A 4-core mini PC running the server, Postgres 18 (pgtune settings) and the load generator together, full seed, no
