@@ -395,7 +395,6 @@ pub struct ReadWorker {
     distinct_arts: KeySet<i64>,
     distinct_authors: KeySet<i64>,
     art_author_ords: Vec<u32>,
-    art_spans: Vec<wire::RowSpan>,
     author_spans: Vec<Option<wire::RowSpan>>,
     fav_pairs: Vec<(i64, i64)>,
     foll_pairs: Vec<(i64, i64)>,
@@ -441,7 +440,6 @@ impl ReadWorker {
             distinct_arts: KeySet::new(),
             distinct_authors: KeySet::new(),
             art_author_ords: Vec::with_capacity(256),
-            art_spans: Vec::with_capacity(256),
             author_spans: Vec::with_capacity(128),
             fav_pairs: Vec::with_capacity(512),
             foll_pairs: Vec::with_capacity(512),
@@ -759,7 +757,6 @@ impl ReadWorker {
         self.distinct_arts.clear();
         self.distinct_authors.clear();
         self.art_author_ords.clear();
-        self.art_spans.clear();
 
         let pa = &self.pa;
         let grp = |s: Option<usize>, len: usize| s.map(|idx| group_rows_by_ordinal(pa, idx, len)).unwrap_or_default();
@@ -814,7 +811,6 @@ impl ReadWorker {
             if (ord as usize) == prev_len {
                 let au_ord = self.distinct_authors.intern(author);
                 self.art_author_ords.push(au_ord);
-                self.art_spans.push(span);
             }
             ArticleRef {
                 aid,
@@ -928,9 +924,19 @@ impl ReadWorker {
                     }
                 }
                 PlanSlot::Filtered(kind, _, p) => {
-                    for &art in &filter_results[kind].1[p as usize] {
-                        self.fav_pairs.push((viewer, art.aid));
-                        self.foll_pairs.push((viewer, art.author));
+                    let rows = &filter_results[kind].1[p as usize];
+                    if kind == 1 {
+                        if let Some(&first) = rows.first() {
+                            self.foll_pairs.push((viewer, first.author));
+                        }
+                        for &art in rows {
+                            self.fav_pairs.push((viewer, art.aid));
+                        }
+                    } else {
+                        for &art in rows {
+                            self.fav_pairs.push((viewer, art.aid));
+                            self.foll_pairs.push((viewer, art.author));
+                        }
                     }
                 }
                 PlanSlot::Feed(_, p) => {
@@ -1049,6 +1055,8 @@ impl ReadWorker {
         let arena = &mut self.arena;
         self.fav_hits.clear();
         self.foll_hits.clear();
+        let mut fav_viewer_mask = 0u64;
+        let mut foll_viewer_mask = 0u64;
         let mut tag_sort_buf: Vec<&[u8]> = Vec::with_capacity(8);
 
         if n_phase_b > 0 {
@@ -1073,19 +1081,18 @@ impl ReadWorker {
                             continue;
                         };
                         let au = pb.row(au_span);
-                        let ar = pa.row(self.art_spans[k]);
 
                         let head_start = arena.len() as u32;
                         arena.extend_from_slice(b"{\"slug\":");
-                        codec::write_str(arena, pa.bytes(ar[3]).unwrap_or(b""));
+                        codec::write_str(arena, pb.bytes(r[1]).unwrap_or(b""));
                         arena.extend_from_slice(b",\"title\":");
-                        codec::write_str(arena, pa.bytes(ar[4]).unwrap_or(b""));
+                        codec::write_str(arena, pb.bytes(r[2]).unwrap_or(b""));
                         arena.extend_from_slice(b",\"description\":");
-                        codec::write_str(arena, pa.bytes(ar[5]).unwrap_or(b""));
+                        codec::write_str(arena, pb.bytes(r[3]).unwrap_or(b""));
                         let head_end = arena.len() as u32;
 
                         arena.extend_from_slice(b",\"tagList\":[");
-                        if let Some(raw_arr) = pb.bytes(r[1]) {
+                        if let Some(raw_arr) = pb.bytes(r[6]) {
                             tag_sort_buf.clear();
                             for elem in wire::iter_binary_array(raw_arr) {
                                 if let Ok(bytes) = elem.try_into() {
@@ -1108,14 +1115,14 @@ impl ReadWorker {
                             }
                         }
                         arena.extend_from_slice(b"],\"createdAt\":");
-                        codec::write_timestamp(arena, pa.i64(ar[6]));
+                        codec::write_timestamp(arena, pb.i64(r[4]));
                         arena.extend_from_slice(b",\"updatedAt\":");
-                        codec::write_timestamp(arena, pa.i64(ar[7]));
+                        codec::write_timestamp(arena, pb.i64(r[5]));
                         arena.extend_from_slice(b",\"favorited\":");
                         let mid_end = arena.len() as u32;
 
                         arena.extend_from_slice(b",\"favoritesCount\":");
-                        codec::write_i64(arena, pb.i64(r[2]));
+                        codec::write_i64(arena, pb.i64(r[7]));
                         arena.extend_from_slice(b",\"author\":{\"username\":");
                         codec::write_str(arena, pb.bytes(au[1]).unwrap_or(b""));
                         arena.extend_from_slice(b",\"bio\":");
@@ -1139,9 +1146,12 @@ impl ReadWorker {
                 for &span in pb.result_rows(s) {
                     let r = pb.row(span);
                     let (kind, viewer_id, target_id) = (pb.i64(r[0]), pb.i64(r[1]), pb.i64(r[2]));
+                    let bit = 1u64 << ((viewer_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58);
                     if kind == 0 {
+                        fav_viewer_mask |= bit;
                         self.fav_hits.push((viewer_id, target_id));
                     } else {
+                        foll_viewer_mask |= bit;
                         self.foll_hits.push((viewer_id, target_id));
                     }
                 }
@@ -1198,6 +1208,8 @@ impl ReadWorker {
             arena,
             fav_hits: &self.fav_hits,
             foll_hits: &self.foll_hits,
+            fav_viewer_mask,
+            foll_viewer_mask,
         };
 
         let mut rendered_tags: Option<Arc<[u8]>> = None;
@@ -1466,17 +1478,26 @@ struct RenderCtx<'a> {
     arena: &'a [u8],
     fav_hits: &'a [(i64, i64)],
     foll_hits: &'a [(i64, i64)],
+    fav_viewer_mask: u64,
+    foll_viewer_mask: u64,
+}
+
+#[inline(always)]
+fn viewer_bit(viewer: i64) -> u64 {
+    1u64 << ((viewer as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58)
 }
 
 impl RenderCtx<'_> {
     #[inline]
     fn is_following(&self, viewer: i64, author: i64) -> bool {
-        !self.foll_hits.is_empty() && self.foll_hits.binary_search(&(viewer, author)).is_ok()
+        (self.foll_viewer_mask & viewer_bit(viewer)) != 0
+            && self.foll_hits.binary_search(&(viewer, author)).is_ok()
     }
 
     #[inline]
     fn is_favorited(&self, viewer: i64, article: i64) -> bool {
-        !self.fav_hits.is_empty() && self.fav_hits.binary_search(&(viewer, article)).is_ok()
+        (self.fav_viewer_mask & viewer_bit(viewer)) != 0
+            && self.fav_hits.binary_search(&(viewer, article)).is_ok()
     }
 
     #[inline]
@@ -1511,7 +1532,7 @@ impl RenderCtx<'_> {
             let ar = pa.row(art.row);
             dst.extend_from_slice(&self.arena[slices.head_start as usize..slices.head_end as usize]);
             dst.extend_from_slice(b",\"body\":");
-            codec::write_str(dst, pa.bytes(ar[8]).unwrap_or(b""));
+            codec::write_str(dst, pa.bytes(ar[3]).unwrap_or(b""));
             dst.extend_from_slice(&self.arena[slices.head_end as usize..slices.mid_end as usize]);
             dst.extend_from_slice(if fav { b"true" } else { b"false" });
             dst.extend_from_slice(&self.arena[slices.mid_end as usize..slices.tail_end as usize]);
@@ -1729,10 +1750,11 @@ impl WriteWorker {
             Err(e) => return Err((e, all_addrs)),
         };
 
-        let is_single_stmt = tasks.len() == 1 && stmt_count_for_write(&tasks[0]) == 1;
-        let has_slug_mutation = tasks
-            .iter()
-            .any(|t| matches!(t.op, WriteOp::UpdateArticle { .. } | WriteOp::DeleteArticle { .. }));
+        let is_single_task = tasks.len() == 1;
+        let has_slug_mutation = !is_single_task
+            && tasks
+                .iter()
+                .any(|t| matches!(t.op, WriteOp::UpdateArticle { .. } | WriteOp::DeleteArticle { .. }));
 
         let mut fav_on_jobs: Vec<(i64, &str)> = Vec::new();
         let mut fav_off_jobs: Vec<(i64, &str)> = Vec::new();
@@ -1740,7 +1762,7 @@ impl WriteWorker {
         let mut foll_off_jobs: Vec<(i64, &str)> = Vec::new();
         let mut cmt_jobs: Vec<(i64, &str, &str)> = Vec::new();
 
-        if !is_single_stmt && !has_slug_mutation {
+        if !is_single_task && !has_slug_mutation {
             for t in tasks.iter() {
                 match &t.op {
                     WriteOp::Favorite { slug, on: true } => fav_on_jobs.push((t.viewer, slug.as_str())),
@@ -1767,10 +1789,6 @@ impl WriteWorker {
         let batch_cmt = cmt_jobs.len() >= 2;
 
         let mut n_exec = 0usize;
-        if !is_single_stmt {
-            conn.tx.bind_and_exec("begin", &[]);
-            n_exec += 1;
-        }
 
         let slot_fav_on = if batch_fav_on {
             let s = n_exec;
@@ -1894,10 +1912,6 @@ impl WriteWorker {
             }
         }
 
-        if !is_single_stmt {
-            conn.tx.bind_and_exec("commit", &[]);
-            n_exec += 1;
-        }
         conn.tx.write_sync();
 
         if let Err(e) = conn.flush().and_then(|_| conn.read_pipeline_into(n_exec, &mut self.pipe)) {
@@ -1905,7 +1919,7 @@ impl WriteWorker {
         }
 
         let any_failed = self.pipe.results.iter().any(|r| r.error.is_some());
-        if any_failed && !is_single_stmt {
+        if any_failed && !is_single_task {
             for t in tasks.drain(..) {
                 let addr = t.addr;
                 if let Err(e) = self.exec_individual(t) {
@@ -2038,24 +2052,13 @@ impl WriteWorker {
     fn exec_individual(&mut self, task: WriteTask) -> PgResult<()> {
         let conn = Self::ensure_conn(&mut self.conn, self.cfg)?;
         let cnt = stmt_count_for_write(&task);
-        let mut n_exec = 0;
-        if cnt > 1 {
-            conn.tx.bind_and_exec("begin", &[]);
-            n_exec += 1;
-        }
-        let start = n_exec;
         bind_single_write(&mut conn.tx, &task);
-        n_exec += cnt;
-        if cnt > 1 {
-            conn.tx.bind_and_exec("commit", &[]);
-            n_exec += 1;
-        }
         conn.tx.write_sync();
         conn.flush()?;
-        conn.read_pipeline_into(n_exec, &mut self.pipe)?;
+        conn.read_pipeline_into(cnt, &mut self.pipe)?;
         let mut replies = Vec::new();
         let mut post_reads = Vec::new();
-        finalize_write_task(task, &self.pipe, start, cnt, self.cfg, &mut replies, &mut post_reads);
+        finalize_write_task(task, &self.pipe, 0, cnt, self.cfg, &mut replies, &mut post_reads);
         if !post_reads.is_empty() {
             READ_QUEUE.push_batch(&mut post_reads);
         }
