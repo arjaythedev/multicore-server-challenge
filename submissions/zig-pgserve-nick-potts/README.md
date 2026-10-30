@@ -48,10 +48,6 @@ DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit \
 - `PGSERVE_DWELL_US=N` (default 5,000; 0 turns it off; at most 50,000) is the batch clock, with `PGSERVE_DWELL_CAP`
   (default 256) and `PGSERVE_DWELL_MIN` (default 2). `PGSERVE_STATS_S=N` (off by default) logs each worker's batch
   sizes every `N` seconds. Both are under "How a request is served".
-- `PGSERVE_SHED=1` (the default; 0 turns it off) is load shedding. A worker answers logins, sign-ups and password
-  changes with 503 from the first 1 s window in which its loop spent under 2% of the time in `epoll_wait`,
-  until a window above 10%, and for at least 10 s. Only time in `epoll_wait` with no turn work pending counts
-  as idle, so a turn held by `PGSERVE_DWELL_US` counts as busy.
 - `GET /api/tags` answered 5.6-8.6 s after a cold Postgres restart in our runs. Most of that is bcrypt's
   self-test and calibration.
 
@@ -189,14 +185,6 @@ also our Zig entry's code, vendored unchanged.
 
 **Answers go out uncompressed.** SPEC makes compression optional, and gzip lost every test we gave it (see
 "What we tried"). The Zig entry's gzip code and its vendored libdeflate are not in this folder.
-
-**Load shedding is on by default** (`PGSERVE_SHED=0` turns it off). Three earlier designs were built and dropped
-(see "What we tried"); this one is the simplest, described under "How to run". At a fixed 300,000 users on an
-aged database it refused 0.08-0.09% of requests, nearly all logins. Together with the bcrypt threads at nice 19
-and thin-stream timeouts it cut the box's CPU per request from 92 to 78 µs and p95 from 50 to 29 ms, against all
-three off. Each worker decides alone from its own loop, already-queued
-hashes still finish, and a refusal is a 503 on a connection that stays open. Each worker logs to stderr when
-it starts and stops shedding, and every 10 s while it sheds, with its refusal counts.
 
 ## The read engine
 
@@ -647,14 +635,6 @@ same build in the same series. Engine rows are dev-seed instructions per request
 | gzip only for answers it squeezes into one TCP segment, with our own fixed-Huffman encoder (checked by Go's `compress/gzip` on 2,817 real bodies and 8,000 generated ones) | +3.4 µs at 150k (A-A 0.6), +2.4 µs at 200k; receive-CPU softirq 11.00 against 10.77 µs per request | Only 3.9% of bodies became one segment, and the encoder ran at 1.4-1.7 ns per byte. |
 | libdeflate with an 8 KB hash table (order 11) | 150k with gzip: 123.6 / 122.7 against 122.7 / 122.0 µs | No gain. |
 | libdeflate with preset Huffman codes; a 1,280-byte cutoff | not run on pgserve | Dropped with gzip. |
-
-### Load shedding
-
-| tried | result | why it lost |
-|---|---|---|
-| bcrypt in a separate idle-priority hasher process, plus refusing the costliest classes in a fixed order when the box's idle CPU falls under 3% | 220k: 132.7 against 113.9 µs per request; held 210,000 against 220,000; refused 0 | The six event loops saturate at about 85% box CPU, so a box-wide idle trigger never fired. The hasher started every hash at once instead of filling a batch, which took 30% of the box. |
-| refuse hashing requests (login, sign-up, password change) when the oldest unstarted hash is over 500 ms old, with a `SCHED_IDLE` hasher | 300k: 104.4 / 103.5 against 88.4 / 89.4 µs per request, p99 2.1-3.8 s, fail | 0 of 49,860 hash requests refused. Dropping the batch-fill wait ran batches of about one lane at nearly full-batch cost, and the idle hasher soaked up every spare CPU. |
-| refuse hashing requests when a worker's loop was idle under 3% of the last second | 330k: both arms fail on retransmits and orphaned-socket overflow at 86% CPU; 29 refusals | At the knee the box isn't CPU-bound (one CPU's softirq is the wall), so it would never fire there. Dropped without a final run. |
 
 ### Commit and memory
 

@@ -41,6 +41,6 @@ start)
   C=$2
   docker cp launcher "$C:/usr/local/bin/pgserve-launcher"
   echo "pgserve: CI mode: launcher in container $C's mount namespace, serving $HOST:$PORT" >&2
-  exec sudo --preserve-env=HOST,PORT,JWT_SECRET,DATABASE_URL,PGSERVE_WORKERS,PGSERVE_HASH_NICE,PGSERVE_THIN_TO,PGSERVE_DWELL_US,PGSERVE_DWELL_CAP,PGSERVE_DWELL_MIN,PGSERVE_STATS_S,PGSERVE_SHED \
+  exec sudo --preserve-env=HOST,PORT,JWT_SECRET,DATABASE_URL,PGSERVE_WORKERS,PGSERVE_HASH_NICE,PGSERVE_THIN_TO,PGSERVE_DWELL_US,PGSERVE_DWELL_CAP,PGSERVE_DWELL_MIN,PGSERVE_STATS_S \
     nsenter -m -t "$(docker inspect -f '{{.State.Pid}}' "$C")" /usr/local/bin/pgserve-launcher ;;
 esac
