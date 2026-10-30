@@ -10,6 +10,3 @@ individually. The write actor also uses the packed-query method inside an explic
 transaction, waits separately for COMMIT before successful HTTP replies, and
 rolls back a failed statement group before retrying each job in isolation.
 An uncertain COMMIT is not replayed.
-
-`src/bin/group-check.rs` in the application checks group sizes, empty results,
-SQL-error recovery, packed frames and separate READ COMMITTED snapshots.
