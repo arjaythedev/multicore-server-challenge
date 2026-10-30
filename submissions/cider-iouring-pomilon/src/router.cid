@@ -1,0 +1,1903 @@
+// router.cid — Request router and JSON serializer for the 19 RealWorld Conduit endpoints
+// Pure Cider non-blocking implementation with pipeline support.
+
+from sys import native_memcpy, native_memset, native_memcmp, native_strlen, native_strncmp, native_itoa, native_atoi, sys_mmap, sys_read, sys_write, sys_exit, sys_getrandom;
+from http import HttpRequest, http_query_param, http_parse_limit, http_parse_offset;
+from json import json_find_str, json_find_taglist, json_escape, json_unescape, json_has_wrapper;
+from sha256 import jwt_verify, jwt_sign;
+from bcrypt import bcrypt_hash, bcrypt_verify;
+from pg import PgConn, PQresultStatus, PQclear, PQntuples, PQnfields, PQgetvalue, PQgetisnull, pg_get_read_conn, pg_get_write_conn, pg_get_write_conn_force, pg_enqueue_slot, PQsendQueryPrepared, PQsendPipelineSync, PGRES_TUPLES_OK, PGRES_COMMAND_OK;
+
+func str_len(s: *char) -> int {
+    if (s as i64 == 0 as i64) { return 0; }
+    return native_strlen(s) as int;
+}
+
+func res_ok_tuples(res: *void) -> int {
+    if (res as i64 == 0 as i64) { return 0; }
+    return (PQresultStatus(res) == PGRES_TUPLES_OK) as int;
+}
+
+func res_ok_command(res: *void) -> int {
+    if (res as i64 == 0 as i64) { return 0; }
+    return (PQresultStatus(res) == PGRES_COMMAND_OK) as int;
+}
+
+func gen_salt(salt: *u8) -> int {
+    var total: int = 0;
+    while (total < 16) {
+        var n: i64 = sys_getrandom(((salt as i64) + (total as i64)) as *void, (16 - total) as i64, 0 as u32);
+        if (n <= 0) { return 0; }
+        total = total + (n as int);
+    }
+    return 1;
+}
+
+struct BufWriter {
+    var buf: *char;
+    var len: int;
+    var cap: int;
+}
+
+func buf_append(w: *BufWriter, s: *char, len: int) -> void {
+    if (w->len + len > w->cap) { return; }
+    var base: i64 = w->buf as i64;
+    native_memcpy((base + (w->len as i64)) as *char, s, len as i64);
+    w->len = w->len + len;
+}
+
+func buf_append_str(w: *BufWriter, s: *char) -> void {
+    buf_append(w, s, str_len(s));
+}
+
+func buf_append_char(w: *BufWriter, c: int) -> void {
+    if (w->len + 1 > w->cap) { return; }
+    var base: i64 = w->buf as i64;
+    *(((base + (w->len as i64)) as *u8)) = c as u8;
+    w->len = w->len + 1;
+}
+
+func buf_append_i64(w: *BufWriter, v: i64) -> void {
+    var tmp: [u8; 32] = uninit;
+    var n: int = native_itoa(v, (&tmp[0]) as *char);
+    buf_append(w, (&tmp[0]) as *char, n);
+}
+
+func buf_append_json_str(w: *BufWriter, s: *char, len: int) -> void {
+    buf_append_char(w, 34); // '"'
+    if (len > 0 && s as i64 != 0 as i64) {
+        var base: i64 = w->buf as i64;
+        var rem: int = w->cap - w->len;
+        if (rem > len * 2 + 2) {
+            var n: int = json_escape(s, len, (base + (w->len as i64)) as *char);
+            w->len = w->len + n;
+        }
+    }
+    buf_append_char(w, 34); // '"'
+}
+
+func buf_append_json_nullable(w: *BufWriter, s: *char, is_null: int) -> void {
+    if (is_null != 0 || s as i64 == 0 as i64) {
+        buf_append_str(w, "null");
+    } else {
+        buf_append_json_str(w, s, str_len(s));
+    }
+}
+
+func get_status_text(code: int) -> *char {
+    if (code == 200) { return "OK"; }
+    if (code == 201) { return "Created"; }
+    if (code == 204) { return "No Content"; }
+    if (code == 400) { return "Bad Request"; }
+    if (code == 401) { return "Unauthorized"; }
+    if (code == 403) { return "Forbidden"; }
+    if (code == 404) { return "Not Found"; }
+    if (code == 422) { return "Unprocessable Entity"; }
+    return "Internal Server Error";
+}
+
+func fmt_error_response(status_code: int, msg: *char, out: *char, cap: int) -> int {
+    var body_buf: [u8; 256] = uninit;
+    var bw: BufWriter = uninit;
+    bw.buf = (&body_buf[0]) as *char;
+    bw.len = 0;
+    bw.cap = 256;
+    buf_append_str(&bw, "{\"errors\":{\"body\":[");
+    buf_append_json_str(&bw, msg, str_len(msg));
+    buf_append_char(&bw, 93);  // ']'
+    buf_append_char(&bw, 125); // '}'
+    buf_append_char(&bw, 125); // '}'
+
+    var w: BufWriter = uninit;
+    w.buf = out;
+    w.len = 0;
+    w.cap = cap;
+
+    buf_append_str(&w, "HTTP/1.1 ");
+    buf_append_i64(&w, status_code as i64);
+    buf_append_char(&w, 32);
+    buf_append_str(&w, get_status_text(status_code));
+    buf_append_str(&w, "\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: ");
+    buf_append_i64(&w, bw.len as i64);
+    buf_append_str(&w, "\r\nConnection: keep-alive\r\n\r\n");
+    buf_append(&w, bw.buf, bw.len);
+    return w.len;
+}
+
+func fmt_json_response(status_code: int, body: *char, blen: int, out: *char, cap: int) -> int {
+    var w: BufWriter = uninit;
+    w.buf = out;
+    w.len = 0;
+    w.cap = cap;
+
+    buf_append_str(&w, "HTTP/1.1 ");
+    buf_append_i64(&w, status_code as i64);
+    buf_append_char(&w, 32);
+    buf_append_str(&w, get_status_text(status_code));
+    buf_append_str(&w, "\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: ");
+    buf_append_i64(&w, blen as i64);
+    buf_append_str(&w, "\r\nConnection: keep-alive\r\n\r\n");
+    buf_append(&w, body, blen);
+    return w.len;
+}
+
+func fmt_204_response(out: *char, cap: int) -> int {
+    var w: BufWriter = uninit;
+    w.buf = out;
+    w.len = 0;
+    w.cap = cap;
+    buf_append_str(&w, "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n");
+    return w.len;
+}
+
+func render_user_json(w: *BufWriter, email: *char, token: *char, username: *char, bio: *char, bio_null: int, image: *char, image_null: int) -> void {
+    buf_append_str(w, "{\"user\":{\"email\":");
+    buf_append_json_str(w, email, str_len(email));
+    buf_append_str(w, ",\"token\":");
+    buf_append_json_str(w, token, str_len(token));
+    buf_append_str(w, ",\"username\":");
+    buf_append_json_str(w, username, str_len(username));
+    buf_append_str(w, ",\"bio\":");
+    buf_append_json_nullable(w, bio, bio_null);
+    buf_append_str(w, ",\"image\":");
+    buf_append_json_nullable(w, image, image_null);
+    buf_append_char(w, 125); // '}'
+    buf_append_char(w, 125); // '}'
+}
+
+func render_profile_json(w: *BufWriter, username: *char, bio: *char, bio_null: int, image: *char, image_null: int, following: int) -> void {
+    buf_append_str(w, "{\"profile\":{\"username\":");
+    buf_append_json_str(w, username, str_len(username));
+    buf_append_str(w, ",\"bio\":");
+    buf_append_json_nullable(w, bio, bio_null);
+    buf_append_str(w, ",\"image\":");
+    buf_append_json_nullable(w, image, image_null);
+    buf_append_str(w, ",\"following\":");
+    if (following != 0) {
+        buf_append_str(w, "true");
+    } else {
+        buf_append_str(w, "false");
+    }
+    buf_append_char(w, 125); // '}'
+    buf_append_char(w, 125); // '}'
+}
+
+func render_article_object(w: *BufWriter, res: *void, row: int, full: int) -> void {
+    var slug: *char = PQgetvalue(res, row, 1);
+    var title: *char = PQgetvalue(res, row, 2);
+    var desc: *char = PQgetvalue(res, row, 3);
+    var col: int = 4;
+    var body: *char = 0 as *char;
+    if (full != 0) {
+        body = PQgetvalue(res, row, 4);
+        col = 5;
+    }
+    var created_at: *char = PQgetvalue(res, row, col);
+    var updated_at: *char = PQgetvalue(res, row, col + 1);
+    var tag_list: *char = PQgetvalue(res, row, col + 2);
+    var fav_count: *char = PQgetvalue(res, row, col + 3);
+    var favorited_str: *char = PQgetvalue(res, row, col + 4);
+    var username: *char = PQgetvalue(res, row, col + 5);
+    var bio: *char = PQgetvalue(res, row, col + 6);
+    var bio_null: int = PQgetisnull(res, row, col + 6);
+    var image: *char = PQgetvalue(res, row, col + 7);
+    var image_null: int = PQgetisnull(res, row, col + 7);
+    var following_str: *char = PQgetvalue(res, row, col + 8);
+
+    var fav: int = 0;
+    if (*(((favorited_str as i64)) as *u8) == 116 as u8) { fav = 1; }
+    var fol: int = 0;
+    if (*(((following_str as i64)) as *u8) == 116 as u8) { fol = 1; }
+
+    buf_append_str(w, "{\"slug\":");
+    buf_append_json_str(w, slug, str_len(slug));
+    buf_append_str(w, ",\"title\":");
+    buf_append_json_str(w, title, str_len(title));
+    buf_append_str(w, ",\"description\":");
+    buf_append_json_str(w, desc, str_len(desc));
+    if (full != 0) {
+        buf_append_str(w, ",\"body\":");
+        buf_append_json_str(w, body, str_len(body));
+    }
+    buf_append_str(w, ",\"tagList\":");
+    buf_append_str(w, tag_list);
+    buf_append_str(w, ",\"createdAt\":");
+    buf_append_json_str(w, created_at, str_len(created_at));
+    buf_append_str(w, ",\"updatedAt\":");
+    buf_append_json_str(w, updated_at, str_len(updated_at));
+    buf_append_str(w, ",\"favorited\":");
+    if (fav != 0) { buf_append_str(w, "true"); } else { buf_append_str(w, "false"); }
+    buf_append_str(w, ",\"favoritesCount\":");
+    buf_append_str(w, fav_count);
+    buf_append_str(w, ",\"author\":{\"username\":");
+    buf_append_json_str(w, username, str_len(username));
+    buf_append_str(w, ",\"bio\":");
+    buf_append_json_nullable(w, bio, bio_null);
+    buf_append_str(w, ",\"image\":");
+    buf_append_json_nullable(w, image, image_null);
+    buf_append_str(w, ",\"following\":");
+    if (fol != 0) { buf_append_str(w, "true"); } else { buf_append_str(w, "false"); }
+    buf_append_char(w, 125); // '}'
+    buf_append_char(w, 125); // '}'
+}
+
+func render_comment_object(w: *BufWriter, res: *void, row: int, has_following: int) -> void {
+    var id: *char = PQgetvalue(res, row, 0);
+    var body: *char = PQgetvalue(res, row, 1);
+    var created_at: *char = PQgetvalue(res, row, 2);
+    var updated_at: *char = PQgetvalue(res, row, 3);
+    var username: *char = PQgetvalue(res, row, 4);
+    var bio: *char = PQgetvalue(res, row, 5);
+    var bio_null: int = PQgetisnull(res, row, 5);
+    var image: *char = PQgetvalue(res, row, 6);
+    var image_null: int = PQgetisnull(res, row, 6);
+    var fol: int = 0;
+    if (has_following != 0) {
+        var following_str: *char = PQgetvalue(res, row, 7);
+        if (*(((following_str as i64)) as *u8) == 116 as u8) { fol = 1; }
+    }
+
+    buf_append_str(w, "{\"id\":");
+    buf_append_str(w, id);
+    buf_append_str(w, ",\"createdAt\":");
+    buf_append_json_str(w, created_at, str_len(created_at));
+    buf_append_str(w, ",\"updatedAt\":");
+    buf_append_json_str(w, updated_at, str_len(updated_at));
+    buf_append_str(w, ",\"body\":");
+    buf_append_json_str(w, body, str_len(body));
+    buf_append_str(w, ",\"author\":{\"username\":");
+    buf_append_json_str(w, username, str_len(username));
+    buf_append_str(w, ",\"bio\":");
+    buf_append_json_nullable(w, bio, bio_null);
+    buf_append_str(w, ",\"image\":");
+    buf_append_json_nullable(w, image, image_null);
+    buf_append_str(w, ",\"following\":");
+    if (fol != 0) { buf_append_str(w, "true"); } else { buf_append_str(w, "false"); }
+    buf_append_char(w, 125); // '}'
+    buf_append_char(w, 125); // '}'
+}
+
+var g_scratch_ptr: i64 = 0;
+
+func get_scratch() -> *char {
+    if (g_scratch_ptr == 0 as i64) {
+        var m: *void = sys_mmap(0 as *void, 262144, 3, 34, -1, 0); // 256KB
+        g_scratch_ptr = m as i64;
+    }
+    return g_scratch_ptr as *char;
+}
+
+var STATE_IDLE: int = 0;
+var STATE_RECV: int = 1;
+var STATE_WAIT_DB: int = 2;
+var STATE_SEND: int = 3;
+var STATE_WAIT_PG: int = 4;
+var STATE_WAIT_BCRYPT: int = 5;
+
+struct BcryptJob {
+    var slot_idx: int;
+    var pw_len: int;
+    var hash_len: int;
+    var pw: [u8; 76];
+    var hash: [u8; 68];
+}
+
+struct BcryptResp {
+    var slot_idx: int;
+    var ok: int;
+}
+
+var g_bcrypt_fds: [int; 4] = [-1, -1, -1, -1];
+var g_bcrypt_load: [int; 4] = [0, 0, 0, 0];
+var g_num_bcrypt: int = 0;
+var g_bcrypt_turn: int = 0;
+
+func router_set_bcrypt_fds(fds: *int, n: int) -> void {
+    g_num_bcrypt = n;
+    for (var i: int = 0; i < n; i = i + 1) {
+        g_bcrypt_fds[i] = fds[i];
+        g_bcrypt_load[i] = 0;
+    }
+}
+
+func router_bcrypt_done(idx: int) -> void {
+    if (idx >= 0 && idx < 4) {
+        if (g_bcrypt_load[idx] > 0) {
+            g_bcrypt_load[idx] = g_bcrypt_load[idx] - 1;
+        }
+    }
+}
+
+func bcrypt_worker_loop(fd: int) -> void {
+    for (;;) {
+        var job: BcryptJob = uninit;
+        var nr: i64 = sys_read(fd, (&job) as *void, sizeof(BcryptJob) as i64);
+        if (nr <= 0) {
+            sys_exit(0);
+        }
+        var ok: int = bcrypt_verify((&job.pw[0]) as *char, job.pw_len, (&job.hash[0]) as *char, job.hash_len);
+        var resp: BcryptResp = uninit;
+        resp.slot_idx = job.slot_idx;
+        resp.ok = ok;
+        sys_write(fd, (&resp) as *void, sizeof(BcryptResp) as i64);
+    }
+}
+
+var ROUTE_NONE: int = 0;
+var ROUTE_TAGS: int = 1;
+var ROUTE_USER_REGISTER: int = 2;
+var ROUTE_USER_LOGIN: int = 3;
+var ROUTE_USER_CURRENT: int = 4;
+var ROUTE_USER_UPDATE: int = 5;
+var ROUTE_PROFILE: int = 6;
+var ROUTE_PROFILE_FOLLOW: int = 7;
+var ROUTE_ARTICLES_LIST: int = 8;
+var ROUTE_ARTICLES_FEED: int = 9;
+var ROUTE_ARTICLE_GET: int = 10;
+var ROUTE_ARTICLE_CREATE: int = 11;
+var ROUTE_ARTICLE_UPDATE: int = 12;
+var ROUTE_ARTICLE_DELETE: int = 13;
+var ROUTE_ARTICLE_FAVORITE: int = 14;
+var ROUTE_COMMENTS_GET: int = 15;
+var ROUTE_COMMENTS_CREATE: int = 16;
+var ROUTE_COMMENTS_DELETE: int = 17;
+
+struct ConnSlot {
+    var fd: int;
+    var in_use: int;
+    var state: int;
+    var write_buf_idx: int;
+    var write_offset: int;
+    var write_len: int;
+    var write_sent: int;
+
+    // Route state
+    var route_id: int;
+    var sub_id: int;
+    var step: int;
+    var viewer_id: i64;
+    var auth_status: int;
+
+    // Results from PostgreSQL
+    var num_res: int;
+    var res: [*void; 4];
+
+    // Saved data across DB round-trip
+    var v_buf: [u8; 32];
+    var lim_buf: [u8; 32];
+    var off_buf: [u8; 32];
+    var param1: [u8; 256];
+    var param2: [u8; 256];
+    var p1_len: int;
+    var p2_len: int;
+
+    // Socket read buffer
+    var read_buf: [u8; 8192];
+    var read_len: int;
+
+    // In-flight coalescing link
+    var next_coalesced: int;
+}
+
+var g_slots_base: i64 = 0;
+var g_inflight_base: i64 = 0;
+
+struct InFlightEntry {
+    var in_use: int;
+    var slot_idx: int;
+    var viewer_id: i64;
+    var hash: u32;
+    var key_len: int;
+    var key: [u8; 96];
+}
+
+func router_set_slots_base(ptr: *ConnSlot) -> void {
+    g_slots_base = ptr as i64;
+    var mem: *void = sys_mmap(0 as *void, 262144 as i64, 3, 34, -1, 0);
+    g_inflight_base = mem as i64;
+    var tbl: *InFlightEntry = mem as *InFlightEntry;
+    for (var i: int = 0; i < 1024; i = i + 1) {
+        tbl[i].in_use = 0;
+    }
+}
+
+func finish_json_response(slot: *ConnSlot, status_code: int, body_len: int, out: *char) -> int {
+    var hdr_tmp: [u8; 128] = uninit;
+    var hw: BufWriter = uninit;
+    hw.buf = (&hdr_tmp[0]) as *char;
+    hw.len = 0;
+    hw.cap = 128;
+    buf_append_str(&hw, "HTTP/1.1 ");
+    buf_append_i64(&hw, status_code as i64);
+    buf_append_char(&hw, 32);
+    buf_append_str(&hw, get_status_text(status_code));
+    buf_append_str(&hw, "\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: ");
+    buf_append_i64(&hw, body_len as i64);
+    buf_append_str(&hw, "\r\nConnection: keep-alive\r\n\r\n");
+
+    var hdr_len: int = hw.len;
+    var offset: int = 128 - hdr_len;
+    var dst: *char = ((out as i64) + (offset as i64)) as *char;
+    native_memcpy(dst, hw.buf, hdr_len as i64);
+    slot->write_offset = offset;
+    return hdr_len + body_len;
+}
+
+func get_slot_by_idx(idx: int) -> *ConnSlot {
+    var base: *ConnSlot = g_slots_base as *ConnSlot;
+    return &base[idx];
+}
+
+func get_inflight_by_idx(idx: int) -> *InFlightEntry {
+    var base: *InFlightEntry = g_inflight_base as *InFlightEntry;
+    return &base[idx];
+}
+
+func str_fnv_hash(s: *char, len: int) -> u32 {
+    var h: u32 = 2166136261 as u32;
+    var base: i64 = s as i64;
+    for (var i: int = 0; i < len; i = i + 1) {
+        var c: u32 = (*((base + (i as i64)) as *u8)) as u32;
+        h = (h ^ c) * (16777619 as u32);
+    }
+    return h;
+}
+
+func inflight_find(route_id: int, viewer_id: i64, key: *char, klen: int) -> int {
+    if (klen > 90 || klen <= 0) { return -1; }
+    var h: u32 = str_fnv_hash(key, klen) ^ (route_id as u32);
+    var idx: int = (h & (1023 as u32)) as int;
+    var e: *InFlightEntry = get_inflight_by_idx(idx);
+    if (e->in_use != 0 && e->viewer_id == viewer_id && e->hash == h && e->key_len == klen) {
+        if (native_strncmp((&e->key[0]) as *char, key, klen as i64) == 0) {
+            return e->slot_idx;
+        }
+    }
+    return -1;
+}
+
+func inflight_register(route_id: int, viewer_id: i64, key: *char, klen: int, slot_idx: int) -> void {
+    if (klen > 90 || klen <= 0) { return; }
+    var h: u32 = str_fnv_hash(key, klen) ^ (route_id as u32);
+    var idx: int = (h & (1023 as u32)) as int;
+    var e: *InFlightEntry = get_inflight_by_idx(idx);
+    e->in_use = 1;
+    e->slot_idx = slot_idx;
+    e->viewer_id = viewer_id;
+    e->hash = h;
+    e->key_len = klen;
+    native_memcpy((&e->key[0]) as *char, key, klen as i64);
+}
+
+func inflight_clear(route_id: int, key: *char, klen: int, slot_idx: int) -> void {
+    if (klen > 90 || klen <= 0) { return; }
+    var h: u32 = str_fnv_hash(key, klen) ^ (route_id as u32);
+    var idx: int = (h & (1023 as u32)) as int;
+    var e: *InFlightEntry = get_inflight_by_idx(idx);
+    if (e->in_use != 0 && e->slot_idx == slot_idx) {
+        e->in_use = 0;
+    }
+}
+
+func router_clear_inflight(slot: *ConnSlot, slot_idx: int) -> void {
+    // In-flight request coalescing was removed: every request reads its own data from PostgreSQL.
+    slot->next_coalesced = -1;
+}
+
+func route_dispatch(slot: *ConnSlot, slot_idx: int, req: *HttpRequest, secret: *char, slen: int, out: *char, cap: int, out_len: *int) -> int {
+    // 1. Authenticate
+    slot->viewer_id = 0;
+    slot->auth_status = 0; // 0 = no auth, 1 = valid auth, -1 = bad auth
+    var incoming_token: *char = 0 as *char;
+    var incoming_token_len: int = 0;
+    var in_tok_buf: [u8; 512] = uninit;
+
+    if (req->auth_len > 0) {
+        if (req->auth_len > 6 && native_memcmp(req->auth_ptr, "Token ", 6) == 0) {
+            incoming_token = (req->auth_ptr as i64 + 6) as *char;
+            incoming_token_len = req->auth_len - 6;
+            if (incoming_token_len > 0 && incoming_token_len < 512) {
+                native_memcpy((&in_tok_buf[0]) as *char, incoming_token, incoming_token_len as i64);
+                in_tok_buf[incoming_token_len] = 0 as u8;
+                incoming_token = (&in_tok_buf[0]) as *char;
+                if (jwt_verify(incoming_token, incoming_token_len, secret, slen, &slot->viewer_id) != 0) {
+                    slot->auth_status = 1;
+                } else {
+                    slot->auth_status = -1;
+                }
+            } else {
+                slot->auth_status = -1;
+            }
+        } else {
+            slot->auth_status = -1;
+        }
+    }
+
+    if (slot->auth_status < 0) {
+        var is_public: int = 0;
+        if (req->method == 1 && native_memcmp(req->path_ptr, "/api/tags", 9) == 0 && (req->path_len == 9 || *(((req->path_ptr as i64) + 9) as *u8) == 63 as u8)) {
+            is_public = 1;
+        } else if (req->method == 2 && req->path_len >= 10 && native_memcmp(req->path_ptr, "/api/users", 10) == 0) {
+            is_public = 1;
+        }
+        if (is_public == 0) {
+            *out_len = fmt_error_response(401, "unauthorized", out, cap);
+            return 0; // Immediate
+        }
+    }
+
+    native_itoa(slot->viewer_id, (&slot->v_buf[0]) as *char);
+    var v_str: *char = (&slot->v_buf[0]) as *char;
+    slot->num_res = 0;
+    slot->step = 1;
+
+    // Route: GET /api/tags
+    if (req->method == 1 && native_memcmp(req->path_ptr, "/api/tags", 9) == 0 && (req->path_len == 9 || *(((req->path_ptr as i64) + 9) as *u8) == 63 as u8)) {
+        slot->route_id = ROUTE_TAGS;
+        var conn: *PgConn = pg_get_read_conn();
+        if (conn as i64 == 0 as i64) {
+            return -2;
+        }
+        slot->next_coalesced = -1;
+        PQsendQueryPrepared(conn->c, "s_tags", 0, 0 as **char, 0 as *int, 0 as *int, 0);
+        PQsendPipelineSync(conn->c);
+        pg_enqueue_slot(conn, slot_idx);
+        return 1; // Wait DB
+    }
+
+    // Route: POST /api/users
+    if (req->method == 2 && native_memcmp(req->path_ptr, "/api/users", 10) == 0 && req->path_len == 10) {
+        if (json_has_wrapper(req->body_ptr, req->body_len, "user", 4) == 0) {
+            *out_len = fmt_error_response(422, "missing user wrapper", out, cap);
+            return 0;
+        }
+        var u_user: *char = 0 as *char;
+        var u_user_len: int = 0;
+        var st_u: int = json_find_str(req->body_ptr, req->body_len, "username", 8, &u_user, &u_user_len);
+        if (st_u <= 0 || u_user_len == 0 || u_user_len >= 250) {
+            *out_len = fmt_error_response(422, "username can't be empty", out, cap);
+            return 0;
+        }
+        var u_email: *char = 0 as *char;
+        var u_email_len: int = 0;
+        var st_e: int = json_find_str(req->body_ptr, req->body_len, "email", 5, &u_email, &u_email_len);
+        if (st_e <= 0 || u_email_len == 0 || u_email_len >= 250) {
+            *out_len = fmt_error_response(422, "email can't be empty", out, cap);
+            return 0;
+        }
+        var u_pass: *char = 0 as *char;
+        var u_pass_len: int = 0;
+        var st_p: int = json_find_str(req->body_ptr, req->body_len, "password", 8, &u_pass, &u_pass_len);
+        if (st_p <= 0 || u_pass_len == 0 || u_pass_len > 72) {
+            *out_len = fmt_error_response(422, "password invalid or over 72 bytes", out, cap);
+            return 0;
+        }
+
+        if (json_unescape(u_user, u_user_len, (&slot->param1[0]) as *char, 256) < 0) {
+            *out_len = fmt_error_response(422, "username too long", out, cap);
+            return 0;
+        }
+        if (json_unescape(u_email, u_email_len, (&slot->param2[0]) as *char, 256) < 0) {
+            *out_len = fmt_error_response(422, "email too long", out, cap);
+            return 0;
+        }
+
+        var p_buf: [u8; 128] = uninit;
+        native_memcpy((&p_buf[0]) as *char, u_pass, u_pass_len as i64);
+        p_buf[u_pass_len] = 0 as u8;
+
+        var salt: [u8; 16] = uninit;
+        if (gen_salt(&salt[0]) == 0) {
+            *out_len = fmt_error_response(500, "random source unavailable", out, cap);
+            return 0;
+        }
+        var hash_out: [u8; 64] = uninit;
+        bcrypt_hash((&p_buf[0]) as *char, u_pass_len, &salt[0], 10, (&hash_out[0]) as *char);
+
+        var params: [*char; 3] = [(&slot->param1[0]) as *char, (&slot->param2[0]) as *char, (&hash_out[0]) as *char];
+        var conn: *PgConn = pg_get_write_conn();
+        if (conn as i64 == 0 as i64) {
+            return -4;
+        }
+        PQsendQueryPrepared(conn->c, "s_user_insert", 3, &params[0], 0 as *int, 0 as *int, 0);
+        PQsendPipelineSync(conn->c);
+        pg_enqueue_slot(conn, slot_idx);
+        slot->route_id = ROUTE_USER_REGISTER;
+        return 1;
+    }
+
+    // Route: POST /api/users/login
+    if (req->method == 2 && native_memcmp(req->path_ptr, "/api/users/login", 16) == 0 && req->path_len == 16) {
+        if (json_has_wrapper(req->body_ptr, req->body_len, "user", 4) == 0) {
+            *out_len = fmt_error_response(422, "missing user wrapper", out, cap);
+            return 0;
+        }
+        var u_email: *char = 0 as *char;
+        var u_email_len: int = 0;
+        var st_e: int = json_find_str(req->body_ptr, req->body_len, "email", 5, &u_email, &u_email_len);
+        if (st_e <= 0 || u_email_len == 0 || u_email_len >= 250) {
+            *out_len = fmt_error_response(422, "email can't be empty", out, cap);
+            return 0;
+        }
+        var u_pass: *char = 0 as *char;
+        var u_pass_len: int = 0;
+        var st_p: int = json_find_str(req->body_ptr, req->body_len, "password", 8, &u_pass, &u_pass_len);
+        if (st_p <= 0 || u_pass_len == 0 || u_pass_len >= 250) {
+            *out_len = fmt_error_response(422, "password can't be empty", out, cap);
+            return 0;
+        }
+
+        if (json_unescape(u_email, u_email_len, (&slot->param1[0]) as *char, 256) < 0) {
+            *out_len = fmt_error_response(422, "email too long", out, cap);
+            return 0;
+        }
+        native_memcpy((&slot->param2[0]) as *char, u_pass, u_pass_len as i64);
+        slot->param2[u_pass_len] = 0 as u8;
+        slot->p2_len = u_pass_len;
+
+        var params: [*char; 1] = [(&slot->param1[0]) as *char];
+        var conn: *PgConn = pg_get_read_conn();
+        if (conn as i64 == 0 as i64) {
+            return -2;
+        }
+        PQsendQueryPrepared(conn->c, "s_user_by_email", 1, &params[0], 0 as *int, 0 as *int, 0);
+        PQsendPipelineSync(conn->c);
+        pg_enqueue_slot(conn, slot_idx);
+        slot->route_id = ROUTE_USER_LOGIN;
+        return 1;
+    }
+
+    // Route: GET /api/user
+    if (req->method == 1 && native_memcmp(req->path_ptr, "/api/user", 9) == 0 && req->path_len == 9) {
+        if (slot->auth_status <= 0 || slot->viewer_id <= 0) {
+            *out_len = fmt_error_response(401, "unauthorized", out, cap);
+            return 0;
+        }
+        if (incoming_token_len > 0 && incoming_token_len < 250) {
+            native_memcpy((&slot->param1[0]) as *char, incoming_token, incoming_token_len as i64);
+            slot->param1[incoming_token_len] = 0 as u8;
+        }
+        var params: [*char; 1] = [v_str];
+        var conn: *PgConn = pg_get_read_conn();
+        if (conn as i64 == 0 as i64) {
+            return -2;
+        }
+        PQsendQueryPrepared(conn->c, "s_user_by_id", 1, &params[0], 0 as *int, 0 as *int, 0);
+        PQsendPipelineSync(conn->c);
+        pg_enqueue_slot(conn, slot_idx);
+        slot->route_id = ROUTE_USER_CURRENT;
+        return 1;
+    }
+
+    // Route: PUT /api/user
+    if (req->method == 3 && native_memcmp(req->path_ptr, "/api/user", 9) == 0 && req->path_len == 9) {
+        if (slot->auth_status <= 0 || slot->viewer_id <= 0) {
+            *out_len = fmt_error_response(401, "unauthorized", out, cap);
+            return 0;
+        }
+        if (json_has_wrapper(req->body_ptr, req->body_len, "user", 4) == 0) {
+            *out_len = fmt_error_response(422, "missing user wrapper", out, cap);
+            return 0;
+        }
+
+        var u_email: *char = 0 as *char;
+        var u_email_len: int = 0;
+        var has_email: int = json_find_str(req->body_ptr, req->body_len, "email", 5, &u_email, &u_email_len);
+        if (has_email < 0) { *out_len = fmt_error_response(422, "email invalid", out, cap); return 0; }
+        if (has_email == 1 && (u_email_len == 0 || u_email_len >= 128)) { *out_len = fmt_error_response(422, "email can't be empty or too long", out, cap); return 0; }
+
+        var u_user: *char = 0 as *char;
+        var u_user_len: int = 0;
+        var has_user: int = json_find_str(req->body_ptr, req->body_len, "username", 8, &u_user, &u_user_len);
+        if (has_user < 0) { *out_len = fmt_error_response(422, "username invalid", out, cap); return 0; }
+        if (has_user == 1 && (u_user_len == 0 || u_user_len >= 128)) { *out_len = fmt_error_response(422, "username can't be empty or too long", out, cap); return 0; }
+
+        var u_pass: *char = 0 as *char;
+        var u_pass_len: int = 0;
+        var has_pass: int = json_find_str(req->body_ptr, req->body_len, "password", 8, &u_pass, &u_pass_len);
+        if (has_pass < 0) { *out_len = fmt_error_response(422, "password invalid", out, cap); return 0; }
+        if (has_pass == 1 && (u_pass_len == 0 || u_pass_len > 72)) { *out_len = fmt_error_response(422, "password invalid or over 72 bytes", out, cap); return 0; }
+
+        var u_bio: *char = 0 as *char;
+        var u_bio_len: int = 0;
+        var has_bio: int = json_find_str(req->body_ptr, req->body_len, "bio", 3, &u_bio, &u_bio_len);
+        if (has_bio < 0) { *out_len = fmt_error_response(422, "bio invalid", out, cap); return 0; }
+        if (has_bio == 1 && u_bio_len >= 512) { *out_len = fmt_error_response(422, "bio too long", out, cap); return 0; }
+
+        var u_img: *char = 0 as *char;
+        var u_img_len: int = 0;
+        var has_img: int = json_find_str(req->body_ptr, req->body_len, "image", 5, &u_img, &u_img_len);
+        if (has_img < 0) { *out_len = fmt_error_response(422, "image invalid", out, cap); return 0; }
+        if (has_img == 1 && u_img_len >= 256) { *out_len = fmt_error_response(422, "image too long", out, cap); return 0; }
+
+        var e_buf: [u8; 128] = uninit;
+        var u_buf: [u8; 128] = uninit;
+        var p_buf: [u8; 64] = uninit;
+        var b_buf: [u8; 512] = uninit;
+        var i_buf: [u8; 256] = uninit;
+
+        var p_email: *char = 0 as *char;
+        if (has_email == 1) {
+            if (json_unescape(u_email, u_email_len, (&e_buf[0]) as *char, 128) < 0) {
+                *out_len = fmt_error_response(422, "email too long", out, cap);
+                return 0;
+            }
+            p_email = (&e_buf[0]) as *char;
+        }
+        var p_user: *char = 0 as *char;
+        if (has_user == 1) {
+            if (json_unescape(u_user, u_user_len, (&u_buf[0]) as *char, 128) < 0) {
+                *out_len = fmt_error_response(422, "username too long", out, cap);
+                return 0;
+            }
+            p_user = (&u_buf[0]) as *char;
+        }
+        var p_pass: *char = 0 as *char;
+        if (has_pass == 1 && u_pass_len > 0) {
+            var salt: [u8; 16] = uninit;
+            if (gen_salt(&salt[0]) == 0) {
+                *out_len = fmt_error_response(500, "random source unavailable", out, cap);
+                return 0;
+            }
+            bcrypt_hash(u_pass, u_pass_len, &salt[0], 10, (&p_buf[0]) as *char);
+            p_pass = (&p_buf[0]) as *char;
+        }
+        var p_bio: *char = 0 as *char;
+        if (has_bio == 1) {
+            if (json_unescape(u_bio, u_bio_len, (&b_buf[0]) as *char, 512) < 0) {
+                *out_len = fmt_error_response(422, "bio too long", out, cap);
+                return 0;
+            }
+            p_bio = (&b_buf[0]) as *char;
+        }
+        var p_img: *char = 0 as *char;
+        if (has_img == 1) {
+            if (json_unescape(u_img, u_img_len, (&i_buf[0]) as *char, 256) < 0) {
+                *out_len = fmt_error_response(422, "image too long", out, cap);
+                return 0;
+            }
+            p_img = (&i_buf[0]) as *char;
+        }
+
+        if (incoming_token_len > 0 && incoming_token_len < 250) {
+            native_memcpy((&slot->param1[0]) as *char, incoming_token, incoming_token_len as i64);
+            slot->param1[incoming_token_len] = 0 as u8;
+        }
+
+        var params: [*char; 6] = [v_str, p_email, p_user, p_pass, p_bio, p_img];
+        var conn: *PgConn = pg_get_write_conn();
+        if (conn as i64 == 0 as i64) {
+            return -4;
+        }
+        PQsendQueryPrepared(conn->c, "s_user_update", 6, &params[0], 0 as *int, 0 as *int, 0);
+        PQsendPipelineSync(conn->c);
+        pg_enqueue_slot(conn, slot_idx);
+        slot->route_id = ROUTE_USER_UPDATE;
+        return 1;
+    }
+
+    // Route: Profiles: /api/profiles/:username...
+    if (req->path_len > 14 && native_memcmp(req->path_ptr, "/api/profiles/", 14) == 0) {
+        var rest: *char = (req->path_ptr as i64 + 14) as *char;
+        var rlen: int = req->path_len - 14;
+
+        var is_follow: int = 0;
+        if (rlen > 7 && native_memcmp((rest as i64 + (rlen as i64) - 7) as *char, "/follow", 7) == 0) {
+            is_follow = 1;
+            rlen = rlen - 7;
+        }
+
+        if (rlen > 240) { *out_len = fmt_error_response(404, "not found", out, cap); return 0; }
+        native_memcpy((&slot->param1[0]) as *char, rest, rlen as i64);
+        slot->param1[rlen] = 0 as u8;
+        slot->p1_len = rlen;
+
+        if (is_follow != 0) {
+            if (req->method != 2 && req->method != 4) {
+                *out_len = fmt_error_response(404, "not found", out, cap);
+                return 0;
+            }
+            if (slot->auth_status <= 0 || slot->viewer_id <= 0) {
+                *out_len = fmt_error_response(401, "unauthorized", out, cap);
+                return 0;
+            }
+            var p_user: [*char; 1] = [(&slot->param1[0]) as *char];
+            var conn: *PgConn = pg_get_read_conn();
+            if (conn as i64 == 0 as i64) {
+                return -2;
+            }
+            PQsendQueryPrepared(conn->c, "s_user_by_name", 1, &p_user[0], 0 as *int, 0 as *int, 0);
+            PQsendPipelineSync(conn->c);
+            pg_enqueue_slot(conn, slot_idx);
+            slot->route_id = ROUTE_PROFILE_FOLLOW;
+            slot->sub_id = req->method; // 2 = follow, 4 = unfollow
+            slot->step = 1;
+            return 1;
+        } else if (req->method == 1) { // GET profile
+            var params: [*char; 2] = [v_str, (&slot->param1[0]) as *char];
+            var conn: *PgConn = pg_get_read_conn();
+            if (conn as i64 == 0 as i64) {
+                return -2;
+            }
+            PQsendQueryPrepared(conn->c, "s_profile", 2, &params[0], 0 as *int, 0 as *int, 0);
+            PQsendPipelineSync(conn->c);
+            pg_enqueue_slot(conn, slot_idx);
+            slot->route_id = ROUTE_PROFILE;
+            return 1;
+        }
+    }
+
+    // Route: GET /api/articles or POST /api/articles
+    if (req->path_len == 13 && native_memcmp(req->path_ptr, "/api/articles", 13) == 0) {
+        if (req->method == 1) { // GET /api/articles
+            var limit_val: int = 20;
+            var offset_val: int = 0;
+            if (http_parse_limit(req->query_ptr, req->query_len, &limit_val) < 0) {
+                *out_len = fmt_error_response(422, "invalid limit", out, cap);
+                return 0;
+            }
+            if (http_parse_offset(req->query_ptr, req->query_len, &offset_val) < 0) {
+                *out_len = fmt_error_response(422, "invalid offset", out, cap);
+                return 0;
+            }
+            native_itoa(limit_val as i64, (&slot->lim_buf[0]) as *char);
+            native_itoa(offset_val as i64, (&slot->off_buf[0]) as *char);
+            var lim_str: *char = (&slot->lim_buf[0]) as *char;
+            var off_str: *char = (&slot->off_buf[0]) as *char;
+
+            var q_val: *char = 0 as *char;
+            var q_len: int = 0;
+            var conn: *PgConn = pg_get_read_conn();
+            if (conn as i64 == 0 as i64) {
+                return -2;
+            }
+
+            if (http_query_param(req->query_ptr, req->query_len, "tag", 3, &q_val, &q_len) > 0 && q_len > 0) {
+                if (q_len > 240) { q_len = 240; }
+                native_memcpy((&slot->param1[0]) as *char, q_val, q_len as i64);
+                slot->param1[q_len] = 0 as u8;
+                var p_tag: [*char; 4] = [v_str, lim_str, off_str, (&slot->param1[0]) as *char];
+                PQsendQueryPrepared(conn->c, "s_list_tag", 4, &p_tag[0], 0 as *int, 0 as *int, 0);
+            } else if (http_query_param(req->query_ptr, req->query_len, "author", 6, &q_val, &q_len) > 0 && q_len > 0) {
+                if (q_len > 240) { q_len = 240; }
+                native_memcpy((&slot->param1[0]) as *char, q_val, q_len as i64);
+                slot->param1[q_len] = 0 as u8;
+                var p_aut: [*char; 4] = [v_str, lim_str, off_str, (&slot->param1[0]) as *char];
+                PQsendQueryPrepared(conn->c, "s_list_author", 4, &p_aut[0], 0 as *int, 0 as *int, 0);
+            } else if (http_query_param(req->query_ptr, req->query_len, "favorited", 9, &q_val, &q_len) > 0 && q_len > 0) {
+                if (q_len > 240) { q_len = 240; }
+                native_memcpy((&slot->param1[0]) as *char, q_val, q_len as i64);
+                slot->param1[q_len] = 0 as u8;
+                var p_fav: [*char; 4] = [v_str, lim_str, off_str, (&slot->param1[0]) as *char];
+                PQsendQueryPrepared(conn->c, "s_list_fav", 4, &p_fav[0], 0 as *int, 0 as *int, 0);
+            } else {
+                var p_all: [*char; 3] = [v_str, lim_str, off_str];
+                PQsendQueryPrepared(conn->c, "s_list_all", 3, &p_all[0], 0 as *int, 0 as *int, 0);
+            }
+            PQsendPipelineSync(conn->c);
+            pg_enqueue_slot(conn, slot_idx);
+            slot->route_id = ROUTE_ARTICLES_LIST;
+            return 1;
+        } else if (req->method == 2) { // POST /api/articles
+            if (slot->auth_status <= 0 || slot->viewer_id <= 0) {
+                *out_len = fmt_error_response(401, "unauthorized", out, cap);
+                return 0;
+            }
+            var conn: *PgConn = pg_get_write_conn();
+            if (conn as i64 == 0 as i64) {
+                return -4;
+            }
+            if (json_has_wrapper(req->body_ptr, req->body_len, "article", 7) == 0) {
+                *out_len = fmt_error_response(422, "missing article wrapper", out, cap);
+                return 0;
+            }
+            var title: *char = 0 as *char;
+            var tlen: int = 0;
+            var st_title: int = json_find_str(req->body_ptr, req->body_len, "title", 5, &title, &tlen);
+            if (st_title <= 0 || tlen == 0) {
+                *out_len = fmt_error_response(422, "title can't be empty", out, cap);
+                return 0;
+            }
+            if (tlen >= 512) {
+                *out_len = fmt_error_response(422, "title too long", out, cap);
+                return 0;
+            }
+            var desc: *char = 0 as *char;
+            var dlen: int = 0;
+            var st_desc: int = json_find_str(req->body_ptr, req->body_len, "description", 11, &desc, &dlen);
+            if (st_desc <= 0 || dlen == 0) {
+                *out_len = fmt_error_response(422, "description can't be empty", out, cap);
+                return 0;
+            }
+            if (dlen >= 1024) {
+                *out_len = fmt_error_response(422, "description too long", out, cap);
+                return 0;
+            }
+            var body: *char = 0 as *char;
+            var blen: int = 0;
+            var st_body: int = json_find_str(req->body_ptr, req->body_len, "body", 4, &body, &blen);
+            if (st_body <= 0 || blen == 0) {
+                *out_len = fmt_error_response(422, "body can't be empty", out, cap);
+                return 0;
+            }
+            if (blen >= 262144) {
+                *out_len = fmt_error_response(422, "body too long", out, cap);
+                return 0;
+            }
+
+            var t_buf: [u8; 512] = uninit;
+            var d_buf: [u8; 1024] = uninit;
+            if (json_unescape(title, tlen, (&t_buf[0]) as *char, 512) < 0 ||
+                json_unescape(desc, dlen, (&d_buf[0]) as *char, 1024) < 0) {
+                *out_len = fmt_error_response(422, "article field too long", out, cap);
+                return 0;
+            }
+
+            var b_unescaped: *char = get_scratch();
+            if (json_unescape(body, blen, b_unescaped, 262144) < 0) {
+                *out_len = fmt_error_response(422, "body too long", out, cap);
+                return 0;
+            }
+
+            // Tags
+            var tags: [*char; 16] = [0 as *char, 0 as *char, 0 as *char, 0 as *char, 0 as *char, 0 as *char, 0 as *char, 0 as *char, 0 as *char, 0 as *char, 0 as *char, 0 as *char, 0 as *char, 0 as *char, 0 as *char, 0 as *char];
+            var tag_lens: [int; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            var ntags: int = json_find_taglist(req->body_ptr, req->body_len, &tags[0], &tag_lens[0], 16);
+            if (ntags < 0) {
+                *out_len = fmt_error_response(422, "tagList invalid", out, cap);
+                return 0;
+            }
+
+            // Build a PostgreSQL array literal, escaping '"' and '\'. Reject if it cannot fit.
+            var tag_total: int = 2;
+            for (var ti: int = 0; ti < ntags; ti = ti + 1) {
+                tag_total = tag_total + (tag_lens[ti] * 2) + 1;
+            }
+            if (tag_total > 256) {
+                *out_len = fmt_error_response(422, "tagList too long", out, cap);
+                return 0;
+            }
+            var tw: BufWriter = uninit;
+            tw.buf = (&slot->param1[0]) as *char;
+            tw.len = 0;
+            tw.cap = 256;
+            buf_append_char(&tw, 123); // '{'
+            for (var i: int = 0; i < ntags; i = i + 1) {
+                if (i > 0) { buf_append_char(&tw, 44); } // ','
+                buf_append_char(&tw, 34); // '"'
+                for (var tj: int = 0; tj < tag_lens[i]; tj = tj + 1) {
+                    var tc: u8 = *((((tags[i] as i64) + (tj as i64)) as *u8));
+                    if (tc == (34 as u8) || tc == (92 as u8)) {
+                        buf_append_char(&tw, 92); // escape for array literal
+                    }
+                    buf_append_char(&tw, tc as int);
+                }
+                buf_append_char(&tw, 34); // '"'
+            }
+            buf_append_char(&tw, 125); // '}'
+            buf_append_char(&tw, 0);
+
+            var p_ins: [*char; 5] = [v_str, (&t_buf[0]) as *char, (&d_buf[0]) as *char, b_unescaped, (&slot->param1[0]) as *char];
+            PQsendQueryPrepared(conn->c, "s_article_insert", 5, &p_ins[0], 0 as *int, 0 as *int, 0);
+            PQsendPipelineSync(conn->c);
+            pg_enqueue_slot(conn, slot_idx);
+            slot->route_id = ROUTE_ARTICLE_CREATE;
+            slot->step = 1;
+            return 1;
+        }
+    }
+
+    // Route: GET /api/articles/feed
+    if (req->method == 1 && req->path_len == 18 && native_memcmp(req->path_ptr, "/api/articles/feed", 18) == 0) {
+        if (slot->auth_status <= 0 || slot->viewer_id <= 0) {
+            *out_len = fmt_error_response(401, "unauthorized", out, cap);
+            return 0;
+        }
+        var limit_val: int = 20;
+        var offset_val: int = 0;
+        if (http_parse_limit(req->query_ptr, req->query_len, &limit_val) < 0) {
+            *out_len = fmt_error_response(422, "invalid limit", out, cap);
+            return 0;
+        }
+        if (http_parse_offset(req->query_ptr, req->query_len, &offset_val) < 0) {
+            *out_len = fmt_error_response(422, "invalid offset", out, cap);
+            return 0;
+        }
+        native_itoa(limit_val as i64, (&slot->lim_buf[0]) as *char);
+        native_itoa(offset_val as i64, (&slot->off_buf[0]) as *char);
+
+        var conn: *PgConn = pg_get_read_conn();
+        if (conn as i64 == 0 as i64) {
+            return -2;
+        }
+        var p_feed: [*char; 3] = [v_str, (&slot->lim_buf[0]) as *char, (&slot->off_buf[0]) as *char];
+        PQsendQueryPrepared(conn->c, "s_feed", 3, &p_feed[0], 0 as *int, 0 as *int, 0);
+        PQsendPipelineSync(conn->c);
+        pg_enqueue_slot(conn, slot_idx);
+        slot->route_id = ROUTE_ARTICLES_FEED;
+        return 1;
+    }
+
+    // Route: Articles by slug: /api/articles/:slug...
+    if (req->path_len > 14 && native_memcmp(req->path_ptr, "/api/articles/", 14) == 0) {
+        var rest: *char = (req->path_ptr as i64 + 14) as *char;
+        var rlen: int = req->path_len - 14;
+
+        // Check for "/favorite"
+        if (rlen > 9 && native_memcmp((rest as i64 + (rlen as i64) - 9) as *char, "/favorite", 9) == 0) {
+            var slen_act: int = rlen - 9;
+            if (slen_act > 240) { *out_len = fmt_error_response(404, "not found", out, cap); return 0; }
+            native_memcpy((&slot->param1[0]) as *char, rest, slen_act as i64);
+            slot->param1[slen_act] = 0 as u8;
+
+            if (req->method != 2 && req->method != 4) {
+                *out_len = fmt_error_response(404, "not found", out, cap);
+                return 0;
+            }
+            if (slot->auth_status <= 0 || slot->viewer_id <= 0) {
+                *out_len = fmt_error_response(401, "unauthorized", out, cap);
+                return 0;
+            }
+
+            var p_slug: [*char; 1] = [(&slot->param1[0]) as *char];
+            var conn: *PgConn = pg_get_read_conn();
+            if (conn as i64 == 0 as i64) {
+                return -2;
+            }
+            PQsendQueryPrepared(conn->c, "s_article_owner", 1, &p_slug[0], 0 as *int, 0 as *int, 0);
+            PQsendPipelineSync(conn->c);
+            pg_enqueue_slot(conn, slot_idx);
+            slot->route_id = ROUTE_ARTICLE_FAVORITE;
+            slot->sub_id = req->method; // 2 = POST favorite, 4 = DELETE unfavorite
+            slot->step = 1;
+            return 1;
+        }
+
+        // Check for "/comments"
+        var comm_idx: int = -1;
+        var r_base: i64 = rest as i64;
+        for (var i: int = 0; i + 9 <= rlen; i = i + 1) {
+            if (native_memcmp((r_base + (i as i64)) as *char, "/comments", 9) == 0) {
+                comm_idx = i;
+                break;
+            }
+        }
+
+        if (comm_idx > 0) {
+            if (comm_idx > 240) { *out_len = fmt_error_response(404, "not found", out, cap); return 0; }
+            native_memcpy((&slot->param1[0]) as *char, rest, comm_idx as i64);
+            slot->param1[comm_idx] = 0 as u8;
+
+            if (rlen == comm_idx + 9) { // Exactly "/comments"
+                if (req->method == 2) { // POST comment
+                    if (slot->auth_status <= 0 || slot->viewer_id <= 0) {
+                        *out_len = fmt_error_response(401, "unauthorized", out, cap);
+                        return 0;
+                    }
+                    var wconn: *PgConn = pg_get_write_conn();
+                    if (wconn as i64 == 0 as i64) {
+                        return -4;
+                    }
+                    if (json_has_wrapper(req->body_ptr, req->body_len, "comment", 7) == 0) {
+                        *out_len = fmt_error_response(422, "missing comment wrapper", out, cap);
+                        return 0;
+                    }
+                    var c_body: *char = 0 as *char;
+                    var c_blen: int = 0;
+                    var st_c: int = json_find_str(req->body_ptr, req->body_len, "body", 4, &c_body, &c_blen);
+                    if (st_c <= 0 || c_blen == 0) {
+                        *out_len = fmt_error_response(422, "body can't be empty", out, cap);
+                        return 0;
+                    }
+                    var c_unescaped: *char = get_scratch();
+                    if (c_blen >= 262144 || json_unescape(c_body, c_blen, c_unescaped, 262144) < 0) {
+                        *out_len = fmt_error_response(422, "comment too long", out, cap);
+                        return 0;
+                    }
+
+                    var p_ins: [*char; 3] = [(&slot->param1[0]) as *char, v_str, c_unescaped];
+                    PQsendQueryPrepared(wconn->c, "s_comment_insert", 3, &p_ins[0], 0 as *int, 0 as *int, 0);
+                    PQsendPipelineSync(wconn->c);
+                    pg_enqueue_slot(wconn, slot_idx);
+                    slot->route_id = ROUTE_COMMENTS_CREATE;
+                    return 1;
+                } else if (req->method == 1) { // GET comments
+                    slot->route_id = ROUTE_COMMENTS_GET;
+                    slot->p1_len = comm_idx;
+                    var conn: *PgConn = pg_get_read_conn();
+                    if (conn as i64 == 0 as i64) {
+                        return -2;
+                    }
+                    slot->next_coalesced = -1;
+
+                    var p_c: [*char; 2] = [v_str, (&slot->param1[0]) as *char];
+                    PQsendQueryPrepared(conn->c, "s_comments_by_slug", 2, &p_c[0], 0 as *int, 0 as *int, 0);
+                    PQsendPipelineSync(conn->c);
+                    pg_enqueue_slot(conn, slot_idx);
+                    return 1;
+                }
+            } else if (rlen > comm_idx + 10 && *(((r_base + (comm_idx as i64) + 9)) as *u8) == 47 as u8) { // "/comments/:id"
+                var cid_ptr: *char = (r_base + (comm_idx as i64) + 10) as *char;
+                var cid_len: int = rlen - comm_idx - 10;
+                if (cid_len > 240) { *out_len = fmt_error_response(404, "not found", out, cap); return 0; }
+                native_memcpy((&slot->param2[0]) as *char, cid_ptr, cid_len as i64);
+                slot->param2[cid_len] = 0 as u8;
+
+                // Validate cid is all digits
+                for (var i: int = 0; i < cid_len; i = i + 1) {
+                    var ch: u8 = slot->param2[i];
+                    if (ch < (48 as u8) || ch > (57 as u8)) {
+                        *out_len = fmt_error_response(404, "invalid comment id", out, cap);
+                        return 0;
+                    }
+                }
+
+                if (req->method == 4) { // DELETE comment
+                    if (slot->auth_status <= 0 || slot->viewer_id <= 0) {
+                        *out_len = fmt_error_response(401, "unauthorized", out, cap);
+                        return 0;
+                    }
+                    var p_own: [*char; 2] = [(&slot->param2[0]) as *char, (&slot->param1[0]) as *char];
+                    var conn: *PgConn = pg_get_read_conn();
+                    if (conn as i64 == 0 as i64) {
+                        return -2;
+                    }
+                    PQsendQueryPrepared(conn->c, "s_comment_owner", 2, &p_own[0], 0 as *int, 0 as *int, 0);
+                    PQsendPipelineSync(conn->c);
+                    pg_enqueue_slot(conn, slot_idx);
+                    slot->route_id = ROUTE_COMMENTS_DELETE;
+                    slot->step = 1;
+                    return 1;
+                }
+            }
+        }
+
+        // Single article: /api/articles/:slug
+        if (rlen > 240) { *out_len = fmt_error_response(404, "not found", out, cap); return 0; }
+        native_memcpy((&slot->param1[0]) as *char, rest, rlen as i64);
+        slot->param1[rlen] = 0 as u8;
+
+        if (req->method == 1) { // GET /api/articles/:slug
+            slot->route_id = ROUTE_ARTICLE_GET;
+            slot->p1_len = rlen;
+            var conn: *PgConn = pg_get_read_conn();
+            if (conn as i64 == 0 as i64) {
+                return -2;
+            }
+            slot->next_coalesced = -1;
+
+            var p_art: [*char; 2] = [v_str, (&slot->param1[0]) as *char];
+            PQsendQueryPrepared(conn->c, "s_article_by_slug", 2, &p_art[0], 0 as *int, 0 as *int, 0);
+            PQsendPipelineSync(conn->c);
+            pg_enqueue_slot(conn, slot_idx);
+            return 1;
+        } else if (req->method == 3) { // PUT /api/articles/:slug
+            if (slot->auth_status <= 0 || slot->viewer_id <= 0) {
+                *out_len = fmt_error_response(401, "unauthorized", out, cap);
+                return 0;
+            }
+            if (json_has_wrapper(req->body_ptr, req->body_len, "article", 7) == 0) {
+                *out_len = fmt_error_response(422, "missing article wrapper", out, cap);
+                return 0;
+            }
+            var u_title: *char = 0 as *char;
+            var u_tlen: int = 0;
+            var has_title: int = json_find_str(req->body_ptr, req->body_len, "title", 5, &u_title, &u_tlen);
+            if (has_title < 0) {
+                *out_len = fmt_error_response(422, "title invalid", out, cap);
+                return 0;
+            }
+            if (has_title == 1 && (u_tlen == 0 || u_tlen >= 512)) {
+                *out_len = fmt_error_response(422, "title can't be empty or too long", out, cap);
+                return 0;
+            }
+
+            var u_desc: *char = 0 as *char;
+            var u_dlen: int = 0;
+            var has_desc: int = json_find_str(req->body_ptr, req->body_len, "description", 11, &u_desc, &u_dlen);
+            if (has_desc < 0) {
+                *out_len = fmt_error_response(422, "description invalid", out, cap);
+                return 0;
+            }
+            if (has_desc == 1 && u_dlen >= 1024) {
+                *out_len = fmt_error_response(422, "description too long", out, cap);
+                return 0;
+            }
+
+            var u_body: *char = 0 as *char;
+            var u_blen: int = 0;
+            var has_body: int = json_find_str(req->body_ptr, req->body_len, "body", 4, &u_body, &u_blen);
+            if (has_body < 0) {
+                *out_len = fmt_error_response(422, "body invalid", out, cap);
+                return 0;
+            }
+            if (has_body == 1 && u_blen >= 262144) {
+                *out_len = fmt_error_response(422, "body too long", out, cap);
+                return 0;
+            }
+
+            var p_own: [*char; 1] = [(&slot->param1[0]) as *char];
+            var conn: *PgConn = pg_get_read_conn();
+            if (conn as i64 == 0 as i64) {
+                return -2;
+            }
+            PQsendQueryPrepared(conn->c, "s_article_owner", 1, &p_own[0], 0 as *int, 0 as *int, 0);
+            PQsendPipelineSync(conn->c);
+            pg_enqueue_slot(conn, slot_idx);
+            slot->route_id = ROUTE_ARTICLE_UPDATE;
+            slot->sub_id = (req->body_ptr as i64 - (&slot->read_buf[0]) as i64) as int;
+            slot->p2_len = req->body_len;
+            slot->step = 1;
+            return 1;
+        } else if (req->method == 4) { // DELETE /api/articles/:slug
+            if (slot->auth_status <= 0 || slot->viewer_id <= 0) {
+                *out_len = fmt_error_response(401, "unauthorized", out, cap);
+                return 0;
+            }
+            var p_own: [*char; 1] = [(&slot->param1[0]) as *char];
+            var conn: *PgConn = pg_get_read_conn();
+            if (conn as i64 == 0 as i64) {
+                return -2;
+            }
+            PQsendQueryPrepared(conn->c, "s_article_owner", 1, &p_own[0], 0 as *int, 0 as *int, 0);
+            PQsendPipelineSync(conn->c);
+            pg_enqueue_slot(conn, slot_idx);
+            slot->route_id = ROUTE_ARTICLE_DELETE;
+            slot->step = 1;
+            return 1;
+        }
+    }
+
+    // Default 404
+    *out_len = fmt_error_response(404, "not found", out, cap);
+    return 0;
+}
+
+func route_login_finish(slot: *ConnSlot, ok: int, secret: *char, slen: int, out: *char, cap: int) -> int {
+    slot->write_offset = 0;
+    if (slot->num_res <= 0) {
+        slot->num_res = 0;
+        return fmt_error_response(500, "database result missing", out, cap);
+    }
+    var res: *void = slot->res[0];
+    if (res as i64 == 0 as i64) {
+        slot->num_res = 0;
+        return fmt_error_response(500, "database result missing", out, cap);
+    }
+    if (ok == 0) {
+        PQclear(res);
+        slot->res[0] = 0 as *void;
+        slot->num_res = 0;
+        return fmt_error_response(401, "invalid email or password", out, cap);
+    }
+    var uid_str: *char = PQgetvalue(res, 0, 0);
+    var uid: i64 = native_atoi(uid_str) as i64;
+    var username: *char = PQgetvalue(res, 0, 1);
+    var email: *char = PQgetvalue(res, 0, 2);
+    var bio: *char = PQgetvalue(res, 0, 3);
+    var bio_null: int = PQgetisnull(res, 0, 3);
+    var image: *char = PQgetvalue(res, 0, 4);
+    var image_null: int = PQgetisnull(res, 0, 4);
+
+    var tok_buf: [u8; 256] = uninit;
+    jwt_sign(uid, secret, slen, (&tok_buf[0]) as *char);
+
+    var bw: BufWriter = uninit;
+    bw.buf = ((out as i64) + 128 as i64) as *char;
+    bw.len = 0;
+    bw.cap = cap - 128;
+    render_user_json(&bw, email, (&tok_buf[0]) as *char, username, bio, bio_null, image, image_null);
+    PQclear(res);
+    slot->res[0] = 0 as *void;
+    slot->num_res = 0;
+    return finish_json_response(slot, 200, bw.len, out);
+}
+
+func route_finish(slot: *ConnSlot, slot_idx: int, secret: *char, slen: int, out: *char, cap: int) -> int {
+    slot->write_offset = 0;
+    router_clear_inflight(slot, slot_idx);
+    var v_str: *char = (&slot->v_buf[0]) as *char;
+    if (slot->num_res <= 0) {
+        slot->num_res = 0;
+        return fmt_error_response(500, "database result missing", out, cap);
+    }
+
+    if (slot->route_id == ROUTE_TAGS) {
+        var res: *void = slot->res[0];
+        if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
+            PQclear(res);
+            return fmt_error_response(500, "database error", out, cap);
+        }
+        var tags_json: *char = PQgetvalue(res, 0, 0);
+        var bw: BufWriter = uninit;
+        bw.buf = ((out as i64) + 128 as i64) as *char;
+        bw.len = 0;
+        bw.cap = cap - 128;
+        buf_append_str(&bw, "{\"tags\":");
+        buf_append_str(&bw, tags_json);
+        buf_append_char(&bw, 125);
+        PQclear(res);
+        return finish_json_response(slot, 200, bw.len, out);
+    }
+
+    if (slot->route_id == ROUTE_USER_REGISTER) {
+        var res: *void = slot->res[0];
+        if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
+            PQclear(res);
+            return fmt_error_response(422, "username or email is already taken", out, cap);
+        }
+        var new_id_str: *char = PQgetvalue(res, 0, 0);
+        var new_id: i64 = native_atoi(new_id_str) as i64;
+        var tok_buf: [u8; 256] = uninit;
+        jwt_sign(new_id, secret, slen, (&tok_buf[0]) as *char);
+
+        var bw: BufWriter = uninit;
+        bw.buf = ((out as i64) + 128 as i64) as *char;
+        bw.len = 0;
+        bw.cap = cap - 128;
+        render_user_json(&bw, (&slot->param2[0]) as *char, (&tok_buf[0]) as *char, (&slot->param1[0]) as *char, 0 as *char, 1, 0 as *char, 1);
+        PQclear(res);
+        return finish_json_response(slot, 201, bw.len, out);
+    }
+
+    if (slot->route_id == ROUTE_USER_LOGIN) {
+        var res: *void = slot->res[0];
+        if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
+            PQclear(res);
+            slot->num_res = 0;
+            return fmt_error_response(401, "invalid email or password", out, cap);
+        }
+        var db_hash: *char = PQgetvalue(res, 0, 5);
+        var hlen: int = str_len(db_hash);
+        if (hlen > 64) { hlen = 64; }
+
+        if (g_num_bcrypt > 0) {
+            var best: int = 0;
+            var min_load: int = g_bcrypt_load[0];
+            for (var bi: int = 1; bi < g_num_bcrypt; bi = bi + 1) {
+                if (g_bcrypt_load[bi] < min_load) {
+                    min_load = g_bcrypt_load[bi];
+                    best = bi;
+                }
+            }
+            g_bcrypt_load[best] = g_bcrypt_load[best] + 1;
+            var bfd: int = g_bcrypt_fds[best];
+
+            var job: BcryptJob = uninit;
+            job.slot_idx = (best << 28) | (slot_idx & 0x0FFFFFFF);
+            job.pw_len = slot->p2_len;
+            if (job.pw_len > 72) { job.pw_len = 72; }
+            job.hash_len = hlen;
+            native_memcpy((&job.pw[0]) as *char, (&slot->param2[0]) as *char, job.pw_len as i64);
+            native_memcpy((&job.hash[0]) as *char, db_hash, hlen as i64);
+
+            sys_write(bfd, (&job) as *void, sizeof(BcryptJob) as i64);
+            slot->state = STATE_WAIT_BCRYPT;
+            return -3; // Pending async bcrypt
+        }
+
+        if (bcrypt_verify((&slot->param2[0]) as *char, slot->p2_len, db_hash, hlen) == 0) {
+            PQclear(res);
+            slot->num_res = 0;
+            return fmt_error_response(401, "invalid email or password", out, cap);
+        }
+        return route_login_finish(slot, 1, secret, slen, out, cap);
+    }
+
+    if (slot->route_id == ROUTE_USER_CURRENT) {
+        var res: *void = slot->res[0];
+        if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
+            PQclear(res);
+            return fmt_error_response(401, "user not found", out, cap);
+        }
+        var username: *char = PQgetvalue(res, 0, 1);
+        var email: *char = PQgetvalue(res, 0, 2);
+        var bio: *char = PQgetvalue(res, 0, 3);
+        var bio_null: int = PQgetisnull(res, 0, 3);
+        var image: *char = PQgetvalue(res, 0, 4);
+        var image_null: int = PQgetisnull(res, 0, 4);
+
+        var bw: BufWriter = uninit;
+        bw.buf = ((out as i64) + 128 as i64) as *char;
+        bw.len = 0;
+        bw.cap = cap - 128;
+        render_user_json(&bw, email, (&slot->param1[0]) as *char, username, bio, bio_null, image, image_null);
+        PQclear(res);
+        return finish_json_response(slot, 200, bw.len, out);
+    }
+
+    if (slot->route_id == ROUTE_USER_UPDATE) {
+        var res: *void = slot->res[0];
+        if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
+            PQclear(res);
+            return fmt_error_response(422, "username or email already taken", out, cap);
+        }
+        var username: *char = PQgetvalue(res, 0, 1);
+        var email: *char = PQgetvalue(res, 0, 2);
+        var bio: *char = PQgetvalue(res, 0, 3);
+        var bio_null: int = PQgetisnull(res, 0, 3);
+        var image: *char = PQgetvalue(res, 0, 4);
+        var image_null: int = PQgetisnull(res, 0, 4);
+
+        var bw: BufWriter = uninit;
+        bw.buf = ((out as i64) + 128 as i64) as *char;
+        bw.len = 0;
+        bw.cap = cap - 128;
+        render_user_json(&bw, email, (&slot->param1[0]) as *char, username, bio, bio_null, image, image_null);
+        PQclear(res);
+        return finish_json_response(slot, 200, bw.len, out);
+    }
+
+    if (slot->route_id == ROUTE_PROFILE) {
+        var res: *void = slot->res[0];
+        if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
+            PQclear(res);
+            return fmt_error_response(404, "profile not found", out, cap);
+        }
+        var username: *char = PQgetvalue(res, 0, 1);
+        var bio: *char = PQgetvalue(res, 0, 2);
+        var bio_null: int = PQgetisnull(res, 0, 2);
+        var image: *char = PQgetvalue(res, 0, 3);
+        var image_null: int = PQgetisnull(res, 0, 3);
+        var fol_str: *char = PQgetvalue(res, 0, 4);
+        var fol: int = 0;
+        if (*(((fol_str as i64)) as *u8) == 116 as u8) { fol = 1; }
+
+        var bw: BufWriter = uninit;
+        bw.buf = ((out as i64) + 128 as i64) as *char;
+        bw.len = 0;
+        bw.cap = cap - 128;
+        render_profile_json(&bw, username, bio, bio_null, image, image_null, fol);
+        PQclear(res);
+        return finish_json_response(slot, 200, bw.len, out);
+    }
+
+    if (slot->route_id == ROUTE_PROFILE_FOLLOW) {
+        if (slot->step == 1) {
+            var res_u: *void = slot->res[0];
+            if (PQresultStatus(res_u) != PGRES_TUPLES_OK || PQntuples(res_u) == 0) {
+                PQclear(res_u);
+                return fmt_error_response(404, "profile not found", out, cap);
+            }
+            var tid_str: *char = PQgetvalue(res_u, 0, 0);
+            var tid_len: int = native_strlen(tid_str) as int;
+            native_memcpy((&slot->param2[0]) as *char, tid_str, tid_len as i64);
+            slot->param2[tid_len] = 0 as u8;
+            PQclear(res_u);
+            slot->num_res = 0;
+
+            var p_fol: [*char; 2] = [v_str, (&slot->param2[0]) as *char];
+            var wconn: *PgConn = pg_get_write_conn_force();
+            if (slot->sub_id == 2) {
+                PQsendQueryPrepared(wconn->c, "s_follow", 2, &p_fol[0], 0 as *int, 0 as *int, 0);
+            } else {
+                PQsendQueryPrepared(wconn->c, "s_unfollow", 2, &p_fol[0], 0 as *int, 0 as *int, 0);
+            }
+            var p_prof: [*char; 2] = [v_str, (&slot->param1[0]) as *char];
+            PQsendQueryPrepared(wconn->c, "s_profile", 2, &p_prof[0], 0 as *int, 0 as *int, 0);
+            PQsendPipelineSync(wconn->c);
+            pg_enqueue_slot(wconn, slot_idx);
+            slot->step = 2;
+            return -1; // Wait for step 2
+        } else if (slot->step == 2) {
+            if (slot->num_res < 2) {
+                for (var ri: int = 0; ri < slot->num_res; ri = ri + 1) { PQclear(slot->res[ri]); slot->res[ri] = 0 as *void; }
+                slot->num_res = 0;
+                return fmt_error_response(500, "database write failed", out, cap);
+            }
+            var res_f: *void = slot->res[0];
+            var res: *void = slot->res[1];
+            slot->res[0] = 0 as *void;
+            slot->res[1] = 0 as *void;
+            if (res_ok_command(res_f) == 0 || res_ok_tuples(res) == 0 || PQntuples(res) == 0) {
+                PQclear(res_f);
+                PQclear(res);
+                slot->num_res = 0;
+                return fmt_error_response(500, "database write failed", out, cap);
+            }
+            var username: *char = PQgetvalue(res, 0, 1);
+            var bio: *char = PQgetvalue(res, 0, 2);
+            var bio_null: int = PQgetisnull(res, 0, 2);
+            var image: *char = PQgetvalue(res, 0, 3);
+            var image_null: int = PQgetisnull(res, 0, 3);
+            var fol: int = 0;
+            if (slot->sub_id == 2) { fol = 1; }
+
+            var bw: BufWriter = uninit;
+            bw.buf = ((out as i64) + 128 as i64) as *char;
+            bw.len = 0;
+            bw.cap = cap - 128;
+            render_profile_json(&bw, username, bio, bio_null, image, image_null, fol);
+            PQclear(res_f);
+            PQclear(res);
+            slot->num_res = 0;
+            return finish_json_response(slot, 200, bw.len, out);
+        }
+    }
+
+    if (slot->route_id == ROUTE_ARTICLES_LIST || slot->route_id == ROUTE_ARTICLES_FEED) {
+        var res: *void = slot->res[0];
+        if (res_ok_tuples(res) == 0 || PQntuples(res) <= 0) {
+            PQclear(res);
+            slot->num_res = 0;
+            return fmt_error_response(500, "database error", out, cap);
+        }
+        var count_str: *char = PQgetvalue(res, 0, 0);
+        var has_articles: int = 0;
+        var n: int = PQntuples(res);
+        if (PQgetisnull(res, 0, 1) == 0) {
+            has_articles = 1;
+        }
+
+        var bw: BufWriter = uninit;
+        bw.buf = ((out as i64) + 128 as i64) as *char;
+        bw.len = 0;
+        bw.cap = cap - 128;
+        buf_append_str(&bw, "{\"articles\":[");
+        if (has_articles != 0) {
+            for (var i: int = 0; i < n; i = i + 1) {
+                if (i > 0) { buf_append_char(&bw, 44); } // ','
+                render_article_object(&bw, res, i, 0);
+            }
+        }
+        buf_append_str(&bw, "],\"articlesCount\":");
+        buf_append_str(&bw, count_str);
+        buf_append_char(&bw, 125);
+        PQclear(res);
+        return finish_json_response(slot, 200, bw.len, out);
+    }
+
+    if (slot->route_id == ROUTE_ARTICLE_GET) {
+        var res_art: *void = slot->res[0];
+        if (PQresultStatus(res_art) != PGRES_TUPLES_OK || PQntuples(res_art) == 0) {
+            PQclear(res_art);
+            return fmt_error_response(404, "article not found", out, cap);
+        }
+        var bw: BufWriter = uninit;
+        bw.buf = ((out as i64) + 128 as i64) as *char;
+        bw.len = 0;
+        bw.cap = cap - 128;
+        buf_append_str(&bw, "{\"article\":");
+        render_article_object(&bw, res_art, 0, 1);
+        buf_append_char(&bw, 125);
+        PQclear(res_art);
+        return finish_json_response(slot, 200, bw.len, out);
+    }
+
+    if (slot->route_id == ROUTE_ARTICLE_FAVORITE) {
+        if (slot->step == 1) {
+            var res_own: *void = slot->res[0];
+            if (PQresultStatus(res_own) != PGRES_TUPLES_OK || PQntuples(res_own) == 0) {
+                PQclear(res_own);
+                return fmt_error_response(404, "article not found", out, cap);
+            }
+            var aid_str: *char = PQgetvalue(res_own, 0, 0);
+            var aid_len: int = native_strlen(aid_str) as int;
+            native_memcpy((&slot->param2[0]) as *char, aid_str, aid_len as i64);
+            slot->param2[aid_len] = 0 as u8;
+            PQclear(res_own);
+            slot->num_res = 0;
+
+            var p_fav: [*char; 2] = [v_str, (&slot->param2[0]) as *char];
+            var wconn: *PgConn = pg_get_write_conn_force();
+            if (slot->sub_id == 2) {
+                PQsendQueryPrepared(wconn->c, "s_favorite", 2, &p_fav[0], 0 as *int, 0 as *int, 0);
+            } else {
+                PQsendQueryPrepared(wconn->c, "s_unfavorite", 2, &p_fav[0], 0 as *int, 0 as *int, 0);
+            }
+            var p_art: [*char; 2] = [v_str, (&slot->param2[0]) as *char];
+            PQsendQueryPrepared(wconn->c, "s_article_by_id", 2, &p_art[0], 0 as *int, 0 as *int, 0);
+            PQsendPipelineSync(wconn->c);
+            pg_enqueue_slot(wconn, slot_idx);
+            slot->step = 2;
+            return -1;
+        } else if (slot->step == 2) {
+            if (slot->num_res < 2) {
+                for (var ri: int = 0; ri < slot->num_res; ri = ri + 1) { PQclear(slot->res[ri]); slot->res[ri] = 0 as *void; }
+                slot->num_res = 0;
+                return fmt_error_response(500, "database write failed", out, cap);
+            }
+            var res_f: *void = slot->res[0];
+            var res_art: *void = slot->res[1];
+            slot->res[0] = 0 as *void;
+            slot->res[1] = 0 as *void;
+            if (res_ok_command(res_f) == 0 || res_ok_tuples(res_art) == 0 || PQntuples(res_art) == 0) {
+                PQclear(res_f);
+                PQclear(res_art);
+                slot->num_res = 0;
+                return fmt_error_response(500, "database write failed", out, cap);
+            }
+            var bw: BufWriter = uninit;
+            bw.buf = ((out as i64) + 128 as i64) as *char;
+            bw.len = 0;
+            bw.cap = cap - 128;
+            buf_append_str(&bw, "{\"article\":");
+            render_article_object(&bw, res_art, 0, 1);
+            buf_append_char(&bw, 125);
+            PQclear(res_f);
+            PQclear(res_art);
+            slot->num_res = 0;
+            return finish_json_response(slot, 200, bw.len, out);
+        }
+    }
+
+    if (slot->route_id == ROUTE_COMMENTS_GET) {
+        var res_c: *void = slot->res[0];
+        if (PQresultStatus(res_c) != PGRES_TUPLES_OK || PQntuples(res_c) == 0) {
+            PQclear(res_c);
+            return fmt_error_response(404, "article not found", out, cap);
+        }
+        var bw: BufWriter = uninit;
+        bw.buf = ((out as i64) + 128 as i64) as *char;
+        bw.len = 0;
+        bw.cap = cap - 128;
+        buf_append_str(&bw, "{\"comments\":[");
+        if (PQgetisnull(res_c, 0, 0) == 0) {
+            var n: int = PQntuples(res_c);
+            for (var i: int = 0; i < n; i = i + 1) {
+                if (i > 0) { buf_append_char(&bw, 44); } // ','
+                render_comment_object(&bw, res_c, i, 1);
+            }
+        }
+        buf_append_str(&bw, "]}");
+        PQclear(res_c);
+        return finish_json_response(slot, 200, bw.len, out);
+    }
+
+    if (slot->route_id == ROUTE_COMMENTS_CREATE) {
+        var res_ins: *void = slot->res[0];
+        if (PQresultStatus(res_ins) != PGRES_TUPLES_OK || PQntuples(res_ins) == 0) {
+            PQclear(res_ins);
+            return fmt_error_response(404, "article not found", out, cap);
+        }
+        var bw: BufWriter = uninit;
+        bw.buf = ((out as i64) + 128 as i64) as *char;
+        bw.len = 0;
+        bw.cap = cap - 128;
+        buf_append_str(&bw, "{\"comment\":");
+        render_comment_object(&bw, res_ins, 0, 0);
+        buf_append_char(&bw, 125);
+        PQclear(res_ins);
+        return finish_json_response(slot, 201, bw.len, out);
+    }
+
+    if (slot->route_id == ROUTE_COMMENTS_DELETE) {
+        if (slot->step == 1) {
+            var res_own: *void = slot->res[0];
+            if (PQresultStatus(res_own) != PGRES_TUPLES_OK || PQntuples(res_own) == 0) {
+                PQclear(res_own);
+                return fmt_error_response(404, "comment not found", out, cap);
+            }
+            var author_id_str: *char = PQgetvalue(res_own, 0, 0);
+            var author_id: i64 = native_atoi(author_id_str) as i64;
+            PQclear(res_own);
+            if (author_id != slot->viewer_id) {
+                return fmt_error_response(403, "forbidden", out, cap);
+            }
+            slot->num_res = 0;
+            var p_del: [*char; 1] = [(&slot->param2[0]) as *char];
+            var wconn: *PgConn = pg_get_write_conn_force();
+            PQsendQueryPrepared(wconn->c, "s_comment_delete", 1, &p_del[0], 0 as *int, 0 as *int, 0);
+            PQsendPipelineSync(wconn->c);
+            pg_enqueue_slot(wconn, slot_idx);
+            slot->step = 2;
+            return -1;
+        } else if (slot->step == 2) {
+            var res_del: *void = slot->res[0];
+            if (res_ok_command(res_del) == 0) {
+                PQclear(res_del);
+                slot->num_res = 0;
+                return fmt_error_response(500, "database delete failed", out, cap);
+            }
+            PQclear(res_del);
+            slot->num_res = 0;
+            return fmt_204_response(out, cap);
+        }
+    }
+
+    if (slot->route_id == ROUTE_ARTICLE_CREATE) {
+        if (slot->step == 1) {
+            var res_ins: *void = slot->res[0];
+            if (PQresultStatus(res_ins) != PGRES_TUPLES_OK || PQntuples(res_ins) == 0) {
+                PQclear(res_ins);
+                return fmt_error_response(500, "database insert failed", out, cap);
+            }
+            var new_aid_str: *char = PQgetvalue(res_ins, 0, 0);
+            var aid_len: int = native_strlen(new_aid_str) as int;
+            native_memcpy((&slot->param2[0]) as *char, new_aid_str, aid_len as i64);
+            slot->param2[aid_len] = 0 as u8;
+            PQclear(res_ins);
+            slot->res[0] = 0 as *void;
+            slot->num_res = 0;
+
+            var wconn: *PgConn = pg_get_write_conn_force();
+            if (wconn as i64 == 0 as i64) {
+                return fmt_error_response(500, "no database connection", out, cap);
+            }
+            var p_art: [*char; 2] = [v_str, (&slot->param2[0]) as *char];
+            PQsendQueryPrepared(wconn->c, "s_article_by_id", 2, &p_art[0], 0 as *int, 0 as *int, 0);
+            PQsendPipelineSync(wconn->c);
+            pg_enqueue_slot(wconn, slot_idx);
+            slot->step = 2;
+            return -1;
+        } else if (slot->step == 2) {
+            var res_art: *void = slot->res[0];
+            if (res_ok_tuples(res_art) == 0 || PQntuples(res_art) == 0) {
+                PQclear(res_art);
+                slot->num_res = 0;
+                return fmt_error_response(500, "article readback failed", out, cap);
+            }
+            var bw: BufWriter = uninit;
+            bw.buf = ((out as i64) + 128 as i64) as *char;
+            bw.len = 0;
+            bw.cap = cap - 128;
+            buf_append_str(&bw, "{\"article\":");
+            render_article_object(&bw, res_art, 0, 1);
+            buf_append_char(&bw, 125);
+            PQclear(res_art);
+            slot->num_res = 0;
+            return finish_json_response(slot, 201, bw.len, out);
+        }
+    }
+
+    if (slot->route_id == ROUTE_ARTICLE_UPDATE) {
+        if (slot->step == 1) {
+            var res_own: *void = slot->res[0];
+            if (PQresultStatus(res_own) != PGRES_TUPLES_OK || PQntuples(res_own) == 0) {
+                PQclear(res_own);
+                return fmt_error_response(404, "article not found", out, cap);
+            }
+            var aid_str: *char = PQgetvalue(res_own, 0, 0);
+            var author_id_str: *char = PQgetvalue(res_own, 0, 1);
+            var author_id: i64 = native_atoi(author_id_str) as i64;
+            var aid_len: int = native_strlen(aid_str) as int;
+            native_memcpy((&slot->param2[0]) as *char, aid_str, aid_len as i64);
+            slot->param2[aid_len] = 0 as u8;
+            PQclear(res_own);
+            slot->num_res = 0;
+
+            if (author_id != slot->viewer_id) {
+                return fmt_error_response(403, "forbidden", out, cap);
+            }
+
+            // Locate JSON body from saved offset and length
+            var b_ptr: *char = ((((&slot->read_buf[0]) as *char as i64) + (slot->sub_id as i64))) as *char;
+            var b_len: int = slot->p2_len;
+
+            var u_title: *char = 0 as *char;
+            var u_tlen: int = 0;
+            var has_title: int = json_find_str(b_ptr, b_len, "title", 5, &u_title, &u_tlen);
+            var u_desc: *char = 0 as *char;
+            var u_dlen: int = 0;
+            var has_desc: int = json_find_str(b_ptr, b_len, "description", 11, &u_desc, &u_dlen);
+            var u_body: *char = 0 as *char;
+            var u_blen: int = 0;
+            var has_body: int = json_find_str(b_ptr, b_len, "body", 4, &u_body, &u_blen);
+
+            var t_buf: [u8; 512] = uninit;
+            var d_buf: [u8; 1024] = uninit;
+            var p_title: *char = 0 as *char;
+            if (has_title == 1) {
+                if (u_tlen == 0 || u_tlen >= 512 || json_unescape(u_title, u_tlen, (&t_buf[0]) as *char, 512) < 0) {
+                    return fmt_error_response(422, "title too long", out, cap);
+                }
+                p_title = (&t_buf[0]) as *char;
+            }
+            var p_desc: *char = 0 as *char;
+            if (has_desc == 1) {
+                if (u_dlen >= 1024 || json_unescape(u_desc, u_dlen, (&d_buf[0]) as *char, 1024) < 0) {
+                    return fmt_error_response(422, "description too long", out, cap);
+                }
+                p_desc = (&d_buf[0]) as *char;
+            }
+            var p_b: *char = 0 as *char;
+            if (has_body == 1) {
+                var b_scratch: *char = get_scratch();
+                if (u_blen >= 262144 || json_unescape(u_body, u_blen, b_scratch, 262144) < 0) {
+                    return fmt_error_response(422, "body too long", out, cap);
+                }
+                p_b = b_scratch;
+            }
+
+            var p_upd: [*char; 4] = [(&slot->param2[0]) as *char, p_title, p_desc, p_b];
+            var wconn: *PgConn = pg_get_write_conn_force();
+            PQsendQueryPrepared(wconn->c, "s_article_update", 4, &p_upd[0], 0 as *int, 0 as *int, 0);
+            var p_art: [*char; 2] = [v_str, (&slot->param2[0]) as *char];
+            PQsendQueryPrepared(wconn->c, "s_article_by_id", 2, &p_art[0], 0 as *int, 0 as *int, 0);
+            PQsendPipelineSync(wconn->c);
+            pg_enqueue_slot(wconn, slot_idx);
+            slot->step = 2;
+            return -1;
+        } else if (slot->step == 2) {
+            if (slot->num_res < 2) {
+                for (var ri: int = 0; ri < slot->num_res; ri = ri + 1) { PQclear(slot->res[ri]); slot->res[ri] = 0 as *void; }
+                slot->num_res = 0;
+                return fmt_error_response(500, "database update failed", out, cap);
+            }
+            var res_upd: *void = slot->res[0];
+            var res_art: *void = slot->res[1];
+            slot->res[0] = 0 as *void;
+            slot->res[1] = 0 as *void;
+            if (res_ok_tuples(res_upd) == 0 || PQntuples(res_upd) == 0 ||
+                res_ok_tuples(res_art) == 0 || PQntuples(res_art) == 0) {
+                PQclear(res_upd);
+                PQclear(res_art);
+                slot->num_res = 0;
+                return fmt_error_response(500, "database update failed", out, cap);
+            }
+            var bw: BufWriter = uninit;
+            bw.buf = ((out as i64) + 128 as i64) as *char;
+            bw.len = 0;
+            bw.cap = cap - 128;
+            buf_append_str(&bw, "{\"article\":");
+            render_article_object(&bw, res_art, 0, 1);
+            buf_append_char(&bw, 125);
+            PQclear(res_upd);
+            PQclear(res_art);
+            slot->num_res = 0;
+            return finish_json_response(slot, 200, bw.len, out);
+        }
+    }
+
+    if (slot->route_id == ROUTE_ARTICLE_DELETE) {
+        if (slot->step == 1) {
+            var res_own: *void = slot->res[0];
+            if (PQresultStatus(res_own) != PGRES_TUPLES_OK || PQntuples(res_own) == 0) {
+                PQclear(res_own);
+                return fmt_error_response(404, "article not found", out, cap);
+            }
+            var aid_str: *char = PQgetvalue(res_own, 0, 0);
+            var author_id_str: *char = PQgetvalue(res_own, 0, 1);
+            var author_id: i64 = native_atoi(author_id_str) as i64;
+            var aid_len: int = native_strlen(aid_str) as int;
+            native_memcpy((&slot->param2[0]) as *char, aid_str, aid_len as i64);
+            slot->param2[aid_len] = 0 as u8;
+            PQclear(res_own);
+            slot->num_res = 0;
+
+            if (author_id != slot->viewer_id) {
+                return fmt_error_response(403, "forbidden", out, cap);
+            }
+
+            var p_del: [*char; 1] = [(&slot->param2[0]) as *char];
+            var wconn: *PgConn = pg_get_write_conn_force();
+            PQsendQueryPrepared(wconn->c, "s_article_delete", 1, &p_del[0], 0 as *int, 0 as *int, 0);
+            PQsendPipelineSync(wconn->c);
+            pg_enqueue_slot(wconn, slot_idx);
+            slot->step = 2;
+            return -1;
+        } else if (slot->step == 2) {
+            var res_del: *void = slot->res[0];
+            if (res_ok_command(res_del) == 0) {
+                PQclear(res_del);
+                slot->num_res = 0;
+                return fmt_error_response(500, "database delete failed", out, cap);
+            }
+            PQclear(res_del);
+            slot->num_res = 0;
+            return fmt_204_response(out, cap);
+        }
+    }
+
+    return fmt_error_response(404, "not found", out, cap);
+}

@@ -1,0 +1,373 @@
+// sys.cid — 100% Freestanding Linux x86-64 syscalls and native memory/string routines
+// Zero libc dependencies. Invokes Linux kernel syscalls directly via inline assembly.
+
+struct SyscallArgs {
+    var nr: i64;
+    var a1: i64;
+    var a2: i64;
+    var a3: i64;
+    var a4: i64;
+    var a5: i64;
+    var a6: i64;
+}
+
+func sys_call(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) -> i64 {
+    var args: SyscallArgs = uninit;
+    args.nr = nr;
+    args.a1 = a1;
+    args.a2 = a2;
+    args.a3 = a3;
+    args.a4 = a4;
+    args.a5 = a5;
+    args.a6 = a6;
+    var p: *SyscallArgs = &args;
+    var ret: i64 = 0;
+    asm {
+        "mov r11, {p}"
+        "mov rax, qword ptr [r11 + 0]"
+        "mov rdi, qword ptr [r11 + 8]"
+        "mov rsi, qword ptr [r11 + 16]"
+        "mov rdx, qword ptr [r11 + 24]"
+        "mov r10, qword ptr [r11 + 32]"
+        "mov r8,  qword ptr [r11 + 40]"
+        "mov r9,  qword ptr [r11 + 48]"
+        "syscall"
+        "mov {ret:q}, rax"
+    }
+    return ret;
+}
+
+// ---- Standard Linux Syscalls ----
+
+func sys_read(fd: int, buf: *void, count: i64) -> i64 {
+    return sys_call(0, fd as i64, buf as i64, count, 0, 0, 0);
+}
+
+func sys_write(fd: int, buf: *void, count: i64) -> i64 {
+    return sys_call(1, fd as i64, buf as i64, count, 0, 0, 0);
+}
+
+func sys_close(fd: int) -> int {
+    return sys_call(3, fd as i64, 0, 0, 0, 0, 0) as int;
+}
+
+func sys_mmap(addr: *void, len: i64, prot: int, flags: int, fd: int, off: i64) -> *void {
+    return sys_call(9, addr as i64, len, prot as i64, flags as i64, fd as i64, off) as *void;
+}
+
+func sys_munmap(addr: *void, len: i64) -> int {
+    return sys_call(11, addr as i64, len, 0, 0, 0, 0) as int;
+}
+
+func sys_socket(domain: int, type_: int, proto: int) -> int {
+    return sys_call(41, domain as i64, type_ as i64, proto as i64, 0, 0, 0) as int;
+}
+
+func sys_socketpair(domain: int, type_: int, proto: int, sv: *int) -> int {
+    return sys_call(53, domain as i64, type_ as i64, proto as i64, sv as i64, 0, 0) as int;
+}
+
+func sys_connect(fd: int, addr: *void, addrlen: u32) -> int {
+    return sys_call(42, fd as i64, addr as i64, addrlen as i64, 0, 0, 0) as int;
+}
+
+func sys_bind(fd: int, addr: *void, addrlen: u32) -> int {
+    return sys_call(49, fd as i64, addr as i64, addrlen as i64, 0, 0, 0) as int;
+}
+
+func sys_listen(fd: int, backlog: int) -> int {
+    return sys_call(50, fd as i64, backlog as i64, 0, 0, 0, 0) as int;
+}
+
+func sys_setsockopt(fd: int, level: int, optname: int, optval: *void, optlen: u32) -> int {
+    return sys_call(54, fd as i64, level as i64, optname as i64, optval as i64, optlen as i64, 0) as int;
+}
+
+func sys_fork() -> int {
+    return sys_call(57, 0, 0, 0, 0, 0, 0) as int;
+}
+
+func sys_exit(code: int) -> void {
+    sys_call(60, code as i64, 0, 0, 0, 0, 0);
+}
+
+func sys_sched_setaffinity(pid: int, cpusetsize: i64, mask: *void) -> int {
+    return sys_call(203, pid as i64, cpusetsize, mask as i64, 0, 0, 0) as int;
+}
+
+func sys_sched_getaffinity(pid: int, cpusetsize: i64, mask: *void) -> int {
+    return sys_call(204, pid as i64, cpusetsize, mask as i64, 0, 0, 0) as int;
+}
+
+func sys_clock_gettime(clock_id: int, tp: *void) -> int {
+    return sys_call(228, clock_id as i64, tp as i64, 0, 0, 0, 0) as int;
+}
+
+func sys_nanosleep(req: *void, rem: *void) -> int {
+    return sys_call(35, req as i64, rem as i64, 0, 0, 0, 0) as int;
+}
+
+struct Rlimit64 {
+    var rlim_cur: u64;
+    var rlim_max: u64;
+}
+
+func sys_prlimit64(pid: int, resource: int, new_limit: *void, old_limit: *void) -> int {
+    return sys_call(302, pid as i64, resource as i64, new_limit as i64, old_limit as i64, 0, 0) as int;
+}
+
+func sys_accept4(fd: int, addr: *void, addrlen: *void, flags: int) -> int {
+    return sys_call(288, fd as i64, addr as i64, addrlen as i64, flags as i64, 0, 0) as int;
+}
+
+func sys_io_uring_setup(entries: u32, p: *void) -> int {
+    return sys_call(425, entries as i64, p as i64, 0, 0, 0, 0) as int;
+}
+
+func sys_io_uring_enter(fd: int, to_submit: u32, min_complete: u32, flags: u32, sig: *void, sigsz: i64) -> int {
+    return sys_call(426, fd as i64, to_submit as i64, min_complete as i64, flags as i64, sig as i64, sigsz) as int;
+}
+
+func sys_io_uring_register(fd: int, opcode: u32, arg: *void, nr_args: u32) -> int {
+    return sys_call(427, fd as i64, opcode as i64, arg as i64, nr_args as i64, 0, 0) as int;
+}
+
+func sys_ioctl_fionread(fd: int) -> int {
+    var n: u32 = 0 as u32;
+    var ret: i64 = sys_call(16, fd as i64, 0x541B, (&n) as i64, 0, 0, 0);
+    if (ret < 0) { return 0; }
+    return n as int;
+}
+
+func sys_getrandom(buf: *void, len: i64, flags: u32) -> i64 {
+    return sys_call(318, buf as i64, len, flags as i64, 0, 0, 0);
+}
+
+// ---- Native Memory Operations (No Libc) ----
+
+func native_memcpy(dst: *char, src: *char, n: i64) -> *char {
+    var d: i64 = dst as i64;
+    var s: i64 = src as i64;
+    var i: i64 = 0;
+    // Copy 8-byte chunks
+    while (i + 8 <= n) {
+        *(((d + i) as *u64)) = *(((s + i) as *u64));
+        i = i + 8;
+    }
+    // Copy trailing bytes
+    while (i < n) {
+        *(((d + i) as *u8)) = *(((s + i) as *u8));
+        i = i + 1;
+    }
+    return dst;
+}
+
+func native_memset(dst: *char, val: int, n: i64) -> *char {
+    var d: i64 = dst as i64;
+    var b: u8 = val as u8;
+    var w: u64 = b as u64;
+    w = w | (w << 8);
+    w = w | (w << 16);
+    w = w | (w << 32);
+    var i: i64 = 0;
+    while (i + 8 <= n) {
+        *(((d + i) as *u64)) = w;
+        i = i + 8;
+    }
+    while (i < n) {
+        *(((d + i) as *u8)) = b;
+        i = i + 1;
+    }
+    return dst;
+}
+
+func native_memcmp(s1: *char, s2: *char, n: i64) -> int {
+    var p1: i64 = s1 as i64;
+    var p2: i64 = s2 as i64;
+    for (var i: i64 = 0; i < n; i = i + 1) {
+        var b1: u8 = *(((p1 + i) as *u8));
+        var b2: u8 = *(((p2 + i) as *u8));
+        if (b1 != b2) {
+            return (b1 as int) - (b2 as int);
+        }
+    }
+    return 0;
+}
+
+func native_memmove(dst: *char, src: *char, n: i64) -> *char {
+    var d: i64 = dst as i64;
+    var s: i64 = src as i64;
+    if (d == s || n == 0) { return dst; }
+    if (d < s) {
+        return native_memcpy(dst, src, n);
+    }
+    // Backward copy for overlapping regions
+    var i: i64 = n;
+    while (i > 0) {
+        i = i - 1;
+        *(((d + i) as *u8)) = *(((s + i) as *u8));
+    }
+    return dst;
+}
+
+// ---- Native String Routines (No Libc) ----
+
+func native_strlen(s: *char) -> i64 {
+    var p: i64 = s as i64;
+    var len: i64 = 0;
+    while (*(((p + len) as *u8)) != (0 as u8)) {
+        len = len + 1;
+    }
+    return len;
+}
+
+func native_strcmp(s1: *char, s2: *char) -> int {
+    var p1: i64 = s1 as i64;
+    var p2: i64 = s2 as i64;
+    var i: i64 = 0;
+    for (;;) {
+        var b1: u8 = *(((p1 + i) as *u8));
+        var b2: u8 = *(((p2 + i) as *u8));
+        if (b1 != b2) {
+            return (b1 as int) - (b2 as int);
+        }
+        if (b1 == (0 as u8)) { break; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+func native_strncmp(s1: *char, s2: *char, n: i64) -> int {
+    if (s1 as i64 == 0 as i64 || s2 as i64 == 0 as i64) {
+        if (s1 as i64 == s2 as i64) { return 0; }
+        return -1;
+    }
+    var p1: i64 = s1 as i64;
+    var p2: i64 = s2 as i64;
+    for (var i: i64 = 0; i < n; i = i + 1) {
+        var b1: u8 = *(((p1 + i) as *u8));
+        var b2: u8 = *(((p2 + i) as *u8));
+        if (b1 != b2) {
+            return (b1 as int) - (b2 as int);
+        }
+        if (b1 == (0 as u8)) { break; }
+    }
+    return 0;
+}
+
+// ---- Network Byte Order ----
+
+func native_htons(v: u16) -> u16 {
+    var vi: int = v as int;
+    var lo: int = (vi >> 8) & 0x00FF;
+    var hi: int = (vi << 8) & 0xFF00;
+    return (lo | hi) as u16;
+}
+
+func native_ntohs(v: u16) -> u16 {
+    return native_htons(v);
+}
+
+func native_htonl(v: u32) -> u32 {
+    var vi: i64 = v as i64;
+    var b0: i64 = (vi >> 24) & (0x000000FF as i64);
+    var b1: i64 = (vi >> 8)  & (0x0000FF00 as i64);
+    var b2: i64 = (vi << 8)  & (0x00FF0000 as i64);
+    var b3: i64 = (vi << 24) & (0xFF000000 as i64);
+    return (b0 | b1 | b2 | b3) as u32;
+}
+
+func native_ntohl(v: u32) -> u32 {
+    return native_htonl(v);
+}
+
+// ---- Native IP & Number Parsers ----
+
+func native_inet_pton(str: *char, out_addr: *void) -> int {
+    var p: i64 = str as i64;
+    var octets: [u8; 4] = uninit;
+    var octet_idx: int = 0;
+    var cur: int = 0;
+    var has_digits: int = 0;
+
+    for (var i: i64 = 0;; i = i + 1) {
+        var c: u8 = *(((p + i) as *u8));
+        if (c >= (48 as u8) && c <= (57 as u8)) {
+            cur = cur * 10 + ((c - 48 as u8) as int);
+            if (cur > 255) { return 0; }
+            has_digits = 1;
+        } else if (c == (46 as u8) || c == (0 as u8)) {
+            if (has_digits == 0 || octet_idx >= 4) { return 0; }
+            octets[octet_idx] = cur as u8;
+            octet_idx = octet_idx + 1;
+            cur = 0;
+            has_digits = 0;
+            if (c == (0 as u8)) { break; }
+        } else {
+            return 0;
+        }
+    }
+    if (octet_idx != 4) { return 0; }
+
+    var dst: i64 = out_addr as i64;
+    for (var j: int = 0; j < 4; j = j + 1) {
+        *(((dst + (j as i64)) as *u8)) = octets[j];
+    }
+    return 1;
+}
+
+func native_itoa(val: i64, buf: *char) -> int {
+    var b: i64 = buf as i64;
+    if (val == 0) {
+        *(((b + 0) as *u8)) = 48 as u8; // '0'
+        *(((b + 1) as *u8)) = 0 as u8;
+        return 1;
+    }
+    var v: i64 = val;
+    var neg: int = 0;
+    if (v < 0) {
+        neg = 1;
+        v = 0 - v;
+    }
+    var tmp: [u8; 32] = uninit;
+    var len: int = 0;
+    while (v > 0) {
+        tmp[len] = ((v % 10) + 48) as u8;
+        v = v / 10;
+        len = len + 1;
+    }
+    var out_idx: int = 0;
+    if (neg != 0) {
+        *(((b + (out_idx as i64)) as *u8)) = 45 as u8; // '-'
+        out_idx = out_idx + 1;
+    }
+    while (len > 0) {
+        len = len - 1;
+        *(((b + (out_idx as i64)) as *u8)) = tmp[len];
+        out_idx = out_idx + 1;
+    }
+    *(((b + (out_idx as i64)) as *u8)) = 0 as u8;
+    return out_idx;
+}
+
+func native_atoi(str: *char) -> int {
+    var p: i64 = str as i64;
+    var res: int = 0;
+    var neg: int = 0;
+    var i: i64 = 0;
+    if (*(((p + 0) as *u8)) == (45 as u8)) {
+        neg = 1;
+        i = 1;
+    }
+    while (*(((p + i) as *u8)) >= (48 as u8) && *(((p + i) as *u8)) <= (57 as u8)) {
+        res = res * 10 + ((*(((p + i) as *u8)) - 48 as u8) as int);
+        i = i + 1;
+    }
+    if (neg != 0) { return 0 - res; }
+    return res;
+}
+
+func native_print(s: *char) -> void {
+    var len: i64 = native_strlen(s);
+    sys_write(1, s as *void, len);
+}

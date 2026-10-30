@@ -1,0 +1,303 @@
+// json.cid — Zero-allocation JSON parser and serializer in pure Cider for RealWorld Conduit
+
+from sys import native_memcpy, native_strlen, native_memcmp, native_itoa;
+
+func hex_digit(c: u8) -> int {
+    if (c >= (48 as u8) && c <= (57 as u8)) { return (c - (48 as u8)) as int; }
+    if (c >= (97 as u8) && c <= (102 as u8)) { return (c - (97 as u8) + 10) as int; }
+    if (c >= (65 as u8) && c <= (70 as u8)) { return (c - (65 as u8) + 10) as int; }
+    return -1;
+}
+
+// In-place unescape of JSON string (handles \n, \r, \t, \b, \f, \", \\, \/, \uXXXX)
+// dst capacity includes the trailing NUL. Returns the decoded length or -1 if it does not fit.
+func json_unescape(src: *char, slen: int, dst: *char, dcap: int) -> int {
+    if (dcap <= 0 || slen < 0) { return -1; }
+    var s: i64 = src as i64;
+    var d: i64 = dst as i64;
+    var out_idx: int = 0;
+    var i: int = 0;
+    while (i < slen) {
+        var c: u8 = *(((s + (i as i64)) as *u8));
+        if (c == (92 as u8) && i + 1 < slen) { // '\'
+            var nc: u8 = *(((s + (i as i64) + 1) as *u8));
+            if (nc == (110 as u8) || nc == (114 as u8) || nc == (116 as u8) ||
+                nc == (98 as u8) || nc == (102 as u8)) { // n r t b f
+                if (out_idx + 1 >= dcap) { return -1; }
+                if (nc == (110 as u8)) { *(((d + (out_idx as i64)) as *u8)) = 10 as u8; }
+                else if (nc == (114 as u8)) { *(((d + (out_idx as i64)) as *u8)) = 13 as u8; }
+                else if (nc == (116 as u8)) { *(((d + (out_idx as i64)) as *u8)) = 9 as u8; }
+                else if (nc == (98 as u8)) { *(((d + (out_idx as i64)) as *u8)) = 8 as u8; }
+                else { *(((d + (out_idx as i64)) as *u8)) = 12 as u8; }
+                out_idx = out_idx + 1;
+                i = i + 2;
+                continue;
+            } else if (nc == (34 as u8)) { // '"'
+                if (out_idx + 1 >= dcap) { return -1; }
+                *(((d + (out_idx as i64)) as *u8)) = 34 as u8;
+                out_idx = out_idx + 1;
+                i = i + 2;
+                continue;
+            } else if (nc == (92 as u8)) { // '\'
+                if (out_idx + 1 >= dcap) { return -1; }
+                *(((d + (out_idx as i64)) as *u8)) = 92 as u8;
+                out_idx = out_idx + 1;
+                i = i + 2;
+                continue;
+            } else if (nc == (47 as u8)) { // '/'
+                if (out_idx + 1 >= dcap) { return -1; }
+                *(((d + (out_idx as i64)) as *u8)) = 47 as u8;
+                out_idx = out_idx + 1;
+                i = i + 2;
+                continue;
+            } else if (nc == (117 as u8) && i + 5 < slen) { // 'u'
+                var h1: int = hex_digit(*(((s + (i as i64) + 2)) as *u8));
+                var h2: int = hex_digit(*(((s + (i as i64) + 3)) as *u8));
+                var h3: int = hex_digit(*(((s + (i as i64) + 4)) as *u8));
+                var h4: int = hex_digit(*(((s + (i as i64) + 5)) as *u8));
+                if (h1 >= 0 && h2 >= 0 && h3 >= 0 && h4 >= 0) {
+                    var cp: int = (h1 << 12) | (h2 << 8) | (h3 << 4) | h4;
+                    if (cp < 128) {
+                        if (out_idx + 1 >= dcap) { return -1; }
+                        *(((d + (out_idx as i64)) as *u8)) = cp as u8;
+                        out_idx = out_idx + 1;
+                    } else if (cp < 2048) {
+                        if (out_idx + 2 >= dcap) { return -1; }
+                        *(((d + (out_idx as i64)) as *u8)) = (192 | (cp >> 6)) as u8;
+                        *(((d + (out_idx as i64) + 1)) as *u8) = (128 | (cp & 63)) as u8;
+                        out_idx = out_idx + 2;
+                    } else {
+                        if (out_idx + 3 >= dcap) { return -1; }
+                        *(((d + (out_idx as i64)) as *u8)) = (224 | (cp >> 12)) as u8;
+                        *(((d + (out_idx as i64) + 1)) as *u8) = (128 | ((cp >> 6) & 63)) as u8;
+                        *(((d + (out_idx as i64) + 2)) as *u8) = (128 | (cp & 63)) as u8;
+                        out_idx = out_idx + 3;
+                    }
+                    i = i + 6;
+                    continue;
+                }
+            }
+        }
+        if (out_idx + 1 >= dcap) { return -1; }
+        *(((d + (out_idx as i64)) as *u8)) = c;
+        out_idx = out_idx + 1;
+        i = i + 1;
+    }
+    *(((d + (out_idx as i64)) as *u8)) = 0 as u8;
+    return out_idx;
+}
+
+// Check if JSON has top-level wrapper object: {"key": { ... }}
+func json_has_wrapper(json: *char, len: int, key: *char, klen: int) -> int {
+    if (len <= 0 || json as i64 == 0 as i64) { return 0; }
+    var p: i64 = json as i64;
+    var idx: int = 0;
+    while (idx < len && (*(((p + (idx as i64)) as *u8)) == (32 as u8) || *(((p + (idx as i64)) as *u8)) == (9 as u8) ||
+                         *(((p + (idx as i64)) as *u8)) == (10 as u8) || *(((p + (idx as i64)) as *u8)) == (13 as u8))) {
+        idx = idx + 1;
+    }
+    if (idx >= len || *(((p + (idx as i64)) as *u8)) != (123 as u8)) { return 0; } // '{'
+    idx = idx + 1;
+
+    for (var i: int = idx; i + klen + 3 < len; i = i + 1) {
+        if (*(((p + (i as i64)) as *u8)) == (34 as u8)) {
+            if (native_memcmp((p + (i as i64) + 1) as *char, key, klen as i64) == 0 &&
+                *(((p + (i as i64) + 1 + (klen as i64)) as *u8)) == (34 as u8)) {
+                var j: int = i + 1 + klen + 1;
+                while (j < len && *(((p + (j as i64)) as *u8)) != (58 as u8)) { j = j + 1; }
+                if (j >= len) { return 0; }
+                j = j + 1; // skip ':'
+                while (j < len && (*(((p + (j as i64)) as *u8)) == (32 as u8) || *(((p + (j as i64)) as *u8)) == (9 as u8) ||
+                                  *(((p + (j as i64)) as *u8)) == (10 as u8) || *(((p + (j as i64)) as *u8)) == (13 as u8))) {
+                    j = j + 1;
+                }
+                if (j < len && *(((p + (j as i64)) as *u8)) == (123 as u8)) { // '{'
+                    return 1;
+                }
+                return 0;
+            }
+        }
+    }
+    return 0;
+}
+
+// Find string property in JSON object, e.g. "email": "foo@bar.com"
+// Return:
+//   0: key not found
+//   1: valid string (*out_val, *out_vlen)
+//   2: null (*out_val = 0, *out_vlen = 0)
+//  -1: non-string value (e.g. number, boolean, array, object)
+func json_find_str(json: *char, len: int, key: *char, klen: int, out_val: **char, out_vlen: *int) -> int {
+    if (len <= 0 || json as i64 == 0 as i64) { return 0; }
+    var p: i64 = json as i64;
+
+    for (var i: int = 0; i + klen + 3 < len; i = i + 1) {
+        // Look for '"' key '"'
+        if (*(((p + (i as i64)) as *u8)) == (34 as u8)) { // '"'
+            if (native_memcmp((p + (i as i64) + 1) as *char, key, klen as i64) == 0 &&
+                *(((p + (i as i64) + 1 + (klen as i64)) as *u8)) == (34 as u8)) {
+                
+                // Found key! Now scan for ':'
+                var j: int = i + 1 + klen + 1;
+                while (j < len && *(((p + (j as i64)) as *u8)) != (58 as u8)) { // ':'
+                    j = j + 1;
+                }
+                if (j >= len) { return 0; }
+                j = j + 1; // skip ':'
+
+                // Skip whitespace
+                while (j < len && (*(((p + (j as i64)) as *u8)) == (32 as u8) || *(((p + (j as i64)) as *u8)) == (9 as u8) ||
+                                  *(((p + (j as i64)) as *u8)) == (10 as u8) || *(((p + (j as i64)) as *u8)) == (13 as u8))) {
+                    j = j + 1;
+                }
+                if (j >= len) { return 0; }
+
+                // Check for null
+                if (j + 4 <= len && native_memcmp((p + (j as i64)) as *char, "null", 4) == 0) {
+                    *out_val = 0 as *char;
+                    *out_vlen = 0;
+                    return 2;
+                }
+
+                // Check for '"' string value
+                if (*(((p + (j as i64)) as *u8)) == (34 as u8)) {
+                    j = j + 1; // skip '"'
+                    var start_val: int = j;
+                    while (j < len) {
+                        var c: u8 = *(((p + (j as i64)) as *u8));
+                        if (c == (92 as u8)) { // '\' escape
+                            j = j + 2;
+                            continue;
+                        }
+                        if (c == (34 as u8)) { // '"' closing
+                            *out_val = (p + (start_val as i64)) as *char;
+                            *out_vlen = j - start_val;
+                            return 1;
+                        }
+                        j = j + 1;
+                    }
+                    return -1;
+                }
+
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+// Find string array (like "tagList": ["a", "b", "c"])
+// Return: count (>= 0), or -1 if invalid type (not an array, empty string item, number item, null item)
+func json_find_taglist(json: *char, len: int, out_tags: **char, out_lens: *int, max_tags: int) -> int {
+    if (len <= 0 || json as i64 == 0 as i64) { return 0; }
+    var p: i64 = json as i64;
+    var klen: int = 7; // "tagList"
+
+    for (var i: int = 0; i + klen + 3 < len; i = i + 1) {
+        if (*(((p + (i as i64)) as *u8)) == (34 as u8)) {
+            if (native_memcmp((p + (i as i64) + 1) as *char, "tagList", 7) == 0 &&
+                *(((p + (i as i64) + 8) as *u8)) == (34 as u8)) {
+
+                var j: int = i + 9;
+                while (j < len && *(((p + (j as i64)) as *u8)) != (58 as u8)) { j = j + 1; } // ':'
+                if (j >= len) { return 0; }
+                j = j + 1; // skip ':'
+
+                while (j < len && (*(((p + (j as i64)) as *u8)) == (32 as u8) || *(((p + (j as i64)) as *u8)) == (9 as u8) ||
+                                  *(((p + (j as i64)) as *u8)) == (10 as u8) || *(((p + (j as i64)) as *u8)) == (13 as u8))) {
+                    j = j + 1;
+                }
+                if (j >= len) { return 0; }
+
+                // Check null
+                if (j + 4 <= len && native_memcmp((p + (j as i64)) as *char, "null", 4) == 0) {
+                    return 0;
+                }
+
+                // Must be '['
+                if (*(((p + (j as i64)) as *u8)) != (91 as u8)) {
+                    return -1; // not an array!
+                }
+                j = j + 1; // skip '['
+
+                var count: int = 0;
+                while (j < len) {
+                    // skip whitespace and commas
+                    while (j < len && (*(((p + (j as i64)) as *u8)) == (32 as u8) || *(((p + (j as i64)) as *u8)) == (44 as u8) ||
+                                      *(((p + (j as i64)) as *u8)) == (10 as u8) || *(((p + (j as i64)) as *u8)) == (13 as u8))) {
+                        j = j + 1;
+                    }
+                    if (j >= len) { return -1; }
+                    if (*(((p + (j as i64)) as *u8)) == (93 as u8)) { // ']'
+                        break;
+                    }
+
+                    // Must be a string '"'
+                    if (*(((p + (j as i64)) as *u8)) != (34 as u8)) {
+                        return -1; // not a string item! (e.g. number 1, null, object)
+                    }
+                    j = j + 1; // skip '"'
+                    var start_tag: int = j;
+                    while (j < len && *(((p + (j as i64)) as *u8)) != (34 as u8)) {
+                        j = j + 1;
+                    }
+                    if (j >= len) { return -1; }
+                    var tag_len: int = j - start_tag;
+                    if (tag_len == 0) {
+                        return -1; // empty string tag is invalid!
+                    }
+                    j = j + 1; // skip closing '"'
+
+                    if (count < max_tags) {
+                        var tag_ptr: *char = (p + (start_tag as i64)) as *char;
+                        var unescaped_len: int = json_unescape(tag_ptr, tag_len, tag_ptr, tag_len + 1);
+                        if (unescaped_len < 0) { return -1; }
+                        var tags_base: i64 = out_tags as i64;
+                        var lens_base: i64 = out_lens as i64;
+                        *(((tags_base + (count as i64) * 8) as **char)) = tag_ptr;
+                        *(((lens_base + (count as i64) * 4) as *int)) = unescaped_len;
+                        count = count + 1;
+                    }
+                }
+                return count;
+            }
+        }
+    }
+    return 0;
+}
+
+// Escape string into JSON buffer
+func json_escape(src: *char, slen: int, dst: *char) -> int {
+    var s: i64 = src as i64;
+    var d: i64 = dst as i64;
+    var out_idx: int = 0;
+
+    for (var i: int = 0; i < slen; i = i + 1) {
+        var c: u8 = *(((s + (i as i64)) as *u8));
+        if (c == (34 as u8)) { // '"'
+            *(((d + (out_idx as i64)) as *u8)) = 92 as u8; // '\'
+            *(((d + (out_idx as i64) + 1) as *u8)) = 34 as u8;
+            out_idx = out_idx + 2;
+        } else if (c == (92 as u8)) { // '\'
+            *(((d + (out_idx as i64)) as *u8)) = 92 as u8;
+            *(((d + (out_idx as i64) + 1) as *u8)) = 92 as u8;
+            out_idx = out_idx + 2;
+        } else if (c == (10 as u8)) { // '\n'
+            *(((d + (out_idx as i64)) as *u8)) = 92 as u8;
+            *(((d + (out_idx as i64) + 1) as *u8)) = 110 as u8; // 'n'
+            out_idx = out_idx + 2;
+        } else if (c == (13 as u8)) { // '\r'
+            *(((d + (out_idx as i64)) as *u8)) = 92 as u8;
+            *(((d + (out_idx as i64) + 1) as *u8)) = 114 as u8; // 'r'
+            out_idx = out_idx + 2;
+        } else if (c == (9 as u8)) { // '\t'
+            *(((d + (out_idx as i64)) as *u8)) = 92 as u8;
+            *(((d + (out_idx as i64) + 1) as *u8)) = 116 as u8; // 't'
+            out_idx = out_idx + 2;
+        } else {
+            *(((d + (out_idx as i64)) as *u8)) = c;
+            out_idx = out_idx + 1;
+        }
+    }
+    return out_idx;
+}
