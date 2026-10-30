@@ -27,7 +27,9 @@ Optional process settings (defaults sized from the CPU count): `HTTP_THREADS`, `
 (`READ_QUEUE_MAX`, `WRITE_QUEUE_MAX`, `BCRYPT_QUEUE_MAX`), `READ_SHARE`, `READ_GATHER_MS`, `READ_MAX_BATCH`,
 `READ_VIEWER_FLAGS`, `READ_FEED_MAX_BATCH` (default 64: feeds share nothing, so they leave in small batches and no
 long feed execution holds a read connection; 0 = `READ_MAX_BATCH`), `READ_FEED_HEAVY`, `READ_FEED_FLOOR`, `BCRYPT_FLUSH_MIN`,
-`BCRYPT_FLUSH_AGE_MS`, `BCRYPT_PRIO_LOAD`, `BCRYPT_NICE` (bcrypt threads default to `max(2, cpus/4)` at nice 0: one thread lost most
+`BCRYPT_FLUSH_AGE_MS`, `BCRYPT_PRIO_LOAD`, `SCHED_BATCH` (default on: every thread we start runs under the SCHED_BATCH policy, so a worker woken by epoll or a
+futex does not preempt a running Postgres backend on a saturated box; `0` = the default policy), `HTTP_GZIP` (unset = only while the box sends more than
+`GZIP_ABOVE_MBPS` (100) MB/s on a real interface with TCP retransmits; `0` never, `1` always), `BCRYPT_NICE` (bcrypt threads default to `max(2, cpus/4)` at nice 0: one thread lost most
 logins to the 10 s timeout above ~130k users on the box) (defaults: gather 30 ms, `READ_MAX_BATCH` 1024, feed shortcut on, bcrypt flush at 4
 waiting / 150 ms): see the JVM build's README for what they do, they
 are the same code.

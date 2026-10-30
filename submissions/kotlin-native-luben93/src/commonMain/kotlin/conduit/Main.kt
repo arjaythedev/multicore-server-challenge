@@ -6,6 +6,7 @@ import conduit.auth.Passwords
 import conduit.db.Db
 import conduit.db.DbConfig
 import conduit.db.sleepNanos
+import conduit.http.Gzip
 import conduit.http.HttpEngine
 import conduit.platform.Monitor
 import conduit.platform.cpuCount
@@ -63,6 +64,8 @@ fun main() {
     val lifoMs = envInt("READ_LIFO_MS", 0)
 
     Jwt.init(secret)
+    // HTTP_GZIP: 0 never, 1 always, unset = only while the network link is full (GZIP_ABOVE_MBPS, see http/Gzip.kt)
+    Gzip.configure(getenv("HTTP_GZIP"), envInt("GZIP_ABOVE_MBPS", 100))
     // Adaptive bcrypt flush (default 4 lanes / 150 ms like the leaders; BCRYPT_FLUSH_MIN=0 = the plain BCRYPT_BATCH_MS window): BCRYPT_FLUSH_MIN lanes queued and the oldest
     // waiting BCRYPT_FLUSH_AGE_MS flushes a partial batch; BCRYPT_PRIO_LOAD reads queued for Postgres flushes at once.
     val bcryptPrioLoad = envInt("BCRYPT_PRIO_LOAD", 0)
@@ -102,6 +105,7 @@ fun main() {
         "conduit: listening on $host:$port (cpus=$cpus http=$httpThreads db=$readConns+$writeConns " +
             "bcrypt=$bcryptThreads; tags sorted by ${App.tagOrder}; reads ${App.readMode}, gather $gatherMs ms${if (lifoMs > 0) ", LIFO after $lifoMs ms" else ""}; " +
             "overload guard ${if (guard) "on, queue caps $readQueueMax/$writeQueueMax/$bcryptQueueMax" else "off"}; " +
+            "gzip ${Gzip.description}; " +
             "$platform)",
     )
     // DB_STATS_S=<seconds> (diagnostics): logs batching statistics periodically.

@@ -81,6 +81,9 @@ import kotlin.concurrent.AtomicInt
 import kotlin.native.concurrent.ThreadLocal
 
 private const val SYS_GETTID = 186L
+private const val SYS_SCHED_SETSCHEDULER = 144L
+/** SCHED_BATCH on every thread we start (default on, SCHED_BATCH=0 turns it off): a thread woken by epoll or a futex no longer preempts a running Postgres backend on a saturated box. */
+private val SCHED_BATCH: Boolean = platform.posix.getenv("SCHED_BATCH")?.toKString()?.trim() != "0"
 private const val SYS_SCHED_GETAFFINITY = 204L
 
 actual fun platformInit(): String {
@@ -165,6 +168,24 @@ actual fun secureRandomBytes(dst: ByteArray) {
 
 actual fun getenv(name: String): String? = platform.posix.getenv(name)?.toKString()
 
+actual fun readTextFile(path: String): String? {
+    val f = platform.posix.fopen(path, "r") ?: return null
+    try {
+        val sb = StringBuilder()
+        val buf = ByteArray(4096)
+        buf.usePinned { pinned ->
+            while (true) {
+                val n = platform.posix.fread(pinned.addressOf(0), 1u, buf.size.convert(), f).toInt()
+                if (n <= 0) break
+                sb.append(buf.decodeToString(0, n))
+            }
+        }
+        return sb.toString()
+    } finally {
+        platform.posix.fclose(f)
+    }
+}
+
 actual fun cpuCount(): Int {
     // sched_getaffinity, so `taskset` limits are respected like the JVM's availableProcessors()
     val n = memScoped {
@@ -193,6 +214,7 @@ actual fun startThread(name: String, nice: Int, body: () -> Unit) {
                 val start = r.get()
                 r.dispose()
                 if (start.nice > 0) setpriority(PRIO_PROCESS, syscall(SYS_GETTID).convert(), start.nice)
+                if (SCHED_BATCH) memScoped { val p = alloc<kotlinx.cinterop.IntVar>().apply { value = 0 }; syscall(SYS_SCHED_SETSCHEDULER, 0, 3, p.ptr) } // SCHED_BATCH, this thread
                 try {
                     start.body()
                 } catch (t: Throwable) {

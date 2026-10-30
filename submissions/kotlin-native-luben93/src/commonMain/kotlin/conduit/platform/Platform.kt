@@ -27,6 +27,9 @@ expect fun secureRandomBytes(dst: ByteArray)
 
 expect fun getenv(name: String): String?
 
+/** A small text file's contents (e.g. /proc counters), or null if it cannot be read. */
+expect fun readTextFile(path: String): String?
+
 /** CPUs this process may run on (affinity-aware where the platform allows). */
 expect fun cpuCount(): Int
 
