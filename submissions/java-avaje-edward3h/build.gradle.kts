@@ -52,6 +52,28 @@ tasks.withType<JavaCompile>().configureEach {
     options.encoding = "UTF-8"
 }
 
+// src/main/resources/schema.sql must be identical to the repository's fixed schema.sql, which kiwiproc validates the
+// SQL against. The root file is missing when the submission is built on its own, so the check is skipped then.
+val checkSchema by tasks.registering {
+    description = "Fails if src/main/resources/schema.sql differs from the repository's schema.sql."
+    group = "verification"
+    val copy = layout.projectDirectory.file("src/main/resources/schema.sql").asFile
+    val root = layout.projectDirectory.file("../../schema.sql").asFile
+    inputs.file(copy)
+    inputs.files(root).optional()
+    doLast {
+        if (!root.exists()) {
+            logger.warn("checkSchema: ${root.canonicalPath} not found, skipped")
+        } else if (!copy.readBytes().contentEquals(root.readBytes())) {
+            throw GradleException("${copy.name} has drifted from ${root.canonicalPath}: cp it over the copy in src/main/resources")
+        }
+    }
+}
+
+tasks.compileJava { dependsOn(checkSchema) }
+
+tasks.check { dependsOn(checkSchema) }
+
 // Optional: ./gradlew checkNullness runs the Checker Framework's Nullness Checker over our own sources. It is not
 // part of build, check or installDist (and so not of build.sh). The generated sources are already compiled by
 // compileJava, so they are only on the classpath here, not checked.

@@ -34,7 +34,8 @@ environment (plus `DB_POOL_SIZE`, which `start.sh` derives from the core count).
 kiwiproc checks every SQL statement and result mapping at compile time. For that the Gradle plugin starts a
 throwaway embedded PostgreSQL (zonky, no Docker, runs as a normal user) and loads `src/main/resources/schema.sql`
 through `changelog.xml`. `schema.sql` is a copy of the repository's fixed `schema.sql`; it is only used at build
-time and never touches the real database.
+time and never touches the real database. The `checkSchema` task (run by `compileJava`, so by `build.sh`) fails if the
+copy differs from `../../schema.sql`, and is skipped if that file isn't there.
 
 ## Code layout
 
