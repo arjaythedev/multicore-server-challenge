@@ -1,0 +1,25 @@
+Result equivalence: all four list families passed mixed-argument checks.
+all        requests= 2 pages=1: 0.267 -> 0.262 ms (-1.9%), buffer hits 308 -> 308
+all        requests= 2 pages=2: 0.341 -> 0.331 ms (-2.9%), buffer hits 474 -> 474
+all        requests= 8 pages=1: 0.455 -> 0.374 ms (-17.7%), buffer hits 686 -> 686
+all        requests= 8 pages=2: 0.453 -> 0.461 ms (+1.9%), buffer hits 852 -> 852
+all        requests=32 pages=1: 0.920 -> 0.911 ms (-1.0%), buffer hits 2198 -> 2198
+all        requests=32 pages=2: 1.091 -> 0.985 ms (-9.7%), buffer hits 2364 -> 2364
+tag        requests= 2 pages=1: 0.354 -> 0.303 ms (-14.5%), buffer hits 327 -> 312
+tag        requests= 2 pages=2: 0.420 -> 0.358 ms (-14.6%), buffer hits 509 -> 497
+tag        requests= 8 pages=1: 0.819 -> 0.413 ms (-49.5%), buffer hits 765 -> 672
+tag        requests= 8 pages=2: 0.886 -> 0.527 ms (-40.5%), buffer hits 947 -> 857
+tag        requests=32 pages=1: 2.787 -> 0.910 ms (-67.3%), buffer hits 2517 -> 2112
+tag        requests=32 pages=2: 2.889 -> 1.055 ms (-63.5%), buffer hits 2699 -> 2297
+author     requests= 2 pages=1: 0.298 -> 0.266 ms (-11.1%), buffer hits 332 -> 307
+author     requests= 2 pages=2: 0.373 -> 0.371 ms (-0.5%), buffer hits 504 -> 484
+author     requests= 8 pages=1: 0.597 -> 0.398 ms (-33.4%), buffer hits 818 -> 667
+author     requests= 8 pages=2: 0.690 -> 0.520 ms (-24.7%), buffer hits 990 -> 844
+author     requests=32 pages=1: 1.797 -> 0.877 ms (-51.2%), buffer hits 2762 -> 2107
+author     requests=32 pages=2: 1.944 -> 0.939 ms (-51.7%), buffer hits 2934 -> 2284
+favorited  requests= 2 pages=1: 0.257 -> 0.265 ms (+3.1%), buffer hits 330 -> 312
+favorited  requests= 2 pages=2: 0.411 -> 0.399 ms (-2.9%), buffer hits 512 -> 497
+favorited  requests= 8 pages=1: 0.413 -> 0.350 ms (-15.1%), buffer hits 774 -> 672
+favorited  requests= 8 pages=2: 0.561 -> 0.526 ms (-6.2%), buffer hits 956 -> 857
+favorited  requests=32 pages=1: 1.183 -> 0.843 ms (-28.8%), buffer hits 2550 -> 2112
+favorited  requests=32 pages=2: 1.271 -> 1.064 ms (-16.3%), buffer hits 2733 -> 2298

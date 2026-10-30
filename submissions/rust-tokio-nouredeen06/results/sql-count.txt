@@ -1,0 +1,4 @@
+PASS exact-count boundaries: 0, 1, 2, 999, 1000, 1001 rows.
+offset=0: 0.191 -> 0.160 ms (-16.2%)
+offset=40: 0.304 -> 0.276 ms (-9.2%)
+offset=1000: 0.306 -> 0.279 ms (-8.8%)

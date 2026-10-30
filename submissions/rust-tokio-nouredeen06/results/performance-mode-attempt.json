@@ -1,0 +1,2411 @@
+{
+  "recorded_at_unix": 1792950417.5500815,
+  "status": "no_completed_measurement",
+  "attempts": [
+    {
+      "directory": ".local/performance-20261025-6000",
+      "summary": {
+        "runs": [],
+        "guard_stop": "sustained host pressure: memory=False, CPU PSI=0.0, I/O=True",
+        "min_available_gib": 20.460941314697266,
+        "max_cpu_temp_c": 79.0
+      },
+      "log": "Waiting for a cool baseline: CPU 90 C\nReady: full seed, 4 CPU/8 GiB PostgreSQL; app + generator limited to 4 CPU/2 GiB.\nSTART hold-6000: 60s ramp + 300s measurement\nGUARD STOP: sustained host pressure: memory=False, CPU PSI=0.0, I/O=True\nSTOP: sustained host pressure: memory=False, CPU PSI=0.0, I/O=True\nTraceback (most recent call last):\n  File \"/home/nouredeen/backend-challenge/submissions/rust-tokio-nouredeen/tools/laptop-load.py\", line 347, in <module>\n    sys.exit(main())\n             ~~~~^^\n  File \"/home/nouredeen/backend-challenge/submissions/rust-tokio-nouredeen/tools/laptop-load.py\", line 342, in main\n    session.close()\n    ~~~~~~~~~~~~~^^\n  File \"/home/nouredeen/backend-challenge/submissions/rust-tokio-nouredeen/tools/laptop-load.py\", line 293, in close\n    self.stop_owned()\n    ~~~~~~~~~~~~~~~^^\n  File \"/home/nouredeen/backend-challenge/submissions/rust-tokio-nouredeen/tools/laptop-load.py\", line 97, in stop_owned\n    command(\"docker\", \"stop\", \"--time\", \"3\", self.container, timeout=20, check=False)\n    ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/nouredeen/backend-challenge/submissions/rust-tokio-nouredeen/tools/laptop-load.py\", line 26, in command\n    return subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=check)\n           ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.14/subprocess.py\", line 557, in run\n    stdout, stderr = process.communicate(input, timeout=timeout)\n                     ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.14/subprocess.py\", line 1221, in communicate\n    stdout, stderr = self._communicate(input, endtime, timeout)\n                     ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.14/subprocess.py\", line 2154, in _communicate\n    self._check_timeout(endtime, orig_timeout, stdout, stderr)\n    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.14/subprocess.py\", line 1268, in _check_timeout\n    raise TimeoutExpired(\n    ...<2 lines>...\n            stderr=b''.join(stderr_seq) if stderr_seq else None)\nsubprocess.TimeoutExpired: Command '('docker', 'stop', '--time', '3', 'nouredeen-load-72536-pg')' timed out after 20 seconds\n",
+      "load_generator_started": false,
+      "plan": {
+        "initial": {
+          "time": 1792949496.2060728,
+          "available_gib": 20.767459869384766,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 2.5,
+          "io_full": 2.06,
+          "cpu_temp_c": 72.0,
+          "disk_busy_ms": 191318
+        },
+        "binary_sha256": "71f84fdd1e961ac4b045ddcd23779347282ec10240520777c6ef7e22286559e6",
+        "limits": {
+          "postgres_cpu": 4,
+          "postgres_memory_gib": 8,
+          "app_plus_loadgen_cpu": 4,
+          "app_plus_loadgen_memory_gib": 2,
+          "disk_read_mib_s": 128,
+          "disk_write_mib_s": 64,
+          "reserve_available_gib": 8
+        },
+        "image": "postgres@sha256:edb0c08dc33befd0262ab3b5cf1c4f3f8cfd8b09e88c05b45adee29d6761ddb6",
+        "think_scale": 0.1,
+        "seed": "conduit_seed",
+        "note": "Shared laptop, resource-capped local result, not official capacity.",
+        "watchdog": {
+          "interval_s": 1,
+          "immediate_temperature_c": 95,
+          "sustained_temperature_c": 90,
+          "sustained_temperature_samples": 8,
+          "reserve_available_gib": 8,
+          "pressure_headroom_gib": 12,
+          "max_scheduling_gap_s": 3
+        },
+        "power_profile": {
+          "/sys/firmware/acpi/platform_profile": "performance",
+          "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference": "performance",
+          "/sys/class/power_supply/ACAD/online": "1"
+        }
+      },
+      "pg-cgroup": {
+        "cpu.max": "400000 100000\n",
+        "memory.max": "8589934592\n",
+        "memory.swap.max": "0\n",
+        "io.max": "259:0 rbps=134217728 wbps=67108864 riops=max wiops=max\n"
+      },
+      "guard-stop": {
+        "reason": "sustained host pressure: memory=False, CPU PSI=0.0, I/O=True",
+        "time": 1792949506.2453518,
+        "phase": "hold-6000"
+      },
+      "monitor": [
+        {
+          "time": 1792949497.2328265,
+          "available_gib": 20.663150787353516,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 2.5,
+          "io_full": 2.06,
+          "cpu_temp_c": 71.0,
+          "disk_busy_ms": 192092,
+          "disk_busy_percent": 77.29914069961383,
+          "phase": "setup",
+          "pg": null,
+          "benchmark": null
+        },
+        {
+          "time": 1792949498.2341192,
+          "available_gib": 20.581809997558594,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 3.14,
+          "io_full": 2.59,
+          "cpu_temp_c": 68.0,
+          "disk_busy_ms": 192269,
+          "disk_busy_percent": 17.676068371029984,
+          "phase": "setup",
+          "pg": {
+            "memory": 123699200,
+            "peak": 124858368,
+            "nonreclaimable": 118882304,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 213187,
+              "user_usec": 99146,
+              "system_usec": 114040,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 10,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": null
+        },
+        {
+          "time": 1792949499.235817,
+          "available_gib": 20.511993408203125,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 3.14,
+          "io_full": 2.59,
+          "cpu_temp_c": 79.0,
+          "disk_busy_ms": 192677,
+          "disk_busy_percent": 40.72963991362074,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 1069166592,
+            "peak": 1069428736,
+            "nonreclaimable": 137355264,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 711981,
+              "user_usec": 236146,
+              "system_usec": 475835,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 19,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": null
+        },
+        {
+          "time": 1792949500.2379303,
+          "available_gib": 20.460941314697266,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 3.11,
+          "io_full": 2.66,
+          "cpu_temp_c": 70.0,
+          "disk_busy_ms": 193198,
+          "disk_busy_percent": 51.98676834767886,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 2576953344,
+            "peak": 2576953344,
+            "nonreclaimable": 137355264,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 1156330,
+              "user_usec": 238170,
+              "system_usec": 918159,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 25,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": {
+            "memory": 30363648,
+            "peak": 50339840,
+            "nonreclaimable": 29466624,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 143639,
+              "user_usec": 106198,
+              "system_usec": 37441,
+              "nice_usec": 102061,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 3,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          }
+        },
+        {
+          "time": 1792949501.2389157,
+          "available_gib": 20.466442108154297,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 3.11,
+          "io_full": 2.66,
+          "cpu_temp_c": 67.0,
+          "disk_busy_ms": 193875,
+          "disk_busy_percent": 67.62903124430517,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 2575851520,
+            "peak": 2576953344,
+            "nonreclaimable": 137355264,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 1156891,
+              "user_usec": 238732,
+              "system_usec": 918159,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 25,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": {
+            "memory": 30363648,
+            "peak": 50339840,
+            "nonreclaimable": 29466624,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 143744,
+              "user_usec": 106303,
+              "system_usec": 37441,
+              "nice_usec": 103057,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 3,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          }
+        },
+        {
+          "time": 1792949502.240048,
+          "available_gib": 20.493160247802734,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 13.05,
+          "io_full": 12.14,
+          "cpu_temp_c": 70.0,
+          "disk_busy_ms": 194877,
+          "disk_busy_percent": 100.11430335769624,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 2575650816,
+            "peak": 2576953344,
+            "nonreclaimable": 137355264,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 1157379,
+              "user_usec": 238974,
+              "system_usec": 918404,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 25,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": {
+            "memory": 30363648,
+            "peak": 50339840,
+            "nonreclaimable": 29466624,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 143744,
+              "user_usec": 106303,
+              "system_usec": 37441,
+              "nice_usec": 103057,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 3,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          }
+        },
+        {
+          "time": 1792949503.2417464,
+          "available_gib": 20.528606414794922,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 13.05,
+          "io_full": 12.14,
+          "cpu_temp_c": 70.0,
+          "disk_busy_ms": 195878,
+          "disk_busy_percent": 99.92817570029911,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 2575474688,
+            "peak": 2576953344,
+            "nonreclaimable": 137355264,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 1157897,
+              "user_usec": 239081,
+              "system_usec": 918815,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 25,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": {
+            "memory": 30363648,
+            "peak": 50339840,
+            "nonreclaimable": 29466624,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 143744,
+              "user_usec": 106303,
+              "system_usec": 37441,
+              "nice_usec": 103057,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 3,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          }
+        },
+        {
+          "time": 1792949504.2428522,
+          "available_gib": 20.55620574951172,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 20.65,
+          "io_full": 19.0,
+          "cpu_temp_c": 67.0,
+          "disk_busy_ms": 196879,
+          "disk_busy_percent": 99.96550241442925,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 2575474688,
+            "peak": 2576953344,
+            "nonreclaimable": 137355264,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 1158373,
+              "user_usec": 239081,
+              "system_usec": 919291,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 27,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": {
+            "memory": 30334976,
+            "peak": 50339840,
+            "nonreclaimable": 29466624,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 143744,
+              "user_usec": 106303,
+              "system_usec": 37441,
+              "nice_usec": 103057,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 3,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          }
+        },
+        {
+          "time": 1792949505.2439332,
+          "available_gib": 20.540325164794922,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 20.65,
+          "io_full": 19.0,
+          "cpu_temp_c": 67.0,
+          "disk_busy_ms": 197880,
+          "disk_busy_percent": 99.99168021272392,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 2575474688,
+            "peak": 2576953344,
+            "nonreclaimable": 137355264,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 1158750,
+              "user_usec": 239081,
+              "system_usec": 919668,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 27,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": {
+            "memory": 30334976,
+            "peak": 50339840,
+            "nonreclaimable": 29466624,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 143744,
+              "user_usec": 106303,
+              "system_usec": 37441,
+              "nice_usec": 103057,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 3,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          }
+        },
+        {
+          "time": 1792949506.2447672,
+          "available_gib": 20.547801971435547,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 31.94,
+          "io_full": 30.05,
+          "cpu_temp_c": 69.0,
+          "disk_busy_ms": 198881,
+          "disk_busy_percent": 100.01732767729187,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 2575474688,
+            "peak": 2576953344,
+            "nonreclaimable": 137355264,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 1159166,
+              "user_usec": 239138,
+              "system_usec": 920027,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 29,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": {
+            "memory": 30334976,
+            "peak": 50339840,
+            "nonreclaimable": 29466624,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 143744,
+              "user_usec": 106303,
+              "system_usec": 37441,
+              "nice_usec": 103057,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 3,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "directory": ".local/performance-20261025-6000-slowcopy",
+      "summary": {
+        "runs": [],
+        "guard_stop": "CPU / NVMe did not settle below their starting thresholds",
+        "min_available_gib": 20.923686981201172,
+        "max_cpu_temp_c": 93.0
+      },
+      "log": "Waiting for a cool baseline: CPU 67 C, NVMe composite 73.8 C\nWaiting for a cool baseline: CPU 66 C, NVMe composite 75.8 C\nWaiting for a cool baseline: CPU 70 C, NVMe composite 76.8 C\nWaiting for a cool baseline: CPU 66 C, NVMe composite 76.8 C\nSTOP: CPU / NVMe did not settle below their starting thresholds\n",
+      "load_generator_started": false
+    },
+    {
+      "directory": ".local/performance-20261025-6000-retry",
+      "summary": {
+        "runs": [],
+        "guard_stop": "CPU temperature reached the protective threshold",
+        "min_available_gib": 20.66379165649414,
+        "max_cpu_temp_c": 96.0
+      },
+      "log": "Waiting for a cool baseline: CPU 72 C, NVMe composite 68.8 C\nReady: full seed, 4 CPU/8 GiB PostgreSQL; app + generator limited to 4 CPU/2 GiB.\nSTART hold-6000: 60s ramp + 300s measurement\nGUARD STOP: CPU temperature reached the protective threshold\nSTOP: CPU temperature reached the protective threshold\nCleanup timeout for nouredeen-load-94945-pg; requesting forced termination.\nTermination request for nouredeen-load-94945-pg is still waiting on the system.\nCleanup timeout for nouredeen-load-94945-pg; requesting forced termination.\nTermination request for nouredeen-load-94945-pg is still waiting on the system.\n",
+      "load_generator_started": false,
+      "plan": {
+        "initial": {
+          "time": 1792950036.4973865,
+          "available_gib": 20.98907470703125,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 0.02,
+          "io_full": 0.02,
+          "cpu_temp_c": 65.0,
+          "disk_busy_ms": 281909,
+          "nvme_composite_c": 67.85,
+          "nvme_stop_c": 73.85
+        },
+        "binary_sha256": "71f84fdd1e961ac4b045ddcd23779347282ec10240520777c6ef7e22286559e6",
+        "limits": {
+          "postgres_cpu": 4,
+          "postgres_memory_gib": 8,
+          "app_plus_loadgen_cpu": 4,
+          "app_plus_loadgen_memory_gib": 2,
+          "disk_read_mib_s": 32,
+          "disk_write_mib_s": 8,
+          "reserve_available_gib": 8
+        },
+        "image": "postgres@sha256:edb0c08dc33befd0262ab3b5cf1c4f3f8cfd8b09e88c05b45adee29d6761ddb6",
+        "think_scale": 0.1,
+        "seed": "conduit_seed",
+        "note": "Shared laptop, resource-capped local result, not official capacity.",
+        "watchdog": {
+          "interval_s": 1,
+          "immediate_temperature_c": 95,
+          "sustained_temperature_c": 90,
+          "sustained_temperature_samples": 8,
+          "reserve_available_gib": 8,
+          "pressure_headroom_gib": 12,
+          "max_scheduling_gap_s": 3,
+          "nvme_stop_c": 73.85
+        },
+        "power_profile": {
+          "/sys/firmware/acpi/platform_profile": "performance",
+          "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference": "performance",
+          "/sys/class/power_supply/ACAD/online": "1"
+        }
+      },
+      "pg-cgroup": {
+        "cpu.max": "400000 100000\n",
+        "memory.max": "8589934592\n",
+        "memory.swap.max": "0\n",
+        "io.max": "259:0 rbps=33554432 wbps=8388608 riops=max wiops=max\n"
+      },
+      "guard-stop": {
+        "reason": "CPU temperature reached the protective threshold",
+        "time": 1792950061.6463919,
+        "phase": "hold-6000"
+      },
+      "monitor": [
+        {
+          "time": 1792950037.5229428,
+          "available_gib": 20.800880432128906,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 0.02,
+          "io_full": 0.02,
+          "cpu_temp_c": 65.0,
+          "disk_busy_ms": 281955,
+          "nvme_composite_c": 67.85,
+          "nvme_stop_c": 73.85,
+          "disk_busy_percent": 4.575950829587733,
+          "phase": "setup",
+          "pg": {
+            "memory": 123015168,
+            "peak": 124751872,
+            "nonreclaimable": 118874112,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 136612,
+              "user_usec": 69820,
+              "system_usec": 66792,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 5,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": null
+        },
+        {
+          "time": 1792950038.530065,
+          "available_gib": 20.709545135498047,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 0.01,
+          "io_full": 0.01,
+          "cpu_temp_c": 88.0,
+          "disk_busy_ms": 281966,
+          "nvme_composite_c": 67.85,
+          "nvme_stop_c": 73.85,
+          "disk_busy_percent": 1.0922228707374453,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 1955463168,
+            "peak": 1955463168,
+            "nonreclaimable": 137342976,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 775332,
+              "user_usec": 205555,
+              "system_usec": 569776,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 13,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": null
+        },
+        {
+          "time": 1792950039.5361702,
+          "available_gib": 20.698638916015625,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 0.01,
+          "io_full": 0.01,
+          "cpu_temp_c": 65.0,
+          "disk_busy_ms": 281967,
+          "nvme_composite_c": 67.85,
+          "nvme_stop_c": 73.85,
+          "disk_busy_percent": 0.09938981452147949,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 1954967552,
+            "peak": 1955463168,
+            "nonreclaimable": 137342976,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 776158,
+              "user_usec": 205774,
+              "system_usec": 570384,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 15,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": {
+            "memory": 32497664,
+            "peak": 52305920,
+            "nonreclaimable": 31559680,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 115462,
+              "user_usec": 87323,
+              "system_usec": 28138,
+              "nice_usec": 88214,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 3,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          }
+        },
+        {
+          "time": 1792950040.5405154,
+          "available_gib": 20.717777252197266,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 9.25,
+          "io_full": 9.25,
+          "cpu_temp_c": 66.0,
+          "disk_busy_ms": 281970,
+          "nvme_composite_c": 67.85,
+          "nvme_stop_c": 73.85,
+          "disk_busy_percent": 0.2987205074774154,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 1954586624,
+            "peak": 1955463168,
+            "nonreclaimable": 137342976,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 776695,
+              "user_usec": 206311,
+              "system_usec": 570384,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 15,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": {
+            "memory": 32497664,
+            "peak": 52305920,
+            "nonreclaimable": 31559680,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 115462,
+              "user_usec": 87323,
+              "system_usec": 28138,
+              "nice_usec": 88214,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 3,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          }
+        },
+        {
+          "time": 1792950041.5461333,
+          "available_gib": 20.705814361572266,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 9.25,
+          "io_full": 9.25,
+          "cpu_temp_c": 65.0,
+          "disk_busy_ms": 281970,
+          "nvme_composite_c": 67.85,
+          "nvme_stop_c": 73.85,
+          "disk_busy_percent": 0.0,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 1954586624,
+            "peak": 1955463168,
+            "nonreclaimable": 137342976,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 777243,
+              "user_usec": 206510,
+              "system_usec": 570733,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 17,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": {
+            "memory": 32497664,
+            "peak": 52305920,
+            "nonreclaimable": 31559680,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 115462,
+              "user_usec": 87323,
+              "system_usec": 28138,
+              "nice_usec": 88214,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 3,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          }
+        },
+        {
+          "time": 1792950042.5505838,
+          "available_gib": 20.67259979248047,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 19.35,
+          "io_full": 19.17,
+          "cpu_temp_c": 65.0,
+          "disk_busy_ms": 281970,
+          "nvme_composite_c": 67.85,
+          "nvme_stop_c": 73.85,
+          "disk_busy_percent": 0.0,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 1954586624,
+            "peak": 1955463168,
+            "nonreclaimable": 137342976,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 777786,
+              "user_usec": 206510,
+              "system_usec": 571276,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 17,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": {
+            "memory": 32497664,
+            "peak": 52305920,
+            "nonreclaimable": 31559680,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 115462,
+              "user_usec": 87323,
+              "system_usec": 28138,
+              "nice_usec": 88214,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 3,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          }
+        },
+        {
+          "time": 1792950043.5548882,
+          "available_gib": 20.66379165649414,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 19.35,
+          "io_full": 19.17,
+          "cpu_temp_c": 66.0,
+          "disk_busy_ms": 281971,
+          "nvme_composite_c": 67.85,
+          "nvme_stop_c": 73.85,
+          "disk_busy_percent": 0.09955344485968516,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 1954586624,
+            "peak": 1955463168,
+            "nonreclaimable": 137342976,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 778389,
+              "user_usec": 207113,
+              "system_usec": 571276,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 19,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": {
+            "memory": 32497664,
+            "peak": 52305920,
+            "nonreclaimable": 31559680,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 115462,
+              "user_usec": 87323,
+              "system_usec": 28138,
+              "nice_usec": 88214,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 3,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          }
+        },
+        {
+          "time": 1792950044.5590677,
+          "available_gib": 20.669090270996094,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 28.88,
+          "io_full": 28.37,
+          "cpu_temp_c": 65.0,
+          "disk_busy_ms": 281973,
+          "nvme_composite_c": 67.85,
+          "nvme_stop_c": 73.85,
+          "disk_busy_percent": 0.19917161319414878,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 1954586624,
+            "peak": 1955463168,
+            "nonreclaimable": 137342976,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 779014,
+              "user_usec": 207431,
+              "system_usec": 571583,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 19,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": {
+            "memory": 32497664,
+            "peak": 52305920,
+            "nonreclaimable": 31559680,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 115462,
+              "user_usec": 87323,
+              "system_usec": 28138,
+              "nice_usec": 88214,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 3,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          }
+        },
+        {
+          "time": 1792950045.5651066,
+          "available_gib": 20.687034606933594,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 28.88,
+          "io_full": 28.37,
+          "cpu_temp_c": 67.0,
+          "disk_busy_ms": 281973,
+          "nvme_composite_c": 67.85,
+          "nvme_stop_c": 73.85,
+          "disk_busy_percent": 0.0,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 1954586624,
+            "peak": 1955463168,
+            "nonreclaimable": 137342976,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 779682,
+              "user_usec": 207609,
+              "system_usec": 572072,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 21,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": {
+            "memory": 32497664,
+            "peak": 52305920,
+            "nonreclaimable": 31559680,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 115462,
+              "user_usec": 87323,
+              "system_usec": 28138,
+              "nice_usec": 88214,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 3,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          }
+        },
+        {
+          "time": 1792950046.5694294,
+          "available_gib": 20.69124984741211,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 37.78,
+          "io_full": 37.0,
+          "cpu_temp_c": 65.0,
+          "disk_busy_ms": 281973,
+          "nvme_composite_c": 67.85,
+          "nvme_stop_c": 73.85,
+          "disk_busy_percent": 0.0,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 1954586624,
+            "peak": 1955463168,
+            "nonreclaimable": 137342976,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 780224,
+              "user_usec": 207753,
+              "system_usec": 572470,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 21,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": {
+            "memory": 32477184,
+            "peak": 52305920,
+            "nonreclaimable": 31559680,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 115462,
+              "user_usec": 87323,
+              "system_usec": 28138,
+              "nice_usec": 88214,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 3,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          }
+        },
+        {
+          "time": 1792950047.5744324,
+          "available_gib": 20.701629638671875,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 37.78,
+          "io_full": 37.0,
+          "cpu_temp_c": 65.0,
+          "disk_busy_ms": 281973,
+          "nvme_composite_c": 67.85,
+          "nvme_stop_c": 73.85,
+          "disk_busy_percent": 0.0,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 1954848768,
+            "peak": 1955463168,
+            "nonreclaimable": 137342976,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 780732,
+              "user_usec": 207753,
+              "system_usec": 572978,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 21,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": {
+            "memory": 32477184,
+            "peak": 52305920,
+            "nonreclaimable": 31559680,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 115462,
+              "user_usec": 87323,
+              "system_usec": 28138,
+              "nice_usec": 88214,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 3,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          }
+        },
+        {
+          "time": 1792950048.579963,
+          "available_gib": 20.69314193725586,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 43.8,
+          "io_full": 42.98,
+          "cpu_temp_c": 65.0,
+          "disk_busy_ms": 281975,
+          "nvme_composite_c": 67.85,
+          "nvme_stop_c": 73.85,
+          "disk_busy_percent": 0.19890014821517243,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 1954590720,
+            "peak": 1955463168,
+            "nonreclaimable": 137342976,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 781308,
+              "user_usec": 207781,
+              "system_usec": 573527,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 23,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": {
+            "memory": 32477184,
+            "peak": 52305920,
+            "nonreclaimable": 31559680,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 115462,
+              "user_usec": 87323,
+              "system_usec": 28138,
+              "nice_usec": 88214,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 3,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          }
+        },
+        {
+          "time": 1792950049.585497,
+          "available_gib": 20.71186065673828,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 43.8,
+          "io_full": 42.98,
+          "cpu_temp_c": 66.0,
+          "disk_busy_ms": 281976,
+          "nvme_composite_c": 67.85,
+          "nvme_stop_c": 73.85,
+          "disk_busy_percent": 0.09945046952408772,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 1954590720,
+            "peak": 1955463168,
+            "nonreclaimable": 137342976,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 781720,
+              "user_usec": 207781,
+              "system_usec": 573939,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 23,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": {
+            "memory": 32477184,
+            "peak": 52305920,
+            "nonreclaimable": 31559680,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 115462,
+              "user_usec": 87323,
+              "system_usec": 28138,
+              "nice_usec": 88214,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 3,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          }
+        },
+        {
+          "time": 1792950050.5896587,
+          "available_gib": 20.705699920654297,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 46.73,
+          "io_full": 45.88,
+          "cpu_temp_c": 65.0,
+          "disk_busy_ms": 281976,
+          "nvme_composite_c": 67.85,
+          "nvme_stop_c": 73.85,
+          "disk_busy_percent": 0.0,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 1954590720,
+            "peak": 1955463168,
+            "nonreclaimable": 137342976,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 782303,
+              "user_usec": 207781,
+              "system_usec": 574522,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 25,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": {
+            "memory": 32477184,
+            "peak": 52305920,
+            "nonreclaimable": 31559680,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 115462,
+              "user_usec": 87323,
+              "system_usec": 28138,
+              "nice_usec": 88214,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 3,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          }
+        },
+        {
+          "time": 1792950051.5942676,
+          "available_gib": 20.689903259277344,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 46.73,
+          "io_full": 45.88,
+          "cpu_temp_c": 65.0,
+          "disk_busy_ms": 281976,
+          "nvme_composite_c": 67.85,
+          "nvme_stop_c": 73.85,
+          "disk_busy_percent": 0.0,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 1954586624,
+            "peak": 1955463168,
+            "nonreclaimable": 137342976,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 782684,
+              "user_usec": 207781,
+              "system_usec": 574902,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 25,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": {
+            "memory": 32477184,
+            "peak": 52305920,
+            "nonreclaimable": 31559680,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 115462,
+              "user_usec": 87323,
+              "system_usec": 28138,
+              "nice_usec": 88214,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 3,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          }
+        },
+        {
+          "time": 1792950052.5998507,
+          "available_gib": 20.704456329345703,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 51.31,
+          "io_full": 50.43,
+          "cpu_temp_c": 65.0,
+          "disk_busy_ms": 282024,
+          "nvme_composite_c": 67.85,
+          "nvme_stop_c": 73.85,
+          "disk_busy_percent": 4.773204134127186,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 1954848768,
+            "peak": 1955463168,
+            "nonreclaimable": 137355264,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 783494,
+              "user_usec": 207839,
+              "system_usec": 575655,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 27,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": {
+            "memory": 32477184,
+            "peak": 52305920,
+            "nonreclaimable": 31559680,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 115462,
+              "user_usec": 87323,
+              "system_usec": 28138,
+              "nice_usec": 88214,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 3,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          }
+        },
+        {
+          "time": 1792950053.6041913,
+          "available_gib": 20.706069946289062,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 51.31,
+          "io_full": 50.43,
+          "cpu_temp_c": 65.0,
+          "disk_busy_ms": 282024,
+          "nvme_composite_c": 67.85,
+          "nvme_stop_c": 73.85,
+          "disk_busy_percent": 0.0,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 1954869248,
+            "peak": 1955463168,
+            "nonreclaimable": 137355264,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 784746,
+              "user_usec": 208171,
+              "system_usec": 576575,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 28,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": {
+            "memory": 32477184,
+            "peak": 52305920,
+            "nonreclaimable": 31559680,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 115462,
+              "user_usec": 87323,
+              "system_usec": 28138,
+              "nice_usec": 88214,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 3,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          }
+        },
+        {
+          "time": 1792950054.6082425,
+          "available_gib": 20.71062469482422,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 56.51,
+          "io_full": 55.6,
+          "cpu_temp_c": 65.0,
+          "disk_busy_ms": 282024,
+          "nvme_composite_c": 67.85,
+          "nvme_stop_c": 73.85,
+          "disk_busy_percent": 0.0,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 1955917824,
+            "peak": 1955917824,
+            "nonreclaimable": 137355264,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 785936,
+              "user_usec": 208487,
+              "system_usec": 577449,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 31,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": {
+            "memory": 32477184,
+            "peak": 52305920,
+            "nonreclaimable": 31559680,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 115462,
+              "user_usec": 87323,
+              "system_usec": 28138,
+              "nice_usec": 88214,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 3,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          }
+        },
+        {
+          "time": 1792950055.6136696,
+          "available_gib": 20.732685089111328,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 56.51,
+          "io_full": 55.6,
+          "cpu_temp_c": 68.0,
+          "disk_busy_ms": 282024,
+          "nvme_composite_c": 67.85,
+          "nvme_stop_c": 73.85,
+          "disk_busy_percent": 0.0,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 1956900864,
+            "peak": 1956900864,
+            "nonreclaimable": 137355264,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 786954,
+              "user_usec": 208757,
+              "system_usec": 578196,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 33,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": {
+            "memory": 32477184,
+            "peak": 52305920,
+            "nonreclaimable": 31559680,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 115462,
+              "user_usec": 87323,
+              "system_usec": 28138,
+              "nice_usec": 88214,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 3,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          }
+        },
+        {
+          "time": 1792950056.61939,
+          "available_gib": 20.72982406616211,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 62.39,
+          "io_full": 61.11,
+          "cpu_temp_c": 65.0,
+          "disk_busy_ms": 282024,
+          "nvme_composite_c": 67.85,
+          "nvme_stop_c": 73.85,
+          "disk_busy_percent": 0.0,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 1957429248,
+            "peak": 1957429248,
+            "nonreclaimable": 137355264,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 788033,
+              "user_usec": 209043,
+              "system_usec": 578990,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 33,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": {
+            "memory": 32477184,
+            "peak": 52305920,
+            "nonreclaimable": 31559680,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 115462,
+              "user_usec": 87323,
+              "system_usec": 28138,
+              "nice_usec": 88214,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 3,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          }
+        },
+        {
+          "time": 1792950057.6238208,
+          "available_gib": 20.73874282836914,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 62.39,
+          "io_full": 61.11,
+          "cpu_temp_c": 65.0,
+          "disk_busy_ms": 282028,
+          "nvme_composite_c": 67.85,
+          "nvme_stop_c": 73.85,
+          "disk_busy_percent": 0.39822663269009195,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 1958612992,
+            "peak": 1958739968,
+            "nonreclaimable": 137355264,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 789715,
+              "user_usec": 209489,
+              "system_usec": 580225,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 36,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": {
+            "memory": 32477184,
+            "peak": 52305920,
+            "nonreclaimable": 31559680,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 115462,
+              "user_usec": 87323,
+              "system_usec": 28138,
+              "nice_usec": 88214,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 3,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          }
+        },
+        {
+          "time": 1792950058.6281095,
+          "available_gib": 20.722110748291016,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 64.31,
+          "io_full": 62.9,
+          "cpu_temp_c": 65.0,
+          "disk_busy_ms": 282040,
+          "nvme_composite_c": 67.85,
+          "nvme_stop_c": 73.85,
+          "disk_busy_percent": 1.1949016593193413,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 1959796736,
+            "peak": 1959796736,
+            "nonreclaimable": 137355264,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 791411,
+              "user_usec": 209939,
+              "system_usec": 581471,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 39,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": {
+            "memory": 32477184,
+            "peak": 52305920,
+            "nonreclaimable": 31559680,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 115462,
+              "user_usec": 87323,
+              "system_usec": 28138,
+              "nice_usec": 88214,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 3,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          }
+        },
+        {
+          "time": 1792950059.6337922,
+          "available_gib": 20.741085052490234,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 64.31,
+          "io_full": 62.9,
+          "cpu_temp_c": 65.0,
+          "disk_busy_ms": 282040,
+          "nvme_composite_c": 67.85,
+          "nvme_stop_c": 73.85,
+          "disk_busy_percent": 0.0,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 1961504768,
+            "peak": 1961504768,
+            "nonreclaimable": 137355264,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 793097,
+              "user_usec": 210387,
+              "system_usec": 582710,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 44,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": {
+            "memory": 32477184,
+            "peak": 52305920,
+            "nonreclaimable": 31559680,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 115462,
+              "user_usec": 87323,
+              "system_usec": 28138,
+              "nice_usec": 88214,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 3,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          }
+        },
+        {
+          "time": 1792950060.6382473,
+          "available_gib": 20.724185943603516,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 63.71,
+          "io_full": 62.01,
+          "cpu_temp_c": 65.0,
+          "disk_busy_ms": 282046,
+          "nvme_composite_c": 67.85,
+          "nvme_stop_c": 73.85,
+          "disk_busy_percent": 0.5972819014684086,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 1963601920,
+            "peak": 1963601920,
+            "nonreclaimable": 137355264,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 795041,
+              "user_usec": 210902,
+              "system_usec": 584138,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 48,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": {
+            "memory": 32477184,
+            "peak": 52305920,
+            "nonreclaimable": 31559680,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 115462,
+              "user_usec": 87323,
+              "system_usec": 28138,
+              "nice_usec": 88214,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 3,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          }
+        },
+        {
+          "time": 1792950061.6422472,
+          "available_gib": 20.68722152709961,
+          "cpu_some": 0.0,
+          "cpu_full": 0.0,
+          "memory_some": 0.0,
+          "memory_full": 0.0,
+          "io_some": 63.71,
+          "io_full": 62.01,
+          "cpu_temp_c": 96.0,
+          "disk_busy_ms": 282048,
+          "nvme_composite_c": 67.85,
+          "nvme_stop_c": 73.85,
+          "disk_busy_percent": 0.19919824955494075,
+          "phase": "hold-6000",
+          "pg": {
+            "memory": 1965051904,
+            "peak": 1965051904,
+            "nonreclaimable": 137355264,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 797187,
+              "user_usec": 211471,
+              "system_usec": 585715,
+              "nice_usec": 0,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 50,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          },
+          "benchmark": {
+            "memory": 32477184,
+            "peak": 52305920,
+            "nonreclaimable": 31559680,
+            "events": {
+              "low": 0,
+              "high": 0,
+              "max": 0,
+              "oom": 0,
+              "oom_kill": 0,
+              "oom_group_kill": 0,
+              "sock_throttled": 0
+            },
+            "cpu": {
+              "usage_usec": 115462,
+              "user_usec": 87323,
+              "system_usec": 28138,
+              "nice_usec": 88214,
+              "core_sched.force_idle_usec": 0,
+              "nr_periods": 3,
+              "nr_throttled": 0,
+              "throttled_usec": 0,
+              "nr_bursts": 0,
+              "burst_usec": 0
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "observed_during_second_preflight": {
+    "nvme_composite_c": 76.85,
+    "nvme_alarm": 1,
+    "nvme_reported_high_c": 74.85,
+    "nvme_reported_critical_c": 79.85
+  },
+  "final_nvme_hwmon": {
+    "temp2_min": "-273150",
+    "temp4_label": "Sensor 3",
+    "temp2_max": "65261850",
+    "temp3_input": "88850",
+    "temp3_min": "-273150",
+    "temp1_label": "Composite",
+    "temp1_crit": "79850",
+    "temp3_max": "65261850",
+    "temp4_input": "65850",
+    "temp4_min": "-273150",
+    "temp1_alarm": "0",
+    "temp2_label": "Sensor 1",
+    "temp1_input": "65850",
+    "temp4_max": "65261850",
+    "temp1_min": "-273150",
+    "temp3_label": "Sensor 2",
+    "temp1_max": "74850",
+    "temp2_input": "94850"
+  },
+  "power_profile": {
+    "/sys/firmware/acpi/platform_profile": "performance",
+    "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference": "performance",
+    "/sys/class/power_supply/ACAD/online": "1"
+  },
+  "cleanup": "No temporary benchmark container, systemd unit, runner or port-3110 listener remains. Original container remains stopped. Seed volume retained. Inspection of any interrupted clone files deferred; no database restarted merely for cleanup.",
+  "subsequent_reflink_attempt": {
+    "directory": ".local/performance-20261025-reflink-6000",
+    "summary": {
+      "runs": [],
+      "guard_stop": "interrupted",
+      "min_available_gib": 18.404361724853516,
+      "max_cpu_temp_c": 93.0
+    },
+    "snapshot_cleanup": {
+      "volume": "nouredeen-load-117892-snapshot",
+      "removed": true,
+      "stderr": "",
+      "followup_cleanup": true
+    },
+    "load_generator_started": true,
+    "completion": "User requested stopping all tests before the five-minute measurement finished. No completed result or performance-mode score."
+  }
+}

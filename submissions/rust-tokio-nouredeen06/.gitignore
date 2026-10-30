@@ -1,0 +1,11 @@
+target/
+target-*/
+__pycache__/
+*.pyc
+local-results/
+.local/
+# Retained textual evidence, overriding the repository-wide results/ ignore.
+!results/
+!results/*.md
+!results/*.json
+!results/*.txt

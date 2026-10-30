@@ -1,0 +1,59 @@
+conformance-full.log
+== conformance suite
+== fresh database challenge_test_722354 from conduit_seed
+== build
+    Blocking waiting for file lock on build directory
+    Finished `release` profile [optimized] target(s) in 8.85s
+== start
+== test
+
+197 steps, 197 passed, 0 failed (6.3s)
+RESULT: PASS
+
+conformance-ubuntu.log
+
+197 steps, 197 passed, 0 failed (2.9s)
+RESULT: PASS
+
+conformance-ubuntu-full-final.log
+
+197 steps, 197 passed, 0 failed (5.3s)
+RESULT: PASS
+
+regression-forced.log
+PASS independent viewers, duplicate/filter/page keys, empty pages and counts
+PASS independent viewers, duplicate/filter/page keys, empty pages and counts
+PASS committed favorites, follows, profiles, tags and comments become visible immediately
+PASS failed grouped mutations roll back; successful neighbors commit exactly once
+PASS HTTP pipelines, chunking, trailers, fragmentation, 100-continue and ambiguous framing
+PASS 2097 regression assertions; fixture prefix regfd29233356bc
+Elapsed: 2.37s
+
+regression-normal.log
+PASS independent viewers, duplicate/filter/page keys, empty pages and counts
+PASS independent viewers, duplicate/filter/page keys, empty pages and counts
+PASS committed favorites, follows, profiles, tags and comments become visible immediately
+PASS failed grouped mutations roll back; successful neighbors commit exactly once
+PASS HTTP pipelines, chunking, trailers, fragmentation, 100-continue and ambiguous framing
+PASS 2097 regression assertions; fixture prefix reg3bb36c1c10a3
+Elapsed: 5.02s
+
+group-check.log
+PASS distinct READ COMMITTED statement snapshots
+PASS packed frames including SQL error drain
+PASS group sizes 1/2/8/32, empty result, SQL error drain and connection reuse
+
+conformance-final-dev.log (final binary, two bcrypt workers)
+== conformance suite
+== fresh database challenge_test_2918752 from conduit_dev
+== build
+    Finished `release` profile [optimized] target(s) in 0.35s
+== start
+== test
+
+197 steps, 197 passed, 0 failed (2.8s)
+RESULT: PASS
+
+Rust release tests: 13 passed, 2 inherited diagnostics ignored.
+Clippy --locked --all-targets -- -D warnings: passed.
+Changed Rust modules: rustfmt --check passed. Shell entrypoints: bash -n passed.
