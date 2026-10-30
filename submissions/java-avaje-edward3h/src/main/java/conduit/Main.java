@@ -6,6 +6,7 @@ import java.util.List;
 import io.avaje.inject.BeanScope;
 import io.avaje.http.api.ValidationException;
 import io.avaje.json.JsonException;
+import io.avaje.jsonb.JsonType;
 import io.helidon.http.HeaderNames;
 import io.helidon.http.HttpException;
 import io.helidon.http.Status;
@@ -18,7 +19,7 @@ public class Main {
     public static void main(String[] args) {
         BeanScope scope = BeanScope.builder().build();
         List<HttpFeature> features = scope.list(HttpFeature.class);
-        io.avaje.jsonb.JsonType<Dto.Errors> errors = scope.get(io.avaje.jsonb.Jsonb.class).type(Dto.Errors.class);
+        JsonType<Dto.Errors> errors = scope.get(io.avaje.jsonb.Jsonb.class).type(Dto.Errors.class);
 
         HttpRouting.Builder routing = HttpRouting.builder();
         features.forEach(routing::addFeature);
@@ -49,10 +50,9 @@ public class Main {
                 .host(Config.env("HOST", "127.0.0.1"))
                 .port(Integer.parseInt(Config.env("PORT", "3000")))
                 .backlog(1024)
-                .connectionConfig(c -> c.readTimeout(Duration.ofSeconds(75)))
                 // without this a response written in two pieces (headers, then a larger body) waits for the
                 // client's delayed ACK: about 40 ms on the list endpoints
-                .connectionOptions(o -> o.tcpNoDelay(true))
+                .connectionOptions(o -> o.readTimeout(Duration.ofSeconds(75)).tcpNoDelay(true))
                 .addRouting(routing)
                 .build()
                 .start();
