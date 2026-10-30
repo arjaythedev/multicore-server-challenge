@@ -48,7 +48,8 @@ class ArticleController implements ApiController {
         return s != null && !s.isEmpty();
     }
 
-    private static Dto.Profile author(String username, String bio, String image, boolean following) {
+    private static Dto.Profile author(String username, @Nullable String bio, @Nullable String image,
+            boolean following) {
         return new Dto.Profile(username, bio, image, following);
     }
 

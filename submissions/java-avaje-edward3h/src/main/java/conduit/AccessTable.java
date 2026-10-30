@@ -29,7 +29,7 @@ final class AccessTable {
             }
             int length = path.length() > 1 && path.charAt(path.length() - 1) == '/' ? path.length() - 1 : path.length();
             int pos = 1;
-            for (int i = 0; i < segments.length; i++) {
+            for (String literal : segments) {
                 if (pos > length) {
                     return false;
                 }
@@ -37,7 +37,6 @@ final class AccessTable {
                 if (end < 0 || end > length) {
                     end = length;
                 }
-                String literal = segments[i];
                 if (literal == null ? end == pos : end - pos != literal.length() || !path.startsWith(literal, pos)) {
                     return false;
                 }

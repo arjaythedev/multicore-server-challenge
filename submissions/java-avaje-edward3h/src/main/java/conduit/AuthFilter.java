@@ -4,7 +4,6 @@ import io.avaje.http.api.Controller;
 import io.avaje.http.api.Filter;
 import io.helidon.webserver.http.FilterChain;
 import io.helidon.webserver.http.RoutingRequest;
-import io.helidon.webserver.http.RoutingResponse;
 
 /**
  * Authenticates every request before routing, so an auth failure comes before the body is bound (and before a 422).
@@ -22,7 +21,7 @@ final class AuthFilter {
     }
 
     @Filter
-    void filter(FilterChain chain, RoutingRequest req, RoutingResponse res) {
+    void filter(FilterChain chain, RoutingRequest req) {
         Access.Level level = access.level(req.prologue().method().text(), req.path().rawPath());
         if (level != Access.Level.NONE) {
             auth.authenticate(req, level == Access.Level.REQUIRED);

@@ -16,28 +16,29 @@ import io.helidon.webserver.http.HttpRouting;
 
 public class Main {
 
-    public static void main(String[] args) {
+    @SuppressWarnings("resource") // the scope lives as long as the server
+    static void main() {
         BeanScope scope = BeanScope.builder().build();
         List<HttpFeature> features = scope.list(HttpFeature.class);
         JsonType<Dto.Errors> errors = scope.get(io.avaje.jsonb.Jsonb.class).type(Dto.Errors.class);
 
         HttpRouting.Builder routing = HttpRouting.builder();
         features.forEach(routing::addFeature);
-        routing.error(ApiException.class, (req, res, ex) -> res.status(Status.create(ex.status))
+        routing.error(ApiException.class, (_, res, ex) -> res.status(Status.create(ex.status))
                 .header(HeaderNames.CONTENT_TYPE, "application/json")
                 .send(errors.toJson(Dto.Errors.of(ex.getMessage()))));
-        routing.error(JsonException.class, (req, res, ex) -> res.status(Status.create(422))
+        routing.error(JsonException.class, (_, res, _) -> res.status(Status.create(422))
                 .header(HeaderNames.CONTENT_TYPE, "application/json")
                 .send(errors.toJson(Dto.Errors.of("malformed JSON body"))));
-        routing.error(ValidationException.class, (req, res, ex) -> res.status(Status.create(422))
+        routing.error(ValidationException.class, (_, res, ex) -> res.status(Status.create(422))
                 .header(HeaderNames.CONTENT_TYPE, "application/json")
                 .send(errors.toJson(Dto.Errors.of(ex.getErrors().stream()
                         .map(v -> v.getPath() + " " + v.getMessage())
                         .collect(java.util.stream.Collectors.joining("; "))))));
-        routing.error(HttpException.class, (req, res, ex) -> res.status(ex.status())
+        routing.error(HttpException.class, (_, res, ex) -> res.status(ex.status())
                 .header(HeaderNames.CONTENT_TYPE, "application/json")
                 .send(errors.toJson(Dto.Errors.of(ex.getMessage()))));
-        routing.error(Exception.class, (req, res, ex) -> {
+        routing.error(Exception.class, (_, res, ex) -> {
             System.err.println("unhandled: " + ex);
             res.status(Status.INTERNAL_SERVER_ERROR_500)
                     .header(HeaderNames.CONTENT_TYPE, "application/json")
