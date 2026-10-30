@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Runs the server in the foreground. Config: DATABASE_URL, JWT_SECRET, HOST, PORT.
+# Launches the Conduit Apex HTTP server in the foreground.
 set -euo pipefail
-DIR="$(cd "$(dirname "$0")" && pwd)"
-exec "$DIR/target/release/conduit"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+exec "$SCRIPT_DIR/target/release/conduit"

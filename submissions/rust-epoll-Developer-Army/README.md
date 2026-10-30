@@ -5,7 +5,7 @@ Front: direct
 | | |
 |---|---|
 | Language | Rust 1.99.0 (edition 2024), fat LTO, single codegen unit, `target-cpu=native` |
-| HTTP | Hand-crafted HTTP/1.1 on multi-core raw `epoll` with `SO_REUSEPORT`, fast header parsing via `httparse` |
+| HTTP | Hand-crafted zero-copy HTTP/1.1 parser on multi-core raw `epoll` with `SO_REUSEPORT` |
 | Postgres driver | Dedicated PostgreSQL v3 wire-protocol client (SCRAM-SHA-256, binary wire rows, pipelining). Zero external driver dependencies |
 | Allocator & crates | `mimalloc`, `hmac` + `sha2` (zero-alloc JWT), `serde_json`, `base64`, `memchr`, `itoa`, `getrandom`. Pinned in `Cargo.lock` |
 | Password hashing | 8-lane interleaved Blowfish engine (`cost=10`), adaptive scheduling with low-latency window |
