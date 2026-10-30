@@ -26,8 +26,8 @@ object Settings:
   )
   /** The read connections in all, split evenly over the loops: one per CPU, so that Postgres's backends, each kept
     * busy by pipelining, don't take turns on the CPUs (4 connections on 4 CPUs cost Postgres 5-13% less per request
-    * than 16, and the server 7% less; 8 no less than 16). The box's Postgres allows 100, and the
-    * spec asks for 95 at most, write connections included.
+    * than 16, and the server 7% less; 8 saved nothing over 16). The box's Postgres allows 100, and the spec asks for
+    * 95 at most, write connections included.
     */
   val pgConnections: Int = int("conduit.pgConnections", math.min(95 - loops * pgWriteConnections, math.max(loops, cpus)))
   /** The most writes in one transaction ([[WriteGroup]]); 1: each its own. */
@@ -40,10 +40,10 @@ object Settings:
     v.trim.toBooleanOption.getOrElse(throw IllegalArgumentException(s"""-Dconduit.pgDrain must be true or false, not "$v""""))
   )
   /** With [[pgDrain]]: the most reads a connection takes in a round, the oldest first whatever their kind (each kind's
-    * still together, in batches of up to [[batchSize]]), so that every kind waits alike. 0:
-    * up to [[batchSize]] of every kind, oldest or not: under overload the two most frequent kinds fell rounds behind
-    * and failed the holds. 32 and 64 cut the batches too small; every waiting read let one connection take thousands
-    * while the other served newer ones. 512, so that [[pgGatherMicros]]'s rounds aren't cut short near the limit.
+    * still together, in batches of up to [[batchSize]]), so that every kind waits alike. 0: up to [[batchSize]] of
+    * every kind, oldest or not: under overload the two most frequent kinds fell rounds behind and failed the holds.
+    * 32 and 64 cut the batches too small; with no cap, one connection took thousands of reads while the other served
+    * newer ones. 512, so that [[pgGatherMicros]]'s rounds aren't cut short near the limit.
     */
   val pgRoundSize: Int = sys.props.get("conduit.pgRoundSize").fold(512)(v =>
     v.trim.toIntOption.filter(_ >= 0).getOrElse(throw IllegalArgumentException(s"""-Dconduit.pgRoundSize must be 0 or more, not "$v""""))
@@ -78,7 +78,9 @@ object Settings:
   val bcryptNice: Int = sys.props.get("conduit.bcryptNice").fold(0)(v =>
     v.trim.toIntOption.filter(n => n >= 0 && n <= 19).getOrElse(throw IllegalArgumentException(s"""-Dconduit.bcryptNice must be 0 to 19, not "$v""""))
   )
-  /** The most connections held; past it the longest-idle are evicted. Unset, the descriptors there are. */
+  /** The most connections each loop holds; past it the longest-idle are evicted, and with none idle the server stops
+    * accepting until one is. Unset, its share of descriptors.
+    */
   val maxConnections: Option[Int] = sys.props.get("conduit.maxConnections").map(positive("conduit.maxConnections", _))
   /** Idle keep-alive connections are closed after this. The spec asks for at least 65 s. */
   val idleTimeoutSeconds: Int = int("conduit.idleTimeoutSeconds", 75)
@@ -90,7 +92,9 @@ object Settings:
   val acceptsPerPass: Int = int("conduit.acceptsPerPass", 1024)
   /** The listen backlog asked for; the kernel caps it at `net.core.somaxconn` (65,535 on the box). */
   val listenBacklog: Int = int("conduit.listenBacklog", 65535)
-  /** Logs every 10 s each loop's queries to Postgres: how many waited for a connection, and the batches they went in. */
+  /** Logs every 10 s each loop's queries to Postgres (how many waited for a connection, and the batches they went in)
+    * and its connections (open, evicted so far, and whether it is full).
+    */
   val stats: Boolean = java.lang.Boolean.getBoolean("conduit.stats")
   /** Logs every 10 s how long each event loop went without getting to its tasks ([[LagMonitor]]). */
   val lagMonitor: Boolean = java.lang.Boolean.getBoolean("conduit.lagMonitor")

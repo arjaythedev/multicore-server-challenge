@@ -5,10 +5,10 @@ Front: direct
 | | |
 |---|---|
 | Language / runtime | Scala 3.10.0 on JDK 25 (Eclipse Temurin 25.0.4.1, checksummed in `install.sh`), sbt 1.13.0 |
-| HTTP | Netty 4.2.19 (io_uring, epoll where the kernel doesn't allow it), hand-written HTTP/1.1 decoding: no Netty codec |
-| Postgres | a hand-written client for the PostgreSQL wire protocol 3.0 over Netty (SCRAM-SHA-256, extended query protocol, binary rows, pipelining): no JDBC |
-| JSON | hand-written: request bodies parsed strictly, responses written straight from Postgres's binary rows |
-| bcrypt, JWT | hand-written bcrypt (cost 10, `$2a$`/`$2b$`/`$2y$`; Blowfish's constants computed from pi at startup), HS256 in per-thread buffers |
+| HTTP | Netty 4.2.19 (io_uring, epoll where the kernel doesn't allow it), own HTTP/1.1 decoding: no Netty codec |
+| Postgres | own client for the PostgreSQL wire protocol 3.0 over Netty (SCRAM-SHA-256, extended query protocol, binary rows, pipelining): no JDBC |
+| JSON | own: request bodies parsed strictly, responses written straight from Postgres's binary rows |
+| bcrypt, JWT | own bcrypt (cost 10, `$2a$`/`$2b$`/`$2y$`; Blowfish's constants computed from pi at startup), HS256 in per-thread buffers |
 | Dependencies | Netty only (`build.sbt`, pinned); tests: munit, and Jackson and Spring Security's BCrypt as references |
 
 ```bash
@@ -121,14 +121,17 @@ All optional, as JVM system properties (`JAVA_TOOL_OPTIONS="-Dconduit.loops=2" b
 | `conduit.bcryptWaitMillis` | 400 | how long a hash waits for others to run four at a time |
 | `conduit.bcryptNice` | 0 | the bcrypt threads' nice value (up to 19: they wait whenever Postgres or a loop has work) |
 | `conduit.transport` | `io_uring` | or `epoll`; either falls back to NIO off Linux |
-| `conduit.maxConnections` | the descriptors | connections held per loop before the longest-idle are closed |
+| `conduit.maxConnections` | the descriptors | connections held per loop before the longest-idle are closed; with none idle, the server stops accepting until one is |
 | `conduit.idleTimeoutSeconds` | 75 | the spec asks for at least 65 |
+| `conduit.requestDeadlineSeconds` | 30 | how long a request may take to arrive whole before it gets a 408 |
+| `conduit.acceptsPerPass` | 1024 | new connections accepted per pass of the accepting loop |
+| `conduit.listenBacklog` | 65535 | the listen backlog asked for (the kernel caps it at `net.core.somaxconn`) |
 | `conduit.lagMonitor` | false | logs each loop's lag every 10 s |
 | `conduit.stats` | false | logs each loop's queries every 10 s: how many waited, the batches |
 
 ## Results
 
 Not yet run on the official box. On a local copy of it at half its size (Postgres and the server on 4 vCPUs, the
-challenge's load generator on others), at 72,000 users on a database grown by 29 million requests, in three 1-minute
-runs: 157-162 µs of CPU per request, the server's 49-51 and Postgres's 108-111; 3.0-3.1 of the 4 cores busy; p95
-8-11 ms, p99 21-24 ms, no errors.
+challenge's load generator on others), at 92,000 users on a fresh copy of the full seed, in three 1-minute runs: all
+three passed, at 23,900-24,200 requests a second; 107-125 µs of CPU per request, the server's 46-52 and Postgres's
+61-73; 2.6-3.0 of the 4 cores busy; p95 64-245 ms, p99 102-336 ms, no errors.

@@ -6,10 +6,10 @@ import java.security.{MessageDigest, SecureRandom}
 import java.util.Arrays
 import scala.annotation.nowarn
 
-/** bcrypt (Provos and Mazières, 1999), as OpenBSD computes it: `$2a$`/`$2b$`/`$2y$`
-  * hashes, the password's first 72 bytes of UTF-8. Every password the server stores is hashed at cost 10, and every
-  * login is checked against its stored hash (rule 7). CPU-bound for ~50 ms, so it runs on threads of its own
-  * ([[Passwords]]), never on an event loop.
+/** bcrypt (Provos and Mazières, 1999), as OpenBSD computes it: `$2a$`/`$2b$`/`$2y$` hashes, the password's first 72
+  * bytes of UTF-8. Every password the server stores is hashed at cost 10, and every login is checked against its
+  * stored hash (rule 7). CPU-bound for ~55 ms, so it runs on threads of its own ([[Passwords]]), never on an event
+  * loop.
   */
 object Bcrypt:
   val Cost = 10
@@ -240,12 +240,12 @@ object Bcrypt:
   /** [[f]] without bounds checks, for [[crypt4]]: each index is a byte of `x` (0 to 255) into its S-box, which is
     * always within the state's 1,042 words. Four lanes of `f` are ~16 loads whose checks the JIT can't remove (the
     * index isn't a loop variable), and the interleaved hashes are bound by instruction count: 18.5 ms of CPU per hash
-    * instead of 26.6. Each byte is extracted on its own and scaled in the address (`<< 2`), as a C
-    * compiler indexes a table, rather than shifted and masked to a byte offset in one go: 16.2 ms instead of 18.7. A
-    * method, not `inline`: [[expand4]] calls it 64 times, and inlined there it makes a method too big for the JIT to
-    * compile (93 ms per hash, interpreted); the JIT inlines it itself. `Unsafe`'s memory access is deprecated for
-    * removal, and allowed on JDK 25 (`install.sh` pins it) with `--sun-misc-unsafe-memory-access=allow` (`start.sh`);
-    * a later JDK would refuse it.
+    * instead of 26.6. Each byte is extracted on its own and scaled in the address (`<< 2`), as a C compiler indexes a
+    * table, rather than shifted and masked to a byte offset in one go: 16.2 ms instead of 18.7. A method, not
+    * `inline`: [[expand4]] calls it 64 times, and inlined there it makes a method too big for the JIT to compile (93 ms
+    * per hash, interpreted); the JIT inlines it itself. `Unsafe`'s memory access is deprecated for removal, and
+    * allowed on JDK 25 (`install.sh` pins it) with `--sun-misc-unsafe-memory-access=allow` (`start.sh`); a later JDK
+    * would refuse it.
     */
   @nowarn("cat=deprecation")
   private def fu(st: Array[Int], x: Int): Int =

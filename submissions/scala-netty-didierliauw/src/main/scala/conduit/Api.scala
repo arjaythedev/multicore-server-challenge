@@ -473,7 +473,7 @@ object Api:
       else if found then answered()
       else fail(Status.Unauthorized, Messages.Unauthorized)
 
-    /** The user's row has been written: by default, the response is ready. */
+    /** The user's row has been rendered: by default, the response is ready. */
     protected def answered(): Unit = finish(status)
 
   private final class CurrentUserCall(viewer: Long, presented: String) extends UserCall(Status.Ok):

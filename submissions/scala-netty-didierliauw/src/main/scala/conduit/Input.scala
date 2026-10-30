@@ -36,8 +36,7 @@ object Input:
         i += 1
       value
 
-  /** A query parameter's value: ASCII digits only, no sign or spaces, and fitting in a Long; -1 if it isn't one.
-    */
+  /** A query parameter's value: ASCII digits only, no sign or spaces, and fitting in a Long; -1 if it isn't one. */
   def unsigned(s: String): Long =
     if s.isEmpty || s.length > 19 then return -1
     var value = 0L

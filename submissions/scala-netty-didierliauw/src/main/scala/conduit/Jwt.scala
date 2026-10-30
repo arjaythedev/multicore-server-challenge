@@ -22,7 +22,9 @@ final class Jwt(secret: Array[Byte]):
     val key = if secret.length > Block then MessageDigest.getInstance("SHA-256").digest(secret) else secret
     Array.tabulate(Block)(i => ((if i < key.length then key(i) else 0) ^ x).toByte)
 
-  /** The user id (`sub`) of the token in `header` from `from` on (after `Token `), or [[Invalid]] if it is refused. */
+  /** The user id (`sub`) of the token in `header` from `from` on (after `Token `), or [[Jwt.Invalid]] if it is
+    * refused.
+    */
   def verify(header: String, from: Int, nowSeconds: Long): Long =
     val dot1 = header.indexOf('.', from)
     val dot2 = if dot1 < 0 then -1 else header.indexOf('.', dot1 + 1)
@@ -53,8 +55,8 @@ final class Jwt(secret: Array[Byte]):
     catch case _: Json.Malformed => false
 
   /** The payload's user id, from the token's part from `from` until `until`, or [[Invalid]]. `exp` is required and
-    * `nbf` optional; both must be numbers, and `sub` a positive id in a string.
-    * The last of each counts, as in `JSON.parse`.
+    * `nbf` optional; both must be numbers, and `sub` a positive id in a string. The last of each counts, as in
+    * `JSON.parse`.
     */
   private[conduit] def claims(header: String, from: Int, until: Int, now: Long): Long =
     val s = scratch.get()

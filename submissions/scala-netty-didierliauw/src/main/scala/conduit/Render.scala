@@ -116,7 +116,7 @@ object Render:
     profile(out, row, 0, following)
     out.byte('}')
 
-  /** A comment from the row's id, body, created_at, updated_at, username, bio, image and, unless given, following. */
+  /** A comment from the row's id, body, created_at, updated_at, username, bio and image, with `following`. */
   def comment(out: Out, row: PgRow, following: Boolean): Unit =
     out.bytes(IdKey).long(row.int8(0))
     out.bytes(CreatedAtKey)

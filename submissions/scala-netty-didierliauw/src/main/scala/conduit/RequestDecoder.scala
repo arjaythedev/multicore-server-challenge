@@ -79,7 +79,7 @@ class RequestDecoder extends ByteToMessageDecoder:
   protected def received(@unused ctx: ChannelHandlerContext, req: Request, out: util.List[AnyRef]): Unit =
     out.add(Request(req.method, req.path, req.query, req.authorization, req.body, req.keepAlive, req.http10))
 
-  /** Answers a request that can't be served and closes the connection, ignoring anything else it sends. */
+  /** Answers a request the server can't serve and closes the connection, ignoring anything else the client sends. */
   private def fail(ctx: ChannelHandlerContext, in: ByteBuf, response: Array[Byte]): Unit =
     failed = true
     in.skipBytes(in.readableBytes)

@@ -35,7 +35,7 @@ object PgConfig:
 final class Statement(val id: Int, val sql: String, val paramTypes: Array[Int]):
   private[conduit] val name: Array[Byte] = s"s$id".getBytes(US_ASCII)
 
-/** Postgres's types for the parameters this client sends (`pg_type.oid`). */
+/** Postgres's types for the parameters the server sends (`pg_type.oid`). */
 object Oid:
   val Bool = 16
   val Int8 = 20
@@ -453,7 +453,7 @@ final class PgConnection(pool: PgPool, config: PgConfig, statements: collection.
     buf.writeByte('p').writeInt(4 + bytes.length).writeBytes(bytes)
     ctx.writeAndFlush(buf)
 
-  /** Startup failed: say why, and close. */
+  /** The connection failed: fails the startup with `why` if it is still under way, else logs it; then closes. */
   private def fail(why: String): Unit =
     if !started.isDone then started.completeExceptionally(IllegalStateException(why))
     else Log.warn("Postgres connection failed", "error" -> why)
@@ -485,17 +485,16 @@ final class PgConnection(pool: PgPool, config: PgConfig, statements: collection.
     ctx.close()
 
 object PgConnection:
-  /** Settings for this client's sessions, sent with the login (rule 2 allows session-level settings): every statement's
-    * generic plan instead of planning it again for the first executions, no JIT compilation or parallel workers,
-    * which cost more than they save on queries this small, and no Memoize (none of the server's plans had one
-    * before batches).
+  /** Settings for the server's own sessions, sent with the login (rule 2 allows session-level settings): every
+    * statement's generic plan instead of planning it again for the first executions, no JIT compilation or parallel
+    * workers, which cost more than they save on queries this small, and no Memoize, which in a batch ([[Sql.Batch]])
+    * would hand a request rows cached for another's identical look-up: a batch shares only where it says so, in its
+    * shared and packed kinds (rule 5).
     */
   private val SessionSettings = Seq(
     "plan_cache_mode" -> "force_generic_plan",
     "jit" -> "off",
     "max_parallel_workers_per_gather" -> "0",
-    // In a batch ([[Sql.Batch]]) Memoize would hand a request rows cached for another's identical look-up: a batch
-    // shares only where it says so (`shared`).
     "enable_memoize" -> "off",
   )
 
@@ -517,16 +516,19 @@ object PgConnection:
       p = stop + 1
     PgError(code, message)
 
-/** A loop's connections to Postgres. With `drain`, a read goes to a read connection that has nothing in flight; if
-  * none is idle it waits in the pool's queue, and the next connection to finish takes the `roundSize` oldest reads
-  * that wait, whatever their kind (with 0, up to `batchSize` of every kind), each kind's together, up to `batchSize`
-  * of a kind in one statement ([[Sql.Batch]]): one round of statements in flight per connection. Without it, a read goes to the connection with the fewest in flight, up to `depth`, and a
-  * connection with room takes the oldest waiting read's kind. No timer either way: a batch is what accumulated while
-  * the connections were busy, and nothing waits for one at a light load. Writes
-  * ([[PgQuery.write]]) go to the `writers` write connections, one transaction in flight on each: those that wait go out
-  * together when one is free, up to `groupSize` of them in one transaction ([[WriteGroup]]), again no timer, so a group
-  * is what accumulated during the last one's commit. Without write connections, writes go as reads do. A lost
-  * connection is replaced; meanwhile the others serve.
+/** A loop's connections to Postgres.
+  *
+  * With `drain`, a read goes to a read connection that has nothing in flight; if none is idle it waits in the pool's
+  * queue, and the next connection to finish takes the `roundSize` oldest reads that wait, whatever their kind (with 0,
+  * up to `batchSize` of every kind), each kind's together, up to `batchSize` of a kind in one statement
+  * ([[Sql.Batch]]): one round of statements in flight per connection. Without it, a read goes to the connection with
+  * the fewest in flight, up to `depth`, and a connection with room takes the oldest waiting read's kind. No timer
+  * either way: a batch is what accumulated while the connections were busy, and nothing waits for one at a light load.
+  *
+  * Writes ([[PgQuery.write]]) go to the `writers` write connections, one transaction in flight on each: those that
+  * wait go out together when one is free, up to `groupSize` of them in one transaction ([[WriteGroup]]), again no
+  * timer, so a group is what accumulated during the last one's commit. Without write connections, writes go as reads
+  * do. A lost connection is replaced; meanwhile the others serve.
   */
 final class PgPool(
     loop: EventLoop,
@@ -566,7 +568,7 @@ final class PgPool(
 
   def size: Int = connections.length
 
-  // Counts since the last [[stats]]: queries, those that waited, the batches they went out in and the queries in them,
+  // Counts since the last `stats()`: queries, those that waited, the batches they went out in and the queries in them,
   // and the most waiting at once; the writes, the groups they went out in and the writes in them, and those sent again
   // after their group failed.
   private var submitted, queued, batches, batched, mostWaiting, writes, groups, grouped, retried = 0L
@@ -696,8 +698,8 @@ final class PgPool(
       sendOldest(c)
 
   /** Sends the `roundSize` oldest waiting reads on `c`, whatever their kind, each kind's together, so that every kind
-    * waits alike. Taking every kind's, up to
-    * `batchSize` of each, let the most frequent kinds fall rounds behind the others under overload.
+    * waits alike. Taking every kind's, up to `batchSize` of each, let the most frequent kinds fall rounds behind the
+    * others under overload.
     */
   private def sendOldest(c: PgConnection): Unit =
     var i = 0
@@ -822,10 +824,11 @@ object PgPool:
       q.nextQuery = null
       q
 
-/** Queries of one kind, sent as one statement: its parameters, an array each, from each query's, and each row back to
-  * its query by the batch's last column, the query's place in it from 1 ([[Sql.Batch]]); a shared batch's rows to
-  * every query; a packed batch's rows for all of them (0 in the last column, ahead of the queries' own) to what its
-  * first query keeps them in ([[PgQuery.packed]]), and each query's own with them.
+/** Queries of one kind sent as one statement ([[Sql.Batch]]). Each of the statement's parameters is an array holding
+  * that parameter from every query, and each row goes back to its query by the batch's last column: the query's place
+  * in the batch, from 1. A shared batch's rows go to every query; a packed batch's rows for all of them (0 in the last
+  * column, ahead of the queries' own) to what its first query keeps them in ([[PgQuery.packed]]), and each query's
+  * own with them.
   */
 private final class BatchQuery(kind: Sql.Batch, queries: Array[PgQuery]) extends PgQuery:
   private val n = queries.length

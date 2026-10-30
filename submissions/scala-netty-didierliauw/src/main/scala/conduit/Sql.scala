@@ -128,8 +128,9 @@ object Sql:
     Int8, Text,
   )
 
-  /** A new article, its slug computed by [[Input.slugify]] ($5) and its id: $1 author, $2 title, $3 description,
-    * $4 body. Then, in the same transaction, [[InsertTags]] and [[TagArticle]] if it has tags, and [[NewArticle]].
+  /** A new article, its slug computed by [[Input.slugify]] (`$5`) and its id: `$1` author, `$2` title, `$3`
+    * description, `$4` body. Then, in the same transaction, [[InsertTags]] and [[TagArticle]] if it has tags, and
+    * [[NewArticle]].
     */
   val InsertArticle: Statement = statement(
     """INSERT INTO articles (id, slug, author_id, title, description, body)
@@ -137,7 +138,7 @@ object Sql:
     Int8, Text, Text, Text, Text,
   )
 
-  /** The tags of $1 that don't exist yet, in name order: concurrent inserts of the same new tags take their locks
+  /** The tags of `$1` that don't exist yet, in name order: concurrent inserts of the same new tags take their locks
     * in the same order, and tags that exist cost no insert (nor a sequence value).
     */
   val InsertTags: Statement = statement(
@@ -148,7 +149,7 @@ object Sql:
     TextArray,
   )
 
-  /** The article just inserted on this connection gets the tags $1. A statement of its own: in READ COMMITTED it
+  /** The article just inserted on this connection gets the tags `$1`. A statement of its own: in READ COMMITTED it
     * sees the tags [[InsertTags]] inserted, and those others committed meanwhile.
     */
   val TagArticle: Statement = statement(
@@ -157,15 +158,15 @@ object Sql:
     TextArray,
   )
 
-  /** The article just inserted on this connection, for viewer $1 (its author). */
+  /** The article just inserted on this connection, for viewer `$1` (its author). */
   val NewArticle: Statement = statement(
     s"""SELECT $Full, ${tail("a", "$1")} FROM articles a JOIN users u ON u.id = a.author_id
        |WHERE a.id = (SELECT currval(pg_get_serial_sequence('articles', 'id')))""".stripMargin,
     Int8,
   )
 
-  /** The article with slug $2 updated by its author $1, as the spec's reference SQL updates it ($3 title,
-    * $4 description, $5 body, each null to keep it; $6 the new title's slug, null without one), and read back:
+  /** The article with slug `$2` updated by its author `$1`, as the spec's reference SQL updates it (`$3` title,
+    * `$4` description, `$5` body, each null to keep it; `$6` the new title's slug, null without one), and read back:
     * `author_id`, then the article's columns, null unless it was updated. No row: no such article.
     */
   val UpdateArticle: Statement = statement(
@@ -182,7 +183,7 @@ object Sql:
     Int8, Text, Text, Text, Text, Text,
   )
 
-  /** The article with slug $2, deleted if $1 is its author: its `author_id`. No row: no such article. */
+  /** The article with slug `$2`, deleted if `$1` is its author: its `author_id`. No row: no such article. */
   val DeleteArticle: Statement = statement(
     """WITH a AS (SELECT id, author_id FROM articles WHERE slug = $2),
       |d AS (DELETE FROM articles x USING a WHERE x.id = a.id AND a.author_id = $1)
@@ -190,8 +191,8 @@ object Sql:
     Int8, Text,
   )
 
-  /** The newest 100 comments on the article with slug $2, for viewer $1: id, body, created_at, updated_at, username,
-    * bio, image, following. No row: no such article; one row of nulls: no comments.
+  /** The newest 100 comments on the article with slug `$2`, for viewer `$1`: id, body, created_at, updated_at,
+    * username, bio, image, following. No row: no such article; one row of nulls: no comments.
     */
   val Comments: Statement = statement(
     """SELECT c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image,
@@ -206,8 +207,8 @@ object Sql:
     Int8, Text,
   )
 
-  /** A comment by $1 on the article with slug $2, with body $3: as [[Comments]] has it, without `following`. No row:
-    * no such article.
+  /** A comment by `$1` on the article with slug `$2`, with body `$3`: as [[Comments]] has it, without `following`.
+    * No row: no such article.
     */
   val CreateComment: Statement = statement(
     """WITH c AS (
@@ -217,7 +218,9 @@ object Sql:
     Int8, Text, Text,
   )
 
-  /** Comment $3 on the article with slug $2, deleted if $1 wrote it: its `author_id`. No row: no such comment there. */
+  /** Comment `$3` on the article with slug `$2`, deleted if `$1` wrote it: its `author_id`. No row: no such comment
+    * there.
+    */
   val DeleteComment: Statement = statement(
     """WITH c AS (SELECT c.id, c.author_id FROM comments c JOIN articles a ON a.id = c.article_id WHERE c.id = $3 AND a.slug = $2),
       |d AS (DELETE FROM comments x USING c WHERE x.id = c.id AND c.author_id = $1)
@@ -225,14 +228,14 @@ object Sql:
     Int8, Text, Int8,
   )
 
-  /** The profile of $2 for viewer $1: username, bio, image, following. */
+  /** The profile of `$2` for viewer `$1`: username, bio, image, following. */
   val Profile: Statement = statement(
     """SELECT u.username, u.bio, u.image, EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = u.id)
       |FROM users u WHERE u.username = $2""".stripMargin,
     Int8, Text,
   )
 
-  /** $1 follows $2: their username, bio and image. No row: no such user. */
+  /** `$1` follows `$2`: their username, bio and image. No row: no such user. */
   val Follow: Statement = statement(
     """WITH u AS (SELECT id, username, bio, image FROM users WHERE username = $2),
       |i AS (INSERT INTO follows (follower_id, followee_id) SELECT $1, id FROM u ON CONFLICT DO NOTHING)
@@ -265,7 +268,7 @@ object Sql:
     Int8,
   )
 
-  /** $1 the user; each of $2 email, $3 username, $4 password hash, $5 bio, $6 image null to keep it. */
+  /** `$1` the user; each of `$2` email, `$3` username, `$4` password hash, `$5` bio, `$6` image null to keep it. */
   val UpdateUser: Statement = statement(
     """UPDATE users SET email = COALESCE($2, email), username = COALESCE($3, username),
       |  password_hash = COALESCE($4, password_hash), bio = COALESCE($5, bio), image = COALESCE($6, image)
