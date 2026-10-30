@@ -27,6 +27,13 @@ def main():
         " ON c.author_id = fo.followee_id LIMIT 100")]
     viewers += [v for (v,) in conn.execute(
         "SELECT DISTINCT f.user_id FROM favorites f WHERE f.article_id > (SELECT max(id) - 60 FROM articles) LIMIT 100")]
+    # feed viewers: anonymous/unknown, users following nobody, users with small and large feeds
+    followers = [0, -1] + viewers[1:150] + [v for (v,) in conn.execute(
+        "SELECT follower_id FROM follows GROUP BY follower_id ORDER BY count(*) DESC LIMIT 30")]
+    # author lists: prolific authors, random users, an unknown name
+    names = [n for (n,) in conn.execute("SELECT u.username FROM users u JOIN articles a ON a.author_id = u.id"
+                                        " GROUP BY u.username ORDER BY count(*) DESC LIMIT 20")]
+    names += [n for (n,) in conn.execute("SELECT username FROM users ORDER BY random() LIMIT 60")] + ["no-such-user"]
     slugs = [s for (s,) in conn.execute("SELECT slug FROM articles ORDER BY id DESC LIMIT 200")]
     slugs += [s for (s,) in conn.execute("SELECT slug FROM articles ORDER BY random() LIMIT 200")]
     slugs += [s for (s,) in conn.execute(
@@ -47,6 +54,10 @@ def main():
     gens = {
         r._LIST_NONE_JSON: lambda: (rnd.choice(viewers), rnd.choice([10, 10, 5, 20]),
                                     0 if rnd.random() < 0.5 else 10 * rnd.randint(1, 4)),
+        r._LIST_FEED_JSON: lambda: (rnd.choice(followers), rnd.choice([10, 10, 5, 20]),
+                                    0 if rnd.random() < 0.5 else 10 * rnd.randint(1, 4)),
+        r._LIST_AUTHOR_JSON: lambda: (rnd.choice(viewers), rnd.choice(names), rnd.choice([10, 10, 5, 20]),
+                                      0 if rnd.random() < 0.5 else 10 * rnd.randint(1, 4)),
         r._ARTICLE_BY_SLUG_JSON: lambda: (rnd.choice(viewers), rnd.choice(slugs)),
         r._COMMENTS_BY_SLUG_JSON: lambda: (rnd.choice(viewers), rnd.choice(slugs)),
     }

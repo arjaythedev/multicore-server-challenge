@@ -111,7 +111,8 @@ build the user responses, and they are the contract `scripts/diffsql.py` checks 
   `force_generic_plan`: under `auto`, Postgres re-planned the list statements on every execution (~180 µs each).
 
   The broker runs a unit of queued requests in one of three ways:
-  - **Batched statement** (`pg_repository.BATCHED`: global list from 4 requests, article from 2, comments from 4):
+  - **Batched statement** (`pg_repository.BATCHED`: global list from 4 requests, feed and author list from 2,
+    article from 2, comments from 4):
     parameters are arrays with one element per request, the shared work runs once (an article's tags, favorites
     count and author once per distinct article; the list's capped count once per unit), and one body comes back per
     request. Single-connection Postgres time per request, batched against single, at 16 requests: global list 96 µs
@@ -119,6 +120,12 @@ build the user responses, and they are the contract `scripts/diffsql.py` checks 
     and deduplicated from `unnest` of an array: the generic plan can't see that a CTE is small, so it merge-joined all
     of `articles` and sized a hash table for thousands of rows. `scripts/batchcheck.py` checks that every batched body
     is byte for byte the single statement's. If a batch fails, its requests run again one by one.
+    In the list batches each request's count and page are its own (feed: per viewer; author list: per distinct
+    author), the article data is built once for the union of the pages, and the pages are put together in one grouped
+    join (a subquery per request scanned all the shared articles each time). The feed's cost is mostly per article,
+    favorites counts above all (popular authors' articles have up to 2,000), so the batch saves the most when feeds
+    overlap. Tag and favorited lists stay single: their keys rarely repeat in a unit, and batches measured 15–35%
+    slower than singles.
   - **Shared** (tags, no parameters): one execution answers every request in the unit.
   - Anything else: pipelined single statements, one Sync each.
 
@@ -157,11 +164,15 @@ and 154k of the ~2.5M comments, so most feeds were empty). Each row is one run, 
 | broker, batched reads, group commit (6 read connections) | 20,000 | 25,529 | 121 ms | 223 ms | pass |
 | same, 8 read connections | 24,000 | 25,854 | 494 ms | 915 ms | pass |
 | same, 6 read connections | 24,000 | 26,535 | 588 ms | 1,082 ms | fail |
+| + batched feed and author lists (6 read connections) | 24,000 | 27,535–28,756 | 271–351 ms | 599–616 ms | pass (2/2; without: 0/2) |
+| same | 28,000 | 29,694 | 443 ms | 957 ms | pass |
+| same, 8 read connections | 28,000 | 27,499 | 608 ms | 1,001 ms | fail |
 
 Per request at 8,000 test users (`cpusplit.sh`, two runs each): app + Postgres CPU went from 477–509k ns
 (`BROKER=0`) to 389–407k with the broker on 2 read connections. At saturation (24,000 test users) Postgres used
 about 4.7 cores, the workers about half a core each and the broker a quarter of one: the queue in front of the read
-connections is where requests wait, and the unbatched statements (the feed above all) are now the largest cost.
+connections is where requests wait, and the unbatched statements (the feed above all) were the largest cost.
+Batching the feed and author lists took Postgres from 161–174 to 143–146 µs per request at 24,000 test users.
 
 The earlier rows' p99 failures were mostly the laptop's own Postgres, which ran with 128 MB of shared buffers and
 forced checkpoints; it now runs the box's settings (`box/pg-conf.sh`). Per request, CPU went from about 600 µs app +

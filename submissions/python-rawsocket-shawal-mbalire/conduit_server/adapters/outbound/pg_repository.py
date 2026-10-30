@@ -359,14 +359,23 @@ _V_FOLLOWING = (
 )
 
 
-def _w_article_json(with_body: bool) -> str:
+def _w_article_json(with_body: bool, following: str = _V_FOLLOWING) -> str:
     return (
         "json_build_object('slug', w.slug, 'title', w.title, 'description', w.description,"
         + (" 'body', w.body," if with_body else "")
         + " 'tagList', w.tl, 'createdAt', w.ca, 'updatedAt', w.ua,"
         f" 'favorited', {_V_FAVORITED}, 'favoritesCount', w.fc,"
         " 'author', json_build_object('username', w.username, 'bio', w.bio, 'image', w.image,"
-        f" 'following', {_V_FOLLOWING}))"
+        f" 'following', {following}))"
+    )
+
+
+def _pages_json(article_json: str) -> str:
+    """CTE `j` (ord, a): each request's page as a json array, from `pg` (ord, id) and `w`, in one grouped join (a
+    subquery per request scanned all of `w` each time). Pages that are empty have no row."""
+    return (
+        f", j AS (SELECT pg.ord, json_agg({article_json} ORDER BY w.id DESC) AS a"
+        " FROM pg JOIN w ON w.id = pg.id JOIN v ON v.ord = pg.ord GROUP BY pg.ord)"
     )
 
 
@@ -381,11 +390,53 @@ _LIST_NONE_BATCH = _Stmt(
     f" w AS MATERIALIZED (SELECT {_SHARED_ARTICLE_COLS}"
     " FROM (SELECT DISTINCT id FROM unnest(ARRAY(SELECT id FROM pg)) id) d CROSS JOIN LATERAL (SELECT a.*, u.username, u.bio, u.image FROM articles a"
     " JOIN users u ON u.id = a.author_id WHERE a.id = d.id LIMIT 1) a)"
-    " SELECT v.ord, json_build_object('articles', COALESCE((SELECT json_agg("
-    f"{_w_article_json(False)} ORDER BY w.id DESC)"
-    " FROM pg JOIN w ON w.id = pg.id WHERE pg.ord = v.ord), '[]'), 'articlesCount', c.n)"
-    " FROM v, c ORDER BY v.ord"
+    f"{_pages_json(_w_article_json(False))}"
+    " SELECT v.ord, json_build_object('articles', COALESCE(j.a, '[]'), 'articlesCount', c.n)"
+    " FROM v CROSS JOIN c LEFT JOIN j ON j.ord = v.ord ORDER BY v.ord"
 )
+# Feed: each request's count and page are its own (as _FEED_SQL, viewer from v); the article data is built once
+# for the union of the pages (popular authors' newest articles are on many feeds).
+_LIST_FEED_BATCH = _Stmt(
+    "WITH v AS (SELECT * FROM unnest($1::bigint[], $2::int[], $3::int[]) WITH ORDINALITY AS v(viewer, lim, off, ord)),"
+    " pg AS MATERIALIZED (SELECT v.ord, p.id FROM v CROSS JOIN LATERAL"
+    " (SELECT * FROM (SELECT x.id FROM follows fo CROSS JOIN LATERAL"
+    " (SELECT a3.id FROM articles a3 WHERE a3.author_id = fo.followee_id ORDER BY a3.id DESC LIMIT (v.lim + v.off)) x"
+    " WHERE fo.follower_id = v.viewer ORDER BY x.id DESC LIMIT 100 OFFSET v.off) b ORDER BY b.id DESC LIMIT v.lim) p),"
+    f" w AS MATERIALIZED (SELECT {_SHARED_ARTICLE_COLS}"
+    " FROM (SELECT DISTINCT id FROM unnest(ARRAY(SELECT id FROM pg)) id) d CROSS JOIN LATERAL (SELECT a.*, u.username, u.bio, u.image FROM articles a"
+    " JOIN users u ON u.id = a.author_id WHERE a.id = d.id LIMIT 1) a)"
+    f"{_pages_json(_w_article_json(False, 'true'))}"
+    " SELECT v.ord, json_build_object('articles', COALESCE(j.a, '[]'), 'articlesCount',"
+    " (SELECT count(*) FROM (SELECT 1 FROM follows fo CROSS JOIN LATERAL"
+    " (SELECT 1 FROM articles a3 WHERE a3.author_id = fo.followee_id"
+    " ORDER BY a3.author_id DESC, a3.id ASC LIMIT 1000) a WHERE fo.follower_id = v.viewer LIMIT 1000) s))"
+    " FROM v LEFT JOIN j ON j.ord = v.ord ORDER BY v.ord"
+)
+def _keyed_list_batch(count_sql: str, page_sql: str) -> _Stmt:
+    """A list filtered by a key ($2, the tag or username; $3 limit, $4 offset): the count once per distinct key in the
+    unit, each request's page as the single statement's, the article data once for the union of the pages. Used for
+    author lists (the workload opens the authors of the newest articles); tag and favorited units measured slower
+    than singles (keys rarely repeat in a unit, and building `w` costs more than it shares)."""
+    count = count_sql.replace("$2", "d.key")
+    page = page_sql.replace("$2", "v.key").replace("$3::int", "v.lim").replace("$4::int", "v.off")
+    return _Stmt(
+        "WITH v AS (SELECT * FROM unnest($1::bigint[], $2::text[], $3::int[], $4::int[])"
+        " WITH ORDINALITY AS v(viewer, key, lim, off, ord)),"
+        f" c AS MATERIALIZED (SELECT d.key, ({count}) AS n FROM (SELECT DISTINCT key FROM unnest($2::text[]) key) d),"
+        f" pg AS MATERIALIZED (SELECT v.ord, p.id FROM v CROSS JOIN LATERAL ({page}) p),"
+        f" w AS MATERIALIZED (SELECT {_SHARED_ARTICLE_COLS}"
+        " FROM (SELECT DISTINCT id FROM unnest(ARRAY(SELECT id FROM pg)) id) d CROSS JOIN LATERAL"
+        " (SELECT a.*, u.username, u.bio, u.image FROM articles a"
+        " JOIN users u ON u.id = a.author_id WHERE a.id = d.id LIMIT 1) a)"
+        f"{_pages_json(_w_article_json(False))}"
+        " SELECT v.ord, json_build_object('articles', COALESCE(j.a, '[]'), 'articlesCount', c.n)"
+        " FROM v JOIN c ON c.key = v.key LEFT JOIN j ON j.ord = v.ord ORDER BY v.ord"
+    )
+
+
+_LIST_AUTHOR_BATCH = _keyed_list_batch(*_AUTHOR_SQL[:2])
+
+
 _ARTICLE_BY_SLUG_BATCH = _Stmt(
     "WITH v AS (SELECT * FROM unnest($1::bigint[], $2::text[]) WITH ORDINALITY AS v(viewer, slug, ord)),"
     f" w AS MATERIALIZED (SELECT {_SHARED_ARTICLE_COLS}, a.body"
@@ -421,6 +472,16 @@ def _viewer_text_params(jobs_args) -> tuple:
     return _int_array([a[0] for a in jobs_args]), _text_array([a[1] for a in jobs_args])
 
 
+def _keyed_list_params(jobs_args) -> tuple:
+    """(viewer, key, limit, offset) per request -> ($1 bigint[], $2 text[], $3 int[], $4 int[])."""
+    return (
+        _int_array([a[0] for a in jobs_args]),
+        _text_array([a[1] for a in jobs_args]),
+        _int_array([a[2] for a in jobs_args]),
+        _int_array([a[3] for a in jobs_args]),
+    )
+
+
 def _list_none_params(jobs_args) -> tuple:
     return (
         _int_array([a[0] for a in jobs_args]),
@@ -441,6 +502,8 @@ class Batched:
 # single statement index -> Batched
 BATCHED = {
     _LIST_NONE_JSON.index: Batched(_LIST_NONE_BATCH, _list_none_params, 4),
+    _LIST_FEED_JSON.index: Batched(_LIST_FEED_BATCH, _list_none_params, 2),
+    _LIST_AUTHOR_JSON.index: Batched(_LIST_AUTHOR_BATCH, _keyed_list_params, 2),
     _ARTICLE_BY_SLUG_JSON.index: Batched(_ARTICLE_BY_SLUG_BATCH, _viewer_text_params, 2),
     _COMMENTS_BY_SLUG_JSON.index: Batched(_COMMENTS_BY_SLUG_BATCH, _viewer_text_params, 4),
 }
