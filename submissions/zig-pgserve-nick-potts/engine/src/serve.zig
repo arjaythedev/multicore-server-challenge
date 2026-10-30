@@ -924,9 +924,10 @@ fn knobInt(comptime name: []const u8, value: []const u8, min: u32, max: u32) u32
 var clock: Clock = .{};
 var stats: Stats = .{};
 
-/// PGSERVE_THIN_TO (default 1; 0 turns it off): TCP_THIN_LINEAR_TIMEOUTS on every connection. An answer is 2-3 segments, so the kernel
-/// sees a thin stream and backs its retransmission timeout off linearly, not exponentially.
-var thin_to = true;
+/// PGSERVE_THIN_TO (default 0; 1 turns it on): TCP_THIN_LINEAR_TIMEOUTS on every connection. An answer is 2-3 segments, so the kernel
+/// sees a thin stream and, with this on, backs its retransmission timeout off linearly, not exponentially. Off, a burst
+/// of lost answers backs off and drains instead of retrying every 200 ms.
+var thin_to = false;
 
 fn watch(ep: i32, op: u32, fd: i32, events: u32, data: u64) void {
     var ev: linux.epoll_event = .{ .events = events, .data = .{ .u64 = data } };

@@ -44,7 +44,7 @@ DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit \
   `DATABASE_URL`. Two optional variables exist: `PGSERVE_WORKERS` (default 6) and `PGSERVE_LIB` (default
   `pgengine`).
 - `PGSERVE_HASH_NICE=N` (default 19) runs the bcrypt threads at nice `N`; 0 keeps them at the worker's.
-- `PGSERVE_THIN_TO=1` (the default; 0 turns it off) sets `TCP_THIN_LINEAR_TIMEOUTS` on every accepted connection.
+- `PGSERVE_THIN_TO=1` (off by default) sets `TCP_THIN_LINEAR_TIMEOUTS` on every accepted connection.
 - `PGSERVE_DWELL_US=N` (default 5,000; 0 turns it off; at most 50,000) is the batch clock, with `PGSERVE_DWELL_CAP`
   (default 256) and `PGSERVE_DWELL_MIN` (default 2). `PGSERVE_STATS_S=N` (off by default) logs each worker's batch
   sizes every `N` seconds. Both are under "How a request is served".
