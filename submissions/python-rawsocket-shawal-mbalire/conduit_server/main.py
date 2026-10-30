@@ -64,7 +64,8 @@ def serve(listener, database_url: str, jwt_secret: str, pool_size: int, threads:
         pipeline = None
     server = RawSocketHttpServer(
         host="", port=0, router=router, threads=threads, listener=listener,
-        offload=frozenset(router.offload), pipeline=pipeline,
+        offload=frozenset(router.offload - router.broker_ok if broker_sock is not None else router.offload),
+        pipeline=pipeline,
     )
     server.start()
 
@@ -114,6 +115,9 @@ def main():
     broker = threads == 0 and bool(pg_readers) and os.getenv("BROKER", "1") != "0"
     broker_readers = max(1, int(os.getenv("BROKER_READERS", 6)))
     broker_writers = max(1, int(os.getenv("BROKER_WRITERS", 2)))
+    # the broker's bcrypt threads (logins): a lone login waits up to BCRYPT_WAIT_MS for others to hash with it
+    bcrypt_threads = max(1, int(os.getenv("BCRYPT_THREADS", 2)))
+    bcrypt_wait = max(0, int(os.getenv("BCRYPT_WAIT_MS", 100))) / 1000
     if broker:
         total = broker_readers + broker_writers + workers
     else:
@@ -142,7 +146,8 @@ def main():
                 listener.close()
             for worker_end, _ in pairs:
                 worker_end.close()
-            serve_broker([broker_end for _, broker_end in pairs], database_url, broker_readers, broker_writers)
+            serve_broker([broker_end for _, broker_end in pairs], database_url, broker_readers, broker_writers,
+                         bcrypt_threads, bcrypt_wait)
         children.append(pid)
     for i in range(workers):
         pid = os.fork()

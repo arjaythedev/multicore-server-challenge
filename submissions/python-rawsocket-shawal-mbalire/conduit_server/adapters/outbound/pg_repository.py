@@ -802,6 +802,9 @@ class PostgresUserRepository(ArticleRepositoryPort):
     def find_user_by_email(self, email: str) -> Optional[dict]:
         return self._one(_USER_BY_EMAIL, email)
 
+    def q_find_user_by_email(self, email: str) -> Query:
+        return Query(self, _USER_BY_EMAIL, (email,), _first_dict(_USER_BY_EMAIL))
+
     def q_find_user_by_id(self, user_id: int) -> Query:
         return Query(self, _USER_BY_ID, (user_id,), _first_dict(_USER_BY_ID))
 

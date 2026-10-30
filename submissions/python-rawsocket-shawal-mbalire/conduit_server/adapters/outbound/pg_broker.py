@@ -15,6 +15,9 @@ connection is busy and drain as soon as one frees up. A unit of a kind with a ba
 (`pg_repository.BATCHED`, from its `min_size`) runs as that one statement; a statement without parameters
 (`SHARED`: tags) runs once for the whole unit; anything else runs as pipelined single statements.
 
+Logins send their bcrypt here too (statement index -1, `crypto_adapter.BcryptJob`): the broker's bcrypt threads
+hash up to 6 at once on the multi-lane bcrypt (`BcryptBatcher`), 4.4x less CPU per hash than one at a time.
+
 Writes queue the same way for the write connections, and a unit of several is one transaction (group commit, allowed
 by rule 6): BEGIN, the statements, COMMIT behind one Sync, so they share one WAL flush; each write's reply goes out
 only once COMMIT has returned. Committed one by one, writes queued for seconds behind the WAL flushes at 20,000 test
@@ -32,6 +35,7 @@ from collections import deque
 
 import psycopg
 
+from conduit_server.adapters.outbound.crypto_adapter import BcryptBatcher
 from conduit_server.adapters.outbound.pg_repository import (
     BATCHED,
     SHARED,
@@ -129,8 +133,8 @@ class BrokerClient:
         for frame in _frames(self.inbuf):
             for jid, status, value in frame:
                 query, token = inflight.pop(jid)
-                if status == _OK_JSON:
-                    out.append((token, value, None))
+                if status == _OK_JSON:  # a body, or a bcrypt hash (its job's `finish` turns it into the answer)
+                    out.append((token, value if query.finish is None else query.finish(value), None))
                 elif status == _OK_ROWS:
                     cols, rows = value
                     if query.stmt.cols is None:
@@ -240,8 +244,9 @@ def _error_reply(e: Exception) -> tuple:
 class Broker:
     """The broker process's epoll loop over the workers' sockets and its own Postgres connections."""
 
-    def __init__(self, socks, conninfo: str, readers: int, writers: int):
+    def __init__(self, socks, conninfo: str, readers: int, writers: int, bcrypt=None):
         self.socks = list(socks)
+        self.bcrypt = bcrypt  # BcryptBatcher: jobs with statement index -1
         for s in self.socks:
             s.setblocking(False)
         self.read_pipes = [PgPipeline(conninfo) for _ in range(readers)]
@@ -263,6 +268,9 @@ class Broker:
         self.pfd, self.pipe_state = {}, {}
         for p in self.read_pipes + self.write_pipes:
             self._watch_pipe(p, False)
+        bfd = self.bcrypt.efd if self.bcrypt is not None else -1
+        if bfd >= 0:
+            ep.register(bfd, _IN)
         print(f"Postgres broker (pid {os.getpid()}): {len(self.read_pipes)} read + {len(self.write_pipes)} write"
               " connections", flush=True)
         parent = os.getppid()
@@ -272,6 +280,10 @@ class Broker:
             if not events and os.getppid() != parent:
                 os._exit(0)  # supervisor is gone
             for fd, mask in events:
+                if fd == bfd:
+                    for (i, jid), value in self.bcrypt.results():
+                        replies[i].append((jid, _OK_JSON, value))
+                    continue
                 i = wfd.get(fd)
                 if i is not None:
                     if mask & select.EPOLLOUT:
@@ -312,7 +324,9 @@ class Broker:
         queues, writes = self.queues, self.writes
         for frame in _frames(buf):
             for jid, index, args, flags in frame:
-                if flags & _WRITE:
+                if index < 0:  # bcrypt (BcryptJob): hashed with other workers' logins
+                    self.bcrypt.submit((i, jid), *args)
+                elif flags & _WRITE:
                     writes.append((index, i, jid, args, bool(flags & _JSON)))
                 else:
                     self.seq += 1
@@ -452,9 +466,10 @@ class Broker:
         self.pipe_state[id(pipe)] = (fd, mask)
 
 
-def serve_broker(socks, conninfo: str, readers: int, writers: int):
+def serve_broker(socks, conninfo: str, readers: int, writers: int, bcrypt_threads: int = 2, bcrypt_wait: float = 0.1):
     try:
-        Broker(socks, conninfo, readers, writers).run()
+        batcher = BcryptBatcher(bcrypt_threads, bcrypt_wait)
+        Broker(socks, conninfo, readers, writers, batcher).run()
     except BaseException:
         import traceback
 

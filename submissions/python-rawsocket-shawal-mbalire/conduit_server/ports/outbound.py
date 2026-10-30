@@ -8,6 +8,9 @@ class CryptoPort(Protocol):
 
     def verify_password(self, password: str, password_hash: str) -> bool: ...
 
+    def q_verify_password(self, password: str, password_hash: str) -> "QueryPort":
+        """`verify_password` as a job a handler waits on (`ok = yield ...`), so logins can be hashed together."""
+
     def issue_token(self, user_id: int) -> str: ...
 
     def verify_token(self, token: str) -> int:

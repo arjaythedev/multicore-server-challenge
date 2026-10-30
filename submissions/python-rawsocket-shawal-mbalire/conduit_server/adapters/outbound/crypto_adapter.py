@@ -2,9 +2,12 @@ import binascii
 import ctypes
 import hashlib
 import hmac
+import os
 import orjson
+import re
 import threading
 import time
+from collections import deque
 import warnings
 
 import bcrypt
@@ -53,6 +56,151 @@ def _bcrypt(password: bytes, setting: bytes):
     return out if out and out.startswith(b"$2") else None
 
 
+# ---- multi-lane bcrypt ------------------------------------------------------------------------------------------
+# native/bcrypt_lanes.c (built by build.sh): up to 8 hashes in lockstep, so one hash's S-box loads overlap the others'
+# waits. Cost 10 per hash, single thread: 1 lane 37.6 ms (libxcrypt 38.4), 2: 19.8, 4: 11.3, 6: 8.8, 8: 9.3.
+LANES = 6
+_SETTING = re.compile(rb"\$2[aby]\$(0[4-9]|[12][0-9]|3[01])\$[./A-Za-z0-9]{22}")
+
+
+def _load_lanes():
+    """The native `bcrypt_many`, or None (not built, or its output differs from libxcrypt/pyca on a probe)."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "native", "libbcrypt_lanes.so")
+    try:
+        fn = ctypes.CDLL(path).bcrypt_many
+    except (OSError, AttributeError):
+        return None
+    fn.restype = ctypes.c_int
+    fn.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_char_p), ctypes.c_char_p]
+    pws = [b"probe", b"another probe \xc3\xa9", b"x" * 72]
+    settings = [bcrypt.gensalt(4, prefix=p) for p in (b"2a", b"2b", b"2b")]
+    out = ctypes.create_string_buffer(61 * 3)
+    if fn(3, (ctypes.c_char_p * 3)(*pws), (ctypes.c_char_p * 3)(*settings), out) != 0:
+        return None
+    for i, (pw, s) in enumerate(zip(pws, settings)):
+        if out.raw[61 * i : 61 * i + 60] != bcrypt.hashpw(pw, s):
+            return None
+    return fn
+
+
+_lanes = _load_lanes()
+
+
+def _bcrypt_one(password: bytes, setting: bytes):
+    """One hash without the lanes: libxcrypt, else pyca. None if `setting` isn't a bcrypt setting."""
+    try:
+        return _bcrypt(password, setting) or bcrypt.hashpw(password, setting)
+    except ValueError:
+        return None
+
+
+def bcrypt_many(jobs) -> list:
+    """bcrypt of each (password, setting) pair (both bytes, password at most 72 bytes): the hash, or None for a
+    malformed setting. Valid jobs run together on the lanes; a password with a NUL (C strings end there) or an odd
+    setting goes through libxcrypt/pyca on its own. Releases the GIL while hashing."""
+    out = [None] * len(jobs)
+    lane = []
+    for i, (pw, setting) in enumerate(jobs):
+        if _lanes is not None and b"\0" not in pw and _SETTING.match(setting):
+            lane.append(i)
+        else:
+            out[i] = _bcrypt_one(pw, setting)
+    for start in range(0, len(lane), LANES):
+        idx = lane[start : start + LANES]
+        n = len(idx)
+        buf = ctypes.create_string_buffer(61 * n)
+        pws = (ctypes.c_char_p * n)(*[jobs[i][0] for i in idx])
+        settings = (ctypes.c_char_p * n)(*[jobs[i][1] for i in idx])
+        if _lanes(n, pws, settings, buf) == 0:
+            raw = buf.raw
+            for k, i in enumerate(idx):
+                out[i] = raw[61 * k : 61 * k + 60]
+        else:  # can't happen after _SETTING; stay correct anyway
+            for i in idx:
+                out[i] = _bcrypt_one(*jobs[i])
+    return out
+
+
+def _false(_) -> bool:
+    return False
+
+
+class _BcryptStmt:
+    index = -1  # the broker's marker for a bcrypt job (statements are 0..n)
+
+
+class BcryptJob:
+    """A bcrypt a handler waits on (`ok = yield crypto.q_verify_password(...)`), like a repository Query: the broker
+    runs it on its bcrypt threads with other workers' logins (BcryptBatcher); `run()` computes it in place."""
+
+    __slots__ = ("args", "finish")
+    stmt = _BcryptStmt
+    json = True
+    write = False
+
+    def __init__(self, password: bytes, setting: bytes, finish):
+        self.args, self.finish = (password, setting), finish
+
+    def run(self):
+        return self.finish(bcrypt_many([self.args])[0])
+
+
+class BcryptBatcher:
+    """The broker's bcrypt threads. `submit` queues a job; finished (token, hash) pairs collect in `done` and
+    `efd` (an eventfd for the broker's epoll) is signalled. The first thread runs up to LANES queued jobs once LANES
+    are queued or the oldest has waited `wait` seconds (a lone login waits for company: 6 lanes cost 4.4x less per
+    hash than 1). The others take only full batches, for backlogs: an extra thread that took every job split the
+    queue into small, costly batches."""
+
+    def __init__(self, threads: int, wait: float):
+        self.wait = wait
+        self.queue = deque()  # (arrival, token, password, setting)
+        self.cv = threading.Condition()
+        self.done = deque()
+        self.efd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
+        for k in range(max(1, threads)):
+            threading.Thread(target=self._run, args=(k == 0,), daemon=True, name=f"bcrypt-{k}").start()
+
+    def submit(self, token, password: bytes, setting: bytes):
+        with self.cv:
+            self.queue.append((time.monotonic(), token, password, setting))
+            if len(self.queue) == 1 or len(self.queue) >= LANES:
+                self.cv.notify_all()
+
+    def results(self) -> list:
+        try:
+            os.eventfd_read(self.efd)
+        except BlockingIOError:
+            pass
+        done, out = self.done, []
+        while done:
+            out.append(done.popleft())
+        return out
+
+    def _run(self, primary: bool):
+        q, cv = self.queue, self.cv
+        while True:
+            with cv:
+                while True:
+                    n = len(q)
+                    if n >= LANES:
+                        break
+                    if primary and n:
+                        left = q[0][0] + self.wait - time.monotonic()
+                        if left <= 0:
+                            break
+                        cv.wait(left)
+                    else:
+                        cv.wait()
+                batch = [q.popleft() for _ in range(min(LANES, len(q)))]
+            try:
+                hashes = bcrypt_many([(pw, s) for _, _, pw, s in batch])
+            except Exception:  # never lose a waiting login: answer None (verify fails)
+                hashes = [None] * len(batch)
+            self.done.extend((job[1], h) for job, h in zip(batch, hashes))
+            os.eventfd_write(self.efd, 1)
+
+
 class JoseBcryptCryptoAdapter(CryptoPort):
     def __init__(self, secret_key: str):
         self._secret = secret_key
@@ -90,6 +238,14 @@ class JoseBcryptCryptoAdapter(CryptoPort):
             return hmac.compare_digest(computed, stored)
         except ValueError:
             return False
+
+    def q_verify_password(self, password: str, password_hash: str) -> BcryptJob:
+        """`verify_password` as a job a handler yields: True if the password matches. Over 72 bytes it can't (bcrypt
+        would use only the first 72), so that job hashes nothing useful and answers False."""
+        pw, stored = password.encode("utf-8"), password_hash.encode("utf-8")
+        if len(pw) > _MAX_PASSWORD:
+            return BcryptJob(b"", stored, _false)
+        return BcryptJob(pw, stored, lambda computed: computed is not None and hmac.compare_digest(computed, stored))
 
     def issue_token(self, user_id: int) -> str:
         now = int(time.time())

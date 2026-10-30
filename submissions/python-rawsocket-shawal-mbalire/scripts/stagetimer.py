@@ -67,6 +67,7 @@ for route in router_mod.router.routes:
 Crypto = crypto_adapter.JoseBcryptCryptoAdapter
 for name in ("hash_password", "verify_password"):
     _patch(Crypto, name, "bcrypt")
+_patch(crypto_adapter, "bcrypt_many", "bcrypt")  # logins, on the broker's bcrypt threads (looked up at call time)
 for name in ("issue_token", "verify_token"):
     _patch(Crypto, name, "jwt verify/issue")
 

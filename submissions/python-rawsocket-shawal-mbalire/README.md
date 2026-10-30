@@ -13,6 +13,12 @@ from the previous challenge, i wondered whether sockets could remove all the ove
   used only in the optional threaded mode
 - `bcrypt` 5.0.0 (salts, and the fallback), plus the OS's libxcrypt (`libcrypt.so.1`, loaded with `ctypes`) for the
   bcrypt computation itself: same algorithm and hash format, about 14% less CPU
+- Logins (with the broker): a multi-lane bcrypt in C, `conduit_server/adapters/outbound/native/bcrypt_lanes.c`, built
+  by `build.sh` with gcc and called through `ctypes`. It is OpenBSD's bcrypt, run for up to 8 passwords in lockstep so
+  one hash's S-box loads overlap the others' waits; Blowfish's initial tables are generated from the digits of pi
+  (`gen_pi.py`). Cost 10, CPU per hash, single thread on the laptop: libxcrypt 38.4 ms; 1 lane 37.6, 2 lanes 19.8,
+  4 lanes 11.3, 6 lanes 8.8, 8 lanes 9.3. Hashes are byte for byte libxcrypt's (checked when it loads, and on 139
+  hashes across costs, lane counts, `$2a`/`$2b`/`$2y` and password lengths); without the library, libxcrypt is used
 - `PyJWT` 2.15.1 (only to derive the HS256 header; tokens are signed and verified with stdlib `hmac`)
 - `orjson` 3.13.0: request bodies and the user responses
 
@@ -78,6 +84,10 @@ build the user responses, and they are the contract `scripts/diffsql.py` checks 
   - The three bcrypt routes (register, login, `PUT /api/user`, `offload=True` on the route) run on one helper thread
     per worker with its own connection, results handed back through a deque + `eventfd`, so a ~40 ms bcrypt doesn't
     stall the worker's other connections (the libxcrypt call releases the GIL).
+  - With the broker, login (`broker=True` on the route) runs on the loop instead: it yields its user lookup and then
+    its bcrypt to the broker, whose bcrypt threads (`BcryptBatcher`, `BCRYPT_THREADS`, default 2) hash up to 6
+    logins from all workers at once. A lone login waits up to `BCRYPT_WAIT_MS` (default 100) for others; a second
+    thread takes only full batches, when logins back up.
   - Postgres connections: the broker's 8 plus one per worker for the bcrypt helper, 14 in all (with `BROKER=0`: 4 per
     worker, 24). `main.py` refuses to start a configuration that could open more than 95. `PIPELINE=0` runs every
     query blocking on one connection instead.
@@ -167,6 +177,7 @@ and 154k of the ~2.5M comments, so most feeds were empty). Each row is one run, 
 | + batched feed and author lists (6 read connections) | 24,000 | 27,535–28,756 | 271–351 ms | 599–616 ms | pass (2/2; without: 0/2) |
 | same | 28,000 | 29,694 | 443 ms | 957 ms | pass |
 | same, 8 read connections | 28,000 | 27,499 | 608 ms | 1,001 ms | fail |
+| + multi-lane bcrypt for logins, in the broker | 28,000 | 30,240–31,185 | 459–481 ms | 706–884 ms | pass (2/2; without: 0/2) |
 
 Per request at 8,000 test users (`cpusplit.sh`, two runs each): app + Postgres CPU went from 477–509k ns
 (`BROKER=0`) to 389–407k with the broker on 2 read connections. At saturation (24,000 test users) Postgres used

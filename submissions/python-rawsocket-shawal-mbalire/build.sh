@@ -14,3 +14,8 @@ fi
 "$UV" venv --python 3.15 --managed-python --clear .venv
 "$UV" pip install --python .venv/bin/python --no-cache -c constraints.txt 'psycopg[c]' psycopg_pool bcrypt pyjwt orjson
 .venv/bin/python -c 'import sys, psycopg; assert psycopg.pq.__impl__ == "c", psycopg.pq.__impl__; print("python build ok:", sys.version.split()[0], "psycopg", psycopg.__version__, psycopg.pq.__impl__)'
+# Multi-lane bcrypt (native/bcrypt_lanes.c, called through ctypes): Blowfish's initial tables are generated from pi
+N=conduit_server/adapters/outbound/native
+.venv/bin/python $N/gen_pi.py $N/bf_init.h
+gcc -O3 -march=x86-64-v2 -fPIC -shared -Wall -o $N/libbcrypt_lanes.so $N/bcrypt_lanes.c
+echo "native build ok: $N/libbcrypt_lanes.so"

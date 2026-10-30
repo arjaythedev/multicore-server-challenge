@@ -91,7 +91,9 @@ def register(request: HttpRequest):
     return 201, UserResponse(user=_user_data(row, crypto.issue_token(row["id"])))
 
 
-@router.post("/api/users/login", offload=True)  # bcrypt verify
+# With the broker, logins yield their bcrypt to it, where other workers' logins share the hashing (6 lanes: 4.4x less
+# CPU per hash); without it, this generator runs on the offload helper thread, each step in place.
+@router.post("/api/users/login", offload=True, broker=True)  # bcrypt verify
 def login(request: HttpRequest):
     body = request.json()
     try:
@@ -99,8 +101,11 @@ def login(request: HttpRequest):
     except ValueError:
         raise ApiError(422, "email and password are required")
     user = body["user"]
-    row = db.find_user_by_email(user["email"])
-    if not row or not crypto.verify_password(user["password"], row["password_hash"]):
+    row = yield db.q_find_user_by_email(user["email"])
+    if not row:
+        raise ApiError(401, "invalid credentials")
+    ok = yield crypto.q_verify_password(user["password"], row["password_hash"])
+    if not ok:
         raise ApiError(401, "invalid credentials")
     return 200, UserResponse(user=_user_data(row, crypto.issue_token(row["id"])))
 

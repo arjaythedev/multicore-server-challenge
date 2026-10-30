@@ -75,23 +75,27 @@ class SocketRouter:
         self._static: Dict[Tuple[str, str], _Route] = {}  # (method, path) -> route without params
         # b"METHOD /path" of routes that hold the CPU for tens of ms (bcrypt): the server runs them off its loop
         self.offload: set = set()
+        # those of them that, with the Postgres broker, yield their bcrypt to it instead and run on the loop
+        self.broker_ok: set = set()
 
-    def get(self, path: str, offload: bool = False):
-        return self._register("GET", path, offload)
+    def get(self, path: str, offload: bool = False, broker: bool = False):
+        return self._register("GET", path, offload, broker)
 
-    def post(self, path: str, offload: bool = False):
-        return self._register("POST", path, offload)
+    def post(self, path: str, offload: bool = False, broker: bool = False):
+        return self._register("POST", path, offload, broker)
 
-    def put(self, path: str, offload: bool = False):
-        return self._register("PUT", path, offload)
+    def put(self, path: str, offload: bool = False, broker: bool = False):
+        return self._register("PUT", path, offload, broker)
 
-    def delete(self, path: str, offload: bool = False):
-        return self._register("DELETE", path, offload)
+    def delete(self, path: str, offload: bool = False, broker: bool = False):
+        return self._register("DELETE", path, offload, broker)
 
-    def _register(self, method: str, path: str, offload: bool = False):
+    def _register(self, method: str, path: str, offload: bool = False, broker: bool = False):
         if offload:
             assert ":" not in path, "offload is matched on the exact path"
             self.offload.add(f"{method} {path}".encode())
+            if broker:
+                self.broker_ok.add(f"{method} {path}".encode())
 
         def decorator(func: Callable):
             route = _Route(method, path, func)
