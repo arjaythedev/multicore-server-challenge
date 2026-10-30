@@ -54,7 +54,9 @@ def main():
         _ = sys_exit_group(2)
     if workers < 1:
         workers = 1
-    var bcrypt_workers = max(1, env_int("BCRYPT_WORKERS", 2))
+    # 4: ~80 hashes/s at ~50 ms each, so the ~28 logins/s of 100k users keep them under half busy (2 would run at
+    # 70-80%, where login latency climbs steeply). Idle ones cost nothing.
+    var bcrypt_workers = max(1, env_int("BCRYPT_WORKERS", 4))
 
     # One SOCK_SEQPACKET socketpair per (HTTP worker, bcrypt worker): pair_fds[2 * (h * B + b)] is the HTTP
     # worker's end, the next one the bcrypt worker's.

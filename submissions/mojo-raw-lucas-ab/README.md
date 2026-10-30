@@ -24,7 +24,7 @@ DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=... HO
 
 The binary links Mojo's runtime libraries from `/opt/mojo`, so it stays installed. Optional settings: `WORKERS`
 (HTTP worker processes, default 2), `PG_READ_CONNS` / `PG_WRITE_CONNS` (Postgres connections per worker, default 6
-and 2: 16 in all), `BCRYPT_WORKERS` (default 2), `PG_GENERIC_PLANS` (default 1), `PG_GROUP_STATS=N` (log the
+and 2: 16 in all), `BCRYPT_WORKERS` (default 4), `PG_GENERIC_PLANS` (default 1), `PG_GROUP_STATS=N` (log the
 group-commit counters every N groups).
 
 ## Design
