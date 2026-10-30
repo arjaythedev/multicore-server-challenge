@@ -184,8 +184,49 @@ q_user_update:
     .ascii "RETURNING id, username, email, bio, image"
 q_user_update_end:
 
+# Merged runs (writer.s): one statement for a run of consecutive same-type writes in a group commit. Param i is
+# the array of the jobs' params i; each row is the row that job's own statement returns, with the job's 1-based
+# ordinal in the run appended as a last int8 column. A favorite / follow repeated inside a run is inserted once.
+q_favorite_n:
+    .ascii "WITH r AS (SELECT x.k, x.uid, a.id FROM unnest($1::int8[], $2::text[]) WITH ORDINALITY x(uid, slug, k)\n"
+    .ascii "           JOIN articles a ON a.slug = x.slug),\n"
+    .ascii " w AS (INSERT INTO favorites (user_id, article_id) SELECT DISTINCT uid, id FROM r ORDER BY 1, 2 ON CONFLICT DO NOTHING)\n"
+    .ascii "SELECT id, k FROM r"
+q_favorite_n_end:
+
+q_unfavorite_n:
+    .ascii "WITH r AS (SELECT x.k, x.uid, a.id FROM unnest($1::int8[], $2::text[]) WITH ORDINALITY x(uid, slug, k)\n"
+    .ascii "           JOIN articles a ON a.slug = x.slug),\n"
+    .ascii " w AS (DELETE FROM favorites f USING r WHERE f.user_id = r.uid AND f.article_id = r.id)\n"
+    .ascii "SELECT id, k FROM r"
+q_unfavorite_n_end:
+
+q_follow_n:
+    .ascii "WITH r AS (SELECT x.k, x.fid, u.id, u.username, u.bio, u.image FROM unnest($1::int8[], $2::text[]) WITH ORDINALITY x(fid, uname, k)\n"
+    .ascii "           JOIN users u ON u.username = x.uname),\n"
+    .ascii " w AS (INSERT INTO follows (follower_id, followee_id) SELECT DISTINCT fid, id FROM r ORDER BY 1, 2 ON CONFLICT DO NOTHING)\n"
+    .ascii "SELECT username, bio, image, k FROM r"
+q_follow_n_end:
+
+q_unfollow_n:
+    .ascii "WITH r AS (SELECT x.k, x.fid, u.id, u.username, u.bio, u.image FROM unnest($1::int8[], $2::text[]) WITH ORDINALITY x(fid, uname, k)\n"
+    .ascii "           JOIN users u ON u.username = x.uname),\n"
+    .ascii " w AS (DELETE FROM follows fo USING r WHERE fo.follower_id = r.fid AND fo.followee_id = r.id)\n"
+    .ascii "SELECT username, bio, image, k FROM r"
+q_unfollow_n_end:
+
+# Comment ids are drawn in ordinal order, so the run's comments are numbered as if inserted one by one.
+q_comment_create_n:
+    .ascii "WITH r AS (SELECT x.k, a.id AS aid, x.uid, x.body FROM unnest($1::text[], $2::int8[], $3::text[]) WITH ORDINALITY x(slug, uid, body, k)\n"
+    .ascii "           JOIN articles a ON a.slug = x.slug),\n"
+    .ascii " n AS (SELECT o.k, o.aid, o.uid, o.body, nextval(pg_get_serial_sequence('comments', 'id')) AS id FROM (SELECT * FROM r ORDER BY k) o),\n"
+    .ascii " c AS (INSERT INTO comments (id, article_id, author_id, body) SELECT id, aid, uid, body FROM n\n"
+    .ascii "       RETURNING id, body, created_at, updated_at, author_id)\n"
+    .ascii "SELECT c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image, n.k FROM c JOIN n ON n.id = c.id JOIN users u ON u.id = c.author_id"
+q_comment_create_n_end:
+
 q_session:
-    .ascii "SET plan_cache_mode = force_generic_plan; SET jit = off; SET max_parallel_workers_per_gather = 0"
+    .ascii "SET plan_cache_mode = force_generic_plan; SET jit = off; SET max_parallel_workers_per_gather = 0; SET enable_memoize = off"
 q_session_end:
 
 # Statement table, indexed by S_* (app.inc order). Single-request forms first; the read families come first,
@@ -216,6 +257,11 @@ sql_table:
     STMT q_unfollow, q_unfollow_end                 # 20 S_UNFOLLOW
     STMT q_user_insert, q_user_insert_end           # 21 S_USER_INSERT
     STMT q_user_update, q_user_update_end           # 22 S_USER_UPDATE
+    STMT q_favorite_n, q_favorite_n_end             # 23 S_FAVORITE_N
+    STMT q_unfavorite_n, q_unfavorite_n_end         # 24 S_UNFAVORITE_N
+    STMT q_follow_n, q_follow_n_end                 # 25 S_FOLLOW_N
+    STMT q_unfollow_n, q_unfollow_n_end             # 26 S_UNFOLLOW_N
+    STMT q_comment_create_n, q_comment_create_n_end # 27 S_COMMENT_CREATE_N
 sql_table_end:
 .globl sql_count
 .equ sql_count, (sql_table_end - sql_table) / 16

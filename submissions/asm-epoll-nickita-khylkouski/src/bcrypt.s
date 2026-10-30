@@ -60,27 +60,26 @@ bf_atoi64:                        # indexed by (char - 0x20), 64 = invalid
     .endif
 .endm
 
-# eax = F(x) for a lane whose S-boxes start at [rbx + \d]:
-#   ((S0[b3] + S1[b2]) ^ S2[b1]) + S3[b0]. b1 comes out of dh, b0 from the lane's low byte. Clobbers edx, esi.
+# edx = F(x) for a lane whose S-boxes start at [rbx + \d]:
+#   ((S0[b3] + S1[b2]) ^ S2[b1]) + S3[b0]. One copy of x gives b1 (dh), b2 (dl after >> 16) and b3 (>> 8 more);
+#   b0 is the lane's low byte. Clobbers eax, esi.
 .macro FF x, d
     mov   edx, \x
-    shr   edx, 24
-    mov   eax, [rbx + \d + 0 + rdx*4]       # S0[x>>24]
-    mov   edx, \x
+    movzx esi, dh                           # b1
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rbx + \d + 1024 + rdx*4]    # + S1[(x>>16)&255]
-    mov   edx, \x
-    movzx edx, dh
-    xor   eax, [rbx + \d + 2048 + rdx*4]    # ^ S2[(x>>8)&255]
+    movzx eax, dl                           # b2
+    shr   edx, 8                            # b3
+    mov   edx, [rbx + \d + 0 + rdx*4]       # S0[x>>24]
+    add   edx, [rbx + \d + 1024 + rax*4]    # + S1[(x>>16)&255]
+    xor   edx, [rbx + \d + 2048 + rsi*4]    # ^ S2[(x>>8)&255]
     LOB   \x
-    add   eax, [rbx + \d + 3072 + rsi*4]    # + S3[x&255]
+    add   edx, [rbx + \d + 3072 + rsi*4]    # + S3[x&255]
 .endm
 
 # dst ^= F(src) ^ P[p]    (P-array at [rbx + \d + BCX_P])
 .macro RND dst, src, d, p
     FF    \src, \d
-    xor   \dst, eax
+    xor   \dst, edx
     xor   \dst, [rbx + \d + BCX_P + \p*4]
 .endm
 
@@ -1983,1348 +1982,1156 @@ bf_enc6:
     xor   ebx, [rsp + 80 + 4*BCX_SIZE + BCX_P]
     xor   edi, [rsp + 80 + 5*BCX_SIZE + BCX_P]
     mov   edx, r8d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r8d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r8d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 0*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 0*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r8b
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
-    xor   r12d, eax
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
+    xor   r12d, edx
     xor   r12d, [rsp + 80 + 0*BCX_SIZE + BCX_P + 4]
     mov   edx, r9d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r9d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r9d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 1*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 1*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r9b
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
-    xor   r13d, eax
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
+    xor   r13d, edx
     xor   r13d, [rsp + 80 + 1*BCX_SIZE + BCX_P + 4]
     mov   edx, r10d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r10d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r10d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 2*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 2*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r10b
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
-    xor   r14d, eax
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
+    xor   r14d, edx
     xor   r14d, [rsp + 80 + 2*BCX_SIZE + BCX_P + 4]
     mov   edx, r11d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r11d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r11d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 3*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 3*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r11b
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
-    xor   r15d, eax
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
+    xor   r15d, edx
     xor   r15d, [rsp + 80 + 3*BCX_SIZE + BCX_P + 4]
     mov   edx, ebx
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
-    mov   edx, ebx
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, ebx
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 4*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 4*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, bl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
-    xor   ebp, eax
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
+    xor   ebp, edx
     xor   ebp, [rsp + 80 + 4*BCX_SIZE + BCX_P + 4]
     mov   edx, edi
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
-    mov   edx, edi
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, edi
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 5*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 5*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, dil
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
-    xor   esi, eax
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
+    xor   esi, edx
     xor   esi, [rsp + 80 + 5*BCX_SIZE + BCX_P + 4]
     mov   edx, r12d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r12d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r12d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 0*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 0*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r12b
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
-    xor   r8d, eax
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
+    xor   r8d, edx
     xor   r8d, [rsp + 80 + 0*BCX_SIZE + BCX_P + 8]
     mov   edx, r13d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r13d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r13d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 1*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 1*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r13b
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
-    xor   r9d, eax
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
+    xor   r9d, edx
     xor   r9d, [rsp + 80 + 1*BCX_SIZE + BCX_P + 8]
     mov   edx, r14d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r14d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r14d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 2*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 2*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r14b
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
-    xor   r10d, eax
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
+    xor   r10d, edx
     xor   r10d, [rsp + 80 + 2*BCX_SIZE + BCX_P + 8]
     mov   edx, r15d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r15d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r15d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 3*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 3*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r15b
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
-    xor   r11d, eax
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
+    xor   r11d, edx
     xor   r11d, [rsp + 80 + 3*BCX_SIZE + BCX_P + 8]
     mov   edx, ebp
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
-    mov   edx, ebp
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, ebp
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 4*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 4*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, bpl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
-    xor   ebx, eax
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
+    xor   ebx, edx
     xor   ebx, [rsp + 80 + 4*BCX_SIZE + BCX_P + 8]
     mov   edx, esi
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
-    mov   edx, esi
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, esi
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 5*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 5*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, sil
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
-    xor   edi, eax
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
+    xor   edi, edx
     xor   edi, [rsp + 80 + 5*BCX_SIZE + BCX_P + 8]
     mov   edx, r8d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r8d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r8d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 0*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 0*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r8b
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
-    xor   r12d, eax
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
+    xor   r12d, edx
     xor   r12d, [rsp + 80 + 0*BCX_SIZE + BCX_P + 12]
     mov   edx, r9d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r9d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r9d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 1*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 1*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r9b
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
-    xor   r13d, eax
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
+    xor   r13d, edx
     xor   r13d, [rsp + 80 + 1*BCX_SIZE + BCX_P + 12]
     mov   edx, r10d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r10d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r10d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 2*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 2*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r10b
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
-    xor   r14d, eax
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
+    xor   r14d, edx
     xor   r14d, [rsp + 80 + 2*BCX_SIZE + BCX_P + 12]
     mov   edx, r11d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r11d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r11d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 3*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 3*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r11b
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
-    xor   r15d, eax
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
+    xor   r15d, edx
     xor   r15d, [rsp + 80 + 3*BCX_SIZE + BCX_P + 12]
     mov   edx, ebx
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
-    mov   edx, ebx
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, ebx
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 4*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 4*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, bl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
-    xor   ebp, eax
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
+    xor   ebp, edx
     xor   ebp, [rsp + 80 + 4*BCX_SIZE + BCX_P + 12]
     mov   edx, edi
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
-    mov   edx, edi
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, edi
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 5*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 5*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, dil
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
-    xor   esi, eax
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
+    xor   esi, edx
     xor   esi, [rsp + 80 + 5*BCX_SIZE + BCX_P + 12]
     mov   edx, r12d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r12d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r12d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 0*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 0*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r12b
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
-    xor   r8d, eax
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
+    xor   r8d, edx
     xor   r8d, [rsp + 80 + 0*BCX_SIZE + BCX_P + 16]
     mov   edx, r13d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r13d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r13d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 1*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 1*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r13b
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
-    xor   r9d, eax
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
+    xor   r9d, edx
     xor   r9d, [rsp + 80 + 1*BCX_SIZE + BCX_P + 16]
     mov   edx, r14d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r14d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r14d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 2*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 2*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r14b
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
-    xor   r10d, eax
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
+    xor   r10d, edx
     xor   r10d, [rsp + 80 + 2*BCX_SIZE + BCX_P + 16]
     mov   edx, r15d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r15d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r15d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 3*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 3*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r15b
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
-    xor   r11d, eax
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
+    xor   r11d, edx
     xor   r11d, [rsp + 80 + 3*BCX_SIZE + BCX_P + 16]
     mov   edx, ebp
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
-    mov   edx, ebp
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, ebp
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 4*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 4*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, bpl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
-    xor   ebx, eax
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
+    xor   ebx, edx
     xor   ebx, [rsp + 80 + 4*BCX_SIZE + BCX_P + 16]
     mov   edx, esi
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
-    mov   edx, esi
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, esi
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 5*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 5*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, sil
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
-    xor   edi, eax
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
+    xor   edi, edx
     xor   edi, [rsp + 80 + 5*BCX_SIZE + BCX_P + 16]
     mov   edx, r8d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r8d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r8d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 0*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 0*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r8b
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
-    xor   r12d, eax
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
+    xor   r12d, edx
     xor   r12d, [rsp + 80 + 0*BCX_SIZE + BCX_P + 20]
     mov   edx, r9d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r9d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r9d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 1*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 1*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r9b
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
-    xor   r13d, eax
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
+    xor   r13d, edx
     xor   r13d, [rsp + 80 + 1*BCX_SIZE + BCX_P + 20]
     mov   edx, r10d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r10d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r10d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 2*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 2*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r10b
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
-    xor   r14d, eax
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
+    xor   r14d, edx
     xor   r14d, [rsp + 80 + 2*BCX_SIZE + BCX_P + 20]
     mov   edx, r11d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r11d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r11d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 3*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 3*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r11b
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
-    xor   r15d, eax
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
+    xor   r15d, edx
     xor   r15d, [rsp + 80 + 3*BCX_SIZE + BCX_P + 20]
     mov   edx, ebx
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
-    mov   edx, ebx
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, ebx
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 4*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 4*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, bl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
-    xor   ebp, eax
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
+    xor   ebp, edx
     xor   ebp, [rsp + 80 + 4*BCX_SIZE + BCX_P + 20]
     mov   edx, edi
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
-    mov   edx, edi
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, edi
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 5*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 5*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, dil
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
-    xor   esi, eax
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
+    xor   esi, edx
     xor   esi, [rsp + 80 + 5*BCX_SIZE + BCX_P + 20]
     mov   edx, r12d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r12d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r12d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 0*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 0*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r12b
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
-    xor   r8d, eax
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
+    xor   r8d, edx
     xor   r8d, [rsp + 80 + 0*BCX_SIZE + BCX_P + 24]
     mov   edx, r13d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r13d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r13d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 1*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 1*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r13b
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
-    xor   r9d, eax
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
+    xor   r9d, edx
     xor   r9d, [rsp + 80 + 1*BCX_SIZE + BCX_P + 24]
     mov   edx, r14d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r14d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r14d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 2*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 2*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r14b
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
-    xor   r10d, eax
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
+    xor   r10d, edx
     xor   r10d, [rsp + 80 + 2*BCX_SIZE + BCX_P + 24]
     mov   edx, r15d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r15d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r15d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 3*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 3*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r15b
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
-    xor   r11d, eax
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
+    xor   r11d, edx
     xor   r11d, [rsp + 80 + 3*BCX_SIZE + BCX_P + 24]
     mov   edx, ebp
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
-    mov   edx, ebp
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, ebp
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 4*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 4*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, bpl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
-    xor   ebx, eax
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
+    xor   ebx, edx
     xor   ebx, [rsp + 80 + 4*BCX_SIZE + BCX_P + 24]
     mov   edx, esi
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
-    mov   edx, esi
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, esi
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 5*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 5*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, sil
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
-    xor   edi, eax
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
+    xor   edi, edx
     xor   edi, [rsp + 80 + 5*BCX_SIZE + BCX_P + 24]
     mov   edx, r8d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r8d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r8d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 0*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 0*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r8b
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
-    xor   r12d, eax
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
+    xor   r12d, edx
     xor   r12d, [rsp + 80 + 0*BCX_SIZE + BCX_P + 28]
     mov   edx, r9d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r9d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r9d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 1*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 1*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r9b
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
-    xor   r13d, eax
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
+    xor   r13d, edx
     xor   r13d, [rsp + 80 + 1*BCX_SIZE + BCX_P + 28]
     mov   edx, r10d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r10d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r10d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 2*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 2*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r10b
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
-    xor   r14d, eax
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
+    xor   r14d, edx
     xor   r14d, [rsp + 80 + 2*BCX_SIZE + BCX_P + 28]
     mov   edx, r11d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r11d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r11d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 3*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 3*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r11b
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
-    xor   r15d, eax
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
+    xor   r15d, edx
     xor   r15d, [rsp + 80 + 3*BCX_SIZE + BCX_P + 28]
     mov   edx, ebx
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
-    mov   edx, ebx
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, ebx
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 4*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 4*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, bl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
-    xor   ebp, eax
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
+    xor   ebp, edx
     xor   ebp, [rsp + 80 + 4*BCX_SIZE + BCX_P + 28]
     mov   edx, edi
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
-    mov   edx, edi
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, edi
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 5*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 5*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, dil
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
-    xor   esi, eax
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
+    xor   esi, edx
     xor   esi, [rsp + 80 + 5*BCX_SIZE + BCX_P + 28]
     mov   edx, r12d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r12d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r12d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 0*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 0*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r12b
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
-    xor   r8d, eax
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
+    xor   r8d, edx
     xor   r8d, [rsp + 80 + 0*BCX_SIZE + BCX_P + 32]
     mov   edx, r13d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r13d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r13d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 1*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 1*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r13b
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
-    xor   r9d, eax
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
+    xor   r9d, edx
     xor   r9d, [rsp + 80 + 1*BCX_SIZE + BCX_P + 32]
     mov   edx, r14d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r14d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r14d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 2*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 2*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r14b
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
-    xor   r10d, eax
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
+    xor   r10d, edx
     xor   r10d, [rsp + 80 + 2*BCX_SIZE + BCX_P + 32]
     mov   edx, r15d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r15d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r15d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 3*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 3*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r15b
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
-    xor   r11d, eax
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
+    xor   r11d, edx
     xor   r11d, [rsp + 80 + 3*BCX_SIZE + BCX_P + 32]
     mov   edx, ebp
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
-    mov   edx, ebp
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, ebp
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 4*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 4*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, bpl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
-    xor   ebx, eax
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
+    xor   ebx, edx
     xor   ebx, [rsp + 80 + 4*BCX_SIZE + BCX_P + 32]
     mov   edx, esi
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
-    mov   edx, esi
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, esi
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 5*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 5*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, sil
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
-    xor   edi, eax
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
+    xor   edi, edx
     xor   edi, [rsp + 80 + 5*BCX_SIZE + BCX_P + 32]
     mov   edx, r8d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r8d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r8d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 0*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 0*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r8b
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
-    xor   r12d, eax
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
+    xor   r12d, edx
     xor   r12d, [rsp + 80 + 0*BCX_SIZE + BCX_P + 36]
     mov   edx, r9d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r9d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r9d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 1*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 1*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r9b
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
-    xor   r13d, eax
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
+    xor   r13d, edx
     xor   r13d, [rsp + 80 + 1*BCX_SIZE + BCX_P + 36]
     mov   edx, r10d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r10d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r10d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 2*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 2*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r10b
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
-    xor   r14d, eax
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
+    xor   r14d, edx
     xor   r14d, [rsp + 80 + 2*BCX_SIZE + BCX_P + 36]
     mov   edx, r11d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r11d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r11d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 3*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 3*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r11b
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
-    xor   r15d, eax
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
+    xor   r15d, edx
     xor   r15d, [rsp + 80 + 3*BCX_SIZE + BCX_P + 36]
     mov   edx, ebx
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
-    mov   edx, ebx
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, ebx
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 4*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 4*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, bl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
-    xor   ebp, eax
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
+    xor   ebp, edx
     xor   ebp, [rsp + 80 + 4*BCX_SIZE + BCX_P + 36]
     mov   edx, edi
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
-    mov   edx, edi
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, edi
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 5*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 5*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, dil
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
-    xor   esi, eax
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
+    xor   esi, edx
     xor   esi, [rsp + 80 + 5*BCX_SIZE + BCX_P + 36]
     mov   edx, r12d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r12d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r12d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 0*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 0*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r12b
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
-    xor   r8d, eax
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
+    xor   r8d, edx
     xor   r8d, [rsp + 80 + 0*BCX_SIZE + BCX_P + 40]
     mov   edx, r13d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r13d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r13d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 1*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 1*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r13b
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
-    xor   r9d, eax
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
+    xor   r9d, edx
     xor   r9d, [rsp + 80 + 1*BCX_SIZE + BCX_P + 40]
     mov   edx, r14d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r14d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r14d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 2*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 2*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r14b
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
-    xor   r10d, eax
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
+    xor   r10d, edx
     xor   r10d, [rsp + 80 + 2*BCX_SIZE + BCX_P + 40]
     mov   edx, r15d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r15d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r15d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 3*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 3*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r15b
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
-    xor   r11d, eax
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
+    xor   r11d, edx
     xor   r11d, [rsp + 80 + 3*BCX_SIZE + BCX_P + 40]
     mov   edx, ebp
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
-    mov   edx, ebp
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, ebp
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 4*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 4*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, bpl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
-    xor   ebx, eax
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
+    xor   ebx, edx
     xor   ebx, [rsp + 80 + 4*BCX_SIZE + BCX_P + 40]
     mov   edx, esi
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
-    mov   edx, esi
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, esi
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 5*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 5*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, sil
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
-    xor   edi, eax
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
+    xor   edi, edx
     xor   edi, [rsp + 80 + 5*BCX_SIZE + BCX_P + 40]
     mov   edx, r8d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r8d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r8d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 0*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 0*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r8b
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
-    xor   r12d, eax
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
+    xor   r12d, edx
     xor   r12d, [rsp + 80 + 0*BCX_SIZE + BCX_P + 44]
     mov   edx, r9d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r9d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r9d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 1*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 1*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r9b
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
-    xor   r13d, eax
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
+    xor   r13d, edx
     xor   r13d, [rsp + 80 + 1*BCX_SIZE + BCX_P + 44]
     mov   edx, r10d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r10d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r10d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 2*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 2*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r10b
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
-    xor   r14d, eax
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
+    xor   r14d, edx
     xor   r14d, [rsp + 80 + 2*BCX_SIZE + BCX_P + 44]
     mov   edx, r11d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r11d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r11d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 3*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 3*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r11b
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
-    xor   r15d, eax
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
+    xor   r15d, edx
     xor   r15d, [rsp + 80 + 3*BCX_SIZE + BCX_P + 44]
     mov   edx, ebx
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
-    mov   edx, ebx
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, ebx
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 4*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 4*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, bl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
-    xor   ebp, eax
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
+    xor   ebp, edx
     xor   ebp, [rsp + 80 + 4*BCX_SIZE + BCX_P + 44]
     mov   edx, edi
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
-    mov   edx, edi
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, edi
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 5*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 5*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, dil
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
-    xor   esi, eax
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
+    xor   esi, edx
     xor   esi, [rsp + 80 + 5*BCX_SIZE + BCX_P + 44]
     mov   edx, r12d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r12d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r12d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 0*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 0*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r12b
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
-    xor   r8d, eax
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
+    xor   r8d, edx
     xor   r8d, [rsp + 80 + 0*BCX_SIZE + BCX_P + 48]
     mov   edx, r13d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r13d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r13d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 1*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 1*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r13b
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
-    xor   r9d, eax
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
+    xor   r9d, edx
     xor   r9d, [rsp + 80 + 1*BCX_SIZE + BCX_P + 48]
     mov   edx, r14d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r14d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r14d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 2*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 2*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r14b
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
-    xor   r10d, eax
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
+    xor   r10d, edx
     xor   r10d, [rsp + 80 + 2*BCX_SIZE + BCX_P + 48]
     mov   edx, r15d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r15d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r15d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 3*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 3*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r15b
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
-    xor   r11d, eax
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
+    xor   r11d, edx
     xor   r11d, [rsp + 80 + 3*BCX_SIZE + BCX_P + 48]
     mov   edx, ebp
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
-    mov   edx, ebp
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, ebp
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 4*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 4*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, bpl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
-    xor   ebx, eax
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
+    xor   ebx, edx
     xor   ebx, [rsp + 80 + 4*BCX_SIZE + BCX_P + 48]
     mov   edx, esi
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
-    mov   edx, esi
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, esi
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 5*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 5*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, sil
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
-    xor   edi, eax
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
+    xor   edi, edx
     xor   edi, [rsp + 80 + 5*BCX_SIZE + BCX_P + 48]
     mov   edx, r8d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r8d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r8d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 0*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 0*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r8b
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
-    xor   r12d, eax
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
+    xor   r12d, edx
     xor   r12d, [rsp + 80 + 0*BCX_SIZE + BCX_P + 52]
     mov   edx, r9d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r9d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r9d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 1*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 1*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r9b
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
-    xor   r13d, eax
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
+    xor   r13d, edx
     xor   r13d, [rsp + 80 + 1*BCX_SIZE + BCX_P + 52]
     mov   edx, r10d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r10d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r10d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 2*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 2*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r10b
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
-    xor   r14d, eax
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
+    xor   r14d, edx
     xor   r14d, [rsp + 80 + 2*BCX_SIZE + BCX_P + 52]
     mov   edx, r11d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r11d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r11d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 3*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 3*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r11b
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
-    xor   r15d, eax
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
+    xor   r15d, edx
     xor   r15d, [rsp + 80 + 3*BCX_SIZE + BCX_P + 52]
     mov   edx, ebx
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
-    mov   edx, ebx
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, ebx
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 4*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 4*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, bl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
-    xor   ebp, eax
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
+    xor   ebp, edx
     xor   ebp, [rsp + 80 + 4*BCX_SIZE + BCX_P + 52]
     mov   edx, edi
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
-    mov   edx, edi
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, edi
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 5*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 5*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, dil
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
-    xor   esi, eax
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
+    xor   esi, edx
     xor   esi, [rsp + 80 + 5*BCX_SIZE + BCX_P + 52]
     mov   edx, r12d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r12d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r12d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 0*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 0*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r12b
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
-    xor   r8d, eax
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
+    xor   r8d, edx
     xor   r8d, [rsp + 80 + 0*BCX_SIZE + BCX_P + 56]
     mov   edx, r13d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r13d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r13d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 1*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 1*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r13b
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
-    xor   r9d, eax
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
+    xor   r9d, edx
     xor   r9d, [rsp + 80 + 1*BCX_SIZE + BCX_P + 56]
     mov   edx, r14d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r14d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r14d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 2*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 2*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r14b
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
-    xor   r10d, eax
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
+    xor   r10d, edx
     xor   r10d, [rsp + 80 + 2*BCX_SIZE + BCX_P + 56]
     mov   edx, r15d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r15d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r15d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 3*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 3*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r15b
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
-    xor   r11d, eax
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
+    xor   r11d, edx
     xor   r11d, [rsp + 80 + 3*BCX_SIZE + BCX_P + 56]
     mov   edx, ebp
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
-    mov   edx, ebp
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, ebp
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 4*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 4*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, bpl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
-    xor   ebx, eax
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
+    xor   ebx, edx
     xor   ebx, [rsp + 80 + 4*BCX_SIZE + BCX_P + 56]
     mov   edx, esi
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
-    mov   edx, esi
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, esi
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 5*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 5*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, sil
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
-    xor   edi, eax
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
+    xor   edi, edx
     xor   edi, [rsp + 80 + 5*BCX_SIZE + BCX_P + 56]
     mov   edx, r8d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r8d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r8d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 0*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 0*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r8b
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
-    xor   r12d, eax
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
+    xor   r12d, edx
     xor   r12d, [rsp + 80 + 0*BCX_SIZE + BCX_P + 60]
     mov   edx, r9d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r9d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r9d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 1*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 1*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r9b
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
-    xor   r13d, eax
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
+    xor   r13d, edx
     xor   r13d, [rsp + 80 + 1*BCX_SIZE + BCX_P + 60]
     mov   edx, r10d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r10d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r10d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 2*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 2*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r10b
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
-    xor   r14d, eax
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
+    xor   r14d, edx
     xor   r14d, [rsp + 80 + 2*BCX_SIZE + BCX_P + 60]
     mov   edx, r11d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r11d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r11d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 3*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 3*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r11b
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
-    xor   r15d, eax
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
+    xor   r15d, edx
     xor   r15d, [rsp + 80 + 3*BCX_SIZE + BCX_P + 60]
     mov   edx, ebx
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
-    mov   edx, ebx
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, ebx
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 4*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 4*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, bl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
-    xor   ebp, eax
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
+    xor   ebp, edx
     xor   ebp, [rsp + 80 + 4*BCX_SIZE + BCX_P + 60]
     mov   edx, edi
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
-    mov   edx, edi
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, edi
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 5*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 5*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, dil
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
-    xor   esi, eax
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
+    xor   esi, edx
     xor   esi, [rsp + 80 + 5*BCX_SIZE + BCX_P + 60]
     mov   edx, r12d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r12d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r12d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 0*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 0*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 0*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r12b
-    add   eax, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
-    xor   r8d, eax
+    add   edx, [rsp + 80 + 0*BCX_SIZE + 3072 + rcx*4]
+    xor   r8d, edx
     xor   r8d, [rsp + 80 + 0*BCX_SIZE + BCX_P + 64]
     mov   edx, r13d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r13d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r13d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 1*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 1*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 1*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r13b
-    add   eax, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
-    xor   r9d, eax
+    add   edx, [rsp + 80 + 1*BCX_SIZE + 3072 + rcx*4]
+    xor   r9d, edx
     xor   r9d, [rsp + 80 + 1*BCX_SIZE + BCX_P + 64]
     mov   edx, r14d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r14d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r14d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 2*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 2*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 2*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r14b
-    add   eax, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
-    xor   r10d, eax
+    add   edx, [rsp + 80 + 2*BCX_SIZE + 3072 + rcx*4]
+    xor   r10d, edx
     xor   r10d, [rsp + 80 + 2*BCX_SIZE + BCX_P + 64]
     mov   edx, r15d
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
-    mov   edx, r15d
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, r15d
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 3*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 3*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 3*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, r15b
-    add   eax, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
-    xor   r11d, eax
+    add   edx, [rsp + 80 + 3*BCX_SIZE + 3072 + rcx*4]
+    xor   r11d, edx
     xor   r11d, [rsp + 80 + 3*BCX_SIZE + BCX_P + 64]
     mov   edx, ebp
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
-    mov   edx, ebp
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, ebp
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 4*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 4*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 4*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, bpl
-    add   eax, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
-    xor   ebx, eax
+    add   edx, [rsp + 80 + 4*BCX_SIZE + 3072 + rcx*4]
+    xor   ebx, edx
     xor   ebx, [rsp + 80 + 4*BCX_SIZE + BCX_P + 64]
     mov   edx, esi
-    shr   edx, 24
-    mov   eax, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
-    mov   edx, esi
+    movzx ecx, dh
     shr   edx, 16
-    movzx edx, dl
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 1024 + rdx*4]
-    mov   edx, esi
-    movzx edx, dh
-    xor   eax, [rsp + 80 + 5*BCX_SIZE + 2048 + rdx*4]
+    movzx eax, dl
+    shr   edx, 8
+    mov   edx, [rsp + 80 + 5*BCX_SIZE + 0 + rdx*4]
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 1024 + rax*4]
+    xor   edx, [rsp + 80 + 5*BCX_SIZE + 2048 + rcx*4]
     movzx ecx, sil
-    add   eax, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
-    xor   edi, eax
+    add   edx, [rsp + 80 + 5*BCX_SIZE + 3072 + rcx*4]
+    xor   edi, edx
     xor   edi, [rsp + 80 + 5*BCX_SIZE + BCX_P + 64]
     mov   eax, r8d
     mov   r8d, r12d

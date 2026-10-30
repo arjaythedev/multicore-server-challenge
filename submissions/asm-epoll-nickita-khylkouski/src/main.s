@@ -2,8 +2,10 @@
 # then starts the bcrypt thread(s) and the worker threads and parks the main thread.
 #
 # Environment: DATABASE_URL, JWT_SECRET (required); HOST (127.0.0.1), PORT (3000); tuning: APP_THREADS
-# (min(ceil(cores/4), 8)), DB_READ_CONNS (read connections per worker, 3), BCRYPT_THREADS (ceil(cores/8)),
-# WRITE_BATCH_US (group-commit wait for a lone write, 1000; 0 = none).
+# (min(ceil(cores/4), 8)), DB_READ_CONNS (read connections per worker, 3), BCRYPT_THREADS (min(ceil(cores/4), 2); one main + helpers),
+# WRITE_BATCH_US (group-commit wait for a lone write, 1000; 0 = none), BCRYPT_BATCH_MS (bcrypt lane-fill wait,
+# 150; 0 = none), READ_BATCH_MS (read gather wait, 0 = none), READ_SHARE_PCT (article-by-slug share rule, 100),
+# SCHED_BATCH (every thread under the SCHED_BATCH policy, 1; 0 = the default policy).
 .include "defs.inc"
 .include "app.inc"
 
@@ -42,6 +44,11 @@ g_workers:   .skip 8 * MAX_WORKERS
 .Lenv_nread:   .ascii "DB_READ_CONNS"
 .Lenv_bcrypt:  .ascii "BCRYPT_THREADS"
 .Lenv_wbatch:  .ascii "WRITE_BATCH_US"
+.Lenv_bfill:   .ascii "BCRYPT_BATCH_MS"
+.Lenv_rwait:   .ascii "READ_BATCH_MS"
+.Lenv_rshare:  .ascii "READ_SHARE_PCT"
+.Lenv_sbatch:  .ascii "SCHED_BATCH"
+    .skip 53, 0                     # padding: keeps what follows at its previous 64-byte alignment
 .Lstr_localhost: .ascii "localhost"
 DEFSTR .Lmsg_nodb, "DATABASE_URL must be set\n"
 DEFSTR .Lmsg_nojwt, "JWT_SECRET must be set\n"
@@ -351,8 +358,12 @@ main:
     call rt_die
 9:
     mov rdx, [rip + g_cores]
-    add rdx, 7
-    shr rdx, 3                           # ceil(cores/8)
+    add rdx, 3
+    shr rdx, 2                           # ceil(cores/4), at most 2: one hand-off is pending at a time
+    cmp rdx, 2
+    jbe 1f
+    mov edx, 2
+1:
     lea rdi, [rip + .Lenv_bcrypt]
     mov esi, 14
     call env_uint
@@ -375,11 +386,93 @@ main:
     call rt_die
 10: mov [rip + g_wdelay_us], rax
 9:
+    # BCRYPT_BATCH_MS: how long a lone login may wait for others to share its bcrypt run (bcq.s; 0 = none)
+    lea rdi, [rip + .Lenv_bfill]
+    mov esi, 15
+    call getenv
+    test rax, rax
+    jz 9f
+    test rdx, rdx
+    jz 9f
+    mov rdi, rax
+    mov rsi, rdx
+    call rt_parse_u64
+    test rdx, rdx
+    jnz 10f
+    lea rdi, [rip + .Lmsg_badnum]
+    mov esi, .Lmsg_badnum_len
+    call rt_die
+10: mov [rip + g_bc_fill_ms], rax
+9:
+    # READ_BATCH_MS: how long the oldest queued read may wait for others to share its batch (readb.s; 0 = none)
+    lea rdi, [rip + .Lenv_rwait]
+    mov esi, 13
+    call getenv
+    test rax, rax
+    jz 9f
+    test rdx, rdx
+    jz 9f
+    mov rdi, rax
+    mov rsi, rdx
+    call rt_parse_u64
+    test rdx, rdx
+    jnz 10f
+    lea rdi, [rip + .Lmsg_badnum]
+    mov esi, .Lmsg_badnum_len
+    call rt_die
+10: mov [rip + g_rd_wait_ms], rax
+9:
+    # READ_SHARE_PCT: an article-by-slug take uses its shared statement when distinct slugs <= n * pct / 100
+    lea rdi, [rip + .Lenv_rshare]
+    mov esi, 14
+    call getenv
+    test rax, rax
+    jz 9f
+    test rdx, rdx
+    jz 9f
+    mov rdi, rax
+    mov rsi, rdx
+    call rt_parse_u64
+    test rdx, rdx
+    jnz 10f
+    lea rdi, [rip + .Lmsg_badnum]
+    mov esi, .Lmsg_badnum_len
+    call rt_die
+10: mov [rip + g_share_pct], rax
+9:
     # gzip negotiation / adaptive egress (HTTP_GZIP, HTTP_GZIP_ABOVE_MBS; egress.s)
     mov rdi, [rip + g_envp]
     call egress_init
     mov [rip + g_egmode], rax
 
+    # SCHED_BATCH (1; 0 = off): run every thread under SCHED_BATCH. Set before any thread starts, so they all
+    # inherit it. A thread woken by epoll or a futex then waits for the running thread's slice instead of
+    # preempting it, so workers and Postgres backends switch less. An error leaves the default policy.
+    mov qword ptr [rsp], 1
+    lea rdi, [rip + .Lenv_sbatch]
+    mov esi, 11
+    call getenv
+    test rax, rax
+    jz 9f
+    test rdx, rdx
+    jz 9f
+    mov rdi, rax
+    mov rsi, rdx
+    call rt_parse_u64
+    test rdx, rdx
+    jnz 10f
+    lea rdi, [rip + .Lmsg_badnum]
+    mov esi, .Lmsg_badnum_len
+    call rt_die
+10: mov [rsp], rax
+9:  cmp qword ptr [rsp], 0
+    je 8f
+    mov qword ptr [rsp], 0               # struct sched_param: sched_priority 0
+    xor edi, edi                         # this thread
+    mov esi, SCHED_BATCH
+    mov rdx, rsp
+    SYS SYS_sched_setscheduler
+8:
     # bcrypt threads
     xor ebx, ebx
 .Lm_bc:
@@ -417,5 +510,6 @@ main:
     xor r10d, r10d
     SYS SYS_futex
     jmp .Lm_park
+    .skip 24, 0xcc                     # padding: keeps what follows at its previous 64-byte alignment
 
 .section .note.GNU-stack,"",@progbits

@@ -12,6 +12,13 @@
 # meanwhile form the next group. When the writer goes to cut a unit and finds exactly one job, it first waits
 # WRITE_BATCH_US (default 1000 us; 0 = no wait) on a timerfd, giving concurrent writes a chance to share the
 # flush, as Rust does.
+#
+# Inside a group, a run of 2+ consecutive favorites (or unfavorites, follows, unfollows, new comments) is sent as
+# one statement over arrays of the jobs' params (S_*_N, sql.s) instead of one statement per job. Its rows carry
+# each job's ordinal in the run, so the reply is split back into one copy per job, shaped as that job's own
+# statement would have answered (a job with no row, e.g. an unknown slug, gets a reply with no rows). Only
+# consecutive jobs of one type merge, so the order of the group's effects is unchanged. If the merged statement
+# fails, the group rolls back and every job retries on its own, as for any failed statement.
 .include "defs.inc"
 .include "app.inc"
 
@@ -197,7 +204,17 @@ wr_start:
 .Lst_job:
     test r14, r14
     jz .Lst_commit
-    mov rbp, [r14 + J_WNEXT]             # read before enqueueing (a dead connection runs conts at once)
+    mov rdi, r14
+    call wr_run_len
+    cmp rax, 2
+    jb 1f
+    mov rdi, rbx                         # a run: one merged statement for its jobs
+    mov rsi, r14
+    mov rdx, rax
+    call wr_put_run
+    mov r14, rax                         # the job after the run
+    jmp .Lst_job
+1:  mov rbp, [r14 + J_WNEXT]             # read before enqueueing (a dead connection runs conts at once)
     mov rax, [r14 + J_CONT]
     mov [r14 + J_WCONT], rax
     lea rax, [rip + wr_stash]
@@ -227,6 +244,169 @@ wr_start:
     lea rsi, [rbx + PC_GCOMMIT]
     call pgio_enqueue
 .Lst_ret:
+    pop rbp
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+# wr_run_len(job) -> rax = number of consecutive jobs from `job` on (J_WNEXT) that can merge with it: the same
+# mergeable statement with the same param types (int8 / text, none NULL). 0 if `job` cannot merge.
+wr_run_len:
+    xor eax, eax
+    mov rcx, [rdi + J_STMT]
+    cmp rcx, S_FAVORITE
+    je 1f
+    cmp rcx, S_UNFAVORITE
+    je 1f
+    cmp rcx, S_FOLLOW
+    je 1f
+    cmp rcx, S_UNFOLLOW
+    je 1f
+    cmp rcx, S_COMMENT_CREATE
+    jne 9f
+1:  mov r8, rdi                          # the first job: its param types
+    mov r9, [rdi + J_NP]
+    test r9, r9
+    jz 9f
+    cmp r9, 8
+    ja 9f
+2:  cmp [rdi + J_STMT], rcx
+    jne 9f
+    cmp [rdi + J_NP], r9
+    jne 9f
+    xor edx, edx
+3:  movzx r10d, byte ptr [rdi + J_PT + rdx]
+    cmp r10b, [r8 + J_PT + rdx]
+    jne 9f
+    cmp r10d, PT_INT8
+    je 4f
+    cmp r10d, PT_TEXT
+    jne 9f
+4:  mov r11, rdx
+    shl r11, 4
+    cmp qword ptr [rdi + J_P + r11 + 8], 0
+    jl 9f
+    inc rdx
+    cmp rdx, r9
+    jb 3b
+    inc rax
+    mov rdi, [rdi + J_WNEXT]
+    test rdi, rdi
+    jnz 2b
+9:  ret
+
+# wr_put_run(pc, job, n) -> rax = the job after the run: Bind/Execute/Sync of the merged statement for the n jobs
+# from `job` on (param i = the array of the jobs' param i), queued as one op: the first job, with J_CONT =
+# wr_stash_run. Every job keeps its own J_WCONT.
+wr_put_run:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push rbp
+    sub rsp, 32                          # [rsp] bind handle, [rsp + 8] array handle, [rsp + 16] param
+    mov rbx, rdi
+    mov r12, rsi
+    mov r13, rdx
+    # set the jobs up and bound the message size: 256 + per job and param 16 + len (an int8 element is 12)
+    mov r14, r12
+    mov rbp, r13
+    mov esi, 256
+1:  mov rax, [r14 + J_CONT]
+    mov [r14 + J_WCONT], rax
+    mov qword ptr [r14 + J_WSEG], 0
+    mov qword ptr [r14 + J_WSEGLEN], 0
+    xor ecx, ecx
+2:  mov rax, rcx
+    shl rax, 4
+    mov rax, [r14 + J_P + rax + 8]
+    lea rsi, [rsi + rax + 16]
+    inc rcx
+    cmp rcx, [r14 + J_NP]
+    jb 2b
+    mov r14, [r14 + J_WNEXT]
+    dec rbp
+    jnz 1b
+    mov rbp, r14                         # read before enqueueing (a dead connection runs conts at once)
+    mov [r12 + J_WRUN], r13
+    lea rax, [rip + wr_stash_run]
+    mov [r12 + J_CONT], rax
+    mov rdi, rbx
+    call pgio_reserve
+    # the statement: S_FAVORITE -> S_FAVORITE_N, ...
+    mov rax, [r12 + J_STMT]
+    mov ecx, S_FAVORITE_N
+    cmp rax, S_FAVORITE
+    je 3f
+    mov ecx, S_UNFAVORITE_N
+    cmp rax, S_UNFAVORITE
+    je 3f
+    mov ecx, S_FOLLOW_N
+    cmp rax, S_FOLLOW
+    je 3f
+    mov ecx, S_UNFOLLOW_N
+    cmp rax, S_UNFOLLOW
+    je 3f
+    mov ecx, S_COMMENT_CREATE_N
+3:  lea rdi, [rbx + PC_OUT]
+    lea rsi, [rip + sql_names]
+    lea rsi, [rsi + rcx*4]
+    mov edx, 3
+    mov rcx, [r12 + J_NP]
+    call pgw_bind_begin
+    mov [rsp], rax
+    mov qword ptr [rsp + 16], 0
+.Lpr_param:
+    mov rax, [rsp + 16]
+    cmp rax, [r12 + J_NP]
+    jae .Lpr_end
+    lea rdi, [rbx + PC_OUT]
+    mov esi, OID_INT8
+    cmp byte ptr [r12 + J_PT + rax], PT_INT8
+    je 4f
+    mov esi, OID_TEXT
+4:  call pgw_array_begin
+    mov [rsp + 8], rax
+    mov r14, r12
+.Lpr_elem:
+    cmp r14, rbp
+    je .Lpr_arr_end
+    mov rax, [rsp + 16]
+    lea rdi, [rbx + PC_OUT]
+    mov rsi, [rsp + 8]
+    cmp byte ptr [r14 + J_PT + rax], PT_INT8
+    jne 5f
+    shl rax, 4
+    mov rdx, [r14 + J_P + rax]
+    call pgw_array_int8
+    jmp 6f
+5:  shl rax, 4
+    mov rdx, [r14 + J_P + rax]
+    mov rcx, [r14 + J_P + rax + 8]
+    call pgw_array_text
+6:  mov r14, [r14 + J_WNEXT]
+    jmp .Lpr_elem
+.Lpr_arr_end:
+    lea rdi, [rbx + PC_OUT]
+    mov rsi, [rsp + 8]
+    call pgw_array_end
+    inc qword ptr [rsp + 16]
+    jmp .Lpr_param
+.Lpr_end:
+    lea rdi, [rbx + PC_OUT]
+    mov rsi, [rsp]
+    call pgw_bind_end
+    lea rdi, [rbx + PC_OUT]
+    call pgw_execute
+    lea rdi, [rbx + PC_OUT]
+    call pgw_sync
+    mov rdi, rbx
+    mov rsi, r12
+    call pgio_enqueue
+    mov rax, rbp
+    add rsp, 32
     pop rbp
     pop r14
     pop r13
@@ -322,6 +502,121 @@ wr_stash:
     mov rdx, r13
     call rt_memcpy
 9:  pop r13
+    pop r12
+    pop rbx
+    ret
+
+# A merged run answered (inside the transaction): split it into one reply copy per job. Each DataRow ends with
+# the job's 1-based ordinal (int8); the copy is that row without the ordinal column, then a ReadyForQuery. A job
+# with no row gets just the ReadyForQuery. On an error every job of the run is marked failed (-2), as wr_stash
+# does for one job.
+wr_stash_run:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push rbp
+    sub rsp, WR_BATCH_MAX * 8            # the run's jobs by ordinal
+    mov r12, rsi
+    mov r13, rdx
+    mov rbp, [rdi + J_WRUN]
+    xor ecx, ecx
+    mov rax, rdi
+1:  mov [rsp + rcx*8], rax
+    mov rax, [rax + J_WNEXT]
+    inc rcx
+    cmp rcx, rbp
+    jb 1b
+    mov rdx, -1
+    cmp r13, -1
+    je .Lsr_mark
+    mov rdi, r12
+    mov rsi, r13
+    call seg_has_error
+    test rax, rax
+    jz .Lsr_rows
+    mov rax, [r15 + W_WR]
+    or qword ptr [rax + PC_GERR], GE_STMT
+    mov rdx, -2
+.Lsr_mark:
+    xor ecx, ecx
+2:  mov rax, [rsp + rcx*8]
+    mov [rax + J_WSEGLEN], rdx
+    inc rcx
+    cmp rcx, rbp
+    jb 2b
+    jmp .Lsr_ret
+.Lsr_rows:
+    add r13, r12                         # end of the segment
+.Lsr_next:
+    mov rdi, r12
+    mov rsi, r13
+    sub rsi, r12
+    jle .Lsr_rest
+    call pgr_next
+    test rax, rax
+    jle .Lsr_rest
+    mov r14, rdx                         # message length
+    cmp al, 'D'
+    jne .Lsr_skip
+    cmp r14, 7 + 12
+    jb .Lsr_skip
+    cmp dword ptr [r12 + r14 - 12], 0x08000000  # last column: 8 bytes
+    jne .Lsr_skip
+    mov rax, [r12 + r14 - 8]
+    bswap rax
+    dec rax                              # 0-based ordinal
+    cmp rax, rbp
+    jae .Lsr_skip
+    mov rbx, [rsp + rax*8]
+    cmp qword ptr [rbx + J_WSEGLEN], 0
+    jne .Lsr_skip                        # (one row per job; keep the first)
+    lea rdi, [r14 + 8 - 12 + 6]
+    call rt_alloc
+    mov [rax], rdx                       # cap, for rt_free
+    mov [rbx + J_WSEG], rax
+    lea rcx, [r14 - 12 + 6]
+    mov [rbx + J_WSEGLEN], rcx
+    lea rdi, [rax + 8]
+    mov rsi, r12
+    lea rdx, [r14 - 12]
+    call rt_memcpy                       # the row up to the ordinal column
+    mov byte ptr [rax], 'Z'
+    mov dword ptr [rax + 1], 0x05000000
+    mov byte ptr [rax + 5], 'T'
+    mov rdi, [rbx + J_WSEG]
+    lea eax, [r14 - 13]                  # message length field without the column
+    bswap eax
+    mov [rdi + 8 + 1], eax
+    movzx eax, word ptr [rdi + 8 + 5]    # column count - 1
+    rol ax, 8
+    dec ax
+    rol ax, 8
+    mov [rdi + 8 + 5], ax
+.Lsr_skip:
+    add r12, r14
+    jmp .Lsr_next
+.Lsr_rest:
+    xor r14d, r14d                       # jobs without a row: a reply with no rows
+3:  mov rbx, [rsp + r14*8]
+    cmp qword ptr [rbx + J_WSEGLEN], 0
+    jne 4f
+    mov edi, 8 + 6
+    call rt_alloc
+    mov [rax], rdx
+    mov [rbx + J_WSEG], rax
+    mov qword ptr [rbx + J_WSEGLEN], 6
+    mov byte ptr [rax + 8], 'Z'
+    mov dword ptr [rax + 9], 0x05000000
+    mov byte ptr [rax + 13], 'T'
+4:  inc r14
+    cmp r14, rbp
+    jb 3b
+.Lsr_ret:
+    add rsp, WR_BATCH_MAX * 8
+    pop rbp
+    pop r14
+    pop r13
     pop r12
     pop rbx
     ret
@@ -437,5 +732,6 @@ wr_retry_done:
 1:  mov rax, [rdi + J_WCONT]
     mov [rdi + J_CONT], rax
     jmp rax
+    .skip 49, 0xcc                     # padding: keeps the code after this at its previous 64-byte alignment
 
 .section .note.GNU-stack,"",@progbits

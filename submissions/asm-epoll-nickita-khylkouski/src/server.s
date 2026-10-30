@@ -93,7 +93,16 @@ worker_main:
     call rt_log
 
 .Lwm_loop:
-    mov rdi, [r15 + W_EPFD]
+    mov qword ptr [r15 + W_RDNOW], -1
+    cmp qword ptr [r15 + W_RDDUE], 0
+    je 1f
+    call rt_mono_ms_v                    # a read take is deferred (READ_BATCH_MS): wake at its deadline
+    mov rcx, [r15 + W_RDDUE]
+    sub rcx, rax
+    jg 2f
+    xor ecx, ecx
+2:  mov [r15 + W_RDNOW], rcx
+1:  mov rdi, [r15 + W_EPFD]
     mov rsi, [r15 + W_EVENTS]
     mov edx, EV_BATCH
     mov r10, -1
@@ -103,11 +112,15 @@ worker_main:
 1:  cmp qword ptr [r15 + W_ACCOFF], 0
     je 1f
     mov r10d, ACCEPT_BACKOFF_MS          # accepting is paused: wake up to resume it
+1:  cmp r10, [r15 + W_RDNOW]
+    jbe 1f
+    mov r10, [r15 + W_RDNOW]
 1:  SYS SYS_epoll_wait
     test rax, rax
     jg 2f
     mov rcx, [r15 + W_NDEAD]
     or rcx, [r15 + W_ACCOFF]
+    or rcx, [r15 + W_RDDUE]
     jz .Lwm_loop                         # EINTR (or nothing)
     xor eax, eax
 2:  mov r14, rax                         # events

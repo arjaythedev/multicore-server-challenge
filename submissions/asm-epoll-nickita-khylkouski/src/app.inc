@@ -59,6 +59,8 @@
 .equ W_TFD, 904                         # writer.s: batch-delay timerfd
 .equ W_GZ, 912                          # gzip_compress context (GZ_CTX_SIZE; 0 when HTTP_GZIP=0)
 .equ W_TURN, 920                        # egress_compress turn counter (worker-local)
+.equ W_RDDUE, 928                       # readb.s: monotonic ms when a deferred read take is due (0 = none)
+.equ W_RDNOW, 936                       # readb.s / server.s: scratch monotonic ms
 .equ W_NDEAD, 944                       # pgio.s: this worker's Postgres connections that are down
 .equ W_RETRY, 952                       # pgio.s: monotonic ms before which no reconnect is tried
 .equ W_RSIG, 960                        # readb.s: workers whose eventfd rb_signal writes (bit = W_ID, worker-local)
@@ -187,6 +189,7 @@
 .equ J_RFN, 968                         # renderer (RA_RENDER)
 .equ J_RSH, 976                         # shared reply copy to drop (0 = none)
 .equ J_RW, 984                          # the worker that posted it (allocated J_RA)
+.equ J_WRUN, 1016                       # writer.s: jobs in a merged run (on the run's first job)
 .equ J_INL, 1024                        # inline scratch (JOB_INLINE_SCR bytes)
 .equ J_SIZE, 2048
 
@@ -252,6 +255,11 @@
 .equ S_UNFOLLOW, 20
 .equ S_USER_INSERT, 21
 .equ S_USER_UPDATE, 22
+.equ S_FAVORITE_N, 23                   # merged runs of the writes above (writer.s)
+.equ S_UNFAVORITE_N, 24
+.equ S_FOLLOW_N, 25
+.equ S_UNFOLLOW_N, 26
+.equ S_COMMENT_CREATE_N, 27
 
 # ---------------------------------------------------------------- macros
 # DEFSTR name, "text": defines `name` and `name_len`.

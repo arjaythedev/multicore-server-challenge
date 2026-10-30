@@ -35,6 +35,7 @@
 .equ SYS_fcntl,           72
 .equ SYS_gettid,          186
 .equ SYS_futex,           202
+.equ SYS_sched_setscheduler, 144
 .equ SYS_sched_getaffinity, 204
 .equ SYS_epoll_wait,      232
 .equ SYS_epoll_ctl,       233
@@ -85,6 +86,7 @@
 .equ CLOCK_MONOTONIC, 1
 .equ FUTEX_WAIT_PRIVATE, 128
 .equ FUTEX_WAKE_PRIVATE, 129
+.equ SCHED_BATCH, 3                     # sched_setscheduler policy
 .equ CLONE_THREAD_FLAGS, 0x00050f00   # CLONE_VM|FS|FILES|SIGHAND (0xf00) | CLONE_THREAD 0x10000 | CLONE_SYSVSEM 0x40000
 .equ CLONE_SYSVSEM, 0x40000
 
