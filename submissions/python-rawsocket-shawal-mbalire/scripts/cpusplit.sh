@@ -4,7 +4,7 @@
 set -uo pipefail
 APP="$(cd "$(dirname "$0")/.." && pwd)"; S=/tmp/conduit-lg; mkdir -p $S
 USERS=$1
-export DATABASE_URL=${DATABASE_URL:-postgres://conduit:conduit@127.0.0.1:5432/conduit_lg} JWT_SECRET=dev-secret HOST=127.0.0.1 PORT=3111 WORKERS=${WORKERS:-6}
+export DATABASE_URL=${DATABASE_URL:-postgres://conduit:conduit@127.0.0.1:5432/conduit_full} JWT_SECRET=dev-secret HOST=127.0.0.1 PORT=3111 WORKERS=${WORKERS:-6}
 rm -f $S/stages-*.json  # STAGES=0: plain server, no per-stage counters
 if [ "${STAGES:-1}" = 1 ]; then ENTRY=scripts/stagetimer.py; else ENTRY="-m conduit_server.main"; fi
 (cd $APP && STAGES_DIR=$S exec .venv/bin/python $ENTRY) > $S/srv.log 2>&1 &

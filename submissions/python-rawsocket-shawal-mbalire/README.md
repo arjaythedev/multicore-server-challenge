@@ -50,7 +50,18 @@ build the user responses, and they are the contract `scripts/diffsql.py` checks 
   keeps one connection on the worker that accepted it, so the split has to be even. At 8,000 users it gave 470–542
   connections per worker, against 106–846 with one shared `EPOLLEXCLUSIVE` listener (still available as
   `REUSEPORT=0`), and halved the median latency. If any worker dies, the parent stops the server (rule 9: no
-  restarts). With `WORKERS=1` nothing forks.
+  restarts). With `WORKERS=1` and `BROKER=0` nothing forks.
+
+- **One Postgres process for all workers** (`pg_broker.py`, `BROKER=1`, the default). Postgres is most of the CPU per
+  request, and much of a read's cost is work that other requests repeat at the same moment: the same list page, the
+  same popular article, the same capped count. One statement over many requests does that work once, but only if the
+  requests wait in one place, and each worker alone had 0–1 queries in flight. So a broker process owns every
+  Postgres connection (`BROKER_READERS` read, default 6, and `BROKER_WRITERS` write, default 2), and each worker sends
+  it its queries over a Unix socketpair made before the fork: one frame per loop pass, `marshal`-encoded. The broker
+  queues reads by statement; when a read connection has nothing in flight, it takes the queue whose oldest request is
+  oldest and runs it as one unit (see Data layer). At 20,000 test users this held 25.5k req/s at p95 121 ms, where the
+  per-worker connections (`BROKER=0`) failed at 18.6k req/s with p95 1.3 s. The IPC costs the workers and the broker
+  about 35k ns of app CPU per request; the broker itself used about a quarter of a core at 24,000 test users.
 
 - **Transport** (per worker): one epoll loop thread does non-blocking accept/recv/send and HTTP/1.1 framing, and runs
   each request's handler inline. A worker is a single thread, so nothing contends for its GIL. (A thread pool per
@@ -62,13 +73,14 @@ build the user responses, and they are the contract `scripts/diffsql.py` checks 
     reads them from its socket together, and each costs less: one blocking round trip took 30 µs of Postgres CPU and
     16.5 µs of ours; with two in flight, 14.3 and 8.1 µs. Each query has its own Sync, so it runs in its own
     transaction and is committed before its result (and so the response) comes back.
-  - Each worker has 2 read pipelines (`PG_READERS`), and a query goes to the one with fewer in flight. Writes go to a
-    third, write pipeline. Every write is one statement (CTEs), so it is atomic on its own.
+  - With `BROKER=0`, each worker has 2 read pipelines (`PG_READERS`), and a query goes to the one with fewer in
+    flight; writes go to a third, write pipeline. Every write is one statement (CTEs), so it is atomic on its own.
   - The three bcrypt routes (register, login, `PUT /api/user`, `offload=True` on the route) run on one helper thread
     per worker with its own connection, results handed back through a deque + `eventfd`, so a ~40 ms bcrypt doesn't
     stall the worker's other connections (the libxcrypt call releases the GIL).
-  - Postgres connections: 4 per worker, 24 in all (the helper's opens on first use). `main.py` refuses to start a
-    configuration that could open more than 95. `PIPELINE=0` runs every query blocking on one connection instead.
+  - Postgres connections: the broker's 8 plus one per worker for the bcrypt helper, 14 in all (with `BROKER=0`: 4 per
+    worker, 24). `main.py` refuses to start a configuration that could open more than 95. `PIPELINE=0` runs every
+    query blocking on one connection instead.
   - Writes to clients never block: whatever the kernel doesn't take waits in a per-connection buffer under `EPOLLOUT`.
     A connection has one request in flight at a time (keeping HTTP/1.1 order), and pipelined bytes are handled after
     it. Idle keep-alive sockets close after 90 s: there is no Nginx in front, every virtual user holds its own
@@ -98,6 +110,23 @@ build the user responses, and they are the contract `scripts/diffsql.py` checks 
   - tag names come from `tags_pkey` lookups, and the comments page fetches the article and its comments together.
   `force_generic_plan`: under `auto`, Postgres re-planned the list statements on every execution (~180 µs each).
 
+  The broker runs a unit of queued requests in one of three ways:
+  - **Batched statement** (`pg_repository.BATCHED`: global list from 4 requests, article from 2, comments from 4):
+    parameters are arrays with one element per request, the shared work runs once (an article's tags, favorites
+    count and author once per distinct article; the list's capped count once per unit), and one body comes back per
+    request. Single-connection Postgres time per request, batched against single, at 16 requests: global list 96 µs
+    against 175, article 22 against 38, comments 12 against 21. The keys are looked up through `LATERAL ... LIMIT 1`
+    and deduplicated from `unnest` of an array: the generic plan can't see that a CTE is small, so it merge-joined all
+    of `articles` and sized a hash table for thousands of rows. `scripts/batchcheck.py` checks that every batched body
+    is byte for byte the single statement's. If a batch fails, its requests run again one by one.
+  - **Shared** (tags, no parameters): one execution answers every request in the unit.
+  - Anything else: pipelined single statements, one Sync each.
+
+  Writes queue the same way. A unit of several writes is **one transaction** (group commit, rule 6): `BEGIN`, the
+  statements, `COMMIT` behind one Sync, sharing one WAL flush; each reply goes out only after `COMMIT` returns. If any
+  statement fails, the broker rolls back and runs each write again on its own, so only the one at fault gets the error.
+  Committed one at a time, writes waited about 5 s at 20,000 test users; grouped, their p99 was under 100 ms.
+
 - **Security**: no caching, no shortcuts. Every login does a fresh bcrypt verify (cost 10; passwords over 72 bytes
   are rejected as 422, as pyca/bcrypt does; passwords containing NUL go to pyca/bcrypt, since C strings end at NUL).
   Every request re-verifies the JWT signature (HS256 only, `exp`/`iat`/`nbf` checked, string `sub` required, strict
@@ -117,6 +146,22 @@ build the user responses, and they are the contract `scripts/diffsql.py` checks 
 | + JWT/parse/router/glue trims, libxcrypt bcrypt, bcrypt off the loop, `SO_REUSEPORT` | 8,000 | 9,692–10,349 | 84–328 ms | 2 of 3 runs pass |
 | + Postgres pipeline (6 workers), JSON built by Postgres, Postgres tuned like the box | 8,000 | not recorded | not recorded | pass, p99 11–44 ms |
 | + pipelined single-statement writes, CPython 3.15 via uv | 8,000 | 10,576 | 2.9 ms | pass (p99 9.4 ms) |
+
+From here on, measured on `conduit_full`, the complete seed (the earlier `conduit_lg` had only 117k of the ~2M follows
+and 154k of the ~2.5M comments, so most feeds were empty). Each row is one run, `STAGES=0`:
+
+| Version | Test users | req/s | p95 | p99 | Result |
+|---|--:|--:|--:|--:|---|
+| per-worker pipelines (`BROKER=0`) | 16,000 | 19,209 | 370 ms | 932 ms | pass |
+| per-worker pipelines (`BROKER=0`) | 20,000 | 18,566 | 1,292 ms | 2,791 ms | fail |
+| broker, batched reads, group commit (6 read connections) | 20,000 | 25,529 | 121 ms | 223 ms | pass |
+| same, 8 read connections | 24,000 | 25,854 | 494 ms | 915 ms | pass |
+| same, 6 read connections | 24,000 | 26,535 | 588 ms | 1,082 ms | fail |
+
+Per request at 8,000 test users (`cpusplit.sh`, two runs each): app + Postgres CPU went from 477–509k ns
+(`BROKER=0`) to 389–407k with the broker on 2 read connections. At saturation (24,000 test users) Postgres used
+about 4.7 cores, the workers about half a core each and the broker a quarter of one: the queue in front of the read
+connections is where requests wait, and the unbatched statements (the feed above all) are now the largest cost.
 
 The earlier rows' p99 failures were mostly the laptop's own Postgres, which ran with 128 MB of shared buffers and
 forced checkpoints; it now runs the box's settings (`box/pg-conf.sh`). Per request, CPU went from about 600 µs app +
@@ -149,14 +194,15 @@ box's.
 
 ## Measuring
 
-All scripts need a local database `conduit_lg` (a copy of the full seed) and the load generator at
-`/tmp/conduit-lg/loadgen`.
+All scripts need a local database `conduit_full` with the complete seed (`SEED_DB=conduit_full bash
+seed/make-seed.sh` from the repo root; it must print `OK`) and the load generator at `/tmp/conduit-lg/loadgen`.
 
 | Command | What it does |
 |---|---|
 | `bash scripts/loadtest.sh <label> <users> [WORKERS]` | scoring-style run: overall result, verdict, CPU split; JSON with a per-second timeline in `/tmp/conduit-lg/<label>.json` |
 | `WORKERS=6 bash scripts/cpusplit.sh <users>` | app user/sys µs, Postgres µs and context switches per request, then the per-stage ns table above. `STAGES=0` runs the plain server without the stage table |
 | `PYTHONPATH=. .venv/bin/python scripts/diffsql.py` | compares every Postgres-built response (reads, and writes inside rolled-back transactions) with the spec's reference SQL (should print 0 mismatches) |
+| `PYTHONPATH=. .venv/bin/python scripts/batchcheck.py` | runs every batched statement and its single statement on the same random requests and compares the bytes (should print 0 mismatches) |
 | `PYTHONPATH=. .venv/bin/python scripts/profile.py` | single-thread CPU per endpoint, plus cProfile output |
 
 `cpusplit.sh` starts the server through `scripts/stagetimer.py`. It wraps the hot functions with per-thread CPU

@@ -1,5 +1,5 @@
 """Diff every response body Postgres builds (repository `q_*` statements) against the SPEC's reference SQL on
-conduit_lg: lists, feed, article, comments, profile, tags, and the writes (follow, favorite, create/update/delete
+conduit_full: lists, feed, article, comments, profile, tags, and the writes (follow, favorite, create/update/delete
 article, create/delete comment). Each write runs inside a transaction that is rolled back, and its response is
 compared with the reference SQL read in that same transaction. Nothing is left changed in the database.
 
@@ -12,7 +12,7 @@ from conduit_server.domain import services
 from conduit_server.domain.models import (ArticleData, ArticlesResponse, CommentData, CommentsResponse, ProfileData,
                                           ProfileResponse, SingleArticleResponse, SingleCommentResponse, TagsResponse)
 
-URL = "postgres://conduit:conduit@127.0.0.1:5432/conduit_lg"
+URL = "postgres://conduit:conduit@127.0.0.1:5432/conduit_full"
 pool = SingleConnection(URL)
 repo = PostgresUserRepository(pool)
 conn = pool.get()

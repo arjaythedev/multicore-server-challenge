@@ -2,6 +2,7 @@ import gc
 import os
 import resource
 import signal
+import socket
 import sys
 from psycopg_pool import ConnectionPool
 
@@ -16,6 +17,7 @@ from conduit_server.adapters.outbound.pg_repository import (
     configure_connection,
 )
 from conduit_server.adapters.outbound.crypto_adapter import JoseBcryptCryptoAdapter
+from conduit_server.adapters.outbound.pg_broker import BrokerClient, serve_broker
 
 # Total Postgres connections across every worker in threaded mode (max_connections = 100; the spec asks for <= 95).
 DB_BUDGET = int(os.getenv("DB_BUDGET", 64))
@@ -31,11 +33,13 @@ def connections_per_worker(threads: int, pool_size: int, pipeline: bool, pg_read
     return (pg_readers + 1 if pipeline else 1) + 1
 
 
-def serve(listener, database_url: str, jwt_secret: str, pool_size: int, threads: int, pg_readers: int):
+def serve(listener, database_url: str, jwt_secret: str, pool_size: int, threads: int, pg_readers: int,
+          broker_sock=None):
     """One worker: its own connections (they can't cross a fork) and thread pool, the shared listener.
     threads=0: handlers run inline on the loop thread; bcrypt routes (router.offload) run on one helper thread with
     its own connection; queries that handlers `yield` run on PG_READERS read pipelines and one write pipeline
-    (pg_readers=0, i.e. PIPELINE=0: on the loop's own connection, blocking). See connections_per_worker."""
+    (pg_readers=0, i.e. PIPELINE=0: on the loop's own connection, blocking). See connections_per_worker.
+    broker_sock: queries go to the shared Postgres broker process instead (pg_broker.py)."""
     if threads == 0:
         db_pool = SingleConnection(database_url)
     else:
@@ -52,7 +56,9 @@ def serve(listener, database_url: str, jwt_secret: str, pool_size: int, threads:
     # Composition root: wire ports into controllers, then start the raw socket server.
     controllers.bootstrap(article_repository, crypto_adapter)
 
-    if threads == 0 and pg_readers:
+    if broker_sock is not None:
+        pipeline = (BrokerClient(broker_sock),)
+    elif threads == 0 and pg_readers:
         pipeline = tuple(PgPipeline(database_url) for _ in range(pg_readers + 1))
     else:
         pipeline = None
@@ -102,13 +108,22 @@ def main():
     threads = int(os.getenv("THREADS", 0))
     pool_size = 1 if threads == 0 else DB_BUDGET // workers
     pg_readers = max(1, int(os.getenv("PG_READERS", 2))) if threads == 0 and os.getenv("PIPELINE", "1") != "0" else 0
-    total = workers * connections_per_worker(threads, pool_size, bool(pg_readers), pg_readers)
+    # BROKER=1 (default, inline pipeline mode only): one more process owns BROKER_READERS read connections and
+    # BROKER_WRITERS write connections for all workers, and batches their reads (pg_broker.py). Workers keep only the
+    # bcrypt helper's.
+    broker = threads == 0 and bool(pg_readers) and os.getenv("BROKER", "1") != "0"
+    broker_readers = max(1, int(os.getenv("BROKER_READERS", 6)))
+    broker_writers = max(1, int(os.getenv("BROKER_WRITERS", 2)))
+    if broker:
+        total = broker_readers + broker_writers + workers
+    else:
+        total = workers * connections_per_worker(threads, pool_size, bool(pg_readers), pg_readers)
     if total > MAX_CONNECTIONS:
         print(f"Error: {workers} workers would open up to {total} Postgres connections (limit {MAX_CONNECTIONS});"
               " lower WORKERS, PG_READERS or DB_BUDGET.", file=sys.stderr)
         sys.exit(1)
 
-    if workers == 1:
+    if workers == 1 and not broker:
         try:
             serve(listeners[0], database_url, jwt_secret, pool_size, threads, pg_readers)
         except KeyboardInterrupt:
@@ -117,6 +132,18 @@ def main():
 
     gc.freeze()
     children = []
+    pairs = [socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM) for _ in range(workers)] if broker else []
+    if broker:
+        pid = os.fork()
+        if pid == 0:
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            for listener in set(listeners):
+                listener.close()
+            for worker_end, _ in pairs:
+                worker_end.close()
+            serve_broker([broker_end for _, broker_end in pairs], database_url, broker_readers, broker_writers)
+        children.append(pid)
     for i in range(workers):
         pid = os.fork()
         if pid == 0:
@@ -126,14 +153,22 @@ def main():
                 for j, other in enumerate(listeners):
                     if j != i:
                         other.close()  # only this worker's listener stays open in it
+            for j, (worker_end, broker_end) in enumerate(pairs):
+                broker_end.close()
+                if j != i:
+                    worker_end.close()
             try:
-                serve(listeners[i], database_url, jwt_secret, pool_size, threads, pg_readers)
+                serve(listeners[i], database_url, jwt_secret, pool_size, threads, pg_readers,
+                      pairs[i][0] if broker else None)
             except BaseException:
                 import traceback
                 traceback.print_exc()
             finally:
                 os._exit(1)
         children.append(pid)
+    for worker_end, broker_end in pairs:  # the parent only supervises
+        worker_end.close()
+        broker_end.close()
 
     def stop(*_):
         for child in children:

@@ -1,6 +1,6 @@
 """Per-endpoint Python CPU (single thread, real DB) + cProfile top functions.
 
-    PYTHONPATH=. .venv/bin/python scripts/profile.py      # needs the conduit_lg full-seed copy
+    PYTHONPATH=. .venv/bin/python scripts/profile.py      # needs the full seed in conduit_full
 """
 import cProfile
 import pstats
@@ -15,7 +15,7 @@ from conduit_server.adapters.outbound.pg_repository import PostgresUserRepositor
 from conduit_server.adapters.outbound.crypto_adapter import JoseBcryptCryptoAdapter
 
 warnings.filterwarnings("ignore")
-pool = ConnectionPool("postgres://conduit:conduit@127.0.0.1:5432/conduit_lg", min_size=1, max_size=1,
+pool = ConnectionPool("postgres://conduit:conduit@127.0.0.1:5432/conduit_full", min_size=1, max_size=1,
                       configure=configure_connection, open=True)
 crypto = JoseBcryptCryptoAdapter("dev-secret")
 controllers.bootstrap(PostgresUserRepository(pool), crypto)

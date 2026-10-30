@@ -32,10 +32,11 @@ _PIPELINE_SYNC = pq.ExecStatus.PIPELINE_SYNC
 class _Stmt:
     """One static statement: its server-side prepared name, `$n` SQL, and column names (fixed per statement)."""
 
-    __slots__ = ("name", "sql", "cols")
+    __slots__ = ("name", "sql", "cols", "index")
 
     def __init__(self, sql: str):
-        self.name = b"c%d" % len(_STATEMENTS)
+        self.index = len(_STATEMENTS)  # same in every process (module-level definitions): the broker's job key
+        self.name = b"c%d" % self.index
         if "%s" in sql:
             n = iter(range(1, 1000))
             sql = re.sub(r"%s", lambda _: f"${next(n)}", sql)
@@ -327,6 +328,126 @@ _DELETE_COMMENT_BY_SLUG = _Stmt(
 )
 
 
+# ---- Batched reads (pg_broker.py) ------------------------------------------------------------------------------
+# One statement for a unit of N queued requests of one kind: parameters are arrays (one element per request), the
+# work the requests share runs once (an article's tags, favorites count and author; the list's capped count), and
+# the result is one row per request, (ord, body) in request order, body NULL where the single statement returns no
+# row. Every body is the same bytes the single statement returns (scripts/batchcheck.py).
+def _text_array(values) -> str:
+    return "{" + ",".join('"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"' for v in values) + "}"
+
+
+def _int_array(values) -> str:
+    return "{" + ",".join(["%d" % v for v in values]) + "}"
+
+
+# Per-article data shared by every request in the unit that shows the article: `w` columns. The units' keys come
+# from CTEs, whose size a generic plan can't know (it merge-joined all of `articles`): each key is looked up through
+# LATERAL with LIMIT 1 (the keys are unique), which keeps the planner from flattening it back into a join: an index
+# probe per key.
+_SHARED_ARTICLE_COLS = (
+    "a.id, a.slug, a.title, a.description, a.author_id,"
+    f" {TAG_LIST_ARRAY.removesuffix(' AS tag_list')} AS tl,"
+    f" {_TS_EXPR.format('a.created_at')} AS ca, {_TS_EXPR.format('a.updated_at')} AS ua,"
+    f" {FAVORITES_COUNT.removesuffix(' AS favorites_count')} AS fc,"
+    " a.username, a.bio, a.image"
+)
+# The viewer's flags, per request (v.viewer) and article (w)
+_V_FAVORITED = "(v.viewer <> 0 AND EXISTS (SELECT 1 FROM favorites f WHERE f.user_id = v.viewer AND f.article_id = w.id))"
+_V_FOLLOWING = (
+    "(v.viewer <> 0 AND EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = v.viewer AND fo.followee_id = w.author_id))"
+)
+
+
+def _w_article_json(with_body: bool) -> str:
+    return (
+        "json_build_object('slug', w.slug, 'title', w.title, 'description', w.description,"
+        + (" 'body', w.body," if with_body else "")
+        + " 'tagList', w.tl, 'createdAt', w.ca, 'updatedAt', w.ua,"
+        f" 'favorited', {_V_FAVORITED}, 'favoritesCount', w.fc,"
+        " 'author', json_build_object('username', w.username, 'bio', w.bio, 'image', w.image,"
+        f" 'following', {_V_FOLLOWING}))"
+    )
+
+
+# Global list: each request's page is `LIMIT least(lim, 100) OFFSET off` of articles by id (as _NONE_SQL); the
+# article data is built once for the union of the pages, the count once for the unit. The union's DISTINCT reads
+# from unnest(ARRAY(...)): over the CTE, the generic plan sized its hash table for thousands of rows (0.45 ms).
+_LIST_NONE_BATCH = _Stmt(
+    "WITH v AS (SELECT * FROM unnest($1::bigint[], $2::int[], $3::int[]) WITH ORDINALITY AS v(viewer, lim, off, ord)),"
+    f" c AS ({_NONE_SQL[0]}),"
+    " pg AS MATERIALIZED (SELECT v.ord, p.id FROM v CROSS JOIN LATERAL"
+    " (SELECT a2.id FROM articles a2 ORDER BY a2.id DESC LIMIT least(v.lim, 100) OFFSET v.off) p),"
+    f" w AS MATERIALIZED (SELECT {_SHARED_ARTICLE_COLS}"
+    " FROM (SELECT DISTINCT id FROM unnest(ARRAY(SELECT id FROM pg)) id) d CROSS JOIN LATERAL (SELECT a.*, u.username, u.bio, u.image FROM articles a"
+    " JOIN users u ON u.id = a.author_id WHERE a.id = d.id LIMIT 1) a)"
+    " SELECT v.ord, json_build_object('articles', COALESCE((SELECT json_agg("
+    f"{_w_article_json(False)} ORDER BY w.id DESC)"
+    " FROM pg JOIN w ON w.id = pg.id WHERE pg.ord = v.ord), '[]'), 'articlesCount', c.n)"
+    " FROM v, c ORDER BY v.ord"
+)
+_ARTICLE_BY_SLUG_BATCH = _Stmt(
+    "WITH v AS (SELECT * FROM unnest($1::bigint[], $2::text[]) WITH ORDINALITY AS v(viewer, slug, ord)),"
+    f" w AS MATERIALIZED (SELECT {_SHARED_ARTICLE_COLS}, a.body"
+    " FROM (SELECT DISTINCT slug FROM unnest($2::text[]) slug) s CROSS JOIN LATERAL"
+    " (SELECT a.*, u.username, u.bio, u.image FROM articles a"
+    " JOIN users u ON u.id = a.author_id WHERE a.slug = s.slug LIMIT 1) a)"
+    f" SELECT v.ord, (SELECT json_build_object('article', {_w_article_json(True)}) FROM w WHERE w.slug = v.slug)"
+    " FROM v ORDER BY v.ord"
+)
+# Comments share little (an article's comments are listed once per request anyway), and a CTE shared by the unit
+# made every request scan all of its comments (163 µs a request under load, worse than single statements): each
+# request runs the single statement's lookup through LATERAL, so the unit saves only per-statement overhead.
+_COMMENTS_BY_SLUG_BATCH = _Stmt(
+    "WITH v AS (SELECT * FROM unnest($1::bigint[], $2::text[]) WITH ORDINALITY AS v(viewer, slug, ord))"
+    " SELECT v.ord, (SELECT json_build_object('comments', COALESCE((SELECT json_agg(json_build_object("
+    "'id', c.id,"
+    f" 'createdAt', {_TS_EXPR.format('c.created_at')}, 'updatedAt', {_TS_EXPR.format('c.updated_at')},"
+    " 'body', c.body,"
+    " 'author', json_build_object('username', u.username, 'bio', u.bio, 'image', u.image,"
+    " 'following', (v.viewer <> 0 AND EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = v.viewer"
+    " AND fo.followee_id = c.author_id))))"
+    " ORDER BY c.created_at DESC, c.id DESC)"
+    " FROM (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id"
+    " FROM comments c WHERE c.article_id = a.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c"
+    " CROSS JOIN LATERAL (SELECT u.username, u.bio, u.image FROM users u WHERE u.id = c.author_id LIMIT 1) u), '[]'))"
+    " FROM articles a WHERE a.slug = v.slug)"
+    " FROM v ORDER BY v.ord"
+)
+
+
+def _viewer_text_params(jobs_args) -> tuple:
+    """(viewer, text) per request -> ($1 bigint[], $2 text[])."""
+    return _int_array([a[0] for a in jobs_args]), _text_array([a[1] for a in jobs_args])
+
+
+def _list_none_params(jobs_args) -> tuple:
+    return (
+        _int_array([a[0] for a in jobs_args]),
+        _int_array([a[1] for a in jobs_args]),
+        _int_array([a[2] for a in jobs_args]),
+    )
+
+
+class Batched:
+    """How the broker runs a unit of `single`'s requests: as `stmt`, with `params(list of args)`, from `min_size`."""
+
+    __slots__ = ("stmt", "params", "min_size")
+
+    def __init__(self, stmt: _Stmt, params, min_size: int):
+        self.stmt, self.params, self.min_size = stmt, params, min_size
+
+
+# single statement index -> Batched
+BATCHED = {
+    _LIST_NONE_JSON.index: Batched(_LIST_NONE_BATCH, _list_none_params, 4),
+    _ARTICLE_BY_SLUG_JSON.index: Batched(_ARTICLE_BY_SLUG_BATCH, _viewer_text_params, 2),
+    _COMMENTS_BY_SLUG_JSON.index: Batched(_COMMENTS_BY_SLUG_BATCH, _viewer_text_params, 4),
+}
+# Statements without parameters whose one result every request in the unit shares
+SHARED = frozenset({_TAGS_JSON.index})
+
+
 class DuplicateError(Exception):
     pass
 
@@ -480,7 +601,7 @@ class PgPipeline:
     def __init__(self, conninfo: str, configure=configure_connection):
         self.conninfo, self.configure = conninfo, configure
         self.inflight: deque = deque()  # (query, token), in submission order
-        self.pending = None  # the head query's result, until its Sync arrives
+        self.pending = []  # the head query's results, until its Sync arrives
         self.conn = self.pg = None
         self._connect()
 
@@ -503,6 +624,15 @@ class PgPipeline:
         pg.pipeline_sync()
         self.inflight.append((query, token))
 
+    def submit_unit(self, unit, token) -> None:
+        """Several statements behind one Sync (pg_broker's group commit): `unit.send(pg)` sends them, and
+        `unit.result(conn, results)` gets every result that came back before the Sync."""
+        if self.pg is None:
+            self._connect()
+        unit.send(self.pg)
+        self.pg.pipeline_sync()
+        self.inflight.append((unit, token))
+
     def flush(self) -> bool:
         """Send what libpq has buffered; True if some is left (wait for the socket to be writable)."""
         if self.pg is None:
@@ -523,12 +653,15 @@ class PgPipeline:
                 if res is None:
                     continue  # end of one query's results; its Sync comes next
                 if res.status != _PIPELINE_SYNC:
-                    self.pending = res
+                    self.pending.append(res)
                     continue
                 query, token = inflight.popleft()
-                res, self.pending = self.pending, None
+                results, self.pending = self.pending, []
                 try:
-                    out.append((token, query.result(self.conn, res), None))
+                    if getattr(query, "multi", False):
+                        out.append((token, query.result(self.conn, results), None))
+                    else:
+                        out.append((token, query.result(self.conn, results[-1]), None))
                 except Exception as e:
                     out.append((token, None, e))
         except psycopg.OperationalError as e:
@@ -541,7 +674,7 @@ class PgPipeline:
         """Fail every query in flight; the next submit reconnects."""
         failed = [(token, None, error) for _, token in self.inflight]
         self.inflight.clear()
-        self.pending = None
+        self.pending = []
         try:
             self.conn.close()
         except Exception:
