@@ -1,15 +1,14 @@
 package conduit;
 
-import java.util.List;
-
 import io.avaje.http.api.Controller;
-import io.avaje.http.api.Valid;
 import io.avaje.http.api.Delete;
 import io.avaje.http.api.Get;
 import io.avaje.http.api.Post;
 import io.avaje.http.api.Produces;
 import io.avaje.http.api.Put;
+import io.avaje.http.api.Valid;
 import io.helidon.webserver.http.ServerRequest;
+import java.util.List;
 import org.jspecify.annotations.Nullable;
 
 /** Articles, the feed, and favorites. */
@@ -25,8 +24,7 @@ class ArticleController implements ApiController {
         this.auth = auth;
     }
 
-    private record Page(long limit, long offset) {
-    }
+    private record Page(long limit, long offset) {}
 
     /** limit (default 20, 1..100) and offset (default 0, >= 0); a parameter that is present, even empty, must be valid. */
     private static Page page(ServerRequest req) {
@@ -50,25 +48,42 @@ class ArticleController implements ApiController {
         return s == null || s.isEmpty() ? null : s;
     }
 
-    private static Dto.Profile author(String username, @Nullable String bio, @Nullable String image,
-            boolean following) {
+    private static Dto.Profile author(
+            String username, @Nullable String bio, @Nullable String image, boolean following) {
         return new Dto.Profile(username, bio, image, following);
     }
 
     private static Dto.ArticleList summaries(List<ArticleDao.ArticleRow> rows, long count) {
-        return new Dto.ArticleList(rows.stream()
-                .map(r -> new Dto.ArticleSummary(r.slug(), r.title(), r.description(), r.tagList(),
-                        Dto.timestamp(r.createdAt()), Dto.timestamp(r.updatedAt()), r.favorited(),
-                        r.favoritesCount(), author(r.username(), r.bio(), r.image(), r.following())))
-                .toList(), count);
+        return new Dto.ArticleList(
+                rows.stream()
+                        .map(r -> new Dto.ArticleSummary(
+                                r.slug(),
+                                r.title(),
+                                r.description(),
+                                r.tagList(),
+                                Dto.timestamp(r.createdAt()),
+                                Dto.timestamp(r.updatedAt()),
+                                r.favorited(),
+                                r.favoritesCount(),
+                                author(r.username(), r.bio(), r.image(), r.following())))
+                        .toList(),
+                count);
     }
 
     private static Dto.ArticleResponse full(ArticleDao.@Nullable ArticleFullRow r) {
         if (r == null) {
             throw ApiException.notFound("article");
         }
-        return new Dto.ArticleResponse(new Dto.Article(r.slug(), r.title(), r.description(), r.body(), r.tagList(),
-                Dto.timestamp(r.createdAt()), Dto.timestamp(r.updatedAt()), r.favorited(), r.favoritesCount(),
+        return new Dto.ArticleResponse(new Dto.Article(
+                r.slug(),
+                r.title(),
+                r.description(),
+                r.body(),
+                r.tagList(),
+                Dto.timestamp(r.createdAt()),
+                Dto.timestamp(r.updatedAt()),
+                r.favorited(),
+                r.favoritesCount(),
                 author(r.username(), r.bio(), r.image(), r.following())));
     }
 
@@ -83,10 +98,11 @@ class ArticleController implements ApiController {
         if (tag != null) {
             return summaries(articles.listByTag(viewer, p.limit(), p.offset(), tag), articles.countByTag(tag));
         } else if (author != null) {
-            return summaries(articles.listByAuthor(viewer, p.limit(), p.offset(), author),
-                    articles.countByAuthor(author));
+            return summaries(
+                    articles.listByAuthor(viewer, p.limit(), p.offset(), author), articles.countByAuthor(author));
         } else if (favorited != null) {
-            return summaries(articles.listFavorited(viewer, p.limit(), p.offset(), favorited),
+            return summaries(
+                    articles.listFavorited(viewer, p.limit(), p.offset(), favorited),
                     articles.countFavorited(favorited));
         }
         return summaries(articles.listAll(viewer, p.limit(), p.offset()), articles.countAll());

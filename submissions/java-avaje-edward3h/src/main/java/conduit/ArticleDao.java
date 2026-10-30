@@ -2,7 +2,6 @@ package conduit;
 
 import java.time.OffsetDateTime;
 import java.util.List;
-
 import org.ethelred.kiwiproc.annotation.DAO;
 import org.ethelred.kiwiproc.annotation.SqlQuery;
 import org.ethelred.kiwiproc.annotation.SqlUpdate;
@@ -13,18 +12,38 @@ import org.jspecify.annotations.Nullable;
 @DAO
 public interface ArticleDao extends TransactionalDAO<ArticleDao> {
 
-    record ArticleRow(long id, String slug, String title, String description, OffsetDateTime createdAt,
-            OffsetDateTime updatedAt, List<String> tagList, long favoritesCount, boolean favorited, String username,
-            @Nullable String bio, @Nullable String image, boolean following) {
-    }
+    record ArticleRow(
+            long id,
+            String slug,
+            String title,
+            String description,
+            OffsetDateTime createdAt,
+            OffsetDateTime updatedAt,
+            List<String> tagList,
+            long favoritesCount,
+            boolean favorited,
+            String username,
+            @Nullable String bio,
+            @Nullable String image,
+            boolean following) {}
 
-    record ArticleFullRow(long id, String slug, String title, String description, String body, OffsetDateTime createdAt,
-            OffsetDateTime updatedAt, List<String> tagList, long favoritesCount, boolean favorited, String username,
-            @Nullable String bio, @Nullable String image, boolean following) {
-    }
+    record ArticleFullRow(
+            long id,
+            String slug,
+            String title,
+            String description,
+            String body,
+            OffsetDateTime createdAt,
+            OffsetDateTime updatedAt,
+            List<String> tagList,
+            long favoritesCount,
+            boolean favorited,
+            String username,
+            @Nullable String bio,
+            @Nullable String image,
+            boolean following) {}
 
-    record OwnerRow(long id, long authorId) {
-    }
+    record OwnerRow(long id, long authorId) {}
 
     // ---- shared fragments (:viewer = viewer) ----
     //
@@ -78,8 +97,7 @@ public interface ArticleDao extends TransactionalDAO<ArticleDao> {
     @SqlQuery("""
             WITH page AS MATERIALIZED (SELECT at.article_id AS id FROM article_tags at
                                         WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = :tag)
-                                        ORDER BY at.article_id DESC LIMIT :limit OFFSET :offset)"""
-            + TAGS + LIST_SELECT)
+                                        ORDER BY at.article_id DESC LIMIT :limit OFFSET :offset)""" + TAGS + LIST_SELECT)
     List<ArticleRow> listByTag(long viewer, long limit, long offset, String tag);
 
     @SqlQuery("""
@@ -89,8 +107,7 @@ public interface ArticleDao extends TransactionalDAO<ArticleDao> {
     @SqlQuery("""
             WITH page AS MATERIALIZED (SELECT a.id FROM articles a
                                         WHERE a.author_id = (SELECT au.id FROM users au WHERE au.username = :author)
-                                        ORDER BY a.id DESC LIMIT :limit OFFSET :offset)"""
-            + TAGS + LIST_SELECT)
+                                        ORDER BY a.id DESC LIMIT :limit OFFSET :offset)""" + TAGS + LIST_SELECT)
     List<ArticleRow> listByAuthor(long viewer, long limit, long offset, String author);
 
     @SqlQuery("""
@@ -100,8 +117,7 @@ public interface ArticleDao extends TransactionalDAO<ArticleDao> {
     @SqlQuery("""
             WITH page AS MATERIALIZED (SELECT f.article_id AS id FROM favorites f
                                         WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = :favoritedBy)
-                                        ORDER BY f.article_id DESC LIMIT :limit OFFSET :offset)"""
-            + TAGS + LIST_SELECT)
+                                        ORDER BY f.article_id DESC LIMIT :limit OFFSET :offset)""" + TAGS + LIST_SELECT)
     List<ArticleRow> listFavorited(long viewer, long limit, long offset, String favoritedBy);
 
     @SqlQuery("""
@@ -111,8 +127,7 @@ public interface ArticleDao extends TransactionalDAO<ArticleDao> {
     @SqlQuery("""
             WITH page AS MATERIALIZED (SELECT x.id FROM follows fo CROSS JOIN LATERAL
                 (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT (CAST(:limit AS int) + CAST(:offset AS int))) x
-              WHERE fo.follower_id = :viewer ORDER BY x.id DESC LIMIT :limit OFFSET :offset)"""
-            + TAGS + LIST_SELECT)
+              WHERE fo.follower_id = :viewer ORDER BY x.id DESC LIMIT :limit OFFSET :offset)""" + TAGS + LIST_SELECT)
     List<ArticleRow> feed(long viewer, long limit, long offset);
 
     @SqlQuery("""
@@ -150,7 +165,8 @@ public interface ArticleDao extends TransactionalDAO<ArticleDao> {
     @SqlUpdate("INSERT INTO tags (name) SELECT DISTINCT unnest(CAST(:tags AS text[])) ON CONFLICT (name) DO NOTHING")
     void insertTags(List<String> tags);
 
-    @SqlUpdate("INSERT INTO article_tags (article_id, tag_id) SELECT :id, t.id FROM tags t WHERE t.name = ANY(CAST(:tags AS text[]))")
+    @SqlUpdate(
+            "INSERT INTO article_tags (article_id, tag_id) SELECT :id, t.id FROM tags t WHERE t.name = ANY(CAST(:tags AS text[]))")
     void tagArticle(long id, List<String> tags);
 
     @SqlUpdate("""

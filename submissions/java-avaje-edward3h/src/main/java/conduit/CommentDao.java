@@ -2,7 +2,6 @@ package conduit;
 
 import java.time.OffsetDateTime;
 import java.util.List;
-
 import org.ethelred.kiwiproc.annotation.DAO;
 import org.ethelred.kiwiproc.annotation.SqlQuery;
 import org.ethelred.kiwiproc.annotation.SqlUpdate;
@@ -11,14 +10,25 @@ import org.jspecify.annotations.Nullable;
 @DAO
 public interface CommentDao {
 
-    record CommentRow(long id, String body, OffsetDateTime createdAt, OffsetDateTime updatedAt, String username,
-            @Nullable String bio, @Nullable String image, boolean following) {
-    }
+    record CommentRow(
+            long id,
+            String body,
+            OffsetDateTime createdAt,
+            OffsetDateTime updatedAt,
+            String username,
+            @Nullable String bio,
+            @Nullable String image,
+            boolean following) {}
 
     /** A freshly inserted comment: its author is the viewer, so there is no "following". */
-    record NewCommentRow(long id, String body, OffsetDateTime createdAt, OffsetDateTime updatedAt, String username,
-            @Nullable String bio, @Nullable String image) {
-    }
+    record NewCommentRow(
+            long id,
+            String body,
+            OffsetDateTime createdAt,
+            OffsetDateTime updatedAt,
+            String username,
+            @Nullable String bio,
+            @Nullable String image) {}
 
     @SqlQuery("""
             SELECT c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image,

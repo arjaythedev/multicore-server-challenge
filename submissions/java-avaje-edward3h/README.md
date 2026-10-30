@@ -137,6 +137,9 @@ the access lookup 2%, validation under 1%. Postgres used about 36% of the box, t
 
 ## Development
 
+`./gradlew spotlessCheck` and `./gradlew spotlessApply` check and apply the code style (Palantir Java format, ktlint for
+the Gradle files). They are not part of `build.sh`.
+
 `./gradlew checkNullness` runs the Checker Framework's Nullness Checker (4.3.1) over `src/main/java`, using the
 jspecify annotations (`@NullMarked` in `package-info.java`, `@Nullable`). It is not part of `build`, `check` or
 `build.sh`.

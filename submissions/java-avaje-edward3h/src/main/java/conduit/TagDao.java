@@ -1,7 +1,6 @@
 package conduit;
 
 import java.util.List;
-
 import org.ethelred.kiwiproc.annotation.DAO;
 import org.ethelred.kiwiproc.annotation.SqlQuery;
 

@@ -1,12 +1,11 @@
 package conduit;
 
+import at.favre.lib.crypto.bcrypt.BCrypt;
+import jakarta.inject.Singleton;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-
-import at.favre.lib.crypto.bcrypt.BCrypt;
-import jakarta.inject.Singleton;
 
 /**
  * bcrypt cost 10 takes about 70 ms of CPU. Requests run on virtual threads whose carriers are one per core, so a few
@@ -31,10 +30,15 @@ final class Passwords {
     }
 
     String hash(String password) {
-        return await(pool.submit(() -> BCrypt.withDefaults().hashToString(COST, Body.hashable(password).toCharArray())));
+        return await(pool.submit(() ->
+                BCrypt.withDefaults().hashToString(COST, Body.hashable(password).toCharArray())));
     }
 
+    /** A password bcrypt can't take (over 72 bytes) can't match a hash made from one that it could. */
     boolean verify(String password, String hash) {
+        if (!Body.isHashable(password)) {
+            return false;
+        }
         return await(pool.submit(() -> BCrypt.verifyer().verify(password.toCharArray(), hash).verified));
     }
 

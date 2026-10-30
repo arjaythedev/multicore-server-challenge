@@ -1,21 +1,23 @@
 package conduit;
 
 import java.nio.charset.StandardCharsets;
-
 import org.jspecify.annotations.Nullable;
 
 /** Helpers the request records' constraints can't express: password length in bytes and unsigned integers. */
 final class Body {
 
-    private Body() {
-    }
+    private Body() {}
 
     /** bcrypt only hashes the first 72 bytes; longer passwords are refused: 422. */
     static String hashable(String password) {
-        if (password.getBytes(StandardCharsets.UTF_8).length > 72) {
+        if (!isHashable(password)) {
             throw ApiException.invalid("password is too long");
         }
         return password;
+    }
+
+    static boolean isHashable(String password) {
+        return password.getBytes(StandardCharsets.UTF_8).length <= 72;
     }
 
     /** ASCII digits only (no sign, no spaces) that fit in a long; -1 otherwise. */

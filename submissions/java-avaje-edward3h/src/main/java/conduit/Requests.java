@@ -1,13 +1,11 @@
 package conduit;
 
-import java.util.List;
-
-import org.jspecify.annotations.Nullable;
-
 import io.avaje.jsonb.Json;
 import io.avaje.validation.constraints.NotEmpty;
 import io.avaje.validation.constraints.NotNull;
 import io.avaje.validation.constraints.Valid;
+import java.util.List;
+import org.jspecify.annotations.Nullable;
 
 /**
  * Request body shapes from SPEC.md. Jsonb rejects a value of the wrong JSON type (a number where a string is
@@ -17,16 +15,17 @@ import io.avaje.validation.constraints.Valid;
  */
 final class Requests {
 
-    private Requests() {
-    }
+    private Requests() {}
 
     @Json
     @Valid
     record Register(@NotNull @Valid Registration user) {
         @Json
         @Valid
-        record Registration(@NotEmpty String username, @NotEmpty String email, @NotEmpty String password) {
-        }
+        record Registration(
+                @NotEmpty String username,
+                @NotEmpty String email,
+                @NotEmpty String password) {}
     }
 
     @Json
@@ -34,8 +33,7 @@ final class Requests {
     record Login(@NotNull @Valid Credentials user) {
         @Json
         @Valid
-        record Credentials(@NotEmpty String email, @NotEmpty String password) {
-        }
+        record Credentials(@NotEmpty String email, @NotEmpty String password) {}
     }
 
     @Json
@@ -43,9 +41,12 @@ final class Requests {
     record UpdateUser(@NotNull @Valid Changes user) {
         @Json
         @Valid
-        record Changes(@Nullable @NotEmpty String email, @Nullable @NotEmpty String username,
-                @Nullable @NotEmpty String password, @Nullable String bio, @Nullable String image) {
-        }
+        record Changes(
+                @Nullable @NotEmpty String email,
+                @Nullable @NotEmpty String username,
+                @Nullable @NotEmpty String password,
+                @Nullable String bio,
+                @Nullable String image) {}
     }
 
     @Json
@@ -53,9 +54,11 @@ final class Requests {
     record CreateArticle(@NotNull @Valid NewArticle article) {
         @Json
         @Valid
-        record NewArticle(@NotEmpty String title, @NotEmpty String description, @NotEmpty String body,
-                @Nullable List<@NotEmpty String> tagList) {
-        }
+        record NewArticle(
+                @NotEmpty String title,
+                @NotEmpty String description,
+                @NotEmpty String body,
+                @Nullable List<@NotEmpty String> tagList) {}
     }
 
     @Json
@@ -63,9 +66,10 @@ final class Requests {
     record UpdateArticle(@NotNull @Valid Changes article) {
         @Json
         @Valid
-        record Changes(@Nullable @NotEmpty String title, @Nullable @NotEmpty String description,
-                @Nullable @NotEmpty String body) {
-        }
+        record Changes(
+                @Nullable @NotEmpty String title,
+                @Nullable @NotEmpty String description,
+                @Nullable @NotEmpty String body) {}
     }
 
     @Json
@@ -73,7 +77,6 @@ final class Requests {
     record CreateComment(@NotNull @Valid NewComment comment) {
         @Json
         @Valid
-        record NewComment(@NotEmpty String body) {
-        }
+        record NewComment(@NotEmpty String body) {}
     }
 }

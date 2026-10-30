@@ -1,18 +1,15 @@
 package conduit;
 
-import java.net.URI;
-import java.net.URLDecoder;
-import java.nio.charset.StandardCharsets;
-
-import javax.sql.DataSource;
-
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
-
 import io.avaje.inject.Bean;
 import io.avaje.inject.Factory;
 import io.avaje.jsonb.Jsonb;
 import jakarta.inject.Named;
+import java.net.URI;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
+import javax.sql.DataSource;
 import org.jspecify.annotations.Nullable;
 
 /**

@@ -1,10 +1,7 @@
 package conduit;
 
-import java.time.Duration;
-import java.util.List;
-
-import io.avaje.inject.BeanScope;
 import io.avaje.http.api.ValidationException;
+import io.avaje.inject.BeanScope;
 import io.avaje.json.JsonException;
 import io.avaje.jsonb.JsonType;
 import io.helidon.http.HeaderNames;
@@ -13,6 +10,11 @@ import io.helidon.http.Status;
 import io.helidon.webserver.WebServer;
 import io.helidon.webserver.http.HttpFeature;
 import io.helidon.webserver.http.HttpRouting;
+import io.helidon.webserver.http.ServerResponse;
+import java.time.Duration;
+import java.util.List;
+import java.util.stream.Collectors;
+import org.jspecify.annotations.Nullable;
 
 public class Main {
 
@@ -24,25 +26,23 @@ public class Main {
 
         HttpRouting.Builder routing = HttpRouting.builder();
         features.forEach(routing::addFeature);
-        routing.error(ApiException.class, (_, res, ex) -> res.status(Status.create(ex.status))
-                .header(HeaderNames.CONTENT_TYPE, "application/json")
-                .send(errors.toJson(Dto.Errors.of(ex.getMessage()))));
-        routing.error(JsonException.class, (_, res, _) -> res.status(Status.create(422))
-                .header(HeaderNames.CONTENT_TYPE, "application/json")
-                .send(errors.toJson(Dto.Errors.of("malformed JSON body"))));
-        routing.error(ValidationException.class, (_, res, ex) -> res.status(Status.create(422))
-                .header(HeaderNames.CONTENT_TYPE, "application/json")
-                .send(errors.toJson(Dto.Errors.of(ex.getErrors().stream()
-                        .map(v -> v.getPath() + " " + v.getMessage())
-                        .collect(java.util.stream.Collectors.joining("; "))))));
-        routing.error(HttpException.class, (_, res, ex) -> res.status(ex.status())
-                .header(HeaderNames.CONTENT_TYPE, "application/json")
-                .send(errors.toJson(Dto.Errors.of(ex.getMessage()))));
+        routing.error(ApiException.class, (_, res, ex) -> send(res, errors, ex.status, ex.getMessage()));
+        routing.error(JsonException.class, (_, res, _) -> send(res, errors, 422, "malformed JSON body"));
+        routing.error(
+                ValidationException.class,
+                (_, res, ex) -> send(
+                        res,
+                        errors,
+                        422,
+                        ex.getErrors().stream()
+                                .map(v -> v.getPath() + " " + v.getMessage())
+                                .collect(Collectors.joining("; "))));
+        routing.error(
+                HttpException.class,
+                (_, res, ex) -> send(res, errors, ex.status().code(), ex.getMessage()));
         routing.error(Exception.class, (_, res, ex) -> {
-            System.err.println("unhandled: " + ex);
-            res.status(Status.INTERNAL_SERVER_ERROR_500)
-                    .header(HeaderNames.CONTENT_TYPE, "application/json")
-                    .send(errors.toJson(Dto.Errors.of("internal server error")));
+            ex.printStackTrace();
+            send(res, errors, 500, "internal server error");
         });
 
         // Helidon runs every request on a virtual thread. The read timeout also bounds an idle keep-alive connection:
@@ -57,5 +57,12 @@ public class Main {
                 .addRouting(routing)
                 .build()
                 .start();
+    }
+
+    /** An error response: {"errors":{"body":[message]}} with the status. */
+    private static void send(ServerResponse res, JsonType<Dto.Errors> errors, int status, @Nullable String message) {
+        res.status(Status.create(status))
+                .header(HeaderNames.CONTENT_TYPE, "application/json")
+                .send(errors.toJson(Dto.Errors.of(message)));
     }
 }

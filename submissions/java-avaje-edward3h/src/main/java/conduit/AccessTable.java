@@ -1,14 +1,13 @@
 package conduit;
 
-import java.lang.reflect.Method;
-import java.util.ArrayList;
-import java.util.List;
-
 import io.avaje.http.api.Delete;
 import io.avaje.http.api.Get;
 import io.avaje.http.api.Post;
 import io.avaje.http.api.Put;
 import jakarta.inject.Singleton;
+import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.List;
 import org.jspecify.annotations.Nullable;
 
 /**
@@ -53,10 +52,30 @@ final class AccessTable {
             for (Method m : controller.getClass().getDeclaredMethods()) {
                 Access access = m.getAnnotation(Access.class);
                 Access.Level level = access == null ? Access.Level.REQUIRED : access.value();
-                add("GET", m.getAnnotation(Get.class) == null ? null : m.getAnnotation(Get.class).value(), level);
-                add("POST", m.getAnnotation(Post.class) == null ? null : m.getAnnotation(Post.class).value(), level);
-                add("PUT", m.getAnnotation(Put.class) == null ? null : m.getAnnotation(Put.class).value(), level);
-                add("DELETE", m.getAnnotation(Delete.class) == null ? null : m.getAnnotation(Delete.class).value(), level);
+                add(
+                        "GET",
+                        m.getAnnotation(Get.class) == null
+                                ? null
+                                : m.getAnnotation(Get.class).value(),
+                        level);
+                add(
+                        "POST",
+                        m.getAnnotation(Post.class) == null
+                                ? null
+                                : m.getAnnotation(Post.class).value(),
+                        level);
+                add(
+                        "PUT",
+                        m.getAnnotation(Put.class) == null
+                                ? null
+                                : m.getAnnotation(Put.class).value(),
+                        level);
+                add(
+                        "DELETE",
+                        m.getAnnotation(Delete.class) == null
+                                ? null
+                                : m.getAnnotation(Delete.class).value(),
+                        level);
             }
         }
     }

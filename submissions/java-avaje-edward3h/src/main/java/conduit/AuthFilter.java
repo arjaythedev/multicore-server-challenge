@@ -22,7 +22,8 @@ final class AuthFilter {
 
     @Filter
     void filter(FilterChain chain, RoutingRequest req) {
-        Access.Level level = access.level(req.prologue().method().text(), req.path().rawPath());
+        Access.Level level =
+                access.level(req.prologue().method().text(), req.path().rawPath());
         if (level != Access.Level.NONE) {
             auth.authenticate(req, level == Access.Level.REQUIRED);
         }

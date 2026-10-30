@@ -1,12 +1,11 @@
 package conduit;
 
-
 import io.avaje.http.api.Controller;
-import io.avaje.http.api.Valid;
 import io.avaje.http.api.Get;
 import io.avaje.http.api.Post;
 import io.avaje.http.api.Produces;
 import io.avaje.http.api.Put;
+import io.avaje.http.api.Valid;
 import io.helidon.webserver.http.ServerRequest;
 import org.ethelred.kiwiproc.exception.UncheckedSQLException;
 
@@ -63,8 +62,8 @@ class UserController implements ApiController {
         if (row == null || !passwords.verify(user.password(), row.passwordHash())) {
             throw new ApiException(401, "email or password is invalid");
         }
-        return wrap(new UserDao.UserRow(row.id(), row.username(), row.email(), row.bio(), row.image()),
-                jwt.sign(row.id()));
+        return wrap(
+                new UserDao.UserRow(row.id(), row.username(), row.email(), row.bio(), row.image()), jwt.sign(row.id()));
     }
 
     @Get("/api/user")

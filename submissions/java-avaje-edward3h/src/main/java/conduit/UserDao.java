@@ -9,18 +9,33 @@ import org.jspecify.annotations.Nullable;
 @DAO
 public interface UserDao {
 
-    record UserRow(long id, String username, String email, @Nullable String bio, @Nullable String image) {
-    }
+    record UserRow(
+            long id,
+            String username,
+            String email,
+            @Nullable String bio,
+            @Nullable String image) {}
 
-    record LoginRow(long id, String username, String email, @Nullable String bio, @Nullable String image,
-            String passwordHash) {
-    }
+    record LoginRow(
+            long id,
+            String username,
+            String email,
+            @Nullable String bio,
+            @Nullable String image,
+            String passwordHash) {}
 
-    record ProfileRow(long id, String username, @Nullable String bio, @Nullable String image, boolean following) {
-    }
+    record ProfileRow(
+            long id,
+            String username,
+            @Nullable String bio,
+            @Nullable String image,
+            boolean following) {}
 
-    record FolloweeRow(long id, String username, @Nullable String bio, @Nullable String image) {
-    }
+    record FolloweeRow(
+            long id,
+            String username,
+            @Nullable String bio,
+            @Nullable String image) {}
 
     @SqlQuery("""
             INSERT INTO users (username, email, password_hash) VALUES (:username, :email, :hash)
@@ -41,8 +56,13 @@ public interface UserDao {
              WHERE id = :id
             RETURNING id, username, email, bio, image""")
     @Nullable
-    UserRow update(long id, @Nullable String email, @Nullable String username, @Nullable String hash,
-            @Nullable String bio, @Nullable String image);
+    UserRow update(
+            long id,
+            @Nullable String email,
+            @Nullable String username,
+            @Nullable String hash,
+            @Nullable String bio,
+            @Nullable String image);
 
     @SqlQuery("""
             SELECT u.id, u.username, u.bio, u.image,

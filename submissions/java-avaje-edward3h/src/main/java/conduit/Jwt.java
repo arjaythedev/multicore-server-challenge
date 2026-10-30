@@ -1,5 +1,8 @@
 package conduit;
 
+import io.avaje.jsonb.JsonType;
+import io.avaje.jsonb.Jsonb;
+import io.avaje.jsonb.Types;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
@@ -8,13 +11,8 @@ import java.time.Instant;
 import java.util.Base64;
 import java.util.Map;
 import java.util.concurrent.ConcurrentLinkedQueue;
-
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
-
-import io.avaje.jsonb.JsonType;
-import io.avaje.jsonb.Jsonb;
-import io.avaje.jsonb.Types;
 
 /**
  * HS256 tokens: {"sub": "<user id>", "iat": now, "exp": now + 30 days}. Verified on every request, no cache: the
@@ -26,7 +24,8 @@ final class Jwt {
     private static final Duration TTL = Duration.ofDays(30);
     private static final Base64.Encoder ENCODER = Base64.getUrlEncoder().withoutPadding();
     private static final Base64.Decoder DECODER = Base64.getUrlDecoder();
-    private static final String HEADER = ENCODER.encodeToString("{\"alg\":\"HS256\",\"typ\":\"JWT\"}".getBytes(StandardCharsets.UTF_8));
+    private static final String HEADER =
+            ENCODER.encodeToString("{\"alg\":\"HS256\",\"typ\":\"JWT\"}".getBytes(StandardCharsets.UTF_8));
 
     private final SecretKeySpec key;
     private final JsonType<Map<String, Object>> claimsType;
@@ -62,7 +61,8 @@ final class Jwt {
                 return 0;
             }
             Map<String, Object> claims = claimsType.fromJson(DECODER.decode(token.substring(first + 1, second)));
-            if (!(claims.get("exp") instanceof Number exp) || exp.doubleValue() <= Instant.now().getEpochSecond()) {
+            if (!(claims.get("exp") instanceof Number exp)
+                    || exp.doubleValue() <= Instant.now().getEpochSecond()) {
                 return 0;
             }
             // sub must be a JSON string of digits
@@ -80,7 +80,7 @@ final class Jwt {
                 mac = Mac.getInstance("HmacSHA256");
                 mac.init(key);
             }
-            byte[] out = mac.doFinal(input.getBytes(StandardCharsets.US_ASCII));   // also resets the MAC
+            byte[] out = mac.doFinal(input.getBytes(StandardCharsets.US_ASCII)); // also resets the MAC
             macs.offer(mac);
             return out;
         } catch (GeneralSecurityException ex) {

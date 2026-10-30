@@ -2,6 +2,7 @@ plugins {
     java
     application
     id("org.ethelred.kiwiproc") version "1.0"
+    id("com.diffplug.spotless") version "8.10.4"
 }
 
 repositories {
@@ -65,23 +66,39 @@ val checkNullness by tasks.registering(JavaCompile::class) {
     options.annotationProcessorPath = checker
     options.release = 26
     options.encoding = "UTF-8"
-    options.compilerArgs.addAll(listOf(
-        "-proc:full",
-        "-processor", "org.checkerframework.checker.nullness.NullnessChecker",
-        "-Xlint:-processing",
-    ))
-    options.isFork = true
-    options.forkOptions.jvmArgs = listOf(
-        "--add-exports=jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED",
-        "--add-exports=jdk.compiler/com.sun.tools.javac.code=ALL-UNNAMED",
-        "--add-exports=jdk.compiler/com.sun.tools.javac.comp=ALL-UNNAMED",
-        "--add-exports=jdk.compiler/com.sun.tools.javac.file=ALL-UNNAMED",
-        "--add-exports=jdk.compiler/com.sun.tools.javac.main=ALL-UNNAMED",
-        "--add-exports=jdk.compiler/com.sun.tools.javac.model=ALL-UNNAMED",
-        "--add-exports=jdk.compiler/com.sun.tools.javac.parser=ALL-UNNAMED",
-        "--add-exports=jdk.compiler/com.sun.tools.javac.processing=ALL-UNNAMED",
-        "--add-exports=jdk.compiler/com.sun.tools.javac.tree=ALL-UNNAMED",
-        "--add-exports=jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED",
-        "--add-opens=jdk.compiler/com.sun.tools.javac.comp=ALL-UNNAMED",
+    options.compilerArgs.addAll(
+        listOf(
+            "-proc:full",
+            "-processor",
+            "org.checkerframework.checker.nullness.NullnessChecker",
+            "-Xlint:-processing",
+        ),
     )
+    options.isFork = true
+    options.forkOptions.jvmArgs =
+        listOf(
+            "--add-exports=jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED",
+            "--add-exports=jdk.compiler/com.sun.tools.javac.code=ALL-UNNAMED",
+            "--add-exports=jdk.compiler/com.sun.tools.javac.comp=ALL-UNNAMED",
+            "--add-exports=jdk.compiler/com.sun.tools.javac.file=ALL-UNNAMED",
+            "--add-exports=jdk.compiler/com.sun.tools.javac.main=ALL-UNNAMED",
+            "--add-exports=jdk.compiler/com.sun.tools.javac.model=ALL-UNNAMED",
+            "--add-exports=jdk.compiler/com.sun.tools.javac.parser=ALL-UNNAMED",
+            "--add-exports=jdk.compiler/com.sun.tools.javac.processing=ALL-UNNAMED",
+            "--add-exports=jdk.compiler/com.sun.tools.javac.tree=ALL-UNNAMED",
+            "--add-exports=jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED",
+            "--add-opens=jdk.compiler/com.sun.tools.javac.comp=ALL-UNNAMED",
+        )
+}
+
+// ./gradlew spotlessCheck | spotlessApply. Not part of installDist, so not of build.sh.
+spotless {
+    java {
+        target("src/*/java/**/*.java")
+        palantirJavaFormat()
+        removeUnusedImports()
+    }
+    kotlinGradle {
+        ktlint()
+    }
 }

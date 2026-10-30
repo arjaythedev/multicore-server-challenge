@@ -14,8 +14,7 @@ import org.jspecify.annotations.Nullable;
 final class Auth {
 
     /** Authenticated caller: user id and the token they presented. */
-    record User(long id, String token) {
-    }
+    record User(long id, String token) {}
 
     private static final String PREFIX = "Token ";
     private static final String CALLER = "conduit.caller";
