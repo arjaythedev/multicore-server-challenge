@@ -31,15 +31,27 @@ namespace {
     "WITH p AS (" PAGE "), c AS (SELECT count(*) AS n FROM (" COUNT ") s) " \
     "SELECT c.n, p.* FROM c LEFT JOIN p ON true ORDER BY p.id DESC"
 
-// The global and tag lists get LIMIT/OFFSET as literals (validated integers), one prepared statement per page shape.
-// With them as parameters Postgres can't reuse a generic plan for these two (it guesses LIMIT $n means 10% of the
-// rows) and replans on every call, which costs as much as running the query (measured on the full seed: planning
-// 0.26-0.36 ms vs execution ~0.29 ms; with literals planning drops to ~0.005 ms). The other lists already reuse
-// their generic plans with parameters. Here $1 = viewer, $2 = tag.
+// Every list pages its article ids first (an index-only walk that can skip OFFSET rows cheaply) and only then
+// builds the full rows, with their tag/favorite/follow subselects, for at most `limit` ids. Paging the full
+// select instead makes Postgres build every skipped row: ?offset=100000000 took 12.8 s on the full seed.
+//
+// The global, author and tag lists get LIMIT/OFFSET as literals (validated integers), one prepared statement per
+// page shape. With them as parameters Postgres can't reuse a generic plan for these (it guesses LIMIT $n means 10%
+// of the rows) and replans on every call, which costs as much as running the query (measured on the full seed:
+// planning 0.26-0.36 ms vs execution ~0.29 ms; with literals planning drops to ~0.005 ms). The favorited list and
+// the feed already reuse their generic plans with parameters. Here $1 = viewer, $2 = tag or author.
 constexpr std::string_view kPageMark = "/*PAGE*/";
 
-const std::string kListAllTpl = LIST_WITH_COUNT(LIST_SELECT "ORDER BY a.id DESC /*PAGE*/",
-                                                "SELECT 1 FROM articles a LIMIT 1000");
+const std::string kListAllTpl = LIST_WITH_COUNT(
+    LIST_SELECT "WHERE a.id IN (SELECT a2.id FROM articles a2 ORDER BY a2.id DESC /*PAGE*/) ORDER BY a.id DESC",
+    "SELECT 1 FROM articles a LIMIT 1000");
+
+const std::string kListByAuthorTpl = LIST_WITH_COUNT(
+    LIST_SELECT
+    "WHERE a.id IN (SELECT a2.id FROM articles a2 "
+    "WHERE a2.author_id = (SELECT au.id FROM users au WHERE au.username = $2) "
+    "ORDER BY a2.id DESC /*PAGE*/) ORDER BY a.id DESC",
+    "SELECT 1 FROM articles a WHERE a.author_id = (SELECT u.id FROM users u WHERE u.username = $2) LIMIT 1000");
 
 const std::string kListByTagTpl = LIST_WITH_COUNT(
     LIST_SELECT
@@ -55,14 +67,6 @@ pg::Query WithPage(const std::string& tpl, const Page& page, const char* name) {
                 "LIMIT " + std::to_string(page.limit) + " OFFSET " + std::to_string(page.offset));
     return pg::Query{std::move(sql), pg::Query::Name{name}};
 }
-
-const pg::Query kListByAuthor{
-    LIST_WITH_COUNT(LIST_SELECT
-                    "WHERE a.author_id = (SELECT au.id FROM users au WHERE au.username = $4) "
-                    "ORDER BY a.id DESC LIMIT $2 OFFSET $3",
-                    "SELECT 1 FROM articles a WHERE a.author_id = (SELECT u.id FROM users u WHERE u.username = $4) "
-                    "LIMIT 1000"),
-    pg::Query::Name{"list_by_author"}};
 
 const pg::Query kListByFavorited{
     LIST_WITH_COUNT(LIST_SELECT
@@ -187,7 +191,7 @@ std::string Articles::Handle(const HttpRequest& request) const {
             return ListBody(Db().Execute(kMaster, WithPage(kListByTagTpl, page, "list_by_tag"), viewer, *tag));
         }
         if (const auto* author = Filter(request, "author")) {
-            return ListBody(Db().Execute(kMaster, kListByAuthor, viewer, page.limit, page.offset, *author));
+            return ListBody(Db().Execute(kMaster, WithPage(kListByAuthorTpl, page, "list_by_author"), viewer, *author));
         }
         if (const auto* fav = Filter(request, "favorited")) {
             return ListBody(Db().Execute(kMaster, kListByFavorited, viewer, page.limit, page.offset, *fav));
