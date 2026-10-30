@@ -8,7 +8,7 @@ targets:
 dependencies:
   rayo:
     github: faustinoaq/rayo
-    commit: c9553d94583fe2a56ab299e3788fe40dcd0e72b2
+    commit: eafa17b624e8f03fd1626aa532699d3f8b518946
 
 crystal: ">= 1.22.0"
 license: MIT
