@@ -60,6 +60,9 @@ const Client = struct {
     shared: ?*Shared = null,
     req: api.Req = .{},
     next_free: ?*Client = null,
+    /// The next response waiting for the send budget (ZIG_SEND_PACE), and when this one started waiting.
+    paced_next: ?*Client = null,
+    paced_ns: u64 = 0,
 };
 
 /// A lead's response, sent to the lead and to each of its followers.
@@ -91,6 +94,59 @@ const quickack_off: c_int = 0;
 /// The setsockopt's completion, which only a failure posts: tag 0 like the buffer returns, told apart by a pointer
 /// part of its own.
 const ack_delay_data: u64 = 8;
+
+/// ZIG_SEND_PACE=N: the server hands responses to send at N Mbit/s at most, each worker an equal share, in the order
+/// they finished; 0, the default, sends each at once. At 200,000 users a shared drain answers ~1,900 reads together,
+/// ~4.5 MB, about 15 ms of the rig's 2.4 Gbit/s link. Queued that long in the NIC's one queue, responses' tail-loss
+/// probes fire while the originals still wait (TCPSpuriousRtxHostQueues); queued here, they run no TCP timer.
+pub var pace: Bucket = .{ .per_ms = 0 };
+var paced: struct { head: ?*Client = null, tail: ?*Client = null, n: u32 = 0, bytes: u64 = 0, wait_max: u64 = 0, at: u64 = 0 } = .{};
+
+/// A byte budget refilled at `per_ms` bytes per ms that holds at most 1 ms of it; a send may take it below zero.
+pub const Bucket = struct {
+    per_ms: u64,
+    credit: i64 = 0,
+    at: u64 = 0,
+
+    fn refill(b: *Bucket, t: u64) void {
+        const add = @min(t -| b.at, std.time.ns_per_ms) * b.per_ms / std.time.ns_per_ms;
+        b.credit = @min(b.credit + @as(i64, @intCast(add)), @as(i64, @intCast(b.per_ms)));
+        b.at = t;
+    }
+
+    /// When the budget is above zero again (monotonic ns).
+    fn next(b: *const Bucket) u64 {
+        return b.at + (@as(u64, @intCast(1 - b.credit)) * std.time.ns_per_ms + b.per_ms - 1) / b.per_ms;
+    }
+};
+
+/// Hands waiting responses to send while the budget lasts; returns when the next may go, if one waits.
+fn sendPaced() ?u64 {
+    pace.refill(db.now_ns);
+    while (paced.head) |c| {
+        if (pace.credit <= 0) return pace.next();
+        paced.head = c.paced_next;
+        if (paced.head == null) paced.tail = null;
+        c.paced_next = null;
+        pace.credit -= @intCast(c.sending.len);
+        if (db.lane_stats) {
+            paced.n += 1;
+            paced.bytes += c.sending.len;
+            paced.wait_max = @max(paced.wait_max, db.now_ns -| c.paced_ns);
+        }
+        sendBytes(c, c.sending);
+    }
+    return null;
+}
+
+fn logPaced() void {
+    if (paced.at == 0) paced.at = db.now_ns;
+    if (db.now_ns < paced.at + 10 * std.time.ns_per_s) return;
+    sys.log("send pace {d} ms: {d} responses, {d} KB, longest wait {d} ms", .{
+        (db.now_ns - paced.at) / std.time.ns_per_ms, paced.n, paced.bytes >> 10, paced.wait_max / std.time.ns_per_ms,
+    });
+    paced = .{ .head = paced.head, .tail = paced.tail, .at = db.now_ns };
+}
 
 fn sqe() *linux.io_uring_sqe {
     return ring.get_sqe() catch {
@@ -141,6 +197,10 @@ pub fn run(comptime F: Flags, listener: ?i32) noreturn {
         if (F.shed and listener != null) if (shed.ctl.due()) |t| {
             due = if (due) |d| @min(d, t) else t;
         };
+        if (listener != null and pace.per_ms > 0) {
+            if (sendPaced()) |t| due = if (due) |d| @min(d, t) else t;
+            if (db.lane_stats) logPaced();
+        }
         for (db.conns) |*c| flushPg(c);
         due = drain_process.send(due);
         for (returned.items) |bid| {
@@ -325,7 +385,11 @@ fn badRequest(c: *Client) void {
 /// Called by api with the finished response.
 pub fn respond(r: *api.Req, bytes: []const u8) void {
     const c: *Client = @fieldParentPtr("req", r);
-    sendBytes(c, bytes);
+    if (pace.per_ms == 0) return sendBytes(c, bytes);
+    c.sending = bytes;
+    c.paced_ns = db.now_ns;
+    if (paced.tail) |t| t.paced_next = c else paced.head = c;
+    paced.tail = c;
 }
 
 /// Makes the response `r` just started sending also the response of the next `followers` requests that get
@@ -574,6 +638,26 @@ test "text Postgres rejects never reaches a queue, and is answered as the refere
         try testing.expectEqualStrings(o.status, got[9..12]);
         try testing.expect(n > 12);
     }
+}
+
+test "the send budget refills at its rate, holds at most 1 ms of it, and says when a send that overdrew it is paid off" {
+    const ms = std.time.ns_per_ms;
+    var b: Bucket = .{ .per_ms = 1000 };
+    // Idle since boot: one ms of budget, not more.
+    b.refill(16 * 24 * 3600 * std.time.ns_per_s);
+    try std.testing.expectEqual(1000, b.credit);
+    // A 2,500-byte response overdraws it by 1,500: the next may go once 1,501 bytes have accrued, 1.501 ms on.
+    b.credit -= 2500;
+    const t0 = b.at;
+    try std.testing.expectEqual(t0 + 1501 * ms / 1000, b.next());
+    b.refill(t0 + 1 * ms);
+    try std.testing.expectEqual(-500, b.credit);
+    try std.testing.expectEqual(t0 + 1 * ms + 501 * ms / 1000, b.next());
+    b.refill(b.next());
+    try std.testing.expectEqual(1, b.credit);
+    // Half a ms at a time it never holds more than 1 ms.
+    for (0..4) |_| b.refill(b.at + ms / 2);
+    try std.testing.expectEqual(1000, b.credit);
 }
 
 test "a served socket leaves quick-ACK mode through the ring, with no completion" {

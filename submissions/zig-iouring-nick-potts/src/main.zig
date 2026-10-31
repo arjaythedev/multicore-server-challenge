@@ -99,8 +99,16 @@ pub fn main(init: std.process.Init.Minimal) void {
         db.feed3_idle = if (v.len == 0) 0 else std.fmt.parseInt(u8, v, 10) catch 255;
         if (db.feed3_idle > 100) sys.fatal("ZIG_FEED3: '{s}' is not an idle percentage, 0 to 100", .{v});
     }
-    if (db.lane_stats or db.feed3_idle > 0) sys.log("lane stats {s}, third feed drain {s} (at {d}% idle)", .{
+    if (env.getPosix("ZIG_READ_CAP")) |v| {
+        db.read_cap = if (v.len == 0) 0 else std.fmt.parseInt(u8, v, 10) catch sys.fatal("ZIG_READ_CAP: '{s}' is not a drain count", .{v});
+    }
+    if (env.getPosix("ZIG_LANE_SEP")) |v| {
+        const sep = if (v.len == 0) 0 else std.fmt.parseInt(u8, v, 10) catch sys.fatal("ZIG_LANE_SEP: '{s}' is not ms, 0 to 255", .{v});
+        db.lane_sep_ns = @as(u64, sep) * std.time.ns_per_ms;
+    }
+    if (db.lane_stats or db.feed3_idle > 0 or db.read_cap > 0 or db.lane_sep_ns > 0) sys.log("lane stats {s}, third feed drain {s} (at {d}% idle), read drains in flight at most {d} (0: no cap), shared starts {d} ms from feed starts", .{
         if (db.lane_stats) "on" else "off", if (db.feed3_idle > 0) "on" else "off", db.feed3_idle,
+        db.read_cap,                        db.lane_sep_ns / std.time.ns_per_ms,
     });
 
     jwt.init(secret);
@@ -119,6 +127,11 @@ pub fn main(init: std.process.Init.Minimal) void {
     bcrypt.prepare();
 
     const sz = sizing(sys.cpuCount());
+    if (env.getPosix("ZIG_SEND_PACE")) |v| {
+        const mbit = if (v.len == 0) 0 else std.fmt.parseInt(u32, v, 10) catch sys.fatal("ZIG_SEND_PACE: '{s}' is not Mbit/s", .{v});
+        loop.pace.per_ms = @as(u64, mbit) * 125 / sz.workers;
+        if (mbit > 0) sys.log("send pace {d} Mbit/s, {d} bytes per ms per worker", .{ mbit, loop.pace.per_ms });
+    }
     var fbuf: [64]u8 = undefined;
     sys.log("{d} workers x ({d} read + {d} write postgres connections, {d} bcrypt threads), sha-ni {}, gzip {s}, flags {s}", .{
         sz.workers, sz.read_conns, sz.write_conns, sz.bcrypt_threads, jwt.usingShaNi(),
