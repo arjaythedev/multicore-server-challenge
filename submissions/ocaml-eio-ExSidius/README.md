@@ -36,6 +36,28 @@
 - **`OCAMLRUNPARAM` trades memory for fewer collections** (`s=32M,o=400`), because each major collection scans every
   fiber's stack.
 
+## Private benchmark results
+
+Measured on 2026-10-31 at commit `9bad590`, using the submitted defaults without diagnostic counters or
+service tuning overrides. The target was an AWS c6a.2xlarge (8 vCPUs, 16 GB RAM), with PostgreSQL 18 and the
+full seed on the same machine; the load generator ran on a separate machine. Each run used a fresh database,
+a 60-second ramp and a 300-second measured hold. Both runs passed all 197 conformance checks first.
+
+| Users | Requests/s | p95 | p99 | Errors | Verdict |
+|---:|---:|---:|---:|---:|---|
+| 140,000 | 35,199.9 | 431.6 ms | 562.2 ms | 0 | Pass |
+| 150,000 | 37,347.1 | 551.4 ms | 748.5 ms | 0 | Fail: p95 must be below 500 ms |
+
+Neither run was load-generator limited. These are private measurements, not an official leaderboard score;
+the maintainer's benchmark after merge determines that score.
+
+The development harness commands were:
+
+```sh
+bash dev/aws/aws.sh hold submission-defaults-140k 140000
+bash dev/aws/aws.sh hold defaults-no-stats-150k 150000
+```
+
 ## Development
 
 `dev/aws/aws.sh` syncs this folder to two AWS machines and runs builds, conformance and benchmarks there through the
