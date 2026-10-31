@@ -539,7 +539,7 @@ pub fn openConn(url: pg.Url, write: bool, index: u16) !Conn {
             try pg.prepareChecked(b, stmtName(&name, 'b', s), text, types[0..d.params.len], cols);
         }
     }
-    if (!write) try pg.prepareChecked(b, mega_name, sql.mega.sql, &sql.mega.params, &sql.mega.cols);
+    if (!write) try pg.prepareChecked(b, mega_name, mega.text(), &sql.mega.params, mega.cols());
     if (b.end != b.start) return error.UnexpectedData;
     return .{
         .fd = b.fd,

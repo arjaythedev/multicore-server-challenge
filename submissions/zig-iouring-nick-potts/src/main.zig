@@ -19,6 +19,7 @@ const sys = @import("sys.zig");
 const pz = @import("pz.zig");
 const pg = @import("pg.zig");
 const db = @import("db.zig");
+const mega = @import("mega.zig");
 const jwt = @import("jwt.zig");
 const bcrypt = @import("bcrypt.zig");
 const loop = @import("loop.zig");
@@ -93,6 +94,12 @@ pub fn main(init: std.process.Init.Minimal) void {
         error.UnknownFlag => sys.fatal("CONDUIT_FLAGS: unknown flag '{s}' (flags: " ++ flags.known ++ ")", .{bad}),
         error.BadValue => sys.fatal("CONDUIT_FLAGS: '{s}' is not name=on or name=off", .{bad}),
     };
+    // ZIG_MEGA_TAG_TEXT=1 and ZIG_MEGA_NAME_IDS=1 prepare MEGA with tags as text and with one name lookup per list
+    // (sql.zig); both off by default.
+    mega.tag_text = onOff(env, "ZIG_MEGA_TAG_TEXT");
+    mega.name_ids = onOff(env, "ZIG_MEGA_NAME_IDS");
+    if (mega.tag_text) sys.log("ZIG_MEGA_TAG_TEXT=1: MEGA sends each article's tags as one text", .{});
+    if (mega.name_ids) sys.log("ZIG_MEGA_NAME_IDS=1: MEGA looks each list's tag name or username up once", .{});
 
     if (env.getPosix("ZIG_LANE_STATS")) |v| db.lane_stats = if (std.mem.eql(u8, v, "1")) true else if (v.len == 0 or std.mem.eql(u8, v, "0")) false else sys.fatal("ZIG_LANE_STATS: '{s}' is not 0 or 1", .{v});
     if (env.getPosix("ZIG_FEED3")) |v| {
@@ -228,6 +235,14 @@ fn listenerOptions(fd: i32) void {
     sys.setsockoptInt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, 1) catch sys.fatal("SO_REUSEADDR", .{});
     sys.setsockoptInt(fd, linux.SOL.SOCKET, linux.SO.REUSEPORT, 1) catch sys.fatal("SO_REUSEPORT", .{});
     sys.setsockoptInt(fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, 1) catch sys.fatal("TCP_NODELAY", .{});
+}
+
+/// An environment knob: unset, empty or `0` is off, `1` is on; anything else stops the server.
+fn onOff(env: anytype, comptime name: []const u8) bool {
+    const v = env.getPosix(name) orelse "";
+    if (std.mem.eql(u8, v, "1")) return true;
+    if (v.len == 0 or std.mem.eql(u8, v, "0")) return false;
+    sys.fatal(name ++ ": '{s}' is not 0 or 1", .{v});
 }
 
 fn ignoreSigpipe() void {

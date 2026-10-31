@@ -15,6 +15,21 @@ const gpa = std.heap.smp_allocator;
 const ncols = sql.mega.cols.len;
 const page = sql.mega.page;
 
+/// ZIG_MEGA_TAG_TEXT=1 (main.zig): MEGA sends each article's tags as one text (sql.zig), which `Result.add` turns
+/// back into the text[] the statements return.
+pub var tag_text = false;
+/// ZIG_MEGA_NAME_IDS=1 (main.zig): MEGA looks each list's tag name or username up once (sql.zig).
+pub var name_ids = false;
+
+/// The text read connections prepare as MEGA, and its columns.
+pub fn text() []const u8 {
+    return sql.mega.variants[@as(usize, @intFromBool(tag_text)) * 2 + @intFromBool(name_ids)];
+}
+
+pub fn cols() []const sql.Oid {
+    return if (tag_text) &sql.mega.cols_tag_text else &sql.mega.cols;
+}
+
 /// Binds MEGA (prepared as `name`) with one array element per read and executes it. A read's ordinal is its
 /// 1-based position in `reads`.
 pub fn encode(o: *pg.Out, name: []const u8, reads: []const *Query) void {
@@ -67,8 +82,73 @@ pub const Result = struct {
             c.off[i] = base + row.off[i];
             c.len[i] = row.len[i];
         }
+        if (tag_text and c.len[sql.mega.tags] >= 0) try m.tagArray(&c);
         if (c.len[page.ids] < 0) return m.rows.append(gpa, c);
         try m.expand(c);
+    }
+
+    /// Points the tags column at the article's tag names as a binary text[], appended to `data`, built from the
+    /// text `sql.mega.tag_text` sends: the names joined by chr(31), or chr(31) and the text[] in Postgres's text
+    /// form, `{a,"b c"}`, where an element is quoted when it needs to be and `"` and `\` in quotes are escaped.
+    fn tagArray(m: *Result, c: *Cols) !void {
+        const len: usize = @intCast(c.len[sql.mega.tags]);
+        // At most 20 header bytes, then 4 length bytes per name and the names, which are no longer than the text.
+        try m.data.ensureUnusedCapacity(gpa, 24 + 5 * len);
+        const s = m.data.items[c.off[sql.mega.tags]..][0..len];
+        const out = m.data.unusedCapacitySlice();
+        var o: usize = 20;
+        var n: i32 = 0;
+        if (len > 0 and s[0] == 0x1f) {
+            if (len < 3 or s[1] != '{' or s[len - 1] != '}') return error.BadMegaTags;
+            var i: usize = 2;
+            while (i < len - 1) : (i += 1) {
+                const name_at = o;
+                o += 4;
+                if (s[i] == '"') {
+                    i += 1;
+                    while (i < len - 1 and s[i] != '"') : (i += 1) {
+                        if (s[i] == '\\') i += 1;
+                        out[o] = s[i];
+                        o += 1;
+                    }
+                    if (i >= len - 1) return error.BadMegaTags;
+                    i += 1;
+                } else {
+                    while (s[i] != ',' and s[i] != '}') : (i += 1) {
+                        out[o] = s[i];
+                        o += 1;
+                    }
+                }
+                std.mem.writeInt(i32, out[name_at..][0..4], @intCast(o - name_at - 4), .big);
+                n += 1;
+            }
+        } else if (len > 0) {
+            var name_at = o;
+            o += 4;
+            for (s) |ch| {
+                if (ch != 0x1f) {
+                    out[o] = ch;
+                    o += 1;
+                    continue;
+                }
+                std.mem.writeInt(i32, out[name_at..][0..4], @intCast(o - name_at - 4), .big);
+                n += 1;
+                name_at = o;
+                o += 4;
+            }
+            std.mem.writeInt(i32, out[name_at..][0..4], @intCast(o - name_at - 4), .big);
+            n += 1;
+        }
+        std.mem.writeInt(i32, out[0..4], @intFromBool(n > 0), .big);
+        std.mem.writeInt(i32, out[4..8], 0, .big);
+        std.mem.writeInt(i32, out[8..12], @intFromEnum(sql.Oid.text), .big);
+        if (n > 0) {
+            std.mem.writeInt(i32, out[12..16], n, .big);
+            std.mem.writeInt(i32, out[16..20], 1, .big);
+        } else o = 12;
+        c.off[sql.mega.tags] = @intCast(m.data.items.len);
+        c.len[sql.mega.tags] = @intCast(o);
+        m.data.items.len += o;
     }
 
     /// A list read's page row, with the page's article ids and their authors and the viewer's favorites and
@@ -487,6 +567,47 @@ test "add expands a page row into one row per article, with the viewer's flags f
         \\list_tag done
         \\
     , got.items);
+}
+
+/// `names` as Postgres sends a text[] in binary: no dimensions when empty.
+fn textArrayBytes(out: *std.ArrayList(u8), names: []const []const u8) !void {
+    const a = testing.allocator;
+    const hdr = [_]i32{ @intFromBool(names.len > 0), 0, @intFromEnum(sql.Oid.text), @intCast(names.len), 1 };
+    for (hdr[0..if (names.len > 0) 5 else 3]) |h| try out.appendSlice(a, &std.mem.toBytes(std.mem.nativeToBig(i32, h)));
+    for (names) |n| {
+        try out.appendSlice(a, &std.mem.toBytes(std.mem.nativeToBig(i32, @intCast(n.len))));
+        try out.appendSlice(a, n);
+    }
+}
+
+test "with tags as text, add turns the joined names, or the text[] in text form, into the binary text[]" {
+    tag_text = true;
+    defer tag_text = false;
+    const cases = [_]struct { text: []const u8, names: []const []const u8 }{
+        .{ .text = "", .names = &.{} },
+        .{ .text = "dragons", .names = &.{"dragons"} },
+        .{ .text = "a\x1fbb\x1fccc", .names = &.{ "a", "bb", "ccc" } },
+        .{ .text = "\x1f{}", .names = &.{} },
+        // Postgres's own text form of this text[] (array_out).
+        .{
+            .text = "\x1f{\"\",\"a,b\",\"say \\\"hi\\\"\",\"back\\\\slash\",\"sp ace\",\"{x}\",\"NULL\",x\x1fy,\"tab\t\",\xc3\xa9,plain}",
+            .names = &.{ "", "a,b", "say \"hi\"", "back\\slash", "sp ace", "{x}", "NULL", "x\x1fy", "tab\t", "\xc3\xa9", "plain" },
+        },
+    };
+    for (cases) |t| {
+        var m: Result = .{};
+        try addRow(&m, -1, &.{ .{ 1, .{ .int = 9 } }, .{ sql.mega.tags, .{ .text = t.text } } });
+        try addRow(&m, 1, &.{.{ 0, .{ .int = 0 } }});
+        const c = m.rows.items[0];
+        var want: std.ArrayList(u8) = .empty;
+        defer want.deinit(testing.allocator);
+        try textArrayBytes(&want, t.names);
+        try testing.expectEqualSlices(u8, want.items, m.data.items[c.off[sql.mega.tags]..][0..@intCast(c.len[sql.mega.tags])]);
+        try testing.expectEqual(-1, m.rows.items[1].len[sql.mega.tags]);
+    }
+    var m: Result = .{};
+    try testing.expectError(error.BadMegaTags, addRow(&m, -1, &.{.{ sql.mega.tags, .{ .text = "\x1f{\"open}" } }}));
+    try testing.expectError(error.BadMegaTags, addRow(&m, -1, &.{.{ sql.mega.tags, .{ .text = "\x1f{" } }}));
 }
 
 test "add refuses a page whose arrays are not one-dimensional int8 without NULLs, or of different lengths" {

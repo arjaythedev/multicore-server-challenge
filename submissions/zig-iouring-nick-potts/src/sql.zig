@@ -68,6 +68,46 @@ pub const mega = struct {
     pub const cols = [_]Oid{ .int8, .int8, .text, .text, .text, .text, .timestamptz, .timestamptz, .text_array, .int8, .bool, .text, .text, .text, .bool, .int8_array, .int8_array, .int8_array, .int8_array, .int8 };
     pub const keys = [_]u8{1};
     pub const ordinal = cols.len - 1;
+    pub const tags = 8;
+    /// MEGA as a read connection prepares it, indexed by ZIG_MEGA_TAG_TEXT * 2 + ZIG_MEGA_NAME_IDS (main.zig).
+    pub const variants = [4][]const u8{ sql, edit(sql, &name_ids), edit(sql, &tag_text), edit(edit(sql, &name_ids), &tag_text) };
+    /// The columns with ZIG_MEGA_TAG_TEXT=1.
+    pub const cols_tag_text = blk: {
+        var c = cols;
+        c[tags] = .text;
+        break :blk c;
+    };
+    /// ZIG_MEGA_TAG_TEXT=1: each article's tags as one text, the names joined by chr(31) by string_agg, which saves
+    /// Postgres building a text[] and sending it element by element. While some tag name is empty or holds chr(31),
+    /// the join could not be split back, so every article's tags come as chr(31) and the text[] in Postgres's text
+    /// form instead; a joined text never starts with chr(31). mega.zig turns either into the text[].
+    const tag_text = [_][2][]const u8{
+        .{ "array_agg(t.name ORDER BY t.name) AS tags", "string_agg(t.name, chr(31) ORDER BY t.name) AS tags" },
+        .{ "COALESCE(tg.tags, '{}'::text[]) AS tags",
+            \\CASE WHEN NOT EXISTS (SELECT 1 FROM tags t WHERE t.name = '' OR strpos(t.name, chr(31)) > 0) THEN COALESCE(tg.tags, '')
+            \\      ELSE chr(31) || ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE at.article_id = a.id ORDER BY t.name)::text END AS tags
+        },
+    };
+    /// ZIG_MEGA_NAME_IDS=1: each distinct list read looks its tag name or username up once, as `rid` in `la`,
+    /// instead of once for its count and again for its page. Every other read's `rid` is 0, not NULL, so the feed
+    /// rows keep a tuple without NULLs.
+    const name_ids = [_][2][]const u8{
+        .{ "WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = ck.t1) OFFSET 999", "WHERE at.tag_id = ck.rid OFFSET 999" },
+        .{ "WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = ck.t1) LIMIT 1000", "WHERE at.tag_id = ck.rid LIMIT 1000" },
+        .{ "author_id = (SELECT au.id FROM users au WHERE au.username = ck.t1)", "author_id = ck.rid" },
+        .{ "f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = ck.t1)", "f.user_id = ck.rid" },
+        .{ "at.tag_id = (SELECT t.id FROM tags t WHERE t.name = lk.t1)", "at.tag_id = lk.rid" },
+        .{ "a2.author_id = (SELECT au.id FROM users au WHERE au.username = lk.t1)", "a2.author_id = lk.rid" },
+        .{ "f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = lk.t1)", "f.user_id = lk.rid" },
+        .{ "ck.t1, ck.a, CASE", "ck.t1, ck.a, ck.rid, CASE" },
+        .{ "lpo, t1, a, max(n)", "lpo, t1, a, rid, max(n)" },
+        .{ "WHERE fo.follower_id = lk.fv) END AS a\n",
+            \\WHERE fo.follower_id = lk.fv) END AS a,
+            \\    CASE WHEN lk.k = 2 THEN (SELECT t.id FROM tags t WHERE t.name = lk.t1)
+            \\      WHEN lk.k IN (3, 4) THEN (SELECT u.id FROM users u WHERE u.username = lk.t1) ELSE 0 END AS rid
+            \\
+        },
+    };
     /// A list read's page arrays and the columns filled per article from them.
     pub const page = struct {
         pub const ids = 15;
@@ -145,6 +185,20 @@ fn text(comptime s: Stmt) []const u8 {
 /// The hand-written batched form of `s`: `sql/BATCH_<NAME>.sql`.
 fn batchText(comptime s: Stmt) []const u8 {
     return file("BATCH_", s);
+}
+
+/// `s` with each pair's first text, which must occur exactly once, replaced by its second, in order.
+fn edit(comptime s: []const u8, comptime pairs: []const [2][]const u8) []const u8 {
+    comptime {
+        @setEvalBranchQuota(1_000_000);
+        var t = s;
+        for (pairs) |p| {
+            const at = std.mem.indexOf(u8, t, p[0]) orelse @compileError("MEGA.sql: not found: " ++ p[0]);
+            if (std.mem.indexOfPos(u8, t, at + 1, p[0]) != null) @compileError("MEGA.sql: found twice: " ++ p[0]);
+            t = t[0..at] ++ p[1] ++ t[at + p[0].len ..];
+        }
+        return t;
+    }
 }
 
 fn file(comptime prefix: []const u8, comptime s: Stmt) []const u8 {
