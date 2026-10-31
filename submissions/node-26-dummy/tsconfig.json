@@ -7,6 +7,7 @@
     "outDir": "dist",
     "types": ["node"],
     "strict": true,
+    "noEmitOnError": true,
     "exactOptionalPropertyTypes": true,
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,

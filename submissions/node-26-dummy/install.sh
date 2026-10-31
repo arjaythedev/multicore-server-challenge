@@ -50,6 +50,8 @@ apt-get install -y --no-install-recommends \
   ca-certificates \
   curl \
   xz-utils \
+  build-essential \
+  python3 \
   libatomic1
 
 install -d -m 0755 "${INSTALL_ROOT}"

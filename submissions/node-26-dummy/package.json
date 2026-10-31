@@ -5,15 +5,23 @@
   "description": "A minimal strict TypeScript 7 HTTP application on Node.js 26.",
   "type": "module",
   "engines": {
-    "node": ">=26.0.0"
+    "node": ">=26.0.0 <27"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node test.mjs",
     "start": "node dist/cluster.js"
   },
   "devDependencies": {
+    "@types/pg": "8.23.1",
+    "@types/bcrypt": "6.0.0",
     "@types/node": "26.6.6",
     "typescript": "7.0.2"
+  },
+  "dependencies": {
+    "pg": "8.23.1",
+    "bcrypt": "6.0.0",
+    "jose": "6.2.14"
   }
 }
