@@ -31,7 +31,8 @@ pub enum Read {
     Login { email: String, password: Vec<u8> },
     Profile { username: String },
     Article { slug: String },
-    ArticleId { id: i64, status: u16 },
+    /// A write's read-back; `fav`: the viewer's favorite state when the write just set it.
+    ArticleId { id: i64, status: u16, fav: Option<bool> },
     Comments { slug: String },
     Global { lim: i64, off: i64 },
     Tag { tag: String, lim: i64, off: i64 },
@@ -120,6 +121,7 @@ pub struct Settings {
     pub bcrypt_lanes: usize,
     pub bcrypt_window: Duration,
     pub bcrypt_idle: bool,
+    pub bcrypt_rescue: Duration,
 }
 
 // ------------------------------------------------------------------------------------------------------------------
@@ -131,9 +133,17 @@ impl Hasher for Fx {
     fn finish(&self) -> u64 {
         self.0
     }
+    // Eight bytes per step: slugs, usernames and emails are tens of bytes long.
     fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 = (self.0.rotate_left(5) ^ b as u64).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        let mut c = bytes.chunks_exact(8);
+        for w in &mut c {
+            self.write_u64(u64::from_le_bytes(w.try_into().unwrap()));
+        }
+        let r = c.remainder();
+        if !r.is_empty() {
+            let mut t = [0u8; 8];
+            t[..r.len()].copy_from_slice(r);
+            self.write_u64(u64::from_le_bytes(t) ^ ((r.len() as u64) << 56));
         }
     }
     fn write_u64(&mut self, v: u64) {
@@ -159,6 +169,10 @@ impl<K: Hash + Eq + Clone> Keys<K> {
         if let Some(&i) = self.map.get(&key) {
             return i;
         }
+        self.add(key)
+    }
+    /// Adds a key known to be new.
+    fn add(&mut self, key: K) -> u32 {
         let i = self.list.len() as u32;
         self.map.insert(key.clone(), i);
         self.list.push(key);
@@ -175,7 +189,7 @@ impl Keys<String> {
         if let Some(&i) = self.map.get(key) {
             return i;
         }
-        self.idx(key.to_owned())
+        self.add(key.to_owned())
     }
 }
 
@@ -602,13 +616,15 @@ impl ReadLane {
         let mut foll: Keys<(i64, i64)> = Keys::new();
         // Article rows phase A returned with their columns (everything but feed pages), by id.
         let mut full: FxMap<i64, &[Col]> = FxMap::default();
-        let mut add_art = |id: i64, author: i64, v: i64, arts: &mut Keys<i64>, favd: &mut Keys<(i64, i64)>, foll: Option<&mut Keys<(i64, i64)>>| {
+        let mut add_art = |id: i64, author: i64, v: i64, arts: &mut Keys<i64>, favd: &mut Keys<(i64, i64)>, foll: Option<&mut Keys<(i64, i64)>>, ask_fav: bool| {
             let i = arts.idx(id) as usize;
             if art_author.len() <= i {
                 art_author.push(author);
             }
             if v != 0 {
-                favd.idx((v, id));
+                if ask_fav {
+                    favd.idx((v, id));
+                }
                 if let Some(foll) = foll {
                     foll.idx((v, author));
                 }
@@ -621,25 +637,26 @@ impl ReadLane {
                     let p = if let Ask::Slug(_) = a { by_slug[k as usize] } else { by_id[k as usize] };
                     if let Some((id, author, r)) = p {
                         full.entry(id).or_insert(r);
-                        add_art(id, author, v, &mut arts, &mut favd, Some(&mut foll));
+                        let known = matches!(j.kind, Read::ArticleId { fav: Some(_), .. });
+                        add_art(id, author, v, &mut arts, &mut favd, Some(&mut foll), !known);
                     }
                 }
                 Ask::Global(p) => {
                     for &(id, author, r) in &gpages[p as usize] {
                         full.entry(id).or_insert(r);
-                        add_art(id, author, v, &mut arts, &mut favd, Some(&mut foll));
+                        add_art(id, author, v, &mut arts, &mut favd, Some(&mut foll), true);
                     }
                 }
                 Ask::List(f, _, p) => {
                     for &(id, author, r) in &decoded[f].1[p as usize] {
                         full.entry(id).or_insert(r);
-                        add_art(id, author, v, &mut arts, &mut favd, Some(&mut foll));
+                        add_art(id, author, v, &mut arts, &mut favd, Some(&mut foll), true);
                     }
                 }
                 Ask::Feed(_, p) => {
                     // A feed's articles are by authors the viewer follows: no follow probe needed.
                     for &(id, author, _) in &fpages[p as usize] {
-                        add_art(id, author, v, &mut arts, &mut favd, None);
+                        add_art(id, author, v, &mut arts, &mut favd, None, true);
                     }
                 }
                 Ask::Comments(k) => {
@@ -647,8 +664,8 @@ impl ReadLane {
                         if let Some(s) = s_cmts {
                             for &i in &g_cmts[k as usize] {
                                 let r = &pa.results[s].rows[i];
-                                if r[2].len >= 0 {
-                                    foll.idx((v, pa.i64(r[6])));
+                                if r[1].len >= 0 {
+                                    foll.idx((v, pa.i64(r[5])));
                                 }
                             }
                         }
@@ -677,6 +694,18 @@ impl ReadLane {
             }
         }
 
+        // Every comment's author, sorted and distinct.
+        let mut cauth: Vec<i64> = Vec::new();
+        if let Some(s) = s_cmts {
+            for r in &pa.results[s].rows {
+                if r[1].len >= 0 {
+                    cauth.push(pa.i64(r[5]));
+                }
+            }
+        }
+        cauth.sort_unstable();
+        cauth.dedup();
+
         // ---- phase B ----
         let mut nb = 0usize;
         let mut slotb = |cond: bool| -> Option<usize> {
@@ -690,6 +719,7 @@ impl ReadLane {
         let b_artx = slotb(arts.len() > 0);
         let b_flags = slotb(favd.len() + foll.len() > 0);
         let b_rows = slotb(need_rows.len() > 0);
+        let b_auser = slotb(!cauth.is_empty());
         let pb = if nb > 0 {
             let ids = int_array(arts.list.iter().copied());
             let o = &mut conn.out;
@@ -709,6 +739,9 @@ impl ReadLane {
             }
             if b_rows.is_some() {
                 o.bind_exec("artrow", &[Param::Raw(&int_array(need_rows.list.iter().copied()))]);
+            }
+            if b_auser.is_some() {
+                o.bind_exec("auser", &[Param::Raw(&int_array(cauth.iter().copied()))]);
             }
             o.sync();
             conn.flush()?;
@@ -746,6 +779,12 @@ impl ReadLane {
                         target[k as usize] = true;
                     }
                 }
+            }
+        }
+        let mut auser: FxMap<i64, &[Col]> = FxMap::default();
+        if let (Some(pb), Some(s)) = (&pb, b_auser) {
+            for r in &pb.results[s].rows {
+                auser.insert(pb.i64(r[0]), &r[..]);
             }
         }
         let mut rows_b: FxMap<i64, usize> = FxMap::default();
@@ -794,13 +833,13 @@ impl ReadLane {
                 },
                 Ask::Slug(k) | Ask::Id(k) => {
                     let p = if let Ask::Slug(_) = ask { by_slug[k as usize] } else { by_id[k as usize] };
-                    let status = match j.kind {
-                        Read::ArticleId { status, .. } => status,
-                        _ => 200,
+                    let (status, fav) = match j.kind {
+                        Read::ArticleId { status, fav, .. } => (status, fav),
+                        _ => (200, None),
                     };
                     let mut b = Vec::with_capacity(2048);
                     b.extend_from_slice(b"{\"article\":");
-                    if p.is_some_and(|a| ctx.article(&mut b, &pa, a, true, v, false)) {
+                    if p.is_some_and(|a| ctx.article(&mut b, &pa, a, true, v, false, fav)) {
                         b.push(b'}');
                         out.push(Response { to, status, body: b });
                     } else {
@@ -814,25 +853,35 @@ impl ReadLane {
                         continue;
                     }
                     let s = s_cmts.unwrap();
-                    let mut list: Vec<&[Col]> = rows.iter().map(|&i| &pa.results[s].rows[i]).filter(|r| r[2].len >= 0 && r[7].len >= 0).collect();
-                    list.sort_unstable_by(|x, y| (pa.i64(y[4]), pa.i64(y[2])).cmp(&(pa.i64(x[4]), pa.i64(x[2]))));
+                    // Each comment with its author's row, looked up once.
+                    let mut list: Vec<(&[Col], &[Col])> = rows
+                        .iter()
+                        .map(|&i| &pa.results[s].rows[i][..])
+                        .filter(|r| r[1].len >= 0)
+                        .filter_map(|r| auser.get(&pa.i64(r[5])).map(|&u| (r, u)))
+                        .collect();
+                    // Already newest first from the statement; sorting a sorted run is linear.
+                    list.sort_unstable_by(|(x, _), (y, _)| (pa.i64(y[3]), pa.i64(y[1])).cmp(&(pa.i64(x[3]), pa.i64(x[1]))));
+                    // Some whenever a comment is listed: its author came from phase B's "auser".
+                    let pbr = pb.as_ref();
                     let mut b = Vec::with_capacity(64 + 400 * list.len());
                     b.extend_from_slice(b"{\"comments\":[");
-                    for (n, r) in list.into_iter().enumerate() {
+                    for (n, (r, u)) in list.into_iter().enumerate() {
                         if n > 0 {
                             b.push(b',');
                         }
                         b.extend_from_slice(b"{\"id\":");
-                        json::int(&mut b, pa.i64(r[2]));
+                        json::int(&mut b, pa.i64(r[1]));
                         b.extend_from_slice(b",\"createdAt\":");
-                        json::ts(&mut b, pa.i64(r[4]));
+                        json::ts(&mut b, pa.i64(r[3]));
                         b.extend_from_slice(b",\"updatedAt\":");
-                        json::ts(&mut b, pa.i64(r[5]));
+                        json::ts(&mut b, pa.i64(r[4]));
                         b.extend_from_slice(b",\"body\":");
-                        json::str(&mut b, pa.bytes(r[3]).unwrap_or(b""));
+                        json::str(&mut b, pa.bytes(r[2]).unwrap_or(b""));
                         b.extend_from_slice(b",\"author\":");
-                        let following = v != 0 && ctx.following(v, pa.i64(r[6]));
-                        profile_obj(&mut b, pa.bytes(r[7]).unwrap_or(b""), pa.bytes(r[8]), pa.bytes(r[9]), following);
+                        let following = v != 0 && ctx.following(v, pa.i64(r[5]));
+                        let pb = pbr.unwrap();
+                        profile_obj(&mut b, pb.bytes(u[1]).unwrap_or(b""), pb.bytes(u[2]), pb.bytes(u[3]), following);
                         b.push(b'}');
                     }
                     b.extend_from_slice(b"]}");
@@ -855,7 +904,7 @@ impl ReadLane {
                         if !first {
                             b.push(b',');
                         }
-                        if ctx.article(&mut b, &pa, a, false, v, followed) {
+                        if ctx.article(&mut b, &pa, a, false, v, followed, None) {
                             first = false;
                         } else {
                             b.truncate(mark);
@@ -967,7 +1016,7 @@ impl Ctx<'_> {
 
     /// Writes one Article object for viewer `v`, from the batch's fragment for it. Returns false (writing nothing)
     /// if the article's phase-B row is missing.
-    fn article(&self, b: &mut Vec<u8>, pa: &Pipeline, a: ArtRef, full: bool, v: i64, followed: bool) -> bool {
+    fn article(&self, b: &mut Vec<u8>, pa: &Pipeline, a: ArtRef, full: bool, v: i64, followed: bool, known_fav: Option<bool>) -> bool {
         let (id, author, _) = a;
         let mut f = self.frags.borrow_mut();
         let f = &mut *f;
@@ -985,7 +1034,7 @@ impl Ctx<'_> {
         };
         let Some((start, fav, foll)) = at else { return false };
         b.extend_from_slice(&f.buf[start..fav]);
-        json::bool(b, v != 0 && self.favorited(v, id));
+        json::bool(b, known_fav.unwrap_or_else(|| v != 0 && self.favorited(v, id)));
         b.extend_from_slice(&f.buf[fav..foll]);
         json::bool(b, followed || (v != 0 && self.following(v, author)));
         b.extend_from_slice(b"}}");
@@ -1079,12 +1128,18 @@ fn bind_write(o: &mut pg::Out, w: &WriteJob) {
         }
         Write::Favorite { slug, on } => o.bind_exec(if *on { "fav" } else { "unfav" }, &[Param::I64(v), Param::Text(slug.as_bytes())]),
         Write::CreateArticle { title, description, body, tags } => {
+            let arr = text_array(tags.iter().map(|t| t.as_bytes()));
             o.bind_exec(
                 "newart",
-                &[Param::I64(v), Param::Text(title.as_bytes()), Param::Text(description.as_bytes()), Param::Text(body.as_bytes())],
+                &[
+                    Param::I64(v),
+                    Param::Text(title.as_bytes()),
+                    Param::Text(description.as_bytes()),
+                    Param::Text(body.as_bytes()),
+                    Param::Raw(&arr),
+                ],
             );
             if !tags.is_empty() {
-                let arr = text_array(tags.iter().map(|t| t.as_bytes()));
                 o.bind_exec("newtags", &[Param::Raw(&arr)]);
                 o.bind_exec("arttags", &[Param::Raw(&arr)]);
             }
@@ -1273,17 +1328,47 @@ fn finish_row(j: WriteJob, p: &Pipeline, first: Option<&[Col]>, s: &Settings, ou
             }
             None => out.push(reply::error(to, 404, "profile not found")),
         },
-        Write::Favorite { .. } => match first {
-            Some(r) => push_read(ReadJob { kind: Read::ArticleId { id: p.i64(r[0]), status: 200 }, viewer: v, to }),
+        Write::Favorite { on, .. } => match first {
+            // The write just set the viewer's favorite state: the read-back needn't look it up again.
+            Some(r) => push_read(ReadJob { kind: Read::ArticleId { id: p.i64(r[0]), status: 200, fav: Some(on) }, viewer: v, to }),
             None => out.push(reply::error(to, 404, "article not found")),
         },
-        Write::CreateArticle { .. } => match first {
-            Some(r) => push_read(ReadJob { kind: Read::ArticleId { id: p.i64(r[0]), status: 201 }, viewer: v, to }),
+        // A new article's whole response comes from the request and the row "newart" returns: no
+        // favorites yet, so favorited is false and favoritesCount 0.
+        Write::CreateArticle { title, description, body, .. } => match first {
+            Some(r) => {
+                let mut b = Vec::with_capacity(1024 + body.len());
+                b.extend_from_slice(b"{\"article\":{\"slug\":");
+                json::str(&mut b, p.bytes(r[1]).unwrap_or(b""));
+                b.extend_from_slice(b",\"title\":");
+                json::str(&mut b, title.as_bytes());
+                b.extend_from_slice(b",\"description\":");
+                json::str(&mut b, description.as_bytes());
+                b.extend_from_slice(b",\"body\":");
+                json::str(&mut b, body.as_bytes());
+                b.extend_from_slice(b",\"tagList\":[");
+                if let Some(arr) = p.bytes(r[7]) {
+                    for (i, t) in pg::array_elems(arr).enumerate() {
+                        if i > 0 {
+                            b.push(b',');
+                        }
+                        json::str(&mut b, t);
+                    }
+                }
+                b.extend_from_slice(b"],\"createdAt\":");
+                json::ts(&mut b, p.i64(r[2]));
+                b.extend_from_slice(b",\"updatedAt\":");
+                json::ts(&mut b, p.i64(r[3]));
+                b.extend_from_slice(b",\"favorited\":false,\"favoritesCount\":0,\"author\":");
+                profile_obj(&mut b, p.bytes(r[4]).unwrap_or(b""), p.bytes(r[5]), p.bytes(r[6]), p.bytes(r[8]) == Some(&[1u8][..]));
+                b.extend_from_slice(b"}}");
+                out.push(Response { to, status: 201, body: b });
+            }
             None => out.push(reply::error(to, 500, "internal error")),
         },
         Write::UpdateArticle { .. } => match first {
             Some(r) if p.i64(r[1]) != v => out.push(reply::error(to, 403, "not the author")),
-            Some(r) => push_read(ReadJob { kind: Read::ArticleId { id: p.i64(r[0]), status: 200 }, viewer: v, to }),
+            Some(r) => push_read(ReadJob { kind: Read::ArticleId { id: p.i64(r[0]), status: 200, fav: None }, viewer: v, to }),
             None => out.push(reply::error(to, 404, "article not found")),
         },
         Write::DeleteArticle { .. } => match first {
@@ -1323,10 +1408,12 @@ fn finish_row(j: WriteJob, p: &Pipeline, first: Option<&[Col]>, s: &Settings, ou
 /// Worker 0 waits up to the window to fill its lanes, then runs what it has. Other workers only take full sets of
 /// lanes, so they add capacity under a backlog without splitting the trickle of logins into half-empty runs.
 pub fn bcrypt_worker(s: &'static Settings, index: usize) {
+    // Hashing yields to everything else: the thread runs at nice 19 (raising one's own nice needs no privileges).
+    // A nice thread still gets a small share, so a lock it holds when preempted (a reply outbox, a queue) is freed
+    // within milliseconds; SCHED_IDLE could hold one for seconds on a busy box, and an unprivileged thread can't
+    // leave SCHED_IDLE again to take its locks at normal priority.
     if s.bcrypt_idle {
-        // Hashing only takes CPU nothing else wants: SCHED_IDLE for this thread (no privileges needed).
-        let p = libc::sched_param { sched_priority: 0 };
-        unsafe { libc::sched_setscheduler(0, libc::SCHED_IDLE, &p) };
+        unsafe { libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, 19) };
     }
     let mut jobs: Vec<BcryptJob> = Vec::new();
     loop {
@@ -1369,14 +1456,14 @@ pub fn bcrypt_worker(s: &'static Settings, index: usize) {
     }
 }
 
-/// With idle-priority hashers: a normal-priority thread that hashes only what has waited a second already, so logins
+/// With low-priority hashers: a normal-priority thread that hashes only what has waited BCRYPT_RESCUE_MS (a second) already, so logins
 /// still finish when the box has no idle time at all.
 pub fn bcrypt_rescue(s: &'static Settings) {
     let mut jobs: Vec<BcryptJob> = Vec::new();
     loop {
         std::thread::sleep(Duration::from_millis(100));
         jobs.clear();
-        while BCRYPT.take_if_older(Duration::from_secs(1), s.bcrypt_lanes, &mut jobs) {
+        while BCRYPT.take_if_older(s.bcrypt_rescue, s.bcrypt_lanes, &mut jobs) {
             let batch = std::mem::take(&mut jobs);
             let (ten, odd): (Vec<BcryptJob>, Vec<BcryptJob>) = batch.into_iter().partition(|j| match j {
                 BcryptJob::Verify { hash, .. } => crate::bcrypt::parse(hash).map(|p| p.cost) == Some(10),

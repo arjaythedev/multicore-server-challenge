@@ -73,8 +73,10 @@ unfavorites, follows, unfollows and new comments in a group are put next to thei
 
 **bcrypt** runs on its own threads, several hashes in lockstep: a single bcrypt is one long chain of dependent S-box
 loads, and interleaving independent hashes lets the core overlap them. How many lanes pay off depends on the CPU
-(its L1 and registers hold a few 4 KB S-box sets, not many), so at startup the server times widths 1 to 6 on throwaway
-keys at a low cost and keeps the fastest per hash. One worker waits up to 400 ms for its lanes to fill; a second
+(its L1 and registers hold a few 4 KB S-box sets, not many). The lanes' states sit next to each other in memory, and
+on x86-64 with BMI1/BMI2 the cost loop can run a generated assembly expand0 (`build.rs`) that reaches every lane
+from one base register, in two styles of S-box index extraction. At startup the server times each kernel (that one in
+both styles, and the plain Rust one) at widths 1 to 6 on throwaway keys at a low cost and keeps the fastest per hash. One worker waits up to 400 ms for its lanes to fill; a second
 worker only takes full sets, so a steady trickle of logins isn't split into half-empty runs. Every hash still does all
 2^10 rounds; logins always verify against the stored hash.
 
@@ -121,7 +123,8 @@ Defaults suit the 8-vCPU box; all are optional environment variables.
 | `READ_MIN` | 4096 | a batch is taken early once this many (or the recent average, if larger) are waiting |
 | `READ_BATCH`, `WRITE_BATCH` | 4096, 256 | batch size caps |
 | `WRITE_WINDOW_US` | 3000 | how long a write waits for others to share its group |
-| `BCRYPT_IDLE` | 0 | 1: hashing threads under `SCHED_IDLE`, plus a normal-priority thread for logins waiting 1 s |
+| `BCRYPT_IDLE` | 0 | 1: hashing threads at nice 19, plus a normal-priority thread for logins waiting `BCRYPT_RESCUE_MS` |
+| `BCRYPT_RESCUE_MS` | 1000 | with `BCRYPT_IDLE`, how long a login waits before the normal-priority thread hashes it (0: no such thread) |
 | `ACK_DELAY` | 1 | leave TCP quick-ack mode after each response |
 | `PRIVATE_FDS` | 1 | a descriptor table per IO thread |
 | `SCHED_BATCH` | 1 | run under the `SCHED_BATCH` scheduling policy (0: the default policy) |
@@ -144,6 +147,8 @@ entries (#61, #100); long gathers from #117; one read of the tags table per batc
 from `zig-fourneau-y2kbugger`; `max_parallel_workers_per_gather = 0` from several entries (#103, #105); backing off
 `accept` on `EMFILE`, `SCHED_BATCH` and merging runs of writes from `asm-epoll-nickita-khylkouski` (#82, #130);
 merged favorite/follow statements also in #105; skipping queued work for clients that hung up and a descriptor table per IO thread from #132. Leaving quick-ack mode after each response and
-group commit without `BEGIN`/`COMMIT` from `zig-iouring-nick-potts` (#117).
+group commit without `BEGIN`/`COMMIT` from `zig-iouring-nick-potts` (#117), whose `asm_gen.zig` the generated bcrypt
+kernel is a port of. Answering article creation from its own insert and carrying a favorite's known state into its read-back from
+`rust-epoll-theCatWisel` (#154).
 
 Built with Claude (Anthropic).

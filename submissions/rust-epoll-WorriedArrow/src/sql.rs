@@ -58,11 +58,10 @@ pub fn read_statements() -> Vec<Stmt> {
         ),
         s(
             "cmts",
-            "SELECT r.k, a.id, c.id, c.body, c.created_at, c.updated_at, c.author_id, u.username, u.bio, u.image \
+            "SELECT r.k, c.id, c.body, c.created_at, c.updated_at, c.author_id \
              FROM unnest($1::text[]) WITH ORDINALITY r(slug, k) JOIN articles a ON a.slug = r.slug \
              LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id FROM comments c \
-               WHERE c.article_id = a.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true \
-             LEFT JOIN users u ON u.id = c.author_id",
+               WHERE c.article_id = a.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true",
             &[TEXT_ARRAY],
         ),
         // Lists: one statement per filter returns the capped counts (k <= 0: -k is the count key, the count in
@@ -72,7 +71,8 @@ pub fn read_statements() -> Vec<Stmt> {
         s(
             "global",
             format!(
-                "SELECT 0::int8, (SELECT count(*) FROM (SELECT 1 FROM articles ORDER BY id LIMIT 1000) s), {PAD} \
+                "SELECT 0::int8, CASE WHEN EXISTS (SELECT 1 FROM articles ORDER BY id OFFSET 999) THEN 1000::int8 \
+                   ELSE (SELECT count(*) FROM articles) END, {PAD} \
                  UNION ALL \
                  SELECT r.k, {COLS} FROM unnest($1::int8[], $2::int8[]) WITH ORDINALITY r(lim, off, k) \
                  CROSS JOIN LATERAL (SELECT * FROM articles a ORDER BY a.id DESC LIMIT r.lim OFFSET r.off) a"
@@ -89,7 +89,8 @@ pub fn read_statements() -> Vec<Stmt> {
                  CROSS JOIN LATERAL (SELECT at.article_id FROM article_tags at WHERE at.tag_id = t.id \
                    ORDER BY at.article_id DESC LIMIT r.lim OFFSET r.off) p \
                  JOIN articles a ON a.id = p.article_id",
-                capped("SELECT 1 FROM article_tags at WHERE at.tag_id = t.id")
+                "CASE WHEN EXISTS (SELECT 1 FROM article_tags at WHERE at.tag_id = t.id OFFSET 999) THEN 1000::int8 \
+                 ELSE (SELECT count(*) FROM article_tags at WHERE at.tag_id = t.id) END"
             ),
             &[TEXT_ARRAY, TEXT_ARRAY, INT8_ARRAY, INT8_ARRAY],
         ),
@@ -121,7 +122,8 @@ pub fn read_statements() -> Vec<Stmt> {
         ),
         // Personal feeds: capped counts per distinct viewer ($1, k <= 0), pages per (viewer, limit, offset) (k > 0).
         // Followees shared by several viewers of the batch ("hubs", popular authors) are looked at once for the
-        // whole batch: whether they have 1,000+ articles (then every viewer following one counts 1,000 without
+        // whole batch: whether the most shared ones have 1,000+ articles (one big followee settles a viewer's count,
+        // so checking every hub mostly repeats work) (then every viewer following one counts 1,000 without
         // scanning), and the id of their depth-th newest article (a floor: a page of depth d is made of articles at
         // least that new, so every other followee's scan stops there). Other followees are read per viewer, at most
         // limit + offset newest ids each, from articles_author_idx. Page rows are ids and authors only (index-only);
@@ -138,8 +140,11 @@ pub fn read_statements() -> Vec<Stmt> {
                  hubs AS MATERIALIZED ( \
                    SELECT h.fid, \
                      (SELECT a.id FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC LIMIT 1 OFFSET h.depth - 1) AS floor_id, \
-                     EXISTS (SELECT 1 FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC LIMIT 1 OFFSET 999) AS big \
-                   FROM (SELECT f.fid, max(u.depth) AS depth FROM u, unnest(u.fids) f(fid) \
+                     CASE WHEN h.rn <= (SELECT GREATEST(6, count(*) / 8) FROM u) \
+                       THEN EXISTS (SELECT 1 FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC LIMIT 1 OFFSET 999) \
+                       ELSE false END AS big \
+                   FROM (SELECT f.fid, max(u.depth) AS depth, row_number() OVER (ORDER BY count(*) DESC, f.fid) AS rn \
+                     FROM u, unnest(u.fids) f(fid) \
                      GROUP BY f.fid HAVING count(*) >= 2 ORDER BY count(*) DESC, f.fid LIMIT 32) h), \
                  big AS MATERIALIZED (SELECT ARRAY(SELECT fid FROM hubs WHERE big) AS fids) \
                  SELECT -u.k, CASE WHEN u.fids && (SELECT fids FROM big) THEN 1000::int8 \
@@ -164,6 +169,9 @@ pub fn read_statements() -> Vec<Stmt> {
             format!("SELECT 0::int8, {COLS} FROM articles a WHERE a.id = ANY($1::int8[])"),
             &[INT8_ARRAY],
         ),
+        // Comment authors' profile columns, for the sorted distinct ids of every comment in the batch: one ordered
+        // walk of the primary key instead of a probe per comment row.
+        s("auser", "SELECT u.id, u.username, u.bio, u.image FROM users u WHERE u.id = ANY($1::int8[])", &[INT8_ARRAY]),
         // One row per distinct article: its tag ids, its favorite count, its author's profile columns.
         s(
             "artx",
@@ -181,8 +189,8 @@ pub fn read_statements() -> Vec<Stmt> {
              SELECT 0::int8, p.v, f.article_id FROM p CROSS JOIN LATERAL \
                (SELECT f.article_id FROM favorites f WHERE f.user_id = p.v AND f.article_id = ANY(p.aa)) f \
              UNION ALL \
-             SELECT 1::int8, q.v, fo.followee_id FROM q CROSS JOIN LATERAL \
-               (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = q.v AND fo.followee_id = ANY(q.uu)) fo",
+             SELECT 1::int8, q.v, x.fid FROM q CROSS JOIN LATERAL \
+               (SELECT fo.followee_id AS fid FROM follows fo WHERE fo.follower_id = q.v) x WHERE x.fid = ANY(q.uu)",
             &[INT8_ARRAY, INT8_ARRAY, INT8_ARRAY, INT8_ARRAY],
         ),
     ]
@@ -283,14 +291,20 @@ pub fn write_statements() -> Vec<Stmt> {
              FROM c JOIN ids ON ids.id = c.id JOIN users u ON u.id = c.author_id",
             &[INT8_ARRAY, TEXT_ARRAY, TEXT_ARRAY],
         ),
+        // A new article and its whole response row (its tag list is the request's, distinct and in the database's
+        // name order, as article_tags will hold it): no read-back after the commit.
         s(
             "newart",
             format!(
-                "INSERT INTO articles (id, slug, author_id, title, description, body) \
-                 SELECT n.id, {SLUGIFY} || '-' || n.id, $1, $2, $3, $4 \
-                 FROM (SELECT nextval('articles_id_seq'::regclass) AS id) n RETURNING id"
+                "WITH n AS (INSERT INTO articles (id, slug, author_id, title, description, body) \
+                   SELECT n.id, {SLUGIFY} || '-' || n.id, $1, $2, $3, $4 \
+                   FROM (SELECT nextval('articles_id_seq'::regclass) AS id) n RETURNING id, slug, created_at, updated_at) \
+                 SELECT n.id, n.slug, n.created_at, n.updated_at, u.username, u.bio, u.image, \
+                   ARRAY(SELECT DISTINCT x FROM unnest($5::text[]) x ORDER BY x), \
+                   EXISTS (SELECT 1 FROM follows f WHERE f.follower_id = $1 AND f.followee_id = $1) \
+                 FROM n JOIN users u ON u.id = $1"
             ),
-            &[crate::pg::INT8, crate::pg::TEXT, crate::pg::TEXT, crate::pg::TEXT],
+            &[crate::pg::INT8, crate::pg::TEXT, crate::pg::TEXT, crate::pg::TEXT, TEXT_ARRAY],
         ),
         s(
             "newtags",
@@ -341,4 +355,16 @@ pub fn write_statements() -> Vec<Stmt> {
             &[crate::pg::INT8, crate::pg::TEXT, crate::pg::INT8],
         ),
     ]
+}
+
+#[cfg(test)]
+mod dump {
+    /// Prints every statement, for EXPLAIN by hand: cargo test --release dump_sql -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn dump_sql() {
+        for s in super::read_statements().into_iter().chain(super::write_statements()) {
+            println!("--@{}\n{};", s.name, s.sql);
+        }
+    }
 }
