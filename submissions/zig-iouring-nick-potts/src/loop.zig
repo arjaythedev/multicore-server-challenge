@@ -20,6 +20,20 @@
 //! delayed ACK as a request arrives, before it is read, and leaves delayed mode whenever its delayed-ACK timer fires
 //! (a response slower than about 40 ms), so this is done after every response, which carries any pending ACK and so
 //! stops that timer.
+//!
+//! Ring knobs, each off by default (environment, read in main.zig):
+//! - ZIG_BUF_RUNS=1: consecutive returned buffer ids go back in one PROVIDE_BUFFERS each, not one per buffer.
+//! - ZIG_CQ_BUDGET=N: at most N completions per iteration before the rest of it (answers, pump, publish, buffer
+//!   returns); the next wait then submits and returns at once, as completions are still ready.
+//! - ZIG_FIXED_FILES=1: the Postgres sockets go through the ring's fixed-file table; 2: client sockets too, each
+//!   client keeping its own slot while slots last (the rest stay plain).
+//! - ZIG_PG_POLL_FIRST=1: a Postgres receive waits for data before trying (IORING_RECVSEND_POLL_FIRST) when the last
+//!   one left the socket empty (no IORING_CQE_F_SOCK_NONEMPTY); 2: always.
+//! - ZIG_ACK_SKIP_MS=N: no TCP_QUICKACK uring_cmd for a response sent within N ms of its socket's last data. The
+//!   kernel already counts such a reply toward pingpong mode (a reply within ato of the last received segment, and
+//!   6.8 keeps ato at 20 ms or more), so the setsockopt would change nothing. The socket's data is dated by the start
+//!   of the iteration before the one that read it, so the gap is never undercounted.
+//! - ZIG_URING_STATS=1: every 10 s each process logs what these act on.
 const std = @import("std");
 const linux = std.os.linux;
 const IoUring = linux.IoUring;
@@ -63,6 +77,10 @@ const Client = struct {
     /// The next response waiting for the send budget (ZIG_SEND_PACE), and when this one started waiting.
     paced_next: ?*Client = null,
     paced_ns: u64 = 0,
+    /// Its fixed-file slot (ZIG_FIXED_FILES=2), kept across reuse, or `no_slot`.
+    slot: u32 = no_slot,
+    /// When its last data arrived at the earliest (ZIG_ACK_SKIP_MS).
+    rx_ns: u64 = 0,
 };
 
 /// A lead's response, sent to the lead and to each of its followers.
@@ -75,6 +93,24 @@ const Shared = struct {
     waiting: u32,
     next_free: ?*Shared = null,
 };
+
+pub var buf_runs = false;
+pub var cq_budget: u32 = 0;
+pub var fixed_files: u2 = 0;
+pub var pg_poll_first: u2 = 0;
+pub var ack_skip_ns: u64 = 0;
+pub var stats_on = false;
+
+const no_slot = std.math.maxInt(u32);
+/// Client slots per worker; the table also holds the Postgres connections, first.
+const client_slots = 1 << 17;
+var slots: u32 = 0;
+var next_slot: u32 = 0;
+const no_fd: i32 = -1;
+/// A fixed-file update's completion, which only a failure posts.
+const files_update_data: u64 = 16;
+/// The previous iteration's start: nothing read in this iteration arrived before it.
+var prev_ns: u64 = 0;
 
 var ring: IoUring = undefined;
 var listen_fd: i32 = -1;
@@ -170,6 +206,7 @@ pub fn run(comptime F: Flags, listener: ?i32) noreturn {
         .cq_entries = 65536,
     });
     ring = IoUring.init_params(4096, &params) catch |e| sys.fatal("io_uring setup: {s}", .{@errorName(e)});
+    if (fixed_files > 0) registerFiles(listener != null);
 
     if (listener) |fd| {
         listen_fd = fd;
@@ -180,23 +217,30 @@ pub fn run(comptime F: Flags, listener: ?i32) noreturn {
         armAccept();
         armBcrypt();
     }
-    for (db.conns) |*c| armPgRecv(c);
+    for (db.conns) |*c| armPgRecv(c, true);
     armWake();
 
     var cqes: [512]linux.io_uring_cqe = undefined;
     // The drain process's first wait comes after its first idle check too, or no worker would wake it.
     var due: ?u64 = drain_process.send(null);
+    db.now_ns = sys.monoNs();
     while (true) {
         wait(due);
         now = sys.nowSec();
+        prev_ns = db.now_ns;
         db.now_ns = sys.monoNs();
         if (F.shed and listener != null) shed.ctl.tick(db.now_ns);
-        while (true) {
-            const n = ring.copy_cqes(&cqes, 0) catch |e| sys.fatal("io_uring cqes: {s}", .{@errorName(e)});
+        var handled: u32 = 0;
+        while (cq_budget == 0 or handled < cq_budget) {
+            const room = if (cq_budget == 0) cqes.len else @min(cqes.len, cq_budget - handled);
+            const n = ring.copy_cqes(cqes[0..room], 0) catch |e| sys.fatal("io_uring cqes: {s}", .{@errorName(e)});
             if (n == 0) break;
+            handled += n;
             for (cqes[0..n]) |*c| complete(F, c);
         }
+        if (stats_on) stats.completions(handled, cq_budget > 0 and handled == cq_budget);
         drain_process.receive();
+        if (stats_on) stats.answers();
         due = db.pump();
         if (listener != null) if (bcrypt.pump(db.now_ns)) |t| {
             due = if (due) |d| @min(d, t) else t;
@@ -210,16 +254,67 @@ pub fn run(comptime F: Flags, listener: ?i32) noreturn {
         }
         for (db.conns) |*c| flushPg(c);
         due = drain_process.send(due);
-        for (returned.items) |bid| {
-            const s = sqe();
-            s.prep_provide_buffers(bufs[@as(usize, bid) * buf_size ..].ptr, buf_size, 1, buf_group, bid);
-            s.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
-            s.user_data = 0;
-        }
-        returned.clearRetainingCapacity();
+        returnBuffers();
         for (rearm.items) |c| armRecv(c);
         rearm.clearRetainingCapacity();
+        if (stats_on) stats.endIteration(listener != null, db.now_ns);
     }
+}
+
+/// Gives this iteration's buffers back, one PROVIDE_BUFFERS each, or one per run of consecutive ids with
+/// ZIG_BUF_RUNS. A run is added in id order, so the kernel's list holds them in the same order either way.
+fn returnBuffers() void {
+    var i: usize = 0;
+    while (i < returned.items.len) {
+        const bid = returned.items[i];
+        var n: u16 = 1;
+        if (buf_runs) while (i + n < returned.items.len and returned.items[i + n] == bid + n) : (n += 1) {};
+        const s = sqe();
+        s.prep_provide_buffers(bufs[@as(usize, bid) * buf_size ..].ptr, buf_size, n, buf_group, bid);
+        s.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
+        s.user_data = 0;
+        if (stats_on) stats.return_sqes += 1;
+        i += n;
+    }
+    if (stats_on) stats.returns += returned.items.len;
+    returned.clearRetainingCapacity();
+}
+
+/// The fixed-file table (ZIG_FIXED_FILES): the Postgres connections at their index, then client slots in a worker
+/// with 2. If the kernel refuses it, every socket stays plain.
+fn registerFiles(clients: bool) void {
+    var lim: linux.rlimit = undefined;
+    const most: u32 = if (linux.errno(linux.getrlimit(.NOFILE, &lim)) == .SUCCESS) @intCast(@min(lim.cur, 1 << 20)) else 1024;
+    const conns: u32 = @intCast(db.conns.len);
+    const want = conns + if (clients and fixed_files == 2) @min(client_slots, most -| conns) else 0;
+    ring.register_files_sparse(want) catch |e| {
+        sys.log("fixed files ({d}): {s}; sockets stay plain", .{ want, @errorName(e) });
+        fixed_files = 0;
+        return;
+    };
+    for (db.conns) |c| ring.register_files_update(c.index, &.{c.fd}) catch |e|
+        sys.fatal("fixed file for postgres connection {d}: {s}", .{ c.index, @errorName(e) });
+    slots = want;
+    next_slot = conns;
+}
+
+/// Points `s` at the socket `fd`, through its fixed-file slot if it has one.
+fn setFile(s: *linux.io_uring_sqe, fd: i32, slot: u32) void {
+    if (slot == no_slot) {
+        s.fd = fd;
+    } else {
+        s.fd = @intCast(slot);
+        s.flags |= linux.IOSQE_FIXED_FILE;
+    }
+}
+
+/// Puts `fd` (or `no_fd`, which empties it) in fixed-file slot `slot`, in submission order: the SQEs after it see
+/// the new file. `fd` is read when the ring takes the SQE.
+fn updateSlot(slot: u32, fd: *const i32) void {
+    const s = sqe();
+    s.prep_files_update(fd[0..1], slot);
+    s.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
+    s.user_data = files_update_data;
 }
 
 /// Waits for the first completion, or until `due` (monotonic ns) if that comes first.
@@ -243,6 +338,7 @@ fn complete(comptime F: Flags, cqe: *const linux.io_uring_cqe) void {
     const tag_bits: u3 = @truncate(cqe.user_data);
     if (tag_bits == 0) {
         if (cqe.user_data == ack_delay_data) return ackDelayFailed(cqe);
+        if (cqe.user_data == files_update_data) return sys.log("fixed-file update failed: {s}", .{@tagName(cqe.err())});
         if (cqe.res < 0) sys.log("provide buffers failed: {s}", .{@tagName(cqe.err())});
         return;
     }
@@ -280,6 +376,10 @@ fn onAccept(cqe: *const linux.io_uring_cqe) void {
     const c = free_clients orelse blk: {
         const n = gpa.create(Client) catch sys.fatal("oom", .{});
         n.* = .{ .fd = -1 };
+        if (fixed_files == 2 and next_slot < slots) {
+            n.slot = next_slot;
+            next_slot += 1;
+        }
         break :blk n;
     };
     free_clients = c.next_free;
@@ -294,12 +394,14 @@ fn onAccept(cqe: *const linux.io_uring_cqe) void {
     var mss: c_int = 0;
     var len: linux.socklen_t = @sizeOf(c_int);
     c.req.mss = if (linux.errno(linux.getsockopt(fd, linux.IPPROTO.TCP, linux.TCP.MAXSEG, std.mem.asBytes(&mss), &len)) == .SUCCESS and mss >= 536 and mss <= 9000) @intCast(mss) else 1448;
+    if (c.slot != no_slot) updateSlot(c.slot, &c.fd);
     armRecv(c);
 }
 
 fn armRecv(c: *Client) void {
     const s = sqe();
     s.prep_rw(.RECV, c.fd, 0, 0, 0);
+    setFile(s, c.fd, c.slot);
     s.flags |= linux.IOSQE_BUFFER_SELECT;
     s.buf_index = buf_group;
     s.ioprio |= linux.IORING_RECV_MULTISHOT;
@@ -311,6 +413,7 @@ fn onRecv(comptime F: Flags, c: *Client, cqe: *const linux.io_uring_cqe) void {
     const more = cqe.flags & linux.IORING_CQE_F_MORE != 0;
     if (!more) c.recv_armed = false;
     if (cqe.res > 0) {
+        c.rx_ns = prev_ns;
         const bid = cqe.buffer_id() catch unreachable;
         returned.append(gpa, bid) catch sys.fatal("oom", .{});
         const data = bufs[@as(usize, bid) * buf_size ..][0..@intCast(cqe.res)];
@@ -369,9 +472,10 @@ fn startOne(comptime F: Flags, c: *Client, data: []const u8) usize {
     }
 }
 
-fn delayAck(fd: i32) void {
+fn delayAck(fd: i32, slot: u32) void {
     const s = sqe();
     s.prep_cmd_sock(.SETSOCKOPT, fd, linux.IPPROTO.TCP, linux.TCP.QUICKACK, @intFromPtr(&quickack_off), @sizeOf(c_int));
+    setFile(s, fd, slot);
     s.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
     s.user_data = ack_delay_data;
 }
@@ -443,6 +547,7 @@ fn sendBytes(c: *Client, bytes: []const u8) void {
     c.sending = bytes;
     const s = sqe();
     s.prep_send(c.fd, bytes, linux.MSG.NOSIGNAL);
+    setFile(s, c.fd, c.slot);
     s.user_data = userData(c, .send);
 }
 
@@ -458,7 +563,13 @@ fn onSend(comptime F: Flags, c: *Client, cqe: *const linux.io_uring_cqe) void {
     c.busy = false;
     if (!c.req.keep_alive) c.closing = true;
     if (!c.closing) {
-        if (F.ackdelay and ack_delay) delayAck(c.fd);
+        if (F.ackdelay and ack_delay) {
+            // db.now_ns is no earlier than the send, c.rx_ns no later than the socket's last data.
+            if (db.now_ns - c.rx_ns >= ack_skip_ns) {
+                delayAck(c.fd, c.slot);
+                if (stats_on) stats.acks += 1;
+            } else if (stats_on) stats.acks_skipped += 1;
+        }
         return drain(F, c);
     }
     if (c.recv_armed) _ = linux.shutdown(c.fd, linux.SHUT.RDWR);
@@ -473,6 +584,8 @@ fn maybeFree(c: *Client) void {
         _ = linux.shutdown(c.fd, linux.SHUT.RDWR);
         return;
     }
+    // The slot holds the socket open too; emptying it before the slot's next client fills it keeps them in order.
+    if (c.slot != no_slot) updateSlot(c.slot, &no_fd);
     sys.closeFd(c.fd);
     c.req.out.release();
     if (c.pending.capacity > 64 * 1024) c.pending.clearAndFree(gpa) else c.pending.clearRetainingCapacity();
@@ -482,10 +595,16 @@ fn maybeFree(c: *Client) void {
 
 // ---------------------------------------------------------------- postgres
 
-fn armPgRecv(c: *db.Conn) void {
+/// `empty`: the last receive left the socket empty, as far as the kernel said.
+fn armPgRecv(c: *db.Conn, empty: bool) void {
     const space = db.recvSpace(c);
     const s = sqe();
     s.prep_recv(c.fd, space, 0);
+    setFile(s, c.fd, pgSlot(c));
+    if (pg_poll_first == 2 or (pg_poll_first == 1 and empty)) {
+        s.ioprio |= linux.IORING_RECVSEND_POLL_FIRST;
+        if (stats_on) stats.pg_poll_first += 1;
+    }
     s.user_data = userData(c, .pg_recv);
 }
 
@@ -493,7 +612,16 @@ fn onPgRecv(c: *db.Conn, cqe: *const linux.io_uring_cqe) void {
     if (cqe.res <= 0) sys.fatal("postgres connection {d} lost ({d})", .{ c.index, cqe.res });
     c.rend += @intCast(cqe.res);
     db.onRecv(c);
-    armPgRecv(c);
+    const nonempty = cqe.flags & linux.IORING_CQE_F_SOCK_NONEMPTY != 0;
+    if (stats_on) {
+        stats.pg_recvs += 1;
+        if (nonempty) stats.pg_nonempty += 1;
+    }
+    armPgRecv(c, !nonempty);
+}
+
+fn pgSlot(c: *const db.Conn) u32 {
+    return if (fixed_files > 0) c.index else no_slot;
 }
 
 fn flushPg(c: *db.Conn) void {
@@ -507,6 +635,7 @@ fn flushPg(c: *db.Conn) void {
 fn pgSend(c: *db.Conn) void {
     const s = sqe();
     s.prep_send(c.fd, c.sending.list.items[c.send_off..], linux.MSG.NOSIGNAL);
+    setFile(s, c.fd, pgSlot(c));
     s.user_data = userData(c, .pg_send);
 }
 
@@ -544,6 +673,82 @@ fn armWake() void {
     s.prep_read(fd, std.mem.asBytes(&wake_buf), 0);
     s.user_data = userData(null, .wake);
 }
+
+// ---------------------------------------------------------------- stats
+
+/// ZIG_URING_STATS: counts since the last line, logged every `stats_ns`.
+var stats: Stats = .{};
+const stats_ns = 10 * std.time.ns_per_s;
+
+const Stats = struct {
+    iterations: u64 = 0,
+    cqes: u64 = 0,
+    /// Iterations that stopped at ZIG_CQ_BUDGET with completions left.
+    budget_hits: u64 = 0,
+    returns: u64 = 0,
+    return_sqes: u64 = 0,
+    pg_recvs: u64 = 0,
+    pg_nonempty: u64 = 0,
+    pg_poll_first: u64 = 0,
+    acks: u64 = 0,
+    acks_skipped: u64 = 0,
+    /// Each iteration's completion phase, then its answer phase (the drain rings), in µs.
+    cqe_us: Hist = .{},
+    answer_us: Hist = .{},
+    mark_ns: u64 = 0,
+    log_at: u64 = 0,
+
+    /// Ends the completion phase, which began with the iteration.
+    fn completions(s: *Stats, cqes: u32, hit: bool) void {
+        s.mark_ns = sys.monoNs();
+        s.cqe_us.add((s.mark_ns - db.now_ns) / std.time.ns_per_us);
+        s.cqes += cqes;
+        if (hit) s.budget_hits += 1;
+    }
+
+    /// Ends the answer phase, which began where the completion phase ended.
+    fn answers(s: *Stats) void {
+        s.answer_us.add((sys.monoNs() - s.mark_ns) / std.time.ns_per_us);
+    }
+
+    fn endIteration(s: *Stats, worker: bool, t: u64) void {
+        s.iterations += 1;
+        if (s.log_at == 0) s.log_at = t + stats_ns;
+        if (t < s.log_at) return;
+        s.log_at = t + stats_ns;
+        sys.log("uring {s}: {d} iterations, {d} completions ({d} budget stops); buffers {d} returned in {d} SQEs; " ++
+            "postgres receives {d} ({d} left data, {d} poll-first); quickack {d} sent, {d} skipped; " ++
+            "completion phase us p50/p99/max {d}/{d}/{d}, answer phase {d}/{d}/{d}", .{
+            if (worker) "worker" else "drain", s.iterations, s.cqes,          s.budget_hits, s.returns, s.return_sqes,
+            s.pg_recvs,                         s.pg_nonempty, s.pg_poll_first, s.acks,        s.acks_skipped,
+            s.cqe_us.pct(50),                   s.cqe_us.pct(99), s.cqe_us.max, s.answer_us.pct(50), s.answer_us.pct(99),
+            s.answer_us.max,
+        });
+        s.* = .{ .log_at = s.log_at };
+    }
+};
+
+/// Durations in µs, in power-of-two buckets; a percentile reads as its bucket's upper bound.
+const Hist = struct {
+    n: [32]u64 = @splat(0),
+    max: u64 = 0,
+
+    fn add(h: *Hist, us: u64) void {
+        h.n[@min(31, std.math.log2_int_ceil(u64, us + 1))] += 1;
+        h.max = @max(h.max, us);
+    }
+
+    fn pct(h: *const Hist, p: u64) u64 {
+        var total: u64 = 0;
+        for (h.n) |k| total += k;
+        var seen: u64 = 0;
+        for (h.n, 0..) |k, i| {
+            seen += k;
+            if (seen * 100 >= total * p and total > 0) return (@as(u64, 1) << @intCast(i)) - 1;
+        }
+        return 0;
+    }
+};
 
 // ---------------------------------------------------------------- tests
 
@@ -673,10 +878,8 @@ test "the pacer lets a backlog out at its rate however late the loop comes back,
     try std.testing.expectEqual(1500, sent);
 }
 
-test "a served socket leaves quick-ACK mode through the ring, with no completion" {
-    const testing = std.testing;
-    ring = try IoUring.init(8, 0);
-    defer ring.deinit();
+/// A loopback TCP connection: the client's end, then the accepted end.
+fn testPair() ![2]i32 {
     const stream = linux.SOCK.STREAM | linux.SOCK.CLOEXEC;
     const lfd: i32 = @intCast(try sys.check(linux.socket(linux.AF.INET, stream, 0)));
     defer sys.closeFd(lfd);
@@ -686,21 +889,29 @@ test "a served socket leaves quick-ACK mode through the ring, with no completion
     _ = try sys.check(linux.listen(lfd, 1));
     _ = try sys.check(linux.getsockname(lfd, @ptrCast(&addr), &len));
     const cfd: i32 = @intCast(try sys.check(linux.socket(linux.AF.INET, stream, 0)));
-    defer sys.closeFd(cfd);
+    errdefer sys.closeFd(cfd);
     _ = try sys.check(linux.connect(cfd, @ptrCast(&addr), len));
-    const sfd: i32 = @intCast(try sys.check(linux.accept(lfd, null, null)));
-    defer sys.closeFd(sfd);
+    return .{ cfd, @intCast(try sys.check(linux.accept(lfd, null, null))) };
+}
 
-    const quickAck = struct {
-        fn get(fd: i32) !c_int {
-            var v: c_int = -1;
-            var n: linux.socklen_t = @sizeOf(c_int);
-            _ = try sys.check(linux.getsockopt(fd, linux.IPPROTO.TCP, linux.TCP.QUICKACK, std.mem.asBytes(&v), &n));
-            return v;
-        }
-    }.get;
+/// TCP_QUICKACK as getsockopt reads it: 0 while the socket is in pingpong (delayed-ACK) mode.
+fn quickAckForTest(fd: i32) !c_int {
+    var v: c_int = -1;
+    var n: linux.socklen_t = @sizeOf(c_int);
+    _ = try sys.check(linux.getsockopt(fd, linux.IPPROTO.TCP, linux.TCP.QUICKACK, std.mem.asBytes(&v), &n));
+    return v;
+}
+
+test "a served socket leaves quick-ACK mode through the ring, with no completion" {
+    const testing = std.testing;
+    ring = try IoUring.init(8, 0);
+    defer ring.deinit();
+    const cfd, const sfd = try testPair();
+    defer sys.closeFd(cfd);
+    defer sys.closeFd(sfd);
+    const quickAck = quickAckForTest;
     try testing.expectEqual(1, try quickAck(sfd));
-    delayAck(sfd);
+    delayAck(sfd, no_slot);
     try testing.expectEqual(1, try ring.submit());
     try testing.expectEqual(0, try quickAck(sfd));
     try testing.expectEqual(0, ring.cq_ready());
@@ -742,4 +953,147 @@ test "a follower gets its lead's response even after the lead's client has sent 
     try testing.expectEqualStrings(first ++ second, got[0..n]);
     n = try sys.check(linux.read(pairs[1][1], &got, got.len));
     try testing.expectEqualStrings(first, got[0..n]);
+}
+
+test "ZIG_ACK_SKIP_MS: a quick reply already puts the socket in pingpong mode, a reply after the delayed ACK does not" {
+    const testing = std.testing;
+    const cfd, const sfd = try testPair();
+    defer sys.closeFd(cfd);
+    defer sys.closeFd(sfd);
+    var b: [16]u8 = undefined;
+    // Answered at once, as a response under ZIG_ACK_SKIP_MS is: the reply alone enters pingpong mode.
+    _ = try sys.check(linux.write(cfd, "ask", 3));
+    _ = try sys.check(linux.read(sfd, &b, b.len));
+    _ = try sys.check(linux.write(sfd, "answer", 6));
+    try testing.expectEqual(0, try quickAckForTest(sfd));
+    // Answered after the delayed-ACK timer (40 ms here) fired: it left pingpong mode, and the late reply does not
+    // bring it back, so this response still needs the uring_cmd.
+    _ = try sys.check(linux.write(cfd, "ask", 3));
+    _ = try sys.check(linux.read(sfd, &b, b.len));
+    const ts: linux.timespec = .{ .sec = 0, .nsec = 70 * std.time.ns_per_ms };
+    _ = linux.nanosleep(&ts, null);
+    try testing.expectEqual(1, try quickAckForTest(sfd));
+    _ = try sys.check(linux.write(sfd, "answer", 6));
+    try testing.expectEqual(1, try quickAckForTest(sfd));
+}
+
+test "ZIG_BUF_RUNS: buffers given back in runs are handed out again in the same order as one at a time" {
+    const testing = std.testing;
+    const saved = .{ bufs, buf_runs, stats_on };
+    defer bufs, buf_runs, stats_on = saved;
+    stats_on = false;
+    bufs = try std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(4096), buf_size * 8);
+    defer std.heap.page_allocator.free(bufs);
+    var orders: [2][8]u16 = undefined;
+    for ([_]bool{ false, true }, 0..) |runs, k| {
+        buf_runs = runs;
+        ring = try IoUring.init(16, 0);
+        defer ring.deinit();
+        var fds: [2]i32 = undefined;
+        _ = try sys.check(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &fds));
+        defer for (fds) |fd| sys.closeFd(fd);
+        var s = sqe();
+        s.prep_provide_buffers(bufs.ptr, buf_size, 8, buf_group, 0);
+        s.user_data = 0;
+        s = sqe();
+        s.prep_rw(.RECV, fds[0], 0, 0, 0);
+        s.flags |= linux.IOSQE_BUFFER_SELECT;
+        s.buf_index = buf_group;
+        s.ioprio |= linux.IORING_RECV_MULTISHOT;
+        s.user_data = 1;
+        _ = try ring.submit_and_wait(1);
+        _ = try ring.copy_cqe();
+        // Take five, give them back, then take all eight.
+        for (0..13) |i| {
+            _ = try sys.check(linux.write(fds[1], "x", 1));
+            _ = try ring.submit_and_wait(1);
+            const c = try ring.copy_cqe();
+            try testing.expect(c.res == 1 and c.flags & linux.IORING_CQE_F_MORE != 0);
+            const bid = try c.buffer_id();
+            if (i < 5) try returned.append(gpa, bid) else orders[k][i - 5] = bid;
+            if (i == 4) {
+                returnBuffers();
+                try testing.expectEqual(@as(u32, if (runs) 1 else 5), ring.sq_ready());
+            }
+        }
+    }
+    try testing.expectEqualSlices(u16, &.{ 5, 6, 7, 0, 1, 2, 3, 4 }, &orders[0]);
+    try testing.expectEqualSlices(u16, &orders[0], &orders[1]);
+}
+
+test "ZIG_FIXED_FILES: a client's slot is filled before its first send and emptied before its socket closes" {
+    const testing = std.testing;
+    ring = try IoUring.init(16, 0);
+    defer ring.deinit();
+    try ring.register_files_sparse(4);
+    var fds: [2]i32 = undefined;
+    _ = try sys.check(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &fds));
+    defer sys.closeFd(fds[1]);
+    var c: Client = .{ .fd = fds[0], .slot = 2 };
+    // One submission: the update, then a send naming only the slot.
+    updateSlot(c.slot, &c.fd);
+    sendBytes(&c, "hello");
+    try testing.expectEqual(2, try ring.submit_and_wait(1));
+    const done = try ring.copy_cqe();
+    try testing.expectEqual(userData(&c, .send), done.user_data);
+    try testing.expectEqual(5, done.res);
+    var b: [8]u8 = undefined;
+    try testing.expectEqual(5, try sys.check(linux.read(fds[1], &b, b.len)));
+    // Emptied and closed: the peer sees the end of the stream, so the slot no longer holds the socket open.
+    updateSlot(c.slot, &no_fd);
+    sys.closeFd(c.fd);
+    _ = try ring.submit();
+    try testing.expectEqual(0, ring.cq_ready());
+    try testing.expectEqual(0, try sys.check(linux.recvfrom(fds[1], &b, b.len, linux.MSG.DONTWAIT, null, null)));
+}
+
+test "ZIG_PG_POLL_FIRST: a receive that waits for data first still gets it, and SOCK_NONEMPTY means more is queued" {
+    const testing = std.testing;
+    ring = try IoUring.init(16, 0);
+    defer ring.deinit();
+    const cfd, const sfd = try testPair();
+    defer sys.closeFd(cfd);
+    defer sys.closeFd(sfd);
+    const saved = pg_poll_first;
+    defer pg_poll_first = saved;
+    pg_poll_first = 1;
+    const rbuf = try std.heap.page_allocator.alloc(u8, 128 * 1024);
+    var c: db.Conn = .{ .fd = sfd, .index = 0, .write = false, .rbuf = rbuf };
+    defer std.heap.page_allocator.free(c.rbuf);
+    armPgRecv(&c, true);
+    try testing.expectEqual(1, try ring.submit());
+    try testing.expectEqual(0, ring.cq_ready());
+    _ = try sys.check(linux.write(cfd, "0123456789", 10));
+    _ = try ring.submit_and_wait(1);
+    var got = try ring.copy_cqe();
+    try testing.expectEqual(10, got.res);
+    try testing.expectEqualStrings("0123456789", c.rbuf[0..10]);
+    // A receive that leaves bytes behind says so; the one that takes the rest does not.
+    _ = try sys.check(linux.write(cfd, "0123456789", 10));
+    var small: [4]u8 = undefined;
+    for ([_]i32{ 4, 6 }, [_]bool{ true, false }) |want, more| {
+        const s = sqe();
+        s.prep_recv(sfd, if (more) &small else c.rbuf, 0);
+        _ = try ring.submit_and_wait(1);
+        got = try ring.copy_cqe();
+        try testing.expectEqual(want, got.res);
+        try testing.expectEqual(more, got.flags & linux.IORING_CQE_F_SOCK_NONEMPTY != 0);
+    }
+}
+
+test "ZIG_CQ_BUDGET: the wait after a budget stop returns at once while completions are left" {
+    const testing = std.testing;
+    var params = std.mem.zeroInit(linux.io_uring_params, .{
+        .flags = linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_DEFER_TASKRUN | linux.IORING_SETUP_COOP_TASKRUN,
+    });
+    ring = try IoUring.init_params(16, &params);
+    defer ring.deinit();
+    for (0..3) |_| sqe().prep_nop();
+    _ = try ring.submit_and_wait(3);
+    var cqes: [1]linux.io_uring_cqe = undefined;
+    try testing.expectEqual(1, try ring.copy_cqes(&cqes, 0));
+    const t = sys.monoNs();
+    wait(t + std.time.ns_per_s);
+    try testing.expect(sys.monoNs() - t < 100 * std.time.ns_per_ms);
+    try testing.expectEqual(2, ring.cq_ready());
 }

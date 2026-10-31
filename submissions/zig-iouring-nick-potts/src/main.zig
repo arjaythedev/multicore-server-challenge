@@ -122,6 +122,17 @@ pub fn main(init: std.process.Init.Minimal) void {
     mega.sorted_ids = if (std.mem.eql(u8, sorted, "1")) true else if (sorted.len == 0 or std.mem.eql(u8, sorted, "0")) false else sys.fatal("ZIG_MEGA_SORTED_IDS: '{s}' is not 0 or 1", .{sorted});
     if (mega.sorted_ids) sys.log("ZIG_MEGA_SORTED_IDS=1: MEGA builds its article id set in id order", .{});
 
+    loop.buf_runs = envUint(env, "ZIG_BUF_RUNS", 1) == 1;
+    loop.cq_budget = @intCast(envUint(env, "ZIG_CQ_BUDGET", 1 << 20));
+    loop.fixed_files = @intCast(envUint(env, "ZIG_FIXED_FILES", 2));
+    loop.pg_poll_first = @intCast(envUint(env, "ZIG_PG_POLL_FIRST", 2));
+    loop.ack_skip_ns = envUint(env, "ZIG_ACK_SKIP_MS", 19) * std.time.ns_per_ms;
+    loop.stats_on = envUint(env, "ZIG_URING_STATS", 1) == 1;
+    if (loop.buf_runs or loop.cq_budget > 0 or loop.fixed_files > 0 or loop.pg_poll_first > 0 or loop.ack_skip_ns > 0 or loop.stats_on)
+        sys.log("ring knobs: buffer runs {}, completion budget {d}, fixed files {d}, postgres poll-first {d}, quickack skip under {d} ms, stats {}", .{
+            loop.buf_runs, loop.cq_budget, loop.fixed_files, loop.pg_poll_first, loop.ack_skip_ns / std.time.ns_per_ms, loop.stats_on,
+        });
+
     jwt.init(secret);
     ignoreSigpipe();
     raiseFileLimit();
@@ -247,6 +258,15 @@ fn onOff(env: anytype, comptime name: []const u8) bool {
     if (std.mem.eql(u8, v, "1")) return true;
     if (v.len == 0 or std.mem.eql(u8, v, "0")) return false;
     sys.fatal(name ++ ": '{s}' is not 0 or 1", .{v});
+}
+
+/// An unsigned knob from the environment, 0 when unset or empty; anything else above `max` stops the server.
+fn envUint(env: anytype, comptime name: []const u8, max: u64) u64 {
+    const v = env.getPosix(name) orelse return 0;
+    if (v.len == 0) return 0;
+    const n = std.fmt.parseInt(u64, v, 10) catch max + 1;
+    if (n > max) sys.fatal(name ++ ": '{s}' is not a number from 0 to {d}", .{ v, max });
+    return n;
 }
 
 fn ignoreSigpipe() void {
