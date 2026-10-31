@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"io"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -16,9 +17,9 @@ import (
 )
 
 const (
-	readBufSize = 64 << 10
-	maxHeader   = 16 << 10
-	maxBody     = 1 << 20
+	bufSize   = 4 << 10
+	maxHeader = 16 << 10
+	maxBody   = 1 << 20
 )
 
 // conn is everything an idle keep-alive connection holds: no goroutine, no buffers.
@@ -26,11 +27,16 @@ type conn struct {
 	mu              sync.Mutex
 	fd              int
 	loop            *loop
-	busy            bool // a request is being served, input waits in pending
-	closed          bool // peer is gone, the fd closes once the request in flight is done
+	events          uint32 // what epoll watches on fd
+	busy            bool   // a request is being served, input waits in pending
+	reading         bool   // the request in flight reads the rest of its body off the socket
+	masked          bool   // input is unwatched until the body reader waits for it
+	served          bool   // the handler returned, flush finishes the request
+	closed          bool   // peer is gone, the fd closes once the request in flight is done
+	closeAfterWrite bool
+	wake            chan struct{} // tells the body reader the socket has input
 	pending         []byte
 	out             []byte // response bytes the socket did not take yet
-	closeAfterWrite bool
 }
 
 type server struct {
@@ -88,7 +94,7 @@ func serve(addr netip.AddrPort, loops int, h http.Handler) error {
 		if err = unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, lfd, &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(lfd)}); err != nil {
 			return err
 		}
-		l := &loop{srv: s, epfd: epfd, lfd: lfd, buf: make([]byte, readBufSize), events: make([]unix.EpollEvent, 1024)}
+		l := &loop{srv: s, epfd: epfd, lfd: lfd, buf: make([]byte, bufSize), events: make([]unix.EpollEvent, 1024)}
 		go func() { errc <- l.run() }()
 	}
 	return <-errc
@@ -119,7 +125,7 @@ func (l *loop) run() error {
 				c.flush()
 			}
 			if ev.Events&(unix.EPOLLIN|unix.EPOLLRDHUP|unix.EPOLLHUP|unix.EPOLLERR) != 0 {
-				l.read(c)
+				l.read(c, ev.Events)
 			}
 		}
 	}
@@ -136,29 +142,36 @@ func (l *loop) accept() {
 			continue
 		}
 		_ = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
-		c := &conn{fd: fd, loop: l}
+		c := &conn{fd: fd, loop: l, events: unix.EPOLLIN | unix.EPOLLRDHUP}
 		l.srv.conns[fd].Store(c)
-		if err = unix.EpollCtl(l.epfd, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{Events: unix.EPOLLIN | unix.EPOLLRDHUP, Fd: int32(fd)}); err != nil {
+		if err = unix.EpollCtl(l.epfd, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{Events: c.events, Fd: int32(fd)}); err != nil {
 			l.srv.conns[fd].Store(nil)
 			_ = unix.Close(fd)
 		}
 	}
 }
 
-func (l *loop) read(c *conn) {
-	n, err := unix.Read(c.fd, l.buf)
-	if n <= 0 {
-		if err == unix.EAGAIN || err == unix.EINTR {
-			return
-		}
-		c.mu.Lock()
-		c.shutdown()
-		c.mu.Unlock()
+func (l *loop) read(c *conn, events uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
 		return
 	}
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
+	if c.reading {
+		if events&(unix.EPOLLHUP|unix.EPOLLERR) != 0 {
+			c.shutdown()
+			return
+		}
+		c.masked = true
+		c.arm()
+		c.signal()
+		return
+	}
+	n, err := unix.Read(c.fd, l.buf)
+	if n <= 0 {
+		if err != unix.EAGAIN && err != unix.EINTR {
+			c.shutdown()
+		}
 		return
 	}
 	if c.busy || len(c.pending) > 0 {
@@ -166,10 +179,9 @@ func (l *loop) read(c *conn) {
 		if !c.busy {
 			c.next()
 		}
-	} else {
-		c.dispatch(l.buf[:n])
+		return
 	}
-	c.mu.Unlock()
+	c.dispatch(l.buf[:n], l)
 }
 
 // shutdown drops the conn from epoll and closes it, or leaves the close to the request in flight.
@@ -180,6 +192,7 @@ func (c *conn) shutdown() {
 	}
 	c.closed = true
 	_ = unix.EpollCtl(c.loop.epfd, unix.EPOLL_CTL_DEL, c.fd, nil)
+	c.signal()
 	if !c.busy {
 		c.release()
 	}
@@ -192,47 +205,85 @@ func (c *conn) release() {
 	c.out = nil
 }
 
-// next serves the request buffered in pending, if a whole one is there. Callers hold c.mu.
+func (c *conn) signal() {
+	select {
+	case c.wake <- struct{}{}:
+	default:
+	}
+}
+
+// arm makes epoll watch what c waits for. Callers hold c.mu.
+func (c *conn) arm() {
+	ev := uint32(unix.EPOLLIN | unix.EPOLLRDHUP)
+	if c.masked {
+		ev = 0
+	}
+	if len(c.out) > 0 {
+		ev |= unix.EPOLLOUT
+	}
+	if ev == c.events || c.closed {
+		return
+	}
+	c.events = ev
+	_ = unix.EpollCtl(c.loop.epfd, unix.EPOLL_CTL_MOD, c.fd, &unix.EpollEvent{Events: ev, Fd: int32(c.fd)})
+}
+
+// next serves the request buffered in pending, if a whole head is there. Callers hold c.mu.
 func (c *conn) next() {
 	rest := c.pending
 	c.pending = nil
-	c.dispatch(rest)
+	c.dispatch(rest, nil)
 }
 
 // dispatch parses one request out of data and hands it to a goroutine. Whatever follows it waits in
-// pending until the response is out, so responses keep request order. Callers hold c.mu.
-func (c *conn) dispatch(data []byte) {
+// pending until the response is out, so responses keep request order. A request read by l takes
+// over l's buffer instead of copying it. Callers hold c.mu.
+func (c *conn) dispatch(data []byte, l *loop) {
 	req := reqPool.Get().(*request)
-	used, err := req.parse(data)
-	switch {
-	case err == errIncomplete:
+	used, err := req.parse(data, l != nil)
+	if err != nil {
 		reqPool.Put(req)
-		if len(data) > maxHeader+maxBody {
-			c.writeRaw(resp400)
-			c.shutdown()
+		if err == errIncomplete {
+			c.pending = append(c.pending[:0], data...)
 			return
 		}
-		c.pending = append(c.pending[:0], data...)
-		return
-	case err != nil:
-		reqPool.Put(req)
 		c.writeRaw(resp400)
 		c.shutdown()
 		return
+	}
+	if l != nil {
+		req.buf, l.buf = l.buf, req.buf[:cap(req.buf)]
 	}
 	if used < len(data) {
 		c.pending = append(c.pending[:0], data[used:]...)
 	}
 	c.busy = true
+	c.start(req)
 	go c.serve(req)
+}
+
+// start hands the socket to req's body reader when the body is not all in. Callers hold c.mu.
+func (c *conn) start(req *request) {
+	req.w.c = c
+	req.body.c = c
+	if req.body.left > 0 {
+		c.reading = true
+		if c.wake == nil {
+			c.wake = make(chan struct{}, 1)
+		}
+	}
 }
 
 func (c *conn) serve(req *request) {
 	for {
 		c.loop.srv.handler.ServeHTTP(&req.w, &req.Request)
+		if !req.w.sent {
+			_, _ = req.w.Write(nil)
+		}
 		closeAfter := req.close
-		out := req.w.finish(req.out[:0])
-		req.out = out
+		if req.body.left > 0 && !req.body.discard(req.buf[:cap(req.buf)]) {
+			closeAfter = true
+		}
 
 		c.mu.Lock()
 		if c.closed {
@@ -243,9 +294,10 @@ func (c *conn) serve(req *request) {
 			reqPool.Put(req)
 			return
 		}
-		c.closeAfterWrite = closeAfter
-		if !c.write(out) {
+		if len(c.out) > 0 {
 			// the socket is full, flush finishes the job from the loop
+			c.served = true
+			c.closeAfterWrite = closeAfter
 			c.mu.Unlock()
 			req.reset()
 			reqPool.Put(req)
@@ -266,7 +318,7 @@ func (c *conn) serve(req *request) {
 			reqPool.Put(req)
 			return
 		}
-		used, err := req.parse(c.pending)
+		used, err := req.parse(c.pending, false)
 		if err == errIncomplete {
 			c.busy = false
 			c.mu.Unlock()
@@ -282,31 +334,57 @@ func (c *conn) serve(req *request) {
 			return
 		}
 		c.pending = append(c.pending[:0], c.pending[used:]...)
+		c.start(req)
 		c.mu.Unlock()
 	}
 }
 
-// write sends b, keeping what the socket did not take in c.out. It reports whether everything went out.
-// Callers hold c.mu.
-func (c *conn) write(b []byte) bool {
-	for len(b) > 0 {
-		n, err := unix.Write(c.fd, b)
-		if err != nil {
-			if err == unix.EINTR {
-				continue
+// send writes h and b, keeping what the socket did not take in c.out. It reports whether the conn
+// is still open. Callers hold c.mu.
+func (c *conn) send(h, b []byte) bool {
+	for len(h)+len(b) > 0 {
+		n, err := writev(c.fd, h, b)
+		switch err {
+		case nil:
+		case unix.EINTR:
+			continue
+		case unix.EAGAIN:
+			c.out = append(append(c.out[:0], h...), b...)
+			c.arm()
+			return true
+		default:
+			if c.served {
+				c.served = false
+				c.busy = false
 			}
-			if err == unix.EAGAIN {
-				c.out = append(c.out[:0], b...)
-				_ = unix.EpollCtl(c.loop.epfd, unix.EPOLL_CTL_MOD, c.fd, &unix.EpollEvent{Events: unix.EPOLLIN | unix.EPOLLOUT | unix.EPOLLRDHUP, Fd: int32(c.fd)})
-				return false
-			}
-			c.busy = false
 			c.shutdown()
 			return false
 		}
-		b = b[n:]
+		if n < len(h) {
+			h = h[n:]
+			continue
+		}
+		b = b[n-len(h):]
+		h = nil
 	}
 	return true
+}
+
+func writev(fd int, h, b []byte) (int, error) {
+	if len(b) == 0 {
+		return unix.Write(fd, h)
+	}
+	if len(h) == 0 {
+		return unix.Write(fd, b)
+	}
+	iov := [2]unix.Iovec{{Base: &h[0]}, {Base: &b[0]}}
+	iov[0].SetLen(len(h))
+	iov[1].SetLen(len(b))
+	n, _, e := unix.Syscall(unix.SYS_WRITEV, uintptr(fd), uintptr(unsafe.Pointer(&iov[0])), uintptr(len(iov)))
+	if e != 0 {
+		return 0, e
+	}
+	return int(n), nil
 }
 
 func (c *conn) writeRaw(b []byte) {
@@ -320,11 +398,16 @@ func (c *conn) flush() {
 		return
 	}
 	out := c.out
-	c.out = nil
-	if !c.write(out) {
+	c.out = c.out[:0]
+	if !c.send(out, nil) || len(c.out) > 0 {
 		return
 	}
-	_ = unix.EpollCtl(c.loop.epfd, unix.EPOLL_CTL_MOD, c.fd, &unix.EpollEvent{Events: unix.EPOLLIN | unix.EPOLLRDHUP, Fd: int32(c.fd)})
+	c.out = nil
+	c.arm()
+	if !c.served {
+		return
+	}
+	c.served = false
 	c.busy = false
 	if c.closeAfterWrite {
 		c.shutdown()
@@ -335,9 +418,50 @@ func (c *conn) flush() {
 	}
 }
 
+// readBody reads body bytes off the socket into p, waiting for the loop to see input when there is none.
+func (c *conn) readBody(p []byte) (int, error) {
+	for {
+		n, err := unix.Read(c.fd, p)
+		switch {
+		case err == nil && n > 0:
+			return n, nil
+		case err == nil:
+			return 0, io.ErrUnexpectedEOF
+		case err == unix.EINTR:
+			continue
+		case err != unix.EAGAIN:
+			return 0, err
+		}
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			return 0, io.ErrUnexpectedEOF
+		}
+		c.masked = false
+		c.arm()
+		c.mu.Unlock()
+		<-c.wake
+	}
+}
+
+// endBody gives the socket back to the loop.
+func (c *conn) endBody() {
+	c.mu.Lock()
+	c.reading = false
+	c.masked = false
+	c.arm()
+	select {
+	case <-c.wake:
+	default:
+	}
+	c.mu.Unlock()
+}
+
 var (
 	errIncomplete = errors.New("incomplete request")
 	errBadRequest = errors.New("bad request")
+	errWritten    = errors.New("response already written")
+	errClosed     = errors.New("connection closed")
 	resp400       = []byte("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
 )
 
@@ -346,17 +470,16 @@ type request struct {
 	url   url.URL
 	hdr   http.Header
 	auth  [1]string
-	body  bytes.Reader
-	raw   []byte
-	out   []byte
+	body  body
+	buf   []byte // what the head and the start of the body were parsed from
 	w     responseWriter
 	close bool
 }
 
 var reqPool = sync.Pool{New: func() any {
-	r := &request{hdr: make(http.Header, 1), raw: make([]byte, 0, 1024), out: make([]byte, 0, 4096)}
+	r := &request{hdr: make(http.Header, 1), buf: make([]byte, bufSize)}
 	r.w.hdr = make(http.Header, 2)
-	r.w.body = make([]byte, 0, 4096)
+	r.w.head = make([]byte, 0, 256)
 	return r
 }}
 
@@ -364,12 +487,14 @@ func (r *request) reset() {
 	r.Request = http.Request{}
 	clear(r.hdr)
 	r.auth[0] = ""
+	r.body.buf, r.body.left = nil, 0
 	r.close = false
 	r.w.reset()
 }
 
-// parse reads one request from data into r, copying it so data can be reused. It returns the bytes consumed.
-func (r *request) parse(data []byte) (int, error) {
+// parse reads one request head from data into r, with as much of the body as data holds. r points
+// into data when inPlace, else into a copy in r.buf. It returns the bytes consumed.
+func (r *request) parse(data []byte, inPlace bool) (int, error) {
 	end := bytes.Index(data, crlfcrlf)
 	if end < 0 {
 		if len(data) > maxHeader {
@@ -394,7 +519,7 @@ func (r *request) parse(data []byte) (int, error) {
 	http10 := proto[7] == '0'
 
 	contentLength := 0
-	keepAlive10 := false
+	closeConn, keepAlive10 := false, false
 	var authStart, authEnd int
 	for line := head[lineEnd+2:]; len(line) > 0; {
 		i := bytes.IndexByte(line, '\r')
@@ -422,7 +547,7 @@ func (r *request) parse(data []byte) (int, error) {
 		case 10:
 			if asciiEqualFold(name, "connection") {
 				if asciiEqualFold(val, "close") {
-					r.close = true
+					closeConn = true
 				} else if asciiEqualFold(val, "keep-alive") {
 					keepAlive10 = true
 				}
@@ -433,16 +558,13 @@ func (r *request) parse(data []byte) (int, error) {
 			}
 		}
 	}
-	if http10 && !keepAlive10 {
-		r.close = true
-	}
 	total := end + 4 + contentLength
-	if len(data) < total {
-		return 0, errIncomplete
+	used := min(len(data), total)
+	raw := data[:used]
+	if !inPlace {
+		r.buf = append(r.buf[:0], raw...)
+		raw = r.buf
 	}
-
-	r.raw = append(r.raw[:0], data[:total]...)
-	raw := r.raw
 	r.Method = method(raw[:sp1])
 	target := raw[sp1+1 : sp2]
 	r.url = url.URL{}
@@ -452,6 +574,7 @@ func (r *request) parse(data []byte) (int, error) {
 	}
 	r.url.Path = unsafe.String(unsafe.SliceData(target), len(target))
 	r.URL = &r.url
+	r.close = closeConn || http10 && !keepAlive10
 	r.Proto = "HTTP/1.1"
 	r.ProtoMajor, r.ProtoMinor = 1, 1
 	if authEnd > 0 {
@@ -460,9 +583,10 @@ func (r *request) parse(data []byte) (int, error) {
 	}
 	r.Header = r.hdr
 	r.ContentLength = int64(contentLength)
-	r.body.Reset(raw[end+4 : total])
-	r.Body = bodyReader{&r.body}
-	return total, nil
+	r.body.buf = raw[end+4:]
+	r.body.left = total - used
+	r.Body = &r.body
+	return used, nil
 }
 
 var crlfcrlf = []byte("\r\n\r\n")
@@ -507,14 +631,54 @@ func asciiEqualFold(b []byte, lower string) bool {
 	return true
 }
 
-type bodyReader struct{ *bytes.Reader }
+// body reads a request body: first the part read with the head, then the rest straight off the socket.
+type body struct {
+	c    *conn
+	buf  []byte
+	left int // bytes still on the socket
+}
 
-func (bodyReader) Close() error { return nil }
+func (b *body) Read(p []byte) (int, error) {
+	if len(b.buf) > 0 {
+		n := copy(p, b.buf)
+		b.buf = b.buf[n:]
+		return n, nil
+	}
+	if b.left == 0 {
+		return 0, io.EOF
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	n, err := b.c.readBody(p[:min(len(p), b.left)])
+	b.left -= n
+	if b.left == 0 {
+		b.c.endBody()
+	}
+	return n, err
+}
 
+func (*body) Close() error { return nil }
+
+// discard reads the rest of the body into scratch, so the next request starts at its head.
+func (b *body) discard(scratch []byte) bool {
+	b.buf = nil
+	for b.left > 0 {
+		if _, err := b.Read(scratch); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// responseWriter sends the whole response from Write, the body straight from the caller's buffer, so
+// a handler writes its body in one call.
 type responseWriter struct {
+	c      *conn
 	hdr    http.Header
+	head   []byte
 	status int
-	body   []byte
+	sent   bool
 }
 
 func (w *responseWriter) Header() http.Header { return w.hdr }
@@ -526,21 +690,28 @@ func (w *responseWriter) WriteHeader(code int) {
 }
 
 func (w *responseWriter) Write(b []byte) (int, error) {
-	if w.status == 0 {
-		w.status = http.StatusOK
+	if w.sent {
+		return 0, errWritten
 	}
-	w.body = append(w.body, b...)
+	w.sent = true
+	w.head = w.appendHead(w.head[:0], len(b))
+	c := w.c
+	c.mu.Lock()
+	ok := !c.closed && c.send(w.head, b)
+	c.mu.Unlock()
+	if !ok {
+		return 0, errClosed
+	}
 	return len(b), nil
 }
 
 func (w *responseWriter) reset() {
 	clear(w.hdr)
 	w.status = 0
-	w.body = w.body[:0]
+	w.sent = false
 }
 
-// finish appends the whole response to dst.
-func (w *responseWriter) finish(dst []byte) []byte {
+func (w *responseWriter) appendHead(dst []byte, n int) []byte {
 	status := w.status
 	if status == 0 {
 		status = http.StatusOK
@@ -555,9 +726,8 @@ func (w *responseWriter) finish(dst []byte) []byte {
 		}
 	}
 	dst = append(dst, "Content-Length: "...)
-	dst = strconv.AppendInt(dst, int64(len(w.body)), 10)
-	dst = append(dst, "\r\n\r\n"...)
-	return append(dst, w.body...)
+	dst = strconv.AppendInt(dst, int64(n), 10)
+	return append(dst, "\r\n\r\n"...)
 }
 
 func statusLine(code int) string {
