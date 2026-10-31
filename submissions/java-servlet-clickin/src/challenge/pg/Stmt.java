@@ -78,11 +78,17 @@ public final class Stmt {
                              .replace("$2::int4", "r.lim")
                              .replace("$1::int8", "r.viewer");
         String prefix = "";
+        String afterInputs = "";
         if (global) {
             prefix = "WITH shared_cnt AS MATERIALIZED (SELECT count(*) AS n FROM (SELECT 1 FROM articles LIMIT 1000) s) ";
             sql = sql.replace("cnt AS (SELECT count(*) AS n FROM (SELECT 1 FROM articles LIMIT 1000) s)", "cnt AS (SELECT n FROM shared_cnt)");
         } else if (single == FEED) {
-            prefix = "WITH candidates AS MATERIALIZED (SELECT fo.followee_id FROM unnest($1::int8[],$2::int4[],$3::int4[]) AS b(viewer,lim,off) JOIN follows fo ON fo.follower_id=b.viewer GROUP BY fo.followee_id ORDER BY count(*) DESC,fo.followee_id LIMIT 4), prolific AS MATERIALIZED (SELECT c.followee_id,EXISTS (SELECT 1 FROM articles a WHERE a.author_id=c.followee_id ORDER BY a.id DESC OFFSET 999 LIMIT 1) AS proven FROM candidates c) ";
+            // hubs: the authors most followed by the batch's viewers, read once. A hub's depth-th newest article is a
+            // floor for every viewer following it (their page can only hold articles at least that new), so the
+            // other followees' index walks stop there. The 4 most followed also prove a 1,000 count.
+            afterInputs = ", hubs AS MATERIALIZED (SELECT fo.followee_id AS fid,count(*) AS c,max(r.lim::int8+r.off::int8) AS depth FROM r JOIN follows fo ON fo.follower_id=r.viewer GROUP BY fo.followee_id ORDER BY count(*) DESC,fo.followee_id LIMIT 32), hub_floors AS MATERIALIZED (SELECT h.fid,(SELECT a.id FROM articles a WHERE a.author_id=h.fid ORDER BY a.id DESC OFFSET h.depth-1 LIMIT 1) AS floor_id FROM hubs h), prolific AS MATERIALIZED (SELECT c.fid AS followee_id,EXISTS (SELECT 1 FROM articles a WHERE a.author_id=c.fid ORDER BY a.id DESC OFFSET 999 LIMIT 1) AS proven FROM (SELECT fid FROM hubs ORDER BY c DESC,fid LIMIT 4) c)";
+            sql = sql.replace("SELECT x.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id=fo.followee_id ORDER BY",
+                    "SELECT x.id FROM (SELECT COALESCE(max(hf.floor_id),0::int8) AS f FROM hub_floors hf JOIN follows fh ON fh.follower_id=r.viewer AND fh.followee_id=hf.fid) fl CROSS JOIN follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id=fo.followee_id AND a2.id>=fl.f ORDER BY");
             sql = sql.replace(
                     "cnt AS (SELECT count(*) AS n FROM (SELECT 1 FROM articles a WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id=r.viewer) LIMIT 1000) s)",
                     "cnt AS (SELECT CASE WHEN EXISTS (SELECT 1 FROM prolific c JOIN follows fo ON fo.follower_id=r.viewer AND fo.followee_id=c.followee_id WHERE c.proven) THEN 1000::bigint ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id=r.viewer) LIMIT 1000) s) END AS n)");
@@ -98,7 +104,9 @@ public final class Stmt {
                         + inputs
                         + ") WITH ORDINALITY AS r("
                         + columns
-                        + ")), pages AS MATERIALIZED (SELECT r.i,r.viewer,p.id,p.n FROM r CROSS JOIN LATERAL ("
+                        + "))"
+                        + afterInputs
+                        + ", pages AS MATERIALIZED (SELECT r.i,r.viewer,p.id,p.n FROM r CROSS JOIN LATERAL ("
                         + sql
                         + ") p)",
                 types);
