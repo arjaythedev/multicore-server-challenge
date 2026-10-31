@@ -1,0 +1,10 @@
+(executable
+ (name main)
+ (ocamlopt_flags (:standard -O3 -inline 200))
+ (foreign_stubs
+  (language c)
+  (names bcrypt_stubs bcrypt_expand0)
+  (flags (:standard -O3 -fno-strict-aliasing)))
+ (link_flags (-cclib -lcrypt))
+ (preprocess (pps ppx_deriving_yojson))
+ (libraries eio eio.unix eio_linux yojson digestif eqaf postgresql threads.posix unix))
