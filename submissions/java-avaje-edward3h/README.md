@@ -143,6 +143,11 @@ Not comparable with the leaderboard: it has half the cores, and they are shared 
 | 16,000 | fail, 13.3% errors | fail, 12.0% errors |
 | **Hold (5 min)** | **10,000 users: p95 118 ms, p99 416 ms, 0% errors, CPU 85%** | **9,800 users: p95 65 ms, p99 192 ms, 0% errors, CPU 74%** |
 
+With the two-statement lists and autocommit (kiwiproc 1.1), the same machine and procedure gave one search with 12,000
+passing (p95 3.5 ms), 14,000 passing, 15,000 failing (1.23% errors) and 16,000 failing. The 5-minute hold at **14,000
+users** passed: 3,637 requests/s, p95 328 ms, p99 745 ms, 0% errors, CPU 94%. That is close to the limit, so read it as
+13,000 to 14,000 users; the table above is the earlier build.
+
 For comparison, the Spring example held 10,000 users on the same machine, and this submission's earlier builds held
 9,200 to 10,000. Hold latency at 10,000 users varies by about 70 to 160 ms at p95 between runs: the machine is close to
 saturation there, so one run can pass or fail the same step.
