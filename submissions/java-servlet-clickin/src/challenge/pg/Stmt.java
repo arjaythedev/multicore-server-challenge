@@ -72,7 +72,6 @@ public final class Stmt {
             int... types) {
         String sql = REGISTRY.get(single)
                              .sql()
-                             .replace("$4::text", "r.name")
                              .replace("$3::int8", "r.off::int8")
                              .replace("$2::int8", "r.lim::int8")
                              .replace("$3::int4", "r.off")
@@ -91,10 +90,8 @@ public final class Stmt {
         int select = sql.indexOf(" SELECT " + ARTICLE_COLUMNS);
         sql = sql.substring(0, select) + " SELECT p.id,cnt.n FROM cnt LEFT JOIN page p ON true";
         String ctes = prefix.isEmpty() ? "WITH " : prefix + ", ";
-        String columns = (types.length == 4 ? "name," : "")
-                + (single == FEED ? "viewer,lim,off" : "lim,off,viewer")
-                + ",i";
-        return register(
+        String columns = (single == FEED ? "viewer,lim,off" : "lim,off,viewer") + ",i";
+        return decorated(
                 ctes
                         + "r AS MATERIALIZED (SELECT * FROM unnest("
                         + inputs
@@ -102,7 +99,18 @@ public final class Stmt {
                         + columns
                         + ")), pages AS MATERIALIZED (SELECT r.i,r.viewer,p.id,p.n FROM r CROSS JOIN LATERAL ("
                         + sql
-                        + ") p), ids AS (SELECT DISTINCT id FROM pages WHERE id IS NOT NULL), deco AS MATERIALIZED ("
+                        + ") p)",
+                types);
+    }
+
+    /**
+     * {@code pages(i, viewer, id, n)}, one row per listed article (id null for
+     * an empty page), decorated once per distinct article.
+     */
+    private static int decorated(String pages, int... types) {
+        return register(
+                pages
+                        + ", ids AS (SELECT DISTINCT id FROM pages WHERE id IS NOT NULL), deco AS MATERIALIZED ("
                         + BATCH_DECO.replace("a.description,a.body,", "a.description,")
                         + ") SELECT r.i::int4,"
                         + BATCH_COLUMNS
@@ -111,16 +119,34 @@ public final class Stmt {
                 types);
     }
 
+    /**
+     * A list filtered by a name (tag, author, favoriting user): each distinct
+     * name in the batch is resolved and counted once, however many requests
+     * ask for it. {@code key} turns names {@code k(name)} into {@code
+     * kid}; an unknown name leaves kid null, so its page is empty and its count
+     * 0.
+     */
+    private static int keyedList(String key, String count, String page) {
+        return decorated("WITH r AS MATERIALIZED (SELECT * FROM unnest($1::text[],$2::int4[],$3::int4[],$4::int8[]) WITH ORDINALITY AS r(name,lim,off,viewer,i)), k AS MATERIALIZED ("
+                        + key.replace("{names}", "(SELECT DISTINCT name FROM r) k")
+                        + "), kc AS MATERIALIZED (SELECT k.name,k.kid,(SELECT count(*) FROM ("
+                        + count
+                        + " LIMIT 1000) s) AS n FROM k), pages AS MATERIALIZED (SELECT r.i,r.viewer,p.id,kc.n FROM r JOIN kc ON kc.name=r.name LEFT JOIN LATERAL (SELECT id FROM ("
+                        + page
+                        + " LIMIT r.lim OFFSET r.off) pg LIMIT 100) p ON true)",
+                TEXT_ARRAY, INT4_ARRAY, INT4_ARRAY, INT8_ARRAY);
+    }
+
     public static final int ARTICLES_BATCH = batchList(ARTICLES, "$1::int4[],$2::int4[],$3::int8[]",
             true, INT4_ARRAY, INT4_ARRAY, INT8_ARRAY);
     public static final int FEED_BATCH = batchList(FEED, "$1::int8[],$2::int4[],$3::int4[]",
             false, INT8_ARRAY, INT4_ARRAY, INT4_ARRAY);
-    public static final int ARTICLES_TAG_BATCH = batchList(ARTICLES_TAG, "$1::text[],$2::int4[],$3::int4[],$4::int8[]",
-            false, TEXT_ARRAY, INT4_ARRAY, INT4_ARRAY, INT8_ARRAY);
-    public static final int ARTICLES_AUTHOR_BATCH = batchList(ARTICLES_AUTHOR, "$1::text[],$2::int4[],$3::int4[],$4::int8[]",
-            false, TEXT_ARRAY, INT4_ARRAY, INT4_ARRAY, INT8_ARRAY);
-    public static final int ARTICLES_FAVORITED_BATCH = batchList(ARTICLES_FAVORITED, "$1::text[],$2::int4[],$3::int4[],$4::int8[]",
-            false, TEXT_ARRAY, INT4_ARRAY, INT4_ARRAY, INT8_ARRAY);
+    public static final int ARTICLES_TAG_BATCH = keyedList("SELECT k.name,t.id AS kid FROM {names} LEFT JOIN tags t ON t.name=k.name",
+            "SELECT 1 FROM article_tags WHERE tag_id=k.kid", "SELECT article_id AS id FROM article_tags WHERE tag_id=kc.kid ORDER BY article_id DESC");
+    public static final int ARTICLES_AUTHOR_BATCH = keyedList("SELECT k.name,u.id AS kid FROM {names} LEFT JOIN users u ON u.username=k.name",
+            "SELECT 1 FROM articles WHERE author_id=k.kid", "SELECT id FROM articles WHERE author_id=kc.kid ORDER BY id DESC");
+    public static final int ARTICLES_FAVORITED_BATCH = keyedList("SELECT k.name,u.id AS kid FROM {names} LEFT JOIN users u ON u.username=k.name",
+            "SELECT 1 FROM favorites WHERE user_id=k.kid", "SELECT article_id AS id FROM favorites WHERE user_id=kc.kid ORDER BY article_id DESC");
     public static final int PROFILE_BATCH = register("SELECT r.i::int4,q.* FROM unnest($1::text[],$2::int8[]) WITH ORDINALITY AS r(name,viewer,i) CROSS JOIN LATERAL (SELECT u.username,u.bio,u.image,EXISTS (SELECT 1 FROM follows f WHERE f.follower_id=r.viewer AND f.followee_id=u.id) FROM users u WHERE u.username=r.name) q",
             TEXT_ARRAY, INT8_ARRAY);
     public static final int USER_BATCH = register(
