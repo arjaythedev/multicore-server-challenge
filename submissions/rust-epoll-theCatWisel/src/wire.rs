@@ -359,6 +359,11 @@ impl PipelineBuf {
             _ => 0,
         }
     }
+
+    #[inline]
+    pub fn bool(&self, c: Cell) -> bool {
+        matches!(self.bytes(c), Some(b) if !b.is_empty() && b[0] != 0)
+    }
 }
 
 pub fn iter_binary_array(raw: &[u8]) -> impl Iterator<Item = &[u8]> {
@@ -607,7 +612,12 @@ impl PgConn {
 
     pub fn read_pipeline_into(&mut self, expected_execs: usize, out: &mut PipelineBuf) -> PgResult<()> {
         out.clear();
-        let mut row_start = 0u32;
+        self.read_pipeline_append(expected_execs, out)
+    }
+
+    pub fn read_pipeline_append(&mut self, expected_execs: usize, out: &mut PipelineBuf) -> PgResult<()> {
+        let target_results = out.results.len() + expected_execs;
+        let mut row_start = out.rows.len() as u32;
         loop {
             let (tag, body) = self.next_frame()?;
             match tag {
@@ -660,7 +670,7 @@ impl PgConn {
                 other => return Err(PgError::Wire(format!("unexpected frame {:?}", other as char))),
             }
         }
-        while out.results.len() < expected_execs {
+        while out.results.len() < target_results {
             out.results.push(ExecOutcome {
                 row_start,
                 row_count: 0,
