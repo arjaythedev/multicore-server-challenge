@@ -15,8 +15,9 @@ pub enum Failure {
 
 /// The outcome the response is built from.
 pub enum Finding<'r> {
-    /// Every statement ran; this is the answer of the last one.
-    Done(StmtResult<'r>),
+    /// Every statement ran. The job's answer is row `usize` of the last statement's result: row 0 for a job that
+    /// owns its statements, the job's own row for a statement shared by a run of jobs.
+    Done(StmtResult<'r>, usize),
     Failed(Failure),
     /// The job could not be sent (see [`Pushed::Rejected`](super::push::Pushed::Rejected)).
     Rejected,
@@ -43,7 +44,24 @@ pub fn finding_for(results: &Results, first: usize, count: usize) -> Finding<'_>
             return Finding::Failed(Failure::NotRun);
         }
     }
-    Finding::Done(results.statement(first + count - 1))
+    Finding::Done(results.statement(first + count - 1), 0)
+}
+
+/// Judges job number `row` of a run of `rows` jobs answered by the single statement at `stmt` (one result row per
+/// job, in job order). A statement that returns another number of rows broke that contract: the transaction is
+/// already committed then, so the jobs are answered 500 instead of being read from the wrong rows.
+pub fn finding_for_row(results: &Results, stmt: usize, row: usize, rows: usize) -> Finding<'_> {
+    if stmt >= results.len() {
+        return Finding::Failed(Failure::NotRun);
+    }
+    let statement = results.statement(stmt);
+    match statement.error() {
+        Some(error) if error.is_unique_violation() => Finding::Failed(Failure::UniqueViolation),
+        Some(_) => Finding::Failed(Failure::Server),
+        None if !statement.is_ok() => Finding::Failed(Failure::NotRun),
+        None if statement.row_count() != rows => Finding::Failed(Failure::Server),
+        None => Finding::Done(statement, row),
+    }
 }
 
 /// True when every statement of the pipeline ran, so its transaction committed as a whole.

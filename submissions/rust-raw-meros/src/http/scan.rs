@@ -24,7 +24,7 @@ fn ends_block(buf: &[u8], lf: usize) -> bool {
 }
 
 /// Portable reference implementation.
-#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[cfg(any(test, not(target_arch = "x86_64")))]
 pub fn find_header_end_scalar(buf: &[u8]) -> Option<usize> {
     (3..buf.len())
         .find(|&i| buf[i] == b'\n' && ends_block(buf, i))

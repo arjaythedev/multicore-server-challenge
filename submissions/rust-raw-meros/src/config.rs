@@ -28,6 +28,8 @@ pub struct Config {
     pub bcrypt_threads: usize,
     /// How long the oldest queued password job waits to fill the interleaved lanes.
     pub bcrypt_window: Duration,
+    /// Seconds between lines of read-lane statistics on stderr; 0 = off.
+    pub stats_seconds: u64,
 }
 
 impl Config {
@@ -52,12 +54,16 @@ impl Config {
             write_batch_max: optional_num("WRITE_BATCH_MAX", 256)?,
             bcrypt_threads: optional_num("BCRYPT_THREADS", (cpus / 8).max(1))?,
             bcrypt_window: Duration::from_micros(optional_num("BCRYPT_WINDOW_US", 400_000)?),
+            stats_seconds: optional_num("STATS_SECONDS", 0)?,
         })
     }
 }
 
 fn required(name: &str) -> Result<String, String> {
-    std::env::var(name).map_err(|_| format!("{name} is not set"))
+    match std::env::var(name) {
+        Ok(value) if !value.is_empty() => Ok(value),
+        _ => Err(format!("{name} is not set")),
+    }
 }
 
 fn optional_num<T: std::str::FromStr>(name: &str, default: T) -> Result<T, String> {
