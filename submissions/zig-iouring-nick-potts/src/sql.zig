@@ -274,9 +274,17 @@ pub fn fallible(s: Stmt) bool {
     return s == .user_insert or s == .user_update;
 }
 
+/// ZIG_COMMENTS_FW=1 (main.zig): the batched comments statement carries, per request, only the viewer's followees
+/// among its thread's comment authors (`sql/BATCH_COMMENTS_LIST_SET_FW.sql`), which threads.zig reads the same way.
+/// Each request then fetches follows rows only for authors it follows, not its whole followee list, so the
+/// read stays index-only while follows is not all-visible.
+pub var comments_fw = false;
+const comments_fw_sql = std.mem.trimEnd(u8, @embedFile("sql/BATCH_COMMENTS_LIST_SET_FW.sql"), "\n; ");
+
 /// The batched form: `$n` becomes `r.pn`, the request rows come from unnest of one array per parameter.
 pub fn batchedSql(gpa: std.mem.Allocator, s: Stmt) ![]u8 {
     const d = s.def();
+    if (s == .comments_list_set and comments_fw) return gpa.dupe(u8, comments_fw_sql);
     if (d.batched) |b| return gpa.dupe(u8, b);
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(gpa, "SELECT q.*, r.ord FROM unnest(");
@@ -332,4 +340,18 @@ test "the sorted-ids MEGA orders the ids CTE and changes nothing else" {
     try std.testing.expectEqualStrings(mega.sql[0..at], mega.sql_sorted_ids[0..at]);
     try std.testing.expectEqualStrings(" ORDER BY 1", mega.sql_sorted_ids[at..][0..11]);
     try std.testing.expectEqualStrings(mega.sql[at..], mega.sql_sorted_ids[at + 11 ..]);
+}
+
+test "ZIG_COMMENTS_FW swaps only the batched comments statement" {
+    const gpa = std.testing.allocator;
+    defer comments_fw = false;
+    for ([_]bool{ false, true }) |on| {
+        comments_fw = on;
+        const t = try batchedSql(gpa, .comments_list_set);
+        defer gpa.free(t);
+        try std.testing.expectEqualStrings(if (on) comments_fw_sql else comptime batchText(.comments_list_set), t);
+        const f = try batchedSql(gpa, .follow);
+        defer gpa.free(f);
+        try std.testing.expectEqualStrings(comptime batchText(.follow), f);
+    }
 }

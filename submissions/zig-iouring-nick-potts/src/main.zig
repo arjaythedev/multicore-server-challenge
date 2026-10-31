@@ -26,6 +26,7 @@ const loop = @import("loop.zig");
 const drain = @import("drain.zig");
 const shed = @import("shed.zig");
 const flags = @import("flags.zig");
+const sql = @import("sql.zig");
 const Flags = flags.Flags;
 
 const Sizing = struct {
@@ -121,6 +122,10 @@ pub fn main(init: std.process.Init.Minimal) void {
     const sorted = env.getPosix("ZIG_MEGA_SORTED_IDS") orelse "";
     mega.sorted_ids = if (std.mem.eql(u8, sorted, "1")) true else if (sorted.len == 0 or std.mem.eql(u8, sorted, "0")) false else sys.fatal("ZIG_MEGA_SORTED_IDS: '{s}' is not 0 or 1", .{sorted});
     if (mega.sorted_ids) sys.log("ZIG_MEGA_SORTED_IDS=1: MEGA builds its article id set in id order", .{});
+    // ZIG_COMMENTS_FW=1 prepares the batched comments statement with each request's followees among its thread's
+    // authors only (sql.zig); off by default.
+    sql.comments_fw = onOff(env, "ZIG_COMMENTS_FW");
+    if (sql.comments_fw) sys.log("ZIG_COMMENTS_FW=1: batched comments read only the followees among each thread's authors", .{});
 
     loop.buf_runs = envUint(env, "ZIG_BUF_RUNS", 1) == 1;
     loop.cq_budget = @intCast(envUint(env, "ZIG_CQ_BUDGET", 1 << 20));
