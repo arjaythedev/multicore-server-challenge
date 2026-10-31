@@ -1,15 +1,19 @@
 /* Reads the configuration, then forks the worker processes. The parent only watches: if any worker exits it
  * kills the rest and exits too, so a crash shows up as a dead server rather than a half-working one (the box
  * never restarts it, and restarting would break rule 9's spirit). */
+#define _GNU_SOURCE
 #include <errno.h>
+#include <sched.h>
 #include <signal.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include "drain.h"
 #include "ipc.h"
 #include "jwt.h"
+#include "plan.h"
 #include "sha256.h"
 #include "worker.h"
 
@@ -65,7 +69,7 @@ int main(int argc, char **argv) {
     cfg.host = env_str("HOST", "0.0.0.0");
     cfg.port = env_str("PORT", "3000");
     cfg.workers = env_int("WORKERS", cpus >= 2 ? (int)(cpus / 2) : 1, 1, MAX_WORKERS);
-    cfg.read_conns = env_int("READ_CONNS", 12, 1, 64);
+    cfg.read_conns = env_int("READ_CONNS", 8, 1, 64);
     cfg.write_conns = env_int("WRITE_CONNS", 1, 1, 8);
     cfg.bcrypt_threads = env_int("BCRYPT_THREADS", 1, 1, 64);
     cfg.bcrypt_wait_ms = env_int("BCRYPT_WAIT_MS", 1000, 0, 5000);
@@ -73,19 +77,49 @@ int main(int argc, char **argv) {
     cfg.bcrypt_nice = env_int("BCRYPT_NICE", 10, 0, 19);
     cfg.pg_pipeline = (uint32_t)env_int("PG_PIPELINE", 16, 1, 1024);
     cfg.write_group = (uint32_t)env_int("WRITE_GROUP", 128, 1, 4096);
+    cfg.write_merge = env_int("WRITE_MERGE", 1, 0, 1);
+    cfg.write_wait_us = env_int("WRITE_WAIT_US", 3000, 0, 100000);
+    cfg.skip_gone = env_int("SKIP_GONE", 1, 0, 1);
     cfg.plan_max = (uint32_t)env_int("PLAN_MAX", 4096, 1, 65536);
     cfg.plan_wait_us = env_int("PLAN_WAIT_US", 20000, 0, 1000000);
     cfg.planner = env_int("PLANNER", 1, 0, 1);
     cfg.plan_pace = env_int("PLAN_PACE", 1, 0, 1);
+    cfg.lanes = env_int("LANES", 1, 0, 1);
+    cfg.lane_window_us = env_int("LANE_WINDOW_US", 5000, 0, 1000000);
+    cfg.lane_gap_us[PL_FEED] = env_int("FEED_GAP_US", 80000, 0, 1000000);
+    cfg.lane_gap_us[PL_CMT] = env_int("CMT_GAP_US", 100000, 0, 1000000);
+    cfg.lane_gap_us[PL_SHARED] = env_int("SHARED_GAP_US", 80000, 0, 1000000);
+    cfg.lane_cap[PL_FEED] = env_int("FEED_CAP", 2, 1, 64);
+    cfg.lane_cap[PL_CMT] = env_int("CMT_CAP", 2, 1, 64);
+    cfg.lane_cap[PL_SHARED] = env_int("SHARED_CAP", 3, 1, 64);
+    cfg.ack_delay = env_int("ACK_DELAY", 1, 0, 1);
+    cfg.sched_batch = env_int("SCHED_BATCH", 0, 0, 1);
     session_tune = env_int("PG_TUNE", 0, 0, 1);
     cfg.direct_fds = env_int("DIRECT_FDS", 0, 0, 1);
     if (cfg.read_conns + cfg.workers * cfg.write_conns > 95) die("more than 95 postgres connections");
+
+    /* SCHED_BATCH (no privilege needed; inherited by every process and thread forked below): our processes wake
+     * constantly (a request, a reply, a finished plan), and under the default policy each wakeup may preempt a busy
+     * Postgres backend. Batch tasks get the same CPU share without cutting in line. */
+    if (cfg.sched_batch) {
+        struct sched_param sp = {0};
+        if (sched_setscheduler(0, SCHED_BATCH, &sp) < 0) fprintf(stderr, "SCHED_BATCH: %s\n", strerror(errno));
+    }
 
     sha256_select();
     jwt_init(secret, strlen(secret));
     signal(SIGPIPE, SIG_IGN);
 
-    ipc_setup(cfg.workers, (size_t)env_int("RING_MB", 32, 1, 1024) << 20);
+    /* The descriptor limit, raised here so every child inherits it, bounds the connection table of each worker
+     * (worker_run sizes it the same way) and so the liveness tables. */
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+        rl.rlim_cur = rl.rlim_max;
+        setrlimit(RLIMIT_NOFILE, &rl);
+    }
+    getrlimit(RLIMIT_NOFILE, &rl);
+    uint32_t nconns = rl.rlim_cur > (1u << 22) ? (1u << 22) : (uint32_t)rl.rlim_cur;
+    ipc_setup(cfg.workers, (size_t)env_int("RING_MB", 32, 1, 1024) << 20, nconns);
 
     /* Process 0 is the drain; then the workers. */
     pid_t parent = getpid();
