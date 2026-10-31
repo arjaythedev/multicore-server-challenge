@@ -106,7 +106,10 @@ Every login and sign-up verifies or hashes with cost 10 (rule 7). That is about 
 ~65 ms per hash on EPYC, ~1.7 cores: a fifth of the box. Blowfish is one long dependency chain, so a single hash
 leaves most of the core idle: `BCrypt` runs up to 4 independent hashes interleaved in the same loop (1 lane 67.5 ms,
 4 lanes 38 ms per hash on EPYC). Hashes run on their own `BCRYPT_THREADS` (4) threads at `nice` 5 (`setpriority`
-per thread through FFM; `Thread.setPriority` is a no-op on Linux), which wait up to 40 ms to fill their lanes.
+per thread through FFM; `Thread.setPriority` is a no-op on Linux). One thread at a time gathers a set, waiting up to
+400 ms to fill its lanes, while the others hash: when every thread gathered on its own for 40 ms, ~20-30 logins/s
+came out one per thread and the 4-lane loop mostly ran a lone hash (locally 70 ms of CPU per hash, 32 ms after; bcrypt
+threads 1.39 -> 0.63 cores at 18k req/s). Logins wait longer for their set (p50 ~0.2 s), but they are 0.1% of requests.
 
 ## Results
 
@@ -169,7 +172,7 @@ so compare with the leaderboard loosely.
 ## Tuning knobs (all optional; defaults are what was measured)
 
 `LOOPS`, `READ_CONNS` (8), `WRITE_CONNS` (1), `READ_GATHER_US` (5000), `READ_ROUND_MAX` (512), `WRITE_GROUP_MAX` (256),
-`COALESCE` (1), `MAX_INFLIGHT_PER_LOOP` (1024), `BCRYPT_THREADS` (4), `BCRYPT_LANES` (4), `BCRYPT_GATHER_MS` (40),
+`COALESCE` (1), `MAX_INFLIGHT_PER_LOOP` (1024), `BCRYPT_THREADS` (4), `BCRYPT_LANES` (4), `BCRYPT_GATHER_MS` (400),
 `BCRYPT_NICE` (5), `JAVA_OPTS`.
 
 `dev/` holds the local Linux box (`Dockerfile`, `conformance.sh`, `load.sh`, `alloc.sh`) and the Hetzner scripts

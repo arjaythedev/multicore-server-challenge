@@ -6,6 +6,7 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
 
 import challenge.pg.Unit;
 
@@ -55,7 +56,8 @@ public final class BcryptPool implements AutoCloseable {
         }
     }
 
-    private final long gatherNanos = Long.parseLong(System.getenv().getOrDefault("BCRYPT_GATHER_MS", "40")) * 1_000_000L;
+    private final long gatherNanos = Long.parseLong(System.getenv().getOrDefault("BCRYPT_GATHER_MS", "400")) * 1_000_000L;
+    private final ReentrantLock gathering = new ReentrantLock();
 
     private boolean acquireUntil(long deadline) {
         long left = deadline - System.nanoTime();
@@ -83,31 +85,38 @@ public final class BcryptPool implements AutoCloseable {
         }
         BCrypt bcrypt = new BCrypt();
         for (; ; ) {
-            available.acquireUninterruptibly();
-            Unit unit = queue.poll();
-            if (unit == null) {
-                if (closed && publishers.get() == 0 && queue.isEmpty()) {
-                    available.release();
-                    return;
-                }
-                continue;
-            }
             Unit[] jobs = new Unit[lanes];
-            int count = 1;
-            jobs[0] = unit;
-            // wait up to BCRYPT_GATHER_MS for company: lanes interleave in one loop, so a fuller batch costs
-            // little more CPU than a lone hash (4 lanes: ~1.8x the throughput of 1 on EPYC)
-            long gatherEnd = System.nanoTime() + gatherNanos;
-            while (count < lanes && acquireUntil(gatherEnd)) {
-                Unit next = queue.poll();
-                if (next != null) {
-                    jobs[count++] = next;
-                } else {
-                    if (closed) {
+            int count = 0;
+            // one thread gathers at a time, the others hash: with every thread gathering on its own, ~30 logins/s
+            // spread one per thread and a 4-lane loop mostly ran a lone hash (~1.8x the CPU of a full set on EPYC)
+            gathering.lock();
+            try {
+                available.acquireUninterruptibly();
+                Unit unit = queue.poll();
+                if (unit == null) {
+                    if (closed && publishers.get() == 0 && queue.isEmpty()) {
                         available.release();
+                        return;
                     }
-                    break;
+                    continue;
                 }
+                jobs[count++] = unit;
+                // wait up to BCRYPT_GATHER_MS for a full set: lanes interleave in one loop, so a full set costs
+                // little more CPU than a lone hash
+                long gatherEnd = System.nanoTime() + gatherNanos;
+                while (count < lanes && acquireUntil(gatherEnd)) {
+                    Unit next = queue.poll();
+                    if (next != null) {
+                        jobs[count++] = next;
+                    } else {
+                        if (closed) {
+                            available.release();
+                        }
+                        break;
+                    }
+                }
+            } finally {
+                gathering.unlock();
             }
             Unit[] valid = new Unit[count];
             String[] passwords = new String[count];
