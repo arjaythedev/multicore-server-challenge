@@ -19,7 +19,7 @@ pub enum ReadOp {
     Login { email: String, password: Vec<u8> },
     Profile { username: String },
     ArticleBySlug { slug: String },
-    ArticleById { id: i64, status: u16 },
+    ArticleById { id: i64, known_fav: Option<bool> },
     Comments { slug: String },
     Global { lim: i64, off: i64 },
     ByTag { tag: String, lim: i64, off: i64 },
@@ -280,6 +280,51 @@ pub fn write_profile_json(
     dst.push(b'}');
 }
 
+#[allow(clippy::too_many_arguments)]
+fn write_full_article_envelope(
+    dst: &mut Vec<u8>,
+    slug: &[u8],
+    title: &[u8],
+    description: &[u8],
+    body: &[u8],
+    sorted_tags: &[&[u8]],
+    created_at: i64,
+    updated_at: i64,
+    favorited: bool,
+    favorites_count: i64,
+    author_username: &[u8],
+    author_bio: Option<&[u8]>,
+    author_image: Option<&[u8]>,
+    following: bool,
+) {
+    dst.extend_from_slice(b"{\"article\":{\"slug\":");
+    codec::write_str(dst, slug);
+    dst.extend_from_slice(b",\"title\":");
+    codec::write_str(dst, title);
+    dst.extend_from_slice(b",\"description\":");
+    codec::write_str(dst, description);
+    dst.extend_from_slice(b",\"body\":");
+    codec::write_str(dst, body);
+    dst.extend_from_slice(b",\"tagList\":[");
+    for (idx, &t) in sorted_tags.iter().enumerate() {
+        if idx > 0 {
+            dst.push(b',');
+        }
+        codec::write_str(dst, t);
+    }
+    dst.extend_from_slice(b"],\"createdAt\":");
+    codec::write_timestamp(dst, created_at);
+    dst.extend_from_slice(b",\"updatedAt\":");
+    codec::write_timestamp(dst, updated_at);
+    dst.extend_from_slice(b",\"favorited\":");
+    codec::write_bool(dst, favorited);
+    dst.extend_from_slice(b",\"favoritesCount\":");
+    codec::write_i64(dst, favorites_count);
+    dst.extend_from_slice(b",\"author\":");
+    write_profile_json(dst, author_username, author_bio, author_image, following);
+    dst.extend_from_slice(b"}}");
+}
+
 #[derive(Clone, Copy)]
 enum PlanSlot {
     Tags,
@@ -287,7 +332,7 @@ enum PlanSlot {
     Login(u32),
     Profile(u32),
     BySlug(u32),
-    ById(u32),
+    ById(u32, Option<bool>),
     Comments(u32),
     Global(u32),
     Filtered(usize, u32, u32),
@@ -359,6 +404,14 @@ fn build_flag_runs(
 }
 
 #[derive(Clone, Copy, Default)]
+enum MetaSource {
+    #[default]
+    None,
+    PhaseA(wire::RowSpan),
+    PhaseB(wire::RowSpan),
+}
+
+#[derive(Clone, Copy, Default)]
 struct CachedArticleSlices {
     ready: bool,
     head_start: u32,
@@ -395,6 +448,9 @@ pub struct ReadWorker {
     distinct_arts: KeySet<i64>,
     distinct_authors: KeySet<i64>,
     art_author_ords: Vec<u32>,
+    art_meta: Vec<MetaSource>,
+    meta_req_ids: Vec<i64>,
+    meta_req_ords: Vec<u32>,
     author_spans: Vec<Option<wire::RowSpan>>,
     fav_pairs: Vec<(i64, i64)>,
     foll_pairs: Vec<(i64, i64)>,
@@ -440,6 +496,9 @@ impl ReadWorker {
             distinct_arts: KeySet::new(),
             distinct_authors: KeySet::new(),
             art_author_ords: Vec::with_capacity(256),
+            art_meta: Vec::with_capacity(256),
+            meta_req_ids: Vec::with_capacity(256),
+            meta_req_ords: Vec::with_capacity(256),
             author_spans: Vec::with_capacity(128),
             fav_pairs: Vec::with_capacity(512),
             foll_pairs: Vec::with_capacity(512),
@@ -566,7 +625,7 @@ impl ReadWorker {
                 ReadOp::Login { email, .. } => PlanSlot::Login(self.k_uemail.intern(email.clone())),
                 ReadOp::Profile { username } => PlanSlot::Profile(self.k_prof.intern(username.clone())),
                 ReadOp::ArticleBySlug { slug } => PlanSlot::BySlug(self.k_slug.intern(slug.clone())),
-                ReadOp::ArticleById { id, .. } => PlanSlot::ById(self.k_aid.intern(*id)),
+                ReadOp::ArticleById { id, known_fav } => PlanSlot::ById(self.k_aid.intern(*id), *known_fav),
                 ReadOp::Comments { slug } => PlanSlot::Comments(self.k_cmts.intern(slug.clone())),
                 ReadOp::Global { lim, off } => PlanSlot::Global(self.k_global.intern((*lim, *off))),
                 ReadOp::ByTag { tag: key, lim, off }
@@ -620,6 +679,7 @@ impl ReadWorker {
             }
         };
 
+        let st_tags = alloc_slot(need_tags_endpoint || touches_articles);
         let st_uid = alloc_slot(self.k_uid.len() > 0);
         let st_uemail = alloc_slot(self.k_uemail.len() > 0);
         let st_prof = alloc_slot(self.k_prof.len() > 0);
@@ -629,27 +689,25 @@ impl ReadWorker {
         let st_global = alloc_slot(self.k_global.len() > 0);
         let st_filters: [Option<usize>; 3] = std::array::from_fn(|i| alloc_slot(self.k_filters[i].pages.len() > 0));
         let st_feed = alloc_slot(self.k_feed_cnt.len() > 0);
-        let st_tags = alloc_slot(need_tags_endpoint || touches_articles);
+        let n_phase_a1 = usize::from(st_tags.is_some())
+            + usize::from(st_uid.is_some())
+            + usize::from(st_uemail.is_some());
+        let n_phase_a2 = n_phase_a - n_phase_a1;
 
         let tx = &mut conn.tx;
-        if st_uid.is_some() {
-            tx.bind_and_exec("uid", &[BindParam::I64Slice(&self.k_uid.items)]);
+        if n_phase_a1 > 0 {
+            if st_tags.is_some() {
+                tx.bind_and_exec("tags", &[]);
+            }
+            if st_uid.is_some() {
+                tx.bind_and_exec("uid", &[BindParam::I64Slice(&self.k_uid.items)]);
+            }
+            if st_uemail.is_some() {
+                tx.bind_and_exec("uemail", &[BindParam::TextSlice(&self.k_uemail.items)]);
+            }
+            tx.write_sync();
         }
-        if st_uemail.is_some() {
-            tx.bind_and_exec("uemail", &[BindParam::TextSlice(&self.k_uemail.items)]);
-        }
-        if st_prof.is_some() {
-            tx.bind_and_exec("prof", &[BindParam::TextSlice(&self.k_prof.items)]);
-        }
-        if st_slug.is_some() {
-            tx.bind_and_exec("aslug", &[BindParam::TextSlice(&self.k_slug.items)]);
-        }
-        if st_aid.is_some() {
-            tx.bind_and_exec("aid", &[BindParam::I64Slice(&self.k_aid.items)]);
-        }
-        if st_cmts.is_some() {
-            tx.bind_and_exec("cmts", &[BindParam::TextSlice(&self.k_cmts.items)]);
-        }
+
         let mut global_win_max: i64 = 0;
         let mut use_global_win = self.k_global.len() > 0;
         for &(l, o) in &self.k_global.items {
@@ -662,155 +720,257 @@ impl ReadWorker {
                 global_win_max = end;
             }
         }
-        if st_global.is_some() {
-            if use_global_win {
-                tx.bind_and_exec("global_win", &[BindParam::I64(global_win_max.max(1))]);
-            } else {
-                self.enc_b.reset(OID_INT8, self.k_global.items.len());
-                self.enc_c.reset(OID_INT8, self.k_global.items.len());
-                for &(l, o) in &self.k_global.items {
-                    self.enc_b.push_i64(l);
-                    self.enc_c.push_i64(o);
-                }
-                tx.bind_and_exec(
-                    "global",
-                    &[
-                        BindParam::Raw(self.enc_b.finish()),
-                        BindParam::Raw(self.enc_c.finish()),
-                    ],
-                );
+        if n_phase_a2 > 0 {
+            if st_prof.is_some() {
+                tx.bind_and_exec("prof", &[BindParam::TextSlice(&self.k_prof.items)]);
             }
-        }
-        for i in 0..3 {
-            if st_filters[i].is_some() {
-                let fd = &self.k_filters[i];
-                self.enc_a.reset(OID_INT8, fd.pages.items.len());
-                self.enc_b.reset(OID_INT8, fd.pages.items.len());
-                self.enc_c.reset(OID_INT8, fd.pages.items.len());
-                for &(c_ord, l, o) in &fd.pages.items {
+            if st_slug.is_some() {
+                tx.bind_and_exec("aslug", &[BindParam::TextSlice(&self.k_slug.items)]);
+            }
+            if st_aid.is_some() {
+                tx.bind_and_exec("aid", &[BindParam::I64Slice(&self.k_aid.items)]);
+            }
+            if st_cmts.is_some() {
+                tx.bind_and_exec("cmts", &[BindParam::TextSlice(&self.k_cmts.items)]);
+            }
+            if st_global.is_some() {
+                if use_global_win {
+                    tx.bind_and_exec("global_win", &[BindParam::I64(global_win_max.max(1))]);
+                } else {
+                    self.enc_b.reset(OID_INT8, self.k_global.items.len());
+                    self.enc_c.reset(OID_INT8, self.k_global.items.len());
+                    for &(l, o) in &self.k_global.items {
+                        self.enc_b.push_i64(l);
+                        self.enc_c.push_i64(o);
+                    }
+                    tx.bind_and_exec(
+                        "global",
+                        &[
+                            BindParam::Raw(self.enc_b.finish()),
+                            BindParam::Raw(self.enc_c.finish()),
+                        ],
+                    );
+                }
+            }
+            for i in 0..3 {
+                if st_filters[i].is_some() {
+                    let fd = &self.k_filters[i];
+                    self.enc_a.reset(OID_INT8, fd.pages.items.len());
+                    self.enc_b.reset(OID_INT8, fd.pages.items.len());
+                    self.enc_c.reset(OID_INT8, fd.pages.items.len());
+                    for &(c_ord, l, o) in &fd.pages.items {
+                        self.enc_a.push_i64(c_ord as i64 + 1);
+                        self.enc_b.push_i64(l);
+                        self.enc_c.push_i64(o);
+                    }
+                    tx.bind_and_exec(
+                        FILTER_STMT_NAMES[i],
+                        &[
+                            BindParam::TextSlice(&fd.counts.items),
+                            BindParam::Raw(self.enc_a.finish()),
+                            BindParam::Raw(self.enc_b.finish()),
+                            BindParam::Raw(self.enc_c.finish()),
+                        ],
+                    );
+                }
+            }
+            if st_feed.is_some() {
+                self.feed_depths.clear();
+                self.feed_depths.resize(self.k_feed_cnt.items.len(), 1);
+                self.enc_a.reset(OID_INT8, self.k_feed_page.items.len());
+                self.enc_b.reset(OID_INT8, self.k_feed_page.items.len());
+                self.enc_c.reset(OID_INT8, self.k_feed_page.items.len());
+                for &(c_ord, l, o) in &self.k_feed_page.items {
+                    let d = l.saturating_add(o).max(1);
+                    if d > self.feed_depths[c_ord as usize] {
+                        self.feed_depths[c_ord as usize] = d;
+                    }
                     self.enc_a.push_i64(c_ord as i64 + 1);
                     self.enc_b.push_i64(l);
                     self.enc_c.push_i64(o);
                 }
                 tx.bind_and_exec(
-                    FILTER_STMT_NAMES[i],
+                    "feed",
                     &[
-                        BindParam::TextSlice(&fd.counts.items),
+                        BindParam::I64Slice(&self.k_feed_cnt.items),
+                        BindParam::I64Slice(&self.feed_depths),
                         BindParam::Raw(self.enc_a.finish()),
                         BindParam::Raw(self.enc_b.finish()),
                         BindParam::Raw(self.enc_c.finish()),
                     ],
                 );
             }
+            tx.write_sync();
         }
-        if st_feed.is_some() {
-            self.feed_depths.clear();
-            self.feed_depths.resize(self.k_feed_cnt.items.len(), 1);
-            self.enc_a.reset(OID_INT8, self.k_feed_page.items.len());
-            self.enc_b.reset(OID_INT8, self.k_feed_page.items.len());
-            self.enc_c.reset(OID_INT8, self.k_feed_page.items.len());
-            for &(c_ord, l, o) in &self.k_feed_page.items {
-                let d = l.saturating_add(o).max(1);
-                if d > self.feed_depths[c_ord as usize] {
-                    self.feed_depths[c_ord as usize] = d;
-                }
-                self.enc_a.push_i64(c_ord as i64 + 1);
-                self.enc_b.push_i64(l);
-                self.enc_c.push_i64(o);
-            }
-            tx.bind_and_exec(
-                "feed",
-                &[
-                    BindParam::I64Slice(&self.k_feed_cnt.items),
-                    BindParam::I64Slice(&self.feed_depths),
-                    BindParam::Raw(self.enc_a.finish()),
-                    BindParam::Raw(self.enc_b.finish()),
-                    BindParam::Raw(self.enc_c.finish()),
-                ],
-            );
-        }
-        if st_tags.is_some() {
-            tx.bind_and_exec("tags", &[]);
-        }
-        tx.write_sync();
         conn.flush()?;
-        conn.read_pipeline_into(n_phase_a, &mut self.pa)?;
-        if let Some(failed) = self.pa.results.iter().find(|r| r.error.is_some()) {
-            return Err(PgError::Wire(format!("phase A error: {}", failed.error.as_ref().unwrap())));
-        }
-        if need_tags_endpoint {
-            if let Some(s) = st_tags {
-                let r = &self.pa.results[s];
-                let (start, end) = (r.row_start as usize, (r.row_start + r.row_count) as usize);
-                let data = &self.pa.data;
-                let cols = &self.pa.cols;
-                self.pa.rows[start..end].sort_unstable_by(|&a, &b| {
-                    let ca = cols[a.start as usize + 1];
-                    let cb = cols[b.start as usize + 1];
-                    let sa = &data[ca.offset as usize..ca.offset as usize + ca.len.max(0) as usize];
-                    let sb = &data[cb.offset as usize..cb.offset as usize + cb.len.max(0) as usize];
-                    sa.cmp(sb)
-                });
+        self.pa.clear();
+        self.tag_lut.clear();
+
+        if n_phase_a1 > 0 {
+            conn.read_pipeline_append(n_phase_a1, &mut self.pa)?;
+            if let Some(failed) = self.pa.results.iter().find(|r| r.error.is_some()) {
+                return Err(PgError::Wire(format!("phase A1 error: {}", failed.error.as_ref().unwrap())));
             }
-        }
-
-        self.distinct_arts.clear();
-        self.distinct_authors.clear();
-        self.art_author_ords.clear();
-
-        let pa = &self.pa;
-        let grp = |s: Option<usize>, len: usize| s.map(|idx| group_rows_by_ordinal(pa, idx, len)).unwrap_or_default();
-        let grp_uid = grp(st_uid, self.k_uid.len());
-        let grp_uemail = grp(st_uemail, self.k_uemail.len());
-        let grp_prof = grp(st_prof, self.k_prof.len());
-        let grp_cmts = grp(st_cmts, self.k_cmts.len());
-
-        // Hand login password checks to the crypto threads before running Phase B.
-        if st_uemail.is_some() {
-            let mut early_err: Vec<OutgoingReply> = Vec::new();
+            if need_tags_endpoint {
+                if let Some(s) = st_tags {
+                    let r = &self.pa.results[s];
+                    let (start, end) = (r.row_start as usize, (r.row_start + r.row_count) as usize);
+                    let data = &self.pa.data;
+                    let cols = &self.pa.cols;
+                    self.pa.rows[start..end].sort_unstable_by(|&a, &b| {
+                        let ca = cols[a.start as usize + 1];
+                        let cb = cols[b.start as usize + 1];
+                        let sa = &data[ca.offset as usize..ca.offset as usize + ca.len.max(0) as usize];
+                        let sb = &data[cb.offset as usize..cb.offset as usize + cb.len.max(0) as usize];
+                        sa.cmp(sb)
+                    });
+                }
+            }
+            let pa = &self.pa;
+            if touches_articles {
+                if let Some(s) = st_tags {
+                    let rows = pa.result_rows(s);
+                    self.tag_lut.resize(rows.len() + 64, Cell { offset: 0, len: -1 });
+                    for &span in rows {
+                        let r = pa.row(span);
+                        let tid = pa.i64(r[0]) as usize;
+                        if tid >= self.tag_lut.len() {
+                            self.tag_lut.resize(tid + 16, Cell { offset: 0, len: -1 });
+                        }
+                        self.tag_lut[tid] = r[1];
+                    }
+                }
+            }
+            let grp_uid = st_uid.map(|idx| group_rows_by_ordinal(pa, idx, self.k_uid.len())).unwrap_or_default();
+            let grp_uemail = st_uemail.map(|idx| group_rows_by_ordinal(pa, idx, self.k_uemail.len())).unwrap_or_default();
+            let mut early_replies: Vec<OutgoingReply> = Vec::new();
             let mut login_tasks: Vec<CryptoTask> = Vec::new();
-            for (task, &slot) in tasks.iter_mut().zip(self.plan.iter()) {
-                if let PlanSlot::Login(k) = slot {
-                    let ReadOp::Login { password, .. } = &mut task.op else {
-                        unreachable!()
-                    };
-                    let pw = std::mem::take(password);
-                    match grp_uemail[k as usize].first() {
-                        Some(&row_i) => {
-                            let r = pa.row(pa.result_rows(st_uemail.unwrap())[row_i]);
-                            let user = UserRecord {
-                                id: pa.i64(r[1]),
-                                username: clone_cell_bytes(pa, r[2]).unwrap_or_default(),
-                                email: clone_cell_bytes(pa, r[3]).unwrap_or_default(),
-                                bio: clone_cell_bytes(pa, r[4]),
-                                image: clone_cell_bytes(pa, r[5]),
+            let mut rendered_tags: Option<Arc<[u8]>> = None;
+
+            if need_tags_endpoint || st_uid.is_some() || st_uemail.is_some() {
+                for (task, &slot) in tasks.iter_mut().zip(self.plan.iter()) {
+                    match slot {
+                        PlanSlot::Tags => {
+                            let shared = if let Some(cached) = &rendered_tags {
+                                cached.clone()
+                            } else {
+                                let s = st_tags.unwrap();
+                                let mut buf = Vec::with_capacity(4096);
+                                buf.extend_from_slice(b"{\"tags\":[");
+                                for (i, &span) in pa.result_rows(s).iter().enumerate() {
+                                    if i > 0 {
+                                        buf.push(b',');
+                                    }
+                                    codec::write_str(&mut buf, pa.bytes(pa.row(span)[1]).unwrap_or(b""));
+                                }
+                                buf.extend_from_slice(b"]}");
+                                let arc: Arc<[u8]> = buf.into();
+                                rendered_tags = Some(arc.clone());
+                                arc
                             };
-                            let hash = clone_cell_bytes(pa, r[6]).unwrap_or_default();
-                            login_tasks.push(CryptoTask::VerifyLogin {
-                                password: pw,
-                                hash,
-                                user,
+                            early_replies.push(OutgoingReply {
                                 addr: task.addr,
+                                status: 200,
+                                body: ReplyBody::Shared(shared),
                             });
                         }
-                        None => early_err.push(reactor::error_reply(task.addr, 401, "invalid email or password")),
+                        PlanSlot::User(k) => {
+                            let ReadOp::CurrentUser { token, .. } = &task.op else {
+                                unreachable!()
+                            };
+                            match grp_uid[k as usize].first() {
+                                Some(&row_i) => {
+                                    let r = pa.row(pa.result_rows(st_uid.unwrap())[row_i]);
+                                    let mut body = Vec::with_capacity(512);
+                                    write_user_envelope(
+                                        &mut body,
+                                        pa.bytes(r[3]).unwrap_or(b""),
+                                        token.as_bytes(),
+                                        pa.bytes(r[2]).unwrap_or(b""),
+                                        pa.bytes(r[4]),
+                                        pa.bytes(r[5]),
+                                    );
+                                    early_replies.push(OutgoingReply {
+                                        addr: task.addr,
+                                        status: 200,
+                                        body: ReplyBody::Owned(body),
+                                    });
+                                }
+                                None => early_replies.push(reactor::error_reply(task.addr, 401, "unauthorized")),
+                            }
+                        }
+                        PlanSlot::Login(k) => {
+                            let ReadOp::Login { password, .. } = &mut task.op else {
+                                unreachable!()
+                            };
+                            let pw = std::mem::take(password);
+                            match grp_uemail[k as usize].first() {
+                                Some(&row_i) => {
+                                    let r = pa.row(pa.result_rows(st_uemail.unwrap())[row_i]);
+                                    let user = UserRecord {
+                                        id: pa.i64(r[1]),
+                                        username: clone_cell_bytes(pa, r[2]).unwrap_or_default(),
+                                        email: clone_cell_bytes(pa, r[3]).unwrap_or_default(),
+                                        bio: clone_cell_bytes(pa, r[4]),
+                                        image: clone_cell_bytes(pa, r[5]),
+                                    };
+                                    let hash = clone_cell_bytes(pa, r[6]).unwrap_or_default();
+                                    login_tasks.push(CryptoTask::VerifyLogin {
+                                        password: pw,
+                                        hash,
+                                        user,
+                                        addr: task.addr,
+                                    });
+                                }
+                                None => early_replies.push(reactor::error_reply(task.addr, 401, "invalid email or password")),
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
             if !login_tasks.is_empty() {
                 CRYPTO_QUEUE.push_batch(&mut login_tasks);
             }
-            if !early_err.is_empty() {
-                reactor::complete_batch(early_err);
+            if !early_replies.is_empty() {
+                reactor::complete_batch(early_replies);
+            }
+            err_addrs.clear();
+            for (t, &slot) in tasks.iter().zip(self.plan.iter()) {
+                if !matches!(slot, PlanSlot::Tags | PlanSlot::User(_) | PlanSlot::Login(_)) {
+                    err_addrs.push(t.addr);
+                }
+            }
+            if n_phase_a2 == 0 {
+                tasks.clear();
+                return Ok(());
             }
         }
 
-        let mut intern_art = |aid: i64, author: i64, span: wire::RowSpan| -> ArticleRef {
+        conn.read_pipeline_append(n_phase_a2, &mut self.pa)?;
+        if let Some(failed) = self.pa.results[n_phase_a1..].iter().find(|r| r.error.is_some()) {
+            return Err(PgError::Wire(format!("phase A2 error: {}", failed.error.as_ref().unwrap())));
+        }
+
+        self.distinct_arts.clear();
+        self.distinct_authors.clear();
+        self.art_author_ords.clear();
+        self.art_meta.clear();
+
+        let pa = &self.pa;
+        let grp = |s: Option<usize>, len: usize| s.map(|idx| group_rows_by_ordinal(pa, idx, len)).unwrap_or_default();
+        let grp_prof = grp(st_prof, self.k_prof.len());
+        let grp_cmts = grp(st_cmts, self.k_cmts.len());
+
+        let mut intern_art = |aid: i64, author: i64, span: wire::RowSpan, meta_src: MetaSource| -> ArticleRef {
             let prev_len = self.distinct_arts.len();
             let ord = self.distinct_arts.intern(aid);
             if (ord as usize) == prev_len {
                 let au_ord = self.distinct_authors.intern(author);
                 self.art_author_ords.push(au_ord);
+                self.art_meta.push(meta_src);
+            } else if !matches!(meta_src, MetaSource::None) && matches!(self.art_meta[ord as usize], MetaSource::None) {
+                self.art_meta[ord as usize] = meta_src;
             }
             ArticleRef {
                 aid,
@@ -827,49 +987,60 @@ impl ReadWorker {
                     let r = pa.row(span);
                     let ord = pa.i64(r[0]);
                     if ord >= 1 && (ord as usize) <= len {
-                        out[ord as usize - 1] = Some(intern_art(pa.i64(r[1]), pa.i64(r[2]), span));
+                        out[ord as usize - 1] =
+                            Some(intern_art(pa.i64(r[1]), pa.i64(r[2]), span, MetaSource::PhaseA(span)));
                     }
                 }
             }
             out
         };
         let slug_rows = single_article(st_slug, self.k_slug.len());
-        let id_rows = single_article(st_aid, self.k_aid.len());
+        let aid_rows = single_article(st_aid, self.k_aid.len());
 
-        let mut unpack_list = |s: Option<usize>, n_cnt: usize, n_page: usize| -> (Vec<i64>, Vec<ArticlePage>) {
-            let mut counts = vec![0i64; n_cnt.max(1)];
-            let mut pages: Vec<ArticlePage> = vec![Vec::new(); n_page];
-            if let Some(idx) = s {
-                let mut raw_pages: Vec<Vec<(i64, i64, wire::RowSpan)>> = vec![Vec::new(); n_page];
-                for &span in pa.result_rows(idx) {
-                    let r = pa.row(span);
-                    let ord = pa.i64(r[0]);
-                    if ord <= 0 {
-                        let c_idx = (-ord) as usize;
-                        let c_idx = if c_idx == 0 { 0 } else { c_idx - 1 };
-                        if c_idx < counts.len() {
-                            counts[c_idx] = pa.i64(r[1]);
+        let mut unpack_list =
+            |s: Option<usize>, n_cnt: usize, n_page: usize, has_meta: bool| -> (Vec<i64>, Vec<ArticlePage>) {
+                let mut counts = vec![0i64; n_cnt.max(1)];
+                let mut pages: Vec<ArticlePage> = vec![Vec::new(); n_page];
+                if let Some(idx) = s {
+                    let mut raw_pages: Vec<Vec<(i64, i64, wire::RowSpan)>> = vec![Vec::new(); n_page];
+                    for &span in pa.result_rows(idx) {
+                        let r = pa.row(span);
+                        let ord = pa.i64(r[0]);
+                        if ord <= 0 {
+                            let c_idx = (-ord) as usize;
+                            let c_idx = if c_idx == 0 { 0 } else { c_idx - 1 };
+                            if c_idx < counts.len() {
+                                counts[c_idx] = pa.i64(r[1]);
+                            }
+                        } else if (ord as usize) <= n_page {
+                            raw_pages[ord as usize - 1].push((pa.i64(r[1]), pa.i64(r[2]), span));
                         }
-                    } else if (ord as usize) <= n_page {
-                        raw_pages[ord as usize - 1].push((pa.i64(r[1]), pa.i64(r[2]), span));
+                    }
+                    for (p_idx, mut rp) in raw_pages.into_iter().enumerate() {
+                        if rp.len() > 1 {
+                            rp.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                        }
+                        let dst = &mut pages[p_idx];
+                        dst.reserve(rp.len());
+                        for (aid, author, span) in rp {
+                            dst.push(intern_art(
+                                aid,
+                                author,
+                                span,
+                                if has_meta {
+                                    MetaSource::PhaseA(span)
+                                } else {
+                                    MetaSource::None
+                                },
+                            ));
+                        }
                     }
                 }
-                for (p_idx, mut rp) in raw_pages.into_iter().enumerate() {
-                    if rp.len() > 1 {
-                        rp.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-                    }
-                    let dst = &mut pages[p_idx];
-                    dst.reserve(rp.len());
-                    for (aid, author, span) in rp {
-                        dst.push(intern_art(aid, author, span));
-                    }
-                }
-            }
-            (counts, pages)
-        };
+                (counts, pages)
+            };
 
         let (global_counts, global_pages) = if use_global_win {
-            let (cnts, mut win_pages) = unpack_list(st_global, 1, 1);
+            let (cnts, mut win_pages) = unpack_list(st_global, 1, 1, true);
             let win = win_pages.pop().unwrap_or_default();
             let pages: Vec<ArticlePage> = self
                 .k_global
@@ -883,7 +1054,7 @@ impl ReadWorker {
                 .collect();
             (cnts, pages)
         } else {
-            unpack_list(st_global, 1, self.k_global.len())
+            unpack_list(st_global, 1, self.k_global.len(), true)
         };
         let filter_results: Vec<(Vec<i64>, Vec<ArticlePage>)> = (0..3)
             .map(|i| {
@@ -891,10 +1062,20 @@ impl ReadWorker {
                     st_filters[i],
                     self.k_filters[i].counts.len(),
                     self.k_filters[i].pages.len(),
+                    i != 1,
                 )
             })
             .collect();
-        let (feed_counts, feed_pages) = unpack_list(st_feed, self.k_feed_cnt.len(), self.k_feed_page.len());
+        let (feed_counts, feed_pages) = unpack_list(st_feed, self.k_feed_cnt.len(), self.k_feed_page.len(), false);
+
+        self.meta_req_ids.clear();
+        self.meta_req_ords.clear();
+        for (k, &meta) in self.art_meta.iter().enumerate() {
+            if matches!(meta, MetaSource::None) {
+                self.meta_req_ids.push(self.distinct_arts.items[k]);
+                self.meta_req_ords.push(k as u32);
+            }
+        }
 
         self.fav_pairs.clear();
         self.foll_pairs.clear();
@@ -911,9 +1092,11 @@ impl ReadWorker {
                         self.foll_pairs.push((viewer, art.author));
                     }
                 }
-                PlanSlot::ById(k) => {
-                    if let Some(art) = id_rows[k as usize] {
-                        self.fav_pairs.push((viewer, art.aid));
+                PlanSlot::ById(k, known_fav) => {
+                    if let Some(art) = aid_rows[k as usize] {
+                        if known_fav.is_none() {
+                            self.fav_pairs.push((viewer, art.aid));
+                        }
                         self.foll_pairs.push((viewer, art.author));
                     }
                 }
@@ -992,12 +1175,16 @@ impl ReadWorker {
                 None
             }
         };
+        let b_artmeta = alloc_b(!self.meta_req_ids.is_empty());
         let b_artx = alloc_b(self.distinct_arts.len() > 0);
         let b_artau = alloc_b(self.distinct_authors.len() > 0);
         let b_flags = alloc_b(!self.fav_viewers.is_empty() || !self.foll_viewers.is_empty());
 
         if n_phase_b > 0 {
             let tx = &mut conn.tx;
+            if b_artmeta.is_some() {
+                tx.bind_and_exec("artmeta", &[BindParam::I64Slice(&self.meta_req_ids)]);
+            }
             if b_artx.is_some() {
                 tx.bind_and_exec("artx", &[BindParam::I64Slice(&self.distinct_arts.items)]);
             }
@@ -1021,29 +1208,8 @@ impl ReadWorker {
             }
             tx.write_sync();
             conn.flush()?;
-            conn.read_pipeline_into(n_phase_b, &mut self.pb)?;
-            if let Some(failed) = self.pb.results.iter().find(|r| r.error.is_some()) {
-                return Err(PgError::Wire(format!("phase B error: {}", failed.error.as_ref().unwrap())));
-            }
         } else {
             self.pb.clear();
-        }
-
-        let pa = &self.pa;
-        let pb = &self.pb;
-
-        self.tag_lut.clear();
-        if let Some(s) = st_tags {
-            let rows = pa.result_rows(s);
-            self.tag_lut.resize(rows.len() + 64, Cell { offset: 0, len: -1 });
-            for &span in rows {
-                let r = pa.row(span);
-                let tid = pa.i64(r[0]) as usize;
-                if tid >= self.tag_lut.len() {
-                    self.tag_lut.resize(tid + 16, Cell { offset: 0, len: -1 });
-                }
-                self.tag_lut[tid] = r[1];
-            }
         }
 
         self.author_spans.clear();
@@ -1052,14 +1218,169 @@ impl ReadWorker {
         self.cached_arts
             .resize(self.distinct_arts.len(), CachedArticleSlices::default());
         self.arena.clear();
-        let arena = &mut self.arena;
         self.fav_hits.clear();
         self.foll_hits.clear();
+
+        let mut cached_cmts: Vec<Option<Vec<CachedCommentSlice>>> = Vec::with_capacity(self.k_cmts.len());
+        let mut rendered_profiles: Vec<Option<Arc<[u8]>>> = vec![None; self.k_prof.len()];
+        let mut rendered_cmts: Vec<Option<Arc<[u8]>>> = vec![None; self.k_cmts.len()];
+        {
+            let pa = &self.pa;
+            let arena = &mut self.arena;
+            if let Some(s) = st_cmts {
+                let cmt_rows = pa.result_rows(s);
+                for row_indices in &grp_cmts {
+                    if row_indices.is_empty() {
+                        cached_cmts.push(None);
+                        continue;
+                    }
+                    let mut rows: Vec<&[Cell]> = row_indices
+                        .iter()
+                        .map(|&i| pa.row(cmt_rows[i]))
+                        .filter(|r| r[2].len >= 0 && r[7].len >= 0)
+                        .collect();
+                    rows.sort_unstable_by(|a, b| (pa.i64(b[4]), pa.i64(b[2])).cmp(&(pa.i64(a[4]), pa.i64(a[2]))));
+                    let mut list = Vec::with_capacity(rows.len());
+                    for r in rows {
+                        let start = arena.len() as u32;
+                        arena.extend_from_slice(b"{\"id\":");
+                        codec::write_i64(arena, pa.i64(r[2]));
+                        arena.extend_from_slice(b",\"createdAt\":");
+                        codec::write_timestamp(arena, pa.i64(r[4]));
+                        arena.extend_from_slice(b",\"updatedAt\":");
+                        codec::write_timestamp(arena, pa.i64(r[5]));
+                        arena.extend_from_slice(b",\"body\":");
+                        codec::write_str(arena, pa.bytes(r[3]).unwrap_or(b""));
+                        arena.extend_from_slice(b",\"author\":{\"username\":");
+                        codec::write_str(arena, pa.bytes(r[7]).unwrap_or(b""));
+                        arena.extend_from_slice(b",\"bio\":");
+                        codec::write_nullable_str(arena, pa.bytes(r[8]));
+                        arena.extend_from_slice(b",\"image\":");
+                        codec::write_nullable_str(arena, pa.bytes(r[9]));
+                        arena.extend_from_slice(b",\"following\":");
+                        let end = arena.len() as u32;
+                        list.push(CachedCommentSlice {
+                            author_id: pa.i64(r[6]),
+                            start,
+                            end,
+                        });
+                    }
+                    cached_cmts.push(Some(list));
+                }
+            }
+
+            if st_prof.is_some() || st_cmts.is_some() {
+                let mut mid_replies: Vec<OutgoingReply> = Vec::new();
+                for (task, &slot) in tasks.iter().zip(self.plan.iter()) {
+                    if task.viewer != 0 {
+                        continue;
+                    }
+                    let addr = task.addr;
+                    match slot {
+                        PlanSlot::Profile(k) => match grp_prof[k as usize].first() {
+                            Some(&row_i) => {
+                                if let Some(shared) = &rendered_profiles[k as usize] {
+                                    mid_replies.push(OutgoingReply {
+                                        addr,
+                                        status: 200,
+                                        body: ReplyBody::Shared(shared.clone()),
+                                    });
+                                } else {
+                                    let r = pa.row(pa.result_rows(st_prof.unwrap())[row_i]);
+                                    let mut body = Vec::with_capacity(256);
+                                    body.extend_from_slice(b"{\"profile\":");
+                                    write_profile_json(
+                                        &mut body,
+                                        pa.bytes(r[2]).unwrap_or(b""),
+                                        pa.bytes(r[3]),
+                                        pa.bytes(r[4]),
+                                        false,
+                                    );
+                                    body.push(b'}');
+                                    let arc: Arc<[u8]> = body.into();
+                                    rendered_profiles[k as usize] = Some(arc.clone());
+                                    mid_replies.push(OutgoingReply {
+                                        addr,
+                                        status: 200,
+                                        body: ReplyBody::Shared(arc),
+                                    });
+                                }
+                            }
+                            None => mid_replies.push(reactor::error_reply(addr, 404, "profile not found")),
+                        },
+                        PlanSlot::Comments(k) => {
+                            let Some(list) = &cached_cmts[k as usize] else {
+                                mid_replies.push(reactor::error_reply(addr, 404, "article not found"));
+                                continue;
+                            };
+                            if let Some(shared) = &rendered_cmts[k as usize] {
+                                mid_replies.push(OutgoingReply {
+                                    addr,
+                                    status: 200,
+                                    body: ReplyBody::Shared(shared.clone()),
+                                });
+                            } else {
+                                let mut body = Vec::with_capacity(64 + 320 * list.len());
+                                body.extend_from_slice(b"{\"comments\":[");
+                                for (idx, c) in list.iter().enumerate() {
+                                    if idx > 0 {
+                                        body.push(b',');
+                                    }
+                                    body.extend_from_slice(&arena[c.start as usize..c.end as usize]);
+                                    body.extend_from_slice(b"false}}");
+                                }
+                                body.extend_from_slice(b"]}");
+                                let arc: Arc<[u8]> = body.into();
+                                rendered_cmts[k as usize] = Some(arc.clone());
+                                mid_replies.push(OutgoingReply {
+                                    addr,
+                                    status: 200,
+                                    body: ReplyBody::Shared(arc),
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if !mid_replies.is_empty() {
+                    reactor::complete_batch(mid_replies);
+                    err_addrs.clear();
+                    for (t, &slot) in tasks.iter().zip(self.plan.iter()) {
+                        let done_a1 = matches!(slot, PlanSlot::Tags | PlanSlot::User(_) | PlanSlot::Login(_));
+                        let done_mid = t.viewer == 0 && matches!(slot, PlanSlot::Profile(_) | PlanSlot::Comments(_));
+                        if !done_a1 && !done_mid {
+                            err_addrs.push(t.addr);
+                        }
+                    }
+                }
+            }
+        }
+
+        if n_phase_b > 0 {
+            conn.read_pipeline_into(n_phase_b, &mut self.pb)?;
+            if let Some(failed) = self.pb.results.iter().find(|r| r.error.is_some()) {
+                return Err(PgError::Wire(format!("phase B error: {}", failed.error.as_ref().unwrap())));
+            }
+        }
+
+        let pa = &self.pa;
+        let pb = &self.pb;
+        let arena = &mut self.arena;
         let mut fav_viewer_mask = 0u64;
         let mut foll_viewer_mask = 0u64;
         let mut tag_sort_buf: Vec<&[u8]> = Vec::with_capacity(8);
 
         if n_phase_b > 0 {
+            if let Some(s) = b_artmeta {
+                for &span in pb.result_rows(s) {
+                    let r = pb.row(span);
+                    let ord = pb.i64(r[0]);
+                    if ord >= 1 && (ord as usize) <= self.meta_req_ords.len() {
+                        let art_k = self.meta_req_ords[ord as usize - 1] as usize;
+                        self.art_meta[art_k] = MetaSource::PhaseB(span);
+                    }
+                }
+            }
             if let Some(s) = b_artau {
                 for &span in pb.result_rows(s) {
                     let r = pb.row(span);
@@ -1080,19 +1401,42 @@ impl ReadWorker {
                         let Some(au_span) = self.author_spans.get(au_ord).copied().flatten() else {
                             continue;
                         };
+                        let (slug_b, title_b, desc_b, created_at, updated_at) = match self.art_meta[k] {
+                            MetaSource::PhaseA(mspan) => {
+                                let mr = pa.row(mspan);
+                                (
+                                    pa.bytes(mr[3]).unwrap_or(b""),
+                                    pa.bytes(mr[4]).unwrap_or(b""),
+                                    pa.bytes(mr[5]).unwrap_or(b""),
+                                    pa.i64(mr[6]),
+                                    pa.i64(mr[7]),
+                                )
+                            }
+                            MetaSource::PhaseB(mspan) => {
+                                let mr = pb.row(mspan);
+                                (
+                                    pb.bytes(mr[1]).unwrap_or(b""),
+                                    pb.bytes(mr[2]).unwrap_or(b""),
+                                    pb.bytes(mr[3]).unwrap_or(b""),
+                                    pb.i64(mr[4]),
+                                    pb.i64(mr[5]),
+                                )
+                            }
+                            MetaSource::None => continue,
+                        };
                         let au = pb.row(au_span);
 
                         let head_start = arena.len() as u32;
                         arena.extend_from_slice(b"{\"slug\":");
-                        codec::write_str(arena, pb.bytes(r[1]).unwrap_or(b""));
+                        codec::write_str(arena, slug_b);
                         arena.extend_from_slice(b",\"title\":");
-                        codec::write_str(arena, pb.bytes(r[2]).unwrap_or(b""));
+                        codec::write_str(arena, title_b);
                         arena.extend_from_slice(b",\"description\":");
-                        codec::write_str(arena, pb.bytes(r[3]).unwrap_or(b""));
+                        codec::write_str(arena, desc_b);
                         let head_end = arena.len() as u32;
 
                         arena.extend_from_slice(b",\"tagList\":[");
-                        if let Some(raw_arr) = pb.bytes(r[6]) {
+                        if let Some(raw_arr) = pb.bytes(r[1]) {
                             tag_sort_buf.clear();
                             for elem in wire::iter_binary_array(raw_arr) {
                                 if let Ok(bytes) = elem.try_into() {
@@ -1115,14 +1459,14 @@ impl ReadWorker {
                             }
                         }
                         arena.extend_from_slice(b"],\"createdAt\":");
-                        codec::write_timestamp(arena, pb.i64(r[4]));
+                        codec::write_timestamp(arena, created_at);
                         arena.extend_from_slice(b",\"updatedAt\":");
-                        codec::write_timestamp(arena, pb.i64(r[5]));
+                        codec::write_timestamp(arena, updated_at);
                         arena.extend_from_slice(b",\"favorited\":");
                         let mid_end = arena.len() as u32;
 
                         arena.extend_from_slice(b",\"favoritesCount\":");
-                        codec::write_i64(arena, pb.i64(r[7]));
+                        codec::write_i64(arena, pb.i64(r[2]));
                         arena.extend_from_slice(b",\"author\":{\"username\":");
                         codec::write_str(arena, pb.bytes(au[1]).unwrap_or(b""));
                         arena.extend_from_slice(b",\"bio\":");
@@ -1160,49 +1504,6 @@ impl ReadWorker {
             }
         }
 
-        let mut cached_cmts: Vec<Option<Vec<CachedCommentSlice>>> = Vec::with_capacity(self.k_cmts.len());
-        if let Some(s) = st_cmts {
-            let cmt_rows = pa.result_rows(s);
-            for row_indices in &grp_cmts {
-                if row_indices.is_empty() {
-                    cached_cmts.push(None);
-                    continue;
-                }
-                let mut rows: Vec<&[Cell]> = row_indices
-                    .iter()
-                    .map(|&i| pa.row(cmt_rows[i]))
-                    .filter(|r| r[2].len >= 0 && r[7].len >= 0)
-                    .collect();
-                rows.sort_unstable_by(|a, b| (pa.i64(b[4]), pa.i64(b[2])).cmp(&(pa.i64(a[4]), pa.i64(a[2]))));
-                let mut list = Vec::with_capacity(rows.len());
-                for r in rows {
-                    let start = arena.len() as u32;
-                    arena.extend_from_slice(b"{\"id\":");
-                    codec::write_i64(arena, pa.i64(r[2]));
-                    arena.extend_from_slice(b",\"createdAt\":");
-                    codec::write_timestamp(arena, pa.i64(r[4]));
-                    arena.extend_from_slice(b",\"updatedAt\":");
-                    codec::write_timestamp(arena, pa.i64(r[5]));
-                    arena.extend_from_slice(b",\"body\":");
-                    codec::write_str(arena, pa.bytes(r[3]).unwrap_or(b""));
-                    arena.extend_from_slice(b",\"author\":{\"username\":");
-                    codec::write_str(arena, pa.bytes(r[7]).unwrap_or(b""));
-                    arena.extend_from_slice(b",\"bio\":");
-                    codec::write_nullable_str(arena, pa.bytes(r[8]));
-                    arena.extend_from_slice(b",\"image\":");
-                    codec::write_nullable_str(arena, pa.bytes(r[9]));
-                    arena.extend_from_slice(b",\"following\":");
-                    let end = arena.len() as u32;
-                    list.push(CachedCommentSlice {
-                        author_id: pa.i64(r[6]),
-                        start,
-                        end,
-                    });
-                }
-                cached_cmts.push(Some(list));
-            }
-        }
-
         let render_ctx = RenderCtx {
             cached_arts: &self.cached_arts,
             arena,
@@ -1212,10 +1513,7 @@ impl ReadWorker {
             foll_viewer_mask,
         };
 
-        let mut rendered_tags: Option<Arc<[u8]>> = None;
-        let mut rendered_profiles: Vec<Option<Arc<[u8]>>> = vec![None; self.k_prof.len()];
         let mut rendered_slugs: Vec<Option<Arc<[u8]>>> = vec![None; self.k_slug.len()];
-        let mut rendered_cmts: Vec<Option<Arc<[u8]>>> = vec![None; self.k_cmts.len()];
         let mut rendered_global: Vec<Option<Arc<[u8]>>> = vec![None; global_pages.len()];
         let mut rendered_filters: [Vec<Option<Arc<[u8]>>>; 3] = [
             vec![None; filter_results[0].1.len()],
@@ -1228,116 +1526,62 @@ impl ReadWorker {
             let viewer = task.viewer;
             let addr = task.addr;
             match slot {
-                PlanSlot::Tags => {
-                    let shared = if let Some(cached) = &rendered_tags {
-                        cached.clone()
-                    } else {
-                        let s = st_tags.unwrap();
-                        let mut buf = Vec::with_capacity(4096);
-                        buf.extend_from_slice(b"{\"tags\":[");
-                        for (i, &span) in pa.result_rows(s).iter().enumerate() {
-                            if i > 0 {
-                                buf.push(b',');
-                            }
-                            codec::write_str(&mut buf, pa.bytes(pa.row(span)[1]).unwrap_or(b""));
-                        }
-                        buf.extend_from_slice(b"]}");
-                        let arc: Arc<[u8]> = buf.into();
-                        rendered_tags = Some(arc.clone());
-                        arc
-                    };
-                    replies.push(OutgoingReply {
-                        addr,
-                        status: 200,
-                        body: ReplyBody::Shared(shared),
-                    });
-                }
-                PlanSlot::User(k) => {
-                    let ReadOp::CurrentUser { token, .. } = task.op else {
-                        unreachable!()
-                    };
-                    match grp_uid[k as usize].first() {
+                PlanSlot::Tags | PlanSlot::User(_) | PlanSlot::Login(_) => {}
+                PlanSlot::Profile(k) => {
+                    if viewer == 0 {
+                        continue;
+                    }
+                    match grp_prof[k as usize].first() {
                         Some(&row_i) => {
-                            let r = pa.row(pa.result_rows(st_uid.unwrap())[row_i]);
-                            let mut body = Vec::with_capacity(512);
-                            write_user_envelope(
+                            let r = pa.row(pa.result_rows(st_prof.unwrap())[row_i]);
+                            let following = render_ctx.is_following(viewer, pa.i64(r[1]));
+                            if !following {
+                                if let Some(shared) = &rendered_profiles[k as usize] {
+                                    replies.push(OutgoingReply {
+                                        addr,
+                                        status: 200,
+                                        body: ReplyBody::Shared(shared.clone()),
+                                    });
+                                    continue;
+                                }
+                            }
+                            let mut body = Vec::with_capacity(256);
+                            body.extend_from_slice(b"{\"profile\":");
+                            write_profile_json(
                                 &mut body,
-                                pa.bytes(r[3]).unwrap_or(b""),
-                                token.as_bytes(),
                                 pa.bytes(r[2]).unwrap_or(b""),
+                                pa.bytes(r[3]),
                                 pa.bytes(r[4]),
-                                pa.bytes(r[5]),
+                                following,
                             );
+                            body.push(b'}');
+                            let reply_body = if !following {
+                                let arc: Arc<[u8]> = body.into();
+                                rendered_profiles[k as usize] = Some(arc.clone());
+                                ReplyBody::Shared(arc)
+                            } else {
+                                ReplyBody::Owned(body)
+                            };
                             replies.push(OutgoingReply {
                                 addr,
                                 status: 200,
-                                body: ReplyBody::Owned(body),
+                                body: reply_body,
                             });
                         }
-                        None => replies.push(reactor::error_reply(addr, 401, "unauthorized")),
+                        None => replies.push(reactor::error_reply(addr, 404, "profile not found")),
                     }
                 }
-                PlanSlot::Login(_) => {}
-                PlanSlot::Profile(k) => match grp_prof[k as usize].first() {
-                    Some(&row_i) => {
-                        let r = pa.row(pa.result_rows(st_prof.unwrap())[row_i]);
-                        let following = viewer != 0 && render_ctx.is_following(viewer, pa.i64(r[1]));
-                        if !following {
-                            if let Some(shared) = &rendered_profiles[k as usize] {
-                                replies.push(OutgoingReply {
-                                    addr,
-                                    status: 200,
-                                    body: ReplyBody::Shared(shared.clone()),
-                                });
-                                continue;
-                            }
-                        }
-                        let mut body = Vec::with_capacity(256);
-                        body.extend_from_slice(b"{\"profile\":");
-                        write_profile_json(
-                            &mut body,
-                            pa.bytes(r[2]).unwrap_or(b""),
-                            pa.bytes(r[3]),
-                            pa.bytes(r[4]),
-                            following,
-                        );
-                        body.push(b'}');
-                        let reply_body = if !following {
-                            let arc: Arc<[u8]> = body.into();
-                            rendered_profiles[k as usize] = Some(arc.clone());
-                            ReplyBody::Shared(arc)
-                        } else {
-                            ReplyBody::Owned(body)
-                        };
-                        replies.push(OutgoingReply {
-                            addr,
-                            status: 200,
-                            body: reply_body,
-                        });
-                    }
-                    None => replies.push(reactor::error_reply(addr, 404, "profile not found")),
-                },
-                PlanSlot::BySlug(k) | PlanSlot::ById(k) => {
-                    let (item, status, is_slug) = match slot {
-                        PlanSlot::BySlug(_) => (slug_rows[k as usize], 200, true),
-                        PlanSlot::ById(_) => {
-                            let ReadOp::ArticleById { status, .. } = task.op else {
-                                unreachable!()
-                            };
-                            (id_rows[k as usize], status, false)
-                        }
-                        _ => unreachable!(),
-                    };
-                    let Some(art) = item else {
+                PlanSlot::BySlug(k) => {
+                    let Some(art) = slug_rows[k as usize] else {
                         replies.push(reactor::error_reply(addr, 404, "article not found"));
                         continue;
                     };
-                    let unflagged = is_slug && render_ctx.is_article_unflagged(art, viewer);
+                    let unflagged = render_ctx.is_article_unflagged(art, viewer);
                     if unflagged {
                         if let Some(shared) = &rendered_slugs[k as usize] {
                             replies.push(OutgoingReply {
                                 addr,
-                                status,
+                                status: 200,
                                 body: ReplyBody::Shared(shared.clone()),
                             });
                             continue;
@@ -1345,7 +1589,7 @@ impl ReadWorker {
                     }
                     let mut body = Vec::with_capacity(2048);
                     body.extend_from_slice(b"{\"article\":");
-                    if render_ctx.write_article(&mut body, pa, art, true, viewer, false) {
+                    if render_ctx.write_article(&mut body, pa, art, true, viewer, false, None) {
                         body.push(b'}');
                         let reply_body = if unflagged {
                             let arc: Arc<[u8]> = body.into();
@@ -1356,19 +1600,40 @@ impl ReadWorker {
                         };
                         replies.push(OutgoingReply {
                             addr,
-                            status,
+                            status: 200,
                             body: reply_body,
                         });
                     } else {
                         replies.push(reactor::error_reply(addr, 404, "article not found"));
                     }
                 }
+                PlanSlot::ById(k, known_fav) => {
+                    let Some(art) = aid_rows[k as usize] else {
+                        replies.push(reactor::error_reply(addr, 404, "article not found"));
+                        continue;
+                    };
+                    let mut body = Vec::with_capacity(2048);
+                    body.extend_from_slice(b"{\"article\":");
+                    if render_ctx.write_article(&mut body, pa, art, true, viewer, false, known_fav) {
+                        body.push(b'}');
+                        replies.push(OutgoingReply {
+                            addr,
+                            status: 200,
+                            body: ReplyBody::Owned(body),
+                        });
+                    } else {
+                        replies.push(reactor::error_reply(addr, 404, "article not found"));
+                    }
+                }
                 PlanSlot::Comments(k) => {
+                    if viewer == 0 {
+                        continue;
+                    }
                     let Some(list) = &cached_cmts[k as usize] else {
                         replies.push(reactor::error_reply(addr, 404, "article not found"));
                         continue;
                     };
-                    let unflagged = viewer == 0 || list.iter().all(|c| !render_ctx.is_following(viewer, c.author_id));
+                    let unflagged = list.iter().all(|c| !render_ctx.is_following(viewer, c.author_id));
                     if unflagged {
                         if let Some(shared) = &rendered_cmts[k as usize] {
                             replies.push(OutgoingReply {
@@ -1439,7 +1704,15 @@ impl ReadWorker {
                         if !first {
                             body.push(b',');
                         }
-                        if render_ctx.write_article(&mut body, pa, art, false, if unflagged { 0 } else { viewer }, is_feed) {
+                        if render_ctx.write_article(
+                            &mut body,
+                            pa,
+                            art,
+                            false,
+                            if unflagged { 0 } else { viewer },
+                            is_feed,
+                            None,
+                        ) {
                             first = false;
                         } else {
                             body.truncate(mark);
@@ -1468,7 +1741,9 @@ impl ReadWorker {
             }
         }
 
-        reactor::complete_batch(replies);
+        if !replies.is_empty() {
+            reactor::complete_batch(replies);
+        }
         Ok(())
     }
 }
@@ -1506,6 +1781,7 @@ impl RenderCtx<'_> {
     }
 
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn write_article(
         &self,
         dst: &mut Vec<u8>,
@@ -1514,14 +1790,15 @@ impl RenderCtx<'_> {
         include_body: bool,
         viewer: i64,
         known_following: bool,
+        known_fav: Option<bool>,
     ) -> bool {
         let Some(slices) = self.cached_arts.get(art.art_ord as usize) else {
             return false;
         };
         if !slices.ready {
             return false;
-        }
-        let fav = viewer != 0 && self.is_favorited(viewer, art.aid);
+        };
+        let fav = known_fav.unwrap_or_else(|| viewer != 0 && self.is_favorited(viewer, art.aid));
         let foll = known_following || (viewer != 0 && self.is_following(viewer, art.author));
         if !include_body {
             dst.extend_from_slice(&self.arena[slices.head_start as usize..slices.mid_end as usize]);
@@ -1532,7 +1809,7 @@ impl RenderCtx<'_> {
             let ar = pa.row(art.row);
             dst.extend_from_slice(&self.arena[slices.head_start as usize..slices.head_end as usize]);
             dst.extend_from_slice(b",\"body\":");
-            codec::write_str(dst, pa.bytes(ar[3]).unwrap_or(b""));
+            codec::write_str(dst, pa.bytes(ar[8]).unwrap_or(b""));
             dst.extend_from_slice(&self.arena[slices.head_end as usize..slices.mid_end as usize]);
             dst.extend_from_slice(if fav { b"true" } else { b"false" });
             dst.extend_from_slice(&self.arena[slices.mid_end as usize..slices.tail_end as usize]);
@@ -1752,9 +2029,15 @@ impl WriteWorker {
 
         let is_single_task = tasks.len() == 1;
         let has_slug_mutation = !is_single_task
-            && tasks
-                .iter()
-                .any(|t| matches!(t.op, WriteOp::UpdateArticle { .. } | WriteOp::DeleteArticle { .. }));
+            && tasks.iter().any(|t| {
+                matches!(
+                    t.op,
+                    WriteOp::CreateArticle { .. }
+                        | WriteOp::UpdateArticle { .. }
+                        | WriteOp::DeleteArticle { .. }
+                        | WriteOp::UpdateUser { .. }
+                )
+            });
 
         let mut fav_on_jobs: Vec<(i64, &str)> = Vec::new();
         let mut fav_off_jobs: Vec<(i64, &str)> = Vec::new();
@@ -1790,36 +2073,6 @@ impl WriteWorker {
 
         let mut n_exec = 0usize;
 
-        let slot_fav_on = if batch_fav_on {
-            let s = n_exec;
-            n_exec += 1;
-            conn.tx.bind_and_exec(
-                "fav_batch",
-                &[
-                    BindParam::Raw(&encode_i64_array(fav_on_jobs.iter().map(|x| x.0))),
-                    BindParam::Raw(&encode_text_array(fav_on_jobs.iter().map(|x| x.1.as_bytes()))),
-                ],
-            );
-            Some(s)
-        } else {
-            None
-        };
-
-        let slot_fav_off = if batch_fav_off {
-            let s = n_exec;
-            n_exec += 1;
-            conn.tx.bind_and_exec(
-                "unfav_batch",
-                &[
-                    BindParam::Raw(&encode_i64_array(fav_off_jobs.iter().map(|x| x.0))),
-                    BindParam::Raw(&encode_text_array(fav_off_jobs.iter().map(|x| x.1.as_bytes()))),
-                ],
-            );
-            Some(s)
-        } else {
-            None
-        };
-
         let slot_foll_on = if batch_foll_on {
             let s = n_exec;
             n_exec += 1;
@@ -1843,6 +2096,36 @@ impl WriteWorker {
                 &[
                     BindParam::Raw(&encode_i64_array(foll_off_jobs.iter().map(|x| x.0))),
                     BindParam::Raw(&encode_text_array(foll_off_jobs.iter().map(|x| x.1.as_bytes()))),
+                ],
+            );
+            Some(s)
+        } else {
+            None
+        };
+
+        let slot_fav_on = if batch_fav_on {
+            let s = n_exec;
+            n_exec += 1;
+            conn.tx.bind_and_exec(
+                "fav_batch",
+                &[
+                    BindParam::Raw(&encode_i64_array(fav_on_jobs.iter().map(|x| x.0))),
+                    BindParam::Raw(&encode_text_array(fav_on_jobs.iter().map(|x| x.1.as_bytes()))),
+                ],
+            );
+            Some(s)
+        } else {
+            None
+        };
+
+        let slot_fav_off = if batch_fav_off {
+            let s = n_exec;
+            n_exec += 1;
+            conn.tx.bind_and_exec(
+                "unfav_batch",
+                &[
+                    BindParam::Raw(&encode_i64_array(fav_off_jobs.iter().map(|x| x.0))),
+                    BindParam::Raw(&encode_text_array(fav_off_jobs.iter().map(|x| x.1.as_bytes()))),
                 ],
             );
             Some(s)
@@ -1930,19 +2213,6 @@ impl WriteWorker {
         }
 
         let pipe = &self.pipe;
-        let decode_ord_i64 = |slot: Option<usize>, len: usize| -> Vec<Option<i64>> {
-            let mut out = vec![None; len];
-            if let Some(s) = slot {
-                for &span in pipe.result_rows(s) {
-                    let r = pipe.row(span);
-                    let k = pipe.i64(r[0]);
-                    if k >= 1 && (k as usize) <= len {
-                        out[k as usize - 1] = Some(pipe.i64(r[1]));
-                    }
-                }
-            }
-            out
-        };
         let decode_ord_rows = |slot: Option<usize>, len: usize| -> Vec<Option<&[Cell]>> {
             let mut out = vec![None; len];
             if let Some(s) = slot {
@@ -1956,8 +2226,8 @@ impl WriteWorker {
             }
             out
         };
-        let fav_on_res = decode_ord_i64(slot_fav_on, c_fav_on);
-        let fav_off_res = decode_ord_i64(slot_fav_off, c_fav_off);
+        let fav_on_res = decode_ord_rows(slot_fav_on, c_fav_on);
+        let fav_off_res = decode_ord_rows(slot_fav_off, c_fav_off);
         let foll_on_res = decode_ord_rows(slot_foll_on, c_foll_on);
         let foll_off_res = decode_ord_rows(slot_foll_off, c_foll_off);
         let cmt_res = decode_ord_rows(slot_cmt, c_cmt);
@@ -1970,17 +2240,22 @@ impl WriteWorker {
                     finalize_write_task(task, pipe, start, count, self.cfg, &mut replies, &mut post_reads);
                 }
                 WriteDispatchLoc::BatchedFav { on, ord } => {
-                    let aid = if on {
+                    let row = if on {
                         fav_on_res[ord - 1]
                     } else {
                         fav_off_res[ord - 1]
                     };
-                    match aid {
-                        Some(id) => post_reads.push(ReadTask {
-                            op: ReadOp::ArticleById { id, status: 200 },
-                            viewer: task.viewer,
-                            addr: task.addr,
-                        }),
+                    match row {
+                        Some(r) => {
+                            post_reads.push(ReadTask {
+                                op: ReadOp::ArticleById {
+                                    id: pipe.i64(r[1]),
+                                    known_fav: Some(on),
+                                },
+                                viewer: task.viewer,
+                                addr: task.addr,
+                            });
+                        }
                         None => replies.push(reactor::error_reply(task.addr, 404, "article not found")),
                     }
                 }
@@ -2150,38 +2425,68 @@ fn finalize_write_task(
             }
             None => replies.push(reactor::error_reply(addr, 404, "profile not found")),
         },
-        WriteOp::Favorite { .. } => match first_row {
-            Some(r) => post_reads.push(ReadTask {
-                op: ReadOp::ArticleById {
-                    id: pipe.i64(r[0]),
-                    status: 200,
-                },
-                viewer,
-                addr,
-            }),
+        WriteOp::Favorite { on, .. } => match first_row {
+            Some(r) => {
+                post_reads.push(ReadTask {
+                    op: ReadOp::ArticleById {
+                        id: pipe.i64(r[0]),
+                        known_fav: Some(on),
+                    },
+                    viewer,
+                    addr,
+                });
+            }
             None => replies.push(reactor::error_reply(addr, 404, "article not found")),
         },
-        WriteOp::CreateArticle { .. } => match first_row {
-            Some(r) => post_reads.push(ReadTask {
-                op: ReadOp::ArticleById {
-                    id: pipe.i64(r[0]),
+        WriteOp::CreateArticle {
+            title,
+            description,
+            body: art_body,
+            tags,
+        } => match first_row {
+            Some(r) => {
+                let mut local_tags: Vec<&[u8]> = tags.iter().map(|s| s.as_bytes()).collect();
+                if local_tags.len() > 1 {
+                    local_tags.sort_unstable();
+                    local_tags.dedup();
+                }
+                let mut body = Vec::with_capacity(2048);
+                write_full_article_envelope(
+                    &mut body,
+                    pipe.bytes(r[0]).unwrap_or(b""),
+                    title.as_bytes(),
+                    description.as_bytes(),
+                    art_body.as_bytes(),
+                    &local_tags,
+                    pipe.i64(r[1]),
+                    pipe.i64(r[2]),
+                    false,
+                    0,
+                    pipe.bytes(r[3]).unwrap_or(b""),
+                    pipe.bytes(r[4]),
+                    pipe.bytes(r[5]),
+                    pipe.bool(r[6]),
+                );
+                replies.push(OutgoingReply {
+                    addr,
                     status: 201,
-                },
-                viewer,
-                addr,
-            }),
+                    body: ReplyBody::Owned(body),
+                });
+            }
             None => replies.push(reactor::error_reply(addr, 500, "internal server error")),
         },
         WriteOp::UpdateArticle { .. } => match first_row {
             Some(r) if pipe.i64(r[1]) != viewer => replies.push(reactor::error_reply(addr, 403, "forbidden")),
-            Some(r) => post_reads.push(ReadTask {
-                op: ReadOp::ArticleById {
-                    id: pipe.i64(r[0]),
-                    status: 200,
-                },
-                viewer,
-                addr,
-            }),
+            Some(r) => {
+                post_reads.push(ReadTask {
+                    op: ReadOp::ArticleById {
+                        id: pipe.i64(r[0]),
+                        known_fav: None,
+                    },
+                    viewer,
+                    addr,
+                });
+            }
             None => replies.push(reactor::error_reply(addr, 404, "article not found")),
         },
         WriteOp::DeleteArticle { .. } => match first_row {
