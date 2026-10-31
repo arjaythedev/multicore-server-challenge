@@ -4,7 +4,7 @@ Every submission on the same box: **8 dedicated vCPU / 16 GB**, Postgres 18 on t
 
 | # | Users | Submission | PR | Front | req/s | p95 ms | p99 ms | CPU: app / Postgres | Note |
 |--:|--:|---|---|---|--:|--:|--:|---|---|
-| 1 | **190,000** | [rust-epoll-theCatWisel](submissions/rust-epoll-theCatWisel) | [#143](https://github.com/arjaythedev/multicore-server-challenge/pull/143) @theCatWisel | direct | 47,157 | 430 | 599 | 34% / 58% |  |
+| 1 | **190,000** | [rust-epoll-theCatWisel](submissions/rust-epoll-theCatWisel) | [#143](https://github.com/arjaythedev/multicore-server-challenge/pull/143) @theCatWisel | direct | 47,297 | 469 | 757 | 34% / 62% | Update #154 scored at a9ca94b (not merged yet; same 190,000 as merged #143). The PR's head moved to 486cd87 during the run; that commit is queued for its own run |
 | 2 | **190,000** | [zig-iouring-nick-potts](submissions/zig-iouring-nick-potts) | [#117](https://github.com/arjaythedev/multicore-server-challenge/pull/117) @nick-potts | direct | 47,649 | 461 | 746 | 36% / 58% |  |
 | 3 | **180,000** | [rust-epoll-WorriedArrow](submissions/rust-epoll-WorriedArrow) | [#139](https://github.com/arjaythedev/multicore-server-challenge/pull/139) @WorriedArrow | direct | 44,659 | 492 | 803 | 35% / 60% |  |
 | 4 | **170,000** | [kotlin-native-luben93](submissions/kotlin-native-luben93) | [#151](https://github.com/arjaythedev/multicore-server-challenge/pull/151) @luben93 | direct | 42,272 | 500 | 655 | 33% / 65% |  |
