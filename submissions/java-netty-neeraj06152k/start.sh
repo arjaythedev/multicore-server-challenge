@@ -39,6 +39,18 @@ if [ -z "$JAVA" ] || [ ! -x "$JAVA" ]; then
   exit 1
 fi
 
+# Assert Java version 25
+JAVA_VER="$("$JAVA" -version 2>&1 | awk -F '"' '/version/ {print $2}')"
+case "$JAVA_VER" in
+  25*)
+    echo "Running with JDK 25: $JAVA ($JAVA_VER)"
+    ;;
+  *)
+    echo "Error: Java 25 required, but found '$JAVA_VER' at $JAVA." >&2
+    exit 1
+    ;;
+esac
+
 JAR="$HERE/target/conduit.jar"
 if [ ! -f "$JAR" ]; then
   echo "Error: $JAR not found. Run build.sh first." >&2

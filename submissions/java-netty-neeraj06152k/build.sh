@@ -39,6 +39,18 @@ if [ -z "$JAVA" ] || [ ! -x "$JAVA" ]; then
   exit 1
 fi
 
+# Assert Java version 25
+JAVA_VER="$("$JAVA" -version 2>&1 | awk -F '"' '/version/ {print $2}')"
+case "$JAVA_VER" in
+  25*)
+    echo "Verified JDK 25: $JAVA ($JAVA_VER)"
+    ;;
+  *)
+    echo "Error: Java 25 required, but found '$JAVA_VER' at $JAVA." >&2
+    exit 1
+    ;;
+esac
+
 # Ensure bin is on PATH for child processes
 if [ -n "${JAVA_HOME:-}" ] && [ -d "$JAVA_HOME/bin" ]; then
   export PATH="$JAVA_HOME/bin:${PATH}"

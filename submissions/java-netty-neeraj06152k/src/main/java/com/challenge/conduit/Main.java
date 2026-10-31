@@ -32,7 +32,8 @@ public final class Main {
         // 1. Load configuration (config.properties + environment variable overrides)
         ServerConfig config = ServerConfig.load();
 
-        System.out.println("Starting Conduit Server [java-netty-neeraj06152k] on " + config.host() + ":" + config.port());
+        System.out.println("Starting Conduit Server [java-netty-neeraj06152k] on " + config.host() + ":" + config.port()
+                + " [JVM: " + System.getProperty("java.vm.name") + " " + System.getProperty("java.version") + "]");
         System.out.println("DB URL: " + config.databaseUrl() + " (pool: " + config.dbPoolMaxSize() + ", pipelining: " + config.dbPipeliningLimit() + ")");
 
         // 2. Initialize Security & Concurrency Worker Pools
