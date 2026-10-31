@@ -41,7 +41,7 @@ official `conduit-loadgen` and the scoring scripts. To check the rig, the curren
 
 | Version | Result on the rig |
 |---|---|
-| first version of this PR | 110,000 users held for 5 minutes (120,000 failed on p95 544 ms) |
+| first merged version (#120) | 110,000 users held for 5 minutes (120,000 failed on p95 544 ms). The official run scored 100,000, and its 250,000-user probe stalled the accept loop, see below. |
 | set-based tag and favorite enrichment, feed shortcut | 110,000 (a 120,000 one-minute probe passed, the hold failed on p95 650 ms) |
 | per-kind read queues, bcrypt in `SCHED_IDLE`, no quadratic page scan | a 128,000 probe passed with p95 112 ms and 0.04% errors; a 135,000 run of 90 s had p95 96 ms and 14% idle CPU. The 5-minute hold was not run. |
 
