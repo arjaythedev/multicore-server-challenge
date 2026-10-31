@@ -19,6 +19,8 @@ use crate::pg::Config as PgConfig;
 use super::queue::ReadQueue;
 use super::runner::{Health, Runner};
 use super::session::{Db, RETRY_BACKOFF, SESSION_OPTIONS, START_PATIENCE};
+use super::stats::READ_STATS;
+use std::time::Instant;
 
 /// Starts `count` lanes. Each connects on its own thread, so the caller does not wait for the database.
 pub fn spawn_lanes(
@@ -73,7 +75,9 @@ impl Lane {
             .ok();
         let mut batch: Vec<ReadJob> = Vec::new();
         loop {
+            let started = Instant::now();
             self.queue.take_batch(&mut batch);
+            let taken = Instant::now();
             if db.is_none() {
                 db = Db::open(&self.pg, SESSION_OPTIONS)
                     .map_err(|e| eprintln!("read lane reconnect: {e}"))
@@ -94,7 +98,9 @@ impl Lane {
                     std::thread::sleep(RETRY_BACKOFF);
                 }
             }
+            let jobs = batch.len();
             self.runner.deliver(&mut batch, &self.mailboxes);
+            READ_STATS.record(jobs, taken - started, taken.elapsed());
         }
     }
 }

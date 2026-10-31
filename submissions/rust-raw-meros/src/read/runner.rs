@@ -12,6 +12,7 @@ use crate::pool::POOL;
 use super::articles::{Articles, GroupCtx};
 use super::comments::Comments;
 use super::error::ReadError;
+use super::feed::FeedBatch;
 use super::plan::Plan;
 use super::scratch::recycle;
 use super::simple::{self, PasswordSink};
@@ -37,6 +38,7 @@ pub struct Runner {
     plan: Plan,
     sink: Sink,
     shapes: Shapes,
+    feed: FeedBatch,
     tag_names: Vec<&'static str>,
     tag_ranks: IdTable,
     tags_body: Vec<u8>,
@@ -59,6 +61,7 @@ impl Runner {
         self.plan.footprint()
             + self.shapes.articles.footprint()
             + self.shapes.comments.footprint()
+            + self.feed.footprint()
             + self.tag_ranks.footprint()
             + self.tag_names.capacity() * 16
             + self.tags_body.capacity()
@@ -145,9 +148,31 @@ impl Runner {
                 Health::Good
             };
         }
+        let health = self.feed_second_round(conn, stmts, jobs);
         self.answer_groups(jobs, passwords);
         self.results.shrink_if_above(KEEP_RESULT_BYTES);
-        Health::Good
+        self.feed.shrink();
+        health
+    }
+
+    /// The feed's phase B (see `feed.rs`): the only statement that depends on the rows of another one.
+    fn feed_second_round(
+        &mut self,
+        conn: &mut Connection,
+        stmts: &Statements,
+        jobs: &[ReadJob],
+    ) -> Health {
+        let members = self.plan.members(Group::Feed);
+        let phase_a = self
+            .plan
+            .statement_of(Group::Feed)
+            .map(|at| self.results.statement(at));
+        let usable = self.feed.second_round(conn, stmts, phase_a, members, jobs);
+        if usable {
+            Health::Good
+        } else {
+            Health::Poisoned
+        }
     }
 
     fn answer_groups(&mut self, jobs: &mut [ReadJob], passwords: &dyn PasswordSink) {
@@ -156,6 +181,7 @@ impl Runner {
             plan,
             sink,
             shapes,
+            feed,
             tag_names,
             tag_ranks,
             tags_body,
@@ -173,7 +199,16 @@ impl Runner {
                 continue;
             }
             sink.begin_group(members.len());
-            let stmt = plan.statement_of(group).map(|at| results.statement(at));
+            let mut stmt = plan.statement_of(group).map(|at| results.statement(at));
+            if group == Group::Feed {
+                if let Some(status) = feed.failure() {
+                    for &job in members {
+                        sink.error(jobs[job as usize].origin, status, "database unavailable");
+                    }
+                    continue;
+                }
+                stmt = feed.answer(stmt);
+            }
             if let Some(error) = stmt.and_then(|s| s.error()) {
                 eprintln!("read lane: {group:?} statement failed: {error}");
                 if members.len() > 1 {
