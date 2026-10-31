@@ -59,6 +59,10 @@ public final class PostgresClient {
         return pool.preparedQuery(sql).execute(tuple);
     }
 
+    public Future<Void> checkConnection() {
+        return pool.query("SELECT 1").execute().mapEmpty();
+    }
+
     public PgPool pool() {
         return pool;
     }

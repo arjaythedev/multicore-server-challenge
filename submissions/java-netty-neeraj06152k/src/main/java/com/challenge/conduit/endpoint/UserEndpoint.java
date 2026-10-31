@@ -49,6 +49,7 @@ public final class UserEndpoint {
                     req.send(HttpResponseStatus.CREATED, buf);
                 } else {
                     Throwable cause = ar.cause();
+                    System.err.println("User register database query failed: " + cause);
                     ByteBuf errBuf = req.alloc();
                     if (cause instanceof PgException pgEx && "23505".equals(pgEx.getCode())) {
                         JsonStreamer.writeError(errBuf, "Username or email is already taken");

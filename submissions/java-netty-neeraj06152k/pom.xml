@@ -47,6 +47,12 @@
             <artifactId>vertx-core</artifactId>
             <version>4.5.14</version>
         </dependency>
+        <!-- SCRAM-SHA-256 Authentication Support for PostgreSQL 18 -->
+        <dependency>
+            <groupId>com.ongres.scram</groupId>
+            <artifactId>client</artifactId>
+            <version>2.1</version>
+        </dependency>
     </dependencies>
 
     <build>

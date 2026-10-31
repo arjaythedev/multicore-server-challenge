@@ -52,6 +52,7 @@ public final class TagsEndpoint {
                             temp.release();
                         }
                     } else {
+                        System.err.println("GET /api/tags query failed: " + ar.cause());
                         ByteBuf temp = req.alloc();
                         try {
                             JsonStreamer.writeEmptyTags(temp);

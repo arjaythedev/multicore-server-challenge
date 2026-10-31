@@ -52,6 +52,9 @@ public final class Main {
                 config.dbPipeliningLimit(),
                 config.dbCachePreparedStatements()
         );
+        pgClient.checkConnection().onFailure(err -> {
+            System.err.println("WARN: PostgreSQL connection check failed: " + err.getMessage());
+        });
 
         // 5. Netty Server setup (Thread-per-core)
         boolean useEpoll = Epoll.isAvailable() && config.soReusePort();
