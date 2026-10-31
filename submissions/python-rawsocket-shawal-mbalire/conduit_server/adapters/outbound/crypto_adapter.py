@@ -13,7 +13,7 @@ import warnings
 import bcrypt
 import jwt
 
-from conduit_server.ports.outbound import CryptoPort
+from conduit_server.ports.outbound import PasswordHasherPort, TokenPort
 
 _HS256 = "HS256"
 _EXP_30_DAYS_SECONDS = 30 * 24 * 3600
@@ -229,23 +229,9 @@ class BcryptBatcher:
             os.eventfd_write(self.efd, 1)
 
 
-class JoseBcryptCryptoAdapter(CryptoPort):
-    def __init__(self, secret_key: str):
-        self._secret = secret_key
-        self._key = secret_key.encode("utf-8")
-        base = hmac.new(self._key, digestmod=hashlib.sha256)
-        # the C HMAC object inside the stdlib wrapper (same copy/update/digest): the wrapper's Python copy() cost
-        # ~0.4 µs per token
-        self._base_hmac = getattr(base, "_hmac", None) or base
-        # PyJWT's header for every HS256 token we issue: a token carrying exactly this segment needs no decoding
-        with warnings.catch_warnings():  # PyJWT warns about short keys; the secret is given by the spec
-            warnings.simplefilter("ignore")
-            hdr = jwt.encode({}, secret_key, algorithm=_HS256).partition(".")[0]
-        self._hs256_header = hdr
-        self._hs256_header_b = hdr.encode("ascii")
-        self._hs256_prefix_b = self._hs256_header_b + b"."
-        if _jwt_native is not None:
-            _jwt_native.init(self._key, self._hs256_header_b)  # process-wide: one secret per server
+class BcryptPasswordHasher(PasswordHasherPort):
+    """bcrypt cost 10: libxcrypt through ctypes (pyca/bcrypt as fallback); logins as BcryptJobs, which the broker
+    hashes together on the multi-lane bcrypt (`batcher`)."""
 
     def hash_password(self, password: str) -> str:
         pw = password.encode("utf-8")
@@ -276,6 +262,32 @@ class JoseBcryptCryptoAdapter(CryptoPort):
         if len(pw) > _MAX_PASSWORD:
             return BcryptJob(b"", stored, _false)
         return BcryptJob(pw, stored, lambda computed: computed is not None and hmac.compare_digest(computed, stored))
+
+    @staticmethod
+    def batcher(threads: int, wait: float) -> "BcryptBatcher":
+        """The broker's bcrypt threads for the BcryptJobs that q_verify_password returns."""
+        return BcryptBatcher(threads, wait)
+
+
+class Hs256TokenService(TokenPort):
+    """HS256 JWTs: issued with stdlib HMAC, verified in C for our own form (native/jwt_verify.c) else in Python."""
+
+    def __init__(self, secret_key: str):
+        self._secret = secret_key
+        self._key = secret_key.encode("utf-8")
+        base = hmac.new(self._key, digestmod=hashlib.sha256)
+        # the C HMAC object inside the stdlib wrapper (same copy/update/digest): the wrapper's Python copy() cost
+        # ~0.4 µs per token
+        self._base_hmac = getattr(base, "_hmac", None) or base
+        # PyJWT's header for every HS256 token we issue: a token carrying exactly this segment needs no decoding
+        with warnings.catch_warnings():  # PyJWT warns about short keys; the secret is given by the spec
+            warnings.simplefilter("ignore")
+            hdr = jwt.encode({}, secret_key, algorithm=_HS256).partition(".")[0]
+        self._hs256_header = hdr
+        self._hs256_header_b = hdr.encode("ascii")
+        self._hs256_prefix_b = self._hs256_header_b + b"."
+        if _jwt_native is not None:
+            _jwt_native.init(self._key, self._hs256_header_b)  # process-wide: one secret per server
 
     def issue_token(self, user_id: int) -> str:
         now = int(time.time())
@@ -340,3 +352,80 @@ def _b64decode_b(segment: bytes) -> bytes:
     """base64url without padding. strict_mode: any character outside the alphabet is an error (the default mode
     skips them, so a signature with junk mixed in would still decode)."""
     return binascii.a2b_base64(segment.translate(_B64_DECODE_TR) + _B64_PAD[len(segment) & 3], strict_mode=True)
+
+
+# ---- alternatives (registry.py), for A/B runs -------------------------------------------------------------------
+class _InPlaceJob:
+    """A bcrypt verify computed where it's run (on the offload helper thread): hashers without a batcher."""
+
+    __slots__ = ("fn",)
+    write = False
+
+    def __init__(self, fn):
+        self.fn = fn
+
+    def run(self):
+        return self.fn()
+
+
+class LibxcryptPasswordHasher(PasswordHasherPort):
+    """PASSWORD_HASHER=libxcrypt: the OS's libxcrypt (libcrypt.so, C) one hash at a time, no multi-lane batching;
+    logins run on the offload helper thread."""
+
+    def __init__(self):
+        if _crypt_rn is None:
+            raise SystemExit("Error: PASSWORD_HASHER=libxcrypt needs libcrypt.so with crypt_rn")
+        self._inner = BcryptPasswordHasher()
+
+    def hash_password(self, password: str) -> str:
+        return self._inner.hash_password(password)
+
+    def verify_password(self, password: str, password_hash: str) -> bool:
+        return self._inner.verify_password(password, password_hash)
+
+    def q_verify_password(self, password: str, password_hash: str) -> _InPlaceJob:
+        return _InPlaceJob(lambda: self.verify_password(password, password_hash))
+
+
+class PycaPasswordHasher(PasswordHasherPort):
+    """PASSWORD_HASHER=pyca: pyca/bcrypt (Rust) for everything; logins on the offload helper thread."""
+
+    def hash_password(self, password: str) -> str:
+        pw = password.encode("utf-8")
+        if len(pw) > _MAX_PASSWORD:
+            raise ValueError("password cannot be longer than 72 bytes")
+        return bcrypt.hashpw(pw, bcrypt.gensalt(rounds=10)).decode("utf-8")
+
+    def verify_password(self, password: str, password_hash: str) -> bool:
+        pw = password.encode("utf-8")
+        if len(pw) > _MAX_PASSWORD:
+            return False
+        try:
+            return bcrypt.checkpw(pw, password_hash.encode("utf-8"))
+        except ValueError:
+            return False
+
+    def q_verify_password(self, password: str, password_hash: str) -> _InPlaceJob:
+        return _InPlaceJob(lambda: self.verify_password(password, password_hash))
+
+
+class Hs256PyTokenService(Hs256TokenService):
+    """TOKENS=hs256-py: the same tokens and checks with the stdlib's HMAC (OpenSSL), no native/jwt_verify.c."""
+
+    def verify_token(self, token: str) -> int:
+        return self._verify_token_py(token)
+
+
+class PyJwtTokenService(Hs256TokenService):
+    """TOKENS=pyjwt: PyJWT's decode (pure Python apart from the HMAC); issues the same tokens."""
+
+    def __init__(self, secret_key: str):
+        super().__init__(secret_key)
+        warnings.filterwarnings("ignore", module="jwt")  # short key: the secret is given by the spec
+
+    def verify_token(self, token: str) -> int:
+        payload = jwt.decode(token, self._secret, algorithms=[_HS256], options={"require": ["exp", "iat", "sub"]})
+        sub = payload["sub"]
+        if sub.__class__ is not str:
+            raise ValueError("sub must be a string")
+        return int(sub)

@@ -16,7 +16,8 @@ connection is busy and drain as soon as one frees up. A unit of a kind with a ba
 (`SHARED`: tags) runs once for the whole unit; anything else runs as pipelined single statements.
 
 Logins send their bcrypt here too (statement index -1, `crypto_adapter.BcryptJob`): the broker's bcrypt threads
-hash up to 6 at once on the multi-lane bcrypt (`BcryptBatcher`), 4.4x less CPU per hash than one at a time.
+(the password hasher's `batcher`, passed in by the composition root) hash up to 6 at once on the multi-lane bcrypt,
+4.4x less CPU per hash than one at a time.
 
 Writes queue the same way for the write connections, and a unit of several is one transaction (group commit, allowed
 by rule 6): BEGIN, the statements, COMMIT behind one Sync, so they share one WAL flush; each write's reply goes out
@@ -35,7 +36,6 @@ from collections import deque
 
 import psycopg
 
-from conduit_server.adapters.outbound.crypto_adapter import BcryptBatcher
 from conduit_server.adapters.outbound.pg_repository import (
     BATCHED,
     SHARED,
@@ -247,6 +247,8 @@ class Broker:
     def __init__(self, socks, conninfo: str, readers: int, writers: int, bcrypt=None):
         self.socks = list(socks)
         self.bcrypt = bcrypt  # BcryptBatcher: jobs with statement index -1
+        # BROKER_BATCH=0: every unit runs as single statements (no BATCHED/SHARED forms), for A/B runs
+        self.batch = os.getenv("BROKER_BATCH", "1") != "0"
         for s in self.socks:
             s.setblocking(False)
         self.read_pipes = [PgPipeline(conninfo) for _ in range(readers)]
@@ -379,8 +381,8 @@ class Broker:
             q = queues[best]
             stmt = _STATEMENTS[best]
             jobs = [q.popleft() for _ in range(min(len(q), MAX_UNIT))]
-            spec = BATCHED.get(best)
-            if best in SHARED and len(jobs) > 1:
+            spec = BATCHED.get(best) if self.batch else None
+            if self.batch and best in SHARED and len(jobs) > 1:
                 self._submit(pipe, _Job(stmt, (), True), [_SHARED, best, jobs])
             elif spec is not None and len(jobs) >= spec.min_size:
                 self._submit(pipe, _BatchJob(spec.stmt, spec.params([j[3] for j in jobs])), [_BATCH, best, jobs])
@@ -466,10 +468,11 @@ class Broker:
         self.pipe_state[id(pipe)] = (fd, mask)
 
 
-def serve_broker(socks, conninfo: str, readers: int, writers: int, bcrypt_threads: int = 2, bcrypt_wait: float = 0.1):
+def serve_broker(socks, conninfo: str, readers: int, writers: int, make_bcrypt=None):
+    """Run the broker in this (forked) process until it dies. make_bcrypt: builds the password hasher's batcher
+    here, after the fork, so its threads live in this process."""
     try:
-        batcher = BcryptBatcher(bcrypt_threads, bcrypt_wait)
-        Broker(socks, conninfo, readers, writers, batcher).run()
+        Broker(socks, conninfo, readers, writers, make_bcrypt() if make_bcrypt is not None else None).run()
     except BaseException:
         import traceback
 

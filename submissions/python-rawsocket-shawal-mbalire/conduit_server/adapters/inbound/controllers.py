@@ -1,12 +1,14 @@
 from typing import Tuple
 
 from conduit_server.adapters.inbound.errors import ApiError
-from conduit_server.adapters.inbound.router import HttpRequest, router
-from conduit_server.adapters.outbound.pg_repository import DuplicateError
+from conduit_server.adapters.inbound.router import router
+from conduit_server.domain.errors import DuplicateError
 from conduit_server.domain.models import UserData, UserResponse, Empty
 from conduit_server.domain import services
+from conduit_server.ports.inbound import HttpRequest
 
-# Controllers use the db and crypto ports injected from main.py.
+# Controllers use the ports injected from main.py (repository, password hasher, tokens, JSON codec); they import no
+# outbound adapter.
 # Every route but the three bcrypt ones is a generator: `body = yield db.q_...(...)` hands the query to the server,
 # which runs it pipelined (the worker keeps serving meanwhile) and resumes the handler with its result. Those
 # results are finished JSON bodies built by Postgres (the response shapes are in domain/models.py and checked by
@@ -15,16 +17,20 @@ from conduit_server.domain import services
 
 # Injected at startup by main.py (composition root).
 db = None  # type: ArticleRepositoryPort — no caching; every call hits Postgres
-crypto = None  # type: CryptoPort
+passwords = None  # type: PasswordHasherPort
+tokens = None  # type: TokenPort
+_loads = None  # JsonCodecPort.loads
 
 
 _MAX_BIGINT = 2**63 - 1
 
 
-def bootstrap(article_repository, crypto_adapter):
-    global db, crypto
-    db = article_repository
-    crypto = crypto_adapter
+def bootstrap(repository, password_hasher, token_service, json_codec):
+    global db, passwords, tokens, _loads
+    db = repository
+    passwords = password_hasher
+    tokens = token_service
+    _loads = json_codec.loads
 
 
 # ---- shared helpers -------------------------------------------------------
@@ -42,13 +48,31 @@ def _viewer(request: HttpRequest, required: bool) -> int:
         return 0
     token = header[len("Token ") :]
     try:
-        return crypto.verify_token(token)
+        return tokens.verify_token(token)
     except Exception:
         raise ApiError(401, "Invalid token")
 
 
 def _token(request: HttpRequest) -> str:
     return request.headers.get("authorization", "").removeprefix("Token ")
+
+
+def _body(request: HttpRequest):
+    if not request.body:
+        return {}
+    try:
+        return _loads(request.body)
+    except (ValueError, UnicodeDecodeError):
+        raise ApiError(422, "Invalid JSON body")
+
+
+def _wrapped(request: HttpRequest, outer: str) -> dict:
+    """{outer: {...}} — missing/not-a-dict wrapper is 422."""
+    body = _body(request)
+    payload = body.get(outer) if isinstance(body, dict) else None
+    if not isinstance(payload, dict):
+        raise ApiError(422, f"{outer} is required")
+    return payload
 
 
 def _paging(query: dict) -> Tuple[int, int]:
@@ -73,7 +97,7 @@ def _user_data(row: dict, token: str) -> UserData:
 
 @router.post("/api/users", offload=True)  # bcrypt hash
 def register(request: HttpRequest):
-    body = request.json()
+    body = _body(request)
     try:
         services.require_strings(body, "user", "username", "email", "password")
     except ValueError:
@@ -82,20 +106,20 @@ def register(request: HttpRequest):
 
     try:
         row = db.register_user(
-            user["username"], user["email"], crypto.hash_password(user["password"])
+            user["username"], user["email"], passwords.hash_password(user["password"])
         )
     except DuplicateError:
         raise ApiError(422, "duplicate username or email")
     except ValueError:  # bcrypt: password over 72 bytes
         raise ApiError(422, "password too long")
-    return 201, UserResponse(user=_user_data(row, crypto.issue_token(row["id"])))
+    return 201, UserResponse(user=_user_data(row, tokens.issue_token(row["id"])))
 
 
 # With the broker, logins yield their bcrypt to it, where other workers' logins share the hashing (6 lanes: 4.4x less
 # CPU per hash); without it, this generator runs on the offload helper thread, each step in place.
 @router.post("/api/users/login", offload=True, broker=True)  # bcrypt verify
 def login(request: HttpRequest):
-    body = request.json()
+    body = _body(request)
     try:
         services.require_strings(body, "user", "email", "password")
     except ValueError:
@@ -104,10 +128,10 @@ def login(request: HttpRequest):
     row = yield db.q_find_user_by_email(user["email"])
     if not row:
         raise ApiError(401, "invalid credentials")
-    ok = yield crypto.q_verify_password(user["password"], row["password_hash"])
+    ok = yield passwords.q_verify_password(user["password"], row["password_hash"])
     if not ok:
         raise ApiError(401, "invalid credentials")
-    return 200, UserResponse(user=_user_data(row, crypto.issue_token(row["id"])))
+    return 200, UserResponse(user=_user_data(row, tokens.issue_token(row["id"])))
 
 
 @router.get("/api/user")
@@ -122,7 +146,7 @@ def current_user(request: HttpRequest):
 @router.put("/api/user", offload=True)  # bcrypt hash when the password changes
 def update_user(request: HttpRequest):
     viewer = _viewer(request, required=True)
-    payload = request.json_wrapped("user")
+    payload = _wrapped(request, "user")
     # every provided field must be a string (empty string is allowed); absent/null unchanged
     for k in ("email", "username", "password", "bio", "image"):
         v = payload.get(k)
@@ -133,7 +157,7 @@ def update_user(request: HttpRequest):
     fields = {k: payload.get(k) for k in ("email", "username", "bio", "image") if k in payload}
     if payload.get("password"):
         try:
-            fields["password_hash"] = crypto.hash_password(payload["password"])
+            fields["password_hash"] = passwords.hash_password(payload["password"])
         except ValueError:  # bcrypt: password over 72 bytes
             raise ApiError(422, "password too long")
     try:
@@ -211,7 +235,7 @@ def get_article(request: HttpRequest):
 @router.post("/api/articles")
 def create_article(request: HttpRequest):
     viewer = _viewer(request, required=True)
-    payload = request.json_wrapped("article")
+    payload = _wrapped(request, "article")
     try:
         tag_list = services.parse_tag_list(payload.get("tagList"))
     except ValueError:
@@ -232,7 +256,7 @@ def create_article(request: HttpRequest):
 @router.put("/api/articles/:slug")
 def update_article(request: HttpRequest):
     viewer = _viewer(request, required=True)
-    payload = request.json_wrapped("article")
+    payload = _wrapped(request, "article")
     for k in ("title", "description", "body"):
         v = payload.get(k)
         if v is not None and not services.is_non_empty_string(v):
@@ -300,7 +324,7 @@ def list_comments(request: HttpRequest):
 @router.post("/api/articles/:slug/comments")
 def create_comment(request: HttpRequest):
     viewer = _viewer(request, required=True)
-    comment = request.json_wrapped("comment")
+    comment = _wrapped(request, "comment")
     if not services.is_non_empty_string(comment.get("body")):
         raise ApiError(422, "comment body is required")
     body = yield db.q_create_comment_by_slug_json(viewer, request.params["slug"], comment["body"])
