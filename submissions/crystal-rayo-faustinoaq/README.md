@@ -5,7 +5,7 @@ Front: direct
 | Component | Version / implementation |
 |---|---|
 | Crystal | 1.22.1, `--release --mcpu x86-64-v3 -Dwithout_mt` |
-| Framework | [Rayo](https://github.com/faustinoaq/rayo), commit `eafa17b624e8f03fd1626aa532699d3f8b518946` |
+| Framework | [Rayo](https://github.com/faustinoaq/rayo), commit `facd4464cb55eec83b5541b605ea42b57632ea60` |
 | PostgreSQL driver | Rayo::PG, prepared statements, pipelining and application read batches |
 | Network I/O | Rayo io_uring, `SO_REUSEPORT`; Linux 6.1+ with io_uring allowed |
 | JWT | Rayo::JWT, HS256 through OpenSSL libcrypto |
@@ -140,6 +140,10 @@ think scale 1:
 | 100,000 | 26,304 | 50.0 ms | 52.8 ms | 0 | pass |
 | 120,000 | 31,381 | 93.1 ms | 116.5 ms | 0 | pass |
 | 130,000 | 32,022 | 1,532 ms | 1,997 ms | 0 | fail (p95) |
+
+Rayo facd446 also frees connection buffers whenever they are empty. Same runs with it: 120k
+pass (31,401 req/s, p95 92 ms, p99 114 ms), 130k fail (p95 1,492 ms); box peak memory
+(app + Postgres + page cache) 8,154 MB at 120k, down from 11,392 MB.
 
 ## Final comparison (Rayo c9553d9)
 
