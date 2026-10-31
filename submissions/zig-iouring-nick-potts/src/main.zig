@@ -9,10 +9,10 @@
 //!
 //! CONDUIT_FLAGS (flags.zig) is read here, before forking; every process then runs the server built for it.
 //!
-//! Two scheduling settings, both off by default. ZIG_SCHED_BATCH=1 puts each worker's event loop and the drain process
-//! under SCHED_BATCH (as #130 does), so a loop woken by a completion no longer preempts a running Postgres backend; the
-//! bcrypt hashers stay at SCHED_IDLE and the watchdog at normal priority. ZIG_LOOP_NICE=N (0 to 19) sets nice N on
-//! each worker's event loop. Both apply to the calling thread only, after the bcrypt threads have started.
+//! Two scheduling settings. Each worker's event loop and the drain process run under SCHED_BATCH (as #130 does), so a
+//! loop woken by a completion no longer preempts a running Postgres backend; ZIG_SCHED_BATCH=0 keeps the default
+//! policy. The bcrypt hashers stay at SCHED_IDLE and the watchdog at normal priority. ZIG_LOOP_NICE=N (0 to 19, default
+//! 0) sets nice N on each worker's event loop. Both apply to the calling thread only, after the bcrypt threads start.
 const std = @import("std");
 const linux = std.os.linux;
 const sys = @import("sys.zig");
@@ -39,12 +39,14 @@ const Sizing = struct {
 
 /// ZIG_SCHED_BATCH and ZIG_LOOP_NICE (see the top of this file).
 const Sched = struct {
-    batch: bool = false,
+    batch: bool = true,
     loop_nice: u5 = 0,
 
     fn parse(batch: ?[]const u8, nice: ?[]const u8) Sched {
         var s: Sched = .{};
-        if (batch) |b| s.batch = if (std.mem.eql(u8, b, "1")) true else if (b.len == 0 or std.mem.eql(u8, b, "0")) false else sys.fatal("ZIG_SCHED_BATCH: '{s}' is not 0 or 1", .{b});
+        if (batch) |b| if (b.len > 0) {
+            s.batch = if (std.mem.eql(u8, b, "1")) true else if (std.mem.eql(u8, b, "0")) false else sys.fatal("ZIG_SCHED_BATCH: '{s}' is not 0 or 1", .{b});
+        };
         if (nice) |n| if (n.len > 0) {
             s.loop_nice = std.fmt.parseInt(u5, n, 10) catch sys.fatal("ZIG_LOOP_NICE: '{s}' is not 0 to 19", .{n});
             if (s.loop_nice > 19) sys.fatal("ZIG_LOOP_NICE: '{s}' is not 0 to 19", .{n});
@@ -114,7 +116,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         if (!pz.has_pclmul) "off (no pclmulqdq)" else if (pz.has_vpclmul) "on (vpclmulqdq crc)" else "on (pclmulqdq crc)",
         flags.format(fl, &fbuf),
     });
-    if (sched.batch or sched.loop_nice > 0) sys.log("scheduling: SCHED_BATCH {s}, event loop nice {d}", .{ if (sched.batch) "on" else "off", sched.loop_nice });
+    if (!sched.batch or sched.loop_nice > 0) sys.log("scheduling: SCHED_BATCH {s}, event loop nice {d}", .{ if (sched.batch) "on" else "off", sched.loop_nice });
     flags.dispatch(fl, serve, .{ url, host, port, sz, sched });
 }
 
@@ -219,8 +221,9 @@ fn raiseFileLimit() void {
 }
 
 test "scheduling settings: parsed from the environment, applied to the calling thread only" {
-    try std.testing.expectEqual(Sched{}, Sched.parse(null, null));
-    try std.testing.expectEqual(Sched{}, Sched.parse("0", ""));
+    try std.testing.expectEqual(Sched{ .batch = true }, Sched.parse(null, null));
+    try std.testing.expectEqual(Sched{ .batch = false }, Sched.parse("0", ""));
+    try std.testing.expectEqual(Sched{ .batch = true }, Sched.parse("", ""));
     try std.testing.expectEqual(Sched{ .batch = true, .loop_nice = 2 }, Sched.parse("1", "2"));
     const T = struct {
         fn run(s: Sched, event_loop: bool, out: *[2]usize) void {
