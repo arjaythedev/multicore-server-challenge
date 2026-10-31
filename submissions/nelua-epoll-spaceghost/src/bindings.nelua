@@ -1,0 +1,85 @@
+-- Compile-time namespace only. All allocation belongs to the native host.
+local N: type = @record{}
+local N.Request: type <cimport'nc_request',cinclude'"native.h"',cincomplete> = @record{}
+local N.Buffer: type <cimport'nc_buffer',cinclude'"native.h"',cincomplete> = @record{}
+local N.Json: type <cimport'nc_json',cinclude'"native.h"',cincomplete> = @record{}
+local N.Db: type <cimport'nc_db',cinclude'"native.h"',cincomplete> = @record{}
+local N.Result: type <cimport'nc_result',cinclude'"native.h"',cincomplete> = @record{}
+
+function N.method(r:*N.Request):cstring <cimport'nc_method',nodecl> end
+function N.segment(r:*N.Request,i:cint):cstring <cimport'nc_segment',nodecl> end
+function N.segments(r:*N.Request):cint <cimport'nc_segments',nodecl> end
+function N.query_arg(r:*N.Request,key:cstring):cstring <cimport'nc_query',nodecl> end
+function N.eq(a:cstring,b:cstring):boolean <cimport'nc_eq',nodecl> end
+function N.length(s:cstring):csize <cimport'nc_length',nodecl> end
+function N.parse_uint(s:cstring):int64 <cimport'nc_parse_uint',nodecl> end
+function N.decimal(r:*N.Request,n:int64):cstring <cimport'nc_decimal',nodecl> end
+function N.body(r:*N.Request,key:cstring):*N.Json <cimport'nc_body',nodecl> end
+function N.field(o:*N.Json,key:cstring):*N.Json <cimport'nc_field',nodecl> end
+function N.kind(o:*N.Json):cint <cimport'nc_kind',nodecl> end
+function N.string(o:*N.Json):cstring <cimport'nc_string',nodecl> end
+function N.array_length(o:*N.Json):cint <cimport'nc_array_length',nodecl> end
+function N.array_item(o:*N.Json,i:cint):*N.Json <cimport'nc_array_item',nodecl> end
+function N.tag_array(r:*N.Request,o:*N.Json):cstring <cimport'nc_tag_array',nodecl> end
+function N.text_vector(r:*N.Request,values:*cstring,count:cint):cstring <cimport'nc_text_vector',nodecl> end
+function N.int_vector(r:*N.Request,values:*int64,count:cint):cstring <cimport'nc_int_vector',nodecl> end
+function N.auth(r:*N.Request):int64 <cimport'nc_auth',nodecl> end
+function N.token(r:*N.Request):cstring <cimport'nc_token',nodecl> end
+function N.issue_token(r:*N.Request,id:int64):cstring <cimport'nc_issue_token',nodecl> end
+function N.hash(r:*N.Request,pw:cstring):cstring <cimport'nc_hash',nodecl> end
+function N.verify(pw:cstring,hash:cstring):boolean <cimport'nc_verify',nodecl> end
+function N.begin(r:*N.Request,status:cint):*N.Buffer <cimport'nc_begin',nodecl> end
+function N.response_data(r:*N.Request,length:*csize):cstring <cimport'nc_response_data',nodecl> end
+function N.status(r:*N.Request):cint <cimport'nc_status',nodecl> end
+function N.write(b:*N.Buffer,s:cstring) <cimport'nc_write',nodecl> end
+function N.write_n(b:*N.Buffer,s:cstring,n:csize) <cimport'nc_write_n',nodecl> end
+function N.putc(b:*N.Buffer,c:cchar) <cimport'nc_putc',nodecl> end
+function N.error(r:*N.Request,status:cint) <cimport'nc_error',nodecl> end
+function N.query(db:*N.Db,id:cint,sql:cstring,count:cint,values:*cstring):*N.Result <cimport'nc_db_query',nodecl> end
+function N.pipeline_begin(db:*N.Db):boolean <cimport'nc_db_pipeline_begin',nodecl> end
+function N.pipeline_staging(db:*N.Db):boolean <cimport'nc_db_pipeline_staging',nodecl> end
+function N.pipeline_flush(db:*N.Db):boolean <cimport'nc_db_pipeline_flush',nodecl> end
+function N.pipeline_end(db:*N.Db) <cimport'nc_db_pipeline_end',nodecl> end
+function N.tx(db:*N.Db,command:cstring):boolean <cimport'nc_tx',nodecl> end
+function N.ok(res:*N.Result):boolean <cimport'nc_db_ok',nodecl> end
+function N.unique(res:*N.Result):boolean <cimport'nc_db_unique',nodecl> end
+function N.free(res:*N.Result) <cimport'nc_result_free',nodecl> end
+function N.rows(res:*N.Result):cint <cimport'nc_rows',nodecl> end
+function N.null(res:*N.Result,row:cint,col:cint):boolean <cimport'nc_null',nodecl> end
+function N.value(res:*N.Result,row:cint,col:cint):cstring <cimport'nc_value',nodecl> end
+function N.value_length(res:*N.Result,row:cint,col:cint):csize <cimport'nc_value_length',nodecl> end
+function N.integer(res:*N.Result,row:cint,col:cint):int64 <cimport'nc_integer',nodecl> end
+function N.boolean(res:*N.Result,row:cint,col:cint):boolean <cimport'nc_boolean',nodecl> end
+function N.timestamp(b:*N.Buffer,res:*N.Result,row:cint,col:cint) <cimport'nc_timestamp',nodecl> end
+function N.text_array(b:*N.Buffer,res:*N.Result,row:cint,col:cint) <cimport'nc_text_array',nodecl> end
+
+-- A failed result is freed here; successful results remain owned by the caller.
+function N.check(r:*N.Request,res:*N.Result):boolean
+  if not N.ok(res) then
+    local status:cint = 500
+    if N.unique(res) then status = 422 end
+    N.error(r,status)
+    N.free(res)
+    return false
+  end
+  return true
+end
+
+function N.required(o:*N.Json,key:cstring):cstring
+  local value = N.field(o,key)
+  if N.kind(value) ~= 3 then return nilptr end
+  local s = N.string(value)
+  if not s or N.length(s) == 0 then return nilptr end
+  return s
+end
+
+function N.optional(o:*N.Json,key:cstring,nonempty:boolean):(cstring,boolean)
+  local value = N.field(o,key)
+  local kind = N.kind(value)
+  if kind == 0 then return nilptr,true end
+  if kind ~= 3 then return nilptr,false end
+  local s = N.string(value)
+  if not s or (nonempty and N.length(s) == 0) then return nilptr,false end
+  return s,true
+end
+return N

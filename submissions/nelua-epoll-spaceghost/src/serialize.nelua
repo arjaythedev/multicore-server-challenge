@@ -1,0 +1,148 @@
+-- Scalar/stack JSON kernels. The host owns each response buffer and result.
+## pragmas.nogc = true
+## pragmas.nochecks = true
+## pragmas.noentrypoint = true
+
+local N = require 'bindings'
+local S: type = @record{}
+
+local function nc_json_string(buffer: *N.Buffer, data: *[0]byte, length: csize) <cexport, codename 'nc_json_string'>
+  N.putc(buffer, cchar(34))
+  local first: csize = 0
+  local i: csize = 0
+  while i < length do
+    local value: byte = data[i]
+    if value < 32 or value == 34 or value == 92 then
+      if i > first then N.write_n(buffer, cstring(&data[first]), i - first) end
+      if value == 34 or value == 92 then
+        N.putc(buffer, cchar(92))
+        N.putc(buffer, cchar(value))
+      else
+        local escape: [6]cchar <noinit>
+        escape[0], escape[1], escape[2], escape[3] = cchar(92), cchar(117), cchar(48), cchar(48)
+        local high: byte = value >> 4
+        local low: byte = value & 15
+        escape[4] = cchar(high + 48)
+        if low < 10 then escape[5] = cchar(low + 48) else escape[5] = cchar(low + 87) end
+        N.write_n(buffer, cstring(&escape[0]), 6)
+      end
+      first = i + 1
+    end
+    i = i + 1
+  end
+  if length > first then N.write_n(buffer, cstring(&data[first]), length - first) end
+  N.putc(buffer, cchar(34))
+end
+
+local function nc_json_int64(buffer: *N.Buffer, value: int64) <cexport, codename 'nc_json_int64'>
+  local digits: [20]cchar <noinit>
+  local magnitude: uint64
+  if value < 0 then
+    N.putc(buffer, cchar(45))
+    magnitude = uint64(-(value + 1)) + 1
+  else magnitude = uint64(value) end
+  local first: csize = 20
+  repeat
+    first = first - 1
+    digits[first] = cchar(magnitude % 10 + 48)
+    magnitude = magnitude // 10
+  until magnitude == 0
+  N.write_n(buffer, cstring(&digits[first]), 20 - first)
+end
+
+function S.str(buffer: *N.Buffer, value: cstring) <inline>
+  if value == nilptr then N.write(buffer, 'null')
+  else nc_json_string(buffer, (@*[0]byte)(value), N.length(value)) end
+end
+
+function S.quote(buffer: *N.Buffer, value: cstring) <inline>
+  S.str(buffer, value)
+end
+
+function S.integer(buffer: *N.Buffer, value: int64) <inline>
+  nc_json_int64(buffer, value)
+end
+
+function S.boolean(buffer: *N.Buffer, value: boolean) <inline>
+  if value then N.write(buffer, 'true') else N.write(buffer, 'false') end
+end
+
+function S.text(buffer: *N.Buffer, result: *N.Result, row: cint, column: cint) <inline>
+  if N.null(result, row, column) then N.write(buffer, 'null')
+  else nc_json_string(buffer, (@*[0]byte)(N.value(result, row, column)), N.value_length(result, row, column)) end
+end
+
+-- username, nullable bio, nullable image, following.
+function S.profile(buffer: *N.Buffer, result: *N.Result, row: cint, base: cint)
+  N.write(buffer, '{"username":')
+  S.text(buffer, result, row, base)
+  N.write(buffer, ',"bio":')
+  S.text(buffer, result, row, base + 1)
+  N.write(buffer, ',"image":')
+  S.text(buffer, result, row, base + 2)
+  N.write(buffer, ',"following":')
+  S.boolean(buffer, N.boolean(result, row, base + 3))
+  N.putc(buffer, cchar(125))
+end
+
+-- Full: slug,title,description,body,created,updated,tags,count,favorite,profile.
+-- List: body is omitted and every following field shifts left one column.
+function S.article(buffer: *N.Buffer, result: *N.Result, row: cint, full: boolean)
+  N.write(buffer, '{"slug":')
+  S.text(buffer, result, row, 0)
+  N.write(buffer, ',"title":')
+  S.text(buffer, result, row, 1)
+  N.write(buffer, ',"description":')
+  S.text(buffer, result, row, 2)
+  local base: cint = 3
+  if full then
+    N.write(buffer, ',"body":')
+    S.text(buffer, result, row, 3)
+    base = 4
+  end
+  N.write(buffer, ',"createdAt":')
+  N.timestamp(buffer, result, row, base)
+  N.write(buffer, ',"updatedAt":')
+  N.timestamp(buffer, result, row, base + 1)
+  N.write(buffer, ',"tagList":')
+  N.text_array(buffer, result, row, base + 2)
+  N.write(buffer, ',"favoritesCount":')
+  nc_json_int64(buffer, N.integer(result, row, base + 3))
+  N.write(buffer, ',"favorited":')
+  S.boolean(buffer, N.boolean(result, row, base + 4))
+  N.write(buffer, ',"author":')
+  S.profile(buffer, result, row, base + 5)
+  N.putc(buffer, cchar(125))
+end
+
+-- User queries return id,username,email,bio,image; id is used only for tokens.
+function S.user(buffer: *N.Buffer, result: *N.Result, row: cint, token: cstring)
+  N.write(buffer, '{"email":')
+  S.text(buffer, result, row, 2)
+  N.write(buffer, ',"token":')
+  S.str(buffer, token)
+  N.write(buffer, ',"username":')
+  S.text(buffer, result, row, 1)
+  N.write(buffer, ',"bio":')
+  S.text(buffer, result, row, 3)
+  N.write(buffer, ',"image":')
+  S.text(buffer, result, row, 4)
+  N.putc(buffer, cchar(125))
+end
+
+-- id,body,created,updated,username,bio,image,following.
+function S.comment(buffer: *N.Buffer, result: *N.Result, row: cint)
+  N.write(buffer, '{"id":')
+  nc_json_int64(buffer, N.integer(result, row, 0))
+  N.write(buffer, ',"body":')
+  S.text(buffer, result, row, 1)
+  N.write(buffer, ',"createdAt":')
+  N.timestamp(buffer, result, row, 2)
+  N.write(buffer, ',"updatedAt":')
+  N.timestamp(buffer, result, row, 3)
+  N.write(buffer, ',"author":')
+  S.profile(buffer, result, row, 4)
+  N.putc(buffer, cchar(125))
+end
+
+return S
