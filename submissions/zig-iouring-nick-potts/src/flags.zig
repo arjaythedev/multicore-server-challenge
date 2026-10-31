@@ -17,7 +17,7 @@ pub const Flags = struct {
     /// Shared responses (drain.zig): reads of one drain execution that would get the same bytes (same statement and
     /// parameters but the viewer, no viewer flag set, same worker and response head) are rendered once and sent to
     /// each client from one buffer.
-    share: bool = false,
+    share: bool = true,
 };
 
 const names = std.meta.fieldNames(Flags);
@@ -97,8 +97,8 @@ test "defaults, overrides, and the errors that stop the server" {
     try testing.expectError(error.BadValue, parse("shed=yes", &bad));
     try testing.expectError(error.BadValue, parse("shed", &bad));
     var buf: [64]u8 = undefined;
-    try testing.expectEqualStrings("shed=off,ackdelay=on,gzip=on,share=off", format(.{}, &buf));
-    try testing.expectEqual(Flags{ .share = true }, try parse("share=on", &bad));
+    try testing.expectEqualStrings("shed=off,ackdelay=on,gzip=on,share=on", format(.{}, &buf));
+    try testing.expectEqual(Flags{ .share = false }, try parse("share=off", &bad));
 }
 
 test "dispatch passes the runtime flags as a comptime value" {
