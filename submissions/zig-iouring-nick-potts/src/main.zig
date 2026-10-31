@@ -8,6 +8,11 @@
 //! crash is visible.
 //!
 //! CONDUIT_FLAGS (flags.zig) is read here, before forking; every process then runs the server built for it.
+//!
+//! Two scheduling settings, both off by default. ZIG_SCHED_BATCH=1 puts each worker's event loop and the drain process
+//! under SCHED_BATCH (as #130 does), so a loop woken by a completion no longer preempts a running Postgres backend; the
+//! bcrypt hashers stay at SCHED_IDLE and the watchdog at normal priority. ZIG_LOOP_NICE=N (0 to 19) sets nice N on
+//! each worker's event loop. Both apply to the calling thread only, after the bcrypt threads have started.
 const std = @import("std");
 const linux = std.os.linux;
 const sys = @import("sys.zig");
@@ -30,6 +35,32 @@ const Sizing = struct {
     bcrypt_threads: usize,
     /// The drain process's read connections; 0 without one.
     drain_reads: u16,
+};
+
+/// ZIG_SCHED_BATCH and ZIG_LOOP_NICE (see the top of this file).
+const Sched = struct {
+    batch: bool = false,
+    loop_nice: u5 = 0,
+
+    fn parse(batch: ?[]const u8, nice: ?[]const u8) Sched {
+        var s: Sched = .{};
+        if (batch) |b| s.batch = if (std.mem.eql(u8, b, "1")) true else if (b.len == 0 or std.mem.eql(u8, b, "0")) false else sys.fatal("ZIG_SCHED_BATCH: '{s}' is not 0 or 1", .{b});
+        if (nice) |n| if (n.len > 0) {
+            s.loop_nice = std.fmt.parseInt(u5, n, 10) catch sys.fatal("ZIG_LOOP_NICE: '{s}' is not 0 to 19", .{n});
+            if (s.loop_nice > 19) sys.fatal("ZIG_LOOP_NICE: '{s}' is not 0 to 19", .{n});
+        };
+        return s;
+    }
+
+    /// Applies the settings to the calling thread: SCHED_BATCH if set, and on a worker's event loop the nice.
+    fn apply(s: Sched, event_loop: bool) void {
+        if (s.batch) {
+            const param: linux.sched_param = .{ .priority = 0 };
+            _ = sys.check(linux.sched_setscheduler(0, .{ .mode = .BATCH }, &param)) catch sys.fatal("SCHED_BATCH", .{});
+        }
+        // PRIO_PROCESS with 0 is the calling thread on Linux.
+        if (event_loop and s.loop_nice > 0) _ = sys.check(linux.syscall3(.setpriority, 0, 0, s.loop_nice)) catch sys.fatal("nice {d}", .{s.loop_nice});
+    }
 };
 
 /// Read connections: one per core, as #47 runs 8 read lanes (#56 and #53 settled on 5/8 before the drain gap, when
@@ -55,6 +86,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     const port = std.fmt.parseInt(u16, env.getPosix("PORT") orelse "3000", 10) catch sys.fatal("bad PORT", .{});
     const url = pg.parseUrl(url_text) catch sys.fatal("bad DATABASE_URL", .{});
     var bad: []const u8 = "";
+    const sched = Sched.parse(env.getPosix("ZIG_SCHED_BATCH"), env.getPosix("ZIG_LOOP_NICE"));
     const fl = flags.parse(env.getPosix("CONDUIT_FLAGS") orelse "", &bad) catch |e| switch (e) {
         error.UnknownFlag => sys.fatal("CONDUIT_FLAGS: unknown flag '{s}' (flags: " ++ flags.known ++ ")", .{bad}),
         error.BadValue => sys.fatal("CONDUIT_FLAGS: '{s}' is not name=on or name=off", .{bad}),
@@ -82,11 +114,12 @@ pub fn main(init: std.process.Init.Minimal) void {
         if (!pz.has_pclmul) "off (no pclmulqdq)" else if (pz.has_vpclmul) "on (vpclmulqdq crc)" else "on (pclmulqdq crc)",
         flags.format(fl, &fbuf),
     });
-    flags.dispatch(fl, serve, .{ url, host, port, sz });
+    if (sched.batch or sched.loop_nice > 0) sys.log("scheduling: SCHED_BATCH {s}, event loop nice {d}", .{ if (sched.batch) "on" else "off", sched.loop_nice });
+    flags.dispatch(fl, serve, .{ url, host, port, sz, sched });
 }
 
 /// Forks the workers and the drain process, all running the server built for `F`, and waits for one to exit.
-fn serve(comptime F: Flags, url: pg.Url, host: []const u8, port: u16, sz: Sizing) void {
+fn serve(comptime F: Flags, url: pg.Url, host: []const u8, port: u16, sz: Sizing, sched: Sched) void {
     var pids: [257]linux.pid_t = undefined;
     const n = @min(sz.workers, pids.len - 1);
     if (sz.drain_reads > 0) drain.setup(n);
@@ -94,14 +127,14 @@ fn serve(comptime F: Flags, url: pg.Url, host: []const u8, port: u16, sz: Sizing
     for (0..n) |i| {
         const rc = linux.fork();
         if (linux.errno(rc) != .SUCCESS) sys.fatal("fork failed", .{});
-        if (rc == 0) worker(F, url, host, port, sz, i);
+        if (rc == 0) worker(F, url, host, port, sz, sched, i);
         pids[i] = @intCast(rc);
     }
     var procs = n;
     if (sz.drain_reads > 0) {
         const rc = linux.fork();
         if (linux.errno(rc) != .SUCCESS) sys.fatal("fork failed", .{});
-        if (rc == 0) drainProcess(F, url, sz, n);
+        if (rc == 0) drainProcess(F, url, sz, sched, n);
         pids[n] = @intCast(rc);
         procs += 1;
     }
@@ -113,19 +146,21 @@ fn serve(comptime F: Flags, url: pg.Url, host: []const u8, port: u16, sz: Sizing
     linux.exit_group(1);
 }
 
-fn worker(comptime F: Flags, url: pg.Url, host: []const u8, port: u16, sz: Sizing, index: usize) noreturn {
+fn worker(comptime F: Flags, url: pg.Url, host: []const u8, port: u16, sz: Sizing, sched: Sched, index: usize) noreturn {
     _ = linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @intFromEnum(linux.SIG.TERM), 0, 0, 0);
     db.conns = openConns(url, sz.read_conns, sz.write_conns);
     if (sz.drain_reads > 0) drain.becomeWorker(index);
     bcrypt.start(F, sz.bcrypt_threads) catch sys.fatal("bcrypt threads", .{});
+    sched.apply(true);
     if (F.shed and index == 0) shed.ctl.sampler = .{};
     loop.run(F, listen(host, port));
 }
 
-fn drainProcess(comptime F: Flags, url: pg.Url, sz: Sizing, workers: usize) noreturn {
+fn drainProcess(comptime F: Flags, url: pg.Url, sz: Sizing, sched: Sched, workers: usize) noreturn {
     _ = linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @intFromEnum(linux.SIG.TERM), 0, 0, 0);
     db.conns = openConns(url, sz.drain_reads, 0);
     drain.becomeDrain();
+    sched.apply(false);
     sys.log("drain process: {d} read postgres connections for {d} workers, rings {d} MB ask + {d} MB answer per worker", .{
         sz.drain_reads, workers, drain.ask_bytes >> 20, drain.answer_bytes >> 20,
     });
@@ -181,6 +216,34 @@ fn raiseFileLimit() void {
     if (linux.errno(linux.getrlimit(.NOFILE, &lim)) != .SUCCESS) return;
     lim.cur = lim.max;
     _ = linux.setrlimit(.NOFILE, &lim);
+}
+
+test "scheduling settings: parsed from the environment, applied to the calling thread only" {
+    try std.testing.expectEqual(Sched{}, Sched.parse(null, null));
+    try std.testing.expectEqual(Sched{}, Sched.parse("0", ""));
+    try std.testing.expectEqual(Sched{ .batch = true, .loop_nice = 2 }, Sched.parse("1", "2"));
+    const T = struct {
+        fn run(s: Sched, event_loop: bool, out: *[2]usize) void {
+            s.apply(event_loop);
+            out[0] = linux.syscall1(.sched_getscheduler, 0);
+            out[1] = linux.syscall2(.getpriority, 0, 0);
+        }
+    };
+    // Nice 19, which any thread may take whatever nice it runs at; the raw syscall returns 20 - nice.
+    const s: Sched = .{ .batch = true, .loop_nice = 19 };
+    const mine = linux.syscall2(.getpriority, 0, 0);
+    var got: [2]usize = undefined;
+    var t = try std.Thread.spawn(.{}, T.run, .{ s, true, &got });
+    t.join();
+    try std.testing.expectEqual(@intFromEnum(linux.SCHED.Mode.BATCH), got[0]);
+    try std.testing.expectEqual(20 - 19, got[1]);
+    t = try std.Thread.spawn(.{}, T.run, .{ s, false, &got });
+    t.join();
+    try std.testing.expectEqual(@intFromEnum(linux.SCHED.Mode.BATCH), got[0]);
+    try std.testing.expectEqual(mine, got[1]);
+    // This thread is untouched.
+    try std.testing.expectEqual(@intFromEnum(linux.SCHED.Mode.NORMAL), linux.syscall1(.sched_getscheduler, 0));
+    try std.testing.expectEqual(mine, linux.syscall2(.getpriority, 0, 0));
 }
 
 test {
