@@ -75,6 +75,16 @@ fn eventfd() i32 {
 fn signal(fd: i32) void {
     const one: u64 = 1;
     _ = linux.write(fd, std.mem.asBytes(&one), 8);
+    wakes.sent += 1;
+}
+
+/// Counters for ZIG_LANE_STATS: eventfd writes to wake the other side, wake completions taken, and loop iterations.
+pub var wakes: struct { sent: u32 = 0, taken: u32 = 0, iterations: u32 = 0 } = .{};
+
+pub fn logWakes(span_ms: u64) void {
+    if (role == .alone) return;
+    sys.log("wakes {d} ms: {s} sent {d}, took {d}, {d} loop iterations", .{ span_ms, @tagName(role), wakes.sent, wakes.taken, wakes.iterations });
+    wakes = .{};
 }
 
 /// The eventfd this process's loop reads besides its sockets, if any.
@@ -89,6 +99,7 @@ pub fn wakeFd() ?i32 {
 /// Takes what the other side published: a worker its answers, the drain process its asks. Called once per loop
 /// iteration, after the completions.
 pub fn receive() void {
+    wakes.iterations += 1;
     switch (role) {
         .alone => {},
         .worker => takeAnswers(),

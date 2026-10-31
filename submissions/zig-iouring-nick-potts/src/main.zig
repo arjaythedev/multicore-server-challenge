@@ -94,6 +94,15 @@ pub fn main(init: std.process.Init.Minimal) void {
         error.BadValue => sys.fatal("CONDUIT_FLAGS: '{s}' is not name=on or name=off", .{bad}),
     };
 
+    if (env.getPosix("ZIG_LANE_STATS")) |v| db.lane_stats = if (std.mem.eql(u8, v, "1")) true else if (v.len == 0 or std.mem.eql(u8, v, "0")) false else sys.fatal("ZIG_LANE_STATS: '{s}' is not 0 or 1", .{v});
+    if (env.getPosix("ZIG_FEED3")) |v| {
+        db.feed3_idle = if (v.len == 0) 0 else std.fmt.parseInt(u8, v, 10) catch 255;
+        if (db.feed3_idle > 100) sys.fatal("ZIG_FEED3: '{s}' is not an idle percentage, 0 to 100", .{v});
+    }
+    if (db.lane_stats or db.feed3_idle > 0) sys.log("lane stats {s}, third feed drain {s} (at {d}% idle)", .{
+        if (db.lane_stats) "on" else "off", if (db.feed3_idle > 0) "on" else "off", db.feed3_idle,
+    });
+
     jwt.init(secret);
     ignoreSigpipe();
     raiseFileLimit();

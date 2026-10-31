@@ -188,7 +188,10 @@ fn complete(comptime F: Flags, cqe: *const linux.io_uring_cqe) void {
         .pg_send => onPgSend(@ptrFromInt(ptr), cqe),
         .bcrypt => onBcrypt(),
         // Only ends the wait: every iteration takes what the rings hold.
-        .wake => armWake(),
+        .wake => {
+            drain_process.wakes.taken += 1;
+            armWake();
+        },
     }
 }
 
