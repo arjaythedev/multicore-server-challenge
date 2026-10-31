@@ -117,3 +117,13 @@ Total Postgres connections, `READ_CONNS + WORKERS x WRITE_CONNS`, must stay with
 - `tests/bench/`: `measure.sh` (throughput, latency and CPU per request for us and for Postgres), `prewarm.sh`
   (a reusable, cached measurement database) and `conns.c` (holds N idle keep-alive connections and checks none
   is dropped).
+
+## Credits
+
+- I got the idea for these optimisations from nick-potts' write-ups in
+  [zig-iouring-nick-potts](../zig-iouring-nick-potts) (#79, #117): one drain process owning every read connection,
+  reached through shared-memory rings; one set-based execution for all list and article reads of a batch, each
+  article fetched once; the feed shortcut for authors with 1,000+ articles; separate lanes for feeds, comments and
+  the rest, with their gaps (80 / 100 / 80 ms) and 8 read connections; ACK delay through `TCP_QUICKACK`; group
+  commit without `BEGIN`/`COMMIT` on one write connection per worker; forced generic plans; and cores / 2 worker
+  processes, one io_uring each, with a parent that takes the whole server down if any child dies.
