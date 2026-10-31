@@ -55,9 +55,10 @@ and `LOG_SQL=1` for every SQL statement. All of it is compiled out of Release bu
 
 ## Optimizations, and why
 
-- **Native AOT** with `OptimizationPreference=Speed` and `IlcInstructionSet=native`. The server is built on the box that runs it
-  (rule 11), so the compiler may use that CPU's whole instruction set. No JIT warm-up, no tiering, and about 40 to 100 MB of
-  memory under load, which leaves the cores and RAM to Postgres.
+- **Native AOT** with `OptimizationPreference=Speed`. No JIT warm-up, no tiering, and about 40 to 100 MB of memory under load,
+  which leaves the cores and RAM to Postgres. The compiler's default instruction set is used: `IlcInstructionSet=native` made
+  `ilc` fail on the benchmark box's AVX-512 VM, and it measured no faster than the default or `x86-64-v3` (within 2% on the
+  list mix, the feed and logins).
 - **Runtime settings** in `Conduit.csproj`: server GC without the background GC thread; thread-pool workers that sleep
   instead of spinning (`UnfairSemaphoreSpinLimit=0`: the spinning burns CPU that Postgres needs); Npgsql's SQL rewriting off
   (every statement uses positional `$n` parameters); invariant globalization; no event sources, metrics or debugger support.

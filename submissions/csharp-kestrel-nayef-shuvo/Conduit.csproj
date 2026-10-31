@@ -20,13 +20,14 @@
   </PropertyGroup>
 
   <!-- Native AOT: `dotnet publish` produces one native executable (bin/conduit), no JIT, no runtime install needed.
-       The app is built on the box that runs it (rule 11), so the compiler may target that CPU's full instruction set. -->
+       The instruction set is left at the compiler's default on purpose: <IlcInstructionSet>native</IlcInstructionSet> made ilc fail
+       on the benchmark box's AVX-512 VM, and it measured no faster than the default or x86-64-v3 (within 2% on the list mix, the
+       feed and logins). -->
   <PropertyGroup>
     <PublishAot>true</PublishAot>
     <!-- Restore and publish must agree on the platform: use the SDK's own (linux-x64 on the box). -->
     <RuntimeIdentifier>$(NETCoreSdkPortableRuntimeIdentifier)</RuntimeIdentifier>
     <OptimizationPreference>Speed</OptimizationPreference>
-    <IlcInstructionSet>native</IlcInstructionSet>
     <StripSymbols>true</StripSymbols>
   </PropertyGroup>
 
