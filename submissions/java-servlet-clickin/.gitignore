@@ -2,3 +2,4 @@
 /lib/
 /dev/hcloud/loadgen
 /dev/hcloud/hosts.env
+/dev/hcloud/results/
