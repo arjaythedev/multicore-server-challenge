@@ -1,0 +1,25 @@
+{
+	"authors": [
+		"Dmitry Olshansky"
+	],
+	"configurations": [
+		{
+			"name": "library",
+			"targetType": "library"
+		}
+	],
+	"copyright": "Copyright © 2023, Dmitry Olshansky",
+	"dependencies": {
+		"xbuf": "~>0.2.1"
+	},
+	"description": "Http server for Photon or standalone use cases",
+	"importPaths": [
+		"source/"
+	],
+	"license": "Boost",
+	"name": "photon-http",
+	"sourcePaths": [
+		"source/"
+	],
+	"version": "0.6.10"
+}
