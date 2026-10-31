@@ -49,6 +49,9 @@ pub const Def = struct {
     thread_cols: ?[]const Oid = null,
     /// How the statement's requests ride in the mega statement; null: never.
     mega: ?Mega = null,
+    /// The viewer ($1) only sets `favorited` and `following`: within one execution, requests with the same other
+    /// parameters and neither flag set in any row get the same response (drain.zig's shared responses).
+    share: bool = false,
 };
 
 /// MEGA (branch sql-stack, stack-14-fcset: sql-proto's MEGA2 with the stack's count, feed, tag, list-count, list-flag and favorite-count edits, without comments):
@@ -170,21 +173,21 @@ fn file(comptime prefix: []const u8, comptime s: Stmt) []const u8 {
 //   a few index lookups, so they run as units of their own ahead of MEGA and are answered before it runs.
 const defs = [count]Def{
     // lists (branch sql-lists)
-    .{ .sql = text(.list_all), .params = &.{ .int8, .int8, .int8 }, .cols = &list_cols, .batch = .arrays, .order = ", q.id DESC", .mega = listMega(1, &.{ .v, .i1, .i2 }) },
-    .{ .sql = text(.list_tag), .params = &list_params, .cols = &list_cols, .batch = .arrays, .order = ", q.id DESC", .mega = listMega(2, &.{ .v, .i1, .i2, .t1 }) },
-    .{ .sql = text(.list_author), .params = &list_params, .cols = &list_cols, .batch = .arrays, .order = ", q.id DESC", .mega = listMega(3, &.{ .v, .i1, .i2, .t1 }) },
-    .{ .sql = text(.list_favorited), .params = &list_params, .cols = &list_cols, .batch = .arrays, .order = ", q.id DESC", .mega = listMega(4, &.{ .v, .i1, .i2, .t1 }) },
+    .{ .sql = text(.list_all), .params = &.{ .int8, .int8, .int8 }, .cols = &list_cols, .batch = .arrays, .order = ", q.id DESC", .mega = listMega(1, &.{ .v, .i1, .i2 }), .share = true },
+    .{ .sql = text(.list_tag), .params = &list_params, .cols = &list_cols, .batch = .arrays, .order = ", q.id DESC", .mega = listMega(2, &.{ .v, .i1, .i2, .t1 }), .share = true },
+    .{ .sql = text(.list_author), .params = &list_params, .cols = &list_cols, .batch = .arrays, .order = ", q.id DESC", .mega = listMega(3, &.{ .v, .i1, .i2, .t1 }), .share = true },
+    .{ .sql = text(.list_favorited), .params = &list_params, .cols = &list_cols, .batch = .arrays, .order = ", q.id DESC", .mega = listMega(4, &.{ .v, .i1, .i2, .t1 }), .share = true },
     // feed (branch sql-feed)
     .{ .sql = text(.list_feed), .params = &.{ .int8, .int8, .int8, .int8 }, .cols = &list_cols, .batch = .arrays, .order = ", q.id DESC", .mega = listMega(5, &.{ .v, .i1, .i2, .i3 }) },
     // article page (branch sql-articlepage)
-    .{ .sql = text(.article_by_slug), .params = &.{ .int8, .text }, .cols = &full_cols, .batch = .arrays, .mega = .{ .kind = 6, .args = &.{ .v, .t1 }, .cols = &full_mega_cols, .fill = 1 } },
-    .{ .sql = text(.article_by_id), .params = &.{ .int8, .int8 }, .cols = &full_cols, .batch = .arrays, .mega = .{ .kind = 7, .args = &.{ .v, .i1 }, .cols = &full_mega_cols, .fill = 1 } },
+    .{ .sql = text(.article_by_slug), .params = &.{ .int8, .text }, .cols = &full_cols, .batch = .arrays, .mega = .{ .kind = 6, .args = &.{ .v, .t1 }, .cols = &full_mega_cols, .fill = 1 }, .share = true },
+    .{ .sql = text(.article_by_id), .params = &.{ .int8, .int8 }, .cols = &full_cols, .batch = .arrays, .mega = .{ .kind = 7, .args = &.{ .v, .i1 }, .cols = &full_mega_cols, .fill = 1 }, .share = true },
     .{ .sql = text(.comments_list_set), .params = &.{ .int8, .text }, .cols = &.{ .int8, .text, .timestamptz, .timestamptz, .text, .text, .text, .bool }, .batch = .arrays, .batched = batchText(.comments_list_set), .thread_cols = &threads.cols },
     .{ .sql = text(.profile), .params = &.{ .int8, .text }, .cols = &.{ .text, .text, .text, .bool }, .batch = .arrays },
     // users and tags
     .{ .sql = text(.user_by_id), .params = &.{.int8}, .cols = &user_cols, .batch = .arrays },
     .{ .sql = text(.user_by_email), .params = &.{.text}, .cols = &.{ .int8, .text, .text, .text, .text, .text }, .batch = .arrays, .batched = batchText(.user_by_email) },
-    .{ .sql = text(.tags), .params = &.{}, .cols = &.{.text_array}, .batch = .broadcast },
+    .{ .sql = text(.tags), .params = &.{}, .cols = &.{.text_array}, .batch = .broadcast, .share = true },
     // writes (branch sql-writes): a group's writes of one of these statements share one execution of its batched form
     .{ .write = true, .sql = text(.favorite), .params = &.{ .int8, .text }, .cols = &.{.int8}, .batch = .arrays, .batched = batchText(.favorite) },
     .{ .write = true, .sql = text(.unfavorite), .params = &.{ .int8, .text }, .cols = &.{.int8}, .batch = .arrays, .batched = batchText(.unfavorite) },

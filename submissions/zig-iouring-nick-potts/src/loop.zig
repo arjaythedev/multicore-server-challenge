@@ -5,7 +5,8 @@
 //! Clients: multishot accept, then multishot recv into provided buffers (the classic PROVIDE_BUFFERS kind; buffer
 //! rings return EINVAL on the target's 6.8 kernel). A request is parsed straight out of the provided buffer when it
 //! arrived whole; only leftovers are copied into the client's own buffer. One request per client is handled at a
-//! time, so pipelined requests are answered in order. A response leaves in one send from the buffer it was built in.
+//! time, so pipelined requests are answered in order. A response leaves in one send from the buffer it was built in;
+//! a shared response (drain.zig) leaves from its lead's buffer, freed when the last of its sends completes.
 //!
 //! Each iteration handles every completion that is ready, takes what the other side of the drain rings published,
 //! then fills the Postgres connections (db.pump), sends what they queued and publishes to the other side. While reads
@@ -30,6 +31,7 @@ const bcrypt = @import("bcrypt.zig");
 const drain_process = @import("drain.zig");
 const shed = @import("shed.zig");
 const Flags = @import("flags.zig").Flags;
+const Buf = @import("buf.zig").Buf;
 
 const gpa = std.heap.smp_allocator;
 
@@ -54,8 +56,21 @@ const Client = struct {
     /// No more requests will be read: the peer closed, the connection failed or the response said close.
     closing: bool = false,
     sending: []const u8 = "",
+    /// The response being sent is this shared one.
+    shared: ?*Shared = null,
     req: api.Req = .{},
     next_free: ?*Client = null,
+};
+
+/// A lead's response, sent to the lead and to each of its followers.
+const Shared = struct {
+    out: Buf,
+    bytes: []const u8,
+    /// Sends not completed yet, the followers' still to come included.
+    refs: u32,
+    /// Followers not answered yet.
+    waiting: u32,
+    next_free: ?*Shared = null,
 };
 
 var ring: IoUring = undefined;
@@ -64,6 +79,9 @@ var bufs: []align(4096) u8 = &.{};
 var returned: std.ArrayList(u16) = .empty;
 var rearm: std.ArrayList(*Client) = .empty;
 var free_clients: ?*Client = null;
+var free_shared: ?*Shared = null;
+/// The latest lead, while followers wait for its response.
+var lead: ?*Shared = null;
 var efd_buf: u64 = 0;
 var wake_buf: u64 = 0;
 var now: i64 = 0;
@@ -307,6 +325,43 @@ pub fn respond(r: *api.Req, bytes: []const u8) void {
     sendBytes(c, bytes);
 }
 
+/// Makes the response `r` just started sending also the response of the next `followers` requests that get
+/// `respondShared`.
+pub fn share(r: *api.Req, followers: u32) void {
+    const c: *Client = @fieldParentPtr("req", r);
+    if (lead != null) sys.fatal("a lead before the previous lead's followers", .{});
+    const s = free_shared orelse blk: {
+        const n = gpa.create(Shared) catch sys.fatal("oom", .{});
+        n.next_free = null;
+        break :blk n;
+    };
+    free_shared = s.next_free;
+    s.* = .{ .out = r.out, .bytes = c.sending, .refs = followers + 1, .waiting = followers };
+    r.out = .{};
+    c.shared = s;
+    lead = s;
+}
+
+/// Sends `r` the latest lead's response.
+pub fn respondShared(r: *api.Req) void {
+    const c: *Client = @fieldParentPtr("req", r);
+    const s = lead orelse sys.fatal("a follower without a lead", .{});
+    s.waiting -= 1;
+    if (s.waiting == 0) lead = null;
+    c.shared = s;
+    sendBytes(c, s.bytes);
+}
+
+fn unshare(c: *Client) void {
+    const s = c.shared orelse return;
+    c.shared = null;
+    s.refs -= 1;
+    if (s.refs > 0) return;
+    s.out.release();
+    s.next_free = free_shared;
+    free_shared = s;
+}
+
 fn sendBytes(c: *Client, bytes: []const u8) void {
     c.sending = bytes;
     const s = sqe();
@@ -322,6 +377,7 @@ fn onSend(comptime F: Flags, c: *Client, cqe: *const linux.io_uring_cqe) void {
         if (c.sending.len > 0) return sendBytes(c, c.sending);
     }
     c.req.out.release();
+    unshare(c);
     c.busy = false;
     if (!c.req.keep_alive) c.closing = true;
     if (!c.closing) {
@@ -549,4 +605,41 @@ test "a served socket leaves quick-ACK mode through the ring, with no completion
     try testing.expectEqual(0, try quickAck(sfd));
     try testing.expectEqual(0, ring.cq_ready());
     try testing.expect(ack_delay);
+}
+
+test "a follower gets its lead's response even after the lead's client has sent its next one" {
+    const testing = std.testing;
+    const F: Flags = .{ .ackdelay = false };
+    ring = try IoUring.init(8, 0);
+    defer ring.deinit();
+    var pairs: [2][2]i32 = undefined;
+    for (&pairs) |*p| _ = try sys.check(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, p));
+    defer for (pairs) |p| for (p) |fd| sys.closeFd(fd);
+    var leader: Client = .{ .fd = pairs[0][0] };
+    var follower: Client = .{ .fd = pairs[1][0], .busy = true };
+
+    const first = "HTTP/1.1 200 OK\r\nContent-Type:application/json\r\nContent-Length:14\r\n\r\n{\"tags\":[\"a\"]}";
+    const second = "HTTP/1.1 200 OK\r\nContent-Type:application/json\r\nContent-Length:14\r\n\r\n{\"tags\":[\"b\"]}";
+    for ([_][]const u8{ "{\"tags\":[\"a\"]}", "{\"tags\":[\"b\"]}" }, 0..) |body, i| {
+        leader.busy = true;
+        leader.req.out = Buf.init();
+        leader.req.out.append(body);
+        respond(&leader.req, leader.req.out.finish(.ok, true, false, 1448));
+        if (i == 0) share(&leader.req, 1);
+        try testing.expectEqual(1, try ring.submit_and_wait(1));
+        const cqe = try ring.copy_cqe();
+        complete(F, &cqe);
+        try testing.expect(!leader.busy);
+    }
+    respondShared(&follower.req);
+    try testing.expectEqual(1, try ring.submit_and_wait(1));
+    const cqe = try ring.copy_cqe();
+    complete(F, &cqe);
+    try testing.expectEqual(null, lead);
+
+    var got: [512]u8 = undefined;
+    var n = try sys.check(linux.read(pairs[0][1], &got, got.len));
+    try testing.expectEqualStrings(first ++ second, got[0..n]);
+    n = try sys.check(linux.read(pairs[1][1], &got, got.len));
+    try testing.expectEqualStrings(first, got[0..n]);
 }

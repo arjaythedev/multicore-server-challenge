@@ -14,6 +14,10 @@ pub const Flags = struct {
     /// gzip (pz.zig, a fixed code table) for responses that need 3+ TCP segments, when the client accepts it and
     /// it saves a segment: fewer segments draw fewer client ACKs on the receive CPU.
     gzip: bool = true,
+    /// Shared responses (drain.zig): reads of one drain execution that would get the same bytes (same statement and
+    /// parameters but the viewer, no viewer flag set, same worker and response head) are rendered once and sent to
+    /// each client from one buffer.
+    share: bool = false,
 };
 
 const names = std.meta.fieldNames(Flags);
@@ -93,7 +97,8 @@ test "defaults, overrides, and the errors that stop the server" {
     try testing.expectError(error.BadValue, parse("shed=yes", &bad));
     try testing.expectError(error.BadValue, parse("shed", &bad));
     var buf: [64]u8 = undefined;
-    try testing.expectEqualStrings("shed=off,ackdelay=on,gzip=on", format(.{}, &buf));
+    try testing.expectEqualStrings("shed=off,ackdelay=on,gzip=on,share=off", format(.{}, &buf));
+    try testing.expectEqual(Flags{ .share = true }, try parse("share=on", &bad));
 }
 
 test "dispatch passes the runtime flags as a comptime value" {

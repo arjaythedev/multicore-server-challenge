@@ -123,6 +123,8 @@ pub const Query = struct {
     solo: bool = false,
     stmt: Stmt = .tags,
     params: [6]Param = undefined,
+    /// In the drain process, the share class of a worker's read (drain.zig's shared responses); 0: never shared.
+    share: u32 = 0,
 };
 
 pub const Queue = struct {
@@ -267,6 +269,8 @@ pub const Conn = struct {
     row: pg.Row = .{},
     mega: mega.Result = .{},
     fan: threads.Fan = .{},
+    /// The current unit's shared responses (drain.zig); none while empty.
+    share: drain.Plan = .{},
     /// A write connection's next drain time (monotonic ns), set once it is idle with writes queued.
     write_due: ?u64 = null,
 
@@ -668,7 +672,10 @@ fn message(c: *Conn, t: u8, body: []const u8) void {
             const members = g.unitMembers(u);
             switch (u.kind) {
                 .single => results.row(members[0], &c.row),
-                .broadcast => for (members) |r| results.row(r, &c.row),
+                .broadcast => {
+                    if (c.share.reads.len == 0) c.share.all(members);
+                    for (members, 0..) |r, k| if (!c.share.follows(k)) results.row(r, &c.row);
+                },
                 .batched => {
                     if (u.stmt.def().thread_cols != null)
                         return c.fan.row(&c.row, members, results) catch |e| sys.fatal("comments result: {s}", .{@errorName(e)});
@@ -685,12 +692,13 @@ fn message(c: *Conn, t: u8, body: []const u8) void {
             if (g.failed_at != null) return;
             const u = &g.units[g.cur];
             if (u.kind == .mega) {
-                c.mega.deliver(g.unitMembers(u), results) catch |e| sys.fatal("MEGA result: {s}", .{@errorName(e)});
+                c.mega.deliver(g.unitMembers(u), &c.share, results) catch |e| sys.fatal("MEGA result: {s}", .{@errorName(e)});
                 c.mega.reset();
             } else if (!g.write) {
-                for (g.unitMembers(u)) |r| results.done(r);
+                c.share.answer(g.unitMembers(u), results);
             }
             c.fan.reset();
+            c.share.reset();
             g.cur += 1;
         },
         'E' => {
@@ -699,6 +707,7 @@ fn message(c: *Conn, t: u8, body: []const u8) void {
             g.err = pg.ErrorInfo.parse(body);
             c.mega.reset();
             c.fan.reset();
+            c.share.reset();
         },
         'Z' => {
             const g = c.popGroup();
@@ -720,6 +729,15 @@ fn Results() type {
 
         pub fn done(_: @This(), r: *Query) void {
             if (drain.role == .drain) drain.done(r) else api.onDone(api.request(r));
+        }
+
+        /// Only the drain process has share classes, so only it leads or follows.
+        pub fn lead(_: @This(), r: *Query, n: u32) void {
+            drain.lead(r, n);
+        }
+
+        pub fn same(_: @This(), r: *Query) void {
+            drain.same(r);
         }
 
         /// The statement failed for this query alone.
