@@ -157,6 +157,10 @@ func (b *articles) bind(wake func()) {
 
 func (b *articles) pending() bool { return len(b.queue) > 0 }
 
+// maxArticleBatch bounds the reads of one articles statement. Bigger batches share more, but past this
+// one holds its reads too long.
+const maxArticleBatch = 1536
+
 // maxTop bounds the newest articles listed per shared followee. A feed reaching past it has no floor
 // and walks each followee instead.
 const maxTop = 200
@@ -184,7 +188,7 @@ type commentRow struct {
 }
 
 func (b *articles) take(pl *pgx.Batch) func(pgx.BatchResults) {
-	n := min(len(b.queue), maxBatch)
+	n := min(len(b.queue), maxArticleBatch)
 	if n == 0 {
 		return nil
 	}

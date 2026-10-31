@@ -41,7 +41,8 @@ Every article, comments, list and feed read of a batch is answered by **one exec
 Reads run on two lanes. The cheap lookups (tags, current user, login, profile) go to two connections that take
 whatever is queued when they free up. The statement above runs on eight connections, its batches starting at
 least 10 ms apart, so they grow with the load and share more. Under heavy load every worker is busy and
-batches grow on their own.
+batches grow on their own, up to 1536 reads: two batches merged into one cost Postgres about 15% less, but a
+bigger one holds its reads too long.
 
 What a batch shares, the tags list, the global count and every article's details among them, is read from
 Postgres within that one execution, for requests that were all waiting when it was sent. Nothing outlives it.
