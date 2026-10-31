@@ -705,11 +705,80 @@ const BCRYPT_DEC: [u8; 256] = {
 };
 
 #[derive(Clone, Copy)]
-#[repr(align(64))]
+#[repr(C, align(64))]
 struct BfState {
     p: [u32; 18],
     s: [[u32; 256]; 4],
     _pad: [u32; 14],
+}
+
+const _: () = assert!(std::mem::size_of::<BfState>() == 4224);
+
+#[cfg(target_arch = "x86_64")]
+std::arch::global_asm!(include_str!(concat!(env!("OUT_DIR"), "/bc_expand0.s")));
+
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" {
+    fn bc_expand0_ah_1(st: *mut BfState);
+    fn bc_expand0_ah_2(st: *mut BfState);
+    fn bc_expand0_ah_3(st: *mut BfState);
+    fn bc_expand0_ah_4(st: *mut BfState);
+    fn bc_expand0_ah_5(st: *mut BfState);
+    fn bc_expand0_ah_6(st: *mut BfState);
+    fn bc_expand0_bextr_1(st: *mut BfState);
+    fn bc_expand0_bextr_2(st: *mut BfState);
+    fn bc_expand0_bextr_3(st: *mut BfState);
+    fn bc_expand0_bextr_4(st: *mut BfState);
+    fn bc_expand0_bextr_5(st: *mut BfState);
+    fn bc_expand0_bextr_6(st: *mut BfState);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum BcryptKernel {
+    Rust = 0,
+    Ah = 1,
+    Bextr = 2,
+}
+
+static BCRYPT_KERNEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(BcryptKernel::Rust as u8);
+
+#[inline(always)]
+pub fn active_bcrypt_kernel() -> BcryptKernel {
+    match BCRYPT_KERNEL.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => BcryptKernel::Ah,
+        2 => BcryptKernel::Bextr,
+        _ => BcryptKernel::Rust,
+    }
+}
+
+#[inline(always)]
+fn xor_p_lanes<const N: usize>(st: &mut [BfState; N], xor_words: &[[u32; 18]; N]) {
+    for k in 0..N {
+        for i in 0..18 {
+            st[k].p[i] ^= xor_words[k][i];
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn asm_expand0_fn<const N: usize>(kernel: BcryptKernel) -> Option<unsafe extern "C" fn(*mut BfState)> {
+    match (kernel, N) {
+        (BcryptKernel::Ah, 1) => Some(bc_expand0_ah_1),
+        (BcryptKernel::Ah, 2) => Some(bc_expand0_ah_2),
+        (BcryptKernel::Ah, 3) => Some(bc_expand0_ah_3),
+        (BcryptKernel::Ah, 4) => Some(bc_expand0_ah_4),
+        (BcryptKernel::Ah, 5) => Some(bc_expand0_ah_5),
+        (BcryptKernel::Ah, 6) => Some(bc_expand0_ah_6),
+        (BcryptKernel::Bextr, 1) => Some(bc_expand0_bextr_1),
+        (BcryptKernel::Bextr, 2) => Some(bc_expand0_bextr_2),
+        (BcryptKernel::Bextr, 3) => Some(bc_expand0_bextr_3),
+        (BcryptKernel::Bextr, 4) => Some(bc_expand0_bextr_4),
+        (BcryptKernel::Bextr, 5) => Some(bc_expand0_bextr_5),
+        (BcryptKernel::Bextr, 6) => Some(bc_expand0_bextr_6),
+        _ => None,
+    }
 }
 
 #[inline(always)]
@@ -841,7 +910,16 @@ pub struct BcryptInput<'a> {
     pub salt: [u8; 16],
 }
 
+#[inline]
 pub fn bcrypt_lanes<const N: usize>(inputs: &[BcryptInput; N], cost: u32) -> [[u8; 23]; N] {
+    bcrypt_lanes_with_kernel::<N>(inputs, cost, active_bcrypt_kernel())
+}
+
+pub fn bcrypt_lanes_with_kernel<const N: usize>(
+    inputs: &[BcryptInput; N],
+    cost: u32,
+    kernel: BcryptKernel,
+) -> [[u8; 23]; N] {
     let mats: [KeyMaterial; N] = std::array::from_fn(|k| KeyMaterial::from_pw_salt(inputs[k].password, &inputs[k].salt));
     let key_p: [[u32; 18]; N] = std::array::from_fn(|k| mats[k].key_p);
     let salt_p: [[u32; 18]; N] = std::array::from_fn(|k| mats[k].salt18);
@@ -855,9 +933,28 @@ pub fn bcrypt_lanes<const N: usize>(inputs: &[BcryptInput; N], cost: u32) -> [[u
 
     eks_expand::<N, true>(&mut st, &key_p, &salt4);
     let rounds = 1u64 << cost;
-    for _ in 0..rounds {
-        eks_expand::<N, false>(&mut st, &key_p, &salt4);
-        eks_expand::<N, false>(&mut st, &salt_p, &salt4);
+    #[cfg(target_arch = "x86_64")]
+    if let Some(expand0) = asm_expand0_fn::<N>(kernel) {
+        let base_ptr = st.as_mut_ptr();
+        for _ in 0..rounds {
+            xor_p_lanes(&mut st, &key_p);
+            unsafe { expand0(base_ptr) };
+            xor_p_lanes(&mut st, &salt_p);
+            unsafe { expand0(base_ptr) };
+        }
+    } else {
+        for _ in 0..rounds {
+            eks_expand::<N, false>(&mut st, &key_p, &salt4);
+            eks_expand::<N, false>(&mut st, &salt_p, &salt4);
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = kernel;
+        for _ in 0..rounds {
+            eks_expand::<N, false>(&mut st, &key_p, &salt4);
+            eks_expand::<N, false>(&mut st, &salt_p, &salt4);
+        }
     }
 
     let mut ctext: [[u32; 6]; N] = [BCRYPT_CTEXT; N];
@@ -904,31 +1001,60 @@ pub fn calibrate_bcrypt_hardware() -> (usize, usize, usize) {
         password: b"calibrate-warmup",
         salt: [0x5au8; 16],
     }];
-    std::hint::black_box(bcrypt_lanes::<1>(&warm_in, 5));
 
-    macro_rules! probe_n {
-        ($n:literal) => {{
+    #[cfg(target_arch = "x86_64")]
+    let has_bmi = std::is_x86_feature_detected!("bmi1") && std::is_x86_feature_detected!("bmi2");
+    #[cfg(not(target_arch = "x86_64"))]
+    let has_bmi = false;
+
+    let kernels: &[BcryptKernel] = if has_bmi {
+        &[BcryptKernel::Ah, BcryptKernel::Bextr, BcryptKernel::Rust]
+    } else {
+        &[BcryptKernel::Rust]
+    };
+
+    for &k in kernels {
+        std::hint::black_box(bcrypt_lanes_with_kernel::<1>(&warm_in, 5, k));
+    }
+
+    macro_rules! probe_nk {
+        ($n:literal, $kernel:expr) => {{
             let inputs: [BcryptInput; $n] = std::array::from_fn(|k| BcryptInput {
                 password: b"calibrate-benchmark-pw",
                 salt: [(k as u8).wrapping_mul(17).wrapping_add(3); 16],
             });
-            let t0 = std::time::Instant::now();
-            std::hint::black_box(bcrypt_lanes::<$n>(&inputs, 8));
-            let us_cost8 = t0.elapsed().as_micros() as usize;
-            let us_cost10 = (us_cost8 * 4).max(1_000);
+            let mut min_us = usize::MAX;
+            for _ in 0..2 {
+                let t0 = std::time::Instant::now();
+                std::hint::black_box(bcrypt_lanes_with_kernel::<$n>(&inputs, 7, $kernel));
+                let us = t0.elapsed().as_micros() as usize;
+                if us < min_us {
+                    min_us = us;
+                }
+            }
+            let us_cost10 = (min_us * 8).max(1_000);
             let per_hash_us = us_cost10 / $n;
-            ($n, us_cost10, per_hash_us)
+            ($n, us_cost10, per_hash_us, $kernel)
         }};
     }
 
-    let candidates = [probe_n!(2), probe_n!(3), probe_n!(4), probe_n!(6)];
-    let mut best = candidates[0];
-    for cand in &candidates[1..] {
-        let state_kb = (cand.0 * std::mem::size_of::<BfState>()) / 1024;
-        if state_kb <= l1d_kb && cand.2 * 103 < best.2 * 100 {
-            best = *cand;
+    let mut best = probe_nk!(2, kernels[0]);
+    for &k in kernels {
+        let candidates = [
+            probe_nk!(2, k),
+            probe_nk!(3, k),
+            probe_nk!(4, k),
+            probe_nk!(5, k),
+            probe_nk!(6, k),
+        ];
+        for cand in &candidates {
+            let state_kb = (cand.0 * std::mem::size_of::<BfState>()) / 1024;
+            if state_kb <= l1d_kb && cand.2 * 102 < best.2 * 100 {
+                best = *cand;
+            }
         }
     }
+    BCRYPT_KERNEL.store(best.3 as u8, std::sync::atomic::Ordering::Relaxed);
     (best.0, best.1, l1d_kb)
 }
 
@@ -1085,10 +1211,17 @@ mod tests {
         let pws: [&[u8]; 6] = [b"a", b"bb", b"password123", b"test4", b"test5", b"zzzzzzzzzzzzzzzzzzzz"];
         let salts: [[u8; 16]; 6] = std::array::from_fn(|i| [i as u8 * 7 + 1; 16]);
         let jobs: [BcryptInput; 6] = std::array::from_fn(|i| BcryptInput { password: pws[i], salt: salts[i] });
-        let multi = bcrypt_lanes::<6>(&jobs, 4);
-        for i in 0..6 {
-            let single = bcrypt_lanes::<1>(&[BcryptInput { password: pws[i], salt: salts[i] }], 4)[0];
-            assert_eq!(multi[i], single);
+        let expected: [[u8; 23]; 6] = std::array::from_fn(|i| {
+            bcrypt_lanes_with_kernel::<1>(&[BcryptInput { password: pws[i], salt: salts[i] }], 4, BcryptKernel::Rust)[0]
+        });
+        let kernels = [BcryptKernel::Rust, BcryptKernel::Ah, BcryptKernel::Bextr];
+        for &k in &kernels {
+            assert_eq!(bcrypt_lanes_with_kernel::<1>(&[BcryptInput { password: pws[0], salt: salts[0] }], 4, k)[0], expected[0]);
+            assert_eq!(bcrypt_lanes_with_kernel::<2>(jobs[..2].try_into().unwrap(), 4, k), expected[..2]);
+            assert_eq!(bcrypt_lanes_with_kernel::<3>(jobs[..3].try_into().unwrap(), 4, k), expected[..3]);
+            assert_eq!(bcrypt_lanes_with_kernel::<4>(jobs[..4].try_into().unwrap(), 4, k), expected[..4]);
+            assert_eq!(bcrypt_lanes_with_kernel::<5>(jobs[..5].try_into().unwrap(), 4, k), expected[..5]);
+            assert_eq!(bcrypt_lanes_with_kernel::<6>(&jobs, 4, k), expected);
         }
     }
 }

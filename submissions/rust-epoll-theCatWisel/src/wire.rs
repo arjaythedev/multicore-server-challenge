@@ -366,34 +366,6 @@ impl PipelineBuf {
     }
 }
 
-pub fn iter_binary_array(raw: &[u8]) -> impl Iterator<Item = &[u8]> {
-    let (mut pos, mut rem) = if raw.len() < 12 {
-        (0, 0)
-    } else {
-        let ndim = i32::from_be_bytes(raw[0..4].try_into().unwrap());
-        if ndim <= 0 {
-            (0, 0)
-        } else {
-            let count = i32::from_be_bytes(raw[12..16].try_into().unwrap()).max(0) as usize;
-            (12 + 8 * ndim as usize, count)
-        }
-    };
-    std::iter::from_fn(move || {
-        while rem > 0 {
-            rem -= 1;
-            let len = i32::from_be_bytes(raw.get(pos..pos + 4)?.try_into().ok()?);
-            pos += 4;
-            if len < 0 {
-                continue;
-            }
-            let slice = raw.get(pos..pos + len as usize)?;
-            pos += len as usize;
-            return Some(slice);
-        }
-        None
-    })
-}
-
 pub struct PgConn {
     stream: TcpStream,
     rx: Vec<u8>,

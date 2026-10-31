@@ -206,8 +206,15 @@ impl<K: Hash + Eq + Clone> KeySet<K> {
     }
 }
 
-fn group_rows_by_ordinal(pipe: &PipelineBuf, res_idx: usize, key_count: usize) -> Vec<Vec<usize>> {
-    let mut grouped = vec![Vec::new(); key_count];
+fn group_rows_by_ordinal_into(pipe: &PipelineBuf, res_idx: usize, key_count: usize, grouped: &mut Vec<Vec<usize>>) {
+    for g in grouped.iter_mut() {
+        g.clear();
+    }
+    if grouped.len() < key_count {
+        grouped.resize_with(key_count, Vec::new);
+    } else {
+        grouped.truncate(key_count);
+    }
     for (row_idx, &span) in pipe.result_rows(res_idx).iter().enumerate() {
         let cols = pipe.row(span);
         let ord = pipe.i64(cols[0]);
@@ -215,25 +222,48 @@ fn group_rows_by_ordinal(pipe: &PipelineBuf, res_idx: usize, key_count: usize) -
             grouped[ord as usize - 1].push(row_idx);
         }
     }
-    grouped
 }
 
-fn encode_text_array<'a>(iter: impl ExactSizeIterator<Item = &'a [u8]>) -> Vec<u8> {
-    let mut enc = ArrayEncoder::with_capacity(OID_TEXT, iter.len());
-    for s in iter {
-        enc.push_bytes(s);
+fn map_rows_by_i64_into(
+    pipe: &PipelineBuf,
+    res_idx: Option<usize>,
+    keys: &KeySet<i64>,
+    col: usize,
+    out: &mut Vec<Option<wire::RowSpan>>,
+) {
+    out.clear();
+    out.resize(keys.len(), None);
+    if let Some(idx) = res_idx {
+        for &span in pipe.result_rows(idx) {
+            let r = pipe.row(span);
+            if let Some(&ord) = keys.index.get(&pipe.i64(r[col])) {
+                out[ord as usize] = Some(span);
+            }
+        }
     }
-    enc.finish();
-    enc.buf
 }
 
-fn encode_i64_array(iter: impl ExactSizeIterator<Item = i64>) -> Vec<u8> {
-    let mut enc = ArrayEncoder::with_capacity(OID_INT8, iter.len());
-    for v in iter {
-        enc.push_i64(v);
+fn map_rows_by_str_into(
+    pipe: &PipelineBuf,
+    res_idx: Option<usize>,
+    keys: &KeySet<String>,
+    col: usize,
+    out: &mut Vec<Option<wire::RowSpan>>,
+) {
+    out.clear();
+    out.resize(keys.len(), None);
+    if let Some(idx) = res_idx {
+        for &span in pipe.result_rows(idx) {
+            let r = pipe.row(span);
+            if let Some(raw) = pipe.bytes(r[col]) {
+                if let Ok(s) = std::str::from_utf8(raw) {
+                    if let Some(&ord) = keys.index.get(s) {
+                        out[ord as usize] = Some(span);
+                    }
+                }
+            }
+        }
     }
-    enc.finish();
-    enc.buf
 }
 
 #[inline]
@@ -337,6 +367,56 @@ enum PlanSlot {
     Global(u32),
     Filtered(usize, u32, u32),
     Feed(u32, u32),
+}
+
+struct ReadRenderScratch {
+    slug_rows: Vec<Option<ArticleRef>>,
+    aid_rows: Vec<Option<ArticleRef>>,
+    prof_rows: Vec<Option<wire::RowSpan>>,
+    uid_rows: Vec<Option<wire::RowSpan>>,
+    uemail_rows: Vec<Option<wire::RowSpan>>,
+    grp_cmts: Vec<Vec<usize>>,
+    cmt_sort_buf: Vec<(i64, i64, wire::RowSpan)>,
+    cached_cmts: Vec<Option<Vec<CachedCommentSlice>>>,
+    rendered_profiles: Vec<Option<Arc<[u8]>>>,
+    rendered_cmts: Vec<Option<Arc<[u8]>>>,
+    rendered_slugs: Vec<Option<Arc<[u8]>>>,
+    rendered_global: Vec<Option<Arc<[u8]>>>,
+    rendered_filters: [Vec<Option<Arc<[u8]>>>; 3],
+    global_counts: Vec<i64>,
+    global_pages: Vec<ArticlePage>,
+    filter_counts: [Vec<i64>; 3],
+    filter_pages: [Vec<ArticlePage>; 3],
+    feed_counts: Vec<i64>,
+    feed_pages: Vec<ArticlePage>,
+    raw_pages: Vec<Vec<(i64, i64, wire::RowSpan)>>,
+}
+
+impl ReadRenderScratch {
+    fn new() -> Self {
+        ReadRenderScratch {
+            slug_rows: Vec::with_capacity(64),
+            aid_rows: Vec::with_capacity(64),
+            prof_rows: Vec::with_capacity(64),
+            uid_rows: Vec::with_capacity(32),
+            uemail_rows: Vec::with_capacity(32),
+            grp_cmts: Vec::with_capacity(64),
+            cmt_sort_buf: Vec::with_capacity(128),
+            cached_cmts: Vec::with_capacity(64),
+            rendered_profiles: Vec::with_capacity(64),
+            rendered_cmts: Vec::with_capacity(64),
+            rendered_slugs: Vec::with_capacity(64),
+            rendered_global: Vec::with_capacity(16),
+            rendered_filters: [Vec::with_capacity(32), Vec::with_capacity(32), Vec::with_capacity(32)],
+            global_counts: Vec::with_capacity(4),
+            global_pages: Vec::with_capacity(16),
+            filter_counts: [Vec::with_capacity(32), Vec::with_capacity(32), Vec::with_capacity(32)],
+            filter_pages: [Vec::with_capacity(32), Vec::with_capacity(32), Vec::with_capacity(32)],
+            feed_counts: Vec::with_capacity(64),
+            feed_pages: Vec::with_capacity(64),
+            raw_pages: Vec::with_capacity(64),
+        }
+    }
 }
 
 struct FilterDedup {
@@ -450,7 +530,9 @@ pub struct ReadWorker {
     art_author_ords: Vec<u32>,
     art_meta: Vec<MetaSource>,
     meta_req_ids: Vec<i64>,
-    meta_req_ords: Vec<u32>,
+    art_fav_counts: Vec<i64>,
+    art_tag_head: Vec<u32>,
+    art_tag_nodes: Vec<(u32, u32)>,
     author_spans: Vec<Option<wire::RowSpan>>,
     fav_pairs: Vec<(i64, i64)>,
     foll_pairs: Vec<(i64, i64)>,
@@ -469,6 +551,7 @@ pub struct ReadWorker {
     enc_a: ArrayEncoder,
     enc_b: ArrayEncoder,
     enc_c: ArrayEncoder,
+    rr: ReadRenderScratch,
 }
 
 const FILTER_STMT_NAMES: [&str; 3] = ["tag", "author", "favlist"];
@@ -498,7 +581,9 @@ impl ReadWorker {
             art_author_ords: Vec::with_capacity(256),
             art_meta: Vec::with_capacity(256),
             meta_req_ids: Vec::with_capacity(256),
-            meta_req_ords: Vec::with_capacity(256),
+            art_fav_counts: Vec::with_capacity(256),
+            art_tag_head: Vec::with_capacity(256),
+            art_tag_nodes: Vec::with_capacity(512),
             author_spans: Vec::with_capacity(128),
             fav_pairs: Vec::with_capacity(512),
             foll_pairs: Vec::with_capacity(512),
@@ -517,6 +602,7 @@ impl ReadWorker {
             enc_a: ArrayEncoder::with_capacity(OID_INT8, 256),
             enc_b: ArrayEncoder::with_capacity(OID_INT8, 256),
             enc_c: ArrayEncoder::with_capacity(OID_INT8, 256),
+            rr: ReadRenderScratch::new(),
         }
     }
 
@@ -841,8 +927,10 @@ impl ReadWorker {
                     }
                 }
             }
-            let grp_uid = st_uid.map(|idx| group_rows_by_ordinal(pa, idx, self.k_uid.len())).unwrap_or_default();
-            let grp_uemail = st_uemail.map(|idx| group_rows_by_ordinal(pa, idx, self.k_uemail.len())).unwrap_or_default();
+            map_rows_by_i64_into(pa, st_uid, &self.k_uid, 0, &mut self.rr.uid_rows);
+            map_rows_by_str_into(pa, st_uemail, &self.k_uemail, 2, &mut self.rr.uemail_rows);
+            let uid_rows = &self.rr.uid_rows;
+            let uemail_rows = &self.rr.uemail_rows;
             let mut early_replies: Vec<OutgoingReply> = Vec::new();
             let mut login_tasks: Vec<CryptoTask> = Vec::new();
             let mut rendered_tags: Option<Arc<[u8]>> = None;
@@ -878,17 +966,17 @@ impl ReadWorker {
                             let ReadOp::CurrentUser { token, .. } = &task.op else {
                                 unreachable!()
                             };
-                            match grp_uid[k as usize].first() {
-                                Some(&row_i) => {
-                                    let r = pa.row(pa.result_rows(st_uid.unwrap())[row_i]);
+                            match uid_rows.get(k as usize).copied().flatten() {
+                                Some(span) => {
+                                    let r = pa.row(span);
                                     let mut body = Vec::with_capacity(512);
                                     write_user_envelope(
                                         &mut body,
-                                        pa.bytes(r[3]).unwrap_or(b""),
-                                        token.as_bytes(),
                                         pa.bytes(r[2]).unwrap_or(b""),
+                                        token.as_bytes(),
+                                        pa.bytes(r[1]).unwrap_or(b""),
+                                        pa.bytes(r[3]),
                                         pa.bytes(r[4]),
-                                        pa.bytes(r[5]),
                                     );
                                     early_replies.push(OutgoingReply {
                                         addr: task.addr,
@@ -904,17 +992,17 @@ impl ReadWorker {
                                 unreachable!()
                             };
                             let pw = std::mem::take(password);
-                            match grp_uemail[k as usize].first() {
-                                Some(&row_i) => {
-                                    let r = pa.row(pa.result_rows(st_uemail.unwrap())[row_i]);
+                            match uemail_rows.get(k as usize).copied().flatten() {
+                                Some(span) => {
+                                    let r = pa.row(span);
                                     let user = UserRecord {
-                                        id: pa.i64(r[1]),
-                                        username: clone_cell_bytes(pa, r[2]).unwrap_or_default(),
-                                        email: clone_cell_bytes(pa, r[3]).unwrap_or_default(),
-                                        bio: clone_cell_bytes(pa, r[4]),
-                                        image: clone_cell_bytes(pa, r[5]),
+                                        id: pa.i64(r[0]),
+                                        username: clone_cell_bytes(pa, r[1]).unwrap_or_default(),
+                                        email: clone_cell_bytes(pa, r[2]).unwrap_or_default(),
+                                        bio: clone_cell_bytes(pa, r[3]),
+                                        image: clone_cell_bytes(pa, r[4]),
                                     };
-                                    let hash = clone_cell_bytes(pa, r[6]).unwrap_or_default();
+                                    let hash = clone_cell_bytes(pa, r[5]).unwrap_or_default();
                                     login_tasks.push(CryptoTask::VerifyLogin {
                                         password: pw,
                                         hash,
@@ -958,9 +1046,14 @@ impl ReadWorker {
         self.art_meta.clear();
 
         let pa = &self.pa;
-        let grp = |s: Option<usize>, len: usize| s.map(|idx| group_rows_by_ordinal(pa, idx, len)).unwrap_or_default();
-        let grp_prof = grp(st_prof, self.k_prof.len());
-        let grp_cmts = grp(st_cmts, self.k_cmts.len());
+        map_rows_by_str_into(pa, st_prof, &self.k_prof, 1, &mut self.rr.prof_rows);
+        if let Some(idx) = st_cmts {
+            group_rows_by_ordinal_into(pa, idx, self.k_cmts.len(), &mut self.rr.grp_cmts);
+        } else {
+            self.rr.grp_cmts.clear();
+        }
+        let prof_rows = &self.rr.prof_rows;
+        let grp_cmts = &self.rr.grp_cmts;
 
         let mut intern_art = |aid: i64, author: i64, span: wire::RowSpan, meta_src: MetaSource| -> ArticleRef {
             let prev_len = self.distinct_arts.len();
@@ -980,100 +1073,157 @@ impl ReadWorker {
             }
         };
 
-        let mut single_article = |s: Option<usize>, len: usize| -> Vec<Option<ArticleRef>> {
-            let mut out = vec![None; len];
-            if let Some(idx) = s {
-                for &span in pa.result_rows(idx) {
-                    let r = pa.row(span);
-                    let ord = pa.i64(r[0]);
-                    if ord >= 1 && (ord as usize) <= len {
-                        out[ord as usize - 1] =
-                            Some(intern_art(pa.i64(r[1]), pa.i64(r[2]), span, MetaSource::PhaseA(span)));
+        self.rr.slug_rows.clear();
+        self.rr.slug_rows.resize(self.k_slug.len(), None);
+        if let Some(idx) = st_slug {
+            for &span in pa.result_rows(idx) {
+                let r = pa.row(span);
+                if let Some(raw) = pa.bytes(r[3]) {
+                    if let Ok(s) = std::str::from_utf8(raw) {
+                        if let Some(&ord) = self.k_slug.index.get(s) {
+                            self.rr.slug_rows[ord as usize] =
+                                Some(intern_art(pa.i64(r[1]), pa.i64(r[2]), span, MetaSource::PhaseA(span)));
+                        }
                     }
                 }
             }
-            out
-        };
-        let slug_rows = single_article(st_slug, self.k_slug.len());
-        let aid_rows = single_article(st_aid, self.k_aid.len());
+        }
+        self.rr.aid_rows.clear();
+        self.rr.aid_rows.resize(self.k_aid.len(), None);
+        if let Some(idx) = st_aid {
+            for &span in pa.result_rows(idx) {
+                let r = pa.row(span);
+                let aid = pa.i64(r[1]);
+                if let Some(&ord) = self.k_aid.index.get(&aid) {
+                    self.rr.aid_rows[ord as usize] =
+                        Some(intern_art(aid, pa.i64(r[2]), span, MetaSource::PhaseA(span)));
+                }
+            }
+        }
+        let slug_rows = &self.rr.slug_rows;
+        let aid_rows = &self.rr.aid_rows;
 
-        let mut unpack_list =
-            |s: Option<usize>, n_cnt: usize, n_page: usize, has_meta: bool| -> (Vec<i64>, Vec<ArticlePage>) {
-                let mut counts = vec![0i64; n_cnt.max(1)];
-                let mut pages: Vec<ArticlePage> = vec![Vec::new(); n_page];
-                if let Some(idx) = s {
-                    let mut raw_pages: Vec<Vec<(i64, i64, wire::RowSpan)>> = vec![Vec::new(); n_page];
-                    for &span in pa.result_rows(idx) {
-                        let r = pa.row(span);
-                        let ord = pa.i64(r[0]);
-                        if ord <= 0 {
-                            let c_idx = (-ord) as usize;
-                            let c_idx = if c_idx == 0 { 0 } else { c_idx - 1 };
-                            if c_idx < counts.len() {
-                                counts[c_idx] = pa.i64(r[1]);
-                            }
-                        } else if (ord as usize) <= n_page {
-                            raw_pages[ord as usize - 1].push((pa.i64(r[1]), pa.i64(r[2]), span));
+        let raw_pages = &mut self.rr.raw_pages;
+        let mut unpack_list_into = |s: Option<usize>,
+                                    n_cnt: usize,
+                                    n_page: usize,
+                                    has_meta: bool,
+                                    counts: &mut Vec<i64>,
+                                    pages: &mut Vec<ArticlePage>| {
+            counts.clear();
+            counts.resize(n_cnt.max(1), 0);
+            for p in pages.iter_mut() {
+                p.clear();
+            }
+            if pages.len() < n_page {
+                pages.resize_with(n_page, Vec::new);
+            } else {
+                pages.truncate(n_page);
+            }
+            if let Some(idx) = s {
+                for rp in raw_pages.iter_mut() {
+                    rp.clear();
+                }
+                if raw_pages.len() < n_page {
+                    raw_pages.resize_with(n_page, Vec::new);
+                } else {
+                    raw_pages.truncate(n_page);
+                }
+                for &span in pa.result_rows(idx) {
+                    let r = pa.row(span);
+                    let ord = pa.i64(r[0]);
+                    if ord <= 0 {
+                        let c_idx = (-ord) as usize;
+                        let c_idx = if c_idx == 0 { 0 } else { c_idx - 1 };
+                        if c_idx < counts.len() {
+                            counts[c_idx] = pa.i64(r[1]);
                         }
-                    }
-                    for (p_idx, mut rp) in raw_pages.into_iter().enumerate() {
-                        if rp.len() > 1 {
-                            rp.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-                        }
-                        let dst = &mut pages[p_idx];
-                        dst.reserve(rp.len());
-                        for (aid, author, span) in rp {
-                            dst.push(intern_art(
-                                aid,
-                                author,
-                                span,
-                                if has_meta {
-                                    MetaSource::PhaseA(span)
-                                } else {
-                                    MetaSource::None
-                                },
-                            ));
-                        }
+                    } else if (ord as usize) <= n_page {
+                        raw_pages[ord as usize - 1].push((pa.i64(r[1]), pa.i64(r[2]), span));
                     }
                 }
-                (counts, pages)
-            };
-
-        let (global_counts, global_pages) = if use_global_win {
-            let (cnts, mut win_pages) = unpack_list(st_global, 1, 1, true);
-            let win = win_pages.pop().unwrap_or_default();
-            let pages: Vec<ArticlePage> = self
-                .k_global
-                .items
-                .iter()
-                .map(|&(lim, off)| {
-                    let start = (off.max(0) as usize).min(win.len());
-                    let end = start.saturating_add(lim.max(0) as usize).min(win.len());
-                    win[start..end].to_vec()
-                })
-                .collect();
-            (cnts, pages)
-        } else {
-            unpack_list(st_global, 1, self.k_global.len(), true)
+                for (p_idx, rp) in raw_pages.iter_mut().enumerate() {
+                    if rp.len() > 1 {
+                        rp.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                    }
+                    let dst = &mut pages[p_idx];
+                    dst.reserve(rp.len());
+                    for &(aid, author, span) in rp.iter() {
+                        dst.push(intern_art(
+                            aid,
+                            author,
+                            span,
+                            if has_meta {
+                                MetaSource::PhaseA(span)
+                            } else {
+                                MetaSource::None
+                            },
+                        ));
+                    }
+                }
+            }
         };
-        let filter_results: Vec<(Vec<i64>, Vec<ArticlePage>)> = (0..3)
-            .map(|i| {
-                unpack_list(
-                    st_filters[i],
-                    self.k_filters[i].counts.len(),
-                    self.k_filters[i].pages.len(),
-                    i != 1,
-                )
-            })
-            .collect();
-        let (feed_counts, feed_pages) = unpack_list(st_feed, self.k_feed_cnt.len(), self.k_feed_page.len(), false);
+
+        if use_global_win {
+            unpack_list_into(
+                st_global,
+                1,
+                1,
+                true,
+                &mut self.rr.global_counts,
+                &mut self.rr.global_pages,
+            );
+            let win = self.rr.global_pages.pop().unwrap_or_default();
+            let n_g = self.k_global.items.len();
+            for p in self.rr.global_pages.iter_mut() {
+                p.clear();
+            }
+            if self.rr.global_pages.len() < n_g {
+                self.rr.global_pages.resize_with(n_g, Vec::new);
+            } else {
+                self.rr.global_pages.truncate(n_g);
+            }
+            for (idx, &(lim, off)) in self.k_global.items.iter().enumerate() {
+                let start = (off.max(0) as usize).min(win.len());
+                let end = start.saturating_add(lim.max(0) as usize).min(win.len());
+                self.rr.global_pages[idx].extend_from_slice(&win[start..end]);
+            }
+        } else {
+            unpack_list_into(
+                st_global,
+                1,
+                self.k_global.len(),
+                true,
+                &mut self.rr.global_counts,
+                &mut self.rr.global_pages,
+            );
+        }
+        for i in 0..3 {
+            unpack_list_into(
+                st_filters[i],
+                self.k_filters[i].counts.len(),
+                self.k_filters[i].pages.len(),
+                i != 1,
+                &mut self.rr.filter_counts[i],
+                &mut self.rr.filter_pages[i],
+            );
+        }
+        unpack_list_into(
+            st_feed,
+            self.k_feed_cnt.len(),
+            self.k_feed_page.len(),
+            false,
+            &mut self.rr.feed_counts,
+            &mut self.rr.feed_pages,
+        );
+        let global_pages = &self.rr.global_pages;
+        let filter_pages = &self.rr.filter_pages;
+        let feed_pages = &self.rr.feed_pages;
 
         self.meta_req_ids.clear();
-        self.meta_req_ords.clear();
         for (k, &meta) in self.art_meta.iter().enumerate() {
             if matches!(meta, MetaSource::None) {
                 self.meta_req_ids.push(self.distinct_arts.items[k]);
-                self.meta_req_ords.push(k as u32);
             }
         }
 
@@ -1107,7 +1257,7 @@ impl ReadWorker {
                     }
                 }
                 PlanSlot::Filtered(kind, _, p) => {
-                    let rows = &filter_results[kind].1[p as usize];
+                    let rows = &filter_pages[kind][p as usize];
                     if kind == 1 {
                         if let Some(&first) = rows.first() {
                             self.foll_pairs.push((viewer, first.author));
@@ -1132,18 +1282,16 @@ impl ReadWorker {
                         let rows = pa.result_rows(s);
                         for &row_i in &grp_cmts[k as usize] {
                             let r = pa.row(rows[row_i]);
-                            if r[2].len >= 0 {
-                                self.foll_pairs.push((viewer, pa.i64(r[6])));
+                            if r[1].len >= 0 {
+                                self.foll_pairs.push((viewer, pa.i64(r[5])));
                             }
                         }
                     }
                 }
                 PlanSlot::Profile(k) => {
-                    if let Some(s) = st_prof {
-                        if let Some(&row_i) = grp_prof[k as usize].first() {
-                            let r = pa.row(pa.result_rows(s)[row_i]);
-                            self.foll_pairs.push((viewer, pa.i64(r[1])));
-                        }
+                    if let Some(span) = prof_rows.get(k as usize).copied().flatten() {
+                        let r = pa.row(span);
+                        self.foll_pairs.push((viewer, pa.i64(r[0])));
                     }
                 }
                 PlanSlot::Tags | PlanSlot::User(_) | PlanSlot::Login(_) => {}
@@ -1221,46 +1369,56 @@ impl ReadWorker {
         self.fav_hits.clear();
         self.foll_hits.clear();
 
-        let mut cached_cmts: Vec<Option<Vec<CachedCommentSlice>>> = Vec::with_capacity(self.k_cmts.len());
-        let mut rendered_profiles: Vec<Option<Arc<[u8]>>> = vec![None; self.k_prof.len()];
-        let mut rendered_cmts: Vec<Option<Arc<[u8]>>> = vec![None; self.k_cmts.len()];
+        self.rr.cached_cmts.clear();
+        self.rr.rendered_profiles.clear();
+        self.rr.rendered_profiles.resize(self.k_prof.len(), None);
+        self.rr.rendered_cmts.clear();
+        self.rr.rendered_cmts.resize(self.k_cmts.len(), None);
         {
             let pa = &self.pa;
             let arena = &mut self.arena;
+            let cached_cmts = &mut self.rr.cached_cmts;
+            let cmt_sort_buf = &mut self.rr.cmt_sort_buf;
+            let rendered_profiles = &mut self.rr.rendered_profiles;
+            let rendered_cmts = &mut self.rr.rendered_cmts;
             if let Some(s) = st_cmts {
                 let cmt_rows = pa.result_rows(s);
-                for row_indices in &grp_cmts {
+                for row_indices in grp_cmts {
                     if row_indices.is_empty() {
                         cached_cmts.push(None);
                         continue;
                     }
-                    let mut rows: Vec<&[Cell]> = row_indices
-                        .iter()
-                        .map(|&i| pa.row(cmt_rows[i]))
-                        .filter(|r| r[2].len >= 0 && r[7].len >= 0)
-                        .collect();
-                    rows.sort_unstable_by(|a, b| (pa.i64(b[4]), pa.i64(b[2])).cmp(&(pa.i64(a[4]), pa.i64(a[2]))));
-                    let mut list = Vec::with_capacity(rows.len());
-                    for r in rows {
+                    cmt_sort_buf.clear();
+                    for &i in row_indices {
+                        let span = cmt_rows[i];
+                        let r = pa.row(span);
+                        if r[1].len >= 0 && r[6].len >= 0 {
+                            cmt_sort_buf.push((pa.i64(r[3]), pa.i64(r[1]), span));
+                        }
+                    }
+                    cmt_sort_buf.sort_unstable_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
+                    let mut list = Vec::with_capacity(cmt_sort_buf.len());
+                    for &(_, cid, span) in cmt_sort_buf.iter() {
+                        let r = pa.row(span);
                         let start = arena.len() as u32;
                         arena.extend_from_slice(b"{\"id\":");
-                        codec::write_i64(arena, pa.i64(r[2]));
+                        codec::write_i64(arena, cid);
                         arena.extend_from_slice(b",\"createdAt\":");
-                        codec::write_timestamp(arena, pa.i64(r[4]));
+                        codec::write_timestamp(arena, pa.i64(r[3]));
                         arena.extend_from_slice(b",\"updatedAt\":");
-                        codec::write_timestamp(arena, pa.i64(r[5]));
+                        codec::write_timestamp(arena, pa.i64(r[4]));
                         arena.extend_from_slice(b",\"body\":");
-                        codec::write_str(arena, pa.bytes(r[3]).unwrap_or(b""));
+                        codec::write_str(arena, pa.bytes(r[2]).unwrap_or(b""));
                         arena.extend_from_slice(b",\"author\":{\"username\":");
-                        codec::write_str(arena, pa.bytes(r[7]).unwrap_or(b""));
+                        codec::write_str(arena, pa.bytes(r[6]).unwrap_or(b""));
                         arena.extend_from_slice(b",\"bio\":");
-                        codec::write_nullable_str(arena, pa.bytes(r[8]));
+                        codec::write_nullable_str(arena, pa.bytes(r[7]));
                         arena.extend_from_slice(b",\"image\":");
-                        codec::write_nullable_str(arena, pa.bytes(r[9]));
+                        codec::write_nullable_str(arena, pa.bytes(r[8]));
                         arena.extend_from_slice(b",\"following\":");
                         let end = arena.len() as u32;
                         list.push(CachedCommentSlice {
-                            author_id: pa.i64(r[6]),
+                            author_id: pa.i64(r[5]),
                             start,
                             end,
                         });
@@ -1277,8 +1435,8 @@ impl ReadWorker {
                     }
                     let addr = task.addr;
                     match slot {
-                        PlanSlot::Profile(k) => match grp_prof[k as usize].first() {
-                            Some(&row_i) => {
+                        PlanSlot::Profile(k) => match prof_rows.get(k as usize).copied().flatten() {
+                            Some(span) => {
                                 if let Some(shared) = &rendered_profiles[k as usize] {
                                     mid_replies.push(OutgoingReply {
                                         addr,
@@ -1286,14 +1444,14 @@ impl ReadWorker {
                                         body: ReplyBody::Shared(shared.clone()),
                                     });
                                 } else {
-                                    let r = pa.row(pa.result_rows(st_prof.unwrap())[row_i]);
+                                    let r = pa.row(span);
                                     let mut body = Vec::with_capacity(256);
                                     body.extend_from_slice(b"{\"profile\":");
                                     write_profile_json(
                                         &mut body,
-                                        pa.bytes(r[2]).unwrap_or(b""),
+                                        pa.bytes(r[1]).unwrap_or(b""),
+                                        pa.bytes(r[2]),
                                         pa.bytes(r[3]),
-                                        pa.bytes(r[4]),
                                         false,
                                     );
                                     body.push(b'}');
@@ -1374,116 +1532,127 @@ impl ReadWorker {
             if let Some(s) = b_artmeta {
                 for &span in pb.result_rows(s) {
                     let r = pb.row(span);
-                    let ord = pb.i64(r[0]);
-                    if ord >= 1 && (ord as usize) <= self.meta_req_ords.len() {
-                        let art_k = self.meta_req_ords[ord as usize - 1] as usize;
-                        self.art_meta[art_k] = MetaSource::PhaseB(span);
+                    if let Some(&art_k) = self.distinct_arts.index.get(&pb.i64(r[0])) {
+                        self.art_meta[art_k as usize] = MetaSource::PhaseB(span);
                     }
                 }
             }
             if let Some(s) = b_artau {
                 for &span in pb.result_rows(s) {
                     let r = pb.row(span);
-                    let ord = pb.i64(r[0]);
-                    if ord >= 1 && (ord as usize) <= self.author_spans.len() {
-                        self.author_spans[ord as usize - 1] = Some(span);
+                    if let Some(&au_ord) = self.distinct_authors.index.get(&pb.i64(r[0])) {
+                        self.author_spans[au_ord as usize] = Some(span);
                     }
                 }
             }
             if let Some(s) = b_artx {
                 let n_arts = self.distinct_arts.len();
+                self.art_fav_counts.clear();
+                self.art_fav_counts.resize(n_arts, 0);
+                self.art_tag_head.clear();
+                self.art_tag_head.resize(n_arts, u32::MAX);
+                self.art_tag_nodes.clear();
                 for &span in pb.result_rows(s) {
                     let r = pb.row(span);
-                    let ord = pb.i64(r[0]);
-                    if ord >= 1 && (ord as usize) <= n_arts {
-                        let k = ord as usize - 1;
-                        let au_ord = self.art_author_ords[k] as usize;
-                        let Some(au_span) = self.author_spans.get(au_ord).copied().flatten() else {
-                            continue;
-                        };
-                        let (slug_b, title_b, desc_b, created_at, updated_at) = match self.art_meta[k] {
-                            MetaSource::PhaseA(mspan) => {
-                                let mr = pa.row(mspan);
-                                (
-                                    pa.bytes(mr[3]).unwrap_or(b""),
-                                    pa.bytes(mr[4]).unwrap_or(b""),
-                                    pa.bytes(mr[5]).unwrap_or(b""),
-                                    pa.i64(mr[6]),
-                                    pa.i64(mr[7]),
-                                )
-                            }
-                            MetaSource::PhaseB(mspan) => {
-                                let mr = pb.row(mspan);
-                                (
-                                    pb.bytes(mr[1]).unwrap_or(b""),
-                                    pb.bytes(mr[2]).unwrap_or(b""),
-                                    pb.bytes(mr[3]).unwrap_or(b""),
-                                    pb.i64(mr[4]),
-                                    pb.i64(mr[5]),
-                                )
-                            }
-                            MetaSource::None => continue,
-                        };
-                        let au = pb.row(au_span);
+                    let kind = pb.i64(r[0]);
+                    let aid = pb.i64(r[1]);
+                    let val = pb.i64(r[2]);
+                    if let Some(&ord) = self.distinct_arts.index.get(&aid) {
+                        let k = ord as usize;
+                        if kind == 0 {
+                            let node_idx = self.art_tag_nodes.len() as u32;
+                            self.art_tag_nodes.push((val as u32, self.art_tag_head[k]));
+                            self.art_tag_head[k] = node_idx;
+                        } else {
+                            self.art_fav_counts[k] = val;
+                        }
+                    }
+                }
+                for k in 0..n_arts {
+                    let au_ord = self.art_author_ords[k] as usize;
+                    let Some(au_span) = self.author_spans.get(au_ord).copied().flatten() else {
+                        continue;
+                    };
+                    let (slug_b, title_b, desc_b, created_at, updated_at) = match self.art_meta[k] {
+                        MetaSource::PhaseA(mspan) => {
+                            let mr = pa.row(mspan);
+                            (
+                                pa.bytes(mr[3]).unwrap_or(b""),
+                                pa.bytes(mr[4]).unwrap_or(b""),
+                                pa.bytes(mr[5]).unwrap_or(b""),
+                                pa.i64(mr[6]),
+                                pa.i64(mr[7]),
+                            )
+                        }
+                        MetaSource::PhaseB(mspan) => {
+                            let mr = pb.row(mspan);
+                            (
+                                pb.bytes(mr[1]).unwrap_or(b""),
+                                pb.bytes(mr[2]).unwrap_or(b""),
+                                pb.bytes(mr[3]).unwrap_or(b""),
+                                pb.i64(mr[4]),
+                                pb.i64(mr[5]),
+                            )
+                        }
+                        MetaSource::None => continue,
+                    };
+                    let au = pb.row(au_span);
 
-                        let head_start = arena.len() as u32;
-                        arena.extend_from_slice(b"{\"slug\":");
-                        codec::write_str(arena, slug_b);
-                        arena.extend_from_slice(b",\"title\":");
-                        codec::write_str(arena, title_b);
-                        arena.extend_from_slice(b",\"description\":");
-                        codec::write_str(arena, desc_b);
-                        let head_end = arena.len() as u32;
+                    let head_start = arena.len() as u32;
+                    arena.extend_from_slice(b"{\"slug\":");
+                    codec::write_str(arena, slug_b);
+                    arena.extend_from_slice(b",\"title\":");
+                    codec::write_str(arena, title_b);
+                    arena.extend_from_slice(b",\"description\":");
+                    codec::write_str(arena, desc_b);
+                    let head_end = arena.len() as u32;
 
-                        arena.extend_from_slice(b",\"tagList\":[");
-                        if let Some(raw_arr) = pb.bytes(r[1]) {
-                            tag_sort_buf.clear();
-                            for elem in wire::iter_binary_array(raw_arr) {
-                                if let Ok(bytes) = elem.try_into() {
-                                    let tid = i32::from_be_bytes(bytes) as usize;
-                                    if let Some(&name_cell) = self.tag_lut.get(tid) {
-                                        if let Some(name_bytes) = pa.bytes(name_cell) {
-                                            tag_sort_buf.push(name_bytes);
-                                        }
-                                    }
-                                }
-                            }
-                            if tag_sort_buf.len() > 1 {
-                                tag_sort_buf.sort_unstable();
-                            }
-                            for (idx, &name_bytes) in tag_sort_buf.iter().enumerate() {
-                                if idx > 0 {
-                                    arena.push(b',');
-                                }
-                                codec::write_str(arena, name_bytes);
+                    arena.extend_from_slice(b",\"tagList\":[");
+                    tag_sort_buf.clear();
+                    let mut cur = self.art_tag_head[k];
+                    while cur != u32::MAX {
+                        let (tid, next) = self.art_tag_nodes[cur as usize];
+                        cur = next;
+                        if let Some(&name_cell) = self.tag_lut.get(tid as usize) {
+                            if let Some(name_bytes) = pa.bytes(name_cell) {
+                                tag_sort_buf.push(name_bytes);
                             }
                         }
-                        arena.extend_from_slice(b"],\"createdAt\":");
-                        codec::write_timestamp(arena, created_at);
-                        arena.extend_from_slice(b",\"updatedAt\":");
-                        codec::write_timestamp(arena, updated_at);
-                        arena.extend_from_slice(b",\"favorited\":");
-                        let mid_end = arena.len() as u32;
-
-                        arena.extend_from_slice(b",\"favoritesCount\":");
-                        codec::write_i64(arena, pb.i64(r[2]));
-                        arena.extend_from_slice(b",\"author\":{\"username\":");
-                        codec::write_str(arena, pb.bytes(au[1]).unwrap_or(b""));
-                        arena.extend_from_slice(b",\"bio\":");
-                        codec::write_nullable_str(arena, pb.bytes(au[2]));
-                        arena.extend_from_slice(b",\"image\":");
-                        codec::write_nullable_str(arena, pb.bytes(au[3]));
-                        arena.extend_from_slice(b",\"following\":");
-                        let tail_end = arena.len() as u32;
-
-                        self.cached_arts[k] = CachedArticleSlices {
-                            ready: true,
-                            head_start,
-                            head_end,
-                            mid_end,
-                            tail_end,
-                        };
                     }
+                    if tag_sort_buf.len() > 1 {
+                        tag_sort_buf.sort_unstable();
+                    }
+                    for (idx, &name_bytes) in tag_sort_buf.iter().enumerate() {
+                        if idx > 0 {
+                            arena.push(b',');
+                        }
+                        codec::write_str(arena, name_bytes);
+                    }
+                    arena.extend_from_slice(b"],\"createdAt\":");
+                    codec::write_timestamp(arena, created_at);
+                    arena.extend_from_slice(b",\"updatedAt\":");
+                    codec::write_timestamp(arena, updated_at);
+                    arena.extend_from_slice(b",\"favorited\":");
+                    let mid_end = arena.len() as u32;
+
+                    arena.extend_from_slice(b",\"favoritesCount\":");
+                    codec::write_i64(arena, self.art_fav_counts[k]);
+                    arena.extend_from_slice(b",\"author\":{\"username\":");
+                    codec::write_str(arena, pb.bytes(au[1]).unwrap_or(b""));
+                    arena.extend_from_slice(b",\"bio\":");
+                    codec::write_nullable_str(arena, pb.bytes(au[2]));
+                    arena.extend_from_slice(b",\"image\":");
+                    codec::write_nullable_str(arena, pb.bytes(au[3]));
+                    arena.extend_from_slice(b",\"following\":");
+                    let tail_end = arena.len() as u32;
+
+                    self.cached_arts[k] = CachedArticleSlices {
+                        ready: true,
+                        head_start,
+                        head_end,
+                        mid_end,
+                        tail_end,
+                    };
                 }
             }
             if let Some(s) = b_flags {
@@ -1513,13 +1682,29 @@ impl ReadWorker {
             foll_viewer_mask,
         };
 
-        let mut rendered_slugs: Vec<Option<Arc<[u8]>>> = vec![None; self.k_slug.len()];
-        let mut rendered_global: Vec<Option<Arc<[u8]>>> = vec![None; global_pages.len()];
-        let mut rendered_filters: [Vec<Option<Arc<[u8]>>>; 3] = [
-            vec![None; filter_results[0].1.len()],
-            vec![None; filter_results[1].1.len()],
-            vec![None; filter_results[2].1.len()],
-        ];
+        self.rr.rendered_slugs.clear();
+        self.rr.rendered_slugs.resize(self.k_slug.len(), None);
+        self.rr.rendered_global.clear();
+        self.rr.rendered_global.resize(self.rr.global_pages.len(), None);
+        for i in 0..3 {
+            self.rr.rendered_filters[i].clear();
+            self.rr.rendered_filters[i].resize(self.rr.filter_pages[i].len(), None);
+        }
+        let prof_rows = &self.rr.prof_rows;
+        let slug_rows = &self.rr.slug_rows;
+        let aid_rows = &self.rr.aid_rows;
+        let cached_cmts = &self.rr.cached_cmts;
+        let rendered_profiles = &mut self.rr.rendered_profiles;
+        let rendered_cmts = &mut self.rr.rendered_cmts;
+        let rendered_slugs = &mut self.rr.rendered_slugs;
+        let rendered_global = &mut self.rr.rendered_global;
+        let rendered_filters = &mut self.rr.rendered_filters;
+        let global_counts = &self.rr.global_counts;
+        let global_pages = &self.rr.global_pages;
+        let filter_counts = &self.rr.filter_counts;
+        let filter_pages = &self.rr.filter_pages;
+        let feed_counts = &self.rr.feed_counts;
+        let feed_pages = &self.rr.feed_pages;
         let mut replies: Vec<OutgoingReply> = Vec::with_capacity(tasks.len());
 
         for (task, &slot) in tasks.drain(..).zip(self.plan.iter()) {
@@ -1531,10 +1716,10 @@ impl ReadWorker {
                     if viewer == 0 {
                         continue;
                     }
-                    match grp_prof[k as usize].first() {
-                        Some(&row_i) => {
-                            let r = pa.row(pa.result_rows(st_prof.unwrap())[row_i]);
-                            let following = render_ctx.is_following(viewer, pa.i64(r[1]));
+                    match prof_rows.get(k as usize).copied().flatten() {
+                        Some(span) => {
+                            let r = pa.row(span);
+                            let following = render_ctx.is_following(viewer, pa.i64(r[0]));
                             if !following {
                                 if let Some(shared) = &rendered_profiles[k as usize] {
                                     replies.push(OutgoingReply {
@@ -1549,9 +1734,9 @@ impl ReadWorker {
                             body.extend_from_slice(b"{\"profile\":");
                             write_profile_json(
                                 &mut body,
-                                pa.bytes(r[2]).unwrap_or(b""),
+                                pa.bytes(r[1]).unwrap_or(b""),
+                                pa.bytes(r[2]),
                                 pa.bytes(r[3]),
-                                pa.bytes(r[4]),
                                 following,
                             );
                             body.push(b'}');
@@ -1672,8 +1857,8 @@ impl ReadWorker {
                     let (rows, total_count, is_feed): (&ArticlePage, i64, bool) = match slot {
                         PlanSlot::Global(p) => (&global_pages[p as usize], global_counts[0], false),
                         PlanSlot::Filtered(kind, c, p) => (
-                            &filter_results[kind].1[p as usize],
-                            filter_results[kind].0[c as usize],
+                            &filter_pages[kind][p as usize],
+                            filter_counts[kind][c as usize],
                             false,
                         ),
                         PlanSlot::Feed(c, p) => (&feed_pages[p as usize], feed_counts[c as usize], true),
@@ -1823,6 +2008,9 @@ pub struct WriteWorker {
     conn: Option<PgConn>,
     cfg: &'static RuntimeConfig,
     pipe: PipelineBuf,
+    enc_i64: ArrayEncoder,
+    enc_txt1: ArrayEncoder,
+    enc_txt2: ArrayEncoder,
 }
 
 fn stmt_count_for_write(task: &WriteTask) -> usize {
@@ -1981,6 +2169,9 @@ impl WriteWorker {
             conn: None,
             cfg,
             pipe: PipelineBuf::with_capacity(),
+            enc_i64: ArrayEncoder::with_capacity(OID_INT8, 64),
+            enc_txt1: ArrayEncoder::with_capacity(OID_TEXT, 64),
+            enc_txt2: ArrayEncoder::with_capacity(OID_TEXT, 64),
         }
     }
 
@@ -2076,11 +2267,17 @@ impl WriteWorker {
         let slot_foll_on = if batch_foll_on {
             let s = n_exec;
             n_exec += 1;
+            self.enc_i64.reset(OID_INT8, foll_on_jobs.len());
+            self.enc_txt1.reset(OID_TEXT, foll_on_jobs.len());
+            for &(v, u) in &foll_on_jobs {
+                self.enc_i64.push_i64(v);
+                self.enc_txt1.push_bytes(u.as_bytes());
+            }
             conn.tx.bind_and_exec(
                 "follow_batch",
                 &[
-                    BindParam::Raw(&encode_i64_array(foll_on_jobs.iter().map(|x| x.0))),
-                    BindParam::Raw(&encode_text_array(foll_on_jobs.iter().map(|x| x.1.as_bytes()))),
+                    BindParam::Raw(self.enc_i64.finish()),
+                    BindParam::Raw(self.enc_txt1.finish()),
                 ],
             );
             Some(s)
@@ -2091,11 +2288,17 @@ impl WriteWorker {
         let slot_foll_off = if batch_foll_off {
             let s = n_exec;
             n_exec += 1;
+            self.enc_i64.reset(OID_INT8, foll_off_jobs.len());
+            self.enc_txt1.reset(OID_TEXT, foll_off_jobs.len());
+            for &(v, u) in &foll_off_jobs {
+                self.enc_i64.push_i64(v);
+                self.enc_txt1.push_bytes(u.as_bytes());
+            }
             conn.tx.bind_and_exec(
                 "unfollow_batch",
                 &[
-                    BindParam::Raw(&encode_i64_array(foll_off_jobs.iter().map(|x| x.0))),
-                    BindParam::Raw(&encode_text_array(foll_off_jobs.iter().map(|x| x.1.as_bytes()))),
+                    BindParam::Raw(self.enc_i64.finish()),
+                    BindParam::Raw(self.enc_txt1.finish()),
                 ],
             );
             Some(s)
@@ -2106,11 +2309,17 @@ impl WriteWorker {
         let slot_fav_on = if batch_fav_on {
             let s = n_exec;
             n_exec += 1;
+            self.enc_i64.reset(OID_INT8, fav_on_jobs.len());
+            self.enc_txt1.reset(OID_TEXT, fav_on_jobs.len());
+            for &(v, sl) in &fav_on_jobs {
+                self.enc_i64.push_i64(v);
+                self.enc_txt1.push_bytes(sl.as_bytes());
+            }
             conn.tx.bind_and_exec(
                 "fav_batch",
                 &[
-                    BindParam::Raw(&encode_i64_array(fav_on_jobs.iter().map(|x| x.0))),
-                    BindParam::Raw(&encode_text_array(fav_on_jobs.iter().map(|x| x.1.as_bytes()))),
+                    BindParam::Raw(self.enc_i64.finish()),
+                    BindParam::Raw(self.enc_txt1.finish()),
                 ],
             );
             Some(s)
@@ -2121,11 +2330,17 @@ impl WriteWorker {
         let slot_fav_off = if batch_fav_off {
             let s = n_exec;
             n_exec += 1;
+            self.enc_i64.reset(OID_INT8, fav_off_jobs.len());
+            self.enc_txt1.reset(OID_TEXT, fav_off_jobs.len());
+            for &(v, sl) in &fav_off_jobs {
+                self.enc_i64.push_i64(v);
+                self.enc_txt1.push_bytes(sl.as_bytes());
+            }
             conn.tx.bind_and_exec(
                 "unfav_batch",
                 &[
-                    BindParam::Raw(&encode_i64_array(fav_off_jobs.iter().map(|x| x.0))),
-                    BindParam::Raw(&encode_text_array(fav_off_jobs.iter().map(|x| x.1.as_bytes()))),
+                    BindParam::Raw(self.enc_i64.finish()),
+                    BindParam::Raw(self.enc_txt1.finish()),
                 ],
             );
             Some(s)
@@ -2136,12 +2351,20 @@ impl WriteWorker {
         let slot_cmt = if batch_cmt {
             let s = n_exec;
             n_exec += 1;
+            self.enc_i64.reset(OID_INT8, cmt_jobs.len());
+            self.enc_txt1.reset(OID_TEXT, cmt_jobs.len());
+            self.enc_txt2.reset(OID_TEXT, cmt_jobs.len());
+            for &(v, sl, bd) in &cmt_jobs {
+                self.enc_i64.push_i64(v);
+                self.enc_txt1.push_bytes(sl.as_bytes());
+                self.enc_txt2.push_bytes(bd.as_bytes());
+            }
             conn.tx.bind_and_exec(
                 "newcmt_batch",
                 &[
-                    BindParam::Raw(&encode_i64_array(cmt_jobs.iter().map(|x| x.0))),
-                    BindParam::Raw(&encode_text_array(cmt_jobs.iter().map(|x| x.1.as_bytes()))),
-                    BindParam::Raw(&encode_text_array(cmt_jobs.iter().map(|x| x.2.as_bytes()))),
+                    BindParam::Raw(self.enc_i64.finish()),
+                    BindParam::Raw(self.enc_txt1.finish()),
+                    BindParam::Raw(self.enc_txt2.finish()),
                 ],
             );
             Some(s)
@@ -2625,67 +2848,87 @@ fn execute_bcrypt_batch(tasks: &mut Vec<CryptoTask>, cfg: &RuntimeConfig, cost: 
     if tasks.is_empty() {
         return;
     }
-    let mut salts: Vec<[u8; 16]> = Vec::with_capacity(tasks.len());
-    let mut expected: Vec<Option<[u8; 23]>> = Vec::with_capacity(tasks.len());
-    for t in tasks.iter() {
-        match t {
-            CryptoTask::VerifyLogin { hash, .. } => {
-                let parsed = auth::parse_bcrypt(hash).expect("validated hash");
-                salts.push(parsed.salt);
-                expected.push(Some(parsed.digest));
-            }
-            CryptoTask::HashPassword { .. } => {
-                let mut salt = [0u8; 16];
-                assert!(codec::fill_random(&mut salt), "getrandom");
-                salts.push(salt);
-                expected.push(None);
-            }
-        }
-    }
-    let digests = {
-        let passwords: Vec<&[u8]> = tasks
-            .iter()
-            .map(|t| match t {
-                CryptoTask::VerifyLogin { password, .. } | CryptoTask::HashPassword { password, .. } => {
-                    password.as_slice()
-                }
-            })
-            .collect();
-        dispatch_lanes(&passwords, &salts, cost)
-    };
     let mut replies: Vec<OutgoingReply> = Vec::with_capacity(tasks.len());
     let mut writes: Vec<WriteTask> = Vec::new();
-    for (((task, digest), salt), exp) in tasks.drain(..).zip(digests).zip(salts).zip(expected) {
-        match task {
-            CryptoTask::VerifyLogin { user, addr, .. } => {
-                if auth::ct_digest_eq(&digest, &exp.unwrap()) {
-                    let tok = cfg.signer.issue(user.id);
-                    let mut body = Vec::with_capacity(512);
-                    write_user_envelope(
-                        &mut body,
-                        &user.email,
-                        tok.as_bytes(),
-                        &user.username,
-                        user.bio.as_deref(),
-                        user.image.as_deref(),
-                    );
-                    replies.push(OutgoingReply {
-                        addr,
-                        status: 200,
-                        body: ReplyBody::Owned(body),
-                    });
-                } else {
-                    replies.push(reactor::error_reply(addr, 401, "invalid credentials"));
+    let mut salts = [[0u8; 16]; 6];
+    let mut expected: [Option<[u8; 23]>; 6] = [None; 6];
+    let mut digests = [[0u8; 23]; 6];
+
+    while !tasks.is_empty() {
+        let chunk_n = tasks.len().min(6);
+        for k in 0..chunk_n {
+            match &tasks[k] {
+                CryptoTask::VerifyLogin { hash, .. } => {
+                    let parsed = auth::parse_bcrypt(hash).expect("validated hash");
+                    salts[k] = parsed.salt;
+                    expected[k] = Some(parsed.digest);
+                }
+                CryptoTask::HashPassword { .. } => {
+                    assert!(codec::fill_random(&mut salts[k]), "getrandom");
+                    expected[k] = None;
                 }
             }
-            CryptoTask::HashPassword { mut write, .. } => {
-                let formatted = auth::format_bcrypt(cost, &salt, &digest);
-                match &mut write.op {
-                    WriteOp::Register { hash, .. } => *hash = formatted,
-                    WriteOp::UpdateUser { hash, .. } => *hash = Some(formatted),
-                    _ => {}
+        }
+        {
+            let pw = |k: usize| -> &[u8] {
+                match &tasks[k] {
+                    CryptoTask::VerifyLogin { password, .. } | CryptoTask::HashPassword { password, .. } => {
+                        password.as_slice()
+                    }
                 }
-                writes.push(write);
+            };
+            macro_rules! run_n {
+                ($n:literal) => {{
+                    let inputs: [BcryptInput; $n] = std::array::from_fn(|k| BcryptInput {
+                        password: pw(k),
+                        salt: salts[k],
+                    });
+                    digests[..$n].copy_from_slice(&auth::bcrypt_lanes::<$n>(&inputs, cost));
+                }};
+            }
+            match chunk_n {
+                1 => run_n!(1),
+                2 => run_n!(2),
+                3 => run_n!(3),
+                4 => run_n!(4),
+                5 => run_n!(5),
+                _ => run_n!(6),
+            }
+        }
+        for (k, task) in tasks.drain(..chunk_n).enumerate() {
+            let digest = &digests[k];
+            let salt = &salts[k];
+            match task {
+                CryptoTask::VerifyLogin { user, addr, .. } => {
+                    if auth::ct_digest_eq(digest, &expected[k].unwrap()) {
+                        let tok = cfg.signer.issue(user.id);
+                        let mut body = Vec::with_capacity(512);
+                        write_user_envelope(
+                            &mut body,
+                            &user.email,
+                            tok.as_bytes(),
+                            &user.username,
+                            user.bio.as_deref(),
+                            user.image.as_deref(),
+                        );
+                        replies.push(OutgoingReply {
+                            addr,
+                            status: 200,
+                            body: ReplyBody::Owned(body),
+                        });
+                    } else {
+                        replies.push(reactor::error_reply(addr, 401, "invalid credentials"));
+                    }
+                }
+                CryptoTask::HashPassword { mut write, .. } => {
+                    let formatted = auth::format_bcrypt(cost, salt, digest);
+                    match &mut write.op {
+                        WriteOp::Register { hash, .. } => *hash = formatted,
+                        WriteOp::UpdateUser { hash, .. } => *hash = Some(formatted),
+                        _ => {}
+                    }
+                    writes.push(write);
+                }
             }
         }
     }
@@ -2695,31 +2938,4 @@ fn execute_bcrypt_batch(tasks: &mut Vec<CryptoTask>, cfg: &RuntimeConfig, cost: 
     if !writes.is_empty() {
         WRITE_QUEUE.push_batch_front(&mut writes);
     }
-}
-
-fn dispatch_lanes(passwords: &[&[u8]], salts: &[[u8; 16]], cost: u32) -> Vec<[u8; 23]> {
-    let mut out = Vec::with_capacity(passwords.len());
-    let mut i = 0;
-    while i < passwords.len() {
-        let rem = passwords.len() - i;
-        macro_rules! run_n {
-            ($n:literal) => {{
-                let inputs: [BcryptInput; $n] = std::array::from_fn(|k| BcryptInput {
-                    password: passwords[i + k],
-                    salt: salts[i + k],
-                });
-                out.extend_from_slice(&auth::bcrypt_lanes::<$n>(&inputs, cost));
-                i += $n;
-            }};
-        }
-        match rem {
-            1 => run_n!(1),
-            2 => run_n!(2),
-            3 => run_n!(3),
-            4 => run_n!(4),
-            5 => run_n!(5),
-            _ => run_n!(6),
-        }
-    }
-    out
 }

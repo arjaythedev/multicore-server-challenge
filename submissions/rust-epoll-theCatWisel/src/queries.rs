@@ -25,37 +25,37 @@ pub fn read_catalog() -> Vec<PreparedDef> {
         def("tags", "SELECT id, name FROM tags", &[]),
         def(
             "uid",
-            "SELECT r.k, u.id, u.username, u.email, u.bio, u.image \
-             FROM unnest($1::int8[]) WITH ORDINALITY r(id, k) JOIN users u ON u.id = r.id",
+            "SELECT u.id, u.username, u.email, u.bio, u.image \
+             FROM users u WHERE u.id = ANY($1::int8[])",
             &[OID_INT8_ARR],
         ),
         def(
             "uemail",
-            "SELECT r.k, u.id, u.username, u.email, u.bio, u.image, u.password_hash \
-             FROM unnest($1::text[]) WITH ORDINALITY r(email, k) JOIN users u ON u.email = r.email",
+            "SELECT u.id, u.username, u.email, u.bio, u.image, u.password_hash \
+             FROM users u WHERE u.email = ANY($1::text[])",
             &[OID_TEXT_ARR],
         ),
         def(
             "prof",
-            "SELECT r.k, u.id, u.username, u.bio, u.image \
-             FROM unnest($1::text[]) WITH ORDINALITY r(username, k) JOIN users u ON u.username = r.username",
+            "SELECT u.id, u.username, u.bio, u.image \
+             FROM users u WHERE u.username = ANY($1::text[])",
             &[OID_TEXT_ARR],
         ),
         def(
             "aslug",
-            "SELECT r.k, a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at, a.body \
-             FROM unnest($1::text[]) WITH ORDINALITY r(slug, k) JOIN articles a ON a.slug = r.slug",
+            "SELECT 0::int8, a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at, a.body \
+             FROM articles a WHERE a.slug = ANY($1::text[])",
             &[OID_TEXT_ARR],
         ),
         def(
             "aid",
-            "SELECT r.k, a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at, a.body \
-             FROM unnest($1::int8[]) WITH ORDINALITY r(id, k) JOIN articles a ON a.id = r.id",
+            "SELECT 0::int8, a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at, a.body \
+             FROM articles a WHERE a.id = ANY($1::int8[])",
             &[OID_INT8_ARR],
         ),
         def(
             "cmts",
-            "SELECT r.k, a.id, c.id, c.body, c.created_at, c.updated_at, c.author_id, u.username, u.bio, u.image \
+            "SELECT r.k, c.id, c.body, c.created_at, c.updated_at, c.author_id, u.username, u.bio, u.image \
              FROM unnest($1::text[]) WITH ORDINALITY r(slug, k) JOIN articles a ON a.slug = r.slug \
              LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id FROM comments c \
                WHERE c.article_id = a.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true \
@@ -109,7 +109,7 @@ pub fn read_catalog() -> Vec<PreparedDef> {
             "author",
             format!(
                 "WITH u AS MATERIALIZED ( \
-                   SELECT r.k, usr.id, {} AS cnt \
+                   SELECT r.k, usr.id, CASE WHEN usr.id IS NULL THEN 0::int8 ELSE {} END AS cnt \
                    FROM unnest($1::text[]) WITH ORDINALITY r(username, k) LEFT JOIN users usr ON usr.username = r.username \
                  ) \
                  SELECT -u.k, u.cnt, 0::int8 FROM u \
@@ -125,7 +125,7 @@ pub fn read_catalog() -> Vec<PreparedDef> {
             "favlist",
             format!(
                 "WITH u AS MATERIALIZED ( \
-                   SELECT r.k, usr.id, {} AS cnt \
+                   SELECT r.k, usr.id, CASE WHEN usr.id IS NULL THEN 0::int8 ELSE {} END AS cnt \
                    FROM unnest($1::text[]) WITH ORDINALITY r(username, k) LEFT JOIN users usr ON usr.username = r.username \
                  ) \
                  SELECT -u.k, u.cnt, 0::int8, NULL::text, NULL::text, NULL::text, NULL::timestamptz, NULL::timestamptz FROM u \
@@ -155,13 +155,13 @@ pub fn read_catalog() -> Vec<PreparedDef> {
                      SELECT f.fid, max(u.depth) AS depth \
                      FROM u, unnest(u.fids) AS f(fid) \
                      GROUP BY f.fid HAVING count(*) >= 2 \
-                     ORDER BY count(*) DESC, f.fid LIMIT 32 \
+                     ORDER BY count(*) DESC, f.fid LIMIT 16 \
                    ) h \
                  ), \
                  cap_authors AS MATERIALIZED ( \
                    SELECT ARRAY( \
                      SELECT hf.fid FROM ( \
-                       SELECT hf.fid FROM hub_floors hf WHERE hf.floor_id IS NOT NULL ORDER BY hf.floor_id DESC LIMIT 16 \
+                       SELECT hf.fid FROM hub_floors hf WHERE hf.floor_id IS NOT NULL ORDER BY hf.floor_id DESC LIMIT 5 \
                      ) hf \
                      WHERE EXISTS (SELECT 1 FROM articles a WHERE a.author_id = hf.fid LIMIT 1 OFFSET 999) \
                    ) AS fids \
@@ -176,7 +176,7 @@ pub fn read_catalog() -> Vec<PreparedDef> {
                  UNION ALL \
                  SELECT p.k, x.id, x.author_id \
                  FROM unnest($3::int8[], $4::int8[], $5::int8[]) WITH ORDINALITY p(uk, lim, off, k) \
-                 JOIN u ON u.k = p.uk \
+                 JOIN u ON u.k = p.uk AND cardinality(u.fids) > 0 \
                  CROSS JOIN LATERAL (SELECT COALESCE(max(hf.floor_id), 0::int8) AS floor_id FROM hub_floors hf WHERE hf.fid = ANY(u.fids)) fl \
                  CROSS JOIN LATERAL ( \
                    SELECT y.id, y.author_id FROM unnest(u.fids) AS fid \
@@ -199,23 +199,24 @@ pub fn read_catalog() -> Vec<PreparedDef> {
         ),
         def(
             "artmeta",
-            "SELECT r.k, a.slug, a.title, a.description, a.created_at, a.updated_at \
-             FROM unnest($1::int8[]) WITH ORDINALITY r(id, k) \
-             JOIN articles a ON a.id = r.id",
+            "SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at \
+             FROM articles a WHERE a.id = ANY($1::int8[])",
             &[OID_INT8_ARR],
         ),
         def(
             "artx",
-            "SELECT r.k, \
-             ARRAY(SELECT at.tag_id FROM article_tags at WHERE at.article_id = r.id), \
-             (SELECT count(*) FROM favorites f WHERE f.article_id = r.id) \
-             FROM unnest($1::int8[]) WITH ORDINALITY r(id, k)",
+            "SELECT 0::int4, at.article_id, at.tag_id::int8 \
+             FROM article_tags at WHERE at.article_id = ANY($1::int8[]) \
+             UNION ALL \
+             SELECT 1::int4, f.article_id, count(*)::int8 \
+             FROM favorites f WHERE f.article_id = ANY($1::int8[]) \
+             GROUP BY f.article_id",
             &[OID_INT8_ARR],
         ),
         def(
             "artau",
-            "SELECT r.k, u.username, u.bio, u.image \
-             FROM unnest($1::int8[]) WITH ORDINALITY r(id, k) JOIN users u ON u.id = r.id",
+            "SELECT u.id, u.username, u.bio, u.image \
+             FROM users u WHERE u.id = ANY($1::int8[])",
             &[OID_INT8_ARR],
         ),
         def(
@@ -371,17 +372,13 @@ pub fn write_catalog() -> Vec<PreparedDef> {
         ),
         def(
             "newcmt_batch",
-            "WITH r AS (SELECT x.k, x.uid, x.body, a.id AS aid \
+            "WITH r AS (SELECT x.k, x.uid, x.body, a.id AS aid, nextval('comments_id_seq'::regclass) AS cid \
                FROM unnest($1::int8[], $2::text[], $3::text[]) WITH ORDINALITY x(uid, slug, body, k) \
                JOIN articles a ON a.slug = x.slug), \
              ins AS (INSERT INTO comments (id, article_id, author_id, body) \
-               SELECT nextval('comments_id_seq'::regclass), r.aid, r.uid, r.body \
-               FROM (SELECT * FROM r ORDER BY k) r \
-               RETURNING id, body, created_at, updated_at, author_id), \
-             ord AS (SELECT row_number() OVER (ORDER BY id) AS rn, id, body, created_at, updated_at, author_id FROM ins), \
-             rk AS (SELECT row_number() OVER (ORDER BY k) AS rn, k FROM r) \
-             SELECT rk.k, ord.id, ord.body, ord.created_at, ord.updated_at, u.username, u.bio, u.image \
-             FROM ord JOIN rk ON rk.rn = ord.rn JOIN users u ON u.id = ord.author_id",
+               SELECT cid, aid, uid, body FROM r) \
+             SELECT r.k, r.cid, r.body, now(), now(), u.username, u.bio, u.image \
+             FROM r JOIN users u ON u.id = r.uid",
             &[OID_INT8_ARR, OID_TEXT_ARR, OID_TEXT_ARR],
         ),
         def(
