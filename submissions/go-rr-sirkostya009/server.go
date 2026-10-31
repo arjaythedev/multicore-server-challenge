@@ -48,9 +48,13 @@ type loop struct {
 	srv    *server
 	epfd   int
 	lfd    int
-	buf    []byte
+	buf    *[bufSize]byte
 	events []unix.EpollEvent
 }
+
+// bufPool holds the buffers requests are read into. A request with a body keeps the one its head came
+// in until the body is read.
+var bufPool = sync.Pool{New: func() any { return new([bufSize]byte) }}
 
 func listen(addr netip.AddrPort) (int, error) {
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
@@ -94,7 +98,7 @@ func serve(addr netip.AddrPort, loops int, h http.Handler) error {
 		if err = unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, lfd, &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(lfd)}); err != nil {
 			return err
 		}
-		l := &loop{srv: s, epfd: epfd, lfd: lfd, buf: make([]byte, bufSize), events: make([]unix.EpollEvent, 1024)}
+		l := &loop{srv: s, epfd: epfd, lfd: lfd, buf: bufPool.Get().(*[bufSize]byte), events: make([]unix.EpollEvent, 1024)}
 		go func() { errc <- l.run() }()
 	}
 	return <-errc
@@ -167,7 +171,7 @@ func (l *loop) read(c *conn, events uint32) {
 		c.signal()
 		return
 	}
-	n, err := unix.Read(c.fd, l.buf)
+	n, err := unix.Read(c.fd, l.buf[:])
 	if n <= 0 {
 		if err != unix.EAGAIN && err != unix.EINTR {
 			c.shutdown()
@@ -236,11 +240,11 @@ func (c *conn) next() {
 }
 
 // dispatch parses one request out of data and hands it to a goroutine. Whatever follows it waits in
-// pending until the response is out, so responses keep request order. A request read by l takes
-// over l's buffer instead of copying it. Callers hold c.mu.
+// pending until the response is out, so responses keep request order. A body that starts in l's
+// buffer takes it over, and l gets another. Callers hold c.mu.
 func (c *conn) dispatch(data []byte, l *loop) {
 	req := reqPool.Get().(*request)
-	used, err := req.parse(data, l != nil)
+	used, err := req.parse(data)
 	if err != nil {
 		reqPool.Put(req)
 		if err == errIncomplete {
@@ -250,8 +254,8 @@ func (c *conn) dispatch(data []byte, l *loop) {
 		c.reject(err)
 		return
 	}
-	if l != nil {
-		req.buf, l.buf = l.buf, req.buf[:cap(req.buf)]
+	if l != nil && len(req.body.buf) > 0 {
+		req.body.owned, l.buf = l.buf, bufPool.Get().(*[bufSize]byte)
 	}
 	if used < len(data) {
 		c.pending = append(c.pending[:0], data[used:]...)
@@ -280,7 +284,7 @@ func (c *conn) serve(req *request) {
 			_, _ = req.w.Write(nil)
 		}
 		closeAfter := req.close
-		if req.body.left > 0 && !req.body.discard(req.buf[:cap(req.buf)]) {
+		if req.body.left > 0 && !req.body.discard() {
 			closeAfter = true
 		}
 
@@ -317,7 +321,7 @@ func (c *conn) serve(req *request) {
 			reqPool.Put(req)
 			return
 		}
-		used, err := req.parse(c.pending, false)
+		used, err := req.parse(c.pending)
 		if err == errIncomplete {
 			c.busy = false
 			c.mu.Unlock()
@@ -331,7 +335,15 @@ func (c *conn) serve(req *request) {
 			reqPool.Put(req)
 			return
 		}
-		c.pending = append(c.pending[:0], c.pending[used:]...)
+		if rest := c.pending[used:]; len(req.body.buf) == 0 {
+			c.pending = append(c.pending[:0], rest...)
+		} else {
+			// the body starts in pending, so what follows it moves out
+			c.pending = nil
+			if len(rest) > 0 {
+				c.pending = append(c.pending, rest...)
+			}
+		}
 		c.start(req)
 		c.mu.Unlock()
 	}
@@ -477,13 +489,13 @@ type request struct {
 	hdr   http.Header
 	auth  [1]string
 	body  body
-	buf   []byte // what the head and the start of the body were parsed from
+	head  []byte // the target and Authorization, copied out of the buffer the head was read into
 	w     responseWriter
 	close bool
 }
 
 var reqPool = sync.Pool{New: func() any {
-	r := &request{hdr: make(http.Header, 1), buf: make([]byte, bufSize)}
+	r := &request{hdr: make(http.Header, 1), head: make([]byte, 0, 512)}
 	r.w.hdr = make(http.Header, 2)
 	r.w.head = make([]byte, 0, 256)
 	return r
@@ -493,14 +505,15 @@ func (r *request) reset() {
 	r.Request = http.Request{}
 	clear(r.hdr)
 	r.auth[0] = ""
-	r.body.buf, r.body.left = nil, 0
+	r.body.drop()
+	r.body.left = 0
 	r.close = false
 	r.w.reset()
 }
 
-// parse reads one request head from data into r, with as much of the body as data holds. r points
-// into data when inPlace, else into a copy in r.buf. It returns the bytes consumed.
-func (r *request) parse(data []byte, inPlace bool) (int, error) {
+// parse reads one request head from data into r, with as much of the body as data holds. The body
+// points into data. It returns the bytes consumed.
+func (r *request) parse(data []byte) (int, error) {
 	end := bytes.Index(data, crlfcrlf)
 	if end < 0 {
 		if len(data) > maxHeader {
@@ -566,36 +579,34 @@ func (r *request) parse(data []byte, inPlace bool) (int, error) {
 	}
 	total := end + 4 + contentLength
 	used := min(len(data), total)
-	raw := data[:used]
-	if !inPlace {
-		r.buf = append(r.buf[:0], raw...)
-		raw = r.buf
-	}
-	r.Method = method(raw[:sp1])
-	target := raw[sp1+1 : sp2]
+	r.Method = method(data[:sp1])
+	r.head = append(append(r.head[:0], data[sp1+1:sp2]...), data[authStart:authEnd]...)
+	target, auth := r.head[:sp2-sp1-1], r.head[sp2-sp1-1:]
 	r.url = url.URL{}
 	if q := bytes.IndexByte(target, '?'); q >= 0 {
-		r.url.RawQuery = unsafe.String(unsafe.SliceData(target[q+1:]), len(target)-q-1)
+		r.url.RawQuery = str(target[q+1:])
 		target = target[:q]
 	}
-	r.url.Path = unsafe.String(unsafe.SliceData(target), len(target))
+	r.url.Path = str(target)
 	r.URL = &r.url
 	r.close = closeConn || http10 && !keepAlive10
 	r.Proto = "HTTP/1.1"
 	r.ProtoMajor, r.ProtoMinor = 1, 1
 	if authEnd > 0 {
-		r.auth[0] = unsafe.String(&raw[authStart], authEnd-authStart)
+		r.auth[0] = str(auth)
 		r.hdr["Authorization"] = r.auth[:]
 	}
 	r.Header = r.hdr
 	r.ContentLength = int64(contentLength)
-	r.body.buf = raw[end+4:]
+	r.body.buf = data[end+4 : used]
 	r.body.left = total - used
 	r.Body = &r.body
 	return used, nil
 }
 
 var crlfcrlf = []byte("\r\n\r\n")
+
+func str(b []byte) string { return unsafe.String(unsafe.SliceData(b), len(b)) }
 
 func method(b []byte) string {
 	switch string(b) {
@@ -639,15 +650,19 @@ func asciiEqualFold(b []byte, lower string) bool {
 
 // body reads a request body: first the part read with the head, then the rest straight off the socket.
 type body struct {
-	c    *conn
-	buf  []byte
-	left int // bytes still on the socket
+	c     *conn
+	buf   []byte
+	owned *[bufSize]byte // the read buffer buf is in, pooled again once buf is read
+	left  int            // bytes still on the socket
 }
 
 func (b *body) Read(p []byte) (int, error) {
 	if len(b.buf) > 0 {
 		n := copy(p, b.buf)
 		b.buf = b.buf[n:]
+		if len(b.buf) == 0 {
+			b.drop()
+		}
 		return n, nil
 	}
 	if b.left == 0 {
@@ -666,11 +681,21 @@ func (b *body) Read(p []byte) (int, error) {
 
 func (*body) Close() error { return nil }
 
-// discard reads the rest of the body into scratch, so the next request starts at its head.
-func (b *body) discard(scratch []byte) bool {
+func (b *body) drop() {
 	b.buf = nil
+	if b.owned != nil {
+		bufPool.Put(b.owned)
+		b.owned = nil
+	}
+}
+
+// discard reads the rest of the body off the socket, so the next request starts at its head.
+func (b *body) discard() bool {
+	b.drop()
+	scratch := bufPool.Get().(*[bufSize]byte)
+	defer bufPool.Put(scratch)
 	for b.left > 0 {
-		if _, err := b.Read(scratch); err != nil {
+		if _, err := b.Read(scratch[:]); err != nil {
 			return false
 		}
 	}

@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -38,6 +39,10 @@ var testAddr = func() string {
 			_, _ = w.Write(bytes.Repeat([]byte{'x'}, n))
 		case "/empty":
 			w.WriteHeader(http.StatusNoContent)
+		case "/head":
+			b, _ := io.ReadAll(r.Body)
+			time.Sleep(time.Millisecond)
+			_, _ = fmt.Fprintf(w, "%s?%s %s %s", r.URL.Path, r.URL.RawQuery, r.Header.Get("Authorization"), b)
 		}
 	})
 	go func() { panic(serve(netip.MustParseAddrPort(addr), 2, h)) }()
@@ -205,4 +210,38 @@ func TestChunkedLengthRequired(t *testing.T) {
 	if _, err := br.ReadByte(); err != io.EOF {
 		t.Fatalf("got %v, want EOF", err)
 	}
+}
+
+func TestHeadOutlivesReadBuffer(t *testing.T) {
+	var wg sync.WaitGroup
+	for g := range 64 {
+		wg.Go(func() {
+			c, br := dial(t)
+			for i := range 20 {
+				body := strings.Repeat(strconv.Itoa(g), 100+i)
+				auth := fmt.Sprintf("Token %d-%d", g, i)
+				if _, err := fmt.Fprintf(c, "POST /head?g=%d&i=%d HTTP/1.1\r\nAuthorization: %s\r\nContent-Length: %d\r\n\r\n%s", g, i, auth, len(body), body); err != nil {
+					t.Error(err)
+					return
+				}
+				res, err := http.ReadResponse(br, nil)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				b, _ := io.ReadAll(res.Body)
+				if want := fmt.Sprintf("/head?g=%d&i=%d %s %s", g, i, auth, body); string(b) != want {
+					t.Errorf("got %.80q, want %.80q", b, want)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+}
+
+func TestEmptyAuthorization(t *testing.T) {
+	c, br := dial(t)
+	write(t, c, "POST /head?q HTTP/1.1\r\nAuthorization:\r\nContent-Length: 2\r\n\r\nhi")
+	expect(t, br, 200, "/head?q  hi")
 }
