@@ -6,38 +6,32 @@ cd "$HERE"
 
 PREFIX="${PREFIX:-/usr/local/java-netty-neeraj06152k}"
 
-# 1. Locate Java 25 JDK
+# 1. Locate Java 25 JDK (prioritize the toolchain installed by install.sh in PREFIX)
+if [ -x "$PREFIX/graalvm/bin/java" ]; then
+  export JAVA_HOME="$PREFIX/graalvm"
+elif [ -x "$PREFIX/jdk/bin/java" ]; then
+  export JAVA_HOME="$PREFIX/jdk"
+elif [ -x "/usr/local/conduit/graalvm/bin/java" ]; then
+  export JAVA_HOME="/usr/local/conduit/graalvm"
+elif [ -x "/usr/local/conduit/jdk/bin/java" ]; then
+  export JAVA_HOME="/usr/local/conduit/jdk"
+elif [ -x "/home/nrj/Java/graalvm-jdk-25/bin/java" ]; then
+  export JAVA_HOME="/home/nrj/Java/graalvm-jdk-25"
+elif [ -d "${HOME:-}/Java/graalvm-jdk-25" ] && [ -x "${HOME:-}/Java/graalvm-jdk-25/bin/java" ]; then
+  export JAVA_HOME="${HOME}/Java/graalvm-jdk-25"
+elif [ -x "/opt/graalvm/bin/java" ]; then
+  export JAVA_HOME="/opt/graalvm"
+elif [ -x "/opt/jdk/bin/java" ]; then
+  export JAVA_HOME="/opt/jdk"
+fi
+
 JAVA=""
 if [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/java" ]; then
   JAVA="$JAVA_HOME/bin/java"
-elif [ -x "$PREFIX/graalvm/bin/java" ]; then
-  export JAVA_HOME="$PREFIX/graalvm"
-  JAVA="$PREFIX/graalvm/bin/java"
-elif [ -x "$PREFIX/jdk/bin/java" ]; then
-  export JAVA_HOME="$PREFIX/jdk"
-  JAVA="$PREFIX/jdk/bin/java"
-elif [ -x "/usr/local/conduit/graalvm/bin/java" ]; then
-  export JAVA_HOME="/usr/local/conduit/graalvm"
-  JAVA="/usr/local/conduit/graalvm/bin/java"
-elif [ -x "/usr/local/conduit/jdk/bin/java" ]; then
-  export JAVA_HOME="/usr/local/conduit/jdk"
-  JAVA="/usr/local/conduit/jdk/bin/java"
 elif [ -x "/usr/local/bin/java" ]; then
   JAVA="/usr/local/bin/java"
 elif command -v java >/dev/null; then
   JAVA="$(command -v java)"
-elif [ -x "/opt/graalvm/bin/java" ]; then
-  export JAVA_HOME="/opt/graalvm"
-  JAVA="/opt/graalvm/bin/java"
-elif [ -x "/opt/jdk/bin/java" ]; then
-  export JAVA_HOME="/opt/jdk"
-  JAVA="/opt/jdk/bin/java"
-elif [ -x "/home/nrj/Java/graalvm-jdk-25/bin/java" ]; then
-  export JAVA_HOME="/home/nrj/Java/graalvm-jdk-25"
-  JAVA="/home/nrj/Java/graalvm-jdk-25/bin/java"
-elif [ -d "${HOME:-}/Java/graalvm-jdk-25" ] && [ -x "${HOME:-}/Java/graalvm-jdk-25/bin/java" ]; then
-  export JAVA_HOME="${HOME}/Java/graalvm-jdk-25"
-  JAVA="${HOME}/Java/graalvm-jdk-25/bin/java"
 fi
 
 if [ -z "$JAVA" ] || [ ! -x "$JAVA" ]; then
