@@ -46,6 +46,11 @@ fun main() {
     // ~28 logins/s at 100k users: 400 ms fills 93% of 8-lane batches (mean 7.9 jobs). Logins are ~0.1% of requests,
     // so their latency can't move p95/p99.
     val bcryptWindow = envInt("BCRYPT_BATCH_MS", 400).toLong()
+    // BCRYPT_THREADS_MAX (default half the CPUs, never below BCRYPT_THREADS): the workers above BCRYPT_THREADS start hashing
+    // only once the oldest queued login has waited BCRYPT_EXTRA_AGE_MS (default: the batch window + 100 ms), i.e. when the base
+    // threads cannot keep up (insurance for a login rate above ~36/s per base thread; idle they cost nothing).
+    val bcryptExtra = maxOf(0, envInt("BCRYPT_THREADS_MAX", maxOf(bcryptThreads, (cpus + 1) / 2)) - bcryptThreads)
+    val bcryptExtraAge = envInt("BCRYPT_EXTRA_AGE_MS", bcryptWindow.toInt() + 100).toLong()
     val options = getenv("DB_OPTIONS") ?: DEFAULT_OPTIONS
     // Overload guard (OVERLOAD_GUARD=0 turns it off): queued work whose client has given up is dropped unrun, and a
     // full read, write or bcrypt queue answers 503 at once (0 = no cap). The caps sit far above what a load that
@@ -74,6 +79,7 @@ fun main() {
         bcryptThreads, bcryptWindow, bcryptQueueMax, skipAbandoned = guard,
         flushMin = envInt("BCRYPT_FLUSH_MIN", 4), flushAgeMs = envInt("BCRYPT_FLUSH_AGE_MS", 150).toLong(),
         priorityLoad = bcryptPrioLoad, niceLevel = envInt("BCRYPT_NICE", 0),
+        extraThreads = bcryptExtra, extraAgeMs = bcryptExtraAge,
     )
     val dbConfig = DbConfig.fromUrl(
         dbUrl, readConns, writeConns, options, readQueueMax, writeQueueMax, guard, gatherMicros = gatherMs * 1000,
@@ -86,13 +92,18 @@ fun main() {
         shareMaxBatch = envInt("READ_MAX_BATCH", 1024),
         // READ_VIEWER_FLAGS (default on): shared lists check favorited/following once per viewer, not twice per row
         viewerFlags = envInt("READ_VIEWER_FLAGS", 1) != 0,
-        // READ_FEED_MAX_BATCH (default 64, 0 = READ_MAX_BATCH; 128 raised p99 to 300 ms in the lab): feeds share nothing, so they leave in small batches
-        // (5-minute holds at 144k users: p95/p99 66/95 ms vs 107/175 ms uncapped, same Postgres CPU per request)
-        feedMaxBatch = envInt("READ_FEED_MAX_BATCH", 64),
+        // READ_FEED_MAX_BATCH (default 192, 0 = READ_MAX_BATCH): most feeds per execution. The feed statement decorates each distinct page article once (READ_FEED_SHARE)
+        // and its hub/count work is per batch, so bigger batches cost less per feed (EXPLAIN, per feed: 334 us at 64, 233 us at 200). Lab, 180k users: cap 64 collapsed (p95 6 s,
+        // 1.7% timeouts), 192 and 1024 held the whole load (steady-state p95 130-143 ms, p99 184-199 ms).
+        feedMaxBatch = envInt("READ_FEED_MAX_BATCH", 192),
         // READ_FEED_HEAVY (default on; 0 = the plain capped count): skip the capped feed count for viewers who follow an author with 1000+ articles
         feedHeavy = envInt("READ_FEED_HEAVY", 1) != 0,
         // READ_FEED_FLOOR (default on, needs READ_FEED_HEAVY; 0 = off): per-batch floor ids of the shared hub followees bound the page probes
         feedFloor = envInt("READ_FEED_FLOOR", 1) != 0,
+        // READ_FEED_SHARE (default on, needs READ_FEED_HEAVY and READ_FEED_FLOOR; 0 = decorate every page row): each distinct page article of a feed batch is decorated once
+        feedShared = envInt("READ_FEED_SHARE", 1) != 0,
+        // READ_SHARED_ROWS (default on, needs READ_SHARE; 0 = fan every row out to every request): comments and the global, tag and author lists send each distinct thread or page once
+        sharedRows = envInt("READ_SHARED_ROWS", 1) != 0,
     )
     // SQL_PRINT=1 (diagnostics, .tmp/lab/explain.sh): prints every read statement as "sql<TAB>name<TAB>sql" and exits
     if (envInt("SQL_PRINT", 0) != 0) {
@@ -103,7 +114,7 @@ fun main() {
     startHttpServer(host, port, httpThreads, HttpEngine { ex -> App.handle(ex) })
     println(
         "conduit: listening on $host:$port (cpus=$cpus http=$httpThreads db=$readConns+$writeConns " +
-            "bcrypt=$bcryptThreads; tags sorted by ${App.tagOrder}; reads ${App.readMode}, gather $gatherMs ms${if (lifoMs > 0) ", LIFO after $lifoMs ms" else ""}; " +
+            "bcrypt=$bcryptThreads${if (bcryptExtra > 0) "+$bcryptExtra after ${bcryptExtraAge}ms" else ""}; tags sorted by ${App.tagOrder}; reads ${App.readMode}, gather $gatherMs ms${if (lifoMs > 0) ", LIFO after $lifoMs ms" else ""}; " +
             "overload guard ${if (guard) "on, queue caps $readQueueMax/$writeQueueMax/$bcryptQueueMax" else "off"}; " +
             "gzip ${Gzip.description}; " +
             "$platform)",
