@@ -61,10 +61,21 @@ The box is CPU-bound: the app and Postgres share the cores. Every change below w
 machine described under [Results](#results); the ones that didn't help are listed afterwards.
 
 **Database**
-- The SQL is the reference SQL from `SPEC.md`, in the same order, except that article queries first pick their page
-  of ids (a `page` CTE with the reference query's filter, order and limit) and then join one aggregate of those
-  articles' tags, instead of running a tag subquery per article. The result is identical; in Postgres the list
-  query ran about twice as fast (pgbench, 4 clients).
+- The SQL is the reference SQL from `SPEC.md`, except for how the article queries are put together. A single article
+  (`GET /api/articles/:slug` and the re-reads after a write) first picks its id (a `page` CTE) and then joins one
+  aggregate of its tags, instead of running a tag subquery per article; in Postgres that ran about twice as fast
+  (pgbench, 4 clients).
+- A list is two statements, plus the capped count: a small query that picks the page of article ids (the reference
+  query's filter, order and limit), then one query that reads those articles `WHERE id = ANY($1)`. The result is
+  identical. The split is for planning: with `LIMIT` and `OFFSET` as parameters, Postgres plans a page query with
+  the real values on every call, because a generic plan has to assume the limit is 10% of the table and costs
+  thousands of times more, so it is never chosen. A page query that also joined tags, favorites and users was
+  therefore planned on every call, at about three times its execution time (0.94 ms to plan and 0.29 ms to run,
+  and 43% of all the time Postgres spent on statements in a profile at 8,000 users). The ids queries plan in about
+  0.06 ms, and the array parameter doesn't inflate the estimate, so the second query's generic plan is cached
+  after the first few calls. Planning time in that profile fell from 43.5 s to 4.5 s, and the held load from 9,800
+  to 11,000 users on the test machine. The two statements are not one snapshot, so an article deleted between
+  them is missing from that page; the count was already a separate statement.
 - `POST /api/articles` runs its inserts in one transaction with kiwiproc's `TransactionalDAO.call`.
 - The pool is 10 connections per core, capped at 95, and was not very sensitive (see below).
 

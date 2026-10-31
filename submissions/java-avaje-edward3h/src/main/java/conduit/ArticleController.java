@@ -53,7 +53,11 @@ class ArticleController implements ApiController {
         return new Dto.Profile(username, bio, image, following);
     }
 
-    private static Dto.ArticleList summaries(List<ArticleDao.ArticleRow> rows, long count) {
+    /** The page's articles: nothing to read when the page of ids is empty. */
+    private Dto.ArticleList summaries(long viewer, List<ArticleDao.IdRow> page, long count) {
+        List<ArticleDao.ArticleRow> rows = page.isEmpty()
+                ? List.of()
+                : articles.rows(viewer, page.stream().map(ArticleDao.IdRow::id).toList());
         return new Dto.ArticleList(
                 rows.stream()
                         .map(r -> new Dto.ArticleSummary(
@@ -96,23 +100,25 @@ class ArticleController implements ApiController {
         String author = given(query(req, "author"));
         String favorited = given(query(req, "favorited"));
         if (tag != null) {
-            return summaries(articles.listByTag(viewer, p.limit(), p.offset(), tag), articles.countByTag(tag));
+            return summaries(viewer, articles.idsByTag(p.limit(), p.offset(), tag), articles.countByTag(tag));
         } else if (author != null) {
             return summaries(
-                    articles.listByAuthor(viewer, p.limit(), p.offset(), author), articles.countByAuthor(author));
+                    viewer, articles.idsByAuthor(p.limit(), p.offset(), author), articles.countByAuthor(author));
         } else if (favorited != null) {
             return summaries(
-                    articles.listFavorited(viewer, p.limit(), p.offset(), favorited),
+                    viewer,
+                    articles.idsFavorited(p.limit(), p.offset(), favorited),
                     articles.countFavorited(favorited));
         }
-        return summaries(articles.listAll(viewer, p.limit(), p.offset()), articles.countAll());
+        return summaries(viewer, articles.idsAll(p.limit(), p.offset()), articles.countAll());
     }
 
     @Get("/api/articles/feed")
     Dto.ArticleList feed(ServerRequest req) {
         Auth.User caller = auth.user(req);
         Page p = page(req);
-        return summaries(articles.feed(caller.id(), p.limit(), p.offset()), articles.countFeed(caller.id()));
+        return summaries(
+                caller.id(), articles.idsFeed(caller.id(), p.limit(), p.offset()), articles.countFeed(caller.id()));
     }
 
     @Access(Access.Level.OPTIONAL)
