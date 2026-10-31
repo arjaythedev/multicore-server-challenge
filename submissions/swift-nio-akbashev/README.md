@@ -120,8 +120,8 @@ All dependencies are pinned exactly in `Package.swift` (plus `Package.resolved`)
   startup parameters (session settings, nothing server-wide): the box's Postgres has JIT and parallel query on, and
   both cost more than they save on sub-millisecond statements, and the batches' array parameters would otherwise be
   re-planned on every execution.
-- **Writes** (`Writes.swift`) are committed in groups: they wait in one queue, and a write lane (one Postgres
-  connection; `WRITE_LANES`, 1) runs every write waiting as one transaction and answers them all once `COMMIT` has
+- **Writes** (`Writes.swift`) are committed in groups: they wait in one queue, and a write lane (`WRITE_LANES`,
+  1; each group on a connection leased from the pool) runs every write waiting as one transaction and answers them all once `COMMIT` has
   returned, so a group pays for one commit instead of one per write. Consecutive favorites, unfavorites, follows,
   unfollows and new comments of a group (8 of the workload's 9.7 points of writes) run as one statement each, over
   arrays of their parameters, in the order they arrived (new comment ids are drawn in that order). If any statement
