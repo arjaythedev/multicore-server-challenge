@@ -117,6 +117,10 @@ pub fn main(init: std.process.Init.Minimal) void {
         if (db.lane_stats) "on" else "off", if (db.feed3_idle > 0) "on" else "off", db.feed3_idle,
         db.read_cap,                        db.lane_sep_ns / std.time.ns_per_ms,
     });
+    // ZIG_MEGA_SORTED_IDS=1 prepares MEGA with its article id set built in id order (sql.zig); off by default.
+    const sorted = env.getPosix("ZIG_MEGA_SORTED_IDS") orelse "";
+    mega.sorted_ids = if (std.mem.eql(u8, sorted, "1")) true else if (sorted.len == 0 or std.mem.eql(u8, sorted, "0")) false else sys.fatal("ZIG_MEGA_SORTED_IDS: '{s}' is not 0 or 1", .{sorted});
+    if (mega.sorted_ids) sys.log("ZIG_MEGA_SORTED_IDS=1: MEGA builds its article id set in id order", .{});
 
     jwt.init(secret);
     ignoreSigpipe();
@@ -302,4 +306,5 @@ test {
     _ = @import("shared.zig");
     _ = @import("drain.zig");
     _ = @import("loop.zig");
+    _ = @import("sql.zig");
 }

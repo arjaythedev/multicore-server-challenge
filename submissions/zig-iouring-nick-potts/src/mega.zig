@@ -20,10 +20,12 @@ const page = sql.mega.page;
 pub var tag_text = false;
 /// ZIG_MEGA_NAME_IDS=1 (main.zig): MEGA looks each list's tag name or username up once (sql.zig).
 pub var name_ids = false;
+/// ZIG_MEGA_SORTED_IDS=1 (main.zig): MEGA builds its article id set in id order (sql.zig).
+pub var sorted_ids = false;
 
 /// The text read connections prepare as MEGA, and its columns.
 pub fn text() []const u8 {
-    return sql.mega.variants[@as(usize, @intFromBool(tag_text)) * 2 + @intFromBool(name_ids)];
+    return sql.mega.variants[@as(usize, @intFromBool(sorted_ids)) * 4 + @as(usize, @intFromBool(tag_text)) * 2 + @intFromBool(name_ids)];
 }
 
 pub fn cols() []const sql.Oid {

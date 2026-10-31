@@ -64,13 +64,26 @@ pub const Def = struct {
 /// Comments, tags, profiles and users stay out of it, so the article is the only entity type.
 pub const mega = struct {
     pub const sql = std.mem.trimEnd(u8, @embedFile("sql/MEGA.sql"), "\n; ");
+    /// MEGA with the `ids` CTE built in id order (ZIG_MEGA_SORTED_IDS=1): one sort and dedup instead of a hash
+    /// aggregate followed by the tag and favorite-count arrays each sorting it again. Same rows; the entity rows
+    /// come in id order, which mega.zig never reads.
+    pub const sql_sorted_ids = blk: {
+        @setEvalBranchQuota(100_000);
+        const from = "UNION SELECT id FROM art),";
+        const at = std.mem.indexOf(u8, sql, from) orelse @compileError("MEGA.sql: no ids CTE to sort");
+        break :blk sql[0..at] ++ "UNION SELECT id FROM art ORDER BY 1)," ++ sql[at + from.len ..];
+    };
     pub const params = [_]Oid{ .int4_array, .int8_array, .int8_array, .int8_array, .int8_array, .text_array };
     pub const cols = [_]Oid{ .int8, .int8, .text, .text, .text, .text, .timestamptz, .timestamptz, .text_array, .int8, .bool, .text, .text, .text, .bool, .int8_array, .int8_array, .int8_array, .int8_array, .int8 };
     pub const keys = [_]u8{1};
     pub const ordinal = cols.len - 1;
     pub const tags = 8;
-    /// MEGA as a read connection prepares it, indexed by ZIG_MEGA_TAG_TEXT * 2 + ZIG_MEGA_NAME_IDS (main.zig).
-    pub const variants = [4][]const u8{ sql, edit(sql, &name_ids), edit(sql, &tag_text), edit(edit(sql, &name_ids), &tag_text) };
+    /// MEGA as a read connection prepares it, indexed by ZIG_MEGA_SORTED_IDS * 4 + ZIG_MEGA_TAG_TEXT * 2 +
+    /// ZIG_MEGA_NAME_IDS (main.zig).
+    pub const variants = [8][]const u8{
+        sql,            edit(sql, &name_ids),            edit(sql, &tag_text),            edit(edit(sql, &name_ids), &tag_text),
+        sql_sorted_ids, edit(sql_sorted_ids, &name_ids), edit(sql_sorted_ids, &tag_text), edit(edit(sql_sorted_ids, &name_ids), &tag_text),
+    };
     /// The columns with ZIG_MEGA_TAG_TEXT=1.
     pub const cols_tag_text = blk: {
         var c = cols;
@@ -311,4 +324,12 @@ pub fn arrayOid(p: Oid) Oid {
         .text => .text_array,
         else => unreachable,
     };
+}
+
+test "the sorted-ids MEGA orders the ids CTE and changes nothing else" {
+    const ids = "ids AS MATERIALIZED (\n  SELECT id FROM pg WHERE id IS NOT NULL UNION SELECT id FROM art";
+    const at = std.mem.indexOf(u8, mega.sql, ids).? + ids.len;
+    try std.testing.expectEqualStrings(mega.sql[0..at], mega.sql_sorted_ids[0..at]);
+    try std.testing.expectEqualStrings(" ORDER BY 1", mega.sql_sorted_ids[at..][0..11]);
+    try std.testing.expectEqualStrings(mega.sql[at..], mega.sql_sorted_ids[at + 11 ..]);
 }
