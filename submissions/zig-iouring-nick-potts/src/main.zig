@@ -131,7 +131,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     }
 
     // The bcrypt self-test and calibration (about 3.4 CPU-seconds) run once here; the workers inherit the pick.
-    bcrypt.prepare();
+    bcrypt.prepare(env.getPosix("ZIG_BCRYPT_KERNEL") orelse "");
 
     const sz = sizing(sys.cpuCount());
     if (env.getPosix("ZIG_SEND_PACE")) |v| {
