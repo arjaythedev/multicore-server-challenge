@@ -338,22 +338,22 @@ default.
 
 ### On a VM like the challenge's box (not official)
 
-Latest, the 5-minute holds on the same VM, one load box, builds alternated.
-"Steady" is the seconds from 90 s on, median of each second's p99:
+Latest, 5-minute holds on the same VM with the official pass rule, from one
+load box over four source IPs. Past about 32,000 connections per source IP
+the box's own `connect` walked the kernel's port range under a lock, which
+stalled it for 8 to 24 seconds around the end of the ramp in every hold above
+145,000 users, the top entry's too. The load generator here now gives each
+user a fixed source port; the server is not involved, and these holds ran
+with that fix and no stall:
 
-| Build | Users | Verdict | req/s | p95 | p99 | Steady p99 | µs a request (Postgres + server) |
+| Build | Users | Verdict | req/s | p95 | p99 | Errors | µs a request (Postgres + server) |
 |---|--:|---|--:|--:|--:|--:|---|
-| before this update, two holds | 145,000 | PASS, PASS | 37,306-37,440 | 205-288 ms | 600-666 ms | 139-151 ms | 143 + 67-69 |
-| before this update, two holds | 155,000 | FAIL, FAIL | 37,765-37,952 | 560-692 ms | 1,436-2,542 ms | 372-386 ms | 140 + 69-70 |
-| this one, two holds | 155,000 | FAIL, FAIL | 38,986-39,442 | 190-291 ms | 2,587-4,420 ms | 118-135 ms | 119-120 + 63-64 |
-| this build on 0.28.0 (three) and 0.29.0 (two) | 165,000 | 2 PASS, 3 FAIL | 39,864-41,171 | 292-462 ms | 988-4,534 ms | 193-265 ms | 114-119 + 64-71 |
-| this one on 0.28.0 | 175,000 | FAIL | 40,760 | 515 ms | 1,161 ms | 344 ms | 116 + 68 |
+| before this update | 165,000 | FAIL | 37,407 | 1,750 ms | 2,322 ms | 0.00% | 138 + 74 |
+| this one, two holds | 165,000 | PASS, PASS | 42,310-42,402 | 230-254 ms | 379-389 ms | 0.00% | 113 + 62-63 |
+| this one, two holds | 175,000 | PASS, FAIL | 43,335-43,366 | 491-514 ms | 562-735 ms | 0.00% | 109 + 64 |
+| this one | 190,000 | FAIL | 42,984 | 984 ms | 1,072 ms | 0.00% | 108 + 68 |
 
-The failures above 145,000 on this build are p99, from a stall of 8 to 19
-seconds around the end of the ramp, which starts before the ramp ends, grows
-with the users, and comes with the load box's own sampler running up to 22 s
-late. It may be the rig more than the server: nothing here has separated
-them. Nish 0.29.0 alone measured the same as 0.28.0. Gzip
+Nish 0.29.0 alone measured the same as 0.28.0. Gzip
 (`GZIP=1`, `nish/net/http-compress`) cost about 30 µs a request and failed its
 holds at 145,000, and stays off.
 
