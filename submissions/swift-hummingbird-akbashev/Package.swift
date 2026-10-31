@@ -19,6 +19,7 @@ let package = Package(
             name: "Conduit",
             dependencies: [
                 .product(name: "Hummingbird", package: "hummingbird"),
+                .product(name: "HummingbirdCore", package: "hummingbird"),
                 .product(name: "PostgresNIO", package: "postgres-nio"),
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "HTTPTypes", package: "swift-http-types"),

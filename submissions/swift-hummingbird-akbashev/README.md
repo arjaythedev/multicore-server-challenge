@@ -30,7 +30,11 @@ All dependencies are pinned exactly in `Package.swift` (plus `Package.resolved`)
   cooperative pool. `NIO_GLOBAL_EXECUTOR=1` makes the event loops Swift Concurrency's global executor instead, so a
   handler resumed by a Postgres reply carries on on the event loop that read it. It is off by default: measured on
   Linux it took about a third off throughput (and on macOS added 10-30% CPU per request), and it needs a dynamic
-  Swift runtime, since NIO finds its hook with `dlsym`, which `--static-swift-stdlib` hides. A read's task waits for
+  Swift runtime, since NIO finds its hook with `dlsym`, which `--static-swift-stdlib` hides. Each connection's task
+  (reading its requests, running the handlers, writing the responses) is pinned to the event loop that owns the
+  connection (`Pinning.swift`: a `TaskExecutor` per event loop, wrapped around Hummingbird's `HTTP1Channel`), instead of
+  running on the cooperative pool and crossing to it and back for every request: 8-17% less server CPU per request.
+  `PIN_CONNECTIONS=0` runs them on the pool, as Hummingbird does by default. A read's task waits for
   its batch (Reads.swift) and a write's for its group's commit (Writes.swift). The Postgres pool size is
   `DB_POOL_SIZE` (`start.sh`: `3 × cores`, capped at 95 for the box's `max_connections = 100`).
 - **bcrypt** (`Bcrypt.swift`): OpenBSD's algorithm, written in Swift so that several hashes run in lockstep on one
@@ -127,7 +131,7 @@ DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit_dev JWT_SECRET=co
 
 Environment: `DATABASE_URL`, `JWT_SECRET` (required); `HOST` (127.0.0.1), `PORT` (3000),
 `DB_POOL_SIZE` (`start.sh`: min(3 × cores, 95)), `BCRYPT_THREADS` (half the cores), `BCRYPT_QUEUE` (40 ×
-`BCRYPT_THREADS`), `BCRYPT_LANES` (measured at startup), `BCRYPT_WINDOW_MS` (200), `WRITE_GROUPING` (`0`: a
+`BCRYPT_THREADS`), `PIN_CONNECTIONS` (`0`: connections on the cooperative pool; pinned), `BCRYPT_LANES` (measured at startup), `BCRYPT_WINDOW_MS` (200), `WRITE_GROUPING` (`0`: a
 transaction per write; on), `WRITE_LANES` (1), `WRITE_GROUP_MAX` (256), `NIO_GLOBAL_EXECUTOR` (`1` to run Swift tasks on NIO's event loops; off), `SCHED_BATCH` (`0` to
 keep the default scheduling policy; on), `READ_BATCHING` (`0`: no batching; on), `READ_LANES` (cores),
 `READ_WINDOW_MS` (5), `READ_BATCH_MIN` (32), `READ_BATCH_MAX` (1024). Batches lease their statements' connections

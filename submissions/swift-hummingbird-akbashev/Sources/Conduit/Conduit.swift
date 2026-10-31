@@ -1,6 +1,7 @@
 // Conduit (RealWorld) API server in Swift + Hummingbird, for the multicore server challenge (SPEC.md).
 import Foundation
 import Hummingbird
+import HummingbirdCore
 import Logging
 import NIOCore
 import NIOPosix
@@ -101,7 +102,12 @@ struct Conduit {
 
         let server = Application(
             router: app.router(),
-            server: .http1(configuration: .init(idleTimeout: .seconds(75))),
+            server: env["PIN_CONNECTIONS"] != "0"
+                ? HTTPServerBuilder { responder in
+                    LoopPinnedHTTP1Channel(inner: HTTP1Channel(responder: responder, configuration: .init(idleTimeout: .seconds(75))),
+                                           executors: EventLoopTaskExecutors(MultiThreadedEventLoopGroup.singleton))
+                }
+                : .http1(configuration: .init(idleTimeout: .seconds(75))),
             // Front: direct, so this socket takes every user's connection: a backlog deep enough for a ramp (the
             // kernel caps it at net.core.somaxconn, 65535 on the box) instead of Hummingbird's default 256.
             configuration: .init(address: .hostname(host, port: port), backlog: 65535),
