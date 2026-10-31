@@ -54,10 +54,8 @@ class ArticleController implements ApiController {
     }
 
     /** The page's articles: nothing to read when the page of ids is empty. */
-    private Dto.ArticleList summaries(long viewer, List<ArticleDao.IdRow> page, long count) {
-        List<ArticleDao.ArticleRow> rows = page.isEmpty()
-                ? List.of()
-                : articles.rows(viewer, page.stream().map(ArticleDao.IdRow::id).toList());
+    private Dto.ArticleList summaries(long viewer, List<Long> page, long count) {
+        List<ArticleDao.ArticleRow> rows = page.isEmpty() ? List.of() : articles.rows(viewer, page);
         return new Dto.ArticleList(
                 rows.stream()
                         .map(r -> new Dto.ArticleSummary(

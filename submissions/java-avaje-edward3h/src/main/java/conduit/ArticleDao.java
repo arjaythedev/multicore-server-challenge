@@ -45,9 +45,6 @@ public interface ArticleDao extends TransactionalDAO<ArticleDao> {
 
     record OwnerRow(long id, long authorId) {}
 
-    /** One article id of a page. A record, because kiwiproc generates {@code List<long>} for a {@code List<Long>} result. */
-    record IdRow(long id) {}
-
     // ---- shared fragments (:viewer = viewer) ----
     //
     // The single-article queries first pick the id they will return (the "page" CTE), then join one aggregate of
@@ -86,31 +83,31 @@ public interface ArticleDao extends TransactionalDAO<ArticleDao> {
     // plan is cached after the first few calls.
 
     @SqlQuery("SELECT a.id FROM articles a ORDER BY a.id DESC LIMIT :limit OFFSET :offset")
-    List<IdRow> idsAll(long limit, long offset);
+    List<Long> idsAll(long limit, long offset);
 
     @SqlQuery("""
-            SELECT at.article_id AS id FROM article_tags at
+            SELECT at.article_id FROM article_tags at
              WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = :tag)
              ORDER BY at.article_id DESC LIMIT :limit OFFSET :offset""")
-    List<IdRow> idsByTag(long limit, long offset, String tag);
+    List<Long> idsByTag(long limit, long offset, String tag);
 
     @SqlQuery("""
             SELECT a.id FROM articles a
              WHERE a.author_id = (SELECT au.id FROM users au WHERE au.username = :author)
              ORDER BY a.id DESC LIMIT :limit OFFSET :offset""")
-    List<IdRow> idsByAuthor(long limit, long offset, String author);
+    List<Long> idsByAuthor(long limit, long offset, String author);
 
     @SqlQuery("""
-            SELECT f.article_id AS id FROM favorites f
+            SELECT f.article_id FROM favorites f
              WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = :favoritedBy)
              ORDER BY f.article_id DESC LIMIT :limit OFFSET :offset""")
-    List<IdRow> idsFavorited(long limit, long offset, String favoritedBy);
+    List<Long> idsFavorited(long limit, long offset, String favoritedBy);
 
     @SqlQuery("""
             SELECT x.id FROM follows fo CROSS JOIN LATERAL
                 (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT (CAST(:limit AS int) + CAST(:offset AS int))) x
               WHERE fo.follower_id = :viewer ORDER BY x.id DESC LIMIT :limit OFFSET :offset""")
-    List<IdRow> idsFeed(long viewer, long limit, long offset);
+    List<Long> idsFeed(long viewer, long limit, long offset);
 
     @SqlQuery("""
             WITH tg AS (SELECT at.article_id, array_agg(t.name ORDER BY t.name) AS names
