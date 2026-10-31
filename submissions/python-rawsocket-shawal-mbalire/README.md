@@ -186,7 +186,9 @@ build the user responses, and they are the contract `scripts/diffsql.py` checks 
     lists: per distinct key), the article data is built once for the union of the pages, and the pages are put together in one grouped
     join (a subquery per request scanned all the shared articles each time). The feed's cost is mostly per article,
     favorites counts above all (popular authors' articles have up to 2,000), so the batch saves the most when feeds
-    overlap. Tag and favorited lists had measured 15–35% slower batched on a drifted local database; on fresh copies
+    overlap. The feed's capped count reads the author index once for all followees (`author_id = ANY (...)`, one
+    index scan in PostgreSQL 17+) rather than once per followee: the same rows, ~20% less time for the count alone.
+    Tag and favorited lists had measured 15–35% slower batched on a drifted local database; on fresh copies
     of the seed they are cheaper batched (Postgres 109 against 114 µs per request), so they are batched too.
   - **Shared** (tags, no parameters): one execution answers every request in the unit.
   - Anything else: pipelined single statements, one Sync each.
