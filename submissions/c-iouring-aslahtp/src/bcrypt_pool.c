@@ -14,6 +14,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "ipc.h"
 #include "pg_conn.h"
 #include "worker.h"
 
@@ -50,7 +51,10 @@ static void run_batch(struct req **jobs, int n) {
     for (int i = 0; i < n; i++) {
         struct bc_job *j = &jobs[i]->bc;
         j->ok = false;
-        if (now - j->t_us > BCRYPT_STALE_US) {
+        /* Too old, or its client hung up while it waited: answered without hashing (a gone client's answer is
+         * dropped). */
+        if (now - j->t_us > BCRYPT_STALE_US ||
+            (cfg.skip_gone && !ipc_alive(jobs[i]->w->id, jobs[i]->fd, jobs[i]->gen))) {
             j->stale = true;
             continue;
         }

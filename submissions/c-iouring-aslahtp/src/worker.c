@@ -35,6 +35,12 @@ struct io_uring_sqe *sqe_get(struct worker *w) {
     return s;
 }
 
+static int64_t mono_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
 static double wall_now(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -59,6 +65,8 @@ struct req *req_alloc(struct worker *w, int fd, uint32_t gen) {
     r->gen = gen;
     r->keep_alive = true;
     r->pg_error = r->write = r->solo = false;
+    r->merge = M_NONE;
+    r->q_split = 0;
     r->step = 0;
     r->nexec = 0;
     r->stmt = 0;
@@ -127,6 +135,7 @@ static void conn_close(struct worker *w, int fd) {
     if (!c->open) return;
     c->open = false;
     c->gen = (c->gen + 1) & GEN_MASK;
+    if ((uint32_t)fd < ipc.live_n) atomic_store_explicit(&ipc.live[w->id][fd], c->gen, memory_order_relaxed);
     c->busy = c->want_recv = false;
     free(c->pend);
     c->pend = NULL;
@@ -275,6 +284,36 @@ static void rearm_starved(struct worker *w) {
     }
 }
 
+/* ACK delay: after a response, TCP_QUICKACK off on its socket through the ring (a socket command, kernel 6.7+), so
+ * the next request's ACK leaves with that request's response instead of as a packet of its own. The kernel picks
+ * quick or delayed ACK as a request arrives and leaves delayed mode whenever its delayed-ACK timer fires (a response
+ * slower than about 40 ms), so this goes out after every response. Only a failure posts a completion; on a kernel
+ * without the command the worker makes the setsockopt call itself from then on. */
+static const int quickack_off __attribute__((aligned(8))) = 0;
+#define ACK_UD UD_MAKE_PTR(&quickack_off, OP_QUIET)
+static bool ack_delay, ack_syscall;
+
+/* SOCKET_URING_OP_SETSOCKOPT in the kernel's uapi (6.7+). liburing 2.5's header predates it, and its
+ * io_uring_prep_cmd_sock drops level, optname and optval, so the fields are set here by their uapi places: level and
+ * optname share the 64-bit addr word, optlen is the file_index word, optval the addr3 word. */
+#define URING_SETSOCKOPT 3
+
+static void delay_ack(struct worker *w, int fd) {
+    if (ack_syscall) {
+        if (!w->direct) setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &quickack_off, sizeof quickack_off);
+        return;
+    }
+    struct io_uring_sqe *s = sqe_get(w);
+    io_uring_prep_rw(IORING_OP_URING_CMD, s, fd, NULL, 0, 0);
+    s->cmd_op = URING_SETSOCKOPT;
+    s->addr = (uint64_t)(uint32_t)IPPROTO_TCP | (uint64_t)(uint32_t)TCP_QUICKACK << 32;
+    s->file_index = sizeof quickack_off;
+    s->addr3 = (uint64_t)(uintptr_t)&quickack_off;
+    s->flags |= IOSQE_CQE_SKIP_SUCCESS;
+    if (w->direct) s->flags |= IOSQE_FIXED_FILE;
+    io_uring_sqe_set_data64(s, ACK_UD);
+}
+
 static void send_resp(struct req *r) {
     struct io_uring_sqe *s = sqe_get(r->w);
     size_t off = r->resp_off + r->resp_sent;
@@ -326,6 +365,7 @@ static void on_send(struct worker *w, struct io_uring_cqe *cqe) {
         conn_close(w, fd);
         return;
     }
+    if (ack_delay) delay_ack(w, fd);
     if (c->plen) drain_pending(w, fd);
 }
 
@@ -352,9 +392,37 @@ static void pg_start_send(struct worker *w, struct pgc *pc) {
 
 static void pg_start_group(struct worker *w, struct pgc *pc);
 
+/* Microseconds until the queued writes should go out as a group: at once for a solo write (it runs alone, so waiting
+ * gains nothing) or a full group, otherwise once the oldest has waited write_wait_us for company. */
+static int64_t write_due_in(const struct worker *w, int64_t now) {
+    const struct req *r = w->wait_write;
+    if (r->solo || w->wait_write_n >= cfg.write_group) return 0;
+    int64_t due = r->t_us + cfg.write_wait_us - now;
+    return due > 0 ? due : 0;
+}
+
+#define TIMER_UD(w) UD_MAKE_PTR(&(w)->timer_ts, OP_IGNORE)
+
+static void arm_write_timer(struct worker *w, int64_t us) {
+    if (w->timer_armed) return;
+    w->timer_armed = true;
+    w->timer_ts.tv_sec = us / 1000000;
+    w->timer_ts.tv_nsec = (us % 1000000) * 1000;
+    struct io_uring_sqe *s = sqe_get(w);
+    io_uring_prep_timeout(s, &w->timer_ts, 0, 0);
+    io_uring_sqe_set_data64(s, TIMER_UD(w));
+}
+
 static void pg_flush_all(struct worker *w) {
-    for (int i = w->nread; i < w->npg && w->wait_write; i++)
-        if (!w->pg[i].head) pg_start_group(w, &w->pg[i]);
+    if (w->wait_write) {
+        int64_t now = mono_us();
+        for (int i = w->nread; i < w->npg && w->wait_write && write_due_in(w, now) == 0; i++)
+            if (!w->pg[i].head) pg_start_group(w, &w->pg[i]);
+        if (w->wait_write) {
+            int64_t due = write_due_in(w, now);
+            if (due > 0) arm_write_timer(w, due);
+        }
+    }
     while (w->dirty) {
         struct pgc *pc = w->dirty;
         w->dirty = pc->next_dirty;
@@ -371,30 +439,112 @@ static void mark_dirty(struct pgc *pc) {
     }
 }
 
+/* Sends a request's unit from byte `from` of q (0: all of it; q_split: what follows its write statement). */
+static void emit_unit(struct pgc *pc, struct req *r, uint32_t from) {
+    if (from >= r->q.len) return;
+    buf_put(&pc->out, r->q.p + from, r->q.len - from);
+    pc->steps[pc->nsteps++] = (struct wstep){r, 0, 0};
+}
+
+static const enum stmt merge_stmt[M_KINDS] = {
+    [M_FAV] = S_M_FAVORITE, [M_UNFAV] = S_M_UNFAVORITE, [M_FOLLOW] = S_M_FOLLOW,
+    [M_UNFOLLOW] = S_M_UNFOLLOW, [M_COMMENT] = S_M_COMMENT,
+};
+
+static void bind_i64s(struct pg_bind *pb, struct req **rs, uint32_t n) {
+    size_t at;
+    pg_bind_array_begin(pb, OID_INT8, &at);
+    for (uint32_t i = 0; i < n; i++) pg_bind_array_i64(pb, rs[i]->viewer);
+    pg_bind_array_end(pb, at, n, false);
+}
+
+static void bind_texts(struct pg_bind *pb, struct req **rs, uint32_t n, int slot) {
+    size_t at;
+    pg_bind_array_begin(pb, OID_TEXT, &at);
+    for (uint32_t i = 0; i < n; i++) pg_bind_array_text(pb, rs[i]->s[slot], rs[i]->sl[slot]);
+    pg_bind_array_end(pb, at, n, false);
+}
+
+/* One statement for every request of the kind in the segment; their rows come back by ordinal (pc->run). */
+static void emit_merged(struct pgc *pc, int kind, struct req **seg, uint32_t nseg) {
+    uint32_t start = pc->nrun;
+    for (uint32_t i = 0; i < nseg; i++)
+        if (seg[i]->merge == kind) pc->run[pc->nrun++] = seg[i];
+    struct req **rs = pc->run + start;
+    uint32_t n = pc->nrun - start;
+    struct pg_bind pb;
+    pg_bind_begin(&pb, &pc->out, stmt_names[merge_stmt[kind]]);
+    if (kind == M_COMMENT) {
+        bind_texts(&pb, rs, n, 0);
+        bind_i64s(&pb, rs, n);
+        bind_texts(&pb, rs, n, 1);
+    } else {
+        bind_i64s(&pb, rs, n);
+        bind_texts(&pb, rs, n, 0);
+    }
+    pg_bind_end(&pb);
+    pg_execute(&pc->out);
+    pc->steps[pc->nsteps++] = (struct wstep){NULL, start, n};
+}
+
+/* A segment's merged statements (kinds with two or more requests) go first, then every request's unit in arrival
+ * order: the rest of it for merged requests (the favorite read-back), all of it for the others. */
+static void emit_segment(struct pgc *pc, struct req **seg, uint32_t nseg) {
+    uint32_t count[M_KINDS] = {0};
+    for (uint32_t i = 0; i < nseg; i++) count[seg[i]->merge]++;
+    for (int k = 1; k < M_KINDS; k++)
+        if (count[k] >= 2) emit_merged(pc, k, seg, nseg);
+    for (uint32_t i = 0; i < nseg; i++) emit_unit(pc, seg[i], count[seg[i]->merge] >= 2 ? seg[i]->q_split : 0);
+}
+
+/* Whether r's viewer already has a write of another kind in the segment: merging would reorder the two. */
+static bool seg_conflict(struct req **seg, uint32_t nseg, const struct req *r) {
+    for (uint32_t i = 0; i < nseg; i++)
+        if (seg[i]->viewer == r->viewer && seg[i]->merge != r->merge) return true;
+    return false;
+}
+
 /* Writes: an idle write connection takes the queued writes (up to write_group, or one solo write) and sends
  * them as one transaction ended by one Sync, so one WAL flush commits them all. Every response still waits
- * for that ReadyForQuery (rule 6). */
+ * for that ReadyForQuery (rule 6).
+ *
+ * With write_merge the group is cut into segments: runs of favorites, unfavorites, follows, unfollows and new
+ * comments. Each kind in a segment goes as one statement over arrays (sql.c S_M_*), followed by each request's
+ * own read-back. Any other write ends the segment and keeps its place, and so does a viewer coming back with
+ * another kind of write, so no user's writes change order. */
 static void pg_start_group(struct worker *w, struct pgc *pc) {
-    uint32_t n = 0;
+    uint32_t n = 0, nseg = 0;
     pc->group_failed = false;
+    pc->nsteps = pc->cur = pc->nrun = 0;
     while (w->wait_write && n < cfg.write_group) {
         struct req *r = w->wait_write;
         if (n && r->solo) break;
         w->wait_write = r->next;
+        w->wait_write_n--;
         r->next = NULL;
         r->stmt = 0;
         r->pg_error = false;
         r->sqlstate[0] = 0;
-        buf_put(&pc->out, r->q.p, r->q.len);
         if (pc->tail) pc->tail->next = r;
         else pc->head = r;
         pc->tail = r;
         n++;
+        if (cfg.write_merge && r->merge != M_NONE && !r->solo) {
+            if (seg_conflict(pc->seg, nseg, r)) {
+                emit_segment(pc, pc->seg, nseg);
+                nseg = 0;
+            }
+            pc->seg[nseg++] = r;
+        } else {
+            emit_segment(pc, pc->seg, nseg);
+            nseg = 0;
+            emit_unit(pc, r, 0);
+        }
         if (r->solo) break;
     }
+    emit_segment(pc, pc->seg, nseg);
     if (!w->wait_write) w->wait_write_tail = NULL;
     pg_sync(&pc->out);
-    pc->cur = pc->head;
     pc->inflight = n;
     mark_dirty(pc);
 }
@@ -421,9 +571,11 @@ void unit_submit(struct req *r, bool write) {
         /* Queued; pg_flush_all starts a group on an idle write connection once this batch of completions has
          * been handled, so every write that arrived in it shares the commit. */
         r->resp_mark = r->resp.len;
+        r->t_us = mono_us();
         if (w->wait_write_tail) w->wait_write_tail->next = r;
         else w->wait_write = r;
         w->wait_write_tail = r;
+        w->wait_write_n++;
         return;
     }
 
@@ -445,6 +597,8 @@ void plan_submit(struct req *r, int kind, int filter, int64_t limit, int64_t off
     pr->kind = (uint8_t)kind;
     pr->filter = (uint8_t)filter;
     pr->keylen = keylen;
+    pr->fd = r->fd;
+    pr->gen = r->gen;
     pr->viewer = r->viewer;
     pr->limit = limit;
     pr->offset = offset;
@@ -507,6 +661,11 @@ static void on_drain_replies(struct worker *w) {
         struct req *r = (struct req *)(uintptr_t)h->token;
         if (h->kind == IPC_PLAN) {
             const struct plan_reply *rp = (const struct plan_reply *)(h + 1);
+            if (rp->status == 0) {
+                /* Dropped unrun: the drain saw the client gone (req_respond frees it; a live one gets a 503). */
+                req_error(r, 503, "server busy, try again");
+                continue;
+            }
             http_begin(&r->resp);
             buf_put(&r->resp, rp->body, rp->len);
             req_respond(r, rp->status);
@@ -526,23 +685,58 @@ static void on_drain_replies(struct worker *w) {
     if (any) ipc_release(ring);
 }
 
+/* A merged statement's row ends with its request's ordinal k. Drops that column in place (the row lies in the
+ * connection's own receive buffer and is read once), so the handler sees the row of the single statement. */
+static bool row_take_k(const struct pg_msg *m, struct pg_msg *row, int64_t *k) {
+    struct pg_row pr;
+    if (!pg_row_init(&pr, m) || pr.ncols == 0) return false;
+    const uint8_t *last = NULL, *v = NULL;
+    int32_t n = -1;
+    for (uint16_t i = 0; i < pr.ncols; i++) {
+        last = pr.p;
+        n = pg_col(&pr, &v);
+        if (n == -2) return false;
+    }
+    if (n != 8) return false;
+    *k = pg_i64(v);
+    store_be16((uint8_t *)m->body, (uint16_t)(pr.ncols - 1));
+    *row = *m;
+    row->len = (uint32_t)(last - m->body);
+    return true;
+}
+
 static void pg_dispatch_write(struct worker *w, struct pgc *pc, const struct pg_msg *m) {
-    struct req *r = pc->cur;
+    struct wstep *st = pc->cur < pc->nsteps ? &pc->steps[pc->cur] : NULL;
     switch (m->type) {
     case 'D':
-        if (unlikely(!r)) die("postgres: row without a write");
-        if (!pc->group_failed) r->fn(r, EV_ROW, m);
+        if (unlikely(!st)) die("postgres: row without a write");
+        if (pc->group_failed) break;
+        if (st->r) {
+            st->r->fn(st->r, EV_ROW, m);
+        } else {
+            struct pg_msg row;
+            int64_t k;
+            if (unlikely(!row_take_k(m, &row, &k) || k < 1 || k > st->n)) die("postgres: malformed merged row");
+            struct req *r = pc->run[st->run + (uint32_t)k - 1];
+            r->fn(r, EV_ROW, &row);
+        }
         break;
     case 'C':
     case 'I':
-        if (unlikely(!r)) die("postgres: completion without a write");
-        if (++r->stmt == r->nexec) pc->cur = r->next;
+        if (unlikely(!st)) die("postgres: completion without a write");
+        if (!st->r) {
+            for (uint32_t i = 0; i < st->n; i++) pc->run[st->run + i]->stmt = 1;  /* their write was statement 0 */
+            pc->cur++;
+        } else if (++st->r->stmt == st->r->nexec) {
+            pc->cur++;
+        }
         break;
     case 'E': {
         struct pg_error e;
         pg_error_msg(w, m, &e);
         pc->group_failed = true;
-        r = r ? r : pc->head;  /* an error at commit time belongs to the group; a lone write owns it */
+        /* an error at commit time belongs to the group; a lone write owns it */
+        struct req *r = st ? (st->r ? st->r : pc->run[st->run]) : pc->head;
         if (r && !r->pg_error) {
             r->pg_error = true;
             memcpy(r->sqlstate, e.sqlstate, 6);
@@ -552,7 +746,8 @@ static void pg_dispatch_write(struct worker *w, struct pgc *pc, const struct pg_
     case 'Z': {
         struct req *list = pc->head, *tail = pc->tail;
         if (unlikely(!list)) die("postgres: ReadyForQuery without a write group");
-        pc->head = pc->tail = pc->cur = NULL;
+        pc->head = pc->tail = NULL;
+        pc->nsteps = pc->cur = pc->nrun = 0;
         pc->inflight = 0;
         if (pc->group_failed && list->next) {
             /* The whole group rolled back, so none of it happened: retry each write alone, first in line. */
@@ -560,6 +755,7 @@ static void pg_dispatch_write(struct worker *w, struct pgc *pc, const struct pg_
                 x->solo = true;
                 x->rows = 0;
                 x->resp.len = x->resp_mark;
+                w->wait_write_n++;
             }
             tail->next = w->wait_write;
             if (!w->wait_write) w->wait_write_tail = tail;
@@ -705,6 +901,10 @@ static void pg_init(struct worker *w) {
         buf_init(&pc->out, 16384);
         buf_init(&pc->sending, 16384);
         buf_init(&pc->in, 2 * PG_RECV_MIN);
+        /* At most one step per request plus one merged step per two requests. */
+        pc->steps = xcalloc(2 * (size_t)cfg.write_group + 1, sizeof *pc->steps);
+        pc->run = xcalloc(cfg.write_group, sizeof *pc->run);
+        pc->seg = xcalloc(cfg.write_group, sizeof *pc->seg);
     }
 }
 
@@ -718,9 +918,19 @@ static void on_cqe(struct worker *w, struct io_uring_cqe *cqe) {
     case OP_PG_SEND: on_pg_send(w, cqe); break;
     case OP_EVENTFD: on_eventfd(w, cqe); break;
     case OP_IGNORE:
+        if (ud == TIMER_UD(w)) {
+            w->timer_armed = false;  /* the loop starts the waiting group (pg_flush_all) */
+            break;
+        }
         if (cqe->res < 0) fprintf(stderr, "worker %d: ring op failed: %s\n", w->id, strerror(-cqe->res));
         break;
     case OP_QUIET:
+        /* EBADF is a client closed in the same iteration, before the ring took the setsockopt. */
+        if (ud == ACK_UD && !ack_syscall && (cqe->res == -EINVAL || cqe->res == -EOPNOTSUPP)) {
+            ack_syscall = true;
+            fprintf(stderr, "worker %d: no TCP_QUICKACK through io_uring (%s); using setsockopt\n", w->id,
+                    strerror(-cqe->res));
+        }
         break;
     }
 }
@@ -757,6 +967,7 @@ void worker_run(int id) {
     w->efd = ipc.worker_efd[id];  /* replies from the drain and finished bcrypt jobs */
     w->bp = bcrypt_pool_start(w, cfg.bcrypt_threads);
 
+    ack_delay = cfg.ack_delay;
     arm_accept(w);
     arm_eventfd(w);
     for (int i = 0; i < w->npg; i++) pg_arm_recv(w, &w->pg[i]);
