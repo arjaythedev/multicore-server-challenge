@@ -1,0 +1,7 @@
+bin/
+.build/
+a.s
+a.o
+bcause/bcause
+bcause/libb.o
+bcause/libb.a
