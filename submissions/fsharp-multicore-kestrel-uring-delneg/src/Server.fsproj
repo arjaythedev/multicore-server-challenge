@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>Server</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>disable</Nullable>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <UseSystemResourceKeys>true</UseSystemResourceKeys>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <PublishReadyToRun>true</PublishReadyToRun>
+    <TieredPGO>true</TieredPGO>
+    <EnableDefaultContentItems>false</EnableDefaultContentItems>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Native.fs" />
+    <Compile Include="Pg.fs" />
+    <Compile Include="Json.fs" />
+    <Compile Include="Jwt.fs" />
+    <Compile Include="Bcrypt.fs" />
+    <Compile Include="Sql.fs" />
+    <Compile Include="Ctx.fs" />
+    <Compile Include="Handlers.fs" />
+    <Compile Include="Planner.fs" />
+    <Compile Include="Ring.fs" />
+    <Compile Include="Db.fs" />
+    <Compile Include="Http.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Update="FSharp.Core" Version="11.0.101-rc3.26522.148" />
+  </ItemGroup>
+</Project>
