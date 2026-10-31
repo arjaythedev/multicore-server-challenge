@@ -6,7 +6,7 @@ import org.ethelred.kiwiproc.annotation.SqlUpdate;
 import org.jspecify.annotations.Nullable;
 
 /** Users, profiles and follows. */
-@DAO
+@DAO(autoCommit = true)
 public interface UserDao {
 
     record UserRow(

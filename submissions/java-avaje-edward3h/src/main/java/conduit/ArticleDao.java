@@ -9,7 +9,7 @@ import org.ethelred.kiwiproc.api.TransactionalDAO;
 import org.jspecify.annotations.Nullable;
 
 /** Articles, the feed, tags on articles, and favorites. */
-@DAO
+@DAO(autoCommit = true)
 public interface ArticleDao extends TransactionalDAO<ArticleDao> {
 
     record ArticleRow(

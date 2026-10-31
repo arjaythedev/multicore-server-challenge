@@ -18,7 +18,7 @@ implementations, so there is no reflection on the request path.
 | HTTP | avaje-http 3.12.1 annotations and `helidon` generator, on Helidon SE (WebServer) 4.5.6 |
 | JSON | avaje-jsonb 3.16 |
 | Validation | avaje-validator 2.18 |
-| SQL | kiwiproc 1.0 (Gradle plugin), reference SQL from `SPEC.md` |
+| SQL | kiwiproc 1.1 (Gradle plugin), reference SQL from `SPEC.md` |
 | Driver and pool | pgjdbc 42.7.14, HikariCP 7.1.0 (10 connections per core, capped at 95, set in `start.sh`) |
 | bcrypt | `at.favre.lib:bcrypt` 0.10.2, cost 10 |
 | JWT | hand-written HS256 (`javax.crypto.Mac`), in `Jwt.java` |
@@ -76,6 +76,10 @@ machine described under [Results](#results); the ones that didn't help are liste
   after the first few calls. Planning time in that profile fell from 43.5 s to 4.5 s, and the held load from 9,800
   to 11,000 users on the test machine. The two statements are not one snapshot, so an article deleted between
   them is missing from that page; the count was already a separate statement.
+- The DAOs are `@DAO(autoCommit = true)` (kiwiproc 1.1), so a single statement runs on a connection in autocommit
+  mode. Without it, kiwiproc wraps every call in `BEGIN`/`COMMIT`, which was about 435,000 extra statements in the
+  8,000-user profile; removing them took the held load from 9,800 to 11,000 users on the test machine. Each write
+  is still committed before the response is sent.
 - `POST /api/articles` runs its inserts in one transaction with kiwiproc's `TransactionalDAO.call`.
 - The pool is 10 connections per core, capped at 95, and was not very sensitive (see below).
 
