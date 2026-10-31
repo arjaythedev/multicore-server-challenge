@@ -34,14 +34,62 @@ All pins live in `constraints.txt` (transitives included); `build.sh` installs a
 conduit_server/
 ├── domain/            pure business logic: frozen dataclasses + validation/slug/paging rules. No I/O deps.
 │   ├── models.py      response shapes (User, Profile, Article, Comment…)
-│   └── services.py    slugify (byte-identical to SQL SLUGIFY), strict limit/offset, tagList checks
-├── ports/             Protocol contracts — inbound (transport) & outbound (db, crypto)
+│   ├── services.py    slugify (byte-identical to SQL SLUGIFY), strict limit/offset, tagList checks
+│   └── errors.py      DuplicateError (raised by any database adapter)
+├── ports/             Protocol contracts; import no adapter
+│   ├── inbound.py     HttpRequest, RequestParser, HttpApplication (router), InboundServer (transport)
+│   └── outbound.py    repository, query pipeline, database driver, password hasher, tokens, JSON codec
 ├── adapters/
 │   ├── inbound/       raw socket server (epoll), router, controllers
-│   └── outbound/      libpq/psycopg PostgreSQL repository + bcrypt/JWT adapter
-├── main.py            composition root: wires connections → repository → crypto → controllers, forks workers
+│   └── outbound/      libpq driver (repository, pipelines, broker), bcrypt hasher, HS256 tokens, orjson codec
+├── registry.py        which adapter plugs into each port, by environment variable
+├── main.py            composition root: builds the chosen adapters, wires them into the controllers, forks workers
 └── scripts/check.py   static wiring check (used by `just check`)
 ```
+
+Every adapter is chosen at startup by an environment variable (`registry.py`; the first listed is the default, an
+unknown name stops the server with the list of choices). Controllers only see the ports, so an adapter can be swapped
+without touching them:
+
+| Variable | Port | Adapters |
+|---|---|---|
+| `HTTP_SERVER` | `InboundServer` | `epoll` (Python loop on epoll), `uvloop` (libuv, C) |
+| `JSON_CODEC` | `JsonCodecPort` | `orjson` (Rust), `msgspec` (C), `stdlib` (`_json`, C), `ujson` (C), `rapidjson` (C++), `yyjson` (C; fails one conformance step: decodes `\u` escapes wrongly), `pydantic` (pydantic-core, Rust) |
+| `DB_DRIVER` | `DatabaseDriverPort` | `libpq` (psycopg-c), `libpq-ctypes` (psycopg's pure-Python libpq bindings), `libpq-rows` (rows, bodies built in the app with the codec), `asyncpg` (needs `HTTP_SERVER=uvloop`; no broker) |
+| `PASSWORD_HASHER` | `PasswordHasherPort` | `bcrypt` (multi-lane C + libxcrypt), `libxcrypt` (libcrypt.so, one at a time), `pyca` (pyca/bcrypt, Rust) |
+| `TOKENS` | `TokenPort` | `hs256` (C verify, SHA-NI), `hs256-py` (stdlib HMAC), `pyjwt` (PyJWT) |
+
+The non-default adapters' dependencies (uvloop, asyncpg, msgspec, ujson, python-rapidjson, yyjson, pydantic) are installed only with `ALT_ADAPTERS=1 bash build.sh`
+(also set it for `test/run.sh`, which runs build.sh). Each passes the conformance suite. Measured against the
+defaults (laptop, `conduit_full`, 24,000 test users, alternating runs, `STAGES=0`):
+
+App and Postgres CPU per request (µs, user+sys), req/s; every run PASSed unless noted. The defaults ran several
+times across the session: app 90–96, Postgres 154–185, 29.9k–31.4k req/s.
+
+| Change from the defaults | App | Postgres | req/s | Note |
+|---|--:|--:|--:|---|
+| `HTTP_SERVER=uvloop` | 97, 100 | 177, 185 | 31.7k, 30.2k | same responses byte for byte on raw HTTP edge cases |
+| `TOKENS=hs256-py` | 93 | 167 | 31.0k | C verify saves ~2 µs/req (224 → 1,280 ns per token single-thread) |
+| `TOKENS=pyjwt` | 134 | 181 | 30.9k | 13.6 µs per token |
+| `PASSWORD_HASHER=libxcrypt` | 132 | 163 | 30.9k | multi-lane bcrypt saves ~40 µs/req |
+| `PASSWORD_HASHER=pyca` | 151 | 177 | 31.2k | |
+| `DB_DRIVER=libpq-ctypes` | 95 | 181 | 31.3k | psycopg-c saves ~4 µs: most results are one JSON value, no row decoding |
+| `DB_DRIVER=libpq-rows` (orjson) | 117 | 188 | 30.9k | bodies built in the app; no batched forms |
+| `BROKER_BATCH=0` (JSON statements unbatched) | 105 | 200 | 30.2k | the like-for-like baseline for libpq-rows |
+| `libpq-rows` + `JSON_CODEC=msgspec` / `pydantic` / `ujson` | 124 / 130 / 137 | 194–197 | 29.6k–30.0k | |
+| `BROKER=0` (epoll / uvloop) | 147 / 133–155 | 277–287 | 27.3k–28.9k | p99 2.0–3.4 s |
+| `DB_DRIVER=asyncpg HTTP_SERVER=uvloop PG_READERS=3` | 130–132 | 317–347 | 23.8k–25.2k | against BROKER=0; p50 150–220 ms (one query at a time per connection), 0.06–0.13% errors |
+
+So Postgres building the JSON costs it about what building the bodies costs the app (rows: −12 µs Postgres, +12 µs app
+against unbatched JSON), and batching only works on the JSON statements. asyncpg's statements cost Postgres as much as
+libpq's on one connection (190 against 180 µs for a list page, with asyncpg's statement cache; explicit `prepare()`
+with the cache off cost 490), but without pipelining each query is its own round trip and connections queue.
+
+JSON codecs (`scripts/codeccheck.py`): every one writes the same JSON as orjson (rapidjson and yyjson escape control
+characters in upper-case hex, so their bytes differ). A 20-article page, single-thread: orjson 6.8 µs, msgspec 18.6,
+pydantic 36, yyjson 66, ujson 76, rapidjson 99, stdlib 108. Most accept some bodies orjson rejects (NaN, Infinity,
+1e400, lone surrogates); yyjson decodes `\u` escapes wrongly. Tokens (`scripts/tokencheck.py`): the three verifiers
+agree on 4,057 tokens.
 
 Every response except the three user routes (`/api/users`, `/api/users/login`, `/api/user`) is a JSON body that
 Postgres builds (`json_build_object`), which the server passes through as bytes. The dataclasses in `domain/models.py`
@@ -66,7 +114,7 @@ build the user responses, and they are the contract `scripts/diffsql.py` checks 
   request, and much of a read's cost is work that other requests repeat at the same moment: the same list page, the
   same popular article, the same capped count. One statement over many requests does that work once, but only if the
   requests wait in one place, and each worker alone had 0–1 queries in flight. So a broker process owns every
-  Postgres connection (`BROKER_READERS` read, default 6, and `BROKER_WRITERS` write, default 2), and each worker sends
+  Postgres connection (`BROKER_READERS` read, default 8, and `BROKER_WRITERS` write, default 2), and each worker sends
   it its queries over a Unix socketpair made before the fork: one frame per loop pass, `marshal`-encoded. The broker
   queues reads by statement; when a read connection has nothing in flight, it takes the queue whose oldest request is
   oldest and runs it as one unit (see Data layer). At 20,000 test users this held 25.5k req/s at p95 121 ms, where the

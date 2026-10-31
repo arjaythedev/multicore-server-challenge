@@ -19,6 +19,7 @@ from psycopg import pq
 from psycopg.adapt import Transformer
 from typing import Optional, List
 
+from conduit_server.domain.errors import DuplicateError
 from conduit_server.domain.services import slugify
 from conduit_server.ports.outbound import ArticleRepositoryPort
 
@@ -509,10 +510,6 @@ BATCHED = {
 }
 # Statements without parameters whose one result every request in the unit shares
 SHARED = frozenset({_TAGS_JSON.index})
-
-
-class DuplicateError(Exception):
-    pass
 
 
 def configure_connection(conn: psycopg.Connection) -> None:

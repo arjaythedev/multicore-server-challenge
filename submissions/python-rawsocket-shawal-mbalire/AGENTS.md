@@ -24,6 +24,7 @@ To ensure clean separation of concerns, testability, and strict decoupling, the 
    - **Inbound (`adapters/inbound/`):** Non-blocking raw socket server (`selectors`/epoll), decorator-based router (`SocketRouter`), and endpoint controllers.
    - **Outbound (`adapters/outbound/`):** PostgreSQL repository adapter (`psycopg3`: statements on libpq directly through `conn.pgconn`, rows decoded by psycopg's C `Transformer`) and cryptographic/JWT adapter (`bcrypt`, `PyJWT`).
 4. **Composition Root (`main.py`):** Wires infrastructure adapters, connection pools, and routers together at startup.
+5. **Registry (`registry.py`, 2026-10-31):** every port's adapter is chosen by an environment variable (`HTTP_SERVER`, `JSON_CODEC`, `DB_DRIVER`, `PASSWORD_HASHER`, `TOKENS`; the first entry is the default), imported in the parent before the fork. Controllers import no outbound adapter (they get the repository, hasher, tokens and codec through `controllers.bootstrap`), and `ports/` imports no adapter. A new adapter is a class implementing the port plus one line in `registry.ADAPTERS`; the defaults are the measured-best ones, so alternatives are A/B'd by env var without touching the default path.
 
 ---
 
@@ -47,8 +48,8 @@ To ensure clean separation of concerns, testability, and strict decoupling, the 
 
 ### D. Bounded Connection Pooling
 
-- **Choice (default since 2026-10-30, `BROKER=1`):** one broker process (`adapters/outbound/pg_broker.py`) owns every connection: `BROKER_READERS` (default 6) read + `BROKER_WRITERS` (default 2) write pipelines, plus one per worker for the bcrypt helper thread: 14 at `WORKERS=6`. With `BROKER=0`, the per-worker layout below.
-- **Per-worker layout (`BROKER=0`):** Per inline worker: `PG_READERS` (default 2) read pipelines + 1 write pipeline + 1 connection for the bcrypt helper thread, opened on first use: 4 per worker, 24 at the default `WORKERS=6`. The loop's own `SingleConnection` is opened only when the pipeline is off (`PIPELINE=0`: 2 per worker). In the optional threaded mode (`THREADS=N`), one total budget of **64 connections** (`DB_BUDGET` in `main.py`) is split evenly across the forked workers as fixed-size `psycopg_pool.ConnectionPool`s. `main.py` refuses to start if `WORKERS × connections_per_worker()` exceeds 95.
+- **Choice (default since 2026-10-30, `BROKER=1`):** one broker process (`adapters/outbound/pg_broker.py`) owns every connection: `BROKER_READERS` (default 8 since 2026-10-31) read + `BROKER_WRITERS` (default 2) write pipelines, plus one per worker for the bcrypt helper thread: 16 at `WORKERS=6`. With `BROKER=0`, the per-worker layout below.
+- **Per-worker layout (`BROKER=0`):** Per inline worker: `PG_READERS` (default 2) read pipelines + 1 write pipeline + 1 connection for the bcrypt helper thread, opened on first use: 4 per worker, 24 at the default `WORKERS=6`. The loop's own `SingleConnection` is opened only when the pipeline is off (`PIPELINE=0`: 2 per worker). In the optional threaded mode (`THREADS=N`), one total budget of **64 connections** (`DB_BUDGET` in `main.py`) is split evenly across the forked workers as fixed-size `psycopg_pool.ConnectionPool`s. `main.py` refuses to start if `WORKERS × driver.connections_per_worker()` exceeds 95.
 - **Why:** PostgreSQL is configured with a hard limit of `max_connections = 100` on the challenge box (spec: keep it at 95 or fewer). A fixed bounded pool prevents connection exhaustion while eliminating per-request handshake overhead.
 
 ### D2. Statements on libpq, prepared at connect
@@ -82,19 +83,24 @@ To ensure clean separation of concerns, testability, and strict decoupling, the 
 conduit_server/
 ├── domain/
 │   ├── models.py            # Frozen dataclasses for entities and responses
-│   └── services.py          # Pure business logic, validation rules & slug generation
+│   ├── services.py          # Pure business logic, validation rules & slug generation
+│   └── errors.py            # DuplicateError, raised by any database adapter
 ├── ports/
-│   ├── inbound.py           # Inbound handler protocols
-│   └── outbound.py          # Database & Crypto port contracts
+│   ├── inbound.py           # HttpRequest, RequestParser, HttpApplication, InboundServer
+│   └── outbound.py          # Repository, QueryPort, QueryPipelinePort, DatabaseDriverPort, PasswordHasherPort, TokenPort, JsonCodecPort
 ├── adapters/
 │   ├── inbound/
-│   │   ├── socket_server.py # Non-blocking epoll raw socket server
-│   │   ├── router.py        # Decorator router & JSON/dataclass serializer
-│   │   └── controllers.py   # Endpoint handlers utilizing domain services
+│   │   ├── socket_server.py # Non-blocking epoll raw socket server (HTTP_SERVER=epoll)
+│   │   ├── router.py        # Decorator router; response bytes via the injected JSON codec
+│   │   └── controllers.py   # Endpoint handlers utilizing domain services and the injected ports
 │   └── outbound/
-│       ├── pg_repository.py # Psycopg3 PostgreSQL adapter
-│       ├── crypto_adapter.py# Bcrypt & JWT verification adapter, multi-lane bcrypt batcher
+│       ├── pg_driver.py     # DB_DRIVER=libpq: builds the repository, pipelines and broker below
+│       ├── pg_repository.py # Psycopg3/libpq PostgreSQL adapter
+│       ├── pg_broker.py     # Shared broker process (batched reads, group commit)
+│       ├── json_codec.py    # JSON_CODEC=orjson
+│       ├── crypto_adapter.py# PASSWORD_HASHER=bcrypt (multi-lane batcher), TOKENS=hs256
 │       └── native/          # bcrypt_lanes.c (multi-lane bcrypt), jwt_verify.c (HS256 verify, CPython extension), gen_pi.py; built by build.sh
+├── registry.py              # Adapter per port, by environment variable
 └── main.py                  # Composition root & process bootstrap
 ```
 
@@ -127,6 +133,9 @@ conduit_server/
 - **JWT verify in C (2026-10-30):** `native/jwt_verify.c`, a CPython extension (a ctypes call would cost about as much as the work), built by `build.sh`. It decides tokens in our own form (our header; payload exactly `{"sub":"<digits>","iat":<digits>,"exp":<digits>}`); anything else returns None and `_verify_token_py` decides it. HMAC ipad/opad states are hashed once at init; SHA-256 uses SHA-NI when the CPU has it (`JWT_PORTABLE_SHA=1` forces portable C). `JWT_NATIVE=0` turns it off. Equivalence: fuzzing 24,544 tokens (mutations, other payloads/headers, signature trailing bits) gave the same outcome as the Python check, on both SHA paths. Single-thread 1,823 → 243 ns (portable SHA 684 ns). Alternating A/B at 24,000 users, 2 runs each, all PASS: JWT stage 9.6k/8.5k → 1.4k/1.2k ns/req, app 117k/107k → 100k/94k ns/req (the stage accounts for ~7.5k of that; the rest is within noise). Conformance 197/197.
 - **C connection core, tried and dropped (2026-10-30, user's decision):** a CPython extension doing epoll, accept, recv, framing, parsing, send and the idle sweep (Python kept routing, handlers, broker). Correct (197/197; 51 raw HTTP edge cases byte-identical to the Python loop), but uninstrumented (`STAGES=0`) it saved only ~6–8 µs app user per request (24,000 users: 54/58 → 47/50 µs; sys unchanged ~21 µs), with no capacity gain (Postgres-bound: ~29.5k req/s either way; both failed at 28,000 that day). Not worth ~550 lines of C. Lesson: the stage table's wrappers inflate small Python stages (it suggested 20–25k for loop + recv + send + parse + router); judge loop/IO ideas against `STAGES=0` app user+sys, and recv/send are mostly kernel time.
 - **Where Postgres time goes, and a feed page bound tried and dropped (2026-10-30):** at 24,000 users (`pg_stat_statements`) the feed is 32% of Postgres time (~750 µs a request), single article 18%, comments 14%, author list 9%, tag list 8%, global list 8%. A feed page that reads each followee's articles only down to the K-th largest of their newest ids (K = limit + offset; identical ids, batchcheck/diffsql 0 mismatches) cut the page step 297 → 177 µs alone, but the whole statement didn't move (batch ~858 → ~820 µs, noise) and the alternating load A/B showed no gain, so it was reverted. Inside the feed, removing the favorites count saves ~405 of ~900 µs: after a day of load runs 63% of the favorites it reads need heap fetches (the runs' writes clear all-visible bits; role `conduit` can't VACUUM). The box starts each search from a fresh copy of a frozen seed (`score/switch.sh`), so local `conduit_full` overstates this cost and drifts between runs: suspect DB state when Postgres numbers jump.
+- **Pluggable adapters (2026-10-31):** ports + `registry.py` (no regression: 31.6k/31.4k req/s against 31.5k, app ~95 µs both, 24,000 users). `HTTP_SERVER=uvloop` (uvloop 0.23, asyncio Protocols, same pipelines): app 97/100 against 92/93 µs/req, req/s within noise: no gain, stays non-default. `JSON_CODEC=msgspec|stdlib`: identical bytes; irrelevant under load while Postgres builds the bodies. Box result for PR #133: 74,000 users (#44), app 33% / Postgres 62% at 18,814 req/s (≈140 / 264 µs per request; #1 rust ≈58 / 99). Locally our Postgres per request matched the asm entry's, on the box it is ~1.8× asm's: the gap looks box-specific, unexplained.
+- **C-library and alternative adapters, measured (2026-10-31, 24,000 users, `STAGES=0`; table in README):** none beats the defaults. What C buys: multi-lane bcrypt ~40 µs/req over libxcrypt alone (pyca +60), C JWT verify ~2 µs over stdlib HMAC (PyJWT +43), psycopg-c ~4 µs over its ctypes build. Rows + app-side JSON (`DB_DRIVER=libpq-rows`, diffsql `REPO=rows` 0 mismatches): against unbatched JSON statements (`BROKER_BATCH=0`) Postgres −12 µs and app +12 µs, so `json_build_object` is not where the box's Postgres cost goes; and the batched forms exist only for JSON. asyncpg (`HTTP_SERVER=uvloop`, no broker): Postgres 317–347 against libpq's 283–287 without the broker, p50 150–220 ms (no pipelining); use its statement cache (explicit `prepare()` with `statement_cache_size=0` made Postgres re-prepare: 490 against 190 µs per list page).
+- **Measure on fresh copies of the frozen seed (2026-10-31):** `conduit_full` had drifted (772k articles against the seed's 500k, churned visibility map): Postgres 155–185 µs/req there, 100–126 on fresh copies. Build the exact seed once (`SEED_DB=conduit_box bash seed/make-seed.sh`, fingerprint OK), then `TEMPLATE=conduit_box IPS=3 STAGES=0 bash scripts/cpusplit.sh N` copies it per run (6.5 s) and spreads loadgen over 3 loopback IPs (one IP has ~28k ports). Earlier conduit_full numbers in this file are inflated. Capacity A/B there (the user's rule: laptop runs decide the defaults): default 44,000 PASS / 48,000 FAIL. At 46,000: 6 readers 1/2 PASS (48.6k/44.1k req/s, p95 458/552), **8 readers 3/3 PASS** (52.6–53.1k req/s, p95 254–330); at 50,000 1 PASS, 1 FAIL (p95 450/556: the edge). Now the default. 10 readers PASS at 46,000, FAIL at 50,000, Postgres 120 µs/req. uvloop + 8 readers FAIL at 50,000. libpq-rows FAIL at 46,000 (34–36k req/s). Leaderboard (all entries, same box): Postgres µs/req falls with throughput for everyone (≈260 at 19k req/s, ≈100 at 47k); ours sits on that curve, so the "box gap" is our throughput, not our SQL.
 - **Next steps, by expected saving:**
   1. Settle the orjson p99 question above, then controllers (23k): faster frozen-dataclass construction via a generated constructor in `domain/models.py` (518 ns against 100 ns for a dict; needs the user's OK).
   2. Postgres (374 µs/req, now the larger half): per-statement cost with pgbench; fewer statements in write paths.

@@ -4,8 +4,9 @@ article, create/delete comment). Each write runs inside a transaction that is ro
 compared with the reference SQL read in that same transaction. Nothing is left changed in the database.
 
     PYTHONPATH=. .venv/bin/python scripts/diffsql.py
+    REPO=rows ...   # the same check for DB_DRIVER=libpq-rows (bodies built in the app from rows)
 """
-import dataclasses, datetime, random, orjson
+import dataclasses, datetime, os, random, orjson
 from psycopg.rows import dict_row
 from conduit_server.adapters.outbound.pg_repository import PostgresUserRepository, SingleConnection
 from conduit_server.domain import services
@@ -14,7 +15,12 @@ from conduit_server.domain.models import (ArticleData, ArticlesResponse, Comment
 
 URL = "postgres://conduit:conduit@127.0.0.1:5432/conduit_full"
 pool = SingleConnection(URL)
-repo = PostgresUserRepository(pool)
+if os.getenv("REPO") == "rows":
+    from conduit_server.adapters.outbound.json_codec import OrjsonCodec
+    from conduit_server.adapters.outbound.pg_rows_repository import PostgresRowsRepository
+    repo = PostgresRowsRepository(pool, OrjsonCodec())
+else:
+    repo = PostgresUserRepository(pool)
 conn = pool.get()
 c = conn.cursor(row_factory=dict_row)
 
