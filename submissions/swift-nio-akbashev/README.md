@@ -120,16 +120,21 @@ All dependencies are pinned exactly in `Package.swift` (plus `Package.resolved`)
   startup parameters (session settings, nothing server-wide): the box's Postgres has JIT and parallel query on, and
   both cost more than they save on sub-millisecond statements, and the batches' array parameters would otherwise be
   re-planned on every execution.
-- **Writes** (`Writes.swift`) are committed in groups: they wait in one queue, and a write lane (`WRITE_LANES`,
-  1; each group on a connection leased from the pool) runs every write waiting as one transaction and answers them all once `COMMIT` has
-  returned, so a group pays for one commit instead of one per write. Consecutive favorites, unfavorites, follows,
-  unfollows and new comments of a group (8 of the workload's 9.7 points of writes) run as one statement each, over
-  arrays of their parameters, in the order they arrived (new comment ids are drawn in that order). If any statement
-  fails (a sign-up whose username is taken), the group is rolled back and each write runs again in a transaction of
-  its own, so one bad write fails alone; a lost connection fails its group without a retry, since its `COMMIT`'s
-  outcome is unknown. Writes that answer with an article (favorite, create, update) read it after the commit through
-  the read batcher, like any `GET` of it. On a write-heavy mix this took Postgres CPU per request from about 140 µs
-  (a transaction per write, `WRITE_GROUPING=0`) to about 45. More lanes answer sooner and commit more often.
+- **Writes** (`Writes.swift`) are committed in groups: they wait in one queue, and each write lane (`WRITE_LANES`,
+  4) takes every write waiting, runs them as one transaction on a connection of its own, and answers them all once
+  `COMMIT` has returned, so a group pays for one commit instead of one per write. The write lanes' connections are a
+  pool of their own (out of `DB_POOL_SIZE`), so a write never waits for a connection behind the read batches'
+  statements. All of a group's favorites, unfavorites, follows, unfollows and new comments (8 of the workload's 9.7
+  points of writes) run as one statement per kind, over arrays of their parameters, however they were interleaved:
+  writes of different users commute, a user's own requests on one connection come one after another, and a group is
+  cut where the same user would toggle the same favorite or follow twice (new comment ids are drawn in arrival
+  order). So a group is about five statements however many writes it holds. With one statement per write in turn on
+  one lane, as before, a lane tops out at a few hundred writes a second once a round trip costs a millisecond or two:
+  with 1 ms added to every Postgres reply, that took writes to p90 1.7 s on a mixed load, against 43 ms now. If any
+  statement fails (a sign-up whose username is taken), the group is rolled back and each write runs again in a
+  transaction of its own, so one bad write fails alone; a lost connection fails its group without a retry, since its
+  `COMMIT`'s outcome is unknown. Writes that answer with an article (favorite, create, update) read it after the
+  commit through the read batcher, like any `GET` of it.
 - **Auth**: `Authorization: Token <jwt>`; the signature is checked (constant-time, with an HMAC keyed once at startup)
   on every request. Tokens shaped like the ones this server issues are parsed in place; anything else goes through
   `JSONSerialization`. Present-but-invalid is 401 even on auth-optional endpoints; absent means anonymous
@@ -148,7 +153,7 @@ DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit_dev JWT_SECRET=co
 Environment: `DATABASE_URL`, `JWT_SECRET` (required); `HOST` (127.0.0.1), `PORT` (3000),
 `DB_POOL_SIZE` (`start.sh`: min(3 × cores, 95)), `BCRYPT_THREADS` (half the cores), `BCRYPT_QUEUE` (40 ×
 `BCRYPT_THREADS`), `BCRYPT_LANES` (measured at startup), `BCRYPT_WINDOW_MS` (200), `WRITE_GROUPING` (`0`: a
-transaction per write; on), `WRITE_LANES` (1), `WRITE_GROUP_MAX` (256), `NIO_GLOBAL_EXECUTOR` (`1` to run Swift tasks on NIO's event loops; off), `SCHED_BATCH` (`0` to
+transaction per write; on), `WRITE_LANES` (4), `WRITE_GROUP_MAX` (256), `NIO_GLOBAL_EXECUTOR` (`1` to run Swift tasks on NIO's event loops; off), `SCHED_BATCH` (`0` to
 keep the default scheduling policy; on), `READ_BATCHING` (`0`: no batching; on), `READ_LANES` (cores),
 `READ_WINDOW_MS` (5), `READ_BATCH_MIN` (32), `READ_BATCH_MAX` (1024). Batches lease their statements' connections
 from the same `DB_POOL_SIZE` pool as everything else.
