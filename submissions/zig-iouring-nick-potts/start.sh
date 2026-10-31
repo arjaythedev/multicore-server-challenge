@@ -3,9 +3,11 @@
 set -euo pipefail
 # Defaults for this build's optional levers (each also documented where main.zig reads it): the bcrypt kernel pinned
 # to asm_shrx at 5 lanes, MEGA with tags as text, one name lookup per list and its id set in id order, at most 4
-# read drains in flight across the lanes, and the per-lane counters in the log. An environment value set before
+# read drains in flight across the lanes, the per-lane counters in the log, and the io_uring plumbing set (buffer
+# returns in runs, sockets as fixed files, poll-first Postgres receives, no quick-ACK reset for replies within 15 ms). An environment value set before
 # start.sh wins.
 export ZIG_BCRYPT_KERNEL=${ZIG_BCRYPT_KERNEL-asm_shrx:5}
 export ZIG_MEGA_TAG_TEXT=${ZIG_MEGA_TAG_TEXT-1} ZIG_MEGA_NAME_IDS=${ZIG_MEGA_NAME_IDS-1} ZIG_MEGA_SORTED_IDS=${ZIG_MEGA_SORTED_IDS-1}
 export ZIG_READ_CAP=${ZIG_READ_CAP-4} ZIG_LANE_STATS=${ZIG_LANE_STATS-1}
+export ZIG_BUF_RUNS=${ZIG_BUF_RUNS-1} ZIG_FIXED_FILES=${ZIG_FIXED_FILES-2} ZIG_PG_POLL_FIRST=${ZIG_PG_POLL_FIRST-1} ZIG_ACK_SKIP_MS=${ZIG_ACK_SKIP_MS-15}
 exec "$(cd "$(dirname "$0")" && pwd)/bin/conduit"
