@@ -259,7 +259,7 @@ const Turn = struct {
 /// keeps reading sockets and queueing requests, and runs its writes and reads only once its oldest request has
 /// waited `dwell_ns` or it holds `cap` requests. A dwell of 0 runs every turn at once.
 const Clock = struct {
-    dwell_ns: i64 = 5 * std.time.ns_per_ms,
+    dwell_ns: i64 = 2500 * std.time.ns_per_us,
     cap: u32 = 256,
     /// The smallest batch that keeps the clock on for the next turn. A smaller one means light load: the next
     /// turn runs at once, so a lone request is not held for company that isn't coming.

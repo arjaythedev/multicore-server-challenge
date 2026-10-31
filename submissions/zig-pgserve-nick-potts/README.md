@@ -45,7 +45,7 @@ DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit \
   `pgengine`).
 - `PGSERVE_HASH_NICE=N` (default 19) runs the bcrypt threads at nice `N`; 0 keeps them at the worker's.
 - `PGSERVE_THIN_TO=1` (off by default) sets `TCP_THIN_LINEAR_TIMEOUTS` on every accepted connection.
-- `PGSERVE_DWELL_US=N` (default 5,000; 0 turns it off; at most 50,000) is the batch clock, with `PGSERVE_DWELL_CAP`
+- `PGSERVE_DWELL_US=N` (default 2,500; 0 turns it off; at most 50,000) is the batch clock, with `PGSERVE_DWELL_CAP`
   (default 256) and `PGSERVE_DWELL_MIN` (default 2). `PGSERVE_STATS_S=N` (off by default) logs each worker's batch
   sizes every `N` seconds. Both are under "How a request is served".
 - `GET /api/tags` answered 5.6-8.6 s after a cold Postgres restart in our runs. Most of that is bcrypt's
@@ -145,7 +145,7 @@ Each worker is one thread running an epoll loop, plus one bcrypt thread. Each tu
 Without a batch clock (`PGSERVE_DWELL_US=0`) a batch is whatever arrived during one turn. At 300,000 users that
 was a mean of 4 article reads per batch, and 1.2-3.9 for the other endpoints.
 
-`PGSERVE_DWELL_US` (default 5,000) is the batch clock. A turn is held: the worker keeps reading sockets, answering
+`PGSERVE_DWELL_US` (default 2,500) is the batch clock. A turn is held: the worker keeps reading sockets, answering
 what needs no data and queueing reads and writes, but runs the turn's writes and reads (steps 2 and 3) only once
 its oldest queued request has waited `PGSERVE_DWELL_US` µs or it holds `PGSERVE_DWELL_CAP` requests. A held worker
 sleeps in `epoll_pwait2` until that deadline, so the clock costs no spinning. Writes are still answered only after
@@ -153,7 +153,8 @@ their commit, and requests still share work only inside one batch. The clock sta
 `PGSERVE_DWELL_MIN`, so at light load a lone request runs at once instead of waiting for company. The dwell is
 capped at 50 ms. At 300,000 users on an aged database, 5 ms raised the mean article batch from 4 to 41 and cut the
 box's CPU per request from 79 to 63 µs and p99 from 93 to 30 ms, against no clock (2 ms: batch 20, 64 µs,
-p99 30 ms).
+p99 30 ms). On an 8-vCPU Xeon box whose one receive CPU is the wall, 2.5 ms cost that CPU 4.5-5.9% less per
+request than 5 ms in back-to-back runs: shorter waits mean fewer bare ACKs, as more of them ride an answer.
 
 `PGSERVE_STATS_S` logs one line per worker every that many seconds (`pgserve stats ...` in the Postgres log): how
 many turns ran and why (`now`: clock off or cold; `deadline`; `cap`), how long a turn's oldest request waited,
