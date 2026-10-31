@@ -1,2 +1,2 @@
-[build]
-rustflags = ["-C", "target-cpu=native"]
+# The benchmark box builds the binary itself (build.sh), so native code generation matches the CPU that runs it.
+# A binary built here can raise SIGILL on an older CPU: build on the machine that runs it.
