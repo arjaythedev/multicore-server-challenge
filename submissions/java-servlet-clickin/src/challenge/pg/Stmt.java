@@ -91,7 +91,8 @@ public final class Stmt {
         sql = sql.substring(0, select) + " SELECT p.id,cnt.n FROM cnt LEFT JOIN page p ON true";
         String ctes = prefix.isEmpty() ? "WITH " : prefix + ", ";
         String columns = (single == FEED ? "viewer,lim,off" : "lim,off,viewer") + ",i";
-        return decorated(
+        // a feed only lists followed authors (read from the same snapshot), so following is known without a probe
+        return decorated(single == FEED ? "d.id IS NOT NULL" : FOLLOWING,
                 ctes
                         + "r AS MATERIALIZED (SELECT * FROM unnest("
                         + inputs
@@ -107,14 +108,16 @@ public final class Stmt {
      * {@code pages(i, viewer, id, n)}, one row per listed article (id null for
      * an empty page), decorated once per distinct article.
      */
-    private static int decorated(String pages, int... types) {
+    private static final String FOLLOWING = "EXISTS(SELECT 1 FROM follows fo WHERE fo.follower_id=r.viewer AND fo.followee_id=d.author_id)";
+
+    private static int decorated(String following, String pages, int... types) {
         return register(
                 pages
                         + ", ids AS (SELECT DISTINCT id FROM pages WHERE id IS NOT NULL), deco AS MATERIALIZED ("
                         + BATCH_DECO.replace("a.description,a.body,", "a.description,")
                         + ") SELECT r.i::int4,"
                         + BATCH_COLUMNS
-                        + BATCH_DECORATION
+                        + BATCH_DECORATION.replace(FOLLOWING, following)
                         + ",r.n FROM pages r LEFT JOIN deco d ON d.id=r.id ORDER BY r.i,d.id DESC",
                 types);
     }
@@ -127,7 +130,7 @@ public final class Stmt {
      * 0.
      */
     private static int keyedList(String key, String count, String page) {
-        return decorated("WITH r AS MATERIALIZED (SELECT * FROM unnest($1::text[],$2::int4[],$3::int4[],$4::int8[]) WITH ORDINALITY AS r(name,lim,off,viewer,i)), k AS MATERIALIZED ("
+        return decorated(FOLLOWING, "WITH r AS MATERIALIZED (SELECT * FROM unnest($1::text[],$2::int4[],$3::int4[],$4::int8[]) WITH ORDINALITY AS r(name,lim,off,viewer,i)), k AS MATERIALIZED ("
                         + key.replace("{names}", "(SELECT DISTINCT name FROM r) k")
                         + "), kc AS MATERIALIZED (SELECT k.name,k.kid,(SELECT count(*) FROM ("
                         + count
