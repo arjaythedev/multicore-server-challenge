@@ -1,0 +1,47 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <!-- BenchmarkDotNet micro-benchmarks for the server's hot code. It is its own project: Conduit.csproj excludes
+       Benchmarks/** and build.sh never builds it. It compiles the app's own source files (linked below), so a benchmark
+       always measures the code as it is on disk. Run it with bash Benchmarks/run.sh (see Benchmarks/README.md). -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>conduit-benchmarks</AssemblyName>
+    <RootNamespace>Conduit.Benchmarks</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <IsPackable>false</IsPackable>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <!-- The same GC mode as the server, so allocation costs behave alike. -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The app code under test. Program.cs, Api*.cs and OpenApi.cs are left out: they need the whole host. -->
+    <Compile Include="..\Http.cs" Link="App\Http.cs" />
+    <Compile Include="..\Auth.cs" Link="App\Auth.cs" />
+    <Compile Include="..\Bcrypt.cs" Link="App\Bcrypt.cs" />
+    <Compile Include="..\BcryptCore.cs" Link="App\BcryptCore.cs" />
+    <Compile Include="..\BcryptLanes.g.cs" Link="App\BcryptLanes.g.cs" />
+    <Compile Include="..\BcryptPool.cs" Link="App\BcryptPool.cs" />
+    <Compile Include="..\BlowfishConstants.g.cs" Link="App\BlowfishConstants.g.cs" />
+    <Compile Include="..\Db.cs" Link="App\Db.cs" />
+    <Compile Include="..\Sql.cs" Link="App\Sql.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="BCrypt.Net-Next" Version="4.2.0" />
+    <PackageReference Include="BenchmarkDotNet" Version="0.15.8" />
+    <PackageReference Include="Microsoft.IdentityModel.JsonWebTokens" Version="8.23.0" />
+    <PackageReference Include="Npgsql" Version="10.0.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- As in the server: Npgsql doesn't parse the SQL text, since every statement uses positional parameters. -->
+    <RuntimeHostConfigurationOption Include="Npgsql.EnableSqlRewriting" Value="false" />
+  </ItemGroup>
+
+</Project>
