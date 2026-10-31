@@ -158,18 +158,21 @@ final class WriteBatcher: Service {
         for lane in idle { lane.resume() }
     }
 
-    /// One Postgres connection, held for the lane's life; a lost connection is replaced.
+    /// Commits groups, one at a time, each on a connection leased from the pool for it (the pool only hands out open
+    /// ones). Not one held for the lane's life: postgres-nio's `query` on a connection that has since closed (Postgres
+    /// restarted, the socket dropped) never returns, so a connection held while idle could hang every write behind it.
     private func lane() async {
-        while !state.withLock({ $0.stopped }) {
+        while let group = await nextGroup() {
+            var answered = false
             do {
                 try await db.withConnection { connection in
-                    while let group = await self.nextGroup() {
-                        try await self.commit(group, on: connection)
-                    }
+                    guard !connection.isClosed else { throw ApiError(.serviceUnavailable, "database connection closed") }
+                    answered = true
+                    await self.commit(group, on: connection)
                 }
             } catch {
-                App.logger.error("write lane failed", metadata: ["error": "\(error)"])
-                try? await Task.sleep(for: .milliseconds(100))
+                App.logger.error("write group failed", metadata: ["error": "\(error)"])
+                if !answered { for waiting in group { waiting.continuation.resume(throwing: error) } }
             }
         }
     }
@@ -196,17 +199,22 @@ final class WriteBatcher: Service {
         }
     }
 
-    /// One transaction for the whole group. An error from Postgres rolls it back and sends each write through a
-    /// transaction of its own; a lost connection (when COMMIT's outcome is unknown) fails the group and the lane
-    /// reconnects.
-    private func commit(_ group: [Waiting], on connection: PostgresConnection) async throws {
+    /// One transaction for the whole group; every write in it is answered, whatever happens. An error from Postgres
+    /// rolls it back and sends each write through a transaction of its own; a lost connection (when COMMIT's outcome
+    /// is unknown) fails the group without a retry.
+    private func commit(_ group: [Waiting], on connection: PostgresConnection) async {
         do {
             try await connection.exec("BEGIN")
             let outcomes = try await execute(group.map(\.write), on: connection)
             try await connection.exec("COMMIT")
             for (waiting, outcome) in zip(group, outcomes) { waiting.continuation.resume(returning: outcome) }
         } catch let error as PSQLError where error.serverInfo != nil {
-            try await connection.exec("ROLLBACK")
+            do {
+                try await connection.exec("ROLLBACK")
+            } catch {
+                for waiting in group { waiting.continuation.resume(throwing: error) }
+                return
+            }
             for waiting in group {
                 do {
                     waiting.continuation.resume(returning: try await alone(waiting.write, on: connection))
@@ -216,7 +224,6 @@ final class WriteBatcher: Service {
             }
         } catch {
             for waiting in group { waiting.continuation.resume(throwing: error) }
-            throw error
         }
     }
 
