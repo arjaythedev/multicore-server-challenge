@@ -10,6 +10,7 @@ at connect time, and rows come back in binary format, decoded by one reused psyc
 a few µs and yields the same values.
 """
 
+import os
 import re
 import threading
 import psycopg
@@ -416,8 +417,7 @@ _LIST_FEED_BATCH = _Stmt(
 def _keyed_list_batch(count_sql: str, page_sql: str) -> _Stmt:
     """A list filtered by a key ($2, the tag or username; $3 limit, $4 offset): the count once per distinct key in the
     unit, each request's page as the single statement's, the article data once for the union of the pages. Used for
-    author lists (the workload opens the authors of the newest articles); tag and favorited units measured slower
-    than singles (keys rarely repeat in a unit, and building `w` costs more than it shares)."""
+    author, tag and favorited lists."""
     count = count_sql.replace("$2", "d.key")
     page = page_sql.replace("$2", "v.key").replace("$3::int", "v.lim").replace("$4::int", "v.off")
     return _Stmt(
@@ -436,6 +436,8 @@ def _keyed_list_batch(count_sql: str, page_sql: str) -> _Stmt:
 
 
 _LIST_AUTHOR_BATCH = _keyed_list_batch(*_AUTHOR_SQL[:2])
+_LIST_TAG_BATCH = _keyed_list_batch(*_TAG_SQL[:2])
+_LIST_FAVORITED_BATCH = _keyed_list_batch(*_FAVORITED_SQL[:2])
 
 
 _ARTICLE_BY_SLUG_BATCH = _Stmt(
@@ -508,6 +510,12 @@ BATCHED = {
     _ARTICLE_BY_SLUG_JSON.index: Batched(_ARTICLE_BY_SLUG_BATCH, _viewer_text_params, 2),
     _COMMENTS_BY_SLUG_JSON.index: Batched(_COMMENTS_BY_SLUG_BATCH, _viewer_text_params, 4),
 }
+# Tag and favorited lists, batched since 2026-10-31: on fresh copies of the seed at 50,000 test users, Postgres 109
+# against 114 µs/request (mean of 6 and 8 runs). On the drifted conduit_full they had measured slower than singles.
+# BATCH_KEYED=0 runs them as singles (A/B).
+if os.getenv("BATCH_KEYED", "1") != "0":
+    BATCHED[_LIST_TAG_JSON.index] = Batched(_LIST_TAG_BATCH, _keyed_list_params, 2)
+    BATCHED[_LIST_FAVORITED_JSON.index] = Batched(_LIST_FAVORITED_BATCH, _keyed_list_params, 2)
 # Statements without parameters whose one result every request in the unit shares
 SHARED = frozenset({_TAGS_JSON.index})
 

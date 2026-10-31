@@ -13,7 +13,7 @@ from conduit_server.domain import services
 from conduit_server.domain.models import (ArticleData, ArticlesResponse, CommentData, CommentsResponse, ProfileData,
                                           ProfileResponse, SingleArticleResponse, SingleCommentResponse, TagsResponse)
 
-URL = "postgres://conduit:conduit@127.0.0.1:5432/conduit_full"
+URL = os.getenv("DATABASE_URL", "postgres://conduit:conduit@127.0.0.1:5432/conduit_full")
 pool = SingleConnection(URL)
 if os.getenv("REPO") == "rows":
     from conduit_server.adapters.outbound.json_codec import OrjsonCodec

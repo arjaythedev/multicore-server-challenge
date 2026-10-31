@@ -140,7 +140,7 @@ build the user responses, and they are the contract `scripts/diffsql.py` checks 
     its bcrypt to the broker, whose bcrypt threads (`BcryptBatcher`, `BCRYPT_THREADS`, default 2) hash up to 6
     logins from all workers at once. A lone login waits up to `BCRYPT_WAIT_MS` (default 100) for others; a second
     thread takes only full batches, when logins back up.
-  - Postgres connections: the broker's 8 plus one per worker for the bcrypt helper, 14 in all (with `BROKER=0`: 4 per
+  - Postgres connections: the broker's 10 (8 read, 2 write) plus one per worker for the bcrypt helper, 16 in all (with `BROKER=0`: 4 per
     worker, 24). `main.py` refuses to start a configuration that could open more than 95. `PIPELINE=0` runs every
     query blocking on one connection instead.
   - Writes to clients never block: whatever the kernel doesn't take waits in a per-connection buffer under `EPOLLOUT`.
@@ -173,8 +173,8 @@ build the user responses, and they are the contract `scripts/diffsql.py` checks 
   `force_generic_plan`: under `auto`, Postgres re-planned the list statements on every execution (~180 µs each).
 
   The broker runs a unit of queued requests in one of three ways:
-  - **Batched statement** (`pg_repository.BATCHED`: global list from 4 requests, feed and author list from 2,
-    article from 2, comments from 4):
+  - **Batched statement** (`pg_repository.BATCHED`: global list from 4 requests, feed, author, tag and favorited
+    lists from 2, article from 2, comments from 4):
     parameters are arrays with one element per request, the shared work runs once (an article's tags, favorites
     count and author once per distinct article; the list's capped count once per unit), and one body comes back per
     request. Single-connection Postgres time per request, batched against single, at 16 requests: global list 96 µs
@@ -182,12 +182,12 @@ build the user responses, and they are the contract `scripts/diffsql.py` checks 
     and deduplicated from `unnest` of an array: the generic plan can't see that a CTE is small, so it merge-joined all
     of `articles` and sized a hash table for thousands of rows. `scripts/batchcheck.py` checks that every batched body
     is byte for byte the single statement's. If a batch fails, its requests run again one by one.
-    In the list batches each request's count and page are its own (feed: per viewer; author list: per distinct
-    author), the article data is built once for the union of the pages, and the pages are put together in one grouped
+    In the list batches each request's count and page are its own (feed: per viewer; author, tag and favorited
+    lists: per distinct key), the article data is built once for the union of the pages, and the pages are put together in one grouped
     join (a subquery per request scanned all the shared articles each time). The feed's cost is mostly per article,
     favorites counts above all (popular authors' articles have up to 2,000), so the batch saves the most when feeds
-    overlap. Tag and favorited lists stay single: their keys rarely repeat in a unit, and batches measured 15–35%
-    slower than singles.
+    overlap. Tag and favorited lists had measured 15–35% slower batched on a drifted local database; on fresh copies
+    of the seed they are cheaper batched (Postgres 109 against 114 µs per request), so they are batched too.
   - **Shared** (tags, no parameters): one execution answers every request in the unit.
   - Anything else: pipelined single statements, one Sync each.
 
@@ -231,6 +231,24 @@ and 154k of the ~2.5M comments, so most feeds were empty). Each row is one run, 
 | same, 8 read connections | 28,000 | 27,499 | 608 ms | 1,001 ms | fail |
 | + multi-lane bcrypt for logins, in the broker | 28,000 | 30,240–31,185 | 459–481 ms | 706–884 ms | pass (2/2; without: 0/2) |
 
+From here on, each run is on a fresh copy of the exact seed (`TEMPLATE=conduit_box`, see "Measuring"): by then
+`conduit_full` had drifted to 772k articles against the seed's 500k, which made Postgres 155–185 µs per request
+there against 100–126 on fresh copies. Load spread over 3 loopback IPs, `STAGES=0`:
+
+| Version | Test users | req/s | p95 | Result |
+|---|--:|--:|--:|---|
+| 6 read connections | 44,000 | 49,598 | 261 ms | pass |
+| same | 48,000 | 46,357 | 566 ms | fail |
+| same | 46,000 | 44,131–48,642 | 458–552 ms | 1 of 2 pass |
+| 8 read connections (now the default) | 46,000 | 52,622–53,094 | 254–330 ms | 3 of 3 pass |
+| same | 50,000 | 48,338–53,019 | 413–622 ms | 4 of 8 pass, Postgres 114 µs/req |
+| + tag and favorited lists batched | 50,000 | 49,586–51,789 | 399–561 ms | 4 of 6 pass, Postgres 109 µs/req |
+
+At 50,000 test users the laptop is at its edge (all 10 CPUs busy, the load generator included), so pass or fail
+there is close to a coin flip; CPU per request is the steadier measure. At about 52k req/s a request costs about
+70 µs of app CPU and 105 µs of Postgres CPU, all of it in the client backends (each of the 8 readers about 0.6 of a
+core).
+
 Per request at 8,000 test users (`cpusplit.sh`, two runs each): app + Postgres CPU went from 477–509k ns
 (`BROKER=0`) to 389–407k with the broker on 2 read connections. At saturation (24,000 test users) Postgres used
 about 4.7 cores, the workers about half a core each and the broker a quarter of one: the queue in front of the read
@@ -268,16 +286,22 @@ box's.
 
 ## Measuring
 
-All scripts need a local database `conduit_full` with the complete seed (`SEED_DB=conduit_full bash
-seed/make-seed.sh` from the repo root; it must print `OK`) and the load generator at `/tmp/conduit-lg/loadgen`.
+All scripts need a local copy of the complete seed (`SEED_DB=conduit_box bash seed/make-seed.sh` from the repo
+root, as a Postgres superuser; it must print `OK`) and the load generator at `/tmp/conduit-lg/loadgen`
+(`go build -o /tmp/conduit-lg/loadgen ./cmd/loadgen` in `bench/`). Load runs change the database, and a database
+that has absorbed many runs makes Postgres slower and drifts between runs, so compare runs on fresh copies:
+`TEMPLATE=conduit_box` makes `cpusplit.sh` copy the template to `conduit_run` before each run (6.5 s), and `IPS=3`
+spreads the load generator over 127.0.0.1–3 (one address has about 28,000 ephemeral ports). The checks take
+`DATABASE_URL` (or a URL argument for batchcheck); otherwise they use `conduit_full`.
 
 | Command | What it does |
 |---|---|
 | `bash scripts/loadtest.sh <label> <users> [WORKERS]` | scoring-style run: overall result, verdict, CPU split; JSON with a per-second timeline in `/tmp/conduit-lg/<label>.json` |
-| `WORKERS=6 bash scripts/cpusplit.sh <users>` | app user/sys µs, Postgres µs and context switches per request, then the per-stage ns table above. `STAGES=0` runs the plain server without the stage table |
+| `TEMPLATE=conduit_box IPS=3 STAGES=0 bash scripts/cpusplit.sh <users>` | app user/sys µs, Postgres µs and context switches per request on a fresh copy of the seed. Without `STAGES=0`, the per-stage ns table above too |
 | `PYTHONPATH=. .venv/bin/python scripts/diffsql.py` | compares every Postgres-built response (reads, and writes inside rolled-back transactions) with the spec's reference SQL (should print 0 mismatches) |
 | `PYTHONPATH=. .venv/bin/python scripts/batchcheck.py` | runs every batched statement and its single statement on the same random requests and compares the bytes (should print 0 mismatches) |
 | `PYTHONPATH=. .venv/bin/python scripts/profile.py` | single-thread CPU per endpoint, plus cProfile output |
+| `.venv/bin/python scripts/codeccheck.py`, `scripts/tokencheck.py` | every JSON codec / token adapter against the default |
 
 `cpusplit.sh` starts the server through `scripts/stagetimer.py`. It wraps the hot functions with per-thread CPU
 clocks (`time.thread_time_ns`, which leaves out time spent waiting for a core) and charges each stage only its own
