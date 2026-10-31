@@ -67,20 +67,29 @@ against the Servlet API: standard `HttpServlet`s, in async mode, on a container 
 - **One statement per request**, prepared once per connection, binary results, generic plans that stay sane: every
   list's page is cut first (`LIMIT/OFFSET` on the bare index walk) and decorated afterwards, and the page sits under a
   constant `LIMIT 100` so a parameter `LIMIT` can't make the planner expect 10% of the table (it once picked a hash
-  join over all 500k articles for every request in a batch: 8 s per batch, 13 ms after).
-- **Reads are batched across requests.** A single dispatcher thread owns all read connections (8) and write
-  connections (4). Each read connection has one round in flight; reads that arrive meanwhile wait (and wait up to
+  join over all 500k articles for every request in a batch: 8 s per batch, 13 ms after). Every connection sets
+  `plan_cache_mode = force_generic_plan` (a session `SET`): in `auto` mode Postgres kept re-planning the batch
+  statements, whose array parameters make each custom plan look different, on almost every execution (~0.3 ms each).
+- **Reads are batched across requests.** A single dispatcher thread owns all read connections (8) and the write
+  connection (1). Each read connection has one round in flight; reads that arrive meanwhile wait (and wait up to
   `READ_GATHER_US` = 5 ms for company), then go out together: requests of a kind become **one** statement over arrays
   of their parameters (`unnest(...) WITH ORDINALITY` + `LATERAL`), each row tagged with its request. Within a
   statement, each distinct article is decorated (tags, favorites count, author) **once**, however many requests in
   the batch show it; only `favorited` / `following` are per viewer. Nothing outlives the statement (rule 5).
+- **No repeated lookups inside a batch.** Tag names come from one join + `array_agg` grouped by article (the
+  per-article subquery's generic plan scanned and hashed all 200 tags for every article). The article and comments
+  batches look each slug up once in a `MATERIALIZED` CTE and reuse that row (they used to look it up twice). A keyed
+  list (`?tag=`, `?author=`, `?favorited=`) resolves and counts each distinct name once, however many requests in
+  the batch ask for it. The feed knows `following` is true for every author it walks and skips that probe.
 - **The feed's count, proven instead of counted.** Most viewers follow an author with 1,000+ articles (82.6% of users),
   so their capped count is 1,000. A batch picks the 4 authors most followed by its viewers, proves ≥ 1,000 articles
   for each with one bounded index walk, and only the other viewers count.
-- **Group commit.** Each write connection has one group in flight; writes that arrive meanwhile go out together, each
+- **Group commit.** The write connection has one group in flight; writes that arrive meanwhile go out together, each
   request's statements back to back and one `Sync` at the end: one transaction, one WAL flush. Responses are sent
   only after the group commits (rule 6). If any statement fails, the group is rolled back by Postgres and its
-  requests are retried one by one, so only the faulty one gets its error (e.g. 422 on a duplicate email).
+  requests are retried one by one, so only the faulty one gets its error (e.g. 422 on a duplicate email). With
+  four write connections each group held one or two writes, i.e. about one fsync per write; one connection gathers
+  every write that arrives during a WAL flush.
 
 Measured locally on the full seed (Postgres, server and load generator in one 8-CPU container, fixed load of
 18k req/s; `pg_stat_statements`, local only):
@@ -100,6 +109,25 @@ leaves most of the core idle: `BCrypt` runs up to 4 independent hashes interleav
 per thread through FFM; `Thread.setPriority` is a no-op on Linux), which wait up to 40 ms to fill their lanes.
 
 ## Results
+
+### Query work (this branch vs. the previous build, `a3d49a1`)
+
+Hetzner ccx33 target, two cpx42 load boxes (`dev/hcloud/fixed.sh`): fresh switch, a 60 s warm-up, then a fixed user
+count, measured 120 s (80k) or 60 s (120k), two runs per build, alternated. CPU is the share of the whole box (app / Postgres, from systemd cgroups).
+
+| Users | Build | req/s | p50 | p95 | p99 | Box CPU (app / Postgres) |
+|--:|---|--:|--:|--:|--:|---|
+| 80,000 | previous | 21,054-21,068 | 26-27 ms | 48-54 ms | 68-104 ms | 72.3% (31.1% / 39.3%) |
+| 80,000 | this | 21,073-21,099 | 20-21 ms | 35-36 ms | 43-49 ms | 60.5% (29.2% / 29.2%) |
+| 120,000 | previous | 30,657-30,800 | 94-98 ms | 352-371 ms | 474-667 ms | 98.6% (42.7% / 54.5%) |
+| 120,000 | this | 31,297-31,325 | 40-45 ms | 167-178 ms | 251-262 ms | 90.7% (45.0% / 44.1%) |
+
+At the same throughput Postgres uses about a quarter less CPU (39.3% -> 29.2% of the box at 80k). At 120k the
+previous build is out of CPU and queueing, while this one still has ~9% of the box free and half the tail latency.
+Past ~130k users these two load boxes fall behind themselves, so the rig cannot find this build's limit. Local
+`pg_stat_statements` (same load, total execution time): 78 s -> 55 s.
+
+### Earlier search (before this branch)
 
 On Hetzner **ccx33** (8 dedicated AMD EPYC-Milan vCPU, Postgres 18; configured by `box/pg-conf.sh` as for 16 GB),
 full seed, the repo's `loadgen search` from two separate load boxes (one cx43 and one cpx42, 8 shared vCPU each, the
@@ -140,7 +168,7 @@ so compare with the leaderboard loosely.
 
 ## Tuning knobs (all optional; defaults are what was measured)
 
-`LOOPS`, `READ_CONNS` (8), `WRITE_CONNS` (4), `READ_GATHER_US` (5000), `READ_ROUND_MAX` (512), `WRITE_GROUP_MAX` (256),
+`LOOPS`, `READ_CONNS` (8), `WRITE_CONNS` (1), `READ_GATHER_US` (5000), `READ_ROUND_MAX` (512), `WRITE_GROUP_MAX` (256),
 `COALESCE` (1), `MAX_INFLIGHT_PER_LOOP` (1024), `BCRYPT_THREADS` (4), `BCRYPT_LANES` (4), `BCRYPT_GATHER_MS` (40),
 `BCRYPT_NICE` (5), `JAVA_OPTS`.
 
