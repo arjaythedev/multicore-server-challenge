@@ -1,0 +1,291 @@
+-- Application writes/auth, expressed in Nelua over the host's prepared libpq API.
+-- No result, password verification, or token verification survives a request.
+local N = require 'bindings'
+local S = require 'serialize'
+local R = require 'reads'
+local M: type = @record{}
+
+local function user_response(req: *N.Request, result: *N.Result, status: cint, token: cstring)
+  if not token then
+    N.free(result)
+    N.error(req, 500)
+    return
+  end
+  local buffer = N.begin(req, status)
+  N.write(buffer, '{"user":')
+  S.user(buffer, result, 0, token)
+  N.write(buffer, '}')
+  N.free(result)
+end
+
+function M.register(req: *N.Request, db: *N.Db)
+  local object = N.body(req, 'user')
+  if not object then N.error(req, 422); return end
+  local username = N.required(object, 'username')
+  local email = N.required(object, 'email')
+  local password = N.required(object, 'password')
+  if not username or not email or not password then N.error(req, 422); return end
+  local hash = N.hash(req, password)
+  if not hash then N.error(req, 422); return end
+  local parameters: [3]cstring = {username, email, hash}
+  local result = N.query(db, 40, [[
+    INSERT INTO public.users (username,email,password_hash) VALUES ($1,$2,$3)
+    RETURNING id,username,email,bio,image
+  ]], 3, &parameters[0])
+  if not N.check(req, result) then return end
+  local token = N.issue_token(req, N.integer(result, 0, 0))
+  user_response(req, result, 201, token)
+end
+
+function M.login(req: *N.Request, db: *N.Db)
+  local object = N.body(req, 'user')
+  if not object then N.error(req, 422); return end
+  local email = N.required(object, 'email')
+  local password = N.required(object, 'password')
+  if not email or not password then N.error(req, 422); return end
+  local parameters: [1]cstring = {email}
+  local result = N.query(db, 41, [[
+    SELECT id,username,email,bio,image,password_hash FROM public.users WHERE email=$1
+  ]], 1, &parameters[0])
+  if not N.check(req, result) then return end
+  if N.rows(result) == 0 then N.free(result); N.error(req, 401); return end
+  if not N.verify(password, N.value(result, 0, 5)) then
+    N.free(result); N.error(req, 401); return
+  end
+  local token = N.issue_token(req, N.integer(result, 0, 0))
+  user_response(req, result, 200, token)
+end
+
+function M.current(req: *N.Request, db: *N.Db, viewer: int64)
+  local parameters: [1]cstring = {N.decimal(req, viewer)}
+  local result = N.query(db, 42, [[
+    SELECT id,username,email,bio,image FROM public.users WHERE id=$1::bigint
+  ]], 1, &parameters[0])
+  if not N.check(req, result) then return end
+  if N.rows(result) == 0 then N.free(result); N.error(req, 401); return end
+  user_response(req, result, 200, N.token(req))
+end
+
+function M.update_user(req: *N.Request, db: *N.Db, viewer: int64)
+  local object = N.body(req, 'user')
+  if not object then N.error(req, 422); return end
+  local email, ok_email = N.optional(object, 'email', true)
+  local username, ok_username = N.optional(object, 'username', true)
+  local password, ok_password = N.optional(object, 'password', true)
+  local bio, ok_bio = N.optional(object, 'bio', false)
+  local image, ok_image = N.optional(object, 'image', false)
+  if not ok_email or not ok_username or not ok_password or not ok_bio or not ok_image then
+    N.error(req, 422); return
+  end
+  local hash: cstring = nilptr
+  if password then
+    hash = N.hash(req, password)
+    if not hash then N.error(req, 422); return end
+  end
+  local parameters: [6]cstring = {N.decimal(req, viewer), email, username, hash, bio, image}
+  local result = N.query(db, 43, [[
+    UPDATE public.users SET email=COALESCE($2,email),username=COALESCE($3,username),
+      password_hash=COALESCE($4,password_hash),bio=COALESCE($5,bio),image=COALESCE($6,image)
+    WHERE id=$1::bigint RETURNING id,username,email,bio,image
+  ]], 6, &parameters[0])
+  if not N.check(req, result) then return end
+  if N.rows(result) == 0 then N.free(result); N.error(req, 401); return end
+  user_response(req, result, 200, N.token(req))
+end
+
+function M.follow(req: *N.Request, db: *N.Db, viewer: int64, username: cstring, active: boolean)
+  local parameters: [2]cstring = {N.decimal(req, viewer), username}
+  local result: *N.Result
+  -- The DML CTE commits before libpq returns. The following flag is the requested
+  -- state, avoiding a stale snapshot probe of the relation changed by this CTE.
+  if active then
+    result = N.query(db, 44, [[
+      WITH target AS MATERIALIZED (
+        SELECT id,username,bio,image FROM public.users WHERE username=$2),
+      changed AS (INSERT INTO public.follows (follower_id,followee_id)
+        SELECT $1::bigint,id FROM target ON CONFLICT DO NOTHING)
+      SELECT username,bio,image,true FROM target
+    ]], 2, &parameters[0])
+  else
+    result = N.query(db, 45, [[
+      WITH target AS MATERIALIZED (
+        SELECT id,username,bio,image FROM public.users WHERE username=$2),
+      changed AS (DELETE FROM public.follows f USING target t
+        WHERE f.follower_id=$1::bigint AND f.followee_id=t.id)
+      SELECT username,bio,image,false FROM target
+    ]], 2, &parameters[0])
+  end
+  if not N.check(req, result) then return end
+  if N.rows(result) == 0 then N.free(result); N.error(req, 404); return end
+  local buffer = N.begin(req, 200)
+  N.write(buffer, '{"profile":')
+  S.profile(buffer, result, 0, 0)
+  N.write(buffer, '}')
+  N.free(result)
+end
+
+function M.create_article(req: *N.Request, db: *N.Db, viewer: int64)
+  local object = N.body(req, 'article')
+  if not object then N.error(req, 422); return end
+  local title = N.required(object, 'title')
+  local description = N.required(object, 'description')
+  local body = N.required(object, 'body')
+  if not title or not description or not body then N.error(req, 422); return end
+  local tags = N.field(object, 'tagList')
+  local tag_count: cint = 0
+  local tag_value: cstring = nilptr
+  if N.kind(tags) ~= 0 then
+    if N.kind(tags) ~= 2 then N.error(req, 422); return end
+    tag_count = N.array_length(tags)
+    for i: cint = 0, tag_count - 1 do
+      local item = N.array_item(tags, i)
+      if N.kind(item) ~= 3 then N.error(req, 422); return end
+      local value = N.string(item)
+      if not value or N.length(value) == 0 then N.error(req, 422); return end
+    end
+    if tag_count > 0 then
+      tag_value = N.tag_array(req, tags)
+      if not tag_value then N.error(req, 500); return end
+    end
+  end
+  if not N.tx(db, 'BEGIN') then N.error(req, 500); return end
+  local parameters: [4]cstring = {N.decimal(req, viewer), title, description, body}
+  local result = N.query(db, 46, [[
+    INSERT INTO public.articles (id,slug,author_id,title,description,body)
+    SELECT n.id,trim(both '-' from lower(regexp_replace($2,'[^A-Za-z0-9]+','-','g'))) || '-' || n.id,
+      $1::bigint,$2,$3,$4
+    FROM (SELECT nextval(pg_get_serial_sequence('public.articles','id')) AS id) n
+    RETURNING id
+  ]], 4, &parameters[0])
+  if not N.check(req, result) then N.tx(db, 'ROLLBACK'); return end
+  local article_id = N.decimal(req, N.integer(result, 0, 0))
+  N.free(result)
+  if tag_count > 0 then
+    local tag_parameters: [1]cstring = {tag_value}
+    result = N.query(db, 47, [[
+      INSERT INTO public.tags (name) SELECT DISTINCT unnest($1::text[]) ORDER BY 1
+      ON CONFLICT (name) DO NOTHING
+    ]], 1, &tag_parameters[0])
+    if not N.check(req, result) then N.tx(db, 'ROLLBACK'); return end
+    N.free(result)
+    local link_parameters: [2]cstring = {article_id, tag_value}
+    result = N.query(db, 48, [[
+      INSERT INTO public.article_tags (article_id,tag_id)
+      SELECT $1::bigint,t.id FROM public.tags t WHERE t.name=ANY($2::text[])
+    ]], 2, &link_parameters[0])
+    if not N.check(req, result) then N.tx(db, 'ROLLBACK'); return end
+    N.free(result)
+  end
+  if not N.tx(db, 'COMMIT') then N.tx(db, 'ROLLBACK'); N.error(req, 500); return end
+  R.article(req, db, viewer, article_id, true, 201)
+end
+
+function M.update_article(req: *N.Request, db: *N.Db, viewer: int64, slug: cstring)
+  local object = N.body(req, 'article')
+  if not object then N.error(req, 422); return end
+  local title, ok_title = N.optional(object, 'title', true)
+  local description, ok_description = N.optional(object, 'description', true)
+  local body, ok_body = N.optional(object, 'body', true)
+  if not ok_title or not ok_description or not ok_body then N.error(req, 422); return end
+  local parameters: [5]cstring = {N.decimal(req, viewer), slug, title, description, body}
+  local result = N.query(db, 49, [[
+    WITH target AS MATERIALIZED (SELECT id,author_id FROM public.articles WHERE slug=$2),
+    changed AS (UPDATE public.articles a SET title=COALESCE($3,a.title),
+      description=COALESCE($4,a.description),body=COALESCE($5,a.body),
+      slug=CASE WHEN $3::text IS NULL THEN a.slug ELSE
+        trim(both '-' from lower(regexp_replace($3,'[^A-Za-z0-9]+','-','g'))) || '-' || a.id END,
+      updated_at=now() FROM target t WHERE a.id=t.id AND t.author_id=$1::bigint)
+    SELECT id,author_id FROM target
+  ]], 5, &parameters[0])
+  if not N.check(req, result) then return end
+  if N.rows(result) == 0 then N.free(result); N.error(req, 404); return end
+  if N.integer(result, 0, 1) ~= viewer then N.free(result); N.error(req, 403); return end
+  local article_id = N.decimal(req, N.integer(result, 0, 0))
+  N.free(result)
+  R.article(req, db, viewer, article_id, true, 200)
+end
+
+function M.delete_article(req: *N.Request, db: *N.Db, viewer: int64, slug: cstring)
+  local parameters: [2]cstring = {N.decimal(req, viewer), slug}
+  local result = N.query(db, 50, [[
+    WITH target AS MATERIALIZED (SELECT id,author_id FROM public.articles WHERE slug=$2),
+    changed AS (DELETE FROM public.articles a USING target t
+      WHERE a.id=t.id AND t.author_id=$1::bigint)
+    SELECT author_id FROM target
+  ]], 2, &parameters[0])
+  if not N.check(req, result) then return end
+  if N.rows(result) == 0 then N.free(result); N.error(req, 404); return end
+  if N.integer(result, 0, 0) ~= viewer then N.free(result); N.error(req, 403); return end
+  N.free(result)
+  N.begin(req, 204)
+end
+
+function M.favorite(req: *N.Request, db: *N.Db, viewer: int64, slug: cstring, active: boolean)
+  local parameters: [2]cstring = {N.decimal(req, viewer), slug}
+  local result: *N.Result
+  if active then
+    result = N.query(db, 51, [[
+      WITH target AS MATERIALIZED (SELECT id FROM public.articles WHERE slug=$2),
+      changed AS (INSERT INTO public.favorites (user_id,article_id)
+        SELECT $1::bigint,id FROM target ON CONFLICT DO NOTHING)
+      SELECT id FROM target
+    ]], 2, &parameters[0])
+  else
+    result = N.query(db, 52, [[
+      WITH target AS MATERIALIZED (SELECT id FROM public.articles WHERE slug=$2),
+      changed AS (DELETE FROM public.favorites f USING target t
+        WHERE f.user_id=$1::bigint AND f.article_id=t.id)
+      SELECT id FROM target
+    ]], 2, &parameters[0])
+  end
+  if not N.check(req, result) then return end
+  if N.rows(result) == 0 then N.free(result); N.error(req, 404); return end
+  local article_id = N.decimal(req, N.integer(result, 0, 0))
+  N.free(result)
+  R.article(req, db, viewer, article_id, true, 200)
+end
+
+function M.create_comment(req: *N.Request, db: *N.Db, viewer: int64, slug: cstring)
+  local object = N.body(req, 'comment')
+  if not object then N.error(req, 422); return end
+  local body = N.required(object, 'body')
+  if not body then N.error(req, 422); return end
+  local parameters: [3]cstring = {N.decimal(req, viewer), slug, body}
+  local result = N.query(db, 53, [[
+    WITH target AS (SELECT id FROM public.articles WHERE slug=$2),
+    comment AS (INSERT INTO public.comments (article_id,author_id,body)
+      SELECT id,$1::bigint,$3 FROM target
+      RETURNING id,body,created_at,updated_at,author_id)
+    SELECT c.id,c.body,c.created_at,c.updated_at,u.username,u.bio,u.image,false
+    FROM comment c JOIN public.users u ON u.id=c.author_id
+  ]], 3, &parameters[0])
+  if not N.check(req, result) then return end
+  if N.rows(result) == 0 then N.free(result); N.error(req, 404); return end
+  local buffer = N.begin(req, 201)
+  N.write(buffer, '{"comment":')
+  S.comment(buffer, result, 0)
+  N.write(buffer, '}')
+  N.free(result)
+end
+
+function M.delete_comment(req: *N.Request, db: *N.Db, viewer: int64, slug: cstring, id_string: cstring)
+  local id = N.parse_uint(id_string)
+  if id < 0 then N.error(req, 404); return end
+  local parameters: [3]cstring = {N.decimal(req, viewer), slug, N.decimal(req, id)}
+  local result = N.query(db, 54, [[
+    WITH target AS MATERIALIZED (
+      SELECT c.id,c.author_id FROM public.comments c
+      JOIN public.articles a ON a.id=c.article_id
+      WHERE a.slug=$2 AND c.id=$3::bigint),
+    changed AS (DELETE FROM public.comments c USING target t
+      WHERE c.id=t.id AND t.author_id=$1::bigint)
+    SELECT author_id FROM target
+  ]], 3, &parameters[0])
+  if not N.check(req, result) then return end
+  if N.rows(result) == 0 then N.free(result); N.error(req, 404); return end
+  if N.integer(result, 0, 0) ~= viewer then N.free(result); N.error(req, 403); return end
+  N.free(result)
+  N.begin(req, 204)
+end
+
+return M

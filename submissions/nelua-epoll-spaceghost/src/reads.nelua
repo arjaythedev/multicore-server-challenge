@@ -1,0 +1,306 @@
+-- The query result owns all data until emission finishes; no rows outlive a request.
+## pragmas.nogc = true
+## pragmas.nochecks = true
+## pragmas.noentrypoint = true
+
+local N = require 'bindings'
+local S = require 'serialize'
+local R: type = @record{}
+
+-- Fixed IDs are reserved per prepared connection. Only plans are cached.
+
+local q_tags: cstring <comptime> = [[
+SELECT name FROM public.tags ORDER BY name
+]]
+
+local q_profile: cstring <comptime> = [[
+SELECT u.username, u.bio, u.image,
+       EXISTS(SELECT 1 FROM public.follows fo WHERE fo.follower_id=$1::bigint AND fo.followee_id=u.id)
+  FROM public.users u WHERE u.username=$2::text
+]]
+
+local q_article: cstring <comptime> = [[
+SELECT a.slug, a.title, a.description, a.body,
+       a.created_at, a.updated_at,
+       ARRAY(SELECT (SELECT t.name FROM public.tags t WHERE t.id=at.tag_id)
+               FROM public.article_tags at WHERE at.article_id=a.id ORDER BY 1) AS tag_list,
+       (SELECT count(*) FROM public.favorites f WHERE f.article_id=a.id) AS favorites_count,
+       EXISTS(SELECT 1 FROM public.favorites f WHERE f.article_id=a.id AND f.user_id=$1::bigint) AS favorited,
+       u.username, u.bio, u.image,
+       EXISTS(SELECT 1 FROM public.follows fo WHERE fo.follower_id=$1::bigint AND fo.followee_id=a.author_id) AS following
+  FROM public.articles a JOIN public.users u ON u.id=a.author_id WHERE a.slug=$2::text
+]]
+
+local q_article_id: cstring <comptime> = [[
+SELECT a.slug, a.title, a.description, a.body,
+       a.created_at, a.updated_at,
+       ARRAY(SELECT (SELECT t.name FROM public.tags t WHERE t.id=at.tag_id)
+               FROM public.article_tags at WHERE at.article_id=a.id ORDER BY 1) AS tag_list,
+       (SELECT count(*) FROM public.favorites f WHERE f.article_id=a.id) AS favorites_count,
+       EXISTS(SELECT 1 FROM public.favorites f WHERE f.article_id=a.id AND f.user_id=$1::bigint) AS favorited,
+       u.username, u.bio, u.image,
+       EXISTS(SELECT 1 FROM public.follows fo WHERE fo.follower_id=$1::bigint AND fo.followee_id=a.author_id) AS following
+  FROM public.articles a JOIN public.users u ON u.id=a.author_id WHERE a.id=$2::bigint
+]]
+
+local q_comments: cstring <comptime> = [[
+SELECT c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image,
+       EXISTS(SELECT 1 FROM public.follows fo WHERE fo.follower_id=$1::bigint AND fo.followee_id=c.author_id)
+  FROM public.articles a
+  LEFT JOIN LATERAL (
+       SELECT id, body, created_at, updated_at, author_id FROM public.comments
+        WHERE article_id=a.id ORDER BY created_at DESC,id DESC LIMIT 100
+  ) c ON true
+  LEFT JOIN public.users u ON u.id=c.author_id
+ WHERE a.slug=$2::text
+ ORDER BY c.created_at DESC,c.id DESC
+]]
+
+local q_list_all: cstring <comptime> = [[
+WITH page AS MATERIALIZED (
+    SELECT id FROM (SELECT a.id FROM public.articles a ORDER BY a.id DESC LIMIT 100 OFFSET $3::bigint) bounded LIMIT $2::bigint
+), capped AS MATERIALIZED (
+    SELECT count(*) AS n FROM (SELECT 1 FROM public.articles LIMIT 1000) counted
+)
+SELECT a.slug, a.title, a.description,
+       a.created_at, a.updated_at,
+       ARRAY(SELECT (SELECT t.name FROM public.tags t WHERE t.id=at.tag_id)
+               FROM public.article_tags at WHERE at.article_id=a.id ORDER BY 1) AS tag_list,
+       (SELECT count(*) FROM public.favorites f WHERE f.article_id=a.id) AS favorites_count,
+       EXISTS(SELECT 1 FROM public.favorites f WHERE f.article_id=a.id AND f.user_id=$1::bigint) AS favorited,
+       u.username, u.bio, u.image,
+       EXISTS(SELECT 1 FROM public.follows fo WHERE fo.follower_id=$1::bigint AND fo.followee_id=a.author_id) AS following, capped.n
+  FROM capped LEFT JOIN page p ON true
+  LEFT JOIN public.articles a ON a.id=p.id
+  LEFT JOIN public.users u ON u.id=a.author_id
+ ORDER BY a.id DESC
+]]
+
+local q_list_tag: cstring <comptime> = [[
+WITH page AS MATERIALIZED (
+    SELECT id FROM (SELECT at.article_id AS id FROM public.article_tags at
+       WHERE at.tag_id=(SELECT t.id FROM public.tags t WHERE t.name=$4::text)
+       ORDER BY at.article_id DESC LIMIT 100 OFFSET $3::bigint) bounded LIMIT $2::bigint
+), capped AS MATERIALIZED (
+    SELECT count(*) AS n FROM (SELECT 1 FROM public.article_tags at
+       WHERE at.tag_id=(SELECT t.id FROM public.tags t WHERE t.name=$4::text) LIMIT 1000) counted
+)
+SELECT a.slug, a.title, a.description,
+       a.created_at, a.updated_at,
+       ARRAY(SELECT (SELECT t.name FROM public.tags t WHERE t.id=at.tag_id)
+               FROM public.article_tags at WHERE at.article_id=a.id ORDER BY 1) AS tag_list,
+       (SELECT count(*) FROM public.favorites f WHERE f.article_id=a.id) AS favorites_count,
+       EXISTS(SELECT 1 FROM public.favorites f WHERE f.article_id=a.id AND f.user_id=$1::bigint) AS favorited,
+       u.username, u.bio, u.image,
+       EXISTS(SELECT 1 FROM public.follows fo WHERE fo.follower_id=$1::bigint AND fo.followee_id=a.author_id) AS following, capped.n
+  FROM capped LEFT JOIN page p ON true
+  LEFT JOIN public.articles a ON a.id=p.id
+  LEFT JOIN public.users u ON u.id=a.author_id
+ ORDER BY a.id DESC
+]]
+
+local q_list_author: cstring <comptime> = [[
+WITH page AS MATERIALIZED (
+    SELECT id FROM (SELECT a.id FROM public.articles a
+       WHERE a.author_id=(SELECT u.id FROM public.users u WHERE u.username=$4::text)
+       ORDER BY a.id DESC LIMIT 100 OFFSET $3::bigint) bounded LIMIT $2::bigint
+), capped AS MATERIALIZED (
+    SELECT count(*) AS n FROM (SELECT 1 FROM public.articles a
+       WHERE a.author_id=(SELECT u.id FROM public.users u WHERE u.username=$4::text) LIMIT 1000) counted
+)
+SELECT a.slug, a.title, a.description,
+       a.created_at, a.updated_at,
+       ARRAY(SELECT (SELECT t.name FROM public.tags t WHERE t.id=at.tag_id)
+               FROM public.article_tags at WHERE at.article_id=a.id ORDER BY 1) AS tag_list,
+       (SELECT count(*) FROM public.favorites f WHERE f.article_id=a.id) AS favorites_count,
+       EXISTS(SELECT 1 FROM public.favorites f WHERE f.article_id=a.id AND f.user_id=$1::bigint) AS favorited,
+       u.username, u.bio, u.image,
+       EXISTS(SELECT 1 FROM public.follows fo WHERE fo.follower_id=$1::bigint AND fo.followee_id=a.author_id) AS following, capped.n
+  FROM capped LEFT JOIN page p ON true
+  LEFT JOIN public.articles a ON a.id=p.id
+  LEFT JOIN public.users u ON u.id=a.author_id
+ ORDER BY a.id DESC
+]]
+
+local q_list_favorite: cstring <comptime> = [[
+WITH page AS MATERIALIZED (
+    SELECT id FROM (SELECT f.article_id AS id FROM public.favorites f
+       WHERE f.user_id=(SELECT u.id FROM public.users u WHERE u.username=$4::text)
+       ORDER BY f.article_id DESC LIMIT 100 OFFSET $3::bigint) bounded LIMIT $2::bigint
+), capped AS MATERIALIZED (
+    SELECT count(*) AS n FROM (SELECT 1 FROM public.favorites f
+       WHERE f.user_id=(SELECT u.id FROM public.users u WHERE u.username=$4::text) LIMIT 1000) counted
+)
+SELECT a.slug, a.title, a.description,
+       a.created_at, a.updated_at,
+       ARRAY(SELECT (SELECT t.name FROM public.tags t WHERE t.id=at.tag_id)
+               FROM public.article_tags at WHERE at.article_id=a.id ORDER BY 1) AS tag_list,
+       (SELECT count(*) FROM public.favorites f WHERE f.article_id=a.id) AS favorites_count,
+       EXISTS(SELECT 1 FROM public.favorites f WHERE f.article_id=a.id AND f.user_id=$1::bigint) AS favorited,
+       u.username, u.bio, u.image,
+       EXISTS(SELECT 1 FROM public.follows fo WHERE fo.follower_id=$1::bigint AND fo.followee_id=a.author_id) AS following, capped.n
+  FROM capped LEFT JOIN page p ON true
+  LEFT JOIN public.articles a ON a.id=p.id
+  LEFT JOIN public.users u ON u.id=a.author_id
+ ORDER BY a.id DESC
+]]
+
+local q_list_feed: cstring <comptime> = [[
+WITH page AS MATERIALIZED (
+    SELECT id FROM (SELECT x.id FROM public.follows fo CROSS JOIN LATERAL (
+           SELECT a2.id FROM public.articles a2 WHERE a2.author_id=fo.followee_id
+            ORDER BY a2.id DESC
+            LIMIT LEAST($2::numeric+$3::numeric,9223372036854775807)::bigint
+       ) x WHERE fo.follower_id=$1::bigint
+       ORDER BY x.id DESC LIMIT 100 OFFSET $3::bigint) bounded LIMIT $2::bigint
+), capped AS MATERIALIZED (
+    SELECT count(*) AS n FROM (SELECT 1 FROM public.articles a
+       WHERE a.author_id IN (SELECT fo.followee_id FROM public.follows fo WHERE fo.follower_id=$1::bigint) LIMIT 1000) counted
+)
+SELECT a.slug, a.title, a.description,
+       a.created_at, a.updated_at,
+       ARRAY(SELECT (SELECT t.name FROM public.tags t WHERE t.id=at.tag_id)
+               FROM public.article_tags at WHERE at.article_id=a.id ORDER BY 1) AS tag_list,
+       (SELECT count(*) FROM public.favorites f WHERE f.article_id=a.id) AS favorites_count,
+       EXISTS(SELECT 1 FROM public.favorites f WHERE f.article_id=a.id AND f.user_id=$1::bigint) AS favorited,
+       u.username, u.bio, u.image,
+       EXISTS(SELECT 1 FROM public.follows fo WHERE fo.follower_id=$1::bigint AND fo.followee_id=a.author_id) AS following, capped.n
+  FROM capped LEFT JOIN page p ON true
+  LEFT JOIN public.articles a ON a.id=p.id
+  LEFT JOIN public.users u ON u.id=a.author_id
+ ORDER BY a.id DESC
+]]
+
+function R.tags(req: *N.Request, db: *N.Db)
+  local result = N.query(db, 0, q_tags, 0, nilptr)
+  if not N.check(req, result) then return end
+  local buffer = N.begin(req, 200)
+  N.write(buffer, '{"tags":[')
+  for row: cint = 0, <N.rows(result) do
+    if row > 0 then N.putc(buffer, cchar(44)) end
+    S.text(buffer, result, row, 0)
+  end
+  N.write(buffer, ']}')
+  N.free(result)
+end
+
+function R.profile(req: *N.Request, db: *N.Db, viewer: int64, username: cstring)
+  local params: [2]cstring = {N.decimal(req, viewer), username}
+  local result = N.query(db, 1, q_profile, 2, &params[0])
+  if not N.check(req, result) then return end
+  if N.rows(result) == 0 then
+    N.free(result)
+    N.error(req, 404)
+    return
+  end
+  local buffer = N.begin(req, 200)
+  N.write(buffer, '{"profile":')
+  S.profile(buffer, result, 0, 0)
+  N.putc(buffer, cchar(125))
+  N.free(result)
+end
+
+function R.article(req: *N.Request, db: *N.Db, viewer: int64, key: cstring, byid: boolean, status: cint)
+  local params: [2]cstring = {N.decimal(req, viewer), key}
+  local sql: cstring = q_article
+  local id: cint = 2
+  if byid then sql = q_article_id; id = 3 end
+  local result = N.query(db, id, sql, 2, &params[0])
+  if not N.check(req, result) then return end
+  if N.rows(result) == 0 then
+    N.free(result)
+    N.error(req, 404)
+    return
+  end
+  local buffer = N.begin(req, status)
+  N.write(buffer, '{"article":')
+  S.article(buffer, result, 0, true)
+  N.putc(buffer, cchar(125))
+  N.free(result)
+end
+
+function R.list(req: *N.Request, db: *N.Db, viewer: int64, feed: boolean)
+  local page_limit: int64 = 20
+  local page_offset: int64 = 0
+  local raw_limit = N.query_arg(req, 'limit')
+  local raw_offset = N.query_arg(req, 'offset')
+  if raw_limit ~= nilptr then page_limit = N.parse_uint(raw_limit) end
+  if raw_offset ~= nilptr then page_offset = N.parse_uint(raw_offset) end
+  if page_limit < 1 or page_limit > 100 or page_offset < 0 then
+    N.error(req, 422)
+    return
+  end
+  local sql: cstring = q_list_all
+  local id: cint = 4
+  local nparams: cint = 3
+  local filter: cstring = nilptr
+  if feed then
+    sql = q_list_feed
+    id = 8
+  else
+    local tag = N.query_arg(req, 'tag')
+    local author = N.query_arg(req, 'author')
+    local favorite = N.query_arg(req, 'favorited')
+    if tag ~= nilptr and N.length(tag) > 0 then
+      sql = q_list_tag
+      id = 5
+      filter = tag
+    elseif author ~= nilptr and N.length(author) > 0 then
+      sql = q_list_author
+      id = 6
+      filter = author
+    elseif favorite ~= nilptr and N.length(favorite) > 0 then
+      sql = q_list_favorite
+      id = 7
+      filter = favorite
+    end
+    if filter ~= nilptr then nparams = 4 end
+  end
+  local params: [4]cstring = {N.decimal(req, viewer), N.decimal(req, page_limit), N.decimal(req, page_offset), filter}
+  local result = N.query(db, id, sql, nparams, &params[0])
+  if not N.check(req, result) then return end
+  if N.rows(result) == 0 then
+    N.free(result)
+    N.error(req, 500)
+    return
+  end
+  local buffer = N.begin(req, 200)
+  N.write(buffer, '{"articles":[')
+  local first: boolean = true
+  for row: cint = 0, <N.rows(result) do
+    if not N.null(result, row, 0) then
+      if not first then N.putc(buffer, cchar(44)) end
+      first = false
+      S.article(buffer, result, row, false)
+    end
+  end
+  N.write(buffer, '],"articlesCount":')
+  S.integer(buffer, N.integer(result, 0, 12))
+  N.putc(buffer, cchar(125))
+  N.free(result)
+end
+
+function R.comments(req: *N.Request, db: *N.Db, viewer: int64, slug: cstring)
+  local params: [2]cstring = {N.decimal(req, viewer), slug}
+  local result = N.query(db, 9, q_comments, 2, &params[0])
+  if not N.check(req, result) then return end
+  if N.rows(result) == 0 then
+    N.free(result)
+    N.error(req, 404)
+    return
+  end
+  local buffer = N.begin(req, 200)
+  N.write(buffer, '{"comments":[')
+  local first: boolean = true
+  for row: cint = 0, <N.rows(result) do
+    if not N.null(result, row, 0) then
+      if not first then N.putc(buffer, cchar(44)) end
+      first = false
+      S.comment(buffer, result, row)
+    end
+  end
+  N.write(buffer, ']}')
+  N.free(result)
+end
+
+return R

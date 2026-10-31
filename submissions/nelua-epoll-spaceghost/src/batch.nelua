@@ -1,0 +1,468 @@
+-- Batch only requests already waiting in the transport's bounded read window.
+-- Rows, target deduplication, and rendered responses never outlive this batch.
+local N = require 'bindings'
+local S = require 'serialize'
+local B: type = @record{}
+
+local function handle_one(req:*N.Request, db:*N.Db) <cimport'conduit_handle',nodecl> end
+
+local function fail_group(requests:*[0]*N.Request, count:cint)
+  local i:cint = 0
+  while i < count do
+    N.error(requests[i], 500)
+    i = i + 1
+  end
+end
+
+local function tags(requests:*[0]*N.Request, count:cint, db:*N.Db)
+  local result = N.query(db, 90, [[SELECT name FROM public.tags ORDER BY name]], 0, nilptr)
+  if N.pipeline_staging(db) then return end
+  if not N.ok(result) then
+    fail_group(requests, count)
+    if result then N.free(result) end
+    return
+  end
+  -- Every tag request in this pending batch sees this exact result. Render it
+  -- once, then copy bytes into independently owned response buffers.
+  local buffer = N.begin(requests[0], 200)
+  N.write(buffer, '{"tags":[')
+  local row:cint = 0
+  while row < N.rows(result) do
+    if row > 0 then N.putc(buffer, cchar(44)) end
+    S.text(buffer, result, row, 0)
+    row = row + 1
+  end
+  N.write(buffer, ']}')
+  local length:csize = 0
+  local data = N.response_data(requests[0], &length)
+  local status = N.status(requests[0])
+  local i:cint = 1
+  while i < count do
+    N.write_n(N.begin(requests[i], status), data, length)
+    i = i + 1
+  end
+  N.free(result)
+end
+
+local function lookup(requests:*[0]*N.Request, keys:*cstring, viewers:*int64,
+                      count:cint, db:*N.Db, kind:cint)
+  local parameters:[2]cstring = {
+    N.text_vector(requests[0], keys, count),
+    N.int_vector(requests[0], viewers, count)
+  }
+  if not parameters[0] or not parameters[1] then
+    fail_group(requests, count)
+    return
+  end
+  local result:*N.Result = nilptr
+  local ordinal_column:cint = 4
+  if kind == 2 then
+    -- The public profile is fetched once per distinct username. Following is
+    -- still probed separately for each request's independently verified viewer.
+    result = N.query(db, 91, [[
+      WITH incoming AS MATERIALIZED (
+        SELECT key,viewer,ordinal
+          FROM unnest($1::text[],$2::bigint[]) WITH ORDINALITY AS r(key,viewer,ordinal)
+      ), keys AS MATERIALIZED (SELECT DISTINCT key FROM incoming),
+      profiles AS MATERIALIZED (
+        SELECT u.id,u.username,u.bio,u.image
+          FROM keys k JOIN public.users u ON u.username=k.key
+      )
+      SELECT p.username,p.bio,p.image,
+             (r.viewer<>0 AND EXISTS(SELECT 1 FROM public.follows f
+               WHERE f.follower_id=r.viewer AND f.followee_id=p.id)) AS following,
+             r.ordinal::bigint
+        FROM incoming r LEFT JOIN profiles p ON p.username=r.key
+       ORDER BY r.ordinal
+    ]], 2, &parameters[0])
+  else
+    ordinal_column = 13
+    -- Expensive article enrichment is independent of the viewer. Materialize
+    -- it once per distinct slug, then join each incoming viewer's two flags.
+    result = N.query(db, 92, [[
+      WITH incoming AS MATERIALIZED (
+        SELECT key,viewer,ordinal
+          FROM unnest($1::text[],$2::bigint[]) WITH ORDINALITY AS r(key,viewer,ordinal)
+      ), keys AS MATERIALIZED (SELECT DISTINCT key FROM incoming),
+      articles AS MATERIALIZED (
+        SELECT a.id,a.author_id,a.slug,a.title,a.description,a.body,
+               a.created_at,a.updated_at,
+               ARRAY(SELECT (SELECT t.name FROM public.tags t WHERE t.id=x.tag_id)
+                 FROM public.article_tags x WHERE x.article_id=a.id ORDER BY 1) AS tag_list,
+               (SELECT count(*) FROM public.favorites f
+                 WHERE f.article_id=a.id) AS favorites_count,
+               u.username,u.bio,u.image
+          FROM keys k JOIN public.articles a ON a.slug=k.key
+          JOIN public.users u ON u.id=a.author_id
+      )
+      SELECT a.slug,a.title,a.description,a.body,a.created_at,a.updated_at,
+             a.tag_list,a.favorites_count,
+             (r.viewer<>0 AND EXISTS(SELECT 1 FROM public.favorites f
+               WHERE f.article_id=a.id AND f.user_id=r.viewer)) AS favorited,
+             a.username,a.bio,a.image,
+             (r.viewer<>0 AND EXISTS(SELECT 1 FROM public.follows f
+               WHERE f.follower_id=r.viewer AND f.followee_id=a.author_id)) AS following,
+             r.ordinal::bigint
+        FROM incoming r LEFT JOIN articles a ON a.slug=r.key
+       ORDER BY r.ordinal
+    ]], 2, &parameters[0])
+  end
+  if N.pipeline_staging(db) then return end
+  if not N.ok(result) then
+    fail_group(requests, count)
+    if result then N.free(result) end
+    return
+  end
+  local row:cint = 0
+  -- Both queries preserve one result row for each incoming request, including
+  -- missing resources. Ordinality, not a username/slug map, assigns the row.
+  while row < count do
+    if row >= N.rows(result) or N.integer(result, row, ordinal_column) ~= int64(row + 1) then
+      N.error(requests[row], 500)
+    elseif N.null(result, row, 0) then
+      N.error(requests[row], 404)
+    else
+      local buffer = N.begin(requests[row], 200)
+      if kind == 2 then
+        N.write(buffer, '{"profile":')
+        S.profile(buffer, result, row, 0)
+      else
+        N.write(buffer, '{"article":')
+        S.article(buffer, result, row, true)
+      end
+      N.putc(buffer, cchar(125))
+    end
+    row = row + 1
+  end
+  N.free(result)
+end
+
+local function comments(requests:*[0]*N.Request, keys:*cstring, viewers:*int64,
+                        count:cint, db:*N.Db)
+  local parameters:[2]cstring = {
+    N.text_vector(requests[0], keys, count),
+    N.int_vector(requests[0], viewers, count)
+  }
+  if not parameters[0] or not parameters[1] then
+    fail_group(requests, count)
+    return
+  end
+  local result = N.query(db, 93, [[
+    WITH incoming AS MATERIALIZED (
+      SELECT key,viewer,ordinal
+        FROM unnest($1::text[],$2::bigint[]) WITH ORDINALITY AS r(key,viewer,ordinal)
+    ), keys AS MATERIALIZED (SELECT DISTINCT key FROM incoming),
+    targets AS MATERIALIZED (
+      SELECT k.key,a.id FROM keys k LEFT JOIN public.articles a ON a.slug=k.key
+    ), comments AS MATERIALIZED (
+      SELECT t.key,c.id,c.body,c.created_at,c.updated_at,c.author_id,
+             u.username,u.bio,u.image
+        FROM targets t CROSS JOIN LATERAL (
+          SELECT c.id,c.body,c.created_at,c.updated_at,c.author_id
+            FROM public.comments c WHERE c.article_id=t.id
+           ORDER BY c.created_at DESC,c.id DESC LIMIT 100
+        ) c JOIN public.users u ON u.id=c.author_id
+    )
+    SELECT c.id,c.body,c.created_at,c.updated_at,c.username,c.bio,c.image,
+           (r.viewer<>0 AND EXISTS(SELECT 1 FROM public.follows f
+             WHERE f.follower_id=r.viewer AND f.followee_id=c.author_id)) AS following,
+           r.ordinal::bigint,t.id AS article_id
+      FROM incoming r JOIN targets t ON t.key=r.key
+      LEFT JOIN comments c ON c.key=r.key
+     ORDER BY r.ordinal,c.created_at DESC,c.id DESC
+  ]], 2, &parameters[0])
+  if N.pipeline_staging(db) then return end
+  if not N.ok(result) then
+    fail_group(requests, count)
+    if result then N.free(result) end
+    return
+  end
+  local row:cint = 0
+  local request:cint = 0
+  while request < count do
+    if row >= N.rows(result) or N.integer(result, row, 8) ~= int64(request + 1) then
+      N.error(requests[request], 500)
+    elseif N.null(result, row, 9) then
+      -- A marker row keeps an unknown article distinct from an empty thread.
+      N.error(requests[request], 404)
+      row = row + 1
+    else
+      local buffer = N.begin(requests[request], 200)
+      N.write(buffer, '{"comments":[')
+      local first:boolean = true
+      while row < N.rows(result) and N.integer(result, row, 8) == int64(request + 1) do
+        if not N.null(result, row, 0) then
+          if not first then N.putc(buffer, cchar(44)) end
+          first = false
+          S.comment(buffer, result, row)
+        end
+        row = row + 1
+      end
+      N.write(buffer, ']}')
+    end
+    request = request + 1
+  end
+  N.free(result)
+end
+
+-- The compiler assembles five fixed statements; no SQL/string builder survives
+-- into the executable. Generic plans see constant inner LIMIT 100 boundaries.
+##[=[
+local function batch_list_sql(kind)
+  local owner = kind == 9 and 'viewer' or '0::bigint'
+  local owner_join = kind == 9 and 'r.viewer' or '0::bigint'
+  -- The feed join already proves this relationship for the request's viewer.
+  -- Keep false on the empty-page marker row as well.
+  local following = kind == 9 and '(a.id IS NOT NULL)' or [[
+    (r.viewer<>0 AND EXISTS(SELECT 1 FROM public.follows f
+      WHERE f.follower_id=r.viewer AND f.followee_id=a.author_id))]]
+  local target, page, counted
+  if kind == 5 then
+    target = '0::bigint'
+    page = 'SELECT a.id FROM public.articles a ORDER BY a.id DESC LIMIT 100 OFFSET k.off'
+    counted = 'SELECT 1 FROM public.articles LIMIT 1000'
+  elseif kind == 6 then
+    target = '(SELECT t.id FROM public.tags t WHERE t.name=k.key)'
+    page = 'SELECT x.article_id AS id FROM public.article_tags x WHERE x.tag_id=f.id ORDER BY x.article_id DESC LIMIT 100 OFFSET k.off'
+    counted = 'SELECT 1 FROM public.article_tags x WHERE x.tag_id=f.id LIMIT 1000'
+  elseif kind == 7 then
+    target = '(SELECT u.id FROM public.users u WHERE u.username=k.key)'
+    page = 'SELECT a.id FROM public.articles a WHERE a.author_id=f.id ORDER BY a.id DESC LIMIT 100 OFFSET k.off'
+    counted = 'SELECT 1 FROM public.articles a WHERE a.author_id=f.id LIMIT 1000'
+  elseif kind == 8 then
+    target = '(SELECT u.id FROM public.users u WHERE u.username=k.key)'
+    page = 'SELECT x.article_id AS id FROM public.favorites x WHERE x.user_id=f.id ORDER BY x.article_id DESC LIMIT 100 OFFSET k.off'
+    counted = 'SELECT 1 FROM public.favorites x WHERE x.user_id=f.id LIMIT 1000'
+  else
+    target = 'k.owner'
+    page = [[SELECT x.id FROM public.follows fo CROSS JOIN LATERAL (
+      SELECT a2.id FROM public.articles a2 WHERE a2.author_id=fo.followee_id
+       ORDER BY a2.id DESC
+       LIMIT LEAST(k.lim::numeric+k.off::numeric,9223372036854775807)::bigint
+    ) x WHERE fo.follower_id=k.owner ORDER BY x.id DESC LIMIT 100 OFFSET k.off]]
+    counted = [[SELECT 1 FROM public.articles a WHERE a.author_id IN
+      (SELECT fo.followee_id FROM public.follows fo WHERE fo.follower_id=f.owner) LIMIT 1000]]
+  end
+  return [[
+    WITH incoming AS MATERIALIZED (
+      SELECT key,viewer,lim,off,ordinal
+        FROM unnest($1::text[],$2::bigint[],$3::bigint[],$4::bigint[])
+             WITH ORDINALITY AS r(key,viewer,lim,off,ordinal)
+    ), page_keys AS MATERIALIZED (
+      SELECT DISTINCT key,lim,off,]] .. owner .. [[ AS owner FROM incoming
+    ), count_keys AS MATERIALIZED (
+      SELECT DISTINCT key,owner FROM page_keys
+    ), filter_ids AS MATERIALIZED (
+      SELECT k.key,k.owner,]] .. target .. [[ AS id FROM count_keys k
+    ), counts AS MATERIALIZED (
+      SELECT f.key,f.owner,(SELECT count(*) FROM (]] .. counted .. [[) capped) AS n
+        FROM filter_ids f
+    ), pages AS MATERIALIZED (
+      SELECT k.key,k.owner,k.lim,k.off,p.id
+        FROM page_keys k JOIN filter_ids f ON f.key=k.key AND f.owner=k.owner
+        CROSS JOIN LATERAL (SELECT id FROM (]] .. page .. [[) bounded LIMIT k.lim) p
+    ), page_ids AS MATERIALIZED (SELECT DISTINCT id FROM pages),
+    articles AS MATERIALIZED (
+      SELECT a.id,a.author_id,a.slug,a.title,a.description,a.created_at,a.updated_at,
+             ARRAY(SELECT (SELECT t.name FROM public.tags t WHERE t.id=x.tag_id)
+                     FROM public.article_tags x WHERE x.article_id=a.id ORDER BY 1) AS tag_list,
+             (SELECT count(*) FROM public.favorites f WHERE f.article_id=a.id) AS favorites_count,
+             u.username,u.bio,u.image
+        FROM page_ids p JOIN public.articles a ON a.id=p.id
+        JOIN public.users u ON u.id=a.author_id
+    )
+    SELECT a.slug,a.title,a.description,a.created_at,a.updated_at,
+           a.tag_list,a.favorites_count,
+           (r.viewer<>0 AND EXISTS(SELECT 1 FROM public.favorites f
+             WHERE f.user_id=r.viewer AND f.article_id=a.id)) AS favorited,
+           a.username,a.bio,a.image,
+           ]] .. following .. [[ AS following,
+           c.n,r.ordinal::bigint
+      FROM incoming r JOIN counts c ON c.key=r.key AND c.owner=]] .. owner_join .. [[
+      LEFT JOIN pages p ON p.key=r.key AND p.owner=]] .. owner_join .. [[
+        AND p.lim=r.lim AND p.off=r.off
+      LEFT JOIN articles a ON a.id=p.id
+     ORDER BY r.ordinal,a.id DESC
+  ]]
+end
+]=]
+
+local q_batch_global:cstring <comptime> = #[batch_list_sql(5)]#
+local q_batch_tag:cstring <comptime> = #[batch_list_sql(6)]#
+local q_batch_author:cstring <comptime> = #[batch_list_sql(7)]#
+local q_batch_favorite:cstring <comptime> = #[batch_list_sql(8)]#
+local q_batch_feed:cstring <comptime> = #[batch_list_sql(9)]#
+
+local function pages(requests:*[0]*N.Request, keys:*cstring, viewers:*int64,
+                     limits:*int64, offsets:*int64, count:cint, db:*N.Db, kind:cint)
+  local parameters:[4]cstring = {
+    N.text_vector(requests[0], keys, count), N.int_vector(requests[0], viewers, count),
+    N.int_vector(requests[0], limits, count), N.int_vector(requests[0], offsets, count)
+  }
+  if not parameters[0] or not parameters[1] or not parameters[2] or not parameters[3] then
+    fail_group(requests, count)
+    return
+  end
+  local sql:cstring = q_batch_global
+  if kind == 6 then sql = q_batch_tag
+  elseif kind == 7 then sql = q_batch_author
+  elseif kind == 8 then sql = q_batch_favorite
+  elseif kind == 9 then sql = q_batch_feed end
+  local result = N.query(db, 89 + kind, sql, 4, &parameters[0])
+  if N.pipeline_staging(db) then return end
+  if not N.ok(result) then
+    fail_group(requests, count)
+    if result then N.free(result) end
+    return
+  end
+  local row:cint = 0
+  local request:cint = 0
+  while request < count do
+    if row >= N.rows(result) or N.integer(result, row, 13) ~= int64(request + 1) then
+      N.error(requests[request], 500)
+    else
+      local total = N.integer(result, row, 12)
+      local buffer = N.begin(requests[request], 200)
+      N.write(buffer, '{"articles":[')
+      local first:boolean = true
+      while row < N.rows(result) and N.integer(result, row, 13) == int64(request + 1) do
+        if not N.null(result, row, 0) then
+          if not first then N.putc(buffer, cchar(44)) end
+          first = false
+          S.article(buffer, result, row, false)
+        end
+        row = row + 1
+      end
+      N.write(buffer, '],"articlesCount":')
+      S.integer(buffer, total)
+      N.putc(buffer, cchar(125))
+    end
+    request = request + 1
+  end
+  N.free(result)
+end
+
+local function conduit_batch(requests:*[0]*N.Request, count:cint, db:*N.Db) <cexport,codename'conduit_batch'>
+  if count < 1 then return end
+  if count > 128 then
+    local i:cint = 0
+    while i < count do handle_one(requests[i], db); i = i + 1 end
+    return
+  end
+  local kinds:[128]cint <noinit>
+  local verified:[128]int64 <noinit>
+  local validated_limits:[128]int64 <noinit>
+  local validated_offsets:[128]int64 <noinit>
+  local filter_keys:[128]cstring <noinit>
+  local grouped:[128]*N.Request <noinit>
+  local keys:[128]cstring <noinit>
+  local viewers:[128]int64 <noinit>
+  local limits:[128]int64 <noinit>
+  local offsets:[128]int64 <noinit>
+  local has_group:boolean = false
+  local i:cint = 0
+  while i < count do
+    local req = requests[i]
+    local kind:cint = 0
+    local segments = N.segments(req)
+    filter_keys[i] = ''
+    validated_limits[i] = 20
+    validated_offsets[i] = 0
+    if N.eq(N.method(req), 'GET') and N.eq(N.segment(req, 0), 'api') then
+      if segments == 2 and N.eq(N.segment(req, 1), 'tags') then
+        kind = 1
+      elseif segments == 3 and N.eq(N.segment(req, 1), 'profiles') then
+        kind = 2
+      elseif N.eq(N.segment(req, 1), 'articles') then
+        if segments == 2 then
+          kind = 5
+          local tag = N.query_arg(req, 'tag')
+          local author = N.query_arg(req, 'author')
+          local favorite = N.query_arg(req, 'favorited')
+          if tag ~= nilptr and N.length(tag) > 0 then kind = 6; filter_keys[i] = tag
+          elseif author ~= nilptr and N.length(author) > 0 then kind = 7; filter_keys[i] = author
+          elseif favorite ~= nilptr and N.length(favorite) > 0 then kind = 8; filter_keys[i] = favorite end
+        elseif segments == 3 then
+          if N.eq(N.segment(req, 2), 'feed') then kind = 9 else kind = 3 end
+        elseif segments == 4 and N.eq(N.segment(req, 3), 'comments') then kind = 4 end
+      end
+    end
+    verified[i] = 0
+    if kind > 1 then
+      verified[i] = N.auth(req)
+      if verified[i] < 0 or (kind == 9 and verified[i] == 0) then
+        N.error(req, 401); kind = -1
+      end
+    end
+    if kind >= 5 then
+      local raw_limit = N.query_arg(req, 'limit')
+      local raw_offset = N.query_arg(req, 'offset')
+      if raw_limit ~= nilptr then validated_limits[i] = N.parse_uint(raw_limit) end
+      if raw_offset ~= nilptr then validated_offsets[i] = N.parse_uint(raw_offset) end
+      if validated_limits[i] < 1 or validated_limits[i] > 100 or validated_offsets[i] < 0 then
+        N.error(req, 422); kind = -1
+      end
+    end
+    kinds[i] = kind
+    if kind > 0 then has_group = true end
+    i = i + 1
+  end
+  -- The optional first pass queues these exact read families. The second pass
+  -- claims batch-local results and uses the same rendering/ordinal validation.
+  local pipeline:boolean = false
+  if has_group then pipeline = N.pipeline_begin(db) end
+  local passes:cint = 1
+  if pipeline then passes = 2 end
+  local phase:cint = 1
+  while phase <= passes do
+    local kind:cint = 1
+    while kind <= 9 do
+      local used:cint = 0
+      i = 0
+      while i < count do
+        if kinds[i] == kind then
+          grouped[used] = requests[i]
+          viewers[used] = verified[i]
+          limits[used] = validated_limits[i]
+          offsets[used] = validated_offsets[i]
+          if kind >= 5 then keys[used] = filter_keys[i]
+          elseif kind >= 2 then keys[used] = N.segment(requests[i], 2)
+          else keys[used] = nilptr end
+          used = used + 1
+        end
+        i = i + 1
+      end
+      if used > 0 then
+        if kind == 1 then tags((@*[0]*N.Request)(&grouped[0]), used, db)
+        elseif kind == 4 then
+          comments((@*[0]*N.Request)(&grouped[0]), &keys[0], &viewers[0], used, db)
+        elseif kind >= 5 then
+          pages((@*[0]*N.Request)(&grouped[0]), &keys[0], &viewers[0], &limits[0], &offsets[0], used, db, kind)
+        else
+          lookup((@*[0]*N.Request)(&grouped[0]), &keys[0], &viewers[0], used, db, kind)
+        end
+      end
+      kind = kind + 1
+    end
+    if pipeline and phase == 1 then
+      if not N.pipeline_flush(db) then
+        i = 0
+        while i < count do
+          if kinds[i] > 0 then N.error(requests[i], 500) end
+          i = i + 1
+        end
+        break
+      end
+    end
+    phase = phase + 1
+  end
+  if pipeline then N.pipeline_end(db) end
+  -- Other routes retain the complete individual handler and its validation.
+  i = 0
+  while i < count do
+    if kinds[i] == 0 then handle_one(requests[i], db) end
+    i = i + 1
+  end
+end
+
+return B
