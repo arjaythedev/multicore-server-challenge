@@ -1,6 +1,5 @@
 // Conduit (RealWorld) API server in Swift + Hummingbird, for the multicore server challenge (SPEC.md).
 import Foundation
-import HTTPTypes
 import Hummingbird
 import Logging
 import NIOCore
@@ -56,8 +55,10 @@ struct Conduit {
         }
         let poolSize = Int(envOr("DB_POOL_SIZE", "10")) ?? 10
         let bcryptThreads = Int(envOr("BCRYPT_THREADS", "")) ?? max(1, System.coreCount / 2)
-        // Running plus waiting hashes; a cost-10 hash is about 50 ms, so the default is about 2 s of queued work.
+        // Running plus waiting hashes: about 2 s of queued work at the default.
         let bcryptQueue = Int(envOr("BCRYPT_QUEUE", "")) ?? 40 * bcryptThreads
+        let calibration = BcryptWorkers.calibrate()
+        let bcryptLanes = Int(envOr("BCRYPT_LANES", "")) ?? calibration.lanes
         let host = envOr("HOST", "127.0.0.1")
         let port = Int(envOr("PORT", "3000")) ?? 3000
 
@@ -81,7 +82,8 @@ struct Conduit {
             ("plan_cache_mode", "force_generic_plan"),
         ]
         let db = PostgresClient(configuration: dbConfig)
-        let bcrypt = ThreadPoolExecutor(threads: bcryptThreads, limit: bcryptQueue)
+        let bcrypt = BcryptWorkers(threads: bcryptThreads, lanes: bcryptLanes,
+                                   window: .milliseconds(Int(envOr("BCRYPT_WINDOW_MS", "")) ?? 200), limit: bcryptQueue)
         // Read batching: each lane holds one pooled connection, so DB_POOL_SIZE must leave room for writes and logins.
         let reads: ReadBatcher? = envOr("READ_BATCHING", "1") == "0" ? nil : ReadBatcher(db: db, settings: .init(
             lanes: Int(envOr("READ_LANES", "")) ?? System.coreCount,
@@ -89,7 +91,13 @@ struct Conduit {
             minBatch: Int(envOr("READ_BATCH_MIN", "")) ?? 32,
             maxBatch: Int(envOr("READ_BATCH_MAX", "")) ?? 1024
         ))
-        let app = App(db: db, signer: JWTSigner(secret: jwtSecret), bcrypt: bcrypt, reads: reads)
+        let signer = JWTSigner(secret: jwtSecret)
+        // Group commit: each write lane holds one pooled connection. WRITE_GROUPING=0: a transaction per write.
+        let writes = WriteBatcher(db: db, signer: signer, settings: .init(
+            lanes: envOr("WRITE_GROUPING", "1") == "0" ? 0 : Int(envOr("WRITE_LANES", "")) ?? 1,
+            maxGroup: Int(envOr("WRITE_GROUP_MAX", "")) ?? 256
+        ))
+        let app = App(db: db, signer: signer, bcrypt: bcrypt, reads: reads, writes: writes)
 
         let server = Application(
             router: app.router(),
@@ -97,20 +105,21 @@ struct Conduit {
             // Front: direct, so this socket takes every user's connection: a backlog deep enough for a ramp (the
             // kernel caps it at net.core.somaxconn, 65535 on the box) instead of Hummingbird's default 256.
             configuration: .init(address: .hostname(host, port: port), backlog: 65535),
-            logger: App.quietLogger
+            logger: App.queryLogger
         )
 
         // One ServiceGroup owns everything long-lived. It runs them until SIGTERM or SIGINT, then shuts them down in
         // reverse order: the HTTP server first (in-flight requests finish), then the read lanes, the Postgres pool and
         // the bcrypt threads.
         let services = ServiceGroup(configuration: .init(
-            services: [bcrypt, db] + (reads.map { [$0] } ?? []) + [server],
+            services: [bcrypt, db] + (reads.map { [$0] } ?? []) + [writes, server],
             gracefulShutdownSignals: [.sigterm, .sigint],
             logger: logger
         ))
         logger.info("""
             conduit (swift/hummingbird) listening on \(host):\(port), pool \(poolSize), \
-            bcrypt threads \(bcryptThreads) (queue \(bcryptQueue)), \
+            bcrypt threads \(bcryptThreads) (queue \(bcryptQueue), \(bcrypt.lanes) in lockstep; cost 6 per hash at widths 1-6: \
+            \(calibration.perHash.map { "\($0.components.attoseconds / 1_000_000_000_000) µs" }.joined(separator: ", "))), \
             global executor: \(nioExecutor ? "NIO event loops" : "Swift cooperative pool")
             """)
         try await services.run()
@@ -119,40 +128,5 @@ struct Conduit {
     private static func fail(_ message: Logger.Message) -> Never {
         logger.critical(message)
         exit(1)
-    }
-}
-
-extension App {
-    /// The routes. Built in a nonisolated method so no handler closure can pick up the main actor from `main()`.
-    func router() -> Router<BasicRequestContext> {
-        let router = Router(context: BasicRequestContext.self)
-        router.post("api/users") { request, ctx in await handle { try await register(request, ctx) } }
-        router.post("api/users/login") { request, ctx in await handle { try await login(request, ctx) } }
-        router.get("api/user") { request, ctx in await handle { try await currentUser(request, ctx) } }
-        router.put("api/user") { request, ctx in await handle { try await updateUser(request, ctx) } }
-
-        router.get("api/profiles/:username") { request, ctx in await handle { try await getProfile(request, ctx) } }
-        router.post("api/profiles/:username/follow") { request, ctx in await handle { try await follow(request, ctx, follow: true) } }
-        router.delete("api/profiles/:username/follow") { request, ctx in await handle { try await follow(request, ctx, follow: false) } }
-
-        router.get("api/articles") { request, ctx in await handle { try await listArticles(request, ctx) } }
-        router.get("api/articles/feed") { request, ctx in await handle { try await feed(request, ctx) } }
-        router.post("api/articles") { request, ctx in await handle { try await createArticle(request, ctx) } }
-        router.get("api/articles/:slug") { request, ctx in await handle { try await getArticle(request, ctx) } }
-        router.put("api/articles/:slug") { request, ctx in await handle { try await updateArticleHandler(request, ctx) } }
-        router.delete("api/articles/:slug") { request, ctx in await handle { try await deleteArticle(request, ctx) } }
-        router.post("api/articles/:slug/favorite") { request, ctx in await handle { try await favorite(request, ctx, fav: true) } }
-        router.delete("api/articles/:slug/favorite") { request, ctx in await handle { try await favorite(request, ctx, fav: false) } }
-        router.get("api/articles/:slug/comments") { request, ctx in await handle { try await listComments(request, ctx) } }
-        router.post("api/articles/:slug/comments") { request, ctx in await handle { try await createComment(request, ctx) } }
-        router.delete("api/articles/:slug/comments/:id") { request, ctx in await handle { try await deleteComment(request, ctx) } }
-
-        router.get("api/tags") { request, ctx in await handle { try await tags(request, ctx) } }
-
-        // Anything else (unknown path, or a known path with another method) is a JSON 404.
-        for method: HTTPRequest.Method in [.get, .post, .put, .delete, .patch, .head, .options, .trace, .connect] {
-            router.on("**", method: method) { _, _ in errorResponse(.notFound, "not found") }
-        }
-        return router
     }
 }

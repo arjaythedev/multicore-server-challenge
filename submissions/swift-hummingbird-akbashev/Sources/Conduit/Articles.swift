@@ -2,6 +2,7 @@
 import HTTPTypes
 import Hummingbird
 import Logging
+import NIOCore
 import PostgresNIO
 
 let articleListSelect = """
@@ -69,16 +70,17 @@ let insertArticle = """
 INSERT INTO articles (id, slug, author_id, title, description, body)
 SELECT n.id, trim(both '-' from lower(regexp_replace($2, '[^A-Za-z0-9]+', '-', 'g'))) || '-' || n.id, $1, $2, $3, $4
   FROM (SELECT nextval(pg_get_serial_sequence('articles', 'id')) AS id) n
-RETURNING id
+RETURNING id, slug
 """
 let insertTags = "INSERT INTO tags (name) SELECT DISTINCT unnest($1::text[]) ON CONFLICT (name) DO NOTHING"
 let insertArticleTags = "INSERT INTO article_tags (article_id, tag_id) SELECT $1, t.id FROM tags t WHERE t.name = ANY($2::text[])"
 
-let updateArticle = """
+let updateArticleSQL = """
 UPDATE articles SET title = COALESCE($2, title), description = COALESCE($3, description), body = COALESCE($4, body),
        slug = CASE WHEN $2::text IS NULL THEN slug ELSE trim(both '-' from lower(regexp_replace($2, '[^A-Za-z0-9]+', '-', 'g'))) || '-' || id END,
        updated_at = now()
  WHERE id = $1
+RETURNING slug
 """
 
 struct ArticleRow {
@@ -96,10 +98,19 @@ struct ArticleRow {
 
 extension JSONWriter {
     mutating func article(_ a: borrowing ArticleRow, full: Bool) {
+        articleUpToFavorited(a, full: full)
+        bool(a.favorited)
+        articleUpToFollowing(a)
+        bool(a.author.following)
+        raw("}}")
+    }
+
+    /// An article up to its `favorited` value: the part that is the same for every viewer.
+    private mutating func articleUpToFavorited(_ a: borrowing ArticleRow, full: Bool) {
         raw("{\"slug\":"); string(a.slug)
         raw(",\"title\":"); string(a.title)
         raw(",\"description\":"); string(a.description)
-        if full, a.body != nil { raw(",\"body\":"); string(a.body!) }
+        if full, let body = a.body { raw(",\"body\":"); string(body) }
         raw(",\"tagList\":[")
         for i in a.tagList.indices {
             if i > 0 { raw(",") }
@@ -107,11 +118,50 @@ extension JSONWriter {
         }
         raw("],\"createdAt\":"); timestamp(a.createdAt)
         raw(",\"updatedAt\":"); timestamp(a.updatedAt)
-        raw(",\"favorited\":"); bool(a.favorited)
-        raw(",\"favoritesCount\":"); int(a.favoritesCount)
-        raw(",\"author\":"); author(a.author)
-        raw("}")
+        raw(",\"favorited\":")
     }
+
+    /// From after `favorited` up to the author's `following` value.
+    private mutating func articleUpToFollowing(_ a: borrowing ArticleRow) {
+        raw(",\"favoritesCount\":"); int(a.favoritesCount)
+        raw(",\"author\":"); authorUpToFollowing(a.author)
+    }
+
+    /// The article once for a whole batch, with its two viewer-dependent values left open.
+    mutating func articleSplice(_ a: borrowing ArticleRow, full: Bool) -> ArticleSplice {
+        let start = position
+        articleUpToFavorited(a, full: full)
+        let favorited = position
+        articleUpToFollowing(a)
+        return ArticleSplice(start: Int32(start), favorited: Int32(favorited), following: Int32(position))
+    }
+
+    /// One viewer's copy of an article written by `articleSplice`.
+    mutating func article(_ view: ArticleView, from json: borrowing ByteBuffer) {
+        let s = view.splice
+        splice(json, s.start..<s.favorited)
+        bool(view.favorited)
+        splice(json, s.favorited..<s.following)
+        bool(view.following)
+        raw("}}")
+    }
+}
+
+/// Where an article's JSON sits in its batch's buffer: from `start`, with the `favorited` value due at `favorited` and
+/// the author's `following` value at `following`; the object then ends with `}}`.
+struct ArticleSplice: Sendable, BitwiseCopyable {
+    let start: Int32
+    let favorited: Int32
+    let following: Int32
+
+    var length: Int { Int(following - start) + 16 }
+}
+
+/// An article of a batch as one viewer sees it.
+struct ArticleView: Sendable, BitwiseCopyable {
+    let splice: ArticleSplice
+    let favorited: Bool
+    let following: Bool
 }
 
 /// One row of an article page: the list's total, and the article (nil on the single row of an empty page).
@@ -161,14 +211,14 @@ extension RowCursor {
 
 extension App {
     /// One article as seen by the viewer; 404 if no row.
-    func writeFullArticle<Q: ArticleSQL>(status: HTTPResponse.Status, _ statement: ArticleByKey<Q>) async throws -> Response {
+    func writeFullArticle<Q: ArticleSQL>(status: Status, _ statement: ArticleByKey<Q>) async throws -> Response {
         guard let article = try await fetchFirst(statement) else {
             throw ApiError(.notFound, "article not found")
         }
         return articleResponse(status, article)
     }
 
-    func articleResponse(_ status: HTTPResponse.Status, _ article: borrowing ArticleRow) -> Response {
+    func articleResponse(_ status: Status, _ article: borrowing ArticleRow) -> Response {
         var out = JSONWriter(capacity: 1024 + (article.body?.bytes.readableBytes ?? 0))
         out.raw("{\"article\":")
         out.article(article, full: true)
@@ -176,18 +226,35 @@ extension App {
         return out.response(status)
     }
 
-    /// A page from the read batcher.
-    func pageResponse(total: Int64, articles: [ArticleRow]) -> Response {
-        var out = JSONWriter(capacity: 256 + articles.count * 512)
+    /// A page from the read batcher: its articles copied from the batch's JSON.
+    func pageResponse(total: Int64, articles: borrowing [ArticleView], json: borrowing ByteBuffer) -> Response {
+        var size = 64
+        for i in articles.indices { size += articles[i].splice.length }
+        var out = JSONWriter(capacity: size)
         out.raw("{\"articles\":[")
         for i in articles.indices {
             if i > 0 { out.raw(",") }
-            out.article(articles[i], full: false)
+            out.article(articles[i], from: json)
         }
         out.raw("],\"articlesCount\":")
         out.int(total)
         out.raw("}")
         return out.response(.ok)
+    }
+
+    func emptyPage() -> Response {
+        var out = JSONWriter(capacity: 40)
+        out.raw("{\"articles\":[],\"articlesCount\":0}")
+        return out.response(.ok)
+    }
+
+    /// A single article from the read batcher.
+    func articleResponse(_ view: ArticleView, json: borrowing ByteBuffer, status: Status) -> Response {
+        var out = JSONWriter(capacity: view.splice.length + 16)
+        out.raw("{\"article\":")
+        out.article(view, from: json)
+        out.raw("}")
+        return out.response(status)
     }
 
     /// The page's rows stream straight into the response; each carries the list's total.
@@ -209,158 +276,70 @@ extension App {
         return out.response(.ok)
     }
 
-    // GET /api/articles
-    func listArticles(_ request: Request, _ ctx: BasicRequestContext) async throws -> Response {
-        let auth = try Auth.optional(request, signer)
-        let query = QueryParams(request.uri.query)
-        let (limit, offset) = try limitOffset(query)
-        // The first non-empty filter in the order tag, author, favorited applies; later ones aren't even looked up.
-        let kind: PageKind =
-            if let tag = query.get("tag"), !tag.isEmpty { .tag(tag) }
-            else if let author = query.get("author"), !author.isEmpty { .author(author) }
-            else if let favorited = query.get("favorited"), !favorited.isEmpty { .favorited(favorited) }
-            else { .all }
-        if let reads {
-            let page = try await reads.page(kind, limit: limit, offset: offset, viewer: auth.viewer)
-            return pageResponse(total: page.total, articles: page.articles)
-        }
+    // GET /api/articles and /api/articles/feed, unbatched
+    func listArticles(_ kind: PageKind, limit: Int64, offset: Int64, viewer: Int64) async throws -> Response {
         switch kind {
         case .all:
-            return try await writeList(ArticlePage<PageAllSQL>(viewer: auth.viewer, limit: limit, offset: offset, filter: nil))
+            try await writeList(ArticlePage<PageAllSQL>(viewer: viewer, limit: limit, offset: offset, filter: nil))
         case .tag(let tag):
-            return try await writeList(ArticlePage<PageByTagSQL>(viewer: auth.viewer, limit: limit, offset: offset, filter: tag))
+            try await writeList(ArticlePage<PageByTagSQL>(viewer: viewer, limit: limit, offset: offset, filter: tag))
         case .author(let author):
-            return try await writeList(ArticlePage<PageByAuthorSQL>(viewer: auth.viewer, limit: limit, offset: offset, filter: author))
+            try await writeList(ArticlePage<PageByAuthorSQL>(viewer: viewer, limit: limit, offset: offset, filter: author))
         case .favorited(let name):
-            return try await writeList(ArticlePage<PageByFavoriteSQL>(viewer: auth.viewer, limit: limit, offset: offset, filter: name))
+            try await writeList(ArticlePage<PageByFavoriteSQL>(viewer: viewer, limit: limit, offset: offset, filter: name))
         case .feed(let viewer):
-            return try await writeList(ArticlePage<PageFeedSQL>(viewer: viewer, limit: limit, offset: offset, filter: nil))
+            try await writeList(ArticlePage<PageFeedSQL>(viewer: viewer, limit: limit, offset: offset, filter: nil))
         }
     }
 
-    // GET /api/articles/feed
-    func feed(_ request: Request, _ ctx: BasicRequestContext) async throws -> Response {
-        let auth = try Auth.require(request, signer)
-        let (limit, offset) = try limitOffset(QueryParams(request.uri.query))
-        if let reads {
-            let page = try await reads.page(.feed(auth.viewer), limit: limit, offset: offset, viewer: auth.viewer)
-            return pageResponse(total: page.total, articles: page.articles)
-        }
-        return try await writeList(ArticlePage<PageFeedSQL>(viewer: auth.viewer, limit: limit, offset: offset, filter: nil))
-    }
-
-    // GET /api/articles/:slug
-    func getArticle(_ request: Request, _ ctx: BasicRequestContext) async throws -> Response {
-        let auth = try Auth.optional(request, signer)
-        let slug = ctx.parameters.get("slug") ?? ""
-        if let reads {
-            guard let article = try await reads.article(slug: slug, viewer: auth.viewer) else {
-                throw ApiError(.notFound, "article not found")
-            }
-            return articleResponse(.ok, article)
-        }
-        return try await writeFullArticle(status: .ok, ArticleByKey<ArticleBySlugSQL>(viewer: auth.viewer, key: slug))
+    // GET /api/articles/:slug, unbatched
+    func getArticle(viewer: Int64, slug: String) async throws -> Response {
+        try await writeFullArticle(status: .ok, ArticleByKey<ArticleBySlugSQL>(viewer: viewer, key: slug))
     }
 
     // POST /api/articles
-    func createArticle(_ request: Request, _ ctx: BasicRequestContext) async throws -> Response {
-        let auth = try Auth.require(request, signer)
+    func createArticle(viewer: Int64, _ body: ByteBuffer) async throws -> WriteOutcome {
         let m: [String: Any]
-        do { m = try await readWrapper(request, "article") } catch { throw ApiError(.unprocessableContent, "invalid body") }
+        do { m = try readWrapper(body, "article") } catch { throw ApiError(.unprocessableContent, "invalid body") }
         let title: String
         let description: String
-        let body: String
+        let text: String
         let tagList: [String]
         do {
             title = try reqString(m, "title")
             description = try reqString(m, "description")
-            body = try reqString(m, "body")
+            text = try reqString(m, "body")
             tagList = try optTagList(m)
         } catch {
             throw ApiError(.unprocessableContent, "title, description and body are required")
         }
-
-        let id = try await db.withTransaction(logger: App.queryLogger) { conn -> Int64 in
-            let inserted = try await conn.query(makeQuery(insertArticle, [auth.viewer, title, description, body]), logger: App.queryLogger)
-            var newId: Int64?
-            for try await row in inserted {
-                var cells = RowCursor(row)
-                newId = try cells.int()
-                break
-            }
-            guard let newId else { throw ApiError(.internalServerError, "insert returned no row") }
-            if !tagList.isEmpty {
-                _ = try await conn.query(makeQuery(insertTags, [tagList]), logger: App.queryLogger)
-                _ = try await conn.query(makeQuery(insertArticleTags, [newId, tagList]), logger: App.queryLogger)
-            }
-            return newId
-        }
-        return try await writeFullArticle(status: .created, ArticleByKey<ArticleByIDSQL>(viewer: auth.viewer, key: id))
-    }
-
-    private func updateArticleBinds(id: Int64, title: String?, description: String?, body: String?) -> PostgresBindings {
-        var binds = PostgresBindings(capacity: 4)
-        binds.append(id)
-        binds.append(title)
-        binds.append(description)
-        binds.append(body)
-        return binds
-    }
-
-    /// SELECT id, author_id FROM articles WHERE slug = $1: 404 if missing, 403 if not the viewer's.
-    func ownArticle(_ slug: String, viewer: Int64) async throws -> Int64 {
-        guard let row = try await queryRow("SELECT id, author_id FROM articles WHERE slug = $1", [slug]) else {
-            throw ApiError(.notFound, "article not found")
-        }
-        var cells = RowCursor(row)
-        let id = try cells.int()
-        guard try cells.int() == viewer else { throw ApiError(.forbidden, "not the author") }
-        return id
+        return try await writes.run(.createArticle(viewer: viewer, title: title, description: description, body: text, tags: tagList))
     }
 
     // PUT /api/articles/:slug
-    func updateArticleHandler(_ request: Request, _ ctx: BasicRequestContext) async throws -> Response {
-        let auth = try Auth.require(request, signer)
-        let slug = ctx.parameters.get("slug") ?? ""
+    func updateArticle(viewer: Int64, slug: String, _ body: ByteBuffer) async throws -> WriteOutcome {
         let m: [String: Any]
-        do { m = try await readWrapper(request, "article") } catch { throw ApiError(.unprocessableContent, "invalid body") }
+        do { m = try readWrapper(body, "article") } catch { throw ApiError(.unprocessableContent, "invalid body") }
         let title: String?
         let description: String?
-        let body: String?
+        let text: String?
         do {
             title = try optString(m, "title", nonEmpty: true)
             description = try optString(m, "description", nonEmpty: true)
-            body = try optString(m, "body", nonEmpty: true)
+            text = try optString(m, "body", nonEmpty: true)
         } catch {
             throw ApiError(.unprocessableContent, "title, description and body must be non-empty strings")
         }
-        let id = try await ownArticle(slug, viewer: auth.viewer)
-        try await exec(updateArticle, binds: updateArticleBinds(id: id, title: title, description: description, body: body))
-        return try await writeFullArticle(status: .ok, ArticleByKey<ArticleByIDSQL>(viewer: auth.viewer, key: id))
+        return try await writes.run(.updateArticle(viewer: viewer, slug: slug, title: title, description: description, body: text))
     }
 
     // DELETE /api/articles/:slug
-    func deleteArticle(_ request: Request, _ ctx: BasicRequestContext) async throws -> Response {
-        let auth = try Auth.require(request, signer)
-        let slug = ctx.parameters.get("slug") ?? ""
-        let id = try await ownArticle(slug, viewer: auth.viewer)
-        try await exec("DELETE FROM articles WHERE id = $1", [id])
-        return emptyResponse(.noContent)
+    func deleteArticle(viewer: Int64, slug: String) async throws -> WriteOutcome {
+        try await writes.run(.deleteArticle(viewer: viewer, slug: slug))
     }
 
     // POST and DELETE /api/articles/:slug/favorite
-    func favorite(_ request: Request, _ ctx: BasicRequestContext, fav: Bool) async throws -> Response {
-        let auth = try Auth.require(request, signer)
-        let slug = ctx.parameters.get("slug") ?? ""
-        // One round trip for the lookup and the toggle; no row means no such article (404).
-        let toggle = fav
-            ? "WITH a AS (SELECT id FROM articles WHERE slug = $2), ins AS (INSERT INTO favorites (user_id, article_id) SELECT $1, id FROM a ON CONFLICT DO NOTHING) SELECT id FROM a"
-            : "WITH a AS (SELECT id FROM articles WHERE slug = $2), del AS (DELETE FROM favorites WHERE user_id = $1 AND article_id IN (SELECT id FROM a)) SELECT id FROM a"
-        guard let row = try await queryRow(toggle, [auth.viewer, slug]) else {
-            throw ApiError(.notFound, "article not found")
-        }
-        var cells = RowCursor(row)
-        let id = try cells.int()
-        return try await writeFullArticle(status: .ok, ArticleByKey<ArticleByIDSQL>(viewer: auth.viewer, key: id))
+    func favorite(viewer: Int64, slug: String, on: Bool) async throws -> WriteOutcome {
+        try await writes.run(.favorite(viewer: viewer, slug: slug, on: on))
     }
 }

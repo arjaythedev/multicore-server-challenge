@@ -13,7 +13,6 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-nio.git", exact: "2.104.0"),
         .package(url: "https://github.com/apple/swift-log.git", exact: "1.16.1"),
         .package(url: "https://github.com/swift-server/swift-service-lifecycle.git", exact: "2.13.0"),
-        .package(url: "https://github.com/hummingbird-project/hummingbird-auth.git", exact: "2.5.0"),
     ],
     targets: [
         .executableTarget(
@@ -28,7 +27,6 @@ let package = Package(
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"),
                 .product(name: "UnixSignals", package: "swift-service-lifecycle"),
-                .product(name: "HummingbirdBcrypt", package: "hummingbird-auth"),
             ],
             path: "Sources/Conduit",
             swiftSettings: [

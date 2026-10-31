@@ -2,7 +2,8 @@
 // answers every read waiting, of every endpoint, with one statement per kind of read present, each over arrays of
 // distinct keys (`unnest(...) WITH ORDINALITY`): identical reads share one row, and every article in the batch is
 // enriched once (tags, favorite count, author), however many reads show it. Rule 5 holds: only reads already queued
-// when a batch is taken share it, and nothing outlives the batch.
+// when a batch is taken share it, and nothing outlives the batch. Each read's task resumes with its result and
+// writes its JSON from the batch's.
 import HTTPTypes
 import Logging
 import NIOCore
@@ -27,13 +28,15 @@ enum Read: Sendable {
     case tags
 }
 
+/// A read's answer. Articles, comments and the tags body are written to JSON once per batch, into `json`, which
+/// every result of the batch shares; each result says which parts of it are its own, with its viewer's flags.
 enum ReadResult: Sendable {
-    case page(total: Int64, articles: [ArticleRow])
-    case article(ArticleRow?)
-    case comments([CommentRow]?)
+    case page(total: Int64, articles: [ArticleView], json: ByteBuffer)
+    case article(ArticleView?, json: ByteBuffer)
+    case comments([CommentView]?, json: ByteBuffer)
     case profile(ProfileRow?)
     case user(UserRow?)
-    case tags([PGText])
+    case tags(Range<Int32>, json: ByteBuffer)
 }
 
 // ---------- SQL ----------
@@ -99,19 +102,26 @@ enum PagesByFavoriteSQL: BatchSQL {
         """
 }
 
-enum PagesFeedSQL: BatchSQL {
-    static let name = "b_pages_feed"
+/// Feeds, shared between the viewers of a batch: the viewers' follows (kind 0: viewer, followee), each distinct
+/// followee's article count capped at 1,000 (kind 1: followee, count), and each followee's newest articles, as many as
+/// the most any of its viewers' pages needs (kind 2: followee, article id). A popular author is looked at once for
+/// every viewer who follows them. The counts and pages are put together per viewer in BatchPlan.feedPages; they are
+/// exactly the reference SQL's, since articles have one author: the count of a viewer's followees' articles capped at
+/// 1,000 is the sum of the followees' counts capped at 1,000 each, then again at 1,000.
+enum FeedSQL: BatchSQL {
+    static let name = "b_feed"
     static let sql = """
-        SELECT -r.k, (SELECT count(*) FROM (SELECT 1 FROM articles a
-                        WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.v) LIMIT 1000) s),
-               NULL::int8
-          FROM unnest($1::int8[]) WITH ORDINALITY r(v, k)
+        WITH v AS (SELECT * FROM unnest($1::int8[], $2::int8[]) r(viewer, want)),
+             e AS (SELECT fo.follower_id AS viewer, fo.followee_id AS followee, v.want
+                     FROM v JOIN follows fo ON fo.follower_id = v.viewer),
+             d AS (SELECT followee, max(want) AS want FROM e GROUP BY followee)
+        SELECT 0::int8, viewer, followee FROM e
         UNION ALL
-        SELECT r.k, p.id, p.author_id FROM unnest($2::int8[], $3::int8[], $4::int8[]) WITH ORDINALITY r(v, lim, off, k)
-          CROSS JOIN LATERAL (SELECT x.id, x.author_id FROM follows fo
-                               CROSS JOIN LATERAL (SELECT a2.id, a2.author_id FROM articles a2 WHERE a2.author_id = fo.followee_id
-                                                    ORDER BY a2.id DESC LIMIT r.lim + r.off) x
-                               WHERE fo.follower_id = r.v ORDER BY x.id DESC LIMIT r.lim OFFSET r.off) p
+        SELECT 1::int8, d.followee, (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = d.followee LIMIT 1000) s)
+          FROM d
+        UNION ALL
+        SELECT 2::int8, d.followee, x.id FROM d
+          CROSS JOIN LATERAL (SELECT a.id FROM articles a WHERE a.author_id = d.followee ORDER BY a.id DESC LIMIT d.want) x
         """
 }
 
@@ -218,8 +228,7 @@ final class ReadBatcher: Service {
         var maxBatch: Int
     }
 
-    fileprivate struct Waiting: Sendable {
-        let id: UInt64
+    struct Waiting: Sendable {
         let read: Read
         let viewer: Int64
         let since: ContinuousClock.Instant
@@ -228,7 +237,6 @@ final class ReadBatcher: Service {
 
     private struct State {
         var queue: [Waiting] = []
-        var nextID: UInt64 = 0
         /// One lane at a time collects the next batch; the others wait for their turn here.
         var collecting = false
         var waitingForTurn: [CheckedContinuation<Void, Never>] = []
@@ -252,28 +260,16 @@ final class ReadBatcher: Service {
 
     /// Queues `read` for the next batch and waits for its result.
     func read(_ read: Read, viewer: Int64) async throws -> ReadResult {
-        let id = state.withLock { s in
-            s.nextID &+= 1
-            return s.nextID
-        }
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                let waiting = Waiting(id: id, read: read, viewer: viewer, since: clock.now, continuation: continuation)
-                let (queued, wake) = state.withLock { s -> (Bool, CheckedContinuation<Void, Never>?) in
-                    if s.stopped { return (false, nil) }
-                    s.queue.append(waiting)
-                    defer { s.waitingForWork = nil }
-                    return (true, s.waitingForWork)
-                }
-                if !queued { continuation.resume(throwing: ApiError(.serviceUnavailable, "shutting down")) }
-                wake?.resume()
+        try await withCheckedThrowingContinuation { continuation in
+            let waiting = Waiting(read: read, viewer: viewer, since: clock.now, continuation: continuation)
+            let (queued, wake) = state.withLock { s -> (Bool, CheckedContinuation<Void, Never>?) in
+                if s.stopped { return (false, nil) }
+                s.queue.append(waiting)
+                defer { s.waitingForWork = nil }
+                return (true, s.waitingForWork)
             }
-        } onCancel: {
-            let cancelled = state.withLock { s -> Waiting? in
-                guard let i = s.queue.firstIndex(where: { $0.id == id }) else { return nil }
-                return s.queue.remove(at: i)
-            }
-            cancelled?.continuation.resume(throwing: CancellationError())
+            if !queued { continuation.resume(throwing: ApiError(.serviceUnavailable, "shutting down")) }
+            wake?.resume()
         }
     }
 
@@ -304,19 +300,10 @@ final class ReadBatcher: Service {
         work?.resume()
     }
 
-    /// One Postgres connection, held for the lane's life; a lost connection is replaced.
+    /// Answers batches, one at a time. A batch's statements run on pooled connections, several at once.
     private func lane() async {
-        while !isStopped {
-            do {
-                try await db.withConnection { connection in
-                    while let batch = await self.nextBatch() {
-                        try await self.answer(batch, on: connection)
-                    }
-                }
-            } catch {
-                App.logger.error("read lane failed", metadata: ["error": "\(error)"])
-                try? await Task.sleep(for: .milliseconds(100))
-            }
+        while let batch = await nextBatch() {
+            await answer(batch)
         }
     }
 
@@ -352,14 +339,22 @@ final class ReadBatcher: Service {
                 guard let deadline, deadline > clock.now else { break }
                 try? await Task.sleep(until: deadline, clock: clock)
             }
-            let (batch, next, stopped) = state.withLock { s -> ([Waiting], CheckedContinuation<Void, Never>?, Bool) in
+            // The event loops queue reads under this lock, so it is held for as little as possible: the whole queue is
+            // swapped out for an empty one, reserved here, before taking the lock.
+            var batch: [Waiting] = []
+            batch.reserveCapacity(min(settings.maxBatch, max(settings.minBatch, 2 * Int(state.withLock { $0.typicalBatch }))))
+            let (next, stopped) = state.withLock { s -> (CheckedContinuation<Void, Never>?, Bool) in
                 let count = min(s.queue.count, settings.maxBatch)
-                let batch = Array(s.queue.prefix(count))
-                s.queue.removeFirst(count)
+                if count == s.queue.count {
+                    swap(&batch, &s.queue)
+                } else {
+                    batch.append(contentsOf: s.queue.prefix(count))
+                    s.queue.removeFirst(count)
+                }
                 if count > 0 { s.typicalBatch = s.typicalBatch == 0 ? Double(count) : 0.9 * s.typicalBatch + 0.1 * Double(count) }
                 let next = s.waitingForTurn.isEmpty ? nil : s.waitingForTurn.removeFirst()
                 s.collecting = next != nil
-                return (batch, next, s.stopped)
+                return (next, s.stopped)
             }
             next?.resume()
             if !batch.isEmpty { return batch }
@@ -368,68 +363,24 @@ final class ReadBatcher: Service {
     }
 
     /// Answers a batch; on failure every read in it gets the error.
-    private func answer(_ batch: [Waiting], on connection: PostgresConnection) async throws {
+    private func answer(_ batch: [Waiting]) async {
         do {
             var plan = BatchPlan(batch)
-            try await plan.execute(on: connection)
+            try await plan.execute(on: db)
             for (i, waiting) in batch.enumerated() {
                 waiting.continuation.resume(returning: plan.result(i, viewer: waiting.viewer))
             }
         } catch {
+            App.logger.error("read batch failed", metadata: ["error": "\(error)"])
             for waiting in batch { waiting.continuation.resume(throwing: error) }
-            throw error
         }
-    }
-}
-
-extension ReadBatcher {
-    func page(_ kind: PageKind, limit: Int64, offset: Int64, viewer: Int64) async throws -> (total: Int64, articles: [ArticleRow]) {
-        guard case .page(let total, let articles) = try await read(.page(kind, limit: limit, offset: offset), viewer: viewer) else {
-            throw ApiError(.internalServerError, "unexpected read result")
-        }
-        return (total, articles)
-    }
-
-    func article(slug: String, viewer: Int64) async throws -> ArticleRow? {
-        guard case .article(let article) = try await read(.article(slug: slug), viewer: viewer) else {
-            throw ApiError(.internalServerError, "unexpected read result")
-        }
-        return article
-    }
-
-    func comments(slug: String, viewer: Int64) async throws -> [CommentRow]? {
-        guard case .comments(let comments) = try await read(.comments(slug: slug), viewer: viewer) else {
-            throw ApiError(.internalServerError, "unexpected read result")
-        }
-        return comments
-    }
-
-    func profile(username: String, viewer: Int64) async throws -> ProfileRow? {
-        guard case .profile(let profile) = try await read(.profile(username: username), viewer: viewer) else {
-            throw ApiError(.internalServerError, "unexpected read result")
-        }
-        return profile
-    }
-
-    func user(id: Int64) async throws -> UserRow? {
-        guard case .user(let user) = try await read(.user(id: id), viewer: id) else {
-            throw ApiError(.internalServerError, "unexpected read result")
-        }
-        return user
-    }
-
-    func tags() async throws -> [PGText] {
-        guard case .tags(let tags) = try await read(.tags, viewer: 0) else {
-            throw ApiError(.internalServerError, "unexpected read result")
-        }
-        return tags
     }
 }
 
 // ---------- one batch ----------
 
 /// Distinct keys in first-seen order. A key's ordinal (1-based) is what the batched statements tag its rows with.
-private struct Ordinals<Key: Hashable> {
+private struct Ordinals<Key: Hashable & Sendable>: Sendable {
     private(set) var keys: [Key] = []
     private var index: [Key: Int] = [:]
 
@@ -441,25 +392,25 @@ private struct Ordinals<Key: Hashable> {
     }
 }
 
-private struct PageKey<Filter: Hashable>: Hashable {
+private struct PageKey<Filter: Hashable & Sendable>: Hashable, Sendable {
     let filter: Filter
     let limit: Int64
     let offset: Int64
 }
 
-private struct ArticleRef {
+private struct ArticleRef: Sendable {
     let id: Int64
     let author: Int64
 }
 
 /// The distinct pages of one list kind in a batch, and what Postgres returned for them.
-private struct PageFamily<Filter: Hashable> {
+private struct PageFamily<Filter: Hashable & Sendable>: Sendable {
     var counts = Ordinals<Filter>()
     var pages = Ordinals<PageKey<Filter>>()
     /// Indexed by ordinal (1-based; the global list's one count is at 0), sized by `prepare` once the keys are known,
     /// so a batch's results take no dictionary of their own.
-    private(set) var totals: [Int64] = []
-    private(set) var rows: [[ArticleRef]] = []
+    var totals: [Int64] = []
+    var rows: [[ArticleRef]] = []
 
     var isEmpty: Bool { pages.keys.isEmpty }
 
@@ -483,12 +434,12 @@ private struct PageFamily<Filter: Hashable> {
     }
 }
 
-private struct Pair: Hashable {
+private struct Pair: Hashable, Sendable {
     let viewer: Int64
     let target: Int64
 }
 
-private struct CommentRef {
+private struct CommentRef: Sendable {
     let row: CommentRow
     let author: Int64
 }
@@ -527,8 +478,17 @@ private struct BatchPlan {
     private var users: [UserRow?] = []
     private var tagNames: [PGText] = []
     private var details: [Int64: ArticleRow] = [:]
+    /// Articles some page of the batch shows (single-article reads aside, which show the body too).
+    private var listed = Set<Int64>()
     private var favorites = Set<Pair>()
     private var follows = Set<Pair>()
+
+    // The batch's JSON (`render`) and where each part of it is.
+    private var json = ByteBuffer()
+    private var listSplices: [Int64: ArticleSplice] = [:]
+    private var fullSplices: [Int64: ArticleSplice] = [:]
+    private var threadSplices: [[(splice: CommentSplice, author: Int64)]?] = []
+    private var tagsBody: Range<Int32> = 0..<0
 
     fileprivate init(_ batch: [ReadBatcher.Waiting]) {
         slots.reserveCapacity(batch.count)
@@ -578,94 +538,108 @@ private struct BatchPlan {
 
     // ---------- execution ----------
 
-    mutating func execute(on connection: PostgresConnection) async throws {
-        // Phase 1: what each read is about.
-        if !all.isEmpty {
-            var binds = PostgresBindings(capacity: 2)
-            binds.append(all.pages.keys.map(\.limit))
-            binds.append(all.pages.keys.map(\.offset))
-            for try await row in try await connection.execute(BatchStatement<PagesAllSQL>(binds: binds), logger: App.queryLogger) {
-                try all.take(row)
+    /// What one statement of the batch returned, from the child task that ran it.
+    private enum Answer: Sendable {
+        case all(PageFamily<Bool>)
+        case tag(PageFamily<String>)
+        case author(PageFamily<String>)
+        case favorited(PageFamily<String>)
+        case feed(PageFamily<Int64>)
+        case articles([ArticleRef?])
+        case threads([[CommentRef]?])
+        case profiles([(id: Int64, row: ProfileRow)?])
+        case users([UserRow?])
+        case tags([PGText], [Int32: Int])
+        case details([Int64: ArticleRow], [Int64: [Int32]])
+        case flags(favorites: Set<Pair>, follows: Set<Pair>)
+    }
+
+    /// Two rounds of statements, each statement on a pooled connection of its own, so a batch takes about as long as
+    /// its slowest statement per round instead of all of them in turn on one connection: what each read is about, then
+    /// every article shown (once) and the viewer flags.
+    mutating func execute(on db: PostgresClient) async throws {
+        let showsArticles = !all.isEmpty || !byTag.isEmpty || !byAuthor.isEmpty || !byFavorite.isEmpty || !feed.isEmpty
+            || !slugs.keys.isEmpty
+        var rank: [Int32: Int] = [:]
+        try await withThrowingTaskGroup(of: Answer.self) { group in
+            if !all.isEmpty {
+                var binds = PostgresBindings(capacity: 2)
+                binds.append(all.pages.keys.map(\.limit))
+                binds.append(all.pages.keys.map(\.offset))
+                let family = all
+                group.addTask { .all(try await Self.pages(PagesAllSQL.self, family, binds, db)) }
             }
-        }
-        try await run(PagesByTagSQL.self, &byTag, on: connection)
-        try await run(PagesByAuthorSQL.self, &byAuthor, on: connection)
-        try await run(PagesByFavoriteSQL.self, &byFavorite, on: connection)
-        if !feed.isEmpty {
-            var binds = PostgresBindings(capacity: 4)
-            binds.append(feed.counts.keys)
-            binds.append(feed.pages.keys.map(\.filter))
-            binds.append(feed.pages.keys.map(\.limit))
-            binds.append(feed.pages.keys.map(\.offset))
-            for try await row in try await connection.execute(BatchStatement<PagesFeedSQL>(binds: binds), logger: App.queryLogger) {
-                try feed.take(row)
+            if !byTag.isEmpty {
+                let (family, binds) = (byTag, try Self.filterBinds(byTag))
+                group.addTask { .tag(try await Self.pages(PagesByTagSQL.self, family, binds, db)) }
             }
-        }
-        if !slugs.keys.isEmpty {
-            var binds = PostgresBindings(capacity: 1)
-            binds.append(slugs.keys)
-            for try await row in try await connection.execute(BatchStatement<ArticlesBySlugSQL>(binds: binds), logger: App.queryLogger) {
-                var cells = RowCursor(row)
-                let k = try cells.int()
-                articleRefs[Int(k)] = ArticleRef(id: try cells.int(), author: try cells.int())
+            if !byAuthor.isEmpty {
+                let (family, binds) = (byAuthor, try Self.filterBinds(byAuthor))
+                group.addTask { .author(try await Self.pages(PagesByAuthorSQL.self, family, binds, db)) }
             }
-        }
-        if !commentSlugs.keys.isEmpty {
-            var binds = PostgresBindings(capacity: 1)
-            binds.append(commentSlugs.keys)
-            for try await row in try await connection.execute(BatchStatement<CommentsBySlugSQL>(binds: binds), logger: App.queryLogger) {
-                var cells = RowCursor(row)
-                let k = Int(try cells.int())
-                if threads[k] == nil { threads[k] = [] } // found; stays empty for an article without comments
-                guard let id = try cells.intOrNull() else { continue }
-                let body = try cells.text()
-                let createdAt = try cells.timestamp()
-                let updatedAt = try cells.timestamp()
-                let author = try cells.int()
-                let username = try cells.text()
-                let bio = try cells.textOrNull()
-                let image = try cells.textOrNull()
-                let row = CommentRow(id: id, body: body, createdAt: createdAt, updatedAt: updatedAt,
-                                     author: ProfileRow(username: username, bio: bio, image: image, following: false))
-                threads[k]?.append(CommentRef(row: row, author: author))
+            if !byFavorite.isEmpty {
+                let (family, binds) = (byFavorite, try Self.filterBinds(byFavorite))
+                group.addTask { .favorited(try await Self.pages(PagesByFavoriteSQL.self, family, binds, db)) }
             }
-        }
-        if !usernames.keys.isEmpty {
-            var binds = PostgresBindings(capacity: 1)
-            binds.append(usernames.keys)
-            for try await row in try await connection.execute(BatchStatement<ProfilesByNameSQL>(binds: binds), logger: App.queryLogger) {
-                var cells = RowCursor(row)
-                let k = Int(try cells.int())
-                let id = try cells.int()
-                let username = try cells.text()
-                let bio = try cells.textOrNull()
-                let image = try cells.textOrNull()
-                profiles[k] = (id, ProfileRow(username: username, bio: bio, image: image, following: false))
+            if !feed.isEmpty {
+                let family = feed
+                group.addTask { .feed(try await Self.feedPages(family, db)) }
             }
-        }
-        if !userIDs.keys.isEmpty {
-            var binds = PostgresBindings(capacity: 1)
-            binds.append(userIDs.keys)
-            for try await row in try await connection.execute(BatchStatement<UsersByIDSQL>(binds: binds), logger: App.queryLogger) {
-                var cells = RowCursor(row)
-                let k = Int(try cells.int())
-                users[k] = try cells.user().user
+            if !slugs.keys.isEmpty {
+                let (keys, refs) = (slugs.keys, articleRefs)
+                group.addTask { .articles(try await Self.articleRefs(keys, refs, db)) }
+            }
+            if !commentSlugs.keys.isEmpty {
+                let (keys, threads) = (commentSlugs.keys, threads)
+                group.addTask { .threads(try await Self.threads(keys, threads, db)) }
+            }
+            if !usernames.keys.isEmpty {
+                let (keys, profiles) = (usernames.keys, profiles)
+                group.addTask { .profiles(try await Self.profiles(keys, profiles, db)) }
+            }
+            if !userIDs.keys.isEmpty {
+                let (keys, users) = (userIDs.keys, users)
+                group.addTask { .users(try await Self.users(keys, users, db)) }
+            }
+            if wantsTags || showsArticles {
+                group.addTask { let (names, rank) = try await Self.tags(db); return .tags(names, rank) }
+            }
+            for try await answer in group {
+                switch answer {
+                case .all(let family): all = family
+                case .tag(let family): byTag = family
+                case .author(let family): byAuthor = family
+                case .favorited(let family): byFavorite = family
+                case .feed(let family): feed = family
+                case .articles(let refs): articleRefs = refs
+                case .threads(let found): threads = found
+                case .profiles(let found): profiles = found
+                case .users(let found): users = found
+                case .tags(let names, let ranks): (tagNames, rank) = (names, ranks)
+                case .details, .flags: break
+                }
             }
         }
 
-        // Phase 2: every article shown, once, and the viewer flags.
         var ids = Set<Int64>()
         ids.reserveCapacity(slots.count * 4)
         var favoritePairs = Set<Pair>()
         var followPairs = Set<Pair>()
+        /// A feed's articles are by authors its viewer follows: no lookup needed.
+        var followed = Set<Pair>()
         for (i, slot) in slots.enumerated() {
             let viewer = viewers[i]
-            func show(_ refs: [ArticleRef]) {
+            func show(_ refs: [ArticleRef], listed isListed: Bool = true, followed isFollowed: Bool = false) {
                 for ref in refs {
                     ids.insert(ref.id)
+                    if isListed { listed.insert(ref.id) }
                     if viewer != 0 {
                         favoritePairs.insert(Pair(viewer: viewer, target: ref.id))
-                        followPairs.insert(Pair(viewer: viewer, target: ref.author))
+                        if isFollowed {
+                            followed.insert(Pair(viewer: viewer, target: ref.author))
+                        } else {
+                            followPairs.insert(Pair(viewer: viewer, target: ref.author))
+                        }
                     }
                 }
             }
@@ -674,8 +648,8 @@ private struct BatchPlan {
             case .tag(_, let page): show(byTag.rows[page])
             case .author(_, let page): show(byAuthor.rows[page])
             case .favorited(_, let page): show(byFavorite.rows[page])
-            case .feed(_, let page): show(feed.rows[page])
-            case .article(let k): if let ref = articleRefs[k] { show([ref]) }
+            case .feed(_, let page): show(feed.rows[page], followed: true)
+            case .article(let k): if let ref = articleRefs[k] { show([ref], listed: false) }
             case .comments(let k):
                 if viewer != 0, let thread = threads[k] {
                     for comment in thread { followPairs.insert(Pair(viewer: viewer, target: comment.author)) }
@@ -686,119 +660,339 @@ private struct BatchPlan {
                 break
             }
         }
+
         var tagIDs: [Int64: [Int32]] = [:]
-        tagIDs.reserveCapacity(ids.count)
-        details.reserveCapacity(ids.count)
-        if !ids.isEmpty {
-            var binds = PostgresBindings(capacity: 2)
-            binds.append(Array(ids))
-            binds.append(articleRefs.compactMap { $0?.id })
-            for try await row in try await connection.execute(BatchStatement<ArticleDetailsSQL>(binds: binds), logger: App.queryLogger) {
-                var cells = RowCursor(row)
-                let id = try cells.int()
-                let slug = try cells.text()
-                let title = try cells.text()
-                let description = try cells.text()
-                let body = try cells.textOrNull()
-                let createdAt = try cells.timestamp()
-                let updatedAt = try cells.timestamp()
-                tagIDs[id] = try cells.int4Array()
-                let favoritesCount = try cells.int()
-                let username = try cells.text()
-                let bio = try cells.textOrNull()
-                let image = try cells.textOrNull()
-                details[id] = ArticleRow(slug: slug, title: title, description: description, body: body, tagList: [],
-                                         createdAt: createdAt, updatedAt: updatedAt, favorited: false,
-                                         favoritesCount: favoritesCount,
-                                         author: ProfileRow(username: username, bio: bio, image: image, following: false))
+        try await withThrowingTaskGroup(of: Answer.self) { group in
+            if !ids.isEmpty {
+                let (shown, bodies) = (Array(ids), articleRefs.compactMap { $0?.id })
+                group.addTask { let (rows, tags) = try await Self.details(shown, bodies: bodies, db); return .details(rows, tags) }
             }
-        }
-        // After the details, so every tag they name already exists. Tags are never deleted.
-        if !details.isEmpty || wantsTags {
-            var rank: [Int32: Int] = [:]
-            rank.reserveCapacity(256)
-            for try await row in try await connection.execute(BatchStatement<TagsSQL>(binds: PostgresBindings()), logger: App.queryLogger) {
-                var cells = RowCursor(row)
-                rank[try cells.int4()] = tagNames.count
-                tagNames.append(try cells.text())
+            if !favoritePairs.isEmpty || !followPairs.isEmpty {
+                let (favoritePairs, followPairs) = (favoritePairs, followPairs)
+                group.addTask {
+                    let (favorites, follows) = try await Self.flags(favoritePairs, followPairs, db)
+                    return .flags(favorites: favorites, follows: follows)
+                }
             }
-            for (id, tags) in tagIDs {
-                details[id]?.tagList = tags.compactMap { rank[$0] }.sorted().map { tagNames[$0] }
-            }
-        }
-        if !favoritePairs.isEmpty || !followPairs.isEmpty {
-            var binds = PostgresBindings(capacity: 4)
-            binds.append(favoritePairs.map(\.viewer))
-            binds.append(favoritePairs.map(\.target))
-            binds.append(followPairs.map(\.viewer))
-            binds.append(followPairs.map(\.target))
-            for try await row in try await connection.execute(BatchStatement<ViewerFlagsSQL>(binds: binds), logger: App.queryLogger) {
-                var cells = RowCursor(row)
-                let kind = try cells.int()
-                let pair = Pair(viewer: try cells.int(), target: try cells.int())
-                switch kind {
-                case 0: favorites.insert(pair)
-                case 1: follows.insert(pair)
-                default: throw RowError.typeMismatch("flag kind", .int8)
+            for try await answer in group {
+                switch answer {
+                case .details(let rows, let tags): (details, tagIDs) = (rows, tags)
+                case .flags(let favorited, let following): (favorites, follows) = (favorited, following)
+                default: break
                 }
             }
         }
+
+        follows.formUnion(followed)
+
+        // The tags table was read alongside the first round, so an article created since may name a tag it doesn't
+        // have yet; then it is read again. Tags are never deleted, so the second read has every tag the details name.
+        if tagIDs.values.contains(where: { $0.contains { rank[$0] == nil } }) {
+            (tagNames, rank) = try await Self.tags(db)
+        }
+        for (id, tags) in tagIDs {
+            details[id]?.tagList = tags.compactMap { rank[$0] }.sorted().map { tagNames[$0] }
+        }
+        render()
     }
 
-    private func run<Q: BatchSQL>(_ sql: Q.Type, _ family: inout PageFamily<String>, on connection: PostgresConnection) async throws {
-        guard !family.isEmpty else { return }
+    // ---------- the statements, each on a pooled connection ----------
+
+    private static func rows<Q: BatchSQL>(_ sql: Q.Type, _ binds: PostgresBindings, _ db: PostgresClient) async throws
+        -> AsyncThrowingMapSequence<PostgresRowSequence, PostgresRow> {
+        try await db.execute(BatchStatement<Q>(binds: binds), logger: App.queryLogger)
+    }
+
+    private static func filterBinds<F>(_ family: PageFamily<F>) throws -> PostgresBindings where F: PostgresArrayEncodable {
         var binds = PostgresBindings(capacity: 4)
-        binds.append(family.counts.keys)
-        binds.append(family.pages.keys.map(\.filter))
+        try binds.append(family.counts.keys)
+        try binds.append(family.pages.keys.map(\.filter))
         binds.append(family.pages.keys.map(\.limit))
         binds.append(family.pages.keys.map(\.offset))
-        for try await row in try await connection.execute(BatchStatement<Q>(binds: binds), logger: App.queryLogger) {
-            try family.take(row)
+        return binds
+    }
+
+    private static func pages<Q: BatchSQL, F>(_ sql: Q.Type, _ family: PageFamily<F>, _ binds: PostgresBindings,
+                                              _ db: PostgresClient) async throws -> PageFamily<F> {
+        var family = family
+        for try await row in try await rows(sql, binds, db) { try family.take(row) }
+        return family
+    }
+
+    /// The batch's feeds from FeedSQL: each viewer's total, and each page merged from its viewer's followees' newest
+    /// articles (each list newest first; a page takes the next newest head `offset + limit` times).
+    private static func feedPages(_ family: PageFamily<Int64>, _ db: PostgresClient) async throws -> PageFamily<Int64> {
+        var family = family
+        let viewers = family.counts.keys
+        var slot: [Int64: Int] = [:]
+        slot.reserveCapacity(viewers.count)
+        for (i, viewer) in viewers.enumerated() { slot[viewer] = i }
+        var want = [Int64](repeating: 0, count: viewers.count)
+        for key in family.pages.keys {
+            let i = slot[key.filter]!
+            want[i] = max(want[i], key.limit + key.offset)
         }
+        var binds = PostgresBindings(capacity: 2)
+        binds.append(viewers)
+        binds.append(want)
+
+        var followees = [[Int64]](repeating: [], count: viewers.count)
+        var counts: [Int64: Int64] = [:]
+        var newest: [Int64: [Int64]] = [:]
+        for try await row in try await rows(FeedSQL.self, binds, db) {
+            var cells = RowCursor(row)
+            let kind = try cells.int()
+            let a = try cells.int()
+            let b = try cells.int()
+            switch kind {
+            case 0: followees[slot[a]!].append(b)
+            case 1: counts[a] = b
+            case 2: newest[a, default: []].append(b)
+            default: throw RowError.typeMismatch("feed row kind", .int8)
+            }
+        }
+        for followee in newest.keys { newest[followee]!.sort(by: >) }
+
+        for i in viewers.indices {
+            var total: Int64 = 0
+            for followee in followees[i] { total += counts[followee] ?? 0 }
+            family.totals[i + 1] = min(total, 1000)
+        }
+        for (k, key) in family.pages.keys.enumerated() {
+            let sources = followees[slot[key.filter]!]
+            var heads = [Int](repeating: 0, count: sources.count)
+            var page: [ArticleRef] = []
+            page.reserveCapacity(Int(key.limit))
+            var taken: Int64 = 0
+            while taken < key.offset + key.limit {
+                var best = -1
+                var bestID = Int64.min
+                for s in sources.indices {
+                    guard let list = newest[sources[s]], heads[s] < list.count, list[heads[s]] > bestID else { continue }
+                    best = s
+                    bestID = list[heads[s]]
+                }
+                guard best >= 0 else { break }
+                heads[best] += 1
+                if taken >= key.offset { page.append(ArticleRef(id: bestID, author: sources[best])) }
+                taken += 1
+            }
+            family.rows[k + 1] = page
+        }
+        return family
+    }
+
+    private static func articleRefs(_ slugs: [String], _ refs: [ArticleRef?], _ db: PostgresClient) async throws -> [ArticleRef?] {
+        var refs = refs
+        var binds = PostgresBindings(capacity: 1)
+        binds.append(slugs)
+        for try await row in try await rows(ArticlesBySlugSQL.self, binds, db) {
+            var cells = RowCursor(row)
+            let k = try cells.int()
+            refs[Int(k)] = ArticleRef(id: try cells.int(), author: try cells.int())
+        }
+        return refs
+    }
+
+    private static func threads(_ slugs: [String], _ threads: [[CommentRef]?], _ db: PostgresClient) async throws -> [[CommentRef]?] {
+        var threads = threads
+        var binds = PostgresBindings(capacity: 1)
+        binds.append(slugs)
+        for try await row in try await rows(CommentsBySlugSQL.self, binds, db) {
+            var cells = RowCursor(row)
+            let k = Int(try cells.int())
+            if threads[k] == nil { threads[k] = [] } // found; stays empty for an article without comments
+            guard let id = try cells.intOrNull() else { continue }
+            let body = try cells.text()
+            let createdAt = try cells.timestamp()
+            let updatedAt = try cells.timestamp()
+            let author = try cells.int()
+            let username = try cells.text()
+            let bio = try cells.textOrNull()
+            let image = try cells.textOrNull()
+            let row = CommentRow(id: id, body: body, createdAt: createdAt, updatedAt: updatedAt,
+                                 author: ProfileRow(username: username, bio: bio, image: image, following: false))
+            threads[k]?.append(CommentRef(row: row, author: author))
+        }
+        return threads
+    }
+
+    private static func profiles(_ usernames: [String], _ profiles: [(id: Int64, row: ProfileRow)?],
+                                 _ db: PostgresClient) async throws -> [(id: Int64, row: ProfileRow)?] {
+        var profiles = profiles
+        var binds = PostgresBindings(capacity: 1)
+        binds.append(usernames)
+        for try await row in try await rows(ProfilesByNameSQL.self, binds, db) {
+            var cells = RowCursor(row)
+            let k = Int(try cells.int())
+            let id = try cells.int()
+            let username = try cells.text()
+            let bio = try cells.textOrNull()
+            let image = try cells.textOrNull()
+            profiles[k] = (id, ProfileRow(username: username, bio: bio, image: image, following: false))
+        }
+        return profiles
+    }
+
+    private static func users(_ ids: [Int64], _ users: [UserRow?], _ db: PostgresClient) async throws -> [UserRow?] {
+        var users = users
+        var binds = PostgresBindings(capacity: 1)
+        binds.append(ids)
+        for try await row in try await rows(UsersByIDSQL.self, binds, db) {
+            var cells = RowCursor(row)
+            let k = Int(try cells.int())
+            users[k] = try cells.user().user
+        }
+        return users
+    }
+
+    /// Tag names in the database's name order, and each tag id's place in that order.
+    private static func tags(_ db: PostgresClient) async throws -> ([PGText], [Int32: Int]) {
+        var names: [PGText] = []
+        var rank: [Int32: Int] = [:]
+        rank.reserveCapacity(256)
+        for try await row in try await rows(TagsSQL.self, PostgresBindings(), db) {
+            var cells = RowCursor(row)
+            rank[try cells.int4()] = names.count
+            names.append(try cells.text())
+        }
+        return (names, rank)
+    }
+
+    private static func details(_ ids: [Int64], bodies: [Int64], _ db: PostgresClient) async throws
+        -> ([Int64: ArticleRow], [Int64: [Int32]]) {
+        var details: [Int64: ArticleRow] = [:]
+        var tagIDs: [Int64: [Int32]] = [:]
+        details.reserveCapacity(ids.count)
+        tagIDs.reserveCapacity(ids.count)
+        var binds = PostgresBindings(capacity: 2)
+        binds.append(ids)
+        binds.append(bodies)
+        for try await row in try await rows(ArticleDetailsSQL.self, binds, db) {
+            var cells = RowCursor(row)
+            let id = try cells.int()
+            let slug = try cells.text()
+            let title = try cells.text()
+            let description = try cells.text()
+            let body = try cells.textOrNull()
+            let createdAt = try cells.timestamp()
+            let updatedAt = try cells.timestamp()
+            tagIDs[id] = try cells.int4Array()
+            let favoritesCount = try cells.int()
+            let username = try cells.text()
+            let bio = try cells.textOrNull()
+            let image = try cells.textOrNull()
+            details[id] = ArticleRow(slug: slug, title: title, description: description, body: body, tagList: [],
+                                     createdAt: createdAt, updatedAt: updatedAt, favorited: false,
+                                     favoritesCount: favoritesCount,
+                                     author: ProfileRow(username: username, bio: bio, image: image, following: false))
+        }
+        return (details, tagIDs)
+    }
+
+    private static func flags(_ favoritePairs: Set<Pair>, _ followPairs: Set<Pair>, _ db: PostgresClient) async throws
+        -> (Set<Pair>, Set<Pair>) {
+        var favorites = Set<Pair>()
+        var follows = Set<Pair>()
+        var binds = PostgresBindings(capacity: 4)
+        binds.append(favoritePairs.map(\.viewer))
+        binds.append(favoritePairs.map(\.target))
+        binds.append(followPairs.map(\.viewer))
+        binds.append(followPairs.map(\.target))
+        for try await row in try await rows(ViewerFlagsSQL.self, binds, db) {
+            var cells = RowCursor(row)
+            let kind = try cells.int()
+            let pair = Pair(viewer: try cells.int(), target: try cells.int())
+            switch kind {
+            case 0: favorites.insert(pair)
+            case 1: follows.insert(pair)
+            default: throw RowError.typeMismatch("flag kind", .int8)
+            }
+        }
+        return (favorites, follows)
+    }
+
+    /// Writes everything the batch's results show into one buffer, each article and comment once (with their
+    /// viewer-dependent values left open) however many results show them: the results copy their parts on their
+    /// connections' event loops.
+    private mutating func render() {
+        var out = JSONWriter(capacity: (listed.count + slugs.keys.count) * 640 + (wantsTags ? 64 + tagNames.count * 24 : 0))
+        if wantsTags {
+            let start = out.position
+            out.raw("{\"tags\":[")
+            for i in tagNames.indices {
+                if i > 0 { out.raw(",") }
+                out.string(tagNames[i])
+            }
+            out.raw("]}")
+            tagsBody = Int32(start)..<Int32(out.position)
+        }
+        listSplices.reserveCapacity(listed.count)
+        for id in listed {
+            if let row = details[id] { listSplices[id] = out.articleSplice(row, full: false) }
+        }
+        for ref in articleRefs {
+            guard let ref, fullSplices[ref.id] == nil, let row = details[ref.id] else { continue }
+            fullSplices[ref.id] = out.articleSplice(row, full: true)
+        }
+        if !threads.isEmpty {
+            threadSplices = Array(repeating: nil, count: threads.count)
+            for k in threads.indices {
+                guard let thread = threads[k] else { continue }
+                let newestFirst = thread.sorted {
+                    $0.row.createdAt.micros != $1.row.createdAt.micros
+                        ? $0.row.createdAt.micros > $1.row.createdAt.micros : $0.row.id > $1.row.id
+                }
+                var splices: [(splice: CommentSplice, author: Int64)] = []
+                splices.reserveCapacity(newestFirst.count)
+                for comment in newestFirst { splices.append((out.commentSplice(comment.row), comment.author)) }
+                threadSplices[k] = splices
+            }
+        }
+        json = out.finish()
     }
 
     // ---------- results ----------
 
     func result(_ i: Int, viewer: Int64) -> ReadResult {
         switch slots[i] {
-        case .all(let page): return .page(total: all.totals[0], articles: articles(all.rows[page], viewer: viewer))
-        case .tag(let count, let page): return .page(total: byTag.totals[count], articles: articles(byTag.rows[page], viewer: viewer))
+        case .all(let page): return .page(total: all.totals[0], articles: views(all.rows[page], viewer: viewer), json: json)
+        case .tag(let count, let page):
+            return .page(total: byTag.totals[count], articles: views(byTag.rows[page], viewer: viewer), json: json)
         case .author(let count, let page):
-            return .page(total: byAuthor.totals[count], articles: articles(byAuthor.rows[page], viewer: viewer))
+            return .page(total: byAuthor.totals[count], articles: views(byAuthor.rows[page], viewer: viewer), json: json)
         case .favorited(let count, let page):
-            return .page(total: byFavorite.totals[count], articles: articles(byFavorite.rows[page], viewer: viewer))
-        case .feed(let count, let page): return .page(total: feed.totals[count], articles: articles(feed.rows[page], viewer: viewer))
+            return .page(total: byFavorite.totals[count], articles: views(byFavorite.rows[page], viewer: viewer), json: json)
+        case .feed(let count, let page):
+            return .page(total: feed.totals[count], articles: views(feed.rows[page], viewer: viewer), json: json)
         case .article(let k):
-            guard let ref = articleRefs[k] else { return .article(nil) }
-            return .article(articles([ref], viewer: viewer).first)
+            guard let ref = articleRefs[k], let splice = fullSplices[ref.id] else { return .article(nil, json: json) }
+            return .article(view(ref, splice, viewer: viewer), json: json)
         case .comments(let k):
-            guard let thread = threads[k] else { return .comments(nil) }
-            let sorted = thread.sorted {
-                $0.row.createdAt.micros != $1.row.createdAt.micros ? $0.row.createdAt.micros > $1.row.createdAt.micros : $0.row.id > $1.row.id
-            }
-            return .comments(sorted.map { comment in
-                var row = comment.row
-                row.author.following = follows.contains(Pair(viewer: viewer, target: comment.author))
-                return row
-            })
+            guard let thread = threadSplices[k] else { return .comments(nil, json: json) }
+            return .comments(thread.map { comment in
+                CommentView(splice: comment.splice, following: follows.contains(Pair(viewer: viewer, target: comment.author)))
+            }, json: json)
         case .profile(let k):
             guard let profile = profiles[k] else { return .profile(nil) }
             var row = profile.row
             row.following = follows.contains(Pair(viewer: viewer, target: profile.id))
             return .profile(row)
         case .user(let k): return .user(users[k])
-        case .tags: return .tags(tagNames)
+        case .tags: return .tags(tagsBody, json: json)
         }
     }
 
+    private func view(_ ref: ArticleRef, _ splice: ArticleSplice, viewer: Int64) -> ArticleView {
+        ArticleView(splice: splice,
+                    favorited: favorites.contains(Pair(viewer: viewer, target: ref.id)),
+                    following: follows.contains(Pair(viewer: viewer, target: ref.author)))
+    }
+
     /// A page's articles, newest first, with this viewer's flags.
-    private func articles(_ refs: [ArticleRef]?, viewer: Int64) -> [ArticleRow] {
-        guard let refs else { return [] }
-        return refs.sorted { $0.id > $1.id }.compactMap { ref in
-            guard var row = details[ref.id] else { return nil }
-            row.favorited = favorites.contains(Pair(viewer: viewer, target: ref.id))
-            row.author.following = follows.contains(Pair(viewer: viewer, target: ref.author))
-            return row
+    private func views(_ refs: [ArticleRef], viewer: Int64) -> [ArticleView] {
+        refs.sorted { $0.id > $1.id }.compactMap { ref in
+            listSplices[ref.id].map { view(ref, $0, viewer: viewer) }
         }
     }
 }

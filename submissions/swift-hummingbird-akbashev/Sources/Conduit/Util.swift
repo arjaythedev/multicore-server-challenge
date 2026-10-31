@@ -6,10 +6,12 @@ import Logging
 import NIOCore
 import PostgresNIO
 
+typealias Status = HTTPResponse.Status
+
 struct ApiError: Error {
-    let status: HTTPResponse.Status
+    let status: Status
     let message: String
-    init(_ status: HTTPResponse.Status, _ message: String) {
+    init(_ status: Status, _ message: String) {
         self.status = status
         self.message = message
     }
@@ -19,7 +21,7 @@ struct ApiError: Error {
 
 let jsonHeaders: HTTPFields = [.contentType: "application/json"]
 
-func errorResponse(_ status: HTTPResponse.Status, _ message: String) -> Response {
+func errorResponse(_ status: Status, _ message: String) -> Response {
     var out = JSONWriter(capacity: 64)
     out.raw("{\"errors\":{\"body\":[")
     out.string(message)
@@ -27,19 +29,23 @@ func errorResponse(_ status: HTTPResponse.Status, _ message: String) -> Response
     return out.response(status)
 }
 
-func emptyResponse(_ status: HTTPResponse.Status) -> Response {
+func emptyResponse(_ status: Status) -> Response {
     JSONWriter(capacity: 0).response(status)
 }
 
-// Run a handler, mapping ApiError to a JSON response and anything else to a 500.
+/// ApiError as its JSON response, anything else as a 500.
+func errorResponse(for error: any Error) -> Response {
+    if let e = error as? ApiError { return errorResponse(e.status, e.message) }
+    App.logger.error("internal error", metadata: ["error": "\(error)"])
+    return errorResponse(.internalServerError, "internal error")
+}
+
+/// Runs a handler; whatever it throws becomes its response.
 func handle(_ handler: () async throws -> Response) async -> Response {
     do {
         return try await handler()
-    } catch let e as ApiError {
-        return errorResponse(e.status, e.message)
     } catch {
-        App.logger.error("internal error", metadata: ["error": "\(error)"])
-        return errorResponse(.internalServerError, "internal error")
+        return errorResponse(for: error)
     }
 }
 
@@ -60,8 +66,21 @@ struct JSONWriter: ~Copyable {
         buffer = ByteBufferAllocator().buffer(capacity: capacity)
     }
 
-    consuming func response(_ status: HTTPResponse.Status) -> Response {
+    consuming func response(_ status: Status) -> Response {
         Response(status: status, headers: jsonHeaders, body: .init(byteBuffer: buffer))
+    }
+
+    /// The bytes written, for a batch's shared JSON (see `splice`).
+    consuming func finish() -> ByteBuffer {
+        buffer
+    }
+
+    /// Where the next byte goes, as an offset into the bytes written so far.
+    var position: Int { buffer.readableBytes }
+
+    /// Copies `range` (offsets as `position` gave them) of JSON written by another writer.
+    mutating func splice(_ json: borrowing ByteBuffer, _ range: Range<Int32>) {
+        buffer.writeBytes(json.readableBytesSpan.extracting(Int(range.lowerBound)..<Int(range.upperBound)))
     }
 
     /// JSON punctuation and keys, written verbatim.
@@ -93,7 +112,7 @@ struct JSONWriter: ~Copyable {
             digits[i] = 0x30 &+ UInt8(truncatingIfNeeded: x % 10)
             x /= 10
         } while x != 0
-        if v < 0 { buffer.writeInteger(UInt8(ascii: "-")) }
+        if v < 0 { raw("-") }
         buffer.writeBytes(digits.span.extracting(i..<20).bytes)
     }
 
@@ -117,31 +136,49 @@ struct JSONWriter: ~Copyable {
         buffer.writeBytes(out.span.bytes)
     }
 
-    /// A quoted JSON string. Runs of bytes that need no escaping are copied in one go.
+    /// A quoted JSON string. Its exact escaped length is counted first, so the buffer grows at most once and every
+    /// byte goes in with a plain store (`OutputRawSpan`) instead of a `ByteBuffer` write call of its own.
     private mutating func escaped(_ bytes: Span<UInt8>) {
-        buffer.writeInteger(UInt8(ascii: "\""))
-        var run = 0 // first byte not written yet
+        var length = bytes.count + 2
         for i in bytes.indices {
             let b = bytes[i]
-            guard b < 0x20 || b == 0x22 || b == 0x5C else { continue }
-            if run < i { buffer.writeBytes(bytes.extracting(run..<i).bytes) }
+            if b >= 0x20, b != 0x22, b != 0x5C { continue }
             switch b {
-            case 0x22: buffer.writeStaticString("\\\"")
-            case 0x5C: buffer.writeStaticString("\\\\")
-            case 0x08: buffer.writeStaticString("\\b")
-            case 0x0C: buffer.writeStaticString("\\f")
-            case 0x0A: buffer.writeStaticString("\\n")
-            case 0x0D: buffer.writeStaticString("\\r")
-            case 0x09: buffer.writeStaticString("\\t")
-            default:
-                buffer.writeStaticString("\\u00")
-                buffer.writeInteger(hexDigit(b >> 4))
-                buffer.writeInteger(hexDigit(b & 0xF))
+            case 0x22, 0x5C, 0x08, 0x0C, 0x0A, 0x0D, 0x09: length += 1 // \" \\ \b \f \n \r \t
+            default: length += 5 // \u00XX
             }
-            run = i + 1
         }
-        if run < bytes.count { buffer.writeBytes(bytes.extracting(run..<bytes.count).bytes) }
-        buffer.writeInteger(UInt8(ascii: "\""))
+        let plain = length == bytes.count + 2
+        buffer.writeWithOutputRawSpan(minimumWritableBytes: length) { out in
+            out.append(0x22)
+            if plain {
+                for i in bytes.indices { out.append(bytes[i]) }
+            } else {
+                for i in bytes.indices {
+                    let b = bytes[i]
+                    if b >= 0x20, b != 0x22, b != 0x5C {
+                        out.append(b)
+                        continue
+                    }
+                    out.append(0x5C)
+                    switch b {
+                    case 0x22, 0x5C: out.append(b)
+                    case 0x08: out.append(0x62) // b
+                    case 0x0C: out.append(0x66) // f
+                    case 0x0A: out.append(0x6E) // n
+                    case 0x0D: out.append(0x72) // r
+                    case 0x09: out.append(0x74) // t
+                    default:
+                        out.append(0x75) // u
+                        out.append(0x30)
+                        out.append(0x30)
+                        out.append(hexDigit(b >> 4))
+                        out.append(hexDigit(b & 0xF))
+                    }
+                }
+            }
+            out.append(0x22)
+        }
     }
 }
 
@@ -331,16 +368,16 @@ struct RowCursor {
 // ---------- query parameters ----------
 
 /// First-value-wins query parser over the raw query string (matches Go's URL.Query()[k][0]).
-/// Each lookup scans the query's UTF-8 in place; only the value it returns is decoded into a String.
+/// Each lookup scans the query's bytes in place, a slice of the request's; only the value it returns becomes a String.
 struct QueryParams {
-    private let query: String
+    private let query: ByteBuffer
 
-    init(_ query: String?) {
-        self.query = query ?? ""
+    init(_ query: ByteBuffer) {
+        self.query = query
     }
 
     func get(_ key: String) -> String? {
-        let bytes = query.utf8.span
+        let bytes = query.readableBytesUInt8Span
         var start = 0
         while start < bytes.count {
             var end = start
@@ -389,6 +426,31 @@ func percentDecode(_ bytes: Span<UInt8>) -> String {
     return String(decoding: out, as: UTF8.self)
 }
 
+/// A path segment, percent-decoded ('+' stays itself in a path); nil if an escape is malformed or the bytes are not
+/// UTF-8.
+func percentDecodePath(_ bytes: Span<UInt8>) -> String? {
+    var escaped = false
+    for i in bytes.indices where bytes[i] == 0x25 { escaped = true; break } // %
+    if !escaped {
+        guard let utf8 = try? UTF8Span(validating: bytes) else { return nil }
+        return String(copying: utf8)
+    }
+    var out = [UInt8]()
+    out.reserveCapacity(bytes.count)
+    var i = 0
+    while i < bytes.count {
+        if bytes[i] == 0x25 {
+            guard i + 2 < bytes.count, let hi = hexVal(bytes[i + 1]), let lo = hexVal(bytes[i + 2]) else { return nil }
+            out.append(hi << 4 | lo)
+            i += 3
+        } else {
+            out.append(bytes[i])
+            i += 1
+        }
+    }
+    return String(validating: out, as: UTF8.self)
+}
+
 private func hexVal(_ b: UInt8) -> UInt8? {
     switch b {
     case 0x30...0x39: return b - 0x30
@@ -396,6 +458,13 @@ private func hexVal(_ b: UInt8) -> UInt8? {
     case 0x61...0x66: return b - 0x61 + 10
     default: return nil
     }
+}
+
+func equals(_ bytes: Span<UInt8>, _ literal: StaticString) -> Bool {
+    guard bytes.count == literal.utf8CodeUnitCount else { return false }
+    let expected = literal.utf8Start
+    for i in bytes.indices where bytes[i] != expected[i] { return false }
+    return true
 }
 
 func bytesEqual(_ a: Span<UInt8>, _ b: Span<UInt8>) -> Bool {
@@ -444,9 +513,8 @@ func limitOffset(_ query: QueryParams) throws -> (Int64, Int64) {
 // ---------- request bodies ----------
 
 /// Parse the body as a JSON object and return the inner object under `key` (case-sensitive keys).
-func readWrapper(_ request: Request, _ key: String) async throws -> [String: Any] {
-    let buffer = try await request.body.collect(upTo: 1 << 20)
-    let data = Data(buffer.readableBytesView)
+func readWrapper(_ body: ByteBuffer, _ key: String) throws -> [String: Any] {
+    let data = Data(body.readableBytesView)
     let top: Any
     do {
         top = try JSONSerialization.jsonObject(with: data)

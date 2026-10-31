@@ -1,6 +1,4 @@
 // App state, the bcrypt executor and Postgres helpers.
-import HTTPTypes
-import HummingbirdBcrypt
 import Logging
 import NIOPosix
 import PostgresNIO
@@ -10,68 +8,27 @@ import Synchronization
 struct App: Sendable {
     let db: PostgresClient
     let signer: JWTSigner
-    let bcrypt: ThreadPoolExecutor
+    let bcrypt: BcryptWorkers
     /// Batched reads (Reads.swift); nil runs each read as its own statement (READ_BATCHING=0).
     let reads: ReadBatcher?
+    /// Group-committed writes (Writes.swift).
+    let writes: WriteBatcher
 
     /// For Hummingbird's per-request loggers and postgres-nio's per-query ones, which nothing here reads: both set
     /// metadata on every request or statement, and swift-log's StreamLogHandler re-renders its metadata string on each
-    /// set, logged or not (2 allocations per request, plus the formatting). Our own messages use `logger`.
-    static let quietLogger = Logger(label: "conduit.quiet", factory: { _ in SwiftLogNoOpLogHandler() })
-    static let queryLogger = quietLogger
+    /// set, logged or not. Our own messages use `logger`.
+    static let queryLogger = Logger(label: "conduit.quiet", factory: { _ in SwiftLogNoOpLogHandler() })
     static let logger = Logger(label: "conduit.app")
-
-    // bcrypt (cost 10) is deliberately CPU-bound, so it must never run on an event loop. The request's own task moves
-    // onto the bcrypt threads for the hash and comes back afterwards: the @concurrent function hops to the task's
-    // preferred executor on entry, which withTaskExecutorPreference has set to those threads. Past the executor's
-    // admission limit a login or sign-up is a 503 straight away, rather than a wait longer than any client will give it.
-
-    func bcryptHash(_ password: String) async throws -> String {
-        guard password.utf8.count <= 72 else { throw ApiError(.unprocessableContent, "password is too long") }
-        guard bcrypt.enter() else { throw ApiError(.serviceUnavailable, "server busy") }
-        defer { bcrypt.leave() }
-        return await withTaskExecutorPreference(bcrypt) { await App.hash(password) }
-    }
-
-    func bcryptVerify(_ password: String, hash: String) async throws -> Bool {
-        guard password.utf8.count <= 72 else { return false }
-        guard bcrypt.enter() else { throw ApiError(.serviceUnavailable, "server busy") }
-        defer { bcrypt.leave() }
-        return await withTaskExecutorPreference(bcrypt) { await App.verify(password, hash: hash) }
-    }
-
-    @concurrent private static func hash(_ password: String) async -> String {
-        Bcrypt.hash(password, cost: 10) // SPEC.md: cost 10 (HummingbirdBcrypt defaults to 12)
-    }
-
-    @concurrent private static func verify(_ password: String, hash: String) async -> Bool {
-        Bcrypt.verify(password, hash: hash)
-    }
 }
 
-/// A TaskExecutor on its own fixed-size thread pool. Its size caps how many cores a burst of logins can take from the
-/// event loops. `enter()` caps the work running or waiting at `limit`, so the queue can't grow without bound under
-/// overload. A Service, so the ServiceGroup stops its threads on shutdown.
-final class ThreadPoolExecutor: TaskExecutor, Service {
+/// A TaskExecutor on its own fixed-size thread pool, for the bcrypt workers: its size caps how many cores a burst of
+/// logins can take from the event loops.
+final class ThreadPoolExecutor: TaskExecutor {
     private let pool: NIOThreadPool
-    private let limit: Int
-    private let admitted = Atomic<Int>(0)
 
-    init(threads: Int, limit: Int) {
+    init(threads: Int) {
         pool = NIOThreadPool(numberOfThreads: threads)
-        self.limit = limit
         pool.start()
-    }
-
-    /// Admits one more piece of work unless `limit` are already running or waiting; each `true` needs a `leave()`.
-    func enter() -> Bool {
-        if admitted.wrappingAdd(1, ordering: .relaxed).newValue <= limit { return true }
-        admitted.wrappingSubtract(1, ordering: .relaxed)
-        return false
-    }
-
-    func leave() {
-        admitted.wrappingSubtract(1, ordering: .relaxed)
     }
 
     func enqueue(_ job: consuming ExecutorJob) {
@@ -81,8 +38,7 @@ final class ThreadPoolExecutor: TaskExecutor, Service {
         pool.submit { _ in job.runSynchronously(on: self.asUnownedTaskExecutor()) }
     }
 
-    func run() async throws {
-        try? await gracefulShutdown()
+    func shutdown() async throws {
         try await pool.shutdownGracefully()
     }
 }

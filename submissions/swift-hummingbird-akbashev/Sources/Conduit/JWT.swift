@@ -2,7 +2,6 @@
 import Crypto
 import Foundation
 import HTTPTypes
-import Hummingbird
 
 /// How long an issued token is valid (SPEC.md: exp = iat + 30 days). iat and exp are wall-clock Unix seconds, so they
 /// come from Date: ContinuousClock and SuspendingClock are monotonic, with no fixed epoch.
@@ -87,8 +86,7 @@ struct JWTSigner: @unchecked Sendable {
 
     /// Verify an HS256 JWT: signature (constant-time), alg, exp and a positive numeric sub.
     /// Returns the user id, or nil if the token is invalid.
-    func verify(_ token: Substring) -> Int64? {
-        let bytes = token.utf8.span
+    func verify(_ bytes: Span<UInt8>) -> Int64? {
         var dot1 = -1
         var dot2 = -1
         for i in bytes.indices where bytes[i] == 0x2E { // .
@@ -114,7 +112,7 @@ struct JWTSigner: @unchecked Sendable {
             case .reject: return nil
             }
         }
-        return fullClaims(token)
+        return fullClaims(bytes.withUnsafeBufferPointer { String(decoding: $0, as: UTF8.self) })
     }
 
     private enum Verdict { case user(Int64), reject }
@@ -198,7 +196,7 @@ struct JWTSigner: @unchecked Sendable {
     }
 
     /// Any other well-signed token: alg, exp (number or numeric string) and sub, through JSONSerialization.
-    private func fullClaims(_ token: Substring) -> Int64? {
+    private func fullClaims(_ token: String) -> Int64? {
         let parts = token.split(separator: ".", omittingEmptySubsequences: false)
         guard let headerBytes = b64urlDecode(String(parts[0])) else { return nil }
         guard let payloadBytes = b64urlDecode(String(parts[1])) else { return nil }
@@ -230,25 +228,29 @@ struct JWTSigner: @unchecked Sendable {
     }
 }
 
-/// The Authorization header: absent -> anonymous; present but invalid -> 401 (SPEC.md "Authentication").
-struct Auth {
-    var viewer: Int64 = 0
-    /// The token as presented, still inside the header's String (echoed back by GET and PUT /api/user).
-    var token: Substring = ""
-
-    /// Viewer for an auth-optional endpoint: absent is anonymous (viewer 0), present but invalid is a 401.
-    static func optional(_ request: Request, _ signer: JWTSigner) throws -> Auth {
-        guard let header = request.headers[.authorization], !header.isEmpty else { return Auth() }
-        guard header.hasPrefix("Token ") else { throw ApiError(.unauthorized, "unauthorized") }
-        let token = header.dropFirst(6)
-        guard let id = signer.verify(token) else { throw ApiError(.unauthorized, "unauthorized") }
-        return Auth(viewer: id, token: token)
+/// The Authorization header: absent -> anonymous; present but invalid -> 401 (SPEC.md "Authentication"). Checked from
+/// the header's bytes in the request as received.
+enum Auth {
+    /// The viewer of an auth-optional endpoint: no header (or an empty one) is anonymous, viewer 0.
+    static func optional(_ header: Span<UInt8>, _ signer: JWTSigner) throws -> Int64 {
+        if header.isEmpty { return 0 }
+        guard header.count > 6, equals(header.extracting(0..<6), "Token "),
+              let id = signer.verify(header.extracting(6..<header.count)) else {
+            throw ApiError(.unauthorized, "unauthorized")
+        }
+        return id
     }
 
-    /// Viewer for an auth-required endpoint: absent or invalid is a 401.
-    static func require(_ request: Request, _ signer: JWTSigner) throws -> Auth {
-        let auth = try optional(request, signer)
-        guard auth.viewer != 0 else { throw ApiError(.unauthorized, "unauthorized") }
-        return auth
+    /// The viewer of an auth-required endpoint.
+    static func require(_ header: Span<UInt8>, _ signer: JWTSigner) throws -> Int64 {
+        let viewer = try optional(header, signer)
+        guard viewer != 0 else { throw ApiError(.unauthorized, "unauthorized") }
+        return viewer
+    }
+
+    /// The viewer and the token as presented, for the endpoints that echo it back (GET and PUT /api/user).
+    static func requireWithToken(_ header: Span<UInt8>, _ signer: JWTSigner) throws -> (Int64, String) {
+        let viewer = try require(header, signer)
+        return (viewer, header.extracting(6..<header.count).withUnsafeBufferPointer { String(decoding: $0, as: UTF8.self) })
     }
 }
