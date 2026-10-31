@@ -118,8 +118,10 @@ build the user responses, and they are the contract `scripts/diffsql.py` checks 
   it its queries over a Unix socketpair made before the fork: one frame per loop pass, `marshal`-encoded. The broker
   queues reads by statement; when a read connection has nothing in flight, it takes the queue whose oldest request is
   oldest and runs it as one unit (see Data layer). At 20,000 test users this held 25.5k req/s at p95 121 ms, where the
-  per-worker connections (`BROKER=0`) failed at 18.6k req/s with p95 1.3 s. The IPC costs the workers and the broker
-  about 35k ns of app CPU per request; the broker itself used about a quarter of a core at 24,000 test users.
+  per-worker connections (`BROKER=0`) failed at 18.6k req/s with p95 1.3 s. At capacity (46,000 test users, ~55k req/s on
+  a fresh seed copy) each message carries about 11 requests, and the worker side of the IPC costs about 0.8 µs per
+  request (measured against a stub broker: 5.9 µs per request one at a time, 0.55 µs twenty at a time). The broker's
+  event loop uses about half a core there, its two bcrypt threads about one core, each worker about 0.4 of a core.
 
 - **Transport** (per worker): one epoll loop thread does non-blocking accept/recv/send and HTTP/1.1 framing, and runs
   each request's handler inline. A worker is a single thread, so nothing contends for its GIL. (A thread pool per
@@ -249,7 +251,8 @@ there against 100–126 on fresh copies. Load spread over 3 loopback IPs, `STAGE
 At 50,000 test users the laptop is at its edge (all 10 CPUs busy, the load generator included), so pass or fail
 there is close to a coin flip; CPU per request is the steadier measure. At about 52k req/s a request costs about
 70 µs of app CPU and 105 µs of Postgres CPU, all of it in the client backends (each of the 8 readers about 0.6 of a
-core).
+core). bcrypt for logins is the largest single app cost, about 28% of app CPU (cost 10 is fixed by the rules; 6
+lanes measured best); the rest is spread over socket I/O, the event loop and the handlers, a few µs each.
 
 Per request at 8,000 test users (`cpusplit.sh`, two runs each): app + Postgres CPU went from 477–509k ns
 (`BROKER=0`) to 389–407k with the broker on 2 read connections. At saturation (24,000 test users) Postgres used
