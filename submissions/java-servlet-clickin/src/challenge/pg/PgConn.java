@@ -598,7 +598,9 @@ public final class PgConn {
     private void ready(byte status) {
         if (phase == 0) {
             phase = 1;
-            simple("SET jit = off; SET max_parallel_workers_per_gather = 0");
+            // force_generic_plan: in auto mode the batched statements' generic cost estimate loses to the custom plans,
+            // so Postgres re-planned them on every execution (~0.3 ms each) for plans that run no faster
+            simple("SET jit = off; SET max_parallel_workers_per_gather = 0; SET plan_cache_mode = force_generic_plan");
         } else if (phase == 1) {
             phase = 2;
             for (int i = 0; i < statements.size(); i++) {
