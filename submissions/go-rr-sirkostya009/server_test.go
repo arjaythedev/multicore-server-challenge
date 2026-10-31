@@ -197,3 +197,12 @@ func TestBadRequestDoesNotLeakClose(t *testing.T) {
 		expect(t, br, 204, "")
 	}
 }
+
+func TestChunkedLengthRequired(t *testing.T) {
+	c, br := dial(t)
+	write(t, c, "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
+	expect(t, br, 411, "")
+	if _, err := br.ReadByte(); err != io.EOF {
+		t.Fatalf("got %v, want EOF", err)
+	}
+}

@@ -247,8 +247,7 @@ func (c *conn) dispatch(data []byte, l *loop) {
 			c.pending = append(c.pending[:0], data...)
 			return
 		}
-		c.writeRaw(resp400)
-		c.shutdown()
+		c.reject(err)
 		return
 	}
 	if l != nil {
@@ -327,8 +326,7 @@ func (c *conn) serve(req *request) {
 		}
 		if err != nil {
 			c.busy = false
-			c.writeRaw(resp400)
-			c.shutdown()
+			c.reject(err)
 			c.mu.Unlock()
 			reqPool.Put(req)
 			return
@@ -387,8 +385,14 @@ func writev(fd int, h, b []byte) (int, error) {
 	return int(n), nil
 }
 
-func (c *conn) writeRaw(b []byte) {
-	_, _ = unix.Write(c.fd, b)
+// reject answers a request that cannot be served and closes the conn. Callers hold c.mu.
+func (c *conn) reject(err error) {
+	resp := resp400
+	if err == errLengthRequired {
+		resp = resp411
+	}
+	_, _ = unix.Write(c.fd, resp)
+	c.shutdown()
 }
 
 func (c *conn) flush() {
@@ -458,11 +462,13 @@ func (c *conn) endBody() {
 }
 
 var (
-	errIncomplete = errors.New("incomplete request")
-	errBadRequest = errors.New("bad request")
-	errWritten    = errors.New("response already written")
-	errClosed     = errors.New("connection closed")
-	resp400       = []byte("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+	errIncomplete     = errors.New("incomplete request")
+	errBadRequest     = errors.New("bad request")
+	errLengthRequired = errors.New("length required")
+	errWritten        = errors.New("response already written")
+	errClosed         = errors.New("connection closed")
+	resp400           = []byte("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+	resp411           = []byte("HTTP/1.1 411 Length Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
 )
 
 type request struct {
@@ -554,7 +560,7 @@ func (r *request) parse(data []byte, inPlace bool) (int, error) {
 			}
 		case 17:
 			if asciiEqualFold(name, "transfer-encoding") {
-				return 0, errBadRequest
+				return 0, errLengthRequired
 			}
 		}
 	}
