@@ -307,12 +307,13 @@ pub var done_efd: i32 = -1;
 pub fn prepare(kernel: []const u8) void {
     if (prepared) return;
     var failure: bc.Failure = .{};
+    const shrx = std.mem.eql(u8, kernel, "shrx");
     const pin = if (std.mem.indexOfScalar(u8, kernel, ':')) |colon| pinned(kernel[0..colon], kernel[colon + 1 ..]) else null;
-    if (pin == null and kernel.len > 0 and !std.mem.eql(u8, kernel, "shrx")) {
+    if (pin == null and kernel.len > 0 and !shrx) {
         std.debug.print("conduit: ZIG_BCRYPT_KERNEL '{s}' is not shrx or <variant>:<lanes>\n", .{kernel});
         linux.exit_group(1);
     }
-    const chosen = if (pin) |p| bc.initPinned(p.v, p.n, 8, &failure) else bc.init(kernel.len > 0, 8, &failure);
+    const chosen = if (pin) |p| bc.initPinned(p.v, p.n, 8, &failure) else bc.init(shrx, 8, &failure);
     engine = chosen catch |e| {
         std.debug.print("conduit: bcrypt self-test failed: {s} ({s} width {d} case {d})\n", .{
             @errorName(e), failure.variant, failure.width, failure.case,
