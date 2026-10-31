@@ -44,13 +44,28 @@ class ArticleData:
 
 
 @dataclass(frozen=True)
+class ArticleListData:
+    """A list entry: an article without its body."""
+
+    slug: str
+    title: str
+    description: str
+    tagList: List[str]
+    createdAt: str
+    updatedAt: str
+    favorited: bool
+    favoritesCount: int
+    author: ProfileData
+
+
+@dataclass(frozen=True)
 class SingleArticleResponse:
     article: ArticleData
 
 
 @dataclass(frozen=True)
 class ArticlesResponse:
-    articles: List[ArticleData]
+    articles: list  # ArticleListData (or dicts without "body")
     articlesCount: int
 
 

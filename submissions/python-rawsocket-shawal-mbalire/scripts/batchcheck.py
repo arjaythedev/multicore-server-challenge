@@ -39,6 +39,9 @@ def main():
     slugs += [s for (s,) in conn.execute(
         "SELECT a.slug FROM articles a JOIN comments c ON c.article_id = a.id GROUP BY a.slug HAVING count(*) > 20 LIMIT 50")]
     slugs += ["no-such-slug", 'odd"slug\\x', "ünïcode-slug"]
+    tags = [t for (t,) in conn.execute("SELECT name FROM tags")] + ["no-such-tag"]
+    favers = [n for (n,) in conn.execute("SELECT u.username FROM users u WHERE u.id IN"
+                                         " (SELECT user_id FROM favorites ORDER BY user_id DESC LIMIT 2000) LIMIT 40")]
 
     def single(stmt, args):
         res = pg.exec_prepared(stmt.name, r._params(args), None, 1)
@@ -58,12 +61,18 @@ def main():
                                     0 if rnd.random() < 0.5 else 10 * rnd.randint(1, 4)),
         r._LIST_AUTHOR_JSON: lambda: (rnd.choice(viewers), rnd.choice(names), rnd.choice([10, 10, 5, 20]),
                                       0 if rnd.random() < 0.5 else 10 * rnd.randint(1, 4)),
+        r._LIST_TAG_JSON: lambda: (rnd.choice(viewers), rnd.choice(tags), rnd.choice([10, 10, 5, 20]),
+                                   0 if rnd.random() < 0.5 else 10 * rnd.randint(1, 4)),
+        r._LIST_FAVORITED_JSON: lambda: (rnd.choice(viewers), rnd.choice(names + favers), rnd.choice([10, 10, 5, 20]),
+                                         0 if rnd.random() < 0.5 else 10 * rnd.randint(1, 4)),
         r._ARTICLE_BY_SLUG_JSON: lambda: (rnd.choice(viewers), rnd.choice(slugs)),
         r._COMMENTS_BY_SLUG_JSON: lambda: (rnd.choice(viewers), rnd.choice(slugs)),
     }
     total = bad = 0
     for stmt, gen in gens.items():
-        spec = r.BATCHED[stmt.index]
+        spec = r.BATCHED.get(stmt.index)
+        if spec is None:  # not batched in this configuration (BATCH_KEYED)
+            continue
         for size in (1, 2, 3, 8, 32, 100):
             for _ in range(6):
                 argss = [gen() for _ in range(size)]
