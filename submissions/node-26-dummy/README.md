@@ -3,9 +3,10 @@
 Front: direct
 
 All 19 Conduit API operations implemented with `node:http`, parameterized SQL,
-and strict TypeScript. Four application source files: all handlers and queries
+and strict TypeScript. Five application source files: all handlers and queries
 in `src/handlers.ts`, shared helpers in `src/utils.ts`, routing/lifecycle in
-`src/server.ts`, and worker supervision in `src/cluster.ts`.
+`src/server.ts`, worker supervision in `src/cluster.ts`, and opt-in pool
+instrumentation/output in `src/pool-diagnostics.ts`.
 
 Runtime: Node 26; compiler: TypeScript 7.0.2. Dependencies are pinned:
 `pg` 8.23.1, `bcrypt` 6.0.0, and `jose` 6.2.14. No ORM or HTTP framework.
@@ -132,18 +133,117 @@ Reproduce the read-only equivalence/plan checks from this submission directory:
 
 ```bash
 npm run build
-TEST_SQL_DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit_lg node test-sql.mjs
+TEST_SQL_DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit_lg \
+TEST_SQL_ALLOW_MISSING_FIXTURE=1 TEST_SQL_EXPECT_TAG_INDEX=1 node test-sql.mjs
 ```
 
-The check compares actual handler SQL against the previous query shapes: 30
+The check now compares actual handler SQL against previous query shapes: 80
 page/count pairs covering all filters, anonymous/authenticated viewers, offsets,
 missing filters and filter precedence. It also checks the maximum feed offset,
 single-query current-user lookup, and unknown-user 401. It uses one connection,
 a read-only transaction, and a 10-second per-statement timeout. The database must
-contain the standard seed fixtures. Results and SQL parameters are not logged.
+contain the standard seed fixtures. It now runs EXPLAIN ANALYZE for selected
+queries. No-tag fixtures must be supplied in an isolated clone; the opt-in
+ALLOW_MISSING_FIXTURE skips absent fixtures on a read-only working database.
+EXPECT_TAG_INDEX asserts the actual index choice on the tuned full database.
+Results and SQL parameters are not logged.
 
 Remaining hypothesis: excess scanning/index probes contribute to PostgreSQL CPU
 saturation. Their contribution and the resulting RPS/p95 change still need an
 identical-workload before/after benchmark or SQL profiling under load. A larger
 pool is not justified by the available measurements. Rebuild and restart the
 application to use these changes; an already running server is not updated.
+
+## Page enrichment and pool diagnostics (2026-11-01)
+
+The global unfiltered list now selects article rows with LIMIT/OFFSET before
+enrichment, without an extra article PK lookup. Tag names use scalar lookups by
+tag ID in the shared article projection. PostgreSQL still chooses the physical
+access path: the tuned full database uses `tags_pkey`, while default costs on the
+small dev seed can prefer a sequential scan. Filtered page selection, LATERAL,
+favorites counts and capped counts retain their existing semantics.
+
+`BENCH_DIAGNOSTICS=1` installs diagnostics on the existing pool in each worker.
+Unset/0 does not import the diagnostics module and installs no diagnostic
+wrappers, timers or event listeners. The pool's
+max, idle timeout, release behavior and transaction handling are unchanged.
+
+From this submission directory, after building, start in the foreground:
+
+```bash
+bash observability/ctl.sh run pool pool-001
+bash observability/ctl.sh run trace5 trace-pool-001 --pool
+```
+
+Run one command at a time on a free configured port. `pool` preserves SQL
+profiling settings and disables OTel/V8 profiling. `trace5 --pool` retains the
+existing trace5 behavior, including its SQL-profiling configuration step.
+Other modes explicitly set diagnostics to 0 unless `--pool` is passed. The
+effective setting is recorded as `pool_diagnostics` in the run manifest.
+`pg_stat_statements_track` records the actual `SHOW pg_stat_statements.track`
+result, including in `pool` mode: this read does not change PostgreSQL settings.
+Configuration stays in `observability/modes.env` and `runtime.env`.
+
+Each worker writes one `pool_diagnostics` JSON line every 10 seconds to stdout,
+plus a final partial interval on graceful shutdown. `run_id` matches OTel
+`benchmark.run_id`; `pid` matches `process.pid`; hostname and UTC interval bounds
+allow correlation with Tempo. `worker_id` and `sequence` distinguish processes
+and consecutive intervals. Primary does not create a pool or emit pool metrics.
+
+The controller also saves JSON lines under
+`observability/runs/<RUN_ID>/pool/worker-<worker_id>-<pid>.jsonl`.
+Each worker keeps the current file and one `.1` backup, each at most 10 MiB
+(at most 120 MiB for a normal six-worker run). Rotation preserves whole records
+and overwrites the oldest backup. Files are created with mode 0600. Set
+`BENCH_DIAGNOSTICS_MAX_BYTES` in `observability/modes.env` to override the
+per-file limit (4096–67108864 bytes); the manifest records this limit and path.
+Direct launches can opt into file output via `BENCH_DIAGNOSTICS_DIR`.
+
+Stdout and file output have independent queues capped at 64 KiB each per worker.
+Stdout respects both write callbacks and backpressure (`drain`); a blocked pipe
+does not block file logging. Overflow drops records, prioritizing the final
+record over queued older records. `output.stdout` and `output.file` report
+cumulative `pending_bytes`, `dropped`, and `errors` as observed before emitting
+the current record. File failures disable that sink and are reported at shutdown;
+they do not interrupt API requests. Disk writes add overhead only when enabled.
+
+Histogram buckets are **non-cumulative**, with inclusive upper bounds in
+`histogram_upper_bounds_ms`; the last bucket is overflow. Every histogram has
+`count`, `sum_ms`, `max_ms` and `buckets`. Acquisitions are assigned to the interval
+in which they finish. `all` includes failures; `new`, `reused`, `unknown` and
+`failed` partition it. `new` means the first successful acquisition of a client
+observed through the pool's physical `connect` event, not an increase in size.
+Connection ages start at successful connection establishment.
+
+Acquisition duration includes connection creation, scheduling and possible
+queueing. It is **not pure queue wait**. `waitingCount` can briefly be nonzero
+even with an idle connection because pg-pool schedules delivery on nextTick.
+Gauge maxima are observations at events/acquisitions and one-second samples,
+not guaranteed exact peaks. Histogram quantiles have bucket resolution.
+
+Diagnostics do not create spans or log requests, SQL, parameters or credentials.
+The wrapper delegates to the existing connect method, including OTel's wrapper,
+and forwards the original client/release. Shutdown waits for asynchronous
+`remove` events after `pool.end()`, then gives output queues up to 1500 ms to
+flush. Files close independently of blocked stdout. The deadline prevents a
+blocked consumer from hanging graceful shutdown; pending records can be lost
+on timeout or sink failure. SIGKILL or the existing forced-shutdown deadline
+can also prevent the final record. This is bounded diagnostic logging, not a
+durable audit log (no fsync guarantee).
+
+Validation scripts (use your isolated PostgreSQL instance/clone):
+
+```bash
+TEST_DATABASE_URL=postgres://postgres@127.0.0.1:55432/postgres node test-pool.mjs
+node observability/test-ctl.mjs
+node observability/test-output.mjs
+TEST_DATABASE_URL=postgres://conduit:conduit@127.0.0.1:55432/node26_diag_checks node observability/verify.mjs otel
+TEST_DATABASE_URL=postgres://conduit:conduit@127.0.0.1:55432/node26_diag_checks node observability/verify.mjs overhead
+```
+
+The OTel check uses a private local OTLP HTTP/JSON receiver with the same ESM
+auto-instrumentation hooks. The overhead check uses six workers, 30s warmup and
+60s measured at 100 RPS per run, tracing disabled, three alternating OFF/ON
+pairs. It logs Node CPU ticks (Linux `getconf CLK_TCK`), latency, errors, stdout
+bytes, and scheduler lateness. It is a local read-only diagnostic workload, not
+the official 10k-VU benchmark. See [validation results](observability/VALIDATION.md).

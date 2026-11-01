@@ -5,8 +5,15 @@ assert(process.env.TEST_SQL_DATABASE_URL, 'Set TEST_SQL_DATABASE_URL explicitly'
 process.env.DATABASE_URL = process.env.TEST_SQL_DATABASE_URL;
 process.env.JWT_SECRET = 'sql-regression-test-only';
 process.env.PG_POOL_SIZE = '1';
-const { pool, issueToken } = await import('./dist/utils.js');
-const { listArticles, getArticleFeed, getCurrentUser } = await import('./dist/handlers.js');
+const { pool, issueToken, finishPoolDiagnostics } = await import('./dist/utils.js');
+const { listArticles, getArticleFeed, getCurrentUser, getArticle } = await import('./dist/handlers.js');
+const oldSelect = `SELECT a.id,a.slug,a.title,a.description,a.created_at,a.updated_at,
+ ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id=at.tag_id WHERE at.article_id=a.id ORDER BY t.name) tag_list,
+ (SELECT count(*) FROM favorites f WHERE f.article_id=a.id) favorites_count,
+ EXISTS(SELECT 1 FROM favorites f WHERE f.article_id=a.id AND f.user_id=$1) favorited,
+ u.username,u.bio,u.image,
+ EXISTS(SELECT 1 FROM follows f WHERE f.follower_id=$1 AND f.followee_id=a.author_id) following
+ FROM articles a JOIN users u ON u.id=a.author_id`;
 const client = await pool.connect();
 const originalQuery = pool.query;
 let captured = [];
@@ -16,7 +23,7 @@ pool.query = async (sql, values) => {
   captured.push({ sql, values, rows: result.rows });
   return result;
 };
-async function call(handler, query, viewer) {
+async function call(handler, query, viewer, params = {}) {
   captured = [];
   let body;
   const response = {
@@ -24,7 +31,7 @@ async function call(handler, query, viewer) {
     end(value) { body = JSON.parse(value); },
   };
   const headers = viewer === '0' ? {} : { authorization: `Token ${await issueToken(viewer)}` };
-  await handler({ request: { headers }, response, url: new URL(`http://localhost/api/articles?${query}`), params: {} });
+  await handler({ request: { headers }, response, url: new URL(`http://localhost/api/articles?${query}`), params });
   return body;
 }
 function baseline(query, viewer, feed, select) {
@@ -49,15 +56,21 @@ function baseline(query, viewer, feed, select) {
   ];
 }
 async function explain(statement) {
-  const result = await client.query(`EXPLAIN (FORMAT JSON) ${statement.sql}`, statement.values);
-  const plan = result.rows[0]['QUERY PLAN'][0].Plan;
+  const result = await client.query(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${statement.sql}`, statement.values);
+  const explained = result.rows[0]['QUERY PLAN'][0];
+  const plan = explained.Plan;
   const indexes = new Set();
+  const enrichment = [];
   const walk = node => {
     if (node['Index Name']) indexes.add(node['Index Name']);
+    if (node['Parent Relationship'] === 'SubPlan') enrichment.push({ node: node['Node Type'],
+      relation: node['Relation Name'], loops: node['Actual Loops'], rows: node['Actual Rows'],
+      heap_fetches: node['Heap Fetches'] });
     for (const child of node.Plans ?? []) walk(child);
   };
   walk(plan);
-  return { estimatedCost: plan['Total Cost'], indexes: [...indexes] };
+  return { estimatedCost: plan['Total Cost'], execution_ms: explained['Execution Time'],
+    shared_hits: plan['Shared Hit Blocks'], indexes: [...indexes], enrichment };
 }
 try {
   await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
@@ -77,28 +90,52 @@ try {
   ];
   let checks = 0;
   for (const [name, filter] of filters) {
-    for (const [limit, offset, viewer] of [[20, 0, '100'], [5, 5, '0'], [100, 1000, '100']]) {
+    for (const [limit, offset, viewer] of [0, 10, 20, 40].flatMap(offset => ['0', '100'].map(viewer => [10, offset, viewer]))) {
       const feed = name === 'feed';
       const actualViewer = feed ? '100' : viewer;
       const query = `${filter}&limit=${limit}&offset=${offset}`;
       const body = await call(feed ? getArticleFeed : listArticles, query, actualViewer);
       const statements = captured.slice(-2);
-      const select = statements[0].sql.slice(0, statements[0].sql.lastIndexOf('FROM articles a JOIN users u ON u.id=a.author_id')
-        + 'FROM articles a JOIN users u ON u.id=a.author_id'.length);
-      const old = baseline(query, actualViewer, feed, select);
+      const old = baseline(query, actualViewer, feed, oldSelect);
       for (let i = 0; i < 2; i++) {
         const expected = await client.query(old[i].sql, old[i].values);
         assert.deepEqual(statements[i].rows, expected.rows, `${name}: statement ${i}, offset ${offset}`);
       }
       assert(body.articlesCount <= 1000);
       assert(body.articles.every(article => !Object.hasOwn(article, 'body')));
-      if (offset === 0 && ['all', 'tag', 'author', 'favorited', 'feed'].includes(name)) {
-        for (let i = 0; i < 2; i++) console.log(JSON.stringify({ filter: name, statement: i === 0 ? 'page' : 'count',
-          before: await explain(old[i]), after: await explain(statements[i]) }));
+      if (name === 'all' && viewer === '100' && (offset === 0 || offset === 40)) {
+        const before = await explain(old[0]), after = await explain(statements[0]);
+        if (process.env.TEST_SQL_EXPECT_TAG_INDEX === '1') assert(after.indexes.includes('tags_pkey'));
+        assert.equal(after.enrichment.find(n => n.node === 'Aggregate').loops, 10);
+        assert.equal(before.enrichment.find(n => n.node === 'Aggregate').loops, 10 + offset);
+        console.log(JSON.stringify({ filter: name, offset, before, after }));
       }
       checks++;
     }
   }
+  // Explicit full-article fixtures: no tags and multiple tags, both viewers.
+  for (const multi of [false, true]) {
+    const fixture = (await client.query(`SELECT a.slug FROM articles a WHERE
+      (SELECT count(*) FROM article_tags at WHERE at.article_id=a.id) ${multi ? '>=2' : '=0'} LIMIT 1`)).rows[0];
+    if (!fixture && process.env.TEST_SQL_ALLOW_MISSING_FIXTURE === '1') {
+      console.log(`SKIP full-database fixture: ${multi ? 'multiple tags' : 'no tags'}; verify on an isolated clone`);
+      continue;
+    }
+    assert(fixture, 'Provide a tagless article in an isolated test clone');
+    for (const viewer of ['0', '100']) {
+      const body = await call(getArticle, '', viewer, { slug: fixture.slug });
+      const actual = captured.at(-1);
+      const fullOld = oldSelect.replace('a.description,', 'a.description,a.body,');
+      assert.deepEqual(actual.rows, (await client.query(fullOld + ' WHERE a.slug=$2', [viewer, fixture.slug])).rows);
+      assert(multi ? body.article.tagList.length >= 2 : body.article.tagList.length === 0);
+    }
+  }
+  await call(getArticleFeed, 'limit=20', '629');
+  const feed = captured.at(-2);
+  const oldFeedSql = feed.sql.replace(/ARRAY\(SELECT \(SELECT t.name[\s\S]*?ORDER BY name\) tag_list/,
+    'ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id=at.tag_id WHERE at.article_id=a.id ORDER BY t.name) tag_list');
+  assert.deepEqual(feed.rows, (await client.query(oldFeedSql, feed.values)).rows);
+  console.log(JSON.stringify({ filter: 'feed-629', before: await explain({ sql: oldFeedSql, values: feed.values }), after: await explain(feed) }));
   const boundary = await call(getArticleFeed, 'limit=100&offset=2147483647', '100');
   assert.deepEqual(boundary.articles, []);
   await call(getCurrentUser, '', '100');
@@ -110,4 +147,5 @@ try {
   await client.query('ROLLBACK');
   client.release();
   await pool.end();
+  await finishPoolDiagnostics?.();
 }

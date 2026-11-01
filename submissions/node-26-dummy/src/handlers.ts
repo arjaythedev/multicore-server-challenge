@@ -24,14 +24,15 @@ const comment = (row: CommentRow) => ({ id: safeInteger(row.id), body: row.body,
   createdAt: row.created_at.toISOString(), updatedAt: row.updated_at.toISOString(), author: profile(row) });
 
 // $1 is always the viewer, including anonymous viewer 0.
-const articleSelect = (full: boolean): string => `SELECT a.id,a.slug,a.title,a.description,${full ? 'a.body,' : ''}
+const articleSelect = (full: boolean, source = 'articles'): string => `SELECT a.id,a.slug,a.title,a.description,${full ? 'a.body,' : ''}
   a.created_at,a.updated_at,
-  ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id=at.tag_id WHERE at.article_id=a.id ORDER BY t.name) tag_list,
+  ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id=at.tag_id) AS name
+    FROM article_tags at WHERE at.article_id=a.id ORDER BY name) tag_list,
   (SELECT count(*) FROM favorites f WHERE f.article_id=a.id) favorites_count,
   EXISTS(SELECT 1 FROM favorites f WHERE f.article_id=a.id AND f.user_id=$1) favorited,
   u.username,u.bio,u.image,
   EXISTS(SELECT 1 FROM follows f WHERE f.follower_id=$1 AND f.followee_id=a.author_id) following
-  FROM articles a JOIN users u ON u.id=a.author_id`;
+  FROM ${source} a JOIN users u ON u.id=a.author_id`;
 const slugify = (expression: string): string => `trim(both '-' from lower(regexp_replace(${expression}, '[^A-Za-z0-9]+', '-', 'g')))`;
 async function articleById(id: string, viewer: string): Promise<ArticleResponse> {
   const result = await pool.query<ArticleRow>(`${articleSelect(true)} WHERE a.id=$2`, [viewer, id]);
@@ -114,8 +115,8 @@ async function list(context: RequestContext, feed: boolean): Promise<void> {
     where = 'f.user_id=(SELECT id FROM users WHERE username=$4)';
     values.push(favorited); countValues = [favorited];
   }
-  // Page link-table/feed IDs before enrichment. Global/author lists already
-  // walk the article indexes directly, avoiding a redundant PK lookup.
+  // Page link-table/feed IDs before enrichment. The global list pages article
+  // rows directly so skipped rows need neither enrichment nor another PK lookup.
   // Link-table PKs and FKs make counts equivalent without joining articles.
   const page = feed
     ? `SELECT x.id FROM follows fo CROSS JOIN LATERAL
@@ -125,7 +126,10 @@ async function list(context: RequestContext, feed: boolean): Promise<void> {
     : `SELECT ${pageId} FROM ${source} WHERE ${where} ORDER BY ${pageId} DESC LIMIT $2 OFFSET $3`;
   const pageSql = feed || source !== 'articles a'
     ? `${articleSelect(false)} WHERE a.id IN (${page}) ORDER BY a.id DESC`
-    : `${articleSelect(false)} WHERE ${where} ORDER BY a.id DESC LIMIT $2 OFFSET $3`;
+    : where === 'TRUE'
+      ? `${articleSelect(false, `(SELECT id,slug,title,description,author_id,created_at,updated_at
+          FROM articles ORDER BY id DESC LIMIT $2 OFFSET $3)`)} ORDER BY a.id DESC`
+      : `${articleSelect(false)} WHERE ${where} ORDER BY a.id DESC LIMIT $2 OFFSET $3`;
   const rows = (await pool.query<ArticleRow>(pageSql, values)).rows;
   const countWhere = where.replaceAll('$4', '$1');
   const count = first((await pool.query<{ count: string }>(`SELECT count(*) FROM

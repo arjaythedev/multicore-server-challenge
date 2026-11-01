@@ -22,11 +22,15 @@ Usage:
   ./ctl.sh sql on|off|detailed|status
 
   ./ctl.sh run baseline RUN_ID
+  ./ctl.sh run pool RUN_ID
   ./ctl.sh run sql RUN_ID
   ./ctl.sh run trace5 RUN_ID
   ./ctl.sh run trace100 RUN_ID
   ./ctl.sh run cpu RUN_ID
   ./ctl.sh run deep RUN_ID
+
+  Append --pool to any run mode to enable pool diagnostics.
+  The pool mode preserves PostgreSQL SQL-profiling settings.
 
   ./ctl.sh begin RUN_ID
   ./ctl.sh end RUN_ID
@@ -105,10 +109,22 @@ run_app() {
   local tracing="off"
   local cpu="off"
   local ratio="$TRACE_RATIO"
+  local diagnostics=0
+  local option="${3:-}"
+
+  [[ $# -le 3 && ( -z "$option" || "$option" == "--pool" ) ]] || {
+    echo "Usage: ctl.sh run MODE RUN_ID [--pool]" >&2
+    exit 2
+  }
+  [[ "$option" != "--pool" ]] || diagnostics=1
 
   validate_id "$run_id"
 
   case "$mode" in
+    pool)
+      sql_mode="preserve"
+      diagnostics=1
+      ;;
     baseline)
       sql_mode="off"
       ;;
@@ -175,15 +191,37 @@ run_app() {
     exit 2
   }
 
-  "$OBS_DIR/sql-profile.sh" "$sql_mode"
+  if [[ "$sql_mode" != "preserve" ]]; then
+    "$OBS_DIR/sql-profile.sh" "$sql_mode"
+  fi
+  local sql_track
+  sql_track="$(pg_track)"
+  case "$sql_track" in all|top|none) ;; *) echo "Cannot determine pg_stat_statements.track" >&2; exit 2 ;; esac
+  export BENCH_DIAGNOSTICS="$diagnostics" BENCH_RUN_ID="$run_id"
+  unset BENCH_DIAGNOSTICS_DIR
+  if [[ "$diagnostics" == 1 ]]; then
+    export BENCH_DIAGNOSTICS_DIR="$run_dir/pool"
+    export BENCH_DIAGNOSTICS_MAX_BYTES="${BENCH_DIAGNOSTICS_MAX_BYTES:-10485760}"
+    [[ "$BENCH_DIAGNOSTICS_MAX_BYTES" =~ ^[0-9]{1,8}$ ]] &&
+      (( 10#$BENCH_DIAGNOSTICS_MAX_BYTES >= 4096 && 10#$BENCH_DIAGNOSTICS_MAX_BYTES <= 67108864 )) || {
+        echo "BENCH_DIAGNOSTICS_MAX_BYTES must be 4096..67108864" >&2; exit 2;
+      }
+  fi
 
   {
     printf 'run_id=%s\n' "$run_id"
     printf 'mode=%s\n' "$mode"
     printf 'sql_mode=%s\n' "$sql_mode"
+    printf 'pg_stat_statements_track=%s\n' "$sql_track"
     printf 'tracing=%s\n' "$tracing"
     printf 'trace_ratio=%s\n' "$ratio"
     printf 'cpu_profiler=%s\n' "$cpu"
+    printf 'pool_diagnostics=%s\n' "$diagnostics"
+    if [[ "$diagnostics" == 1 ]]; then
+      printf 'pool_diagnostics_dir=%s\n' "$BENCH_DIAGNOSTICS_DIR"
+      printf 'pool_file_max_bytes=%s\n' "$BENCH_DIAGNOSTICS_MAX_BYTES"
+      printf 'pool_files_per_worker=2\n'
+    fi
     printf 'port=%s\n' "$PORT"
     printf 'timestamp_utc=%s\n' "$(date -u +%FT%TZ)"
     printf 'node_version=%s\n' "$(node -v)"
@@ -236,7 +274,7 @@ run_app() {
 
   echo
   echo "[conduit] RUN_ID=$run_id"
-  echo "[conduit] mode=$mode sql=$sql_mode trace=$tracing cpu=$cpu"
+  echo "[conduit] mode=$mode sql=$sql_mode trace=$tracing cpu=$cpu pool=$diagnostics"
   echo "[conduit] port=$PORT workers=6"
   echo "[conduit] Ctrl+C to stop"
   echo
@@ -262,7 +300,7 @@ case "$action" in
     esac
     ;;
   run)
-    run_app "${1:-}" "${2:-}"
+    run_app "$@"
     ;;
   begin)
     validate_id "${1:?Missing RUN_ID}"

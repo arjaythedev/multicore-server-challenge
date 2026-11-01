@@ -75,6 +75,7 @@ try {
   assert.deepEqual(utils.pagination(new URL('http://local/?limit=01&offset=2147483647')), { limit: 1, offset: 2147483647 });
   assert.throws(() => utils.pagination(new URL('http://local/?offset=2147483648')));
   await utils.pool.end();
+  await utils.finishPoolDiagnostics?.();
 
   const port = Number(process.env.TEST_PORT ?? 33112);
   let child = await start(port);

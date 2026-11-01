@@ -25,6 +25,13 @@ export const pool = new Pool({ connectionString: databaseUrl, max: poolSize,
   connectionTimeoutMillis: 10_000, application_name: 'node-26-conduit' });
 pool.on('error', (error: Error) => { console.error('Idle database connection error', error); });
 
+// Nothing is installed or measured when diagnostics are disabled.
+export let finishPoolDiagnostics: (() => Promise<void>) | undefined;
+if (process.env.BENCH_DIAGNOSTICS === '1') {
+  const { instrumentPool } = await import('./pool-diagnostics.js');
+  finishPoolDiagnostics = await instrumentPool(pool);
+}
+
 export async function transaction<T>(work: (client: PoolClient) => Promise<T>): Promise<T> {
   const client = await pool.connect();
   let broken = false;

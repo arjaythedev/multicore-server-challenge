@@ -1,7 +1,7 @@
 import * as http from "node:http";
 
 import * as handlers from "./handlers.js";
-import { HttpError, pool, sendError, type Handler } from "./utils.js";
+import { HttpError, pool, finishPoolDiagnostics, sendError, type Handler } from "./utils.js";
 
 const host = process.env.HOST ?? "0.0.0.0";
 const port = Number(process.env.PORT ?? "3000");
@@ -126,7 +126,7 @@ const shutdown = (): void => {
   for (const response of activeResponses) response.shouldKeepAlive = false;
   const deadline = setTimeout(() => process.exit(1), 9_000);
   server.close(() => {
-    void Promise.allSettled([...pendingHandlers]).then(() => pool.end()).then(() => {
+    void Promise.allSettled([...pendingHandlers]).then(() => pool.end()).then(() => finishPoolDiagnostics?.()).then(() => {
       clearTimeout(deadline);
       process.exit(0);
     }).catch((error: unknown) => { console.error(error); process.exit(1); });
