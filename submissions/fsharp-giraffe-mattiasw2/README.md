@@ -101,9 +101,11 @@ check.sh      the harness: build -> facts -> conformance suite (../../test/run.s
     applied twice.
   - At shutdown the server logs `group commit: N writes in M groups`.
 - **bcrypt on dedicated threads** (`BCRYPT_THREADS`, default 2) behind a queue, each computing up to `BCRYPT_WIDTH`
-  (4) hashes in lockstep (see below). A thread that takes a login waits up to `BCRYPT_GATHER_MS` (50) for
-  batch-mates. Logins are ~0.1% of the requests, so that wait barely touches p95 or p99. A burst of logins waits
-  for a thread instead of parking thread-pool threads that the cheap reads need.
+  (4) hashes in lockstep (see below). A thread that takes a login waits up to `BCRYPT_GATHER_MS` (150) for
+  batch-mates. Logins are ~0.1% of the requests, so that wait barely touches p95 or p99. At 100,000 users on
+  6 threads 150 ms instead of 50 filled the batches to 3.3-3.4 hashes instead of 2.4 and saved 0.12-0.16 of the
+  app's ~2.8 threads in two paired runs, with the same p95. A burst of logins waits for a thread instead of
+  parking thread-pool threads that the cheap reads need.
 - **GC:** server GC, non-concurrent, DATAS off, and a 64 MB gen0 budget (`DOTNET_GCgen0size` in `start.sh`). The
   JIT runs with tiered PGO.
 
@@ -231,4 +233,4 @@ SKIP_CONFORMANCE=1 bash check.sh  # the quick gate, no database
 
 Environment: `DATABASE_URL`, `JWT_SECRET` (required); `HOST` (127.0.0.1), `PORT` (3000); `READ_LANES` (cores);
 `READ_BATCH` (512); `READ_GATHER_MS` (25); `WRITE_LANES` (2); `WRITE_GROUP` (128); `DB_POOL_SIZE` (cores / 2, capped so the total stays
-at most 95); `BCRYPT_THREADS` (2); `BCRYPT_WIDTH` (4); `BCRYPT_GATHER_MS` (50).
+at most 95); `BCRYPT_THREADS` (2); `BCRYPT_WIDTH` (4); `BCRYPT_GATHER_MS` (150).

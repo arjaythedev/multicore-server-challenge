@@ -93,7 +93,7 @@ let main args =
     // up to BCRYPT_GATHER_MS for batch-mates.
     let bcryptWidth = max 1 (int (setting "BCRYPT_WIDTH" "4"))
     // Logins are ~0.1% of the requests, so waiting for batch-mates barely touches p95 or p99.
-    let bcryptGather = TimeSpan.FromMilliseconds(float (setting "BCRYPT_GATHER_MS" "50"))
+    let bcryptGather = TimeSpan.FromMilliseconds(float (setting "BCRYPT_GATHER_MS" "150"))
 
     Engine.Passwords.start bcryptLanes bcryptWidth bcryptGather
     let ds = Engine.Db.dataSource (Engine.Db.connectionString databaseUrl poolSize true)

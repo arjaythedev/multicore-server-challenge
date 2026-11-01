@@ -5,7 +5,7 @@
 # 25), DB_POOL_SIZE (multiplexed connections for cold reads, default cores / 2),
 # WRITE_LANES / WRITE_GROUP (group-commit connections, default 2; writes per group, default 128),
 # BCRYPT_THREADS / BCRYPT_WIDTH / BCRYPT_GATHER_MS (bcrypt threads, default 2; hashes each computes in
-# lockstep, default 4; how long a login may wait for batch-mates, default 50).
+# lockstep, default 4; how long a login may wait for batch-mates, default 150).
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 export DOTNET_ROOT="${DOTNET_ROOT:-/usr/local/dotnet}" DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1
