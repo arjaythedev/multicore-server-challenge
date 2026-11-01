@@ -188,31 +188,51 @@ The pre-checks don't change the outcome: two racing sign-ups can both pass, and 
 - **Connections:** at most 95 Postgres connections (`READ_LANES` + `WRITE_LANES` + `DB_POOL_SIZE`; the pool is
   capped to fit).
 
-## Capacity on 6 vCPUs (3 cores x 2 hyperthreads)
+## Capacity
 
-A cloud vCPU is one hyperthread: the benchmark's 8 vCPUs are 4 physical cores x 2. The test box (a Ryzen AI 7 PRO 350 laptop) runs each
-measurement as the benchmark's search does: a fresh copy of the seed (`CREATE DATABASE ... TEMPLATE`), one server
-start, the benchmark's warm-up (500 users, 60 s ramp + 120 s), then a 60 s ramp and 60 s measured. Server and
-Postgres share pinned cores, and the load generator runs on cores they do not touch. One load generator on one
-laptop runs out of room above ~120,000 users, so the limit was found on **3 cores with both hyperthreads** (6
-vCPUs), where it is below that (commits 3f7cc19 to d67ba2f). There is no measurement on 8 vCPUs under these
-conditions:
+Measured on one laptop, not on the benchmark box:
+
+| | |
+|---|---|
+| Machine | Lenovo ThinkPad T14s Gen 6, AMD Ryzen AI 7 PRO 350: 8 cores / 16 threads, 4 Zen 5 (up to 5.1 GHz) and 4 Zen 5c (up to 3.5 GHz), 16 MB L3; 64 GB RAM |
+| Software | Ubuntu 24.04.5, kernel 6.17 (OEM), .NET 10.0.14, PostgreSQL 18.6 in Docker with the box's settings for 16 GB (`box/pg-conf.sh`: shared_buffers 4 GB) |
+| Pinning | server and Postgres on Zen 5 cores with both of their hyperthreads; the load generator on the cores they do not touch |
+
+A cloud vCPU is one hyperthread, so the benchmark's 8 vCPUs are 4 physical cores x 2. Each run follows the
+benchmark's search: a fresh copy of the seed (`CREATE DATABASE ... TEMPLATE`), one server start, the benchmark's
+warm-up (500 users, 60 s ramp + 120 s), then a 60 s ramp and 60 s measured.
+
+**8 vCPUs** (4 Zen 5 cores x 2; load generator on the 8 Zen 5c threads; commit 908861b):
+
+| Users | requests/s | p95 | p99 | Postgres threads | app threads | |
+|--:|--:|--:|--:|--:|--:|---|
+| 130,000 | 33,700 | 211 ms | 356 ms | 3.4 | 3.2 | pass |
+| 140,000 | 35,900 | 481 ms | 1,261 ms | 3.8 | 3.5 | fail on p99 |
+| 150,000 | 37,200 | 749 ms | 1,959 ms | 4.1 | 3.7 | fail |
+
+At 140,000 users the p99 comes from the first four seconds of the window, right where the ramp ends: for those
+seconds p50 is 0.5-1.6 s, then the run settles. In the read path itself p99 stays at 322 ms. At 150,000 the 8 threads
+are full (7.7 busy), and the load generator, on the same laptop, reaches 98% in its busiest seconds.
+
+**6 vCPUs** (3 Zen 5 cores x 2; load generator on the other 10 threads; commits 3f7cc19 to d67ba2f):
 
 | Users | requests/s | p95 | p99 | Postgres threads | app threads | |
 |--:|--:|--:|--:|--:|--:|---|
 | 100,000 | 25,900 | 186-197 ms | 309-339 ms | 2.6 | 2.6-2.8 | pass (4 runs) |
+| 105,000, 5-minute hold | 27,200 | 194 ms | 283 ms | 2.65 | 2.5 | pass, 8.16 M requests |
 | 110,000 | 28,200 | 291-449 ms | 409-591 ms | 2.8-3.0 | 2.7-3.0 | pass (3 runs) |
 | 120,000 | 28,800 | 737 ms | 869 ms | 2.85 | 3.0 | fail: the 6 threads are full |
 
-At 120,000 users the read path waits for CPU, not for Postgres: a batch executes in 2 ms at the median, but requests
-queue for a lane (p95 561 ms). The app and Postgres use about the same share. These Zen 5 cores are faster than a
-typical cloud core, so the benchmark box will hold fewer users per core.
+In the 5-minute hold the server's memory stayed at 2.5-2.9 GB, and the database grew by 36,000 articles (7%); the
+p95 of single seconds rose from ~80 ms to ~185 ms as the data grew. These Zen 5 cores are faster than a typical
+cloud core, so the benchmark box will hold fewer users per vCPU.
 
 Three things in the method moved the numbers more than most code changes, and are worth knowing for any local
 rig: without the warm-up, 100,000 users gave p95 361 ms instead of 196 (the JIT had not finished optimizing); a
 database that had grown through earlier runs (850,000 articles instead of 500,000) made Postgres do ~60% more work
 for the same load; and a 30 s ramp instead of the benchmark's 60 s left a seconds-long transient in the measured
-window. Comparisons elsewhere in this README are paired runs under the same conditions; their absolute numbers
+window. Above ~113,000 users one load generator also needs more than 4 target addresses: each gives it only ~28,000
+local ports. Comparisons elsewhere in this README are paired runs under the same conditions; their absolute numbers
 come from different stages of the rig.
 
 ## Where the app's CPU goes: half of it was bcrypt
