@@ -39,6 +39,9 @@ internal class ReadReq(
 
     /** When it was queued ([nanoTime]). */
     @JvmField val born = nanoTime()
+
+    /** [TpKind] ordinal of a two-phase kind's request, else -1. */
+    @JvmField var tpKind = -1
 }
 
 /** FIFO of one [ReadKind]'s waiting requests (ring buffer, power-of-two capacity). Guarded by the pool lock. */
@@ -113,6 +116,11 @@ internal class ReadBatch(cap: Int) {
 
     /** [Sharing.ARTICLES] kinds: the batch's distinct article rows. */
     @JvmField val arts = ArticleRows()
+
+    /** A mixed batch of two-phase kinds ([TpKind]): [tp] holds its state; [encoded] once its phase A is in the connection's buffer. */
+    @JvmField var isTp = false
+    @JvmField var encoded = false
+    @JvmField var tp: TpState? = null
 
     /** Room for [n] requests (broadcast kinds may take more than the usual cap). Under the pool lock. */
     fun ensure(n: Int) {
@@ -203,8 +211,33 @@ internal class ReadWorker(pool: ReadPool, index: Int, cap: Int) : Worker(pool, i
 
     fun spare(): ReadBatch = if (done === a) b else a
 
+    /** A mixed two-phase batch: phase A's reply, the decoration round trip, the batch's tables (TwoPhase.kt). */
+    private fun processTp(c: PgConn, batch: ReadBatch) {
+        val tp = batch.tp!!
+        val n = batch.n
+        val res = batch.results
+        for (j in 0 until n) res[j].clear()
+        val err = tp.processReply(c)
+        val status = tp.lastStatus
+        for (j in 0 until n) {
+            val r = res[j]
+            if (err != null) {
+                r.error = err
+            } else {
+                r.buf = c.rbuf
+                r.tp = tp
+                r.tpIdx = j
+            }
+        }
+        if (status != 'I'.code) (pool as ReadPool).runtime.rollback(c)
+    }
+
     override fun processReply(c: PgConn) {
         val batch = flight!!
+        if (batch.isTp) {
+            processTp(c, batch)
+            return
+        }
         val n = batch.n
         val res = batch.results
         val broadcast = batch.q!!.kind.broadcast
@@ -379,6 +412,7 @@ internal class ReadPool(
         val q = if (id >= 0 && id < queues.size) queues[id] else null
         check(q != null && q.kind === kind) { "ReadKind ${kind.name} was not passed to Db.start" }
         val r = ReadReq(viewer, limit, offset, key, cont, if (skipAbandoned) cont.context[RequestKey] else null)
+        r.tpKind = q.kind.tp?.ordinal ?: -1
         val c = lock.locked {
             r.seq = ++seq
             q.add(r)
@@ -438,6 +472,7 @@ internal class ReadPool(
         val now = if (gatherNanos > 0 || lifoNanos > 0) nanoTime() else 0L
         var best: KindQueue? = null
         var n = 0
+        var tpBatch = false
         while (n == 0 && queued > 0) {
             best = null
             var bestSeq = Long.MAX_VALUE
@@ -470,6 +505,29 @@ internal class ReadPool(
                 lifoBatches++
             }
             val k = best!!
+            if (k.kind.tp != null) {
+                // two-phase kinds go out together (the leader's read worker takes everything queued): every two-phase queue,
+                // up to its maxBatch, in one mixed batch; each kind's own gather window decided that this one is ready
+                var total = 0
+                for (q in queues) if (q.kind.tp != null) total += minOf(q.size, q.maxBatch)
+                batch.ensure(total)
+                for (q in queues) {
+                    if (q.kind.tp == null || q.size == 0) continue
+                    var taken = 0
+                    while (q.size > 0 && taken < q.maxBatch) {
+                        val r = q.poll()
+                        queued--
+                        taken++
+                        if (!dropAbandoned(r)) batch.reqs[n++] = r
+                    }
+                    q.requests += taken
+                    q.iRequests += taken
+                    q.batches++
+                    q.iBatches++
+                }
+                tpBatch = true
+                continue
+            }
             batch.ensure(minOf(k.size, k.maxBatch))
             while (n < k.maxBatch && k.size > 0) {
                 val r = if (lifo) k.pollLast() else k.poll()
@@ -489,18 +547,26 @@ internal class ReadPool(
         best.inflight++
         w.flight = batch
         w.inFlight = true
-        encode(batch, w.conn!!.out)
+        batch.isTp = tpBatch
+        batch.encoded = false
+        if (tpBatch) {
+            if (batch.tp == null) batch.tp = TpState() // its phase A is encoded by [send], outside the lock
+        } else {
+            encode(batch, w.conn!!.out)
+        }
         batches++
         requests += n
-        best.batches++
-        best.requests += n
         if (n > largest) largest = n
         sizes[minOf(6, 31 - n.countLeadingZeroBits())]++
         val t = nanoTime()
-        for (j in 0 until n) best.wait.add(t - batch.reqs[j]!!.born)
         batch.sentAt = t
-        best.iRequests += n
-        best.iBatches++
+        if (!tpBatch) {
+            best.batches++
+            best.requests += n
+            for (j in 0 until n) best.wait.add(t - batch.reqs[j]!!.born)
+            best.iRequests += n
+            best.iBatches++
+        }
         return true
     }
 
@@ -573,6 +639,24 @@ internal class ReadPool(
         o.abandon()
         skipped++
         return true
+    }
+
+    /** A two-phase batch's phase A is interned and encoded here, by the thread that sends it and outside the pool lock. */
+    override fun send(c: PgConn) {
+        var w: ReadWorker? = null
+        for (x in workers) if (x.conn === c) { w = x; break }
+        val b = w?.flight
+        if (b != null && b.isTp && !b.encoded) {
+            try {
+                b.tp!!.encodeA(b, c.out)
+                b.encoded = true
+            } catch (e: Throwable) {
+                logSafe({ "db: two-phase encode failed" }, e)
+                c.close() // the worker's reader sees the dead socket and fails the batch
+                return
+            }
+        }
+        super.send(c)
     }
 
     override fun drainLocked(): List<Any>? {

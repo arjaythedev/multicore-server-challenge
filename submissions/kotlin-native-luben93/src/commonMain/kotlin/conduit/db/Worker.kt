@@ -113,7 +113,7 @@ internal abstract class Pool(
     abstract fun failDrained(drained: List<Any>, err: PgError)
 
     /** Writes the encoded round trip. A failure is left to the worker's reader, which sees the dead socket. */
-    fun send(c: PgConn) {
+    open fun send(c: PgConn) {
         try {
             c.send()
         } catch (_: Throwable) {

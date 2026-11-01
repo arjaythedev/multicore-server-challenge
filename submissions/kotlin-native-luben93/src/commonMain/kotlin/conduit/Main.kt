@@ -113,6 +113,9 @@ fun main() {
         globalWin = envInt("READ_GLOBAL_WIN", 1) != 0,
         // READ_SHARED_ROWS (default on, needs READ_SHARE; 0 = fan every row out to every request): comments and the global, tag and author lists send each distinct thread or page once
         sharedRows = envInt("READ_SHARED_ROWS", 1) != 0,
+        // READ_TP (default on) / READ_TP_SLUG, _ID, _COMMENTS, _GLOBAL, _TAG, _AUTHOR, _FAVLIST, _FEED (default on; 0 = the kind's own statement):
+        // the leader's two-phase read path (db/TwoPhase.kt): phase A per kind, one shared decoration round trip, the rest in the app
+        twoPhase = if (envInt("READ_TP", 1) == 0) emptySet() else conduit.db.TpKind.entries.filter { envInt("READ_TP_${it.name}", 1) != 0 }.toSet(),
     )
     // SQL_PRINT=1 (diagnostics, .tmp/lab/explain.sh): prints every read statement as "sql<TAB>name<TAB>sql" and exits
     if (envInt("SQL_PRINT", 0) != 0) {

@@ -247,3 +247,14 @@ server-config changes; session settings only. <= 95 Postgres connections total.
 - Local fd limit is 20000 per process (cannot be raised); the box gives 200000.
 - Research notes (verbatim SQL of the top entries, conformance checklist, bcrypt details):
   `/tmp/claude-0/-home-user-multicore-server-challenge/99796a5c-b120-524c-822d-dc73b94b523b/scratchpad/research/`
+
+## Two-phase reads (READ_TP)
+
+Ported from rust-epoll-theCatWisel's read path (MIT; `db/TwoPhase.kt`, statements in `db/TpSql.kt`). When any of the
+two-phase kinds is ready, every two-phase queue goes into one mixed batch. Phase A is one Sync pipeline of per-kind
+statements returning ids and counts (identical slugs, pages and viewers are interned and queried once). Phase B is one
+round trip: `artx` (article columns, tag ids, favorites count per distinct article), `artau` (per distinct author),
+`flags` (favorited/following per viewer) and the tags table. The app maps tag ids to names, formats each distinct
+article once per batch and assembles every response. Everything lives for one batch only; nothing is kept between
+batches. Deviations from the leader's SQL for exact results: the capped-count gate on tag/author/favorited pages is
+removed, and tag order follows the database collation (`ORDER BY name`).

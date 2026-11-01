@@ -88,6 +88,10 @@ class Result {
 
     /** [Sharing.ARTICLES] reads: the batch's distinct article rows, shared by every Result of the batch. */
     @JvmField var articles: ArticleRows? = null
+
+    /** Two-phase reads: the batch's [conduit.db.TpState] and this request's index in it (no rows: the handler renders from it). */
+    @JvmField var tp: Any? = null
+    @JvmField var tpIdx: Int = 0
     private val view = Row()
     private val articleView = Row()
 
@@ -145,7 +149,7 @@ class Result {
     }
 
     fun clear() {
-        error = null; affected = 0; rowCount = 0; flagCount = 0; articles = null
+        error = null; affected = 0; rowCount = 0; flagCount = 0; articles = null; tp = null
     }
 }
 

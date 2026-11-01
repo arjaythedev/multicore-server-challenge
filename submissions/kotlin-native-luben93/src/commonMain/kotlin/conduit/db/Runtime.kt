@@ -46,6 +46,7 @@ internal class DbRuntime(@JvmField val config: DbConfig, reads: List<ReadKind>, 
             list.add(PgStatement("s${reads.size + j}", w.sql, w.paramOids, "write '${w.name}'"))
         }
         val tx = reads.size + writes.size
+        if (reads.any { it.tp != null }) for ((name, sql, oids) in TpSql.all) list.add(PgStatement(name, sql, oids, "two-phase read"))
         list.add(PgStatement("s$tx", "BEGIN", IntArray(0), "BEGIN"))
         list.add(PgStatement("s${tx + 1}", "COMMIT", IntArray(0), "COMMIT"))
         list.add(PgStatement("s${tx + 2}", "ROLLBACK", IntArray(0), "ROLLBACK"))

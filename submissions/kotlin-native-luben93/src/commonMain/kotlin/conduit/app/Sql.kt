@@ -2,6 +2,7 @@ package conduit.app
 
 import conduit.db.ReadKind
 import conduit.db.Sharing
+import conduit.db.TpKind
 import conduit.db.WriteStmt
 import conduit.pg.Oid
 
@@ -134,6 +135,12 @@ internal object ReadShare {
      * parsed every thread once per request before (the leaders send each distinct row once; .tmp/reports/multicore-sql-research-20261030.md).
      */
     var sharedRows = false
+
+    /**
+     * READ_TP (default on) and READ_TP_<KIND>: the kinds read as the leader reads them (db/TwoPhase.kt, statement shapes after
+     * rust-epoll-theCatWisel): phase A per kind, ONE shared decoration round trip, the rest in the app.
+     */
+    var tp: Set<TpKind> = emptySet()
 }
 
 /** The batch's requests, materialized once and referenced by several CTEs. */
@@ -333,6 +340,7 @@ internal object Sql {
                 "FROM articles a JOIN users u ON u.id = a.author_id WHERE a.slug = r.k) x"
         },
         maxBatch = batch,
+        tp = TpKind.SLUG.takeIf { it in ReadShare.tp },
         sharing = if (rowsShared) Sharing.GROUPS else Sharing.NONE,
     )
 
@@ -347,6 +355,7 @@ internal object Sql {
                 "FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id = r.o) x"
         },
         maxBatch = batch,
+        tp = TpKind.ID.takeIf { it in ReadShare.tp },
     )
 
     /**
@@ -397,6 +406,7 @@ internal object Sql {
                 "LEFT JOIN users u ON u.id = c.author_id WHERE a.slug = r.k ORDER BY c.created_at DESC, c.id DESC) x"
         },
         maxBatch = batch,
+        tp = TpKind.COMMENTS.takeIf { it in ReadShare.tp },
         sharing = if (rowsShared) Sharing.GROUPS else Sharing.NONE,
     )
 
@@ -479,6 +489,7 @@ internal object Sql {
             )
         },
         maxBatch = batch,
+        tp = TpKind.GLOBAL.takeIf { it in ReadShare.tp },
         sharing = if (rowsShared) Sharing.GROUPS else Sharing.NONE,
     )
 
@@ -535,6 +546,7 @@ internal object Sql {
             )
         },
         maxBatch = batch,
+        tp = TpKind.AUTHOR.takeIf { it in ReadShare.tp },
         sharing = if (rowsShared) Sharing.GROUPS else Sharing.NONE,
     )
 
@@ -582,6 +594,7 @@ internal object Sql {
             )
         },
         maxBatch = batch,
+        tp = TpKind.TAG.takeIf { it in ReadShare.tp },
         sharing = if (rowsShared) Sharing.GROUPS else Sharing.NONE,
     )
 
@@ -601,6 +614,7 @@ internal object Sql {
             ),
         ),
         maxBatch = batch,
+        tp = TpKind.FAVLIST.takeIf { it in ReadShare.tp },
     )
 
     /**
@@ -715,6 +729,7 @@ internal object Sql {
             )
         },
         maxBatch = ReadShare.feedMaxBatch.takeIf { it > 0 } ?: batch,
+        tp = TpKind.FEED.takeIf { it in ReadShare.tp },
         sharing = if (ReadShare.feedRows && ReadShare.feedShared && ReadShare.feedHeavy && ReadShare.feedFloor) Sharing.ARTICLES else Sharing.NONE,
     )
 

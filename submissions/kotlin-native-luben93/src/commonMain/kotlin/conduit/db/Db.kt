@@ -43,6 +43,11 @@ class ReadKind(
     val broadcast: Boolean = false,
     /** [Sharing.GROUPS]: the statement returns each group's rows once, see [Sharing]. */
     val sharing: Sharing = Sharing.NONE,
+    /**
+     * Two-phase kind (see TwoPhase.kt): its requests are batched together with those of the other two-phase kinds, run as the
+     * leader's phase A statements and ONE shared decoration round trip; [sql] is then not used.
+     */
+    val tp: TpKind? = null,
 ) {
     /** Assigned by [Db.start]: index into the kind table. */
     var id: Int = -1
