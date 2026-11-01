@@ -578,6 +578,33 @@ type private Pending(read: Read) =
 
 let private unexpected (a: Answer) : 'a = invalidOp $"Reads: unexpected answer {a}"
 
+/// Durations in 1 ms buckets (the last bucket holds everything from 2 s up), for the shutdown
+/// line: cheap enough to record every request.
+[<Sealed>]
+type private Millis() =
+    let buckets: int64[] = Array.zeroCreate 2001
+
+    member _.Record(elapsed: TimeSpan) =
+        let ms = int elapsed.TotalMilliseconds
+        Interlocked.Increment(&buckets[if ms < 0 then 0 elif ms > 2000 then 2000 else ms]) |> ignore
+
+    /// "p50/p95/p99 ms", or "-" before anything was recorded.
+    member _.Summary() =
+        let counts = Array.copy buckets
+        let total = Array.sum counts
+        if total = 0L then
+            "-"
+        else
+            let at (q: float) =
+                let target = int64 (Math.Ceiling(q * float total))
+                let mutable seen = 0L
+                let mutable i = 0
+                while seen + counts[i] < target do
+                    seen <- seen + counts[i]
+                    i <- i + 1
+                i
+            $"{at 0.5}/{at 0.95}/{at 0.99} ms"
+
 /// The hot reads' side of the process: `lanes` dedicated connections (not multiplexed: a batch
 /// holds a snapshot across two round trips), each answering one batch at a time. A lane that
 /// wakes for a request first lets it wait up to `gather` for batch-mates (less if `maxBatch` of
@@ -588,6 +615,9 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
         Channel.CreateUnbounded<Pending>(UnboundedChannelOptions(SingleReader = (lanes = 1), SingleWriter = false))
     let ds = NpgsqlDataSource.Create connectionString
     let counts = [| 0L; 0L |] // batches, requests
+    let queued = Millis() // per request: arrived -> taken into a batch
+    let executed = Millis() // per batch: taken -> answered
+    let answered = Millis() // per request: arrived -> answered
     /// How often a gathering lane looks whether a full batch is already queued.
     let tick = TimeSpan.FromMilliseconds 2.0
 
@@ -653,6 +683,9 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
                 if pending.Count > 0 then
                     let batch = pending.ToArray()
                     pending.Clear()
+                    let taken = Diagnostics.Stopwatch.GetTimestamp()
+                    for p in batch do
+                        queued.Record(Diagnostics.Stopwatch.GetElapsedTime(p.Arrived, taken))
                     try
                         if isNull conn || conn.State <> ConnectionState.Open then
                             if not (isNull conn) then conn.Dispose()
@@ -663,6 +696,10 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
                     with e ->
                         for p in batch do
                             p.Fail e
+                    let finished = Diagnostics.Stopwatch.GetTimestamp()
+                    executed.Record(Diagnostics.Stopwatch.GetElapsedTime(taken, finished))
+                    for p in batch do
+                        answered.Record(Diagnostics.Stopwatch.GetElapsedTime(p.Arrived, finished))
                     Interlocked.Increment(&counts[0]) |> ignore
                     Interlocked.Add(&counts[1], int64 batch.Length) |> ignore
         }
@@ -720,3 +757,7 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
 
     /// (batches, requests) so far.
     member _.Counts = Volatile.Read(&counts[0]), Volatile.Read(&counts[1])
+
+    /// p50/p95/p99 of: a request's wait for its batch, a batch's execution, a request's whole
+    /// time in Reads.
+    member _.Timings = queued.Summary(), executed.Summary(), answered.Summary()

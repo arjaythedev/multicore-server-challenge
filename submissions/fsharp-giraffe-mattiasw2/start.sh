@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs the server in the foreground. Config: DATABASE_URL, JWT_SECRET, HOST, PORT (SPEC.md).
 # Optional: READ_LANES / READ_BATCH (read-batching connections, default one per core; requests per
-# batch, default 1024), READ_GATHER_MS (how long a request may wait for batch-mates, default
+# batch, default 512), READ_GATHER_MS (how long a request may wait for batch-mates, default
 # 25), DB_POOL_SIZE (multiplexed connections for cold reads, default cores / 2),
 # WRITE_LANES / WRITE_GROUP (group-commit connections, default 2; writes per group, default 128),
 # BCRYPT_THREADS / BCRYPT_WIDTH / BCRYPT_GATHER_MS (bcrypt threads, default 2; hashes each computes in

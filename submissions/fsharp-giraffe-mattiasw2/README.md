@@ -42,6 +42,12 @@ check.sh      the harness: build -> facts -> conformance suite (../../test/run.s
   - **Gather.** A lane that wakes for a request waits until the oldest queued request is `READ_GATHER_MS` old, or
     until `READ_BATCH` requests are queued, whichever comes first, and then takes them all. The latency budget is
     500 ms at p95, and a bigger batch shares more work.
+  - **Batch size.** A batch's statements run one after another on one backend, so a huge batch is slow for every
+    request in it: while all lanes are busy the queue grows, the next lane takes it all, and that batch is slower
+    still. At 85,000 users a cap of 512 beat 1,024 on p95 and p99 in two paired runs (227 vs 427 ms and 255 vs
+    295 ms at p95), with no more Postgres work. At 128 too little is shared: Postgres used more, the lanes saturated
+    and p95 rose to 659 ms. The shutdown line `read timings` gives p50/p95/p99 of a request's wait for its batch,
+    a batch's execution and a request's whole time in the read path.
   - **Plan (F#).** The batch's distinct needs: forty requests for page 1 of the global feed are one page, and an
     article page and its comments are one slug lookup.
   - **Phase A (one round trip).** Ids: the tag list, one capped count per distinct list key, the ids of each distinct
@@ -224,5 +230,5 @@ SKIP_CONFORMANCE=1 bash check.sh  # the quick gate, no database
 ```
 
 Environment: `DATABASE_URL`, `JWT_SECRET` (required); `HOST` (127.0.0.1), `PORT` (3000); `READ_LANES` (cores);
-`READ_BATCH` (1024); `READ_GATHER_MS` (25); `WRITE_LANES` (2); `WRITE_GROUP` (128); `DB_POOL_SIZE` (cores / 2, capped so the total stays
+`READ_BATCH` (512); `READ_GATHER_MS` (25); `WRITE_LANES` (2); `WRITE_GROUP` (128); `DB_POOL_SIZE` (cores / 2, capped so the total stays
 at most 95); `BCRYPT_THREADS` (2); `BCRYPT_WIDTH` (4); `BCRYPT_GATHER_MS` (50).

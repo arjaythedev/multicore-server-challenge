@@ -81,7 +81,7 @@ let main args =
     // Read batching: READ_LANES connections of their own, each running one batch of up to
     // READ_BATCH requests at a time. One busy backend per core.
     let readLanes = max 1 (int (setting "READ_LANES" (string cores)))
-    let readBatch = max 1 (int (setting "READ_BATCH" "1024"))
+    let readBatch = max 1 (int (setting "READ_BATCH" "512"))
     let readGather = TimeSpan.FromMilliseconds(float (setting "READ_GATHER_MS" "25"))
     // Multiplexed: the cold reads (sign-in lookups, the read after a write). Rule: 95 or fewer
     // connections in total, lanes included.
@@ -150,7 +150,9 @@ let main args =
         let groups, written = writes.Counts
         eprintfn "group commit: %d writes in %d groups" written groups
         let batches, requests = reads.Counts
-        eprintfn "read batching: %d requests in %d batches" requests batches)
+        eprintfn "read batching: %d requests in %d batches" requests batches
+        let queued, executed, answered = reads.Timings
+        eprintfn "read timings (p50/p95/p99): queued %s, batch executed %s, answered %s" queued executed answered)
     |> ignore
     app.Run()
     0
