@@ -220,6 +220,31 @@ runtime setting that measurably helped is `DOTNET_ThreadPool_UnfairSemaphoreSpin
 thread-pool workers sleep at once instead of spinning on cores that Postgres needs. At 85,000 users it cut p99 from
 1,155 ms to 823 ms.
 
+### The profile now
+
+`perf` on the server process at 110,000 users (commit 3f7cc19; fresh copy of the seed, the benchmark's warm-up,
+server and Postgres on 3 cores with both hyperthreads, ~28,000 requests/s, p95 291 ms; 20 s at 499 Hz):
+
+| Where | Share of the app's 2.86 threads | Threads |
+|---|--:|--:|
+| bcrypt (`Bcrypt.expand4`, the key schedule) | **36%** | **1.04** |
+| kernel: TCP, epoll, AppArmor, scheduling | 15% | 0.43 |
+| Kestrel, pipelines, sockets | 10% | 0.29 |
+| the .NET runtime (GC, write barriers, stubs) | 8% | 0.24 |
+| JSON and text encoding | 7% | 0.19 |
+| libc, vdso, loader | 4% | 0.13 |
+| Npgsql | 3% | 0.07 |
+| date and number formatting | 2% | 0.06 |
+| our read engine (without bcrypt) | 2% | 0.05 |
+| kernel conntrack | 1% | 0.04 |
+| HMAC for the JWTs | 1% | 0.03 |
+| our web layer, Giraffe included | 1% | 0.03 |
+| everything else (CoreLib, async machinery, unresolved) | 6% | 0.16 |
+
+bcrypt is still a third of the app's CPU for 0.1% of the requests: ~37 ms of CPU per hash, twice an idle core's
+quad, because its threads share cores with Postgres and the app. Below it the profile is flat; Giraffe costs
+under 1%.
+
 ## Build, run, check
 
 ```bash
