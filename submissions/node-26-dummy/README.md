@@ -391,3 +391,5 @@ measurable overhead; enable them to explain a controlled run, then disable them
 for clean benchmarks. Known candidates for future measured work include
 `favorites_count`, CPU/event-loop contention, response serialization/output, and
 network delivery. Change one variable at a time and preserve conformance.
+
+Front: direct
