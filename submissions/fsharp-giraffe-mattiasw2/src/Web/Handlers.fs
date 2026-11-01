@@ -134,11 +134,15 @@ let register (env: Env) : HttpHandler =
     body Wire.registration (fun r ->
         respond (fun () ->
             task {
-                let! hash = Passwords.hash r.Password
-                match! Users.register env.Db r.Username r.Email hash with
-                | Stored u -> return created (Wire.user u (env.Jwt.Mint(u.Id, now ())))
-                | Taken -> return unprocessable "username or email is already taken"
-                | Missing -> return unprocessable "not registered"
+                // bcrypt is the expensive part: never hash for a name that is already taken.
+                match! Users.taken env.Db 0L (Some r.Username) (Some r.Email) with
+                | true -> return unprocessable "username or email is already taken"
+                | false ->
+                    let! hash = Passwords.hash r.Password
+                    match! Users.register env.Db r.Username r.Email hash with
+                    | Stored u -> return created (Wire.user u (env.Jwt.Mint(u.Id, now ())))
+                    | Taken -> return unprocessable "username or email is already taken"
+                    | Missing -> return unprocessable "not registered"
             }))
 
 let login (env: Env) : HttpHandler =
@@ -161,27 +165,39 @@ let currentUser (env: Env) : HttpHandler =
                 | None -> return unauthorized
             }))
 
+let private applyUserEdit (env: Env) (id: int64) (token: string) (edit: Wire.UserEdit) (hash: string option) =
+    task {
+        let changes: Users.Changes =
+            { Email = edit.Email
+              Username = edit.Username
+              PasswordHash = hash
+              Bio = edit.Bio
+              Image = edit.Image }
+        match! Users.update env.Db id changes with
+        | Stored u -> return ok (Wire.user u token)
+        | Taken -> return unprocessable "username or email is already taken"
+        | Missing -> return unauthorized
+    }
+
 let updateUser (env: Env) : HttpHandler =
     signedIn env (fun id token ->
         body Wire.userEdit (fun edit ->
             respond (fun () ->
                 task {
-                    let! hash =
-                        match edit.Password with
-                        | Some p -> task {
-                            let! h = Passwords.hash p
-                            return Some h }
-                        | None -> Task.FromResult None
-                    let changes: Users.Changes =
-                        { Email = edit.Email
-                          Username = edit.Username
-                          PasswordHash = hash
-                          Bio = edit.Bio
-                          Image = edit.Image }
-                    match! Users.update env.Db id changes with
-                    | Stored u -> return ok (Wire.user u token)
-                    | Taken -> return unprocessable "username or email is already taken"
-                    | Missing -> return unauthorized
+                    let update = applyUserEdit env id token edit
+                    match edit.Password with
+                    | None -> return! update None
+                    | Some password ->
+                        // A new password costs a bcrypt hash: pay it only for an update that
+                        // will go through (the user still exists, the new names are free).
+                        match! Users.byId env.Db id with
+                        | None -> return unauthorized
+                        | Some _ ->
+                            match! Users.taken env.Db id edit.Username edit.Email with
+                            | true -> return unprocessable "username or email is already taken"
+                            | false ->
+                                let! hash = Passwords.hash password
+                                return! update (Some hash)
                 })))
 
 let profile (env: Env) (username: string) : HttpHandler =

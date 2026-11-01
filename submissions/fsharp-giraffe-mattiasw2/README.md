@@ -70,6 +70,22 @@ The reference SQL, reshaped so that **every read and most writes take one round 
   `sub` must be a decimal string and `exp` must be present and in the future.
 - **bcrypt:** cost 10 for every new password, and every login verifies against the stored hash. A password longer
   than 72 bytes is refused with a 422, never silently truncated.
+
+## bcrypt runs once per sign-in, and never for a refused request
+
+bcrypt is by far the most expensive thing the server does (~50-80 ms of a core), so it runs exactly once per
+sign-up, password change or login, and only when that request is going to succeed:
+
+| Request | bcrypt |
+|---|---|
+| `POST /api/users` | one hash, only after a cheap check that the username and email are free. A body that fails validation, or a taken name, costs none. |
+| `POST /api/users/login` | one verify, only when the email exists. An unknown email or a malformed body costs none. |
+| `PUT /api/user` with `password` | one hash, only after checking that the user exists and the new names are free. Without `password`, none. |
+| everything else | none. Tokens are HS256 JWTs, and `GET /api/user` reads the user row. |
+
+The pre-checks don't change the outcome: two racing sign-ups can both pass, and the UNIQUE constraint still answers
+422. At shutdown the server logs its counts (`bcrypt: N hashes, M verifies`). A conformance run gives exactly
+3 hashes (2 sign-ups + 1 password change) and 5 verifies (the 5 logins whose email exists).
 - **Connections:** at most 95 Postgres connections (`DB_POOL_SIZE` is capped).
 
 ## Build, run, check

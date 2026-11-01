@@ -11,6 +11,12 @@ open System.Threading.Tasks
 // queue in front: a burst of logins waits for a lane, everything else keeps its cores.
 
 let private work = new BlockingCollection<unit -> unit>()
+let mutable private hashes = 0L
+let mutable private verifies = 0L
+
+/// (hashes, verifies) run since start: the proof that bcrypt runs once per sign-up, password
+/// change or login, and never on a request that is refused anyway.
+let counts () : int64 * int64 = Interlocked.Read &hashes, Interlocked.Read &verifies
 let mutable private lanes = 0
 let private gate = obj ()
 
@@ -44,10 +50,12 @@ let private run (f: unit -> 'a) : Task<'a> =
 let fits (password: string) : bool = Encoding.UTF8.GetByteCount password <= 72
 
 let hash (password: string) : Task<string> =
+    Interlocked.Increment &hashes |> ignore
     run (fun () -> BCrypt.Net.BCrypt.HashPassword(password, 10))
 
 /// A malformed stored hash verifies as false, never as an error.
 let verify (password: string) (storedHash: string) : Task<bool> =
+    Interlocked.Increment &verifies |> ignore
     run (fun () ->
         try
             BCrypt.Net.BCrypt.Verify(password, storedHash)

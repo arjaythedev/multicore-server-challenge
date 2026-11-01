@@ -11,6 +11,26 @@ let private user (read: RowReader) : User =
       Bio = read.textOrNone "bio"
       Image = read.textOrNone "image" }
 
+/// Is either name already held by ANOTHER user (`exceptId` 0 = by anyone)? Asked before bcrypt
+/// runs, so a refused sign-up or rename never pays for a hash. Only a pre-check: two racing
+/// requests can both pass it, and the UNIQUE constraint still decides (Taken).
+let taken (ds: NpgsqlDataSource) (exceptId: int64) (username: string option) (email: string option) : Task<bool> =
+    match username, email with
+    | None, None -> Task.FromResult false
+    | _ ->
+        task {
+            let! rows =
+                Sql.fromDataSource ds
+                |> Sql.query
+                    "SELECT EXISTS (SELECT 1 FROM users WHERE (username = @username OR email = @email) AND id <> @id) AS taken"
+                |> Sql.parameters
+                    [ "@id", Sql.int64 exceptId
+                      "@username", Sql.textOrNone username
+                      "@email", Sql.textOrNone email ]
+                |> Sql.executeAsync (fun read -> read.bool "taken")
+            return List.exists id rows
+        }
+
 let register (ds: NpgsqlDataSource) (username: string) (email: string) (passwordHash: string) : Task<Unique<User>> =
     task {
         try

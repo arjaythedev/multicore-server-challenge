@@ -112,5 +112,9 @@ let main args =
     // Touch the database before taking traffic: a bad DATABASE_URL fails here, loudly.
     (Engine.Tags.all ds).GetAwaiter().GetResult() |> ignore
     eprintfn "conduit (F#, Giraffe on Kestrel) on %s:%d, %d db connections (multiplexed), %d bcrypt lanes" host port poolSize bcryptLanes
+    app.Lifetime.ApplicationStopping.Register(fun () ->
+        let hashes, verifies = Engine.Passwords.counts ()
+        eprintfn "bcrypt: %d hashes (sign-ups, password changes), %d verifies (logins)" hashes verifies)
+    |> ignore
     app.Run()
     0
