@@ -1,5 +1,71 @@
 # SQL and pool diagnostics validation — 2026-11-01
 
+## HTTP/event-loop follow-up — actual checks and overhead
+
+Added opt-in `BENCH_HTTP_DIAGNOSTICS=1` / controller `--http`, with fixed router
+labels, bounded histograms, size-conditioned handler/flush durations, 5% sampled
+comments phases, event-loop delay/ELU and CPU deltas. No SQL text, pool sizing,
+workers, keep-alive, schema or PostgreSQL configuration changed.
+
+Actual checks on Node 26.13.0 and the private PostgreSQL 18.6 instance (55432):
+
+- Typecheck and build passed. Clean conformance builds also passed.
+- Conformance **197/197**, one worker with both diagnostics off; **197/197**,
+  six workers with both diagnostics on, fresh dev-seed clones.
+- HTTP focused tests cover deterministic sampled phases, byte-size groups,
+  401/204, finish/close deduplication, premature close before/after end,
+  listener cleanup, final flush, requests spanning a ten-second interval, and a real HTTP client disconnect while its
+  handler is still pending. Off/unset runs assert no diagnostic timer, output
+  or initialization, even with intentionally invalid output configuration.
+- Existing pool contract tests passed (callbacks/Promises, reuse, exhaustion,
+  acquisition errors, transactions/release and natural process exit).
+- Bounded-output tests passed (slow/blocked stdout, real unread pipe, rotation,
+  file permissions, EPIPE, disk errors, final record and flush deadline).
+- Controller fixture tests passed: explicit off, --http, --pool, manifest,
+  pool mode preserves SQL tracking; no real configuration command executed.
+- OTel integration passed with six workers, pool/query spans under HTTP,
+  PID correlation, balanced pool connections and final HTTP records/files on
+  Cluster shutdown. Final repeat: 188 spans, 74 pool, 74 query; HTTP output
+  counters showed zero drops/errors for all worker records.
+
+### New overhead measurement: both diagnostics plus files
+
+Same isolated `node26_diag_checks` database and read-only workload, six workers,
+tracing off, loopback, 100 RPS. Each run: 30 seconds warmup, 60 seconds measured
+(6000 requests). Two pairs, order OFF→ON then ON→OFF. ON enables pool + HTTP +
+event-loop metrics and **file output**, OFF disables both. File cap 10 MiB;
+output is drained by the verifier. CPU is primary+workers user/system time from
+`/proc`, CLK_TCK=100; it excludes PostgreSQL and generator CPU.
+
+| Pair | Mode | p50 ms | p95 ms | p99 ms | Node CPU s | Stdout bytes |
+|---|---|---:|---:|---:|---:|---:|
+| 1 | OFF | 5.011 | 9.456 | 10.209 | 12.53 | 0 |
+| 1 | ON | 5.080 | 9.881 | 10.370 | 14.45 | 215,048 |
+| 2 | ON | 5.034 | 9.476 | 10.268 | 14.00 | 209,622 |
+| 2 | OFF | 4.982 | 9.460 | 10.161 | 12.59 | 0 |
+
+All four runs: **zero HTTP errors**, zero generator scheduling lateness >100 ms.
+Mean Node CPU: **12.56 s OFF versus 14.225 s ON**, observed **+13.3%**.
+Pair CPU increases: +15.3% and +11.2%. Mean per-run p95: 9.458 versus 9.678 ms;
+p99: 10.185 versus 10.319 ms. Mean emitted diagnostic stdout: 212,335 bytes per
+minute across six workers, also persisted to JSONL (excluding final/startup
+records from measured log volume).
+
+This is a measurable cost, not zero-overhead instrumentation. It measures the
+combined diagnostic stack, not the marginal HTTP-only cost. Two local pairs do
+not establish production/high-concurrency overhead or predict 20k latency.
+Keep instrumentation off for clean performance benchmarks; high-VU ON/OFF
+validation and client/server network attribution remain manual follow-ups.
+
+### Ethernet feasibility (read-only)
+
+`eno2` was administratively UP but operationally DOWN/NO-CARRIER, with no IP.
+The LAN/default route used `wlo1`; no network setting was changed. A cable/link
+is needed before a server-side Ethernet A/B. After connecting/configuring it,
+verify `ip route get <MacBook-IP> from <Ethernet-IP>` and use that Ethernet IP
+as the target. Keep seed/workload/instrumentation identical. No high-load test
+or service restart was performed; only the private test PostgreSQL was started.
+
 ## Follow-up refactor and bounded logging validation
 
 The diagnostics implementation was extracted into `src/pool-diagnostics.ts`,

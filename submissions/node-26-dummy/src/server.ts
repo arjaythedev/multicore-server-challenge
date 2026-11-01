@@ -1,7 +1,7 @@
 import * as http from "node:http";
 
 import * as handlers from "./handlers.js";
-import { HttpError, pool, finishPoolDiagnostics, sendError, type Handler } from "./utils.js";
+import { HttpError, pool, finishPoolDiagnostics, httpDiagnostics, sendError, type Handler } from "./utils.js";
 
 const host = process.env.HOST ?? "0.0.0.0";
 const port = Number(process.env.PORT ?? "3000");
@@ -68,6 +68,7 @@ const routeRequest = async (
     }
 
     const params: Record<string, string> = {};
+    httpDiagnostics?.route(response, route.method + ' ' + route.pattern.source);
 
     try {
       for (const [index, name] of route.parameterNames.entries()) {
@@ -94,6 +95,7 @@ let shuttingDown = false;
 const activeResponses = new Set<http.ServerResponse>();
 const pendingHandlers = new Set<Promise<void>>();
 const server = http.createServer((request, response) => {
+  httpDiagnostics?.begin(response);
   activeResponses.add(response);
   response.once('close', () => activeResponses.delete(response));
   if (shuttingDown) response.shouldKeepAlive = false;
@@ -126,7 +128,7 @@ const shutdown = (): void => {
   for (const response of activeResponses) response.shouldKeepAlive = false;
   const deadline = setTimeout(() => process.exit(1), 9_000);
   server.close(() => {
-    void Promise.allSettled([...pendingHandlers]).then(() => pool.end()).then(() => finishPoolDiagnostics?.()).then(() => {
+    void Promise.allSettled([...pendingHandlers]).then(() => pool.end()).then(() => Promise.all([finishPoolDiagnostics?.(), httpDiagnostics?.finish()])).then(() => {
       clearTimeout(deadline);
       process.exit(0);
     }).catch((error: unknown) => { console.error(error); process.exit(1); });

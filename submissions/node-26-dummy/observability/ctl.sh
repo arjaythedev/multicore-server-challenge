@@ -29,7 +29,7 @@ Usage:
   ./ctl.sh run cpu RUN_ID
   ./ctl.sh run deep RUN_ID
 
-  Append --pool to any run mode to enable pool diagnostics.
+  Append --pool and/or --http to enable pool / HTTP-event-loop diagnostics.
   The pool mode preserves PostgreSQL SQL-profiling settings.
 
   ./ctl.sh begin RUN_ID
@@ -110,13 +110,15 @@ run_app() {
   local cpu="off"
   local ratio="$TRACE_RATIO"
   local diagnostics=0
-  local option="${3:-}"
-
-  [[ $# -le 3 && ( -z "$option" || "$option" == "--pool" ) ]] || {
-    echo "Usage: ctl.sh run MODE RUN_ID [--pool]" >&2
-    exit 2
-  }
-  [[ "$option" != "--pool" ]] || diagnostics=1
+  local http_diagnostics=0
+  local option
+  for option in "${@:3}"; do
+    case "$option" in
+      --pool) diagnostics=1 ;;
+      --http) http_diagnostics=1 ;;
+      *) echo "Usage: ctl.sh run MODE RUN_ID [--pool] [--http]" >&2; exit 2 ;;
+    esac
+  done
 
   validate_id "$run_id"
 
@@ -198,8 +200,9 @@ run_app() {
   sql_track="$(pg_track)"
   case "$sql_track" in all|top|none) ;; *) echo "Cannot determine pg_stat_statements.track" >&2; exit 2 ;; esac
   export BENCH_DIAGNOSTICS="$diagnostics" BENCH_RUN_ID="$run_id"
+  export BENCH_HTTP_DIAGNOSTICS="$http_diagnostics"
   unset BENCH_DIAGNOSTICS_DIR
-  if [[ "$diagnostics" == 1 ]]; then
+  if [[ "$diagnostics" == 1 || "$http_diagnostics" == 1 ]]; then
     export BENCH_DIAGNOSTICS_DIR="$run_dir/pool"
     export BENCH_DIAGNOSTICS_MAX_BYTES="${BENCH_DIAGNOSTICS_MAX_BYTES:-10485760}"
     [[ "$BENCH_DIAGNOSTICS_MAX_BYTES" =~ ^[0-9]{1,8}$ ]] &&
@@ -217,7 +220,13 @@ run_app() {
     printf 'trace_ratio=%s\n' "$ratio"
     printf 'cpu_profiler=%s\n' "$cpu"
     printf 'pool_diagnostics=%s\n' "$diagnostics"
-    if [[ "$diagnostics" == 1 ]]; then
+    printf 'http_diagnostics=%s\n' "$http_diagnostics"
+    printf 'http_sample_ratio=0.05\n'
+    if [[ "$http_diagnostics" == 1 ]]; then
+      printf 'http_files_per_worker=2\n'
+      printf 'http_file_prefix=http-worker-\n'
+    fi
+    if [[ "$diagnostics" == 1 || "$http_diagnostics" == 1 ]]; then
       printf 'pool_diagnostics_dir=%s\n' "$BENCH_DIAGNOSTICS_DIR"
       printf 'pool_file_max_bytes=%s\n' "$BENCH_DIAGNOSTICS_MAX_BYTES"
       printf 'pool_files_per_worker=2\n'

@@ -1,249 +1,393 @@
-# Node.js 26 + TypeScript 7 + PostgreSQL 18
+# Node.js 26 Conduit API
 
-Front: direct
+`node-26-dummy` implements all 19 Conduit API operations with direct `node:http`,
+strict TypeScript 7, Node.js 26, PostgreSQL 18, `pg`, `bcrypt`, and `jose`. It
+has no ORM and no HTTP framework.
 
-All 19 Conduit API operations implemented with `node:http`, parameterized SQL,
-and strict TypeScript. Five application source files: all handlers and queries
-in `src/handlers.ts`, shared helpers in `src/utils.ts`, routing/lifecycle in
-`src/server.ts`, worker supervision in `src/cluster.ts`, and opt-in pool
-instrumentation/output in `src/pool-diagnostics.ts`.
+This is the canonical project reference. Update it with every change to API
+behavior, SQL, scripts, configuration, diagnostics, or performance claims.
 
-Runtime: Node 26; compiler: TypeScript 7.0.2. Dependencies are pinned:
-`pg` 8.23.1, `bcrypt` 6.0.0, and `jose` 6.2.14. No ORM or HTTP framework.
+## Project layout
 
-## Run
+| Path | Purpose |
+|---|---|
+| `src/cluster.ts` | Cluster primary, worker budget, fail-fast supervision. |
+| `src/server.ts` | HTTP server, route matching, lifecycle and shutdown. |
+| `src/handlers.ts` | API handlers, SQL and response mapping. |
+| `src/utils.ts` | Pool, transactions, JWT, bcrypt, parsing and validation. |
+| `src/pool-diagnostics.ts` | Optional pool instrumentation and bounded JSONL output. |
+| `src/http-diagnostics.ts` | Optional HTTP/event-loop instrumentation and bounded JSONL output. |
+| `build.sh` / `start.sh` / `install.sh` | Clean build / compiled launch / Ubuntu-Debian bootstrap. |
+| `observability/` | LGTM stack, tracing, CPU profiling, SQL snapshots and diagnostics. |
 
-Node.js 26, npm, Python 3, and a C++ build toolchain are required.
-`sudo bash install.sh` installs these prerequisites on Ubuntu/Debian.
-PostgreSQL 18 and the repository's seed database must be prepared separately.
+## Requirements and installation
+
+Pinned runtime dependencies: Node.js 26, TypeScript 7.0.2, PostgreSQL 18,
+`pg` 8.23.1, `bcrypt` 6.0.0, and `jose` 6.2.14. PostgreSQL schema and Conduit
+seed data are prepared by the challenge repository, not this submission.
 
 ```bash
+cd submissions/node-26-dummy
+sudo bash install.sh
+node --version
+npm --version
+```
+
+`install.sh` supports Ubuntu/Debian x64 and arm64. It installs build prerequisites,
+downloads Node 26.13.0, verifies its SHA-256 checksum, and links `node`, `npm`,
+and `npx` into `/usr/local/bin`. It does not manage PostgreSQL.
+
+## Build and run
+
+```bash
+cd submissions/node-26-dummy
 bash build.sh
-DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit_lg \
-JWT_SECRET=dev-secret HOST=127.0.0.1 PORT=3110 bash start.sh
+npm run typecheck
+
+DATABASE_URL='postgres://conduit:conduit@127.0.0.1:5432/conduit_lg' \
+JWT_SECRET='local-development-secret-change-me' \
+HOST=0.0.0.0 PORT=3110 WORKERS=6 \
+bash start.sh
 ```
 
-`build.sh` checks Node 26, installs locked dependencies including development
-tools, builds bcrypt from source, removes only this submission's `dist/`, then
-compiles TypeScript with `noEmitOnError`. `start.sh` runs the emitted JavaScript.
-`npm run typecheck` checks types without emitting files.
+`build.sh` verifies Node 26, runs `npm ci --include=dev`, rebuilds `bcrypt` from
+source, deletes only this submission's `dist/`, and compiles with strict
+TypeScript and `noEmitOnError`. `start.sh` runs only `node dist/cluster.js`;
+there is no runtime compilation. `npm run typecheck` emits no JavaScript.
 
-`DATABASE_URL` and `JWT_SECRET` are required. The start script defaults to
-`HOST=0.0.0.0`, `PORT=3110`, and `NODE_ENV=production`. `GET /api/tags` is the
-database-backed health endpoint. There is no separate `/health` route.
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `DATABASE_URL` | yes | — | PostgreSQL connection URL. |
+| `JWT_SECRET` | yes | — | HS256 signing/verification key. |
+| `HOST` | no | `0.0.0.0` | Listening address. |
+| `PORT` | no | `3110` | Listening port. |
+| `WORKERS` | no | available CPUs, max 90 | Cluster workers, 1–90. |
+| `NODE_ENV` | no | `production` | Set by `start.sh`; does not change API semantics. |
+| `BENCH_DIAGNOSTICS` | no | disabled | Pool metrics when exactly `1`. |
+| `BENCH_HTTP_DIAGNOSTICS` | no | disabled | HTTP/event-loop metrics when exactly `1`. |
+| `BENCH_RUN_ID` | no | none | Safe identifier in diagnostic records. |
+| `BENCH_DIAGNOSTICS_DIR` | no | none | Diagnostic JSONL output directory. |
+| `BENCH_DIAGNOSTICS_MAX_BYTES` | no | `10485760` | Per-file cap, 4096–67108864. |
 
-## Workers and database budget
+Never commit a real JWT secret or database password.
 
-`WORKERS` defaults to the available CPU count, capped at 90; valid values are
-1–90. Each worker owns one pool with `min(10, floor(90 / WORKERS))` connections.
-The application can never allocate more than 90 connections, leaving 10 of
-PostgreSQL's 100 for administration and other clients. On six CPUs the maximum
-is 60. Primary computes and logs the budget and never connects to PostgreSQL.
-`PG_POOL_SIZE` is an internal value supplied by primary, not a tuning option.
+## Runtime architecture
 
-An unexpected worker exit (even exit code 0) stops the entire cluster with exit
-code 1; workers are never restarted. SIGINT/SIGTERM drain HTTP requests and close
-database pools. Workers have a nine-second shutdown deadline; primary kills
-remaining workers after ten seconds and exits unsuccessfully if forced cleanup
-was needed. HTTP keep-alive is 75 seconds.
+The primary process computes the worker count once and never connects to
+PostgreSQL. Every worker has one `pg.Pool`:
 
-## API behavior
+- `WORKERS` defaults to `min(availableParallelism(), 90)`.
+- Pool size is `min(10, floor(90 / WORKERS))`.
+- The application uses at most 90 PostgreSQL connections, reserving 10 of a
+  100-connection server. Six workers therefore have 60 total connections.
+- `PG_POOL_SIZE` is an internal primary-to-worker setting, not a public tuning
+  setting.
+- Any unexpected worker exit, including code 0, stops the cluster non-zero;
+  there is no restart loop.
+- SIGINT/SIGTERM stop new work, drain handlers, close pools and flush enabled
+  diagnostics. Worker timeout is nine seconds; primary force-kills after ten.
 
-The implementation follows `SPEC.md` and the conformance suite. Authentication
-uses HS256 with mandatory expiration and decimal-string subjects; credentials
-and tokens are never cached. Password hashing/verification is asynchronous
-bcrypt (cost 10 for new hashes), with a 72-byte UTF-8 password limit.
+HTTP keep-alive is 75 seconds and headers timeout is 80 seconds. `GET /api/tags`
+is the database-backed health endpoint; there is no `/health` route.
 
-Article creation, tags, and links commit together. Failures roll back and release
-the connection. IDs remain strings internally; numeric response fields are
-checked for safe JSON integer conversion. An unrepresentable comment ID causes
-an error rather than rounding; comment creation rolls back in that case.
-Pagination is validated strictly, slugs are generated using the reference SQL,
-and every data response reads PostgreSQL. No schema changes or result caches.
+## HTTP API and SQL
 
-## Validation
+All SQL uses positional parameters. “Auth lookup” below means JWT validation plus
+`SELECT id FROM users WHERE id=$1` when a token is supplied. Optional auth permits
+no header, but rejects an invalid supplied header. Article projections include
+author, ordered tags, favorite count, and viewer-specific following/favorited
+flags. List projections omit article body; detail projections include it.
 
-From the repository root, with PostgreSQL administrator access configured via
-the usual `PGHOST`, `PGPORT`, `PGUSER`, and optional `PGPASSWORD` variables:
+### Users and profiles
+
+| Endpoint | Auth | SQL operations |
+|---|---|---|
+| `POST /api/users` | none | bcrypt hash; `INSERT users ... RETURNING` user fields; issue JWT. |
+| `POST /api/users/login` | none | `SELECT` user/password hash by email; bcrypt compare; issue JWT. |
+| `GET /api/user` | required | JWT verify; one `SELECT` user fields by id. |
+| `PUT /api/user` | required | Auth lookup; optional bcrypt; `UPDATE users` with `COALESCE`, `RETURNING` fields. |
+| `GET /api/profiles/:username` | optional | Auth lookup; `SELECT users` by username plus `EXISTS follows` viewer flag. |
+| `POST /api/profiles/:username/follow` | required | Auth lookup; target-user lookup; `INSERT follows ... ON CONFLICT DO NOTHING`. |
+| `DELETE /api/profiles/:username/follow` | required | Auth lookup; target-user lookup; `DELETE follows`. |
+
+### Articles
+
+| Endpoint | Auth | SQL operations |
+|---|---|---|
+| `GET /api/articles` | optional | Auth lookup; paged list and capped count described below. |
+| `GET /api/articles/feed` | required | Auth lookup; LATERAL feed page, capped count, article enrichment. |
+| `GET /api/articles/:slug` | optional | Auth lookup; full article projection filtered by slug. |
+| `POST /api/articles` | required | Auth lookup; transaction: allocate ID, insert article and SQL slug; insert missing tags; insert article-tag links; commit; project result. |
+| `PUT /api/articles/:slug` | required | Auth lookup; article identity/owner lookup; `UPDATE articles`; recalculate slug when title changes; project result. |
+| `DELETE /api/articles/:slug` | required | Auth lookup; identity/owner lookup; `DELETE articles`; 204. |
+| `POST /api/articles/:slug/favorite` | required | Auth lookup; article lookup; idempotent `INSERT favorites`; project result. |
+| `DELETE /api/articles/:slug/favorite` | required | Auth lookup; article lookup; `DELETE favorites`; project result. |
+
+### Comments and tags
+
+| Endpoint | Auth | SQL operations |
+|---|---|---|
+| `GET /api/articles/:slug/comments` | optional | Auth lookup; article identity lookup; newest 100 comments joined to authors, `EXISTS follows`, ordered by `created_at DESC, id DESC`. |
+| `POST /api/articles/:slug/comments` | required | Auth lookup; article lookup; transaction with `INSERT comments ... RETURNING` joined to author. |
+| `DELETE /api/articles/:slug/comments/:id` | required | Auth lookup; validate id; owner lookup joined to article slug; `DELETE comments`; 204. |
+| `GET /api/tags` | ignored | `SELECT name FROM tags ORDER BY name`; ignores `Authorization`. |
+
+### List query shapes
+
+Lists sort by article ID descending. Counts are capped at 1000 independently of
+the page. The first non-empty list filter wins: `tag`, then `author`, then
+`favorited`; unknown values return an empty list.
+
+| Form | Page selection before enrichment | Capped count |
+|---|---|---|
+| Global | Derived `articles` relation, ordered and `LIMIT/OFFSET` before projection. | `articles`, first 1000 rows. |
+| Tag | Ordered IDs from `article_tags`, then enriched `articles WHERE id IN (page)`. | `article_tags` only. |
+| Author | Direct filtered `articles`, ordered and paged before projection. | `articles` only. |
+| Favorited | Ordered IDs from `favorites`, then enriched `articles WHERE id IN (page)`. | `favorites` only. |
+| Feed | `follows CROSS JOIN LATERAL` gets at most `limit + offset` IDs per followed author; sorts globally, pages, enriches. | Followed-author `articles`, first 1000 rows. |
+
+The feed addition is cast to PostgreSQL `bigint` to preserve maximum-offset
+behavior.
+
+## Correctness rules
+
+`SPEC.md` and conformance are the external contract. Current implementation:
+
+- Accepts only `Authorization: Token <jwt>`, HS256, valid `exp`, and a positive
+  decimal PostgreSQL-bigint `sub`.
+- Authenticates protected routes before body validation; `/api/tags` ignores auth.
+- Uses async bcrypt cost 10 and rejects new passwords over 72 UTF-8 bytes.
+- Parses bodies as `unknown`, limits them to 1 MiB, rejects malformed JSON and
+  invalid wrappers/types with 422, and ignores unknown fields.
+- Accepts decimal-only `limit` 1–100 and `offset` 0–2147483647; leading zeroes
+  are valid, signs/whitespace/fractions/overflow are not.
+- Retains bigint IDs as strings internally and checks every numeric API output
+  with `Number.isSafeInteger`; it never rounds silently.
+- Builds slugs in PostgreSQL: non-alphanumeric runs become `-`, lowercased and
+  trimmed, then `-<id>` is appended.
+- Uses a transaction for article/tag/link creation and comment creation.
+- Returns UTC ISO timestamps, 201 for creation, 204 with no body for deletion,
+  and errors as `{ "errors": { "body": ["..."] } }`.
+
+## Query-shape optimizations
+
+No schema, index, PostgreSQL configuration, pool-size, or worker-count changes
+are made by this submission. Current optimizations preserve response semantics:
+
+1. Tag and favorited lists page link-table IDs before article enrichment. Their
+   capped counts read their link table instead of joining `articles`.
+2. The global list pages articles before author/tag/favorite/viewer enrichment;
+   skipped rows do not receive that work.
+3. Tag names use `tags.id = article_tags.tag_id`, allowing `tags_pkey` lookup on
+   the tuned large database instead of repeated full tag scans.
+4. Feed keeps the tested LATERAL form rather than a slower join alternative.
+5. `GET /api/user` returns user data in the same query that confirms it exists.
+
+`favorites_count` remains one subquery per returned article. It is a future
+candidate, not an implemented optimization. Do not claim a speedup without the
+same seed, workload, network path, database state, and instrumentation mode.
+
+Read-only SQL equivalence and selected plan checks:
 
 ```bash
-PORT=3111 WORKERS=1 bash test/run.sh submissions/node-26-dummy
-PORT=3111 bash test/run.sh submissions/node-26-dummy
-```
-
-The harness builds and starts the app on a temporary clone of `conduit_dev`,
-runs conformance, and removes that clone. It never tests against your working
-application database.
-
-Supplemental integration tests, from this submission directory:
-
-```bash
-TEST_DATABASE_URL=postgres://postgres@127.0.0.1:5432/postgres npm test
-```
-
-The supplied URL must have permission to create/drop databases and change grants
-in its own test clone. `test.mjs` creates a uniquely named clone of `conduit_dev`
-and removes it in cleanup. It checks transaction rollback, bigint conversion,
-pagination boundaries, a saturated connection budget, draining active requests,
-pool closure, fail-fast on worker crashes and unexpected exit 0, and forced
-termination of an unresponsive worker. `TEST_PORT` defaults to 33112.
-
-Verified on Node 26.13.0 and PostgreSQL 18.6, using an isolated PostgreSQL instance
-and the fingerprint-verified dev seed: conformance **197/197** with one worker
-and **197/197** with the default six workers. Strict compilation and supplemental
-integration checks pass. These are correctness checks, not performance scores.
-
-## First SQL optimizations (2026-10-31)
-
-Changes are limited to query shape and eliminating a redundant user lookup:
-
-- Tag/favorited pages select ordered IDs with LIMIT/OFFSET from the indexed link
-  table before fetching articles, authors, tags and favorite counts.
-- Their capped counts read only the link table. Its foreign keys and composite
-  primary key guarantee the same count without joining `articles`.
-- Feed uses the reference LATERAL query: at most `limit + offset` IDs per followed
-  author, then the global page, then enrichment. The sum uses bigint to avoid
-  overflow at the maximum allowed offset.
-- `/api/user` verifies the JWT and fetches the user in one SQL statement instead
-  of two. Missing/deleted users still return 401; no verification cache is added.
-- Global/author page queries retain their direct index paths: an experimental
-  ID-first variant added PK lookups and increased estimated cost, so was omitted.
-
-Read-only checks on the existing full-size `conduit_lg` used a single repeatable
-read snapshot, sequential queries, and EXPLAIN **without ANALYZE**. For one fixture
-per filter, viewer 100, limit 20, offset 0, planner total costs were:
-
-| SQL | Before | After |
-|---|---:|---:|
-| Tag page | 817.25 | 130.80 |
-| Tag capped count | 692.13 | 38.42 |
-| Favorited page | 384.89 | 368.75 |
-| Favorited capped count | 30.82 | 6.81 |
-| Feed page | 482.53 | 477.82 |
-| Global / author page | 309.01 / 332.66 | unchanged |
-
-These are **planner cost units, not milliseconds or measured speedups**. The tag
-page now uses `article_tags_tag_idx`; its count no longer probes `articles_pkey`.
-This verifies removal of unnecessary work, not its share of CPU during the 10k
-VU run. Feed improvement is workload-dependent: many follows or deep offsets
-can still require many candidates. No indexes, schema, PostgreSQL configuration,
-pool budgets, or production data were changed. No load benchmark was run.
-
-Reproduce the read-only equivalence/plan checks from this submission directory:
-
-```bash
+cd submissions/node-26-dummy
 npm run build
-TEST_SQL_DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit_lg \
+TEST_SQL_DATABASE_URL='postgres://conduit:conduit@127.0.0.1:5432/conduit_lg' \
 TEST_SQL_ALLOW_MISSING_FIXTURE=1 TEST_SQL_EXPECT_TAG_INDEX=1 node test-sql.mjs
 ```
 
-The check now compares actual handler SQL against previous query shapes: 80
-page/count pairs covering all filters, anonymous/authenticated viewers, offsets,
-missing filters and filter precedence. It also checks the maximum feed offset,
-single-query current-user lookup, and unknown-user 401. It uses one connection,
-a read-only transaction, and a 10-second per-statement timeout. The database must
-contain the standard seed fixtures. It now runs EXPLAIN ANALYZE for selected
-queries. No-tag fixtures must be supplied in an isolated clone; the opt-in
-ALLOW_MISSING_FIXTURE skips absent fixtures on a read-only working database.
-EXPECT_TAG_INDEX asserts the actual index choice on the tuned full database.
-Results and SQL parameters are not logged.
+This uses one read-only transaction and statement timeout; it compares query
+shapes across filters, viewers, offsets and capped counts, and runs selected
+`EXPLAIN ANALYZE` checks. It does not alter its database.
 
-Remaining hypothesis: excess scanning/index probes contribute to PostgreSQL CPU
-saturation. Their contribution and the resulting RPS/p95 change still need an
-identical-workload before/after benchmark or SQL profiling under load. A larger
-pool is not justified by the available measurements. Rebuild and restart the
-application to use these changes; an already running server is not updated.
+## Testing
 
-## Page enrichment and pool diagnostics (2026-11-01)
-
-The global unfiltered list now selects article rows with LIMIT/OFFSET before
-enrichment, without an extra article PK lookup. Tag names use scalar lookups by
-tag ID in the shared article projection. PostgreSQL still chooses the physical
-access path: the tuned full database uses `tags_pkey`, while default costs on the
-small dev seed can prefer a sequential scan. Filtered page selection, LATERAL,
-favorites counts and capped counts retain their existing semantics.
-
-`BENCH_DIAGNOSTICS=1` installs diagnostics on the existing pool in each worker.
-Unset/0 does not import the diagnostics module and installs no diagnostic
-wrappers, timers or event listeners. The pool's
-max, idle timeout, release behavior and transaction handling are unchanged.
-
-From this submission directory, after building, start in the foreground:
+From repository root, conformance creates and removes a fresh clone of
+`conduit_dev`; do not direct it at a working benchmark database:
 
 ```bash
-bash observability/ctl.sh run pool pool-001
-bash observability/ctl.sh run trace5 trace-pool-001 --pool
+cd /home/padlo/projects/multicore-server-challenge
+PORT=3111 WORKERS=1 bash test/run.sh submissions/node-26-dummy
+PORT=3111 WORKERS=6 bash test/run.sh submissions/node-26-dummy
 ```
 
-Run one command at a time on a free configured port. `pool` preserves SQL
-profiling settings and disables OTel/V8 profiling. `trace5 --pool` retains the
-existing trace5 behavior, including its SQL-profiling configuration step.
-Other modes explicitly set diagnostics to 0 unless `--pool` is passed. The
-effective setting is recorded as `pool_diagnostics` in the run manifest.
-`pg_stat_statements_track` records the actual `SHOW pg_stat_statements.track`
-result, including in `pool` mode: this read does not change PostgreSQL settings.
-Configuration stays in `observability/modes.env` and `runtime.env`.
+Set `PGHOST`, `PGPORT`, `PGUSER`, and optionally `PGPASSWORD` for a non-default
+PostgreSQL server. Correctness has passed conformance 197/197 with one and six
+workers on isolated PostgreSQL 18.6 seed clones.
 
-Each worker writes one `pool_diagnostics` JSON line every 10 seconds to stdout,
-plus a final partial interval on graceful shutdown. `run_id` matches OTel
-`benchmark.run_id`; `pid` matches `process.pid`; hostname and UTC interval bounds
-allow correlation with Tempo. `worker_id` and `sequence` distinguish processes
-and consecutive intervals. Primary does not create a pool or emit pool metrics.
-
-The controller also saves JSON lines under
-`observability/runs/<RUN_ID>/pool/worker-<worker_id>-<pid>.jsonl`.
-Each worker keeps the current file and one `.1` backup, each at most 10 MiB
-(at most 120 MiB for a normal six-worker run). Rotation preserves whole records
-and overwrites the oldest backup. Files are created with mode 0600. Set
-`BENCH_DIAGNOSTICS_MAX_BYTES` in `observability/modes.env` to override the
-per-file limit (4096–67108864 bytes); the manifest records this limit and path.
-Direct launches can opt into file output via `BENCH_DIAGNOSTICS_DIR`.
-
-Stdout and file output have independent queues capped at 64 KiB each per worker.
-Stdout respects both write callbacks and backpressure (`drain`); a blocked pipe
-does not block file logging. Overflow drops records, prioritizing the final
-record over queued older records. `output.stdout` and `output.file` report
-cumulative `pending_bytes`, `dropped`, and `errors` as observed before emitting
-the current record. File failures disable that sink and are reported at shutdown;
-they do not interrupt API requests. Disk writes add overhead only when enabled.
-
-Histogram buckets are **non-cumulative**, with inclusive upper bounds in
-`histogram_upper_bounds_ms`; the last bucket is overflow. Every histogram has
-`count`, `sum_ms`, `max_ms` and `buckets`. Acquisitions are assigned to the interval
-in which they finish. `all` includes failures; `new`, `reused`, `unknown` and
-`failed` partition it. `new` means the first successful acquisition of a client
-observed through the pool's physical `connect` event, not an increase in size.
-Connection ages start at successful connection establishment.
-
-Acquisition duration includes connection creation, scheduling and possible
-queueing. It is **not pure queue wait**. `waitingCount` can briefly be nonzero
-even with an idle connection because pg-pool schedules delivery on nextTick.
-Gauge maxima are observations at events/acquisitions and one-second samples,
-not guaranteed exact peaks. Histogram quantiles have bucket resolution.
-
-Diagnostics do not create spans or log requests, SQL, parameters or credentials.
-The wrapper delegates to the existing connect method, including OTel's wrapper,
-and forwards the original client/release. Shutdown waits for asynchronous
-`remove` events after `pool.end()`, then gives output queues up to 1500 ms to
-flush. Files close independently of blocked stdout. The deadline prevents a
-blocked consumer from hanging graceful shutdown; pending records can be lost
-on timeout or sink failure. SIGKILL or the existing forced-shutdown deadline
-can also prevent the final record. This is bounded diagnostic logging, not a
-durable audit log (no fsync guarantee).
-
-Validation scripts (use your isolated PostgreSQL instance/clone):
+Integration tests require an isolated PostgreSQL admin URL; they create/remove
+their own `node26_*` clone:
 
 ```bash
-TEST_DATABASE_URL=postgres://postgres@127.0.0.1:55432/postgres node test-pool.mjs
-node observability/test-ctl.mjs
+cd submissions/node-26-dummy
+TEST_DATABASE_URL='postgres://postgres@127.0.0.1:55432/postgres' npm test
+TEST_DATABASE_URL='postgres://postgres@127.0.0.1:55432/postgres' node test-pool.mjs
+node observability/test-http.mjs
 node observability/test-output.mjs
-TEST_DATABASE_URL=postgres://conduit:conduit@127.0.0.1:55432/node26_diag_checks node observability/verify.mjs otel
-TEST_DATABASE_URL=postgres://conduit:conduit@127.0.0.1:55432/node26_diag_checks node observability/verify.mjs overhead
+node observability/test-ctl.mjs
 ```
 
-The OTel check uses a private local OTLP HTTP/JSON receiver with the same ESM
-auto-instrumentation hooks. The overhead check uses six workers, 30s warmup and
-60s measured at 100 RPS per run, tracing disabled, three alternating OFF/ON
-pairs. It logs Node CPU ticks (Linux `getconf CLK_TCK`), latency, errors, stdout
-bytes, and scheduler lateness. It is a local read-only diagnostic workload, not
-the official 10k-VU benchmark. See [validation results](observability/VALIDATION.md).
+`test.mjs` covers lifecycle, rollback, bigint, pagination, fail-fast and shutdown.
+`test-pool.mjs` covers callback/Promise compatibility, reuse, saturation, errors,
+transactions and release. Focused observability tests cover backpressure,
+rotation, HTTP phases/sizes, premature close and controller behavior.
+
+OTel and local diagnostic-overhead verification need an isolated seeded clone:
+
+```bash
+TEST_DATABASE_URL='postgres://conduit:conduit@127.0.0.1:55432/node26_diag_checks' \
+node observability/verify.mjs otel
+TEST_DATABASE_URL='postgres://conduit:conduit@127.0.0.1:55432/node26_diag_checks' \
+OVERHEAD_PAIRS=2 node observability/verify.mjs overhead
+```
+
+The overhead verifier is local, six-worker, read-only 100 RPS with 30-second
+warmup and 60-second measured periods; it is not an official high-VU benchmark.
+
+## Observability
+
+Run these commands from `submissions/node-26-dummy` after `bash build.sh`.
+`observability/runtime.env` provides `DATABASE_URL` and `JWT_SECRET` to the
+controller. `observability/modes.env` provides `PORT`, `HOST`, and `TRACE_RATIO`.
+Treat both as local secret/configuration files.
+
+### LGTM stack
+
+`compose.yaml` runs Grafana LGTM locally: Grafana `127.0.0.1:3300`, OTLP HTTP
+`127.0.0.1:4318`. Set `GRAFANA_ADMIN_PASSWORD` in `observability/.env` first.
+
+```bash
+export GRAFANA_ADMIN_PASSWORD='choose-a-local-password'
+bash observability/ctl.sh stack start
+bash observability/ctl.sh stack status
+bash observability/ctl.sh stack logs
+bash observability/ctl.sh status
+bash observability/ctl.sh stack stop
+```
+
+### Controller modes
+
+`ctl.sh run` launches Node in the foreground. Press Ctrl+C for graceful shutdown.
+`RUN_ID` must be unique and match `[A-Za-z0-9_-]+`; output goes to
+`observability/runs/<RUN_ID>/manifest.txt`.
+
+| Command | Global SQL profile change | Trace | CPU profile |
+|---|---|---|---|
+| `bash observability/ctl.sh run baseline RUN_ID` | off | off | off |
+| `bash observability/ctl.sh run pool RUN_ID` | preserve | off | off |
+| `bash observability/ctl.sh run sql RUN_ID` | on | off | off |
+| `bash observability/ctl.sh run trace5 RUN_ID` | on | 5% | off |
+| `ALLOW_FULL_TRACE=1 bash observability/ctl.sh run trace100 RUN_ID` | on | 100% | off |
+| `bash observability/ctl.sh run cpu RUN_ID` | on | off | on |
+| `bash observability/ctl.sh run deep RUN_ID` | on | 5% | on |
+
+Append `--pool`, `--http`, or both:
+
+```bash
+# Pool plus HTTP/event-loop metrics; preserves PostgreSQL settings.
+bash observability/ctl.sh run pool diag-001 --http
+
+# Sampled traces with both diagnostic families.
+bash observability/ctl.sh run trace5 trace-001 --pool --http
+```
+
+`pool` only reads `SHOW pg_stat_statements.track`. Other modes marked `on/off`
+call `sql-profile.sh`, which uses `ALTER SYSTEM` and `pg_reload_conf()` to change
+global `pg_stat_statements.track`, `track_io_timing`, and planning tracking. Do
+not run those global modes on shared PostgreSQL without authorization.
+
+Direct SQL-profile controller commands are:
+
+```bash
+bash observability/ctl.sh sql status
+bash observability/ctl.sh sql off
+bash observability/ctl.sh sql on
+bash observability/ctl.sh sql detailed
+```
+
+`off` sets statement tracking to `none`; `on` sets top-level tracking without I/O
+or planning timing; `detailed` enables both I/O timing and planning tracking.
+
+`observability/run-node.sh off|sampled|full` is a lower-level compiled-node OTel
+launcher. It requires `DATABASE_URL`, `JWT_SECRET`, and `modes.env`; `full`
+requires `ALLOW_FULL_TRACE=1`. Prefer `ctl.sh run` because it writes a manifest.
+
+### SQL snapshots
+
+Use snapshots for a real `pg_stat_statements` delta around a manually run load:
+
+```bash
+bash observability/ctl.sh begin run-001
+# Run the load generator manually.
+bash observability/ctl.sh end run-001
+bash observability/ctl.sh report run-001
+```
+
+`sql-snapshot.sh` saves begin/end CSV plus reset/deallocation metadata.
+`sql-diff.py` refuses a delta if that metadata changed, then reports calls, total
+execution time, mean execution time and truncated normalized SQL. It reports SQL
+execution, not complete HTTP latency, and does not reset statistics.
+
+### Pool diagnostics
+
+`BENCH_DIAGNOSTICS=1` instruments the existing worker pool. It preserves pool
+callbacks, promises, release and transaction ownership and does not make another
+pool. Every 10 seconds each worker emits `pool_diagnostics` containing current
+and observed peak `totalCount`/`idleCount`/`waitingCount`, acquisition outcomes
+and fixed histograms, new/reused client counts, connection create/remove counts,
+and removed-client lifetime.
+
+Acquisition duration includes queueing, physical creation and scheduling; it is
+not pure queue wait. New clients are identified from physical pool `connect`
+events and client identity. Gauge maxima are observed at events and 1-second
+samples, not continuous perfect peaks.
+
+### HTTP/event-loop diagnostics
+
+`BENCH_HTTP_DIAGNOSTICS=1` is imported only when enabled. Every 10 seconds each
+worker emits `http_diagnostics` records with fixed route labels, never URLs/slugs.
+
+- Worker records: UTC interval, PID, worker id, ELU, process CPU delta, and
+  event-loop delay p50/p95/p99/max.
+- Endpoint records: starts, `finish`, premature close, HTTP errors, in-flight,
+  callback-to-`response.end()` (`handler_ms`) and `response.end()`-to-finish
+  (`flush_ms`) histograms.
+- Response groups: prepared JSON bodies `<=4 KiB`, `>4–64 KiB`, `>64 KiB`, each
+  with handler/flush histograms.
+- Random 5% sample: JSON preparation duration; comments also reports auth,
+  article lookup, comments query and mapping durations.
+
+`handler_ms` includes asynchronous waits, not only JavaScript CPU. `flush_ms`
+means Node handed data to its lower layer; it does not prove the remote client
+received it. Event-loop delay has a 20-ms sampling resolution. Histograms are
+fixed and non-cumulative; never subtract independent percentiles.
+
+### Output and retention
+
+Enabled diagnostics write JSONL to stdout and, through `ctl.sh`, to:
+
+```text
+observability/runs/<RUN_ID>/pool/worker-<worker>-<pid>.jsonl
+observability/runs/<RUN_ID>/pool/http-worker-<worker>-<pid>.jsonl
+```
+
+Each stream retains a current file and one `.1` backup. Default cap is 10 MiB per
+file, files are mode 0600, and pool plus HTTP output can retain 240 MiB for six
+workers. Each stream has independent 64-KiB stdout/file queues, honors stdout
+backpressure, and gets 1500 ms to flush on shutdown. Counters expose dropped and
+failed output; SIGKILL or a sink failure can lose records. This is bounded
+diagnostic logging, not durable auditing: no `fsync`, per-request records, SQL,
+parameters, JWTs, credentials, or personal data.
+
+## Performance context
+
+Historical pre-current-SQL baseline: 10,000 VUs for 300 seconds, 2,625.9 RPS,
+p95 69.2 ms, p99 117.9 ms, 0% errors. It is not comparable to a current build
+unless seed, workload, route, PostgreSQL state and instrumentation mode match.
+
+See [observability/VALIDATION.md](observability/VALIDATION.md) for actual local
+diagnostic verification and ON/OFF overhead measurements. Diagnostics have
+measurable overhead; enable them to explain a controlled run, then disable them
+for clean benchmarks. Known candidates for future measured work include
+`favorites_count`, CPU/event-loop contention, response serialization/output, and
+network delivery. Change one variable at a time and preserve conformance.

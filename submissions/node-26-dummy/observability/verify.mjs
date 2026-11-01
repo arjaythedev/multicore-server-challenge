@@ -56,7 +56,8 @@ async function start(enabled, extraEnv = {}) {
     env: { ...process.env, NODE_OPTIONS: '', OTEL_SDK_DISABLED: 'true',
       DATABASE_URL: dbUrl.href, JWT_SECRET: secret, HOST: '127.0.0.1', PORT: String(port), WORKERS: '6',
       BENCH_DIAGNOSTICS: enabled ? '1' : '0', BENCH_RUN_ID: `verify-${mode}-${enabled ? 'on' : 'off'}`,
-      BENCH_DIAGNOSTICS_DIR: enabled ? logDir : '', BENCH_DIAGNOSTICS_MAX_BYTES: '4096', ...extraEnv },
+      BENCH_HTTP_DIAGNOSTICS: enabled ? '1' : '0',
+      BENCH_DIAGNOSTICS_DIR: enabled ? logDir : '', BENCH_DIAGNOSTICS_MAX_BYTES: '10485760', ...extraEnv },
     stdio: ['ignore', 'pipe', 'pipe'] });
   app.port = port; app.logDir = logDir; app.output = ''; app.errors = ''; app.bytes = 0;
   app.stdout.on('data', chunk => { app.output += chunk; app.bytes += chunk.length; });
@@ -80,7 +81,7 @@ async function stop(app, enabled) {
   assert.equal(exit.code, 0, app.errors);
   for (const pid of workerPids(app)) assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
   const all = records(app);
-  if (!enabled) assert.equal(all.length, 0);
+  if (!enabled) { assert.equal(all.length, 0); assert(!app.output.includes('"event":"http_diagnostics"')); }
   else {
     const final = all.filter(r => r.final);
     assert.equal(final.length, 6);
@@ -94,8 +95,21 @@ async function stop(app, enabled) {
       const content = readFileSync(join(app.logDir, filename), 'utf8').trim().split('\n').map(JSON.parse);
       assert.deepEqual(content.at(-1), record, 'final JSON on disk matches stdout');
     }
-    for (const file of files) assert(statSync(join(app.logDir, file)).size <= 4096);
-    assert(files.length <= 12);
+    for (const file of files) assert(statSync(join(app.logDir, file)).size <= 10485760);
+    assert(files.length <= 24);
+    const httpRecords = app.output.split('\n').flatMap(line => { try { const r = JSON.parse(line); return r.event === 'http_diagnostics' ? [r] : []; } catch { return []; } });
+    assert.equal(httpRecords.filter(r => r.kind === 'worker' && r.final).length, 6);
+    for (const r of httpRecords.filter(r => r.kind === 'worker')) {
+      assert.equal(r.output.stdout.dropped, 0); assert.equal(r.output.stdout.errors, 0);
+      assert.equal(r.output.file.dropped, 0); assert.equal(r.output.file.errors, 0);
+    }
+    for (const pid of workerPids(app)) {
+      const r = httpRecords.filter(r => r.pid === pid && r.kind === 'endpoint');
+      assert.equal(r.reduce((s, x) => s + x.started, 0), r.reduce((s, x) => s + x.finished + x.premature_close, 0));
+      assert(r.filter(x => x.final).every(x => x.in_flight === 0));
+      const file = files.find(f => f.startsWith('http-worker-') && f.endsWith(`-${pid}.jsonl`));
+      assert(file); assert(readFileSync(join(app.logDir, file), 'utf8').includes('"final":true'));
+    }
     for (const pid of workerPids(app)) {
       const own = all.filter(r => r.pid === pid);
       assert.equal(own.reduce((sum, r) => sum + r.connections.created, 0), own.reduce((sum, r) => sum + r.connections.removed, 0));

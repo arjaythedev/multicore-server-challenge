@@ -1,6 +1,6 @@
 import { authenticate, authenticateUser, fail, first, issueToken, optional, pagination, passwordHash,
   passwordMatches, pool, readBody, safeInteger, sendJson, string, transaction, validId,
-  type Handler, type RequestContext, type UserRow } from './utils.js';
+  httpDiagnostics, type Handler, type RequestContext, type UserRow } from './utils.js';
 
 interface Profile { username: string; bio: string | null; image: string | null; following: boolean }
 interface ArticleRow extends Profile {
@@ -177,6 +177,7 @@ export const deleteArticle: Handler = async ({ request, response, params }) => {
   const row = await articleIdentity(params.slug);
   owner(row.author_id, auth.id);
   await pool.query('DELETE FROM articles WHERE id=$1', [row.id]);
+  httpDiagnostics?.end(response, 0);
   response.writeHead(204).end();
 };
 async function favorite(context: RequestContext, add: boolean): Promise<void> {
@@ -191,11 +192,16 @@ export const favoriteArticle: Handler = c => favorite(c, true);
 export const unfavoriteArticle: Handler = c => favorite(c, false);
 export const listComments: Handler = async ({ request, response, params }) => {
   const auth = await authenticate(request, false);
+  httpDiagnostics?.phase(response, 'auth');
   const row = await articleIdentity(params.slug);
+  httpDiagnostics?.phase(response, 'lookup');
   const comments = (await pool.query<CommentRow>(`SELECT c.id,c.body,c.created_at,c.updated_at,u.username,u.bio,u.image,
     EXISTS(SELECT 1 FROM follows WHERE follower_id=$1 AND followee_id=c.author_id) following
     FROM comments c JOIN users u ON u.id=c.author_id WHERE c.article_id=$2 ORDER BY c.created_at DESC,c.id DESC LIMIT 100`, [auth.id, row.id])).rows;
-  sendJson(response, 200, { comments: comments.map(comment) });
+  httpDiagnostics?.phase(response, 'query');
+  const mapped = comments.map(comment);
+  httpDiagnostics?.phase(response, 'mapping');
+  sendJson(response, 200, { comments: mapped });
 };
 export const createComment: Handler = async ({ request, response, params }) => {
   const auth = await authenticate(request);
@@ -218,6 +224,7 @@ export const deleteComment: Handler = async ({ request, response, params }) => {
     WHERE c.id=$1 AND a.slug=$2`, [params.id, params.slug])).rows);
   owner(row.author_id, auth.id);
   await pool.query('DELETE FROM comments WHERE id=$1', [params.id]);
+  httpDiagnostics?.end(response, 0);
   response.writeHead(204).end();
 };
 export const listTags: Handler = async ({ response }) => {

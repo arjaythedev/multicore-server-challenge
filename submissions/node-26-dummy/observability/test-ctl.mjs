@@ -47,6 +47,9 @@ printf 'effective_pool=%s run=%s tracing=%s\\n' "$BENCH_DIAGNOSTICS" "$BENCH_RUN
   assert(run(['run', 'trace5', 'trace-test', '--pool']).includes('effective_pool=1 run=trace-test tracing=false'));
   assert(readFileSync(join(obs, 'runs/trace-test/manifest.txt'), 'utf8').includes('pool_diagnostics=1'));
   assert.equal(readFileSync(env.TEST_SQL_CALLS, 'utf8'), 'off\non\n');
+  run(['run', 'pool', 'http-test', '--http']);
+  assert(readFileSync(join(obs, 'runs/http-test/manifest.txt'), 'utf8').includes('http_diagnostics=1'));
+  assert(readFileSync(join(obs, 'runs/pool-test/manifest.txt'), 'utf8').includes('http_diagnostics=0'));
   run(['run', 'pool', 'invalid-option', '--bad'], false);
   run(['run', 'pool', '../bad'], false);
   run(['run', 'pool', 'pool-test'], false);

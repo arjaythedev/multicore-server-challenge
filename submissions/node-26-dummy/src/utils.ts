@@ -27,6 +27,8 @@ pool.on('error', (error: Error) => { console.error('Idle database connection err
 
 // Nothing is installed or measured when diagnostics are disabled.
 export let finishPoolDiagnostics: (() => Promise<void>) | undefined;
+export const httpDiagnostics = process.env.BENCH_HTTP_DIAGNOSTICS === '1'
+  ? await (await import('./http-diagnostics.js')).createHttpDiagnostics() : undefined;
 if (process.env.BENCH_DIAGNOSTICS === '1') {
   const { instrumentPool } = await import('./pool-diagnostics.js');
   finishPoolDiagnostics = await instrumentPool(pool);
@@ -49,10 +51,12 @@ export async function transaction<T>(work: (client: PoolClient) => Promise<T>): 
 }
 
 export function sendJson(response: ServerResponse, status: number, body: unknown): void {
+  const serializationStart = httpDiagnostics?.serializationStart(response);
   const payload = JSON.stringify(body);
   if (payload === undefined) throw new Error('Response is not JSON');
-  response.writeHead(status, { 'content-type': 'application/json; charset=utf-8',
-    'content-length': Buffer.byteLength(payload) });
+  const bytes = Buffer.byteLength(payload);
+  response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': bytes });
+  httpDiagnostics?.end(response, bytes, serializationStart);
   response.end(payload);
 }
 export function sendError(response: ServerResponse, status: number, message: string): void {
