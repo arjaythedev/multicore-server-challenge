@@ -1,0 +1,3 @@
+{"run":"baseline","eq_users":80000,"rps":18774,"p95":114,"p99":162,"app_us":152,"pg_us":265,"status":"baseline"}
+{"run":"e1-planner","eq_users":120000,"rps":29677,"p95":59,"p99":81,"app_us":117.6,"pg_us":140.9,"status":"keep"}
+{"run":"e2-tagids","eq_users":120000,"rps":30311,"p95":41,"p99":59,"app_us":118.7,"pg_us":134.0,"status":"keep"}
