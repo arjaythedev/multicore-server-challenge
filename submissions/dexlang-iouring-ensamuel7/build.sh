@@ -14,6 +14,7 @@ else
 fi
 
 "$DEX" version
+"$DEX" mod download
 "$DEX" build server.dx
 
 test -x build/server

@@ -7,6 +7,7 @@ import "time"
 import "os"
 import "num"
 import "queries"
+import "github.com/ensamuel7/dex-modules/dexqu" as "q"
 
 let conn: int = -1
 let jwtSecret: string = ""
@@ -521,11 +522,38 @@ fn optionalString(obj: json.Value, key: string, nonEmpty: bool): OptField {
     return OptField { value: s, present: true, valid: true }
 }
 
-fn bindOpt(st: int, idx: int, f: OptField): void {
-    if (f.present) {
-        db.bindStr(st, idx, f.value)
-    } else {
-        db.bindNull(st, idx)
+let preparedSt: int[] = []
+let preparedQ: q.Query[] = []
+
+fn slotsOf(st: int, name: string): int[] {
+    for (let i: int = 0; i < preparedSt.len(); i = i + 1) {
+        if (preparedSt[i] == st) {
+            return preparedQ[i].slots(name)
+        }
+    }
+    let none: int[] = []
+    return none
+}
+
+fn bindL(st: int, name: string, v: long): void {
+    foreach (slotsOf(st, name) as at) {
+        db.bindLong(st, at, v)
+    }
+}
+
+fn bindS(st: int, name: string, v: string): void {
+    foreach (slotsOf(st, name) as at) {
+        db.bindStr(st, at, v)
+    }
+}
+
+fn bindOpt(st: int, name: string, f: OptField): void {
+    foreach (slotsOf(st, name) as at) {
+        if (f.present) {
+            db.bindStr(st, at, f.value)
+        } else {
+            db.bindNull(st, at)
+        }
     }
 }
 
@@ -601,11 +629,11 @@ fn bindBatch(st: int, picked: Held[]): void {
     viewers.append('}')
     limits.append('}')
     offsets.append('}')
-    db.bindStr(st, 1, ids.toString())
-    db.bindStr(st, 2, viewers.toString())
-    db.bindStr(st, 3, limits.toString())
-    db.bindStr(st, 4, offsets.toString())
-    db.bindStr(st, 5, textArrayLiteral(keys))
+    bindS(st, "ids", ids.toString())
+    bindS(st, "viewers", viewers.toString())
+    bindS(st, "limits", limits.toString())
+    bindS(st, "offsets", offsets.toString())
+    bindS(st, "keys", textArrayLiteral(keys))
 }
 
 fn emptyBodies(n: int): string[] {
@@ -698,7 +726,7 @@ fn runComments(picked: Held[], st: int): void {
     replyBodies(picked, bodies, failed, 404, "article not found")
 }
 
-fn runList(kind: int, picked: Held[], st: int): void {
+fn runList(picked: Held[], st: int): void {
     let bodies: string[] = emptyBodies(picked.len())
     let cur: int = -1
     let total: long = 0
@@ -761,7 +789,7 @@ fn flushBatch(): bool {
         } else if (kind == K_COMMENTS) {
             runComments(picked, st)
         } else if (kind >= K_ALL) {
-            runList(kind, picked, st)
+            runList(picked, st)
         } else {
             runSingle(kind, picked, st)
         }
@@ -777,8 +805,8 @@ fn articleResponse(status: int, st: int): http.HttpResponse {
 
 fn fullArticleById(status: int, viewer: long, id: long): http.HttpResponse {
     db.reset(stArticleById)
-    db.bindLong(stArticleById, 1, viewer)
-    db.bindLong(stArticleById, 2, id)
+    bindL(stArticleById, "viewer", viewer)
+    bindL(stArticleById, "id", id)
     if (!db.step(stArticleById)) {
         let failed: bool = db.errorCode() != ""
         db.reset(stArticleById)
@@ -809,9 +837,9 @@ fn register(req: http.HttpRequest): http.HttpResponse {
         return fail(422, "password cannot be hashed")
     }
     db.reset(stInsertUser)
-    db.bindStr(stInsertUser, 1, username)
-    db.bindStr(stInsertUser, 2, email)
-    db.bindStr(stInsertUser, 3, hash)
+    bindS(stInsertUser, "username", username)
+    bindS(stInsertUser, "email", email)
+    bindS(stInsertUser, "hash", hash)
     if (!db.step(stInsertUser)) {
         let code: string = db.errorCode()
         db.reset(stInsertUser)
@@ -837,7 +865,7 @@ fn login(req: http.HttpRequest): http.HttpResponse {
         return fail(422, "email and password are required")
     }
     db.reset(stLogin)
-    db.bindStr(stLogin, 1, email)
+    bindS(stLogin, "email", email)
     if (!db.step(stLogin)) {
         let failed: bool = db.errorCode() != ""
         db.reset(stLogin)
@@ -866,7 +894,7 @@ fn currentUser(req: http.HttpRequest): http.HttpResponse {
         return internal()
     }
     db.reset(stUserById)
-    db.bindLong(stUserById, 1, v.id)
+    bindL(stUserById, "viewer", v.id)
     if (!db.step(stUserById)) {
         let failed: bool = db.errorCode() != ""
         db.reset(stUserById)
@@ -910,12 +938,12 @@ fn updateUser(req: http.HttpRequest): http.HttpResponse {
         hash = OptField { value: h, present: true, valid: true }
     }
     db.reset(stUpdateUser)
-    db.bindLong(stUpdateUser, 1, v.id)
-    bindOpt(stUpdateUser, 2, email)
-    bindOpt(stUpdateUser, 3, username)
-    bindOpt(stUpdateUser, 4, hash)
-    bindOpt(stUpdateUser, 5, bio)
-    bindOpt(stUpdateUser, 6, image)
+    bindL(stUpdateUser, "id", v.id)
+    bindOpt(stUpdateUser, "email", email)
+    bindOpt(stUpdateUser, "username", username)
+    bindOpt(stUpdateUser, "hash", hash)
+    bindOpt(stUpdateUser, "bio", bio)
+    bindOpt(stUpdateUser, "image", image)
     if (!db.step(stUpdateUser)) {
         let code: string = db.errorCode()
         db.reset(stUpdateUser)
@@ -942,8 +970,8 @@ fn getProfile(req: http.HttpRequest): http.HttpResponse {
         return internal()
     }
     db.reset(stProfile)
-    db.bindLong(stProfile, 1, v.id)
-    db.bindStr(stProfile, 2, username)
+    bindL(stProfile, "viewer", v.id)
+    bindS(stProfile, "key", username)
     if (!db.step(stProfile)) {
         let failed: bool = db.errorCode() != ""
         db.reset(stProfile)
@@ -963,7 +991,7 @@ fn followChange(req: http.HttpRequest, follow: bool): http.HttpResponse {
         return fail(401, "unauthorized")
     }
     db.reset(stUserByName)
-    db.bindStr(stUserByName, 1, urlDecode(req.params.get("username"), false))
+    bindS(stUserByName, "username", urlDecode(req.params.get("username"), false))
     if (!db.step(stUserByName)) {
         let failed: bool = db.errorCode() != ""
         db.reset(stUserByName)
@@ -980,8 +1008,8 @@ fn followChange(req: http.HttpRequest, follow: bool): http.HttpResponse {
         st = stFollow
     }
     db.reset(st)
-    db.bindLong(st, 1, v.id)
-    db.bindLong(st, 2, id)
+    bindL(st, "follower", v.id)
+    bindL(st, "followee", id)
     db.step(st)
     let failed: bool = db.errorCode() != ""
     db.reset(st)
@@ -1001,11 +1029,11 @@ fn unfollow(req: http.HttpRequest): http.HttpResponse {
 
 fn writeList(list: int, viewer: long, page: Page, filter: string): http.HttpResponse {
     db.reset(list)
-    db.bindLong(list, 1, viewer)
-    db.bindLong(list, 2, page.limit)
-    db.bindLong(list, 3, page.offset)
+    bindL(list, "viewer", viewer)
+    bindL(list, "limit", page.limit)
+    bindL(list, "offset", page.offset)
     if (!filter.isEmpty()) {
-        db.bindStr(list, 4, filter)
+        bindS(list, "key", filter)
     }
     let items: ArticleItem[] = []
     let total: long = 0
@@ -1077,8 +1105,8 @@ fn getArticle(req: http.HttpRequest): http.HttpResponse {
         return internal()
     }
     db.reset(stArticleBySlug)
-    db.bindLong(stArticleBySlug, 1, v.id)
-    db.bindStr(stArticleBySlug, 2, slug)
+    bindL(stArticleBySlug, "viewer", v.id)
+    bindS(stArticleBySlug, "key", slug)
     if (!db.step(stArticleBySlug)) {
         let failed: bool = db.errorCode() != ""
         db.reset(stArticleBySlug)
@@ -1135,10 +1163,10 @@ fn createArticle(req: http.HttpRequest): http.HttpResponse {
         return internal()
     }
     db.reset(stInsertArticle)
-    db.bindLong(stInsertArticle, 1, v.id)
-    db.bindStr(stInsertArticle, 2, title)
-    db.bindStr(stInsertArticle, 3, description)
-    db.bindStr(stInsertArticle, 4, body)
+    bindL(stInsertArticle, "author", v.id)
+    bindS(stInsertArticle, "title", title)
+    bindS(stInsertArticle, "description", description)
+    bindS(stInsertArticle, "body", body)
     if (!db.step(stInsertArticle)) {
         db.reset(stInsertArticle)
         return rollback()
@@ -1148,13 +1176,13 @@ fn createArticle(req: http.HttpRequest): http.HttpResponse {
     if (tags.len() > 0) {
         let literal: string = textArrayLiteral(tags)
         db.reset(stInsertTags)
-        db.bindStr(stInsertTags, 1, literal)
+        bindS(stInsertTags, "names", literal)
         if (!runStep(stInsertTags)) {
             return rollback()
         }
         db.reset(stInsertArticleTags)
-        db.bindLong(stInsertArticleTags, 1, id)
-        db.bindStr(stInsertArticleTags, 2, literal)
+        bindL(stInsertArticleTags, "article", id)
+        bindS(stInsertArticleTags, "names", literal)
         if (!runStep(stInsertArticleTags)) {
             return rollback()
         }
@@ -1172,7 +1200,7 @@ struct Owned {
 
 fn ownArticle(slug: string, viewer: long): Owned {
     db.reset(stOwnArticle)
-    db.bindStr(stOwnArticle, 1, slug)
+    bindS(stOwnArticle, "slug", slug)
     if (!db.step(stOwnArticle)) {
         let failed: bool = db.errorCode() != ""
         db.reset(stOwnArticle)
@@ -1220,10 +1248,10 @@ fn updateArticle(req: http.HttpRequest): http.HttpResponse {
         return ownedFailure(o)
     }
     db.reset(stUpdateArticle)
-    db.bindLong(stUpdateArticle, 1, o.id)
-    bindOpt(stUpdateArticle, 2, title)
-    bindOpt(stUpdateArticle, 3, description)
-    bindOpt(stUpdateArticle, 4, body)
+    bindL(stUpdateArticle, "id", o.id)
+    bindOpt(stUpdateArticle, "title", title)
+    bindOpt(stUpdateArticle, "description", description)
+    bindOpt(stUpdateArticle, "body", body)
     if (!runStep(stUpdateArticle)) {
         return internal()
     }
@@ -1240,7 +1268,7 @@ fn deleteArticle(req: http.HttpRequest): http.HttpResponse {
         return ownedFailure(o)
     }
     db.reset(stDeleteArticle)
-    db.bindLong(stDeleteArticle, 1, o.id)
+    bindL(stDeleteArticle, "id", o.id)
     if (!runStep(stDeleteArticle)) {
         return internal()
     }
@@ -1249,7 +1277,7 @@ fn deleteArticle(req: http.HttpRequest): http.HttpResponse {
 
 fn articleIdBySlug(slug: string): long {
     db.reset(stArticleId)
-    db.bindStr(stArticleId, 1, slug)
+    bindS(stArticleId, "slug", slug)
     if (!db.step(stArticleId)) {
         let failed: bool = db.errorCode() != ""
         db.reset(stArticleId)
@@ -1280,8 +1308,8 @@ fn favoriteChange(req: http.HttpRequest, fav: bool): http.HttpResponse {
         st = stFavorite
     }
     db.reset(st)
-    db.bindLong(st, 1, v.id)
-    db.bindLong(st, 2, id)
+    bindL(st, "user", v.id)
+    bindL(st, "article", id)
     if (!runStep(st)) {
         return internal()
     }
@@ -1306,8 +1334,8 @@ fn listComments(req: http.HttpRequest): http.HttpResponse {
         return internal()
     }
     db.reset(stComments)
-    db.bindLong(stComments, 1, v.id)
-    db.bindStr(stComments, 2, slug)
+    bindL(stComments, "viewer", v.id)
+    bindS(stComments, "key", slug)
     let found: bool = false
     let comments: Comment[] = []
     while (db.step(stComments)) {
@@ -1348,9 +1376,9 @@ fn createComment(req: http.HttpRequest): http.HttpResponse {
         return fail(404, "article not found")
     }
     db.reset(stInsertComment)
-    db.bindLong(stInsertComment, 1, id)
-    db.bindLong(stInsertComment, 2, v.id)
-    db.bindStr(stInsertComment, 3, body)
+    bindL(stInsertComment, "article", id)
+    bindL(stInsertComment, "author", v.id)
+    bindS(stInsertComment, "body", body)
     if (!db.step(stInsertComment)) {
         db.reset(stInsertComment)
         return internal()
@@ -1376,8 +1404,8 @@ fn deleteComment(req: http.HttpRequest): http.HttpResponse {
         return fail(404, "comment not found")
     }
     db.reset(stCommentAuthor)
-    db.bindLong(stCommentAuthor, 1, id)
-    db.bindStr(stCommentAuthor, 2, urlDecode(req.params.get("slug"), false))
+    bindL(stCommentAuthor, "id", id)
+    bindS(stCommentAuthor, "slug", urlDecode(req.params.get("slug"), false))
     if (!db.step(stCommentAuthor)) {
         let failed: bool = db.errorCode() != ""
         db.reset(stCommentAuthor)
@@ -1392,7 +1420,7 @@ fn deleteComment(req: http.HttpRequest): http.HttpResponse {
         return fail(403, "not the author")
     }
     db.reset(stDeleteComment)
-    db.bindLong(stDeleteComment, 1, id)
+    bindL(stDeleteComment, "id", id)
     if (!runStep(stDeleteComment)) {
         return internal()
     }
@@ -1420,11 +1448,13 @@ fn notFound(req: http.HttpRequest): http.HttpResponse {
     return fail(404, "not found")
 }
 
-fn prepare(sql: string): int {
-    let st: int = db.prepare(conn, sql)
+fn prepare(query: q.Query): int {
+    let st: int = db.prepare(conn, query.sql)
     if (st < 0) {
         os.exit(1)
     }
+    preparedSt.push(st)
+    preparedQ.push(query)
     return st
 }
 
@@ -1461,36 +1491,40 @@ fn main(): void {
     if (conn < 0) {
         os.exit(1)
     }
-    stTags = prepare(queries.tags())
-    stInsertUser = prepare(queries.insertUser())
-    stLogin = prepare(queries.login())
-    stUserById = prepare(queries.userById())
-    stUpdateUser = prepare(queries.updateUser())
-    stProfile = prepare(queries.profile())
-    stUserByName = prepare(queries.userByName())
-    stFollow = prepare(queries.follow())
-    stUnfollow = prepare(queries.unfollow())
-    stListAll = prepare(queries.listAll())
-    stListTag = prepare(queries.listByTag())
-    stListAuthor = prepare(queries.listByAuthor())
-    stListFavorited = prepare(queries.listByFavorited())
-    stListFeed = prepare(queries.listFeed())
-    stArticleBySlug = prepare(queries.articleBySlug())
-    stArticleById = prepare(queries.articleById())
-    stInsertArticle = prepare(queries.insertArticle())
-    stInsertTags = prepare(queries.insertTags())
-    stInsertArticleTags = prepare(queries.insertArticleTags())
-    stOwnArticle = prepare(queries.ownArticle())
-    stUpdateArticle = prepare(queries.updateArticle())
-    stDeleteArticle = prepare(queries.deleteArticle())
-    stArticleId = prepare(queries.articleId())
-    stFavorite = prepare(queries.favorite())
-    stUnfavorite = prepare(queries.unfavorite())
-    stComments = prepare(queries.comments())
-    stInsertComment = prepare(queries.insertComment())
-    stCommentAuthor = prepare(queries.commentAuthor())
-    stDeleteComment = prepare(queries.deleteComment())
-    batchSt = [stTags, prepare(queries.batchUser()), prepare(queries.batchProfile()), prepare(queries.batchArticle()), prepare(queries.batchComments()), prepare(queries.batchListAll()), prepare(queries.batchListTag()), prepare(queries.batchListAuthor()), prepare(queries.batchListFavorited()), prepare(queries.batchListFeed())]
+    try {
+        stTags = prepare(queries.tags())
+        stInsertUser = prepare(queries.insertUser())
+        stLogin = prepare(queries.login())
+        stUserById = prepare(queries.userById())
+        stUpdateUser = prepare(queries.updateUser())
+        stProfile = prepare(queries.profile())
+        stUserByName = prepare(queries.userByName())
+        stFollow = prepare(queries.follow())
+        stUnfollow = prepare(queries.unfollow())
+        stListAll = prepare(queries.listAll())
+        stListTag = prepare(queries.listByTag())
+        stListAuthor = prepare(queries.listByAuthor())
+        stListFavorited = prepare(queries.listByFavorited())
+        stListFeed = prepare(queries.listFeed())
+        stArticleBySlug = prepare(queries.articleBySlug())
+        stArticleById = prepare(queries.articleById())
+        stInsertArticle = prepare(queries.insertArticle())
+        stInsertTags = prepare(queries.insertTags())
+        stInsertArticleTags = prepare(queries.insertArticleTags())
+        stOwnArticle = prepare(queries.ownArticle())
+        stUpdateArticle = prepare(queries.updateArticle())
+        stDeleteArticle = prepare(queries.deleteArticle())
+        stArticleId = prepare(queries.articleId())
+        stFavorite = prepare(queries.favorite())
+        stUnfavorite = prepare(queries.unfavorite())
+        stComments = prepare(queries.comments())
+        stInsertComment = prepare(queries.insertComment())
+        stCommentAuthor = prepare(queries.commentAuthor())
+        stDeleteComment = prepare(queries.deleteComment())
+        batchSt = [stTags, prepare(queries.batchUser()), prepare(queries.batchProfile()), prepare(queries.batchArticle()), prepare(queries.batchComments()), prepare(queries.batchListAll()), prepare(queries.batchListTag()), prepare(queries.batchListAuthor()), prepare(queries.batchListFavorited()), prepare(queries.batchListFeed())]
+    } catch (e: q.QueryError) {
+        os.exit(1)
+    }
 
     http.route("POST", "/api/users", register)
     http.route("POST", "/api/users/login", login)

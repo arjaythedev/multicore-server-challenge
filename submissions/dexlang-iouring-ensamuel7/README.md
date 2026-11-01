@@ -5,7 +5,7 @@ Front: direct
 | | |
 |---|---|
 | **Language** | [DexLang](https://github.com/ensamuel7/dex) `v0.9.28`: statically typed, compiles to C, which `cc` builds into a native binary |
-| **Framework** | None. DexLang's own `http`, `db`, `json` and `crypto` standard library modules |
+| **Framework** | None. DexLang's own `http`, `db`, `json` and `crypto` standard library modules, and [dexqu](https://github.com/ensamuel7/dex-modules/tree/main/dexqu) `v0.2.0`, a SQL query builder written in Dex, for the SQL |
 | **Server** | The `http` module's io_uring backend (`http.uring()`), one event loop per process, `http.fork(n)` processes sharing port 80 through `SO_REUSEPORT` |
 | **Postgres driver** | libpq (Ubuntu's `libpq-dev`), through the `db` module: prepared statements, one connection per process |
 | **Password hashing** | bcrypt cost 10 through libxcrypt (`crypto.bcryptHash` / `crypto.bcryptVerify`) |
@@ -14,7 +14,8 @@ Front: direct
 
 What runs is one native binary: no interpreter, no garbage collector, no
 framework. The program is `server.dx` (handlers, auth, JSON) and `queries.dx`
-(the SQL), and everything below it is the language's standard library.
+(the SQL, built with dexqu once at startup), and everything below it is the
+language's standard library.
 
 ## How it serves
 
@@ -46,10 +47,14 @@ keep-alive connection holds no read buffer. The idle timeout is 75 s.
 
 ## The SQL
 
-The responses are exactly the reference SQL's. Every read statement is written
-once with its arguments as expressions: the per-request form binds `$1`, `$2`,
-..., and the batched form puts the request's row from `unnest` in their place,
-so a batch runs the same query for each request. Each rewrite of a list or
+The responses are exactly the reference SQL's. Every statement is built with
+dexqu when the server starts, then prepared once. A read is built once from its
+arguments as expressions: the per-request form gets named parameters
+(`q.param("viewer")`), and the batched form gets the request's row from
+`unnest` (`q.col("r.v")`), so a batch runs the same query for each request.
+Fixed limits stay literal SQL (`q.raw("1000")`) so they don't become parameters
+the planner has to guess at. The dexqu port returned the same rows as the
+hand-written SQL it replaced in 760 random comparisons. Each rewrite of a list or
 article query was run against the reference statement over the same 300 random
 parameter sets on the full seed and compared byte for byte, and the shared list
 statements against the per-request ones over 300 random batches.
@@ -104,6 +109,11 @@ estimate, not a measurement.
 
 ## What the language gained from this challenge
 
+- dexqu (v0.2.0): `LATERAL` joins, `MATERIALIZED` CTEs, column-list aliases
+  such as `unnest(...) AS r(i, v)`, `ARRAY(SELECT ...)`, array casts,
+  `returningExpr` on INSERT, and `Query.slots(name)` to bind a prepared
+  statement by parameter name.
+
 - `http.hold()` and `http.reply()`: a handler takes a ticket for its request,
   and the batch hook answers it, so one query serves a whole batch.
 - `http.batchWindow(ms)`: under io_uring, a batch gathers requests across
@@ -123,11 +133,13 @@ estimate, not a measurement.
 
 ```
 server.dx    routes, handlers, auth, JSON
-queries.dx   the SQL
-dex.mod      module file: dex 0.9.28
+queries.dx   the SQL, built with dexqu
+dex.mod      module file: dex 0.9.28, requires dexqu v0.2.0
+dex.sum      dexqu's checksum
 install.sh   root, once: build-essential, pkg-config, libpq-dev, libcrypt-dev,
              libssl-dev, libcurl, libsqlite3-dev, and Go 1.27.2 (sha256-checked)
 build.sh     builds the dex compiler from the pinned v0.9.28 tag through the Go
-             module proxy (checksum-verified), then compiles server.dx
+             module proxy (checksum-verified), downloads dexqu (checked
+             against dex.sum), then compiles server.dx
 start.sh     raises the open-file limit and runs two workers per core
 ```

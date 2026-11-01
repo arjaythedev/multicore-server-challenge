@@ -1,253 +1,368 @@
-const TAG_LIST: string = "ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at WHERE at.article_id = a.id ORDER BY 1) AS tag_list"
+import "github.com/ensamuel7/dex-modules/dexqu" as "q"
 
-const BATCH: string = "unnest($1::int4[], $2::int8[], $3::int4[], $4::int4[], $5::text[]) r(i, v, l, o, k)"
+const PG: q.Dialect = q.Dialect.Postgres
 
-fn viewerColumns(v: string): string {
-    return "(SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count, EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = " + v + ") AS favorited, u.username, u.bio, u.image, EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = " + v + " AND fo.followee_id = a.author_id) AS following"
+fn cols(names: string[]): q.Expr[] {
+    let out: q.Expr[] = []
+    foreach (names as name) {
+        out.push(q.col(name))
+    }
+    return out
 }
 
-fn fullSelect(v: string): string {
-    return "SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at, " + TAG_LIST + ", " + viewerColumns(v) + " FROM articles a JOIN users u ON u.id = a.author_id"
+fn append(a: q.Expr[], b: q.Expr[]): q.Expr[] {
+    let out: q.Expr[] = []
+    foreach (a as e) {
+        out.push(e)
+    }
+    foreach (b as e) {
+        out.push(e)
+    }
+    return out
 }
 
-fn withCount(count: string, list: string): string {
-    return "SELECT n.total, l.* FROM (" + count + ") n(total) LEFT JOIN LATERAL (" + list + ") l ON true ORDER BY l.id DESC"
+fn noArgs(): q.Expr[] {
+    let none: q.Expr[] = []
+    return none
 }
 
-fn listPage(ids: string, v: string): string {
-    return "SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, " + TAG_LIST + ", " + viewerColumns(v) + " FROM (" + ids + ") p JOIN articles a ON a.id = p.id JOIN users u ON u.id = a.author_id ORDER BY a.id DESC"
+fn one(): q.Expr {
+    return q.raw("1")
 }
 
-fn batched(query: string, order: string): string {
-    return "SELECT r.i, x.* FROM " + BATCH + " CROSS JOIN LATERAL (" + query + ") x ORDER BY r.i" + order
+fn tagList(): q.Expr {
+    let name: q.Select = q.from("tags t").columns(["t.name"]).where(q.col("t.id").eq(q.col("at.tag_id")))
+    return q.arrayOf(q.from("article_tags at").select([q.sub(name)]).where(q.col("at.article_id").eq(q.col("a.id"))).orderByExpr(one())).alias("tag_list")
 }
 
-const SLUGIFY: string = "trim(both '-' from lower(regexp_replace($2, '[^A-Za-z0-9]+', '-', 'g')))"
-
-fn tags(): string {
-    return "SELECT name FROM tags ORDER BY name"
+fn favoritesCount(): q.Expr {
+    return q.sub(q.from("favorites f").select([q.countAll()]).where(q.col("f.article_id").eq(q.col("a.id")))).alias("favorites_count")
 }
 
-fn insertUser(): string {
-    return "INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3) RETURNING id, username, email, bio, image"
+fn favoritedBy(article: q.Expr, v: q.Expr): q.Expr {
+    return q.exists(q.from("favorites f").select([one()]).where(q.col("f.article_id").eq(article)).where(q.col("f.user_id").eq(v)))
 }
 
-fn login(): string {
-    return "SELECT id, username, email, bio, image, password_hash FROM users WHERE email = $1"
+fn follows(v: q.Expr, author: q.Expr): q.Expr {
+    return q.exists(q.from("follows fo").select([one()]).where(q.col("fo.follower_id").eq(v)).where(q.col("fo.followee_id").eq(author)))
 }
 
-fn userOf(v: string): string {
-    return "SELECT id, username, email, bio, image FROM users WHERE id = " + v
+fn viewerColumns(v: q.Expr): q.Expr[] {
+    return [favoritesCount(), favoritedBy(q.col("a.id"), v).alias("favorited"), q.col("u.username"), q.col("u.bio"), q.col("u.image"), follows(v, q.col("a.author_id")).alias("following")]
 }
 
-fn userById(): string {
-    return userOf("$1")
+fn fullSelect(v: q.Expr): q.Select {
+    let head: q.Expr[] = cols(["a.id", "a.slug", "a.title", "a.description", "a.body", "a.created_at", "a.updated_at"])
+    head.push(tagList())
+    return q.from("articles a").select(append(head, viewerColumns(v))).join("users u", q.col("u.id").eq(q.col("a.author_id")))
 }
 
-fn updateUser(): string {
-    return "UPDATE users SET email = COALESCE($2, email), username = COALESCE($3, username), password_hash = COALESCE($4, password_hash), bio = COALESCE($5, bio), image = COALESCE($6, image) WHERE id = $1 RETURNING id, username, email, bio, image"
+fn withCount(count: q.Select, list: q.Select): q.Select {
+    return q.select(cols(["n.total", "l.*"])).fromExpr(q.sub(count).aliasColumns("n", ["total"])).leftJoinLateral(q.sub(list).alias("l"), q.boolean(true)).orderByExpr(q.col("l.id").desc())
 }
 
-fn profileOf(v: string, k: string): string {
-    return "SELECT u.id, u.username, u.bio, u.image, EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = " + v + " AND fo.followee_id = u.id) AS following FROM users u WHERE u.username = " + k
+fn listPage(ids: q.Select, v: q.Expr): q.Select {
+    let head: q.Expr[] = cols(["a.id", "a.slug", "a.title", "a.description", "a.created_at", "a.updated_at"])
+    head.push(tagList())
+    return q.select(append(head, viewerColumns(v))).fromExpr(q.sub(ids).alias("p")).join("articles a", q.col("a.id").eq(q.col("p.id"))).join("users u", q.col("u.id").eq(q.col("a.author_id"))).orderByExpr(q.col("a.id").desc())
 }
 
-fn profile(): string {
-    return profileOf("$1", "$2")
+fn capped(rows: q.Select): q.Select {
+    return q.select([q.countAll()]).fromExpr(q.sub(rows.select([one()]).limitExpr(q.raw("1000"))).alias("s"))
 }
 
-fn userByName(): string {
-    return "SELECT id, username, bio, image FROM users WHERE username = $1"
+fn tagId(k: q.Expr): q.Expr {
+    return q.sub(q.from("tags t").columns(["t.id"]).where(q.col("t.name").eq(k)))
 }
 
-fn follow(): string {
-    return "INSERT INTO follows (follower_id, followee_id) VALUES ($1, $2) ON CONFLICT DO NOTHING"
+fn userId(alias: string, k: q.Expr): q.Expr {
+    return q.sub(q.from("users " + alias).columns([alias + ".id"]).where(q.col(alias + ".username").eq(k)))
 }
 
-fn unfollow(): string {
-    return "DELETE FROM follows WHERE follower_id = $1 AND followee_id = $2"
+fn countAll(): q.Select {
+    return capped(q.from("articles a"))
 }
 
-fn countAll(): string {
-    return "SELECT count(*) FROM (SELECT 1 FROM articles a LIMIT 1000) s"
+fn idsAll(l: q.Expr, o: q.Expr): q.Select {
+    return q.from("articles").columns(["id"]).orderByExpr(q.col("id").desc()).limitExpr(l).offsetExpr(o)
 }
 
-fn idsAll(l: string, o: string): string {
-    return "SELECT id FROM articles ORDER BY id DESC LIMIT " + l + " OFFSET " + o
+fn countTag(k: q.Expr): q.Select {
+    return capped(q.from("article_tags at").where(q.col("at.tag_id").eq(tagId(k))))
 }
 
-fn countTag(k: string): string {
-    return "SELECT count(*) FROM (SELECT 1 FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = " + k + ") LIMIT 1000) s"
+fn idsTag(k: q.Expr, l: q.Expr, o: q.Expr): q.Select {
+    return q.from("article_tags at").select([q.col("at.article_id").alias("id")]).where(q.col("at.tag_id").eq(tagId(k))).orderByExpr(q.col("at.article_id").desc()).limitExpr(l).offsetExpr(o)
 }
 
-fn idsTag(k: string, l: string, o: string): string {
-    return "SELECT at.article_id AS id FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = " + k + ") ORDER BY at.article_id DESC LIMIT " + l + " OFFSET " + o
+fn countAuthor(k: q.Expr): q.Select {
+    return capped(q.from("articles a").where(q.col("a.author_id").eq(userId("u", k))))
 }
 
-fn countAuthor(k: string): string {
-    return "SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = (SELECT u.id FROM users u WHERE u.username = " + k + ") LIMIT 1000) s"
+fn idsAuthor(k: q.Expr, l: q.Expr, o: q.Expr): q.Select {
+    return q.from("articles").columns(["id"]).where(q.col("author_id").eq(userId("au", k))).orderByExpr(q.col("id").desc()).limitExpr(l).offsetExpr(o)
 }
 
-fn idsAuthor(k: string, l: string, o: string): string {
-    return "SELECT id FROM articles WHERE author_id = (SELECT au.id FROM users au WHERE au.username = " + k + ") ORDER BY id DESC LIMIT " + l + " OFFSET " + o
+fn countFavorited(k: q.Expr): q.Select {
+    return capped(q.from("favorites f").where(q.col("f.user_id").eq(userId("fu", k))))
 }
 
-fn countFavorited(k: string): string {
-    return "SELECT count(*) FROM (SELECT 1 FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = " + k + ") LIMIT 1000) s"
+fn idsFavorited(k: q.Expr, l: q.Expr, o: q.Expr): q.Select {
+    return q.from("favorites f").select([q.col("f.article_id").alias("id")]).where(q.col("f.user_id").eq(userId("fu", k))).orderByExpr(q.col("f.article_id").desc()).limitExpr(l).offsetExpr(o)
 }
 
-fn idsFavorited(k: string, l: string, o: string): string {
-    return "SELECT f.article_id AS id FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = " + k + ") ORDER BY f.article_id DESC LIMIT " + l + " OFFSET " + o
+fn followees(v: q.Expr): q.Select {
+    return q.from("follows fo").columns(["fo.followee_id"]).where(q.col("fo.follower_id").eq(v))
 }
 
-fn countFeed(v: string): string {
-    return "SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = " + v + ") LIMIT 1000) s"
+fn countFeed(v: q.Expr): q.Select {
+    return capped(q.from("articles a").where(q.col("a.author_id").inSelect(followees(v))))
 }
 
-fn idsFeed(v: string, l: string, o: string): string {
-    return "SELECT x.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT (" + l + "::int + " + o + "::int)) x WHERE fo.follower_id = " + v + " ORDER BY x.id DESC LIMIT " + l + " OFFSET " + o
+fn idsFeed(v: q.Expr, l: q.Expr, o: q.Expr): q.Select {
+    let newest: q.Select = q.from("articles a2").columns(["a2.id"]).where(q.col("a2.author_id").eq(q.col("fo.followee_id"))).orderByExpr(q.col("a2.id").desc()).limitExpr(l.cast("int").plus(o.cast("int")))
+    return q.select([q.col("x.id")]).from("follows fo").crossJoinLateral(q.sub(newest).alias("x")).where(q.col("fo.follower_id").eq(v)).orderByExpr(q.col("x.id").desc()).limitExpr(l).offsetExpr(o)
 }
 
-fn listAllOf(v: string, l: string, o: string): string {
-    return withCount(countAll(), listPage(idsAll(l, o), v))
+fn profileOf(v: q.Expr, k: q.Expr): q.Select {
+    return q.from("users u").select(append(cols(["u.id", "u.username", "u.bio", "u.image"]), [follows(v, q.col("u.id")).alias("following")])).where(q.col("u.username").eq(k))
 }
 
-fn listByTagOf(v: string, l: string, o: string, k: string): string {
-    return withCount(countTag(k), listPage(idsTag(k, l, o), v))
+fn userOf(v: q.Expr): q.Select {
+    return q.from("users").columns(["id", "username", "email", "bio", "image"]).where(q.col("id").eq(v))
 }
 
-fn listByAuthorOf(v: string, l: string, o: string, k: string): string {
-    return withCount(countAuthor(k), listPage(idsAuthor(k, l, o), v))
+fn commentsOf(v: q.Expr, k: q.Expr): q.Select {
+    let newest: q.Select = q.from("comments c").select(append(cols(["c.id", "c.body", "c.created_at", "c.updated_at", "u.username", "u.bio", "u.image"]), [follows(v, q.col("c.author_id")).alias("following")])).join("users u", q.col("u.id").eq(q.col("c.author_id"))).where(q.col("c.article_id").eq(q.col("a.id"))).orderByExpr(q.col("c.created_at").desc()).orderByExpr(q.col("c.id").desc()).limitExpr(q.raw("100"))
+    let picked: q.Expr[] = [q.col("a.id").alias("article_id")]
+    return q.from("articles a").select(append(picked, cols(["c.id", "c.body", "c.created_at", "c.updated_at", "c.username", "c.bio", "c.image", "c.following"]))).leftJoinLateral(q.sub(newest).alias("c"), q.boolean(true)).where(q.col("a.slug").eq(k)).orderByExpr(q.col("c.created_at").desc()).orderByExpr(q.col("c.id").desc())
 }
 
-fn listByFavoritedOf(v: string, l: string, o: string, k: string): string {
-    return withCount(countFavorited(k), listPage(idsFavorited(k, l, o), v))
+fn requests(): q.Expr {
+    return q.call("unnest", [q.param("ids").cast("int4[]"), q.param("viewers").cast("int8[]"), q.param("limits").cast("int4[]"), q.param("offsets").cast("int4[]"), q.param("keys").cast("text[]")]).aliasColumns("r", ["i", "v", "l", "o", "k"])
 }
 
-fn listFeedOf(v: string, l: string, o: string): string {
-    return withCount(countFeed(v), listPage(idsFeed(v, l, o), v))
+fn batched(query: q.Select, order: q.Expr[]): q.Query throws q.QueryError {
+    let s: q.Select = q.select(cols(["r.i", "x.*"])).fromExpr(requests()).crossJoinLateral(q.sub(query).alias("x")).orderBy("r.i")
+    foreach (order as e) {
+        s = s.orderByExpr(e)
+    }
+    return s.build(PG)
 }
 
-fn sharedList(key: string, count: string, ids: string): string {
-    return "WITH r AS MATERIALIZED (SELECT * FROM " + BATCH + "), c AS MATERIALIZED (SELECT d.key, (" + count + ") AS total FROM (SELECT DISTINCT " + key + " AS key FROM r) d), g AS MATERIALIZED (SELECT DISTINCT " + key + " AS key, l, o FROM r), p AS MATERIALIZED (SELECT g.key, g.l, g.o, q.id FROM g CROSS JOIN LATERAL (" + ids + ") q), x AS MATERIALIZED (SELECT a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at, " + TAG_LIST + ", (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count, u.username, u.bio, u.image FROM (SELECT DISTINCT id FROM p) d CROSS JOIN LATERAL (SELECT * FROM articles ar WHERE ar.id = d.id LIMIT 1) a CROSS JOIN LATERAL (SELECT us.username, us.bio, us.image FROM users us WHERE us.id = a.author_id LIMIT 1) u) SELECT r.i, c.total, x.id, x.slug, x.title, x.description, x.created_at, x.updated_at, x.tag_list, x.favorites_count, CASE WHEN x.id IS NOT NULL THEN EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = x.id AND f.user_id = r.v) END AS favorited, x.username, x.bio, x.image, CASE WHEN x.id IS NOT NULL THEN EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.v AND fo.followee_id = x.author_id) END AS following FROM r JOIN c ON c.key = r." + key + " LEFT JOIN p ON p.key = r." + key + " AND p.l = r.l AND p.o = r.o LEFT JOIN x ON x.id = p.id ORDER BY r.i, x.id DESC"
+fn sharedList(key: string, count: q.Select, ids: q.Select): q.Query throws q.QueryError {
+    let distinctKeys: q.Select = q.from("r").distinct().select([q.col(key).alias("key")])
+    let counts: q.Select = q.select([q.col("d.key"), q.sub(count).alias("total")]).fromExpr(q.sub(distinctKeys).alias("d"))
+    let pages: q.Select = q.from("r").distinct().select([q.col(key).alias("key"), q.col("l"), q.col("o")])
+    let pageIds: q.Select = q.select(cols(["g.key", "g.l", "g.o", "q.id"])).from("g").crossJoinLateral(q.sub(ids).alias("q"))
+    let article: q.Select = q.from("articles ar").where(q.col("ar.id").eq(q.col("d.id"))).limitExpr(one())
+    let author: q.Select = q.from("users us").columns(["us.username", "us.bio", "us.image"]).where(q.col("us.id").eq(q.col("a.author_id"))).limitExpr(one())
+    let head: q.Expr[] = cols(["a.id", "a.author_id", "a.slug", "a.title", "a.description", "a.created_at", "a.updated_at"])
+    head.push(tagList())
+    head.push(favoritesCount())
+    let decorated: q.Select = q.select(append(head, cols(["u.username", "u.bio", "u.image"]))).fromExpr(q.sub(q.from("p").distinct().columns(["id"])).alias("d")).crossJoinLateral(q.sub(article).alias("a")).crossJoinLateral(q.sub(author).alias("u"))
+    let present: q.Expr = q.col("x.id").isNotNull()
+    let picked: q.Expr[] = cols(["r.i", "c.total", "x.id", "x.slug", "x.title", "x.description", "x.created_at", "x.updated_at", "x.tag_list", "x.favorites_count"])
+    picked.push(q.caseWhen(present, favoritedBy(q.col("x.id"), q.col("r.v"))).end().alias("favorited"))
+    picked = append(picked, cols(["x.username", "x.bio", "x.image"]))
+    picked.push(q.caseWhen(present, follows(q.col("r.v"), q.col("x.author_id"))).end().alias("following"))
+    let rk: q.Expr = q.col("r." + key)
+    let s: q.Select = q.from("r").select(picked)
+        .withMaterialized("r", q.select([q.star()]).fromExpr(requests()))
+        .withMaterialized("c", counts)
+        .withMaterialized("g", pages)
+        .withMaterialized("p", pageIds)
+        .withMaterialized("x", decorated)
+        .join("c", q.col("c.key").eq(rk))
+        .leftJoin("p", q.and([q.col("p.key").eq(rk), q.col("p.l").eq(q.col("r.l")), q.col("p.o").eq(q.col("r.o"))]))
+        .leftJoin("x", q.col("x.id").eq(q.col("p.id")))
+        .orderBy("r.i")
+        .orderByExpr(q.col("x.id").desc())
+    return s.build(PG)
 }
 
-fn listAll(): string {
-    return listAllOf("$1", "$2", "$3")
+fn slugOf(title: q.Expr): q.Expr {
+    return q.rawWith("trim(both '-' from lower(regexp_replace(?, '[^A-Za-z0-9]+', '-', 'g')))", [title])
 }
 
-fn listByTag(): string {
-    return listByTagOf("$1", "$2", "$3", "$4")
+fn tags(): q.Query throws q.QueryError {
+    return q.from("tags").columns(["name"]).orderBy("name").build(PG)
 }
 
-fn listByAuthor(): string {
-    return listByAuthorOf("$1", "$2", "$3", "$4")
+fn insertUser(): q.Query throws q.QueryError {
+    return q.insertInto("users").columns(["username", "email", "password_hash"]).values([q.param("username"), q.param("email"), q.param("hash")]).returning(["id", "username", "email", "bio", "image"]).build(PG)
 }
 
-fn listByFavorited(): string {
-    return listByFavoritedOf("$1", "$2", "$3", "$4")
+fn login(): q.Query throws q.QueryError {
+    return q.from("users").columns(["id", "username", "email", "bio", "image", "password_hash"]).where(q.col("email").eq(q.param("email"))).build(PG)
 }
 
-fn listFeed(): string {
-    return listFeedOf("$1", "$2", "$3")
+fn userById(): q.Query throws q.QueryError {
+    return userOf(q.param("viewer")).build(PG)
 }
 
-fn articleBySlug(): string {
-    return fullSelect("$1") + " WHERE a.slug = $2"
+fn keep(column: string): q.Expr {
+    return q.coalesce([q.param(column), q.col(column)])
 }
 
-fn articleById(): string {
-    return fullSelect("$1") + " WHERE a.id = $2"
+fn updateUser(): q.Query throws q.QueryError {
+    return q.update("users")
+        .set("email", keep("email"))
+        .set("username", keep("username"))
+        .set("password_hash", q.coalesce([q.param("hash"), q.col("password_hash")]))
+        .set("bio", keep("bio"))
+        .set("image", keep("image"))
+        .where(q.col("id").eq(q.param("id")))
+        .returning(["id", "username", "email", "bio", "image"])
+        .build(PG)
 }
 
-fn insertArticle(): string {
-    return "INSERT INTO articles (id, slug, author_id, title, description, body) SELECT n.id, " + SLUGIFY + " || '-' || n.id, $1, $2, $3, $4 FROM (SELECT nextval(pg_get_serial_sequence('articles', 'id')) AS id) n RETURNING id"
+fn profile(): q.Query throws q.QueryError {
+    return profileOf(q.param("viewer"), q.param("key")).build(PG)
 }
 
-fn insertTags(): string {
-    return "INSERT INTO tags (name) SELECT DISTINCT unnest($1::text[]) ON CONFLICT (name) DO NOTHING"
+fn userByName(): q.Query throws q.QueryError {
+    return q.from("users").columns(["id", "username", "bio", "image"]).where(q.col("username").eq(q.param("username"))).build(PG)
 }
 
-fn insertArticleTags(): string {
-    return "INSERT INTO article_tags (article_id, tag_id) SELECT $1, t.id FROM tags t WHERE t.name = ANY($2::text[])"
+fn follow(): q.Query throws q.QueryError {
+    return q.insertInto("follows").columns(["follower_id", "followee_id"]).values([q.param("follower"), q.param("followee")]).doNothing().build(PG)
 }
 
-fn ownArticle(): string {
-    return "SELECT id, author_id FROM articles WHERE slug = $1"
+fn unfollow(): q.Query throws q.QueryError {
+    return q.deleteFrom("follows").where(q.col("follower_id").eq(q.param("follower"))).where(q.col("followee_id").eq(q.param("followee"))).build(PG)
 }
 
-fn updateArticle(): string {
-    return "UPDATE articles SET title = COALESCE($2, title), description = COALESCE($3, description), body = COALESCE($4, body), slug = CASE WHEN $2::text IS NULL THEN slug ELSE " + SLUGIFY + " || '-' || id END, updated_at = now() WHERE id = $1"
+fn listAll(): q.Query throws q.QueryError {
+    return withCount(countAll(), listPage(idsAll(q.param("limit"), q.param("offset")), q.param("viewer"))).build(PG)
 }
 
-fn deleteArticle(): string {
-    return "DELETE FROM articles WHERE id = $1"
+fn listByTag(): q.Query throws q.QueryError {
+    return withCount(countTag(q.param("key")), listPage(idsTag(q.param("key"), q.param("limit"), q.param("offset")), q.param("viewer"))).build(PG)
 }
 
-fn articleId(): string {
-    return "SELECT id FROM articles WHERE slug = $1"
+fn listByAuthor(): q.Query throws q.QueryError {
+    return withCount(countAuthor(q.param("key")), listPage(idsAuthor(q.param("key"), q.param("limit"), q.param("offset")), q.param("viewer"))).build(PG)
 }
 
-fn favorite(): string {
-    return "INSERT INTO favorites (user_id, article_id) VALUES ($1, $2) ON CONFLICT DO NOTHING"
+fn listByFavorited(): q.Query throws q.QueryError {
+    return withCount(countFavorited(q.param("key")), listPage(idsFavorited(q.param("key"), q.param("limit"), q.param("offset")), q.param("viewer"))).build(PG)
 }
 
-fn unfavorite(): string {
-    return "DELETE FROM favorites WHERE user_id = $1 AND article_id = $2"
+fn listFeed(): q.Query throws q.QueryError {
+    return withCount(countFeed(q.param("viewer")), listPage(idsFeed(q.param("viewer"), q.param("limit"), q.param("offset")), q.param("viewer"))).build(PG)
 }
 
-fn commentsOf(v: string, k: string): string {
-    return "SELECT a.id AS article_id, c.id, c.body, c.created_at, c.updated_at, c.username, c.bio, c.image, c.following FROM articles a LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image, EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = " + v + " AND fo.followee_id = c.author_id) AS following FROM comments c JOIN users u ON u.id = c.author_id WHERE c.article_id = a.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true WHERE a.slug = " + k + " ORDER BY c.created_at DESC, c.id DESC"
+fn articleBySlug(): q.Query throws q.QueryError {
+    return fullSelect(q.param("viewer")).where(q.col("a.slug").eq(q.param("key"))).build(PG)
 }
 
-fn comments(): string {
-    return commentsOf("$1", "$2")
+fn articleById(): q.Query throws q.QueryError {
+    return fullSelect(q.param("viewer")).where(q.col("a.id").eq(q.param("id"))).build(PG)
 }
 
-fn batchUser(): string {
-    return batched(userOf("r.v"), "")
+fn insertArticle(): q.Query throws q.QueryError {
+    let next: q.Select = q.select([q.raw("nextval(pg_get_serial_sequence('articles', 'id'))").alias("id")])
+    let row: q.Select = q.select([q.col("n.id"), slugOf(q.param("title")).concat(q.raw("'-'")).concat(q.col("n.id")), q.param("author"), q.param("title"), q.param("description"), q.param("body")]).fromExpr(q.sub(next).alias("n"))
+    return q.insertInto("articles").columns(["id", "slug", "author_id", "title", "description", "body"]).fromSelect(row).returning(["id"]).build(PG)
 }
 
-fn batchProfile(): string {
-    return batched(profileOf("r.v", "r.k"), "")
+fn insertTags(): q.Query throws q.QueryError {
+    return q.insertInto("tags").columns(["name"]).fromSelect(q.select([q.call("unnest", [q.param("names").cast("text[]")])]).distinct()).onConflict(["name"]).doNothing().build(PG)
 }
 
-fn batchArticle(): string {
-    return batched(fullSelect("r.v") + " WHERE a.slug = r.k", "")
+fn insertArticleTags(): q.Query throws q.QueryError {
+    let row: q.Select = q.from("tags t").select([q.param("article"), q.col("t.id")]).where(q.col("t.name").eq(q.call("ANY", [q.param("names").cast("text[]")])))
+    return q.insertInto("article_tags").columns(["article_id", "tag_id"]).fromSelect(row).build(PG)
 }
 
-fn batchComments(): string {
-    return batched(commentsOf("r.v", "r.k"), ", x.created_at DESC, x.id DESC")
+fn ownArticle(): q.Query throws q.QueryError {
+    return q.from("articles").columns(["id", "author_id"]).where(q.col("slug").eq(q.param("slug"))).build(PG)
 }
 
-fn batchListAll(): string {
-    return sharedList("k", countAll(), idsAll("g.l", "g.o"))
+fn updateArticle(): q.Query throws q.QueryError {
+    let slug: q.Expr = q.caseWhen(q.param("title").cast("text").isNull(), q.col("slug")).orElse(slugOf(q.param("title")).concat(q.raw("'-'")).concat(q.col("id")))
+    return q.update("articles")
+        .set("title", keep("title"))
+        .set("description", keep("description"))
+        .set("body", keep("body"))
+        .set("slug", slug)
+        .set("updated_at", q.call("now", noArgs()))
+        .where(q.col("id").eq(q.param("id")))
+        .build(PG)
 }
 
-fn batchListTag(): string {
-    return sharedList("k", countTag("d.key"), idsTag("g.key", "g.l", "g.o"))
+fn deleteArticle(): q.Query throws q.QueryError {
+    return q.deleteFrom("articles").where(q.col("id").eq(q.param("id"))).build(PG)
 }
 
-fn batchListAuthor(): string {
-    return sharedList("k", countAuthor("d.key"), idsAuthor("g.key", "g.l", "g.o"))
+fn articleId(): q.Query throws q.QueryError {
+    return q.from("articles").columns(["id"]).where(q.col("slug").eq(q.param("slug"))).build(PG)
 }
 
-fn batchListFavorited(): string {
-    return sharedList("k", countFavorited("d.key"), idsFavorited("g.key", "g.l", "g.o"))
+fn favorite(): q.Query throws q.QueryError {
+    return q.insertInto("favorites").columns(["user_id", "article_id"]).values([q.param("user"), q.param("article")]).doNothing().build(PG)
 }
 
-fn batchListFeed(): string {
-    return sharedList("v", countFeed("d.key"), idsFeed("g.key", "g.l", "g.o"))
+fn unfavorite(): q.Query throws q.QueryError {
+    return q.deleteFrom("favorites").where(q.col("user_id").eq(q.param("user"))).where(q.col("article_id").eq(q.param("article"))).build(PG)
 }
 
-fn insertComment(): string {
-    return "WITH c AS (INSERT INTO comments (article_id, author_id, body) VALUES ($1, $2, $3) RETURNING id, body, created_at, updated_at, author_id) SELECT c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image FROM c JOIN users u ON u.id = c.author_id"
+fn comments(): q.Query throws q.QueryError {
+    return commentsOf(q.param("viewer"), q.param("key")).build(PG)
 }
 
-fn commentAuthor(): string {
-    return "SELECT c.author_id FROM comments c JOIN articles a ON a.id = c.article_id WHERE c.id = $1 AND a.slug = $2"
+fn authorColumn(column: string): q.Expr {
+    return q.sub(q.from("users u").columns(["u." + column]).where(q.col("u.id").eq(q.col("comments.author_id")))).alias(column)
 }
 
-fn deleteComment(): string {
-    return "DELETE FROM comments WHERE id = $1"
+fn insertComment(): q.Query throws q.QueryError {
+    return q.insertInto("comments").columns(["article_id", "author_id", "body"]).values([q.param("article"), q.param("author"), q.param("body")]).returning(["id", "body", "created_at", "updated_at"]).returningExpr([authorColumn("username"), authorColumn("bio"), authorColumn("image")]).build(PG)
+}
+
+fn commentAuthor(): q.Query throws q.QueryError {
+    return q.from("comments c").columns(["c.author_id"]).join("articles a", q.col("a.id").eq(q.col("c.article_id"))).where(q.col("c.id").eq(q.param("id"))).where(q.col("a.slug").eq(q.param("slug"))).build(PG)
+}
+
+fn deleteComment(): q.Query throws q.QueryError {
+    return q.deleteFrom("comments").where(q.col("id").eq(q.param("id"))).build(PG)
+}
+
+fn batchUser(): q.Query throws q.QueryError {
+    let none: q.Expr[] = []
+    return batched(userOf(q.col("r.v")), none)
+}
+
+fn batchProfile(): q.Query throws q.QueryError {
+    let none: q.Expr[] = []
+    return batched(profileOf(q.col("r.v"), q.col("r.k")), none)
+}
+
+fn batchArticle(): q.Query throws q.QueryError {
+    let none: q.Expr[] = []
+    return batched(fullSelect(q.col("r.v")).where(q.col("a.slug").eq(q.col("r.k"))), none)
+}
+
+fn batchComments(): q.Query throws q.QueryError {
+    return batched(commentsOf(q.col("r.v"), q.col("r.k")), [q.col("x.created_at").desc(), q.col("x.id").desc()])
+}
+
+fn batchListAll(): q.Query throws q.QueryError {
+    return sharedList("k", countAll(), idsAll(q.col("g.l"), q.col("g.o")))
+}
+
+fn batchListTag(): q.Query throws q.QueryError {
+    return sharedList("k", countTag(q.col("d.key")), idsTag(q.col("g.key"), q.col("g.l"), q.col("g.o")))
+}
+
+fn batchListAuthor(): q.Query throws q.QueryError {
+    return sharedList("k", countAuthor(q.col("d.key")), idsAuthor(q.col("g.key"), q.col("g.l"), q.col("g.o")))
+}
+
+fn batchListFavorited(): q.Query throws q.QueryError {
+    return sharedList("k", countFavorited(q.col("d.key")), idsFavorited(q.col("g.key"), q.col("g.l"), q.col("g.o")))
+}
+
+fn batchListFeed(): q.Query throws q.QueryError {
+    return sharedList("v", countFeed(q.col("d.key")), idsFeed(q.col("g.key"), q.col("g.l"), q.col("g.o")))
 }
