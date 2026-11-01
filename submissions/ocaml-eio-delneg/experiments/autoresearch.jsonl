@@ -1,3 +1,6 @@
 {"run":"baseline","eq_users":80000,"rps":18774,"p95":114,"p99":162,"app_us":152,"pg_us":265,"status":"baseline"}
 {"run":"e1-planner","eq_users":120000,"rps":29677,"p95":59,"p99":81,"app_us":117.6,"pg_us":140.9,"status":"keep"}
 {"run":"e2-tagids","eq_users":120000,"rps":30311,"p95":41,"p99":59,"app_us":118.7,"pg_us":134.0,"status":"keep"}
+{"run":"e3-rawio","eq_users":120000,"rps":30515,"p95":34,"p99":49,"app_us":113,"pg_us":136,"rss_mb":125,"status":"keep"}
+{"run":"e4-central","eq_users":120000,"domains":4,"rps":30566,"p95":32,"p99":42,"app_us":110,"pg_us":98,"status":"keep"}
+{"run":"e5-bcrypt5","eq_users":120000,"domains":4,"rps":30768,"p95":24,"p99":31,"app_us":93,"pg_us":104,"status":"keep"}

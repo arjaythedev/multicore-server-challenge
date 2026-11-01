@@ -84,8 +84,48 @@ let hmac key msg = Digestif.SHA256.(to_raw_string (hmac_string ~key msg))
 
 external bcrypt_verify_raw : string -> string -> bool = "mc_bcrypt_verify"
 external bcrypt_hash_raw : string -> int -> string = "mc_bcrypt_hash"
-let bcrypt_verify pw h = Eio_unix.run_in_systhread ~label:"bcrypt" (fun () -> bcrypt_verify_raw pw h)
-let bcrypt_hash pw = Eio_unix.run_in_systhread ~label:"bcrypt" (fun () -> bcrypt_hash_raw pw 10)
+(* the interleaved core: hasher threads take up to 5 waiting hashes at a time and run them in lockstep, after
+   waiting BCRYPT_WAIT_MS for company when fewer are queued (logins are ~0.1% of requests). Every hash is full
+   bcrypt at cost 10, and every login is checked against its stored hash. *)
+module Bc = struct
+  external hash_n : string array -> string array -> string array = "mc_bc_hash_n"
+  external gensalt : unit -> string = "mc_bc_gensalt"
+  external cost : string -> int = "mc_bc_cost"
+  type job = { pw : string; setting : string; u : (string, exn) result P.u }
+  let lanes = 5
+  let m = Mutex.create () and c = Condition.create () and q : job Queue.t = Queue.create ()
+  let wait_s = float_of_string (getenv "BCRYPT_WAIT_MS" "30") /. 1000.
+  let rec worker () =
+    Mutex.lock m;
+    while Queue.is_empty q do Condition.wait c m done;
+    let few = Queue.length q < lanes in
+    Mutex.unlock m;
+    if few && wait_s > 0. then Thread.delay wait_s;
+    Mutex.lock m;
+    let n = min lanes (Queue.length q) in
+    let jobs = Array.init n (fun _ -> Queue.pop q) in
+    Mutex.unlock m;
+    if n > 0 then begin
+      let out = try Ok (hash_n (Array.map (fun j -> j.pw) jobs) (Array.map (fun j -> j.setting) jobs)) with e -> Error e in
+      Array.iteri (fun i j -> P.resolve j.u (match out with Ok o -> Ok o.(i) | Error e -> Error e)) jobs
+    end;
+    worker ()
+  let started = ref false
+  let start () =
+    if not !started then begin
+      started := true;
+      for _ = 1 to int_of_string (getenv "BCRYPT_THREADS" "2") do ignore (Thread.create worker ()) done
+    end
+  let run pw setting =
+    let p, u = P.create () in
+    Mutex.lock m; Queue.push { pw; setting; u } q; Condition.signal c; Mutex.unlock m;
+    match P.await p with Ok h -> h | Error e -> raise e
+end
+
+let bcrypt_verify pw h =
+  if String.length h = 60 && Bc.cost h = 10 then Eqaf.equal (Bc.run pw h) h
+  else Eio_unix.run_in_systhread ~label:"bcrypt" (fun () -> bcrypt_verify_raw pw h)
+let bcrypt_hash pw = Bc.run pw (Bc.gensalt ())
 
 (* ---------- Postgres wire client: extended protocol, pipelined, binary results ---------- *)
 
@@ -629,9 +669,12 @@ let status_text = function
   | 200 -> "OK" | 201 -> "Created" | 204 -> "No Content" | 401 -> "Unauthorized" | 403 -> "Forbidden"
   | 404 -> "Not Found" | 422 -> "Unprocessable Entity" | 500 -> "Internal Server Error" | _ -> "Error"
 
-let with_buf n f = let b = Buffer.create n in f b; Buffer.contents b
+(* a response body is a writer, run when the response is written (straight into the domain's output buffer) *)
+type body = Buffer.t -> unit
+let with_buf (_ : int) (f : body) : body = f
+let str_buf n f = let b = Buffer.create n in f b; Buffer.contents b
 
-let error_body msg = let b = Buffer.create 64 in Buffer.add_string b "{\"errors\":{\"body\":["; jstr b msg; Buffer.add_string b "]}}"; Buffer.contents b
+let error_body msg : body = fun b -> Buffer.add_string b "{\"errors\":{\"body\":["; jstr b msg; Buffer.add_string b "]}}"
 
 (* ---------- request bodies ---------- *)
 
@@ -666,7 +709,7 @@ let check_pw p = if String.length p > 72 then raise (Http (422, "password longer
 module Plan = struct
   type kind = Art | Cmt | Prof | Global | Tag | Author | Fav | Feed | Tags
 
-  type job = { kind : kind; key : string; viewer : int; lim : int; off : int; u : (int * string) P.u }
+  type job = { kind : kind; key : string; viewer : int; lim : int; off : int; u : (int * body) P.u }
 
   let cols = "a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at"
   let pad = "NULL::int8, NULL::text, NULL::text, NULL::text, NULL::timestamptz, NULL::timestamptz"
@@ -931,16 +974,16 @@ module Plan = struct
     let names = !names in
     let is_fav v id = v > 0 && Hashtbl.mem favs (v, id) and is_fol v u = v > 0 && Hashtbl.mem fols (v, u) in
     (* answers *)
-    let tags_body = lazy (with_buf 4096 (fun b ->
+    let tags_body = (fun b ->
         Buffer.add_string b "{\"tags\":[";
         Array.iteri (fun k r -> if k > 0 then Buffer.add_char b ','; jcol b r 1) names;
-        Buffer.add_string b "]}")) in
+        Buffer.add_string b "]}") in
     let nf = (404, error_body "article not found") in
     Array.iteri (fun i j ->
         let v = j.viewer in
         let ans =
           match j.kind with
-          | Tags -> (200, Lazy.force tags_body)
+          | Tags -> (200, tags_body)
           | Art ->
             (match art_k.(kidx.(i)) with
              | Some a when a.x <> None ->
@@ -995,26 +1038,36 @@ module Plan = struct
                  Buffer.add_char b '}')) in
         P.resolve j.u ans) jobs
 
-  type t = { q : job Queue.t; mutable waiters : unit P.u list }
+  (* the queue is shared by every domain (Mutex); the planner loops and their connections live on one domain, and
+     each answer's body is written by the requesting fiber, on its own domain *)
+  type t = { m : Mutex.t; q : job Queue.t; mutable waiters : unit P.u list }
 
+  let create () = { m = Mutex.create (); q = Queue.create (); waiters = [] }
   let max_batch = int_of_string (getenv "PLANNER_MAX" "1024")
 
   let submit t job =
+    Mutex.lock t.m;
     Queue.push job t.q;
-    match t.waiters with
-    | w :: rest -> t.waiters <- rest; P.resolve w ()
-    | [] -> ()
+    let w = match t.waiters with w :: rest -> t.waiters <- rest; Some w | [] -> None in
+    Mutex.unlock t.m;
+    match w with Some w -> P.resolve w () | None -> ()
 
   (* one loop per in-flight batch: wait for work, let the other ready fibers queue theirs, take everything *)
   let loop t pick =
     let rec go () =
+      Mutex.lock t.m;
       if Queue.is_empty t.q then begin
-        let p, u = P.create () in t.waiters <- u :: t.waiters; P.await p
-      end;
+        let p, u = P.create () in
+        t.waiters <- u :: t.waiters;
+        Mutex.unlock t.m;
+        P.await p
+      end else Mutex.unlock t.m;
       Eio.Fiber.yield ();
+      Mutex.lock t.m;
       let n = min max_batch (Queue.length t.q) in
+      let jobs = Array.init n (fun _ -> Queue.pop t.q) in
+      Mutex.unlock t.m;
       if n > 0 then begin
-        let jobs = Array.init n (fun _ -> Queue.pop t.q) in
         (try run_batch (pick ()) jobs with
          | Eio.Io _ as e -> raise e
          | e ->
@@ -1030,7 +1083,8 @@ end
 let i v = Some (string_of_int v)
 let s v = Some v
 
-type ctx = { pick : unit -> Pg.conn; plan : Plan.t }
+type ctx = { pick : unit -> Pg.conn; plan : Plan.t;
+             rbuf : Bytes.t; bodyb : Buffer.t; mutable wbuf : Bytes.t } (* per domain; never held across a suspension *)
 
 let planned ctx ?(key = "") ?(lim = 0) ?(off = 0) kind viewer =
   let p, u = P.create () in
@@ -1046,7 +1100,7 @@ let viewer_of req ~required =
     let id = if tok = "" then 0 else verify_token tok in
     if id = 0 then raise (Http (401, "invalid token")) else (id, tok)
 
-let respond_user r token = (200, let b = Buffer.create 256 in juser b r token; Buffer.contents b)
+let respond_user r token = (200, fun b -> juser b r token)
 
 let article_resp code full r = (code, with_buf 2048 (fun b -> Buffer.add_string b "{\"article\":"; jarticle b full r; Buffer.add_char b '}'))
 
@@ -1151,7 +1205,7 @@ let handle ctx req =
     let batch =
       if tags = [] then [ ins ]
       else begin
-        let arr = with_buf 64 (fun b ->
+        let arr = str_buf 64 (fun b ->
             Buffer.add_char b '{';
             List.iteri (fun k t ->
                 if k > 0 then Buffer.add_char b ',';
@@ -1188,7 +1242,7 @@ let handle ctx req =
      | Some r ->
        if Pg.int r 1 <> viewer then raise (Http (403, "not your article"));
        ignore (query q_delete_article [| i (Pg.int r 0) |]);
-       (204, ""))
+       (204, ignore))
   | ("POST" | "DELETE") as m, [ "articles"; slug; "favorite" ] ->
     let viewer, _ = viewer_of req ~required:true in
     let res, _ = run [ ((if m = "POST" then q_fav else q_unfav), [| i viewer; s slug |]);
@@ -1214,7 +1268,7 @@ let handle ctx req =
      | Some r ->
        if Pg.int r 0 <> viewer then raise (Http (403, "not your comment"));
        ignore (query q_delete_comment [| i cid |]);
-       (204, ""))
+       (204, ignore))
   | _ -> raise (Http (404, "not found"))
 
 (* ---------- connection loop ---------- *)
@@ -1226,65 +1280,120 @@ let lower_prefix h p =
 let header_value h n =
   let v = String.sub h n (String.length h - n) in String.trim v
 
-let serve ctx flow =
-  let r = Eio.Buf_read.of_flow ~initial_size:2048 ~max_size:(1 lsl 20) flow in
-  let out = Buffer.create 4096 in
+let dispatch ctx meth target auth body =
+  let path, qs = match String.index_opt target '?' with
+    | Some k -> String.sub target 0 k, String.sub target (k + 1) (String.length target - k - 1)
+    | None -> target, "" in
+  let query =
+    if qs = "" then []
+    else List.filter_map (fun kv ->
+        if kv = "" then None
+        else match String.index_opt kv '=' with
+          | Some k -> Some (url_decode (String.sub kv 0 k), url_decode (String.sub kv (k + 1) (String.length kv - k - 1)))
+          | None -> Some (url_decode kv, "")) (String.split_on_char '&' qs) in
+  (* keep the first occurrence of each key, as Go's Query().Get does *)
+  let query = List.rev (List.fold_left (fun acc (k, v) -> if List.mem_assoc k acc then acc else (k, v) :: acc) [] query) in
+  match String.split_on_char '/' path with
+  | "" :: "api" :: segs ->
+    let segs = List.map path_decode (List.filter (fun x -> x <> "") segs) in
+    (try handle ctx { meth; path = segs; query; auth; body } with
+     | Http (code, msg) -> (code, error_body msg)
+     | Pg.Pg_error (code, msg) -> Printf.eprintf "pg error %s %s\n%!" code msg; (500, error_body "database error")
+     | Eio.Io _ as e -> raise e
+     | e -> Printf.eprintf "error: %s\n%!" (Printexc.to_string e); (500, error_body "internal error"))
+  | _ -> (404, error_body "not found")
+
+(* one parsed request out of the connection's pending bytes, or None when it isn't complete yet *)
+let find_head s =
+  let n = String.length s in
+  let rec go i =
+    match String.index_from_opt s i '\r' with
+    | Some j when j + 3 < n -> if s.[j + 1] = '\n' && s.[j + 2] = '\r' && s.[j + 3] = '\n' then Some j else go (j + 1)
+    | _ -> None in
+  go 0
+
+exception Bad_request
+
+let parse_request s =
+  match find_head s with
+  | None -> if String.length s > 65536 then raise Bad_request else None
+  | Some hend ->
+    let le = String.index s '\r' in
+    let line = String.sub s 0 le in
+    let meth, target = match String.split_on_char ' ' line with m :: t :: _ -> m, t | _ -> "", "/" in
+    let clen = ref 0 and auth = ref None and close = ref false in
+    let p = ref (le + 2) in
+    while !p < hend do
+      let e = match String.index_from_opt s !p '\r' with Some e when e <= hend -> e | _ -> hend in
+      let h = String.sub s !p (e - !p) in
+      (if lower_prefix h "content-length:" then clen := (try int_of_string (header_value h 15) with _ -> 0)
+       else if lower_prefix h "authorization:" then auth := Some (header_value h 14)
+       else if lower_prefix h "connection:" then close := String.lowercase_ascii (header_value h 11) = "close");
+      p := e + 2
+    done;
+    let bstart = hend + 4 in
+    if String.length s < bstart + !clen then None
+    else Some (meth, target, !auth, !close, String.sub s bstart !clen, bstart + !clen)
+
+let write_all fd (b : Bytes.t) off len =
+  let rec go off len =
+    if len > 0 then
+      match Unix.single_write fd b off len with
+      | k -> go (off + k) (len - k)
+      | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) ->
+        (* the domain's buffer may be reused while we wait: wait on a private copy *)
+        let rest = Bytes.sub b off len in
+        let rec slow off len =
+          if len > 0 then begin
+            Eio_unix.await_writable fd;
+            match Unix.single_write fd rest off len with
+            | k -> slow (off + k) (len - k)
+            | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) -> slow off len
+          end in
+        slow 0 len in
+  go off len
+
+let respond ctx fd code (body : body) =
+  let bb = ctx.bodyb in
+  Buffer.clear bb;
+  let code, blen =
+    if code = 204 then (204, 0)
+    else match body bb with
+      | () -> (code, Buffer.length bb)
+      | exception e ->
+        Printf.eprintf "error: %s\n%!" (Printexc.to_string e);
+        Buffer.clear bb; error_body "internal error" bb; (500, Buffer.length bb) in
+  let head =
+    if code = 204 then "HTTP/1.1 204 No Content\r\n\r\n"
+    else Printf.sprintf "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n" code (status_text code) blen in
+  let hl = String.length head in
+  if Bytes.length ctx.wbuf < hl + blen then ctx.wbuf <- Bytes.create (2 * (hl + blen));
+  Bytes.blit_string head 0 ctx.wbuf 0 hl;
+  Buffer.blit bb 0 ctx.wbuf hl blen;
+  write_all fd ctx.wbuf 0 (hl + blen)
+
+(* a connection: wait until readable, read into the domain's buffer, answer every complete request; an idle
+   connection keeps no buffer of its own *)
+let serve ctx fd =
+  let pending = ref "" in
   let rec loop () =
-    match Eio.Buf_read.line r with
-    | exception End_of_file -> ()
-    | "" -> loop ()
-    | line ->
-      let meth, target =
-        match String.split_on_char ' ' line with
-        | m :: t :: _ -> m, t
-        | _ -> "", "/" in
-      let clen = ref 0 and auth = ref None and close = ref false in
-      let rec headers () =
-        match Eio.Buf_read.line r with
-        | "" -> ()
-        | h ->
-          (if lower_prefix h "content-length:" then clen := (try int_of_string (header_value h 15) with _ -> 0)
-           else if lower_prefix h "authorization:" then auth := Some (header_value h 14)
-           else if lower_prefix h "connection:" then
-             close := String.lowercase_ascii (header_value h 11) = "close");
-          headers () in
-      headers ();
-      let body = if !clen > 0 then Eio.Buf_read.take !clen r else "" in
-      let path, qs = match String.index_opt target '?' with
-        | Some k -> String.sub target 0 k, String.sub target (k + 1) (String.length target - k - 1)
-        | None -> target, "" in
-      let query =
-        if qs = "" then []
-        else List.filter_map (fun kv ->
-            if kv = "" then None
-            else match String.index_opt kv '=' with
-              | Some k -> Some (url_decode (String.sub kv 0 k), url_decode (String.sub kv (k + 1) (String.length kv - k - 1)))
-              | None -> Some (url_decode kv, "")) (String.split_on_char '&' qs) in
-      (* keep the first occurrence of each key, as Go's Query().Get does *)
-      let query = List.rev (List.fold_left (fun acc (k, v) -> if List.mem_assoc k acc then acc else (k, v) :: acc) [] query) in
-      let code, resp =
-        match String.split_on_char '/' path with
-        | "" :: "api" :: segs ->
-          let segs = List.map path_decode (List.filter (fun x -> x <> "") segs) in
-          (try handle ctx { meth; path = segs; query; auth = !auth; body } with
-           | Http (code, msg) -> (code, error_body msg)
-           | Pg.Pg_error (code, msg) -> Printf.eprintf "pg error %s %s\n%!" code msg; (500, error_body "database error")
-           | Eio.Io _ as e -> raise e
-           | e -> Printf.eprintf "error: %s\n%!" (Printexc.to_string e); (500, error_body "internal error"))
-        | _ -> (404, error_body "not found") in
-      Buffer.clear out;
-      Buffer.add_string out "HTTP/1.1 ";
-      Buffer.add_string out (string_of_int code); Buffer.add_char out ' ';
-      Buffer.add_string out (status_text code);
-      if code = 204 then Buffer.add_string out "\r\n\r\n"
-      else begin
-        Buffer.add_string out "\r\nContent-Type: application/json\r\nContent-Length: ";
-        Buffer.add_string out (string_of_int (String.length resp));
-        Buffer.add_string out "\r\n\r\n";
-        Buffer.add_string out resp
-      end;
-      Eio.Flow.copy_string (Buffer.contents out) flow;
-      if not !close then loop ()
+    match parse_request !pending with
+    | exception Bad_request -> ()
+    | Some (meth, target, auth, close, body, used) ->
+      let rest = String.length !pending - used in
+      pending := (if rest = 0 then "" else String.sub !pending used rest);
+      let code, b = dispatch ctx meth target auth body in
+      respond ctx fd code b;
+      if not close then loop ()
+    | None ->
+      Eio_unix.await_readable fd;
+      match Unix.read fd ctx.rbuf 0 (Bytes.length ctx.rbuf) with
+      | 0 -> ()
+      | n ->
+        pending := (if !pending = "" then Bytes.sub_string ctx.rbuf 0 n else !pending ^ Bytes.sub_string ctx.rbuf 0 n);
+        loop ()
+      | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) -> loop ()
+      | exception Unix.Unix_error _ -> ()
   in
   loop ()
 
@@ -1297,16 +1406,20 @@ let () =
   let host = getenv "HOST" "127.0.0.1" and port = int_of_string (getenv "PORT" "3000") in
   let ncpu = Domain.recommended_domain_count () in
   let domains = int_of_string (getenv "DOMAINS" (string_of_int ncpu)) in
-  let planner_loops = int_of_string (getenv "PLANNER_LOOPS" "2") in
-  let conns_per = int_of_string (getenv "PG_CONNS_PER_DOMAIN" (string_of_int (max 1 (min 8 (64 / domains))))) in
+  (* PLANNER_CENTRAL=1: one planner for the whole process, on domain 0 with PLANNER_CONNS read connections;
+     0: a planner per domain on that domain's connections *)
+  let central = getenv "PLANNER_CENTRAL" "1" = "1" in
+  let planner_loops = int_of_string (getenv "PLANNER_LOOPS" (if central then "4" else "2")) in
+  let planner_conns = int_of_string (getenv "PLANNER_CONNS" (string_of_int planner_loops)) in
+  let conns_per = int_of_string (getenv "PG_CONNS_PER_DOMAIN" (string_of_int (max 1 (min (if central then 4 else 8) (64 / domains))))) in
+  let shared = Plan.create () in
+  Bc.start ();
   Eio_main.run @@ fun env ->
   let net = Eio.Stdenv.net env and dm = Eio.Stdenv.domain_mgr env in
   let addr = `Tcp (Eio_unix.Net.Ipaddr.of_unix (Unix.inet_addr_of_string host), port) in
-  let worker k () =
-    Eio.Switch.run @@ fun sw ->
-    let conns = Array.init conns_per (fun _ -> Pg.connect ~sw net url) in
+  let picker conns =
     let rr = ref 0 in
-    let pick () =
+    fun () ->
       (* least queued, starting from a rotating index *)
       let n = Array.length conns in
       rr := (!rr + 1) mod n;
@@ -1316,17 +1429,35 @@ let () =
         if Queue.length c.Pg.q < Queue.length !best.Pg.q then best := c
       done;
       !best in
-    let plan = { Plan.q = Queue.create (); waiters = [] } in
-    for _ = 1 to planner_loops do Eio.Fiber.fork_daemon ~sw (fun () -> Plan.loop plan pick) done;
-    let ctx = { pick; plan } in
+  let worker k () =
+    Eio.Switch.run @@ fun sw ->
+    let conns = Array.init conns_per (fun _ -> Pg.connect ~sw net url) in
+    let pick = picker conns in
+    let plan =
+      if central then begin
+        if k = 0 then begin
+          let pconns = Array.init planner_conns (fun _ -> Pg.connect ~sw net url) in
+          let ppick = picker pconns in
+          for _ = 1 to planner_loops do Eio.Fiber.fork_daemon ~sw (fun () -> Plan.loop shared ppick) done
+        end;
+        shared
+      end else begin
+        let plan = Plan.create () in
+        for _ = 1 to planner_loops do Eio.Fiber.fork_daemon ~sw (fun () -> Plan.loop plan pick) done;
+        plan
+      end in
+    let ctx = { pick; plan; rbuf = Bytes.create 65536; bodyb = Buffer.create 65536; wbuf = Bytes.create 65536 } in
     let sock = Eio.Net.listen ~sw ~backlog:4096 ~reuse_addr:true ~reuse_port:true net addr in
     if k = 0 then Printf.printf "conduit (ocaml %s) on %s:%d, %d domains x %d pg conns\n%!" Sys.ocaml_version host port domains conns_per;
     let rec accept () =
       Eio.Net.accept_fork ~sw sock ~on_error:(fun _ -> ()) (fun flow _ ->
-          (match Eio_unix.Resource.fd_opt flow with
-           | Some fd -> Eio_unix.Fd.use_exn "nodelay" fd (fun u -> try Unix.setsockopt u Unix.TCP_NODELAY true with _ -> ())
-           | None -> ());
-          serve ctx flow);
+          match Eio_unix.Resource.fd_opt flow with
+          | Some fd ->
+            Eio_unix.Fd.use_exn "serve" fd (fun u ->
+                (try Unix.setsockopt u Unix.TCP_NODELAY true with _ -> ());
+                Unix.set_nonblock u;
+                serve ctx u)
+          | None -> ());
       accept () in
     accept ()
   in

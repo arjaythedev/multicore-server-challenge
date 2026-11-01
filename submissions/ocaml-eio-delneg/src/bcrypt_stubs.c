@@ -9,6 +9,7 @@
 #include <caml/alloc.h>
 #include <caml/fail.h>
 #include <caml/signals.h>
+#include <stdbool.h>
 
 static char *dup_ml(value s) {
   size_t n = caml_string_length(s);
@@ -57,3 +58,42 @@ value mc_bcrypt_hash(value pw, value cost) {
   res = caml_copy_string(out);
   CAMLreturn(res);
 }
+
+/* ---------- the interleaved core (bcrypt_lanes.c) ---------- */
+
+void bc_hash_n(int n, const char *const *pw, const char *const *setting, char (*out)[64]);
+bool bc_gensalt(char setting[30]);
+int bc_cost(const char *setting);
+
+/* hashes n (1..5) passwords with their settings (all the same cost) in one interleaved run, runtime released */
+value mc_bc_hash_n(value vpw, value vset) {
+  CAMLparam2(vpw, vset);
+  CAMLlocal1(res);
+  int n = Wosize_val(vpw);
+  if (n < 1 || n > 5 || (int)Wosize_val(vset) != n) caml_invalid_argument("bc_hash_n");
+  char pw[5][73], st[5][64], out[5][64];
+  const char *pp[5], *sp[5];
+  for (int l = 0; l < n; l++) {
+    size_t a = caml_string_length(Field(vpw, l)), b = caml_string_length(Field(vset, l));
+    if (a > 72) a = 72;
+    if (b > 63) b = 63;
+    memcpy(pw[l], String_val(Field(vpw, l)), a); pw[l][a] = 0;
+    memcpy(st[l], String_val(Field(vset, l)), b); st[l][b] = 0;
+    pp[l] = pw[l]; sp[l] = st[l];
+  }
+  caml_enter_blocking_section();
+  bc_hash_n(n, pp, sp, out);
+  caml_leave_blocking_section();
+  res = caml_alloc(n, 0);
+  for (int l = 0; l < n; l++) Store_field(res, l, caml_alloc_initialized_string(60, out[l]));
+  CAMLreturn(res);
+}
+
+value mc_bc_gensalt(value unit) {
+  CAMLparam1(unit);
+  char s[30];
+  if (!bc_gensalt(s)) caml_failwith("getrandom");
+  CAMLreturn(caml_alloc_initialized_string(29, s));
+}
+
+value mc_bc_cost(value s) { return Val_int(bc_cost(String_val(s))); }

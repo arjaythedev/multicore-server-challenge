@@ -45,3 +45,28 @@ Profile at 120k: artx 615 µs/call (tags subplan seq-scans all 200 tags per arti
 ### E2 tag ids + one read of all tags (kept)
 artx returns `ARRAY(tag_id)`, phase B reads `SELECT id, name FROM tags ORDER BY name` once; GET /api/tags uses
 the same read. 120k eq x2: pg 135 / 133 µs/req (E1 141), app 118 / 120, p95 39 / 43 ms (E1 59).
+
+### Real-scale harness
+`lgr.sh`: think-scale 1.0, 3 loadgen processes to 127.0.0.1/2/3 (64k source ports each), so connection counts are
+real. E2 at 60k real users: 15.9k req/s, p95 7 ms, **RSS 2,552 MB** (~40 KB per connection), app 195 µs/req.
+At the grader's ~190k connections that is ~7.6 GB. The scaled runs hid this (10x fewer connections).
+
+### E3 connection loop without per-connection buffers (kept)
+`idle.py` (20k connections, then a request on each): E2 35 KB/conn (Eio.Buf_read 2 KB + a 4 KB output Buffer that
+grows to the biggest response + fiber), E3 **4.8 KB/conn**. A connection waits with `Eio_unix.await_readable`, reads
+into the domain's buffer, and bodies are writer closures run straight into the domain's output buffer; the
+socket is non-blocking and written with `Unix.single_write` (waiting with `await_writable` on a private copy if the
+kernel buffer is full). 120k eq x2: app 117/119 → 115/111 µs/req, RSS 838 → 125 MB. 60k real: RSS 2,552 → 266 MB.
+At equal req/s, real connections cost ~9% more app CPU than scaled ones (196 vs 180).
+
+### E4 one central planner (kept)
+One shared queue (Mutex) for every domain's reads, 4 planner loops on domain 0 with their own 4 read connections;
+answers resolve the requesting fiber's promise and its body is written on its own domain. Writes keep per-domain
+connections. 120k eq: pg 135 → 98 µs/req. DOMAINS=4 better than 8 (total 207/209 vs 217 µs/req).
+Knobs on E3: OCAMLRUNPARAM s=1M app -8% but pg up (total ~same); DOMAINS=4 total 232 vs 249.
+
+### E5 5-lane bcrypt (kept)
+perf on E4: libcrypt = 42% of the app's CPU. The interleaved core from c-iouring-tigokraft (#10, MIT; 5 lanes as
+in our F# #87) at -O3 -funroll-loops: 11.3 ms/hash with 5 lanes vs libxcrypt 36.2 ms (wsl26, one core); 6-8
+lanes no better. 2 hasher threads take up to 5 queued hashes, waiting 30 ms for company when fewer.
+120k eq DOMAINS=4 x2: app 110.5/110.4 → 93.4/92.5 µs/req, total 208/211 → 197/198. Login p50 44 → 75 ms.
