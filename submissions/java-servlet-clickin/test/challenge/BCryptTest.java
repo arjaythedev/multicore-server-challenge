@@ -25,9 +25,11 @@ public final class BCryptTest {
                 throw new AssertionError("vector " + i);
             }
         }
-        for (int count = 1; count <= 4; count++) {
-            String[] mixedPasswords = {"", "한글🔒", "x".repeat(73), "other"};
-            String[] mixedSalts = {"$2a$05$CCCCCCCCCCCCCCCCCCCCC.", "$2b$05$ZSfEoPvlcsj2XfvsSeK25e", "$2y$05$......................", "$2a$05$ZSfEoPvlcsj2XfvsSeK25e"};
+        for (int count = 1; count <= BCryptLanes.MAX; count++) {
+            String[] mixedPasswords = {"", "한글🔒", "x".repeat(73), "other",
+                    "x".repeat(72), "fifth"};
+            String[] mixedSalts = {"$2a$05$CCCCCCCCCCCCCCCCCCCCC.", "$2b$05$ZSfEoPvlcsj2XfvsSeK25e", "$2y$05$......................",
+                    "$2a$05$ZSfEoPvlcsj2XfvsSeK25e", "$2b$05$......................", "$2a$05$CCCCCCCCCCCCCCCCCCCCC."};
             String[] batch = bcrypt.calculateBatch(Arrays.copyOf(mixedPasswords, count), Arrays.copyOf(mixedSalts, count));
             for (int i = 0; i < count; i++) {
                 if (!batch[i].equals(bcrypt.calculate(mixedPasswords[i], mixedSalts[i]))) {

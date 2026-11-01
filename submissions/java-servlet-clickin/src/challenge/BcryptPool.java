@@ -6,6 +6,7 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
 
 import challenge.pg.Unit;
 
@@ -17,7 +18,9 @@ public final class BcryptPool implements AutoCloseable {
     private final Semaphore available = new Semaphore(0);
     private final AtomicInteger publishers = new AtomicInteger();
     private final Thread[] threads;
-    private final int lanes = Integer.parseInt(System.getenv().getOrDefault("BCRYPT_LANES", "4"));
+    private final int configuredLanes = Integer.parseInt(System.getenv().getOrDefault("BCRYPT_LANES", "0"));
+    // 4 until the startup timing (BCRYPT_LANES=0) picks this core's fastest width
+    private volatile int lanes = configuredLanes == 0 ? 4 : configuredLanes;
     private volatile boolean closed;
 
     public BcryptPool() {
@@ -25,11 +28,21 @@ public final class BcryptPool implements AutoCloseable {
     }
 
     public BcryptPool(int count) {
-        if (lanes < 1 || lanes > 4) {
-            throw new IllegalArgumentException("BCRYPT_LANES must be between 1 and 4");
+        if (configuredLanes < 0 || configuredLanes > BCryptLanes.MAX) {
+            throw new IllegalArgumentException("BCRYPT_LANES must be between 0 (timed at startup) and " + BCryptLanes.MAX);
         }
         if (count < 1) {
             throw new IllegalArgumentException("BCRYPT_THREADS must be positive");
+        }
+        if (configuredLanes == 0) {
+            Thread timer = new Thread(() -> {
+                StringBuilder curve = new StringBuilder();
+                lanes = BCrypt.fastestLanes(curve);
+                System.err.println("bcrypt: " + lanes + " lanes (per hash at cost 7:" + curve + ")");
+            },
+                    "bcrypt-lanes");
+            timer.setDaemon(true);
+            timer.start();
         }
         threads = new Thread[count];
         for (int i = 0; i < count; i++) {
@@ -55,7 +68,8 @@ public final class BcryptPool implements AutoCloseable {
         }
     }
 
-    private final long gatherNanos = Long.parseLong(System.getenv().getOrDefault("BCRYPT_GATHER_MS", "40")) * 1_000_000L;
+    private final long gatherNanos = Long.parseLong(System.getenv().getOrDefault("BCRYPT_GATHER_MS", "400")) * 1_000_000L;
+    private final ReentrantLock gathering = new ReentrantLock();
 
     private boolean acquireUntil(long deadline) {
         long left = deadline - System.nanoTime();
@@ -83,31 +97,38 @@ public final class BcryptPool implements AutoCloseable {
         }
         BCrypt bcrypt = new BCrypt();
         for (; ; ) {
-            available.acquireUninterruptibly();
-            Unit unit = queue.poll();
-            if (unit == null) {
-                if (closed && publishers.get() == 0 && queue.isEmpty()) {
-                    available.release();
-                    return;
-                }
-                continue;
-            }
             Unit[] jobs = new Unit[lanes];
-            int count = 1;
-            jobs[0] = unit;
-            // wait up to BCRYPT_GATHER_MS for company: lanes interleave in one loop, so a fuller batch costs
-            // little more CPU than a lone hash (4 lanes: ~1.8x the throughput of 1 on EPYC)
-            long gatherEnd = System.nanoTime() + gatherNanos;
-            while (count < lanes && acquireUntil(gatherEnd)) {
-                Unit next = queue.poll();
-                if (next != null) {
-                    jobs[count++] = next;
-                } else {
-                    if (closed) {
+            int count = 0;
+            // one thread gathers at a time, the others hash: with every thread gathering on its own, ~30 logins/s
+            // spread one per thread and a 4-lane loop mostly ran a lone hash (~1.8x the CPU of a full set on EPYC)
+            gathering.lock();
+            try {
+                available.acquireUninterruptibly();
+                Unit unit = queue.poll();
+                if (unit == null) {
+                    if (closed && publishers.get() == 0 && queue.isEmpty()) {
                         available.release();
+                        return;
                     }
-                    break;
+                    continue;
                 }
+                jobs[count++] = unit;
+                // wait up to BCRYPT_GATHER_MS for a full set: lanes interleave in one loop, so a full set costs
+                // little more CPU than a lone hash
+                long gatherEnd = System.nanoTime() + gatherNanos;
+                while (count < jobs.length && acquireUntil(gatherEnd)) {
+                    Unit next = queue.poll();
+                    if (next != null) {
+                        jobs[count++] = next;
+                    } else {
+                        if (closed) {
+                            available.release();
+                        }
+                        break;
+                    }
+                }
+            } finally {
+                gathering.unlock();
             }
             Unit[] valid = new Unit[count];
             String[] passwords = new String[count];

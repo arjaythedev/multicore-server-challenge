@@ -4,6 +4,7 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.net.InetAddress;
 import java.util.ArrayDeque;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -33,10 +34,14 @@ public final class PgDispatcher implements AutoCloseable {
 
     public PgDispatcher(String url) throws Exception {
         int nr = env("READ_CONNS", 8);
-        int nw = env("WRITE_CONNS", 4);
+        // one write connection: its group commit then gathers every write that arrives during a WAL flush, so
+        // there are fewer fsyncs per write (Hetzner, 80k users: about -1.5% box CPU and a lower p99 than 4)
+        int nw = env("WRITE_CONNS", 1);
         writeGroupMax = env("WRITE_GROUP_MAX", 256);
-        readRoundMax = env("READ_ROUND_MAX", 512);
-        gatherUs = env("READ_GATHER_US", 5000);
+        readRoundMax = env("READ_ROUND_MAX", 4096);
+        // Hetzner 150k: 20 ms gathers cut Postgres CPU 52 -> 44% of the box (box 97.9 -> 90.6%), p95 498 -> 254 ms; with a
+        // round spread over connections (READ_SPREAD), 30 ms holds the same latency and batches more
+        gatherUs = env("READ_GATHER_US", 30000);
         coalesce = env("COALESCE", 1) != 0;
         if (readRoundMax < 1 || gatherUs < 0) {
             throw new IllegalArgumentException("invalid read round configuration");
@@ -105,10 +110,109 @@ public final class PgDispatcher implements AutoCloseable {
         }
     }
 
+    // spread(): the round's reads bucketed by kind (last bucket: units that are a statement of their own)
+    private Unit[][] buckets;
+    private final int[] bucketCounts = new int[PgConn.KINDS + 1];
+    private final long[] loads = new long[96];
+    private final PgConn[] idle = new PgConn[96];
+    // Hetzner 130k: 8 (with 30 ms gathers) cut p95 210 -> 113 ms at the same CPU per request, but at the 150k knee runs
+    // went bimodal, plausibly eight backends crowding the HTTP loops on a saturated box. 3 keeps the latency (locally
+    // p95 42 vs 41 ms with 8, 56 serial) with fewer backends at once (Postgres exec time 28 s vs 37 s with 8, 26 serial).
+    private final int spreadMax = env("READ_SPREAD", 3);
+
+    /**
+     * Takes the round's reads (in queue order, up to a tx read, at most
+     * READ_ROUND_MAX) and spreads them over the idle read connections from
+     * reads[from] on, one kind's batch whole on one connection, heaviest kinds
+     * first onto the least loaded connection. A round's statements run one
+     * after another on a backend and every unit waits for the round's Sync, so
+     * one connection per kind cuts a round to its slowest statement (locally 21
+     * -> ~9 ms at 20 ms gathers, with 7 of 8 read connections idle before).
+     */
+    private void spread(int from) {
+        if (buckets == null) {
+            buckets = new Unit[PgConn.KINDS + 1][readRoundMax];
+        }
+        int n = 0;
+        for (int c = from;
+             c < reads.length && n < spreadMax;
+             c++) {
+            if (reads[c].idle()) {
+                idle[n] = reads[c];
+                loads[n++] = 0;
+            }
+        }
+        Arrays.fill(bucketCounts, 0);
+        int taken = 0;
+        boolean blocked = false;
+        int count = waiting.size();
+        while (count-- > 0) {
+            Unit u = waiting.remove();
+            if (u.tx && !u.write) {
+                blocked = true;
+            }
+            if (u.write || blocked || taken == readRoundMax) {
+                waiting.add(u);
+                continue;
+            }
+            int k = PgConn.kind(u);
+            int b = k < 0 ? PgConn.KINDS : k;
+            buckets[b][bucketCounts[b]++] = u;
+            taken++;
+        }
+        for (; ; ) {
+            int heaviest = -1;
+            long heaviestCost = -1;
+            for (int b = 0; b <= PgConn.KINDS; b++) {
+                if (bucketCounts[b] == 0) {
+                    continue;
+                }
+                // a batch statement costs ~0.3 ms beyond its rows
+                long cost = 300 + (long) bucketCounts[b] * PgConn.cost(b == PgConn.KINDS ? -1 : b);
+                if (cost > heaviestCost) {
+                    heaviest = b;
+                    heaviestCost = cost;
+                }
+            }
+            if (heaviest < 0) {
+                break;
+            }
+            int target = 0;
+            for (int i = 1; i < n; i++) {
+                if (loads[i] < loads[target]) {
+                    target = i;
+                }
+            }
+            loads[target] += heaviestCost;
+            PgConn conn = idle[target];
+            Unit[] bucket = buckets[heaviest];
+            for (int i = 0, end = bucketCounts[heaviest];
+                 i < end;
+                 i++) {
+                Unit u = bucket[i];
+                bucket[i] = null;
+                try {
+                    conn.addToGroup(u);
+                } catch (RuntimeException e) {
+                    u.sqlState = "XX000";
+                    u.errorMessage = e.toString();
+                    u.owner.post(u);
+                }
+            }
+            bucketCounts[heaviest] = 0;
+        }
+        for (int i = 0; i < n; i++) {
+            if (idle[i].groupSize() != 0) {
+                idle[i].sendReadRound();
+            }
+        }
+    }
+
     private void plan() {
         int count = waiting.size();
         if (coalesce) {
-            for (PgConn conn : reads) {
+            for (int c = 0; c < reads.length; c++) {
+                PgConn conn = reads[c];
                 if (!conn.idle()) {
                     continue;
                 }
@@ -139,28 +243,8 @@ public final class PgDispatcher implements AutoCloseable {
                     }
                     continue;
                 }
-                count = waiting.size();
-                boolean blocked = false;
-                while (count-- > 0) {
-                    Unit u = waiting.remove();
-                    if (u.tx && !u.write) {
-                        blocked = true;
-                    }
-                    if (u.write || blocked || conn.groupSize() == readRoundMax) {
-                        waiting.add(u);
-                        continue;
-                    }
-                    try {
-                        conn.addToGroup(u);
-                    } catch (RuntimeException e) {
-                        u.sqlState = "XX000";
-                        u.errorMessage = e.toString();
-                        u.owner.post(u);
-                    }
-                }
-                if (conn.groupSize() != 0) {
-                    conn.sendReadRound();
-                }
+                spread(c);
+                break;
             }
         } else {
             while (count-- > 0) {
