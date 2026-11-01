@@ -1,7 +1,10 @@
 package conduit
 
 import io.netty.buffer.{ByteBuf, ByteBufAllocator}
+import io.netty.util.concurrent.FastThreadLocal
 
+import java.lang.invoke.{MethodHandles, VarHandle}
+import java.nio.ByteOrder
 import java.nio.charset.StandardCharsets.{US_ASCII, UTF_8}
 import java.util.Arrays
 
@@ -28,8 +31,8 @@ enum Status(val code: Int, reason: String):
 
 /** Builds one response body. The JSON is written after some headroom; [[response]] then puts the status line and
   * headers right in front of it and copies the whole response into one buffer, for a single socket write. A request
-  * holds one while it waits for Postgres, and gives it back to its loop's [[Out.Pool]] once answered, so it must
-  * stay on that loop's thread.
+  * takes one from the [[Out.Pool]] of the thread that first writes its body (where its replies from Postgres are
+  * read), and gives it back to the pool of the thread it finishes on.
   */
 final class Out:
   import Out.*
@@ -122,6 +125,8 @@ final class Out:
     from.getBytes(index, buf, pos, length)
     val end = pos + length
     var i = pos
+    // Eight bytes at a time while none needs escaping, then one at a time: to the first that does, or the end.
+    while i + 8 <= end && clean(Longs.get(buf, i).asInstanceOf[Long]) do i += 8
     while i < end && { val b = buf(i) & 0xff; b >= 0x20 && b != '"' && b != '\\' } do i += 1
     if i == end then
       pos = end
@@ -192,6 +197,8 @@ final class Out:
 
   /** The body written since [[reset]], as text (tests). */
   private[conduit] def body: String = String(buf, Headroom, pos - Headroom, UTF_8)
+  /** The same, as bytes (tests). */
+  private[conduit] def bodyBytes: Array[Byte] = Arrays.copyOfRange(buf, Headroom, pos)
 
   private def ensure(n: Int): Unit =
     if pos + n > buf.length then buf = Arrays.copyOf(buf, math.max(buf.length * 2, pos + n))
@@ -214,7 +221,7 @@ object Out:
     case Close extends Ending("\r\nconnection: close\r\n\r\n")
     private[Out] val bytes = text.getBytes(US_ASCII)
 
-  /** A loop's spare [[Out]]s: a request takes one when it starts and gives it back once answered. */
+  /** A thread's spare [[Out]]s, used on that thread only ([[Pool.current]]). */
   final class Pool:
     private var free = new Array[Out](64)
     private var size = 0
@@ -235,7 +242,57 @@ object Out:
         free(size) = out
         size += 1
 
+    /** Spare [[Out]]s for what a round's batches share ([[RoundArticles]], [[PackedArticles]], [[PackedComments]]),
+      * kept whatever their size, a few at most: a round's articles run to hundreds of KB, past [[MaxPooledBytes]], and
+      * growing new ones from 16 KB every round, by doubling, took 2% of the server's CPU at saturation in zeroing and
+      * copying.
+      */
+    private val rounds = new Array[Out](MaxRoundOuts)
+    private var roundsSize = 0
+
+    def takeRound(): Out =
+      if roundsSize == 0 then Out()
+      else
+        roundsSize -= 1
+        val out = rounds(roundsSize)
+        rounds(roundsSize) = null
+        out.reset()
+        out
+
+    def giveRound(out: Out): Unit =
+      if roundsSize < MaxRoundOuts && out.buf.length <= MaxRoundBytes then
+        rounds(roundsSize) = out
+        roundsSize += 1
+
+  object Pool:
+    private val pools = new FastThreadLocal[Pool]:
+      override protected def initialValue(): Pool = Pool()
+
+    /** The current thread's. */
+    def current: Pool = pools.get()
+
   private val MaxPooledBytes = 256 * 1024
+
+  /** A byte array read eight bytes at a time ([[clean]]). */
+  private val Longs: VarHandle = MethodHandles.byteArrayViewVarHandle(classOf[Array[Long]], ByteOrder.LITTLE_ENDIAN)
+  private val Ones = 0x0101010101010101L
+  private val Highs = 0x8080808080808080L
+
+  /** Whether none of eight bytes needs escaping in a JSON string: none below 0x20, none `"` or `\`. Each test sets a
+    * byte's high bit where its condition holds: `(x - n·ones) & ~x` for a byte below `n`, the same with `n` 1 on `x`
+    * XOR a byte's copies for that byte. Where none holds nothing borrows, so the high bits are all clear; a byte from
+    * 0x80 on (in a multi-byte character) never sets its own.
+    */
+  private def clean(x: Long): Boolean =
+    val q = x ^ (Ones * '"')
+    val s = x ^ (Ones * '\\')
+    ((((x - Ones * 0x20) & ~x) | ((q - Ones) & ~q) | ((s - Ones) & ~s)) & Highs) == 0L
+
+  /** A thread's round buffers: a round's plan takes two, its comments' and lists' batches one each, a round in flight
+    * per read connection, four connections per loop on the box.
+    */
+  private val MaxRoundOuts = 16
+  private val MaxRoundBytes = 16 * 1024 * 1024
 
   private def digitCount(value: Long): Int =
     var n = 1

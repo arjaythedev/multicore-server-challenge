@@ -78,8 +78,8 @@ class PgSuite extends munit.FunSuite:
     row.textArray(0, out)
     assertEquals(out.body, "[]")
 
-  /** A write that sends `statements` statements and records what it gets. */
-  private final class Write(statements: Int) extends PgQuery:
+  /** A write that sends `statements` statements and records what it gets; of `client`, if known. */
+  private final class Write(statements: Int, override val client: AnyRef = null) extends PgQuery:
     val rows = collection.mutable.ArrayBuffer[Int]()
     var resets = 0
     var error: PgError = null
@@ -94,7 +94,8 @@ class PgSuite extends munit.FunSuite:
       rows.clear()
 
   /** A pool without connections: what it is asked to send fails as unavailable. */
-  private def noConnections = PgPool(null, PgConfig("", 0, "", "", ""), Vector.empty, 0, 1, classOf[io.netty.channel.socket.nio.NioSocketChannel])
+  private def noConnections =
+    PgPool(null, PgConfig("", 0, "", "", ""), Vector.empty, PgReads(0, 1), 0, 0, classOf[io.netty.channel.socket.nio.NioSocketChannel])
 
   private def sent(writes: Array[Write]): WriteGroup =
     val group = WriteGroup(noConnections, writes.toArray[PgQuery])
@@ -125,6 +126,79 @@ class PgSuite extends munit.FunSuite:
     val group = sent(writes)
     group.done(PgError.ConnectionLost)
     assert(writes.forall(w => w.resets == 0 && (w.error eq PgError.ConnectionLost)))
+
+  /** A follow by `viewer`, of client `client`: a write that merges with the follows in its group. */
+  private final class Follow(viewer: Long, name: String, override val client: AnyRef) extends PgQuery:
+    val rows = collection.mutable.ArrayBuffer[(Int, Long)]()
+    var error: PgError = null
+    override def write: Boolean = true
+    override def merge: Sql.Merge = Sql.mergeOf(Sql.Follow)
+    override def int8Param(p: Int): Long = viewer
+    override def textParam(p: Int): String = name
+    def send(w: PgWriter): Unit = w.bind(Sql.Follow).int8(viewer).text(name).execute()
+    def row(statement: Int, row: PgRow): Unit = rows += statement -> row.int8(row.columns - 1)
+    def done(e: PgError): Unit = error = e
+
+  test("a group's follows of different clients: one statement, ordered after the rest, rows back by their place"):
+    val a = Follow(1, "a", "client a")
+    val b = Follow(2, "b", "client b")
+    val other = Write(1, "client o")
+    val group = WriteGroup(noConnections, Array[PgQuery](a, other, b))
+    val w = PgWriter()
+    w.buf = Unpooled.buffer()
+    group.send(w)
+    assertEquals(w.executes, 2) // the other write's statement, then the follows'
+    group.row(0, PgRow())
+    group.row(1, dataRow(text("b"), null, null, int8(2)))
+    group.row(1, dataRow(text("a"), null, null, int8(1)))
+    assertEquals((other.rows.toList, a.rows.toList, b.rows.toList), (List(0), List(0 -> 1L), List(0 -> 2L)))
+
+  test("a group with two writes of one client: in the order they came, only runs merged"):
+    val a = Follow(1, "a", "client a")
+    val b = Follow(1, "b", "client a")
+    val other = Write(1)
+    val group = WriteGroup(noConnections, Array[PgQuery](a, other, b))
+    val w = PgWriter()
+    w.buf = Unpooled.buffer()
+    group.send(w)
+    assertEquals(w.executes, 3)
+    group.row(0, dataRow(text("a"), null, null, int8(1)))
+    group.row(1, PgRow())
+    group.row(2, dataRow(text("b"), null, null, int8(1)))
+    assertEquals((a.rows.toList, other.rows.toList, b.rows.toList), (List(0 -> 1L), List(0), List(0 -> 1L)))
+
+  test("a shared batch's rows go to its first query when every query copies, the copies made before any is done"):
+    final class Q(copies: Boolean, log: collection.mutable.Buffer[String], name: String) extends PgQuery:
+      val rows = collection.mutable.Buffer[String]()
+      def send(w: PgWriter): Unit = ()
+      def row(statement: Int, row: PgRow): Unit = rows += row.string(0)
+      override def copiesShared: Boolean = copies
+      override def copyShared(first: PgQuery): Unit =
+        rows ++= first.asInstanceOf[Q].rows
+        log += s"$name copies"
+      def done(error: PgError): Unit = log += s"$name done"
+    val tags = Sql.batchOf(Sql.Tags)
+    val log = collection.mutable.Buffer[String]()
+    val copying = Array(Q(true, log, "a"), Q(true, log, "b"), Q(true, log, "c"))
+    val batch = BatchQuery(tags, copying.asInstanceOf[Array[PgQuery]])
+    batch.row(0, dataRow(text("x")))
+    batch.row(0, dataRow(text("y")))
+    assertEquals(copying.map(_.rows.toList).toList, List(List("x", "y"), Nil, Nil))
+    batch.done(null)
+    assertEquals(copying.map(_.rows.toList).toList, List.fill(3)(List("x", "y")))
+    assertEquals(log.toList, List("b copies", "c copies", "a done", "b done", "c done"))
+    // One that can't copy: every query gets every row, and nothing is copied.
+    val mixed = Array(Q(true, log, "d"), Q(false, log, "e"))
+    log.clear()
+    val other = BatchQuery(tags, mixed.asInstanceOf[Array[PgQuery]])
+    other.row(0, dataRow(text("x")))
+    other.done(null)
+    assertEquals((mixed.map(_.rows.toList).toList, log.toList), (List(List("x"), List("x")), List("d done", "e done")))
+    // A failed batch copies nothing.
+    val failing = Array(Q(true, log, "f"), Q(true, log, "g"))
+    log.clear()
+    BatchQuery(tags, failing.asInstanceOf[Array[PgQuery]]).done(PgError.ConnectionLost)
+    assertEquals(log.toList, List("f done", "g done"))
 
   /** A DataRow's content: each column a value written by its function, or null. */
   private def dataRow(columns: (io.netty.buffer.ByteBuf => Unit)*): PgRow =
@@ -185,3 +259,108 @@ class PgSuite extends munit.FunSuite:
     assertEquals(got.body, expected.body)
     assertEquals(packed.find(8), -1)
     packed.release()
+
+  test("a packed batch's comments, copied with each viewer's following, are the comments Render.comment writes"):
+    // id, body, created_at, updated_at, username, bio, image, then the article and the author.
+    def comment(id: Long, body: String, author: Long, bio: String) = Seq[io.netty.buffer.ByteBuf => Unit](
+      int8(id), text(body), int8(id * 1_000_000), int8(id * 2_000_000), text(s"u$author"), if bio == null then null else text(bio), null,
+    )
+    // Article 7's comments newest first, then article 9's.
+    val comments = Seq((7L, 30L, "third \"q\"", 3L, "bio"), (7L, 20L, "second", 4L, null), (9L, 10L, "é\n", 3L, "x"))
+    val outs = Out.Pool()
+    val packed = PackedComments(outs)
+    for (article, id, body, author, bio) <- comments do
+      packed.row(dataRow(comment(id, body, author, bio) ++ Seq(int8(article), int8(author), null, int8(0))*))
+    for (article, followed) <- Seq((7L, Seq(4L)), (9L, Seq(3L)), (8L, Seq())) do
+      val got = Out()
+      val expected = Out()
+      var k = packed.first(article)
+      while k >= 0 && k < packed.size && packed.article(k) == article do
+        packed.write(got, k, followed.contains(packed.author(k)))
+        k += 1
+      for (a, id, body, author, bio) <- comments if a == article do
+        Render.comment(expected, dataRow(comment(id, body, author, bio) :+ bool(followed.contains(author))*), followed.contains(author))
+      assertEquals(got.body, expected.body)
+    assertEquals(packed.first(8), -1)
+    packed.release()
+
+  test("a round's articles, put together from both phases with each viewer's flags, are the articles Render.article writes"):
+    // id, author, slug, title, description, created_at, updated_at; the body; the tag names; favorites; the author's.
+    case class A(id: Long, author: Long, slug: String, body: String, tags: Seq[String], favorites: Long)
+    val articles = Seq(A(7, 3, "seven", "b7 \"q\"", Seq("b", "a\\"), 5), A(9, 4, "nine", "b9", Seq(), 0),
+      A(11, 3, "eleven", "b11\n", Seq("c"), 12))
+    val tagIds = Map("a\\" -> 30, "b" -> 4, "c" -> 17) // in name order: "a\\", "b", "c"
+    val bios = Map(3L -> "bio", 4L -> null)
+    def head(a: A) = Seq[io.netty.buffer.ByteBuf => Unit](int8(a.id), int8(a.author), text(a.slug), text("T \"q\""), text("dé"),
+      int8(a.id * 1_000_000), int8(a.id * 2_000_000))
+    val outs = Out.Pool()
+    val round = RoundArticles(outs)
+    // First phase: a list's articles (no body), then an article page's (with its body), one of them twice.
+    for a <- articles do round.article(dataRow((null +: head(a)) ++ Seq(null, int8(0))*), withBody = false)
+    val page = round.article(dataRow((null +: head(articles(0))) ++ Seq(text(articles(0).body), int8(1))*), withBody = true)
+    assertEquals((round.size, round.find(7), page, round.find(8)), (3, 0, 0, -1))
+    assertEquals((0 until round.authorCount).map(round.authorId).toSet, Set(3L, 4L))
+    round.ask(1, 0, following = true)
+    round.ask(1, 1, following = true)
+    round.ask(2, 2, following = false)
+    val (favorites, follows) = (round.favoritesAsked, round.followsAsked)
+    assertEquals((favorites.size, favorites.count, follows.size, follows.count), (2, 3, 1, 2))
+    assertEquals((0 until favorites.count).map(favorites.second), articles.map(_.id).toSeq)
+    // Second phase: tag ids and favorites, authors, the tags in name order, the flags that hold.
+    for a <- articles.reverse do round.enriched(dataRow(int8(a.id), int8s(a.tags.map(t => tagIds(t).toLong).reverse*), int8(a.favorites)))
+    for (id, bio) <- bios do round.author(dataRow(int8(id), text(s"u$id"), if bio == null then null else text(bio), null))
+    for t <- tagIds.keys.toSeq.sorted do round.tag(dataRow(_.writeInt(tagIds(t)), text(t)))
+    round.flag(dataRow(int8(0), int8(1), int8(7)))
+    round.flag(dataRow(int8(1), int8(1), int8(4)))
+    round.assemble()
+    def expected(a: A, viewer: Long, withBody: Boolean): String =
+      val favorited = viewer == 1 && a.id == 7
+      val following = viewer == 1 && a.author == 4
+      val tail = Seq(int8(a.id * 1_000_000), int8(a.id * 2_000_000), texts(a.tags.sorted*), int8(a.favorites), bool(favorited),
+        text(s"u${a.author}"), if bios(a.author) == null then null else text(bios(a.author)), null, bool(following))
+      val row = dataRow((head(a).slice(2, 5) ++ (if withBody then Seq(text(a.body)) else Nil) ++ tail)*)
+      val out = Out()
+      Render.article(out, row, 0, withBody)
+      out.body
+    for viewer <- Seq(0L, 1L, 2L); a <- articles do
+      val i = round.find(a.id)
+      assert(round.ready(i))
+      val got = Out()
+      round.write(got, i, round.favorited(viewer, i), round.following(viewer, i))
+      assertEquals(got.body, expected(a, viewer, withBody = false))
+    val got = Out()
+    round.writeWithBody(got, page, round.favorited(1, page), round.following(1, page))
+    assertEquals(got.body, expected(articles(0), 1, withBody = true))
+    round.release()
+
+  test("a round's article whose second phase didn't name its tag or author isn't whole"):
+    val round = RoundArticles(Out.Pool())
+    val head = Seq[io.netty.buffer.ByteBuf => Unit](text("s"), text("t"), text("d"), int8(1), int8(2))
+    round.article(dataRow((Seq(null, int8(5), int8(3)) ++ head ++ Seq(null, int8(0)))*), withBody = false)
+    round.article(dataRow((Seq(null, int8(6), int8(4)) ++ head ++ Seq(null, int8(0)))*), withBody = false)
+    round.enriched(dataRow(int8(5), int8s(99), int8(0)))
+    round.enriched(dataRow(int8(6), int8s(), int8(0)))
+    round.author(dataRow(int8(3), text("u3"), null, null))
+    round.assemble()
+    assert(!round.ready(round.find(5))) // tag 99 not among the tags read
+    assert(!round.ready(round.find(6))) // author 4 not read
+    round.release()
+
+  test("pairs and ids, each once"):
+    val set = PairSet()
+    for i <- 0 until 500 do set.add(i % 50, i / 50)
+    set.add(3, 0)
+    assertEquals(set.size, 500)
+    assert(set.has(49, 9) && !set.has(50, 0))
+    val index = LongIndex()
+    assertEquals((0 until 300).map(i => index.add(i * 7919L)), 0 until 300)
+    assertEquals((index.add(7919L), index.find(299 * 7919L), index.find(1)), (1, 299, -1))
+
+  test("pairs grouped by their first, as 1-based slices, in the order added"):
+    val set = PairSet()
+    for (a, b) <- Seq((7L, 1L), (3L, 2L), (7L, 3L), (9L, 4L), (3L, 5L), (7L, 6L)) do set.add(a, b)
+    val s = PairSlices(set)
+    assertEquals((0 until s.size).map(s.first), Seq(7L, 3L, 9L))
+    assertEquals((0 until s.size).map(k => (s.start(k), s.end(k))), Seq((1L, 3L), (4L, 5L), (6L, 6L)))
+    assertEquals((0 until s.count).map(s.second), Seq(1L, 3L, 6L, 2L, 5L, 4L))
+    assertEquals((PairSlices(PairSet()).size, PairSlices(PairSet()).count), (0, 0))
