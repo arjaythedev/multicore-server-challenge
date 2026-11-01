@@ -13,14 +13,14 @@ database layer of typed queries through Npgsql.FSharp, and one small module for 
 | JSON | `System.Text.Json`: `Utf8JsonWriter` out, `JsonDocument` in |
 | Postgres | Npgsql 10.0.3 (multiplexing, auto-prepare) through Npgsql.FSharp 5.7.0 |
 | JWT | HS256 with the BCL's `HMACSHA256` and `Base64Url` (`src/Web/Jwt.fs`) |
-| bcrypt | BCrypt.Net-Next 4.2.0, cost 10 |
+| bcrypt | our own, four hashes in lockstep (`src/Engine/Bcrypt.fs`), cost 10; BCrypt.Net-Next 4.2.0 is the test reference and the fallback for unusual hashes |
 
 Package versions are pinned, and `build.sh` restores the `packages.lock.json` graphs in locked mode.
 
 ## Layout
 
 ```
-src/Engine/   the database side: Types, Db (pool), Commit (group commit), Reads (read batching), Passwords (bcrypt lanes), Tags, Users, Profiles, Articles, Comments
+src/Engine/   the database side: Types, Db (pool), Commit (group commit), Reads (read batching), Bcrypt (lockstep bcrypt), Passwords (bcrypt threads), Tags, Users, Profiles, Articles, Comments
 src/Web/      Jwt (the token shim), Wire (JSON in/out, query paging; pure), Handlers (Giraffe), Program (Kestrel)
 src/Tests/    xUnit facts for Jwt and Wire (no database); BatchTests, the read-batching property (FsCheck)
 check.sh      the harness: build -> facts -> conformance suite (../../test/run.sh) -> batch property, one verdict
@@ -68,7 +68,8 @@ check.sh      the harness: build -> facts -> conformance suite (../../test/run.s
     that: two viewers, one article.
   - This is not a cache: every request is answered from a snapshot taken after it arrived, and nothing outlives
     its batch.
-  - **Measured** on an 8-core test box (server and Postgres pinned to the same 8 cores, the load generator on others):
+  - **Measured** on an 8-thread test box (server and Postgres pinned to the same 8 hardware threads, the load generator
+    on the others; in these runs those were each core's sibling hyperthread, so absolute numbers are pessimistic):
 
     | Users | Build | p95 | Postgres cores | Result |
     |--:|---|--:|--:|---|
@@ -91,8 +92,10 @@ check.sh      the harness: build -> facts -> conformance suite (../../test/run.s
   - If the connection breaks, whether the group committed is unknown, so its writes fail (500) instead of being
     applied twice.
   - At shutdown the server logs `group commit: N writes in M groups`.
-- **bcrypt on dedicated threads** (`BCRYPT_THREADS`, default one per two cores) behind a queue. A burst of logins waits
-  for a lane instead of parking thread-pool threads that the cheap reads need.
+- **bcrypt on dedicated threads** (`BCRYPT_THREADS`, default 2) behind a queue, each computing up to `BCRYPT_WIDTH`
+  (4) hashes in lockstep (see below). A thread that takes a login waits up to `BCRYPT_GATHER_MS` (50) for
+  batch-mates. Logins are ~0.1% of the requests, so that wait barely touches p95 or p99. A burst of logins waits
+  for a thread instead of parking thread-pool threads that the cheap reads need.
 - **GC:** server GC, non-concurrent, DATAS off, and a 64 MB gen0 budget (`DOTNET_GCgen0size` in `start.sh`). The
   JIT runs with tiered PGO.
 
@@ -144,9 +147,17 @@ The pre-checks don't change the outcome: two racing sign-ups can both pass, and 
 - **Connections:** at most 95 Postgres connections (`READ_LANES` + `WRITE_LANES` + `DB_POOL_SIZE`; the pool is
   capped to fit).
 
-## Where the app's CPU goes: half of it is bcrypt
+## Capacity on a box like the benchmark's
 
-`perf` on the server process (60,000 users, ~15,600 requests/s, Release build, 20 s at 499 Hz, JIT frames named via
+8 vCPUs on a cloud host are 4 physical cores × 2 hyperthreads. The test box models that: server and Postgres on 4
+Zen 5 cores with both of their hyperthreads, and the load generator on other cores, sharing none of them. With
+batched reads, group commit and lockstep bcrypt, it holds **75,000 users** (19,150 requests/s, p95 378 ms, p99 560
+ms, no errors). It fails at 80,000 (p95 583 ms). Postgres uses 4.5 of the 8 threads and the app 2.8. These cores
+are faster than a typical cloud core, so expect the benchmark box to hold fewer users.
+
+## Where the app's CPU goes: half of it was bcrypt
+
+`perf` on the server process (before the lockstep bcrypt below; 60,000 users, ~15,600 requests/s, Release build, 20 s at 499 Hz, JIT frames named via
 `DOTNET_PerfMapEnabled=1` and `DOTNET_EnableWriteXorExecute=0`):
 
 | Where | Share of the app's ~2.8 cores |
@@ -161,6 +172,32 @@ second. A cost-10 bcrypt takes 51 ms on an idle core, but ~92 ms of CPU under lo
 with busy hyperthread siblings. The rules make every login pay it (cost 10, verified against the stored hash, no
 cache), so the only lever is a faster bcrypt. The system's native one (libxcrypt `crypt_r`, the Openwall C code)
 is only 22% faster than BCrypt.Net-Next.
+
+**So bcrypt is our own, four hashes in lockstep** (`src/Engine/Bcrypt.fs`). One bcrypt is ~1 M Blowfish encryptions,
+each feeding the next: a chain of dependent S-box lookups that leaves the CPU waiting on memory latency. Four
+logins' hashes are independent, so their rounds are interleaved inside each encryption (`encipher4`). That is four
+chains in flight at once, all in registers, which the CPU's out-of-order engine overlaps.
+
+| bcrypt cost 10, one thread | ms per hash | vs BCrypt.Net-Next |
+|---|--:|--:|
+| BCrypt.Net-Next | 64-79 | 1x |
+| ours, one at a time | ~58 | ~1.2x |
+| ours, two in lockstep | ~33 | ~2.2x |
+| ours, four in lockstep | **~19-20** | **~3.2-4x** |
+
+(A batch of three runs as four, the copy's result dropped: one quad costs less than a pair plus a single.)
+
+At 85,000 users on the test box this cut the app's CPU from 3.81 to 3.00 cores, with more requests per second
+(21,400 against 21,000) and p95 from 647 ms to 515 ms. Postgres took the freed cores (3.88 to 4.30) and is now the
+larger consumer, and the lockstep batches averaged ~2.5 logins.
+
+- **Bit for bit.** `Tests/BcryptTests.fs` is an FsCheck property: for random batches (1 to 6) of random passwords
+  (ASCII and 2-, 3- and 4-byte UTF-8, up to the 72-byte limit) and random salts, every hash equals
+  BCrypt.Net-Next's. Our hashes also verify in BCrypt.Net-Next, and its `$2a$` and `$2b$` hashes verify in ours.
+- **Constants derived, not pasted.** Blowfish's 1,042 initial words are the hexadecimal digits of pi. `Bcrypt.fs`
+  computes them with Machin's formula on big integers, and the tests check them against the published tables.
+- Stored hashes we do not compute ourselves (another revision, a malformed string) go to BCrypt.Net-Next, and a
+  malformed one verifies as false. Comparisons are constant-time.
 
 Allocation is not where the time goes. Pooled response buffers, UTF-8 timestamps from a stack buffer and no boxed
 struct comparisons halved the allocation rate (300 → 145 MB/s), and GC pauses stayed at 2-3% of wall time. The other
@@ -181,4 +218,4 @@ SKIP_CONFORMANCE=1 bash check.sh  # the quick gate, no database
 
 Environment: `DATABASE_URL`, `JWT_SECRET` (required); `HOST` (127.0.0.1), `PORT` (3000); `READ_LANES` (cores);
 `READ_BATCH` (1024); `READ_GATHER_MS` (25); `WRITE_LANES` (2); `WRITE_GROUP` (128); `DB_POOL_SIZE` (cores / 2, capped so the total stays
-at most 95); `BCRYPT_THREADS` (cores / 2).
+at most 95); `BCRYPT_THREADS` (2); `BCRYPT_WIDTH` (4); `BCRYPT_GATHER_MS` (50).

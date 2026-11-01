@@ -86,9 +86,16 @@ let main args =
     // Multiplexed: the cold reads (sign-in lookups, the read after a write). Rule: 95 or fewer
     // connections in total, lanes included.
     let poolSize = min (95 - writeLanes - readLanes) (int (setting "DB_POOL_SIZE" (string (max 2 (cores / 2)))))
-    let bcryptLanes = int (setting "BCRYPT_THREADS" (string (max 1 (cores / 2))))
+    // Two threads, each computing up to four hashes in lockstep (~50 a second), cover a login
+    // rate far above this workload's; fewer threads also fill the lockstep batches.
+    let bcryptLanes = max 1 (int (setting "BCRYPT_THREADS" "2"))
+    // Each bcrypt thread computes up to BCRYPT_WIDTH hashes in lockstep, letting the first wait
+    // up to BCRYPT_GATHER_MS for batch-mates.
+    let bcryptWidth = max 1 (int (setting "BCRYPT_WIDTH" "4"))
+    // Logins are ~0.1% of the requests, so waiting for batch-mates barely touches p95 or p99.
+    let bcryptGather = TimeSpan.FromMilliseconds(float (setting "BCRYPT_GATHER_MS" "50"))
 
-    Engine.Passwords.start bcryptLanes
+    Engine.Passwords.start bcryptLanes bcryptWidth bcryptGather
     let ds = Engine.Db.dataSource (Engine.Db.connectionString databaseUrl poolSize true)
     let writes =
         Engine.Commit.Writer(Engine.Db.connectionString databaseUrl writeLanes false, writeLanes, writeGroup)
@@ -138,6 +145,8 @@ let main args =
     app.Lifetime.ApplicationStopping.Register(fun () ->
         let hashes, verifies = Engine.Passwords.counts ()
         eprintfn "bcrypt: %d hashes (sign-ups, password changes), %d verifies (logins)" hashes verifies
+        let lockstepBatches, inBatches = Engine.Passwords.lockstep ()
+        eprintfn "bcrypt lockstep: %d hashes in %d batches" inBatches lockstepBatches
         let groups, written = writes.Counts
         eprintfn "group commit: %d writes in %d groups" written groups
         let batches, requests = reads.Counts

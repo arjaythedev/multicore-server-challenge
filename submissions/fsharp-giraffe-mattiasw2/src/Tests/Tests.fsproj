@@ -9,6 +9,7 @@
          proof is the conformance suite, which check.sh runs against the real server. -->
     <Compile Include="JwtTests.fs" />
     <Compile Include="WireTests.fs" />
+    <Compile Include="BcryptTests.fs" />
     <Compile Include="BatchTests.fs" />
   </ItemGroup>
   <ItemGroup>
