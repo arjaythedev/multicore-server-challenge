@@ -4,7 +4,7 @@ Front: direct
 
 | | |
 |---|---|
-| **Language** | [DexLang](https://github.com/ensamuel7/dex) `v0.9.28`: statically typed, compiles to C, which `cc` builds into a native binary |
+| **Language** | [DexLang](https://github.com/ensamuel7/dex) `v0.9.29`: statically typed, compiles to C, which `cc` builds into a native binary |
 | **Framework** | None. DexLang's own `http`, `db`, `json` and `crypto` standard library modules, and [dexqu](https://github.com/ensamuel7/dex-modules/tree/main/dexqu) `v0.2.0`, a SQL query builder written in Dex, for the SQL |
 | **Server** | The `http` module's io_uring backend (`http.uring()`), one event loop per process, `http.fork(n)` processes sharing port 80 through `SO_REUSEPORT` |
 | **Postgres driver** | libpq (Ubuntu's `libpq-dev`), through the `db` module: prepared statements, one connection per process |
@@ -134,11 +134,11 @@ estimate, not a measurement.
 ```
 server.dx    routes, handlers, auth, JSON
 queries.dx   the SQL, built with dexqu
-dex.mod      module file: dex 0.9.28, requires dexqu v0.2.0
+dex.mod      module file: dex 0.9.29, requires dexqu v0.2.0
 dex.sum      dexqu's checksum
 install.sh   root, once: build-essential, pkg-config, libpq-dev, libcrypt-dev,
              libssl-dev, libcurl, libsqlite3-dev, and Go 1.27.2 (sha256-checked)
-build.sh     builds the dex compiler from the pinned v0.9.28 tag through the Go
+build.sh     builds the dex compiler from the pinned v0.9.29 tag through the Go
              module proxy (checksum-verified), downloads dexqu (checked
              against dex.sum), then compiles server.dx
 start.sh     raises the open-file limit and runs two workers per core
