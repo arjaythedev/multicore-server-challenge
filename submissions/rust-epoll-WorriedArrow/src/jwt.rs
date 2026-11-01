@@ -294,6 +294,102 @@ fn with_decoded<R>(part: &[u8], f: impl FnOnce(&[u8]) -> Option<R>) -> Option<R>
     }
 }
 
+/// The payload claims verify() checks: (exp, nbf, iat is a number, sub).
+type Claims = (Option<Option<f64>>, Option<Option<f64>>, Option<bool>, Option<Option<i64>>);
+
+fn claims(pb: &[u8]) -> Option<Claims> {
+    match flat_claims(pb) {
+        Some((exp, iat, sub)) => Some((Some(Some(exp)), None, iat.then_some(true), Some(Some(sub)))),
+        None => scan_claims(pb),
+    }
+}
+
+/// The common payload, read without the general scanner: a flat object of "exp" and "iat" (unsigned integers) and
+/// "sub" (a string of digits), each at most once, in any order, with no whitespace, escapes or other keys. Anything
+/// else returns None and goes through the full scan; whatever this accepts, the scan reads to the same values.
+fn flat_claims(b: &[u8]) -> Option<(f64, bool, i64)> {
+    let (mut exp, mut iat, mut sub) = (None, false, None);
+    let mut i = 1;
+    if b.first() != Some(&b'{') || b.last() != Some(&b'}') || b.len() < 3 {
+        return None;
+    }
+    let end = b.len() - 1;
+    loop {
+        let key = b.get(i..i + 6)?;
+        i += 6;
+        match key {
+            b"\"exp\":" | b"\"iat\":" => {
+                let s = i;
+                while i < end && b[i].is_ascii_digit() {
+                    i += 1;
+                }
+                let n = i - s;
+                if n == 0 || n > 15 || (n > 1 && b[s] == b'0') {
+                    return None;
+                }
+                let v = b[s..i].iter().fold(0u64, |a, &c| a * 10 + (c - b'0') as u64) as f64;
+                if key[1] == b'e' {
+                    if exp.replace(v).is_some() {
+                        return None;
+                    }
+                } else if std::mem::replace(&mut iat, true) {
+                    return None;
+                }
+            }
+            b"\"sub\":" => {
+                if b.get(i) != Some(&b'"') {
+                    return None;
+                }
+                i += 1;
+                let s = i;
+                while i < end && b[i].is_ascii_digit() {
+                    i += 1;
+                }
+                let n = i - s;
+                if n == 0 || n > 18 || b.get(i) != Some(&b'"') {
+                    return None;
+                }
+                let v = b[s..i].iter().fold(0i64, |a, &c| a * 10 + (c - b'0') as i64);
+                i += 1;
+                if sub.replace(v).is_some() {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+        if i == end {
+            break;
+        }
+        if b[i] != b',' {
+            return None;
+        }
+        i += 1;
+    }
+    Some((exp?, iat, sub?))
+}
+
+fn scan_claims(pb: &[u8]) -> Option<Claims> {
+    let mut exp: Option<Option<f64>> = None;
+    let mut nbf: Option<Option<f64>> = None;
+    let mut iat: Option<bool> = None;
+    let mut sub: Option<Option<i64>> = None;
+    Scan::document(pb, |k, v| match k {
+        b"exp" => exp = Some(if let Val::Num(x) = v { Some(x) } else { None }),
+        b"nbf" => nbf = Some(if let Val::Num(x) = v { Some(x) } else { None }),
+        b"iat" => iat = Some(matches!(v, Val::Num(_))),
+        b"sub" => {
+            sub = Some(match v {
+                Val::Str(Some((a, n))) if n > 0 && a[..n].iter().all(|c| c.is_ascii_digit()) => {
+                    std::str::from_utf8(&a[..n]).ok().and_then(|t| t.parse::<i64>().ok())
+                }
+                _ => None,
+            })
+        }
+        _ => {}
+    })?;
+    Some((exp, nbf, iat, sub))
+}
+
 impl Keys {
     pub fn new(secret: &[u8]) -> Keys {
         Keys { mac: HmacSha256::new_from_slice(secret).expect("hmac key") }
@@ -330,27 +426,7 @@ impl Keys {
                 return None;
             }
         }
-        let (exp, nbf, iat_ok, sub) = with_decoded(p, |pb| {
-            let mut exp: Option<Option<f64>> = None;
-            let mut nbf: Option<Option<f64>> = None;
-            let mut iat: Option<bool> = None;
-            let mut sub: Option<Option<i64>> = None;
-            Scan::document(pb, |k, v| match k {
-                b"exp" => exp = Some(if let Val::Num(x) = v { Some(x) } else { None }),
-                b"nbf" => nbf = Some(if let Val::Num(x) = v { Some(x) } else { None }),
-                b"iat" => iat = Some(matches!(v, Val::Num(_))),
-                b"sub" => {
-                    sub = Some(match v {
-                        Val::Str(Some((a, n))) if n > 0 && a[..n].iter().all(|c| c.is_ascii_digit()) => {
-                            std::str::from_utf8(&a[..n]).ok().and_then(|t| t.parse::<i64>().ok())
-                        }
-                        _ => None,
-                    })
-                }
-                _ => {}
-            })?;
-            Some((exp, nbf, iat, sub))
-        })?;
+        let (exp, nbf, iat_ok, sub) = with_decoded(p, claims)?;
         let now = now_f64();
         // exp is required, a number, and in the future.
         let exp = exp??;
@@ -392,6 +468,42 @@ impl Keys {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flat_claims_match_scan() {
+        let cases: &[&[u8]] = &[
+            br#"{"sub":"42","iat":1700000000,"exp":1800000000}"#,
+            br#"{"exp":1800000000,"iat":1700000000,"sub":"42"}"#,
+            br#"{"exp":1800000000,"sub":"7"}"#,
+            br#"{"sub":"0007","exp":0}"#,
+            br#"{"sub":"42","exp":18,"exp":19}"#,
+            br#"{"sub":"42","exp":018}"#,
+            br#"{"sub":"42","exp":1.5}"#,
+            br#"{"sub":"42","exp":1e9}"#,
+            br#"{"sub":"","exp":1}"#,
+            br#"{"sub":42,"exp":1}"#,
+            br#"{"sub":"42","exp":1,"nbf":0}"#,
+            br#"{"sub":"42", "exp":1}"#,
+            br#"{"sub":"42","exp":1,}"#,
+            br#"{"sub":"4\u0032","exp":1}"#,
+            br#"{"iat":1,"sub":"1234567890123456789","exp":2}"#,
+            br#"{"exp":1234567890123456,"sub":"1"}"#,
+            br#"{"exp":2,"sub":"1"}x"#,
+            br#"{}"#,
+            br#"{"sub":"9"}"#,
+        ];
+        for c in cases {
+            if let Some((exp, iat, sub)) = flat_claims(c) {
+                let (e, n, i, s) = scan_claims(c).expect("scan accepts what the fast path does");
+                assert_eq!(e, Some(Some(exp)), "{}", String::from_utf8_lossy(c));
+                assert_eq!(n, None);
+                assert_eq!(i, iat.then_some(true));
+                assert_eq!(s, Some(Some(sub)));
+            }
+        }
+        assert!(flat_claims(cases[0]).is_some() && flat_claims(cases[1]).is_some() && flat_claims(cases[2]).is_some());
+    }
+
 
     fn token(k: &Keys, header: &str, payload: &str) -> Vec<u8> {
         let mut t = String::new();
