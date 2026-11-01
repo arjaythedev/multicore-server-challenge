@@ -106,14 +106,15 @@ Every submission on the same box: **8 dedicated vCPU / 16 GB**, Postgres 18 on t
 | 100 | **19,000** | [elixir-phoenix-gerbal](submissions/elixir-phoenix-gerbal) | [#72](https://github.com/arjaythedev/multicore-server-challenge/pull/72) @gerbal | direct | 4,985 | 191 | 387 | 50% / 30% |  |
 | 101 | **18,000** | [bun-native-PetarGeorgiev-hash](submissions/bun-native-PetarGeorgiev-hash) | [#26](https://github.com/arjaythedev/multicore-server-challenge/pull/26) @PetarGeorgiev-hash | direct | 4,591 | 296 | 736 | 18% / 33% |  |
 | 102 | **16,000** | [crystal-kemal-faustinoaq](submissions/crystal-kemal-faustinoaq) | [#110](https://github.com/arjaythedev/multicore-server-challenge/pull/110) @faustinoaq | direct | 4,188 | 263 | 426 | 20% / 66% |  |
-| 103 | **11,000** | [chicken-spiffy-wardjm](submissions/chicken-spiffy-wardjm) | [#44](https://github.com/arjaythedev/multicore-server-challenge/pull/44) @wardjm | nginx | 2,904 | 75 | 172 | 49% / 32% (+ Nginx 7%) |  |
-| 104 | **10,000** | [python example](examples/python) (the video's server) | — | nginx | 2,634 | 82 | 150 | 49% / 25% (+ Nginx 6%) |  |
-| 105 | **10,000** | [ruby-rails-bottrall](submissions/ruby-rails-bottrall) | [#74](https://github.com/arjaythedev/multicore-server-challenge/pull/74) @bottrall | direct | 2,582 | 349 | 650 | 59% / 30% |  |
-| 106 | **8,500** | [ruby-rails-Alex-Bradshaw](submissions/ruby-rails-Alex-Bradshaw) | [#51](https://github.com/arjaythedev/multicore-server-challenge/pull/51) @Alex-Bradshaw | nginx | 2,147 | 484 | 553 | 48% / 31% (+ Nginx 5%) |  |
-| 107 | **8,300** | [csharp-efcore-xeonfx](submissions/csharp-efcore-xeonfx) | [#20](https://github.com/arjaythedev/multicore-server-challenge/pull/20) @XeonFX | direct | 2,108 | 447 | 720 | 19% / 78% |  |
-| 108 | **6,800** | [zig-zix-prothegee](submissions/zig-zix-prothegee) | [#84](https://github.com/arjaythedev/multicore-server-challenge/pull/84) @prothegee | direct | 1,749 | 428 | 652 | 3% / 80% |  |
-| 109 | **4,300** | [perl-raw-kamkmgamer](submissions/perl-raw-kamkmgamer) | [#68](https://github.com/arjaythedev/multicore-server-challenge/pull/68) @Kamkmgamer | direct | 1,114 | 215 | 315 | 6% / 5% |  |
-| 110 | **1,100** | [perl-mojolicious-denizakya](submissions/perl-mojolicious-denizakya) | [#23](https://github.com/arjaythedev/multicore-server-challenge/pull/23) @denizak | nginx | 287 | 197 | 327 | 8% / 3% (+ Nginx 0%) |  |
+| 103 | **15,000** | [scala-http4s-sideeffffect](https://github.com/arjaythedev/multicore-server-challenge/pull/77) | [#77](https://github.com/arjaythedev/multicore-server-challenge/pull/77) @sideeffffect | direct | 3,979 | 4 | 14 | 40% / 23% |  |
+| 104 | **11,000** | [chicken-spiffy-wardjm](submissions/chicken-spiffy-wardjm) | [#44](https://github.com/arjaythedev/multicore-server-challenge/pull/44) @wardjm | nginx | 2,904 | 75 | 172 | 49% / 32% (+ Nginx 7%) |  |
+| 105 | **10,000** | [python example](examples/python) (the video's server) | — | nginx | 2,634 | 82 | 150 | 49% / 25% (+ Nginx 6%) |  |
+| 106 | **10,000** | [ruby-rails-bottrall](submissions/ruby-rails-bottrall) | [#74](https://github.com/arjaythedev/multicore-server-challenge/pull/74) @bottrall | direct | 2,582 | 349 | 650 | 59% / 30% |  |
+| 107 | **8,500** | [ruby-rails-Alex-Bradshaw](submissions/ruby-rails-Alex-Bradshaw) | [#51](https://github.com/arjaythedev/multicore-server-challenge/pull/51) @Alex-Bradshaw | nginx | 2,147 | 484 | 553 | 48% / 31% (+ Nginx 5%) |  |
+| 108 | **8,300** | [csharp-efcore-xeonfx](submissions/csharp-efcore-xeonfx) | [#20](https://github.com/arjaythedev/multicore-server-challenge/pull/20) @XeonFX | direct | 2,108 | 447 | 720 | 19% / 78% |  |
+| 109 | **6,800** | [zig-zix-prothegee](submissions/zig-zix-prothegee) | [#84](https://github.com/arjaythedev/multicore-server-challenge/pull/84) @prothegee | direct | 1,749 | 428 | 652 | 3% / 80% |  |
+| 110 | **4,300** | [perl-raw-kamkmgamer](submissions/perl-raw-kamkmgamer) | [#68](https://github.com/arjaythedev/multicore-server-challenge/pull/68) @Kamkmgamer | direct | 1,114 | 215 | 315 | 6% / 5% |  |
+| 111 | **1,100** | [perl-mojolicious-denizakya](submissions/perl-mojolicious-denizakya) | [#23](https://github.com/arjaythedev/multicore-server-challenge/pull/23) @denizak | nginx | 287 | 197 | 327 | 8% / 3% (+ Nginx 0%) |  |
 
 ## Not scored
 
