@@ -39,8 +39,9 @@ public final class PgDispatcher implements AutoCloseable {
         int nw = env("WRITE_CONNS", 1);
         writeGroupMax = env("WRITE_GROUP_MAX", 256);
         readRoundMax = env("READ_ROUND_MAX", 4096);
-        // Hetzner 150k: 20 ms gathers cut Postgres CPU 52 -> 44% of the box (box 97.9 -> 90.6%), p95 498 -> 254 ms
-        gatherUs = env("READ_GATHER_US", 20000);
+        // Hetzner 150k: 20 ms gathers cut Postgres CPU 52 -> 44% of the box (box 97.9 -> 90.6%), p95 498 -> 254 ms; with a
+        // round spread over connections (READ_SPREAD), 30 ms holds the same latency and batches more
+        gatherUs = env("READ_GATHER_US", 30000);
         coalesce = env("COALESCE", 1) != 0;
         if (readRoundMax < 1 || gatherUs < 0) {
             throw new IllegalArgumentException("invalid read round configuration");
@@ -114,8 +115,10 @@ public final class PgDispatcher implements AutoCloseable {
     private final int[] bucketCounts = new int[PgConn.KINDS + 1];
     private final long[] loads = new long[96];
     private final PgConn[] idle = new PgConn[96];
-    // 1 by default: on Hetzner 130k, 8 cut p95 210 -> 113 ms at the same CPU, but whether it holds at the knee is unsettled
-    private final int spreadMax = env("READ_SPREAD", 1);
+    // Hetzner 130k: 8 (with 30 ms gathers) cut p95 210 -> 113 ms at the same CPU per request, but at the 150k knee runs
+    // went bimodal, plausibly eight backends crowding the HTTP loops on a saturated box. 3 keeps the latency (locally
+    // p95 42 vs 41 ms with 8, 56 serial) with fewer backends at once (Postgres exec time 28 s vs 37 s with 8, 26 serial).
+    private final int spreadMax = env("READ_SPREAD", 3);
 
     /**
      * Takes the round's reads (in queue order, up to a tx read, at most

@@ -74,10 +74,15 @@ against the Servlet API: standard `HttpServlet`s, in async mode, on a container 
   statements, whose array parameters make each custom plan look different, on almost every execution (~0.3 ms each).
 - **Reads are batched across requests.** A single dispatcher thread owns all read connections (8) and the write
   connection (1). Each read connection has one round in flight; reads that arrive meanwhile wait (and wait up to
-  `READ_GATHER_US` = 20 ms for company, up to `READ_ROUND_MAX` = 4096 per round), then go out together: requests of a kind become **one** statement over arrays
+  `READ_GATHER_US` = 30 ms for company, up to `READ_ROUND_MAX` = 4096 per round), then go out together: requests of a kind become **one** statement over arrays
   of their parameters (`unnest(...) WITH ORDINALITY` + `LATERAL`), each row tagged with its request. Within a
   statement, each distinct article is decorated (tags, favorites count, author) **once**, however many requests in
   the batch show it; only `favorited` / `following` are per viewer. Nothing outlives the statement (rule 5).
+- **A round's kinds run side by side.** A round's batch statements would otherwise run one after another on one
+  backend, every request waiting for the round's last one, while the other read connections sat idle (locally 0.7
+  busy at 20 ms gathers). The round is grouped by kind and each kind's batch goes whole to one of up to
+  `READ_SPREAD` (3) idle connections, heaviest first onto the least loaded, so a round takes about its slowest
+  statement (feed) instead of the sum.
 - **No repeated lookups inside a batch.** Tag names come from one join + `array_agg` grouped by article (the
   per-article subquery's generic plan scanned and hashed all 200 tags for every article). The article and comments
   batches look each slug up once in a `MATERIALIZED` CTE and reuse that row (they used to look it up twice). A keyed
@@ -140,7 +145,7 @@ Past ~130k users these two load boxes fall behind themselves, so the rig cannot 
 Same rig and script, three load boxes (two cpx42, one ccx23), 60 s warm-up, 120 s measured. This target ran faster than
 the one above (base at 120k: 78% of the box, not 90.7%), so compare within this table only. "lanes" is the generated
 bcrypt kernels on the old defaults; "+ gather" adds `READ_GATHER_US` 20000, `READ_ROUND_MAX` 4096 and
-`MAX_INFLIGHT_PER_LOOP` 2048 (now the defaults).
+`MAX_INFLIGHT_PER_LOOP` 2048.
 
 | Users | Build | req/s | p95 | p99 | Box CPU (app / Postgres) |
 |--:|---|--:|--:|--:|---|
@@ -157,6 +162,24 @@ bcrypt kernels on the old defaults; "+ gather" adds `READ_GATHER_US` 20000, `REA
 The 20 ms gather takes ~16% off Postgres for a little more app CPU and ~100 ms more p50. With the old in-flight cap
 (1024 per loop) the same gather collapsed at 140k: 31.2k req/s, p99 6.6 s, box only 72% (40 ms gathers: 21.5k).
 At 160k the + gather run misses on latency with 6% of the box still free.
+
+### Spreading a round over connections (2026-11-01)
+
+Another target (slower: the 20 ms-gather build at 150k ran 93-96% of the box), three load boxes split 3:3:2 (the third
+is a 4-vCPU ccx23), 120 s measured, alternated. "spread" is `READ_SPREAD=8` with `READ_GATHER_US=30000`; "previous" is
+the defaults above (serial rounds, 20 ms gathers).
+
+| Users | Build | req/s | p50 | p95 | p99 | Box CPU (app / Postgres) |
+|--:|---|--:|--:|--:|--:|---|
+| 130,000 | previous | 33,458-33,532 | 102-105 ms | 205-215 ms | 257-274 ms | 85.0-85.7% (40.8-40.9% / 41.6-42.2%) |
+| 130,000 | spread | 33,964-34,021 | 44-46 ms | 109-117 ms | 184-185 ms | 85.0-86.4% (40.3-41.2% / 42.6-43.2%) |
+
+Below the knee, CPU per request is the same within 1% and p95 roughly halves. At 150k, this host's knee, both builds
+turned bimodal (spread: 3 passes, 2 collapses; previous: one pass at p95 311 ms, one at 476 ms), and every collapse
+coincided with a load box near its ~64k source ports, so the rig could not settle it. The default is 3 rather than 8 on
+that hypothesis: on a saturated box, eight backends at once compete with the HTTP loops. Locally 3 kept the latency of
+8 (p95 42 vs 41 ms, serial 56 ms) with less Postgres time (28 s vs 37 s over the same window, serial 26 s). The default
+(3 with 30 ms gathers) was not itself run on Hetzner.
 
 ### Earlier search (before this branch)
 
@@ -199,7 +222,7 @@ so compare with the leaderboard loosely.
 
 ## Tuning knobs (all optional; defaults are what was measured)
 
-`LOOPS`, `READ_CONNS` (8), `WRITE_CONNS` (1), `READ_GATHER_US` (20000), `READ_ROUND_MAX` (4096), `READ_SPREAD` (1: how many idle read connections one round's kinds are spread over), `WRITE_GROUP_MAX` (256),
+`LOOPS`, `READ_CONNS` (8), `WRITE_CONNS` (1), `READ_GATHER_US` (30000), `READ_ROUND_MAX` (4096), `READ_SPREAD` (3: how many idle read connections one round's kinds are spread over), `WRITE_GROUP_MAX` (256),
 `COALESCE` (1), `MAX_INFLIGHT_PER_LOOP` (2048), `BCRYPT_THREADS` (4), `BCRYPT_LANES` (0 = timed at startup, 1-6), `BCRYPT_GATHER_MS` (400),
 `BCRYPT_NICE` (5), `JAVA_OPTS`.
 
