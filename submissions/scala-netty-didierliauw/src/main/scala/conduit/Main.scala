@@ -51,6 +51,8 @@ object Main:
         if Settings.lagMonitor then LagMonitor.start(loop)
         if Settings.stats then
           loop.scheduleAtFixedRate(() => Log.info("postgres queries", (("loop" -> Thread.currentThread.getName) +: pool.stats())*), 10, 10, TimeUnit.SECONDS)
+          loop.scheduleAtFixedRate(() => Log.info("connections", "loop" -> Thread.currentThread.getName,
+            "open" -> connections.size, "evicted" -> connections.evicted, "full" -> connections.full), 10, 10, TimeUnit.SECONDS)
         (loop, connections, Api(jwt, pool, passwords, loop))
 
       var nextLoop = 0
@@ -74,16 +76,34 @@ object Main:
           // connection.
           override def channelRead(ctx: ChannelHandlerContext, msg: AnyRef): Unit =
             val child = msg.asInstanceOf[Channel]
+            var tries = 1
+            while servers(nextLoop)._2.full && tries < servers.length do
+              nextLoop = (nextLoop + 1) % servers.length
+              tries += 1
             val (loop, connections, api) = servers(nextLoop)
             nextLoop = (nextLoop + 1) % servers.length
             child.pipeline.addLast("connection", Connection(connections, api)) // not the varargs one: no array
             // With the channel's void promise: if registering fails, Netty closes the channel itself.
             loop.register(child.voidPromise())
+            if connections.full && servers.forall(_._2.full) then pause(ctx)
 
-          // Out of descriptors, Netty's acceptor stops accepting for a second; accept again on the next pass.
+          // Out of descriptors (some still closing), Netty's acceptor stops accepting for a second; this one too,
+          // for a pause, instead of failing an accept on every pass.
           override def exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable): Unit = cause match
-            case e: Errors.NativeIoException if e.expectedErr == -EMFILE || e.expectedErr == -ENFILE => ()
+            case e: Errors.NativeIoException if e.expectedErr == -EMFILE || e.expectedErr == -ENFILE => pause(ctx)
             case _ => ctx.fireExceptionCaught(cause)
+
+          /** Stops accepting until a loop has room, looked at every [[AcceptPauseMillis]]: meanwhile new connections
+            * wait in the listen queue.
+            */
+          private def pause(ctx: ChannelHandlerContext): Unit =
+            val config = ctx.channel.config
+            if config.isAutoRead then
+              config.setAutoRead(false)
+              lazy val check: Runnable = () =>
+                if servers.exists(!_._2.full) then config.setAutoRead(true)
+                else ctx.executor.schedule(check, AcceptPauseMillis, TimeUnit.MILLISECONDS)
+              ctx.executor.schedule(check, AcceptPauseMillis, TimeUnit.MILLISECONDS)
         })
         .childHandler(new ChannelInboundHandlerAdapter) // required by ServerBootstrap, never reached: see above
         .bind(host, port)
@@ -102,7 +122,7 @@ object Main:
       val attempt = loops.zipWithIndex.map((loop, i) =>
         PgPool(loop, database, Sql.statements, share(Settings.pgConnections, i).max(1), Settings.pgDepth, transport.socketChannel,
           Settings.batchSize, Settings.pgWriteConnections, Settings.writeGroupSize, Settings.pgDrain,
-          Settings.pgRoundSize)
+          Settings.pgRoundSize, Settings.pgGatherMicros)
       )
       try
         attempt.map(_.start()).foreach(_.get(30, TimeUnit.SECONDS))
@@ -128,6 +148,8 @@ object Main:
       case _ => Int.MaxValue
 
   private val EMFILE = 24
+  /** How often a listening socket that stopped accepting looks for room again. */
+  private val AcceptPauseMillis = 100L
   private val ENFILE = 23
 
   /** How the event loops talk to the kernel: for the server's sockets and for Postgres's. */

@@ -188,6 +188,32 @@ pub fn raw_n<const N: usize>(jobs: &[Job; N], cost: u32) -> [[u8; 23]; N] {
     }
 }
 
+/// The number of hashes to run in lockstep on this CPU: more lanes hide more load latency until the lanes' S-boxes
+/// (4 KB each) and chains stop fitting the core's L1 and registers, which differs between CPUs. Times every width
+/// from 1 to 6 on throwaway keys at a low cost and returns the one with the lowest time per hash (the narrower one
+/// when within 3%, since a narrower set fills sooner).
+pub fn calibrate() -> usize {
+    fn per_hash<const N: usize>() -> f64 {
+        let salt = [7u8; 16];
+        let jobs: [Job; N] = std::array::from_fn(|_| Job { password: b"calibration", salt });
+        let mut best = f64::MAX;
+        for _ in 0..6 {
+            let t = std::time::Instant::now();
+            std::hint::black_box(raw_n::<N>(std::hint::black_box(&jobs), 7));
+            best = best.min(t.elapsed().as_secs_f64() / N as f64);
+        }
+        best
+    }
+    let times = [per_hash::<1>(), per_hash::<2>(), per_hash::<3>(), per_hash::<4>(), per_hash::<5>(), per_hash::<6>()];
+    let mut best = 0;
+    for n in 1..times.len() {
+        if times[n] < times[best] * 0.97 {
+            best = n;
+        }
+    }
+    best + 1
+}
+
 fn b64_encode(src: &[u8], out: &mut Vec<u8>) {
     let mut i = 0;
     while i < src.len() {
@@ -337,6 +363,13 @@ mod speed {
         }
         let per = t.elapsed().as_secs_f64() * 1000.0 / (reps * N) as f64;
         eprintln!("lanes={N} ms/hash={per:.2}");
+    }
+    #[test]
+    #[ignore]
+    fn calibrate_picks() {
+        for _ in 0..5 {
+            eprintln!("calibrated lanes={}", calibrate());
+        }
     }
     #[test]
     #[ignore]

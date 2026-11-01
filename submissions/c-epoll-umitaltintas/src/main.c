@@ -366,7 +366,10 @@ static void *loop_main(void *arg) {
   time_t dbg_t = time(NULL);
   bool dbg = getenv("DEBUG_LOOP") != NULL;
   for (;;) {
-    int n = epoll_wait(L->ep, evs, 512, L->paused ? 200 : -1);
+    int64_t wus = pg_wait_us(L);
+    if (L->paused && (wus < 0 || wus > 200000)) wus = 200000;
+    struct timespec wts = {wus / 1000000, (wus % 1000000) * 1000};
+    int n = epoll_pwait2(L->ep, evs, 512, wus < 0 ? NULL : &wts, NULL);
     if (dbg) {
       dbg_w++;
       for (int i = 0; i < n; i++) {
@@ -375,10 +378,15 @@ static void *loop_main(void *arg) {
       }
       if (time(NULL) != dbg_t) {
         dbg_t = time(NULL);
-        extern long dbg_batches, dbg_batched;
-        fprintf(stderr, "loop %d: wakeups %ld listen %ld conn %ld pg %ld ev %ld (out %ld) batches %ld reqs %ld\n", L->id,
-                dbg_w, dbg_k[1], dbg_k[2], dbg_k[3], dbg_k[0], dbg_out, dbg_batches, dbg_batched);
-        if (L->id == 0) dbg_batches = dbg_batched = 0;
+        extern long dbg_batches, dbg_batched, dbg_bc_groups, dbg_bc_hashes;
+        fprintf(stderr, "loop %d: wakeups %ld listen %ld conn %ld pg %ld ev %ld (out %ld) batches %ld reqs %ld bcrypt %ld/%ld\n",
+                L->id, dbg_w, dbg_k[1], dbg_k[2], dbg_k[3], dbg_k[0], dbg_out, dbg_batches, dbg_batched,
+                __atomic_load_n(&dbg_bc_hashes, __ATOMIC_RELAXED), __atomic_load_n(&dbg_bc_groups, __ATOMIC_RELAXED));
+        if (L->id == 0) {
+          dbg_batches = dbg_batched = 0;
+          __atomic_store_n(&dbg_bc_hashes, 0, __ATOMIC_RELAXED);
+          __atomic_store_n(&dbg_bc_groups, 0, __ATOMIC_RELAXED);
+        }
         dbg_w = dbg_out = 0;
         memset(dbg_k, 0, sizeof dbg_k);
       }
@@ -442,7 +450,8 @@ static int env_int(const char *name, int def) {
   return v && *v ? atoi(v) : def;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+  if (argc > 1 && !strcmp(argv[1], "--bcrypt-selftest")) return bc_selftest(argc > 2 ? atoi(argv[2]) : 500);
   signal(SIGPIPE, SIG_IGN);
   struct rlimit rl;
   if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
@@ -465,8 +474,16 @@ int main(void) {
   extern int pg_depth, batch_max;
   pg_depth = env_int("PG_DEPTH", pg_depth);
   batch_max = env_int("BATCH_MAX", batch_max);
+  extern int read_window_us;
+  read_window_us = env_int("READ_WINDOW_US", read_window_us);
   extern int bcrypt_nice;
   bcrypt_nice = env_int("BCRYPT_NICE", bcrypt_nice);
+  extern int bcrypt_lanes;
+  bcrypt_lanes = env_int("BCRYPT_LANES", bcrypt_lanes);
+  extern int bcrypt_window_ms;
+  bcrypt_window_ms = env_int("BCRYPT_WINDOW_MS", bcrypt_window_ms);
+  if (bcrypt_lanes < 1) bcrypt_lanes = 1;
+  if (bcrypt_lanes > BC_MAXLANES) bcrypt_lanes = BC_MAXLANES;
   share_reads = env_int("SHARE_READS", share_reads);
   int nread = env_int("PG_READ_PER_LOOP", 3);
   int nwrite = env_int("PG_WRITE_PER_LOOP", 16);

@@ -13,7 +13,8 @@ import conduit.pg.Oid
 // - lists return one row per request even for an empty page (the capped count); `OFFSET 0` keeps the count a
 //   per-request subquery (pulled up, it runs once per article row);
 // - a subquery that references no request column is tied to the request row with `r.i >= 0`, or it becomes an
-//   InitPlan evaluated once per statement and shared by every request (rule 5).
+//   InitPlan evaluated once per statement and shared by every request. That is the per-request reading of rule 5;
+//   the ReadShare shapes (default) share on purpose, see [ReadShare].
 // Writes are single statements (CTEs) with the author checks in SQL, so no write needs a separate SELECT.
 
 private const val U =
@@ -62,6 +63,100 @@ private fun list(count: String, page: String) =
     "SELECT r.i, c.n, x.* FROM $U CROSS JOIN LATERAL (SELECT $count AS n OFFSET 0) c LEFT JOIN LATERAL ($page) x ON true"
 
 /**
+ * Whether one execution shares work between the requests of its batch. Set once at startup, before [Sql] is first
+ * touched (like [TagOrder]). Off: every request computes its own rows (the shapes above). On (READ_SHARE=1): a kind's
+ * statement computes each distinct key's count and page, and each distinct article's columns, once per execution, and
+ * joins them back to every request row in the same layout ([Cols]); favorited/following stay per request row. Only
+ * requests already waiting when the statement starts share it, and nothing outlives it: the #1 entry's reading of
+ * rule 5, the same as [Sql.TAGS]'s broadcast. [maxBatch]: most requests per execution while sharing.
+ * [viewerFlags] (READ_VIEWER_FLAGS=1): shared lists look up favorited/following once per viewer, `user_id = v AND
+ * article_id = ANY (the viewer's page)`, instead of two primary-key probes per row (the #1 entry's technique).
+ */
+internal object ReadShare {
+    var on = false
+    var maxBatch = 256
+    var viewerFlags = false
+
+    /**
+     * READ_FEED_MAX_BATCH (lab, 0 = the usual cap): most feeds per execution. Feeds share nothing, so a big batch only
+     * saves round trips, while one of 200 viewers (~0.3 ms of Postgres each) holds a read connection for 60-450 ms
+     * under load and everything queued behind it waits.
+     */
+    var feedMaxBatch = 0
+}
+
+/** The batch's requests, materialized once and referenced by several CTEs. */
+private const val R = "r AS MATERIALIZED (SELECT * FROM $U)"
+
+/**
+ * `art`: one row per distinct article: id, author_id, slug, title, description, [body], created_at, updated_at, tags,
+ * fc (favorites count), username, bio, image. [from] yields the distinct keys and [where] picks the article by them.
+ * `OFFSET 0` keeps the LATERAL a per-key index probe: pulled up into a plain join, the generic plan (which takes a
+ * LIMIT parameter for 10% of the table) hashed all of articles and users per execution (278 ms per 60 requests).
+ */
+private fun art(from: String, where: String, withBody: Boolean) =
+    "art AS MATERIALIZED (SELECT x.* FROM $from CROSS JOIN LATERAL (SELECT a.id, a.author_id, a.slug, a.title, " +
+        "a.description, ${if (withBody) "a.body, " else ""}a.created_at, a.updated_at, $TAG_NAMES AS tags, " +
+        "$FAV_COUNT AS fc, u.username, u.bio, u.image FROM articles a JOIN users u ON u.id = a.author_id " +
+        "WHERE $where OFFSET 0) x)"
+
+private const val ART_FAVORITED =
+    "(SELECT true FROM favorites f WHERE f.user_id = r.v AND f.article_id = art.id) IS NOT NULL"
+private const val ART_FOLLOWING =
+    "(SELECT true FROM follows fo WHERE fo.follower_id = r.v AND fo.followee_id = art.author_id) IS NOT NULL"
+
+/** Article columns of [Cols] from `art` for request row `r`. */
+private fun artCols(withBody: Boolean, following: String) =
+    "art.slug, art.title, art.description, ${if (withBody) "art.body, " else ""}art.created_at, art.updated_at, " +
+        "art.tags, art.fc, $ART_FAVORITED, art.username, art.bio, art.image, $following"
+
+/**
+ * A shared list. [ctes] define `cn` (one capped count n per distinct count key) and `pp` (the page's article ids, one
+ * set per distinct page key); [countJoin] and [pageOn] join them back to the request row. An empty page is one row
+ * with a NULL slug, as in [list].
+ */
+private fun sharedList(ctes: String, countJoin: String, pageOn: String, following: String) =
+    if (ReadShare.viewerFlags && following == ART_FOLLOWING) {
+        viewerFlagsList(ctes, countJoin, pageOn)
+    } else {
+        "WITH $R, $ctes, ${art("(SELECT DISTINCT pp.id FROM pp) d", "a.id = d.id", withBody = false)} " +
+            "SELECT r.i, cn.n, ${artCols(withBody = false, following)} FROM r $countJoin LEFT JOIN pp ON $pageOn " +
+            "LEFT JOIN art ON art.id = pp.id ORDER BY r.i, pp.id DESC"
+    }
+
+/**
+ * [sharedList] with favorited/following per viewer ([ReadShare.viewerFlags]): `fl` holds each signed-in viewer's page
+ * articles and their authors, `fav`/`fol` the ones they favorite/follow (one favorites_pkey and one follows_pkey scan
+ * per viewer, `= ANY`), joined back to the rows. A viewer's (viewer, article) and (viewer, author) pairs are unique
+ * (primary keys), so no row is duplicated; anonymous viewers (0) and empty pages get false.
+ */
+private fun viewerFlagsList(ctes: String, countJoin: String, pageOn: String) =
+    "WITH $R, $ctes, ${art("(SELECT DISTINCT pp.id FROM pp) d", "a.id = d.id", withBody = false)}, " +
+        "fl AS MATERIALIZED (SELECT r.v, array_agg(DISTINCT art.id) AS aids, array_agg(DISTINCT art.author_id) AS uids " +
+        "FROM r JOIN pp ON $pageOn JOIN art ON art.id = pp.id WHERE r.v > 0 GROUP BY r.v), " +
+        "fav AS MATERIALIZED (SELECT fl.v, x.article_id FROM fl CROSS JOIN LATERAL (SELECT f.article_id FROM favorites f " +
+        "WHERE f.user_id = fl.v AND f.article_id = ANY (fl.aids) OFFSET 0) x), " +
+        "fol AS MATERIALIZED (SELECT fl.v, x.followee_id FROM fl CROSS JOIN LATERAL (SELECT fo.followee_id FROM follows fo " +
+        "WHERE fo.follower_id = fl.v AND fo.followee_id = ANY (fl.uids) OFFSET 0) x) " +
+        "SELECT r.i, cn.n, art.slug, art.title, art.description, art.created_at, art.updated_at, art.tags, art.fc, " +
+        "fav.article_id IS NOT NULL, art.username, art.bio, art.image, fol.followee_id IS NOT NULL " +
+        "FROM r $countJoin LEFT JOIN pp ON $pageOn LEFT JOIN art ON art.id = pp.id " +
+        "LEFT JOIN fav ON fav.v = r.v AND fav.article_id = art.id " +
+        "LEFT JOIN fol ON fol.v = r.v AND fol.followee_id = art.author_id ORDER BY r.i, pp.id DESC"
+
+/** Distinct page keys (key columns + limit + offset) of a filtered list, and the id of the filter's row as `fk.id`. */
+private fun pageKeys(lookup: String) =
+    "kk AS MATERIALIZED (SELECT DISTINCT r.k FROM r), " +
+        "fk AS MATERIALIZED (SELECT kk.k, ($lookup) AS id FROM kk), " +
+        "pk AS MATERIALIZED (SELECT DISTINCT r.k, r.l, r.o FROM r)"
+
+/** pp for a filtered list: [ids] selects `id` for `fk.id` with LIMIT pk.l OFFSET pk.o. */
+private fun filteredPages(ids: String) =
+    "pp AS MATERIALIZED (SELECT pk.k, pk.l, pk.o, x.id FROM pk JOIN fk ON fk.k = pk.k CROSS JOIN LATERAL ($ids) x)"
+
+private const val KEYED_PAGE_ON = "pp.k = r.k AND pp.l = r.l AND pp.o = r.o"
+
+/**
  * Column layouts, all read with binary formats. Reads have `r.i` at column 0, lists the capped count (int8) at 1.
  * Article: slug, title, description, [body], created_at, updated_at, tag_list text[], favorites_count int8,
  * favorited bool, username, bio, image, following bool.
@@ -85,18 +180,32 @@ internal object Sql {
         broadcast = true,
     )
 
+    private val batch get() = if (ReadShare.on) ReadShare.maxBatch else 64
+
     /** k = slug. Row: i, full article. No row: 404. */
     val ARTICLE_BY_SLUG = ReadKind(
         "article",
-        "SELECT r.i, x.* FROM $U CROSS JOIN LATERAL (SELECT $FULL_COLS, $FOLLOWING " +
-            "FROM articles a JOIN users u ON u.id = a.author_id WHERE a.slug = r.k) x",
+        if (ReadShare.on) {
+            "WITH $R, kk AS MATERIALIZED (SELECT DISTINCT r.k FROM r), ${art("kk", "a.slug = kk.k", withBody = true)} " +
+                "SELECT r.i, ${artCols(withBody = true, ART_FOLLOWING)} FROM r JOIN art ON art.slug = r.k"
+        } else {
+            "SELECT r.i, x.* FROM $U CROSS JOIN LATERAL (SELECT $FULL_COLS, $FOLLOWING " +
+                "FROM articles a JOIN users u ON u.id = a.author_id WHERE a.slug = r.k) x"
+        },
+        maxBatch = batch,
     )
 
     /** o = article id (read-back after favorite/update: by id, so a concurrent rename can't 404). */
     val ARTICLE_BY_ID = ReadKind(
         "article_id",
-        "SELECT r.i, x.* FROM $U CROSS JOIN LATERAL (SELECT $FULL_COLS, $FOLLOWING " +
-            "FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id = r.o) x",
+        if (ReadShare.on) {
+            "WITH $R, ${art("(SELECT DISTINCT r.o FROM r) d", "a.id = d.o", withBody = true)} " +
+                "SELECT r.i, ${artCols(withBody = true, ART_FOLLOWING)} FROM r JOIN art ON art.id = r.o"
+        } else {
+            "SELECT r.i, x.* FROM $U CROSS JOIN LATERAL (SELECT $FULL_COLS, $FOLLOWING " +
+                "FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id = r.o) x"
+        },
+        maxBatch = batch,
     )
 
     /**
@@ -106,21 +215,48 @@ internal object Sql {
      */
     val COMMENTS = ReadKind(
         "comments",
-        "SELECT r.i, x.* FROM $U CROSS JOIN LATERAL (" +
-            "SELECT c.id, c.created_at, c.updated_at, c.body, u.username, u.bio, u.image, " +
-            "c.author_id = ANY (f.ids) AS following FROM articles a " +
-            "CROSS JOIN LATERAL (SELECT ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.v) AS ids) f " +
-            "LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id FROM comments c " +
-            "WHERE c.article_id = a.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true " +
-            "LEFT JOIN users u ON u.id = c.author_id WHERE a.slug = r.k ORDER BY c.created_at DESC, c.id DESC) x",
+        if (ReadShare.on) {
+            // each distinct slug's thread (newest 100, with authors) and each distinct viewer's followees once
+            "WITH $R, kk AS MATERIALIZED (SELECT DISTINCT r.k FROM r), " +
+                "ar AS MATERIALIZED (SELECT kk.k, a.id FROM kk CROSS JOIN LATERAL " +
+                "(SELECT a.id FROM articles a WHERE a.slug = kk.k OFFSET 0) a), " +
+                "cm AS MATERIALIZED (SELECT ar.k, c.* FROM ar CROSS JOIN LATERAL (SELECT c.id, c.created_at, " +
+                "c.updated_at, c.body, c.author_id, u.username, u.bio, u.image FROM comments c " +
+                "JOIN users u ON u.id = c.author_id WHERE c.article_id = ar.id " +
+                "ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c), " +
+                "fv AS MATERIALIZED (SELECT vv.v, ARRAY(SELECT fo.followee_id FROM follows fo " +
+                "WHERE fo.follower_id = vv.v) AS ids FROM (SELECT DISTINCT r.v FROM r) vv) " +
+                "SELECT r.i, cm.id, cm.created_at, cm.updated_at, cm.body, cm.username, cm.bio, cm.image, " +
+                "cm.author_id = ANY (fv.ids) FROM r JOIN ar ON ar.k = r.k JOIN fv ON fv.v = r.v " +
+                "LEFT JOIN cm ON cm.k = r.k ORDER BY r.i, cm.created_at DESC, cm.id DESC"
+        } else {
+            "SELECT r.i, x.* FROM $U CROSS JOIN LATERAL (" +
+                "SELECT c.id, c.created_at, c.updated_at, c.body, u.username, u.bio, u.image, " +
+                "c.author_id = ANY (f.ids) AS following FROM articles a " +
+                "CROSS JOIN LATERAL (SELECT ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.v) AS ids) f " +
+                "LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id FROM comments c " +
+                "WHERE c.article_id = a.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true " +
+                "LEFT JOIN users u ON u.id = c.author_id WHERE a.slug = r.k ORDER BY c.created_at DESC, c.id DESC) x"
+        },
+        maxBatch = batch,
     )
 
     /** k = username. Row: i, username, bio, image, following. No row: 404. */
     val PROFILE = ReadKind(
         "profile",
-        "SELECT r.i, x.* FROM $U CROSS JOIN LATERAL (SELECT u.username, u.bio, u.image, " +
-            "(SELECT true FROM follows fo WHERE fo.follower_id = r.v AND fo.followee_id = u.id) IS NOT NULL " +
-            "FROM users u WHERE u.username = r.k) x",
+        if (ReadShare.on) {
+            "WITH $R, kk AS MATERIALIZED (SELECT DISTINCT r.k FROM r), pu AS MATERIALIZED (SELECT u.* FROM kk " +
+                "CROSS JOIN LATERAL (SELECT u.id, u.username, u.bio, u.image FROM users u WHERE u.username = kk.k " +
+                "OFFSET 0) u) " +
+                "SELECT r.i, pu.username, pu.bio, pu.image, " +
+                "(SELECT true FROM follows fo WHERE fo.follower_id = r.v AND fo.followee_id = pu.id) IS NOT NULL " +
+                "FROM r JOIN pu ON pu.username = r.k"
+        } else {
+            "SELECT r.i, x.* FROM $U CROSS JOIN LATERAL (SELECT u.username, u.bio, u.image, " +
+                "(SELECT true FROM follows fo WHERE fo.follower_id = r.v AND fo.followee_id = u.id) IS NOT NULL " +
+                "FROM users u WHERE u.username = r.k) x"
+        },
+        maxBatch = batch,
     )
 
     /** v = user id. Row: i, email, username, bio, image. No row: 401. */
@@ -143,13 +279,28 @@ internal object Sql {
      */
     val LIST_ALL = ReadKind(
         "list",
-        list(
-            "CASE WHEN EXISTS (SELECT 1 FROM articles c WHERE r.i >= 0 ORDER BY c.id OFFSET 999) THEN 1000 " +
-                "ELSE (SELECT count(*) FROM articles c WHERE r.i >= 0) END",
-            "SELECT $LIST_COLS, $FOLLOWING FROM (SELECT a.id, a.slug, a.title, a.description, a.created_at, " +
-                "a.updated_at, a.author_id FROM articles a ORDER BY a.id DESC LIMIT r.l OFFSET r.o) a " +
-                "JOIN users u ON u.id = a.author_id ORDER BY a.id DESC",
-        ),
+        if (ReadShare.on) {
+            // one count per execution, one page per distinct (limit, offset)
+            sharedList(
+                "cn AS MATERIALIZED (SELECT CASE WHEN EXISTS (SELECT 1 FROM articles c ORDER BY c.id OFFSET 999) " +
+                    "THEN 1000 ELSE (SELECT count(*) FROM articles c) END AS n), " +
+                    "pk AS MATERIALIZED (SELECT DISTINCT r.l, r.o FROM r), " +
+                    "pp AS MATERIALIZED (SELECT pk.l, pk.o, x.id FROM pk CROSS JOIN LATERAL " +
+                    "(SELECT a.id FROM articles a ORDER BY a.id DESC LIMIT pk.l OFFSET pk.o) x)",
+                "CROSS JOIN cn",
+                "pp.l = r.l AND pp.o = r.o",
+                ART_FOLLOWING,
+            )
+        } else {
+            list(
+                "CASE WHEN EXISTS (SELECT 1 FROM articles c WHERE r.i >= 0 ORDER BY c.id OFFSET 999) THEN 1000 " +
+                    "ELSE (SELECT count(*) FROM articles c WHERE r.i >= 0) END",
+                "SELECT $LIST_COLS, $FOLLOWING FROM (SELECT a.id, a.slug, a.title, a.description, a.created_at, " +
+                    "a.updated_at, a.author_id FROM articles a ORDER BY a.id DESC LIMIT r.l OFFSET r.o) a " +
+                    "JOIN users u ON u.id = a.author_id ORDER BY a.id DESC",
+            )
+        },
+        maxBatch = batch,
     )
 
     /**
@@ -171,33 +322,68 @@ internal object Sql {
     /** k = author username. Authors have few articles, so the plain capped count is cheapest. */
     val LIST_AUTHOR = ReadKind(
         "list_author",
-        list(
-            "(SELECT count(*) FROM (SELECT 1 FROM articles c WHERE c.author_id = " +
-                "(SELECT u.id FROM users u WHERE u.username = r.k) LIMIT 1000) s)",
-            "SELECT $LIST_COLS, $FOLLOWING FROM (SELECT a.id, a.slug, a.title, a.description, a.created_at, " +
-                "a.updated_at, a.author_id FROM articles a WHERE a.author_id = " +
-                "(SELECT au.id FROM users au WHERE au.username = r.k) ORDER BY a.id DESC LIMIT r.l OFFSET r.o) a " +
-                "JOIN users u ON u.id = a.author_id ORDER BY a.id DESC",
-        ),
+        if (ReadShare.on) {
+            sharedList(
+                pageKeys("SELECT u.id FROM users u WHERE u.username = kk.k") + ", " +
+                    "cn AS MATERIALIZED (SELECT fk.k, (SELECT count(*) FROM (SELECT 1 FROM articles c " +
+                    "WHERE c.author_id = fk.id LIMIT 1000) s) AS n FROM fk), " +
+                    filteredPages(
+                        "SELECT a.id FROM articles a WHERE a.author_id = fk.id ORDER BY a.id DESC LIMIT pk.l OFFSET pk.o",
+                    ),
+                "JOIN cn ON cn.k = r.k",
+                KEYED_PAGE_ON,
+                ART_FOLLOWING,
+            )
+        } else {
+            list(
+                "(SELECT count(*) FROM (SELECT 1 FROM articles c WHERE c.author_id = " +
+                    "(SELECT u.id FROM users u WHERE u.username = r.k) LIMIT 1000) s)",
+                "SELECT $LIST_COLS, $FOLLOWING FROM (SELECT a.id, a.slug, a.title, a.description, a.created_at, " +
+                    "a.updated_at, a.author_id FROM articles a WHERE a.author_id = " +
+                    "(SELECT au.id FROM users au WHERE au.username = r.k) ORDER BY a.id DESC LIMIT r.l OFFSET r.o) a " +
+                    "JOIN users u ON u.id = a.author_id ORDER BY a.id DESC",
+            )
+        },
+        maxBatch = batch,
     )
 
     /** k = tag. Every seed tag has >= 1000 articles, so "a 1000th link exists" usually answers the count. */
     val LIST_TAG = ReadKind(
         "list_tag",
-        list(
-            "CASE WHEN EXISTS (SELECT 1 FROM article_tags c WHERE c.tag_id = " +
-                "(SELECT t.id FROM tags t WHERE t.name = r.k) OFFSET 999 LIMIT 1) THEN 1000::bigint " +
-                "ELSE (SELECT count(*) FROM (SELECT 1 FROM article_tags c WHERE c.tag_id = " +
-                "(SELECT t.id FROM tags t WHERE t.name = r.k) LIMIT 1000) s) END",
-            listOf(
-                "SELECT at.article_id AS id FROM article_tags at WHERE at.tag_id = " +
-                    "(SELECT t.id FROM tags t WHERE t.name = r.k) ORDER BY at.article_id DESC LIMIT r.l OFFSET r.o",
-                FOLLOWING,
-            ),
-        ),
+        if (ReadShare.on) {
+            sharedList(
+                pageKeys("SELECT t.id FROM tags t WHERE t.name = kk.k") + ", " +
+                    "cn AS MATERIALIZED (SELECT fk.k, CASE WHEN EXISTS (SELECT 1 FROM article_tags c " +
+                    "WHERE c.tag_id = fk.id OFFSET 999 LIMIT 1) THEN 1000::bigint ELSE (SELECT count(*) FROM " +
+                    "(SELECT 1 FROM article_tags c WHERE c.tag_id = fk.id LIMIT 1000) s) END AS n FROM fk), " +
+                    filteredPages(
+                        "SELECT at.article_id AS id FROM article_tags at WHERE at.tag_id = fk.id " +
+                            "ORDER BY at.article_id DESC LIMIT pk.l OFFSET pk.o",
+                    ),
+                "JOIN cn ON cn.k = r.k",
+                KEYED_PAGE_ON,
+                ART_FOLLOWING,
+            )
+        } else {
+            list(
+                "CASE WHEN EXISTS (SELECT 1 FROM article_tags c WHERE c.tag_id = " +
+                    "(SELECT t.id FROM tags t WHERE t.name = r.k) OFFSET 999 LIMIT 1) THEN 1000::bigint " +
+                    "ELSE (SELECT count(*) FROM (SELECT 1 FROM article_tags c WHERE c.tag_id = " +
+                    "(SELECT t.id FROM tags t WHERE t.name = r.k) LIMIT 1000) s) END",
+                listOf(
+                    "SELECT at.article_id AS id FROM article_tags at WHERE at.tag_id = " +
+                        "(SELECT t.id FROM tags t WHERE t.name = r.k) ORDER BY at.article_id DESC LIMIT r.l OFFSET r.o",
+                    FOLLOWING,
+                ),
+            )
+        },
+        maxBatch = batch,
     )
 
-    /** k = username of the favoriting user. */
+    /**
+     * k = username of the favoriting user. Per request even with [ReadShare]: its keys rarely repeat within a batch,
+     * and the shared shape cost more (EXPLAIN, 60 requests, full seed: 128 vs 99 us per request).
+     */
     val LIST_FAVORITED = ReadKind(
         "list_favorited",
         list(
@@ -209,6 +395,7 @@ internal object Sql {
                 FOLLOWING,
             ),
         ),
+        maxBatch = batch,
     )
 
     /**
@@ -218,6 +405,9 @@ internal object Sql {
      */
     val FEED = ReadKind(
         "feed",
+        // per request even with [ReadShare]: feeds are per viewer, so there is nothing to share (EXPLAIN: 361 vs 352 us).
+        // Tried and dropped (2026-10-28): taking the page from the count's id scan when below the cap. EXPLAIN 456 vs
+        // 327 us per feed: most viewers reach the 1000 cap (mean 893 ids), so the per-followee page runs anyway.
         list(
             "(SELECT count(*) FROM (SELECT 1 FROM articles c WHERE c.author_id = " +
                 "ANY (ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.v)) LIMIT 1000) s)",
@@ -228,6 +418,7 @@ internal object Sql {
                 "true",
             ),
         ),
+        maxBatch = ReadShare.feedMaxBatch.takeIf { it > 0 } ?: batch,
     )
 
     val reads: List<ReadKind> = listOf(

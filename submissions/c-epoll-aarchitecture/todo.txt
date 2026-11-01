@@ -1,0 +1,31 @@
+how to stop being a retard (...in case i forget)
+
+- 4 io threads, 12 read lanes/threads (one conn each), 1 write lane, 8 crypto threads.
+  we have 12 read conns but only 4 worker threads doing the parsing and rendering too.
+- self-clocked batching: window 0 when every peer is busy, otherwise pace off the EWMA
+  service time. no hardcoded 20 ms sleep like the 120k rust entry.
+- feed capped to the 16 most prolific followees plus a floor_id, instead of expanding
+  every followee and sorting the lot.
+- article JSON rendered once per distinct article per batch, flags spliced in. tags
+  rendered once per batch.
+- favorite/follow writes collapsed into one unnest statement per kind.
+
+stuff to do, roughly in the most painful order:
+
+[x] one batch.
+[x] render once per batch, not once per request.
+[x] feed that does not scan the whole follow graph.
+[x] get parsing/rendering off the io threads.
+[x] cheaper per-request work.
+[x] writes.
+[x] other shit
+    - work_mem, random_page_cost, effective_io_concurrency
+    - plan_cache_mode/jit/parallel/memoize
+
+
+moreover, also in case i forget:
+- replacing libpq with my own wire client. to do so is quite literally benchmarkmaxxing
+  unmaintainable retardation.
+- custom crypto. same reason as replacing libpq, suicide is healthier than writing your
+  own crypto.
+- relying on logins timing out is a pussy bitch move.

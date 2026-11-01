@@ -1,0 +1,16 @@
+POST /api/profiles/:username/follow            1944     32.4      9.6    123.4    169.5    242.0      411    0.00
+POST /api/articles                             1491     24.9     11.2    125.7    163.7    259.2      353    0.00
+DELETE /api/articles/:slug/favorite             696     11.6      9.1    111.9    158.8    258.7      417    0.00
+DELETE /api/profiles/:username/follow           695     11.6     10.2    131.0    166.9    240.0      354    0.00
+PUT /api/user                                   525      8.8      9.6     73.0    100.2    171.4      255    0.00
+POST /api/users/login                           490      8.2    280.1    395.5    490.0    652.8     1754    0.00
+DELETE /api/articles/:slug/comments/:id         282      4.7     10.3    129.1    183.8    230.4      350    0.00
+PUT /api/articles/:slug                         135      2.2     11.7    157.4    218.2    389.9      393    0.00
+POST /api/users                                  12      0.2    297.7    407.0    407.0   1439.7     1440    0.00
+ALL                                          336875   5614.6     69.0    472.6    741.9   1119.2     1801    0.00
+mix: 1.86 calls/page, 1.872 req/s per user, 5.0% writes, 181367 page views
+box 0 (DESKTOP-MTLQ7TM): 3000 users, CPU avg 28% max 38%, loadgen proc 21%, RSS peak 163 MB, 3000 TCP connects, behind=false
+verdict: FAIL (p95 742 ms >= 500, p99 1119 ms >= 1000)   [p95 < 500 ms, p99 < 1000 ms, errors < 1%]
+lg_limited: no
+box cpu-seconds: postgres 72 app 56 total 128; peak mem 3070 MB; oom 0
+worker 0: 0.0.0.0:3293, 4 Postgres connections, 2 bcrypt threads, 8 ring(s) x 65535 fixed slots, 4096/32768 sq/cq entries

@@ -25,6 +25,8 @@ actual fun nanoTime(): Long = System.nanoTime()
 
 actual fun currentTimeMillis(): Long = System.currentTimeMillis()
 
+actual fun isOutOfMemory(e: Throwable): Boolean = e is OutOfMemoryError
+
 private val random = SecureRandom()
 
 actual fun secureRandomBytes(dst: ByteArray) = random.nextBytes(dst)

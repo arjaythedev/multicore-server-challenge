@@ -33,8 +33,11 @@ import platform.posix.SIGPIPE
 import platform.posix.SIG_IGN
 import platform.posix.SOCK_STREAM
 import platform.posix.SOL_SOCKET
+import platform.posix.SO_KEEPALIVE
 import platform.posix.SO_RCVBUF
+import platform.posix.SO_RCVTIMEO
 import platform.posix.SO_SNDBUF
+import platform.posix.SO_SNDTIMEO
 import platform.posix.TCP_NODELAY
 import platform.posix.addrinfo
 import platform.posix.clock_gettime
@@ -73,10 +76,14 @@ import platform.posix.syscall
 import platform.posix.sysconf
 import platform.posix._SC_NPROCESSORS_ONLN
 import platform.posix.timespec
+import platform.posix.timeval
 import kotlin.concurrent.AtomicInt
 import kotlin.native.concurrent.ThreadLocal
 
 private const val SYS_GETTID = 186L
+private const val SYS_SCHED_SETSCHEDULER = 144L
+/** SCHED_BATCH on every thread we start (default on, SCHED_BATCH=0 turns it off): a thread woken by epoll or a futex no longer preempts a running Postgres backend on a saturated box. */
+private val SCHED_BATCH: Boolean = platform.posix.getenv("SCHED_BATCH")?.toKString()?.trim() != "0"
 private const val SYS_SCHED_GETAFFINITY = 204L
 
 actual fun platformInit(): String {
@@ -98,7 +105,8 @@ actual fun platformInit(): String {
 /**
  * The GC's heap target defaults to 10 MiB, so a server allocating tens of MB/s would collect many times a second
  * (each collection marks the whole live heap: every connection's state). GC_HEAP_MB (default 512) raises the floor
- * of the autotuned target; GC_LOG=1 prints collections per 10 s with the last pause.
+ * of the autotuned target; GC_LOG=1 prints collections per 10 s with the last pause. (The collector itself, the
+ * allocator and the inliner are build-time options: build.gradle.kts, CONDUIT_GC and friends.)
  */
 @OptIn(kotlin.native.runtime.NativeRuntimeApi::class)
 private fun gcInit(): String {
@@ -143,6 +151,8 @@ actual fun currentTimeMillis(): Long = memScoped {
     ts.tv_sec * 1000L + ts.tv_nsec / 1_000_000
 }
 
+actual fun isOutOfMemory(e: Throwable): Boolean = e is OutOfMemoryError
+
 private val urandom: Int by lazy { open("/dev/urandom", O_RDONLY).also { check(it >= 0) { "open /dev/urandom" } } }
 
 actual fun secureRandomBytes(dst: ByteArray) {
@@ -157,6 +167,24 @@ actual fun secureRandomBytes(dst: ByteArray) {
 }
 
 actual fun getenv(name: String): String? = platform.posix.getenv(name)?.toKString()
+
+actual fun readTextFile(path: String): String? {
+    val f = platform.posix.fopen(path, "r") ?: return null
+    try {
+        val sb = StringBuilder()
+        val buf = ByteArray(4096)
+        buf.usePinned { pinned ->
+            while (true) {
+                val n = platform.posix.fread(pinned.addressOf(0), 1u, buf.size.convert(), f).toInt()
+                if (n <= 0) break
+                sb.append(buf.decodeToString(0, n))
+            }
+        }
+        return sb.toString()
+    } finally {
+        platform.posix.fclose(f)
+    }
+}
 
 actual fun cpuCount(): Int {
     // sched_getaffinity, so `taskset` limits are respected like the JVM's availableProcessors()
@@ -186,6 +214,7 @@ actual fun startThread(name: String, nice: Int, body: () -> Unit) {
                 val start = r.get()
                 r.dispose()
                 if (start.nice > 0) setpriority(PRIO_PROCESS, syscall(SYS_GETTID).convert(), start.nice)
+                if (SCHED_BATCH) memScoped { val p = alloc<kotlinx.cinterop.IntVar>().apply { value = 0 }; syscall(SYS_SCHED_SETSCHEDULER, 0, 3, p.ptr) } // SCHED_BATCH, this thread
                 try {
                     start.body()
                 } catch (t: Throwable) {
@@ -241,6 +270,9 @@ actual class Monitor actual constructor() {
     }
 }
 
+/** Seconds a Postgres socket may block in recv, send or connect (no query of the app takes anywhere near this). */
+private const val PG_IO_TIMEOUT_S = 15L
+
 actual class BlockingSocket private constructor(private val fd: Int) {
     private val closed = AtomicInt(0)
 
@@ -287,6 +319,12 @@ actual class BlockingSocket private constructor(private val fd: Int) {
             val big = alloc<kotlinx.cinterop.IntVar>().apply { value = 1 shl 20 }
             setsockopt(fd, SOL_SOCKET, SO_RCVBUF, big.ptr, sizeOf<kotlinx.cinterop.IntVar>().convert())
             setsockopt(fd, SOL_SOCKET, SO_SNDBUF, big.ptr, sizeOf<kotlinx.cinterop.IntVar>().convert())
+            // A Postgres that stops answering (frozen, partitioned without an RST) must fail the worker's recv/send/connect
+            // after a while instead of blocking its thread forever: the worker's error path then reconnects.
+            val tmo = alloc<timeval>().apply { tv_sec = PG_IO_TIMEOUT_S; tv_usec = 0 }
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, tmo.ptr, sizeOf<timeval>().convert())
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, tmo.ptr, sizeOf<timeval>().convert())
+            setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, one.ptr, sizeOf<kotlinx.cinterop.IntVar>().convert())
             val cr = connect(fd, ai.ai_addr, ai.ai_addrlen)
             freeaddrinfo(res.value)
             if (cr != 0) {
@@ -307,6 +345,8 @@ actual class HmacSha256 actual constructor(key: ByteArray) {
 }
 
 actual fun sha256(data: ByteArray): ByteArray = Sha256.digest(data)
+
+actual fun loadLongLE(b: ByteArray, p: Int): Long = b.getLongAt(p) // unaligned native load (x86-64: little-endian)
 
 @ThreadLocal
 private object ThreadScratch {

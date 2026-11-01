@@ -1,0 +1,166 @@
+# userver static config. Runtime settings come from the environment (start.sh sets the defaults):
+#   HOST, PORT, DATABASE_URL, JWT_SECRET (read in code), WORKER_THREADS, BCRYPT_THREADS, DB_POOL_SIZE, EVENT_THREADS
+components_manager:
+    coro_pool:
+        initial_size: 5000
+        max_size: 200000
+
+    event_thread_pool:
+        threads: $event_threads
+        threads#env: EVENT_THREADS
+        threads#fallback: 2
+
+    task_processors:
+        main-task-processor:
+            worker_threads: $worker_threads
+            worker_threads#env: WORKER_THREADS
+            worker_threads#fallback: 8
+        # bcrypt (login, sign-up, password change) runs here so it can't occupy every HTTP worker
+        bcrypt-task-processor:
+            thread_name: bcrypt-worker
+            worker_threads: $bcrypt_threads
+            worker_threads#env: BCRYPT_THREADS
+            worker_threads#fallback: 4
+        fs-task-processor:
+            worker_threads: 2
+
+    default_task_processor: main-task-processor
+
+    components:
+        server:
+            # only the exception-to-500 middleware: no tracing, access log or per-handler metrics
+            middleware-pipeline-builder: minimal-server-middleware-pipeline-builder
+            listener:
+                address: $host
+                address#env: HOST
+                address#fallback: 127.0.0.1
+                port: $port
+                port#env: PORT
+                port#fallback: 3000
+                task_processor: main-task-processor
+                # Front: direct. Every user holds its own keep-alive connection, so tens of thousands of them:
+                # the default cap of 32768 would refuse users, and the accept queue matches the box's somaxconn.
+                max_connections: 200000
+                backlog: 65535
+                connection:
+                    # preallocated per connection: 8 KB fits any request here (bodies are a few KB) and keeps
+                    # 50k idle connections at ~400 MB instead of 1.6 GB with the default 32 KB
+                    in_buffer_size: 8192
+                    # users think ~7 s (at most 70 s) between pages: keep their connections open
+                    keepalive_timeout: 600
+                handler-defaults:
+                    set_tracing_headers: false
+                    deadline_propagation_enabled: false
+                    enable_write_statistics: false
+            server-name: conduit
+
+        logging:
+            fs-task-processor: fs-task-processor
+            loggers:
+                default:
+                    file_path: '@stderr'
+                    level: warning
+                    overflow_behavior: discard
+
+        dynamic-config:
+            defaults:
+                USERVER_LOG_REQUEST: false
+                POSTGRES_DEFAULT_COMMAND_CONTROL:
+                    network_timeout_ms: 15000
+                    statement_timeout_ms: 10000
+
+        dns-client:
+            fs-task-processor: fs-task-processor
+
+        testsuite-support: {}
+
+        conduit-db:
+            dbconnection: $database_url
+            dbconnection#env: DATABASE_URL
+            blocking_task_processor: fs-task-processor
+            dns_resolver: getaddrinfo
+            connlimit_mode: manual
+            min_pool_size: $db_pool_size
+            min_pool_size#env: DB_POOL_SIZE
+            min_pool_size#fallback: 48
+            max_pool_size: $db_pool_size
+            max_pool_size#env: DB_POOL_SIZE
+            max_pool_size#fallback: 48
+            max_queue_size: 100000
+            statement-log-mode: hide
+            user-types-enabled: false
+            persistent-prepared-statements: true
+            sync-start: true
+
+        handler-register:
+            path: /api/users
+            method: POST
+            task_processor: main-task-processor
+            throttling_enabled: false
+            decompress_request: false
+        handler-login:
+            path: /api/users/login
+            method: POST
+            task_processor: main-task-processor
+            throttling_enabled: false
+            decompress_request: false
+        handler-current-user:
+            path: /api/user
+            method: GET,PUT
+            task_processor: main-task-processor
+            throttling_enabled: false
+            decompress_request: false
+        handler-profile:
+            path: /api/profiles/{username}
+            method: GET
+            task_processor: main-task-processor
+            throttling_enabled: false
+            decompress_request: false
+        handler-follow:
+            path: /api/profiles/{username}/follow
+            method: POST,DELETE
+            task_processor: main-task-processor
+            throttling_enabled: false
+            decompress_request: false
+        handler-articles:
+            path: /api/articles
+            method: GET,POST
+            task_processor: main-task-processor
+            throttling_enabled: false
+            decompress_request: false
+        handler-feed:
+            path: /api/articles/feed
+            method: GET
+            task_processor: main-task-processor
+            throttling_enabled: false
+            decompress_request: false
+        handler-article:
+            path: /api/articles/{slug}
+            method: GET,PUT,DELETE
+            task_processor: main-task-processor
+            throttling_enabled: false
+            decompress_request: false
+        handler-favorite:
+            path: /api/articles/{slug}/favorite
+            method: POST,DELETE
+            task_processor: main-task-processor
+            throttling_enabled: false
+            decompress_request: false
+        handler-comments:
+            path: /api/articles/{slug}/comments
+            method: GET,POST
+            task_processor: main-task-processor
+            throttling_enabled: false
+            decompress_request: false
+        handler-comment:
+            path: /api/articles/{slug}/comments/{id}
+            method: DELETE
+            task_processor: main-task-processor
+            throttling_enabled: false
+            decompress_request: false
+        handler-tags:
+            path: /api/tags
+            method: GET
+            task_processor: main-task-processor
+            throttling_enabled: false
+            decompress_request: false

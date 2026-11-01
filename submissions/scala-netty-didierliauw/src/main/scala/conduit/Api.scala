@@ -148,6 +148,9 @@ final class Api(val jwt: Jwt, val pool: PgPool, val passwords: Passwords, val lo
 object Api:
   private val TokenScheme = "Token "
 
+  /** A packed batch named an article it didn't send: a 500, never a page without it. */
+  private val Missing = PgError("XX000", "a packed batch named an article it didn't send")
+
   /** A body field that isn't what the request needs: a 422. */
   private object Invalid extends Exception(null, null, false, false)
 
@@ -299,10 +302,14 @@ object Api:
       else if author != viewer then fail(Status.Forbidden, Messages.Forbidden)
       else finish(Status.NoContent)
 
-  /** A page of articles and the capped count, which every row carries; a row without an article for an empty page. */
+  /** A page of articles and the capped count, which every row carries; a row without an article for an empty page.
+    * In a packed batch, one row: the count, the page's ids, and the viewer's flags for its articles.
+    */
   private final class ListCall(statement: Statement, viewer: Long, limit: Long, offset: Long, filter: String) extends Call:
     private var count = 0L
     private var articles = 0
+    /** A packed batch named an article it didn't send. */
+    private var missing = false
 
     override def batch: Sql.Batch = Sql.batchOf(statement)
     override def int8Param(p: Int): Long = if p == 0 then viewer else if p == 1 then limit else offset
@@ -322,8 +329,28 @@ object Api:
         Render.article(out, row, Columns.ListArticle, withBody = false)
         articles += 1
 
+    override def packed(): PgPacked = PackedArticles(api.outs)
+
+    override def row(statement: Int, row: PgRow, packed: PgPacked): Unit =
+      import Columns.Packed
+      count = row.int8(Packed.Count)
+      val shared = packed.asInstanceOf[PackedArticles]
+      val n = row.int8ArrayLength(Packed.Ids)
+      var k = 0
+      while k < n do
+        val id = row.int8ArrayAt(Packed.Ids, k)
+        val a = if shared == null then -1 else shared.find(id)
+        if a < 0 then missing = true
+        else
+          if articles == 0 then Render.articlesOpen(out) else out.byte(',')
+          val following = row.isNull(Packed.Following) || row.int8ArrayHas(Packed.Following, shared.author(a))
+          shared.write(out, a, row.int8ArrayHas(Packed.Favorited, id), following)
+          articles += 1
+        k += 1
+
     override def done(error: PgError): Unit =
       if error != null then failed(error)
+      else if missing then failed(Api.Missing)
       else
         if articles == 0 then Render.articlesOpen(out)
         Render.articlesClose(out, count)
@@ -590,3 +617,60 @@ abstract class Call extends PgQuery:
     else
       Log.warn("query failed", "request" -> getClass.getSimpleName, "error" -> error.toString)
       fail(Status.InternalServerError, Messages.Internal)
+
+/** A packed batch's articles ([[Columns.Packed]]), each written once as the JSON its requests' pages share
+  * ([[Render.sharedArticle]]), and found by id; a page copies them with its viewer's flags.
+  */
+private[conduit] final class PackedArticles(outs: Out.Pool) extends PgPacked:
+  private val text = outs.take()
+  private var ids = new Array[Long](16)
+  private var authors = new Array[Long](16)
+  /** Where each article's text is split around `favorited`, and where it ends; it starts where the one before ends. */
+  private var splits = new Array[Int](16)
+  private var ends = new Array[Int](16)
+  private var n = 0
+  /** Open addressing by id: each slot an article's index plus 1, or 0. */
+  private var slots = new Array[Int](32)
+
+  def row(row: PgRow): Unit =
+    import Columns.Packed
+    if n == ids.length then
+      ids = java.util.Arrays.copyOf(ids, n * 2)
+      authors = java.util.Arrays.copyOf(authors, n * 2)
+      splits = java.util.Arrays.copyOf(splits, n * 2)
+      ends = java.util.Arrays.copyOf(ends, n * 2)
+    ids(n) = row.int8(Packed.Id)
+    authors(n) = row.int8(Packed.Author)
+    splits(n) = Render.sharedArticle(text, row, Packed.Article)
+    ends(n) = text.length
+    n += 1
+    if 2 * n > slots.length then
+      slots = new Array[Int](slots.length * 2)
+      var a = 0
+      while a < n do
+        place(a)
+        a += 1
+    else place(n - 1)
+
+  private def slot(id: Long): Int = ((id * 0x9e3779b97f4a7c15L) >>> 40).toInt & (slots.length - 1)
+
+  private def place(a: Int): Unit =
+    var i = slot(ids(a))
+    while slots(i) != 0 do i = (i + 1) & (slots.length - 1)
+    slots(i) = a + 1
+
+  /** The article with `id`'s index, or -1. */
+  def find(id: Long): Int =
+    var i = slot(id)
+    while slots(i) != 0 && ids(slots(i) - 1) != id do i = (i + 1) & (slots.length - 1)
+    slots(i) - 1
+
+  def author(a: Int): Long = authors(a)
+
+  /** Article `a` as [[Render.article]] writes it, with these flags. */
+  def write(out: Out, a: Int, favorited: Boolean, following: Boolean): Unit =
+    val start = if a == 0 then 0 else ends(a - 1)
+    out.bytes(text, start, splits(a) - start).bool(favorited)
+    out.bytes(text, splits(a), ends(a) - splits(a)).bool(following).byte('}').byte('}')
+
+  def release(): Unit = outs.give(text)

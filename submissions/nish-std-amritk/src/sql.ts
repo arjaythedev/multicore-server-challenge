@@ -232,7 +232,10 @@ export const registerStatements = (pool: PgPool): boolean => {
         "d AS (DELETE FROM articles a USING a0 WHERE a.id = a0.id AND a0.author_id = $2) SELECT author_id FROM a0",
       none
     ) && ok
-  // Favorites: the write, then the article as it is after it, in one group.
+  // Favorites: the write; the article as it is after it is then read by a
+  // read plan, like an article page. A folded write's request runs `noop`,
+  // so that every request of a write batch has a statement of its own.
+  ok = pool.register("noop", "SELECT 1", none) && ok
   ok =
     pool.register(
       "favorite",
@@ -243,6 +246,22 @@ export const registerStatements = (pool: PgPool): boolean => {
     pool.register(
       "unfavorite",
       "DELETE FROM favorites f USING articles a WHERE f.user_id = $1 AND f.article_id = a.id AND a.slug = $2",
+      none
+    ) && ok
+  // A write batch's favorites and unfavorites, each kind one statement over
+  // the batch's (viewer, slug) pairs; each request then reads its article in a plan.
+  ok =
+    pool.register(
+      "favorite_many",
+      "INSERT INTO favorites (user_id, article_id) SELECT q.v, a.id FROM unnest($1::int8[], $2::text[]) q(v, slug) " +
+        "JOIN articles a ON a.slug = q.slug ON CONFLICT DO NOTHING",
+      none
+    ) && ok
+  ok =
+    pool.register(
+      "unfavorite_many",
+      "DELETE FROM favorites f USING unnest($1::int8[], $2::text[]) q(v, slug), articles a " +
+        "WHERE a.slug = q.slug AND f.user_id = q.v AND f.article_id = a.id",
       none
     ) && ok
   // Comments: the article and its newest comments in one statement, one row
@@ -365,17 +384,31 @@ export const registerPlanStatements = (pool: PgPool): boolean => {
     ) && ok
   // A feed's page reads at most limit + offset of each followee's newest ids
   // from articles_author_idx, as SPEC.md's does, and the followee is the author.
+  // Followees several viewers of the plan share are looked at once (`hubs`).
+  // The depth-th newest article of one is a floor for those viewers' pages,
+  // which can hold nothing older, so every other followee's walk stops there;
+  // and one with 1,000 articles proves its followers' count without a count.
+  // An idea from the challenge's rust-epoll-WorriedArrow and
+  // rust-epoll-theCatWisel submissions; the SQL follows the latter's.
   ok =
     pool.register(
       "plan_feed",
-      planList(
-        "int8",
-        "",
-        "SELECT 1 FROM articles a WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = q.key)",
-        "SELECT y.id, fo.followee_id AS author FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 " +
-          "WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT (q.lim::int + q.off::int)) y " +
-          "WHERE fo.follower_id = q.key ORDER BY y.id DESC LIMIT q.lim OFFSET q.off"
-      ),
+      "WITH w AS MATERIALIZED (SELECT q.key, q.lim, q.off, q.k FROM unnest($2::int8[], $3::int8[], $4::int8[]) WITH ORDINALITY q(key, lim, off, k)), " +
+        "u AS MATERIALIZED (SELECT r.key, max(r.depth) AS depth, ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.key) AS fids " +
+        "FROM (SELECT c.key, 1::int8 AS depth FROM unnest($1::int8[]) c(key) UNION ALL SELECT w.key, w.lim + w.off FROM w) r GROUP BY r.key), " +
+        "hubs AS MATERIALIZED (SELECT h.fid, (SELECT a.id FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC LIMIT 1 OFFSET h.depth - 1) AS floor_id " +
+        "FROM (SELECT f.fid, max(u.depth) AS depth FROM u, unnest(u.fids) f(fid) GROUP BY f.fid HAVING count(*) >= 2 ORDER BY count(*) DESC, f.fid LIMIT 32) h), " +
+        "capped AS MATERIALIZED (SELECT ARRAY(SELECT n.fid FROM (SELECT h.fid FROM hubs h WHERE h.floor_id IS NOT NULL ORDER BY h.floor_id DESC LIMIT 16) n " +
+        "WHERE EXISTS (SELECT 1 FROM articles a WHERE a.author_id = n.fid ORDER BY a.id DESC LIMIT 1 OFFSET 999)) AS fids) " +
+        "SELECT -c.k, CASE WHEN cardinality(u.fids) = 0 THEN 0::int8 WHEN u.fids && capped.fids THEN 1000::int8 " +
+        "ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = ANY(u.fids) LIMIT 1000) s) END, NULL::int8[], NULL::int8[] " +
+        "FROM unnest($1::int8[]) WITH ORDINALITY c(key, k) JOIN u ON u.key = c.key CROSS JOIN capped " +
+        "UNION ALL SELECT w.k, NULL::int8, x.ids, x.authors FROM w JOIN u ON u.key = w.key " +
+        "CROSS JOIN LATERAL (SELECT COALESCE(max(h.floor_id), 0::int8) AS floor_id FROM hubs h WHERE h.fid = ANY(u.fids)) fl " +
+        planPage(
+          "SELECT y.id, fid AS author FROM unnest(u.fids) fid CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 " +
+            "WHERE a2.author_id = fid AND a2.id >= fl.floor_id ORDER BY a2.id DESC LIMIT (w.lim + w.off)) y ORDER BY y.id DESC LIMIT w.lim OFFSET w.off"
+        ),
       none
     ) && ok
   // Every tag by name, once a plan: the tag list's answer, and the names, in
@@ -383,27 +416,41 @@ export const registerPlanStatements = (pool: PgPool): boolean => {
   ok = pool.register("plan_tags", "SELECT id, name FROM tags ORDER BY name", none) && ok
   // The articles every list, feed and article page of the plan returned, each
   // once: ARTICLE_LIST_SELECT's columns but the viewer's two flags, with tag
-  // ids for the tag names, and the body of those an article page shows.
+  // ids for the tag names, and the body of those an article page shows. Its
+  // rows come in binary (`bindStartBinary`): the id, the count, the two times
+  // and the tag ids (an `int4[]`, read by `PgBinaryArray`) are sent as they
+  // are stored instead of formatted as text.
   ok =
     pool.register(
       "plan_meta",
       "SELECT a.id, a.slug, a.title, a.description, " +
         "ARRAY(SELECT at.tag_id FROM article_tags at WHERE at.article_id = a.id), " +
-        "a.created_at, a.updated_at, (SELECT count(*) FROM favorites f WHERE f.article_id = a.id), u.username, u.bio, u.image, " +
+        "a.created_at, a.updated_at, u.username, u.bio, u.image, " +
         "CASE WHEN q.with_body THEN a.body END " +
         "FROM unnest($1::int8[], $2::bool[]) q(id, with_body) JOIN articles a ON a.id = q.id JOIN users u ON u.id = a.author_id",
       none
     ) && ok
+  // Each article's favorite count, for a worker's count lane (plan.ts
+  // `CountRun`): the costliest column of `plan_meta`, a walk of the article's
+  // index entries and, for the pages writes have touched, its heap.
+  ok =
+    pool.register(
+      "plan_counts",
+      "SELECT q.id, (SELECT count(*) FROM favorites f WHERE f.article_id = q.id) FROM unnest($1::int8[]) q(id)",
+      none
+    ) && ok
   // The flags: (0, viewer, article) for each favorite asked about that
   // exists, (1, viewer, user) for each follow; each viewer's in one range
-  // scan of the primary key over its ids.
+  // scan of the primary key over its ids. Each viewer's ids come as one
+  // `int8[]` literal, grouped by the plan: regrouping (viewer, id) pairs
+  // here took half the statement's time.
   ok =
     pool.register(
       "plan_flags",
-      "SELECT 0::int8, g.v, f.article_id FROM (SELECT x.v, array_agg(x.id) AS ids FROM unnest($1::int8[], $2::int8[]) x(v, id) GROUP BY x.v) g " +
-        "CROSS JOIN LATERAL (SELECT f.article_id FROM favorites f WHERE f.user_id = g.v AND f.article_id = ANY(g.ids)) f " +
-        "UNION ALL SELECT 1::int8, g.v, fo.followee_id FROM (SELECT x.v, array_agg(x.id) AS ids FROM unnest($3::int8[], $4::int8[]) x(v, id) GROUP BY x.v) g " +
-        "CROSS JOIN LATERAL (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = g.v AND fo.followee_id = ANY(g.ids)) fo",
+      "SELECT 0::int8, g.v, f.article_id FROM unnest($1::int8[], $2::text[]) g(v, ids) " +
+        "CROSS JOIN LATERAL (SELECT f.article_id FROM favorites f WHERE f.user_id = g.v AND f.article_id = ANY(g.ids::int8[])) f " +
+        "UNION ALL SELECT 1::int8, g.v, fo.followee_id FROM unnest($1::int8[], $3::text[]) g(v, ids) " +
+        "CROSS JOIN LATERAL (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = g.v AND fo.followee_id = ANY(g.ids::int8[])) fo",
       none
     ) && ok
   return ok
@@ -412,6 +459,10 @@ export const registerPlanStatements = (pool: PgPool): boolean => {
 /** A plan's batcher of articles by slug: each distinct slug's id and author, no row when there is none. */
 export const planArticleBatch = (maxRequests: i32): PgBatchConfig =>
   planBatch("plan_article", "SELECT a.id, a.author_id FROM articles a WHERE a.slug = q.key", "", maxRequests)
+
+/** A plan's batcher of profiles by username: the user's id and profile, no row when there is none. */
+export const planProfileBatch = (maxRequests: i32): PgBatchConfig =>
+  planBatch("plan_profile", "SELECT u.id, u.username, u.bio, u.image FROM users u WHERE u.username = q.key", "", maxRequests)
 
 /**
  * A plan's batcher of comments by slug: the article's newest comments, with
@@ -435,6 +486,8 @@ const planBatch = (name: string, select: string, orderBy: string, maxRequests: i
   c.select = select
   c.orderBy = orderBy
   c.keyType = PG_BATCH_TEXT
+  // Binary rows: the ids and times are read as they are stored.
+  c.binary = true
   c.maxRequests = maxRequests
   // A plan's keys are at most PLAN_KEY_BYTES, each escaped at worst to twice its length.
   c.maxBytes = 65536

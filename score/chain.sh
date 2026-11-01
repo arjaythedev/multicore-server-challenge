@@ -20,15 +20,25 @@ LOG="$OUT/chain.log"
 export CONDUIT_JWT_SECRET=multicore-server-challenge
 mkdir -p "$OUT"
 say() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$LOG"; }
+# monitor.sh (started on the target by conduit-loadgen over ssh) outlives a run that crashed or was stopped, and each
+# one keeps a psql session open: four of them used up Postgres's free connection slots on 2026-10-29. Kill any left
+# over before and after every submission. ([m] keeps the pattern from matching this ssh command's own shell.)
+reap_monitors() {
+  ssh -n -o BatchMode=yes "$TARGET" 'for p in $(pgrep -f "^bash /opt/conduit-tools/[m]onitor.sh"); do pkill -P $p; kill $p; done' >/dev/null 2>&1
+}
 
 grep -v '^\s*#' "$LIST" | awk 'NF{print $1}' | while read -r name; do
   if [ -s "$OUT/$name/SUMMARY.txt" ]; then say "$name: already scored, skipping"; continue; fi
+  reap_monitors
   say "$name: prepare"
   if ! ssh -n -o BatchMode=yes "$TARGET" "/opt/conduit-tools/prepare.sh '$name'" > "$OUT/$name.prepare.log" 2>&1; then
     say "$name: PREPARE FAILED (see $name.prepare.log)"; continue
   fi
   say "$name: search"
-  conduit-loadgen search -target-ssh "$TARGET" -target-url "$URLS" -boxes local=1 -lang "$name" -label "$name" \
+  # -restart: a phase that wedged the app (often the overload probe at -max) or got Postgres OOM-killed would fail
+  # every later phase at 100% errors; the search restarts both before a phase whose health check fails
+  conduit-loadgen search -target-ssh "$TARGET" -target-url "$URLS" -boxes "${BOXES:-local=1}" -lang "$name" -label "$name" \
+    -restart "systemctl start postgresql@18-main; systemctl restart challenge.service" \
     -start "$START" -max "$MAX" -outdir "$OUT/$name" < /dev/null > "$OUT/$name.out" 2>&1 &
   pid=$!
   # Watchdog: the search doesn't notice a dead server (it keeps stepping holds down). Once the switch is done,
@@ -51,5 +61,6 @@ grep -v '^\s*#' "$LIST" | awk 'NF{print $1}' | while read -r name; do
     say "$name: SEARCH FAILED rc=$rc: $(grep -m1 -iE 'fail|error' "$OUT/$name.out" | cut -c1-200)"
   fi
   ssh -n -o BatchMode=yes "$TARGET" 'systemctl stop challenge.service' >/dev/null 2>&1
+  reap_monitors
 done
 say "batch done"

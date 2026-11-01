@@ -2,6 +2,7 @@ package conduit.platform
 
 import conduit.http.HttpConn
 import conduit.http.HttpEngine
+import conduit.util.logSafe
 import java.lang.foreign.Arena
 import java.lang.foreign.FunctionDescriptor
 import java.lang.foreign.Linker
@@ -18,6 +19,7 @@ import java.net.InetAddress
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater
+import java.util.concurrent.locks.LockSupport
 
 /**
  * Linux syscalls through the FFM API (x86_64 glibc), for the epoll HTTP loop. The per-request calls (recv, send,
@@ -183,6 +185,8 @@ internal fun startEpollServer(host: String, port: Int, loops: Int, engine: HttpE
 private const val EVENTS = 512
 private const val EP_READ_CHUNK = 64 * 1024
 private const val EP_TASKS_PER_TURN = 4096
+/** A loop that just caught an OutOfMemoryError waits this long before its next turn, so that the GC gets to run. */
+private const val OOM_PAUSE_NANOS = 10_000_000L
 
 internal class EpollLoop(private val index: Int, private val listenFd: Int, private val engine: HttpEngine) {
     /**
@@ -227,7 +231,9 @@ internal class EpollLoop(private val index: Int, private val listenFd: Int, priv
             try {
                 turn()
             } catch (e: Throwable) {
-                println("http-$index: loop error: ${e.stackTraceToString()}")
+                // nothing in a catch may throw: this thread owns every socket of its listener
+                logSafe({ "http-$index: loop error" }, e)
+                if (e is OutOfMemoryError) LockSupport.parkNanos(OOM_PAUSE_NANOS) // let the GC make progress
             }
         }
     }
@@ -258,8 +264,11 @@ internal class EpollLoop(private val index: Int, private val listenFd: Int, priv
                     try {
                         handle(c, flags)
                     } catch (e: Throwable) { // never let one connection kill the loop and all its sockets
-                        println("http-$index: connection error: $e")
-                        c.close()
+                        try {
+                            c.close() // before logging (which allocates): the fd must not stay open and registered
+                        } catch (_: Throwable) {
+                        }
+                        logSafe({ "http-$index: connection error" }, e)
                     }
                 }
             }
@@ -273,7 +282,12 @@ internal class EpollLoop(private val index: Int, private val listenFd: Int, priv
             if (!c.isClosing()) engine.onWritable(c)
         }
         if (flags and (Sys.EPOLLIN or Sys.EPOLLHUP or Sys.EPOLLERR) != 0) {
-            if (c.isClosing()) return
+            if (c.isClosing()) {
+                // the finishClose that close() posted may be lost (out of memory), and a shut-down socket is readable
+                // for good: finish here (idempotent) rather than fire on every epoll_wait
+                finishClose(c)
+                return
+            }
             val r = Sys.RECV.invokeExact(cap, c.fd, scratchSeg, EP_READ_CHUNK.toLong(), 0) as Long
             if (r > 0) {
                 engine.onData(c, scratch, 0, r.toInt())
@@ -301,15 +315,24 @@ internal class EpollLoop(private val index: Int, private val listenFd: Int, priv
                 return // EAGAIN (drained), EINTR, ECONNABORTED: back to epoll
             }
             Sys.SETSOCKOPT.invokeExact(fd, Sys.IPPROTO_TCP, Sys.TCP_NODELAY, Sys.ONE, 4) as Int
-            if (fd >= conns.size) conns = conns.copyOf(maxOf(fd + 1, conns.size * 2))
-            val c = EpollConn(fd, this)
-            conns[fd] = c
-            ctl(Sys.EPOLL_CTL_ADD, fd, Sys.EPOLLIN)
+            val c: EpollConn
+            try {
+                if (fd >= conns.size) conns = conns.copyOf(maxOf(fd + 1, conns.size * 2))
+                c = EpollConn(fd, this)
+                conns[fd] = c
+                ctl(Sys.EPOLL_CTL_ADD, fd, Sys.EPOLLIN)
+            } catch (e: Throwable) { // out of memory: nobody else knows this fd, so it is closed here, not leaked
+                Sys.CLOSE.invokeExact(fd) as Int
+                throw e
+            }
             try {
                 engine.onOpen(c)
             } catch (e: Throwable) {
-                println("http-$index: onOpen error: $e")
-                c.close()
+                try {
+                    c.close() // before logging, as in turn()
+                } catch (_: Throwable) {
+                }
+                logSafe({ "http-$index: onOpen error" }, e)
             }
         }
     }
@@ -345,7 +368,7 @@ internal class EpollLoop(private val index: Int, private val listenFd: Int, priv
             try {
                 t()
             } catch (e: Throwable) {
-                println("http-$index: task failed: ${e.stackTraceToString()}")
+                logSafe({ "http-$index: task failed" }, e)
             }
         }
     }

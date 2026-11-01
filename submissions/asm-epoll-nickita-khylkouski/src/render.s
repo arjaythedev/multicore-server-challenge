@@ -285,7 +285,7 @@ r_article_row:
     ret
 
 # r_comment(dst, cols, b, following): {"id":..,"createdAt":..,"updatedAt":..,"body":..,"author":Profile} from
-# (id, body, created_at, updated_at, username, bio, image) at column b.
+# (id, body, created_at, updated_at, username, bio, image) at column b. A NULL updated_at reads as created_at.
 .globl r_comment
 r_comment:
     push rbx
@@ -304,7 +304,10 @@ r_comment:
     mov rdi, rax
     mov rsi, [rbx + 32]
     mov rdx, [rbx + 48]
-    call r_times
+    cmp qword ptr [rbx + 56], 0
+    jge 1f
+    mov rdx, rsi                         # NULL updated_at (the SQL's NULLIF): same as created_at
+1:  call r_times
     mov rdi, rax
     PUTL lit_c_body
     mov rsi, [rbx + 16]

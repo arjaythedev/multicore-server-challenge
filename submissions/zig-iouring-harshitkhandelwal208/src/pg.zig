@@ -310,7 +310,7 @@ const Scram = struct {
     }
 };
 
-pub const Prep = struct { id: u16, sql: []const u8, params: []const u32 };
+pub const Prep = struct { id: u16, sql: []const u8, params: []const u32, results: ?[]const u32 = null };
 
 /// Parse each statement on a connected (blocking) socket. Statement `id` is named "s<id>".
 pub fn prepareAll(fd: i32, items: []const Prep) !void {
@@ -328,22 +328,58 @@ pub fn prepareAll(fd: i32, items: []const Prep) !void {
         out.putInt(u16, @intCast(it.params.len), .big);
         for (it.params) |o| out.putInt(u32, o, .big);
         std.mem.writeInt(u32, out.ptr[at..][0..4], @intCast(out.len - at), .big);
+        out.put('D');
+        const desc_at = out.len;
+        out.putInt(u32, 0, .big);
+        out.put('S');
+        out.putSlice(stmtName(&nb, it.id));
+        out.put(0);
+        std.mem.writeInt(u32, out.ptr[desc_at..][0..4], @intCast(out.len - desc_at), .big);
     }
     out.putSlice("S\x00\x00\x00\x04");
     try writeAll(fd, out.slice());
     var in = try Buf.init(1024);
     defer in.deinit();
+    var described: usize = 0;
     while (true) {
         const t = try readMsg(fd, &in);
         switch (t) {
+            'T', 'n' => {
+                if (described >= items.len) return error.Protocol;
+                const it = items[described];
+                if (it.results) |expected| {
+                    validateDescription(if (t == 'n') "\x00\x00" else in.slice(), expected) catch |err| {
+                        std.log.err("postgres statement s{d}: result columns/OIDs do not match the decoder", .{it.id});
+                        return err;
+                    };
+                }
+                described += 1;
+            },
             'E' => {
                 std.log.err("postgres prepare: {s}", .{errorText(in.slice())});
                 return error.PrepareFailed;
             },
-            'Z' => return,
+            'Z' => {
+                if (described != items.len) return error.Protocol;
+                return;
+            },
             else => {},
         }
     }
+}
+
+pub fn validateDescription(bytes: []const u8, expected: []const u32) !void {
+    if (bytes.len < 2 or std.mem.readInt(u16, bytes[0..2], .big) != expected.len) return error.ResultShape;
+    var pos: usize = 2;
+    for (expected) |want| {
+        const end = std.mem.indexOfScalarPos(u8, bytes, pos, 0) orelse return error.Protocol;
+        pos = end + 1;
+        if (bytes.len - pos < 18) return error.Protocol;
+        const actual = std.mem.readInt(u32, bytes[pos + 6 ..][0..4], .big);
+        if (actual != want) return error.ResultShape;
+        pos += 18;
+    }
+    if (pos != bytes.len) return error.Protocol;
 }
 
 fn stmtName(buf: *[8]u8, i: u16) []const u8 {
@@ -566,6 +602,66 @@ pub const TextArray = struct {
         return s;
     }
 };
+
+/// Validated one-dimensional, non-null binary int8[] used by packed read headers.
+pub const Int8Array = struct {
+    data: []const u8,
+    pos: usize = 0,
+
+    pub fn init(b: []const u8) !Int8Array {
+        if (b.len < 12 or i32Of(b[4..]) != 0 or i32Of(b[8..]) != oid.int8) return error.Protocol;
+        const dims = i32Of(b);
+        if (dims == 0) {
+            if (b.len != 12) return error.Protocol;
+            return .{ .data = &.{} };
+        }
+        if (dims != 1 or b.len < 20) return error.Protocol;
+        const count = i32Of(b[12..]);
+        if (count < 0 or @as(u64, @intCast(count)) * 12 + 20 != b.len) return error.Protocol;
+        var p: usize = 20;
+        while (p < b.len) : (p += 12) if (i32Of(b[p..]) != 8) return error.Protocol;
+        return .{ .data = b[20..] };
+    }
+
+    pub fn next(self: *Int8Array) ?i64 {
+        if (self.pos == self.data.len) return null;
+        const n = i64Of(self.data[self.pos + 4 ..]);
+        self.pos += 12;
+        return n;
+    }
+
+    pub fn contains(self: Int8Array, id: i64) bool {
+        var it = self;
+        while (it.next()) |x| if (x == id) return true;
+        return false;
+    }
+};
+
+test "startup description and packed array validation reject decoder mismatches" {
+    try validateDescription("\x00\x00", &.{});
+    try std.testing.expectError(error.ResultShape, validateDescription("\x00\x00", &.{oid.int8}));
+    var b: Buf = .{};
+    defer b.deinit();
+    b.putInt(u16, 1, .big);
+    b.putSlice("id\x00");
+    b.putInt(u32, 0, .big);
+    b.putInt(u16, 0, .big);
+    b.putInt(u32, oid.int8, .big);
+    b.putInt(u16, 8, .big);
+    b.putInt(i32, -1, .big);
+    b.putInt(u16, 0, .big);
+    try validateDescription(b.slice(), &.{oid.int8});
+    try std.testing.expectError(error.ResultShape, validateDescription(b.slice(), &.{oid.text}));
+    try std.testing.expectError(error.Protocol, Int8Array.init(""));
+    b.reset();
+    b.putInt(u32, 0, .big);
+    b.putInt(u32, 0, .big);
+    b.putInt(u32, oid.int8, .big);
+    var empty = try Int8Array.init(b.slice());
+    try std.testing.expect(empty.next() == null);
+    b.ptr[11] = oid.text;
+    try std.testing.expectError(error.Protocol, Int8Array.init(b.slice()));
+}
 
 /// SQLSTATE of an ErrorResponse body, or null.
 pub fn sqlstate(body: []const u8) ?[]const u8 {

@@ -8,7 +8,7 @@ Front: direct
 | HTTP/1.1, JSON, JWT (HS256), routing | hand-written, in `src/` |
 | Postgres driver | libpq (`libpq-dev`, 18.x from the PGDG repo that the box already has; 14+ works) in pipeline mode |
 | HMAC-SHA256 | OpenSSL 3.0 SHA-256 (`libssl-dev`) |
-| bcrypt | libxcrypt 4.4.36 (`libcrypt-dev`), cost 10 |
+| bcrypt | `src/bcrypt.c` (several hashes interleaved in one thread, see below), cost 10; libxcrypt 4.4.36 (`libcrypt-dev`) for salts and other hash formats |
 
 `install.sh` installs `gcc libc6-dev libpq-dev libssl-dev libcrypt-dev` with apt. `build.sh` is one `gcc` call
 (`-O2 -march=native`, no other dependencies). `start.sh` runs `bin/conduit`, configured by `DATABASE_URL`,
@@ -34,23 +34,34 @@ inserts use `currval`); update article is a lookup, then the update and the read
 
 **Batched reads.** Much of what a small statement costs Postgres is per statement: protocol messages, executor
 start-up and shutdown, snapshot, transaction start and end. Reads of one kind (an article by slug, comments, the tag
-list, a profile, a page of each list kind, the feed) wait in a per-loop queue. When a read connection has nothing in
-flight, the kind whose oldest request has waited longest goes out as one statement: the per-request query is the
-inner side of a `LATERAL` join over the unnested parameters of every waiting request, and each row carries its
-request's ordinal.
+list, a profile, a page of each list kind, the feed) wait in a per-loop queue. Each kind collects its requests for
+up to 40 ms (or until 256 are waiting), then goes out as one statement over the unnested parameters of every
+waiting request, each row carrying its request's ordinal. The window keeps batches large at any load, not only when
+the connections are busy (the idea is from rust-epoll-WorriedArrow's batch clock).
+
+**Shared within a statement.** The requests of one statement share whatever doesn't depend on who is asking: each
+distinct page key (limit, offset, tag, author, ...) is paged and counted once, each article in the batch gets its
+tags, favorite count and author once, each slug's comments are read once, and only `favorited` / `following` are
+computed per request. A list statement looks like this:
 
 ```sql
-SELECT r.i, x.* FROM unnest($1::int8[], $2::text[]) WITH ORDINALITY AS r(v, k, i)
-CROSS JOIN LATERAL (<the per-request query, with r.v as the viewer and r.k as the slug> LIMIT 1) x
+WITH r AS MATERIALIZED (SELECT * FROM unnest($1::int8[], $2::int8[], $3::int8[]) WITH ORDINALITY AS r(v, l, o, i)),
+     c AS MATERIALIZED (<capped count per distinct count key>),
+     p AS MATERIALIZED (<page ids per distinct (limit, offset, key)>),
+     a AS MATERIALIZED (<tags, favorite count, author per distinct article>)
+SELECT r.i, c.n, a.*, <favorited by r.v>, <following by r.v>
+FROM r JOIN c ON ... JOIN p ON ... LEFT JOIN a ON a.id = p.id ORDER BY r.i, p.id DESC
 ```
 
-Each request still gets its own execution of its own query, in the statement's snapshot, while it is being served:
-the inner queries are correlated with their request row (by their parameters, or `r.i > 0` where nothing else ties
-them to it), and Memoize is off for the session, so no request is ever handed a row cached from another request's
-lookup. At low load a batch holds one request and nothing waits; under load the queues fill while the connections
-are busy, so batches grow by themselves (100-250 requests at the limit). Six read connections in total turned out to
-be the best trade between filling batches and keeping Postgres's cores busy. Rows are handed out by ordinal, and a
-batch whose rows don't come back grouped per request in order fails with 500 instead of mixing anything up.
+Everything a response contains was read by that statement while the request was waiting, in one snapshot, and
+nothing outlives the statement: only requests that are queued when it goes out share it. Per-key lookups are
+`LATERAL ... LIMIT` so generic plans probe indexes, and hash aggregation is off for the session (a generic plan
+sized each `DISTINCT`'s hash table for thousands of keys). Rows are handed out by ordinal, and a batch whose rows
+don't come back grouped per request in order fails with 500 instead of mixing anything up. A differential test of
+20,000 random reads at concurrency 256 against `examples/go` on the same database: no differences.
+
+At 68,000 users on the test machine (the official score of the first version), the window and the sharing took
+Postgres from 2.9 to 1.6 cores and the whole box from 55% to 32% CPU for the same traffic.
 
 **Writes on their own connections** (32), so a commit's WAL flush never holds up reads queued behind it on a
 pipelined connection, and concurrent commits share flushes.
@@ -79,13 +90,23 @@ pipelined connection, and concurrent commits share flushes.
 **Binary results, text parameters.** Rows are read from libpq's result as binary (int8, bool, timestamptz as
 microseconds since 2000, `text[]` arrays) and written straight into the JSON response.
 
-**bcrypt** runs on its own threads (one per CPU, at a lower scheduling priority than the event loops and Postgres),
-so a ~40 ms hash never blocks a loop; the finished job comes back to its loop through a mailbox and an eventfd.
+**bcrypt** runs on its own threads (at a lower scheduling priority than the event loops and Postgres), so a hash
+never blocks a loop; the finished job comes back to its loop through a mailbox and an eventfd. A cost-10 hash is
+about a million Blowfish encryptions, each a chain of dependent S-box loads, so one hash at a time leaves the core
+mostly waiting on load latency. `src/bcrypt.c` computes up to 4 hashes at once in one thread, each step done for
+all of them back to back, so their chains overlap: on the test machine 13 ms of CPU per hash with 4 at once
+instead of libxcrypt's 37 ms (on a core shared with its hyper-thread sibling: 24 ms instead of 40 ms). Every hash
+is still full bcrypt at cost 10 with a fresh salt from libxcrypt, and every login is verified against its stored
+hash. The first worker lets its batch fill for up to 150 ms (at moderate load logins are too rare to fill it
+otherwise: 1.2 hashes per batch on average without the wait, 3.3 with it); the other workers only start when two
+full batches are waiting. `bin/conduit --bcrypt-selftest` checks the output
+against libxcrypt on random passwords, salts and `$2a$`/`$2b$`/`$2y$` settings. `$2a$` with password bytes
+>= 0x80 (where libxcrypt applies a countermeasure for an old bug) and other formats go to libxcrypt.
 
 ## Rules
 
 - No caching across requests: every request reads Postgres while it's being served. Only connections and prepared
-  statements are reused. Batching shares statements, never rows (see above).
+  statements are reused. Requests share rows only within one batched statement, while all of them are waiting (see above).
 - Every password is hashed with bcrypt cost 10 (fresh salt from libxcrypt's `crypt_gensalt_rn`), every login
   verifies against the stored hash, and passwords over 72 bytes are rejected (422) rather than truncated. Every
   request with a token verifies its HS256 signature, `alg` and `exp`.
@@ -95,9 +116,11 @@ so a ~40 ms hash never blocks a loop; the finished job comes back to its loop th
 ## Configuration (env, optional)
 
 `THREADS` (event loops, default CPUs/4), `PG_READ_PER_LOOP` (3), `PG_WRITE_PER_LOOP` (16), `PG_DEPTH` (batches in
-flight per read connection, 1), `BATCH_MAX` (256), `BCRYPT_THREADS` (CPUs), `BCRYPT_NICE` (10).
-`SHARE_READS` (default 0): if 1, tag-list requests that are all waiting when the statement goes out share one
-execution (the result is never kept for later requests).
+flight per read connection, 1), `BATCH_MAX` (256), `READ_WINDOW_US` (how long a read kind collects a batch, 40000), `BCRYPT_THREADS` (CPUs; all but one are spare capacity), `BCRYPT_LANES` (hashes computed together, 4, at most 8), `BCRYPT_WINDOW_MS` (how long the first worker waits
+for its lanes to fill, 150),
+`BCRYPT_NICE` (10).
+`SHARE_READS` (default 1): tag-list requests that are waiting when the statement goes out share one execution
+(0: one row each).
 
 ## Credits
 
@@ -106,11 +129,15 @@ Ideas taken from the write-ups of other submissions, implemented here from scrat
 separate write connections), [c-iouring-tigokraft](../c-iouring-tigokraft) (tag names by primary key, page ids
 before per-article work, the bounded inner `LIMIT 100`, generic plans, no TLS on the loopback connection, few
 connections), [rust-tokio-Scooter1337](../rust-tokio-Scooter1337) (sharing one execution among waiting tag-list
-requests, off by default here).
+requests; interleaving several bcrypt hashes in one thread, also in c-iouring-tigokraft),
+[rust-epoll-WorriedArrow](../rust-epoll-WorriedArrow) (a time window that fills read batches, sharing pages,
+counts and per-article data within a batch, the feed count over an array of followees, waiting for bcrypt lanes to
+fill).
 
 ## Local results (not official)
 
 On a local emulation of the box (8 CPUs of a 16-thread desktop, Postgres 18 with the box's config, full seed, load
-generator on the other 8 CPUs over loopback), 2-minute probes: 145,000 users pass (38,000 req/s, p95 ~100 ms,
-p99 ~200 ms); a 5-minute hold passes at 140,000 users. Under the same setup the current leader passes about the
-same number of users, so these numbers only compare submissions on that machine.
+generator on the other 8 CPUs over loopback), 5-minute holds: 150,000 users at p95 74 ms, p99 107 ms (box CPU 76%)
+and 160,000 users at p95 80 ms, p99 120 ms (77%); past ~170,000 users the local load generator itself stalls, for
+the leader too. The first version (official score 68,000) used 55% of the box at 68,000 users there; this one
+uses 32%. These numbers only compare submissions on that machine.

@@ -43,19 +43,29 @@ object Settings:
     * still together, in batches of up to [[batchSize]]), so that every kind waits alike. 0: up to [[batchSize]] of
     * every kind, oldest or not: under overload the two most frequent kinds fell rounds behind and failed the holds.
     * 32 and 64 cut the batches too small; with no cap, one connection took thousands of reads while the other served
-    * newer ones.
+    * newer ones. 512, so that [[pgGatherMicros]]'s rounds aren't cut short near the limit.
     */
-  val pgRoundSize: Int = sys.props.get("conduit.pgRoundSize").fold(256)(v =>
+  val pgRoundSize: Int = sys.props.get("conduit.pgRoundSize").fold(512)(v =>
     v.trim.toIntOption.filter(_ >= 0).getOrElse(throw IllegalArgumentException(s"""-Dconduit.pgRoundSize must be 0 or more, not "$v""""))
+  )
+  /** With [[pgDrain]] and [[pgRoundSize]]: how long the oldest waiting read waits for others before an idle read
+    * connection takes them as a round ([[PgPool]]), unless a round's worth waits first; reads that waited that long
+    * for a connection go as soon as one is free. 0: a free connection takes what waits at once, and a read that
+    * finds one free goes alone. 10 ms: 9-11% less of Postgres's CPU per request near the limit, where the batches
+    * were what arrived while every connection was busy; 15 ms with rounds of 512 another 6.5%, the packed batches
+    * paying with their size (20 ms 7%, its p95 higher).
+    */
+  val pgGatherMicros: Int = sys.props.get("conduit.pgGatherMicros").fold(15_000)(v =>
+    v.trim.toIntOption.filter(_ >= 0).getOrElse(throw IllegalArgumentException(s"""-Dconduit.pgGatherMicros must be 0 or more, not "$v""""))
   )
   /** Without [[pgDrain]]: the most requests in flight on one Postgres connection; past that they wait in their loop's
     * queue, in order.
     */
   val pgDepth: Int = int("conduit.pgDepth", 16)
   /** The most requests of a kind that wait for a Postgres connection to go out as one statement ([[Sql.Batch]]); 1:
-    * each its own statement.
+    * each its own statement. 128, for [[pgGatherMicros]]'s batches.
     */
-  val batchSize: Int = int("conduit.batchSize", 32)
+  val batchSize: Int = int("conduit.batchSize", 128)
   /** Threads that hash and check passwords (bcrypt), off the event loops. */
   val bcryptThreads: Int = int("conduit.bcryptThreads", math.max(1, cpus / 4))
   /** How long a hash may wait for others to run with it, four at a time ([[Passwords]]). */
@@ -68,7 +78,9 @@ object Settings:
   val bcryptNice: Int = sys.props.get("conduit.bcryptNice").fold(0)(v =>
     v.trim.toIntOption.filter(n => n >= 0 && n <= 19).getOrElse(throw IllegalArgumentException(s"""-Dconduit.bcryptNice must be 0 to 19, not "$v""""))
   )
-  /** The most connections each loop holds; past it the longest-idle are evicted. Unset, its share of descriptors. */
+  /** The most connections each loop holds; past it the longest-idle are evicted, and with none idle the server stops
+    * accepting until one is. Unset, its share of descriptors.
+    */
   val maxConnections: Option[Int] = sys.props.get("conduit.maxConnections").map(positive("conduit.maxConnections", _))
   /** Idle keep-alive connections are closed after this. The spec asks for at least 65 s. */
   val idleTimeoutSeconds: Int = int("conduit.idleTimeoutSeconds", 75)
@@ -80,7 +92,9 @@ object Settings:
   val acceptsPerPass: Int = int("conduit.acceptsPerPass", 1024)
   /** The listen backlog asked for; the kernel caps it at `net.core.somaxconn` (65,535 on the box). */
   val listenBacklog: Int = int("conduit.listenBacklog", 65535)
-  /** Logs every 10 s each loop's queries to Postgres: how many waited for a connection, and the batches they went in. */
+  /** Logs every 10 s each loop's queries to Postgres (how many waited for a connection, and the batches they went in)
+    * and its connections (open, evicted so far, and whether it is full).
+    */
   val stats: Boolean = java.lang.Boolean.getBoolean("conduit.stats")
   /** Logs every 10 s how long each event loop went without getting to its tasks ([[LagMonitor]]). */
   val lagMonitor: Boolean = java.lang.Boolean.getBoolean("conduit.lagMonitor")
@@ -97,6 +111,7 @@ object Settings:
     "pgDrain" -> pgDrain,
     "pgRoundSize" -> pgRoundSize,
     "batchSize" -> batchSize,
+    "pgGatherMicros" -> pgGatherMicros,
     "bcryptThreads" -> bcryptThreads,
     "bcryptWaitMillis" -> bcryptWaitMillis,
     "bcryptNice" -> bcryptNice,

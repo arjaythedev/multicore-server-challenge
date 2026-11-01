@@ -2,18 +2,19 @@ package conduit.http
 
 import conduit.json.JsonWriter
 import conduit.platform.Monitor
+import conduit.platform.nanoTime
 import conduit.util.ByteBuf
-import kotlin.concurrent.atomics.AtomicInt
+import conduit.util.logSafe
 import kotlin.coroutines.Continuation
 import kotlin.coroutines.CoroutineContext
-import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.jvm.JvmField
 
 /**
  * Bytes in front of every response body where [putHead] writes the status line and headers (right-aligned), so
- * header + body leave in ONE write. Worst case is ~132 bytes (longest reason, 10-digit length, Connection header).
+ * header + body leave in ONE write. Worst case is ~156 bytes (longest reason, 10-digit length, Connection header,
+ * Content-Encoding).
  */
-internal const val RESERVE = 160
+internal const val RESERVE = 192
 
 private const val OUT_INITIAL = 8192
 /**
@@ -60,16 +61,28 @@ internal class OutPool(cap: Int) {
     }
 }
 
+/** [Ex.key]: how the queues a suspended handler waits in (Db, Passwords) find the request its coroutine belongs to. */
+internal object RequestKey : CoroutineContext.Key<Ex>
+
 /**
- * The [Exchange] of one request, and the completion of its handler coroutine (no extra object per request).
- * Head fields are filled by [parseHead] on the loop; [res] is attached right before the handler starts and
- * detached by the one answer that wins [answered].
+ * The client's own timeout (the loadgen's): a request older than this has certainly been given up on, because the
+ * server-side age is never more than the client's.
  */
-internal class Ex(@JvmField val engine: EngineCore, @JvmField val cs: ConnState) : Exchange(), Continuation<Unit> {
+private const val ABANDONED_NANOS = 10_000_000_000L
+
+/**
+ * The [Exchange] of one request, the completion of its handler coroutine (no extra object per request) and that
+ * coroutine's context (an element under [RequestKey]; no interceptor, so nothing is dispatched differently).
+ * Head fields are filled by [parseHead] on the loop; [res] is attached when the handler first needs it (a request
+ * waiting for the database holds no buffer) and detached by the one answer that wins [answered].
+ */
+internal class Ex(@JvmField val engine: EngineCore, @JvmField val cs: ConnState) :
+    Exchange(), Continuation<Unit>, CoroutineContext.Element {
     override var method: Method = Method.OTHER
     override var path: String = ""
     override var query: String? = null
-    override var authorization: String? = null
+    override val authorization: String?
+        get() = authBuf?.decodeToString(authOff, authOff + authLen)
     override var body: ByteArray = EMPTY
 
     /** [KEEP], [CLOSE] or [KEEP_10]. */
@@ -79,16 +92,32 @@ internal class Ex(@JvmField val engine: EngineCore, @JvmField val cs: ConnState)
     @JvmField var chunked = false
     @JvmField var expect = false
 
+    /** The client sent Accept-Encoding with gzip (and no q=0): the body may go out gzipped, see [Gzip]. */
+    @JvmField var acceptGzip = false
+
     @JvmField var res: Out? = null
     private var jsonReady = false
-    private val answered = AtomicInt(0)
+    /**
+     * The handler and this completion run as one coroutine (sequentially, handed between threads through the db and
+     * bcrypt queues, which publish), so a plain field suffices: no atomic object per request.
+     */
+    private var answered = false
+
+    /** When the head was parsed ([nanoTime]): the request's age for [abandoned]. */
+    private val born = nanoTime()
+
+    /** The response buffer, taken from the pool on first use: only the thread that renders and sends holds one. */
+    private fun buf(): Out {
+        if (answered) error("exchange already answered")
+        return res ?: engine.takeOut().also { res = it }
+    }
 
     override val out: ByteBuf
-        get() = (res ?: error("exchange already answered")).buf
+        get() = buf().buf
 
     override val json: JsonWriter
         get() {
-            val o = res ?: error("exchange already answered")
+            val o = buf()
             if (!jsonReady) { // a pooled writer may hold nesting state from an abandoned body (sendError)
                 jsonReady = true
                 val len = o.buf.len
@@ -118,36 +147,80 @@ internal class Ex(@JvmField val engine: EngineCore, @JvmField val cs: ConnState)
 
     /** First answer wins; later ones (and answers after the engine's 500) are ignored. */
     private fun claim(): Out? {
-        if (!answered.compareAndSet(0, 1)) return null
-        val o = res
+        if (answered) return null
+        val o = res ?: engine.takeOut() // may throw (out of memory): still unanswered then, see resumeWith
+        answered = true
         res = null
         return o
     }
 
     private fun respond(o: Out, status: Int, bodyLen: Int) {
+        if (acceptGzip && bodyLen >= Gzip.MIN_BODY && Gzip.active) {
+            val z = gzipped(o, bodyLen)
+            if (z != null) {
+                val start = putHead(z.buf.buf, status, z.buf.len - RESERVE, connMode, gzip = true)
+                engine.write(cs, z, start, z.buf.len, connMode == CLOSE)
+                return
+            }
+        }
         val start = putHead(o.buf.buf, status, bodyLen, connMode)
         engine.write(cs, o, start, if (bodyLen < 0) RESERVE else o.buf.len, connMode == CLOSE)
     }
 
-    override val context: CoroutineContext get() = EmptyCoroutineContext
+    /**
+     * The body of [o] gzipped into another pooled buffer (then [o] goes back to the pool), or null (o unchanged) if
+     * compressing failed or did not make it smaller.
+     */
+    private fun gzipped(o: Out, bodyLen: Int): Out? {
+        val z = try {
+            engine.takeOut()
+        } catch (_: Throwable) { // out of memory: send it uncompressed
+            return null
+        }
+        if (gzip(o.buf.buf, RESERVE, bodyLen, z.buf) && z.buf.len - RESERVE < bodyLen) {
+            Gzip.count(bodyLen, z.buf.len - RESERVE)
+            engine.putOut(o)
+            return z
+        }
+        engine.putOut(z)
+        return null
+    }
+
+    override val abandoned: Boolean
+        get() = cs.st.load() == CLOSED || nanoTime() - born >= ABANDONED_NANOS
+
+    override fun abandon() {
+        if (cs.st.load() == CLOSED) return
+        cs.st.store(CLOSED)
+        try {
+            cs.conn.close() // a client that is still waiting (the loop has not seen it close) is released
+        } catch (_: Throwable) { // out of memory: the loop finishes the close when the shut-down socket reports it
+        }
+    }
+
+    override val key: CoroutineContext.Key<*> get() = RequestKey
+
+    override val context: CoroutineContext get() = this
 
     /** The handler returned or threw: answer 500 unless it answered. */
     override fun resumeWith(result: Result<Unit>) {
         val e = result.exceptionOrNull()
-        if (e != null) logHandlerError(e)
-        if (answered.load() == 0) sendError(500, "internal server error")
+        if (!answered) {
+            try {
+                sendError(500, "internal server error")
+            } catch (_: Throwable) {
+                // no buffer to answer with (out of memory): close the connection rather than leave the client waiting
+                cs.st.store(CLOSED)
+                cs.conn.close()
+            }
+        }
+        if (e != null) logHandlerError(e) // after the answer: the client is waiting, and logging allocates
     }
 }
 
 private fun hasBody(status: Int) = status >= 200 && status != 204 && status != 304
 
-private val errorCount = AtomicInt(0)
-
-private fun logHandlerError(e: Throwable) {
-    // full traces for the first few (debugging), one line after that (no log flood under load)
-    if (errorCount.addAndFetch(1) <= 10) println("http: handler failed: ${e.stackTraceToString()}")
-    else println("http: handler failed: $e")
-}
+private fun logHandlerError(e: Throwable) = logSafe({ "http: handler failed" }, e)
 
 private val ERR_PREFIX = "{\"errors\":{\"body\":[\"".encodeToByteArray()
 private val ERR_SUFFIX = "\"]}}".encodeToByteArray()
@@ -212,12 +285,13 @@ private fun statusLine(status: Int): ByteArray {
 private val CONTENT = "Content-Type: application/json\r\nContent-Length: ".encodeToByteArray()
 private val CONN_CLOSE = "Connection: close\r\n".encodeToByteArray()
 private val CONN_KEEP = "Connection: keep-alive\r\n".encodeToByteArray()
+private val ENC_GZIP = "Content-Encoding: gzip\r\n".encodeToByteArray()
 
 /**
  * Writes the status line and headers into dst so that they end exactly at [RESERVE] (where the body starts) and
- * returns their start. [bodyLen] < 0: no Content-Type/Content-Length (204, 304).
+ * returns their start. [bodyLen] < 0: no Content-Type/Content-Length (204, 304). [gzip]: the body is gzipped.
  */
-internal fun putHead(dst: ByteArray, status: Int, bodyLen: Int, connMode: Int): Int {
+internal fun putHead(dst: ByteArray, status: Int, bodyLen: Int, connMode: Int, gzip: Boolean = false): Int {
     var p = RESERVE - 2
     dst[p] = 13
     dst[p + 1] = 10
@@ -229,6 +303,10 @@ internal fun putHead(dst: ByteArray, status: Int, bodyLen: Int, connMode: Int): 
     if (conn != null) {
         p -= conn.size
         conn.copyInto(dst, p)
+    }
+    if (gzip) {
+        p -= ENC_GZIP.size
+        ENC_GZIP.copyInto(dst, p)
     }
     if (bodyLen >= 0) {
         dst[--p] = 10

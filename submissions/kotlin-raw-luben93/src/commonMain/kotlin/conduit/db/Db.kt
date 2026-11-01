@@ -24,7 +24,8 @@ import kotlin.concurrent.Volatile
  *
  * Each request's rows come back in the order the per-request query produces them. Subqueries that don't reference
  * a request column must be tied to the request row (e.g. `WHERE r.i >= 0`) so they run once per request, never once
- * per statement (rule 5: nothing is shared between requests).
+ * per statement, unless the kind is written to share them among the requests of its batch (app/Sql.kt ReadShare:
+ * all of them were waiting when the statement was sent, and nothing outlives it).
  */
 class ReadKind(
     val name: String,
@@ -65,13 +66,45 @@ class DbConfig(
     val writeConns: Int,
     /** Startup `options`, e.g. "-c plan_cache_mode=force_generic_plan -c jit=off". */
     val options: String,
+    /**
+     * Queued reads / writes at which [Db.readsSaturated] / [Db.writesSaturated] is set (and cleared again at 75% of
+     * it); the app then answers 503 instead of queueing more. 0: no limit.
+     */
+    val readQueueMax: Int = 0,
+    val writeQueueMax: Int = 0,
+    /**
+     * Drop queued reads whose HTTP client is gone ([conduit.http.Exchange.abandoned]) instead of running them. Their
+     * handlers are never resumed. Writes are always run: committing one for a client that left does no harm.
+     */
+    val skipAbandoned: Boolean = false,
+    /**
+     * Gather window: a kind is sent once its oldest request has waited this long or its batch is full (0: as soon as a
+     * connection is free). Bigger batches cost Postgres less per request, the more so when they share work.
+     */
+    val gatherMicros: Int = 0,
+    /**
+     * Adaptive LIFO (0: off, plain oldest-first): while a kind's oldest waiting read is older than this, a free
+     * connection takes that kind's NEWEST requests. A backlog burst then delays only its own requests (they are served
+     * once it clears, or dropped unrun past the client's timeout) instead of every request behind it.
+     */
+    val lifoMicros: Int = 0,
 ) {
     companion object {
         /**
          * Parses postgres://user:pass@host:port/db (also postgresql://; percent-decoding user, password and database;
          * default port 5432, user "postgres", database = user; a ?query is ignored, IPv6 hosts go in brackets).
          */
-        fun fromUrl(url: String, readConns: Int, writeConns: Int, options: String): DbConfig {
+        fun fromUrl(
+            url: String,
+            readConns: Int,
+            writeConns: Int,
+            options: String,
+            readQueueMax: Int = 0,
+            writeQueueMax: Int = 0,
+            skipAbandoned: Boolean = false,
+            gatherMicros: Int = 0,
+            lifoMicros: Int = 0,
+        ): DbConfig {
             val rest = when {
                 url.startsWith("postgres://") -> url.substring("postgres://".length)
                 url.startsWith("postgresql://") -> url.substring("postgresql://".length)
@@ -103,7 +136,10 @@ class DbConfig(
                     ?: throw IllegalArgumentException("bad port '$portText' in database URL")
             }
             val database = percentDecode(path.trimEnd('/')).ifEmpty { user }
-            return DbConfig(host.ifEmpty { "localhost" }, port, user, password, database, readConns, writeConns, options)
+            return DbConfig(
+                host.ifEmpty { "localhost" }, port, user, password, database, readConns, writeConns, options,
+                readQueueMax, writeQueueMax, skipAbandoned, gatherMicros, lifoMicros,
+            )
         }
 
         /** %XX sequences as UTF-8 bytes; anything else (including a malformed %) is kept as is. */
@@ -138,6 +174,7 @@ class DbConfig(
  *
  * Contract for implementers: [read] and [write] ALWAYS suspend (they never complete inline), and the continuation
  * is resumed exactly once, with a [Result] whose rows stay valid until the resumed code suspends again or returns.
+ * (The one exception: with [DbConfig.skipAbandoned], a read of an HTTP request whose client is gone is dropped.)
  *
  * Dispatch (see Worker.kt): a request queued while some connection is idle is encoded and written to that
  * connection by the queueing thread itself (a small blocking write into an idle socket's buffer, never a wait on
@@ -196,8 +233,20 @@ object Db {
         }
     }
 
+    /** The read queue is at its cap ([DbConfig.readQueueMax]): callers shed new work, see [conduit.app.App.handle]. */
+    val readsSaturated: Boolean get() = runtime?.readPool?.saturated == true
+
+    /** The write queue is at its cap ([DbConfig.writeQueueMax]). */
+    val writesSaturated: Boolean get() = runtime?.writePool?.saturated == true
+
     /** One line of batching / group-commit / connection statistics, for logs. */
     fun stats(): String = runtime?.stats() ?: "db: not started"
+
+    /**
+     * One line for the statistics interval just ended ([intervalNanos] long; the next starts now): connection
+     * utilization, queue waits and round trips per read kind and for writes (see ReadPool.intervalStats).
+     */
+    fun intervalStats(intervalNanos: Long): String = runtime?.intervalStats(intervalNanos) ?: "db: not started"
 
     private fun rt(): DbRuntime = runtime ?: throw IllegalStateException("Db.start was not called")
 }

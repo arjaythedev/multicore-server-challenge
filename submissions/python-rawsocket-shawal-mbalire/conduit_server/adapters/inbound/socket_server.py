@@ -4,11 +4,14 @@ import socket
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from typing import Callable, Dict, Optional
+from typing import Dict, Optional
 
-from conduit_server.adapters.inbound.router import parse_request
+from conduit_server.ports.inbound import HttpApplication, InboundServer, RequestParser
 
 _IN = select.EPOLLIN
+# Linux >= 4.5. Some Python builds (uv's standalone CPython) are compiled against older kernel headers and lack the
+# constant, though the kernel supports the flag; its value is fixed in the kernel ABI.
+_EPOLLEXCLUSIVE = getattr(select, "EPOLLEXCLUSIVE", 1 << 28)
 _IN_OUT = select.EPOLLIN | select.EPOLLOUT
 _BAD_REQUEST = (
     b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n"
@@ -43,7 +46,7 @@ class _Conn:
         self.last = time.monotonic()
 
 
-class RawSocketHttpServer:
+class RawSocketHttpServer(InboundServer):
     """epoll(7) HTTP/1.1 keep-alive server: one I/O loop thread, handlers inline or on a thread pool.
 
     threads=0: the loop runs each complete request's synchronous router call itself, so a worker process is a single
@@ -68,21 +71,37 @@ class RawSocketHttpServer:
         self,
         host: str,
         port: int,
-        router,
+        router: HttpApplication,
+        parse: RequestParser,
         threads: int = 16,
         listener: Optional[socket.socket] = None,
         offload: frozenset = frozenset(),
         pipeline=None,
     ):
+        self.parse = parse  # raw request bytes -> HttpRequest
         self.dispatch = router.dispatch  # HttpRequest -> bytes, or (handler, query) to wait on
         self.dispatch_sync = router.dispatch_sync  # HttpRequest -> bytes
         self.resume = router.resume  # (handler, value, error) -> bytes, or (handler, query)
-        self.pipeline = pipeline
+        if pipeline is None:
+            self.pipes = ()
+            self.read_pipes = ()
+            self.write_pipe = None
+        elif isinstance(pipeline, (list, tuple)):
+            self.pipes = tuple(pipeline)
+            self.read_pipes = self.pipes[:-1] if len(self.pipes) > 1 else self.pipes
+            self.write_pipe = self.pipes[-1]
+        else:
+            self.pipes = (pipeline,)
+            self.read_pipes = (pipeline,)
+            self.write_pipe = pipeline
+        self.pipeline = self.read_pipes[0] if self.read_pipes else None
         self.listener = listener if listener is not None else make_listener(host, port)
         self.threads = threads
         self.offload = offload
         self.conns: Dict[int, _Conn] = {}
         self.done: deque = deque()
+
+    make_listener = staticmethod(make_listener)
 
     def start(self):
         # threads=0: requests run inline on the loop (no GIL handoffs), except offloaded ones on one helper thread
@@ -95,13 +114,20 @@ class RawSocketHttpServer:
         self.efd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
         lfd = self.listener.fileno()
         # EPOLLEXCLUSIVE: with several workers on one listener, a new connection wakes only one of them
-        self.ep.register(lfd, select.EPOLLIN | select.EPOLLEXCLUSIVE)
+        self.ep.register(lfd, select.EPOLLIN | _EPOLLEXCLUSIVE)
         self.ep.register(self.efd, select.EPOLLIN)
         if not self.inline:
+            self.pipes = ()
+            self.read_pipes = ()
+            self.write_pipe = None
             self.pipeline = None
-        pipe, self.pfd, self.pfd_mask = self.pipeline, -1, 0
-        if pipe is not None:
-            self._watch_pipeline(False)
+        if any(hasattr(p, "attach") for p in self.pipes):
+            raise SystemExit("Error: this DB_DRIVER's pipelines run on asyncio: use HTTP_SERVER=uvloop")
+        self.pfd_map = {}  # fd -> PgPipeline
+        self.pipe_state = {}  # id(pipe) -> (fd, mask)
+        self.dirty_pipes = set()
+        for p in self.pipes:
+            self._watch_pipe(p, False)
         print(
             f"Raw socket server (pid {os.getpid()}) running on port {self.listener.getsockname()[1]}...",
             flush=True,
@@ -109,15 +135,19 @@ class RawSocketHttpServer:
 
         parent = os.getppid()
         next_sweep = time.monotonic() + self.SWEEP_EVERY
-        conns, efd = self.conns, self.efd
+        conns, efd, pfd_map, dirty_pipes = self.conns, self.efd, self.pfd_map, self.dirty_pipes
         while True:
             for fd, mask in self.ep.poll(self.SWEEP_EVERY):
                 if fd == lfd:
                     self._accept()
                 elif fd == efd:
                     self._completions()
-                elif fd == self.pfd:
-                    self._pipeline_ready()
+                elif fd in pfd_map:
+                    p = pfd_map[fd]
+                    if mask & select.EPOLLOUT:
+                        dirty_pipes.add(p)
+                    if mask & (select.EPOLLIN | select.EPOLLHUP | select.EPOLLERR):
+                        self._pipeline_ready(p)
                 else:
                     conn = conns.get(fd)
                     if conn is None:
@@ -126,8 +156,10 @@ class RawSocketHttpServer:
                         self._flush(conn)
                     if mask & (select.EPOLLIN | select.EPOLLHUP | select.EPOLLERR) and conn.sock:
                         self._read(conn)
-            if pipe is not None:  # one flush per pass: what this pass submitted goes out together
-                self._watch_pipeline(pipe.flush())
+            if dirty_pipes:  # one flush per pass per active pipeline: what this pass submitted goes out together
+                for p in tuple(dirty_pipes):
+                    dirty_pipes.discard(p)
+                    self._watch_pipe(p, p.flush())
             now = time.monotonic()
             if now >= next_sweep:
                 next_sweep = now + self.SWEEP_EVERY
@@ -162,6 +194,32 @@ class RawSocketHttpServer:
             self._close(conn)
             return
         conn.last = time.monotonic()
+        if (
+            self.inline
+            and not conn.inbuf
+            and not conn.busy
+            and data[:4] == b"GET "
+            and data.endswith(b"\r\n\r\n")
+            and data.find(b"\r\n\r\n") == len(data) - 4
+            and b"close" not in data
+            and b"Close" not in data
+            and b"CLOSE" not in data
+            and b"ength:" not in data
+            and b"ENGTH:" not in data
+        ):
+            if self.pipeline is None:
+                self._send(conn, self._respond(data, False))
+                return
+            try:
+                out = self.dispatch(self.parse(data))
+            except Exception:
+                out = _BAD_REQUEST
+            out = self._await(conn, out, False)
+            if out is None:
+                conn.busy = True
+            else:
+                self._send(conn, out)
+            return
         conn.inbuf += data
         if len(conn.inbuf) > self.MAX_BUFFER:
             self._close(conn)
@@ -180,22 +238,30 @@ class RawSocketHttpServer:
             return  # wait for the rest of the headers
 
         head = bytes(buf[: end + 4])
-        lower = head.lower()
         content_length = 0
-        i = lower.find(b"\r\ncontent-length:")
-        if i != -1:
-            j = lower.find(b"\r\n", i + 2)
-            try:
-                content_length = max(0, int(lower[i + 17 : j]))
-            except ValueError:
-                content_length = 0
+        if head[:4] != b"GET " or b"ength:" in head or b"ENGTH:" in head:
+            lower = head.lower()
+            i = lower.find(b"\r\ncontent-length:")
+            if i != -1:
+                j = lower.find(b"\r\n", i + 2)
+                try:
+                    content_length = max(0, int(lower[i + 17 : j]))
+                except ValueError:
+                    content_length = 0
+        else:
+            lower = None
         total = end + 4 + content_length
         if len(buf) < total:
             return  # body not fully received yet
 
         raw = bytes(buf[:total])
         del buf[:total]
-        keep_close = b"connection: close" in lower
+        if b"close" in head or b"Close" in head or b"CLOSE" in head:
+            if lower is None:
+                lower = head.lower()
+            keep_close = b"connection: close" in lower
+        else:
+            keep_close = False
         if self.inline and not (self.offload and self._route_key(head) in self.offload):
             # inline: this worker's loop thread runs the handler itself
             if keep_close:
@@ -204,7 +270,7 @@ class RawSocketHttpServer:
                 self._send(conn, self._respond(raw, keep_close))
                 return True
             try:
-                out = self.dispatch(parse_request(raw))
+                out = self.dispatch(self.parse(raw))
             except Exception:
                 out = _BAD_REQUEST
             out = self._await(conn, out, keep_close)
@@ -244,41 +310,67 @@ class RawSocketHttpServer:
             pass
 
     # ---- Postgres pipeline (inline only) -----------------------------------
+    def _pick_pipe(self, query):
+        if getattr(query, "write", False):
+            return self.write_pipe
+        pipes = self.read_pipes
+        if len(pipes) == 1:
+            return pipes[0]
+        p0, p1 = pipes[0], pipes[1]
+        if len(pipes) == 2:
+            return p0 if len(p0.inflight) <= len(p1.inflight) else p1
+        return min(pipes, key=lambda p: len(p.inflight))
+
     def _await(self, conn: _Conn, out, keep_close: bool) -> Optional[bytes]:
         """Response bytes once the handler is done, or None after submitting the query it now waits on."""
         while out.__class__ is tuple:
             handler, query = out
+            pipe = self._pick_pipe(query)
             try:
-                self.pipeline.submit(query, (conn, handler, keep_close))
+                pipe.submit(query, (conn, handler, keep_close))
+                self.dirty_pipes.add(pipe)
                 return None
             except Exception as e:  # Postgres unreachable: the handler sees the error at its `yield`
                 out = self.resume(handler, None, e)
         return out
 
-    def _pipeline_ready(self):
-        for (conn, handler, keep_close), value, error in self.pipeline.ready():
+    def _pipeline_ready(self, pipe):
+        results = pipe.ready()
+        if pipe.fileno() == -1:  # connection lost: drop its old fd now, before a new client can be given that number
+            self._watch_pipe(pipe, False)
+        for (conn, handler, keep_close), value, error in results:
             out = self._await(conn, self.resume(handler, value, error), keep_close)
             if out is not None:
                 self._complete(conn, _closing(out) if keep_close else out, keep_close)
 
-    def _watch_pipeline(self, want_write: bool):
+    def _watch_pipe(self, pipe, want_write: bool):
         """Keep the pipeline's socket registered (its fd changes on reconnect), for writes too while libpq has
         unsent bytes."""
-        fd = self.pipeline.fileno()
+        fd = pipe.fileno()
         mask = _IN_OUT if want_write else _IN
-        if fd == self.pfd and mask == self.pfd_mask:
-            return
-        if fd != self.pfd:
-            if self.pfd >= 0:
-                try:
-                    self.ep.unregister(self.pfd)
-                except OSError:
-                    pass  # closed with the old connection
+        pid = id(pipe)
+        old = self.pipe_state.get(pid)
+        if old is not None:
+            old_fd, old_mask = old
+            if fd == old_fd and mask == old_mask:
+                return
+            if fd != old_fd:
+                if old_fd >= 0:
+                    self.pfd_map.pop(old_fd, None)
+                    try:
+                        self.ep.unregister(old_fd)
+                    except OSError:
+                        pass  # closed with the old connection
+                if fd >= 0:
+                    self.pfd_map[fd] = pipe
+                    self.ep.register(fd, mask)
+            elif fd >= 0:
+                self.ep.modify(fd, mask)
+        else:
             if fd >= 0:
+                self.pfd_map[fd] = pipe
                 self.ep.register(fd, mask)
-        elif fd >= 0:
-            self.ep.modify(fd, mask)
-        self.pfd, self.pfd_mask = fd, mask
+        self.pipe_state[pid] = (fd, mask)
 
     def _send(self, conn: _Conn, payload: bytes):
         if conn.outbuf:
@@ -334,7 +426,7 @@ class RawSocketHttpServer:
     # ---- pool threads ------------------------------------------------------
     def _respond(self, raw: bytes, keep_close: bool) -> bytes:
         try:
-            response = self.dispatch_sync(parse_request(raw))
+            response = self.dispatch_sync(self.parse(raw))
         except Exception:
             response = _BAD_REQUEST
         return _closing(response) if keep_close else response

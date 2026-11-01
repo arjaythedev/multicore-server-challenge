@@ -233,6 +233,34 @@ class JsonWriterTest {
     }
 
     @Test
+    fun textArraysSortedByBytes() {
+        val many = (0 until 40).map { "t" + (39 - it).toString().padStart(2, '0') }
+        val row = rowOf(
+            textArrayBytes(listOf("zz", "dragons", "a\"b", "é", "Z", "", "dragon")),
+            textArrayBytes(listOf("x", null, "a")),
+            textArrayBytes(listOf("only")),
+            textArrayBytes(null),
+            textArrayBytes(many),
+        )
+        assertEquals(
+            // unsigned bytes: "" < "Z" < "a\"b" < "dragon" < "dragons" < "zz" < "é" (0xC3)
+            """[["","Z","a\"b","dragon","dragons","zz","é"],[null,"a","x"],["only"],[]]""",
+            json {
+                beginArray()
+                textArray(row, 0, sortBytes = true)
+                textArray(row, 1, sortBytes = true)
+                textArray(row, 2, sortBytes = true)
+                textArray(row, 3, sortBytes = true)
+                endArray()
+            },
+        )
+        assertEquals(
+            many.sorted().joinToString(",", "[", "]") { "\"$it\"" },
+            json { textArray(row, 4, sortBytes = true) },
+        )
+    }
+
+    @Test
     fun twoDimensionalTextArrayIsFlattened() {
         val b = ByteBuf()
         b.putIntBE(2); b.putIntBE(0); b.putIntBE(25)
@@ -240,5 +268,54 @@ class JsonWriterTest {
         for (s in listOf("a", "b", "c", "d")) { b.putIntBE(1); b.put(s.encodeToByteArray()) }
         val row = rowOf(b.toByteArray())
         assertEquals("""["a","b","c","d"]""", json { textArray(row, 0) })
+    }
+
+    /** The 8-bytes-per-step scan must find every byte that needs an escape, at every offset of a long run. */
+    @Test
+    fun longRunsEscapeLikeTheByteLoop() {
+        val hex = "0123456789abcdef"
+        fun reference(bytes: ByteArray): String {
+            val sb = StringBuilder("\"")
+            for (x in bytes) {
+                val c = x.toInt() and 0xFF
+                when {
+                    c == '"'.code -> sb.append("\\\"")
+                    c == '\\'.code -> sb.append("\\\\")
+                    c == '\n'.code -> sb.append("\\n")
+                    c == '\r'.code -> sb.append("\\r")
+                    c == '\t'.code -> sb.append("\\t")
+                    c < 0x20 -> sb.append("\\u00").append(hex[c shr 4]).append(hex[c and 15])
+                    else -> sb.append(c.toChar())
+                }
+            }
+            return sb.append('"').toString()
+        }
+        fun latin(b: ByteArray) = b.joinToString("") { (it.toInt() and 0xFF).toChar().toString() }
+        // every byte value at every position of a 24-byte run of plain text, with the run at offsets 0..8
+        for (v in 0 until 256) {
+            for (pos in 0 until 24) {
+                for (off in 0..8) {
+                    val bytes = ByteArray(24) { ('a'.code + it % 26).toByte() }
+                    bytes[pos] = v.toByte()
+                    val src = ByteArray(off) + bytes + ByteArray(5)
+                    val out = ByteBuf(1)
+                    JsonWriter(out).string(src, off, bytes.size)
+                    assertEquals(reference(bytes), latin(out.toByteArray()), "byte $v at $pos, offset $off")
+                }
+            }
+        }
+        // random mixes of plain ASCII, UTF-8 high bytes and escapes
+        val r = Random(99)
+        val alphabet = byteArrayOf(
+            'a'.code.toByte(), 'Z'.code.toByte(), ' '.code.toByte(), '"'.code.toByte(), '\\'.code.toByte(), 0, 1,
+            0x1F, 0x7F, 0x80.toByte(), 0xC3.toByte(), 0xFF.toByte(), '\n'.code.toByte(),
+        )
+        repeat(2000) {
+            val n = r.nextInt(0, 100)
+            val bytes = ByteArray(n) { if (r.nextInt(10) < 7) 'x'.code.toByte() else alphabet[r.nextInt(alphabet.size)] }
+            val out = ByteBuf(1)
+            JsonWriter(out).string(bytes, 0, n)
+            assertEquals(reference(bytes), latin(out.toByteArray()))
+        }
     }
 }

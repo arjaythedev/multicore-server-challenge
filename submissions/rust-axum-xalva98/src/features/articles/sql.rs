@@ -169,17 +169,23 @@ pub const BY_ID: &str = concat!(
     " FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id = $2"
 );
 
-pub const INSERT: &str = concat!(
-    "INSERT INTO articles (id, slug, author_id, title, description, body)
-     SELECT n.id, ",
+/// The article, its new tags and the links in one statement. `DO UPDATE` returns the id of a tag that exists, even one
+/// another writer committed a moment ago, so every tag in the list is linked. A new article has no favorites.
+pub const CREATE: &str = concat!(
+    "WITH n AS (SELECT nextval(pg_get_serial_sequence('articles', 'id')) AS id),
+          a AS (INSERT INTO articles (id, slug, author_id, title, description, body)
+                SELECT n.id, ",
     slugify!("$2"),
-    " || '-' || n.id, $1, $2, $3, $4
-       FROM (SELECT nextval(pg_get_serial_sequence('articles', 'id')) AS id) n
-     RETURNING id"
+    " || '-' || n.id, $1, $2, $3, $4 FROM n
+                RETURNING id, slug, title, description, body, created_at, updated_at, author_id),
+          t AS (INSERT INTO tags (name) SELECT DISTINCT unnest($5::text[])
+                ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id, name),
+          linked AS (INSERT INTO article_tags (article_id, tag_id) SELECT a.id, t.id FROM a, t)
+     SELECT a.slug, a.title, a.description, a.body, a.created_at, a.updated_at,
+            ARRAY(SELECT t.name FROM t ORDER BY t.name) AS tag_list, 0::bigint AS favorites_count, false AS favorited, ",
+    author!(),
+    " FROM a JOIN users u ON u.id = a.author_id"
 );
-pub const INSERT_TAGS: &str = "INSERT INTO tags (name) SELECT DISTINCT unnest($1::text[]) ON CONFLICT (name) DO NOTHING";
-pub const LINK_TAGS: &str =
-    "INSERT INTO article_tags (article_id, tag_id) SELECT $1, t.id FROM tags t WHERE t.name = ANY($2::text[])";
 
 /// Only the author's own article changes; the row names the author so a stranger gets 403, not 404.
 pub const UPDATE: &str = concat!(

@@ -20,7 +20,12 @@ HTTP/1.1 server and the Postgres wire protocol (SCRAM-SHA-256, extended query) a
 
 Required environment: `DATABASE_URL`, `JWT_SECRET`. Optional: `HOST` (default `127.0.0.1`), `PORT` (`3000`),
 `APP_THREADS` (`min(ceil(cores/4), 8)`), `DB_READ_CONNS` (read connections per worker, `3`), `BCRYPT_THREADS`
-(`ceil(cores/8)`), `WRITE_BATCH_US` (group-commit wait when a single write is pending, `1000`; `0` = none),
+(`min(ceil(cores/4), 2)`: one main thread and a helper), `WRITE_BATCH_US` (group-commit wait when a single write is pending, `1000`; `0` = none),
+`BCRYPT_BATCH_MS` (how long fewer than 6 queued logins wait for more to share a bcrypt run, `150`; `0` = none),
+`READ_BATCH_MS` (how long the oldest queued read waits for more reads to join its batch, default `0` = none),
+`READ_SHARE_PCT` (an article-by-slug batch uses the shared statement when its distinct slugs are at most
+`pct`% of its jobs, `100`),
+`SCHED_BATCH` (every thread runs under the `SCHED_BATCH` scheduling policy, `1`; `0` = the default policy),
 `HTTP_GZIP` (`0` never, `1` always, unset = adaptive). Postgres connections total `APP_THREADS * (DB_READ_CONNS + 1)` and must be at most 95 (startup fails otherwise); on 8 cores that is 2 * 4 = 8. `GET /api/tags` returning 200 is the health check and answers within 60 s of `start.sh`.
 
 ## How it works
@@ -41,10 +46,11 @@ Required environment: `DATABASE_URL`, `JWT_SECRET`. Optional: `HOST` (default `1
   extended-query protocol. Statements are prepared once per connection.
 - **Read batching** (`readb.s`, `readr.s`; a port of the Rust `read_batch.rs`): each read joins a per-family
   queue shared by all workers, as Rust's queues are shared by its tasks; whenever a read connection is idle it
-  takes the oldest family's queued jobs (up to 512) and runs them as one statement whose parameters are arrays,
-  the same SQL text as Rust. A lone job runs its own statement. Lists, and article / comment reads with repeated
-  slugs, use Rust's shared ("packed") forms and are rendered from the shared rows by `readr.s`; tags run once for
-  every waiter. If a batch fails, each job is retried on its own. A batch can hold other workers' jobs: their
+  takes the oldest family's queued jobs (up to 512) and runs them as one statement whose parameters are arrays.
+  The oldest family is left to gather until its first job has waited `READ_BATCH_MS` (or 512 jobs are queued);
+  the worker's `epoll_wait` times out at that deadline. A lone job runs its own statement. Lists and articles by
+  slug use Rust's shared ("packed") forms, comments do when each slug is asked at least twice on average, and
+  they are rendered from the shared rows by `readr.s`; tags run once for every waiter. If a batch fails, each job is retried on its own. A batch can hold other workers' jobs: their
   reply bytes are copied once into a reference-counted block, and each job is handed back to its own worker on a
   lock-free stack (the way bcrypt results come back), which renders and sends it, so client sockets, gzip and
   allocations stay with their worker. A block freed on another worker goes back to the worker that allocated it.
@@ -52,10 +58,15 @@ Required environment: `DATABASE_URL`, `JWT_SECRET`. Optional: `HOST` (default `1
 - **Writes** use durable group commit on the worker's write connection (`writer.s`, a port of the Rust
   `writer.rs`): up to 128 queued writes run as one pipelined `BEGIN` … `COMMIT`, and each reply is released only
   after the `COMMIT` returns. If a statement fails, the group has rolled back, so every write in it is retried
-  on its own; a failed `COMMIT` is never retried. Each execution takes one `READ COMMITTED` snapshot; nothing is cached across requests.
+  on its own; a failed `COMMIT` is never retried. Consecutive favorites, unfavorites, follows, unfollows or new
+  comments in a group run as one statement over arrays of their parameters (new comment ids are drawn in request
+  order), and its rows are split back per request. Each execution takes one `READ COMMITTED` snapshot; nothing is cached across requests.
 - **bcrypt** (`bcrypt.s`, `bcq.s`): password hashing/verification runs on dedicated thread(s) at cost 10. Each
   batch takes up to 6 queued jobs of the oldest job's kind and runs them as one interleaved 6-lane call (Rust
-  batches up to 5). A job that waits more than 8 s before starting is shed with a 503, matching the Rust reference.
+  batches up to 5). With fewer than 6 queued, the thread waits until the oldest has waited `BCRYPT_BATCH_MS`
+  (150 ms) for more to arrive. When 6 or more jobs are still queued behind the batch it is about to run, the
+  main bcrypt thread hands the oldest 6 to an idle helper thread. A job that waits more than 8 s before starting
+  is shed with a 503, matching the Rust reference.
 - **gzip** (`gzip.s`, `egress.s`): as in Rust, a response body of at least 1024 bytes is gzipped when the client
   accepts gzip and the adaptive controller (a port of Rust's `egress`) says so, i.e. only while the box is sending
   over 100 MB/s with TCP retransmits, and kept only if smaller. Each worker has its own compressor state.
@@ -72,8 +83,8 @@ Required environment: `DATABASE_URL`, `JWT_SECRET`. Optional: `HOST` (default `1
 About two thirds of the server-side CPU (app plus Postgres) goes to Postgres, so the plan was: send Postgres
 exactly the work the Rust entry sends it, and spend less CPU on everything else.
 
-- **Same SQL, same batching.** The batched reads, group commit and gzip controller are ports of the Rust entry's,
-  with the same SQL text. Both servers pass the same 197 conformance checks, and the read responses were diffed
+- **Same SQL, same batching (as first submitted).** The batched reads, group commit and gzip controller are ports
+  of the Rust entry's, with the same SQL text. Both servers pass the same 197 conformance checks, and the read responses were diffed
   against Rust's (2,033 distinct reads, 0 differences). Postgres does the same work per request for both, so the
   difference comes down to how cheap the app side is.
 - **No runtime.** No libc, no async runtime, no allocator library: one epoll loop per worker thread, a size-class
@@ -88,14 +99,79 @@ exactly the work the Rust entry sends it, and spend less CPU on everything else.
   below), and at saturation on the same box the two were within 1% (one pair, 51.5k against 52.1k req/s).
 - **6-lane bcrypt.** Login is the one CPU-heavy endpoint: every hash is cost 10. The bcrypt thread runs up to 6
   queued jobs as one interleaved call. Six independent Blowfish states hide each other's table-lookup latency,
-  so a batch of 6 costs 13.3 ms per hash against 14.6 ms with 5 lanes. At 8k users the login p50 was 62 ms against
-  Rust's 185 ms, and with only login traffic it served 74.6 logins/s against Rust's 70.5.
-- **One bcrypt thread.** A second bcrypt thread raised the overall p95 from 14 to 48 ms, because it takes a core
-  from the workers and Postgres. The 8 s shed rule for queued logins is the Rust entry's.
+  so a batch of 6 costs 12.4 ms per hash against 13.7 ms with 5 lanes and 15.8 ms with 4. A round takes the
+  four S-box indexes out of one copy of the lane (one high-byte read, two shifts, two zero-extends): 12
+  instructions per lane and round instead of 14, which made a hash 5% cheaper on an idle core and 10-12% cheaper
+  while the other hyperthread of the core runs a memory-bound loop. That is the usual case under load: the hash
+  costs about 2.5x its idle time next to a busy sibling.
+- **Waiting to fill the lanes.** At 150,000 users logins arrive at about 40/s. Run as they come, the faster
+  hash only shortened the queue: the thread stayed 97-98% busy on 1- to 5-lane runs. Waiting up to 150 ms for 6
+  jobs brought it to 89% (the rest of the core goes to the workers and Postgres), at a login p50 of 246 ms.
+  Once logins queue 6 deep on their own the wait never starts, and the faster hash is the whole gain.
+- **A helper bcrypt thread for backlogs only.** A second bcrypt thread that took jobs as they came raised the
+  overall p95 from 14 to 48 ms: it split the queue into smaller, costlier batches and took a core from the
+  workers and Postgres all the time. But one thread caps logins: on a 5-core box at 165,000 users logins waited
+  3.6-4.9 s at p95. Now the helper sleeps until a full 6-job batch is waiting behind the running one, and then
+  runs that batch. On the same box and load, login p95 went from 3.4-5.1 s to 0.41 s (two runs each) with no
+  login errors either way. The 8 s shed rule for queued logins is the Rust entry's.
+- **Feed SQL.** The feed statement is #124's, with the window below read lazily. For the followees that two or
+  more viewers in a feed batch share (up to 20), the batch reads once the newest `take` article ids of each, where
+  `take` is the largest offset + limit among the viewers who follow them. A viewer's cutoff is the highest of its
+  shared followees' (offset + limit)-th newest ids: that author alone has that many articles at or above it, so
+  the page can't hold an older article, and the viewer's walk over its followees' articles stops there. The capped
+  count is 1000 when one of those followees has 1000 or more articles and otherwise one `LIMIT 1000` scan, and
+  `enable_memoize` is off for the session.
+- **Recent feeds from one window.** When a viewer's cutoff from those shared followees falls among the newest
+  32 × (batch size) article ids (at most 2,048, and only in batches of 32 or more), the batch reads the newest
+  articles once and takes the viewer's page from them; other viewers keep the walk over their followees. #124
+  reads the whole window; this reads it only down to the lowest cutoff that uses it. Replayed on real captured
+  batches, with identical rows, the feed statement took 3% less time than #124's and 4-7% less than ours before it.
+- **Shared reads where keys repeat.** Article-by-slug batches always use the shared statement, which reads each
+  slug once (14% less Postgres time for that family, measured with a 20 ms wait). Comments keep Rust's rule
+  (shared only when each slug is asked at least twice on average): a thread has about 1.5 comments, and the shared
+  form cost 15% more when slugs did not repeat. Its shared form looks up the viewer's follows only among each
+  article's own commenters. The per-request form checks each commenter with one `EXISTS` probe on `follows`
+  rather than building the viewer's whole followee array (identical rows on replayed batches),
+  and the shared article-by-slug form aggregates the tag names of the batch's articles in one pass.
+- **Fewer lookups in the author and favorited lists.** An author list has one author, so whether the viewer follows
+  them is one `follows` probe per request instead of one per row. Both lists find the viewer's favorites on the page
+  with one `favorites` probe (`user_id` = the viewer and `article_id = ANY(page)`), and the favorited list checks
+  the follows of the page's distinct authors with one probe, as #124's author list does. Comment rows carry
+  `updated_at` only when it differs from `created_at`. On replayed batches, with identical rows, that is 3.9% less
+  time for the author list, 1.6% for the favorited list and 3-8% for comments. At 150,000 users on 5 vCPUs (120 s
+  holds in two interleaved before/after/after/before blocks), p95 went from 63 to 55 ms and from 50 to 45 ms, with
+  0.6-0.7% less Postgres time.
+- **Where it counts.** These SQL changes matter most once the box is out of CPU. With the target held to 5 vCPUs
+  at 165,000 users (aged database, 120 s holds, two runs each, interleaved), the previous build failed on p95
+  (617 and 566 ms, p99 751 and 690) at 40.0-40.5k req/s, and this one passed (p95 353 and 359, p99 479 and 462) at
+  41.9k req/s; the feed's p95 went from 723-786 ms to 492-514. On a second box of the same type, also held to
+  5 vCPUs, a build with them passed a scored-length hold (60 s ramp, 300 s measured, warm cache) at 170,000 users:
+  43,860 req/s, p95 252 ms, p99 377 ms, no errors.
+- **`SCHED_BATCH`.** At startup, before any thread starts, the process puts itself under the `SCHED_BATCH`
+  scheduling policy, which every thread inherits. It needs no privileges, it is set in-process, and
+  `SCHED_BATCH=0` turns it off. A worker woken by epoll or a futex then no longer preempts a running Postgres
+  backend: it runs when that backend blocks or its time slice ends, and finds more work waiting. On the same
+  code with and without it (150,000 users, 5 vCPUs, four 120 s holds each, interleaved), the workers used 15%
+  less CPU, Postgres time was 5% lower, and p95 went from 89 to 63 ms (p99 128 to 94). The bcrypt threads used
+  about 10% more CPU, and logins were slightly faster (p95 322-341 ms against 339-366).
+- **Both, in scored-length holds.** The list changes and `SCHED_BATCH` together, against the build before them,
+  on another box held to 5 vCPUs (60 s ramp, 300 s measured, warm cache, builds interleaved; every hold passed
+  with no errors). At 170,000 users p95 went from 152 and 141 ms to 116 and 138 (p99 250 and 237 to 188 and 230)
+  with 4% less Postgres time, and at 180,000 users from 233 and 230 ms to 227 and 204 (p99 346 and 355 to 339 and
+  311) with 2% less. At 190,000 users this build served 48.6k req/s at p95 303 ms and p99 432 (one hold), the
+  build before them 47.8k and 47.4k at p95 399 and 432, p99 539 and 566.
+- **Waiting to fill read batches: off by default.** `READ_BATCH_MS` lets the oldest family's queue gather until
+  its first job is that old, so batches are bigger and share more. While the box has CPU to spare it saves a lot:
+  at 150,000 users on 8 vCPUs, total Postgres execution time per hold went from 950 s to 816 s at 20 ms and box
+  idle from 3% to 10%, for a p95 of 80 ms instead of 45. But once the box is over capacity the queues fill on
+  their own while every read still waits the extra time: on the 5-vCPU setup above, p95 was 350 ms with no wait,
+  362 ms at 20 ms and 435 ms at 40 ms, for only 4-5% less Postgres time. The score is decided in that regime, so
+  the wait is off.
 
 ## Measurements
 
-These are not official scores. Closest to the official run: an AWS c7i.2xlarge target (8 vCPUs, Xeon 8488C,
+These are not official scores, and they are for the builds in PR #82; the changes since were
+measured on the 5-vCPU setup in the sections above. Closest to the official run: an AWS c7i.2xlarge target (8 vCPUs, Xeon 8488C,
 15.7 GB) set up with the repo's `box/setup-box.sh`, the full seed, and the repo's `conduit-loadgen` on a separate
 c7i.4xlarge over the target's four addresses, at its default think time. Each run starts from a fresh database
 that is first aged by 128,000 users for 300 s (the official search reaches high loads on a database its earlier
@@ -113,7 +189,7 @@ Rust is the same entry as below, on the same boxes in the same session.
 All four pass. The first two rows were each run twice; the repeats were within 1.2 ms on p95 and 5.2 ms on
 p99. Both use six read connections and the same Postgres CPU; with two workers every read endpoint's p50 and p95
 were 5-13% lower. About 90% of the errors are logins: about 28% of them (22% for Rust)
-wait 8 s for the one bcrypt thread and are shed with a 503, but logins are about 0.1% of the requests. The rest
+wait 8 s for the bcrypt thread (one, in that build) and are shed with a 503, but logins are about 0.1% of the requests. The rest
 are about 450 reads per run that hit the load generator's 10 s timeout, about the same for Rust. The process's
 memory stayed flat (135-138 MB with two workers) through the measured window.
 
@@ -162,6 +238,11 @@ both servers, which the warm-up keeps out of the scored window.
   (#7) and cknutson12's rust-hyper submission (#1), both MIT-licensed. As that entry's README credits them, the
   per-family read queue comes from #22 (its batch cap from #52), the shared list/article SQL from #32, and the
   feed's cap for authors with 1000+ articles from #61.
+- The optional read gather wait follows #103 (gichamba, 20 ms) and #117 (nick-potts, a 20 ms drain gap).
+- The feed statement and the lists' `= ANY` favorite and follow probes are #124's (dennisimoo), which credits the
+  feed cutoff from the most-shared followees to #102 and the per-viewer `= ANY` probes to #53, #47 and #95.
+- Merging same-type writes into one statement and giving logins more than one bcrypt thread follow #105
+  (theCatWisel).
 - bcrypt follows OpenBSD/Openwall crypt_blowfish.
 - gzip.s: deflate design and parameters follow libdeflate (Copyright 2016 Eric Biggers, 2024 Google LLC; MIT
   license). The PCLMULQDQ CRC32 is translated from Chromium zlib's crc32_sse42_simd_ (Copyright 2017 The Chromium
@@ -184,8 +265,8 @@ src/
   defs.inc  cross-module constants               app.inc   app struct layouts + macros
 ```
 
-Validation: the repo's 197 conformance checks pass on this build and on builds with AVX-512, AVX2, BMI2 and SHA-NI
-each switched off (the server picks code paths with CPUID at startup), and responses were diffed byte for byte
-against Rust's (logins, reads, concurrent reads, writes, reads after writes: 0 differences). Each module was also
+Validation: the repo's 197 conformance checks pass on this build, also with `SCHED_BATCH=0`. The first submitted
+build also passed them with AVX-512, AVX2, BMI2 and SHA-NI each switched off (the server picks code paths with
+CPUID at startup), and its responses were diffed byte for byte against Rust's (logins, reads, concurrent reads, writes, reads after writes: 0 differences). Each module was also
 tested on its own against reference implementations (Python's hashlib/hmac for SHA-256/HMAC/JWT, the Rust
 `bcrypt` crate, zlib for gzip output); those harnesses are not part of this folder.

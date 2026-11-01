@@ -1,7 +1,6 @@
 //! SQL for articles. Named statements, no business rules (see `service.rs`).
 
 use tokio_postgres::types::Type;
-use tokio_postgres::Client;
 
 use super::model::{ArticleChanges, ArticleRow, ListFilter, ListedRow, NewArticle, OwnerRow};
 use super::sql;
@@ -26,13 +25,12 @@ static BY_SLUG: Stmt = Stmt { sql: sql::BY_SLUG, types: &[Type::INT8, Type::TEXT
 static BY_ID: Stmt = Stmt { sql: sql::BY_ID, types: &[Type::INT8, Type::INT8] };
 static UPDATE_OWN: Stmt = Stmt { sql: sql::UPDATE, types: &[Type::TEXT, Type::INT8, Type::TEXT, Type::TEXT, Type::TEXT] };
 static DELETE_OWN: Stmt = Stmt { sql: sql::DELETE, types: &[Type::TEXT, Type::INT8] };
-static INSERT: Stmt = Stmt { sql: sql::INSERT, types: &[Type::INT8, Type::TEXT, Type::TEXT, Type::TEXT] };
-static INSERT_TAGS: Stmt = Stmt { sql: sql::INSERT_TAGS, types: &[Type::TEXT_ARRAY] };
-static LINK_TAGS: Stmt = Stmt { sql: sql::LINK_TAGS, types: &[Type::INT8, Type::TEXT_ARRAY] };
+static CREATE: Stmt =
+    Stmt { sql: sql::CREATE, types: &[Type::INT8, Type::TEXT, Type::TEXT, Type::TEXT, Type::TEXT_ARRAY] };
 
 pub(crate) static STATEMENTS: &[&Stmt] = &[
     &LIST_ALL, &LIST_TAG, &LIST_AUTHOR, &LIST_FAVORITED, &LIST_FEED, &COUNT_ALL, &COUNT_TAG, &COUNT_AUTHOR,
-    &COUNT_FAVORITED, &COUNT_FEED, &BY_SLUG, &BY_ID, &UPDATE_OWN, &DELETE_OWN,
+    &COUNT_FAVORITED, &COUNT_FEED, &BY_SLUG, &BY_ID, &CREATE, &UPDATE_OWN, &DELETE_OWN,
 ];
 
 /// The count rides in the page statement; only an empty page needs a second statement for it.
@@ -83,25 +81,13 @@ pub async fn by_id(db: &Db, viewer: i64, id: i64) -> Result<Option<ArticleRow>, 
     db.read().opt(&BY_ID, &[&viewer, &id]).await.map_err(AppError::db("article by id"))
 }
 
-/// The article, its new tags and its tag links in one transaction; a tag another writer just created is linked too.
-pub async fn create(db: &Db, author: i64, new: &NewArticle) -> Result<i64, AppError> {
-    let mut c = db.transaction_connection().await?;
-    let r = insert_article(&mut c, author, new).await;
-    c.release(r).map_err(AppError::db("create article"))
-}
-
-async fn insert_article(client: &mut Client, author: i64, new: &NewArticle) -> Result<i64, PgError> {
-    let tx = client.transaction().await?;
-    let insert = tx.prepare_typed(INSERT.sql, INSERT.types).await?;
-    let id: i64 = tx.query_one(&insert, &[&author, &new.title, &new.description, &new.body]).await?.try_get(0)?;
-    if !new.tags.is_empty() {
-        let insert_tags = tx.prepare_typed(INSERT_TAGS.sql, INSERT_TAGS.types).await?;
-        tx.execute(&insert_tags, &[&new.tags]).await?;
-        let link_tags = tx.prepare_typed(LINK_TAGS.sql, LINK_TAGS.types).await?;
-        tx.execute(&link_tags, &[&id, &new.tags]).await?;
-    }
-    tx.commit().await?;
-    Ok(id)
+/// The article and its tags in one statement on the write connections; the row is the article as created.
+pub async fn create(db: &Db, author: i64, new: &NewArticle) -> Result<ArticleRow, AppError> {
+    db.write()
+        .opt(&CREATE, &[&author, &new.title, &new.description, &new.body, &new.tags])
+        .await
+        .map_err(AppError::db("create article"))?
+        .ok_or_else(|| AppError::internal_server_error("create article returned no row"))
 }
 
 /// Changes the article only when `author` wrote it; the row says who did.

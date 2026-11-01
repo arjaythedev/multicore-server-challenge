@@ -3,6 +3,8 @@ package conduit.http
 // HTTP/1.1 request parsing (RFC 9112), in place over the input bytes. Only the headers the server acts on are
 // looked at: Content-Length, Transfer-Encoding, Connection, Expect and Authorization; Host and the rest are skipped.
 
+import conduit.platform.loadLongLE
+
 internal const val MAX_HEAD = 64 * 1024
 internal const val MAX_BODY = 1 shl 20
 
@@ -29,13 +31,28 @@ private val AUTHORIZATION = "authorization".encodeToByteArray()
 private val CONNECTION = "connection".encodeToByteArray()
 private val TRANSFER_ENCODING = "transfer-encoding".encodeToByteArray()
 private val EXPECT = "expect".encodeToByteArray()
+private val ACCEPT_ENCODING = "accept-encoding".encodeToByteArray()
+private val GZIP_TOKEN = "gzip".encodeToByteArray()
 private val CHUNKED = "chunked".encodeToByteArray()
 private val CONTINUE = "100-continue".encodeToByteArray()
 private val CLOSE_TOKEN = "close".encodeToByteArray()
 private val KEEP_ALIVE = "keep-alive".encodeToByteArray()
 
+private const val ONES = 0x0101010101010101L
+private const val HIGHS = -0x7f7f7f7f7f7f7f80L // 0x8080808080808080
+
+/** First index of [c] in b[from, end), or -1. Tests 8 bytes per step (SWAR zero-byte test on x xor c...c). */
 internal fun indexOf(b: ByteArray, c: Byte, from: Int, end: Int): Int {
     var i = from
+    val pattern = (c.toLong() and 0xFF) * ONES
+    while (i + 8 <= end) {
+        val x = loadLongLE(b, i) xor pattern
+        // the lowest flagged byte is exact (a borrow only flags bytes above a real match); little-endian: lowest
+        // byte = lowest address
+        val m = (x - ONES) and x.inv() and HIGHS
+        if (m != 0L) return i + (m.countTrailingZeroBits() ushr 3)
+        i += 8
+    }
     while (i < end) {
         if (b[i] == c) return i
         i++
@@ -49,20 +66,19 @@ internal fun indexOf(b: ByteArray, c: Byte, from: Int, end: Int): Int {
  */
 internal fun headEnd(b: ByteArray, from: Int, end: Int): Int {
     var i = from
-    while (i < end) {
-        if (b[i] == LF) {
-            val n = i + 1
-            if (n >= end) return -1
-            val c = b[n]
-            if (c == LF) return n + 1
-            if (c == CR) {
-                if (n + 1 >= end) return -1
-                if (b[n + 1] == LF) return n + 2
-            }
+    while (true) {
+        i = indexOf(b, LF, i, end)
+        if (i < 0) return -1
+        val n = i + 1
+        if (n >= end) return -1
+        val c = b[n]
+        if (c == LF) return n + 1
+        if (c == CR) {
+            if (n + 1 >= end) return -1
+            if (b[n + 1] == LF) return n + 2
         }
-        i++
+        i = n
     }
-    return -1
 }
 
 /** [b] at [p] equals the lowercase ASCII [lower], ignoring case. Only for letters and '-'. */
@@ -75,6 +91,43 @@ private fun eqToken(b: ByteArray, s: Int, e: Int, lower: ByteArray): Boolean =
     e - s == lower.size && eqLower(b, s, lower)
 
 private fun isWs(c: Byte) = c == SP || c == HT
+
+/**
+ * An Accept-Encoding value b[s, e) lists gzip without q=0 ("gzip", "gzip, deflate", "br;q=1, gzip;q=0.5"). Other
+ * codings and "*" are ignored: we only ever send gzip, and only to clients that name it.
+ */
+private fun acceptsGzip(b: ByteArray, s0: Int, e: Int): Boolean {
+    var s = s0
+    while (s < e) {
+        var t = indexOf(b, ','.code.toByte(), s, e)
+        if (t < 0) t = e
+        var ts = s
+        while (ts < t && isWs(b[ts])) ts++
+        var semi = indexOf(b, ';'.code.toByte(), ts, t)
+        if (semi < 0) semi = t
+        var te = semi
+        while (te > ts && isWs(b[te - 1])) te--
+        if (eqToken(b, ts, te, GZIP_TOKEN)) return !qZero(b, semi, t)
+        s = t + 1
+    }
+    return false
+}
+
+/** Parameters b[s, e) (";q=0", "; q=0.000") give q = 0. */
+private fun qZero(b: ByteArray, s: Int, e: Int): Boolean {
+    val q = indexOf(b, '='.code.toByte(), s, e)
+    if (q < 0) return false
+    var i = q + 1
+    while (i < e && isWs(b[i])) i++
+    if (i >= e || b[i] != '0'.code.toByte()) return false
+    i++
+    if (i < e && b[i] == '.'.code.toByte()) {
+        i++
+        while (i < e && b[i] == '0'.code.toByte()) i++
+    }
+    while (i < e && isWs(b[i])) i++
+    return i == e
+}
 
 /**
  * Parses the head b[start, he) (he from [headEnd]) into [ex]: method, path, query, Authorization, body framing,
@@ -127,7 +180,11 @@ internal fun parseHead(ex: Ex, b: ByteArray, start: Int, he: Int): Int {
                 if (n < 0 || (contentLength >= 0 && contentLength != n)) return 400
                 contentLength = n
             }
-            13 -> if (eqLower(b, p, AUTHORIZATION) && ex.authorization == null) ex.authorization = b.decodeToString(vs, ve)
+            13 -> if (eqLower(b, p, AUTHORIZATION) && ex.authBuf == null) { // the first one counts
+                ex.authBuf = b // zero-copy; [EngineCore] copies it if the request waits for its body
+                ex.authOff = vs
+                ex.authLen = ve - vs
+            }
             10 -> if (eqLower(b, p, CONNECTION)) {
                 var s = vs
                 while (s < ve) {
@@ -151,6 +208,7 @@ internal fun parseHead(ex: Ex, b: ByteArray, start: Int, he: Int): Int {
                 if (!eqToken(b, vs, ve, CONTINUE)) return 417
                 ex.expect = true
             }
+            15 -> if (eqLower(b, p, ACCEPT_ENCODING)) ex.acceptGzip = acceptsGzip(b, vs, ve)
         }
         p = lineEnd + 1
     }

@@ -1,0 +1,18 @@
+[package]
+name = "conduit"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Conduit (RealWorld) API on PostgreSQL: std only, no third-party crates"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+
+[profile.test]
+opt-level = 2

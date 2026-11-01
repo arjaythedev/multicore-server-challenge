@@ -1,0 +1,32 @@
+NOTICE:  database "conduit" does not exist, skipping
+GET /api/user                                   377     37.7     37.7     82.4    105.4    121.3      151    0.00
+POST /api/articles                              301     30.1     79.2    163.5    192.0    235.1      282    0.00
+PUT /api/user                                   137     13.7     47.9     96.2    105.3    141.2      147    0.00
+DELETE /api/articles/:slug/favorite             113     11.3     75.5    134.9    190.3    244.7      245    0.00
+DELETE /api/profiles/:username/follow            93      9.3     45.0     76.9     87.2    122.2      142    0.00
+POST /api/users/login                            79      7.9    597.5    900.6    976.4   1390.6     1524    0.00
+DELETE /api/articles/:slug/comments/:id          28      2.8     36.4     68.3     74.6    109.0      109    0.00
+PUT /api/articles/:slug                           9      0.9     72.9    114.3    244.4    244.4      244    0.00
+POST /api/users                                   2      0.2    577.0    809.5    809.5    809.5      809    0.00
+ALL                                           69742   6974.2     46.2     95.4    117.3    190.8     1524    0.00
+mix: 1.86 calls/page, 2.325 req/s per user, 4.9% writes, 37505 page views
+box 0 (DESKTOP-MTLQ7TM): 3000 users, CPU avg 50% max 52%, loadgen proc 26%, RSS peak 108 MB, 3000 TCP connects, behind=false
+verdict: PASS   [p95 < 500 ms, p99 < 1000 ms, errors < 1%]
+lg_limited: no
+box cpu-seconds: postgres 36 app 17 total 53; peak mem 3071 MB; oom 0
+ calls |  ms   | mean  | blk_per_call |  blks   |                                                       q                                                        
+-------+-------+-------+--------------+---------+----------------------------------------------------------------------------------------------------------------
+  5914 | 26509 | 4.482 |          320 | 1894244 | WITH r AS MATERIALIZED ( SELECT *, CASE WHEN t = $6 THEN v ELSE $7 END AS kv FROM unnest($1::int8[], $2::int8[
+ 25100 | 17576 | 0.700 |           22 |  576789 | SELECT c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image, EXISTS (SELECT $3 FROM follows fo
+  5914 | 13134 | 2.221 |          145 |  858321 | WITH p AS (SELECT x.v, array_agg(x.a) AS aa FROM unnest($1::int8[], $2::int8[]) x(a, v) GROUP BY x.v) SELECT p
+  5914 | 10410 | 1.760 |          560 | 3313864 | WITH d AS MATERIALIZED (SELECT DISTINCT unnest($1::int8[]) AS id), tg AS MATERIALIZED ( SELECT at.article_id, 
+  1564 |  3889 | 2.487 |           31 |   48793 | WITH a AS (SELECT id FROM articles WHERE slug = $1), c AS (INSERT INTO comments (article_id, author_id, body) 
+ 24550 |  3247 | 0.132 |           56 | 1398984 | SELECT name FROM tags ORDER BY name
+  5914 |  1227 | 0.207 |           31 |  185695 | WITH p AS (SELECT x.v, array_agg(x.a) AS aa FROM unnest($1::int8[], $2::int8[]) x(a, v) GROUP BY x.v) SELECT p
+  2587 |   647 | 0.250 |           30 |   78702 | SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at, ARRAY(SELECT (SELECT t.name F
+ 25100 |   609 | 0.024 |            4 |  100400 | SELECT id FROM articles WHERE slug = $1
+  2390 |   478 | 0.200 |           27 |   64918 | INSERT INTO favorites (user_id, article_id) SELECT $1, a.id FROM articles a WHERE a.slug = $2 ON CONFLICT DO N
+   187 |   420 | 2.244 |            9 |    1810 | WITH u AS (SELECT id, username, bio, image FROM users WHERE username = $2), f AS (DELETE FROM follows fo USING
+   331 |   350 | 1.058 |           61 |   20439 | WITH a AS ( INSERT INTO articles (id, slug, author_id, title, description, body) SELECT n.id, trim(both $6 fro
+(12 rows)
+

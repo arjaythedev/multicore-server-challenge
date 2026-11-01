@@ -2,6 +2,7 @@ package conduit.platform
 
 import conduit.http.HttpConn
 import conduit.http.HttpEngine
+import conduit.util.logSafe
 import java.io.IOException
 import java.net.Inet4Address
 import java.net.InetAddress
@@ -80,7 +81,7 @@ internal class NioLoop(@JvmField val index: Int, private val engine: HttpEngine)
             try {
                 turn()
             } catch (e: Throwable) {
-                println("http-$index: loop error: ${e.stackTraceToString()}")
+                logSafe({ "http-$index: loop error" }, e) // never throws: nothing here may end the loop
             }
         }
     }
@@ -209,7 +210,7 @@ internal class NioLoop(@JvmField val index: Int, private val engine: HttpEngine)
             try {
                 t()
             } catch (e: Throwable) {
-                println("http-$index: task failed: ${e.stackTraceToString()}")
+                logSafe({ "http-$index: task failed" }, e)
             }
         }
     }

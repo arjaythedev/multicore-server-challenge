@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>Conduit</RootNamespace>
+    <AssemblyName>conduit</AssemblyName>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <PublishAot>true</PublishAot>
+    <RuntimeIdentifier>linux-x64</RuntimeIdentifier>
+    <!-- Server GC adds a heap and a GC thread per core, which would compete with Postgres for the same 8 cores. -->
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+  </PropertyGroup>
+
+  <!-- native/build-native.sh builds the library before publish; the condition lets an editor compile without it. -->
+  <ItemGroup Condition="Exists('../native/libconduit_bcrypt.so')">
+    <None Include="../native/libconduit_bcrypt.so" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Link="libconduit_bcrypt.so" />
+  </ItemGroup>
+
+</Project>

@@ -1,5 +1,6 @@
 package conduit.http
 
+import conduit.util.logSafe
 import kotlin.concurrent.atomics.AtomicInt
 import kotlin.coroutines.startCoroutine
 import kotlin.jvm.JvmField
@@ -98,9 +99,9 @@ internal class EngineCore(private val handler: suspend (Exchange) -> Unit) {
     }
 
     private fun fail(cs: ConnState, e: Throwable) {
-        println("http: engine error, closing connection: ${e.stackTraceToString()}")
-        cs.st.store(CLOSED)
+        cs.st.store(CLOSED) // state and socket first: logging allocates, and may fail
         cs.conn.close()
+        logSafe({ "http: engine error, closing connection" }, e)
     }
 
     /**
@@ -144,7 +145,7 @@ internal class EngineCore(private val handler: suspend (Exchange) -> Unit) {
             if (ex.chunked) {
                 val r = scanChunked(cs, b, pos, end)
                 when (r) {
-                    NEED -> return waitBody(cs, ex, pos)
+                    NEED -> return waitBody(cs, ex, b, pos)
                     BAD -> return reject(cs, 400, "malformed chunked body", end)
                     TOO_BIG -> return reject(cs, 413, "request body too large", end)
                 }
@@ -154,7 +155,7 @@ internal class EngineCore(private val handler: suspend (Exchange) -> Unit) {
                 pos = r
             } else {
                 val n = ex.bodyLen
-                if (end - pos < n) return waitBody(cs, ex, pos)
+                if (end - pos < n) return waitBody(cs, ex, b, pos)
                 ex.body = b.copyOfRange(pos, pos + n)
                 pos += n
             }
@@ -163,7 +164,13 @@ internal class EngineCore(private val handler: suspend (Exchange) -> Unit) {
         }
     }
 
-    private fun waitBody(cs: ConnState, ex: Ex, pos: Int): Int {
+    private fun waitBody(cs: ConnState, ex: Ex, b: ByteArray, pos: Int): Int {
+        // the head's bytes are not kept with the body: the Authorization value must not point into them
+        val a = ex.authBuf
+        if (a === b) {
+            ex.authBuf = b.copyOfRange(ex.authOff, ex.authOff + ex.authLen)
+            ex.authOff = 0
+        }
         if (ex.expect) { // the client waits for this before it sends the body
             ex.expect = false
             if (cs.conn.tryWrite(CONTINUE_100, 0, CONTINUE_100.size) != CONTINUE_100.size) {
@@ -176,10 +183,15 @@ internal class EngineCore(private val handler: suspend (Exchange) -> Unit) {
     }
 
     private fun dispatch(cs: ConnState, ex: Ex) {
-        ex.res = pool.get()
         cs.st.store(BUSY) // before the handler can answer on another thread
         handler.startCoroutine(ex, ex)
     }
+
+    /** A response buffer for [Ex] (any thread): taken when the response is rendered, not when the request is parsed. */
+    internal fun takeOut(): Out = pool.get()
+
+    /** Returns an unsent buffer (any thread), e.g. the uncompressed body once its gzipped copy is sent instead. */
+    internal fun putOut(o: Out) = pool.put(o)
 
     /** Answers [status] with Connection: close and drops all input. Returns [end] (everything consumed). */
     private fun reject(cs: ConnState, status: Int, message: String, end: Int): Int {

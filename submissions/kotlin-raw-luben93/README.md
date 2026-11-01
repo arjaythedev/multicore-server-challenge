@@ -27,4 +27,17 @@ Optional process settings (defaults sized from the CPU count): `HTTP_THREADS`, `
 `BCRYPT_THREADS`, `BCRYPT_BATCH_MS`, `DB_OPTIONS`, `HTTP_IO` (`nio`: JVM HTTP loops on java.nio instead of epoll).
 `BCRYPT_IMPL=kotlin` forces the pure-Kotlin bcrypt.
 `APP_SORT_TAGS=0` leaves tag-list sorting to SQL even under a byte-order collation; `DB_STATS_S=<seconds>` logs
-batching statistics.
+batching statistics. `JAVA_HEAP` sets the JVM heap in `start.sh` (default `3g`).
+Overload guard: `OVERLOAD_GUARD=0` turns it off. Otherwise queued reads and bcrypt jobs whose client has given up are
+dropped unrun, and a full queue answers 503 "server busy" (`READ_QUEUE_MAX` 65536, `WRITE_QUEUE_MAX` 8192,
+`BCRYPT_QUEUE_MAX` 2048; 0 = no cap).
+Batched reads: `READ_SHARE=0` makes every request of a batch compute its own rows (default 1: the requests of one
+execution share counts, pages and article columns, see DESIGN.md "Shared reads"); `READ_GATHER_MS` (default 20) is how
+long a read kind waits for more requests before it is sent (0: as soon as a connection is free); `READ_MAX_BATCH`
+(default 256) caps one execution while sharing; `READ_VIEWER_FLAGS=0` makes shared lists check favorited/following
+per row instead of once per viewer; `READ_FEED_MAX_BATCH` (default 32; 0 = `READ_MAX_BATCH`) caps the feeds per
+execution: feeds share nothing, so small batches keep one long feed execution from holding a read connection.
+Postgres connections default to three read connections per four CPUs and one write connection per two
+(`DB_READ_CONNS`, `DB_WRITE_CONNS`: 6 + 4 on the box). With `DB_STATS_S` the log also gets, per interval, each read kind's
+queue wait and round trip, the read and write connections' utilization, and the bcrypt queue wait.
+`SQL_PRINT=1` prints every read statement and exits (diagnostics).

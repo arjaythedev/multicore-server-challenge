@@ -34,23 +34,40 @@
 #define UNNEST_VK "unnest($1::int8[], $2::text[]) WITH ORDINALITY AS r(v, k, i)"
 #define UNNEST_L4 "unnest($1::int8[], $2::int8[], $3::int8[], $4::text[]) WITH ORDINALITY AS r(v, l, o, k, i)"
 #define UNNEST_L3 "unnest($1::int8[], $2::int8[], $3::int8[]) WITH ORDINALITY AS r(v, l, o, i)"
-// A list page: the capped count, then the page. The page's ids are picked first from the bare index walk
-// (the inner LIMIT 100 is the API's maximum page and keeps generic-plan estimates small), and the
-// per-article columns are computed for those rows only. The count row is always there, so an empty page
-// comes back as one row with a NULL article.
-#define BLIST_X(un, countexpr, ids, FOLL)                                                                 \
-  "SELECT r.i, c.n, p.* FROM " un " CROSS JOIN LATERAL (SELECT " countexpr " AS n OFFSET 0) c "           \
-  "LEFT JOIN LATERAL ("                                                                                     \
-  "SELECT " ART_COLS_X("", FAVS_OF, FAVD_OF("r.v"), FOLL) " FROM (SELECT id FROM (" ids                    \
-  " OFFSET r.o LIMIT 100) q ORDER BY id DESC LIMIT r.l) pg JOIN articles a ON a.id = pg.id "              \
-  "JOIN users u ON u.id = a.author_id ORDER BY a.id DESC) p ON true"
-// the capped count: count(*) over at most 1000 rows. (The OFFSET 0 above keeps Postgres from pulling the
-// count up into the outer query, where it would run once per article row instead of once per request.)
+// the capped count: count(*) over at most 1000 rows
 #define COUNT_CAP(q) "(SELECT count(*) FROM (" q " LIMIT 1000) s)"
 // the same, for sets that nearly always reach the cap: step over 999 rows first (no aggregation)
 #define COUNT_CAP_BIG(q) "(CASE WHEN EXISTS (" q " OFFSET 999) THEN 1000 ELSE " COUNT_CAP(q) " END)"
-#define BLIST(un, count, ids) BLIST_X(un, COUNT_CAP(count), ids, FOLL_OF("r.v"))
 #define CURRVAL "currval(pg_get_serial_sequence('articles', 'id'))"
+
+// ---- shared batched reads ----
+// A batch's requests share what doesn't depend on who is asking: each distinct page key (limit, offset,
+// tag/author/...), count key and article is read once per statement, and only favorited / following are
+// computed per request. Requests in one statement see one snapshot, and nothing outlives the statement.
+// Each CTE is MATERIALIZED so it runs once; the per-key lookups are LATERAL ... LIMIT so generic plans
+// probe indexes instead of hashing whole tables.
+#define FAVD_R "(r.v > 0 AND EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = r.v))"
+#define FOLL_R "(r.v > 0 AND EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.v AND fo.followee_id = a.author_id))"
+// the shared columns of each article with id d.id (or slug d.k: cond), its body if body = "a.body, "
+#define ENRICH(src, body, cond)                                                                           \
+  "SELECT x.* FROM (" src ") d CROSS JOIN LATERAL (SELECT a.id, a.slug, a.title, a.description, " body    \
+  "a.created_at, a.updated_at, a.author_id, " TAG_LIST " AS tags, " FAVS_OF " AS favs, u.username, "      \
+  "u.bio, u.image FROM articles a JOIN users u ON u.id = a.author_id WHERE " cond " LIMIT 1) x"
+// A list page: c = one capped count per distinct count key, p = the page's ids per distinct page key
+// (ids walks the index for the key d.*; the inner LIMIT 100 is the API's maximum page), a = the articles.
+// The count row is always there, so an empty page comes back as one row with a NULL article.
+#define SLIST(un, ckeys, cjoin, count, pkeys, pjoin, ids, FOLL)                                           \
+  "WITH r AS MATERIALIZED (SELECT * FROM " un "), "                                                       \
+  "c AS MATERIALIZED (SELECT d.*, (" count ") AS n FROM (SELECT DISTINCT " ckeys " FROM r) d), "         \
+  "p AS MATERIALIZED (SELECT d.*, q.id FROM (SELECT DISTINCT " pkeys " FROM r) d LEFT JOIN LATERAL ("    \
+  "SELECT id FROM (" ids " OFFSET d.o LIMIT 100) q ORDER BY id DESC LIMIT d.l) q ON true), "              \
+  "a AS MATERIALIZED (" ENRICH("SELECT DISTINCT id FROM p WHERE id IS NOT NULL", "", "a.id = d.id") ") " \
+  "SELECT r.i, c.n, a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, a.tags, a.favs, "  \
+  FAVD_R ", a.username, a.bio, a.image, " FOLL " FROM r JOIN c ON " cjoin " JOIN p ON " pjoin            \
+  " LEFT JOIN a ON a.id = p.id ORDER BY r.i, p.id DESC"
+#define PJOIN_LO "p.l = r.l AND p.o = r.o"
+#define TAG_ID(k) "(SELECT t.id FROM tags t WHERE t.name = " k ")"
+#define USER_ID(k) "(SELECT u.id FROM users u WHERE u.username = " k ")"
 
 enum {
   S_REGISTER, S_LOGIN, S_USER, S_UPD_USER, S_FOLLOW, S_UNFOLLOW,
@@ -112,38 +129,55 @@ const stmt_t STMTS[] = {
                  "WHERE c.id = $2 AND a.slug = $3), "
                  "d AS (DELETE FROM comments x USING c WHERE x.id = c.id AND c.author_id = $1) "
                  "SELECT author_id FROM c", 3},
-  [SB_ART] = {"SELECT r.i, x.* FROM " UNNEST_VK " CROSS JOIN LATERAL (SELECT " ART_COLS_V("a.body, ", "r.v")
-               " FROM articles a JOIN users u ON u.id = a.author_id WHERE a.slug = r.k LIMIT 1) x", 2},
-  [SB_CMT] = {"SELECT r.i, a.id, c.* FROM " UNNEST_VK " CROSS JOIN LATERAL "
-              "(SELECT a.id FROM articles a WHERE a.slug = r.k LIMIT 1) a LEFT JOIN LATERAL ("
-              "SELECT c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image, "
-              "EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.v AND fo.followee_id = c.author_id) "
-              "FROM comments c JOIN users u ON u.id = c.author_id WHERE c.article_id = a.id "
-              "ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true", 2},
+  [SB_ART] = {"WITH r AS MATERIALIZED (SELECT * FROM " UNNEST_VK "), "
+               "a AS MATERIALIZED (" ENRICH("SELECT DISTINCT k FROM r", "a.body, ", "a.slug = d.k") ") "
+               "SELECT r.i, a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at, a.tags, "
+               "a.favs, " FAVD_R ", a.username, a.bio, a.image, " FOLL_R " FROM r JOIN a ON a.slug = r.k ORDER BY r.i", 2},
+  // following: the viewer's followees are read once per request (r.fl), not probed per comment
+  [SB_CMT] = {"WITH r AS MATERIALIZED (SELECT r.*, ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.v) AS fl "
+              "FROM " UNNEST_VK "), "
+              "s AS MATERIALIZED (SELECT d.k, x.aid, c.* FROM (SELECT DISTINCT k FROM r) d CROSS JOIN LATERAL "
+              "(SELECT a.id AS aid FROM articles a WHERE a.slug = d.k LIMIT 1) x LEFT JOIN LATERAL ("
+              "SELECT c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image, c.author_id "
+              "FROM comments c JOIN users u ON u.id = c.author_id WHERE c.article_id = x.aid "
+              "ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true) "
+              "SELECT r.i, s.aid, s.id, s.body, s.created_at, s.updated_at, s.username, s.bio, s.image, "
+              "CASE WHEN s.id IS NOT NULL THEN s.author_id = ANY (r.fl) END FROM r JOIN s ON s.k = r.k "
+              "ORDER BY r.i, s.created_at DESC, s.id DESC", 2},
   [SB_TAGS] = {"SELECT r.i, ARRAY(SELECT t.name FROM tags t WHERE r.i > 0 ORDER BY t.name) "
                "FROM generate_series(1::int8, $1::int8) AS r(i)", 1},
   [SB_TAGS1] = {"SELECT 1::int8, ARRAY(SELECT t.name FROM tags t ORDER BY t.name)", 0},
-  [SB_PROF] = {"SELECT r.i, x.* FROM " UNNEST_VK " CROSS JOIN LATERAL (SELECT u.username, u.bio, u.image, "
-               "EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.v AND fo.followee_id = u.id) "
-               "FROM users u WHERE u.username = r.k LIMIT 1) x", 2},
-  [SB_LALL] = {BLIST_X(UNNEST_L3, COUNT_CAP_BIG("SELECT 1 FROM articles a WHERE r.i > 0"),
-                       "SELECT x.id FROM articles x ORDER BY x.id DESC", FOLL_OF("r.v")), 3},
-  [SB_LTAG] = {BLIST_X(UNNEST_L4,
-                       COUNT_CAP_BIG("SELECT 1 FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = r.k)"),
-                       "SELECT at.article_id AS id FROM article_tags at WHERE at.tag_id = "
-                       "(SELECT t.id FROM tags t WHERE t.name = r.k) ORDER BY at.article_id DESC", FOLL_OF("r.v")), 4},
-  [SB_LAUTH] = {BLIST(UNNEST_L4, "SELECT 1 FROM articles a WHERE a.author_id = (SELECT u.id FROM users u WHERE u.username = r.k)",
-                      "SELECT x.id FROM articles x WHERE x.author_id = "
-                      "(SELECT au.id FROM users au WHERE au.username = r.k) ORDER BY x.id DESC"), 4},
-  [SB_LFAV] = {BLIST(UNNEST_L4, "SELECT 1 FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = r.k)",
-                     "SELECT f.article_id AS id FROM favorites f WHERE f.user_id = "
-                     "(SELECT fu.id FROM users fu WHERE fu.username = r.k) ORDER BY f.article_id DESC"), 4},
-  // every feed article's author is followed in this same snapshot, so `following` is true
-  [SB_FEED] = {BLIST_X(UNNEST_L3,
-                       COUNT_CAP("SELECT 1 FROM articles a WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.v)"),
-                       "SELECT x.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 "
-                       "WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT (r.l + r.o)) x "
-                       "WHERE fo.follower_id = r.v ORDER BY x.id DESC", "true"), 3},
+  [SB_PROF] = {"WITH r AS MATERIALIZED (SELECT * FROM " UNNEST_VK "), "
+               "u AS MATERIALIZED (SELECT x.* FROM (SELECT DISTINCT k FROM r) d CROSS JOIN LATERAL ("
+               "SELECT u.id, u.username, u.bio, u.image FROM users u WHERE u.username = d.k LIMIT 1) x) "
+               "SELECT r.i, u.username, u.bio, u.image, (r.v > 0 AND EXISTS (SELECT 1 FROM follows fo "
+               "WHERE fo.follower_id = r.v AND fo.followee_id = u.id)) FROM r JOIN u ON u.username = r.k ORDER BY r.i", 2},
+  [SB_LALL] = {SLIST(UNNEST_L3, "1 AS z", "true", COUNT_CAP_BIG("SELECT 1 FROM articles a"), "l, o", PJOIN_LO,
+                     "SELECT x.id FROM articles x ORDER BY x.id DESC", FOLL_R), 3},
+  [SB_LTAG] = {SLIST(UNNEST_L4, "k", "c.k = r.k",
+                     COUNT_CAP_BIG("SELECT 1 FROM article_tags at WHERE at.tag_id = " TAG_ID("d.k")), "l, o, k",
+                     PJOIN_LO " AND p.k = r.k",
+                     "SELECT at.article_id AS id FROM article_tags at WHERE at.tag_id = " TAG_ID("d.k")
+                     " ORDER BY at.article_id DESC", FOLL_R), 4},
+  [SB_LAUTH] = {SLIST(UNNEST_L4, "k", "c.k = r.k",
+                      COUNT_CAP("SELECT 1 FROM articles a WHERE a.author_id = " USER_ID("d.k")), "l, o, k",
+                      PJOIN_LO " AND p.k = r.k",
+                      "SELECT x.id FROM articles x WHERE x.author_id = " USER_ID("d.k") " ORDER BY x.id DESC", FOLL_R), 4},
+  [SB_LFAV] = {SLIST(UNNEST_L4, "k", "c.k = r.k",
+                     COUNT_CAP("SELECT 1 FROM favorites f WHERE f.user_id = " USER_ID("d.k")), "l, o, k",
+                     PJOIN_LO " AND p.k = r.k",
+                     "SELECT f.article_id AS id FROM favorites f WHERE f.user_id = " USER_ID("d.k")
+                     " ORDER BY f.article_id DESC", FOLL_R), 4},
+  // every feed article's author is followed in this same snapshot, so `following` is true. Most feeds
+  // reach the count cap (85% on the seed), hence COUNT_CAP_BIG; the followees go in as one array, so the
+  // count is one index scan over articles_author_idx (idea from rust-epoll-WorriedArrow).
+  [SB_FEED] = {SLIST(UNNEST_L3, "v", "c.v = r.v",
+                     COUNT_CAP_BIG("SELECT 1 FROM articles a WHERE a.author_id = ANY (ARRAY(SELECT fo.followee_id FROM follows fo "
+                                   "WHERE fo.follower_id = d.v)) ORDER BY a.author_id, a.id DESC"),
+                     "v, l, o", PJOIN_LO " AND p.v = r.v",
+                     "SELECT x.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 "
+                     "WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT (d.l + d.o)) x "
+                     "WHERE fo.follower_id = d.v ORDER BY x.id DESC", "true"), 3},
 };
 const int NSTMTS = S_COUNT;
 

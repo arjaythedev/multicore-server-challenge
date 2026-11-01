@@ -313,6 +313,22 @@ rt_now_sec:
     ret
     .skip 2, 0xcc                      # padding: keeps the code after this at its previous 64-byte alignment
 
+# rt_mono_ms_v() -> rax = CLOCK_MONOTONIC in milliseconds, from the vDSO. Clobbers the caller-saved registers.
+.globl rt_mono_ms_v
+rt_mono_ms_v:
+    sub rsp, 24
+    mov edi, CLOCK_MONOTONIC
+    mov rsi, rsp
+    call egress_clock_gettime
+    imul rcx, [rsp], 1000
+    mov rax, [rsp + 8]
+    xor edx, edx
+    mov r8d, 1000000
+    div r8
+    add rax, rcx
+    add rsp, 24
+    ret
+
 # rt_mono_ms() -> rax = CLOCK_MONOTONIC in milliseconds.
 .globl rt_mono_ms
 rt_mono_ms:

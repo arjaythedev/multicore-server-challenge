@@ -82,6 +82,9 @@ pub const Key = struct {
         const pl = b64.Decoder.calcSizeForSlice(token[d1 + 1 .. d2]) catch return null;
         if (pl > pb.len) return null;
         b64.Decoder.decode(pb[0..pl], token[d1 + 1 .. d2]) catch return null;
+        // Exact issued payload only, after HMAC and algorithm verification. Any
+        // extra/reordered claim (including nbf) must use the general parser below.
+        if (canonicalClaims(pb[0..pl], now)) |uid| return uid;
         var f: [3]jp.Field = undefined;
         jp.parseObject(pb[0..pl], sc, &.{ "sub", "exp", "nbf" }, &f) catch return null;
         if (f[0].kind != .string or f[1].kind != .number) return null;
@@ -104,6 +107,46 @@ pub const Key = struct {
 };
 
 pub const max_token_len = header_b64.len + 1 + 96 * 4 / 3 + 3 + 1 + 43;
+
+fn decimal(s: []const u8, json_number: bool) ?u64 {
+    if (s.len == 0 or s.len > 19 or (json_number and s.len > 1 and s[0] == '0')) return null;
+    var n: u64 = 0;
+    for (s) |c| {
+        if (c < '0' or c > '9') return null;
+        n = n * 10 + (c - '0');
+    }
+    return if (n <= std.math.maxInt(i64)) n else null;
+}
+
+fn canonicalClaims(payload: []const u8, now: i64) ?u64 {
+    const prefix = "{\"sub\":\"";
+    const middle = "\",\"iat\":";
+    const end = ",\"exp\":";
+    if (!std.mem.startsWith(u8, payload, prefix) or !std.mem.endsWith(u8, payload, "}")) return null;
+    const split = std.mem.indexOfPos(u8, payload, prefix.len, middle) orelse return null;
+    const uid = decimal(payload[prefix.len..split], false) orelse return null;
+    if (uid == 0) return null;
+    const at = split + middle.len;
+    const next = std.mem.indexOfPos(u8, payload, at, end) orelse return null;
+    _ = decimal(payload[at..next], true) orelse return null;
+    const expires = decimal(payload[next + end.len .. payload.len - 1], true) orelse return null;
+    if (@as(i64, @intCast(expires)) <= now) return null;
+    return uid;
+}
+
+test "canonical claims never bypass nbf, extra claims, malformed numbers or expiration" {
+    try std.testing.expectEqual(@as(?u64, 42), canonicalClaims("{\"sub\":\"42\",\"iat\":100,\"exp\":200}", 150));
+    const rejected = [_][]const u8{
+        "{\"sub\":\"42\",\"iat\":100,\"exp\":150}",
+        "{\"sub\":\"0\",\"iat\":100,\"exp\":200}",
+        "{\"sub\":\"42\",\"iat\":0100,\"exp\":200}",
+        "{\"sub\":\"42\",\"iat\":100,\"exp\":0200}",
+        "{\"sub\":\"42\",\"iat\":100,\"exp\":200,\"nbf\":190}",
+        "{\"sub\":\"42\",\"iat\":100,\"exp\":200,\"extra\":true}",
+        "{\"sub\":\"9223372036854775808\",\"iat\":100,\"exp\":200}",
+    };
+    for (rejected) |p| try std.testing.expect(canonicalClaims(p, 150) == null);
+}
 
 fn parseNumericDate(s: []const u8) ?i64 {
     if (std.fmt.parseInt(i64, s, 10)) |v| return v else |_| {}

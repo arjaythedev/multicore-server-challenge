@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"strconv"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -267,6 +268,8 @@ func (s *pgSession) decodeBatchArticle(batch []*reqCtx, rr *pgconn.ResultReader)
 	for _, t := range batch {
 		t.plan.rowsSeen = 0
 	}
+	prevSlot := -1
+	var prevFav, prevFol byte
 	for rr.NextRow() {
 		cols := rr.Values()
 		slot := int(decodePGInt8(cols[13])) - 1
@@ -274,9 +277,24 @@ func (s *pgSession) decodeBatchArticle(batch []*reqCtx, rr *pgconn.ResultReader)
 			t := batch[slot]
 			qp := &t.plan
 			qp.rowsSeen = 1
+			var fav, fol byte
+			if len(cols[8]) > 0 {
+				fav = cols[8][0]
+			}
+			if len(cols[12]) > 0 {
+				fol = cols[12][0]
+			}
+			if prevSlot >= 0 && fav == prevFav && fol == prevFol &&
+				bytes.Equal(qp.bindArgs[1], batch[prevSlot].plan.bindArgs[1]) {
+				qp.jsonBuf = append(qp.jsonBuf[:0], batch[prevSlot].plan.jsonBuf...)
+				continue
+			}
 			qp.jsonBuf = append(qp.jsonBuf[:0], `{"article":`...)
 			qp.jsonBuf = writeArticleObject(qp.jsonBuf, cols, 0, true)
 			qp.jsonBuf = append(qp.jsonBuf, '}')
+			prevSlot = slot
+			prevFav = fav
+			prevFol = fol
 		}
 	}
 	if _, err := rr.Close(); err != nil {
@@ -382,7 +400,7 @@ func writeArticleObject(dst []byte, cols [][]byte, offset int, includeBody bool)
 	}
 	createdRaw, updatedRaw, tagsRaw, favCountRaw, favFlagRaw := cols[idx], cols[idx+1], cols[idx+2], cols[idx+3], cols[idx+4]
 	dst = append(dst, `,"tagList":`...)
-	dst = writePGTextArray(dst, tagsRaw)
+	dst = writeSortedPGTextArray(dst, tagsRaw)
 	dst = writeTimestamps(dst, createdRaw, updatedRaw)
 	dst = append(dst, `,"favorited":`...)
 	dst = writeJSONBool(dst, favFlagRaw)

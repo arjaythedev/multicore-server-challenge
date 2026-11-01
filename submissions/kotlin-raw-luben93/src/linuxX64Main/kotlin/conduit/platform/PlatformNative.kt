@@ -106,6 +106,8 @@ actual fun currentTimeMillis(): Long = memScoped {
     ts.tv_sec * 1000L + ts.tv_nsec / 1_000_000
 }
 
+actual fun isOutOfMemory(e: Throwable): Boolean = e is OutOfMemoryError
+
 private val urandom: Int by lazy { open("/dev/urandom", O_RDONLY).also { check(it >= 0) { "open /dev/urandom" } } }
 
 actual fun secureRandomBytes(dst: ByteArray) {

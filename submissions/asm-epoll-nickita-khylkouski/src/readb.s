@@ -56,6 +56,12 @@
 .equ RW_WAKE, 8                         # 1: its eventfd was written for that (xchg)
 .equ RW_FREE, 16                        # blocks of this worker's freed on others: {next, cap} (rb_free_to)
 
+.data
+.globl g_rd_wait_ms
+g_rd_wait_ms: .quad 0                   # READ_BATCH_MS
+.globl g_share_pct
+g_share_pct: .quad 100                  # READ_SHARE_PCT (article by slug; comments share at 50)
+
 .bss
 .align 64
 rb_lock: .quad 0
@@ -200,7 +206,14 @@ readb_enqueue:
     mov rax, [rdi + J_STMT]
     cmp rax, RK_COUNT
     jae db_read
-    mov [rdi + J_FAM], rax
+    cmp qword ptr [rip + g_rd_wait_ms], 0
+    je 0f
+    push rdi
+    call rt_mono_ms_v
+    pop rdi
+    mov [rdi + J_T0], rax               # arrival (READ_BATCH_MS)
+    mov rax, [rdi + J_STMT]
+0:  mov [rdi + J_FAM], rax
     mov [rdi + J_WORKER], r15
     mov qword ptr [rdi + J_BNEXT], 0
     shl rax, 5
@@ -241,6 +254,7 @@ readb_service:
     shl rbp, 6
     lea rax, [rip + rb_wk]
     add rbp, rax                        # this worker's wake flags
+    mov qword ptr [r15 + W_RDDUE], 0
     cmp qword ptr [rbp + RW_FREE], 0
     je 1f
     mov rdi, rbp
@@ -282,7 +296,11 @@ readb_service:
     cmp qword ptr [rip + rb_count], 0
     je .Lsv_ret
 .Lsv_take:
-    RB_LOCK
+    cmp qword ptr [rip + g_rd_wait_ms], 0
+    je 0f
+    call rt_mono_ms_v
+    mov [r15 + W_RDNOW], rax
+0:  RB_LOCK
     xor r12d, r12d                      # queue of the oldest head (the largest key)
     xor r14d, r14d
     xor ecx, ecx
@@ -302,7 +320,21 @@ readb_service:
     jnz 5f
     RB_UNLOCK                           # emptied by another worker
     jmp .Lsv_loop
-5:  mov rdi, [r12 + Q_HEAD]             # detach the whole queue
+5:  cmp qword ptr [rip + g_rd_wait_ms], 0
+    je 55f
+    # READ_BATCH_MS: leave the oldest queue to gather until its head has waited that long (or RB_CAP wait)
+    cmp qword ptr [r12 + Q_COUNT], RB_CAP
+    jae 55f
+    mov rax, [r12 + Q_HEAD]
+    mov rax, [rax + J_T0]
+    add rax, [rip + g_rd_wait_ms]
+    cmp rax, [r15 + W_RDNOW]
+    jbe 55f
+    RB_UNLOCK
+    mov [r15 + W_RDDUE], rax            # the loop's epoll_wait wakes at the deadline
+    mov qword ptr [rbp + RW_IDLE], 0    # the timer covers it: busy workers need not wake this one
+    jmp .Lsv_ret
+55: mov rdi, [r12 + Q_HEAD]             # detach the whole queue
     mov rsi, [r12 + Q_TAIL]
     mov r14, [r12 + Q_COUNT]
     xor eax, eax
@@ -505,6 +537,11 @@ rb_issue:
     je 1f
     mov rdi, r13
     mov rsi, r14
+    mov edx, 50                         # comments: share at 2 requests per slug
+    cmp byte ptr [r12], 5               # article by slug (RK_SLUG's batched statement)
+    jne .Lis_fam_pct
+    mov rdx, [rip + g_share_pct]
+.Lis_fam_pct:
     call rb_should_share
     test eax, eax
     jz 1f
@@ -611,15 +648,16 @@ rb_issue:
     pop rbx
     ret
 
-# rb_should_share(first, n) -> eax = 1 if the take's distinct param-1 texts (slugs) * 2 <= n (Rust
-# should_share with share_pct 50). Counted with an FNV-1a open-addressing set of {ptr, len + 2}.
+# rb_should_share(first, n, pct) -> eax = 1 if the take's distinct param-1 texts (slugs) * 100 <= n * pct
+# (Rust should_share with share_pct). Counted with an FNV-1a open-addressing set of {ptr, len + 2}.
 rb_should_share:
     push rbx
     push r12
     push r13
     push r14
     push rbp
-    sub rsp, 16
+    sub rsp, 32
+    mov [rsp + 16], rdx                 # pct
     mov rbx, rdi
     mov r12, rsi
     lea rcx, [r12 + r12]
@@ -701,10 +739,11 @@ rb_should_share:
     mov rsi, [rsp]
     call rt_free
     xor eax, eax
-    add rbp, rbp
+    imul rbp, rbp, 100
+    imul r12, [rsp + 16]
     cmp rbp, r12
     setbe al
-    add rsp, 16
+    add rsp, 32
     pop rbp
     pop r14
     pop r13
@@ -1840,19 +1879,21 @@ qb_f02_shared:
     .ascii "         k.username, k.bio, k.image\012"
     .ascii "         FROM article_ids i JOIN articles a ON a.id = i.id JOIN keys k ON k.p4 = i.p4),\012"
     .ascii "         bounds AS MATERIALIZED (SELECT min(id) AS lo, max(id) AS hi, array_agg(DISTINCT author_id) AS au FROM enriched),\012"
+    .ascii "         fl0 AS MATERIALIZED (\012"
+    .ascii "         SELECT q.ord, q.p1, array_agg(p.id ORDER BY p.id DESC) FILTER (WHERE p.id IS NOT NULL) AS ids\012"
+    .ascii "         FROM requests q JOIN pages p ON p.p2 = q.p2 AND p.p3 = q.p3 AND p.p4 = q.p4 GROUP BY q.ord, q.p1),\012"
     .ascii "         fl AS MATERIALIZED (\012"
-    .ascii "         SELECT q.ord, array_agg(p.id ORDER BY p.id DESC) FILTER (WHERE p.id IS NOT NULL) AS ids,\012"
-    .ascii "         array_agg(p.id) FILTER (WHERE EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = p.id AND f.user_id = q.p1)) AS favs,\012"
-    .ascii "         array_agg(e.author_id) FILTER (WHERE EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = q.p1 AND fo.followee_id = e.author_id)) AS fols\012"
-    .ascii "         FROM requests q JOIN pages p ON p.p2 = q.p2 AND p.p3 = q.p3 AND p.p4 = q.p4 LEFT JOIN enriched e ON e.id = p.id GROUP BY q.ord, q.p1)\012"
+    .ascii "         SELECT ord, ids,\012"
+    .ascii "         ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id = fl0.p1 AND f.article_id = ANY(fl0.ids)) AS favs\012"
+    .ascii "         FROM fl0)\012"
     .ascii "         SELECT NULL::bigint AS n, e.id, e.slug, e.title, e.description, e.created_at, e.updated_at, e.tags, e.fc,\012"
     .ascii "         NULL::boolean, e.username, e.bio, e.image, NULL::boolean, e.author_id,\012"
     .ascii "         NULL::bigint[], NULL::bigint[], NULL::bigint[], 0::bigint AS __request_id\012"
     .ascii "         FROM enriched e\012"
     .ascii "         UNION ALL\012"
     .ascii "         SELECT c.n, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,\012"
-    .ascii "         COALESCE(fl.ids, '{}'), COALESCE(fl.favs, '{}'), COALESCE(fl.fols, '{}'), q.ord::bigint\012"
-    .ascii "         FROM requests q JOIN counted c ON c.p4 = q.p4 JOIN fl ON fl.ord = q.ord"
+    .ascii "         COALESCE(fl.ids, '{}'), COALESCE(fl.favs, '{}'), CASE WHEN EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = q.p1 AND fo.followee_id = k.uid) THEN ARRAY[k.uid] ELSE '{}'::bigint[] END, q.ord::bigint\012"
+    .ascii "         FROM requests q JOIN counted c ON c.p4 = q.p4 JOIN fl ON fl.ord = q.ord JOIN keys k ON k.p4 = q.p4"
 qb_f02_shared_end:
 qb_f03_shared:
     .ascii "WITH requests AS MATERIALIZED (\012"
@@ -1871,11 +1912,16 @@ qb_f03_shared:
     .ascii "         u.username, u.bio, u.image\012"
     .ascii "         FROM article_ids i JOIN articles a ON a.id = i.id JOIN users u ON u.id = a.author_id),\012"
     .ascii "         bounds AS MATERIALIZED (SELECT min(id) AS lo, max(id) AS hi, array_agg(DISTINCT author_id) AS au FROM enriched),\012"
+    .ascii "         fl0 AS MATERIALIZED (\012"
+    .ascii "         SELECT q.ord, q.p1, array_agg(p.id ORDER BY p.id DESC) FILTER (WHERE p.id IS NOT NULL) AS ids,\012"
+    .ascii "         array_agg(DISTINCT e.author_id) FILTER (WHERE e.author_id IS NOT NULL) AS au\012"
+    .ascii "         FROM requests q JOIN pages p ON p.p2 = q.p2 AND p.p3 = q.p3 AND p.p4 = q.p4\012"
+    .ascii "         LEFT JOIN enriched e ON e.id = p.id GROUP BY q.ord, q.p1),\012"
     .ascii "         fl AS MATERIALIZED (\012"
-    .ascii "         SELECT q.ord, array_agg(p.id ORDER BY p.id DESC) FILTER (WHERE p.id IS NOT NULL) AS ids,\012"
-    .ascii "         array_agg(p.id) FILTER (WHERE EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = p.id AND f.user_id = q.p1)) AS favs,\012"
-    .ascii "         array_agg(e.author_id) FILTER (WHERE EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = q.p1 AND fo.followee_id = e.author_id)) AS fols\012"
-    .ascii "         FROM requests q JOIN pages p ON p.p2 = q.p2 AND p.p3 = q.p3 AND p.p4 = q.p4 LEFT JOIN enriched e ON e.id = p.id GROUP BY q.ord, q.p1)\012"
+    .ascii "         SELECT ord, ids,\012"
+    .ascii "         ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id = fl0.p1 AND f.article_id = ANY(fl0.ids)) AS favs,\012"
+    .ascii "         ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = fl0.p1 AND fo.followee_id = ANY(fl0.au)) AS fols\012"
+    .ascii "         FROM fl0)\012"
     .ascii "         SELECT NULL::bigint AS n, e.id, e.slug, e.title, e.description, e.created_at, e.updated_at, e.tags, e.fc,\012"
     .ascii "         NULL::boolean, e.username, e.bio, e.image, NULL::boolean, e.author_id,\012"
     .ascii "         NULL::bigint[], NULL::bigint[], NULL::bigint[], 0::bigint AS __request_id\012"
@@ -1889,44 +1935,58 @@ qb_f04_shared:
     .ascii "WITH r AS MATERIALIZED (\012"
     .ascii " SELECT r.*, ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.p1) AS fl\012"
     .ascii " FROM unnest($1::bigint[], $2::bigint[], $3::bigint[], $4::bigint[]) WITH ORDINALITY AS r(p1,p2,p3,p4,ord)),\012"
-    .ascii " big AS MATERIALIZED (\012"
-    .ascii " SELECT ARRAY(SELECT b.f FROM (SELECT f FROM r, unnest(r.fl) AS f GROUP BY f HAVING count(*) >= 2\012"
-    .ascii "                               ORDER BY count(*) DESC, f LIMIT 8) b\012"
-    .ascii "   WHERE EXISTS (SELECT 1 FROM articles a3 WHERE a3.author_id = b.f ORDER BY a3.id DESC OFFSET 999 LIMIT 1)) AS fids),\012"
-    .ascii " cnt AS MATERIALIZED (\012"
-    .ascii " SELECT r.ord, CASE WHEN r.fl && (SELECT fids FROM big) THEN 1000::bigint\012"
-    .ascii "   WHEN EXISTS (SELECT a3.author_id, a3.id FROM articles a3 WHERE a3.author_id = ANY(r.fl)\012"
-    .ascii "                ORDER BY a3.author_id, a3.id DESC OFFSET 999 LIMIT 1) THEN 1000::bigint\012"
-    .ascii "   ELSE (SELECT count(*) FROM articles a3 WHERE a3.author_id = ANY(r.fl)) END AS n FROM r),\012"
+    .ascii " bounds AS MATERIALIZED (\012"
+    .ascii " SELECT b.f AS author_id,\012"
+    .ascii "   ARRAY(SELECT s.id FROM (SELECT a3.id FROM articles a3 WHERE a3.author_id = b.f ORDER BY a3.id DESC LIMIT b.take) s ORDER BY s.id) AS ids,\012"
+    .ascii "   EXISTS (SELECT 1 FROM articles a3 WHERE a3.author_id = b.f ORDER BY a3.id DESC OFFSET 999 LIMIT 1) AS big\012"
+    .ascii " FROM (SELECT f, max(GREATEST(r.p4, 1)) AS take FROM r, unnest(r.fl) AS f GROUP BY f HAVING count(*) >= 2\012"
+    .ascii "       ORDER BY count(*) DESC, f LIMIT 20) b),\012"
+    .ascii " sh AS MATERIALIZED (\012"
+    .ascii " SELECT j.ord, max(j.ids[cardinality(j.ids) - j.p4 + 1]) AS cutoff, bool_or(j.big) AS anybig\012"
+    .ascii " FROM (SELECT r.ord, r.p4, b.ids, b.big FROM r, unnest(r.fl) AS f JOIN bounds b ON b.author_id = f) j GROUP BY j.ord),\012"
+    .ascii " wq AS MATERIALIZED (\012"
+    .ascii " SELECT sh.ord, sh.cutoff FROM sh\012"
+    .ascii " WHERE sh.cutoff > (SELECT max(a.id) FROM articles a)\012"
+    .ascii "   - CASE WHEN cardinality($1::bigint[]) < 32 THEN 0 ELSE LEAST(2048, 32 * cardinality($1::bigint[])) END),\012"
+    .ascii " win AS MATERIALIZED (\012"
+    .ascii " SELECT a.id, a.author_id FROM articles a WHERE a.id >= (SELECT min(wq.cutoff) FROM wq)),\012"
+    .ascii " wc AS MATERIALIZED (\012"
+    .ascii " SELECT q.ord, q.p3, q.p4, array_agg(w.id ORDER BY w.id DESC) AS ids, array_agg(w.author_id ORDER BY w.id DESC) AS aus\012"
+    .ascii " FROM (SELECT r.ord, r.p3, r.p4, r.fl, wq.cutoff FROM r JOIN wq ON wq.ord = r.ord) q\012"
+    .ascii " CROSS JOIN LATERAL unnest(q.fl) AS f(followee_id) JOIN win w ON w.author_id = f.followee_id AND w.id >= q.cutoff\012"
+    .ascii " GROUP BY q.ord, q.p3, q.p4),\012"
     .ascii " page AS MATERIALIZED (\012"
-    .ascii " SELECT r.ord, p.id FROM r CROSS JOIN LATERAL (\012"
-    .ascii "   SELECT x.id FROM unnest(r.fl) AS fo(followee_id) CROSS JOIN LATERAL (\012"
-    .ascii "     SELECT a3.id FROM articles a3 WHERE a3.author_id = fo.followee_id ORDER BY a3.id DESC LIMIT r.p4) x\012"
-    .ascii "   ORDER BY x.id DESC LIMIT r.p2 OFFSET r.p3) p),\012"
+    .ascii " SELECT wc.ord, p.id, p.author_id FROM wc\012"
+    .ascii " CROSS JOIN LATERAL unnest(wc.ids[wc.p3 + 1 : wc.p4], wc.aus[wc.p3 + 1 : wc.p4]) AS p(id, author_id)\012"
+    .ascii " UNION ALL\012"
+    .ascii " SELECT r.ord, p.id, p.author_id FROM r LEFT JOIN sh ON sh.ord = r.ord\012"
+    .ascii " CROSS JOIN LATERAL (\012"
+    .ascii "   SELECT x.id, fo.followee_id AS author_id FROM unnest(r.fl) AS fo(followee_id) CROSS JOIN LATERAL (\012"
+    .ascii "     SELECT a3.id FROM articles a3 WHERE a3.author_id = fo.followee_id\012"
+    .ascii "       AND a3.id >= COALESCE(sh.cutoff, '-9223372036854775808'::bigint) ORDER BY a3.id DESC LIMIT r.p4) x\012"
+    .ascii "   ORDER BY x.id DESC LIMIT r.p2 OFFSET r.p3) p\012"
+    .ascii " WHERE NOT EXISTS (SELECT 1 FROM wc WHERE wc.ord = r.ord)),\012"
     .ascii " ids AS MATERIALIZED (SELECT DISTINCT id FROM page),\012"
-    .ascii " tg AS MATERIALIZED (\012"
-    .ascii " SELECT at.article_id, array_agg(t.name ORDER BY t.name) AS tags FROM article_tags at JOIN tags t ON t.id = at.tag_id\012"
-    .ascii " WHERE at.article_id = ANY(ARRAY(SELECT id FROM ids)) GROUP BY 1),\012"
-    .ascii " fc AS MATERIALIZED (\012"
-    .ascii " SELECT f.article_id, count(*) AS n FROM favorites f WHERE f.article_id = ANY(ARRAY(SELECT id FROM ids)) GROUP BY 1),\012"
-    .ascii " e AS MATERIALIZED (\012"
-    .ascii " SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, a.author_id, u.username, u.bio, u.image,\012"
-    .ascii "   COALESCE(tg.tags, '{}') AS tags, COALESCE(fc.n, 0) AS fc\012"
-    .ascii " FROM ids JOIN articles a ON a.id = ids.id JOIN users u ON u.id = a.author_id\012"
-    .ascii " LEFT JOIN tg ON tg.article_id = a.id LEFT JOIN fc ON fc.article_id = a.id),\012"
-    .ascii " pg AS MATERIALIZED (\012"
-    .ascii " SELECT p.ord, array_agg(p.id ORDER BY p.id DESC) AS ids,\012"
-    .ascii "   array_agg(p.id) FILTER (WHERE EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = p.id AND f.user_id = r.p1)) AS favs,\012"
-    .ascii "   array_agg(e.author_id) AS fols\012"
-    .ascii " FROM page p JOIN r ON r.ord = p.ord JOIN e ON e.id = p.id GROUP BY p.ord)\012"
-    .ascii "SELECT NULL::bigint AS n, e.id, e.slug, e.title, e.description, e.created_at, e.updated_at, e.tags, e.fc,\012"
-    .ascii " NULL::boolean, e.username, e.bio, e.image, NULL::boolean, e.author_id,\012"
+    .ascii " ea AS MATERIALIZED (\012"
+    .ascii " SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, a.author_id\012"
+    .ascii " FROM articles a WHERE a.id = ANY(ARRAY(SELECT id FROM ids)))\012"
+    .ascii "SELECT NULL::bigint AS n, a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, COALESCE(tg.tags, '{}'), COALESCE(fc.n, 0),\012"
+    .ascii " NULL::boolean, u.username, u.bio, u.image, NULL::boolean, a.author_id,\012"
     .ascii " NULL::bigint[], NULL::bigint[], NULL::bigint[], 0::bigint AS __request_id\012"
-    .ascii "FROM e\012"
+    .ascii "FROM ea a\012"
+    .ascii "JOIN (SELECT u.id, u.username, u.bio, u.image FROM users u WHERE u.id = ANY(ARRAY(SELECT DISTINCT author_id FROM ea))) u ON u.id = a.author_id\012"
+    .ascii "LEFT JOIN (SELECT at.article_id, array_agg(t.name ORDER BY t.name) AS tags FROM article_tags at JOIN tags t ON t.id = at.tag_id\012"
+    .ascii "           WHERE at.article_id = ANY(ARRAY(SELECT id FROM ids)) GROUP BY 1) tg ON tg.article_id = a.id\012"
+    .ascii "LEFT JOIN (SELECT f.article_id, count(*) AS n FROM favorites f WHERE f.article_id = ANY(ARRAY(SELECT id FROM ids)) GROUP BY 1) fc ON fc.article_id = a.id\012"
     .ascii "UNION ALL\012"
-    .ascii "SELECT c.n, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,\012"
-    .ascii " COALESCE(pg.ids, '{}'), COALESCE(pg.favs, '{}'), COALESCE(pg.fols, '{}'), r.ord::bigint\012"
-    .ascii "FROM r JOIN cnt c ON c.ord = r.ord LEFT JOIN pg ON pg.ord = r.ord"
+    .ascii "SELECT CASE WHEN sh.anybig THEN 1000::bigint\012"
+    .ascii "   ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a3 WHERE a3.author_id = ANY(r.fl) LIMIT 1000) s) END,\012"
+    .ascii " NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,\012"
+    .ascii " COALESCE(pg.ids, '{}'),\012"
+    .ascii " COALESCE(ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id = r.p1 AND f.article_id = ANY(pg.ids)), '{}'),\012"
+    .ascii " COALESCE(pg.fols, '{}'), r.ord::bigint\012"
+    .ascii "FROM r LEFT JOIN sh ON sh.ord = r.ord\012"
+    .ascii "LEFT JOIN (SELECT p.ord, array_agg(p.id ORDER BY p.id DESC) AS ids, array_agg(p.author_id) AS fols FROM page p GROUP BY p.ord) pg ON pg.ord = r.ord"
 qb_f04_shared_end:
 qb_f05_batch:
     .ascii "SELECT q.*, r.ord::bigint AS __request_id FROM unnest($1::bigint[],$2::text[]) WITH ORDINALITY AS r(p1,p2,ord) CROSS JOIN LATERAL (SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at,\012"
@@ -1938,13 +1998,16 @@ qb_f05_batch:
 qb_f05_batch_end:
 qb_f05_shared:
     .ascii "WITH requests AS MATERIALIZED (SELECT * FROM unnest($1::bigint[],$2::text[]) WITH ORDINALITY AS r(p1,p2,ord)),\012"
+    .ascii "         e0 AS MATERIALIZED (\012"
+    .ascii "         SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at, a.author_id\012"
+    .ascii "         FROM articles a WHERE a.slug IN (SELECT DISTINCT p2 FROM requests)),\012"
+    .ascii "         tg AS MATERIALIZED (\012"
+    .ascii "         SELECT at.article_id, array_agg(t.name ORDER BY t.name) AS tags FROM article_tags at JOIN tags t ON t.id = at.tag_id\012"
+    .ascii "         WHERE at.article_id = ANY(ARRAY(SELECT id FROM e0)) GROUP BY 1),\012"
     .ascii "         e AS MATERIALIZED (\012"
-    .ascii "         SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at, a.author_id,\012"
-    .ascii "         ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) AS name\012"
-    .ascii "               FROM article_tags at WHERE at.article_id = a.id ORDER BY 1) AS tags,\012"
-    .ascii "         (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS fc,\012"
-    .ascii "         u.username, u.bio, u.image\012"
-    .ascii "         FROM articles a JOIN users u ON u.id = a.author_id WHERE a.slug IN (SELECT DISTINCT p2 FROM requests))\012"
+    .ascii "         SELECT e0.id, e0.slug, e0.title, e0.description, e0.body, e0.created_at, e0.updated_at, e0.author_id,\012"
+    .ascii "         COALESCE(tg.tags, '{}') AS tags, (SELECT count(*) FROM favorites f WHERE f.article_id = e0.id) AS fc, u.username, u.bio, u.image\012"
+    .ascii "         FROM e0 JOIN users u ON u.id = e0.author_id LEFT JOIN tg ON tg.article_id = e0.id)\012"
     .ascii "         SELECT e.id, e.slug, e.title, e.description, e.body, e.created_at, e.updated_at, e.tags, e.fc,\012"
     .ascii "         NULL::boolean, e.username, e.bio, e.image, NULL::boolean, e.author_id, 0::bigint AS __request_id\012"
     .ascii "         FROM e\012"
@@ -1976,12 +2039,12 @@ qb_f09_batch:
     .ascii "SELECT q.*, r.ord::bigint AS __request_id FROM unnest($1::text[]) WITH ORDINALITY AS r(p1,ord) CROSS JOIN LATERAL (SELECT id, username, email, bio, image, password_hash FROM users WHERE email = r.p1) q"
 qb_f09_batch_end:
 qb_f10_batch:
-    .ascii "SELECT q.aid, q.cid, q.body, q.created_at, q.updated_at, q.username, q.bio, q.image, q.following,\012"
+    .ascii "SELECT NULL::bigint, q.cid, q.body, q.created_at, NULLIF(q.updated_at, q.created_at), q.username, q.bio, q.image, q.following,\012"
     .ascii " r.ord::bigint AS __request_id\012"
     .ascii "FROM unnest($1::bigint[], $2::text[]) WITH ORDINALITY AS r(p1,p2,ord)\012"
     .ascii "CROSS JOIN LATERAL (\012"
     .ascii " SELECT a.id AS aid, c.id AS cid, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image,\012"
-    .ascii " CASE WHEN c.id IS NULL THEN false ELSE c.author_id = ANY(ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.p1)) END AS following\012"
+    .ascii " CASE WHEN c.id IS NULL THEN false ELSE EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.p1 AND fo.followee_id = c.author_id) END AS following\012"
     .ascii " FROM articles a\012"
     .ascii " LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id FROM comments c WHERE c.article_id = a.id\012"
     .ascii "                    ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true\012"
@@ -1997,14 +2060,14 @@ qb_f10_shared:
     .ascii "                            ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true\012"
     .ascii "         LEFT JOIN users u ON u.id = c.author_id\012"
     .ascii "         WHERE a.slug IN (SELECT DISTINCT p2 FROM requests)),\012"
-    .ascii "         au AS MATERIALIZED (SELECT array_agg(DISTINCT author_id) AS au FROM e),\012"
-    .ascii "         arts AS MATERIALIZED (SELECT DISTINCT slug, aid FROM e)\012"
+    .ascii "         arts AS MATERIALIZED (SELECT slug, aid, array_agg(DISTINCT author_id) FILTER (WHERE author_id IS NOT NULL) AS au\012"
+    .ascii "                               FROM e GROUP BY slug, aid)\012"
     .ascii "         SELECT e.aid, e.id, e.body, e.created_at, e.updated_at, e.username, e.bio, e.image, NULL::boolean, e.author_id,\012"
     .ascii "         NULL::bigint[], 0::bigint AS __request_id\012"
     .ascii "         FROM e WHERE e.id IS NOT NULL\012"
     .ascii "         UNION ALL\012"
     .ascii "         SELECT arts.aid, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,\012"
-    .ascii "         ARRAY(SELECT fo.followee_id FROM follows fo, au WHERE fo.follower_id = q.p1 AND fo.followee_id = ANY(au.au)),\012"
+    .ascii "         ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = q.p1 AND fo.followee_id = ANY(arts.au)),\012"
     .ascii "         q.ord::bigint\012"
     .ascii "         FROM requests q LEFT JOIN arts ON arts.slug = q.p2"
 qb_f10_shared_end:

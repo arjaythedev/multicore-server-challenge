@@ -78,6 +78,13 @@ class Result {
     /** Start offsets (in [buf]) of each DataRow body. */
     @JvmField var rowStarts: IntArray = IntArray(8)
     @JvmField var rowCount: Int = 0
+
+    /**
+     * Flag rows of a shared read ([conduit.db.Sharing]): start offsets (in [buf]) of the DataRows `(-1 - i, flag int8, ...)`
+     * the statement returned for this request alone; [hasFlag] looks a flag up. Everything else in the rows is shared.
+     */
+    @JvmField var flagStarts: IntArray = IntArray(4)
+    @JvmField var flagCount: Int = 0
     private val view = Row()
 
     val ok: Boolean get() = error == null
@@ -94,8 +101,21 @@ class Result {
         rowStarts[rowCount++] = bodyStart
     }
 
+    /** A flag row: column 0 is the Int32 request marker, column 1 an Int64 flag (the DataRow body holds both, 30 bytes at least). */
+    fun addFlag(b: ByteArray, bodyStart: Int) {
+        if (flagCount == flagStarts.size) flagStarts = flagStarts.copyOf(flagCount * 2)
+        flagStarts[flagCount++] = bodyStart
+    }
+
+    /** Whether this request's flag rows hold [flag] (body: Int16 ncols, Int32 len + Int32 marker, Int32 len + Int64 flag). */
+    fun hasFlag(flag: Long): Boolean {
+        val b = buf
+        for (k in 0 until flagCount) if (b.longBE(flagStarts[k] + 14) == flag) return true
+        return false
+    }
+
     fun clear() {
-        error = null; affected = 0; rowCount = 0
+        error = null; affected = 0; rowCount = 0; flagCount = 0
     }
 }
 

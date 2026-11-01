@@ -15,6 +15,8 @@ pub fn build(b: *std.Build) void {
             .strip = strip,
         }),
     });
+    exe.root_module.link_libc = true;
+    exe.root_module.linkSystemLibrary("deflate", .{});
     b.installArtifact(exe);
 
     // The bcrypt kernel is hand-written assembly that needs the register allocator of an optimized build, so a Debug
@@ -24,6 +26,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = if (optimize == .debug) .safe else optimize,
     }) });
+    tests.root_module.link_libc = true;
+    tests.root_module.linkSystemLibrary("deflate", .{});
     const bc = b.createModule(.{ .root_source_file = b.path("src/bcrypt.zig"), .target = target, .optimize = optimize });
     const bench = b.addExecutable(.{ .name = "bench-bcrypt", .root_module = b.createModule(.{
         .root_source_file = b.path("tools/bench_bcrypt.zig"),

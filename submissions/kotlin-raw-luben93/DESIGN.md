@@ -71,10 +71,28 @@ every Bind asks for binary results. Startup packet `options`:
 - **Per request**, the Authorization header is verified in place in the input buffer (`Exchange.authBuf`: no
   String, no copy); the token String exists only for `/api/user`, which echoes it.
 - **JVM flags** (start.sh): `-XX:+UseTransparentHugePages -XX:+UseSystemMemoryBarrier -XX:-UsePerfData` on G1 with
-  a fixed, pre-touched 1 GB heap. In the lab at saturation (13000 users, think-scale 0.2; 5 runs without, 2 with)
+  a fixed, pre-touched heap (1 GB when these were measured; 3 GB since, `JAVA_HEAP` overrides: 1 GB filled up under
+  the 120k-user overload, see "Overload"). In the lab at saturation (13000 users, think-scale 0.2; 5 runs without, 2 with)
   they took the app from 50.3 to 48.0 us/req, total CPU from 138.7 to 134.5 us/req and req/s from 14266 to 14735.
   ParallelGC failed p95 in one of two runs there (642 ms): its pauses.
   GC itself is negligible (two ~10 ms young collections per 45 s at 8k req/s).
+
+## Overload
+
+The scorer's 120k-user probe is past the box's capacity and is never followed by a restart: the server has to come
+out of it working.
+- **Threads survive any Throwable.** Every catch on an HTTP loop, a Postgres worker and the bcrypt threads changes
+  state or closes first, then logs through `logSafe` (never throws; an OutOfMemoryError gets a constant line), and the
+  thread carries on. A Postgres worker always goes back to a guarded `reconnect()`; `run()` returns only once stopping.
+- **A waiting request holds no response buffer.** `Out` is taken when the response is rendered, not when the request
+  is parsed (~0.5 KB per queued request instead of ~8.8 KB).
+- **Abandoned work is dropped.** `Ex` is its handler coroutine's context element (`RequestKey`), so `ReadPool` and
+  `Passwords` know whose request a queued read or bcrypt job is. If that connection is closed, or the request is older
+  than 10 s (the client's timeout), the job is dropped unrun and its handler is never resumed. Writes always run.
+- **Queue caps.** At `READ_QUEUE_MAX` (65536) queued reads, `WRITE_QUEUE_MAX` (8192) writes or `BCRYPT_QUEUE_MAX`
+  (2048) jobs a flag is set (cleared at 75%) and `App.handle` answers 503 "server busy" on the kept-alive connection.
+  `Db.read`/`Db.write` still always suspend.
+- `OVERLOAD_GUARD=0` turns off the last two. The heap is 3 GB (`JAVA_HEAP`).
 
 ## Postgres-side savings
 
@@ -88,6 +106,34 @@ Two Postgres-side savings beyond batching (measured in the lab, see the commit m
   libc `C`/`POSIX`/`C.*`, builtin `C`/`C.UTF-8`): the per-article `ARRAY(... ORDER BY 1)` drops its Sort node
   (-3 to -7% on article/list statements) and `JsonWriter.textArray(sortBytes = true)` insertion-sorts the 1-4 names
   by bytes. With any other collation SQL keeps sorting (the reference's order). `APP_SORT_TAGS=0` turns it off.
+
+## Shared reads (`READ_SHARE`, default on) and the gather window (`READ_GATHER_MS`, default 20)
+
+Postgres CPU per request was the gap to the top entries (box at the 88k hold: ours 253 us/req, #1 159 us/req, apps
+equal). #1 (rust-epoll-WorriedArrow) gathers reads for 20 ms and answers each distinct key once per batch. Ours now
+does the same inside each kind's batched statement (`ReadShare` in app/Sql.kt), with the same columns and JSON:
+- the requests are a MATERIALIZED CTE; each list's capped count runs once per distinct key (the global count once per
+  execution), each page once per distinct (key, limit, offset), and each distinct article is decorated once (`art`:
+  tags, favorites count, author), then joined back to every request row.
+- favorited/following in the shared lists (`READ_VIEWER_FLAGS`, default on): one favorites_pkey and one follows_pkey
+  scan per signed-in viewer (`= ANY` of the viewer's page articles / authors) instead of two probes per row
+  (60 workload-shaped requests: global list 6.3 -> 3.2 ms, author list 7.6 -> 3.8, tag list 12.9 -> 10.7).
+- article, article read-back, comments (each distinct slug's newest 100 with authors, each distinct viewer's
+  followees once) and profile share by key. Feed and the favorited list stay per request (nothing repeats; the
+  shared shape cost more there).
+- Every keyed LATERAL ends in `OFFSET 0`: pulled up into a plain join, the generic plan (which takes a LIMIT parameter
+  for 10% of the table) hashed all of articles and users per execution (278 ms per 60 requests).
+- `ReadPool` sends a kind once its oldest request has waited `READ_GATHER_MS` or its batch is full
+  (`READ_MAX_BATCH`, 256); a `db-gather` clock thread hands kinds whose window passed to idle connections.
+
+Connections: 8 read + 4 write on the box (one per CPU, one per two). With 6 + 2, the write connections were ~100%
+busy at 120k users waiting on the WAL flush, and the writes' backlog (5% of requests) broke p99; the read connections
+queued while Postgres had idle cores. With 8 + 4 the scorer's search held its 144k cap here (p99 489 ms at the hold).
+
+Lab (2026-10-27, box simulation on 8 of 20 laptop CPUs, lab/reports/omarchy-20261027.md): at 120k users Postgres
+went from 170 to 127 us/req (statement execution 5.4 -> 4.1 cores; the global list 127 -> 44 s per 2 minutes), the
+app from 46 to 40 us/req; the scorer's search held 130k (here) instead of 120k. Per execution, 60 workload-shaped
+requests: global list 15.8 -> 4.8 ms, author list 5.3 -> 3.3, article 0.85 -> 0.50, tag list 11.7 -> 9.3.
 
 ## Contracts (read the KDoc in these files; they are the source of truth)
 
@@ -107,7 +153,8 @@ Two Postgres-side savings beyond batching (measured in the lab, see the commit m
 
 Concurrency rules everybody relies on:
 - `Db.read`/`Db.write`/`Passwords.*` ALWAYS suspend (never complete inline) and resume exactly once, on the
-  worker thread that did the work. Publication to that thread goes through a lock/queue (happens-before).
+  worker thread that did the work (except a read or bcrypt job whose client is gone: see Overload). Publication to
+  that thread goes through a lock/queue (happens-before).
   Implement with `suspendCoroutineUninterceptedOrReturn { c -> enqueue(c); COROUTINE_SUSPENDED }`.
 - A `Result`/`Row` is valid until the resumed code suspends again or returns: copy what must survive.
 - An `Exchange` is answered exactly once; `send` may be called from any thread.
@@ -117,9 +164,10 @@ Concurrency rules everybody relies on:
 
 ## Rules of the challenge we must keep (README.md "Rules")
 No caching across requests of any kind (no result caches, no remembered JWT or bcrypt results); every request
-reads Postgres while being served. Batching shares a STATEMENT, never a result: per-request subqueries must be
-tied to the request row so they run once per request. The one exception is the request-independent tag list
-(broadcast above: one execution for the requests already waiting, as the #1 entry does, nothing retained).
+reads Postgres while being served. A batched statement may share its reads among the requests it serves, all of
+which were already waiting when it was sent; nothing outlives the statement (the #1 entry's reading of rule 5, and
+our tags broadcast above). With `READ_SHARE=0` per-request subqueries are tied to the request row so they run once
+per request (the stricter reading this submission started with).
 bcrypt cost 10 for every hash, every login verifies.
 Every request verifies the HS256 signature and `exp`. Writes are committed before responding. No schema or
 server-config changes; session settings only. <= 95 Postgres connections total.

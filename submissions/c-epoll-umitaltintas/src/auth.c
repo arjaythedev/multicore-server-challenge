@@ -1,6 +1,7 @@
-// JWT (HS256) and bcrypt. HMAC-SHA256 uses OpenSSL's SHA-256 with the key's inner and outer states
-// computed once at startup. bcrypt (libxcrypt) runs on its own threads so the event loops never block on
-// it; a finished job goes back to its loop through a mailbox and an eventfd.
+// JWT (HS256) and the bcrypt thread pool. HMAC-SHA256 uses OpenSSL's SHA-256 with the key's inner and outer
+// states computed once at startup. bcrypt (bcrypt.c, libxcrypt for other formats) runs on its own threads
+// so the event loops never block on it; a finished job goes back to its loop through a mailbox and an
+// eventfd.
 #include "app.h"
 
 #include <crypt.h>
@@ -166,52 +167,116 @@ int jwt_verify(const char *tok, int len, int64_t *uid) {
 // ---- bcrypt pool ----
 
 static pthread_mutex_t bq_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t bq_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t bq_cv;  // CLOCK_MONOTONIC, set up in bcrypt_start
 static job_t *bq_head, *bq_tail;
+static int bq_n;
 
 int bcrypt_nice = 10;
+int bcrypt_lanes = 4;
+int bcrypt_window_ms = 150;
+long dbg_bc_groups, dbg_bc_hashes;  // DEBUG_LOOP counters
+
+// libxcrypt, for hashes bcrypt.c doesn't take (other formats, $2a$ with 8-bit passwords)
+static void bc_slow(job_t *j, const char *setting, struct crypt_data *cd) {
+  char *h = crypt_rn(j->bc_pw, setting, cd, sizeof *cd);
+  if (!j->bc_set) {
+    if (!h) die("crypt failed");
+    j->hash = strdup(h);
+  } else {
+    size_t n = strlen(j->bc_set);
+    j->ok = h && strlen(h) == n && CRYPTO_memcmp(h, j->bc_set, n) == 0;
+  }
+}
+
+static void bc_done(job_t *j) {
+  loop_t *L = j->L;
+  pthread_mutex_lock(&L->mbx_mu);
+  j->link = L->mbx;
+  L->mbx = j;
+  pthread_mutex_unlock(&L->mbx_mu);
+  uint64_t one = 1;
+  if (write(L->evfd, &one, 8) < 0) {}
+}
 
 static void *bcrypt_worker(void *arg) {
-  (void)arg;
+  // Worker 0 takes whatever is queued. The others only start when two full batches are waiting: one
+  // thread with several lanes keeps up with the usual login rate (and fills its lanes better alone), the
+  // rest are spare capacity for when it falls behind.
+  bool helper = (intptr_t)arg != 0;
   // Hashing yields to request handling and Postgres when the CPU is contended: a login waits a little
   // longer instead of every other request waiting behind it.
   if (bcrypt_nice) setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), bcrypt_nice);
   struct crypt_data *cd = calloc(1, sizeof *cd);
   for (;;) {
+    // take up to bcrypt_lanes queued jobs: they are computed together (see bcrypt.c). Worker 0 never
+    // waits for a batch to fill; batches fill up by themselves while it is busy.
+    job_t *jobs[BC_MAXLANES];
+    int nj = 0;
     pthread_mutex_lock(&bq_mu);
-    while (!bq_head) pthread_cond_wait(&bq_cv, &bq_mu);
-    job_t *j = bq_head;
-    bq_head = j->link;
+    while (helper ? bq_n < 2 * bcrypt_lanes : bq_n == 0) pthread_cond_wait(&bq_cv, &bq_mu);
+    if (!helper && bq_n < bcrypt_lanes && bcrypt_window_ms > 0) {
+      // let the batch fill: the oldest job waits up to bcrypt_window_ms for others (logins are ~0.1% of
+      // requests, so at moderate load a batch would otherwise nearly always run one lane)
+      int64_t dl = bq_head->t_us + (int64_t)bcrypt_window_ms * 1000;
+      struct timespec ts = {dl / 1000000, (dl % 1000000) * 1000};
+      while (bq_n < bcrypt_lanes && pthread_cond_timedwait(&bq_cv, &bq_mu, &ts) == 0) {}
+    }
+    while (bq_head && nj < bcrypt_lanes) {
+      jobs[nj++] = bq_head;
+      bq_head = bq_head->link;
+      bq_n--;
+    }
     if (!bq_head) bq_tail = NULL;
     pthread_mutex_unlock(&bq_mu);
 
-    if (!j->bc_set) {
+    bc_req_t q[BC_MAXLANES];
+    job_t *qj[BC_MAXLANES];
+    int nq = 0;
+    for (int i = 0; i < nj; i++) {
+      job_t *j = jobs[i];
       char salt[CRYPT_GENSALT_OUTPUT_SIZE];
-      if (!crypt_gensalt_rn("$2b$", 10, NULL, 0, salt, sizeof salt)) die("crypt_gensalt failed");
-      char *h = crypt_rn(j->bc_pw, salt, cd, sizeof *cd);
-      if (!h) die("crypt failed");
-      j->hash = strdup(h);
-    } else {
-      char *h = crypt_rn(j->bc_pw, j->bc_set, cd, sizeof *cd);
-      size_t n = strlen(j->bc_set);
-      j->ok = h && strlen(h) == n && CRYPTO_memcmp(h, j->bc_set, n) == 0;
+      const char *setting = j->bc_set;
+      if (!setting) {
+        if (!crypt_gensalt_rn("$2b$", 10, NULL, 0, salt, sizeof salt)) die("crypt_gensalt failed");
+        setting = salt;
+      }
+      if (bc_prepare(&q[nq], j->bc_pw, setting) == 0) qj[nq++] = j;
+      else bc_slow(j, setting, cd), bc_done(j);
     }
-
-    loop_t *L = j->L;
-    pthread_mutex_lock(&L->mbx_mu);
-    j->link = L->mbx;
-    L->mbx = j;
-    pthread_mutex_unlock(&L->mbx_mu);
-    uint64_t one = 1;
-    if (write(L->evfd, &one, 8) < 0) {}
+    // one bc_compute per cost (all requests share cost 10 in practice)
+    while (nq > 0) {
+      int cost = q[0].cost, m = 0, rest = 0;
+      bc_req_t grp[BC_MAXLANES];
+      job_t *gj[BC_MAXLANES];
+      for (int i = 0; i < nq; i++) {
+        if (q[i].cost == cost) grp[m] = q[i], gj[m++] = qj[i];
+        else q[rest] = q[i], qj[rest++] = qj[i];
+      }
+      nq = rest;
+      bc_compute(grp, m);
+      __atomic_fetch_add(&dbg_bc_groups, 1, __ATOMIC_RELAXED);
+      __atomic_fetch_add(&dbg_bc_hashes, m, __ATOMIC_RELAXED);
+      for (int i = 0; i < m; i++) {
+        job_t *j = gj[i];
+        if (!j->bc_set) j->hash = strdup(grp[i].out);
+        else j->ok = strlen(j->bc_set) == 60 && CRYPTO_memcmp(grp[i].out, j->bc_set, 60) == 0;
+        bc_done(j);
+      }
+      memset(grp, 0, sizeof grp);
+    }
+    memset(q, 0, sizeof q);
   }
   return NULL;
 }
 
 void bcrypt_start(int n) {
+  pthread_condattr_t ca;
+  pthread_condattr_init(&ca);
+  pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+  pthread_cond_init(&bq_cv, &ca);
   for (int i = 0; i < n; i++) {
     pthread_t t;
-    pthread_create(&t, NULL, bcrypt_worker, NULL);
+    pthread_create(&t, NULL, bcrypt_worker, (void *)(intptr_t)i);
   }
 }
 
@@ -221,7 +286,11 @@ static void bq_push(job_t *j) {
   if (bq_tail) bq_tail->link = j;
   else bq_head = j;
   bq_tail = j;
-  pthread_cond_signal(&bq_cv);
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  j->t_us = (int64_t)now.tv_sec * 1000000 + now.tv_nsec / 1000;
+  bq_n++;
+  pthread_cond_broadcast(&bq_cv);
   pthread_mutex_unlock(&bq_mu);
 }
 

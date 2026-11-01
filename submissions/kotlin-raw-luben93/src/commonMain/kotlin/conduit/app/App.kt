@@ -1,5 +1,7 @@
 package conduit.app
 
+import conduit.auth.Passwords
+import conduit.db.Db
 import conduit.db.ReadKind
 import conduit.db.WriteStmt
 import conduit.http.Exchange
@@ -11,13 +13,29 @@ object App {
      * datlocale) from [COLLATION_PROBE]; with a byte-order collation the app sorts tag lists itself, unless
      * [appSortsTags] is false.
      */
-    fun configure(collation: List<String?>?, appSortsTags: Boolean = true) {
+    fun configure(
+        collation: List<String?>?,
+        appSortsTags: Boolean = true,
+        shareReads: Boolean = false,
+        shareMaxBatch: Int = ReadShare.maxBatch,
+        viewerFlags: Boolean = false,
+        feedMaxBatch: Int = 0,
+    ) {
         TagOrder.appSorts = appSortsTags && collation != null &&
             TagOrder.isByteOrder(collation[0] ?: "", collation[1] ?: "", collation[2] ?: "")
+        ReadShare.on = shareReads
+        ReadShare.maxBatch = shareMaxBatch
+        ReadShare.viewerFlags = viewerFlags
+        ReadShare.feedMaxBatch = feedMaxBatch
     }
 
     /** Who sorts tag lists (for the startup log line). */
     val tagOrder: String get() = if (TagOrder.appSorts) "app" else "sql"
+
+    /** How batched reads work (for the startup log line), see [ReadShare]. */
+    val readMode: String
+        get() = if (!ReadShare.on) "per request" else "shared, up to ${ReadShare.maxBatch} per batch" +
+            if (ReadShare.viewerFlags) ", flags per viewer" else ""
 
     const val COLLATION_PROBE = TagOrder.PROBE
 
@@ -27,9 +45,23 @@ object App {
     /** Every write statement, prepared on every connection at startup. */
     val writes: List<WriteStmt> get() = Sql.writes
 
+    /**
+     * The queue this route's handler waits in is full (caps: [conduit.db.DbConfig.readQueueMax] and its siblings, set
+     * in Main). Answered inline, before anything is queued: the work already queued is bounded this way.
+     */
+    private fun busy(route: Int): Boolean = when (route) {
+        Route.NOT_FOUND -> false
+        Route.REGISTER, Route.LOGIN -> Passwords.saturated
+        Route.USER_PUT, Route.FOLLOW, Route.UNFOLLOW, Route.ARTICLE_CREATE, Route.ARTICLE_PUT, Route.ARTICLE_DELETE,
+        Route.FAVORITE, Route.UNFAVORITE, Route.COMMENT_CREATE, Route.COMMENT_DELETE -> Db.writesSaturated
+        else -> Db.readsSaturated
+    }
+
     /** Handles one request; must answer it exactly once (see [Exchange]). */
     suspend fun handle(ex: Exchange) {
         val m = Router.match(ex.method, ex.path)
+        // 503 on a kept-alive connection: closing it would only make the client redial, at the worst moment
+        if (busy(m.route)) return ex.sendError(503, "server busy")
         when (m.route) {
             // No auth at all: tags ignores the header entirely, register/login don't use it.
             Route.TAGS -> return Handlers.tags(ex)

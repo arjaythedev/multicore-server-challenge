@@ -70,6 +70,36 @@ object Render:
     profile(out, row, i + 5, row.bool(i + 8))
     out.byte('}')
 
+  /** What [[article]] writes of an article that is the same for every viewer, from the row's slug, title,
+    * description, created_at, updated_at, tag_list, favorites_count, username, bio and image at `at` on: up to
+    * `favorited`'s value, then (from the length it returns) up to `following`'s. A viewer's article is the first part,
+    * its `favorited`, the second, its `following`, then `}}`.
+    */
+  def sharedArticle(out: Out, row: PgRow, at: Int): Int =
+    out.bytes(SlugKey)
+    row.text(at, out)
+    out.bytes(TitleKey)
+    row.text(at + 1, out)
+    out.bytes(DescriptionKey)
+    row.text(at + 2, out)
+    out.bytes(TagListKey)
+    row.textArray(at + 5, out)
+    out.bytes(CreatedAtKey)
+    row.timestamp(at + 3, out)
+    out.bytes(UpdatedAtKey)
+    row.timestamp(at + 4, out)
+    out.bytes(FavoritedKey)
+    val split = out.length
+    out.bytes(FavoritesCountKey).long(row.int8(at + 6))
+    out.bytes(AuthorKey).bytes(UsernameKey)
+    row.text(at + 7, out)
+    out.bytes(BioKey)
+    row.textOrNull(at + 8, out)
+    out.bytes(ImageKey)
+    row.textOrNull(at + 9, out)
+    out.bytes(FollowingKey)
+    split
+
   /** A profile from the row's username, bio and image at `at` on. */
   def profile(out: Out, row: PgRow, at: Int, following: Boolean): Unit =
     out.bytes(UsernameKey)

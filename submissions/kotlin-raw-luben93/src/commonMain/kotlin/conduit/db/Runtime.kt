@@ -77,6 +77,7 @@ internal class DbRuntime(@JvmField val config: DbConfig, reads: List<ReadKind>, 
         }
         startWorkers(readPool, readPool.workers, conns.subList(0, config.readConns))
         startWorkers(writePool, writePool.workers, conns.subList(config.readConns, total))
+        readPool.startGatherClock()
     }
 
     private fun startWorkers(pool: Pool, workers: Array<out Worker>, conns: List<PgConn>) {
@@ -131,6 +132,9 @@ internal class DbRuntime(@JvmField val config: DbConfig, reads: List<ReadKind>, 
     }
 
     fun stats(): String = readPool.stats() + "; " + writePool.stats()
+
+    fun intervalStats(intervalNanos: Long): String =
+        readPool.intervalStats(intervalNanos) + " || " + writePool.intervalStats(intervalNanos)
 
     /**
      * Tests only: closes every connection and lets the workers exit instead of reconnecting. In-flight requests get

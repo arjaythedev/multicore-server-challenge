@@ -1,0 +1,25 @@
+[package]
+name = "conduit"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+tokio = { version = "=1.53.2", features = ["rt-multi-thread", "net", "sync", "time", "io-util"] }
+tokio-postgres = { version = "=0.7.18", default-features = false, features = ["runtime"] }
+httparse = "=1.10.1"
+serde_json = "=1.0.154"
+hmac = "=0.12.1"
+sha2 = "=0.10.9"
+base64 = "=0.22.1"
+itoa = "=1.0.18"
+mimalloc = { version = "=0.1.52", default-features = false }
+
+[dev-dependencies]
+bcrypt = "=0.19.3" # cross-checks src/bcrypt.rs in tests
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

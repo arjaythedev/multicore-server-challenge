@@ -30,11 +30,19 @@ object Sql:
     * row `u`, for viewer `viewer`.
     */
   private def tail(a: String, viewer: String, following: String = "") =
-    s"""ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at WHERE at.article_id = $a.id ORDER BY 1),
-       |(SELECT count(*) FROM favorites f WHERE f.article_id = $a.id),
-       |EXISTS (SELECT 1 FROM favorites f WHERE f.user_id = $viewer AND f.article_id = $a.id),
+    s"""${tagNames(a)},
+       |${favoritesCount(a)},
+       |${favorited(a, viewer)},
        |u.username, u.bio, u.image,
-       |${if following.nonEmpty then following else s"EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $viewer AND fo.followee_id = $a.author_id)"}""".stripMargin
+       |${if following.nonEmpty then following else follows(s"$a.author_id", viewer)}""".stripMargin
+
+  private def tagNames(a: String) =
+    s"ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at WHERE at.article_id = $a.id ORDER BY 1)"
+  private def favoritesCount(a: String) = s"(SELECT count(*) FROM favorites f WHERE f.article_id = $a.id)"
+  private def favorited(a: String, viewer: String) =
+    s"EXISTS (SELECT 1 FROM favorites f WHERE f.user_id = $viewer AND f.article_id = $a.id)"
+  private def follows(author: String, viewer: String) =
+    s"EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $viewer AND fo.followee_id = $author)"
 
   private val Full = "a.slug, a.title, a.description, a.body, a.created_at, a.updated_at"
   private val Short = "a.slug, a.title, a.description, a.created_at, a.updated_at"
@@ -64,53 +72,44 @@ object Sql:
     Int8, Int8, Int8,
   )
 
+  private val ByTag = "FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = $4)"
+  private val TagCount = s"SELECT 1 $ByTag"
+  private val TagPage = paged(s"SELECT at.article_id AS id $ByTag", "id")
+
   // $4 tag
-  val ListByTag: Statement = statement(
-    list(
-      "SELECT 1 FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = $4)",
-      paged("SELECT at.article_id AS id FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = $4)", "id"),
-      rows = false,
-    ),
-    Int8, Int8, Int8, Text,
-  )
+  val ListByTag: Statement = statement(list(TagCount, TagPage, rows = false), Int8, Int8, Int8, Text)
+
+  private val AuthorCount = "SELECT 1 FROM articles a WHERE a.author_id = (SELECT u.id FROM users u WHERE u.username = $4)"
 
   // $4 author's username
   val ListByAuthor: Statement = statement(
     list(
-      "SELECT 1 FROM articles a WHERE a.author_id = (SELECT u.id FROM users u WHERE u.username = $4)",
+      AuthorCount,
       paged(s"SELECT $PageColumns FROM articles WHERE author_id = (SELECT u.id FROM users u WHERE u.username = $$4)", "id"),
       rows = true,
     ),
     Int8, Int8, Int8, Text,
   )
 
+  private val ByFavoriter = "FROM favorites f WHERE f.user_id = (SELECT u.id FROM users u WHERE u.username = $4)"
+  private val FavoritedCount = s"SELECT 1 $ByFavoriter"
+  private val FavoritedPage = paged(s"SELECT f.article_id AS id $ByFavoriter", "id")
+
   // $4 the username whose favorites these are
-  val ListByFavorited: Statement = statement(
-    list(
-      "SELECT 1 FROM favorites f WHERE f.user_id = (SELECT u.id FROM users u WHERE u.username = $4)",
-      paged("SELECT f.article_id AS id FROM favorites f WHERE f.user_id = (SELECT u.id FROM users u WHERE u.username = $4)", "id"),
-      rows = false,
-    ),
-    Int8, Int8, Int8, Text,
+  val ListByFavorited: Statement = statement(list(FavoritedCount, FavoritedPage, rows = false), Int8, Int8, Int8, Text)
+
+  private val FeedCount = "SELECT 1 FROM articles a WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $1)"
+  private val FeedPage = paged(
+    """SELECT x.id FROM follows fo CROSS JOIN LATERAL
+      |  (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT ($2 + $3)) x
+      |WHERE fo.follower_id = $1""".stripMargin,
+    "id",
   )
 
   /** The viewer's feed: the newest `$2 + $3` of each followed author's articles, merged. The viewer follows every
     * author in it, in the statement's own snapshot, so `following` is true without a probe.
     */
-  val Feed: Statement = statement(
-    list(
-      "SELECT 1 FROM articles a WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $1)",
-      paged(
-        """SELECT x.id FROM follows fo CROSS JOIN LATERAL
-          |  (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT ($2 + $3)) x
-          |WHERE fo.follower_id = $1""".stripMargin,
-        "id",
-      ),
-      rows = false,
-      following = "true",
-    ),
-    Int8, Int8, Int8,
-  )
+  val Feed: Statement = statement(list(FeedCount, FeedPage, rows = false, following = "true"), Int8, Int8, Int8)
 
   // $1 viewer, $2 slug
   val ArticleBySlug: Statement = statement(
@@ -281,42 +280,112 @@ object Sql:
 
   /** A read whose waiting requests share one statement ([[PgPool]] sends the requests of a kind waiting for a
     * connection together): `batched` runs `single` once per request, in a `LATERAL` subquery over the requests'
-    * parameters as arrays, one element per request (`$1` the number of requests when there are none), and tags each
-    * request's rows with its place in the batch, from 1, in an extra last column. Much of a small statement's cost is
-    * per statement (executor start and end, a transaction, a snapshot, the protocol's messages), not per row.
+    * parameters as arrays, one element per request, and tags each request's rows with its place in the batch, from 1,
+    * in an extra last column. Much of a small statement's cost is per statement (executor start and end, a
+    * transaction, a snapshot, the protocol's messages), not per row.
     *
-    * Each request still gets its own execution, in the statement's snapshot, and nothing is shared between requests
-    * (rule 5): parts with no parameter depend on the request's place (`r.i > 0`) so that Postgres runs them once per
-    * request rather than once per statement, and the session runs without Memoize ([[PgConnection]]), which would hand
-    * one request rows cached for another.
+    * The requests that wait together may share what they read, within the statement (rule 5: they read it from
+    * Postgres while they are served, and nothing is kept once the statement is answered). The lists' batches
+    * ([[packedList]]) read each article once however many of their requests' pages have it (and the global list's
+    * count once), and are `packed`: a row for each article, then a row for each request. A `shared`
+    * batch, a statement without parameters, is the statement itself, run once for all the requests in it, and each of
+    * its rows goes to every one of them. The sessions run without Memoize ([[PgConnection]]).
     */
-  final class Batch private[Sql] (val id: Int, val single: Statement, val batched: Statement):
+  final class Batch private[Sql] (val id: Int, val single: Statement, val batched: Statement, val shared: Boolean,
+      val packed: Boolean):
     def paramTypes: Array[Int] = single.paramTypes
 
   private val batches = collection.mutable.ArrayBuffer[Batch]()
 
-  private def batch(single: Statement, body: String = null): Batch =
-    val types = single.paramTypes
-    val inner = (types.length to 1 by -1).foldLeft(if body == null then single.sql else body)((sql, i) => sql.replace("$" + i, s"r.p$i"))
-    val (from, params) =
-      if types.isEmpty then ("generate_series(1, $1::int8) AS r(i)", Seq(Int4))
-      else
-        val arrays = types.indices.map(i => s"$$${i + 1}::${if types(i) == Int8 then "int8" else "text"}[]").mkString(", ")
-        val columns = types.indices.map(i => s"p${i + 1}").mkString(", ")
-        (s"unnest($arrays) WITH ORDINALITY AS r($columns, i)", types.toSeq.map(t => if t == Int8 then Int8Array else TextArray))
-    val b = Batch(batches.length + 1, single, statement(s"SELECT q.*, r.i FROM $from CROSS JOIN LATERAL ($inner) q", params*))
+  private def shared(single: Statement): Batch =
+    require(single.paramTypes.isEmpty, single.sql)
+    val b = Batch(batches.length + 1, single, single, shared = true, packed = false)
     batches += b
     b
 
-  batch(ListAll, list("SELECT 1 FROM articles WHERE r.i > 0", paged(s"SELECT $PageColumns FROM articles", "id"), rows = true))
-  batch(ListByTag)
-  batch(ListByAuthor)
-  batch(ListByFavorited)
-  batch(Feed)
+  private def batch(single: Statement): Batch =
+    batched(single, from => s"SELECT q.*, r.i FROM $from CROSS JOIN LATERAL (${perRequest(single, single.sql)}) q")
+
+  /** `single`'s batch, `sql(from)` over the requests' parameters as rows `from`: `r(p1, ..., pn, i)`. */
+  private def batched(single: Statement, sql: String => String, packed: Boolean = false): Batch =
+    val types = single.paramTypes
+    require(types.nonEmpty, single.sql)
+    val arrays = types.indices.map(i => s"$$${i + 1}::${if types(i) == Int8 then "int8" else "text"}[]").mkString(", ")
+    val columns = types.indices.map(i => s"p${i + 1}").mkString(", ")
+    val params = types.toSeq.map(t => if t == Int8 then Int8Array else TextArray)
+    val b = Batch(batches.length + 1, single, statement(sql(s"unnest($arrays) WITH ORDINALITY AS r($columns, i)"), params*),
+      shared = false, packed)
+    batches += b
+    b
+
+  /** `sql`, with `single`'s parameters as the request's (`r.p1` ...). */
+  private def perRequest(single: Statement, sql: String) =
+    (single.paramTypes.length to 1 by -1).foldLeft(sql)((sql, i) => sql.replace("$" + i, s"r.p$i"))
+
+  /** A list's batch that reads each article once however many of its requests' pages have it (most requests for the
+    * global list ask for its first page), packed ([[Columns.Packed]]): per request its count and its page's ids
+    * (`count` and `page` as [[list]] takes them, `page` yielding `id`s), then each distinct article with its tags,
+    * favorites count and author, as a row of its own; then a row per request: its count, its page's ids newest first,
+    * those it favorited and the authors it follows among them (null for the feed, where it follows all). A count that
+    * depends on no parameter runs once. The articles' rows come first ([[BatchQuery]]): a `UNION ALL`, run in order.
+    *
+    * The feed's count is capped at 1,000 and most viewers follow an author with that many articles, whose count is
+    * then 1,000 without walking 1,000 index entries: the four authors most followed among the batch's viewers (by
+    * two at least) are each checked once (`b`), and a viewer who follows one of them counts 1,000. A probe bounded
+    * by `LIMIT 1`, which the generic plan can't turn into a hash of all their followers; `OFFSET 0` keeps the count
+    * once per request rather than per page row.
+    */
+  private def packedList(single: Statement, count: String, page: String, feed: Boolean = false): Batch =
+    val following =
+      if feed then "NULL::int8[]"
+      else "ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = q.p1 AND fo.followee_id = ANY(q.authors))"
+    val counted = s"count(*) AS n FROM (${perRequest(single, count)} LIMIT 1000) s"
+    val (big, n) =
+      if !feed then ("", counted)
+      else (
+        """b AS MATERIALIZED (
+          |  SELECT ARRAY(
+          |    SELECT x.f FROM (
+          |      SELECT fo.followee_id AS f FROM r JOIN follows fo ON fo.follower_id = r.p1
+          |      GROUP BY 1 HAVING count(*) >= 2 ORDER BY count(*) DESC, 1 LIMIT 4) x
+          |    WHERE EXISTS (SELECT 1 FROM articles a WHERE a.author_id = x.f OFFSET 999)) AS ids),
+          |""".stripMargin,
+        s"""CASE WHEN (SELECT true FROM follows fo WHERE fo.follower_id = r.p1 AND fo.followee_id = ANY((SELECT b.ids FROM b)::int8[])
+           |  LIMIT 1) THEN 1000::int8 ELSE (SELECT $counted) END AS n OFFSET 0""".stripMargin,
+      )
+    batched(single, packed = true, sql = from =>
+      s"""WITH r AS MATERIALIZED (SELECT * FROM $from),
+         |${big}p AS MATERIALIZED (
+         |  SELECT r.i, r.p1, c.n, x.id FROM r
+         |  CROSS JOIN LATERAL (SELECT $n) c
+         |  LEFT JOIN LATERAL (${perRequest(single, page)}) x ON true),
+         |m AS MATERIALIZED (
+         |  SELECT a.id, a.author_id, $Short, ${tagNames("a")} AS tag_list, ${favoritesCount("a")} AS favorites_count,
+         |    u.username, u.bio, u.image
+         |  FROM (SELECT DISTINCT id FROM p WHERE id IS NOT NULL) d JOIN articles a ON a.id = d.id JOIN users u ON u.id = a.author_id),
+         |q AS (
+         |  SELECT p.i, p.p1, p.n, array_agg(m.id ORDER BY m.id DESC) FILTER (WHERE m.id IS NOT NULL) AS ids,
+         |    array_agg(m.author_id) FILTER (WHERE m.id IS NOT NULL) AS authors
+         |  FROM p LEFT JOIN m ON m.id = p.id GROUP BY p.i, p.p1, p.n)
+         |SELECT NULL::int8, m.slug, m.title, m.description, m.created_at, m.updated_at, m.tag_list, m.favorites_count,
+         |  m.username, m.bio, m.image, m.id, m.author_id, NULL::int8[], NULL::int8[], NULL::int8[], 0::int8
+         |FROM m
+         |UNION ALL
+         |SELECT q.n, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, q.ids,
+         |  ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id = q.p1 AND f.article_id = ANY(q.ids)),
+         |  $following, q.i
+         |FROM q""".stripMargin
+    )
+
+  packedList(ListAll, "SELECT 1 FROM articles", paged("SELECT id FROM articles", "id"))
+  packedList(ListByTag, TagCount, TagPage)
+  packedList(ListByAuthor, AuthorCount, paged("SELECT id FROM articles WHERE author_id = (SELECT u.id FROM users u WHERE u.username = $4)", "id"))
+  packedList(ListByFavorited, FavoritedCount, FavoritedPage)
+  packedList(Feed, FeedCount, FeedPage, feed = true)
   batch(ArticleBySlug)
   batch(Comments)
   batch(Profile)
-  batch(Tags, "SELECT name FROM tags WHERE r.i > 0 ORDER BY name")
+  shared(Tags)
   batch(CurrentUser)
 
   /** The kinds of batch, by [[Batch.id]] from 1. */
@@ -338,3 +407,17 @@ object Columns:
   val FullArticle = 0
   /** After the author's id. */
   val UpdatedArticle = 1
+
+  /** A packed list batch's rows ([[Sql]]'s `packedList`): an article's (the last column 0) has its columns from
+    * [[Article]] on without `favorited` and `following`, then [[Id]] and [[Author]]; a request's has [[Count]],
+    * [[Ids]], [[Favorited]] and [[Following]].
+    */
+  object Packed:
+    val Count = 0
+    /** slug, title, description, created_at, updated_at, tag_list, favorites_count, username, bio, image. */
+    val Article = 1
+    val Id = 11
+    val Author = 12
+    val Ids = 13
+    val Favorited = 14
+    val Following = 15

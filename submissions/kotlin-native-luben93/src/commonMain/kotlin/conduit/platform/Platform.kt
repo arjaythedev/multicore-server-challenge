@@ -16,10 +16,19 @@ expect fun nanoTime(): Long
 /** Wall clock, milliseconds since the Unix epoch. */
 expect fun currentTimeMillis(): Long
 
+/**
+ * Whether [e] is an OutOfMemoryError (which common Kotlin has no type for). Error paths ask before they build any
+ * message: with the heap exhausted, every allocation there can throw again.
+ */
+expect fun isOutOfMemory(e: Throwable): Boolean
+
 /** Fills [dst] with cryptographically secure random bytes (bcrypt salts, SCRAM nonces). */
 expect fun secureRandomBytes(dst: ByteArray)
 
 expect fun getenv(name: String): String?
+
+/** A small text file's contents (e.g. /proc counters), or null if it cannot be read. */
+expect fun readTextFile(path: String): String?
 
 /** CPUs this process may run on (affinity-aware where the platform allows). */
 expect fun cpuCount(): Int
@@ -80,6 +89,12 @@ expect class HmacSha256(key: ByteArray) {
 
 /** SHA-256 digest (one-shot; SCRAM only, not on hot paths). */
 expect fun sha256(data: ByteArray): ByteArray
+
+/**
+ * The 8 bytes b[p, p+8) as a little-endian Long, in one (unaligned) load where the platform has one: lets hot
+ * scanners (JSON string escaping) test 8 bytes per step. The caller guarantees p + 8 <= b.size.
+ */
+expect fun loadLongLE(b: ByteArray, p: Int): Long
 
 /** Per-thread scratch objects (one per OS thread, created lazily). */
 class Scratch {

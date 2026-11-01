@@ -7,6 +7,7 @@ pub const Buf = struct {
     ptr: [*]u8 = undefined,
     len: usize = 0,
     cap: usize = 0,
+    pool: ?*Pool = null,
 
     pub fn init(cap: usize) !Buf {
         const m = try gpa.alloc(u8, cap);
@@ -30,7 +31,12 @@ pub const Buf = struct {
         var ncap = if (self.cap == 0) 4096 else self.cap;
         while (ncap < need) ncap *= 2;
         const old = self.ptr[0..self.cap];
-        const m = if (self.cap == 0)
+        const m = if (self.pool) |pool| blk: {
+            const next = pool.take(ncap);
+            if (self.len != 0) @memcpy(next[0..self.len], old[0..self.len]);
+            if (self.cap != 0) pool.release(old);
+            break :blk next;
+        } else if (self.cap == 0)
             gpa.alloc(u8, ncap) catch @panic("out of memory")
         else
             gpa.realloc(old, ncap) catch @panic("out of memory");
@@ -69,3 +75,66 @@ pub const Buf = struct {
         self.len += n;
     }
 };
+
+/// Worker-local response storage. Each class retains at most 256 KiB, or one large
+/// allocation; buffers above 4 MiB are never retained. No cross-request data is cached.
+pub const Pool = struct {
+    slots: [11][64][*]u8 = undefined,
+    counts: [11]usize = @splat(0),
+
+    fn class(cap: usize) ?usize {
+        if (cap < 4096 or cap > 4 * 1024 * 1024 or !std.math.isPowerOfTwo(cap)) return null;
+        return @ctz(cap) - 12;
+    }
+
+    pub fn take(self: *Pool, cap: usize) []u8 {
+        if (class(cap)) |k| {
+            if (self.counts[k] != 0) {
+                self.counts[k] -= 1;
+                return self.slots[k][self.counts[k]][0..cap];
+            }
+        }
+        return gpa.alloc(u8, cap) catch @panic("out of memory");
+    }
+
+    pub fn release(self: *Pool, bytes: []u8) void {
+        if (class(bytes.len)) |k| {
+            const limit = @max(1, @min(64, 256 * 1024 / bytes.len));
+            if (self.counts[k] < limit) {
+                self.slots[k][self.counts[k]] = bytes.ptr;
+                self.counts[k] += 1;
+                return;
+            }
+        }
+        gpa.free(bytes);
+    }
+
+    pub fn deinit(self: *Pool) void {
+        for (self.counts, 0..) |n, k| {
+            for (self.slots[k][0..n]) |p| gpa.free(p[0 .. @as(usize, 4096) << @intCast(k)]);
+        }
+        self.counts = @splat(0);
+    }
+};
+
+test "response pool reuses every bounded size class and preserves growing data" {
+    var pool: Pool = .{};
+    defer pool.deinit();
+    var b: Buf = .{ .pool = &pool };
+    defer b.deinit();
+    b.putSlice("retained data");
+    const first = b.ptr;
+    b.ensure(8192);
+    try std.testing.expectEqualStrings("retained data", b.slice());
+    const reused = pool.take(4096);
+    try std.testing.expectEqual(first, reused.ptr);
+    pool.release(reused);
+    for (0..11) |k| {
+        const size = @as(usize, 4096) << @intCast(k);
+        const bytes = pool.take(size);
+        pool.release(bytes);
+        const again = pool.take(size);
+        try std.testing.expectEqual(bytes.ptr, again.ptr);
+        pool.release(again);
+    }
+}

@@ -125,3 +125,63 @@ class PgSuite extends munit.FunSuite:
     val group = sent(writes)
     group.done(PgError.ConnectionLost)
     assert(writes.forall(w => w.resets == 0 && (w.error eq PgError.ConnectionLost)))
+
+  /** A DataRow's content: each column a value written by its function, or null. */
+  private def dataRow(columns: (io.netty.buffer.ByteBuf => Unit)*): PgRow =
+    val b = Unpooled.buffer()
+    b.writeShort(columns.length)
+    for c <- columns do
+      if c == null then b.writeInt(-1)
+      else
+        val v = Unpooled.buffer()
+        c(v)
+        b.writeInt(v.readableBytes).writeBytes(v)
+    val row = PgRow()
+    row.load(b, 0)
+    row
+
+  private def int8(x: Long): io.netty.buffer.ByteBuf => Unit = _.writeLong(x)
+  private def bool(x: Boolean): io.netty.buffer.ByteBuf => Unit = _.writeByte(if x then 1 else 0)
+  private def text(s: String): io.netty.buffer.ByteBuf => Unit = _.writeBytes(s.getBytes(UTF_8))
+  private def texts(s: String*): io.netty.buffer.ByteBuf => Unit = b =>
+    b.writeInt(1).writeInt(0).writeInt(Oid.Text).writeInt(s.length).writeInt(1)
+    for x <- s do b.writeInt(x.length).writeBytes(x.getBytes(UTF_8))
+  private def int8s(xs: Long*): io.netty.buffer.ByteBuf => Unit = b =>
+    if xs.isEmpty then b.writeInt(0).writeInt(0).writeInt(20)
+    else
+      b.writeInt(1).writeInt(0).writeInt(20).writeInt(xs.length).writeInt(1)
+      for x <- xs do b.writeInt(8).writeLong(x)
+
+  test("int8 arrays, read in place"):
+    val row = dataRow(int8s(9, 7, 12), int8s(), null)
+    assertEquals((row.int8ArrayLength(0), row.int8ArrayAt(0, 0), row.int8ArrayAt(0, 2)), (3, 9L, 12L))
+    assert(row.int8ArrayHas(0, 7) && !row.int8ArrayHas(0, 8))
+    assertEquals((row.int8ArrayLength(1), row.int8ArrayLength(2)), (0, 0))
+    assert(!row.int8ArrayHas(1, 0) && !row.int8ArrayHas(2, 0))
+
+  test("a packed batch's articles, copied with each viewer's flags, are the articles Render.article writes"):
+    // slug, title, description, created_at, updated_at, tag_list, favorites_count, then the author's.
+    def article(id: Long, author: Long, slug: String, bio: String) = Seq[io.netty.buffer.ByteBuf => Unit](
+      text(slug), text("T \"q\""), text("dé"), int8(id * 1_000_000), int8(id * 2_000_000), texts("b", "a\\"),
+      int8(id + 100), text(s"u$author"), if bio == null then null else text(bio), null,
+    )
+    val articles = Seq((7L, 3L, "seven", "bio"), (9L, 4L, "nine", null), (11L, 3L, "eleven", "x\ny"))
+    val outs = Out.Pool()
+    val packed = PackedArticles(outs)
+    for (id, author, slug, bio) <- articles.reverse do
+      packed.row(dataRow((null +: article(id, author, slug, bio)) ++ Seq(int8(id), int8(author), null, null, null, int8(0))*))
+    val viewer = dataRow((int8(3) +: Seq.fill(12)(null)) ++ Seq(int8s(11, 9, 7), int8s(7), int8s(4), int8(1))*)
+    val got = Out()
+    val expected = Out()
+    for k <- 0 until viewer.int8ArrayLength(13) do
+      val id = viewer.int8ArrayAt(13, k)
+      val (_, author, slug, bio) = articles.find(_._1 == id).get
+      val a = packed.find(id)
+      assertEquals(packed.author(a), author)
+      packed.write(got, a, viewer.int8ArrayHas(14, id), viewer.int8ArrayHas(15, author))
+      val (shared, ownerInfo) = article(id, author, slug, bio).splitAt(7)
+      val listRow = dataRow((int8(3) +: shared) ++ (bool(id == 7) +: ownerInfo) :+ bool(author == 4)*)
+      Render.article(expected, listRow, Columns.ListArticle, withBody = false)
+    assertEquals(got.body, expected.body)
+    assertEquals(packed.find(8), -1)
+    packed.release()

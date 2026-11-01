@@ -5,76 +5,145 @@ use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+struct Inner<T> {
+    q: VecDeque<T>,
+    /// When the oldest queued item arrived (after a partial take: when the oldest taken one did, an upper bound).
+    since: Option<Instant>,
+    /// A `take_aged` waiter's threshold: pushes below it don't wake anyone (the waiter's timer covers the age).
+    hold: usize,
+    /// Threads blocked on the condvar.
+    waiting: usize,
+}
+
 pub struct Queue<T> {
-    q: Mutex<VecDeque<T>>,
+    m: Mutex<Inner<T>>,
     cv: Condvar,
 }
 
 impl<T> Queue<T> {
     pub const fn new() -> Queue<T> {
-        Queue { q: Mutex::new(VecDeque::new()), cv: Condvar::new() }
+        Queue { m: Mutex::new(Inner { q: VecDeque::new(), since: None, hold: 0, waiting: 0 }), cv: Condvar::new() }
+    }
+
+    /// Pushes; returns whether a waiter needs waking.
+    fn push_inner(&self, item: T) -> bool {
+        let mut g = self.m.lock().unwrap();
+        if g.q.is_empty() {
+            g.since = Some(Instant::now());
+        }
+        g.q.push_back(item);
+        let n = g.q.len();
+        g.waiting > 0 && (n == 1 || n >= g.hold)
+    }
+
+    fn wait<'a>(&self, mut g: std::sync::MutexGuard<'a, Inner<T>>) -> std::sync::MutexGuard<'a, Inner<T>> {
+        g.waiting += 1;
+        let mut g = self.cv.wait(g).unwrap();
+        g.waiting -= 1;
+        g
+    }
+
+    fn wait_timeout<'a>(&self, mut g: std::sync::MutexGuard<'a, Inner<T>>, d: Duration) -> std::sync::MutexGuard<'a, Inner<T>> {
+        g.waiting += 1;
+        let mut g = self.cv.wait_timeout(g, d).unwrap().0;
+        g.waiting -= 1;
+        g
     }
 
     pub fn push(&self, item: T) {
-        self.q.lock().unwrap().push_back(item);
-        self.cv.notify_one();
+        if self.push_inner(item) {
+            self.cv.notify_one();
+        }
     }
 
     /// Push and wake every waiter (for queues whose consumers wait on different conditions).
     pub fn push_all(&self, item: T) {
-        self.q.lock().unwrap().push_back(item);
-        self.cv.notify_all();
+        if self.push_inner(item) {
+            self.cv.notify_all();
+        }
     }
 
-    /// Blocks until at least one item is queued, then takes up to `max`.
-    pub fn take(&self, max: usize, out: &mut Vec<T>) {
-        let mut q = self.q.lock().unwrap();
-        while q.is_empty() {
-            q = self.cv.wait(q).unwrap();
-        }
-        let n = q.len().min(max);
-        out.extend(q.drain(..n));
-        if !q.is_empty() {
-            self.cv.notify_one();
+    fn drain(g: &mut Inner<T>, n: usize, out: &mut Vec<T>) {
+        out.extend(g.q.drain(..n));
+        // Items left behind (a backlog past one batch) keep the old timestamp: they are at least that old already,
+        // so the next take doesn't make them wait another window.
+        if g.q.is_empty() {
+            g.since = None;
         }
     }
 
     /// Blocks until at least `want` items are queued, then takes `want`.
     pub fn take_full(&self, want: usize, out: &mut Vec<T>) {
-        let mut q = self.q.lock().unwrap();
-        while q.len() < want {
-            q = self.cv.wait(q).unwrap();
+        let mut g = self.m.lock().unwrap();
+        while g.q.len() < want {
+            g = self.wait(g);
         }
-        out.extend(q.drain(..want));
-        if !q.is_empty() {
+        Self::drain(&mut g, want, out);
+        if !g.q.is_empty() && g.waiting > 0 {
             self.cv.notify_all();
         }
     }
 
-    /// Blocks until one item is queued, then waits up to `window` for `want` items before taking up to `want`.
+    /// Blocks until one item is queued, then waits up to `window` (from that moment) for `want` items before taking
+    /// up to `want`.
     pub fn take_gather(&self, want: usize, window: Duration, out: &mut Vec<T>) {
-        self.take_window(want, window, want, out)
-    }
-
-    /// Blocks until one item is queued, then waits up to `window` (from that moment) until at least `min` are
-    /// queued, then takes up to `max`.
-    pub fn take_window(&self, min: usize, window: Duration, max: usize, out: &mut Vec<T>) {
-        let mut q = self.q.lock().unwrap();
-        while q.is_empty() {
-            q = self.cv.wait(q).unwrap();
+        let mut g = self.m.lock().unwrap();
+        while g.q.is_empty() {
+            g = self.wait(g);
         }
         let deadline = Instant::now() + window;
-        while q.len() < min {
+        while g.q.len() < want {
             let now = Instant::now();
             if now >= deadline {
                 break;
             }
-            q = self.cv.wait_timeout(q, deadline - now).unwrap().0;
+            g = self.wait_timeout(g, deadline - now);
         }
-        let n = q.len().min(max);
-        out.extend(q.drain(..n));
-        if !q.is_empty() {
+        let n = g.q.len().min(want);
+        Self::drain(&mut g, n, out);
+        if !g.q.is_empty() && g.waiting > 0 {
             self.cv.notify_one();
+        }
+    }
+
+    /// Blocks until at least `want` items are queued or the oldest has waited `max_age`, then takes up to `max`.
+    pub fn take_aged(&self, want: usize, max_age: Duration, max: usize, out: &mut Vec<T>) {
+        let mut g = self.m.lock().unwrap();
+        g.hold = want;
+        loop {
+            if g.q.len() >= want {
+                break;
+            }
+            match g.since {
+                None => g = self.wait(g),
+                Some(t) => {
+                    let deadline = t + max_age;
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    g = self.wait_timeout(g, deadline - now);
+                }
+            }
+        }
+        g.hold = 0;
+        let n = g.q.len().min(max);
+        Self::drain(&mut g, n, out);
+        if !g.q.is_empty() && g.waiting > 0 {
+            self.cv.notify_one();
+        }
+    }
+
+    /// Takes up to `max` without blocking if the oldest item has waited at least `age`; returns whether it did.
+    pub fn take_if_older(&self, age: Duration, max: usize, out: &mut Vec<T>) -> bool {
+        let mut g = self.m.lock().unwrap();
+        match g.since {
+            Some(t) if t.elapsed() >= age => {
+                let n = g.q.len().min(max);
+                Self::drain(&mut g, n, out);
+                true
+            }
+            _ => false,
         }
     }
 }

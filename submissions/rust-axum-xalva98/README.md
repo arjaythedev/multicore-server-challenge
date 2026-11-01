@@ -10,10 +10,10 @@ Written like a normal production service rather than a benchmark special: featur
 outside tests. No custom HTTP parser, no request coalescing, no patched driver.
 
 - Shared Postgres connections that tokio-postgres pipelines, 2 × cores for reads and 2 × cores for writes, so a commit
-  waiting on its WAL flush never holds up a read. The one multi-statement transaction (an article with its tags) gets
-  a connection of its own.
-- One statement per request: lists carry their capped count, comments carry the article lookup, and follows,
-  favorites, comments and deletes are data-modifying CTEs.
+  waiting on its WAL flush never holds up a read.
+- One statement per request: lists carry their capped count, comments carry the article lookup, and every write is a
+  data-modifying CTE. Creating an article inserts it, its new tags and the links in one statement; the tag upsert
+  (`ON CONFLICT DO UPDATE ... RETURNING`) returns every tag's id, also one another writer just committed.
 - Lists cut their page of ids first and compute tags, favorite counts and viewer flags only for those rows. Tag names
   come from primary-key lookups, which avoids the hash join over all tags that the generic plan picks.
 - Every statement is prepared on every connection at boot; `plan_cache_mode = force_generic_plan` and `jit = off`
@@ -29,5 +29,5 @@ bash build.sh
 DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=... HOST=0.0.0.0 PORT=80 bash start.sh
 ```
 
-Optional settings: `DB_READ_CONNECTIONS`, `DB_WRITE_CONNECTIONS`, `DB_TRANSACTION_CONNECTIONS` (2), `APP_THREADS`,
-`BCRYPT_THREADS`, `DB_ACQUIRE_TIMEOUT_SECS` (8), `DB_STATEMENT_TIMEOUT_SECS` (30).
+Optional settings: `DB_READ_CONNECTIONS`, `DB_WRITE_CONNECTIONS`, `APP_THREADS`, `BCRYPT_THREADS`,
+`DB_STATEMENT_TIMEOUT_SECS` (30).

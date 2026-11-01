@@ -99,7 +99,6 @@ const sqlArticleMetaCols = `
     SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id)
     FROM article_tags at
     WHERE at.article_id = a.id
-    ORDER BY 1
   ) AS tags,
   (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
   ($1::bigint <> 0 AND EXISTS (
@@ -119,7 +118,6 @@ const sqlFeedMetaCols = `
     SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id)
     FROM article_tags at
     WHERE at.article_id = a.id
-    ORDER BY 1
   ) AS tags,
   (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
   EXISTS (
@@ -183,21 +181,11 @@ func buildFeedSQL(countSQL, pageSQL string) string {
 const (
 	sqlCountAll = `(CASE WHEN EXISTS (SELECT 1 FROM articles ORDER BY id OFFSET 999 LIMIT 1) THEN 1000::bigint ELSE (SELECT count(*) FROM articles) END)`
 
-	sqlCountByTag = `((
-  WITH t_target AS (SELECT t.id FROM tags t WHERE t.name = $4)
-  SELECT CASE WHEN (SELECT id FROM t_target) IS NULL THEN 0::bigint
-              WHEN EXISTS (
-                SELECT 1 FROM article_tags at
-                WHERE at.tag_id = (SELECT id FROM t_target)
-                ORDER BY at.article_id ASC
-                OFFSET 999 LIMIT 1
-              ) THEN 1000::bigint
-              ELSE (
-                SELECT count(*) FROM article_tags at
-                WHERE at.tag_id = (SELECT id FROM t_target)
-              )
-         END
-))`
+	sqlCountByTag = `(SELECT count(*) FROM (
+  SELECT 1 FROM article_tags at
+  WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = $4)
+  LIMIT 1000
+) s)`
 
 	sqlCountByAuthor = `(SELECT count(*) FROM (
   SELECT 1 FROM articles a
@@ -348,7 +336,6 @@ var sqlCatalog = [sqlOpCount]struct{ id, query string }{
 		   ARRAY(
 		     SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id)
 		     FROM article_tags at WHERE at.article_id = a.id
-		     ORDER BY 1
 		   ) AS tags,
 		   (SELECT count(*) FROM favorites f WHERE f.article_id = a.id)
 		     + (SELECT count(*) FROM ins) AS favorites_count,
@@ -377,7 +364,6 @@ var sqlCatalog = [sqlOpCount]struct{ id, query string }{
 		   ARRAY(
 		     SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id)
 		     FROM article_tags at WHERE at.article_id = a.id
-		     ORDER BY 1
 		   ) AS tags,
 		   GREATEST(
 		     (SELECT count(*) FROM favorites f WHERE f.article_id = a.id)
@@ -460,7 +446,6 @@ var sqlCatalog = [sqlOpCount]struct{ id, query string }{
 		   CASE WHEN a.id IS NULL THEN NULL ELSE ARRAY(
 		     SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id)
 		     FROM article_tags at WHERE at.article_id = a.id
-		     ORDER BY 1
 		   ) END AS tags,
 		   CASE WHEN a.id IS NULL THEN NULL
 		        ELSE (SELECT count(*) FROM favorites f WHERE f.article_id = a.id)
@@ -592,7 +577,6 @@ var sqlCatalog = [sqlOpCount]struct{ id, query string }{
 		            SELECT (SELECT names FROM tmap)[at.tag_id]
 		            FROM article_tags at
 		            WHERE at.article_id = a.id
-		            ORDER BY 1
 		          ) AS tags,
 		          (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
 		          u.username, u.bio, u.image
@@ -606,7 +590,7 @@ var sqlCatalog = [sqlOpCount]struct{ id, query string }{
 		"q26",
 		`SELECT c.id, c.body, c.created_at, c.updated_at, c.username, c.bio, c.image,
 		        CASE WHEN c.id IS NULL OR r.p1 = 0 THEN false
-		             ELSE EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.p1 AND fo.followee_id = c.author_id)
+		             ELSE c.author_id = ANY(uf.fols)
 		        END AS following,
 		        r.ord
 		 FROM unnest($1::int8[], $2::text[]) WITH ORDINALITY AS r(p1, p2, ord)
@@ -615,6 +599,13 @@ var sqlCatalog = [sqlOpCount]struct{ id, query string }{
 		   SELECT a.id
 		   FROM articles a WHERE a.slug = k.slug LIMIT 1
 		 ) a
+		 CROSS JOIN LATERAL (SELECT r.p1 AS uid LIMIT 1) ku
+		 CROSS JOIN LATERAL (
+		   SELECT CASE WHEN ku.uid = 0 THEN '{}'::int8[]
+		               ELSE ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = ku.uid)
+		          END AS fols
+		   LIMIT 1
+		 ) uf
 		 LEFT JOIN LATERAL (
 		   SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id,
 		          u.username, u.bio, u.image
@@ -662,7 +653,6 @@ var sqlCatalog = [sqlOpCount]struct{ id, query string }{
 		            SELECT (SELECT names FROM tmap)[at.tag_id]
 		            FROM article_tags at
 		            WHERE at.article_id = a.id
-		            ORDER BY 1
 		          ) AS tags,
 		          (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
 		          u.username, u.bio, u.image
@@ -696,16 +686,9 @@ var sqlCatalog = [sqlOpCount]struct{ id, query string }{
 		 CROSS JOIN LATERAL (SELECT r.p4 AS tag LIMIT 1) kt
 		 LEFT JOIN LATERAL (
 		   SELECT t.id AS tid,
-		          CASE WHEN EXISTS (
-		                 SELECT 1 FROM article_tags at
-		                 WHERE at.tag_id = t.id
-		                 OFFSET 999 LIMIT 1
-		               ) THEN 1000::bigint
-		               ELSE (
-		                 SELECT count(*) FROM article_tags at
-		                 WHERE at.tag_id = t.id
-		               )
-		          END AS n
+		          (SELECT count(*) FROM (
+		            SELECT 1 FROM article_tags at WHERE at.tag_id = t.id LIMIT 1000
+		          ) s) AS n
 		   FROM tags t
 		   WHERE t.name = kt.tag
 		   LIMIT 1
@@ -736,7 +719,6 @@ var sqlCatalog = [sqlOpCount]struct{ id, query string }{
 		              SELECT (SELECT names FROM tmap)[at.tag_id]
 		              FROM article_tags at
 		              WHERE at.article_id = a.id
-		              ORDER BY 1
 		            ) AS tags,
 		            (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
 		            u.username, u.bio, u.image
@@ -756,7 +738,7 @@ var sqlCatalog = [sqlOpCount]struct{ id, query string }{
 		        q.tags, q.favorites_count,
 		        CASE WHEN q.id IS NULL THEN NULL
 		             WHEN r.p1 = 0 THEN false
-		             ELSE EXISTS (SELECT 1 FROM favorites f WHERE f.user_id = r.p1 AND f.article_id = q.id)
+		             ELSE q.id = ANY(uf.favs)
 		        END AS favorited,
 		        ac.username, ac.bio, ac.image,
 		        CASE WHEN q.id IS NULL THEN NULL
@@ -777,6 +759,7 @@ var sqlCatalog = [sqlOpCount]struct{ id, query string }{
 		 CROSS JOIN LATERAL (SELECT CASE WHEN COALESCE(ac.n, 0) = 0 THEN 0::bigint ELSE r.p1 END AS uid, ac.uid AS auid LIMIT 1) ku
 		 CROSS JOIN LATERAL (
 		   SELECT
+		     CASE WHEN ku.uid = 0 THEN '{}'::int8[] ELSE ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id = ku.uid) END AS favs,
 		     CASE WHEN ku.uid = 0 THEN false ELSE EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = ku.uid AND fo.followee_id = ku.auid) END AS is_following
 		   LIMIT 1
 		 ) uf
@@ -787,7 +770,6 @@ var sqlCatalog = [sqlOpCount]struct{ id, query string }{
 		            SELECT (SELECT names FROM tmap)[at.tag_id]
 		            FROM article_tags at
 		            WHERE at.article_id = a.id
-		            ORDER BY 1
 		          ) AS tags,
 		          (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count
 		   FROM (
@@ -854,7 +836,6 @@ var sqlCatalog = [sqlOpCount]struct{ id, query string }{
 		              SELECT (SELECT names FROM tmap)[at.tag_id]
 		              FROM article_tags at
 		              WHERE at.article_id = a.id
-		              ORDER BY 1
 		            ) AS tags,
 		            (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
 		            u.username, u.bio, u.image
@@ -875,8 +856,8 @@ var sqlCatalog = [sqlOpCount]struct{ id, query string }{
 		          ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id = r.p1) AS favs
 		   FROM unnest($1::int8[], $2::int8[], $3::int8[]) WITH ORDINALITY AS r(p1, p2, p3, ord)
 		 ),
-		 big_rows AS MATERIALIZED (
-		   SELECT d.fid,
+		 top_fols AS MATERIALIZED (
+		   SELECT d.fid, d.fcnt,
 		          ARRAY(
 		            SELECT a.id FROM articles a
 		            WHERE a.author_id = d.fid
@@ -884,23 +865,28 @@ var sqlCatalog = [sqlOpCount]struct{ id, query string }{
 		            LIMIT 50
 		          ) AS ids
 		   FROM (
-		     SELECT fo.fid
+		     SELECT fo.fid, count(*) AS fcnt
 		     FROM rf, unnest(rf.fols) AS fo(fid)
 		     GROUP BY fo.fid
 		     HAVING count(*) >= 2
 		     ORDER BY count(*) DESC
-		     LIMIT 24
+		     LIMIT 16
 		   ) d
-		   WHERE EXISTS (
-		     SELECT 1 FROM articles a
-		     WHERE a.author_id = d.fid
-		     ORDER BY a.id DESC
-		     OFFSET 999 LIMIT 1
-		   )
 		 ),
 		 big AS MATERIALIZED (
-		   SELECT COALESCE(array_agg(fid), '{}'::int8[]) AS fids
-		   FROM big_rows
+		   SELECT COALESCE(array_agg(tf.fid), '{}'::int8[]) AS fids
+		   FROM (
+		     SELECT fid FROM top_fols
+		     WHERE ids[50] IS NOT NULL
+		     ORDER BY fcnt DESC, ids[50] DESC
+		     LIMIT 6
+		   ) tf
+		   WHERE EXISTS (
+		     SELECT 1 FROM articles a
+		     WHERE a.author_id = tf.fid
+		     ORDER BY a.id ASC
+		     OFFSET 999 LIMIT 1
+		   )
 		 )
 		 SELECT c.n,
 		        am.slug, am.title, am.description, am.created_at, am.updated_at,
@@ -920,13 +906,14 @@ var sqlCatalog = [sqlOpCount]struct{ id, query string }{
 		       SELECT count(*) FROM (
 		         SELECT 1 FROM articles a
 		         WHERE a.author_id = ANY(rf.fols)
+		         ORDER BY a.author_id DESC, a.id ASC
 		         LIMIT 1000
 		       ) s
 		     )
 		   END AS n,
 		   CASE
-		     WHEN rf.p2 + LEAST(rf.p3, 9000000000000000000) <= 50 AND (rf.fols && big.fids) THEN
-		       COALESCE((SELECT max(br.ids[rf.p2 + rf.p3]) FROM big_rows br WHERE br.fid = ANY(rf.fols)), 0)
+		     WHEN rf.p2 + LEAST(rf.p3, 9000000000000000000) <= 50 THEN
+		       COALESCE((SELECT max(tf.ids[rf.p2 + rf.p3]) FROM top_fols tf WHERE tf.fid = ANY(rf.fols)), 0)
 		     ELSE 0::int8
 		   END AS floor_id
 		   LIMIT 1
@@ -952,7 +939,6 @@ var sqlCatalog = [sqlOpCount]struct{ id, query string }{
 		            SELECT (SELECT names FROM tmap)[at.tag_id]
 		            FROM article_tags at
 		            WHERE at.article_id = a.id
-		            ORDER BY 1
 		          ) AS tags,
 		          (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count
 		   FROM articles a
@@ -984,6 +970,7 @@ var sqlCatalog = [sqlOpCount]struct{ id, query string }{
 		   SELECT DISTINCT r.p1, t.id
 		   FROM req r
 		   JOIN target t ON t.username = r.p2
+		   ORDER BY 1, 2
 		   ON CONFLICT DO NOTHING
 		 )
 		 SELECT t.username, t.bio, t.image, r.ord
@@ -1024,7 +1011,6 @@ var sqlCatalog = [sqlOpCount]struct{ id, query string }{
 		          ARRAY(
 		            SELECT (SELECT names FROM tmap)[at.tag_id]
 		            FROM article_tags at WHERE at.article_id = a.id
-		            ORDER BY 1
 		          ) AS tags,
 		          (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS base_favs,
 		          u.username, u.bio, u.image
@@ -1037,6 +1023,7 @@ var sqlCatalog = [sqlOpCount]struct{ id, query string }{
 		   SELECT DISTINCT r.p1, a.id
 		   FROM req r
 		   JOIN arts a ON a.slug = r.p2
+		   ORDER BY 1, 2
 		   ON CONFLICT DO NOTHING
 		   RETURNING article_id
 		 ),
@@ -1072,7 +1059,6 @@ var sqlCatalog = [sqlOpCount]struct{ id, query string }{
 		          ARRAY(
 		            SELECT (SELECT names FROM tmap)[at.tag_id]
 		            FROM article_tags at WHERE at.article_id = a.id
-		            ORDER BY 1
 		          ) AS tags,
 		          (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS base_favs,
 		          u.username, u.bio, u.image

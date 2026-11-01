@@ -42,6 +42,7 @@ type searcher struct {
 	boxes                                     []boxSpec
 	sshKey, secret, remoteBin, remoteDir      string
 	switchCmd, monitorCmd, monitorDir         string
+	restartCmd                                string
 	pushBin, noSwitch, dry                    bool
 	warmupRamp, warmupMeasure                 time.Duration
 	probeRamp, probeMeasure                   time.Duration
@@ -71,8 +72,11 @@ type phaseResult struct {
 	P95    float64 `json:"p95_ms"`
 	P99    float64 `json:"p99_ms"`
 	ErrPct float64 `json:"error_pct"`
-	m      *Merged
-	dir    string
+	// the app failed the health check before this phase and was restarted for it (a phase that wedged it, often
+	// the overload probe at -max, would otherwise fail every later phase too)
+	Restarted bool `json:"restarted_before,omitempty"`
+	m         *Merged
+	dir       string
 }
 
 func cmdSearch(args []string) int {
@@ -94,6 +98,7 @@ func cmdSearch(args []string) int {
 	fs.BoolVar(&s.pushBin, "push-bin", true, "copy this binary to -remote-bin on the remote boxes when it differs")
 	fs.StringVar(&s.switchCmd, "switch", "/opt/conduit-tools/switch.sh", "target command run as '<switch> <lang>'")
 	fs.BoolVar(&s.noSwitch, "no-switch", false, "don't run the switch command (target already prepared)")
+	fs.StringVar(&s.restartCmd, "restart", "systemctl restart challenge.service", "target command that restarts the app when it fails the health check before a phase ('' = never restart)")
 	fs.StringVar(&s.monitorCmd, "monitor", "/opt/conduit-tools/monitor.sh", "target monitor run as '<monitor> 1 <tag>' during each phase ('' = none)")
 	fs.StringVar(&s.monitorDir, "monitor-dir", "/root/conduit-monitor", "working directory of the monitor on the target (its CSV is looked for there)")
 	fs.DurationVar(&s.warmupRamp, "warmup-ramp", 60*time.Second, "warm-up ramp")
@@ -580,8 +585,31 @@ func (s *searcher) phase(name string, users int, ramp, measure time.Duration) (*
 		s.waitIdle()
 	}
 	s.firstPhase = false
-	if out, err := s.sshOut(s.targetSSH, "curl -s -m 5 -o /dev/null -w '%{http_code}' "+shq(strings.Split(s.targetURL, ",")[0]+"/api/tags")); err != nil || strings.TrimSpace(out) != "200" {
+	health := "curl -s -m 5 -o /dev/null -w '%{http_code}' " + shq(strings.Split(s.targetURL, ",")[0]+"/api/tags")
+	restarted := false
+	if out, err := s.sshOut(s.targetSSH, health); err != nil || strings.TrimSpace(out) != "200" {
 		s.logln("  WARNING: target health check: %q %v", out, err)
+		// An app that a previous phase wedged (typically the overload probe at -max) would fail every later phase
+		// at 100% errors, so restart it for this one. Healthy apps are never restarted: they keep their warm state.
+		if s.restartCmd != "" {
+			s.logln("  restarting the app before %s: %s", name, s.restartCmd)
+			if rout, rerr := s.sshOut(s.targetSSH, s.restartCmd+" 2>&1"); rerr != nil {
+				s.logln("  restart failed: %v %s", rerr, strings.TrimSpace(rout))
+			}
+			ok := false
+			for t0 := time.Now(); time.Since(t0) < 120*time.Second; time.Sleep(2 * time.Second) {
+				if out, err := s.sshOut(s.targetSSH, health); err == nil && strings.TrimSpace(out) == "200" {
+					ok = true
+					break
+				}
+			}
+			restarted = ok
+			if ok {
+				s.logln("  app healthy again after the restart")
+			} else {
+				s.logln("  WARNING: app still unhealthy 120 s after the restart")
+			}
+		}
 	}
 	runID := fmt.Sprintf("%s-%s-%s", s.label, name, strconv.FormatInt(time.Now().Unix(), 36))
 	tag := s.label + "-" + name
@@ -648,7 +676,9 @@ func (s *searcher) phase(name string, users int, ramp, measure time.Duration) (*
 	if !m.Verdict.Pass {
 		s.logln("  fail: %s", strings.Join(m.Verdict.Reasons, ", "))
 	}
-	return s.result(name, users, m, dir), nil
+	r := s.result(name, users, m, dir)
+	r.Restarted = restarted
+	return r, nil
 }
 
 func (s *searcher) result(name string, users int, m *Merged, dir string) *phaseResult {
@@ -996,7 +1026,8 @@ func (s *searcher) writeSummary(started time.Time, score int, scored *phaseResul
 	}
 	b.WriteString("\nphase         users   pass  lg     req/s     p50     p95     p99   err%\n")
 	for _, r := range append(append([]*phaseResult{}, probes...), holds...) {
-		fmt.Fprintf(&b, "%-12s %6d   %-5v %-5v %7.0f %7.1f %7.1f %7.1f %6.2f\n", r.Name, r.Users, r.Pass, r.LG, r.RPS, r.P50, r.P95, r.P99, r.ErrPct)
+		fmt.Fprintf(&b, "%-12s %6d   %-5v %-5v %7.0f %7.1f %7.1f %7.1f %6.2f%s\n", r.Name, r.Users, r.Pass, r.LG, r.RPS, r.P50, r.P95, r.P99, r.ErrPct,
+			map[bool]string{true: "  (app restarted first: it failed the health check after the phase before)", false: ""}[r.Restarted])
 	}
 	if err := os.WriteFile(filepath.Join(s.outdir, "SUMMARY.txt"), []byte(b.String()), 0o644); err != nil {
 		return err

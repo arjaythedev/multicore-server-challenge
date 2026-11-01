@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <sys/epoll.h>
+#include <time.h>
 
 struct pgc {
   int kind;
@@ -30,10 +31,12 @@ static void pg_watch(pgc_t *pc, bool w) {
 }
 
 // Session settings (rule 2 allows them on our own connections): every statement here has a generic plan as
-// good as a custom one, so skip re-planning; no JIT or parallel workers for these small queries. Memoize is
-// off so that, in a batched read, no request is ever handed a row cached from another request's lookup.
+// good as a custom one, so skip re-planning; no JIT or parallel workers for these small queries. No hash
+// aggregation: a generic plan can't see how few distinct keys a batch has and sized each DISTINCT's hash
+// table for thousands (8 MB per statement); sorting a few hundred keys is cheaper.
 static const char *SESSION_OPTS =
-    "-c plan_cache_mode=force_generic_plan -c jit=off -c max_parallel_workers_per_gather=0 -c enable_memoize=off";
+    "-c plan_cache_mode=force_generic_plan -c jit=off -c max_parallel_workers_per_gather=0 -c enable_memoize=off "
+    "-c enable_hashagg=off";
 
 int pg_depth = 1;     // batches in flight per read connection
 int batch_max = 256;  // requests per batched statement
@@ -200,15 +203,24 @@ void pg_event(pgc_t *pc, uint32_t ev) {
 
 // ---- batched reads ----
 //
-// Reads of one kind wait in the loop's queue for that kind. When a read connection has fewer than pg_depth
-// statements in flight, the kind whose head has waited longest goes out as one statement: the per-request
-// query is the inner side of a LATERAL join over the unnested parameters of every waiting request, and each
-// row carries its request's ordinal. At low load each batch holds one request and nothing waits; under load
-// the queues fill while the connections are busy, so batches grow by themselves.
+// Reads of one kind wait in the loop's queue for that kind. A kind goes out as one statement once its
+// oldest request has waited read_window_us (or batch_max requests are waiting) and a read connection has
+// fewer than pg_depth statements in flight: the per-request query is the inner side of a LATERAL join over
+// the unnested parameters of every waiting request, and each row carries its request's ordinal.
+// Postgres pays a fixed cost per statement, so the window keeps batches large at any load, for a few tens
+// of ms of latency. (Without it, batches only grow when the connections are busy: at moderate load nearly every
+// request went out alone, at ~25% more Postgres CPU per request.)
 
-// SHARE_READS=1: viewer-independent reads (the tag list) that are all waiting when the statement goes out
-// share one execution, and every one of them gets its row. The result is never kept for later requests.
-int share_reads = 0;
+// The tag list doesn't depend on the viewer: every request waiting when the statement goes out shares one
+// execution and gets its row. The result is never kept for later requests. (SHARE_READS=0: one row each.)
+int share_reads = 1;
+int read_window_us = 40000;
+
+static int64_t now_us(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
 
 struct batch {
   job_t hdr;  // sits in the connection's FIFO like a job; hdr.res[0] is the shared result
@@ -223,6 +235,8 @@ void pg_read(job_t *j, int kind, job_fn fn) {
   j->next = fn;
   j->link = NULL;
   j->seq = L->seq++;
+  j->t_us = now_us();
+  L->bq_cnt[kind]++;
   if (L->bq_tail[kind]) L->bq_tail[kind]->link = j;
   else L->bq_head[kind] = j;
   L->bq_tail[kind] = j;
@@ -309,6 +323,7 @@ static void send_batch(loop_t *L, int kind, int pgi) {
   L->bq_head[kind] = j;
   if (!j) L->bq_tail[kind] = NULL;
   L->bq_n -= n;
+  L->bq_cnt[kind] -= n;
 
   // parameters: one array literal per column, or the count
   static __thread buf_t pb[4];
@@ -345,8 +360,12 @@ static void send_batch(loop_t *L, int kind, int pgi) {
   pg_end(&b->hdr, batch_done);
 }
 
-// Send waiting reads while a read connection has room.
+// Send the kinds whose window is over while a read connection has room; L->next_due is when the next
+// window ends (the loop sleeps until then at most).
 void pg_schedule(loop_t *L) {
+  L->next_due = 0;
+  if (L->bq_n == 0) return;
+  int64_t now = now_us();
   while (L->bq_n > 0) {
     int best = 0, load = L->pg[0].inflight;
     for (int i = 1; i < L->npg; i++)
@@ -354,10 +373,29 @@ void pg_schedule(loop_t *L) {
         load = L->pg[i].inflight;
         best = i;
       }
-    if (load >= pg_depth) return;
+    if (load >= pg_depth) return;  // a connection's result runs this again
     int kind = -1;
-    for (int k = 0; k < NBK; k++)
-      if (L->bq_head[k] && (kind < 0 || L->bq_head[k]->seq < L->bq_head[kind]->seq)) kind = k;
+    int64_t due_min = INT64_MAX;
+    for (int k = 0; k < NBK; k++) {
+      job_t *h = L->bq_head[k];
+      if (!h) continue;
+      int64_t due = h->t_us + read_window_us;
+      if (due > now && L->bq_cnt[k] < batch_max) {
+        if (due < due_min) due_min = due;
+        continue;
+      }
+      if (kind < 0 || h->seq < L->bq_head[kind]->seq) kind = k;
+    }
+    if (kind < 0) {
+      L->next_due = due_min;
+      return;
+    }
     send_batch(L, kind, best);
   }
+}
+
+int64_t pg_wait_us(loop_t *L) {
+  if (!L->next_due) return -1;
+  int64_t d = L->next_due - now_us();
+  return d > 0 ? d : 0;
 }

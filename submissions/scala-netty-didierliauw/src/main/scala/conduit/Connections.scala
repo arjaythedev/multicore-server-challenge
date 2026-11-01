@@ -6,9 +6,13 @@ import io.netty.channel.{ChannelFutureListener, ChannelHandlerContext}
 import java.io.IOException
 import java.util
 
-/** One event loop's open connections, least recently active first. Idle ones are closed by one sweep a second
-  * instead of a timer per connection, and beyond `maxConnections` the longest-idle ones are closed, so `accept`
-  * never fails for want of a file descriptor. Used on its event loop's thread only.
+/** One event loop's open connections. Those with no request waiting are listed least recently active first: idle ones
+  * are closed by one sweep a second instead of a timer per connection, and beyond `maxConnections` the longest-idle
+  * ones are closed. A connection whose request waits for Postgres is off the list, so neither ever steps over it:
+  * under overload nearly every connection waits, and an eviction that skipped them walked the whole list for every
+  * connection accepted (300 µs at 100,000 connections). Past the limit with none idle, the loop is [[full]], and the
+  * listening socket stops accepting until it isn't (`Main`), so `accept` never fails for want of a file descriptor.
+  * Used on its event loop's thread only, but for [[full]].
   *
   * `requestDeadlineSeconds`: how long a request may take to arrive ([[RequestDecoder.deadlineSeconds]]), timed by
   * [[clock]]; none by default.
@@ -20,9 +24,12 @@ final class Connections(
 ):
   import Connections.*
 
+  /** The connections with no request waiting, longest idle first. */
   private var oldest: Connection = null
   private var newest: Connection = null
+  /** The open connections, waiting or not, but those already being closed. */
   private var count = 0
+  @volatile private var atLimit = false
   /** A coarse clock in seconds, advanced by each sweep: precise enough for an idle timeout, and free to read. */
   private var now = 0L
   /** Connections evicted so far. */
@@ -30,55 +37,74 @@ final class Connections(
 
   def size: Int = count
 
+  /** Whether the loop holds `maxConnections` and none of them is idle: read by the listening socket's loop. */
+  def full: Boolean = atLimit
+
   /** Seconds since the first sweep: the clock the idle timeout and the request deadline read. */
   private[conduit] def clock: Long = now
 
   /** Closes connections that have been idle longer than the timeout. Run once a second. */
   def sweep(): Unit =
     now += 1
-    while oldest != null && now - oldest.lastActive > idleTimeoutSeconds do
-      val idle = oldest
-      remove(idle)
-      if idle.busy then touch(idle) // waiting for Postgres, not idle
-      else idle.close()
+    while oldest != null && now - oldest.lastActive > idleTimeoutSeconds do discard(oldest)
+    update()
 
   private[conduit] def add(c: Connection): Unit =
+    c.counted = true
+    count += 1
     c.lastActive = now
     append(c)
-    count += 1
     if count > maxConnections then evict()
+    update()
 
-  /** A connection has closed. */
-  private[conduit] def closed(c: Connection): Unit = remove(c)
+  /** `c` has a request waiting: off the list until it has answered every request. */
+  private[conduit] def busy(c: Connection): Unit =
+    if c.linked then
+      unlink(c)
+      update()
 
-  /** Closes the longest-idle connections. A client that was evicted while idle reconnects on its next request. */
-  private def evict(): Unit =
-    var n = 0
-    var skipped = 0
-    while n < EvictionBatch && oldest != null && oldest.ne(newest) && skipped < count do
-      val idle = oldest
-      if idle.busy then
-        touch(idle)
-        skipped += 1
-      else
-        remove(idle)
-        idle.close()
-        n += 1
-    evicted += n
+  /** `c` has answered every request: back on the list, the most recently active. */
+  private[conduit] def idle(c: Connection): Unit =
+    c.lastActive = now
+    if c.counted && !c.linked then
+      append(c)
+      update()
 
+  /** `c` received something: the most recently active, if it is on the list. */
   private[conduit] def touch(c: Connection): Unit =
     c.lastActive = now
     if c.linked && (c ne newest) then
       unlink(c)
       append(c)
-    else if !c.linked && c.open then
-      append(c)
-      count += 1
 
-  private[conduit] def remove(c: Connection): Unit =
-    if c.linked then
-      unlink(c)
+  /** A connection has closed. */
+  private[conduit] def closed(c: Connection): Unit =
+    if c.linked then unlink(c)
+    if c.counted then
+      c.counted = false
       count -= 1
+    update()
+
+  /** Closes the longest-idle connections, but the newest. A client that was evicted while idle reconnects on its next
+    * request.
+    */
+  private def evict(): Unit =
+    var n = 0
+    while n < EvictionBatch && oldest != null && (oldest ne newest) do
+      discard(oldest)
+      n += 1
+    evicted += n
+
+  /** Closes `c`, counted as closed from now on: its descriptor is freed once the close completes. */
+  private def discard(c: Connection): Unit =
+    unlink(c)
+    c.counted = false
+    count -= 1
+    c.close()
+
+  private def update(): Unit =
+    val reached = count >= maxConnections && (oldest == null || (oldest eq newest))
+    if reached != atLimit then atLimit = reached
 
   private def append(c: Connection): Unit =
     c.prev = newest
@@ -108,6 +134,8 @@ final class Connection(connections: Connections, api: Api) extends RequestDecode
   private[conduit] var prev: Connection = null
   private[conduit] var next: Connection = null
   private[conduit] var linked = false
+  /** Counted among its loop's connections: from its activation until it closes or is being closed. */
+  private[conduit] var counted = false
   private[conduit] var lastActive = 0L
   private[conduit] var open = true
   private var ctx: ChannelHandlerContext = null
@@ -117,9 +145,6 @@ final class Connection(connections: Connections, api: Api) extends RequestDecode
   private var pending = 0
   /** In a read: responses ready now are flushed when it completes. */
   private var reading = false
-
-  /** Whether a request of its is being answered. */
-  private[conduit] def busy: Boolean = first != null
 
   private[conduit] def alloc: ByteBufAllocator = ctx.alloc()
 
@@ -163,7 +188,10 @@ final class Connection(connections: Connections, api: Api) extends RequestDecode
     */
   private[conduit] def enqueue(call: Call): Unit =
     call.nextCall = null
-    if last == null then first = call else last.nextCall = call
+    if last == null then
+      first = call
+      connections.busy(this)
+    else last.nextCall = call
     last = call
     pending += 1
     if pending == MaxPipelined then ctx.channel.config.setAutoRead(false)
@@ -183,7 +211,7 @@ final class Connection(connections: Connections, api: Api) extends RequestDecode
       c.response = null
       wrote = true
     if wrote then
-      connections.touch(this)
+      if first == null then connections.idle(this)
       if !reading then ctx.flush()
 
   /** Writes without a future when the connection stays open: a failed write still reaches `exceptionCaught`. On a

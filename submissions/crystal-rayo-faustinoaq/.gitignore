@@ -1,0 +1,8 @@
+/bin/
+/lib/
+/.shards/
+/test/__pycache__/
+!/results/
+!/results/README.md
+!/results/*.txt
+/results/*.json
