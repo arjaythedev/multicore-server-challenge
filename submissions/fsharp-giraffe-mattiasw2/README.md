@@ -322,8 +322,8 @@ Ideas taken from other entries; the code here is our own.
   - letting a login wait 150 ms for bcrypt batch-mates;
   - their Openwall crypt_blowfish with interleaved lanes, as the yardstick our F# bcrypt was tuned against.
 
-Read batching and group commit themselves are the author's own, from earlier experiments on the author's
-production platform (rule 6 allows several requests' writes in one transaction).
+Read batching and group commit themselves come from an earlier presentation (rule 6 allows several requests'
+writes in one transaction).
 
 ## Build, run, check
 
