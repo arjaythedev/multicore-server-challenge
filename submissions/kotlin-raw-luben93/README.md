@@ -42,4 +42,4 @@ DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=... HO
 - Other: `APP_SORT_TAGS`, `HTTP_GZIP` (unset: only while the network link is full, `GZIP_ABOVE_MBPS`), `DB_STATS_S`
   (batching statistics every N seconds; off by default).
 - Postgres batching (speculative, all default on): `DB_PIPELINE` (2), `DB_IMPLICIT_TX`, `DB_BATCH_WRITES`, `READ_FEED_ROWS`,
-  `READ_GLOBAL_WIN`, `READ_LIMIT_AUTO` (`READ_LIMIT=<n>` pins the read batches in flight), `SCHED_BATCH` (JVM threads too).
+  `READ_GLOBAL_WIN`, `SCHED_BATCH` (JVM threads too); `READ_LIMIT_AUTO=1` (off by default: no gain in the lab) or `READ_LIMIT=<n>` limit the read batches in flight.

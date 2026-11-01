@@ -71,10 +71,10 @@ fun main() {
     val gatherMaxMs = if (envInt("READ_GATHER_AUTO", 1) != 0) envInt("READ_GATHER_MAX_MS", 100) else 0
     // READ_LIFO_MS (lab, 0 = off): adaptive LIFO once a kind's oldest read has waited this long (see DbConfig)
     val lifoMs = envInt("READ_LIFO_MS", 0)
-    // READ_LIMIT=<n> pins how many read batches may be in flight at once (lab); READ_LIMIT_AUTO (default on, 0 = all connections may
+    // READ_LIMIT=<n> pins how many read batches may be in flight at once (lab); READ_LIMIT_AUTO (default OFF: no gain in the lab; 1 = on, otherwise all connections may
     // be busy) lets the server find it between 2 and DB_READ_CONNS from the service-time inflation of its own batches.
     val readLimit = envInt("READ_LIMIT", 0)
-    val readLimitAuto = readLimit <= 0 && envInt("READ_LIMIT_AUTO", 1) != 0
+    val readLimitAuto = readLimit <= 0 && envInt("READ_LIMIT_AUTO", 0) != 0
 
     Jwt.init(secret)
     // HTTP_GZIP: 0 never, 1 always, unset = only while the network link is full (GZIP_ABOVE_MBPS, see http/Gzip.kt)
