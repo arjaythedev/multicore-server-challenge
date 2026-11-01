@@ -144,6 +144,30 @@ The pre-checks don't change the outcome: two racing sign-ups can both pass, and 
 - **Connections:** at most 95 Postgres connections (`READ_LANES` + `WRITE_LANES` + `DB_POOL_SIZE`; the pool is
   capped to fit).
 
+## Where the app's CPU goes: half of it is bcrypt
+
+`perf` on the server process (60,000 users, ~15,600 requests/s, Release build, 20 s at 499 Hz, JIT frames named via
+`DOTNET_PerfMapEnabled=1` and `DOTNET_EnableWriteXorExecute=0`):
+
+| Where | Share of the app's ~2.8 cores |
+|---|--:|
+| `BCrypt.Net.BCrypt.Encipher` + `Key` (Blowfish) | **51%** (~1.4 cores) |
+| kernel (sockets, epoll, conntrack, AppArmor) | 12% |
+| the .NET runtime (GC, write barriers, stubs) | 8% |
+| everything else (JSON, Kestrel, Npgsql, our F#) | the rest, no function above 0.8% |
+
+That is half the CPU for **0.1% of the requests**: ~15 logins and sign-ups per second, against 15,600 requests per
+second. A cost-10 bcrypt takes 51 ms on an idle core, but ~92 ms of CPU under load, on cores shared with Postgres and
+with busy hyperthread siblings. The rules make every login pay it (cost 10, verified against the stored hash, no
+cache), so the only lever is a faster bcrypt. The system's native one (libxcrypt `crypt_r`, the Openwall C code)
+is only 22% faster than BCrypt.Net-Next.
+
+Allocation is not where the time goes. Pooled response buffers, UTF-8 timestamps from a stack buffer and no boxed
+struct comparisons halved the allocation rate (300 → 145 MB/s), and GC pauses stayed at 2-3% of wall time. The other
+runtime setting that measurably helped is `DOTNET_ThreadPool_UnfairSemaphoreSpinLimit=0` (in `start.sh`): idle
+thread-pool workers sleep at once instead of spinning on cores that Postgres needs. At 85,000 users it cut p99 from
+1,155 ms to 823 ms.
+
 ## Build, run, check
 
 ```bash

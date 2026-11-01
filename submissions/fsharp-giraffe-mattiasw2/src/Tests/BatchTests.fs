@@ -28,7 +28,7 @@ let private dataSource =
 
 /// What a client sees: the answer as Wire encodes it.
 let private seen (a: Answer) : string =
-    let text (m: ReadOnlyMemory<byte>) = Encoding.UTF8.GetString m.Span
+    let text (b: Wire.Body) = Encoding.UTF8.GetString b.Span
     match a with
     | TagNames names -> text (Wire.tags names)
     | Listed page -> text (Wire.articles page)

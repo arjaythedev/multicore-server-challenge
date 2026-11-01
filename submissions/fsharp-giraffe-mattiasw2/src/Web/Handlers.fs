@@ -23,13 +23,17 @@ let private now () = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
 
 // ------------------------------------------------------------- responses -------
 
-let private send (status: int) (body: ReadOnlyMemory<byte>) : HttpHandler =
+/// Sends a rendered body once, then returns its buffer to the pool (Kestrel has copied it).
+let private send (status: int) (body: Wire.Body) : HttpHandler =
     fun _ ctx ->
         task {
-            ctx.Response.StatusCode <- status
-            ctx.Response.ContentType <- "application/json"
-            ctx.Response.ContentLength <- int64 body.Length
-            do! ctx.Response.Body.WriteAsync(body)
+            try
+                ctx.Response.StatusCode <- status
+                ctx.Response.ContentType <- "application/json"
+                ctx.Response.ContentLength <- int64 body.Length
+                do! ctx.Response.Body.WriteAsync(body.Memory)
+            finally
+                body.Release()
             return Some ctx
         }
 
@@ -41,7 +45,9 @@ let noContent: HttpHandler =
         ctx.Response.StatusCode <- 204
         Task.FromResult(Some ctx)
 
-let fail (status: int) (message: string) : HttpHandler = send status (Wire.error message)
+/// Renders per request: `notFound` and friends are values, and a pooled body is sent only once.
+let fail (status: int) (message: string) : HttpHandler =
+    fun next ctx -> send status (Wire.error message) next ctx
 
 let private unauthorized = fail 401 "unauthorized"
 let private forbidden = fail 403 "forbidden"

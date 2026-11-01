@@ -2,9 +2,12 @@
 /// rule SPEC.md and the conformance suite state about shapes is a plain unit test.
 module Web.Wire
 
+#nowarn "9" // NativePtr.stackalloc: the timestamp's 32-byte stack buffer
+
 open System
 open System.Buffers
 open System.Globalization
+open Microsoft.FSharp.NativeInterop
 open System.Text.Encodings.Web
 open System.Text.Json
 open Engine
@@ -14,17 +17,91 @@ open Engine
 let private writerOptions =
     JsonWriterOptions(Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping, SkipValidation = true)
 
-/// One response body. The writer is the only allocation besides the bytes themselves.
-let render (write: Utf8JsonWriter -> unit) : ReadOnlyMemory<byte> =
-    let buffer = ArrayBufferWriter<byte>(2048)
-    use w = new Utf8JsonWriter(buffer, writerOptions)
+/// A response body in a buffer rented from the shared pool. It is sent once, and `Release`
+/// returns the buffer (the body must not be used after that).
+[<Struct; NoEquality; NoComparison>]
+type Body =
+    { Buffer: byte[]
+      Length: int }
+
+    member b.Memory = ReadOnlyMemory<byte>(b.Buffer, 0, b.Length)
+    member b.Span = ReadOnlySpan<byte>(b.Buffer, 0, b.Length)
+    member b.Release() = ArrayPool<byte>.Shared.Return b.Buffer
+
+/// An IBufferWriter over pooled arrays: grows by renting a bigger one, and `Take` hands the
+/// written bytes over as a Body (the writer then starts afresh).
+[<Sealed; AllowNullLiteral>]
+type private PooledWriter() =
+    let mutable buffer: byte[] = null
+    let mutable written = 0
+
+    member private _.Ensure(hint: int) =
+        let need = written + max hint 1
+        if isNull buffer then
+            buffer <- ArrayPool<byte>.Shared.Rent(max need 16384)
+        elif need > buffer.Length then
+            let bigger = ArrayPool<byte>.Shared.Rent(max need (buffer.Length * 2))
+            Buffer.BlockCopy(buffer, 0, bigger, 0, written)
+            ArrayPool<byte>.Shared.Return buffer
+            buffer <- bigger
+
+    member _.Take() : Body =
+        let body = { Buffer = buffer; Length = written }
+        buffer <- null
+        written <- 0
+        body
+
+    interface IBufferWriter<byte> with
+        member _.Advance(count: int) = written <- written + count
+
+        member this.GetMemory(hint: int) =
+            this.Ensure hint
+            Memory<byte>(buffer, written, buffer.Length - written)
+
+        member this.GetSpan(hint: int) =
+            this.Ensure hint
+            Span<byte>(buffer, written, buffer.Length - written)
+
+/// One writer and one Utf8JsonWriter per thread: rendering is synchronous, so a thread never
+/// renders two bodies at once.
+[<Sealed; AbstractClass>]
+type private Scratch =
+    [<ThreadStatic; DefaultValue>]
+    static val mutable private output: PooledWriter
+
+    [<ThreadStatic; DefaultValue>]
+    static val mutable private json: Utf8JsonWriter
+
+    static member Get() : struct (PooledWriter * Utf8JsonWriter) =
+        if isNull Scratch.output then
+            Scratch.output <- PooledWriter()
+            Scratch.json <- new Utf8JsonWriter(Scratch.output, writerOptions)
+        else
+            Scratch.json.Reset(Scratch.output)
+        struct (Scratch.output, Scratch.json)
+
+/// One response body, written into a pooled buffer by this thread's writer.
+let render (write: Utf8JsonWriter -> unit) : Body =
+    let struct (output, w) = Scratch.Get()
     write w
     w.Flush()
-    buffer.WrittenMemory
+    output.Take()
+
+let private timestampFormat = "yyyy-MM-dd'T'HH:mm:ss.fff'Z'"
 
 /// RFC 3339, UTC, exactly three fractional digits, truncated (`fff` truncates, never rounds).
 let timestamp (d: DateTime) : string =
-    d.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", CultureInfo.InvariantCulture)
+    d.ToUniversalTime().ToString(timestampFormat, CultureInfo.InvariantCulture)
+
+/// `timestamp`, written as UTF-8 straight from a stack buffer: no string per field.
+let private writeTimestamp (w: Utf8JsonWriter) (name: JsonEncodedText) (d: DateTime) =
+    let utf8 = Span<byte>(NativePtr.toVoidPtr (NativePtr.stackalloc<byte> 32), 32)
+    let mutable written = 0
+    if d.ToUniversalTime().TryFormat(utf8, &written, timestampFormat.AsSpan(), CultureInfo.InvariantCulture) then
+        let value: ReadOnlySpan<byte> = Span.op_Implicit (utf8.Slice(0, written))
+        w.WriteString(name, value)
+    else
+        w.WriteString(name, timestamp d)
 
 let private k (name: string) = JsonEncodedText.Encode name
 let private kUser = k "user"
@@ -90,8 +167,8 @@ let private writeArticle (w: Utf8JsonWriter) (withBody: bool) (a: Article) =
     for t in c.TagList do
         w.WriteStringValue t
     w.WriteEndArray()
-    w.WriteString(kCreatedAt, timestamp c.CreatedAt)
-    w.WriteString(kUpdatedAt, timestamp c.UpdatedAt)
+    writeTimestamp w kCreatedAt c.CreatedAt
+    writeTimestamp w kUpdatedAt c.UpdatedAt
     w.WriteBoolean(kFavorited, a.Favorited)
     w.WriteNumber(kFavoritesCount, c.FavoritesCount)
     w.WritePropertyName kAuthor
@@ -101,8 +178,8 @@ let private writeArticle (w: Utf8JsonWriter) (withBody: bool) (a: Article) =
 let private writeComment (w: Utf8JsonWriter) (c: Comment) =
     w.WriteStartObject()
     w.WriteNumber(kId, c.Card.Id)
-    w.WriteString(kCreatedAt, timestamp c.Card.CreatedAt)
-    w.WriteString(kUpdatedAt, timestamp c.Card.UpdatedAt)
+    writeTimestamp w kCreatedAt c.Card.CreatedAt
+    writeTimestamp w kUpdatedAt c.Card.UpdatedAt
     w.WriteString(kBody, c.Card.Body)
     w.WritePropertyName kAuthor
     writeAuthor w c.Card.Author c.Following

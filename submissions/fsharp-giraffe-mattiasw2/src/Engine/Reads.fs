@@ -223,7 +223,11 @@ let private pageKey (read: Read) (paging: Paging) =
 
 let private planA (reads: Read[]) : PlanA =
     let plan =
-        { Tags = reads |> Array.exists (fun r -> r = ReadTags)
+        { Tags =
+            reads
+            |> Array.exists (function
+                | ReadTags -> true
+                | _ -> false)
           Counts = Array.init listings.Length (fun _ -> Distinct())
           Pages = Array.init listings.Length (fun _ -> Distinct())
           Slugs = Distinct()
@@ -309,7 +313,8 @@ type private FoundB =
 // ------------------------------------------------------------ assemble ---------
 
 let private newestFirst (x: CommentCard) (y: CommentCard) =
-    match compare y.CreatedAt x.CreatedAt with
+    // DateTime.Compare, not `compare`: F#'s generic comparison boxes structs.
+    match DateTime.Compare(y.CreatedAt, x.CreatedAt) with
     | 0 -> compare y.Id x.Id
     | c -> c
 
@@ -608,13 +613,14 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
             while! queue.Reader.WaitToReadAsync() do
                 // Gather: until the oldest request has waited `gather`, or a full batch is
                 // queued, whichever comes first.
-                let mutable waiting = gather > TimeSpan.Zero
+                // (Ticks, not TimeSpan's `>`: F#'s generic comparison boxes structs.)
+                let mutable waiting = gather.Ticks > 0L
                 while waiting do
                     match queue.Reader.TryPeek() with
                     | true, oldest when queue.Reader.Count < maxBatch ->
                         let left = gather - Diagnostics.Stopwatch.GetElapsedTime oldest.Arrived
-                        if left > TimeSpan.Zero then
-                            do! Task.Delay(if left < tick then left else tick)
+                        if left.Ticks > 0L then
+                            do! Task.Delay(if left.Ticks < tick.Ticks then left else tick)
                         else
                             waiting <- false
                     | _ -> waiting <- false

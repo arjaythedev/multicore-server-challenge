@@ -13,6 +13,9 @@ ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 # A 64 MB gen0 budget: each request allocates a few KB, and the default budget would run a gen0
 # collection many times a second. The runtime reads this only from the environment.
 export DOTNET_GCgen0size="${DOTNET_GCgen0size:-0x4000000}"
+# Idle thread-pool workers spin before they sleep (13% of the app's CPU in a profile). Postgres
+# shares these cores, so a worker with nothing to do should sleep at once.
+export DOTNET_ThreadPool_UnfairSemaphoreSpinLimit="${DOTNET_ThreadPool_UnfairSemaphoreSpinLimit:-0}"
 DOTNET="$DOTNET_ROOT/dotnet"
 [ -x "$DOTNET" ] || DOTNET=dotnet
 exec "$DOTNET" "$DIR/out/Web.dll"

@@ -9,7 +9,7 @@ open global.Web
 
 let private parse (json: string) = JsonDocument.Parse(json).RootElement
 let private isError (r: Result<'a, string>) = match r with Error _ -> true | Ok _ -> false
-let private text (body: ReadOnlyMemory<byte>) = Encoding.UTF8.GetString(body.Span)
+let private text (body: Wire.Body) = Encoding.UTF8.GetString(body.Span)
 
 let private query (pairs: (string * string) list) (name: string) =
     pairs |> List.tryFind (fun (k, _) -> k = name) |> Option.map snd

@@ -57,10 +57,15 @@ let private writeError (ctx: HttpContext) (status: int) (message: string) : Task
         Task.CompletedTask
     else
         let body = Wire.error message
-        ctx.Response.StatusCode <- status
-        ctx.Response.ContentType <- "application/json"
-        ctx.Response.ContentLength <- int64 body.Length
-        ctx.Response.Body.WriteAsync(body).AsTask()
+        task {
+            try
+                ctx.Response.StatusCode <- status
+                ctx.Response.ContentType <- "application/json"
+                ctx.Response.ContentLength <- int64 body.Length
+                do! ctx.Response.Body.WriteAsync(body.Memory)
+            finally
+                body.Release()
+        }
 
 [<EntryPoint>]
 let main args =

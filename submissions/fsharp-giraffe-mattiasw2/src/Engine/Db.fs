@@ -28,6 +28,9 @@ let connectionString (url: string) (poolSize: int) (multiplexed: bool) : string 
     b.MaxPoolSize <- poolSize
     b.MinPoolSize <- 0
     b.Multiplexing <- multiplexed
+    // The lanes' own connections: no command timeout, because with one Npgsql arms a timer
+    // (a CancellationTokenSource) around every buffer read, and those timers contend on a lock.
+    if not multiplexed then b.CommandTimeout <- 0
     b.NoResetOnClose <- true
     b.Enlist <- false
     b.MaxAutoPrepare <- 64
