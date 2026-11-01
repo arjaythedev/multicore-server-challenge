@@ -2,13 +2,16 @@ package conduit.pg
 
 import conduit.platform.BlockingSocket
 import conduit.platform.Monitor
+import conduit.platform.SocketReadTimeout
 import conduit.util.ByteBuf
 import conduit.util.intBE
 import conduit.util.shortBE
 import kotlin.jvm.JvmField
 
 /** The connection is unusable (EOF, I/O error, protocol violation); requests on it fail with 08006. */
-class PgIoException(message: String, cause: Throwable? = null) : Exception(message, cause)
+/** [timeout]: the receive timeout expired with no byte read (the connection and its buffer are still consistent). */
+class PgIoException(message: String, cause: Throwable? = null, @JvmField val timeout: Boolean = false) :
+    Exception(message, cause)
 
 /** An ErrorResponse where there is no [Result] to put it in (startup, prepare, simple query). */
 class PgException(val error: PgError, context: String) : Exception("$context: ${error.code} ${error.message}")
@@ -65,7 +68,7 @@ class PgConn private constructor(private val sock: BlockingSocket) {
             val n = try {
                 sock.read(rbuf, rlen, rbuf.size - rlen)
             } catch (e: Throwable) {
-                throw PgIoException("recv: ${e.message ?: e}", e)
+                throw PgIoException("recv: ${e.message ?: e}", e, e is SocketReadTimeout)
             }
             if (n <= 0) throw PgIoException("connection closed by the server")
             rlen += n
