@@ -91,8 +91,14 @@ thread inherits it). Our threads wake constantly (a request, a reply, a ready ba
 each wakeup can preempt a busy Postgres backend; batch threads get the same CPU share without cutting in line.
 `SCHED_BATCH=0` turns it off.
 
-**Fewer packets**: after each response the server leaves TCP quick-ack mode on that socket, so the ACK for the
-client's next request rides on the response to it instead of going out as a packet of its own.
+**Fewer packets** (optional, `ACK_DELAY=1`): after each response the server leaves TCP quick-ack mode on that
+socket, so the ACK for the client's next request rides on the response to it instead of going out as a packet of its
+own. Off by default: near saturation most replies come too late for the delayed-ACK window, and the extra call per
+response costs more than it saves.
+
+**Feeds in parallel**: each read lane has a second connection for the feed statement, the costliest one. It goes
+out first, and a second backend runs it while the first runs the rest of phase A; phase B, once both are in, still
+enriches every article of the batch once. `FEED_CONN=0` sends it with the rest of phase A as before.
 
 **Clients that hung up** while their request was queued (a load generator's timeout, say) cost nothing more: each
 IO thread publishes, per connection slot, which request generation can still be answered, and read lanes and
@@ -114,6 +120,7 @@ Defaults suit the 8-vCPU box; all are optional environment variables.
 |---|---|---|
 | `IO_THREADS` | cores / 2 | epoll threads |
 | `READ_LANES` | cores | read connections |
+| `FEED_CONN` | 1 | 1: each read lane runs its batch's feed statement on a second connection, alongside the rest of phase A |
 | `WRITE_LANES` | 1 | group-commit connections |
 | `BCRYPT_THREADS` | 2 | bcrypt threads (the first gathers, the rest take full sets) |
 | `BCRYPT_LANES` | measured | hashes run in lockstep (1 to 6; by default timed at startup) |
@@ -125,7 +132,7 @@ Defaults suit the 8-vCPU box; all are optional environment variables.
 | `WRITE_WINDOW_US` | 3000 | how long a write waits for others to share its group |
 | `BCRYPT_IDLE` | 0 | 1: hashing threads at nice 19, plus a normal-priority thread for logins waiting `BCRYPT_RESCUE_MS` |
 | `BCRYPT_RESCUE_MS` | 1000 | with `BCRYPT_IDLE`, how long a login waits before the normal-priority thread hashes it (0: no such thread) |
-| `ACK_DELAY` | 1 | leave TCP quick-ack mode after each response |
+| `ACK_DELAY` | 0 | 1: leave TCP quick-ack mode after each response (off by default: at high load most replies miss the delayed-ACK window anyway) |
 | `PRIVATE_FDS` | 1 | a descriptor table per IO thread |
 | `SCHED_BATCH` | 1 | run under the `SCHED_BATCH` scheduling policy (0: the default policy) |
 

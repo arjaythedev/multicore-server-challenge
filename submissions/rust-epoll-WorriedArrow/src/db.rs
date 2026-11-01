@@ -120,6 +120,7 @@ pub struct Settings {
     pub bcrypt_lanes: usize,
     pub bcrypt_window: Duration,
     pub bcrypt_idle: bool,
+    pub feed_conn: bool,
     pub bcrypt_rescue: Duration,
 }
 
@@ -132,9 +133,17 @@ impl Hasher for Fx {
     fn finish(&self) -> u64 {
         self.0
     }
+    // Eight bytes per step: slugs, usernames and emails are tens of bytes long.
     fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 = (self.0.rotate_left(5) ^ b as u64).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        let mut c = bytes.chunks_exact(8);
+        for w in &mut c {
+            self.write_u64(u64::from_le_bytes(w.try_into().unwrap()));
+        }
+        let r = c.remainder();
+        if !r.is_empty() {
+            let mut t = [0u8; 8];
+            t[..r.len()].copy_from_slice(r);
+            self.write_u64(u64::from_le_bytes(t) ^ ((r.len() as u64) << 56));
         }
     }
     fn write_u64(&mut self, v: u64) {
@@ -160,6 +169,10 @@ impl<K: Hash + Eq + Clone> Keys<K> {
         if let Some(&i) = self.map.get(&key) {
             return i;
         }
+        self.add(key)
+    }
+    /// Adds a key known to be new.
+    fn add(&mut self, key: K) -> u32 {
         let i = self.list.len() as u32;
         self.map.insert(key.clone(), i);
         self.list.push(key);
@@ -176,8 +189,32 @@ impl Keys<String> {
         if let Some(&i) = self.map.get(key) {
             return i;
         }
-        self.idx(key.to_owned())
+        self.add(key.to_owned())
     }
+}
+
+/// A list statement's rows: k < 0 is the count of count key -k (k = 0: the single global count), k > 0 a page row.
+fn decode_list<'p>(pa: &'p Pipeline, slot: Option<usize>, ncount: usize, npage: usize) -> (Vec<i64>, Vec<PageRows<'p>>) {
+    let mut counts = vec![0i64; ncount.max(1)];
+    let mut pages: Vec<PageRows> = vec![Vec::new(); npage];
+    if let Some(s) = slot {
+        for r in &pa.results[s].rows {
+            let k = pa.i64(r[0]);
+            if k <= 0 {
+                let i = (-k) as usize;
+                let i = if i == 0 { 0 } else { i - 1 };
+                if i < counts.len() {
+                    counts[i] = pa.i64(r[1]);
+                }
+            } else if (k as usize) <= npage {
+                pages[k as usize - 1].push((pa.i64(r[1]), pa.i64(r[2]), &r[..]));
+            }
+        }
+        for p in &mut pages {
+            p.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        }
+    }
+    (counts, pages)
 }
 
 /// Rows of a statement result grouped by their `k` (column 0), as row indices.
@@ -283,6 +320,8 @@ type PageRows<'p> = Vec<ArtRef<'p>>;
 
 pub struct ReadLane {
     conn: Option<Conn>,
+    /// A second connection that runs the batch's feed statement while `conn` runs the rest of phase A.
+    fconn: Option<Conn>,
     s: &'static Settings,
     pool: &'static Pool,
     /// Requests of the current batch already answered (before phase B), so a later failure doesn't answer them twice.
@@ -293,7 +332,7 @@ const LIST_STMTS: [&str; 3] = ["tag", "author", "favlist"];
 
 impl ReadLane {
     pub fn new(s: &'static Settings, pool: &'static Pool) -> ReadLane {
-        ReadLane { conn: None, s, pool, answered: Vec::new() }
+        ReadLane { conn: None, fconn: None, s, pool, answered: Vec::new() }
     }
 
     /// The lane's connection, (re)opened on demand (borrows only that field).
@@ -325,26 +364,32 @@ impl ReadLane {
             let n = jobs.len() as u64;
             let prev = self.pool.batch_len.load(Relaxed);
             self.pool.batch_len.store(if prev == 0 { n } else { (prev * 7 + n) / 8 }, Relaxed);
-            let mut batch = std::mem::take(&mut jobs);
-            // Clients that hung up while queued (a load generator's timeout, say) get no database work.
-            if batch.iter().any(|j| !reply::alive(j.to)) {
-                let (live, gone): (Vec<ReadJob>, Vec<ReadJob>) = batch.into_iter().partition(|j| reply::alive(j.to));
-                reply::send_all(gone.into_iter().map(|j| reply::error(j.to, 503, "client gone")).collect());
-                batch = live;
-                if batch.is_empty() {
-                    continue;
-                }
+            let batch = std::mem::take(&mut jobs);
+            self.execute(batch);
+        }
+    }
+
+    /// Runs one batch and answers every request in it, with a 500 for whatever is unanswered if it fails.
+    fn execute(&mut self, mut batch: Vec<ReadJob>) {
+        // Clients that hung up while queued (a load generator's timeout, say) get no database work.
+        if batch.iter().any(|j| !reply::alive(j.to)) {
+            let (live, gone): (Vec<ReadJob>, Vec<ReadJob>) = batch.into_iter().partition(|j| reply::alive(j.to));
+            reply::send_all(gone.into_iter().map(|j| reply::error(j.to, 503, "client gone")).collect());
+            batch = live;
+            if batch.is_empty() {
+                return;
             }
-            let tos: Vec<ReplyTo> = batch.iter().map(|j| j.to).collect();
-            self.answered.clear();
-            let res = self.batch(batch);
-            if let Err(e) = res {
-                eprintln!("read batch failed: {e}");
-                self.conn = None;
-                let done = |t: &ReplyTo| self.answered.iter().any(|a| (a.thread, a.slot, a.generation) == (t.thread, t.slot, t.generation));
-                let left: Vec<Response> = tos.iter().filter(|t| !done(t)).map(|&t| reply::error(t, 500, "internal error")).collect();
-                reply::send_all(left);
-            }
+        }
+        let tos: Vec<ReplyTo> = batch.iter().map(|j| j.to).collect();
+        self.answered.clear();
+        let res = self.batch(batch);
+        if let Err(e) = res {
+            eprintln!("read batch failed: {e}");
+            self.conn = None;
+            self.fconn = None;
+            let done = |t: &ReplyTo| self.answered.iter().any(|a| (a.thread, a.slot, a.generation) == (t.thread, t.slot, t.generation));
+            let left: Vec<Response> = tos.iter().filter(|t| !done(t)).map(|&t| reply::error(t, 500, "internal error")).collect();
+            reply::send_all(left);
         }
     }
 
@@ -391,6 +436,23 @@ impl ReadLane {
             .collect();
 
         // ---- phase A ----
+        // The feed statement (the costliest one) goes out first on the lane's second connection, so a second backend
+        // runs it while the first runs the rest of phase A; phase B, after both, still covers every article once.
+        let split = self.s.feed_conn && feed.len() > 0;
+        if split {
+            let fc = Self::conn_of(&mut self.fconn, self.s)?;
+            fc.out.bind_exec(
+                "feed",
+                &[
+                    Param::Raw(&int_array(feed.list.iter().copied())),
+                    Param::Raw(&int_array(feedpage.list.iter().map(|k| k.0))),
+                    Param::Raw(&int_array(feedpage.list.iter().map(|k| k.1))),
+                    Param::Raw(&int_array(feedpage.list.iter().map(|k| k.2))),
+                ],
+            );
+            fc.out.sync();
+            fc.flush()?;
+        }
         let conn = Self::conn_of(&mut self.conn, self.s)?;
         let mut n = 0usize;
         let mut slot = |cond: bool| -> Option<usize> {
@@ -413,7 +475,7 @@ impl ReadLane {
         let s_cmts = slot(cmts.len() > 0);
         let s_global = slot(global.len() > 0);
         let s_lists: [Option<usize>; 3] = std::array::from_fn(|f| slot(lists[f].page.len() > 0));
-        let s_feed = slot(feed.len() > 0);
+        let s_feed = slot(feed.len() > 0 && !split);
 
         let o = &mut conn.out;
         let texts = |k: &Keys<String>| text_array(k.list.iter().map(|s| s.as_bytes()));
@@ -547,6 +609,16 @@ impl ReadLane {
         if let Some(r) = pa.results.iter().find(|r| r.error.is_some()) {
             return Err(pg::Error::Protocol(format!("phase A: {}", r.error.as_ref().unwrap())));
         }
+        let pf = match self.fconn.as_mut() {
+            Some(fc) if split => {
+                let p = fc.read_pipeline(1)?;
+                if let Some(e) = &p.results[0].error {
+                    return Err(pg::Error::Protocol(format!("feed: {e}")));
+                }
+                Some(p)
+            }
+            _ => None,
+        };
 
         // ---- decode phase A ----
         let g = |slot: Option<usize>, n: usize| slot.map(|s| group(&pa, s, n)).unwrap_or_default();
@@ -567,34 +639,14 @@ impl ReadLane {
         let by_slug = first_row(s_aslug, aslug.len());
         let by_id = first_row(s_aid, aid.len());
 
-        // list statements: k < 0 -> count of count key -k (k = 0 -> the single global count), k > 0 -> page row
-        let decode_list = |slot: Option<usize>, ncount: usize, npage: usize| -> (Vec<i64>, Vec<PageRows>) {
-            let mut counts = vec![0i64; ncount.max(1)];
-            let mut pages: Vec<PageRows> = vec![Vec::new(); npage];
-            if let Some(s) = slot {
-                for r in &pa.results[s].rows {
-                    let k = pa.i64(r[0]);
-                    if k <= 0 {
-                        let i = (-k) as usize;
-                        let i = if i == 0 { 0 } else { i - 1 };
-                        if i < counts.len() {
-                            counts[i] = pa.i64(r[1]);
-                        }
-                    } else if (k as usize) <= npage {
-                        pages[k as usize - 1].push((pa.i64(r[1]), pa.i64(r[2]), &r[..]));
-                    }
-                }
-                for p in &mut pages {
-                    p.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-                }
-            }
-            (counts, pages)
-        };
-        let (gcount, gpages) = decode_list(s_global, 1, global.len());
+        let (gcount, gpages) = decode_list(&pa, s_global, 1, global.len());
         let decoded: Vec<(Vec<i64>, Vec<PageRows>)> =
-            (0..3).map(|f| decode_list(s_lists[f], lists[f].count.len(), lists[f].page.len())).collect();
+            (0..3).map(|f| decode_list(&pa, s_lists[f], lists[f].count.len(), lists[f].page.len())).collect();
 
-        let (fcount, fpages) = decode_list(s_feed, feed.len(), feedpage.len());
+        let (fcount, fpages) = match &pf {
+            Some(p) => decode_list(p, Some(0), feed.len(), feedpage.len()),
+            None => decode_list(&pa, s_feed, feed.len(), feedpage.len()),
+        };
 
         // ---- phase B keys ----
         let mut arts: Keys<i64> = Keys::new();
@@ -837,11 +889,20 @@ impl ReadLane {
                         continue;
                     }
                     let s = s_cmts.unwrap();
-                    let mut list: Vec<&[Col]> = rows.iter().map(|&i| &pa.results[s].rows[i]).filter(|r| r[2].len >= 0 && auser.contains_key(&pa.i64(r[6]))).collect();
-                    list.sort_unstable_by(|x, y| (pa.i64(y[4]), pa.i64(y[2])).cmp(&(pa.i64(x[4]), pa.i64(x[2]))));
+                    // Each comment with its author's row, looked up once.
+                    let mut list: Vec<(&[Col], &[Col])> = rows
+                        .iter()
+                        .map(|&i| &pa.results[s].rows[i][..])
+                        .filter(|r| r[2].len >= 0)
+                        .filter_map(|r| auser.get(&pa.i64(r[6])).map(|&u| (r, u)))
+                        .collect();
+                    // Already newest first from the statement; sorting a sorted run is linear.
+                    list.sort_unstable_by(|(x, _), (y, _)| (pa.i64(y[4]), pa.i64(y[2])).cmp(&(pa.i64(x[4]), pa.i64(x[2]))));
+                    // Some whenever a comment is listed: its author came from phase B's "auser".
+                    let pbr = pb.as_ref();
                     let mut b = Vec::with_capacity(64 + 400 * list.len());
                     b.extend_from_slice(b"{\"comments\":[");
-                    for (n, r) in list.into_iter().enumerate() {
+                    for (n, (r, u)) in list.into_iter().enumerate() {
                         if n > 0 {
                             b.push(b',');
                         }
@@ -855,7 +916,7 @@ impl ReadLane {
                         json::str(&mut b, pa.bytes(r[3]).unwrap_or(b""));
                         b.extend_from_slice(b",\"author\":");
                         let following = v != 0 && ctx.following(v, pa.i64(r[6]));
-                        let (u, pb) = (auser[&pa.i64(r[6])], pb.as_ref().unwrap());
+                        let pb = pbr.unwrap();
                         profile_obj(&mut b, pb.bytes(u[1]).unwrap_or(b""), pb.bytes(u[2]), pb.bytes(u[3]), following);
                         b.push(b'}');
                     }
