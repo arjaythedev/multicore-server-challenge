@@ -9,3 +9,7 @@
 {"run":"e9-s4M-w15","eq_users":120000,"tot_us":155.3,"status":"keep"}
 {"run":"e12-per-domain-planner","real_users":150000,"rps":38006,"p95":306,"p99":364,"status":"keep","note":"central p95 823 FAIL"}
 {"run":"e13-d6l3","real_users":170000,"rps":40870,"p95":632,"status":"keep-defaults","note":"all configs fail at 170k"}
+{"run":"s9-e13-d6l2","real_users":180000,"rps":45000,"p95":445,"p99":656,"status":"pass","note":"fresh DB"}
+{"run":"e14-frag","eq_users":120000,"app_us":70.3,"tot_us":178.8,"status":"drop","note":"base app 71.7 tot 180.5, RSS +16%, 180k FAIL p95 538"}
+{"run":"e15-loops2","status":"keep-defaults","note":"d6l2 best at 160k and 180k"}
+{"run":"s11-e15-defaults","real_users":180000,"rps":45157,"p95":429,"p99":671,"status":"pass","note":"160k p95 119 pass, 190k p95 890 fail"}

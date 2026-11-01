@@ -1471,11 +1471,20 @@ let () =
      (cheaper below saturation, but domain 0 becomes the ceiling);
      0: a planner per domain on that domain's connections *)
   let central = getenv "PLANNER_CENTRAL" "0" = "1" in
-  let planner_loops = int_of_string (getenv "PLANNER_LOOPS" (if central then "4" else "3")) in
+  let planner_loops = int_of_string (getenv "PLANNER_LOOPS" (if central then "4" else "2")) in
   let planner_conns = int_of_string (getenv "PLANNER_CONNS" (string_of_int planner_loops)) in
   let conns_per = int_of_string (getenv "PG_CONNS_PER_DOMAIN" (string_of_int (max 1 (min (if central then 4 else 8) (64 / domains))))) in
   let shared = Plan.create () in
   Bc.start ();
+  (* GC_STATS=1: print GC counters every 10 s (diagnostics only) *)
+  if getenv "GC_STATS" "0" = "1" then
+    ignore (Thread.create (fun () ->
+        while true do
+          Thread.delay 10.;
+          let st = Gc.quick_stat () in
+          Printf.eprintf "gc minor_words=%.0f promoted=%.0f major_words=%.0f minor_gcs=%d major_gcs=%d heap_words=%d\n%!"
+            st.Gc.minor_words st.Gc.promoted_words st.Gc.major_words st.Gc.minor_collections st.Gc.major_collections st.Gc.heap_words
+        done) ());
   Eio_main.run @@ fun env ->
   let net = Eio.Stdenv.net env and dm = Eio.Stdenv.domain_mgr env in
   let clock = Eio.Stdenv.mono_clock env in

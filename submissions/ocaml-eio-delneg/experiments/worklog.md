@@ -118,3 +118,25 @@ Lesson: the moderate-load CPU numbers (E4) favoured central; the ceiling punishe
 d4 l2: 38.8k req/s p95 881; d4 l4: 39.7k p95 757; **d6 l3: 40.9k p95 632**, total 190 µs/req = ~7.75 cores: CPU-bound.
 Defaults now DOMAINS = 3/4 of the CPUs (6 on the 8 vCPU box), 3 planner loops per domain.
 Local ceiling: between 150k (pass) and 170k (fail). #1 on this box: 119 µs/req total vs ours ~180.
+
+### Series 8/9: fresh database, default candidates (informative)
+Aged DB (after ~20 runs) costs Postgres ~110 µs/req against ~76 fresh, so each run below starts from a fresh copy
+of the seed. Real users, s4M, w15.
+- 160k: d4 l2 41.1k req/s p95 198 (163 µs/req); **d6 l2 41.6k p95 128** (180); d6 l3 41.5k p95 176 (183). All pass.
+- 180k: d4 l2 43.6k p95 535 FAIL; **d6 l2 45.0k p95 445 / p99 656 PASS** (barely); e14 d6 l2 44.9k p95 538 FAIL.
+
+### E14 per-batch article fragments + tags body once per batch (dropped)
+Each article's JSON split once per batch around the viewer flags, the tags body built once per batch.
+180k real: no app gain (89.0 vs 88.6 µs/req), p95 538 FAIL vs 445. Scaled A/B x2 at 120k eq (d6 l2):
+app 71.9/71.5 → 70.1/70.4, total 180.7/180.2 → 181.6/175.9, RSS 328 → 380 MB. Within noise on total and more
+memory, so reverted (diff kept outside the repo).
+
+### E15 2 planner loops per domain by default (kept)
+From series 8/9: d6 l2 is the best config at both 160k and 180k. `PLANNER_LOOPS` default 3 → 2 (per-domain mode).
+Also a `GC_STATS=1` knob that prints GC counters every 10 s (diagnostics, off by default).
+
+### Series 11: defaults (e15: d6, 2 loops, w15, s4M), fresh DB per run, real users
+- 160k: 41.8k req/s, p95 119 / p99 150 ms PASS (app 85, pg 93 µs/req, RSS 939 MB)
+- **180k: 45.2k req/s, p95 429 / p99 671 ms PASS** (app 89, pg 80, RSS 1132 MB)
+- 190k: 45.5k req/s, p95 890 / p99 1807 ms FAIL (the loadgens also report falling behind)
+Local ceiling: 180k.
