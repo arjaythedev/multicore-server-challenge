@@ -1,0 +1,29 @@
+[package]
+name = "conduit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64 = "0.23.1"
+bcrypt = "0.19.3"
+bytes = "1.12.1"
+hmac = "0.13.0"
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", features = ["http1", "server"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+itoa = "1.0.18"
+libc = "0.2.191"
+mimalloc = "0.1.52"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+socket2 = "0.6.5"
+tokio = "1.54.1"
+tokio-postgres = "0.7.18"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
