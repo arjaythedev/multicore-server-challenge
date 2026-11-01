@@ -282,7 +282,9 @@ pub var comments_fw = false;
 const comments_fw_sql = std.mem.trimEnd(u8, @embedFile("sql/BATCH_COMMENTS_LIST_SET_FW.sql"), "\n; ");
 
 /// ZIG_COMMENT_AUTHORS_ONCE=1 (main.zig), with ZIG_COMMENTS_FW=1: the comments statement reads each distinct author's
-/// profile once per batch and joins it back to the comments (`sql/BATCH_COMMENTS_LIST_SET_FW_AUTHORS.sql`). Same rows.
+/// profile once per batch, as author rows ahead of the thread rows, whose author columns it leaves NULL
+/// (`sql/BATCH_COMMENTS_LIST_SET_FW_AUTHORS.sql`); threads.zig fills them in. The thread rows keep the order of the
+/// per-thread sort, with no join after it.
 pub var comment_authors_once = false;
 const comments_fw_authors_sql = std.mem.trimEnd(u8, @embedFile("sql/BATCH_COMMENTS_LIST_SET_FW_AUTHORS.sql"), "\n; ");
 
