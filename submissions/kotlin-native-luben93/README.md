@@ -45,4 +45,4 @@ Build-time (read by `build.gradle.kts` from the environment, defaults are what t
 `CONDUIT_GENERIC_CPU=1` (build.sh: generic x86-64 instead of this CPU).
 
 - Postgres batching (speculative, all default on): `DB_PIPELINE` (2), `DB_IMPLICIT_TX`, `DB_BATCH_WRITES`, `READ_FEED_ROWS`,
-  `READ_GLOBAL_WIN`, `READ_LIMIT_AUTO` (`READ_LIMIT=<n>` pins the read batches in flight), `SCHED_BATCH` (JVM threads too).
+  `READ_GLOBAL_WIN`, `SCHED_BATCH` (JVM threads too); `READ_LIMIT_AUTO=1` (off by default: no gain in the lab) or `READ_LIMIT=<n>` limit the read batches in flight.
