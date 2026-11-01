@@ -22,6 +22,17 @@ module W = struct
   let str w s = let l = String.length s in ensure w l; Bytes.blit_string s 0 w.b w.n l; w.n <- w.n + l
   let cstr w s = str w s; char w '\000'
   let patch32 w at v = Bytes.set_int32_be w.b at (Int32.of_int v)
+  (* decimal digits written in place *)
+  let int w v =
+    if v < 0 then str w (string_of_int v)
+    else begin
+      let d = ref 1 and t = ref v in
+      while !t >= 10 do t := !t / 10; incr d done;
+      ensure w !d;
+      let p = ref (w.n + !d - 1) and t = ref v in
+      for _ = 1 to !d do Bytes.unsafe_set w.b !p (Char.unsafe_chr (48 + !t mod 10)); t := !t / 10; decr p done;
+      w.n <- w.n + !d
+    end
   (* message: type byte, length placeholder, body, then patch the length *)
   let msg w typ f = char w typ; let at = w.n in i32 w 0; f (); patch32 w at (w.n - at)
 end
@@ -242,18 +253,39 @@ module Pg = struct
   let nstmts = ref 0
   let prepare sql = let i = !nstmts in incr nstmts; stmts := !stmts @ [ sql ]; i
 
-  let add_exec w (stmt, (params : param array)) =
+  let add_exec_gen wp w (stmt, params) =
     W.msg w 'B' (fun () ->
         W.char w '\000'; W.cstr w ("s" ^ string_of_int stmt);
         W.i16 w 0; W.i16 w (Array.length params);
-        Array.iter (function None -> W.i32 w (-1) | Some s -> W.i32 w (String.length s); W.str w s) params;
+        Array.iter (wp w) params;
         W.i16 w 1; W.i16 w 1);
     W.msg w 'E' (fun () -> W.char w '\000'; W.i32 w 0)
+  let add_exec = add_exec_gen (fun w -> function None -> W.i32 w (-1) | Some s -> W.i32 w (String.length s); W.str w s)
+
+  (* planner parameters: array literals written straight into the Bind message, no string in between *)
+  type pv = Str of string | Ints of int list | Txts of string list
+  let w_pv w = function
+    | Str s -> W.i32 w (String.length s); W.str w s
+    | Ints l ->
+      let at = w.W.n in
+      W.i32 w 0; W.char w '{';
+      List.iteri (fun k v -> if k > 0 then W.char w ','; W.int w v) l;
+      W.char w '}'; W.patch32 w at (w.W.n - at - 4)
+    | Txts l ->
+      let at = w.W.n in
+      W.i32 w 0; W.char w '{';
+      List.iteri (fun k t ->
+          if k > 0 then W.char w ',';
+          W.char w '"';
+          String.iter (fun c -> if c = '"' || c = '\\' then W.char w '\\'; W.char w c) t;
+          W.char w '"') l;
+      W.char w '}'; W.patch32 w at (w.W.n - at - 4)
+  let add_exec_v = add_exec_gen w_pv
 
   (* runs statements back to back, inside one implicit transaction (one Sync) *)
-  let run c (batch : (int * param array) list) =
+  let run_gen addf c batch =
     let n = List.length batch in
-    List.iter (add_exec c.out) batch;
+    List.iter (addf c.out) batch;
     W.msg c.out 'S' (fun () -> ());
     let p, u = P.create () in
     let pend = { results = Array.make n []; affected = Array.make n 0; idx = 0; err = None; resolver = u } in
@@ -263,6 +295,8 @@ module Pg = struct
     | Ok () -> Array.map List.rev pend.results, pend.affected
     | Error (code, msg) -> raise (Pg_error (code, msg))
 
+  let run c (batch : (int * param array) list) = run_gen add_exec c batch
+  let run_v c (batch : (int * pv array) list) = run_gen add_exec_v c batch
   let query c stmt params = (fst (run c [ (stmt, params) ])).(0)
 
   (* ---- connect + auth (trust, cleartext, md5, SCRAM-SHA-256) ---- *)
@@ -471,22 +505,36 @@ let q_tags = Pg.prepare "SELECT name FROM tags ORDER BY name"
 
 let hex = "0123456789abcdef"
 
+(* JSON string escape; 8 bytes per step while none of them is '"', '\\' or a control byte (SWAR test) *)
+external get64u : string -> int -> int64 = "%caml_string_get64u"
+let esc_byte b c =
+  match c with
+  | '"' -> Buffer.add_string b "\\\"" | '\\' -> Buffer.add_string b "\\\\"
+  | '\n' -> Buffer.add_string b "\\n" | '\r' -> Buffer.add_string b "\\r" | '\t' -> Buffer.add_string b "\\t"
+  | c -> Buffer.add_string b "\\u00"; Buffer.add_char b hex.[Char.code c lsr 4]; Buffer.add_char b hex.[Char.code c land 15]
 let esc_sub b s off len =
   Buffer.add_char b '"';
-  let start = ref off in
-  let flush i = if i > !start then Buffer.add_substring b s !start (i - !start) in
-  for i = off to off + len - 1 do
-    let c = String.unsafe_get s i in
-    if c = '"' || c = '\\' || Char.code c < 0x20 then begin
-      flush i;
-      (match c with
-       | '"' -> Buffer.add_string b "\\\"" | '\\' -> Buffer.add_string b "\\\\"
-       | '\n' -> Buffer.add_string b "\\n" | '\r' -> Buffer.add_string b "\\r" | '\t' -> Buffer.add_string b "\\t"
-       | c -> Buffer.add_string b "\\u00"; Buffer.add_char b hex.[Char.code c lsr 4]; Buffer.add_char b hex.[Char.code c land 15]);
-      start := i + 1
+  let start = ref off and i = ref off and stop = off + len in
+  while !i < stop do
+    if !i + 8 <= stop &&
+       (let x = get64u s !i in
+        let lo = 0x0101010101010101L and hi = 0x8080808080808080L in
+        let q = Int64.logxor x 0x2222222222222222L and k = Int64.logxor x 0x5C5C5C5C5C5C5C5CL in
+        Int64.equal (Int64.logand hi
+          (Int64.logor (Int64.logand (Int64.sub x 0x2020202020202020L) (Int64.lognot x))
+            (Int64.logor (Int64.logand (Int64.sub q lo) (Int64.lognot q)) (Int64.logand (Int64.sub k lo) (Int64.lognot k))))) 0L)
+    then i := !i + 8
+    else begin
+      let c = String.unsafe_get s !i in
+      if c = '"' || c = '\\' || Char.code c < 0x20 then begin
+        if !i > !start then Buffer.add_substring b s !start (!i - !start);
+        esc_byte b c;
+        start := !i + 1
+      end;
+      incr i
     end
   done;
-  flush (off + len);
+  if stop > !start then Buffer.add_substring b s !start (stop - !start);
   Buffer.add_char b '"'
 
 let jstr b s = esc_sub b s 0 (String.length s)
@@ -836,25 +884,9 @@ module Plan = struct
        (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = q.v AND fo.followee_id = ANY (q.uu)) fo"
 
   (* array parameters in text form *)
-  (* one scratch buffer per domain: an array literal is built and copied out with no yield in between *)
-  let scratch = Domain.DLS.new_key (fun () -> Buffer.create 65536)
-  let scratch_buf () = let b = Domain.DLS.get scratch in Buffer.clear b; b
-  let text_arr (l : string list) =
-    let b = scratch_buf () in
-    Buffer.add_char b '{';
-    List.iteri (fun k t ->
-        if k > 0 then Buffer.add_char b ',';
-        Buffer.add_char b '"';
-        String.iter (fun c -> if c = '"' || c = '\\' then Buffer.add_char b '\\'; Buffer.add_char b c) t;
-        Buffer.add_char b '"') l;
-    Buffer.add_char b '}';
-    Some (Buffer.contents b)
-  let int_arr (l : int list) =
-    let b = scratch_buf () in
-    Buffer.add_char b '{';
-    List.iteri (fun k v -> if k > 0 then Buffer.add_char b ','; Buffer.add_string b (string_of_int v)) l;
-    Buffer.add_char b '}';
-    Some (Buffer.contents b)
+  (* array parameters, written as text literals into the Bind message (Pg.w_pv) *)
+  let text_arr (l : string list) = Pg.Txts l
+  let int_arr (l : int list) = Pg.Ints l
 
   (* distinct keys of one statement: key -> k (1-based), in insertion order *)
   module Keys = struct
@@ -961,7 +993,7 @@ module Plan = struct
       add s_feed 7 [| int_arr (Keys.keys bt.kfeedc); int_arr (List.map (fun (v, _, _) -> v) pk);
                       int_arr (List.map (fun (_, l, _) -> l) pk); int_arr (List.map (fun (_, _, o) -> o) pk) |]
     end;
-    let ra, _ = Pg.run c (List.rev !stmts) in
+    let ra, _ = Pg.run_v c (List.rev !stmts) in
     let res kind = if slot.(kind) < 0 then [] else ra.(slot.(kind)) in
     (* collect articles *)
     let arts : (int, art) Hashtbl.t = Hashtbl.create 256 in
@@ -1018,7 +1050,7 @@ module Plan = struct
               @ (if has_tags then [ (s_tagall, [||]) ] else []) in
     let names = ref [||] and rank = Hashtbl.create 256 in
     if bst <> [] then begin
-      let rb, _ = Pg.run c bst in
+      let rb, _ = Pg.run_v c bst in
       let xi = if ids <> [] then 0 else -1 in
       let fi = if has_flags then xi + 1 else -1 in
       let ti = if has_tags then (if has_flags then fi + 1 else xi + 1) else -1 in

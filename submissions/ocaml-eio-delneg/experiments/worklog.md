@@ -167,3 +167,24 @@ JWT (~4%). One-time startup buffers make up ~28% of the samples.
 Writer blits into a per-connection Cstruct and writes that; `int_arr`/`text_arr` reuse a domain-local Buffer.
 Scaled x2: major words 145M/140M → 104M/96M (−30%), minor −2.5%, RSS 328/323 → 309/307 MB; app 70.9/71.2 →
 71.1/70.8 µs/req (no CPU change at this load). 197/197.
+
+### Where the CPU goes at 150k real (e18, perf + per-thread /proc)
+39.5k req/s, app 80 / pg 99 µs/req. Threads: the two bcrypt threads 32% + 31% of a core (~16 µs/req), six
+domains ~40% each (~61 µs/req): the domains are far from saturated, the box is (app ~3.1 + Postgres ~3.9 cores).
+perf over the process: kernel 29% (TCP stack, conntrack, SELinux hooks: loopback networking, spread thin),
+bcrypt eks* 21%, libc 5%, JSON escaping ~6% (esc_sub + Buffer adds), GC ~5%. Allocation sampling at this scale:
+only ~4% of minor words promoted; uring's own heap arrays growing during ramp-up are the biggest major-heap item.
+
+### E19 array parameters written straight into the Bind message (kept, small)
+`Pg.pv = Str | Ints | Txts`, written by `w_pv` into the message buffer with in-place decimal digits; no
+intermediate string or Buffer. Scaled x2: app 71.4/71.5 → 70.4/70.2 µs/req, major words −8%. 197/197.
+
+### E20 JSON escaping 8 bytes per step (SWAR)
+Int64 test for '"', '\\' and bytes < 0x20 over 8 bytes, byte loop only around hits. Checked equal to the old
+escaper on 300k random strings; 2.4 KB body: 1950 → 625 ns.
+Scaled x2 (e19 vs e20): app 70.9/70.1 → 67.4/68.2 µs/req (−4%), total 177.8/173.5 → 174.0/173.3. 197/197. Kept.
+
+### bcrypt lanes and fill (informative, nothing changed)
+Our C core at 1-8 lanes (bench, CPU 10): 5-8 lanes all ~11.5 ms/hash, so more lanes buy nothing. Logins + sign-ups
+at 180k are ~48 hashes/s (~0.1% of requests); from the profile's eks1-5 split, filling every batch to 5 lanes would
+save ~7% of bcrypt time (~1.5% of app CPU). Not worth a longer wait.

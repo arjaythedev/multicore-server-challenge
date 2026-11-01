@@ -15,3 +15,5 @@
 {"run":"s11-e15-defaults","real_users":180000,"rps":45157,"p95":429,"p99":671,"status":"pass","note":"160k p95 119 pass, 190k p95 890 fail"}
 {"run":"e16-s32M","real_users":180000,"p95":[598,506],"status":"drop","note":"s4M p95 445/394 pass"}
 {"run":"e18-nocopy-writer","eq_users":120000,"app_us":71.0,"status":"keep","note":"major words -30%, RSS -6%, CPU neutral"}
+{"run":"e19-bind-params","eq_users":120000,"app_us":70.3,"status":"keep","note":"base 71.45, major words -8%"}
+{"run":"e20-swar-escape","eq_users":120000,"app_us":67.8,"status":"keep","note":"base 70.5"}
