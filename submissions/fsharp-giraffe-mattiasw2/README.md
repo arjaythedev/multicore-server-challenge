@@ -188,14 +188,15 @@ The pre-checks don't change the outcome: two racing sign-ups can both pass, and 
 - **Connections:** at most 95 Postgres connections (`READ_LANES` + `WRITE_LANES` + `DB_POOL_SIZE`; the pool is
   capped to fit).
 
-## Capacity on a box like the benchmark's
+## Capacity on 6 vCPUs (3 cores x 2 hyperthreads)
 
-8 vCPUs on a cloud host are 4 physical cores x 2 hyperthreads. The test box (a Ryzen AI 7 PRO 350 laptop) runs each
+A cloud vCPU is one hyperthread: the benchmark's 8 vCPUs are 4 physical cores x 2. The test box (a Ryzen AI 7 PRO 350 laptop) runs each
 measurement as the benchmark's search does: a fresh copy of the seed (`CREATE DATABASE ... TEMPLATE`), one server
 start, the benchmark's warm-up (500 users, 60 s ramp + 120 s), then a 60 s ramp and 60 s measured. Server and
 Postgres share pinned cores, and the load generator runs on cores they do not touch. One load generator on one
 laptop runs out of room above ~120,000 users, so the limit was found on **3 cores with both hyperthreads** (6
-threads), where it is below that (commits 3f7cc19 to d67ba2f):
+vCPUs), where it is below that (commits 3f7cc19 to d67ba2f). There is no measurement on 8 vCPUs under these
+conditions:
 
 | Users | requests/s | p95 | p99 | Postgres threads | app threads | |
 |--:|--:|--:|--:|--:|--:|---|
