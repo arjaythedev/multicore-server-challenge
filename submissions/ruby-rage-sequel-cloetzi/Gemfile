@@ -1,0 +1,11 @@
+source "https://rubygems.org"
+
+ruby "4.0.9"
+
+gem "rage-rb", "1.29.0"
+gem "sequel", "5.109.0"
+gem "sequel_pg", "1.20.0", require: false # loaded by Sequel's postgres adapter
+gem "pg", "1.7.0"
+gem "bcrypt", "3.1.22"
+gem "jwt", "3.3.0"
+gem "json", "3.1.0"
