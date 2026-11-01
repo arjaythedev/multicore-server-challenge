@@ -92,3 +92,29 @@ Bigger minor heap lowers app CPU but Postgres rose by the same amount: faster tu
 PLANNER_WAIT_US: a planner loop sleeps this long after it wakes, then takes everything queued.
 Clean x2 at 120k eq: w0 183.6/185.9 µs/req total; w3000 175.0/176.0; **w8000 162.7/168.1** (pg 96→80/85). p95 at this
 load 17 → 48 ms, far under 500.
+
+### E9 minor heap 4M words + longer window (kept: start.sh sets OCAMLRUNPARAM=s=4M, window 15 ms)
+Clean x2 at 120k eq, DOMAINS=4: w8 167.5/167.2 µs/req; w8+s4M 158.2/162.7 (app 81 → 75); w15+s4M 155.9/154.7;
+w25+s4M 153.4/150.9. p95 at that load: w8 51, w15 86, w25 107 ms. Took 15 ms.
+
+### E10 domain count at moderate load (informative)
+120k eq, w15, s4M, x2: d3 151.7/153.6, d4 156.3/159.6, d5 158.0/164.4, d6 160.5/164.0 µs/req.
+Fewer domains is cheaper below saturation; the ceiling decides (E12).
+
+### E11 JWT claims fast path, no Printf in the response head (kept, small)
+Flat claims objects with escape-free string / integer values are read directly; anything else goes to Yojson,
+so the decision is the same. Not measured on its own (expected ~1-2 µs/req).
+
+### E12 the ceiling: central planner fails, per-domain planners pass (kept: PLANNER_CENTRAL=0 default)
+150k real users (lgr.sh), DOMAINS=4, w15, s4M:
+- central, 4 loops: 35.0k req/s, p95 823 / p99 886 ms FAIL. Every planner read p50 ~530 ms (even GET /api/tags),
+  non-planner endpoints 5-10 ms. Per-thread CPU: domain 0 80%, other domains ~52%, ~2 cores idle overall: domain 0
+  parses every read's results and the loops serialize on their connections.
+- central, 8 loops, PLANNER_MAX=256: 33.0k req/s, p95 1127 ms FAIL.
+- **per-domain planners (2 loops each): 38.0k req/s, p95 306 / p99 364 ms PASS**, app 90, pg 89 µs/req.
+Lesson: the moderate-load CPU numbers (E4) favoured central; the ceiling punishes the single domain.
+
+### E13 domains / loops at 170k real (all FAIL; picks defaults)
+d4 l2: 38.8k req/s p95 881; d4 l4: 39.7k p95 757; **d6 l3: 40.9k p95 632**, total 190 µs/req = ~7.75 cores: CPU-bound.
+Defaults now DOMAINS = 3/4 of the CPUs (6 on the 8 vCPU box), 3 planner loops per domain.
+Local ceiling: between 150k (pass) and 170k (fail). #1 on this box: 119 µs/req total vs ours ~180.

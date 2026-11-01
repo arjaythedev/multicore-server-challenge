@@ -6,3 +6,6 @@
 {"run":"e5-bcrypt5","eq_users":120000,"domains":4,"rps":30768,"p95":24,"p99":31,"app_us":93,"pg_us":104,"status":"keep"}
 {"run":"e6-bcrypt-fill","eq_users":120000,"app_us":87.7,"pg_us":95.9,"status":"keep"}
 {"run":"e8-window-8ms","eq_users":120000,"app_us":82.7,"pg_us":82.8,"p95":48,"status":"keep"}
+{"run":"e9-s4M-w15","eq_users":120000,"tot_us":155.3,"status":"keep"}
+{"run":"e12-per-domain-planner","real_users":150000,"rps":38006,"p95":306,"p99":364,"status":"keep","note":"central p95 823 FAIL"}
+{"run":"e13-d6l3","real_users":170000,"rps":40870,"p95":632,"status":"keep-defaults","note":"all configs fail at 170k"}

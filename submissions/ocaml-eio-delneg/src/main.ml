@@ -592,6 +592,54 @@ let make_token id =
   let si = jwt_header ^ "." ^ payload in
   si ^ "." ^ b64_encode ~url:true (hmac !secret si)
 
+(* Fast path for a flat claims object whose values are escape-free strings or plain integers (what tokens look
+   like): Some (first "sub" if a string, first "exp" if an integer). Anything else gives None and goes to Yojson,
+   so the result is always what the Yojson path would decide. *)
+let flat_claims s =
+  let n = String.length s in
+  let exception No in
+  let rec ws i = if i < n && (s.[i] = ' ' || s.[i] = '\t' || s.[i] = '\n' || s.[i] = '\r') then ws (i + 1) else i in
+  let str i = (* s.[i] = '"' *)
+    let rec go j = if j >= n then raise No else match s.[j] with '"' -> j | '\\' -> raise No | c when Char.code c < 0x20 -> raise No | _ -> go (j + 1) in
+    let j = go (i + 1) in (String.sub s (i + 1) (j - i - 1), j + 1) in
+  try
+    let i = ws 0 in
+    if i >= n || s.[i] <> '{' then raise No;
+    let sub = ref None and exp = ref None and seen_sub = ref false and seen_exp = ref false in
+    let rec members i first =
+      let i = ws i in
+      if i < n && s.[i] = '}' then i + 1
+      else begin
+        let i = if first then i else if i < n && s.[i] = ',' then ws (i + 1) else raise No in
+        if i >= n || s.[i] <> '"' then raise No;
+        let key, i = str i in
+        let i = ws i in
+        if i >= n || s.[i] <> ':' then raise No;
+        let i = ws (i + 1) in
+        if i >= n then raise No;
+        let i =
+          if s.[i] = '"' then begin
+            let v, j = str i in
+            if key = "sub" && not !seen_sub then (seen_sub := true; sub := Some v);
+            if key = "exp" then seen_exp := true;
+            j
+          end else begin
+            let j = ref (if s.[i] = '-' then i + 1 else i) in
+            let d0 = !j in
+            while !j < n && s.[!j] >= '0' && s.[!j] <= '9' do incr j done;
+            if !j = d0 || !j - d0 > 17 then raise No;
+            if !j < n && (s.[!j] = '.' || s.[!j] = 'e' || s.[!j] = 'E') then raise No;
+            if key = "exp" && not !seen_exp then (seen_exp := true; exp := Some (int_of_string (String.sub s i (!j - i))));
+            if key = "sub" then seen_sub := true;
+            !j
+          end in
+        members i false
+      end in
+    let i = members (i + 1) true in
+    if ws i <> n then raise No;
+    Some (!sub, !exp)
+  with No | Failure _ -> None
+
 (* user id, or 0 when the token is invalid *)
 let verify_token tok =
   match String.index_opt tok '.' with
@@ -616,6 +664,12 @@ let verify_token tok =
           match b64_decode (String.sub tok (d1 + 1) (d2 - d1 - 1)) with
           | None -> 0
           | Some pl ->
+            match flat_claims pl with
+            | Some (sub, exp) ->
+              let exp_ok = match exp with Some e -> float_of_int e > Unix.time () | None -> false in
+              let sub = match sub with Some s -> (match parse_uint s with Some n -> n | None -> 0) | None -> 0 in
+              if exp_ok && sub > 0 then sub else 0
+            | None ->
             try
               match Yojson.Safe.from_string pl with
               | `Assoc l ->
@@ -1053,7 +1107,7 @@ module Plan = struct
     match w with Some w -> P.resolve w () | None -> ()
 
   (* one loop per in-flight batch: wait for work, let the other ready fibers queue theirs, take everything *)
-  let wait_s = float_of_string (getenv "PLANNER_WAIT_US" "2000") /. 1e6
+  let wait_s = float_of_string (getenv "PLANNER_WAIT_US" "15000") /. 1e6
 
   let loop t pick sleep =
     let rec go () =
@@ -1370,7 +1424,9 @@ let respond ctx fd code (body : body) =
         Buffer.clear bb; error_body "internal error" bb; (500, Buffer.length bb) in
   let head =
     if code = 204 then "HTTP/1.1 204 No Content\r\n\r\n"
-    else Printf.sprintf "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n" code (status_text code) blen in
+    else if code = 200 then "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " ^ string_of_int blen ^ "\r\n\r\n"
+    else "HTTP/1.1 " ^ string_of_int code ^ " " ^ status_text code ^ "\r\nContent-Type: application/json\r\nContent-Length: "
+         ^ string_of_int blen ^ "\r\n\r\n" in
   let hl = String.length head in
   if Bytes.length ctx.wbuf < hl + blen then ctx.wbuf <- Bytes.create (2 * (hl + blen));
   Bytes.blit_string head 0 ctx.wbuf 0 hl;
@@ -1410,11 +1466,12 @@ let () =
   let url = Pg.parse_url (getenv "DATABASE_URL" "postgres://conduit:conduit@127.0.0.1:5432/conduit") in
   let host = getenv "HOST" "127.0.0.1" and port = int_of_string (getenv "PORT" "3000") in
   let ncpu = Domain.recommended_domain_count () in
-  let domains = int_of_string (getenv "DOMAINS" (string_of_int ncpu)) in
-  (* PLANNER_CENTRAL=1: one planner for the whole process, on domain 0 with PLANNER_CONNS read connections;
+  let domains = int_of_string (getenv "DOMAINS" (string_of_int (max 2 (ncpu * 3 / 4)))) in
+  (* PLANNER_CENTRAL=1: one planner for the whole process, on domain 0 with PLANNER_CONNS read connections
+     (cheaper below saturation, but domain 0 becomes the ceiling);
      0: a planner per domain on that domain's connections *)
-  let central = getenv "PLANNER_CENTRAL" "1" = "1" in
-  let planner_loops = int_of_string (getenv "PLANNER_LOOPS" (if central then "4" else "2")) in
+  let central = getenv "PLANNER_CENTRAL" "0" = "1" in
+  let planner_loops = int_of_string (getenv "PLANNER_LOOPS" (if central then "4" else "3")) in
   let planner_conns = int_of_string (getenv "PLANNER_CONNS" (string_of_int planner_loops)) in
   let conns_per = int_of_string (getenv "PG_CONNS_PER_DOMAIN" (string_of_int (max 1 (min (if central then 4 else 8) (64 / domains))))) in
   let shared = Plan.create () in
