@@ -50,6 +50,8 @@ pub const Req = struct {
     /// A body string is text Postgres rejects. The request runs only the lookup the reference makes before its
     /// write, and answers its 404 or 403, or else the 500 of the reference's failed write.
     bad_text: bool = false,
+    /// Shared responses are on (the `share` flag).
+    share: bool = false,
 
     fn keep(r: *Req, s: []const u8) []const u8 {
         std.debug.assert(r.scratch.unusedCapacitySlice().len >= s.len);
@@ -238,6 +240,7 @@ pub fn start(comptime F: Flags, r: *Req, head: *const http.Head, body: []const u
     r.items = 0;
     r.count = 0;
     r.bad_text = false;
+    r.share = F.share;
 
     const m = http.route(head.method, head.target);
     if (F.shed and shed.ctl.refuse(m.route)) return fail(r, .unavailable, "server overloaded");
@@ -580,6 +583,13 @@ pub fn request(q: *db.Query) *Req {
     return @fieldParentPtr("q", q);
 }
 
+/// The queued read's share class for the drain process (drain.zig): the inputs of its response head (keep-alive,
+/// gzip, segment size) and a set bit. 0: its response is its own.
+pub fn shareClass(r: *const Req) u32 {
+    if (!r.share or r.bad_text or !r.q.stmt.def().share) return 0;
+    return 1 | @as(u32, @intFromBool(r.keep_alive)) << 1 | @as(u32, @intFromBool(r.gzip)) << 2 | @as(u32, r.mss) << 16;
+}
+
 pub fn onRow(r: *Req, row: *const Row) void {
     const o = &r.out;
     defer r.rows += 1;
@@ -703,6 +713,18 @@ pub fn onDone(r: *Req) void {
             noContent(r);
         },
     }
+}
+
+/// Like `onDone`, and its response also answers the next `n` requests that get `onSame` (drain.zig's shared
+/// responses).
+pub fn onLead(r: *Req, n: u32) void {
+    onDone(r);
+    loop.share(r, n);
+}
+
+/// The request gets the response of the latest `onLead` request.
+pub fn onSame(r: *Req) void {
+    loop.respondShared(r);
 }
 
 /// The statement failed for this request alone.

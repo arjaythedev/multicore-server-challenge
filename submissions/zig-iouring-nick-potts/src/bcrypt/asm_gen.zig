@@ -5,11 +5,14 @@
 //!
 //! One base register (rdi) reaches every lane: each S-box and P read is rdi + index*4 + a fixed displacement,
 //! folded into an add or xor. Per round, a lane whose halves live in registers costs 11 instructions, in one of
-//! two styles that differ in how they extract the index bytes; startup calibration picks per CPU:
+//! three styles that differ in how they extract the index bytes; startup calibration picks per CPU:
 //! - `ah`: byte 0 by movzx from the low byte, byte 1 by BEXTR, bytes 2 and 3 by one RORX into eax then movzx
 //!   from al and ah. Best on Zen 3.
 //! - `bextr`: byte 3 by a register copy (eliminated at rename) and a shift, bytes 2 and 1 by BEXTR, byte 0 by
 //!   movzx. No partial-register reads, which Zen 5 runs 8% faster.
+//! - `shrx`: byte 3 by SHRX, bytes 1 and 2 by one RORX into eax then movzx from al and ah, byte 0 by movzx. No
+//!   BEXTR, which Intel cores split into 2 uops: 11 uops a round where `ah` takes 12, on a core whose 4-wide
+//!   issue is the limit (Skylake to Cascade Lake). The fewer-uops goal follows #130's one-copy extraction.
 //! Only five lanes fit in registers; further lanes keep their halves on the stack and load their index bytes with
 //! movzx straight from memory, 10 instructions that use the load ports instead of the ALUs.
 //! Usage: asm_gen <out.S>
@@ -20,12 +23,12 @@ const words = 18 + 4 * 256;
 const stride = words * 4;
 const encryptions = words / 2;
 /// Lanes whose halves fit in registers: 15 GPRs less base, index, accumulator, and eax and ecx (`ah`: rotate
-/// temp and BEXTR control; `bextr`: two BEXTR controls).
+/// temp and BEXTR control; `bextr`: two BEXTR controls; `shrx`: rotate temp and shift count).
 const reg_lanes = 5;
 const halves = [reg_lanes][2][]const u8{ .{ "ebx", "ebp" }, .{ "r8d", "r9d" }, .{ "r10d", "r11d" }, .{ "r12d", "r13d" }, .{ "r14d", "r15d" } };
 const low_byte = [reg_lanes][2][]const u8{ .{ "bl", "bpl" }, .{ "r8b", "r9b" }, .{ "r10b", "r11b" }, .{ "r12b", "r13b" }, .{ "r14b", "r15b" } };
 
-const Style = enum { ah, bextr };
+const Style = enum { ah, bextr, shrx };
 
 const Gen = struct {
     out: std.ArrayList(u8) = .empty,
@@ -63,9 +66,18 @@ fn halfRound(g: *Gen, style: Style, u: usize, hx: usize, r: usize) !void {
                 try g.line("  mov edx, dword ptr [rdi + rsi*4 + {d}]", .{s});
                 try g.line("  bextr esi, {s}, eax", .{x});
             },
+            .shrx => {
+                try g.line("  shrx esi, {s}, ecx", .{x});
+                try g.line("  mov edx, dword ptr [rdi + rsi*4 + {d}]", .{s});
+                try g.line("  rorx eax, {s}, 8", .{x});
+                try g.line("  movzx esi, ah", .{});
+            },
         }
         try g.line("  add edx, dword ptr [rdi + rsi*4 + {d}]", .{s + 1024});
-        try g.line("  bextr esi, {s}, ecx", .{x});
+        switch (style) {
+            .ah, .bextr => try g.line("  bextr esi, {s}, ecx", .{x}),
+            .shrx => try g.line("  movzx esi, al", .{}),
+        }
         try g.line("  xor edx, dword ptr [rdi + rsi*4 + {d}]", .{s + 2048});
         try g.line("  movzx esi, {s}", .{low_byte[u][hx]});
         try g.line("  add edx, dword ptr [rdi + rsi*4 + {d}]", .{s + 3072});
@@ -96,7 +108,7 @@ fn function(g: *Gen, style: Style, n: usize) !void {
     try g.line("bc_expand0_{s}_{d}:", .{ name, n });
     for ([_][]const u8{ "rbx", "rbp", "r12", "r13", "r14", "r15" }) |r| try g.line("  push {s}", .{r});
     try g.line("  sub rsp, {d}", .{frame});
-    try g.line("  mov ecx, 0x0808", .{});
+    try g.line("  mov ecx, {s}", .{if (style == .shrx) "24" else "0x0808"});
     if (style == .bextr) try g.line("  mov eax, 0x0810", .{});
     try g.line("  mov qword ptr [rsp], 0", .{});
     for (0..n) |u| {
@@ -162,7 +174,7 @@ pub fn main(init: std.process.Init) !void {
     var g: Gen = .{ .gpa = init.arena.allocator() };
     try g.line("  .intel_syntax noprefix", .{});
     try g.line("  .text", .{});
-    for ([_]Style{ .ah, .bextr }) |style| {
+    for ([_]Style{ .ah, .bextr, .shrx }) |style| {
         for (1..max_lanes + 1) |n| try function(&g, style, n);
     }
     try g.line("  .section .note.GNU-stack,\"\",@progbits", .{});

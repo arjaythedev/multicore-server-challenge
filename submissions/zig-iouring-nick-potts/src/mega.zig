@@ -4,15 +4,33 @@
 //! columns from entity rows that may come later. A list read's page arrives as one row of arrays and is expanded
 //! into one row per article here, with the viewer flags. At the end it hands each read its rows in the column
 //! layout of the read's own statement, filled and sorted as that statement returns them, so the API writes the same
-//! JSON.
+//! JSON. Reads that share a response (drain.zig's `Plan`) get it through their lead, whose rows alone are handed over.
 const std = @import("std");
 const sql = @import("sql.zig");
 const pg = @import("pg.zig");
 const Query = @import("db.zig").Query;
+const Plan = @import("drain.zig").Plan;
 
 const gpa = std.heap.smp_allocator;
 const ncols = sql.mega.cols.len;
 const page = sql.mega.page;
+
+/// ZIG_MEGA_TAG_TEXT=1 (main.zig): MEGA sends each article's tags as one text (sql.zig), which `Result.add` turns
+/// back into the text[] the statements return.
+pub var tag_text = false;
+/// ZIG_MEGA_NAME_IDS=1 (main.zig): MEGA looks each list's tag name or username up once (sql.zig).
+pub var name_ids = false;
+/// ZIG_MEGA_SORTED_IDS=1 (main.zig): MEGA builds its article id set in id order (sql.zig).
+pub var sorted_ids = false;
+
+/// The text read connections prepare as MEGA, and its columns.
+pub fn text() []const u8 {
+    return sql.mega.variants[@as(usize, @intFromBool(sorted_ids)) * 4 + @as(usize, @intFromBool(tag_text)) * 2 + @intFromBool(name_ids)];
+}
+
+pub fn cols() []const sql.Oid {
+    return if (tag_text) &sql.mega.cols_tag_text else &sql.mega.cols;
+}
 
 /// Binds MEGA (prepared as `name`) with one array element per read and executes it. A read's ordinal is its
 /// 1-based position in `reads`.
@@ -66,8 +84,73 @@ pub const Result = struct {
             c.off[i] = base + row.off[i];
             c.len[i] = row.len[i];
         }
+        if (tag_text and c.len[sql.mega.tags] >= 0) try m.tagArray(&c);
         if (c.len[page.ids] < 0) return m.rows.append(gpa, c);
         try m.expand(c);
+    }
+
+    /// Points the tags column at the article's tag names as a binary text[], appended to `data`, built from the
+    /// text `sql.mega.tag_text` sends: the names joined by chr(31), or chr(31) and the text[] in Postgres's text
+    /// form, `{a,"b c"}`, where an element is quoted when it needs to be and `"` and `\` in quotes are escaped.
+    fn tagArray(m: *Result, c: *Cols) !void {
+        const len: usize = @intCast(c.len[sql.mega.tags]);
+        // At most 20 header bytes, then 4 length bytes per name and the names, which are no longer than the text.
+        try m.data.ensureUnusedCapacity(gpa, 24 + 5 * len);
+        const s = m.data.items[c.off[sql.mega.tags]..][0..len];
+        const out = m.data.unusedCapacitySlice();
+        var o: usize = 20;
+        var n: i32 = 0;
+        if (len > 0 and s[0] == 0x1f) {
+            if (len < 3 or s[1] != '{' or s[len - 1] != '}') return error.BadMegaTags;
+            var i: usize = 2;
+            while (i < len - 1) : (i += 1) {
+                const name_at = o;
+                o += 4;
+                if (s[i] == '"') {
+                    i += 1;
+                    while (i < len - 1 and s[i] != '"') : (i += 1) {
+                        if (s[i] == '\\') i += 1;
+                        out[o] = s[i];
+                        o += 1;
+                    }
+                    if (i >= len - 1) return error.BadMegaTags;
+                    i += 1;
+                } else {
+                    while (s[i] != ',' and s[i] != '}') : (i += 1) {
+                        out[o] = s[i];
+                        o += 1;
+                    }
+                }
+                std.mem.writeInt(i32, out[name_at..][0..4], @intCast(o - name_at - 4), .big);
+                n += 1;
+            }
+        } else if (len > 0) {
+            var name_at = o;
+            o += 4;
+            for (s) |ch| {
+                if (ch != 0x1f) {
+                    out[o] = ch;
+                    o += 1;
+                    continue;
+                }
+                std.mem.writeInt(i32, out[name_at..][0..4], @intCast(o - name_at - 4), .big);
+                n += 1;
+                name_at = o;
+                o += 4;
+            }
+            std.mem.writeInt(i32, out[name_at..][0..4], @intCast(o - name_at - 4), .big);
+            n += 1;
+        }
+        std.mem.writeInt(i32, out[0..4], @intFromBool(n > 0), .big);
+        std.mem.writeInt(i32, out[4..8], 0, .big);
+        std.mem.writeInt(i32, out[8..12], @intFromEnum(sql.Oid.text), .big);
+        if (n > 0) {
+            std.mem.writeInt(i32, out[12..16], n, .big);
+            std.mem.writeInt(i32, out[16..20], 1, .big);
+        } else o = 12;
+        c.off[sql.mega.tags] = @intCast(m.data.items.len);
+        c.len[sql.mega.tags] = @intCast(o);
+        m.data.items.len += o;
     }
 
     /// A list read's page row, with the page's article ids and their authors and the viewer's favorites and
@@ -134,8 +217,9 @@ pub const Result = struct {
         for (&m.entities) |*e| e.clearRetainingCapacity();
     }
 
-    /// Hands every read its rows through `sink.row(r, row)`, then calls `sink.done(r)`.
-    pub fn deliver(m: *Result, reads: []const *Query, sink: anytype) !void {
+    /// Hands every read its rows through `sink.row(r, row)`, then calls `sink.done(r)`; a set of reads sharing a
+    /// response goes as its lead's rows, then `plan.done`.
+    pub fn deliver(m: *Result, reads: []const *Query, plan: *Plan, sink: anytype) !void {
         const n = reads.len;
         m.start.clearRetainingCapacity();
         try m.start.appendNTimes(gpa, 0, n + 1);
@@ -162,17 +246,37 @@ pub const Result = struct {
             m.start.items[k] += 1;
         }
         // The placement advanced each read's start to its end, which is the next read's start.
+        plan.begin(reads);
         var first: u32 = 0;
+        for (reads, 0..) |r, k| {
+            const end = m.start.items[k];
+            if (r.share != 0 and !m.flagged(m.by_read.items[first..end])) plan.add(@intCast(k));
+            first = end;
+        }
+        first = 0;
         for (reads, 0..) |r, k| {
             const spec = r.stmt.def().mega.?;
             const end = m.start.items[k];
+            defer first = end;
+            if (plan.follows(k)) continue;
             m.view.clearRetainingCapacity();
             for (m.by_read.items[first..end]) |i| try m.view.append(gpa, m.assemble(spec, &m.rows.items[i]));
-            first = end;
             if (spec.order.len > 0) std.mem.sort(pg.Row, m.view.items, spec.order, newer);
             for (m.view.items) |*row| sink.row(r, row);
-            sink.done(r);
+            plan.done(k, sink);
         }
+    }
+
+    /// Whether the viewer favorited or follows anything in a read's rows. Every read's flags are in the page's
+    /// flag columns, list or not.
+    fn flagged(m: *const Result, rows: []const u32) bool {
+        for (rows) |i| {
+            const c = &m.rows.items[i];
+            for ([_]usize{ page.favorited, page.following }) |col| {
+                if (c.len[col] == 1 and m.data.items[c.off[col]] != 0) return true;
+            }
+        }
+        return false;
     }
 
     /// Row `c` in the read statement's column layout, each NULL column taken from the entity row `c` points at.
@@ -360,6 +464,14 @@ const Recorder = struct {
         s.out.print(testing.allocator, "{s} done\n", .{@tagName(r.stmt)}) catch @panic("oom");
     }
 
+    pub fn lead(s: Recorder, r: *Query, n: u32) void {
+        s.out.print(testing.allocator, "{s} lead {d}\n", .{ @tagName(r.stmt), n }) catch @panic("oom");
+    }
+
+    pub fn same(s: Recorder, r: *Query) void {
+        s.out.print(testing.allocator, "{s} same, viewer {d}\n", .{ @tagName(r.stmt), r.params[0].int }) catch @panic("oom");
+    }
+
     fn write(s: Recorder, r: *Query, x: *const pg.Row) !void {
         const a = testing.allocator;
         try s.out.appendSlice(a, @tagName(r.stmt));
@@ -408,7 +520,8 @@ test "deliver hands each read its own statement's rows, filled from entity rows 
 
     var got: std.ArrayList(u8) = .empty;
     defer got.deinit(testing.allocator);
-    try m.deliver(&ptrs, Recorder{ .out = &got });
+    var plan: Plan = .{};
+    try m.deliver(&ptrs, &plan, Recorder{ .out = &got });
     try testing.expectEqualStrings(
         \\list_all 2 9 's9' 'T9' 'D9' 90 91 [a,b] 3 t 'amy' - - f
         \\list_all 2 5 's5' 'T5' 'D5' 50 51 [] 0 f 'bob' 'hi' - t
@@ -443,7 +556,8 @@ test "add expands a page row into one row per article, with the viewer's flags f
 
     var got: std.ArrayList(u8) = .empty;
     defer got.deinit(testing.allocator);
-    try m.deliver(&ptrs, Recorder{ .out = &got });
+    var plan: Plan = .{};
+    try m.deliver(&ptrs, &plan, Recorder{ .out = &got });
     try testing.expectEqualStrings(
         \\list_all 3 9 's9' 'T9' 'D9' 90 91 [a,b] 3 f 'amy' - - t
         \\list_all 3 7 - - - - - - - f - - - f
@@ -455,6 +569,47 @@ test "add expands a page row into one row per article, with the viewer's flags f
         \\list_tag done
         \\
     , got.items);
+}
+
+/// `names` as Postgres sends a text[] in binary: no dimensions when empty.
+fn textArrayBytes(out: *std.ArrayList(u8), names: []const []const u8) !void {
+    const a = testing.allocator;
+    const hdr = [_]i32{ @intFromBool(names.len > 0), 0, @intFromEnum(sql.Oid.text), @intCast(names.len), 1 };
+    for (hdr[0..if (names.len > 0) 5 else 3]) |h| try out.appendSlice(a, &std.mem.toBytes(std.mem.nativeToBig(i32, h)));
+    for (names) |n| {
+        try out.appendSlice(a, &std.mem.toBytes(std.mem.nativeToBig(i32, @intCast(n.len))));
+        try out.appendSlice(a, n);
+    }
+}
+
+test "with tags as text, add turns the joined names, or the text[] in text form, into the binary text[]" {
+    tag_text = true;
+    defer tag_text = false;
+    const cases = [_]struct { text: []const u8, names: []const []const u8 }{
+        .{ .text = "", .names = &.{} },
+        .{ .text = "dragons", .names = &.{"dragons"} },
+        .{ .text = "a\x1fbb\x1fccc", .names = &.{ "a", "bb", "ccc" } },
+        .{ .text = "\x1f{}", .names = &.{} },
+        // Postgres's own text form of this text[] (array_out).
+        .{
+            .text = "\x1f{\"\",\"a,b\",\"say \\\"hi\\\"\",\"back\\\\slash\",\"sp ace\",\"{x}\",\"NULL\",x\x1fy,\"tab\t\",\xc3\xa9,plain}",
+            .names = &.{ "", "a,b", "say \"hi\"", "back\\slash", "sp ace", "{x}", "NULL", "x\x1fy", "tab\t", "\xc3\xa9", "plain" },
+        },
+    };
+    for (cases) |t| {
+        var m: Result = .{};
+        try addRow(&m, -1, &.{ .{ 1, .{ .int = 9 } }, .{ sql.mega.tags, .{ .text = t.text } } });
+        try addRow(&m, 1, &.{.{ 0, .{ .int = 0 } }});
+        const c = m.rows.items[0];
+        var want: std.ArrayList(u8) = .empty;
+        defer want.deinit(testing.allocator);
+        try textArrayBytes(&want, t.names);
+        try testing.expectEqualSlices(u8, want.items, m.data.items[c.off[sql.mega.tags]..][0..@intCast(c.len[sql.mega.tags])]);
+        try testing.expectEqual(-1, m.rows.items[1].len[sql.mega.tags]);
+    }
+    var m: Result = .{};
+    try testing.expectError(error.BadMegaTags, addRow(&m, -1, &.{.{ sql.mega.tags, .{ .text = "\x1f{\"open}" } }}));
+    try testing.expectError(error.BadMegaTags, addRow(&m, -1, &.{.{ sql.mega.tags, .{ .text = "\x1f{" } }}));
 }
 
 test "add refuses a page whose arrays are not one-dimensional int8 without NULLs, or of different lengths" {
@@ -473,5 +628,61 @@ test "deliver refuses an entity type other than the article" {
     try addRow(&m, -3, &.{.{ 0, .{ .int = 0 } }});
     var got: std.ArrayList(u8) = .empty;
     defer got.deinit(testing.allocator);
-    try testing.expectError(error.MegaOrdinal, m.deliver(&ptrs, Recorder{ .out = &got }));
+    var plan: Plan = .{};
+    try testing.expectError(error.MegaOrdinal, m.deliver(&ptrs, &plan, Recorder{ .out = &got }));
+}
+
+test "deliver hands rows once per set of reads sharing a response, then answers its followers right after its lead" {
+    // Share classes as the drain process makes them: the same response head, from worker 0 and from worker 1.
+    const w0: u32 = 1 | 2 | 4 | 1448 << 16;
+    const w1: u32 = w0 | 1 << 3;
+    var reqs = [_]Query{
+        testReq(.list_all, &.{ .{ .int = 7 }, .{ .int = 10 }, .{ .int = 0 } }),
+        testReq(.list_all, &.{ .{ .int = 8 }, .{ .int = 10 }, .{ .int = 0 } }),
+        // Favorited article 9.
+        testReq(.list_all, &.{ .{ .int = 9 }, .{ .int = 10 }, .{ .int = 0 } }),
+        testReq(.list_all, &.{ .{ .int = 10 }, .{ .int = 10 }, .{ .int = 0 } }),
+        testReq(.list_all, &.{ .{ .int = 11 }, .{ .int = 10 }, .{ .int = 10 } }),
+        testReq(.list_all, &.{ .{ .int = 0 }, .{ .int = 10 }, .{ .int = 0 } }),
+        testReq(.list_all, &.{ .{ .int = 12 }, .{ .int = 10 }, .{ .int = 0 } }),
+    };
+    for (&reqs, [_]u32{ w0, w0, w0, w1, w0, w0, 0 }) |*r, c| r.share = c;
+    var ptrs: [reqs.len]*Query = undefined;
+    for (&reqs, &ptrs) |*r, *p| p.* = r;
+
+    var m: Result = .{};
+    for (1..8) |ord| {
+        if (ord == 5) {
+            try addRow(&m, 5, &.{ .{ 0, .{ .int = 2 } }, .{ 15, .{ .ints = &.{3} } }, .{ 16, .{ .ints = &.{2} } }, .{ 17, .{ .ints = &.{} } }, .{ 18, .{ .ints = &.{} } } });
+            continue;
+        }
+        const fa: []const i64 = if (ord == 3) &.{9} else &.{};
+        try addRow(&m, @intCast(ord), &.{ .{ 0, .{ .int = 2 } }, .{ 15, .{ .ints = &.{ 5, 9 } } }, .{ 16, .{ .ints = &.{ 1, 1 } } }, .{ 17, .{ .ints = fa } }, .{ 18, .{ .ints = &.{} } } });
+    }
+    try addRow(&m, -1, &.{ .{ 1, .{ .int = 9 } }, .{ 2, .{ .text = "s9" } }, .{ 3, .{ .text = "T9" } }, .{ 4, .{ .text = "D9" } }, .{ 6, .{ .int = 90 } }, .{ 7, .{ .int = 91 } }, .{ 8, .{ .tags = &.{ "a", "b" } } }, .{ 9, .{ .int = 3 } }, .{ 11, .{ .text = "amy" } } });
+    try addRow(&m, -1, &.{ .{ 1, .{ .int = 5 } }, .{ 2, .{ .text = "s5" } }, .{ 3, .{ .text = "T5" } }, .{ 4, .{ .text = "D5" } }, .{ 6, .{ .int = 50 } }, .{ 7, .{ .int = 51 } }, .{ 8, .{ .tags = &.{} } }, .{ 9, .{ .int = 0 } }, .{ 11, .{ .text = "amy" } } });
+
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(testing.allocator);
+    var plan: Plan = .{};
+    try m.deliver(&ptrs, &plan, Recorder{ .out = &got });
+    try testing.expectEqualStrings(
+        \\list_all 2 9 's9' 'T9' 'D9' 90 91 [a,b] 3 f 'amy' - - f
+        \\list_all 2 5 's5' 'T5' 'D5' 50 51 [] 0 f 'amy' - - f
+        \\list_all lead 2
+        \\list_all same, viewer 8
+        \\list_all same, viewer 0
+        \\list_all 2 9 's9' 'T9' 'D9' 90 91 [a,b] 3 t 'amy' - - f
+        \\list_all 2 5 's5' 'T5' 'D5' 50 51 [] 0 f 'amy' - - f
+        \\list_all done
+        \\list_all 2 9 's9' 'T9' 'D9' 90 91 [a,b] 3 f 'amy' - - f
+        \\list_all 2 5 's5' 'T5' 'D5' 50 51 [] 0 f 'amy' - - f
+        \\list_all done
+        \\list_all 2 3 - - - - - - - f - - - f
+        \\list_all done
+        \\list_all 2 9 's9' 'T9' 'D9' 90 91 [a,b] 3 f 'amy' - - f
+        \\list_all 2 5 's5' 'T5' 'D5' 50 51 [] 0 f 'amy' - - f
+        \\list_all done
+        \\
+    , got.items);
 }
