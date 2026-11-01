@@ -19,64 +19,125 @@ fn capped_count(subquery: &str) -> String {
     format!("(SELECT count(*) FROM ({subquery} LIMIT 1000) s)")
 }
 
+fn feed_def() -> PreparedDef {
+    def(
+        "feed",
+        format!(
+            "WITH u AS MATERIALIZED ( \
+               SELECT r.k, r.v, r.depth, \
+                 ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.v) AS fids \
+               FROM unnest($1::int8[], $2::int8[]) WITH ORDINALITY r(v, depth, k) \
+             ), \
+             hub_floors AS MATERIALIZED ( \
+               SELECT h.fid, \
+                 (SELECT a.id FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC LIMIT 1 OFFSET h.depth - 1) AS floor_id, \
+                 EXISTS (SELECT 1 FROM articles a WHERE a.author_id = h.fid ORDER BY a.id ASC LIMIT 1 OFFSET 999) AS big \
+               FROM ( \
+                 SELECT f.fid, max(u.depth) AS depth \
+                 FROM u, unnest(u.fids) AS f(fid) \
+                 GROUP BY f.fid HAVING count(*) >= 2 \
+                 ORDER BY count(*) DESC, f.fid LIMIT 32 \
+               ) h \
+             ), \
+             cap_authors AS MATERIALIZED ( \
+               SELECT ARRAY(SELECT hf.fid FROM hub_floors hf WHERE hf.big) AS fids \
+             ) \
+             SELECT -u.k, \
+               CASE WHEN cardinality(u.fids) = 0 THEN 0::int8 \
+                    WHEN u.fids && (SELECT fids FROM cap_authors) THEN 1000::int8 \
+                    ELSE {} \
+               END, \
+               0::int8 \
+             FROM u \
+             UNION ALL \
+             SELECT p.k, x.id, x.author_id \
+             FROM unnest($3::int8[], $4::int8[], $5::int8[]) WITH ORDINALITY p(uk, lim, off, k) \
+             JOIN u ON u.k = p.uk AND cardinality(u.fids) > 0 \
+             CROSS JOIN LATERAL (SELECT COALESCE(max(hf.floor_id), 0::int8) AS floor_id FROM hub_floors hf WHERE hf.fid = ANY(u.fids)) fl \
+             CROSS JOIN LATERAL ( \
+               SELECT y.id, y.author_id FROM unnest(u.fids) AS fid \
+               CROSS JOIN LATERAL ( \
+                 SELECT a2.id, fid AS author_id FROM articles a2 \
+                 WHERE a2.author_id = fid AND a2.id >= fl.floor_id \
+                 ORDER BY a2.id DESC LIMIT (p.lim + p.off) \
+               ) y \
+               ORDER BY y.id DESC LIMIT p.lim OFFSET p.off \
+             ) x",
+            capped_count("SELECT 1 FROM articles a WHERE a.author_id = ANY(u.fids)")
+        ),
+        &[
+            OID_INT8_ARR,
+            OID_INT8_ARR,
+            OID_INT8_ARR,
+            OID_INT8_ARR,
+            OID_INT8_ARR,
+        ],
+    )
+}
+
 pub fn read_catalog() -> Vec<PreparedDef> {
     vec![
         // Sequential scan over the 2-page tags heap; sorted in memory by ReadWorker.
         def("tags", "SELECT id, name FROM tags", &[]),
         def(
             "uid",
-            "SELECT r.k, u.id, u.username, u.email, u.bio, u.image \
-             FROM unnest($1::int8[]) WITH ORDINALITY r(id, k) JOIN users u ON u.id = r.id",
+            "SELECT u.id, u.username, u.email, u.bio, u.image \
+             FROM users u WHERE u.id = ANY($1::int8[])",
             &[OID_INT8_ARR],
         ),
         def(
             "uemail",
-            "SELECT r.k, u.id, u.username, u.email, u.bio, u.image, u.password_hash \
-             FROM unnest($1::text[]) WITH ORDINALITY r(email, k) JOIN users u ON u.email = r.email",
+            "SELECT u.id, u.username, u.email, u.bio, u.image, u.password_hash \
+             FROM users u WHERE u.email = ANY($1::text[])",
             &[OID_TEXT_ARR],
         ),
         def(
             "prof",
-            "SELECT r.k, u.id, u.username, u.bio, u.image \
-             FROM unnest($1::text[]) WITH ORDINALITY r(username, k) JOIN users u ON u.username = r.username",
+            "SELECT u.id, u.username, u.bio, u.image \
+             FROM users u WHERE u.username = ANY($1::text[])",
             &[OID_TEXT_ARR],
         ),
         def(
             "aslug",
-            "SELECT r.k, a.id, a.author_id, a.body \
-             FROM unnest($1::text[]) WITH ORDINALITY r(slug, k) JOIN articles a ON a.slug = r.slug",
+            "SELECT 0::int8, a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at, a.body \
+             FROM articles a WHERE a.slug = ANY($1::text[])",
             &[OID_TEXT_ARR],
         ),
         def(
             "aid",
-            "SELECT r.k, a.id, a.author_id, a.body \
-             FROM unnest($1::int8[]) WITH ORDINALITY r(id, k) JOIN articles a ON a.id = r.id",
+            "SELECT 0::int8, a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at, a.body \
+             FROM articles a WHERE a.id = ANY($1::int8[])",
             &[OID_INT8_ARR],
         ),
         def(
             "cmts",
-            "SELECT r.k, a.id, c.id, c.body, c.created_at, c.updated_at, c.author_id, u.username, u.bio, u.image \
+            "SELECT r.k, c.id, c.body, c.created_at, c.updated_at, c.author_id \
              FROM unnest($1::text[]) WITH ORDINALITY r(slug, k) JOIN articles a ON a.slug = r.slug \
              LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id FROM comments c \
-               WHERE c.article_id = a.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true \
-             LEFT JOIN users u ON u.id = c.author_id",
+               WHERE c.article_id = a.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true",
             &[OID_TEXT_ARR],
         ),
         def(
             "global",
             "SELECT 0::int8, CASE WHEN EXISTS (SELECT 1 FROM articles ORDER BY id ASC LIMIT 1 OFFSET 999) \
-             THEN 1000 ELSE (SELECT count(*) FROM articles) END, 0::int8 \
+             THEN 1000 ELSE (SELECT count(*) FROM articles) END, 0::int8, \
+             NULL::text, NULL::text, NULL::text, NULL::timestamptz, NULL::timestamptz \
              UNION ALL \
-             SELECT r.k, a.id, a.author_id FROM unnest($1::int8[], $2::int8[]) WITH ORDINALITY r(lim, off, k) \
-             CROSS JOIN LATERAL (SELECT a.id, a.author_id FROM articles a ORDER BY a.id DESC LIMIT r.lim OFFSET r.off) a",
+             SELECT r.k, a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at \
+             FROM unnest($1::int8[], $2::int8[]) WITH ORDINALITY r(lim, off, k) \
+             CROSS JOIN LATERAL (SELECT a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at \
+               FROM articles a ORDER BY a.id DESC LIMIT r.lim OFFSET r.off) a",
             &[OID_INT8_ARR, OID_INT8_ARR],
         ),
         def(
             "global_win",
             "SELECT 0::int8, CASE WHEN EXISTS (SELECT 1 FROM articles ORDER BY id ASC LIMIT 1 OFFSET 999) \
-             THEN 1000 ELSE (SELECT count(*) FROM articles) END, 0::int8 \
+             THEN 1000 ELSE (SELECT count(*) FROM articles) END, 0::int8, \
+             NULL::text, NULL::text, NULL::text, NULL::timestamptz, NULL::timestamptz \
              UNION ALL \
-             SELECT 1::int8, a.id, a.author_id FROM (SELECT a.id, a.author_id FROM articles a ORDER BY a.id DESC LIMIT $1) a",
+             SELECT 1::int8, a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at \
+             FROM (SELECT a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at \
+               FROM articles a ORDER BY a.id DESC LIMIT $1) a",
             &[OID_INT8],
         ),
         def(
@@ -89,9 +150,10 @@ pub fn read_catalog() -> Vec<PreparedDef> {
                  END AS cnt \
                FROM unnest($1::text[]) WITH ORDINALITY r(tag, k) LEFT JOIN tags t ON t.name = r.tag \
              ) \
-             SELECT -u.k, u.cnt, 0::int8 FROM u \
+             SELECT -u.k, u.cnt, 0::int8, NULL::text, NULL::text, NULL::text, NULL::timestamptz, NULL::timestamptz FROM u \
              UNION ALL \
-             SELECT p.k, a.id, a.author_id FROM unnest($2::int8[], $3::int8[], $4::int8[]) WITH ORDINALITY p(uk, lim, off, k) \
+             SELECT p.k, a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at \
+             FROM unnest($2::int8[], $3::int8[], $4::int8[]) WITH ORDINALITY p(uk, lim, off, k) \
              JOIN u ON u.k = p.uk AND u.id IS NOT NULL AND u.cnt > p.off \
              CROSS JOIN LATERAL (SELECT at.article_id FROM article_tags at WHERE at.tag_id = u.id \
                ORDER BY at.article_id DESC LIMIT p.lim OFFSET p.off) x \
@@ -102,14 +164,16 @@ pub fn read_catalog() -> Vec<PreparedDef> {
             "author",
             format!(
                 "WITH u AS MATERIALIZED ( \
-                   SELECT r.k, usr.id, {} AS cnt \
+                   SELECT r.k, usr.id, CASE WHEN usr.id IS NULL THEN 0::int8 ELSE {} END AS cnt \
                    FROM unnest($1::text[]) WITH ORDINALITY r(username, k) LEFT JOIN users usr ON usr.username = r.username \
                  ) \
-                 SELECT -u.k, u.cnt, 0::int8 FROM u \
+                 SELECT -u.k, u.cnt, 0::int8, NULL::text, NULL::text, NULL::text, NULL::timestamptz, NULL::timestamptz FROM u \
                  UNION ALL \
-                 SELECT p.k, a.id, u.id FROM unnest($2::int8[], $3::int8[], $4::int8[]) WITH ORDINALITY p(uk, lim, off, k) \
+                 SELECT p.k, a.id, u.id, a.slug, a.title, a.description, a.created_at, a.updated_at \
+                 FROM unnest($2::int8[], $3::int8[], $4::int8[]) WITH ORDINALITY p(uk, lim, off, k) \
                  JOIN u ON u.k = p.uk AND u.id IS NOT NULL AND u.cnt > p.off \
-                 CROSS JOIN LATERAL (SELECT a.id FROM articles a WHERE a.author_id = u.id ORDER BY a.id DESC LIMIT p.lim OFFSET p.off) a",
+                 CROSS JOIN LATERAL (SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at \
+                   FROM articles a WHERE a.author_id = u.id ORDER BY a.id DESC LIMIT p.lim OFFSET p.off) a",
                 capped_count("SELECT 1 FROM articles a WHERE a.author_id = usr.id")
             ),
             &[OID_TEXT_ARR, OID_INT8_ARR, OID_INT8_ARR, OID_INT8_ARR],
@@ -118,12 +182,13 @@ pub fn read_catalog() -> Vec<PreparedDef> {
             "favlist",
             format!(
                 "WITH u AS MATERIALIZED ( \
-                   SELECT r.k, usr.id, {} AS cnt \
+                   SELECT r.k, usr.id, CASE WHEN usr.id IS NULL THEN 0::int8 ELSE {} END AS cnt \
                    FROM unnest($1::text[]) WITH ORDINALITY r(username, k) LEFT JOIN users usr ON usr.username = r.username \
                  ) \
-                 SELECT -u.k, u.cnt, 0::int8 FROM u \
+                 SELECT -u.k, u.cnt, 0::int8, NULL::text, NULL::text, NULL::text, NULL::timestamptz, NULL::timestamptz FROM u \
                  UNION ALL \
-                 SELECT p.k, a.id, a.author_id FROM unnest($2::int8[], $3::int8[], $4::int8[]) WITH ORDINALITY p(uk, lim, off, k) \
+                 SELECT p.k, a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at \
+                 FROM unnest($2::int8[], $3::int8[], $4::int8[]) WITH ORDINALITY p(uk, lim, off, k) \
                  JOIN u ON u.k = p.uk AND u.id IS NOT NULL AND u.cnt > p.off \
                  CROSS JOIN LATERAL (SELECT f.article_id FROM favorites f WHERE f.user_id = u.id \
                    ORDER BY f.article_id DESC LIMIT p.lim OFFSET p.off) x \
@@ -132,76 +197,25 @@ pub fn read_catalog() -> Vec<PreparedDef> {
             ),
             &[OID_TEXT_ARR, OID_INT8_ARR, OID_INT8_ARR, OID_INT8_ARR],
         ),
+        feed_def(),
         def(
-            "feed",
-            format!(
-                "WITH u AS MATERIALIZED ( \
-                   SELECT r.k, r.v, r.depth, \
-                     ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.v) AS fids \
-                   FROM unnest($1::int8[], $2::int8[]) WITH ORDINALITY r(v, depth, k) \
-                 ), \
-                 hub_floors AS MATERIALIZED ( \
-                   SELECT h.fid, \
-                     (SELECT a.id FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC LIMIT 1 OFFSET h.depth - 1) AS floor_id \
-                   FROM ( \
-                     SELECT f.fid, max(u.depth) AS depth \
-                     FROM u, unnest(u.fids) AS f(fid) \
-                     GROUP BY f.fid HAVING count(*) >= 2 \
-                     ORDER BY count(*) DESC, f.fid LIMIT 32 \
-                   ) h \
-                 ), \
-                 cap_authors AS MATERIALIZED ( \
-                   SELECT ARRAY( \
-                     SELECT hf.fid FROM ( \
-                       SELECT hf.fid FROM hub_floors hf WHERE hf.floor_id IS NOT NULL ORDER BY hf.floor_id DESC LIMIT 16 \
-                     ) hf \
-                     WHERE EXISTS (SELECT 1 FROM articles a WHERE a.author_id = hf.fid LIMIT 1 OFFSET 999) \
-                   ) AS fids \
-                 ) \
-                 SELECT -u.k, \
-                   CASE WHEN cardinality(u.fids) = 0 THEN 0::int8 \
-                        WHEN u.fids && (SELECT fids FROM cap_authors) THEN 1000::int8 \
-                        ELSE {} \
-                   END, \
-                   0::int8 \
-                 FROM u \
-                 UNION ALL \
-                 SELECT p.k, x.id, x.author_id \
-                 FROM unnest($3::int8[], $4::int8[], $5::int8[]) WITH ORDINALITY p(uk, lim, off, k) \
-                 JOIN u ON u.k = p.uk \
-                 CROSS JOIN LATERAL (SELECT COALESCE(max(hf.floor_id), 0::int8) AS floor_id FROM hub_floors hf WHERE hf.fid = ANY(u.fids)) fl \
-                 CROSS JOIN LATERAL ( \
-                   SELECT y.id, y.author_id FROM unnest(u.fids) AS fid \
-                   CROSS JOIN LATERAL ( \
-                     SELECT a2.id, fid AS author_id FROM articles a2 \
-                     WHERE a2.author_id = fid AND a2.id >= fl.floor_id \
-                     ORDER BY a2.id DESC LIMIT (p.lim + p.off) \
-                   ) y \
-                   ORDER BY y.id DESC LIMIT p.lim OFFSET p.off \
-                 ) x",
-                capped_count("SELECT 1 FROM articles a WHERE a.author_id = ANY(u.fids)")
-            ),
-            &[
-                OID_INT8_ARR,
-                OID_INT8_ARR,
-                OID_INT8_ARR,
-                OID_INT8_ARR,
-                OID_INT8_ARR,
-            ],
+            "artmeta",
+            "SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at \
+             FROM articles a WHERE a.id = ANY($1::int8[])",
+            &[OID_INT8_ARR],
         ),
         def(
             "artx",
-            "SELECT r.k, a.slug, a.title, a.description, a.created_at, a.updated_at, \
-             ARRAY(SELECT at.tag_id FROM article_tags at WHERE at.article_id = r.id), \
-             (SELECT count(*) FROM favorites f WHERE f.article_id = r.id) \
-             FROM unnest($1::int8[]) WITH ORDINALITY r(id, k) \
-             JOIN articles a ON a.id = r.id",
+            "SELECT r.id, \
+               ARRAY(SELECT at.tag_id FROM article_tags at WHERE at.article_id = r.id), \
+               (SELECT count(*) FROM favorites f WHERE f.article_id = r.id) \
+             FROM unnest($1::int8[]) AS r(id)",
             &[OID_INT8_ARR],
         ),
         def(
             "artau",
-            "SELECT r.k, u.username, u.bio, u.image \
-             FROM unnest($1::int8[]) WITH ORDINALITY r(id, k) JOIN users u ON u.id = r.id",
+            "SELECT u.id, u.username, u.bio, u.image \
+             FROM users u WHERE u.id = ANY($1::int8[])",
             &[OID_INT8_ARR],
         ),
         def(
@@ -308,9 +322,14 @@ pub fn write_catalog() -> Vec<PreparedDef> {
         ),
         def(
             "newart",
-            "INSERT INTO articles (id, slug, author_id, title, description, body) \
-             SELECT n.id, $5::text || '-' || n.id, $1, $2, $3, $4 \
-             FROM (SELECT nextval('articles_id_seq'::regclass) AS id) n RETURNING id",
+            "WITH ins AS (INSERT INTO articles (id, slug, author_id, title, description, body) \
+               SELECT n.id, $5::text || '-' || n.id, $1, $2, $3, $4 \
+               FROM (SELECT nextval('articles_id_seq'::regclass) AS id) n \
+               RETURNING slug, created_at, updated_at, author_id) \
+             SELECT ins.slug, ins.created_at, ins.updated_at, \
+             u.username, u.bio, u.image, \
+             EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = ins.author_id) \
+             FROM ins JOIN users u ON u.id = ins.author_id",
             &[OID_INT8, OID_TEXT, OID_TEXT, OID_TEXT, OID_TEXT],
         ),
         def(
@@ -352,17 +371,14 @@ pub fn write_catalog() -> Vec<PreparedDef> {
         ),
         def(
             "newcmt_batch",
-            "WITH r AS (SELECT x.k, x.uid, x.body, a.id AS aid \
-               FROM unnest($1::int8[], $2::text[], $3::text[]) WITH ORDINALITY x(uid, slug, body, k) \
-               JOIN articles a ON a.slug = x.slug), \
+            "WITH r AS MATERIALIZED (SELECT s.k, s.uid, s.body, s.aid, nextval('comments_id_seq'::regclass) AS cid \
+               FROM (SELECT x.k, x.uid, x.body, a.id AS aid \
+                 FROM unnest($1::int8[], $2::text[], $3::text[]) WITH ORDINALITY x(uid, slug, body, k) \
+                 JOIN articles a ON a.slug = x.slug ORDER BY x.k) s), \
              ins AS (INSERT INTO comments (id, article_id, author_id, body) \
-               SELECT nextval('comments_id_seq'::regclass), r.aid, r.uid, r.body \
-               FROM (SELECT * FROM r ORDER BY k) r \
-               RETURNING id, body, created_at, updated_at, author_id), \
-             ord AS (SELECT row_number() OVER (ORDER BY id) AS rn, id, body, created_at, updated_at, author_id FROM ins), \
-             rk AS (SELECT row_number() OVER (ORDER BY k) AS rn, k FROM r) \
-             SELECT rk.k, ord.id, ord.body, ord.created_at, ord.updated_at, u.username, u.bio, u.image \
-             FROM ord JOIN rk ON rk.rn = ord.rn JOIN users u ON u.id = ord.author_id",
+               SELECT cid, aid, uid, body FROM r) \
+             SELECT r.k, r.cid, r.body, now(), now(), u.username, u.bio, u.image \
+             FROM r JOIN users u ON u.id = r.uid",
             &[OID_INT8_ARR, OID_TEXT_ARR, OID_TEXT_ARR],
         ),
         def(
