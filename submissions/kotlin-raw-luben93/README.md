@@ -25,10 +25,13 @@ DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=... HO
 
 ## Settings (all optional; defaults are what the box runs)
 
-- Threads and connections: `HTTP_THREADS`, `DB_READ_CONNS`, `DB_WRITE_CONNS`, `BCRYPT_THREADS`, `BCRYPT_THREADS_MAX`,
-  `BCRYPT_EXTRA_AGE_MS`. `JAVA_HEAP` sets the heap in `start.sh` (default `3g`). `HTTP_IO=nio`: java.nio loops.
+- Threads and connections: `HTTP_THREADS`, `DB_READ_CONNS` (`start.sh` sets 6 on the JVM), `DB_WRITE_CONNS`, `BCRYPT_THREADS`, `BCRYPT_THREADS_MAX`,
+  `BCRYPT_EXTRA_AGE_MS`. `JAVA_HEAP` sets the heap in `start.sh` (default `3g`). `HTTP_IO=nio`: java.nio loops. `SCHED_BATCH`
+  (default on): every thread, HotSpot's included, runs under SCHED_BATCH so it does not preempt Postgres backends.
 - Postgres session: `DB_OPTIONS` (default: generic plans, no JIT, no parallel workers).
-  `WRITE_IMPLICIT_TX` (default on): a write group is one implicit transaction ended by its Sync, without BEGIN/COMMIT.
+  `DB_IMPLICIT_TX` (default on): a write group is one implicit transaction ended by its Sync, without BEGIN/COMMIT.
+  `DB_BATCH_WRITES` (default on): writes of a group that run the same statement go out as one multi-row statement.
+  `DB_PIPELINE` (default 2): a read connection with another full batch queued writes it behind the running one.
 - Batched reads: `READ_SHARE` (default on: the requests of a batch share counts, pages and article columns),
   `READ_SHARED_ROWS` and `READ_FEED_SHARE` (default on: each distinct thread, page or article is returned once per
   batch), `READ_VIEWER_FLAGS`, `READ_MAX_BATCH`, `READ_FEED_MAX_BATCH`, `READ_FEED_HEAVY`, `READ_FEED_FLOOR`.

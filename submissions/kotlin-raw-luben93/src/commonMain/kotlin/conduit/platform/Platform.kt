@@ -63,14 +63,14 @@ inline fun <T> Monitor.locked(block: () -> T): T {
     }
 }
 
-/** [BlockingSocket.read] waited longer than the socket's receive timeout without a byte arriving (not a failure by itself). */
-class SocketReadTimeout(message: String) : RuntimeException(message)
+/** [BlockingSocket.read]'s result when the receive timeout expired with no byte arriving (not a failure by itself). */
+const val READ_TIMEOUT = -2
 
 /** A blocking TCP client socket with TCP_NODELAY (the Postgres connections; one reader thread each). */
 expect class BlockingSocket {
     /**
-     * Reads up to [len] bytes; blocks until at least one byte arrives. Returns -1 at EOF. Throws on error, and
-     * [SocketReadTimeout] when the socket has a receive timeout and it expired (the socket stays usable).
+     * Reads up to [len] bytes; blocks until at least one byte arrives. Returns -1 at EOF and [READ_TIMEOUT] when the
+     * socket has a receive timeout and it expired (the socket stays usable). Throws on error.
      */
     fun read(b: ByteArray, off: Int, len: Int): Int
 

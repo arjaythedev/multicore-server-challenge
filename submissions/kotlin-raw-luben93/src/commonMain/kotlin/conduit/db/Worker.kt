@@ -97,8 +97,15 @@ internal abstract class Pool(
         val w = idle[--idleCount]!!
         idle[idleCount] = null
         w.idle = false
-        return if (assignLocked(w)) w.conn else null
+        return if (assignDispatchedLocked(w)) w.conn else null
     }
+
+    /**
+     * [assignLocked] for a worker taken off the idle stack by a thread that is not the worker's own (it will write the
+     * round trip): a pool that pipelines sends one round trip only, so the worker's own thread is the only encoder of a
+     * connection that already has bytes in flight.
+     */
+    open fun assignDispatchedLocked(w: Worker): Boolean = assignLocked(w)
 
     /**
      * Under [lock]: moves the next round trip's worth of queued requests to [w] (encoding it into w.conn.out, setting
@@ -210,12 +217,8 @@ internal abstract class Worker(@JvmField val pool: Pool, @JvmField val index: In
     private fun awaitMessage(c: PgConn) {
         while (true) {
             val running = pool.lock.locked { inFlight }
-            try {
-                c.next()
-                return
-            } catch (e: PgIoException) {
-                if (!e.timeout || running) throw e
-            }
+            if (c.nextOrTimeout() != PgConn.TIMEOUT) return
+            if (running) throw PgIoException("recv: timed out", null, true)
         }
     }
 

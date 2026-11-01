@@ -771,6 +771,11 @@ internal object Sql {
             "w AS (INSERT INTO favorites (user_id, article_id) SELECT \$1, t.id FROM t ON CONFLICT DO NOTHING) " +
             "SELECT t.id FROM t",
         intArrayOf(I8, T),
+        // m favorites at once: $1 i, $2 viewers, $3 slugs. Rows: i, article id. DISTINCT: the same favorite twice in one group.
+        batchSql = "WITH r AS (SELECT * FROM unnest(\$1::int4[], \$2::int8[], \$3::text[]) AS r(i, v, s)), " +
+            "t AS (SELECT r.i, r.v, a.id FROM r JOIN articles a ON a.slug = r.s), " +
+            "w AS (INSERT INTO favorites (user_id, article_id) SELECT DISTINCT t.v, t.id FROM t ON CONFLICT DO NOTHING) " +
+            "SELECT t.i, t.id FROM t",
     )
 
     /** $1 viewer, $2 slug. Row: article id. No row: 404. */
@@ -842,6 +847,15 @@ internal object Sql {
             "RETURNING id, created_at, updated_at, author_id) " +
             "SELECT c.id, c.created_at, c.updated_at, u.username, u.bio, u.image FROM c JOIN users u ON u.id = c.author_id",
         intArrayOf(I8, T, T),
+        // m comments at once: $1 i, $2 viewers, $3 slugs, $4 bodies. Ids are drawn in request order (the sort is under the nextval).
+        // Rows: i, id, created_at, updated_at, username, bio, image.
+        batchSql = "WITH r AS (SELECT * FROM unnest(\$1::int4[], \$2::int8[], \$3::text[], \$4::text[]) AS r(i, v, s, b)), " +
+            "m AS (SELECT x.*, nextval('comments_id_seq'::regclass) AS cid FROM " +
+            "(SELECT r.i, r.v, r.b, a.id AS aid FROM r JOIN articles a ON a.slug = r.s ORDER BY r.i OFFSET 0) x), " +
+            "c AS (INSERT INTO comments (id, article_id, author_id, body) SELECT m.cid, m.aid, m.v, m.b FROM m " +
+            "RETURNING id, created_at, updated_at, author_id) " +
+            "SELECT m.i, c.id, c.created_at, c.updated_at, u.username, u.bio, u.image " +
+            "FROM c JOIN m ON m.cid = c.id JOIN users u ON u.id = c.author_id",
     )
 
     /**

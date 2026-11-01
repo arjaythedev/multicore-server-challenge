@@ -3,6 +3,7 @@
 # CONDUIT_NATIVE=1 (development): runs the Kotlin/Native binary instead of the JVM build.
 set -euo pipefail
 cd "$(dirname "$0")"
+export DB_READ_CONNS=${DB_READ_CONNS:-6} DB_IMPLICIT_TX=${DB_IMPLICIT_TX:-1} DB_BATCH_WRITES=${DB_BATCH_WRITES:-1} DB_PIPELINE=${DB_PIPELINE:-2}
 if [ "${CONDUIT_NATIVE:-0}" = 1 ]; then exec build/bin/linuxX64/releaseExecutable/conduit.kexe; fi
 if [ -x /opt/jdk/bin/java ]; then JAVA=/opt/jdk/bin/java; else JAVA="${JAVA_HOME:+$JAVA_HOME/bin/}java"; fi
 # --enable-native-access: the FFM epoll HTTP loops and per-thread nice for the bcrypt workers.
