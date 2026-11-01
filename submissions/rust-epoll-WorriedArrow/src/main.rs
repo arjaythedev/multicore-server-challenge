@@ -63,6 +63,8 @@ fn main() {
         bcrypt_lanes,
         bcrypt_window: Duration::from_millis(env_or("BCRYPT_WINDOW_MS", 400)),
         bcrypt_idle: env_or("BCRYPT_IDLE", 0) != 0,
+        feed_conn: env_or("FEED_CONN", 1) != 0,
+        bcrypt_rescue: Duration::from_millis(env_or("BCRYPT_RESCUE_MS", 1000)),
     }));
 
     // Fail fast if Postgres is unreachable or a statement doesn't prepare.
@@ -75,7 +77,7 @@ fn main() {
         }
     }
 
-    http::ACK_DELAY.store(env_or("ACK_DELAY", 1) != 0, std::sync::atomic::Ordering::Relaxed);
+    http::ACK_DELAY.store(env_or("ACK_DELAY", 0) != 0, std::sync::atomic::Ordering::Relaxed);
     reply::init(io_threads);
     // FEED_LANES of the read lanes (and connections) serve only feeds; 0 (the default): every lane serves every read.
     // A fixed split caps feeds at those lanes' connections, and near saturation their queue can grow without bound.
@@ -93,7 +95,7 @@ fn main() {
     for i in 0..bcrypt_threads {
         std::thread::Builder::new().name("bcrypt".into()).spawn(move || db::bcrypt_worker(settings, i)).unwrap();
     }
-    if settings.bcrypt_idle {
+    if settings.bcrypt_idle && !settings.bcrypt_rescue.is_zero() {
         std::thread::Builder::new().name("bcrypt-rescue".into()).spawn(move || db::bcrypt_rescue(settings)).unwrap();
     }
     let mut handles = Vec::new();

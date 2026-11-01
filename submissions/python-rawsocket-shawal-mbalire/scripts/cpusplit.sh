@@ -4,13 +4,26 @@
 set -uo pipefail
 APP="$(cd "$(dirname "$0")/.." && pwd)"; S=/tmp/conduit-lg; mkdir -p $S
 USERS=$1
+# TEMPLATE=<db>: run on a fresh copy of that frozen database (conduit_run), so every A/B run starts from the same
+#   state (needs a local superuser; runs mutate the database, and a churned one drifts Postgres numbers)
+# IPS=n: spread the users over n loopback IPs (one IP has ~28k ephemeral ports)
+if [ -n "${TEMPLATE:-}" ]; then
+  psql -qX -d postgres -c "DROP DATABASE IF EXISTS conduit_run WITH (FORCE)" \
+       -c "CREATE DATABASE conduit_run TEMPLATE $TEMPLATE STRATEGY FILE_COPY" >/dev/null || exit 1
+  DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit_run
+fi
 export DATABASE_URL=${DATABASE_URL:-postgres://conduit:conduit@127.0.0.1:5432/conduit_full} JWT_SECRET=dev-secret HOST=127.0.0.1 PORT=3111 WORKERS=${WORKERS:-6}
+TARGET=http://127.0.0.1:3111
+if [ "${IPS:-1}" -gt 1 ]; then
+  export HOST=0.0.0.0
+  TARGET=$(seq -s, -f "http://127.0.0.%g:3111" 1 $IPS)
+fi
 rm -f $S/stages-*.json  # STAGES=0: plain server, no per-stage counters
 if [ "${STAGES:-1}" = 1 ]; then ENTRY=scripts/stagetimer.py; else ENTRY="-m conduit_server.main"; fi
 (cd $APP && STAGES_DIR=$S exec .venv/bin/python $ENTRY) > $S/srv.log 2>&1 &
 PID=$!
 for _ in $(seq 30); do curl -sf -o /dev/null http://127.0.0.1:3111/api/tags && break; sleep 1; done
-/tmp/conduit-lg/loadgen run -target http://127.0.0.1:3111 -users $USERS -ramp 5s -measure 20s -tail 2s \
+/tmp/conduit-lg/loadgen run -target $TARGET -users $USERS -ramp 5s -measure 20s -tail 2s \
   -secret dev-secret -articles 500000 -think-scale 0.2 -run-id cs-$RANDOM -out $S/lg.json > $S/lg.out 2>&1 &
 LG=$!
 snap() { # utime stime vol nonvol summed over all threads of all server procs

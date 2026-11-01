@@ -2,6 +2,7 @@ package conduit.app
 
 import conduit.json.JsonName
 import conduit.json.JsonWriter
+import conduit.pg.Result
 import conduit.pg.Row
 
 // Response JSON, written straight from binary rows (text columns are copied as UTF-8, never decoded to Strings).
@@ -45,9 +46,12 @@ internal fun JsonWriter.profile(r: Row, c: Int, following: Boolean) {
 
 /**
  * Article from the layout at [c]: slug, title, description, [body], created_at, updated_at, tag_list,
- * favorites_count, favorited, username, bio, image, following.
+ * favorites_count, favorited, username, bio, image, following. [flags]: the rows are shared between requests (a
+ * [conduit.db.Sharing.GROUPS] read) and carry no viewer flags: favorited and following come from this request's flag rows
+ * ([conduit.pg.Result.hasFlag]: the article id when the viewer favorited it, minus the author id when they follow the
+ * author), and the article and author ids are the two columns after the layout.
  */
-internal fun JsonWriter.article(r: Row, c: Int, withBody: Boolean) {
+internal fun JsonWriter.article(r: Row, c: Int, withBody: Boolean, flags: Result? = null) {
     beginObject()
     name(N_SLUG); text(r, c)
     name(N_TITLE); text(r, c + 1)
@@ -57,16 +61,41 @@ internal fun JsonWriter.article(r: Row, c: Int, withBody: Boolean) {
     name(N_TAG_LIST); textArray(r, p + 2, TagOrder.appSorts)
     name(N_CREATED_AT); timestamp(r.micros(p))
     name(N_UPDATED_AT); timestamp(r.micros(p + 1))
-    name(N_FAVORITED); bool(r.bool(p + 4))
+    name(N_FAVORITED); bool(if (flags == null) r.bool(p + 4) else flags.hasFlag(r.int8(p + 9)))
     name(N_FAVORITES_COUNT); number(r.int8(p + 3))
-    name(N_AUTHOR); profile(r, p + 5, r.bool(p + 8))
+    name(N_AUTHOR); profile(r, p + 5, if (flags == null) r.bool(p + 8) else flags.hasFlag(-r.int8(p + 10)))
+    endObject()
+}
+
+/**
+ * A feed article from its shared row [r] in the [Cols.FEED_ROW] layout (a [conduit.db.Sharing.ARTICLES] read); same members as
+ * [article]. Favorited comes from this request's flag rows (the article id), following is the constant true: every page row was
+ * selected through the viewer's follows.
+ */
+internal fun JsonWriter.feedArticle(r: Row, flags: Result) {
+    beginObject()
+    name(N_SLUG); text(r, 3)
+    name(N_TITLE); text(r, 4)
+    name(N_DESCRIPTION); text(r, 5)
+    name(N_TAG_LIST); textArray(r, 8, TagOrder.appSorts)
+    name(N_CREATED_AT); timestamp(r.micros(6))
+    name(N_UPDATED_AT); timestamp(r.micros(7))
+    name(N_FAVORITED); bool(flags.hasFlag(r.int8(1)))
+    name(N_FAVORITES_COUNT); number(r.int8(9))
+    name(N_AUTHOR)
+    beginObject()
+    name(N_USERNAME); text(r, 10)
+    name(N_BIO); text(r, 11)
+    name(N_IMAGE); text(r, 12)
+    name(N_FOLLOWING); bool(true)
+    endObject()
     endObject()
 }
 
 /** {"article": ...} for a full article at column [c]. */
-internal fun JsonWriter.articleEnvelope(r: Row, c: Int) {
+internal fun JsonWriter.articleEnvelope(r: Row, c: Int, flags: Result? = null) {
     beginObject()
-    name(N_ARTICLE); article(r, c, withBody = true)
+    name(N_ARTICLE); article(r, c, withBody = true, flags)
     endObject()
 }
 

@@ -7,7 +7,7 @@ import org.ethelred.kiwiproc.annotation.SqlQuery;
 import org.ethelred.kiwiproc.annotation.SqlUpdate;
 import org.jspecify.annotations.Nullable;
 
-@DAO
+@DAO(autoCommit = true)
 public interface CommentDao {
 
     record CommentRow(

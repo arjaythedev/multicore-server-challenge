@@ -2,16 +2,25 @@
 
 Front: direct
 
-An update of this submission, first scored at 91,000 users in #83 (`3de991e`),
-on the same compiler and library and the same design. Since that build: the
-profiles go through the read plans too, the favorites are folded into them,
-logins go to bcrypt services in their own processes, every connection sets
-`enable_memoize=off`, the viewers' flags are sent as one id array per viewer,
-half the CPUs serve HTTP (four on the box, where #83 ran two), and Nish
-0.23.1 no longer sweeps every idle connection on every turn of the loop. On a VM like the box, #83's build
-held 90,000 users and this one 150,000 (below; not official).
+An update of this submission, scored at 91,000 users in #83 (`3de991e`) and
+100,000 in #116 (`6e69d72`), on the same design. Since #116, most of it to
+cut what Postgres spends a request: favorite counts leave `plan_meta` for a
+count lane of their own, an idea of this submission's (below); two HTTP
+workers instead of four, for read plans twice the size; feeds share their
+followees within a plan; Nish 0.29.0 reads an article's tag ids and the
+plan's batches in binary, and runs bcrypt at the width the CPU likes best;
+each answer turns delayed ACKs back on for its connection; and a sign-up's
+hash waits 20 ms for company instead of 160.
 
-Nish 0.23.1 (a statically typed TypeScript subset compiled to native code
+Since #83: the profiles go through the read plans too, the favorites are
+folded into them, logins go to bcrypt services in their own processes, every
+connection sets `enable_memoize=off`, the viewers' flags are sent as one id
+array per viewer, a quarter of the CPUs serve HTTP (two on the box, each with a bigger
+read queue than four could have, where #83 ran
+two), and Nish 0.23.1 no longer sweeps every idle connection on every turn of
+the loop.
+
+Nish 0.29.0 (a statically typed TypeScript subset compiled to native code
 through LLVM), built with clang-18 and lld-18 from LLVM 18, against
 PostgreSQL 18. The compiler runs on Node.js 22.18.0 at build time only; the
 server is one native binary with no runtime dependency beyond libc. Every
@@ -26,8 +35,15 @@ bash build.sh
 DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=... HOST=0.0.0.0 PORT=80 bash start.sh
 ```
 
-The server needs Nish 0.23.1, whose `nish/net/http1-server` no longer
-sweeps every connection on every turn of the loop (below). 0.23.0 was the
+The server needs Nish 0.29.0: 0.26.0 brought binary result columns to
+`nish/net/postgres` (`bindStartBinary`, `binaryInt`, `PgBinary`) and
+`TCP_QUICKACK` to `netSetOption`, and 0.27.0 the binary `PgBatcher`
+(`PgBatchConfig.binary`), `PgBinaryArray` for an integer array column, and
+`setNice` and `setIdlePriority` in `nish:process`, and 0.28.0 `bcryptHashN`,
+`bcryptVerifyN` and `bcryptCalibrate`, and the policy in
+`nish/net/http-compress`. 0.23.1's
+`nish/net/http1-server` no longer sweeps every connection on every turn of
+the loop (below). 0.23.0 was the
 first published release with the `nish/net/postgres` array parameters built in the Bind (`arrayStart`,
 `arrayElement`, `arrayInt`, `paramIntArray`) and the `PgBatcher` it uses
 (0.22.1 brought `PreforkConfig.restart`, `Http1Config.idleInput` and
@@ -38,7 +54,8 @@ the compiler and its platform package.
 ## Design and optimizations
 
 - **Processes.** A prefork parent starts the HTTP workers and the bcrypt
-  services (half the CPUs each, at least two: four and four on the box), and
+  services (a quarter of the CPUs and half of them, at least two each: two
+and four on the box), and
   restarts none of them. Each HTTP worker binds `HOST:PORT` with `SO_REUSEPORT` and
   `TCP_NODELAY`, and runs one epoll loop over its listener, its keep-alive
   connections, its PostgreSQL connections and its connection to each bcrypt
@@ -65,7 +82,10 @@ the compiler and its platform package.
   emptied every execution (2 hits in 351): the comments statement ran 7–12%
   slower with it. A group is pipelined
   Bind/Execute messages and one Sync, and up to 16 groups are pipelined on
-  each connection.
+  each connection. A read plan's article rows and its batches come back in
+  binary (`bindStartBinary`): ids, counts and times as they are stored, and
+  an article's tag ids as an `int4[]` that `PgBinaryArray` walks in place,
+  rather than text the server parses back.
 - **Read plans.** Postgres is what the challenge's box runs out of, so the
   reads are planned to cost it as little as possible. Every list page (the
   global list, a tag, an author, a user's favorites), every feed, every
@@ -107,8 +127,8 @@ the compiler and its platform package.
   Postgres while that request waited, and a plan takes only the requests
   already waiting when it starts.
 - **Batch clock.** A plan starts when 256 reads wait (a full plan) or when
-  the oldest has waited 10 ms, and up to three are in flight per worker (one
-  a read connection). Started at once instead, a plan is whatever arrived
+  the oldest has waited 10 ms, and up to three are in
+  flight per worker (one a read connection). Started at once instead, a plan is whatever arrived
   during the last one's two round trips, about 17 requests at the load
   measured below, and Postgres pays its fixed costs and reads the same
   articles again plan after plan. The window makes plans of about 60
@@ -119,6 +139,40 @@ the compiler and its platform package.
   than `READ_PLAN_LIGHT` (32) planned reads a window starts a plan at once
   while none is in flight, and gathers for the window above that, so a
   quiet server answers in a couple of milliseconds instead of ten.
+  On the VM below at 120,000 users, 20, 30 and 40 ms windows took Postgres
+  from 149 µs a request to 135, 129 and 128, and p95 from 43 ms to 57, 67
+  and 74. At 145,000 users, past the knee, 30 ms saved nothing (206 µs a
+  request against 208) and p95 was worse, so the window stays at 10 ms.
+- **The count lane.** A favorite count walks the article's index entries,
+  and the heap of any page writes have touched, so unlike the rest of an
+  article it costs by the row: taking the column out of `plan_meta`, to
+  measure it, took Postgres from 124 µs a request to 95 at 120,000 users on
+  the VM, and p99 from 199 ms to 57. Popular articles are on the pages of
+  plan after plan: at 145,000 users, 54% of the entries a plan counted had
+  been counted for the same article in the 30 ms before. So each worker runs
+  one `plan_counts` at a time, over the union of the articles of every plan
+  waiting when it starts, each counted once; the plans stay concurrent and
+  only the costly column queues. A run is fixed as it is bound, so every
+  count is read after the requests it answers arrived, and it keeps nothing
+  once its plans have their counts: this is a batch, not a cache.
+- **Two HTTP workers.** Each worker has its own read queue, so fewer workers
+  make bigger plans. At 120,000 users on the VM, Postgres spent 150 µs a
+  request with four, 129 with two and 117 with one, which ran out of core.
+  Each worker has six read connections and up to ten plans in flight; eight
+  connections in all left p95 at 400-600 ms at 155,000 users, and six or four
+  stop near 37,000 and 29,000 requests a second with CPU to spare.
+- **Feeds in a plan.** Followees several viewers of a plan share are looked
+  at once: one with 1,000 articles proves its followers' count without a
+  count, and the depth-th newest article of one is a floor that stops every
+  other followee's walk. The rows matched the old statement on 40 random
+  batches of the full seed, and total CPU fell by about 6 µs a request.
+- **Delayed ACKs.** A request's answer is often sent within the 40 ms the
+  kernel waits to ACK it alone, but a socket with `TCP_NODELAY` drops back
+  to quick ACKs. After each answer the worker sets `TCP_QUICKACK` off on
+  that connection again, so the next request's ACK can ride on its answer.
+  On the VM it cut the server's packets out per request by 5–7%; the
+  single CPU that takes the network interrupts is what the box runs out of
+  first.
 - **Durable group commit.** While a batch is in flight on the write
   connection, the writes that arrive wait. Then up to 128 of them go as one
   group: one transaction, one commit, and one WAL flush. Each response is
@@ -158,7 +212,9 @@ the compiler and its platform package.
   expiry are checked on every request. Nothing is cached between requests.
 - **bcrypt.** Cost 10, with salts from the CSPRNG. Each bcrypt service
   batches up to four hashes or four checks into one four-lane bcrypt call,
-  after a collection window of up to 160 ms. A worker sends a login to the
+  after a collection window of up to 160 ms for checks (logins) and 20 ms
+  for hashes (sign-ups, which a 160 ms window kept waiting for company that
+  rarely comes). A worker sends a login to the
   service whose batch is closest to full, else the least busy, so batches
   fill before another service is given work. With Postgres keeping every
   core busy, one process got a share of a core too small for the logins:
@@ -172,16 +228,23 @@ Every request reads PostgreSQL, and there are no result, token or password
 caches. There are no schema or configuration changes, no CPU affinity and no
 host tuning.
 
-Optional process settings, with their defaults: `HTTP_WORKERS` (half the
+Optional process settings, with their defaults: `HTTP_WORKERS` (a quarter of the
 CPUs, at least 2),
-`DB_READ_CONNS` (3) and `DB_WRITE_CONNS` (1) per worker, `DB_MAX_IN_FLIGHT`
-(16), `DB_READ_PLANS` (`DB_READ_CONNS`) read plans in flight per worker,
-`READ_PLAN_WAIT_US` (10000) and `READ_PLAN_MIN` (256) for the batch clock,
+`DB_READ_CONNS` (6) and `DB_WRITE_CONNS` (1) per worker, `DB_MAX_IN_FLIGHT`
+(16), `DB_READ_PLANS` (10) read plans in flight per worker,
+`READ_PLAN_WAIT_US` (10000) and `READ_PLAN_MIN` (512) for the batch clock,
 `READ_PLAN_CLOCK` (1; 0 starts a plan at once while none is in flight, 2
 is adaptive) and `READ_PLAN_LIGHT` (32), `BCRYPT_WORKERS` (half the CPUs,
-at least 2), `BCRYPT_BATCH_MS` (160), `BCRYPT_PORT` (47391, loopback; the
-services listen on it and the ports above) and
-`IDLE_TIMEOUT_MS` (75000). On the box's 8 CPUs that makes 16 PostgreSQL
+at least 2), `BCRYPT_BATCH_MS` (160) and `BCRYPT_HASH_MS` (20),
+`BCRYPT_WIDTH` (unset, timed at startup; 1 to 6 lanes a call),
+`GZIP` (0; 1 when it saves a TCP segment, 2 whenever it saves anything; at
+145,000 users on the VM it cost about 30 µs a request and failed the hold),
+`GZIP_MIN` (1300),
+`BCRYPT_NICE` (unset; 1 to 19 lowers the bcrypt services' priority with
+`setNice`, `idle` moves them to `SCHED_IDLE`; it measured within the spread
+between runs, so it stays off), `BCRYPT_PORT` (47391, loopback; the
+services listen on it and the ports above), `ACK_DELAY` (1; 0 leaves the
+kernel's ACKs alone) and `IDLE_TIMEOUT_MS` (75000). On the box's 8 CPUs that makes 16 PostgreSQL
 connections in all, inside the limit of 95.
 
 ## Measured
@@ -275,6 +338,25 @@ default.
 
 ### On a VM like the challenge's box (not official)
 
+Latest, 5-minute holds on the same VM with the official pass rule, from one
+load box over four source IPs. Past about 32,000 connections per source IP
+the box's own `connect` walked the kernel's port range under a lock, which
+stalled it for 8 to 24 seconds around the end of the ramp in every hold above
+145,000 users, the top entry's too. The load generator here now gives each
+user a fixed source port; the server is not involved, and these holds ran
+with that fix and no stall:
+
+| Build | Users | Verdict | req/s | p95 | p99 | Errors | µs a request (Postgres + server) |
+|---|--:|---|--:|--:|--:|--:|---|
+| before this update | 165,000 | FAIL | 37,407 | 1,750 ms | 2,322 ms | 0.00% | 138 + 74 |
+| this one, two holds | 165,000 | PASS, PASS | 42,310-42,402 | 230-254 ms | 379-389 ms | 0.00% | 113 + 62-63 |
+| this one, two holds | 175,000 | PASS, FAIL | 43,335-43,366 | 491-514 ms | 562-735 ms | 0.00% | 109 + 64 |
+| this one | 190,000 | FAIL | 42,984 | 984 ms | 1,072 ms | 0.00% | 108 + 68 |
+
+Nish 0.29.0 alone measured the same as 0.28.0. Gzip
+(`GZIP=1`, `nish/net/http-compress`) cost about 30 µs a request and failed its
+holds at 145,000, and stays off.
+
 The challenge's own `loadgen search` (warm-up, doubling probes, bisection to
 5%, 5-minute holds; the official pass rule) against an 8-vCPU Intel Xeon
 Platinum 8260 VM with 16 GB running PostgreSQL 18 and the server, from a
@@ -292,7 +374,7 @@ and Postgres 47%), so the VM reads about 1% low.
 | `40b375e` | `HTTP_WORKERS=4`, three searches | 110,000–120,000 | 28,401–30,483 | 184–419 ms | 232–513 ms | 39% / 58% / 97–98% |
 | `40b375e` | `HTTP_WORKERS=5` | 120,000 | 30,055 | 446 ms | 612 ms | 38% / 59% / 98% |
 | `0475a77` | its defaults (four workers, sweep once a second), two searches | 140,000 | 35,407–36,107 | 240–406 ms | 333–603 ms | 28% / 67% / 97% |
-| this build | its defaults, a 5-minute hold at 150,000 | 150,000 | 38,902 | 175 ms | 661 ms | 31% / 66% / 98% |
+| `6e69d72` (#116) | its defaults, a 5-minute hold at 150,000 | 150,000 | 38,902 | 175 ms | 661 ms | 31% / 66% / 98% |
 
 With four workers 130,000 failed its probe (p95 730 ms), with throughput flat
 at about 30,500 req/s. Two workers left the box about a sixth idle; four use
@@ -301,7 +383,7 @@ that takes the network interrupts is the first to run out (about 30% of it in
 softirq). With the idle sweep once a second, the server's share of the box
 fell from 39% to 28%, which Postgres took: 140,000 held at the top of the
 searches' range, and 145,000 passed a probe (p95 483 ms) but not a 5-minute
-hold (p95 634 ms). This build, on Nish 0.23.1, held 150,000 in a 5-minute
+hold (p95 634 ms). #116's build (`6e69d72`), on Nish 0.23.1, held 150,000 in a 5-minute
 hold on the official pass rule (`loadgen run`, 60 s ramp and 300 s
 measured), above the searches' range. The VM's speed drifts by about 8% over
 a day, so the hold was run once a check at 140,000 matched the earlier
@@ -337,6 +419,18 @@ from the idea, not the code:
   ([#53](https://github.com/arjaythedev/multicore-server-challenge/pull/53)):
   more bcrypt workers than one core's worth, because a saturated box gives
   each only a fair share.
+- From [zig-iouring-nick-potts](https://github.com/arjaythedev/multicore-server-challenge/tree/main/submissions/zig-iouring-nick-potts)
+  ([#79](https://github.com/arjaythedev/multicore-server-challenge/pull/79)):
+  turning delayed ACKs back on after each answer (`TCP_QUICKACK` off), and
+  bcrypt at idle priority (`BCRYPT_NICE=idle`, off by default here).
+- From [rust-epoll-theCatWisel](https://github.com/arjaythedev/multicore-server-challenge/tree/main/submissions/rust-epoll-theCatWisel)
+  ([#132](https://github.com/arjaythedev/multicore-server-challenge/pull/132))
+  and rust-epoll-WorriedArrow: the feed's shared followees, a floor for their
+  pages and a proof of their count; the statement follows theCatWisel's.
+- From rust-epoll-WorriedArrow and zig-iouring-nick-potts: timing bcrypt's
+  lane widths at startup and keeping the fastest, here through Nish's
+  `bcryptCalibrate`; and from nick-potts, gzip only when it saves a TCP
+  segment (`GZIP=1`, off by default).
 - `enable_memoize=off` as a session option was set first by
   [c-iouring-tigokraft](https://github.com/arjaythedev/multicore-server-challenge/tree/main/submissions/c-iouring-tigokraft)
   ([#10](https://github.com/arjaythedev/multicore-server-challenge/pull/10)),

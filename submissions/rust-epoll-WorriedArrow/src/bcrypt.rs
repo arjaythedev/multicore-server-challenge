@@ -10,15 +10,81 @@ const ALPHABET: &[u8; 64] = b"./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuv
 const MAGIC: [u32; 6] = [0x4f727068, 0x65616e42, 0x65686f6c, 0x64657253, 0x63727944, 0x6f756274]; // "OrpheanBeholderScryDoubt"
 
 #[derive(Clone)]
+#[repr(C)]
 struct State {
     p: [u32; 18],
     s: [[u32; 256]; 4],
 }
 
-impl State {
-    fn new() -> Box<State> {
-        Box::new(State { p: P, s: S })
+// The generated expand0 kernels (build.rs): `bc_expand0_<style>_<n>(lanes)` over n contiguous States.
+#[cfg(target_arch = "x86_64")]
+std::arch::global_asm!(include_str!(concat!(env!("OUT_DIR"), "/expand0.s")));
+
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" {
+    fn bc_expand0_ah_1(s: *mut State);
+    fn bc_expand0_ah_2(s: *mut State);
+    fn bc_expand0_ah_3(s: *mut State);
+    fn bc_expand0_ah_4(s: *mut State);
+    fn bc_expand0_ah_5(s: *mut State);
+    fn bc_expand0_ah_6(s: *mut State);
+    fn bc_expand0_ah_7(s: *mut State);
+    fn bc_expand0_ah_8(s: *mut State);
+    fn bc_expand0_bextr_1(s: *mut State);
+    fn bc_expand0_bextr_2(s: *mut State);
+    fn bc_expand0_bextr_3(s: *mut State);
+    fn bc_expand0_bextr_4(s: *mut State);
+    fn bc_expand0_bextr_5(s: *mut State);
+    fn bc_expand0_bextr_6(s: *mut State);
+    fn bc_expand0_bextr_7(s: *mut State);
+    fn bc_expand0_bextr_8(s: *mut State);
+}
+
+/// Which expand0 the cost loop runs: the Rust one, or a generated kernel in one of its two index styles.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Kernel {
+    Rust = 0,
+    Ah = 1,
+    Bextr = 2,
+}
+
+static KERNEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn kernel() -> Kernel {
+    match KERNEL.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Kernel::Ah,
+        2 => Kernel::Bextr,
+        _ => Kernel::Rust,
     }
+}
+
+/// The kernels that can run here: the generated ones need BMI1 (bextr) and BMI2 (rorx).
+pub fn kernels() -> Vec<Kernel> {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("bmi1") && std::arch::is_x86_feature_detected!("bmi2") {
+        return vec![Kernel::Rust, Kernel::Ah, Kernel::Bextr];
+    }
+    vec![Kernel::Rust]
+}
+
+#[cfg(target_arch = "x86_64")]
+fn asm_expand0(k: Kernel, lanes: &mut [State]) {
+    type F = unsafe extern "C" fn(*mut State);
+    const AH: [F; 8] = [bc_expand0_ah_1, bc_expand0_ah_2, bc_expand0_ah_3, bc_expand0_ah_4, bc_expand0_ah_5, bc_expand0_ah_6, bc_expand0_ah_7, bc_expand0_ah_8];
+    const BX: [F; 8] = [
+        bc_expand0_bextr_1,
+        bc_expand0_bextr_2,
+        bc_expand0_bextr_3,
+        bc_expand0_bextr_4,
+        bc_expand0_bextr_5,
+        bc_expand0_bextr_6,
+        bc_expand0_bextr_7,
+        bc_expand0_bextr_8,
+    ];
+    let f = if k == Kernel::Ah { AH[lanes.len() - 1] } else { BX[lanes.len() - 1] };
+    // SAFETY: the lanes are contiguous repr(C) States of 1042 words (the kernel's stride), and `kernels()` checked
+    // for the BMI1/BMI2 instructions the kernel uses.
+    unsafe { f(lanes.as_mut_ptr()) }
 }
 
 #[inline(always)]
@@ -142,76 +208,111 @@ pub struct Job<'a> {
 
 /// Runs N jobs of the same cost in lockstep and returns each raw 23-byte digest.
 pub fn raw_n<const N: usize>(jobs: &[Job; N], cost: u32) -> [[u8; 23]; N] {
+    raw_with::<N>(jobs, cost, kernel())
+}
+
+fn raw_with<const N: usize>(jobs: &[Job; N], cost: u32, k: Kernel) -> [[u8; 23]; N] {
     let mut keys: Vec<Vec<u8>> = Vec::with_capacity(N);
     for j in jobs {
         // $2a$: the key is the password followed by its NUL terminator (as golang.org/x/crypto/bcrypt does).
-        let mut k = Vec::with_capacity(j.password.len() + 1);
-        k.extend_from_slice(j.password);
-        k.push(0);
-        keys.push(k);
+        let mut kb = Vec::with_capacity(j.password.len() + 1);
+        kb.extend_from_slice(j.password);
+        kb.push(0);
+        keys.push(kb);
     }
-    let words: Vec<Words> = (0..N).map(|k| Words::new(&keys[k], &jobs[k].salt)).collect();
-    let mut boxes: Vec<Box<State>> = (0..N).map(|_| State::new()).collect();
+    let words: Vec<Words> = (0..N).map(|i| Words::new(&keys[i], &jobs[i].salt)).collect();
+    // One contiguous block, as the generated kernels address every lane from one base.
+    let mut lanes: Vec<State> = vec![State { p: P, s: S }; N];
+    let kp: [&[u32; 18]; N] = std::array::from_fn(|i| &words[i].key);
+    let sp: [&[u32; 18]; N] = std::array::from_fn(|i| &words[i].salt18);
+    let s4: [&[u32; 4]; N] = std::array::from_fn(|i| &words[i].salt);
     {
-        let mut it = boxes.iter_mut();
-        let mut st: [&mut State; N] = std::array::from_fn(|_| &mut **it.next().unwrap());
-        let kp: [&[u32; 18]; N] = std::array::from_fn(|k| &words[k].key);
-        let sp: [&[u32; 18]; N] = std::array::from_fn(|k| &words[k].salt18);
-        let s4: [&[u32; 4]; N] = std::array::from_fn(|k| &words[k].salt);
+        let mut it = lanes.iter_mut();
+        let mut st: [&mut State; N] = std::array::from_fn(|_| it.next().unwrap());
         expand_n(&mut st, kp, Some(s4));
-        let rounds = 1u64 << cost;
-        for _ in 0..rounds {
-            expand_n(&mut st, kp, None);
-            expand_n(&mut st, sp, None);
-        }
-        let mut out = [[0u8; 23]; N];
-        let mut c: [[u32; 6]; N] = [MAGIC; N];
-        for _ in 0..64 {
-            for half in 0..3 {
-                let mut l: [u32; N] = std::array::from_fn(|k| c[k][2 * half]);
-                let mut r: [u32; N] = std::array::from_fn(|k| c[k][2 * half + 1]);
-                encrypt_n(&st, &mut l, &mut r);
-                for k in 0..N {
-                    c[k][2 * half] = l[k];
-                    c[k][2 * half + 1] = r[k];
+    }
+    let rounds = 1u64 << cost;
+    match k {
+        #[cfg(target_arch = "x86_64")]
+        Kernel::Ah | Kernel::Bextr => {
+            for _ in 0..rounds {
+                for xor in [&kp, &sp] {
+                    for (st, w) in lanes.iter_mut().zip(xor.iter()) {
+                        for i in 0..18 {
+                            st.p[i] ^= w[i];
+                        }
+                    }
+                    asm_expand0(k, &mut lanes);
                 }
             }
         }
-        for k in 0..N {
-            let mut bytes = [0u8; 24];
-            for (i, w) in c[k].iter().enumerate() {
-                bytes[4 * i..4 * i + 4].copy_from_slice(&w.to_be_bytes());
+        _ => {
+            let mut it = lanes.iter_mut();
+            let mut st: [&mut State; N] = std::array::from_fn(|_| it.next().unwrap());
+            for _ in 0..rounds {
+                expand_n(&mut st, kp, None);
+                expand_n(&mut st, sp, None);
             }
-            out[k].copy_from_slice(&bytes[..23]);
         }
-        out
     }
+    let mut it = lanes.iter_mut();
+    let st: [&mut State; N] = std::array::from_fn(|_| it.next().unwrap());
+    let mut out = [[0u8; 23]; N];
+    let mut c: [[u32; 6]; N] = [MAGIC; N];
+    for _ in 0..64 {
+        for half in 0..3 {
+            let mut l: [u32; N] = std::array::from_fn(|i| c[i][2 * half]);
+            let mut r: [u32; N] = std::array::from_fn(|i| c[i][2 * half + 1]);
+            encrypt_n(&st, &mut l, &mut r);
+            for i in 0..N {
+                c[i][2 * half] = l[i];
+                c[i][2 * half + 1] = r[i];
+            }
+        }
+    }
+    for i in 0..N {
+        let mut bytes = [0u8; 24];
+        for (j, w) in c[i].iter().enumerate() {
+            bytes[4 * j..4 * j + 4].copy_from_slice(&w.to_be_bytes());
+        }
+        out[i].copy_from_slice(&bytes[..23]);
+    }
+    out
 }
 
-/// The number of hashes to run in lockstep on this CPU: more lanes hide more load latency until the lanes' S-boxes
-/// (4 KB each) and chains stop fitting the core's L1 and registers, which differs between CPUs. Times every width
-/// from 1 to 6 on throwaway keys at a low cost and returns the one with the lowest time per hash (the narrower one
-/// when within 3%, since a narrower set fills sooner).
+/// Picks the expand0 kernel and the number of hashes to run in lockstep on this CPU, and returns the width: more
+/// lanes hide more load latency until the lanes' S-boxes (4 KB each) and chains stop fitting the core's L1 and
+/// registers, and which index style decodes faster differs between CPUs. Times every kernel at every width from 1 to
+/// 6 on throwaway keys at a low cost and keeps the lowest time per hash (a narrower width when within 3%, since a
+/// narrower set fills sooner).
 pub fn calibrate() -> usize {
-    fn per_hash<const N: usize>() -> f64 {
+    fn per_hash<const N: usize>(k: Kernel) -> f64 {
         let salt = [7u8; 16];
         let jobs: [Job; N] = std::array::from_fn(|_| Job { password: b"calibration", salt });
         let mut best = f64::MAX;
         for _ in 0..6 {
             let t = std::time::Instant::now();
-            std::hint::black_box(raw_n::<N>(std::hint::black_box(&jobs), 7));
+            std::hint::black_box(raw_with::<N>(std::hint::black_box(&jobs), 7, k));
             best = best.min(t.elapsed().as_secs_f64() / N as f64);
         }
         best
     }
-    let times = [per_hash::<1>(), per_hash::<2>(), per_hash::<3>(), per_hash::<4>(), per_hash::<5>(), per_hash::<6>()];
-    let mut best = 0;
-    for n in 1..times.len() {
-        if times[n] < times[best] * 0.97 {
-            best = n;
+    let mut pick = (Kernel::Rust, 1, f64::MAX);
+    for k in kernels() {
+        let times = [per_hash::<1>(k), per_hash::<2>(k), per_hash::<3>(k), per_hash::<4>(k), per_hash::<5>(k), per_hash::<6>(k)];
+        let mut best = 0;
+        for n in 1..times.len() {
+            if times[n] < times[best] * 0.97 {
+                best = n;
+            }
+        }
+        if times[best] < pick.2 {
+            pick = (k, best + 1, times[best]);
         }
     }
-    best + 1
+    KERNEL.store(pick.0 as u8, std::sync::atomic::Ordering::Relaxed);
+    eprintln!("bcrypt: {:?} kernel x {} lanes, {:.1} ms per cost-10 hash", pick.0, pick.1, pick.2 * 8000.0);
+    pick.1
 }
 
 fn b64_encode(src: &[u8], out: &mut Vec<u8>) {
@@ -317,7 +418,7 @@ mod tests {
     use super::*;
 
     fn one(pw: &[u8], salt: [u8; 16], cost: u32) -> [u8; 23] {
-        raw_n::<1>(&[Job { password: pw, salt }], cost)[0]
+        raw_with::<1>(&[Job { password: pw, salt }], cost, Kernel::Rust)[0]
     }
 
     #[test]
@@ -342,6 +443,32 @@ mod tests {
     }
 
     #[test]
+    fn kernels_match_reference() {
+        let pws: [&[u8]; 8] = [b"a", b"", b"password123", &[0x80u8; 72], b"x", b"correct horse battery staple", b"bb", b"zz"];
+        let salts: [[u8; 16]; 8] = std::array::from_fn(|i| [i as u8 * 7 + 1; 16]);
+        let want: Vec<[u8; 23]> = (0..8).map(|i| one(pws[i], salts[i], 4)).collect();
+        for k in kernels() {
+            macro_rules! check {
+                ($n:literal) => {{
+                    let jobs: [Job; $n] = std::array::from_fn(|i| Job { password: pws[i], salt: salts[i] });
+                    let got = raw_with::<$n>(&jobs, 4, k);
+                    for i in 0..$n {
+                        assert_eq!(got[i], want[i], "{k:?} n={} lane {i}", $n);
+                    }
+                }};
+            }
+            check!(1);
+            check!(2);
+            check!(3);
+            check!(4);
+            check!(5);
+            check!(6);
+            check!(7);
+            check!(8);
+        }
+    }
+
+    #[test]
     fn verifies_seed_hash() {
         let h = b"$2a$10$ZSfEoPvlcsj2XfvsSeK25em4NZ9Jm7ntGqXuLgQfHEeZPYB8899wq";
         let p = parse(h).unwrap();
@@ -354,15 +481,20 @@ mod tests {
 #[cfg(test)]
 mod speed {
     use super::*;
-    fn run<const N: usize>() {
+    fn run<const N: usize>(k: Kernel) {
         let jobs: [Job; N] = std::array::from_fn(|i| Job { password: b"password123", salt: [i as u8; 16] });
-        let t = std::time::Instant::now();
+        let cpu = || {
+            let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut t) };
+            t.tv_sec as f64 * 1e3 + t.tv_nsec as f64 / 1e6
+        };
+        let (t, c) = (std::time::Instant::now(), cpu());
         let reps = 3;
         for _ in 0..reps {
-            std::hint::black_box(raw_n::<N>(&jobs, 10));
+            std::hint::black_box(raw_with::<N>(&jobs, 10, k));
         }
-        let per = t.elapsed().as_secs_f64() * 1000.0 / (reps * N) as f64;
-        eprintln!("lanes={N} ms/hash={per:.2}");
+        let n = (reps * N) as f64;
+        eprintln!("{k:?} lanes={N} wall ms/hash={:.2} cpu ms/hash={:.2}", t.elapsed().as_secs_f64() * 1000.0 / n, (cpu() - c) / n);
     }
     #[test]
     #[ignore]
@@ -374,11 +506,14 @@ mod speed {
     #[test]
     #[ignore]
     fn bcrypt_speed() {
-        run::<1>();
-        run::<2>();
-        run::<3>();
-        run::<4>();
-        run::<6>();
-        run::<8>();
+        for k in kernels() {
+            run::<1>(k);
+            run::<2>(k);
+            run::<3>(k);
+            run::<4>(k);
+            run::<5>(k);
+            run::<6>(k);
+            run::<8>(k);
+        }
     }
 }

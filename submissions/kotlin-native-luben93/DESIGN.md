@@ -46,10 +46,14 @@ PG write thread (x DB_WRITE_CONNS, default 2): group commit. Takes all queued wr
   BEGIN; w1; w2; ...; COMMIT; Sync in ONE round trip; resumes callers only after COMMIT's ReadyForQuery.
   On any error: ROLLBACK, then each job alone (autocommit). `isolated` writes (register, user update: unique
   violations expected) always run alone.
-bcrypt thread (x BCRYPT_THREADS, default 1, nice 10): collects up to 8 jobs within BCRYPT_BATCH_MS (400 ms; at
+bcrypt thread (x BCRYPT_THREADS, default max(2, cpus/4)): collects up to 8 jobs within BCRYPT_BATCH_MS (400 ms; at
   ~28 logins/s 93% of batches are full), computes them as interleaved lanes in one call to the C kernel (FFM on the
   JVM, cinterop on Native; 12.6-13 ms CPU/hash at 8 lanes vs 23.4 / 18.7 ms for the Kotlin 4 lanes), resumes
   each caller on the bcrypt thread. If the kernel is missing or fails its startup checks: Kotlin lanes, up to 4.
+  Extra bcrypt workers (BCRYPT_THREADS_MAX, default cpus/2; BCRYPT_EXTRA_AGE_MS, default window + 100 ms) sleep until the
+  oldest queued login has waited that long, i.e. until every base thread is busy, then take what is queued (a partial
+  batch too): a login rate above what the base threads hash (about 36/s per thread on the busy box) is absorbed instead
+  of timing out, and the extra threads use CPU only while such a backlog exists.
 ```
 
 Every statement is prepared once per connection at startup (named `s<id>`, explicit parameter OIDs, no Describe);
@@ -134,6 +138,31 @@ Lab (2026-10-27, box simulation on 8 of 20 laptop CPUs, lab/reports/omarchy-2026
 went from 170 to 127 us/req (statement execution 5.4 -> 4.1 cores; the global list 127 -> 44 s per 2 minutes), the
 app from 46 to 40 us/req; the scorer's search held 130k (here) instead of 120k. Per execution, 60 workload-shaped
 requests: global list 15.8 -> 4.8 ms, author list 5.3 -> 3.3, article 0.85 -> 0.50, tag list 11.7 -> 9.3.
+
+## Shared rows (`READ_SHARED_ROWS`, default on) and the feed (`READ_FEED_SHARE`, default on)
+
+The shared shapes above still sent every row to every request: 865 comments requests over a few dozen threads made
+Postgres serialize, and the pool parse, each thread once per request. The leaders send each distinct row once
+(.tmp/reports/multicore-sql-research-20261030.md has the statement-by-statement comparison). Kinds with
+`Sharing.GROUPS` (comments, article, global/tag/author lists) now do the same:
+- the pool groups a batch by (key, limit, offset) (`Grouper`, by the key as Postgres sees it: `wireKey`); the statement
+  groups the same way (`min(r.i)` per group) and returns each group's rows ONCE, tagged with the group's first request;
+  `ReadWorker.processReply` hands every request of a group views of those rows (same receive buffer, no copy).
+- what differs per request (favorited, following) comes back as flag rows `(-1 - request, flag int8, NULL...)`: the
+  article id when the viewer favorited it, minus the author id when they follow the author (comments: the author id).
+  One favorites_pkey and one follows_pkey probe per signed-in request, `= ANY` of the group's articles / authors.
+  `Result.hasFlag` looks them up; `JsonWriter.article(..., flags)` and the comments handler use them. Rows then carry
+  the article id and the author id after the usual layout (see `Cols`).
+- the feed keeps its per-request rows (every viewer's page is different) but decorates each distinct page article once:
+  the viewers' page ids are cut first, then tags, favorites counts and authors come from one `= ANY` probe per table
+  and the viewer's favorited flags from one favorites_pkey probe per viewer (about 630 page rows for 290-340
+  distinct articles at 64 feeds).
+Both are exact: the equality harness (.tmp/exp/sqlr, eqgen.py / eqgen2.py) compares every column of every request's
+rows, in order, with the previous statements on the full seed (sizes 1 to 800, anonymous viewers, 404 keys, empty and
+past-the-end pages, hub authors around the 1000-article cap, viewers who follow/favorite what is in the rows).
+EXPLAIN replay, new/old Postgres time per batch on the loaded lab box: feed 76% at 64 feeds, comments 20% (20 hot
+slugs) to 55% (200 slugs), article 80%, global list 26%, tag list 68%, author list 58%.
+`READ_SHARED_ROWS=0` / `READ_FEED_SHARE=0` run the previous statements.
 
 ## Kotlin/Native specifics (linuxX64Main, build.gradle.kts)
 

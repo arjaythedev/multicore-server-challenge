@@ -6,7 +6,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Optional
 
-from conduit_server.adapters.inbound.router import parse_request
+from conduit_server.ports.inbound import HttpApplication, InboundServer, RequestParser
 
 _IN = select.EPOLLIN
 # Linux >= 4.5. Some Python builds (uv's standalone CPython) are compiled against older kernel headers and lack the
@@ -46,7 +46,7 @@ class _Conn:
         self.last = time.monotonic()
 
 
-class RawSocketHttpServer:
+class RawSocketHttpServer(InboundServer):
     """epoll(7) HTTP/1.1 keep-alive server: one I/O loop thread, handlers inline or on a thread pool.
 
     threads=0: the loop runs each complete request's synchronous router call itself, so a worker process is a single
@@ -71,12 +71,14 @@ class RawSocketHttpServer:
         self,
         host: str,
         port: int,
-        router,
+        router: HttpApplication,
+        parse: RequestParser,
         threads: int = 16,
         listener: Optional[socket.socket] = None,
         offload: frozenset = frozenset(),
         pipeline=None,
     ):
+        self.parse = parse  # raw request bytes -> HttpRequest
         self.dispatch = router.dispatch  # HttpRequest -> bytes, or (handler, query) to wait on
         self.dispatch_sync = router.dispatch_sync  # HttpRequest -> bytes
         self.resume = router.resume  # (handler, value, error) -> bytes, or (handler, query)
@@ -99,6 +101,8 @@ class RawSocketHttpServer:
         self.conns: Dict[int, _Conn] = {}
         self.done: deque = deque()
 
+    make_listener = staticmethod(make_listener)
+
     def start(self):
         # threads=0: requests run inline on the loop (no GIL handoffs), except offloaded ones on one helper thread
         self.inline = self.threads == 0
@@ -117,6 +121,8 @@ class RawSocketHttpServer:
             self.read_pipes = ()
             self.write_pipe = None
             self.pipeline = None
+        if any(hasattr(p, "attach") for p in self.pipes):
+            raise SystemExit("Error: this DB_DRIVER's pipelines run on asyncio: use HTTP_SERVER=uvloop")
         self.pfd_map = {}  # fd -> PgPipeline
         self.pipe_state = {}  # id(pipe) -> (fd, mask)
         self.dirty_pipes = set()
@@ -205,7 +211,7 @@ class RawSocketHttpServer:
                 self._send(conn, self._respond(data, False))
                 return
             try:
-                out = self.dispatch(parse_request(data))
+                out = self.dispatch(self.parse(data))
             except Exception:
                 out = _BAD_REQUEST
             out = self._await(conn, out, False)
@@ -264,7 +270,7 @@ class RawSocketHttpServer:
                 self._send(conn, self._respond(raw, keep_close))
                 return True
             try:
-                out = self.dispatch(parse_request(raw))
+                out = self.dispatch(self.parse(raw))
             except Exception:
                 out = _BAD_REQUEST
             out = self._await(conn, out, keep_close)
@@ -420,7 +426,7 @@ class RawSocketHttpServer:
     # ---- pool threads ------------------------------------------------------
     def _respond(self, raw: bytes, keep_close: bool) -> bytes:
         try:
-            response = self.dispatch_sync(parse_request(raw))
+            response = self.dispatch_sync(self.parse(raw))
         except Exception:
             response = _BAD_REQUEST
         return _closing(response) if keep_close else response

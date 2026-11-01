@@ -18,7 +18,7 @@ implementations, so there is no reflection on the request path.
 | HTTP | avaje-http 3.12.1 annotations and `helidon` generator, on Helidon SE (WebServer) 4.5.6 |
 | JSON | avaje-jsonb 3.16 |
 | Validation | avaje-validator 2.18 |
-| SQL | kiwiproc 1.0 (Gradle plugin), reference SQL from `SPEC.md` |
+| SQL | kiwiproc 1.1 (Gradle plugin), reference SQL from `SPEC.md` |
 | Driver and pool | pgjdbc 42.7.14, HikariCP 7.1.0 (10 connections per core, capped at 95, set in `start.sh`) |
 | bcrypt | `at.favre.lib:bcrypt` 0.10.2, cost 10 |
 | JWT | hand-written HS256 (`javax.crypto.Mac`), in `Jwt.java` |
@@ -61,10 +61,25 @@ The box is CPU-bound: the app and Postgres share the cores. Every change below w
 machine described under [Results](#results); the ones that didn't help are listed afterwards.
 
 **Database**
-- The SQL is the reference SQL from `SPEC.md`, in the same order, except that article queries first pick their page
-  of ids (a `page` CTE with the reference query's filter, order and limit) and then join one aggregate of those
-  articles' tags, instead of running a tag subquery per article. The result is identical; in Postgres the list
-  query ran about twice as fast (pgbench, 4 clients).
+- The SQL is the reference SQL from `SPEC.md`, except for how the article queries are put together. A single article
+  (`GET /api/articles/:slug` and the re-reads after a write) first picks its id (a `page` CTE) and then joins one
+  aggregate of its tags, instead of running a tag subquery per article; in Postgres that ran about twice as fast
+  (pgbench, 4 clients).
+- A list is two statements, plus the capped count: a small query that picks the page of article ids (the reference
+  query's filter, order and limit), then one query that reads those articles `WHERE id = ANY($1)`. The result is
+  identical. The split is for planning: with `LIMIT` and `OFFSET` as parameters, Postgres plans a page query with
+  the real values on every call, because a generic plan has to assume the limit is 10% of the table and costs
+  thousands of times more, so it is never chosen. A page query that also joined tags, favorites and users was
+  therefore planned on every call, at about three times its execution time (0.94 ms to plan and 0.29 ms to run,
+  and 43% of all the time Postgres spent on statements in a profile at 8,000 users). The ids queries plan in about
+  0.06 ms, and the array parameter doesn't inflate the estimate, so the second query's generic plan is cached
+  after the first few calls. Planning time in that profile fell from 43.5 s to 4.5 s, and the held load from 9,800
+  to 11,000 users on the test machine. The two statements are not one snapshot, so an article deleted between
+  them is missing from that page; the count was already a separate statement.
+- The DAOs are `@DAO(autoCommit = true)` (kiwiproc 1.1), so a single statement runs on a connection in autocommit
+  mode. Without it, kiwiproc wraps every call in `BEGIN`/`COMMIT`, which was about 435,000 extra statements in the
+  8,000-user profile; removing them took the held load from 9,800 to 11,000 users on the test machine. Each write
+  is still committed before the response is sent.
 - `POST /api/articles` runs its inserts in one transaction with kiwiproc's `TransactionalDAO.call`.
 - The pool is 10 connections per core, capped at 95, and was not very sensitive (see below).
 
@@ -127,6 +142,11 @@ Not comparable with the leaderboard: it has half the cores, and they are shared 
 | 12,000 | fail, p95 2,765 ms | fail, p95 3,285 ms, 1.17% errors |
 | 16,000 | fail, 13.3% errors | fail, 12.0% errors |
 | **Hold (5 min)** | **10,000 users: p95 118 ms, p99 416 ms, 0% errors, CPU 85%** | **9,800 users: p95 65 ms, p99 192 ms, 0% errors, CPU 74%** |
+
+With the two-statement lists and autocommit (kiwiproc 1.1), the same machine and procedure gave one search with 12,000
+passing (p95 3.5 ms), 14,000 passing, 15,000 failing (1.23% errors) and 16,000 failing. The 5-minute hold at **14,000
+users** passed: 3,637 requests/s, p95 328 ms, p99 745 ms, 0% errors, CPU 94%. That is close to the limit, so read it as
+13,000 to 14,000 users; the table above is the earlier build.
 
 For comparison, the Spring example held 10,000 users on the same machine, and this submission's earlier builds held
 9,200 to 10,000. Hold latency at 10,000 users varies by about 70 to 160 ms at p95 between runs: the machine is close to

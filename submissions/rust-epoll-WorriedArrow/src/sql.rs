@@ -58,11 +58,10 @@ pub fn read_statements() -> Vec<Stmt> {
         ),
         s(
             "cmts",
-            "SELECT r.k, a.id, c.id, c.body, c.created_at, c.updated_at, c.author_id, u.username, u.bio, u.image \
+            "SELECT r.k, a.id, c.id, c.body, c.created_at, c.updated_at, c.author_id \
              FROM unnest($1::text[]) WITH ORDINALITY r(slug, k) JOIN articles a ON a.slug = r.slug \
              LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id FROM comments c \
-               WHERE c.article_id = a.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true \
-             LEFT JOIN users u ON u.id = c.author_id",
+               WHERE c.article_id = a.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true",
             &[TEXT_ARRAY],
         ),
         // Lists: one statement per filter returns the capped counts (k <= 0: -k is the count key, the count in
@@ -164,6 +163,9 @@ pub fn read_statements() -> Vec<Stmt> {
             format!("SELECT 0::int8, {COLS} FROM articles a WHERE a.id = ANY($1::int8[])"),
             &[INT8_ARRAY],
         ),
+        // Comment authors' profile columns, for the sorted distinct ids of every comment in the batch: one ordered
+        // walk of the primary key instead of a probe per comment row.
+        s("auser", "SELECT u.id, u.username, u.bio, u.image FROM users u WHERE u.id = ANY($1::int8[])", &[INT8_ARRAY]),
         // One row per distinct article: its tag ids, its favorite count, its author's profile columns.
         s(
             "artx",

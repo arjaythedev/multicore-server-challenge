@@ -106,12 +106,86 @@ internal class ReadBatch(cap: Int) {
     @JvmField var reqs = arrayOfNulls<ReadReq>(cap)
     @JvmField var results = Array(cap) { Result() }
 
+    /** [Sharing.GROUPS] kinds: per request, the index of the first request of its group (itself for that one). */
+    @JvmField var rep = IntArray(cap)
+
     /** Room for [n] requests (broadcast kinds may take more than the usual cap). Under the pool lock. */
     fun ensure(n: Int) {
         if (n <= reqs.size) return
         val old = results
         reqs = reqs.copyOf(n)
         results = Array(n) { if (it < old.size) old[it] else Result() }
+        rep = rep.copyOf(n)
+    }
+}
+
+/**
+ * [key] as Postgres will see it: what ByteBuf.putUtf8 writes, so two requests have the same wire key exactly when their
+ * texts are equal. A key with a NUL matches nothing (Postgres text cannot hold it): the key "".
+ */
+internal fun wireKey(key: String): String {
+    var i = 0
+    var lone = false
+    while (i < key.length) {
+        val c = key[i]
+        if (c == '\u0000') return ""
+        if (c in '\uD800'..'\uDFFF') {
+            if (c <= '\uDBFF' && i + 1 < key.length && key[i + 1] in '\uDC00'..'\uDFFF') i++ else lone = true
+        }
+        i++
+    }
+    if (!lone) return key
+    val sb = StringBuilder(key.length)
+    i = 0
+    while (i < key.length) {
+        val c = key[i]
+        if (c in '\uD800'..'\uDBFF' && i + 1 < key.length && key[i + 1] in '\uDC00'..'\uDFFF') {
+            sb.append(c).append(key[i + 1])
+            i += 2
+            continue
+        }
+        sb.append(if (c in '\uD800'..'\uDFFF') '\uFFFD' else c) // a lone surrogate is written as U+FFFD
+        i++
+    }
+    return sb.toString()
+}
+
+/** Groups the requests of a [Sharing.GROUPS] batch by (key, limit, offset). Under the pool lock; keeps its tables between batches. */
+internal class Grouper {
+    private var table = IntArray(64) // request index + 1, open addressing
+    private var keys = arrayOfNulls<String>(16)
+
+    /** rep[j] = index of the first request of the batch whose wire key, limit and offset equal request j's. */
+    fun group(reqs: Array<ReadReq?>, n: Int, rep: IntArray) {
+        var size = 64
+        while (size < n * 2) size = size shl 1
+        if (table.size == size) table.fill(0) else table = IntArray(size)
+        if (keys.size < n) keys = arrayOfNulls(n)
+        val mask = size - 1
+        for (j in 0 until n) {
+            val q = reqs[j]!!
+            val k = wireKey(q.key)
+            keys[j] = k
+            var h = (k.hashCode() * 31 + q.limit) * 31 + q.offset.hashCode()
+            h = h xor (h ushr 15)
+            var slot = h and mask
+            while (true) {
+                val e = table[slot]
+                if (e == 0) {
+                    table[slot] = j + 1
+                    rep[j] = j
+                    break
+                }
+                val g = e - 1
+                val gq = reqs[g]!!
+                if (gq.limit == q.limit && gq.offset == q.offset && keys[g] == k) {
+                    rep[j] = g
+                    break
+                }
+                slot = (slot + 1) and mask
+            }
+        }
+        keys.fill(null, 0, n) // the strings stay reachable otherwise
     }
 }
 
@@ -129,6 +203,7 @@ internal class ReadWorker(pool: ReadPool, index: Int, cap: Int) : Worker(pool, i
         val n = batch.n
         val res = batch.results
         val broadcast = batch.q!!.kind.broadcast
+        val grouped = batch.q!!.kind.sharing == Sharing.GROUPS
         for (j in 0 until n) res[j].clear()
         var err: PgError? = null
         var status = 'I'.code
@@ -145,7 +220,11 @@ internal class ReadWorker(pool: ReadPool, index: Int, cap: Int) : Worker(pool, i
                 val p = c.mstart
                 if (c.mlen >= 10 && buf.intBE(p + 2) == 4) {
                     val i = buf.intBE(p + 6)
-                    if (i in 0 until n) res[i].addRow(buf, p)
+                    if (i in 0 until n) {
+                        res[i].addRow(buf, p)
+                    } else if (grouped && i < 0 && -1 - i < n && c.mlen >= 30) {
+                        res[-1 - i].addFlag(buf, p) // (-1 - request, flag int8, ...): this request's own flag
+                    }
                 }
             } else if (t == 'Z'.code) {
                 status = c.txStatus()
@@ -161,11 +240,22 @@ internal class ReadWorker(pool: ReadPool, index: Int, cap: Int) : Worker(pool, i
             val first = res[0]
             for (j in 1 until n) for (k in 0 until first.rowCount) res[j].addRow(buf, first.rowStarts[k])
         }
+        if (grouped && err == null) {
+            // the statement tagged each group's rows with its first request: every request of the group gets views of them
+            val rep = batch.rep
+            for (j in 0 until n) {
+                val g = rep[j]
+                if (g == j) continue
+                val first = res[g]
+                for (k in 0 until first.rowCount) res[j].addRow(buf, first.rowStarts[k])
+            }
+        }
         for (j in 0 until n) {
             val r = res[j]
             if (err != null) {
                 r.error = err
                 r.rowCount = 0
+                r.flagCount = 0
             } else {
                 r.buf = buf
                 r.affected = r.rowCount.toLong()
@@ -247,6 +337,7 @@ internal class ReadPool(
 
     private var seq = 0L
     private var queued = 0
+    private val grouper = Grouper()
 
     /** Reads queued right now (a racy read, for a load signal: [Db.readsQueued]). */
     val queuedNow: Int get() = queued
@@ -390,6 +481,7 @@ internal class ReadPool(
         }
         val n = batch.n
         val reqs = batch.reqs
+        if (batch.q!!.kind.sharing == Sharing.GROUPS) grouper.group(reqs, n, batch.rep)
         val lp = o.beginBind(batch.q!!.stmtName, 5)
         arrayHeader(o, Oid.INT4, n, n * 8)
         for (j in 0 until n) {
