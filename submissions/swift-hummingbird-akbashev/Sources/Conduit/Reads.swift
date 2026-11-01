@@ -102,12 +102,12 @@ enum PagesByFavoriteSQL: BatchSQL {
         """
 }
 
-/// Feeds, shared between the viewers of a batch: the viewers' follows (kind 0: viewer, followee), each distinct
-/// followee's article count capped at 1,000 (kind 1: followee, count), and each followee's newest articles, as many as
-/// the most any of its viewers' pages needs (kind 2: followee, article id). A popular author is looked at once for
-/// every viewer who follows them. The counts and pages are put together per viewer in BatchPlan.feedPages; they are
-/// exactly the reference SQL's, since articles have one author: the count of a viewer's followees' articles capped at
-/// 1,000 is the sum of the followees' counts capped at 1,000 each, then again at 1,000.
+/// Feeds, shared between the viewers of a batch: the viewers' follows (kind 0: viewer, followee), each viewer's count of
+/// its followees' articles capped at 1,000 (kind 1: viewer, count), and each followee's newest articles, as many as the
+/// most any of its viewers' pages needs (kind 2: followee, article id). A popular author's newest articles are read
+/// once for every viewer who follows them; the pages are put together per viewer in BatchPlan.feedPages, exactly the
+/// reference SQL's. The count stops at the 1,000th article over all of a viewer's followees: most viewers follow a
+/// prolific author, and a count capped at 1,000 per followee instead read about 2.5 times as many index entries.
 enum FeedSQL: BatchSQL {
     static let name = "b_feed"
     static let sql = """
@@ -117,8 +117,10 @@ enum FeedSQL: BatchSQL {
              d AS (SELECT followee, max(want) AS want FROM e GROUP BY followee)
         SELECT 0::int8, viewer, followee FROM e
         UNION ALL
-        SELECT 1::int8, d.followee, (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = d.followee LIMIT 1000) s)
-          FROM d
+        SELECT 1::int8, v.viewer, (SELECT count(*) FROM (SELECT 1 FROM articles a
+                                    WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = v.viewer)
+                                    LIMIT 1000) s)
+          FROM v
         UNION ALL
         SELECT 2::int8, d.followee, x.id FROM d
           CROSS JOIN LATERAL (SELECT a.id FROM articles a WHERE a.author_id = d.followee ORDER BY a.id DESC LIMIT d.want) x
@@ -164,15 +166,23 @@ enum UsersByIDSQL: BatchSQL {
 
 /// Every article any read of the batch shows, once: its columns, tag ids, favorite count and author. Bodies only for
 /// the articles a single-article read asked for. Tag names come from one read of the tags table per batch (TagsSQL).
+/// Each table is read once for the whole set (`= ANY` over the ids, one grouped favorites count, each author once)
+/// instead of an index descent per article per table: the articles a batch shows are mostly recent, so they sit next
+/// to each other in the indexes. On the full seed that touched a quarter fewer buffer pages for 194 articles, and a
+/// fifth as many for 4,888, with the same rows.
 enum ArticleDetailsSQL: BatchSQL {
     static let name = "b_article_details"
     static let sql = """
-        SELECT a.id, a.slug, a.title, a.description, CASE WHEN a.id = ANY($2::int8[]) THEN a.body END,
-               a.created_at, a.updated_at,
-               ARRAY(SELECT at.tag_id FROM article_tags at WHERE at.article_id = a.id),
-               (SELECT count(*) FROM favorites f WHERE f.article_id = a.id),
-               u.username, u.bio, u.image
-          FROM unnest($1::int8[]) r(id) JOIN articles a ON a.id = r.id JOIN users u ON u.id = a.author_id
+        WITH a AS MATERIALIZED (SELECT a.id, a.slug, a.title, a.description, CASE WHEN a.id = ANY($2::int8[]) THEN a.body END AS body,
+                                       a.created_at, a.updated_at, a.author_id
+                                  FROM articles a WHERE a.id = ANY($1::int8[])),
+             t AS (SELECT x.article_id, array_agg(x.tag_id) AS tags FROM article_tags x WHERE x.article_id = ANY($1::int8[])
+                    GROUP BY x.article_id),
+             f AS (SELECT x.article_id, count(*) AS n FROM favorites x WHERE x.article_id = ANY($1::int8[]) GROUP BY x.article_id),
+             u AS (SELECT u.id, u.username, u.bio, u.image FROM users u WHERE u.id = ANY(ARRAY(SELECT DISTINCT author_id FROM a)))
+        SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at, coalesce(t.tags, '{}'::int4[]),
+               coalesce(f.n, 0), u.username, u.bio, u.image
+          FROM a JOIN u ON u.id = a.author_id LEFT JOIN t ON t.article_id = a.id LEFT JOIN f ON f.article_id = a.id
         """
 }
 
@@ -737,7 +747,6 @@ private struct BatchPlan {
         binds.append(want)
 
         var followees = [[Int64]](repeating: [], count: viewers.count)
-        var counts: [Int64: Int64] = [:]
         var newest: [Int64: [Int64]] = [:]
         for try await row in try await rows(FeedSQL.self, binds, db) {
             var cells = RowCursor(row)
@@ -746,18 +755,13 @@ private struct BatchPlan {
             let b = try cells.int()
             switch kind {
             case 0: followees[slot[a]!].append(b)
-            case 1: counts[a] = b
+            case 1: family.totals[slot[a]! + 1] = b
             case 2: newest[a, default: []].append(b)
             default: throw RowError.typeMismatch("feed row kind", .int8)
             }
         }
         for followee in newest.keys { newest[followee]!.sort(by: >) }
 
-        for i in viewers.indices {
-            var total: Int64 = 0
-            for followee in followees[i] { total += counts[followee] ?? 0 }
-            family.totals[i + 1] = min(total, 1000)
-        }
         for (k, key) in family.pages.keys.enumerated() {
             let sources = followees[slot[key.filter]!]
             var heads = [Int](repeating: 0, count: sources.count)
