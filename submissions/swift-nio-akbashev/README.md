@@ -101,18 +101,20 @@ All dependencies are pinned exactly in `Package.swift` (plus `Package.resolved`)
   in turn on one connection, a typical batch of 600 reads took 18 ms, nearly all of it one Postgres backend working
   through the statements, while the other cores waited for the next wave of requests. (The tags table is read in the
   first round; if an article in the details names a tag created since, it is read again.) Feeds are shared between
-  the viewers of a batch: one statement reads their follows, each distinct followee's article count (capped at 1,000)
-  and each followee's newest articles, as many as the most any of its viewers' pages needs, and each viewer's count
-  and page are put together from those (the count is the followees' counts summed and capped at 1,000, the page a
-  merge of their newest-first lists): exactly the reference SQL's results, with a popular author looked at once per
-  batch instead of once per follower, and about a quarter less Postgres time per feed. A feed's articles are by
-  authors its viewer follows, so their `following` needs no lookup. Identical reads share a row, every article in the
-  batch is enriched once (columns, tag list, favorite count, author) however many reads show it, and the
-  viewer-dependent flags are one lookup per (viewer, article or author) pair. A batch goes as soon as a typical batch
-  is waiting (a moving average, at least `READ_BATCH_MIN`), or once the oldest read has waited `READ_WINDOW_MS`.
-  Only reads already queued when a batch is taken share it, and nothing outlives the batch (rule 5). On a local
-  database shaped like the seed this took Postgres CPU per request down by about 85%. `READ_BATCHING=0` runs every
-  read as its own statement instead (below).
+  the viewers of a batch: one statement reads their follows, each viewer's count of its followees' articles
+  (stopping at the 1,000th over all of them: most viewers follow a prolific author, and counting up to 1,000 per
+  followee instead read about 2.5 times as many index entries) and each followee's newest articles, as many as the
+  most any of its viewers' pages needs, and each viewer's page is a merge of those newest-first lists: exactly the
+  reference SQL's results, with a popular author's articles read once per batch instead of once per follower. A
+  feed's articles are by authors its viewer follows, so their `following` needs no lookup. Identical reads share a
+  row, every article in the batch is enriched once (columns, tag list, favorite count, author) however many reads
+  show it, each table read once for the whole set (`= ANY` over the ids, one grouped favorites count, each author
+  once; recent articles shown together share index pages), and the viewer-dependent flags are one lookup per
+  (viewer, article or author) pair. A batch goes as soon as a typical batch is waiting (a moving average, at least
+  `READ_BATCH_MIN`), or once the oldest read has waited `READ_WINDOW_MS`. Only reads already queued when a batch is
+  taken share it, and nothing outlives the batch (rule 5). On a local database shaped like the seed this took
+  Postgres CPU per request down by about 85%. `READ_BATCHING=0` runs every read as its own statement instead
+  (below).
 - **Postgres**: the hot reads are prepared statements (article pages, single articles, tags, the current user,
   profiles, comments). A list's page and its count are one statement (the count LEFT JOINed to the page), so a list
   request takes one pooled connection and one round trip (with `READ_BATCHING=0`). Our
@@ -140,7 +142,8 @@ All dependencies are pinned exactly in `Package.swift` (plus `Package.resolved`)
   `JSONSerialization`. Present-but-invalid is 401 even on auth-optional endpoints; absent means anonymous
   (`viewer = 0`).
 - **Bodies** are parsed with `JSONSerialization` into dictionaries, so key matching is case-sensitive, unknown
-  fields are ignored, and `null` vs absent is distinguished exactly as in the spec.
+  fields are ignored, and `null` vs absent is distinguished exactly as in the spec. A string holding NUL is a 422:
+  Postgres text can't hold it, and as a parameter it would fail the whole group or batch it went in.
 
 ## Build and run
 
@@ -156,4 +159,4 @@ Environment: `DATABASE_URL`, `JWT_SECRET` (required); `HOST` (127.0.0.1), `PORT`
 transaction per write; on), `WRITE_LANES` (4), `WRITE_GROUP_MAX` (256), `NIO_GLOBAL_EXECUTOR` (`1` to run Swift tasks on NIO's event loops; off), `SCHED_BATCH` (`0` to
 keep the default scheduling policy; on), `READ_BATCHING` (`0`: no batching; on), `READ_LANES` (cores),
 `READ_WINDOW_MS` (5), `READ_BATCH_MIN` (32), `READ_BATCH_MAX` (1024). Batches lease their statements' connections
-from the same `DB_POOL_SIZE` pool as everything else.
+from the same pool as everything else but the write lanes, which have `WRITE_LANES` of `DB_POOL_SIZE` to themselves.
