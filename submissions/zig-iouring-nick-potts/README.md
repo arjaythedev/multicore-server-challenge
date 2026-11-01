@@ -96,7 +96,8 @@ Three smaller changes trim what MEGA asks of Postgres, each about 1% fewer Postg
 ```
  SCHED_OTHER  Postgres
               watchdog: takes over any hash batch held up too long, resumes from its last saved round
- SCHED_BATCH  event loops, drain process: the same CPU share, but waking up doesn't preempt a running task
+ SCHED_BATCH  drain process: the same CPU share, but waking up doesn't preempt a running task
+              event loops: the same, at nice 5
  SCHED_IDLE   bcrypt hashers: only CPU nothing else wants
 ```
 
@@ -105,6 +106,11 @@ preempts whatever runs on its CPU, such as a Postgres backend in the middle of a
 keeps its CPU share but waits until the running task blocks or uses up its slice. At 200k users on our test rig,
 p95 fell by 93-172 ms and feed p95 fell from 1.2-1.6 s to 0.7-0.8 s. Of everything here that we measured in holds,
 this moved p95 the most.
+
+The event loops also run at nice 5, so when the CPUs are full they yield a little time to the drain process and
+Postgres. The drain process waited half as long for a CPU and Postgres 18% less, so every read lane emptied faster.
+In paired 200k holds on an aged database p95 fell by 30 and 41 ms; login, which waits on the loops, rose 84 ms at
+p95.
 
 Hashing never takes CPU from anything else. The kernel is our own assembly, hashing five passwords at once with
 their rounds interleaved. It takes each round's index bytes apart with SHRX and RORX, one micro-op fewer per round

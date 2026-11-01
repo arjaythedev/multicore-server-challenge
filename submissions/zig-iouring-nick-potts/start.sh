@@ -2,12 +2,12 @@
 # Runs the server in the foreground. Config: DATABASE_URL, JWT_SECRET, HOST, PORT.
 set -euo pipefail
 # Defaults for this build's optional levers (each also documented where main.zig reads it): the bcrypt kernel pinned
-# to asm_shrx at 5 lanes, MEGA with tags as text and one name lookup per list and its id set in id order, comments
-# reading only the followees among each thread's authors, the per-lane counters in the log, a third feed drain once
-# a queued feed has waited 120 ms, and the io_uring plumbing set (buffer returns in runs, sockets as fixed files,
-# poll-first Postgres receives, no quick-ACK reset for replies within 15 ms). An environment value set before
-# start.sh wins.
-export ZIG_BCRYPT_KERNEL=${ZIG_BCRYPT_KERNEL-asm_shrx:5}
+# to asm_shrx at 5 lanes, the event loops at nice 5, MEGA with tags as text and one name lookup per list and its id
+# set in id order, comments reading only the followees among each thread's authors, the per-lane counters in the
+# log, a third feed drain once a queued feed has waited 120 ms, and the io_uring plumbing set (buffer returns in
+# runs, sockets as fixed files, poll-first Postgres receives, no quick-ACK reset for replies within 15 ms). An
+# environment value set before start.sh wins.
+export ZIG_BCRYPT_KERNEL=${ZIG_BCRYPT_KERNEL-asm_shrx:5} ZIG_LOOP_NICE=${ZIG_LOOP_NICE-5}
 export ZIG_MEGA_TAG_TEXT=${ZIG_MEGA_TAG_TEXT-1} ZIG_MEGA_NAME_IDS=${ZIG_MEGA_NAME_IDS-1} ZIG_MEGA_SORTED_IDS=${ZIG_MEGA_SORTED_IDS-1}
 export ZIG_COMMENTS_FW=${ZIG_COMMENTS_FW-1} ZIG_COMMENT_AUTHORS_ONCE=${ZIG_COMMENT_AUTHORS_ONCE-1} ZIG_LANE_STATS=${ZIG_LANE_STATS-1}
 export ZIG_FEED3_QWAIT=${ZIG_FEED3_QWAIT-120}
