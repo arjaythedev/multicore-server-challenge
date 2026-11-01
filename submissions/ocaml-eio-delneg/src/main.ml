@@ -91,17 +91,17 @@ module Bc = struct
   external hash_n : string array -> string array -> string array = "mc_bc_hash_n"
   external gensalt : unit -> string = "mc_bc_gensalt"
   external cost : string -> int = "mc_bc_cost"
-  type job = { pw : string; setting : string; u : (string, exn) result P.u }
+  type job = { pw : string; setting : string; t0 : float; u : (string, exn) result P.u }
   let lanes = 5
   let m = Mutex.create () and c = Condition.create () and q : job Queue.t = Queue.create ()
-  let wait_s = float_of_string (getenv "BCRYPT_WAIT_MS" "30") /. 1000.
+  let wait_s = float_of_string (getenv "BCRYPT_WAIT_MS" "100") /. 1000.
+  (* a hasher starts when 5 hashes are queued, or when the oldest has waited wait_s *)
   let rec worker () =
     Mutex.lock m;
     while Queue.is_empty q do Condition.wait c m done;
-    let few = Queue.length q < lanes in
-    Mutex.unlock m;
-    if few && wait_s > 0. then Thread.delay wait_s;
-    Mutex.lock m;
+    while Queue.length q > 0 && Queue.length q < lanes && Unix.gettimeofday () < (Queue.peek q).t0 +. wait_s do
+      Mutex.unlock m; Thread.delay 0.002; Mutex.lock m
+    done;
     let n = min lanes (Queue.length q) in
     let jobs = Array.init n (fun _ -> Queue.pop q) in
     Mutex.unlock m;
@@ -118,7 +118,7 @@ module Bc = struct
     end
   let run pw setting =
     let p, u = P.create () in
-    Mutex.lock m; Queue.push { pw; setting; u } q; Condition.signal c; Mutex.unlock m;
+    Mutex.lock m; Queue.push { pw; setting; t0 = Unix.gettimeofday (); u } q; Condition.signal c; Mutex.unlock m;
     match P.await p with Ok h -> h | Error e -> raise e
 end
 
@@ -1053,7 +1053,9 @@ module Plan = struct
     match w with Some w -> P.resolve w () | None -> ()
 
   (* one loop per in-flight batch: wait for work, let the other ready fibers queue theirs, take everything *)
-  let loop t pick =
+  let wait_s = float_of_string (getenv "PLANNER_WAIT_US" "2000") /. 1e6
+
+  let loop t pick sleep =
     let rec go () =
       Mutex.lock t.m;
       if Queue.is_empty t.q then begin
@@ -1062,7 +1064,8 @@ module Plan = struct
         Mutex.unlock t.m;
         P.await p
       end else Mutex.unlock t.m;
-      Eio.Fiber.yield ();
+      (* collect: bigger batches cost Postgres less per request *)
+      if wait_s > 0. then sleep wait_s else Eio.Fiber.yield ();
       Mutex.lock t.m;
       let n = min max_batch (Queue.length t.q) in
       let jobs = Array.init n (fun _ -> Queue.pop t.q) in
@@ -1273,9 +1276,11 @@ let handle ctx req =
 
 (* ---------- connection loop ---------- *)
 
+(* h starts with the lowercase p, ignoring ASCII case; no allocation *)
 let lower_prefix h p =
   let n = String.length p in
-  String.length h > n && String.lowercase_ascii (String.sub h 0 n) = p
+  String.length h > n
+  && (let rec go i = i = n || (Char.lowercase_ascii (String.unsafe_get h i) = String.unsafe_get p i && go (i + 1)) in go 0)
 
 let header_value h n =
   let v = String.sub h n (String.length h - n) in String.trim v
@@ -1416,6 +1421,8 @@ let () =
   Bc.start ();
   Eio_main.run @@ fun env ->
   let net = Eio.Stdenv.net env and dm = Eio.Stdenv.domain_mgr env in
+  let clock = Eio.Stdenv.mono_clock env in
+  let sleep d = Eio.Time.Mono.sleep clock d in
   let addr = `Tcp (Eio_unix.Net.Ipaddr.of_unix (Unix.inet_addr_of_string host), port) in
   let picker conns =
     let rr = ref 0 in
@@ -1438,12 +1445,12 @@ let () =
         if k = 0 then begin
           let pconns = Array.init planner_conns (fun _ -> Pg.connect ~sw net url) in
           let ppick = picker pconns in
-          for _ = 1 to planner_loops do Eio.Fiber.fork_daemon ~sw (fun () -> Plan.loop shared ppick) done
+          for _ = 1 to planner_loops do Eio.Fiber.fork_daemon ~sw (fun () -> Plan.loop shared ppick sleep) done
         end;
         shared
       end else begin
         let plan = Plan.create () in
-        for _ = 1 to planner_loops do Eio.Fiber.fork_daemon ~sw (fun () -> Plan.loop plan pick) done;
+        for _ = 1 to planner_loops do Eio.Fiber.fork_daemon ~sw (fun () -> Plan.loop plan pick sleep) done;
         plan
       end in
     let ctx = { pick; plan; rbuf = Bytes.create 65536; bodyb = Buffer.create 65536; wbuf = Bytes.create 65536 } in

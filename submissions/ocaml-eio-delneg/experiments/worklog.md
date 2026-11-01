@@ -70,3 +70,25 @@ perf on E4: libcrypt = 42% of the app's CPU. The interleaved core from c-iouring
 in our F# #87) at -O3 -funroll-loops: 11.3 ms/hash with 5 lanes vs libxcrypt 36.2 ms (wsl26, one core); 6-8
 lanes no better. 2 hasher threads take up to 5 queued hashes, waiting 30 ms for company when fewer.
 120k eq DOMAINS=4 x2: app 110.5/110.4 → 93.4/92.5 µs/req, total 208/211 → 197/198. Login p50 44 → 75 ms.
+
+### Calibration against #1 (rust-epoll-theCatWisel, 190k on the grader)
+Built from upstream and run through the same `lgr.sh` at 120k real users: 31.6k req/s, p95 45 ms, p99 60 ms,
+**app 27 µs/req, pg 92 µs/req**. Ours (E5): 31.2k req/s, p95 198, p99 251, app 102, pg 96. Postgres side is on par;
+the gap is app CPU. (Its process ignored SIGTERM and stayed on :3110 with SO_REUSEPORT, sharing traffic with the
+next runs; those runs were thrown away and redone after the harness learned to kill every listener on the port.)
+
+### Profile of E5's app CPU (perf, symbols mapped with nm)
+bcrypt 28% (eks1 11%, eks2 9%: lanes not filled), GC ~17% (do_some_marking, try_update_object_header,
+oldify_one, darken, pool_sweep), kernel 17%, JSON escaping ~4%, libc 4%, polymorphic hash/compare ~1%.
+
+### E6 fill the bcrypt lanes (kept)
+A hasher starts when 5 hashes are queued or the oldest has waited BCRYPT_WAIT_MS (100). Clean A/B x2 at 120k eq:
+app 96.9/95.7 → 88.2/87.1 µs/req. Login p50 75 → 114 ms (0.1% of requests).
+
+### E7 minor heap size (knob only, contaminated run, redone in E9 series)
+Bigger minor heap lowers app CPU but Postgres rose by the same amount: faster turnaround = smaller batches.
+
+### E8 planner collection window (kept)
+PLANNER_WAIT_US: a planner loop sleeps this long after it wakes, then takes everything queued.
+Clean x2 at 120k eq: w0 183.6/185.9 µs/req total; w3000 175.0/176.0; **w8000 162.7/168.1** (pg 96→80/85). p95 at this
+load 17 → 48 ms, far under 500.
