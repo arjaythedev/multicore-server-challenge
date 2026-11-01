@@ -120,6 +120,10 @@ let main args =
         | _ when host = "localhost" -> o.ListenLocalhost port
         | _ -> o.ListenAnyIP port)
     |> ignore
+    // Kestrel's listen backlog is 512 unless set. Users arrive thousands a second, so a GC pause
+    // of a few hundred ms fills 512, and the kernel drops the rest: each dropped connection costs
+    // its user a 1-3 s TCP retry. The box allows 65535 (somaxconn); the kernel caps it to that.
+    builder.WebHost.UseSockets(fun o -> o.Backlog <- 65535) |> ignore
     builder.Services.AddRouting().AddGiraffe() |> ignore
 
     let app = builder.Build()

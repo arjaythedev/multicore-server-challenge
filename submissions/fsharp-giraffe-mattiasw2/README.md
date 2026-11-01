@@ -61,7 +61,10 @@ and never inside SQL, a transaction or a commit group.
 ## Multicore model
 
 - **One process, one Kestrel.** Kestrel serves every core with async I/O and holds each user's keep-alive
-  connection directly (`Front: direct`). The keep-alive timeout is 120 s.
+  connection directly (`Front: direct`). The keep-alive timeout is 120 s. The listen backlog is 65535 instead of
+  Kestrel's 512: users arrive thousands a second, and during a GC pause 512 fills and the kernel drops the rest,
+  each a 1-3 s TCP retry for its user. At 115,000 users on 6 vCPUs that was 216 dropped connections and p99 405 ms;
+  with the larger backlog none, and p99 354 ms.
 - **Read batching for the hot reads** (`src/Engine/Reads.fs`): tags, the four article lists, the feed, article by
   slug, comments and profiles. Each such request is a value (`Read`) on one channel. `READ_LANES` reader lanes
   (default one per core), each with a connection of its own, answer the queue in batches:
@@ -221,6 +224,7 @@ are full (7.7 busy), and the load generator, on the same laptop, reaches 98% in 
 | 100,000 | 25,900 | 186-197 ms | 309-339 ms | 2.6 | 2.6-2.8 | pass (4 runs) |
 | 105,000, 5-minute hold | 27,200 | 194 ms | 283 ms | 2.65 | 2.5 | pass, 8.16 M requests |
 | 110,000 | 28,200 | 291-449 ms | 409-591 ms | 2.8-3.0 | 2.7-3.0 | pass (3 runs) |
+| 115,000 | 29,600 | 262 ms | 354 ms | 2.9 | 2.7 | pass (listen backlog 65535) |
 | 120,000 | 28,800 | 737 ms | 869 ms | 2.85 | 3.0 | fail: the 6 threads are full |
 
 In the 5-minute hold the server's memory stayed at 2.5-2.9 GB, and the database grew by 36,000 articles (7%); the
