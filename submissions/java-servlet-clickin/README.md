@@ -112,7 +112,7 @@ Measured locally on the full seed (Postgres, server and load generator in one 8-
 Every login and sign-up verifies or hashes with cost 10 (rule 7). That is about 28 hashes/s at 100k users and, at
 ~65 ms per hash on EPYC, ~1.7 cores: a fifth of the box. Blowfish is one long dependency chain, so a single hash
 leaves most of the core idle: `BCrypt` runs up to 6 independent hashes interleaved in one straight-line kernel per
-width, each lane in its own locals (`BCryptLanes`, written by `dev/gen-bcrypt-lanes.py`). Per hash on Hetzner's EPYC
+width, each lane in its own locals (`BCryptLanes`, generated). Per hash on Hetzner's EPYC
 Milan: 1 lane 60 ms, 2 lanes 33, 3 lanes 25.8, 4 lanes 23.4, 5 lanes 23.0, 6 lanes 24.5 (the earlier hand-written
 2/4-lane loop: 38 / 29). The best width depends on the core's registers and load ports, so the pool times every width
 at startup (~2-5 s of one core, logged as `bcrypt: N lanes`) and takes the fastest, preferring fewer lanes within 3%. Hashes run on their own `BCRYPT_THREADS` (4) threads at `nice` 5 (`setpriority`
@@ -125,7 +125,7 @@ threads 1.39 -> 0.63 cores at 18k req/s). Logins wait longer for their set (p50 
 
 ### Query work (this branch vs. the previous build, `a3d49a1`)
 
-Hetzner ccx33 target, two cpx42 load boxes (`dev/hcloud/fixed.sh`): fresh switch, a 60 s warm-up, then a fixed user
+Hetzner ccx33 target, two cpx42 load boxes: fresh switch, a 60 s warm-up, then a fixed user
 count, measured 120 s (80k) or 60 s (120k), two runs per build, alternated. CPU is the share of the whole box (app / Postgres, from systemd cgroups).
 
 | Users | Build | req/s | p50 | p95 | p99 | Box CPU (app / Postgres) |
@@ -210,7 +210,7 @@ so compare with the leaderboard loosely.
 ## Correctness checks beyond the suite
 
 - `test/run.sh`: 197/197.
-- `dev/diffcheck.py`: 3,000 concurrent reads against a batching server and one with `COALESCE=0` on the same
+- A differential check: 3,000 concurrent reads against a batching server and one with `COALESCE=0` on the same
   database: byte-identical responses.
 - `test/sql/batch_equiv.sql` and `test/sql/feed_check.sql`: the batched statements return exactly the rows of the
   per-request ones, and the feed shortcut the counts of the reference SQL (2,000 viewers).
@@ -226,9 +226,6 @@ so compare with the leaderboard loosely.
 `COALESCE` (1), `MAX_INFLIGHT_PER_LOOP` (2048), `BCRYPT_THREADS` (4), `BCRYPT_LANES` (0 = timed at startup, 1-6), `BCRYPT_GATHER_MS` (400),
 `BCRYPT_NICE` (5), `JAVA_OPTS`.
 
-`dev/` holds the local Linux box (`Dockerfile`, `conformance.sh`, `load.sh`, `alloc.sh`) and the Hetzner scripts
-(`dev/hcloud/`). They aren't used by the benchmark.
-
 ## Credits
 
 The FFM epoll/socket bindings and the Postgres wire-protocol basics started from
@@ -243,4 +240,4 @@ connection from [scala-netty-didierliauw](../scala-netty-didierliauw)
 MIT, under the repo's [license](../../LICENSE).
 
 Built with Claude Code (Anthropic). Changes were checked against the unit tests (`test/run-unit.sh`), the
-conformance suite (`dev/conformance.sh`) and alternating local load runs against the previous build (`dev/load.sh`).
+conformance suite and alternating local load runs against the previous build.
