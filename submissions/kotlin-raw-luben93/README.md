@@ -28,9 +28,13 @@ DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=... HO
 - Threads and connections: `HTTP_THREADS`, `DB_READ_CONNS`, `DB_WRITE_CONNS`, `BCRYPT_THREADS`, `BCRYPT_THREADS_MAX`,
   `BCRYPT_EXTRA_AGE_MS`. `JAVA_HEAP` sets the heap in `start.sh` (default `3g`). `HTTP_IO=nio`: java.nio loops.
 - Postgres session: `DB_OPTIONS` (default: generic plans, no JIT, no parallel workers).
+  `WRITE_IMPLICIT_TX` (default on): a write group is one implicit transaction ended by its Sync, without BEGIN/COMMIT.
 - Batched reads: `READ_SHARE` (default on: the requests of a batch share counts, pages and article columns),
   `READ_SHARED_ROWS` and `READ_FEED_SHARE` (default on: each distinct thread, page or article is returned once per
   batch), `READ_VIEWER_FLAGS`, `READ_MAX_BATCH`, `READ_FEED_MAX_BATCH`, `READ_FEED_HEAVY`, `READ_FEED_FLOOR`.
+  `READ_FEED_ROWS` (default on): the feed returns each distinct article's columns once per batch and the app fans
+  them out to its pages. `READ_GLOBAL_WIN` (default on): overlapping global-list pages of a batch are read by one
+  window scan.
 - Gather window: `READ_GATHER_MS` (floor, 30 ms). `READ_GATHER_AUTO` (default on) widens it by `READ_GATHER_STEP_MS`
   (10) a second up to `READ_GATHER_MAX_MS` (100) while the CPUs the process may use are at least `READ_GATHER_HIGH_PCT`
   (75) busy, and back at `READ_GATHER_LOW_PCT` (60): bigger batches cost Postgres less per request, and the extra wait

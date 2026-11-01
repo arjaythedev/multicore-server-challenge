@@ -55,7 +55,16 @@ class ReadKind(
  * every request of a group views of its first request's rows and the request's own flags ([conduit.pg.Result.hasFlag]).
  * Postgres serializes and the pool parses each distinct page or thread once instead of once per request.
  */
-enum class Sharing { NONE, GROUPS }
+enum class Sharing {
+    NONE, GROUPS,
+
+    /**
+     * Feed reads: page rows `(i, n, article id, NULL...)` per request, each distinct article of the batch once as
+     * `(Int.MIN_VALUE, id, author id, columns...)` and flag rows `(-1 - i, article id, ...)`; the pool collects the article
+     * rows in an [conduit.pg.ArticleRows] table every request's [conduit.pg.Result] can look an id up in.
+     */
+    ARTICLES,
+}
 
 /** A single-statement write (or a write-adjacent read that must run on a write connection). */
 class WriteStmt(
