@@ -78,7 +78,9 @@ Three smaller changes trim what MEGA asks of Postgres, each about 1% fewer Postg
 
 Comments have their own batched statement. It now looks up only the follows among that thread's comment authors,
 not the viewer's whole followee list. On a `follows` table aged by a run's follows and unfollows, a 950-request
-comments batch costs Postgres 23% fewer instructions.
+comments batch costs Postgres 23% fewer instructions. It also reads each comment author's profile once per batch
+and attaches it to every comment by that author. Threads fill up as a run goes on, so authors repeat more late in a
+run; on a database aged by a full search, 200k-user holds ran 47 ms lower at p95 with it.
 
 ## 3. Repeated reads in one execution share one response
 
