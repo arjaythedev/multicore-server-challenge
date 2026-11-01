@@ -47,10 +47,16 @@ typealias BcryptDigest = InlineArray<23, UInt8>
 /// Runs `lanes` hashes of the same cost in lockstep and returns their digests (the 23 bytes a hash string encodes).
 func bcryptDigests<let lanes: Int>(_ keys: borrowing InlineArray<lanes, BcryptKey>, cost: Int) -> InlineArray<lanes, BcryptDigest> {
     var states = InlineArray<lanes, BlowfishState>(repeating: .initial)
-    expand(&states, keys, .initial)
-    for _ in 0..<(1 << cost) {
-        expand(&states, keys, .key)
-        expand(&states, keys, .salt)
+    expandWithSalt(&states, keys)
+    // The cost loop, 2^cost times ExpandKey(state, 0, key) then ExpandKey(state, 0, salt): the key or the salt mixed
+    // into P, then the key-only expansion written out for this many lanes (BcryptKernels.swift). One loop, so that
+    // kernel is inlined once.
+    for half in 0..<(2 << cost) {
+        let salt = half & 1 == 1
+        for k in 0..<lanes {
+            for i in 0..<18 { states[k].p[i] ^= salt ? keys[k].saltAsKey[i] : keys[k].key[i] }
+        }
+        expandKeyOnly(&states)
     }
     // Encrypt "OrpheanBeholderScryDoubt" (6 words, 3 blocks) 64 times.
     let magic: InlineArray<6, UInt32> = [0x4f72_7068, 0x6561_6e42, 0x6568_6f6c, 0x6465_7253, 0x6372_7944, 0x6f75_6274]
@@ -79,34 +85,21 @@ func bcryptDigests<let lanes: Int>(_ keys: borrowing InlineArray<lanes, BcryptKe
     return digests
 }
 
-private enum Expansion {
-    /// ExpandKey(state, salt, key): P mixed with the key, and every block mixed with the salt.
-    case initial
-    /// ExpandKey(state, 0, key)
-    case key
-    /// ExpandKey(state, 0, salt)
-    case salt
-}
-
-@inline(__always)
-private func expand<let lanes: Int>(_ states: inout InlineArray<lanes, BlowfishState>,
-                                    _ keys: borrowing InlineArray<lanes, BcryptKey>, _ mode: Expansion) {
+/// ExpandKey(state, salt, key), once per hash: P mixed with the key, and every block mixed with the salt.
+private func expandWithSalt<let lanes: Int>(_ states: inout InlineArray<lanes, BlowfishState>,
+                                            _ keys: borrowing InlineArray<lanes, BcryptKey>) {
     for k in 0..<lanes {
-        for i in 0..<18 {
-            states[k].p[i] ^= mode == .salt ? keys[k].saltAsKey[i] : keys[k].key[i]
-        }
+        for i in 0..<18 { states[k].p[i] ^= keys[k].key[i] }
     }
     var l = InlineArray<lanes, UInt32>(repeating: 0)
     var r = InlineArray<lanes, UInt32>(repeating: 0)
     var saltWord = 0
     for i in 0..<9 {
-        if mode == .initial {
-            for k in 0..<lanes {
-                l[k] ^= keys[k].salt[saltWord]
-                r[k] ^= keys[k].salt[saltWord + 1]
-            }
-            saltWord ^= 2
+        for k in 0..<lanes {
+            l[k] ^= keys[k].salt[saltWord]
+            r[k] ^= keys[k].salt[saltWord + 1]
         }
+        saltWord ^= 2
         encrypt(states, &l, &r)
         for k in 0..<lanes {
             states[k].p[2 * i] = l[k]
@@ -114,13 +107,11 @@ private func expand<let lanes: Int>(_ states: inout InlineArray<lanes, BlowfishS
         }
     }
     for j in 0..<512 {
-        if mode == .initial {
-            for k in 0..<lanes {
-                l[k] ^= keys[k].salt[saltWord]
-                r[k] ^= keys[k].salt[saltWord + 1]
-            }
-            saltWord ^= 2
+        for k in 0..<lanes {
+            l[k] ^= keys[k].salt[saltWord]
+            r[k] ^= keys[k].salt[saltWord + 1]
         }
+        saltWord ^= 2
         encrypt(states, &l, &r)
         for k in 0..<lanes {
             states[k].s[2 * j] = l[k]
