@@ -33,11 +33,12 @@ final class JobQueue {
         long now = System.nanoTime();
         lock.lock();
         try {
+            int before = q.size();
             for (Job j : js) {
                 j.t0 = now;
                 q.addLast(j);
             }
-            ready.signal();
+            if (before == 0 || q.size() >= want) ready.signal();
         } finally {
             lock.unlock();
         }
