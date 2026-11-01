@@ -213,3 +213,27 @@ Promoted share of minor words: 1.5-3% during the ramp, then 10% at t=60, 17% at 
 GCs 3 → 17 per 10 s; heap ~520 MB. At saturation in-flight requests outlive the ~0.2 s between minor GCs, get
 promoted, and the major GC marks a heap made mostly of 180k connections' state. E16 tried o=400 only at scaled
 load (2.5% promoted), where it could not show: retried at real scale as E22.
+
+### E22 space_overhead at real scale (e21, 190k, 180 s measure, fresh DB)
+Round 1: s=4M 46.2k req/s p95 541 / p99 1536 FAIL (app 84.5); s=4M,o=200 46.7k p95 464 / p99 942 PASS (82.8);
+**s=4M,o=400 46.9k p95 446 / p99 773 PASS** (81.3, RSS 1.7 GB). Promoted 33% at this load in all three;
+major GCs per 10 s 13.3 / 10.4 / 7.2, heap 665 / 746 / 845 MB.
+Round 2 (order o400, s4M, o800, o200): o400 46.9k p95 450 / p99 1209; s4M 46.4k 491 / 866; o800 46.9k 443 / 803
+(app 80.4, RSS 1.9 GB); o200 46.6k 478 / 748. App µs/req falls with o every time (84.1-84.5 → 82.8 → 80.9-81.3
+→ 80.4). p99 over the window is set by the ramp-end stall (p99 2-9 s for the first ~15 s, then ~300-600 ms in
+every config), so pass/fail at 190k is noisy here. **Kept o=400** in start.sh (`s=4M,o=400`).
+
+### The ramp-end stall (o400 run, per-second loadgen timeline)
+t=44-50: ~40k completions/s, p50 24-80 ms. t=52-60, while users go 168k → 190k: completions fall to 15-20k/s,
+p50 0.8-2.1 s, p99 3-7 s, loadgen CPU fine. t=64-70: catch-up, then p50 ~150-250 ms. GC in the same 10 s
+windows: promoted per window 27M → 82M → 108M → 276M → 279M words, heap 216 → 870 MB.
+Memprof at 190k (rate 1e-5): major-heap words led by the Postgres message buffer growing again after each flush
+(W.ensure, 20%: buffers > 1 MB were cut back to 64 KB), the writer Cstruct growing (15%), and phase-B hashtables
+`fav_ask`/`fol_ask` resizing from 64 buckets with tuple keys (~17%). Postgres row strings: 12%, 65% of them promoted.
+
+### E23 batch hashtables sized from the batch, (viewer, id) packed in one int; message buffers kept up to 8 MB
+197/197.
+Series 24, 190k real, 180 s, both o=400, x2 interleaved: e21 47.1k/47.0k p95 433/430 p99 744/668 (app 80.6/81.2)
+PASS both; e23 47.1k/47.1k p95 412/444 p99 1321/793 (app 80.4/80.2). No gain: **dropped** (diff kept outside
+the repo). e21 with o=400 has now passed 3 of 4 runs at 190k locally (the failure: p99 1209 from the ramp-end
+stall). Pushed as the new head.

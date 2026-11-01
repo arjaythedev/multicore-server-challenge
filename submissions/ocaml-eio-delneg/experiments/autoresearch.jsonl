@@ -18,3 +18,5 @@
 {"run":"e19-bind-params","eq_users":120000,"app_us":70.3,"status":"keep","note":"base 71.45, major words -8%"}
 {"run":"e20-swar-escape","eq_users":120000,"app_us":67.8,"status":"keep","note":"base 70.5"}
 {"run":"e21-http-inplace","eq_users":120000,"app_us":68.55,"status":"keep","note":"base 69.05, minor words -5%"}
+{"run":"e22-o400","real_users":190000,"p95":[446,450,433,430],"p99":[773,1209,744,668],"status":"keep","note":"3 of 4 pass; s4M 541/1536, 491/866"}
+{"run":"e23-hashtbl-sizing","real_users":190000,"p95":[412,444],"p99":[1321,793],"status":"drop","note":"no gain vs e21 o400"}
