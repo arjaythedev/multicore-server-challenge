@@ -107,6 +107,8 @@ statement per kind, see above):
 - **Lists:** the count, the page's ids and their cards are one statement. The page is chosen by id first and the card
   columns are built only for its rows, so a huge `offset` skips index entries instead of computing tag arrays and
   counts for every skipped article. An empty page still returns the count.
+- **Tag names:** each is one `tags` primary-key probe, sorted in SQL. Written as a join, the planner may hash the
+  whole tags table once per article shown.
 - **Global count:** walks the primary key from the oldest end (`ORDER BY id LIMIT 1000`). Those pages are
   all-visible, so it is an index-only scan.
 - **Comments:** the article lookup and the newest 100 comments are one statement. No row means 404.

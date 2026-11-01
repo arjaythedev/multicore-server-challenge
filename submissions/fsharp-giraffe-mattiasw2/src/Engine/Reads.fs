@@ -141,12 +141,14 @@ let private usersSql =
       CROSS JOIN LATERAL (SELECT u.id, u.username, u.bio, u.image FROM users u WHERE u.username = r.username LIMIT 1) x"
 
 /// Phase B: each distinct article's card; the body only where an article page shows it.
+/// Each tag name is one tags_pkey probe: as a JOIN the planner hash-joins the whole tags table
+/// once per card, which was over half of this statement's time.
 let private cardsSql =
     "SELECT x.* FROM unnest(@ids::int8[], @bodies::bool[]) AS r(id, body)
       CROSS JOIN LATERAL (
             SELECT a.id, CASE WHEN r.body THEN a.body END AS body, a.slug, a.title, a.description, a.created_at, a.updated_at,
-                   ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id
-                          WHERE at.article_id = a.id ORDER BY t.name) AS tag_list,
+                   ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at
+                          WHERE at.article_id = a.id ORDER BY 1) AS tag_list,
                    (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
                    a.author_id, u.username, u.bio, u.image
               FROM articles a JOIN users u ON u.id = a.author_id
