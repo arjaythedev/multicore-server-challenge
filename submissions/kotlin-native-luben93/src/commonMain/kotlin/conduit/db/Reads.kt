@@ -6,6 +6,7 @@ import conduit.pg.Oid
 import conduit.pg.PgConn
 import conduit.pg.PgError
 import conduit.pg.PgStatement
+import conduit.pg.ArticleRows
 import conduit.pg.Result
 import conduit.pg.beginBind
 import conduit.pg.endBindExecute
@@ -110,6 +111,9 @@ internal class ReadBatch(cap: Int) {
     /** [Sharing.GROUPS] kinds: per request, the index of the first request of its group (itself for that one). */
     @JvmField var rep = IntArray(cap)
 
+    /** [Sharing.ARTICLES] kinds: the batch's distinct article rows. */
+    @JvmField val arts = ArticleRows()
+
     /** Room for [n] requests (broadcast kinds may take more than the usual cap). Under the pool lock. */
     fun ensure(n: Int) {
         if (n <= reqs.size) return
@@ -205,6 +209,9 @@ internal class ReadWorker(pool: ReadPool, index: Int, cap: Int) : Worker(pool, i
         val res = batch.results
         val broadcast = batch.q!!.kind.broadcast
         val grouped = batch.q!!.kind.sharing == Sharing.GROUPS
+        val articled = batch.q!!.kind.sharing == Sharing.ARTICLES
+        val arts = batch.arts
+        if (articled) arts.clear()
         for (j in 0 until n) res[j].clear()
         var err: PgError? = null
         var status = 'I'.code
@@ -225,6 +232,9 @@ internal class ReadWorker(pool: ReadPool, index: Int, cap: Int) : Worker(pool, i
                         res[i].addRow(buf, p)
                     } else if (grouped && i < 0 && -1 - i < n && c.mlen >= 30) {
                         res[-1 - i].addFlag(buf, p) // (-1 - request, flag int8, ...): this request's own flag
+                    } else if (articled) {
+                        if (i == Int.MIN_VALUE) arts.add(p) // a distinct article of the batch
+                        else if (i < 0 && -1 - i < n && c.mlen >= 30) res[-1 - i].addFlag(buf, p) // (-1 - request, article id, ...)
                     }
                 }
             } else if (t == 'Z'.code) {
@@ -251,8 +261,10 @@ internal class ReadWorker(pool: ReadPool, index: Int, cap: Int) : Worker(pool, i
                 for (k in 0 until first.rowCount) res[j].addRow(buf, first.rowStarts[k])
             }
         }
+        if (articled && err == null) arts.build(buf)
         for (j in 0 until n) {
             val r = res[j]
+            if (articled && err == null) r.articles = arts
             if (err != null) {
                 r.error = err
                 r.rowCount = 0

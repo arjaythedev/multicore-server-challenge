@@ -43,3 +43,4 @@ Build-time (read by `build.gradle.kts` from the environment, defaults are what t
 `CONDUIT_GC` (`pmcs` | `cms` | `stwms`), `CONDUIT_ALLOCATOR` (`custom` | `std`), `CONDUIT_INLINE` (default 40),
 `CONDUIT_LLVM_INLINE`, `CONDUIT_BINARY` (`key=value,...` for any other `-Xbinary` option, e.g. `gcMarkSingleThreaded=true`),
 `CONDUIT_GENERIC_CPU=1` (build.sh: generic x86-64 instead of this CPU).
+`READ_FEED_ROWS` (default on: the feed returns each distinct article's columns once per batch and the app fans them out to its pages), `READ_GLOBAL_WIN` (default on: overlapping global-list pages of a batch are read by one window scan) and `WRITE_IMPLICIT_TX` (default on: a write group is one implicit transaction ended by its Sync, without BEGIN/COMMIT); `0` gives the previous behaviour.

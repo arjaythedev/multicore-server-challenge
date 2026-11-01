@@ -23,6 +23,8 @@ object App {
         feedHeavy: Boolean = false,
         feedFloor: Boolean = false,
         feedShared: Boolean = false,
+        feedRows: Boolean = false,
+        globalWin: Boolean = false,
         sharedRows: Boolean = false,
     ) {
         TagOrder.appSorts = appSortsTags && collation != null &&
@@ -34,6 +36,8 @@ object App {
         ReadShare.feedHeavy = feedHeavy
         ReadShare.feedFloor = feedFloor
         ReadShare.feedShared = feedShared
+        ReadShare.feedRows = feedRows
+        ReadShare.globalWin = globalWin
         ReadShare.sharedRows = sharedRows
     }
 

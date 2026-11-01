@@ -67,6 +67,31 @@ internal fun JsonWriter.article(r: Row, c: Int, withBody: Boolean, flags: Result
     endObject()
 }
 
+/**
+ * A feed article from its shared row [r] in the [Cols.FEED_ROW] layout (a [conduit.db.Sharing.ARTICLES] read); same members as
+ * [article]. Favorited comes from this request's flag rows (the article id), following is the constant true: every page row was
+ * selected through the viewer's follows.
+ */
+internal fun JsonWriter.feedArticle(r: Row, flags: Result) {
+    beginObject()
+    name(N_SLUG); text(r, 3)
+    name(N_TITLE); text(r, 4)
+    name(N_DESCRIPTION); text(r, 5)
+    name(N_TAG_LIST); textArray(r, 8, TagOrder.appSorts)
+    name(N_CREATED_AT); timestamp(r.micros(6))
+    name(N_UPDATED_AT); timestamp(r.micros(7))
+    name(N_FAVORITED); bool(flags.hasFlag(r.int8(1)))
+    name(N_FAVORITES_COUNT); number(r.int8(9))
+    name(N_AUTHOR)
+    beginObject()
+    name(N_USERNAME); text(r, 10)
+    name(N_BIO); text(r, 11)
+    name(N_IMAGE); text(r, 12)
+    name(N_FOLLOWING); bool(true)
+    endObject()
+    endObject()
+}
+
 /** {"article": ...} for a full article at column [c]. */
 internal fun JsonWriter.articleEnvelope(r: Row, c: Int, flags: Result? = null) {
     beginObject()

@@ -5,6 +5,7 @@ import conduit.auth.Jwt
 import conduit.auth.Passwords
 import conduit.db.Db
 import conduit.db.DbConfig
+import conduit.db.WritePool
 import conduit.db.sleepNanos
 import conduit.http.Gzip
 import conduit.http.HttpEngine
@@ -107,6 +108,9 @@ fun main() {
         feedFloor = envInt("READ_FEED_FLOOR", 1) != 0,
         // READ_FEED_SHARE (default on, needs READ_FEED_HEAVY and READ_FEED_FLOOR; 0 = decorate every page row): each distinct page article of a feed batch is decorated once
         feedShared = envInt("READ_FEED_SHARE", 1) != 0,
+        // READ_FEED_ROWS (default on, needs READ_FEED_SHARE; 0 = join every page row to its article's columns): the feed statement sends each distinct article of the batch once and the page as (count, id) rows
+        feedRows = envInt("READ_FEED_ROWS", 1) != 0,
+        globalWin = envInt("READ_GLOBAL_WIN", 1) != 0,
         // READ_SHARED_ROWS (default on, needs READ_SHARE; 0 = fan every row out to every request): comments and the global, tag and author lists send each distinct thread or page once
         sharedRows = envInt("READ_SHARED_ROWS", 1) != 0,
     )
@@ -115,6 +119,7 @@ fun main() {
         for (k in App.reads) println("sql\t${k.name}\t${k.sql}")
         return
     }
+    WritePool.implicitTx = envInt("WRITE_IMPLICIT_TX", 1) != 0
     Db.start(dbConfig, App.reads, App.writes)
     startHttpServer(host, port, httpThreads, HttpEngine { ex -> App.handle(ex) })
     println(
