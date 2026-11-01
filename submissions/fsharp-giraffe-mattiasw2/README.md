@@ -45,11 +45,13 @@ check.sh      the harness: build -> facts -> conformance suite (../../test/run.s
   - **Plan (F#).** The batch's distinct needs: forty requests for page 1 of the global feed are one page, and an
     article page and its comments are one slug lookup.
   - **Phase A (one round trip).** Ids: the tag list, one capped count per distinct list key, the ids of each distinct
-    page, slug → article id, and username → user.
+    page, slug → article id, username → user, and each distinct comment thread, so phase B knows who wrote the
+    comments.
   - **Phase B (one round trip).** Everything shown, once per **batch** and across every kind of request: each
-    distinct article's card (columns, tags, favorite count, author), whether a list or an article page shows it; each
-    distinct comment thread; and the viewers' flags as two sets, (viewer, article) favorited and (viewer, user)
-    following.
+    distinct article's card (columns, tags, favorite count, author), whether a list or an article page shows it; and
+    the viewers' flags as two sets, (viewer, article) favorited and (viewer, user) following. The flags are one
+    statement: each article's author is looked up once, and each viewer's pairs are one index range scan
+    (`= ANY`), not one probe per pair.
   - **Assemble (pure).** Each request's answer is built from those maps. Requests that show the same article share one
     `Card` object.
   - Both phases run in one `REPEATABLE READ READ ONLY` transaction: one snapshot, so the phases agree, and it is
