@@ -1,0 +1,152 @@
+--[[
+The Conduit API (SPEC.md) in Nelua: Lua's syntax, compiled to C. Worker processes do HTTP, each with its own epoll
+loop and listening socket (SO_REUSEPORT); one database process holds the pipelined Postgres connections and runs
+every worker's database jobs, in batches; bcrypt helper processes hash for both. The parent starts the helpers,
+the database process and the workers, and waits.
+]]
+## pragmas.nogc = true
+require 'server'
+
+local function env(name: cstring, default: cstring): cstring
+  local v = C.getenv(name)
+  if v == nilptr or cbytes(v)[0] == 0 then return default end
+  return v
+end
+
+-- How many CPUs this process may run on (its affinity mask, as nproc counts them); 0 if unknown.
+local function usable_cpus(): cint
+  local mask: [16]uint64
+  if sched_getaffinity(0, 128, &mask) ~= 0 then return 0 end
+  local n: cint = 0
+  for i: cint = 0, < 16 do
+    local w = mask[i]
+    while w ~= 0 do
+      w = w & (w - 1)
+      n = n + 1
+    end
+  end
+  return n
+end
+
+local url = C.getenv('DATABASE_URL')
+local jwt_secret = C.getenv('JWT_SECRET')
+if url == nilptr or jwt_secret == nilptr then
+  C.fprintf(C.stderr, 'DATABASE_URL and JWT_SECRET are required\n')
+  C.exit(1)
+end
+local host = env('HOST', '127.0.0.1')
+local port = env('PORT', '3000')
+local extra_port = env('EXTRA_PORT', '')
+-- how long a worker waits after a quiet loop pass (microseconds)
+local batch_us = (@cuint)(C.atoi(env('BATCH_US', '2000')))
+
+-- Workers: one per 2 CPUs this process may use (WORKERS overrides it). They only do HTTP: the database process
+-- batches every worker's reads together, so more workers don't make smaller batches.
+local cpus = usable_cpus()
+if cpus < 1 then cpus = (@cint)(sysconf(_SC_NPROCESSORS_ONLN)) end
+local workers: cint = C.atoi(env('WORKERS', '0'))
+if workers < 1 then workers = cpus // 2 end
+if workers < 1 then workers = 1 end
+if workers > 1024 then workers = 1024 end
+-- Postgres connections, all the database process's (the box allows 95)
+local pool: cint = C.atoi(env('DB_POOL', '48'))
+if pool < 1 then pool = 1 end
+
+local limit: rlimit
+getrlimit(RLIMIT_NOFILE, &limit)
+limit.rlim_cur = limit.rlim_max
+setrlimit(RLIMIT_NOFILE, &limit)
+
+-- The bcrypt helpers: one per CPU (BCRYPT_HELPERS overrides it), started before anything they shouldn't hold
+local helpers: cint = C.atoi(env('BCRYPT_HELPERS', '0'))
+if helpers < 1 then helpers = cpus end
+local bc_addr: sockaddr_un
+local bc_len: cuint
+start_bcrypt_helpers(helpers, &bc_addr, &bc_len)
+
+local secret: string = {data = cbytes(jwt_secret), size = C.strlen(jwt_secret)}
+
+-- The database process, with a link (a stream socket pair) to each worker, also before the listening sockets
+local db_ends: [1024]cint
+local worker_ends: [1024]cint
+for w: cint = 0, < workers do
+  local pair: [2]cint
+  if socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, &pair) ~= 0 then
+    C.perror('conduit: socketpair')
+    C.exit(1)
+  end
+  db_ends[w] = pair[0]
+  worker_ends[w] = pair[1]
+end
+local db_pid = fork()
+if db_pid == 0 then
+  prctl(PR_SET_PDEATHSIG, SIGKILL)
+  for w: cint = 0, < workers do close(worker_ends[w]) end
+  serve_db(url, secret, (@*[0]cint)(&db_ends), workers, pool, batch_us, &bc_addr, bc_len)
+  C.exit(0)
+end
+for w: cint = 0, < workers do close(db_ends[w]) end
+
+-- Every worker's listening sockets, one per port, in one SO_REUSEPORT group per port
+local fd_a: [1024]cint
+local fd_b: [1024]cint
+for w: cint = 0, < workers do
+  fd_a[w] = open_listener(host, port)
+  fd_b[w] = -1
+  if C.strlen(extra_port) > 0 then fd_b[w] = open_listener(host, extra_port) end
+end
+
+C.printf('conduit: %d workers, a database process with %d Postgres connections\n', workers, pool)
+C.fflush(C.stdout)
+
+local running: cint = 0
+local pids: [1024]cint
+for w: cint = 0, < workers do
+  local pid = fork()
+  if pid == 0 then
+    prctl(PR_SET_PDEATHSIG, SIGKILL)   -- the workers go when the parent does
+    for i: cint = 0, < workers do   -- the other workers' sockets
+      if i ~= w then
+        close(fd_a[i])
+        if fd_b[i] >= 0 then close(fd_b[i]) end
+        close(worker_ends[i])
+      end
+    end
+    serve(secret, fd_a[w], fd_b[w], worker_ends[w], batch_us, &bc_addr, bc_len)
+    C.exit(0)
+  elseif pid > 0 then
+    pids[running] = pid
+    running = running + 1
+  end
+end
+local started = running
+-- Only the workers hold their sockets now: a worker that dies takes its sockets out of the groups.
+for i: cint = 0, < workers do
+  close(fd_a[i])
+  if fd_b[i] >= 0 then close(fd_b[i]) end
+  close(worker_ends[i])
+end
+-- A worker or helper that dies isn't replaced (the others keep serving); exit when no worker is left, or when the
+-- database process goes.
+while running > 0 do
+  local status: cint
+  local pid = waitpid(-1, &status, 0)
+  if pid > 0 then
+    local worker = false
+    for i: cint = 0, < started do
+      if pids[i] == pid then worker = true end
+    end
+    if pid == db_pid then
+      C.fprintf(C.stderr, 'conduit: the database process exited (status %d)\n', status)
+      break
+    elseif worker then
+      running = running - 1
+      C.fprintf(C.stderr, 'conduit: worker %d exited (status %d), %d left\n', pid, status, running)
+    else
+      C.fprintf(C.stderr, 'conduit: bcrypt helper %d exited (status %d)\n', pid, status)
+    end
+  elseif C.errno ~= EINTR then
+    break
+  end
+end
+C.exit(1)
