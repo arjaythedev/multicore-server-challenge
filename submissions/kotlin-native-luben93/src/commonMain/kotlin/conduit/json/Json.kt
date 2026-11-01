@@ -116,6 +116,13 @@ class JsonWriter(@JvmField val out: ByteBuf) {
         o.len = p
     }
 
+    /** Raw output (pre-rendered JSON): [beginRaw] writes the separator a value needs, [rawPart]s append bytes, [rawQuoted] a JSON string. */
+    fun beginRaw() = sep()
+
+    fun rawPart(src: ByteArray, off: Int, len: Int) = out.put(src, off, len)
+
+    fun rawQuoted(src: ByteArray, off: Int, len: Int) = quoted(src, off, len)
+
     /** A JSON string from UTF-8 bytes (escaped as needed). */
     fun string(b: ByteArray, off: Int, len: Int) {
         sep()

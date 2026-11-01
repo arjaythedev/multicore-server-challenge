@@ -43,6 +43,11 @@ class ReadKind(
     val broadcast: Boolean = false,
     /** [Sharing.GROUPS]: the statement returns each group's rows once, see [Sharing]. */
     val sharing: Sharing = Sharing.NONE,
+    /**
+     * Two-phase kind (see TwoPhase.kt): its requests are batched together with those of the other two-phase kinds, run as the
+     * leader's phase A statements and ONE shared decoration round trip; [sql] is then not used.
+     */
+    val tp: TpKind? = null,
 ) {
     /** Assigned by [Db.start]: index into the kind table. */
     var id: Int = -1
@@ -55,7 +60,16 @@ class ReadKind(
  * every request of a group views of its first request's rows and the request's own flags ([conduit.pg.Result.hasFlag]).
  * Postgres serializes and the pool parses each distinct page or thread once instead of once per request.
  */
-enum class Sharing { NONE, GROUPS }
+enum class Sharing {
+    NONE, GROUPS,
+
+    /**
+     * Feed reads: page rows `(i, n, article id, NULL...)` per request, each distinct article of the batch once as
+     * `(Int.MIN_VALUE, id, author id, columns...)` and flag rows `(-1 - i, article id, ...)`; the pool collects the article
+     * rows in an [conduit.pg.ArticleRows] table every request's [conduit.pg.Result] can look an id up in.
+     */
+    ARTICLES,
+}
 
 /** A single-statement write (or a write-adjacent read that must run on a write connection). */
 class WriteStmt(
@@ -99,6 +113,15 @@ class DbConfig(
      * once it clears, or dropped unrun past the client's timeout) instead of every request behind it.
      */
     val lifoMicros: Int = 0,
+    /**
+     * Auto gather ([GatherTuner]; 0 or at most [gatherMicros]: off): the window ([gatherMicros] is its floor) widens by
+     * [gatherStepMicros] per second up to this while the CPUs the process runs on are at least [gatherHighPct] busy and
+     * narrows again at [gatherLowPct] or less.
+     */
+    val gatherMaxMicros: Int = 0,
+    val gatherStepMicros: Int = 10_000,
+    val gatherHighPct: Int = 75,
+    val gatherLowPct: Int = 60,
 ) {
     companion object {
         /**
@@ -115,6 +138,10 @@ class DbConfig(
             skipAbandoned: Boolean = false,
             gatherMicros: Int = 0,
             lifoMicros: Int = 0,
+            gatherMaxMicros: Int = 0,
+            gatherStepMicros: Int = 10_000,
+            gatherHighPct: Int = 75,
+            gatherLowPct: Int = 60,
         ): DbConfig {
             val rest = when {
                 url.startsWith("postgres://") -> url.substring("postgres://".length)
@@ -150,6 +177,7 @@ class DbConfig(
             return DbConfig(
                 host.ifEmpty { "localhost" }, port, user, password, database, readConns, writeConns, options,
                 readQueueMax, writeQueueMax, skipAbandoned, gatherMicros, lifoMicros,
+                gatherMaxMicros, gatherStepMicros, gatherHighPct, gatherLowPct,
             )
         }
 

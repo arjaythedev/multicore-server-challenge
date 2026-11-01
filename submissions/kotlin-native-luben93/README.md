@@ -24,9 +24,11 @@ DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=... HO
 
 Optional process settings (defaults sized from the CPU count): `HTTP_THREADS`, `DB_READ_CONNS`, `DB_WRITE_CONNS`
 (8 + 4 on the box), `BCRYPT_THREADS`, `BCRYPT_BATCH_MS`, `DB_OPTIONS`, `APP_SORT_TAGS`, `DB_STATS_S`, `OVERLOAD_GUARD`
-(`READ_QUEUE_MAX`, `WRITE_QUEUE_MAX`, `BCRYPT_QUEUE_MAX`), `READ_SHARE`, `READ_GATHER_MS`, `READ_MAX_BATCH`,
+(`READ_QUEUE_MAX`, `WRITE_QUEUE_MAX`, `BCRYPT_QUEUE_MAX`), `READ_SHARE`, `READ_GATHER_MS` (the gather window's floor, 30), `READ_GATHER_AUTO` (default off; `1`: while the CPUs the process may use are at least
+`READ_GATHER_HIGH_PCT` (75) busy the window widens by `READ_GATHER_STEP_MS` (10) a second up to `READ_GATHER_MAX_MS` (100), back down at `READ_GATHER_LOW_PCT` (60); `0` = the fixed `READ_GATHER_MS`), `READ_MAX_BATCH`,
+`PG_IO_TIMEOUT_S` (15: how long a Postgres socket may block with a reply outstanding; an idle connection waits indefinitely),
 `READ_VIEWER_FLAGS`, `READ_FEED_MAX_BATCH` (default 192: the feed statement decorates each distinct page article once and its hub/count work is per batch, so
-bigger batches are cheaper per feed; in the lab at 180k users cap 64 collapsed and 192 held; 0 = `READ_MAX_BATCH`), `READ_FEED_HEAVY`, `READ_FEED_FLOOR`, `BCRYPT_FLUSH_MIN`,
+bigger batches are cheaper per feed; in the lab at 180k users cap 64 collapsed and 192 and 1,024 held; 0 = `READ_MAX_BATCH`), `READ_FEED_HEAVY`, `READ_FEED_FLOOR`, `BCRYPT_FLUSH_MIN`,
 `BCRYPT_FLUSH_AGE_MS`, `BCRYPT_PRIO_LOAD`, `BCRYPT_THREADS_MAX` and `BCRYPT_EXTRA_AGE_MS` (extra bcrypt workers that only start once the oldest login has
 waited that long: insurance for a login rate the base threads cannot hash), `READ_SHARED_ROWS` (default on: comments, article and the global, tag and author lists
 return each distinct thread or page once; `0` = fan every row out to every request) and `READ_FEED_SHARE` (default on: the feed decorates each distinct page
@@ -41,36 +43,5 @@ Build-time (read by `build.gradle.kts` from the environment, defaults are what t
 `CONDUIT_GC` (`pmcs` | `cms` | `stwms`), `CONDUIT_ALLOCATOR` (`custom` | `std`), `CONDUIT_INLINE` (default 40),
 `CONDUIT_LLVM_INLINE`, `CONDUIT_BINARY` (`key=value,...` for any other `-Xbinary` option, e.g. `gcMarkSingleThreaded=true`),
 `CONDUIT_GENERIC_CPU=1` (build.sh: generic x86-64 instead of this CPU).
-
-## Lab results (2026-10-31)
-
-Box simulation on an i7-13700H: server + Postgres 18 on 8 of its 20 CPUs (Postgres in a container with the box's pg-conf values for 8 cores / 16 GB),
-the challenge's own load generator on the other 12, full seed, 200 s measured holds. Lab numbers only; nothing here is an official result.
-
-**156k lab users, interleaved with the previous version (merged #121), same state, 0 errors in all four runs**
-
-| run | rps | p50 / p95 / p99 ms | Postgres us/request | app us/request | box CPU |
-|---|--:|---|--:|--:|--:|
-| previous (#121), a | 39,313 | 167 / 471 / 596 | 129 | 59 | 100% |
-| previous (#121), b | 39,079 | 160 / 586 / 742 | 132 | 58 | 100% |
-| this version, a | 40,918 | 34 / 77 / 138 | 93 | 50 | 81% |
-| this version, b | 40,900 | 36 / 90 / 217 | 97 | 52 | 83% |
-
-**180k lab users, feed batch cap** (single runs): cap 64 collapsed (p95 6,074 ms, 1.7% timeouts); cap 192 held the whole offered load (46,486 rps, steady-state p95 143 / p99 199 ms, 0 errors); cap 1,024 likewise (steady p95 130 / p99 184).
-
-**190k lab users, same bench as three of the leaders** (steady state = the hold minus its first 15 s; all four runs 0.00% errors and 0.00% on the login endpoint)
-
-| | verdict (window p99 ms) | steady p50 / p95 / p99 ms (worst second) | box CPU | Postgres us/request | logins + registrations |
-|---|---|---|--:|--:|--:|
-| this version (cap 192) | FAIL (1,538) | 62 / 153 / 206 (445) | 97% | 93 | 10,080 + 218 |
-| rust-epoll-theCatWisel | FAIL (1,221) | 102 / 157 / 175 (345) | 74% | 63 | 10,120 + 201 |
-| rust-epoll-WorriedArrow | FAIL (1,734) | 115 / 180 / 207 (533) | 95% | 92 | 10,138 + 224 |
-| zig-iouring-nick-potts | FAIL (1,904) | 154 / 252 / 305 (608) | 84% | 70 | 10,091 + 210 |
-
-All four fail the load generator's verdict window because the generator, on the same machine, pegs its CPUs at the end of its ramp and the first seconds of the window carry that transient;
-the steady-state columns are the comparison. This version is on par with WorriedArrow at 190k and behind theCatWisel in CPU headroom (box 97% against 74%, Postgres 93 against 63 us/request).
-The capacity on the benchmark box is not measured here (INFERRED only: the previous version held 156k in this lab and scored 130k officially).
-
-What the batch does now: comments, article, the global/tag/author lists return each distinct thread or page once per batch (the per-request favorited/following flags come back as a few flag rows),
-the feed decorates each distinct page article once and its batch cap is 192, and bcrypt gets extra workers that start only when the oldest login has waited its window plus 100 ms.
-Same as before: batch-shared reads, 8 read + 4 write connections, the overload guard (requests whose client is gone are dropped, queue caps answer 503), adaptive gzip.
+`READ_FEED_ROWS` (default on: the feed returns each distinct article's columns once per batch and the app fans them out to its pages), `READ_GLOBAL_WIN` (default on: overlapping global-list pages of a batch are read by one window scan) and `WRITE_IMPLICIT_TX` (default on: a write group is one implicit transaction ended by its Sync, without BEGIN/COMMIT); `0` gives the previous behaviour.
+`READ_TP` (default on): the two-phase read path (statement shapes after rust-epoll-theCatWisel): article, comments, the global/tag/author/favorited lists and the feed form one mixed batch whose phase A fetches ids and counts per kind and whose phase B is ONE shared decoration round trip (article columns with tag ids and favorites counts, authors, viewer flags); tag ids map to names in the app; nothing is kept between batches. `READ_TP_<SLUG|ID|COMMENTS|GLOBAL|TAG|AUTHOR|FAVLIST|FEED>=0` puts one kind back on its own statement.

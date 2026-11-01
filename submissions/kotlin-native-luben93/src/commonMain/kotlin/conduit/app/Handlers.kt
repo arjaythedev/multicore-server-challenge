@@ -4,6 +4,7 @@ import conduit.auth.Jwt
 import conduit.auth.Passwords
 import conduit.db.Db
 import conduit.db.Sharing
+import conduit.db.TpState
 import conduit.http.Exchange
 import conduit.json.JsonReader
 import conduit.pg.Params
@@ -175,13 +176,29 @@ internal object Handlers {
         }
         val res = Db.read(kind, ex.viewer, q.limit, q.offset, q.key)
         if (!res.ok) return failed(ex, res)
+        val tp = res.tp as TpState?
+        if (tp != null) { // two-phase read: the batch's decoration is rendered from its tables
+            tp.writeList(ex.json, res.tpIdx)
+            return ex.send(200)
+        }
         val j = ex.json
         j.beginObject()
         j.name(N_ARTICLES)
         j.beginArray()
         var count = 0L
         val flags = if (kind.sharing == Sharing.GROUPS) res else null // shared rows: the viewer's flags are the request's own
-        for (i in 0 until res.rowCount) {
+        if (kind.sharing == Sharing.ARTICLES) {
+            // a count row and page rows (article ids): each id's row is looked up in the batch's one copy of the article
+            for (i in 0 until res.rowCount) {
+                val n = res.pageCount(i)
+                if (n >= 0) count = n
+                val id = res.pageId(i)
+                if (id >= 0) {
+                    val a = res.article(id)
+                    if (a != null) j.feedArticle(a, res)
+                }
+            }
+        } else for (i in 0 until res.rowCount) {
             val r = res.row(i)
             if (i == 0) count = r.int8(Cols.LIST_COUNT)
             if (!r.isNull(Cols.LIST)) j.article(r, Cols.LIST, withBody = false, flags)
@@ -195,6 +212,11 @@ internal object Handlers {
     suspend fun article(ex: Exchange, slug: String) {
         val res = Db.read(Sql.ARTICLE_BY_SLUG, ex.viewer, key = slug)
         if (!res.ok) return failed(ex, res)
+        val tp = res.tp as TpState?
+        if (tp != null) {
+            if (!tp.writeArticle(ex.json, res.tpIdx)) return notFound(ex, "article")
+            return ex.send(200)
+        }
         if (res.rowCount == 0) return notFound(ex, "article")
         if (Sql.ARTICLE_BY_SLUG.sharing == Sharing.GROUPS) {
             ex.json.articleEnvelope(res.row(0), Cols.ARTICLE_SHARED, res) // shared rows: the viewer's flags are this request's own
@@ -208,6 +230,11 @@ internal object Handlers {
     private suspend fun readBack(ex: Exchange, id: Long) {
         val res = Db.read(Sql.ARTICLE_BY_ID, ex.viewer, offset = id)
         if (!res.ok) return failed(ex, res)
+        val tp = res.tp as TpState?
+        if (tp != null) {
+            if (!tp.writeArticle(ex.json, res.tpIdx)) return notFound(ex, "article") // deleted meanwhile
+            return ex.send(200)
+        }
         if (res.rowCount == 0) return notFound(ex, "article") // deleted meanwhile
         ex.json.articleEnvelope(res.row(0), Cols.ARTICLE)
         ex.send(200)
@@ -257,6 +284,11 @@ internal object Handlers {
     suspend fun comments(ex: Exchange, slug: String) {
         val res = Db.read(Sql.COMMENTS, ex.viewer, key = slug)
         if (!res.ok) return failed(ex, res)
+        val tp = res.tp as TpState?
+        if (tp != null) {
+            if (!tp.writeComments(ex.json, res.tpIdx)) return notFound(ex, "article")
+            return ex.send(200)
+        }
         if (res.rowCount == 0) return notFound(ex, "article")
         val j = ex.json
         val shared = Sql.COMMENTS.sharing == Sharing.GROUPS // column 8: the author id (the viewer's follows are flag rows), else following

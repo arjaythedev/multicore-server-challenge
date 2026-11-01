@@ -127,8 +127,16 @@ does the same inside each kind's batched statement (`ReadShare` in app/Sql.kt), 
   shared shape cost more there).
 - Every keyed LATERAL ends in `OFFSET 0`: pulled up into a plain join, the generic plan (which takes a LIMIT parameter
   for 10% of the table) hashed all of articles and users per execution (278 ms per 60 requests).
-- `ReadPool` sends a kind once its oldest request has waited `READ_GATHER_MS` or its batch is full
+- `ReadPool` sends a kind once its oldest request has waited the gather window or its batch is full
   (`READ_MAX_BATCH`, 256); a `db-gather` clock thread hands kinds whose window passed to idle connections.
+- The window is `READ_GATHER_MS` (30). Optional, off by default: `GatherTuner` (db/GatherTuner.kt, `READ_GATHER_AUTO=1`) samples the busy
+  share of the CPUs in Cpus_allowed_list from /proc/stat once a second and widens the window by 10 ms per second up to
+  `READ_GATHER_MAX_MS` while it is at least 75% busy, back down at 60% or less. Bigger batches make the statements cheaper
+  per request (lab, 180k users, fixed windows: Postgres 91 / 75 / 69 / 64 us per request at 30 / 60 / 90 / 120 ms); the price is latency,
+  which is only worth paying once the CPUs are the bottleneck.
+- Postgres sockets time out after 15 s (`PG_IO_TIMEOUT_S`). A worker with no reply outstanding treats the timeout as nothing
+  (an idle connection has nothing to receive: `Worker.awaitMessage` waits again); with a batch in flight it is the hang
+  detector and the worker reconnects.
 
 Connections: 8 read + 4 write on the box (one per CPU, one per two). With 6 + 2, the write connections were ~100%
 busy at 120k users waiting on the WAL flush, and the writes' backlog (5% of requests) broke p99; the read connections
@@ -239,3 +247,14 @@ server-config changes; session settings only. <= 95 Postgres connections total.
 - Local fd limit is 20000 per process (cannot be raised); the box gives 200000.
 - Research notes (verbatim SQL of the top entries, conformance checklist, bcrypt details):
   `/tmp/claude-0/-home-user-multicore-server-challenge/99796a5c-b120-524c-822d-dc73b94b523b/scratchpad/research/`
+
+## Two-phase reads (READ_TP)
+
+Ported from rust-epoll-theCatWisel's read path (MIT; `db/TwoPhase.kt`, statements in `db/TpSql.kt`). When any of the
+two-phase kinds is ready, every two-phase queue goes into one mixed batch. Phase A is one Sync pipeline of per-kind
+statements returning ids and counts (identical slugs, pages and viewers are interned and queried once). Phase B is one
+round trip: `artx` (article columns, tag ids, favorites count per distinct article), `artau` (per distinct author),
+`flags` (favorited/following per viewer) and the tags table. The app maps tag ids to names, formats each distinct
+article once per batch and assembles every response. Everything lives for one batch only; nothing is kept between
+batches. Deviations from the leader's SQL for exact results: the capped-count gate on tag/author/favorited pages is
+removed, and tag order follows the database collation (`ORDER BY name`).

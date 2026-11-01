@@ -23,7 +23,10 @@ object App {
         feedHeavy: Boolean = false,
         feedFloor: Boolean = false,
         feedShared: Boolean = false,
+        feedRows: Boolean = false,
+        globalWin: Boolean = false,
         sharedRows: Boolean = false,
+        twoPhase: Set<conduit.db.TpKind> = emptySet(),
     ) {
         TagOrder.appSorts = appSortsTags && collation != null &&
             TagOrder.isByteOrder(collation[0] ?: "", collation[1] ?: "", collation[2] ?: "")
@@ -34,7 +37,10 @@ object App {
         ReadShare.feedHeavy = feedHeavy
         ReadShare.feedFloor = feedFloor
         ReadShare.feedShared = feedShared
+        ReadShare.feedRows = feedRows
+        ReadShare.globalWin = globalWin
         ReadShare.sharedRows = sharedRows
+        ReadShare.tp = if (shareReads && sharedRows) twoPhase else emptySet()
     }
 
     /** Who sorts tag lists (for the startup log line). */
