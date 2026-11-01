@@ -32,6 +32,32 @@ check.sh      the harness: build -> facts -> conformance suite (../../test/run.s
   timestamp truncation) are plain unit tests.
 - **Handlers** only authenticate, decode, call Engine and encode.
 
+## What is different here
+
+Most fast entries share the same big ideas: batch the reads, group the commits, hash passwords several at a time. Two
+parts of this one are done differently.
+
+**The read batch is planned in F#, and SQL only looks rows up.** Every hot read is a value (`Read`, in
+`src/Engine/Reads.fs`), not a query. A batch of them goes through plain functions: `planA` turns the requests into
+distinct keys per kind (forty readers of page 1 are one page, an article page and its comments one slug), two
+round trips fetch what those keys need, `planB` derives the second round's keys from the first round's rows, and
+`assemble` builds every answer from the rows. Postgres never deduplicates or joins whole tables: each statement
+unnests arrays of keys F# has already made distinct and probes an index once per key (`CROSS JOIN LATERAL (...
+LIMIT 1)`). Both rounds run in one `REPEATABLE READ READ ONLY` snapshot. Because plan and assembly are pure, the
+whole design has a property test (`src/Tests/BatchTests.fs`, FsCheck): for random batches of real keys, every
+request's answer inside the batch equals its answer alone, byte for byte as the JSON goes out. A planted bug (one
+viewer's favorite leaking to another viewer of the same article) shrank to exactly that batch: two viewers, one
+article.
+
+**bcrypt is F#, not C.** Several fast entries call C for bcrypt. Ours is managed F# with raw pointers
+(`src/Engine/Bcrypt.fs`): four logins' hashes step through their Blowfish rounds together,
+so four independent chains of S-box lookups keep the core busy. Blowfish's 1,042 initial words are computed from
+pi (Machin's formula on big integers), not pasted. The JIT's code was tuned by reading its assembly (see
+"Where the app's CPU goes" below): one quad of hashes is now 12.9 ms per hash on one Zen 5 core, against 11.1 ms for Openwall's C
+with the same interleaving. Every hash is checked bit for bit against BCrypt.Net-Next by a property test on random
+passwords (UTF-8 up to 72 bytes) and salts. bcrypt runs only for a request that will succeed (cheap checks first)
+and never inside SQL, a transaction or a commit group.
+
 ## Multicore model
 
 - **One process, one Kestrel.** Kestrel serves every core with async I/O and holds each user's keep-alive
@@ -164,11 +190,29 @@ The pre-checks don't change the outcome: two racing sign-ups can both pass, and 
 
 ## Capacity on a box like the benchmark's
 
-8 vCPUs on a cloud host are 4 physical cores × 2 hyperthreads. The test box models that: server and Postgres on 4
-Zen 5 cores with both of their hyperthreads, and the load generator on other cores, sharing none of them. With
-batched reads, group commit and lockstep bcrypt, it holds **75,000 users** (19,150 requests/s, p95 378 ms, p99 560
-ms, no errors). It fails at 80,000 (p95 583 ms). Postgres uses 4.5 of the 8 threads and the app 2.8. These cores
-are faster than a typical cloud core, so expect the benchmark box to hold fewer users.
+8 vCPUs on a cloud host are 4 physical cores x 2 hyperthreads. The test box (a Ryzen AI 7 PRO 350 laptop) runs each
+measurement as the benchmark's search does: a fresh copy of the seed (`CREATE DATABASE ... TEMPLATE`), one server
+start, the benchmark's warm-up (500 users, 60 s ramp + 120 s), then a 60 s ramp and 60 s measured. Server and
+Postgres share pinned cores, and the load generator runs on cores they do not touch. One load generator on one
+laptop runs out of room above ~120,000 users, so the limit was found on **3 cores with both hyperthreads** (6
+threads), where it is below that (commits 3f7cc19 to d67ba2f):
+
+| Users | requests/s | p95 | p99 | Postgres threads | app threads | |
+|--:|--:|--:|--:|--:|--:|---|
+| 100,000 | 25,900 | 186-197 ms | 309-339 ms | 2.6 | 2.6-2.8 | pass (4 runs) |
+| 110,000 | 28,200 | 291-449 ms | 409-591 ms | 2.8-3.0 | 2.7-3.0 | pass (3 runs) |
+| 120,000 | 28,800 | 737 ms | 869 ms | 2.85 | 3.0 | fail: the 6 threads are full |
+
+At 120,000 users the read path waits for CPU, not for Postgres: a batch executes in 2 ms at the median, but requests
+queue for a lane (p95 561 ms). The app and Postgres use about the same share. These Zen 5 cores are faster than a
+typical cloud core, so the benchmark box will hold fewer users per core.
+
+Three things in the method moved the numbers more than most code changes, and are worth knowing for any local
+rig: without the warm-up, 100,000 users gave p95 361 ms instead of 196 (the JIT had not finished optimizing); a
+database that had grown through earlier runs (850,000 articles instead of 500,000) made Postgres do ~60% more work
+for the same load; and a 30 s ramp instead of the benchmark's 60 s left a seconds-long transient in the measured
+window. Comparisons elsewhere in this README are paired runs under the same conditions; their absolute numbers
+come from different stages of the rig.
 
 ## Where the app's CPU goes: half of it was bcrypt
 
@@ -261,6 +305,24 @@ server and Postgres on 3 cores with both hyperthreads, ~28,000 requests/s, p95 2
 bcrypt is still a third of the app's CPU for 0.1% of the requests: ~37 ms of CPU per hash, twice an idle core's
 quad, because its threads share cores with Postgres and the app. Below it the profile is flat; Giraffe costs
 under 1%.
+
+## Built on others' ideas
+
+Ideas taken from other entries; the code here is our own.
+
+- `csharp-epoll-aot-gichamba` / `csharp-epoll-jit-gichamba` (PR #103 / #104), compared line by line:
+  - the feed count's shortcut: a viewer who follows an author with 1,000+ articles counts 1,000, proved once per
+    batch for the followees the batch's viewers share most (they credit `go-epoll-MegaPanchamZ` and
+    `zig-iouring-harshitkhandelwal208`);
+  - comment threads in the first round trip, so the second one knows the comment authors, and the favorited and
+    following flags as one statement with one `= ANY` range scan per viewer (their two-phase planner, which they
+    credit to `rust-epoll-WorriedArrow`);
+  - tag names by a primary-key probe per tag instead of a join;
+  - letting a login wait 150 ms for bcrypt batch-mates;
+  - their Openwall crypt_blowfish with interleaved lanes, as the yardstick our F# bcrypt was tuned against.
+
+Read batching and group commit themselves are the author's own, from earlier experiments on the author's
+production platform (rule 6 allows several requests' writes in one transaction).
 
 ## Build, run, check
 
