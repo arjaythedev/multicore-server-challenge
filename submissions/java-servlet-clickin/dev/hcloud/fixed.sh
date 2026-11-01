@@ -30,5 +30,8 @@ cpu=$($SSH root@$TARGET "kill \$(cat /root/monitor.pid) 2>/dev/null; awk -F, -v 
 # merge the boxes' results on the first load box
 for h in "${LG[@]:1}"; do $SSH root@$h "cat /root/m.json" | $SSH root@${LG[0]} "cat > /root/m-$h.json"; done
 sum=$($SSH root@${LG[0]} "/root/loadgen merge -o '' /root/m.json \$(ls /root/m-*.json 2>/dev/null | tr '\n' ' ')" || true)
-echo "$LABEL users=$U $cpu | $(echo "$sum" | awk '/^ALL /{printf "req/s=%s p50=%s p95=%s p99=%s err%%=%s", $3, $4, $6, $7, $9} /^box /{sub(/,.*CPU avg/, " cpu"); printf " | %s", $0}')"
-mkdir -p "$HERE/results"; echo "$sum" > "$HERE/results/$LABEL.txt"
+line="$LABEL users=$U $cpu | $(echo "$sum" | awk '/^ALL /{printf "req/s=%s p50=%s p95=%s p99=%s err%%=%s", $3, $4, $6, $7, $9} /^box /{sub(/,.*CPU avg/, " cpu"); printf " | %s", $0}')"
+echo "$line"
+# keep the CPU split and the per-second samples: stdout alone lost them once
+mkdir -p "$HERE/results"; { echo "$line"; echo "$sum"; } > "$HERE/results/$LABEL.txt"; echo "$line" >> "$HERE/results/fixed.log"
+scp -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@$TARGET:/root/results/monitor-$LABEL.csv "$HERE/results/" || true

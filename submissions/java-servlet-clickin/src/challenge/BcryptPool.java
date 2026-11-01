@@ -18,7 +18,9 @@ public final class BcryptPool implements AutoCloseable {
     private final Semaphore available = new Semaphore(0);
     private final AtomicInteger publishers = new AtomicInteger();
     private final Thread[] threads;
-    private final int lanes = Integer.parseInt(System.getenv().getOrDefault("BCRYPT_LANES", "4"));
+    private final int configuredLanes = Integer.parseInt(System.getenv().getOrDefault("BCRYPT_LANES", "0"));
+    // 4 until the startup timing (BCRYPT_LANES=0) picks this core's fastest width
+    private volatile int lanes = configuredLanes == 0 ? 4 : configuredLanes;
     private volatile boolean closed;
 
     public BcryptPool() {
@@ -26,11 +28,21 @@ public final class BcryptPool implements AutoCloseable {
     }
 
     public BcryptPool(int count) {
-        if (lanes < 1 || lanes > 4) {
-            throw new IllegalArgumentException("BCRYPT_LANES must be between 1 and 4");
+        if (configuredLanes < 0 || configuredLanes > BCryptLanes.MAX) {
+            throw new IllegalArgumentException("BCRYPT_LANES must be between 0 (timed at startup) and " + BCryptLanes.MAX);
         }
         if (count < 1) {
             throw new IllegalArgumentException("BCRYPT_THREADS must be positive");
+        }
+        if (configuredLanes == 0) {
+            Thread timer = new Thread(() -> {
+                StringBuilder curve = new StringBuilder();
+                lanes = BCrypt.fastestLanes(curve);
+                System.err.println("bcrypt: " + lanes + " lanes (per hash at cost 7:" + curve + ")");
+            },
+                    "bcrypt-lanes");
+            timer.setDaemon(true);
+            timer.start();
         }
         threads = new Thread[count];
         for (int i = 0; i < count; i++) {
@@ -104,7 +116,7 @@ public final class BcryptPool implements AutoCloseable {
                 // wait up to BCRYPT_GATHER_MS for a full set: lanes interleave in one loop, so a full set costs
                 // little more CPU than a lone hash
                 long gatherEnd = System.nanoTime() + gatherNanos;
-                while (count < lanes && acquireUntil(gatherEnd)) {
+                while (count < jobs.length && acquireUntil(gatherEnd)) {
                     Unit next = queue.poll();
                     if (next != null) {
                         jobs[count++] = next;
