@@ -50,6 +50,7 @@ const S_OPEN: i32 = 1
 const S_DUE: i32 = 2
 const S_A: i32 = 3
 const S_B: i32 = 4
+/** Group B has ended and the plan waits only for its count run. */
 const S_COUNT: i32 = 5
 /** How long an answer waits for room in a worker's ring, in ns, before that worker counts as stuck. */
 const STUCK_NS: i64 = 5000000000
@@ -87,6 +88,9 @@ export class ReadService {
   /** The plan taking reads, or -1, and when its first came. */
   open: i32 = -1
   openedAt: i64 = 0
+  /** Per plan: it waits for a count run still, and its connection was lost meanwhile. */
+  counting: boolean[]
+  lost: boolean[]
   planMin: i32
   planWait: i64
   /** A read popped that its plan had no room for, and its worker; the next ring to look at. */
@@ -111,9 +115,13 @@ export class ReadService {
     registerPlanStatements(this.pool)
     this.plans = []
     this.state = []
+    this.counting = []
+    this.lost = []
     for (let k: i32 = 0; k < (cfg.readPlans > 0 ? cfg.readPlans : 1); k++) {
       this.plans.push(new ReadPlan())
       this.state.push(S_FREE)
+      this.counting.push(false)
+      this.lost.push(false)
     }
     const noTypes: i32[] = []
     this.pool.register(this.plans[0].articles.name, this.plans[0].articles.sql, noTypes)
@@ -365,16 +373,23 @@ export class ReadService {
       if (plan.failed) {
         plan.abortA()
       } else if (plan.planB()) {
-        if (plan.metas > 0) {
-          if (this.countRuns[this.countOpen].join(p, plan)) {
-            this.state[p] = S_COUNT
-            return
-          }
+        // Group B and the counts run side by side: the run joined is one
+        // plans share, and a plan need not wait for it to read its articles.
+        if (plan.metas > 0 && !this.countRuns[this.countOpen].join(p, plan)) {
           plan.failed = true
         } else if (this.askB(p)) {
+          this.counting[p] = plan.metas > 0
+          return
+        } else if (plan.metas > 0) {
+          // In the run already: its end finishes the plan.
+          this.counting[p] = true
+          this.state[p] = S_COUNT
           return
         }
       }
+    } else if (this.counting[p]) {
+      this.state[p] = S_COUNT
+      return
     }
     this.finish(p, false)
   }
@@ -395,15 +410,12 @@ export class ReadService {
     this.countBusy[place] = false
     this.running -= 1
     for (const p of run.plans) {
-      if (lost) {
-        this.finish(p, true)
-      } else {
-        const plan: ReadPlan = this.plans[p]
-        plan.failed = plan.failed || failed || run.failed
-        plan.takeCounts(run)
-        if (plan.failed || !this.askB(p)) {
-          this.finish(p, false)
-        }
+      const plan: ReadPlan = this.plans[p]
+      plan.failed = plan.failed || failed || lost || run.failed
+      plan.takeCounts(run)
+      this.counting[p] = false
+      if (this.state[p] === S_COUNT) {
+        this.finish(p, lost || this.lost[p])
       }
     }
     run.reset()
@@ -427,6 +439,7 @@ export class ReadService {
       this.deliver(this.links[tag % WORKER_TAGS], plan.out, len)
     }
     this.state[p] = S_FREE
+    this.lost[p] = false
   }
 
   deliver(link: ReadLink, b: u8[], len: i32): void {
@@ -550,7 +563,12 @@ export class ReadService {
     if (event === PG_LOST) {
       this.ticketPlan[at] = -1
       plan.abortA()
-      this.finish(p, true)
+      if (this.counting[p]) {
+        this.lost[p] = true
+        this.state[p] = S_COUNT
+      } else {
+        this.finish(p, true)
+      }
     } else if (event === PG_GROUP_DONE) {
       this.ticketPlan[at] = -1
       if (conn.groupFailed) {

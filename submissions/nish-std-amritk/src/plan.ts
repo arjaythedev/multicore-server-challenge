@@ -320,7 +320,7 @@ export class ReadPlan {
   metaFull: boolean[]
   metas: i32 = 0
   private readonly idTable: i32[]
-  /** Each article's JSON in `text`: [m0, m1) up to the body, [m1, m2) the body, [m2, m3) up to `favorited`, [m3, m4) up to `following`. */
+  /** Each article's JSON in `text`: [m0, m1) up to the body, [m1, m2) the body, [m2, m3) up to `favorited`, [m3, m4) from the author up to `following`. */
   m0: i32[]
   m1: i32[]
   m2: i32[]
@@ -1509,8 +1509,6 @@ export class ReadPlan {
     o = this.stampInto(out, o, conn, M_UPDATED)
     o = jsonOutRaw(out, o, f[7])
     this.m3[m] = o
-    o = jsonOutRaw(out, o, f[8])
-    o = jwtDigits(this.metaCount[m], out, o)
     o = jsonOutRaw(out, o, f[9])
     o = jsonOutString(out, o, b, conn.colStart(M_USERNAME), conn.colLength(M_USERNAME))
     o = jsonOutRaw(out, o, f[10])
@@ -1699,7 +1697,7 @@ export class ReadPlan {
       if (!this.found[m] || !this.slugIs(m, r)) {
         return PLAN_ALONE
       }
-      this.outRoom(this.m4[m] - this.m0[m] + 64)
+      this.outRoom(this.m4[m] - this.m0[m] + 128)
       let o: i32 = jsonOutRaw(this.out, 0, this.f[16])
       o = this.article(o, m, true, v, id, this.slugAuthor[key])
       this.out[o] = toU8(125)
@@ -1715,7 +1713,7 @@ export class ReadPlan {
         return PLAN_ALONE
       }
       const m: i32 = this.idTable[slot] - 1
-      size += this.m4[m] - this.m0[m] + 32
+      size += this.m4[m] - this.m0[m] + 96
     }
     this.outRoom(size)
     let o: i32 = jsonOutRaw(this.out, 0, this.f[14])
@@ -1748,6 +1746,9 @@ export class ReadPlan {
     copyBytes(out, at, t, this.m2[m], this.m3[m] - this.m2[m])
     at += this.m3[m] - this.m2[m]
     at = jsonOutBool(out, at, this.flag(v, id, 0))
+    // The count comes from the count lane, maybe after this row did.
+    at = jsonOutRaw(out, at, this.f[8])
+    at = jwtDigits(this.metaCount[m], out, at)
     copyBytes(out, at, t, this.m3[m], this.m4[m] - this.m3[m])
     at += this.m4[m] - this.m3[m]
     at = jsonOutBool(out, at, this.flag(v, author, 1))
