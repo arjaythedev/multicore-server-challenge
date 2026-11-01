@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Runs the server in the foreground. Config: DATABASE_URL, JWT_SECRET, HOST, PORT (SPEC.md).
+# Optional: DB_POOL_SIZE (multiplexed Postgres connections, default 3 per core, capped at 95),
+# BCRYPT_THREADS (dedicated bcrypt threads, default one per two cores).
+set -euo pipefail
+DIR="$(cd "$(dirname "$0")" && pwd)"
+export DOTNET_ROOT="${DOTNET_ROOT:-/usr/local/dotnet}" DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1
+# Direct front: every user holds a keep-alive socket, so lift the soft descriptor limit to the hard one.
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
+# A 64 MB gen0 budget: each request allocates a few KB, and the default budget would run a gen0
+# collection many times a second. The runtime reads this only from the environment.
+export DOTNET_GCgen0size="${DOTNET_GCgen0size:-0x4000000}"
+DOTNET="$DOTNET_ROOT/dotnet"
+[ -x "$DOTNET" ] || DOTNET=dotnet
+exec "$DOTNET" "$DIR/out/Web.dll"

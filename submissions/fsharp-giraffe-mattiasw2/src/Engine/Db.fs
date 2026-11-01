@@ -1,0 +1,45 @@
+module Engine.Db
+
+open System
+open Npgsql
+
+/// DATABASE_URL (`postgres://user:pass@host:port/db`) as an Npgsql connection string.
+///
+/// One pool for the process, MULTIPLEXED: a request borrows no physical connection for its
+/// lifetime, its statements are queued and written to whichever connection is free, so a few
+/// connections carry thousands of concurrent requests without a pool wait. Statements are
+/// auto-prepared (server-side plans are cached per connection; rule 5 allows that).
+let connectionString (url: string) (poolSize: int) : string =
+    let uri = Uri url
+    let user, password =
+        match uri.UserInfo.Split(':', 2) with
+        | [| u; p |] -> Uri.UnescapeDataString u, Uri.UnescapeDataString p
+        | [| u |] -> Uri.UnescapeDataString u, ""
+        | _ -> "", ""
+    let b = NpgsqlConnectionStringBuilder()
+    b.Host <- uri.Host
+    b.Port <- (if uri.Port > 0 then uri.Port else 5432)
+    b.Username <- user
+    if password <> "" then b.Password <- password
+    b.Database <- Uri.UnescapeDataString(uri.AbsolutePath.TrimStart '/')
+    b.SslMode <- SslMode.Disable
+    b.Pooling <- true
+    b.MaxPoolSize <- poolSize
+    b.MinPoolSize <- 0
+    b.Multiplexing <- true
+    b.NoResetOnClose <- true
+    b.Enlist <- false
+    b.MaxAutoPrepare <- 64
+    b.AutoPrepareMinUsages <- 2
+    b.ApplicationName <- "conduit-fsharp"
+    b.ConnectionString
+
+let dataSource (connectionString: string) : NpgsqlDataSource = NpgsqlDataSource.Create connectionString
+
+/// SQLSTATE 23505, wherever the driver put it in the exception chain.
+let rec isUniqueViolation (e: exn) : bool =
+    match e with
+    | :? PostgresException as p -> p.SqlState = PostgresErrorCodes.UniqueViolation
+    | :? AggregateException as a -> a.InnerExceptions |> Seq.exists isUniqueViolation
+    | null -> false
+    | e -> isUniqueViolation e.InnerException
