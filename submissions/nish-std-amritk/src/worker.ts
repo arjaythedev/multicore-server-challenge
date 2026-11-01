@@ -555,6 +555,8 @@ export class WorkerConfig {
   idleTimeoutMs: i32 = 75000
   /** Whether each answered connection goes back to delayed ACKs (`ConduitWorker.ackDelay`). */
   ackDelay: boolean = true
+  /** How many count runs the read service runs at once. */
+  countLanes: i32 = 2
   /** Bytes of the read service's answers a worker sends a millisecond (`ConduitWorker.takeAnswers`). */
   answerPace: i32 = 262144
   /** 0: no gzip; 1: gzip a body when that sends fewer TCP segments; 2: whenever it saves anything. */

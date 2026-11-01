@@ -209,6 +209,7 @@ export const main = (): i32 => {
     }
     cfg.readConns = envInt("READ_SERVICE_CONNS", 12)
     cfg.readPlans = envInt("READ_SERVICE_PLANS", 20)
+    cfg.countLanes = envInt("READ_COUNT_LANES", 2)
     console.log(`conduit: the read service holds ${cfg.readPlans} plans on ${cfg.readConns} connections`)
     return new ReadService(cfg, links).run()
   }

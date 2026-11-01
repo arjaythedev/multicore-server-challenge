@@ -69,11 +69,21 @@ export class ReadService {
   links: ReadLink[]
   plans: ReadPlan[]
   state: i32[]
-  /** Per ticket: the plan whose group it is, `plans.length` for the count run, or -1. */
+  /** Per ticket: the plan whose group it is, `plans.length` for a count run not yet bound, past that a count run by place, or -1. */
   ticketPlan: i32[]
+  /**
+   * The count lanes: one run taking plans, up to `lanes` running, each on a
+   * connection of its own, and whether a connection has been asked for. One
+   * lane is enough while plans are small; with every read of the box in one
+   * queue, a lane's run took 45 ms and a plan waited 80 ms for it, half of
+   * all a read took.
+   */
   countRuns: CountRun[]
+  countBusy: boolean[]
   countOpen: i32 = 0
-  countBusy: boolean = false
+  lanes: i32
+  running: i32 = 0
+  asked: boolean = false
   /** The plan taking reads, or -1, and when its first came. */
   open: i32 = -1
   openedAt: i64 = 0
@@ -113,7 +123,13 @@ export class ReadService {
     for (let k: i32 = 0; k < SERVICE_TICKETS; k++) {
       this.ticketPlan[k] = -1
     }
-    this.countRuns = [new CountRun(), new CountRun()]
+    this.lanes = cfg.countLanes > 0 ? cfg.countLanes : 1
+    this.countRuns = []
+    this.countBusy = []
+    for (let k: i32 = 0; k <= this.lanes; k++) {
+      this.countRuns.push(new CountRun())
+      this.countBusy.push(false)
+    }
     this.planMin = cfg.planMin
     this.planWait = toI64(cfg.planWaitUs) * 1000
     this.rec = new Array<u8>(READ_HEAD + 2048)
@@ -251,11 +267,11 @@ export class ReadService {
         this.state[p] = S_A
       }
     }
-    if (!this.countBusy && this.countRuns[this.countOpen].plans.length > 0) {
+    if (!this.asked && this.running < this.lanes && this.countRuns[this.countOpen].plans.length > 0) {
       const ticket: i32 = this.pool.request()
       if (ticket !== PG_POOL_FULL) {
         this.ticketPlan[ticket % SERVICE_TICKETS] = toI32(this.plans.length)
-        this.countBusy = true
+        this.asked = true
       }
     }
     let s: i32 = this.pool.dispatch()
@@ -304,9 +320,18 @@ export class ReadService {
   bindGroup(conn: PgConnection, at: i32): void {
     const pi: i32 = this.ticketPlan[at]
     if (pi === toI32(this.plans.length)) {
-      // The count run: it takes every plan waiting now, and the next plans open the other.
-      const run: CountRun = this.countRuns[this.countOpen]
-      this.countOpen = 1 - this.countOpen
+      // A count run: it takes every plan waiting now, and the next plans open a free one.
+      const place: i32 = this.countOpen
+      const run: CountRun = this.countRuns[place]
+      this.countBusy[place] = true
+      this.running += 1
+      this.asked = false
+      this.ticketPlan[at] = pi + 1 + place
+      for (let k: i32 = 0; k < toI32(this.countBusy.length); k++) {
+        if (!this.countBusy[k]) {
+          this.countOpen = k
+        }
+      }
       const counted: boolean = run.bind(conn)
       if (!counted) {
         conn.bindCancel()
@@ -314,7 +339,7 @@ export class ReadService {
       run.failed = !counted
       if (!this.pool.send()) {
         this.ticketPlan[at] = -1
-        this.countsDone(true, false)
+        this.countsDone(place, true, false)
       }
       return
     }
@@ -365,9 +390,10 @@ export class ReadService {
     return true
   }
 
-  countsDone(failed: boolean, lost: boolean): void {
-    const run: CountRun = this.countRuns[1 - this.countOpen]
-    this.countBusy = false
+  countsDone(place: i32, failed: boolean, lost: boolean): void {
+    const run: CountRun = this.countRuns[place]
+    this.countBusy[place] = false
+    this.running -= 1
     for (const p of run.plans) {
       if (lost) {
         this.finish(p, true)
@@ -506,12 +532,17 @@ export class ReadService {
 
   planEvent(at: i32, conn: PgConnection, event: i32): void {
     const p: i32 = this.ticketPlan[at]
-    if (p === toI32(this.plans.length)) {
-      if (event === PG_LOST || event === PG_GROUP_DONE) {
+    if (p >= toI32(this.plans.length)) {
+      const place: i32 = p - toI32(this.plans.length) - 1
+      if (place < 0) {
+        // Lost before it was bound.
         this.ticketPlan[at] = -1
-        this.countsDone(event === PG_LOST || conn.groupFailed, event === PG_LOST)
+        this.asked = false
+      } else if (event === PG_LOST || event === PG_GROUP_DONE) {
+        this.ticketPlan[at] = -1
+        this.countsDone(place, event === PG_LOST || conn.groupFailed, event === PG_LOST)
       } else {
-        this.countRuns[1 - this.countOpen].event(conn, event)
+        this.countRuns[place].event(conn, event)
       }
       return
     }
