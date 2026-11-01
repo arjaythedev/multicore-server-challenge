@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-DEX_VERSION="${DEX_VERSION:-v0.9.27}"
+DEX_VERSION="${DEX_VERSION:-v0.9.28}"
 
 if [ -n "${DEX_BIN:-}" ]; then
   DEX="$DEX_BIN"
