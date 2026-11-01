@@ -59,8 +59,10 @@ against the Servlet API: standard `HttpServlet`s, in async mode, on a container 
   None of it runs unless called. Not provided: sessions, login, multipart, request dispatching to other paths,
   protocol upgrade and trailers; those throw or answer as the spec says for a container without them. The async
   timeout is stored but not enforced, and a response is sent whole on completion (`flushBuffer` cannot commit early).
-- **Backpressure.** At most `MAX_INFLIGHT_PER_LOOP` (1024) requests in flight per loop; past that a loop stops reading
-  new requests until one completes, so overload raises latency instead of memory.
+- **Backpressure.** At most `MAX_INFLIGHT_PER_LOOP` (2048) requests in flight per loop; past that a loop stops reading
+  new requests until one completes, so overload raises latency instead of memory. A request holds its slot through
+  every read round, gather waits included, so the cap is also a throughput limit (slots / time held): at 1024 a 20 ms
+  gather capped Hetzner at 31.5k req/s with the box at 72%; at 4096 an overloaded run filled the 2 GB heap.
 
 ## Postgres work per request
 
@@ -72,7 +74,7 @@ against the Servlet API: standard `HttpServlet`s, in async mode, on a container 
   statements, whose array parameters make each custom plan look different, on almost every execution (~0.3 ms each).
 - **Reads are batched across requests.** A single dispatcher thread owns all read connections (8) and the write
   connection (1). Each read connection has one round in flight; reads that arrive meanwhile wait (and wait up to
-  `READ_GATHER_US` = 5 ms for company), then go out together: requests of a kind become **one** statement over arrays
+  `READ_GATHER_US` = 20 ms for company, up to `READ_ROUND_MAX` = 4096 per round), then go out together: requests of a kind become **one** statement over arrays
   of their parameters (`unnest(...) WITH ORDINALITY` + `LATERAL`), each row tagged with its request. Within a
   statement, each distinct article is decorated (tags, favorites count, author) **once**, however many requests in
   the batch show it; only `favorited` / `following` are per viewer. Nothing outlives the statement (rule 5).
@@ -133,6 +135,29 @@ previous build is out of CPU and queueing, while this one still has ~9% of the b
 Past ~130k users these two load boxes fall behind themselves, so the rig cannot find this build's limit. Local
 `pg_stat_statements` (same load, total execution time): 78 s -> 55 s.
 
+### bcrypt kernels and longer read gathers (2026-11-01)
+
+Same rig and script, three load boxes (two cpx42, one ccx23), 60 s warm-up, 120 s measured. This target ran faster than
+the one above (base at 120k: 78% of the box, not 90.7%), so compare within this table only. "lanes" is the generated
+bcrypt kernels on the old defaults; "+ gather" adds `READ_GATHER_US` 20000, `READ_ROUND_MAX` 4096 and
+`MAX_INFLIGHT_PER_LOOP` 2048 (now the defaults).
+
+| Users | Build | req/s | p95 | p99 | Box CPU (app / Postgres) |
+|--:|---|--:|--:|--:|---|
+| 120,000 | previous | 31,543-31,604 | 53 ms | 67 ms | 78.1-78.6% (33.3-33.8% / 41.9%) |
+| 120,000 | lanes | 31,521-31,542 | 51-53 ms | 63-65 ms | 77.1-77.4% (32.2-32.4% / 42.0-42.2%) |
+| 140,000 | previous | 36,550 | 124 ms | 191 ms | 94.0% (41.8% / 50.2%) |
+| 140,000 | lanes | 36,636-36,673 | 92-95 ms | 126-137 ms | 91.6-92.0% (39.2-39.4% / 50.1-50.2%) |
+| 140,000 | + gather | 36,127 | 200 ms | 249 ms | 84.4% (39.8% / 41.4%) |
+| 150,000 | lanes | 37,956 | 498 ms | 593 ms | 97.9% (44.0% / 52.0%) — at the p95 limit |
+| 150,000 | + gather | 38,447 | 254 ms | 326 ms | 90.6% (43.2% / 44.4%) |
+| 160,000 | lanes | 37,313 | 786 ms | 1,090 ms | 99.1% (46.6% / 50.7%) — fail |
+| 160,000 | + gather | 40,072 | 557 ms | 790 ms | 94.1% (45.2% / 46.0%) — fail (p95) |
+
+The 20 ms gather takes ~16% off Postgres for a little more app CPU and ~100 ms more p50. With the old in-flight cap
+(1024 per loop) the same gather collapsed at 140k: 31.2k req/s, p99 6.6 s, box only 72% (40 ms gathers: 21.5k).
+At 160k the + gather run misses on latency with 6% of the box still free.
+
 ### Earlier search (before this branch)
 
 On Hetzner **ccx33** (8 dedicated AMD EPYC-Milan vCPU, Postgres 18; configured by `box/pg-conf.sh` as for 16 GB),
@@ -174,8 +199,8 @@ so compare with the leaderboard loosely.
 
 ## Tuning knobs (all optional; defaults are what was measured)
 
-`LOOPS`, `READ_CONNS` (8), `WRITE_CONNS` (1), `READ_GATHER_US` (5000), `READ_ROUND_MAX` (512), `WRITE_GROUP_MAX` (256),
-`COALESCE` (1), `MAX_INFLIGHT_PER_LOOP` (1024), `BCRYPT_THREADS` (4), `BCRYPT_LANES` (0 = timed at startup, 1-6), `BCRYPT_GATHER_MS` (400),
+`LOOPS`, `READ_CONNS` (8), `WRITE_CONNS` (1), `READ_GATHER_US` (20000), `READ_ROUND_MAX` (4096), `WRITE_GROUP_MAX` (256),
+`COALESCE` (1), `MAX_INFLIGHT_PER_LOOP` (2048), `BCRYPT_THREADS` (4), `BCRYPT_LANES` (0 = timed at startup, 1-6), `BCRYPT_GATHER_MS` (400),
 `BCRYPT_NICE` (5), `JAVA_OPTS`.
 
 `dev/` holds the local Linux box (`Dockerfile`, `conformance.sh`, `load.sh`, `alloc.sh`) and the Hetzner scripts

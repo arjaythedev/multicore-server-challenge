@@ -37,8 +37,9 @@ public final class PgDispatcher implements AutoCloseable {
         // there are fewer fsyncs per write (Hetzner, 80k users: about -1.5% box CPU and a lower p99 than 4)
         int nw = env("WRITE_CONNS", 1);
         writeGroupMax = env("WRITE_GROUP_MAX", 256);
-        readRoundMax = env("READ_ROUND_MAX", 512);
-        gatherUs = env("READ_GATHER_US", 5000);
+        readRoundMax = env("READ_ROUND_MAX", 4096);
+        // Hetzner 150k: 20 ms gathers cut Postgres CPU 52 -> 44% of the box (box 97.9 -> 90.6%), p95 498 -> 254 ms
+        gatherUs = env("READ_GATHER_US", 20000);
         coalesce = env("COALESCE", 1) != 0;
         if (readRoundMax < 1 || gatherUs < 0) {
             throw new IllegalArgumentException("invalid read round configuration");

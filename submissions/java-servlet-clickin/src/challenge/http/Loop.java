@@ -23,7 +23,9 @@ import challenge.servlet.Response;
  */
 public final class Loop implements Runnable {
     private static final int MAX_REQUEST = 16 * 1024 * 1024;
-    private final int maxInflight = positiveEnv("MAX_INFLIGHT_PER_LOOP", 1024);
+    // a request holds its slot through every read round, gather waits included: at 1024 x 4 loops a 20 ms gather
+    // capped Hetzner at 31.5k req/s with the box at 72%; 4096 ran the 2 GB heap out of memory when overloaded
+    private final int maxInflight = positiveEnv("MAX_INFLIGHT_PER_LOOP", 2048);
     private int inflight;
     private final Pending pending = new Pending();
     private Conn serving;
