@@ -1,7 +1,7 @@
 plugins {
     java
     application
-    id("org.ethelred.kiwiproc") version "1.0"
+    id("org.ethelred.kiwiproc") version "1.1"
     id("com.diffplug.spotless") version "8.10.4"
 }
 

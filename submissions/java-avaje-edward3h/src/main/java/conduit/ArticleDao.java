@@ -9,7 +9,7 @@ import org.ethelred.kiwiproc.api.TransactionalDAO;
 import org.jspecify.annotations.Nullable;
 
 /** Articles, the feed, tags on articles, and favorites. */
-@DAO
+@DAO(autoCommit = true)
 public interface ArticleDao extends TransactionalDAO<ArticleDao> {
 
     record ArticleRow(
@@ -47,9 +47,9 @@ public interface ArticleDao extends TransactionalDAO<ArticleDao> {
 
     // ---- shared fragments (:viewer = viewer) ----
     //
-    // Every article query first picks the ids it will return (the "page" CTE, the same rows and order as the
-    // reference SQL's ORDER_PAGE), then joins one aggregate of those articles' tags. That replaces a correlated
-    // tag subquery per article, which was the most expensive part of a list in Postgres.
+    // The single-article queries first pick the id they will return (the "page" CTE), then join one aggregate of
+    // that article's tags. That replaces a correlated tag subquery per article, which was the most expensive part
+    // of a list in Postgres.
     //
     // The CTE is referenced twice (here and in the final join), so Postgres 18 materialises it anyway: EXPLAIN
     // gives the same plan with and without MATERIALIZED. The keyword only makes that intent explicit.
@@ -59,19 +59,6 @@ public interface ArticleDao extends TransactionalDAO<ArticleDao> {
                        FROM article_tags at JOIN tags t ON t.id = at.tag_id
                       WHERE at.article_id IN (SELECT id FROM page) GROUP BY at.article_id)
             """;
-
-    String LIST_SELECT = """
-            SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at,
-                   coalesce(tg.names, ARRAY[]::text[]) AS tag_list,
-                   (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
-                   EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = :viewer) AS favorited,
-                   u.username, u.bio, u.image,
-                   EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = :viewer AND fo.followee_id = a.author_id) AS following
-              FROM articles a
-              JOIN page ON page.id = a.id
-              JOIN users u ON u.id = a.author_id
-              LEFT JOIN tg ON tg.article_id = a.id
-             ORDER BY a.id DESC""";
 
     String FULL_SELECT = """
             SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at,
@@ -86,49 +73,73 @@ public interface ArticleDao extends TransactionalDAO<ArticleDao> {
               LEFT JOIN tg ON tg.article_id = a.id""";
 
     // ---- lists ----
+    //
+    // A list is two statements: one of the "ids" queries picks the page of article ids (the same rows and order as
+    // the reference SQL's ORDER_PAGE), then "rows" reads those articles. They are separate because of planning:
+    // with LIMIT and OFFSET as parameters, Postgres plans a page query with the real values every time, since a
+    // generic plan has to assume 10% of the table and costs far more. So a page query that also joins tags,
+    // favorites and users was planned on every call, at about three times its execution time. The ids queries are
+    // trivial to plan, and "rows" takes the ids as an array, which does not inflate the estimate, so its generic
+    // plan is cached after the first few calls.
 
-    @SqlQuery("WITH page AS MATERIALIZED (SELECT a.id FROM articles a ORDER BY a.id DESC LIMIT :limit OFFSET :offset)"
-            + TAGS + LIST_SELECT)
-    List<ArticleRow> listAll(long viewer, long limit, long offset);
+    @SqlQuery("SELECT a.id FROM articles a ORDER BY a.id DESC LIMIT :limit OFFSET :offset")
+    List<Long> idsAll(long limit, long offset);
+
+    @SqlQuery("""
+            SELECT at.article_id FROM article_tags at
+             WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = :tag)
+             ORDER BY at.article_id DESC LIMIT :limit OFFSET :offset""")
+    List<Long> idsByTag(long limit, long offset, String tag);
+
+    @SqlQuery("""
+            SELECT a.id FROM articles a
+             WHERE a.author_id = (SELECT au.id FROM users au WHERE au.username = :author)
+             ORDER BY a.id DESC LIMIT :limit OFFSET :offset""")
+    List<Long> idsByAuthor(long limit, long offset, String author);
+
+    @SqlQuery("""
+            SELECT f.article_id FROM favorites f
+             WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = :favoritedBy)
+             ORDER BY f.article_id DESC LIMIT :limit OFFSET :offset""")
+    List<Long> idsFavorited(long limit, long offset, String favoritedBy);
+
+    @SqlQuery("""
+            SELECT x.id FROM follows fo CROSS JOIN LATERAL
+                (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT (CAST(:limit AS int) + CAST(:offset AS int))) x
+              WHERE fo.follower_id = :viewer ORDER BY x.id DESC LIMIT :limit OFFSET :offset""")
+    List<Long> idsFeed(long viewer, long limit, long offset);
+
+    @SqlQuery("""
+            WITH tg AS (SELECT at.article_id, array_agg(t.name ORDER BY t.name) AS names
+                          FROM article_tags at JOIN tags t ON t.id = at.tag_id
+                         WHERE at.article_id = ANY(CAST(:ids AS bigint[])) GROUP BY at.article_id)
+            SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at,
+                   coalesce(tg.names, ARRAY[]::text[]) AS tag_list,
+                   (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
+                   EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = :viewer) AS favorited,
+                   u.username, u.bio, u.image,
+                   EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = :viewer AND fo.followee_id = a.author_id) AS following
+              FROM articles a
+              JOIN users u ON u.id = a.author_id
+              LEFT JOIN tg ON tg.article_id = a.id
+             WHERE a.id = ANY(CAST(:ids AS bigint[]))
+             ORDER BY a.id DESC""")
+    List<ArticleRow> rows(long viewer, List<Long> ids);
 
     @SqlQuery("SELECT count(*) FROM (SELECT 1 FROM articles a LIMIT 1000) s")
     long countAll();
-
-    @SqlQuery("""
-            WITH page AS MATERIALIZED (SELECT at.article_id AS id FROM article_tags at
-                                        WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = :tag)
-                                        ORDER BY at.article_id DESC LIMIT :limit OFFSET :offset)""" + TAGS + LIST_SELECT)
-    List<ArticleRow> listByTag(long viewer, long limit, long offset, String tag);
 
     @SqlQuery("""
             SELECT count(*) FROM (SELECT 1 FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = :tag) LIMIT 1000) s""")
     long countByTag(String tag);
 
     @SqlQuery("""
-            WITH page AS MATERIALIZED (SELECT a.id FROM articles a
-                                        WHERE a.author_id = (SELECT au.id FROM users au WHERE au.username = :author)
-                                        ORDER BY a.id DESC LIMIT :limit OFFSET :offset)""" + TAGS + LIST_SELECT)
-    List<ArticleRow> listByAuthor(long viewer, long limit, long offset, String author);
-
-    @SqlQuery("""
             SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = (SELECT u.id FROM users u WHERE u.username = :author) LIMIT 1000) s""")
     long countByAuthor(String author);
 
     @SqlQuery("""
-            WITH page AS MATERIALIZED (SELECT f.article_id AS id FROM favorites f
-                                        WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = :favoritedBy)
-                                        ORDER BY f.article_id DESC LIMIT :limit OFFSET :offset)""" + TAGS + LIST_SELECT)
-    List<ArticleRow> listFavorited(long viewer, long limit, long offset, String favoritedBy);
-
-    @SqlQuery("""
             SELECT count(*) FROM (SELECT 1 FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = :favoritedBy) LIMIT 1000) s""")
     long countFavorited(String favoritedBy);
-
-    @SqlQuery("""
-            WITH page AS MATERIALIZED (SELECT x.id FROM follows fo CROSS JOIN LATERAL
-                (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT (CAST(:limit AS int) + CAST(:offset AS int))) x
-              WHERE fo.follower_id = :viewer ORDER BY x.id DESC LIMIT :limit OFFSET :offset)""" + TAGS + LIST_SELECT)
-    List<ArticleRow> feed(long viewer, long limit, long offset);
 
     @SqlQuery("""
             SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = :viewer) LIMIT 1000) s""")
