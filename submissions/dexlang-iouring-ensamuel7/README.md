@@ -4,8 +4,8 @@ Front: direct
 
 | | |
 |---|---|
-| **Language** | [DexLang](https://github.com/ensamuel7/dex) `v0.9.27`: statically typed, compiles to C, which `cc` builds into a native binary |
-| **Framework** | None. DexLang's own `http`, `db`, `json` and `crypto` standard library modules |
+| **Language** | [DexLang](https://github.com/ensamuel7/dex) `v0.9.29`: statically typed, compiles to C, which `cc` builds into a native binary |
+| **Framework** | None. DexLang's own `http`, `db`, `json` and `crypto` standard library modules, and [dexqu](https://github.com/ensamuel7/dex-modules/tree/main/dexqu) `v0.2.0`, a SQL query builder written in Dex, for the SQL |
 | **Server** | The `http` module's io_uring backend (`http.uring()`), one event loop per process, `http.fork(n)` processes sharing port 80 through `SO_REUSEPORT` |
 | **Postgres driver** | libpq (Ubuntu's `libpq-dev`), through the `db` module: prepared statements, one connection per process |
 | **Password hashing** | bcrypt cost 10 through libxcrypt (`crypto.bcryptHash` / `crypto.bcryptVerify`) |
@@ -14,23 +14,32 @@ Front: direct
 
 What runs is one native binary: no interpreter, no garbage collector, no
 framework. The program is `server.dx` (handlers, auth, JSON) and `queries.dx`
-(the SQL), and everything below it is the language's standard library.
+(the SQL, built with dexqu once at startup), and everything below it is the
+language's standard library.
 
 ## How it serves
 
-**Processes, not threads.** `start.sh` runs 48 workers (`WORKERS`). Before
-opening anything, the server calls `http.fork(48)`; each copy then opens its own
-Postgres connection, prepares its statements and listens on port 80 with
-`SO_REUSEPORT`, so the kernel spreads connections across them. A worker owns
-its sockets, its connection and its statements outright: there is no lock, no
-pool and no handoff anywhere on a request's path. 48 connections stay well
-under the 95 allowed.
+**Processes, not threads.** `start.sh` runs two workers per core (`WORKERS`, 16
+on the 8-core box). Before opening anything, the server calls `http.fork(16)`;
+each copy then opens its own Postgres connection, prepares its statements and
+listens on port 80 with `SO_REUSEPORT`, so the kernel spreads connections across
+them. A worker owns its sockets, its connection and its statements outright:
+there is no lock, no pool and no handoff anywhere on a request's path. 16
+connections stay well under the 95 allowed.
 
-**A worker waits on Postgres in its own time.** Each handler runs its
-statements on the worker's connection and blocks until the answer comes back.
-With 48 workers on 8 cores there are always others ready to run, so the cores
-stay busy with Postgres's work, which is the expensive part of every request
-here. A bcrypt login (about 60 ms of CPU) holds only its own worker.
+**Reads are answered in batches.** A read handler (`/api/tags`, `/api/user`, a
+profile, an article, its comments, and every list and feed) checks its input,
+takes a ticket with `http.hold()` and queues what it needs. A worker's batch
+stays open for 80 ms from its first request (`http.batchWindow(80)`, `BATCH_MS`),
+then the `http.afterBatch` hook runs one statement per kind of read for the
+whole batch, with the requests as arrays (`unnest($1::int4[], $2::int8[], ...)`),
+and answers each ticket with `http.reply()`. Every request still gets its own
+rows from that statement, read while it is being served: nothing is kept after
+the batch.
+
+**Writes and logins answer at once.** Writes run on the worker's connection as
+they arrive, each committed before its response. A bcrypt login (about 60 ms of
+CPU) holds only its own worker.
 
 **io_uring with direct descriptors**: accepts, receives and sends are queued on
 a ring and submitted together, receives use a kernel buffer ring, and an idle
@@ -38,29 +47,35 @@ keep-alive connection holds no read buffer. The idle timeout is 75 s.
 
 ## The SQL
 
-The responses are exactly the reference SQL's. Each rewrite of a list or
+The responses are exactly the reference SQL's. Every statement is built with
+dexqu when the server starts, then prepared once. A read is built once from its
+arguments as expressions: the per-request form gets named parameters
+(`q.param("viewer")`), and the batched form gets the request's row from
+`unnest` (`q.col("r.v")`), so a batch runs the same query for each request.
+Fixed limits stay literal SQL (`q.raw("1000")`) so they don't become parameters
+the planner has to guess at. The dexqu port returned the same rows as the
+hand-written SQL it replaced in 760 random comparisons. Each rewrite of a list or
 article query was run against the reference statement over the same 300 random
-parameter sets on the full seed, and the outputs compared byte for byte.
+parameter sets on the full seed and compared byte for byte, and the shared list
+statements against the per-request ones over 300 random batches.
 
+- **A list batch shares what its requests share.** One statement per list kind
+  counts each distinct filter once, cuts each distinct page once, and decorates
+  each distinct article once (tags, favorite count, author). Only the
+  `favorited` and `following` flags are per request.
 - **Pick the page first, then decorate it.** The reference list query computes
-  tags, favorite counts and both `EXISTS` for every row `OFFSET` skips, so page 5
-  builds 50 rows to return 10. Each list here selects the page's ids first, from
-  the index that orders it (`articles_pkey`, `articles_author_idx`,
-  `article_tags_tag_idx`, `favorites_pkey`, or the feed's lateral walk), and
-  decorates only those rows: 33% less time for the global list, 15–20% for the
-  others.
+  tags, favorite counts and both `EXISTS` for every row `OFFSET` skips. Each
+  list here selects the page's ids first, from the index that orders it, and
+  decorates only those rows.
 - **Tags by key.** `ARRAY(SELECT (SELECT name FROM tags WHERE id = at.tag_id) …
-  ORDER BY 1)` looks each tag up through `tags_pkey`, where the reference join
-  hashed all 200 tags once per article.
-- **One statement per list.** The capped `articlesCount` is joined onto the page
-  (`count LEFT JOIN LATERAL page`), so a list is one round trip instead of two.
+  ORDER BY 1)` looks each tag up through `tags_pkey`.
 - **One statement for comments.** The article lookup and its newest 100
   comments are one `LEFT JOIN LATERAL`: no row means 404, a row without a
   comment means an empty list.
-- **No TLS to a database on the same box.** The connection adds
-  `sslmode=disable` (libpq otherwise negotiates TLS even over `127.0.0.1`), and
-  `TimeZone=UTC`, `DateStyle=ISO` as connection options, so timestamps come back
-  in a fixed text form that is cut to milliseconds without parsing.
+- **Session settings only.** The connection adds `sslmode=disable`, and sets
+  `TimeZone=UTC`, `DateStyle=ISO` and `jit=off` for its own session. A batched
+  statement's estimated cost is high enough that Postgres would otherwise
+  JIT-compile every execution, about 300 ms of compiling for 10 ms of work.
 
 Article creation runs in one transaction (`BEGIN`, insert, tags, article tags,
 `COMMIT`, rolled back on any failure). Unique violations (SQLSTATE 23505) are
@@ -77,18 +92,32 @@ must be a positive integer. New tokens carry `sub`, `iat` and `exp` (30 days).
 
 Full seed, a 4-vCPU Synteq VPS (Xeon Platinum 8260) running both the server and
 Postgres 18 configured by `box/pg-conf.sh`, the challenge's `loadgen` on two
-other boxes, 60 s ramp and 60 s measured:
+other boxes, 60 s ramp and 60 s measured, 8 workers:
 
-| users | req/s | p95 | p99 | errors | |
-|--:|--:|--:|--:|--:|---|
-| 27,000 | 6,926 | 341 ms | 497 ms | 0% | pass |
-| 30,000 | 6,899 | 1,143 ms | 1,402 ms | 0% | fail |
+| version | users | req/s | p95 | p99 | errors | box CPU | |
+|---|--:|--:|--:|--:|--:|--:|---|
+| one statement per request | 27,000 | 6,926 | 341 ms | 497 ms | 0% | 100% | pass |
+| one statement per request | 30,000 | 6,899 | 1,143 ms | 1,402 ms | 0% | 100% | fail |
+| batched | 42,000 | 10,714 | 283 ms | 427 ms | 0% | 88% | pass |
 
-Postgres uses about two thirds of the box's CPU and is what runs out. On the
-8-core box that extrapolates to roughly 55,000 users.
+At 42,000 users Postgres uses 52% of the box and the server 34%, about half of
+that bcrypt. Past about 45,000 users the two load boxes ran out of CPU, so the
+4-vCPU ceiling was not reached. The CPU per request is 1.75 times lower than
+one statement per request. The one-statement version scored 34,000 users on the
+benchmark box (#157), so this one should land somewhere near 60,000. That is an
+estimate, not a measurement.
 
 ## What the language gained from this challenge
 
+- dexqu (v0.2.0): `LATERAL` joins, `MATERIALIZED` CTEs, column-list aliases
+  such as `unnest(...) AS r(i, v)`, `ARRAY(SELECT ...)`, array casts,
+  `returningExpr` on INSERT, and `Query.slots(name)` to bind a prepared
+  statement by parameter name.
+
+- `http.hold()` and `http.reply()`: a handler takes a ticket for its request,
+  and the batch hook answers it, so one query serves a whole batch.
+- `http.batchWindow(ms)`: under io_uring, a batch gathers requests across
+  passes of the loop until its first request is `ms` old.
 - `http.fork(n)`: split a program into `n` processes sharing one listening port,
   so each opens its own database connection before `listen`.
 - `db.bindNull`, `db.isNull` (to tell `NULL` from `""` for `bio` and `image`),
@@ -104,11 +133,13 @@ Postgres uses about two thirds of the box's CPU and is what runs out. On the
 
 ```
 server.dx    routes, handlers, auth, JSON
-queries.dx   the SQL
-dex.mod      module file: dex 0.9.27
+queries.dx   the SQL, built with dexqu
+dex.mod      module file: dex 0.9.29, requires dexqu v0.2.0
+dex.sum      dexqu's checksum
 install.sh   root, once: build-essential, pkg-config, libpq-dev, libcrypt-dev,
              libssl-dev, libcurl, libsqlite3-dev, and Go 1.27.2 (sha256-checked)
-build.sh     builds the dex compiler from the pinned v0.9.27 tag through the Go
-             module proxy (checksum-verified), then compiles server.dx
-start.sh     raises the open-file limit and runs 48 workers
+build.sh     builds the dex compiler from the pinned v0.9.29 tag through the Go
+             module proxy (checksum-verified), downloads dexqu (checked
+             against dex.sum), then compiles server.dx
+start.sh     raises the open-file limit and runs two workers per core
 ```
