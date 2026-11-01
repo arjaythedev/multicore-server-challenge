@@ -118,6 +118,10 @@ After each response the server turns `TCP_QUICKACK` off on that socket, as an io
 The next ACK rides on the response: 27% fewer pure ACKs, 12% less load on the network core. A response sent within
 15 ms of its request skips the command, since the kernel already holds the ACK back after a reply that quick.
 
+This build turns it off by default (`CONDUIT_FLAGS=ackdelay=off` in start.sh). At 200k users most replies miss the
+delayed-ACK window anyway, and in paired 5-minute holds at 200k the build ran 33-36 ms lower at p95 without it.
+`CONDUIT_FLAGS=ackdelay=on` turns it back on.
+
 ## 5. Fewer packets: gzip only when it saves a packet
 
 A client ACKs every second segment, so every segment we save is an ACK we don't receive.
