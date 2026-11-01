@@ -72,7 +72,9 @@ extension App {
 
     // DELETE /api/articles/:slug
     func deleteArticle(viewer: Int64, slug: String) async throws -> WriteOutcome {
-        try await writes.run(.deleteArticle(viewer: viewer, slug: slug))
+        // Only the author deletes, so the viewer may drop below 1,000 articles: feeds count theirs from now on.
+        reads.prolificAuthors.remove(viewer)
+        return try await writes.run(.deleteArticle(viewer: viewer, slug: slug))
     }
 
     // POST and DELETE /api/articles/:slug/favorite

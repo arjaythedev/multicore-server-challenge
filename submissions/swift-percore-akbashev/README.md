@@ -91,9 +91,12 @@ All dependencies are pinned exactly in `Package.swift` (plus `Package.resolved`)
   Identical reads share a row, every article in the batch is enriched once however many reads show it, and each
   table is read once for the whole set (`= ANY` over the ids: articles, tag ids, one grouped favorites count, each
   author once), so recent articles shown together share index pages. A comment thread comes with its authors' ids,
-  and the batch's distinct comment authors are read once. A feed's count stops at the 1,000th article over all of
-  its viewer's followees, and its page is merged in Postgres from the followees' newest articles, so only the page
-  comes back. The viewer-dependent flags are one lookup per (viewer, article or author) pair. The batch's integer
+  and the batch's distinct comment authors are read once. A feed's page is merged in Postgres from the followees'
+  newest articles, so only the page comes back, and each followee is read only down to a floor, as
+  `rust-epoll-theCatWisel`'s feed (#154) does: for an author several of the batch's viewers follow, the article as
+  deep as the deepest of their pages. A feed that follows an author of 1,000 or more articles counts 1,000 without
+  counting: those authors are read when the first lane connects, and deleting an article takes its author out for
+  good, so a stale entry can't stand. Any other feed's count stops at the 1,000th article over all its followees. The viewer-dependent flags are one lookup per (viewer, article or author) pair. The batch's integer
   lookups (ids, tag ids, viewer pairs) are an open-addressing table with a multiplicative hash (`Tables.swift`), not
   `Set`/`Dictionary` and their SipHash. Only reads already queued when a batch is taken share it, and nothing
   outlives the batch (rule 5). A login's user (with its stored hash) is read in a batch too. (The tags table is read
@@ -171,8 +174,9 @@ Postgres CPU per request is 10-25% below #147's on the same load.
 Postgres work per request with the benchmark's own load generator (`bench/loadgen`, 12,000 users at a tenth of
 the think time, about 28,000 requests a second) on the full seed (`seed/make-seed.sh`), as buffer pages touched
 (pg_stat_statements; unlike CPU time on a shared machine, it doesn't move with the load around it): 66 at the
-start (batches every 5 ms), 41 now, against 39-42 for `rust-epoll-theCatWisel` (#154) on the same setup. The feed
-count, the set-based article details, the shared comment authors and 30 ms batches each took a part.
+start (batches every 5 ms), 41 with the capped feed count, the set-based article details, the shared comment
+authors and 30 ms batches, and 32-33 now with the feed's floors and its prolific authors, against 39-42 for
+`rust-epoll-theCatWisel` as of #143 on the same setup.
 
 ## Build and run
 
