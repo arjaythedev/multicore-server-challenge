@@ -125,6 +125,16 @@ fn feedWaited() bool {
     return now_ns -| reads[@intFromEnum(s)].head.?.queued_ns >= feed3_qwait_ns;
 }
 
+/// ZIG_SHARED_GAP_BUSY=N ms: the shared lane's gap while the box is busy, 0, the default, never. Busy is at most
+/// `busy_on_idle` of the CPUs this process may run on idle at a reading of /proc/stat (every `feed3_sample_ns`,
+/// hashing counted as busy), and it ends at `busy_off_idle`. Lists, articles, tags and profiles sit far under the
+/// feeds in latency, so a longer gap costs their reads a little wait and gives the shared drains more reads each,
+/// which costs Postgres less per read; the feed and comments lanes keep their gaps.
+pub var shared_gap_busy_ns: u64 = 0;
+const busy_on_idle = 0.05;
+const busy_off_idle = 0.10;
+var busy = false;
+
 /// Lane `l`'s cap on drains in flight now.
 fn cap(l: LaneId) u8 {
     return switch (l) {
@@ -132,6 +142,11 @@ fn cap(l: LaneId) u8 {
         .comments => comments_max_inflight,
         .shared => if (feed3_qwait_ns > 0 and lane(.feed).inflight > feed_max_inflight) max_inflight - 1 else max_inflight,
     };
+}
+
+/// Lane `l`'s gap now.
+fn gapOf(l: LaneId) u64 {
+    return if (l == .shared and busy) shared_gap_busy_ns else lane(l).gap_ns;
 }
 
 /// ZIG_READ_CAP=N: read drains in flight across all lanes at most, each lane still under its own cap; 0, the default,
@@ -160,14 +175,52 @@ fn apart(due: u64) u64 {
     return at;
 }
 
+/// The CPUs this process may run on: the whole box on the official box, the pinned set elsewhere.
+var cpus: ?std.os.linux.cpu_set_t = null;
+
+fn inSet(set: *const std.os.linux.cpu_set_t, i: usize) bool {
+    const bits = @bitSizeOf(usize);
+    return i / bits < set.len and (set[i / bits] >> @intCast(i % bits)) & 1 == 1;
+}
+
+/// The idle and total ticks of the CPUs in `set`, summed from /proc/stat's per-CPU lines; null with none found.
+fn statOf(text: []const u8, set: *const std.os.linux.cpu_set_t) ?shed.Stat {
+    var s: shed.Stat = .{ .idle = 0, .total = 0 };
+    var any = false;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line.len < 4 or !std.mem.startsWith(u8, line, "cpu") or !std.ascii.isDigit(line[3])) continue;
+        var it = std.mem.tokenizeScalar(u8, line, ' ');
+        const i = std.fmt.parseInt(usize, it.next().?[3..], 10) catch continue;
+        if (!inSet(set, i)) continue;
+        // user nice system idle iowait irq softirq steal, as shed.parseStat reads the box's line.
+        for (0..8) |k| {
+            const x = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
+            if (k == 3 or k == 4) s.idle += x;
+            s.total += x;
+        }
+        any = true;
+    }
+    return if (any) s else null;
+}
+
+/// Reads the box's idle share since the last reading and moves the third-slot and busy-gap gates on it.
 fn sampleIdle() void {
     feed3.next_ns = now_ns + feed3_sample_ns;
-    var buf: [256]u8 = undefined;
-    const stat = shed.parseStat(shed.readFile("/proc/stat", &buf) orelse return) orelse return;
+    if (cpus == null) {
+        var set: std.os.linux.cpu_set_t = @splat(0);
+        if (std.os.linux.sched_getaffinity(0, @sizeOf(std.os.linux.cpu_set_t), &set) != 0) @memset(&set, std.math.maxInt(usize));
+        cpus = set;
+    }
+    var buf: [16384]u8 = undefined;
+    const stat = statOf(shed.readFile("/proc/stat", &buf) orelse return, &cpus.?) orelse return;
     if (feed3.stat) |prev| {
-        feed3.open = shed.idleShare(prev, stat, 0) * 100 >= @as(f64, @floatFromInt(feed3_idle));
+        const idle = shed.idleShare(prev, stat, 0);
+        feed3.open = feed3_idle > 0 and idle * 100 >= @as(f64, @floatFromInt(feed3_idle));
+        if (shared_gap_busy_ns > 0) busy = if (busy) idle < busy_off_idle else idle <= busy_on_idle;
         stats_gate.readings += 1;
         stats_gate.open += @intFromBool(feed3.open);
+        stats_gate.busy += @intFromBool(busy);
     }
     feed3.stat = stat;
 }
@@ -225,7 +278,7 @@ const LaneStats = struct {
     near_end: u32 = 0,
 };
 var stats = [_]LaneStats{ .{}, .{}, .{} };
-var stats_gate: struct { readings: u32 = 0, open: u32 = 0 } = .{};
+var stats_gate: struct { readings: u32 = 0, open: u32 = 0, busy: u32 = 0 } = .{};
 /// Each lane's last drain end (monotonic ns), for `near_end`.
 var last_end = [_]u64{ 0, 0, 0 };
 const near_ns = 5 * std.time.ns_per_ms;
@@ -311,14 +364,14 @@ fn logStats() void {
     for (lane_order) |l| {
         const st = &stats[@intFromEnum(l)];
         const drains: u64 = @max(st.drains, 1);
-        sys.log("lane {s} {d} ms: {d} drains, {d} reads ({d} per drain), {d} on a full queue, oldest waited {d} ms max {d} ms mean, {d} ms at the cap, {d} in flight, {d} queued; wait p50 {d} p95 {d} p99 {d} max {d} ms, run p50 {d} p95 {d} max {d} ms, {d} due with no free connection, {d} on the third slot, gate open {d} of {d} readings, {d} ms held by the read cap, {d} started and {d} ended within 5 ms of another lane", .{
+        sys.log("lane {s} {d} ms: {d} drains, {d} reads ({d} per drain), {d} on a full queue, oldest waited {d} ms max {d} ms mean, {d} ms at the cap, {d} in flight, {d} queued; wait p50 {d} p95 {d} p99 {d} max {d} ms, run p50 {d} p95 {d} max {d} ms, {d} due with no free connection, {d} on the third slot, gate open {d} of {d} readings, {d} ms held by the read cap, {d} started and {d} ended within 5 ms of another lane, busy gap {d} of {d} readings", .{
             @tagName(l),                 span_ms,                st.drains,                  st.reads,
             st.reads / drains,           st.full_drains,         st.oldest_max_ns / ms,      st.oldest_sum_ns / drains / ms,
             st.at_cap.take(),            lane(l).inflight,       queuedOn(l),                st.wait.at(500),
             st.wait.at(950),             st.wait.at(990),        st.wait.at(1000),           st.run.at(500),
             st.run.at(950),              st.run.at(1000),        st.starved,                 st.third,
             stats_gate.open,             stats_gate.readings,    st.held.take(),             st.near_start,
-            st.near_end,
+            st.near_end,                 stats_gate.busy,        stats_gate.readings,
         });
         st.* = .{ .at_cap = st.at_cap, .held = st.held };
     }
@@ -607,7 +660,7 @@ fn readsDue(l: LaneId) ?u64 {
     const ln = lane(l);
     if (ln.inflight >= cap(l)) return null;
     if (full(l)) return now_ns;
-    const due = @max(reads[@intFromEnum(s)].head.?.queued_ns + window_ns, ln.last_ns + ln.gap_ns);
+    const due = @max(reads[@intFromEnum(s)].head.?.queued_ns + window_ns, ln.last_ns + gapOf(l));
     return if (l == .shared and lane_sep_ns > 0) apart(due) else due;
 }
 
@@ -827,7 +880,7 @@ fn nextLane() ?LaneId {
 /// ends the wait.
 pub fn pump() ?u64 {
     var next: ?u64 = null;
-    if (feed3_idle > 0 and drain.role != .worker and now_ns >= feed3.next_ns and !builtin.is_test) sampleIdle();
+    if ((feed3_idle > 0 or shared_gap_busy_ns > 0) and drain.role != .worker and now_ns >= feed3.next_ns and !builtin.is_test) sampleIdle();
     for (conns) |*c| {
         if (c.write) {
             if (c.in_len > 0) continue;
@@ -1413,6 +1466,48 @@ test "with ZIG_FEED3_QWAIT the feed lane runs a third drain once its oldest read
     for (&fc) |*c| message(c, 'Z', "I");
     message(&sc[0], 'Z', "I");
     message(&sc[2], 'Z', "I");
+}
+
+test "with ZIG_SHARED_GAP_BUSY the shared lane keeps the busy gap while the box is busy, and the feed lane keeps its own" {
+    clearQueuesForTest();
+    defer clearQueuesForTest();
+    shared_gap_busy_ns = 120 * ms;
+    defer {
+        shared_gap_busy_ns = 0;
+        busy = false;
+    }
+    var c: Conn = .{ .fd = -1, .index = 0, .write = false, .rbuf = &.{} };
+    var a: Query = undefined;
+    var b: Query = undefined;
+    var f: Query = undefined;
+    var f2: Query = undefined;
+    now_ns = 1000 * ms;
+    readAt(&a, .list_all, now_ns - window_ns);
+    c.pushGroup(dueRead().?);
+    message(&c, 'Z', "I");
+    readAt(&f, .list_feed, now_ns - window_ns);
+    c.pushGroup(dueRead().?);
+    message(&c, 'Z', "I");
+    readAt(&b, .list_all, now_ns);
+    readAt(&f2, .list_feed, now_ns);
+    try testing.expectEqual(1000 * ms + gap_ns, readsDue(.shared).?);
+    busy = true;
+    try testing.expectEqual(1000 * ms + shared_gap_busy_ns, readsDue(.shared).?);
+    try testing.expectEqual(1000 * ms + feed_gap_ns, readsDue(.feed).?);
+    try testing.expectEqual(1000 * ms + feed_gap_ns, pump().?);
+    busy = false;
+    try testing.expectEqual(1000 * ms + gap_ns, readsDue(.shared).?);
+}
+
+test "the box reading sums only the CPUs this process may run on" {
+    const text = "cpu  1 1 1 1 1 1 1 1 0 0\ncpu0 10 0 20 70 0 0 0 0 0 0\ncpu1 50 0 40 10 0 0 0 0 0 0\ncpu2 5 0 5 85 5 0 0 0 0 0\nintr 0\n";
+    var set: std.os.linux.cpu_set_t = @splat(0);
+    set[0] = 0b101;
+    const s = statOf(text, &set).?;
+    try testing.expectEqual(160, s.idle);
+    try testing.expectEqual(200, s.total);
+    set[0] = 0b1000;
+    try testing.expectEqual(null, statOf(text, &set));
 }
 
 test "with ZIG_READ_CAP no read drain starts past the cap, and each freed slot goes to the due lane whose oldest read waited longest" {
