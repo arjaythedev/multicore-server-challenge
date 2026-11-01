@@ -151,9 +151,9 @@ All dependencies are pinned exactly in `Package.swift` (plus `Package.resolved`)
   thread pool (a mutex), and the JWT signer. Release builds use `-Ounchecked`, which doesn't evaluate preconditions,
   so nothing with a side effect goes inside one. `build.sh` adds `-enforce-exclusivity=unchecked` for every module,
   on Linux `--static-swift-stdlib`, and `-target-cpu` for the CPU it builds on, which is the box's (rule 11), as the
-  Rust's `target-cpu=native`: Swift has no "native", so the toolchain's clang says which CPU it detects. On x86-64
-  that lets bcrypt extract its bytes with BMI's `bextr`. `start.sh` preloads jemalloc (installed by `install.sh`) in place of glibc
-  malloc.
+  Rust's `target-cpu=native`: Swift has no "native", so the toolchain's clang says which CPU it detects. On AMD
+  (Zen 2 to 4) bcrypt then extracts its bytes with `bextr`; for Intel models LLVM keeps `shr`/`and`/`movzbl`.
+  `start.sh` preloads jemalloc (installed by `install.sh`) in place of glibc malloc.
 - **Scheduling** (Linux): the process switches to `SCHED_BATCH` at startup (no privileges needed; threads inherit it),
   so its constant small wakeups don't preempt busy Postgres backends. `SCHED_BATCH=0` turns it off.
 - **Auth**: `Authorization: Token <jwt>`; the signature is checked (constant-time, with an HMAC keyed once at startup)
