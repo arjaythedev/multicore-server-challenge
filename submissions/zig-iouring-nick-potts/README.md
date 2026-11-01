@@ -57,10 +57,12 @@ A bigger batch shares more work, so each read costs Postgres less. One shared qu
 Postgres CPU than four separate ones, and the rings add only 1-3 µs per request. Feeds, the most expensive read,
 get their own lane so nothing waits behind them. Every 10 s the drain process logs each lane's counters.
 
-Each lane runs at most two drains at once. Late in a run the feed lane sits at that cap most of the time, so once the
-oldest queued feed has waited 120 ms it borrows a third slot from the shared lane. Feed drains get smaller and
-quicker. In paired 200k holds on an aged database, feed p95 fell by about 450 ms and overall p95 by 59 and 128 ms,
-while the other reads waited up to 130 ms longer.
+Each lane has a usual cap of two drains at once (three for the shared lane), and the box runs at most six read
+drains in all. When a connection frees, it goes to the lane whose oldest queued read has waited longest, which may
+then run past its usual cap. On a grown database the shared lane used to sit at its cap most of a hold while
+comments had room; now each slot goes where a read has waited longest, and the six drains are traded between lanes
+rather than added to. In paired 200k holds on a database grown by a full search, p95 fell from 694 and 768 ms to 614
+and 579 ms. The idea is theCatWisel's #154.
 
 ## 2. One SQL statement for every list and article read
 
@@ -216,11 +218,12 @@ aged database.
 - If any process dies, the parent kills the rest, so a crash is never a half-working server.
 
 Ideas borrowed: #47's gather (the drain gap), #7's array-parameter batching, #61's feed count for authors with
-1,000+ articles, #105's hub floor (the early stop for shared followees), and WorriedArrow's #152 for reading comment
-authors once. SCHED_BATCH is common to several entries, and #130 measured it. #130 also counts bcrypt
-instructions per lane-round, as we did for our kernel. Sharing a response within one execution has #31 as precedent
-and follows the form of theCatWisel's #132 and #143. Test vectors: Openwall, Rust `bcrypt`, Go `x/crypto/bcrypt`.
+1,000+ articles, #105's hub floor (the early stop for shared followees), WorriedArrow's #152 for reading comment
+authors once, and theCatWisel's #154 for giving a freed read connection to the oldest waiting read. SCHED_BATCH is
+common to several entries, and #130 measured it. #130 also counts bcrypt instructions per lane-round, as we did for
+our kernel. Sharing a response within one execution has #31 as precedent and follows the form of theCatWisel's #132
+and #143. Test vectors: Openwall, Rust `bcrypt`, Go `x/crypto/bcrypt`.
 
-Ours: the single read queue across workers and the feed lane's borrowed third slot, MEGA and its three trims, the
-comments follows lookup scoped to the thread's authors, gzip only when it saves a segment and its encoder, ACK delay
-as a ring command, the ring bookkeeping set, and the SHRX bcrypt kernel.
+Ours: the single read queue across workers, MEGA and its three trims, the comments follows lookup scoped to the
+thread's authors, gzip only when it saves a segment and its encoder, ACK delay as a ring command, the ring
+bookkeeping set, and the SHRX bcrypt kernel.
