@@ -90,7 +90,8 @@ export function validId(value: unknown): value is string {
   return typeof value === 'string' && /^\d+$/.test(value) && value.replace(/^0+/, '').length <= 19 &&
     BigInt(value) > 0n && BigInt(value) <= 9223372036854775807n;
 }
-export async function authenticate(request: IncomingMessage, required = true): Promise<{ id: string; token: string }> {
+export interface UserRow { id: string; username: string; email: string; bio: string | null; image: string | null }
+async function verifyAuthorization(request: IncomingMessage, required: boolean): Promise<{ id: string; token: string }> {
   const header = request.headers.authorization;
   if (header === undefined && !required) return { id: '0', token: '' };
   if (!header || !/^Token \S+$/.test(header)) fail(401, 'Invalid authorization');
@@ -101,9 +102,19 @@ export async function authenticate(request: IncomingMessage, required = true): P
     if (!validId(payload.sub)) fail(401, 'Invalid subject');
     id = BigInt(payload.sub).toString();
   } catch { fail(401, 'Invalid token'); }
-  const result = await pool.query<{ id: string }>('SELECT id FROM users WHERE id=$1', [id]);
-  first(result.rows, 401);
   return { id, token };
+}
+export async function authenticate(request: IncomingMessage, required = true): Promise<{ id: string; token: string }> {
+  const auth = await verifyAuthorization(request, required);
+  if (auth.id === '0') return auth;
+  const result = await pool.query<{ id: string }>('SELECT id FROM users WHERE id=$1', [auth.id]);
+  first(result.rows, 401);
+  return auth;
+}
+export async function authenticateUser(request: IncomingMessage): Promise<{ row: UserRow; token: string }> {
+  const { id, token } = await verifyAuthorization(request, true);
+  const row = first((await pool.query<UserRow>('SELECT id,username,email,bio,image FROM users WHERE id=$1', [id])).rows, 401);
+  return { row, token };
 }
 export function issueToken(id: string): Promise<string> {
   const now = Math.floor(Date.now() / 1000);

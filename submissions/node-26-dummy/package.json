@@ -14,14 +14,16 @@
     "start": "node dist/cluster.js"
   },
   "devDependencies": {
-    "@types/pg": "8.23.1",
+    "@opentelemetry/auto-instrumentations-node": "^0.82.0",
+    "@opentelemetry/instrumentation": "^0.300.0",
     "@types/bcrypt": "6.0.0",
     "@types/node": "26.6.6",
+    "@types/pg": "8.23.1",
     "typescript": "7.0.2"
   },
   "dependencies": {
-    "pg": "8.23.1",
     "bcrypt": "6.0.0",
-    "jose": "6.2.14"
+    "jose": "6.2.14",
+    "pg": "8.23.1"
   }
 }

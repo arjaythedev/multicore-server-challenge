@@ -1,9 +1,8 @@
-import { authenticate, fail, first, issueToken, optional, pagination, passwordHash,
+import { authenticate, authenticateUser, fail, first, issueToken, optional, pagination, passwordHash,
   passwordMatches, pool, readBody, safeInteger, sendJson, string, transaction, validId,
-  type Handler, type RequestContext } from './utils.js';
+  type Handler, type RequestContext, type UserRow } from './utils.js';
 
 interface Profile { username: string; bio: string | null; image: string | null; following: boolean }
-interface UserRow { id: string; username: string; email: string; bio: string | null; image: string | null }
 interface ArticleRow extends Profile {
   id: string; slug: string; title: string; description: string; body: string;
   created_at: Date; updated_at: Date; tag_list: string[]; favorites_count: string; favorited: boolean;
@@ -58,9 +57,8 @@ export const loginUser: Handler = async ({ request, response }) => {
   sendJson(response, 200, { user: user(row, await issueToken(row.id)) });
 };
 export const getCurrentUser: Handler = async ({ request, response }) => {
-  const auth = await authenticate(request);
-  const row = first((await pool.query<UserRow>(`SELECT ${userColumns} FROM users WHERE id=$1`, [auth.id])).rows, 401);
-  sendJson(response, 200, { user: user(row, auth.token) });
+  const { row, token } = await authenticateUser(request);
+  sendJson(response, 200, { user: user(row, token) });
 };
 export const updateCurrentUser: Handler = async ({ request, response }) => {
   const auth = await authenticate(request);
@@ -96,17 +94,42 @@ async function list(context: RequestContext, feed: boolean): Promise<void> {
   const { id } = await authenticate(request, feed);
   const { limit, offset } = pagination(url);
   const tag = url.searchParams.get('tag'), author = url.searchParams.get('author'), favorited = url.searchParams.get('favorited');
+  let source = 'articles a';
   let where = 'TRUE';
+  let pageId = 'a.id';
   const values: (string | number)[] = [id, limit, offset];
-  if (feed) where = 'a.author_id IN (SELECT followee_id FROM follows WHERE follower_id=$1)';
-  else if (tag) { where = 'a.id IN (SELECT at.article_id FROM article_tags at JOIN tags t ON t.id=at.tag_id WHERE t.name=$4)'; values.push(tag); }
-  else if (author) { where = 'a.author_id=(SELECT id FROM users WHERE username=$4)'; values.push(author); }
-  else if (favorited) { where = 'a.id IN (SELECT f.article_id FROM favorites f JOIN users fu ON fu.id=f.user_id WHERE fu.username=$4)'; values.push(favorited); }
-  const rows = (await pool.query<ArticleRow>(`${articleSelect(false)} WHERE ${where} ORDER BY a.id DESC LIMIT $2 OFFSET $3`, values)).rows;
-  const countWhere = where.replaceAll('$4', '$2');
-  const countValues = values.length === 4 ? [id, values[3]] : [id];
+  let countValues: string[] = [];
+  if (feed) {
+    where = 'a.author_id IN (SELECT followee_id FROM follows WHERE follower_id=$1)';
+    countValues = [id];
+  } else if (tag) {
+    source = 'article_tags at'; pageId = 'at.article_id';
+    where = 'at.tag_id=(SELECT id FROM tags WHERE name=$4)';
+    values.push(tag); countValues = [tag];
+  } else if (author) {
+    where = 'a.author_id=(SELECT id FROM users WHERE username=$4)';
+    values.push(author); countValues = [author];
+  } else if (favorited) {
+    source = 'favorites f'; pageId = 'f.article_id';
+    where = 'f.user_id=(SELECT id FROM users WHERE username=$4)';
+    values.push(favorited); countValues = [favorited];
+  }
+  // Page link-table/feed IDs before enrichment. Global/author lists already
+  // walk the article indexes directly, avoiding a redundant PK lookup.
+  // Link-table PKs and FKs make counts equivalent without joining articles.
+  const page = feed
+    ? `SELECT x.id FROM follows fo CROSS JOIN LATERAL
+        (SELECT a2.id FROM articles a2 WHERE a2.author_id=fo.followee_id
+         ORDER BY a2.id DESC LIMIT ($2::bigint + $3::bigint)) x
+       WHERE fo.follower_id=$1 ORDER BY x.id DESC LIMIT $2 OFFSET $3`
+    : `SELECT ${pageId} FROM ${source} WHERE ${where} ORDER BY ${pageId} DESC LIMIT $2 OFFSET $3`;
+  const pageSql = feed || source !== 'articles a'
+    ? `${articleSelect(false)} WHERE a.id IN (${page}) ORDER BY a.id DESC`
+    : `${articleSelect(false)} WHERE ${where} ORDER BY a.id DESC LIMIT $2 OFFSET $3`;
+  const rows = (await pool.query<ArticleRow>(pageSql, values)).rows;
+  const countWhere = where.replaceAll('$4', '$1');
   const count = first((await pool.query<{ count: string }>(`SELECT count(*) FROM
-    (SELECT 1 FROM articles a WHERE ($1::bigint IS NOT NULL) AND ${countWhere} LIMIT 1000) counted`, countValues)).rows);
+    (SELECT 1 FROM ${source} WHERE ${countWhere} LIMIT 1000) counted`, countValues)).rows);
   sendJson(response, 200, { articles: rows.map(r => article(r, false)), articlesCount: safeInteger(count.count) });
 }
 export const listArticles: Handler = c => list(c, false);

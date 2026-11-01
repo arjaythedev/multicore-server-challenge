@@ -1,0 +1,30 @@
+name: conduit-observability
+
+services:
+  lgtm:
+    image: grafana/otel-lgtm:0.39.0
+    container_name: conduit-lgtm
+
+    restart: "no"
+    init: true
+    stop_grace_period: 30s
+
+    ports:
+      # Grafana UI
+      - "127.0.0.1:3300:3000"
+
+      # OpenTelemetry OTLP HTTP
+      - "127.0.0.1:4318:4318"
+
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?required}
+
+    volumes:
+      - lgtm-data:/data
+
+    mem_limit: 3g
+    cpus: 1.5
+
+volumes:
+  lgtm-data:

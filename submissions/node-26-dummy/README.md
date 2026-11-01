@@ -91,3 +91,59 @@ Verified on Node 26.13.0 and PostgreSQL 18.6, using an isolated PostgreSQL insta
 and the fingerprint-verified dev seed: conformance **197/197** with one worker
 and **197/197** with the default six workers. Strict compilation and supplemental
 integration checks pass. These are correctness checks, not performance scores.
+
+## First SQL optimizations (2026-10-31)
+
+Changes are limited to query shape and eliminating a redundant user lookup:
+
+- Tag/favorited pages select ordered IDs with LIMIT/OFFSET from the indexed link
+  table before fetching articles, authors, tags and favorite counts.
+- Their capped counts read only the link table. Its foreign keys and composite
+  primary key guarantee the same count without joining `articles`.
+- Feed uses the reference LATERAL query: at most `limit + offset` IDs per followed
+  author, then the global page, then enrichment. The sum uses bigint to avoid
+  overflow at the maximum allowed offset.
+- `/api/user` verifies the JWT and fetches the user in one SQL statement instead
+  of two. Missing/deleted users still return 401; no verification cache is added.
+- Global/author page queries retain their direct index paths: an experimental
+  ID-first variant added PK lookups and increased estimated cost, so was omitted.
+
+Read-only checks on the existing full-size `conduit_lg` used a single repeatable
+read snapshot, sequential queries, and EXPLAIN **without ANALYZE**. For one fixture
+per filter, viewer 100, limit 20, offset 0, planner total costs were:
+
+| SQL | Before | After |
+|---|---:|---:|
+| Tag page | 817.25 | 130.80 |
+| Tag capped count | 692.13 | 38.42 |
+| Favorited page | 384.89 | 368.75 |
+| Favorited capped count | 30.82 | 6.81 |
+| Feed page | 482.53 | 477.82 |
+| Global / author page | 309.01 / 332.66 | unchanged |
+
+These are **planner cost units, not milliseconds or measured speedups**. The tag
+page now uses `article_tags_tag_idx`; its count no longer probes `articles_pkey`.
+This verifies removal of unnecessary work, not its share of CPU during the 10k
+VU run. Feed improvement is workload-dependent: many follows or deep offsets
+can still require many candidates. No indexes, schema, PostgreSQL configuration,
+pool budgets, or production data were changed. No load benchmark was run.
+
+Reproduce the read-only equivalence/plan checks from this submission directory:
+
+```bash
+npm run build
+TEST_SQL_DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit_lg node test-sql.mjs
+```
+
+The check compares actual handler SQL against the previous query shapes: 30
+page/count pairs covering all filters, anonymous/authenticated viewers, offsets,
+missing filters and filter precedence. It also checks the maximum feed offset,
+single-query current-user lookup, and unknown-user 401. It uses one connection,
+a read-only transaction, and a 10-second per-statement timeout. The database must
+contain the standard seed fixtures. Results and SQL parameters are not logged.
+
+Remaining hypothesis: excess scanning/index probes contribute to PostgreSQL CPU
+saturation. Their contribution and the resulting RPS/p95 change still need an
+identical-workload before/after benchmark or SQL profiling under load. A larger
+pool is not justified by the available measurements. Rebuild and restart the
+application to use these changes; an already running server is not updated.
