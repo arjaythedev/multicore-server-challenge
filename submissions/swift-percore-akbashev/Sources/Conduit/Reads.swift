@@ -105,73 +105,43 @@ enum PagesByFavoriteSQL: BatchSQL {
 /// 7,000 rows per batch on the full seed, nearly nine in ten of all the rows a batch read) for our side to parse and
 /// merge.
 ///
-/// $1/$2 are the viewers and each one's deepest page (limit + offset), $3 the prolific authors (ProlificAuthors), and
-/// $4-$6 the pages (the viewer's ordinal, limit, offset). Most viewers on the full seed follow an author of 1,000 or
-/// more articles, so their count is 1,000 without counting; the others' count stops at the 1,000th article over all
-/// their followees. A page reads each followee's newest articles down to a floor, as rust-epoll-theCatWisel's feed
-/// (#154): for an author several of the batch's viewers follow, the article as deep as the deepest of their pages, as
-/// that author alone has that many articles at or above it, so no page of theirs reaches below it. On the full seed,
-/// batches of 16 feeds took under 30% of the Postgres time and 40% fewer buffer pages this way than counting every
-/// viewer and reading each followee down to the page's depth, with the same rows.
+/// $1/$2 are the viewers and each one's deepest page (limit + offset), $3-$5 the pages (the viewer's ordinal, limit,
+/// offset). As rust-epoll-theCatWisel's feed (#154), the authors several of the batch's viewers follow (its hubs, up
+/// to 32) are looked at once for the whole batch: whether each has 1,000 articles, so a viewer who follows one counts
+/// 1,000 without counting (most viewers on the full seed do), and its floor, the article as deep as the deepest page
+/// of the viewers who follow it. That author alone has that many articles at or above it, so no page of theirs reaches
+/// below it, and a page reads each followee's newest articles only down to the highest floor among its hubs. Any
+/// other viewer's count stops at the 1,000th article over all their followees. On the full seed, batches of 16 feeds
+/// took half the Postgres time and a third fewer buffer pages this way than counting every viewer and reading each
+/// followee down to the page's depth, with the same rows.
 enum FeedSQL: BatchSQL {
     static let name = "b_feed"
     static let sql = """
         WITH v AS MATERIALIZED (
                SELECT r.k, r.depth, ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.viewer) AS followees
                  FROM unnest($1::int8[], $2::int8[]) WITH ORDINALITY r(viewer, depth, k)),
-             floors AS MATERIALIZED (
-               SELECT h.author, (SELECT a.id FROM articles a WHERE a.author_id = h.author
-                                  ORDER BY a.id DESC LIMIT 1 OFFSET h.depth - 1) AS id
+             hubs AS MATERIALIZED (
+               SELECT h.author,
+                      (SELECT a.id FROM articles a WHERE a.author_id = h.author
+                        ORDER BY a.id DESC LIMIT 1 OFFSET h.depth - 1) AS floor_id,
+                      EXISTS (SELECT 1 FROM articles a WHERE a.author_id = h.author ORDER BY a.id LIMIT 1 OFFSET 999) AS big
                  FROM (SELECT f.author, max(v.depth) AS depth FROM v, unnest(v.followees) f(author)
                         GROUP BY f.author HAVING count(*) >= 2 ORDER BY count(*) DESC, f.author LIMIT 32) h)
-        SELECT -v.k, CASE WHEN v.followees && $3::int8[] THEN 1000
+        SELECT -v.k, CASE WHEN v.followees && ARRAY(SELECT h.author FROM hubs h WHERE h.big) THEN 1000
                           ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = ANY(v.followees)
                                                        LIMIT 1000) s) END, NULL::int8
           FROM v
         UNION ALL
         SELECT p.k, x.id, x.author_id
-          FROM unnest($4::int8[], $5::int8[], $6::int8[]) WITH ORDINALITY p(viewer, lim, off, k)
+          FROM unnest($3::int8[], $4::int8[], $5::int8[]) WITH ORDINALITY p(viewer, lim, off, k)
           JOIN v ON v.k = p.viewer
-          CROSS JOIN LATERAL (SELECT coalesce(max(f.id), 0) AS id FROM floors f WHERE f.author = ANY(v.followees)) fl
+          CROSS JOIN LATERAL (SELECT coalesce(max(h.floor_id), 0) AS id FROM hubs h WHERE h.author = ANY(v.followees)) fl
           CROSS JOIN LATERAL (SELECT n.id, n.author_id FROM unnest(v.followees) fid
                                CROSS JOIN LATERAL (SELECT a.id, a.author_id FROM articles a
                                                     WHERE a.author_id = fid AND a.id >= fl.id
                                                     ORDER BY a.id DESC LIMIT p.lim + p.off) n
                               ORDER BY n.id DESC LIMIT p.lim OFFSET p.off) x
         """
-}
-
-/// Every author of 1,000 or more articles.
-enum ProlificAuthorsSQL: BatchSQL {
-    static let name = "b_prolific_authors"
-    static let sql = "SELECT author_id FROM articles GROUP BY author_id HAVING count(*) >= 1000"
-}
-
-/// Authors of 1,000 or more articles, for FeedSQL to count a feed that follows one as 1,000 without counting. Read by
-/// the first read lane whenever it connects. Only a deletion takes an author below 1,000, and every deletion goes through
-/// this server, which takes its author out for good when queuing it, before any later read, so a set read earlier
-/// can't bring them back. An author who reaches 1,000 after a read isn't in it until the next: their followers' feeds
-/// are counted. Empty (until the first read) is always right.
-final class ProlificAuthors: Sendable {
-    private struct State {
-        var ids: [Int64] = []
-        var removed: Set<Int64> = []
-    }
-
-    private let state = Mutex(State())
-
-    var ids: [Int64] { state.withLock { $0.ids } }
-
-    func set(_ ids: [Int64]) {
-        state.withLock { s in s.ids = ids.filter { !s.removed.contains($0) } }
-    }
-
-    func remove(_ author: Int64) {
-        state.withLock { s in
-            s.removed.insert(author)
-            s.ids.removeAll { $0 == author }
-        }
-    }
 }
 
 /// Single articles: slug -> id and author.
@@ -317,8 +287,6 @@ final class ReadBatcher: Service {
     private let settings: Settings
     private let state = Mutex(State())
     private let clock = ContinuousClock()
-    /// Read by lane 0 whenever it connects; an article's deletion takes its author out (Articles.swift).
-    let prolificAuthors = ProlificAuthors()
 
     init(config: PGConfig, settings: Settings) {
         self.config = config
@@ -384,7 +352,7 @@ final class ReadBatcher: Service {
         await withDiscardingTaskGroup { group in
             for i in 0..<settings.lanes {
                 let loop = Loop.all[i % Loop.all.count]
-                group.addTask(executorPreference: loop) { await self.lane(on: loop, readsProlificAuthors: i == 0) }
+                group.addTask(executorPreference: loop) { await self.lane(on: loop) }
             }
             group.addTask {
                 try? await gracefulShutdown()
@@ -410,43 +378,22 @@ final class ReadBatcher: Service {
 
     /// Answers batches, one at a time, on its connections. Runs on `loop`, where its connections live, so a reply
     /// from Postgres resumes it on the thread that read it. A closed connection is replaced before the next batch.
-    private func lane(on loop: Loop, readsProlificAuthors: Bool) async {
+    private func lane(on loop: Loop) async {
         var connections: [PGConnection] = []
         while !isStopped {
             connections.removeAll { $0.isClosed }
-            var connected = false
             while connections.count < settings.connections, !isStopped {
                 do {
                     connections.append(try await PGConnection.connect(config, on: loop))
-                    connected = true
                 } catch {
                     App.logger.error("read lane could not connect", metadata: ["error": "\(error)"])
                     try? await Task.sleep(for: .milliseconds(200))
                 }
             }
-            if readsProlificAuthors, connected, !connections.isEmpty { await readProlificAuthors(on: connections) }
             guard let batch = await nextBatch() else { break }
             await answer(batch, on: connections)
         }
         for connection in connections { connection.close() }
-    }
-
-    /// Reads ProlificAuthors; on failure it keeps what it had (an empty set only means feeds are counted).
-    private func readProlificAuthors(on connections: [PGConnection]) async {
-        do {
-            var arena = Bytes(capacity: 1024)
-            var round = Round(connections)
-            let i = round.add { $0.execute(ProlificAuthorsSQL.self) { _ in } }
-            var ids: [Int64] = []
-            for row in try await round.run(into: &arena)[i] {
-                var cells = row
-                ids.append(try cells.int(arena))
-            }
-            prolificAuthors.set(ids)
-            App.logger.info("read the prolific authors", metadata: ["count": "\(ids.count)"])
-        } catch {
-            App.logger.warning("could not read the prolific authors", metadata: ["error": "\(error)"])
-        }
     }
 
     /// Waits for this lane's turn to collect, then until the queue's oldest read has waited `window` or the queue holds
@@ -507,7 +454,7 @@ final class ReadBatcher: Service {
     private func answer(_ batch: [Waiting], on connections: [PGConnection]) async {
         do {
             guard !connections.isEmpty else { throw PGConnectionError.closed }
-            var plan = BatchPlan(batch, prolificAuthors: prolificAuthors.ids)
+            var plan = BatchPlan(batch)
             try await plan.execute(on: connections)
             Self.deliver(batch.indices.map { i in (batch[i].reply, .success(plan.result(i, viewer: batch[i].viewer))) })
         } catch {
@@ -714,11 +661,7 @@ private struct BatchPlan: ~Copyable {
     private var loginViews: [LoginView?] = []
     private var tagsBody: Range<Int32> = 0..<0
 
-    /// The authors a feed's count can stop at (ProlificAuthors), as the batch began.
-    private let prolificAuthors: [Int64]
-
-    fileprivate init(_ batch: [ReadBatcher.Waiting], prolificAuthors: [Int64]) {
-        self.prolificAuthors = prolificAuthors
+    fileprivate init(_ batch: [ReadBatcher.Waiting]) {
         slots.reserveCapacity(batch.count)
         for waiting in batch {
             switch waiting.read {
@@ -804,12 +747,10 @@ private struct BatchPlan: ~Copyable {
                 depths[k - 1] = max(depths[k - 1], page.limit + page.offset)
                 return Int64(k)
             }
-            let prolific = prolificAuthors
             at["feed"] = first.add { request in
                 request.execute(FeedSQL.self) { b in
                     b.int8Array(viewers)
                     b.int8Array(depths)
-                    b.int8Array(prolific)
                     b.int8Array(owners)
                     b.int8Array(pages.map(\.limit))
                     b.int8Array(pages.map(\.offset))
