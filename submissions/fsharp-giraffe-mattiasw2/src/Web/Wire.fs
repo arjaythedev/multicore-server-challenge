@@ -67,34 +67,45 @@ let private writeProfile (w: Utf8JsonWriter) (p: Profile) =
     w.WriteBoolean(kFollowing, p.Following)
     w.WriteEndObject()
 
-let private writeArticle (w: Utf8JsonWriter) (a: Article) =
+let private writeAuthor (w: Utf8JsonWriter) (a: Author) (following: bool) =
     w.WriteStartObject()
-    w.WriteString(kSlug, a.Slug)
-    w.WriteString(kTitle, a.Title)
-    w.WriteString(kDescription, a.Description)
-    match a.Body with
-    | Some body -> w.WriteString(kBody, body)
-    | None -> ()
+    w.WriteString(kUsername, a.Username)
+    nullable w kBio a.Bio
+    nullable w kImage a.Image
+    w.WriteBoolean(kFollowing, following)
+    w.WriteEndObject()
+
+/// A list never shows a body, even when the shared card has one (an article page in the same
+/// batch needed it).
+let private writeArticle (w: Utf8JsonWriter) (withBody: bool) (a: Article) =
+    let c = a.Card
+    w.WriteStartObject()
+    w.WriteString(kSlug, c.Slug)
+    w.WriteString(kTitle, c.Title)
+    w.WriteString(kDescription, c.Description)
+    match c.Body with
+    | Some body when withBody -> w.WriteString(kBody, body)
+    | _ -> ()
     w.WriteStartArray kTagList
-    for t in a.TagList do
+    for t in c.TagList do
         w.WriteStringValue t
     w.WriteEndArray()
-    w.WriteString(kCreatedAt, timestamp a.CreatedAt)
-    w.WriteString(kUpdatedAt, timestamp a.UpdatedAt)
+    w.WriteString(kCreatedAt, timestamp c.CreatedAt)
+    w.WriteString(kUpdatedAt, timestamp c.UpdatedAt)
     w.WriteBoolean(kFavorited, a.Favorited)
-    w.WriteNumber(kFavoritesCount, a.FavoritesCount)
+    w.WriteNumber(kFavoritesCount, c.FavoritesCount)
     w.WritePropertyName kAuthor
-    writeProfile w a.Author
+    writeAuthor w c.Author a.Following
     w.WriteEndObject()
 
 let private writeComment (w: Utf8JsonWriter) (c: Comment) =
     w.WriteStartObject()
-    w.WriteNumber(kId, c.Id)
-    w.WriteString(kCreatedAt, timestamp c.CreatedAt)
-    w.WriteString(kUpdatedAt, timestamp c.UpdatedAt)
-    w.WriteString(kBody, c.Body)
+    w.WriteNumber(kId, c.Card.Id)
+    w.WriteString(kCreatedAt, timestamp c.Card.CreatedAt)
+    w.WriteString(kUpdatedAt, timestamp c.Card.UpdatedAt)
+    w.WriteString(kBody, c.Card.Body)
     w.WritePropertyName kAuthor
-    writeProfile w c.Author
+    writeAuthor w c.Card.Author c.Following
     w.WriteEndObject()
 
 /// `{"user": User}`
@@ -121,7 +132,7 @@ let article (a: Article) =
     render (fun w ->
         w.WriteStartObject()
         w.WritePropertyName kArticle
-        writeArticle w a
+        writeArticle w true a
         w.WriteEndObject())
 
 let articles (page: ArticlePage) =
@@ -129,7 +140,7 @@ let articles (page: ArticlePage) =
         w.WriteStartObject()
         w.WriteStartArray kArticles
         for a in page.Articles do
-            writeArticle w a
+            writeArticle w false a
         w.WriteEndArray()
         w.WriteNumber(kArticlesCount, page.Count)
         w.WriteEndObject())

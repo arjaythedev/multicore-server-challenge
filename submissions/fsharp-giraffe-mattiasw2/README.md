@@ -22,8 +22,8 @@ Package versions are pinned, and `build.sh` restores the `packages.lock.json` gr
 ```
 src/Engine/   the database side: Types, Db (pool), Commit (group commit), Reads (read batching), Passwords (bcrypt lanes), Tags, Users, Profiles, Articles, Comments
 src/Web/      Jwt (the token shim), Wire (JSON in/out, query paging; pure), Handlers (Giraffe), Program (Kestrel)
-src/Tests/    xUnit facts for Jwt and Wire (no database)
-check.sh      the harness: build -> facts -> conformance suite (../../test/run.sh), with one verdict at the end
+src/Tests/    xUnit facts for Jwt and Wire (no database); BatchTests, the read-batching property (FsCheck)
+check.sh      the harness: build -> facts -> conformance suite (../../test/run.sh) -> batch property, one verdict
 ```
 
 - **Engine** has no HTTP and no tokens. Each function takes typed values and returns typed records, or a small
@@ -37,26 +37,46 @@ check.sh      the harness: build -> facts -> conformance suite (../../test/run.s
 - **One process, one Kestrel.** Kestrel serves every core with async I/O and holds each user's keep-alive
   connection directly (`Front: direct`). The keep-alive timeout is 120 s.
 - **Read batching for the hot reads** (`src/Engine/Reads.fs`): tags, the four article lists, the feed, article by
-  slug, comments and profiles. Every such read queues on one channel. `READ_LANES` reader lanes (default one per
-  core), each with a connection of its own, take whatever queued while their previous batch was in flight (up to
-  `READ_BATCH`, default 1024) and send it as one `NpgsqlBatch` with **one statement per kind of read**.
-  - Each kind has two statements with the same columns. A kind with one request in the batch uses the **single**
-    statement (the plain per-request query). A kind with several uses the **batched** statement, which takes the
-    requests as arrays (`unnest(...) WITH ORDINALITY`) and tags every row with `k`, the request it belongs to.
-  - The batched statement does the viewer-independent work **once per distinct value**, in `MATERIALIZED` CTEs: one
-    capped count per list key, one page of ids per (key, limit, offset), and one card per article (columns, tag array,
-    favorite count, author). Only the viewer's `favorited` and `following` flags are per request. Forty users on
-    page 1 of the global feed cost one page and ten cards, plus the flags.
-  - There is no timer. With no load each statement serves one request; near saturation the batches grow by
-    themselves, and each request costs Postgres less. On an 8-core test box at 40,000 users this took p95 from 673 ms
-    (fail) to 66 ms, at more requests per second and less Postgres CPU.
-  - This is not a cache: every request is answered by a statement that started after it arrived, and nothing
-    outlives its batch.
-  - Lookups by a batch's keys are `CROSS JOIN LATERAL (… LIMIT 1)`: one index probe per distinct key. The planner
-    cannot see how few rows a CTE holds. With a plain join it hash-joins whole tables, and the `LIMIT 1` (on unique
-    keys) stops it from flattening the lateral back into that join.
-  - Our sessions run with `jit=off` (a session setting; the server config is untouched). The batched statements look
-    costly to the planner, and JIT compiling took ~400 ms of a 1 ms query.
+  slug, comments and profiles. Each such request is a value (`Read`) on one channel. `READ_LANES` reader lanes
+  (default one per core), each with a connection of its own, answer the queue in batches:
+  - **Gather.** A lane that wakes for a request waits until the oldest queued request is `READ_GATHER_MS` old, or
+    until `READ_BATCH` requests are queued, whichever comes first, and then takes them all. The latency budget is
+    500 ms at p95, and a bigger batch shares more work.
+  - **Plan (F#).** The batch's distinct needs: forty requests for page 1 of the global feed are one page, and an
+    article page and its comments are one slug lookup.
+  - **Phase A (one round trip).** Ids: the tag list, one capped count per distinct list key, the ids of each distinct
+    page, slug → article id, and username → user.
+  - **Phase B (one round trip).** Everything shown, once per **batch** and across every kind of request: each
+    distinct article's card (columns, tags, favorite count, author), whether a list or an article page shows it; each
+    distinct comment thread; and the viewers' flags as two sets, (viewer, article) favorited and (viewer, user)
+    following.
+  - **Assemble (pure).** Each request's answer is built from those maps. Requests that show the same article share one
+    `Card` object.
+  - Both phases run in one `REPEATABLE READ READ ONLY` transaction: one snapshot, so the phases agree, and it is
+    cheaper than a snapshot per statement.
+  - The SQL only looks rows up by keys that F# has already made distinct: unnest the arrays, then one
+    `CROSS JOIN LATERAL (… LIMIT 1)` index probe per key. The planner cannot see how few keys there are. With a plain
+    join it may hash-join whole tables, and the `LIMIT 1` (the keys are unique) stops it from flattening the lateral
+    back into that join.
+  - Our sessions run with `jit=off` (a session setting; the server config is untouched). The batched statements
+    look costly to the planner, and JIT compiling took ~400 ms of a 1 ms query. Prepared statements do not help:
+    Postgres does not cache JIT code.
+  - **Proof.** `src/Tests/BatchTests.fs` is an FsCheck property: for random batches of real keys (with many
+    duplicates, unknown keys, anonymous viewers and huge offsets), every request's answer in the batch equals its
+    answer alone, byte for byte as Wire encodes it. A failure shrinks to the smallest batch that still fails. A bug
+    planted to check it (one viewer's favorite leaking to another viewer of the same article) shrank to exactly
+    that: two viewers, one article.
+  - This is not a cache: every request is answered from a snapshot taken after it arrived, and nothing outlives
+    its batch.
+  - **Measured** on an 8-core test box (server and Postgres pinned to the same 8 cores, the load generator on others):
+
+    | Users | Build | p95 | Postgres cores | Result |
+    |--:|---|--:|--:|---|
+    | 40,000 | one statement per request | 673 ms | 5.44 | fail |
+    | 40,000 | batched, no gather window | 30 ms | 4.32 | pass |
+    | 40,000 | batched, 25 ms window (72 requests per batch) | 84 ms | 1.91 | pass |
+    | 80,000 | batched, 25 ms window | 434 ms | 3.65 | pass |
+    | 90,000 | batched, 25 or 50 ms window | ~900 ms | 3.6 | fail: the app's CPU (4.1 cores) is now the limit |
 - **One multiplexed Npgsql pool for the cold reads** (sign-in lookups, the read after a write), `DB_POOL_SIZE`
   connections, default cores / 2. A request does not hold a connection: its statements are pipelined onto whichever
   connection is free.
@@ -131,10 +151,10 @@ sudo bash install.sh            # once: .NET SDK 10.0.402 -> /usr/local/dotnet
 bash build.sh                   # -> out/Web.dll
 DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=multicore-server-challenge \
   HOST=0.0.0.0 PORT=80 bash start.sh
-bash check.sh                   # build + facts + conformance (needs the dev seed, Go, psql, curl)
+bash check.sh                   # build + facts + conformance + batch property (needs the dev seed, Go, psql, curl)
 SKIP_CONFORMANCE=1 bash check.sh  # the quick gate, no database
 ```
 
 Environment: `DATABASE_URL`, `JWT_SECRET` (required); `HOST` (127.0.0.1), `PORT` (3000); `READ_LANES` (cores);
-`READ_BATCH` (1024); `WRITE_LANES` (2); `WRITE_GROUP` (128); `DB_POOL_SIZE` (cores / 2, capped so the total stays
+`READ_BATCH` (1024); `READ_GATHER_MS` (25); `WRITE_LANES` (2); `WRITE_GROUP` (128); `DB_POOL_SIZE` (cores / 2, capped so the total stays
 at most 95); `BCRYPT_THREADS` (cores / 2).

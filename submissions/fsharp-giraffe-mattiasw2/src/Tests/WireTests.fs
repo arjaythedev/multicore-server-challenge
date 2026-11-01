@@ -137,15 +137,18 @@ let ``a profile's null bio and image are JSON null`` () =
 
 [<Fact>]
 let ``a list article has no body; a single article does`` () =
-    let a =
-        { Slug = "s"; Title = "t"; Description = "d"; Body = None; TagList = [| "a"; "b" |]
+    // One shared card WITH a body (an article page in the same batch needed it): the list
+    // still shows none.
+    let card: Card =
+        { Id = 1L; Slug = "s"; Title = "t"; Description = "d"; Body = Some "x"; TagList = [| "a"; "b" |]
           CreatedAt = DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc); UpdatedAt = DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc)
-          Favorited = true; FavoritesCount = 3L
-          Author = { Username = "u"; Bio = Some "b"; Image = None; Following = true } }
+          FavoritesCount = 3L
+          Author = { Id = 7L; Username = "u"; Bio = Some "b"; Image = None } }
+    let a = { Card = card; Favorited = true; Following = true }
     let listed = text (Wire.articles { Articles = [ a ]; Count = 1000L })
     Assert.DoesNotContain("\"body\"", listed)
     Assert.Contains("\"articlesCount\":1000", listed)
-    Assert.Contains("\"body\":\"x\"", text (Wire.article { a with Body = Some "x" }))
+    Assert.Contains("\"body\":\"x\"", text (Wire.article a))
 
 [<Fact>]
 let ``errors have the RealWorld shape`` () =

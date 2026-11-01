@@ -18,8 +18,18 @@ type User =
       Bio: string option
       Image: string option }
 
-type Article =
-    { Slug: string
+/// A user as the author of an article or a comment, before anyone's `following` is known.
+type Author =
+    { Id: int64
+      Username: string
+      Bio: string option
+      Image: string option }
+
+/// An article as anyone sees it. A read batch builds each card once, and every request in it
+/// that shows the article (a list, the article page) shares the same card object.
+type Card =
+    { Id: int64
+      Slug: string
       Title: string
       Description: string
       /// None on list endpoints (they omit the body, as the current RealWorld spec does).
@@ -27,18 +37,31 @@ type Article =
       TagList: string[]
       CreatedAt: DateTime
       UpdatedAt: DateTime
-      Favorited: bool
       FavoritesCount: int64
-      Author: Profile }
+      Author: Author }
+
+/// An article as one viewer sees it: the shared card and the viewer's two flags.
+type Article =
+    { Card: Card
+      Favorited: bool
+      /// Does the viewer follow the card's author?
+      Following: bool }
 
 type ArticlePage = { Articles: Article list; Count: int64 }
 
-type Comment =
+/// A comment as anyone sees it (shared like a Card).
+type CommentCard =
     { Id: int64
       CreatedAt: DateTime
       UpdatedAt: DateTime
       Body: string
-      Author: Profile }
+      Author: Author }
+
+/// A comment as one viewer sees it.
+type Comment =
+    { Card: CommentCard
+      /// Does the viewer follow the comment's author?
+      Following: bool }
 
 /// GET /api/articles applies at most one filter: the first of tag, author, favorited.
 type ArticleFilter =

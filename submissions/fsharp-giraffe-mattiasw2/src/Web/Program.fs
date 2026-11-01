@@ -77,6 +77,7 @@ let main args =
     // READ_BATCH requests at a time. One busy backend per core.
     let readLanes = max 1 (int (setting "READ_LANES" (string cores)))
     let readBatch = max 1 (int (setting "READ_BATCH" "1024"))
+    let readGather = TimeSpan.FromMilliseconds(float (setting "READ_GATHER_MS" "25"))
     // Multiplexed: the cold reads (sign-in lookups, the read after a write). Rule: 95 or fewer
     // connections in total, lanes included.
     let poolSize = min (95 - writeLanes - readLanes) (int (setting "DB_POOL_SIZE" (string (max 2 (cores / 2)))))
@@ -86,7 +87,7 @@ let main args =
     let ds = Engine.Db.dataSource (Engine.Db.connectionString databaseUrl poolSize true)
     let writes =
         Engine.Commit.Writer(Engine.Db.connectionString databaseUrl writeLanes false, writeLanes, writeGroup)
-    let reads = Engine.Reads.Gather(Engine.Db.connectionString databaseUrl readLanes false, readLanes, readBatch)
+    let reads = Engine.Reads.Gather(Engine.Db.connectionString databaseUrl readLanes false, readLanes, readBatch, readGather)
     let env: Handlers.Env =
         { Db = ds
           Reads = reads
@@ -134,8 +135,8 @@ let main args =
         eprintfn "bcrypt: %d hashes (sign-ups, password changes), %d verifies (logins)" hashes verifies
         let groups, written = writes.Counts
         eprintfn "group commit: %d writes in %d groups" written groups
-        let batches, statements, requests = reads.Counts
-        eprintfn "read batching: %d requests in %d statements, %d batches" requests statements batches)
+        let batches, requests = reads.Counts
+        eprintfn "read batching: %d requests in %d batches" requests batches)
     |> ignore
     app.Run()
     0
