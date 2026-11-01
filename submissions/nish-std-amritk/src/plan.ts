@@ -21,7 +21,7 @@
 // per-viewer `= ANY` flags, and gathering a batch for a window (the worker's
 // batch clock), are ideas from the challenge's rust-epoll-WorriedArrow
 // submission; the SQL and this code are written here.
-import { copyBytes } from "nish/bytes"
+import { copyBytes, setI32LE } from "nish/bytes"
 import {
   PG_ARRAY_ELEMENT,
   PG_ARRAY_END,
@@ -57,8 +57,8 @@ const KINDS: i32 = 9
 const TAG_ID_MAX: i32 = 1048576
 
 /** The most requests one plan takes, and the most bytes of keys. */
-export const PLAN_MAX: i32 = 256
-export const PLAN_KEY_BYTES: i32 = 24576
+export const PLAN_MAX: i32 = 512
+export const PLAN_KEY_BYTES: i32 = 49152
 
 /** `render`'s answer for a request the plan could not answer: send it alone. */
 export const PLAN_ALONE: i32 = -1
@@ -80,7 +80,7 @@ const S_META: i32 = 100
 const S_FLAGS: i32 = 101
 
 /** The hash tables: a power of two at least twice what they hold. */
-const TABLE: i32 = 1024
+const TABLE: i32 = 2048
 const ID_TABLE: i32 = 65536
 
 /**
@@ -1772,8 +1772,16 @@ export class ReadPlan {
     return true
   }
 
+  /** Puts `tag` and `status` after the answer in `out`, in `tail` bytes, for the read service's rings: the length with them. */
+  seal(tag: i32, status: i32, tail: i32): i32 {
+    this.outRoom(this.outEnd + tail)
+    setI32LE(this.out, this.outEnd, tag)
+    setI32LE(this.out, this.outEnd + 4, status)
+    return this.outEnd + tail
+  }
+
   private outRoom(n: i32): void {
-    this.out = grownBytes(this.out, n, 0)
+    this.out = grownBytes(this.out, n, this.outEnd)
   }
 }
 

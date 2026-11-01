@@ -26,9 +26,19 @@
 // GZIP (0; 1 when it saves a TCP segment, 2 whenever it saves anything) and GZIP_MIN (1300).
 import { tcpListenFlags } from "nish:net"
 import { availableParallelism, getenv, setIdlePriority, setNice } from "nish:process"
-import { PREFORK_STOPPED, PreforkConfig, preforkWith } from "nish/net/prefork"
+import {
+  PREFORK_STOPPED,
+  PreforkConfig,
+  preforkIndex,
+  preforkServiceChannel,
+  preforkServiceChannelOf,
+  preforkWith,
+} from "nish/net/prefork"
+import { createRegion, openRegion, SharedRegion, ShmError, unlinkRegion } from "nish/sync/shm"
 import { bcryptCalibrate } from "nish/crypto/bcrypt"
 import { BCRYPT_LANES, runBcryptService } from "./bcrypt-service"
+import { initReadRings, ReadLink, readRegionBytes } from "./read-ring"
+import { ReadService } from "./read-service"
 import { BCRYPT_SERVICES_MAX, ConduitWorker, WorkerConfig } from "./worker"
 
 /** `tcpListenFlags`: SO_REUSEPORT, and TCP_NODELAY on every accepted socket. */
@@ -150,21 +160,65 @@ export const main = (): i32 => {
   const asked: i32 = envInt("BCRYPT_WIDTH", 0)
   const width: i32 = asked >= 1 && asked <= BCRYPT_LANES ? asked : bcryptCalibrate()
   cfg.bcryptWidth = width
+  // One worker after the HTTP workers holds every read plan (read-service.ts).
+  // The supervisor makes the rings before any worker starts; a box where it
+  // cannot leaves the region missing, and each HTTP worker plans for itself.
+  const service: boolean = (getenv("READ_SERVICE") ?? "1") !== "0"
+  const regionName: string = `conduit-reads-${cfg.port}`
+  const supervisor: boolean = preforkIndex(process.argv) < 0
+  if (supervisor && service) {
+    // Whatever a killed run left; none is the usual answer.
+    const stale: Result<void, ShmError> = unlinkRegion(regionName)
+    const made: Result<SharedRegion, ShmError> = createRegion(regionName, readRegionBytes(http))
+    if (made.isOk() && (stale.isOk() || stale.isErr())) {
+      initReadRings(made.expect("the read service's region"), http)
+    } else {
+      console.log("conduit: no shared memory for the read service; each worker plans for itself")
+    }
+  }
+  const extra: i32 = service ? 1 : 0
   const prefork = new PreforkConfig()
-  prefork.workers = http + cfg.bcryptServices
+  prefork.workers = http + extra + cfg.bcryptServices
   prefork.restart = false
+  prefork.serviceWorker = service ? http : -1
   const index: i32 = preforkWith(process.argv, prefork)
+  if (supervisor && service) {
+    const removed: Result<void, ShmError> = unlinkRegion(regionName)
+    if (removed.isErr()) {
+      return index === PREFORK_STOPPED ? 0 : 1
+    }
+  }
   if (index < 0) {
     return index === PREFORK_STOPPED ? 0 : 1
   }
+  let region: SharedRegion | null = null
+  if (service && index <= http) {
+    const opened: Result<SharedRegion, ShmError> = openRegion(regionName)
+    if (opened.isOk()) {
+      region = opened.expect("the read service's region")
+    }
+  }
+  if (service && index === http) {
+    if (region === null) {
+      return 0
+    }
+    const links: ReadLink[] = []
+    for (let w: i32 = 0; w < http; w++) {
+      links.push(new ReadLink(region, w, preforkServiceChannelOf(process.argv, w), true))
+    }
+    cfg.readConns = envInt("READ_SERVICE_CONNS", 12)
+    cfg.readPlans = envInt("READ_SERVICE_PLANS", 20)
+    console.log(`conduit: the read service holds ${cfg.readPlans} plans on ${cfg.readConns} connections`)
+    return new ReadService(cfg, links).run()
+  }
   if (index >= http) {
-    const port: i32 = cfg.bcryptPort + index - http
+    const port: i32 = cfg.bcryptPort + index - http - extra
     const listener: i32 = tcpListenFlags("127.0.0.1", port, 1024, 2)
     if (listener < 0) {
       console.log(`conduit: the bcrypt service cannot listen on 127.0.0.1:${port} (${listener})`)
       return 1
     }
-    if (index === http) {
+    if (index === http + extra) {
       console.log(`conduit: bcrypt runs ${width} lanes a call`)
     }
     lowerPriority(getenv("BCRYPT_NICE") ?? "0")
@@ -178,5 +232,14 @@ export const main = (): i32 => {
   if (index === 0) {
     console.log(`conduit: ${http} workers on ${cfg.host}:${cfg.port}`)
   }
-  return new ConduitWorker(cfg, listener).run()
+  if (region !== null) {
+    // Reads a plan does not take, and a plan's overflow, are all a worker reads itself.
+    cfg.readConns = envInt("DB_SOLO_CONNS", 2)
+    cfg.readPlans = 1
+  }
+  const worker = new ConduitWorker(cfg, listener)
+  if (region !== null) {
+    worker.reads = new ReadLink(region, index, preforkServiceChannel(process.argv), false)
+  }
+  return worker.run()
 }

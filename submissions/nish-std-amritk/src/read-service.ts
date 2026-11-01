@@ -1,0 +1,543 @@
+// The read service: one process that holds every read plan of the box. HTTP
+// workers parse, check the token and write the answer; the reads a plan takes
+// come to this process over rings (read-ring.ts), so two workers' reads share
+// one plan and each key and article of a window is read once for both. It is
+// what a single worker's queue would be, on a core that does not also serve
+// connections.
+//
+// A plan opens with its first read and starts when it is full or its window
+// ends. While every plan is busy reads wait in the rings, and a worker whose
+// ring is full plans them itself. Nothing is kept between plans.
+import { getI32LE, getI64LE } from "nish/bytes"
+import {
+  connectResult,
+  netAddress,
+  netClose,
+  netRead,
+  netWrite,
+  pollAdd,
+  pollCreate,
+  pollModify,
+  pollRemove,
+  pollWait,
+  tcpConnect,
+} from "nish:net"
+import { monotonicNanos } from "nish:process"
+import { secret, wipe } from "nish:secret"
+import { H1_WANT_READ, H1_WANT_WRITE } from "nish/net/http1-server"
+import {
+  PG_FAILED,
+  PG_GROUP_DONE,
+  PG_LOST,
+  PG_NEED_MORE,
+  PG_POOL_FULL,
+  PgConnection,
+  PgPool,
+} from "nish/net/postgres"
+import { RING_EMPTY, RING_TOO_SMALL } from "nish/sync/ring"
+import { CountRun, PLAN_ALONE, ReadPlan } from "./plan"
+import { ANSWER_ALONE, ANSWER_MAX, ANSWER_TAIL, READ_HEAD, ReadLink } from "./read-ring"
+import { registerPlanStatements } from "./sql"
+import { pgConfig, WorkerConfig } from "./worker"
+
+const SERVICE_AGAIN: i32 = -11
+const SERVICE_READABLE: i32 = 5
+const SERVICE_TICKETS: i32 = 131072
+const SERVICE_QUEUE: i32 = 65536
+/** A plan's states: free, taking reads, full or due, its groups, or waiting for its counts. */
+const S_FREE: i32 = 0
+const S_OPEN: i32 = 1
+const S_DUE: i32 = 2
+const S_A: i32 = 3
+const S_B: i32 = 4
+const S_COUNT: i32 = 5
+/** How long an answer waits for room in a worker's ring, in ns, before that worker counts as stuck. */
+const STUCK_NS: i64 = 5000000000
+const WORKER_TAGS: i32 = 16
+
+class ServiceSocket {
+  fd: i32 = -1
+  connected: boolean = false
+  armed: i32 = 0
+}
+
+export class ReadService {
+  loop: i32
+  pool: PgPool
+  sockets: ServiceSocket[]
+  address: u8[]
+  links: ReadLink[]
+  plans: ReadPlan[]
+  state: i32[]
+  /** Per ticket: the plan whose group it is, `plans.length` for the count run, or -1. */
+  ticketPlan: i32[]
+  countRuns: CountRun[]
+  countOpen: i32 = 0
+  countBusy: boolean = false
+  /** The plan taking reads, or -1, and when its first came. */
+  open: i32 = -1
+  openedAt: i64 = 0
+  planMin: i32
+  planWait: i64
+  /** A read popped that its plan had no room for, and its worker; the next ring to look at. */
+  rec: u8[]
+  recLen: i32 = 0
+  recFrom: i32 = 0
+  nextLink: i32 = 0
+  gone: boolean = false
+
+  constructor(cfg: WorkerConfig, links: ReadLink[]) {
+    this.links = links
+    this.loop = pollCreate()
+    const password = secret(serviceBytes(cfg.dbPassword))
+    this.pool = new PgPool(pgConfig(cfg, cfg.readInFlight), password, cfg.readConns, SERVICE_QUEUE)
+    wipe(password)
+    this.sockets = []
+    for (let s: i32 = 0; s < this.pool.size; s++) {
+      this.sockets.push(new ServiceSocket())
+    }
+    this.address = new Array<u8>(18)
+    netAddress(this.address, cfg.dbHost, cfg.dbPort)
+    registerPlanStatements(this.pool)
+    this.plans = []
+    this.state = []
+    for (let k: i32 = 0; k < (cfg.readPlans > 0 ? cfg.readPlans : 1); k++) {
+      this.plans.push(new ReadPlan())
+      this.state.push(S_FREE)
+    }
+    const noTypes: i32[] = []
+    this.pool.register(this.plans[0].articles.name, this.plans[0].articles.sql, noTypes)
+    this.pool.register(this.plans[0].comments.name, this.plans[0].comments.sql, noTypes)
+    this.pool.register(this.plans[0].profiles.name, this.plans[0].profiles.sql, noTypes)
+    this.ticketPlan = new Array<i32>(SERVICE_TICKETS)
+    for (let k: i32 = 0; k < SERVICE_TICKETS; k++) {
+      this.ticketPlan[k] = -1
+    }
+    this.countRuns = [new CountRun(), new CountRun()]
+    this.planMin = cfg.planMin
+    this.planWait = toI64(cfg.planWaitUs) * 1000
+    this.rec = new Array<u8>(READ_HEAD + 2048)
+  }
+
+  /** Serves until a worker goes; a worker that goes ends the server (the challenge restarts nothing). */
+  run(): i32 {
+    const ready: i32[] = new Array<i32>(2 * 256)
+    for (let k: i32 = 0; k < toI32(this.links.length); k++) {
+      pollAdd(this.loop, this.links[k].fd, H1_WANT_READ, -1 - k)
+    }
+    const link: ReadLink = this.links[0]
+    while (!this.gone) {
+      this.pump()
+      let wait: i32 = 1000
+      const left: i64 = this.waitLeft()
+      if (left > 0) {
+        const ms: i32 = toI32((left + 999999) / 1000000)
+        wait = ms < wait ? ms : wait
+      } else if (this.open >= 0) {
+        wait = 0
+      }
+      link.sleeping()
+      if (this.take()) {
+        wait = 0
+      }
+      const n: i32 = pollWait(this.loop, ready, wait)
+      link.awake()
+      if (n < 0 && n !== -4) {
+        return 1
+      }
+      for (let k: i32 = 0; k < n; k++) {
+        const token: i32 = ready[2 * k]
+        if (token < 0) {
+          this.gone = !this.links[-1 - token].woken() || this.gone
+        } else if (token < this.pool.size) {
+          this.pgReady(token, ready[2 * k + 1])
+        }
+      }
+    }
+    return 1
+  }
+
+  /** How long, in ns, the open plan may wait still. */
+  waitLeft(): i64 {
+    if (this.open < 0) {
+      return 0
+    }
+    const left: i64 = this.openedAt + this.planWait - monotonicNanos()
+    return left > 0 ? left : 0
+  }
+
+  freePlan(): i32 {
+    for (let p: i32 = 0; p < toI32(this.state.length); p++) {
+      if (this.state[p] === S_FREE) {
+        return p
+      }
+    }
+    return -1
+  }
+
+  /** The next read from the rings into `rec`, round the workers; false when none waits. */
+  popRead(): boolean {
+    const n: i32 = toI32(this.links.length)
+    for (let k: i32 = 0; k < n; k++) {
+      const at: i32 = (this.nextLink + k) % n
+      const got: i32 = this.links[at].rx.tryPop(this.rec, 0)
+      if (got > 0) {
+        this.recLen = got
+        this.recFrom = at
+        this.nextLink = (at + 1) % n
+        return true
+      }
+      if (got === RING_TOO_SMALL) {
+        this.rec = new Array<u8>(2 * toI32(this.rec.length))
+        k -= 1
+      } else if (got !== RING_EMPTY) {
+        return false
+      }
+    }
+    return false
+  }
+
+  /** Moves reads from the rings into plans, while a plan is free; whether it moved any. */
+  take(): boolean {
+    let took: boolean = false
+    while (this.recLen > 0 || this.popRead()) {
+      if (this.open < 0) {
+        const p: i32 = this.freePlan()
+        if (p < 0) {
+          return took
+        }
+        this.plans[p].reset()
+        this.state[p] = S_OPEN
+        this.open = p
+        this.openedAt = monotonicNanos()
+      }
+      const b: u8[] = this.rec
+      const tag: i32 = getI32LE(b, 0) * WORKER_TAGS + this.recFrom
+      const added: boolean = this.plans[this.open].add(
+        tag,
+        getI32LE(b, 4),
+        getI64LE(b, 16),
+        getI64LE(b, 24),
+        getI64LE(b, 32),
+        b,
+        READ_HEAD,
+        getI32LE(b, 8)
+      )
+      if (added) {
+        this.recLen = 0
+        took = true
+      } else {
+        this.state[this.open] = S_DUE
+        this.open = -1
+      }
+    }
+    return took
+  }
+
+  pump(): void {
+    this.take()
+    if (this.open >= 0 && (this.plans[this.open].count >= this.planMin || this.waitLeft() === 0)) {
+      this.state[this.open] = S_DUE
+      this.open = -1
+      this.take()
+    }
+    for (let p: i32 = 0; p < toI32(this.state.length); p++) {
+      if (this.state[p] === S_DUE) {
+        const ticket: i32 = this.pool.request()
+        if (ticket === PG_POOL_FULL) {
+          break
+        }
+        this.ticketPlan[ticket % SERVICE_TICKETS] = p
+        this.state[p] = S_A
+      }
+    }
+    if (!this.countBusy && this.countRuns[this.countOpen].plans.length > 0) {
+      const ticket: i32 = this.pool.request()
+      if (ticket !== PG_POOL_FULL) {
+        this.ticketPlan[ticket % SERVICE_TICKETS] = toI32(this.plans.length)
+        this.countBusy = true
+      }
+    }
+    let s: i32 = this.pool.dispatch()
+    while (s >= 0) {
+      this.bindGroup(this.pool.connection(s), this.pool.ticket % SERVICE_TICKETS)
+      s = this.pool.dispatch()
+    }
+    s = this.pool.wanted()
+    while (s >= 0 && s < this.pool.size) {
+      const socket: ServiceSocket = this.sockets[s]
+      const nonce = new Array<u8>(18)
+      crypto.getRandomValues(nonce)
+      this.pool.connect(s, nonce)
+      socket.fd = tcpConnect(this.address)
+      socket.connected = false
+      socket.armed = H1_WANT_WRITE
+      if (socket.fd < 0 || pollAdd(this.loop, socket.fd, H1_WANT_WRITE, s) < 0) {
+        this.pool.connection(s).closed()
+        this.pgEvents(s)
+      }
+      s = this.pool.wanted()
+    }
+    for (let k: i32 = 0; k < this.pool.size; k++) {
+      const socket: ServiceSocket = this.sockets[k]
+      if (socket.fd >= 0 && socket.connected) {
+        const conn: PgConnection = this.pool.connection(k)
+        if (!this.flush(conn, socket.fd)) {
+          conn.closed()
+          this.pgEvents(k)
+        } else if (socket.fd >= 0) {
+          const wants: i32 =
+            conn.outputEnd() > conn.outputStart() ? H1_WANT_READ | H1_WANT_WRITE : H1_WANT_READ
+          if (wants !== socket.armed) {
+            socket.armed = wants
+            pollModify(this.loop, socket.fd, wants, k)
+          }
+        }
+      }
+    }
+    for (const link of this.links) {
+      link.ring()
+    }
+  }
+
+  /** Binds the group of the ticket at `at`: a plan's, or the count run's. */
+  bindGroup(conn: PgConnection, at: i32): void {
+    const pi: i32 = this.ticketPlan[at]
+    if (pi === toI32(this.plans.length)) {
+      // The count run: it takes every plan waiting now, and the next plans open the other.
+      const run: CountRun = this.countRuns[this.countOpen]
+      this.countOpen = 1 - this.countOpen
+      const counted: boolean = run.bind(conn)
+      if (!counted) {
+        conn.bindCancel()
+      }
+      run.failed = !counted
+      if (!this.pool.send()) {
+        this.ticketPlan[at] = -1
+        this.countsDone(true, false)
+      }
+      return
+    }
+    if (pi < 0) {
+      return
+    }
+    const plan: ReadPlan = this.plans[pi]
+    if (!(this.state[pi] === S_A ? plan.bindA(conn) : plan.bindB(conn))) {
+      // The statements bound still run; the plan's requests go alone once they have.
+      plan.failed = true
+      conn.bindCancel()
+    }
+    if (!this.pool.send()) {
+      this.ticketPlan[at] = -1
+      plan.failed = true
+      this.groupDone(pi)
+    }
+  }
+
+  groupDone(p: i32): void {
+    const plan: ReadPlan = this.plans[p]
+    if (this.state[p] === S_A) {
+      if (plan.failed) {
+        plan.abortA()
+      } else if (plan.planB()) {
+        if (plan.metas > 0) {
+          if (this.countRuns[this.countOpen].join(p, plan)) {
+            this.state[p] = S_COUNT
+            return
+          }
+          plan.failed = true
+        } else if (this.askB(p)) {
+          return
+        }
+      }
+    }
+    this.finish(p, false)
+  }
+
+  askB(p: i32): boolean {
+    const ticket: i32 = this.pool.request()
+    if (ticket === PG_POOL_FULL) {
+      this.plans[p].failed = true
+      return false
+    }
+    this.ticketPlan[ticket % SERVICE_TICKETS] = p
+    this.state[p] = S_B
+    return true
+  }
+
+  countsDone(failed: boolean, lost: boolean): void {
+    const run: CountRun = this.countRuns[1 - this.countOpen]
+    this.countBusy = false
+    for (const p of run.plans) {
+      if (lost) {
+        this.finish(p, true)
+      } else {
+        const plan: ReadPlan = this.plans[p]
+        plan.failed = plan.failed || failed || run.failed
+        plan.takeCounts(run)
+        if (plan.failed || !this.askB(p)) {
+          this.finish(p, false)
+        }
+      }
+    }
+    run.reset()
+  }
+
+  /** Sends every answer of plan `p` to its worker and frees the plan. */
+  finish(p: i32, lost: boolean): void {
+    const plan: ReadPlan = this.plans[p]
+    for (let i: i32 = 0; i < plan.count; i++) {
+      let status: i32 = 500
+      plan.outEnd = 0
+      if (!lost) {
+        status = plan.failed ? PLAN_ALONE : plan.render(i)
+      }
+      if (status !== 200 || plan.outEnd > ANSWER_MAX) {
+        plan.outEnd = 0
+        status = status === 200 || status === PLAN_ALONE ? ANSWER_ALONE : status
+      }
+      const tag: i32 = plan.tags[i]
+      const len: i32 = plan.seal(tag / WORKER_TAGS, status, ANSWER_TAIL)
+      this.deliver(this.links[tag % WORKER_TAGS], plan.out, len)
+    }
+    this.state[p] = S_FREE
+  }
+
+  deliver(link: ReadLink, b: u8[], len: i32): void {
+    if (link.push(b, len)) {
+      return
+    }
+    // The worker drains this ring every turn: it is full only while the worker is behind.
+    const stuck: i64 = monotonicNanos() + STUCK_NS
+    link.ring()
+    while (!link.push(b, len)) {
+      link.ring()
+      if (monotonicNanos() > stuck) {
+        this.gone = true
+        return
+      }
+    }
+  }
+
+  flush(conn: PgConnection, fd: i32): boolean {
+    while (conn.outputEnd() > conn.outputStart()) {
+      const n: i32 = netWrite(fd, conn.outputBuffer(), conn.outputStart(), conn.outputEnd() - conn.outputStart())
+      if (n === SERVICE_AGAIN) {
+        return true
+      }
+      if (n <= 0) {
+        return false
+      }
+      conn.sent(n)
+    }
+    return true
+  }
+
+  pgReady(s: i32, events: i32): void {
+    const socket: ServiceSocket = this.sockets[s]
+    if (socket.fd < 0) {
+      return
+    }
+    const conn: PgConnection = this.pool.connection(s)
+    if (!socket.connected) {
+      if (connectResult(socket.fd) === 0) {
+        socket.connected = true
+      } else {
+        conn.closed()
+      }
+      this.pgEvents(s)
+      return
+    }
+    if ((events & SERVICE_READABLE) !== 0) {
+      while (true) {
+        let room: i32 = conn.inputRoom()
+        if (room <= 0) {
+          this.pgEvents(s)
+          if (socket.fd < 0) {
+            return
+          }
+          room = conn.inputRoom()
+          if (room <= 0) {
+            break
+          }
+        }
+        const got: i32 = netRead(socket.fd, conn.inputBuffer(), conn.inputEnd(), room)
+        if (got === SERVICE_AGAIN) {
+          break
+        }
+        if (got <= 0) {
+          conn.closed()
+          break
+        }
+        conn.received(got)
+        if (got < room) {
+          break
+        }
+        this.pgEvents(s)
+        if (socket.fd < 0) {
+          return
+        }
+      }
+    }
+    this.pgEvents(s)
+  }
+
+  pgEvents(s: i32): void {
+    const conn: PgConnection = this.pool.connection(s)
+    let event: i32 = this.pool.next(s)
+    while (event !== PG_NEED_MORE) {
+      if (event === PG_FAILED) {
+        const socket: ServiceSocket = this.sockets[s]
+        if (socket.fd >= 0) {
+          pollRemove(this.loop, socket.fd)
+          netClose(socket.fd)
+          socket.fd = -1
+          socket.connected = false
+        }
+        return
+      }
+      const ticket: i32 = this.pool.ticket
+      if (ticket >= 0 && this.ticketPlan[ticket % SERVICE_TICKETS] >= 0) {
+        this.planEvent(ticket % SERVICE_TICKETS, conn, event)
+      }
+      event = this.pool.next(s)
+    }
+  }
+
+  planEvent(at: i32, conn: PgConnection, event: i32): void {
+    const p: i32 = this.ticketPlan[at]
+    if (p === toI32(this.plans.length)) {
+      if (event === PG_LOST || event === PG_GROUP_DONE) {
+        this.ticketPlan[at] = -1
+        this.countsDone(event === PG_LOST || conn.groupFailed, event === PG_LOST)
+      } else {
+        this.countRuns[1 - this.countOpen].event(conn, event)
+      }
+      return
+    }
+    const plan: ReadPlan = this.plans[p]
+    if (event === PG_LOST) {
+      this.ticketPlan[at] = -1
+      plan.abortA()
+      this.finish(p, true)
+    } else if (event === PG_GROUP_DONE) {
+      this.ticketPlan[at] = -1
+      if (conn.groupFailed) {
+        plan.failed = true
+      }
+      this.groupDone(p)
+    } else if (this.state[p] === S_A) {
+      plan.eventA(conn, event)
+    } else {
+      plan.eventB(conn, event)
+    }
+  }
+}
+
+const serviceBytes = (s: string): u8[] => {
+  const out: u8[] = new Array<u8>(s.length)
+  for (let k: i32 = 0; k < toI32(s.length) && k < toI32(out.length); k++) {
+    out[k] = toU8(s.charCodeAt(k))
+  }
+  return out
+}
