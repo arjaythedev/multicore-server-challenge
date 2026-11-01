@@ -30,7 +30,7 @@ fn main() {
     let io_workers: usize = env_parse("IO_THREADS", (cores / 2).max(2));
     let read_workers: usize = env_parse("READ_LANES", cores.max(4));
     let write_workers: usize = env_parse("WRITE_LANES", 1);
-    let crypto_workers: usize = env_parse("BCRYPT_THREADS", cores.max(4));
+    let crypto_workers: usize = env_parse("BCRYPT_THREADS", (cores / 2).max(3));
 
     let (auto_lanes, seed_bcrypt_us, l1d_kb) = auth::calibrate_bcrypt_hardware();
     let bcrypt_lanes: usize = env_parse("BCRYPT_LANES", auto_lanes);

@@ -731,6 +731,12 @@ unsafe extern "C" {
     fn bc_expand0_bextr_4(st: *mut BfState);
     fn bc_expand0_bextr_5(st: *mut BfState);
     fn bc_expand0_bextr_6(st: *mut BfState);
+    fn bc_expand0_shrx_1(st: *mut BfState);
+    fn bc_expand0_shrx_2(st: *mut BfState);
+    fn bc_expand0_shrx_3(st: *mut BfState);
+    fn bc_expand0_shrx_4(st: *mut BfState);
+    fn bc_expand0_shrx_5(st: *mut BfState);
+    fn bc_expand0_shrx_6(st: *mut BfState);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -739,6 +745,7 @@ pub enum BcryptKernel {
     Rust = 0,
     Ah = 1,
     Bextr = 2,
+    Shrx = 3,
 }
 
 static BCRYPT_KERNEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(BcryptKernel::Rust as u8);
@@ -748,6 +755,7 @@ pub fn active_bcrypt_kernel() -> BcryptKernel {
     match BCRYPT_KERNEL.load(std::sync::atomic::Ordering::Relaxed) {
         1 => BcryptKernel::Ah,
         2 => BcryptKernel::Bextr,
+        3 => BcryptKernel::Shrx,
         _ => BcryptKernel::Rust,
     }
 }
@@ -777,6 +785,12 @@ fn asm_expand0_fn<const N: usize>(kernel: BcryptKernel) -> Option<unsafe extern 
         (BcryptKernel::Bextr, 4) => Some(bc_expand0_bextr_4),
         (BcryptKernel::Bextr, 5) => Some(bc_expand0_bextr_5),
         (BcryptKernel::Bextr, 6) => Some(bc_expand0_bextr_6),
+        (BcryptKernel::Shrx, 1) => Some(bc_expand0_shrx_1),
+        (BcryptKernel::Shrx, 2) => Some(bc_expand0_shrx_2),
+        (BcryptKernel::Shrx, 3) => Some(bc_expand0_shrx_3),
+        (BcryptKernel::Shrx, 4) => Some(bc_expand0_shrx_4),
+        (BcryptKernel::Shrx, 5) => Some(bc_expand0_shrx_5),
+        (BcryptKernel::Shrx, 6) => Some(bc_expand0_shrx_6),
         _ => None,
     }
 }
@@ -1008,7 +1022,7 @@ pub fn calibrate_bcrypt_hardware() -> (usize, usize, usize) {
     let has_bmi = false;
 
     let kernels: &[BcryptKernel] = if has_bmi {
-        &[BcryptKernel::Ah, BcryptKernel::Bextr, BcryptKernel::Rust]
+        &[BcryptKernel::Shrx, BcryptKernel::Ah, BcryptKernel::Bextr, BcryptKernel::Rust]
     } else {
         &[BcryptKernel::Rust]
     };
@@ -1214,7 +1228,12 @@ mod tests {
         let expected: [[u8; 23]; 6] = std::array::from_fn(|i| {
             bcrypt_lanes_with_kernel::<1>(&[BcryptInput { password: pws[i], salt: salts[i] }], 4, BcryptKernel::Rust)[0]
         });
-        let kernels = [BcryptKernel::Rust, BcryptKernel::Ah, BcryptKernel::Bextr];
+        let kernels = [
+            BcryptKernel::Rust,
+            BcryptKernel::Ah,
+            BcryptKernel::Bextr,
+            BcryptKernel::Shrx,
+        ];
         for &k in &kernels {
             assert_eq!(bcrypt_lanes_with_kernel::<1>(&[BcryptInput { password: pws[0], salt: salts[0] }], 4, k)[0], expected[0]);
             assert_eq!(bcrypt_lanes_with_kernel::<2>(jobs[..2].try_into().unwrap(), 4, k), expected[..2]);

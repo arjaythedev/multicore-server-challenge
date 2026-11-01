@@ -28,6 +28,7 @@ const LOW_BYTES: [[&str; 2]; REG_LANES] = [
 enum ExtractStyle {
     Ah,
     Bextr,
+    Shrx,
 }
 
 impl ExtractStyle {
@@ -35,6 +36,7 @@ impl ExtractStyle {
         match self {
             ExtractStyle::Ah => "ah",
             ExtractStyle::Bextr => "bextr",
+            ExtractStyle::Shrx => "shrx",
         }
     }
 }
@@ -57,17 +59,30 @@ fn emit_half_round(out: &mut String, style: ExtractStyle, lane: usize, hx: usize
                 let _ = writeln!(out, "  movzx esi, ah");
                 let _ = writeln!(out, "  mov edx, dword ptr [rdi + rsi*4 + {sbox}]");
                 let _ = writeln!(out, "  movzx esi, al");
+                let _ = writeln!(out, "  add edx, dword ptr [rdi + rsi*4 + {}]", sbox + 1024);
+                let _ = writeln!(out, "  bextr esi, {x}, ecx");
+                let _ = writeln!(out, "  xor edx, dword ptr [rdi + rsi*4 + {}]", sbox + 2048);
             }
             ExtractStyle::Bextr => {
                 let _ = writeln!(out, "  mov esi, {x}");
                 let _ = writeln!(out, "  shr esi, 24");
                 let _ = writeln!(out, "  mov edx, dword ptr [rdi + rsi*4 + {sbox}]");
                 let _ = writeln!(out, "  bextr esi, {x}, eax");
+                let _ = writeln!(out, "  add edx, dword ptr [rdi + rsi*4 + {}]", sbox + 1024);
+                let _ = writeln!(out, "  bextr esi, {x}, ecx");
+                let _ = writeln!(out, "  xor edx, dword ptr [rdi + rsi*4 + {}]", sbox + 2048);
+            }
+            ExtractStyle::Shrx => {
+                let _ = writeln!(out, "  shrx esi, {x}, eax");
+                let _ = writeln!(out, "  mov edx, dword ptr [rdi + rsi*4 + {sbox}]");
+                let _ = writeln!(out, "  shrx esi, {x}, ecx");
+                let _ = writeln!(out, "  movzx esi, sil");
+                let _ = writeln!(out, "  add edx, dword ptr [rdi + rsi*4 + {}]", sbox + 1024);
+                let _ = writeln!(out, "  rorx esi, {x}, 8");
+                let _ = writeln!(out, "  movzx esi, sil");
+                let _ = writeln!(out, "  xor edx, dword ptr [rdi + rsi*4 + {}]", sbox + 2048);
             }
         }
-        let _ = writeln!(out, "  add edx, dword ptr [rdi + rsi*4 + {}]", sbox + 1024);
-        let _ = writeln!(out, "  bextr esi, {x}, ecx");
-        let _ = writeln!(out, "  xor edx, dword ptr [rdi + rsi*4 + {}]", sbox + 2048);
         let _ = writeln!(out, "  movzx esi, {}", LOW_BYTES[lane][hx]);
         let _ = writeln!(out, "  add edx, dword ptr [rdi + rsi*4 + {}]", sbox + 3072);
         let _ = writeln!(out, "  xor {y}, edx");
@@ -100,9 +115,18 @@ fn emit_kernel(out: &mut String, style: ExtractStyle, lanes: usize) {
         let _ = writeln!(out, "  push {reg}");
     }
     let _ = writeln!(out, "  sub rsp, {frame}");
-    let _ = writeln!(out, "  mov ecx, 0x0808");
-    if style == ExtractStyle::Bextr {
-        let _ = writeln!(out, "  mov eax, 0x0810");
+    match style {
+        ExtractStyle::Ah => {
+            let _ = writeln!(out, "  mov ecx, 0x0808");
+        }
+        ExtractStyle::Bextr => {
+            let _ = writeln!(out, "  mov ecx, 0x0808");
+            let _ = writeln!(out, "  mov eax, 0x0810");
+        }
+        ExtractStyle::Shrx => {
+            let _ = writeln!(out, "  mov ecx, 16");
+            let _ = writeln!(out, "  mov eax, 24");
+        }
     }
     let _ = writeln!(out, "  mov qword ptr [rsp], 0");
     for u in 0..lanes {
@@ -160,8 +184,16 @@ fn emit_kernel(out: &mut String, style: ExtractStyle, lanes: usize) {
             let _ = writeln!(out, "  mov dword ptr [rsp + {s1}], eax");
         }
     }
-    if style == ExtractStyle::Bextr && mem_lanes > 0 {
-        let _ = writeln!(out, "  mov eax, 0x0810");
+    if mem_lanes > 0 {
+        match style {
+            ExtractStyle::Bextr => {
+                let _ = writeln!(out, "  mov eax, 0x0810");
+            }
+            ExtractStyle::Shrx => {
+                let _ = writeln!(out, "  mov eax, 24");
+            }
+            ExtractStyle::Ah => {}
+        }
     }
     let _ = writeln!(out, "  add rsi, 1");
     let _ = writeln!(out, "  mov qword ptr [rsp], rsi");
@@ -178,10 +210,10 @@ fn emit_kernel(out: &mut String, style: ExtractStyle, lanes: usize) {
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
-    let mut asm = String::with_capacity(256 * 1024);
+    let mut asm = String::with_capacity(384 * 1024);
     if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64") {
         let _ = writeln!(&mut asm, "  .text");
-        for style in [ExtractStyle::Ah, ExtractStyle::Bextr] {
+        for style in [ExtractStyle::Ah, ExtractStyle::Bextr, ExtractStyle::Shrx] {
             for lanes in 1..=MAX_LANES {
                 emit_kernel(&mut asm, style, lanes);
             }

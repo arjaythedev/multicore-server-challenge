@@ -376,7 +376,7 @@ struct ReadRenderScratch {
     uid_rows: Vec<Option<wire::RowSpan>>,
     uemail_rows: Vec<Option<wire::RowSpan>>,
     grp_cmts: Vec<Vec<usize>>,
-    cmt_sort_buf: Vec<(i64, i64, wire::RowSpan)>,
+    cmt_sort_buf: Vec<(i64, i64, wire::RowSpan, wire::RowSpan)>,
     cached_cmts: Vec<Option<Vec<CachedCommentSlice>>>,
     rendered_profiles: Vec<Option<Arc<[u8]>>>,
     rendered_cmts: Vec<Option<Arc<[u8]>>>,
@@ -530,9 +530,6 @@ pub struct ReadWorker {
     art_author_ords: Vec<u32>,
     art_meta: Vec<MetaSource>,
     meta_req_ids: Vec<i64>,
-    art_fav_counts: Vec<i64>,
-    art_tag_head: Vec<u32>,
-    art_tag_nodes: Vec<(u32, u32)>,
     author_spans: Vec<Option<wire::RowSpan>>,
     fav_pairs: Vec<(i64, i64)>,
     foll_pairs: Vec<(i64, i64)>,
@@ -581,9 +578,6 @@ impl ReadWorker {
             art_author_ords: Vec::with_capacity(256),
             art_meta: Vec::with_capacity(256),
             meta_req_ids: Vec::with_capacity(256),
-            art_fav_counts: Vec::with_capacity(256),
-            art_tag_head: Vec::with_capacity(256),
-            art_tag_nodes: Vec::with_capacity(512),
             author_spans: Vec::with_capacity(128),
             fav_pairs: Vec::with_capacity(512),
             foll_pairs: Vec::with_capacity(512),
@@ -635,9 +629,13 @@ impl ReadWorker {
                 let bcrypt_us = EWMA_BCRYPT_US.load(Ordering::Relaxed);
                 let (want, max_age) = if busy == 0 && ewma_len <= 2 {
                     (rw, Duration::from_micros((tau_us / rw).max(1) as u64))
-                } else {
+                } else if busy < rw {
                     let target = (ewma_len + (ewma_len >> 1)).max(base_batch).min(max_batch);
                     (target, Duration::from_micros((bcrypt_us / lanes).max(1) as u64))
+                } else {
+                    let target = (ewma_len + (ewma_len >> 1)).max(base_batch).min(max_batch);
+                    let window_us = (tau_us / rw).max(bcrypt_us / (lanes / 2).max(2)).min(bcrypt_us);
+                    (target, Duration::from_micros(window_us as u64))
                 };
                 READ_QUEUE.take_aged(want, max_age, max_batch, &mut tasks);
             }
@@ -888,7 +886,9 @@ impl ReadWorker {
             }
             tx.write_sync();
         }
-        conn.flush()?;
+        if n_phase_a > 0 {
+            conn.flush()?;
+        }
         self.pa.clear();
         self.tag_lut.clear();
 
@@ -1035,9 +1035,11 @@ impl ReadWorker {
             }
         }
 
-        conn.read_pipeline_append(n_phase_a2, &mut self.pa)?;
-        if let Some(failed) = self.pa.results[n_phase_a1..].iter().find(|r| r.error.is_some()) {
-            return Err(PgError::Wire(format!("phase A2 error: {}", failed.error.as_ref().unwrap())));
+        if n_phase_a2 > 0 {
+            conn.read_pipeline_append(n_phase_a2, &mut self.pa)?;
+            if let Some(failed) = self.pa.results[n_phase_a1..].iter().find(|r| r.error.is_some()) {
+                return Err(PgError::Wire(format!("phase A2 error: {}", failed.error.as_ref().unwrap())));
+            }
         }
 
         self.distinct_arts.clear();
@@ -1104,7 +1106,8 @@ impl ReadWorker {
         let aid_rows = &self.rr.aid_rows;
 
         let raw_pages = &mut self.rr.raw_pages;
-        let mut unpack_list_into = |s: Option<usize>,
+        let mut unpack_list_into = |pipe: &PipelineBuf,
+                                    s: Option<usize>,
                                     n_cnt: usize,
                                     n_page: usize,
                                     has_meta: bool,
@@ -1129,17 +1132,17 @@ impl ReadWorker {
                 } else {
                     raw_pages.truncate(n_page);
                 }
-                for &span in pa.result_rows(idx) {
-                    let r = pa.row(span);
-                    let ord = pa.i64(r[0]);
+                for &span in pipe.result_rows(idx) {
+                    let r = pipe.row(span);
+                    let ord = pipe.i64(r[0]);
                     if ord <= 0 {
                         let c_idx = (-ord) as usize;
                         let c_idx = if c_idx == 0 { 0 } else { c_idx - 1 };
                         if c_idx < counts.len() {
-                            counts[c_idx] = pa.i64(r[1]);
+                            counts[c_idx] = pipe.i64(r[1]);
                         }
                     } else if (ord as usize) <= n_page {
-                        raw_pages[ord as usize - 1].push((pa.i64(r[1]), pa.i64(r[2]), span));
+                        raw_pages[ord as usize - 1].push((pipe.i64(r[1]), pipe.i64(r[2]), span));
                     }
                 }
                 for (p_idx, rp) in raw_pages.iter_mut().enumerate() {
@@ -1166,6 +1169,7 @@ impl ReadWorker {
 
         if use_global_win {
             unpack_list_into(
+                pa,
                 st_global,
                 1,
                 1,
@@ -1190,6 +1194,7 @@ impl ReadWorker {
             }
         } else {
             unpack_list_into(
+                pa,
                 st_global,
                 1,
                 self.k_global.len(),
@@ -1200,15 +1205,17 @@ impl ReadWorker {
         }
         for i in 0..3 {
             unpack_list_into(
+                pa,
                 st_filters[i],
                 self.k_filters[i].counts.len(),
                 self.k_filters[i].pages.len(),
-                i != 1,
+                true,
                 &mut self.rr.filter_counts[i],
                 &mut self.rr.filter_pages[i],
             );
         }
         unpack_list_into(
+            pa,
             st_feed,
             self.k_feed_cnt.len(),
             self.k_feed_page.len(),
@@ -1216,6 +1223,14 @@ impl ReadWorker {
             &mut self.rr.feed_counts,
             &mut self.rr.feed_pages,
         );
+        if let Some(s) = st_cmts {
+            for &span in pa.result_rows(s) {
+                let r = pa.row(span);
+                if r[1].len >= 0 && r[5].len >= 0 {
+                    self.distinct_authors.intern(pa.i64(r[5]));
+                }
+            }
+        }
         let global_pages = &self.rr.global_pages;
         let filter_pages = &self.rr.filter_pages;
         let feed_pages = &self.rr.feed_pages;
@@ -1282,7 +1297,7 @@ impl ReadWorker {
                         let rows = pa.result_rows(s);
                         for &row_i in &grp_cmts[k as usize] {
                             let r = pa.row(rows[row_i]);
-                            if r[1].len >= 0 {
+                            if r[1].len >= 0 && r[5].len >= 0 {
                                 self.foll_pairs.push((viewer, pa.i64(r[5])));
                             }
                         }
@@ -1374,122 +1389,38 @@ impl ReadWorker {
         self.rr.rendered_profiles.resize(self.k_prof.len(), None);
         self.rr.rendered_cmts.clear();
         self.rr.rendered_cmts.resize(self.k_cmts.len(), None);
-        {
+        if st_prof.is_some() {
             let pa = &self.pa;
-            let arena = &mut self.arena;
-            let cached_cmts = &mut self.rr.cached_cmts;
-            let cmt_sort_buf = &mut self.rr.cmt_sort_buf;
             let rendered_profiles = &mut self.rr.rendered_profiles;
-            let rendered_cmts = &mut self.rr.rendered_cmts;
-            if let Some(s) = st_cmts {
-                let cmt_rows = pa.result_rows(s);
-                for row_indices in grp_cmts {
-                    if row_indices.is_empty() {
-                        cached_cmts.push(None);
-                        continue;
-                    }
-                    cmt_sort_buf.clear();
-                    for &i in row_indices {
-                        let span = cmt_rows[i];
-                        let r = pa.row(span);
-                        if r[1].len >= 0 && r[6].len >= 0 {
-                            cmt_sort_buf.push((pa.i64(r[3]), pa.i64(r[1]), span));
-                        }
-                    }
-                    cmt_sort_buf.sort_unstable_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
-                    let mut list = Vec::with_capacity(cmt_sort_buf.len());
-                    for &(_, cid, span) in cmt_sort_buf.iter() {
-                        let r = pa.row(span);
-                        let start = arena.len() as u32;
-                        arena.extend_from_slice(b"{\"id\":");
-                        codec::write_i64(arena, cid);
-                        arena.extend_from_slice(b",\"createdAt\":");
-                        codec::write_timestamp(arena, pa.i64(r[3]));
-                        arena.extend_from_slice(b",\"updatedAt\":");
-                        codec::write_timestamp(arena, pa.i64(r[4]));
-                        arena.extend_from_slice(b",\"body\":");
-                        codec::write_str(arena, pa.bytes(r[2]).unwrap_or(b""));
-                        arena.extend_from_slice(b",\"author\":{\"username\":");
-                        codec::write_str(arena, pa.bytes(r[6]).unwrap_or(b""));
-                        arena.extend_from_slice(b",\"bio\":");
-                        codec::write_nullable_str(arena, pa.bytes(r[7]));
-                        arena.extend_from_slice(b",\"image\":");
-                        codec::write_nullable_str(arena, pa.bytes(r[8]));
-                        arena.extend_from_slice(b",\"following\":");
-                        let end = arena.len() as u32;
-                        list.push(CachedCommentSlice {
-                            author_id: pa.i64(r[5]),
-                            start,
-                            end,
-                        });
-                    }
-                    cached_cmts.push(Some(list));
+            let mut mid_replies: Vec<OutgoingReply> = Vec::new();
+            for (task, &slot) in tasks.iter().zip(self.plan.iter()) {
+                if task.viewer != 0 {
+                    continue;
                 }
-            }
-
-            if st_prof.is_some() || st_cmts.is_some() {
-                let mut mid_replies: Vec<OutgoingReply> = Vec::new();
-                for (task, &slot) in tasks.iter().zip(self.plan.iter()) {
-                    if task.viewer != 0 {
-                        continue;
-                    }
-                    let addr = task.addr;
-                    match slot {
-                        PlanSlot::Profile(k) => match prof_rows.get(k as usize).copied().flatten() {
-                            Some(span) => {
-                                if let Some(shared) = &rendered_profiles[k as usize] {
-                                    mid_replies.push(OutgoingReply {
-                                        addr,
-                                        status: 200,
-                                        body: ReplyBody::Shared(shared.clone()),
-                                    });
-                                } else {
-                                    let r = pa.row(span);
-                                    let mut body = Vec::with_capacity(256);
-                                    body.extend_from_slice(b"{\"profile\":");
-                                    write_profile_json(
-                                        &mut body,
-                                        pa.bytes(r[1]).unwrap_or(b""),
-                                        pa.bytes(r[2]),
-                                        pa.bytes(r[3]),
-                                        false,
-                                    );
-                                    body.push(b'}');
-                                    let arc: Arc<[u8]> = body.into();
-                                    rendered_profiles[k as usize] = Some(arc.clone());
-                                    mid_replies.push(OutgoingReply {
-                                        addr,
-                                        status: 200,
-                                        body: ReplyBody::Shared(arc),
-                                    });
-                                }
-                            }
-                            None => mid_replies.push(reactor::error_reply(addr, 404, "profile not found")),
-                        },
-                        PlanSlot::Comments(k) => {
-                            let Some(list) = &cached_cmts[k as usize] else {
-                                mid_replies.push(reactor::error_reply(addr, 404, "article not found"));
-                                continue;
-                            };
-                            if let Some(shared) = &rendered_cmts[k as usize] {
+                let addr = task.addr;
+                if let PlanSlot::Profile(k) = slot {
+                    match prof_rows.get(k as usize).copied().flatten() {
+                        Some(span) => {
+                            if let Some(shared) = &rendered_profiles[k as usize] {
                                 mid_replies.push(OutgoingReply {
                                     addr,
                                     status: 200,
                                     body: ReplyBody::Shared(shared.clone()),
                                 });
                             } else {
-                                let mut body = Vec::with_capacity(64 + 320 * list.len());
-                                body.extend_from_slice(b"{\"comments\":[");
-                                for (idx, c) in list.iter().enumerate() {
-                                    if idx > 0 {
-                                        body.push(b',');
-                                    }
-                                    body.extend_from_slice(&arena[c.start as usize..c.end as usize]);
-                                    body.extend_from_slice(b"false}}");
-                                }
-                                body.extend_from_slice(b"]}");
+                                let r = pa.row(span);
+                                let mut body = Vec::with_capacity(256);
+                                body.extend_from_slice(b"{\"profile\":");
+                                write_profile_json(
+                                    &mut body,
+                                    pa.bytes(r[1]).unwrap_or(b""),
+                                    pa.bytes(r[2]),
+                                    pa.bytes(r[3]),
+                                    false,
+                                );
+                                body.push(b'}');
                                 let arc: Arc<[u8]> = body.into();
-                                rendered_cmts[k as usize] = Some(arc.clone());
+                                rendered_profiles[k as usize] = Some(arc.clone());
                                 mid_replies.push(OutgoingReply {
                                     addr,
                                     status: 200,
@@ -1497,18 +1428,18 @@ impl ReadWorker {
                                 });
                             }
                         }
-                        _ => {}
+                        None => mid_replies.push(reactor::error_reply(addr, 404, "profile not found")),
                     }
                 }
-                if !mid_replies.is_empty() {
-                    reactor::complete_batch(mid_replies);
-                    err_addrs.clear();
-                    for (t, &slot) in tasks.iter().zip(self.plan.iter()) {
-                        let done_a1 = matches!(slot, PlanSlot::Tags | PlanSlot::User(_) | PlanSlot::Login(_));
-                        let done_mid = t.viewer == 0 && matches!(slot, PlanSlot::Profile(_) | PlanSlot::Comments(_));
-                        if !done_a1 && !done_mid {
-                            err_addrs.push(t.addr);
-                        }
+            }
+            if !mid_replies.is_empty() {
+                reactor::complete_batch(mid_replies);
+                err_addrs.clear();
+                for (t, &slot) in tasks.iter().zip(self.plan.iter()) {
+                    let done_a1 = matches!(slot, PlanSlot::Tags | PlanSlot::User(_) | PlanSlot::Login(_));
+                    let done_mid = t.viewer == 0 && matches!(slot, PlanSlot::Profile(_));
+                    if !done_a1 && !done_mid {
+                        err_addrs.push(t.addr);
                     }
                 }
             }
@@ -1546,29 +1477,13 @@ impl ReadWorker {
                 }
             }
             if let Some(s) = b_artx {
-                let n_arts = self.distinct_arts.len();
-                self.art_fav_counts.clear();
-                self.art_fav_counts.resize(n_arts, 0);
-                self.art_tag_head.clear();
-                self.art_tag_head.resize(n_arts, u32::MAX);
-                self.art_tag_nodes.clear();
                 for &span in pb.result_rows(s) {
                     let r = pb.row(span);
-                    let kind = pb.i64(r[0]);
-                    let aid = pb.i64(r[1]);
-                    let val = pb.i64(r[2]);
-                    if let Some(&ord) = self.distinct_arts.index.get(&aid) {
-                        let k = ord as usize;
-                        if kind == 0 {
-                            let node_idx = self.art_tag_nodes.len() as u32;
-                            self.art_tag_nodes.push((val as u32, self.art_tag_head[k]));
-                            self.art_tag_head[k] = node_idx;
-                        } else {
-                            self.art_fav_counts[k] = val;
-                        }
-                    }
-                }
-                for k in 0..n_arts {
+                    let aid = pb.i64(r[0]);
+                    let Some(&ord) = self.distinct_arts.index.get(&aid) else {
+                        continue;
+                    };
+                    let k = ord as usize;
                     let au_ord = self.art_author_ords[k] as usize;
                     let Some(au_span) = self.author_spans.get(au_ord).copied().flatten() else {
                         continue;
@@ -1608,25 +1523,27 @@ impl ReadWorker {
                     let head_end = arena.len() as u32;
 
                     arena.extend_from_slice(b",\"tagList\":[");
-                    tag_sort_buf.clear();
-                    let mut cur = self.art_tag_head[k];
-                    while cur != u32::MAX {
-                        let (tid, next) = self.art_tag_nodes[cur as usize];
-                        cur = next;
-                        if let Some(&name_cell) = self.tag_lut.get(tid as usize) {
-                            if let Some(name_bytes) = pa.bytes(name_cell) {
-                                tag_sort_buf.push(name_bytes);
+                    if let Some(raw_arr) = pb.bytes(r[1]) {
+                        tag_sort_buf.clear();
+                        for elem in wire::iter_binary_array(raw_arr) {
+                            if let Ok(bytes) = elem.try_into() {
+                                let tid = i32::from_be_bytes(bytes) as usize;
+                                if let Some(&name_cell) = self.tag_lut.get(tid) {
+                                    if let Some(name_bytes) = pa.bytes(name_cell) {
+                                        tag_sort_buf.push(name_bytes);
+                                    }
+                                }
                             }
                         }
-                    }
-                    if tag_sort_buf.len() > 1 {
-                        tag_sort_buf.sort_unstable();
-                    }
-                    for (idx, &name_bytes) in tag_sort_buf.iter().enumerate() {
-                        if idx > 0 {
-                            arena.push(b',');
+                        if tag_sort_buf.len() > 1 {
+                            tag_sort_buf.sort_unstable();
                         }
-                        codec::write_str(arena, name_bytes);
+                        for (idx, &name_bytes) in tag_sort_buf.iter().enumerate() {
+                            if idx > 0 {
+                                arena.push(b',');
+                            }
+                            codec::write_str(arena, name_bytes);
+                        }
                     }
                     arena.extend_from_slice(b"],\"createdAt\":");
                     codec::write_timestamp(arena, created_at);
@@ -1636,7 +1553,7 @@ impl ReadWorker {
                     let mid_end = arena.len() as u32;
 
                     arena.extend_from_slice(b",\"favoritesCount\":");
-                    codec::write_i64(arena, self.art_fav_counts[k]);
+                    codec::write_i64(arena, pb.i64(r[2]));
                     arena.extend_from_slice(b",\"author\":{\"username\":");
                     codec::write_str(arena, pb.bytes(au[1]).unwrap_or(b""));
                     arena.extend_from_slice(b",\"bio\":");
@@ -1670,6 +1587,60 @@ impl ReadWorker {
                 }
                 self.fav_hits.sort_unstable();
                 self.foll_hits.sort_unstable();
+            }
+        }
+
+        if let Some(s) = st_cmts {
+            let cached_cmts = &mut self.rr.cached_cmts;
+            let cmt_sort_buf = &mut self.rr.cmt_sort_buf;
+            let cmt_rows = pa.result_rows(s);
+            for row_indices in grp_cmts {
+                if row_indices.is_empty() {
+                    cached_cmts.push(None);
+                    continue;
+                }
+                cmt_sort_buf.clear();
+                for &i in row_indices {
+                    let span = cmt_rows[i];
+                    let r = pa.row(span);
+                    if r[1].len >= 0 && r[5].len >= 0 {
+                        let author_id = pa.i64(r[5]);
+                        if let Some(&au_ord) = self.distinct_authors.index.get(&author_id) {
+                            if let Some(au_span) = self.author_spans.get(au_ord as usize).copied().flatten() {
+                                cmt_sort_buf.push((pa.i64(r[3]), pa.i64(r[1]), span, au_span));
+                            }
+                        }
+                    }
+                }
+                cmt_sort_buf.sort_unstable_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
+                let mut list = Vec::with_capacity(cmt_sort_buf.len());
+                for &(_, cid, span, au_span) in cmt_sort_buf.iter() {
+                    let r = pa.row(span);
+                    let au = pb.row(au_span);
+                    let start = arena.len() as u32;
+                    arena.extend_from_slice(b"{\"id\":");
+                    codec::write_i64(arena, cid);
+                    arena.extend_from_slice(b",\"createdAt\":");
+                    codec::write_timestamp(arena, pa.i64(r[3]));
+                    arena.extend_from_slice(b",\"updatedAt\":");
+                    codec::write_timestamp(arena, pa.i64(r[4]));
+                    arena.extend_from_slice(b",\"body\":");
+                    codec::write_str(arena, pa.bytes(r[2]).unwrap_or(b""));
+                    arena.extend_from_slice(b",\"author\":{\"username\":");
+                    codec::write_str(arena, pb.bytes(au[1]).unwrap_or(b""));
+                    arena.extend_from_slice(b",\"bio\":");
+                    codec::write_nullable_str(arena, pb.bytes(au[2]));
+                    arena.extend_from_slice(b",\"image\":");
+                    codec::write_nullable_str(arena, pb.bytes(au[3]));
+                    arena.extend_from_slice(b",\"following\":");
+                    let end = arena.len() as u32;
+                    list.push(CachedCommentSlice {
+                        author_id: pa.i64(r[5]),
+                        start,
+                        end,
+                    });
+                }
+                cached_cmts.push(Some(list));
             }
         }
 
@@ -1811,14 +1782,11 @@ impl ReadWorker {
                     }
                 }
                 PlanSlot::Comments(k) => {
-                    if viewer == 0 {
-                        continue;
-                    }
                     let Some(list) = &cached_cmts[k as usize] else {
                         replies.push(reactor::error_reply(addr, 404, "article not found"));
                         continue;
                     };
-                    let unflagged = list.iter().all(|c| !render_ctx.is_following(viewer, c.author_id));
+                    let unflagged = viewer == 0 || list.iter().all(|c| !render_ctx.is_following(viewer, c.author_id));
                     if unflagged {
                         if let Some(shared) = &rendered_cmts[k as usize] {
                             replies.push(OutgoingReply {
@@ -2219,26 +2187,21 @@ impl WriteWorker {
         };
 
         let is_single_task = tasks.len() == 1;
-        let has_slug_mutation = !is_single_task
-            && tasks.iter().any(|t| {
-                matches!(
-                    t.op,
-                    WriteOp::CreateArticle { .. }
-                        | WriteOp::UpdateArticle { .. }
-                        | WriteOp::DeleteArticle { .. }
-                        | WriteOp::UpdateUser { .. }
-                )
-            });
+        let has_user_mutation = !is_single_task && tasks.iter().any(|t| matches!(t.op, WriteOp::UpdateUser { .. }));
 
+        let mut mutated_slugs: Vec<&str> = Vec::new();
         let mut fav_on_jobs: Vec<(i64, &str)> = Vec::new();
         let mut fav_off_jobs: Vec<(i64, &str)> = Vec::new();
         let mut foll_on_jobs: Vec<(i64, &str)> = Vec::new();
         let mut foll_off_jobs: Vec<(i64, &str)> = Vec::new();
         let mut cmt_jobs: Vec<(i64, &str, &str)> = Vec::new();
 
-        if !is_single_task && !has_slug_mutation {
+        if !is_single_task {
             for t in tasks.iter() {
                 match &t.op {
+                    WriteOp::UpdateArticle { slug, .. } | WriteOp::DeleteArticle { slug } => {
+                        mutated_slugs.push(slug.as_str());
+                    }
                     WriteOp::Favorite { slug, on: true } => fav_on_jobs.push((t.viewer, slug.as_str())),
                     WriteOp::Favorite { slug, on: false } => fav_off_jobs.push((t.viewer, slug.as_str())),
                     WriteOp::Follow { username, on: true } => foll_on_jobs.push((t.viewer, username.as_str())),
@@ -2251,16 +2214,19 @@ impl WriteWorker {
 
         let fav_conflict = fav_on_jobs
             .iter()
-            .any(|(_, s1)| fav_off_jobs.iter().any(|(_, s2)| s1 == s2));
-        let foll_conflict = foll_on_jobs
-            .iter()
-            .any(|(_, u1)| foll_off_jobs.iter().any(|(_, u2)| u1 == u2));
+            .any(|(_, s1)| fav_off_jobs.iter().any(|(_, s2)| s1 == s2) || mutated_slugs.contains(s1))
+            || fav_off_jobs.iter().any(|(_, s2)| mutated_slugs.contains(s2));
+        let foll_conflict = has_user_mutation
+            || foll_on_jobs
+                .iter()
+                .any(|(_, u1)| foll_off_jobs.iter().any(|(_, u2)| u1 == u2));
+        let cmt_conflict = has_user_mutation || cmt_jobs.iter().any(|(_, s, _)| mutated_slugs.contains(s));
 
         let batch_fav_on = !fav_conflict && fav_on_jobs.len() >= 2;
         let batch_fav_off = !fav_conflict && fav_off_jobs.len() >= 2;
         let batch_foll_on = !foll_conflict && foll_on_jobs.len() >= 2;
         let batch_foll_off = !foll_conflict && foll_off_jobs.len() >= 2;
-        let batch_cmt = cmt_jobs.len() >= 2;
+        let batch_cmt = !cmt_conflict && cmt_jobs.len() >= 2;
 
         let mut n_exec = 0usize;
 
