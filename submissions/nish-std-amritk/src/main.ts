@@ -144,6 +144,7 @@ export const main = (): i32 => {
   const gzip: string = getenv("GZIP") ?? "0"
   cfg.gzip = gzip === "1" ? 1 : gzip === "2" ? 2 : 0
   cfg.gzipMin = envInt("GZIP_MIN", 1300)
+  cfg.answerPace = envInt("ANSWER_PACE", 262144)
   // A quarter of the CPUs serve HTTP, each with its own read queue: at 120,000
   // users on a VM like the challenge's, 2 workers' bigger plans cost Postgres
   // 129 µs a request against 4 workers' 150, and 1 worker ran out of core.

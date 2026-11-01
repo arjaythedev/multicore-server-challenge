@@ -555,6 +555,8 @@ export class WorkerConfig {
   idleTimeoutMs: i32 = 75000
   /** Whether each answered connection goes back to delayed ACKs (`ConduitWorker.ackDelay`). */
   ackDelay: boolean = true
+  /** Bytes of the read service's answers a worker sends a millisecond (`ConduitWorker.takeAnswers`). */
+  answerPace: i32 = 262144
   /** 0: no gzip; 1: gzip a body when that sends fewer TCP segments; 2: whenever it saves anything. */
   gzip: i32 = 0
   /** The shortest body gzip is tried on. */
@@ -666,11 +668,17 @@ export class ConduitWorker {
   answerBuf: u8[]
   /** The channel is gone: the read service died. */
   readsGone: boolean = false
+  /** How many bytes of answers may go out a ms, what may go now and when that was reckoned, and whether answers wait for it. */
+  pace: i64 = 0
+  paceLeft: i64 = 0
+  paceAt: i64 = 0
+  paced: boolean = false
 
   constructor(cfg: WorkerConfig, listener: i32) {
     this.listener = listener
     this.readRec = new Array<u8>(READ_HEAD + PLAN_KEY_MAX)
     this.answerBuf = new Array<u8>(RESPONSE_ROOM)
+    this.pace = toI64(cfg.answerPace)
     const http = new Http1Config()
     http.idleTimeout = cfg.idleTimeoutMs
     http.maxBody = 1048576
@@ -825,6 +833,8 @@ export class ConduitWorker {
         reads.sleeping()
         if (this.takeAnswers(reads)) {
           wait = 0
+        } else if (this.paced) {
+          wait = wait > 1 ? 1 : wait
         }
       }
       const n: i32 = pollWait(this.loop, ready, wait)
@@ -844,10 +854,28 @@ export class ConduitWorker {
     return 1
   }
 
-  /** Answers every request the read service has answered; whether there were any. */
+  /**
+   * Answers the requests the read service has answered, as fast as `pace`
+   * lets it; whether there were any. A plan's answers come at once, hundreds
+   * of them, and written in one go they overflow a NIC's queue: on the VM at
+   * 175,000 users, 20,000 segments a second went again and 4,600 connections
+   * a second timed out, for 2 ms of waiting saved. Paced, they leave over the
+   * few ms the plan took to gather.
+   */
   takeAnswers(reads: ReadLink): boolean {
     let took: boolean = false
+    const now: i64 = monotonicNanos()
+    // A gap of a millisecond or more fills the budget, the first one included.
+    const gap: i64 = now - this.paceAt
+    this.paceLeft = gap >= 1000000 ? this.pace : this.paceLeft + (gap * this.pace) / 1000000
+    this.paceLeft = this.paceLeft > this.pace ? this.pace : this.paceLeft
+    this.paceAt = now
+    this.paced = false
     while (true) {
+      if (this.paceLeft <= 0) {
+        this.paced = true
+        return took
+      }
       const n: i32 = reads.rx.tryPop(this.answerBuf, 0)
       if (n === RING_EMPTY) {
         return took
@@ -857,6 +885,7 @@ export class ConduitWorker {
         continue
       }
       took = true
+      this.paceLeft -= toI64(n)
       const len: i32 = n - ANSWER_TAIL
       const r: ConduitReq = this.reqs[getI32LE(this.answerBuf, len)]
       const status: i32 = getI32LE(this.answerBuf, len + 4)
