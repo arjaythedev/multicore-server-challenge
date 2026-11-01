@@ -11,3 +11,8 @@ data/
 # Temporary files
 *.tmp
 *.swp
+
+runtime.env
+*.pyc
+__pycache__/
+*~
