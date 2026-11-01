@@ -12,17 +12,23 @@
 // and the ports above it.
 //
 // Configured by the environment only: DATABASE_URL, JWT_SECRET, HOST, PORT
-// (the challenge's), and optionally HTTP_WORKERS (half the CPUs, at least 2), DB_READ_CONNS (3) and
+// (the challenge's), and optionally HTTP_WORKERS (a quarter of the CPUs, at least 2), DB_READ_CONNS (6) and
 // DB_WRITE_CONNS (1) per worker, DB_MAX_IN_FLIGHT (16), DB_READ_IN_FLIGHT (4)
-// for the read connections, DB_READ_PLANS (DB_READ_CONNS) read plans in flight
-// per worker, READ_PLAN_MIN (256), READ_PLAN_WAIT_US (10000) and
+// for the read connections, DB_READ_PLANS (10) read plans in flight
+// per worker, READ_PLAN_MIN (512), READ_PLAN_WAIT_US (10000) and
 // READ_PLAN_CLOCK (1; 2 adaptive, with READ_PLAN_LIGHT 32) for when a plan starts (worker.ts, `planWaitLeft`),
-// BCRYPT_WORKERS (half the CPUs, at least 2), BCRYPT_BATCH_MS (160),
-// BCRYPT_PORT (47391) and IDLE_TIMEOUT_MS (75000).
+// BCRYPT_WORKERS (half the CPUs, at least 2), BCRYPT_BATCH_MS (160) for logins
+// and BCRYPT_HASH_MS (20) for sign-ups (bcrypt-service.ts),
+// BCRYPT_PORT (47391), BCRYPT_NICE (0; 1 to 19 lowers the bcrypt services'
+// priority, and "idle" moves them to SCHED_IDLE), IDLE_TIMEOUT_MS (75000) and
+// BCRYPT_WIDTH (0, timed at startup; 1 to 6 lanes a call),
+// ACK_DELAY (1; 0 leaves the kernel's ACKs alone, worker.ts `ackDelayAfter`),
+// GZIP (0; 1 when it saves a TCP segment, 2 whenever it saves anything) and GZIP_MIN (1300).
 import { tcpListenFlags } from "nish:net"
-import { availableParallelism, getenv } from "nish:process"
+import { availableParallelism, getenv, setIdlePriority, setNice } from "nish:process"
 import { PREFORK_STOPPED, PreforkConfig, preforkWith } from "nish/net/prefork"
-import { runBcryptService } from "./bcrypt-service"
+import { bcryptCalibrate } from "nish/crypto/bcrypt"
+import { BCRYPT_LANES, runBcryptService } from "./bcrypt-service"
 import { BCRYPT_SERVICES_MAX, ConduitWorker, WorkerConfig } from "./worker"
 
 /** `tcpListenFlags`: SO_REUSEPORT, and TCP_NODELAY on every accepted socket. */
@@ -82,6 +88,24 @@ const readDatabaseUrl = (url: string, cfg: WorkerConfig): boolean => {
   return cfg.dbUser.length > 0 && cfg.dbName.length > 0 && cfg.dbPort > 0
 }
 
+/**
+ * BCRYPT_NICE for a bcrypt service: a nice value from 1 to 19, or "idle" for
+ * SCHED_IDLE, so hashing yields the CPU to HTTP and Postgres; anything else
+ * leaves the priority alone. A refusal is logged and the service runs as is.
+ * Running bcrypt at idle priority is an idea from the challenge's
+ * zig-iouring-nick-potts submission.
+ */
+const lowerPriority = (nice: string): void => {
+  const n: i32 = nice === "idle" ? 0 : envInt("BCRYPT_NICE", 0)
+  if (nice !== "idle" && (n < 1 || n > 19)) {
+    return
+  }
+  const r: i32 = nice === "idle" ? setIdlePriority() : setNice(n)
+  if (r < 0) {
+    console.log(`conduit: the bcrypt service keeps its priority (BCRYPT_NICE=${nice}: ${r})`)
+  }
+}
+
 export const main = (): i32 => {
   const cfg = new WorkerConfig()
   if (!readDatabaseUrl(getenv("DATABASE_URL") ?? "", cfg)) {
@@ -94,26 +118,38 @@ export const main = (): i32 => {
   }
   cfg.host = getenv("HOST") ?? "0.0.0.0"
   cfg.port = envInt("PORT", 3000)
-  cfg.readConns = envInt("DB_READ_CONNS", 3)
+  cfg.readConns = envInt("DB_READ_CONNS", 6)
   cfg.writeConns = envInt("DB_WRITE_CONNS", 1)
   cfg.maxInFlight = envInt("DB_MAX_IN_FLIGHT", 16)
   cfg.readInFlight = envInt("DB_READ_IN_FLIGHT", 4)
-  cfg.readPlans = envInt("DB_READ_PLANS", cfg.readConns)
-  cfg.planMin = envInt("READ_PLAN_MIN", 256)
+  cfg.readPlans = envInt("DB_READ_PLANS", 10)
+  cfg.planMin = envInt("READ_PLAN_MIN", 512)
   cfg.planWaitUs = envInt("READ_PLAN_WAIT_US", 10000)
   const clock: string = getenv("READ_PLAN_CLOCK") ?? "1"
   cfg.planClock = clock === "0" ? 0 : clock === "2" ? 2 : 1
   cfg.planLight = envInt("READ_PLAN_LIGHT", 32)
   cfg.bcryptPort = envInt("BCRYPT_PORT", 47391)
   cfg.idleTimeoutMs = envInt("IDLE_TIMEOUT_MS", 75000)
-  // Half the CPUs serve HTTP: on the challenge's 8 CPUs, 4 held 120,000 users
-  // on a VM like it where 2 held 100,000 and 5 tied 4 with longer tails.
+  cfg.ackDelay = (getenv("ACK_DELAY") ?? "1") !== "0"
+  const gzip: string = getenv("GZIP") ?? "0"
+  cfg.gzip = gzip === "1" ? 1 : gzip === "2" ? 2 : 0
+  cfg.gzipMin = envInt("GZIP_MIN", 1300)
+  // A quarter of the CPUs serve HTTP, each with its own read queue: at 120,000
+  // users on a VM like the challenge's, 2 workers' bigger plans cost Postgres
+  // 129 µs a request against 4 workers' 150, and 1 worker ran out of core.
   const half: i32 = availableParallelism() / 2
-  const http: i32 = envInt("HTTP_WORKERS", half > 2 ? half : 2)
+  const quarter: i32 = half / 2
+  const http: i32 = envInt("HTTP_WORKERS", quarter > 2 ? quarter : 2)
   // Logins wait on bcrypt, which gets a fair share of a core per process
   // while Postgres keeps every core busy: one process fell behind them.
   const services: i32 = envInt("BCRYPT_WORKERS", half > 2 ? half : 2)
   cfg.bcryptServices = services > BCRYPT_SERVICES_MAX ? BCRYPT_SERVICES_MAX : services
+  // Every process comes through here, prefork starting each anew, so each times
+  // it for itself: all at once, at startup, about 30 ms. A worker's width only
+  // says which service it fills next.
+  const asked: i32 = envInt("BCRYPT_WIDTH", 0)
+  const width: i32 = asked >= 1 && asked <= BCRYPT_LANES ? asked : bcryptCalibrate()
+  cfg.bcryptWidth = width
   const prefork = new PreforkConfig()
   prefork.workers = http + cfg.bcryptServices
   prefork.restart = false
@@ -128,7 +164,11 @@ export const main = (): i32 => {
       console.log(`conduit: the bcrypt service cannot listen on 127.0.0.1:${port} (${listener})`)
       return 1
     }
-    return runBcryptService(listener, envInt("BCRYPT_BATCH_MS", 160))
+    if (index === http) {
+      console.log(`conduit: bcrypt runs ${width} lanes a call`)
+    }
+    lowerPriority(getenv("BCRYPT_NICE") ?? "0")
+    return runBcryptService(listener, envInt("BCRYPT_BATCH_MS", 160), envInt("BCRYPT_HASH_MS", 20), width)
   }
   const listener: i32 = tcpListenFlags(cfg.host, cfg.port, cfg.backlog, LISTEN_FLAGS)
   if (listener < 0) {
