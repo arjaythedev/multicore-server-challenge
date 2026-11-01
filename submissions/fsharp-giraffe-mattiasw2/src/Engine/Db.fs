@@ -33,6 +33,10 @@ let connectionString (url: string) (poolSize: int) (multiplexed: bool) : string 
     b.MaxAutoPrepare <- 64
     b.AutoPrepareMinUsages <- 2
     b.ApplicationName <- "conduit-fsharp"
+    // Session setting, not server config: a batch's statement looks costly to the planner (it
+    // cannot see how few rows a CTE holds), which crosses jit_above_cost, and compiling then
+    // takes ~400 ms of a 1 ms query.
+    b.Options <- "-c jit=off"
     b.ConnectionString
 
 let dataSource (connectionString: string) : NpgsqlDataSource = NpgsqlDataSource.Create connectionString

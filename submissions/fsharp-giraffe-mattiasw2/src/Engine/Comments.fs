@@ -4,9 +4,27 @@ open System.Threading.Tasks
 open Npgsql
 open Npgsql.FSharp
 
-// The article lookup and the newest 100 comments in one statement: no article row = 404, an
-// article without comments is one row with NULL comment columns.
-let private listSql =
+// A batch of (slug, viewer) requests. Each distinct article's newest 100 comments are read once
+// (`c`); only the viewer's `following` flag is per request. No row for a request = no such
+// article (404); an article without comments is one row with NULL comment columns.
+let private batchedListSql =
+    "WITH q AS (SELECT * FROM unnest(@slugs::text[], @viewers::int8[]) WITH ORDINALITY AS r(slug, viewer, k)),
+          t AS MATERIALIZED (SELECT x.id, d.slug FROM (SELECT DISTINCT slug FROM q) d CROSS JOIN LATERAL
+                               (SELECT a.id FROM articles a WHERE a.slug = d.slug LIMIT 1) x),
+          c AS MATERIALIZED (
+            SELECT t.id AS article_id, x.* FROM t CROSS JOIN LATERAL (
+                SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id, u.username, u.bio, u.image
+                  FROM comments c JOIN users u ON u.id = c.author_id
+                 WHERE c.article_id = t.id
+                 ORDER BY c.created_at DESC, c.id DESC
+                 LIMIT 100) x)
+     SELECT q.k, c.id, c.body, c.created_at, c.updated_at, c.username, c.bio, c.image,
+            EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = q.viewer AND fo.followee_id = c.author_id) AS following
+       FROM q JOIN t ON t.slug = q.slug LEFT JOIN c ON c.article_id = t.id
+      ORDER BY q.k, c.created_at DESC, c.id DESC"
+
+// One request: the article lookup and its newest 100 comments.
+let private singleListSql =
     "SELECT t.id AS article_id, c.* FROM (SELECT id FROM articles WHERE slug = @slug) t
        LEFT JOIN LATERAL (
             SELECT c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image,
@@ -28,22 +46,25 @@ let private comment (following: bool option) (read: RowReader) : Comment =
           Image = read.textOrNone "image"
           Following = following |> Option.defaultWith (fun () -> read.bool "following") } }
 
-/// None = no such article.
-let list (ds: NpgsqlDataSource) (viewer: ViewerId) (slug: string) : Task<Comment list option> =
-    task {
-        let! rows =
-            Sql.fromDataSource ds
-            |> Sql.query listSql
-            |> Sql.parameters [ "@viewer", Sql.int64 viewer; "@slug", Sql.text slug ]
-            |> Sql.executeAsync (fun read ->
-                match read.int64OrNone "id" with
-                | Some _ -> Some(comment None read)
-                | None -> None)
-        return
+let private listKind: Reads.Kind<string * ViewerId, Comment option, Comment list option> =
+    Reads.Kind(
+        batchedListSql,
+        (fun rs -> [ Reads.texts "@slugs" (rs |> Array.map fst); Reads.int64s "@viewers" (rs |> Array.map snd) ]),
+        singleListSql,
+        (fun (slug, viewer) -> [ Reads.text "@slug" slug; Reads.long "@viewer" viewer ]),
+        (fun read ->
+            match read.int64OrNone "id" with
+            | Some _ -> Some(comment None read)
+            | None -> None),
+        (fun _ rows ->
             match rows with
             | [] -> None
-            | rows -> Some(List.choose id rows)
-    }
+            | rows -> Some(List.choose id rows))
+    )
+
+/// None = no such article.
+let list (reads: Reads.Gather) (viewer: ViewerId) (slug: string) : Task<Comment list option> =
+    reads.Run(listKind, (slug, viewer))
 
 let private createSql =
     "WITH t AS (SELECT id FROM articles WHERE slug = @slug),

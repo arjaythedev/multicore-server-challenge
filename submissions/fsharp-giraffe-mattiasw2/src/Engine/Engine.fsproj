@@ -8,6 +8,7 @@
     <Compile Include="Types.fs" />
     <Compile Include="Db.fs" />
     <Compile Include="Commit.fs" />
+    <Compile Include="Reads.fs" />
     <Compile Include="Passwords.fs" />
     <Compile Include="Tags.fs" />
     <Compile Include="Users.fs" />

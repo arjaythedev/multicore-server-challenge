@@ -13,6 +13,8 @@ open Engine
 [<NoEquality; NoComparison>]
 type Env =
     { Db: NpgsqlDataSource
+      /// The hot reads, batched (Engine.Reads).
+      Reads: Reads.Gather
       /// Every write goes through group commit (Engine.Commit).
       Writes: Commit.Writer
       Jwt: Jwt.Signer }
@@ -130,7 +132,7 @@ let private respond (f: unit -> Task<HttpHandler>) : HttpHandler =
 let tags (env: Env) : HttpHandler =
     respond (fun () ->
         task {
-            let! names = Tags.all env.Db
+            let! names = Tags.all env.Reads
             return ok (Wire.tags names)
         })
 
@@ -208,7 +210,7 @@ let profile (env: Env) (username: string) : HttpHandler =
     viewing env (fun viewer ->
         respond (fun () ->
             task {
-                match! Profiles.get env.Db viewer username with
+                match! Profiles.get env.Reads viewer username with
                 | Some p -> return ok (Wire.profile p)
                 | None -> return notFound
             }))
@@ -229,7 +231,7 @@ let listArticles (env: Env) : HttpHandler =
         | Error message -> unprocessable message next ctx
         | Ok paging ->
             task {
-                let! page = Articles.list env.Db viewer (Wire.filter query) paging
+                let! page = Articles.list env.Reads viewer (Wire.filter query) paging
                 return! ok (Wire.articles page) next ctx
             })
 
@@ -239,7 +241,7 @@ let feed (env: Env) : HttpHandler =
         | Error message -> unprocessable message next ctx
         | Ok paging ->
             task {
-                let! page = Articles.feed env.Db viewer paging
+                let! page = Articles.feed env.Reads viewer paging
                 return! ok (Wire.articles page) next ctx
             })
 
@@ -247,7 +249,7 @@ let article (env: Env) (slug: string) : HttpHandler =
     viewing env (fun viewer ->
         respond (fun () ->
             task {
-                match! Articles.bySlug env.Db viewer slug with
+                match! Articles.bySlug env.Reads viewer slug with
                 | Some a -> return ok (Wire.article a)
                 | None -> return notFound
             }))
@@ -297,7 +299,7 @@ let comments (env: Env) (slug: string) : HttpHandler =
     viewing env (fun viewer ->
         respond (fun () ->
             task {
-                match! Comments.list env.Db viewer slug with
+                match! Comments.list env.Reads viewer slug with
                 | Some cs -> return ok (Wire.comments cs)
                 | None -> return notFound
             }))

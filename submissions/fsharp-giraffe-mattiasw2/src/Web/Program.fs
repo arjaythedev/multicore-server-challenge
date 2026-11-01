@@ -73,16 +73,25 @@ let main args =
     // WRITE_GROUP writes at a time.
     let writeLanes = max 1 (int (setting "WRITE_LANES" "2"))
     let writeGroup = max 1 (int (setting "WRITE_GROUP" "128"))
-    // Multiplexed: these connections carry every read; Postgres does best with a few busy
-    // backends per core, not many idle ones. Rule: 95 or fewer in total, lanes included.
-    let poolSize = min (95 - writeLanes) (int (setting "DB_POOL_SIZE" (string (cores * 3))))
+    // Read batching: READ_LANES connections of their own, each running one batch of up to
+    // READ_BATCH requests at a time. One busy backend per core.
+    let readLanes = max 1 (int (setting "READ_LANES" (string cores)))
+    let readBatch = max 1 (int (setting "READ_BATCH" "1024"))
+    // Multiplexed: the cold reads (sign-in lookups, the read after a write). Rule: 95 or fewer
+    // connections in total, lanes included.
+    let poolSize = min (95 - writeLanes - readLanes) (int (setting "DB_POOL_SIZE" (string (max 2 (cores / 2)))))
     let bcryptLanes = int (setting "BCRYPT_THREADS" (string (max 1 (cores / 2))))
 
     Engine.Passwords.start bcryptLanes
     let ds = Engine.Db.dataSource (Engine.Db.connectionString databaseUrl poolSize true)
     let writes =
         Engine.Commit.Writer(Engine.Db.connectionString databaseUrl writeLanes false, writeLanes, writeGroup)
-    let env: Handlers.Env = { Db = ds; Writes = writes; Jwt = Jwt.Signer secret }
+    let reads = Engine.Reads.Gather(Engine.Db.connectionString databaseUrl readLanes false, readLanes, readBatch)
+    let env: Handlers.Env =
+        { Db = ds
+          Reads = reads
+          Writes = writes
+          Jwt = Jwt.Signer secret }
 
     let builder = WebApplication.CreateSlimBuilder(args)
     builder.Logging.ClearProviders() |> ignore
@@ -116,15 +125,17 @@ let main args =
     app.Run(RequestDelegate(fun ctx -> writeError ctx 404 "not found"))
 
     // Touch the database before taking traffic: a bad DATABASE_URL fails here, loudly.
-    (Engine.Tags.all ds).GetAwaiter().GetResult() |> ignore
+    (Engine.Tags.all reads).GetAwaiter().GetResult() |> ignore
     eprintfn
-        "conduit (F#, Giraffe on Kestrel) on %s:%d, %d db connections (multiplexed) + %d write lanes (groups of <= %d), %d bcrypt lanes"
-        host port poolSize writeLanes writeGroup bcryptLanes
+        "conduit (F#, Giraffe on Kestrel) on %s:%d, %d read lanes (batches of <= %d) + %d write lanes (groups of <= %d) + %d multiplexed db connections, %d bcrypt lanes"
+        host port readLanes readBatch writeLanes writeGroup poolSize bcryptLanes
     app.Lifetime.ApplicationStopping.Register(fun () ->
         let hashes, verifies = Engine.Passwords.counts ()
         eprintfn "bcrypt: %d hashes (sign-ups, password changes), %d verifies (logins)" hashes verifies
         let groups, written = writes.Counts
-        eprintfn "group commit: %d writes in %d groups" written groups)
+        eprintfn "group commit: %d writes in %d groups" written groups
+        let batches, statements, requests = reads.Counts
+        eprintfn "read batching: %d requests in %d statements, %d batches" requests statements batches)
     |> ignore
     app.Run()
     0

@@ -1,10 +1,9 @@
 module Engine.Tags
 
 open System.Threading.Tasks
-open Npgsql
-open Npgsql.FSharp
 
-let all (ds: NpgsqlDataSource) : Task<string list> =
-    Sql.fromDataSource ds
-    |> Sql.query "SELECT name FROM tags ORDER BY name"
-    |> Sql.executeAsync (fun read -> read.text "name")
+/// Every tag request of a batch shares the one statement's rows.
+let private allKind =
+    Reads.shared "SELECT name FROM tags ORDER BY name" (fun read -> read.text "name") id
+
+let all (reads: Reads.Gather) : Task<string list> = reads.Run(allKind, ())

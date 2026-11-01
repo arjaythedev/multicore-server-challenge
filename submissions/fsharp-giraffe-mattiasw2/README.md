@@ -20,7 +20,7 @@ Package versions are pinned, and `build.sh` restores the `packages.lock.json` gr
 ## Layout
 
 ```
-src/Engine/   the database side: Types, Db (pool), Commit (group commit), Passwords (bcrypt lanes), Tags, Users, Profiles, Articles, Comments
+src/Engine/   the database side: Types, Db (pool), Commit (group commit), Reads (read batching), Passwords (bcrypt lanes), Tags, Users, Profiles, Articles, Comments
 src/Web/      Jwt (the token shim), Wire (JSON in/out, query paging; pure), Handlers (Giraffe), Program (Kestrel)
 src/Tests/    xUnit facts for Jwt and Wire (no database)
 check.sh      the harness: build -> facts -> conformance suite (../../test/run.sh), with one verdict at the end
@@ -36,9 +36,30 @@ check.sh      the harness: build -> facts -> conformance suite (../../test/run.s
 
 - **One process, one Kestrel.** Kestrel serves every core with async I/O and holds each user's keep-alive
   connection directly (`Front: direct`). The keep-alive timeout is 120 s.
-- **One multiplexed Npgsql pool for reads**, `DB_POOL_SIZE` connections, default 3 per core. A request does not hold
-  a connection: its statements queue and are written, pipelined, to whichever connection is free. That keeps Postgres
-  at a few busy backends per core instead of one per waiting request.
+- **Read batching for the hot reads** (`src/Engine/Reads.fs`): tags, the four article lists, the feed, article by
+  slug, comments and profiles. Every such read queues on one channel. `READ_LANES` reader lanes (default one per
+  core), each with a connection of its own, take whatever queued while their previous batch was in flight (up to
+  `READ_BATCH`, default 1024) and send it as one `NpgsqlBatch` with **one statement per kind of read**.
+  - Each kind has two statements with the same columns. A kind with one request in the batch uses the **single**
+    statement (the plain per-request query). A kind with several uses the **batched** statement, which takes the
+    requests as arrays (`unnest(...) WITH ORDINALITY`) and tags every row with `k`, the request it belongs to.
+  - The batched statement does the viewer-independent work **once per distinct value**, in `MATERIALIZED` CTEs: one
+    capped count per list key, one page of ids per (key, limit, offset), and one card per article (columns, tag array,
+    favorite count, author). Only the viewer's `favorited` and `following` flags are per request. Forty users on
+    page 1 of the global feed cost one page and ten cards, plus the flags.
+  - There is no timer. With no load each statement serves one request; near saturation the batches grow by
+    themselves, and each request costs Postgres less. On an 8-core test box at 40,000 users this took p95 from 673 ms
+    (fail) to 66 ms, at more requests per second and less Postgres CPU.
+  - This is not a cache: every request is answered by a statement that started after it arrived, and nothing
+    outlives its batch.
+  - Lookups by a batch's keys are `CROSS JOIN LATERAL (… LIMIT 1)`: one index probe per distinct key. The planner
+    cannot see how few rows a CTE holds. With a plain join it hash-joins whole tables, and the `LIMIT 1` (on unique
+    keys) stops it from flattening the lateral back into that join.
+  - Our sessions run with `jit=off` (a session setting; the server config is untouched). The batched statements look
+    costly to the planner, and JIT compiling took ~400 ms of a 1 ms query.
+- **One multiplexed Npgsql pool for the cold reads** (sign-in lookups, the read after a write), `DB_POOL_SIZE`
+  connections, default cores / 2. A request does not hold a connection: its statements are pipelined onto whichever
+  connection is free.
 - **Group commit for writes** (`src/Engine/Commit.fs`). Every write queues on one channel. `WRITE_LANES` writer
   lanes (default 2), each with a connection of its own, take whatever queued while their previous group was in flight
   (up to `WRITE_GROUP`, default 128) and send it as one `NpgsqlBatch`. That is one round trip and one implicit
@@ -57,10 +78,12 @@ check.sh      the harness: build -> facts -> conformance suite (../../test/run.s
 
 ## SQL
 
-The reference SQL, reshaped so that **every read and most writes take one round trip**:
+The reference SQL, reshaped so that **every read and most writes take one round trip** (and a batch of reads one
+statement per kind, see above):
 
-- **Lists:** the page and its capped count are one statement. The count is a one-row subquery and the page joins it
-  `LEFT JOIN LATERAL`, so an empty page still returns the count.
+- **Lists:** the count, the page's ids and their cards are one statement. The page is chosen by id first and the card
+  columns are built only for its rows, so a huge `offset` skips index entries instead of computing tag arrays and
+  counts for every skipped article. An empty page still returns the count.
 - **Global count:** walks the primary key from the oldest end (`ORDER BY id LIMIT 1000`). Those pages are
   all-visible, so it is an index-only scan.
 - **Comments:** the article lookup and the newest 100 comments are one statement. No row means 404.
@@ -98,7 +121,8 @@ sign-up, password change or login, and only when that request is going to succee
 The pre-checks don't change the outcome: two racing sign-ups can both pass, and the UNIQUE constraint still answers
 422. At shutdown the server logs its counts (`bcrypt: N hashes, M verifies`). A conformance run gives exactly
 3 hashes (2 sign-ups + 1 password change) and 5 verifies (the 5 logins whose email exists).
-- **Connections:** at most 95 Postgres connections (`DB_POOL_SIZE` + `WRITE_LANES`, the pool is capped to fit).
+- **Connections:** at most 95 Postgres connections (`READ_LANES` + `WRITE_LANES` + `DB_POOL_SIZE`; the pool is
+  capped to fit).
 
 ## Build, run, check
 
@@ -111,5 +135,6 @@ bash check.sh                   # build + facts + conformance (needs the dev see
 SKIP_CONFORMANCE=1 bash check.sh  # the quick gate, no database
 ```
 
-Environment: `DATABASE_URL`, `JWT_SECRET` (required); `HOST` (127.0.0.1), `PORT` (3000); `DB_POOL_SIZE`
-(3 × cores, at most 95 − `WRITE_LANES`); `WRITE_LANES` (2); `WRITE_GROUP` (128); `BCRYPT_THREADS` (cores / 2).
+Environment: `DATABASE_URL`, `JWT_SECRET` (required); `HOST` (127.0.0.1), `PORT` (3000); `READ_LANES` (cores);
+`READ_BATCH` (1024); `WRITE_LANES` (2); `WRITE_GROUP` (128); `DB_POOL_SIZE` (cores / 2, capped so the total stays
+at most 95); `BCRYPT_THREADS` (cores / 2).
