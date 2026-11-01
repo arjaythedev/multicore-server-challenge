@@ -61,9 +61,18 @@ static struct ring *ring_new(size_t bytes) {
     return r;
 }
 
-void ipc_setup(int nworkers, size_t ring_bytes) {
+void ipc_setup(int nworkers, size_t ring_bytes, uint32_t nconns) {
     if (ring_bytes & (ring_bytes - 1)) die("ring size must be a power of two");
     ipc.nworkers = nworkers;
+    /* Zero-filled shared pages, touched only where connections are: idle tables cost no memory. */
+    ipc.live_n = nconns;
+    ipc.live = xcalloc((size_t)nworkers, sizeof *ipc.live);
+    for (int i = 0; i < nworkers; i++) {
+        void *p = mmap(NULL, (size_t)nconns * sizeof(uint32_t), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS,
+                       -1, 0);
+        if (p == MAP_FAILED) die("mmap liveness table: %s", strerror(errno));
+        ipc.live[i] = p;
+    }
     ipc.drain_efd = eventfd(0, EFD_CLOEXEC);
     if (ipc.drain_efd < 0) die("eventfd: %s", strerror(errno));
     ipc.worker_efd = xcalloc((size_t)nworkers, sizeof(int));

@@ -20,27 +20,38 @@ struct plan_req {
     uint8_t kind, filter;
     uint16_t pad;
     uint32_t keylen;       /* the tag, author, favorited user, slug or username, in key[] */
+    int32_t fd;            /* the client connection and its generation (ipc_alive) */
+    uint32_t gen;
     int64_t viewer;        /* 0: anonymous */
     int64_t limit, offset;
     char key[];
 };
 
 struct plan_reply {
-    uint16_t status;
+    uint16_t status;       /* 0: not run, its client hung up (no body) */
     uint16_t pad;
     uint32_t len;          /* JSON body bytes that follow */
     char body[];
 };
+
+/* Planned reads wait in one queue per lane, and each plan takes requests of one lane only: feeds (the dearest
+ * read) and comments (their own statement and nothing to enrich) don't hold up the rest. With LANES=0 every
+ * request waits in PL_SHARED. */
+enum plan_lane { PL_FEED, PL_CMT, PL_SHARED, PL_N };
 
 /* drain.c hands planned requests to planner.c and lends it a Postgres connection per plan. */
 struct dconn;
 struct plan;
 void planner_init(void);
 void planner_add(int worker, uint64_t token, const struct plan_req *pr, uint32_t len);
-/* Microseconds until the oldest waiting request is due, 0 if one is due now, -1 if nothing waits. */
-int64_t planner_due_in(int64_t now_us, int64_t wait_us);
-/* Takes up to the batch limit of waiting requests into a plan and writes its phase A to out; NULL if none. */
-struct plan *planner_start(struct buf *out);
+/* Microseconds until the lane's oldest waiting request has waited wait_us (0 if it has, or if the lane holds a
+ * full plan), -1 if nothing waits on the lane. */
+int64_t planner_due_in(int lane, int64_t now_us, int64_t wait_us);
+/* Requests waiting on the lane. */
+uint32_t planner_waiting(int lane);
+/* Takes up to the batch limit of the lane's waiting requests into a plan and writes its phase A to out; NULL if
+ * none. */
+struct plan *planner_start(int lane, struct buf *out);
 /* A message of the plan's current phase. On ReadyForQuery it returns true, after writing phase B to out (when
  * there is one) or answering every request and freeing the plan (*done set). */
 bool planner_msg(struct plan *p, const struct pg_msg *m, struct buf *out, bool *done);

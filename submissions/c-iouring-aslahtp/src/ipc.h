@@ -50,8 +50,18 @@ struct shared {
     int *worker_efd;        /* drain (and bcrypt threads) -> worker wake-ups */
     struct ring **to_drain;
     struct ring **to_worker;
+    /* Per worker, by connection fd: the connection's current generation, written by the worker when it closes the
+     * connection (the only time a generation changes). A request whose generation no longer matches belongs to a
+     * client that hung up; the drain drops it instead of running it. */
+    _Atomic uint32_t **live;
+    uint32_t live_n;
 };
 extern struct shared ipc;
 
-void ipc_setup(int nworkers, size_t ring_bytes);
+void ipc_setup(int nworkers, size_t ring_bytes, uint32_t nconns);
 void ipc_wake(int efd);
+
+/* Whether a request (fd, gen) of the worker still has its client. */
+static inline bool ipc_alive(int worker, int fd, uint32_t gen) {
+    return (uint32_t)fd >= ipc.live_n || atomic_load_explicit(&ipc.live[worker][fd], memory_order_relaxed) == gen;
+}
