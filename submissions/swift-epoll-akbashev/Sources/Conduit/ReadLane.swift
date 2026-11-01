@@ -828,7 +828,7 @@ actor ReadLane {
             tagSortBuf.removeAll(keepingCapacity: true)
             forEachArrayElement(pb.text(pb.cell(r, 6))) { elem in
                 guard elem.count == 4 else { return }
-                let tid = Int(Int32(bigEndian: elem.withUnsafeBytes { $0.loadUnaligned(as: Int32.self) }))
+                let tid = Int(elem.bytes.load(fromByteOffset: 0, as: Int32.self, .bigEndian))
                 if tid >= 0 && tid < tagLut.count && !tagLut[tid].isNull { tagSortBuf.append(tagLut[tid]) }
             }
             if tagSortBuf.count > 1 { tagSortBuf.sort { lexLess(pa.text($0), pa.text($1)) } }

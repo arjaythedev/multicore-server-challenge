@@ -57,14 +57,16 @@ batch, never per request:
 - `~Copyable`: `ByteBuffer` (the Rust's `Vec<u8>`: one owner, never copied, so appending never copies its array),
   `UniqueArray` (the reactor's connection slots, each owning its buffers), `PgConn` (owns its socket, closes it in
   `deinit`), `PipelineBuf`, `TxBuf`, and the `Dispatch`/`ParseOutcome` results that carry an owned body.
-- `Span`, `MutableSpan`, `OutputSpan`: every byte reader takes a `Span`; socket reads fill a buffer through an
+- `Span`, `RawSpan`, `MutableSpan`, `OutputSpan`: every byte reader takes a `Span`; integers are loaded from a
+  `RawSpan` (`load(fromByteOffset:as:_:)`, big-endian for Postgres frames and cells and SHA-256 blocks, native for
+  epoll events), as are the JSON writer's 16-byte SIMD and 8-byte word checks; socket reads fill a buffer through an
   `OutputSpan`; base64 decodes into a `MutableSpan` of a stack `InlineArray`.
 - `~Escapable` with `@_lifetime`: `HttpReq` borrows the reactor's read buffer (the Rust's `HttpReq<'a>`), the JSON
   parser borrows the body, and the pipeline buffer lends its cells as `Span`s.
 - `InlineArray` and value generics: the SHA-256 state and schedule, bcrypt's Blowfish states (`bcryptLanes<let n>`,
   the Rust's `bcrypt_lanes<const N>`), bcrypt's base64 decode (`<let count: Int>`), HTTP header and number buffers.
-- `UTF8Span(validating:)` for UTF-8 checks, typed throws (`throws(PgError)`), `sending`/region isolation,
-  `Mutex` and `Atomic` from Synchronization.
+- `UTF8Span(validating:)` for UTF-8 checks, typed throws (`throws(PgError)`), `Mutex` and `Atomic` from
+  Synchronization.
 - `@_extern(c)`: the Linux calls Glibc's module leaves out (epoll, eventfd, accept4, unshare, getrandom,
   sched_setscheduler, prctl, mallopt), declared in Swift (`Sys.swift`), as the Rust declares them in its `mod sys`.
 

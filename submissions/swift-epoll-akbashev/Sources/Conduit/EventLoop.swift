@@ -90,25 +90,31 @@ final class EventLoop: SerialExecutor, TaskExecutor {
     /// epoll instance, filling `events` (whose stride is `Sys.epollEventStride`), until a registered socket is ready or
     /// a job is queued for the loop. Returns the socket events (the eventfd's are dropped) and whether jobs are
     /// waiting, which the caller lets run by suspending.
-    func waitForEvents(_ events: UnsafeMutableRawPointer, _ maxEvents: Int32) -> (count: Int, jobsWaiting: Bool) {
+    func waitForEvents(_ events: inout [UInt8]) -> (count: Int, jobsWaiting: Bool) {
         sleeping.store(true, ordering: .sequentiallyConsistent)
         let timeout: Int32 = jobs.withLock({ $0.isEmpty }) ? -1 : 0
-        let n = Int(max(sys_epoll_wait(epollFD, events, maxEvents, timeout), 0))
+        let n = Int(max(epollWait(&events, timeout), 0))
         sleeping.store(false, ordering: .relaxed)
         var kept = 0
         for i in 0..<n {
             let at = i * Sys.epollEventStride
-            if events.loadUnaligned(fromByteOffset: at + Sys.epollDataOffset, as: UInt64.self) == EventLoop.wakeToken {
+            if events.span.bytes.load(fromByteOffset: at + Sys.epollDataOffset, as: UInt64.self) == EventLoop.wakeToken {
                 var value: UInt64 = 0
                 _ = sys_read(wakeFD, &value, 8)
                 continue
             }
             if kept != i {
-                (events + kept * Sys.epollEventStride).copyMemory(from: events + at, byteCount: Sys.epollEventStride)
+                for b in 0..<Sys.epollEventStride { events[kept * Sys.epollEventStride + b] = events[at + b] }
             }
             kept += 1
         }
         return (kept, !jobs.withLock { $0.isEmpty })
+    }
+
+    /// epoll_wait into `events`, as many events as it holds.
+    @inline(__always) private func epollWait(_ events: inout [UInt8], _ timeout: Int32) -> Int32 {
+        let capacity = Int32(events.count / Sys.epollEventStride)
+        return events.withUnsafeMutableBytes { sys_epoll_wait(epollFD, $0.baseAddress!, capacity, timeout) }
     }
 
     // ---------- the thread ----------
@@ -116,7 +122,7 @@ final class EventLoop: SerialExecutor, TaskExecutor {
     private func run() -> Never {
         threadID.store(UInt(bitPattern: Int(bitPattern: pthread_self())), ordering: .relaxed)
         let maxEvents = 64
-        let events = UnsafeMutableRawPointer.allocate(byteCount: maxEvents * Sys.epollEventStride, alignment: 8)
+        var events = [UInt8](repeating: 0, count: maxEvents * Sys.epollEventStride)
         var batch: [UnownedJob] = []
         while true {
             jobs.withLock { swap(&batch, &$0) }
@@ -139,10 +145,10 @@ final class EventLoop: SerialExecutor, TaskExecutor {
                 timeout = deadline <= now ? 0 : Int32(min((deadline - now + 999_999) / 1_000_000, 60_000))
             }
             // Only the eventfd matters here: a reactor's sockets are read by the reactor's own waitForEvents.
-            let n = sys_epoll_wait(epollFD, events, Int32(maxEvents), timeout)
+            let n = epollWait(&events, timeout)
             sleeping.store(false, ordering: .relaxed)
             for i in 0..<max(Int(n), 0)
-            where events.loadUnaligned(fromByteOffset: i * Sys.epollEventStride + Sys.epollDataOffset, as: UInt64.self) == EventLoop.wakeToken {
+            where events.span.bytes.load(fromByteOffset: i * Sys.epollEventStride + Sys.epollDataOffset, as: UInt64.self) == EventLoop.wakeToken {
                 var value: UInt64 = 0
                 _ = sys_read(wakeFD, &value, 8)
             }

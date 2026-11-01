@@ -108,7 +108,7 @@ actor Reactor {
     private var activeConns = 0
     private var idleHead = idleNone
     private var idleTail = idleNone
-    private let events: UnsafeMutableRawPointer
+    private var events: [UInt8]
     private let maxEvents = 1024
     /// What this tick routed, for the scheduler.
     private var pending = Submission()
@@ -121,7 +121,7 @@ actor Reactor {
         self.host = host
         self.port = port
         self.fdBudget = max(fdBudget, 256)
-        events = .allocate(byteCount: 1024 * Sys.epollEventStride, alignment: 8)
+        events = [UInt8](repeating: 0, count: maxEvents * Sys.epollEventStride)
         freeSlots.reserveCapacity(4096)
         pipelinedSlots.reserveCapacity(256)
     }
@@ -144,11 +144,11 @@ actor Reactor {
             while true {
                 // One epoll_wait per tick, as the Rust's loop: it blocks here, on this actor's own thread, until a
                 // socket is ready or a message (a lane's `deliver`) is queued for the actor.
-                let (n, messagesWaiting) = loop.waitForEvents(events, Int32(maxEvents))
+                let (n, messagesWaiting) = loop.waitForEvents(&events)
                 for i in 0..<n {
                     let base = i * Sys.epollEventStride
-                    let flags = events.loadUnaligned(fromByteOffset: base, as: UInt32.self)
-                    let token = events.loadUnaligned(fromByteOffset: base + Sys.epollDataOffset, as: UInt64.self)
+                    let flags = events.span.bytes.load(fromByteOffset: base, as: UInt32.self)
+                    let token = events.span.bytes.load(fromByteOffset: base + Sys.epollDataOffset, as: UInt64.self)
                     switch token {
                     case tokenListener: acceptReady()
                     default:

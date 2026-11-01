@@ -60,29 +60,28 @@ private let sha256K: InlineArray<64, UInt32> = [
     state[7] &+= h
 }
 
-@inline(__always) private func compressBlock(_ state: inout SHA256State, _ block: UnsafeRawPointer) {
-    let w = InlineArray<16, UInt32> { i in UInt32(bigEndian: block.loadUnaligned(fromByteOffset: 4 * i, as: UInt32.self)) }
+/// Compresses the 64-byte block at `offset` of `data`.
+@inline(__always) private func compressBlock(_ state: inout SHA256State, _ data: RawSpan, at offset: Int = 0) {
+    var w = InlineArray<16, UInt32>(repeating: 0)
+    for i in 0..<16 { w[i] = data.load(fromByteOffset: offset + 4 * i, as: UInt32.self, .bigEndian) }
     compressWords(&state, w)
 }
 
-private func sha256(from initial: SHA256State, priorBytes: UInt64, _ data: UnsafeRawBufferPointer) -> SHA256State {
+private func sha256(from initial: SHA256State, priorBytes: UInt64, _ data: Span<UInt8>) -> SHA256State {
     var state = initial
     let full = data.count / 64
-    for i in 0..<full { compressBlock(&state, data.baseAddress! + 64 * i) }
+    for i in 0..<full { compressBlock(&state, data.bytes, at: 64 * i) }
     let rem = data.count - 64 * full
     let totalBits = (priorBytes + UInt64(data.count)) * 8
     var tail = InlineArray<64, UInt8>(repeating: 0)
     for i in 0..<rem { tail[i] = data[64 * full + i] }
     tail[rem] = 0x80
-    var tailSpan = tail.mutableSpan
-    tailSpan.withUnsafeMutableBytes { raw in
-        if rem >= 56 {
-            compressBlock(&state, raw.baseAddress!)
-            memset(raw.baseAddress!, 0, 64)
-        }
-        raw.storeBytes(of: totalBits.bigEndian, toByteOffset: 56, as: UInt64.self)
-        compressBlock(&state, raw.baseAddress!)
+    if rem >= 56 {
+        compressBlock(&state, tail.span.bytes)
+        tail = InlineArray(repeating: 0)
     }
+    for i in 0..<8 { tail[56 + i] = UInt8(truncatingIfNeeded: totalBits >> (56 - 8 * UInt64(i))) }
+    compressBlock(&state, tail.span.bytes)
     return state
 }
 
@@ -90,11 +89,11 @@ private func sha256(from initial: SHA256State, priorBytes: UInt64, _ data: Unsaf
     Digest32 { i in UInt8(truncatingIfNeeded: state[i >> 2] >> (24 - 8 * UInt32(i & 3))) }
 }
 
-func sha256Digest(_ data: UnsafeRawBufferPointer) -> Digest32 {
+func sha256Digest(_ data: Span<UInt8>) -> Digest32 {
     stateBytes(sha256(from: sha256H0, priorBytes: 0, data))
 }
 
-func hmacSHA256(key: borrowing [UInt8], _ data: UnsafeRawBufferPointer) -> Digest32 {
+func hmacSHA256(key: borrowing [UInt8], _ data: Span<UInt8>) -> Digest32 {
     TokenSigner(secret: key).sign(data)
 }
 
@@ -162,14 +161,20 @@ private func scanFlatClaims(_ buf: Span<UInt8>, now: Double) -> FlatClaims {
             i += 1
             sub = uid
         } else if spanEqual(key, "exp") || spanEqual(key, "nbf") || spanEqual(key, "iat") {
-            let v0 = i
-            if buf[i] == 0x2D { i += 1 }
+            let negative = buf[i] == 0x2D
+            if negative { i += 1 }
             let d0 = i
-            while i < buf.count && (0x30...0x39).contains(buf[i]) { i += 1 }
+            var value: Int64 = 0
+            while i < buf.count && (0x30...0x39).contains(buf[i]) {
+                let (m, o1) = value.multipliedReportingOverflow(by: 10)
+                let digit = Int64(buf[i] - 0x30)
+                let (s, o2) = negative ? m.subtractingReportingOverflow(digit) : m.addingReportingOverflow(digit)
+                if o1 || o2 { return .fallback }
+                value = s
+                i += 1
+            }
             if i == d0 { return .invalid }
             if i < buf.count && (buf[i] == 0x2E || buf[i] == 0x65 || buf[i] == 0x45) { return .fallback }
-            let text = buf.extracting(v0..<i).withUnsafeBufferPointer { String(decoding: $0, as: UTF8.self) }
-            guard let value = Int64(text) else { return .fallback }
             if spanEqual(key, "exp") {
                 exp = Double(value)
             } else if spanEqual(key, "nbf") {
@@ -212,22 +217,20 @@ struct TokenSigner: Sendable {
     init(secret: borrowing [UInt8]) {
         var block = InlineArray<64, UInt8>(repeating: 0)
         if secret.count > 64 {
-            let hashed = secret.withUnsafeBytes { sha256Digest($0) }
+            let hashed = sha256Digest(secret.span)
             for i in 0..<32 { block[i] = hashed[i] }
         } else {
             for i in 0..<secret.count { block[i] = secret[i] }
         }
-        var ipad = InlineArray<64, UInt8> { 0x36 ^ block[$0] }
-        var opad = InlineArray<64, UInt8> { 0x5C ^ block[$0] }
+        let ipad = InlineArray<64, UInt8> { 0x36 ^ block[$0] }
+        let opad = InlineArray<64, UInt8> { 0x5C ^ block[$0] }
         ipadState = sha256H0
         opadState = sha256H0
-        var ipadSpan = ipad.mutableSpan
-        var opadSpan = opad.mutableSpan
-        ipadSpan.withUnsafeMutableBytes { compressBlock(&ipadState, $0.baseAddress!) }
-        opadSpan.withUnsafeMutableBytes { compressBlock(&opadState, $0.baseAddress!) }
+        compressBlock(&ipadState, ipad.span.bytes)
+        compressBlock(&opadState, opad.span.bytes)
     }
 
-    func sign(_ data: UnsafeRawBufferPointer) -> Digest32 {
+    func sign(_ data: Span<UInt8>) -> Digest32 {
         let inner = sha256(from: ipadState, priorBytes: 64, data)
         let words: InlineArray<16, UInt32> = [
             inner[0], inner[1], inner[2], inner[3], inner[4], inner[5], inner[6], inner[7],
@@ -249,7 +252,7 @@ struct TokenSigner: Sendable {
         var signature = InlineArray<48, UInt8>(repeating: 0)
         var signatureSpan = signature.mutableSpan
         guard b64UrlDecode(signature64, into: &signatureSpan) == 32 else { return nil }
-        let expected = token.extracting(0..<dot2).withUnsafeBytes { sign($0) }
+        let expected = sign(token.extracting(0..<dot2))
         guard constantTimeEqual32(expected, signature.span) else { return nil }
 
         if !spanEqual(header, jwtHeaderStandard) && !spanEqual(header, jwtHeaderReordered) && !spanEqual(header, jwtHeaderMinimal) {
@@ -303,7 +306,7 @@ struct TokenSigner: Sendable {
         var token = ByteBuffer(capacity: 160)
         token.append("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.")
         b64UrlEncode(payload.span, into: &token)
-        let signature = token.withBytes { sign($0) }
+        let signature = sign(token.span)
         token.append(0x2E)
         b64UrlEncode(signature.span, into: &token)
         return token.take()

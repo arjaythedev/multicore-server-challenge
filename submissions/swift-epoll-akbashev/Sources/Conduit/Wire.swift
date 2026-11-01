@@ -108,8 +108,7 @@ struct TxBuf: ~Copyable {
     }
 
     @inline(__always) private mutating func cstr(_ s: String) {
-        var s = s
-        s.withUTF8 { buf.append(UnsafeRawBufferPointer($0)) }
+        buf.append(s.utf8Span.span)
         buf.append(0)
     }
 
@@ -262,12 +261,10 @@ struct PipelineBuf: ~Copyable {
     }
 
     @inline(__always) func i64(_ c: Cell) -> Int64 {
-        data.withBytes { raw in
-            switch c.len {
-            case 8: Int64(bigEndian: raw.loadUnaligned(fromByteOffset: Int(c.offset), as: Int64.self))
-            case 4: Int64(Int32(bigEndian: raw.loadUnaligned(fromByteOffset: Int(c.offset), as: Int32.self)))
-            default: 0
-            }
+        switch c.len {
+        case 8: data.span.bytes.load(fromByteOffset: Int(c.offset), as: Int64.self, .bigEndian)
+        case 4: Int64(data.span.bytes.load(fromByteOffset: Int(c.offset), as: Int32.self, .bigEndian))
+        default: 0
         }
     }
 
@@ -275,29 +272,32 @@ struct PipelineBuf: ~Copyable {
 
     /// A copy of a cell's bytes; nil for NULL.
     func copy(_ c: Cell) -> [UInt8]? {
-        c.isNull ? nil : data.withBytes { Array($0[Int(c.offset)..<(Int(c.offset) + Int(c.len))]) }
+        c.isNull ? nil : ByteBuffer(copying: text(c)).take()
     }
 }
 
 /// Calls `body` with each element of a one-dimensional binary array (`iter_binary_array`).
 func forEachArrayElement(_ raw: Span<UInt8>, _ body: (Span<UInt8>) -> Void) {
     guard raw.count >= 12 else { return }
-    raw.withUnsafeBytes { bytes in
-        let ndim = Int32(bigEndian: bytes.loadUnaligned(fromByteOffset: 0, as: Int32.self))
-        guard ndim > 0, bytes.count >= 16 else { return }
-        var remaining = max(Int(Int32(bigEndian: bytes.loadUnaligned(fromByteOffset: 12, as: Int32.self))), 0)
-        var pos = 12 + 8 * Int(ndim)
-        while remaining > 0 {
-            remaining -= 1
-            guard pos + 4 <= bytes.count else { return }
-            let len = Int32(bigEndian: bytes.loadUnaligned(fromByteOffset: pos, as: Int32.self))
-            pos += 4
-            if len < 0 { continue }
-            guard pos + Int(len) <= bytes.count else { return }
-            body(raw.extracting(pos..<(pos + Int(len))))
-            pos += Int(len)
-        }
+    let bytes = raw.bytes
+    let ndim = bytes.load(fromByteOffset: 0, as: Int32.self, .bigEndian)
+    guard ndim > 0, raw.count >= 16 else { return }
+    var remaining = max(Int(bytes.load(fromByteOffset: 12, as: Int32.self, .bigEndian)), 0)
+    var pos = 12 + 8 * Int(ndim)
+    while remaining > 0 {
+        remaining -= 1
+        guard pos + 4 <= raw.count else { return }
+        let len = bytes.load(fromByteOffset: pos, as: Int32.self, .bigEndian)
+        pos += 4
+        if len < 0 { continue }
+        guard pos + Int(len) <= raw.count else { return }
+        body(raw.extracting(pos..<(pos + Int(len))))
+        pos += Int(len)
     }
+}
+
+private func digestBytes(_ digest: Digest32) -> [UInt8] {
+    (0..<32).map { digest[$0] }
 }
 
 private func decodeError(_ body: Span<UInt8>) -> SqlStateErr {
@@ -307,7 +307,7 @@ private func decodeError(_ body: Span<UInt8>) -> SqlStateErr {
     while start < body.count {
         let end = findByte(body, 0, from: start) ?? body.count
         if end > start {
-            let field = body.extracting((start + 1)..<end).withUnsafeBufferPointer { String(decoding: $0, as: UTF8.self) }
+            let field = copyString(body.extracting((start + 1)..<end)) ?? ""
             switch body[start] {
             case 0x43: code = field
             case 0x4D: message = field
@@ -398,7 +398,7 @@ struct PgConn: ~Copyable {
     private mutating func nextFrame() throws(PgError) -> (tag: UInt8, payload: Range<Int>) {
         try ensure(5)
         let tag = rx[rpos]
-        let len = rx.withBytes { Int(Int32(bigEndian: $0.loadUnaligned(fromByteOffset: rpos + 1, as: Int32.self))) }
+        let len = Int(rx.span.bytes.load(fromByteOffset: rpos + 1, as: Int32.self, .bigEndian))
         try ensure(1 + len)
         let start = rpos + 5
         rpos += 1 + len
@@ -426,7 +426,7 @@ struct PgConn: ~Copyable {
         }
     }
 
-    private func payload(_ r: Range<Int>) -> [UInt8] { rx.withBytes { Array($0[r]) } }
+    private func payload(_ r: Range<Int>) -> [UInt8] { ByteBuffer(copying: rx.span.extracting(r)).take() }
 
     private mutating func authenticate(_ ep: DbEndpoint) throws(PgError) {
         var scram: (bare: String, nonce: String)?
@@ -437,7 +437,7 @@ struct PgConn: ~Copyable {
             let body = payload(range)
             switch tag {
             case 0x52:
-                let method = Int32(bigEndian: body.withUnsafeBytes { $0.loadUnaligned(as: Int32.self) })
+                let method = body.span.bytes.load(fromByteOffset: 0, as: Int32.self, .bigEndian)
                 switch method {
                 case 0:
                     break
@@ -468,7 +468,7 @@ struct PgConn: ~Copyable {
                         if part.hasPrefix("r=") {
                             rToken = String(part.dropFirst(2))
                         } else if part.hasPrefix("s=") {
-                            salt = Array(part.dropFirst(2).utf8).withUnsafeBufferPointer { b64StdDecode(Span(_unsafeElements: $0)) }
+                            salt = b64StdDecode(Array(part.dropFirst(2).utf8).span)
                         } else if part.hasPrefix("i=") {
                             iterations = UInt32(part.dropFirst(2))
                         }
@@ -476,33 +476,30 @@ struct PgConn: ~Copyable {
                     guard let rToken, let salt, let iterations, rToken.hasPrefix(nonce) else {
                         throw .wire("invalid SCRAM server-first")
                     }
-                    var u = (salt + [0, 0, 0, 1]).withUnsafeBytes { hmacSHA256(key: password, $0) }
+                    let firstBlock = salt + [0, 0, 0, 1]
+                    var u = hmacSHA256(key: password, firstBlock.span)
                     var salted = u
                     for _ in 1..<max(iterations, 1) {
-                        u = u.span.withUnsafeBytes { hmacSHA256(key: password, $0) }
+                        u = hmacSHA256(key: password, u.span)
                         for b in 0..<32 { salted[b] ^= u[b] }
                     }
-                    let saltedKey = Array(salted.span.withUnsafeBufferPointer { $0 })
-                    let clientKey = Array("Client Key".utf8).withUnsafeBytes { hmacSHA256(key: saltedKey, $0) }
-                    let storedKey = clientKey.span.withUnsafeBytes { sha256Digest($0) }
+                    let saltedKey = digestBytes(salted)
+                    let clientKey = hmacSHA256(key: saltedKey, Array("Client Key".utf8).span)
+                    let storedKey = sha256Digest(clientKey.span)
                     let noProof = "c=biws,r=\(rToken)"
                     let authMessage = Array("\(bare),\(serverFirst),\(noProof)".utf8)
-                    let clientSignature = authMessage.withUnsafeBytes {
-                        hmacSHA256(key: Array(storedKey.span.withUnsafeBufferPointer { $0 }), $0)
-                    }
-                    var proof = Array(clientKey.span.withUnsafeBufferPointer { $0 })
+                    let clientSignature = hmacSHA256(key: digestBytes(storedKey), authMessage.span)
+                    var proof = digestBytes(clientKey)
                     for b in 0..<32 { proof[b] ^= clientSignature[b] }
-                    let serverKey = Array("Server Key".utf8).withUnsafeBytes { hmacSHA256(key: saltedKey, $0) }
-                    let serverSignature = authMessage.withUnsafeBytes {
-                        hmacSHA256(key: Array(serverKey.span.withUnsafeBufferPointer { $0 }), $0)
-                    }
-                    expectedServerSignature = Array(serverSignature.span.withUnsafeBufferPointer { $0 })
+                    let serverKey = hmacSHA256(key: saltedKey, Array("Server Key".utf8).span)
+                    let serverSignature = hmacSHA256(key: digestBytes(serverKey), authMessage.span)
+                    expectedServerSignature = digestBytes(serverSignature)
                     let finalMessage = noProof + ",p=" + String(decoding: b64StdEncode(proof), as: UTF8.self)
                     try sendPacket(0x70, Array(finalMessage.utf8))
                 case 12:
                     let serverFinal = String(decoding: body[4...], as: UTF8.self)
                     let verifier = serverFinal.hasPrefix("v=")
-                        ? Array(serverFinal.dropFirst(2).utf8).withUnsafeBufferPointer { b64StdDecode(Span(_unsafeElements: $0)) }
+                        ? b64StdDecode(Array(serverFinal.dropFirst(2).utf8).span)
                         : nil
                     guard let verifier, verifier == expectedServerSignature else {
                         throw .wire("SCRAM server signature mismatch")
@@ -511,7 +508,7 @@ struct PgConn: ~Copyable {
                     throw .wire("unsupported auth code \(method)")
                 }
             case 0x45:
-                throw .server(body.withUnsafeBufferPointer { decodeError(Span(_unsafeElements: $0)) })
+                throw .server(decodeError(body.span))
             case 0x5A:
                 return
             default:
@@ -539,32 +536,32 @@ struct PgConn: ~Copyable {
             let (tag, range) = try nextFrame()
             switch tag {
             case 0x44:
-                rx.withBytes { raw in
-                    var p = range.lowerBound
-                    let ncols = UInt16(bigEndian: raw.loadUnaligned(fromByteOffset: p, as: UInt16.self))
-                    p += 2
-                    let colStart = UInt32(out.cols.count)
-                    for _ in 0..<ncols {
-                        let len = Int32(bigEndian: raw.loadUnaligned(fromByteOffset: p, as: Int32.self))
-                        p += 4
-                        if len < 0 {
-                            out.cols.append(.null)
-                        } else {
-                            let offset = UInt32(out.data.count)
-                            out.data.append(UnsafeRawBufferPointer(rebasing: raw[p..<(p + Int(len))]))
-                            p += Int(len)
-                            out.cols.append(Cell(offset: offset, len: len))
-                        }
+                let frame = rx.span
+                let raw = frame.bytes
+                var p = range.lowerBound
+                let ncols = raw.load(fromByteOffset: p, as: UInt16.self, .bigEndian)
+                p += 2
+                let colStart = UInt32(out.cols.count)
+                for _ in 0..<ncols {
+                    let len = raw.load(fromByteOffset: p, as: Int32.self, .bigEndian)
+                    p += 4
+                    if len < 0 {
+                        out.cols.append(.null)
+                    } else {
+                        let offset = UInt32(out.data.count)
+                        out.data.append(frame.extracting(p..<(p + Int(len))))
+                        p += Int(len)
+                        out.cols.append(Cell(offset: offset, len: len))
                     }
-                    out.rows.append(RowSpan(start: colStart, count: ncols))
                 }
+                out.rows.append(RowSpan(start: colStart, count: ncols))
             case 0x43:
                 let total = UInt32(out.rows.count)
                 out.results.append(ExecOutcome(rowStart: rowStart, rowCount: total - rowStart, error: nil))
                 rowStart = total
             case 0x45:
                 let total = UInt32(out.rows.count)
-                let err = rx.withBytes { decodeError(Span(_unsafeElements: UnsafeBufferPointer(rebasing: $0.bindMemory(to: UInt8.self)[range]))) }
+                let err = decodeError(rx.span.extracting(range))
                 out.results.append(ExecOutcome(rowStart: rowStart, rowCount: total - rowStart, error: err))
                 rowStart = total
             case 0x49:
@@ -591,7 +588,7 @@ struct PgConn: ~Copyable {
             let (tag, range) = try nextFrame()
             switch tag {
             case 0x45:
-                let err = payload(range).withUnsafeBufferPointer { decodeError(Span(_unsafeElements: $0)) }
+                let err = decodeError(rx.span.extracting(range))
                 while try nextFrame().tag != 0x5A {}
                 throw .server(err)
             case 0x5A:

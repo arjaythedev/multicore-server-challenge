@@ -52,8 +52,8 @@ private let maskHi: UInt64 = 0x8080_8080_8080_8080
 }
 
 /// Whether 16 bytes need no escaping (the Rust's SSE2 `chunk16_clean`, as portable SIMD).
-@inline(__always) private func chunk16Clean(_ raw: UnsafeRawBufferPointer, _ at: Int) -> Bool {
-    let v = raw.loadUnaligned(fromByteOffset: at, as: SIMD16<UInt8>.self)
+@inline(__always) private func chunk16Clean(_ raw: RawSpan, _ at: Int) -> Bool {
+    let v = raw.load(fromByteOffset: at, as: SIMD16<UInt8>.self)
     let special = (v .== SIMD16(repeating: 0x22)) .| (v .== SIMD16(repeating: 0x5C)) .| (v .< SIMD16(repeating: 0x20))
     return !any(special)
 }
@@ -62,59 +62,58 @@ private let hexDigits: StaticString = "0123456789abcdef"
 
 /// `src` as a JSON string, quotes included.
 func writeStr(_ dst: inout ByteBuffer, _ src: Span<UInt8>) {
-    src.withUnsafeBytes { raw in
-        let n = raw.count
-        dst.append(0x22)
-        var pos = 0
-        while pos + 16 <= n, chunk16Clean(raw, pos) { pos += 16 }
-        while pos + 8 <= n, !hasSpecial8(UInt64(littleEndian: raw.loadUnaligned(fromByteOffset: pos, as: UInt64.self))) {
-            pos += 8
-        }
-        while pos < n {
-            let c = raw[pos]
-            if c < 0x20 || c == 0x22 || c == 0x5C { break }
-            pos += 1
-        }
-        if pos == n {
-            dst.append(raw)
-            dst.append(0x22)
-            return
-        }
-        dst.append(UnsafeRawBufferPointer(rebasing: raw[0..<pos]))
-        var anchor = pos
-        var idx = pos
-        while idx < n {
-            if idx + 16 <= n, chunk16Clean(raw, idx) {
-                idx += 16
-                continue
-            }
-            let c = raw[idx]
-            let escape: StaticString
-            switch c {
-            case 0x22: escape = "\\\""
-            case 0x5C: escape = "\\\\"
-            case 0x0A: escape = "\\n"
-            case 0x0D: escape = "\\r"
-            case 0x09: escape = "\\t"
-            case 0x00...0x1F: escape = ""
-            default:
-                idx += 1
-                continue
-            }
-            dst.append(UnsafeRawBufferPointer(rebasing: raw[anchor..<idx]))
-            if escape.utf8CodeUnitCount == 0 {
-                dst.append("\\u00")
-                dst.append(hexDigits.utf8Start[Int(c >> 4)])
-                dst.append(hexDigits.utf8Start[Int(c & 0x0F)])
-            } else {
-                dst.append(escape)
-            }
-            anchor = idx + 1
-            idx += 1
-        }
-        dst.append(UnsafeRawBufferPointer(rebasing: raw[anchor..<n]))
-        dst.append(0x22)
+    let raw = src.bytes
+    let n = src.count
+    dst.append(0x22)
+    var pos = 0
+    while pos + 16 <= n, chunk16Clean(raw, pos) { pos += 16 }
+    while pos + 8 <= n, !hasSpecial8(raw.load(fromByteOffset: pos, as: UInt64.self, .littleEndian)) {
+        pos += 8
     }
+    while pos < n {
+        let c = src[pos]
+        if c < 0x20 || c == 0x22 || c == 0x5C { break }
+        pos += 1
+    }
+    if pos == n {
+        dst.append(src)
+        dst.append(0x22)
+        return
+    }
+    dst.append(src.extracting(0..<pos))
+    var anchor = pos
+    var idx = pos
+    while idx < n {
+        if idx + 16 <= n, chunk16Clean(raw, idx) {
+            idx += 16
+            continue
+        }
+        let c = src[idx]
+        let escape: StaticString
+        switch c {
+        case 0x22: escape = "\\\""
+        case 0x5C: escape = "\\\\"
+        case 0x0A: escape = "\\n"
+        case 0x0D: escape = "\\r"
+        case 0x09: escape = "\\t"
+        case 0x00...0x1F: escape = ""
+        default:
+            idx += 1
+            continue
+        }
+        dst.append(src.extracting(anchor..<idx))
+        if escape.utf8CodeUnitCount == 0 {
+            dst.append("\\u00")
+            dst.append(hexDigits.utf8Start[Int(c >> 4)])
+            dst.append(hexDigits.utf8Start[Int(c & 0x0F)])
+        } else {
+            dst.append(escape)
+        }
+        anchor = idx + 1
+        idx += 1
+    }
+    dst.append(src.extracting(anchor..<n))
+    dst.append(0x22)
 }
 
 @inline(__always) func writeStr(_ dst: inout ByteBuffer, _ src: borrowing [UInt8]) {
@@ -385,6 +384,12 @@ func b64StdDecode(_ bytes: Span<UInt8>) -> [UInt8]? {
     (try? UTF8Span(validating: bytes)) != nil
 }
 
+/// A String copy of `bytes`, nil unless they are valid UTF-8.
+func copyString(_ bytes: Span<UInt8>) -> String? {
+    guard let utf8 = try? UTF8Span(validating: bytes) else { return nil }
+    return String(copying: utf8)
+}
+
 /// memcmp of `n` bytes, where a pointer may be nil only if `n` is 0.
 @inline(__always) func compareBytes(_ a: UnsafeRawPointer?, _ b: UnsafeRawPointer?, _ n: Int) -> Int32 {
     n == 0 ? 0 : memcmp(a!, b!, n)
@@ -522,7 +527,7 @@ struct JsonParser: ~Escapable {
                 let segment = src.extracting(start..<pos)
                 guard isValidUTF8(segment) else { return nil }
                 pos += 1
-                return segment.withUnsafeBufferPointer { Array($0) }
+                return ByteBuffer(copying: segment).take()
             }
             if c == 0x5C { return parseStringEscaped(start) }
             if c < 0x20 { return nil }
@@ -534,12 +539,12 @@ struct JsonParser: ~Escapable {
     private mutating func parseStringEscaped(_ start: Int) -> [UInt8]? {
         let head = src.extracting(start..<pos)
         guard isValidUTF8(head) else { return nil }
-        var out = head.withUnsafeBufferPointer { Array($0) }
+        var out = ByteBuffer(copying: head)
         while pos < src.count {
             let c = src[pos]
             if c == 0x22 {
                 pos += 1
-                return out
+                return out.take()
             }
             if c < 0x20 { return nil }
             if c != 0x5C {
@@ -552,7 +557,7 @@ struct JsonParser: ~Escapable {
                 }
                 let segment = src.extracting(segStart..<pos)
                 guard isValidUTF8(segment) else { return nil }
-                segment.withUnsafeBufferPointer { out.append(contentsOf: $0) }
+                out.append(segment)
                 continue
             }
             pos += 1
@@ -581,7 +586,7 @@ struct JsonParser: ~Escapable {
                     code = UInt32(u1)
                 }
                 guard let scalar = Unicode.Scalar(code) else { return nil }
-                out.append(contentsOf: UTF8.encode(scalar)!)
+                for byte in UTF8.encode(scalar)! { out.append(byte) }
             default:
                 return nil
             }
@@ -636,8 +641,7 @@ struct JsonParser: ~Escapable {
             skipDigits()
             if pos == expStart { return nil }
         }
-        let text = src.extracting(start..<pos).withUnsafeBufferPointer { String(decoding: $0, as: UTF8.self) }
-        guard let v = Double(text), v.isFinite else { return nil }
+        guard let text = copyString(src.extracting(start..<pos)), let v = Double(text), v.isFinite else { return nil }
         return v
     }
 

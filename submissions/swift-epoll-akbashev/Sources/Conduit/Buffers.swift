@@ -14,6 +14,12 @@ struct ByteBuffer: ~Copyable, Sendable {
         bytes.reserveCapacity(capacity)
     }
 
+    /// A buffer holding a copy of `span`, exactly its size (`take()` it for an owned `[UInt8]`).
+    init(copying span: Span<UInt8>) {
+        bytes.reserveCapacity(span.count)
+        append(span)
+    }
+
     @inline(__always) var count: Int { bytes.count }
     @inline(__always) var isEmpty: Bool { bytes.isEmpty }
     @inline(__always) var capacity: Int { bytes.capacity }
