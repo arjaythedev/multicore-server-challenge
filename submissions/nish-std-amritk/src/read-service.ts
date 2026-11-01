@@ -74,10 +74,10 @@ export class ReadService {
   ticketPlan: i32[]
   /**
    * The count lanes: one run taking plans, up to `lanes` running, each on a
-   * connection of its own, and whether a connection has been asked for. One
-   * lane is enough while plans are small; with every read of the box in one
-   * queue, a lane's run took 45 ms and a plan waited 80 ms for it, half of
-   * all a read took.
+   * connection of its own, and whether a connection has been asked for. A
+   * run takes about 45 ms at 175,000 users and plans read their articles
+   * beside it, so one lane costs a read little; a second cost Postgres 9 µs a
+   * request on the VM, in articles the runs no longer share.
    */
   countRuns: CountRun[]
   countBusy: boolean[]

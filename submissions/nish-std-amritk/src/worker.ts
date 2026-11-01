@@ -558,7 +558,7 @@ export class WorkerConfig {
   /** How many count runs the read service runs at once. */
   countLanes: i32 = 1
   /** Bytes of the read service's answers a worker sends a millisecond (`ConduitWorker.takeAnswers`). */
-  answerPace: i32 = 262144
+  answerPace: i32 = 196608
   /** 0: no gzip; 1: gzip a body when that sends fewer TCP segments; 2: whenever it saves anything. */
   gzip: i32 = 0
   /** The shortest body gzip is tried on. */
@@ -862,7 +862,9 @@ export class ConduitWorker {
    * of them, and written in one go they overflow a NIC's queue: on the VM at
    * 175,000 users, 20,000 segments a second went again and 4,600 connections
    * a second timed out, for 2 ms of waiting saved. Paced, they leave over the
-   * few ms the plan took to gather.
+   * few ms the plan took to gather. On the VM at 175,000 users 192 KiB a ms
+   * passed 2 holds of 2, and 256 KiB passed 2 of 3 and let the retransmits
+   * run away once; it is the worker's share of a 2 Gbit/s peak or so.
    */
   takeAnswers(reads: ReadLink): boolean {
     let took: boolean = false

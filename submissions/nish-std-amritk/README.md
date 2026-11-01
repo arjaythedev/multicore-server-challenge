@@ -155,6 +155,18 @@ and four on the box), and
   only the costly column queues. A run is fixed as it is bound, so every
   count is read after the requests it answers arrived, and it keeps nothing
   once its plans have their counts: this is a batch, not a cache.
+- **The read service.** One process after the HTTP workers holds every read
+  plan of the box, so two workers' reads share one plan: workers parse, check
+  the token and write the answer, and hand reads over a pair of `nish/sync/ring`
+  rings each (a busy ring makes no system call; a side that sleeps is woken on
+  its prefork service channel). On the VM at 175,000 users Postgres fell from
+  109 to 95 µs a request. Two things came with it. A plan reads its articles
+  beside its favorite counts instead of after them, because a count run took
+  45 ms and plans queued 80 ms behind it. And a worker takes a plan's answers
+  at `ANSWER_PACE` bytes a millisecond, because hundreds of answers written at
+  once overflowed the NIC's queue: 20,000 retransmitted segments a second at
+  the first try. Where the region cannot be made, each worker plans for itself.
+
 - **Two HTTP workers.** Each worker has its own read queue, so fewer workers
   make bigger plans. At 120,000 users on the VM, Postgres spent 150 µs a
   request with four, 129 with two and 117 with one, which ran out of core.
@@ -248,6 +260,13 @@ kernel's ACKs alone) and `IDLE_TIMEOUT_MS` (75000). On the box's 8 CPUs that mak
 connections in all, inside the limit of 95.
 
 ## Measured
+
+On the fixed load box (below), 5-minute holds of the read service against the
+build before it: at 175,000 users it passed 2 of 2 at 44.0k to 44.5k req/s,
+p95 361 to 450 ms, p99 519 to 653 ms, 166 to 169 µs a request; the build
+before passed 1 of 3 at 173 µs. At 190,000 users it fails, as the build before
+did, and worse: once the box saturates, retransmits run away (p95 1,111 ms,
+p99 3,004 ms, 0.08% errors, against 984, 1,072 and none).
 
 These figures are local, not official scores. They come from a 4-core
 container (Intel Xeon at 2.10 GHz, 16 GB) shared by the server, PostgreSQL
@@ -427,6 +446,8 @@ from the idea, not the code:
   ([#132](https://github.com/arjaythedev/multicore-server-challenge/pull/132))
   and rust-epoll-WorriedArrow: the feed's shared followees, a floor for their
   pages and a proof of their count; the statement follows theCatWisel's.
+- From zig-iouring-nick-potts: one queue of reads for the whole box, here a
+  process and rings of Nish's rather than its box-wide drain.
 - From rust-epoll-WorriedArrow and zig-iouring-nick-potts: timing bcrypt's
   lane widths at startup and keeping the fastest, here through Nish's
   `bcryptCalibrate`; and from nick-potts, gzip only when it saves a TCP
