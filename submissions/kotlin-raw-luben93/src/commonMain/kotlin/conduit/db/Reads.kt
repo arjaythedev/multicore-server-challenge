@@ -195,13 +195,27 @@ internal class Grouper {
 }
 
 internal class ReadWorker(pool: ReadPool, index: Int, cap: Int) : Worker(pool, index) {
-    // Two batch objects: one being resumed while the next is in flight. The next is always the one that is not [done].
+    // Batch objects: the oldest one in flight, with pipelining one more written behind it, and the one being resumed.
+    // The third object only exists once the pool pipelines.
+    private val cap = cap
     private val a = ReadBatch(cap)
     private val b = ReadBatch(cap)
+    private var c: ReadBatch? = null
     @JvmField var flight: ReadBatch? = null
+
+    /** Written to the connection behind [flight] (pipelining), not yet read. */
+    @JvmField var queued: ReadBatch? = null
     @JvmField var done: ReadBatch? = null
 
-    fun spare(): ReadBatch = if (done === a) b else a
+    /** The pipelined batch of a connection that died, to fail after [done]. */
+    private var failed: ReadBatch? = null
+
+    /** A batch object that is neither outstanding nor being resumed. Under the pool lock. */
+    fun spare(): ReadBatch {
+        if (a !== flight && a !== queued && a !== done) return a
+        if (b !== flight && b !== queued && b !== done) return b
+        return c ?: ReadBatch(cap).also { c = it }
+    }
 
     override fun processReply(c: PgConn) {
         val batch = flight!!
@@ -284,8 +298,9 @@ internal class ReadWorker(pool: ReadPool, index: Int, cap: Int) : Worker(pool, i
         batch.q!!.rtt.add(rt)
         (pool as ReadPool).busyNanos += rt
         done = batch
-        flight = null
-        inFlight = false
+        flight = queued
+        queued = null
+        inFlight = flight != null
     }
 
     override fun resumeCompleted() {
@@ -297,13 +312,27 @@ internal class ReadWorker(pool: ReadPool, index: Int, cap: Int) : Worker(pool, i
         val batch = flight ?: return false
         batch.q!!.inflight--
         done = batch
+        val second = queued
+        if (second != null) {
+            second.q!!.inflight--
+            failed = second
+        }
         flight = null
+        queued = null
         inFlight = false
         return true
     }
 
     override fun resumeAbandoned(err: PgError) {
-        val batch = done!!
+        fail(done!!, err)
+        val second = failed
+        if (second != null) {
+            failed = null
+            fail(second, err)
+        }
+    }
+
+    private fun fail(batch: ReadBatch, err: PgError) {
         for (j in 0 until batch.n) {
             val r = batch.results[j]
             r.clear()
@@ -345,6 +374,7 @@ internal class ReadPool(
     private val cap = queues.maxOfOrNull { it.maxBatch } ?: 1
     @JvmField val workers = Array(config.readConns) { ReadWorker(this, it, cap) }
     private val skipAbandoned = config.skipAbandoned
+    private val depth = config.pipelineDepth.coerceIn(1, 2)
     /** The gather window; [config]'s is the floor, the [GatherTuner] (when on) moves it between 1 s ticks. */
     private val cfg = config
     @Volatile private var gatherNanos = config.gatherMicros * 1000L
@@ -432,9 +462,45 @@ internal class ReadPool(
         }
     }
 
-    override fun assignLocked(w: Worker): Boolean {
-        w as ReadWorker
-        val batch = w.spare()
+    override fun assignLocked(w: Worker): Boolean = assign(w as ReadWorker, depth)
+
+    /** One round trip only: this thread writes it, and the worker's own thread must find the send buffer free. */
+    override fun assignDispatchedLocked(w: Worker): Boolean = assign(w as ReadWorker, 1)
+
+    /**
+     * Under [lock]: fills [w]'s connection up to [limit] outstanding round trips from the queues, encoding them into its
+     * send buffer back to back (one write). The first is any ready kind's batch; one behind a running one must be FULL, so
+     * pipelining never trades batch size (what the sharing lives on) for latency. Returns whether anything was
+     * encoded; parks [w] on the idle stack when it has nothing outstanding and nothing to send.
+     */
+    private fun assign(w: ReadWorker, limit: Int): Boolean {
+        var sent = false
+        while (true) {
+            val outstanding = if (w.flight == null) 0 else if (w.queued == null) 1 else 2
+            if (outstanding >= limit) break
+            val batch = w.spare()
+            if (!form(batch, outstanding > 0)) break
+            val o = w.conn!!.out
+            if (!sent) {
+                o.reset()
+                sent = true
+            }
+            encode(batch, o)
+            if (w.flight == null) w.flight = batch else w.queued = batch
+        }
+        if (!sent) {
+            if (w.flight == null) pushIdleLocked(w)
+            return false
+        }
+        w.inFlight = true
+        return true
+    }
+
+    /**
+     * Under [lock]: moves the next batch's requests from the queues into [batch] (only from a full queue when [full]).
+     * False when no such batch exists.
+     */
+    private fun form(batch: ReadBatch, full: Boolean): Boolean {
         val now = if (gatherNanos > 0 || lifoNanos > 0) nanoTime() else 0L
         var best: KindQueue? = null
         var n = 0
@@ -443,7 +509,7 @@ internal class ReadPool(
             var bestSeq = Long.MAX_VALUE
             var oldestBorn = Long.MAX_VALUE
             for (q in queues) {
-                if (q.ready(now, gatherNanos)) {
+                if (q.ready(now, gatherNanos) && (!full || q.size >= q.maxBatch)) {
                     val h = q.ring[q.head]!!
                     if (h.born < oldestBorn) oldestBorn = h.born
                     if (h.seq < bestSeq) {
@@ -459,7 +525,7 @@ internal class ReadPool(
             if (lifo) {
                 var newest = Long.MIN_VALUE
                 for (q in queues) {
-                    if (q.ready(now, gatherNanos)) {
+                    if (q.ready(now, gatherNanos) && (!full || q.size >= q.maxBatch)) {
                         val s = q.ring[(q.head + q.size - 1) and (q.ring.size - 1)]!!.seq
                         if (s > newest) {
                             newest = s
@@ -480,16 +546,10 @@ internal class ReadPool(
             // than send an empty batch.
         }
         noteQueuedLocked(queued)
-        if (best == null || n == 0) {
-            pushIdleLocked(w)
-            return false
-        }
+        if (best == null || n == 0) return false
         batch.n = n
         batch.q = best
         best.inflight++
-        w.flight = batch
-        w.inFlight = true
-        encode(batch, w.conn!!.out)
         batches++
         requests += n
         best.batches++
@@ -509,7 +569,6 @@ internal class ReadPool(
      * kind binds no parameters.
      */
     private fun encode(batch: ReadBatch, o: ByteBuf) {
-        o.reset()
         if (batch.q!!.kind.broadcast) {
             o.endBindExecute(o.beginBind(batch.q!!.stmtName, 0))
             o.sync()

@@ -72,6 +72,12 @@ class WriteStmt(
     val sql: String,
     /** Parse parameter type OIDs, see [conduit.pg.Oid]. */
     val paramOids: IntArray,
+    /**
+     * The same statement for m jobs at once (DbConfig.batchWrites): $1 int4[] i (0..m-1), then one array per parameter of
+     * [sql], same order, every element non-NULL. Its rows start with i (column 0), then the columns [sql] returns, so
+     * the pool can hand each job its own rows. Must give each job exactly what [sql] would.
+     */
+    val batchSql: String? = null,
 ) {
     var id: Int = -1
 }
@@ -117,6 +123,20 @@ class DbConfig(
     val gatherStepMicros: Int = 10_000,
     val gatherHighPct: Int = 75,
     val gatherLowPct: Int = 60,
+    /**
+     * Round trips a read connection may have outstanding (1: one at a time). With 2, a connection that finishes one
+     * and has another FULL batch queued gets it written behind the one Postgres is already running, so the backend
+     * never waits for the app between batches (the app's read, parse and encode time is hidden).
+     */
+    val pipelineDepth: Int = 1,
+    /**
+     * A write group is one implicit transaction (every job's Bind/Execute, then ONE Sync: Postgres commits at the Sync)
+     * instead of BEGIN ... COMMIT around them: two statements fewer per group, same atomicity and the same rule that no
+     * caller resumes before the commit.
+     */
+    val implicitTx: Boolean = false,
+    /** Jobs of a write group that run the same [WriteStmt] with a batch form go out as ONE multi-row execution of it. */
+    val batchWrites: Boolean = false,
 ) {
     companion object {
         /**
@@ -137,6 +157,9 @@ class DbConfig(
             gatherStepMicros: Int = 10_000,
             gatherHighPct: Int = 75,
             gatherLowPct: Int = 60,
+            pipelineDepth: Int = 1,
+            implicitTx: Boolean = false,
+            batchWrites: Boolean = false,
         ): DbConfig {
             val rest = when {
                 url.startsWith("postgres://") -> url.substring("postgres://".length)
@@ -172,7 +195,7 @@ class DbConfig(
             return DbConfig(
                 host.ifEmpty { "localhost" }, port, user, password, database, readConns, writeConns, options,
                 readQueueMax, writeQueueMax, skipAbandoned, gatherMicros, lifoMicros,
-                gatherMaxMicros, gatherStepMicros, gatherHighPct, gatherLowPct,
+                gatherMaxMicros, gatherStepMicros, gatherHighPct, gatherLowPct, pipelineDepth, implicitTx, batchWrites,
             )
         }
 

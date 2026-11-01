@@ -140,10 +140,16 @@ private fun gcLog() {
     }
 }
 
-actual fun nanoTime(): Long = memScoped {
-    val ts = alloc<timespec>()
+/** One timespec per thread, so [nanoTime] (several calls per request) allocates nothing (memScoped mallocs and frees an arena). */
+@ThreadLocal
+private object ThreadClock {
+    val ts = nativeHeap.alloc<timespec>()
+}
+
+actual fun nanoTime(): Long {
+    val ts = ThreadClock.ts
     clock_gettime(CLOCK_MONOTONIC, ts.ptr)
-    ts.tv_sec * 1_000_000_000L + ts.tv_nsec
+    return ts.tv_sec * 1_000_000_000L + ts.tv_nsec
 }
 
 actual fun currentTimeMillis(): Long = memScoped {
@@ -287,7 +293,7 @@ actual class BlockingSocket private constructor(private val fd: Int) {
             if (r > 0) return r.toInt()
             if (r == 0L) return -1
             val e = errno
-            if (e == EAGAIN) throw SocketReadTimeout("recv timed out")
+            if (e == EAGAIN) return READ_TIMEOUT
             if (e != EINTR) throw IllegalStateException("recv: ${strerror(e)?.toKString()}")
         }
     }

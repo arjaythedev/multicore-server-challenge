@@ -90,6 +90,12 @@ fun main() {
         lifoMicros = lifoMs * 1000, gatherMaxMicros = gatherMaxMs * 1000,
         gatherStepMicros = envInt("READ_GATHER_STEP_MS", 10) * 1000, gatherHighPct = envInt("READ_GATHER_HIGH_PCT", 75),
         gatherLowPct = envInt("READ_GATHER_LOW_PCT", 60),
+        // DB_PIPELINE (default 2 = a full batch is written behind the running one; 1 = one round trip per read connection)
+        pipelineDepth = envInt("DB_PIPELINE", 2),
+        // DB_IMPLICIT_TX (default 1 = the group is one implicit transaction ended by its Sync; 0 = BEGIN/COMMIT around a write group)
+        implicitTx = envInt("DB_IMPLICIT_TX", 1) != 0,
+        // DB_BATCH_WRITES (default 1; 0 = off; same-statement writes of a group go out as one multi-row statement, see WriteStmt.batchSql)
+        batchWrites = envInt("DB_BATCH_WRITES", 1) != 0,
     )
     App.configure(
         Db.query(dbConfig, App.COLLATION_PROBE).firstOrNull(),
@@ -119,7 +125,6 @@ fun main() {
         for (k in App.reads) println("sql\t${k.name}\t${k.sql}")
         return
     }
-    WritePool.implicitTx = envInt("WRITE_IMPLICIT_TX", 1) != 0
     Db.start(dbConfig, App.reads, App.writes)
     startHttpServer(host, port, httpThreads, HttpEngine { ex -> App.handle(ex) })
     println(

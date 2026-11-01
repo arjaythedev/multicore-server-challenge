@@ -49,12 +49,21 @@ internal class DbRuntime(@JvmField val config: DbConfig, reads: List<ReadKind>, 
         list.add(PgStatement("s$tx", "BEGIN", IntArray(0), "BEGIN"))
         list.add(PgStatement("s${tx + 1}", "COMMIT", IntArray(0), "COMMIT"))
         list.add(PgStatement("s${tx + 2}", "ROLLBACK", IntArray(0), "ROLLBACK"))
+        val batchNames = arrayOfNulls<ByteArray>(writes.size)
+        if (config.batchWrites) {
+            writes.forEachIndexed { j, w ->
+                val sql = w.batchSql ?: return@forEachIndexed
+                val name = "s${list.size}"
+                batchNames[j] = PgConn.cstr(name)
+                list.add(PgStatement(name, sql, intArrayOf(Oid.INT4_ARRAY) + IntArray(w.paramOids.size) { arrayOid(w.paramOids[it]) }, "batched write '${w.name}'"))
+            }
+        }
         statements = list
         beginExec = bindExec("s$tx")
         commitExec = bindExec("s${tx + 1}")
         rollbackExec = bindExec("s${tx + 2}")
         readPool = ReadPool(this, config, list, reads, List(reads.size) { PgConn.cstr("s$it") })
-        writePool = WritePool(this, config, list, writes, List(writes.size) { PgConn.cstr("s${reads.size + it}") })
+        writePool = WritePool(this, config, list, writes, List(writes.size) { PgConn.cstr("s${reads.size + it}") }, batchNames.asList())
     }
 
     private fun bindExec(name: String): ByteArray {
@@ -147,6 +156,13 @@ internal class DbRuntime(@JvmField val config: DbConfig, reads: List<ReadKind>, 
     }
 
     companion object {
+        private fun arrayOid(elem: Int): Int = when (elem) {
+            Oid.INT8 -> Oid.INT8_ARRAY
+            Oid.INT4 -> Oid.INT4_ARRAY
+            Oid.TEXT -> Oid.TEXT_ARRAY
+            else -> throw IllegalArgumentException("no batched form for parameter type $elem")
+        }
+
         /** $1 int4[] i, $2 int8[] v, $3 int4[] l, $4 int8[] o, $5 text[] k. */
         private val READ_OIDS = intArrayOf(Oid.INT4_ARRAY, Oid.INT8_ARRAY, Oid.INT4_ARRAY, Oid.INT8_ARRAY, Oid.TEXT_ARRAY)
         const val FIRST_CONNECT_NANOS = 50_000_000_000L

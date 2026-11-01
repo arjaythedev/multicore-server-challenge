@@ -2,7 +2,7 @@ package conduit.pg
 
 import conduit.platform.BlockingSocket
 import conduit.platform.Monitor
-import conduit.platform.SocketReadTimeout
+import conduit.platform.READ_TIMEOUT
 import conduit.util.ByteBuf
 import conduit.util.intBE
 import conduit.util.shortBE
@@ -49,6 +49,16 @@ class PgConn private constructor(private val sock: BlockingSocket) {
 
     /** Reads the next complete message (blocking) and returns its type byte. Throws [PgIoException]. */
     fun next(): Int {
+        val t = nextOrTimeout()
+        if (t < 0) throw PgIoException("recv: timed out", null, true)
+        return t
+    }
+
+    /**
+     * [next], but returns [TIMEOUT] when the receive timeout expired with no byte read (the connection and its buffer
+     * are still consistent) instead of throwing. Throws [PgIoException] for everything else.
+     */
+    fun nextOrTimeout(): Int {
         while (true) {
             val avail = rlen - rpos
             if (avail >= 5) {
@@ -68,8 +78,9 @@ class PgConn private constructor(private val sock: BlockingSocket) {
             val n = try {
                 sock.read(rbuf, rlen, rbuf.size - rlen)
             } catch (e: Throwable) {
-                throw PgIoException("recv: ${e.message ?: e}", e, e is SocketReadTimeout)
+                throw PgIoException("recv: ${e.message ?: e}", e)
             }
+            if (n == READ_TIMEOUT) return TIMEOUT
             if (n <= 0) throw PgIoException("connection closed by the server")
             rlen += n
         }
@@ -339,6 +350,8 @@ class PgConn private constructor(private val sock: BlockingSocket) {
     }
 
     companion object {
+        /** [nextOrTimeout]: the receive timeout expired. */
+        const val TIMEOUT = -1
         private const val PROTOCOL_3_0 = 196608
         private const val INITIAL_RBUF = 128 * 1024
         private const val MAX_KEEP_RBUF = 4 * 1024 * 1024
