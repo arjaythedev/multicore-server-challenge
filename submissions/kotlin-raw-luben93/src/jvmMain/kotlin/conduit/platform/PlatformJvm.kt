@@ -17,9 +17,11 @@ import java.util.concurrent.locks.ReentrantLock
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
-actual fun platformInit(): String =
-    "jvm ${System.getProperty("java.vm.name")} ${System.getProperty("java.version")}, " +
+actual fun platformInit(): String {
+    Sched.startSweep()
+    return "jvm ${System.getProperty("java.vm.name")} ${System.getProperty("java.version")}, " +
         "heap max ${Runtime.getRuntime().maxMemory() shr 20} MB"
+}
 
 actual fun nanoTime(): Long = System.nanoTime()
 
@@ -33,6 +35,12 @@ actual fun secureRandomBytes(dst: ByteArray) = random.nextBytes(dst)
 
 actual fun getenv(name: String): String? = System.getenv(name)
 
+actual fun readTextFile(path: String): String? = try {
+    java.nio.file.Files.readString(java.nio.file.Path.of(path))
+} catch (_: Exception) {
+    null
+}
+
 actual fun cpuCount(): Int = Runtime.getRuntime().availableProcessors()
 
 /** Our own threads carry their [Scratch] (and FFM errno capture) in fields: no ThreadLocal lookup on hot paths. */
@@ -44,6 +52,7 @@ internal class ConduitThread(name: String, body: Runnable) : Thread(body, name) 
 actual fun startThread(name: String, nice: Int, body: () -> Unit) {
     val t = ConduitThread(name) {
         if (nice > 0) Nice.set(nice)
+        Sched.batchSelf()
         body()
     }
     t.isDaemon = true

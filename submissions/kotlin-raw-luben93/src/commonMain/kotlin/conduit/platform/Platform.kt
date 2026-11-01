@@ -27,6 +27,9 @@ expect fun secureRandomBytes(dst: ByteArray)
 
 expect fun getenv(name: String): String?
 
+/** A small text file's contents (e.g. /proc counters), or null if it cannot be read. */
+expect fun readTextFile(path: String): String?
+
 /** CPUs this process may run on (affinity-aware where the platform allows). */
 expect fun cpuCount(): Int
 
@@ -60,9 +63,15 @@ inline fun <T> Monitor.locked(block: () -> T): T {
     }
 }
 
+/** [BlockingSocket.read]'s result when the receive timeout expired with no byte arriving (not a failure by itself). */
+const val READ_TIMEOUT = -2
+
 /** A blocking TCP client socket with TCP_NODELAY (the Postgres connections; one reader thread each). */
 expect class BlockingSocket {
-    /** Reads up to [len] bytes; blocks until at least one byte arrives. Returns -1 at EOF. Throws on error. */
+    /**
+     * Reads up to [len] bytes; blocks until at least one byte arrives. Returns -1 at EOF and [READ_TIMEOUT] when the
+     * socket has a receive timeout and it expired (the socket stays usable). Throws on error.
+     */
     fun read(b: ByteArray, off: Int, len: Int): Int
 
     /** Writes all [len] bytes, blocking as needed. Throws on error. */
