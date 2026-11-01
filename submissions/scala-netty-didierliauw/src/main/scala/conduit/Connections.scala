@@ -1,10 +1,12 @@
 package conduit
 
 import io.netty.buffer.{ByteBuf, ByteBufAllocator}
-import io.netty.channel.{ChannelFutureListener, ChannelHandlerContext}
+import io.netty.channel.{ChannelFutureListener, ChannelHandlerContext, EventLoop}
+import io.netty.util.concurrent.FastThreadLocal
 
 import java.io.IOException
 import java.util
+import scala.util.control.NonFatal
 
 /** One event loop's open connections. Those with no request waiting are listed least recently active first: idle ones
   * are closed by one sweep a second instead of a timer per connection, and beyond `maxConnections` the longest-idle
@@ -225,3 +227,75 @@ final class Connection(connections: Connections, api: Api) extends RequestDecode
 object Connection:
   /** Requests a connection may have waiting before it stops reading more. */
   private val MaxPipelined = 32
+
+/** The responses a loop's thread finished for requests of other loops (reads answered on its Postgres connections for
+  * them, [[PgReads]]): gathered during a pass of the loop, then handed to each of those loops as one task, which
+  * writes them ([[Connection.answered]]). Used on its loop's thread only.
+  */
+private[conduit] final class Handoff(loop: EventLoop) extends Runnable:
+  import Handoff.*
+
+  /** The loops with responses to hand over, and each one's. */
+  private var loops = new Array[EventLoop](4)
+  private var answers = new Array[Answers](4)
+  private var n = 0
+  private var scheduled = false
+
+  /** `call`'s response, for its loop. */
+  def add(call: Call, response: ByteBuf): Unit =
+    val to = call.api.loop
+    var k = 0
+    while k < n && (loops(k) ne to) do k += 1
+    if k == n then
+      if n == loops.length then
+        loops = java.util.Arrays.copyOf(loops, n * 2)
+        answers = java.util.Arrays.copyOf(answers, n * 2)
+      loops(n) = to
+      n += 1
+    if answers(k) == null then answers(k) = Answers()
+    answers(k).add(call, response)
+    if !scheduled then
+      scheduled = true
+      loop.execute(this)
+
+  /** At the end of the pass: each loop's responses go to it. */
+  def run(): Unit =
+    scheduled = false
+    var k = 0
+    while k < n do
+      if answers(k) != null then
+        loops(k).execute(answers(k))
+        answers(k) = null
+      k += 1
+
+object Handoff:
+  private val handoffs = new FastThreadLocal[Handoff]
+
+  /** Gives `loop`'s thread its own: on that thread, before it serves. */
+  def install(loop: EventLoop): Unit = handoffs.set(Handoff(loop))
+
+  /** The current loop's. */
+  def current: Handoff = handoffs.get()
+
+  /** Responses for one loop, written there. */
+  private final class Answers extends Runnable:
+    private var calls = new Array[Call](16)
+    private var responses = new Array[ByteBuf](16)
+    private var n = 0
+
+    def add(call: Call, response: ByteBuf): Unit =
+      if n == calls.length then
+        calls = java.util.Arrays.copyOf(calls, n * 2)
+        responses = java.util.Arrays.copyOf(responses, n * 2)
+      calls(n) = call
+      responses(n) = response
+      n += 1
+
+    def run(): Unit =
+      var i = 0
+      while i < n do
+        val call = calls(i)
+        call.response = responses(i)
+        try call.connection.answered(call)
+        catch case NonFatal(t) => Log.error("request failed", t)
+        i += 1

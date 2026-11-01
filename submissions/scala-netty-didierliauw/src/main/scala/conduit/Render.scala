@@ -100,6 +100,48 @@ object Render:
     out.bytes(FollowingKey)
     split
 
+  // A round's articles ([[RoundArticles]]) as pieces, put together as [[article]] writes them: the head (slug, title,
+  // description), the body, `tagList`, the dates, `favorited`'s key, then `favoritesCount` and the author up to
+  // `following`'s value.
+
+  /** The slug, title and description, from the row's columns at `at` on. */
+  def articleHead(out: Out, row: PgRow, at: Int): Unit =
+    out.bytes(SlugKey)
+    row.text(at, out)
+    out.bytes(TitleKey)
+    row.text(at + 1, out)
+    out.bytes(DescriptionKey)
+    row.text(at + 2, out)
+
+  def articleBody(out: Out, row: PgRow, at: Int): Unit =
+    out.bytes(BodyKey)
+    row.text(at, out)
+
+  /** `created_at` and `updated_at`, from the row's columns at `at` on. */
+  def articleDates(out: Out, row: PgRow, at: Int): Unit =
+    out.bytes(CreatedAtKey)
+    row.timestamp(at, out)
+    out.bytes(UpdatedAtKey)
+    row.timestamp(at + 1, out)
+
+  /** `tagList`'s key and the array's opening bracket. */
+  def tagListOpen(out: Out): Unit = out.bytes(TagListKey).byte('[')
+
+  def favoritedKey(out: Out): Unit = out.bytes(FavoritedKey)
+
+  /** `favoritesCount`, then the author's key. */
+  def countAndAuthor(out: Out, count: Long): Unit = out.bytes(FavoritesCountKey).long(count).bytes(AuthorKey)
+
+  /** A profile up to `following`'s value, from the row's username, bio and image at `at` on. */
+  def sharedProfile(out: Out, row: PgRow, at: Int): Unit =
+    out.bytes(UsernameKey)
+    row.text(at, out)
+    out.bytes(BioKey)
+    row.textOrNull(at + 1, out)
+    out.bytes(ImageKey)
+    row.textOrNull(at + 2, out)
+    out.bytes(FollowingKey)
+
   /** A profile from the row's username, bio and image at `at` on. */
   def profile(out: Out, row: PgRow, at: Int, following: Boolean): Unit =
     out.bytes(UsernameKey)
@@ -128,6 +170,25 @@ object Render:
     out.bytes(AuthorKey)
     profile(out, row, 4, following)
     out.byte('}')
+
+  /** What [[comment]] writes of a comment that is the same for every viewer, up to `following`'s value: a viewer's
+    * comment is it, its `following`, then `}}`.
+    */
+  def sharedComment(out: Out, row: PgRow): Unit =
+    out.bytes(IdKey).long(row.int8(0))
+    out.bytes(CreatedAtKey)
+    row.timestamp(2, out)
+    out.bytes(UpdatedAtKey)
+    row.timestamp(3, out)
+    out.bytes(BodyKey)
+    row.text(1, out)
+    out.bytes(AuthorKey).bytes(UsernameKey)
+    row.text(4, out)
+    out.bytes(BioKey)
+    row.textOrNull(5, out)
+    out.bytes(ImageKey)
+    row.textOrNull(6, out)
+    out.bytes(FollowingKey)
 
   /** A user, from the row's id, username, email, bio and image, with `token`. */
   def user(out: Out, row: PgRow, token: String): Unit =
