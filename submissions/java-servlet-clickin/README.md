@@ -199,7 +199,7 @@ so compare with the leaderboard loosely.
 
 ## Tuning knobs (all optional; defaults are what was measured)
 
-`LOOPS`, `READ_CONNS` (8), `WRITE_CONNS` (1), `READ_GATHER_US` (20000), `READ_ROUND_MAX` (4096), `WRITE_GROUP_MAX` (256),
+`LOOPS`, `READ_CONNS` (8), `WRITE_CONNS` (1), `READ_GATHER_US` (20000), `READ_ROUND_MAX` (4096), `READ_SPREAD` (1: how many idle read connections one round's kinds are spread over), `WRITE_GROUP_MAX` (256),
 `COALESCE` (1), `MAX_INFLIGHT_PER_LOOP` (2048), `BCRYPT_THREADS` (4), `BCRYPT_LANES` (0 = timed at startup, 1-6), `BCRYPT_GATHER_MS` (400),
 `BCRYPT_NICE` (5), `JAVA_OPTS`.
 

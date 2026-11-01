@@ -15,10 +15,14 @@ printf 'DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit\nJWT_SECR
 for kv in $*; do echo \$kv >> /etc/challenge/env; done
 /opt/conduit-tools/switch.sh >/dev/null"
 run() { # users ramp measure tag
-  local start=$(( ($(date +%s) + 5) * 1000 )) per=$(( $1 / N )) i=0 pids=()
+  local start=$(( ($(date +%s) + 5) * 1000 )) i=0 off=0 pids=() w=(${LG_WEIGHTS:-}) sum=0 per
+  # LG_WEIGHTS="2 2 1": users split by weight, for load boxes of unequal size (default: even)
+  [ ${#w[@]} -eq $N ] || { w=(); for _ in "${LG[@]}"; do w+=(1); done; }
+  for x in "${w[@]}"; do sum=$((sum + x)); done
   for h in "${LG[@]}"; do
-    $SSH root@$h "ulimit -n 1048576; CONDUIT_JWT_SECRET=multicore-server-challenge /root/loadgen run -target http://$TARGET_PRIV -users $per -ramp ${2}s -measure ${3}s -tail 10s -box-index $i -id-offset $((i*per)) -run-id $4$RANDOM -start-at $start -q -out /root/$4.json >/root/$4.log 2>&1" & pids+=($!)
-    i=$((i+1)); done
+    per=$(( $1 * ${w[$i]} / sum ))
+    $SSH root@$h "ulimit -n 1048576; CONDUIT_JWT_SECRET=multicore-server-challenge /root/loadgen run -target http://$TARGET_PRIV -users $per -ramp ${2}s -measure ${3}s -tail 10s -box-index $i -id-offset $off -run-id $4$RANDOM -start-at $start -q -out /root/$4.json >/root/$4.log 2>&1" & pids+=($!)
+    i=$((i+1)); off=$((off + per)); done
   echo $start
   wait "${pids[@]}"
 }

@@ -89,38 +89,57 @@ public final class PgConn {
      * statement (TAGS shares one result).
      */
     enum Read {
-        TAGS(Stmt.TAGS, -1, new int[] {}, new int[] {}),
-        ARTICLE(Stmt.ARTICLE, Stmt.ARTICLE_BATCH, new int[] {1, 0},
+        TAGS(0, Stmt.TAGS, -1, new int[] {},
+                new int[] {}),
+        ARTICLE(60, Stmt.ARTICLE, Stmt.ARTICLE_BATCH, new int[] {1, 0},
                 new int[] {Stmt.TEXT, Stmt.INT8}),
-        COMMENTS(Stmt.COMMENTS, Stmt.COMMENTS_BATCH, new int[] {1, 0},
+        COMMENTS(75, Stmt.COMMENTS, Stmt.COMMENTS_BATCH, new int[] {1, 0},
                 new int[] {Stmt.TEXT, Stmt.INT8}),
-        ARTICLES(Stmt.ARTICLES, Stmt.ARTICLES_BATCH, new int[] {1, 2, 0},
+        ARTICLES(
+                85,
+                Stmt.ARTICLES,
+                Stmt.ARTICLES_BATCH,
+                new int[] {1, 2, 0},
                 new int[] {Stmt.INT4, Stmt.INT4, Stmt.INT8}),
-        FEED(Stmt.FEED, Stmt.FEED_BATCH, new int[] {0, 1, 2},
+        FEED(
+                290,
+                Stmt.FEED,
+                Stmt.FEED_BATCH,
+                new int[] {0, 1, 2},
                 new int[] {Stmt.INT8, Stmt.INT4, Stmt.INT4}),
-        PROFILE(Stmt.PROFILE, Stmt.PROFILE_BATCH, new int[] {1, 0},
+        PROFILE(20, Stmt.PROFILE, Stmt.PROFILE_BATCH, new int[] {1, 0},
                 new int[] {Stmt.TEXT, Stmt.INT8}),
         ARTICLES_TAG(
+                160,
                 Stmt.ARTICLES_TAG,
                 Stmt.ARTICLES_TAG_BATCH,
                 new int[] {3, 1, 2, 0},
                 new int[] {Stmt.TEXT, Stmt.INT4, Stmt.INT4, Stmt.INT8}),
         ARTICLES_AUTHOR(
+                120,
                 Stmt.ARTICLES_AUTHOR,
                 Stmt.ARTICLES_AUTHOR_BATCH,
                 new int[] {3, 1, 2, 0},
                 new int[] {Stmt.TEXT, Stmt.INT4, Stmt.INT4, Stmt.INT8}),
         ARTICLES_FAVORITED(
+                150,
                 Stmt.ARTICLES_FAVORITED,
                 Stmt.ARTICLES_FAVORITED_BATCH,
                 new int[] {3, 1, 2, 0},
                 new int[] {Stmt.TEXT, Stmt.INT4, Stmt.INT4, Stmt.INT8}),
-        USER(Stmt.USER, Stmt.USER_BATCH, new int[] {0}, new int[] {Stmt.INT8});
+        USER(20, Stmt.USER, Stmt.USER_BATCH, new int[] {0},
+                new int[] {Stmt.INT8});
 
         /**
          * single: per-unit statement; batch: coalesced statement or -1;
          * params/types: unit parameter order and batch array OIDs.
          */
+        /**
+         * Rough Postgres time per coalesced unit (µs, local
+         * pg_stat_statements), for spreading a round over connections.
+         */
+        final int cost;
+
         final int single;
 
         final int batch;
@@ -128,8 +147,9 @@ public final class PgConn {
         final int[] params;
         final int[] types;
 
-        Read(int single, int batch, int[] params,
-             int[] types) {
+        Read(int cost, int single, int batch,
+             int[] params, int[] types) {
+            this.cost = cost;
             this.single = single;
             this.batch = batch;
             this.params = params;
@@ -220,11 +240,22 @@ public final class PgConn {
         }
     }
 
-    private int kind(Unit u) {
+    /** The Read ordinal a unit coalesces under, or -1. */
+    static int kind(Unit u) {
         if (u.tx || u.queries.length != 1) {
             return -1;
         }
         return KIND[u.queries[0].statementId] - 1;
+    }
+
+    static final int KINDS = READS.length;
+
+    /**
+     * Estimated cost of one more unit of a kind (-1: a statement of its own) in
+     * a round.
+     */
+    static int cost(int kind) {
+        return kind < 0 ? 300 : READS[kind].cost;
     }
 
     private boolean skipped(int i) {
