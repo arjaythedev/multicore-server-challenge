@@ -140,3 +140,30 @@ Also a `GC_STATS=1` knob that prints GC counters every 10 s (diagnostics, off by
 - **180k: 45.2k req/s, p95 429 / p99 671 ms PASS** (app 89, pg 80, RSS 1132 MB)
 - 190k: 45.5k req/s, p95 890 / p99 1807 ms FAIL (the loadgens also report falling behind)
 Local ceiling: 180k.
+
+### PR opened: arjaythedev/multicore-server-challenge#179 at c66c76c, CI `test` green (6m42s).
+Also read #158 (ocaml-eio-ExSidius, OCaml 5.4 + libpq, batches shared across 6 domains, 150 ms window,
+`OCAMLRUNPARAM=s=32M,o=400`, claims a private 140k pass).
+
+### E16 GC settings from #158 (scaled 120k eq, d6 l2, x2 interleaved)
+s=4M: tot 181.4/180.9 (app 71.9/72.1), RSS 328; s=4M,o=400: 182.5/179.4 (no gain); s=32M,o=400: 177.1/178.4
+(app 70.4/69.1), RSS 1.85 GB. o=400 does nothing for us; a 32M minor heap may give ~2%. Checked at 180k real (series 13).
+180k real, fresh DB, x2 interleaved (series 13): s=4M p95 445/394 ms PASS both, tot 168.8/169.1 µs/req;
+s=32M p95 598/506 FAIL both (p99 1215/985), tot 169.9/169.0, RSS 2.55 GB. **Dropped**, s=4M stays.
+GC counters (GC_STATS=1, s=4M, 180k): ~10.5e9 minor words in ~120 s, i.e. on the order of 2,000 words per
+request, and 16% of minor words get promoted. Allocation is the next target.
+
+### E17 #158's generated BMI2 bcrypt assembly: not tried
+Benchmarking it means compiling and running code from another PR on wsl26; the session's permission check
+refused that, so it waits for a go-ahead.
+
+### Allocation profile (MEMPROF knob, Gc.Memprof, scaled 120k eq)
+Steady-state top sites: Postgres writer `Bytes.sub_string` of every outgoing batch (15% of sampled words, all in the
+major heap, then copied again by `copy_string`); `Buf_read.take` of each Postgres message (14%); array-literal
+parameters growing a fresh `Buffer` each time (~10%, major heap); hashtables of the batch keys (~5%); digestif in
+JWT (~4%). One-time startup buffers make up ~28% of the samples.
+
+### E18 no-copy Postgres writer + one scratch buffer per domain for array literals (kept, memory)
+Writer blits into a per-connection Cstruct and writes that; `int_arr`/`text_arr` reuse a domain-local Buffer.
+Scaled x2: major words 145M/140M → 104M/96M (−30%), minor −2.5%, RSS 328/323 → 309/307 MB; app 70.9/71.2 →
+71.1/70.8 µs/req (no CPU change at this load). 197/197.

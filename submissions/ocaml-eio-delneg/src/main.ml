@@ -216,6 +216,7 @@ module Pg = struct
     loop ()
 
   let writer c =
+    let cs = ref (Cstruct.create 65536) in
     let rec loop () =
       if c.out.W.n = 0 then begin
         let p, u = P.create () in
@@ -223,10 +224,13 @@ module Pg = struct
       end;
       let w = c.out in
       c.out <- c.spare; c.spare <- w;
-      let s = Bytes.sub_string w.W.b 0 w.W.n in
+      (* one copy into this connection's own off-heap buffer, no string per batch *)
+      let n = w.W.n in
+      if Cstruct.length !cs < n then cs := Cstruct.create (max n (2 * Cstruct.length !cs));
+      Cstruct.blit_from_bytes w.W.b 0 !cs 0 n;
       w.W.n <- 0;
       if Bytes.length w.W.b > 1 lsl 20 then w.W.b <- Bytes.create 65536;
-      Eio.Flow.copy_string s c.flow;
+      Eio.Flow.write c.flow [ Cstruct.sub !cs 0 n ];
       loop ()
     in
     loop ()
@@ -832,8 +836,11 @@ module Plan = struct
        (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = q.v AND fo.followee_id = ANY (q.uu)) fo"
 
   (* array parameters in text form *)
+  (* one scratch buffer per domain: an array literal is built and copied out with no yield in between *)
+  let scratch = Domain.DLS.new_key (fun () -> Buffer.create 65536)
+  let scratch_buf () = let b = Domain.DLS.get scratch in Buffer.clear b; b
   let text_arr (l : string list) =
-    let b = Buffer.create 256 in
+    let b = scratch_buf () in
     Buffer.add_char b '{';
     List.iteri (fun k t ->
         if k > 0 then Buffer.add_char b ',';
@@ -843,7 +850,7 @@ module Plan = struct
     Buffer.add_char b '}';
     Some (Buffer.contents b)
   let int_arr (l : int list) =
-    let b = Buffer.create 256 in
+    let b = scratch_buf () in
     Buffer.add_char b '{';
     List.iteri (fun k v -> if k > 0 then Buffer.add_char b ','; Buffer.add_string b (string_of_int v)) l;
     Buffer.add_char b '}';
@@ -1458,6 +1465,56 @@ let serve ctx fd =
   in
   loop ()
 
+(* ---------- diagnostics: MEMPROF=<rate> samples allocations per domain (Gc.Memprof) and prints the top
+   allocation sites (words sampled, words of those promoted) every 30 s. Off by default. ---------- *)
+
+let memprof_rate = float_of_string (getenv "MEMPROF" "0")
+let mp_m = Mutex.create ()
+let mp_tbl : (string, float ref * float ref) Hashtbl.t = Hashtbl.create 256
+
+let mp_key cs =
+  match Printexc.backtrace_slots cs with
+  | None -> "?"
+  | Some slots ->
+    let b = Buffer.create 80 and k = ref 0 in
+    Array.iter (fun s ->
+        if !k < 4 then
+          match Printexc.Slot.location s with
+          | Some l when l.Printexc.filename <> "" ->
+            incr k; if !k > 1 then Buffer.add_string b " < ";
+            Buffer.add_string b (Filename.basename l.Printexc.filename ^ ":" ^ string_of_int l.Printexc.line_number)
+          | _ -> ()) slots;
+    Buffer.contents b
+
+let mp_add key words promoted =
+  Mutex.lock mp_m;
+  let a, p = match Hashtbl.find_opt mp_tbl key with
+    | Some e -> e | None -> let e = (ref 0., ref 0.) in Hashtbl.replace mp_tbl key e; e in
+  a := !a +. words; p := !p +. promoted;
+  Mutex.unlock mp_m
+
+let memprof_start () =
+  let tracker = { Gc.Memprof.null_tracker with
+    alloc_minor = (fun (a : Gc.Memprof.allocation) ->
+        let key = mp_key a.callstack in
+        let w = float (a.n_samples * (a.size + 1)) in
+        mp_add key w 0.; Some (key, w));
+    alloc_major = (fun (a : Gc.Memprof.allocation) ->
+        mp_add ("MAJOR " ^ mp_key a.callstack) (float (a.n_samples * (a.size + 1))) 0.; None);
+    promote = (fun (key, w) -> mp_add key 0. w; None) } in
+  ignore (Gc.Memprof.start ~sampling_rate:memprof_rate ~callstack_size:24 tracker)
+
+let memprof_dump () =
+  Mutex.lock mp_m;
+  let l = Hashtbl.fold (fun k (a, p) acc -> (k, !a, !p) :: acc) mp_tbl [] in
+  Mutex.unlock mp_m;
+  let tot = List.fold_left (fun s (_, a, _) -> s +. a) 0. l in
+  let l = List.sort (fun (_, a, _) (_, b, _) -> compare b a) l in
+  Printf.eprintf "memprof total sampled words %.0f (rate %g)\n" tot memprof_rate;
+  List.iteri (fun i (k, a, p) -> if i < 40 then
+                 Printf.eprintf "memprof %5.1f%% words %.0f promoted %.0f  %s\n" (100. *. a /. tot) a p k) l;
+  flush stderr
+
 (* ---------- main ---------- *)
 
 let () =
@@ -1485,6 +1542,8 @@ let () =
           Printf.eprintf "gc minor_words=%.0f promoted=%.0f major_words=%.0f minor_gcs=%d major_gcs=%d heap_words=%d\n%!"
             st.Gc.minor_words st.Gc.promoted_words st.Gc.major_words st.Gc.minor_collections st.Gc.major_collections st.Gc.heap_words
         done) ());
+  if memprof_rate > 0. then
+    ignore (Thread.create (fun () -> while true do Thread.delay 30.; memprof_dump () done) ());
   Eio_main.run @@ fun env ->
   let net = Eio.Stdenv.net env and dm = Eio.Stdenv.domain_mgr env in
   let clock = Eio.Stdenv.mono_clock env in
@@ -1503,6 +1562,7 @@ let () =
       done;
       !best in
   let worker k () =
+    if memprof_rate > 0. then memprof_start ();
     Eio.Switch.run @@ fun sw ->
     let conns = Array.init conns_per (fun _ -> Pg.connect ~sw net url) in
     let pick = picker conns in

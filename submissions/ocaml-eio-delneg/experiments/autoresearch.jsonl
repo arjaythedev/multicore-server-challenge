@@ -13,3 +13,5 @@
 {"run":"e14-frag","eq_users":120000,"app_us":70.3,"tot_us":178.8,"status":"drop","note":"base app 71.7 tot 180.5, RSS +16%, 180k FAIL p95 538"}
 {"run":"e15-loops2","status":"keep-defaults","note":"d6l2 best at 160k and 180k"}
 {"run":"s11-e15-defaults","real_users":180000,"rps":45157,"p95":429,"p99":671,"status":"pass","note":"160k p95 119 pass, 190k p95 890 fail"}
+{"run":"e16-s32M","real_users":180000,"p95":[598,506],"status":"drop","note":"s4M p95 445/394 pass"}
+{"run":"e18-nocopy-writer","eq_users":120000,"app_us":71.0,"status":"keep","note":"major words -30%, RSS -6%, CPU neutral"}
