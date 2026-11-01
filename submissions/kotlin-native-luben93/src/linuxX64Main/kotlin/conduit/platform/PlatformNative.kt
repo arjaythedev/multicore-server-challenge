@@ -23,6 +23,7 @@ import kotlinx.cinterop.value
 import platform.posix.AF_INET
 import platform.posix.CLOCK_MONOTONIC
 import platform.posix.CLOCK_REALTIME
+import platform.posix.EAGAIN
 import platform.posix.EINTR
 import platform.posix.IPPROTO_TCP
 import platform.posix.MSG_NOSIGNAL
@@ -42,6 +43,9 @@ import platform.posix.TCP_NODELAY
 import platform.posix.addrinfo
 import platform.posix.clock_gettime
 import platform.posix.close
+import platform.posix.closedir
+import platform.posix.opendir
+import platform.posix.readdir
 import platform.posix.connect
 import platform.posix.errno
 import platform.posix.freeaddrinfo
@@ -117,7 +121,32 @@ private fun gcInit(): String {
         kotlin.native.runtime.GC.targetHeapBytes = bytes
     }
     if (getenv("GC_LOG") == "1") startThread("gc-log") { gcLog() }
+    if (getenv("SCHED_SWEEP") == "1") startThread("sched-sweep") { schedSweep() }
     return "gc heap target ${kotlin.native.runtime.GC.targetHeapBytes shr 20} MiB"
+}
+
+/**
+ * SCHED_SWEEP=1: puts every thread of the process that was not started by [startThread] (the Kotlin/Native runtime's GC
+ * and finalizer threads) into SCHED_BATCH too, once a second (they are created lazily, at the first collection).
+ */
+private fun schedSweep() {
+    val policy = nativeHeap.alloc<kotlinx.cinterop.IntVar>().apply { value = 0 }
+    val done = HashSet<Int>()
+    while (true) {
+        val dir = opendir("/proc/self/task")
+        if (dir != null) {
+            val now = HashSet<Int>()
+            while (true) {
+                val e = readdir(dir) ?: break
+                val tid = e.pointed.d_name.toKString().toIntOrNull() ?: continue
+                now.add(tid)
+                if (done.add(tid)) syscall(SYS_SCHED_SETSCHEDULER, tid, 3, policy.ptr)
+            }
+            closedir(dir)
+            done.retainAll(now)
+        }
+        sleep(1u)
+    }
 }
 
 @OptIn(kotlin.native.runtime.NativeRuntimeApi::class, ExperimentalStdlibApi::class)
@@ -139,10 +168,16 @@ private fun gcLog() {
     }
 }
 
-actual fun nanoTime(): Long = memScoped {
-    val ts = alloc<timespec>()
+/** One timespec per thread, so [nanoTime] (several calls per request) allocates nothing (memScoped mallocs and frees an arena). */
+@ThreadLocal
+private object ThreadClock {
+    val ts = nativeHeap.alloc<timespec>()
+}
+
+actual fun nanoTime(): Long {
+    val ts = ThreadClock.ts
     clock_gettime(CLOCK_MONOTONIC, ts.ptr)
-    ts.tv_sec * 1_000_000_000L + ts.tv_nsec
+    return ts.tv_sec * 1_000_000_000L + ts.tv_nsec
 }
 
 actual fun currentTimeMillis(): Long = memScoped {
@@ -270,8 +305,11 @@ actual class Monitor actual constructor() {
     }
 }
 
-/** Seconds a Postgres socket may block in recv, send or connect (no query of the app takes anywhere near this). */
-private const val PG_IO_TIMEOUT_S = 15L
+/**
+ * Seconds a Postgres socket may block in recv, send or connect (no query of the app takes anywhere near this).
+ * PG_IO_TIMEOUT_S overrides it (tests).
+ */
+private val PG_IO_TIMEOUT_S: Long = platform.posix.getenv("PG_IO_TIMEOUT_S")?.toKString()?.trim()?.toLongOrNull()?.coerceAtLeast(1L) ?: 15L
 
 actual class BlockingSocket private constructor(private val fd: Int) {
     private val closed = AtomicInt(0)
@@ -283,6 +321,7 @@ actual class BlockingSocket private constructor(private val fd: Int) {
             if (r > 0) return r.toInt()
             if (r == 0L) return -1
             val e = errno
+            if (e == EAGAIN) return READ_TIMEOUT
             if (e != EINTR) throw IllegalStateException("recv: ${strerror(e)?.toKString()}")
         }
     }

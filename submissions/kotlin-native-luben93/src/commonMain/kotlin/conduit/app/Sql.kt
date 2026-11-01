@@ -115,6 +115,18 @@ internal object ReadShare {
     var feedShared = false
 
     /**
+     * READ_FEED_ROWS (default on; needs [feedShared]; 0 = the v4 statement that joins every page row to its article's
+     * columns): the feed statement returns each viewer's page as narrow rows (count, article id) and each distinct article of
+     * the batch ONCE, plus flag rows for the viewer's favorites ([conduit.db.Sharing.ARTICLES]); the pool collects the article
+     * rows in an id table and the handler looks each page id up. No fan-out join, no final sort over wide rows, a fraction of
+     * the bytes on the wire (about 630 wide rows for 290-340 distinct articles per 64 feeds before).
+     */
+    var feedRows = false
+
+    /** READ_GLOBAL_WIN (default on; needs [sharedRows]; 0 = one index scan per distinct page): the global list's pages come from one window scan, see [Sql.LIST_ALL]. */
+    var globalWin = false
+
+    /**
      * READ_SHARED_ROWS (default on; needs [on]; 0 = the shared shapes that fan every row out to every request): comments
      * and the global, tag and author lists return each distinct thread or page ONCE and the pool hands every request of a
      * group views of the same rows ([conduit.db.Sharing.GROUPS]); what is per request (favorited, following) comes back as
@@ -272,6 +284,11 @@ internal object Cols {
     const val LIST_COUNT = 1
     const val LIST = 2         // list article (no body) from column 2; NULL slug = empty page
     const val CREATED = 0      // ARTICLE_CREATE: full article from column 0
+
+    // Feed rows ([ReadShare.feedRows], Sharing.ARTICLES): column 1 is the capped count (count row, NULL in page rows) or the article id
+    // (article and flag rows), column 2 the page's article id (page rows) or the author id (article rows), then slug, title,
+    // description, created_at, updated_at, tags, favorites count, username, bio, image from column 3 (article rows only).
+    const val FEED_ROW = 3
 }
 
 internal object Sql {
@@ -427,8 +444,16 @@ internal object Sql {
                 "cn AS MATERIALIZED (SELECT CASE WHEN EXISTS (SELECT 1 FROM articles c ORDER BY c.id OFFSET 999) " +
                     "THEN 1000 ELSE (SELECT count(*) FROM articles c) END AS n), " +
                     "pk AS MATERIALIZED (SELECT r.k, r.l, r.o, min(r.i) AS rep FROM r GROUP BY r.k, r.l, r.o), " +
-                    "pp AS MATERIALIZED (SELECT pk.rep, x.id FROM pk CROSS JOIN LATERAL " +
-                    "(SELECT a.id FROM articles a ORDER BY a.id DESC LIMIT pk.l OFFSET pk.o) x)",
+                    (if (ReadShare.globalWin) {
+                        // the pages of a batch overlap (offsets 0-40): ONE scan of the newest max(limit + offset) ids, sliced per page
+                        "win AS MATERIALIZED (SELECT array_agg(w.id ORDER BY w.id DESC) AS ids FROM (SELECT a.id FROM articles a " +
+                            "ORDER BY a.id DESC LIMIT (SELECT max(pk.l::bigint + pk.o) FROM pk)) w), " +
+                            "pp AS MATERIALIZED (SELECT pk.rep, x.id FROM pk CROSS JOIN win CROSS JOIN LATERAL " +
+                            "unnest(win.ids[pk.o::int + 1 : pk.o::int + pk.l]) AS x(id))"
+                    } else {
+                        "pp AS MATERIALIZED (SELECT pk.rep, x.id FROM pk CROSS JOIN LATERAL " +
+                            "(SELECT a.id FROM articles a ORDER BY a.id DESC LIMIT pk.l OFFSET pk.o) x)"
+                    }),
                 "CROSS JOIN cn",
                 GROUP_ON,
             )
@@ -620,20 +645,38 @@ internal object Sql {
      * `fl`: the page articles each viewer favorited, one favorites_pkey probe per viewer. An empty page is one row with
      * NULLs after the count, as in [feedFloor].
      */
-    private fun feedShared(): String {
-        return "WITH $FEED_CTES, " +
+    private fun feedShared(narrow: Boolean): String {
+        val ctes = "WITH $FEED_CTES, " +
             "cn AS MATERIALIZED (SELECT r.i, c.n FROM r $FEED_COUNT), " +
             "pg AS MATERIALIZED (SELECT r.i, x.id FROM r CROSS JOIN LATERAL ($FLOOR_IDS) x), " +
             "${distinctArticles("pg")}, " +
             "fl AS MATERIALIZED (SELECT g.i, x.article_id FROM (SELECT pg.i, r.v, array_agg(pg.id) AS aids FROM pg " +
             "JOIN r ON r.i = pg.i WHERE r.v > 0 GROUP BY pg.i, r.v) g CROSS JOIN LATERAL (SELECT f.article_id " +
-            "FROM favorites f WHERE f.user_id = g.v AND f.article_id = ANY (g.aids) OFFSET 0) x) " +
+            "FROM favorites f WHERE f.user_id = g.v AND f.article_id = ANY (g.aids) OFFSET 0) x) "
+        if (narrow) return ctes + FEED_ROWS_SELECT
+        return ctes +
             "SELECT cn.i, cn.n, art.slug, art.title, art.description, art.created_at, art.updated_at, art.tags, art.fc, " +
             "CASE WHEN art.id IS NOT NULL THEN fl.article_id IS NOT NULL END, art.username, art.bio, art.image, " +
             "CASE WHEN art.id IS NOT NULL THEN true END " +
             "FROM cn LEFT JOIN pg ON pg.i = cn.i LEFT JOIN art ON art.id = pg.id " +
             "LEFT JOIN fl ON fl.i = cn.i AND fl.article_id = pg.id ORDER BY cn.i, pg.id DESC"
     }
+
+    /** NULL columns after the article id of a page or flag row (the width of [Cols.FEED_ROW] minus 3). */
+    private val FEED_PAD = listOf("text", "text", "text", "timestamptz", "timestamptz", "text[]", "int8", "text", "text", "text")
+        .joinToString("") { ", NULL::$it" }
+
+    /**
+     * The final SELECT of [feedShared] with [ReadShare.feedRows] ([Cols.FEED_ROW] layout): per request one count row
+     * `(i, n, NULL)`, its page rows `(i, NULL, id)` (newest first; none for an empty page), then each distinct article once, then
+     * the flag rows `(-1 - request, article id)` of the page articles the viewer favorited. No join back to the articles.
+     */
+    private val FEED_ROWS_SELECT: String get() =
+        "(SELECT cn.i, cn.n, NULL::int8$FEED_PAD FROM cn) " +
+            "UNION ALL (SELECT pg.i, NULL::int8, pg.id$FEED_PAD FROM pg ORDER BY pg.i, pg.id DESC) " +
+            "UNION ALL (SELECT (-2147483648)::int4, art.id, art.author_id, art.slug, art.title, art.description, " +
+            "art.created_at, art.updated_at, art.tags, art.fc, art.username, art.bio, art.image FROM art) " +
+            "UNION ALL (SELECT -1 - fl.i, fl.article_id, NULL::int8$FEED_PAD FROM fl)"
 
     /** The page ids of [feedFloor]: per followee at most depth ids, none older than the viewer's hub floor. */
     private const val FLOOR_IDS =
@@ -661,7 +704,7 @@ internal object Sql {
         // Tried and dropped (2026-10-28): taking the page from the count's id scan when below the cap. EXPLAIN 456 vs
         // 327 us per feed: most viewers reach the 1000 cap (mean 893 ids), so the per-followee page runs anyway.
         if (ReadShare.feedHeavy && ReadShare.feedFloor) {
-            if (ReadShare.feedShared) feedShared() else feedFloor()
+            if (ReadShare.feedShared) feedShared(ReadShare.feedRows) else feedFloor()
         } else if (ReadShare.feedHeavy) {
             feedHeavy(FEED_PAGE)
         } else {
@@ -672,6 +715,7 @@ internal object Sql {
             )
         },
         maxBatch = ReadShare.feedMaxBatch.takeIf { it > 0 } ?: batch,
+        sharing = if (ReadShare.feedRows && ReadShare.feedShared && ReadShare.feedHeavy && ReadShare.feedFloor) Sharing.ARTICLES else Sharing.NONE,
     )
 
     val reads: List<ReadKind> = listOf(
@@ -727,6 +771,11 @@ internal object Sql {
             "w AS (INSERT INTO favorites (user_id, article_id) SELECT \$1, t.id FROM t ON CONFLICT DO NOTHING) " +
             "SELECT t.id FROM t",
         intArrayOf(I8, T),
+        // m favorites at once: $1 i, $2 viewers, $3 slugs. Rows: i, article id. DISTINCT: the same favorite twice in one group.
+        batchSql = "WITH r AS (SELECT * FROM unnest(\$1::int4[], \$2::int8[], \$3::text[]) AS r(i, v, s)), " +
+            "t AS (SELECT r.i, r.v, a.id FROM r JOIN articles a ON a.slug = r.s), " +
+            "w AS (INSERT INTO favorites (user_id, article_id) SELECT DISTINCT t.v, t.id FROM t ON CONFLICT DO NOTHING) " +
+            "SELECT t.i, t.id FROM t",
     )
 
     /** $1 viewer, $2 slug. Row: article id. No row: 404. */
@@ -798,6 +847,15 @@ internal object Sql {
             "RETURNING id, created_at, updated_at, author_id) " +
             "SELECT c.id, c.created_at, c.updated_at, u.username, u.bio, u.image FROM c JOIN users u ON u.id = c.author_id",
         intArrayOf(I8, T, T),
+        // m comments at once: $1 i, $2 viewers, $3 slugs, $4 bodies. Ids are drawn in request order (the sort is under the nextval).
+        // Rows: i, id, created_at, updated_at, username, bio, image.
+        batchSql = "WITH r AS (SELECT * FROM unnest(\$1::int4[], \$2::int8[], \$3::text[], \$4::text[]) AS r(i, v, s, b)), " +
+            "m AS (SELECT x.*, nextval('comments_id_seq'::regclass) AS cid FROM " +
+            "(SELECT r.i, r.v, r.b, a.id AS aid FROM r JOIN articles a ON a.slug = r.s ORDER BY r.i OFFSET 0) x), " +
+            "c AS (INSERT INTO comments (id, article_id, author_id, body) SELECT m.cid, m.aid, m.v, m.b FROM m " +
+            "RETURNING id, created_at, updated_at, author_id) " +
+            "SELECT m.i, c.id, c.created_at, c.updated_at, u.username, u.bio, u.image " +
+            "FROM c JOIN m ON m.cid = c.id JOIN users u ON u.id = c.author_id",
     )
 
     /**

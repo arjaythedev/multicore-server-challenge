@@ -181,7 +181,18 @@ internal object Handlers {
         j.beginArray()
         var count = 0L
         val flags = if (kind.sharing == Sharing.GROUPS) res else null // shared rows: the viewer's flags are the request's own
-        for (i in 0 until res.rowCount) {
+        if (kind.sharing == Sharing.ARTICLES) {
+            // a count row and page rows (article ids): each id's row is looked up in the batch's one copy of the article
+            for (i in 0 until res.rowCount) {
+                val n = res.pageCount(i)
+                if (n >= 0) count = n
+                val id = res.pageId(i)
+                if (id >= 0) {
+                    val a = res.article(id)
+                    if (a != null) j.feedArticle(a, res)
+                }
+            }
+        } else for (i in 0 until res.rowCount) {
             val r = res.row(i)
             if (i == 0) count = r.int8(Cols.LIST_COUNT)
             if (!r.isNull(Cols.LIST)) j.article(r, Cols.LIST, withBody = false, flags)

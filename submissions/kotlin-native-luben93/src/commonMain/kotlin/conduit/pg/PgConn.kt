@@ -2,13 +2,16 @@ package conduit.pg
 
 import conduit.platform.BlockingSocket
 import conduit.platform.Monitor
+import conduit.platform.READ_TIMEOUT
 import conduit.util.ByteBuf
 import conduit.util.intBE
 import conduit.util.shortBE
 import kotlin.jvm.JvmField
 
 /** The connection is unusable (EOF, I/O error, protocol violation); requests on it fail with 08006. */
-class PgIoException(message: String, cause: Throwable? = null) : Exception(message, cause)
+/** [timeout]: the receive timeout expired with no byte read (the connection and its buffer are still consistent). */
+class PgIoException(message: String, cause: Throwable? = null, @JvmField val timeout: Boolean = false) :
+    Exception(message, cause)
 
 /** An ErrorResponse where there is no [Result] to put it in (startup, prepare, simple query). */
 class PgException(val error: PgError, context: String) : Exception("$context: ${error.code} ${error.message}")
@@ -46,6 +49,16 @@ class PgConn private constructor(private val sock: BlockingSocket) {
 
     /** Reads the next complete message (blocking) and returns its type byte. Throws [PgIoException]. */
     fun next(): Int {
+        val t = nextOrTimeout()
+        if (t < 0) throw PgIoException("recv: timed out", null, true)
+        return t
+    }
+
+    /**
+     * [next], but returns [TIMEOUT] when the receive timeout expired with no byte read (the connection and its buffer
+     * are still consistent) instead of throwing. Throws [PgIoException] for everything else.
+     */
+    fun nextOrTimeout(): Int {
         while (true) {
             val avail = rlen - rpos
             if (avail >= 5) {
@@ -67,6 +80,7 @@ class PgConn private constructor(private val sock: BlockingSocket) {
             } catch (e: Throwable) {
                 throw PgIoException("recv: ${e.message ?: e}", e)
             }
+            if (n == READ_TIMEOUT) return TIMEOUT
             if (n <= 0) throw PgIoException("connection closed by the server")
             rlen += n
         }
@@ -336,6 +350,8 @@ class PgConn private constructor(private val sock: BlockingSocket) {
     }
 
     companion object {
+        /** [nextOrTimeout]: the receive timeout expired. */
+        const val TIMEOUT = -1
         private const val PROTOCOL_3_0 = 196608
         private const val INITIAL_RBUF = 128 * 1024
         private const val MAX_KEEP_RBUF = 4 * 1024 * 1024

@@ -1,5 +1,6 @@
 package conduit.db
 
+import conduit.pg.Oid
 import conduit.pg.Params
 import conduit.pg.PgConn
 import conduit.pg.PgError
@@ -12,7 +13,9 @@ import conduit.platform.locked
 import conduit.platform.nanoTime
 import conduit.util.ByteBuf
 import conduit.util.Timing
+import conduit.util.intBE
 import conduit.util.logSafe
+import conduit.util.shortBE
 import kotlin.coroutines.Continuation
 import kotlin.coroutines.resume
 import kotlin.jvm.JvmField
@@ -71,6 +74,16 @@ internal class WriteTrip(cap: Int) {
 
     /** When it was handed to its connection ([nanoTime]), for the statistics. */
     @JvmField var sentAt = 0L
+
+    /**
+     * The group as statements ([WritePool.plan]): unit u is jobs[unitStart[u], +unitCount[u]): one job, or (count >= 2) jobs
+     * of one statement sent as ONE batched execution. Jobs of a batched unit are contiguous in [jobs].
+     */
+    @JvmField val unitStart = IntArray(WritePool.MAX_GROUP)
+    @JvmField val unitCount = IntArray(WritePool.MAX_GROUP)
+    @JvmField var nUnits = 0
+    @JvmField val tmp = arrayOfNulls<WriteJob>(WritePool.MAX_GROUP)
+    @JvmField val taken = BooleanArray(WritePool.MAX_GROUP)
 }
 
 internal class WriteWorker(pool: WritePool, index: Int) : Worker(pool, index) {
@@ -118,19 +131,31 @@ internal class WriteWorker(pool: WritePool, index: Int) : Worker(pool, index) {
         }
     }
 
-    /** BEGIN, jobs, COMMIT, Sync. Statement s: 0 = BEGIN, 1..g = jobs, g+1 = COMMIT. */
+    /**
+     * Explicit group: BEGIN, jobs, COMMIT, Sync; statement s: 0 = BEGIN, 1..g = jobs, g+1 = COMMIT. Implicit group (the
+     * jobs and one Sync, Postgres commits at the Sync): s: 0 until g = jobs, and an error after all g
+     * CommandCompletes is the commit's.
+     */
     private fun readGroup(c: PgConn, t: WriteTrip): Int {
         val first = t.nIso
-        val g = t.n - first
+        val units = t.nUnits
+        val base = if (wpool.implicitTx) 0 else 1
         var s = 0
         var err: PgError? = null
         var errAt = -1
         while (true) {
             val m = c.next()
             if (m == 'D'.code) {
-                if (err == null && s in 1..g) t.jobs[first + s - 1]!!.res.addRow(c.rbuf, c.mstart)
+                val u = s - base
+                if (err == null && u >= 0 && u < units) route(c, t, u)
             } else if (m == 'C'.code) {
-                if (s in 1..g) t.jobs[first + s - 1]!!.res.affected = c.tagCount()
+                val u = s - base
+                if (u >= 0 && u < units) {
+                    val at = t.unitStart[u]
+                    val n = t.unitCount[u]
+                    if (n == 1) t.jobs[at]!!.res.affected = c.tagCount()
+                    else for (j in at until at + n) t.jobs[j]!!.res.let { it.affected = it.rowCount.toLong() }
+                }
                 s++
             } else if (m == 'E'.code) {
                 if (err == null) {
@@ -146,7 +171,7 @@ internal class WriteWorker(pool: WritePool, index: Int) : Worker(pool, index) {
             for (j in first until t.n) t.jobs[j]!!.settled = true
             return status
         }
-        if (errAt == g + 1) {
+        if (errAt == units + base) {
             // COMMIT itself failed: the outcome is not ours to guess, so nothing is retried
             for (j in first until t.n) {
                 val job = t.jobs[j]!!
@@ -162,15 +187,19 @@ internal class WriteWorker(pool: WritePool, index: Int) : Worker(pool, index) {
         wpool.lock.locked { wpool.reruns++ }
         val o = c.out
         o.reset()
-        o.put(wpool.runtime.rollbackExec)
-        o.sync()
+        if (!wpool.implicitTx) { // an implicit transaction was rolled back by the Sync already
+            o.put(wpool.runtime.rollbackExec)
+            o.sync()
+        }
         for (j in first until t.n) {
             wpool.encodeJob(o, t.jobs[j]!!)
             o.sync()
         }
         c.send()
-        while (c.next() != 'Z'.code) {
-            // ROLLBACK's BindComplete / CommandComplete
+        if (!wpool.implicitTx) {
+            while (c.next() != 'Z'.code) {
+                // ROLLBACK's BindComplete / CommandComplete
+            }
         }
         var st = 'I'.code
         for (j in first until t.n) {
@@ -179,6 +208,28 @@ internal class WriteWorker(pool: WritePool, index: Int) : Worker(pool, index) {
             st = readSingle(c, job)
         }
         return st
+    }
+
+    /**
+     * The DataRow just read belongs to unit [u]: a single job's row as it is, a batched unit's row to the job named by its
+     * column 0 (i), with column 0 cut off in place (the Int16 column count is rewritten over the end of i's value), so
+     * the job sees exactly the row its own statement would have returned.
+     */
+    private fun route(c: PgConn, t: WriteTrip, u: Int) {
+        val at = t.unitStart[u]
+        val n = t.unitCount[u]
+        if (n == 1) {
+            t.jobs[at]!!.res.addRow(c.rbuf, c.mstart)
+            return
+        }
+        val b = c.rbuf
+        val p = c.mstart
+        val i = b.intBE(p + 6)
+        if (i < 0 || i >= n) return
+        val cols = b.shortBE(p) - 1
+        b[p + 8] = (cols ushr 8).toByte()
+        b[p + 9] = cols.toByte()
+        t.jobs[at + i]!!.res.addRow(b, p + 8)
     }
 
     override fun completeLocked() {
@@ -237,8 +288,12 @@ internal class WritePool(
     statements: List<PgStatement>,
     private val stmts: List<WriteStmt>,
     private val stmtNames: List<ByteArray>,
+    /** Per statement: the name of its prepared batch form, null where it has none (or batching is off). */
+    private val batchNames: List<ByteArray?>,
 ) : Pool("write", config, statements, config.writeConns, config.writeQueueMax) {
     @JvmField val workers = Array(config.writeConns) { WriteWorker(this, it) }
+    @JvmField val implicitTx = config.implicitTx
+    private val batching = config.batchWrites && batchNames.any { it != null }
     private val isoQ = JobQueue()
     private val groupQ = JobQueue()
 
@@ -313,11 +368,108 @@ internal class WritePool(
             encodeJob(o, t.jobs[t.nIso]!!)
             o.sync()
         } else if (g > 1) {
-            o.put(runtime.beginExec)
-            for (j in t.nIso until t.n) encodeJob(o, t.jobs[j]!!)
-            o.put(runtime.commitExec)
+            plan(t)
+            if (!implicitTx) o.put(runtime.beginExec)
+            for (u in 0 until t.nUnits) {
+                val at = t.unitStart[u]
+                val n = t.unitCount[u]
+                if (n == 1) encodeJob(o, t.jobs[at]!!) else encodeBatch(o, t, at, n)
+            }
+            if (!implicitTx) o.put(runtime.commitExec)
             o.sync()
         }
+    }
+
+    /**
+     * Under the pool lock: splits the group into statements. Without batching every job is one. With it, the jobs of a
+     * statement that has a batch form are pulled together (at the position of its first job, the others keep their order)
+     * and sent as one execution. Jobs of different requests in one group are concurrent, so any order is a valid one.
+     */
+    private fun plan(t: WriteTrip) {
+        val first = t.nIso
+        val g = t.n - first
+        var nu = 0
+        if (!batching) {
+            for (j in 0 until g) {
+                t.unitStart[nu] = first + j
+                t.unitCount[nu] = 1
+                nu++
+            }
+            t.nUnits = nu
+            return
+        }
+        for (j in 0 until g) {
+            t.tmp[j] = t.jobs[first + j]
+            t.taken[j] = false
+        }
+        var pos = first
+        for (j in 0 until g) {
+            if (t.taken[j]) continue
+            val job = t.tmp[j]!!
+            t.unitStart[nu] = pos
+            var c = 0
+            t.jobs[pos + c++] = job
+            if (batchNames[job.stmt.id] != null && nonNull(job.params)) {
+                for (k in j + 1 until g) {
+                    val other = t.tmp[k]!!
+                    if (!t.taken[k] && other.stmt === job.stmt && nonNull(other.params)) {
+                        t.taken[k] = true
+                        t.jobs[pos + c++] = other
+                    }
+                }
+            }
+            t.unitCount[nu] = c
+            pos += c
+            nu++
+        }
+        for (j in 0 until g) t.tmp[j] = null
+        t.nUnits = nu
+    }
+
+    /** No parameter is NULL (a batch form's arrays hold no NULLs). */
+    private fun nonNull(p: Params): Boolean {
+        val b = p.out.buf
+        var off = 0
+        for (k in 0 until p.count) {
+            val len = b.intBE(off)
+            if (len < 0) return false
+            off += 4 + len
+        }
+        return true
+    }
+
+    private val offs = IntArray(MAX_GROUP * MAX_BATCH_PARAMS)
+
+    /** One execution of the batch form for jobs[at, at + n) of one statement: $1 = 0..n-1, then each parameter as an array. */
+    private fun encodeBatch(o: ByteBuf, t: WriteTrip, at: Int, n: Int) {
+        val stmt = t.jobs[at]!!.stmt
+        val np = stmt.paramOids.size
+        require(np <= MAX_BATCH_PARAMS) { "batched write '${stmt.name}' has too many parameters" }
+        for (x in 0 until n) {
+            val p = t.jobs[at + x]!!.params
+            var off = 0
+            for (k in 0 until np) {
+                offs[x * np + k] = off
+                off += 4 + p.out.buf.intBE(off)
+            }
+        }
+        val lp = o.beginBind(batchNames[stmt.id]!!, 1 + np)
+        putArrayHeader(o, Oid.INT4, n, n * 8)
+        for (x in 0 until n) {
+            o.putIntBE(4)
+            o.putIntBE(x)
+        }
+        for (k in 0 until np) {
+            var data = 0
+            for (x in 0 until n) data += 4 + t.jobs[at + x]!!.params.out.buf.intBE(offs[x * np + k])
+            putArrayHeader(o, stmt.paramOids[k], n, data)
+            for (x in 0 until n) {
+                val buf = t.jobs[at + x]!!.params.out.buf
+                val off = offs[x * np + k]
+                o.put(buf, off, 4 + buf.intBE(off))
+            }
+        }
+        o.endBindExecute(lp)
     }
 
     /** Bind (binary parameters as encoded by the caller) + Execute. */
@@ -370,5 +522,16 @@ internal class WritePool(
         const val MAX_GROUP = 64
         const val MAX_ISOLATED = 16
         const val MAX_TRIP = MAX_GROUP + MAX_ISOLATED
+        private const val MAX_BATCH_PARAMS = 8
     }
+}
+
+/** Binary 1-D array parameter header (no NULLs, lower bound 1), preceded by the parameter's Int32 length. */
+internal fun putArrayHeader(o: ByteBuf, elemOid: Int, n: Int, dataLen: Int) {
+    o.putIntBE(20 + dataLen)
+    o.putIntBE(1)
+    o.putIntBE(0)
+    o.putIntBE(elemOid)
+    o.putIntBE(n)
+    o.putIntBE(1)
 }

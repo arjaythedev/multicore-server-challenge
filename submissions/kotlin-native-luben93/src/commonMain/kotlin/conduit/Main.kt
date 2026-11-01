@@ -5,6 +5,7 @@ import conduit.auth.Jwt
 import conduit.auth.Passwords
 import conduit.db.Db
 import conduit.db.DbConfig
+import conduit.db.WritePool
 import conduit.db.sleepNanos
 import conduit.http.Gzip
 import conduit.http.HttpEngine
@@ -65,8 +66,15 @@ fun main() {
     // took Postgres from 170 to 127 us per request at 120k users (lab/reports/omarchy-20261027.md).
     val shareReads = envInt("READ_SHARE", 1) != 0
     val gatherMs = envInt("READ_GATHER_MS", 30)
+    // READ_GATHER_AUTO (default on, 0 = the fixed READ_GATHER_MS): the window is READ_GATHER_MS while the CPUs have room and widens
+    // by READ_GATHER_STEP_MS a second up to READ_GATHER_MAX_MS while they are at least READ_GATHER_HIGH_PCT busy (back at READ_GATHER_LOW_PCT).
+    val gatherMaxMs = if (envInt("READ_GATHER_AUTO", 1) != 0) envInt("READ_GATHER_MAX_MS", 100) else 0
     // READ_LIFO_MS (lab, 0 = off): adaptive LIFO once a kind's oldest read has waited this long (see DbConfig)
     val lifoMs = envInt("READ_LIFO_MS", 0)
+    // READ_LIMIT=<n> pins how many read batches may be in flight at once (lab); READ_LIMIT_AUTO (default on, 0 = all connections may
+    // be busy) lets the server find it between 2 and DB_READ_CONNS from the service-time inflation of its own batches.
+    val readLimit = envInt("READ_LIMIT", 0)
+    val readLimitAuto = readLimit <= 0 && envInt("READ_LIMIT_AUTO", 1) != 0
 
     Jwt.init(secret)
     // HTTP_GZIP: 0 never, 1 always, unset = only while the network link is full (GZIP_ABOVE_MBPS, see http/Gzip.kt)
@@ -83,7 +91,16 @@ fun main() {
     )
     val dbConfig = DbConfig.fromUrl(
         dbUrl, readConns, writeConns, options, readQueueMax, writeQueueMax, guard, gatherMicros = gatherMs * 1000,
-        lifoMicros = lifoMs * 1000,
+        lifoMicros = lifoMs * 1000, gatherMaxMicros = gatherMaxMs * 1000,
+        gatherStepMicros = envInt("READ_GATHER_STEP_MS", 10) * 1000, gatherHighPct = envInt("READ_GATHER_HIGH_PCT", 75),
+        gatherLowPct = envInt("READ_GATHER_LOW_PCT", 60),
+        // DB_PIPELINE (default 2 = a full batch is written behind the running one)
+        pipelineDepth = envInt("DB_PIPELINE", 2),
+        // DB_IMPLICIT_TX (default 1 = the group is one implicit transaction ended by its Sync)
+        implicitTx = envInt("DB_IMPLICIT_TX", 1) != 0,
+        // DB_BATCH_WRITES (default 1 = same-statement writes of a group go out as one multi-row statement, see WriteStmt.batchSql)
+        batchWrites = envInt("DB_BATCH_WRITES", 1) != 0,
+        readLimit = readLimit, readLimitAuto = readLimitAuto,
     )
     App.configure(
         Db.query(dbConfig, App.COLLATION_PROBE).firstOrNull(),
@@ -92,16 +109,19 @@ fun main() {
         shareMaxBatch = envInt("READ_MAX_BATCH", 1024),
         // READ_VIEWER_FLAGS (default on): shared lists check favorited/following once per viewer, not twice per row
         viewerFlags = envInt("READ_VIEWER_FLAGS", 1) != 0,
-        // READ_FEED_MAX_BATCH (default 192, 0 = READ_MAX_BATCH): most feeds per execution. The feed statement decorates each distinct page article once (READ_FEED_SHARE)
+        // READ_FEED_MAX_BATCH (default 512, 0 = READ_MAX_BATCH): most feeds per execution. The feed statement decorates each distinct page article once (READ_FEED_SHARE)
         // and its hub/count work is per batch, so bigger batches cost less per feed (EXPLAIN, per feed: 334 us at 64, 233 us at 200). Lab, 180k users: cap 64 collapsed (p95 6 s,
-        // 1.7% timeouts), 192 and 1024 held the whole load (steady-state p95 130-143 ms, p99 184-199 ms).
-        feedMaxBatch = envInt("READ_FEED_MAX_BATCH", 192),
+        // 1.7% timeouts), 192 and 1024 held the whole load (steady-state p95 130-143 ms, p99 184-199 ms). The auto gather window sends bigger feed batches: at 60 ms 512 measured 74-75 us per request against 78 with 192.
+        feedMaxBatch = envInt("READ_FEED_MAX_BATCH", 512),
         // READ_FEED_HEAVY (default on; 0 = the plain capped count): skip the capped feed count for viewers who follow an author with 1000+ articles
         feedHeavy = envInt("READ_FEED_HEAVY", 1) != 0,
         // READ_FEED_FLOOR (default on, needs READ_FEED_HEAVY; 0 = off): per-batch floor ids of the shared hub followees bound the page probes
         feedFloor = envInt("READ_FEED_FLOOR", 1) != 0,
         // READ_FEED_SHARE (default on, needs READ_FEED_HEAVY and READ_FEED_FLOOR; 0 = decorate every page row): each distinct page article of a feed batch is decorated once
         feedShared = envInt("READ_FEED_SHARE", 1) != 0,
+        // READ_FEED_ROWS (default on, needs READ_FEED_SHARE; 0 = join every page row to its article's columns): the feed statement sends each distinct article of the batch once and the page as (count, id) rows
+        feedRows = envInt("READ_FEED_ROWS", 1) != 0,
+        globalWin = envInt("READ_GLOBAL_WIN", 1) != 0,
         // READ_SHARED_ROWS (default on, needs READ_SHARE; 0 = fan every row out to every request): comments and the global, tag and author lists send each distinct thread or page once
         sharedRows = envInt("READ_SHARED_ROWS", 1) != 0,
     )
@@ -114,7 +134,7 @@ fun main() {
     startHttpServer(host, port, httpThreads, HttpEngine { ex -> App.handle(ex) })
     println(
         "conduit: listening on $host:$port (cpus=$cpus http=$httpThreads db=$readConns+$writeConns " +
-            "bcrypt=$bcryptThreads${if (bcryptExtra > 0) "+$bcryptExtra after ${bcryptExtraAge}ms" else ""}; tags sorted by ${App.tagOrder}; reads ${App.readMode}, gather $gatherMs ms${if (lifoMs > 0) ", LIFO after $lifoMs ms" else ""}; " +
+            "bcrypt=$bcryptThreads${if (bcryptExtra > 0) "+$bcryptExtra after ${bcryptExtraAge}ms" else ""}; tags sorted by ${App.tagOrder}; reads ${App.readMode}, gather $gatherMs ms${if (gatherMaxMs > gatherMs) "..$gatherMaxMs ms (auto)" else ""}${if (lifoMs > 0) ", LIFO after $lifoMs ms" else ""}; " +
             "overload guard ${if (guard) "on, queue caps $readQueueMax/$writeQueueMax/$bcryptQueueMax" else "off"}; " +
             "gzip ${Gzip.description}; " +
             "$platform)",

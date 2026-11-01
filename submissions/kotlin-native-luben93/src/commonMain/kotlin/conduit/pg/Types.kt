@@ -85,7 +85,37 @@ class Result {
      */
     @JvmField var flagStarts: IntArray = IntArray(4)
     @JvmField var flagCount: Int = 0
+
+    /** [Sharing.ARTICLES] reads: the batch's distinct article rows, shared by every Result of the batch. */
+    @JvmField var articles: ArticleRows? = null
     private val view = Row()
+    private val articleView = Row()
+
+    /** The article row of [id] (a shared view like [row]), or null when the batch has none. */
+    fun article(id: Long): Row? {
+        val a = articles ?: return null
+        val at = a.find(id)
+        if (at < 0) return null
+        articleView.parse(buf, at)
+        return articleView
+    }
+
+    /**
+     * [Sharing.ARTICLES] feed row [i]: the page article id, or -1 for a count row. Body: Int16 ncols, Int32 len + Int32 marker, then
+     * column 1 (the count: Int32 len + Int64, or len -1 and no bytes) and column 2 (the id: the same), so a page row, whose
+     * column 1 is NULL, has column 2's length at offset 14.
+     */
+    fun pageId(i: Int): Long {
+        val p = rowStarts[i]
+        if (buf.intBE(p + 10) >= 0) return -1L
+        return if (buf.intBE(p + 14) < 0) -1L else buf.longBE(p + 18)
+    }
+
+    /** [Sharing.ARTICLES] feed row [i]: the request's capped count (column 1), or -1 when it is NULL (a page row). */
+    fun pageCount(i: Int): Long {
+        val p = rowStarts[i]
+        return if (buf.intBE(p + 10) < 0) -1L else buf.longBE(p + 14)
+    }
 
     val ok: Boolean get() = error == null
 
@@ -115,7 +145,57 @@ class Result {
     }
 
     fun clear() {
-        error = null; affected = 0; rowCount = 0; flagCount = 0
+        error = null; affected = 0; rowCount = 0; flagCount = 0; articles = null
+    }
+}
+
+/**
+ * The distinct article rows of a [conduit.db.Sharing.ARTICLES] batch, found by article id (column 1, an Int64 at body
+ * offset 14). Primitive arrays reused from batch to batch: open addressing over row indexes, no boxing.
+ */
+class ArticleRows {
+    private var starts = IntArray(64)
+    private var count = 0
+    private var table = IntArray(128) // row index + 1, 0 = empty
+    private var mask = 127
+    private var buf: ByteArray = ByteArray(0)
+
+    fun clear() { count = 0 }
+
+    fun add(bodyStart: Int) {
+        if (count == starts.size) starts = starts.copyOf(count * 2)
+        starts[count++] = bodyStart
+    }
+
+    /** Indexes the rows added since [clear]; [b] is the receive buffer they live in (it may have grown while they were added). */
+    fun build(b: ByteArray) {
+        buf = b
+        var size = 128
+        while (size < count * 2) size = size shl 1
+        if (table.size == size) table.fill(0) else table = IntArray(size)
+        mask = size - 1
+        for (k in 0 until count) {
+            var slot = slotOf(b.longBE(starts[k] + 14))
+            while (table[slot] != 0) slot = (slot + 1) and mask
+            table[slot] = k + 1
+        }
+    }
+
+    /** Body start of the row of [id], or -1. */
+    fun find(id: Long): Int {
+        var slot = slotOf(id)
+        while (true) {
+            val e = table[slot]
+            if (e == 0) return -1
+            val at = starts[e - 1]
+            if (buf.longBE(at + 14) == id) return at
+            slot = (slot + 1) and mask
+        }
+    }
+
+    private fun slotOf(id: Long): Int {
+        val h = (id * -0x61c8864680b583ebL)
+        return (h ushr 40).toInt() and mask
     }
 }
 

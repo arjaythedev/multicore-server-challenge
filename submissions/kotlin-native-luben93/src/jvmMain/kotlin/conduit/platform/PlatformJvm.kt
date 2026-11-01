@@ -17,9 +17,11 @@ import java.util.concurrent.locks.ReentrantLock
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
-actual fun platformInit(): String =
-    "jvm ${System.getProperty("java.vm.name")} ${System.getProperty("java.version")}, " +
+actual fun platformInit(): String {
+    Sched.startSweep()
+    return "jvm ${System.getProperty("java.vm.name")} ${System.getProperty("java.version")}, " +
         "heap max ${Runtime.getRuntime().maxMemory() shr 20} MB"
+}
 
 actual fun nanoTime(): Long = System.nanoTime()
 
@@ -50,6 +52,7 @@ internal class ConduitThread(name: String, body: Runnable) : Thread(body, name) 
 actual fun startThread(name: String, nice: Int, body: () -> Unit) {
     val t = ConduitThread(name) {
         if (nice > 0) Nice.set(nice)
+        Sched.batchSelf()
         body()
     }
     t.isDaemon = true
