@@ -215,6 +215,6 @@ authors once. SCHED_BATCH is common to several entries, and #130 measured it. #1
 instructions per lane-round, as we did for our kernel. Sharing a response within one execution has #31 as precedent
 and follows the form of theCatWisel's #132 and #143. Test vectors: Openwall, Rust `bcrypt`, Go `x/crypto/bcrypt`.
 
-Ours: the single read queue across workers and the feed lane's borrowed third slot, MEGA and its three trims, the comments follows lookup scoped to the
-thread's authors, gzip only when it saves a segment and its encoder, ACK delay as a ring command, the ring
-bookkeeping set, and the SHRX bcrypt kernel.
+Ours: the single read queue across workers and the feed lane's borrowed third slot, MEGA and its three trims, the
+comments follows lookup scoped to the thread's authors, gzip only when it saves a segment and its encoder, ACK delay
+as a ring command, the ring bookkeeping set, and the SHRX bcrypt kernel.
