@@ -111,6 +111,9 @@ statement per kind, see above):
   whole tags table once per article shown.
 - **Global count:** walks the primary key from the oldest end (`ORDER BY id LIMIT 1000`). Those pages are
   all-visible, so it is an index-only scan.
+- **Feed count:** a viewer who follows an author with 1,000 or more articles has a feed of at least 1,000. Each batch
+  checks that once for the 8 followees its viewers share most, and those viewers' counts need no scan. On the full
+  seed 78% of the viewers who follow anyone follow such an author. (Idea from `csharp-epoll-aot-gichamba`.)
 - **Comments:** the article lookup and the newest 100 comments are one statement. No row means 404.
 - **Follow, unfollow, favorite, unfavorite, delete article, delete comment, update article:** the lookup, the
   ownership check and the write are one statement (a data-modifying CTE), and the outer `SELECT` reports what it

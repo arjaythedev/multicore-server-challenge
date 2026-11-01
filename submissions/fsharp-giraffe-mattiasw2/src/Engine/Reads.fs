@@ -60,31 +60,37 @@ let private longs (name: string) (values: int64[]) : NpgsqlParameter =
 let private bools (name: string) (values: bool[]) : NpgsqlParameter =
     NpgsqlParameter<bool[]>(name, NpgsqlDbType.Array ||| NpgsqlDbType.Boolean, TypedValue = values)
 
-/// A list's capped count and its page of ids, over the distinct request `r` (r.key, and for the
-/// page r.lim, r.off, r.depth). Every page is newest first (id DESC).
-type private Listing = { Count: string; Page: string }
+/// A list's capped counts, one row (r.i, NULL, total) per distinct count key in @ckeys, and its
+/// page of ids over the distinct request `r` (r.key, r.lim, r.off, r.depth). Every page is newest
+/// first (id DESC).
+type private Listing = { Counts: string; Page: string }
+
+/// Counts: `rows` (over the key r.key, LIMIT 1000) counted for each key.
+let private capped (rows: string) =
+    $"SELECT r.i, NULL::int8 AS id, (SELECT count(*) FROM ({rows}) s) AS total
+        FROM unnest(@ckeys::text[]) WITH ORDINALITY AS r(key, i)"
 
 // The global count walks the primary key from the OLDEST end: those pages are all-visible, so
 // it is an index-only scan that never touches the heap. count(min(total, 1000)) either way.
 let private everything =
-    { Count = "SELECT 1 FROM articles a ORDER BY a.id LIMIT 1000"
+    { Counts = capped "SELECT 1 FROM articles a ORDER BY a.id LIMIT 1000"
       Page = "SELECT a.id FROM articles a ORDER BY a.id DESC LIMIT r.lim OFFSET r.off" }
 
 let private byTag =
-    { Count = "SELECT 1 FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = r.key) LIMIT 1000"
+    { Counts = capped "SELECT 1 FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = r.key) LIMIT 1000"
       Page =
         "SELECT at.article_id AS id FROM article_tags at
           WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = r.key)
           ORDER BY at.article_id DESC LIMIT r.lim OFFSET r.off" }
 
 let private byAuthor =
-    { Count = "SELECT 1 FROM articles a WHERE a.author_id = (SELECT u.id FROM users u WHERE u.username = r.key) LIMIT 1000"
+    { Counts = capped "SELECT 1 FROM articles a WHERE a.author_id = (SELECT u.id FROM users u WHERE u.username = r.key) LIMIT 1000"
       Page =
         "SELECT a.id FROM articles a WHERE a.author_id = (SELECT u.id FROM users u WHERE u.username = r.key)
           ORDER BY a.id DESC LIMIT r.lim OFFSET r.off" }
 
 let private favoritedBy =
-    { Count = "SELECT 1 FROM favorites f WHERE f.user_id = (SELECT u.id FROM users u WHERE u.username = r.key) LIMIT 1000"
+    { Counts = capped "SELECT 1 FROM favorites f WHERE f.user_id = (SELECT u.id FROM users u WHERE u.username = r.key) LIMIT 1000"
       Page =
         "SELECT f.article_id AS id FROM favorites f WHERE f.user_id = (SELECT u.id FROM users u WHERE u.username = r.key)
           ORDER BY f.article_id DESC LIMIT r.lim OFFSET r.off" }
@@ -92,9 +98,24 @@ let private favoritedBy =
 // The feed's key is the viewer. Each followee contributes at most depth = limit + offset of its
 // newest articles.
 let private feed =
-    { Count =
-        "SELECT 1 FROM articles a WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.key::int8)
-          LIMIT 1000"
+    { Counts =
+        // A viewer who follows an author with 1000 or more articles has a feed of 1000 or more.
+        // The batch proves that once for each of the 8 followees its viewers share most (heavy),
+        // and those viewers get 1000 without a count. The rest are counted as before.
+        "WITH fv AS MATERIALIZED (
+              SELECT r.i, ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.key::int8) AS fids
+                FROM unnest(@ckeys::text[]) WITH ORDINALITY AS r(key, i)),
+            shared AS MATERIALIZED (
+              SELECT x.id FROM fv CROSS JOIN LATERAL unnest(fv.fids) AS x(id)
+               GROUP BY x.id HAVING count(*) >= 2 ORDER BY count(*) DESC LIMIT 8),
+            heavy AS MATERIALIZED (
+              SELECT coalesce(array_agg(s.id), '{}') AS ids FROM shared s
+               WHERE EXISTS (SELECT 1 FROM articles a WHERE a.author_id = s.id OFFSET 999))
+          SELECT fv.i, NULL::int8 AS id,
+                 CASE WHEN fv.fids && (SELECT h.ids FROM heavy h) THEN 1000::int8
+                      ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = ANY (fv.fids) LIMIT 1000) s)
+                 END AS total
+            FROM fv"
       Page =
         "SELECT x.id FROM follows fo CROSS JOIN LATERAL
                 (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT r.depth) x
@@ -116,8 +137,7 @@ let private listingOf (read: Read) : struct (int * string) =
 /// Phase A, per listing: count rows (i = the count key's position, total set) and page rows (i =
 /// the page's position, id set).
 let private listSql (l: Listing) =
-    $"SELECT r.i, NULL::int8 AS id, (SELECT count(*) FROM ({l.Count}) s) AS total
-        FROM unnest(@ckeys::text[]) WITH ORDINALITY AS r(key, i)
+    $"{l.Counts}
       UNION ALL
       SELECT r.i, x.id, NULL::int8
         FROM unnest(@pkeys::text[], @lims::int8[], @offs::int8[], @depths::int8[]) WITH ORDINALITY AS r(key, lim, off, depth, i)
