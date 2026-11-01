@@ -120,6 +120,7 @@ pub struct Settings {
     pub bcrypt_lanes: usize,
     pub bcrypt_window: Duration,
     pub bcrypt_idle: bool,
+    pub bcrypt_rescue: Duration,
 }
 
 // ------------------------------------------------------------------------------------------------------------------
@@ -677,6 +678,18 @@ impl ReadLane {
             }
         }
 
+        // Every comment's author, sorted and distinct.
+        let mut cauth: Vec<i64> = Vec::new();
+        if let Some(s) = s_cmts {
+            for r in &pa.results[s].rows {
+                if r[2].len >= 0 {
+                    cauth.push(pa.i64(r[6]));
+                }
+            }
+        }
+        cauth.sort_unstable();
+        cauth.dedup();
+
         // ---- phase B ----
         let mut nb = 0usize;
         let mut slotb = |cond: bool| -> Option<usize> {
@@ -690,6 +703,7 @@ impl ReadLane {
         let b_artx = slotb(arts.len() > 0);
         let b_flags = slotb(favd.len() + foll.len() > 0);
         let b_rows = slotb(need_rows.len() > 0);
+        let b_auser = slotb(!cauth.is_empty());
         let pb = if nb > 0 {
             let ids = int_array(arts.list.iter().copied());
             let o = &mut conn.out;
@@ -709,6 +723,9 @@ impl ReadLane {
             }
             if b_rows.is_some() {
                 o.bind_exec("artrow", &[Param::Raw(&int_array(need_rows.list.iter().copied()))]);
+            }
+            if b_auser.is_some() {
+                o.bind_exec("auser", &[Param::Raw(&int_array(cauth.iter().copied()))]);
             }
             o.sync();
             conn.flush()?;
@@ -746,6 +763,12 @@ impl ReadLane {
                         target[k as usize] = true;
                     }
                 }
+            }
+        }
+        let mut auser: FxMap<i64, &[Col]> = FxMap::default();
+        if let (Some(pb), Some(s)) = (&pb, b_auser) {
+            for r in &pb.results[s].rows {
+                auser.insert(pb.i64(r[0]), &r[..]);
             }
         }
         let mut rows_b: FxMap<i64, usize> = FxMap::default();
@@ -814,7 +837,7 @@ impl ReadLane {
                         continue;
                     }
                     let s = s_cmts.unwrap();
-                    let mut list: Vec<&[Col]> = rows.iter().map(|&i| &pa.results[s].rows[i]).filter(|r| r[2].len >= 0 && r[7].len >= 0).collect();
+                    let mut list: Vec<&[Col]> = rows.iter().map(|&i| &pa.results[s].rows[i]).filter(|r| r[2].len >= 0 && auser.contains_key(&pa.i64(r[6]))).collect();
                     list.sort_unstable_by(|x, y| (pa.i64(y[4]), pa.i64(y[2])).cmp(&(pa.i64(x[4]), pa.i64(x[2]))));
                     let mut b = Vec::with_capacity(64 + 400 * list.len());
                     b.extend_from_slice(b"{\"comments\":[");
@@ -832,7 +855,8 @@ impl ReadLane {
                         json::str(&mut b, pa.bytes(r[3]).unwrap_or(b""));
                         b.extend_from_slice(b",\"author\":");
                         let following = v != 0 && ctx.following(v, pa.i64(r[6]));
-                        profile_obj(&mut b, pa.bytes(r[7]).unwrap_or(b""), pa.bytes(r[8]), pa.bytes(r[9]), following);
+                        let (u, pb) = (auser[&pa.i64(r[6])], pb.as_ref().unwrap());
+                        profile_obj(&mut b, pb.bytes(u[1]).unwrap_or(b""), pb.bytes(u[2]), pb.bytes(u[3]), following);
                         b.push(b'}');
                     }
                     b.extend_from_slice(b"]}");
@@ -1323,10 +1347,12 @@ fn finish_row(j: WriteJob, p: &Pipeline, first: Option<&[Col]>, s: &Settings, ou
 /// Worker 0 waits up to the window to fill its lanes, then runs what it has. Other workers only take full sets of
 /// lanes, so they add capacity under a backlog without splitting the trickle of logins into half-empty runs.
 pub fn bcrypt_worker(s: &'static Settings, index: usize) {
+    // Hashing yields to everything else: the thread runs at nice 19 (raising one's own nice needs no privileges).
+    // A nice thread still gets a small share, so a lock it holds when preempted (a reply outbox, a queue) is freed
+    // within milliseconds; SCHED_IDLE could hold one for seconds on a busy box, and an unprivileged thread can't
+    // leave SCHED_IDLE again to take its locks at normal priority.
     if s.bcrypt_idle {
-        // Hashing only takes CPU nothing else wants: SCHED_IDLE for this thread (no privileges needed).
-        let p = libc::sched_param { sched_priority: 0 };
-        unsafe { libc::sched_setscheduler(0, libc::SCHED_IDLE, &p) };
+        unsafe { libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, 19) };
     }
     let mut jobs: Vec<BcryptJob> = Vec::new();
     loop {
@@ -1369,14 +1395,14 @@ pub fn bcrypt_worker(s: &'static Settings, index: usize) {
     }
 }
 
-/// With idle-priority hashers: a normal-priority thread that hashes only what has waited a second already, so logins
+/// With low-priority hashers: a normal-priority thread that hashes only what has waited BCRYPT_RESCUE_MS (a second) already, so logins
 /// still finish when the box has no idle time at all.
 pub fn bcrypt_rescue(s: &'static Settings) {
     let mut jobs: Vec<BcryptJob> = Vec::new();
     loop {
         std::thread::sleep(Duration::from_millis(100));
         jobs.clear();
-        while BCRYPT.take_if_older(Duration::from_secs(1), s.bcrypt_lanes, &mut jobs) {
+        while BCRYPT.take_if_older(s.bcrypt_rescue, s.bcrypt_lanes, &mut jobs) {
             let batch = std::mem::take(&mut jobs);
             let (ten, odd): (Vec<BcryptJob>, Vec<BcryptJob>) = batch.into_iter().partition(|j| match j {
                 BcryptJob::Verify { hash, .. } => crate::bcrypt::parse(hash).map(|p| p.cost) == Some(10),
