@@ -1,7 +1,7 @@
 // main.rs: configuration, the start-up checks (bcrypt calibration, every statement prepared once), and the server
 // itself as one task group: a child task per actor, each starting on that actor's own event loop. The Rust's thread
-// layout, one actor per thread: IO reactors (cores / 2), read lanes (cores), the write lane, bcrypt workers (cores),
-// and the scheduler that holds the queues.
+// layout, one actor per thread: IO reactors (cores / 2), read lanes (cores), the write lane, bcrypt workers
+// (cores / 2, at least 3), and the scheduler that holds the queues.
 import Glibc
 
 private func env(_ name: String) -> String? {
@@ -25,7 +25,7 @@ struct Conduit {
         let ioWorkers = envInt("IO_THREADS", max(cores / 2, 2))
         let readWorkers = envInt("READ_LANES", max(cores, 4))
         let writeWorkers = envInt("WRITE_LANES", 1)
-        let cryptoWorkers = envInt("BCRYPT_THREADS", max(cores, 4))
+        let cryptoWorkers = envInt("BCRYPT_THREADS", max(cores / 2, 3))
 
         let calibrationStart = monotonicNanos()
         let (autoLanes, seedBcryptUs, l1dKB) = calibrateBcryptHardware()

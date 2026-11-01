@@ -1,7 +1,9 @@
 // engine.rs's WriteWorker: the write lane. Every write waiting is pipelined before one Sync, which makes them one
 // implicit transaction committed at the Sync (group commit); responses go out only after Postgres reports it done.
-// Favorites, follows and new comments of a group run as one `unnest` statement per kind. If any statement fails,
-// each write is retried on its own. Writes that answer with an article read it back through the read lanes.
+// Favorites, follows and new comments of a group run as one `unnest` statement per kind, unless the group also
+// changes what they would read (the same article, or a profile). If any statement fails, each write is retried on
+// its own. A new article is answered from its insert; other writes that answer with an article read it back through
+// the read lanes, with the favorited flag they just set.
 import Glibc
 
 private enum WriteLoc {
@@ -88,6 +90,33 @@ private func writeCommentJSON(_ body: inout ByteBuffer, _ p: borrowing PipelineB
     body.append("}}")
 }
 
+/// A new article's `{"article":{…}}` (`write_full_article_envelope`), from `newart`'s row (slug, created_at,
+/// updated_at, the author's username, bio, image, and whether the writer follows them) and the request's fields.
+private func writeFullArticleEnvelope(_ dst: inout ByteBuffer, _ p: borrowing PipelineBuf, _ r: RowSpan, title: [UInt8],
+                                      description: [UInt8], body: [UInt8], tags: [[UInt8]]) {
+    dst.append("{\"article\":{\"slug\":")
+    writeStr(&dst, p.text(p.cell(r, 0)))
+    dst.append(",\"title\":")
+    writeStr(&dst, title)
+    dst.append(",\"description\":")
+    writeStr(&dst, description)
+    dst.append(",\"body\":")
+    writeStr(&dst, body)
+    dst.append(",\"tagList\":[")
+    for (i, tag) in tags.enumerated() {
+        if i > 0 { dst.append(0x2C) }
+        writeStr(&dst, tag)
+    }
+    dst.append("],\"createdAt\":")
+    writeTimestamp(&dst, p.i64(r, 1))
+    dst.append(",\"updatedAt\":")
+    writeTimestamp(&dst, p.i64(r, 2))
+    dst.append(",\"favorited\":false,\"favoritesCount\":0,\"author\":")
+    writeProfileJSON(&dst, username: p.text(p.cell(r, 3)), bio: p.bytes(p.cell(r, 4)), image: p.bytes(p.cell(r, 5)),
+                     following: p.bool(p.cell(r, 6)))
+    dst.append("}}")
+}
+
 actor WriteLane {
     nonisolated let loop: EventLoop
     nonisolated var unownedExecutor: UnownedSerialExecutor { loop.asUnownedSerialExecutor() }
@@ -145,18 +174,19 @@ actor WriteLane {
         do { try ensureConn() } catch { throw WriteFailure(error: error, addrs: allAddrs) }
 
         let isSingle = tasks.count == 1
-        let hasSlugMutation = !isSingle && tasks.contains {
-            switch $0.op {
-            case .updateArticle, .deleteArticle: true
-            default: false
-            }
+        // A profile changed in the group would show in the follow and comment replies, whose rows carry the author.
+        let hasUserMutation = !isSingle && tasks.contains {
+            if case .updateUser = $0.op { return true }
+            return false
         }
+        var mutatedSlugs: [[UInt8]] = []
         var favOn: [(Int64, [UInt8])] = [], favOff: [(Int64, [UInt8])] = []
         var follOn: [(Int64, [UInt8])] = [], follOff: [(Int64, [UInt8])] = []
         var comments: [(Int64, [UInt8], [UInt8])] = []
-        if !isSingle && !hasSlugMutation {
+        if !isSingle {
             for t in tasks {
                 switch t.op {
+                case .updateArticle(let slug, _, _, _), .deleteArticle(let slug): mutatedSlugs.append(slug)
                 case .favorite(let slug, true): favOn.append((t.viewer, slug))
                 case .favorite(let slug, false): favOff.append((t.viewer, slug))
                 case .follow(let username, true): follOn.append((t.viewer, username))
@@ -166,13 +196,16 @@ actor WriteLane {
                 }
             }
         }
-        let favConflict = favOn.contains { a in favOff.contains { $0.1 == a.1 } }
-        let follConflict = follOn.contains { a in follOff.contains { $0.1 == a.1 } }
+        // A merged statement runs before the group's other writes, so it can't touch what they change.
+        let favConflict = favOn.contains { a in favOff.contains { $0.1 == a.1 } || mutatedSlugs.contains(a.1) }
+            || favOff.contains { mutatedSlugs.contains($0.1) }
+        let follConflict = hasUserMutation || follOn.contains { a in follOff.contains { $0.1 == a.1 } }
+        let commentConflict = hasUserMutation || comments.contains { mutatedSlugs.contains($0.1) }
         let batchFavOn = !favConflict && favOn.count >= 2
         let batchFavOff = !favConflict && favOff.count >= 2
         let batchFollOn = !follConflict && follOn.count >= 2
         let batchFollOff = !follConflict && follOff.count >= 2
-        let batchComments = comments.count >= 2
+        let batchComments = !commentConflict && comments.count >= 2
 
         var nExec = 0
         func merged(_ active: Bool, _ statement: String, _ params: @autoclosure () -> [BindParam]) -> Int? {
@@ -181,10 +214,10 @@ actor WriteLane {
             defer { nExec += 1 }
             return nExec
         }
-        let slotFavOn = merged(batchFavOn, "fav_batch", [.i64Array(favOn.map(\.0)), .textArray(favOn.map(\.1))])
-        let slotFavOff = merged(batchFavOff, "unfav_batch", [.i64Array(favOff.map(\.0)), .textArray(favOff.map(\.1))])
         let slotFollOn = merged(batchFollOn, "follow_batch", [.i64Array(follOn.map(\.0)), .textArray(follOn.map(\.1))])
         let slotFollOff = merged(batchFollOff, "unfollow_batch", [.i64Array(follOff.map(\.0)), .textArray(follOff.map(\.1))])
+        let slotFavOn = merged(batchFavOn, "fav_batch", [.i64Array(favOn.map(\.0)), .textArray(favOn.map(\.1))])
+        let slotFavOff = merged(batchFavOff, "unfav_batch", [.i64Array(favOff.map(\.0)), .textArray(favOff.map(\.1))])
         let slotComments = merged(batchComments, "newcmt_batch",
                                   [.i64Array(comments.map(\.0)), .textArray(comments.map(\.1)), .textArray(comments.map(\.2))])
 
@@ -256,7 +289,7 @@ actor WriteLane {
                 finalize(task, start, count, &replies, &postReads)
             case .batchedFav(let on, let ord):
                 if let r = (on ? favOnRows : favOffRows)[ord - 1] {
-                    postReads.append(ReadTask(op: .articleById(id: pipe.i64(r, 1), status: 200), viewer: task.viewer, addr: task.addr))
+                    postReads.append(ReadTask(op: .articleById(id: pipe.i64(r, 1), knownFav: on), viewer: task.viewer, addr: task.addr))
                 } else {
                     replies.append(errorReply(task.addr, 404, "article not found"))
                 }
@@ -314,8 +347,8 @@ actor WriteLane {
             build(&body)
             replies.append(OutgoingReply(addr: addr, status: status, body: body.take()))
         }
-        func readBack(_ r: RowSpan, _ status: UInt16) {
-            postReads.append(ReadTask(op: .articleById(id: pipe.i64(r, 0), status: status), viewer: viewer, addr: addr))
+        func readBack(_ r: RowSpan, knownFav: Bool?) {
+            postReads.append(ReadTask(op: .articleById(id: pipe.i64(r, 0), knownFav: knownFav), viewer: viewer, addr: addr))
         }
         switch task.op {
         case .register:
@@ -339,16 +372,30 @@ actor WriteLane {
                                  image: pipe.bytes(pipe.cell(r, 2)), following: on)
                 $0.append(0x7D)
             }
-        case .favorite:
+        case .favorite(_, let on):
             guard let r = first else { return replies.append(errorReply(addr, 404, "article not found")) }
-            readBack(r, 200)
-        case .createArticle:
+            readBack(r, knownFav: on)
+        case .createArticle(let title, let description, let articleBody, let tags):
+            // Answered from the insert (slug, timestamps, author) and the request itself: a new article has no
+            // favorites, and its tags are the ones just sent.
             guard let r = first else { return replies.append(errorReply(addr, 500, "internal server error")) }
-            readBack(r, 201)
+            var sortedTags = tags
+            if sortedTags.count > 1 {
+                sortedTags.sort { $0.lexicographicallyPrecedes($1) }
+                var w = 1
+                for i in 1..<sortedTags.count where sortedTags[i] != sortedTags[w - 1] {
+                    sortedTags[w] = sortedTags[i]
+                    w += 1
+                }
+                sortedTags.removeLast(sortedTags.count - w)
+            }
+            var body = ByteBuffer(capacity: 2048)
+            writeFullArticleEnvelope(&body, pipe, r, title: title, description: description, body: articleBody, tags: sortedTags)
+            replies.append(OutgoingReply(addr: addr, status: 201, body: body.take()))
         case .updateArticle:
             guard let r = first else { return replies.append(errorReply(addr, 404, "article not found")) }
             if pipe.i64(r, 1) != viewer { return replies.append(errorReply(addr, 403, "forbidden")) }
-            readBack(r, 200)
+            readBack(r, knownFav: nil)
         case .deleteArticle:
             guard let r = first else { return replies.append(errorReply(addr, 404, "article not found")) }
             if pipe.i64(r, 0) != viewer { return replies.append(errorReply(addr, 403, "forbidden")) }

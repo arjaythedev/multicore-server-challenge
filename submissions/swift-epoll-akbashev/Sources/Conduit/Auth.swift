@@ -429,9 +429,14 @@ struct KeyMaterial: BitwiseCopyable {
 func bcryptLanes<let n: Int>(_ mats: borrowing InlineArray<n, KeyMaterial>, cost: Int) -> InlineArray<n, BcryptDigest> {
     var st = InlineArray<n, BfState>(repeating: .initial)
     eksExpand(&st, mats, withSalt: true, saltAsKey: false)
-    for _ in 0..<(1 << cost) {
-        eksExpand(&st, mats, withSalt: false, saltAsKey: false)
-        eksExpand(&st, mats, withSalt: false, saltAsKey: true)
+    // The cost loop: the key and then the salt XORed into P, each followed by a key-only expansion, the kernel
+    // written out for n lanes (BcryptKernels.swift, the Rust's bc_expand0); one loop, so it is inlined once.
+    for half in 0..<(2 << cost) {
+        let saltAsKey = half & 1 == 1
+        for k in 0..<n {
+            for i in 0..<18 { st[k].p[i] ^= saltAsKey ? mats[k].salt18[i] : mats[k].keyP[i] }
+        }
+        bfExpand0(&st)
     }
     let magic: InlineArray<6, UInt32> = [0x4f72_7068, 0x6561_6e42, 0x6568_6f6c, 0x6465_7253, 0x6372_7944, 0x6f75_6274]
     var ctext = InlineArray<n, InlineArray<6, UInt32>>(repeating: magic)

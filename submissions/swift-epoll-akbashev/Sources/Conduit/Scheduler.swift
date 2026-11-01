@@ -164,7 +164,13 @@ actor Scheduler {
             return Gather(want: rw, maxAge: UInt64(max(ewmaBatchUs / rw, 1)) * 1000, maxCap: maxBatch)
         }
         let target = min(max(ewmaBatchLen + ewmaBatchLen >> 1, baseBatch), maxBatch)
-        return Gather(want: target, maxAge: UInt64(max(ewmaBcryptUs / lanes, 1)) * 1000, maxCap: maxBatch)
+        if busy < rw {
+            return Gather(want: target, maxAge: UInt64(max(ewmaBcryptUs / lanes, 1)) * 1000, maxCap: maxBatch)
+        }
+        // Every lane busy: gather for longer, a lane's share of a batch's time or half a bcrypt lane set's, at most a
+        // bcrypt's.
+        let windowUs = min(max(ewmaBatchUs / rw, ewmaBcryptUs / max(lanes / 2, 2)), ewmaBcryptUs)
+        return Gather(want: target, maxAge: UInt64(windowUs) * 1000, maxCap: maxBatch)
     }
 
     // ---------- bcrypt ----------

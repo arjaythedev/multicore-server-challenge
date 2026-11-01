@@ -270,6 +270,11 @@ struct PipelineBuf: ~Copyable {
 
     @inline(__always) func i64(_ row: RowSpan, _ k: Int) -> Int64 { i64(cell(row, k)) }
 
+    /// A binary bool cell; false for NULL.
+    @inline(__always) func bool(_ c: Cell) -> Bool {
+        !c.isNull && c.len > 0 && data[Int(c.offset)] != 0
+    }
+
     /// A copy of a cell's bytes; nil for NULL.
     func copy(_ c: Cell) -> [UInt8]? {
         c.isNull ? nil : ByteBuffer(copying: text(c)).take()
@@ -531,7 +536,14 @@ struct PgConn: ~Copyable {
     /// filled in as errors so every one of the `expected` has an outcome.
     mutating func readPipeline(into out: inout PipelineBuf, expected: Int) throws(PgError) {
         out.clear()
-        var rowStart: UInt32 = 0
+        try readPipeline(appendingTo: &out, expected: expected)
+    }
+
+    /// `readPipeline(into:)` without clearing `out` first: the statements of a later Sync land after the ones already
+    /// read, so one buffer holds the replies of a pipeline split at several Syncs (`read_pipeline_append`).
+    mutating func readPipeline(appendingTo out: inout PipelineBuf, expected: Int) throws(PgError) {
+        let target = out.results.count + expected
+        var rowStart = UInt32(out.rows.count)
         loop: while true {
             let (tag, range) = try nextFrame()
             switch tag {
@@ -574,7 +586,7 @@ struct PgConn: ~Copyable {
                 throw .wire("unexpected frame \(Character(Unicode.Scalar(tag)))")
             }
         }
-        while out.results.count < expected {
+        while out.results.count < target {
             out.results.append(ExecOutcome(rowStart: rowStart, rowCount: 0,
                                            error: SqlStateErr(code: "skipped", message: "aborted by earlier pipeline error")))
         }

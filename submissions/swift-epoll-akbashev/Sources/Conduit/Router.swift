@@ -24,7 +24,9 @@ enum ReadOp: Sendable {
     case login(email: [UInt8], password: [UInt8])
     case profile(username: [UInt8])
     case articleBySlug(slug: [UInt8])
-    case articleById(id: Int64, status: UInt16)
+    /// A write's read-back; `knownFav` is the favorited flag when the write just set it (a favorite or unfavorite),
+    /// so the lane needn't look it up.
+    case articleById(id: Int64, knownFav: Bool?)
     case comments(slug: [UInt8])
     case global(lim: Int64, off: Int64)
     case byTag(tag: [UInt8], lim: Int64, off: Int64)
