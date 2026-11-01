@@ -129,7 +129,7 @@ does the same inside each kind's batched statement (`ReadShare` in app/Sql.kt), 
   for 10% of the table) hashed all of articles and users per execution (278 ms per 60 requests).
 - `ReadPool` sends a kind once its oldest request has waited the gather window or its batch is full
   (`READ_MAX_BATCH`, 256); a `db-gather` clock thread hands kinds whose window passed to idle connections.
-- The window is `READ_GATHER_MS` (30) while the box has room. `GatherTuner` (db/GatherTuner.kt, `READ_GATHER_AUTO`) samples the busy
+- The window is `READ_GATHER_MS` (30). Optional, off by default: `GatherTuner` (db/GatherTuner.kt, `READ_GATHER_AUTO=1`) samples the busy
   share of the CPUs in Cpus_allowed_list from /proc/stat once a second and widens the window by 10 ms per second up to
   `READ_GATHER_MAX_MS` while it is at least 75% busy, back down at 60% or less. Bigger batches make the statements cheaper
   per request (lab, 180k users, fixed windows: Postgres 91 / 75 / 69 / 64 us per request at 30 / 60 / 90 / 120 ms); the price is latency,

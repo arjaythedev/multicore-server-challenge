@@ -24,10 +24,10 @@ DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=... HO
 
 Optional process settings (defaults sized from the CPU count): `HTTP_THREADS`, `DB_READ_CONNS`, `DB_WRITE_CONNS`
 (8 + 4 on the box), `BCRYPT_THREADS`, `BCRYPT_BATCH_MS`, `DB_OPTIONS`, `APP_SORT_TAGS`, `DB_STATS_S`, `OVERLOAD_GUARD`
-(`READ_QUEUE_MAX`, `WRITE_QUEUE_MAX`, `BCRYPT_QUEUE_MAX`), `READ_SHARE`, `READ_GATHER_MS` (the gather window's floor, 30), `READ_GATHER_AUTO` (default on: while the CPUs the process may use are at least
+(`READ_QUEUE_MAX`, `WRITE_QUEUE_MAX`, `BCRYPT_QUEUE_MAX`), `READ_SHARE`, `READ_GATHER_MS` (the gather window's floor, 30), `READ_GATHER_AUTO` (default off; `1`: while the CPUs the process may use are at least
 `READ_GATHER_HIGH_PCT` (75) busy the window widens by `READ_GATHER_STEP_MS` (10) a second up to `READ_GATHER_MAX_MS` (100), back down at `READ_GATHER_LOW_PCT` (60); `0` = the fixed `READ_GATHER_MS`), `READ_MAX_BATCH`,
 `PG_IO_TIMEOUT_S` (15: how long a Postgres socket may block with a reply outstanding; an idle connection waits indefinitely),
-`READ_VIEWER_FLAGS`, `READ_FEED_MAX_BATCH` (default 512: the feed statement decorates each distinct page article once and its hub/count work is per batch, so
+`READ_VIEWER_FLAGS`, `READ_FEED_MAX_BATCH` (default 192: the feed statement decorates each distinct page article once and its hub/count work is per batch, so
 bigger batches are cheaper per feed; in the lab at 180k users cap 64 collapsed and 192 and 1,024 held; 0 = `READ_MAX_BATCH`), `READ_FEED_HEAVY`, `READ_FEED_FLOOR`, `BCRYPT_FLUSH_MIN`,
 `BCRYPT_FLUSH_AGE_MS`, `BCRYPT_PRIO_LOAD`, `BCRYPT_THREADS_MAX` and `BCRYPT_EXTRA_AGE_MS` (extra bcrypt workers that only start once the oldest login has
 waited that long: insurance for a login rate the base threads cannot hash), `READ_SHARED_ROWS` (default on: comments, article and the global, tag and author lists
