@@ -17,3 +17,4 @@
 {"run":"e18-nocopy-writer","eq_users":120000,"app_us":71.0,"status":"keep","note":"major words -30%, RSS -6%, CPU neutral"}
 {"run":"e19-bind-params","eq_users":120000,"app_us":70.3,"status":"keep","note":"base 71.45, major words -8%"}
 {"run":"e20-swar-escape","eq_users":120000,"app_us":67.8,"status":"keep","note":"base 70.5"}
+{"run":"e21-http-inplace","eq_users":120000,"app_us":68.55,"status":"keep","note":"base 69.05, minor words -5%"}

@@ -188,3 +188,28 @@ Scaled x2 (e19 vs e20): app 70.9/70.1 → 67.4/68.2 µs/req (−4%), total 177.8
 Our C core at 1-8 lanes (bench, CPU 10): 5-8 lanes all ~11.5 ms/hash, so more lanes buy nothing. Logins + sign-ups
 at 180k are ~48 hashes/s (~0.1% of requests); from the profile's eks1-5 split, filling every batch to 5 lanes would
 save ~7% of bcrypt time (~1.5% of app CPU). Not worth a longer wait.
+
+### Series 19: e15 (pushed head) vs e20 at real scale, fresh DB, 60 s measure
+190k: e15 45.5k req/s p95 907 / p99 1510; **e20 46.4k p95 561 / p99 815** (app 89.5 → 84.5 µs/req).
+180k: e15 45.0k p95 429 PASS; e20 43.4k p95 1416 FAIL, from a 3 s stall at t≈92-100 s seen only in that run.
+Every run also stalls at the end of the ramp (t≈56-64 s, p95 up to 6-10 s; the 190k loadgens report falling
+behind then), which a 60 s window weighs heavily. Logins are fine (p50 ~200 ms). Rechecking with 180 s windows.
+
+### Series 20: 190k real, 180 s measure, fresh DB, x2 interleaved
+e15: 45.6k/45.5k req/s, p95 618/659, p99 1028/1453 (app 88.1/88.9); **e20: 46.3k/46.1k, p95 516/591, p99
+1195/1078** (app 84.5/85.2). Both fail at 190k locally; e20 sits 80-100 ms lower through the hold. In every run
+latency climbs slowly after the ramp-end stall (e20 305 → 518 ms over 3 min): the box is at saturation.
+Pushed 9304d15 (e20) to the PR.
+
+### E21 HTTP parse in place, 200 head and statement names without string_of_int
+Requests are parsed straight from the domain's read buffer (only the leftover of a partial or pipelined request
+is copied, before any yield); headers matched in place; Content-Length digits and Bind statement names written
+in place. 197/197, plus own edge tests (3 pipelined in one write, byte-by-byte, 1.5 requests then the rest, POST
+body split across writes with mixed-case headers, lowercase authorization, Connection: close): all pass.
+Scaled x2 (e20 vs e21): app 69.1/69.0 → 68.7/68.4 µs/req, minor words −5%. Kept (small, fewer allocations).
+
+### GC at saturation (e15, 180k real, GC_STATS every 10 s)
+Promoted share of minor words: 1.5-3% during the ramp, then 10% at t=60, 17% at 70, ~23.5% from t=80 on; major
+GCs 3 → 17 per 10 s; heap ~520 MB. At saturation in-flight requests outlive the ~0.2 s between minor GCs, get
+promoted, and the major GC marks a heap made mostly of 180k connections' state. E16 tried o=400 only at scaled
+load (2.5% promoted), where it could not show: retried at real scale as E22.

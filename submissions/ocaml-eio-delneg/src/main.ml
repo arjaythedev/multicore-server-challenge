@@ -255,7 +255,7 @@ module Pg = struct
 
   let add_exec_gen wp w (stmt, params) =
     W.msg w 'B' (fun () ->
-        W.char w '\000'; W.cstr w ("s" ^ string_of_int stmt);
+        W.char w '\000'; W.char w 's'; W.int w stmt; W.char w '\000';
         W.i16 w 0; W.i16 w (Array.length params);
         Array.iter (wp w) params;
         W.i16 w 1; W.i16 w 1);
@@ -1370,14 +1370,6 @@ let handle ctx req =
 (* ---------- connection loop ---------- *)
 
 (* h starts with the lowercase p, ignoring ASCII case; no allocation *)
-let lower_prefix h p =
-  let n = String.length p in
-  String.length h > n
-  && (let rec go i = i = n || (Char.lowercase_ascii (String.unsafe_get h i) = String.unsafe_get p i && go (i + 1)) in go 0)
-
-let header_value h n =
-  let v = String.sub h n (String.length h - n) in String.trim v
-
 let dispatch ctx meth target auth body =
   let path, qs = match String.index_opt target '?' with
     | Some k -> String.sub target 0 k, String.sub target (k + 1) (String.length target - k - 1)
@@ -1402,35 +1394,54 @@ let dispatch ctx meth target auth body =
   | _ -> (404, error_body "not found")
 
 (* one parsed request out of the connection's pending bytes, or None when it isn't complete yet *)
-let find_head s =
-  let n = String.length s in
+(* the request parser reads s up to n only: s may be the domain's read buffer seen as a string, so every value
+   it returns is a copy *)
+let find_head s n =
   let rec go i =
-    match String.index_from_opt s i '\r' with
-    | Some j when j + 3 < n -> if s.[j + 1] = '\n' && s.[j + 2] = '\r' && s.[j + 3] = '\n' then Some j else go (j + 1)
-    | _ -> None in
+    if i + 3 >= n then None
+    else if String.unsafe_get s i = '\r' && String.unsafe_get s (i + 1) = '\n' && String.unsafe_get s (i + 2) = '\r'
+            && String.unsafe_get s (i + 3) = '\n' then Some i
+    else go (i + 1) in
   go 0
 
 exception Bad_request
 
-let parse_request s =
-  match find_head s with
-  | None -> if String.length s > 65536 then raise Bad_request else None
+let index_to s c a e = let rec go i = if i >= e then e else if String.unsafe_get s i = c then i else go (i + 1) in go a
+
+(* the header line s[p, e) starts with pre (lowercase), case-insensitively, and is longer than it *)
+let lower_prefix_at s p e pre =
+  let n = String.length pre in
+  e - p > n
+  && (let rec go i = i = n || (Char.lowercase_ascii (String.unsafe_get s (p + i)) = String.unsafe_get pre i && go (i + 1)) in go 0)
+
+(* s[p + k, e), trimmed like String.trim *)
+let value_at s p e k =
+  let sp c = c = ' ' || c = '\012' || c = '\n' || c = '\r' || c = '\t' in
+  let a = ref (p + k) and b = ref e in
+  while !a < !b && sp (String.unsafe_get s !a) do incr a done;
+  while !b > !a && sp (String.unsafe_get s (!b - 1)) do decr b done;
+  String.sub s !a (!b - !a)
+
+let parse_request s n =
+  match find_head s n with
+  | None -> if n > 65536 then raise Bad_request else None
   | Some hend ->
-    let le = String.index s '\r' in
-    let line = String.sub s 0 le in
-    let meth, target = match String.split_on_char ' ' line with m :: t :: _ -> m, t | _ -> "", "/" in
+    let le = index_to s '\r' 0 hend in
+    let meth, target =
+      let sp1 = index_to s ' ' 0 le in
+      if sp1 >= le then "", "/"
+      else let sp2 = index_to s ' ' (sp1 + 1) le in String.sub s 0 sp1, String.sub s (sp1 + 1) (sp2 - sp1 - 1) in
     let clen = ref 0 and auth = ref None and close = ref false in
     let p = ref (le + 2) in
     while !p < hend do
-      let e = match String.index_from_opt s !p '\r' with Some e when e <= hend -> e | _ -> hend in
-      let h = String.sub s !p (e - !p) in
-      (if lower_prefix h "content-length:" then clen := (try int_of_string (header_value h 15) with _ -> 0)
-       else if lower_prefix h "authorization:" then auth := Some (header_value h 14)
-       else if lower_prefix h "connection:" then close := String.lowercase_ascii (header_value h 11) = "close");
+      let e = index_to s '\r' !p hend in
+      (if lower_prefix_at s !p e "content-length:" then clen := (try int_of_string (value_at s !p e 15) with _ -> 0)
+       else if lower_prefix_at s !p e "authorization:" then auth := Some (value_at s !p e 14)
+       else if lower_prefix_at s !p e "connection:" then close := String.lowercase_ascii (value_at s !p e 11) = "close");
       p := e + 2
     done;
     let bstart = hend + 4 in
-    if String.length s < bstart + !clen then None
+    if n < bstart + !clen then None
     else Some (meth, target, !auth, !close, String.sub s bstart !clen, bstart + !clen)
 
 let write_all fd (b : Bytes.t) off len =
@@ -1451,6 +1462,8 @@ let write_all fd (b : Bytes.t) off len =
         slow 0 len in
   go off len
 
+let ok_head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+
 let respond ctx fd code (body : body) =
   let bb = ctx.bodyb in
   Buffer.clear bb;
@@ -1461,9 +1474,22 @@ let respond ctx fd code (body : body) =
       | exception e ->
         Printf.eprintf "error: %s\n%!" (Printexc.to_string e);
         Buffer.clear bb; error_body "internal error" bb; (500, Buffer.length bb) in
+  if code = 200 then begin
+    (* the common head, with the length's digits written in place *)
+    let h0 = String.length ok_head in
+    let d = let rec nd v k = if v < 10 then k else nd (v / 10) (k + 1) in nd blen 1 in
+    let hl = h0 + d + 4 in
+    if Bytes.length ctx.wbuf < hl + blen then ctx.wbuf <- Bytes.create (2 * (hl + blen));
+    let w = ctx.wbuf in
+    Bytes.blit_string ok_head 0 w 0 h0;
+    let v = ref blen in
+    for k = h0 + d - 1 downto h0 do Bytes.unsafe_set w k (Char.unsafe_chr (48 + !v mod 10)); v := !v / 10 done;
+    Bytes.blit_string "\r\n\r\n" 0 w (h0 + d) 4;
+    Buffer.blit bb 0 w hl blen;
+    write_all fd w 0 (hl + blen)
+  end else begin
   let head =
     if code = 204 then "HTTP/1.1 204 No Content\r\n\r\n"
-    else if code = 200 then "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " ^ string_of_int blen ^ "\r\n\r\n"
     else "HTTP/1.1 " ^ string_of_int code ^ " " ^ status_text code ^ "\r\nContent-Type: application/json\r\nContent-Length: "
          ^ string_of_int blen ^ "\r\n\r\n" in
   let hl = String.length head in
@@ -1471,31 +1497,40 @@ let respond ctx fd code (body : body) =
   Bytes.blit_string head 0 ctx.wbuf 0 hl;
   Buffer.blit bb 0 ctx.wbuf hl blen;
   write_all fd ctx.wbuf 0 (hl + blen)
+  end
 
 (* a connection: wait until readable, read into the domain's buffer, answer every complete request; an idle
    connection keeps no buffer of its own *)
 let serve ctx fd =
   let pending = ref "" in
-  let rec loop () =
-    match parse_request !pending with
+  (* s holds n bytes of request data: either !pending or the domain's read buffer (seen as a string, so anything
+     kept past the next yield is copied first) *)
+  let rec handle s n =
+    match parse_request s n with
     | exception Bad_request -> ()
     | Some (meth, target, auth, close, body, used) ->
-      let rest = String.length !pending - used in
-      pending := (if rest = 0 then "" else String.sub !pending used rest);
+      let rest = n - used in
+      pending := (if rest = 0 then "" else String.sub s used rest);
       let code, b = dispatch ctx meth target auth body in
       respond ctx fd code b;
-      if not close then loop ()
+      if not close then (if !pending = "" then read () else handle !pending (String.length !pending))
     | None ->
-      Eio_unix.await_readable fd;
-      match Unix.read fd ctx.rbuf 0 (Bytes.length ctx.rbuf) with
-      | 0 -> ()
-      | n ->
-        pending := (if !pending = "" then Bytes.sub_string ctx.rbuf 0 n else !pending ^ Bytes.sub_string ctx.rbuf 0 n);
-        loop ()
-      | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) -> loop ()
-      | exception Unix.Unix_error _ -> ()
+      if s != !pending then pending := String.sub s 0 n;
+      read ()
+  and read () =
+    Eio_unix.await_readable fd;
+    match Unix.read fd ctx.rbuf 0 (Bytes.length ctx.rbuf) with
+    | 0 -> ()
+    | n ->
+      if !pending = "" then handle (Bytes.unsafe_to_string ctx.rbuf) n
+      else begin
+        pending := !pending ^ Bytes.sub_string ctx.rbuf 0 n;
+        handle !pending (String.length !pending)
+      end
+    | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) -> read ()
+    | exception Unix.Unix_error _ -> ()
   in
-  loop ()
+  read ()
 
 (* ---------- diagnostics: MEMPROF=<rate> samples allocations per domain (Gc.Memprof) and prints the top
    allocation sites (words sampled, words of those promoted) every 30 s. Off by default. ---------- *)
