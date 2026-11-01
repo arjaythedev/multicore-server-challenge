@@ -126,6 +126,9 @@ pub fn main(init: std.process.Init.Minimal) void {
     // authors only (sql.zig); off by default.
     sql.comments_fw = onOff(env, "ZIG_COMMENTS_FW");
     if (sql.comments_fw) sys.log("ZIG_COMMENTS_FW=1: batched comments read only the followees among each thread's authors", .{});
+    // ZIG_COMMENT_AUTHORS_ONCE=1 (with ZIG_COMMENTS_FW=1) reads each distinct comment author once per batch; off by default.
+    sql.comment_authors_once = onOff(env, "ZIG_COMMENT_AUTHORS_ONCE");
+    if (sql.comment_authors_once) sys.log("ZIG_COMMENT_AUTHORS_ONCE=1: batched comments read each distinct author once", .{});
 
     loop.buf_runs = envUint(env, "ZIG_BUF_RUNS", 1) == 1;
     loop.cq_budget = @intCast(envUint(env, "ZIG_CQ_BUDGET", 1 << 20));

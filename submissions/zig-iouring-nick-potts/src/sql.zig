@@ -281,10 +281,15 @@ pub fn fallible(s: Stmt) bool {
 pub var comments_fw = false;
 const comments_fw_sql = std.mem.trimEnd(u8, @embedFile("sql/BATCH_COMMENTS_LIST_SET_FW.sql"), "\n; ");
 
+/// ZIG_COMMENT_AUTHORS_ONCE=1 (main.zig), with ZIG_COMMENTS_FW=1: the comments statement reads each distinct author's
+/// profile once per batch and joins it back to the comments (`sql/BATCH_COMMENTS_LIST_SET_FW_AUTHORS.sql`). Same rows.
+pub var comment_authors_once = false;
+const comments_fw_authors_sql = std.mem.trimEnd(u8, @embedFile("sql/BATCH_COMMENTS_LIST_SET_FW_AUTHORS.sql"), "\n; ");
+
 /// The batched form: `$n` becomes `r.pn`, the request rows come from unnest of one array per parameter.
 pub fn batchedSql(gpa: std.mem.Allocator, s: Stmt) ![]u8 {
     const d = s.def();
-    if (s == .comments_list_set and comments_fw) return gpa.dupe(u8, comments_fw_sql);
+    if (s == .comments_list_set and comments_fw) return gpa.dupe(u8, if (comment_authors_once) comments_fw_authors_sql else comments_fw_sql);
     if (d.batched) |b| return gpa.dupe(u8, b);
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(gpa, "SELECT q.*, r.ord FROM unnest(");
@@ -353,5 +358,18 @@ test "ZIG_COMMENTS_FW swaps only the batched comments statement" {
         const f = try batchedSql(gpa, .follow);
         defer gpa.free(f);
         try std.testing.expectEqualStrings(comptime batchText(.follow), f);
+    }
+}
+
+test "ZIG_COMMENT_AUTHORS_ONCE swaps the FW comments statement only" {
+    const gpa = std.testing.allocator;
+    defer comments_fw = false;
+    defer comment_authors_once = false;
+    comment_authors_once = true;
+    for ([_]bool{ false, true }) |on| {
+        comments_fw = on;
+        const t = try batchedSql(gpa, .comments_list_set);
+        defer gpa.free(t);
+        try std.testing.expectEqualStrings(if (on) comments_fw_authors_sql else comptime batchText(.comments_list_set), t);
     }
 }
