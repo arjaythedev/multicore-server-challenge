@@ -118,6 +118,17 @@ pub fn main(init: std.process.Init.Minimal) void {
     if (env.getPosix("ZIG_READ_CAP")) |v| {
         db.read_cap = if (v.len == 0) 0 else std.fmt.parseInt(u8, v, 10) catch sys.fatal("ZIG_READ_CAP: '{s}' is not a drain count", .{v});
     }
+    // ZIG_FEED_CAP, ZIG_COMMENTS_CAP and ZIG_SHARED_CAP set the lanes' caps on drains in flight, ZIG_OLDEST_FIRST=1
+    // lets the lane with the oldest queued read run past its cap (db.zig).
+    const lane_caps = [_]?u8{ laneCap(env, "ZIG_FEED_CAP"), laneCap(env, "ZIG_COMMENTS_CAP"), laneCap(env, "ZIG_SHARED_CAP") };
+    db.setCaps(lane_caps[0], lane_caps[1], lane_caps[2]);
+    db.oldest_first = onOff(env, "ZIG_OLDEST_FIRST");
+    if (db.oldest_first or lane_caps[0] != null or lane_caps[1] != null or lane_caps[2] != null) {
+        const c = db.caps();
+        sys.log("lane caps: feed {d}, comments {d}, shared {d}; oldest-first {s}, read drains in flight at most {d} (0: the lanes' caps)", .{
+            c[0], c[1], c[2], if (db.oldest_first) "on (the third-slot rules give way)" else "off", db.readTotal(),
+        });
+    }
     if (env.getPosix("ZIG_LANE_SEP")) |v| {
         const sep = if (v.len == 0) 0 else std.fmt.parseInt(u8, v, 10) catch sys.fatal("ZIG_LANE_SEP: '{s}' is not ms, 0 to 255", .{v});
         db.lane_sep_ns = @as(u64, sep) * std.time.ns_per_ms;
@@ -276,6 +287,16 @@ fn onOff(env: anytype, comptime name: []const u8) bool {
     if (std.mem.eql(u8, v, "1")) return true;
     if (v.len == 0 or std.mem.eql(u8, v, "0")) return false;
     sys.fatal(name ++ ": '{s}' is not 0 or 1", .{v});
+}
+
+/// A lane's cap on drains in flight from the environment, 1 to 8 (the read connections on the box); null when unset or
+/// empty.
+fn laneCap(env: anytype, comptime name: []const u8) ?u8 {
+    const v = env.getPosix(name) orelse return null;
+    if (v.len == 0) return null;
+    const n = std.fmt.parseInt(u8, v, 10) catch 0;
+    if (n < 1 or n > 8) sys.fatal(name ++ ": '{s}' is not a drain count from 1 to 8", .{v});
+    return n;
 }
 
 /// An unsigned knob from the environment, 0 when unset or empty; anything else above `max` stops the server.
