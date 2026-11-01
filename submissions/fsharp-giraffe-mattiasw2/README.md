@@ -202,6 +202,23 @@ chains in flight at once, all in registers, which the CPU's out-of-order engine 
 
 (A batch of three runs as four, the copy's result dropped: one quad costs less than a pair plus a single.)
 
+**Then the JIT's code got the same treatment as C's.** Against Openwall's crypt_blowfish in C with interleaved
+lanes (the code `csharp-epoll-aot-gichamba` calls; `gcc -O2`), on one idle Zen 5 core, fully optimized JIT:
+
+| bcrypt cost 10, one thread | ours before | ours now | C | C faster by |
+|---|--:|--:|--:|--:|
+| one at a time | 46.2 ms | 39.7 ms | 36.2 ms | 1.10x |
+| two in lockstep | 23.8 ms | 20.2 ms | 18.9 ms | 1.07x |
+| four in lockstep | 16.9 ms | **12.9 ms** | 11.1 ms | 1.16x |
+
+The JIT's assembly showed two costs gcc does not have. Each S-box lookup added the S-box's offset to the byte index
+as an `int`, which then needed a sign extension before the load; now each S-box is its own constant offset from the
+lane's pointer, indexed by a `byte`, and the offset folds into the load (`[p + 4*idx + 1096]`). And with eight chain
+words and four lane pointers live, the round counter spilled to the stack every round; the four-lane rounds are now
+written out, so each P word is a constant offset and there is no counter. (Unrolling the one- and two-lane rounds
+too changed nothing: they have registers to spare.) At 110,000 users on 6 threads bcrypt fell from 35% to 28% of the
+app's samples, about 1.04 to 0.78 threads, for the same number of hashes.
+
 At 85,000 users on the test box this cut the app's CPU from 3.81 to 3.00 cores, with more requests per second
 (21,400 against 21,000) and p95 from 647 ms to 515 ms. Postgres took the freed cores (3.88 to 4.30) and is now the
 larger consumer, and the lockstep batches averaged ~2.5 logins.

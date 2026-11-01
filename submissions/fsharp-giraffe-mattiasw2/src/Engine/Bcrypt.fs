@@ -51,10 +51,13 @@ let private magic =
 
 // ------------------------------------------------------------------ Blowfish ----------
 
+// Each S-box is addressed as its own pointer (a constant offset from the state) and indexed by
+// a byte: the JIT then knows the index is not negative and folds the offset into the load
+// (`[p + 4*idx + 1096]`), where an int sum `offset + idx` costs an add and a sign extension.
 let inline private f (s: nativeptr<uint32>) (x: uint32) =
-    ((NativePtr.get s (int (x >>> 24)) + NativePtr.get s (256 + int ((x >>> 16) &&& 0xFFu)))
-     ^^^ NativePtr.get s (512 + int ((x >>> 8) &&& 0xFFu)))
-    + NativePtr.get s (768 + int (x &&& 0xFFu))
+    ((NativePtr.get s (int (byte (x >>> 24))) + NativePtr.get (NativePtr.add s 256) (int (byte (x >>> 16))))
+     ^^^ NativePtr.get (NativePtr.add s 512) (int (byte (x >>> 8))))
+    + NativePtr.get (NativePtr.add s 768) (int (byte x))
 
 /// One Blowfish block with the lane state at `p`.
 let inline private encipher (p: nativeptr<uint32>) (xl: byref<uint32>) (xr: byref<uint32>) =
@@ -97,8 +100,14 @@ let inline private encipher2
     l1 <- d ^^^ NativePtr.get p1 17
     r1 <- c
 
-/// Four Blowfish blocks, of four lanes, with their rounds interleaved (the S-boxes addressed
-/// from each lane's P, 18 words in, so only four pointers stay live).
+/// One Feistel half-round of the lane at `p`: `y ^^^ F(x) ^^^ P[i]`. The S-boxes start 18 words
+/// into the state, so only the lane's one pointer stays live.
+let inline private half (p: nativeptr<uint32>) (i: int) (x: uint32) (y: uint32) =
+    y ^^^ f (NativePtr.add p 18) x ^^^ NativePtr.get p i
+
+/// Four Blowfish blocks, of four lanes, with their rounds interleaved. The 16 rounds are written
+/// out: each P word is then a constant offset, and no round counter competes for the registers
+/// that the eight chain words and four lane pointers already fill.
 let inline private encipher4
     (p0: nativeptr<uint32>)
     (p1: nativeptr<uint32>)
@@ -106,10 +115,6 @@ let inline private encipher4
     (p3: nativeptr<uint32>)
     (x: nativeptr<uint32>)
     =
-    let inline g (p: nativeptr<uint32>) (v: uint32) =
-        ((NativePtr.get p (18 + int (v >>> 24)) + NativePtr.get p (274 + int ((v >>> 16) &&& 0xFFu)))
-         ^^^ NativePtr.get p (530 + int ((v >>> 8) &&& 0xFFu)))
-        + NativePtr.get p (786 + int (v &&& 0xFFu))
     let mutable a0 = NativePtr.get x 0 ^^^ NativePtr.get p0 0
     let mutable b0 = NativePtr.get x 1
     let mutable a1 = NativePtr.get x 2 ^^^ NativePtr.get p1 0
@@ -118,17 +123,70 @@ let inline private encipher4
     let mutable b2 = NativePtr.get x 5
     let mutable a3 = NativePtr.get x 6 ^^^ NativePtr.get p3 0
     let mutable b3 = NativePtr.get x 7
-    let mutable i = 1
-    while i < 17 do
-        b0 <- b0 ^^^ g p0 a0 ^^^ NativePtr.get p0 i
-        b1 <- b1 ^^^ g p1 a1 ^^^ NativePtr.get p1 i
-        b2 <- b2 ^^^ g p2 a2 ^^^ NativePtr.get p2 i
-        b3 <- b3 ^^^ g p3 a3 ^^^ NativePtr.get p3 i
-        a0 <- a0 ^^^ g p0 b0 ^^^ NativePtr.get p0 (i + 1)
-        a1 <- a1 ^^^ g p1 b1 ^^^ NativePtr.get p1 (i + 1)
-        a2 <- a2 ^^^ g p2 b2 ^^^ NativePtr.get p2 (i + 1)
-        a3 <- a3 ^^^ g p3 b3 ^^^ NativePtr.get p3 (i + 1)
-        i <- i + 2
+    b0 <- half p0 1 a0 b0
+    b1 <- half p1 1 a1 b1
+    b2 <- half p2 1 a2 b2
+    b3 <- half p3 1 a3 b3
+    a0 <- half p0 2 b0 a0
+    a1 <- half p1 2 b1 a1
+    a2 <- half p2 2 b2 a2
+    a3 <- half p3 2 b3 a3
+    b0 <- half p0 3 a0 b0
+    b1 <- half p1 3 a1 b1
+    b2 <- half p2 3 a2 b2
+    b3 <- half p3 3 a3 b3
+    a0 <- half p0 4 b0 a0
+    a1 <- half p1 4 b1 a1
+    a2 <- half p2 4 b2 a2
+    a3 <- half p3 4 b3 a3
+    b0 <- half p0 5 a0 b0
+    b1 <- half p1 5 a1 b1
+    b2 <- half p2 5 a2 b2
+    b3 <- half p3 5 a3 b3
+    a0 <- half p0 6 b0 a0
+    a1 <- half p1 6 b1 a1
+    a2 <- half p2 6 b2 a2
+    a3 <- half p3 6 b3 a3
+    b0 <- half p0 7 a0 b0
+    b1 <- half p1 7 a1 b1
+    b2 <- half p2 7 a2 b2
+    b3 <- half p3 7 a3 b3
+    a0 <- half p0 8 b0 a0
+    a1 <- half p1 8 b1 a1
+    a2 <- half p2 8 b2 a2
+    a3 <- half p3 8 b3 a3
+    b0 <- half p0 9 a0 b0
+    b1 <- half p1 9 a1 b1
+    b2 <- half p2 9 a2 b2
+    b3 <- half p3 9 a3 b3
+    a0 <- half p0 10 b0 a0
+    a1 <- half p1 10 b1 a1
+    a2 <- half p2 10 b2 a2
+    a3 <- half p3 10 b3 a3
+    b0 <- half p0 11 a0 b0
+    b1 <- half p1 11 a1 b1
+    b2 <- half p2 11 a2 b2
+    b3 <- half p3 11 a3 b3
+    a0 <- half p0 12 b0 a0
+    a1 <- half p1 12 b1 a1
+    a2 <- half p2 12 b2 a2
+    a3 <- half p3 12 b3 a3
+    b0 <- half p0 13 a0 b0
+    b1 <- half p1 13 a1 b1
+    b2 <- half p2 13 a2 b2
+    b3 <- half p3 13 a3 b3
+    a0 <- half p0 14 b0 a0
+    a1 <- half p1 14 b1 a1
+    a2 <- half p2 14 b2 a2
+    a3 <- half p3 14 b3 a3
+    b0 <- half p0 15 a0 b0
+    b1 <- half p1 15 a1 b1
+    b2 <- half p2 15 a2 b2
+    b3 <- half p3 15 a3 b3
+    a0 <- half p0 16 b0 a0
+    a1 <- half p1 16 b1 a1
+    a2 <- half p2 16 b2 a2
+    a3 <- half p3 16 b3 a3
     NativePtr.set x 0 (b0 ^^^ NativePtr.get p0 17)
     NativePtr.set x 1 a0
     NativePtr.set x 2 (b1 ^^^ NativePtr.get p1 17)
