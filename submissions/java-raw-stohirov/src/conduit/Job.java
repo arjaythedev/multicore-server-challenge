@@ -15,6 +15,8 @@ final class Job {
     final Http.Conn conn;
     long viewer;
     long t0;
+    /** answered (or handed to bcrypt) before the rest of its batch finished */
+    boolean done;
 
     /** slug, username, tag or e-mail (reads); slug or username (writes) */
     String key;

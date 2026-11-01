@@ -42,12 +42,11 @@ final class Sql {
                         + "JOIN articles a ON a.slug = r.slug", TEXT_ARRAY),
                 s("aid", "SELECT r.k, " + COLS + ", a.body FROM unnest($1::int8[]) WITH ORDINALITY r(id, k) "
                         + "JOIN articles a ON a.id = r.id", INT8_ARRAY),
-                // [k, article id, comment id, body, created_at, updated_at, author_id, username, bio, image]
-                s("cmts", "SELECT r.k, a.id, c.id, c.body, c.created_at, c.updated_at, c.author_id, u.username, u.bio, u.image "
+                // [k, article id, comment id, body, created_at, updated_at, author_id]; authors come from auser in phase B
+                s("cmts", "SELECT r.k, a.id, c.id, c.body, c.created_at, c.updated_at, c.author_id "
                         + "FROM unnest($1::text[]) WITH ORDINALITY r(slug, k) JOIN articles a ON a.slug = r.slug "
                         + "LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id FROM comments c "
-                        + "  WHERE c.article_id = a.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true "
-                        + "LEFT JOIN users u ON u.id = c.author_id", TEXT_ARRAY),
+                        + "  WHERE c.article_id = a.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true", TEXT_ARRAY),
                 // Lists: k <= 0 rows are capped counts (-k is the count key, the count in column 1); k > 0 rows are
                 // page rows. The global count walks the primary key from the oldest end, whose pages are all-visible,
                 // so it stays an index-only scan while new articles keep the newest pages dirty.
@@ -65,12 +64,13 @@ final class Sql {
                         + "  ORDER BY at.article_id DESC LIMIT r.lim OFFSET r.off) p "
                         + "JOIN articles a ON a.id = p.article_id",
                         TEXT_ARRAY, TEXT_ARRAY, INT8_ARRAY, INT8_ARRAY),
-                s("author", "SELECT -r.k, " + capped("SELECT 1 FROM articles a WHERE a.author_id = u.id") + ", " + PAD + " "
+                // Author pages are [k, id, author_id] straight from articles_author_idx; artrow reads their columns.
+                s("author", "SELECT -r.k, " + capped("SELECT 1 FROM articles a WHERE a.author_id = u.id") + ", NULL::int8 "
                         + "FROM unnest($1::text[]) WITH ORDINALITY r(username, k) LEFT JOIN users u ON u.username = r.username "
                         + "UNION ALL "
-                        + "SELECT r.k, " + COLS + " FROM unnest($2::text[], $3::int8[], $4::int8[]) WITH ORDINALITY r(username, lim, off, k) "
+                        + "SELECT r.k, a.id, a.author_id FROM unnest($2::text[], $3::int8[], $4::int8[]) WITH ORDINALITY r(username, lim, off, k) "
                         + "JOIN users u ON u.username = r.username "
-                        + "CROSS JOIN LATERAL (SELECT * FROM articles a WHERE a.author_id = u.id ORDER BY a.id DESC LIMIT r.lim OFFSET r.off) a",
+                        + "CROSS JOIN LATERAL (SELECT a.id, a.author_id FROM articles a WHERE a.author_id = u.id ORDER BY a.id DESC LIMIT r.lim OFFSET r.off) a",
                         TEXT_ARRAY, TEXT_ARRAY, INT8_ARRAY, INT8_ARRAY),
                 s("favlist", "SELECT -r.k, " + capped("SELECT 1 FROM favorites f WHERE f.user_id = u.id") + ", " + PAD + " "
                         + "FROM unnest($1::text[]) WITH ORDINALITY r(username, k) LEFT JOIN users u ON u.username = r.username "
@@ -99,19 +99,22 @@ final class Sql {
                         + "    GROUP BY f.fid HAVING count(*) >= 2 ORDER BY count(*) DESC, f.fid LIMIT 32) h), "
                         + "big AS MATERIALIZED (SELECT ARRAY(SELECT fid FROM hubs WHERE big) AS fids) "
                         + "SELECT -u.k, CASE WHEN u.fids && (SELECT fids FROM big) THEN 1000::int8 "
-                        + "  ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = ANY(u.fids) LIMIT 1000) s) END, " + PAD + " "
+                        + "  ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = ANY(u.fids) LIMIT 1000) s) END, NULL::int8 "
                         + "FROM u "
                         + "UNION ALL "
-                        + "SELECT p.k, " + COLS + " FROM unnest($2::int8[], $3::int8[], $4::int8[]) WITH ORDINALITY p(v, lim, off, k) "
+                        + "SELECT p.k, x.id, x.fid FROM unnest($2::int8[], $3::int8[], $4::int8[]) WITH ORDINALITY p(v, lim, off, k) "
                         + "JOIN u ON u.v = p.v "
                         + "CROSS JOIN LATERAL (SELECT COALESCE(max(h.floor_id), 0) AS floor_id FROM hubs h WHERE h.fid = ANY(u.fids)) fl "
-                        + "CROSS JOIN LATERAL (SELECT y.id FROM unnest(u.fids) f(fid) CROSS JOIN LATERAL "
-                        + "  (SELECT a2.id FROM articles a2 WHERE a2.author_id = f.fid AND a2.id >= fl.floor_id "
+                        + "CROSS JOIN LATERAL (SELECT y.id, y.fid FROM unnest(u.fids) f(fid) CROSS JOIN LATERAL "
+                        + "  (SELECT a2.id, f.fid FROM articles a2 WHERE a2.author_id = f.fid AND a2.id >= fl.floor_id "
                         + "    ORDER BY a2.id DESC LIMIT p.lim + p.off) y "
-                        + "  ORDER BY y.id DESC LIMIT p.lim OFFSET p.off) x "
-                        + "JOIN articles a ON a.id = x.id",
+                        + "  ORDER BY y.id DESC LIMIT p.lim OFFSET p.off) x",
                         INT8_ARRAY, INT8_ARRAY, INT8_ARRAY, INT8_ARRAY),
                 // ---- phase B: once per distinct article of the batch ----
+                // article columns for articles phase A only returned ids for, in the page-row layout
+                s("artrow", "SELECT 0::int8, " + COLS + " FROM articles a WHERE a.id = ANY($1::int8[])", INT8_ARRAY),
+                // comment authors: one ordered walk of the primary key instead of a probe per comment row
+                s("auser", "SELECT u.id, u.username, u.bio, u.image FROM users u WHERE u.id = ANY($1::int8[])", INT8_ARRAY),
                 // [id, tag ids, favorites count, author username, bio, image]
                 s("artx", "SELECT r.id, ARRAY(SELECT at.tag_id FROM article_tags at WHERE at.article_id = r.id), "
                         + "(SELECT count(*) FROM favorites f WHERE f.article_id = r.id), u.username, u.bio, u.image "
@@ -127,6 +130,11 @@ final class Sql {
                         + "SELECT 1::int8, q.v, fo.followee_id FROM q CROSS JOIN LATERAL "
                         + "  (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = q.v AND fo.followee_id = ANY(q.uu)) fo",
                         INT8_ARRAY, INT8_ARRAY, INT8_ARRAY, INT8_ARRAY));
+    }
+
+    /** The feed statement alone, for a read lane's second connection. */
+    static List<Stmt> feed() {
+        return reads().stream().filter(x -> x.name().equals("feed")).toList();
     }
 
     private static final String SLUGIFY = "trim(both '-' from lower(regexp_replace($2, '[^A-Za-z0-9]+', '-', 'g')))";

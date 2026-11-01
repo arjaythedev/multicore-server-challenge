@@ -99,6 +99,8 @@ final class Http {
         long acceptPausedUntil;
         int nextLoop;
         final ConcurrentLinkedQueue<Object> inbox = new ConcurrentLinkedQueue<>();
+        /** reads parsed this pass, queued together: one lock per pass instead of one per request */
+        final ArrayList<Job> reads = new ArrayList<>();
         final AtomicBoolean woken = new AtomicBoolean();
         final ByteBuffer rbuf = ByteBuffer.allocateDirect(64 * 1024);
         final byte[] scratch = new byte[64 * 1024];
@@ -124,6 +126,10 @@ final class Http {
                     sel.select(this::onKey, timeout);
                     woken.set(false);
                     drainInbox();
+                    if (!reads.isEmpty()) {
+                        Lanes.READS.pushAll(reads);
+                        reads.clear();
+                    }
                     if (acceptPausedUntil != 0 && System.nanoTime() >= acceptPausedUntil) {
                         acceptPausedUntil = 0;
                         acceptKey.interestOps(SelectionKey.OP_ACCEPT);

@@ -5,5 +5,5 @@ cd "$(dirname "$0")/.."
 JDK=/usr/local/java-raw-stohirov/jdk
 if [ -x "$JDK/bin/javac" ]; then BIN="$JDK/bin/"; else BIN="${JAVA_HOME:+$JAVA_HOME/bin/}"; fi
 rm -rf build/test && mkdir -p build/test
-"${BIN}javac" -encoding UTF-8 -proc:none -d build/test src/conduit/*.java test/conduit/*.java
-"${BIN}java" -XX:-DontCompileHugeMethods -cp build/test conduit.SelfTest
+"${BIN}javac" -encoding UTF-8 -proc:none --add-exports java.base/jdk.internal.misc=ALL-UNNAMED -d build/test src/conduit/*.java test/conduit/*.java
+"${BIN}java" -XX:-DontCompileHugeMethods --add-exports java.base/jdk.internal.misc=ALL-UNNAMED -cp build/test conduit.SelfTest

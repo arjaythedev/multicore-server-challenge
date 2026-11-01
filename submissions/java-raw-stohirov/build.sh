@@ -6,4 +6,4 @@ JDK=/usr/local/java-raw-stohirov/jdk
 if [ -x "$JDK/bin/javac" ]; then JAVAC="$JDK/bin/javac"; else JAVAC="${JAVA_HOME:+$JAVA_HOME/bin/}javac"; fi
 rm -rf build/classes
 mkdir -p build/classes
-"$JAVAC" -encoding UTF-8 -proc:none -d build/classes src/conduit/*.java
+"$JAVAC" -encoding UTF-8 -proc:none --add-exports java.base/jdk.internal.misc=ALL-UNNAMED -d build/classes src/conduit/*.java

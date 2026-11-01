@@ -1,78 +1,90 @@
 #!/usr/bin/env python3
-"""Generates src/conduit/BCryptLanes.java: bcrypt's key schedule for K hashes in lockstep (K = 2..MAXK).
+"""Generates src/conduit/BCryptLanes.java: bcrypt's key schedule for K hashes in lockstep (K = 1..MAXK).
 
 A single bcrypt is one long chain of dependent S-box loads. Running K independent hashes with their rounds
 interleaved, every lane in its own local variables, lets the core overlap the chains. Java has no way to write that
 generically without spilling state to memory, so this script writes one straight-line kernel per K.
+
+All lanes live in one int[]: lane k's P-array at k * STRIDE, its S-boxes right after. Every load is one base register
+plus a constant plus an S-box index, so x86-64's 14 usable registers go to the lanes' L and R words, not to array
+references, and P and S are stored with one uniform index. Unsafe drops the bounds checks: the S-box index comes
+from a byte of a word (0..255), so every offset is in range by construction; the P offsets are constants.
 
     python3 tools/gen-bcrypt-lanes.py > src/conduit/BCryptLanes.java
 """
 import sys
 
 MAXK = 6
+STRIDE = 18 + 1024
+
+
+def get(off):
+    return f"U.getInt(a, B + {off}L)"
+
+
+def sbox(k, box, idx):
+    # B is the array base; bytes: lane k's S-box `box` starts at word k*STRIDE + 18 + box*256
+    base = (k * STRIDE + 18 + box * 256) * 4
+    return f"U.getInt(a, B + {base}L + ((long) ({idx}) << 2))"
 
 
 def f(k, x):
-    s = f"S{k}"
-    return (f"((({s}[{x} >>> 24] + {s}[0x100 | ({x} >>> 16 & 0xff)]) ^ {s}[0x200 | ({x} >>> 8 & 0xff)]) "
-            f"+ {s}[0x300 | ({x} & 0xff)])")
+    return (f"((({sbox(k, 0, f'{x} >>> 24')} + {sbox(k, 1, f'{x} >>> 16 & 0xff')}) "
+            f"^ {sbox(k, 2, f'{x} >>> 8 & 0xff')}) + {sbox(k, 3, f'{x} & 0xff')})")
+
+
+def p(k, i):
+    return get((k * STRIDE + i) * 4)
 
 
 def encipher(K, ind):
     """Encipher (l_k, r_k) for every lane in place: rounds interleaved across lanes."""
     out = []
     for k in range(K):
-        out.append(f"{ind}l{k} ^= P{k}[0];")
+        out.append(f"{ind}l{k} ^= {p(k, 0)};")
     for i in range(1, 17, 2):
         for k in range(K):
-            out.append(f"{ind}r{k} ^= {f(k, f'l{k}')} ^ P{k}[{i}];")
+            out.append(f"{ind}r{k} ^= {f(k, f'l{k}')} ^ {p(k, i)};")
         for k in range(K):
-            out.append(f"{ind}l{k} ^= {f(k, f'r{k}')} ^ P{k}[{i + 1}];")
+            out.append(f"{ind}l{k} ^= {f(k, f'r{k}')} ^ {p(k, i + 1)};")
     for k in range(K):
-        out.append(f"{ind}r{k} ^= P{k}[17];")
+        out.append(f"{ind}r{k} ^= {p(k, 17)};")
         out.append(f"{ind}t = l{k}; l{k} = r{k}; r{k} = t;")
     return out
 
 
 def kernel(K):
     L = []
-    ps = ", ".join(f"P{k} = p[{k}]" for k in range(K))
-    ss = ", ".join(f"S{k} = s[{k}]" for k in range(K))
     ls = ", ".join(f"l{k} = 0, r{k} = 0" for k in range(K))
     # expand: kw[k] are 18 key words (key or salt stream); salted: sw[k] are the 4 salt words xored in per block
     for salted in (False, True):
         name = "expandSalted" if salted else "expand"
-        args = "int[][] p, int[][] s, int[][] kw" + (", int[][] sw" if salted else "")
+        args = "int[] a, int[][] kw" + (", int[][] sw" if salted else "")
         L.append(f"    static void {name}{K}({args}) {{")
-        L.append(f"        final int[] {ps};")
-        L.append(f"        final int[] {ss};")
         for k in range(K):
-            L.append(f"        {{ final int[] w = kw[{k}]; for (int i = 0; i < 18; i++) P{k}[i] ^= w[i]; }}")
+            L.append(f"        {{ final int[] w = kw[{k}]; for (int i = 0; i < 18; i++) a[{k * STRIDE} + i] ^= w[i]; }}")
         if salted:
             for k in range(K):
                 L.append(f"        final int[] w{k} = sw[{k}];")
-        L.append(f"        int {ls}, t, si = 0;")
-        # one loop over P then S keeps the method small enough for the JIT
-        L.append("        for (int i = 0; i < 18 + 1024; i += 2) {")
+        L.append(f"        int {ls}, t;")
+        if salted:
+            L.append("        int si = 0;")
+        # P and S are one run of words per lane, so one loop and one store index cover both
+        L.append(f"        for (int i = 0; i < {STRIDE}; i += 2) {{")
         if salted:
             for k in range(K):
                 L.append(f"            l{k} ^= w{k}[si]; r{k} ^= w{k}[si + 1];")
             L.append("            si ^= 2;")
         L += encipher(K, "            ")
-        L.append("            if (i < 18) {")
+        L.append("            final long o = (long) i << 2;")
         for k in range(K):
-            L.append(f"                P{k}[i] = l{k}; P{k}[i + 1] = r{k};")
-        L.append("            } else {")
-        for k in range(K):
-            L.append(f"                S{k}[i - 18] = l{k}; S{k}[i - 17] = r{k};")
-        L.append("            }")
+            off = k * STRIDE * 4
+            L.append(f"            U.putInt(a, B + {off}L + o, l{k}); U.putInt(a, B + {off + 4}L + o, r{k});")
         L.append("        }")
         L.append("    }")
         L.append("")
     # final: encrypt the magic text 64 times; c[k] is lane k's 6 words
-    L.append(f"    static void encrypt{K}(int[][] p, int[][] s, int[][] c) {{")
-    L.append(f"        final int[] {ps};")
-    L.append(f"        final int[] {ss};")
+    L.append(f"    static void encrypt{K}(int[] a, int[][] c) {{")
     L.append(f"        int {ls}, t;")
     L.append("        for (int n = 0; n < 64; n++) {")
     L.append("            for (int j = 0; j < 6; j += 2) {")
@@ -91,15 +103,20 @@ def kernel(K):
 def main():
     L = ["// GENERATED by tools/gen-bcrypt-lanes.py: do not edit.",
          "package conduit;", "",
-         "/** bcrypt's Blowfish work for K hashes at once, rounds interleaved (see BCrypt.rawLanes). */",
+         "import jdk.internal.misc.Unsafe;", "",
+         "/** bcrypt's Blowfish work for K hashes at once, rounds interleaved, all lanes in one array (see BCrypt.hashLanes). */",
          "final class BCryptLanes {",
-         f"    static final int MAX = {MAXK};", "",
+         f"    static final int MAX = {MAXK};",
+         "    /** Words per lane: lane k's P-array at k * STRIDE, its four S-boxes right after. */",
+         f"    static final int STRIDE = {STRIDE};",
+         "    private static final Unsafe U = Unsafe.getUnsafe();",
+         "    private static final long B = Unsafe.ARRAY_INT_BASE_OFFSET;", "",
          "    private BCryptLanes() {}", ""]
     for K in range(1, MAXK + 1):
         L += kernel(K)
-    for name, args, call in (("expand", "int[][] p, int[][] s, int[][] kw", "p, s, kw"),
-                             ("expandSalted", "int[][] p, int[][] s, int[][] kw, int[][] sw", "p, s, kw, sw"),
-                             ("encrypt", "int[][] p, int[][] s, int[][] c", "p, s, c")):
+    for name, args, call in (("expand", "int[] a, int[][] kw", "a, kw"),
+                             ("expandSalted", "int[] a, int[][] kw, int[][] sw", "a, kw, sw"),
+                             ("encrypt", "int[] a, int[][] c", "a, c")):
         L.append(f"    static void {name}(int k, {args}) {{")
         L.append("        switch (k) {")
         for K in range(1, MAXK + 1):

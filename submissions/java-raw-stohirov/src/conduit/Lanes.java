@@ -9,7 +9,8 @@ import java.util.Map;
 final class Lanes {
     static final JobQueue READS = new JobQueue(), WRITES = new JobQueue(), BCRYPT = new JobQueue();
 
-    record Settings(Pg.Config cfg, int readMin, long readWindowNanos, int readMax, int writeMax) {}
+    record Settings(Pg.Config cfg, int readMin, long readWindowNanos, int readMax, int writeMax, long writeWindowNanos,
+                    boolean feedConn) {}
 
     private static Settings settings;
 
@@ -59,8 +60,7 @@ final class Lanes {
     /**
      * bcrypt workers: verify logins (answering them) and hash new passwords (then queueing their write). Workers take
      * turns gathering: one waits up to the window for a full set of lanes while the others hash theirs, so under a
-     * backlog every set is full, and a trickle of logins still shares sets. Hash threads run at a lower OS priority
-     * (with -XX:ThreadPriorityPolicy=1), so hashing gives way to Postgres and the event loops.
+     * backlog every set is full, and a trickle of logins still shares sets.
      */
     static final class Hasher implements Runnable {
         private static final byte[] E401 = Http.error(401, "invalid email or password");
@@ -72,35 +72,44 @@ final class Lanes {
             this.windowNanos = windowNanos;
         }
 
-        /** Times every width on throwaway keys at a low cost and keeps the fastest per hash. */
+        /**
+         * Times every width on throwaway keys at a low cost and keeps the fastest per hash. Three passes, each width's
+         * fastest run counting: a width isn't judged while the JIT is still compiling its kernel.
+         */
         static int measure() {
             byte[] pw = "throwaway-password".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
-            double best = Double.MAX_VALUE;
-            int bestK = 1;
-            for (int k = 1; k <= BCryptLanes.MAX; k++) {
-                byte[][] pws = new byte[k][];
-                BCrypt.Setting[] st = new BCrypt.Setting[k];
-                for (int i = 0; i < k; i++) {
-                    pws[i] = pw;
-                    st[i] = new BCrypt.Setting("$2a$06$", 6, BCrypt.newSetting().salt());
-                }
-                BCrypt.Setting[] warm = new BCrypt.Setting[k];
-                for (int i = 0; i < k; i++) warm[i] = new BCrypt.Setting("$2a$04$", 4, st[i].salt());
-                for (int w = 0; w < 40; w++) BCrypt.hashLanes(pws, warm); // let the JIT compile this width
-                long t = System.nanoTime();
-                for (int r = 0; r < 4; r++) BCrypt.hashLanes(pws, st);
-                double per = (System.nanoTime() - t) / 4.0 / k;
-                if (per < best * 0.97) {
-                    best = per;
-                    bestK = k;
+            int max = BCryptLanes.MAX;
+            double[] per = new double[max + 1];
+            java.util.Arrays.fill(per, Double.MAX_VALUE);
+            for (int pass = 0; pass < 3; pass++) {
+                for (int k = 1; k <= max; k++) {
+                    byte[][] pws = new byte[k][];
+                    BCrypt.Setting[] st = new BCrypt.Setting[k], warm = new BCrypt.Setting[k];
+                    for (int i = 0; i < k; i++) {
+                        pws[i] = pw;
+                        st[i] = new BCrypt.Setting("$2a$07$", 7, BCrypt.newSetting().salt());
+                        warm[i] = new BCrypt.Setting("$2a$04$", 4, st[i].salt());
+                    }
+                    if (pass == 0) for (int w = 0; w < 200; w++) BCrypt.hashLanes(pws, warm); // let the JIT compile it
+                    for (int r = 0; r < 3; r++) {
+                        long t = System.nanoTime();
+                        BCrypt.hashLanes(pws, st);
+                        per[k] = Math.min(per[k], (double) (System.nanoTime() - t) / k);
+                    }
                 }
             }
+            int bestK = 1;
+            StringBuilder log = new StringBuilder("bcrypt: per-hash ms at cost 10 by width:");
+            for (int k = 1; k <= max; k++) {
+                log.append(String.format(" %d=%.1f", k, per[k] * 8 / 1e6));
+                if (per[k] < per[bestK] * 0.97) bestK = k;
+            }
+            System.out.println(log);
             return bestK;
         }
 
         @Override
         public void run() {
-            Thread.currentThread().setPriority(Thread.MIN_PRIORITY);
             List<Job> jobs = new ArrayList<>(BCryptLanes.MAX);
             while (true) {
                 jobs.clear();
