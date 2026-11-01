@@ -31,16 +31,16 @@ let taken (ds: NpgsqlDataSource) (exceptId: int64) (username: string option) (em
             return List.exists id rows
         }
 
-let register (ds: NpgsqlDataSource) (username: string) (email: string) (passwordHash: string) : Task<Unique<User>> =
+let register (writes: Commit.Writer) (username: string) (email: string) (passwordHash: string) : Task<Unique<User>> =
     task {
         try
             let! rows =
-                Sql.fromDataSource ds
-                |> Sql.query
-                    "INSERT INTO users (username, email, password_hash) VALUES (@username, @email, @hash)
-                     RETURNING id, username, email, bio, image"
-                |> Sql.parameters [ "@username", Sql.text username; "@email", Sql.text email; "@hash", Sql.text passwordHash ]
-                |> Sql.executeAsync user
+                writes.Run(
+                    [ "INSERT INTO users (username, email, password_hash) VALUES (@username, @email, @hash)
+                       RETURNING id, username, email, bio, image",
+                      [ "@username", Sql.text username; "@email", Sql.text email; "@hash", Sql.text passwordHash ] ],
+                    user
+                )
             return
                 match rows with
                 | u :: _ -> Stored u
@@ -78,25 +78,24 @@ type Changes =
       Image: string option }
 
 /// Absent or null fields stay as they are (COALESCE). Missing = the token's user is gone.
-let update (ds: NpgsqlDataSource) (id: int64) (c: Changes) : Task<Unique<User>> =
+let update (writes: Commit.Writer) (id: int64) (c: Changes) : Task<Unique<User>> =
     task {
         try
             let! rows =
-                Sql.fromDataSource ds
-                |> Sql.query
-                    "UPDATE users SET email = COALESCE(@email, email), username = COALESCE(@username, username),
-                                      password_hash = COALESCE(@hash, password_hash), bio = COALESCE(@bio, bio),
-                                      image = COALESCE(@image, image)
-                      WHERE id = @id
-                     RETURNING id, username, email, bio, image"
-                |> Sql.parameters
-                    [ "@id", Sql.int64 id
-                      "@email", Sql.textOrNone c.Email
-                      "@username", Sql.textOrNone c.Username
-                      "@hash", Sql.textOrNone c.PasswordHash
-                      "@bio", Sql.textOrNone c.Bio
-                      "@image", Sql.textOrNone c.Image ]
-                |> Sql.executeAsync user
+                writes.Run(
+                    [ "UPDATE users SET email = COALESCE(@email, email), username = COALESCE(@username, username),
+                                        password_hash = COALESCE(@hash, password_hash), bio = COALESCE(@bio, bio),
+                                        image = COALESCE(@image, image)
+                        WHERE id = @id
+                       RETURNING id, username, email, bio, image",
+                      [ "@id", Sql.int64 id
+                        "@email", Sql.textOrNone c.Email
+                        "@username", Sql.textOrNone c.Username
+                        "@hash", Sql.textOrNone c.PasswordHash
+                        "@bio", Sql.textOrNone c.Bio
+                        "@image", Sql.textOrNone c.Image ] ],
+                    user
+                )
             return
                 match rows with
                 | u :: _ -> Stored u

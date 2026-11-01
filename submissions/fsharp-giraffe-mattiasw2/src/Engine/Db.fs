@@ -9,7 +9,8 @@ open Npgsql
 /// lifetime, its statements are queued and written to whichever connection is free, so a few
 /// connections carry thousands of concurrent requests without a pool wait. Statements are
 /// auto-prepared (server-side plans are cached per connection; rule 5 allows that).
-let connectionString (url: string) (poolSize: int) : string =
+/// `multiplexed` false is for Commit's writer lanes, whose batches each need a connection.
+let connectionString (url: string) (poolSize: int) (multiplexed: bool) : string =
     let uri = Uri url
     let user, password =
         match uri.UserInfo.Split(':', 2) with
@@ -26,7 +27,7 @@ let connectionString (url: string) (poolSize: int) : string =
     b.Pooling <- true
     b.MaxPoolSize <- poolSize
     b.MinPoolSize <- 0
-    b.Multiplexing <- true
+    b.Multiplexing <- multiplexed
     b.NoResetOnClose <- true
     b.Enlist <- false
     b.MaxAutoPrepare <- 64

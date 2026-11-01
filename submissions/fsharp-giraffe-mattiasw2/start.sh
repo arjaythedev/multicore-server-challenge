@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Runs the server in the foreground. Config: DATABASE_URL, JWT_SECRET, HOST, PORT (SPEC.md).
 # Optional: DB_POOL_SIZE (multiplexed Postgres connections, default 3 per core, capped at 95),
+# WRITE_LANES / WRITE_GROUP (group-commit connections, default 2; writes per group, default 128),
 # BCRYPT_THREADS (dedicated bcrypt threads, default one per two cores).
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"

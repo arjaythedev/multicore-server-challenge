@@ -33,16 +33,17 @@ let private unfollowSql =
           w AS (DELETE FROM follows fo USING u WHERE fo.follower_id = @viewer AND fo.followee_id = u.id)
      SELECT username, bio, image FROM u"
 
-let setFollowing (ds: NpgsqlDataSource) (viewer: ViewerId) (username: string) (following: bool) : Task<Profile option> =
+let setFollowing (writes: Commit.Writer) (viewer: ViewerId) (username: string) (following: bool) : Task<Profile option> =
     task {
         let! rows =
-            Sql.fromDataSource ds
-            |> Sql.query (if following then followSql else unfollowSql)
-            |> Sql.parameters [ "@viewer", Sql.int64 viewer; "@username", Sql.text username ]
-            |> Sql.executeAsync (fun read ->
-                { Username = read.text "username"
-                  Bio = read.textOrNone "bio"
-                  Image = read.textOrNone "image"
-                  Following = following })
+            writes.Run(
+                [ (if following then followSql else unfollowSql),
+                  [ "@viewer", Sql.int64 viewer; "@username", Sql.text username ] ],
+                fun read ->
+                    { Username = read.text "username"
+                      Bio = read.textOrNone "bio"
+                      Image = read.textOrNone "image"
+                      Following = following }
+            )
         return List.tryHead rows
     }

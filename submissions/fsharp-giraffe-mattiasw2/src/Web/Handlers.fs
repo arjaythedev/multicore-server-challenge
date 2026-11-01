@@ -11,7 +11,11 @@ open Npgsql
 open Engine
 
 [<NoEquality; NoComparison>]
-type Env = { Db: NpgsqlDataSource; Jwt: Jwt.Signer }
+type Env =
+    { Db: NpgsqlDataSource
+      /// Every write goes through group commit (Engine.Commit).
+      Writes: Commit.Writer
+      Jwt: Jwt.Signer }
 
 let private now () = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
 
@@ -139,7 +143,7 @@ let register (env: Env) : HttpHandler =
                 | true -> return unprocessable "username or email is already taken"
                 | false ->
                     let! hash = Passwords.hash r.Password
-                    match! Users.register env.Db r.Username r.Email hash with
+                    match! Users.register env.Writes r.Username r.Email hash with
                     | Stored u -> return created (Wire.user u (env.Jwt.Mint(u.Id, now ())))
                     | Taken -> return unprocessable "username or email is already taken"
                     | Missing -> return unprocessable "not registered"
@@ -173,7 +177,7 @@ let private applyUserEdit (env: Env) (id: int64) (token: string) (edit: Wire.Use
               PasswordHash = hash
               Bio = edit.Bio
               Image = edit.Image }
-        match! Users.update env.Db id changes with
+        match! Users.update env.Writes id changes with
         | Stored u -> return ok (Wire.user u token)
         | Taken -> return unprocessable "username or email is already taken"
         | Missing -> return unauthorized
@@ -213,7 +217,7 @@ let follow (env: Env) (following: bool) (username: string) : HttpHandler =
     signedIn env (fun viewer _ ->
         respond (fun () ->
             task {
-                match! Profiles.setFollowing env.Db viewer username following with
+                match! Profiles.setFollowing env.Writes viewer username following with
                 | Some p -> return ok (Wire.profile p)
                 | None -> return notFound
             }))
@@ -253,7 +257,7 @@ let createArticle (env: Env) : HttpHandler =
         body Wire.newArticle (fun a ->
             respond (fun () ->
                 task {
-                    let! stored = Articles.create env.Db viewer a.Title a.Description a.Body a.Tags
+                    let! stored = Articles.create env.Db env.Writes viewer a.Title a.Description a.Body a.Tags
                     return created (Wire.article stored)
                 })))
 
@@ -268,7 +272,7 @@ let updateArticle (env: Env) (slug: string) : HttpHandler =
         body Wire.articleEdit (fun edit ->
             respond (fun () ->
                 task {
-                    let! result = Articles.update env.Db viewer slug edit
+                    let! result = Articles.update env.Db env.Writes viewer slug edit
                     return guarded result (Wire.article >> ok)
                 })))
 
@@ -276,7 +280,7 @@ let deleteArticle (env: Env) (slug: string) : HttpHandler =
     signedIn env (fun viewer _ ->
         respond (fun () ->
             task {
-                let! result = Articles.delete env.Db viewer slug
+                let! result = Articles.delete env.Writes viewer slug
                 return guarded result (fun () -> noContent)
             }))
 
@@ -284,7 +288,7 @@ let favorite (env: Env) (on: bool) (slug: string) : HttpHandler =
     signedIn env (fun viewer _ ->
         respond (fun () ->
             task {
-                match! Articles.setFavorite env.Db viewer slug on with
+                match! Articles.setFavorite env.Writes viewer slug on with
                 | Some a -> return ok (Wire.article a)
                 | None -> return notFound
             }))
@@ -303,7 +307,7 @@ let addComment (env: Env) (slug: string) : HttpHandler =
         body Wire.newComment (fun text ->
             respond (fun () ->
                 task {
-                    match! Comments.create env.Db viewer slug text with
+                    match! Comments.create env.Writes viewer slug text with
                     | Some c -> return created (Wire.comment c)
                     | None -> return notFound
                 })))
@@ -315,6 +319,6 @@ let deleteComment (env: Env) (slug: string, idText: string) : HttpHandler =
         | ValueSome id ->
             respond (fun () ->
                 task {
-                    let! result = Comments.delete env.Db viewer slug id
+                    let! result = Comments.delete env.Writes viewer slug id
                     return guarded result (fun () -> noContent)
                 }))

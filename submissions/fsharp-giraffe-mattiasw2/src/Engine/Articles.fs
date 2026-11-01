@@ -157,16 +157,27 @@ let private byId (props: Sql.SqlProps) (viewer: ViewerId) (id: int64) =
 
 let private slugOfTitle = slugify "@title"
 
+// SPEC's reference transaction, as two statements of one group-commit write (Commit: only the
+// last statement may return rows). The tags go in first, and the article and its tag links
+// follow in one statement: a later statement of the same transaction sees the new tags, and the
+// links see the article (one statement, FKs checked at its end). Same rows as SPEC's three
+// statements, in the same transaction.
+let private insertTagsSql = "INSERT INTO tags (name) SELECT DISTINCT unnest(@tags::text[]) ON CONFLICT (name) DO NOTHING"
+
 let private insertArticleSql =
-    $"INSERT INTO articles (id, slug, author_id, title, description, body)
-      SELECT n.id, {slugOfTitle} || '-' || n.id, @viewer, @title, @description, @body
-        FROM (SELECT nextval(pg_get_serial_sequence('articles', 'id')) AS id) n
-      RETURNING id"
+    $"WITH n AS (SELECT nextval(pg_get_serial_sequence('articles', 'id')) AS id),
+          a AS (INSERT INTO articles (id, slug, author_id, title, description, body)
+                SELECT n.id, {slugOfTitle} || '-' || n.id, @viewer, @title, @description, @body FROM n
+                RETURNING id),
+          l AS (INSERT INTO article_tags (article_id, tag_id)
+                SELECT a.id, t.id FROM a, tags t WHERE t.name = ANY(@tags::text[]))
+     SELECT id FROM a"
 
 /// SPEC: the article, its tags and its tag links in ONE transaction; the response is read
 /// after the commit.
 let create
     (ds: NpgsqlDataSource)
+    (writes: Commit.Writer)
     (viewer: ViewerId)
     (title: string)
     (description: string)
@@ -174,38 +185,17 @@ let create
     (tags: string[])
     : Task<Article> =
     task {
-        let! id =
-            task {
-                use! conn = ds.OpenConnectionAsync()
-                use! tx = conn.BeginTransactionAsync()
-                let db = Sql.existingConnection conn
-                let! ids =
-                    db
-                    |> Sql.query insertArticleSql
-                    |> Sql.parameters
-                        [ "@viewer", Sql.int64 viewer
-                          "@title", Sql.text title
-                          "@description", Sql.text description
-                          "@body", Sql.text body ]
-                    |> Sql.executeAsync (fun read -> read.int64 "id")
-                let id = List.head ids
-                if tags.Length > 0 then
-                    let! _ =
-                        db
-                        |> Sql.query "INSERT INTO tags (name) SELECT DISTINCT unnest(@tags::text[]) ON CONFLICT (name) DO NOTHING"
-                        |> Sql.parameters [ "@tags", Sql.stringArray tags ]
-                        |> Sql.executeNonQueryAsync
-                    let! _ =
-                        db
-                        |> Sql.query
-                            "INSERT INTO article_tags (article_id, tag_id) SELECT @id, t.id FROM tags t WHERE t.name = ANY(@tags::text[])"
-                        |> Sql.parameters [ "@id", Sql.int64 id; "@tags", Sql.stringArray tags ]
-                        |> Sql.executeNonQueryAsync
-                    ()
-                do! tx.CommitAsync()
-                return id
-            }
-        let! created = byId (Sql.fromDataSource ds) viewer id
+        let article =
+            insertArticleSql,
+            [ "@viewer", Sql.int64 viewer
+              "@title", Sql.text title
+              "@description", Sql.text description
+              "@body", Sql.text body
+              "@tags", Sql.stringArray tags ]
+        let statements =
+            if tags.Length > 0 then [ (insertTagsSql, [ "@tags", Sql.stringArray tags ]); article ] else [ article ]
+        let! ids = writes.Run(statements, fun read -> read.int64 "id")
+        let! created = byId (Sql.fromDataSource ds) viewer (List.head ids)
         return Option.get created
     }
 
@@ -231,13 +221,10 @@ let private deleteSql =
           w AS (DELETE FROM articles a USING t WHERE a.id = t.id AND t.author_id = @viewer)
      SELECT id, author_id FROM t"
 
-let private guarded (ds: NpgsqlDataSource) (sql: string) (viewer: ViewerId) (parameters: (string * SqlValue) list) =
+let private guarded (writes: Commit.Writer) (sql: string) (viewer: ViewerId) (parameters: (string * SqlValue) list) =
     task {
         let! rows =
-            Sql.fromDataSource ds
-            |> Sql.query sql
-            |> Sql.parameters (("@viewer", Sql.int64 viewer) :: parameters)
-            |> Sql.executeAsync (fun read -> read.int64 "id", read.int64 "author_id")
+            writes.Run([ sql, ("@viewer", Sql.int64 viewer) :: parameters ], fun read -> read.int64 "id", read.int64 "author_id")
         return
             match rows with
             | [] -> NotFound
@@ -245,11 +232,11 @@ let private guarded (ds: NpgsqlDataSource) (sql: string) (viewer: ViewerId) (par
             | _ -> NotYours
     }
 
-let update (ds: NpgsqlDataSource) (viewer: ViewerId) (slug: string) (edit: Edit) : Task<Guarded<Article>> =
+let update (ds: NpgsqlDataSource) (writes: Commit.Writer) (viewer: ViewerId) (slug: string) (edit: Edit) : Task<Guarded<Article>> =
     task {
         let! found =
             guarded
-                ds
+                writes
                 updateSql
                 viewer
                 [ "@slug", Sql.text slug
@@ -267,9 +254,9 @@ let update (ds: NpgsqlDataSource) (viewer: ViewerId) (slug: string) (edit: Edit)
         | NotYours -> return NotYours
     }
 
-let delete (ds: NpgsqlDataSource) (viewer: ViewerId) (slug: string) : Task<Guarded<unit>> =
+let delete (writes: Commit.Writer) (viewer: ViewerId) (slug: string) : Task<Guarded<unit>> =
     task {
-        let! found = guarded ds deleteSql viewer [ "@slug", Sql.text slug ]
+        let! found = guarded writes deleteSql viewer [ "@slug", Sql.text slug ]
         return
             match found with
             | Done _ -> Done()
@@ -296,8 +283,12 @@ let private favoriteSql (on: bool) =
 let private favoriteOn = favoriteSql true
 let private favoriteOff = favoriteSql false
 
-let setFavorite (ds: NpgsqlDataSource) (viewer: ViewerId) (slug: string) (on: bool) : Task<Article option> =
-    single
-        (Sql.fromDataSource ds)
-        (if on then favoriteOn else favoriteOff)
-        [ "@viewer", Sql.int64 viewer; "@slug", Sql.text slug ]
+let setFavorite (writes: Commit.Writer) (viewer: ViewerId) (slug: string) (on: bool) : Task<Article option> =
+    task {
+        let! rows =
+            writes.Run(
+                [ (if on then favoriteOn else favoriteOff), [ "@viewer", Sql.int64 viewer; "@slug", Sql.text slug ] ],
+                article true
+            )
+        return List.tryHead rows
+    }

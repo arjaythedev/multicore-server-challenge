@@ -69,14 +69,20 @@ let main args =
     let secret = required "JWT_SECRET"
     let host = setting "HOST" "127.0.0.1"
     let port = int (setting "PORT" "3000")
-    // Multiplexed: these connections carry every request; Postgres does best with a few
-    // busy backends per core, not many idle ones. Rule: 95 or fewer in total.
-    let poolSize = min 95 (int (setting "DB_POOL_SIZE" (string (cores * 3))))
+    // Group commit: WRITE_LANES connections of their own, each committing one group of up to
+    // WRITE_GROUP writes at a time.
+    let writeLanes = max 1 (int (setting "WRITE_LANES" "2"))
+    let writeGroup = max 1 (int (setting "WRITE_GROUP" "128"))
+    // Multiplexed: these connections carry every read; Postgres does best with a few busy
+    // backends per core, not many idle ones. Rule: 95 or fewer in total, lanes included.
+    let poolSize = min (95 - writeLanes) (int (setting "DB_POOL_SIZE" (string (cores * 3))))
     let bcryptLanes = int (setting "BCRYPT_THREADS" (string (max 1 (cores / 2))))
 
     Engine.Passwords.start bcryptLanes
-    let ds = Engine.Db.dataSource (Engine.Db.connectionString databaseUrl poolSize)
-    let env: Handlers.Env = { Db = ds; Jwt = Jwt.Signer secret }
+    let ds = Engine.Db.dataSource (Engine.Db.connectionString databaseUrl poolSize true)
+    let writes =
+        Engine.Commit.Writer(Engine.Db.connectionString databaseUrl writeLanes false, writeLanes, writeGroup)
+    let env: Handlers.Env = { Db = ds; Writes = writes; Jwt = Jwt.Signer secret }
 
     let builder = WebApplication.CreateSlimBuilder(args)
     builder.Logging.ClearProviders() |> ignore
@@ -111,10 +117,14 @@ let main args =
 
     // Touch the database before taking traffic: a bad DATABASE_URL fails here, loudly.
     (Engine.Tags.all ds).GetAwaiter().GetResult() |> ignore
-    eprintfn "conduit (F#, Giraffe on Kestrel) on %s:%d, %d db connections (multiplexed), %d bcrypt lanes" host port poolSize bcryptLanes
+    eprintfn
+        "conduit (F#, Giraffe on Kestrel) on %s:%d, %d db connections (multiplexed) + %d write lanes (groups of <= %d), %d bcrypt lanes"
+        host port poolSize writeLanes writeGroup bcryptLanes
     app.Lifetime.ApplicationStopping.Register(fun () ->
         let hashes, verifies = Engine.Passwords.counts ()
-        eprintfn "bcrypt: %d hashes (sign-ups, password changes), %d verifies (logins)" hashes verifies)
+        eprintfn "bcrypt: %d hashes (sign-ups, password changes), %d verifies (logins)" hashes verifies
+        let groups, written = writes.Counts
+        eprintfn "group commit: %d writes in %d groups" written groups)
     |> ignore
     app.Run()
     0

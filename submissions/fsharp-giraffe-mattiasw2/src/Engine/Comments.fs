@@ -53,13 +53,13 @@ let private createSql =
        FROM c JOIN users u ON u.id = c.author_id"
 
 /// None = no such article. The author is the viewer, who does not follow themselves.
-let create (ds: NpgsqlDataSource) (viewer: ViewerId) (slug: string) (body: string) : Task<Comment option> =
+let create (writes: Commit.Writer) (viewer: ViewerId) (slug: string) (body: string) : Task<Comment option> =
     task {
         let! rows =
-            Sql.fromDataSource ds
-            |> Sql.query createSql
-            |> Sql.parameters [ "@viewer", Sql.int64 viewer; "@slug", Sql.text slug; "@body", Sql.text body ]
-            |> Sql.executeAsync (comment (Some false))
+            writes.Run(
+                [ createSql, [ "@viewer", Sql.int64 viewer; "@slug", Sql.text slug; "@body", Sql.text body ] ],
+                comment (Some false)
+            )
         return List.tryHead rows
     }
 
@@ -69,13 +69,13 @@ let private deleteSql =
           w AS (DELETE FROM comments c USING t WHERE c.id = t.id AND t.author_id = @viewer)
      SELECT author_id FROM t"
 
-let delete (ds: NpgsqlDataSource) (viewer: ViewerId) (slug: string) (id: int64) : Task<Guarded<unit>> =
+let delete (writes: Commit.Writer) (viewer: ViewerId) (slug: string) (id: int64) : Task<Guarded<unit>> =
     task {
         let! rows =
-            Sql.fromDataSource ds
-            |> Sql.query deleteSql
-            |> Sql.parameters [ "@viewer", Sql.int64 viewer; "@slug", Sql.text slug; "@id", Sql.int64 id ]
-            |> Sql.executeAsync (fun read -> read.int64 "author_id")
+            writes.Run(
+                [ deleteSql, [ "@viewer", Sql.int64 viewer; "@slug", Sql.text slug; "@id", Sql.int64 id ] ],
+                fun read -> read.int64 "author_id"
+            )
         return
             match rows with
             | [] -> NotFound
