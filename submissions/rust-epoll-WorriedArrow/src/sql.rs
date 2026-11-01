@@ -58,11 +58,10 @@ pub fn read_statements() -> Vec<Stmt> {
         ),
         s(
             "cmts",
-            "SELECT r.k, a.id, c.id, c.body, c.created_at, c.updated_at, c.author_id, u.username, u.bio, u.image \
+            "SELECT r.k, a.id, c.id, c.body, c.created_at, c.updated_at, c.author_id \
              FROM unnest($1::text[]) WITH ORDINALITY r(slug, k) JOIN articles a ON a.slug = r.slug \
              LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id FROM comments c \
-               WHERE c.article_id = a.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true \
-             LEFT JOIN users u ON u.id = c.author_id",
+               WHERE c.article_id = a.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true",
             &[TEXT_ARRAY],
         ),
         // Lists: one statement per filter returns the capped counts (k <= 0: -k is the count key, the count in
@@ -124,7 +123,9 @@ pub fn read_statements() -> Vec<Stmt> {
         // whole batch: whether they have 1,000+ articles (then every viewer following one counts 1,000 without
         // scanning), and the id of their depth-th newest article (a floor: a page of depth d is made of articles at
         // least that new, so every other followee's scan stops there). Other followees are read per viewer, at most
-        // limit + offset newest ids each, from articles_author_idx.
+        // limit + offset newest ids each, from articles_author_idx. Page rows are ids and authors only (index-only);
+        // the articles' columns are read once per distinct article in phase B ("artrow"), since popular followees'
+        // newest articles are on many viewers' pages at once.
         s(
             "feed",
             format!(
@@ -144,18 +145,27 @@ pub fn read_statements() -> Vec<Stmt> {
                    ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = ANY(u.fids) LIMIT 1000) s) END, {PAD} \
                  FROM u \
                  UNION ALL \
-                 SELECT p.k, {COLS} FROM unnest($2::int8[], $3::int8[], $4::int8[]) WITH ORDINALITY p(v, lim, off, k) \
+                 SELECT p.k, x.id, x.fid, NULL::text, NULL::text, NULL::text, NULL::timestamptz, NULL::timestamptz \
+                 FROM unnest($2::int8[], $3::int8[], $4::int8[]) WITH ORDINALITY p(v, lim, off, k) \
                  JOIN u ON u.v = p.v \
                  CROSS JOIN LATERAL (SELECT COALESCE(max(h.floor_id), 0) AS floor_id FROM hubs h WHERE h.fid = ANY(u.fids)) fl \
-                 CROSS JOIN LATERAL (SELECT y.id FROM unnest(u.fids) f(fid) CROSS JOIN LATERAL \
-                   (SELECT a2.id FROM articles a2 WHERE a2.author_id = f.fid AND a2.id >= fl.floor_id \
+                 CROSS JOIN LATERAL (SELECT y.id, y.fid FROM unnest(u.fids) f(fid) CROSS JOIN LATERAL \
+                   (SELECT a2.id, f.fid FROM articles a2 WHERE a2.author_id = f.fid AND a2.id >= fl.floor_id \
                      ORDER BY a2.id DESC LIMIT p.lim + p.off) y \
-                   ORDER BY y.id DESC LIMIT p.lim OFFSET p.off) x \
-                 JOIN articles a ON a.id = x.id"
+                   ORDER BY y.id DESC LIMIT p.lim OFFSET p.off) x"
             ),
             &[INT8_ARRAY, INT8_ARRAY, INT8_ARRAY, INT8_ARRAY],
         ),
         // ---- phase B: enrichment over the union of everything phase A referenced ----
+        // Article columns for articles phase A only returned ids for (feed pages), in the page-row layout.
+        s(
+            "artrow",
+            format!("SELECT 0::int8, {COLS} FROM articles a WHERE a.id = ANY($1::int8[])"),
+            &[INT8_ARRAY],
+        ),
+        // Comment authors' profile columns, for the sorted distinct ids of every comment in the batch: one ordered
+        // walk of the primary key instead of a probe per comment row.
+        s("auser", "SELECT u.id, u.username, u.bio, u.image FROM users u WHERE u.id = ANY($1::int8[])", &[INT8_ARRAY]),
         // One row per distinct article: its tag ids, its favorite count, its author's profile columns.
         s(
             "artx",
@@ -184,8 +194,6 @@ const SLUGIFY: &str = "trim(both '-' from lower(regexp_replace($2, '[^A-Za-z0-9]
 
 pub fn write_statements() -> Vec<Stmt> {
     vec![
-        s("begin", "BEGIN", &[]),
-        s("commit", "COMMIT", &[]),
         s(
             "register",
             "INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING \
@@ -269,7 +277,7 @@ pub fn write_statements() -> Vec<Stmt> {
             "WITH r AS MATERIALIZED (SELECT x.k, x.uid, x.body, a.id AS aid \
                FROM unnest($1::int8[], $2::text[], $3::text[]) WITH ORDINALITY x(uid, slug, body, k) \
                JOIN articles a ON a.slug = x.slug ORDER BY x.k), \
-             ids AS MATERIALIZED (SELECT s.k, s.uid, s.body, s.aid, nextval(pg_get_serial_sequence('comments', 'id')) AS id \
+             ids AS MATERIALIZED (SELECT s.k, s.uid, s.body, s.aid, nextval('comments_id_seq'::regclass) AS id \
                FROM (SELECT * FROM r ORDER BY k OFFSET 0) s), \
              c AS (INSERT INTO comments (id, article_id, author_id, body) SELECT id, aid, uid, body FROM ids \
                RETURNING id, body, created_at, updated_at, author_id) \
@@ -282,7 +290,7 @@ pub fn write_statements() -> Vec<Stmt> {
             format!(
                 "INSERT INTO articles (id, slug, author_id, title, description, body) \
                  SELECT n.id, {SLUGIFY} || '-' || n.id, $1, $2, $3, $4 \
-                 FROM (SELECT nextval(pg_get_serial_sequence('articles', 'id')) AS id) n RETURNING id"
+                 FROM (SELECT nextval('articles_id_seq'::regclass) AS id) n RETURNING id"
             ),
             &[crate::pg::INT8, crate::pg::TEXT, crate::pg::TEXT, crate::pg::TEXT],
         ),
@@ -295,7 +303,7 @@ pub fn write_statements() -> Vec<Stmt> {
         s(
             "arttags",
             "INSERT INTO article_tags (article_id, tag_id) \
-             SELECT currval(pg_get_serial_sequence('articles', 'id')), t.id FROM tags t WHERE t.name = ANY($1::text[])",
+             SELECT currval('articles_id_seq'::regclass), t.id FROM tags t WHERE t.name = ANY($1::text[])",
             &[TEXT_ARRAY],
         ),
         s(

@@ -28,6 +28,13 @@ fn decode(buffer: []u8, text: []const u8) ![]const u8 {
 }
 
 pub const Identity = struct { id: i64, token: []const u8 };
+const Header = struct { alg: []const u8 };
+const Claims = struct {
+    sub: []const u8,
+    exp: std.json.Value,
+    // An absent iat is permitted; a present non-integer is still rejected.
+    iat: std.json.Value = .{ .integer = 0 },
+};
 
 pub fn verify(allocator: std.mem.Allocator, secret: []const u8, authorization: ?[]const u8, now: i64) !Identity {
     const header_value = authorization orelse return error.InvalidToken;
@@ -45,22 +52,18 @@ pub fn verify(allocator: std.mem.Allocator, secret: []const u8, authorization: ?
     Hmac.create(&expected, token[0 .. header.len + 1 + claims.len], secret);
     if (!std.crypto.timing_safe.eql(@TypeOf(actual), actual, expected)) return error.InvalidToken;
     var header_buffer: [512]u8 = undefined;
-    const parsed_header = try std.json.parseFromSlice(std.json.Value, allocator, try decode(&header_buffer, header), .{});
+    const parsed_header = try std.json.parseFromSlice(Header, allocator, try decode(&header_buffer, header), .{ .ignore_unknown_fields = true, .allocate = .alloc_if_needed });
     defer parsed_header.deinit();
-    if (parsed_header.value != .object) return error.InvalidToken;
-    const alg = parsed_header.value.object.get("alg") orelse return error.InvalidToken;
-    if (alg != .string or !std.mem.eql(u8, alg.string, "HS256")) return error.InvalidToken;
+    if (!std.mem.eql(u8, parsed_header.value.alg, "HS256")) return error.InvalidToken;
     var claims_buffer: [max_token]u8 = undefined;
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, try decode(&claims_buffer, claims), .{});
+    const parsed = try std.json.parseFromSlice(Claims, allocator, try decode(&claims_buffer, claims), .{ .ignore_unknown_fields = true, .allocate = .alloc_if_needed });
     defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidToken;
-    const exp = parsed.value.object.get("exp") orelse return error.InvalidToken;
-    if (exp != .integer or exp.integer <= now) return error.InvalidToken;
-    if (parsed.value.object.get("iat")) |iat| if (iat != .integer) return error.InvalidToken;
-    const sub = parsed.value.object.get("sub") orelse return error.InvalidToken;
-    if (sub != .string or sub.string.len == 0) return error.InvalidToken;
-    for (sub.string) |ch| if (ch < '0' or ch > '9') return error.InvalidToken;
-    const id = std.fmt.parseInt(i64, sub.string, 10) catch return error.InvalidToken;
+    if (parsed.value.exp != .integer or parsed.value.exp.integer <= now) return error.InvalidToken;
+    if (parsed.value.iat != .integer) return error.InvalidToken;
+    const sub = parsed.value.sub;
+    if (sub.len == 0) return error.InvalidToken;
+    for (sub) |ch| if (ch < '0' or ch > '9') return error.InvalidToken;
+    const id = std.fmt.parseInt(i64, sub, 10) catch return error.InvalidToken;
     if (id <= 0) return error.InvalidToken;
     return .{ .id = id, .token = token };
 }
@@ -75,4 +78,32 @@ test "HS256 round trip, expiry, signature and exact scheme" {
     try std.testing.expectError(error.InvalidToken, verify(a, "wrong", header, 1001));
     try std.testing.expectError(error.InvalidToken, verify(a, "secret", header, 1000 + lifetime));
     try std.testing.expectError(error.InvalidToken, verify(a, "secret", token, 1001));
+}
+
+test "JWT typed parsing retains strict claim types and accepts unrelated claims" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = [_]struct { claims: []const u8, valid: bool }{
+        .{ .claims = "{\"sub\":\"42\",\"exp\":2000}", .valid = true },
+        .{ .claims = "{\"sub\":\"42\",\"exp\":2000,\"other\":{\"nested\":[1,true,null]}}", .valid = true },
+        .{ .claims = "{\"sub\":\"42\",\"exp\":2000.0}", .valid = false },
+        .{ .claims = "{\"sub\":\"42\",\"exp\":\"2000\"}", .valid = false },
+        .{ .claims = "{\"sub\":\"42\",\"exp\":2000,\"iat\":null}", .valid = false },
+        .{ .claims = "{\"sub\":42,\"exp\":2000}", .valid = false },
+        .{ .claims = "{\"sub\":\"0\",\"exp\":2000}", .valid = false },
+        .{ .claims = "{\"sub\":\"42\",\"exp\":1000}", .valid = false },
+    };
+    for (cases) |item| {
+        const message = try std.fmt.allocPrint(a, "{s}.{s}", .{ try encode(a, "{\"alg\":\"HS256\",\"typ\":\"JWT\"}"), try encode(a, item.claims) });
+        var mac: [Hmac.mac_length]u8 = undefined;
+        Hmac.create(&mac, message, "secret");
+        const authorization = try std.fmt.allocPrint(a, "Token {s}.{s}", .{ message, try encode(a, &mac) });
+        const result = verify(a, "secret", authorization, 1000);
+        if (item.valid) {
+            try std.testing.expectEqual(@as(i64, 42), (try result).id);
+        } else if (result) |_| {
+            return error.UnexpectedValidToken;
+        } else |_| {}
+    }
 }

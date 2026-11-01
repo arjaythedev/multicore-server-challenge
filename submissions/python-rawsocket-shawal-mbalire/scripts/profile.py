@@ -1,6 +1,6 @@
 """Per-endpoint Python CPU (single thread, real DB) + cProfile top functions.
 
-    PYTHONPATH=. .venv/bin/python scripts/profile.py      # needs the conduit_lg full-seed copy
+    PYTHONPATH=. .venv/bin/python scripts/profile.py      # needs the full seed in conduit_full
 """
 import cProfile
 import pstats
@@ -10,16 +10,18 @@ import warnings
 from psycopg_pool import ConnectionPool
 
 import conduit_server.adapters.inbound.controllers as controllers
-from conduit_server.adapters.inbound.router import router, parse_request
+from conduit_server.adapters.inbound.router import router, parse_request, use_json
 from conduit_server.adapters.outbound.pg_repository import PostgresUserRepository, configure_connection
-from conduit_server.adapters.outbound.crypto_adapter import JoseBcryptCryptoAdapter
+from conduit_server.adapters.outbound.crypto_adapter import BcryptPasswordHasher, Hs256TokenService
+from conduit_server.adapters.outbound.json_codec import OrjsonCodec
 
 warnings.filterwarnings("ignore")
-pool = ConnectionPool("postgres://conduit:conduit@127.0.0.1:5432/conduit_lg", min_size=1, max_size=1,
+pool = ConnectionPool("postgres://conduit:conduit@127.0.0.1:5432/conduit_full", min_size=1, max_size=1,
                       configure=configure_connection, open=True)
-crypto = JoseBcryptCryptoAdapter("dev-secret")
-controllers.bootstrap(PostgresUserRepository(pool), crypto)
-tok = crypto.issue_token(5)
+tokens = Hs256TokenService("dev-secret")
+use_json(OrjsonCodec)
+controllers.bootstrap(PostgresUserRepository(pool), BcryptPasswordHasher(), tokens, OrjsonCodec)
+tok = tokens.issue_token(5)
 with pool.connection() as conn:
     slug = conn.execute("SELECT slug FROM articles WHERE id = 499000").fetchone()[0]
 auth = f"Authorization: Token {tok}\r\n"

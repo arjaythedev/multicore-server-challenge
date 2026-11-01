@@ -41,10 +41,21 @@ class ReadKind(
      * while being served (GET /api/tags; the #1 entry does the same).
      */
     val broadcast: Boolean = false,
+    /** [Sharing.GROUPS]: the statement returns each group's rows once, see [Sharing]. */
+    val sharing: Sharing = Sharing.NONE,
 ) {
     /** Assigned by [Db.start]: index into the kind table. */
     var id: Int = -1
 }
+
+/**
+ * How a read kind's requests share rows ([ReadKind.sharing]). A shared kind's statement returns the rows of each group of
+ * requests with the same (key, limit, offset) ONCE, tagged with the batch index of the group's first request, plus flag
+ * rows `(-1 - i, flag int8, NULL...)` for the requests whose viewer favorites/follows something in the rows; the pool hands
+ * every request of a group views of its first request's rows and the request's own flags ([conduit.pg.Result.hasFlag]).
+ * Postgres serializes and the pool parses each distinct page or thread once instead of once per request.
+ */
+enum class Sharing { NONE, GROUPS }
 
 /** A single-statement write (or a write-adjacent read that must run on a write connection). */
 class WriteStmt(

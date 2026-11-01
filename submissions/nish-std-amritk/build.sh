@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds the server as a normal user -> bin/conduit, with the compiler and
-# LLVM install.sh put in place (nish 0.23.1, clang-18). The program has no
+# LLVM install.sh put in place (nish 0.29.0, clang-18). The program has no
 # other dependency: everything it imports is Nish's standard library.
 set -euo pipefail
 cd "$(dirname "$0")"

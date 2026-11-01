@@ -1,8 +1,8 @@
 """PostgreSQL adapter implementing all Conduit SQL from the challenge SPEC.
 
-Single rows are shaped into plain dicts, list rows stay tuples (orders in ports.outbound); timestamps arrive
-already formatted as API strings (`_TS`). Article lists and the feed also come as finished JSON response bodies,
-built by Postgres (`list_json_stmt`).
+Every response except the user routes' is a finished JSON body built by Postgres (`json_build_object`), passed
+through as bytes; timestamps are formatted in SQL (`_TS_EXPR`). The user routes' rows are shaped into plain dicts.
+Writes are single statements (CTEs), so each one is atomic on its own in autocommit or behind one pipeline Sync.
 
 Statements run on libpq directly (`conn.pgconn.exec_prepared`): every statement is prepared once per connection
 at connect time, and rows come back in binary format, decoded by one reused psycopg C `Transformer` per connection. psycopg's own
@@ -10,6 +10,7 @@ at connect time, and rows come back in binary format, decoded by one reused psyc
 a few µs and yields the same values.
 """
 
+import os
 import re
 import threading
 import psycopg
@@ -17,8 +18,9 @@ from collections import deque
 from contextlib import contextmanager
 from psycopg import pq
 from psycopg.adapt import Transformer
-from typing import Optional, Tuple, List
+from typing import Optional, List
 
+from conduit_server.domain.errors import DuplicateError
 from conduit_server.domain.services import slugify
 from conduit_server.ports.outbound import ArticleRepositoryPort
 
@@ -32,12 +34,15 @@ _PIPELINE_SYNC = pq.ExecStatus.PIPELINE_SYNC
 class _Stmt:
     """One static statement: its server-side prepared name, `$n` SQL, and column names (fixed per statement)."""
 
-    __slots__ = ("name", "sql", "cols")
+    __slots__ = ("name", "sql", "cols", "index")
 
     def __init__(self, sql: str):
-        n = iter(range(1, 1000))
-        self.name = b"c%d" % len(_STATEMENTS)
-        self.sql = re.sub(r"%s", lambda _: f"${next(n)}", sql).encode()
+        self.index = len(_STATEMENTS)  # same in every process (module-level definitions): the broker's job key
+        self.name = b"c%d" % self.index
+        if "%s" in sql:
+            n = iter(range(1, 1000))
+            sql = re.sub(r"%s", lambda _: f"${next(n)}", sql)
+        self.sql = sql.encode()
         self.cols: Optional[List[str]] = None
         _STATEMENTS.append(self)
 
@@ -54,114 +59,134 @@ FAVORITES_COUNT = (
     "(SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count"
 )
 FAVORITED = (
-    "EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = %s) AS favorited"
+    "($1::bigint <> 0 AND EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1)) AS favorited"
 )
 # Timestamps leave Postgres as the API's strings: RFC 3339 UTC, milliseconds truncated (to_char's MS truncates).
 # ~320 ns of Postgres per value, against ~750 ns of Python to decode and format a timestamptz.
 _TS_EXPR = 'to_char({0} AT TIME ZONE \'UTC\', \'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"\')'
-_TS = _TS_EXPR + " AS {1}"
-
-
-def ts_cols(alias: str) -> str:
-    return f"{_TS.format(alias + '.created_at', 'created_at')}, {_TS.format(alias + '.updated_at', 'updated_at')}"
 
 
 FOLLOWING_AUTHOR = (
-    "EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = %s AND fo.followee_id = a.author_id)"
+    "($1::bigint <> 0 AND EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = a.author_id))"
     " AS following"
 )
 
 
-def article_cols(full: bool = False) -> str:
-    body_col = "a.body, " if full else ""
-    return (
-        f"a.id, a.slug, a.title, a.description, {body_col}{ts_cols('a')}, "
-        f"{TAG_LIST_ARRAY}, {FAVORITES_COUNT}, {FAVORITED}, u.username, u.bio, u.image, {FOLLOWING_AUTHOR}"
-    )
-
-
-def article_select(full: bool = False) -> str:
-    return f"SELECT {article_cols(full)} FROM articles a JOIN users u ON u.id = a.author_id"
-
-
 _PAGE_COLS = "a2.id, a2.slug, a2.title, a2.description, a2.created_at, a2.updated_at, a2.author_id"
+_LAT_FAV_JOIN = (
+    " LEFT JOIN LATERAL (SELECT count(*) AS fc,"
+    " ($1::bigint <> 0 AND COALESCE(bool_or(f.user_id = $1), false)) AS fav"
+    " FROM favorites f WHERE f.article_id = a.id) fv ON true"
+)
 
 
-def list_stmt(count_rows: str, page: str) -> _Stmt:
-    """A list page and its capped count in one statement: `c` (one row) LEFT JOINs the page, so an empty page still
-    returns the count. Per-row subqueries run only on the rows left after LIMIT/OFFSET. `page` yields `a2` columns."""
-    return _Stmt(
-        f"WITH c AS (SELECT count(*) AS n FROM ({count_rows} LIMIT 1000) s)"
-        f" SELECT c.n, {article_cols()} FROM c LEFT JOIN ({page}) a ON true"
-        " LEFT JOIN users u ON u.id = a.author_id ORDER BY a.id DESC"
-    )
-
-
-def list_json_stmt(count_rows: str, page: str) -> _Stmt:
-    """`list_stmt` with the response built by Postgres: one row, one json value, the whole
-    {"articles": [...], "articlesCount": n} body (list entries without body, keys in the API's order).
-    Same placeholders in the same order. json_build_object/json_agg cost Postgres ~1 µs per article and save the
-    app ~3 µs (row decode, response objects, JSON encode): a 20-article page 540 → 563 µs of Postgres CPU,
-    81 → 24 µs of app CPU, single-threaded."""
+def list_json_stmt(
+    count_sql: str,
+    page: str,
+    lateral_fav: bool = False,
+    follow_true: bool = False,
+) -> _Stmt:
+    """A list page and its capped count in one statement, the response built by Postgres: one row, one json value,
+    the whole {"articles": [...], "articlesCount": n} body (list entries without body, keys in the API's order).
+    `c` (one row) holds the count, so an empty page still returns it; per-row subqueries run only on the rows left
+    after LIMIT/OFFSET. `page` yields `a2` columns."""
+    fav_count = "fv.fc" if lateral_fav else FAVORITES_COUNT.removesuffix(" AS favorites_count")
+    fav_expr = "fv.fav" if lateral_fav else FAVORITED.removesuffix(" AS favorited")
+    follow_expr = "true" if follow_true else FOLLOWING_AUTHOR.removesuffix(" AS following")
+    lat = _LAT_FAV_JOIN if lateral_fav else ""
     article = (
         "json_build_object('slug', a.slug, 'title', a.title, 'description', a.description,"
         f" 'tagList', {TAG_LIST_ARRAY.removesuffix(' AS tag_list')},"
         f" 'createdAt', {_TS_EXPR.format('a.created_at')}, 'updatedAt', {_TS_EXPR.format('a.updated_at')},"
-        f" 'favorited', {FAVORITED.removesuffix(' AS favorited')},"
-        f" 'favoritesCount', {FAVORITES_COUNT.removesuffix(' AS favorites_count')},"
+        f" 'favorited', {fav_expr},"
+        f" 'favoritesCount', {fav_count},"
         " 'author', json_build_object('username', u.username, 'bio', u.bio, 'image', u.image,"
-        f" 'following', {FOLLOWING_AUTHOR.removesuffix(' AS following')}))"
+        f" 'following', {follow_expr}))"
     )
     return _Stmt(
-        f"WITH c AS (SELECT count(*) AS n FROM ({count_rows} LIMIT 1000) s)"
+        f"WITH c AS ({count_sql})"
         f" SELECT json_build_object('articles', COALESCE((SELECT json_agg({article} ORDER BY a.id DESC)"
-        f" FROM ({page}) a JOIN users u ON u.id = a.author_id), '[]'), 'articlesCount', c.n) FROM c"
+        f" FROM ({page}) a JOIN users u ON u.id = a.author_id{lat}), '[]'), 'articlesCount', c.n) FROM c"
     )
 
 
-# Placeholders in text order: the count's, then viewer, viewer (FAVORITED, FOLLOWING_AUTHOR), then the page's.
 # The counts walk indexes from the oldest end where pages are all-visible (index-only, no heap fetches).
-# Each list as (count rows, page): prepared twice, as rows (list_stmt) and as a JSON body (list_json_stmt).
-_TAG_ID = "(SELECT t.id FROM tags t WHERE t.name = %s)"
+# Global and tag lists have >1,000 rows in practice, so `EXISTS (... OFFSET 999 LIMIT 1)` skips counting when >= 1,000.
+# Inner `LIMIT 100` gives `force_generic_plan` a tight upper bound (100 rows instead of 61,314).
 _NONE_SQL = (
-    "SELECT 1 FROM articles ORDER BY id",
-    f"SELECT {_PAGE_COLS} FROM articles a2 ORDER BY a2.id DESC LIMIT %s OFFSET %s",
+    "SELECT CASE WHEN EXISTS (SELECT 1 FROM articles ORDER BY id OFFSET 999 LIMIT 1) THEN 1000"
+    " ELSE (SELECT count(*) FROM (SELECT 1 FROM articles ORDER BY id LIMIT 1000) s) END AS n",
+    f"SELECT * FROM (SELECT {_PAGE_COLS} FROM articles a2 ORDER BY a2.id DESC LIMIT 100 OFFSET $3::int) b"
+    " ORDER BY b.id DESC LIMIT $2::int",
+    True,
+    False,
 )
 _TAG_SQL = (
-    f"SELECT 1 FROM article_tags at WHERE at.tag_id = {_TAG_ID} ORDER BY at.tag_id, at.article_id",
-    f"SELECT {_PAGE_COLS} FROM (SELECT at.article_id FROM article_tags at WHERE at.tag_id = {_TAG_ID}"
-    " ORDER BY at.article_id DESC LIMIT %s OFFSET %s) p JOIN articles a2 ON a2.id = p.article_id",
+    "SELECT CASE WHEN EXISTS (SELECT 1 FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = $2)"
+    " ORDER BY at.tag_id, at.article_id OFFSET 999 LIMIT 1) THEN 1000"
+    " ELSE (SELECT count(*) FROM (SELECT 1 FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = $2)"
+    " ORDER BY at.tag_id, at.article_id LIMIT 1000) s) END AS n",
+    f"SELECT {_PAGE_COLS} FROM (SELECT * FROM (SELECT at.article_id FROM article_tags at"
+    " WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = $2)"
+    " ORDER BY at.article_id DESC LIMIT 100 OFFSET $4::int) b ORDER BY b.article_id DESC LIMIT $3::int) p"
+    " JOIN articles a2 ON a2.id = p.article_id",
+    True,
+    False,
 )
 _AUTHOR_SQL = (
-    "SELECT 1 FROM articles a3 WHERE a3.author_id = (SELECT u.id FROM users u WHERE u.username = %s)",
-    f"SELECT {_PAGE_COLS} FROM articles a2 WHERE a2.author_id ="
-    " (SELECT au.id FROM users au WHERE au.username = %s) ORDER BY a2.id DESC LIMIT %s OFFSET %s",
+    "SELECT count(*) AS n FROM (SELECT 1 FROM articles a3"
+    " WHERE a3.author_id = (SELECT u.id FROM users u WHERE u.username = $2)"
+    " ORDER BY a3.author_id DESC, a3.id ASC LIMIT 1000) s",
+    f"SELECT * FROM (SELECT {_PAGE_COLS} FROM articles a2"
+    " WHERE a2.author_id = (SELECT au.id FROM users au WHERE au.username = $2)"
+    " ORDER BY a2.id DESC LIMIT 100 OFFSET $4::int) b ORDER BY b.id DESC LIMIT $3::int",
+    False,
+    False,
 )
 _FAVORITED_SQL = (
-    "SELECT 1 FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = %s)",
-    f"SELECT {_PAGE_COLS} FROM (SELECT f.article_id FROM favorites f WHERE f.user_id ="
-    " (SELECT fu.id FROM users fu WHERE fu.username = %s) ORDER BY f.article_id DESC LIMIT %s OFFSET %s) p"
+    "SELECT count(*) AS n FROM (SELECT 1 FROM favorites f"
+    " WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = $2)"
+    " ORDER BY f.user_id, f.article_id LIMIT 1000) s",
+    f"SELECT {_PAGE_COLS} FROM (SELECT * FROM (SELECT f.article_id FROM favorites f"
+    " WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = $2)"
+    " ORDER BY f.article_id DESC LIMIT 100 OFFSET $4::int) b ORDER BY b.article_id DESC LIMIT $3::int) p"
     " JOIN articles a2 ON a2.id = p.article_id",
+    False,
+    False,
+)
+# The feed's count: one index scan over all the followees (`= ANY`, PostgreSQL 17+) instead of one per followee
+# under a nested loop: the same rows, ~20% less time (each index entry passes through fewer executor nodes).
+_FEED_COUNT = (
+    "SELECT count(*) AS n FROM (SELECT 1 FROM articles a3"
+    " WHERE a3.author_id = ANY (ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = {viewer}))"
+    " ORDER BY a3.author_id DESC, a3.id ASC LIMIT 1000) s"
 )
 _FEED_SQL = (
-    "SELECT 1 FROM articles a3 WHERE a3.author_id = ANY(ARRAY(SELECT fo.followee_id FROM follows fo"
-    " WHERE fo.follower_id = %s))",
-    f"SELECT {_PAGE_COLS} FROM (SELECT x.id FROM follows fo CROSS JOIN LATERAL"
+    _FEED_COUNT.format(viewer="$1"),
+    f"SELECT {_PAGE_COLS} FROM (SELECT * FROM (SELECT x.id FROM follows fo CROSS JOIN LATERAL"
     " (SELECT a3.id FROM articles a3 WHERE a3.author_id = fo.followee_id ORDER BY a3.id DESC"
-    " LIMIT (%s::int + %s::int)) x WHERE fo.follower_id = %s ORDER BY x.id DESC LIMIT %s OFFSET %s) p"
-    " JOIN articles a2 ON a2.id = p.id",
+    " LIMIT ($2::int + $3::int)) x WHERE fo.follower_id = $1 ORDER BY x.id DESC LIMIT 100 OFFSET $3::int) b"
+    " ORDER BY b.id DESC LIMIT $2::int) p JOIN articles a2 ON a2.id = p.id",
+    False,
+    True,
 )
-_LIST_NONE, _LIST_NONE_JSON = list_stmt(*_NONE_SQL), list_json_stmt(*_NONE_SQL)
-_LIST_TAG, _LIST_TAG_JSON = list_stmt(*_TAG_SQL), list_json_stmt(*_TAG_SQL)
-_LIST_AUTHOR, _LIST_AUTHOR_JSON = list_stmt(*_AUTHOR_SQL), list_json_stmt(*_AUTHOR_SQL)
-_LIST_FAVORITED, _LIST_FAVORITED_JSON = list_stmt(*_FAVORITED_SQL), list_json_stmt(*_FAVORITED_SQL)
-_LIST_FEED, _LIST_FEED_JSON = list_stmt(*_FEED_SQL), list_json_stmt(*_FEED_SQL)
+_LIST_NONE_JSON = list_json_stmt(*_NONE_SQL)
+_LIST_TAG_JSON = list_json_stmt(*_TAG_SQL)
+_LIST_AUTHOR_JSON = list_json_stmt(*_AUTHOR_SQL)
+_LIST_FAVORITED_JSON = list_json_stmt(*_FAVORITED_SQL)
+_LIST_FEED_JSON = list_json_stmt(*_FEED_SQL)
 
 
 _USER_COLS = "id, username, email, bio, image"
-_COMMENT_COLS = (
-    f"c.id, c.body, {ts_cols('c')}, u.username, u.bio, u.image,"
-    " EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = %s AND fo.followee_id = c.author_id) AS following"
+_FULL_ARTICLE_JSON = (
+    "json_build_object('article', json_build_object("
+    "'slug', a.slug, 'title', a.title, 'description', a.description, 'body', a.body,"
+    f" 'tagList', {TAG_LIST_ARRAY.removesuffix(' AS tag_list')},"
+    f" 'createdAt', {_TS_EXPR.format('a.created_at')}, 'updatedAt', {_TS_EXPR.format('a.updated_at')},"
+    f" 'favorited', {FAVORITED.removesuffix(' AS favorited')},"
+    f" 'favoritesCount', {FAVORITES_COUNT.removesuffix(' AS favorites_count')},"
+    " 'author', json_build_object('username', u.username, 'bio', u.bio, 'image', u.image,"
+    f" 'following', {FOLLOWING_AUTHOR.removesuffix(' AS following')})))"
 )
 
 _REGISTER_USER = _Stmt(
@@ -177,70 +202,325 @@ _UPDATE_USER = _Stmt(
     " image = COALESCE(%s, image) WHERE id = %s"
     f" RETURNING {_USER_COLS}"
 )
-_PROFILE = _Stmt(
-    "SELECT u.id, u.username, u.bio, u.image,"
-    " EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = %s AND fo.followee_id = u.id)"
-    " AS following FROM users u WHERE u.username = %s"
+_PROFILE_JSON = _Stmt(
+    "SELECT json_build_object('profile', json_build_object("
+    "'username', u.username, 'bio', u.bio, 'image', u.image,"
+    " 'following', ($1::bigint <> 0 AND EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = u.id))))"
+    " FROM users u WHERE u.username = $2"
 )
-_FOLLOW = _Stmt(
-    "INSERT INTO follows (follower_id, followee_id) VALUES (%s, %s) ON CONFLICT DO NOTHING"
+_FOLLOW_JSON = _Stmt(
+    "WITH u AS (SELECT id, username, bio, image FROM users WHERE username = $2),"
+    " w AS (INSERT INTO follows (follower_id, followee_id) SELECT $1, u.id FROM u ON CONFLICT DO NOTHING)"
+    " SELECT json_build_object('profile', json_build_object("
+    "'username', u.username, 'bio', u.bio, 'image', u.image, 'following', true)) FROM u"
 )
-_UNFOLLOW = _Stmt("DELETE FROM follows WHERE follower_id = %s AND followee_id = %s")
-_TAGS = _Stmt("SELECT ARRAY(SELECT name FROM tags ORDER BY name)")  # one row, one array to decode
-_ARTICLE_BY_SLUG = _Stmt(f"{article_select(full=True)} WHERE a.slug = %s")
-_ARTICLE_BY_ID = _Stmt(f"{article_select(full=True)} WHERE a.id = %s")
-_ARTICLE_FOR_WRITE = _Stmt("SELECT id, author_id FROM articles WHERE slug = %s")
-_INSERT_ARTICLE = _Stmt(
-    "INSERT INTO articles (id, slug, author_id, title, description, body)"
-    " SELECT n.id, %s || '-' || n.id, %s, %s, %s, %s"
-    " FROM (SELECT nextval(pg_get_serial_sequence('articles', 'id')) AS id) n"
-    " RETURNING id"
+_UNFOLLOW_JSON = _Stmt(
+    "WITH u AS (SELECT id, username, bio, image FROM users WHERE username = $2),"
+    " w AS (DELETE FROM follows WHERE follower_id = $1 AND followee_id = (SELECT id FROM u))"
+    " SELECT json_build_object('profile', json_build_object("
+    "'username', u.username, 'bio', u.bio, 'image', u.image, 'following', false)) FROM u"
 )
-_INSERT_TAGS = _Stmt(
-    "INSERT INTO tags (name) SELECT DISTINCT unnest(%s::text[]) ON CONFLICT (name) DO NOTHING"
+_TAGS_JSON = _Stmt("SELECT json_build_object('tags', COALESCE((SELECT json_agg(t.name ORDER BY t.name) FROM tags t), '[]'))")
+_ARTICLE_BY_SLUG_JSON = _Stmt(
+    f"SELECT {_FULL_ARTICLE_JSON} FROM articles a JOIN users u ON u.id = a.author_id WHERE a.slug = $2"
 )
-_INSERT_ARTICLE_TAGS = _Stmt(
-    "INSERT INTO article_tags (article_id, tag_id)"
-    " SELECT %s::int, t.id FROM tags t WHERE t.name = ANY(%s::text[])"
+_CREATE_ARTICLE_JSON = _Stmt(
+    "WITH n AS (SELECT nextval(pg_get_serial_sequence('articles', 'id')) AS id),"
+    " ins_a AS (INSERT INTO articles (id, slug, author_id, title, description, body)"
+    " SELECT n.id, $2 || '-' || n.id, $1, $3, $4, $5 FROM n"
+    " RETURNING id, slug, title, description, body, created_at, updated_at, author_id),"
+    " req_tags AS (SELECT DISTINCT unnest($6::text[]) AS name),"
+    " ex_tags AS (SELECT t.id, t.name FROM tags t JOIN req_tags r ON t.name = r.name),"
+    # Tags missing from this statement's snapshot. DO UPDATE (not DO NOTHING): if another request commits the same
+    # new tag meanwhile, the snapshot can't see its row, but DO UPDATE returns it, so the article_tags row isn't lost.
+    # Only tags absent from ex_tags get here, so existing tags are never rewritten.
+    " new_tags AS (INSERT INTO tags (name)"
+    " SELECT r.name FROM req_tags r WHERE NOT EXISTS (SELECT 1 FROM ex_tags e WHERE e.name = r.name)"
+    " ORDER BY r.name ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id, name),"
+    " all_tags AS (SELECT id, name FROM ex_tags UNION ALL SELECT id, name FROM new_tags),"
+    " ins_at AS (INSERT INTO article_tags (article_id, tag_id)"
+    " SELECT ins_a.id, at.id FROM ins_a CROSS JOIN all_tags at)"
+    " SELECT json_build_object('article', json_build_object("
+    "'slug', a.slug, 'title', a.title, 'description', a.description, 'body', a.body,"
+    " 'tagList', COALESCE((SELECT json_agg(r.name ORDER BY r.name) FROM req_tags r), '[]'),"
+    f" 'createdAt', {_TS_EXPR.format('a.created_at')}, 'updatedAt', {_TS_EXPR.format('a.updated_at')},"
+    " 'favorited', false, 'favoritesCount', 0,"
+    " 'author', json_build_object('username', u.username, 'bio', u.bio, 'image', u.image,"
+    f" 'following', {FOLLOWING_AUTHOR.removesuffix(' AS following')})))"  # true if the author follows themselves
+    " FROM ins_a a JOIN users u ON u.id = a.author_id"
 )
-_UPDATE_ARTICLE = _Stmt(
-    "UPDATE articles SET title = COALESCE(%s, title), description = COALESCE(%s, description),"
-    " body = COALESCE(%s, body),"
-    " slug = CASE WHEN %s::text IS NULL THEN slug ELSE %s || '-' || id END,"
-    " updated_at = now() WHERE id = %s"
+_UPDATE_ARTICLE_BY_SLUG_JSON = _Stmt(
+    "WITH t AS (SELECT id, author_id FROM articles WHERE slug = $2),"
+    " u_art AS (UPDATE articles SET title = COALESCE($3, title), description = COALESCE($4, description),"
+    " body = COALESCE($5, body),"
+    " slug = CASE WHEN $6::text IS NULL THEN slug ELSE $6 || '-' || id END,"
+    " updated_at = now() WHERE id = (SELECT id FROM t WHERE author_id = $1)"
+    " RETURNING id, slug, title, description, body, created_at, updated_at, author_id)"
+    " SELECT t.author_id, (SELECT json_build_object('article', json_build_object("
+    "'slug', a.slug, 'title', a.title, 'description', a.description, 'body', a.body,"
+    f" 'tagList', {TAG_LIST_ARRAY.removesuffix(' AS tag_list')},"
+    f" 'createdAt', {_TS_EXPR.format('a.created_at')}, 'updatedAt', {_TS_EXPR.format('a.updated_at')},"
+    f" 'favorited', {FAVORITED.removesuffix(' AS favorited')},"
+    f" 'favoritesCount', {FAVORITES_COUNT.removesuffix(' AS favorites_count')},"
+    " 'author', json_build_object('username', u.username, 'bio', u.bio, 'image', u.image,"
+    f" 'following', {FOLLOWING_AUTHOR.removesuffix(' AS following')})))"
+    " FROM u_art a JOIN users u ON u.id = a.author_id)::text FROM t"
 )
-_DELETE_ARTICLE = _Stmt("DELETE FROM articles WHERE id = %s")
-_FAVORITE = _Stmt(
-    "INSERT INTO favorites (user_id, article_id) VALUES (%s, %s) ON CONFLICT DO NOTHING"
+_DELETE_ARTICLE_BY_SLUG = _Stmt(
+    "WITH t AS (SELECT id, author_id FROM articles WHERE slug = $2),"
+    " d AS (DELETE FROM articles WHERE id = (SELECT id FROM t WHERE author_id = $1))"
+    " SELECT t.author_id FROM t"
 )
-_UNFAVORITE = _Stmt("DELETE FROM favorites WHERE user_id = %s AND article_id = %s")
-_COMMENTS = _Stmt(
-    f"SELECT {_COMMENT_COLS} FROM comments c JOIN users u ON u.id = c.author_id"
-    " WHERE c.article_id = %s ORDER BY c.created_at DESC, c.id DESC LIMIT 100"
+
+
+# Favorite / unfavorite in ONE statement: CTE `w` does the write (RETURNING 1 per row inserted/deleted, empty when
+# nothing changed) and the same statement returns the article's response body. Commands in one statement can't see
+# one another's effects, so favorited and favoritesCount adjust by w's row count.
+def _toggle_json_stmt(write: str, count_op: str, favorited_op: str) -> _Stmt:
+    return _Stmt(
+        f"WITH w AS ({write}"
+        " RETURNING 1)"
+        " SELECT json_build_object('article', json_build_object("
+        "'slug', a.slug, 'title', a.title, 'description', a.description, 'body', a.body,"
+        f" 'tagList', {TAG_LIST_ARRAY.removesuffix(' AS tag_list')},"
+        f" 'createdAt', {_TS_EXPR.format('a.created_at')}, 'updatedAt', {_TS_EXPR.format('a.updated_at')},"
+        f" 'favorited', ({FAVORITED.removesuffix(' AS favorited')} {favorited_op} EXISTS (SELECT 1 FROM w)),"
+        f" 'favoritesCount', ({FAVORITES_COUNT.removesuffix(' AS favorites_count')} {count_op}"
+        " (SELECT count(*) FROM w)),"
+        " 'author', json_build_object('username', u.username, 'bio', u.bio, 'image', u.image,"
+        f" 'following', {FOLLOWING_AUTHOR.removesuffix(' AS following')})))"
+        " FROM articles a JOIN users u ON u.id = a.author_id WHERE a.slug = $2"
+    )
+
+
+_FAVORITE_WRITE = (
+    "INSERT INTO favorites (user_id, article_id) SELECT $1, a.id FROM articles a WHERE a.slug = $2"
+    " ON CONFLICT DO NOTHING"
 )
-# Article lookup and its comments in one statement: no row = no article; one all-NULL row = no comments.
-_COMMENTS_BY_SLUG = _Stmt(
-    f"SELECT {_COMMENT_COLS}"
-    " FROM articles a LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id"
-    " FROM comments c WHERE c.article_id = a.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true"
-    " LEFT JOIN users u ON u.id = c.author_id"
-    " WHERE a.slug = %s ORDER BY c.created_at DESC, c.id DESC"
+_UNFAVORITE_WRITE = (
+    "DELETE FROM favorites WHERE user_id = $1"
+    " AND article_id = (SELECT a.id FROM articles a WHERE a.slug = $2)"
 )
-_CREATE_COMMENT = _Stmt(
-    "WITH c AS (INSERT INTO comments (article_id, author_id, body) VALUES (%s, %s, %s)"
-    " RETURNING id, body, created_at, updated_at, author_id)"
-    f" SELECT c.id, c.body, {ts_cols('c')}, u.username, u.bio, u.image"
+_FAVORITE_JSON = _toggle_json_stmt(_FAVORITE_WRITE, count_op="+", favorited_op="OR")
+_UNFAVORITE_JSON = _toggle_json_stmt(_UNFAVORITE_WRITE, count_op="-", favorited_op="AND NOT")
+_COMMENTS_BY_SLUG_JSON = _Stmt(
+    "SELECT json_build_object('comments', COALESCE((SELECT json_agg(json_build_object("
+    "'id', c.id,"
+    f" 'createdAt', {_TS_EXPR.format('c.created_at')}, 'updatedAt', {_TS_EXPR.format('c.updated_at')},"
+    " 'body', c.body,"
+    " 'author', json_build_object('username', u.username, 'bio', u.bio, 'image', u.image,"
+    " 'following', ($1::bigint <> 0 AND EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = c.author_id))))"
+    " ORDER BY c.created_at DESC, c.id DESC)"
+    " FROM (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id"
+    " FROM comments c WHERE c.article_id = a.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c"
+    " JOIN users u ON u.id = c.author_id), '[]')) FROM articles a WHERE a.slug = $2"
+)
+_CREATE_COMMENT_BY_SLUG_JSON = _Stmt(
+    "WITH a AS (SELECT id FROM articles WHERE slug = $2),"
+    " c AS (INSERT INTO comments (article_id, author_id, body)"
+    " SELECT a.id, $1, $3 FROM a RETURNING id, body, created_at, updated_at, author_id)"
+    " SELECT json_build_object('comment', json_build_object("
+    "'id', c.id,"
+    f" 'createdAt', {_TS_EXPR.format('c.created_at')}, 'updatedAt', {_TS_EXPR.format('c.updated_at')},"
+    " 'body', c.body,"
+    " 'author', json_build_object('username', u.username, 'bio', u.bio, 'image', u.image,"
+    " 'following', ($1::bigint <> 0 AND EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = $1)))))"
     " FROM c JOIN users u ON u.id = c.author_id"
 )
-_COMMENT_FOR_WRITE = _Stmt(
-    "SELECT c.author_id FROM comments c JOIN articles a ON a.id = c.article_id"
-    " WHERE c.id = %s AND a.slug = %s"
+_DELETE_COMMENT_BY_SLUG = _Stmt(
+    "WITH t AS (SELECT c.id, c.author_id FROM comments c JOIN articles a ON a.id = c.article_id"
+    " WHERE c.id = $3 AND a.slug = $2),"
+    " d AS (DELETE FROM comments WHERE id = (SELECT id FROM t WHERE author_id = $1))"
+    " SELECT t.author_id FROM t"
 )
-_DELETE_COMMENT = _Stmt("DELETE FROM comments WHERE id = %s")
 
 
-class DuplicateError(Exception):
-    pass
+# ---- Batched reads (pg_broker.py) ------------------------------------------------------------------------------
+# One statement for a unit of N queued requests of one kind: parameters are arrays (one element per request), the
+# work the requests share runs once (an article's tags, favorites count and author; the list's capped count), and
+# the result is one row per request, (ord, body) in request order, body NULL where the single statement returns no
+# row. Every body is the same bytes the single statement returns (scripts/batchcheck.py).
+def _text_array(values) -> str:
+    return "{" + ",".join('"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"' for v in values) + "}"
+
+
+def _int_array(values) -> str:
+    return "{" + ",".join(["%d" % v for v in values]) + "}"
+
+
+# Per-article data shared by every request in the unit that shows the article: `w` columns. The units' keys come
+# from CTEs, whose size a generic plan can't know (it merge-joined all of `articles`): each key is looked up through
+# LATERAL with LIMIT 1 (the keys are unique), which keeps the planner from flattening it back into a join: an index
+# probe per key.
+_SHARED_ARTICLE_COLS = (
+    "a.id, a.slug, a.title, a.description, a.author_id,"
+    f" {TAG_LIST_ARRAY.removesuffix(' AS tag_list')} AS tl,"
+    f" {_TS_EXPR.format('a.created_at')} AS ca, {_TS_EXPR.format('a.updated_at')} AS ua,"
+    f" {FAVORITES_COUNT.removesuffix(' AS favorites_count')} AS fc,"
+    " a.username, a.bio, a.image"
+)
+# The viewer's flags, per request (v.viewer) and article (w)
+_V_FAVORITED = "(v.viewer <> 0 AND EXISTS (SELECT 1 FROM favorites f WHERE f.user_id = v.viewer AND f.article_id = w.id))"
+_V_FOLLOWING = (
+    "(v.viewer <> 0 AND EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = v.viewer AND fo.followee_id = w.author_id))"
+)
+
+
+def _w_article_json(with_body: bool, following: str = _V_FOLLOWING) -> str:
+    return (
+        "json_build_object('slug', w.slug, 'title', w.title, 'description', w.description,"
+        + (" 'body', w.body," if with_body else "")
+        + " 'tagList', w.tl, 'createdAt', w.ca, 'updatedAt', w.ua,"
+        f" 'favorited', {_V_FAVORITED}, 'favoritesCount', w.fc,"
+        " 'author', json_build_object('username', w.username, 'bio', w.bio, 'image', w.image,"
+        f" 'following', {following}))"
+    )
+
+
+def _pages_json(article_json: str) -> str:
+    """CTE `j` (ord, a): each request's page as a json array, from `pg` (ord, id) and `w`, in one grouped join (a
+    subquery per request scanned all of `w` each time). Pages that are empty have no row."""
+    return (
+        f", j AS (SELECT pg.ord, json_agg({article_json} ORDER BY w.id DESC) AS a"
+        " FROM pg JOIN w ON w.id = pg.id JOIN v ON v.ord = pg.ord GROUP BY pg.ord)"
+    )
+
+
+# Global list: each request's page is `LIMIT least(lim, 100) OFFSET off` of articles by id (as _NONE_SQL); the
+# article data is built once for the union of the pages, the count once for the unit. The union's DISTINCT reads
+# from unnest(ARRAY(...)): over the CTE, the generic plan sized its hash table for thousands of rows (0.45 ms).
+_LIST_NONE_BATCH = _Stmt(
+    "WITH v AS (SELECT * FROM unnest($1::bigint[], $2::int[], $3::int[]) WITH ORDINALITY AS v(viewer, lim, off, ord)),"
+    f" c AS ({_NONE_SQL[0]}),"
+    " pg AS MATERIALIZED (SELECT v.ord, p.id FROM v CROSS JOIN LATERAL"
+    " (SELECT a2.id FROM articles a2 ORDER BY a2.id DESC LIMIT least(v.lim, 100) OFFSET v.off) p),"
+    f" w AS MATERIALIZED (SELECT {_SHARED_ARTICLE_COLS}"
+    " FROM (SELECT DISTINCT id FROM unnest(ARRAY(SELECT id FROM pg)) id) d CROSS JOIN LATERAL (SELECT a.*, u.username, u.bio, u.image FROM articles a"
+    " JOIN users u ON u.id = a.author_id WHERE a.id = d.id LIMIT 1) a)"
+    f"{_pages_json(_w_article_json(False))}"
+    " SELECT v.ord, json_build_object('articles', COALESCE(j.a, '[]'), 'articlesCount', c.n)"
+    " FROM v CROSS JOIN c LEFT JOIN j ON j.ord = v.ord ORDER BY v.ord"
+)
+# Feed: each request's count and page are its own (as _FEED_SQL, viewer from v); the article data is built once
+# for the union of the pages (popular authors' newest articles are on many feeds).
+_LIST_FEED_BATCH = _Stmt(
+    "WITH v AS (SELECT * FROM unnest($1::bigint[], $2::int[], $3::int[]) WITH ORDINALITY AS v(viewer, lim, off, ord)),"
+    " pg AS MATERIALIZED (SELECT v.ord, p.id FROM v CROSS JOIN LATERAL"
+    " (SELECT * FROM (SELECT x.id FROM follows fo CROSS JOIN LATERAL"
+    " (SELECT a3.id FROM articles a3 WHERE a3.author_id = fo.followee_id ORDER BY a3.id DESC LIMIT (v.lim + v.off)) x"
+    " WHERE fo.follower_id = v.viewer ORDER BY x.id DESC LIMIT 100 OFFSET v.off) b ORDER BY b.id DESC LIMIT v.lim) p),"
+    f" w AS MATERIALIZED (SELECT {_SHARED_ARTICLE_COLS}"
+    " FROM (SELECT DISTINCT id FROM unnest(ARRAY(SELECT id FROM pg)) id) d CROSS JOIN LATERAL (SELECT a.*, u.username, u.bio, u.image FROM articles a"
+    " JOIN users u ON u.id = a.author_id WHERE a.id = d.id LIMIT 1) a)"
+    f"{_pages_json(_w_article_json(False, 'true'))}"
+    " SELECT v.ord, json_build_object('articles', COALESCE(j.a, '[]'), 'articlesCount',"
+    f" ({_FEED_COUNT.format(viewer='v.viewer')}))"
+    " FROM v LEFT JOIN j ON j.ord = v.ord ORDER BY v.ord"
+)
+def _keyed_list_batch(count_sql: str, page_sql: str) -> _Stmt:
+    """A list filtered by a key ($2, the tag or username; $3 limit, $4 offset): the count once per distinct key in the
+    unit, each request's page as the single statement's, the article data once for the union of the pages. Used for
+    author, tag and favorited lists."""
+    count = count_sql.replace("$2", "d.key")
+    page = page_sql.replace("$2", "v.key").replace("$3::int", "v.lim").replace("$4::int", "v.off")
+    return _Stmt(
+        "WITH v AS (SELECT * FROM unnest($1::bigint[], $2::text[], $3::int[], $4::int[])"
+        " WITH ORDINALITY AS v(viewer, key, lim, off, ord)),"
+        f" c AS MATERIALIZED (SELECT d.key, ({count}) AS n FROM (SELECT DISTINCT key FROM unnest($2::text[]) key) d),"
+        f" pg AS MATERIALIZED (SELECT v.ord, p.id FROM v CROSS JOIN LATERAL ({page}) p),"
+        f" w AS MATERIALIZED (SELECT {_SHARED_ARTICLE_COLS}"
+        " FROM (SELECT DISTINCT id FROM unnest(ARRAY(SELECT id FROM pg)) id) d CROSS JOIN LATERAL"
+        " (SELECT a.*, u.username, u.bio, u.image FROM articles a"
+        " JOIN users u ON u.id = a.author_id WHERE a.id = d.id LIMIT 1) a)"
+        f"{_pages_json(_w_article_json(False))}"
+        " SELECT v.ord, json_build_object('articles', COALESCE(j.a, '[]'), 'articlesCount', c.n)"
+        " FROM v JOIN c ON c.key = v.key LEFT JOIN j ON j.ord = v.ord ORDER BY v.ord"
+    )
+
+
+_LIST_AUTHOR_BATCH = _keyed_list_batch(*_AUTHOR_SQL[:2])
+_LIST_TAG_BATCH = _keyed_list_batch(*_TAG_SQL[:2])
+_LIST_FAVORITED_BATCH = _keyed_list_batch(*_FAVORITED_SQL[:2])
+
+
+_ARTICLE_BY_SLUG_BATCH = _Stmt(
+    "WITH v AS (SELECT * FROM unnest($1::bigint[], $2::text[]) WITH ORDINALITY AS v(viewer, slug, ord)),"
+    f" w AS MATERIALIZED (SELECT {_SHARED_ARTICLE_COLS}, a.body"
+    " FROM (SELECT DISTINCT slug FROM unnest($2::text[]) slug) s CROSS JOIN LATERAL"
+    " (SELECT a.*, u.username, u.bio, u.image FROM articles a"
+    " JOIN users u ON u.id = a.author_id WHERE a.slug = s.slug LIMIT 1) a)"
+    f" SELECT v.ord, (SELECT json_build_object('article', {_w_article_json(True)}) FROM w WHERE w.slug = v.slug)"
+    " FROM v ORDER BY v.ord"
+)
+# Comments share little (an article's comments are listed once per request anyway), and a CTE shared by the unit
+# made every request scan all of its comments (163 µs a request under load, worse than single statements): each
+# request runs the single statement's lookup through LATERAL, so the unit saves only per-statement overhead.
+_COMMENTS_BY_SLUG_BATCH = _Stmt(
+    "WITH v AS (SELECT * FROM unnest($1::bigint[], $2::text[]) WITH ORDINALITY AS v(viewer, slug, ord))"
+    " SELECT v.ord, (SELECT json_build_object('comments', COALESCE((SELECT json_agg(json_build_object("
+    "'id', c.id,"
+    f" 'createdAt', {_TS_EXPR.format('c.created_at')}, 'updatedAt', {_TS_EXPR.format('c.updated_at')},"
+    " 'body', c.body,"
+    " 'author', json_build_object('username', u.username, 'bio', u.bio, 'image', u.image,"
+    " 'following', (v.viewer <> 0 AND EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = v.viewer"
+    " AND fo.followee_id = c.author_id))))"
+    " ORDER BY c.created_at DESC, c.id DESC)"
+    " FROM (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id"
+    " FROM comments c WHERE c.article_id = a.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c"
+    " CROSS JOIN LATERAL (SELECT u.username, u.bio, u.image FROM users u WHERE u.id = c.author_id LIMIT 1) u), '[]'))"
+    " FROM articles a WHERE a.slug = v.slug)"
+    " FROM v ORDER BY v.ord"
+)
+
+
+def _viewer_text_params(jobs_args) -> tuple:
+    """(viewer, text) per request -> ($1 bigint[], $2 text[])."""
+    return _int_array([a[0] for a in jobs_args]), _text_array([a[1] for a in jobs_args])
+
+
+def _keyed_list_params(jobs_args) -> tuple:
+    """(viewer, key, limit, offset) per request -> ($1 bigint[], $2 text[], $3 int[], $4 int[])."""
+    return (
+        _int_array([a[0] for a in jobs_args]),
+        _text_array([a[1] for a in jobs_args]),
+        _int_array([a[2] for a in jobs_args]),
+        _int_array([a[3] for a in jobs_args]),
+    )
+
+
+def _list_none_params(jobs_args) -> tuple:
+    return (
+        _int_array([a[0] for a in jobs_args]),
+        _int_array([a[1] for a in jobs_args]),
+        _int_array([a[2] for a in jobs_args]),
+    )
+
+
+class Batched:
+    """How the broker runs a unit of `single`'s requests: as `stmt`, with `params(list of args)`, from `min_size`."""
+
+    __slots__ = ("stmt", "params", "min_size")
+
+    def __init__(self, stmt: _Stmt, params, min_size: int):
+        self.stmt, self.params, self.min_size = stmt, params, min_size
+
+
+# single statement index -> Batched
+BATCHED = {
+    _LIST_NONE_JSON.index: Batched(_LIST_NONE_BATCH, _list_none_params, 4),
+    _LIST_FEED_JSON.index: Batched(_LIST_FEED_BATCH, _list_none_params, 2),
+    _LIST_AUTHOR_JSON.index: Batched(_LIST_AUTHOR_BATCH, _keyed_list_params, 2),
+    _ARTICLE_BY_SLUG_JSON.index: Batched(_ARTICLE_BY_SLUG_BATCH, _viewer_text_params, 2),
+    _COMMENTS_BY_SLUG_JSON.index: Batched(_COMMENTS_BY_SLUG_BATCH, _viewer_text_params, 4),
+}
+# Tag and favorited lists, batched since 2026-10-31: on fresh copies of the seed at 50,000 test users, Postgres 109
+# against 114 µs/request (mean of 6 and 8 runs). On the drifted conduit_full they had measured slower than singles.
+# BATCH_KEYED=0 runs them as singles (A/B).
+if os.getenv("BATCH_KEYED", "1") != "0":
+    BATCHED[_LIST_TAG_JSON.index] = Batched(_LIST_TAG_BATCH, _keyed_list_params, 2)
+    BATCHED[_LIST_FAVORITED_JSON.index] = Batched(_LIST_FAVORITED_BATCH, _keyed_list_params, 2)
+# Statements without parameters whose one result every request in the unit shares
+SHARED = frozenset({_TAGS_JSON.index})
 
 
 def configure_connection(conn: psycopg.Connection) -> None:
@@ -255,6 +535,7 @@ def configure_connection(conn: psycopg.Connection) -> None:
     conn.autocommit = True
     conn.execute("SET jit = off")
     conn.execute("SET enable_seqscan = off")
+    conn.execute("SET enable_memoize = off")
     conn.execute("SET plan_cache_mode = force_generic_plan")
     conn.execute("SET TimeZone = 'UTC'")
     pgconn = conn.pgconn
@@ -308,12 +589,13 @@ class SingleConnection:
     """Pool stand-in for a single-threaded worker: one connection, same `.connection()` contract as
     psycopg_pool.ConnectionPool, minus its locks and background threads. Reconnects if the connection breaks.
     The thread that creates it (the worker's loop) owns `conn`; any other thread (the server's helper for
-    offloaded bcrypt requests) gets its own connection, opened on first use."""
+    offloaded bcrypt requests) gets its own connection. Both open on first use: with the pipeline on, the loop
+    thread never runs a query here, so its connection is never opened."""
 
     def __init__(self, conninfo: str, configure=configure_connection):
         self.conninfo, self.configure = conninfo, configure
         self.owner = threading.get_ident()
-        self.conn = self._connect()
+        self.conn = None
         self._others = threading.local()
 
     def _connect(self) -> psycopg.Connection:
@@ -327,11 +609,12 @@ class SingleConnection:
             return self._other()
         conn = self.conn
         # libpq calls bypass psycopg, so its `broken` flag never flips: ask libpq for the connection state
-        if conn.closed or conn.pgconn.status != _CONN_OK:
-            try:
-                conn.close()
-            except Exception:
-                pass
+        if conn is None or conn.closed or conn.pgconn.status != _CONN_OK:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
             conn = self.conn = self._connect()
         return conn
 
@@ -347,15 +630,15 @@ class SingleConnection:
 
 
 class Query:
-    """One read a handler can wait on without blocking its worker: `row = yield db.q_find_article(...)`.
+    """One read or write a handler can wait on without blocking its worker: `row = yield db.q_find_article(...)`.
     The server runs it on its `PgPipeline`; anywhere else `run()` executes it on the repository's connection.
-    `finish` turns the statement's result (rows as tuples; for `json` statements the body's bytes) into what the
-    repository method of the same name returns."""
+    `finish` turns the statement's result (rows as tuples; for `json` statements the body's bytes or None if 0 rows)
+    into what the repository method of the same name returns."""
 
-    __slots__ = ("repo", "stmt", "args", "json", "finish")
+    __slots__ = ("repo", "stmt", "args", "json", "finish", "write")
 
-    def __init__(self, repo, stmt: _Stmt, args: tuple, finish=None, json: bool = False):
-        self.repo, self.stmt, self.args, self.json, self.finish = repo, stmt, args, json, finish
+    def __init__(self, repo, stmt: _Stmt, args: tuple, finish=None, json: bool = False, write: bool = False):
+        self.repo, self.stmt, self.args, self.json, self.finish, self.write = repo, stmt, args, json, finish, write
 
     def run(self):
         """Synchronously, on the repository's own connection."""
@@ -370,7 +653,7 @@ class Query:
         if status != _TUPLES_OK:
             _raise(res)
         if self.json:
-            return res.get_value(0, 0)
+            return res.get_value(0, 0) if res.ntuples else None
         rows = _load(conn, self.stmt, res)
         return rows if self.finish is None else self.finish(rows)
 
@@ -389,7 +672,7 @@ class PgPipeline:
     def __init__(self, conninfo: str, configure=configure_connection):
         self.conninfo, self.configure = conninfo, configure
         self.inflight: deque = deque()  # (query, token), in submission order
-        self.pending = None  # the head query's result, until its Sync arrives
+        self.pending = []  # the head query's results, until its Sync arrives
         self.conn = self.pg = None
         self._connect()
 
@@ -412,6 +695,15 @@ class PgPipeline:
         pg.pipeline_sync()
         self.inflight.append((query, token))
 
+    def submit_unit(self, unit, token) -> None:
+        """Several statements behind one Sync (pg_broker's group commit): `unit.send(pg)` sends them, and
+        `unit.result(conn, results)` gets every result that came back before the Sync."""
+        if self.pg is None:
+            self._connect()
+        unit.send(self.pg)
+        self.pg.pipeline_sync()
+        self.inflight.append((unit, token))
+
     def flush(self) -> bool:
         """Send what libpq has buffered; True if some is left (wait for the socket to be writable)."""
         if self.pg is None:
@@ -432,12 +724,15 @@ class PgPipeline:
                 if res is None:
                     continue  # end of one query's results; its Sync comes next
                 if res.status != _PIPELINE_SYNC:
-                    self.pending = res
+                    self.pending.append(res)
                     continue
                 query, token = inflight.popleft()
-                res, self.pending = self.pending, None
+                results, self.pending = self.pending, []
                 try:
-                    out.append((token, query.result(self.conn, res), None))
+                    if getattr(query, "multi", False):
+                        out.append((token, query.result(self.conn, results), None))
+                    else:
+                        out.append((token, query.result(self.conn, results[-1]), None))
                 except Exception as e:
                     out.append((token, None, e))
         except psycopg.OperationalError as e:
@@ -450,7 +745,7 @@ class PgPipeline:
         """Fail every query in flight; the next submit reconnects."""
         failed = [(token, None, error) for _, token in self.inflight]
         self.inflight.clear()
-        self.pending = None
+        self.pending = []
         try:
             self.conn.close()
         except Exception:
@@ -483,15 +778,15 @@ class PostgresUserRepository(ArticleRepositoryPort):
         return []
 
     @staticmethod
-    def _run_json(conn, stmt: _Stmt, args) -> bytes:
+    def _run_json(conn, stmt: _Stmt, args) -> Optional[bytes]:
         """Execute a prepared statement whose one row is one json value; its bytes as they are (json's binary
-        format is its text), no row decoding."""
+        format is its text), no row decoding. None if 0 rows."""
         res = conn.pgconn.exec_prepared(stmt.name, _params(args), None, 1)
         if res.status != _TUPLES_OK:
             _raise(res)
-        return res.get_value(0, 0)
+        return res.get_value(0, 0) if res.ntuples else None
 
-    def _json(self, stmt: _Stmt, args) -> bytes:
+    def _json(self, stmt: _Stmt, args) -> Optional[bytes]:
         with self.pool.connection() as conn:
             return self._run_json(conn, stmt, args)
 
@@ -515,8 +810,8 @@ class PostgresUserRepository(ArticleRepositoryPort):
     def find_user_by_email(self, email: str) -> Optional[dict]:
         return self._one(_USER_BY_EMAIL, email)
 
-    def find_user_by_id(self, user_id: int) -> Optional[dict]:
-        return self.q_find_user_by_id(user_id).run()
+    def q_find_user_by_email(self, email: str) -> Query:
+        return Query(self, _USER_BY_EMAIL, (email,), _first_dict(_USER_BY_EMAIL))
 
     def q_find_user_by_id(self, user_id: int) -> Query:
         return Query(self, _USER_BY_ID, (user_id,), _first_dict(_USER_BY_ID))
@@ -535,61 +830,21 @@ class PostgresUserRepository(ArticleRepositoryPort):
         except psycopg.errors.UniqueViolation:
             raise DuplicateError("username or email already taken")
 
-    # ---- profiles / follows ------------------------------------------------
-    def find_profile(self, viewer: int, username: str) -> Optional[dict]:
-        return self.q_find_profile(viewer, username).run()
+    # ---- profiles / follows ------------------------------------------------------
+    def q_find_profile_json(self, viewer: int, username: str) -> Query:
+        return Query(self, _PROFILE_JSON, (viewer, username), json=True)
 
-    def q_find_profile(self, viewer: int, username: str) -> Query:
-        return Query(self, _PROFILE, (viewer, username), _first_dict(_PROFILE))
+    def q_follow_json(self, viewer: int, username: str) -> Query:
+        return Query(self, _FOLLOW_JSON, (viewer, username), json=True, write=True)
 
-    def follow(self, follower_id: int, followee_id: int) -> None:
-        self._exec(_FOLLOW, follower_id, followee_id)
+    def q_unfollow_json(self, viewer: int, username: str) -> Query:
+        return Query(self, _UNFOLLOW_JSON, (viewer, username), json=True, write=True)
 
-    def unfollow(self, follower_id: int, followee_id: int) -> None:
-        self._exec(_UNFOLLOW, follower_id, followee_id)
+    # ---- tags --------------------------------------------------------------------
+    def q_list_tags_json(self) -> Query:
+        return Query(self, _TAGS_JSON, (), json=True)
 
-    # ---- tags --------------------------------------------------------------
-    def list_tags(self) -> List[str]:
-        return self.q_list_tags().run()
-
-    def q_list_tags(self) -> Query:
-        return Query(self, _TAGS, (), _only_value)
-
-    # ---- articles ----------------------------------------------------------
-    def list_articles(
-        self,
-        viewer: int,
-        limit: int,
-        offset: int,
-        filter_kind: str = "none",
-        filter_value: str = "",
-    ) -> Tuple[int, List[tuple]]:
-        if filter_kind == "tag":
-            stmt = _LIST_TAG
-        elif filter_kind == "author":
-            stmt = _LIST_AUTHOR
-        elif filter_kind == "favorited":
-            stmt = _LIST_FAVORITED
-        else:  # none
-            return self._list(_LIST_NONE, (viewer, viewer, limit, offset))
-        return self._list(stmt, (filter_value, viewer, viewer, filter_value, limit, offset))
-
-    def _list(self, stmt: _Stmt, args: tuple) -> Tuple[int, List[tuple]]:
-        """One statement, one round-trip: column 0 is the capped count, the rest an article (all NULL if no page)."""
-        rows = self._rows(stmt, args)
-        total = rows[0][0]
-        if rows[0][1] is None:
-            return total, []
-        return total, [r[1:] for r in rows]  # ARTICLE_ROW order
-
-    def feed_articles(self, viewer: int, limit: int, offset: int) -> Tuple[int, List[tuple]]:
-        return self._list(_LIST_FEED, (viewer, viewer, viewer, limit, offset, viewer, limit, offset))  # count, 2x viewer, page
-
-    def list_articles_json(
-        self, viewer: int, limit: int, offset: int, filter_kind: str = "none", filter_value: str = ""
-    ) -> bytes:
-        return self.q_list_articles_json(viewer, limit, offset, filter_kind, filter_value).run()
-
+    # ---- articles ----------------------------------------------------------------
     def q_list_articles_json(
         self, viewer: int, limit: int, offset: int, filter_kind: str = "none", filter_value: str = ""
     ) -> Query:
@@ -600,89 +855,58 @@ class PostgresUserRepository(ArticleRepositoryPort):
         elif filter_kind == "favorited":
             stmt = _LIST_FAVORITED_JSON
         else:  # none
-            return Query(self, _LIST_NONE_JSON, (viewer, viewer, limit, offset), json=True)
-        return Query(self, stmt, (filter_value, viewer, viewer, filter_value, limit, offset), json=True)
-
-    def feed_articles_json(self, viewer: int, limit: int, offset: int) -> bytes:
-        return self.q_feed_articles_json(viewer, limit, offset).run()
+            return Query(self, _LIST_NONE_JSON, (viewer, limit, offset), json=True)
+        return Query(self, stmt, (viewer, filter_value, limit, offset), json=True)
 
     def q_feed_articles_json(self, viewer: int, limit: int, offset: int) -> Query:
-        args = (viewer, viewer, viewer, limit, offset, viewer, limit, offset)  # count, 2x viewer, page
-        return Query(self, _LIST_FEED_JSON, args, json=True)
+        return Query(self, _LIST_FEED_JSON, (viewer, limit, offset), json=True)
 
-    def find_article(self, viewer: int, slug: str) -> Optional[dict]:
-        return self.q_find_article(viewer, slug).run()
+    def q_find_article_json(self, viewer: int, slug: str) -> Query:
+        return Query(self, _ARTICLE_BY_SLUG_JSON, (viewer, slug), json=True)
 
-    def q_find_article(self, viewer: int, slug: str) -> Query:
-        return Query(self, _ARTICLE_BY_SLUG, (viewer, viewer, slug), _first_dict(_ARTICLE_BY_SLUG))
-
-    def find_article_by_id(self, viewer: int, article_id: int) -> Optional[dict]:
-        return self._one(_ARTICLE_BY_ID, viewer, viewer, article_id)
-
-    def article_for_write(self, slug: str) -> Optional[dict]:
-        return self._one(_ARTICLE_FOR_WRITE, slug)
-
-    def create_article(
+    def q_create_article_json(
         self, author_id: int, title: str, description: str, body: str, tags: List[str]
-    ) -> Optional[int]:
-        s = slugify(title)
-        with self.pool.connection() as conn:
-            pgconn = conn.pgconn
-            pgconn.exec_(b"BEGIN")
-            try:
-                article_id = self._run(conn, _INSERT_ARTICLE, (s, author_id, title, description, body))[0][0]
-                if tags:
-                    self._run(conn, _INSERT_TAGS, (list(tags),))
-                    self._run(conn, _INSERT_ARTICLE_TAGS, (article_id, list(tags)))
-            except BaseException:
-                pgconn.exec_(b"ROLLBACK")
-                raise
-            res = pgconn.exec_(b"COMMIT")
-            if res.status != _COMMAND_OK:
-                _raise(res)
-        return article_id
-
-    def update_article(self, article_id: int, fields: dict) -> None:
-        new_title = fields.get("title")
-        new_slug = slugify(new_title) if new_title is not None else None
-        self._exec(
-            _UPDATE_ARTICLE,
-            new_title,
-            fields.get("description"),
-            fields.get("body"),
-            new_slug,
-            new_slug,
-            article_id,
+    ) -> Query:
+        return Query(
+            self,
+            _CREATE_ARTICLE_JSON,
+            (author_id, slugify(title), title, description, body, list(tags)),
+            json=True,
+            write=True,
         )
 
-    def delete_article(self, article_id: int) -> None:
-        self._exec(_DELETE_ARTICLE, article_id)
+    def q_update_article_by_slug_json(
+        self, viewer: int, slug: str, fields: dict
+    ) -> Query:
+        new_title = fields.get("title")
+        new_slug = slugify(new_title) if new_title is not None else None
+        return Query(
+            self,
+            _UPDATE_ARTICLE_BY_SLUG_JSON,
+            (viewer, slug, new_title, fields.get("description"), fields.get("body"), new_slug),
+            _author_and_json,
+            write=True,
+        )
 
-    # ---- favorites ---------------------------------------------------------
-    def favorite(self, viewer: int, article_id: int) -> None:
-        self._exec(_FAVORITE, viewer, article_id)
+    def q_delete_article_by_slug(self, viewer: int, slug: str) -> Query:
+        return Query(self, _DELETE_ARTICLE_BY_SLUG, (viewer, slug), _first_val, write=True)
 
-    def unfavorite(self, viewer: int, article_id: int) -> None:
-        self._exec(_UNFAVORITE, viewer, article_id)
+    # ---- favorites ---------------------------------------------------------------
+    def q_favorite_json(self, viewer: int, slug: str) -> Query:
+        return Query(self, _FAVORITE_JSON, (viewer, slug), json=True, write=True)
 
-    # ---- comments ----------------------------------------------------------
-    def list_comments(self, viewer: int, article_id: int) -> List[tuple]:
-        return self._rows(_COMMENTS, (viewer, article_id))  # COMMENT_ROW order
+    def q_unfavorite_json(self, viewer: int, slug: str) -> Query:
+        return Query(self, _UNFAVORITE_JSON, (viewer, slug), json=True, write=True)
 
-    def list_comments_by_slug(self, viewer: int, slug: str) -> Optional[List[tuple]]:
-        return self.q_list_comments_by_slug(viewer, slug).run()
+    # ---- comments ----------------------------------------------------------------
+    def q_list_comments_by_slug_json(self, viewer: int, slug: str) -> Query:
+        return Query(self, _COMMENTS_BY_SLUG_JSON, (viewer, slug), json=True)
 
-    def q_list_comments_by_slug(self, viewer: int, slug: str) -> Query:
-        return Query(self, _COMMENTS_BY_SLUG, (viewer, slug), _comments_or_none)
+    def q_create_comment_by_slug_json(self, author_id: int, slug: str, body: str) -> Query:
+        return Query(self, _CREATE_COMMENT_BY_SLUG_JSON, (author_id, slug, body), json=True, write=True)
 
-    def create_comment(self, author_id: int, article_id: int, body: str) -> Optional[dict]:
-        return self._one(_CREATE_COMMENT, article_id, author_id, body)
-
-    def comment_for_write(self, slug: str, comment_id: int) -> Optional[dict]:
-        return self._one(_COMMENT_FOR_WRITE, comment_id, slug)
-
-    def delete_comment(self, comment_id: int) -> None:
-        self._exec(_DELETE_COMMENT, comment_id)
+    def q_delete_comment_by_slug(self, viewer: int, slug: str, comment_id: int) -> Query:
+        return Query(self, _DELETE_COMMENT_BY_SLUG, (viewer, slug, comment_id), _first_val, write=True)
 
 
 # ---- `Query.finish` functions: statement rows -> repository return value ---------------------------------------
@@ -693,14 +917,13 @@ def _first_dict(stmt: _Stmt):
     return finish
 
 
-def _only_value(rows):
-    return rows[0][0]
+def _first_val(rows):
+    return rows[0][0] if rows else None
 
 
-def _comments_or_none(rows):
-    """Article lookup and its comments in one statement: no row = no article; one all-NULL row = no comments."""
+def _author_and_json(rows):
     if not rows:
         return None
-    if rows[0][0] is None:
-        return []
-    return rows  # COMMENT_ROW order
+    author_id, body = rows[0]
+    return author_id, body.encode() if body is not None else None
+

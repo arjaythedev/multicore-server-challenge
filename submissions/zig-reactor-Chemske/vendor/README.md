@@ -12,3 +12,10 @@ SHA-256:
 libpq is linked from PostgreSQL 18.6. The native development helper builds
 the official PostgreSQL distribution inside the workspace. Its licence is
 available in that distribution's COPYRIGHT file. No database binary is committed.
+
+The independent bcrypt lane scheduler is adapted from Zig 0.17.0's
+`lib/std/crypto/bcrypt.zig`, using the standard library's public Blowfish state.
+Its MIT licence is retained in [zig-LICENSE](zig-LICENSE). Each independent lane
+retains its own state, salt and complete cost-10 computation. The normal password
+path stays on the standard library until the optional lane implementation passes
+correctness and Linux performance comparisons.

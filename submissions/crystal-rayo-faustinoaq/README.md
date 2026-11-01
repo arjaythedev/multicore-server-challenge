@@ -5,7 +5,7 @@ Front: direct
 | Component | Version / implementation |
 |---|---|
 | Crystal | 1.22.1, `--release --mcpu x86-64-v3 -Dwithout_mt` |
-| Framework | [Rayo](https://github.com/faustinoaq/rayo), commit `c9553d94583fe2a56ab299e3788fe40dcd0e72b2` |
+| Framework | [Rayo](https://github.com/faustinoaq/rayo), commit `facd4464cb55eec83b5541b605ea42b57632ea60` |
 | PostgreSQL driver | Rayo::PG, prepared statements, pipelining and application read batches |
 | Network I/O | Rayo io_uring, `SO_REUSEPORT`; Linux 6.1+ with io_uring allowed |
 | JWT | Rayo::JWT, HS256 through OpenSSL libcrypto |
@@ -119,6 +119,31 @@ No new framework bug was found. Two application pieces remain:
 SQLite, multiple ports and affected-row hooks are not needed by this API.
 Remaining differences from epoll include optional write group commit and allocation-free data
 structures. This entry prioritizes ordinary framework routes and serialization.
+
+## Memory at high user counts (Rayo eafa17b)
+
+The first leaderboard run ran out of memory at 100k users (Postgres was OOM-killed). Two changes:
+
+- Rayo eafa17b returns grown connection buffers to their default size once a request is done,
+  and falls back to classic provided buffers on kernels whose buffer-ring registration fails
+  (Ubuntu 24.04's 6.8.0-147 returns `EINVAL` for every `IORING_REGISTER_PBUF_RING`).
+- Token, claims, payload and tag-list scratch buffers are now per worker instead of per
+  connection (they are only used within one synchronous step), about 9 KB less per connection.
+
+App memory at 100k users went from 5,449 MB to 3,387 MB. Runs on a local 8-core/16-thread
+Ryzen 7 5700G, Ubuntu 24.04 with kernel 6.8.0-147 (fallback path), app + Postgres in a
+container on 8 threads with 12 GB, loadgen on the other 8 threads, 60 s ramp + 60 s measure,
+think scale 1:
+
+| Users | req/s | p95 | p99 | errors | verdict |
+|---:|---:|---:|---:|---:|---|
+| 100,000 | 26,304 | 50.0 ms | 52.8 ms | 0 | pass |
+| 120,000 | 31,381 | 93.1 ms | 116.5 ms | 0 | pass |
+| 130,000 | 32,022 | 1,532 ms | 1,997 ms | 0 | fail (p95) |
+
+Rayo facd446 also frees connection buffers whenever they are empty. Same runs with it: 120k
+pass (31,401 req/s, p95 92 ms, p99 114 ms), 130k fail (p95 1,492 ms); box peak memory
+(app + Postgres + page cache) 8,154 MB at 120k, down from 11,392 MB.
 
 ## Final comparison (Rayo c9553d9)
 

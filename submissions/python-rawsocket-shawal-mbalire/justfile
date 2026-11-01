@@ -16,12 +16,9 @@ paths:
   @echo {{ SUBMISSIONS_DIR }}
   @echo {{ REPO_ROOT }}
 
-# create or recreate the local virtualenv with pinned deps
+# create or recreate the local virtualenv with pinned deps (the same build.sh the box runs)
 venv:
-  python3 -m venv .venv
-  .venv/bin/pip -q install --upgrade pip
-  .venv/bin/pip -q install 'psycopg[binary]' psycopg_pool bcrypt pyjwt
-  @echo "venv ready: .venv"
+  bash build.sh
 
 # lint: compile-check all sources (syntax) — fast static gate
 lint:

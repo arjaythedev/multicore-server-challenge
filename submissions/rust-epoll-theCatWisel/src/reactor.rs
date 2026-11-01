@@ -1,6 +1,7 @@
 use std::io;
 use std::os::fd::RawFd;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::auth::TokenSigner;
 use crate::codec;
@@ -13,6 +14,9 @@ pub mod sys {
 
     pub const PR_SET_THP_DISABLE: c_int = 41;
     pub const M_ARENA_MAX: c_int = -8;
+    pub const SCHED_BATCH: c_int = 3;
+    pub const CLONE_FILES: c_int = 0x0000_0400;
+    pub const RLIMIT_NOFILE: c_int = 7;
     pub const EFD_NONBLOCK: c_int = 0o4000;
     pub const EFD_CLOEXEC: c_int = 0o2000000;
     pub const AF_INET: c_int = 2;
@@ -37,7 +41,20 @@ pub mod sys {
     pub const EPOLLRDHUP: u32 = 0x2000;
     pub const EINTR: c_int = 4;
     pub const EAGAIN: c_int = 11;
+    pub const ENFILE: c_int = 23;
+    pub const EMFILE: c_int = 24;
     pub const ECONNABORTED: c_int = 103;
+
+    #[repr(C)]
+    pub struct sched_param {
+        pub sched_priority: c_int,
+    }
+
+    #[repr(C)]
+    pub struct rlimit {
+        pub rlim_cur: u64,
+        pub rlim_max: u64,
+    }
 
     #[repr(C)]
     pub struct sockaddr {
@@ -89,6 +106,10 @@ pub mod sys {
     unsafe extern "C" {
         pub fn prctl(option: c_int, arg2: usize, arg3: usize, arg4: usize, arg5: usize) -> c_int;
         pub fn mallopt(param: c_int, value: c_int) -> c_int;
+        pub fn sched_setscheduler(pid: c_int, policy: c_int, param: *const sched_param) -> c_int;
+        pub fn unshare(flags: c_int) -> c_int;
+        pub fn getrlimit(resource: c_int, rlim: *mut rlimit) -> c_int;
+        pub fn setrlimit(resource: c_int, rlim: *const rlimit) -> c_int;
         pub fn eventfd(initval: u32, flags: c_int) -> c_int;
         pub fn socket(domain: c_int, ty: c_int, protocol: c_int) -> c_int;
         pub fn setsockopt(
@@ -119,8 +140,39 @@ pub mod sys {
 
 const TOKEN_LISTENER: u64 = u64::MAX;
 const TOKEN_OUTBOX: u64 = u64::MAX - 1;
+const IDLE_NONE: u32 = u32::MAX;
+const EPOCH_CLOSED: u32 = u32::MAX;
 const LIMIT_HEAD: usize = 64 * 1024;
 const LIMIT_BODY: usize = 1024 * 1024;
+
+pub fn unshare_files() {
+    unsafe {
+        let _ = sys::unshare(sys::CLONE_FILES);
+    }
+}
+
+pub fn probe_nofile_limit() -> usize {
+    unsafe {
+        let mut rl = sys::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if sys::getrlimit(sys::RLIMIT_NOFILE, &mut rl) == 0 {
+            let target = rl.rlim_max.min(262_144);
+            if rl.rlim_cur < target {
+                let raised = sys::rlimit {
+                    rlim_cur: target,
+                    rlim_max: rl.rlim_max,
+                };
+                if sys::setrlimit(sys::RLIMIT_NOFILE, &raised) == 0 {
+                    rl.rlim_cur = target;
+                }
+            }
+            return (rl.rlim_cur as usize).saturating_sub(256).max(256);
+        }
+    }
+    65536
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct ReplyAddr {
@@ -129,27 +181,48 @@ pub struct ReplyAddr {
     pub epoch: u32,
 }
 
+pub enum ReplyBody {
+    Owned(Vec<u8>),
+    Shared(Arc<[u8]>),
+    Empty,
+}
+
+impl ReplyBody {
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            ReplyBody::Owned(v) => v.as_slice(),
+            ReplyBody::Shared(a) => a.as_ref(),
+            ReplyBody::Empty => &[],
+        }
+    }
+}
+
 pub struct OutgoingReply {
     pub addr: ReplyAddr,
     pub status: u16,
-    pub body: Vec<u8>,
+    pub body: ReplyBody,
 }
 
 pub struct WorkerOutbox {
     pub pending: Mutex<Vec<OutgoingReply>>,
     pub event_fd: RawFd,
+    pub epochs: Box<[AtomicU32]>,
 }
 
 static OUTBOX_RING: OnceLock<Vec<WorkerOutbox>> = OnceLock::new();
 
-pub fn init_outboxes(worker_count: usize) {
+pub fn init_outboxes(worker_count: usize, slot_cap: usize) {
+    let cap = slot_cap.max(65536) + 512;
     let boxes = (0..worker_count)
         .map(|_| {
             let efd = unsafe { sys::eventfd(0, sys::EFD_NONBLOCK | sys::EFD_CLOEXEC) };
             assert!(efd >= 0, "eventfd creation failed");
+            let epochs: Vec<AtomicU32> = (0..cap).map(|_| AtomicU32::new(EPOCH_CLOSED)).collect();
             WorkerOutbox {
                 pending: Mutex::new(Vec::with_capacity(1024)),
                 event_fd: efd,
+                epochs: epochs.into_boxed_slice(),
             }
         })
         .collect();
@@ -162,6 +235,14 @@ pub fn worker_outbox(worker: usize) -> &'static WorkerOutbox {
 }
 
 #[inline]
+pub fn is_addr_alive(addr: ReplyAddr) -> bool {
+    let ob = worker_outbox(addr.worker as usize);
+    ob.epochs
+        .get(addr.slot as usize)
+        .is_none_or(|e| e.load(Ordering::Relaxed) == addr.epoch)
+}
+
+#[inline]
 fn signal_eventfd(efd: RawFd) {
     let one: u64 = 1;
     unsafe {
@@ -170,11 +251,20 @@ fn signal_eventfd(efd: RawFd) {
 }
 
 pub fn complete_one(addr: ReplyAddr, status: u16, body: Vec<u8>) {
-    let ob = worker_outbox(addr.worker as usize);
+    complete_reply(OutgoingReply {
+        addr,
+        status,
+        body: ReplyBody::Owned(body),
+    });
+}
+
+#[inline]
+fn complete_reply(reply: OutgoingReply) {
+    let ob = worker_outbox(reply.addr.worker as usize);
     let notify = {
         let mut q = ob.pending.lock().unwrap();
         let was_empty = q.is_empty();
-        q.push(OutgoingReply { addr, status, body });
+        q.push(reply);
         was_empty
     };
     if notify {
@@ -188,7 +278,7 @@ pub fn complete_batch(mut replies: Vec<OutgoingReply>) {
     }
     if replies.len() == 1 {
         let r = replies.pop().unwrap();
-        complete_one(r.addr, r.status, r.body);
+        complete_reply(r);
         return;
     }
     replies.sort_unstable_by_key(|r| r.addr.worker);
@@ -225,7 +315,7 @@ pub fn error_reply(addr: ReplyAddr, status: u16, msg: &str) -> OutgoingReply {
     OutgoingReply {
         addr,
         status,
-        body: make_error_json(msg),
+        body: ReplyBody::Owned(make_error_json(msg)),
     }
 }
 
@@ -240,6 +330,10 @@ struct ClientSlot {
     eof_seen: bool,
     polling_out: bool,
     continue_sent: bool,
+    reused: bool,
+    in_idle_lru: bool,
+    idle_prev: u32,
+    idle_next: u32,
 }
 
 pub struct Reactor {
@@ -253,6 +347,11 @@ pub struct Reactor {
     outbox_buf: Vec<OutgoingReply>,
     pipelined_slots: Vec<u32>,
     signer: &'static TokenSigner,
+    epochs: &'static [AtomicU32],
+    active_conns: usize,
+    fd_budget: usize,
+    idle_head: u32,
+    idle_tail: u32,
 }
 
 #[inline]
@@ -359,9 +458,15 @@ enum ParseOutcome {
 }
 
 impl Reactor {
-    pub fn new(worker_id: u16, listen_fd: RawFd, signer: &'static TokenSigner) -> io::Result<Self> {
+    pub fn new(
+        worker_id: u16,
+        listen_fd: RawFd,
+        signer: &'static TokenSigner,
+        fd_budget: usize,
+    ) -> io::Result<Self> {
         let ep_fd = sys_cvt(unsafe { sys::epoll_create1(sys::EPOLL_CLOEXEC) })?;
-        let outbox_fd = worker_outbox(worker_id as usize).event_fd;
+        let ob = worker_outbox(worker_id as usize);
+        let outbox_fd = ob.event_fd;
         let reactor = Reactor {
             worker_id,
             ep_fd,
@@ -373,9 +478,14 @@ impl Reactor {
             outbox_buf: Vec::with_capacity(1024),
             pipelined_slots: Vec::with_capacity(256),
             signer,
+            epochs: &ob.epochs,
+            active_conns: 0,
+            fd_budget: fd_budget.max(256),
+            idle_head: IDLE_NONE,
+            idle_tail: IDLE_NONE,
         };
-        reactor.ep_ctl(sys::EPOLL_CTL_ADD, listen_fd, sys::EPOLLIN as u32, TOKEN_LISTENER)?;
-        reactor.ep_ctl(sys::EPOLL_CTL_ADD, outbox_fd, sys::EPOLLIN as u32, TOKEN_OUTBOX)?;
+        reactor.ep_ctl(sys::EPOLL_CTL_ADD, listen_fd, sys::EPOLLIN, TOKEN_LISTENER)?;
+        reactor.ep_ctl(sys::EPOLL_CTL_ADD, outbox_fd, sys::EPOLLIN, TOKEN_OUTBOX)?;
         Ok(reactor)
     }
 
@@ -384,6 +494,52 @@ impl Reactor {
         let mut ev = sys::epoll_event { events, u64: token };
         sys_cvt(unsafe { sys::epoll_ctl(self.ep_fd, op, fd, &mut ev) })?;
         Ok(())
+    }
+
+    #[inline]
+    fn link_idle(&mut self, slot: u32) {
+        let c = &mut self.slots[slot as usize];
+        if c.in_idle_lru || c.fd < 0 {
+            return;
+        }
+        c.in_idle_lru = true;
+        c.idle_prev = self.idle_tail;
+        c.idle_next = IDLE_NONE;
+        if self.idle_tail != IDLE_NONE {
+            self.slots[self.idle_tail as usize].idle_next = slot;
+        } else {
+            self.idle_head = slot;
+        }
+        self.idle_tail = slot;
+    }
+
+    #[inline]
+    fn unlink_idle(&mut self, slot: u32) {
+        let (in_lru, prev, next) = {
+            let c = &mut self.slots[slot as usize];
+            if !c.in_idle_lru {
+                return;
+            }
+            c.in_idle_lru = false;
+            let p = c.idle_prev;
+            let n = c.idle_next;
+            c.idle_prev = IDLE_NONE;
+            c.idle_next = IDLE_NONE;
+            (true, p, n)
+        };
+        if !in_lru {
+            return;
+        }
+        if prev != IDLE_NONE {
+            self.slots[prev as usize].idle_next = next;
+        } else {
+            self.idle_head = next;
+        }
+        if next != IDLE_NONE {
+            self.slots[next as usize].idle_prev = prev;
+        } else {
+            self.idle_tail = prev;
+        }
     }
 
     pub fn run_loop(mut self) {
@@ -404,17 +560,11 @@ impl Reactor {
                     TOKEN_OUTBOX => self.flush_outbox(),
                     raw_slot => {
                         let slot = raw_slot as u32;
-                        if ev.events & (sys::EPOLLOUT as u32) != 0 {
+                        if ev.events & sys::EPOLLOUT != 0 {
                             self.flush_tx(slot);
                         }
-                        if ev.events
-                            & (sys::EPOLLIN as u32
-                                | sys::EPOLLHUP as u32
-                                | sys::EPOLLERR as u32
-                                | sys::EPOLLRDHUP as u32)
-                            != 0
-                        {
-                            self.read_ready(slot);
+                        if ev.events & (sys::EPOLLIN | sys::EPOLLHUP | sys::EPOLLERR | sys::EPOLLRDHUP) != 0 {
+                            self.read_ready(slot, ev.events);
                         }
                     }
                 }
@@ -424,6 +574,10 @@ impl Reactor {
 
     fn accept_ready(&mut self) {
         loop {
+            while self.active_conns >= self.fd_budget && self.idle_head != IDLE_NONE {
+                let victim = self.idle_head;
+                self.drop_conn(victim);
+            }
             let fd = unsafe {
                 sys::accept4(
                     self.listen_fd,
@@ -437,10 +591,15 @@ impl Reactor {
                 match err.raw_os_error() {
                     Some(sys::EAGAIN) => return,
                     Some(sys::EINTR) | Some(sys::ECONNABORTED) => continue,
-                    _ => {
-                        eprintln!("accept4 error: {err}");
+                    Some(sys::EMFILE) | Some(sys::ENFILE) => {
+                        if self.idle_head != IDLE_NONE {
+                            let victim = self.idle_head;
+                            self.drop_conn(victim);
+                            continue;
+                        }
                         return;
                     }
+                    _ => return,
                 }
             }
             let yes: sys::c_int = 1;
@@ -453,7 +612,7 @@ impl Reactor {
                     4,
                 );
             }
-            let slot = match self.free_slots.pop() {
+            let (slot, epoch) = match self.free_slots.pop() {
                 Some(idx) => {
                     let c = &mut self.slots[idx as usize];
                     c.fd = fd;
@@ -462,8 +621,12 @@ impl Reactor {
                     c.eof_seen = false;
                     c.polling_out = false;
                     c.continue_sent = false;
+                    c.reused = false;
+                    c.in_idle_lru = false;
+                    c.idle_prev = IDLE_NONE;
+                    c.idle_next = IDLE_NONE;
                     c.tx_off = 0;
-                    idx
+                    (idx, c.epoch)
                 }
                 None => {
                     self.slots.push(ClientSlot {
@@ -477,15 +640,23 @@ impl Reactor {
                         eof_seen: false,
                         polling_out: false,
                         continue_sent: false,
+                        reused: false,
+                        in_idle_lru: false,
+                        idle_prev: IDLE_NONE,
+                        idle_next: IDLE_NONE,
                     });
-                    (self.slots.len() - 1) as u32
+                    ((self.slots.len() - 1) as u32, 0)
                 }
             };
+            self.active_conns += 1;
+            if let Some(e) = self.epochs.get(slot as usize) {
+                e.store(epoch, Ordering::Relaxed);
+            }
             if self
                 .ep_ctl(
                     sys::EPOLL_CTL_ADD,
                     fd,
-                    (sys::EPOLLIN | sys::EPOLLRDHUP) as u32,
+                    sys::EPOLLIN | sys::EPOLLRDHUP,
                     slot as u64,
                 )
                 .is_err()
@@ -496,23 +667,38 @@ impl Reactor {
     }
 
     fn drop_conn(&mut self, slot: u32) {
-        let c = &mut self.slots[slot as usize];
-        if c.fd < 0 {
+        if self.slots[slot as usize].fd < 0 {
             return;
         }
+        self.unlink_idle(slot);
+        let c = &mut self.slots[slot as usize];
         unsafe {
             sys::close(c.fd);
         }
         c.fd = -1;
-        c.epoch = c.epoch.wrapping_add(1);
+        let next_epoch = c.epoch.wrapping_add(1);
+        c.epoch = if next_epoch == EPOCH_CLOSED { 0 } else { next_epoch };
+        if let Some(e) = self.epochs.get(slot as usize) {
+            e.store(EPOCH_CLOSED, Ordering::Relaxed);
+        }
         c.rx = Vec::new();
         c.tx = Vec::new();
         c.tx_off = 0;
         c.in_flight = false;
+        c.reused = false;
+        self.active_conns = self.active_conns.saturating_sub(1);
         self.free_slots.push(slot);
     }
 
-    fn read_ready(&mut self, slot: u32) {
+    fn read_ready(&mut self, slot: u32, ev_flags: u32) {
+        if self.slots[slot as usize].fd < 0 {
+            return;
+        }
+        if (ev_flags & (sys::EPOLLHUP | sys::EPOLLERR)) != 0 && (ev_flags & sys::EPOLLIN) == 0 {
+            self.drop_conn(slot);
+            return;
+        }
+        self.unlink_idle(slot);
         let mut first_read = true;
         loop {
             let (fd, can_direct_parse) = {
@@ -534,7 +720,13 @@ impl Reactor {
             if n < 0 {
                 let err = io::Error::last_os_error();
                 match err.raw_os_error() {
-                    Some(sys::EAGAIN) => break,
+                    Some(sys::EAGAIN) => {
+                        if (ev_flags & (sys::EPOLLHUP | sys::EPOLLERR | sys::EPOLLRDHUP)) != 0 {
+                            self.drop_conn(slot);
+                            return;
+                        }
+                        break;
+                    }
                     Some(sys::EINTR) => continue,
                     _ => {
                         self.drop_conn(slot);
@@ -543,13 +735,7 @@ impl Reactor {
                 }
             }
             if n == 0 {
-                let c = &mut self.slots[slot as usize];
-                c.eof_seen = true;
-                if !c.in_flight {
-                    self.drop_conn(slot);
-                } else {
-                    let _ = self.ep_ctl(sys::EPOLL_CTL_MOD, fd, 0, slot as u64);
-                }
+                self.drop_conn(slot);
                 return;
             }
             let n = n as usize;
@@ -619,6 +805,9 @@ impl Reactor {
                         c.rx = Vec::new();
                     } else {
                         c.rx.clear();
+                    }
+                    if !c.in_flight && c.tx_off >= c.tx.len() && c.reused {
+                        self.link_idle(slot);
                     }
                 }
                 return;
@@ -690,7 +879,7 @@ impl Reactor {
                 continue;
             }
             let has_buffered_rx = !c.rx.is_empty();
-            self.write_response(rep.addr.slot, rep.status, &rep.body);
+            self.write_response(rep.addr.slot, rep.status, rep.body.as_slice());
             if has_buffered_rx {
                 check_pipelined.push(rep.addr.slot);
             }
@@ -707,6 +896,7 @@ impl Reactor {
     fn write_response(&mut self, slot: u32, status: u16, body: &[u8]) {
         let c = &mut self.slots[slot as usize];
         c.in_flight = false;
+        c.reused = true;
         let mut hdr = [0u8; 160];
         let mut hlen = 0usize;
         let mut append = |bytes: &[u8]| {
@@ -762,7 +952,7 @@ impl Reactor {
             let rc = unsafe { sys::writev(fd, iov.as_ptr(), if body.is_empty() { 1 } else { 2 }) };
             let written = if rc < 0 {
                 let err = io::Error::last_os_error();
-                if err.raw_os_error() == Some(sys::EAGAIN) {
+                if matches!(err.raw_os_error(), Some(sys::EAGAIN) | Some(sys::EINTR)) {
                     0
                 } else {
                     self.drop_conn(slot);
@@ -791,7 +981,17 @@ impl Reactor {
             c.tx.extend_from_slice(raw);
         } else {
             let rc = unsafe { sys::write(c.fd, raw.as_ptr() as *const sys::c_void, raw.len()) };
-            let written = if rc < 0 { 0 } else { rc as usize };
+            let written = if rc < 0 {
+                let err = io::Error::last_os_error();
+                if matches!(err.raw_os_error(), Some(sys::EAGAIN) | Some(sys::EINTR)) {
+                    0
+                } else {
+                    self.drop_conn(slot);
+                    return;
+                }
+            } else {
+                rc as usize
+            };
             if written < raw.len() {
                 c.tx.clear();
                 c.tx_off = 0;
@@ -811,11 +1011,14 @@ impl Reactor {
             let rc = unsafe { sys::write(c.fd, rem.as_ptr() as *const sys::c_void, rem.len()) };
             if rc < 0 {
                 let err = io::Error::last_os_error();
-                if err.raw_os_error() == Some(sys::EAGAIN) {
-                    break;
+                match err.raw_os_error() {
+                    Some(sys::EAGAIN) => break,
+                    Some(sys::EINTR) => continue,
+                    _ => {
+                        self.drop_conn(slot);
+                        return;
+                    }
                 }
-                self.drop_conn(slot);
-                return;
             }
             c.tx_off += rc as usize;
         }
@@ -823,37 +1026,46 @@ impl Reactor {
     }
 
     fn update_write_state(&mut self, slot: u32) {
-        let c = &mut self.slots[slot as usize];
-        if c.fd < 0 {
-            return;
-        }
-        let has_unsent = c.tx_off < c.tx.len();
-        if !has_unsent {
-            if c.tx.capacity() > 4096 {
-                c.tx = Vec::new();
-            } else {
-                c.tx.clear();
-            }
-            c.tx_off = 0;
-            if !c.in_flight && (c.close_on_done || c.eof_seen) {
-                self.drop_conn(slot);
+        let (has_unsent, should_drop, should_link_idle, mask_change) = {
+            let c = &mut self.slots[slot as usize];
+            if c.fd < 0 {
                 return;
             }
+            let has_unsent = c.tx_off < c.tx.len();
+            if !has_unsent {
+                if c.tx.capacity() > 4096 {
+                    c.tx = Vec::new();
+                } else {
+                    c.tx.clear();
+                }
+                c.tx_off = 0;
+            }
+            let should_drop = !has_unsent && !c.in_flight && (c.close_on_done || c.eof_seen);
+            let should_link_idle = !should_drop && !has_unsent && !c.in_flight && c.rx.is_empty() && c.reused;
+            let mask_change = if !should_drop && has_unsent != c.polling_out {
+                c.polling_out = has_unsent;
+                let mask = if has_unsent {
+                    sys::EPOLLIN | sys::EPOLLOUT | sys::EPOLLRDHUP
+                } else {
+                    sys::EPOLLIN | sys::EPOLLRDHUP
+                };
+                Some((c.fd, mask))
+            } else {
+                None
+            };
+            (has_unsent, should_drop, should_link_idle, mask_change)
+        };
+        if should_drop {
+            self.drop_conn(slot);
+            return;
         }
-        if has_unsent != c.polling_out {
-            c.polling_out = has_unsent;
-            let mask = if has_unsent {
-                sys::EPOLLIN | sys::EPOLLOUT | sys::EPOLLRDHUP
-            } else {
-                sys::EPOLLIN | sys::EPOLLRDHUP
-            };
-            let mask = if c.eof_seen {
-                if has_unsent { sys::EPOLLOUT } else { 0 }
-            } else {
-                mask
-            };
-            let fd = c.fd;
-            let _ = self.ep_ctl(sys::EPOLL_CTL_MOD, fd, mask as u32, slot as u64);
+        if should_link_idle {
+            self.link_idle(slot);
+        } else if has_unsent {
+            self.unlink_idle(slot);
+        }
+        if let Some((fd, mask)) = mask_change {
+            let _ = self.ep_ctl(sys::EPOLL_CTL_MOD, fd, mask, slot as u64);
         }
     }
 }

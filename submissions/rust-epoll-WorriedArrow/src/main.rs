@@ -41,7 +41,7 @@ fn main() {
     }
     let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
 
-    let io_threads: usize = env_or("IO_THREADS", (cpus / 4).max(1));
+    let io_threads: usize = env_or("IO_THREADS", (cpus / 2).max(1));
     let read_lanes: usize = env_or("READ_LANES", cpus.max(2));
     let write_lanes: usize = env_or("WRITE_LANES", 1);
     let bcrypt_threads: usize = env_or("BCRYPT_THREADS", 2);
@@ -56,11 +56,14 @@ fn main() {
         cfg: pg::Config::parse(&url).expect("DATABASE_URL must be postgres://user:password@host:port/db"),
         keys,
         read_batch: env_or("READ_BATCH", 4096),
-        read_min: env_or("READ_MIN", 32),
-        read_window: Duration::from_micros(env_or("READ_WINDOW_US", 20_000)),
+        read_min: env_or("READ_MIN", 4096),
+        read_window: Duration::from_micros(env_or("READ_WINDOW_US", 40_000)),
         write_batch: env_or("WRITE_BATCH", 256),
+        write_window: Duration::from_micros(env_or("WRITE_WINDOW_US", 3_000)),
         bcrypt_lanes,
         bcrypt_window: Duration::from_millis(env_or("BCRYPT_WINDOW_MS", 400)),
+        bcrypt_idle: env_or("BCRYPT_IDLE", 0) != 0,
+        bcrypt_rescue: Duration::from_millis(env_or("BCRYPT_RESCUE_MS", 1000)),
     }));
 
     // Fail fast if Postgres is unreachable or a statement doesn't prepare.
@@ -73,9 +76,15 @@ fn main() {
         }
     }
 
+    http::ACK_DELAY.store(env_or("ACK_DELAY", 1) != 0, std::sync::atomic::Ordering::Relaxed);
     reply::init(io_threads);
-    for _ in 0..read_lanes {
-        let lane = db::ReadLane::new(settings);
+    // FEED_LANES of the read lanes (and connections) serve only feeds; 0 (the default): every lane serves every read.
+    // A fixed split caps feeds at those lanes' connections, and near saturation their queue can grow without bound.
+    let feed_lanes: usize = env_or::<usize>("FEED_LANES", 0).min(read_lanes.saturating_sub(1));
+    db::FEED_SPLIT.store(feed_lanes > 0, std::sync::atomic::Ordering::Relaxed);
+    for i in 0..read_lanes {
+        let pool = if i < feed_lanes { &db::FEEDS } else { &db::READS };
+        let lane = db::ReadLane::new(settings, pool);
         std::thread::Builder::new().name("read".into()).spawn(move || lane.run()).unwrap();
     }
     for _ in 0..write_lanes {
@@ -85,14 +94,22 @@ fn main() {
     for i in 0..bcrypt_threads {
         std::thread::Builder::new().name("bcrypt".into()).spawn(move || db::bcrypt_worker(settings, i)).unwrap();
     }
+    if settings.bcrypt_idle && !settings.bcrypt_rescue.is_zero() {
+        std::thread::Builder::new().name("bcrypt-rescue".into()).spawn(move || db::bcrypt_rescue(settings)).unwrap();
+    }
     let mut handles = Vec::new();
+    // Every IO thread takes a private copy of the descriptor table before any of them serves a request (see
+    // Server::run); the barrier keeps the database lanes from opening sockets that a copy would then hold on to.
+    let unshared = std::sync::Arc::new(std::sync::Barrier::new(io_threads));
+    let private_fds = env_or("PRIVATE_FDS", 1) != 0;
     for t in 0..io_threads {
         let lfd = http::listener(&host, port).expect("listen");
         let server = http::Server::new(t as u16, lfd, keys).expect("epoll");
-        handles.push(std::thread::Builder::new().name("io".into()).spawn(move || server.run()).unwrap());
+        let unshared = unshared.clone();
+        handles.push(std::thread::Builder::new().name("io".into()).spawn(move || server.run(private_fds, &unshared)).unwrap());
     }
     eprintln!(
-        "listening on {host}:{port}: {io_threads} io threads, {read_lanes} read lanes, {write_lanes} write lanes, {bcrypt_threads} bcrypt threads x {bcrypt_lanes} lanes"
+        "listening on {host}:{port}: {io_threads} io threads, {read_lanes} read lanes ({feed_lanes} for feeds), {write_lanes} write lanes, {bcrypt_threads} bcrypt threads x {bcrypt_lanes} lanes"
     );
     for h in handles {
         let _ = h.join();

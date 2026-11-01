@@ -1,15 +1,19 @@
-import base64
+import binascii
 import ctypes
+import hashlib
 import hmac
+import os
 import orjson
+import re
 import threading
 import time
+from collections import deque
 import warnings
 
 import bcrypt
 import jwt
 
-from conduit_server.ports.outbound import CryptoPort
+from conduit_server.ports.outbound import PasswordHasherPort, TokenPort
 
 _HS256 = "HS256"
 _EXP_30_DAYS_SECONDS = 30 * 24 * 3600
@@ -18,6 +22,10 @@ _EXP_30_DAYS_SECONDS = 30 * 24 * 3600
 _BCRYPT_SLOTS = threading.BoundedSemaphore(2)
 _MAX_PASSWORD = 72  # bcrypt's key limit; longer passwords are rejected (pyca/bcrypt raises ValueError)
 _CRYPT_DATA = 65536  # >= sizeof(struct crypt_data) (~32 KiB); one zeroed buffer per call keeps crypt_rn reentrant
+_B64_DECODE_TR = bytes.maketrans(b"-_", b"+/")
+_B64_ENCODE_TR = bytes.maketrans(b"+/", b"-_")
+_B64_PAD = (b"", b"===", b"==", b"=")
+_NUM_TYPES = (int, float)
 
 
 def _load_crypt_rn():
@@ -48,14 +56,182 @@ def _bcrypt(password: bytes, setting: bytes):
     return out if out and out.startswith(b"$2") else None
 
 
-class JoseBcryptCryptoAdapter(CryptoPort):
-    def __init__(self, secret_key: str):
-        self._secret = secret_key
-        self._key = secret_key.encode("utf-8")
-        # PyJWT's header for every HS256 token we issue: a token carrying exactly this segment needs no decoding
-        with warnings.catch_warnings():  # PyJWT warns about short keys; the secret is given by the spec
-            warnings.simplefilter("ignore")
-            self._hs256_header = jwt.encode({}, secret_key, algorithm=_HS256).partition(".")[0]
+# ---- multi-lane bcrypt ------------------------------------------------------------------------------------------
+# native/bcrypt_lanes.c (built by build.sh): up to 8 hashes in lockstep, so one hash's S-box loads overlap the others'
+# waits. Cost 10 per hash, single thread: 1 lane 37.6 ms (libxcrypt 38.4), 2: 19.8, 4: 11.3, 6: 8.8, 8: 9.3.
+LANES = 6
+_SETTING = re.compile(rb"\$2[aby]\$(0[4-9]|[12][0-9]|3[01])\$[./A-Za-z0-9]{22}")
+
+
+def _load_lanes():
+    """The native `bcrypt_many`, or None (not built, or its output differs from libxcrypt/pyca on a probe)."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "native", "libbcrypt_lanes.so")
+    try:
+        fn = ctypes.CDLL(path).bcrypt_many
+    except (OSError, AttributeError):
+        return None
+    fn.restype = ctypes.c_int
+    fn.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_char_p), ctypes.c_char_p]
+    pws = [b"probe", b"another probe \xc3\xa9", b"x" * 72]
+    settings = [bcrypt.gensalt(4, prefix=p) for p in (b"2a", b"2b", b"2b")]
+    out = ctypes.create_string_buffer(61 * 3)
+    if fn(3, (ctypes.c_char_p * 3)(*pws), (ctypes.c_char_p * 3)(*settings), out) != 0:
+        return None
+    for i, (pw, s) in enumerate(zip(pws, settings)):
+        if out.raw[61 * i : 61 * i + 60] != bcrypt.hashpw(pw, s):
+            return None
+    return fn
+
+
+_lanes = _load_lanes()
+
+
+def _load_jwt_verify():
+    """native/jwt_verify.c (built by build.sh): HS256 verification of our own tokens in C, or None if not built
+    or JWT_NATIVE=0."""
+    if os.environ.get("JWT_NATIVE", "1") == "0":
+        return None
+    import importlib.machinery
+    import importlib.util
+
+    native = os.path.join(os.path.dirname(os.path.abspath(__file__)), "native")
+    for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+        path = os.path.join(native, "_jwt_verify" + suffix)
+        if os.path.exists(path):
+            spec = importlib.util.spec_from_file_location("_jwt_verify", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            break
+    else:
+        return None
+    for key in (b"", b"k", b"x" * 64, b"y" * 100):
+        for msg in (b"", b"m" * 55, b"m" * 56, b"m" * 200):
+            if mod.hmac_sha256(key, msg) != hmac.digest(key, msg, "sha256"):
+                return None
+    return mod
+
+
+_jwt_native = _load_jwt_verify()
+
+
+def _bcrypt_one(password: bytes, setting: bytes):
+    """One hash without the lanes: libxcrypt, else pyca. None if `setting` isn't a bcrypt setting."""
+    try:
+        return _bcrypt(password, setting) or bcrypt.hashpw(password, setting)
+    except ValueError:
+        return None
+
+
+def bcrypt_many(jobs) -> list:
+    """bcrypt of each (password, setting) pair (both bytes, password at most 72 bytes): the hash, or None for a
+    malformed setting. Valid jobs run together on the lanes; a password with a NUL (C strings end there) or an odd
+    setting goes through libxcrypt/pyca on its own. Releases the GIL while hashing."""
+    out = [None] * len(jobs)
+    lane = []
+    for i, (pw, setting) in enumerate(jobs):
+        if _lanes is not None and b"\0" not in pw and _SETTING.match(setting):
+            lane.append(i)
+        else:
+            out[i] = _bcrypt_one(pw, setting)
+    for start in range(0, len(lane), LANES):
+        idx = lane[start : start + LANES]
+        n = len(idx)
+        buf = ctypes.create_string_buffer(61 * n)
+        pws = (ctypes.c_char_p * n)(*[jobs[i][0] for i in idx])
+        settings = (ctypes.c_char_p * n)(*[jobs[i][1] for i in idx])
+        if _lanes(n, pws, settings, buf) == 0:
+            raw = buf.raw
+            for k, i in enumerate(idx):
+                out[i] = raw[61 * k : 61 * k + 60]
+        else:  # can't happen after _SETTING; stay correct anyway
+            for i in idx:
+                out[i] = _bcrypt_one(*jobs[i])
+    return out
+
+
+def _false(_) -> bool:
+    return False
+
+
+class _BcryptStmt:
+    index = -1  # the broker's marker for a bcrypt job (statements are 0..n)
+
+
+class BcryptJob:
+    """A bcrypt a handler waits on (`ok = yield crypto.q_verify_password(...)`), like a repository Query: the broker
+    runs it on its bcrypt threads with other workers' logins (BcryptBatcher); `run()` computes it in place."""
+
+    __slots__ = ("args", "finish")
+    stmt = _BcryptStmt
+    json = True
+    write = False
+
+    def __init__(self, password: bytes, setting: bytes, finish):
+        self.args, self.finish = (password, setting), finish
+
+    def run(self):
+        return self.finish(bcrypt_many([self.args])[0])
+
+
+class BcryptBatcher:
+    """The broker's bcrypt threads. `submit` queues a job; finished (token, hash) pairs collect in `done` and
+    `efd` (an eventfd for the broker's epoll) is signalled. The first thread runs up to LANES queued jobs once LANES
+    are queued or the oldest has waited `wait` seconds (a lone login waits for company: 6 lanes cost 4.4x less per
+    hash than 1). The others take only full batches, for backlogs: an extra thread that took every job split the
+    queue into small, costly batches."""
+
+    def __init__(self, threads: int, wait: float):
+        self.wait = wait
+        self.queue = deque()  # (arrival, token, password, setting)
+        self.cv = threading.Condition()
+        self.done = deque()
+        self.efd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
+        for k in range(max(1, threads)):
+            threading.Thread(target=self._run, args=(k == 0,), daemon=True, name=f"bcrypt-{k}").start()
+
+    def submit(self, token, password: bytes, setting: bytes):
+        with self.cv:
+            self.queue.append((time.monotonic(), token, password, setting))
+            if len(self.queue) == 1 or len(self.queue) >= LANES:
+                self.cv.notify_all()
+
+    def results(self) -> list:
+        try:
+            os.eventfd_read(self.efd)
+        except BlockingIOError:
+            pass
+        done, out = self.done, []
+        while done:
+            out.append(done.popleft())
+        return out
+
+    def _run(self, primary: bool):
+        q, cv = self.queue, self.cv
+        while True:
+            with cv:
+                while True:
+                    n = len(q)
+                    if n >= LANES:
+                        break
+                    if primary and n:
+                        left = q[0][0] + self.wait - time.monotonic()
+                        if left <= 0:
+                            break
+                        cv.wait(left)
+                    else:
+                        cv.wait()
+                batch = [q.popleft() for _ in range(min(LANES, len(q)))]
+            try:
+                hashes = bcrypt_many([(pw, s) for _, _, pw, s in batch])
+            except Exception:  # never lose a waiting login: answer None (verify fails)
+                hashes = [None] * len(batch)
+            self.done.extend((job[1], h) for job, h in zip(batch, hashes))
+            os.eventfd_write(self.efd, 1)
+
+
+class BcryptPasswordHasher(PasswordHasherPort):
+    """bcrypt cost 10: libxcrypt through ctypes (pyca/bcrypt as fallback); logins as BcryptJobs, which the broker
+    hashes together on the multi-lane bcrypt (`batcher`)."""
 
     def hash_password(self, password: str) -> str:
         pw = password.encode("utf-8")
@@ -79,44 +255,177 @@ class JoseBcryptCryptoAdapter(CryptoPort):
         except ValueError:
             return False
 
+    def q_verify_password(self, password: str, password_hash: str) -> BcryptJob:
+        """`verify_password` as a job a handler yields: True if the password matches. Over 72 bytes it can't (bcrypt
+        would use only the first 72), so that job hashes nothing useful and answers False."""
+        pw, stored = password.encode("utf-8"), password_hash.encode("utf-8")
+        if len(pw) > _MAX_PASSWORD:
+            return BcryptJob(b"", stored, _false)
+        return BcryptJob(pw, stored, lambda computed: computed is not None and hmac.compare_digest(computed, stored))
+
+    @staticmethod
+    def batcher(threads: int, wait: float) -> "BcryptBatcher":
+        """The broker's bcrypt threads for the BcryptJobs that q_verify_password returns."""
+        return BcryptBatcher(threads, wait)
+
+
+class Hs256TokenService(TokenPort):
+    """HS256 JWTs: issued with stdlib HMAC, verified in C for our own form (native/jwt_verify.c) else in Python."""
+
+    def __init__(self, secret_key: str):
+        self._secret = secret_key
+        self._key = secret_key.encode("utf-8")
+        base = hmac.new(self._key, digestmod=hashlib.sha256)
+        # the C HMAC object inside the stdlib wrapper (same copy/update/digest): the wrapper's Python copy() cost
+        # ~0.4 µs per token
+        self._base_hmac = getattr(base, "_hmac", None) or base
+        # PyJWT's header for every HS256 token we issue: a token carrying exactly this segment needs no decoding
+        with warnings.catch_warnings():  # PyJWT warns about short keys; the secret is given by the spec
+            warnings.simplefilter("ignore")
+            hdr = jwt.encode({}, secret_key, algorithm=_HS256).partition(".")[0]
+        self._hs256_header = hdr
+        self._hs256_header_b = hdr.encode("ascii")
+        self._hs256_prefix_b = self._hs256_header_b + b"."
+        if _jwt_native is not None:
+            _jwt_native.init(self._key, self._hs256_header_b)  # process-wide: one secret per server
+
     def issue_token(self, user_id: int) -> str:
         now = int(time.time())
-        payload = {"sub": str(user_id), "iat": now, "exp": now + _EXP_30_DAYS_SECONDS}
-        return jwt.encode(payload, self._secret, algorithm=_HS256)
+        payload_b64 = (
+            binascii.b2a_base64(
+                orjson.dumps({"sub": str(user_id), "iat": now, "exp": now + _EXP_30_DAYS_SECONDS}),
+                newline=False,
+            )
+            .rstrip(b"=")
+            .translate(_B64_ENCODE_TR)
+        )
+        signing_input = self._hs256_prefix_b + payload_b64
+        h = self._base_hmac.copy()
+        h.update(signing_input)
+        sig_b64 = binascii.b2a_base64(h.digest(), newline=False).rstrip(b"=").translate(_B64_ENCODE_TR)
+        return (signing_input + b"." + sig_b64).decode("ascii")
 
     def verify_token(self, token: str) -> int:
+        """Verify HS256 signature + exp on every call (no caching). Returns user id. Tokens in our own form are
+        checked in C (`_jwt_native.verify`, same result as `_verify_token_py`); anything else in Python."""
+        if _jwt_native is not None:
+            user_id = _jwt_native.verify(token)
+            if user_id is not None:
+                return user_id
+        return self._verify_token_py(token)
+
+    def _verify_token_py(self, token: str) -> int:
         """Verify HS256 signature + exp on every call (no caching). Returns user id.
 
         Same checks PyJWT.decode(algorithms=["HS256"], require exp/iat/sub) makes, with stdlib hmac:
         PyJWT validates base64 one character at a time in Python, which dominated request CPU."""
-        signing_input, _, sig_b64 = token.rpartition(".")
-        header_b64, _, payload_b64 = signing_input.partition(".")
-        if not header_b64 or "." in payload_b64:
+        raw = token.encode("ascii")
+        signing_input, _, sig_b64 = raw.rpartition(b".")
+        header_b64, _, payload_b64 = signing_input.partition(b".")
+        if not header_b64 or b"." in payload_b64:
             raise ValueError("a JWT has exactly three segments")
-        expected = hmac.digest(self._key, signing_input.encode("ascii"), "sha256")
-        if not hmac.compare_digest(expected, _b64decode(sig_b64)):
+        h = self._base_hmac.copy()
+        h.update(signing_input)
+        if not hmac.compare_digest(h.digest(), _b64decode_b(sig_b64)):
             raise ValueError("bad signature")
-        if header_b64 != self._hs256_header and orjson.loads(_b64decode(header_b64)).get("alg") != _HS256:
-            raise ValueError("only HS256 is accepted")
-        payload = orjson.loads(_b64decode(payload_b64))
+        if header_b64 != self._hs256_header_b:
+            hdr = orjson.loads(_b64decode_b(header_b64))
+            if not isinstance(hdr, dict) or hdr.get("alg") != _HS256:
+                raise ValueError("only HS256 is accepted")
+        payload = orjson.loads(_b64decode_b(payload_b64))
         now = time.time()
         exp, iat = payload["exp"], payload["iat"]
-        if not _is_number(exp) or exp <= now:
+        if exp.__class__ not in _NUM_TYPES or exp <= now:
             raise ValueError("expired")
-        if not _is_number(iat) or iat > now:
+        if iat.__class__ not in _NUM_TYPES or iat > now:
             raise ValueError("issued in the future")
         nbf = payload.get("nbf")
-        if nbf is not None and (not _is_number(nbf) or nbf > now):
+        if nbf is not None and (nbf.__class__ not in _NUM_TYPES or nbf > now):
             raise ValueError("not yet valid")
         sub = payload["sub"]
-        if not isinstance(sub, str):
+        if sub.__class__ is not str:
             raise ValueError("sub must be a string")
         return int(sub)
 
 
-def _b64decode(segment: str) -> bytes:
-    return base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4))
+def _b64decode_b(segment: bytes) -> bytes:
+    """base64url without padding. strict_mode: any character outside the alphabet is an error (the default mode
+    skips them, so a signature with junk mixed in would still decode)."""
+    return binascii.a2b_base64(segment.translate(_B64_DECODE_TR) + _B64_PAD[len(segment) & 3], strict_mode=True)
 
 
-def _is_number(value) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+# ---- alternatives (registry.py), for A/B runs -------------------------------------------------------------------
+class _InPlaceJob:
+    """A bcrypt verify computed where it's run (on the offload helper thread): hashers without a batcher."""
+
+    __slots__ = ("fn",)
+    write = False
+
+    def __init__(self, fn):
+        self.fn = fn
+
+    def run(self):
+        return self.fn()
+
+
+class LibxcryptPasswordHasher(PasswordHasherPort):
+    """PASSWORD_HASHER=libxcrypt: the OS's libxcrypt (libcrypt.so, C) one hash at a time, no multi-lane batching;
+    logins run on the offload helper thread."""
+
+    def __init__(self):
+        if _crypt_rn is None:
+            raise SystemExit("Error: PASSWORD_HASHER=libxcrypt needs libcrypt.so with crypt_rn")
+        self._inner = BcryptPasswordHasher()
+
+    def hash_password(self, password: str) -> str:
+        return self._inner.hash_password(password)
+
+    def verify_password(self, password: str, password_hash: str) -> bool:
+        return self._inner.verify_password(password, password_hash)
+
+    def q_verify_password(self, password: str, password_hash: str) -> _InPlaceJob:
+        return _InPlaceJob(lambda: self.verify_password(password, password_hash))
+
+
+class PycaPasswordHasher(PasswordHasherPort):
+    """PASSWORD_HASHER=pyca: pyca/bcrypt (Rust) for everything; logins on the offload helper thread."""
+
+    def hash_password(self, password: str) -> str:
+        pw = password.encode("utf-8")
+        if len(pw) > _MAX_PASSWORD:
+            raise ValueError("password cannot be longer than 72 bytes")
+        return bcrypt.hashpw(pw, bcrypt.gensalt(rounds=10)).decode("utf-8")
+
+    def verify_password(self, password: str, password_hash: str) -> bool:
+        pw = password.encode("utf-8")
+        if len(pw) > _MAX_PASSWORD:
+            return False
+        try:
+            return bcrypt.checkpw(pw, password_hash.encode("utf-8"))
+        except ValueError:
+            return False
+
+    def q_verify_password(self, password: str, password_hash: str) -> _InPlaceJob:
+        return _InPlaceJob(lambda: self.verify_password(password, password_hash))
+
+
+class Hs256PyTokenService(Hs256TokenService):
+    """TOKENS=hs256-py: the same tokens and checks with the stdlib's HMAC (OpenSSL), no native/jwt_verify.c."""
+
+    def verify_token(self, token: str) -> int:
+        return self._verify_token_py(token)
+
+
+class PyJwtTokenService(Hs256TokenService):
+    """TOKENS=pyjwt: PyJWT's decode (pure Python apart from the HMAC); issues the same tokens."""
+
+    def __init__(self, secret_key: str):
+        super().__init__(secret_key)
+        warnings.filterwarnings("ignore", module="jwt")  # short key: the secret is given by the spec
+
+    def verify_token(self, token: str) -> int:
+        payload = jwt.decode(token, self._secret, algorithms=[_HS256], options={"require": ["exp", "iat", "sub"]})
+        sub = payload["sub"]
+        if sub.__class__ is not str:
+            raise ValueError("sub must be a string")
+        return int(sub)

@@ -1,10 +1,12 @@
 # Performance work
 
+These sections record the original Mac experiments. The official 20,000-user result and subsequent Linux scaling work are in [SCALING.md](SCALING.md). Percentages from separate experiments must not be added together.
+
 ## Rules and leaderboard recheck
 
 Checked on 2026-10-25 against upstream `c3012257f2ee3dd2ccc72ada2eeba2b0d1278e8e`. Fetching upstream showed no changes to the rules, schema, workload, test harness or leaderboard since my previous review.
 
-The current official leaders are Rust/Tokio at 100,000 users, C#/Sockets at 95,000, and C/io_uring at 84,000. The leading Rust run reports 26,279 requests/s, p95 119 ms and p99 185 ms, with 20% application CPU and 70% PostgreSQL CPU. These are results on the official eight-vCPU, 16 GB box, with the full seed and separate load generators.
+At that review, the official leaders were Rust/Tokio at 100,000 users, C#/Sockets at 95,000, and C/io_uring at 84,000. The leading Rust run reports 26,279 requests/s, p95 119 ms and p99 185 ms, with 20% application CPU and 70% PostgreSQL CPU. These are results on the official eight-vCPU, 16 GB box, with the full seed and separate load generators.
 
 The score requires a five-minute hold with p95 below 500 ms, p99 below one second and fewer than 1% errors. A load-generator-limited run does not establish server capacity. The application shares its CPU and memory budget with PostgreSQL.
 

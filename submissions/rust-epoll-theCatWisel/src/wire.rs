@@ -171,6 +171,9 @@ impl TxBuf {
 
     pub fn clear(&mut self) {
         self.buf.clear();
+        if self.buf.capacity() > 1024 * 1024 {
+            self.buf.shrink_to(128 * 1024);
+        }
     }
 }
 
@@ -320,6 +323,9 @@ impl PipelineBuf {
 
     pub fn clear(&mut self) {
         self.data.clear();
+        if self.data.capacity() > 4 * 1024 * 1024 {
+            self.data.shrink_to(512 * 1024);
+        }
         self.cols.clear();
         self.rows.clear();
         self.results.clear();
@@ -430,7 +436,6 @@ impl PgConn {
             ("plan_cache_mode", "force_generic_plan"),
             ("jit", "off"),
             ("max_parallel_workers_per_gather", "0"),
-            ("enable_memoize", "off"),
             ("work_mem", "32MB"),
             ("random_page_cost", "1.1"),
             ("effective_io_concurrency", "200"),
@@ -570,7 +575,10 @@ impl PgConn {
         if self.rend - self.rpos >= needed {
             return Ok(());
         }
-        if self.rpos > 0 {
+        if self.rpos == self.rend {
+            self.rpos = 0;
+            self.rend = 0;
+        } else if self.rpos > 0 {
             self.rx.copy_within(self.rpos..self.rend, 0);
             self.rend -= self.rpos;
             self.rpos = 0;

@@ -1,0 +1,7 @@
+# The Mojo toolchain install.sh installs: the compiler (mojo, the runtime libraries the binary links) and its
+# standard library, pinned by version and hash. x86_64 Linux (the benchmark box); `mojo` itself, the LSP, the
+# debugger and the formatter aren't needed to build.
+mojo-compiler==1.2.0 \
+    --hash=sha256:3ee34a3b26c6cccaa9523a0e8db8f67bea954497d782d97c9e61c3c4ecbdac7b
+mojo-compiler-mojo-libs==1.2.0 \
+    --hash=sha256:3d631f7e798c11d0029c4a892ebae1f5742751fac0c526af74b45a8ae07c3acb

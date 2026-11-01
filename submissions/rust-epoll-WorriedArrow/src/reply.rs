@@ -23,6 +23,26 @@ pub struct Outbox {
 
 static OUTBOXES: OnceLock<Vec<Outbox>> = OnceLock::new();
 
+/// Per IO thread and connection slot: the generation of the request that slot can still be answered for. A slot whose
+/// client hung up (or was closed) no longer matches its queued requests' generation, so workers skip their work.
+static LIVE: OnceLock<Vec<Box<[std::sync::atomic::AtomicU32]>>> = OnceLock::new();
+const LIVE_SLOTS: usize = 1 << 18;
+
+/// Records that `slot` on `thread` now answers requests of `generation` only.
+pub fn set_live(thread: u16, slot: u32, generation: u32) {
+    if let Some(a) = LIVE.get().and_then(|v| v.get(thread as usize)).and_then(|a| a.get(slot as usize)) {
+        a.store(generation, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Whether the client this reply goes to is still there (as far as its IO thread has seen).
+pub fn alive(to: ReplyTo) -> bool {
+    match LIVE.get().and_then(|v| v.get(to.thread as usize)).and_then(|a| a.get(to.slot as usize)) {
+        Some(a) => a.load(std::sync::atomic::Ordering::Relaxed) == to.generation,
+        None => true,
+    }
+}
+
 pub fn init(threads: usize) {
     let v = (0..threads)
         .map(|_| {
@@ -32,6 +52,8 @@ pub fn init(threads: usize) {
         })
         .collect();
     OUTBOXES.set(v).ok().expect("reply::init twice");
+    let live = (0..threads).map(|_| (0..LIVE_SLOTS).map(|_| std::sync::atomic::AtomicU32::new(0)).collect()).collect();
+    LIVE.set(live).ok().expect("reply::init twice");
 }
 
 pub fn outbox(thread: usize) -> &'static Outbox {
