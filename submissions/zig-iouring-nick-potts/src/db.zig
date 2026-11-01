@@ -109,9 +109,29 @@ pub var feed3_idle: u8 = 0;
 const feed3_sample_ns = 100 * std.time.ns_per_ms;
 var feed3: struct { open: bool = false, stat: ?shed.Stat = null, next_ns: u64 = 0 } = .{};
 
+/// ZIG_FEED3_QWAIT=N ms: the feed lane may run a third drain once its oldest queued feed has waited N ms, if the
+/// shared lane has a slot to lend; 0, the default, never. The third feed drain takes one of the shared lane's three
+/// slots while it runs, so read drains in flight never exceed the seven of the lanes' own caps, and the slot is back
+/// with the shared lane as soon as any feed drain finishes. The gate is the feed queue's own wait, not the box's
+/// idle: near saturation the box is 95-99% busy, so the idle gate stays shut, while the feed lane sits at its cap
+/// most of the time with hundreds of feeds queued and the shared lane is at its cap under a tenth of the time. A feed
+/// that has waited that long is already past the lane's gap and window, so the slot opens for a backlog, not a blip.
+pub var feed3_qwait_ns: u64 = 0;
+
+/// Whether the feed lane's oldest queued read has waited `feed3_qwait_ns` and the shared lane has a slot to lend.
+fn feedWaited() bool {
+    if (feed3_qwait_ns == 0 or lane(.shared).inflight >= max_inflight) return false;
+    const s = oldestRead(.feed) orelse return false;
+    return now_ns -| reads[@intFromEnum(s)].head.?.queued_ns >= feed3_qwait_ns;
+}
+
 /// Lane `l`'s cap on drains in flight now.
 fn cap(l: LaneId) u8 {
-    return if (l == .feed and feed3.open) feed_max_inflight + 1 else lane(l).max_inflight;
+    return switch (l) {
+        .feed => if (feed3.open or feedWaited()) feed_max_inflight + 1 else feed_max_inflight,
+        .comments => comments_max_inflight,
+        .shared => if (feed3_qwait_ns > 0 and lane(.feed).inflight > feed_max_inflight) max_inflight - 1 else max_inflight,
+    };
 }
 
 /// ZIG_READ_CAP=N: read drains in flight across all lanes at most, each lane still under its own cap; 0, the default,
@@ -833,9 +853,15 @@ pub fn pump() ?u64 {
         if (due <= now_ns) continue;
         next = if (next) |t| @min(t, due) else due;
     }
-    // Held at two feed drains, the lane may get its third at the next reading.
-    if (feed3_idle > 0 and lane(.feed).inflight == feed_max_inflight and oldestRead(.feed) != null)
-        next = if (next) |t| @min(t, feed3.next_ns) else feed3.next_ns;
+    // Held at two feed drains, the lane may get its third at the next reading, or once its oldest read has waited.
+    if (lane(.feed).inflight == feed_max_inflight) if (oldestRead(.feed)) |s| {
+        if (feed3_idle > 0) next = if (next) |t| @min(t, feed3.next_ns) else feed3.next_ns;
+        if (feed3_qwait_ns > 0 and lane(.shared).inflight < max_inflight) {
+            const ln = lane(.feed);
+            const at = @max(reads[@intFromEnum(s)].head.?.queued_ns + feed3_qwait_ns, ln.last_ns + ln.gap_ns);
+            if (at > now_ns) next = if (next) |t| @min(t, at) else at;
+        }
+    };
     if (lane_stats) {
         countPump();
         if (!builtin.is_test) logStats();
@@ -1318,6 +1344,75 @@ test "with ZIG_FEED3 the feed lane runs a third drain while the gate is open, ne
     defer freeGroup(g2);
     try testing.expectEqual(&qs[feed_max_inflight + 1], g2.members[0]);
     message(&cs[feed_max_inflight], 'Z', "I");
+}
+
+test "with ZIG_FEED3_QWAIT the feed lane runs a third drain once its oldest read has waited, on a slot lent by the shared lane" {
+    clearQueuesForTest();
+    defer clearQueuesForTest();
+    feed3_qwait_ns = 120 * ms;
+    defer feed3_qwait_ns = 0;
+    const ln = lane(.feed);
+    var fc: [feed_max_inflight + 1]Conn = undefined;
+    for (&fc) |*c| c.* = .{ .fd = -1, .index = 0, .write = false, .rbuf = &.{} };
+    var sc: [max_inflight]Conn = undefined;
+    for (&sc) |*c| c.* = .{ .fd = -1, .index = 0, .write = false, .rbuf = &.{} };
+    var qs: [feed_max_inflight + 2]Query = undefined;
+    var ss: [max_inflight + 1]Query = undefined;
+    now_ns = 1000 * ms;
+    for (0..feed_max_inflight) |i| {
+        readAt(&qs[i], .list_feed, now_ns);
+        now_ns += ln.gap_ns;
+        fc[i].pushGroup(dueRead().?);
+    }
+    for (0..max_inflight) |i| {
+        readAt(&ss[i], .list_all, now_ns);
+        now_ns += gap_ns;
+        sc[i].pushGroup(dueRead().?);
+    }
+    try testing.expectEqual(feed_max_inflight + max_inflight, readsInflight());
+    // Two feed drains hold the lane. With the shared lane at its cap there is no slot to lend: the feed waits past
+    // 120 ms and nothing opens, and no clock is set for it.
+    readAt(&qs[feed_max_inflight], .list_feed, now_ns);
+    now_ns += 200 * ms;
+    try testing.expectEqual(null, dueRead());
+    try testing.expectEqual(null, pump());
+    // A shared drain finishing lends its slot: the feed that waited gets the third drain, and the shared lane's cap
+    // is two while it runs, so a shared read queued meanwhile waits even past the shared gap.
+    message(&sc[0], 'Z', "I");
+    const g = dueRead().?;
+    try testing.expectEqual(.feed, g.lane);
+    try testing.expectEqual(&qs[feed_max_inflight], g.members[0]);
+    fc[feed_max_inflight].pushGroup(g);
+    try testing.expectEqual(feed_max_inflight + 1, ln.inflight);
+    try testing.expectEqual(max_inflight - 1, cap(.shared));
+    try testing.expectEqual(feed_max_inflight + max_inflight, readsInflight());
+    readAt(&ss[max_inflight], .list_all, now_ns);
+    now_ns += 200 * ms;
+    try testing.expectEqual(null, readsDue(.shared));
+    try testing.expectEqual(null, dueRead());
+    // A feed drain finishing returns the slot: the shared lane drains at once, and a feed queued just now waits
+    // under the cap of two until it has waited 120 ms, which pump() sets the clock for once a shared slot is free.
+    readAt(&qs[feed_max_inflight + 1], .list_feed, now_ns);
+    const queued = now_ns;
+    message(&fc[0], 'Z', "I");
+    try testing.expectEqual(max_inflight, cap(.shared));
+    const sg = dueRead().?;
+    try testing.expectEqual(.shared, sg.lane);
+    try testing.expectEqual(&ss[max_inflight], sg.members[0]);
+    sc[0].pushGroup(sg);
+    try testing.expectEqual(null, dueRead());
+    try testing.expectEqual(null, pump());
+    message(&sc[1], 'Z', "I");
+    try testing.expectEqual(queued + feed3_qwait_ns, pump().?);
+    try testing.expectEqual(null, dueRead());
+    now_ns = queued + feed3_qwait_ns;
+    const g2 = dueRead().?;
+    try testing.expectEqual(&qs[feed_max_inflight + 1], g2.members[0]);
+    fc[0].pushGroup(g2);
+    try testing.expectEqual(feed_max_inflight + max_inflight, readsInflight());
+    for (&fc) |*c| message(c, 'Z', "I");
+    message(&sc[0], 'Z', "I");
+    message(&sc[2], 'Z', "I");
 }
 
 test "with ZIG_READ_CAP no read drain starts past the cap, and each freed slot goes to the due lane whose oldest read waited longest" {
