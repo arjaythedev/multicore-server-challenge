@@ -57,6 +57,11 @@ A bigger batch shares more work, so each read costs Postgres less. One shared qu
 Postgres CPU than four separate ones, and the rings add only 1-3 µs per request. Feeds, the most expensive read,
 get their own lane so nothing waits behind them. Every 10 s the drain process logs each lane's counters.
 
+Each lane runs at most two drains at once. Late in a run the feed lane sits at that cap most of the time, so once the
+oldest queued feed has waited 120 ms it borrows a third slot from the shared lane. Feed drains get smaller and
+quicker. In paired 200k holds on an aged database, feed p95 fell by about 450 ms and overall p95 by 59 and 128 ms,
+while the other reads waited up to 130 ms longer.
+
 ## 2. One SQL statement for every list and article read
 
 ```
@@ -177,7 +182,8 @@ sent within 15 ms of its request skips the command, since the kernel already hol
 quick.
 
 start.sh leaves it off (`CONDUIT_FLAGS=ackdelay=off`). At 200k users most replies miss the delayed-ACK window
-anyway, and in paired 5-minute holds at 200k the server ran 33-36 ms lower at p95 with it off.
+anyway. In paired 5-minute holds at 200k it ran 33-36 ms lower at p95 with it off, and 64 and 72 ms lower on an
+aged database.
 `CONDUIT_FLAGS=ackdelay=on` turns it on.
 
 ## 7. Writes and the event loop
@@ -209,6 +215,6 @@ authors once. SCHED_BATCH is common to several entries, and #130 measured it. #1
 instructions per lane-round, as we did for our kernel. Sharing a response within one execution has #31 as precedent
 and follows the form of theCatWisel's #132 and #143. Test vectors: Openwall, Rust `bcrypt`, Go `x/crypto/bcrypt`.
 
-Ours: the single read queue across workers, MEGA and its three trims, the comments follows lookup scoped to the
+Ours: the single read queue across workers and the feed lane's borrowed third slot, MEGA and its three trims, the comments follows lookup scoped to the
 thread's authors, gzip only when it saves a segment and its encoder, ACK delay as a ring command, the ring
 bookkeeping set, and the SHRX bcrypt kernel.
