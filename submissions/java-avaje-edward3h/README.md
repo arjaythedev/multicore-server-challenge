@@ -1,6 +1,6 @@
 # Conduit: Java 26 (Avaje, Helidon SE, kiwiproc)
 
-**Front: nginx**
+**Front: direct**
 
 Plain Java on the [Avaje](https://avaje.io/) stack, with [Helidon SE](https://helidon.io/) as the HTTP server and
 [kiwiproc](https://edward3h.github.io/kiwiproc/) for SQL. The package layout follows `examples/java` (one controller
@@ -84,9 +84,14 @@ machine described under [Results](#results); the ones that didn't help are liste
 - The pool is 10 connections per core, capped at 95, and was not very sensitive (see below).
 
 **HTTP and threads**
+- Served directly on port 80 rather than behind Nginx, which used about 14% of the benchmark box in the previous
+  official run. That cost only matters because the proxy, Postgres and the server share one machine here; in
+  production the proxy would normally be a separate server (for TLS, slow clients and compression), and this server
+  would sit behind it unchanged: it reads `HOST` and `PORT` and keeps its own connections.
 - Helidon SE instead of the JDK's built-in `HttpServer` (via Jex): 9,200 users held, against 9,500.
 - Helidon runs every request on its own virtual thread. Its connection read timeout is 75 s, which also bounds an
-  idle keep-alive connection, so it outlasts Nginx's 60 s upstream keep-alive. The listen backlog is 1024.
+  idle keep-alive connection. It is above the workload's longest think time (70 s), so a connection that is only
+  thinking is never closed by the server. The listen backlog is 1024.
 - `tcpNoDelay` is on. Without it, a response written in two pieces (headers, then a larger body) waited for the
   client's delayed ACK, about 40 ms on the list endpoints.
 - bcrypt (about 70 ms of CPU per hash) runs on a small pool of platform threads (`Passwords.java`, half the cores),

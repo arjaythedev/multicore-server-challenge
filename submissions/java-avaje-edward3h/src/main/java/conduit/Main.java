@@ -47,7 +47,7 @@ public class Main {
         });
 
         // Helidon runs every request on a virtual thread. The read timeout also bounds an idle keep-alive connection:
-        // keep it above Nginx's 60 s upstream keep-alive.
+        // keep it above the longest think time between a user's requests (70 s).
         WebServer.builder()
                 .host(Config.env("HOST", "127.0.0.1"))
                 .port(Integer.parseInt(Config.env("PORT", "3000")))
