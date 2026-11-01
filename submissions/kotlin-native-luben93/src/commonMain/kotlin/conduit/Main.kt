@@ -65,6 +65,9 @@ fun main() {
     // took Postgres from 170 to 127 us per request at 120k users (lab/reports/omarchy-20261027.md).
     val shareReads = envInt("READ_SHARE", 1) != 0
     val gatherMs = envInt("READ_GATHER_MS", 30)
+    // READ_GATHER_AUTO (default on, 0 = the fixed READ_GATHER_MS): the window is READ_GATHER_MS while the CPUs have room and widens
+    // by READ_GATHER_STEP_MS a second up to READ_GATHER_MAX_MS while they are at least READ_GATHER_HIGH_PCT busy (back at READ_GATHER_LOW_PCT).
+    val gatherMaxMs = if (envInt("READ_GATHER_AUTO", 1) != 0) envInt("READ_GATHER_MAX_MS", 100) else 0
     // READ_LIFO_MS (lab, 0 = off): adaptive LIFO once a kind's oldest read has waited this long (see DbConfig)
     val lifoMs = envInt("READ_LIFO_MS", 0)
 
@@ -83,7 +86,9 @@ fun main() {
     )
     val dbConfig = DbConfig.fromUrl(
         dbUrl, readConns, writeConns, options, readQueueMax, writeQueueMax, guard, gatherMicros = gatherMs * 1000,
-        lifoMicros = lifoMs * 1000,
+        lifoMicros = lifoMs * 1000, gatherMaxMicros = gatherMaxMs * 1000,
+        gatherStepMicros = envInt("READ_GATHER_STEP_MS", 10) * 1000, gatherHighPct = envInt("READ_GATHER_HIGH_PCT", 75),
+        gatherLowPct = envInt("READ_GATHER_LOW_PCT", 60),
     )
     App.configure(
         Db.query(dbConfig, App.COLLATION_PROBE).firstOrNull(),
@@ -92,10 +97,10 @@ fun main() {
         shareMaxBatch = envInt("READ_MAX_BATCH", 1024),
         // READ_VIEWER_FLAGS (default on): shared lists check favorited/following once per viewer, not twice per row
         viewerFlags = envInt("READ_VIEWER_FLAGS", 1) != 0,
-        // READ_FEED_MAX_BATCH (default 192, 0 = READ_MAX_BATCH): most feeds per execution. The feed statement decorates each distinct page article once (READ_FEED_SHARE)
+        // READ_FEED_MAX_BATCH (default 512, 0 = READ_MAX_BATCH): most feeds per execution. The feed statement decorates each distinct page article once (READ_FEED_SHARE)
         // and its hub/count work is per batch, so bigger batches cost less per feed (EXPLAIN, per feed: 334 us at 64, 233 us at 200). Lab, 180k users: cap 64 collapsed (p95 6 s,
-        // 1.7% timeouts), 192 and 1024 held the whole load (steady-state p95 130-143 ms, p99 184-199 ms).
-        feedMaxBatch = envInt("READ_FEED_MAX_BATCH", 192),
+        // 1.7% timeouts), 192 and 1024 held the whole load (steady-state p95 130-143 ms, p99 184-199 ms). The auto gather window sends bigger feed batches: at 60 ms 512 measured 74-75 us per request against 78 with 192.
+        feedMaxBatch = envInt("READ_FEED_MAX_BATCH", 512),
         // READ_FEED_HEAVY (default on; 0 = the plain capped count): skip the capped feed count for viewers who follow an author with 1000+ articles
         feedHeavy = envInt("READ_FEED_HEAVY", 1) != 0,
         // READ_FEED_FLOOR (default on, needs READ_FEED_HEAVY; 0 = off): per-batch floor ids of the shared hub followees bound the page probes
@@ -114,7 +119,7 @@ fun main() {
     startHttpServer(host, port, httpThreads, HttpEngine { ex -> App.handle(ex) })
     println(
         "conduit: listening on $host:$port (cpus=$cpus http=$httpThreads db=$readConns+$writeConns " +
-            "bcrypt=$bcryptThreads${if (bcryptExtra > 0) "+$bcryptExtra after ${bcryptExtraAge}ms" else ""}; tags sorted by ${App.tagOrder}; reads ${App.readMode}, gather $gatherMs ms${if (lifoMs > 0) ", LIFO after $lifoMs ms" else ""}; " +
+            "bcrypt=$bcryptThreads${if (bcryptExtra > 0) "+$bcryptExtra after ${bcryptExtraAge}ms" else ""}; tags sorted by ${App.tagOrder}; reads ${App.readMode}, gather $gatherMs ms${if (gatherMaxMs > gatherMs) "..$gatherMaxMs ms (auto)" else ""}${if (lifoMs > 0) ", LIFO after $lifoMs ms" else ""}; " +
             "overload guard ${if (guard) "on, queue caps $readQueueMax/$writeQueueMax/$bcryptQueueMax" else "off"}; " +
             "gzip ${Gzip.description}; " +
             "$platform)",

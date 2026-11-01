@@ -20,6 +20,7 @@ import conduit.util.intBE
 import conduit.util.logSafe
 import kotlin.coroutines.Continuation
 import kotlin.coroutines.resume
+import kotlin.concurrent.Volatile
 import kotlin.jvm.JvmField
 
 /** One queued read: the request's row of the five arrays plus its continuation. */
@@ -332,7 +333,9 @@ internal class ReadPool(
     private val cap = queues.maxOfOrNull { it.maxBatch } ?: 1
     @JvmField val workers = Array(config.readConns) { ReadWorker(this, it, cap) }
     private val skipAbandoned = config.skipAbandoned
-    private val gatherNanos = config.gatherMicros * 1000L
+    /** The gather window; [config]'s is the floor, the [GatherTuner] (when on) moves it between 1 s ticks. */
+    private val cfg = config
+    @Volatile private var gatherNanos = config.gatherMicros * 1000L
     private val lifoNanos = config.lifoMicros * 1000L
 
     private var seq = 0L
@@ -380,12 +383,33 @@ internal class ReadPool(
      */
     fun startGatherClock() {
         if (gatherNanos <= 0) return
-        val tick = maxOf(500_000L, gatherNanos / 8)
+        val floorNanos = gatherNanos
+        val tick = maxOf(500_000L, floorNanos / 8)
+        val tuner = cfg.gatherMaxMicros.let { max ->
+            if (max > cfg.gatherMicros) {
+                GatherTuner(
+                    cfg.gatherMicros / 1000, max / 1000, cfg.gatherStepMicros / 1000, cfg.gatherHighPct, cfg.gatherLowPct,
+                )
+            } else null
+        }
         startThread("db-gather") {
             val m = Monitor()
             val assigned = ArrayList<PgConn>(workers.size)
+            var nextTune = nanoTime() + 1_000_000_000L
             while (true) {
                 sleepNanos(m, tick)
+                if (tuner != null) {
+                    val now = nanoTime()
+                    if (now >= nextTune) {
+                        nextTune = now + 1_000_000_000L
+                        val cur = (gatherNanos / 1_000_000L).toInt()
+                        val ms = tuner.next(cur)
+                        if (ms != cur) {
+                            gatherNanos = ms * 1_000_000L
+                            if (ms == tuner.maxMs || ms == tuner.floorMs) println("db: read gather window $ms ms (box busy, auto)")
+                        }
+                    }
+                }
                 lock.locked {
                     if (stopping) return@startThread
                     while (true) assigned.add(dispatchLocked() ?: break)
@@ -568,7 +592,7 @@ internal class ReadPool(
     fun intervalStats(intervalNanos: Long): String = lock.locked {
         val util = if (intervalNanos > 0) 100 * busyNanos / (intervalNanos * workers.size) else 0
         busyNanos = 0
-        val sb = StringBuilder("reads util $util%, queued $queued")
+        val sb = StringBuilder("reads util $util%, gather ${gatherNanos / 1_000_000L} ms, queued $queued")
         for (q in queues) {
             if (q.iBatches == 0L) continue
             sb.append(" | ").append(q.kind.name).append(' ').append(q.iRequests).append('/').append(q.iBatches)

@@ -99,6 +99,15 @@ class DbConfig(
      * once it clears, or dropped unrun past the client's timeout) instead of every request behind it.
      */
     val lifoMicros: Int = 0,
+    /**
+     * Auto gather ([GatherTuner]; 0 or at most [gatherMicros]: off): the window ([gatherMicros] is its floor) widens by
+     * [gatherStepMicros] per second up to this while the CPUs the process runs on are at least [gatherHighPct] busy and
+     * narrows again at [gatherLowPct] or less.
+     */
+    val gatherMaxMicros: Int = 0,
+    val gatherStepMicros: Int = 10_000,
+    val gatherHighPct: Int = 75,
+    val gatherLowPct: Int = 60,
 ) {
     companion object {
         /**
@@ -115,6 +124,10 @@ class DbConfig(
             skipAbandoned: Boolean = false,
             gatherMicros: Int = 0,
             lifoMicros: Int = 0,
+            gatherMaxMicros: Int = 0,
+            gatherStepMicros: Int = 10_000,
+            gatherHighPct: Int = 75,
+            gatherLowPct: Int = 60,
         ): DbConfig {
             val rest = when {
                 url.startsWith("postgres://") -> url.substring("postgres://".length)
@@ -150,6 +163,7 @@ class DbConfig(
             return DbConfig(
                 host.ifEmpty { "localhost" }, port, user, password, database, readConns, writeConns, options,
                 readQueueMax, writeQueueMax, skipAbandoned, gatherMicros, lifoMicros,
+                gatherMaxMicros, gatherStepMicros, gatherHighPct, gatherLowPct,
             )
         }
 
