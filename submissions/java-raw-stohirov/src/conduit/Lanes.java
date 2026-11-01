@@ -47,8 +47,11 @@ final class Lanes {
         if (bcryptLanes > 0) Hasher.lanes = Math.min(bcryptLanes, BCryptLanes.MAX);
         else {
             Thread m = new Thread(() -> {
-                Hasher.lanes = Hasher.measure();
-                System.out.println("bcrypt: " + Hasher.lanes + " lanes");
+                try {
+                    Hasher.measure();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
             }, "bcrypt-measure");
             m.setDaemon(true);
             m.start();
@@ -72,40 +75,91 @@ final class Lanes {
             this.windowNanos = windowNanos;
         }
 
-        /**
-         * Times every width on throwaway keys at a low cost and keeps the fastest per hash. Three passes, each width's
-         * fastest run counting: a width isn't judged while the JIT is still compiling its kernel.
-         */
-        static int measure() {
+        /** Times one width of one kernel: hashes at a low cost on throwaway keys, per hash, cost 10 equivalent, in ms. */
+        private static double timeOnce(int style, int k, int cost) {
             byte[] pw = "throwaway-password".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
-            int max = BCryptLanes.MAX;
-            double[] per = new double[max + 1];
-            java.util.Arrays.fill(per, Double.MAX_VALUE);
-            for (int pass = 0; pass < 3; pass++) {
-                for (int k = 1; k <= max; k++) {
-                    byte[][] pws = new byte[k][];
-                    BCrypt.Setting[] st = new BCrypt.Setting[k], warm = new BCrypt.Setting[k];
-                    for (int i = 0; i < k; i++) {
-                        pws[i] = pw;
-                        st[i] = new BCrypt.Setting("$2a$07$", 7, BCrypt.newSetting().salt());
-                        warm[i] = new BCrypt.Setting("$2a$04$", 4, st[i].salt());
+            byte[][] pws = new byte[k][];
+            BCrypt.Setting[] st = new BCrypt.Setting[k];
+            for (int i = 0; i < k; i++) {
+                pws[i] = pw;
+                st[i] = new BCrypt.Setting(String.format("$2a$%02d$", cost), cost, BCrypt.newSetting().salt());
+            }
+            long t = System.nanoTime();
+            BCrypt.hashLanes(pws, st, style);
+            return (System.nanoTime() - t) / 1e6 / k * (1L << (10 - cost));
+        }
+
+        /** The median of one run per CPU, all at once: wider sets lose once hyperthreads share an L1, as under load. */
+        private static double timeBusy(int style, int k, int cost, int threads) throws InterruptedException {
+            double[] res = new double[threads];
+            java.util.concurrent.CountDownLatch go = new java.util.concurrent.CountDownLatch(threads);
+            Thread[] ts = new Thread[threads];
+            for (int i = 0; i < threads; i++) {
+                int id = i;
+                ts[i] = new Thread(() -> {
+                    go.countDown();
+                    try {
+                        go.await();
+                    } catch (InterruptedException e) {
+                        return;
                     }
-                    if (pass == 0) for (int w = 0; w < 200; w++) BCrypt.hashLanes(pws, warm); // let the JIT compile it
-                    for (int r = 0; r < 3; r++) {
-                        long t = System.nanoTime();
-                        BCrypt.hashLanes(pws, st);
-                        per[k] = Math.min(per[k], (double) (System.nanoTime() - t) / k);
+                    res[id] = timeOnce(style, k, cost);
+                });
+                ts[i].setDaemon(true);
+                ts[i].start();
+            }
+            for (Thread t : ts) t.join();
+            java.util.Arrays.sort(res);
+            return res[threads / 2];
+        }
+
+        /**
+         * Picks the kernel and width. Native kernels are timed with every CPU busy, each combination's best of a few
+         * runs. Without them, the Java kernels are timed alone in three passes, each width's fastest run counting: a
+         * width isn't judged while the JIT is still compiling its kernel.
+         */
+        static void measure() throws InterruptedException {
+            int cpus = Runtime.getRuntime().availableProcessors();
+            StringBuilder log = new StringBuilder("bcrypt: ms per hash at cost 10:");
+            double best = Double.MAX_VALUE;
+            int bestStyle = BCrypt.JAVA, bestK = 1;
+            if (BCryptNative.available()) {
+                for (int style : BCryptNative.styles()) {
+                    log.append(' ').append(BCryptNative.name(style)).append(':');
+                    for (int k = 1; k <= BCryptLanes.MAX; k++) {
+                        double t = Double.MAX_VALUE;
+                        for (int r = 0; r < 3; r++) t = Math.min(t, timeBusy(style, k, 7, cpus));
+                        log.append(String.format(" %d=%.1f", k, t));
+                        if (t < best * 0.97) {
+                            best = t;
+                            bestStyle = style;
+                            bestK = k;
+                        }
+                    }
+                }
+            } else {
+                int max = BCryptLanes.MAX;
+                double[] per = new double[max + 1];
+                java.util.Arrays.fill(per, Double.MAX_VALUE);
+                for (int pass = 0; pass < 3; pass++) {
+                    for (int k = 1; k <= max; k++) {
+                        if (pass == 0) for (int w = 0; w < 200; w++) timeOnce(BCrypt.JAVA, k, 4); // let the JIT compile it
+                        for (int r = 0; r < 3; r++) per[k] = Math.min(per[k], timeOnce(BCrypt.JAVA, k, 7));
+                    }
+                }
+                log.append(" java:");
+                for (int k = 1; k <= max; k++) {
+                    log.append(String.format(" %d=%.1f", k, per[k]));
+                    if (per[k] < best * 0.97) {
+                        best = per[k];
+                        bestK = k;
                     }
                 }
             }
-            int bestK = 1;
-            StringBuilder log = new StringBuilder("bcrypt: per-hash ms at cost 10 by width:");
-            for (int k = 1; k <= max; k++) {
-                log.append(String.format(" %d=%.1f", k, per[k] * 8 / 1e6));
-                if (per[k] < per[bestK] * 0.97) bestK = k;
-            }
             System.out.println(log);
-            return bestK;
+            BCryptNative.style = bestStyle;
+            lanes = bestK;
+            System.out.println("bcrypt: " + BCryptNative.name(bestStyle) + " kernel, " + bestK + " lanes");
         }
 
         @Override

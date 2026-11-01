@@ -45,21 +45,28 @@ public final class SelfTest {
         check(!BCrypt.verify("password124".getBytes(StandardCharsets.UTF_8), vectors[5][1]), "bcrypt rejects a wrong password");
         check(BCrypt.verify("hunter2".getBytes(StandardCharsets.UTF_8), BCrypt.hash("hunter2".getBytes(StandardCharsets.UTF_8))), "bcrypt hash round-trips");
         Random rnd = new Random(42);
-        for (int k = 1; k <= BCryptLanes.MAX; k++) {
-            byte[][] pw = new byte[k][];
-            BCrypt.Setting[] st = new BCrypt.Setting[k];
-            for (int i = 0; i < k; i++) {
-                pw[i] = new byte[rnd.nextInt(80)];
-                rnd.nextBytes(pw[i]);
-                st[i] = new BCrypt.Setting("$2a$05$", 5, BCrypt.newSetting().salt());
+        java.util.List<Integer> kernels = new java.util.ArrayList<>(java.util.List.of(BCrypt.JAVA));
+        if (BCryptNative.available()) for (int style : BCryptNative.styles()) kernels.add(style);
+        else System.out.println("note: no native kernels here, Java kernels only");
+        for (int style : kernels) {
+            for (String[] v : vectors) {
+                BCrypt.Setting vs = BCrypt.parse(v[1]);
+                check(BCrypt.hashLanes(new byte[][] {v[0].getBytes(StandardCharsets.UTF_8)}, new BCrypt.Setting[] {vs}, style)[0].equals(v[1]),
+                        "bcrypt " + BCryptNative.name(style) + " vector \"" + v[0] + "\"");
             }
-            String[] h = BCrypt.hashLanes(pw, st);
-            boolean same = true;
-            for (int i = 0; i < k; i++) {
-                String one = BCrypt.hashLanes(new byte[][] {pw[i]}, new BCrypt.Setting[] {st[i]})[0];
-                same &= one.equals(h[i]);
+            for (int k = 1; k <= BCryptLanes.MAX; k++) {
+                byte[][] pw = new byte[k][];
+                BCrypt.Setting[] st = new BCrypt.Setting[k];
+                for (int i = 0; i < k; i++) {
+                    pw[i] = new byte[rnd.nextInt(80)];
+                    rnd.nextBytes(pw[i]);
+                    st[i] = new BCrypt.Setting("$2a$05$", 5, BCrypt.newSetting().salt());
+                }
+                String[] h = BCrypt.hashLanes(pw, st, style);
+                boolean same = true;
+                for (int i = 0; i < k; i++) same &= BCrypt.hashLanes(new byte[][] {pw[i]}, new BCrypt.Setting[] {st[i]}, BCrypt.JAVA)[0].equals(h[i]);
+                check(same, "bcrypt " + BCryptNative.name(style) + " " + k + " lanes match single Java hashes");
             }
-            check(same, "bcrypt " + k + " lanes match single hashes");
         }
 
         // JWT
