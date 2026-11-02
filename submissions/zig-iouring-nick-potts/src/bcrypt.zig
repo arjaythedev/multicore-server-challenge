@@ -301,11 +301,20 @@ pub var done_efd: i32 = -1;
 /// Self-test, then calibration. Exits on a self-test mismatch (a wrong kernel would lock users out). Below
 /// x86-64-v3 it runs the portable kernel, which costs more per hash but still batches. main.zig calls it once
 /// before forking the workers, which spares each worker its own run (about 3.4 CPU-seconds on a Ryzen 9 9950X) and
-/// gives them all the same pick; `start` calls it if nobody has.
-pub fn prepare() void {
+/// gives them all the same pick; `start` calls it if nobody has. `kernel` is ZIG_BCRYPT_KERNEL: empty for the usual
+/// candidates, `shrx` to add the `shrx` kernel style to them, or `<variant>:<lanes>` (`asm_shrx:5`) to skip
+/// calibration and run that kernel.
+pub fn prepare(kernel: []const u8) void {
     if (prepared) return;
     var failure: bc.Failure = .{};
-    engine = bc.init(8, &failure) catch |e| {
+    const shrx = std.mem.eql(u8, kernel, "shrx");
+    const pin = if (std.mem.indexOfScalar(u8, kernel, ':')) |colon| pinned(kernel[0..colon], kernel[colon + 1 ..]) else null;
+    if (pin == null and kernel.len > 0 and !shrx) {
+        std.debug.print("conduit: ZIG_BCRYPT_KERNEL '{s}' is not shrx or <variant>:<lanes>\n", .{kernel});
+        linux.exit_group(1);
+    }
+    const chosen = if (pin) |p| bc.initPinned(p.v, p.n, 8, &failure) else bc.init(shrx, 8, &failure);
+    engine = chosen catch |e| {
         std.debug.print("conduit: bcrypt self-test failed: {s} ({s} width {d} case {d})\n", .{
             @errorName(e), failure.variant, failure.width, failure.case,
         });
@@ -319,6 +328,17 @@ pub fn prepare() void {
     });
 }
 
+const Pin = struct { v: *const bc.Variant, n: usize };
+
+/// A variant this CPU can run, at a width it has.
+fn pinned(name: []const u8, lanes: []const u8) ?Pin {
+    const v = bc.findVariant(name) orelse return null;
+    if (!std.mem.eql(u8, name, "port") and !bc.cpu.detect().v3) return null;
+    const n = std.fmt.parseInt(usize, lanes, 10) catch return null;
+    if (n < 1 or n > bc.max_lanes) return null;
+    return .{ .v = v, .n = n };
+}
+
 /// How long after it was queued a job still unfinished goes to the watchdog: the fill window, which a job may spend
 /// waiting by design, plus two of `e`'s batches' CPU time, the batch a free hasher may be finishing and the job's own.
 /// A job later than that is not batching or queueing behind work; its hasher is getting no CPU.
@@ -329,7 +349,7 @@ pub fn overdueNs(e: bc.Engine) u64 {
 
 /// Starts `threads` hashers at idle priority and the watchdog at normal priority.
 pub fn start(comptime F: Flags, threads: usize) !void {
-    prepare();
+    prepare("");
     done_efd = try eventfd(linux.EFD.CLOEXEC);
     pool = .{
         .lanes = engine.lanes,
@@ -572,7 +592,7 @@ test "logins that overlap wait for company" {
 }
 
 test "a job a hasher holds without getting a CPU goes to the watchdog once overdue, and the hasher drops it" {
-    prepare();
+    prepare("shrx");
     // No threads: this test plays both hashers, and the idle one never runs until the end.
     var slots: [2]Slot = .{ .{}, .{} };
     var p: Pool = .{ .lanes = 4, .overdue_ns = overdueNs(engine), .slots = &slots };
@@ -608,7 +628,7 @@ test "a job a hasher holds without getting a CPU goes to the watchdog once overd
 }
 
 test "a hasher that finished its batch just before the watchdog took it keeps its answer" {
-    prepare();
+    prepare("shrx");
     var slots: [2]Slot = .{ .{}, .{} };
     var p: Pool = .{ .lanes = 4, .overdue_ns = overdueNs(engine), .slots = &slots };
     var j: Job = .{ .kind = .verify, .password = cost4[0], .stored = cost4[1], .owner = &test_owner };
@@ -662,7 +682,7 @@ fn savedBefore(k: u32) u32 {
 }
 
 test "the watchdog carries a hasher's batch on from the newest state the hasher saved, whatever round it got to" {
-    prepare();
+    prepare("shrx");
     const c = 6;
     var l: Logins = .{};
     try l.init(cost6[0..engine.lanes], 0x5701e);
@@ -690,7 +710,7 @@ test "the watchdog carries a hasher's batch on from the newest state the hasher 
 }
 
 test "sign-ups the watchdog carries on keep the salts the hasher picked" {
-    prepare();
+    prepare("shrx");
     for ([_]u32{ 17, 512, 1009 }) |k| {
         var slots: [2]Slot = .{ .{}, .{} };
         var p: Pool = .{ .lanes = engine.lanes, .overdue_ns = overdueNs(engine), .slots = &slots };
@@ -725,7 +745,7 @@ test "sign-ups the watchdog carries on keep the salts the hasher picked" {
 }
 
 test "the watchdog starts from the setting when the hasher's saved state is not the whole batch's" {
-    prepare();
+    prepare("shrx");
     const t0 = 1000 * std.time.ns_per_s;
     {
         // A job answered meanwhile: the batch the watchdog takes is not the one the state was saved for.
@@ -766,7 +786,7 @@ test "the watchdog starts from the setting when the hasher's saved state is not 
 }
 
 test "overdue jobs still queued go to the watchdog `lanes` at a time, or fewer once overdue for `fill_ns`" {
-    prepare();
+    prepare("shrx");
     const ms = std.time.ns_per_ms;
     var slots: [2]Slot = .{ .{}, .{} };
     var p: Pool = .{ .lanes = 2, .overdue_ns = overdueNs(engine), .slots = &slots };

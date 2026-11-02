@@ -17,6 +17,12 @@
 //! A full ring loses nothing: a worker keeps the reads it cannot ask yet in a FIFO, the drain process keeps a
 //! worker's answers in a spill buffer, and each tries again every `retry_ns` until the ring has room.
 //!
+//! Shared responses (the `share` flag): each ask carries the read's share class (api.shareClass), the inputs of its
+//! response head, and the drain process adds the worker. Within one execution, reads with the same class, statement
+//! and parameters after the viewer, and no viewer flag in their rows, would get byte-identical responses (`Plan`).
+//! The first of each such set leads: it gets its rows, then `lead` with the number of reads that follow it. They
+//! follow at once on the same ring as `same` answers, without rows, and the worker sends each of them the bytes it
+//! rendered for the lead (loop.zig). Nothing outlives the execution that produced it.
 const std = @import("std");
 const linux = std.os.linux;
 const shared = @import("shared.zig");
@@ -69,6 +75,16 @@ fn eventfd() i32 {
 fn signal(fd: i32) void {
     const one: u64 = 1;
     _ = linux.write(fd, std.mem.asBytes(&one), 8);
+    wakes.sent += 1;
+}
+
+/// Counters for ZIG_LANE_STATS: eventfd writes to wake the other side, wake completions taken, and loop iterations.
+pub var wakes: struct { sent: u32 = 0, taken: u32 = 0, iterations: u32 = 0 } = .{};
+
+pub fn logWakes(span_ms: u64) void {
+    if (role == .alone) return;
+    sys.log("wakes {d} ms: {s} sent {d}, took {d}, {d} loop iterations", .{ span_ms, @tagName(role), wakes.sent, wakes.taken, wakes.iterations });
+    wakes = .{};
 }
 
 /// The eventfd this process's loop reads besides its sockets, if any.
@@ -83,6 +99,7 @@ pub fn wakeFd() ?i32 {
 /// Takes what the other side published: a worker its answers, the drain process its asks. Called once per loop
 /// iteration, after the completions.
 pub fn receive() void {
+    wakes.iterations += 1;
     switch (role) {
         .alone => {},
         .worker => takeAnswers(),
@@ -127,10 +144,10 @@ fn soonest(a: ?u64, b: u64) u64 {
 
 // ---------------------------------------------------------------- records
 
-/// An ask: the worker's query as an opaque tag, the time it was queued, its statement, then each parameter as its
-/// kind and value.
+/// An ask: the worker's query as an opaque tag, the time it was queued, its statement, its share class, then each
+/// parameter as its kind and value.
 fn askSize(q: *const Query) usize {
-    var n: usize = 8 + 8 + 1;
+    var n: usize = 8 + 8 + 1 + 4;
     for (q.params[0..q.stmt.def().params.len]) |p| n += 1 + switch (p) {
         .null => 0,
         .int => 8,
@@ -139,11 +156,12 @@ fn askSize(q: *const Query) usize {
     return n;
 }
 
-fn encodeAsk(b: []u8, q: *const Query) void {
+fn encodeAsk(b: []u8, q: *const Query, share: u32) void {
     var w: Writer = .{ .b = b };
     w.int(u64, @intFromPtr(q));
     w.int(u64, q.queued_ns);
     w.int(u8, @intFromEnum(q.stmt));
+    w.int(u32, share);
     for (q.params[0..q.stmt.def().params.len]) |p| {
         w.int(u8, @intFromEnum(std.meta.activeTag(p)));
         switch (p) {
@@ -157,12 +175,15 @@ fn encodeAsk(b: []u8, q: *const Query) void {
     }
 }
 
-/// Fills `x` from an ask, its text parameters copied into `x.bytes`; returns when the worker queued it.
+/// Fills `x` from an ask, its text parameters copied into `x.bytes`; returns when the worker queued it. A share
+/// class gets the worker in bits 3-15, below the segment size.
 fn decodeAsk(x: *Proxy, rec: []const u8) u64 {
     var r: Reader = .{ .b = rec };
     x.tag = r.int(u64);
     const at = r.int(u64);
     x.q = .{ .stmt = @enumFromInt(r.int(u8)) };
+    const share = r.int(u32);
+    if (share != 0) x.q.share = share | @as(u32, @intCast(x.worker)) << 3;
     // Room for every byte first, so the slices into it stay valid.
     x.bytes.clearRetainingCapacity();
     x.bytes.ensureTotalCapacity(gpa, rec.len) catch sys.fatal("oom", .{});
@@ -177,8 +198,8 @@ fn decodeAsk(x: *Proxy, rec: []const u8) u64 {
     return at;
 }
 
-const Answer = enum(u8) { row, done, fail, reset };
-/// An answer: the ask's tag, its kind, then a row's DataRow body or a failure's error.
+const Answer = enum(u8) { row, done, fail, reset, lead, same };
+/// An answer: the ask's tag, its kind, then a row's DataRow body, a failure's error or a lead's follower count.
 const answer_head = 8 + 1;
 
 fn rowSize(x: *const pg.Row) usize {
@@ -279,7 +300,7 @@ fn flushAsks() void {
             }
             break;
         };
-        encodeAsk(b, q);
+        encodeAsk(b, q, api.shareClass(api.request(q)));
         _ = waiting.pop();
         asked = true;
     }
@@ -305,6 +326,8 @@ fn takeAnswers() void {
                 api.onFail(r, &e);
             },
             .reset => api.onReset(r),
+            .lead => api.onLead(r, std.mem.readInt(u32, body[0..4], .little)),
+            .same => api.onSame(r),
         }
     }
     answers.release();
@@ -441,6 +464,136 @@ pub fn reset(q: *Query) void {
     _ = answer(Proxy.of(q), .reset, 0);
 }
 
+/// `q` is done, and the next `n` answers on its worker's ring are `same`: they get its response.
+pub fn lead(q: *Query, n: u32) void {
+    const x = Proxy.of(q);
+    std.mem.writeInt(u32, answer(x, .lead, 4)[0..4], n, .little);
+    release(x);
+}
+
+pub fn same(q: *Query) void {
+    const x = Proxy.of(q);
+    _ = answer(x, .same, 0);
+    release(x);
+}
+
+// ---------------------------------------------------------------- shared responses
+
+/// Which reads of one execution share a response: those with the same share class, statement and parameters after
+/// the viewer ($1), and no viewer flag set in their rows. The first read of each set leads; the others follow it.
+pub const Plan = struct {
+    /// The execution's reads; empty while there is no plan.
+    reads: []const *Query = &.{},
+    links: std.ArrayList(Link) = .empty,
+    /// Each set's lead, with the set's last read so far.
+    sets: std.HashMapUnmanaged(u32, u32, Key, std.hash_map.default_max_load_percentage) = .empty,
+
+    const none = std.math.maxInt(u32);
+
+    const Link = struct {
+        /// The next read of its set.
+        next: u32 = none,
+        /// A lead's followers.
+        followers: u32 = 0,
+        follows: bool = false,
+    };
+
+    /// Reads by index: equal when their responses are equal, flags aside.
+    const Key = struct {
+        reads: []const *Query,
+
+        fn params(q: *const Query) []const Param {
+            const n = q.stmt.def().params.len;
+            return if (n == 0) &.{} else q.params[1..n];
+        }
+
+        pub fn hash(k: Key, i: u32) u64 {
+            const q = k.reads[i];
+            var h = std.hash.Wyhash.init(q.share);
+            h.update(&.{@intFromEnum(q.stmt)});
+            for (params(q)) |p| switch (p) {
+                .null => h.update(&.{0}),
+                .int => |v| h.update(std.mem.asBytes(&v)),
+                .text, .raw => |t| {
+                    h.update(std.mem.asBytes(&t.len));
+                    h.update(t);
+                },
+            };
+            return h.final();
+        }
+
+        pub fn eql(k: Key, i: u32, j: u32) bool {
+            const a = k.reads[i];
+            const b = k.reads[j];
+            if (a.share != b.share or a.stmt != b.stmt) return false;
+            for (params(a), params(b)) |x, y| {
+                if (std.meta.activeTag(x) != std.meta.activeTag(y)) return false;
+                const same_value = switch (x) {
+                    .null => true,
+                    .int => |v| v == y.int,
+                    .text => |t| std.mem.eql(u8, t, y.text),
+                    .raw => |t| std.mem.eql(u8, t, y.raw),
+                };
+                if (!same_value) return false;
+            }
+            return true;
+        }
+    };
+
+    /// Starts the plan for an execution answering `reads`, each on its own.
+    pub fn begin(p: *Plan, reads: []const *Query) void {
+        p.reads = reads;
+        p.sets.clearRetainingCapacity();
+        p.links.clearRetainingCapacity();
+        p.links.appendNTimes(gpa, .{}, reads.len) catch sys.fatal("oom", .{});
+    }
+
+    /// The plan for an execution whose rows carry no viewer flag: every read with a share class may share.
+    pub fn all(p: *Plan, reads: []const *Query) void {
+        p.begin(reads);
+        for (reads, 0..) |r, k| if (r.share != 0) p.add(@intCast(k));
+    }
+
+    /// Read `k`, which has a share class and no flag set in its rows, joins its set. Reads come in order.
+    pub fn add(p: *Plan, k: u32) void {
+        const g = p.sets.getOrPutContext(gpa, k, .{ .reads = p.reads }) catch sys.fatal("oom", .{});
+        if (!g.found_existing) {
+            g.value_ptr.* = k;
+            return;
+        }
+        p.links.items[g.value_ptr.*].next = k;
+        p.links.items[g.key_ptr.*].followers += 1;
+        p.links.items[k].follows = true;
+        g.value_ptr.* = k;
+    }
+
+    pub fn follows(p: *const Plan, k: usize) bool {
+        return p.links.items[k].follows;
+    }
+
+    /// Answers read `k`, which does not follow, and the reads that follow it.
+    pub fn done(p: *const Plan, k: usize, sink: anytype) void {
+        const l = p.links.items[k];
+        if (l.followers == 0) return sink.done(p.reads[k]);
+        sink.lead(p.reads[k], l.followers);
+        var f = l.next;
+        while (f != none) : (f = p.links.items[f].next) sink.same(p.reads[f]);
+    }
+
+    /// Answers every read of `reads`: each with `done` while there is no plan, else each set once, through its lead.
+    pub fn answer(p: *const Plan, reads: []const *Query, sink: anytype) void {
+        if (p.reads.len == 0) {
+            for (reads) |r| sink.done(r);
+            return;
+        }
+        for (0..reads.len) |k| if (!p.follows(k)) p.done(k, sink);
+    }
+
+    pub fn reset(p: *Plan) void {
+        p.reads = &.{};
+    }
+};
+
 // ---------------------------------------------------------------- tests
 
 const testing = std.testing;
@@ -485,11 +638,12 @@ test "an ask arrives in the drain's proxy with its tag, time, statement and its 
     q.params[3] = .{ .text = &text };
     var b: [64]u8 = undefined;
     const n = askSize(&q);
-    encodeAsk(b[0..n], &q);
+    encodeAsk(b[0..n], &q, 1 | 1448 << 16);
 
-    var x: Proxy = .{};
+    var x: Proxy = .{ .worker = 3 };
     defer x.bytes.deinit(gpa);
     try testing.expectEqual(123_456_789, decodeAsk(&x, b[0..n]));
+    try testing.expectEqual(1 | 3 << 3 | 1448 << 16, x.q.share);
     text = "changed".*;
     try testing.expectEqual(@intFromPtr(&q), x.tag);
     try testing.expectEqual(.list_tag, x.q.stmt);
@@ -534,4 +688,83 @@ test "a failure crosses with its code and message" {
     const got = readFail(b[0..failSize(&e)]);
     try testing.expect(got.is("23505"));
     try testing.expectEqualStrings("duplicate key value", got.message());
+}
+
+/// Writes what a plan answers, one line per answer, reads named by their viewer.
+const Answers = struct {
+    out: *std.ArrayList(u8),
+
+    pub fn done(a: Answers, r: *Query) void {
+        a.out.print(testing.allocator, "done {d}\n", .{viewerOf(r)}) catch @panic("oom");
+    }
+
+    pub fn lead(a: Answers, r: *Query, n: u32) void {
+        a.out.print(testing.allocator, "lead {d} of {d}\n", .{ viewerOf(r), n }) catch @panic("oom");
+    }
+
+    pub fn same(a: Answers, r: *Query) void {
+        a.out.print(testing.allocator, "same {d}\n", .{viewerOf(r)}) catch @panic("oom");
+    }
+
+    fn viewerOf(r: *const Query) i64 {
+        return if (r.stmt == .tags) @intCast(r.seq) else r.params[0].int;
+    }
+};
+
+test "reads share a response only with the same class, statement and parameters after the viewer" {
+    const w0: u32 = 1 | 2 | 4 | 1448 << 16;
+    var reqs = [_]Query{
+        .{ .stmt = .list_tag, .share = w0, .params = .{ .{ .int = 1 }, .{ .int = 10 }, .{ .int = 0 }, .{ .text = "dragons" }, .null, .null } },
+        .{ .stmt = .list_tag, .share = w0, .params = .{ .{ .int = 2 }, .{ .int = 10 }, .{ .int = 0 }, .{ .text = "dragon" }, .null, .null } },
+        .{ .stmt = .list_author, .share = w0, .params = .{ .{ .int = 3 }, .{ .int = 10 }, .{ .int = 0 }, .{ .text = "dragons" }, .null, .null } },
+        // No keep-alive: another response head.
+        .{ .stmt = .list_tag, .share = w0 & ~@as(u32, 2), .params = .{ .{ .int = 4 }, .{ .int = 10 }, .{ .int = 0 }, .{ .text = "dragons" }, .null, .null } },
+        .{ .stmt = .list_tag, .share = w0, .params = .{ .{ .int = 5 }, .{ .int = 10 }, .{ .int = 0 }, .{ .text = "dragons" }, .null, .null } },
+        .{ .stmt = .article_by_slug, .share = w0, .params = .{ .{ .int = 6 }, .{ .text = "how-to" }, .null, .null, .null, .null } },
+        .{ .stmt = .article_by_slug, .share = w0, .params = .{ .{ .int = 7 }, .{ .text = "how-to" }, .null, .null, .null, .null } },
+        .{ .stmt = .list_tag, .share = w0, .params = .{ .{ .int = 8 }, .{ .int = 10 }, .{ .int = 0 }, .{ .text = "dragons" }, .null, .null } },
+    };
+    var ptrs: [reqs.len]*Query = undefined;
+    for (&reqs, &ptrs) |*r, *p| p.* = r;
+    var plan: Plan = .{};
+    defer plan.links.deinit(gpa);
+    defer plan.sets.deinit(gpa);
+    plan.all(&ptrs);
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(testing.allocator);
+    plan.answer(&ptrs, Answers{ .out = &got });
+    try testing.expectEqualStrings(
+        \\lead 1 of 2
+        \\same 5
+        \\same 8
+        \\done 2
+        \\done 3
+        \\done 4
+        \\lead 6 of 1
+        \\same 7
+        \\
+    , got.items);
+
+    // Without a plan, every read is answered on its own.
+    plan.reset();
+    got.clearRetainingCapacity();
+    plan.answer(ptrs[5..7], Answers{ .out = &got });
+    try testing.expectEqualStrings("done 6\ndone 7\n", got.items);
+}
+
+test "a broadcast's members share by worker and response head, and a read without a class keeps its own" {
+    const w0: u32 = 1 | 2 | 4 | 1448 << 16;
+    const w1: u32 = w0 | 1 << 3;
+    var reqs: [5]Query = undefined;
+    for (&reqs, [_]u32{ w0, w1, w0, 0, w1 }, 1..) |*r, c, i| r.* = .{ .stmt = .tags, .share = c, .seq = i };
+    var ptrs: [reqs.len]*Query = undefined;
+    for (&reqs, &ptrs) |*r, *p| p.* = r;
+    var plan: Plan = .{};
+    defer plan.links.deinit(gpa);
+    defer plan.sets.deinit(gpa);
+    plan.all(&ptrs);
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(testing.allocator);
+    plan.answer(&ptrs, Answers{ .out = &got });
+    try testing.expectEqualStrings("lead 1 of 1\nsame 3\nlead 2 of 1\nsame 5\ndone 4\n", got.items);
 }
