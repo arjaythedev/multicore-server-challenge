@@ -1,0 +1,17 @@
+<Project>
+  <!-- As in sss8: warnings are errors, so a sloppy match or an unused binding never ships. -->
+  <PropertyGroup>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <WarningLevel>5</WarningLevel>
+    <Nullable>disable</Nullable>
+    <!-- rule 11: pinned dependencies. Every project restores from its packages.lock.json
+         (build.sh restores with locked-mode, so a drifted graph is a failed build). -->
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <!-- Every package from nuget.org: some SDK builds (Ubuntu's) ship their own FSharp.Core in a
+         local "library-packs" feed, with another content hash than nuget.org's, and a lock file
+         written there fails a locked restore with Microsoft's SDK (NU1403). -->
+    <DisableImplicitLibraryPacksFolder>true</DisableImplicitLibraryPacksFolder>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+  </PropertyGroup>
+</Project>

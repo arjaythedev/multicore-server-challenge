@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- The database side, as in sss8: typed records in, typed records out, SQL in one
+         place per resource. No HTTP here, and no token cryptography (that is Web.Jwt). -->
+    <Compile Include="Types.fs" />
+    <Compile Include="Db.fs" />
+    <Compile Include="Commit.fs" />
+    <Compile Include="Reads.fs" />
+    <Compile Include="Bcrypt.fs" />
+    <Compile Include="Passwords.fs" />
+    <Compile Include="Tags.fs" />
+    <Compile Include="Users.fs" />
+    <Compile Include="Profiles.fs" />
+    <Compile Include="Articles.fs" />
+    <Compile Include="Comments.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Update="FSharp.Core" Version="10.0.104" />
+    <PackageReference Include="Npgsql" Version="10.0.3" />
+    <PackageReference Include="Npgsql.FSharp" Version="5.7.0" />
+    <PackageReference Include="BCrypt.Net-Next" Version="4.2.0" />
+  </ItemGroup>
+</Project>

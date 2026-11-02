@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>Web</AssemblyName>
+    <!-- As in sss8: server GC with DATAS off. This box has RAM to spare, and DATAS trades
+         throughput for a smaller heap. -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <GarbageCollectionAdaptationMode>0</GarbageCollectionAdaptationMode>
+    <TieredPGO>true</TieredPGO>
+    <TieredCompilation>true</TieredCompilation>
+    <PublishReadyToRun>false</PublishReadyToRun>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- The JWT shim: the ONLY place token cryptography lives (the sss8 FederatedAuth rule). -->
+    <Compile Include="Jwt.fs" />
+    <!-- Wire: JSON in (validated request bodies, query paging) and JSON out. Pure. -->
+    <Compile Include="Wire.fs" />
+    <Compile Include="Handlers.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Update="FSharp.Core" Version="10.0.104" />
+    <PackageReference Include="Giraffe" Version="7.0.2" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Engine\Engine.fsproj" />
+  </ItemGroup>
+</Project>
