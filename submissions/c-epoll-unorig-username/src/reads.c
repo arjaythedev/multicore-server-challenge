@@ -31,10 +31,8 @@ static const pg_stmt READ_STMTS[] = {
       " (SELECT count(*) FROM (SELECT 1 FROM favorites f WHERE f.user_id = u.id LIMIT 1000) s)"
       " FROM unnest($1::text[], $2::int8[], $3::int8[]) WITH ORDINALITY w(n, l, o, i) JOIN users u ON u.username = w.n"),
     S("fo_of", "SELECT follower_id, followee_id FROM follows WHERE follower_id = ANY($1::int8[])"),
-    S("w_feed",
-      "SELECT w.f, ARRAY(SELECT a.id FROM articles a WHERE a.author_id = w.f ORDER BY a.id DESC LIMIT w.k),"
-      " (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = w.f LIMIT 1000) s)"
-      " FROM unnest($1::int8[], $2::int8[]) w(f, k)"),
+    S("w_feed", "SELECT w.f, ARRAY(SELECT a.id FROM articles a WHERE a.author_id = w.f ORDER BY a.id DESC LIMIT w.k) FROM unnest($1::int8[], $2::int8[]) w(f, k)"),
+    S("w_cnt", "SELECT w.f, (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = w.f LIMIT 1000) s) FROM unnest($1::int8[]) w(f)"),
     S("a_slug", "SELECT id, slug, title, description, created_at, updated_at, author_id, body FROM articles WHERE slug = ANY($1::text[])"),
     S("a_idf", "SELECT id, slug, title, description, created_at, updated_at, author_id, body FROM articles WHERE id = ANY($1::int8[])"),
     S("a_meta", "SELECT id, slug, title, description, created_at, updated_at, author_id FROM articles WHERE id = ANY($1::int8[])"),
@@ -57,6 +55,8 @@ static const char *const SETTINGS[] = {
 };
 #define NSETTINGS (int)(sizeof SETTINGS / sizeof *SETTINGS)
 #define NSTMTS (int)(sizeof READ_STMTS / sizeof *READ_STMTS)
+
+static int64_t hub_est = 600;  // estimated articles that make an author worth counting first
 
 // ---- batch-local maps
 typedef struct {
@@ -812,11 +812,51 @@ static int run_batch(drain_t *d, job **jobs, int n) {
       pg_i64arr(c, fk, fe.n);
       pg_bind_end(c);
       EXCH(r);
+      int64_t maxid = 1;
       while (pg_next(&r, &row)) {
         int ix = m64_get(&fe.m, be64(row.v[0]));
         if (ix < 0) continue;
         fw[ix].n = pg_arr_i64(row.v[1], row.l[1], &fw[ix].arr);
-        fw[ix].count = be64(row.v[2]);
+        // An array shorter than asked for holds all of the author's articles, so it is the exact count.
+        fw[ix].count = fw[ix].n < fk[ix] ? fw[ix].n : -1;
+        if (fw[ix].n && PG_ARR_AT(fw[ix].arr, 0) > maxid) maxid = PG_ARR_AT(fw[ix].arr, 0);
+      }
+      // Counts stop at 1,000 per viewer. Most viewers follow an author with 1,000+ articles, and that alone settles their
+      // count, so authors who look that big (from how densely their newest ids fall) are counted first. Everyone else's
+      // counts are read only for viewers still unsettled. The result is the exact capped count either way.
+      for (int round = 0; round < 2; round++) {
+        idset want;
+        is_init(&want, a, fe.n + 1);
+        for (int i = 0; i < n; i++) {
+          job *j = jobs[i];
+          if (!j || j->kind != K_FEED) continue;
+          int v = m64_get(&fviewers.m, j->viewer);
+          int64_t known = 0;
+          for (int q = 0; q < folen[v]; q++) {
+            win_t *w = &fw[m64_get(&fe.m, fol[v][q])];
+            if (w->count > 0) known += w->count;
+          }
+          if (known >= 1000) continue;
+          for (int q = 0; q < folen[v]; q++) {
+            int ix = m64_get(&fe.m, fol[v][q]);
+            win_t *w = &fw[ix];
+            if (w->count >= 0) continue;
+            // Estimated articles: the density of its newest k ids over the whole id range.
+            int64_t span = PG_ARR_AT(w->arr, 0) - PG_ARR_AT(w->arr, w->n - 1) + 1;
+            bool big = (int64_t)w->n * maxid / span >= hub_est;
+            if (round == 1 || big) is_add(&want, fol[v][q]);
+          }
+        }
+        if (!want.n) continue;
+        is_sort(&want);
+        pg_bind(c, "w_cnt", 1);
+        pg_i64arr(c, want.v, want.n);
+        pg_bind_end(c);
+        EXCH(r);
+        while (pg_next(&r, &row)) {
+          int ix = m64_get(&fe.m, be64(row.v[0]));
+          if (ix >= 0) fw[ix].count = be64(row.v[1]);
+        }
       }
     }
     // Merge: repeatedly take the largest head among the viewer's followees.
@@ -835,7 +875,8 @@ static int run_batch(drain_t *d, job **jobs, int n) {
       int64_t cnt = 0;
       for (int q = 0; q < m; q++) {
         pos[q] = 0;
-        cnt += fw[m64_get(&fe.m, fol[v][q])].count;
+        int64_t kc = fw[m64_get(&fe.m, fol[v][q])].count;
+        if (kc > 0) cnt += kc;
       }
       x->count = cnt > 1000 ? 1000 : cnt;
       x->ids = arena_alloc(a, sizeof(int64_t) * j->lim);
@@ -1270,6 +1311,7 @@ static void run_safe(drain_t *d, job **jobs, int n) {
 
 static void *drain_main(void *arg) {
   drain_t *d = arg;
+  pthread_setname_np(pthread_self(), "c-drain");
   const char *pol = getenv("DRAIN_SCHED");
   thread_sched(pol ? pol : "batch", 0);
   arena_init(&d->a, (size_t)4 << 30);
@@ -1300,6 +1342,7 @@ void reads_start(int n) {
   lanes[LANE_SHARED].gap = (e = getenv("GAP_SHARED_US")) ? atoll(e) : 80000;
   lanes[LANE_FEED].gap = (e = getenv("GAP_FEED_US")) ? atoll(e) : 80000;
   lanes[LANE_COMMENT].gap = (e = getenv("GAP_COMMENT_US")) ? atoll(e) : 100000;
+  if ((e = getenv("HUB_EST"))) hub_est = atoll(e);
   if ((e = getenv("READ_CAP"))) read_cap = atoi(e);
   if ((e = getenv("READ_LANES"))) lane_on = atoi(e);
   for (int i = 0; i < n; i++) {

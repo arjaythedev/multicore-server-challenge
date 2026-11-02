@@ -1089,6 +1089,7 @@ static _Atomic int loops_ready;
 static void *loop_main(void *arg) {
   loop_t *l = arg;
   // A private fd table: no contention on the shared one, and its own descriptor limit.
+  pthread_setname_np(pthread_self(), "c-loop");
   if (unshare(CLONE_FILES)) perror("unshare");
   const char *pol = getenv("LOOP_SCHED"), *nc = getenv("LOOP_NICE");
   thread_sched(pol ? pol : "batch", nc ? atoi(nc) : 5);

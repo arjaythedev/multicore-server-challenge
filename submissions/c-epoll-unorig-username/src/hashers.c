@@ -138,6 +138,7 @@ static void deliver(hctx *c, job **g, int n) {
 
 static void *hasher_main(void *arg) {
   slot_t *slot = arg;
+  pthread_setname_np(pthread_self(), "c-hash");
   const char *pol = getenv("HASH_SCHED");
   thread_sched(pol ? pol : "idle", 0);
   hctx *c = calloc(1, sizeof *c);
