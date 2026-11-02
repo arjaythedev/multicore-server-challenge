@@ -88,7 +88,7 @@ Every submission on the same box: **8 dedicated vCPU / 16 GB**, Postgres 18 on t
 | 82 | **32,000** | [elixir-raw-foovoo](submissions/elixir-raw-foovoo) | [#12](https://github.com/arjaythedev/multicore-server-challenge/pull/12) @FooVoo | direct | 7,999 | 323 | 382 | 37% / 48% |  |
 | 83 | **32,000** | [php-symfony-crossy-l](submissions/php-symfony-crossy-l) | [#70](https://github.com/arjaythedev/multicore-server-challenge/pull/70) @crossy-l | direct | 8,376 | 234 | 400 | 40% / 38% |  |
 | 84 | **32,000** | [rust-urus-markk116](submissions/rust-urus-markk116) | [#25](https://github.com/arjaythedev/multicore-server-challenge/pull/25) @Markk116 | direct | 8,313 | 438 | 540 | 27% / 46% |  |
-| 85 | **31,000** | [java-avaje-edward3h](submissions/java-avaje-edward3h) | [#161](https://github.com/arjaythedev/multicore-server-challenge/pull/161) @edward3h | direct | 8,197 | 18 | 115 | 38% / 48% |  |
+| 85 | **31,000** | [java-avaje-edward3h](submissions/java-avaje-edward3h) | [#180](https://github.com/arjaythedev/multicore-server-challenge/pull/180) @edward3h | direct | 8,197 | 18 | 115 | 38% / 48% |  |
 | 86 | **30,000** | [node-cpp-SaisakthiM](submissions/node-cpp-SaisakthiM) | [#62](https://github.com/arjaythedev/multicore-server-challenge/pull/62) @SaisakthiM | direct | 7,766 | 226 | 343 | 30% / 64% |  |
 | 87 | **29,000** | [csharp-kestrel-nayef-shuvo](submissions/csharp-kestrel-nayef-shuvo) | [#129](https://github.com/arjaythedev/multicore-server-challenge/pull/129) @nayef-shuvo | nginx | 7,552 | 214 | 324 | 23% / 61% (+ Nginx 12%) |  |
 | 88 | **28,000** | [pony-stallion-contact-red](submissions/pony-stallion-contact-red) | [#76](https://github.com/arjaythedev/multicore-server-challenge/pull/76) @redvers | direct | 7,335 | 243 | 552 | 42% / 47% |  |
