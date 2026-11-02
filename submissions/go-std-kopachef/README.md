@@ -72,14 +72,8 @@ peer-disconnect cancellation during a handler are outside this backend's scope.
 `cmd/conduit` contains the entry point. `internal/server` contains the API,
 HTTP backend, encoders and database queues; `internal/auth`,
 `internal/jsonquote` and `internal/bcryptlane` hold independent helpers.
-Tests live beside their implementation. Bcrypt source attribution and its
-upstream license remain in `internal/bcryptlane`.
-
-```sh
-go test ./cmd/... ./internal/...
-TEST_DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit_dev \
-  go test -race ./internal/server ./internal/auth ./internal/jsonquote
-```
+Bcrypt source attribution and its upstream license remain in
+`internal/bcryptlane`.
 
 From the challenge repository root, use its official runner:
 
