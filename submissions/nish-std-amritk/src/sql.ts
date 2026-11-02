@@ -425,9 +425,17 @@ export const registerPlanStatements = (pool: PgPool): boolean => {
       "plan_meta",
       "SELECT a.id, a.slug, a.title, a.description, " +
         "ARRAY(SELECT at.tag_id FROM article_tags at WHERE at.article_id = a.id), " +
-        "a.created_at, a.updated_at, u.username, u.bio, u.image, " +
+        "a.created_at, a.updated_at, " +
         "CASE WHEN q.with_body THEN a.body END " +
-        "FROM unnest($1::int8[], $2::bool[]) q(id, with_body) JOIN articles a ON a.id = q.id JOIN users u ON u.id = a.author_id",
+        "FROM unnest($1::int8[], $2::bool[]) q(id, with_body) JOIN articles a ON a.id = q.id",
+      none
+    ) && ok
+  // Each author of a plan's articles and comments, once, however many rows of
+  // the plan are theirs.
+  ok =
+    pool.register(
+      "plan_users",
+      "SELECT u.id, u.username, u.bio, u.image FROM users u WHERE u.id = ANY($1::int8[])",
       none
     ) && ok
   // Each article's favorite count, for a worker's count lane (plan.ts
@@ -466,16 +474,16 @@ export const planProfileBatch = (maxRequests: i32): PgBatchConfig =>
 
 /**
  * A plan's batcher of comments by slug: the article's newest comments, with
- * their authors' ids and profiles, one row with the comment columns NULL when
+ * their authors' ids, one row with the comment columns NULL when
  * it has none, and no row when the article does not exist.
  */
 export const planCommentBatch = (maxRequests: i32): PgBatchConfig =>
   planBatch(
     "plan_comments",
-    "SELECT a.id AS article_id, c.id, c.body, c.created_at, c.updated_at, c.author_id, u.username, u.bio, u.image " +
+    "SELECT a.id AS article_id, c.id, c.body, c.created_at, c.updated_at, c.author_id " +
       "FROM articles a LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id " +
       "FROM comments c WHERE c.article_id = a.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true " +
-      "LEFT JOIN users u ON u.id = c.author_id WHERE a.slug = q.key",
+      "WHERE a.slug = q.key",
     "t.created_at DESC, t.id DESC",
     maxRequests
   )
@@ -490,9 +498,9 @@ const planBatch = (name: string, select: string, orderBy: string, maxRequests: i
   c.binary = true
   c.maxRequests = maxRequests
   // A plan's keys are at most PLAN_KEY_BYTES, each escaped at worst to twice its length.
-  c.maxBytes = 65536
+  c.maxBytes = 524288
   c.queueSize = maxRequests
-  c.queueBytes = 65536
+  c.queueBytes = 524288
   // One execution a plan; a second run would be a plan's failed take, made again empty.
   c.runs = 2
   return c
