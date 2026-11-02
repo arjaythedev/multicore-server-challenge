@@ -44,8 +44,12 @@ static const pg_stmt READ_STMTS[] = {
       " ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true WHERE a.slug = ANY($1::text[])"),
     S("a_tags", "SELECT article_id, tag_id::int8 FROM article_tags WHERE article_id = ANY($1::int8[])"),
     S("f_cnt", "SELECT article_id, count(*) FROM favorites WHERE article_id = ANY($1::int8[]) GROUP BY article_id"),
-    S("f_flag", "SELECT user_id, article_id FROM favorites WHERE user_id = ANY($1::int8[]) AND article_id = ANY($2::int8[])"),
-    S("fo_flag", "SELECT follower_id, followee_id FROM follows WHERE follower_id = ANY($1::int8[]) AND followee_id = ANY($2::int8[])"),
+    // Two arrays on one index: the planner's guess for two ANY conditions can flip to the other index with a linear filter on
+    // the first array, which is ruinous at batch sizes. OFFSET 0 pins the primary-key scan, and the join hashes the second array.
+    S("f_flag", "SELECT s.user_id, s.article_id FROM (SELECT user_id, article_id FROM favorites WHERE user_id = ANY($1::int8[]) OFFSET 0) s"
+                " JOIN unnest($2::int8[]) a(id) ON a.id = s.article_id"),
+    S("fo_flag", "SELECT s.follower_id, s.followee_id FROM (SELECT follower_id, followee_id FROM follows WHERE follower_id = ANY($1::int8[]) OFFSET 0) s"
+                 " JOIN unnest($2::int8[]) a(id) ON a.id = s.followee_id"),
 };
 static const char *const SETTINGS[] = {
     "SET plan_cache_mode = force_generic_plan", "SET jit = off", "SET max_parallel_workers_per_gather = 0", "SET TimeZone = 'UTC'",
@@ -1069,7 +1073,7 @@ typedef struct {
 } lane_t;
 static lane_t lanes[NLANES];
 static pthread_mutex_t q_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t q_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t q_cv;
 static int waiting, inflight, read_cap = 6, lane_on = 1;
 #define MAX_BATCH 4096
 
@@ -1214,6 +1218,10 @@ static void *drain_main(void *arg) {
 }
 
 void reads_start(int n) {
+  pthread_condattr_t ca;
+  pthread_condattr_init(&ca);
+  pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+  pthread_cond_init(&q_cv, &ca);
   const char *e;
   lanes[LANE_SHARED].gap = (e = getenv("GAP_SHARED_US")) ? atoll(e) : 80000;
   lanes[LANE_FEED].gap = (e = getenv("GAP_FEED_US")) ? atoll(e) : 80000;
