@@ -1,0 +1,5 @@
+asyncpg
+bcrypt
+httptools
+orjson
+uvloop
