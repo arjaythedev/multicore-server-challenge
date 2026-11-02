@@ -355,6 +355,10 @@ ngx_http_sql_route(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         sql_param_t *pm = ngx_array_push(&route->params);
         ngx_str_t    val;
 
+        if (pm == NULL) {
+            return NGX_CONF_ERROR;
+        }
+        ngx_memzero(pm, sizeof(*pm));
         p = ngx_strlchr(v[i].data, v[i].data + v[i].len, '=');
         if (p == NULL) {
             return "params are name=value";
