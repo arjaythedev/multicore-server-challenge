@@ -3,7 +3,7 @@ package challenge;
 public final class BCryptBench {
     public static void main(String[] args) {
         BCrypt bcrypt = new BCrypt();
-        for (int lanes : new int[] {1, 2, 4}) {
+        for (int lanes = 1; lanes <= BCryptLanes.MAX; lanes++) {
             String[] passwords = new String[lanes];
             String[] salts = new String[lanes];
             for (int i = 0; i < lanes; i++) {

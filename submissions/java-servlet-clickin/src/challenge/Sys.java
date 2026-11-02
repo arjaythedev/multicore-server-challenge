@@ -49,6 +49,7 @@ public final class Sys {
     public static final int EPOLLHUP = 0x10;
     public static final int EINTR = 4;
     public static final int EAGAIN = 11;
+    public static final int ENOMEM = 12;
     public static final int EBUSY = 16;
     public static final int ENFILE = 23;
     public static final int EMFILE = 24;

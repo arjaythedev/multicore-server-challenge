@@ -59,28 +59,44 @@ against the Servlet API: standard `HttpServlet`s, in async mode, on a container 
   None of it runs unless called. Not provided: sessions, login, multipart, request dispatching to other paths,
   protocol upgrade and trailers; those throw or answer as the spec says for a container without them. The async
   timeout is stored but not enforced, and a response is sent whole on completion (`flushBuffer` cannot commit early).
-- **Backpressure.** At most `MAX_INFLIGHT_PER_LOOP` (1024) requests in flight per loop; past that a loop stops reading
-  new requests until one completes, so overload raises latency instead of memory.
+- **Backpressure.** At most `MAX_INFLIGHT_PER_LOOP` (2048) requests in flight per loop; past that a loop stops reading
+  new requests until one completes, so overload raises latency instead of memory. A request holds its slot through
+  every read round, gather waits included, so the cap is also a throughput limit (slots / time held): at 1024 a 20 ms
+  gather capped Hetzner at 31.5k req/s with the box at 72%; at 4096 an overloaded run filled the 2 GB heap.
 
 ## Postgres work per request
 
 - **One statement per request**, prepared once per connection, binary results, generic plans that stay sane: every
   list's page is cut first (`LIMIT/OFFSET` on the bare index walk) and decorated afterwards, and the page sits under a
   constant `LIMIT 100` so a parameter `LIMIT` can't make the planner expect 10% of the table (it once picked a hash
-  join over all 500k articles for every request in a batch: 8 s per batch, 13 ms after).
-- **Reads are batched across requests.** A single dispatcher thread owns all read connections (8) and write
-  connections (4). Each read connection has one round in flight; reads that arrive meanwhile wait (and wait up to
-  `READ_GATHER_US` = 5 ms for company), then go out together: requests of a kind become **one** statement over arrays
+  join over all 500k articles for every request in a batch: 8 s per batch, 13 ms after). Every connection sets
+  `plan_cache_mode = force_generic_plan` (a session `SET`): in `auto` mode Postgres kept re-planning the batch
+  statements, whose array parameters make each custom plan look different, on almost every execution (~0.3 ms each).
+- **Reads are batched across requests.** A single dispatcher thread owns all read connections (8) and the write
+  connection (1). Each read connection has one round in flight; reads that arrive meanwhile wait (and wait up to
+  `READ_GATHER_US` = 30 ms for company, up to `READ_ROUND_MAX` = 4096 per round), then go out together: requests of a kind become **one** statement over arrays
   of their parameters (`unnest(...) WITH ORDINALITY` + `LATERAL`), each row tagged with its request. Within a
   statement, each distinct article is decorated (tags, favorites count, author) **once**, however many requests in
   the batch show it; only `favorited` / `following` are per viewer. Nothing outlives the statement (rule 5).
+- **A round's kinds run side by side.** A round's batch statements would otherwise run one after another on one
+  backend, every request waiting for the round's last one, while the other read connections sat idle (locally 0.7
+  busy at 20 ms gathers). The round is grouped by kind and each kind's batch goes whole to one of up to
+  `READ_SPREAD` (3) idle connections, heaviest first onto the least loaded, so a round takes about its slowest
+  statement (feed) instead of the sum.
+- **No repeated lookups inside a batch.** Tag names come from one join + `array_agg` grouped by article (the
+  per-article subquery's generic plan scanned and hashed all 200 tags for every article). The article and comments
+  batches look each slug up once in a `MATERIALIZED` CTE and reuse that row (they used to look it up twice). A keyed
+  list (`?tag=`, `?author=`, `?favorited=`) resolves and counts each distinct name once, however many requests in
+  the batch ask for it. The feed knows `following` is true for every author it walks and skips that probe.
 - **The feed's count, proven instead of counted.** Most viewers follow an author with 1,000+ articles (82.6% of users),
   so their capped count is 1,000. A batch picks the 4 authors most followed by its viewers, proves ≥ 1,000 articles
   for each with one bounded index walk, and only the other viewers count.
-- **Group commit.** Each write connection has one group in flight; writes that arrive meanwhile go out together, each
+- **Group commit.** The write connection has one group in flight; writes that arrive meanwhile go out together, each
   request's statements back to back and one `Sync` at the end: one transaction, one WAL flush. Responses are sent
   only after the group commits (rule 6). If any statement fails, the group is rolled back by Postgres and its
-  requests are retried one by one, so only the faulty one gets its error (e.g. 422 on a duplicate email).
+  requests are retried one by one, so only the faulty one gets its error (e.g. 422 on a duplicate email). With
+  four write connections each group held one or two writes, i.e. about one fsync per write; one connection gathers
+  every write that arrives during a WAL flush.
 
 Measured locally on the full seed (Postgres, server and load generator in one 8-CPU container, fixed load of
 18k req/s; `pg_stat_statements`, local only):
@@ -95,11 +111,77 @@ Measured locally on the full seed (Postgres, server and load generator in one 8-
 
 Every login and sign-up verifies or hashes with cost 10 (rule 7). That is about 28 hashes/s at 100k users and, at
 ~65 ms per hash on EPYC, ~1.7 cores: a fifth of the box. Blowfish is one long dependency chain, so a single hash
-leaves most of the core idle: `BCrypt` runs up to 4 independent hashes interleaved in the same loop (1 lane 67.5 ms,
-4 lanes 38 ms per hash on EPYC). Hashes run on their own `BCRYPT_THREADS` (4) threads at `nice` 5 (`setpriority`
-per thread through FFM; `Thread.setPriority` is a no-op on Linux), which wait up to 40 ms to fill their lanes.
+leaves most of the core idle: `BCrypt` runs up to 6 independent hashes interleaved in one straight-line kernel per
+width, each lane in its own locals (`BCryptLanes`, generated). Per hash on Hetzner's EPYC
+Milan: 1 lane 60 ms, 2 lanes 33, 3 lanes 25.8, 4 lanes 23.4, 5 lanes 23.0, 6 lanes 24.5 (the earlier hand-written
+2/4-lane loop: 38 / 29). The best width depends on the core's registers and load ports, so the pool times every width
+at startup (~2-5 s of one core, logged as `bcrypt: N lanes`) and takes the fastest, preferring fewer lanes within 3%. Hashes run on their own `BCRYPT_THREADS` (4) threads at `nice` 5 (`setpriority`
+per thread through FFM; `Thread.setPriority` is a no-op on Linux). One thread at a time gathers a set, waiting up to
+400 ms to fill its lanes, while the others hash: when every thread gathered on its own for 40 ms, ~20-30 logins/s
+came out one per thread and the 4-lane loop mostly ran a lone hash (locally 70 ms of CPU per hash, 32 ms after; bcrypt
+threads 1.39 -> 0.63 cores at 18k req/s). Logins wait longer for their set (p50 ~0.2 s), but they are 0.1% of requests.
 
 ## Results
+
+### Query work (this branch vs. the previous build, `a3d49a1`)
+
+Hetzner ccx33 target, two cpx42 load boxes: fresh switch, a 60 s warm-up, then a fixed user
+count, measured 120 s (80k) or 60 s (120k), two runs per build, alternated. CPU is the share of the whole box (app / Postgres, from systemd cgroups).
+
+| Users | Build | req/s | p50 | p95 | p99 | Box CPU (app / Postgres) |
+|--:|---|--:|--:|--:|--:|---|
+| 80,000 | previous | 21,054-21,068 | 26-27 ms | 48-54 ms | 68-104 ms | 72.3% (31.1% / 39.3%) |
+| 80,000 | this | 21,073-21,099 | 20-21 ms | 35-36 ms | 43-49 ms | 60.5% (29.2% / 29.2%) |
+| 120,000 | previous | 30,657-30,800 | 94-98 ms | 352-371 ms | 474-667 ms | 98.6% (42.7% / 54.5%) |
+| 120,000 | this | 31,297-31,325 | 40-45 ms | 167-178 ms | 251-262 ms | 90.7% (45.0% / 44.1%) |
+
+At the same throughput Postgres uses about a quarter less CPU (39.3% -> 29.2% of the box at 80k). At 120k the
+previous build is out of CPU and queueing, while this one still has ~9% of the box free and half the tail latency.
+Past ~130k users these two load boxes fall behind themselves, so the rig cannot find this build's limit. Local
+`pg_stat_statements` (same load, total execution time): 78 s -> 55 s.
+
+### bcrypt kernels and longer read gathers (2026-11-01)
+
+Same rig and script, three load boxes (two cpx42, one ccx23), 60 s warm-up, 120 s measured. This target ran faster than
+the one above (base at 120k: 78% of the box, not 90.7%), so compare within this table only. "lanes" is the generated
+bcrypt kernels on the old defaults; "+ gather" adds `READ_GATHER_US` 20000, `READ_ROUND_MAX` 4096 and
+`MAX_INFLIGHT_PER_LOOP` 2048.
+
+| Users | Build | req/s | p95 | p99 | Box CPU (app / Postgres) |
+|--:|---|--:|--:|--:|---|
+| 120,000 | previous | 31,543-31,604 | 53 ms | 67 ms | 78.1-78.6% (33.3-33.8% / 41.9%) |
+| 120,000 | lanes | 31,521-31,542 | 51-53 ms | 63-65 ms | 77.1-77.4% (32.2-32.4% / 42.0-42.2%) |
+| 140,000 | previous | 36,550 | 124 ms | 191 ms | 94.0% (41.8% / 50.2%) |
+| 140,000 | lanes | 36,636-36,673 | 92-95 ms | 126-137 ms | 91.6-92.0% (39.2-39.4% / 50.1-50.2%) |
+| 140,000 | + gather | 36,127 | 200 ms | 249 ms | 84.4% (39.8% / 41.4%) |
+| 150,000 | lanes | 37,956 | 498 ms | 593 ms | 97.9% (44.0% / 52.0%) — at the p95 limit |
+| 150,000 | + gather | 38,447 | 254 ms | 326 ms | 90.6% (43.2% / 44.4%) |
+| 160,000 | lanes | 37,313 | 786 ms | 1,090 ms | 99.1% (46.6% / 50.7%) — fail |
+| 160,000 | + gather | 40,072 | 557 ms | 790 ms | 94.1% (45.2% / 46.0%) — fail (p95) |
+
+The 20 ms gather takes ~16% off Postgres for a little more app CPU and ~100 ms more p50. With the old in-flight cap
+(1024 per loop) the same gather collapsed at 140k: 31.2k req/s, p99 6.6 s, box only 72% (40 ms gathers: 21.5k).
+At 160k the + gather run misses on latency with 6% of the box still free.
+
+### Spreading a round over connections (2026-11-01)
+
+Another target (slower: the 20 ms-gather build at 150k ran 93-96% of the box), three load boxes split 3:3:2 (the third
+is a 4-vCPU ccx23), 120 s measured, alternated. "spread" is `READ_SPREAD=8` with `READ_GATHER_US=30000`; "previous" is
+the defaults above (serial rounds, 20 ms gathers).
+
+| Users | Build | req/s | p50 | p95 | p99 | Box CPU (app / Postgres) |
+|--:|---|--:|--:|--:|--:|---|
+| 130,000 | previous | 33,458-33,532 | 102-105 ms | 205-215 ms | 257-274 ms | 85.0-85.7% (40.8-40.9% / 41.6-42.2%) |
+| 130,000 | spread | 33,964-34,021 | 44-46 ms | 109-117 ms | 184-185 ms | 85.0-86.4% (40.3-41.2% / 42.6-43.2%) |
+
+Below the knee, CPU per request is the same within 1% and p95 roughly halves. At 150k, this host's knee, both builds
+turned bimodal (spread: 3 passes, 2 collapses; previous: one pass at p95 311 ms, one at 476 ms), and every collapse
+coincided with a load box near its ~64k source ports, so the rig could not settle it. The default is 3 rather than 8 on
+that hypothesis: on a saturated box, eight backends at once compete with the HTTP loops. Locally 3 kept the latency of
+8 (p95 42 vs 41 ms, serial 56 ms) with less Postgres time (28 s vs 37 s over the same window, serial 26 s). The default
+(3 with 30 ms gathers) was not itself run on Hetzner.
+
+### Earlier search (before this branch)
 
 On Hetzner **ccx33** (8 dedicated AMD EPYC-Milan vCPU, Postgres 18; configured by `box/pg-conf.sh` as for 16 GB),
 full seed, the repo's `loadgen search` from two separate load boxes (one cx43 and one cpx42, 8 shared vCPU each, the
@@ -128,7 +210,7 @@ so compare with the leaderboard loosely.
 ## Correctness checks beyond the suite
 
 - `test/run.sh`: 197/197.
-- `dev/diffcheck.py`: 3,000 concurrent reads against a batching server and one with `COALESCE=0` on the same
+- A differential check: 3,000 concurrent reads against a batching server and one with `COALESCE=0` on the same
   database: byte-identical responses.
 - `test/sql/batch_equiv.sql` and `test/sql/feed_check.sql`: the batched statements return exactly the rows of the
   per-request ones, and the feed shortcut the counts of the reference SQL (2,000 viewers).
@@ -140,12 +222,9 @@ so compare with the leaderboard loosely.
 
 ## Tuning knobs (all optional; defaults are what was measured)
 
-`LOOPS`, `READ_CONNS` (8), `WRITE_CONNS` (4), `READ_GATHER_US` (5000), `READ_ROUND_MAX` (512), `WRITE_GROUP_MAX` (256),
-`COALESCE` (1), `MAX_INFLIGHT_PER_LOOP` (1024), `BCRYPT_THREADS` (4), `BCRYPT_LANES` (4), `BCRYPT_GATHER_MS` (40),
+`LOOPS`, `READ_CONNS` (8), `WRITE_CONNS` (1), `READ_GATHER_US` (30000), `READ_ROUND_MAX` (4096), `READ_SPREAD` (3: how many idle read connections one round's kinds are spread over), `WRITE_GROUP_MAX` (256),
+`COALESCE` (1), `MAX_INFLIGHT_PER_LOOP` (2048), `BCRYPT_THREADS` (4), `BCRYPT_LANES` (0 = timed at startup, 1-6), `BCRYPT_GATHER_MS` (400),
 `BCRYPT_NICE` (5), `JAVA_OPTS`.
-
-`dev/` holds the local Linux box (`Dockerfile`, `conformance.sh`, `load.sh`, `alloc.sh`) and the Hetzner scripts
-(`dev/hcloud/`). They aren't used by the benchmark.
 
 ## Credits
 
@@ -161,4 +240,4 @@ connection from [scala-netty-didierliauw](../scala-netty-didierliauw)
 MIT, under the repo's [license](../../LICENSE).
 
 Built with Claude Code (Anthropic). Changes were checked against the unit tests (`test/run-unit.sh`), the
-conformance suite (`dev/conformance.sh`) and alternating local load runs against the previous build (`dev/load.sh`).
+conformance suite and alternating local load runs against the previous build.

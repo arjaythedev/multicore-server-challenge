@@ -37,24 +37,32 @@ SELECT b.batch * 32 + q.i AS sample_id,
        array_agg(q.id ORDER BY q.id DESC) FILTER (WHERE q.id IS NOT NULL) AS ids,
        min(q.n) AS n
 FROM batches b CROSS JOIN LATERAL (
-    WITH candidates AS MATERIALIZED (
-        SELECT fo.followee_id
-        FROM unnest(b.viewers, b.limits, b.offsets) AS x(viewer, lim, off)
-        JOIN follows fo ON fo.follower_id = x.viewer
-        GROUP BY fo.followee_id ORDER BY count(*) DESC, fo.followee_id LIMIT 4
+    WITH r AS MATERIALIZED (
+        SELECT * FROM unnest(b.viewers, b.limits, b.offsets) WITH ORDINALITY AS r(viewer, lim, off, i)
+    ), hubs AS MATERIALIZED (
+        SELECT fo.followee_id AS fid, count(*) AS c, max(r.lim::bigint + r.off::bigint) AS depth
+        FROM r JOIN follows fo ON fo.follower_id = r.viewer
+        GROUP BY fo.followee_id ORDER BY count(*) DESC, fo.followee_id LIMIT 32
+    ), hub_floors AS MATERIALIZED (
+        SELECT h.fid, (
+            SELECT a.id FROM articles a WHERE a.author_id = h.fid
+            ORDER BY a.id DESC OFFSET h.depth - 1 LIMIT 1
+        ) AS floor_id FROM hubs h
     ), prolific AS MATERIALIZED (
-        SELECT c.followee_id, EXISTS (
-            SELECT 1 FROM articles a WHERE a.author_id = c.followee_id
+        SELECT c.fid AS followee_id, EXISTS (
+            SELECT 1 FROM articles a WHERE a.author_id = c.fid
             ORDER BY a.id DESC OFFSET 999 LIMIT 1
-        ) AS proven FROM candidates c
+        ) AS proven FROM (SELECT fid FROM hubs ORDER BY c DESC, fid LIMIT 4) c
     )
     SELECT r.i::int AS i, q.*
-    FROM unnest(b.viewers, b.limits, b.offsets) WITH ORDINALITY AS r(viewer, lim, off, i)
-    CROSS JOIN LATERAL (
+    FROM r CROSS JOIN LATERAL (
         WITH page AS (
             SELECT id FROM (
-                SELECT x.id FROM follows fo CROSS JOIN LATERAL (
-                    SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id
+                SELECT x.id FROM (
+                    SELECT COALESCE(max(hf.floor_id), 0::bigint) AS f FROM hub_floors hf
+                    JOIN follows fh ON fh.follower_id = r.viewer AND fh.followee_id = hf.fid
+                ) fl CROSS JOIN follows fo CROSS JOIN LATERAL (
+                    SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id AND a2.id >= fl.f
                     ORDER BY a2.id DESC LIMIT (r.lim::bigint + r.off::bigint)
                 ) x WHERE fo.follower_id = r.viewer
                 ORDER BY x.id DESC LIMIT r.lim OFFSET r.off
