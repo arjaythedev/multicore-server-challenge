@@ -57,8 +57,10 @@ const KINDS: i32 = 9
 const TAG_ID_MAX: i32 = 1048576
 
 /** The most requests one plan takes, and the most bytes of keys. */
-export const PLAN_MAX: i32 = 1024
-export const PLAN_KEY_BYTES: i32 = 98304
+export const PLAN_MAX: i32 = 2048
+export const PLAN_KEY_BYTES: i32 = 196608
+/** The most distinct articles, comment threads or profiles a plan reads by key: nish's `PgBatcher` takes 1,024. */
+const BATCH_MAX: i32 = 1024
 
 /** `render`'s answer for a request the plan could not answer: send it alone. */
 export const PLAN_ALONE: i32 = -1
@@ -479,9 +481,9 @@ export class ReadPlan {
     this.askTable = new Array<i32>(ID_TABLE)
     this.stmts = new Array<i32>(KINDS)
     this.tagWalk = new PgBinaryArray(new PgBinary())
-    this.articles = new PgBatcher(planArticleBatch(PLAN_MAX))
-    this.comments = new PgBatcher(planCommentBatch(PLAN_MAX))
-    this.profiles = new PgBatcher(planProfileBatch(PLAN_MAX))
+    this.articles = new PgBatcher(planArticleBatch(BATCH_MAX))
+    this.comments = new PgBatcher(planCommentBatch(BATCH_MAX))
+    this.profiles = new PgBatcher(planProfileBatch(BATCH_MAX))
     this.pStart = new Array<i32>(PLAN_MAX)
     this.pEnd = new Array<i32>(PLAN_MAX)
     this.slugId = new Array<i64>(PLAN_MAX)
@@ -595,6 +597,10 @@ export class ReadPlan {
   add(tag: i32, kind: i32, viewer: i64, limit: i64, offset: i64, src: u8[], start: i32, len: i32): boolean {
     const n: i32 = len > 0 ? len : 0
     if (this.count >= PLAN_MAX || this.keyEnd + n > PLAN_KEY_BYTES || (!this.keyed && this.count > 0)) {
+      return false
+    }
+    // A read by key may be one key more than its batcher holds: it waits for the next plan.
+    if ((kind === K_ARTICLE || kind === K_COMMENTS || kind === K_PROFILE) && this.kindPageN[kind] >= BATCH_MAX) {
       return false
     }
     this.keyed = true
@@ -837,11 +843,11 @@ export class ReadPlan {
     // room) is made again, empty.
     if (run < 0 || b.waiting() > 0) {
       if (kind === K_ARTICLE) {
-        this.articles = new PgBatcher(planArticleBatch(PLAN_MAX))
+        this.articles = new PgBatcher(planArticleBatch(BATCH_MAX))
       } else if (kind === K_COMMENTS) {
-        this.comments = new PgBatcher(planCommentBatch(PLAN_MAX))
+        this.comments = new PgBatcher(planCommentBatch(BATCH_MAX))
       } else {
-        this.profiles = new PgBatcher(planProfileBatch(PLAN_MAX))
+        this.profiles = new PgBatcher(planProfileBatch(BATCH_MAX))
       }
       return -1
     }

@@ -5,9 +5,10 @@ Front: direct
 An update of this submission, scored at 91,000 users in #83 (`3de991e`),
 100,000 in #116 (`6e69d72`) and 140,000 in #159 (`6cdf1fd`), on the same
 design. Since #159: one read service holds every read plan of the box, plans
-hold up to 1,024 reads over a 25 ms window, each author of a plan is read once,
+hold up to 2,048 reads over a 40 ms window, each author of a plan is read once,
 a feed no longer asks whether its viewer follows the authors it was built
-from, and a login's check waits 80 ms for company instead of 160. Since #116,
+from, a login's check waits 80 ms for company instead of 160, bcrypt always
+runs six lanes, and delayed ACKs are left to the kernel. Since #116,
 most of it to
 cut what Postgres spends a request: favorite counts leave `plan_meta` for a
 count lane of their own, an idea of this submission's (below); two HTTP
@@ -131,8 +132,8 @@ and four on the box), and
   Nothing outlives its plan: every value in an answer was read from
   Postgres while that request waited, and a plan takes only the requests
   already waiting when it starts.
-- **Batch clock.** A plan starts when 1,024 reads wait (a full plan) or when
-  the oldest has waited 25 ms, and up to 20 are in
+- **Batch clock.** A plan starts when 2,048 reads wait (a full plan) or when
+  the oldest has waited 40 ms, and up to 20 are in
   flight at the read service, on 12 connections. Started at once instead, a plan is whatever arrived
   during the last one's two round trips, about 17 requests at the load
   measured below, and Postgres pays its fixed costs and reads the same
@@ -150,8 +151,11 @@ and four on the box), and
   request against 208) and p95 was worse. Those measurements were on a fresh
   database, with plans capped at 512 reads. On a database aged by 44 million
   requests (below), plans of up to 1,024 over 25 ms took Postgres and the
-  server from 61.1 µs a request to 56.0, for about 20 ms of p95. Nish's
-  `PgBatcher` takes at most 1,024 requests, so that is the cap for now.
+  server from 61.1 µs a request to 56.0, for about 20 ms of p95; 2,048 over
+  40 ms took the saturated run below from 57.2 to 54.8 and 53.8 in two runs.
+  Nish's `PgBatcher` takes at most 1,024 keys, so a plan takes at most that
+  many articles, comment threads or profiles by key, and a read past them
+  waits for the next plan.
 - **Each author once.** `plan_meta` and `plan_comments` no longer join `users`
   row by row: a plan collects the distinct authors of its articles and
   comments, reads them with one `plan_users` statement, and writes each
@@ -196,13 +200,20 @@ and four on the box), and
   count, and the depth-th newest article of one is a floor that stops every
   other followee's walk. The rows matched the old statement on 40 random
   batches of the full seed, and total CPU fell by about 6 µs a request.
-- **Delayed ACKs.** A request's answer is often sent within the 40 ms the
-  kernel waits to ACK it alone, but a socket with `TCP_NODELAY` drops back
-  to quick ACKs. After each answer the worker sets `TCP_QUICKACK` off on
-  that connection again, so the next request's ACK can ride on its answer.
-  On the VM it cut the server's packets out per request by 5–7%; the
-  single CPU that takes the network interrupts is what the box runs out of
-  first.
+- **Delayed ACKs, off by default.** `ACK_DELAY=1` sets `TCP_QUICKACK` off on
+  a connection after each answer, so the next request's ACK can ride on its
+  answer; on the VM it once cut the server's packets out per request by 5–7%.
+  Near saturation it costs a system call per answer: in 5-minute holds at
+  175,000 users on the Xeon VM, two with it and two without, leaving the ACKs
+  to the kernel cut the CPU outside Postgres by about 8% and p99 from
+  366–1,844 ms to 463–569, so it is off.
+- **bcrypt at six lanes.** Each process used to time bcrypt's widths at
+  startup (`bcryptCalibrate`), all at once; on the Xeon VM they chose three
+  lanes on one start and five on the next, and three cost about 5% of the box
+  (a hold's CPU outside Postgres, 202 s a minute against 184 at six). Six is
+  the fastest on both CPUs measured, so it is the default; `BCRYPT_WIDTH=0`
+  times it again. bcrypt is about a quarter of the Xeon VM's CPU at these
+  loads, about 32 ms of CPU a login.
 - **Durable group commit.** While a batch is in flight on the write
   connection, the writes that arrive wait. Then up to 128 of them go as one
   group: one transaction, one commit, and one WAL flush. Each response is
@@ -262,19 +273,19 @@ Optional process settings, with their defaults: `HTTP_WORKERS` (a quarter of the
 CPUs, at least 2),
 `DB_READ_CONNS` (6) and `DB_WRITE_CONNS` (1) per worker, `DB_MAX_IN_FLIGHT`
 (16), `DB_READ_PLANS` (10) read plans in flight per worker,
-`READ_PLAN_WAIT_US` (25000) and `READ_PLAN_MIN` (1024) for the batch clock,
+`READ_PLAN_WAIT_US` (40000) and `READ_PLAN_MIN` (2048) for the batch clock,
 `READ_PLAN_CLOCK` (1; 0 starts a plan at once while none is in flight, 2
 is adaptive) and `READ_PLAN_LIGHT` (32), `BCRYPT_WORKERS` (half the CPUs,
 at least 2), `BCRYPT_BATCH_MS` (80) and `BCRYPT_HASH_MS` (20),
-`BCRYPT_WIDTH` (unset, timed at startup; 1 to 6 lanes a call),
+`BCRYPT_WIDTH` (6; 0 times the widths at startup; 1 to 6 lanes a call),
 `GZIP` (0; 1 when it saves a TCP segment, 2 whenever it saves anything; at
 145,000 users on the VM it cost about 30 µs a request and failed the hold),
 `GZIP_MIN` (1300),
 `BCRYPT_NICE` (unset; 1 to 19 lowers the bcrypt services' priority with
-`setNice`, `idle` moves them to `SCHED_IDLE`; it measured within the spread
-between runs, so it stays off), `BCRYPT_PORT` (47391, loopback; the
-services listen on it and the ports above), `ACK_DELAY` (1; 0 leaves the
-kernel's ACKs alone) and `IDLE_TIMEOUT_MS` (75000). On the box's 8 CPUs that makes 16 PostgreSQL
+`setNice`, `idle` moves them to `SCHED_IDLE`; on a saturated box `idle` let
+logins time out, so it stays off), `BCRYPT_PORT` (47391, loopback; the
+services listen on it and the ports above), `ACK_DELAY` (0, the kernel's ACKs; 1 turns
+delayed ACKs back on after each answer) and `IDLE_TIMEOUT_MS` (75000). On the box's 8 CPUs that makes 16 PostgreSQL
 connections in all, inside the limit of 95.
 
 ## Measured
@@ -299,11 +310,28 @@ machine's, about a third of the official box's.
 | Build | Users | Verdict | req/s | p95 | p99 | Postgres + server µs a request |
 |---|--:|---|--:|--:|--:|---|
 | `6cdf1fd` (#159) | 150,000 | PASS | 39,080 | 101 ms | 134 ms | 45.9 + 20.7 |
-| this one | 190,000 | PASS | 47,958 | 264 ms | 327 ms | 34.2 + 23.0 |
+| #189 as first opened (`91dd6fd`) | 190,000 | PASS | 47,958 | 264 ms | 327 ms | 34.2 + 23.0 |
+| `91dd6fd` | 210,000 | FAIL | 45,564 | 994 ms | 1,103 ms | 31.2 + 27.4 |
+| this one | 190,000 | PASS | 47,856 | 275 ms | 327 ms | 31.5 + 22.3 |
+| this one | 210,000 | PASS | 51,129 | 450 ms | 552 ms | 31.0 + 23.5 |
 | rust-epoll-theCatWisel (#154), for scale | 210,000 | PASS | 54,390 | 149 ms | 195 ms | 35.7 + 14.8 |
 
-bcrypt is 12.3 of this build's 23.0 µs (about 11 ms of CPU a login), the HTTP
-workers 6.7 and the read service 3.8. Building with `--cpu x86-64-v3` measured
+On a Xeon Platinum 8260 VM with 8 vCPU and 16 GB (Postgres 18 and `box/`'s
+setup), 5-minute holds from a separate load box, alternating the builds, on a
+fresh copy of the seed each time; CPU from `/proc` over a minute of the hold:
+
+| Build | Users | Verdict | req/s | p95 | p99 | Postgres + rest µs a request | Box busy |
+|---|--:|---|--:|--:|--:|---|--:|
+| `91dd6fd`, two holds | 175,000 | PASS, PASS | 44,333–44,450 | 298–305 ms | 422–431 ms | 78.9–79.2 + 72.0–77.5 | 84–87% |
+| this one, two holds | 175,000 | PASS, PASS | 43,943–43,971 | 340–383 ms | 462–632 ms | 73.6–74.0 + 71.8–73.0 | 81% |
+
+The window's extra wait shows as p95 while the box has room. At 195,000 users
+both builds fail on that VM: its one network-interrupt CPU is 93–99% in
+softirq, and once clients time out the kernel runs out of orphan sockets, so
+overload there says little about either build.
+
+In `91dd6fd`, bcrypt was 12.3 of the server's 23.0 µs on this machine (about
+11 ms of CPU a login), the HTTP workers 6.7 and the read service 3.8. Building with `--cpu x86-64-v3` measured
 the same, so the build stays at baseline x86-64.
 
 ### On the fixed load box
