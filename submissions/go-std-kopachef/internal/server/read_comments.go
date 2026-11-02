@@ -149,7 +149,6 @@ func (g *commentGroup) decode(calls []*queuedRead, rows pgx.Rows) error {
 	dataDest[7], dataDest[8], dataDest[9] = &metadata.value.Author.Username, &metadata.value.Author.Bio, &metadata.value.Author.Image
 	flagDest[6], flagDest[10], flagDest[11] = &author, &viewer, &follows
 	emptyDest[1] = &ordinal
-	var count int
 	for rows.Next() {
 		if err := kindPlan.Scan(rows.RawValues()[0], &isFlags); err != nil {
 			return err
@@ -181,7 +180,6 @@ func (g *commentGroup) decode(calls []*queuedRead, rows pgx.Rows) error {
 		if !empty {
 			metadata.value.CreatedAt, metadata.value.UpdatedAt = ts(metadata.created), ts(updated)
 			threads[i] = append(threads[i], metadata)
-			count++
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -203,7 +201,6 @@ func (g *commentGroup) decode(calls []*queuedRead, rows pgx.Rows) error {
 			return 0
 		})
 	}
-	var refs int
 	for i, call := range calls {
 		thread := threads[g.forCall[i]]
 		if thread == nil {
@@ -214,12 +211,10 @@ func (g *commentGroup) decode(calls []*queuedRead, rows pgx.Rows) error {
 			output[j] = thread[j].value
 			output[j].Author.Following = following[commentViewerAuthor{call.viewer, thread[j].author}]
 		}
-		refs += len(thread)
 		call.status, call.body = http.StatusOK, nil
 		call.value = struct {
 			Comments []commentJSON `json:"comments"`
 		}{output}
 	}
-	recordCommentBatch(len(calls), len(g.threads), count, refs)
 	return nil
 }

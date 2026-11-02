@@ -106,7 +106,6 @@ func (a *app) serveCompactRead(ctx context.Context, w http.ResponseWriter, p com
 }
 
 func (s *compactSession) respondRead(ctx context.Context, a *app, plan compactReadPlan, authorization string, closeConnection bool) {
-	recordCompactAPIRead()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	w := &s.writer

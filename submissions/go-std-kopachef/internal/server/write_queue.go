@@ -69,7 +69,6 @@ func (q *writeQueue) apply(ctx context.Context, sql string, args, dest []any) er
 	job := &writeJob{ctx: ctx, queued: time.Now(), sql: sql, args: args, dest: dest, done: make(chan struct{})}
 	select {
 	case q.pending <- job:
-		profileWriteAdmission(job)
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-q.ctx.Done():
@@ -77,7 +76,6 @@ func (q *writeQueue) apply(ctx context.Context, sql string, args, dest []any) er
 	}
 	select {
 	case <-job.done:
-		profileWriteReady(job)
 		return job.err
 	case <-ctx.Done():
 		return ctx.Err()
@@ -145,7 +143,6 @@ func (q *writeQueue) execute(jobs []*writeJob) {
 	if len(active) == 0 {
 		return
 	}
-	started := profileWriteExecute(active)
 	ctx, cancel := context.WithTimeout(q.ctx, 5*time.Second)
 	defer cancel()
 	var batch pgx.Batch
@@ -163,7 +160,6 @@ func (q *writeQueue) execute(jobs []*writeJob) {
 	// Returned rows are provisional until Close consumes the implicit COMMIT.
 	// In particular, do not wake a comment caller when its RETURNING row arrives.
 	err := results.Close()
-	retries := 0
 	if retryWriteCohort(err) {
 		// A definite PostgreSQL transaction abort rolls back every statement,
 		// including non-idempotent inserts whose RETURNING rows we already read.
@@ -173,7 +169,6 @@ func (q *writeQueue) execute(jobs []*writeJob) {
 			if job.err != nil {
 				continue
 			}
-			retries++
 			if job.dest == nil {
 				_, job.err = q.pool.Exec(ctx, job.sql, job.args...)
 			} else {
@@ -185,8 +180,6 @@ func (q *writeQueue) execute(jobs []*writeJob) {
 			job.err = err
 		}
 	}
-	recordWriteBatch(len(active), retries)
-	profileWriteDone(started)
 	for _, job := range active {
 		close(job.done)
 	}

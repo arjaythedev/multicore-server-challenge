@@ -23,7 +23,6 @@ type app struct {
 	tokens    *auth.Signer
 	reads     *readQueue
 	passwords *passwordQueue
-	favorites *favoriteQueue
 	writes    *writeQueue
 }
 
@@ -33,7 +32,6 @@ var jsonBuffers = sync.Pool{New: func() any { return bytes.NewBuffer(make([]byte
 var apiJSONBuffers = sync.Pool{New: func() any { b := make([]byte, 0, 4096); return &b }}
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
-	profileStart := profileClock()
 	if responseEncoding != "standard" {
 		buffer := apiJSONBuffers.Get().(*[]byte)
 		dst := (*buffer)[:0]
@@ -49,21 +47,13 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 		}
 		body, ok := appendAPIJSON(dst, v)
 		if ok {
-			profileResponseEncode(profileStart)
-			bodyLength := len(body)
-			if compact != nil {
-				bodyLength -= responseHeadReserve
-			}
-			recordJSONBody(bodyLength)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(status)
-			writeStart := profileClock()
 			if compact != nil {
 				_, _ = compact.writePrefixed(body, responseHeadReserve)
 			} else {
 				_, _ = w.Write(body)
 			}
-			profileResponseWrite(writeStart)
 		}
 		if cap(body) <= 256<<10 {
 			*buffer = body[:0]
@@ -86,13 +76,9 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 		buf.Reset()
 		buf.WriteString(`{"errors":{"body":["internal error"]}}`)
 	}
-	profileResponseEncode(profileStart)
-	recordJSONBody(buf.Len())
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	writeStart := profileClock()
 	_, _ = w.Write(buf.Bytes())
-	profileResponseWrite(writeStart)
 }
 
 type errorBody struct {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate scalar amd64 expansions using baseline x86-64 instructions."""
+"""Generate the selected scalar amd64 expansion with baseline instructions."""
 from pathlib import Path
 
 header = '''// Copyright 2010 The Go Authors. All rights reserved.
@@ -12,55 +12,28 @@ header = '''// Copyright 2010 The Go Authors. All rights reserved.
 #include "textflag.h"
 #include "go_asm.h"
 '''
-for variant in ('Shift', 'Bytes'):
-    out = [header]
+out = [header,
+    'TEXT ·expandAsmShift(SB), NOSPLIT, $0-16',
+    'MOVQ c+0(FP), R9', 'MOVQ words+8(FP), R10', 'XORQ R8, R8',
+    'xorShift:', 'MOVL (R10)(R8*4), AX', 'XORL AX, (R9)(R8*4)',
+    'INCQ R8', 'CMPQ R8, $18', 'JNE xorShift',
+    'XORL AX, AX', 'XORL BX, BX', 'XORQ R8, R8',
+    'blockShift:', 'XORL state_p(R9), AX',
+]
+for i in range(1, 17):
+    left, right = ('AX', 'BX') if i % 2 else ('BX', 'AX')
     out.extend([
-        f'TEXT ·expandAsm{variant}(SB), NOSPLIT, $0-16',
-        'MOVQ c+0(FP), R9',
-        'MOVQ words+8(FP), R10',
-        'XORQ R8, R8',
-        f'xor{variant}:',
-        'MOVL (R10)(R8*4), AX',
-        'XORL AX, (R9)(R8*4)',
-        'INCQ R8',
-        'CMPQ R8, $18',
-        f'JNE xor{variant}',
-        'XORL AX, AX',
-        'XORL BX, BX',
-        'XORQ R8, R8',
-        f'block{variant}:',
-        'XORL state_p(R9), AX',
+        f'MOVL {left}, CX', 'SHRL $24, CX',
+        f'MOVL {left}, DX', 'SHRL $16, DX', 'MOVBLZX DL, DX',
+        'MOVL state_s0(R9)(CX*4), SI', 'ADDL state_s1(R9)(DX*4), SI',
+        f'MOVL {left}, CX', 'SHRL $8, CX', 'MOVBLZX CL, CX',
+        'XORL state_s2(R9)(CX*4), SI',
+        f'MOVL {left}, DX', 'ANDL $255, DX', 'ADDL state_s3(R9)(DX*4), SI',
+        f'XORL state_p+{i*4}(R9), {right}', f'XORL SI, {right}',
     ])
-    for i in range(1, 17):
-        left, right = ('AX', 'BX') if i % 2 else ('BX', 'AX')
-        if variant == 'Bytes':
-            lo, hi = ('AL', 'AH') if i % 2 else ('BL', 'BH')
-            out.extend([
-                f'MOVL {left}, CX', 'SHRL $16, CX',
-                'MOVBLZX CH, SI', 'MOVBLZX CL, DX',
-                'MOVL state_s0(R9)(SI*4), SI', 'ADDL state_s1(R9)(DX*4), SI',
-                f'MOVBLZX {hi}, DX', 'XORL state_s2(R9)(DX*4), SI',
-                f'MOVBLZX {lo}, DX', 'ADDL state_s3(R9)(DX*4), SI',
-            ])
-        else:
-            out.extend([
-                f'MOVL {left}, CX', 'SHRL $24, CX',
-                f'MOVL {left}, DX', 'SHRL $16, DX', 'MOVBLZX DL, DX',
-                'MOVL state_s0(R9)(CX*4), SI', 'ADDL state_s1(R9)(DX*4), SI',
-                f'MOVL {left}, CX', 'SHRL $8, CX', 'MOVBLZX CL, CX',
-                'XORL state_s2(R9)(CX*4), SI',
-                f'MOVL {left}, DX', 'ANDL $255, DX', 'ADDL state_s3(R9)(DX*4), SI',
-            ])
-        out.extend([f'XORL state_p+{i*4}(R9), {right}', f'XORL SI, {right}'])
-    out.extend([
-        'XORL state_p+68(R9), BX',
-        'XCHGL AX, BX',
-        'MOVL AX, (R9)(R8*1)',
-        'MOVL BX, 4(R9)(R8*1)',
-        'ADDQ $8, R8',
-        'CMPQ R8, $state__size',
-        f'JNE block{variant}',
-        'RET',
-    ])
-    filename = 'expand_amd64.s' if variant == 'Shift' else 'scalar_amd64.s'
-    Path(__file__).with_name(filename).write_text('\n'.join(out) + '\n')
+out.extend([
+    'XORL state_p+68(R9), BX', 'XCHGL AX, BX',
+    'MOVL AX, (R9)(R8*1)', 'MOVL BX, 4(R9)(R8*1)',
+    'ADDQ $8, R8', 'CMPQ R8, $state__size', 'JNE blockShift', 'RET',
+])
+Path(__file__).with_name('expand_amd64.s').write_text('\n'.join(out) + '\n')

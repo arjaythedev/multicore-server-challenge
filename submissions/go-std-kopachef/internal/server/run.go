@@ -34,9 +34,6 @@ func Run() {
 	if mode := envOr("HTTP_RESPONSE_BUFFER", "vector"); mode != "vector" && mode != "prefix" {
 		log.Fatal("HTTP_RESPONSE_BUFFER must be vector or prefix")
 	}
-	if n, err := strconv.Atoi(envOr("HTTP_WORKERS", "0")); err != nil || n < 0 || n > 32768 {
-		log.Fatal("HTTP_WORKERS must be between 0 and 32768")
-	}
 	if mode := envOr("HTTP_HOT_PATH", "0"); mode != "0" && mode != "1" {
 		log.Fatal("HTTP_HOT_PATH must be 0 or 1")
 	}
@@ -96,14 +93,8 @@ func Run() {
 		}
 		a.writes = newWriteQueueConfig(pool, time.Duration(wait)*time.Microsecond, workers)
 		defer a.writes.close()
-	} else if envOr("FAVORITE_BATCHING", "1") != "0" {
-		wait, err := strconv.Atoi(envOr("FAVORITE_BATCH_WAIT_US", "2000"))
-		if err != nil || wait < 0 || wait > 5000 {
-			log.Fatal("FAVORITE_BATCH_WAIT_US must be between 0 and 5000")
-		}
-		a.favorites = newFavoriteQueue(pool, time.Duration(wait)*time.Microsecond)
-		defer a.favorites.close()
 	}
+
 	if envOr("BCRYPT_BATCHING", "1") != "0" {
 		workers, err := strconv.Atoi(envOr("BCRYPT_WORKERS", "4"))
 		if err != nil || workers < 1 || workers > 16 {
@@ -140,8 +131,6 @@ func Run() {
 		a.reads = newReadQueueConfig(pool, time.Duration(waitUS)*time.Microsecond, batchSize, workers, queueSize)
 		defer a.reads.close()
 	}
-	stopProfiling := startProfiling(a)
-	defer stopProfiling()
 	srv := &http.Server{
 		Addr:    net.JoinHostPort(envOr("HOST", "127.0.0.1"), envOr("PORT", "3000")),
 		Handler: a.routes(),

@@ -223,19 +223,13 @@ func (a *app) follow(follow bool) authed {
 	return func(w http.ResponseWriter, r *http.Request, viewer int64, _ string) {
 		var id int64
 		var p profileJSON
-		var err error
-		if a.writes != nil && writeFollowLookup {
-			err = a.scanWrite(r.Context(), followByUsernameStatement(follow),
-				[]any{viewer, r.PathValue("username")}, []any{&p.Username, &p.Bio, &p.Image})
-		} else {
-			err = a.pool.QueryRow(r.Context(), `SELECT id, username, bio, image FROM users WHERE username = $1`,
-				r.PathValue("username")).Scan(&id, &p.Username, &p.Bio, &p.Image)
-			if err == nil {
-				if follow {
-					err = a.execWrite(r.Context(), `INSERT INTO follows (follower_id, followee_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, viewer, id)
-				} else {
-					err = a.execWrite(r.Context(), `DELETE FROM follows WHERE follower_id = $1 AND followee_id = $2`, viewer, id)
-				}
+		err := a.pool.QueryRow(r.Context(), `SELECT id, username, bio, image FROM users WHERE username = $1`,
+			r.PathValue("username")).Scan(&id, &p.Username, &p.Bio, &p.Image)
+		if err == nil {
+			if follow {
+				err = a.execWrite(r.Context(), `INSERT INTO follows (follower_id, followee_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, viewer, id)
+			} else {
+				err = a.execWrite(r.Context(), `DELETE FROM follows WHERE follower_id = $1 AND followee_id = $2`, viewer, id)
 			}
 		}
 		if errors.Is(err, pgx.ErrNoRows) {

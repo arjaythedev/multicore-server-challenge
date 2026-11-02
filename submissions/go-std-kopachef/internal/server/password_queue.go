@@ -21,8 +21,6 @@ const defaultPasswordBatchSize = 4
 const maxPasswordBatchSize = 5
 
 var passwordEncoding = base64.NewEncoding("./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789").WithPadding(base64.NoPadding)
-var assemblyPasswordPairs = envOr("BCRYPT_PAIR_ASM", "0") != "0"
-var assemblyPasswordFives = envOr("BCRYPT_FIVE_ASM", "0") != "0"
 
 type passwordJob struct {
 	ctx      context.Context
@@ -160,12 +158,7 @@ func (q *passwordQueue) execute(batch []*passwordJob) {
 	case 1:
 		results[0] = bcryptlane.Single(passwords[0], salts[0], bcryptCost)
 	case 2:
-		var pair [2][23]byte
-		if assemblyPasswordPairs {
-			pair = bcryptlane.Pair([2][]byte{passwords[0], passwords[1]}, [2][16]byte{salts[0], salts[1]}, bcryptCost)
-		} else {
-			pair = bcryptlane.Sum2([2][]byte{passwords[0], passwords[1]}, [2][16]byte{salts[0], salts[1]}, bcryptCost)
-		}
+		pair := bcryptlane.Sum2([2][]byte{passwords[0], passwords[1]}, [2][16]byte{salts[0], salts[1]}, bcryptCost)
 		results[0], results[1] = pair[0], pair[1]
 	case 3:
 		v := bcryptlane.Sum3([3][]byte(passwords[:3]), [3][16]byte(salts[:3]), bcryptCost)
@@ -174,15 +167,10 @@ func (q *passwordQueue) execute(batch []*passwordJob) {
 		v := bcryptlane.Sum4([4][]byte(passwords[:4]), [4][16]byte(salts[:4]), bcryptCost)
 		copy(results[:], v[:])
 	case 5:
-		if assemblyPasswordFives {
-			results = bcryptlane.Five(passwords, salts, bcryptCost)
-		} else {
-			results = bcryptlane.Sum5(passwords, salts, bcryptCost)
-		}
+		results = bcryptlane.Sum5(passwords, salts, bcryptCost)
 	default:
 		panic("invalid password batch width")
 	}
-	recordPasswordBatch(len(batch))
 	for i, job := range batch {
 		job.result = results[i]
 		close(job.done)

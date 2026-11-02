@@ -42,7 +42,6 @@ const (
 )
 
 type queuedRead struct {
-	profile    readTimingProfile
 	ctx        context.Context
 	kind       readKind
 	viewer     int64
@@ -109,21 +108,16 @@ func (a *app) serveReadCall(w http.ResponseWriter, r *http.Request, call *queued
 }
 
 func (a *app) serveReadCallContext(w http.ResponseWriter, ctx context.Context, call *queuedRead) {
-	profileReadEnter(call)
 	select {
 	case a.reads.pending <- call:
-		profileReadAdmission(call)
 	case <-ctx.Done():
-		profileReadLeave(call)
 		return
 	case <-a.reads.ctx.Done():
-		profileReadLeave(call)
 		internalError(w, a.reads.ctx.Err())
 		return
 	}
 	select {
 	case <-call.done:
-		profileReadLeave(call)
 		if call.err != nil {
 			internalError(w, call.err)
 			return
@@ -132,14 +126,11 @@ func (a *app) serveReadCallContext(w http.ResponseWriter, ctx context.Context, c
 			writeJSON(w, call.status, call.value)
 			return
 		}
-		recordJSONBody(len(call.body))
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(call.status)
 		_, _ = w.Write(call.body)
 	case <-ctx.Done():
-		profileReadLeave(call)
 	case <-a.reads.ctx.Done():
-		profileReadLeave(call)
 		internalError(w, a.reads.ctx.Err())
 	}
 }
@@ -219,8 +210,6 @@ const arrayArticleSQL = `SELECT r.ord, a.id FROM unnest($1::text[]) WITH ORDINAL
  JOIN articles a ON a.slug = r.slug`
 
 func (q *readQueue) execute(calls []*queuedRead) {
-	stageStart := profileReadExecute(calls)
-	requestCount := len(calls)
 	stream := earlyReadRelease && streamReadRelease
 	var retained []*queuedRead
 	if stream {
@@ -294,7 +283,6 @@ func (q *readQueue) execute(calls []*queuedRead) {
 		batch.Queue(arrayArticleSQL, slugs)
 	}
 	var err error
-	statements := batch.Len()
 	ctx, cancel := context.WithTimeout(q.ctx, 5*time.Second)
 	if batch.Len() > 0 {
 		results := q.pool.SendBatch(ctx, &batch)
@@ -344,7 +332,6 @@ func (q *readQueue) execute(calls []*queuedRead) {
 		}
 		calls = retained
 	}
-	profileReadStage(0, stageStart)
 	if err == nil {
 		if earlyReadRelease && !stream {
 			// Independent responses are complete after stage one has released
@@ -360,16 +347,9 @@ func (q *readQueue) execute(calls []*queuedRead) {
 			}
 			calls = articles
 		}
-		var n int
-		stageStart = profileClock()
-		n, err = q.enrichArticles(ctx, calls)
-		profileReadStage(1, stageStart)
-		statements += n
+		_, err = q.enrichArticles(ctx, calls)
 	}
 	cancel()
-	if statements > 0 {
-		recordReadBatch(requestCount, statements)
-	}
 	// Release the connection before handing typed results to request goroutines
 	// for serialization. Closing done transfers ownership; canceled callers
 	// leave their result for GC once the worker clears its batch references.
@@ -496,16 +476,13 @@ func decodeReadGroup(kind readKind, group []*queuedRead, rows pgx.Rows) error {
 		group[i].status, group[i].body = http.StatusOK, nil
 	}
 	if kind == readComments {
-		var refs int
 		for i, call := range group {
 			if call.status == http.StatusOK {
 				call.value = struct {
 					Comments []commentJSON `json:"comments"`
 				}{comments[i]}
-				refs += len(comments[i])
 			}
 		}
-		recordCommentBatch(len(group), len(group), refs, refs)
 	}
 	return rows.Err()
 }

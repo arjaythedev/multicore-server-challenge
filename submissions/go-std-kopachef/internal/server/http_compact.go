@@ -16,7 +16,6 @@ import (
 )
 
 var compactContextParent = envOr("HTTP_CONTEXT_PARENT", "server")
-var compactHTTPWorkers, _ = strconv.Atoi(envOr("HTTP_WORKERS", "0"))
 
 // Experimental HTTP/1 backend for this API's complete, single-Write responses.
 // ReadRequest retains the standard request parser. Streaming, upgrades and
@@ -30,9 +29,6 @@ func serveCompactHTTP(ctx context.Context, address string, handler http.Handler)
 }
 
 func serveCompactListener(parent context.Context, listener net.Listener, handler http.Handler) error {
-	if compactHTTPWorkers > 0 {
-		return servePooledCompactListener(parent, listener, handler)
-	}
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	var requestParents [32]context.Context
@@ -122,7 +118,6 @@ type compactSession struct {
 	reader     *bufio.Reader
 	remote     string
 	writer     compactResponse
-	pooled     bool
 }
 
 func newCompactSession(connection net.Conn) *compactSession {
@@ -132,16 +127,11 @@ func newCompactSession(connection net.Conn) *compactSession {
 	return s
 }
 
-// One worker owns all session fields until this call returns. Idle sessions
-// may then move to a different worker; no parsing or writes overlap.
+// The connection goroutine owns all session fields throughout each request.
 func (s *compactSession) serveOne(ctx context.Context, handler http.Handler) bool {
 	connection, limited, reader, writer := s.connection, &s.limited, s.reader, &s.writer
 	limited.N = (1 << 20) + 4096
-	if s.pooled {
-		connection.SetReadDeadline(time.Now().Add(10 * time.Second))
-	} else {
-		connection.SetReadDeadline(time.Now().Add(75 * time.Second))
-	}
+	connection.SetReadDeadline(time.Now().Add(75 * time.Second))
 	if _, err := reader.Peek(1); err != nil {
 		return false
 	}
@@ -158,9 +148,6 @@ func (s *compactSession) serveOne(ctx context.Context, handler http.Handler) boo
 					if err != nil {
 						return false
 					}
-					if s.pooled {
-						connection.SetReadDeadline(time.Time{})
-					}
 					limited.N = 1<<63 - 1
 					auth := ""
 					if spec.seen&(1<<1) != 0 {
@@ -176,9 +163,7 @@ func (s *compactSession) serveOne(ctx context.Context, handler http.Handler) boo
 	}
 	fast := request != nil
 	if !fast {
-		if !s.pooled {
-			connection.SetReadDeadline(time.Now().Add(10 * time.Second))
-		}
+		connection.SetReadDeadline(time.Now().Add(10 * time.Second))
 		request, err = http.ReadRequest(reader)
 	}
 	if err != nil {
@@ -196,7 +181,7 @@ func (s *compactSession) serveOne(ctx context.Context, handler http.Handler) boo
 		unread, _ := reader.Peek(reader.Buffered())
 		*reader = *bufio.NewReaderSize(io.MultiReader(bytes.NewReader(unread), limited), 4096)
 	}
-	if !fast || s.pooled {
+	if !fast {
 		connection.SetReadDeadline(time.Time{})
 	}
 	limited.N = 1<<63 - 1
@@ -319,7 +304,6 @@ func (w *compactResponse) prepare(body []byte) error {
 }
 
 func (w *compactResponse) writeVector(body []byte) (int, error) {
-	recordHTTPResponseBuffer(false)
 	w.buffers[0] = w.wire
 	w.buffers[1] = body
 	if w.head || w.status == http.StatusNoContent || w.status == http.StatusNotModified {

@@ -184,7 +184,6 @@ func (q *readQueue) enrichArticles(ctx context.Context, calls []*queuedRead) (in
 		}
 		targets = append(targets, call.articleIDs...)
 	}
-	var flagRows int
 	var batch pgx.Batch
 	// Metadata and flags use one snapshot and reuse the same article lookup.
 	// The leading boolean identifies the two row shapes. NULL destinations
@@ -199,7 +198,7 @@ func (q *readQueue) enrichArticles(ctx context.Context, calls []*queuedRead) (in
 		}
 		if readArticleTagDictionary {
 			var err error
-			flagRows, err = decodeDictionaryArticles(rows, articles, flags, len(wanted))
+			_, err = decodeDictionaryArticles(rows, articles, flags, len(wanted))
 			return err
 		}
 		if len(rows.FieldDescriptions()) != 16 {
@@ -224,7 +223,6 @@ func (q *readQueue) enrichArticles(ctx context.Context, calls []*queuedRead) (in
 					return err
 				}
 				flags[key] = value
-				flagRows++
 				continue
 			}
 			x := new(articleJSON)
@@ -245,8 +243,6 @@ func (q *readQueue) enrichArticles(ctx context.Context, calls []*queuedRead) (in
 	if err := q.pool.SendBatch(ctx, &batch).Close(); err != nil {
 		return batch.Len(), err
 	}
-	recordArticleBatch(refs, len(articles))
-	recordArticleFlags(pairs, flagRows)
 	for _, call := range calls {
 		if call.err != nil || len(call.articleIDs) == 0 {
 			continue

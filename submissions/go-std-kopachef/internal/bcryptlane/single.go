@@ -11,8 +11,6 @@ import "golang.org/x/crypto/blowfish"
 //go:generate python3 generate.py
 //go:generate gofmt -w lanes_generated.go
 //go:generate python3 asm_generate.py
-//go:generate python3 five_generate.py
-//go:generate gofmt -w five_amd64.go
 
 func standardSingle(password []byte, salt [16]byte, cost uint) (result [23]byte) {
 	key := append(append([]byte(nil), password...), 0)

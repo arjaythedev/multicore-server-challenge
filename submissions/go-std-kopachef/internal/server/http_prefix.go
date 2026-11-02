@@ -26,7 +26,6 @@ func (w *compactResponse) writePrefixed(buffer []byte, offset int) (int, error) 
 		// Arbitrary large headers keep the existing general write path.
 		return w.writeVector(body)
 	}
-	recordHTTPResponseBuffer(true)
 	start, end := offset-len(w.wire), len(buffer)
 	copy(buffer[start:offset], w.wire)
 	if w.head || w.status == http.StatusNoContent || w.status == http.StatusNotModified {

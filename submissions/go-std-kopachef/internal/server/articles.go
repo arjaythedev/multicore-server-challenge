@@ -374,6 +374,16 @@ func (a *app) articleID(w http.ResponseWriter, r *http.Request) (int64, bool) {
 	return id, true
 }
 
+const insertFavoriteSQL = `INSERT INTO favorites (user_id, article_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`
+const deleteFavoriteSQL = `DELETE FROM favorites WHERE user_id = $1 AND article_id = $2`
+
+func favoriteStatement(insert bool) string {
+	if insert {
+		return insertFavoriteSQL
+	}
+	return deleteFavoriteSQL
+}
+
 // POST and DELETE /api/articles/{slug}/favorite
 func (a *app) favorite(fav bool) authed {
 	return func(w http.ResponseWriter, r *http.Request, viewer int64, _ string) {
@@ -392,13 +402,7 @@ func (a *app) favorite(fav bool) authed {
 			if !ok {
 				return
 			}
-			if a.writes != nil {
-				err = a.execWrite(r.Context(), favoriteStatement(fav), viewer, id)
-			} else if a.favorites != nil {
-				err = a.favorites.apply(r.Context(), viewer, id, fav)
-			} else {
-				_, err = a.pool.Exec(r.Context(), favoriteStatement(fav), viewer, id)
-			}
+			err = a.execWrite(r.Context(), favoriteStatement(fav), viewer, id)
 		}
 		if err != nil {
 			internalError(w, err)
