@@ -15,9 +15,9 @@
 // (the challenge's), and optionally HTTP_WORKERS (a quarter of the CPUs, at least 2), DB_READ_CONNS (6) and
 // DB_WRITE_CONNS (1) per worker, DB_MAX_IN_FLIGHT (16), DB_READ_IN_FLIGHT (4)
 // for the read connections, DB_READ_PLANS (10) read plans in flight
-// per worker, READ_PLAN_MIN (512), READ_PLAN_WAIT_US (10000) and
+// per worker, READ_PLAN_MIN (1024), READ_PLAN_WAIT_US (25000) and
 // READ_PLAN_CLOCK (1; 2 adaptive, with READ_PLAN_LIGHT 32) for when a plan starts (worker.ts, `planWaitLeft`),
-// BCRYPT_WORKERS (half the CPUs, at least 2), BCRYPT_BATCH_MS (160) for logins
+// BCRYPT_WORKERS (half the CPUs, at least 2), BCRYPT_BATCH_MS (80) for logins
 // and BCRYPT_HASH_MS (20) for sign-ups (bcrypt-service.ts),
 // BCRYPT_PORT (47391), BCRYPT_NICE (0; 1 to 19 lowers the bcrypt services'
 // priority, and "idle" moves them to SCHED_IDLE), IDLE_TIMEOUT_MS (75000) and
@@ -135,8 +135,8 @@ export const main = (): i32 => {
   cfg.maxInFlight = envInt("DB_MAX_IN_FLIGHT", 16)
   cfg.readInFlight = envInt("DB_READ_IN_FLIGHT", 4)
   cfg.readPlans = envInt("DB_READ_PLANS", 10)
-  cfg.planMin = envInt("READ_PLAN_MIN", 512)
-  cfg.planWaitUs = envInt("READ_PLAN_WAIT_US", 10000)
+  cfg.planMin = envInt("READ_PLAN_MIN", 1024)
+  cfg.planWaitUs = envInt("READ_PLAN_WAIT_US", 25000)
   const clock: string = getenv("READ_PLAN_CLOCK") ?? "1"
   cfg.planClock = clock === "0" ? 0 : clock === "2" ? 2 : 1
   cfg.planLight = envInt("READ_PLAN_LIGHT", 32)
@@ -226,7 +226,7 @@ export const main = (): i32 => {
       console.log(`conduit: bcrypt runs ${width} lanes a call`)
     }
     lowerPriority(getenv("BCRYPT_NICE") ?? "0")
-    return runBcryptService(listener, envInt("BCRYPT_BATCH_MS", 160), envInt("BCRYPT_HASH_MS", 20), width)
+    return runBcryptService(listener, envInt("BCRYPT_BATCH_MS", 80), envInt("BCRYPT_HASH_MS", 20), width)
   }
   const listener: i32 = tcpListenFlags(cfg.host, cfg.port, cfg.backlog, LISTEN_FLAGS)
   if (listener < 0) {

@@ -57,8 +57,8 @@ const KINDS: i32 = 9
 const TAG_ID_MAX: i32 = 1048576
 
 /** The most requests one plan takes, and the most bytes of keys. */
-export const PLAN_MAX: i32 = 512
-export const PLAN_KEY_BYTES: i32 = 49152
+export const PLAN_MAX: i32 = 1024
+export const PLAN_KEY_BYTES: i32 = 98304
 
 /** `render`'s answer for a request the plan could not answer: send it alone. */
 export const PLAN_ALONE: i32 = -1
@@ -78,9 +78,10 @@ const listStatement = (kind: i32): string => {
 }
 const S_META: i32 = 100
 const S_FLAGS: i32 = 101
+const S_USERS: i32 = 102
 
 /** The hash tables: a power of two at least twice what they hold. */
-const TABLE: i32 = 2048
+const TABLE: i32 = 8192
 const ID_TABLE: i32 = 65536
 
 /**
@@ -94,10 +95,7 @@ const M_DESCRIPTION: i32 = 3
 const M_TAGS: i32 = 4
 const M_CREATED: i32 = 5
 const M_UPDATED: i32 = 6
-const M_USERNAME: i32 = 7
-const M_BIO: i32 = 8
-const M_IMAGE: i32 = 9
-const M_BODY: i32 = 10
+const M_BODY: i32 = 7
 
 /** A comment's columns in a `plan_comments` row: the article's id first, NULL comment columns when it has none. */
 const C_ID: i32 = 1
@@ -105,9 +103,12 @@ const C_BODY: i32 = 2
 const C_CREATED: i32 = 3
 const C_UPDATED: i32 = 4
 const C_AUTHOR: i32 = 5
-const C_USERNAME: i32 = 6
-const C_BIO: i32 = 7
-const C_IMAGE: i32 = 8
+
+/** A user's columns in a `plan_users` row. */
+const U_ID: i32 = 0
+const U_USERNAME: i32 = 1
+const U_BIO: i32 = 2
+const U_IMAGE: i32 = 3
 
 /** A profile's columns in a `plan_profile` row. */
 const P_ID: i32 = 0
@@ -320,12 +321,11 @@ export class ReadPlan {
   metaFull: boolean[]
   metas: i32 = 0
   private readonly idTable: i32[]
-  /** Each article's JSON in `text`: [m0, m1) up to the body, [m1, m2) the body, [m2, m3) up to `favorited`, [m3, m4) from the author up to `following`. */
+  /** Each article's JSON in `text`: [m0, m1) up to the body, [m1, m2) the body, [m2, m3) up to `favorited`. */
   m0: i32[]
   m1: i32[]
   m2: i32[]
   m3: i32[]
-  m4: i32[]
   found: boolean[]
   text: u8[]
   textEnd: i32 = 0
@@ -386,6 +386,16 @@ export class ReadPlan {
   c0: i32[]
   c1: i32[]
   cAuthor: i64[]
+  /** The plan's distinct authors, of articles and comments alike, each read once: `plan_users`. */
+  private userIds: i64[]
+  private userSlots: i32[]
+  /** Each author's JSON in `text`, `,"author":{...,"following":`, as [u0, u1); -1 until its row comes. */
+  private u0: i32[]
+  private u1: i32[]
+  private readonly userTable: i32[]
+  private readonly viewerTable: i32[]
+  private readonly viewerSlots: i32[]
+  private users: i32 = 0
   commentsN: i32 = 0
   /** Each profile key's JSON in `text`, `{"profile":{...,"following":`, as [pStart, pEnd). */
   readonly pStart: i32[]
@@ -450,7 +460,6 @@ export class ReadPlan {
     this.m1 = new Array<i32>(4096)
     this.m2 = new Array<i32>(4096)
     this.m3 = new Array<i32>(4096)
-    this.m4 = new Array<i32>(4096)
     this.found = new Array<boolean>(4096)
     this.text = new Array<u8>(262144)
     this.flagV = new Array<i64>(4096)
@@ -483,6 +492,13 @@ export class ReadPlan {
     this.c0 = new Array<i32>(4096)
     this.c1 = new Array<i32>(4096)
     this.cAuthor = new Array<i64>(4096)
+    this.userIds = new Array<i64>(4096)
+    this.userSlots = new Array<i32>(4096)
+    this.u0 = new Array<i32>(4096)
+    this.u1 = new Array<i32>(4096)
+    this.userTable = new Array<i32>(ID_TABLE)
+    this.viewerTable = new Array<i32>(TABLE)
+    this.viewerSlots = new Array<i32>(PLAN_MAX)
     this.out = new Array<u8>(65536)
     this.tagRank = new Array<i32>(1024)
     this.tagStamp = new Array<i32>(1024)
@@ -549,6 +565,10 @@ export class ReadPlan {
       this.askTable[this.askSlot[k]] = 0
     }
     this.asks = 0
+    for (let k: i32 = 0; k < this.users; k++) {
+      this.userTable[this.userSlots[k]] = 0
+    }
+    this.users = 0
     this.stmtCount = 0
     this.stmtDone = 0
     this.failed = false
@@ -1117,7 +1137,7 @@ export class ReadPlan {
     }
   }
 
-  /** A comments row of slug key `key`: its article exists, and the comment, when there is one, is written up to `following`. */
+  /** A comments row of slug key `key`: its article exists, and the comment, when there is one, is written up to its author. */
   private commentRow(conn: PgConnection, key: i32): void {
     if (this.commentCount[key] < 0) {
       this.slugFound[key] = true
@@ -1131,10 +1151,7 @@ export class ReadPlan {
     this.c0 = grownI32(this.c0, c + 1, c)
     this.c1 = grownI32(this.c1, c + 1, c)
     this.cAuthor = grownInts(this.cAuthor, c + 1, c)
-    let worst: i32 = 256
-    for (let col: i32 = C_BODY; col <= C_IMAGE; col++) {
-      worst += jsonOutWorst(conn.colLength(col) > 0 ? conn.colLength(col) : 0)
-    }
+    const worst: i32 = 256 + jsonOutWorst(conn.colLength(C_BODY) > 0 ? conn.colLength(C_BODY) : 0)
     this.text = grownBytes(this.text, this.textEnd + worst, this.textEnd)
     const out: u8[] = this.text
     const b: u8[] = conn.inputBuffer()
@@ -1149,13 +1166,6 @@ export class ReadPlan {
     o = this.stampInto(out, o, conn, C_UPDATED)
     o = jsonOutRaw(out, o, f[22])
     o = this.stringOrNull(out, o, conn, b, C_BODY)
-    o = jsonOutRaw(out, o, f[9])
-    o = this.stringOrNull(out, o, conn, b, C_USERNAME)
-    o = jsonOutRaw(out, o, f[10])
-    o = this.stringOrNull(out, o, conn, b, C_BIO)
-    o = jsonOutRaw(out, o, f[11])
-    o = this.stringOrNull(out, o, conn, b, C_IMAGE)
-    o = jsonOutRaw(out, o, f[12])
     this.c1[c] = o
     this.textEnd = o
     this.cAuthor[c] = conn.binaryInt(C_AUTHOR)
@@ -1254,20 +1264,24 @@ export class ReadPlan {
       const v: i64 = this.viewers[i]
       if (v !== 0) {
         // The viewer's place among the plan's distinct viewers, at most PLAN_MAX of them.
-        let vi: i32 = 0
-        while (vi < this.flagViewerN && this.flagViewers[vi] !== v) {
-          vi++
+        const mask: i32 = TABLE - 1
+        let slot: i32 = slotOf(hashInt(fnv(), v)) & mask
+        while (this.viewerTable[slot] > 0 && this.flagViewers[this.viewerTable[slot] - 1] !== v) {
+          slot = (slot + 1) & mask
         }
-        if (vi === this.flagViewerN) {
-          this.flagViewers[vi] = v
-          this.flagViewerN = vi + 1
+        if (this.viewerTable[slot] === 0) {
+          this.flagViewers[this.flagViewerN] = v
+          this.viewerSlots[this.flagViewerN] = slot
+          this.flagViewerN += 1
+          this.viewerTable[slot] = this.flagViewerN
         }
-        this.curVi = vi
+        this.curVi = this.viewerTable[slot] - 1
       }
       if (kind === K_ARTICLE) {
         const key: i32 = this.pageOf[i]
         if (this.slugFound[key]) {
           this.addMeta(this.slugId[key], true)
+          this.addUser(this.slugAuthor[key])
           if (v !== 0) {
             this.ask(v, this.slugId[key], 0)
             this.ask(v, this.slugAuthor[key], 1)
@@ -1280,22 +1294,34 @@ export class ReadPlan {
         }
       } else if (kind === K_COMMENTS) {
         const key: i32 = this.pageOf[i]
-        if (v !== 0 && this.slugFound[key]) {
+        if (this.slugFound[key]) {
           const first: i32 = this.commentFirst[key]
           for (let c: i32 = first; c < first + this.commentCount[key]; c++) {
-            this.ask(v, this.cAuthor[c], 1)
+            this.addUser(this.cAuthor[c])
+            if (v !== 0) {
+              this.ask(v, this.cAuthor[c], 1)
+            }
           }
         }
-      } else if (v !== 0 && kind < LIST_KINDS) {
+      } else if (kind < LIST_KINDS) {
         const key: i32 = this.pageOf[i]
         const start: i32 = this.pageStart[key]
         for (let j: i32 = start; j < start + this.pageLen[key]; j++) {
-          this.ask(v, this.ids[j], 0)
-          this.ask(v, this.authors[j], 1)
+          this.addUser(this.authors[j])
+          if (v !== 0) {
+            this.ask(v, this.ids[j], 0)
+            // A feed's articles were found through the viewer's follows.
+            if (kind !== K_FEED) {
+              this.ask(v, this.authors[j], 1)
+            }
+          }
         }
       }
     }
-    return this.metas > 0 || this.asks > 0
+    for (let k: i32 = 0; k < this.flagViewerN; k++) {
+      this.viewerTable[this.viewerSlots[k]] = 0
+    }
+    return this.metas > 0 || this.asks > 0 || this.users > 0
   }
 
   /** Takes the favorite count of every article of the plan from `run`. */
@@ -1395,6 +1421,17 @@ export class ReadPlan {
       this.stmts[this.stmtCount] = S_FLAGS
       this.stmtCount += 1
     }
+    if (this.users > 0) {
+      if (
+        !conn.bindStartBinary("plan_users") ||
+        !conn.paramIntArray(this.userIds, 0, this.users) ||
+        !conn.bindEnd()
+      ) {
+        return false
+      }
+      this.stmts[this.stmtCount] = S_USERS
+      this.stmtCount += 1
+    }
     return true
   }
 
@@ -1404,8 +1441,11 @@ export class ReadPlan {
       return
     }
     if (event === PG_ROW) {
-      if (this.stmts[this.stmtDone] === S_META) {
+      const stmt: i32 = this.stmts[this.stmtDone]
+      if (stmt === S_META) {
         this.metaRow(conn)
+      } else if (stmt === S_USERS) {
+        this.userRow(conn)
       } else {
         this.flagRow(conn)
       }
@@ -1460,7 +1500,7 @@ export class ReadPlan {
       worst += jsonOutWorst(this.nameLen[this.ranks[k]]) + 1
     }
     for (let c: i32 = M_SLUG; c <= M_BODY; c++) {
-      if (c === M_SLUG || c === M_TITLE || c === M_DESCRIPTION || c >= M_USERNAME) {
+      if (c === M_SLUG || c === M_TITLE || c === M_DESCRIPTION || c === M_BODY) {
         worst += jsonOutWorst(conn.colLength(c) > 0 ? conn.colLength(c) : 0)
       }
     }
@@ -1471,8 +1511,7 @@ export class ReadPlan {
     if (
       conn.isNull(M_SLUG) ||
       conn.isNull(M_TITLE) ||
-      conn.isNull(M_DESCRIPTION) ||
-      conn.isNull(M_USERNAME)
+      conn.isNull(M_DESCRIPTION)
     ) {
       this.failed = true
       return
@@ -1509,16 +1548,75 @@ export class ReadPlan {
     o = this.stampInto(out, o, conn, M_UPDATED)
     o = jsonOutRaw(out, o, f[7])
     this.m3[m] = o
-    o = jsonOutRaw(out, o, f[9])
-    o = jsonOutString(out, o, b, conn.colStart(M_USERNAME), conn.colLength(M_USERNAME))
-    o = jsonOutRaw(out, o, f[10])
-    o = this.stringOrNull(out, o, conn, b, M_BIO)
-    o = jsonOutRaw(out, o, f[11])
-    o = this.stringOrNull(out, o, conn, b, M_IMAGE)
-    o = jsonOutRaw(out, o, f[12])
-    this.m4[m] = o
     this.textEnd = o
     this.found[m] = true
+  }
+
+  /** A row of `plan_users`: the author's JSON, up to `following`, shared by everything of the plan by that author. */
+  private userRow(conn: PgConnection): void {
+    const id: i64 = conn.binaryInt(U_ID)
+    const at: i32 = this.userTable[this.userSlot(id)]
+    if (at === 0 || conn.isNull(U_USERNAME)) {
+      this.failed = true
+      return
+    }
+    let worst: i32 = 128
+    for (let col: i32 = U_USERNAME; col <= U_IMAGE; col++) {
+      worst += jsonOutWorst(conn.colLength(col) > 0 ? conn.colLength(col) : 0)
+    }
+    this.text = grownBytes(this.text, this.textEnd + worst, this.textEnd)
+    const out: u8[] = this.text
+    const b: u8[] = conn.inputBuffer()
+    const f: u8[][] = this.f
+    let o: i32 = this.textEnd
+    this.u0[at - 1] = o
+    o = jsonOutRaw(out, o, f[9])
+    o = jsonOutString(out, o, b, conn.colStart(U_USERNAME), conn.colLength(U_USERNAME))
+    o = jsonOutRaw(out, o, f[10])
+    o = this.stringOrNull(out, o, conn, b, U_BIO)
+    o = jsonOutRaw(out, o, f[11])
+    o = this.stringOrNull(out, o, conn, b, U_IMAGE)
+    o = jsonOutRaw(out, o, f[12])
+    this.u1[at - 1] = o
+    this.textEnd = o
+  }
+
+  private userSlot(id: i64): i32 {
+    const mask: i32 = ID_TABLE - 1
+    let slot: i32 = slotOf(hashInt(fnv(), id)) & mask
+    while (this.userTable[slot] > 0 && this.userIds[this.userTable[slot] - 1] !== id) {
+      slot = (slot + 1) & mask
+    }
+    return slot
+  }
+
+  /** Adds author `id` to group B's reads, once. */
+  private addUser(id: i64): void {
+    const slot: i32 = this.userSlot(id)
+    if (this.userTable[slot] > 0) {
+      return
+    }
+    if (this.users >= ID_TABLE / 2) {
+      this.failed = true
+      return
+    }
+    const k: i32 = this.users
+    this.userIds = grownInts(this.userIds, k + 1, k)
+    this.userSlots = grownI32(this.userSlots, k + 1, k)
+    this.u0 = grownI32(this.u0, k + 1, k)
+    this.u1 = grownI32(this.u1, k + 1, k)
+    this.userIds[k] = id
+    this.userSlots[k] = slot
+    this.u0[k] = -1
+    this.u1[k] = -1
+    this.userTable[slot] = k + 1
+    this.users = k + 1
+  }
+
+  /** Author `id`'s place, -1 when `plan_users` found no row for it: its requests go alone. */
+  private author(id: i64): i32 {
+    const at: i32 = this.userTable[this.userSlot(id)]
+    return at > 0 && this.u0[at - 1] >= 0 ? at - 1 : -1
   }
 
   // ---- Articles and flags by id ---------------------------------------------------
@@ -1567,7 +1665,6 @@ export class ReadPlan {
     this.m1 = grownI32(this.m1, n, keep)
     this.m2 = grownI32(this.m2, n, keep)
     this.m3 = grownI32(this.m3, n, keep)
-    this.m4 = grownI32(this.m4, n, keep)
     const full: boolean[] = new Array<boolean>(toI32(this.metaIds.length))
     const found: boolean[] = new Array<boolean>(toI32(this.metaIds.length))
     for (let k: i32 = 0; k < keep && k < toI32(full.length); k++) {
@@ -1665,7 +1762,11 @@ export class ReadPlan {
       const n: i32 = this.commentCount[key]
       let size: i32 = 64
       for (let c: i32 = first; c < first + n; c++) {
-        size += this.c1[c] - this.c0[c] + 16
+        const u: i32 = this.author(this.cAuthor[c])
+        if (u < 0) {
+          return PLAN_ALONE
+        }
+        size += this.c1[c] - this.c0[c] + this.u1[u] - this.u0[u] + 16
       }
       this.outRoom(size)
       let o: i32 = jsonOutRaw(this.out, 0, this.f[17])
@@ -1676,6 +1777,9 @@ export class ReadPlan {
         }
         copyBytes(this.out, o, this.text, this.c0[c], this.c1[c] - this.c0[c])
         o += this.c1[c] - this.c0[c]
+        const u: i32 = this.author(this.cAuthor[c])
+        copyBytes(this.out, o, this.text, this.u0[u], this.u1[u] - this.u0[u])
+        o += this.u1[u] - this.u0[u]
         o = jsonOutBool(this.out, o, this.flag(v, this.cAuthor[c], 1))
         o = jsonOutRaw(this.out, o, this.f[13])
       }
@@ -1697,9 +1801,13 @@ export class ReadPlan {
       if (!this.found[m] || !this.slugIs(m, r)) {
         return PLAN_ALONE
       }
-      this.outRoom(this.m4[m] - this.m0[m] + 128)
+      const u: i32 = this.author(this.slugAuthor[key])
+      if (u < 0) {
+        return PLAN_ALONE
+      }
+      this.outRoom(this.m3[m] - this.m0[m] + this.u1[u] - this.u0[u] + 128)
       let o: i32 = jsonOutRaw(this.out, 0, this.f[16])
-      o = this.article(o, m, true, v, id, this.slugAuthor[key])
+      o = this.article(o, m, true, v, id, this.slugAuthor[key], false)
       this.out[o] = toU8(125)
       this.outEnd = o + 1
       return 200
@@ -1713,7 +1821,11 @@ export class ReadPlan {
         return PLAN_ALONE
       }
       const m: i32 = this.idTable[slot] - 1
-      size += this.m4[m] - this.m0[m] + 96
+      const u: i32 = this.author(this.authors[j])
+      if (u < 0) {
+        return PLAN_ALONE
+      }
+      size += this.m3[m] - this.m0[m] + this.u1[u] - this.u0[u] + 96
     }
     this.outRoom(size)
     let o: i32 = jsonOutRaw(this.out, 0, this.f[14])
@@ -1722,7 +1834,7 @@ export class ReadPlan {
         this.out[o] = toU8(44)
         o++
       }
-      o = this.article(o, this.idTable[this.idSlot(this.ids[j])] - 1, false, v, this.ids[j], this.authors[j])
+      o = this.article(o, this.idTable[this.idSlot(this.ids[j])] - 1, false, v, this.ids[j], this.authors[j], kind === K_FEED)
     }
     o = jsonOutRaw(this.out, o, this.f[15])
     const count: i64 = kind === K_GLOBAL ? this.globalCount : this.countValue[this.countOf[i]]
@@ -1732,8 +1844,8 @@ export class ReadPlan {
     return 200
   }
 
-  /** Article `m` at `out[o]`, with its body when `full`, and viewer `v`'s flags on it and its author. */
-  private article(o: i32, m: i32, full: boolean, v: i64, id: i64, author: i64): i32 {
+  /** Article `m` at `out[o]`, with its body when `full`, and viewer `v`'s flags on it and its author, known when `followed`. */
+  private article(o: i32, m: i32, full: boolean, v: i64, id: i64, author: i64, followed: boolean): i32 {
     const t: u8[] = this.text
     const out: u8[] = this.out
     let at: i32 = o
@@ -1749,9 +1861,10 @@ export class ReadPlan {
     // The count comes from the count lane, maybe after this row did.
     at = jsonOutRaw(out, at, this.f[8])
     at = jwtDigits(this.metaCount[m], out, at)
-    copyBytes(out, at, t, this.m3[m], this.m4[m] - this.m3[m])
-    at += this.m4[m] - this.m3[m]
-    at = jsonOutBool(out, at, this.flag(v, author, 1))
+    const u: i32 = this.author(author)
+    copyBytes(out, at, t, this.u0[u], this.u1[u] - this.u0[u])
+    at += this.u1[u] - this.u0[u]
+    at = jsonOutBool(out, at, followed || this.flag(v, author, 1))
     return jsonOutRaw(out, at, this.f[13])
   }
 
