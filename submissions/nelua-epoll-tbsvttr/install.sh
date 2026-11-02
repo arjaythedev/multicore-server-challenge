@@ -22,4 +22,4 @@ else
   make -C "$tmp" -s -j"$(nproc)" PREFIX=/opt/nelua install >/dev/null
   echo "$NELUA_COMMIT" > /opt/nelua/COMMIT
 fi
-/opt/nelua/bin/nelua --version | head -3
+/opt/nelua/bin/nelua --version | sed -n 1,3p   # sed reads it all; with head, nelua could die of SIGPIPE
