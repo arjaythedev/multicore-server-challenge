@@ -158,9 +158,10 @@ let favorited_batch =
 (* A feed takes two statements. The first walks each followed author once, however many viewers in the batch follow
    them, up to the count cap or the deepest requested page; the app merges each viewer's page from that. Rows: 1 a
    viewer's followed authors, 3 an author's capped count and newest ids. $1 limits, $2 offsets, $3 viewers.
-   Each author is read once for both count and ids; OCaml sums the counts for each viewer, capped at 1000. *)
+   Each author is read once for both count and ids; OCaml sums the counts for each viewer, capped at 1000. Authors
+   are walked in id order, so the index lookups move through the index in one direction instead of jumping around. *)
 let feed_walk =
-  s "WITH p AS MATERIALIZED (SELECT * FROM unnest($1::int[], $2::bigint[], $3::bigint[]) q(lim, off, viewer)),\nd AS MATERIALIZED (\n SELECT g.viewer,g.n,ARRAY(SELECT f.followee_id FROM follows f WHERE f.follower_id=g.viewer) fo\n FROM (SELECT viewer,max(lim+off) n FROM p GROUP BY viewer) g),\nau AS MATERIALIZED (SELECT x.id,max(d.n) n FROM d CROSS JOIN LATERAL unnest(d.fo) x(id) GROUP BY x.id),\na AS MATERIALIZED (SELECT au.id,au.n,ARRAY(SELECT a2.id FROM articles a2 WHERE a2.author_id=au.id ORDER BY a2.id DESC LIMIT greatest(1000,au.n)) ids FROM au)\nSELECT 1 AS kind,d.viewer a,0::bigint b,d.fo ids FROM d\nUNION ALL SELECT 3,a.id,least(1000,cardinality(a.ids))::bigint,a.ids[1:least(a.n,cardinality(a.ids))::int] FROM a"
+  s "WITH p AS MATERIALIZED (SELECT * FROM unnest($1::int[], $2::bigint[], $3::bigint[]) q(lim, off, viewer)),\nd AS MATERIALIZED (\n SELECT g.viewer,g.n,ARRAY(SELECT f.followee_id FROM follows f WHERE f.follower_id=g.viewer) fo\n FROM (SELECT viewer,max(lim+off) n FROM p GROUP BY viewer) g),\nau AS MATERIALIZED (SELECT x.id,max(d.n) n FROM d CROSS JOIN LATERAL unnest(d.fo) x(id) GROUP BY x.id ORDER BY x.id),\na AS MATERIALIZED (SELECT au.id,au.n,ARRAY(SELECT a2.id FROM articles a2 WHERE a2.author_id=au.id ORDER BY a2.id DESC LIMIT greatest(1000,au.n)) ids FROM au)\nSELECT 1 AS kind,d.viewer a,0::bigint b,d.fo ids FROM d\nUNION ALL SELECT 3,a.id,least(1000,cardinality(a.ids))::bigint,a.ids[1:least(a.n,cardinality(a.ids))::int] FROM a"
 
 (* The second fetches the articles those pages need: $1 viewers, $2 ids, with no count of its own. *)
 let feed_fetch = batch_stmt "SELECT 1::bigint AS ord, 0::bigint AS total, $2::bigint[] AS ids"

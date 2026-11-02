@@ -17,7 +17,7 @@
 - **Domains.** `WORKERS` (default 6) domains each run an event loop with their own `SO_REUSEPORT` listener and share
   of the Postgres connections. `BCRYPT_THREADS` (default 2) plain C threads do the hashing at `BCRYPT_NICE` (default 19).
 - **Connections.** `PG_CONNECTIONS` (default 30) is split evenly between network domains for unbatched requests.
-  Batch lanes use 20 additional connections at the defaults, for 50 total, below the 95-connection limit.
+  Batch lanes use 22 additional connections at the defaults, for 52 total, below the 95-connection limit.
   Statements are prepared once per connection; session settings disable JIT and query parallelism and reuse generic plans.
 - **bcrypt never blocks an event loop.** A login's fiber suspends on its job's eventfd. Interleaving 5 hashes costs
   14-29 ms of CPU per hash on the benchmark box, against 51-56 ms alone. A hash waits up to `BCRYPT_WAIT_MS` (default
@@ -26,8 +26,9 @@
 
 - **Reads and the common writes are batched across domains.** Each kind has a lane: a fiber on one domain with its own connection,
   which takes every request waiting (from any domain), lets more arrive until the oldest has waited the current window,
-  and runs them as one statement with array parameters. List lanes have `LIST_LANE_FIBERS` (default 2)
-  fibers, one collecting while the other's statement runs, so a slow statement doesn't make the next batch bigger. An article's data is read once however many pages and viewers want it,
+  and runs them as one statement with array parameters. List lanes have `LIST_LANE_FIBERS` (default 2) fibers, and the
+  single-article and comments lanes have 2, one collecting while the other's statement runs, so a slow statement doesn't
+  make the next batch bigger. Write lanes keep one fiber. An article's data is read once however many pages and viewers want it,
   and a viewer's favorites and follows are walked once. Only requests already queued when the statement starts share
   it, and nothing is kept afterwards. Writes in a batch share one statement and one commit, and each response waits
   for that commit. If a batch fails, its requests run alone, so one bad request fails only itself.
@@ -38,8 +39,9 @@
 - **Overload slows accepts down, it doesn't kill the server.** Connections stop being accepted 2,048 below the
   descriptor limit, which leaves room for logins and Postgres reconnects, and new ones wait in the kernel's accept queue.
   `EMFILE` and similar errors from `accept` back off for 50 ms.
-- **Feed reads share author work within a batch.** Followed authors are walked once for both capped counts and newest IDs; OCaml merges each viewer's page. Article and comment lookups are sorted by ID to improve locality.
+- **Feed reads share author work within a batch.** Followed authors are walked once for both capped counts and newest IDs, in ID order; OCaml merges each viewer's page. Article and comment lookups are sorted by ID to improve locality.
 - **An article is rendered once per batch.** Each request joins the shared JSON pieces and adds its viewer's two flags.
+- **`start.sh` runs the server under `SCHED_BATCH`** (`chrt -b 0`), so the kernel preempts its event loops less often.
 - **`OCAMLRUNPARAM` trades memory for fewer collections** (`s=32M,o=400`), because each major collection scans every
   fiber's stack.
 
@@ -74,6 +76,28 @@ The box is saturated at this load, so the window gives no extra capacity: it rem
 from 2,000 users gave p50 15.7 ms at 2,000 users and 18.4 ms at 64,000. Its 250,000-user probe, limited by the single
 load generator, held 197,952 connections without the server exiting.
 
+### On an aged database
+
+The maintainer's search doesn't reset the database between phases, so its hold runs on a database that earlier probes
+have written to. To match that, `dev/aws/exp.sh age` runs four heavy probes against a fresh database and snapshots it,
+and every hold below restores that snapshot first. Measured on 2026-11-01 and 2026-11-02 on the same pair of machines
+as the table above. `db970f2` is the previous head; the current head adds two fibers on the single-article and comments
+lanes, `SCHED_BATCH`, and the author order in the feed walk.
+
+| Users | Build | Requests/s | p50 | p95 | p99 | Errors | Verdict |
+|---:|---|---:|---:|---:|---:|---:|---|
+| 110,000 | `db970f2` | 27,978.1 | 146.2 ms | 355.8 ms | 463.1 ms | 0 | Pass |
+| 110,000 | current | 28,041.2 | 138.1 ms | 323.8 ms | 410.6 ms | 0 | Pass |
+| 120,000 | `db970f2` | 30,218.2 | 177.9 ms | 432.1 ms | 577.5 ms | 0 | Pass |
+| 120,000 | current | 30,298.1 | 172.7 ms | 398.6 ms | 498.7 ms | 0 | Pass |
+| 130,000 | `db970f2` | 32,401.2 | 199.4 ms | 548.4 ms | 834.6 ms | 0 | Fail: p95 |
+| 130,000 | current | 32,558.7 | 196.0 ms | 474.9 ms | 612.9 ms | 0 | Pass |
+| 140,000 | `db970f2` | 34,291.6 | 227.8 ms | 785.4 ms | 1,148.9 ms | 0 | Fail |
+| 140,000 | current | 34,749.6 | 221.2 ms | 582.1 ms | 796.2 ms | 0 | Fail: p95 |
+
+At 140,000 the two builds were also run in alternating pairs; the current settings were ahead in every pair. The
+aging is a guess at the maintainer's, so these show the difference between builds better than the absolute score.
+
 The development harness commands were:
 
 ```sh
@@ -85,5 +109,6 @@ bash dev/aws/aws.sh hold defaults-no-stats-150k 150000
 
 `dev/aws/aws.sh` syncs this folder to two AWS machines and runs builds, conformance and benchmarks there through the
 repo's scoring scripts, with telemetry. `CONDUIT_STATS=1` makes each domain print one line of counters per second;
-it's off by default. `dev/bench.sh` and `dev/profile.sh` are older single-machine equivalents. None of `dev/` runs in
+it's off by default. `dev/aws/exp.sh` restores
+an aged database before each hold and passes environment overrides to the server. `dev/bench.sh` and `dev/profile.sh` are older single-machine equivalents. None of `dev/` runs in
 a scored benchmark.

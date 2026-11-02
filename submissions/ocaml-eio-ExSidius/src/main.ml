@@ -62,13 +62,15 @@ let serve ~host ~port ~db ~pool_size ~secret ~lanes ~workers ~list_fibers ~watch
   let lane home l f =
     if ((home - 1) mod workers) + 1 = domain then Eio.Fiber.fork ~sw (fun () -> Batch.run l ~clock ~url:db f)
   in
-  (* The list statements are the slow ones, so they get several fibers, on consecutive domains. Write lanes keep one:
-     concurrent batches could lock the same rows in different orders. *)
-  let list_lane home l f =
-    for i = 0 to list_fibers - 1 do
+  (* Read lanes get several fibers, on consecutive domains, one collecting while another's statement runs, so a slow
+     statement doesn't make the next batch bigger. Write lanes keep one: concurrent batches could lock the same rows in
+     different orders. *)
+  let fibers n home l f =
+    for i = 0 to n - 1 do
       lane (home + i) l f
     done
   in
+  let list_lane home l f = fibers list_fibers home l f in
   Option.iter
     (fun (l : App.lanes) ->
       lane 1 l.tags_lane App.run_tags;
@@ -77,8 +79,8 @@ let serve ~host ~port ~db ~pool_size ~secret ~lanes ~workers ~list_fibers ~watch
       list_lane 5 l.tag_lane (App.run_pages App.tag_batch);
       list_lane 6 l.author_lane (App.run_pages App.author_batch);
       list_lane 1 l.favorited_lane (App.run_pages App.favorited_batch);
-      lane 2 l.article_lane (App.run_pages App.article_batch);
-      lane 5 l.comments_lane App.run_comments;
+      fibers 2 2 l.article_lane (App.run_pages App.article_batch);
+      fibers 2 5 l.comments_lane App.run_comments;
       lane 4 l.profile_lane App.run_profiles;
       lane 5 l.user_lane App.run_users;
       lane 6 l.favorite_lane (App.run_favorites App.favorite_batch);
