@@ -30,6 +30,10 @@ public final class Loop implements Runnable {
     private final Pending pending = new Pending();
     private Conn serving;
     private boolean listenerPaused;
+    // out of fds (EMFILE/ENFILE/ENOBUFS/ENOMEM on accept): the listener stays out of epoll until this nanoTime, then retries; 0 = not
+    // starved. Timed rather than on close, since fds are per process and other loops' closes free them too.
+    private long starvedUntil;
+    private static final long STARVE_NANOS = 10_000_000L;
     private boolean resuming;
     private final Sys sys = new Sys();
     private final int ep;
@@ -216,12 +220,16 @@ public final class Loop implements Runnable {
     public void run() {
         thread = Thread.currentThread();
         for (; ; ) {
-            int n = sys.epollWait(ep, events, 1024, -1);
+            int n = sys.epollWait(ep, events, 1024, starvedUntil == 0 ? -1 : (int) Math.max(1, (starvedUntil - System.nanoTime()) / 1_000_000));
             if (n < 0) {
                 if (sys.errno() == Sys.EINTR) {
                     continue;
                 }
                 throw new IllegalStateException("epoll_wait errno " + sys.errno());
+            }
+            if (starvedUntil != 0 && System.nanoTime() - starvedUntil >= 0) {
+                starvedUntil = 0;
+                resume();
             }
             for (int i = 0; i < n; i++) {
                 int fd = Sys.eventFd(events, i);
@@ -292,7 +300,7 @@ public final class Loop implements Runnable {
                     }
                 }
             }
-            if (listenerPaused && inflight < maxInflight) {
+            if (listenerPaused && inflight < maxInflight && starvedUntil == 0) {
                 ctl(Sys.EPOLL_CTL_MOD, listener, Sys.EPOLLIN);
                 listenerPaused = false;
             }
@@ -311,6 +319,15 @@ public final class Loop implements Runnable {
                     continue;
                 }
                 if (e == Sys.EAGAIN) {
+                    return;
+                }
+                if (e == Sys.EMFILE || e == Sys.ENFILE || e == Sys.ENOBUFS || e == Sys.ENOMEM) {
+                    // overload, not a fault: leave the rest in the backlog and retry once fds free up
+                    if (!listenerPaused) {
+                        ctl(Sys.EPOLL_CTL_MOD, listener, 0);
+                        listenerPaused = true;
+                    }
+                    starvedUntil = System.nanoTime() + STARVE_NANOS;
                     return;
                 }
                 throw new IllegalStateException("accept errno " + e);
