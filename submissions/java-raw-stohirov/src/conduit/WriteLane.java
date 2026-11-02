@@ -41,7 +41,7 @@ final class WriteLane implements Runnable {
         while (true) {
             jobs.clear();
             try {
-                Lanes.WRITES.takeAny(s.writeMax(), Long.MAX_VALUE, jobs);
+                Lanes.WRITES.take(s.writeMax(), s.writeWindowNanos(), s.writeMax(), jobs);
             } catch (InterruptedException e) {
                 return;
             }
@@ -64,14 +64,18 @@ final class WriteLane implements Runnable {
     }
 
     private void group(List<Job> jobs, List<Http.Resp> out, List<Job> reads) throws IOException {
+        // Every mergeable write of a kind joins that kind's one unit: a group holds no two requests of one connection,
+        // and no response has gone out, so no client can tell the order.
         List<Unit> units = new ArrayList<>();
+        Unit[] merged = new Unit[Job.DELETE_COMMENT + 1];
         for (Job j : jobs) {
-            Unit last = units.isEmpty() ? null : units.get(units.size() - 1);
-            if (last != null && last.kind == j.kind && mergeable(j.kind)) last.jobs.add(j);
+            if (mergeable(j.kind) && merged[j.kind] != null) merged[j.kind].jobs.add(j);
             else {
                 List<Job> l = new ArrayList<>(4);
                 l.add(j);
-                units.add(new Unit(j.kind, l));
+                Unit u = new Unit(j.kind, l);
+                units.add(u);
+                if (mergeable(j.kind)) merged[j.kind] = u;
             }
         }
         int total = 0;

@@ -1,6 +1,5 @@
 package conduit;
 
-import java.io.BufferedInputStream;
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
@@ -98,9 +97,9 @@ final class Pg implements AutoCloseable {
         }
 
         /** Appends one DataRow payload of length n read from in. */
-        void readRow(InputStream in, int n) throws IOException {
+        void readRow(In in, int n) throws IOException {
             if (used + n > buf.length) buf = Arrays.copyOf(buf, Math.max(buf.length * 2, used + n));
-            readFully(in, buf, used, n);
+            in.readFully(buf, used, n);
             int p = used;
             int nc = (buf[p] & 0xff) << 8 | (buf[p + 1] & 0xff);
             p += 2;
@@ -243,17 +242,70 @@ final class Pg implements AutoCloseable {
         }
     }
 
+    /** A socket's input with its own buffer: one thread reads, so no locking per byte. */
+    static final class In {
+        private final InputStream s;
+        private final byte[] b = new byte[1 << 16];
+        private int p, l;
+
+        In(InputStream s) {
+            this.s = s;
+        }
+
+        private boolean fill() throws IOException {
+            p = 0;
+            l = s.read(b, 0, b.length);
+            if (l < 0) l = 0;
+            return l > 0;
+        }
+
+        int read() throws IOException {
+            if (p == l && !fill()) return -1;
+            return b[p++] & 0xff;
+        }
+
+        int readInt() throws IOException {
+            if (l - p >= 4) {
+                int v = getInt(b, p);
+                p += 4;
+                return v;
+            }
+            int a = read(), c = read(), d = read(), e = read();
+            if ((a | c | d | e) < 0) throw new EOFException("postgres closed the connection");
+            return a << 24 | c << 16 | d << 8 | e;
+        }
+
+        void readFully(byte[] out, int off, int n) throws IOException {
+            while (n > 0) {
+                if (p == l && !fill()) throw new EOFException("postgres closed the connection");
+                int m = Math.min(n, l - p);
+                System.arraycopy(b, p, out, off, m);
+                p += m;
+                off += m;
+                n -= m;
+            }
+        }
+
+        void skip(int n) throws IOException {
+            while (n > 0) {
+                if (p == l && !fill()) throw new EOFException("postgres closed the connection");
+                int m = Math.min(n, l - p);
+                p += m;
+                n -= m;
+            }
+        }
+    }
+
     private final Socket sock;
-    private final InputStream in;
+    private final In in;
     private final OutputStream out;
     final Buf w = new Buf(1 << 16);
-    private byte[] scratch = new byte[1024];
 
     Pg(Config cfg, Map<String, String> settings) throws IOException {
         sock = new Socket();
         sock.setTcpNoDelay(true);
         sock.connect(new InetSocketAddress(cfg.host(), cfg.port()), 10_000);
-        in = new BufferedInputStream(sock.getInputStream(), 1 << 16);
+        in = new In(sock.getInputStream());
         out = sock.getOutputStream();
         startup(cfg, settings);
     }
@@ -327,7 +379,7 @@ final class Pg implements AutoCloseable {
         byte[] serverSignature = null;
         while (true) {
             int t = in.read();
-            int n = readInt() - 4;
+            int n = in.readInt() - 4;
             byte[] m = body(n);
             switch (t) {
                 case 'R' -> {
@@ -464,25 +516,10 @@ final class Pg implements AutoCloseable {
         return code + " " + msg;
     }
 
-    private int readInt() throws IOException {
-        int a = in.read(), b = in.read(), c = in.read(), d = in.read();
-        if ((a | b | c | d) < 0) throw new EOFException("postgres closed the connection");
-        return a << 24 | b << 16 | c << 8 | d;
-    }
-
     private byte[] body(int n) throws IOException {
         byte[] b = new byte[n];
-        readFully(in, b, 0, n);
+        in.readFully(b, 0, n);
         return b;
-    }
-
-    private static void readFully(InputStream in, byte[] b, int off, int n) throws IOException {
-        while (n > 0) {
-            int r = in.read(b, off, n);
-            if (r < 0) throw new EOFException("postgres closed the connection");
-            off += r;
-            n -= r;
-        }
     }
 
     // ---- statements ----
@@ -544,6 +581,19 @@ final class Pg implements AutoCloseable {
         return read(n);
     }
 
+    /** Closes the statements buffered so far with a Sync, as one implicit transaction; returns how many there were. */
+    int cut() {
+        sync();
+        int n = execs;
+        execs = 0;
+        return n;
+    }
+
+    /** Reads the results of one cut. Cuts are read in the order they were sent, after flush(). */
+    List<Rows> receive(int n) throws IOException {
+        return read(n);
+    }
+
     /**
      * Reads results for n executes up to ReadyForQuery. After an error, the remaining executes are skipped by the
      * server; their Rows stay empty with sqlstate "skipped".
@@ -556,11 +606,11 @@ final class Pg implements AutoCloseable {
         while (true) {
             int t = in.read();
             if (t < 0) throw new EOFException("postgres closed the connection");
-            int len = readInt() - 4;
+            int len = in.readInt() - 4;
             switch (t) {
                 case 'D' -> res.get(cur).readRow(in, len);
                 case 'C', 'I' -> {
-                    skip(len);
+                    in.skip(len);
                     cur++;
                 }
                 case 'E' -> {
@@ -581,7 +631,7 @@ final class Pg implements AutoCloseable {
                     for (int i = cur; i < n; i++) res.get(i).sqlstate = "skipped";
                     return res;
                 }
-                default -> skip(len); // '1', '2', 'n', 'N', 'S', 's', 't'
+                default -> in.skip(len); // '1', '2', 'n', 'N', 'S', 's', 't'
             }
         }
     }
@@ -596,10 +646,5 @@ final class Pg implements AutoCloseable {
         List<List<Rows>> out = new ArrayList<>(execsPerSegment.length);
         for (int n : execsPerSegment) out.add(read(n));
         return out;
-    }
-
-    private void skip(int n) throws IOException {
-        if (n > scratch.length) scratch = new byte[n];
-        readFully(in, scratch, 0, n);
     }
 }

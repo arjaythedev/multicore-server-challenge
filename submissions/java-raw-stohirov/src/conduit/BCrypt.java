@@ -53,6 +53,8 @@ final class BCrypt {
         }
     }
 
+    static final int JAVA = -1;
+
     /** A parsed "$2x$NN$" + 22-char salt prefix. */
     record Setting(String prefix, int cost, byte[] salt) {}
 
@@ -78,28 +80,38 @@ final class BCrypt {
      * lockstep: the same work as k single hashes, but the core overlaps their dependent S-box loads.
      */
     static String[] hashLanes(byte[][] passwords, Setting[] settings) {
+        return hashLanes(passwords, settings, BCryptNative.style);
+    }
+
+    /** The same with a given cost-loop kernel: a BCryptNative style, or JAVA for the Java kernels. */
+    static String[] hashLanes(byte[][] passwords, Setting[] settings, int style) {
         int k = passwords.length;
         String[] out = new String[k];
         for (int from = 0; from < k; from += BCryptLanes.MAX) {
             int n = Math.min(BCryptLanes.MAX, k - from);
-            int[][] p = new int[n][], s = new int[n][], kw = new int[n][], sw = new int[n][], swk = new int[n][], c = new int[n][];
+            int stride = BCryptLanes.STRIDE;
+            int[] a = new int[n * stride];
+            int[][] kw = new int[n][], sw = new int[n][], swk = new int[n][], c = new int[n][];
             for (int i = 0; i < n; i++) {
                 byte[] key = keyBytes(passwords[from + i]);
                 byte[] salt = settings[from + i].salt();
-                p[i] = P_INIT.clone();
-                s[i] = S_INIT.clone();
+                System.arraycopy(P_INIT, 0, a, i * stride, 18);
+                System.arraycopy(S_INIT, 0, a, i * stride + 18, 1024);
                 kw[i] = words(key, 18);
                 sw[i] = words(salt, 4);
                 swk[i] = words(salt, 18);
                 c[i] = CTEXT.clone();
             }
             int cost = settings[from].cost();
-            BCryptLanes.expandSalted(n, p, s, kw, sw);
-            for (int r = 1 << cost; r > 0; r--) {
-                BCryptLanes.expand(n, p, s, kw);
-                BCryptLanes.expand(n, p, s, swk);
+            BCryptLanes.expandSalted(n, a, kw, sw);
+            if (style >= 0) BCryptNative.costLoop(a, n, style, kw, swk, 1L << cost);
+            else {
+                for (long r = 1L << cost; r > 0; r--) {
+                    BCryptLanes.expand(n, a, kw);
+                    BCryptLanes.expand(n, a, swk);
+                }
             }
-            BCryptLanes.encrypt(n, p, s, c);
+            BCryptLanes.encrypt(n, a, c);
             for (int i = 0; i < n; i++) {
                 byte[] raw = new byte[24];
                 for (int w = 0; w < 6; w++) {

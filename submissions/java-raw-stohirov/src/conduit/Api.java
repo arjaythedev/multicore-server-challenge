@@ -332,7 +332,7 @@ final class Api {
     }
 
     private static byte[] read(Job j) {
-        Lanes.READS.push(j);
+        j.conn.loop.reads.add(j);
         return null;
     }
 
