@@ -17,8 +17,9 @@ module Engine.Reads
 //            share one Card object (and Web encodes its JSON once).
 //
 // The SQL only looks rows up by keys F# has already made distinct (unnest the arrays, one
-// LATERAL index probe per key), so there is no dedup work left for Postgres. No timer: with no
-// load a batch is one request; near saturation the batches grow and each request costs less.
+// LATERAL index probe per key), so there is no dedup work left for Postgres. A lane lets the
+// oldest request wait up to the gather window for batch-mates; near saturation the queue already
+// holds a full batch, nobody waits, and each request costs less.
 //
 // Not a cache: every request is answered from a snapshot taken after it arrived, and nothing
 // outlives its batch (README rule 5).

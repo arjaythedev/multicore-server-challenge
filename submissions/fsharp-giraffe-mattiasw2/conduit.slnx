@@ -1,5 +1,0 @@
-<Solution>
-  <Project Path="src/Engine/Engine.fsproj" />
-  <Project Path="src/Web/Web.fsproj" />
-  <Project Path="src/Tests/Tests.fsproj" />
-</Solution>

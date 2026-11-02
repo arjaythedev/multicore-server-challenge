@@ -8,8 +8,8 @@ open System.Text
 open System.Threading
 open System.Threading.Tasks
 
-// bcrypt cost 10 is ~50 ms of an idle core and ~90 ms under load: half of this server's CPU
-// (README). Run on the thread pool it would park request threads and stall the cheap reads
+// bcrypt cost 10 is ~50 ms of an idle core and ~90 ms under load: the largest single share of
+// this server's CPU (README). Run on the thread pool it would park request threads and stall the cheap reads
 // behind it, so it runs on a few dedicated threads with a queue in front. Each thread computes
 // up to `width` hashes in lockstep (Bcrypt: independent chains overlap in the CPU), so a thread
 // that picks up a login first waits up to `gather` for batch-mates. Under load the queue

@@ -22,7 +22,7 @@ Package versions are pinned, and `build.sh` restores the `packages.lock.json` gr
 ```
 src/Engine/   the database side: Types, Db (pool), Commit (group commit), Reads (read batching), Bcrypt (lockstep bcrypt), Passwords (bcrypt threads), Tags, Users, Profiles, Articles, Comments
 src/Web/      Jwt (the token shim), Wire (JSON in/out, query paging; pure), Handlers (Giraffe), Program (Kestrel)
-src/Tests/    xUnit facts for Jwt and Wire (no database); BatchTests, the read-batching property (FsCheck)
+src/Tests/    xUnit facts for Jwt and Wire, BcryptTests against BCrypt.Net-Next (no database); BatchTests, the read-batching property (FsCheck)
 check.sh      the harness: build -> facts -> conformance suite (../../test/run.sh) -> batch property, one verdict
 ```
 
@@ -172,6 +172,8 @@ statement per kind, see above):
   `sub` must be a decimal string and `exp` must be present and in the future.
 - **bcrypt:** cost 10 for every new password, and every login verifies against the stored hash. A password longer
   than 72 bytes is refused with a 422, never silently truncated.
+- **Connections:** at most 95 Postgres connections (`READ_LANES` + `WRITE_LANES` + `DB_POOL_SIZE`; the pool is
+  capped to fit).
 
 ## bcrypt runs once per sign-in, and never for a refused request
 
@@ -188,8 +190,6 @@ sign-up, password change or login, and only when that request is going to succee
 The pre-checks don't change the outcome: two racing sign-ups can both pass, and the UNIQUE constraint still answers
 422. At shutdown the server logs its counts (`bcrypt: N hashes, M verifies`). A conformance run gives exactly
 3 hashes (2 sign-ups + 1 password change) and 5 verifies (the 5 logins whose email exists).
-- **Connections:** at most 95 Postgres connections (`READ_LANES` + `WRITE_LANES` + `DB_POOL_SIZE`; the pool is
-  capped to fit).
 
 ## Capacity
 
