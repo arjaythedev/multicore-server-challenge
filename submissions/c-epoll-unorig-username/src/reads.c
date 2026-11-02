@@ -1059,56 +1059,86 @@ static int run_batch(drain_t *d, job **jobs, int n) {
   return B_OK;
 }
 
-// ---- the queue
+// ---- the queue: three lanes. Feeds are the costliest read and comments the next, so nothing waits behind them, and
+// each lane starts a drain at most once per gap. A free connection goes to the lane whose oldest read has waited longest.
+enum { LANE_SHARED, LANE_FEED, LANE_COMMENT, NLANES };
+typedef struct {
+  job *head, *tail;
+  int n, inflight;
+  int64_t next_start, gap;
+} lane_t;
+static lane_t lanes[NLANES];
 static pthread_mutex_t q_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t q_cv = PTHREAD_COND_INITIALIZER;
-static job *q_head, *q_tail;
-static int q_n;
-static int waiting;
-static int64_t next_start;
-static int64_t gap_us = 20000;
+static int waiting, inflight, read_cap = 6, lane_on = 1;
 #define MAX_BATCH 4096
 
 void read_enqueue(job *j) {
   j->next = NULL;
+  j->t_in = now_us();
+  lane_t *l = &lanes[lane_on ? (j->kind == K_FEED ? LANE_FEED : j->kind == K_COMMENTS ? LANE_COMMENT : LANE_SHARED) : LANE_SHARED];
   pthread_mutex_lock(&q_mu);
-  if (q_tail) q_tail->next = j;
-  else q_head = j;
-  q_tail = j;
-  q_n++;
-  if (q_n == 1 && waiting) pthread_cond_signal(&q_cv);
+  if (l->tail) l->tail->next = j;
+  else l->head = j;
+  l->tail = j;
+  l->n++;
+  if (l->n == 1 && waiting) pthread_cond_signal(&q_cv);
   pthread_mutex_unlock(&q_mu);
 }
 
-static int take(job **out) {
+static int take(job **out, int *lane_out) {
   pthread_mutex_lock(&q_mu);
   for (;;) {
-    if (q_n) {
-      int64_t now = now_us();
-      if (now >= next_start) {
-        next_start = now + gap_us;
-        int n = 0;
-        while (q_head && n < MAX_BATCH) {
-          job *j = q_head;
-          q_head = j->next;
-          out[n++] = j;
+    int64_t now = now_us(), wake = 0;
+    lane_t *best = NULL;
+    if (inflight < read_cap) {
+      for (int i = 0; i < NLANES; i++) {
+        lane_t *l = &lanes[i];
+        if (!l->n) continue;
+        if (now < l->next_start) {
+          if (!wake || l->next_start < wake) wake = l->next_start;
+          continue;
         }
-        if (!q_head) q_tail = NULL;
-        q_n -= n;
-        if (q_n && waiting) pthread_cond_signal(&q_cv);
-        pthread_mutex_unlock(&q_mu);
-        return n;
+        if (!best || l->head->t_in < best->head->t_in) best = l;
       }
+    }
+    if (best) {
+      best->next_start = now + best->gap;
+      int n = 0;
+      while (best->head && n < MAX_BATCH) {
+        out[n++] = best->head;
+        best->head = best->head->next;
+      }
+      if (!best->head) best->tail = NULL;
+      best->n -= n;
+      best->inflight++;
+      inflight++;
+      *lane_out = (int)(best - lanes);
+      if (waiting) pthread_cond_signal(&q_cv);
       pthread_mutex_unlock(&q_mu);
-      struct timespec ts = {0, (next_start - now) * 1000};
-      nanosleep(&ts, NULL);
-      pthread_mutex_lock(&q_mu);
-      continue;
+      return n;
     }
     waiting++;
-    pthread_cond_wait(&q_cv, &q_mu);
+    if (wake) {
+      struct timespec ts;
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      ts.tv_nsec += (wake - now) * 1000;
+      ts.tv_sec += ts.tv_nsec / 1000000000;
+      ts.tv_nsec %= 1000000000;
+      pthread_cond_timedwait(&q_cv, &q_mu, &ts);
+    } else {
+      pthread_cond_wait(&q_cv, &q_mu);
+    }
     waiting--;
   }
+}
+
+static void take_done(int lane) {
+  pthread_mutex_lock(&q_mu);
+  lanes[lane].inflight--;
+  inflight--;
+  if (waiting) pthread_cond_signal(&q_cv);
+  pthread_mutex_unlock(&q_mu);
 }
 
 // Up to a second of tries; a batch that still has no connection is answered 500 rather than left hanging.
@@ -1162,19 +1192,34 @@ static void run_safe(drain_t *d, job **jobs, int n) {
 
 static void *drain_main(void *arg) {
   drain_t *d = arg;
+  const char *pol = getenv("DRAIN_SCHED");
+  thread_sched(pol ? pol : "batch", 0);
   arena_init(&d->a, (size_t)4 << 30);
   pg_reconnect(d);
   job **batch = malloc(sizeof(job *) * MAX_BATCH);
   for (;;) {
-    int n = take(batch);
+    int lane, n = take(batch, &lane);
+    // Clients that hung up while queued cost nothing more: their jobs go straight back to be freed.
+    for (int i = 0; i < n; i++)
+      if (!conn_alive(batch[i])) {
+        free(batch[i]->resp);
+        batch[i]->resp = NULL;
+        loop_post(batch[i]);
+        batch[i] = NULL;
+      }
     run_safe(d, batch, n);
+    take_done(lane);
   }
   return NULL;
 }
 
 void reads_start(int n) {
-  const char *g = getenv("READ_GAP_US");
-  if (g) gap_us = atoll(g);
+  const char *e;
+  lanes[LANE_SHARED].gap = (e = getenv("GAP_SHARED_US")) ? atoll(e) : 80000;
+  lanes[LANE_FEED].gap = (e = getenv("GAP_FEED_US")) ? atoll(e) : 80000;
+  lanes[LANE_COMMENT].gap = (e = getenv("GAP_COMMENT_US")) ? atoll(e) : 100000;
+  if ((e = getenv("READ_CAP"))) read_cap = atoi(e);
+  if ((e = getenv("READ_LANES"))) lane_on = atoi(e);
   for (int i = 0; i < n; i++) {
     drain_t *d = calloc(1, sizeof *d);
     d->id = i;

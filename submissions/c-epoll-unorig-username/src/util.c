@@ -1,5 +1,9 @@
+#include <sched.h>
 #include <stdio.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include "common.h"
 
@@ -116,4 +120,11 @@ void arena_overflow(arena_t *a) {
   a->off = 0;
   if (a->fail) longjmp(*a->fail, 2);
   abort();
+}
+
+void thread_sched(const char *policy, int nice) {
+  struct sched_param sp = {0};
+  if (policy && !strcmp(policy, "batch")) sched_setscheduler(0, SCHED_BATCH, &sp);
+  if (policy && !strcmp(policy, "idle")) sched_setscheduler(0, SCHED_IDLE, &sp);
+  if (nice) setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), nice);
 }

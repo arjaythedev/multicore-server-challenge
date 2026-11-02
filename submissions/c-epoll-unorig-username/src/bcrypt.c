@@ -12,6 +12,7 @@ typedef struct __attribute__((aligned(64))) {
   uint32_t w[1042];  // P[18], S[4][256]
   char pad[64 - (1042 * 4) % 64];
 } bf_t;
+_Static_assert(sizeof(bf_t) == 4224, "the x86 kernels assume this stride");
 
 #define F(s, x) \
   ((((s)[18 + ((x) >> 24)] + (s)[18 + 256 + (((x) >> 16) & 255)]) ^ (s)[18 + 512 + (((x) >> 8) & 255)]) + (s)[18 + 768 + ((x) & 255)])
@@ -46,6 +47,29 @@ typedef struct __attribute__((aligned(64))) {
 FILL(fill1, 1) FILL(fill2, 2) FILL(fill3, 3) FILL(fill4, 4) FILL(fill5, 5) FILL(fill6, 6) FILL(fill7, 7) FILL(fill8, 8)
 typedef void (*fill_fn)(bf_t *, const uint32_t (*)[4]);
 static const fill_fn fills[9] = {NULL, fill1, fill2, fill3, fill4, fill5, fill6, fill7, fill8};
+
+#if defined(__x86_64__)
+#include <cpuid.h>
+void bf_fill_x86_1(void *), bf_fill_x86_2(void *), bf_fill_x86_3(void *), bf_fill_x86_4(void *), bf_fill_x86_5(void *);
+static void (*const kernels[6])(void *) = {NULL, bf_fill_x86_1, bf_fill_x86_2, bf_fill_x86_3, bf_fill_x86_4, bf_fill_x86_5};
+static bool use_asm;
+static void pick_kernel(void) {
+  unsigned a, b, c, d;
+  use_asm = __get_cpuid_count(7, 0, &a, &b, &c, &d) && (b & (1u << 8)) && !getenv("BCRYPT_NO_ASM");
+}
+#else
+static void pick_kernel(void) {}
+#endif
+
+static inline void fill_nosalt(bf_t *st, int m) {
+#if defined(__x86_64__)
+  if (use_asm && m <= 5) {
+    kernels[m](st);
+    return;
+  }
+#endif
+  fills[m](st, NULL);
+}
 
 static inline uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
 
@@ -146,9 +170,9 @@ void bcrypt_lanes(int n, const char *const pw[], const size_t pl[], const char *
   uint64_t rounds = 1ULL << cost;
   for (uint64_t r = 0; r < rounds; r++) {
     for (int l = 0; l < m; l++) xor_key(&st[l], keys[l], kl[l]);
-    fill(st, NULL);
+    fill_nosalt(st, m);
     for (int l = 0; l < m; l++) xor_key(&st[l], salts[l], 16);
-    fill(st, NULL);
+    fill_nosalt(st, m);
   }
   static const char MAGIC[] = "OrpheanBeholderScryDoubt";
   for (int l = 0; l < m; l++) {
@@ -194,6 +218,7 @@ void bcrypt_gen_salt(char out[30]) {
 }
 
 void bcrypt_selftest(void) {
+  pick_kernel();
   // Generated with golang.org/x/crypto/bcrypt; every lane count must reproduce them.
   static const struct { const char *pw, *hash; } v[] = {
       {"U*U", "$2a$05$qEcno4Flir2c22Nm4rGCi.2Y8JeOLBjkZAxnxTHm/9YrZfgWtGN2C"},

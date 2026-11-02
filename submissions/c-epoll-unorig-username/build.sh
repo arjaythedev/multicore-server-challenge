@@ -6,4 +6,4 @@ mkdir -p bin
 MARCH=-march=native
 [ "$(uname -m)" = x86_64 ] || MARCH=
 gcc -std=gnu11 -D_GNU_SOURCE -O3 $MARCH -flto -fno-plt -fno-semantic-interposition -Wall -Wextra -Wno-unused-parameter \
-  -pthread -o bin/conduit src/*.c
+  -pthread -o bin/conduit src/*.c src/*.S

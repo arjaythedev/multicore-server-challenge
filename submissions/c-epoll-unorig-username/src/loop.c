@@ -88,9 +88,36 @@ static size_t put_head(char *o, int status, size_t n, bool close) {
   return o - s;
 }
 
+// Gzip only what saves a TCP segment: a client ACKs every second segment, so a segment less is less work on both sides.
+static int gz_mss = 1448, gz_min_segs = 3;
+static inline size_t segs(size_t n) { return (n + (size_t)gz_mss - 1) / (size_t)gz_mss; }
+
 void job_reply(job *j, int status, const char *body, size_t n) {
-  char *r = malloc(160 + n);
+  char *r = malloc(200 + n);
   if (!r) abort();
+  if (j->gzip && gz_min_segs && n + 120 > (size_t)gz_mss * (size_t)gz_min_segs - (size_t)gz_mss) {
+    static __thread uint8_t *z;
+    static __thread size_t zc;
+    if (zc < n + 1024) {
+      free(z);
+      zc = n * 2 + 4096;
+      z = malloc(zc);
+    }
+    size_t want = (segs(n + 120) - 1) * (size_t)gz_mss - 140;
+    size_t zn = gz_encode((const uint8_t *)body, n, z, want);
+    if (zn) {
+      size_t h = put_head(r, status, zn, j->close);
+      h -= 2;
+      static const char CE[] = "Content-Encoding: gzip\r\n\r\n";
+      memcpy(r + h, CE, sizeof CE - 1);
+      h += sizeof CE - 1;
+      memcpy(r + h, z, zn);
+      j->resp = r;
+      j->resp_len = h + zn;
+      loop_post(j);
+      return;
+    }
+  }
   size_t h = put_head(r, status, n, j->close);
   memcpy(r + h, body, n);
   j->resp = r;
@@ -1059,11 +1086,15 @@ static void on_accept(loop_t *l) {
   }
 }
 
+static _Atomic int loops_ready;
 static void *loop_main(void *arg) {
   loop_t *l = arg;
   // A private fd table: no contention on the shared one, and its own descriptor limit.
   if (unshare(CLONE_FILES)) perror("unshare");
+  const char *pol = getenv("LOOP_SCHED"), *nc = getenv("LOOP_NICE");
+  thread_sched(pol ? pol : "batch", nc ? atoi(nc) : 5);
   l->rd = malloc(RD_BUF);
+  atomic_fetch_add(&loops_ready, 1);
   struct epoll_event ev[512];
   for (;;) {
     int timeout = l->lsn_off ? 100 : -1;
@@ -1097,6 +1128,8 @@ static void *loop_main(void *arg) {
 }
 
 void loops_start(int n, const char *host, int port) {
+  const char *ge = getenv("GZIP_MIN_SEGS");
+  if (ge) gz_min_segs = atoi(ge);
   listen_host = strdup(host);
   listen_port = port;
   nloops = n;
@@ -1120,4 +1153,5 @@ void loops_start(int n, const char *host, int port) {
     pthread_t t;
     pthread_create(&t, NULL, loop_main, &loops[i]);
   }
+  while (atomic_load(&loops_ready) < n) usleep(100);
 }

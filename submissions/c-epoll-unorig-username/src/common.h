@@ -58,6 +58,9 @@ static inline void *arena_alloc(arena_t *a, size_t n) {
   return p;
 }
 
+// Scheduling of the calling thread. policy: "batch", "idle" or "" for the default.
+void thread_sched(const char *policy, int nice);
+
 // ---- crypto
 void sha256_init_cpu(void);
 void hmac_jwt_init(const char *secret, size_t len);
@@ -78,6 +81,10 @@ void bcrypt_gen_salt(char out[30]);  // "$2a$10$" + 22 chars
 void bcrypt_lanes(int n, const char *const pw[], const size_t pl[], const char *const setting[], char out[][BCRYPT_LEN + 1]);
 void bcrypt_selftest(void);
 bool ct_eq(const char *a, const char *b, size_t n);
+
+// ---- gzip
+void gz_init(void);
+size_t gz_encode(const uint8_t *in, size_t n, uint8_t *out, size_t limit);
 
 // ---- request jobs
 enum {

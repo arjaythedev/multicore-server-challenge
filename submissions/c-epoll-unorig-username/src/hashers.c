@@ -8,7 +8,7 @@
 static pthread_mutex_t q_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t q_cv = PTHREAD_COND_INITIALIZER;
 static job *q_head, *q_tail;
-static int lanes = 4;
+static int lanes = 5;
 
 static void push(job *j) {
   j->next = NULL;
@@ -34,6 +34,8 @@ void hash_enqueue_new(job *j) { push(j); }
 
 static void *hasher_main(void *arg) {
   (void)arg;
+  const char *pol = getenv("HASH_SCHED");
+  thread_sched(pol ? pol : "idle", 0);
   job *g[BCRYPT_MAX_LANES];
   const char *pw[BCRYPT_MAX_LANES], *set[BCRYPT_MAX_LANES];
   size_t pl[BCRYPT_MAX_LANES];

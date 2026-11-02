@@ -21,9 +21,11 @@ int main(void) {
   sha256_init_cpu();
   hmac_jwt_init(secret, strlen(secret));
   bcrypt_selftest();
+  gz_init();
+  // Loops first: they unshare their fd tables before any Postgres socket exists to be copied into them.
+  loops_start(env_int("LOOPS", 4), host ? host : "0.0.0.0", port ? atoi(port) : 3000);
   writes_start(env_int("WRITE_CONNS", 4));
   reads_start(env_int("READ_CONNS", 8));
-  hashers_start(env_int("BCRYPT_THREADS", 2));
-  loops_start(env_int("LOOPS", 4), host ? host : "0.0.0.0", port ? atoi(port) : 3000);
+  hashers_start(env_int("BCRYPT_THREADS", 3));
   for (;;) pause();
 }

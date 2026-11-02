@@ -241,6 +241,8 @@ static bool ensure(wr_t *w) {
 
 static void *write_main(void *arg) {
   wr_t *w = arg;
+  const char *pol = getenv("DRAIN_SCHED");
+  thread_sched(pol ? pol : "batch", 0);
   arena_init(&w->a, (size_t)1 << 31);
   job *g[GROUP];
   ensure(w);
