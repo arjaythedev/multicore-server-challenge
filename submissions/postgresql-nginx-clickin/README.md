@@ -72,14 +72,19 @@ Then it checks `alg = HS256`, that `exp` is a number in the future, and that `su
 
 ## Local results
 
-These ran in Docker on a 10-core Mac, with the server, Postgres 18 and the load generator sharing the same VM:
+- `test/run.sh` passes 197/197, on Ubuntu 24.04 arm64 and amd64.
+- `loadgen`, in Docker on an Apple M4:
+  - Server and Postgres 18 (box `pg-conf.sh` values, but `shared_buffers` 2 GB) share 8 pinned cores, as on the
+    box. The load generator has 2 other cores.
+  - Full seed, fresh copy per run, `-think-scale 0.25 -ramp 30s -measure 60s` (each user is 4× as busy as in
+    scoring).
 
-- `test/run.sh` passes 197/197.
-- `loadgen` on the dev seed (`-think-scale 0.2 -ramp 10s -measure 30s`):
+| Users | req/s | p50 | p95 | p99 | errors | |
+|---:|---:|---:|---:|---:|---:|---|
+| 14,000 | 14,775 | 1.8 ms | 12.1 ms | 23.3 ms | 0 | pass |
+| 18,000 | 17,427 | 82 ms | 174 ms | 223 ms | 0 | pass |
+| 21,000 | 18,065 | 213 ms | 328 ms | 397 ms | 0 | pass |
+| 24,000 | 17,662 | 415 ms | 539 ms | 613 ms | 0 | fail (p95) |
 
-| Users | req/s | p50 | p95 | p99 | errors |
-|---:|---:|---:|---:|---:|---:|
-| 2,000 | 2,643 | 0.6 ms | 2.2 ms | 3.8 ms | 0 |
-| 8,000 | 10,453 | 4.1 ms | 27.9 ms | 48.3 ms | 0 |
-
-Performance wasn't the goal: the point is to see how much of a web app plain SQL can carry.
+At the limit Postgres uses about 6 of the 8 cores and nginx about 2. Performance wasn't the goal: the point is to
+see how much of a web app plain SQL can carry.
