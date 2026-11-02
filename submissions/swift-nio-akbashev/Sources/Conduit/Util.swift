@@ -521,11 +521,12 @@ func readWrapper(_ body: ByteBuffer, _ key: String) throws -> [String: Any] {
 
 enum BodyError: Error { case invalid }
 
-/// absent or null -> nil; a string -> value; anything else (or empty when nonEmpty) is invalid.
+/// absent or null -> nil; a string -> value; anything else (or empty when nonEmpty) is invalid. So is a string with
+/// NUL in it: Postgres text can't hold one, and as a parameter it would fail the whole group or batch it went in.
 func optString(_ m: [String: Any], _ key: String, nonEmpty: Bool = false) throws -> String? {
     guard let raw = m[key] else { return nil }
     if raw is NSNull { return nil }
-    guard let s = raw as? String else { throw BodyError.invalid }
+    guard let s = raw as? String, !s.utf8.contains(0) else { throw BodyError.invalid }
     if nonEmpty, s.isEmpty { throw BodyError.invalid }
     return s
 }
@@ -544,7 +545,7 @@ func optTagList(_ m: [String: Any]) throws -> [String] {
     tags.reserveCapacity(items.count)
     for item in items {
         if item is NSNull { throw BodyError.invalid }
-        guard let s = item as? String, !s.isEmpty else { throw BodyError.invalid }
+        guard let s = item as? String, !s.isEmpty, !s.utf8.contains(0) else { throw BodyError.invalid }
         tags.append(s)
     }
     return tags
