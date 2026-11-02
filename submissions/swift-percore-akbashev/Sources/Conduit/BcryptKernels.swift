@@ -2,12 +2,14 @@
 // count and kernel family: every lane's halves in locals, all 16 rounds of every lane in order.
 import Synchronization
 
+#if arch(x86_64)
 /// The shrx kernels' shift counts, so the shifts take their count from a register. Not `private`: a private
 /// global is internal to the object file, where the optimizer sees every access and folds the loads back to
 /// constants (the kernels then compile to the constant family's, which is only slower where that's slower);
 /// a module-internal one is an external symbol, whose value it can't assume.
 let bcryptShiftBy24 = Atomic<UInt32>(24)
 let bcryptShiftBy16 = Atomic<UInt32>(16)
+#endif
 
 /// ExpandKey(state, 0, key) in every lane (P already mixed with the key), by `kernel`'s kernel written out for
 /// `n` lanes (1 to 6).
@@ -23,6 +25,7 @@ let bcryptShiftBy16 = Atomic<UInt32>(16)
         case 6: expandKeyOnly6(&states)
         default: fatalError("no bcrypt kernel for \(n) lanes")
         }
+    #if arch(x86_64)
     case .shrx:
         switch n {
         case 1: expandKeyOnlyShrx1(&states)
@@ -33,6 +36,7 @@ let bcryptShiftBy16 = Atomic<UInt32>(16)
         case 6: expandKeyOnlyShrx6(&states)
         default: fatalError("no bcrypt kernel for \(n) lanes")
         }
+    #endif
     }
 }
 
@@ -906,6 +910,8 @@ let bcryptShiftBy16 = Atomic<UInt32>(16)
         states[5].s[2 * i] = l5; states[5].s[2 * i + 1] = r5
     }
 }
+
+#if arch(x86_64)
 
 /// F of lane `k`, its S-boxes read in place.
 @inline(__always) private func feistelShrx<let m: Int>(_ states: borrowing InlineArray<m, BlowfishState>, _ k: Int,
@@ -1783,3 +1789,5 @@ let bcryptShiftBy16 = Atomic<UInt32>(16)
         states[5].s[2 * i] = l5; states[5].s[2 * i + 1] = r5
     }
 }
+
+#endif

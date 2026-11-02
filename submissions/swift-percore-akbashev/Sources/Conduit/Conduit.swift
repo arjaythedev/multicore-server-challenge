@@ -96,7 +96,7 @@ struct Conduit {
         logger.info("""
             conduit (swift): \(readLanes) read lanes × \(readConnections) connections, \(writeLanes) write lanes, \
             bcrypt threads \(bcryptThreads) (queue \(bcryptQueue), \(bcrypt.lanes) in lockstep, \(bcrypt.kernel) kernel; cost 6 per \
-            hash at widths 1-6: constant \(micros(calibration.constant)), shrx \(micros(calibration.shrx))), \
+            hash at widths 1-6: \(calibration.perHash.map { "\($0.kernel) \(micros($0.times))" }.joined(separator: "; "))), \
             \(Loop.all.count) loops
             """)
         try await Services.run([bcrypt, reads, writes, server], stoppingOn: [SIGTERM, SIGINT])

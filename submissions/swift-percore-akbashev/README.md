@@ -140,9 +140,10 @@ All dependencies are pinned exactly in `Package.swift` (plus `Package.resolved`)
   by 24 and 16 take their count from a register (an atomic's value, which the optimizer can't fold), so with BMI2
   they are three-operand `shrx`, with no copy before each shift: the Rust's kernel for Intel. In the compiler's
   x86-64 output on Intel's cost models that is 11.4-13.3 instructions a half-round at 1 to 5 lanes, against 13.5-15.4
-  with constant shifts and 11-12 for #154's assembly; a tie on AMD's; worse without BMI2. At startup it times both
-  families at widths 1 to 6 at cost 6 and keeps the fastest per hash (`BCRYPT_KERNEL` overrides the family);
-  every hash still runs all 2^10 rounds. Hashes and verifications wait in
+  with constant shifts and 11-12 for #154's assembly; a tie on AMD's; worse without BMI2. The shrx family is
+  compiled on x86-64 only: arm64's `ubfx` extracts a constant field in one instruction, so there it would only add
+  one. At startup it times the families at widths 1 to 6 at cost 6 and keeps the fastest per hash
+  (`BCRYPT_KERNEL` overrides the family); every hash still runs all 2^10 rounds. Hashes and verifications wait in
   one queue; workers (`BCRYPT_THREADS`, half the cores) are child tasks that prefer a `TaskExecutor` over threads of
   their own, so no hash runs on a loop. One worker takes what is waiting once a set is full or the oldest has waited
   `BCRYPT_WINDOW_MS`; the others only take full sets. Its output is byte for byte OpenBSD's and it verifies the seed's `$2a$` hashes; it writes `$2b$`. At most
@@ -201,7 +202,7 @@ DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit_dev JWT_SECRET=co
 
 Environment: `DATABASE_URL`, `JWT_SECRET` (required); `HOST` (127.0.0.1), `PORT` (3000),
 `DB_POOL_SIZE` (`start.sh`: min(3 × cores, 95)), `BCRYPT_THREADS` (half the cores), `BCRYPT_QUEUE` (40 ×
-`BCRYPT_THREADS`), `BCRYPT_LANES` and `BCRYPT_KERNEL` (`constant` or `shrx`; both measured at startup),
+`BCRYPT_THREADS`), `BCRYPT_LANES` and `BCRYPT_KERNEL` (`constant`, or `shrx` on x86-64; both measured at startup),
 `BCRYPT_WINDOW_MS` (200), `WRITE_LANES` (4),
 `WRITE_GROUP_MAX` (256), `READ_LANES` (cores), `READ_CONNECTIONS` (per read lane: what `DB_POOL_SIZE` leaves after
 the write lanes, split between the read lanes, at least 1), `READ_WINDOW_MS` (30), `READ_BATCH_MAX` (1024), `READ_TASKS` (`0`: a read's result goes to its connection as a callback; on), `SCHED_BATCH`

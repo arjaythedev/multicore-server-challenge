@@ -47,21 +47,37 @@ typealias BcryptDigest = InlineArray<23, UInt8>
 /// Which family of the key-only expansion kernels runs (BcryptKernels.swift), as rust-epoll-theCatWisel's
 /// BcryptKernel; BcryptWorkers.calibrate picks the faster on this CPU.
 enum BcryptKernel: Sendable, CustomStringConvertible {
-    /// Bytes extracted with constant shifts: the compiler picks the instructions (BMI1's bextr on AMD).
+    /// Bytes extracted with constant shifts: the compiler picks the instructions (BMI1's bextr on AMD, ubfx on arm64).
     case constant
+    #if arch(x86_64)
     /// The shifts by 24 and 16 take their count from a register: BMI2's shrx, which keeps its input, so no copy
-    /// before each shift (the Rust's shrx kernel, for Intel). Slower without BMI2.
+    /// before each shift (the Rust's shrx kernel, for Intel). Slower without BMI2; x86-64 only, since elsewhere there
+    /// is no copy to save (arm64's ubfx extracts a constant field in one instruction).
     case shrx
+    #endif
 
-    init?(name: String) {
-        switch name {
-        case "constant": self = .constant
-        case "shrx": self = .shrx
-        default: return nil
-        }
+    /// Every family this architecture has.
+    static var all: [BcryptKernel] {
+        #if arch(x86_64)
+        [.constant, .shrx]
+        #else
+        [.constant]
+        #endif
     }
 
-    var description: String { self == .constant ? "constant" : "shrx" }
+    init?(name: String) {
+        guard let kernel = Self.all.first(where: { $0.description == name }) else { return nil }
+        self = kernel
+    }
+
+    var description: String {
+        switch self {
+        case .constant: "constant"
+        #if arch(x86_64)
+        case .shrx: "shrx"
+        #endif
+        }
+    }
 }
 
 /// Runs `lanes` hashes of the same cost in lockstep with `kernel`'s kernels and returns their digests (the 23 bytes a
@@ -431,25 +447,23 @@ final class BcryptWorkers: Service {
     }
 
     /// How many hashes to run in lockstep on this CPU, and with which kernel family: more lanes hide more load latency
-    /// until their S-boxes (4 KB each) stop fitting the core's L1 alongside each other, and the shrx kernels win where
-    /// shrx is cheap (Intel), both of which differ between CPUs. Times both families at widths 1 to 6 at cost 6 and keeps
-    /// the fastest per hash, or a narrower one, or the constant family at the same width, within 3% of it: a narrower
-    /// set fills sooner. Returns the per-hash times by width, constant and shrx.
-    static func calibrate() -> (lanes: Int, kernel: BcryptKernel, constant: [Duration], shrx: [Duration]) {
-        func times(_ kernel: BcryptKernel) -> [Duration] {
-            [time(InlineArray<1, BcryptKey>.self, kernel), time(InlineArray<2, BcryptKey>.self, kernel),
-             time(InlineArray<3, BcryptKey>.self, kernel), time(InlineArray<4, BcryptKey>.self, kernel),
-             time(InlineArray<5, BcryptKey>.self, kernel), time(InlineArray<6, BcryptKey>.self, kernel)]
+    /// until their S-boxes (4 KB each) stop fitting the core's L1 alongside each other, and on x86-64 the shrx kernels
+    /// win where shrx is cheap (Intel), both of which differ between CPUs. Times every family at widths 1 to 6 at cost 6
+    /// and keeps the fastest per hash, or a narrower one, or the constant family at the same width, within 3% of it: a
+    /// narrower set fills sooner. Returns each family's per-hash times by width.
+    static func calibrate() -> (lanes: Int, kernel: BcryptKernel, perHash: [(kernel: BcryptKernel, times: [Duration])]) {
+        let perHash = BcryptKernel.all.map { kernel in
+            (kernel: kernel, times: [time(InlineArray<1, BcryptKey>.self, kernel), time(InlineArray<2, BcryptKey>.self, kernel),
+                                     time(InlineArray<3, BcryptKey>.self, kernel), time(InlineArray<4, BcryptKey>.self, kernel),
+                                     time(InlineArray<5, BcryptKey>.self, kernel), time(InlineArray<6, BcryptKey>.self, kernel)])
         }
-        let constant = times(.constant)
-        let shrx = times(.shrx)
-        var best = (lanes: 1, kernel: BcryptKernel.constant, time: constant[0])
-        for i in 0..<constant.count {
-            for (kernel, time) in [(BcryptKernel.constant, constant[i]), (.shrx, shrx[i])] where time < best.time * 0.97 {
-                best = (i + 1, kernel, time)
+        var best = (lanes: 1, kernel: BcryptKernel.constant, time: perHash[0].times[0])
+        for width in 0..<6 {
+            for family in perHash where family.times[width] < best.time * 0.97 {
+                best = (width + 1, family.kernel, family.times[width])
             }
         }
-        return (best.lanes, best.kernel, constant, shrx)
+        return (best.lanes, best.kernel, perHash)
     }
 
     private static func time<let n: Int>(_: InlineArray<n, BcryptKey>.Type, _ kernel: BcryptKernel) -> Duration {
