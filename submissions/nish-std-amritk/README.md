@@ -344,10 +344,12 @@ fresh copy of the seed each time; CPU from `/proc` over a minute of the hold:
 |---|--:|---|--:|--:|--:|---|--:|
 | `91dd6fd`, two holds | 175,000 | PASS, PASS | 44,333–44,450 | 298–305 ms | 422–431 ms | 78.9–79.2 + 72.0–77.5 | 84–87% |
 | `a24c18d`, two holds | 175,000 | PASS, PASS | 43,943–43,971 | 340–383 ms | 462–632 ms | 73.6–74.0 + 71.8–73.0 | 81% |
-| `a24c18d`, past the VM's limit | 185,000 | FAIL | 42,554 | 1,881 ms | 5,489 ms | 72.4 + 88.4 | 86% |
-| this one, past the VM's limit | 185,000 | FAIL | 45,194 | 886 ms | 2,431 ms | 74.9 + 73.4 | 84% |
+| `a24c18d`, two holds past the VM's limit | 185,000 | FAIL, FAIL | 42,554–45,117 | 859–1,881 ms | 2,439–5,489 ms | 72.4–74.0 + 72.6–88.4 | 83–86% |
+| this one, two holds past the VM's limit | 185,000 | FAIL, FAIL | 44,126–45,194 | 886–1,652 ms | 2,431–4,395 ms | 74.9–76.8 + 73.4–77.4 | 84–86% |
 
-The window's extra wait shows as p95 while the box has room. At 195,000 users
+The window's extra wait shows as p95 while the box has room. At 185,000 the
+two builds' holds overlap: past the VM's limit its load box runs out of local
+ports and holds vary by 2x, so the saturated runs above are what rank them. At 195,000 users
 both builds fail on that VM: its one network-interrupt CPU is 93–99% in
 softirq, and once clients time out the kernel runs out of orphan sockets, so
 overload there says little about either build.
