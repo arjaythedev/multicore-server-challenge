@@ -428,21 +428,37 @@ struct KeyMaterial: BitwiseCopyable {
 /// Which family of the generated key-only expansion kernels runs (BcryptKernels.swift), as the Rust's BcryptKernel;
 /// calibration picks the faster on this CPU.
 enum BcryptKernel: Sendable, CustomStringConvertible {
-    /// Bytes extracted with constant shifts: the compiler picks the instructions (BMI1's bextr on AMD).
+    /// Bytes extracted with constant shifts: the compiler picks the instructions (BMI1's bextr on AMD, ubfx on arm64).
     case constant
+    #if arch(x86_64)
     /// The shifts by 24 and 16 take their count from a register: BMI2's shrx, which keeps its input, so no copy
-    /// before each shift (the Rust's shrx kernel, for Intel). Slower without BMI2.
+    /// before each shift (the Rust's shrx kernel, for Intel). Slower without BMI2; x86-64 only, since elsewhere there
+    /// is no copy to save (arm64's ubfx extracts a constant field in one instruction).
     case shrx
+    #endif
 
-    init?(name: String) {
-        switch name {
-        case "constant": self = .constant
-        case "shrx": self = .shrx
-        default: return nil
-        }
+    /// Every family this architecture has.
+    static var all: [BcryptKernel] {
+        #if arch(x86_64)
+        [.constant, .shrx]
+        #else
+        [.constant]
+        #endif
     }
 
-    var description: String { self == .constant ? "constant" : "shrx" }
+    init?(name: String) {
+        guard let kernel = Self.all.first(where: { $0.description == name }) else { return nil }
+        self = kernel
+    }
+
+    var description: String {
+        switch self {
+        case .constant: "constant"
+        #if arch(x86_64)
+        case .shrx: "shrx"
+        #endif
+        }
+    }
 }
 
 /// `n` bcrypt digests at one cost, in lockstep (`bcrypt_lanes<N>`). Every lane runs all 2^cost rounds.
@@ -515,15 +531,15 @@ private func probe<let n: Int>(_: InlineArray<n, KeyMaterial>.Type, _ kernel: Bc
     return (n, kernel, us10, us10 / n)
 }
 
-/// Picks the kernel and the lockstep width (`calibrate_bcrypt_hardware`): times both kernel families at 2, 3, 4 and
-/// 6 lanes and keeps the fastest per hash whose states fit the L1. Returns (lanes, kernel, the estimated
-/// microseconds of one cost-10 batch, L1D KB).
+/// Picks the kernel and the lockstep width (`calibrate_bcrypt_hardware`): times every kernel family this architecture
+/// has at 2, 3, 4 and 6 lanes and keeps the fastest per hash whose states fit the L1. Returns (lanes, kernel, the
+/// estimated microseconds of one cost-10 batch, L1D KB).
 func calibrateBcryptHardware() -> (lanes: Int, kernel: BcryptKernel, bcryptUs: Int, l1dKB: Int) {
     let l1d = detectL1DKB()
     let warm = InlineArray<1, KeyMaterial>(repeating: KeyMaterial(password: Array("calibrate-warmup".utf8), salt: BcryptSalt(repeating: 0x5A)))
-    for kernel in [BcryptKernel.constant, .shrx] { withExtendedLifetime(bcryptLanes(warm, cost: 5, kernel: kernel)) {} }
+    for kernel in BcryptKernel.all { withExtendedLifetime(bcryptLanes(warm, cost: 5, kernel: kernel)) {} }
     var candidates: [Probe] = []
-    for kernel in [BcryptKernel.constant, .shrx] {
+    for kernel in BcryptKernel.all {
         candidates += [probe(InlineArray<2, KeyMaterial>.self, kernel), probe(InlineArray<3, KeyMaterial>.self, kernel),
                        probe(InlineArray<4, KeyMaterial>.self, kernel), probe(InlineArray<6, KeyMaterial>.self, kernel)]
     }

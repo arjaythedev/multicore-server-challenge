@@ -63,8 +63,9 @@ batch, never per request:
   half-round by half-round, so the compiler only has registers left to choose. Two families, as the Rust has
   several: constant shifts (the compiler's choice of instructions, BMI1's `bextr` on AMD), and `shrx`, whose shifts
   by 24 and 16 take their count from a register (an atomic's value, which the optimizer can't fold), BMI2's
-  three-operand `shrx`, so no copy before each shift: the Rust's kernel for Intel. Calibration times both at every
-  width and keeps the fastest. `build.sh` compiles for the box's CPU, as the Rust's `target-cpu=native`.
+  three-operand `shrx`, so no copy before each shift: the Rust's kernel for Intel. The shrx family is compiled on
+  x86-64 only (arm64's `ubfx` extracts a constant field in one instruction, so there it would only add one).
+  Calibration times the families at every width and keeps the fastest. `build.sh` compiles for the box's CPU, as the Rust's `target-cpu=native`.
 
 ## Swift 6.4 features, and where
 
@@ -102,7 +103,7 @@ batch, never per request:
 ## Settings
 
 As the Rust reads them: `IO_THREADS` (cores / 2), `READ_LANES` (cores), `WRITE_LANES` (1), `BCRYPT_THREADS`
-(cores / 2, at least 3), `BCRYPT_LANES` (calibrated), and `BCRYPT_KERNEL` (`constant` or `shrx`; calibrated). Cores are the process's affinity mask, as Rust's `available_parallelism`.
+(cores / 2, at least 3), `BCRYPT_LANES` (calibrated), and `BCRYPT_KERNEL` (`constant`, or `shrx` on x86-64; calibrated). Cores are the process's affinity mask, as Rust's `available_parallelism`.
 Postgres connections: `READ_LANES + WRITE_LANES`.
 
 ## Correctness

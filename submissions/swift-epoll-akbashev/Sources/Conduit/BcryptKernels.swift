@@ -2,12 +2,14 @@
 // build.rs bc_expand0, in Swift): one per lane count and family, every lane's 16 rounds written out.
 import Synchronization
 
+#if arch(x86_64)
 /// The shrx kernels' shift counts, so the shifts take their count from a register. Not `private`: a private
 /// global is internal to the object file, where the optimizer sees every access and folds the loads back to
 /// constants (the kernels then compile to the constant family's, which is only slower where that's slower);
 /// a module-internal one is an external symbol, whose value it can't assume.
 let bfShiftBy24 = Atomic<UInt32>(24)
 let bfShiftBy16 = Atomic<UInt32>(16)
+#endif
 
 /// The key-only expansion of every lane, by `kernel`'s kernel written out for `n` lanes (1 to 6).
 @inline(__always) func bfExpand0<let n: Int>(_ st: inout InlineArray<n, BfState>, _ kernel: BcryptKernel) {
@@ -22,6 +24,7 @@ let bfShiftBy16 = Atomic<UInt32>(16)
         case 6: bfExpand0Lanes6(&st)
         default: fatalError("no bcrypt kernel for \(n) lanes")
         }
+    #if arch(x86_64)
     case .shrx:
         switch n {
         case 1: bfExpand0ShrxLanes1(&st)
@@ -32,6 +35,7 @@ let bfShiftBy16 = Atomic<UInt32>(16)
         case 6: bfExpand0ShrxLanes6(&st)
         default: fatalError("no bcrypt kernel for \(n) lanes")
         }
+    #endif
     }
 }
 
@@ -910,6 +914,8 @@ let bfShiftBy16 = Atomic<UInt32>(16)
         st[5].s[2 * i] = l5; st[5].s[2 * i + 1] = r5
     }
 }
+
+#if arch(x86_64)
 
 /// F of lane `k`, its S-boxes read in place.
 @inline(__always) private func bfFShrx<let m: Int>(_ st: borrowing InlineArray<m, BfState>, _ k: Int, _ x: UInt32, _ by24: UInt32, _ by16: UInt32) -> UInt32 {
@@ -1792,3 +1798,5 @@ let bfShiftBy16 = Atomic<UInt32>(16)
         st[5].s[2 * i] = l5; st[5].s[2 * i + 1] = r5
     }
 }
+
+#endif
