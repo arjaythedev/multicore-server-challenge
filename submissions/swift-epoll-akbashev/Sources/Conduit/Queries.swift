@@ -2,9 +2,9 @@
 // capped counts expanded), so the SQL is the Rust's text exactly.
 
 struct PreparedDef: Sendable {
-    var name: String
-    var sql: String
-    var oids: [UInt32]
+    let name: String
+    let sql: String
+    let oids: [UInt32]
 }
 
 func readCatalog() -> [PreparedDef] {

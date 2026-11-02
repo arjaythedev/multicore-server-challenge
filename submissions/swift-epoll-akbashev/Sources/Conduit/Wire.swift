@@ -11,8 +11,8 @@ let OID_INT8_ARR: UInt32 = 1016
 let OID_TEXT_ARR: UInt32 = 1009
 
 struct SqlStateErr: Error, CustomStringConvertible, Sendable {
-    var code: String
-    var message: String
+    let code: String
+    let message: String
     var description: String { "\(code): \(message)" }
 }
 
@@ -31,11 +31,11 @@ enum PgError: Error, CustomStringConvertible {
 }
 
 struct DbEndpoint: Sendable {
-    var host: String
-    var port: UInt16
-    var user: String
-    var password: String
-    var database: String
+    let host: String
+    let port: UInt16
+    let user: String
+    let password: String
+    let database: String
 
     private static func decodeURLPart(_ s: Substring) -> String {
         let raw = Array(s.utf8)
@@ -203,21 +203,21 @@ struct TxBuf: ~Copyable {
 }
 
 struct Cell: Sendable {
-    var offset: UInt32
-    var len: Int32
+    let offset: UInt32
+    let len: Int32
     static let null = Cell(offset: 0, len: -1)
     @inline(__always) var isNull: Bool { len < 0 }
 }
 
 struct RowSpan: Sendable {
-    var start: UInt32
-    var count: UInt16
+    let start: UInt32
+    let count: UInt16
 }
 
 struct ExecOutcome {
-    var rowStart: UInt32
-    var rowCount: UInt32
-    var error: SqlStateErr?
+    let rowStart: UInt32
+    let rowCount: UInt32
+    let error: SqlStateErr?
 }
 
 /// Every DataRow of one pipelined round trip: the cells' bytes in one arena, cells and rows as offsets into it.

@@ -8,14 +8,14 @@
 // and responses that come out identical are built once and shared.
 
 struct PairKey: Hashable {
-    var a: Int64
-    var b: Int64
+    let a: Int64
+    let b: Int64
 }
 
 struct PageKey: Hashable {
-    var c: UInt32
-    var lim: Int64
-    var off: Int64
+    let c: UInt32
+    let lim: Int64
+    let off: Int64
 }
 
 /// Distinct keys in first-seen order, each with its ordinal (`KeySet`).
@@ -124,10 +124,10 @@ private enum MetaSource {
 }
 
 private struct ArticleRef {
-    var aid: Int64
-    var author: Int64
-    var artOrd: UInt32
-    var row: RowSpan
+    let aid: Int64
+    let author: Int64
+    let artOrd: UInt32
+    let row: RowSpan
 }
 
 private struct CachedArticleSlices {
@@ -139,14 +139,14 @@ private struct CachedArticleSlices {
 }
 
 private struct CachedCommentSlice {
-    var authorID: Int64
-    var start: UInt32
-    var end: UInt32
+    let authorID: Int64
+    let start: UInt32
+    let end: UInt32
 }
 
 struct Pair: Comparable {
-    var v: Int64
-    var t: Int64
+    let v: Int64
+    let t: Int64
     static func < (a: Pair, b: Pair) -> Bool { a.v != b.v ? a.v < b.v : a.t < b.t }
 }
 

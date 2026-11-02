@@ -176,7 +176,6 @@ actor Reactor {
 
     /// A batch of replies from a lane (flush_outbox).
     func deliver(_ replies: [OutgoingReply]) {
-        pipelinedSlots.removeAll(keepingCapacity: true)
         for rep in replies {
             let s = Int(rep.addr.slot)
             guard s < slots.count, slots[s].fd >= 0, slots[s].epoch == rep.addr.epoch, slots[s].inFlight else { continue }

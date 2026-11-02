@@ -429,7 +429,7 @@ enum JsonVal: Sendable {
 
 struct JsonMap: Sendable {
     struct Entry: Sendable {
-        var key: [UInt8]
+        let key: [UInt8]
         var value: JsonVal
     }
 

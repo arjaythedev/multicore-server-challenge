@@ -9,7 +9,7 @@ an actor, isolated by the compiler, and the whole server is one structured task 
 
 | Piece | Version |
 |---|---|
-| Swift | 6.4.1 (official Ubuntu 24.04 x86_64 tarball, sha256-checked), Swift 6 language mode, nonisolated by default |
+| Swift | 6.4.2 (official Ubuntu 24.04 x86_64 tarball, sha256-checked), Swift 6 language mode, nonisolated by default |
 | Dependencies | none: the standard library, Synchronization, Glibc (as the Rust uses only `std`) |
 | HTTP | hand-rolled HTTP/1.1 on epoll, one `SO_REUSEPORT` listener per reactor |
 | Postgres | hand-rolled protocol 3.0 client: SCRAM-SHA-256, extended protocol, binary rows, pipelines |

@@ -44,19 +44,19 @@ private struct TaskQueue<T> {
 
 /// The parameters one gathering lane computed when it became the gatherer (under the Rust's batch lock).
 private struct Gather {
-    var want: Int
-    var maxAge: UInt64
-    var maxCap: Int
+    let want: Int
+    let maxAge: UInt64
+    let maxCap: Int
 }
 
 struct ReadBatchDone: Sendable {
-    var count: Int
-    var elapsedUs: Int
+    let count: Int
+    let elapsedUs: Int
 }
 
 struct CryptoBatchDone: Sendable {
     /// Microseconds of the cost-10 part, if there was one (EWMA_BCRYPT_US).
-    var standardUs: Int?
+    let standardUs: Int?
 }
 
 actor Scheduler {

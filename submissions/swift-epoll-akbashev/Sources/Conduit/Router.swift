@@ -5,17 +5,17 @@
 /// Where a reply goes: the reactor, the connection slot, and that slot's epoch, so a reply for a connection that
 /// closed in the meantime (and whose slot was reused) is dropped.
 struct ReplyAddr: Hashable, Sendable {
-    var worker: UInt16
-    var slot: UInt32
-    var epoch: UInt32
+    let worker: UInt16
+    let slot: UInt32
+    let epoch: UInt32
 }
 
 struct OutgoingReply: Sendable {
-    var addr: ReplyAddr
-    var status: UInt16
+    let addr: ReplyAddr
+    let status: UInt16
     /// The body: built once and shared by every reply in a batch that has the same one (an array is reference
     /// counted, so this is the Rust's `Arc<[u8]>` as well as its `Vec<u8>`).
-    var body: [UInt8]
+    let body: [UInt8]
 }
 
 enum ReadOp: Sendable {
@@ -36,9 +36,9 @@ enum ReadOp: Sendable {
 }
 
 struct ReadTask: Sendable {
-    var op: ReadOp
-    var viewer: Int64
-    var addr: ReplyAddr
+    let op: ReadOp
+    let viewer: Int64
+    let addr: ReplyAddr
 }
 
 enum WriteOp: Sendable {
@@ -55,16 +55,16 @@ enum WriteOp: Sendable {
 
 struct WriteTask: Sendable {
     var op: WriteOp
-    var viewer: Int64
-    var addr: ReplyAddr
+    let viewer: Int64
+    let addr: ReplyAddr
 }
 
 struct UserRecord: Sendable {
-    var id: Int64
-    var username: [UInt8]
-    var email: [UInt8]
-    var bio: [UInt8]?
-    var image: [UInt8]?
+    let id: Int64
+    let username: [UInt8]
+    let email: [UInt8]
+    let bio: [UInt8]?
+    let image: [UInt8]?
 }
 
 enum CryptoTask: Sendable {

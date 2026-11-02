@@ -615,9 +615,9 @@ private func decodeBcrypt64<let count: Int>(_ src: Span<UInt8>) -> InlineArray<c
 }
 
 struct ParsedBcrypt {
-    var cost: Int
-    var salt: BcryptSalt
-    var digest: BcryptDigest
+    let cost: Int
+    let salt: BcryptSalt
+    let digest: BcryptDigest
 }
 
 func parseBcrypt(_ encoded: Span<UInt8>) -> ParsedBcrypt? {

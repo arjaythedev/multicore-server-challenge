@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Runs once as root on a clean Ubuntu 24.04: Swift 6.4.1 (official tarball, sha256-checked) -> /opt/swift, and
+# Runs once as root on a clean Ubuntu 24.04: Swift 6.4.2 (official tarball, sha256-checked) -> /opt/swift, and
 # jemalloc (start.sh preloads it in place of glibc malloc).
 set -euo pipefail
-SWIFT_VERSION=6.4.1
-SHA256=7d246c7114077ad01dba4ad897628446ada4c489d6c7dbcf39ae3f25cbe17e8b
+SWIFT_VERSION=6.4.2
+SHA256=2e9ebec040ad459dd89a6d093a02d8314939135104850fae4d5c0f174fb3ba8c
 
 apt-get update -q
 apt-get install -y -q \

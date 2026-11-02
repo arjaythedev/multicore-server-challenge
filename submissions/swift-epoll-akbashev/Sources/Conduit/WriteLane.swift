@@ -14,8 +14,8 @@ private enum WriteLoc {
 }
 
 private struct WriteFailure: Error {
-    var error: PgError
-    var addrs: [ReplyAddr]
+    let error: PgError
+    let addrs: [ReplyAddr]
 }
 
 private func stmtCount(_ task: WriteTask) -> Int {

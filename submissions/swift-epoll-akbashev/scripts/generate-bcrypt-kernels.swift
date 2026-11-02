@@ -13,13 +13,13 @@
 let maxLanes = 6
 
 struct Family {
-    var name: String         // the BcryptKernel case
-    var x86Only: Bool        // compiled on x86-64 only
-    var suffix: String       // the kernels' name suffix
-    var extraParams: String  // F's and the encipher's extra parameters
-    var extraArgs: String    // passing them on
-    var feistel: [String]    // F's body
-    var prologue: [String]   // the expansion's first lines (loading the counts)
+    let name: String         // the BcryptKernel case
+    let x86Only: Bool        // compiled on x86-64 only
+    let suffix: String       // the kernels' name suffix
+    let extraParams: String  // F's and the encipher's extra parameters
+    let extraArgs: String    // passing them on
+    let feistel: [String]    // F's body
+    let prologue: [String]   // the expansion's first lines (loading the counts)
 }
 
 let families = [
