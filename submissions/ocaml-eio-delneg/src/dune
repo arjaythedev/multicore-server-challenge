@@ -1,0 +1,6 @@
+(executable
+ (name main)
+ (libraries eio_main eio.unix cstruct digestif.c eqaf yojson unix threads.posix)
+ (foreign_stubs (language c) (names bcrypt_stubs) (flags (:standard -O2)))
+ (foreign_stubs (language c) (names bcrypt_lanes) (flags (:standard -O3 -funroll-loops)))
+ (link_flags (-cclib -lcrypt)))
