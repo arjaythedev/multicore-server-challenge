@@ -6,6 +6,22 @@ cd "$(dirname "$0")"
 : "${DATABASE_URL:?}" "${JWT_SECRET:?}" "${HOST:=0.0.0.0}" "${PORT:=80}"
 WORKERS=$(nproc)
 THREADS=$(( 95 / WORKERS )); [ "$THREADS" -gt 16 ] && THREADS=16
+
+# HMAC-SHA256's two padded keys (RFC 2104) depend only on JWT_SECRET, so they are worked out once here and handed
+# to the SQL as hex (sql/_hmac_keys.sql). The HMAC itself is still computed in SQL for every token.
+if [ "$(printf %s "$JWT_SECRET" | wc -c)" -gt 64 ]; then
+  KEY=$(printf %s "$JWT_SECRET" | sha256sum | cut -c1-64)
+else
+  KEY=$(printf %s "$JWT_SECRET" | od -An -v -tx1 | tr -d ' \n')
+fi
+while [ ${#KEY} -lt 128 ]; do KEY="${KEY}00"; done
+JWT_HMAC_IPAD="" JWT_HMAC_OPAD=""
+for (( i = 0; i < 128; i += 2 )); do
+  JWT_HMAC_IPAD+=$(printf %02x $(( 0x${KEY:i:2} ^ 0x36 )))
+  JWT_HMAC_OPAD+=$(printf %02x $(( 0x${KEY:i:2} ^ 0x5c )))
+done
+export JWT_HMAC_IPAD JWT_HMAC_OPAD
+
 mkdir -p run
 {
   [ "$(id -u)" = 0 ] && echo "user root;"     # started as root, nginx would drop its workers to "nobody"

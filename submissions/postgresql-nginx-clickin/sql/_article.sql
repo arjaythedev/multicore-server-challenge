@@ -1,7 +1,7 @@
 jsonb_build_object(
   'slug', a.slug, 'title', a.title, 'description', a.description, 'body', a.body,
-  'tagList', ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id
-                    WHERE at.article_id = a.id ORDER BY t.name),
+  'tagList', ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) AS name
+                     FROM article_tags at WHERE at.article_id = a.id ORDER BY 1),
   'createdAt', to_char(a.created_at AT TIME ZONE 'UTC', {{_ts}}),
   'updatedAt', to_char(a.updated_at AT TIME ZONE 'UTC', {{_ts}}),
   'favorited', EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = :viewer::bigint),

@@ -48,7 +48,8 @@ that isn't JSON). `{{name}}` in a file pastes in `sql/name.sql`. The shared arti
 ### JWT in SQL
 
 [`sql/auth.sql`](sql/auth.sql) checks HS256 with the core `sha256()` function: HMAC is
-`sha256(opad || sha256(ipad || msg))`, and the pads are the secret XORed byte by byte in a subquery. The
+`sha256(opad || sha256(ipad || msg))`. The two pads depend only on `JWT_SECRET`, so `start.sh` works them out
+once and passes them in as hex. The HMAC itself runs in SQL for every token. The
 signature is compared on the raw token text first. Only a token that passes gets its header and payload
 base64-decoded and parsed. A malformed token therefore never reaches a cast that could raise an error, and the
 session's `plan_cache_mode = force_generic_plan` keeps those `CASE` guards from being folded away at plan time.
