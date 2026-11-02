@@ -22,6 +22,21 @@ No additional services or database objects are required.
 
 ## Implementation
 
+I found that bcrypt was still taking a significant share of the application's
+CPU, so I implemented compatible kernels around the same Blowfish algorithm.
+The batch kernels are generated Go, making each independent hash explicit so
+their work can be interleaved. The single-hash path uses a small amd64 assembly
+routine for key expansion, with the cost loop kept in Go. New hashes still get
+fresh salts, cost stays at 10, and every login checks the stored hash. The
+x/crypto handles compatibility cases; the portable single-hash fallback uses
+its Blowfish implementation.
+
+For JWTs, I build and verify tokens directly with standard-library HMAC and
+SHA-256. Tokens with the fixed HS256 header can skip header JSON decoding;
+other headers retain JSON parsing and algorithm validation. I reuse HMAC
+scratch state, resetting it between uses. Every authenticated request still
+checks the signature and expiration.
+
 I found that separate requests were often doing the same database lookups.
 The read queue groups current requests into bounded batches, selects the page
 IDs, then reads each distinct article once for that batch. Viewer-specific
@@ -38,24 +53,28 @@ Tag names are read afresh for each enrichment batch, with PostgreSQL supplying
 their sort order. The schema and durability settings stay unchanged; the only
 PostgreSQL settings applied are session-level generic plans and disabled JIT.
 
+I also added custom pgx array scanners for tags. They decode IDs into reusable
+batch-owned storage, then translate them to ranks from a freshly read tag
+dictionary. This avoids a separate intermediate array for each article while
+keeping the tag order supplied by PostgreSQL's collation.
+
 I also found that every request in a batch didn't need to wait for all the
 batch's reads. Tags, profiles and comments can finish once their own results
 are fully decoded, while article requests continue through enrichment.
 Once a result is handed back to its request, the worker leaves it alone.
 
-For HTTP and JSON, I kept custom paths for the API's fixed request and response
-shapes, with standard parsing and encoding fallbacks for other cases. Recognized
-GETs can go straight to the read queue. Responses append JSON into pooled
-buffers, and an SSE2 scanner finds strings that need escaping. On the common
-response path, space for the headers is reserved before the JSON body so both
-can be sent together without copying the body into another buffer.
+I use a custom HTTP/1.1 connection loop, keeping the standard request parser
+and router for general requests. Complete, recognized GETs can go straight to
+the read queue without building the usual header map and router parameters.
 
-Bcrypt was another recurring cost. I kept a fixed set of workers and
-interleaved independent calculations inside each worker so separate jobs can
-overlap their dependent work. Each hash still uses its own salt and the full
-cost-10 calculation, and every login checks the stored hash. For JWTs, I reuse
-HMAC scratch state; every authenticated request still checks its signature and
-expiration.
+JSON responses use a handwritten encoder for the API's fixed shapes, with
+standard encoding fallbacks for other values. It appends into pooled buffers,
+and a handwritten SSE2 scanner locates bytes that need JSON escaping or the
+Unicode fallback. On input, a standard token decoder reads the request fields,
+while their raw values reference the owned request body until a handler needs
+to decode them. On the common response path, space for the headers is reserved
+before the JSON body so both can be sent together without copying the body
+into another buffer.
 
 One observation along the way was that fewer allocations didn't always make
 a change worth keeping. I tried packing a row's strings into one allocation,
