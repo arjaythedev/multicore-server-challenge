@@ -1,0 +1,27 @@
+[package]
+name = "conduit"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Optimized for maximum multicore throughput on 8-core systems:
+# Uses zero-overhead std architecture with native C & ASM bindings,
+# optional SQLite3 AOT C FFI, and hardware-accelerated crypto.
+[dependencies]
+
+[build-dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+[profile.test]
+opt-level = 3
