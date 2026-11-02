@@ -1,0 +1,7 @@
+ngx_addon_name=ngx_http_sql_module
+ngx_module_type=HTTP
+ngx_module_name=ngx_http_sql_module
+ngx_module_srcs="$ngx_addon_dir/ngx_http_sql_module.c"
+ngx_module_incs="$(pg_config --includedir 2>/dev/null || echo /usr/include/postgresql)"
+ngx_module_libs="-lpq -lcrypt"
+. auto/module
