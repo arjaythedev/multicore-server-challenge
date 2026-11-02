@@ -2,13 +2,17 @@
 // `read`, as the Rust's does). SCRAM-SHA-256 or cleartext password authentication, the extended protocol with binary
 // parameters and results, and pipelines: many Bind/Execute pairs before one Sync, read back into one reusable arena.
 import Glibc
+import Syscalls
 
-let OID_INT8: UInt32 = 20
-let OID_INT4: UInt32 = 23
-let OID_TEXT: UInt32 = 25
-let OID_INT4_ARR: UInt32 = 1007
-let OID_INT8_ARR: UInt32 = 1016
-let OID_TEXT_ARR: UInt32 = 1009
+/// The Postgres type OIDs the statements' parameters are declared with.
+enum OID {
+    static let int8: UInt32 = 20
+    static let int4: UInt32 = 23
+    static let text: UInt32 = 25
+    static let int4Array: UInt32 = 1007
+    static let int8Array: UInt32 = 1016
+    static let textArray: UInt32 = 1009
+}
 
 struct SqlStateErr: Error, CustomStringConvertible, Sendable {
     let code: String
@@ -153,20 +157,20 @@ struct TxBuf: ~Copyable {
             i32(Int32(s.count))
             buf.append(s)
         case .i64Array(let items):
-            arrayHeader(byteLength: 20 + items.count * 12, elemOID: OID_INT8, count: items.count)
+            arrayHeader(byteLength: 20 + items.count * 12, elemOID: OID.int8, count: items.count)
             for v in items {
                 i32(8)
                 i64(v)
             }
         case .i32Array(let items):
-            arrayHeader(byteLength: 20 + items.count * 8, elemOID: OID_INT4, count: items.count)
+            arrayHeader(byteLength: 20 + items.count * 8, elemOID: OID.int4, count: items.count)
             for v in items {
                 i32(4)
                 i32(v)
             }
         case .textArray(let items):
             let payload = items.reduce(0) { $0 + 4 + $1.count }
-            arrayHeader(byteLength: 20 + payload, elemOID: OID_TEXT, count: items.count)
+            arrayHeader(byteLength: 20 + payload, elemOID: OID.text, count: items.count)
             for s in items {
                 i32(Int32(s.count))
                 buf.append(s)
@@ -281,49 +285,6 @@ struct PipelineBuf: ~Copyable {
     }
 }
 
-/// Calls `body` with each element of a one-dimensional binary array (`iter_binary_array`).
-func forEachArrayElement(_ raw: Span<UInt8>, _ body: (Span<UInt8>) -> Void) {
-    guard raw.count >= 12 else { return }
-    let bytes = raw.bytes
-    let ndim = bytes.load(fromByteOffset: 0, as: Int32.self, .bigEndian)
-    guard ndim > 0, raw.count >= 16 else { return }
-    var remaining = max(Int(bytes.load(fromByteOffset: 12, as: Int32.self, .bigEndian)), 0)
-    var pos = 12 + 8 * Int(ndim)
-    while remaining > 0 {
-        remaining -= 1
-        guard pos + 4 <= raw.count else { return }
-        let len = bytes.load(fromByteOffset: pos, as: Int32.self, .bigEndian)
-        pos += 4
-        if len < 0 { continue }
-        guard pos + Int(len) <= raw.count else { return }
-        body(raw.extracting(pos..<(pos + Int(len))))
-        pos += Int(len)
-    }
-}
-
-private func digestBytes(_ digest: Digest32) -> [UInt8] {
-    (0..<32).map { digest[$0] }
-}
-
-private func decodeError(_ body: Span<UInt8>) -> SqlStateErr {
-    var code = ""
-    var message = ""
-    var start = 0
-    while start < body.count {
-        let end = findByte(body, 0, from: start) ?? body.count
-        if end > start {
-            let field = copyString(body.extracting((start + 1)..<end)) ?? ""
-            switch body[start] {
-            case 0x43: code = field
-            case 0x4D: message = field
-            default: break
-            }
-        }
-        start = end + 1
-    }
-    return SqlStateErr(code: code, message: message)
-}
-
 /// One Postgres connection. It owns its socket: noncopyable, closed in `deinit`, never shared.
 struct PgConn: ~Copyable {
     private let fd: Int32
@@ -359,7 +320,7 @@ struct PgConn: ~Copyable {
             }
         }
         guard fd >= 0 else { throw .io("connect \(ep.host):\(ep.port): \(String(cString: strerror(errno)))") }
-        setNoDelay(fd)
+        Sys.setNoDelay(fd)
         var conn = PgConn(fd: fd)
 
         var startup: [UInt8] = [0, 0, 0, 0]
@@ -386,7 +347,7 @@ struct PgConn: ~Copyable {
         let fd = self.fd
         // The error comes back as a value: a typed-throws closure through `rethrows` crashes Swift 6.4's SILGen.
         let failure = bytes.withUnsafeBytes { raw -> SystemError? in
-            do throws(SystemError) { try writeAll(fd, raw) } catch { return error }
+            do throws(SystemError) { try Sys.writeAll(fd, raw) } catch { return error }
             return nil
         }
         if let failure { throw .io("\(failure)") }
@@ -454,8 +415,8 @@ struct PgConn: ~Copyable {
                         throw .wire("unsupported SASL mechanisms: \(mechanisms)")
                     }
                     var raw = [UInt8](repeating: 0, count: 18)
-                    guard raw.withUnsafeMutableBytes({ fillRandom($0) }) else { throw .wire("getrandom failed") }
-                    let nonce = String(decoding: b64StdEncode(raw), as: UTF8.self)
+                    guard raw.withUnsafeMutableBytes({ Bytes.fillRandom($0) }) else { throw .wire("getrandom failed") }
+                    let nonce = String(decoding: Base64.stdEncode(raw), as: UTF8.self)
                     let bare = "n=,r=\(nonce)"
                     let first = Array("n,,\(bare)".utf8)
                     var msg = Array("SCRAM-SHA-256\0".utf8)
@@ -473,7 +434,7 @@ struct PgConn: ~Copyable {
                         if part.hasPrefix("r=") {
                             rToken = String(part.dropFirst(2))
                         } else if part.hasPrefix("s=") {
-                            salt = b64StdDecode(Array(part.dropFirst(2).utf8).span)
+                            salt = Base64.stdDecode(Array(part.dropFirst(2).utf8).span)
                         } else if part.hasPrefix("i=") {
                             iterations = UInt32(part.dropFirst(2))
                         }
@@ -482,29 +443,29 @@ struct PgConn: ~Copyable {
                         throw .wire("invalid SCRAM server-first")
                     }
                     let firstBlock = salt + [0, 0, 0, 1]
-                    var u = hmacSHA256(key: password, firstBlock.span)
+                    var u = SHA256.hmac(key: password, firstBlock.span)
                     var salted = u
                     for _ in 1..<max(iterations, 1) {
-                        u = hmacSHA256(key: password, u.span)
+                        u = SHA256.hmac(key: password, u.span)
                         for b in 0..<32 { salted[b] ^= u[b] }
                     }
-                    let saltedKey = digestBytes(salted)
-                    let clientKey = hmacSHA256(key: saltedKey, Array("Client Key".utf8).span)
-                    let storedKey = sha256Digest(clientKey.span)
+                    let saltedKey = Self.digestBytes(salted)
+                    let clientKey = SHA256.hmac(key: saltedKey, Array("Client Key".utf8).span)
+                    let storedKey = SHA256.digest(clientKey.span)
                     let noProof = "c=biws,r=\(rToken)"
                     let authMessage = Array("\(bare),\(serverFirst),\(noProof)".utf8)
-                    let clientSignature = hmacSHA256(key: digestBytes(storedKey), authMessage.span)
-                    var proof = digestBytes(clientKey)
+                    let clientSignature = SHA256.hmac(key: Self.digestBytes(storedKey), authMessage.span)
+                    var proof = Self.digestBytes(clientKey)
                     for b in 0..<32 { proof[b] ^= clientSignature[b] }
-                    let serverKey = hmacSHA256(key: saltedKey, Array("Server Key".utf8).span)
-                    let serverSignature = hmacSHA256(key: digestBytes(serverKey), authMessage.span)
-                    expectedServerSignature = digestBytes(serverSignature)
-                    let finalMessage = noProof + ",p=" + String(decoding: b64StdEncode(proof), as: UTF8.self)
+                    let serverKey = SHA256.hmac(key: saltedKey, Array("Server Key".utf8).span)
+                    let serverSignature = SHA256.hmac(key: Self.digestBytes(serverKey), authMessage.span)
+                    expectedServerSignature = Self.digestBytes(serverSignature)
+                    let finalMessage = noProof + ",p=" + String(decoding: Base64.stdEncode(proof), as: UTF8.self)
                     try sendPacket(0x70, Array(finalMessage.utf8))
                 case 12:
                     let serverFinal = String(decoding: body[4...], as: UTF8.self)
                     let verifier = serverFinal.hasPrefix("v=")
-                        ? b64StdDecode(Array(serverFinal.dropFirst(2).utf8).span)
+                        ? Base64.stdDecode(Array(serverFinal.dropFirst(2).utf8).span)
                         : nil
                     guard let verifier, verifier == expectedServerSignature else {
                         throw .wire("SCRAM server signature mismatch")
@@ -513,7 +474,7 @@ struct PgConn: ~Copyable {
                     throw .wire("unsupported auth code \(method)")
                 }
             case 0x45:
-                throw .server(decodeError(body.span))
+                throw .server(Self.decodeError(body.span))
             case 0x5A:
                 return
             default:
@@ -525,7 +486,7 @@ struct PgConn: ~Copyable {
     mutating func flush() throws(PgError) {
         let fd = self.fd
         let failure = tx.buf.withBytes { raw -> SystemError? in
-            do throws(SystemError) { try writeAll(fd, raw) } catch { return error }
+            do throws(SystemError) { try Sys.writeAll(fd, raw) } catch { return error }
             return nil
         }
         if let failure { throw .io("\(failure)") }
@@ -573,7 +534,7 @@ struct PgConn: ~Copyable {
                 rowStart = total
             case 0x45:
                 let total = UInt32(out.rows.count)
-                let err = decodeError(rx.span.extracting(range))
+                let err = Self.decodeError(rx.span.extracting(range))
                 out.results.append(ExecOutcome(rowStart: rowStart, rowCount: total - rowStart, error: err))
                 rowStart = total
             case 0x49:
@@ -592,7 +553,7 @@ struct PgConn: ~Copyable {
         }
     }
 
-    mutating func prepareBatch(_ statements: [PreparedDef]) throws(PgError) {
+    mutating func prepareBatch(_ statements: [Catalog.Statement]) throws(PgError) {
         for s in statements { tx.writeParse(s.name, s.sql, s.oids) }
         tx.writeSync()
         try flush()
@@ -600,7 +561,7 @@ struct PgConn: ~Copyable {
             let (tag, range) = try nextFrame()
             switch tag {
             case 0x45:
-                let err = decodeError(rx.span.extracting(range))
+                let err = Self.decodeError(rx.span.extracting(range))
                 while try nextFrame().tag != 0x5A {}
                 throw .server(err)
             case 0x5A:
@@ -609,5 +570,50 @@ struct PgConn: ~Copyable {
                 break
             }
         }
+    }
+}
+
+extension PgConn {
+    /// Calls `body` with each element of a one-dimensional binary array (`iter_binary_array`).
+    static func forEachArrayElement(_ raw: Span<UInt8>, _ body: (Span<UInt8>) -> Void) {
+        guard raw.count >= 12 else { return }
+        let bytes = raw.bytes
+        let ndim = bytes.load(fromByteOffset: 0, as: Int32.self, .bigEndian)
+        guard ndim > 0, raw.count >= 16 else { return }
+        var remaining = max(Int(bytes.load(fromByteOffset: 12, as: Int32.self, .bigEndian)), 0)
+        var pos = 12 + 8 * Int(ndim)
+        while remaining > 0 {
+            remaining -= 1
+            guard pos + 4 <= raw.count else { return }
+            let len = bytes.load(fromByteOffset: pos, as: Int32.self, .bigEndian)
+            pos += 4
+            if len < 0 { continue }
+            guard pos + Int(len) <= raw.count else { return }
+            body(raw.extracting(pos..<(pos + Int(len))))
+            pos += Int(len)
+        }
+    }
+
+    private static func digestBytes(_ digest: SHA256.Digest) -> [UInt8] {
+        (0..<32).map { digest[$0] }
+    }
+
+    private static func decodeError(_ body: Span<UInt8>) -> SqlStateErr {
+        var code = ""
+        var message = ""
+        var start = 0
+        while start < body.count {
+            let end = Bytes.find(body, 0, from: start) ?? body.count
+            if end > start {
+                let field = Bytes.copyString(body.extracting((start + 1)..<end)) ?? ""
+                switch body[start] {
+                case 0x43: code = field
+                case 0x4D: message = field
+                default: break
+                }
+            }
+            start = end + 1
+        }
+        return SqlStateErr(code: code, message: message)
     }
 }

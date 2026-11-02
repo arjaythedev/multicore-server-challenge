@@ -4,90 +4,7 @@
 // to the scheduler in one message (a child task of the reactor's own task group). Replies arrive as `deliver`
 // messages from the lanes, one per batch, and go out with writev.
 import Glibc
-
-private let tokenListener = UInt64.max - 1
-private let idleNone = UInt32.max
-private let epochClosed = UInt32.max
-private let limitHead = 64 * 1024
-private let limitBody = 1024 * 1024
-
-/// A connection: its socket and buffers (owned, so the slot is noncopyable), and the Rust's flags.
-struct ClientSlot: ~Copyable {
-    var fd: Int32
-    var epoch: UInt32 = 0
-    var rx = ByteBuffer()
-    var tx = ByteBuffer()
-    var txOff = 0
-    var inFlight = false
-    var closeOnDone = false
-    var eofSeen = false
-    var pollingOut = false
-    var continueSent = false
-    var reused = false
-    var inIdleLRU = false
-    var idlePrev = idleNone
-    var idleNext = idleNone
-}
-
-private func reasonPhrase(_ status: UInt16) -> StaticString {
-    switch status {
-    case 100: "100 Continue"
-    case 200: "200 OK"
-    case 201: "201 Created"
-    case 204: "204 No Content"
-    case 400: "400 Bad Request"
-    case 401: "401 Unauthorized"
-    case 403: "403 Forbidden"
-    case 404: "404 Not Found"
-    case 413: "413 Payload Too Large"
-    case 422: "422 Unprocessable Entity"
-    case 431: "431 Request Header Fields Too Large"
-    default: "500 Internal Server Error"
-    }
-}
-
-/// The response head (status line, Content-Type, Content-Length, Connection) into `out`; returns its length.
-private func formatHeader(_ out: UnsafeMutableRawBufferPointer, _ status: UInt16, _ length: Int, _ close: Bool) -> Int {
-    var n = 0
-    func put(_ s: StaticString) {
-        (out.baseAddress! + n).copyMemory(from: s.utf8Start, byteCount: s.utf8CodeUnitCount)
-        n += s.utf8CodeUnitCount
-    }
-    func putLength() {
-        var digits = 1
-        var v = length
-        while v >= 10 {
-            v /= 10
-            digits += 1
-        }
-        v = length
-        for i in stride(from: n + digits - 1, through: n, by: -1) {
-            out[i] = 0x30 + UInt8(v % 10)
-            v /= 10
-        }
-        n += digits
-    }
-    if status == 200 && !close {
-        put("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ")
-        putLength()
-        put("\r\n\r\n")
-    } else if status == 204 {
-        put(close ? "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n" : "HTTP/1.1 204 No Content\r\n\r\n")
-    } else {
-        put("HTTP/1.1 ")
-        put(reasonPhrase(status))
-        put("\r\nContent-Type: application/json\r\nContent-Length: ")
-        putLength()
-        put(close ? "\r\nConnection: close\r\n\r\n" : "\r\n\r\n")
-    }
-    return n
-}
-
-enum ParseOutcome: ~Copyable {
-    case complete(consumed: Int, closeAfter: Bool, dispatch: Dispatch)
-    case incomplete(sendContinue: Bool)
-    case reject(UInt16)
-}
+import Syscalls
 
 actor Reactor {
     let index: UInt16
@@ -133,13 +50,13 @@ actor Reactor {
     // ---------- the loop ----------
 
     func run() async {
-        unshareFiles()
+        Sys.unshareFiles()
         do {
-            listenFD = try bindListener(host: host, port: port)
+            listenFD = try Sys.bindListener(host: host, port: port)
         } catch {
             fatalError("failed to bind listener: \(error)")
         }
-        guard ctl(Sys.EPOLL_CTL_ADD, listenFD, Sys.EPOLLIN, tokenListener) else { fatalError("epoll_ctl listener: \(errno)") }
+        guard ctl(Sys.EPOLL_CTL_ADD, listenFD, Sys.EPOLLIN, Self.tokenListener) else { fatalError("epoll_ctl listener: \(errno)") }
         await withDiscardingTaskGroup { group in
             while true {
                 // One epoll_wait per tick, as the Rust's loop: it blocks here, on this actor's own thread, until a
@@ -150,7 +67,7 @@ actor Reactor {
                     let flags = events.span.bytes.load(fromByteOffset: base, as: UInt32.self)
                     let token = events.span.bytes.load(fromByteOffset: base + Sys.epollDataOffset, as: UInt64.self)
                     switch token {
-                    case tokenListener: acceptReady()
+                    case Self.tokenListener: acceptReady()
                     default:
                         let slot = UInt32(truncatingIfNeeded: token)
                         if flags & Sys.EPOLLOUT != 0 { flushTx(slot) }
@@ -195,8 +112,8 @@ actor Reactor {
         if slots[s].inIdleLRU || slots[s].fd < 0 { return }
         slots[s].inIdleLRU = true
         slots[s].idlePrev = idleTail
-        slots[s].idleNext = idleNone
-        if idleTail != idleNone {
+        slots[s].idleNext = Self.idleNone
+        if idleTail != Self.idleNone {
             slots[Int(idleTail)].idleNext = slot
         } else {
             idleHead = slot
@@ -210,22 +127,22 @@ actor Reactor {
         slots[s].inIdleLRU = false
         let prev = slots[s].idlePrev
         let next = slots[s].idleNext
-        slots[s].idlePrev = idleNone
-        slots[s].idleNext = idleNone
-        if prev != idleNone { slots[Int(prev)].idleNext = next } else { idleHead = next }
-        if next != idleNone { slots[Int(next)].idlePrev = prev } else { idleTail = prev }
+        slots[s].idlePrev = Self.idleNone
+        slots[s].idleNext = Self.idleNone
+        if prev != Self.idleNone { slots[Int(prev)].idleNext = next } else { idleHead = next }
+        if next != Self.idleNone { slots[Int(next)].idlePrev = prev } else { idleTail = prev }
     }
 
     private func acceptReady() {
         while true {
-            while activeConns >= fdBudget && idleHead != idleNone { dropConn(idleHead) }
+            while activeConns >= fdBudget && idleHead != Self.idleNone { dropConn(idleHead) }
             let fd = sys_accept4(listenFD, nil, nil, Sys.SOCK_NONBLOCK | Sys.SOCK_CLOEXEC)
             if fd < 0 {
                 switch errno {
                 case Sys.EAGAIN: return
                 case Sys.EINTR, Sys.ECONNABORTED: continue
                 case Sys.EMFILE, Sys.ENFILE:
-                    if idleHead != idleNone {
+                    if idleHead != Self.idleNone {
                         dropConn(idleHead)
                         continue
                     }
@@ -233,7 +150,7 @@ actor Reactor {
                 default: return
                 }
             }
-            setNoDelay(fd)
+            Sys.setNoDelay(fd)
             let slot: UInt32
             if let idx = freeSlots.popLast() {
                 let s = Int(idx)
@@ -245,8 +162,8 @@ actor Reactor {
                 slots[s].continueSent = false
                 slots[s].reused = false
                 slots[s].inIdleLRU = false
-                slots[s].idlePrev = idleNone
-                slots[s].idleNext = idleNone
+                slots[s].idlePrev = Self.idleNone
+                slots[s].idleNext = Self.idleNone
                 slots[s].txOff = 0
                 slot = idx
             } else {
@@ -269,7 +186,7 @@ actor Reactor {
         _ = sys_close(slots[s].fd)
         slots[s].fd = -1
         let nextEpoch = slots[s].epoch &+ 1
-        slots[s].epoch = nextEpoch == epochClosed ? 0 : nextEpoch
+        slots[s].epoch = nextEpoch == Self.epochClosed ? 0 : nextEpoch
         slots[s].rx.release()
         slots[s].tx.release()
         slots[s].txOff = 0
@@ -317,7 +234,7 @@ actor Reactor {
             // Parse straight out of the scratch buffer when the connection has nothing left over.
             if canDirectParse && n < 256 * 1024 {
                 let addr = ReplyAddr(worker: index, slot: slot, epoch: slots[s].epoch)
-                let outcome = parseOneHTTP(signer, scratch.span, addr)
+                let outcome = HTTP.parseRequest(signer, scratch.span, addr)
                 switch consume outcome {
                 case .complete(let consumed, let closeAfter, let dispatch):
                     slots[s].continueSent = false
@@ -343,7 +260,7 @@ actor Reactor {
     }
 
     /// Writes an immediate answer, or queues the work for this tick's submission. Whether it was immediate.
-    private func handle(_ dispatch: consuming Dispatch, _ slot: UInt32) -> Bool {
+    private func handle(_ dispatch: consuming Router.Dispatch, _ slot: UInt32) -> Bool {
         switch consume dispatch {
         case .immediate(let status, let body):
             body.withBytes { writeResponse(slot, status, $0) }
@@ -367,7 +284,7 @@ actor Reactor {
                 return
             }
             let addr = ReplyAddr(worker: index, slot: slot, epoch: slots[s].epoch)
-            let outcome = parseOneHTTP(signer, slots[s].rx.span, addr)
+            let outcome = HTTP.parseRequest(signer, slots[s].rx.span, addr)
             switch consume outcome {
             case .complete(let consumed, let closeAfter, let dispatch):
                 slots[s].continueSent = false
@@ -393,7 +310,7 @@ actor Reactor {
         slots[s].closeOnDone = true
         slots[s].inFlight = true
         slots[s].rx.release()
-        makeErrorJSON(reasonPhrase(status)).withBytes { writeResponse(slot, status, $0) }
+        JSON.errorBody(HTTP.reasonPhrase(status)).withBytes { writeResponse(slot, status, $0) }
     }
 
     // ---------- writing ----------
@@ -405,7 +322,7 @@ actor Reactor {
         let close = slots[s].closeOnDone
         // The header in a stack buffer, as the Rust's `[0u8; 160]`: no allocation per response.
         withUnsafeTemporaryAllocation(byteCount: 192, alignment: 8) { raw in
-            let header = UnsafeRawBufferPointer(rebasing: raw[0..<formatHeader(raw, status, body.count, close)])
+            let header = UnsafeRawBufferPointer(rebasing: raw[0..<HTTP.formatHeader(raw, status, body.count, close)])
             send(slot, header, body)
         }
         updateWriteState(slot)
@@ -518,190 +435,282 @@ actor Reactor {
     }
 }
 
+extension Reactor {
+    private static let tokenListener = UInt64.max - 1
+    private static let idleNone = UInt32.max
+    private static let epochClosed = UInt32.max
+
+    /// A connection: its socket and buffers (owned, so the slot is noncopyable), and the Rust's flags.
+    struct ClientSlot: ~Copyable {
+        var fd: Int32
+        var epoch: UInt32 = 0
+        var rx = ByteBuffer()
+        var tx = ByteBuffer()
+        var txOff = 0
+        var inFlight = false
+        var closeOnDone = false
+        var eofSeen = false
+        var pollingOut = false
+        var continueSent = false
+        var reused = false
+        var inIdleLRU = false
+        var idlePrev = idleNone
+        var idleNext = idleNone
+    }
+}
+
+/// HTTP/1.1: the response head, and (below) request parsing.
+enum HTTP {
+    private static let limitHead = 64 * 1024
+    private static let limitBody = 1024 * 1024
+
+    fileprivate static func reasonPhrase(_ status: UInt16) -> StaticString {
+        switch status {
+        case 100: "100 Continue"
+        case 200: "200 OK"
+        case 201: "201 Created"
+        case 204: "204 No Content"
+        case 400: "400 Bad Request"
+        case 401: "401 Unauthorized"
+        case 403: "403 Forbidden"
+        case 404: "404 Not Found"
+        case 413: "413 Payload Too Large"
+        case 422: "422 Unprocessable Entity"
+        case 431: "431 Request Header Fields Too Large"
+        default: "500 Internal Server Error"
+        }
+    }
+
+    /// The response head (status line, Content-Type, Content-Length, Connection) into `out`; returns its length.
+    fileprivate static func formatHeader(_ out: UnsafeMutableRawBufferPointer, _ status: UInt16, _ length: Int, _ close: Bool) -> Int {
+        var n = 0
+        func put(_ s: StaticString) {
+            (out.baseAddress! + n).copyMemory(from: s.utf8Start, byteCount: s.utf8CodeUnitCount)
+            n += s.utf8CodeUnitCount
+        }
+        func putLength() {
+            var digits = 1
+            var v = length
+            while v >= 10 {
+                v /= 10
+                digits += 1
+            }
+            v = length
+            for i in stride(from: n + digits - 1, through: n, by: -1) {
+                out[i] = 0x30 + UInt8(v % 10)
+                v /= 10
+            }
+            n += digits
+        }
+        if status == 200 && !close {
+            put("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ")
+            putLength()
+            put("\r\n\r\n")
+        } else if status == 204 {
+            put(close ? "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n" : "HTTP/1.1 204 No Content\r\n\r\n")
+        } else {
+            put("HTTP/1.1 ")
+            put(reasonPhrase(status))
+            put("\r\nContent-Type: application/json\r\nContent-Length: ")
+            putLength()
+            put(close ? "\r\nConnection: close\r\n\r\n" : "\r\n\r\n")
+        }
+        return n
+    }
+
+    enum ParseOutcome: ~Copyable {
+        case complete(consumed: Int, closeAfter: Bool, dispatch: Router.Dispatch)
+        case incomplete(sendContinue: Bool)
+        case reject(UInt16)
+    }
+}
+
 // ---------- HTTP/1.1 parsing ----------
 
-@inline(__always) private func trimOWS(_ s: Span<UInt8>) -> Span<UInt8> {
-    var a = 0
-    var b = s.count
-    while a < b && (s[a] == 0x20 || s[a] == 0x09) { a += 1 }
-    while b > a && (s[b - 1] == 0x20 || s[b - 1] == 0x09) { b -= 1 }
-    return s.extracting(a..<b)
-}
-
-@inline(__always) private func parseUsize(_ s: Span<UInt8>) -> Int? {
-    guard s.count > 0 else { return nil }
-    var value = 0
-    for i in 0..<s.count {
-        let b = s[i]
-        guard (0x30...0x39).contains(b) else { return nil }
-        let (m, o1) = value.multipliedReportingOverflow(by: 10)
-        let (v, o2) = m.addingReportingOverflow(Int(b - 0x30))
-        if o1 || o2 { return nil }
-        value = v
+extension HTTP {
+    @inline(__always) private static func trimOWS(_ s: Span<UInt8>) -> Span<UInt8> {
+        var a = 0
+        var b = s.count
+        while a < b && (s[a] == 0x20 || s[a] == 0x09) { a += 1 }
+        while b > a && (s[b - 1] == 0x20 || s[b - 1] == 0x09) { b -= 1 }
+        return s.extracting(a..<b)
     }
-    return value
-}
 
-@inline(__always) private func isTokenName(_ s: Span<UInt8>) -> Bool {
-    guard s.count > 0 else { return false }
-    for i in 0..<s.count {
-        let b = s[i]
-        if b <= 0x20 || b >= 0x7F { return false }
-        switch b {
-        case 0x28, 0x29, 0x3C, 0x3E, 0x40, 0x2C, 0x3B, 0x3A, 0x5C, 0x22, 0x2F, 0x5B, 0x5D, 0x3F, 0x3D, 0x7B, 0x7D: return false
-        default: continue
+    @inline(__always) private static func parseUsize(_ s: Span<UInt8>) -> Int? {
+        guard s.count > 0 else { return nil }
+        var value = 0
+        for i in 0..<s.count {
+            let b = s[i]
+            guard (0x30...0x39).contains(b) else { return nil }
+            let (m, o1) = value.multipliedReportingOverflow(by: 10)
+            let (v, o2) = m.addingReportingOverflow(Int(b - 0x30))
+            if o1 || o2 { return nil }
+            value = v
         }
-    }
-    return true
-}
-
-@inline(__always) private func equalsIgnoringCase(_ s: Span<UInt8>, _ lower: StaticString) -> Bool {
-    guard s.count == lower.utf8CodeUnitCount else { return false }
-    let l = lower.utf8Start
-    for i in 0..<s.count {
-        var c = s[i]
-        if (0x41...0x5A).contains(c) { c |= 0x20 }
-        if c != l[i] { return false }
-    }
-    return true
-}
-
-func parseOneHTTP(_ signer: TokenSigner, _ buf: Span<UInt8>, _ addr: ReplyAddr) -> ParseOutcome {
-    guard let reqLineEnd = findCRLF(buf) else {
-        return buf.count > limitHead ? .reject(431) : .incomplete(sendContinue: false)
-    }
-    let reqLine = buf.extracting(0..<reqLineEnd)
-    guard let sp1 = findByte(reqLine, 0x20) else { return .reject(400) }
-    let method = reqLine.extracting(0..<sp1)
-    guard isTokenName(method) else { return .reject(400) }
-    guard let sp2 = findByte(reqLine, 0x20, from: sp1 + 1) else { return .reject(400) }
-    let rawTarget = reqLine.extracting((sp1 + 1)..<sp2)
-    guard rawTarget.count > 0 else { return .reject(400) }
-    for i in 0..<rawTarget.count where rawTarget[i] <= 0x20 || rawTarget[i] == 0x7F { return .reject(400) }
-    let version = reqLine.extracting((sp2 + 1)..<reqLine.count)
-    let isHTTP10: Bool
-    if spanEqual(version, "HTTP/1.1") {
-        isHTTP10 = false
-    } else if spanEqual(version, "HTTP/1.0") {
-        isHTTP10 = true
-    } else {
-        return .reject(400)
+        return value
     }
 
-    var contentLength: Int?
-    var isChunked = false
-    var authRange: Range<Int>?
-    var keepAlive = !isHTTP10
-    var expect100 = false
+    @inline(__always) private static func isTokenName(_ s: Span<UInt8>) -> Bool {
+        guard s.count > 0 else { return false }
+        for i in 0..<s.count {
+            let b = s[i]
+            if b <= 0x20 || b >= 0x7F { return false }
+            switch b {
+            case 0x28, 0x29, 0x3C, 0x3E, 0x40, 0x2C, 0x3B, 0x3A, 0x5C, 0x22, 0x2F, 0x5B, 0x5D, 0x3F, 0x3D, 0x7B, 0x7D: return false
+            default: continue
+            }
+        }
+        return true
+    }
 
-    var pos = reqLineEnd + 2
-    var headEnd = 0
-    while true {
-        guard let lineEnd = findCRLF(buf, from: pos) else {
+    @inline(__always) private static func equalsIgnoringCase(_ s: Span<UInt8>, _ lower: StaticString) -> Bool {
+        guard s.count == lower.utf8CodeUnitCount else { return false }
+        let l = lower.utf8Start
+        for i in 0..<s.count {
+            var c = s[i]
+            if (0x41...0x5A).contains(c) { c |= 0x20 }
+            if c != l[i] { return false }
+        }
+        return true
+    }
+
+    static func parseRequest(_ signer: TokenSigner, _ buf: Span<UInt8>, _ addr: ReplyAddr) -> ParseOutcome {
+        guard let reqLineEnd = Bytes.findCRLF(buf) else {
             return buf.count > limitHead ? .reject(431) : .incomplete(sendContinue: false)
         }
-        if lineEnd + 2 > limitHead { return .reject(431) }
-        if lineEnd == pos {
-            headEnd = pos + 2
-            break
-        }
-        let line = buf.extracting(pos..<lineEnd)
-        let lineStart = pos
-        pos = lineEnd + 2
-        guard let colon = findByte(line, 0x3A) else { return .reject(400) }
-        let name = line.extracting(0..<colon)
-        guard isTokenName(name) else { return .reject(400) }
-        let value = trimOWS(line.extracting((colon + 1)..<line.count))
-        switch name.count {
-        case 13 where equalsIgnoringCase(name, "authorization"):
-            // The value's place in `buf` (after the leading whitespace trimOWS skipped), so the request borrows it.
-            var a = colon + 1
-            while a < line.count && (line[a] == 0x20 || line[a] == 0x09) { a += 1 }
-            let valueStart = lineStart + a
-            authRange = valueStart..<(valueStart + value.count)
-        case 14 where equalsIgnoringCase(name, "content-length"):
-            guard let n = parseUsize(value) else { return .reject(400) }
-            if let prev = contentLength, prev != n { return .reject(400) }
-            contentLength = n
-        case 10 where equalsIgnoringCase(name, "connection"):
-            if equalsIgnoringCase(value, "close") {
-                keepAlive = false
-            } else if equalsIgnoringCase(value, "keep-alive") {
-                keepAlive = true
-            }
-        case 17 where equalsIgnoringCase(name, "transfer-encoding"):
-            isChunked = equalsIgnoringCase(value, "chunked")
-            if !isChunked { return .reject(400) }
-        case 6 where equalsIgnoringCase(name, "expect"):
-            expect100 = equalsIgnoringCase(value, "100-continue")
-        default:
-            break
-        }
-    }
-
-    if isChunked && contentLength != nil { return .reject(400) }
-
-    let qpos = findByte(rawTarget, 0x3F) ?? rawTarget.count
-    let path = rawTarget.extracting(0..<qpos)
-    let query = rawTarget.extracting(min(qpos + 1, rawTarget.count)..<rawTarget.count)
-    var auth: Span<UInt8>? = nil
-    if let authRange { auth = buf.extracting(authRange) }
-
-    if isChunked {
-        switch decodeChunkedBody(buf.extracting(headEnd..<buf.count)) {
-        case .complete(let decoded, let used):
-            if decoded.count > limitBody { return .reject(413) }
-            let req = HttpReq(method: method, path: path, query: query, auth: auth, body: decoded.span)
-            let dispatch = routeRequest(signer, req, addr)
-            return .complete(consumed: headEnd + used, closeAfter: !keepAlive, dispatch: dispatch)
-        case .incomplete:
-            if buf.count - headEnd > limitBody + 64 * 1024 { return .reject(413) }
-            return .incomplete(sendContinue: expect100)
-        case .malformed:
+        let reqLine = buf.extracting(0..<reqLineEnd)
+        guard let sp1 = Bytes.find(reqLine, 0x20) else { return .reject(400) }
+        let method = reqLine.extracting(0..<sp1)
+        guard isTokenName(method) else { return .reject(400) }
+        guard let sp2 = Bytes.find(reqLine, 0x20, from: sp1 + 1) else { return .reject(400) }
+        let rawTarget = reqLine.extracting((sp1 + 1)..<sp2)
+        guard rawTarget.count > 0 else { return .reject(400) }
+        for i in 0..<rawTarget.count where rawTarget[i] <= 0x20 || rawTarget[i] == 0x7F { return .reject(400) }
+        let version = reqLine.extracting((sp2 + 1)..<reqLine.count)
+        let isHTTP10: Bool
+        if Bytes.equal(version, "HTTP/1.1") {
+            isHTTP10 = false
+        } else if Bytes.equal(version, "HTTP/1.0") {
+            isHTTP10 = true
+        } else {
             return .reject(400)
         }
-    }
-    let cl = contentLength ?? 0
-    if cl > limitBody { return .reject(413) }
-    if buf.count < headEnd + cl { return .incomplete(sendContinue: expect100) }
-    let req = HttpReq(method: method, path: path, query: query, auth: auth, body: buf.extracting(headEnd..<(headEnd + cl)))
-    let dispatch = routeRequest(signer, req, addr)
-    return .complete(consumed: headEnd + cl, closeAfter: !keepAlive, dispatch: dispatch)
-}
 
-private enum ChunkResult {
-    case complete([UInt8], Int)
-    case incomplete
-    case malformed
-}
+        var contentLength: Int?
+        var isChunked = false
+        var authRange: Range<Int>?
+        var keepAlive = !isHTTP10
+        var expect100 = false
 
-private func decodeChunkedBody(_ src: Span<UInt8>) -> ChunkResult {
-    var out: [UInt8] = []
-    var pos = 0
-    while true {
-        guard let crlf = findCRLF(src, from: pos) else { return .incomplete }
-        let line = src.extracting(pos..<crlf)
-        let hexPart = line.extracting(0..<(findByte(line, 0x3B) ?? line.count))
-        guard isValidUTF8(hexPart) else { return .malformed }
-        let text = hexPart.withUnsafeBufferPointer { String(decoding: $0, as: UTF8.self) }
-            .trimmingCharacters(in: " \t")
-        guard let chunkLen = Int(text, radix: 16), chunkLen >= 0 else { return .malformed }
-        pos = crlf + 2
-        if chunkLen == 0 {
-            while true {
-                guard let endLine = findCRLF(src, from: pos) else { return .incomplete }
-                let empty = endLine == pos
-                pos = endLine + 2
-                if empty { return .complete(out, pos) }
+        var pos = reqLineEnd + 2
+        var headEnd = 0
+        while true {
+            guard let lineEnd = Bytes.findCRLF(buf, from: pos) else {
+                return buf.count > limitHead ? .reject(431) : .incomplete(sendContinue: false)
+            }
+            if lineEnd + 2 > limitHead { return .reject(431) }
+            if lineEnd == pos {
+                headEnd = pos + 2
+                break
+            }
+            let line = buf.extracting(pos..<lineEnd)
+            let lineStart = pos
+            pos = lineEnd + 2
+            guard let colon = Bytes.find(line, 0x3A) else { return .reject(400) }
+            let name = line.extracting(0..<colon)
+            guard isTokenName(name) else { return .reject(400) }
+            let value = trimOWS(line.extracting((colon + 1)..<line.count))
+            switch name.count {
+            case 13 where equalsIgnoringCase(name, "authorization"):
+                // The value's place in `buf` (after the leading whitespace trimOWS skipped), so the request borrows it.
+                var a = colon + 1
+                while a < line.count && (line[a] == 0x20 || line[a] == 0x09) { a += 1 }
+                let valueStart = lineStart + a
+                authRange = valueStart..<(valueStart + value.count)
+            case 14 where equalsIgnoringCase(name, "content-length"):
+                guard let n = parseUsize(value) else { return .reject(400) }
+                if let prev = contentLength, prev != n { return .reject(400) }
+                contentLength = n
+            case 10 where equalsIgnoringCase(name, "connection"):
+                if equalsIgnoringCase(value, "close") {
+                    keepAlive = false
+                } else if equalsIgnoringCase(value, "keep-alive") {
+                    keepAlive = true
+                }
+            case 17 where equalsIgnoringCase(name, "transfer-encoding"):
+                isChunked = equalsIgnoringCase(value, "chunked")
+                if !isChunked { return .reject(400) }
+            case 6 where equalsIgnoringCase(name, "expect"):
+                expect100 = equalsIgnoringCase(value, "100-continue")
+            default:
+                break
             }
         }
-        if chunkLen > limitBody || out.count + chunkLen > limitBody {
-            return .complete([UInt8](repeating: 0, count: limitBody + 1), pos)
+
+        if isChunked && contentLength != nil { return .reject(400) }
+
+        let qpos = Bytes.find(rawTarget, 0x3F) ?? rawTarget.count
+        let path = rawTarget.extracting(0..<qpos)
+        let query = rawTarget.extracting(min(qpos + 1, rawTarget.count)..<rawTarget.count)
+        var auth: Span<UInt8>? = nil
+        if let authRange { auth = buf.extracting(authRange) }
+
+        if isChunked {
+            switch decodeChunkedBody(buf.extracting(headEnd..<buf.count)) {
+            case .complete(let decoded, let used):
+                if decoded.count > limitBody { return .reject(413) }
+                let req = Request(method: method, path: path, query: query, auth: auth, body: decoded.span)
+                let dispatch = Router.route(signer, req, addr)
+                return .complete(consumed: headEnd + used, closeAfter: !keepAlive, dispatch: dispatch)
+            case .incomplete:
+                if buf.count - headEnd > limitBody + 64 * 1024 { return .reject(413) }
+                return .incomplete(sendContinue: expect100)
+            case .malformed:
+                return .reject(400)
+            }
         }
-        if src.count < pos + chunkLen + 2 { return .incomplete }
-        src.extracting(pos..<(pos + chunkLen)).withUnsafeBufferPointer { out.append(contentsOf: $0) }
-        if src[pos + chunkLen] != 0x0D || src[pos + chunkLen + 1] != 0x0A { return .malformed }
-        pos += chunkLen + 2
+        let cl = contentLength ?? 0
+        if cl > limitBody { return .reject(413) }
+        if buf.count < headEnd + cl { return .incomplete(sendContinue: expect100) }
+        let req = Request(method: method, path: path, query: query, auth: auth, body: buf.extracting(headEnd..<(headEnd + cl)))
+        let dispatch = Router.route(signer, req, addr)
+        return .complete(consumed: headEnd + cl, closeAfter: !keepAlive, dispatch: dispatch)
+    }
+
+    private enum ChunkResult {
+        case complete([UInt8], Int)
+        case incomplete
+        case malformed
+    }
+
+    private static func decodeChunkedBody(_ src: Span<UInt8>) -> ChunkResult {
+        var out: [UInt8] = []
+        var pos = 0
+        while true {
+            guard let crlf = Bytes.findCRLF(src, from: pos) else { return .incomplete }
+            let line = src.extracting(pos..<crlf)
+            let hexPart = line.extracting(0..<(Bytes.find(line, 0x3B) ?? line.count))
+            guard Bytes.isValidUTF8(hexPart) else { return .malformed }
+            let text = hexPart.withUnsafeBufferPointer { String(decoding: $0, as: UTF8.self) }
+                .trimmingCharacters(in: " \t")
+            guard let chunkLen = Int(text, radix: 16), chunkLen >= 0 else { return .malformed }
+            pos = crlf + 2
+            if chunkLen == 0 {
+                while true {
+                    guard let endLine = Bytes.findCRLF(src, from: pos) else { return .incomplete }
+                    let empty = endLine == pos
+                    pos = endLine + 2
+                    if empty { return .complete(out, pos) }
+                }
+            }
+            if chunkLen > limitBody || out.count + chunkLen > limitBody {
+                return .complete([UInt8](repeating: 0, count: limitBody + 1), pos)
+            }
+            if src.count < pos + chunkLen + 2 { return .incomplete }
+            src.extracting(pos..<(pos + chunkLen)).withUnsafeBufferPointer { out.append(contentsOf: $0) }
+            if src[pos + chunkLen] != 0x0D || src[pos + chunkLen + 1] != 0x0A { return .malformed }
+            pos += chunkLen + 2
+        }
     }
 }
 

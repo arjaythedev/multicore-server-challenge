@@ -5,60 +5,6 @@
 // takes the batch once it is big enough or its oldest request has waited long enough; the deadline is a timeout
 // on this actor's own loop.
 
-/// A FIFO of tasks with cheap removal from the front and insertion at it.
-private struct TaskQueue<T> {
-    private var items: [T] = []
-    private var head = 0
-
-    var count: Int { items.count - head }
-    var isEmpty: Bool { head == items.count }
-
-    mutating func append(_ t: T) { items.append(t) }
-    mutating func append(contentsOf ts: [T]) { items.append(contentsOf: ts) }
-
-    /// Puts `ts` in front, in their order (Rust's push_front / push_batch_front).
-    mutating func prepend(_ ts: [T]) {
-        guard !ts.isEmpty else { return }
-        if head >= ts.count {
-            head -= ts.count
-            for (i, t) in ts.enumerated() { items[head + i] = t }
-        } else {
-            items.replaceSubrange(0..<head, with: ts)
-            head = 0
-        }
-    }
-
-    mutating func take(_ n: Int) -> [T] {
-        let out = Array(items[head..<(head + n)])
-        head += n
-        if head == items.count {
-            items.removeAll(keepingCapacity: true)
-            head = 0
-        } else if head > 4096 && head * 2 > items.count {
-            items.removeFirst(head)
-            head = 0
-        }
-        return out
-    }
-}
-
-/// The parameters one gathering lane computed when it became the gatherer (under the Rust's batch lock).
-private struct Gather {
-    let want: Int
-    let maxAge: UInt64
-    let maxCap: Int
-}
-
-struct ReadBatchDone: Sendable {
-    let count: Int
-    let elapsedUs: Int
-}
-
-struct CryptoBatchDone: Sendable {
-    /// Microseconds of the cost-10 part, if there was one (EWMA_BCRYPT_US).
-    let standardUs: Int?
-}
-
 actor Scheduler {
     nonisolated let loop: EventLoop
     nonisolated var unownedExecutor: UnownedSerialExecutor { loop.asUnownedSerialExecutor() }
@@ -97,7 +43,7 @@ actor Scheduler {
         self.loop = loop
         self.readWorkers = readWorkers
         self.bcryptLanes = bcryptLanes
-        let families = readCatalog().count
+        let families = Catalog.reads().count
         let rw = max(readWorkers, 2)
         baseBatch = families * rw * 2
         maxBatch = baseBatch * rw * 2
@@ -115,7 +61,7 @@ actor Scheduler {
     }
 
     func submit(_ s: Submission) {
-        let now = monotonicNanos()
+        let now = Sys.monotonicNanos()
         if !s.cancelled.isEmpty {
             if cancelled.count > 4096 { cancelled.removeAll(keepingCapacity: true) }
             cancelled.formUnion(s.cancelled)
@@ -141,7 +87,7 @@ actor Scheduler {
     // ---------- reads ----------
 
     /// The next batch for a read lane, which reports how its last one went.
-    func nextReads(finished: ReadBatchDone?) async -> [ReadTask] {
+    func nextReads(finished: Scheduler.ReadBatchDone?) async -> [ReadTask] {
         if let f = finished {
             busyReadWorkers -= 1
             let us = ewmaBatchUs == 0 ? f.elapsedUs : (ewmaBatchUs * 3 + f.elapsedUs) / 4
@@ -175,7 +121,7 @@ actor Scheduler {
 
     // ---------- bcrypt ----------
 
-    func nextCrypto(finished: CryptoBatchDone?) async -> [CryptoTask] {
+    func nextCrypto(finished: Scheduler.CryptoBatchDone?) async -> [CryptoTask] {
         if let f = finished {
             busyCryptoWorkers -= 1
             if let us = f.standardUs {
@@ -214,7 +160,7 @@ actor Scheduler {
     // ---------- gathering ----------
 
     private func evaluate() {
-        let now = monotonicNanos()
+        let now = Sys.monotonicNanos()
         readDeadline = .max
         while !readWaiters.isEmpty && !reads.isEmpty {
             if readGather == nil { readGather = computeReadGather() }
@@ -258,5 +204,61 @@ actor Scheduler {
             cryptoGather = cryptoWaiters.isEmpty ? nil : computeCryptoGather()
         }
         if reads.isEmpty && crypto.isEmpty && !cancelled.isEmpty { cancelled.removeAll(keepingCapacity: true) }
+    }
+}
+
+extension Scheduler {
+    /// A FIFO of tasks with cheap removal from the front and insertion at it.
+    private struct TaskQueue<T> {
+        private var items: [T] = []
+        private var head = 0
+
+        var count: Int { items.count - head }
+        var isEmpty: Bool { head == items.count }
+
+        mutating func append(_ t: T) { items.append(t) }
+        mutating func append(contentsOf ts: [T]) { items.append(contentsOf: ts) }
+
+        /// Puts `ts` in front, in their order (Rust's push_front / push_batch_front).
+        mutating func prepend(_ ts: [T]) {
+            guard !ts.isEmpty else { return }
+            if head >= ts.count {
+                head -= ts.count
+                for (i, t) in ts.enumerated() { items[head + i] = t }
+            } else {
+                items.replaceSubrange(0..<head, with: ts)
+                head = 0
+            }
+        }
+
+        mutating func take(_ n: Int) -> [T] {
+            let out = Array(items[head..<(head + n)])
+            head += n
+            if head == items.count {
+                items.removeAll(keepingCapacity: true)
+                head = 0
+            } else if head > 4096 && head * 2 > items.count {
+                items.removeFirst(head)
+                head = 0
+            }
+            return out
+        }
+    }
+
+    /// The parameters one gathering lane computed when it became the gatherer (under the Rust's batch lock).
+    private struct Gather {
+        let want: Int
+        let maxAge: UInt64
+        let maxCap: Int
+    }
+
+    struct ReadBatchDone: Sendable {
+        let count: Int
+        let elapsedUs: Int
+    }
+
+    struct CryptoBatchDone: Sendable {
+        /// Microseconds of the cost-10 part, if there was one (EWMA_BCRYPT_US).
+        let standardUs: Int?
     }
 }

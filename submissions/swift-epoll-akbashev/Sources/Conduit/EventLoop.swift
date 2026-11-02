@@ -6,6 +6,7 @@
 // eventfd (`waitForEvents`); the scheduler waits for a deadline or `interrupt()` (`wait(until:)`).
 import Glibc
 import Synchronization
+import Syscalls
 
 final class EventLoop: SerialExecutor, TaskExecutor {
     /// The epoll instance; a reactor registers its sockets on it.
@@ -32,7 +33,7 @@ final class EventLoop: SerialExecutor, TaskExecutor {
         guard EventLoop.control(epollFD, Sys.EPOLL_CTL_ADD, wakeFD, Sys.EPOLLIN, EventLoop.wakeToken) == 0 else {
             fatalError("epoll_ctl eventfd: \(errno)")
         }
-        startThread(name: name) { [self] in run() }
+        Sys.startThread(name: name) { [self] in run() }
     }
 
     /// epoll_ctl with an event built at the ABI's offsets (see `Sys.epollDataOffset`).
@@ -141,7 +142,7 @@ final class EventLoop: SerialExecutor, TaskExecutor {
             }
             var timeout: Int32 = -1
             if let deadline, deadline != .max {
-                let now = monotonicNanos()
+                let now = Sys.monotonicNanos()
                 timeout = deadline <= now ? 0 : Int32(min((deadline - now + 999_999) / 1_000_000, 60_000))
             }
             // Only the eventfd matters here: a reactor's sockets are read by the reactor's own waitForEvents.
@@ -152,7 +153,7 @@ final class EventLoop: SerialExecutor, TaskExecutor {
                 var value: UInt64 = 0
                 _ = sys_read(wakeFD, &value, 8)
             }
-            if let deadline, deadline != .max, monotonicNanos() >= deadline { interrupt() }
+            if let deadline, deadline != .max, Sys.monotonicNanos() >= deadline { interrupt() }
         }
     }
 }
