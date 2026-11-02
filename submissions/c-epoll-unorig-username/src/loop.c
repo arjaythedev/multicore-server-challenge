@@ -135,7 +135,7 @@ void loop_post(job *j) {
   loop_t *l = &loops[j->loop];
   job *h = atomic_load_explicit(&l->done, memory_order_relaxed);
   do j->next = h;
-  while (!atomic_compare_exchange_weak_explicit(&l->done, &h, j, memory_order_release, memory_order_relaxed));
+  while (!atomic_compare_exchange_weak_explicit(&l->done, &h, j, memory_order_seq_cst, memory_order_relaxed));
   if (!h && atomic_load_explicit(&l->sleeping, memory_order_seq_cst)) {
     uint64_t one = 1;
     if (write(l->ev, &one, 8) < 0) { /* the loop is awake if the counter is full */ }

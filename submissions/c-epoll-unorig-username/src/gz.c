@@ -176,6 +176,7 @@ size_t gz_encode(const uint8_t *in, size_t n, uint8_t *out, size_t limit) {
     st->base = 0;
   }
   uint32_t base = st->base + 65536;
+  st->base = base + (uint32_t)n;  // here, because a response too big for the limit returns early
   uint8_t *o = out;
   static const uint8_t HEAD[10] = {0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255};
   memcpy(o, HEAD, 10);
@@ -235,7 +236,6 @@ size_t gz_encode(const uint8_t *in, size_t n, uint8_t *out, size_t limit) {
     acc >>= 8;
     nacc -= 8;
   }
-  st->base = base + (uint32_t)n;
   uint32_t c = crc32_of(in, n), sz = (uint32_t)n;
   memcpy(o, &c, 4);
   memcpy(o + 4, &sz, 4);
