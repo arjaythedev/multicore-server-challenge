@@ -77,6 +77,11 @@ static void hp(uint32_t v, int n) {
     if ((v >> i) & 1) hdr[hdr_bits >> 3] |= 1 << (hdr_bits & 7);
 }
 
+static uint32_t crc32_of(const uint8_t *p, size_t n);
+#if defined(__x86_64__)
+static bool have_clmul;
+#endif
+
 void gz_init(void) {
   for (uint32_t i = 0; i < 256; i++) {
     uint32_t c = i;
@@ -97,6 +102,18 @@ void gz_init(void) {
       else dist_sym[256 + ((x - 1) >> 7)] = d;
     }
   }
+#if defined(__x86_64__)
+  {  // Trusted only if it agrees with the tables on this CPU.
+    uint8_t t[997];
+    for (int i = 0; i < 997; i++) t[i] = (uint8_t)(i * 31 + 7);
+    uint32_t want = crc32_of(t, sizeof t);
+    have_clmul = __builtin_cpu_supports("pclmul") && __builtin_cpu_supports("sse4.1");
+    if (have_clmul && crc32_of(t, sizeof t) != want) {
+      fprintf(stderr, "crc folding disagrees with the tables; using the tables\n");
+      have_clmul = false;
+    }
+  }
+#endif
   build_lengths(GZ_LIT_FREQ, NLIT, lit_len, 15);
   build_lengths(GZ_DIST_FREQ, NDIST, dist_len, 15);
   canon(lit_len, NLIT, lit_code);
@@ -126,8 +143,47 @@ void gz_init(void) {
   for (int i = 0; i < NDIST; i++) hp(cc[dist_len[i]], cl[dist_len[i]]);
 }
 
+#if defined(__x86_64__)
+// Carry-less folding: the same CRC with no 8 KB of tables to fault into a cold cache.
+__attribute__((target("pclmul,sse4.1"))) static uint32_t crc_fold(const uint8_t *p, size_t *np, uint32_t crc) {
+  size_t n = *np;
+  __m128i k = _mm_set_epi64x(0x00ccaa009e, 0x01751997d0);
+  __m128i x = _mm_xor_si128(_mm_loadu_si128((const __m128i *)p), _mm_cvtsi32_si128((int)crc));
+  p += 16;
+  n -= 16;
+  while (n >= 16) {
+    __m128i lo = _mm_clmulepi64_si128(x, k, 0x00);
+    x = _mm_clmulepi64_si128(x, k, 0x11);
+    x = _mm_xor_si128(_mm_xor_si128(x, lo), _mm_loadu_si128((const __m128i *)p));
+    p += 16;
+    n -= 16;
+  }
+  *np = n;
+  __m128i m = _mm_setr_epi32(~0, 0, ~0, 0);
+  __m128i t = _mm_clmulepi64_si128(x, k, 0x10);
+  x = _mm_xor_si128(_mm_srli_si128(x, 8), t);
+  t = _mm_srli_si128(x, 4);
+  x = _mm_clmulepi64_si128(_mm_and_si128(x, m), _mm_set_epi64x(0, 0x0163cd6124), 0x00);
+  x = _mm_xor_si128(x, t);
+  __m128i poly = _mm_set_epi64x(0x01f7011641, 0x01db710641);
+  t = _mm_clmulepi64_si128(_mm_and_si128(x, m), poly, 0x10);
+  t = _mm_clmulepi64_si128(_mm_and_si128(t, m), poly, 0x00);
+  return (uint32_t)_mm_extract_epi32(_mm_xor_si128(x, t), 1);
+}
+#endif
+
 static uint32_t crc32_of(const uint8_t *p, size_t n) {
   uint32_t c = 0xFFFFFFFFu;
+#if defined(__x86_64__)
+  if (have_clmul && n >= 32) {
+    size_t left = n;
+    c = crc_fold(p, &left, c);
+    p += n - left;
+    n = left;
+    while (n--) c = crc_tab[0][(c ^ *p++) & 255] ^ (c >> 8);
+    return ~c;
+  }
+#endif
   while (n >= 8) {
     uint64_t v;
     memcpy(&v, p, 8);
@@ -141,7 +197,7 @@ static uint32_t crc32_of(const uint8_t *p, size_t n) {
   return ~c;
 }
 
-#define HBITS 12
+#define HBITS 11
 #define HSIZE (1 << HBITS)
 typedef struct {
   uint32_t t[HSIZE];

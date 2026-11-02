@@ -179,7 +179,7 @@ static void process_input(loop_t *l, int fd, const char *p, size_t n);
 // Writes a whole response, taking over the caller's reference; keeps it for EPOLLOUT if the socket is full.
 static void conn_send(loop_t *l, int fd, resp_t *r, bool close_after) {
   conn_t *c = &l->conns[fd];
-  ssize_t w = write(fd, r->data, r->len);
+  ssize_t w = send(fd, r->data, r->len, MSG_DONTWAIT | MSG_NOSIGNAL);
   if (w == (ssize_t)r->len) {
     resp_unref(r);
     if (close_after) conn_close(l, fd);
@@ -969,7 +969,7 @@ static void on_readable(loop_t *l, int fd) {
       c->in_cap = c->in_n + RD_BUF;
       c->in = realloc(c->in, c->in_cap);
     }
-    ssize_t r = read(fd, c->in + c->in_n, c->in_cap - c->in_n);
+    ssize_t r = recv(fd, c->in + c->in_n, c->in_cap - c->in_n, MSG_DONTWAIT);
     if (r == 0 || (r < 0 && errno != EAGAIN && errno != EINTR)) {
       conn_close(l, fd);
       return;
@@ -986,7 +986,7 @@ static void on_readable(loop_t *l, int fd) {
     }
     return;
   }
-  ssize_t r = read(fd, l->rd, RD_BUF);
+  ssize_t r = recv(fd, l->rd, RD_BUF, MSG_DONTWAIT);
   if (r == 0 || (r < 0 && errno != EAGAIN && errno != EINTR)) {
     conn_close(l, fd);
     return;
@@ -1007,7 +1007,7 @@ static void on_writable(loop_t *l, int fd) {
     set_out(l, fd, false);
     return;
   }
-  ssize_t w = write(fd, c->out->data + c->out_off, c->out->len - c->out_off);
+  ssize_t w = send(fd, c->out->data + c->out_off, c->out->len - c->out_off, MSG_DONTWAIT | MSG_NOSIGNAL);
   if (w < 0 && errno != EAGAIN && errno != EINTR) {
     conn_close(l, fd);
     return;

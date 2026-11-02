@@ -1190,7 +1190,7 @@ static lane_t lanes[NLANES];
 static pthread_mutex_t q_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t q_cv;
 static int waiting, inflight, read_cap = 6, lane_on = 1;
-#define MAX_BATCH 4096
+#define MAX_BATCH 65536
 
 void read_enqueue(job *j) {
   j->next = NULL;
@@ -1339,9 +1339,9 @@ void reads_start(int n) {
   pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
   pthread_cond_init(&q_cv, &ca);
   const char *e;
-  lanes[LANE_SHARED].gap = (e = getenv("GAP_SHARED_US")) ? atoll(e) : 80000;
-  lanes[LANE_FEED].gap = (e = getenv("GAP_FEED_US")) ? atoll(e) : 80000;
-  lanes[LANE_COMMENT].gap = (e = getenv("GAP_COMMENT_US")) ? atoll(e) : 100000;
+  lanes[LANE_SHARED].gap = (e = getenv("GAP_SHARED_US")) ? atoll(e) : 160000;
+  lanes[LANE_FEED].gap = (e = getenv("GAP_FEED_US")) ? atoll(e) : 160000;
+  lanes[LANE_COMMENT].gap = (e = getenv("GAP_COMMENT_US")) ? atoll(e) : 160000;
   if ((e = getenv("HUB_EST"))) hub_est = atoll(e);
   if ((e = getenv("READ_CAP"))) read_cap = atoi(e);
   if ((e = getenv("READ_LANES"))) lane_on = atoi(e);
