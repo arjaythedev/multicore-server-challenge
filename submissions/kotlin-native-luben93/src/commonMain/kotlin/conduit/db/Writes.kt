@@ -118,19 +118,23 @@ internal class WriteWorker(pool: WritePool, index: Int) : Worker(pool, index) {
         }
     }
 
-    /** BEGIN, jobs, COMMIT, Sync. Statement s: 0 = BEGIN, 1..g = jobs, g+1 = COMMIT. */
+    /**
+     * BEGIN, jobs, COMMIT, Sync (statement s: 0 = BEGIN, 1..g = jobs, g+1 = COMMIT), or with [WritePool.implicitTx] the jobs
+     * and one Sync (s: 0..g-1 = jobs; the pipeline up to Sync is one implicit transaction that commits at the Sync).
+     */
     private fun readGroup(c: PgConn, t: WriteTrip): Int {
         val first = t.nIso
         val g = t.n - first
+        val lead = if (WritePool.implicitTx) 0 else 1 // statements before the first job
         var s = 0
         var err: PgError? = null
         var errAt = -1
         while (true) {
             val m = c.next()
             if (m == 'D'.code) {
-                if (err == null && s in 1..g) t.jobs[first + s - 1]!!.res.addRow(c.rbuf, c.mstart)
+                if (err == null && s >= lead && s < lead + g) t.jobs[first + s - lead]!!.res.addRow(c.rbuf, c.mstart)
             } else if (m == 'C'.code) {
-                if (s in 1..g) t.jobs[first + s - 1]!!.res.affected = c.tagCount()
+                if (s >= lead && s < lead + g) t.jobs[first + s - lead]!!.res.affected = c.tagCount()
                 s++
             } else if (m == 'E'.code) {
                 if (err == null) {
@@ -146,7 +150,7 @@ internal class WriteWorker(pool: WritePool, index: Int) : Worker(pool, index) {
             for (j in first until t.n) t.jobs[j]!!.settled = true
             return status
         }
-        if (errAt == g + 1) {
+        if (errAt == lead + g) {
             // COMMIT itself failed: the outcome is not ours to guess, so nothing is retried
             for (j in first until t.n) {
                 val job = t.jobs[j]!!
@@ -162,14 +166,16 @@ internal class WriteWorker(pool: WritePool, index: Int) : Worker(pool, index) {
         wpool.lock.locked { wpool.reruns++ }
         val o = c.out
         o.reset()
-        o.put(wpool.runtime.rollbackExec)
-        o.sync()
+        if (!WritePool.implicitTx) {
+            o.put(wpool.runtime.rollbackExec)
+            o.sync()
+        }
         for (j in first until t.n) {
             wpool.encodeJob(o, t.jobs[j]!!)
             o.sync()
         }
         c.send()
-        while (c.next() != 'Z'.code) {
+        if (!WritePool.implicitTx) while (c.next() != 'Z'.code) {
             // ROLLBACK's BindComplete / CommandComplete
         }
         var st = 'I'.code
@@ -313,9 +319,9 @@ internal class WritePool(
             encodeJob(o, t.jobs[t.nIso]!!)
             o.sync()
         } else if (g > 1) {
-            o.put(runtime.beginExec)
+            if (!implicitTx) o.put(runtime.beginExec)
             for (j in t.nIso until t.n) encodeJob(o, t.jobs[j]!!)
-            o.put(runtime.commitExec)
+            if (!implicitTx) o.put(runtime.commitExec)
             o.sync()
         }
     }
@@ -367,6 +373,12 @@ internal class WritePool(
     }
 
     companion object {
+        /**
+         * WRITE_IMPLICIT_TX (default on; 0 = explicit BEGIN / COMMIT around a group): a group is its jobs and one Sync, which is
+         * one implicit transaction (a failed statement skips the rest up to the Sync and rolls everything back), two statements
+         * fewer per round trip. Set once at startup.
+         */
+        @JvmField var implicitTx = false
         const val MAX_GROUP = 64
         const val MAX_ISOLATED = 16
         const val MAX_TRIP = MAX_GROUP + MAX_ISOLATED

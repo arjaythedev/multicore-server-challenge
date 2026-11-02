@@ -23,6 +23,7 @@ import kotlinx.cinterop.value
 import platform.posix.AF_INET
 import platform.posix.CLOCK_MONOTONIC
 import platform.posix.CLOCK_REALTIME
+import platform.posix.EAGAIN
 import platform.posix.EINTR
 import platform.posix.IPPROTO_TCP
 import platform.posix.MSG_NOSIGNAL
@@ -270,8 +271,11 @@ actual class Monitor actual constructor() {
     }
 }
 
-/** Seconds a Postgres socket may block in recv, send or connect (no query of the app takes anywhere near this). */
-private const val PG_IO_TIMEOUT_S = 15L
+/**
+ * Seconds a Postgres socket may block in recv, send or connect (no query of the app takes anywhere near this).
+ * PG_IO_TIMEOUT_S overrides it (tests).
+ */
+private val PG_IO_TIMEOUT_S: Long = platform.posix.getenv("PG_IO_TIMEOUT_S")?.toKString()?.trim()?.toLongOrNull()?.coerceAtLeast(1L) ?: 15L
 
 actual class BlockingSocket private constructor(private val fd: Int) {
     private val closed = AtomicInt(0)
@@ -283,6 +287,7 @@ actual class BlockingSocket private constructor(private val fd: Int) {
             if (r > 0) return r.toInt()
             if (r == 0L) return -1
             val e = errno
+            if (e == EAGAIN) throw SocketReadTimeout("recv timed out")
             if (e != EINTR) throw IllegalStateException("recv: ${strerror(e)?.toKString()}")
         }
     }
