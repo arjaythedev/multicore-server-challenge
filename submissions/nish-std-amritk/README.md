@@ -3,9 +3,11 @@
 Front: direct
 
 An update of this submission, scored at 91,000 users in #83 (`3de991e`),
-100,000 in #116 (`6e69d72`) and 140,000 in #159 (`6cdf1fd`), on the same
-design. Since #159: one read service holds every read plan of the box, plans
-hold up to 2,048 reads over a 40 ms window, each author of a plan is read once,
+100,000 in #116 (`6e69d72`), 140,000 in #159 (`6cdf1fd`) and 180,000 in
+#189 (`76a40a5`), on the same design. Since #189: each plan group's
+statements run on two connections side by side, and plans hold up to 4,096
+reads over a 60 ms window instead of 2,048 over 40 ms. Since #159: one read
+service holds every read plan of the box, each author of a plan is read once,
 a feed no longer asks whether its viewer follows the authors it was built
 from, a login's check waits 80 ms for company instead of 160, bcrypt always
 runs six lanes, and delayed ACKs are left to the kernel. Since #116,
@@ -132,8 +134,8 @@ and four on the box), and
   Nothing outlives its plan: every value in an answer was read from
   Postgres while that request waited, and a plan takes only the requests
   already waiting when it starts.
-- **Batch clock.** A plan starts when 2,048 reads wait (a full plan) or when
-  the oldest has waited 40 ms, and up to 20 are in
+- **Batch clock.** A plan starts when 4,096 reads wait (a full plan) or when
+  the oldest has waited 60 ms, and up to 20 are in
   flight at the read service, on 12 connections. Started at once instead, a plan is whatever arrived
   during the last one's two round trips, about 17 requests at the load
   measured below, and Postgres pays its fixed costs and reads the same
@@ -153,9 +155,20 @@ and four on the box), and
   requests (below), plans of up to 1,024 over 25 ms took Postgres and the
   server from 61.1 µs a request to 56.0, for about 20 ms of p95; 2,048 over
   40 ms took the saturated run below from 57.2 to 54.8 and 53.8 in two runs.
+  At 230,000 users, 4,096 over 60 ms took Postgres from about 31 µs a
+  request to 29.6 and, with the two lanes below, p95 from 511 ms to 459.
   Nish's `PgBatcher` takes at most 1,024 keys, so a plan takes at most that
   many articles, comment threads or profiles by key, and a read past them
   waits for the next plan.
+- **A plan's statements in two lanes.** Only about three of a plan's
+  statements were running in Postgres at any moment, because a plan's
+  group ran its statements one after another on one connection while other
+  connections sat idle, so a read waited the sum of them. Each group now
+  runs as two halves on two connections side by side: group A's feeds, its
+  costliest statement, beside everything else, and group B's articles
+  beside the flags and authors. When the pool can give only one connection,
+  both halves run on it as before. The same CPU, less waiting: at 230,000
+  users, saturated, p95 went from 553 ms to 511.
 - **Each author once.** `plan_meta` and `plan_comments` no longer join `users`
   row by row: a plan collects the distinct authors of its articles and
   comments, reads them with one `plan_users` statement, and writes each
@@ -290,7 +303,7 @@ Optional process settings, with their defaults: `HTTP_WORKERS` (a quarter of the
 CPUs, at least 2),
 `DB_READ_CONNS` (6) and `DB_WRITE_CONNS` (1) per worker, `DB_MAX_IN_FLIGHT`
 (16), `DB_READ_PLANS` (10) read plans in flight per worker,
-`READ_PLAN_WAIT_US` (40000) and `READ_PLAN_MIN` (2048) for the batch clock,
+`READ_PLAN_WAIT_US` (60000) and `READ_PLAN_MIN` (4096) for the batch clock,
 `READ_PLAN_CLOCK` (1; 0 starts a plan at once while none is in flight, 2
 is adaptive) and `READ_PLAN_LIGHT` (32), `BCRYPT_WORKERS` (half the CPUs,
 at least 2), `BCRYPT_BATCH_MS` (80) and `BCRYPT_HASH_MS` (20),
@@ -332,9 +345,17 @@ machine's, about a third of the official box's.
 | `a24c18d` | 190,000 | PASS | 47,856 | 275 ms | 327 ms | 31.5 + 22.3 |
 | `a24c18d` | 210,000 | PASS | 51,129 | 450 ms | 552 ms | 31.0 + 23.5 |
 | `a24c18d` | 230,000 | FAIL | 46,967 | 1,483 ms | 1,828 ms | 28.7 + 28.6 |
-| this one | 230,000 | FAIL | 55,073 | 579 ms | 697 ms | 31.4 + 22.2 |
-| this one, again | 230,000 | FAIL | 55,436 | 537 ms | 639 ms | 30.8 + 21.9 |
+| `cf7a78f` | 230,000 | FAIL | 55,073 | 579 ms | 697 ms | 31.4 + 22.2 |
+| `cf7a78f`, again | 230,000 | FAIL | 55,436 | 537 ms | 639 ms | 30.8 + 21.9 |
+| this one | 230,000 | PASS | 56,049 | 459 ms | 539 ms | 29.6 + 21.7 |
+| this one, again | 230,000 | PASS | 55,814 | 482 ms | 578 ms | 29.6 + 21.9 |
 | rust-epoll-theCatWisel (#154), for scale | 210,000 | PASS | 54,390 | 149 ms | 195 ms | 35.7 + 14.8 |
+
+This rig ranks builds; it does not predict the score. `cf7a78f` (#189 as
+merged) scored 180,000 officially, at 77% of the box's CPU, so officially
+this server ran out of time before it ran out of CPU. That is why this
+update goes after waiting: in a plan's statements, which ran one after
+another, more than in its CPU.
 
 On a Xeon Platinum 8260 VM with 8 vCPU and 16 GB (Postgres 18 and `box/`'s
 setup), 5-minute holds from a separate load box, alternating the builds, on a
@@ -344,8 +365,10 @@ fresh copy of the seed each time; CPU from `/proc` over a minute of the hold:
 |---|--:|---|--:|--:|--:|---|--:|
 | `91dd6fd`, two holds | 175,000 | PASS, PASS | 44,333–44,450 | 298–305 ms | 422–431 ms | 78.9–79.2 + 72.0–77.5 | 84–87% |
 | `a24c18d`, two holds | 175,000 | PASS, PASS | 43,943–43,971 | 340–383 ms | 462–632 ms | 73.6–74.0 + 71.8–73.0 | 81% |
+| `a24c18d`, two more holds (alternated with the next row) | 175,000 | PASS, PASS | 43,563–43,648 | 424–426 ms | 585–610 ms | 69.7–70.9 + 72.3–74.7 | 78–80% |
+| `cf7a78f`, two holds | 175,000 | PASS, PASS | 44,053–44,083 | 349–414 ms | 532–616 ms | 72.9–76.0 + 69.9–71.5 | 79–82% |
 | `a24c18d`, two holds past the VM's limit | 185,000 | FAIL, FAIL | 42,554–45,117 | 859–1,881 ms | 2,439–5,489 ms | 72.4–74.0 + 72.6–88.4 | 83–86% |
-| this one, two holds past the VM's limit | 185,000 | FAIL, FAIL | 44,126–45,194 | 886–1,652 ms | 2,431–4,395 ms | 74.9–76.8 + 73.4–77.4 | 84–86% |
+| `cf7a78f`, two holds past the VM's limit | 185,000 | FAIL, FAIL | 44,126–45,194 | 886–1,652 ms | 2,431–4,395 ms | 74.9–76.8 + 73.4–77.4 | 84–86% |
 
 The window's extra wait shows as p95 while the box has room. At 185,000 the
 two builds' holds overlap: past the VM's limit its load box runs out of local

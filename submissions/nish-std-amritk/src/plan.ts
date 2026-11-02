@@ -57,8 +57,8 @@ const KINDS: i32 = 9
 const TAG_ID_MAX: i32 = 1048576
 
 /** The most requests one plan takes, and the most bytes of keys. */
-export const PLAN_MAX: i32 = 2048
-export const PLAN_KEY_BYTES: i32 = 196608
+export const PLAN_MAX: i32 = 4096
+export const PLAN_KEY_BYTES: i32 = 393216
 /** The most distinct articles, comment threads or profiles a plan reads by key: nish's `PgBatcher` takes 1,024. */
 const BATCH_MAX: i32 = 1024
 
@@ -83,8 +83,8 @@ const S_FLAGS: i32 = 101
 const S_USERS: i32 = 102
 
 /** The hash tables: a power of two at least twice what they hold. */
-const TABLE: i32 = 8192
-const ID_TABLE: i32 = 65536
+const TABLE: i32 = 16384
+const ID_TABLE: i32 = 131072
 /**
  * The size the article, author, ask and flag tables start each plan at. They
  * double while they hold more than half of it, up to `ID_TABLE`: a plan's
@@ -400,9 +400,15 @@ export class ReadPlan {
   private readonly askTable: i32[]
   private askMask: i32 = 4095
   /** Group A's statements in the order bound, and how many have completed; whether a statement failed. */
-  readonly stmts: i32[]
-  stmtCount: i32 = 0
-  stmtDone: i32 = 0
+  /**
+   * A group's statements by lane: lane 0 and lane 1 each run on a connection
+   * of their own, side by side, and lane 2 is both on one connection, for
+   * when the pool had only one to give. `laneStmts[lane * KINDS + k]`, with
+   * each lane's count bound and count done.
+   */
+  readonly laneStmts: i32[]
+  readonly laneCount: i32[]
+  readonly laneDone: i32[]
   failed: boolean = false
   /** `tagRanks`'s walk over a row's tag ids, on a decoder of its own so a refused array leaves the connection's `binary.failed` alone. */
   private readonly tagWalk: PgBinaryArray
@@ -521,7 +527,9 @@ export class ReadPlan {
     this.askStart = new Array<i32>(2 * PLAN_MAX + 1)
     this.flagText = new Array<u8>(4096)
     this.askTable = new Array<i32>(ID_TABLE)
-    this.stmts = new Array<i32>(KINDS)
+    this.laneStmts = new Array<i32>(3 * KINDS)
+    this.laneCount = new Array<i32>(3)
+    this.laneDone = new Array<i32>(3)
     this.tagWalk = new PgBinaryArray(new PgBinary())
     this.articles = new PgBatcher(planArticleBatch(BATCH_MAX))
     this.comments = new PgBatcher(planCommentBatch(BATCH_MAX))
@@ -617,8 +625,7 @@ export class ReadPlan {
     this.flagMask = TABLE_START - 1
     this.askMask = TABLE_START - 1
     this.userMask = TABLE_START - 1
-    this.stmtCount = 0
-    this.stmtDone = 0
+    this.clearLanes()
     this.failed = false
     this.articleRun = -1
     this.commentRun = -1
@@ -798,9 +805,49 @@ export class ReadPlan {
 
   // ---- Group A --------------------------------------------------------------------
 
-  /** Binds group A on `conn`; false when a builder call refused (the plan is then failed). */
-  bindA(conn: PgConnection): boolean {
+  private clearLanes(): void {
+    for (let l: i32 = 0; l < 3; l++) {
+      this.laneCount[l] = 0
+      this.laneDone[l] = 0
+    }
+  }
+
+  private laneAdd(lane: i32, stmt: i32): void {
+    this.laneStmts[lane * KINDS + this.laneCount[lane]] = stmt
+    this.laneCount[lane] += 1
+  }
+
+  /** Whether group A has a statement in lane 0 (the feeds) and in lane 1 (the rest): bit 0 and bit 1. */
+  lanesA(): i32 {
+    let named: boolean = this.kindPageN[K_TAGS] > 0 || this.kindPageN[K_ARTICLE] > 0
+    for (let kind: i32 = 0; kind < LIST_KINDS; kind++) {
+      named = named || this.kindPageN[kind] > 0
+    }
+    const rest: boolean = named || this.kindPageN[K_COMMENTS] > 0 || this.kindPageN[K_PROFILE] > 0
+    return (this.kindPageN[K_FEED] > 0 ? 1 : 0) | (rest ? 2 : 0)
+  }
+
+  /** Whether group B has a statement in lane 0 (the articles) and in lane 1 (the flags and authors). */
+  lanesB(): i32 {
+    return (this.metas > 0 ? 1 : 0) | (this.asks > 0 || this.users > 0 ? 2 : 0)
+  }
+
+  /**
+   * Binds lane `lane` of group A on `conn`: 0 the feeds, the costliest list,
+   * 1 everything else, 2 both. False when a builder call refused (the plan is
+   * then failed).
+   */
+  bindA(conn: PgConnection, lane: i32): boolean {
     this.clearKeyTables()
+    if (lane !== 1 && this.kindPageN[K_FEED] > 0) {
+      if (!this.bindList(conn, K_FEED)) {
+        return false
+      }
+      this.laneAdd(lane, K_FEED)
+    }
+    if (lane === 0) {
+      return true
+    }
     // Every tag by name: the tag list's answer, and the names of every article's tags.
     let named: boolean = this.kindPageN[K_TAGS] > 0 || this.kindPageN[K_ARTICLE] > 0
     for (let kind: i32 = 0; kind < LIST_KINDS; kind++) {
@@ -810,42 +857,37 @@ export class ReadPlan {
       if (!conn.bindStart("plan_tags") || !conn.bindEnd()) {
         return false
       }
-      this.stmts[this.stmtCount] = K_TAGS
-      this.stmtCount += 1
+      this.laneAdd(lane, K_TAGS)
     }
     for (let kind: i32 = 0; kind < LIST_KINDS; kind++) {
-      if (this.kindPageN[kind] === 0) {
+      if (kind === K_FEED || this.kindPageN[kind] === 0) {
         continue
       }
       if (!this.bindList(conn, kind)) {
         return false
       }
-      this.stmts[this.stmtCount] = kind
-      this.stmtCount += 1
+      this.laneAdd(lane, kind)
     }
     if (this.kindPageN[K_ARTICLE] > 0) {
       this.articleRun = this.takeSlugs(conn, this.articles, K_ARTICLE)
       if (this.articleRun < 0) {
         return false
       }
-      this.stmts[this.stmtCount] = K_ARTICLE
-      this.stmtCount += 1
+      this.laneAdd(lane, K_ARTICLE)
     }
     if (this.kindPageN[K_COMMENTS] > 0) {
       this.commentRun = this.takeSlugs(conn, this.comments, K_COMMENTS)
       if (this.commentRun < 0) {
         return false
       }
-      this.stmts[this.stmtCount] = K_COMMENTS
-      this.stmtCount += 1
+      this.laneAdd(lane, K_COMMENTS)
     }
     if (this.kindPageN[K_PROFILE] > 0) {
       this.profileRun = this.takeSlugs(conn, this.profiles, K_PROFILE)
       if (this.profileRun < 0) {
         return false
       }
-      this.stmts[this.stmtCount] = K_PROFILE
-      this.stmtCount += 1
+      this.laneAdd(lane, K_PROFILE)
     }
     return true
   }
@@ -983,12 +1025,12 @@ export class ReadPlan {
     return conn.arrayElement(this.keys, this.keyStarts[i], this.keyLens[i])
   }
 
-  /** One event of group A. */
-  eventA(conn: PgConnection, event: i32): void {
-    if (this.stmtDone >= this.stmtCount) {
+  /** One event of lane `lane` of group A. */
+  eventA(conn: PgConnection, event: i32, lane: i32): void {
+    if (this.laneDone[lane] >= this.laneCount[lane]) {
       return
     }
-    const s: i32 = this.stmts[this.stmtDone]
+    const s: i32 = this.laneStmts[lane * KINDS + this.laneDone[lane]]
     if (s === K_ARTICLE || s === K_COMMENTS || s === K_PROFILE) {
       this.slugEvent(conn, event, s)
     } else if (s === K_TAGS) {
@@ -1001,10 +1043,10 @@ export class ReadPlan {
       this.listRow(conn, s)
     }
     if (event === PG_COMPLETE) {
-      this.stmtDone += 1
+      this.laneDone[lane] += 1
     } else if (event === PG_ERROR) {
       this.failed = true
-      this.stmtDone = this.stmtCount
+      this.laneDone[lane] = this.laneCount[lane]
     }
   }
 
@@ -1310,6 +1352,7 @@ export class ReadPlan {
 
   /** After group A: queues the articles of slug reads, and the flags every viewer needs; whether group B has anything to read. */
   planB(): boolean {
+    this.clearLanes()
     this.flagViewerN = 0
     for (let i: i32 = 0; i < this.count; i++) {
       const kind: i32 = this.kinds[i]
@@ -1385,11 +1428,12 @@ export class ReadPlan {
 
   // ---- Group B --------------------------------------------------------------------
 
-  /** Binds group B: the articles, then the flags; false when a builder call refused. */
-  bindB(conn: PgConnection): boolean {
-    this.stmtCount = 0
-    this.stmtDone = 0
-    if (this.metas > 0) {
+  /**
+   * Binds lane `lane` of group B: 0 the articles, 1 the flags and the
+   * authors, 2 all three; false when a builder call refused.
+   */
+  bindB(conn: PgConnection, lane: i32): boolean {
+    if (lane !== 1 && this.metas > 0) {
       if (
         !conn.bindStartBinary("plan_meta") ||
         !conn.paramIntArray(this.metaIds, 0, this.metas) ||
@@ -1408,8 +1452,10 @@ export class ReadPlan {
       if (!conn.bindEnd()) {
         return false
       }
-      this.stmts[this.stmtCount] = S_META
-      this.stmtCount += 1
+      this.laneAdd(lane, S_META)
+    }
+    if (lane === 0) {
+      return true
     }
     if (this.asks > 0) {
       // The asks by viewer and kind, a counting sort: Postgres then takes
@@ -1470,8 +1516,7 @@ export class ReadPlan {
       if (!conn.bindEnd()) {
         return false
       }
-      this.stmts[this.stmtCount] = S_FLAGS
-      this.stmtCount += 1
+      this.laneAdd(lane, S_FLAGS)
     }
     if (this.users > 0) {
       if (
@@ -1481,19 +1526,18 @@ export class ReadPlan {
       ) {
         return false
       }
-      this.stmts[this.stmtCount] = S_USERS
-      this.stmtCount += 1
+      this.laneAdd(lane, S_USERS)
     }
     return true
   }
 
-  /** One event of group B. */
-  eventB(conn: PgConnection, event: i32): void {
-    if (this.stmtDone >= this.stmtCount) {
+  /** One event of lane `lane` of group B. */
+  eventB(conn: PgConnection, event: i32, lane: i32): void {
+    if (this.laneDone[lane] >= this.laneCount[lane]) {
       return
     }
     if (event === PG_ROW) {
-      const stmt: i32 = this.stmts[this.stmtDone]
+      const stmt: i32 = this.laneStmts[lane * KINDS + this.laneDone[lane]]
       if (stmt === S_META) {
         this.metaRow(conn)
       } else if (stmt === S_USERS) {
@@ -1502,10 +1546,10 @@ export class ReadPlan {
         this.flagRow(conn)
       }
     } else if (event === PG_COMPLETE) {
-      this.stmtDone += 1
+      this.laneDone[lane] += 1
     } else if (event === PG_ERROR) {
       this.failed = true
-      this.stmtDone = this.stmtCount
+      this.laneDone[lane] = this.laneCount[lane]
     }
   }
 

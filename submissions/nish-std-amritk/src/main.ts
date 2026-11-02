@@ -15,7 +15,7 @@
 // (the challenge's), and optionally HTTP_WORKERS (a quarter of the CPUs, at least 2), DB_READ_CONNS (6) and
 // DB_WRITE_CONNS (1) per worker, DB_MAX_IN_FLIGHT (16), DB_READ_IN_FLIGHT (4)
 // for the read connections, DB_READ_PLANS (10) read plans in flight
-// per worker, READ_PLAN_MIN (2048), READ_PLAN_WAIT_US (40000) and
+// per worker, READ_PLAN_MIN (4096), READ_PLAN_WAIT_US (60000) and
 // READ_PLAN_CLOCK (1; 2 adaptive, with READ_PLAN_LIGHT 32) for when a plan starts (worker.ts, `planWaitLeft`),
 // BCRYPT_WORKERS (half the CPUs, at least 2), BCRYPT_BATCH_MS (80) for logins
 // and BCRYPT_HASH_MS (20) for sign-ups (bcrypt-service.ts),
@@ -135,8 +135,8 @@ export const main = (): i32 => {
   cfg.maxInFlight = envInt("DB_MAX_IN_FLIGHT", 16)
   cfg.readInFlight = envInt("DB_READ_IN_FLIGHT", 4)
   cfg.readPlans = envInt("DB_READ_PLANS", 10)
-  cfg.planMin = envInt("READ_PLAN_MIN", 2048)
-  cfg.planWaitUs = envInt("READ_PLAN_WAIT_US", 40000)
+  cfg.planMin = envInt("READ_PLAN_MIN", 4096)
+  cfg.planWaitUs = envInt("READ_PLAN_WAIT_US", 60000)
   const clock: string = getenv("READ_PLAN_CLOCK") ?? "1"
   cfg.planClock = clock === "0" ? 0 : clock === "2" ? 2 : 1
   cfg.planLight = envInt("READ_PLAN_LIGHT", 32)

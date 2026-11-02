@@ -540,8 +540,8 @@ export class WorkerConfig {
    * oldest has waited `planWaitUs`: a batch clock. With `planClock` off, the
    * window applies only while another plan is in flight.
    */
-  planMin: i32 = 2048
-  planWaitUs: i32 = 40000
+  planMin: i32 = 4096
+  planWaitUs: i32 = 60000
   /** 0: no clock; 1: the clock; 2: the clock only while at least `planLight` reads come a window. */
   planClock: i32 = 1
   planLight: i32 = 32
@@ -655,7 +655,7 @@ export class ConduitWorker {
   ticketPlan: i32[]
   /** When each read in `planRing` came, in ns, by its place in the ring; and the start policy. */
   planAt: i64[]
-  planMin: i32 = 2048
+  planMin: i32 = 4096
   planWait: i64 = 0
   /** Whether the window gathers reads even while no plan runs: a batch clock (`WorkerConfig.planClock`). */
   planClock: i32 = 1
@@ -1977,9 +1977,9 @@ export class ConduitWorker {
       }
       this.planGroupDone(p)
     } else if (this.planState[p] === PLAN_A) {
-      plan.eventA(conn, event)
+      plan.eventA(conn, event, 2)
     } else {
-      plan.eventB(conn, event)
+      plan.eventB(conn, event, 2)
     }
   }
 
@@ -2042,7 +2042,7 @@ export class ConduitWorker {
             continue
           }
           const plan: ReadPlan = this.plans[pi]
-          const bound: boolean = this.planState[pi] === PLAN_A ? plan.bindA(conn) : plan.bindB(conn)
+          const bound: boolean = this.planState[pi] === PLAN_A ? plan.bindA(conn, 2) : plan.bindB(conn, 2)
           if (!bound) {
             // The statements bound still run; the plan's requests go alone once they have.
             plan.failed = true

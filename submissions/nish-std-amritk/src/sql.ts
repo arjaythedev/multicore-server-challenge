@@ -498,9 +498,9 @@ const planBatch = (name: string, select: string, orderBy: string, maxRequests: i
   c.binary = true
   c.maxRequests = maxRequests
   // A plan's keys are at most PLAN_KEY_BYTES, each escaped at worst to twice its length.
-  c.maxBytes = 524288
+  c.maxBytes = 1048576
   c.queueSize = maxRequests
-  c.queueBytes = 524288
+  c.queueBytes = 1048576
   // One execution a plan; a second run would be a plan's failed take, made again empty.
   c.runs = 2
   return c
