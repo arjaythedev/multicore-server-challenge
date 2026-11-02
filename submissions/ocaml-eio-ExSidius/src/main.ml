@@ -4,7 +4,54 @@ let getenv k default = match Sys.getenv_opt k with Some v when v <> "" -> v | _ 
 let getenv_int k default = int_of_string (getenv k (string_of_int default))
 let queue_depth = 4096
 
-let serve ~host ~port ~db ~pool_size ~secret ~lanes ~workers ~list_fibers domain env : unit =
+let open_files_limit () =
+  let ic = open_in "/proc/self/limits" in
+  Fun.protect
+    ~finally:(fun () -> close_in_noerr ic)
+    (fun () ->
+      let rec find () =
+        let line = input_line ic in
+        if String.starts_with ~prefix:"Max open files" line then
+          Scanf.sscanf (String.sub line 14 (String.length line - 14)) " %s" int_of_string_opt
+        else find ()
+      in
+      find ())
+
+(* Connections stop being accepted a little below the limit, because logins and Postgres reconnects need descriptors
+   too. Past that, new connections wait in the kernel's accept queue: an overloaded server should slow down, not exit. *)
+let max_connections () =
+  match open_files_limit () with
+  | Some limit -> max 1 (limit - min 2048 (limit / 4))
+  | None | (exception (Sys_error _ | End_of_file | Scanf.Scan_failure _ | Failure _)) -> max_int
+
+let connections = Atomic.make 0
+
+let accept_loop ~sw ~clock ~limit sock handle =
+  let on_error e = Printf.eprintf "connection error: %s\n%!" (Printexc.to_string e) in
+  let last_report = ref 0. in
+  let back_off why =
+    let now = Unix.gettimeofday () in
+    if now -. !last_report >= 1. then begin
+      last_report := now;
+      Printf.eprintf "accept paused: %s (%d connections)\n%!" why (Atomic.get connections)
+    end;
+    Eio.Time.sleep clock 0.05
+  in
+  while true do
+    if Atomic.get connections >= limit then back_off "at the connection limit"
+    else
+      try
+        Eio.Net.accept_fork ~sw sock ~on_error (fun flow _ ->
+            Atomic.incr connections;
+            Fun.protect ~finally:(fun () -> Atomic.decr connections) (fun () -> handle flow))
+      with
+      (* The client gave up while queued. *)
+      | Eio.Io (Eio.Exn.X (Eio_unix.Unix_error ((ECONNABORTED | EINTR | EAGAIN), _, _)), _) -> ()
+      (* Out of descriptors or memory, or a network error accept passed on: none is worth losing every connection for. *)
+      | Eio.Io _ as e -> back_off (Printexc.to_string e)
+  done
+
+let serve ~host ~port ~db ~pool_size ~secret ~lanes ~workers ~list_fibers ~watch_load ~limit domain env : unit =
   Eio.Switch.run @@ fun sw ->
   let net = Eio.Stdenv.net env in
   let app = App.{ pool = Pg.create_pool ~size:pool_size db; secret; lanes } in
@@ -42,14 +89,12 @@ let serve ~host ~port ~db ~pool_size ~secret ~lanes ~workers ~list_fibers domain
     lanes;
   Eio.Fiber.fork ~sw (fun () ->
       Stats.reporter ~clock ~domain ~pool_free:(fun () -> Eio.Stream.length app.pool.q));
-  let on_error e = Printf.eprintf "connection error: %s\n%!" (Printexc.to_string e) in
-  while true do
-    Eio.Net.accept_fork ~sw sock ~on_error (fun flow _ ->
-        (match Eio_unix.Resource.fd_opt flow with
-        | Some fd -> Eio_unix.Fd.use_exn "nodelay" fd (fun fd -> Unix.setsockopt fd Unix.TCP_NODELAY true)
-        | None -> ());
-        Http.serve flow (App.handle app))
-  done
+  if domain = 1 then Eio.Fiber.fork ~sw (fun () -> watch_load ~clock);
+  accept_loop ~sw ~clock ~limit sock (fun flow ->
+      (match Eio_unix.Resource.fd_opt flow with
+      | Some fd -> Eio_unix.Fd.use_exn "nodelay" fd (fun fd -> Unix.setsockopt fd Unix.TCP_NODELAY true)
+      | None -> ());
+      Http.serve flow (App.handle app))
 
 (* The box doesn't restart anything: a dead worker takes the whole server down, visibly. *)
 let die e =
@@ -64,11 +109,18 @@ let () =
   let workers = max 1 (getenv_int "WORKERS" 6) in
   let pool_size = max 1 (getenv_int "PG_CONNECTIONS" 30 / workers) in
   Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
-  let window = float (getenv_int "BATCH_WINDOW_MS" 150) /. 1000. in
+  let window_max = float (getenv_int "BATCH_WINDOW_MS" 150) /. 1000. in
+  let window_min = Float.min window_max (float (getenv_int "BATCH_WINDOW_MIN_MS" 15) /. 1000.) in
+  let busy_low = float (getenv_int "BATCH_BUSY_LOW_PCT" 55) /. 100. in
+  let busy_high = float (getenv_int "BATCH_BUSY_HIGH_PCT" 80) /. 100. in
+  Atomic.set Load.current window_min;
+  let watch_load ~clock : unit =
+    Load.run ~clock ~low:window_min ~high:window_max ~busy_low ~busy_high
+  in
   let lanes =
-    if window <= 0. then None
+    if window_max <= 0. then None
     else
-      let lane name = Batch.create ~name ~window in
+      let lane name = Batch.create ~name ~window:Load.window in
       Some
         App.
           {
@@ -90,7 +142,8 @@ let () =
           }
   in
   let list_fibers = max 1 (getenv_int "LIST_LANE_FIBERS" 2) in
-  let serve = serve ~host ~port ~db ~pool_size ~secret ~lanes ~workers ~list_fibers in
+  let limit = max_connections () in
+  let serve = serve ~host ~port ~db ~pool_size ~secret ~lanes ~workers ~list_fibers ~watch_load ~limit in
   try
     Bcrypt.start
       ~threads:(max 1 (getenv_int "BCRYPT_THREADS" 2))

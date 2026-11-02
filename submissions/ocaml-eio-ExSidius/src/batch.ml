@@ -1,5 +1,5 @@
 (* A lane batches requests of one kind from every domain into one execution. Its fibers take turns collecting: one
-   takes whatever is waiting, lets more arrive until the oldest request has waited [window] seconds, and runs them as
+   takes whatever is waiting, lets more arrive until the oldest request has waited the current window (see load.ml), and runs them as
    one statement on its own connection, while the next fiber starts collecting. So a slow statement doesn't hold up
    the requests behind it unless every fiber is busy. Only requests already queued when the statement starts share
    it, and nothing is kept afterwards. *)
@@ -8,7 +8,7 @@ type ('a, 'b) job = { input : 'a; reply : ('b, exn) result Eio.Promise.u; queued
 type ('a, 'b) t = {
   q : ('a, 'b) job Eio.Stream.t;
   collecting : Eio.Semaphore.t;
-  window : float;
+  window : unit -> float;
   name : string;
 }
 
@@ -34,7 +34,7 @@ let run t ~clock ~url f =
         ~finally:(fun () -> Eio.Semaphore.release t.collecting)
         (fun () ->
           let first = Eio.Stream.take t.q in
-          let left = first.queued +. t.window -. Unix.gettimeofday () in
+          let left = first.queued +. t.window () -. Unix.gettimeofday () in
           if left > 0. then Eio.Time.sleep clock left;
           first :: drain t.q [])
     in
@@ -60,9 +60,10 @@ let run t ~clock ~url f =
       let t1 = Stats.now () in
       busy := !busy +. (t1 -. t0);
       if t1 -. !last >= 1. then begin
-        Printf.eprintf "batch lane=%s runs=%d jobs=%d avg=%.1f ms=%.1f\n%!" t.name !runs !jobs_n
+        Printf.eprintf "batch lane=%s runs=%d jobs=%d avg=%.1f ms=%.1f window=%.1f\n%!" t.name !runs !jobs_n
           (float !jobs_n /. float !runs)
-          (1000. *. !busy /. float !runs);
+          (1000. *. !busy /. float !runs)
+          (1000. *. t.window ());
         jobs_n := 0;
         runs := 0;
         busy := 0.;

@@ -5,7 +5,8 @@
 #   dev/aws/aws.sh status              # instances, and what's running
 #   dev/aws/aws.sh up | down           # start or stop both instances (stopped instances don't bill for CPU)
 #   dev/aws/aws.sh test                # sync, build, conformance on the full seed
-#   dev/aws/aws.sh search <label> [start-users]   # sync, then a full search with telemetry, detached on the load box
+#   dev/aws/provision.sh               # create both instances from nothing, if they're gone
+#   dev/aws/aws.sh search <label> [start-users]   # sync, then a full search with telemetry, detached on the load box (STATS=1 adds the app's counters)
 #   dev/aws/aws.sh fetch <label>       # copy that run's results and telemetry to dev/results/aws/<label>
 #   dev/aws/aws.sh pgprofile <label> [users]      # fixed load with pg_stat_statements and perf; prints the profile
 #   dev/aws/aws.sh hold <label> <users>           # conformance, fresh database, then a 5-minute hold with no profilers
@@ -86,7 +87,8 @@ case "${1:-}" in
     URLS=$(target_urls); sync_and_build
     on_target "sudo pkill -f '^bash /opt/conduit-tools/telemetry' || true
       sudo mkdir -p /etc/systemd/system/challenge.service.d
-      printf '[Service]\nEnvironment=CONDUIT_STATS=1\n' | sudo tee /etc/systemd/system/challenge.service.d/stats.conf >/dev/null
+      sudo rm -f /etc/systemd/system/challenge.service.d/stats.conf
+      if [ '${STATS:-0}' = 1 ]; then printf '[Service]\nEnvironment=CONDUIT_STATS=1\n' | sudo tee /etc/systemd/system/challenge.service.d/stats.conf >/dev/null; fi
       sudo systemctl daemon-reload
       sudo setsid nohup /opt/conduit-tools/telemetry.sh /root/telemetry/$LABEL >/dev/null 2>&1 </dev/null & disown"
     PRIVATE=$(instance multicore-target PrivateIpAddress)
@@ -129,5 +131,5 @@ case "${1:-}" in
     rsync -az -e "ssh ${SSH_OPTS[*]}" --rsync-path="sudo rsync" "ubuntu@$TARGET:/root/telemetry/$LABEL/" "$DEST/telemetry/"
     on_target "sudo journalctl -u challenge --since '-24h' -o cat --no-pager | grep '^stats ' || true" > "$DEST/telemetry/app_stats.txt"
     echo "$DEST" ;;
-  *) sed -n 2,10p "$0"; exit 2 ;;
+  *) sed -n 2,11p "$0"; exit 2 ;;
 esac
