@@ -29,7 +29,7 @@ export const ANSWER_TAIL: i32 = 8
 export const ANSWER_ALONE: i32 = 1
 
 const READ_RING: i32 = 1048576
-const ANSWER_RING: i32 = 8388608
+const ANSWER_RING: i32 = 16777216
 /** The longest answer the rings carry; a longer one is read alone by its worker. */
 export const ANSWER_MAX: i32 = 1048576
 /** The service's sleep flag, then one a worker, each with a cache line. */

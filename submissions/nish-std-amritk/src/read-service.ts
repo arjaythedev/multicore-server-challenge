@@ -52,6 +52,8 @@ const S_A: i32 = 3
 const S_B: i32 = 4
 /** Group B has ended and the plan waits only for its count run. */
 const S_COUNT: i32 = 5
+/** The plan's answers are going to the workers; a worker's full ring holds the rest back. */
+const S_SEND: i32 = 6
 /** How long an answer waits for room in a worker's ring, in ns, before that worker counts as stuck. */
 const STUCK_NS: i64 = 5000000000
 const WORKER_TAGS: i32 = 16
@@ -91,6 +93,10 @@ export class ReadService {
   /** Per plan: it waits for a count run still, and its connection was lost meanwhile. */
   counting: boolean[]
   lost: boolean[]
+  /** Per plan in S_SEND: the next answer to send, and since when a full ring has held it back (0: none has). */
+  sendNext: i32[]
+  sendHeld: i64[]
+  sending: i32 = 0
   planMin: i32
   planWait: i64
   /** A read popped that its plan had no room for, and its worker; the next ring to look at. */
@@ -117,11 +123,15 @@ export class ReadService {
     this.state = []
     this.counting = []
     this.lost = []
+    this.sendNext = []
+    this.sendHeld = []
     for (let k: i32 = 0; k < (cfg.readPlans > 0 ? cfg.readPlans : 1); k++) {
       this.plans.push(new ReadPlan())
       this.state.push(S_FREE)
       this.counting.push(false)
       this.lost.push(false)
+      this.sendNext.push(0)
+      this.sendHeld.push(toI64(0))
     }
     const noTypes: i32[] = []
     this.pool.register(this.plans[0].articles.name, this.plans[0].articles.sql, noTypes)
@@ -159,6 +169,10 @@ export class ReadService {
         wait = ms < wait ? ms : wait
       } else if (this.open >= 0) {
         wait = 0
+      }
+      if (this.sending > 0) {
+        // A worker drains its ring every turn, paced: look again in a millisecond.
+        wait = wait < 1 ? wait : 1
       }
       link.sleeping()
       if (this.take()) {
@@ -259,6 +273,13 @@ export class ReadService {
   }
 
   pump(): void {
+    if (this.sending > 0) {
+      for (let p: i32 = 0; p < toI32(this.state.length); p++) {
+        if (this.state[p] === S_SEND) {
+          this.send(p)
+        }
+      }
+    }
     this.take()
     if (this.open >= 0 && (this.plans[this.open].count >= this.planMin || this.waitLeft() === 0)) {
       this.state[this.open] = S_DUE
@@ -421,10 +442,26 @@ export class ReadService {
     run.reset()
   }
 
-  /** Sends every answer of plan `p` to its worker and frees the plan. */
+  /** Sends plan `p`'s answers to its workers, and frees the plan once all have gone. */
   finish(p: i32, lost: boolean): void {
+    this.lost[p] = lost
+    this.sendNext[p] = 0
+    this.sendHeld[p] = toI64(0)
+    this.state[p] = S_SEND
+    this.sending += 1
+    this.send(p)
+  }
+
+  /**
+   * Sends plan `p`'s answers from `sendNext[p]` on. An answer whose worker's
+   * ring is full waits there, and the plan with it, for the next turn: the
+   * service goes on reading and planning meanwhile instead of spinning. A
+   * ring full for `STUCK_NS` means its worker is stuck, which ends the server.
+   */
+  send(p: i32): void {
     const plan: ReadPlan = this.plans[p]
-    for (let i: i32 = 0; i < plan.count; i++) {
+    const lost: boolean = this.lost[p]
+    for (let i: i32 = this.sendNext[p]; i < plan.count; i++) {
       let status: i32 = 500
       plan.outEnd = 0
       if (!lost) {
@@ -436,26 +473,23 @@ export class ReadService {
       }
       const tag: i32 = plan.tags[i]
       const len: i32 = plan.seal(tag / WORKER_TAGS, status, ANSWER_TAIL)
-      this.deliver(this.links[tag % WORKER_TAGS], plan.out, len)
+      const link: ReadLink = this.links[tag % WORKER_TAGS]
+      if (!link.push(plan.out, len)) {
+        link.ring()
+        const now: i64 = monotonicNanos()
+        if (this.sendHeld[p] === toI64(0)) {
+          this.sendHeld[p] = now
+        } else if (now - this.sendHeld[p] > STUCK_NS) {
+          this.gone = true
+        }
+        this.sendNext[p] = i
+        return
+      }
+      this.sendHeld[p] = toI64(0)
     }
     this.state[p] = S_FREE
     this.lost[p] = false
-  }
-
-  deliver(link: ReadLink, b: u8[], len: i32): void {
-    if (link.push(b, len)) {
-      return
-    }
-    // The worker drains this ring every turn: it is full only while the worker is behind.
-    const stuck: i64 = monotonicNanos() + STUCK_NS
-    link.ring()
-    while (!link.push(b, len)) {
-      link.ring()
-      if (monotonicNanos() > stuck) {
-        this.gone = true
-        return
-      }
-    }
+    this.sending -= 1
   }
 
   flush(conn: PgConnection, fd: i32): boolean {

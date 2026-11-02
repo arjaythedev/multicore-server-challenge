@@ -188,6 +188,23 @@ and four on the box), and
   at `ANSWER_PACE` bytes a millisecond, because hundreds of answers written at
   once overflowed the NIC's queue: 20,000 retransmitted segments a second at
   the first try. Where the region cannot be made, each worker plans for itself.
+- **An answer a full ring holds back waits, not the service.** A plan's
+  answers are a few MB, and two plans finishing together could fill a
+  worker's ring faster than its pace drains it. The service used to spin
+  there until the ring had room, so while workers fell behind it read and
+  planned nothing, and spent the core it had on spinning: at 230,000 users,
+  saturated, the service went from 0.17 to all the core it could get after
+  8 minutes, the server's CPU a request rose from 21 to 29 µs and the hold
+  collapsed to p95 1.4 s. Now the plan keeps its place and is sent from
+  there on the next turn (at most a millisecond later), and the rings are
+  16 MB. The same hold stays at 55,000 requests a second and 22 µs.
+- **Plan tables sized to the plan.** A plan finds its articles, authors and
+  flags in open-addressed tables that used to be 65,536 slots (256 KB each)
+  at every size, so a plan's 250 or so flags and 5,500 authors were looked up
+  at random in memory the cache did not hold: on the VM the slot lookups
+  were 18% of the service's CPU, mostly the load of the slot. They now start
+  at 4,096 and double past half full, and a key is hashed with murmur3's
+  finalizer instead of eight rounds of FNV-1a.
 
 - **Two HTTP workers.** Each worker has its own read queue, so fewer workers
   make bigger plans. At 120,000 users on the VM, Postgres spent 150 µs a
@@ -312,8 +329,11 @@ machine's, about a third of the official box's.
 | `6cdf1fd` (#159) | 150,000 | PASS | 39,080 | 101 ms | 134 ms | 45.9 + 20.7 |
 | #189 as first opened (`91dd6fd`) | 190,000 | PASS | 47,958 | 264 ms | 327 ms | 34.2 + 23.0 |
 | `91dd6fd` | 210,000 | FAIL | 45,564 | 994 ms | 1,103 ms | 31.2 + 27.4 |
-| this one | 190,000 | PASS | 47,856 | 275 ms | 327 ms | 31.5 + 22.3 |
-| this one | 210,000 | PASS | 51,129 | 450 ms | 552 ms | 31.0 + 23.5 |
+| `a24c18d` | 190,000 | PASS | 47,856 | 275 ms | 327 ms | 31.5 + 22.3 |
+| `a24c18d` | 210,000 | PASS | 51,129 | 450 ms | 552 ms | 31.0 + 23.5 |
+| `a24c18d` | 230,000 | FAIL | 46,967 | 1,483 ms | 1,828 ms | 28.7 + 28.6 |
+| this one | 230,000 | FAIL | 55,073 | 579 ms | 697 ms | 31.4 + 22.2 |
+| this one, again | 230,000 | FAIL | 55,436 | 537 ms | 639 ms | 30.8 + 21.9 |
 | rust-epoll-theCatWisel (#154), for scale | 210,000 | PASS | 54,390 | 149 ms | 195 ms | 35.7 + 14.8 |
 
 On a Xeon Platinum 8260 VM with 8 vCPU and 16 GB (Postgres 18 and `box/`'s
@@ -323,7 +343,9 @@ fresh copy of the seed each time; CPU from `/proc` over a minute of the hold:
 | Build | Users | Verdict | req/s | p95 | p99 | Postgres + rest µs a request | Box busy |
 |---|--:|---|--:|--:|--:|---|--:|
 | `91dd6fd`, two holds | 175,000 | PASS, PASS | 44,333–44,450 | 298–305 ms | 422–431 ms | 78.9–79.2 + 72.0–77.5 | 84–87% |
-| this one, two holds | 175,000 | PASS, PASS | 43,943–43,971 | 340–383 ms | 462–632 ms | 73.6–74.0 + 71.8–73.0 | 81% |
+| `a24c18d`, two holds | 175,000 | PASS, PASS | 43,943–43,971 | 340–383 ms | 462–632 ms | 73.6–74.0 + 71.8–73.0 | 81% |
+| `a24c18d`, past the VM's limit | 185,000 | FAIL | 42,554 | 1,881 ms | 5,489 ms | 72.4 + 88.4 | 86% |
+| this one, past the VM's limit | 185,000 | FAIL | 45,194 | 886 ms | 2,431 ms | 74.9 + 73.4 | 84% |
 
 The window's extra wait shows as p95 while the box has room. At 195,000 users
 both builds fail on that VM: its one network-interrupt CPU is 93–99% in

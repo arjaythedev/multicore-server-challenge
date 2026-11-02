@@ -85,6 +85,13 @@ const S_USERS: i32 = 102
 /** The hash tables: a power of two at least twice what they hold. */
 const TABLE: i32 = 8192
 const ID_TABLE: i32 = 65536
+/**
+ * The size the article, author, ask and flag tables start each plan at. They
+ * double while they hold more than half of it, up to `ID_TABLE`: a plan's
+ * few hundred flags and few thousand authors then sit in a table that stays
+ * in cache, not at random in 256 KiB.
+ */
+const TABLE_START: i32 = 4096
 
 /**
  * An article's columns in a `plan_meta` row. Its tags are their ids: their
@@ -172,6 +179,24 @@ const fnv = (): u32 => {
 }
 /** A hash as a non-negative i32, for a table index. */
 const slotOf = (h: u32): i32 => toI32(h >> 1)
+const LOW32: i64 = 4294967295
+/** murmur3's 32-bit finalizer over `h`: three multiplies where FNV-1a over eight bytes is eight in a chain. */
+const fmix = (h0: u32): u32 => {
+  let h: u32 = (h0 ^ (h0 >> 16)) * 2246822507
+  h = (h ^ (h >> 13)) * 3266489909
+  return h ^ (h >> 16)
+}
+/** An id's table hash. */
+const idHash = (v: i64): u32 => fmix(toU32(v & LOW32) ^ (toU32((v >> toI64(32)) & LOW32) * 2654435769))
+/** A (viewer, id, kind) pair's table hash. */
+const pairHash = (v: i64, id: i64, kind: i32): u32 =>
+  fmix(
+    (toU32(v & LOW32) * 2654435769) ^
+      toU32(id & LOW32) ^
+      (toU32((id >> toI64(32)) & LOW32) * 2246822507) ^
+      (toU32((v >> toI64(32)) & LOW32) * 3266489909) ^
+      toU32(kind)
+  )
 
 /** One read plan's requests, keys, rows and answers; reused plan after plan. */
 /** The most distinct articles one count run takes; a plan past it goes alone. */
@@ -201,6 +226,7 @@ export class CountRun {
   counts: i64[]
   private readonly table: i32[]
   private readonly slots: i32[]
+  private mask: i32 = 4095
   n: i32 = 0
   /** Its statement could not be bound: its plans go alone. */
   failed: boolean = false
@@ -214,8 +240,8 @@ export class CountRun {
   }
 
   private slot(id: i64): i32 {
-    const mask: i32 = COUNT_TABLE - 1
-    let at: i32 = slotOf(hashInt(fnv(), id)) & mask
+    const mask: i32 = this.mask
+    let at: i32 = slotOf(idHash(id)) & mask
     while (this.table[at] > 0 && this.ids[this.table[at] - 1] !== id) {
       at = (at + 1) & mask
     }
@@ -236,6 +262,17 @@ export class CountRun {
         this.slots[this.n] = at
         this.n += 1
         this.table[at] = this.n
+        if (2 * this.n > this.mask + 1 && this.mask < COUNT_TABLE - 1) {
+          for (let j: i32 = 0; j < this.n; j++) {
+            this.table[this.slots[j]] = 0
+          }
+          this.mask = 2 * this.mask + 1
+          for (let j: i32 = 0; j < this.n; j++) {
+            const to: i32 = this.slot(this.ids[j])
+            this.table[to] = j + 1
+            this.slots[j] = to
+          }
+        }
       }
     }
     this.plans.push(p)
@@ -268,6 +305,7 @@ export class CountRun {
       this.table[this.slots[k]] = 0
     }
     this.n = 0
+    this.mask = TABLE_START - 1
     this.failed = false
     this.plans = []
   }
@@ -323,6 +361,7 @@ export class ReadPlan {
   metaFull: boolean[]
   metas: i32 = 0
   private readonly idTable: i32[]
+  private idMask: i32 = 4095
   /** Each article's JSON in `text`: [m0, m1) up to the body, [m1, m2) the body, [m2, m3) up to `favorited`. */
   m0: i32[]
   m1: i32[]
@@ -337,6 +376,7 @@ export class ReadPlan {
   private flagKind: i32[]
   private flagSlot: i32[]
   private readonly flagTable: i32[]
+  private flagMask: i32 = 4095
   flags: i32 = 0
   /** The pairs group B asks about: favorited (viewer, article) and following (viewer, author). */
   askV: i64[]
@@ -358,6 +398,7 @@ export class ReadPlan {
   private askStart: i32[]
   private flagText: u8[]
   private readonly askTable: i32[]
+  private askMask: i32 = 4095
   /** Group A's statements in the order bound, and how many have completed; whether a statement failed. */
   readonly stmts: i32[]
   stmtCount: i32 = 0
@@ -395,6 +436,7 @@ export class ReadPlan {
   private u0: i32[]
   private u1: i32[]
   private readonly userTable: i32[]
+  private userMask: i32 = 4095
   private readonly viewerTable: i32[]
   private readonly viewerSlots: i32[]
   private users: i32 = 0
@@ -571,6 +613,10 @@ export class ReadPlan {
       this.userTable[this.userSlots[k]] = 0
     }
     this.users = 0
+    this.idMask = TABLE_START - 1
+    this.flagMask = TABLE_START - 1
+    this.askMask = TABLE_START - 1
+    this.userMask = TABLE_START - 1
     this.stmtCount = 0
     this.stmtDone = 0
     this.failed = false
@@ -1271,7 +1317,7 @@ export class ReadPlan {
       if (v !== 0) {
         // The viewer's place among the plan's distinct viewers, at most PLAN_MAX of them.
         const mask: i32 = TABLE - 1
-        let slot: i32 = slotOf(hashInt(fnv(), v)) & mask
+        let slot: i32 = slotOf(idHash(v)) & mask
         while (this.viewerTable[slot] > 0 && this.flagViewers[this.viewerTable[slot] - 1] !== v) {
           slot = (slot + 1) & mask
         }
@@ -1468,7 +1514,7 @@ export class ReadPlan {
     const kind: i32 = toI32(conn.int(0))
     const v: i64 = conn.int(1)
     const id: i64 = conn.int(2)
-    const slot: i32 = this.pairSlot(this.flagTable, this.flagV, this.flagId, this.flagKind, v, id, kind)
+    const slot: i32 = this.pairSlot(this.flagTable, this.flagMask, this.flagV, this.flagId, this.flagKind, v, id, kind)
     if (this.flagTable[slot] > 0 || this.flags >= ID_TABLE / 2) {
       return
     }
@@ -1483,6 +1529,17 @@ export class ReadPlan {
     this.flagKind[k] = kind
     this.flagTable[slot] = k + 1
     this.flags = k + 1
+    if (2 * this.flags > this.flagMask + 1 && this.flagMask < ID_TABLE - 1) {
+      for (let j: i32 = 0; j < this.flags; j++) {
+        this.flagTable[this.flagSlot[j]] = 0
+      }
+      this.flagMask = 2 * this.flagMask + 1
+      for (let j: i32 = 0; j < this.flags; j++) {
+        const at: i32 = this.pairSlot(this.flagTable, this.flagMask, this.flagV, this.flagId, this.flagKind, this.flagV[j], this.flagId[j], this.flagKind[j])
+        this.flagTable[at] = j + 1
+        this.flagSlot[j] = at
+      }
+    }
   }
 
   /** An article row of `plan_meta`: its JSON, cut where the body and the two flags go. */
@@ -1588,8 +1645,8 @@ export class ReadPlan {
   }
 
   private userSlot(id: i64): i32 {
-    const mask: i32 = ID_TABLE - 1
-    let slot: i32 = slotOf(hashInt(fnv(), id)) & mask
+    const mask: i32 = this.userMask
+    let slot: i32 = slotOf(idHash(id)) & mask
     while (this.userTable[slot] > 0 && this.userIds[this.userTable[slot] - 1] !== id) {
       slot = (slot + 1) & mask
     }
@@ -1617,6 +1674,17 @@ export class ReadPlan {
     this.u1[k] = -1
     this.userTable[slot] = k + 1
     this.users = k + 1
+    if (2 * this.users > this.userMask + 1 && this.userMask < ID_TABLE - 1) {
+      for (let j: i32 = 0; j < this.users; j++) {
+        this.userTable[this.userSlots[j]] = 0
+      }
+      this.userMask = 2 * this.userMask + 1
+      for (let j: i32 = 0; j < this.users; j++) {
+        const at: i32 = this.userSlot(this.userIds[j])
+        this.userTable[at] = j + 1
+        this.userSlots[j] = at
+      }
+    }
   }
 
   /** Author `id`'s place, -1 when `plan_users` found no row for it: its requests go alone. */
@@ -1628,8 +1696,8 @@ export class ReadPlan {
   // ---- Articles and flags by id ---------------------------------------------------
 
   private idSlot(id: i64): i32 {
-    const mask: i32 = ID_TABLE - 1
-    let slot: i32 = slotOf(hashInt(fnv(), id)) & mask
+    const mask: i32 = this.idMask
+    let slot: i32 = slotOf(idHash(id)) & mask
     while (this.idTable[slot] > 0 && this.metaIds[this.idTable[slot] - 1] !== id) {
       slot = (slot + 1) & mask
     }
@@ -1657,6 +1725,17 @@ export class ReadPlan {
     this.found[m] = false
     this.idTable[slot] = m + 1
     this.metas = m + 1
+    if (2 * this.metas > this.idMask + 1 && this.idMask < ID_TABLE - 1) {
+      for (let j: i32 = 0; j < this.metas; j++) {
+        this.idTable[this.metaSlot[j]] = 0
+      }
+      this.idMask = 2 * this.idMask + 1
+      for (let j: i32 = 0; j < this.metas; j++) {
+        const at: i32 = this.idSlot(this.metaIds[j])
+        this.idTable[at] = j + 1
+        this.metaSlot[j] = at
+      }
+    }
   }
 
   private growMeta(n: i32): void {
@@ -1681,9 +1760,8 @@ export class ReadPlan {
     this.found = found
   }
 
-  private pairSlot(table: i32[], vs: i64[], ids: i64[], kinds: i32[], v: i64, id: i64, kind: i32): i32 {
-    const mask: i32 = ID_TABLE - 1
-    let slot: i32 = slotOf(hashInt(hashInt(hashInt(fnv(), v), id), toI64(kind))) & mask
+  private pairSlot(table: i32[], mask: i32, vs: i64[], ids: i64[], kinds: i32[], v: i64, id: i64, kind: i32): i32 {
+    let slot: i32 = slotOf(pairHash(v, id, kind)) & mask
     while (table[slot] > 0) {
       const k: i32 = table[slot] - 1
       if (vs[k] === v && ids[k] === id && kinds[k] === kind) {
@@ -1696,7 +1774,7 @@ export class ReadPlan {
 
   /** Asks group B whether viewer `v` favorited article `id` (kind 0) or follows user `id` (kind 1), once. */
   private ask(v: i64, id: i64, kind: i32): void {
-    const slot: i32 = this.pairSlot(this.askTable, this.askV, this.askId, this.askKind, v, id, kind)
+    const slot: i32 = this.pairSlot(this.askTable, this.askMask, this.askV, this.askId, this.askKind, v, id, kind)
     if (this.askTable[slot] > 0) {
       return
     }
@@ -1717,6 +1795,17 @@ export class ReadPlan {
     this.askKind[k] = kind
     this.askTable[slot] = k + 1
     this.asks = k + 1
+    if (2 * this.asks > this.askMask + 1 && this.askMask < ID_TABLE - 1) {
+      for (let j: i32 = 0; j < this.asks; j++) {
+        this.askTable[this.askSlot[j]] = 0
+      }
+      this.askMask = 2 * this.askMask + 1
+      for (let j: i32 = 0; j < this.asks; j++) {
+        const at: i32 = this.pairSlot(this.askTable, this.askMask, this.askV, this.askId, this.askKind, this.askV[j], this.askId[j], this.askKind[j])
+        this.askTable[at] = j + 1
+        this.askSlot[j] = at
+      }
+    }
   }
 
   /** Whether group B found viewer `v`'s flag `kind` on `id` true; always false for the anonymous viewer. */
@@ -1725,7 +1814,7 @@ export class ReadPlan {
       return false
     }
     return (
-      this.flagTable[this.pairSlot(this.flagTable, this.flagV, this.flagId, this.flagKind, v, id, kind)] > 0
+      this.flagTable[this.pairSlot(this.flagTable, this.flagMask, this.flagV, this.flagId, this.flagKind, v, id, kind)] > 0
     )
   }
 
