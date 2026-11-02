@@ -182,7 +182,12 @@ final class WriteBatcher: Service {
         while true {
             let group = state.withLock { s -> [Waiting]? in
                 if s.stopped { return nil }
-                let count = min(s.queue.count, settings.maxGroup)
+                var count = 0
+                var toggles = Set<String>()
+                while count < min(s.queue.count, settings.maxGroup) {
+                    if let key = Self.toggle(s.queue[count].write), !toggles.insert(key).inserted { break }
+                    count += 1
+                }
                 defer { s.queue.removeFirst(count) }
                 return Array(s.queue.prefix(count))
             }
@@ -258,23 +263,35 @@ final class WriteBatcher: Service {
         }
     }
 
-    /// The writes' statements, in order; runs of the same merged kind as one statement.
+    /// The group's statements: every other write in turn, then one statement per merged kind for all the group's
+    /// writes of that kind (in the order they arrived), however they were interleaved. Writes of different users
+    /// commute, and `nextGroup` never puts the same toggle of one user twice in a group, so a group costs about five
+    /// statements however large it is, instead of about one per write.
     private func execute(_ writes: [Write], on connection: PostgresConnection) async throws -> [WriteOutcome] {
-        var outcomes: [WriteOutcome] = []
-        outcomes.reserveCapacity(writes.count)
-        var start = 0
-        while start < writes.count {
-            guard let kind = Self.merged(writes[start]) else {
-                outcomes.append(try await single(writes[start], on: connection))
-                start += 1
+        var outcomes = [WriteOutcome?](repeating: nil, count: writes.count)
+        var byKind: [(kind: Merged, writes: [Int])] = []
+        for (i, write) in writes.enumerated() {
+            guard let kind = Self.merged(write) else {
+                outcomes[i] = try await single(write, on: connection)
                 continue
             }
-            var end = start + 1
-            while end < writes.count, Self.merged(writes[end]) == kind { end += 1 }
-            outcomes += try await run(kind, writes[start..<end], on: connection)
-            start = end
+            if let k = byKind.firstIndex(where: { $0.kind == kind }) { byKind[k].writes.append(i) } else { byKind.append((kind, [i])) }
         }
-        return outcomes
+        for (kind, indices) in byKind {
+            let answers = try await run(kind, ArraySlice(indices.map { writes[$0] }), on: connection)
+            for (i, answer) in zip(indices, answers) { outcomes[i] = answer }
+        }
+        return outcomes.map { $0! }
+    }
+
+    /// What two writes in one group must not share: the same user's favorite of one article, or follow of one user
+    /// (their order matters, and merged runs don't keep the order between kinds).
+    private static func toggle(_ write: Write) -> String? {
+        switch write {
+        case .favorite(let viewer, let slug, _): "f\(viewer) \(slug)"
+        case .follow(let viewer, let username, _): "o\(viewer) \(username)"
+        default: nil
+        }
     }
 
     private func run(_ kind: Merged, _ writes: ArraySlice<Write>, on connection: PostgresConnection) async throws -> [WriteOutcome] {

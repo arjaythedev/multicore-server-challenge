@@ -71,7 +71,10 @@ struct Conduit {
             database: dbURL.path.split(separator: "/").last.map(String.init),
             tls: .disable
         )
-        dbConfig.options.maximumConnections = poolSize
+        // DB_POOL_SIZE is every connection we open: the write lanes get one each, in a pool of their own (so a write never
+        // waits for a connection behind the read batches' statements), and everything else shares the rest.
+        let writeLanes = max(1, Int(envOr("WRITE_LANES", "")) ?? 4)
+        dbConfig.options.maximumConnections = max(1, poolSize - writeLanes)
         // Session settings on our own connections only (startup parameters; nothing server-wide). The box's Postgres
         // runs with JIT and parallel query on, and both cost more than they save on statements that take well under
         // a millisecond: a JIT compile is milliseconds, and a parallel plan starts worker processes. The read batches
@@ -82,6 +85,8 @@ struct Conduit {
             ("max_parallel_workers_per_gather", "0"),
             ("plan_cache_mode", "force_generic_plan"),
         ]
+        var writeConfig = dbConfig
+        writeConfig.options.maximumConnections = writeLanes
         let db = PostgresClient(configuration: dbConfig)
         let bcrypt = BcryptWorkers(threads: bcryptThreads, lanes: bcryptLanes,
                                    window: .milliseconds(Int(envOr("BCRYPT_WINDOW_MS", "")) ?? 200), limit: bcryptQueue)
@@ -94,8 +99,9 @@ struct Conduit {
         ))
         let signer = JWTSigner(secret: jwtSecret)
         // Group commit: each write lane holds one pooled connection. WRITE_GROUPING=0: a transaction per write.
-        let writes = WriteBatcher(db: db, signer: signer, settings: .init(
-            lanes: envOr("WRITE_GROUPING", "1") == "0" ? 0 : Int(envOr("WRITE_LANES", "")) ?? 1,
+        let writeDB = PostgresClient(configuration: writeConfig)
+        let writes = WriteBatcher(db: writeDB, signer: signer, settings: .init(
+            lanes: envOr("WRITE_GROUPING", "1") == "0" ? 0 : writeLanes,
             maxGroup: Int(envOr("WRITE_GROUP_MAX", "")) ?? 256
         ))
         let app = App(db: db, signer: signer, bcrypt: bcrypt, reads: reads, writes: writes)
@@ -118,7 +124,7 @@ struct Conduit {
         // reverse order: the HTTP server first (in-flight requests finish), then the read lanes, the Postgres pool and
         // the bcrypt threads.
         let services = ServiceGroup(configuration: .init(
-            services: [bcrypt, db] + (reads.map { [$0] } ?? []) + [writes, server],
+            services: [bcrypt, db, writeDB] + (reads.map { [$0] } ?? []) + [writes, server],
             gracefulShutdownSignals: [.sigterm, .sigint],
             logger: logger
         ))
