@@ -71,7 +71,12 @@ All dependencies are pinned exactly in `Package.swift` (plus `Package.resolved`)
   way. Unknown routes return the RealWorld JSON error shape. A response is one piece of memory: the JSON writer leaves
   128 bytes free in front of the body, the status line and headers are written into them, and the socket write takes
   the bytes from there. Each loop checks its connections every 75 s and closes those idle since the check before, so
-  after 75 to 150 s idle; a request costs a counter increment, not a timer.
+  after 75 to 150 s idle; a request costs a counter increment, not a timer. Connections are capped below the
+  descriptor limit (its soft limit raised to the hard one at startup): 1,024 descriptors stay for what the process
+  opens by itself, 198,976 connections at the box's 200,000. At the cap, or if accept runs out of descriptors anyway, a
+  loop stops watching its listener for 10 ms and new connections wait in the backlog. Without that the last
+  descriptors went too, and libdispatch (under Swift's global executor) crashes the process when it can't open the
+  /proc file it reads for its threads: a SIGILL on the box in the 250,000-user probe.
 - **JSON out**: the writer appends with an inline capacity check and a store or `memcpy`, no intermediate Strings;
   text with nothing to escape is one `memcpy`, otherwise its exact escaped length is counted first and each byte is
   stored. A batch writes the JSON of every article, comment thread, profile, user and the tags list it shows once,

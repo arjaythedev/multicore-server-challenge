@@ -54,8 +54,9 @@ enum Sockets {
         return fd
     }
 
-    /// The next connection waiting on `listener`, non-blocking and with Nagle off; nil once none is waiting.
-    static func accept(_ listener: Int32) -> Int32? {
+    /// The next connection waiting on `listener`, non-blocking and with Nagle off; nil once none is waiting. Throws
+    /// for anything else, such as running out of descriptors (the connection then waits in the backlog).
+    static func accept(_ listener: Int32) throws(SystemError) -> Int32? {
         while true {
             #if os(Linux)
             let fd = CEventLoop_accept(listener, Int32(SOCK_NONBLOCK.rawValue | SOCK_CLOEXEC.rawValue))
@@ -66,10 +67,7 @@ enum Sockets {
                 switch errno {
                 case EINTR, ECONNABORTED: continue
                 case EAGAIN, EWOULDBLOCK: return nil
-                default:
-                    // Out of descriptors, most likely: the connection waits in the backlog until one closes.
-                    App.logger.error("\(SystemError("accept"))")
-                    return nil
+                default: throw SystemError("accept")
                 }
             }
             #if !os(Linux)
@@ -156,7 +154,7 @@ private func systemConnect(_ fd: Int32, _ address: UnsafePointer<sockaddr>!, _ l
     connect(fd, address, length)
 }
 
-// ---------- cores ----------
+// ---------- cores and descriptors ----------
 
 enum System {
     /// The cores this process may use: the CPUs it may run on, capped by its cgroup's CPU limit (a container's
@@ -177,6 +175,18 @@ enum System {
         return max(1, Int(sysconf(_SC_NPROCESSORS_ONLN)))
         #endif
     }()
+
+    /// How many descriptors this process may have open (its soft limit raised to the hard one first).
+    static let descriptorLimit: Int = {
+        let limit = CEventLoop_descriptorLimit()
+        return limit > 0 ? Int(limit) : 1024
+    }()
+
+    /// How many connections the server takes at once: the descriptor limit less a reserve for every descriptor the
+    /// process opens by itself (the loops', Postgres connections, the signal pipe, and what the runtime opens, such as
+    /// libdispatch reading /proc for the global executor's threads, which crashes the process if it can't). 198,976 at
+    /// the box's 200,000.
+    static let connectionBudget: Int = descriptorLimit - (descriptorLimit >= 8192 ? 1024 : descriptorLimit / 4)
 }
 
 // ---------- threads ----------

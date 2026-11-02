@@ -1,6 +1,6 @@
 // What Swift's Glibc module leaves out and the event loops (Loop.swift, Sockets.swift) need: epoll, eventfd, and two
-// GNU extensions, wrapped in C because they are only declared under _GNU_SOURCE. Empty on macOS, where the loops use
-// kqueue from Darwin.
+// GNU extensions, wrapped in C because they are only declared under _GNU_SOURCE (none of them on macOS, where the
+// loops use kqueue from Darwin); and the descriptor limit, on both.
 #ifndef CEVENTLOOP_H
 #define CEVENTLOOP_H
 #ifdef __linux__
@@ -14,4 +14,8 @@ int CEventLoop_nameThread(const char *name);
 /// How many CPUs this process may run on (sched_getaffinity), or -1.
 int CEventLoop_cpusAllowed(void);
 #endif
+
+/// How many descriptors this process may have open (RLIMIT_NOFILE), its soft limit raised to the hard one first (on
+/// macOS to at most OPEN_MAX), as Go's runtime does at startup; -1 if it can't be read.
+long CEventLoop_descriptorLimit(void);
 #endif

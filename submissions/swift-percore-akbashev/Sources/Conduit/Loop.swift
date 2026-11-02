@@ -86,6 +86,7 @@ final class Loop: TaskExecutor, @unchecked Sendable {
 
     private struct Timer {
         var due: UInt64
+        /// 0 for a timer that runs once.
         let interval: UInt64
         let body: () -> Void
     }
@@ -201,8 +202,18 @@ final class Loop: TaskExecutor, @unchecked Sendable {
     /// Calls `body` on this loop every `interval`, from this loop's own thread.
     func every(_ interval: Duration, _ body: @escaping () -> Void) {
         assert(inLoop, "Loop.every off its loop")
-        let nanos = UInt64(interval.components.seconds) * 1_000_000_000 + UInt64(interval.components.attoseconds / 1_000_000_000)
+        let nanos = Self.nanoseconds(interval)
         timers.append(Timer(due: Self.now() + nanos, interval: nanos, body: body))
+    }
+
+    /// Calls `body` once on this loop, `delay` from now, from this loop's own thread.
+    func after(_ delay: Duration, _ body: @escaping () -> Void) {
+        assert(inLoop, "Loop.after off its loop")
+        timers.append(Timer(due: Self.now() + Self.nanoseconds(delay), interval: 0, body: body))
+    }
+
+    private static func nanoseconds(_ duration: Duration) -> UInt64 {
+        UInt64(duration.components.seconds) * 1_000_000_000 + UInt64(duration.components.attoseconds / 1_000_000_000)
     }
 
     private static func now() -> UInt64 {
@@ -220,10 +231,14 @@ final class Loop: TaskExecutor, @unchecked Sendable {
 
     private func runTimers() {
         let now = Self.now()
+        var ranOnce = false
         for i in timers.indices where timers[i].due <= now {
-            timers[i].due = now + timers[i].interval
+            timers[i].due = timers[i].interval == 0 ? .max : now + timers[i].interval
+            ranOnce = ranOnce || timers[i].interval == 0
             timers[i].body()
         }
+        // Removed after the pass, since a body may add timers of its own.
+        if ranOnce { timers.removeAll { $0.interval == 0 && $0.due == .max } }
     }
 
     // ---------- descriptors ----------

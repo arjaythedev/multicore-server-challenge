@@ -4,6 +4,7 @@
 // (Routes.swift) there, and its response is written there. A batched read is a task pinned to the connection's loop;
 // every other handler runs as a child task of the server, in one task group.
 import Foundation
+import Synchronization
 #if canImport(Glibc)
 import Glibc
 #elseif canImport(Darwin)
@@ -33,6 +34,8 @@ final class HTTPServer: Service {
     private let jobs: AsyncStream<@Sendable () async -> Void>
     private let submit: AsyncStream<@Sendable () async -> Void>.Continuation
     fileprivate let loops: [LoopState]
+    /// Connections open now, on every loop, against System.connectionBudget.
+    private let openConnections = Atomic<Int>(0)
     /// A batched read is a task on its connection's loop; READ_TASKS=0: a callback instead.
     let readTasks = ProcessInfo.processInfo.environment["READ_TASKS"] != "0"
 
@@ -76,7 +79,7 @@ final class HTTPServer: Service {
         for state in loops {
             state.loop.execute { state.loop.every(HTTPConnection.idleCheck) { HTTPConnection.closeIdle(on: state) } }
         }
-        App.logger.info("listening on \(host):\(port)")
+        App.logger.info("listening on \(host):\(port) (up to \(System.connectionBudget) connections)")
 
         // On shutdown: stop accepting, then wait for the handlers still running. Open connections stay until exit.
         await withDiscardingTaskGroup { group in
@@ -97,9 +100,14 @@ final class HTTPServer: Service {
         connection.index = state.connections.count
         state.connections.append(connection)
         connection.token = state.loop.register(fd, connection, readable: true, writable: false)
+        openConnections.add(1, ordering: .relaxed)
     }
 
+    /// Whether another connection fits the budget.
+    fileprivate var hasRoom: Bool { openConnections.load(ordering: .relaxed) < System.connectionBudget }
+
     fileprivate func forget(_ connection: HTTPConnection, on state: LoopState) {
+        openConnections.subtract(1, ordering: .relaxed)
         let i = connection.index
         let last = state.connections.removeLast()
         if i < state.connections.count {
@@ -115,6 +123,8 @@ fileprivate final class Listener: LoopSource {
     private let server: HTTPServer
     private let state: LoopState
     var token: LoopToken?
+    private var paused = false
+    private var warned: ContinuousClock.Instant?
 
     init(fd: Int32, server: HTTPServer, state: LoopState) {
         self.fd = fd
@@ -125,7 +135,14 @@ fileprivate final class Listener: LoopSource {
     func ready(readable: Bool, writable: Bool) {
         // A bounded number per turn, so a burst of new connections doesn't hold up the requests of open ones.
         for _ in 0..<64 {
-            guard let fd = Sockets.accept(fd) else { return }
+            guard server.hasRoom else { return pause("\(System.connectionBudget) connections open") }
+            let accepted: Int32?
+            do {
+                accepted = try Sockets.accept(fd)
+            } catch {
+                return pause("\(error)")
+            }
+            guard let fd = accepted else { return }
             #if os(Linux)
             server.adopt(fd, on: state)
             #else
@@ -133,6 +150,26 @@ fileprivate final class Listener: LoopSource {
             let server = server
             target.loop.execute { server.adopt(fd, on: target) }
             #endif
+        }
+    }
+
+    /// Stops taking connections for 10 ms, at the budget or out of descriptors; new ones wait in the backlog meanwhile.
+    /// The last descriptors are never used, or the process can't open what it needs by itself: libdispatch, under the
+    /// global executor, reads /proc for its threads and crashes the process when it can't (a SIGILL on the box after
+    /// accept failed for lack of descriptors). Warns at most every 10 s.
+    private func pause(_ reason: String) {
+        guard let token, !paused else { return }
+        paused = true
+        state.loop.watch(fd, token, readable: false, writable: false)
+        let now = ContinuousClock.now
+        if warned.map({ now - $0 >= .seconds(10) }) ?? true {
+            warned = now
+            App.logger.warning("not accepting connections for now", metadata: ["reason": reason])
+        }
+        state.loop.after(.milliseconds(10)) { [self] in
+            guard let token = self.token, paused else { return }
+            paused = false
+            state.loop.watch(fd, token, readable: true, writable: false)
         }
     }
 
