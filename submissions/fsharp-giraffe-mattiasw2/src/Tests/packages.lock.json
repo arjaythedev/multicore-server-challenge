@@ -15,7 +15,7 @@
         "type": "Direct",
         "requested": "[10.0.104, )",
         "resolved": "10.0.104",
-        "contentHash": "0yn2AQD33CYa3v8L9ZGjXyca2UslJEpYGcUbGsLYfRCXARQg7g5zTxrvH4gx9sJodb7CyZDaeKIy4vl+6qDNtg=="
+        "contentHash": "2VQpRzjhuN6EHODVGiYZ/svc68up2/c3TdQ7eQtkY2MAN6EKMOF2SaraPCiMDu4+JMIbq9KkPxaWk5sXbfPs9Q=="
       },
       "Microsoft.NET.Test.Sdk": {
         "type": "Direct",

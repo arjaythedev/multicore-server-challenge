@@ -3,7 +3,7 @@
 set -euo pipefail
 SDK_VERSION=10.0.402
 case "$(uname -m)" in x86_64) RID=linux-x64 ;; aarch64) RID=linux-arm64 ;; *) echo "unsupported arch $(uname -m)"; exit 1 ;; esac
-apt-get update -q && apt-get install -y -q curl jq ca-certificates libstdc++6 libssl3t64 zlib1g
+apt-get update -q && apt-get install -y -q curl jq ca-certificates libicu74 libstdc++6 libssl3t64 zlib1g
 FILE="$(curl -fsSL "https://builds.dotnet.microsoft.com/dotnet/release-metadata/${SDK_VERSION%.*}/releases.json" \
   | jq -c --arg v "$SDK_VERSION" --arg rid "$RID" \
     '[.releases[].sdks[]? | select(.version == $v) | .files[] | select(.rid == $rid and (.name | endswith(".tar.gz")))][0]')"
