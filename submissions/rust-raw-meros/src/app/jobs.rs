@@ -61,6 +61,28 @@ pub enum ReadKind {
     LoginLookup,
 }
 
+impl ReadKind {
+    /// Number of distinct queues: one per statement the read lanes run.
+    pub const CLASSES: usize = 11;
+
+    /// Which statement serves this kind (the read queue batches per class, so a batch is one statement's worth).
+    pub fn class(&self) -> usize {
+        match self {
+            ReadKind::Tags => 0,
+            ReadKind::CurrentUser => 1,
+            ReadKind::Profile => 2,
+            ReadKind::List(ListKind::All) => 3,
+            ReadKind::List(ListKind::Tag) => 4,
+            ReadKind::List(ListKind::Author) => 5,
+            ReadKind::List(ListKind::Favorited) => 6,
+            ReadKind::List(ListKind::Feed) => 7,
+            ReadKind::Article => 8,
+            ReadKind::Comments => 9,
+            ReadKind::LoginLookup => 10,
+        }
+    }
+}
+
 /// A read job. `viewer` is the token's user id, 0 for anonymous. `key` is the slug, username, tag or email the kind
 /// needs; for `Feed` it is empty (the viewer is the key). `token` is the presented JWT for `CurrentUser`.
 pub struct ReadJob {

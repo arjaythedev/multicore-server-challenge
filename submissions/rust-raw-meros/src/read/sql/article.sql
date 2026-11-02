@@ -4,14 +4,20 @@
 WITH req AS MATERIALIZED (
   SELECT r.viewer, r.slug, r.ord
     FROM unnest($1::int8[], $2::text[]) WITH ORDINALITY AS r(viewer, slug, ord)),
+art0 AS MATERIALIZED (
+  SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at, a.author_id
+    FROM (SELECT DISTINCT slug FROM req) s
+    JOIN articles a ON a.slug = s.slug),
 art AS MATERIALIZED (
   SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at, a.author_id,
-         ARRAY(SELECT at.tag_id::int8 FROM article_tags at WHERE at.article_id = a.id) AS tag_ids,
-         (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS fav,
+         COALESCE(t.tag_ids, '{}'::int8[]) AS tag_ids, COALESCE(f.n, 0) AS fav,
          u.username, u.bio, u.image
-    FROM (SELECT DISTINCT slug FROM req) s
-    JOIN articles a ON a.slug = s.slug
-    JOIN users u ON u.id = a.author_id)
+    FROM art0 a
+    JOIN users u ON u.id = a.author_id
+    LEFT JOIN (SELECT at.article_id, array_agg(at.tag_id::int8) AS tag_ids FROM article_tags at
+                WHERE at.article_id = ANY(ARRAY(SELECT id FROM art0)) GROUP BY at.article_id) t ON t.article_id = a.id
+    LEFT JOIN (SELECT fv.article_id, count(*) AS n FROM favorites fv
+                WHERE fv.article_id = ANY(ARRAY(SELECT id FROM art0)) GROUP BY fv.article_id) f ON f.article_id = a.id)
 SELECT 0::int4 AS kind, NULL::int8 AS ord, id, slug, title, description, body, created_at, updated_at,
        author_id, tag_ids, fav, username, bio, image,
        NULL::int8 AS total, NULL::int8[] AS page_ids, NULL::int8[] AS favorited_ids, NULL::int8[] AS followed_ids

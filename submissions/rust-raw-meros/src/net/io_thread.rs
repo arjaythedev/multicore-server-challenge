@@ -21,10 +21,16 @@ use crate::sys::{self, EPOLLET, EPOLLIN, EPOLLOUT, EPOLLRDHUP, Epoll, Event, Io}
 /// epoll tokens: connection slots are small integers, the two special descriptors take the top values.
 const LISTENER_TOKEN: u64 = u64::MAX;
 const WAKE_TOKEN: u64 = u64::MAX - 1;
+/// Events taken from one `epoll_wait` call.
 const EVENTS_PER_WAIT: usize = 1024;
+/// While `accept` fails (out of descriptors) the loop retries after this long. The listener is edge-triggered, so
+/// without the retry a full accept queue would never produce another event and the thread would stay deaf for good.
+const ACCEPT_RETRY_MS: i32 = 20;
+/// Edge-triggered: every readiness event is drained until the socket would block.
 const READ_INTEREST: u32 = EPOLLIN | EPOLLRDHUP | EPOLLET;
+/// Read interest plus a wake-up when a socket that was full becomes writable again.
 const WRITE_INTEREST: u32 = READ_INTEREST | EPOLLOUT;
-/// A read that fills less than this fraction of the buffer's spare room has drained the socket.
+/// A read that returns fewer bytes than this has drained the socket, so the loop stops without a second `read`.
 const MIN_SPARE_TO_READ: usize = 1024;
 
 pub struct IoThread {
@@ -38,6 +44,8 @@ pub struct IoThread {
     response: ResponseBuf,
     events: Vec<Event>,
     replies: Vec<Reply>,
+    /// `accept` failed last time (descriptors exhausted): retry on a timer, see [`ACCEPT_RETRY_MS`].
+    accept_stalled: bool,
 }
 
 impl IoThread {
@@ -64,13 +72,22 @@ impl IoThread {
             response: ResponseBuf::new(),
             events: Vec::with_capacity(EVENTS_PER_WAIT),
             replies: Vec::new(),
+            accept_stalled: false,
         })
     }
 
     /// Runs until an unrecoverable epoll error.
     pub fn run(mut self) -> io::Result<()> {
         loop {
-            self.epoll.wait(-1, &mut self.events)?;
+            let timeout = if self.accept_stalled {
+                ACCEPT_RETRY_MS
+            } else {
+                -1
+            };
+            self.epoll.wait(timeout, &mut self.events)?;
+            if self.accept_stalled {
+                self.accept_all();
+            }
             for i in 0..self.events.len() {
                 let Event { token, bits } = self.events[i];
                 match token {
@@ -83,6 +100,7 @@ impl IoThread {
     }
 
     fn accept_all(&mut self) {
+        let was_stalled = std::mem::replace(&mut self.accept_stalled, false);
         loop {
             match sys::accept(self.listener.as_raw_fd()) {
                 Ok(Some(socket)) => {
@@ -98,8 +116,11 @@ impl IoThread {
                 }
                 Ok(None) => return,
                 Err(err) => {
-                    // Out of descriptors or memory: stop accepting for now; the next edge retries.
-                    eprintln!("accept: {err}");
+                    // Out of descriptors or memory: the connection stays in the kernel's queue; retry on a timer.
+                    if !was_stalled && log_budget_available() {
+                        eprintln!("accept: {err} (retrying every {ACCEPT_RETRY_MS} ms)");
+                    }
+                    self.accept_stalled = true;
                     return;
                 }
             }
@@ -362,6 +383,16 @@ impl IoThread {
         }
         self.slab.remove(slot);
     }
+}
+
+/// At most one "accept failed" line per second for the whole process, however many threads stall.
+fn log_budget_available() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static LAST_LOGGED_SECOND: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    LAST_LOGGED_SECOND.swap(now, Relaxed) != now
 }
 
 enum WriteOutcome {

@@ -10,22 +10,27 @@
 //! * `queue`: the shared queue and the batching rule (window, `batch_max`).
 //! * `lane`: the thread, the connection, group execution and the single-job fallback; `spawn_lanes`.
 //! * `statements`: the prepared statements (`sql/*.sql`, included with `include_str!`).
+//! * `batch`: which jobs of a group share one array statement; `push_run` sends such a run.
 //! * `push`: job -> pipelined statements (zero-copy parameters).
 //! * `finding`: a job's statements -> committed / failed / unknown.
 //! * `respond`: findings -> HTTP responses in pooled buffers, delivery through the mailboxes.
 //! * `bodies`: rows -> JSON per request kind.
 //!
 //! Not handled on purpose: caching anything between batches, retrying requests whose commit outcome is unknown,
-//! splitting a batch by kind.
+//! reordering a group across register / article writes (see `batch`).
 
+mod batch;
 mod bodies;
 mod finding;
 mod lane;
 mod push;
+mod push_run;
 mod queue;
 mod respond;
 mod statements;
 
+#[cfg(test)]
+mod batch_tests;
 #[cfg(test)]
 mod bench_tests;
 #[cfg(test)]
