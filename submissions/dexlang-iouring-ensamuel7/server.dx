@@ -1459,7 +1459,7 @@ fn prepare(query: q.Query): int {
 }
 
 fn sessionDsn(url: string): string {
-    let options: string = "sslmode=disable&options=-c%20TimeZone%3DUTC%20-c%20DateStyle%3DISO%20-c%20jit%3Doff"
+    let options: string = "sslmode=disable&options=-c%20TimeZone%3DUTC%20-c%20DateStyle%3DISO%20-c%20jit%3Doff%20-c%20plan_cache_mode%3Dforce_generic_plan"
     if (url.contains("?")) {
         return "${url}&${options}"
     }

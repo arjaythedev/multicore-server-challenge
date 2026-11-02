@@ -73,9 +73,13 @@ statements against the per-request ones over 300 random batches.
   comments are one `LEFT JOIN LATERAL`: no row means 404, a row without a
   comment means an empty list.
 - **Session settings only.** The connection adds `sslmode=disable`, and sets
-  `TimeZone=UTC`, `DateStyle=ISO` and `jit=off` for its own session. A batched
+  `TimeZone=UTC`, `DateStyle=ISO`, `jit=off` and
+  `plan_cache_mode=force_generic_plan` for its own session. A batched
   statement's estimated cost is high enough that Postgres would otherwise
   JIT-compile every execution, about 300 ms of compiling for 10 ms of work.
+  Its parameters are arrays, so a custom plan is no better than the generic
+  one, and planning it again on every execution was about 17% of Postgres
+  CPU.
 
 Article creation runs in one transaction (`BEGIN`, insert, tags, article tags,
 `COMMIT`, rolled back on any failure). Unique violations (SQLSTATE 23505) are
@@ -98,14 +102,14 @@ other boxes, 60 s ramp and 60 s measured, 8 workers:
 |---|--:|--:|--:|--:|--:|--:|---|
 | one statement per request | 27,000 | 6,926 | 341 ms | 497 ms | 0% | 100% | pass |
 | one statement per request | 30,000 | 6,899 | 1,143 ms | 1,402 ms | 0% | 100% | fail |
-| batched | 42,000 | 10,714 | 283 ms | 427 ms | 0% | 88% | pass |
+| batched | 42,000 | 10,723 | 269 ms | 349 ms | 0% | 88% | pass |
+| batched, generic plans | 42,000 | 10,751 | 249 ms | 326 ms | 0% | 86% | pass |
 
-At 42,000 users Postgres uses 52% of the box and the server 34%, about half of
-that bcrypt. Past about 45,000 users the two load boxes ran out of CPU, so the
-4-vCPU ceiling was not reached. The CPU per request is 1.75 times lower than
-one statement per request. The one-statement version scored 34,000 users on the
-benchmark box (#157), so this one should land somewhere near 60,000. That is an
-estimate, not a measurement.
+The two batched rows ran back to back. At 42,000 users generic plans take
+Postgres from 54% of the box to 51%, with the server at 34%, about half of that
+bcrypt. Past about 45,000 users the two load boxes ran out of CPU, so the
+4-vCPU ceiling was not reached. The batched version without generic plans
+scored 76,000 users on the benchmark box (#176).
 
 ## What the language gained from this challenge
 
