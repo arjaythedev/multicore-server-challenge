@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# Runs once as root on a clean Ubuntu 24.04: installs a pinned JDK (Eclipse Temurin 25.0.4.1) from its official
+# Runs once as root on a clean Ubuntu 24.04: installs a pinned JDK (Eclipse Temurin 25.0.5) from its official
 # tarball, checked against its published SHA-256, into /usr/local/java-raw-stohirov/jdk, and gcc for the bcrypt
 # kernels in native/. Nothing else: no Maven, no dependencies.
 set -euo pipefail
 PREFIX=/usr/local/java-raw-stohirov
-JDK_URL="https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.4.1%2B1/OpenJDK25U-jdk_x64_linux_hotspot_25.0.4.1_1.tar.gz"
-JDK_SHA256="dbb698396d478e7fa2b1e50f4103324b2a99b90569ee27c33f2261f9215cf41e"
+JDK_URL="https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.5%2B8/OpenJDK25U-jdk_x64_linux_hotspot_25.0.5_8.tar.gz"
+JDK_SHA256="68982529869257d0ee6b824ec5aa270ff8b118bb438670da0b97ebdab178d7fb"
 
 if command -v apt-get >/dev/null; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -q
   apt-get install -y -q ca-certificates curl tar gzip util-linux gcc
 fi
-if [ -x "$PREFIX/jdk/bin/java" ] && "$PREFIX/jdk/bin/java" -version 2>&1 | grep -q '"25.0.4.1"'; then
+if [ -x "$PREFIX/jdk/bin/java" ] && "$PREFIX/jdk/bin/java" -version 2>&1 | grep -q '"25.0.5"'; then
   echo "JDK already installed"
 else
   tmp="$(mktemp -d)"

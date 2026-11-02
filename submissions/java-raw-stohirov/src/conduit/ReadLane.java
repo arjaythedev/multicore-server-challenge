@@ -182,80 +182,173 @@ final class ReadLane implements Runnable {
     // ---- the batch ----
 
     private void batch(List<Job> jobs, List<Http.Resp> out) throws java.io.IOException {
-        int nj = jobs.size();
-        boolean wantTags = false, hasArticles = false;
-        LongKeys uid = new LongKeys();
-        Keys<String> uemail = new Keys<>(), prof = new Keys<>(), aslug = new Keys<>(), cmts = new Keys<>();
-        LongKeys aid = new LongKeys();
-        Keys<LimOff> global = new Keys<>();
-        @SuppressWarnings("unchecked")
-        Keys<String>[] listCount = new Keys[] {new Keys<String>(), new Keys<String>(), new Keys<String>()};
-        @SuppressWarnings("unchecked")
-        Keys<KeyPage>[] listPage = new Keys[] {new Keys<KeyPage>(), new Keys<KeyPage>(), new Keys<KeyPage>()};
-        LongKeys feed = new LongKeys();
-        Keys<ViewerPage> feedPage = new Keys<>();
+        Plan p = new Plan(jobs, out);
+        p.collectKeys();
+        p.sendPhaseA();
+        p.receiveFirstSegment();
+        p.receivePhaseA();
+        p.collectPhaseBKeys();
+        p.runPhaseB();
+        p.indexPhaseB();
+        p.assemble();
+    }
 
-        int[] ask = new int[nj], ask2 = new int[nj];
-        for (int i = 0; i < nj; i++) {
-            Job j = jobs.get(i);
-            switch (j.kind) {
-                case Job.TAGS -> wantTags = true;
-                case Job.USER -> ask[i] = uid.idx(j.viewer);
-                case Job.LOGIN -> ask[i] = uemail.idx(j.key);
-                case Job.PROFILE -> ask[i] = prof.idx(j.key);
-                case Job.ARTICLE -> {
-                    ask[i] = aslug.idx(j.key);
-                    hasArticles = true;
+    /** The row of each key, whose value is in column 0 of r (-1: none). */
+    private static int[] rowOfKey(LongKeys keys, Pg.Rows r) {
+        int[] row = new int[keys.n];
+        Arrays.fill(row, -1);
+        if (r == null) return row;
+        for (int i = 0; i < r.nrows; i++) {
+            int k = keys.find(r.i64(i, 0));
+            if (k >= 0) row[k] = i;
+        }
+        return row;
+    }
+
+    /** Marks the (kind, viewer, target) rows of the flags statement in isFav and isFoll. */
+    private static void markFlags(Pg.Rows r, PairKeys favd, PairKeys foll, boolean[] isFav, boolean[] isFoll) {
+        for (int i = 0; i < r.nrows; i++) {
+            long kind = r.i64(i, 0);
+            long a = r.i64(i, 1), b = r.i64(i, 2);
+            int k = kind == 0 ? favd.find(a, b) : foll.find(a, b);
+            if (k >= 0) {
+                if (kind == 0) isFav[k] = true;
+                else isFoll[k] = true;
+            }
+        }
+    }
+
+    /** One Page per comments key, with its rows. */
+    private static Page[] groupComments(Pg.Rows r, int n) {
+        Page[] g = new Page[n];
+        for (int i = 0; i < n; i++) {
+            g[i] = new Page();
+            g[i].rows = r;
+        }
+        if (r == null) return g;
+        for (int i = 0; i < r.nrows; i++) {
+            long k = r.i64(i, 0);
+            if (k >= 1 && k <= n) g[(int) k - 1].add(i);
+        }
+        return g;
+    }
+
+    /**
+     * One batch, step by step. The steps are separate methods on purpose: in one 4 KB method, C2's on-stack-replacement
+     * compile of a result loop crashed the JVM (SIGSEGV in TemplateAssertionExpression::clone, Temurin 25.0.4.1).
+     */
+    private final class Plan {
+        final List<Job> jobs;
+        final List<Http.Resp> out;
+        final int nj;
+        final Pg pg = ReadLane.this.pg;
+        final Pg fp = s.feedConn() ? feedPg : ReadLane.this.pg;
+        final int[] ask, ask2;
+
+        boolean wantTags, hasArticles;
+        final LongKeys uid = new LongKeys(), aid = new LongKeys(), feed = new LongKeys();
+        final Keys<String> uemail = new Keys<>(), prof = new Keys<>(), aslug = new Keys<>(), cmts = new Keys<>();
+        final Keys<LimOff> global = new Keys<>();
+        @SuppressWarnings("unchecked")
+        final Keys<String>[] listCount = new Keys[] {new Keys<String>(), new Keys<String>(), new Keys<String>()};
+        @SuppressWarnings("unchecked")
+        final Keys<KeyPage>[] listPage = new Keys[] {new Keys<KeyPage>(), new Keys<KeyPage>(), new Keys<KeyPage>()};
+        final Keys<ViewerPage> feedPage = new Keys<>();
+
+        int slot1, cut1, sTags = -1, sUid = -1, sUemail = -1;
+        int slot2, cut2, feedCut, sFeed = -1, sProf = -1, sAslug = -1, sAid = -1, sCmts = -1, sGlobal = -1;
+        final int[] sList = {-1, -1, -1};
+
+        Pg.Rows rTags, rProf, rAslug, rAid, rCmts;
+        int[] fProf, fAslug, fAid;
+        Page[] gCmts;
+        ListRes lGlobal, lFeed;
+        final ListRes[] lList = new ListRes[3];
+
+        final ArtSet as = new ArtSet();
+        final LongKeys authors = new LongKeys();
+        final PairKeys favd = new PairKeys(), foll = new PairKeys();
+        Pg.Rows rArtrow, rAuser, rArtx, rFlags;
+        int[] authorRow;
+        Ctx ctx;
+
+        Plan(List<Job> jobs, List<Http.Resp> out) {
+            this.jobs = jobs;
+            this.out = out;
+            nj = jobs.size();
+            ask = new int[nj];
+            ask2 = new int[nj];
+        }
+
+        void collectKeys() {
+            for (int i = 0; i < nj; i++) {
+                Job j = jobs.get(i);
+                switch (j.kind) {
+                    case Job.TAGS -> wantTags = true;
+                    case Job.USER -> ask[i] = uid.idx(j.viewer);
+                    case Job.LOGIN -> ask[i] = uemail.idx(j.key);
+                    case Job.PROFILE -> ask[i] = prof.idx(j.key);
+                    case Job.ARTICLE -> {
+                        ask[i] = aslug.idx(j.key);
+                        hasArticles = true;
+                    }
+                    case Job.ARTICLE_ID -> {
+                        ask[i] = aid.idx(j.id);
+                        hasArticles = true;
+                    }
+                    case Job.COMMENTS -> ask[i] = cmts.idx(j.key);
+                    case Job.GLOBAL -> {
+                        ask[i] = global.idx(new LimOff(j.lim, j.off));
+                        hasArticles = true;
+                    }
+                    case Job.TAG, Job.AUTHOR, Job.FAVORITED -> {
+                        int f = j.kind - Job.TAG;
+                        ask[i] = listCount[f].idx(j.key);
+                        ask2[i] = listPage[f].idx(new KeyPage(j.key, j.lim, j.off));
+                        hasArticles = true;
+                    }
+                    case Job.FEED -> {
+                        ask[i] = feed.idx(j.viewer);
+                        ask2[i] = feedPage.idx(new ViewerPage(j.viewer, j.lim, j.off));
+                        hasArticles = true;
+                    }
+                    default -> throw new IllegalStateException("not a read: " + j.kind);
                 }
-                case Job.ARTICLE_ID -> {
-                    ask[i] = aid.idx(j.id);
-                    hasArticles = true;
-                }
-                case Job.COMMENTS -> ask[i] = cmts.idx(j.key);
-                case Job.GLOBAL -> {
-                    ask[i] = global.idx(new LimOff(j.lim, j.off));
-                    hasArticles = true;
-                }
-                case Job.TAG, Job.AUTHOR, Job.FAVORITED -> {
-                    int f = j.kind - Job.TAG;
-                    ask[i] = listCount[f].idx(j.key);
-                    ask2[i] = listPage[f].idx(new KeyPage(j.key, j.lim, j.off));
-                    hasArticles = true;
-                }
-                case Job.FEED -> {
-                    ask[i] = feed.idx(j.viewer);
-                    ask2[i] = feedPage.idx(new ViewerPage(j.viewer, j.lim, j.off));
-                    hasArticles = true;
-                }
-                default -> throw new IllegalStateException("not a read: " + j.kind);
             }
         }
 
-        // ---- phase A ----
-        // Two segments in one flush: the tag list, current users and login lookups (a quarter of all traffic) come back
-        // first and are answered, or handed to bcrypt, while Postgres works through the rest.
-        Pg pg = this.pg;
-        int slot1 = 0;
-        int sTags = -1, sUid = -1, sUemail = -1;
-        if (wantTags || hasArticles) {
-            pg.exec("tags");
-            sTags = slot1++;
+        /**
+         * Two segments in one flush: the tag list, current users and login lookups (a quarter of all traffic) come back
+         * first and are answered, or handed to bcrypt, while Postgres works through the rest.
+         */
+        void sendPhaseA() throws java.io.IOException {
+            sendFirstSegment();
+            sendFeed();
+            sendLookups();
+            sendLists();
+            cut2 = slot2 > 0 ? pg.cut() : 0;
+            pg.flush();
         }
-        if (uid.n > 0) {
-            pg.exec("uid", uid.array());
-            sUid = slot1++;
-        }
-        if (uemail.size() > 0) {
-            pg.exec("uemail", texts(uemail.list));
-            sUemail = slot1++;
-        }
-        int cut1 = slot1 > 0 ? pg.cut() : 0;
 
-        // the feed statement goes out first, on its own backend
-        Pg fp = s.feedConn() ? feedPg : pg;
-        int sFeed = -1, feedCut = 0;
-        int slot2 = 0;
-        if (feed.n > 0) {
+        private void sendFirstSegment() {
+            if (wantTags || hasArticles) {
+                pg.exec("tags");
+                sTags = slot1++;
+            }
+            if (uid.n > 0) {
+                pg.exec("uid", uid.array());
+                sUid = slot1++;
+            }
+            if (uemail.size() > 0) {
+                pg.exec("uemail", texts(uemail.list));
+                sUemail = slot1++;
+            }
+            cut1 = slot1 > 0 ? pg.cut() : 0;
+        }
+
+        /** The feed statement goes out first, on its own backend. */
+        private void sendFeed() throws java.io.IOException {
+            if (feed.n == 0) return;
             Pg.Arr v = new Pg.Arr(Pg.INT8), l = new Pg.Arr(Pg.INT8), o = new Pg.Arr(Pg.INT8);
             for (ViewerPage x : feedPage.list) {
                 v.i64(x.v);
@@ -269,125 +362,118 @@ final class ReadLane implements Runnable {
             } else sFeed = slot2++;
         }
 
-        int sProf = -1, sAslug = -1, sAid = -1, sCmts = -1, sGlobal = -1;
-        int[] sList = {-1, -1, -1};
-        String[] listStmt = {"tag", "author", "favlist"};
-        if (prof.size() > 0) {
-            pg.exec("prof", texts(prof.list));
-            sProf = slot2++;
-        }
-        if (aslug.size() > 0) {
-            pg.exec("aslug", texts(aslug.list));
-            sAslug = slot2++;
-        }
-        if (aid.n > 0) {
-            pg.exec("aid", aid.array());
-            sAid = slot2++;
-        }
-        if (cmts.size() > 0) {
-            pg.exec("cmts", texts(cmts.list));
-            sCmts = slot2++;
-        }
-        if (global.size() > 0) {
-            Pg.Arr l = new Pg.Arr(Pg.INT8), o = new Pg.Arr(Pg.INT8);
-            for (LimOff x : global.list) {
-                l.i64(x.lim);
-                o.i64(x.off);
+        private void sendLookups() {
+            if (prof.size() > 0) {
+                pg.exec("prof", texts(prof.list));
+                sProf = slot2++;
             }
-            pg.exec("global", l.done(), o.done());
-            sGlobal = slot2++;
-        }
-        for (int f = 0; f < 3; f++) {
-            if (listPage[f].size() == 0) continue;
-            Pg.Arr k = new Pg.Arr(Pg.TEXT), l = new Pg.Arr(Pg.INT8), o = new Pg.Arr(Pg.INT8);
-            for (KeyPage x : listPage[f].list) {
-                k.text(x.key);
-                l.i64(x.lim);
-                o.i64(x.off);
+            if (aslug.size() > 0) {
+                pg.exec("aslug", texts(aslug.list));
+                sAslug = slot2++;
             }
-            pg.exec(listStmt[f], texts(listCount[f].list), k.done(), l.done(), o.done());
-            sList[f] = slot2++;
+            if (aid.n > 0) {
+                pg.exec("aid", aid.array());
+                sAid = slot2++;
+            }
+            if (cmts.size() > 0) {
+                pg.exec("cmts", texts(cmts.list));
+                sCmts = slot2++;
+            }
         }
-        int cut2 = slot2 > 0 ? pg.cut() : 0;
-        pg.flush();
 
-        // ---- the first segment: answered now ----
-        Pg.Rows rUid = null, rUemail = null, rTags = null;
-        if (slot1 > 0) {
+        private void sendLists() {
+            String[] listStmt = {"tag", "author", "favlist"};
+            if (global.size() > 0) {
+                Pg.Arr l = new Pg.Arr(Pg.INT8), o = new Pg.Arr(Pg.INT8);
+                for (LimOff x : global.list) {
+                    l.i64(x.lim);
+                    o.i64(x.off);
+                }
+                pg.exec("global", l.done(), o.done());
+                sGlobal = slot2++;
+            }
+            for (int f = 0; f < 3; f++) {
+                if (listPage[f].size() == 0) continue;
+                Pg.Arr k = new Pg.Arr(Pg.TEXT), l = new Pg.Arr(Pg.INT8), o = new Pg.Arr(Pg.INT8);
+                for (KeyPage x : listPage[f].list) {
+                    k.text(x.key);
+                    l.i64(x.lim);
+                    o.i64(x.off);
+                }
+                pg.exec(listStmt[f], texts(listCount[f].list), k.done(), l.done(), o.done());
+                sList[f] = slot2++;
+            }
+        }
+
+        /** The first segment is answered now. */
+        void receiveFirstSegment() throws java.io.IOException {
+            if (slot1 == 0) return;
             List<Pg.Rows> p1 = checked(pg.receive(cut1), "phase A");
             rTags = sTags >= 0 ? p1.get(sTags) : null;
-            rUid = sUid >= 0 ? p1.get(sUid) : null;
-            rUemail = sUemail >= 0 ? p1.get(sUemail) : null;
+            Pg.Rows rUid = sUid >= 0 ? p1.get(sUid) : null;
+            Pg.Rows rUemail = sUemail >= 0 ? p1.get(sUemail) : null;
             early(jobs, ask, rTags, rUid, uid.n, rUemail, uemail.size(), out);
             Http.deliver(out);
             out.clear();
         }
 
-        // ---- the rest of phase A ----
-        List<Pg.Rows> pa = slot2 > 0 ? checked(pg.receive(cut2), "phase A") : List.of();
-        Pg.Rows rFeed = feed.n == 0 ? null : fp != pg ? checked(fp.receive(feedCut), "feed").get(0) : pa.get(sFeed);
-        Pg.Rows rProf = sProf >= 0 ? pa.get(sProf) : null, rAslug = sAslug >= 0 ? pa.get(sAslug) : null,
-                rAid = sAid >= 0 ? pa.get(sAid) : null, rCmts = sCmts >= 0 ? pa.get(sCmts) : null;
-        int[] fProf = firstRows(rProf, prof.size()), fAslug = firstRows(rAslug, aslug.size()), fAid = firstRows(rAid, aid.n);
-        Page[] gCmts = new Page[cmts.size()];
-        for (int i = 0; i < gCmts.length; i++) {
-            gCmts[i] = new Page();
-            gCmts[i].rows = rCmts;
+        void receivePhaseA() throws java.io.IOException {
+            List<Pg.Rows> pa = slot2 > 0 ? checked(pg.receive(cut2), "phase A") : List.of();
+            Pg.Rows rFeed = feed.n == 0 ? null : fp != pg ? checked(fp.receive(feedCut), "feed").get(0) : pa.get(sFeed);
+            rProf = sProf >= 0 ? pa.get(sProf) : null;
+            rAslug = sAslug >= 0 ? pa.get(sAslug) : null;
+            rAid = sAid >= 0 ? pa.get(sAid) : null;
+            rCmts = sCmts >= 0 ? pa.get(sCmts) : null;
+            fProf = firstRows(rProf, prof.size());
+            fAslug = firstRows(rAslug, aslug.size());
+            fAid = firstRows(rAid, aid.n);
+            gCmts = groupComments(rCmts, cmts.size());
+            lGlobal = decodeList(sGlobal >= 0 ? pa.get(sGlobal) : null, 1, global.size());
+            for (int f = 0; f < 3; f++) lList[f] = decodeList(sList[f] >= 0 ? pa.get(sList[f]) : null, listCount[f].size(), listPage[f].size());
+            lFeed = decodeList(rFeed, feed.n, feedPage.size());
         }
-        if (rCmts != null) {
-            for (int i = 0; i < rCmts.nrows; i++) {
-                long k = rCmts.i64(i, 0);
-                if (k >= 1 && k <= gCmts.length) gCmts[(int) k - 1].add(i);
-            }
-        }
-        ListRes lGlobal = decodeList(sGlobal >= 0 ? pa.get(sGlobal) : null, 1, global.size());
-        ListRes[] lList = new ListRes[3];
-        for (int f = 0; f < 3; f++) lList[f] = decodeList(sList[f] >= 0 ? pa.get(sList[f]) : null, listCount[f].size(), listPage[f].size());
-        ListRes lFeed = decodeList(rFeed, feed.n, feedPage.size());
 
-        // ---- phase B keys ----
-        ArtSet as = new ArtSet();
-        LongKeys authors = new LongKeys();
-        PairKeys favd = new PairKeys(), foll = new PairKeys();
-        for (int i = 0; i < nj; i++) {
-            Job j = jobs.get(i);
-            if (j.done) continue;
-            long v = j.viewer;
-            switch (j.kind) {
-                case Job.ARTICLE -> {
-                    int r = fAslug[ask[i]];
-                    if (r >= 0) as.add(rAslug, r, v, favd, foll);
-                }
-                case Job.ARTICLE_ID -> {
-                    int r = fAid[ask[i]];
-                    if (r >= 0) as.add(rAid, r, v, favd, foll);
-                }
-                case Job.GLOBAL -> as.addPage(lGlobal.pages[ask[i]], v, favd, foll);
-                case Job.TAG, Job.AUTHOR, Job.FAVORITED -> as.addPage(lList[j.kind - Job.TAG].pages[ask2[i]], v, favd, foll);
-                // a feed's articles are by followed authors: no follow probe
-                case Job.FEED -> as.addPage(lFeed.pages[ask2[i]], v, favd, null);
-                case Job.COMMENTS -> {
-                    Page p = gCmts[ask[i]];
-                    for (int x = 0; x < p.n; x++) {
-                        if (rCmts.isNull(p.idx[x], 2)) continue;
-                        long author = rCmts.i64(p.idx[x], 6);
-                        authors.idx(author);
-                        if (v != 0) foll.idx(v, author);
+        void collectPhaseBKeys() {
+            for (int i = 0; i < nj; i++) {
+                Job j = jobs.get(i);
+                if (j.done) continue;
+                long v = j.viewer;
+                switch (j.kind) {
+                    case Job.ARTICLE -> {
+                        int r = fAslug[ask[i]];
+                        if (r >= 0) as.add(rAslug, r, v, favd, foll);
+                    }
+                    case Job.ARTICLE_ID -> {
+                        int r = fAid[ask[i]];
+                        if (r >= 0) as.add(rAid, r, v, favd, foll);
+                    }
+                    case Job.GLOBAL -> as.addPage(lGlobal.pages[ask[i]], v, favd, foll);
+                    case Job.TAG, Job.AUTHOR, Job.FAVORITED -> as.addPage(lList[j.kind - Job.TAG].pages[ask2[i]], v, favd, foll);
+                    // a feed's articles are by followed authors: no follow probe
+                    case Job.FEED -> as.addPage(lFeed.pages[ask2[i]], v, favd, null);
+                    case Job.COMMENTS -> addCommentAuthors(gCmts[ask[i]], v);
+                    case Job.PROFILE -> {
+                        int r = fProf[ask[i]];
+                        if (v != 0 && r >= 0) foll.idx(v, rProf.i64(r, 1));
+                    }
+                    default -> {
                     }
                 }
-                case Job.PROFILE -> {
-                    int r = fProf[ask[i]];
-                    if (v != 0 && r >= 0) foll.idx(v, rProf.i64(r, 1));
-                }
-                default -> {
-                }
             }
         }
 
-        // ---- phase B ----
-        Pg.Rows rArtrow = null, rAuser = null, rArtx = null, rFlags = null;
-        LongKeys bare = as.bare();
-        if (as.ids.n > 0 || authors.n > 0 || favd.n + foll.n > 0) {
+        private void addCommentAuthors(Page p, long v) {
+            for (int x = 0; x < p.n; x++) {
+                if (rCmts.isNull(p.idx[x], 2)) continue;
+                long author = rCmts.i64(p.idx[x], 6);
+                authors.idx(author);
+                if (v != 0) foll.idx(v, author);
+            }
+        }
+
+        void runPhaseB() throws java.io.IOException {
+            LongKeys bare = as.bare();
+            if (as.ids.n == 0 && authors.n == 0 && favd.n + foll.n == 0) return;
             int nb = 0, bArtrow = -1, bAuser = -1, bArtx = -1, bFlags = -1;
             if (bare.n > 0) {
                 pg.exec("artrow", bare.array());
@@ -404,16 +490,7 @@ final class ReadLane implements Runnable {
                 bArtx = nb++;
             }
             if (favd.n + foll.n > 0) {
-                Pg.Arr fv = new Pg.Arr(Pg.INT8), fa = new Pg.Arr(Pg.INT8), ov = new Pg.Arr(Pg.INT8), ou = new Pg.Arr(Pg.INT8);
-                for (int i = 0; i < favd.n; i++) {
-                    fv.i64(favd.a[i]);
-                    fa.i64(favd.b[i]);
-                }
-                for (int i = 0; i < foll.n; i++) {
-                    ov.i64(foll.a[i]);
-                    ou.i64(foll.b[i]);
-                }
-                pg.exec("flags", fv.done(), fa.done(), ov.done(), ou.done());
+                sendFlags();
                 bFlags = nb++;
             }
             List<Pg.Rows> pb = checked(pg.run(), "phase B");
@@ -422,136 +499,127 @@ final class ReadLane implements Runnable {
             if (bArtx >= 0) rArtx = pb.get(bArtx);
             if (bFlags >= 0) rFlags = pb.get(bFlags);
         }
-        if (rArtrow != null) for (int i = 0; i < rArtrow.nrows; i++) as.source(rArtrow.i64(i, 1), rArtrow, i);
-        int[] authorRow = new int[authors.n];
-        Arrays.fill(authorRow, -1);
-        if (rAuser != null) {
-            for (int i = 0; i < rAuser.nrows; i++) {
-                int k = authors.find(rAuser.i64(i, 0));
-                if (k >= 0) authorRow[k] = i;
-            }
-        }
-        int[] artRow = new int[as.ids.n];
-        Arrays.fill(artRow, -1);
-        if (rArtx != null) {
-            for (int i = 0; i < rArtx.nrows; i++) {
-                int k = as.ids.find(rArtx.i64(i, 0));
-                if (k >= 0) artRow[k] = i;
-            }
-        }
-        boolean[] isFav = new boolean[favd.n], isFoll = new boolean[foll.n];
-        if (rFlags != null) {
-            for (int i = 0; i < rFlags.nrows; i++) {
-                long kind = rFlags.i64(i, 0);
-                long a = rFlags.i64(i, 1), b = rFlags.i64(i, 2);
-                int k = kind == 0 ? favd.find(a, b) : foll.find(a, b);
-                if (k >= 0) {
-                    if (kind == 0) isFav[k] = true;
-                    else isFoll[k] = true;
-                }
-            }
-        }
-        Ctx ctx = new Ctx(rArtx, as, artRow, rTags, favd, foll, isFav, isFoll);
 
-        // ---- assemble ----
-        for (int i = 0; i < nj; i++) {
-            Job j = jobs.get(i);
-            if (j.done) continue;
-            long v = j.viewer;
-            switch (j.kind) {
-                case Job.PROFILE -> {
-                    int r = fProf[ask[i]];
-                    if (r < 0) {
-                        out.add(new Http.Resp(j.conn, E404_PROFILE));
-                        break;
-                    }
-                    Buf b = body();
-                    b.ascii("{\"profile\":{\"username\":");
-                    rProf.json(b, r, 2);
-                    b.ascii(",\"bio\":");
-                    rProf.json(b, r, 3);
-                    b.ascii(",\"image\":");
-                    rProf.json(b, r, 4);
-                    b.ascii(",\"following\":").bool(v != 0 && ctx.following(v, rProf.i64(r, 1))).ascii("}}");
-                    out.add(new Http.Resp(j.conn, Http.json(200, b)));
-                }
-                case Job.ARTICLE, Job.ARTICLE_ID -> {
-                    Pg.Rows rr = j.kind == Job.ARTICLE ? rAslug : rAid;
-                    int r = (j.kind == Job.ARTICLE ? fAslug : fAid)[ask[i]];
-                    Buf b = body();
-                    b.ascii("{\"article\":");
-                    if (r >= 0 && ctx.article(b, rr, r, true, v, false)) {
-                        b.b('}');
-                        out.add(new Http.Resp(j.conn, Http.json(j.status, b)));
-                    } else out.add(new Http.Resp(j.conn, E404_ARTICLE));
-                }
-                case Job.COMMENTS -> {
-                    Page p = gCmts[ask[i]];
-                    if (p.n == 0) {
-                        out.add(new Http.Resp(j.conn, E404_ARTICLE));
-                        break;
-                    }
-                    // newest first: created_at DESC, id DESC
-                    int[] idx = new int[p.n];
-                    int m = 0;
-                    for (int x = 0; x < p.n; x++) {
-                        if (rCmts.isNull(p.idx[x], 2)) continue;
-                        int k = authors.find(rCmts.i64(p.idx[x], 6));
-                        if (k >= 0 && authorRow[k] >= 0) idx[m++] = p.idx[x];
-                    }
-                    sortComments(rCmts, idx, m);
-                    Buf b = body();
-                    b.ascii("{\"comments\":[");
-                    for (int x = 0; x < m; x++) {
-                        int r = idx[x];
-                        long author = rCmts.i64(r, 6);
-                        int ar = authorRow[authors.find(author)];
-                        if (x > 0) b.b(',');
-                        b.ascii("{\"id\":").num(rCmts.i64(r, 2));
-                        b.ascii(",\"createdAt\":").ts(rCmts.i64(r, 4));
-                        b.ascii(",\"updatedAt\":").ts(rCmts.i64(r, 5));
-                        b.ascii(",\"body\":");
-                        rCmts.json(b, r, 3);
-                        b.ascii(",\"author\":{\"username\":");
-                        rAuser.json(b, ar, 1);
-                        b.ascii(",\"bio\":");
-                        rAuser.json(b, ar, 2);
-                        b.ascii(",\"image\":");
-                        rAuser.json(b, ar, 3);
-                        b.ascii(",\"following\":").bool(v != 0 && ctx.following(v, author)).ascii("}}");
-                    }
-                    b.ascii("]}");
-                    out.add(new Http.Resp(j.conn, Http.json(200, b)));
-                }
-                case Job.GLOBAL, Job.TAG, Job.AUTHOR, Job.FAVORITED, Job.FEED -> {
-                    Page p;
-                    long count;
-                    if (j.kind == Job.GLOBAL) {
-                        p = lGlobal.pages[ask[i]];
-                        count = lGlobal.counts[0];
-                    } else if (j.kind == Job.FEED) {
-                        p = lFeed.pages[ask2[i]];
-                        count = lFeed.counts[ask[i]];
-                    } else {
-                        ListRes lr = lList[j.kind - Job.TAG];
-                        p = lr.pages[ask2[i]];
-                        count = lr.counts[ask[i]];
-                    }
-                    Buf b = body();
-                    b.ascii("{\"articles\":[");
-                    boolean first = true;
-                    boolean feedPageOf = j.kind == Job.FEED;
-                    for (int x = 0; x < p.n; x++) {
-                        int mark = b.n;
-                        if (!first) b.b(',');
-                        if (ctx.article(b, p.rows, p.idx[x], false, v, feedPageOf)) first = false;
-                        else b.n = mark;
-                    }
-                    b.ascii("],\"articlesCount\":").num(count).b('}');
-                    out.add(new Http.Resp(j.conn, Http.json(200, b)));
-                }
-                default -> out.add(new Http.Resp(j.conn, E500));
+        private void sendFlags() {
+            Pg.Arr fv = new Pg.Arr(Pg.INT8), fa = new Pg.Arr(Pg.INT8), ov = new Pg.Arr(Pg.INT8), ou = new Pg.Arr(Pg.INT8);
+            for (int i = 0; i < favd.n; i++) {
+                fv.i64(favd.a[i]);
+                fa.i64(favd.b[i]);
             }
+            for (int i = 0; i < foll.n; i++) {
+                ov.i64(foll.a[i]);
+                ou.i64(foll.b[i]);
+            }
+            pg.exec("flags", fv.done(), fa.done(), ov.done(), ou.done());
+        }
+
+        void indexPhaseB() {
+            if (rArtrow != null) as.sources(rArtrow);
+            authorRow = rowOfKey(authors, rAuser);
+            int[] artRow = rowOfKey(as.ids, rArtx);
+            boolean[] isFav = new boolean[favd.n], isFoll = new boolean[foll.n];
+            if (rFlags != null) markFlags(rFlags, favd, foll, isFav, isFoll);
+            ctx = new Ctx(rArtx, as, artRow, rTags, favd, foll, isFav, isFoll);
+        }
+
+        void assemble() {
+            for (int i = 0; i < nj; i++) {
+                Job j = jobs.get(i);
+                if (j.done) continue;
+                switch (j.kind) {
+                    case Job.PROFILE -> answerProfile(j, fProf[ask[i]]);
+                    case Job.ARTICLE -> answerArticle(j, rAslug, fAslug[ask[i]]);
+                    case Job.ARTICLE_ID -> answerArticle(j, rAid, fAid[ask[i]]);
+                    case Job.COMMENTS -> answerComments(j, gCmts[ask[i]]);
+                    case Job.GLOBAL -> answerList(j, lGlobal.pages[ask[i]], lGlobal.counts[0]);
+                    case Job.FEED -> answerList(j, lFeed.pages[ask2[i]], lFeed.counts[ask[i]]);
+                    case Job.TAG, Job.AUTHOR, Job.FAVORITED -> {
+                        ListRes lr = lList[j.kind - Job.TAG];
+                        answerList(j, lr.pages[ask2[i]], lr.counts[ask[i]]);
+                    }
+                    default -> out.add(new Http.Resp(j.conn, E500));
+                }
+            }
+        }
+
+        private void answerProfile(Job j, int r) {
+            if (r < 0) {
+                out.add(new Http.Resp(j.conn, E404_PROFILE));
+                return;
+            }
+            long v = j.viewer;
+            Buf b = body();
+            b.ascii("{\"profile\":{\"username\":");
+            rProf.json(b, r, 2);
+            b.ascii(",\"bio\":");
+            rProf.json(b, r, 3);
+            b.ascii(",\"image\":");
+            rProf.json(b, r, 4);
+            b.ascii(",\"following\":").bool(v != 0 && ctx.following(v, rProf.i64(r, 1))).ascii("}}");
+            out.add(new Http.Resp(j.conn, Http.json(200, b)));
+        }
+
+        private void answerArticle(Job j, Pg.Rows rr, int r) {
+            Buf b = body();
+            b.ascii("{\"article\":");
+            if (r >= 0 && ctx.article(b, rr, r, true, j.viewer, false)) {
+                b.b('}');
+                out.add(new Http.Resp(j.conn, Http.json(j.status, b)));
+            } else out.add(new Http.Resp(j.conn, E404_ARTICLE));
+        }
+
+        private void answerComments(Job j, Page p) {
+            if (p.n == 0) {
+                out.add(new Http.Resp(j.conn, E404_ARTICLE));
+                return;
+            }
+            long v = j.viewer;
+            // newest first: created_at DESC, id DESC
+            int[] idx = new int[p.n];
+            int m = 0;
+            for (int x = 0; x < p.n; x++) {
+                if (rCmts.isNull(p.idx[x], 2)) continue;
+                int k = authors.find(rCmts.i64(p.idx[x], 6));
+                if (k >= 0 && authorRow[k] >= 0) idx[m++] = p.idx[x];
+            }
+            sortComments(rCmts, idx, m);
+            Buf b = body();
+            b.ascii("{\"comments\":[");
+            for (int x = 0; x < m; x++) {
+                int r = idx[x];
+                long author = rCmts.i64(r, 6);
+                int ar = authorRow[authors.find(author)];
+                if (x > 0) b.b(',');
+                b.ascii("{\"id\":").num(rCmts.i64(r, 2));
+                b.ascii(",\"createdAt\":").ts(rCmts.i64(r, 4));
+                b.ascii(",\"updatedAt\":").ts(rCmts.i64(r, 5));
+                b.ascii(",\"body\":");
+                rCmts.json(b, r, 3);
+                b.ascii(",\"author\":{\"username\":");
+                rAuser.json(b, ar, 1);
+                b.ascii(",\"bio\":");
+                rAuser.json(b, ar, 2);
+                b.ascii(",\"image\":");
+                rAuser.json(b, ar, 3);
+                b.ascii(",\"following\":").bool(v != 0 && ctx.following(v, author)).ascii("}}");
+            }
+            b.ascii("]}");
+            out.add(new Http.Resp(j.conn, Http.json(200, b)));
+        }
+
+        private void answerList(Job j, Page p, long count) {
+            Buf b = body();
+            b.ascii("{\"articles\":[");
+            boolean first = true;
+            boolean feedPageOf = j.kind == Job.FEED;
+            for (int x = 0; x < p.n; x++) {
+                int mark = b.n;
+                if (!first) b.b(',');
+                if (ctx.article(b, p.rows, p.idx[x], false, j.viewer, feedPageOf)) first = false;
+                else b.n = mark;
+            }
+            b.ascii("],\"articlesCount\":").num(count).b('}');
+            out.add(new Http.Resp(j.conn, Http.json(200, b)));
         }
     }
 
@@ -675,11 +743,14 @@ final class ReadLane implements Runnable {
             return b;
         }
 
-        void source(long id, Pg.Rows r, int row) {
-            int k = ids.find(id);
-            if (k >= 0 && src[k] == null) {
-                src[k] = r;
-                srcRow[k] = row;
+        /** Takes columns for the bare articles from the artrow statement's rows ([k, id, ...]). */
+        void sources(Pg.Rows r) {
+            for (int i = 0; i < r.nrows; i++) {
+                int k = ids.find(r.i64(i, 1));
+                if (k >= 0 && src[k] == null) {
+                    src[k] = r;
+                    srcRow[k] = i;
+                }
             }
         }
     }

@@ -4,7 +4,7 @@ Front: direct
 
 | | |
 |---|---|
-| Language / runtime | Java 25, Eclipse Temurin 25.0.4.1 (official tarball, SHA-256 pinned in `install.sh`) |
+| Language / runtime | Java 25, Eclipse Temurin 25.0.5 (official tarball, SHA-256 pinned in `install.sh`) |
 | HTTP | Hand-written HTTP/1.1 on `java.nio` selector loops, one `SO_REUSEPORT` listener per loop |
 | Postgres driver | Own v3 wire-protocol client (SCRAM-SHA-256, named prepared statements, pipelining, binary rows) |
 | JSON, JWT | Own JSON parser and writer; HS256 on `javax.crypto.Mac` |
