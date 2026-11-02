@@ -16,7 +16,7 @@ Every submission on the same box: **8 dedicated vCPU / 16 GB**, Postgres 18 on t
 | 10 | **140,000** | [kotlin-raw-luben93](submissions/kotlin-raw-luben93) | [#164](https://github.com/arjaythedev/multicore-server-challenge/pull/164) @luben93 | direct | 34,822 | 489 | 631 | 49% / 49% |  |
 | 11 | **140,000** | [nish-std-amritk](submissions/nish-std-amritk) | [#159](https://github.com/arjaythedev/multicore-server-challenge/pull/159) @amritk | direct | 35,557 | 316 | 389 | 29% / 62% |  |
 | 12 | **128,000** | [go-epoll-MegaPanchamZ](submissions/go-epoll-MegaPanchamZ) | [#99](https://github.com/arjaythedev/multicore-server-challenge/pull/99) @MegaPanchamZ | direct | 33,272 | 479 | 625 | 29% / 67% |  |
-| 13 | **128,000** | [java-servlet-clickin](submissions/java-servlet-clickin) | [#149](https://github.com/arjaythedev/multicore-server-challenge/pull/149) @Clickin | direct | 32,389 | 379 | 518 | 48% / 47% |  |
+| 13 | **128,000** | [java-servlet-clickin](submissions/java-servlet-clickin) | [#178](https://github.com/arjaythedev/multicore-server-challenge/pull/178) @Clickin | direct | 32,389 | 379 | 518 | 48% / 47% |  |
 | 14 | **128,000** | [java-vertx-bowbahdoe](submissions/java-vertx-bowbahdoe) | [#137](https://github.com/arjaythedev/multicore-server-challenge/pull/137) @bowbahdoe | direct | 32,427 | 340 | 547 | 46% / 51% |  |
 | 15 | **128,000** | [rust-epoll-someoneidoknow](submissions/rust-epoll-someoneidoknow) | [#50](https://github.com/arjaythedev/multicore-server-challenge/pull/50) @someoneidoknow | direct | 32,988 | 254 | 357 | 33% / 63% |  |
 | 16 | **120,000** | [c-iouring-aslahtp](submissions/c-iouring-aslahtp) | [#123](https://github.com/arjaythedev/multicore-server-challenge/pull/123) @aslahtp | direct | 30,222 | 492 | 699 | 23% / 63% |  |
