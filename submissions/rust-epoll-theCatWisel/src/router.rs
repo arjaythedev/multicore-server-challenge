@@ -7,6 +7,10 @@ use crate::codec::{self, JsonMap, JsonVal};
 use crate::engine::{self, CryptoTask, ReadOp, ReadTask, WriteOp, WriteTask};
 use crate::reactor::{self, ReplyAddr};
 
+pub trait Timestamped {
+    fn enqueued_at(&self) -> Instant;
+}
+
 struct QueueInner<T> {
     q: VecDeque<T>,
     since: Option<Instant>,
@@ -19,7 +23,7 @@ pub struct WorkQueue<T> {
     ready: Condvar,
 }
 
-impl<T> WorkQueue<T> {
+impl<T: Timestamped> WorkQueue<T> {
     pub const fn new() -> Self {
         WorkQueue {
             inner: Mutex::new(QueueInner {
@@ -32,11 +36,16 @@ impl<T> WorkQueue<T> {
         }
     }
 
+    pub fn peek_state(&self) -> (usize, Option<Instant>) {
+        let g = self.inner.lock().unwrap();
+        (g.q.len(), g.since)
+    }
+
     pub fn push(&self, item: T) {
         let mut g = self.inner.lock().unwrap();
         let was_empty = g.q.is_empty();
         if was_empty {
-            g.since = Some(Instant::now());
+            g.since = Some(item.enqueued_at());
         }
         g.q.push_back(item);
         let notify = g.waiting > 0 && (was_empty || g.q.len() >= g.hold);
@@ -49,9 +58,11 @@ impl<T> WorkQueue<T> {
     pub fn push_front(&self, item: T) {
         let mut g = self.inner.lock().unwrap();
         let was_empty = g.q.is_empty();
-        if was_empty {
-            g.since = Some(Instant::now());
-        }
+        let ts = item.enqueued_at();
+        g.since = Some(match g.since {
+            Some(prev) => prev.min(ts),
+            None => ts,
+        });
         g.q.push_front(item);
         let notify = g.waiting > 0 && (was_empty || g.q.len() >= g.hold);
         drop(g);
@@ -71,7 +82,7 @@ impl<T> WorkQueue<T> {
         let mut g = self.inner.lock().unwrap();
         let was_empty = g.q.is_empty();
         if was_empty {
-            g.since = Some(Instant::now());
+            g.since = batch.first().map(|x| x.enqueued_at());
         }
         g.q.extend(batch.drain(..));
         let notify = g.waiting > 0 && (was_empty || g.q.len() >= g.hold);
@@ -87,8 +98,12 @@ impl<T> WorkQueue<T> {
         }
         let mut g = self.inner.lock().unwrap();
         let was_empty = g.q.is_empty();
-        if was_empty {
-            g.since = Some(Instant::now());
+        if let Some(first) = batch.first() {
+            let ts = first.enqueued_at();
+            g.since = Some(match g.since {
+                Some(prev) => prev.min(ts),
+                None => ts,
+            });
         }
         for item in batch.drain(..).rev() {
             g.q.push_front(item);
@@ -110,14 +125,53 @@ impl<T> WorkQueue<T> {
         }
         let take_n = g.q.len().min(max_items);
         dst.extend(g.q.drain(..take_n));
-        if g.q.is_empty() {
-            g.since = None;
-        } else {
-            g.since = Some(Instant::now());
+        if let Some(front) = g.q.front() {
+            g.since = Some(front.enqueued_at());
             if g.waiting > 0 {
                 self.ready.notify_one();
             }
+        } else {
+            g.since = None;
         }
+    }
+
+    pub fn try_take_aged(
+        &self,
+        want: usize,
+        max_age: Duration,
+        max_cap: usize,
+        dst: &mut Vec<T>,
+    ) -> usize {
+        let mut g = self.inner.lock().unwrap();
+        if g.q.is_empty() {
+            return 0;
+        }
+        if !max_age.is_zero() && g.q.len() < want {
+            let deadline = g.since.unwrap_or_else(Instant::now) + max_age;
+            while g.q.len() < want {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                g.hold = want;
+                g.waiting += 1;
+                g = self.ready.wait_timeout(g, deadline - now).unwrap().0;
+                g.waiting -= 1;
+                g.hold = 1;
+            }
+        }
+        let take_n = g.q.len().min(max_cap);
+        dst.extend(g.q.drain(..take_n));
+        let rem = g.q.len();
+        if let Some(front) = g.q.front() {
+            g.since = Some(front.enqueued_at());
+            if g.waiting > 0 {
+                self.ready.notify_one();
+            }
+        } else {
+            g.since = None;
+        }
+        rem
     }
 
     pub fn take_aged(
@@ -150,13 +204,13 @@ impl<T> WorkQueue<T> {
         }
         let take_n = g.q.len().min(max_cap);
         dst.extend(g.q.drain(..take_n));
-        if g.q.is_empty() {
-            g.since = None;
-        } else {
-            g.since = Some(Instant::now());
+        if let Some(front) = g.q.front() {
+            g.since = Some(front.enqueued_at());
             if g.waiting > 0 {
                 self.ready.notify_one();
             }
+        } else {
+            g.since = None;
         }
     }
 }
@@ -408,13 +462,23 @@ fn verify_auth_header<'a>(signer: &TokenSigner, raw_hdr: Option<&'a [u8]>) -> Au
 
 #[inline]
 fn enqueue_read(op: ReadOp, viewer: i64, addr: ReplyAddr) -> Dispatch {
-    engine::READ_QUEUE.push(ReadTask { op, viewer, addr });
+    engine::enqueue_read_task(ReadTask {
+        op,
+        viewer,
+        addr,
+        enqueued_at: Instant::now(),
+    });
     Dispatch::Enqueued
 }
 
 #[inline]
 fn enqueue_write(op: WriteOp, viewer: i64, addr: ReplyAddr) -> Dispatch {
-    engine::WRITE_QUEUE.push(WriteTask { op, viewer, addr });
+    engine::WRITE_QUEUE.push(WriteTask {
+        op,
+        viewer,
+        addr,
+        enqueued_at: Instant::now(),
+    });
     Dispatch::Enqueued
 }
 
@@ -623,6 +687,7 @@ fn handle_register(body: &[u8], addr: ReplyAddr) -> Dispatch {
     if password.len() > BCRYPT_MAX_BYTES {
         return fail_now(422, "password exceeds maximum length");
     }
+    let now = Instant::now();
     let task = WriteTask {
         op: WriteOp::Register {
             username,
@@ -631,10 +696,12 @@ fn handle_register(body: &[u8], addr: ReplyAddr) -> Dispatch {
         },
         viewer: 0,
         addr,
+        enqueued_at: now,
     };
     engine::CRYPTO_QUEUE.push(CryptoTask::HashPassword {
         password: password.into_bytes(),
         write: task,
+        enqueued_at: now,
     });
     Dispatch::Enqueued
 }
@@ -649,13 +716,14 @@ fn handle_login(body: &[u8], addr: ReplyAddr) -> Dispatch {
     if email.contains('\0') || password.len() > BCRYPT_MAX_BYTES {
         return fail_now(401, "invalid credentials");
     }
-    engine::READ_QUEUE.push_front(ReadTask {
+    engine::enqueue_read_front(ReadTask {
         op: ReadOp::Login {
             email,
             password: password.into_bytes(),
         },
         viewer: 0,
         addr,
+        enqueued_at: Instant::now(),
     });
     Dispatch::Enqueued
 }
@@ -685,13 +753,16 @@ fn handle_update_user(body: &[u8], uid: i64, token: String, addr: ReplyAddr) -> 
     match password {
         Some(pw) if pw.len() > BCRYPT_MAX_BYTES => fail_now(422, "password exceeds maximum length"),
         Some(pw) => {
+            let now = Instant::now();
             engine::CRYPTO_QUEUE.push(CryptoTask::HashPassword {
                 password: pw.into_bytes(),
                 write: WriteTask {
                     op,
                     viewer: uid,
                     addr,
+                    enqueued_at: now,
                 },
+                enqueued_at: now,
             });
             Dispatch::Enqueued
         }

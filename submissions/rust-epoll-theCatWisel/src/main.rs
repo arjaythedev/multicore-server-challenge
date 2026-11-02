@@ -76,10 +76,11 @@ fn main() {
             .spawn(move || worker.run_loop())
             .unwrap();
     }
-    for _ in 0..crypto_workers {
+    for idx in 0..crypto_workers {
+        let is_watchdog = idx == 0;
         std::thread::Builder::new()
             .name("crypto".into())
-            .spawn(move || engine::run_crypto_worker(cfg))
+            .spawn(move || engine::run_crypto_worker(cfg, is_watchdog))
             .unwrap();
     }
 
@@ -93,6 +94,7 @@ fn main() {
                 .name("io-reactor".into())
                 .spawn(move || {
                     reactor::unshare_files();
+                    reactor::set_thread_nice(5);
                     let lfd = reactor::bind_listener(&host, bind_port).expect("failed to bind listener");
                     let srv = reactor::Reactor::new(idx as u16, lfd, signer, fd_budget)
                         .expect("failed to init epoll reactor");

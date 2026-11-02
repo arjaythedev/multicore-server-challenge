@@ -15,6 +15,7 @@ pub mod sys {
     pub const PR_SET_THP_DISABLE: c_int = 41;
     pub const M_ARENA_MAX: c_int = -8;
     pub const SCHED_BATCH: c_int = 3;
+    pub const PRIO_PROCESS: c_int = 0;
     pub const CLONE_FILES: c_int = 0x0000_0400;
     pub const RLIMIT_NOFILE: c_int = 7;
     pub const EFD_NONBLOCK: c_int = 0o4000;
@@ -107,6 +108,7 @@ pub mod sys {
         pub fn prctl(option: c_int, arg2: usize, arg3: usize, arg4: usize, arg5: usize) -> c_int;
         pub fn mallopt(param: c_int, value: c_int) -> c_int;
         pub fn sched_setscheduler(pid: c_int, policy: c_int, param: *const sched_param) -> c_int;
+        pub fn setpriority(which: c_int, who: u32, prio: c_int) -> c_int;
         pub fn unshare(flags: c_int) -> c_int;
         pub fn getrlimit(resource: c_int, rlim: *mut rlimit) -> c_int;
         pub fn setrlimit(resource: c_int, rlim: *const rlimit) -> c_int;
@@ -148,6 +150,12 @@ const LIMIT_BODY: usize = 1024 * 1024;
 pub fn unshare_files() {
     unsafe {
         let _ = sys::unshare(sys::CLONE_FILES);
+    }
+}
+
+pub fn set_thread_nice(nice_val: i32) {
+    unsafe {
+        let _ = sys::setpriority(sys::PRIO_PROCESS, 0, nice_val);
     }
 }
 

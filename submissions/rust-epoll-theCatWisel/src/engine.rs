@@ -1,14 +1,14 @@
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::auth::{self, BcryptInput, TokenSigner};
 use crate::codec;
 use crate::queries;
 use crate::reactor::{self, OutgoingReply, ReplyAddr, ReplyBody};
-use crate::router::WorkQueue;
+use crate::router::{Timestamped, WorkQueue};
 use crate::wire::{
     self, ArrayEncoder, BindParam, Cell, DbEndpoint, PgConn, PgError, PgResult, PipelineBuf, OID_INT8, OID_TEXT,
 };
@@ -32,6 +32,14 @@ pub struct ReadTask {
     pub op: ReadOp,
     pub viewer: i64,
     pub addr: ReplyAddr,
+    pub enqueued_at: Instant,
+}
+
+impl Timestamped for ReadTask {
+    #[inline]
+    fn enqueued_at(&self) -> Instant {
+        self.enqueued_at
+    }
 }
 
 pub enum WriteOp {
@@ -85,6 +93,14 @@ pub struct WriteTask {
     pub op: WriteOp,
     pub viewer: i64,
     pub addr: ReplyAddr,
+    pub enqueued_at: Instant,
+}
+
+impl Timestamped for WriteTask {
+    #[inline]
+    fn enqueued_at(&self) -> Instant {
+        self.enqueued_at
+    }
 }
 
 pub enum CryptoTask {
@@ -93,11 +109,22 @@ pub enum CryptoTask {
         hash: Vec<u8>,
         user: UserRecord,
         addr: ReplyAddr,
+        enqueued_at: Instant,
     },
     HashPassword {
         password: Vec<u8>,
         write: WriteTask,
+        enqueued_at: Instant,
     },
+}
+
+impl Timestamped for CryptoTask {
+    #[inline]
+    fn enqueued_at(&self) -> Instant {
+        match self {
+            CryptoTask::VerifyLogin { enqueued_at, .. } | CryptoTask::HashPassword { enqueued_at, .. } => *enqueued_at,
+        }
+    }
 }
 
 pub struct UserRecord {
@@ -108,17 +135,81 @@ pub struct UserRecord {
     pub image: Option<Vec<u8>>,
 }
 
-pub static READ_QUEUE: WorkQueue<ReadTask> = WorkQueue::new();
+pub const LANE_FAST: usize = 0;
+pub const LANE_CMTS: usize = 1;
+pub const LANE_FEED: usize = 2;
+
+pub static READ_LANES: [WorkQueue<ReadTask>; 3] = [WorkQueue::new(), WorkQueue::new(), WorkQueue::new()];
 static BATCH_LOCK: Mutex<()> = Mutex::new(());
+static READ_DISPATCH_CV: Condvar = Condvar::new();
+static WAITING_READ_WORKERS: AtomicUsize = AtomicUsize::new(0);
 static BUSY_READ_WORKERS: AtomicUsize = AtomicUsize::new(0);
-static EWMA_BATCH_US: AtomicUsize = AtomicUsize::new(0);
-static EWMA_BATCH_LEN: AtomicUsize = AtomicUsize::new(0);
+static INFLIGHT_LANE: [AtomicUsize; 3] = [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)];
+static COALESCING_LANE: [AtomicUsize; 3] = [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)];
+static EWMA_LANE_US: [AtomicUsize; 3] = [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)];
+static EWMA_LANE_LEN: [AtomicUsize; 3] = [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)];
+static TAG_EPOCH: AtomicUsize = AtomicUsize::new(1);
+
 static CRYPTO_LOCK: Mutex<()> = Mutex::new(());
 static BUSY_CRYPTO_WORKERS: AtomicUsize = AtomicUsize::new(0);
 static EWMA_BCRYPT_US: AtomicUsize = AtomicUsize::new(0);
 static EWMA_CRYPTO_LEN: AtomicUsize = AtomicUsize::new(0);
+static LAST_CRYPTO_DONE_US: AtomicUsize = AtomicUsize::new(0);
+static MONO_BOOT: OnceLock<Instant> = OnceLock::new();
+
 pub static WRITE_QUEUE: WorkQueue<WriteTask> = WorkQueue::new();
 pub static CRYPTO_QUEUE: WorkQueue<CryptoTask> = WorkQueue::new();
+
+#[inline]
+fn mono_micros() -> usize {
+    let base = MONO_BOOT.get_or_init(Instant::now);
+    base.elapsed().as_micros() as usize
+}
+
+#[inline]
+pub fn lane_for_op(op: &ReadOp) -> usize {
+    match op {
+        ReadOp::Feed { .. } => LANE_FEED,
+        ReadOp::Comments { .. } => LANE_CMTS,
+        _ => LANE_FAST,
+    }
+}
+
+#[inline]
+pub fn wake_read_dispatcher(lane: usize) {
+    if COALESCING_LANE[lane].load(Ordering::SeqCst) == 0 && WAITING_READ_WORKERS.load(Ordering::SeqCst) > 0 {
+        let _g = BATCH_LOCK.lock().unwrap();
+        READ_DISPATCH_CV.notify_one();
+    }
+}
+
+#[inline]
+pub fn enqueue_read_task(task: ReadTask) {
+    let lane = lane_for_op(&task.op);
+    READ_LANES[lane].push(task);
+    wake_read_dispatcher(lane);
+}
+
+#[inline]
+pub fn enqueue_read_front(task: ReadTask) {
+    let lane = lane_for_op(&task.op);
+    READ_LANES[lane].push_front(task);
+    wake_read_dispatcher(lane);
+}
+
+#[inline]
+pub fn enqueue_read_batch_fast(batch: &mut Vec<ReadTask>) {
+    if batch.is_empty() {
+        return;
+    }
+    READ_LANES[LANE_FAST].push_batch(batch);
+    wake_read_dispatcher(LANE_FAST);
+}
+
+#[inline]
+fn check_task_alive_and_fresh(addr: ReplyAddr, _enqueued_at: Instant, _expired_replies: &mut Vec<OutgoingReply>) -> bool {
+    reactor::is_addr_alive(addr)
+}
 
 pub struct RuntimeConfig {
     pub db: DbEndpoint,
@@ -128,7 +219,10 @@ pub struct RuntimeConfig {
 }
 
 pub fn seed_hardware_ewma(batch_us: usize, bcrypt_us: usize) {
-    EWMA_BATCH_US.store(batch_us, Ordering::Relaxed);
+    let _ = MONO_BOOT.get_or_init(Instant::now);
+    for slot in &EWMA_LANE_US {
+        slot.store(batch_us, Ordering::Relaxed);
+    }
     EWMA_BCRYPT_US.store(bcrypt_us, Ordering::Relaxed);
 }
 
@@ -377,7 +471,8 @@ struct ReadRenderScratch {
     uemail_rows: Vec<Option<wire::RowSpan>>,
     grp_cmts: Vec<Vec<usize>>,
     cmt_sort_buf: Vec<(i64, i64, wire::RowSpan, wire::RowSpan)>,
-    cached_cmts: Vec<Option<Vec<CachedCommentSlice>>>,
+    cmt_slices: Vec<CachedCommentSlice>,
+    cmt_spans: Vec<Option<(u32, u32)>>,
     rendered_profiles: Vec<Option<Arc<[u8]>>>,
     rendered_cmts: Vec<Option<Arc<[u8]>>>,
     rendered_slugs: Vec<Option<Arc<[u8]>>>,
@@ -402,7 +497,8 @@ impl ReadRenderScratch {
             uemail_rows: Vec::with_capacity(32),
             grp_cmts: Vec::with_capacity(64),
             cmt_sort_buf: Vec::with_capacity(128),
-            cached_cmts: Vec::with_capacity(64),
+            cmt_slices: Vec::with_capacity(256),
+            cmt_spans: Vec::with_capacity(64),
             rendered_profiles: Vec::with_capacity(64),
             rendered_cmts: Vec::with_capacity(64),
             rendered_slugs: Vec::with_capacity(64),
@@ -507,13 +603,132 @@ struct CachedCommentSlice {
     end: u32,
 }
 
+fn pick_eligible_lane(
+    rw: usize,
+    bcrypt_lanes: usize,
+    base_batch: usize,
+    max_batch: usize,
+) -> Option<(usize, usize, Duration, usize)> {
+    let max_active = ((rw * 3) / 4).max(3);
+    let busy_total = BUSY_READ_WORKERS.load(Ordering::Relaxed);
+    if busy_total >= max_active {
+        return None;
+    }
+
+    let base_caps = [
+        (rw / 2).max(2),
+        (rw / 4).max(1),
+        (rw / 4).max(1),
+    ];
+
+    let mut q_lens = [0usize; 3];
+    let mut q_sinces: [Option<Instant>; 3] = [None; 3];
+    let mut inflight = [0usize; 3];
+    let mut coalescing = [false; 3];
+    let mut oldest_lane: Option<(usize, Instant)> = None;
+
+    for l in 0..3 {
+        let (len, since) = READ_LANES[l].peek_state();
+        q_lens[l] = len;
+        q_sinces[l] = since;
+        inflight[l] = INFLIGHT_LANE[l].load(Ordering::Relaxed);
+        coalescing[l] = COALESCING_LANE[l].load(Ordering::Acquire) != 0;
+        if len > 0 {
+            if let Some(ts) = since {
+                if oldest_lane.is_none_or(|(_, best_ts)| ts < best_ts) {
+                    oldest_lane = Some((l, ts));
+                }
+            }
+        }
+    }
+
+    let now = Instant::now();
+    let mut chosen: Option<(usize, Instant)> = None;
+    for l in 0..3 {
+        if q_lens[l] == 0 || coalescing[l] {
+            continue;
+        }
+        let ts = q_sinces[l].unwrap_or(now);
+        let age_ms = now.saturating_duration_since(ts).as_millis();
+        let is_oldest = oldest_lane.is_some_and(|(ol, _)| ol == l);
+        let reserved_for_others: usize = (0..3)
+            .filter(|&x| x != l && q_lens[x] > 0 && inflight[x] == 0)
+            .count();
+        let mut cap = base_caps[l];
+        if busy_total + reserved_for_others < max_active
+            || (is_oldest && age_ms >= 15)
+            || (l == LANE_FEED && age_ms >= 60)
+        {
+            cap = (cap + 1).min(max_active);
+        }
+        if inflight[l] < cap {
+            match chosen {
+                None => chosen = Some((l, ts)),
+                Some((prev_l, prev_ts)) => {
+                    if ts + Duration::from_millis(2) < prev_ts
+                        || (prev_ts.saturating_duration_since(ts) <= Duration::from_millis(2) && l < prev_l)
+                    {
+                        chosen = Some((l, ts));
+                    }
+                }
+            }
+        }
+    }
+
+    let (lane, _) = chosen?;
+    let lane_busy = inflight[lane];
+    let ewma_len = EWMA_LANE_LEN[lane].load(Ordering::Relaxed);
+    let tau_us = EWMA_LANE_US[lane].load(Ordering::Relaxed).max(600);
+    let bcrypt_us = EWMA_BCRYPT_US.load(Ordering::Relaxed).max(10_000);
+    let b_lanes = bcrypt_lanes.max(2);
+
+    let (want, max_age) = if busy_total == 0 && ewma_len <= 2 {
+        (rw, Duration::from_micros((tau_us / rw).max(1) as u64))
+    } else {
+        match lane {
+            LANE_FEED => {
+                let min_feed = (rw * 8).max(48);
+                let target = (ewma_len + (ewma_len >> 1)).max(min_feed).min(max_batch);
+                let win_us = if lane_busy == 0 {
+                    (bcrypt_us / b_lanes).max(4_000).min(12_000)
+                } else {
+                    (tau_us / 2).max(bcrypt_us / b_lanes).min(16_000)
+                };
+                (target, Duration::from_micros(win_us as u64))
+            }
+            LANE_CMTS => {
+                let min_cmts = (rw * 6).max(32);
+                let target = (ewma_len + (ewma_len >> 1)).max(min_cmts).min(max_batch);
+                let win_us = if lane_busy == 0 {
+                    (bcrypt_us / b_lanes).max(2_500).min(10_000)
+                } else {
+                    (tau_us / 2).max(bcrypt_us / b_lanes).min(12_000)
+                };
+                (target, Duration::from_micros(win_us as u64))
+            }
+            _ => {
+                let target = (ewma_len + (ewma_len >> 1)).max(base_batch).min(max_batch);
+                let win_us = if lane_busy == 0 {
+                    (bcrypt_us / b_lanes).max(1)
+                } else {
+                    (tau_us / rw).max(bcrypt_us / (b_lanes / 2).max(2)).min(bcrypt_us)
+                };
+                (target, Duration::from_micros(win_us as u64))
+            }
+        }
+    };
+
+    Some((lane, want, max_age, max_batch))
+}
+
 pub struct ReadWorker {
     conn: Option<PgConn>,
     cfg: &'static RuntimeConfig,
     pa: PipelineBuf,
     pb: PipelineBuf,
     arena: Vec<u8>,
-    tag_lut: Vec<Cell>,
+    tag_cache: Vec<Option<Box<[u8]>>>,
+    tag_epoch: usize,
     k_uid: KeySet<i64>,
     k_uemail: KeySet<String>,
     k_prof: KeySet<String>,
@@ -527,6 +742,8 @@ pub struct ReadWorker {
     plan: Vec<PlanSlot>,
     distinct_arts: KeySet<i64>,
     distinct_authors: KeySet<i64>,
+    sorted_arts: Vec<i64>,
+    sorted_authors: Vec<i64>,
     art_author_ords: Vec<u32>,
     art_meta: Vec<MetaSource>,
     meta_req_ids: Vec<i64>,
@@ -561,7 +778,8 @@ impl ReadWorker {
             pa: PipelineBuf::with_capacity(),
             pb: PipelineBuf::with_capacity(),
             arena: Vec::with_capacity(128 * 1024),
-            tag_lut: Vec::with_capacity(256),
+            tag_cache: Vec::with_capacity(256),
+            tag_epoch: 0,
             k_uid: KeySet::new(),
             k_uemail: KeySet::new(),
             k_prof: KeySet::new(),
@@ -575,6 +793,8 @@ impl ReadWorker {
             plan: Vec::with_capacity(256),
             distinct_arts: KeySet::new(),
             distinct_authors: KeySet::new(),
+            sorted_arts: Vec::with_capacity(256),
+            sorted_authors: Vec::with_capacity(128),
             art_author_ords: Vec::with_capacity(256),
             art_meta: Vec::with_capacity(256),
             meta_req_ids: Vec::with_capacity(256),
@@ -614,6 +834,7 @@ impl ReadWorker {
     pub fn run_loop(mut self) {
         let mut tasks = Vec::new();
         let mut err_addrs = Vec::new();
+        let mut expired_replies = Vec::new();
         let rw = self.cfg.read_workers.max(2);
         let lanes = self.cfg.bcrypt_lanes.max(2);
         let num_families = queries::read_catalog().len();
@@ -621,51 +842,75 @@ impl ReadWorker {
         let max_batch = base_batch * rw * 2;
         loop {
             tasks.clear();
-            {
-                let _guard = BATCH_LOCK.lock().unwrap();
-                let busy = BUSY_READ_WORKERS.load(Ordering::Relaxed).min(rw);
-                let ewma_len = EWMA_BATCH_LEN.load(Ordering::Relaxed);
-                let tau_us = EWMA_BATCH_US.load(Ordering::Relaxed);
-                let bcrypt_us = EWMA_BCRYPT_US.load(Ordering::Relaxed);
-                let (want, max_age) = if busy == 0 && ewma_len <= 2 {
-                    (rw, Duration::from_micros((tau_us / rw).max(1) as u64))
-                } else if busy < rw {
-                    let target = (ewma_len + (ewma_len >> 1)).max(base_batch).min(max_batch);
-                    (target, Duration::from_micros((bcrypt_us / lanes).max(1) as u64))
-                } else {
-                    let target = (ewma_len + (ewma_len >> 1)).max(base_batch).min(max_batch);
-                    let window_us = (tau_us / rw).max(bcrypt_us / (lanes / 2).max(2)).min(bcrypt_us);
-                    (target, Duration::from_micros(window_us as u64))
-                };
-                READ_QUEUE.take_aged(want, max_age, max_batch, &mut tasks);
+            let (lane, want, max_age, cap) = {
+                let mut guard = BATCH_LOCK.lock().unwrap();
+                loop {
+                    if let Some(choice) = pick_eligible_lane(rw, lanes, base_batch, max_batch) {
+                        BUSY_READ_WORKERS.fetch_add(1, Ordering::AcqRel);
+                        INFLIGHT_LANE[choice.0].fetch_add(1, Ordering::AcqRel);
+                        COALESCING_LANE[choice.0].store(1, Ordering::SeqCst);
+                        break choice;
+                    }
+                    WAITING_READ_WORKERS.fetch_add(1, Ordering::SeqCst);
+                    if let Some(choice) = pick_eligible_lane(rw, lanes, base_batch, max_batch) {
+                        WAITING_READ_WORKERS.fetch_sub(1, Ordering::SeqCst);
+                        BUSY_READ_WORKERS.fetch_add(1, Ordering::AcqRel);
+                        INFLIGHT_LANE[choice.0].fetch_add(1, Ordering::AcqRel);
+                        COALESCING_LANE[choice.0].store(1, Ordering::SeqCst);
+                        break choice;
+                    }
+                    guard = READ_DISPATCH_CV.wait(guard).unwrap();
+                    WAITING_READ_WORKERS.fetch_sub(1, Ordering::SeqCst);
+                }
+            };
+
+            let leftover = READ_LANES[lane].try_take_aged(want, max_age, cap, &mut tasks);
+            COALESCING_LANE[lane].store(0, Ordering::SeqCst);
+            if leftover > 0 {
+                wake_read_dispatcher(lane);
             }
-            tasks.retain(|t| reactor::is_addr_alive(t.addr));
+
+            expired_replies.clear();
+            tasks.retain(|t| check_task_alive_and_fresh(t.addr, t.enqueued_at, &mut expired_replies));
+            if !expired_replies.is_empty() {
+                reactor::complete_batch(std::mem::take(&mut expired_replies));
+            }
             if tasks.is_empty() {
+                INFLIGHT_LANE[lane].fetch_sub(1, Ordering::AcqRel);
+                BUSY_READ_WORKERS.fetch_sub(1, Ordering::AcqRel);
+                if WAITING_READ_WORKERS.load(Ordering::SeqCst) > 0 {
+                    let _g = BATCH_LOCK.lock().unwrap();
+                    READ_DISPATCH_CV.notify_one();
+                }
                 continue;
             }
             let batch_n = tasks.len();
-            BUSY_READ_WORKERS.fetch_add(1, Ordering::Relaxed);
             let t0 = Instant::now();
             let res = self.execute_batch(&mut tasks, &mut err_addrs);
             let elapsed_us = t0.elapsed().as_micros() as usize;
-            BUSY_READ_WORKERS.fetch_sub(1, Ordering::Relaxed);
+            INFLIGHT_LANE[lane].fetch_sub(1, Ordering::AcqRel);
+            BUSY_READ_WORKERS.fetch_sub(1, Ordering::AcqRel);
+            if WAITING_READ_WORKERS.load(Ordering::SeqCst) > 0 {
+                let _g = BATCH_LOCK.lock().unwrap();
+                READ_DISPATCH_CV.notify_one();
+            }
 
-            let prev_us = EWMA_BATCH_US.load(Ordering::Relaxed);
+            let prev_us = EWMA_LANE_US[lane].load(Ordering::Relaxed);
             let next_us = if prev_us == 0 {
                 elapsed_us
             } else {
                 (prev_us * 3 + elapsed_us) / 4
             }
             .clamp(200, 100_000);
-            EWMA_BATCH_US.store(next_us, Ordering::Relaxed);
+            EWMA_LANE_US[lane].store(next_us, Ordering::Relaxed);
 
-            let prev_n = EWMA_BATCH_LEN.load(Ordering::Relaxed);
+            let prev_n = EWMA_LANE_LEN[lane].load(Ordering::Relaxed);
             let next_n = if prev_n == 0 {
                 batch_n
             } else {
                 (prev_n * 3 + batch_n) / 4
             };
-            EWMA_BATCH_LEN.store(next_n, Ordering::Relaxed);
+            EWMA_LANE_LEN[lane].store(next_n, Ordering::Relaxed);
 
             if let Err(err) = res {
                 eprintln!("read batch error: {err}");
@@ -763,7 +1008,9 @@ impl ReadWorker {
             }
         };
 
-        let st_tags = alloc_slot(need_tags_endpoint || touches_articles);
+        let cur_tag_epoch = TAG_EPOCH.load(Ordering::Acquire);
+        let need_tag_refresh = touches_articles && (self.tag_epoch != cur_tag_epoch || self.tag_cache.is_empty());
+        let st_tags = alloc_slot(need_tags_endpoint || need_tag_refresh);
         let st_uid = alloc_slot(self.k_uid.len() > 0);
         let st_uemail = alloc_slot(self.k_uemail.len() > 0);
         let st_prof = alloc_slot(self.k_prof.len() > 0);
@@ -890,12 +1137,30 @@ impl ReadWorker {
             conn.flush()?;
         }
         self.pa.clear();
-        self.tag_lut.clear();
 
         if n_phase_a1 > 0 {
             conn.read_pipeline_append(n_phase_a1, &mut self.pa)?;
             if let Some(failed) = self.pa.results.iter().find(|r| r.error.is_some()) {
                 return Err(PgError::Wire(format!("phase A1 error: {}", failed.error.as_ref().unwrap())));
+            }
+            if let Some(s) = st_tags {
+                let rows = self.pa.result_rows(s);
+                for &span in rows {
+                    let r = self.pa.row(span);
+                    let tid = self.pa.i64(r[0]);
+                    if tid > 0 {
+                        let idx = tid as usize;
+                        if idx >= self.tag_cache.len() {
+                            self.tag_cache.resize(idx + 32, None);
+                        }
+                        if self.tag_cache[idx].is_none() {
+                            if let Some(name_b) = self.pa.bytes(r[1]) {
+                                self.tag_cache[idx] = Some(name_b.into());
+                            }
+                        }
+                    }
+                }
+                self.tag_epoch = cur_tag_epoch;
             }
             if need_tags_endpoint {
                 if let Some(s) = st_tags {
@@ -913,20 +1178,6 @@ impl ReadWorker {
                 }
             }
             let pa = &self.pa;
-            if touches_articles {
-                if let Some(s) = st_tags {
-                    let rows = pa.result_rows(s);
-                    self.tag_lut.resize(rows.len() + 64, Cell { offset: 0, len: -1 });
-                    for &span in rows {
-                        let r = pa.row(span);
-                        let tid = pa.i64(r[0]) as usize;
-                        if tid >= self.tag_lut.len() {
-                            self.tag_lut.resize(tid + 16, Cell { offset: 0, len: -1 });
-                        }
-                        self.tag_lut[tid] = r[1];
-                    }
-                }
-            }
             map_rows_by_i64_into(pa, st_uid, &self.k_uid, 0, &mut self.rr.uid_rows);
             map_rows_by_str_into(pa, st_uemail, &self.k_uemail, 2, &mut self.rr.uemail_rows);
             let uid_rows = &self.rr.uid_rows;
@@ -1008,6 +1259,7 @@ impl ReadWorker {
                                         hash,
                                         user,
                                         addr: task.addr,
+                                        enqueued_at: task.enqueued_at,
                                     });
                                 }
                                 None => early_replies.push(reactor::error_reply(task.addr, 401, "invalid email or password")),
@@ -1346,13 +1598,26 @@ impl ReadWorker {
         if n_phase_b > 0 {
             let tx = &mut conn.tx;
             if b_artmeta.is_some() {
+                if self.meta_req_ids.len() > 1 {
+                    self.meta_req_ids.sort_unstable();
+                }
                 tx.bind_and_exec("artmeta", &[BindParam::I64Slice(&self.meta_req_ids)]);
             }
             if b_artx.is_some() {
-                tx.bind_and_exec("artx", &[BindParam::I64Slice(&self.distinct_arts.items)]);
+                self.sorted_arts.clear();
+                self.sorted_arts.extend_from_slice(&self.distinct_arts.items);
+                if self.sorted_arts.len() > 1 {
+                    self.sorted_arts.sort_unstable();
+                }
+                tx.bind_and_exec("artx", &[BindParam::I64Slice(&self.sorted_arts)]);
             }
             if b_artau.is_some() {
-                tx.bind_and_exec("artau", &[BindParam::I64Slice(&self.distinct_authors.items)]);
+                self.sorted_authors.clear();
+                self.sorted_authors.extend_from_slice(&self.distinct_authors.items);
+                if self.sorted_authors.len() > 1 {
+                    self.sorted_authors.sort_unstable();
+                }
+                tx.bind_and_exec("artau", &[BindParam::I64Slice(&self.sorted_authors)]);
             }
             if b_flags.is_some() {
                 tx.bind_and_exec(
@@ -1384,7 +1649,8 @@ impl ReadWorker {
         self.fav_hits.clear();
         self.foll_hits.clear();
 
-        self.rr.cached_cmts.clear();
+        self.rr.cmt_slices.clear();
+        self.rr.cmt_spans.clear();
         self.rr.rendered_profiles.clear();
         self.rr.rendered_profiles.resize(self.k_prof.len(), None);
         self.rr.rendered_cmts.clear();
@@ -1449,6 +1715,47 @@ impl ReadWorker {
             conn.read_pipeline_into(n_phase_b, &mut self.pb)?;
             if let Some(failed) = self.pb.results.iter().find(|r| r.error.is_some()) {
                 return Err(PgError::Wire(format!("phase B error: {}", failed.error.as_ref().unwrap())));
+            }
+            if let Some(s) = b_artx {
+                let mut missing_tag = false;
+                'scan: for &span in self.pb.result_rows(s) {
+                    let r = self.pb.row(span);
+                    if let Some(raw_arr) = self.pb.bytes(r[1]) {
+                        for elem in wire::iter_binary_array(raw_arr) {
+                            if let Ok(bytes) = elem.try_into() {
+                                let tid = i32::from_be_bytes(bytes) as usize;
+                                if self.tag_cache.get(tid).and_then(|v| v.as_ref()).is_none() {
+                                    missing_tag = true;
+                                    break 'scan;
+                                }
+                            }
+                        }
+                    }
+                }
+                if missing_tag {
+                    let tag_res_idx = self.pb.results.len();
+                    conn.tx.bind_and_exec("tags", &[]);
+                    conn.tx.write_sync();
+                    conn.flush()?;
+                    conn.read_pipeline_append(1, &mut self.pb)?;
+                    if let Some(err) = self.pb.results[tag_res_idx].error.as_ref() {
+                        return Err(PgError::Wire(format!("tag refresh error: {err}")));
+                    }
+                    for &span in self.pb.result_rows(tag_res_idx) {
+                        let r = self.pb.row(span);
+                        let tid = self.pb.i64(r[0]);
+                        if tid > 0 {
+                            let idx = tid as usize;
+                            if idx >= self.tag_cache.len() {
+                                self.tag_cache.resize(idx + 32, None);
+                            }
+                            if let Some(name_b) = self.pb.bytes(r[1]) {
+                                self.tag_cache[idx] = Some(name_b.into());
+                            }
+                        }
+                    }
+                    self.tag_epoch = TAG_EPOCH.load(Ordering::Acquire);
+                }
             }
         }
 
@@ -1528,10 +1835,8 @@ impl ReadWorker {
                         for elem in wire::iter_binary_array(raw_arr) {
                             if let Ok(bytes) = elem.try_into() {
                                 let tid = i32::from_be_bytes(bytes) as usize;
-                                if let Some(&name_cell) = self.tag_lut.get(tid) {
-                                    if let Some(name_bytes) = pa.bytes(name_cell) {
-                                        tag_sort_buf.push(name_bytes);
-                                    }
+                                if let Some(Some(name_box)) = self.tag_cache.get(tid) {
+                                    tag_sort_buf.push(name_box.as_ref());
                                 }
                             }
                         }
@@ -1591,12 +1896,13 @@ impl ReadWorker {
         }
 
         if let Some(s) = st_cmts {
-            let cached_cmts = &mut self.rr.cached_cmts;
+            let cmt_slices = &mut self.rr.cmt_slices;
+            let cmt_spans = &mut self.rr.cmt_spans;
             let cmt_sort_buf = &mut self.rr.cmt_sort_buf;
             let cmt_rows = pa.result_rows(s);
             for row_indices in grp_cmts {
                 if row_indices.is_empty() {
-                    cached_cmts.push(None);
+                    cmt_spans.push(None);
                     continue;
                 }
                 cmt_sort_buf.clear();
@@ -1613,7 +1919,7 @@ impl ReadWorker {
                     }
                 }
                 cmt_sort_buf.sort_unstable_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
-                let mut list = Vec::with_capacity(cmt_sort_buf.len());
+                let slice_start = cmt_slices.len() as u32;
                 for &(_, cid, span, au_span) in cmt_sort_buf.iter() {
                     let r = pa.row(span);
                     let au = pb.row(au_span);
@@ -1634,13 +1940,13 @@ impl ReadWorker {
                     codec::write_nullable_str(arena, pb.bytes(au[3]));
                     arena.extend_from_slice(b",\"following\":");
                     let end = arena.len() as u32;
-                    list.push(CachedCommentSlice {
+                    cmt_slices.push(CachedCommentSlice {
                         author_id: pa.i64(r[5]),
                         start,
                         end,
                     });
                 }
-                cached_cmts.push(Some(list));
+                cmt_spans.push(Some((slice_start, cmt_slices.len() as u32)));
             }
         }
 
@@ -1664,7 +1970,8 @@ impl ReadWorker {
         let prof_rows = &self.rr.prof_rows;
         let slug_rows = &self.rr.slug_rows;
         let aid_rows = &self.rr.aid_rows;
-        let cached_cmts = &self.rr.cached_cmts;
+        let cmt_slices = &self.rr.cmt_slices;
+        let cmt_spans = &self.rr.cmt_spans;
         let rendered_profiles = &mut self.rr.rendered_profiles;
         let rendered_cmts = &mut self.rr.rendered_cmts;
         let rendered_slugs = &mut self.rr.rendered_slugs;
@@ -1782,10 +2089,11 @@ impl ReadWorker {
                     }
                 }
                 PlanSlot::Comments(k) => {
-                    let Some(list) = &cached_cmts[k as usize] else {
+                    let Some((s_start, s_end)) = cmt_spans[k as usize] else {
                         replies.push(reactor::error_reply(addr, 404, "article not found"));
                         continue;
                     };
+                    let list = &cmt_slices[s_start as usize..s_end as usize];
                     let unflagged = viewer == 0 || list.iter().all(|c| !render_ctx.is_following(viewer, c.author_id));
                     if unflagged {
                         if let Some(shared) = &rendered_cmts[k as usize] {
@@ -2176,7 +2484,11 @@ impl WriteWorker {
     }
 
     fn commit_group(&mut self, tasks: &mut Vec<WriteTask>) -> Result<(), (PgError, Vec<ReplyAddr>)> {
-        tasks.retain(|t| reactor::is_addr_alive(t.addr));
+        let mut expired_replies = Vec::new();
+        tasks.retain(|t| check_task_alive_and_fresh(t.addr, t.enqueued_at, &mut expired_replies));
+        if !expired_replies.is_empty() {
+            reactor::complete_batch(expired_replies);
+        }
         if tasks.is_empty() {
             return Ok(());
         }
@@ -2188,6 +2500,9 @@ impl WriteWorker {
 
         let is_single_task = tasks.len() == 1;
         let has_user_mutation = !is_single_task && tasks.iter().any(|t| matches!(t.op, WriteOp::UpdateUser { .. }));
+        let has_new_tags = tasks
+            .iter()
+            .any(|t| matches!(&t.op, WriteOp::CreateArticle { tags, .. } if !tags.is_empty()));
 
         let mut mutated_slugs: Vec<&str> = Vec::new();
         let mut fav_on_jobs: Vec<(i64, &str)> = Vec::new();
@@ -2443,6 +2758,7 @@ impl WriteWorker {
                                 },
                                 viewer: task.viewer,
                                 addr: task.addr,
+                                enqueued_at: task.enqueued_at,
                             });
                         }
                         None => replies.push(reactor::error_reply(task.addr, 404, "article not found")),
@@ -2506,25 +2822,32 @@ impl WriteWorker {
             }
         }
 
+        if has_new_tags {
+            TAG_EPOCH.fetch_add(1, Ordering::Release);
+        }
         if !post_reads.is_empty() {
-            READ_QUEUE.push_batch(&mut post_reads);
+            enqueue_read_batch_fast(&mut post_reads);
         }
         reactor::complete_batch(replies);
         Ok(())
     }
 
     fn exec_individual(&mut self, task: WriteTask) -> PgResult<()> {
+        let has_new_tags = matches!(&task.op, WriteOp::CreateArticle { tags, .. } if !tags.is_empty());
         let conn = Self::ensure_conn(&mut self.conn, self.cfg)?;
         let cnt = stmt_count_for_write(&task);
         bind_single_write(&mut conn.tx, &task);
         conn.tx.write_sync();
         conn.flush()?;
         conn.read_pipeline_into(cnt, &mut self.pipe)?;
+        if has_new_tags {
+            TAG_EPOCH.fetch_add(1, Ordering::Release);
+        }
         let mut replies = Vec::new();
         let mut post_reads = Vec::new();
         finalize_write_task(task, &self.pipe, 0, cnt, self.cfg, &mut replies, &mut post_reads);
         if !post_reads.is_empty() {
-            READ_QUEUE.push_batch(&mut post_reads);
+            enqueue_read_batch_fast(&mut post_reads);
         }
         reactor::complete_batch(replies);
         Ok(())
@@ -2542,6 +2865,7 @@ fn finalize_write_task(
 ) {
     let addr = task.addr;
     let viewer = task.viewer;
+    let enqueued_at = task.enqueued_at;
     let slice = &pipe.results[start..start + count];
     if let Some(err) = slice.iter().find_map(|r| r.error.as_ref()) {
         if err.code == "23505" {
@@ -2623,6 +2947,7 @@ fn finalize_write_task(
                     },
                     viewer,
                     addr,
+                    enqueued_at,
                 });
             }
             None => replies.push(reactor::error_reply(addr, 404, "article not found")),
@@ -2674,6 +2999,7 @@ fn finalize_write_task(
                     },
                     viewer,
                     addr,
+                    enqueued_at,
                 });
             }
             None => replies.push(reactor::error_reply(addr, 404, "article not found")),
@@ -2727,21 +3053,30 @@ fn finalize_write_task(
     }
 }
 
-pub fn run_crypto_worker(cfg: &'static RuntimeConfig) {
+pub fn run_crypto_worker(cfg: &'static RuntimeConfig, is_watchdog: bool) {
+    if !is_watchdog {
+        reactor::set_thread_nice(10);
+    }
     let mut batch: Vec<CryptoTask> = Vec::with_capacity(cfg.bcrypt_lanes.max(1));
     let mut non_std: Vec<CryptoTask> = Vec::new();
+    let mut expired_replies: Vec<OutgoingReply> = Vec::new();
     let lanes = cfg.bcrypt_lanes.max(1);
     loop {
         batch.clear();
         {
             let _token = CRYPTO_LOCK.lock().unwrap();
             let busy = BUSY_CRYPTO_WORKERS.load(Ordering::Acquire);
-            let tau_us = EWMA_BCRYPT_US.load(Ordering::Relaxed);
+            let tau_us = EWMA_BCRYPT_US.load(Ordering::Relaxed).max(10_000);
             let ewma_c = EWMA_CRYPTO_LEN.load(Ordering::Relaxed);
-            let age_us = if busy == 0 && ewma_c <= 1 {
+            let last_done = LAST_CRYPTO_DONE_US.load(Ordering::Relaxed);
+            let now_us = mono_micros();
+            let recent_overlap = busy > 0 || (last_done > 0 && now_us.saturating_sub(last_done) < 120_000);
+            let age_us = if !recent_overlap && ewma_c <= 1 {
                 (tau_us / (lanes * 2)).max(1)
+            } else if busy == 0 {
+                (tau_us * 3 / 2).clamp(2_000, 35_000)
             } else {
-                tau_us.saturating_mul(2).max(1)
+                (tau_us * 2).clamp(10_000, 45_000)
             };
             CRYPTO_QUEUE.take_aged(lanes, Duration::from_micros(age_us as u64), lanes, &mut batch);
             BUSY_CRYPTO_WORKERS.fetch_add(1, Ordering::AcqRel);
@@ -2754,10 +3089,18 @@ pub fn run_crypto_worker(cfg: &'static RuntimeConfig) {
             (prev_c * 3 + batch_n) / 4
         };
         EWMA_CRYPTO_LEN.store(next_c, Ordering::Relaxed);
+        expired_replies.clear();
         batch.retain(|t| match t {
-            CryptoTask::VerifyLogin { addr, .. } => reactor::is_addr_alive(*addr),
-            CryptoTask::HashPassword { write, .. } => reactor::is_addr_alive(write.addr),
+            CryptoTask::VerifyLogin { addr, enqueued_at, .. } => {
+                check_task_alive_and_fresh(*addr, *enqueued_at, &mut expired_replies)
+            }
+            CryptoTask::HashPassword { write, enqueued_at, .. } => {
+                check_task_alive_and_fresh(write.addr, *enqueued_at, &mut expired_replies)
+            }
         });
+        if !expired_replies.is_empty() {
+            reactor::complete_batch(std::mem::take(&mut expired_replies));
+        }
         let t0 = Instant::now();
         non_std.clear();
         let mut i = 0;
@@ -2784,6 +3127,7 @@ pub fn run_crypto_worker(cfg: &'static RuntimeConfig) {
             }
             .clamp(1_000, 150_000);
             EWMA_BCRYPT_US.store(next, Ordering::Relaxed);
+            LAST_CRYPTO_DONE_US.store(mono_micros(), Ordering::Relaxed);
         }
         let mut single: Vec<CryptoTask> = Vec::new();
         for task in non_std.drain(..) {
