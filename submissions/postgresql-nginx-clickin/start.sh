@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Runs nginx in the foreground. Config: DATABASE_URL, JWT_SECRET, HOST, PORT.
-# One worker per core; each worker has a thread pool, and each thread one Postgres connection (95 at most in all).
+# One worker per core; each worker has a thread pool, and each thread one Postgres connection. Three threads per
+# worker (24 connections on 8 cores) held more users than 6 or 11: with Postgres on the same cores, fewer busy
+# backends means less contention. SQL_THREADS overrides it; the total stays within 95.
 set -euo pipefail
 cd "$(dirname "$0")"
 : "${DATABASE_URL:?}" "${JWT_SECRET:?}" "${HOST:=0.0.0.0}" "${PORT:=80}"
 WORKERS=$(nproc)
-THREADS=$(( 95 / WORKERS )); [ "$THREADS" -gt 16 ] && THREADS=16
+THREADS=${SQL_THREADS:-3}; [ $(( THREADS * WORKERS )) -gt 95 ] && THREADS=$(( 95 / WORKERS ))
 
 # HMAC-SHA256's two padded keys (RFC 2104) depend only on JWT_SECRET, so they are worked out once here and handed
 # to the SQL as hex (sql/_hmac_keys.sql). The HMAC itself is still computed in SQL for every token.

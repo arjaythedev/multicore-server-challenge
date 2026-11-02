@@ -21,7 +21,8 @@ Conduit. It has no routes, no JSON and no JWT code.
 ```nginx
 location ~ ^/api/articles/(?<slug>[^/]+)/favorite$ {
     sql POST auth.sql,favorite.sql,article_out.sql
-        authorization=$http_authorization secret=env:JWT_SECRET required=1 slug=$slug ok_status=200;
+        authorization=$http_authorization hmac_ipad=env:JWT_HMAC_IPAD hmac_opad=env:JWT_HMAC_OPAD
+        required=1 slug=$slug ok_status=200;
 }
 ```
 
@@ -44,6 +45,10 @@ Postgres can't run bcrypt without an extension, so two column names ask the modu
 Two SQL errors map to responses. A unique violation (23505) is a 422, and so is a data exception (22xxx, a body
 that isn't JSON). `{{name}}` in a file pastes in `sql/name.sql`. The shared article JSON, for example, is
 `{{_article}}`.
+
+Every read endpoint is one statement. The token check (`{{_auth}}`) and the `?limit`/`?offset` check
+(`{{_page}}`) are CTEs of the same statement, and a `CASE` answers 401 or 422 before the page query runs. Writes
+still run a few statements: `auth.sql` first, then the write, then the read-back after the commit.
 
 ### JWT in SQL
 
@@ -68,7 +73,8 @@ Then it checks `alg = HS256`, that `exp` is a number in the future, and that `su
   plan the branches that don't apply are one-time filters and never scan a table.
 - No caching. Each request runs its files against Postgres; prepared statements are the only thing kept.
 - Writes are committed (autocommit, or the explicit `COMMIT`) before the response is sent.
-- Connections: one per thread-pool thread, `95 / nproc` threads per worker (11 × 8 = 88 on the box).
+- Connections: one per thread-pool thread, 3 threads per nginx worker, so 24 on the box's 8 cores. That held
+  more users than 6 or 11 per worker: Postgres shares the cores, and fewer busy backends contend less.
 
 ## Local results
 
@@ -81,10 +87,9 @@ Then it checks `alg = HS256`, that `exp` is a number in the future, and that `su
 
 | Users | req/s | p50 | p95 | p99 | errors | |
 |---:|---:|---:|---:|---:|---:|---|
-| 14,000 | 14,775 | 1.8 ms | 12.1 ms | 23.3 ms | 0 | pass |
-| 18,000 | 17,427 | 82 ms | 174 ms | 223 ms | 0 | pass |
-| 21,000 | 18,065 | 213 ms | 328 ms | 397 ms | 0 | pass |
-| 24,000 | 17,662 | 415 ms | 539 ms | 613 ms | 0 | fail (p95) |
+| 14,000 | 14,784 | 0.6 ms | 3.8 ms | 8.2 ms | 0 | pass |
+| 24,000 | 20,359 | 223 ms | 391 ms | 464 ms | 0 | pass |
+| 27,000 | 20,011 | 391 ms | 597 ms | 754 ms | 0 | fail (p95) |
 
-At the limit Postgres uses about 6 of the 8 cores and nginx about 2. Performance wasn't the goal: the point is to
-see how much of a web app plain SQL can carry.
+At the limit Postgres uses about 5 to 6 of the 8 cores and nginx about 2. Performance wasn't the goal: the point
+is to see how much of a web app plain SQL can carry.
