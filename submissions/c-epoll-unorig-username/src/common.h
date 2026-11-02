@@ -113,6 +113,16 @@ enum {
   W_COMMENT_DEL,
 };
 
+// A finished response. Identical reads in one batch share one of these; it is freed when its last send completes.
+typedef struct {
+  _Atomic int refs;
+  uint32_t len;
+  char data[];
+} resp_t;
+static inline void resp_unref(resp_t *r) {
+  if (r && atomic_fetch_sub_explicit(&r->refs, 1, memory_order_acq_rel) == 1) free(r);
+}
+
 typedef struct job {
   struct job *next;
   uint8_t kind, close, gzip, attempts;
@@ -128,7 +138,8 @@ typedef struct job {
   const char **tags;  // tagList of POST /api/articles
   uint32_t *tag_lens;
   int32_t ntags;
-  char *resp;  // final bytes (head + body), malloc'd; sent and freed by the owning loop
+  resp_t *r;   // what the owning loop sends; NULL = nothing to send
+  char *resp;  // a login's rendered user, until the hash is verified
   size_t resp_len;
   void *b;  // per-batch scratch of the read engine
   char extra[];
@@ -137,10 +148,11 @@ typedef struct job {
 job *job_new(size_t extra);
 // Finishes the job with a JSON body: builds the head and hands it to its loop.
 void job_reply(job *j, int status, const char *body, size_t n);
+resp_t *resp_build(int status, const char *body, size_t n, bool close, bool gzip);
 void job_error(job *j, int status, const char *msg);
 
 // loops
-void loop_post(job *j);  // any thread: deliver j (resp set) to its loop
+void loop_post(job *j);  // any thread: deliver j (r set) to its loop
 void loops_start(int n, const char *host, int port);
 bool conn_alive(const job *j);
 

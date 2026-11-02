@@ -391,6 +391,53 @@ static inline void flag(buf_t *b, bool v) {
   else buf_lit(b, "false");
 }
 
+// Responses identical within this batch: same statement results, no viewer flag set, same head.
+typedef struct {
+  uint64_t a, b;
+  resp_t *r;
+} rc_ent;
+typedef struct {
+  rc_ent *e;
+  uint32_t mask;
+  int n;
+} rcache;
+static void rc_init(rcache *c, arena_t *x, int expect) {
+  uint32_t cap = 16;
+  while (cap < (uint32_t)expect * 2) cap <<= 1;
+  c->e = arena_alloc(x, cap * sizeof(rc_ent));
+  memset(c->e, 0, cap * sizeof(rc_ent));
+  c->mask = cap - 1;
+  c->n = 0;
+}
+// a != 0. Answers j with a shared response, building it on the first use.
+static bool rc_reuse(rcache *c, job *j, uint64_t a, uint64_t b, uint32_t *slot) {
+  a = (a << 1) | j->gzip;
+  uint32_t i = (uint32_t)(((a * 0x9E3779B97F4A7C15ULL) ^ (b * 0xC2B2AE3D27D4EB4FULL)) >> 32) & c->mask;
+  while (c->e[i].a && !(c->e[i].a == a && c->e[i].b == b)) i = (i + 1) & c->mask;
+  *slot = i;
+  if (!c->e[i].a) {
+    c->e[i].a = a;
+    c->e[i].b = b;
+    return false;
+  }
+  atomic_fetch_add_explicit(&c->e[i].r->refs, 1, memory_order_relaxed);
+  j->r = c->e[i].r;
+  loop_post(j);
+  return true;
+}
+static void rc_keep(rcache *c, job *j, uint32_t slot, const char *body, size_t n, int status) {
+  resp_t *r = resp_build(status, body, n, j->close, j->gzip);
+  atomic_fetch_add_explicit(&r->refs, 1, memory_order_relaxed);
+  c->e[slot].r = r;
+  j->r = r;
+  c->n++;
+  loop_post(j);
+}
+static void rc_release(rcache *c) {
+  for (uint32_t i = 0; i <= c->mask; i++)
+    if (c->e[i].a) resp_unref(c->e[i].r);
+}
+
 // ---- one batch. Returns 0 when every job is answered, else 1 = connection lost, 2 = statement failed.
 enum { B_OK, B_LOST, B_SQL };
 
@@ -521,11 +568,17 @@ static int run_batch(drain_t *d, job **jobs, int n) {
       buf_ch(O, '"');
     }
     buf_lit(O, "]}");
+    rcache tc;
+    rc_init(&tc, a, 2);
     for (int i = 0; i < n; i++)
       if (jobs[i] && jobs[i]->kind == K_TAGS) {
-        reply_ok(d, jobs[i], O);
+        uint32_t sl;
+        job *j = jobs[i];
         jobs[i] = NULL;
+        if (j->close) reply_ok(d, j, O);
+        else if (!rc_reuse(&tc, j, 1, 0, &sl)) rc_keep(&tc, j, sl, O->p, O->n, 200);
       }
+    rc_release(&tc);
   }
   // users by id
   if (uids.n) {
@@ -961,11 +1014,14 @@ static int run_batch(drain_t *d, job **jobs, int n) {
     arts[i].author_ix = authors.n ? m64_get(&aum, arts[i].author) : -1;
     art_frag(F, &arts[i], tn);
   }
+  rcache rc;
+  rc_init(&rc, a, n);
   for (int i = 0; i < n; i++) {
     job *j = jobs[i];
     if (!j) continue;
     jb_t *x = &jb[i];
     O->n = 0;
+    uint32_t sl = 0;
     switch (j->kind) {
       case K_PROFILE: {
         sent *e = nn ? ms_slot(&pm, j->s1, j->l1) : NULL;
@@ -979,6 +1035,14 @@ static int run_batch(drain_t *d, job **jobs, int n) {
         break;
       }
       case K_LIST_ALL: case K_LIST_TAG: case K_LIST_AUTHOR: case K_LIST_FAV: case K_FEED: {
+        bool any_flag = j->close || j->kind == K_FEED;
+        for (int q = 0; q < x->n && !any_flag && j->viewer; q++) {
+          int ix = m64_get(&artm, x->ids[q]);
+          if (ix >= 0 && (ps_has(&fav_ps, j->viewer, arts[ix].id) || ps_has(&fol_ps, j->viewer, arts[ix].author))) any_flag = true;
+        }
+        // Same window, slice and limit: the same page.
+        bool share = !any_flag && j->kind != K_FEED;
+        if (share && rc_reuse(&rc, j, ((uint64_t)j->kind << 32) | (uint64_t)x->win, ((uint64_t)j->off << 8) | (uint64_t)j->lim, &sl)) break;
         buf_lit(O, "{\"articles\":[");
         bool first = true;
         for (int q = 0; q < x->n; q++) {
@@ -998,7 +1062,8 @@ static int run_batch(drain_t *d, job **jobs, int n) {
         buf_lit(O, "],\"articlesCount\":");
         buf_i64(O, x->count);
         buf_ch(O, '}');
-        reply_ok(d, j, O);
+        if (share) rc_keep(&rc, j, sl, O->p, O->n, 200);
+        else reply_ok(d, j, O);
         break;
       }
       case K_ARTICLE_SLUG: case K_ARTICLE_ID: {
@@ -1013,6 +1078,8 @@ static int run_batch(drain_t *d, job **jobs, int n) {
           break;
         }
         art_t *t = &arts[ix];
+        bool share = !j->close && !ps_has(&fav_ps, j->viewer, t->id) && !ps_has(&fol_ps, j->viewer, t->author);
+        if (share && rc_reuse(&rc, j, ((uint64_t)K_ARTICLE_SLUG << 32) | (uint64_t)ix, (uint64_t)j->status_hint, &sl)) break;
         buf_lit(O, "{\"article\":{\"body\":\"");
         buf_json(O, t->body, t->bl);
         buf_lit(O, "\",");
@@ -1022,10 +1089,15 @@ static int run_batch(drain_t *d, job **jobs, int n) {
         if (t->author_ix >= 0) buf_put(O, F->p + au[t->author_ix].frag, au[t->author_ix].frag_len);
         flag(O, ps_has(&fol_ps, j->viewer, t->author));
         buf_lit(O, "}}}");
-        reply_ok(d, j, O);
+        if (share) rc_keep(&rc, j, sl, O->p, O->n, j->status_hint ? j->status_hint : 200);
+        else reply_ok(d, j, O);
         break;
       }
       case K_COMMENTS: {
+        bool share = !j->close;
+        for (cmt_t *m = threads[x->thread].first; m && share && j->viewer; m = m->next)
+          if (ps_has(&fol_ps, j->viewer, m->author)) share = false;
+        if (share && rc_reuse(&rc, j, ((uint64_t)K_COMMENTS << 32) | (uint64_t)x->thread, 0, &sl)) break;
         buf_lit(O, "{\"comments\":[");
         bool first = true;
         for (cmt_t *m = threads[x->thread].first; m; m = m->next) {
@@ -1052,7 +1124,8 @@ static int run_batch(drain_t *d, job **jobs, int n) {
           buf_lit(O, "}}");
         }
         buf_lit(O, "]}");
-        reply_ok(d, j, O);
+        if (share) rc_keep(&rc, j, sl, O->p, O->n, 200);
+        else reply_ok(d, j, O);
         break;
       }
       default:
@@ -1060,6 +1133,7 @@ static int run_batch(drain_t *d, job **jobs, int n) {
     }
     jobs[i] = NULL;
   }
+  rc_release(&rc);
   return B_OK;
 }
 
@@ -1206,7 +1280,7 @@ static void *drain_main(void *arg) {
     // Clients that hung up while queued cost nothing more: their jobs go straight back to be freed.
     for (int i = 0; i < n; i++)
       if (!conn_alive(batch[i])) {
-        free(batch[i]->resp);
+        free(batch[i]->resp);  // a login's scratch; it hasn't reached the hasher in this path
         batch[i]->resp = NULL;
         loop_post(batch[i]);
         batch[i] = NULL;

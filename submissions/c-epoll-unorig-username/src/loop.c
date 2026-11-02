@@ -24,8 +24,8 @@ typedef struct {
   bool open, busy, want_close, want_out;
   char *in;  // bytes kept between reads
   uint32_t in_n, in_cap;
-  char *out;  // the unsent rest of a response
-  size_t out_off, out_len;
+  resp_t *out;  // the unsent rest of a response
+  size_t out_off;
   bool out_close;
 } conn_t;
 
@@ -92,10 +92,12 @@ static size_t put_head(char *o, int status, size_t n, bool close) {
 static int gz_mss = 1448, gz_min_segs = 3;
 static inline size_t segs(size_t n) { return (n + (size_t)gz_mss - 1) / (size_t)gz_mss; }
 
-void job_reply(job *j, int status, const char *body, size_t n) {
-  char *r = malloc(200 + n);
+resp_t *resp_build(int status, const char *body, size_t n, bool close, bool gzip) {
+  resp_t *r = malloc(sizeof(resp_t) + 200 + n);
   if (!r) abort();
-  if (j->gzip && gz_min_segs && n + 120 > (size_t)gz_mss * (size_t)gz_min_segs - (size_t)gz_mss) {
+  atomic_init(&r->refs, 1);
+  char *o = r->data;
+  if (gzip && gz_min_segs && n + 120 > (size_t)gz_mss * (size_t)gz_min_segs - (size_t)gz_mss) {
     static __thread uint8_t *z;
     static __thread size_t zc;
     if (zc < n + 1024) {
@@ -106,22 +108,24 @@ void job_reply(job *j, int status, const char *body, size_t n) {
     size_t want = (segs(n + 120) - 1) * (size_t)gz_mss - 140;
     size_t zn = gz_encode((const uint8_t *)body, n, z, want);
     if (zn) {
-      size_t h = put_head(r, status, zn, j->close);
+      size_t h = put_head(o, status, zn, close);
       h -= 2;
       static const char CE[] = "Content-Encoding: gzip\r\n\r\n";
-      memcpy(r + h, CE, sizeof CE - 1);
+      memcpy(o + h, CE, sizeof CE - 1);
       h += sizeof CE - 1;
-      memcpy(r + h, z, zn);
-      j->resp = r;
-      j->resp_len = h + zn;
-      loop_post(j);
-      return;
+      memcpy(o + h, z, zn);
+      r->len = h + zn;
+      return r;
     }
   }
-  size_t h = put_head(r, status, n, j->close);
-  memcpy(r + h, body, n);
-  j->resp = r;
-  j->resp_len = h + n;
+  size_t h = put_head(o, status, n, close);
+  memcpy(o + h, body, n);
+  r->len = h + n;
+  return r;
+}
+
+void job_reply(job *j, int status, const char *body, size_t n) {
+  j->r = resp_build(status, body, n, j->close, j->gzip);
   loop_post(j);
 }
 
@@ -153,8 +157,9 @@ static void conn_close(loop_t *l, int fd) {
   c->open = false;
   atomic_fetch_add_explicit(&c->gen, 1, memory_order_relaxed);
   free(c->in);
-  free(c->out);
-  c->in = c->out = NULL;
+  resp_unref(c->out);
+  c->in = NULL;
+  c->out = NULL;
   c->in_n = c->in_cap = 0;
   c->want_out = false;
   c->busy = false;
@@ -171,23 +176,22 @@ static void set_out(loop_t *l, int fd, bool on) {
 
 static void process_input(loop_t *l, int fd, const char *p, size_t n);
 
-// Writes a whole response; keeps the rest for EPOLLOUT if the socket is full.
-static void conn_send(loop_t *l, int fd, char *r, size_t len, bool close_after) {
+// Writes a whole response, taking over the caller's reference; keeps it for EPOLLOUT if the socket is full.
+static void conn_send(loop_t *l, int fd, resp_t *r, bool close_after) {
   conn_t *c = &l->conns[fd];
-  ssize_t w = write(fd, r, len);
-  if (w == (ssize_t)len) {
-    free(r);
+  ssize_t w = write(fd, r->data, r->len);
+  if (w == (ssize_t)r->len) {
+    resp_unref(r);
     if (close_after) conn_close(l, fd);
     return;
   }
   if (w < 0 && errno != EAGAIN && errno != EINTR) {
-    free(r);
+    resp_unref(r);
     conn_close(l, fd);
     return;
   }
   c->out = r;
   c->out_off = w > 0 ? w : 0;
-  c->out_len = len;
   c->out_close = close_after;
   set_out(l, fd, true);
 }
@@ -207,8 +211,8 @@ static void finish_jobs(loop_t *l) {
     conn_t *c = &l->conns[j->fd];
     if (atomic_load_explicit(&c->gen, memory_order_relaxed) == j->gen && c->open) {
       c->busy = false;
-      conn_send(l, j->fd, j->resp, j->resp_len, j->close);
-      j->resp = NULL;
+      if (j->r) conn_send(l, j->fd, j->r, j->close);
+      j->r = NULL;
       // Pipelined bytes that arrived while this request ran.
       if (c->open && !c->out && c->in_n) {
         char *in = c->in;
@@ -219,7 +223,7 @@ static void finish_jobs(loop_t *l) {
         free(in);
       }
     } else {
-      free(j->resp);
+      resp_unref(j->r);
     }
     free(j);
     j = nx;
@@ -505,11 +509,9 @@ typedef struct {
 } req_t;
 
 static void quick(loop_t *l, int fd, int status, const char *msg, bool close_after) {
-  char b[256], *r = malloc(512);
+  char b[256];
   int n = snprintf(b, sizeof b, "{\"errors\":{\"body\":[\"%s\"]}}", msg);
-  size_t h = put_head(r, status, n, close_after);
-  memcpy(r + h, b, n);
-  conn_send(l, fd, r, h + n, close_after);
+  conn_send(l, fd, resp_build(status, b, n, close_after, false), close_after);
 }
 
 // decode %xx (and + when plus) into o; false on a bad escape
@@ -622,11 +624,8 @@ static void list_or_feed(loop_t *l, int fd, const req_t *q, bool feed) {
   else if (fl[2]) { kind = K_LIST_FAV; nm = f[2]; nl = fl[2]; }
   if (nl && !storable(nm, nl)) {
     free(tmp);
-    char *r = malloc(256);
     static const char E[] = "{\"articles\":[],\"articlesCount\":0}";
-    size_t h = put_head(r, 200, sizeof E - 1, q->close);
-    memcpy(r + h, E, sizeof E - 1);
-    conn_send(l, fd, r, h + sizeof E - 1, q->close);
+    conn_send(l, fd, resp_build(200, E, sizeof E - 1, q->close, false), q->close);
     return;
   }
   job *j = new_for(l, fd, q, kind, v, nl + 1);
@@ -1008,14 +1007,14 @@ static void on_writable(loop_t *l, int fd) {
     set_out(l, fd, false);
     return;
   }
-  ssize_t w = write(fd, c->out + c->out_off, c->out_len - c->out_off);
+  ssize_t w = write(fd, c->out->data + c->out_off, c->out->len - c->out_off);
   if (w < 0 && errno != EAGAIN && errno != EINTR) {
     conn_close(l, fd);
     return;
   }
   if (w > 0) c->out_off += w;
-  if (c->out_off == c->out_len) {
-    free(c->out);
+  if (c->out_off == c->out->len) {
+    resp_unref(c->out);
     c->out = NULL;
     set_out(l, fd, false);
     if (c->out_close) {
