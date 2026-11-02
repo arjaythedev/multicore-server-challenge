@@ -30,6 +30,11 @@ struct Conduit {
             return v
         }
 
+        /// Durations as microseconds, for the start-up line.
+        func micros(_ times: [Duration]) -> String {
+            times.map { "\($0.components.attoseconds / 1_000_000_000_000) µs" }.joined(separator: ", ")
+        }
+
         guard let dbURLString = env["DATABASE_URL"], !dbURLString.isEmpty,
               let jwtSecret = env["JWT_SECRET"], !jwtSecret.isEmpty else {
             fail("DATABASE_URL and JWT_SECRET are required")
@@ -43,6 +48,7 @@ struct Conduit {
         let bcryptQueue = Int(envOr("BCRYPT_QUEUE", "")) ?? 40 * bcryptThreads
         let calibration = BcryptWorkers.calibrate()
         let bcryptLanes = Int(envOr("BCRYPT_LANES", "")) ?? calibration.lanes
+        let bcryptKernel = BcryptKernel(name: envOr("BCRYPT_KERNEL", "")) ?? calibration.kernel
         let host = envOr("HOST", "127.0.0.1")
         let port = Int(envOr("PORT", "3000")) ?? 3000
 
@@ -67,7 +73,7 @@ struct Conduit {
         let writeLanes = max(1, Int(envOr("WRITE_LANES", "")) ?? 4)
         let readLanes = max(1, Int(envOr("READ_LANES", "")) ?? System.coreCount)
         let readConnections = max(1, Int(envOr("READ_CONNECTIONS", "")) ?? (poolSize - writeLanes) / readLanes)
-        let bcrypt = BcryptWorkers(threads: bcryptThreads, lanes: bcryptLanes,
+        let bcrypt = BcryptWorkers(threads: bcryptThreads, lanes: bcryptLanes, kernel: bcryptKernel,
                                    window: .milliseconds(Int(envOr("BCRYPT_WINDOW_MS", "")) ?? 200), limit: bcryptQueue)
         let reads = ReadBatcher(config: dbConfig, settings: .init(
             lanes: readLanes,
@@ -89,8 +95,8 @@ struct Conduit {
         // the bcrypt threads.
         logger.info("""
             conduit (swift): \(readLanes) read lanes × \(readConnections) connections, \(writeLanes) write lanes, \
-            bcrypt threads \(bcryptThreads) (queue \(bcryptQueue), \(bcrypt.lanes) in lockstep; cost 6 per hash at widths 1-6: \
-            \(calibration.perHash.map { "\($0.components.attoseconds / 1_000_000_000_000) µs" }.joined(separator: ", "))), \
+            bcrypt threads \(bcryptThreads) (queue \(bcryptQueue), \(bcrypt.lanes) in lockstep, \(bcrypt.kernel) kernel; cost 6 per \
+            hash at widths 1-6: constant \(micros(calibration.constant)), shrx \(micros(calibration.shrx))), \
             \(Loop.all.count) loops
             """)
         try await Services.run([bcrypt, reads, writes, server], stoppingOn: [SIGTERM, SIGINT])

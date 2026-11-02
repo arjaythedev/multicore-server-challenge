@@ -44,8 +44,30 @@ struct BcryptKey: BitwiseCopyable {
 
 typealias BcryptDigest = InlineArray<23, UInt8>
 
-/// Runs `lanes` hashes of the same cost in lockstep and returns their digests (the 23 bytes a hash string encodes).
-func bcryptDigests<let lanes: Int>(_ keys: borrowing InlineArray<lanes, BcryptKey>, cost: Int) -> InlineArray<lanes, BcryptDigest> {
+/// Which family of the key-only expansion kernels runs (BcryptKernels.swift), as rust-epoll-theCatWisel's
+/// BcryptKernel; BcryptWorkers.calibrate picks the faster on this CPU.
+enum BcryptKernel: Sendable, CustomStringConvertible {
+    /// Bytes extracted with constant shifts: the compiler picks the instructions (BMI1's bextr on AMD).
+    case constant
+    /// The shifts by 24 and 16 take their count from a register: BMI2's shrx, which keeps its input, so no copy
+    /// before each shift (the Rust's shrx kernel, for Intel). Slower without BMI2.
+    case shrx
+
+    init?(name: String) {
+        switch name {
+        case "constant": self = .constant
+        case "shrx": self = .shrx
+        default: return nil
+        }
+    }
+
+    var description: String { self == .constant ? "constant" : "shrx" }
+}
+
+/// Runs `lanes` hashes of the same cost in lockstep with `kernel`'s kernels and returns their digests (the 23 bytes a
+/// hash string encodes).
+func bcryptDigests<let lanes: Int>(_ keys: borrowing InlineArray<lanes, BcryptKey>, cost: Int,
+                                   kernel: BcryptKernel) -> InlineArray<lanes, BcryptDigest> {
     var states = InlineArray<lanes, BlowfishState>(repeating: .initial)
     expandWithSalt(&states, keys)
     // The cost loop, 2^cost times ExpandKey(state, 0, key) then ExpandKey(state, 0, salt): the key or the salt mixed
@@ -56,7 +78,7 @@ func bcryptDigests<let lanes: Int>(_ keys: borrowing InlineArray<lanes, BcryptKe
         for k in 0..<lanes {
             for i in 0..<18 { states[k].p[i] ^= salt ? keys[k].saltAsKey[i] : keys[k].key[i] }
         }
-        expandKeyOnly(&states)
+        expandKeyOnly(&states, kernel)
     }
     // Encrypt "OrpheanBeholderScryDoubt" (6 words, 3 blocks) 64 times.
     let magic: InlineArray<6, UInt32> = [0x4f72_7068, 0x6561_6e42, 0x6568_6f6c, 0x6465_7253, 0x6372_7944, 0x6f75_6274]
@@ -271,6 +293,7 @@ final class BcryptWorkers: Service {
     }
 
     let lanes: Int
+    let kernel: BcryptKernel
     private let threads: ThreadPoolExecutor
     private let workers: Int
     private let window: Duration
@@ -279,10 +302,11 @@ final class BcryptWorkers: Service {
     private let state = Mutex(State())
     private let clock = ContinuousClock()
 
-    init(threads: Int, lanes: Int, window: Duration, limit: Int) {
+    init(threads: Int, lanes: Int, kernel: BcryptKernel, window: Duration, limit: Int) {
         self.threads = ThreadPoolExecutor(threads: threads)
         workers = threads
         self.lanes = min(max(lanes, 1), 6)
+        self.kernel = kernel
         self.window = window
         self.limit = limit
     }
@@ -332,7 +356,7 @@ final class BcryptWorkers: Service {
 
     private func work(gathering: Bool) async {
         while let set = await take(gathering: gathering) {
-            let digests = Self.lockstep(set)
+            let digests = Self.lockstep(set, kernel)
             for i in set.indices { set[i].continuation.resume(returning: digests[i]) }
         }
     }
@@ -388,42 +412,53 @@ final class BcryptWorkers: Service {
         return set
     }
 
-    private static func lockstep(_ set: borrowing [Job]) -> [BcryptDigest] {
+    private static func lockstep(_ set: borrowing [Job], _ kernel: BcryptKernel) -> [BcryptDigest] {
         switch set.count {
-        case 1: lockstep(set, InlineArray<1, BcryptKey>.self)
-        case 2: lockstep(set, InlineArray<2, BcryptKey>.self)
-        case 3: lockstep(set, InlineArray<3, BcryptKey>.self)
-        case 4: lockstep(set, InlineArray<4, BcryptKey>.self)
-        case 5: lockstep(set, InlineArray<5, BcryptKey>.self)
-        default: lockstep(set, InlineArray<6, BcryptKey>.self)
+        case 1: lockstep(set, InlineArray<1, BcryptKey>.self, kernel)
+        case 2: lockstep(set, InlineArray<2, BcryptKey>.self, kernel)
+        case 3: lockstep(set, InlineArray<3, BcryptKey>.self, kernel)
+        case 4: lockstep(set, InlineArray<4, BcryptKey>.self, kernel)
+        case 5: lockstep(set, InlineArray<5, BcryptKey>.self, kernel)
+        default: lockstep(set, InlineArray<6, BcryptKey>.self, kernel)
         }
     }
 
-    private static func lockstep<let n: Int>(_ set: borrowing [Job], _: InlineArray<n, BcryptKey>.Type) -> [BcryptDigest] {
+    private static func lockstep<let n: Int>(_ set: borrowing [Job], _: InlineArray<n, BcryptKey>.Type,
+                                             _ kernel: BcryptKernel) -> [BcryptDigest] {
         let keys = InlineArray<n, BcryptKey> { set[$0].key }
-        let digests = bcryptDigests(keys, cost: set[0].cost)
+        let digests = bcryptDigests(keys, cost: set[0].cost, kernel: kernel)
         return (0..<n).map { digests[$0] }
     }
 
-    /// How many hashes to run in lockstep on this CPU: more lanes hide more load latency until their S-boxes (4 KB
-    /// each) stop fitting the core's L1 alongside each other, which differs between CPUs. Times widths 1 to 6 at cost
-    /// 6 and keeps the fastest per hash, or a narrower one within 3% of it, since a narrower set fills sooner.
-    static func calibrate() -> (lanes: Int, perHash: [Duration]) {
-        let times = [time(InlineArray<1, BcryptKey>.self), time(InlineArray<2, BcryptKey>.self),
-                     time(InlineArray<3, BcryptKey>.self), time(InlineArray<4, BcryptKey>.self),
-                     time(InlineArray<5, BcryptKey>.self), time(InlineArray<6, BcryptKey>.self)]
-        var best = 0
-        for i in 1..<times.count where times[i] < times[best] * 0.97 { best = i }
-        return (best + 1, times)
+    /// How many hashes to run in lockstep on this CPU, and with which kernel family: more lanes hide more load latency
+    /// until their S-boxes (4 KB each) stop fitting the core's L1 alongside each other, and the shrx kernels win where
+    /// shrx is cheap (Intel), both of which differ between CPUs. Times both families at widths 1 to 6 at cost 6 and keeps
+    /// the fastest per hash, or a narrower one, or the constant family at the same width, within 3% of it: a narrower
+    /// set fills sooner. Returns the per-hash times by width, constant and shrx.
+    static func calibrate() -> (lanes: Int, kernel: BcryptKernel, constant: [Duration], shrx: [Duration]) {
+        func times(_ kernel: BcryptKernel) -> [Duration] {
+            [time(InlineArray<1, BcryptKey>.self, kernel), time(InlineArray<2, BcryptKey>.self, kernel),
+             time(InlineArray<3, BcryptKey>.self, kernel), time(InlineArray<4, BcryptKey>.self, kernel),
+             time(InlineArray<5, BcryptKey>.self, kernel), time(InlineArray<6, BcryptKey>.self, kernel)]
+        }
+        let constant = times(.constant)
+        let shrx = times(.shrx)
+        var best = (lanes: 1, kernel: BcryptKernel.constant, time: constant[0])
+        for i in 0..<constant.count {
+            for (kernel, time) in [(BcryptKernel.constant, constant[i]), (.shrx, shrx[i])] where time < best.time * 0.97 {
+                best = (i + 1, kernel, time)
+            }
+        }
+        return (best.lanes, best.kernel, constant, shrx)
     }
 
-    private static func time<let n: Int>(_: InlineArray<n, BcryptKey>.Type) -> Duration {
+    private static func time<let n: Int>(_: InlineArray<n, BcryptKey>.Type, _ kernel: BcryptKernel) -> Duration {
         let password = Array("calibration".utf8)
         let keys = InlineArray<n, BcryptKey>(repeating: BcryptKey(password: password.span, salt: InlineArray(repeating: 7)))
         let clock = ContinuousClock()
         var best = Duration.seconds(1)
         for _ in 0..<5 {
-            best = min(best, clock.measure { _ = bcryptDigests(keys, cost: 6) } / n)
+            best = min(best, clock.measure { _ = bcryptDigests(keys, cost: 6, kernel: kernel) } / n)
         }
         return best
     }

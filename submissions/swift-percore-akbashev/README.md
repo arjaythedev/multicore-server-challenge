@@ -135,8 +135,14 @@ All dependencies are pinned exactly in `Package.swift` (plus `Package.resolved`)
   `swift-epoll-akbashev` does after `rust-epoll-theCatWisel`'s generated assembly in #154): each lane's halves in
   locals and all 16 rounds in order, so the compiler only allocates registers. That is 9% less time per hash than
   the generic loop on arm64 (10.9 against 11.9 ms at the best width), with identical digests; a version with the
-  rounds written out but the lanes still generic was 5 times slower at 4 lanes. At startup it times widths 1 to 6
-  at cost 6 and keeps the fastest per hash; every hash still runs all 2^10 rounds. Hashes and verifications wait in
+  rounds written out but the lanes still generic was 5 times slower at 4 lanes. The kernels come in two families,
+  as the Rust's do: constant shifts (the compiler picks the instructions, `bextr` on AMD), and `shrx`, whose shifts
+  by 24 and 16 take their count from a register (an atomic's value, which the optimizer can't fold), so with BMI2
+  they are three-operand `shrx`, with no copy before each shift: the Rust's kernel for Intel. In the compiler's
+  x86-64 output on Intel's cost models that is 11.4-13.3 instructions a half-round at 1 to 5 lanes, against 13.5-15.4
+  with constant shifts and 11-12 for #154's assembly; a tie on AMD's; worse without BMI2. At startup it times both
+  families at widths 1 to 6 at cost 6 and keeps the fastest per hash (`BCRYPT_KERNEL` overrides the family);
+  every hash still runs all 2^10 rounds. Hashes and verifications wait in
   one queue; workers (`BCRYPT_THREADS`, half the cores) are child tasks that prefer a `TaskExecutor` over threads of
   their own, so no hash runs on a loop. One worker takes what is waiting once a set is full or the oldest has waited
   `BCRYPT_WINDOW_MS`; the others only take full sets. Its output is byte for byte OpenBSD's and it verifies the seed's `$2a$` hashes; it writes `$2b$`. At most
@@ -195,7 +201,8 @@ DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit_dev JWT_SECRET=co
 
 Environment: `DATABASE_URL`, `JWT_SECRET` (required); `HOST` (127.0.0.1), `PORT` (3000),
 `DB_POOL_SIZE` (`start.sh`: min(3 × cores, 95)), `BCRYPT_THREADS` (half the cores), `BCRYPT_QUEUE` (40 ×
-`BCRYPT_THREADS`), `BCRYPT_LANES` (measured at startup), `BCRYPT_WINDOW_MS` (200), `WRITE_LANES` (4),
+`BCRYPT_THREADS`), `BCRYPT_LANES` and `BCRYPT_KERNEL` (`constant` or `shrx`; both measured at startup),
+`BCRYPT_WINDOW_MS` (200), `WRITE_LANES` (4),
 `WRITE_GROUP_MAX` (256), `READ_LANES` (cores), `READ_CONNECTIONS` (per read lane: what `DB_POOL_SIZE` leaves after
 the write lanes, split between the read lanes, at least 1), `READ_WINDOW_MS` (30), `READ_BATCH_MAX` (1024), `READ_TASKS` (`0`: a read's result goes to its connection as a callback; on), `SCHED_BATCH`
 (`0` to keep the default scheduling policy; on). `PG_SELFTEST=1` runs the Postgres client's self-test against
