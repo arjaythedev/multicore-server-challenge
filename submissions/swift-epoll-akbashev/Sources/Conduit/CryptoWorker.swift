@@ -3,14 +3,14 @@
 // together; any other cost runs on its own. Verified logins answer straight to the reactors; hashed passwords go back
 // to the scheduler as writes, ahead of the queue.
 
-/// The digests of `mats` at `cost`, in lockstep sets of up to 6 (`dispatch_lanes`).
-private func dispatchLanes(_ mats: [KeyMaterial], cost: Int) -> [BcryptDigest] {
+/// The digests of `mats` at `cost`, in lockstep sets of up to 6 (`dispatch_lanes`), by `kernel`'s kernels.
+private func dispatchLanes(_ mats: [KeyMaterial], cost: Int, kernel: BcryptKernel) -> [BcryptDigest] {
     var out: [BcryptDigest] = []
     out.reserveCapacity(mats.count)
     var i = 0
     func run<let n: Int>(_: InlineArray<n, KeyMaterial>.Type) {
         let input = InlineArray<n, KeyMaterial> { mats[i + $0] }
-        let digests = bcryptLanes(input, cost: cost)
+        let digests = bcryptLanes(input, cost: cost, kernel: kernel)
         for k in 0..<n { out.append(digests[k]) }
         i += n
     }
@@ -41,12 +41,14 @@ actor CryptoWorker {
     private let scheduler: Scheduler
     private let reactors: [Reactor]
     private let signer: TokenSigner
+    private let kernel: BcryptKernel
 
-    init(loop: EventLoop, scheduler: Scheduler, reactors: [Reactor], signer: TokenSigner) {
+    init(loop: EventLoop, scheduler: Scheduler, reactors: [Reactor], signer: TokenSigner, kernel: BcryptKernel) {
         self.loop = loop
         self.scheduler = scheduler
         self.reactors = reactors
         self.signer = signer
+        self.kernel = kernel
     }
 
     func run() async {
@@ -104,7 +106,7 @@ actor CryptoWorker {
                 mats.append(KeyMaterial(password: password, salt: salt))
             }
         }
-        let digests = dispatchLanes(mats, cost: cost)
+        let digests = dispatchLanes(mats, cost: cost, kernel: kernel)
         for (i, t) in tasks.enumerated() {
             switch t {
             case .verifyLogin(_, _, let user, let addr):

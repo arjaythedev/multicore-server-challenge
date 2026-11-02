@@ -1,60 +1,100 @@
 // Writes Sources/Conduit/BcryptKernels.swift, the bcrypt key-schedule kernels, as the Rust's build.rs writes its
 // bc_expand0 assembly: one kernel per lane count (1 to 6), each lane's two halves in scalar locals and all 16 rounds
 // of every lane written out, interleaved half-round by half-round, so the compiler has nothing left to decide but
-// registers. From the submission folder:
+// registers. Two families, as the Rust has several (calibration picks one at start-up):
+//   constant  bytes extracted with constant shifts; the compiler picks the instructions (BMI1 bextr on AMD).
+//   shrx      the shifts by 24 and 16 take their count from a register (an atomic's value, which the optimizer can't
+//             fold), which on BMI2 is shrx: three operands, the input kept, no copy before each shift (the Rust's
+//             shrx kernel, for Intel). Worse without BMI2, where a variable shift's count must be in cl.
+// From the submission folder:
 //   swift scripts/generate-bcrypt-kernels.swift > Sources/Conduit/BcryptKernels.swift
 
 let maxLanes = 6
 
+struct Family {
+    var suffix: String       // the kernels' name suffix
+    var extraParams: String  // F's and the encipher's extra parameters
+    var extraArgs: String    // passing them on
+    var feistel: [String]    // F's body
+    var prologue: [String]   // the expansion's first lines (loading the counts)
+}
+
+let families = [
+    Family(suffix: "", extraParams: "", extraArgs: "",
+           feistel: ["    ((st[k].s[Int(x >> 24)] &+ st[k].s[256 + Int(x >> 16 & 0xFF)]) ^ st[k].s[512 + Int(x >> 8 & 0xFF)])",
+                     "        &+ st[k].s[768 + Int(x & 0xFF)]"],
+           prologue: []),
+    Family(suffix: "Shrx", extraParams: ", _ by24: UInt32, _ by16: UInt32", extraArgs: ", by24, by16",
+           feistel: ["    ((st[k].s[Int(x &>> by24)] &+ st[k].s[256 + Int(x &>> by16 & 0xFF)]) ^ st[k].s[512 + Int(x >> 8 & 0xFF)])",
+                     "        &+ st[k].s[768 + Int(x & 0xFF)]"],
+           prologue: ["    let by24 = bfShiftBy24.load(ordering: .relaxed), by16 = bfShiftBy16.load(ordering: .relaxed)"]),
+]
+
 func lanes(_ n: Int, _ body: (Int) -> String) -> [String] { (0..<n).map(body) }
 
-func encipher(_ n: Int) -> [String] {
+func feistel(_ f: Family) -> [String] {
+    ["/// F of lane `k`, its S-boxes read in place.",
+     "@inline(__always) private func bfF\(f.suffix)<let m: Int>(_ st: borrowing InlineArray<m, BfState>, _ k: Int, _ x: UInt32\(f.extraParams)) -> UInt32 {"]
+        + f.feistel + ["}"]
+}
+
+func encipher(_ n: Int, _ f: Family) -> [String] {
     var out = ["/// One Blowfish encryption in each of \(n) lane(s): `L ^= P[0]`, sixteen half-rounds `y ^= P[r] ^ F(x)`, then",
                "/// `(L, R) = (R ^ P[17], L)` (the order bc_expand0 runs them in).",
-               "@inline(__always) private func bfEncipher\(n)<let m: Int>(_ st: borrowing InlineArray<m, BfState>,",
-               "    " + lanes(n) { "_ l\($0): inout UInt32, _ r\($0): inout UInt32" }.joined(separator: ", ") + ") {"]
+               "@inline(__always) private func bfEncipher\(f.suffix)\(n)<let m: Int>(_ st: borrowing InlineArray<m, BfState>,",
+               "    " + lanes(n) { "_ l\($0): inout UInt32, _ r\($0): inout UInt32" }.joined(separator: ", ") + "\(f.extraParams)) {"]
     out += lanes(n) { "    l\($0) ^= st[\($0)].p[0]" }
     for round in 1...16 {
         let (x, y) = round % 2 == 1 ? ("l", "r") : ("r", "l")
-        // The P word and F as two statements: in one expression, lending `st` to bfF while reading it would copy it.
+        // The P word and F as two statements: in one expression, lending `st` to F while reading it would copy it.
         out += lanes(n) { "    \(y)\($0) ^= st[\($0)].p[\(round)]" }
-        out += lanes(n) { "    \(y)\($0) ^= bfF(st, \($0), \(x)\($0))" }
+        out += lanes(n) { "    \(y)\($0) ^= bfF\(f.suffix)(st, \($0), \(x)\($0)\(f.extraArgs))" }
     }
     out += lanes(n) { "    (l\($0), r\($0)) = (r\($0) ^ st[\($0)].p[17], l\($0))" }
     out.append("}")
     return out
 }
 
-func expand0(_ n: Int) -> [String] {
-    let args = lanes(n) { "&l\($0), &r\($0)" }.joined(separator: ", ")
+func expand0(_ n: Int, _ f: Family) -> [String] {
+    let args = lanes(n) { "&l\($0), &r\($0)" }.joined(separator: ", ") + f.extraArgs
     var out = ["/// The key-only expansion of \(n) lane(s) (`bc_expand0_*_\(n)`): 521 encryptions chained from zero, filling P",
                "/// and then the S-boxes. Generic over the array's size (always \(n)) so the states are reached by address and",
                "/// never copied.",
-               "@inline(__always) private func bfExpand0Lanes\(n)<let m: Int>(_ st: inout InlineArray<m, BfState>) {",
-               "    " + lanes(n) { "var l\($0): UInt32 = 0, r\($0): UInt32 = 0" }.joined(separator: "; "),
-               "    for i in 0..<9 {",
-               "        bfEncipher\(n)(st, \(args))"]
+               "@inline(__always) private func bfExpand0\(f.suffix)Lanes\(n)<let m: Int>(_ st: inout InlineArray<m, BfState>) {"]
+    out += f.prologue
+    out += ["    " + lanes(n) { "var l\($0): UInt32 = 0, r\($0): UInt32 = 0" }.joined(separator: "; "),
+            "    for i in 0..<9 {",
+            "        bfEncipher\(f.suffix)\(n)(st, \(args))"]
     out += lanes(n) { "        st[\($0)].p[2 * i] = l\($0); st[\($0)].p[2 * i + 1] = r\($0)" }
-    out += ["    }", "    for i in 0..<512 {", "        bfEncipher\(n)(st, \(args))"]
+    out += ["    }", "    for i in 0..<512 {", "        bfEncipher\(f.suffix)\(n)(st, \(args))"]
     out += lanes(n) { "        st[\($0)].s[2 * i] = l\($0); st[\($0)].s[2 * i + 1] = r\($0)" }
     out += ["    }", "}"]
     return out
 }
 
 var file = ["// Generated by scripts/generate-bcrypt-kernels.swift; don't edit. The bcrypt key-schedule kernels (the Rust's",
-            "// build.rs bc_expand0, in Swift): one per lane count, every lane's 16 rounds written out.",
+            "// build.rs bc_expand0, in Swift): one per lane count and family, every lane's 16 rounds written out.",
+            "import Synchronization",
             "",
-            "/// F of lane `k`, its S-boxes read in place.",
-            "@inline(__always) private func bfF<let m: Int>(_ st: borrowing InlineArray<m, BfState>, _ k: Int, _ x: UInt32) -> UInt32 {",
-            "    ((st[k].s[Int(x >> 24)] &+ st[k].s[256 + Int(x >> 16 & 0xFF)]) ^ st[k].s[512 + Int(x >> 8 & 0xFF)])",
-            "        &+ st[k].s[768 + Int(x & 0xFF)]",
-            "}",
+            "/// The shrx kernels' shift counts, so the shifts take their count from a register. Not `private`: a private",
+            "/// global is internal to the object file, where the optimizer sees every access and folds the loads back to",
+            "/// constants (the kernels then compile to the constant family's, which is only slower where that's slower);",
+            "/// a module-internal one is an external symbol, whose value it can't assume.",
+            "let bfShiftBy24 = Atomic<UInt32>(24)",
+            "let bfShiftBy16 = Atomic<UInt32>(16)",
             "",
-            "/// The key-only expansion of every lane, by the kernel written out for `n` lanes (1 to \(maxLanes)).",
-            "@inline(__always) func bfExpand0<let n: Int>(_ st: inout InlineArray<n, BfState>) {",
-            "    switch n {"]
-file += (1...maxLanes).map { "    case \($0): bfExpand0Lanes\($0)(&st)" }
-file += ["    default: fatalError(\"no bcrypt kernel for \\(n) lanes\")", "    }", "}"]
-for n in 1...maxLanes { file += [""] + encipher(n) + [""] + expand0(n) }
-
+            "/// The key-only expansion of every lane, by `kernel`'s kernel written out for `n` lanes (1 to \(maxLanes)).",
+            "@inline(__always) func bfExpand0<let n: Int>(_ st: inout InlineArray<n, BfState>, _ kernel: BcryptKernel) {",
+            "    switch kernel {"]
+for (f, name) in zip(families, ["constant", "shrx"]) {
+    file.append("    case .\(name):")
+    file.append("        switch n {")
+    file += (1...maxLanes).map { "        case \($0): bfExpand0\(f.suffix)Lanes\($0)(&st)" }
+    file += ["        default: fatalError(\"no bcrypt kernel for \\(n) lanes\")", "        }"]
+}
+file += ["    }", "}"]
+for f in families {
+    file += [""] + feistel(f)
+    for n in 1...maxLanes { file += [""] + encipher(n, f) + [""] + expand0(n, f) }
+}
 print(file.joined(separator: "\n"))

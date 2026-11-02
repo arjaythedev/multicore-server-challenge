@@ -28,9 +28,10 @@ struct Conduit {
         let cryptoWorkers = envInt("BCRYPT_THREADS", max(cores / 2, 3))
 
         let calibrationStart = monotonicNanos()
-        let (autoLanes, seedBcryptUs, l1dKB) = calibrateBcryptHardware()
+        let (autoLanes, autoKernel, seedBcryptUs, l1dKB) = calibrateBcryptHardware()
         let calibrationMs = (monotonicNanos() - calibrationStart) / 1_000_000
         let bcryptLanes = envInt("BCRYPT_LANES", autoLanes)
+        let bcryptKernel = env("BCRYPT_KERNEL").flatMap(BcryptKernel.init(name:)) ?? autoKernel
 
         let signer = TokenSigner(secret: Array(jwtSecret.utf8))
         guard let db = DbEndpoint(url: databaseURL) else { fatalError("invalid DATABASE_URL") }
@@ -55,11 +56,12 @@ struct Conduit {
             WriteLane(loop: EventLoop(name: "db-write"), db: db, scheduler: scheduler, reactors: reactors, signer: signer)
         }
         let crypto = (0..<cryptoWorkers).map { _ in
-            CryptoWorker(loop: EventLoop(name: "crypto"), scheduler: scheduler, reactors: reactors, signer: signer)
+            CryptoWorker(loop: EventLoop(name: "crypto"), scheduler: scheduler, reactors: reactors, signer: signer,
+                         kernel: bcryptKernel)
         }
 
         logLine("listening on \(host):\(port) (\(ioWorkers) io, \(readWorkers) read, \(writeWorkers) write, "
-            + "\(cryptoWorkers)x\(bcryptLanes) crypto, L1D=\(l1dKB)KB, nofile=\(fdBudget)/io, "
+            + "\(cryptoWorkers)x\(bcryptLanes) crypto (\(bcryptKernel) kernel), L1D=\(l1dKB)KB, nofile=\(fdBudget)/io, "
             + "bcrypt cost 10 = \(seedBcryptUs / 1000) ms per \(autoLanes)-lane batch, calibrated in \(calibrationMs) ms)")
 
         await withDiscardingTaskGroup { group in

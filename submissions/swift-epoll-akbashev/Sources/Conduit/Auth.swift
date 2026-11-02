@@ -425,8 +425,29 @@ struct KeyMaterial: BitwiseCopyable {
     }
 }
 
+/// Which family of the generated key-only expansion kernels runs (BcryptKernels.swift), as the Rust's BcryptKernel;
+/// calibration picks the faster on this CPU.
+enum BcryptKernel: Sendable, CustomStringConvertible {
+    /// Bytes extracted with constant shifts: the compiler picks the instructions (BMI1's bextr on AMD).
+    case constant
+    /// The shifts by 24 and 16 take their count from a register: BMI2's shrx, which keeps its input, so no copy
+    /// before each shift (the Rust's shrx kernel, for Intel). Slower without BMI2.
+    case shrx
+
+    init?(name: String) {
+        switch name {
+        case "constant": self = .constant
+        case "shrx": self = .shrx
+        default: return nil
+        }
+    }
+
+    var description: String { self == .constant ? "constant" : "shrx" }
+}
+
 /// `n` bcrypt digests at one cost, in lockstep (`bcrypt_lanes<N>`). Every lane runs all 2^cost rounds.
-func bcryptLanes<let n: Int>(_ mats: borrowing InlineArray<n, KeyMaterial>, cost: Int) -> InlineArray<n, BcryptDigest> {
+func bcryptLanes<let n: Int>(_ mats: borrowing InlineArray<n, KeyMaterial>, cost: Int,
+                             kernel: BcryptKernel) -> InlineArray<n, BcryptDigest> {
     var st = InlineArray<n, BfState>(repeating: .initial)
     eksExpand(&st, mats, withSalt: true, saltAsKey: false)
     // The cost loop: the key and then the salt XORed into P, each followed by a key-only expansion, the kernel
@@ -436,7 +457,7 @@ func bcryptLanes<let n: Int>(_ mats: borrowing InlineArray<n, KeyMaterial>, cost
         for k in 0..<n {
             for i in 0..<18 { st[k].p[i] ^= saltAsKey ? mats[k].salt18[i] : mats[k].keyP[i] }
         }
-        bfExpand0(&st)
+        bfExpand0(&st, kernel)
     }
     let magic: InlineArray<6, UInt32> = [0x4f72_7068, 0x6561_6e42, 0x6568_6f6c, 0x6465_7253, 0x6372_7944, 0x6f75_6274]
     var ctext = InlineArray<n, InlineArray<6, UInt32>>(repeating: magic)
@@ -475,33 +496,43 @@ extension String {
     }
 }
 
-private func probe<let n: Int>(_: InlineArray<n, KeyMaterial>.Type) -> (lanes: Int, us10: Int, perHash: Int) {
+private typealias Probe = (lanes: Int, kernel: BcryptKernel, us10: Int, perHash: Int)
+
+/// `n` lanes with `kernel` at cost 7, the faster of two runs (`probe_nk`), scaled to cost 10.
+private func probe<let n: Int>(_: InlineArray<n, KeyMaterial>.Type, _ kernel: BcryptKernel) -> Probe {
     let pw = Array("calibrate-benchmark-pw".utf8)
     let mats = InlineArray<n, KeyMaterial> { k in
         KeyMaterial(password: pw, salt: BcryptSalt(repeating: UInt8(truncatingIfNeeded: k &* 17 &+ 3)))
     }
-    let t0 = monotonicNanos()
-    let digests = bcryptLanes(mats, cost: 8)
-    let us8 = Int((monotonicNanos() - t0) / 1000)
-    withExtendedLifetime(digests) {}
-    let us10 = max(us8 * 4, 1000)
-    return (n, us10, us10 / n)
+    var us7 = Int.max
+    for _ in 0..<2 {
+        let t0 = monotonicNanos()
+        let digests = bcryptLanes(mats, cost: 7, kernel: kernel)
+        us7 = min(us7, Int((monotonicNanos() - t0) / 1000))
+        withExtendedLifetime(digests) {}
+    }
+    let us10 = max(us7 * 8, 1000)
+    return (n, kernel, us10, us10 / n)
 }
 
-/// Picks the lockstep width (`calibrate_bcrypt_hardware`): times 2, 3, 4 and 6 lanes at cost 8 and keeps the fastest
-/// per hash whose states fit the L1. Returns (lanes, the estimated microseconds of one cost-10 batch, L1D KB).
-func calibrateBcryptHardware() -> (lanes: Int, bcryptUs: Int, l1dKB: Int) {
+/// Picks the kernel and the lockstep width (`calibrate_bcrypt_hardware`): times both kernel families at 2, 3, 4 and
+/// 6 lanes and keeps the fastest per hash whose states fit the L1. Returns (lanes, kernel, the estimated
+/// microseconds of one cost-10 batch, L1D KB).
+func calibrateBcryptHardware() -> (lanes: Int, kernel: BcryptKernel, bcryptUs: Int, l1dKB: Int) {
     let l1d = detectL1DKB()
     let warm = InlineArray<1, KeyMaterial>(repeating: KeyMaterial(password: Array("calibrate-warmup".utf8), salt: BcryptSalt(repeating: 0x5A)))
-    withExtendedLifetime(bcryptLanes(warm, cost: 5)) {}
-    let candidates = [probe(InlineArray<2, KeyMaterial>.self), probe(InlineArray<3, KeyMaterial>.self),
-                      probe(InlineArray<4, KeyMaterial>.self), probe(InlineArray<6, KeyMaterial>.self)]
+    for kernel in [BcryptKernel.constant, .shrx] { withExtendedLifetime(bcryptLanes(warm, cost: 5, kernel: kernel)) {} }
+    var candidates: [Probe] = []
+    for kernel in [BcryptKernel.constant, .shrx] {
+        candidates += [probe(InlineArray<2, KeyMaterial>.self, kernel), probe(InlineArray<3, KeyMaterial>.self, kernel),
+                       probe(InlineArray<4, KeyMaterial>.self, kernel), probe(InlineArray<6, KeyMaterial>.self, kernel)]
+    }
     var best = candidates[0]
     for cand in candidates.dropFirst() {
         let stateKB = cand.lanes * MemoryLayout<BfState>.size / 1024
         if stateKB <= l1d && cand.perHash * 103 < best.perHash * 100 { best = cand }
     }
-    return (best.lanes, best.us10, l1d)
+    return (best.lanes, best.kernel, best.us10, l1d)
 }
 
 private let bcryptAlphabet: StaticString = "./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
