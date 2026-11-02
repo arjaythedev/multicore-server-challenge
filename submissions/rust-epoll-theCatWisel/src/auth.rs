@@ -119,12 +119,23 @@ fn compress_words(state: &mut [u32; 8], w: [u32; 16]) {
             target_feature = "ssse3"
         ))
     ))]
-    if std::is_x86_feature_detected!("sha")
-        && std::is_x86_feature_detected!("sse4.1")
-        && std::is_x86_feature_detected!("ssse3")
     {
-        unsafe { compress_words_shani(state, w) };
-        return;
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static HAS_SHANI: AtomicU8 = AtomicU8::new(0);
+        let st = HAS_SHANI.load(Ordering::Relaxed);
+        let ok = if st != 0 {
+            st == 2
+        } else {
+            let d = std::is_x86_feature_detected!("sha")
+                && std::is_x86_feature_detected!("sse4.1")
+                && std::is_x86_feature_detected!("ssse3");
+            HAS_SHANI.store(if d { 2 } else { 1 }, Ordering::Relaxed);
+            d
+        };
+        if ok {
+            unsafe { compress_words_shani(state, w) };
+            return;
+        }
     }
     #[cfg(not(all(
         target_arch = "x86_64",
@@ -401,11 +412,15 @@ fn ct_eq_32(a: &[u8; 32], b: &[u8]) -> bool {
     if b.len() != 32 {
         return false;
     }
-    let mut diff = 0u8;
-    for i in 0..32 {
-        diff |= a[i] ^ b[i];
-    }
-    diff == 0
+    let a0 = u64::from_ne_bytes(a[0..8].try_into().unwrap());
+    let a1 = u64::from_ne_bytes(a[8..16].try_into().unwrap());
+    let a2 = u64::from_ne_bytes(a[16..24].try_into().unwrap());
+    let a3 = u64::from_ne_bytes(a[24..32].try_into().unwrap());
+    let b0 = u64::from_ne_bytes(b[0..8].try_into().unwrap());
+    let b1 = u64::from_ne_bytes(b[8..16].try_into().unwrap());
+    let b2 = u64::from_ne_bytes(b[16..24].try_into().unwrap());
+    let b3 = u64::from_ne_bytes(b[24..32].try_into().unwrap());
+    std::hint::black_box((a0 ^ b0) | (a1 ^ b1) | (a2 ^ b2) | (a3 ^ b3)) == 0
 }
 
 impl TokenSigner {

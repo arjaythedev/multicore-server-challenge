@@ -189,19 +189,48 @@ pub struct ReplyAddr {
     pub epoch: u32,
 }
 
+#[derive(Clone)]
 pub enum ReplyBody {
     Owned(Vec<u8>),
     Shared(Arc<[u8]>),
+    SharedGz { plain: Arc<[u8]>, gz: Arc<[u8]> },
     Empty,
 }
 
 impl ReplyBody {
     #[inline]
-    pub fn as_slice(&self) -> &[u8] {
+    pub fn from_owned(plain: Vec<u8>, _gz_scratch: &mut Vec<u8>) -> Self {
+        ReplyBody::Owned(plain)
+    }
+
+    #[inline]
+    pub fn from_shared(plain_vec: Vec<u8>, gz_scratch: &mut Vec<u8>) -> Self {
+        let plain: Arc<[u8]> = plain_vec.into();
+        if plain.len() >= 192 {
+            codec::gzip_compress_fast(&plain, gz_scratch);
+            if gz_scratch.len() + 26 < plain.len().saturating_sub(64) {
+                return ReplyBody::SharedGz {
+                    plain,
+                    gz: Arc::from(gz_scratch.as_slice()),
+                };
+            }
+        }
+        ReplyBody::Shared(plain)
+    }
+
+    #[inline]
+    pub fn select(&self, accept_gzip: bool) -> (&[u8], Option<&[u8]>) {
         match self {
-            ReplyBody::Owned(v) => v.as_slice(),
-            ReplyBody::Shared(a) => a.as_ref(),
-            ReplyBody::Empty => &[],
+            ReplyBody::Owned(v) => (v.as_slice(), None),
+            ReplyBody::Shared(a) => (a.as_ref(), None),
+            ReplyBody::SharedGz { plain, gz } => {
+                if accept_gzip {
+                    (plain.as_ref(), Some(gz.as_ref()))
+                } else {
+                    (plain.as_ref(), None)
+                }
+            }
+            ReplyBody::Empty => (&[], None),
         }
     }
 }
@@ -335,6 +364,7 @@ struct ClientSlot {
     tx_off: usize,
     in_flight: bool,
     close_on_done: bool,
+    accept_gzip: bool,
     eof_seen: bool,
     polling_out: bool,
     continue_sent: bool,
@@ -372,6 +402,15 @@ fn sys_cvt(rc: i32) -> io::Result<i32> {
 }
 
 pub fn bind_listener(host: &str, port: u16) -> io::Result<RawFd> {
+    if host == "0.0.0.0" {
+        if let Ok(fd) = bind_listener_inner("::", port) {
+            return Ok(fd);
+        }
+    }
+    bind_listener_inner(host, port)
+}
+
+fn bind_listener_inner(host: &str, port: u16) -> io::Result<RawFd> {
     let ip: std::net::IpAddr = host
         .parse()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid HOST address"))?;
@@ -385,15 +424,25 @@ pub fn bind_listener(host: &str, port: u16) -> io::Result<RawFd> {
         let yes: sys::c_int = 1;
         let no: sys::c_int = 0;
         for opt in [sys::SO_REUSEADDR, sys::SO_REUSEPORT] {
-            sys_cvt(sys::setsockopt(
+            if let Err(e) = sys_cvt(sys::setsockopt(
                 fd,
                 sys::SOL_SOCKET,
                 opt,
                 &yes as *const _ as *const sys::c_void,
                 4,
-            ))?;
+            )) {
+                sys::close(fd);
+                return Err(e);
+            }
         }
-        match ip {
+        let _ = sys::setsockopt(
+            fd,
+            sys::IPPROTO_TCP,
+            sys::TCP_NODELAY,
+            &yes as *const _ as *const sys::c_void,
+            4,
+        );
+        let bind_res = match ip {
             std::net::IpAddr::V4(v4) => {
                 let sa = sys::sockaddr_in {
                     sin_family: sys::AF_INET as u16,
@@ -407,16 +456,16 @@ pub fn bind_listener(host: &str, port: u16) -> io::Result<RawFd> {
                     fd,
                     &sa as *const _ as *const sys::sockaddr,
                     std::mem::size_of::<sys::sockaddr_in>() as u32,
-                ))?;
+                ))
             }
             std::net::IpAddr::V6(v6) => {
-                sys_cvt(sys::setsockopt(
+                let _ = sys::setsockopt(
                     fd,
                     sys::IPPROTO_IPV6,
                     sys::IPV6_V6ONLY,
                     &no as *const _ as *const sys::c_void,
                     4,
-                ))?;
+                );
                 let sa = sys::sockaddr_in6 {
                     sin6_family: sys::AF_INET6 as u16,
                     sin6_port: port.to_be(),
@@ -428,10 +477,17 @@ pub fn bind_listener(host: &str, port: u16) -> io::Result<RawFd> {
                     fd,
                     &sa as *const _ as *const sys::sockaddr,
                     std::mem::size_of::<sys::sockaddr_in6>() as u32,
-                ))?;
+                ))
             }
+        };
+        if let Err(e) = bind_res {
+            sys::close(fd);
+            return Err(e);
         }
-        sys_cvt(sys::listen(fd, 65535))?;
+        if let Err(e) = sys_cvt(sys::listen(fd, 65535)) {
+            sys::close(fd);
+            return Err(e);
+        }
         Ok(fd)
     }
 }
@@ -457,6 +513,7 @@ enum ParseOutcome {
     Complete {
         consumed: usize,
         close_after: bool,
+        accept_gzip: bool,
         dispatch: Dispatch,
     },
     Incomplete {
@@ -610,22 +667,13 @@ impl Reactor {
                     _ => return,
                 }
             }
-            let yes: sys::c_int = 1;
-            unsafe {
-                sys::setsockopt(
-                    fd,
-                    sys::IPPROTO_TCP,
-                    sys::TCP_NODELAY,
-                    &yes as *const _ as *const sys::c_void,
-                    4,
-                );
-            }
             let (slot, epoch) = match self.free_slots.pop() {
                 Some(idx) => {
                     let c = &mut self.slots[idx as usize];
                     c.fd = fd;
                     c.in_flight = false;
                     c.close_on_done = false;
+                    c.accept_gzip = false;
                     c.eof_seen = false;
                     c.polling_out = false;
                     c.continue_sent = false;
@@ -645,6 +693,7 @@ impl Reactor {
                         tx_off: 0,
                         in_flight: false,
                         close_on_done: false,
+                        accept_gzip: false,
                         eof_seen: false,
                         polling_out: false,
                         continue_sent: false,
@@ -759,11 +808,13 @@ impl Reactor {
                     ParseOutcome::Complete {
                         consumed,
                         close_after,
+                        accept_gzip,
                         dispatch,
                     } => {
                         let c = &mut self.slots[slot as usize];
                         c.continue_sent = false;
                         c.close_on_done = close_after;
+                        c.accept_gzip = accept_gzip;
                         c.in_flight = true;
                         if consumed < n {
                             c.rx.extend_from_slice(&self.scratch[consumed..n]);
@@ -829,10 +880,12 @@ impl Reactor {
                 ParseOutcome::Complete {
                     consumed,
                     close_after,
+                    accept_gzip,
                     dispatch,
                 } => {
                     c.continue_sent = false;
                     c.close_on_done = close_after;
+                    c.accept_gzip = accept_gzip;
                     c.in_flight = true;
                     if consumed == c.rx.len() {
                         c.rx = Vec::new();
@@ -875,9 +928,19 @@ impl Reactor {
         }
         let mut replies = std::mem::take(&mut self.outbox_buf);
         replies.clear();
-        {
+        const MAX_OUTBOX_BATCH: usize = 256;
+        let more_pending = {
             let mut pending = worker_outbox(self.worker_id as usize).pending.lock().unwrap();
-            std::mem::swap(&mut replies, &mut *pending);
+            if pending.len() <= MAX_OUTBOX_BATCH {
+                std::mem::swap(&mut replies, &mut *pending);
+                false
+            } else {
+                replies.extend(pending.drain(..MAX_OUTBOX_BATCH));
+                true
+            }
+        };
+        if more_pending {
+            signal_eventfd(self.outbox_fd);
         }
         let mut check_pipelined = std::mem::take(&mut self.pipelined_slots);
         check_pipelined.clear();
@@ -887,7 +950,8 @@ impl Reactor {
                 continue;
             }
             let has_buffered_rx = !c.rx.is_empty();
-            self.write_response(rep.addr.slot, rep.status, rep.body.as_slice());
+            let (plain, pre_gz) = rep.body.select(c.accept_gzip);
+            self.write_response_ext(rep.addr.slot, rep.status, plain, pre_gz);
             if has_buffered_rx {
                 check_pipelined.push(rep.addr.slot);
             }
@@ -901,11 +965,21 @@ impl Reactor {
         self.pipelined_slots = check_pipelined;
     }
 
+    #[inline]
     fn write_response(&mut self, slot: u32, status: u16, body: &[u8]) {
+        self.write_response_ext(slot, status, body, None);
+    }
+
+    fn write_response_ext(&mut self, slot: u32, status: u16, body: &[u8], pre_gz: Option<&[u8]>) {
         let c = &mut self.slots[slot as usize];
         c.in_flight = false;
         c.reused = true;
-        let mut hdr = [0u8; 160];
+        let (payload, use_gzip): (&[u8], bool) = if let Some(gz) = pre_gz {
+            (gz, true)
+        } else {
+            (body, false)
+        };
+        let mut hdr = [0u8; 192];
         let mut hlen = 0usize;
         let mut append = |bytes: &[u8]| {
             hdr[hlen..hlen + bytes.len()].copy_from_slice(bytes);
@@ -913,11 +987,17 @@ impl Reactor {
         };
 
         if status == 200 && !c.close_on_done {
-            const PFX_200: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ";
-            hdr[..PFX_200.len()].copy_from_slice(PFX_200);
-            hlen = PFX_200.len();
+            if use_gzip {
+                const PFX_200_GZ: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: ";
+                hdr[..PFX_200_GZ.len()].copy_from_slice(PFX_200_GZ);
+                hlen = PFX_200_GZ.len();
+            } else {
+                const PFX_200: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ";
+                hdr[..PFX_200.len()].copy_from_slice(PFX_200);
+                hlen = PFX_200.len();
+            }
             let mut num = [0u8; 20];
-            let digits = codec::format_u64_into(body.len() as u64, &mut num);
+            let digits = codec::format_u64_into(payload.len() as u64, &mut num);
             hdr[hlen..hlen + digits.len()].copy_from_slice(digits);
             hlen += digits.len();
             hdr[hlen..hlen + 4].copy_from_slice(b"\r\n\r\n");
@@ -931,9 +1011,13 @@ impl Reactor {
         } else {
             append(b"HTTP/1.1 ");
             append(reason_phrase(status).as_bytes());
-            append(b"\r\nContent-Type: application/json\r\nContent-Length: ");
+            if use_gzip {
+                append(b"\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: ");
+            } else {
+                append(b"\r\nContent-Type: application/json\r\nContent-Length: ");
+            }
             let mut num = [0u8; 20];
-            append(codec::format_u64_into(body.len() as u64, &mut num));
+            append(codec::format_u64_into(payload.len() as u64, &mut num));
             append(if c.close_on_done {
                 b"\r\nConnection: close\r\n\r\n"
             } else {
@@ -944,7 +1028,7 @@ impl Reactor {
         let fd = c.fd;
         if c.tx.len() > c.tx_off {
             c.tx.extend_from_slice(&hdr[..hlen]);
-            c.tx.extend_from_slice(body);
+            c.tx.extend_from_slice(payload);
         } else {
             let iov = [
                 sys::iovec {
@@ -952,12 +1036,12 @@ impl Reactor {
                     iov_len: hlen,
                 },
                 sys::iovec {
-                    iov_base: body.as_ptr() as *mut sys::c_void,
-                    iov_len: body.len(),
+                    iov_base: payload.as_ptr() as *mut sys::c_void,
+                    iov_len: payload.len(),
                 },
             ];
-            let total = hlen + body.len();
-            let rc = unsafe { sys::writev(fd, iov.as_ptr(), if body.is_empty() { 1 } else { 2 }) };
+            let total = hlen + payload.len();
+            let rc = unsafe { sys::writev(fd, iov.as_ptr(), if payload.is_empty() { 1 } else { 2 }) };
             let written = if rc < 0 {
                 let err = io::Error::last_os_error();
                 if matches!(err.raw_os_error(), Some(sys::EAGAIN) | Some(sys::EINTR)) {
@@ -974,9 +1058,9 @@ impl Reactor {
                 c.tx_off = 0;
                 if written < hlen {
                     c.tx.extend_from_slice(&hdr[written..hlen]);
-                    c.tx.extend_from_slice(body);
+                    c.tx.extend_from_slice(payload);
                 } else {
-                    c.tx.extend_from_slice(&body[written - hlen..]);
+                    c.tx.extend_from_slice(&payload[written - hlen..]);
                 }
             }
         }
@@ -1148,6 +1232,7 @@ fn parse_one_http(signer: &TokenSigner, buf: &[u8], addr: ReplyAddr) -> ParseOut
     let mut is_chunked = false;
     let mut auth_hdr: Option<&[u8]> = None;
     let mut keep_alive = !is_http10;
+    let mut accept_gzip = false;
     let mut expect_100 = false;
 
     let mut pos = req_line_end + 2;
@@ -1199,6 +1284,9 @@ fn parse_one_http(signer: &TokenSigner, buf: &[u8], addr: ReplyAddr) -> ParseOut
                 } else if val.eq_ignore_ascii_case(b"keep-alive") {
                     keep_alive = true;
                 }
+            }
+            15 if name.eq_ignore_ascii_case(b"accept-encoding") => {
+                accept_gzip = codec::contains_gzip_token(val);
             }
             17 if name.eq_ignore_ascii_case(b"transfer-encoding") => {
                 is_chunked = val.eq_ignore_ascii_case(b"chunked");
@@ -1266,6 +1354,7 @@ fn parse_one_http(signer: &TokenSigner, buf: &[u8], addr: ReplyAddr) -> ParseOut
     ParseOutcome::Complete {
         consumed: total_consumed,
         close_after: !keep_alive,
+        accept_gzip,
         dispatch,
     }
 }

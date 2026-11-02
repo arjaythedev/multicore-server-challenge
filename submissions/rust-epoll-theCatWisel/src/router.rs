@@ -115,26 +115,6 @@ impl<T: Timestamped> WorkQueue<T> {
         }
     }
 
-    pub fn drain_up_to(&self, max_items: usize, dst: &mut Vec<T>) {
-        let mut g = self.inner.lock().unwrap();
-        while g.q.is_empty() {
-            g.hold = 1;
-            g.waiting += 1;
-            g = self.ready.wait(g).unwrap();
-            g.waiting -= 1;
-        }
-        let take_n = g.q.len().min(max_items);
-        dst.extend(g.q.drain(..take_n));
-        if let Some(front) = g.q.front() {
-            g.since = Some(front.enqueued_at());
-            if g.waiting > 0 {
-                self.ready.notify_one();
-            }
-        } else {
-            g.since = None;
-        }
-    }
-
     pub fn try_take_aged(
         &self,
         want: usize,
@@ -174,13 +154,7 @@ impl<T: Timestamped> WorkQueue<T> {
         rem
     }
 
-    pub fn take_aged(
-        &self,
-        want: usize,
-        max_age: Duration,
-        max_cap: usize,
-        dst: &mut Vec<T>,
-    ) {
+    pub fn wait_for_first(&self) -> usize {
         let mut g = self.inner.lock().unwrap();
         while g.q.is_empty() {
             g.hold = 1;
@@ -188,30 +162,7 @@ impl<T: Timestamped> WorkQueue<T> {
             g = self.ready.wait(g).unwrap();
             g.waiting -= 1;
         }
-        if !max_age.is_zero() && g.q.len() < want {
-            let deadline = g.since.unwrap_or_else(Instant::now) + max_age;
-            while g.q.len() < want {
-                let now = Instant::now();
-                if now >= deadline {
-                    break;
-                }
-                g.hold = want;
-                g.waiting += 1;
-                g = self.ready.wait_timeout(g, deadline - now).unwrap().0;
-                g.waiting -= 1;
-                g.hold = 1;
-            }
-        }
-        let take_n = g.q.len().min(max_cap);
-        dst.extend(g.q.drain(..take_n));
-        if let Some(front) = g.q.front() {
-            g.since = Some(front.enqueued_at());
-            if g.waiting > 0 {
-                self.ready.notify_one();
-            }
-        } else {
-            g.since = None;
-        }
+        g.q.len()
     }
 }
 
