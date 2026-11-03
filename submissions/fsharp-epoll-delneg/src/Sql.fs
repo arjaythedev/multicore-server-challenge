@@ -263,7 +263,8 @@ let articleInsertOids = [| OidInt8; OidText; OidText; OidText |]
 
 let tagsInsert = "INSERT INTO tags (name) SELECT DISTINCT unnest($1::text[]) ON CONFLICT (name) DO NOTHING"
 
-/// the article just inserted on this connection (currval of the articles sequence)
+/// the article just inserted on this connection (currval of the articles sequence; as a scalar subquery it is
+/// read once, so the primary key can be used)
 let articleTagsInsert =
     """
 INSERT INTO article_tags (article_id, tag_id)
@@ -285,7 +286,7 @@ let private fullColumns (a: string) =
         a a a a a a a a a a a
 
 let articleCreated =
-    sprintf "SELECT %s FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id = currval(pg_get_serial_sequence('articles', 'id'))" (fullColumns "a")
+    sprintf "SELECT %s FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id = (SELECT currval(pg_get_serial_sequence('articles', 'id')))" (fullColumns "a")
 
 let articleCreatedOids = [| OidInt8 |]
 
