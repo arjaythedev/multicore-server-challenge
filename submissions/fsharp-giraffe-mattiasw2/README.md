@@ -68,9 +68,11 @@ and never inside SQL, a transaction or a commit group.
 - **Read batching for the hot reads** (`src/Engine/Reads.fs`): tags, the four article lists, the feed, article by
   slug, comments and profiles. Each such request is a value (`Read`) on one channel. `READ_LANES` reader lanes
   (default one per core), each with a connection of its own, answer the queue in batches:
-  - **Gather.** A lane that wakes for a request waits until the oldest queued request is `READ_GATHER_MS` old, or
-    until `READ_BATCH` requests are queued, whichever comes first, and then takes them all. The latency budget is
-    500 ms at p95, and a bigger batch shares more work.
+  - **Gather.** One lane gathers at a time: it takes requests as they arrive until the first is `READ_GATHER_MS`
+    old, or until it holds `READ_BATCH`, whichever comes first. The latency budget is 500 ms at p95, and a bigger
+    batch shares more work. The lane never peeks at the queue: a `TryPeek` stops the `ConcurrentQueue` under the
+    channel from clearing dequeued slots and reusing segments, and the dead segments then kept every answer alive
+    through gen0 collections (~400 MB promoted per gen0 at 140k users, found with a heap dump).
   - **Batch size.** A batch's statements run one after another on one backend, so a huge batch is slow for every
     request in it: while all lanes are busy the queue grows, the next lane takes it all, and that batch is slower
     still. At 85,000 users a cap of 512 beat 1,024 on p95 and p99 in two paired runs (227 vs 427 ms and 255 vs
@@ -205,30 +207,33 @@ A cloud vCPU is one hyperthread, so the benchmark's 8 vCPUs are 4 physical cores
 benchmark's search: a fresh copy of the seed (`CREATE DATABASE ... TEMPLATE`), one server start, the benchmark's
 warm-up (500 users, 60 s ramp + 120 s), then a 60 s ramp and 60 s measured.
 
-**8 vCPUs** (4 Zen 5 cores x 2; load generator on the 8 Zen 5c threads; commit 908861b):
+**8 vCPUs** (4 Zen 5 cores x 2; load generator on the 8 Zen 5c threads; commit 570771b):
 
 | Users | requests/s | p95 | p99 | Postgres threads | app threads | |
 |--:|--:|--:|--:|--:|--:|---|
-| 130,000 | 33,700 | 211 ms | 356 ms | 3.4 | 3.2 | pass |
-| 140,000 | 35,900 | 481 ms | 1,261 ms | 3.8 | 3.5 | fail on p99 |
-| 150,000 | 37,200 | 749 ms | 1,959 ms | 4.1 | 3.7 | fail |
+| 130,000 | 33,800 | 215 ms | 434 ms | 3.4 | 3.1 | pass |
+| 140,000 | 35,900 | 576 ms | 1,278 ms | 3.85 | 3.4 | fail |
+| 150,000 | 37,400 | 1,124 ms | 2,041 ms | 4.2 | 3.6 | fail |
 
-At 140,000 users the p99 comes from the first four seconds of the window, right where the ramp ends: for those
-seconds p50 is 0.5-1.6 s, then the run settles. In the read path itself p99 stays at 322 ms. At 150,000 the 8 threads
-are full (7.7 busy), and the load generator, on the same laptop, reaches 98% in its busiest seconds.
+At 140,000 users the failure is the five seconds of the window right where the ramp ends: p50 is 1.0-1.6 s, yet the
+server is waiting, not working (1.9-3.0 threads busy, the read queue near empty, most read lanes idle), while the
+load generator, on the same laptop, runs at 74-99% and its timers wake up to 0.7 s late. From then on the p99 of
+single seconds is 80-250 ms, apart from one 0.5 s blocking gen2 collection as the heap settles. At 150,000 the same
+stall lasts twice as long, and even after it the 8 read lanes are often all busy with thousands of requests queued.
 
-**6 vCPUs** (3 Zen 5 cores x 2; load generator on the other 10 threads; commits 3f7cc19 to d67ba2f):
+**6 vCPUs** (3 Zen 5 cores x 2; load generator on the other 10 threads; commit 570771b):
 
 | Users | requests/s | p95 | p99 | Postgres threads | app threads | |
 |--:|--:|--:|--:|--:|--:|---|
-| 100,000 | 25,900 | 186-197 ms | 309-339 ms | 2.6 | 2.6-2.8 | pass (4 runs) |
-| 105,000, 5-minute hold | 27,200 | 194 ms | 283 ms | 2.65 | 2.5 | pass, 8.16 M requests |
-| 110,000 | 28,200 | 291-449 ms | 409-591 ms | 2.8-3.0 | 2.7-3.0 | pass (3 runs) |
-| 115,000 | 29,600 | 262 ms | 354 ms | 2.9 | 2.7 | pass (listen backlog 65535) |
-| 120,000 | 28,800 | 737 ms | 869 ms | 2.85 | 3.0 | fail: the 6 threads are full |
+| 100,000 | 26,000 | 94 ms | 157 ms | 2.45 | 2.4 | pass |
+| 110,000 | 28,700 | 147 ms | 281 ms | 2.8 | 2.5 | pass |
+| 115,000 | 29,700 | 199 ms | 352 ms | 3.0 | 2.7 | pass |
+| 120,000 | 29,000 | 719 ms | 1,120 ms | 3.15 | 2.75 | fail: the 6 threads are full |
 
-In the 5-minute hold the server's memory stayed at 2.5-2.9 GB, and the database grew by 36,000 articles (7%); the
-p95 of single seconds rose from ~80 ms to ~185 ms as the data grew. These Zen 5 cores are faster than a typical
+Before the read batcher stopped peeking at its queue (commits 3f7cc19 to d67ba2f), 100,000 users gave p95 186-197 ms
+in 4 runs and 110,000 gave 291-449 ms in 3. A 5-minute hold at 105,000 users from then passed with p95 194 ms and
+p99 283 ms over 8.16 M requests; the server's memory stayed at 2.5-2.9 GB, and the database grew by 36,000 articles
+(7%), which raised the p95 of single seconds from ~80 ms to ~185 ms. These Zen 5 cores are faster than a typical
 cloud core, so the benchmark box will hold fewer users per vCPU.
 
 Three things in the method moved the numbers more than most code changes, and are worth knowing for any local
@@ -362,4 +367,22 @@ SKIP_CONFORMANCE=1 bash check.sh  # the quick gate, no database
 
 Environment: `DATABASE_URL`, `JWT_SECRET` (required); `HOST` (127.0.0.1), `PORT` (3000); `READ_LANES` (cores);
 `READ_BATCH` (512); `READ_GATHER_MS` (25); `WRITE_LANES` (2); `WRITE_GROUP` (128); `DB_POOL_SIZE` (cores / 2, capped so the total stays
-at most 95); `BCRYPT_THREADS` (2); `BCRYPT_WIDTH` (4); `BCRYPT_GATHER_MS` (150).
+at most 95); `BCRYPT_THREADS` (2); `BCRYPT_WIDTH` (4); `BCRYPT_GATHER_MS` (150); `STATS_SECONDS` (0, off).
+
+`STATS_SECONDS=1` prints one diagnostic line a second on stderr (`src/Web/Stats.fs`), to line up against the load
+generator's seconds (`t=` is unix seconds):
+
+| Field | Meaning |
+|---|---|
+| `dt` | the interval as measured; above `STATS_SECONDS`, the process (or this thread) was stalled |
+| `conn`, `new` | Kestrel connections open, and opened in the interval |
+| `gc0`, `gc1`, `gc2`, `pause` | collections of exactly that generation, and the total GC pause in the interval |
+| `alloc` | MB allocated in the interval |
+| `eph`, `full`, `bg` | the latest ephemeral, full blocking and background GC, if one ran in the interval: generation, MB promoted, pause |
+| `heap`, `gen2`, `loh`, `poh` | sizes after the latest GC (0 before the first) |
+| `cpu`, `pool`, `pending` | the process's cores busy, thread-pool threads, queued work items |
+| `reads q`, `busy`, `batches`, `per`, `worst` | read requests queued, lanes running a batch, batches finished, requests per batch, the longest arrival-to-answer |
+| `writes q` | writes queued for group commit |
+
+A seconds-long stall that shows up in `pause` (and `dt`) is GC. If `pause` stays small while `reads q` and `worst`
+grow, requests are queueing for the database.

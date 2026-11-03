@@ -17,6 +17,8 @@
     <!-- Wire: JSON in (validated request bodies, query paging) and JSON out. Pure. -->
     <Compile Include="Wire.fs" />
     <Compile Include="Handlers.fs" />
+    <!-- A diagnostic line every STATS_SECONDS (off by default): GC, connections, queues. -->
+    <Compile Include="Stats.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
   <ItemGroup>

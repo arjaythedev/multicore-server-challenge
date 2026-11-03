@@ -607,9 +607,10 @@ type private Millis() =
             $"{at 0.5}/{at 0.95}/{at 0.99} ms"
 
 /// The hot reads' side of the process: `lanes` dedicated connections (not multiplexed: a batch
-/// holds a snapshot across two round trips), each answering one batch at a time. A lane that
-/// wakes for a request first lets it wait up to `gather` for batch-mates (less if `maxBatch` of
-/// them are already queued): bigger batches share more, and the wait is inside the latency budget.
+/// holds a snapshot across two round trips), each answering one batch at a time. The lane whose
+/// turn it is to gather lets the first request it takes wait up to `gather` for batch-mates (less
+/// if `maxBatch` of them arrive sooner): bigger batches share more, and the wait is inside the
+/// latency budget.
 [<Sealed>]
 type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpan) =
     let queue =
@@ -619,8 +620,17 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
     let queued = Millis() // per request: arrived -> taken into a batch
     let executed = Millis() // per batch: taken -> answered
     let answered = Millis() // per request: arrived -> answered
-    /// How often a gathering lane looks whether a full batch is already queued.
+    let busy = [| 0L |] // lanes running a batch
+    let worst = [| 0L |] // TimeSpan ticks: the longest arrived -> answered since Worst() last ran
+    /// How often a gathering lane takes what has been queued since it last looked.
     let tick = TimeSpan.FromMilliseconds 2.0
+    /// One lane gathers at a time, so a batch forms while the other lanes wait their turn.
+    let gate = new SemaphoreSlim(1, 1)
+
+    let rec noteWorst (ticks: int64) =
+        let seen = Volatile.Read(&worst[0])
+        if ticks > seen && Interlocked.CompareExchange(&worst[0], ticks, seen) <> seen then
+            noteWorst ticks
 
     let take (into: ResizeArray<Pending>) =
         let mutable p = Unchecked.defaultof<Pending>
@@ -667,24 +677,30 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
             let mutable conn: NpgsqlConnection = null
             let pending = ResizeArray<Pending>(maxBatch)
             while! queue.Reader.WaitToReadAsync() do
-                // Gather: until the oldest request has waited `gather`, or a full batch is
-                // queued, whichever comes first.
-                // (Ticks, not TimeSpan's `>`: F#'s generic comparison boxes structs.)
-                let mutable waiting = gather.Ticks > 0L
-                while waiting do
-                    match queue.Reader.TryPeek() with
-                    | true, oldest when queue.Reader.Count < maxBatch ->
-                        let left = gather - Diagnostics.Stopwatch.GetElapsedTime oldest.Arrived
+                // Gather: take requests until the oldest has waited `gather`, or a full batch
+                // is in hand, whichever comes first. Never TryPeek the queue: a peek stops the
+                // ConcurrentQueue under the channel from clearing the slots it dequeues and
+                // from reusing its segments, so each dead segment keeps every answer it ever
+                // carried alive through gen0 GCs (~400 MB promoted per gen0 at 140k users).
+                do! gate.WaitAsync()
+                try
+                    take pending
+                    // (Ticks, not TimeSpan's `>`: F#'s generic comparison boxes structs.)
+                    let mutable waiting = gather.Ticks > 0L && pending.Count > 0
+                    while waiting && pending.Count < maxBatch do
+                        let left = gather - Diagnostics.Stopwatch.GetElapsedTime pending[0].Arrived
                         if left.Ticks > 0L then
                             do! Task.Delay(if left.Ticks < tick.Ticks then left else tick)
+                            take pending
                         else
                             waiting <- false
-                    | _ -> waiting <- false
-                take pending
+                finally
+                    gate.Release() |> ignore
                 if pending.Count > 0 then
                     let batch = pending.ToArray()
                     pending.Clear()
                     let taken = Diagnostics.Stopwatch.GetTimestamp()
+                    Interlocked.Increment(&busy[0]) |> ignore
                     for p in batch do
                         queued.Record(Diagnostics.Stopwatch.GetElapsedTime(p.Arrived, taken))
                     try
@@ -698,9 +714,12 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
                         for p in batch do
                             p.Fail e
                     let finished = Diagnostics.Stopwatch.GetTimestamp()
+                    Interlocked.Decrement(&busy[0]) |> ignore
                     executed.Record(Diagnostics.Stopwatch.GetElapsedTime(taken, finished))
                     for p in batch do
                         answered.Record(Diagnostics.Stopwatch.GetElapsedTime(p.Arrived, finished))
+                    // The queue is FIFO, so the batch's first request waited longest.
+                    noteWorst (Diagnostics.Stopwatch.GetElapsedTime(batch[0].Arrived, finished)).Ticks
                     Interlocked.Increment(&counts[0]) |> ignore
                     Interlocked.Add(&counts[1], int64 batch.Length) |> ignore
         }
@@ -762,3 +781,12 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
     /// p50/p95/p99 of: a request's wait for its batch, a batch's execution, a request's whole
     /// time in Reads.
     member _.Timings = queued.Summary(), executed.Summary(), answered.Summary()
+
+    /// Requests queued and not yet taken into a batch.
+    member _.Depth = queue.Reader.Count
+
+    /// Lanes running a batch right now.
+    member _.Busy = Volatile.Read(&busy[0])
+
+    /// The longest arrived -> answered since the last call, and resets it.
+    member _.Worst() = TimeSpan(Interlocked.Exchange(&worst[0], 0L))
