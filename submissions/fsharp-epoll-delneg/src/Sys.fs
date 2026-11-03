@@ -32,6 +32,16 @@ extern nativeint write(int fd, byte* buf, unativeint count)
 [<DllImport(C, SetLastError = true)>]
 extern int close(int fd)
 
+/// sockets use recv/send rather than read/write: they skip the VFS layer (file position lock, LSM file check)
+[<DllImport(C, SetLastError = true)>]
+extern nativeint recv(int fd, byte* buf, unativeint count, int flags)
+
+[<DllImport(C, SetLastError = true)>]
+extern nativeint send(int fd, byte* buf, unativeint count, int flags)
+
+[<Literal>]
+let MSG_NOSIGNAL = 0x4000
+
 [<DllImport(C, SetLastError = true)>]
 extern int socket(int domain, int typ, int protocol)
 

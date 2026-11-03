@@ -112,7 +112,7 @@ type Loop(index: int, listenFd: int) =
         while go && o < data.Length do
             let k =
                 use p = fixed data
-                Sys.write (fd, NativePtr.add p o, unativeint (data.Length - o))
+                Sys.send (fd, NativePtr.add p o, unativeint (data.Length - o), Sys.MSG_NOSIGNAL)
             if k > 0n then o <- o + int k
             else
                 let e = Sys.errno ()
@@ -259,7 +259,7 @@ type Loop(index: int, listenFd: int) =
         while go && c.Open do
             let k =
                 use p = fixed rbuf
-                Sys.read (fd, p, unativeint rbuf.Length)
+                Sys.recv (fd, p, unativeint rbuf.Length, 0)
             if k > 0n then
                 let n = int k
                 if c.InLen = 0 && not c.Busy && n < rbuf.Length then
