@@ -817,7 +817,18 @@ type private Reader(c: Conn) =
 
 // ---------------- writes ----------------
 
+/// Reads go to one of two lanes, each with its own connections, so their statements run in parallel backends:
+/// lists, articles and tags (the `rd` statement) on one; comments, profiles, users and logins on the other.
 let mutable readLane: Lane<RJob> = Unchecked.defaultof<_>
+let mutable sideLane: Lane<RJob> = Unchecked.defaultof<_>
+
+let pushRead (j: RJob) =
+    match j.Kind with
+    | RKind.Comments
+    | RKind.Profile
+    | RKind.User
+    | RKind.Login -> sideLane.Push j
+    | _ -> readLane.Push j
 let mutable writeLane: Lane<WJob> = Unchecked.defaultof<_>
 
 [<Sealed>]
@@ -949,9 +960,9 @@ type private Writer(c: Conn) =
         if ok then
             // committed: the favorite and follow answers (article, profile) are read by the read lane
             for j in favs do
-                readLane.Push(RJob(RKind.Article, j.Dest, Viewer = j.Viewer, Key = j.Key))
+                pushRead (RJob(RKind.Article, j.Dest, Viewer = j.Viewer, Key = j.Key))
             for j in fols do
-                readLane.Push(RJob(RKind.Profile, j.Dest, Viewer = j.Viewer, Key = j.Key))
+                pushRead (RJob(RKind.Profile, j.Dest, Viewer = j.Viewer, Key = j.Key))
             for j in adds do
                 match cmtRows.TryGetValue j.Viewer with
                 | true, b -> reply j b
@@ -1166,14 +1177,14 @@ let private failAll (batch: List<'T>) (ex: exn) =
     for j in batch do
         reply j err
 
-let private readThread (url: string) (options: string) () =
+let private readThread (lane: Lane<RJob>) (url: string) (options: string) () =
     Sys.schedThread ()
     let mutable c = connect url options
     let mutable r = Reader(c, Dump = not (isNull dumpPath))
     let batch = List<RJob>()
     while true do
         batch.Clear()
-        readLane.Take batch
+        lane.Take batch
         try
             r.Run batch
         with ex ->
@@ -1201,13 +1212,16 @@ let private writeThread (url: string) (options: string) () =
             wr <- Writer(c)
 
 /// Opens the connections (each prepares every statement) and starts their threads.
-let start (url: string) (options: string) (reads: int) (writes: int) (readClockUs: int) (readMax: int) (writeClockUs: int) (writeMax: int) =
+let start (url: string) (options: string) (reads: int) (sideReads: int) (writes: int) (readClockUs: int) (sideClockUs: int) (readMax: int) (writeClockUs: int) (writeMax: int) =
     readLane <- Lane<RJob>(readClockUs, readMax)
+    sideLane <- Lane<RJob>(sideClockUs, readMax)
     writeLane <- Lane<WJob>(writeClockUs, writeMax)
     // fail at startup, not on the first request, if a statement doesn't prepare
     (connect url options :> IDisposable).Dispose()
     for i in 1 .. reads do
-        Thread(readThread url options, IsBackground = true, Name = sprintf "pg-read-%d" i).Start()
+        Thread(readThread readLane url options, IsBackground = true, Name = sprintf "pg-read-%d" i).Start()
+    for i in 1 .. sideReads do
+        Thread(readThread sideLane url options, IsBackground = true, Name = sprintf "pg-side-%d" i).Start()
     for i in 1 .. writes do
         Thread(writeThread url options, IsBackground = true, Name = sprintf "pg-write-%d" i).Start()
     if stats then
@@ -1217,6 +1231,6 @@ let start (url: string) (options: string) (reads: int) (writes: int) (readClockU
                         let n = Interlocked.Exchange(statReads, 0L)
                         let b = Interlocked.Exchange(statReadBatches, 0L)
                         eprintfn "reads %d in %d batches (%.1f per batch), queued now: read %d write %d"
-                            n b (if b > 0L then float n / float b else 0.0) readLane.Count writeLane.Count),
+                            n b (if b > 0L then float n / float b else 0.0) (readLane.Count + sideLane.Count) writeLane.Count),
                IsBackground = true)
             .Start()

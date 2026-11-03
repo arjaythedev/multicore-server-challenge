@@ -140,7 +140,7 @@ let private list (d: Dest) (r: Request) (kind: int) (viewer: int64) =
             elif not (String.IsNullOrEmpty fav) then
                 j.ListKind <- ListFavorited
                 j.Key <- fav
-        readLane.Push j
+        pushRead j
         null
 
 let private register (d: Dest) (r: Request) =
@@ -168,7 +168,7 @@ let private login (d: Dest) (r: Request) =
         let p = required (field o "password")
         if isNull e || isNull p then bad
         else
-            readLane.Push(RJob(RKind.Login, d, Key = e, Password = Encoding.UTF8.GetBytes p))
+            pushRead (RJob(RKind.Login, d, Key = e, Password = Encoding.UTF8.GetBytes p))
             null
 
 let private updateUser (d: Dest) (r: Request) (viewer: int64) =
@@ -262,14 +262,14 @@ let handle (d: Dest) (r: Request) : byte[] =
             let opt () = let v = viewer.Value in if v >= 0L then Some v else None
             match n, segs.[0] with
             | 1, "tags" when m = 'G'B ->
-                readLane.Push(RJob(RKind.Tags, d))
+                pushRead (RJob(RKind.Tags, d))
                 null
             | 1, "users" when m = 'P'B -> register d r
             | 2, "users" when m = 'P'B && segs.[1] = "login" -> login d r
             | 1, "user" when m = 'G'B ->
                 match need () with
                 | Some v ->
-                    readLane.Push(RJob(RKind.User, d, Viewer = v, Token = tokenOf r))
+                    pushRead (RJob(RKind.User, d, Viewer = v, Token = tokenOf r))
                     null
                 | None -> unauthorized
             | 1, "user" when m = 'U'B ->
@@ -279,7 +279,7 @@ let handle (d: Dest) (r: Request) : byte[] =
             | 2, "profiles" when m = 'G'B ->
                 match opt () with
                 | Some v ->
-                    readLane.Push(RJob(RKind.Profile, d, Viewer = v, Key = segs.[1]))
+                    pushRead (RJob(RKind.Profile, d, Viewer = v, Key = segs.[1]))
                     null
                 | None -> unauthorized
             | 3, "profiles" when segs.[2] = "follow" && (m = 'P'B || m = 'D'B) ->
@@ -306,7 +306,7 @@ let handle (d: Dest) (r: Request) : byte[] =
                 | 'G'B ->
                     match opt () with
                     | Some v ->
-                        readLane.Push(RJob(RKind.Article, d, Viewer = v, Key = slug))
+                        pushRead (RJob(RKind.Article, d, Viewer = v, Key = slug))
                         null
                     | None -> unauthorized
                 | 'U'B ->
@@ -331,7 +331,7 @@ let handle (d: Dest) (r: Request) : byte[] =
                 | 'G'B ->
                     match opt () with
                     | Some v ->
-                        readLane.Push(RJob(RKind.Comments, d, Viewer = v, Key = segs.[1]))
+                        pushRead (RJob(RKind.Comments, d, Viewer = v, Key = segs.[1]))
                         null
                     | None -> unauthorized
                 | 'P'B ->

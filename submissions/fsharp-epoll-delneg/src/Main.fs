@@ -31,14 +31,16 @@ let main _ =
     | path ->
         IO.File.WriteAllText(path, String.Join("\n\n", [ for name, sql, _ in Sql.all () -> "-- " + name + "\n" + sql ]))
         exit 0
-    let reads = num "PG_READS" 8
+    let reads = num "PG_READS" 5
+    let sideReads = num "PG_SIDE_READS" 3
     let writes = num "PG_WRITES" 4
-    Store.start url options reads writes (num "READ_CLOCK_US" 20000) (num "READ_MAX" 2000) (num "WRITE_CLOCK_US" 5000) (num "WRITE_MAX" 256)
+    let readClock = num "READ_CLOCK_US" 20000
+    Store.start url options reads sideReads writes readClock (num "SIDE_CLOCK_US" readClock) (num "READ_MAX" 2000) (num "WRITE_CLOCK_US" 5000) (num "WRITE_MAX" 256)
     Io.handler <- Api.handle
     let host = env "HOST" "0.0.0.0"
     let port = num "PORT" 3000
     let loops = num "IO_THREADS" 4
-    let limit = Io.start host port loops (reads + writes + 200) (num "IO_NICE" 0)
-    eprintfn "conduit on %s:%d: %d I/O threads, postgres %d read + %d write connections, fd limit %d" host port loops reads writes limit
+    let limit = Io.start host port loops (reads + sideReads + writes + 200) (num "IO_NICE" 0)
+    eprintfn "conduit on %s:%d: %d I/O threads, postgres %d + %d read and %d write connections, fd limit %d" host port loops reads sideReads writes limit
     Thread.Sleep Timeout.Infinite
     0
