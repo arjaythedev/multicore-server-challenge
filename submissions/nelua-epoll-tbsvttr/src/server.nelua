@@ -1,0 +1,3296 @@
+-- The server's processes, each an epoll loop on one thread:
+-- - a worker: its listening sockets, its HTTP connections, its link to the database process and its socket to the
+--   bcrypt helpers;
+-- - the database process: the Postgres connections, the batches, a link to each worker, its socket to the bcrypt
+--   helpers. Nothing blocks except (re)connecting to Postgres;
+-- - the bcrypt helpers, which every process shares.
+require 'jwt'
+require 'bcrypt'
+
+-- epoll hands back a pointer to one of these records; the first field says which.
+global Kind = @enum{LISTENER = 1, CLIENT, PG, BCRYPT, LINK}
+
+-- What a request waits for. The database jobs are one SQL statement each (statement index = job - 1), except the
+-- lists and article pages (LIST_GLOBAL to ARTICLE), which share PAGES (LIST_GLOBAL's); the BC_ jobs wait for the
+-- bcrypt helpers.
+global Job = @enum{
+  NONE = 0,
+  TAGS, USER_GET, LOGIN, REGISTER, USER_UPDATE, PROFILE, FOLLOW, UNFOLLOW,
+  LIST_GLOBAL, LIST_TAG, LIST_AUTHOR, LIST_FAVORITED, FEED,
+  ARTICLE, ARTICLE_CREATE, ARTICLE_UPDATE, ARTICLE_DELETE, FAVORITE, UNFAVORITE,
+  COMMENTS, COMMENT_ADD, COMMENT_DELETE,
+  BC_LOGIN, BC_REGISTER, BC_UPDATE
+}
+local N_STATEMENTS <comptime> = 22
+
+global Listener = @record{kind: Kind, fd: cint}
+global Hasher = @record{kind: Kind, fd: cint}
+
+-- A worker's stream socket to the database process, at either end. Requests go one way, responses the other, each
+-- message a 4-byte length and its bytes; a loop pass's messages leave in one send().
+global Link = @record{
+  kind: Kind,
+  fd: cint,
+  watching_out: boolean,
+  out: Buf,                -- messages, sent up to out_sent
+  out_sent: isize,
+  input: Buf               -- bytes received and not handled yet
+}
+
+global Client: type <forwarddecl> = @record{}
+Client = @record{
+  kind: Kind,
+  fd: cint,
+  job: Job,
+  gzip: boolean,           -- the request in progress accepts gzip
+  close_after: boolean,    -- close once the response is out (Connection: close, HTTP/1.0)
+  closed: boolean,         -- the socket is closed; the record goes once nothing waits for it
+  freeing: boolean,        -- on the list to free at the end of this epoll batch
+  continue_sent: boolean,  -- 100 Continue sent for the request being read
+  watching_out: boolean,   -- EPOLLOUT is registered
+  nparams: uint16,         -- Bind parameters in params
+  viewer: int64,           -- the token's user id, 0 when anonymous
+  recv_ms: int64,          -- when its last bytes came in (now_ms)
+  next: *Client,           -- behind it in its Postgres connection's queue (a batch's first), or in the free list
+  bnext: *Client,          -- behind it in its batch
+  link: *Link,             -- in the database process: the worker that asked (its response goes there)
+  tag: uint64,             -- and its client there
+  input: Buf,              -- bytes received but not handled yet
+  output: Buf,             -- response bytes the socket hasn't taken yet
+  params: Buf,             -- Bind parameters: each a 4-byte length (-1 = NULL) and its bytes
+  token: Buf,              -- the token the request presented
+  stash: Buf               -- what a two-step request keeps between its steps (password, user fields)
+}
+
+-- A Postgres connection. libpq logs in and prepares the statements; after that the worker speaks the protocol
+-- itself on the socket, pipelined: the queries of one loop pass leave in one send() per connection. A query (one
+-- write, or one batch of reads) is Bind/Execute/Sync, done at its ReadyForQuery (after the commit, for a write).
+global PgConn = @record{
+  kind: Kind,
+  fd: cint,
+  conn: pointer,           -- the libpq connection (for PQfinish), nilptr while down
+  writes: boolean,         -- takes the writes, so reads never wait behind a commit
+  flushing: boolean,       -- on the list to send at the end of this loop pass
+  watching_out: boolean,
+  inflight: int32,         -- queries queued or sent and not answered yet
+  head: *Client,           -- their clients, oldest first
+  tail: *Client,
+  out: Buf,                -- messages not sent yet
+  input: Buf,              -- bytes received and not handled yet
+  scanned: isize           -- input[0, scanned) is whole messages of the oldest query
+}
+
+-- SQL. Results come back in binary.
+-- - Writes: SPEC.md's reference statements, each endpoint's folded into one statement (CTEs), one per request.
+-- - Reads: one statement per kind of read for every request of that kind waiting, from every worker: its batch (the
+--   set-based batching of rust-epoll-theCatWisel). Parameter i is the array of the requests' parameter i, each row
+--   starts with k, the request's place in the batch, and rows come ordered by k. A batch works out each distinct
+--   page, count, article and comment list once, whoever asked for it.
+##[[
+-- an article's tag names, sorted (each name by its id: a join would hash all the tags for every article)
+local TAGS_OF = function(id) return 'ARRAY(SELECT (SELECT tg.name FROM tags tg WHERE tg.id = at.tag_id) AS name ' ..
+  'FROM article_tags at WHERE at.article_id = ' .. id .. ' ORDER BY 1)' end
+local SLUGIFY = function(x) return "trim(both '-' from lower(regexp_replace(" .. x .. ", '[^A-Za-z0-9]+', '-', 'g')))" end
+local function capped(rows) return '(SELECT count(*) FROM (' .. rows .. ' LIMIT 1000) s)' end
+-- page g (lim, ofs) of rows. The outer LIMIT 100 (lim's maximum) changes nothing but the plan: a generic plan takes
+-- LIMIT g.lim for a tenth of the table, and sizes hash tables up front for that many rows.
+local function page(rows)
+  return '(SELECT * FROM (' .. rows .. ' LIMIT g.lim OFFSET g.ofs) z LIMIT 100)'
+end
+-- the batch's requests as rows: unnest of the parameter arrays, with k
+local function req(cols)
+  local types, names = {}, {}
+  for i, c in ipairs(cols) do types[i] = '$' .. i .. '::' .. c[2] .. '[]'; names[i] = c[1] end
+  return 'req AS (SELECT * FROM unnest(' .. table.concat(types, ', ') .. ') WITH ORDINALITY r(' ..
+    table.concat(names, ', ') .. ', k))'
+end
+-- The batch statements read every table by index, a row or a range at a time, from a LATERAL subquery that
+-- LIMIT 1 (on a unique key) or OFFSET 0 keeps from being flattened into a join, or from a correlated subquery: a
+-- generic plan has no idea how many requests a batch has, and would rather hash-join a whole table.
+-- PAGES' requests of kind grouped by cols, each group with its requests' k and viewers (ks, vs). A group's rows
+-- unnest back to its requests: joining the requests to the groups instead would rescan the groups for every
+-- request (a generic plan takes them for a few rows, and joins them in a nested loop).
+local function grouped(kind, cols)
+  return '(SELECT ' .. cols .. ', array_agg(k) AS ks, array_agg(viewer) AS vs FROM req WHERE kind = ' .. kind ..
+    ' GROUP BY ' .. cols .. ')'
+end
+-- a group's requests
+local function each_request(group) return 'CROSS JOIN LATERAL unnest(' .. group .. '.ks, ' .. group .. '.vs) u(k, viewer)' end
+-- page g's article ids, newest first, as an array
+local function page_ids(rows) return 'ARRAY(SELECT x.id FROM ' .. page(rows) .. ' x ORDER BY x.id DESC)' end
+-- a list by key ($5, a tag or username) for kind: each distinct key's id (fid) and capped count once (<p>cnt),
+-- each distinct page once (<p>pa)
+local function keyed(p, kind, key_sql, count_sql, page_sql)
+  return p .. 'cnt AS MATERIALIZED (SELECT ky.key, ky.fid, ' .. capped(count_sql) .. ' AS n FROM ' ..
+      '(SELECT s.key, (' .. key_sql .. ') AS fid FROM (SELECT DISTINCT key FROM req WHERE kind = ' .. kind .. ') s) ky), ' ..
+    p .. 'pa AS MATERIALIZED (SELECT g.ks, g.vs, ky.n, ' .. page_ids(page_sql) .. ' AS ids FROM ' ..
+      grouped(kind, 'key, lim, ofs') .. ' g JOIN ' .. p .. 'cnt ky ON ky.key = g.key)'
+end
+-- a keyed list's requests with their counts and pages
+local function keyed_rq(p, kind)
+  return 'SELECT u.k, ' .. kind .. ' AS kind, u.viewer, pa.n, pa.ids FROM ' .. p .. 'pa pa ' .. each_request('pa')
+end
+-- a write that returns the full article, with its favorite count and flag adjusted by the write
+local function favorite(write, sign, flag)
+  return 'WITH t AS (SELECT id FROM articles WHERE slug = $2), w AS (' .. write .. ') ' ..
+    'SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at, ' .. TAGS_OF('a.id') .. ', ' ..
+    '(SELECT count(*) FROM favorites f WHERE f.article_id = a.id) ' .. sign .. ' (SELECT count(*) FROM w), ' .. flag ..
+    ', u.username, u.bio, u.image, ' ..
+    'EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = a.author_id) ' ..
+    'FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id = (SELECT id FROM t)'
+end
+]]
+##[[
+local S = {}
+-- TAGS: no parameters and no k; every request of the batch gets all the rows
+S[1] = [==[SELECT name FROM tags ORDER BY name]==]
+-- USER_GET ($1 id)
+S[2] = 'WITH ' .. req({{'id', 'int8'}}) .. ' ' ..
+  'SELECT r.k, u.id, u.username, u.email, u.bio, u.image FROM req r ' ..
+  'CROSS JOIN LATERAL (SELECT * FROM users u WHERE u.id = r.id LIMIT 1) u ORDER BY r.k'
+-- LOGIN ($1 email)
+S[3] = 'WITH ' .. req({{'email', 'text'}}) .. ' ' ..
+  'SELECT r.k, u.id, u.username, u.email, u.bio, u.image, u.password_hash FROM req r ' ..
+  'CROSS JOIN LATERAL (SELECT * FROM users u WHERE u.email = r.email LIMIT 1) u ORDER BY r.k'
+-- REGISTER ($1 username, $2 email, $3 hash)
+S[4] = [==[INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING ]==] ..
+  [==[RETURNING id, username, email, bio, image]==]
+-- USER_UPDATE ($1 id, $2 email, $3 username, $4 bio, $5 image, $6 hash)
+S[5] = [==[UPDATE users SET email = COALESCE($2, email), username = COALESCE($3, username), ]==] ..
+  [==[password_hash = COALESCE($6, password_hash), bio = COALESCE($4, bio), image = COALESCE($5, image) ]==] ..
+  [==[WHERE id = $1 RETURNING id, username, email, bio, image]==]
+-- PROFILE ($1 viewer, $2 username)
+S[6] = 'WITH ' .. req({{'viewer', 'int8'}, {'username', 'text'}}) .. ' ' ..
+  'SELECT r.k, u.username, u.bio, u.image, ' ..
+  'EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.viewer AND fo.followee_id = u.id) ' ..
+  'FROM req r CROSS JOIN LATERAL (SELECT * FROM users u WHERE u.username = r.username LIMIT 1) u ORDER BY r.k'
+-- FOLLOW ($1 viewer, $2 username)
+S[7] = [==[WITH t AS (SELECT id, username, bio, image FROM users WHERE username = $2), ]==] ..
+  [==[w AS (INSERT INTO follows (follower_id, followee_id) SELECT $1, id FROM t ON CONFLICT DO NOTHING) ]==] ..
+  [==[SELECT username, bio, image FROM t]==]
+-- UNFOLLOW ($1 viewer, $2 username)
+S[8] = [==[WITH t AS (SELECT id, username, bio, image FROM users WHERE username = $2), ]==] ..
+  [==[w AS (DELETE FROM follows WHERE follower_id = $1 AND followee_id = (SELECT id FROM t)) ]==] ..
+  [==[SELECT username, bio, image FROM t]==]
+-- PAGES ($1 kind, $2 viewer, $3 limit, $4 offset, $5 key): the batch's lists (kind 1 global, 2 by tag, 3 by
+-- author, 4 by favoriting user, 5 feed; key the tag or username) and article pages (6; key the slug), all in one
+-- statement. First a row per tag, author and article any of them shows (k -2, -1, 0): each once, whatever asked for
+-- it, an article with its body only if an article page did. Then a row per request, in k order: its count, its
+-- page's ids, those of them the viewer favorited (one index scan for the page, not one probe per article) and the
+-- authors the viewer follows (NULL for a feed: it only shows articles by authors the viewer follows). The worker
+-- puts the responses together.
+S[9] = 'WITH req AS (SELECT * FROM unnest($1::int8[], $2::int8[], $3::int8[], $4::int8[], $5::text[]) ' ..
+    'WITH ORDINALITY r(kind, viewer, lim, ofs, key, k)), ' ..
+  -- global: the count and each distinct page once
+  'gpa AS MATERIALIZED (SELECT g.ks, g.vs, ' .. page_ids('SELECT a.id FROM articles a ORDER BY a.id DESC') ..
+    ' AS ids FROM ' .. grouped(1, 'lim, ofs') .. ' g), ' ..
+  'gcnt AS MATERIALIZED (SELECT ' .. capped('SELECT 1 FROM articles a') .. ' AS n FROM (SELECT 1 FROM gpa LIMIT 1) g), ' ..
+  keyed('t', 2, 'SELECT t.id FROM tags t WHERE t.name = s.key',
+    'SELECT 1 FROM article_tags at WHERE at.tag_id = ky.fid',
+    'SELECT at.article_id AS id FROM article_tags at WHERE at.tag_id = ky.fid ORDER BY at.article_id DESC') .. ', ' ..
+  keyed('a', 3, 'SELECT u.id FROM users u WHERE u.username = s.key',
+    'SELECT 1 FROM articles a WHERE a.author_id = ky.fid',
+    'SELECT a.id FROM articles a WHERE a.author_id = ky.fid ORDER BY a.id DESC') .. ', ' ..
+  keyed('f', 4, 'SELECT u.id FROM users u WHERE u.username = s.key',
+    'SELECT 1 FROM favorites f WHERE f.user_id = ky.fid',
+    'SELECT f.article_id AS id FROM favorites f WHERE f.user_id = ky.fid ORDER BY f.article_id DESC') .. ', ' ..
+  -- feed: each distinct viewer's count once, each distinct page once. A page merges the followed authors' newest
+  -- articles; the count goes through them one by one and stops at 1000. Hubs (rust-epoll-theCatWisel's idea):
+  -- authors that two or more of the batch's viewers follow, at most 16, with their depth-th newest article (depth:
+  -- the deepest page asked for). A viewer who follows a hub with 1000 articles or more has 1000, without counting.
+  -- And no article on a page of a viewer who follows a hub is older than that hub's depth-th newest, so the other
+  -- authors' articles are only read down to there. The hubs are one row of arrays, looked up by array_position.
+  'v AS MATERIALIZED (SELECT viewer, max(lim + ofs) AS depth, array_agg(k) AS ks, array_agg(lim) AS lims, ' ..
+    'array_agg(ofs) AS ofss FROM req WHERE kind = 5 GROUP BY viewer), ' ..
+  'fl AS MATERIALIZED (SELECT v.*, f.fid FROM v LEFT JOIN LATERAL ' ..
+    '(SELECT fo.followee_id AS fid FROM follows fo WHERE fo.follower_id = v.viewer OFFSET 0) f ON true), ' ..
+  'hubs AS MATERIALIZED (SELECT array_agg(h.fid) AS fids, ' ..
+    'array_agg((SELECT a.id FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC OFFSET h.depth - 1 LIMIT 1)) ' ..
+      'AS floors, ' ..
+    'array_agg(EXISTS (SELECT 1 FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC OFFSET 999 LIMIT 1)) ' ..
+      'AS bigs ' ..
+    'FROM (SELECT fid, max(depth) AS depth FROM fl WHERE fid IS NOT NULL GROUP BY fid HAVING count(*) >= 2 ' ..
+    'ORDER BY count(*) DESC, fid LIMIT 16) h), ' ..
+  -- each viewer once (fl carries its requests), with its count and floor
+  'vc AS MATERIALIZED (SELECT x.viewer, x.ks, x.lims, x.ofss, COALESCE(x.floor, 0) AS floor, ' ..
+    'CASE WHEN x.big THEN 1000 ELSE ' .. capped('SELECT 1 FROM follows fo CROSS JOIN LATERAL ' ..
+    '(SELECT 1 FROM articles a WHERE a.author_id = fo.followee_id LIMIT 1000) y WHERE fo.follower_id = x.viewer') ..
+    ' END AS n FROM (SELECT fl.viewer, any_value(fl.ks) AS ks, any_value(fl.lims) AS lims, ' ..
+    'any_value(fl.ofss) AS ofss, bool_or(h.bigs[array_position(h.fids, fl.fid)]) AS big, ' ..
+    'max(h.floors[array_position(h.fids, fl.fid)]) AS floor FROM fl CROSS JOIN hubs h GROUP BY fl.viewer) x), ' ..
+  'epa AS MATERIALIZED (SELECT g.k, vc.viewer, vc.n, ' .. page_ids('SELECT y.id FROM follows fo CROSS JOIN LATERAL ' ..
+    '(SELECT a.id FROM articles a WHERE a.author_id = fo.followee_id AND a.id >= vc.floor ORDER BY a.id DESC ' ..
+    'LIMIT (g.lim + g.ofs)) y WHERE fo.follower_id = vc.viewer ORDER BY y.id DESC') .. ' AS ids ' ..
+    'FROM vc CROSS JOIN LATERAL unnest(vc.ks, vc.lims, vc.ofss) g(k, lim, ofs)), ' ..
+  -- article pages: each distinct slug's article once
+  'arts AS MATERIALIZED (SELECT s.ks, s.vs, (SELECT a.id FROM articles a WHERE a.slug = s.key) AS id ' ..
+    'FROM ' .. grouped(6, 'key') .. ' s), ' ..
+  -- every request: its count (lists) and the ids it shows
+  'rq AS MATERIALIZED (' ..
+    'SELECT u.k, 1 AS kind, u.viewer, c.n, g.ids FROM gpa g CROSS JOIN gcnt c ' .. each_request('g') ..
+    ' UNION ALL ' .. keyed_rq('t', 2) .. ' UNION ALL ' .. keyed_rq('a', 3) .. ' UNION ALL ' .. keyed_rq('f', 4) ..
+    ' UNION ALL SELECT e.k, 5, e.viewer, e.n, e.ids FROM epa e ' ..
+    'UNION ALL SELECT u.k, 6, u.viewer, NULL::int8, CASE WHEN ar.id IS NULL THEN NULL ELSE ARRAY[ar.id] END ' ..
+      'FROM arts ar ' .. each_request('ar') .. '), ' ..
+  -- every article once: its fields, tag ids, favorite count and author id; every author once; every tag once,
+  -- with its rank by name (the order of a tag list)
+  'ids AS MATERIALIZED (SELECT x.id, bool_or(rq.kind = 6) AS with_body FROM rq CROSS JOIN LATERAL unnest(rq.ids) x(id) ' ..
+    'GROUP BY x.id), ' ..
+  'info AS MATERIALIZED (SELECT y.* FROM ids x CROSS JOIN LATERAL (SELECT a.id, a.slug, a.title, a.description, ' ..
+    'CASE WHEN x.with_body THEN a.body END AS body, a.created_at, a.updated_at, ' ..
+    'ARRAY(SELECT at.tag_id::int8 FROM article_tags at WHERE at.article_id = a.id) AS tag_ids, ' ..
+    '(SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS fav_count, a.author_id ' ..
+    'FROM articles a WHERE a.id = x.id LIMIT 1) y), ' ..
+  'au AS MATERIALIZED (SELECT u.* FROM (SELECT DISTINCT author_id FROM info) x CROSS JOIN LATERAL ' ..
+    '(SELECT u.id, u.username, u.bio, u.image FROM users u WHERE u.id = x.author_id LIMIT 1) u), ' ..
+  'tn AS MATERIALIZED (SELECT t.id::int8 AS id, t.name, row_number() OVER (ORDER BY t.name) AS rnk ' ..
+    'FROM (SELECT DISTINCT unnest(tag_ids) AS id FROM info) x CROSS JOIN LATERAL ' ..
+    '(SELECT t.id, t.name FROM tags t WHERE t.id = x.id LIMIT 1) t) ' ..
+  -- k -2: tags (rank, id, name); k -1: authors (id, username, bio, image); k 0: articles; then the requests
+  'SELECT -2::int8 AS k, tn.rnk AS n, NULL::int8[] AS ids, NULL::int8[] AS favs, NULL::int8[] AS fols, tn.id, ' ..
+    'tn.name AS slug, NULL::text AS title, NULL::text AS description, NULL::text AS body, ' ..
+    'NULL::timestamptz AS created_at, NULL::timestamptz AS updated_at, NULL::int8[] AS tag_ids, ' ..
+    'NULL::int8 AS fav_count, NULL::int8 AS author_id, NULL::text AS username, NULL::text AS bio, NULL::text AS image ' ..
+    'FROM tn ' ..
+  'UNION ALL SELECT -1, NULL, NULL, NULL, NULL, au.id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ' ..
+    'au.username, au.bio, au.image FROM au ' ..
+  'UNION ALL SELECT 0, NULL, NULL, NULL, NULL, i.id, i.slug, i.title, i.description, i.body, i.created_at, ' ..
+    'i.updated_at, i.tag_ids, i.fav_count, i.author_id, NULL, NULL, NULL FROM info i ' ..
+  'UNION ALL SELECT rq.k, rq.n, rq.ids, ' ..
+    'CASE WHEN rq.viewer <> 0 AND cardinality(rq.ids) > 0 THEN ARRAY(SELECT f.article_id FROM favorites f ' ..
+      'WHERE f.user_id = rq.viewer AND f.article_id = ANY (rq.ids)) END, ' ..
+    'CASE WHEN rq.viewer <> 0 AND rq.kind <> 5 THEN ARRAY(SELECT fo.followee_id FROM follows fo ' ..
+      'WHERE fo.follower_id = rq.viewer) END, ' ..
+    'NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL FROM rq ORDER BY 1'
+-- LIST_TAG, LIST_AUTHOR, LIST_FAVORITED, FEED, ARTICLE: in PAGES
+S[10] = 'SELECT NULL'
+S[11] = 'SELECT NULL'
+S[12] = 'SELECT NULL'
+S[13] = 'SELECT NULL'
+S[14] = 'SELECT NULL'
+-- ARTICLE_CREATE ($1 viewer, $2 title, $3 description, $4 body, $5 tagList as JSON): one statement, so one
+-- transaction; its result is the new article as ARTICLE_FULL_SELECT would read it after the commit
+S[15] = [==[WITH n AS (SELECT nextval(pg_get_serial_sequence('articles', 'id')) AS id), ]==] ..
+  [==[tl AS (SELECT DISTINCT json_array_elements_text($5::json) AS name), ]==] ..
+  [==[a AS (INSERT INTO articles (id, slug, author_id, title, description, body) ]==] ..
+  [==[SELECT n.id, ]==] .. SLUGIFY('$2') .. [==[ || '-' || n.id, $1, $2, $3, $4 FROM n ]==] ..
+  [==[RETURNING id, slug, title, description, body, created_at, updated_at), ]==] ..
+  [==[nt AS (INSERT INTO tags (name) SELECT name FROM tl ORDER BY name ON CONFLICT (name) DO NOTHING RETURNING id), ]==] ..
+  [==[at AS (INSERT INTO article_tags (article_id, tag_id) SELECT a.id, x.id FROM a, ]==] ..
+  [==[(SELECT id FROM nt UNION SELECT t.id FROM tags t JOIN tl ON t.name = tl.name) x) ]==] ..
+  [==[SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at, ]==] ..
+  [==[ARRAY(SELECT name FROM tl ORDER BY name), 0::int8, false, u.username, u.bio, u.image, ]==] ..
+  [==[EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = $1) ]==] ..
+  [==[FROM a JOIN users u ON u.id = $1]==]
+-- ARTICLE_UPDATE ($1 slug, $2 title, $3 description, $4 body, $5 viewer): the author, then the updated article
+S[16] = [==[WITH t AS (SELECT id, author_id FROM articles WHERE slug = $1), ]==] ..
+  [==[w AS (UPDATE articles SET title = COALESCE($2, title), description = COALESCE($3, description), ]==] ..
+  [==[body = COALESCE($4, body), slug = CASE WHEN $2::text IS NULL THEN slug ELSE ]==] .. SLUGIFY('$2') ..
+  [==[ || '-' || id END, updated_at = now() WHERE id = (SELECT id FROM t WHERE author_id = $5) ]==] ..
+  [==[RETURNING id, slug, title, description, body, created_at, updated_at, author_id) ]==] ..
+  [==[SELECT t.author_id, w.id, w.slug, w.title, w.description, w.body, w.created_at, w.updated_at, ]==] ..
+  TAGS_OF('w.id') .. [==[, (SELECT count(*) FROM favorites f WHERE f.article_id = w.id), ]==] ..
+  [==[EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = w.id AND f.user_id = $5), u.username, u.bio, u.image, ]==] ..
+  [==[EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $5 AND fo.followee_id = w.author_id) ]==] ..
+  [==[FROM t LEFT JOIN w ON true LEFT JOIN users u ON u.id = w.author_id]==]
+-- ARTICLE_DELETE ($1 slug, $2 viewer): the author
+S[17] = [==[WITH t AS (SELECT id, author_id FROM articles WHERE slug = $1), ]==] ..
+  [==[w AS (DELETE FROM articles WHERE id = (SELECT id FROM t WHERE author_id = $2)) SELECT author_id FROM t]==]
+-- FAVORITE ($1 viewer, $2 slug)
+S[18] = favorite([==[INSERT INTO favorites (user_id, article_id) SELECT $1, id FROM t ON CONFLICT DO NOTHING RETURNING 1]==],
+  '+', 'true')
+-- UNFAVORITE ($1 viewer, $2 slug)
+S[19] = favorite([==[DELETE FROM favorites WHERE user_id = $1 AND article_id = (SELECT id FROM t) RETURNING 1]==],
+  '-', 'false')
+-- COMMENTS ($1 viewer, $2 slug): first each article's newest 100 comments (k 0), once whoever asked for them, in
+-- article and then newest-first order; then a row per request: its article's id (NULL if there is none) and the
+-- authors the viewer follows
+S[20] = 'WITH ' .. req({{'viewer', 'int8'}, {'slug', 'text'}}) .. ', ' ..
+  'arts AS MATERIALIZED (SELECT s.slug, s.ks, s.vs, (SELECT a.id FROM articles a WHERE a.slug = s.slug) AS id ' ..
+    'FROM (SELECT slug, array_agg(k) AS ks, array_agg(viewer) AS vs FROM req GROUP BY slug) s), ' ..
+  'cm AS MATERIALIZED (SELECT ar.id AS aid, c.id, c.body, c.created_at, c.updated_at, c.author_id, u.username, ' ..
+    'u.bio, u.image FROM arts ar CROSS JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id ' ..
+    'FROM comments c WHERE c.article_id = ar.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ' ..
+    'CROSS JOIN LATERAL (SELECT u.username, u.bio, u.image FROM users u WHERE u.id = c.author_id LIMIT 1) u) ' ..
+  'SELECT 0::int8 AS k, cm.aid, NULL::int8[] AS fols, cm.id, cm.body, cm.created_at, cm.updated_at, cm.author_id, ' ..
+    'cm.username, cm.bio, cm.image FROM cm ' ..
+  'UNION ALL SELECT u.k, ar.id, CASE WHEN u.viewer <> 0 AND ar.id IS NOT NULL THEN ' ..
+    'ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = u.viewer) END, ' ..
+    'NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL FROM arts ar ' .. each_request('ar') .. ' ' ..
+  'ORDER BY 1, 2, 6 DESC, 4 DESC'
+-- COMMENT_ADD ($1 slug, $2 viewer, $3 body)
+S[21] = [==[WITH t AS (SELECT id FROM articles WHERE slug = $1), ]==] ..
+  [==[c AS (INSERT INTO comments (article_id, author_id, body) SELECT id, $2, $3 FROM t ]==] ..
+  [==[RETURNING id, body, created_at, updated_at, author_id) ]==] ..
+  [==[SELECT c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image FROM c JOIN users u ON u.id = c.author_id]==]
+-- COMMENT_DELETE ($1 id, $2 slug, $3 viewer): the comment's author
+S[22] = [==[WITH t AS (SELECT c.id, c.author_id FROM comments c JOIN articles a ON a.id = c.article_id ]==] ..
+  [==[WHERE c.id = $1 AND a.slug = $2), ]==] ..
+  [==[w AS (DELETE FROM comments WHERE id = (SELECT id FROM t WHERE author_id = $3)) SELECT author_id FROM t]==]
+]]
+-- in Job order: statement i is job i + 1
+local STATEMENTS: [N_STATEMENTS]cstring = {
+  #[S[1]]#, #[S[2]]#, #[S[3]]#, #[S[4]]#, #[S[5]]#, #[S[6]]#, #[S[7]]#, #[S[8]]#, #[S[9]]#, #[S[10]]#, #[S[11]]#,
+  #[S[12]]#, #[S[13]]#, #[S[14]]#, #[S[15]]#, #[S[16]]#, #[S[17]]#, #[S[18]]#, #[S[19]]#, #[S[20]]#, #[S[21]]#,
+  #[S[22]]#
+}
+
+local function is_write(job: Job): boolean
+  return job == Job.REGISTER or job == Job.USER_UPDATE or job == Job.FOLLOW or job == Job.UNFOLLOW or
+    job == Job.ARTICLE_CREATE or job == Job.ARTICLE_UPDATE or job == Job.ARTICLE_DELETE or job == Job.FAVORITE or
+    job == Job.UNFAVORITE or job == Job.COMMENT_ADD or job == Job.COMMENT_DELETE
+end
+
+local epfd: cint
+local db_url: cstring
+local secret: string
+local now: int64
+local now_ms: int64        -- monotonic, coarse: this loop pass's time in milliseconds
+local quickack_ms: int64   -- a response this late re-arms delayed ACKs on its socket (0 = never)
+local use_gzip = false     -- gzip responses for clients that take it (GZIP=1)
+local listeners: [2]Listener
+local bcrypt: Hasher       -- this process's socket to the bcrypt helpers
+local pgs: *[0]PgConn
+local pg_count: isize
+local flush_list: *[0]*PgConn   -- connections with queries to send at the end of this loop pass
+local flush_count: isize
+local flush_cap: isize
+local last_reconnect: int64
+local pg_error: Buf        -- the last error connecting to Postgres
+local free_list: *Client
+local out: Buf             -- the response being sent
+local body: Buf            -- the response body being built
+local zbuf: Buf            -- its gzip
+local gzip_level_buf: pointer   -- igzip's work buffer for level 0
+local scratch: Buf         -- decoded path segments and query values
+local scratch2: Buf
+local readbuf: [65536]byte
+
+local function watch(fd: cint, op: cint, events: uint32, ptr: pointer): void
+  local ev: epoll_event
+  ev.events = events
+  ev.data.ptr = ptr
+  epoll_ctl(epfd, op, fd, &ev)
+end
+
+local function lower(c: byte): byte
+  if c >= 'A'_b and c <= 'Z'_b then return c + 32 end
+  return c
+end
+
+-- p[0, n) equals s, ignoring ASCII case (s is lowercase)
+local function ieq(p: Bytes, n: isize, s: string): boolean
+  if n ~= (@isize)(s.size) then return false end
+  for i: isize = 0, < n do
+    if lower(p[i]) ~= s.data[i] then return false end
+  end
+  return true
+end
+
+local function eq(p: Bytes, n: isize, s: string): boolean
+  return n == (@isize)(s.size) and C.memcmp(p, s.data, s.size) == 0
+end
+
+local function starts_with(p: Bytes, n: isize, s: string): boolean
+  return n >= (@isize)(s.size) and C.memcmp(p, s.data, s.size) == 0
+end
+
+local function contains(p: Bytes, n: isize, s: string): boolean
+  return n > 0 and memmem(p, (@csize)(n), s.data, s.size) ~= nilptr
+end
+
+local function is_space(c: byte): boolean
+  return c == ' '_b or (c >= 9 and c <= 13)
+end
+
+local function off(p: Bytes, i: isize): Bytes
+  return (@Bytes)(&p[i])
+end
+
+-- drop the first n bytes
+local function consume(b: *Buf, n: isize): void
+  if n >= b.len then
+    b:free()
+  elseif n > 0 then
+    C.memmove(b.data, &b.data[n], (@csize)(b.len - n))
+    b.len = b.len - n
+  end
+end
+
+-- drop the first n bytes, keeping the memory
+local function drop_front(b: *Buf, n: isize): void
+  if n >= b.len then
+    b.len = 0
+  elseif n > 0 then
+    C.memmove(b.data, &b.data[n], (@csize)(b.len - n))
+    b.len = b.len - n
+  end
+end
+
+local function be32(p: Bytes): int32
+  return (@int32)(((@uint32)(p[0]) << 24) | ((@uint32)(p[1]) << 16) | ((@uint32)(p[2]) << 8) | (@uint32)(p[3]))
+end
+
+-- a binary int2, int4 or int8
+local function be_int(p: Bytes, n: int32): int64
+  local v: uint64 = 0
+  for i: int32 = 0, < n do v = (v << 8) | p[i] end
+  if n == 4 then return (@int32)((@uint32)(v)) end
+  if n == 2 then return (@int16)((@uint16)(v)) end
+  return (@int64)(v)
+end
+
+local function put32(b: *Buf, v: isize): void
+  b:byte((@byte)((v >> 24) & 0xFF))
+  b:byte((@byte)((v >> 16) & 0xFF))
+  b:byte((@byte)((v >> 8) & 0xFF))
+  b:byte((@byte)(v & 0xFF))
+end
+
+-- room for a length that is filled in later with set32
+local function length_slot(b: *Buf): isize
+  b:reserve(4)
+  b.len = b.len + 4
+  return b.len - 4
+end
+
+local function set32(b: *Buf, at: isize, v: isize): void
+  b.data[at] = (@byte)((v >> 24) & 0xFF)
+  b.data[at + 1] = (@byte)((v >> 16) & 0xFF)
+  b.data[at + 2] = (@byte)((v >> 8) & 0xFF)
+  b.data[at + 3] = (@byte)(v & 0xFF)
+end
+
+-- Bind parameters, as text
+
+local function params_reset(c: *Client): void
+  c.params.len = 0
+  c.nparams = 0
+end
+
+local function param_text(c: *Client, p: Bytes, n: isize): void
+  put32(&c.params, n)
+  c.params:bytes(p, n)
+  c.nparams = c.nparams + 1
+end
+
+local function param_str(c: *Client, s: string): void
+  param_text(c, s.data, (@isize)(s.size))
+end
+
+local function param_null(c: *Client): void
+  put32(&c.params, -1)
+  c.nparams = c.nparams + 1
+end
+
+local function param_int(c: *Client, v: int64): void
+  local at = length_slot(&c.params)
+  local start = c.params.len
+  c.params:int(v)
+  set32(&c.params, at, c.params.len - start)
+  c.nparams = c.nparams + 1
+end
+
+-- Connections
+
+local function client_close(c: *Client): void
+  if c.closed then return end
+  if c.fd >= 0 then close(c.fd) end
+  c.closed = true
+end
+
+-- A closed client is freed once nothing waits for it, at the end of the epoll batch: an event for its fd may
+-- still be further down the batch.
+local function client_release(c: *Client): void
+  if c.closed and c.job == Job.NONE and not c.freeing then
+    c.freeing = true
+    c.next = free_list
+    free_list = c
+  end
+end
+
+local function free_clients(): void
+  while free_list ~= nilptr do
+    local c = free_list
+    free_list = c.next
+    c.input:free()
+    c.output:free()
+    c.params:free()
+    c.token:free()
+    c.stash:free()
+    C.free(c)
+  end
+end
+
+-- The links to send at the end of this loop pass: the database process's to the workers, a worker's one.
+local links: *[0]Link
+local link_count: isize = 0
+
+-- A message on a link: its length, then the bytes of its parts.
+local function link_message(l: *Link, size: isize): void
+  local n: uint32 = (@uint32)(size)
+  l.out:bytes(&n, 4)
+end
+
+-- Send what the socket takes and keep the rest for EPOLLOUT. A stand-in client of the database process sends its
+-- response to its worker instead (the tag and the response), and is done.
+local function client_send(c: *Client, p: Bytes, n: isize): void
+  if c.closed then return end
+  if c.link ~= nilptr then
+    link_message(c.link, 8 + n)
+    c.link.out:bytes(&c.tag, 8)
+    c.link.out:bytes(p, n)
+    c.closed = true
+    return
+  end
+  if c.output.len == 0 then
+    local w = send(c.fd, p, (@csize)(n), MSG_NOSIGNAL)
+    if w == n then return end
+    if w < 0 then
+      if C.errno ~= EAGAIN and C.errno ~= EINTR then
+        client_close(c)
+        return
+      end
+      w = 0
+    end
+    p = (@Bytes)(&p[w])
+    n = n - w
+  end
+  c.output:bytes(p, n)
+  if not c.watching_out then
+    watch(c.fd, EPOLL_CTL_MOD, EPOLLIN | EPOLLOUT, c)
+    c.watching_out = true
+  end
+end
+
+local function status_line(status: int32): string
+  if status == 200 then return '200 OK' end
+  if status == 201 then return '201 Created' end
+  if status == 204 then return '204 No Content' end
+  if status == 401 then return '401 Unauthorized' end
+  if status == 403 then return '403 Forbidden' end
+  if status == 404 then return '404 Not Found' end
+  if status == 422 then return '422 Unprocessable Entity' end
+  if status == 503 then return '503 Service Unavailable' end
+  return '500 Internal Server Error'
+end
+
+local MSS: isize = 1448
+
+local function respond(c: *Client, status: int32, p: Bytes, n: isize, gzipped: boolean): void
+  out.len = 0
+  out:str('HTTP/1.1 ')
+  out:str(status_line(status))
+  if status == 204 then
+    if c.close_after then out:str('\r\nConnection: close') end
+    out:str('\r\n\r\n')
+  else
+    out:str('\r\nContent-Type: application/json\r\nContent-Length: ')
+    out:int(n)
+    if gzipped then out:str('\r\nContent-Encoding: gzip\r\nVary: Accept-Encoding') end
+    if c.close_after then out:str('\r\nConnection: close') end
+    out:str('\r\n\r\n')
+    out:bytes(p, n)
+  end
+  client_send(c, out.data, out.len)
+  if c.close_after and c.output.len == 0 then
+    client_close(c)
+  elseif quickack_ms > 0 and now_ms - c.recv_ms > quickack_ms and not c.closed then
+    -- Too late for the request's ACK to ride on this response: the kernel's delayed-ACK timer (40 ms) has sent it
+    -- alone and left delayed-ACK mode, so the next request would get an ACK of its own too. Back into the mode.
+    local zero: cint = 0
+    setsockopt(c.fd, IPPROTO_TCP, TCP_QUICKACK, &zero, 4)
+  end
+end
+
+-- The body built in body. With GZIP=1, bodies of more than a segment are gzipped when the client takes it and it
+-- saves a segment: every segment saved is also an ACK the client doesn't send. Off by default: compressing costs
+-- more CPU here than the packets it saves.
+local function respond_body(c: *Client, status: int32): void
+  if c.gzip and body.len > MSS - 200 then
+    zbuf:reserve(body.len + 1024)
+    local z: isal_zstream
+    isal_deflate_stateless_init(&z)
+    z.level = 0
+    z.level_buf = gzip_level_buf
+    z.level_buf_size = ISAL_DEF_LVL0_DEFAULT
+    z.gzip_flag = IGZIP_GZIP
+    z.end_of_stream = 1
+    z.next_in = body.data
+    z.avail_in = (@uint32)(body.len)
+    z.next_out = zbuf.data
+    z.avail_out = (@uint32)(zbuf.cap)
+    if isal_deflate_stateless(&z) == COMP_OK then
+      local zn = (@isize)(z.total_out)
+      if (zn + 250) // MSS < (body.len + 200) // MSS then
+        respond(c, status, zbuf.data, zn, true)
+        return
+      end
+    end
+  end
+  respond(c, status, body.data, body.len, false)
+end
+
+local function respond_error(c: *Client, status: int32, message: string): void
+  body.len = 0
+  body:str('{"errors":{"body":["')
+  body:str(message)
+  body:str('"]}}')
+  respond(c, status, body.data, body.len, false)
+end
+
+-- Results
+
+-- A DataRow's columns, one after another.
+local Row = @record{p: Bytes, i: isize}
+local batch_rows = false   -- the rows start with a batch's k (an int8), which row_open skips
+
+local function row_open(r: *Row, row: Bytes): void
+  r.p = row
+  r.i = 2   -- after the column count
+  if batch_rows then r.i = 2 + 4 + 8 end
+end
+
+-- the next column: its bytes and length (-1 = NULL)
+local function row_col(r: *Row): (Bytes, int32)
+  local n = be32(off(r.p, r.i))
+  local p = off(r.p, r.i + 4)
+  r.i = r.i + 4
+  if n > 0 then r.i = r.i + n end
+  return p, n
+end
+
+local function row_skip(r: *Row): void
+  row_col(r)
+end
+
+local function row_int(r: *Row): int64
+  local p, n = row_col(r)
+  if n <= 0 then return 0 end
+  return be_int(p, n)
+end
+
+local function row_is_null(r: *Row): boolean
+  return be32(off(r.p, r.i)) < 0
+end
+
+local function put_text(r: *Row): void
+  local p, n = row_col(r)
+  body:json_string(p, n)
+end
+
+local function put_text_or_null(r: *Row): void
+  local p, n = row_col(r)
+  if n < 0 then body:str('null') else body:json_string(p, n) end
+end
+
+local function put_bool(r: *Row): void
+  local p, n = row_col(r)
+  if n == 1 and p[0] ~= 0 then body:str('true') else body:str('false') end
+end
+
+local function put_time(r: *Row): void
+  local p, n = row_col(r)
+  body:timestamp(be_int(p, n))
+end
+
+-- a binary text[] as a JSON array of strings
+local function put_text_array(r: *Row): void
+  local p, n = row_col(r)
+  body:byte('['_b)
+  if n >= 12 and be32(p) == 1 then
+    local count = be32(off(p, 12))
+    local i: isize = 20
+    for k: int32 = 0, < count do
+      local len = be32(off(p, i))
+      if k > 0 then body:byte(','_b) end
+      body:json_string(off(p, i + 4), len)
+      i = i + 4 + len
+    end
+  end
+  body:byte(']'_b)
+end
+
+-- username, bio, image, following -> "author" or "profile" object
+local function put_profile(r: *Row): void
+  body:str('{"username":')
+  put_text(r)
+  body:str(',"bio":')
+  put_text_or_null(r)
+  body:str(',"image":')
+  put_text_or_null(r)
+  body:str(',"following":')
+  put_bool(r)
+  body:byte('}'_b)
+end
+
+-- id, slug, title, description, [body], created_at, updated_at, tag_list, favorites_count, favorited, username,
+-- bio, image, following -> Article
+local function put_article(r: *Row, with_body: boolean): void
+  row_skip(r)
+  body:str('{"slug":')
+  put_text(r)
+  body:str(',"title":')
+  put_text(r)
+  body:str(',"description":')
+  put_text(r)
+  if with_body then
+    body:str(',"body":')
+    put_text(r)
+  end
+  body:str(',"createdAt":')
+  put_time(r)
+  body:str(',"updatedAt":')
+  put_time(r)
+  body:str(',"tagList":')
+  put_text_array(r)
+  body:str(',"favoritesCount":')
+  body:int(row_int(r))
+  body:str(',"favorited":')
+  put_bool(r)
+  body:str(',"author":')
+  put_profile(r)
+  body:byte('}'_b)
+end
+
+-- id, body, created_at, updated_at, username, bio, image[, following] -> Comment
+local function put_comment(r: *Row, with_following: boolean): void
+  body:str('{"id":')
+  body:int(row_int(r))
+  local bp, bn = row_col(r)
+  body:str(',"createdAt":')
+  put_time(r)
+  body:str(',"updatedAt":')
+  put_time(r)
+  body:str(',"body":')
+  body:json_string(bp, bn)
+  body:str(',"author":{"username":')
+  put_text(r)
+  body:str(',"bio":')
+  put_text_or_null(r)
+  body:str(',"image":')
+  put_text_or_null(r)
+  body:str(',"following":')
+  if with_following then put_bool(r) else body:str('false') end
+  body:str('}}')
+end
+
+-- id, username, email, bio, image -> "user" object with the token in c.token
+local function put_user(c: *Client, r: *Row): void
+  row_skip(r)
+  local up, un = row_col(r)
+  body:str('{"email":')
+  put_text(r)
+  body:str(',"token":')
+  body:json_string(c.token.data, c.token.len)
+  body:str(',"username":')
+  body:json_string(up, un)
+  body:str(',"bio":')
+  put_text_or_null(r)
+  body:str(',"image":')
+  put_text_or_null(r)
+  body:byte('}'_b)
+end
+
+-- An ErrorResponse's payload: is its SQLSTATE c?
+local function sqlstate_is(e: Bytes, n: isize, code: string): boolean
+  local i: isize = 0
+  while i < n and e[i] ~= 0 do
+    local field = e[i]
+    local j = i + 1
+    while j < n and e[j] ~= 0 do j = j + 1 end
+    if field == 'C'_b then return eq(off(e, i + 1), j - i - 1, code) end
+    i = j + 1
+  end
+  return false
+end
+
+local function client_resume(c: *Client): void <forwarddecl> end
+local function bcrypt_request(c: *Client, op: byte, password: Bytes, pn: isize, hash: Bytes, hn: isize): void <forwarddecl> end
+local function start_job(c: *Client, job: Job): void <forwarddecl> end
+
+-- A query failed, or never got to Postgres.
+local function fail_job(c: *Client, job: Job, unique_violation: boolean): void
+  c.stash:free()
+  if c.closed then return end
+  if unique_violation then
+    respond_error(c, 422, 'username or email is already taken')
+  else
+    respond_error(c, 500, 'internal server error')
+  end
+end
+
+-- A query's answer: its messages, m[0, n).
+local function finish_job(c: *Client, m: Bytes, n: isize): void
+  local job = c.job
+  c.job = Job.NONE
+  local first_row: Bytes = nilptr
+  local rows: int32 = 0
+  local i: isize = 0
+  while i < n do
+    local size = 1 + be32(off(m, i + 1))
+    local kind = m[i]
+    if kind == 'E'_b then
+      fail_job(c, job, sqlstate_is(off(m, i + 5), size - 5, '23505'))
+      return
+    elseif kind == 'D'_b then
+      if first_row == nilptr then first_row = off(m, i + 5) end
+      rows = rows + 1
+    end
+    i = i + size
+  end
+  if c.closed then
+    c.stash:free()
+    return
+  end
+  body.len = 0
+  local r: Row
+  if job == Job.TAGS then
+    body:str('{"tags":[')
+    local first = true
+    i = 0
+    while i < n do
+      if m[i] == 'D'_b then
+        if not first then body:byte(','_b) end
+        first = false
+        row_open(&r, off(m, i + 5))
+        put_text(&r)
+      end
+      i = i + 1 + be32(off(m, i + 1))
+    end
+    body:str(']}')
+    respond_body(c, 200)
+  elseif job == Job.USER_GET or job == Job.USER_UPDATE then
+    if first_row == nilptr then
+      respond_error(c, 401, 'unknown user')
+      return
+    end
+    row_open(&r, first_row)
+    body:str('{"user":')
+    put_user(c, &r)
+    body:byte('}'_b)
+    respond_body(c, 200)
+  elseif job == Job.LOGIN then
+    if first_row == nilptr then
+      c.stash:free()
+      respond_error(c, 401, 'email or password is invalid')
+      return
+    end
+    -- keep the user's id and fields, and check the password against its hash in the helper
+    row_open(&r, first_row)
+    local id = row_int(&r)
+    for k = 1, 4 do row_skip(&r) end
+    local hp, hn = row_col(&r)
+    c.viewer = id
+    local password = c.stash.len - 1   -- without its NUL
+    -- the row after the password: its column count and columns, without the batch's k
+    local lead: isize = 2
+    if batch_rows then lead = 2 + 4 + 8 end
+    c.stash:bytes(first_row, 2)
+    c.stash:bytes(off(first_row, lead), r.i - lead)
+    bcrypt_request(c, 'V'_b, c.stash.data, password, hp, hn)
+    return
+  elseif job == Job.REGISTER then
+    if first_row == nilptr then
+      respond_error(c, 422, 'username or email is already taken')
+      return
+    end
+    row_open(&r, first_row)
+    c.token.len = 0
+    Jwt.sign(row_int(&r), now, secret, &c.token)
+    row_open(&r, first_row)
+    body:str('{"user":')
+    put_user(c, &r)
+    body:byte('}'_b)
+    respond_body(c, 201)
+  elseif job == Job.PROFILE or job == Job.FOLLOW or job == Job.UNFOLLOW then
+    if first_row == nilptr then
+      respond_error(c, 404, 'profile not found')
+      return
+    end
+    row_open(&r, first_row)
+    body:str('{"profile":{"username":')
+    put_text(&r)
+    body:str(',"bio":')
+    put_text_or_null(&r)
+    body:str(',"image":')
+    put_text_or_null(&r)
+    body:str(',"following":')
+    if job == Job.PROFILE then put_bool(&r)
+    elseif job == Job.FOLLOW then body:str('true')
+    else body:str('false') end
+    body:str('}}')
+    respond_body(c, 200)
+  elseif job >= Job.LIST_GLOBAL and job <= Job.FEED then
+    local count: int64 = 0
+    local first = true
+    body:str('{"articles":[')
+    i = 0
+    while i < n do
+      if m[i] == 'D'_b then
+        row_open(&r, off(m, i + 5))
+        count = row_int(&r)
+        if not row_is_null(&r) then
+          if not first then body:byte(','_b) end
+          first = false
+          put_article(&r, false)
+        end
+      end
+      i = i + 1 + be32(off(m, i + 1))
+    end
+    body:str('],"articlesCount":')
+    body:int(count)
+    body:byte('}'_b)
+    respond_body(c, 200)
+  elseif job == Job.ARTICLE or job == Job.FAVORITE or job == Job.UNFAVORITE or job == Job.ARTICLE_CREATE then
+    if first_row == nilptr then
+      if job == Job.ARTICLE_CREATE then respond_error(c, 500, 'internal server error')
+      else respond_error(c, 404, 'article not found') end
+      return
+    end
+    row_open(&r, first_row)
+    body:str('{"article":')
+    put_article(&r, true)
+    body:byte('}'_b)
+    if job == Job.ARTICLE_CREATE then respond_body(c, 201) else respond_body(c, 200) end
+  elseif job == Job.ARTICLE_UPDATE then
+    if first_row == nilptr then
+      respond_error(c, 404, 'article not found')
+      return
+    end
+    row_open(&r, first_row)
+    if row_int(&r) ~= c.viewer then
+      respond_error(c, 403, 'only the author can edit this article')
+      return
+    end
+    body:str('{"article":')
+    put_article(&r, true)
+    body:byte('}'_b)
+    respond_body(c, 200)
+  elseif job == Job.ARTICLE_DELETE or job == Job.COMMENT_DELETE then
+    if first_row == nilptr then
+      respond_error(c, 404, 'not found')
+      return
+    end
+    row_open(&r, first_row)
+    if row_int(&r) ~= c.viewer then
+      respond_error(c, 403, 'only the author can delete this')
+      return
+    end
+    respond(c, 204, nilptr, 0, false)
+  elseif job == Job.COMMENTS then
+    if first_row == nilptr then
+      respond_error(c, 404, 'article not found')
+      return
+    end
+    body:str('{"comments":[')
+    local first = true
+    i = 0
+    while i < n do
+      if m[i] == 'D'_b then
+        row_open(&r, off(m, i + 5))
+        row_skip(&r)
+        if not row_is_null(&r) then
+          if not first then body:byte(','_b) end
+          first = false
+          put_comment(&r, true)
+        end
+      end
+      i = i + 1 + be32(off(m, i + 1))
+    end
+    body:str(']}')
+    respond_body(c, 200)
+  elseif job == Job.COMMENT_ADD then
+    if first_row == nilptr then
+      respond_error(c, 404, 'article not found')
+      return
+    end
+    row_open(&r, first_row)
+    body:str('{"comment":')
+    put_comment(&r, false)
+    body:byte('}'_b)
+    respond_body(c, 201)
+  else
+    respond_error(c, 500, 'internal server error')
+  end
+  c.stash:free()
+end
+
+-- The bcrypt helpers
+
+-- A request to the helpers: the client, 'V' (verify password against hash) or 'H' (hash password), the password
+-- and the hash, each with a 2-byte length. When their socket's queue is full, requests wait in bc_out (each with
+-- its 2-byte length) until it has room.
+local bc_msg: Buf
+local bc_out: Buf
+
+-- A request that can't reach the helpers fails.
+local function bcrypt_fail(c: *Client): void
+  c.job = Job.NONE
+  c.stash:free()
+  if not c.closed then respond_error(c, 500, 'internal server error') end
+end
+
+function bcrypt_request(c: *Client, op: byte, password: Bytes, pn: isize, hash: Bytes, hn: isize): void
+  bc_msg.len = 0
+  local tag: uint64 = (@uint64)((@usize)(c))
+  bc_msg:bytes(&tag, 8)
+  bc_msg:byte(op)
+  bc_msg:byte((@byte)(pn >> 8))
+  bc_msg:byte((@byte)(pn & 0xFF))
+  bc_msg:bytes(password, pn)
+  bc_msg:byte((@byte)(hn >> 8))
+  bc_msg:byte((@byte)(hn & 0xFF))
+  bc_msg:bytes(hash, hn)
+  if op == 'V'_b then c.job = Job.BC_LOGIN
+  elseif c.job == Job.NONE then c.job = Job.BC_REGISTER end
+  if bc_out.len == 0 then
+    local w = send(bcrypt.fd, bc_msg.data, (@csize)(bc_msg.len), MSG_NOSIGNAL)
+    if w == bc_msg.len then return end
+    if w >= 0 or C.errno ~= EAGAIN then
+      bcrypt_fail(c)
+      return
+    end
+    watch(bcrypt.fd, EPOLL_CTL_MOD, EPOLLIN | EPOLLOUT, &bcrypt)
+  end
+  bc_out:byte((@byte)(bc_msg.len >> 8))
+  bc_out:byte((@byte)(bc_msg.len & 0xFF))
+  bc_out:bytes(bc_msg.data, bc_msg.len)
+end
+
+-- The helpers' queue has room: send what waits.
+local function bcrypt_flush(): void
+  local i: isize = 0
+  while i < bc_out.len do
+    local n = ((@isize)(bc_out.data[i]) << 8) | bc_out.data[i + 1]
+    local m = off(bc_out.data, i + 2)
+    local w = send(bcrypt.fd, m, (@csize)(n), MSG_NOSIGNAL)
+    if w < 0 and C.errno == EAGAIN then break end
+    if w ~= n then
+      local tag: uint64
+      C.memcpy(&tag, m, 8)
+      local c = (@*Client)((@usize)(tag))
+      bcrypt_fail(c)
+      client_resume(c)
+      client_release(c)
+    end
+    i = i + 2 + n
+  end
+  drop_front(&bc_out, i)
+  if bc_out.len == 0 then watch(bcrypt.fd, EPOLL_CTL_MOD, EPOLLIN, &bcrypt) end
+end
+
+-- The helper's answer: the client, ok, and (for 'H') the new hash with its 2-byte length.
+local function bcrypt_answer(p: Bytes, n: isize): void
+  if n < 9 then return end
+  local tag: uint64
+  C.memcpy(&tag, p, 8)
+  local c = (@*Client)((@usize)(tag))
+  local ok = p[8] ~= 0
+  local job = c.job
+  c.job = Job.NONE
+  if c.closed then
+    c.stash:free()
+    client_release(c)
+    return
+  end
+  if job == Job.BC_LOGIN then
+    if not ok then
+      c.stash:free()
+      respond_error(c, 401, 'email or password is invalid')
+    else
+      -- the row the LOGIN query returned is in the stash after the password
+      local password_len: isize = 0
+      while password_len < c.stash.len and c.stash.data[password_len] ~= 0 do password_len = password_len + 1 end
+      local r: Row
+      row_open(&r, off(c.stash.data, password_len + 1))
+      c.token.len = 0
+      Jwt.sign(c.viewer, now, secret, &c.token)
+      body.len = 0
+      body:str('{"user":')
+      put_user(c, &r)
+      body:byte('}'_b)
+      c.stash:free()
+      respond_body(c, 200)
+    end
+  elseif job == Job.BC_REGISTER or job == Job.BC_UPDATE then
+    if not ok or n < 11 then
+      c.stash:free()
+      respond_error(c, 500, 'internal server error')
+    else
+      local hn = ((@isize)(p[9]) << 8) | p[10]
+      param_text(c, off(p, 11), hn)   -- the hash is the last parameter
+      c.stash:free()
+      if job == Job.BC_REGISTER then start_job(c, Job.REGISTER) else start_job(c, Job.USER_UPDATE) end
+      return
+    end
+  end
+  client_resume(c)
+  client_release(c)
+end
+
+local function bcrypt_event(events: uint32): void
+  if events & EPOLLOUT ~= 0 then bcrypt_flush() end
+  local msg: [512]byte
+  while true do
+    local n = recv(bcrypt.fd, &msg[0], #msg, MSG_DONTWAIT)
+    if n <= 0 then return end
+    bcrypt_answer(&msg[0], n)
+  end
+end
+
+-- A helper process. They share one socket that the workers send their requests to, and a pipe with one token
+-- in it: the helper holding the token collects requests, up to its lanes or until the first has waited wait_ms,
+-- hands the token on, then works out all of them at once (Bcrypt.run) and answers each at its worker's socket.
+-- So requests from every worker fill the lanes, and the helpers run at a lower priority than the event loops.
+local HelperRequest = @record{from: sockaddr_un, from_len: cuint, tag: [8]byte, verify: boolean, want: [23]byte}
+
+local function helper_reply(fd: cint, r: *HelperRequest, ok: boolean, hash: *[60]byte): void
+  local reply: [80]byte
+  C.memcpy(&reply[0], &r.tag, 8)
+  reply[8] = 0
+  if ok then reply[8] = 1 end
+  local len: csize = 9
+  if ok and hash ~= nilptr then
+    reply[9] = 0
+    reply[10] = 60
+    C.memcpy(&reply[11], hash, 60)
+    len = 71
+  end
+  while sendto(fd, &reply[0], len, MSG_NOSIGNAL, (@*sockaddr)(&r.from), r.from_len) < 0 and C.errno == EINTR do end
+end
+
+local function now_ms_helper(): int64
+  local ts: C.timespec
+  clock_gettime(CLOCK_MONOTONIC, &ts)
+  return ts.tv_sec * 1000 + ts.tv_nsec // 1000000
+end
+
+global function bcrypt_helper(fd: cint, token: *[2]cint, lanes: int32, wait_ms: int32): void
+  setpriority(PRIO_PROCESS, 0, 10)
+  local reqs: [BCRYPT_LANES]HelperRequest
+  local jobs: [BCRYPT_LANES]BcryptJob
+  local msg: [1024]byte
+  local t: byte = 0
+  while true do
+    while read(token[0], &t, 1) ~= 1 do
+      if C.errno ~= EINTR then C.exit(0) end
+    end
+    -- collect: wait for the first request, then for more until the lanes are full or the first has waited enough
+    local n: int32 = 0
+    local due: int64 = 0
+    while n < lanes do
+      local r = &reqs[n]
+      r.from_len = #sockaddr_un
+      local flags: cint = 0
+      if n > 0 then flags = MSG_DONTWAIT end
+      local got = recvfrom(fd, &msg[0], #msg, flags, (@*sockaddr)(&r.from), &r.from_len)
+      if got < 0 then
+        if C.errno ~= EAGAIN and C.errno ~= EINTR then C.exit(0) end
+        if n > 0 then
+          local left = due - now_ms_helper()
+          if left <= 0 then break end
+          local p: pollfd = {fd = fd, events = POLLIN}
+          if poll(&p, 1, (@cint)(left)) == 0 then break end
+        end
+        continue
+      end
+      if n == 0 then due = now_ms_helper() + wait_ms end
+      -- the request: tag, op, password and hash with their lengths
+      if got < 13 then continue end
+      C.memcpy(&r.tag, &msg[0], 8)
+      local pn = ((@isize)(msg[9]) << 8) | msg[10]
+      if 11 + pn + 2 > got then continue end
+      local hn = ((@isize)(msg[11 + pn]) << 8) | msg[12 + pn]
+      if 13 + pn + hn > got then continue end
+      local job = &jobs[n]
+      local used = pn
+      if used > 72 then used = 72 end
+      C.memcpy(&job.password, &msg[11], (@csize)(used))
+      job.password_len = (@int32)(used)
+      for i = 0, < used do   -- C strings: the password ends at a NUL
+        if job.password[i] == 0 then
+          job.password_len = (@int32)(i)
+          break
+        end
+      end
+      r.verify = msg[8] == 'V'_b
+      if r.verify then
+        if not Bcrypt.parse((@*[0]byte)(&msg[13 + pn]), hn, job, &r.want) then
+          helper_reply(fd, r, false, nilptr)   -- not a bcrypt hash: nothing matches it
+          continue
+        end
+      else
+        job.cost = 10
+        if getrandom(&job.salt, 16, 0) ~= 16 then
+          helper_reply(fd, r, false, nilptr)
+          continue
+        end
+      end
+      n = n + 1
+    end
+    write(token[1], &t, 1)
+
+    Bcrypt.run((@*[0]BcryptJob)(&jobs), n)
+    for i = 0, < n do
+      local r = &reqs[i]
+      if r.verify then
+        helper_reply(fd, r, CRYPTO_memcmp(&jobs[i].digest, &r.want, 23) == 0, nilptr)
+      else
+        local hash: [60]byte
+        Bcrypt.format(&jobs[i], &hash)
+        helper_reply(fd, r, true, &hash)
+      end
+    end
+  end
+end
+
+-- The lanes that hash fastest per hash here (a short run of each at cost 6).
+local function bcrypt_calibrate(): int32
+  local jobs: [BCRYPT_LANES]BcryptJob
+  for k = 0, < BCRYPT_LANES do
+    jobs[k].cost = 6
+    jobs[k].password_len = 8
+  end
+  local best: int32 = 1
+  local best_us: int64 = -1
+  for n: int32 = 1, BCRYPT_LANES do
+    local ts: C.timespec
+    clock_gettime(CLOCK_MONOTONIC, &ts)
+    local t0 = ts.tv_sec * 1000000 + ts.tv_nsec // 1000
+    Bcrypt.run((@*[0]BcryptJob)(&jobs), n)
+    Bcrypt.run((@*[0]BcryptJob)(&jobs), n)
+    clock_gettime(CLOCK_MONOTONIC, &ts)
+    local per = (ts.tv_sec * 1000000 + ts.tv_nsec // 1000 - t0) // n
+    if best_us < 0 or per * 103 < best_us * 100 then
+      best = n
+      best_us = per
+    end
+  end
+  return best
+end
+
+-- Start count helpers (before the workers and their listening sockets, so the helpers hold none) and return the
+-- address of their socket in addr. BCRYPT_LANES overrides the calibrated lanes, BCRYPT_WAIT_MS (default 150) is
+-- how long a first request waits for others: a login is slower, but the lanes fill (logins are rare).
+global function start_bcrypt_helpers(count: cint, addr: *sockaddr_un, addr_len: *cuint): void
+  local fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0)
+  local auto: sockaddr_un
+  auto.sun_family = (@cushort)(AF_UNIX)
+  $addr_len = #sockaddr_un
+  -- bound to just the family: the kernel picks a free abstract address
+  if fd < 0 or bind(fd, (@*sockaddr)(&auto), 2) ~= 0 or getsockname(fd, (@*sockaddr)(addr), addr_len) ~= 0 then
+    C.perror('conduit: bcrypt socket')
+    C.exit(1)
+  end
+  local token: [2]cint
+  if pipe(&token) ~= 0 then
+    C.perror('conduit: pipe')
+    C.exit(1)
+  end
+  local t: byte = 0
+  write(token[1], &t, 1)
+  local lanes: int32 = 0
+  local v = C.getenv('BCRYPT_LANES')
+  if v ~= nilptr then lanes = C.atoi(v) end
+  if lanes < 1 or lanes > BCRYPT_LANES then lanes = bcrypt_calibrate() end
+  local wait_ms: int32 = 150
+  v = C.getenv('BCRYPT_WAIT_MS')
+  if v ~= nilptr and cbytes(v)[0] ~= 0 then wait_ms = C.atoi(v) end
+  for i: cint = 0, < count do
+    if fork() == 0 then
+      prctl(PR_SET_PDEATHSIG, SIGKILL)
+      bcrypt_helper(fd, &token, lanes, wait_ms)
+      C.exit(0)
+    end
+  end
+  close(fd)
+  close(token[0])
+  close(token[1])
+  C.printf('conduit: %d bcrypt helpers, %d lanes each\n', count, lanes)
+  C.fflush(C.stdout)
+end
+
+-- Postgres connections
+
+local function set_pg_error(message: Bytes, n: isize): void
+  while n > 0 and is_space(message[n - 1]) do n = n - 1 end
+  pg_error.len = 0
+  pg_error:bytes(message, n)
+  pg_error:byte(0)   -- also a C string
+  pg_error.len = pg_error.len - 1
+end
+
+local function flush_later(pc: *PgConn): void
+  if pc.flushing then return end
+  pc.flushing = true
+  if flush_count == flush_cap then
+    flush_cap = flush_cap * 2 + 16
+    flush_list = (@*[0]*PgConn)(C.realloc(flush_list, (@csize)(flush_cap * #pointer)))
+  end
+  flush_list[flush_count] = pc
+  flush_count = flush_count + 1
+end
+
+-- Batches of reads. The reads of a kind wait in its batch until its first has waited batch_ms and the kind has
+-- no batch in flight; then, at the end of a loop pass, all of them (up to batch_max) go as one query. So a batch
+-- holds what came in while the last one ran: the busier the server, the bigger the batches, and the more requests
+-- share each page, count and article, without a fixed wait. A batch runs on one Postgres backend: when the one in
+-- flight has run batch_slow_ms, another may go (up to batch_inflight), so a kind can use more than one core.
+local Batch = @record{head: *Client, tail: *Client, n: int32, inflight: int32, since: int64, sent: int64}
+local batches: [N_STATEMENTS + 1]Batch   -- by job
+local batches_waiting = false            -- some batch has requests waiting
+local batch_inflight: int32 = 1
+local batch_ms: int64 = 0
+local batch_slow_ms: int64 = 0
+local batch_max: int32 = 4000
+
+-- Can b's next batch go now: none in flight, or the last one sent has run long enough and there is room?
+local function batch_room(b: *Batch): boolean
+  return b.inflight == 0 or (b.inflight < batch_inflight and now_ms - b.sent >= batch_slow_ms)
+end
+
+-- The batch a read waits in: the lists and article pages share PAGES (LIST_GLOBAL's).
+local function batch_job(job: Job): Job
+  if job >= Job.LIST_GLOBAL and job <= Job.ARTICLE then return Job.LIST_GLOBAL end
+  return job
+end
+
+-- A batch that was sent failed: every request in it does.
+local function batch_fail(head: *Client): void
+  local b = &batches[(@isize)(batch_job(head.job))]
+  b.inflight = b.inflight - 1
+  batches_waiting = true
+  local c = head
+  while c ~= nilptr do
+    local next = c.bnext
+    c.bnext = nilptr
+    local job = c.job
+    c.job = Job.NONE
+    fail_job(c, job, false)
+    client_resume(c)
+    client_release(c)
+    c = next
+  end
+end
+
+-- A batch's answer, m[0, n): each request's rows are the DataRows with its k (1 for the first, and so on). TAGS
+-- has no k: everyone gets all the rows.
+local function batch_finish(head: *Client, m: Bytes, n: isize): void
+  local first_row = n
+  local i: isize = 0
+  while i < n do
+    local kind = m[i]
+    if kind == 'E'_b then
+      batch_fail(head)
+      return
+    end
+    if kind == 'D'_b and first_row == n then first_row = i end
+    i = i + 1 + be32(off(m, i + 1))
+  end
+  local job = head.job
+  local b = &batches[(@isize)(job)]
+  b.inflight = b.inflight - 1
+  batches_waiting = true
+  i = first_row
+  local k: int64 = 0
+  local c = head
+  while c ~= nilptr do
+    local next = c.bnext
+    c.bnext = nilptr
+    k = k + 1
+    if job == Job.TAGS then
+      finish_job(c, m, n)
+    else
+      local start = i
+      -- a DataRow: 'D', its length, the column count, k's length and k
+      while i < n and m[i] == 'D'_b and be_int(off(m, i + 11), 8) == k do i = i + 1 + be32(off(m, i + 1)) end
+      batch_rows = true
+      finish_job(c, off(m, start), i - start)
+      batch_rows = false
+    end
+    if c.job == Job.NONE then
+      client_resume(c)
+      client_release(c)
+    end
+    c = next
+  end
+end
+
+-- PAGES: the lists and article pages, one batch (statement LIST_GLOBAL - 1). Its articles come first, each once
+-- (a row with k 0); then each request's row: count, ids, favorited ids, followed authors.
+
+-- a binary int8[] (no NULL elements): its elements, 12 bytes apart (a 4-byte length and the value)
+local Int8s = @record{p: Bytes, count: int32}
+
+local function int8s(p: Bytes, n: int32): Int8s
+  if n < 20 or be32(p) ~= 1 then return {p = nilptr, count = 0} end   -- NULL, or no dimensions: empty
+  return {p = off(p, 20), count = be32(off(p, 12))}
+end
+
+local function int8s_at(a: *Int8s, i: int32): int64
+  return be_int(off(a.p, i * 12 + 4), 8)
+end
+
+local function int8s_has(a: *Int8s, v: int64): boolean
+  for i: int32 = 0, < a.count do
+    if int8s_at(a, i) == v then return true end
+  end
+  return false
+end
+
+-- Rows by id (tags, authors, articles): open addressing, sized for the batch; id 0 is an empty slot.
+local IdTable = @record{ids: *[0]int64, rows: *[0]Bytes, cap: isize, mask: uint64}
+
+function IdTable:reset(count: isize): void
+  local cap: isize = 64
+  while cap < count * 2 do cap = cap * 2 end
+  if cap > self.cap then
+    self.ids = (@*[0]int64)(C.realloc(self.ids, (@csize)(cap * 8)))
+    self.rows = (@*[0]Bytes)(C.realloc(self.rows, (@csize)(cap * #pointer)))
+    self.cap = cap
+  end
+  C.memset(self.ids, 0, (@csize)(cap * 8))
+  self.mask = (@uint64)(cap - 1)
+end
+
+function IdTable:slot(id: int64): uint64
+  local i = ((@uint64)(id) * 0x9E3779B97F4A7C15) >> 32 & self.mask
+  while self.ids[i] ~= 0 and self.ids[i] ~= id do i = (i + 1) & self.mask end
+  return i
+end
+
+function IdTable:put(id: int64, row: Bytes): void
+  local i = self:slot(id)
+  self.ids[i] = id
+  self.rows[i] = row
+end
+
+-- id's row, or nilptr
+function IdTable:get(id: int64): Bytes
+  local i = self:slot(id)
+  if self.ids[i] ~= id then return nilptr end
+  return self.rows[i]
+end
+
+local tag_rows: IdTable
+local author_rows: IdTable
+local article_rows: IdTable
+
+-- PAGES' rows: k, n, ids, favs, fols, id, slug, title, description, body, created_at, updated_at, tag_ids,
+-- favorites_count, author_id, username, bio, image. A tag row (k -2) has its rank by name in n and its name in
+-- slug; an author row (k -1) its username, bio and image; an article row (k 0) the rest.
+local PAGES_ID <comptime> = 4      -- columns before id
+
+-- a row's id
+local function row_id(row: Bytes): int64
+  local r: Row
+  row_open(&r, row)
+  for _ = 1, PAGES_ID do row_skip(&r) end
+  return row_int(&r)
+end
+
+-- A tag list: the names of the tag ids, in their rank order (the order of the names in Postgres's collation).
+local TagRef = @record{rank: int64, row: Bytes}
+local tag_refs: *[0]TagRef
+local tag_refs_cap: int32 = 0
+
+local function put_tag_names(ids: *Int8s): void
+  if ids.count > tag_refs_cap then
+    tag_refs_cap = ids.count * 2
+    tag_refs = (@*[0]TagRef)(C.realloc(tag_refs, (@csize)(tag_refs_cap * #TagRef)))
+  end
+  local n: int32 = 0
+  for i: int32 = 0, < ids.count do
+    local row = tag_rows:get(int8s_at(ids, i))
+    if row ~= nilptr then
+      local r: Row
+      row_open(&r, row)
+      local ref: TagRef = {rank = row_int(&r), row = row}
+      local j = n   -- insertion sort: a few tags
+      while j > 0 and tag_refs[j - 1].rank > ref.rank do
+        tag_refs[j] = tag_refs[j - 1]
+        j = j - 1
+      end
+      tag_refs[j] = ref
+      n = n + 1
+    end
+  end
+  body:byte('['_b)
+  for i: int32 = 0, < n do
+    if i > 0 then body:byte(','_b) end
+    local r: Row
+    row_open(&r, tag_refs[i].row)
+    for _ = 1, PAGES_ID + 1 do row_skip(&r) end
+    put_text(&r)
+  end
+  body:byte(']'_b)
+end
+
+-- an article row -> Article
+local function put_page_article(row: Bytes, with_body: boolean, favs: *Int8s, fols: *Int8s, all_followed: boolean): void
+  local r: Row
+  row_open(&r, row)
+  for _ = 1, PAGES_ID do row_skip(&r) end
+  local id = row_int(&r)
+  body:str('{"slug":')
+  put_text(&r)
+  body:str(',"title":')
+  put_text(&r)
+  body:str(',"description":')
+  put_text(&r)
+  if with_body then
+    body:str(',"body":')
+    put_text(&r)
+  else
+    row_skip(&r)
+  end
+  body:str(',"createdAt":')
+  put_time(&r)
+  body:str(',"updatedAt":')
+  put_time(&r)
+  body:str(',"tagList":')
+  local p, n = row_col(&r)
+  local tags = int8s(p, n)
+  put_tag_names(&tags)
+  body:str(',"favoritesCount":')
+  body:int(row_int(&r))
+  if int8s_has(favs, id) then body:str(',"favorited":true') else body:str(',"favorited":false') end
+  local author = row_int(&r)
+  body:str(',"author":{"username":')
+  local a: Row
+  row_open(&a, author_rows:get(author))
+  for _ = 1, PAGES_ID + 10 do row_skip(&a) end
+  put_text(&a)
+  body:str(',"bio":')
+  put_text_or_null(&a)
+  body:str(',"image":')
+  put_text_or_null(&a)
+  if all_followed or int8s_has(fols, author) then body:str(',"following":true}}') else body:str(',"following":false}}') end
+end
+
+-- A request's response from its row (nilptr: Postgres skipped it).
+local function pages_respond(c: *Client, row: Bytes): void
+  local job = c.job
+  c.job = Job.NONE
+  if c.closed then return end
+  if row == nilptr then
+    respond_error(c, 500, 'internal server error')
+    return
+  end
+  local r: Row
+  row_open(&r, row)
+  local count = row_int(&r)
+  local p, n = row_col(&r)
+  local ids = int8s(p, n)
+  p, n = row_col(&r)
+  local favs = int8s(p, n)
+  p, n = row_col(&r)
+  local fols = int8s(p, n)
+  body.len = 0
+  if job == Job.ARTICLE then
+    local article: Bytes = nilptr
+    if ids.count > 0 then article = article_rows:get(int8s_at(&ids, 0)) end
+    if article == nilptr then
+      respond_error(c, 404, 'article not found')
+      return
+    end
+    body:str('{"article":')
+    put_page_article(article, true, &favs, &fols, false)
+    body:byte('}'_b)
+  else
+    body:str('{"articles":[')
+    local first = true
+    for i: int32 = 0, < ids.count do
+      local article = article_rows:get(int8s_at(&ids, i))
+      if article ~= nilptr then
+        if not first then body:byte(','_b) end
+        first = false
+        put_page_article(article, false, &favs, &fols, job == Job.FEED)
+      end
+    end
+    body:str('],"articlesCount":')
+    body:int(count)
+    body:byte('}'_b)
+  end
+  respond_body(c, 200)
+end
+
+-- the k of the DataRow message at m[i]: after 'D', its length, the column count and k's length
+local function message_k(m: Bytes, i: isize): int64
+  return be_int(off(m, i + 11), 8)
+end
+
+-- PAGES' answer, m[0, n).
+local function pages_finish(head: *Client, m: Bytes, n: isize): void
+  local first_row = n
+  local tags: isize = 0
+  local authors: isize = 0
+  local articles: isize = 0
+  local i: isize = 0
+  while i < n do
+    local kind = m[i]
+    if kind == 'E'_b then
+      batch_fail(head)
+      return
+    end
+    if kind == 'D'_b then
+      if first_row == n then first_row = i end
+      local k = message_k(m, i)
+      if k == -2 then tags = tags + 1
+      elseif k == -1 then authors = authors + 1
+      elseif k == 0 then articles = articles + 1 end
+    end
+    i = i + 1 + be32(off(m, i + 1))
+  end
+  local b = &batches[(@isize)(Job.LIST_GLOBAL)]
+  b.inflight = b.inflight - 1
+  batches_waiting = true
+  -- the tags, authors and articles, by id
+  batch_rows = true
+  tag_rows:reset(tags)
+  author_rows:reset(authors)
+  article_rows:reset(articles)
+  i = first_row
+  while i < n and m[i] == 'D'_b and message_k(m, i) <= 0 do
+    local row = off(m, i + 5)
+    local k = message_k(m, i)
+    if k == -2 then tag_rows:put(row_id(row), row)
+    elseif k == -1 then author_rows:put(row_id(row), row)
+    else article_rows:put(row_id(row), row) end
+    i = i + 1 + be32(off(m, i + 1))
+  end
+  batch_rows = false
+  -- the requests, in k order
+  local k: int64 = 0
+  local c = head
+  while c ~= nilptr do
+    local next = c.bnext
+    c.bnext = nilptr
+    k = k + 1
+    local row: Bytes = nilptr
+    if i < n and m[i] == 'D'_b and message_k(m, i) == k then
+      row = off(m, i + 5)
+      i = i + 1 + be32(off(m, i + 1))
+    end
+    batch_rows = true
+    pages_respond(c, row)
+    batch_rows = false
+    if c.job == Job.NONE then
+      client_resume(c)
+      client_release(c)
+    end
+    c = next
+  end
+end
+
+-- COMMENTS' answer, m[0, n): first the comment rows (k 0) by article, then a row per request. The comment row
+-- message at i: 'D', its length, the column count, k (length and value), the article id (at i + 23).
+local function comment_article(m: Bytes, i: isize): int64
+  return be_int(off(m, i + 23), 8)
+end
+
+-- a comment row: k, article id, NULL, id, body, created_at, updated_at, author_id, username, bio, image -> Comment
+local function put_page_comment(row: Bytes, fols: *Int8s): void
+  local r: Row
+  row_open(&r, row)
+  row_skip(&r)
+  row_skip(&r)
+  body:str('{"id":')
+  body:int(row_int(&r))
+  local bp, bn = row_col(&r)
+  body:str(',"createdAt":')
+  put_time(&r)
+  body:str(',"updatedAt":')
+  put_time(&r)
+  body:str(',"body":')
+  body:json_string(bp, bn)
+  local author = row_int(&r)
+  body:str(',"author":{"username":')
+  put_text(&r)
+  body:str(',"bio":')
+  put_text_or_null(&r)
+  body:str(',"image":')
+  put_text_or_null(&r)
+  if int8s_has(fols, author) then body:str(',"following":true}}') else body:str(',"following":false}}') end
+end
+
+local function comments_finish(head: *Client, m: Bytes, n: isize): void
+  local first_row = n
+  local articles: isize = 0
+  local last: int64 = 0
+  local i: isize = 0
+  while i < n do
+    local kind = m[i]
+    if kind == 'E'_b then
+      batch_fail(head)
+      return
+    end
+    if kind == 'D'_b then
+      if first_row == n then first_row = i end
+      if be_int(off(m, i + 11), 8) == 0 and comment_article(m, i) ~= last then
+        last = comment_article(m, i)
+        articles = articles + 1
+      end
+    end
+    i = i + 1 + be32(off(m, i + 1))
+  end
+  local b = &batches[(@isize)(Job.COMMENTS)]
+  b.inflight = b.inflight - 1
+  batches_waiting = true
+  -- each article's first comment message
+  article_rows:reset(articles)
+  i = first_row
+  last = 0
+  while i < n and m[i] == 'D'_b and be_int(off(m, i + 11), 8) == 0 do
+    local aid = comment_article(m, i)
+    if aid ~= last then
+      article_rows:put(aid, off(m, i))
+      last = aid
+    end
+    i = i + 1 + be32(off(m, i + 1))
+  end
+  -- the requests, in k order
+  local k: int64 = 0
+  local c = head
+  while c ~= nilptr do
+    local next = c.bnext
+    c.bnext = nilptr
+    k = k + 1
+    local row: Bytes = nilptr
+    if i < n and m[i] == 'D'_b and be_int(off(m, i + 11), 8) == k then
+      row = off(m, i + 5)
+      i = i + 1 + be32(off(m, i + 1))
+    end
+    c.job = Job.NONE
+    if c.closed then
+      -- nothing to answer
+    elseif row == nilptr then
+      respond_error(c, 500, 'internal server error')
+    else
+      batch_rows = true
+      local r: Row
+      row_open(&r, row)
+      local article_missing = row_is_null(&r)
+      local aid = row_int(&r)
+      local p, pn = row_col(&r)
+      local fols = int8s(p, pn)
+      if article_missing then
+        batch_rows = false
+        respond_error(c, 404, 'article not found')
+      else
+        body.len = 0
+        body:str('{"comments":[')
+        local at = article_rows:get(aid)
+        if at ~= nilptr then
+          local j = (@isize)((@usize)(at) - (@usize)(m))
+          local first = true
+          while j < n and m[j] == 'D'_b and be_int(off(m, j + 11), 8) == 0 and comment_article(m, j) == aid do
+            if not first then body:byte(','_b) end
+            first = false
+            put_page_comment(off(m, j + 5), &fols)
+            j = j + 1 + be32(off(m, j + 1))
+          end
+        end
+        body:str(']}')
+        batch_rows = false
+        respond_body(c, 200)
+      end
+    end
+    client_resume(c)
+    client_release(c)
+    c = next
+  end
+end
+
+-- The connection is gone: fail every query on it. A later request reconnects it.
+local function pg_down(pc: *PgConn, message: string): void
+  set_pg_error(message.data, (@isize)(message.size))
+  epoll_ctl(epfd, EPOLL_CTL_DEL, pc.fd, nilptr)
+  PQfinish(pc.conn)   -- closes the socket
+  pc.conn = nilptr
+  pc.out.len = 0
+  pc.input.len = 0
+  pc.scanned = 0
+  pc.inflight = 0
+  pc.watching_out = false
+  local c = pc.head
+  pc.head = nilptr
+  pc.tail = nilptr
+  while c ~= nilptr do
+    local next = c.next
+    c.next = nilptr
+    if is_write(c.job) then
+      local job = c.job
+      c.job = Job.NONE
+      fail_job(c, job, false)
+      client_resume(c)
+      client_release(c)
+    else
+      batch_fail(c)
+    end
+    c = next
+  end
+end
+
+local function pg_send_out(pc: *PgConn): void
+  if pc.out.len > 0 then
+    local w = send(pc.fd, pc.out.data, (@csize)(pc.out.len), MSG_NOSIGNAL)
+    if w < 0 then
+      if C.errno ~= EAGAIN and C.errno ~= EINTR then
+        pg_down(pc, 'lost the connection to Postgres')
+        return
+      end
+      w = 0
+    end
+    drop_front(&pc.out, w)
+  end
+  local want_out = pc.out.len > 0
+  if want_out ~= pc.watching_out then
+    if want_out then watch(pc.fd, EPOLL_CTL_MOD, EPOLLIN | EPOLLOUT, pc) else watch(pc.fd, EPOLL_CTL_MOD, EPOLLIN, pc) end
+    pc.watching_out = want_out
+  end
+end
+
+local SYNC: string = 'S\x00\x00\x00\x04'
+
+-- End of a loop pass: one send() per connection with queries queued.
+local function pg_flush_all(): void
+  local i: isize = 0
+  while i < flush_count do   -- pg_down can queue more onto other connections meanwhile
+    local pc = flush_list[i]
+    pc.flushing = false
+    if pc.conn ~= nilptr and not pc.watching_out then pg_send_out(pc) end
+    i = i + 1
+  end
+  flush_count = 0
+end
+
+-- The oldest query on pc is done; its messages are m[0, n).
+local function pg_complete(pc: *PgConn, m: Bytes, n: isize): void
+  local c = pc.head
+  if c == nilptr then return end
+  pc.head = c.next
+  if pc.head == nilptr then pc.tail = nilptr end
+  c.next = nilptr
+  pc.inflight = pc.inflight - 1
+  if batch_job(c.job) == Job.LIST_GLOBAL then
+    pages_finish(c, m, n)
+    return
+  elseif c.job == Job.COMMENTS then
+    comments_finish(c, m, n)
+    return
+  elseif not is_write(c.job) then
+    batch_finish(c, m, n)
+    return
+  end
+  finish_job(c, m, n)
+  if c.job == Job.NONE then
+    client_resume(c)
+    client_release(c)
+  end
+end
+
+-- Answer every query whose answer has arrived.
+local function pg_read(pc: *PgConn): void
+  local input = &pc.input
+  input:reserve(65536)
+  local n = recv(pc.fd, &input.data[input.len], (@csize)(input.cap - input.len), 0)
+  if n <= 0 then
+    if n < 0 and (C.errno == EAGAIN or C.errno == EINTR) then return end
+    pg_down(pc, 'lost the connection to Postgres')
+    return
+  end
+  input.len = input.len + n
+  local p = input.data
+  local start: isize = 0
+  local i = pc.scanned
+  while input.len - i >= 5 do
+    local size = 1 + be32(off(p, i + 1))
+    if input.len - i < size then break end
+    local kind = p[i]
+    i = i + size
+    if kind == 'Z'_b then
+      pg_complete(pc, off(p, start), i - start)
+      start = i
+    end
+  end
+  drop_front(input, start)
+  pc.scanned = i - start
+end
+
+local function pg_event(pc: *PgConn, events: uint32): void
+  if events & EPOLLOUT ~= 0 then pg_send_out(pc) end
+  if pc.conn ~= nilptr and events & ~EPOLLOUT ~= 0 then pg_read(pc) end
+end
+
+local name_buf: [8]cchar
+
+local function statement_name(i: isize): cstring
+  name_buf[0] = 's'_b
+  name_buf[1] = (@cchar)('0'_b + i // 10)
+  name_buf[2] = (@cchar)('0'_b + i % 10)
+  name_buf[3] = 0
+  return (@cstring)(&name_buf[0])
+end
+
+-- Session settings (the set rust-epoll-theCatWisel uses): one generic plan per statement instead of re-planning
+-- the ones whose custom plans look cheaper, no JIT compiles, no parallel workers for a request's query.
+local SESSION: cstring = '-c plan_cache_mode=force_generic_plan -c jit=off -c max_parallel_workers_per_gather=0 ' ..
+  '-c work_mem=32MB'
+
+local function pg_connect(pc: *PgConn): boolean
+  local keys: [6]cstring = {'dbname', 'connect_timeout', 'sslmode', 'gssencmode', 'options', nilptr}
+  local values: [6]cstring = {db_url, '2', 'disable', 'disable', SESSION, nilptr}
+  local conn = PQconnectdbParams(&keys[0], &values[0], 1)
+  if PQstatus(conn) ~= CONNECTION_OK then
+    local message = PQerrorMessage(conn)
+    set_pg_error(cbytes(message), (@isize)(C.strlen(message)))
+    PQfinish(conn)
+    return false
+  end
+  for i: isize = 0, < N_STATEMENTS do
+    local r = PQprepare(conn, statement_name(i), STATEMENTS[i], 0, nilptr)
+    local ok = PQresultStatus(r) == PGRES_COMMAND_OK
+    if not ok then
+      local message = PQresultErrorMessage(r)
+      set_pg_error(cbytes(message), (@isize)(C.strlen(message)))
+      C.fprintf(C.stderr, 'conduit: prepare s%02d: %s\n', (@cint)(i), message)
+    end
+    PQclear(r)
+    if not ok then
+      PQfinish(conn)
+      return false
+    end
+  end
+  pc.conn = conn
+  pc.fd = PQsocket(conn)
+  fcntl(pc.fd, F_SETFL, fcntl(pc.fd, F_GETFL, 0) | O_NONBLOCK)
+  pc.inflight = 0
+  pc.head = nilptr
+  pc.tail = nilptr
+  pc.out.len = 0
+  pc.input.len = 0
+  pc.scanned = 0
+  pc.watching_out = false
+  watch(pc.fd, EPOLL_CTL_ADD, EPOLLIN, pc)
+  return true
+end
+
+-- Reconnect the connections that are down, at most once a second; stops at the first failure.
+local function pg_reconnect(): void
+  if now - last_reconnect < 1 then return end
+  last_reconnect = now
+  for i: isize = 0, < pg_count do
+    if pgs[i].conn == nilptr and not pg_connect(&pgs[i]) then return end
+  end
+end
+
+-- Writes in flight on one write connection before the next one gets work.
+local PIPELINE_DEPTH: int32 = 8
+
+-- A write connection with room in its pipeline, else the least busy one of its sort.
+local function pg_pick(writes: boolean): *PgConn
+  local least: *PgConn = nilptr
+  for i: isize = 0, < pg_count do
+    local pc = &pgs[i]
+    if pc.conn ~= nilptr and pc.writes == writes then
+      if writes and pc.inflight < PIPELINE_DEPTH then return pc end
+      if least == nilptr or pc.inflight < least.inflight then least = pc end
+    end
+  end
+  return least
+end
+
+local EXECUTE: string = 'E\x00\x00\x00\x09\x00\x00\x00\x00\x00'   -- unnamed portal, all rows
+
+local function pg_enqueue(pc: *PgConn, c: *Client): void
+  c.next = nilptr
+  if pc.tail ~= nilptr then pc.tail.next = c else pc.head = c end
+  pc.tail = c
+  pc.inflight = pc.inflight + 1
+  flush_later(pc)
+end
+
+-- Queue c's write on pc: Bind (text parameters, binary results), Execute, Sync.
+local function pg_queue(pc: *PgConn, c: *Client): void
+  local o = &pc.out
+  o:byte('B'_b)
+  local at = length_slot(o)
+  o:byte(0)                                      -- unnamed portal
+  local name = statement_name((@isize)(c.job) - 1)
+  o:bytes(name, 4)                               -- statement name and its NUL
+  o:str('\x00\x00')                              -- parameter formats: all text
+  o:byte((@byte)(c.nparams >> 8))
+  o:byte((@byte)(c.nparams & 0xFF))
+  o:bytes(c.params.data, c.params.len)
+  o:str('\x00\x01\x00\x01')                      -- result formats: binary for all columns
+  set32(o, at, o.len - at)
+  o:str(EXECUTE)
+  o:str(SYNC)
+  pg_enqueue(pc, c)
+end
+
+-- A read's parameters, in its batch statement: 'i' an int8 array, 't' a text array.
+local function batch_types(job: Job): string
+  if job == Job.USER_GET then return 'i' end
+  if job == Job.LOGIN then return 't' end
+  if job == Job.PROFILE or job == Job.COMMENTS then return 'it' end
+  if job == Job.LIST_GLOBAL then return 'iiiit' end   -- PAGES
+  return ''   -- TAGS
+end
+
+-- Parameter j (from 0) of c: its bytes and length.
+local function param_at(c: *Client, j: int32): (Bytes, int32)
+  local p = c.params.data
+  local i: isize = 0
+  for _: int32 = 1, j do
+    local len = be32(off(p, i))
+    i = i + 4
+    if len > 0 then i = i + len end
+  end
+  return off(p, i + 4), be32(off(p, i))
+end
+
+local function parse_int(p: Bytes, n: int32): int64
+  local v: int64 = 0
+  local i: int32 = 0
+  if n > 0 and p[0] == '-'_b then i = 1 end
+  while i < n do
+    v = v * 10 + (p[i] - '0'_b)
+    i = i + 1
+  end
+  if n > 0 and p[0] == '-'_b then return -v end
+  return v
+end
+
+local function put64(b: *Buf, v: int64): void
+  put32(b, (@isize)(((@uint64)(v) >> 32) & 0xFFFFFFFF))
+  put32(b, (@isize)((@uint64)(v) & 0xFFFFFFFF))
+end
+
+-- PAGES' parameter j for request c: its kind (1 to 6, in Job order), viewer, limit, offset (0 for an article
+-- page) and key (the tag, username or slug; empty otherwise). Ints come as v, the key as p, n.
+local function pages_param(c: *Client, j: int32): (Bytes, int32, int64)
+  local job = c.job
+  if j == 0 then return nilptr, 0, (@int64)(job) - (@int64)(Job.LIST_GLOBAL) + 1 end
+  if j == 1 or ((j == 2 or j == 3) and job ~= Job.ARTICLE) then
+    local p, n = param_at(c, j - 1)
+    return p, n, parse_int(p, n)
+  end
+  if j < 4 then return nilptr, 0, 0 end
+  if job == Job.ARTICLE then
+    local p, n = param_at(c, 1)
+    return p, n, 0
+  end
+  if job == Job.LIST_GLOBAL or job == Job.FEED then return nilptr, 0, 0 end
+  local p, n = param_at(c, 3)
+  return p, n, 0
+end
+
+local INT8_OID: isize = 20
+local TEXT_OID: isize = 25
+
+-- Queue the first batch_max requests of job's batch b on pc as one query: Bind (the parameters as binary arrays,
+-- binary results), Execute, Sync.
+local function batch_queue(pc: *PgConn, b: *Batch, job: Job): void
+  local head = b.head
+  local last = head
+  local count: int32 = 1
+  while count < batch_max and last.bnext ~= nilptr do
+    last = last.bnext
+    count = count + 1
+  end
+  b.head = last.bnext
+  if b.head == nilptr then b.tail = nilptr end
+  last.bnext = nilptr
+  b.n = b.n - count
+  b.inflight = b.inflight + 1
+  b.since = now_ms
+  b.sent = now_ms
+
+  local types = batch_types(job)
+  local o = &pc.out
+  o:byte('B'_b)
+  local at = length_slot(o)
+  o:byte(0)                                      -- unnamed portal
+  local name = statement_name((@isize)(job) - 1)
+  o:bytes(name, 4)                               -- statement name and its NUL
+  if types.size > 0 then o:str('\x00\x01\x00\x01') else o:str('\x00\x00') end   -- parameter formats: binary
+  o:byte(0)
+  o:byte((@byte)(types.size))
+  for j: int32 = 0, < (@int32)(types.size) do
+    local text = types.data[j] == 't'_b
+    local array_at = length_slot(o)
+    put32(o, 1)                                  -- dimensions
+    put32(o, 0)                                  -- no NULLs
+    if text then put32(o, TEXT_OID) else put32(o, INT8_OID) end
+    put32(o, count)
+    put32(o, 1)                                  -- lower bound
+    local c = head
+    while c ~= nilptr do
+      local p: Bytes, len: int32, v: int64 = nilptr, 0, 0
+      if job == Job.LIST_GLOBAL then
+        p, len, v = pages_param(c, j)
+      else
+        p, len = param_at(c, j)
+        if not text then v = parse_int(p, len) end
+      end
+      if text then
+        put32(o, len)
+        if len > 0 then o:bytes(p, len) end
+      else
+        put32(o, 8)
+        put64(o, v)
+      end
+      c = c.bnext
+    end
+    set32(o, array_at, o.len - array_at - 4)
+  end
+  o:str('\x00\x01\x00\x01')                      -- result formats: binary for all columns
+  set32(o, at, o.len - at)
+  o:str(EXECUTE)
+  o:str(SYNC)
+  pg_enqueue(pc, head)
+end
+
+-- End of a loop pass: send each batch that has waited long enough and whose kind has room in flight, to the least
+-- busy read connection.
+local function batch_send_all(): void
+  if not batches_waiting then return end
+  batches_waiting = false
+  for j: isize = 1, N_STATEMENTS do
+    local b = &batches[j]
+    if b.n > 0 and batch_room(b) and (now_ms - b.since >= batch_ms or b.n >= batch_max) then
+      pg_reconnect()
+      local pc = pg_pick(false)
+      if pc == nilptr then pc = pg_pick(true) end
+      if pc ~= nilptr then
+        batch_queue(pc, b, (@Job)(j))
+      else
+        -- Postgres is unreachable: they fail now
+        local head = b.head
+        b.head = nilptr
+        b.tail = nilptr
+        b.n = 0
+        b.inflight = b.inflight + 1   -- as if sent: batch_fail takes it off again
+        batch_fail(head)
+      end
+    end
+    if b.n > 0 then batches_waiting = true end
+  end
+end
+
+-- How long epoll may wait: until the first waiting batch's time is up (-1: no batch waits for time; one waiting
+-- for its kind's batch in flight goes when that one comes back, or when it has run batch_slow_ms).
+local function batch_timeout(): cint
+  if not batches_waiting then return -1 end
+  local due: int64 = -1
+  for j: isize = 1, N_STATEMENTS do
+    local b = &batches[j]
+    if b.n > 0 and b.inflight < batch_inflight then
+      local at = b.since + batch_ms
+      if b.inflight > 0 and b.sent + batch_slow_ms > at then at = b.sent + batch_slow_ms end
+      if due < 0 or at < due then due = at end
+    end
+  end
+  if due < 0 then return -1 end
+  if due <= now_ms then return 0 end
+  return (@cint)(due - now_ms)
+end
+
+-- Is p[0, n) text Postgres takes: UTF-8, without NULs?
+local function text_ok(p: Bytes, n: isize): boolean
+  local i: isize = 0
+  while i < n do
+    local ch = p[i]
+    if ch < 0x80 then
+      if ch == 0 then return false end
+      i = i + 1
+    else
+      local len: isize = 4
+      local cp: uint32 = ch & 0x07
+      local min: uint32 = 0x10000
+      if ch & 0xE0 == 0xC0 then
+        len = 2
+        cp = ch & 0x1F
+        min = 0x80
+      elseif ch & 0xF0 == 0xE0 then
+        len = 3
+        cp = ch & 0x0F
+        min = 0x800
+      elseif ch & 0xF8 ~= 0xF0 then
+        return false
+      end
+      if i + len > n then return false end
+      for j: isize = 1, < len do
+        local d = p[i + j]
+        if d & 0xC0 ~= 0x80 then return false end
+        cp = (cp << 6) | (d & 0x3F)
+      end
+      if cp < min or cp > 0x10FFFF or (cp >= 0xD800 and cp <= 0xDFFF) then return false end
+      i = i + len
+    end
+  end
+  return true
+end
+
+local function params_ok(c: *Client): boolean
+  local p = c.params.data
+  local i: isize = 0
+  for _: int32 = 1, c.nparams do
+    local len = be32(off(p, i))
+    i = i + 4
+    if len > 0 then
+      if not text_ok(off(p, i), len) then return false end
+      i = i + len
+    end
+  end
+  return true
+end
+
+-- The database process and the workers
+
+local in_db = false   -- this is the database process; otherwise a worker, whose database jobs go to it
+local db_link: Link   -- a worker's link to the database process
+
+-- A worker hands a database job to the database process: its client (as the tag the response comes back with),
+-- the job, gzip and close flags, viewer, Bind parameters, token and stash.
+local function forward_job(c: *Client, job: Job): void
+  local o = &db_link.out
+  link_message(&db_link, 8 + 1 + 1 + 8 + 2 + 4 + c.params.len + 2 + c.token.len + 2 + c.stash.len)
+  local tag: uint64 = (@uint64)((@usize)(c))
+  o:bytes(&tag, 8)
+  o:byte((@byte)(job))
+  local flags: byte = 0
+  if c.gzip then flags = flags | 1 end
+  if c.close_after then flags = flags | 2 end
+  o:byte(flags)
+  o:bytes(&c.viewer, 8)
+  o:bytes(&c.nparams, 2)
+  local pn: uint32 = (@uint32)(c.params.len)
+  o:bytes(&pn, 4)
+  if pn > 0 then o:bytes(c.params.data, c.params.len) end
+  local tn: uint16 = (@uint16)(c.token.len)
+  o:bytes(&tn, 2)
+  if tn > 0 then o:bytes(c.token.data, c.token.len) end
+  local sn: uint16 = (@uint16)(c.stash.len)
+  o:bytes(&sn, 2)
+  if sn > 0 then o:bytes(c.stash.data, c.stash.len) end
+end
+
+-- A read joins its kind's batch. A write is queued on a connection, or fails now if Postgres is unreachable. In a
+-- worker, either goes to the database process.
+function start_job(c: *Client, job: Job): void
+  c.job = job
+  if not in_db then
+    forward_job(c, job)
+    return
+  end
+  if not is_write(job) then
+    -- a text Postgres won't take matches nothing: answered as no rows, so it can't fail a batch
+    if not params_ok(c) then
+      finish_job(c, nilptr, 0)
+      return
+    end
+    local b = &batches[(@isize)(batch_job(job))]
+    c.bnext = nilptr
+    if b.tail ~= nilptr then b.tail.bnext = c else b.head = c end
+    b.tail = c
+    if b.n == 0 then b.since = now_ms end
+    b.n = b.n + 1
+    batches_waiting = true
+    return
+  end
+  pg_reconnect()
+  local pc = pg_pick(true)
+  if pc == nilptr then pc = pg_pick(false) end
+  if pc == nilptr then
+    c.job = Job.NONE
+    fail_job(c, job, false)
+    return
+  end
+  pg_queue(pc, c)
+end
+
+-- The database process: a job from a worker, m[0, n), becomes a stand-in client that answers through the link.
+local function db_request(l: *Link, m: Bytes, n: isize): void
+  local c = (@*Client)(C.calloc(1, #Client))
+  c.kind = Kind.CLIENT
+  c.fd = -1
+  c.link = l
+  c.recv_ms = now_ms
+  C.memcpy(&c.tag, m, 8)
+  local job = (@Job)(m[8])
+  c.gzip = m[9] & 1 ~= 0
+  c.close_after = m[9] & 2 ~= 0
+  C.memcpy(&c.viewer, off(m, 10), 8)
+  C.memcpy(&c.nparams, off(m, 18), 2)
+  local pn: uint32
+  C.memcpy(&pn, off(m, 20), 4)
+  local i: isize = 24
+  if pn > 0 then c.params:bytes(off(m, i), pn) end
+  i = i + pn
+  local tn: uint16
+  C.memcpy(&tn, off(m, i), 2)
+  i = i + 2
+  if tn > 0 then c.token:bytes(off(m, i), tn) end
+  i = i + tn
+  local sn: uint16
+  C.memcpy(&sn, off(m, i), 2)
+  i = i + 2
+  if sn > 0 then c.stash:bytes(off(m, i), sn) end
+  start_job(c, job)
+  client_release(c)
+end
+
+-- A worker: the response to one of its clients' jobs, m[0, n) (the tag, then the HTTP response).
+local function worker_response(m: Bytes, n: isize): void
+  local tag: uint64
+  C.memcpy(&tag, m, 8)
+  local c = (@*Client)((@usize)(tag))
+  c.job = Job.NONE
+  c.stash:free()
+  if not c.closed then
+    client_send(c, off(m, 8), n - 8)
+    if c.close_after and c.output.len == 0 then
+      client_close(c)
+    elseif quickack_ms > 0 and now_ms - c.recv_ms > quickack_ms and not c.closed then
+      local zero: cint = 0   -- as in respond
+      setsockopt(c.fd, IPPROTO_TCP, TCP_QUICKACK, &zero, 4)
+    end
+  end
+  client_resume(c)
+  client_release(c)
+end
+
+-- Send what the socket takes (a batch's responses can be megabytes, a socket takes a few hundred kilobytes at a
+-- time): what's sent stays in front until everything is, rather than being moved out of the way every time.
+local function link_send(l: *Link): void
+  if l.out.len > l.out_sent then
+    local w = send(l.fd, &l.out.data[l.out_sent], (@csize)(l.out.len - l.out_sent), MSG_NOSIGNAL)
+    if w < 0 then
+      if C.errno ~= EAGAIN and C.errno ~= EINTR then
+        C.fprintf(C.stderr, 'conduit: lost a link between the processes\n')
+        C.exit(1)
+      end
+      w = 0
+    end
+    l.out_sent = l.out_sent + w
+    if l.out_sent == l.out.len then
+      l.out.len = 0
+      l.out_sent = 0
+    elseif l.out_sent > 1048576 and l.out_sent * 2 > l.out.len then
+      drop_front(&l.out, l.out_sent)
+      l.out_sent = 0
+    end
+  end
+  local want_out = l.out.len > l.out_sent
+  if want_out ~= l.watching_out then
+    if want_out then watch(l.fd, EPOLL_CTL_MOD, EPOLLIN | EPOLLOUT, l) else watch(l.fd, EPOLL_CTL_MOD, EPOLLIN, l) end
+    l.watching_out = want_out
+  end
+end
+
+-- Read what the link has and handle its whole messages.
+local function link_read(l: *Link): void
+  local input = &l.input
+  while true do
+    input:reserve(262144)
+    local room = input.cap - input.len
+    local got = recv(l.fd, &input.data[input.len], (@csize)(room), 0)
+    if got <= 0 then
+      if got < 0 and (C.errno == EAGAIN or C.errno == EINTR) then break end
+      C.fprintf(C.stderr, 'conduit: lost a link between the processes\n')
+      C.exit(1)
+    end
+    input.len = input.len + got
+    if got < room then break end
+  end
+  local i: isize = 0
+  while input.len - i >= 4 do
+    local size: uint32
+    C.memcpy(&size, &input.data[i], 4)
+    if input.len - i - 4 < size then break end
+    if in_db then db_request(l, off(input.data, i + 4), size) else worker_response(off(input.data, i + 4), size) end
+    i = i + 4 + size
+  end
+  drop_front(input, i)
+end
+
+local link_busy = false   -- a link had something to do this loop pass
+
+local function link_event(l: *Link, events: uint32): void
+  link_busy = true
+  if events & EPOLLOUT ~= 0 then link_send(l) end
+  if events & ~EPOLLOUT ~= 0 then link_read(l) end
+end
+
+-- End of a loop pass: one send() per link with messages queued.
+local function links_flush(): void
+  for i: isize = 0, < link_count do
+    local l = &links[i]
+    if l.out.len > l.out_sent and not l.watching_out then link_send(l) end
+  end
+end
+
+-- Requests
+
+local function hex_digit(c: byte): int32
+  if c >= '0'_b and c <= '9'_b then return c - '0'_b end
+  if c >= 'a'_b and c <= 'f'_b then return c - 'a'_b + 10 end
+  if c >= 'A'_b and c <= 'F'_b then return c - 'A'_b + 10 end
+  return -1
+end
+
+-- Percent-decode p[0, n) into out ('+' is a space in query values).
+local function url_decode(p: Bytes, n: isize, plus_space: boolean, out: *Buf): void
+  out.len = 0
+  local i: isize = 0
+  while i < n do
+    local ch = p[i]
+    if ch == '%'_b and i + 2 < n + 0 and hex_digit(p[i + 1]) >= 0 and hex_digit(p[i + 2]) >= 0 then
+      out:byte((@byte)(hex_digit(p[i + 1]) * 16 + hex_digit(p[i + 2])))
+      i = i + 3
+    elseif ch == '+'_b and plus_space then
+      out:byte(' '_b)
+      i = i + 1
+    else
+      out:byte(ch)
+      i = i + 1
+    end
+  end
+end
+
+-- The token of "Authorization: Token <jwt>": the viewer, or -1 if the header is there but invalid. 0 without one.
+local function viewer_of(c: *Client, auth: Bytes, n: isize): int64
+  if auth == nilptr then return 0 end
+  if not starts_with(auth, n, 'Token ') then return -1 end
+  local id = Jwt.verify(off(auth, 6), n - 6, secret, (@float64)(now))
+  if id <= 0 then return -1 end
+  c.token.len = 0
+  c.token:bytes(off(auth, 6), n - 6)
+  return id
+end
+
+-- A list query string's limit and offset (defaults 20 and 0), and the first filter of tag, author, favorited.
+local Query = @record{limit: int64, offset: int64, ok: boolean, filter: int32, value: Bytes, value_len: isize}
+
+local function parse_count(p: Bytes, n: isize): int64
+  if n < 1 or n > 12 then return -1 end
+  local v: int64 = 0
+  for i: isize = 0, < n do
+    if p[i] < '0'_b or p[i] > '9'_b then return -1 end
+    v = v * 10 + (p[i] - '0'_b)
+  end
+  return v
+end
+
+local function parse_query(q: Bytes, n: isize): Query
+  local res: Query = {limit = 20, offset = 0, ok = true, filter = 0}
+  local found: [4]boolean
+  local fstart: [4]isize
+  local flen: [4]isize
+  local i: isize = 0
+  while i < n do
+    local start = i
+    while i < n and q[i] ~= '&'_b do i = i + 1 end
+    local eqi = start
+    while eqi < i and q[eqi] ~= '='_b do eqi = eqi + 1 end
+    local key = off(q, start)
+    local key_len = eqi - start
+    local value = off(q, eqi + 1)
+    local value_len = i - eqi - 1
+    if value_len < 0 then value_len = 0 end
+    if eq(key, key_len, 'limit') then
+      url_decode(value, value_len, true, &scratch2)
+      res.limit = parse_count(scratch2.data, scratch2.len)
+      if res.limit < 1 or res.limit > 100 then res.ok = false end
+    elseif eq(key, key_len, 'offset') then
+      url_decode(value, value_len, true, &scratch2)
+      res.offset = parse_count(scratch2.data, scratch2.len)
+      if res.offset < 0 then res.ok = false end
+    else
+      local f: int32 = 0
+      if eq(key, key_len, 'tag') then f = 1
+      elseif eq(key, key_len, 'author') then f = 2
+      elseif eq(key, key_len, 'favorited') then f = 3 end
+      if f > 0 and not found[f] and value_len > 0 then   -- an empty filter is no filter
+        found[f] = true
+        fstart[f] = eqi + 1
+        flen[f] = value_len
+      end
+    end
+    i = i + 1
+  end
+  for f: int32 = 1, 3 do
+    if found[f] then
+      res.filter = f
+      res.value = off(q, fstart[f])
+      res.value_len = flen[f]
+      break
+    end
+  end
+  return res
+end
+
+-- The JSON body's object under key ({"user": {...}}), as a span, or -1, -1.
+local function body_object(p: Bytes, n: isize, key: string): (isize, isize)
+  if n <= 0 or not Json.valid(p, n) then return -1, -1 end
+  local s, e = Json.find(p, n, key)
+  if s < 0 or p[s] ~= '{'_b then return -1, -1 end
+  return s, e
+end
+
+-- A field of an object span: 1 = a string (decoded into out), 0 = absent or null, -1 = something else.
+local function field(p: Bytes, s: isize, e: isize, key: string, out: *Buf): int32
+  local fs, fe = Json.find(off(p, s), e - s, key)
+  out.len = 0
+  if fs < 0 then return 0 end
+  local q = off(p, s)
+  if q[fs] == 'n'_b then return 0 end
+  if not Json.string(q, fs, fe, out) then return -1 end
+  return 1
+end
+
+local function required(p: Bytes, s: isize, e: isize, key: string, out: *Buf): boolean
+  return field(p, s, e, key, out) == 1 and out.len > 0
+end
+
+local f1: Buf
+local f2: Buf
+local f3: Buf
+local f4: Buf
+local f5: Buf
+
+local function register(c: *Client, p: Bytes, n: isize): void
+  local s, e = body_object(p, n, 'user')
+  if s < 0 or not required(p, s, e, 'username', &f1) or not required(p, s, e, 'email', &f2) or
+     not required(p, s, e, 'password', &f3) then
+    respond_error(c, 422, 'username, email and password are required')
+    return
+  end
+  if f3.len > 72 then   -- bcrypt uses only the first 72 bytes
+    respond_error(c, 422, 'password must be at most 72 bytes')
+    return
+  end
+  params_reset(c)
+  param_text(c, f1.data, f1.len)
+  param_text(c, f2.data, f2.len)
+  c.job = Job.BC_REGISTER
+  bcrypt_request(c, 'H'_b, f3.data, f3.len, nilptr, 0)
+end
+
+local function login(c: *Client, p: Bytes, n: isize): void
+  local s, e = body_object(p, n, 'user')
+  if s < 0 or not required(p, s, e, 'email', &f1) or not required(p, s, e, 'password', &f2) then
+    respond_error(c, 422, 'email and password are required')
+    return
+  end
+  -- the password waits in the stash (NUL-terminated) for the hash the query returns
+  c.stash.len = 0
+  c.stash:bytes(f2.data, f2.len)
+  c.stash:byte(0)
+  params_reset(c)
+  param_text(c, f1.data, f1.len)
+  start_job(c, Job.LOGIN)
+end
+
+local function update_user(c: *Client, p: Bytes, n: isize): void
+  local s, e = body_object(p, n, 'user')
+  if s < 0 then
+    respond_error(c, 422, 'user is required')
+    return
+  end
+  local email = field(p, s, e, 'email', &f1)
+  local username = field(p, s, e, 'username', &f2)
+  local bio = field(p, s, e, 'bio', &f3)
+  local image = field(p, s, e, 'image', &f4)
+  local password = field(p, s, e, 'password', &f5)
+  if email < 0 or username < 0 or bio < 0 or image < 0 or password < 0 or (email == 1 and f1.len == 0) or
+     (username == 1 and f2.len == 0) or (password == 1 and (f5.len == 0 or f5.len > 72)) then
+    respond_error(c, 422, 'invalid user fields')
+    return
+  end
+  params_reset(c)
+  param_int(c, c.viewer)
+  if email == 1 then param_text(c, f1.data, f1.len) else param_null(c) end
+  if username == 1 then param_text(c, f2.data, f2.len) else param_null(c) end
+  if bio == 1 then param_text(c, f3.data, f3.len) else param_null(c) end
+  if image == 1 then param_text(c, f4.data, f4.len) else param_null(c) end
+  if password == 1 then
+    c.job = Job.BC_UPDATE
+    bcrypt_request(c, 'H'_b, f5.data, f5.len, nilptr, 0)
+  else
+    param_null(c)
+    start_job(c, Job.USER_UPDATE)
+  end
+end
+
+local function create_article(c: *Client, p: Bytes, n: isize): void
+  local s, e = body_object(p, n, 'article')
+  if s < 0 or not required(p, s, e, 'title', &f1) or not required(p, s, e, 'description', &f2) or
+     not required(p, s, e, 'body', &f3) then
+    respond_error(c, 422, 'title, description and body are required')
+    return
+  end
+  -- tagList: optional, an array of non-empty strings, passed on as JSON
+  f4.len = 0
+  f4:byte('['_b)
+  local q = off(p, s)
+  local ts, te = Json.find(q, e - s, 'tagList')
+  if ts >= 0 and q[ts] ~= 'n'_b then
+    if q[ts] ~= '['_b then
+      respond_error(c, 422, 'tagList must be an array of strings')
+      return
+    end
+    local i = ts + 1
+    local first = true
+    while true do
+      local es, ee = Json.next_element(q, i, te)
+      if es < 0 then break end
+      f5.len = 0
+      if not Json.string(q, es, ee, &f5) or f5.len == 0 then
+        respond_error(c, 422, 'tagList must be an array of non-empty strings')
+        return
+      end
+      if not first then f4:byte(','_b) end
+      first = false
+      f4:json_string(f5.data, f5.len)
+      i = ee
+    end
+  end
+  f4:byte(']'_b)
+  params_reset(c)
+  param_int(c, c.viewer)
+  param_text(c, f1.data, f1.len)
+  param_text(c, f2.data, f2.len)
+  param_text(c, f3.data, f3.len)
+  param_text(c, f4.data, f4.len)
+  start_job(c, Job.ARTICLE_CREATE)
+end
+
+local function update_article(c: *Client, slug: *Buf, p: Bytes, n: isize): void
+  local s, e = body_object(p, n, 'article')
+  if s < 0 then
+    respond_error(c, 422, 'article is required')
+    return
+  end
+  local title = field(p, s, e, 'title', &f1)
+  local description = field(p, s, e, 'description', &f2)
+  local text = field(p, s, e, 'body', &f3)
+  if title < 0 or description < 0 or text < 0 or (title == 1 and f1.len == 0) or
+     (description == 1 and f2.len == 0) or (text == 1 and f3.len == 0) then
+    respond_error(c, 422, 'invalid article fields')
+    return
+  end
+  params_reset(c)
+  param_text(c, slug.data, slug.len)
+  if title == 1 then param_text(c, f1.data, f1.len) else param_null(c) end
+  if description == 1 then param_text(c, f2.data, f2.len) else param_null(c) end
+  if text == 1 then param_text(c, f3.data, f3.len) else param_null(c) end
+  param_int(c, c.viewer)
+  start_job(c, Job.ARTICLE_UPDATE)
+end
+
+local function add_comment(c: *Client, slug: *Buf, p: Bytes, n: isize): void
+  local s, e = body_object(p, n, 'comment')
+  if s < 0 or not required(p, s, e, 'body', &f1) then
+    respond_error(c, 422, 'body is required')
+    return
+  end
+  params_reset(c)
+  param_text(c, slug.data, slug.len)
+  param_int(c, c.viewer)
+  param_text(c, f1.data, f1.len)
+  start_job(c, Job.COMMENT_ADD)
+end
+
+local function list_articles(c: *Client, query: Bytes, query_len: isize, feed: boolean): void
+  local q = parse_query(query, query_len)
+  if not q.ok then
+    respond_error(c, 422, 'limit must be 1-100 and offset at least 0')
+    return
+  end
+  params_reset(c)
+  param_int(c, c.viewer)
+  param_int(c, q.limit)
+  param_int(c, q.offset)
+  if feed then
+    start_job(c, Job.FEED)
+  elseif q.filter == 0 then
+    start_job(c, Job.LIST_GLOBAL)
+  else
+    url_decode(q.value, q.value_len, true, &scratch)
+    param_text(c, scratch.data, scratch.len)
+    if q.filter == 1 then start_job(c, Job.LIST_TAG)
+    elseif q.filter == 2 then start_job(c, Job.LIST_AUTHOR)
+    else start_job(c, Job.LIST_FAVORITED) end
+  end
+end
+
+local slug_buf: Buf
+
+-- Route a request. path is the target up to '?', query what follows it.
+local function route(c: *Client, method: Bytes, method_len: isize, path: Bytes, path_len: isize, query: Bytes,
+                     query_len: isize, auth: Bytes, auth_len: isize, req_body: Bytes, req_body_len: isize): void
+  local get = eq(method, method_len, 'GET')
+  local post = eq(method, method_len, 'POST')
+  local put = eq(method, method_len, 'PUT')
+  local delete = eq(method, method_len, 'DELETE')
+  if not starts_with(path, path_len, '/api/') then
+    respond_error(c, 404, 'not found')
+    return
+  end
+  local rest = off(path, 5)
+  local rest_len = path_len - 5
+
+  -- no auth: tags, register, login
+  if eq(rest, rest_len, 'tags') and get then
+    params_reset(c)
+    start_job(c, Job.TAGS)
+    return
+  elseif eq(rest, rest_len, 'users') and post then
+    register(c, req_body, req_body_len)
+    return
+  elseif eq(rest, rest_len, 'users/login') and post then
+    login(c, req_body, req_body_len)
+    return
+  end
+
+  -- every other endpoint: a header that is there must hold a valid token
+  local viewer = viewer_of(c, auth, auth_len)
+  if viewer < 0 then
+    respond_error(c, 401, 'invalid token')
+    return
+  end
+  c.viewer = viewer
+
+  if eq(rest, rest_len, 'user') and (get or put) then
+    if viewer == 0 then
+      respond_error(c, 401, 'token required')
+      return
+    end
+    if get then
+      params_reset(c)
+      param_int(c, viewer)
+      start_job(c, Job.USER_GET)
+    else
+      update_user(c, req_body, req_body_len)
+    end
+    return
+  end
+
+  -- profiles/:username[/follow]
+  if starts_with(rest, rest_len, 'profiles/') then
+    local seg = off(rest, 9)
+    local seg_len = rest_len - 9
+    local follow = false
+    local slash: isize = 0
+    while slash < seg_len and seg[slash] ~= '/'_b do slash = slash + 1 end
+    if slash < seg_len then
+      if not eq(off(seg, slash), seg_len - slash, '/follow') then
+        respond_error(c, 404, 'not found')
+        return
+      end
+      follow = true
+    end
+    if slash == 0 then
+      respond_error(c, 404, 'not found')
+      return
+    end
+    url_decode(seg, slash, false, &scratch)
+    if not follow and get then
+      params_reset(c)
+      param_int(c, viewer)
+      param_text(c, scratch.data, scratch.len)
+      start_job(c, Job.PROFILE)
+      return
+    elseif follow and (post or delete) then
+      if viewer == 0 then
+        respond_error(c, 401, 'token required')
+        return
+      end
+      params_reset(c)
+      param_int(c, viewer)
+      param_text(c, scratch.data, scratch.len)
+      if post then start_job(c, Job.FOLLOW) else start_job(c, Job.UNFOLLOW) end
+      return
+    end
+    respond_error(c, 404, 'not found')
+    return
+  end
+
+  -- articles
+  if eq(rest, rest_len, 'articles') then
+    if get then
+      list_articles(c, query, query_len, false)
+      return
+    elseif post then
+      if viewer == 0 then
+        respond_error(c, 401, 'token required')
+        return
+      end
+      create_article(c, req_body, req_body_len)
+      return
+    end
+  elseif eq(rest, rest_len, 'articles/feed') and get then
+    if viewer == 0 then
+      respond_error(c, 401, 'token required')
+      return
+    end
+    list_articles(c, query, query_len, true)
+    return
+  elseif starts_with(rest, rest_len, 'articles/') then
+    local seg = off(rest, 9)
+    local seg_len = rest_len - 9
+    local slash: isize = 0
+    while slash < seg_len and seg[slash] ~= '/'_b do slash = slash + 1 end
+    if slash == 0 then
+      respond_error(c, 404, 'not found')
+      return
+    end
+    url_decode(seg, slash, false, &slug_buf)
+    local tail = off(seg, slash)
+    local tail_len = seg_len - slash
+    if tail_len == 0 then
+      if get then
+        params_reset(c)
+        param_int(c, viewer)
+        param_text(c, slug_buf.data, slug_buf.len)
+        start_job(c, Job.ARTICLE)
+        return
+      elseif put or delete then
+        if viewer == 0 then
+          respond_error(c, 401, 'token required')
+          return
+        end
+        if put then
+          update_article(c, &slug_buf, req_body, req_body_len)
+        else
+          params_reset(c)
+          param_text(c, slug_buf.data, slug_buf.len)
+          param_int(c, viewer)
+          start_job(c, Job.ARTICLE_DELETE)
+        end
+        return
+      end
+    elseif eq(tail, tail_len, '/favorite') and (post or delete) then
+      if viewer == 0 then
+        respond_error(c, 401, 'token required')
+        return
+      end
+      params_reset(c)
+      param_int(c, viewer)
+      param_text(c, slug_buf.data, slug_buf.len)
+      if post then start_job(c, Job.FAVORITE) else start_job(c, Job.UNFAVORITE) end
+      return
+    elseif eq(tail, tail_len, '/comments') and (get or post) then
+      if get then
+        params_reset(c)
+        param_int(c, viewer)
+        param_text(c, slug_buf.data, slug_buf.len)
+        start_job(c, Job.COMMENTS)
+      else
+        if viewer == 0 then
+          respond_error(c, 401, 'token required')
+          return
+        end
+        add_comment(c, &slug_buf, req_body, req_body_len)
+      end
+      return
+    elseif starts_with(tail, tail_len, '/comments/') and delete then
+      if viewer == 0 then
+        respond_error(c, 401, 'token required')
+        return
+      end
+      local id = parse_id(off(tail, 10), tail_len - 10)
+      if id < 0 then
+        respond_error(c, 404, 'comment not found')
+        return
+      end
+      params_reset(c)
+      param_int(c, id)
+      param_text(c, slug_buf.data, slug_buf.len)
+      param_int(c, viewer)
+      start_job(c, Job.COMMENT_DELETE)
+      return
+    end
+  end
+  respond_error(c, 404, 'not found')
+end
+
+-- HTTP/1.1
+
+local function parse_length(p: Bytes, n: isize): isize
+  if n < 1 or n > 9 then return -1 end
+  local v: isize = 0
+  for i: isize = 0, < n do
+    if p[i] < '0'_b or p[i] > '9'_b then return -1 end
+    v = v * 10 + (p[i] - '0'_b)
+  end
+  return v
+end
+
+local function header_end(p: Bytes, n: isize): isize
+  local i: isize = 3
+  while i < n do
+    if p[i] == '\n'_b and p[i - 1] == '\r'_b and p[i - 2] == '\n'_b and p[i - 3] == '\r'_b then return i + 1 end
+    i = i + 1
+  end
+  return -1
+end
+
+local CONTINUE: string = 'HTTP/1.1 100 Continue\r\n\r\n'
+
+-- Handle the request at the start of p[0, n): returns its length, or 0 if it isn't all here yet.
+local function handle_request(c: *Client, p: Bytes, n: isize): isize
+  local head = header_end(p, n)
+  if head < 0 then
+    if n > 65536 then client_close(c) end
+    return 0
+  end
+  -- request line: METHOD SP target SP version
+  local i: isize = 0
+  while p[i] ~= ' '_b and p[i] ~= '\r'_b do i = i + 1 end
+  local method_len = i
+  local path_start = i + 1
+  i = path_start
+  while p[i] ~= ' '_b and p[i] ~= '?'_b and p[i] ~= '\r'_b do i = i + 1 end
+  local path_len = i - path_start
+  local query_start = i
+  local query_len: isize = 0
+  if p[i] == '?'_b then
+    query_start = i + 1
+    i = query_start
+    while p[i] ~= ' '_b and p[i] ~= '\r'_b do i = i + 1 end
+    query_len = i - query_start
+  end
+  local http10 = p[i] == ' '_b and starts_with((@Bytes)(&p[i + 1]), head - i - 1, 'HTTP/1.0')
+  while p[i] ~= '\n'_b do i = i + 1 end
+  i = i + 1
+  -- headers
+  local content_length: isize = 0
+  local auth: Bytes = nilptr
+  local auth_len: isize = 0
+  local gzip = false
+  local close_requested = false
+  local keep_alive = false
+  local expect_continue = false
+  while i < head - 2 do
+    local line = i
+    while p[i] ~= '\r'_b do i = i + 1 end
+    local line_stop = i
+    i = i + 2
+    local colon = line
+    while colon < line_stop and p[colon] ~= ':'_b do colon = colon + 1 end
+    if colon < line_stop then
+      local name = (@Bytes)(&p[line])
+      local name_len = colon - line
+      local v = colon + 1
+      while v < line_stop and (p[v] == ' '_b or p[v] == '\t'_b) do v = v + 1 end
+      local v_stop = line_stop
+      while v_stop > v and (p[v_stop - 1] == ' '_b or p[v_stop - 1] == '\t'_b) do v_stop = v_stop - 1 end
+      local value = (@Bytes)(&p[v])
+      local value_len = v_stop - v
+      if ieq(name, name_len, 'content-length') then
+        content_length = parse_length(value, value_len)
+      elseif ieq(name, name_len, 'authorization') then
+        auth = value
+        auth_len = value_len
+      elseif ieq(name, name_len, 'accept-encoding') then
+        gzip = contains(value, value_len, 'gzip')
+      elseif ieq(name, name_len, 'connection') then
+        close_requested = contains(value, value_len, 'close')
+        keep_alive = contains(value, value_len, 'keep-alive')
+      elseif ieq(name, name_len, 'expect') then
+        expect_continue = ieq(value, value_len, '100-continue')
+      elseif ieq(name, name_len, 'transfer-encoding') then
+        content_length = -1   -- chunked request bodies aren't supported
+      end
+    end
+  end
+  if content_length < 0 or content_length > 1048576 then
+    c.close_after = true
+    respond_error(c, 422, 'bad request')
+    return n
+  end
+  local total = head + content_length
+  if n < total then
+    if expect_continue and not c.continue_sent then
+      c.continue_sent = true
+      client_send(c, CONTINUE.data, (@isize)(CONTINUE.size))
+    end
+    return 0
+  end
+  c.continue_sent = false
+  c.close_after = close_requested or (http10 and not keep_alive)
+  c.gzip = gzip and use_gzip
+  route(c, p, method_len, off(p, path_start), path_len, off(p, query_start), query_len, auth, auth_len,
+    off(p, head), content_length)
+  if c.job == Job.NONE then c.stash:free() end
+  return total
+end
+
+-- Handle the complete requests at the start of p[0, n), one at a time: stop at one that waits.
+-- Returns how many bytes were used.
+local function handle_requests(c: *Client, p: Bytes, n: isize): isize
+  local used: isize = 0
+  while used < n and not c.closed and c.job == Job.NONE and c.output.len == 0 do
+    local r = handle_request(c, (@Bytes)(&p[used]), n - used)
+    if r == 0 then break end
+    used = used + r
+  end
+  return used
+end
+
+-- After a response: go on with the requests that arrived meanwhile.
+function client_resume(c: *Client): void
+  if c.closed or c.job ~= Job.NONE or c.output.len > 0 or c.input.len == 0 then return end
+  local used = handle_requests(c, c.input.data, c.input.len)
+  if not c.closed then consume(&c.input, used) end
+end
+
+local function client_readable(c: *Client): void
+  local n = recv(c.fd, &readbuf[0], #readbuf, 0)
+  if n <= 0 then
+    if n < 0 and (C.errno == EAGAIN or C.errno == EINTR) then return end
+    client_close(c)
+    return
+  end
+  c.recv_ms = now_ms
+  if c.input.len == 0 and c.job == Job.NONE and c.output.len == 0 then
+    local used = handle_requests(c, (@Bytes)(&readbuf[0]), n)
+    if not c.closed and used < n then c.input:bytes(&readbuf[used], n - used) end
+  elseif c.input.len + n > 2 * 1048576 then
+    client_close(c)
+  else
+    c.input:bytes(&readbuf[0], n)
+    client_resume(c)
+  end
+end
+
+local function client_writable(c: *Client): void
+  if c.output.len > 0 then
+    local w = send(c.fd, c.output.data, (@csize)(c.output.len), MSG_NOSIGNAL)
+    if w < 0 then
+      if C.errno ~= EAGAIN and C.errno ~= EINTR then client_close(c) end
+      return
+    end
+    consume(&c.output, w)
+    if c.output.len > 0 then return end
+  end
+  if c.watching_out then
+    watch(c.fd, EPOLL_CTL_MOD, EPOLLIN, c)
+    c.watching_out = false
+  end
+  if c.close_after and c.job == Job.NONE then
+    client_close(c)
+  else
+    client_resume(c)
+  end
+end
+
+local function accept_clients(l: *Listener): void
+  local one: cint = 1
+  for _: int32 = 1, 256 do
+    local fd = accept4(l.fd, nilptr, nilptr, SOCK_NONBLOCK | SOCK_CLOEXEC)
+    if fd < 0 then return end
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, 4)
+    local c = (@*Client)(C.calloc(1, #Client))
+    if c == nilptr then
+      close(fd)
+      return
+    end
+    c.kind = Kind.CLIENT
+    c.fd = fd
+    watch(fd, EPOLL_CTL_ADD, EPOLLIN, c)
+  end
+end
+
+local function env_int(name: cstring, default: cint): cint
+  local v = C.getenv(name)
+  if v == nilptr or cbytes(v)[0] == 0 then return default end
+  return C.atoi(v)
+end
+
+local function clock_ms(): int64
+  local ts: C.timespec
+  clock_gettime(CLOCK_MONOTONIC, &ts)
+  return ts.tv_sec * 1000 + ts.tv_nsec // 1000000
+end
+
+-- A listening socket on host:port, one of a SO_REUSEPORT group (one per worker): the kernel spreads connections
+-- over them. QUICKACK=1 keeps the kernel's quick ACKs; DEFER_ACCEPT (seconds, 0 = off) is how long accept waits
+-- for data.
+global function open_listener(host: cstring, port: cstring): cint
+  local hints: addrinfo
+  hints.ai_family = AF_UNSPEC
+  hints.ai_socktype = SOCK_STREAM
+  hints.ai_flags = AI_PASSIVE
+  local res: *addrinfo
+  local rc = getaddrinfo(host, port, &hints, &res)
+  if rc ~= 0 then
+    C.fprintf(C.stderr, 'conduit: %s:%s: %s\n', host, port, gai_strerror(rc))
+    C.exit(1)
+  end
+  local fd = socket(res.ai_family, res.ai_socktype | SOCK_NONBLOCK | SOCK_CLOEXEC, res.ai_protocol)
+  local one: cint = 1
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, 4)
+  setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, 4)
+  if fd < 0 or bind(fd, res.ai_addr, res.ai_addrlen) ~= 0 or listen(fd, 65535) ~= 0 then
+    C.perror('conduit: listen')
+    C.exit(1)
+  end
+  freeaddrinfo(res)
+  if env_int('QUICKACK', 0) == 0 then
+    -- Accepted sockets start in delayed-ACK mode, so a connection's first request gets no ACK of its own: it rides
+    -- on the response. Only after listen(), which resets the listener's ACK state. (From asm-epoll-nickita-khylkouski.)
+    local zero: cint = 0
+    setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &zero, 4)
+  end
+  -- accept() returns once the first request is in: no wake-up for a connection that has nothing to read yet
+  local defer_s = env_int('DEFER_ACCEPT', 1)
+  if defer_s > 0 then setsockopt(fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &defer_s, 4) end
+  return fd
+end
+
+local function listen_on(l: *Listener, fd: cint): void
+  l.kind = Kind.LISTENER
+  l.fd = fd
+  watch(fd, EPOLL_CTL_ADD, EPOLLIN, l)
+end
+
+-- Settings and buffers both kinds of process use, and the socket to the bcrypt helpers (bc_addr), bound to an
+-- address the kernel picks so that they can answer.
+local function process_init(key: string, bc_addr: *sockaddr_un, bc_len: cuint): void
+  bcrypt.kind = Kind.BCRYPT
+  bcrypt.fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0)
+  local auto: sockaddr_un
+  auto.sun_family = (@cushort)(AF_UNIX)
+  if bcrypt.fd < 0 or bind(bcrypt.fd, (@*sockaddr)(&auto), 2) ~= 0 or
+     connect(bcrypt.fd, (@*sockaddr)(bc_addr), bc_len) ~= 0 then
+    C.perror('conduit: bcrypt socket')
+    C.exit(1)
+  end
+  secret = key
+  now = C.time(nilptr)
+  now_ms = clock_ms()
+  quickack_ms = env_int('QUICKACK_MS', 25)
+  use_gzip = env_int('GZIP', 0) ~= 0
+  epfd = epoll_create1(0)
+  gzip_level_buf = C.malloc((@csize)(ISAL_DEF_LVL0_DEFAULT))
+  watch(bcrypt.fd, EPOLL_CTL_ADD, EPOLLIN, &bcrypt)
+end
+
+local function link_open(l: *Link, fd: cint): void
+  l.kind = Kind.LINK
+  l.fd = fd
+  fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK)
+  local size: cint = 4194304   -- as much as the kernel allows of it
+  setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, 4)
+  setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, 4)
+  watch(fd, EPOLL_CTL_ADD, EPOLLIN, l)
+end
+
+-- The database process: the Postgres connections (pool), the batches, and a link to each worker (link_fds).
+global function serve_db(url: cstring, key: string, link_fds: *[0]cint, nlinks: isize, pool: isize, batch_us: cuint,
+                         bc_addr: *sockaddr_un, bc_len: cuint): void
+  in_db = true
+  process_init(key, bc_addr, bc_len)
+  db_url = url
+  batch_inflight = env_int('BATCH_INFLIGHT', 3)
+  batch_ms = env_int('BATCH_MS', 20)
+  batch_slow_ms = env_int('BATCH_SLOW_MS', 100)
+  batch_max = env_int('BATCH_MAX', 4000)
+  pg_count = pool
+  pgs = (@*[0]PgConn)(C.calloc((@csize)(pool), #PgConn))
+  last_reconnect = now
+  -- a quarter of the connections (at least one) take the writes
+  local writers = pool // 4
+  if writers < 1 then writers = 1 end
+  for i: isize = 0, < pg_count do
+    pgs[i].kind = Kind.PG
+    pgs[i].writes = i >= pool - writers
+  end
+  for i: isize = 0, < pg_count do
+    if not pg_connect(&pgs[i]) then
+      C.fprintf(C.stderr, 'conduit: Postgres: %s\n', (@cstring)(pg_error.data))
+      break
+    end
+  end
+  links = (@*[0]Link)(C.calloc((@csize)(nlinks), #Link))
+  link_count = nlinks
+  for i: isize = 0, < nlinks do link_open(&links[i], link_fds[i]) end
+
+  local events: [1024]epoll_event
+  while true do
+    local k = epoll_wait(epfd, &events[0], 1024, batch_timeout())
+    now = C.time(nilptr)
+    now_ms = clock_ms()
+    for i: cint = 0, < k do
+      local ev = events[i].events
+      local ptr = events[i].data.ptr
+      local kind = $(@*Kind)(ptr)
+      if kind == Kind.PG then
+        pg_event((@*PgConn)(ptr), ev)
+      elseif kind == Kind.LINK then
+        link_event((@*Link)(ptr), ev)
+      elseif kind == Kind.BCRYPT then
+        bcrypt_event(ev)
+      end
+    end
+    batch_send_all()
+    pg_flush_all()
+    links_flush()
+    free_clients()
+    -- after a pass with few events, wait a moment so the next one handles more per wake-up (not while data flows
+    -- between the processes: each pass moves only a socket's worth)
+    if k > 0 and k < 32 and batch_us > 0 and not link_busy then usleep(batch_us) end
+    link_busy = false
+  end
+end
+
+-- One worker: fd_a and fd_b (-1 for none) are its listening sockets, opened by the parent, link_fd its link to the
+-- database process.
+global function serve(key: string, fd_a: cint, fd_b: cint, link_fd: cint, batch_us: cuint, bc_addr: *sockaddr_un,
+                      bc_len: cuint): void
+  process_init(key, bc_addr, bc_len)
+  links = (@*[0]Link)(&db_link)
+  link_count = 1
+  link_open(&db_link, link_fd)
+  listen_on(&listeners[0], fd_a)
+  if fd_b >= 0 then listen_on(&listeners[1], fd_b) end
+
+  local events: [1024]epoll_event
+  while true do
+    local k = epoll_wait(epfd, &events[0], 1024, -1)
+    now = C.time(nilptr)
+    now_ms = clock_ms()
+    for i: cint = 0, < k do
+      local ev = events[i].events
+      local ptr = events[i].data.ptr
+      local kind = $(@*Kind)(ptr)
+      if kind == Kind.CLIENT then
+        local c = (@*Client)(ptr)
+        if not c.closed then
+          if ev & EPOLLOUT ~= 0 then client_writable(c) end
+          if not c.closed and ev & ~EPOLLOUT ~= 0 then client_readable(c) end   -- errors show up in recv
+          client_release(c)
+        end
+      elseif kind == Kind.LINK then
+        link_event((@*Link)(ptr), ev)
+      elseif kind == Kind.BCRYPT then
+        bcrypt_event(ev)
+      else
+        accept_clients((@*Listener)(ptr))
+      end
+    end
+    links_flush()
+    free_clients()
+    -- after a pass with few events, wait a moment so the next one handles more per wake-up (not while data flows
+    -- between the processes: each pass moves only a socket's worth)
+    if k > 0 and k < 32 and batch_us > 0 and not link_busy then usleep(batch_us) end
+    link_busy = false
+  end
+end

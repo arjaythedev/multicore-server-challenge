@@ -1,0 +1,139 @@
+-- HS256 JWTs. Verify a presented token (signature by OpenSSL's HMAC, compared in constant time; alg HS256; exp
+-- required, nbf if present; sub a user id in decimal), and sign new ones with {"sub": "<id>", "iat", "exp"}.
+require 'json'
+
+global Jwt = @record{}
+
+local B64URL: string = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
+
+local function b64_value(c: byte): int32
+  if c >= 'A'_b and c <= 'Z'_b then return c - 'A'_b end
+  if c >= 'a'_b and c <= 'z'_b then return c - 'a'_b + 26 end
+  if c >= '0'_b and c <= '9'_b then return c - '0'_b + 52 end
+  if c == '-'_b then return 62 end
+  if c == '_'_b then return 63 end
+  return -1
+end
+
+-- base64url without padding, as JWTs use it
+local function b64url_decode(p: Bytes, n: isize, out: *Buf): boolean
+  local acc: uint32 = 0
+  local bits: int32 = 0
+  for i: isize = 0, < n do
+    local v = b64_value(p[i])
+    if v < 0 then return false end
+    acc = (acc << 6) | (@uint32)(v)
+    bits = bits + 6
+    if bits >= 8 then
+      bits = bits - 8
+      out:byte((@byte)((acc >> bits) & 0xFF))
+    end
+  end
+  return bits < 6   -- a single leftover character can't encode a byte
+end
+
+local function b64url_encode(p: Bytes, n: isize, out: *Buf): void
+  out:reserve(n * 4 // 3 + 4)
+  local acc: uint32 = 0
+  local bits: int32 = 0
+  for i: isize = 0, < n do
+    acc = (acc << 8) | p[i]
+    bits = bits + 8
+    while bits >= 6 do
+      bits = bits - 6
+      out.data[out.len] = B64URL.data[(acc >> bits) & 63]
+      out.len = out.len + 1
+    end
+  end
+  if bits > 0 then
+    out.data[out.len] = B64URL.data[(acc << (6 - bits)) & 63]
+    out.len = out.len + 1
+  end
+end
+
+-- A positive integer of at most 2^53 as plain digits: user ids in tokens, comment ids in paths. -1 otherwise.
+global function parse_id(p: Bytes, n: isize): int64
+  if n < 1 or n > 16 then return -1 end
+  local v: int64 = 0
+  for i: isize = 0, < n do
+    local c = p[i]
+    if c < '0'_b or c > '9'_b then return -1 end
+    v = v * 10 + (c - '0'_b)
+  end
+  if v < 1 or v > 9007199254740992 then return -1 end
+  return v
+end
+
+local HS256: string = '"HS256"'
+local scratch: Buf
+local sub_buf: Buf
+local mac_text: Buf
+
+-- Verify token p[0, n): the user id, or -1.
+function Jwt.verify(p: Bytes, n: isize, secret: string, now: float64): int64
+  local dot1: isize, dot2: isize = -1, -1
+  for i: isize = 0, < n do
+    if p[i] == '.'_b then
+      if dot1 < 0 then dot1 = i elseif dot2 < 0 then dot2 = i else return -1 end
+    end
+  end
+  if dot2 < 0 then return -1 end
+
+  -- signature over "header.payload"
+  local mac: [32]byte
+  local mac_len: cuint = 0
+  HMAC(EVP_sha256(), secret.data, (@cint)(secret.size), p, (@csize)(dot2), &mac[0], &mac_len)
+  mac_text.len = 0
+  b64url_encode(&mac[0], 32, &mac_text)
+  if n - dot2 - 1 ~= mac_text.len or CRYPTO_memcmp(mac_text.data, &p[dot2 + 1], (@csize)(mac_text.len)) ~= 0 then
+    return -1
+  end
+
+  -- header: alg must be HS256
+  scratch.len = 0
+  if not b64url_decode(p, dot1, &scratch) or not Json.valid(scratch.data, scratch.len) then return -1 end
+  local s, e = Json.find(scratch.data, scratch.len, 'alg')
+  if not (e - s == 7 and C.memcmp(&scratch.data[s], HS256.data, 7) == 0) then return -1 end
+
+  -- payload: exp required, nbf if present, sub the user id as a decimal string
+  scratch.len = 0
+  if not b64url_decode(&p[dot1 + 1], dot2 - dot1 - 1, &scratch) or not Json.valid(scratch.data, scratch.len) then
+    return -1
+  end
+  s, e = Json.find(scratch.data, scratch.len, 'exp')
+  local has_exp, exp = Json.number(scratch.data, s, e)
+  if not has_exp or exp <= now then return -1 end
+  s, e = Json.find(scratch.data, scratch.len, 'nbf')
+  if s >= 0 then
+    local is_number, nbf = Json.number(scratch.data, s, e)
+    if not is_number or nbf > now then return -1 end
+  end
+  sub_buf.len = 0
+  s, e = Json.find(scratch.data, scratch.len, 'sub')
+  if not Json.string(scratch.data, s, e, &sub_buf) then return -1 end
+  return parse_id(sub_buf.data, sub_buf.len)
+end
+
+local HEADER: string = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9'   -- {"alg":"HS256","typ":"JWT"}
+local THIRTY_DAYS: int64 = 2592000
+
+-- A new token for user id, valid for 30 days from now, appended to out.
+function Jwt.sign(id: int64, now: int64, secret: string, out: *Buf): void
+  local start = out.len
+  out:str(HEADER)
+  out:byte('.'_b)
+  scratch.len = 0
+  scratch:str('{"sub":"')
+  scratch:int(id)
+  scratch:str('","iat":')
+  scratch:int(now)
+  scratch:str(',"exp":')
+  scratch:int(now + THIRTY_DAYS)
+  scratch:byte('}'_b)
+  b64url_encode(scratch.data, scratch.len, out)
+  local mac: [32]byte
+  local mac_len: cuint = 0
+  HMAC(EVP_sha256(), secret.data, (@cint)(secret.size), &out.data[start], (@csize)(out.len - start), &mac[0], &mac_len)
+  out:byte('.'_b)
+  b64url_encode(&mac[0], 32, out)
+end

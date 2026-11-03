@@ -1,0 +1,128 @@
+-- A growable byte buffer on malloc (the program is built without Nelua's GC), and the JSON pieces written into it.
+require 'c'
+
+global Buf = @record{data: Bytes, len: isize, cap: isize}
+
+function Buf:reserve(extra: isize): void
+  local need = self.len + extra
+  if need <= self.cap then return end
+  local cap = self.cap * 2
+  if cap < need then cap = need end
+  if cap < 64 then cap = 64 end
+  local p = C.realloc(self.data, (@csize)(cap))
+  if p == nilptr then C.abort() end
+  self.data = (@Bytes)(p)
+  self.cap = cap
+end
+
+function Buf:free(): void
+  C.free(self.data)
+  self.data = nilptr
+  self.len = 0
+  self.cap = 0
+end
+
+function Buf:byte(b: byte): void
+  self:reserve(1)
+  self.data[self.len] = b
+  self.len = self.len + 1
+end
+
+function Buf:bytes(p: pointer, n: isize): void
+  if n <= 0 then return end
+  self:reserve(n)
+  C.memcpy(&self.data[self.len], p, (@csize)(n))
+  self.len = self.len + n
+end
+
+function Buf:str(s: string): void
+  self:bytes(s.data, (@isize)(s.size))
+end
+
+function Buf:int(v: int64): void
+  local tmp: [24]byte
+  local i: isize = 24
+  local u: uint64 = (@uint64)(v)
+  if v < 0 then u = (@uint64)(-v) end
+  repeat
+    i = i - 1
+    tmp[i] = (@byte)(u % 10) + '0'_b
+    u = u // 10
+  until u == 0
+  if v < 0 then
+    i = i - 1
+    tmp[i] = '-'_b
+  end
+  self:bytes(&tmp[i], 24 - i)
+end
+
+-- v zero-padded to width digits (v >= 0)
+function Buf:padded(v: int64, width: isize): void
+  local tmp: [24]byte
+  local i: isize = 24
+  local u: uint64 = (@uint64)(v)
+  repeat
+    i = i - 1
+    tmp[i] = (@byte)(u % 10) + '0'_b
+    u = u // 10
+  until u == 0 and 24 - i >= width
+  self:bytes(&tmp[i], 24 - i)
+end
+
+local HEX: string = '0123456789abcdef'
+
+-- A JSON string, escaped like JSON.stringify: quotes, backslashes and control characters.
+function Buf:json_string(p: Bytes, n: isize): void
+  self:reserve(n + 2)
+  self:byte('"'_b)
+  local start: isize = 0
+  for i: isize = 0, < n do
+    local c = p[i]
+    if c < 0x20 or c == '"'_b or c == '\\'_b then
+      self:bytes(&p[start], i - start)
+      start = i + 1
+      if c == '"'_b then self:str('\\"')
+      elseif c == '\\'_b then self:str('\\\\')
+      elseif c == '\n'_b then self:str('\\n')
+      elseif c == '\r'_b then self:str('\\r')
+      elseif c == '\t'_b then self:str('\\t')
+      elseif c == 8 then self:str('\\b')
+      elseif c == 12 then self:str('\\f')
+      else
+        self:str('\\u00')
+        self:byte(HEX.data[c >> 4])
+        self:byte(HEX.data[c & 15])
+      end
+    end
+  end
+  self:bytes(&p[start], n - start)
+  self:byte('"'_b)
+end
+
+-- A Postgres timestamptz (binary: microseconds since 2000-01-01 UTC) as ISO 8601 in UTC, truncated to
+-- milliseconds: 2025-12-31T23:59:19.409Z
+function Buf:timestamp(pg_us: int64): void
+  local ms = pg_us // 1000 + 946684800000   -- // floors, also before 1970
+  local days = ms // 86400000
+  local in_day = ms - days * 86400000
+  -- civil_from_days (Howard Hinnant)
+  local z = days + 719468
+  local era = z // 146097
+  local doe = z - era * 146097
+  local yoe = (doe - doe // 1460 + doe // 36524 - doe // 146096) // 365
+  local doy = doe - (365 * yoe + yoe // 4 - yoe // 100)
+  local mp = (5 * doy + 2) // 153
+  local d = doy - (153 * mp + 2) // 5 + 1
+  local m = mp + 3
+  if mp >= 10 then m = mp - 9 end
+  local y = yoe + era * 400
+  if m <= 2 then y = y + 1 end
+  self:byte('"'_b)
+  self:padded(y, 4) self:byte('-'_b) self:padded(m, 2) self:byte('-'_b) self:padded(d, 2)
+  self:byte('T'_b)
+  self:padded(in_day // 3600000, 2) self:byte(':'_b)
+  self:padded(in_day // 60000 % 60, 2) self:byte(':'_b)
+  self:padded(in_day // 1000 % 60, 2) self:byte('.'_b)
+  self:padded(in_day % 1000, 3)
+  self:str('Z"')
+end
