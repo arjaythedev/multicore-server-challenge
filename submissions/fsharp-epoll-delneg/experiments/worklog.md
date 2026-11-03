@@ -121,3 +121,14 @@ Script: `experiments/h.sh`.
   accept and recv fall back to one-shot on EINVAL, and a loop whose ring can't be opened runs epoll. wsl26 runs 6.18,
   which doesn't have the bug, so the classic path is tested by forcing it: 197/197 with epoll, uring and uring +
   classic.
+- **e18 profile** (solo, warm-up, 50k, 150k; same sequence as e08 and the #87 profile): 50k 109.4 µs/req (app 50.2,
+  PG 59.3), 150k 107.9 (app 49.3, PG 58.7). #87 in that sequence: 101.9 and 99.3 (app 44.6, PG 54.8 at 150k). So
+  this is still ~9% more per request than #87 on both sides. PG at 150k by connection: read 1.61 cores, side
+  0.49, write 0.18. App: bcrypt threads 39% of the app's CPU (0.76 cores for 38.6 logins/s = 19.7 ms per hash;
+  #87: 0.63 cores), I/O threads 45% (kernel 33 points of it, mostly TCP; on loopback that includes the load
+  generator's receive path). Logins at 150k: p95 305 ms, p99 358 ms, no errors.
+- **e20: bcrypt state on the stack.** 3.8% of the bcrypt threads' samples were in `__tls_get_addr`: the lane state
+  was a `__thread` array, which in a shared object is reached through that call, and gcc called it again inside the
+  interleaved rounds. (The microbenchmark linked the C file into an executable, where TLS is a plain `%fs` offset, so
+  it never showed.) Through the .so, as the server loads it: 6 lanes 13.16 -> 10.56 ms per hash, 5 lanes 13.9 ->
+  11.6 (CPU 23, sibling busy). Same hashes on the known-answer vectors.
