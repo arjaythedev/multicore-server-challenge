@@ -80,3 +80,14 @@ Script: `experiments/h.sh`.
   (maybe -2%).
 - **e13: one HMAC context per thread** (`IncrementalHash`) for JWT checks instead of `HMACSHA256.HashData`, which
   sets up a new OpenSSL context per call.
+- **e14: `recv`/`send` on client sockets** instead of `read`/`write` (which go through the VFS layer first), with
+  `MSG_NOSIGNAL`.
+- **e10 search** (100k start, 25k users per loadgen process): 100k 101.8 µs/req (app 49.4, PG 52.4; p50 29.5 ms vs
+  #87's 37), 200k pass at 113.6 (app 53.3, PG 60.3, p95 102 ms). The 400k probe overloaded the box as intended,
+  and in the 300k probe after it the server died: "Out of memory." then SIGABRT, 1.3 GB peak, no kernel OOM, 27 GB
+  free. A crashed server isn't restarted by the scorer, so this matters more than speed.
+- **e15: overload defenses.** Each epoll event and each inbox delivery has its own try/with (an error closes that
+  connection only); a spare fd is given up at EMFILE to accept and close the newcomer; past 150,000 queued jobs a
+  lane answers 503; unhandled exceptions are logged.
+- **e16: connection threads reconnect with retries.** A failed batch reconnected once and let a second failure
+  (Postgres full, fd table full) escape the thread, which kills the process.

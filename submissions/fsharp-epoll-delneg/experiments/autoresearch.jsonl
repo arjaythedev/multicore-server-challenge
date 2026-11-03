@@ -2,3 +2,15 @@
 {"id":"e02","label":"e02-new","what":"new design: epoll I/O, own PG client, batched lanes, own bcrypt; first build","kind":"structural","score":null,"note":"warm-up showed PG 4.4 ms/req: currval() in WHERE seq-scanned articles after each insert; fixed with a scalar subquery"}
 {"id":"e03","label":"e03-hubs","what":"shared followee probes for feed counts (HUB_COUNT) and feed page bounds (FEED_BOUND)","kind":"structural","score":null,"note":"first run used the pre-fix build, discarded"}
 {"id":"e04","label":"e04-tagprobe","what":"global/tag counts proved by a 1,000th row (EXISTS OFFSET 999) instead of an aggregate over 1,000 rows","kind":"structural","score":null,"note":"side cluster: 200 tag counts 15.3 ms -> 10.1 ms; 197/197 dev and full seed"}
+{"id":"e05","label":"e05-bcfill","what":"bcrypt waits up to 250 ms for 6 lanes (BCRYPT_FILL 6)","kind":"knob","score":null,"note":"50k/150k cpu sequence: 125.3/119.8 us/req (e04: 141/130)"}
+{"id":"e06","label":"e06-leader","what":"lane leader: one idle thread sleeps out the clock, the rest block untimed (no timed Monitor.Wait)","kind":"structural","score":null,"note":"timed waits spun before blocking; write threads 18% of app CPU at 50k"}
+{"id":"e07","label":"e07-wans","what":"write answers (favorites, follows) via the read lane after commit","kind":"structural","score":null,"note":"50k/150k: 120.5/116.4 us/req"}
+{"id":"e08","label":"e08-batch","what":"SCHED_BATCH for own threads; usleep instead of Thread.Sleep(TimeSpan) for the clock","kind":"structural","score":null,"note":"50k/150k: 107.8/110.0 us/req; #87 same sequence 101.9/99.3"}
+{"id":"e09","label":"e09-sets","what":"article authors, favorite counts, tags as id-ordered ANY lookups; follows flag = viewer's followee list checked in app","kind":"structural","score":null,"note":"real batches: buffers 24,067 -> 17,624, time 21.9 -> 21.2 ms"}
+{"id":"e10","label":"e10-side","what":"second read lane and 3 connections for comments, profiles, users, logins","kind":"structural","score":200000,"note":"search: 100k 101.8 us/req, 200k pass 113.6; crashed (Out of memory, SIGABRT) at 300k after the 400k overload probe"}
+{"id":"e11","label":"e11-depth","what":"feed bounds per (hub, page depth)","kind":"structural","score":null,"note":"real batches 21.6 -> 20.9 ms"}
+{"id":"e12","label":"e12-saop","what":"bounded feeds from one SAOP index scan (author_id = ANY AND id >= bound)","kind":"structural","score":null,"note":"same rows, time within noise"}
+{"id":"e13","label":"e13-hmac","what":"one IncrementalHash HMAC context per thread for JWT","kind":"structural","score":null,"note":"HMACSHA256.HashData set up an OpenSSL context per call"}
+{"id":"e14","label":"e14-recv","what":"recv/send with MSG_NOSIGNAL on client sockets","kind":"structural","score":null,"note":"skips VFS read/write path"}
+{"id":"e15","label":"e15-over","what":"overload defenses: per-event try/with, spare fd at EMFILE, 503 past 150k queued, unhandled logging","kind":"structural","score":null,"note":"robustness"}
+{"id":"e16","label":"e16-reconn","what":"connection threads reconnect with retries","kind":"structural","score":null,"note":"robustness"}

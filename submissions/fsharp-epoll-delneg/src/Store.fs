@@ -1258,7 +1258,9 @@ let start (url: string) (options: string) (reads: int) (sideReads: int) (writes:
                         Thread.Sleep 5000
                         let n = Interlocked.Exchange(statReads, 0L)
                         let b = Interlocked.Exchange(statReadBatches, 0L)
-                        eprintfn "reads %d in %d batches (%.1f per batch), queued now: read %d write %d"
-                            n b (if b > 0L then float n / float b else 0.0) (readLane.Count + sideLane.Count) writeLane.Count),
+                        eprintfn "reads %d in %d batches (%.1f per batch), queued now: read %d side %d write %d; gc %d/%d/%d, paused %.0f ms, heap %d MB"
+                            n b (if b > 0L then float n / float b else 0.0) readLane.Count sideLane.Count writeLane.Count
+                            (GC.CollectionCount 0) (GC.CollectionCount 1) (GC.CollectionCount 2)
+                            (GC.GetTotalPauseDuration().TotalMilliseconds) (GC.GetTotalMemory false / 1048576L)),
                IsBackground = true)
             .Start()
