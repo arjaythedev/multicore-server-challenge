@@ -89,7 +89,7 @@ static size_t put_head(char *o, int status, size_t n, bool close) {
 }
 
 // Gzip only what saves a TCP segment: a client ACKs every second segment, so a segment less is less work on both sides.
-static int gz_mss = 1448, gz_min_segs = 3;
+static int gz_mss = 1448, gz_min_segs = 6;
 static inline size_t segs(size_t n) { return (n + (size_t)gz_mss - 1) / (size_t)gz_mss; }
 
 resp_t *resp_build(int status, const char *body, size_t n, bool close, bool gzip) {

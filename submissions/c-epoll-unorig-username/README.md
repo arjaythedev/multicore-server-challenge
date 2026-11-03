@@ -101,8 +101,13 @@ backend mid-query.
 
 ## 6. Packets and sharing
 
-- **Gzip only when it saves a TCP segment**, with a fixed Huffman table shaped by typical responses. It costs CPU: 5-7% of
-  the box on a NIC with 8 queues. But with one NIC queue, p95 at 200k users was 174-178 ms with it and 303-304 ms without.
+- **Gzip only above 7,240 bytes (six segments), and only when it saves a segment**, with a fixed Huffman table shaped by typical
+  responses. Compressing costs CPU, so the threshold was swept on a database aged by a full search, at 190,000 users, two
+  2-minute runs per setting: with 8 NIC queues the p95 was 560 and 557 ms at the earlier threshold of three segments (above
+  2,896 bytes), 535 at four, 503 and 487 at six, and 489 and 493 with no gzip; the app's CPU per request fell from 60 to 54
+  to 51 us. With one NIC queue, three and six segments gave p95 513, 534 and 519, 521 ms, so six costs nothing there. An
+  earlier test on a young database at 200,000 users and one queue had favoured gzip (p95 174-178 ms against 303-304 ms), which
+  did not reproduce on the aged database. `GZIP_MIN_SEGS` sets the threshold, 0 turns gzip off.
 - **Identical reads in a batch share one response** when no viewer flag is set. It is freed when its last send completes, and
   each batch starts with nothing shared.
 
