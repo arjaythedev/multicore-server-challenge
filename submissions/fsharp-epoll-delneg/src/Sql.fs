@@ -17,7 +17,8 @@ let private slugify (x: string) = sprintf "trim(both '-' from lower(regexp_repla
 ///   2  article, once per distinct article needed: a = id, b = author, c = favorites count, s1..s3 slug, title,
 ///      description, s4 body (only for direct reads), s5..s7 author name, bio, image, ts1/ts2, tg = tag ids
 ///   3  viewer: a = viewer, arr = which of the articles they asked for they favorited
-///   4  viewer: a = viewer, arr = everyone they follow (about 20; the server checks each author against it)
+///   4  viewer: a = viewer, arr = everyone they follow (about 20; the server checks each author against it); no row
+///      for a viewer who follows no one
 ///   5  direct read: a = its index, b = article id (no row: no such article)
 /// hubs: how many shared followees to probe; hubCount/feedBound: whether to use the probes for counts/pages
 let readSql (hubs: int) (hubCount: bool) (feedBound: bool) =
@@ -31,9 +32,11 @@ WITH g AS MATERIALIZED (
                   WHEN 4 THEN g.v END AS kid
     FROM unnest($1::int4[], $2::text[], $3::int8[], $4::int8[], $5::int8[]) WITH ORDINALITY AS g(k, key, v, lim, off, gi)
 ), fl AS MATERIALIZED (
-  -- each feed viewer's followees, read once; everything below about feeds works from this array
-  SELECT x.v, ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = x.v) AS fs
-    FROM (SELECT DISTINCT g.kid AS v FROM g WHERE g.k = 4) x
+  -- each feed viewer's followees, read once, for all of them in one index scan (viewer ids sorted); everything
+  -- below about feeds works from this array. A viewer who follows no one has no row: an empty feed
+  SELECT fo.follower_id AS v, array_agg(fo.followee_id) AS fs FROM follows fo
+   WHERE fo.follower_id = ANY(ARRAY(SELECT DISTINCT g.kid FROM g WHERE g.k = 4 ORDER BY 1))
+   GROUP BY fo.follower_id
 ), cand AS MATERIALIZED (
   -- the followees that the most feed viewers of this batch share, probed once each below
   SELECT f.f FROM fl, unnest(fl.fs) AS f(f) GROUP BY f.f HAVING count(*) >= 2 ORDER BY count(*) DESC LIMIT %d
@@ -88,7 +91,8 @@ WITH g AS MATERIALIZED (
     FROM unnest($10::text[], $11::int8[], $12::int8[]) WITH ORDINALITY AS d(slug, id, dv, di)
 ), art AS MATERIALIZED (
   SELECT a.id, a.author_id, a.slug, a.title, a.description,
-         CASE WHEN a.id = ANY(ARRAY(SELECT d.id FROM d)) THEN a.body END AS body, a.created_at, a.updated_at
+         -- IN (subquery) is a hashed subplan: one hash probe per article, not a scan of every direct read's id
+         CASE WHEN a.id IN (SELECT d.id FROM d WHERE d.id IS NOT NULL) THEN a.body END AS body, a.created_at, a.updated_at
     FROM articles a
    WHERE a.id = ANY(ARRAY(SELECT unnest(r.ids) FROM r UNION SELECT d.id FROM d WHERE d.id IS NOT NULL))
 ), ids AS MATERIALIZED (
@@ -109,6 +113,11 @@ WITH g AS MATERIALIZED (
     FROM (SELECT r.rv AS v, unnest(r.ids) AS id FROM r WHERE r.rv <> 0
           UNION ALL SELECT d.dv, d.id FROM d WHERE d.dv <> 0 AND d.id IS NOT NULL) q
    GROUP BY q.v
+), fw AS MATERIALIZED (
+  -- everyone the other viewers follow, in one index scan over their sorted ids (feed viewers have theirs in fl)
+  SELECT fo.follower_id AS v, array_agg(fo.followee_id) AS fs FROM follows fo
+   WHERE fo.follower_id = ANY(ARRAY(SELECT vw.v FROM vw WHERE NOT EXISTS (SELECT 1 FROM fl WHERE fl.v = vw.v) ORDER BY 1))
+   GROUP BY fo.follower_id
 )
 SELECT 1 AS t, ga.gi AS a, ga.cnt AS b, NULL::int8 AS c, ga.ids AS arr, NULL::text AS s1, NULL::text AS s2,
        NULL::text AS s3, NULL::text AS s4, NULL::text AS s5, NULL::text AS s6, NULL::text AS s7,
@@ -124,10 +133,8 @@ SELECT 3, vw.v, NULL, NULL, ARRAY(SELECT f.article_id FROM favorites f WHERE f.u
        NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
   FROM vw
 UNION ALL
-SELECT 4, vw.v, NULL, NULL,
-       CASE WHEN fl.v IS NOT NULL THEN fl.fs ELSE ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = vw.v) END,
-       NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
-  FROM vw LEFT JOIN fl ON fl.v = vw.v
+SELECT 4, x.v, NULL, NULL, x.fs, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+  FROM (SELECT fl.v, fl.fs FROM fl JOIN vw ON vw.v = fl.v UNION ALL SELECT fw.v, fw.fs FROM fw) x
 UNION ALL
 SELECT 5, d.di, d.id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
   FROM d WHERE d.id IS NOT NULL

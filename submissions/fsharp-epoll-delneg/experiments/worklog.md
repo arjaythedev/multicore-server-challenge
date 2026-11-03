@@ -132,3 +132,32 @@ Script: `experiments/h.sh`.
   interleaved rounds. (The microbenchmark linked the C file into an executable, where TLS is a plain `%fs` offset, so
   it never showed.) Through the .so, as the server loads it: 6 lanes 13.16 -> 10.56 ms per hash, 5 lanes 13.9 ->
   11.6 (CPU 23, sibling busy). Same hashes on the known-answer vectors.
+- **e19 io_uring vs epoll, lanes A and B at once, 80k users, 60 s windows** (app µs/req; PG ~59-61 in all):
+
+  | run | lane A | lane B |
+  |---|---|---|
+  | 1 | epoll 50.4 | uring 50.3 |
+  | 2 | uring 54.2 | epoll 52.8 |
+  | 3 | epoll 52.3 | uring 52.8 |
+  | 4 | classic 51.9 | classic 52.2 |
+
+  Within a lane: A epoll 51.4 vs uring 54.2, B uring 51.6 vs epoll 52.8, so no difference beyond the ±2 µs noise.
+  Same p50/p95 (27-28 / 44-45 ms), no errors on any route in any mode, logins p95 ~345 ms. io_uring holds ~80 MB
+  more (the buffer pools). Where the time goes explains it: on the I/O threads the kernel's TCP work is ~3/4 of the
+  CPU and io_uring doesn't change it; it removes the epoll and syscall-entry part (a few percent of the I/O threads),
+  and adds completion handling, pinning each reply and copying out of the provided buffers.
+- **Closing io_uring connections without a cancel scan** (an idea Denis passed on from a PR #211, which isn't in the
+  upstream repo, so not read): cancelling by fd (`IORING_ASYNC_CANCEL_FD`) makes the kernel search the pending ops,
+  cancelling by user_data is a direct lookup. We already submit no cancel at all: close is `shutdown(SHUT_RDWR)`,
+  which wakes the connection's one pending recv through the socket's own wait queue (it completes with 0, and a
+  completion for a closed connection is ignored and hands its buffer back), then `close`. No fixed files, so
+  nothing needs cancelling before a close either.
+- **e19 decision: epoll stays the default.** Run 5 completed the set (lane A uring 54.1, lane B epoll 52.8): across
+  both lanes io_uring is ~0.8 µs/req worse on average, inside the noise and of no use. `IO_MODE=uring` stays as an
+  option, with its 6.8 fallbacks.
+- **e21: follows lists in one index scan, body flag by hash.** Feed viewers' followees (`fl`) and the other viewers'
+  (`fw`) are each one grouped scan of `follows` over the sorted viewer ids instead of one subplan per viewer, and
+  the direct-read body check is `IN (subquery)` (a hashed subplan) instead of `= ANY(ARRAY(...))`, which scanned
+  the array for every article. On the 40 real batches: identical rows except 10 `t=4` rows with an empty array
+  (viewers who follow no one; the server already treats a missing row as no follows). Execution 20.6 -> 20.0 ms per
+  batch (seed), 22.7 -> 22.2 (aged follows), in both orders; buffers unchanged.
