@@ -60,9 +60,10 @@ No caches across requests, no schema or Postgres configuration changes, nothing 
   per user and kind per batch; the rest wait for the next batch. After the commit, comments are answered from their
   `RETURNING` rows, and favorites and follows go to the read lane to be answered with the article or profile.
   Sign-ups, settings and article changes each get their own transaction.
-- **bcrypt.** The lanes run in lockstep, so one pass costs about the same for 1 lane or 6: 38 ms for a single hash,
-  11 ms per hash with 6 lanes. Logins are about 0.1% of requests, so a login waits up to 250 ms for the lanes to
-  fill.
+- **bcrypt.** Six hashes run in lockstep with their rounds interleaved, so a pass of 6 costs little more than a pass
+  of 1: 41 ms for a single hash, 10.6 ms per hash with 6 lanes (cost 10, one CPU whose SMT sibling is busy). Logins
+  are about 0.1% of requests, so a login waits up to 250 ms for the lanes to fill. The lane state lives on the stack:
+  as a `__thread` array in the shared object it went through `__tls_get_addr` inside the rounds, a fifth of the time.
 - **Scheduling.** Our threads run under SCHED_BATCH, so waking one doesn't preempt a Postgres backend mid-query.
   The bcrypt threads also run at nice 5.
 
@@ -88,7 +89,10 @@ Ideas from other entries, in our own code:
 - One tags read answering every tags request in a batch: #48.
 - SCHED_BATCH for the server's threads: #168, measured by #130.
 - Reading each comment author once per execution: #152.
+- io_uring on the scorer's 6.8 kernel: registering a buffer ring again with a non-zero reserved byte when it fails
+  with EINVAL (#60), and classic `IORING_OP_PROVIDE_BUFFERS` where buffer rings fail (#168).
 
 Ours: the lane leader without timed waits, write answers through the read lane, the id-ordered lookups for article
-details, the epoll server, the Postgres client, and the bcrypt core, whose init words are generated from pi by
-`native/gen_pi.py`.
+details, one followee read per feed viewer for everything a feed needs, dropping the reads of clients that have
+left, the epoll and io_uring server, the Postgres client, and the bcrypt core, whose init words are generated from pi
+by `native/gen_pi.py`.
