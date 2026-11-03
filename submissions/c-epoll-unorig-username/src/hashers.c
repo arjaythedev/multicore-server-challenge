@@ -21,7 +21,7 @@ typedef struct {
   _Atomic int state;
 } slot_t;
 static slot_t *slots;
-static int nslots, rescue_after_us = 700000;
+static int nslots, rescue_after_us = 3000000;
 
 static void push(job *j) {
   j->next = NULL;
@@ -196,6 +196,7 @@ void hashers_start(int n) {
   const char *e;
   if ((e = getenv("BCRYPT_LANES"))) lanes = atoi(e);
   if ((e = getenv("HASH_WAIT_MS"))) wait_us = atoi(e) * 1000;
+  if ((e = getenv("HASH_RESCUE_MS"))) rescue_after_us = atoi(e) * 1000;
   if (lanes < 1) lanes = 1;
   if (lanes > LANES) lanes = LANES;
   pthread_condattr_t ca;
