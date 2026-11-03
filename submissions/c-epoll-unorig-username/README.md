@@ -13,7 +13,20 @@ DATABASE_URL=... JWT_SECRET=... HOST=0.0.0.0 PORT=80 bash start.sh
 
 No caches across requests, no schema or Postgres config changes, no host tuning. Session-level `SET` only.
 
-@@RESULTS@@
+## Measured results
+
+On one AWS `c7i.2xlarge` running the server and Postgres, 5 load boxes, the repo's `loadgen search` from 8,000 users, one search per
+entry. That box is well above the official one, so only the comparison means anything:
+
+| Entry | Held | req/s | p95 ms | p99 ms | Box CPU | App / Postgres |
+|---|--:|--:|--:|--:|--:|---|
+| zig-iouring-nick-potts | 190,000 | 47,360 | 498 | 639 | 99% | 29% / 68% |
+| this entry | 140,000 | 34,353 | 500 | 536 | 81% | 24% / 55% |
+| go-epoll-unorig-username | 130,000 | 32,193 | 452 | 592 | 100% | 37% / 62% |
+
+Both this entry and the leader pass 2-minute probes to 256,000 users on a young database, with p95 381 and 415 ms, and then fail
+holds there as the database ages. **The leader holds about a third more.** At its scoring hold this entry isn't out of CPU: batch
+latency sets its limit, and the 160 ms gap below was chosen on a young database, so that choice is suspect.
 
 ## 1. Flat statements, joined here
 
