@@ -4,10 +4,13 @@ WITH q AS MATERIALIZED (
   SELECT * FROM unnest(:authorization::text[], :slug::text[]) WITH ORDINALITY AS q(authz, slug, i)),
 r AS MATERIALIZED (
   SELECT q.i, q.slug, au.status AS astatus, au.body AS abody, au.viewer FROM q CROSS JOIN LATERAL ({{_jwt}}) au),
+m AS MATERIALIZED (
+  SELECT a.* FROM (SELECT DISTINCT slug FROM r WHERE astatus IS NULL) d JOIN articles a ON a.slug = d.slug),
+ids AS (SELECT id FROM m),
+tg AS MATERIALIZED ({{_tags}}),
 arts AS MATERIALIZED (
-  SELECT d.slug, ar.* FROM (SELECT DISTINCT slug FROM r WHERE astatus IS NULL) d CROSS JOIN LATERAL (
-    SELECT a.id, a.author_id, {{_art_parts}}, ',"body":' || to_json(a.body)::text AS pb
-      FROM articles a JOIN users u ON u.id = a.author_id WHERE a.slug = d.slug OFFSET 0) ar)
+  SELECT a.slug, a.id, a.author_id, {{_art_parts}}, ',"body":' || to_json(a.body)::text AS pb
+    FROM m a JOIN users u ON u.id = a.author_id LEFT JOIN tg ON tg.article_id = a.id)
 SELECT r.i, coalesce(r.astatus, CASE WHEN ar.id IS NULL THEN 404 ELSE 200 END) AS status,
        CASE WHEN r.astatus IS NOT NULL THEN r.abody
             WHEN ar.id IS NULL THEN '{"errors":{"body":["article not found"]}}'

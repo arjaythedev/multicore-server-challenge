@@ -9,7 +9,7 @@ Conduit. It has no routes, no JSON and no JWT code.
 
 | | |
 |---|---|
-| Language | SQL (PostgreSQL 18), plus a generic C nginx module that runs it (~1,150 lines) |
+| Language | SQL (PostgreSQL 18), plus a generic C nginx module that runs it (~1,200 lines) |
 | Server | nginx 1.28.0, built from the pinned tarball with `--with-threads` and the module |
 | Driver | libpq (Ubuntu 24.04's `libpq-dev`) |
 | bcrypt | libxcrypt `crypt_rn`, cost 10 (Ubuntu's `libcrypt-dev`) |
@@ -62,10 +62,11 @@ sql_batch GET article_get_batch.sql;
 nginx's event loop is single-threaded, so a worker can gather requests without locks.
 
 1. A request for such a route goes into that route's queue in its worker, not straight to the thread pool.
-2. After the worker has handled the events from one `epoll_wait`, a posted event sends the whole queue to the
-   thread pool as one task, if that route has no batch running yet. Requests that arrive while a batch runs wait
-   for it, so batches grow with load and wait for nothing when it's quiet. A queue that reaches `sql_batch_max`
-   (128) goes at once.
+2. The first request queued while that route has no batch running starts a timer, `sql_batch_wait` (20 ms).
+   When it fires, the whole queue goes to the thread pool as one task. Requests that arrive while a batch runs
+   wait for it and go as the next batch as soon as it ends, so batches grow with load. A queue that reaches
+   `sql_batch_max` (128) goes at once. With `SQL_BATCH_WAIT=0ms` the queue goes right after the events of one
+   `epoll_wait` instead.
 3. On the thread, every request value becomes a `text[]` with one element per request. Constants such as the
    HMAC pads stay plain values, and `:batch_size` is the count. The statement answers one row per request:
    `i` (its place in the arrays), `status` and `body`.
@@ -76,10 +77,11 @@ row, those requests run the ordinary statement one by one, so a batch never answ
 requests.
 
 The batch statements start with `unnest(...) WITH ORDINALITY` and check every token with the same SQL as single
-requests ([`sql/_jwt.sql`](sql/_jwt.sql)). Requests that ask for the same page share its ids, articles and count.
-The parts of an article that don't depend on the reader (tags, timestamps, favorites count, author) are built
-once per batch as JSON text ([`sql/_art_parts.sql`](sql/_art_parts.sql)). Each request then adds its own
-`favorited` and `following`. Writes don't batch: they keep their few statements per request.
+requests ([`sql/_jwt.sql`](sql/_jwt.sql)). Requests that ask for the same page share its ids and count. Every
+article on any page of the batch is built once: the parts that don't depend on the reader (tags, timestamps,
+favorites count, author) become JSON text ([`sql/_art_parts.sql`](sql/_art_parts.sql)). The tag names of all of
+them come from one join that reads `tags` once and hashes it ([`sql/_tags.sql`](sql/_tags.sql)). Each request then
+adds its own `favorited` and `following`. Writes don't batch: they keep their few statements per request.
 
 ### JWT in SQL
 
@@ -107,6 +109,14 @@ Then it checks `alg = HS256`, that `exp` is a number in the future, and that `su
 - Writes are committed (autocommit, or the explicit `COMMIT`) before the response is sent.
 - Connections: one per thread-pool thread, 3 threads per nginx worker, so 24 on the box's 8 cores. That held
   more users than 6 or 11 per worker: Postgres shares the cores, and fewer busy backends contend less.
+- No TLS to Postgres: `start.sh` sets `PGSSLMODE=disable` (override it to change). libpq's default, `prefer`,
+  encrypts every statement and result over the loopback when the server has `ssl = on`. Ubuntu's Postgres has
+  that by default, with its snakeoil certificate. Locally, with `ssl = on`, TLS cost 5 % more Postgres CPU per
+  request (0.136 vs 0.129 cores per 1k req/s, two runs each).
+- Shutdown: nginx's thread pool lets a worker go on to `exit()` while its threads are still inside
+  `pthread_exit()`. `exit()` runs libcrypto's `OPENSSL_cleanup` (libcrypto comes in with libpq), so a thread still
+  freeing its own state could crash the worker with SIGSEGV or "double free" (2 in 30 stops under load, locally).
+  The module's `exit_process` now waits until the worker has one thread left (0 in 60).
 
 ## Local results
 
@@ -128,3 +138,27 @@ Then it checks `alg = HS256`, that `exp` is a number in the future, and that `su
 Batches cut Postgres CPU per 1,000 req/s from 0.28 to 0.15 cores at 32,000 users. At that point the 8 cores are
 full: nginx's share is mostly bcrypt (about 35 logins/s locally). Performance wasn't the goal: the point is to see
 how much of a web app plain SQL can carry.
+
+**`sql_batch_wait`.** These runs had batches go after every round of events (0 ms). The benchmark box held 64,000
+users that way, with all 8 cores busy and Postgres taking two thirds. Waiting a little longer lets a batch take
+more requests. At 26,000 users (about 24,500–27,000 req/s), each wait run on a fresh copy of the seed:
+
+| `sql_batch_wait` | Requests per batch | Postgres cores per 1k req/s | nginx cores per 1k req/s | Both |
+|---|---:|---:|---:|---:|
+| 0 ms | 4.3–4.6 | 0.186 | 0.09–0.10 | 0.28 |
+| 5 ms | 4.8 | 0.165 | 0.096 | 0.26 |
+| 10 ms | 6.2 | 0.151 | 0.094 | 0.25 |
+| **20 ms** (default) | 8.8 | 0.137 | 0.09 | 0.23 |
+| 40 ms | 13.9 | 0.129 | 0.081 | 0.21 |
+
+The 0 ms and 20 ms runs were done twice, and agreed within 2%. Latency only compares between the two runs in which the
+load generator kept up: 0 ms had p50 9 / p95 61 / p99 102 ms, and 40 ms had p50 31 / p95 72 / p99 131 ms. Reads
+wait up to the timer longer, but cost a fifth less CPU. 20 ms is the default; 40 ms saves more but wasn't checked on
+the benchmark box.
+
+**Articles once per batch.** Feed pages differ for every reader, so a feed batch shares little but the articles
+themselves. Looking up each tag name in `tags_pkey` was half of what it read. Building each article of a batch once,
+with one hashed join for the tag names, gave identical responses with fewer buffers per batch: list −33 to −37 %,
+feed −22 to −39 %, article −20 %. At 26,000 users and 20 ms, Postgres went from 0.137 to 0.129 cores per 1k req/s
+(−6 %). Most of a feed's time is now spent building the articles' JSON (about 30 %), counting up to 1,000
+articles (25 %), and walking each followed author's newest articles (22 %).

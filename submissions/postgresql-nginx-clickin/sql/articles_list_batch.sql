@@ -1,7 +1,7 @@
 -- GET /api/articles for a batch of requests (see "Batches" in the module). Each request value is an array with
 -- one element per request; the answer is one row per request: i (its place in the arrays), status, body.
--- Requests that ask for the same page share its ids, articles and count; "favorited" and "following" are each
--- request's own.
+-- Requests that ask for the same page share its ids and count, and each article on any page of the batch is built
+-- once; "favorited" and "following" are each request's own.
 WITH q AS MATERIALIZED (
   SELECT * FROM unnest(:authorization::text[], :limit::text[], :offset::text[], :tag::text[], :author::text[],
                        :favorited::text[]) WITH ORDINALITY AS q(authz, lim, off, tag, author, favorited, i)),
@@ -15,10 +15,7 @@ r AS MATERIALIZED (
 k AS MATERIALIZED (
   SELECT DISTINCT kind, key, page_limit, page_offset FROM r WHERE astatus IS NULL AND pstatus IS NULL),
 pages AS MATERIALIZED (
-  SELECT k.kind, k.key, k.page_limit, k.page_offset,
-         array_agg(ar.id ORDER BY ar.id DESC) AS ids, array_agg(ar.author_id ORDER BY ar.id DESC) AS authors,
-         array_agg(ar.p1 || ar.p2 ORDER BY ar.id DESC) AS heads, array_agg(ar.p3 ORDER BY ar.id DESC) AS mids
-    FROM k CROSS JOIN LATERAL (
+  SELECT k.kind, k.key, k.page_limit, k.page_offset, ARRAY(SELECT x.id FROM (
       (SELECT a.id FROM articles a WHERE k.kind = 0
         ORDER BY a.id DESC LIMIT k.page_limit OFFSET k.page_offset)
       UNION ALL
@@ -32,10 +29,14 @@ pages AS MATERIALIZED (
       UNION ALL
       (SELECT fa.article_id FROM favorites fa
         WHERE k.kind = 3 AND fa.user_id = (SELECT fu.id FROM users fu WHERE fu.username = k.key)
-        ORDER BY fa.article_id DESC LIMIT k.page_limit OFFSET k.page_offset)) x
-    CROSS JOIN LATERAL (SELECT a.id, a.author_id, {{_art_parts}}
-                          FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id = x.id OFFSET 0) ar
-   GROUP BY k.kind, k.key, k.page_limit, k.page_offset),
+        ORDER BY fa.article_id DESC LIMIT k.page_limit OFFSET k.page_offset)) x ORDER BY x.id DESC) AS ids
+    FROM k),
+ids AS MATERIALIZED (SELECT DISTINCT unnest(ids) AS id FROM pages),
+tg AS MATERIALIZED ({{_tags}}),
+arts AS MATERIALIZED (
+  SELECT a.id, a.author_id, {{_art_parts}}
+    FROM ids JOIN articles a ON a.id = ids.id JOIN users u ON u.id = a.author_id
+    LEFT JOIN tg ON tg.article_id = a.id),
 cnt AS MATERIALIZED (
   SELECT kk.kind, kk.key,
          CASE kk.kind
@@ -49,11 +50,12 @@ cnt AS MATERIALIZED (
          END AS n
     FROM (SELECT DISTINCT kind, key FROM k) kk),
 items AS (
-  SELECT r.i, (SELECT string_agg(e.head || (e.id = ANY (v.favorited))::text || e.mid
-                                 || (e.author_id = ANY (v.following))::text || '}}', ',' ORDER BY e.n)
-                 FROM unnest(p.ids, p.authors, p.heads, p.mids) WITH ORDINALITY AS e(id, author_id, head, mid, n)) AS items
-    FROM r JOIN pages p ON p.kind = r.kind AND p.key = r.key AND p.page_limit = r.page_limit
-                       AND p.page_offset = r.page_offset
+  SELECT r.i, (SELECT string_agg(ar.p1 || ar.p2 || (ar.id = ANY (v.favorited))::text || ar.p3
+                                 || (ar.author_id = ANY (v.following))::text || '}}', ',' ORDER BY e.n)
+                 FROM unnest(p.ids) WITH ORDINALITY AS e(id, n) JOIN arts ar ON ar.id = e.id) AS items
+    FROM r JOIN (SELECT pg.*, ARRAY(SELECT ar.author_id FROM unnest(pg.ids) e(id) JOIN arts ar ON ar.id = e.id) AS authors
+                   FROM pages pg) p
+      ON p.kind = r.kind AND p.key = r.key AND p.page_limit = r.page_limit AND p.page_offset = r.page_offset
     CROSS JOIN LATERAL ({{_viewer_marks}}) v)
 SELECT r.i, coalesce(r.astatus, r.pstatus, 200) AS status,
        CASE WHEN r.astatus IS NOT NULL THEN r.abody
