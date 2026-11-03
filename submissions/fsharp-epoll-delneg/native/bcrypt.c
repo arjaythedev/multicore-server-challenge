@@ -136,7 +136,9 @@ DEFINE_LANES(6)
 /* Hashes n (1..6) passwords with the same cost. keys[i] has lens[i] bytes (no NUL needed); salts[i] is the
  * 22-character encoded salt. Writes the 31-character encoded hash to out[i] (no NUL). Returns 1, or 0 on bad input. */
 int bc_crypt(int n, int cost, const uint8_t *const *keys, const int *lens, const char *const *salts, char *const *out) {
-    static __thread lane_t st[BC_MAX_LANES];
+    /* on the stack (25 KB at 6 lanes): a __thread array in this shared object is reached through __tls_get_addr,
+     * which gcc re-called inside the interleaved rounds (about a tenth of the hashing time under load) */
+    lane_t st[BC_MAX_LANES] __attribute__((aligned(64)));
     uint32_t kw[BC_MAX_LANES][18], sw[BC_MAX_LANES][4], skw[BC_MAX_LANES][18], ct[BC_MAX_LANES][6];
     if (n < 1 || n > BC_MAX_LANES || cost < 4 || cost > 31) return 0;
     for (int l = 0; l < n; l++) {
