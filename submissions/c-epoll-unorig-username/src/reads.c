@@ -441,9 +441,15 @@ static void rc_release(rcache *c) {
 // ---- one batch. Returns 0 when every job is answered, else 1 = connection lost, 2 = statement failed.
 enum { B_OK, B_LOST, B_SQL };
 
-#define EXCH(res)                                  \
-  do {                                             \
-    if (!pg_exchange(&d->pg, a, &(res))) return (res).lost ? B_LOST : B_SQL; \
+// READ_TRACE=1: per-exchange and per-batch wall time, summed over all drains and printed every 10 s.
+static int trace_on;
+static _Atomic int64_t tr_ex_ns[16], tr_ex_n[16], tr_b_ns, tr_b_n, tr_b_jobs, tr_last;
+#define EXCH(res)                                                                       \
+  do {                                                                                  \
+    static const int k_ = __COUNTER__;                                                  \
+    int64_t t0_ = trace_on ? now_us() : 0;                                              \
+    if (!pg_exchange(&d->pg, a, &(res))) return (res).lost ? B_LOST : B_SQL;           \
+    if (trace_on) { atomic_fetch_add(&tr_ex_ns[k_], now_us() - t0_); atomic_fetch_add(&tr_ex_n[k_], 1); } \
   } while (0)
 
 static void reply_ok(drain_t *d, job *j, buf_t *out) {
@@ -1277,7 +1283,18 @@ static void run_safe(drain_t *d, job **jobs, int n) {
     d->a.fail = &d->fail;
     int jr = setjmp(d->fail);
     if (jr == 0) {
+      int64_t tb_ = trace_on ? now_us() : 0;
       rc = run_batch(d, jobs, n);
+      if (trace_on) {
+        atomic_fetch_add(&tr_b_ns, now_us() - tb_); atomic_fetch_add(&tr_b_n, 1); atomic_fetch_add(&tr_b_jobs, n);
+        int64_t nw = now_us(), l = atomic_load(&tr_last);
+        if (nw - l > 10000000 && atomic_compare_exchange_strong(&tr_last, &l, nw)) {
+          fprintf(stderr, "TRACE batches=%ld jobs=%ld batch_ms=%.1f", (long)tr_b_n, (long)tr_b_jobs, tr_b_ns / 1000.0 / (tr_b_n ? tr_b_n : 1));
+          for (int i = 0; i < 16; i++) if (tr_ex_n[i]) fprintf(stderr, " ex%d=%ld/%.1fms", i, (long)tr_ex_n[i], tr_ex_ns[i] / 1000.0 / tr_ex_n[i]);
+          fprintf(stderr, "\n");
+          tr_b_ns = tr_b_n = tr_b_jobs = 0; for (int i = 0; i < 16; i++) tr_ex_ns[i] = tr_ex_n[i] = 0;
+        }
+      }
     } else {  // out of arena: the wire is mid-message
       pg_reconnect(d);
       rc = B_SQL;
@@ -1343,6 +1360,7 @@ void reads_start(int n) {
   lanes[LANE_FEED].gap = (e = getenv("GAP_FEED_US")) ? atoll(e) : 160000;
   lanes[LANE_COMMENT].gap = (e = getenv("GAP_COMMENT_US")) ? atoll(e) : 160000;
   if ((e = getenv("HUB_EST"))) hub_est = atoll(e);
+  trace_on = getenv("READ_TRACE") != NULL;
   if ((e = getenv("READ_CAP"))) read_cap = atoi(e);
   if ((e = getenv("READ_LANES"))) lane_on = atoi(e);
   for (int i = 0; i < n; i++) {
