@@ -30,10 +30,13 @@ WITH g AS MATERIALIZED (
                   WHEN 3 THEN (SELECT u.id FROM users u WHERE u.username = g.key)
                   WHEN 4 THEN g.v END AS kid
     FROM unnest($1::int4[], $2::text[], $3::int8[], $4::int8[], $5::int8[]) WITH ORDINALITY AS g(k, key, v, lim, off, gi)
+), fl AS MATERIALIZED (
+  -- each feed viewer's followees, read once; everything below about feeds works from this array
+  SELECT x.v, ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = x.v) AS fs
+    FROM (SELECT DISTINCT g.kid AS v FROM g WHERE g.k = 4) x
 ), cand AS MATERIALIZED (
   -- the followees that the most feed viewers of this batch share, probed once each below
-  SELECT fo.followee_id AS f FROM g JOIN follows fo ON fo.follower_id = g.kid
-   WHERE g.k = 4 GROUP BY fo.followee_id HAVING count(*) >= 2 ORDER BY count(*) DESC LIMIT %d
+  SELECT f.f FROM fl, unnest(fl.fs) AS f(f) GROUP BY f.f HAVING count(*) >= 2 ORDER BY count(*) DESC LIMIT %d
 ), hub AS MATERIALIZED (
   -- feed counts: a followee with 1,000+ articles proves the capped count, so its followers get 1000 uncounted
   SELECT ARRAY(SELECT c.f FROM cand c
@@ -45,9 +48,8 @@ WITH g AS MATERIALIZED (
   SELECT c.f, n.n, (SELECT a.id FROM articles a WHERE a.author_id = c.f ORDER BY a.id DESC OFFSET n.n - 1 LIMIT 1) AS b
     FROM cand c, (SELECT DISTINCT g.lim + g.off AS n FROM g WHERE g.k = 4) n WHERE %s
 ), gb AS MATERIALIZED (
-  SELECT g.gi, coalesce((SELECT max(hb.b) FROM hb JOIN follows fo ON fo.followee_id = hb.f AND fo.follower_id = g.kid
-                          WHERE hb.n = g.lim + g.off), 0) AS bound
-    FROM g WHERE g.k = 4
+  SELECT g.gi, coalesce((SELECT max(hb.b) FROM hb WHERE hb.f = ANY(fl.fs) AND hb.n = g.lim + g.off), 0) AS bound
+    FROM g JOIN fl ON fl.v = g.kid WHERE g.k = 4
 ), ga AS MATERIALIZED (
   SELECT g.gi,
     CASE g.k
@@ -59,13 +61,12 @@ WITH g AS MATERIALIZED (
       -- without one, each followee's newest are fetched separately and merged
       ELSE CASE WHEN gb.bound > 0
         THEN ARRAY(SELECT a2.id FROM articles a2
-                    WHERE a2.author_id = ANY(ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = g.kid))
-                      AND a2.id >= gb.bound
+                    WHERE a2.author_id = ANY(fl.fs) AND a2.id >= gb.bound
                     ORDER BY a2.id DESC LIMIT g.lim OFFSET g.off)
-        ELSE ARRAY(SELECT x.id FROM follows fo CROSS JOIN LATERAL (
-                   SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id
+        ELSE ARRAY(SELECT x.id FROM unnest(fl.fs) AS f(f) CROSS JOIN LATERAL (
+                   SELECT a2.id FROM articles a2 WHERE a2.author_id = f.f
                     ORDER BY a2.id DESC LIMIT g.lim + g.off) x
-                 WHERE fo.follower_id = g.kid ORDER BY x.id DESC LIMIT g.lim OFFSET g.off) END
+                 ORDER BY x.id DESC LIMIT g.lim OFFSET g.off) END
     END AS ids,
     CASE g.k
       WHEN 0 THEN CASE WHEN EXISTS (SELECT 1 FROM articles a OFFSET 999) THEN 1000
@@ -75,12 +76,10 @@ WITH g AS MATERIALIZED (
                   ELSE (SELECT count(*) FROM article_tags at WHERE at.tag_id = g.kid) END
       WHEN 2 THEN (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = g.kid LIMIT 1000) s)
       WHEN 3 THEN (SELECT count(*) FROM (SELECT 1 FROM favorites f WHERE f.user_id = g.kid LIMIT 1000) s)
-      ELSE CASE WHEN EXISTS (SELECT 1 FROM follows fo, hub WHERE fo.follower_id = g.kid AND fo.followee_id = ANY(hub.ids))
-                THEN 1000
-                ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id IN (
-                        SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = g.kid) LIMIT 1000) s) END
+      ELSE CASE WHEN fl.fs && (SELECT hub.ids FROM hub) THEN 1000
+                ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = ANY(fl.fs) LIMIT 1000) s) END
     END AS cnt
-  FROM g LEFT JOIN gb ON gb.gi = g.gi
+  FROM g LEFT JOIN gb ON gb.gi = g.gi LEFT JOIN fl ON g.k = 4 AND fl.v = g.kid
 ), r AS MATERIALIZED (
   SELECT r.rv, ga.ids[r.rfrom:r.rto] AS ids
     FROM unnest($6::int4[], $7::int4[], $8::int4[], $9::int8[]) AS r(rg, rfrom, rto, rv) JOIN ga ON ga.gi = r.rg
@@ -125,9 +124,10 @@ SELECT 3, vw.v, NULL, NULL, ARRAY(SELECT f.article_id FROM favorites f WHERE f.u
        NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
   FROM vw
 UNION ALL
-SELECT 4, vw.v, NULL, NULL, ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = vw.v),
+SELECT 4, vw.v, NULL, NULL,
+       CASE WHEN fl.v IS NOT NULL THEN fl.fs ELSE ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = vw.v) END,
        NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
-  FROM vw
+  FROM vw LEFT JOIN fl ON fl.v = vw.v
 UNION ALL
 SELECT 5, d.di, d.id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
   FROM d WHERE d.id IS NOT NULL
