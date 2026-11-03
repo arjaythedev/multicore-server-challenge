@@ -77,8 +77,26 @@ and never inside SQL, a transaction or a commit group.
     request in it: while all lanes are busy the queue grows, the next lane takes it all, and that batch is slower
     still. At 85,000 users a cap of 512 beat 1,024 on p95 and p99 in two paired runs (227 vs 427 ms and 255 vs
     295 ms at p95), with no more Postgres work. At 128 too little is shared: Postgres used more, the lanes saturated
-    and p95 rose to 659 ms. The shutdown line `read timings` gives p50/p95/p99 of a request's wait for its batch,
-    a batch's execution and a request's whole time in the read path.
+    and p95 rose to 659 ms. But past the knee 512 is a fixed ceiling (lanes x 512 per batch time): on 6 pinned
+    vCPUs at 120,000 users, 31% of reads waited 512 ms or more for a lane (546 ms on average) while the CPU had
+    room. With 2,048 the same run passed (29,900 vs 28,700 requests/s, p95 452 vs 806 ms) with less Postgres CPU
+    (2.90 vs 3.04 threads), because bigger batches share more; so the default is now 2,048. More lanes instead
+    (12 on 6 vCPUs) changed nothing but each batch's time: lanes are backends, not cores. The shutdown line
+    `read timings` gives p50/p95/p99 of a request's wait for its batch, a batch's execution and a request's whole
+    time in the read path; `read batch phases` splits a batch into phase A, the plan, phase B and the assembly.
+    These timings (and the `write timings` line) are recorded only while a diagnostic is on (`STATS_SECONDS` or
+    `BATCH_LOG`): each record is two interlocked adds on counters every lane shares. Off, the lines print `-`.
+  - **Fair share (`READ_SHARE_MIN`, 64).** A gathering lane takes what waits divided by the idle lanes (itself
+    included), at least 64 and at most `READ_BATCH`, and leaves the rest to the next idle lane, which takes it at once
+    (it has already waited out the window). A burst that arrives while lanes are idle then runs on several backends
+    at once instead of one; with every other lane busy (full speed) the share is everything, the biggest batch.
+    Back to back at 125,000 users on 6 vCPUs: p95 719 vs 778 ms, p99 915 vs 1,002, twice the batches at half the
+    batch time, the same CPU (99%).
+  - **Split phase B (`READ_SPLIT`, off).** Phase B can be cut by article over `READ_SPLIT` connections per lane,
+    all reading phase A's snapshot (`pg_export_snapshot`, then `SET TRANSACTION SNAPSHOT` on each helper; the
+    batch property test covers it). On a CPU that is already full it lost: at 125,000 users on 6 vCPUs p95 571 ms
+    unsplit, 769 split in two, 842 in three, with the box at 98% either way. It can only pay where lanes are busy
+    and cores idle.
   - **Plan (F#).** The batch's distinct needs: forty requests for page 1 of the global feed are one page, and an
     article page and its comments are one slug lookup.
   - **Phase A (one round trip).** Ids: the tag list, one capped count per distinct list key, the ids of each distinct
@@ -99,7 +117,11 @@ and never inside SQL, a transaction or a commit group.
     back into that join.
   - Our sessions run with `jit=off` (a session setting; the server config is untouched). The batched statements
     look costly to the planner, and JIT compiling took ~400 ms of a 1 ms query. Prepared statements do not help:
-    Postgres does not cache JIT code.
+    Postgres does not cache JIT code. For the same reason they also send `max_parallel_workers_per_gather=0` (the
+    box's config allows 4 workers per statement), `plan_cache_mode=force_generic_plan` (with array parameters each
+    custom plan looks different, so `auto` keeps re-planning) and `enable_memoize=off`, as the C# and Java entries
+    above us do. At 30,000 users on the test box this changed nothing measurable (Postgres 0.61 vs 0.62 cores,
+    p95 37 vs 38 ms): no worse plans, and any gain is for saturation to show. `PG_OPTIONS` replaces all four.
   - **Proof.** `src/Tests/BatchTests.fs` is an FsCheck property: for random batches of real keys (with many
     duplicates, unknown keys, anonymous viewers and huge offsets), every request's answer in the batch equals its
     answer alone, byte for byte as Wire encodes it. A failure shrinks to the smallest batch that still fails. A bug
@@ -121,24 +143,37 @@ and never inside SQL, a transaction or a commit group.
   connections, default cores / 2. A request does not hold a connection: its statements are pipelined onto whichever
   connection is free.
 - **Group commit for writes** (`src/Engine/Commit.fs`). Every write queues on one channel. `WRITE_LANES` writer
-  lanes (default 2), each with a connection of its own, take whatever queued while their previous group was in flight
+  lanes (default (cores + 2) / 4: 2 on 8 cores), each with a connection of its own, take whatever queued while their previous group was in flight
   (up to `WRITE_GROUP`, default 128) and send it as one `NpgsqlBatch`. That is one round trip and one implicit
   transaction, ended by the batch's Sync, so the whole group shares one commit and one WAL flush. Each caller is
-  answered only after that commit (ReadyForQuery). There is no timer: with no load a group is one write, and under
-  load the groups grow by themselves.
+  answered only after that commit (ReadyForQuery). Under load the groups grow by themselves.
+  - A group smaller than `WRITE_GROUP_MIN` (8) waits for company
+    until its oldest write has waited `WRITE_GATHER_MS` (2): otherwise a lane that wakes for the first write while the
+    other commits takes it nearly alone. Interleaved at 125,000 users on 6 vCPUs it cut the commits by 11-12% and the
+    write queue's peaks (53-129 writes instead of 408-573), at the same CPU. Ten groups a second instead
+    (`WRITE_LANES=1 WRITE_GATHER_MS=100 WRITE_GROUP_MIN=100000 WRITE_GROUP=1024`) cut the commits from 117-162 to 8-9
+    a second and changed nothing else measurable but the writes, ~100 ms slower. Snapshots are not why: a uprobe on
+    Postgres's `GetSnapshotData` counted ~7,000-7,500 calls a second either way, ~90% on the write connections (3-4 per
+    write), 1.2 µs each at the median with the probe's own trap, under 2% of one core in all; the read lanes take
+    30-70 a second.
   - If the server refuses one statement (a UNIQUE name, a deadlock between lanes), it rolls the whole group back, so
     none of it happened. Each write then runs again in its own transaction, and only the bad one fails.
   - If the connection breaks, whether the group committed is unknown, so its writes fail (500) instead of being
     applied twice.
   - At shutdown the server logs `group commit: N writes in M groups`.
-- **bcrypt on dedicated threads** (`BCRYPT_THREADS`, default 2) behind a queue, each computing up to `BCRYPT_WIDTH`
+- **bcrypt on dedicated threads** (`BCRYPT_THREADS`, default (cores + 2) / 4: 2 on 8 cores) behind a queue, each computing up to `BCRYPT_WIDTH`
   (4) hashes in lockstep (see below). A thread that takes a login waits up to `BCRYPT_GATHER_MS` (150) for
   batch-mates. Logins are ~0.1% of the requests, so that wait barely touches p95 or p99. At 100,000 users on
   6 threads 150 ms instead of 50 filled the batches to 3.3-3.4 hashes instead of 2.4 and saved 0.12-0.16 of the
   app's ~2.8 threads in two paired runs, with the same p95. A burst of logins waits for a thread instead of
   parking thread-pool threads that the cheap reads need.
-- **GC:** server GC, non-concurrent, DATAS off, and a 64 MB gen0 budget (`DOTNET_GCgen0size` in `start.sh`). The
-  JIT runs with tiered PGO.
+- **GC:** server GC, background (concurrent) gen2, DATAS off, a 64 MB gen0 budget (`DOTNET_GCgen0size` in
+  `start.sh`) and a 1 MB large-object threshold (`DOTNET_GCLOHThreshold`, 85 KB by default). The JIT runs with
+  tiered PGO. `DOTNET_gcServer=0` (workstation GC, as `csharp-epoll-jit-gichamba` runs) or
+  `DOTNET_GCHeapCount=N` override it from the environment.
+- **Scheduling:** `start.sh` runs the process under `SCHED_BATCH` (`chrt --batch 0`, no privileges, inherited by every
+  thread), as `java-raw-stohirov` and `kotlin-native-luben93` do: our threads wake constantly, and under the default
+  policy each wakeup may preempt a busy Postgres backend. `SCHED_BATCH=0` turns it off.
 
 ## SQL
 
@@ -366,8 +401,8 @@ SKIP_CONFORMANCE=1 bash check.sh  # the quick gate, no database
 ```
 
 Environment: `DATABASE_URL`, `JWT_SECRET` (required); `HOST` (127.0.0.1), `PORT` (3000); `READ_LANES` (cores);
-`READ_BATCH` (512); `READ_GATHER_MS` (25); `WRITE_LANES` (2); `WRITE_GROUP` (128); `DB_POOL_SIZE` (cores / 2, capped so the total stays
-at most 95); `BCRYPT_THREADS` (2); `BCRYPT_WIDTH` (4); `BCRYPT_GATHER_MS` (150); `STATS_SECONDS` (0, off).
+`READ_BATCH` (2048); `READ_GATHER_MS` (25); `READ_SHARE_MIN` (64; 0 takes everything up to `READ_BATCH`); `READ_SPLIT` (1, off); `READ_SPLIT_MIN` (64); `WRITE_LANES` ((cores + 2) / 4: 2 on 8 or 6 cores); `WRITE_GROUP` (128); `WRITE_GROUP_MIN` (8) and `WRITE_GATHER_MS` (2; 0 never waits); `DB_POOL_SIZE` (cores / 2, capped so the total stays
+at most 95); `BCRYPT_THREADS` ((cores + 2) / 4); `BCRYPT_WIDTH` (4); `BCRYPT_GATHER_MS` (150); `STATS_SECONDS` (0, off); `PHASES_FILE` (none); `BATCH_LOG`, `BATCH_LOG_MS` (25), `BATCH_LOG_PG_CGROUP` (none); `PG_OPTIONS` (the four session settings above); `SCHED_BATCH` (1).
 
 `STATS_SECONDS=1` prints one diagnostic line a second on stderr (`src/Web/Stats.fs`), to line up against the load
 generator's seconds (`t=` is unix seconds):
@@ -382,7 +417,52 @@ generator's seconds (`t=` is unix seconds):
 | `heap`, `gen2`, `loh`, `poh` | sizes after the latest GC (0 before the first) |
 | `cpu`, `pool`, `pending` | the process's cores busy, thread-pool threads, queued work items |
 | `reads q`, `busy`, `batches`, `per`, `worst` | read requests queued, lanes running a batch, batches finished, requests per batch, the longest arrival-to-answer |
-| `writes q` | writes queued for group commit |
+| `writes q`, `busy`, `groups`, `per`, `refused` | writes queued for group commit, the share of time the write lanes spent executing a group, groups committed, writes per group, groups the server refused |
+
+With `STATS_SECONDS` on, the shutdown lines also give the server time per endpoint (named as the load generator
+names them, so a client's latency minus ours is what happened outside the handlers) and the write lanes' queue and
+commit times. With `PHASES_FILE` too, each stats line appends to that file where every request's time went: per
+endpoint and per log2 bucket of server time (under 1 ms, 1-2, 2-4, ... ms), the count and the summed time of the
+read queue, the read batch, the write queue and the write group (`Stats.Phases`, six interlocked adds per
+request). The snapshots are cumulative, so two of them subtracted give any window, and unlike percentiles a
+bucket's phases add up: the slow buckets show which phase made them slow.
+
+`BATCH_LOG=<prefix>` keeps a fine timeline and writes it at shutdown: `<prefix>.batches.csv` has every read batch
+(lane, size, and when it was taken, when phase A, the plan and phase B ended, and when it was answered), and
+`<prefix>.samples.csv` a row every `BATCH_LOG_MS` (25) of cumulative counters: the app's CPU, Postgres's CPU (the
+`usage_usec` of the cgroup `cpu.stat` named by `BATCH_LOG_PG_CGROUP`), how busy the cores this process may run on
+were (`/proc/stat`, Postgres's backends on them included), the GC pause so far, the read lanes busy, the read
+queue, the reads answered and the write queue. Laid out as a Gantt per lane, it tells a dip in CPU from a GC pause
+(the GC threads keep the cores busy while nothing is answered) and from lanes idle between bursts. On 6 pinned
+vCPUs at 120,000 users the cores were 92% busy on average; under 3.5% of the time was GC, and only 1% of the
+25 ms samples under 80% busy held a GC pause. A gen0 budget of 256 MB instead of 64 changed nothing, and 512 MB
+cost more CPU per request.
+
+`<prefix>.gc.csv` has every GC pause, from the runtime's own GC events: its generation and reason, how long
+suspending the threads took, the collection and the whole pause, the bytes promoted out of each generation, each
+generation's size after, and what the marking found alive by root (stacks, finalize queue, handles, older
+generations). At shutdown the log also prints the pauses per generation. On 6 pinned vCPUs at 125,000 users, in
+60 s: 8 gen0 pauses of about 100 ms (up to 158), 3 gen1 of 130 to 230 ms and 2 gen2 of 490 to 540 ms, 4% of the
+time paused. Suspending the threads took about 1 ms; the time went to the collections themselves. Each gen0 kept
+30 to 150 MB alive, nearly all of it reached from older generations (cards), not from stacks, and a gen2 compacted
+a 1.1 GB gen2.
+
+The gen2s at steady state came from the large-object heap: it grew ~5 MB/s with short-lived objects of 85 KB to
+1 MB, and only a full gen2 frees it. With `DOTNET_GCLOHThreshold` at 1 MB those die in gen0 and the large-object heap
+stays flat. Background GC on top removed the blocking gen2 at the end of the ramp. One run each, same rig:
+
+| | p95 | p99 | blocking gen2 | longest pause | gen0 pause p50 | paused |
+|---|--:|--:|--:|--:|--:|--:|
+| before | 409 ms | 650 ms | 2 | 541 ms | 101 ms | 4.0% |
+| LOH threshold 1 MB | 328 ms | 473 ms | 1 | 513 ms | 98 ms | 3.1% |
+| + background GC (now the default) | 355 ms | 466 ms | 0 | 333 ms | 110 ms | 3.2% |
+| LOH 1 MB + 256 MB gen0 | 451 ms | 604 ms | 1 | 524 ms | 147 ms | 3.0% |
+
+A bigger gen0 budget gives fewer but longer gen0 pauses: each keeps about as much alive.
+
+Each kind of connection names itself in Postgres (`application_name`): `conduit-read` (the read lanes),
+`conduit-write` (the write lanes) and `conduit-pool` (the multiplexed pool), so `pg_stat_activity` and probes on
+the backends can tell them apart.
 
 A seconds-long stall that shows up in `pause` (and `dt`) is GC. If `pause` stays small while `reads q` and `worst`
 grow, requests are queueing for the database.

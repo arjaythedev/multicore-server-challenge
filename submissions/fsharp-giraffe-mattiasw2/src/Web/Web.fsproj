@@ -3,9 +3,10 @@
     <TargetFramework>net10.0</TargetFramework>
     <AssemblyName>Web</AssemblyName>
     <!-- As in sss8: server GC with DATAS off. This box has RAM to spare, and DATAS trades
-         throughput for a smaller heap. -->
+         throughput for a smaller heap. Background (concurrent) GC: a gen2 marks alongside the app
+         instead of stopping it for ~500 ms. -->
     <ServerGarbageCollection>true</ServerGarbageCollection>
-    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
     <GarbageCollectionAdaptationMode>0</GarbageCollectionAdaptationMode>
     <TieredPGO>true</TieredPGO>
     <TieredCompilation>true</TieredCompilation>
