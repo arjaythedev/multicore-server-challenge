@@ -26,11 +26,10 @@ cnt AS MATERIALIZED (
                       (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = v.viewer) LIMIT 1000) s) AS n
     FROM (SELECT DISTINCT viewer FROM k) v),
 items AS (
-  SELECT r.i, (SELECT string_agg(e.head
-                                 || EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = e.id AND f.user_id = r.viewer)::text
-                                 || e.mid || 'true}}', ',' ORDER BY e.n)
+  SELECT r.i, (SELECT string_agg(e.head || (e.id = ANY (v.favorited))::text || e.mid || 'true}}', ',' ORDER BY e.n)
                  FROM unnest(p.ids, p.authors, p.heads, p.mids) WITH ORDINALITY AS e(id, author_id, head, mid, n)) AS items
-    FROM r JOIN pages p ON p.viewer = r.viewer AND p.page_limit = r.page_limit AND p.page_offset = r.page_offset)
+    FROM r JOIN pages p ON p.viewer = r.viewer AND p.page_limit = r.page_limit AND p.page_offset = r.page_offset
+    CROSS JOIN LATERAL ({{_viewer_marks}}) v)
 SELECT r.i, coalesce(r.astatus, r.pstatus, 200) AS status,
        CASE WHEN r.astatus IS NOT NULL THEN r.abody
             WHEN r.pstatus IS NOT NULL THEN r.pbody

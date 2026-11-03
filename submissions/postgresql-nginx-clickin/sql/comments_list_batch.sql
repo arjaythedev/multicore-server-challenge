@@ -24,8 +24,8 @@ SELECT r.i, coalesce(r.astatus, CASE WHEN cs.id IS NULL THEN 404 ELSE 200 END) A
        CASE WHEN r.astatus IS NOT NULL THEN r.abody
             WHEN cs.id IS NULL THEN '{"errors":{"body":["article not found"]}}'
             ELSE '{"comments":[' || coalesce(
-                   (SELECT string_agg(e.head || EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.viewer
-                                                                                  AND fo.followee_id = e.author_id)::text
-                                      || '}}', ',' ORDER BY e.n)
+                   (SELECT string_agg(e.head || (e.author_id = ANY (fl.following))::text || '}}', ',' ORDER BY e.n)
                       FROM unnest(cs.authors, cs.heads) WITH ORDINALITY AS e(author_id, head, n)), '') || ']}' END AS body
   FROM r LEFT JOIN cs ON cs.slug = r.slug
+  LEFT JOIN LATERAL (SELECT ARRAY(SELECT fo.followee_id FROM follows fo
+                                   WHERE fo.follower_id = r.viewer AND fo.followee_id = ANY (cs.authors)) AS following) fl ON true

@@ -8,7 +8,7 @@ cd "$(dirname "$0")"
 : "${DATABASE_URL:?}" "${JWT_SECRET:?}" "${HOST:=0.0.0.0}" "${PORT:=80}"
 WORKERS=${NGINX_WORKERS:-$(nproc)}
 THREADS=${SQL_THREADS:-3}; [ $(( THREADS * WORKERS )) -gt 95 ] && THREADS=$(( 95 / WORKERS ))
-BATCH_MAX=${SQL_BATCH_MAX:-128} BATCH_INFLIGHT=${SQL_BATCH_INFLIGHT:-1}
+BATCH_MAX=${SQL_BATCH_MAX:-128} BATCH_INFLIGHT=${SQL_BATCH_INFLIGHT:-1} BATCH_WAIT=${SQL_BATCH_WAIT:-0ms}
 
 # HMAC-SHA256's two padded keys (RFC 2104) depend only on JWT_SECRET, so they are worked out once here and handed
 # to the SQL as hex (sql/_hmac_keys.sql). The HMAC itself is still computed in SQL for every token.
@@ -29,6 +29,7 @@ mkdir -p run
 {
   [ "$(id -u)" = 0 ] && echo "user root;"     # started as root, nginx would drop its workers to "nobody"
   sed -e "s|__LISTEN__|$HOST:$PORT|" -e "s|__ROOT__|$PWD|g" -e "s|__WORKERS__|$WORKERS|" -e "s|__THREADS__|$THREADS|" \
-      -e "s|__BATCH_MAX__|$BATCH_MAX|" -e "s|__BATCH_INFLIGHT__|$BATCH_INFLIGHT|" nginx.conf
+      -e "s|__BATCH_MAX__|$BATCH_MAX|" -e "s|__BATCH_INFLIGHT__|$BATCH_INFLIGHT|" \
+      -e "s|__BATCH_WAIT__|$BATCH_WAIT|" nginx.conf
 } > run/nginx.conf
 exec build/nginx/sbin/nginx -p "$PWD/run/" -c "$PWD/run/nginx.conf" -e stderr

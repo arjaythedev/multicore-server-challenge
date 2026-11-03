@@ -49,15 +49,12 @@ cnt AS MATERIALIZED (
          END AS n
     FROM (SELECT DISTINCT kind, key FROM k) kk),
 items AS (
-  SELECT r.i, (SELECT string_agg(e.head
-                                 || EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = e.id AND f.user_id = r.viewer)::text
-                                 || e.mid
-                                 || EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.viewer
-                                                                       AND fo.followee_id = e.author_id)::text
-                                 || '}}', ',' ORDER BY e.n)
+  SELECT r.i, (SELECT string_agg(e.head || (e.id = ANY (v.favorited))::text || e.mid
+                                 || (e.author_id = ANY (v.following))::text || '}}', ',' ORDER BY e.n)
                  FROM unnest(p.ids, p.authors, p.heads, p.mids) WITH ORDINALITY AS e(id, author_id, head, mid, n)) AS items
     FROM r JOIN pages p ON p.kind = r.kind AND p.key = r.key AND p.page_limit = r.page_limit
-                       AND p.page_offset = r.page_offset)
+                       AND p.page_offset = r.page_offset
+    CROSS JOIN LATERAL ({{_viewer_marks}}) v)
 SELECT r.i, coalesce(r.astatus, r.pstatus, 200) AS status,
        CASE WHEN r.astatus IS NOT NULL THEN r.abody
             WHEN r.pstatus IS NOT NULL THEN r.pbody

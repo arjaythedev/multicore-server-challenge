@@ -86,6 +86,7 @@ typedef struct {
     ngx_thread_pool_t *pool;
     ngx_uint_t   batch_max;
     ngx_uint_t   batch_inflight;
+    ngx_msec_t   batch_wait;
 } sql_main_conf_t;
 
 typedef struct {
@@ -130,6 +131,8 @@ static ngx_command_t ngx_http_sql_commands[] = {
       NGX_HTTP_MAIN_CONF_OFFSET, offsetof(sql_main_conf_t, batch_max), NULL },
     { ngx_string("sql_batch_inflight"), NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1, ngx_conf_set_num_slot,
       NGX_HTTP_MAIN_CONF_OFFSET, offsetof(sql_main_conf_t, batch_inflight), NULL },
+    { ngx_string("sql_batch_wait"), NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1, ngx_conf_set_msec_slot,
+      NGX_HTTP_MAIN_CONF_OFFSET, offsetof(sql_main_conf_t, batch_wait), NULL },
     ngx_null_command
 };
 
@@ -160,6 +163,7 @@ ngx_http_sql_create_main_conf(ngx_conf_t *cf)
     mcf->stmts = ngx_array_create(cf->pool, 32, sizeof(sql_stmt_t));
     mcf->batch_max = NGX_CONF_UNSET_UINT;
     mcf->batch_inflight = NGX_CONF_UNSET_UINT;
+    mcf->batch_wait = NGX_CONF_UNSET_MSEC;
     return mcf->stmts ? mcf : NULL;
 }
 
@@ -170,6 +174,7 @@ ngx_http_sql_init_main_conf(ngx_conf_t *cf, void *conf)
 
     ngx_conf_init_uint_value(mcf->batch_max, 128);
     ngx_conf_init_uint_value(mcf->batch_inflight, 1);
+    ngx_conf_init_msec_value(mcf->batch_wait, 0);
     if (mcf->batch_max < 1 || mcf->batch_inflight < 1) {
         return "sql_batch_max and sql_batch_inflight must be at least 1";
     }
@@ -976,6 +981,9 @@ flush_queue(sql_route_t *route, sql_main_conf_t *mcf, ngx_log_t *log)
     if (route->flush.posted) {
         ngx_delete_posted_event(&route->flush);
     }
+    if (route->flush.timer_set) {
+        ngx_del_timer(&route->flush);
+    }
     task = ngx_calloc(size, log);
     if (task == NULL) {
         return;                         /* the requests stay queued: the next flush takes them */
@@ -1020,6 +1028,7 @@ enqueue(sql_route_t *route, sql_main_conf_t *mcf, sql_task_ctx_t *t, ngx_log_t *
         route->flush.handler = ngx_http_sql_flush_event;
         route->flush.data = route;
         route->flush.log = ngx_cycle->log;
+        route->flush.cancelable = 1;
     }
     if (route->nqueue == mcf->batch_max) {
         return NGX_ERROR;               /* only when the thread pool refused a full queue */
@@ -1027,8 +1036,12 @@ enqueue(sql_route_t *route, sql_main_conf_t *mcf, sql_task_ctx_t *t, ngx_log_t *
     route->queue[route->nqueue++] = t;
     if (route->nqueue == mcf->batch_max) {
         flush_queue(route, mcf, log);
-    } else if (!route->flush.posted && route->inflight < mcf->batch_inflight) {
-        ngx_post_event(&route->flush, &ngx_posted_events);   /* after this round of events: gathers what it read */
+    } else if (!route->flush.posted && !route->flush.timer_set && route->inflight < mcf->batch_inflight) {
+        if (mcf->batch_wait) {
+            ngx_add_timer(&route->flush, mcf->batch_wait);    /* sql_batch_wait: gather a little longer */
+        } else {
+            ngx_post_event(&route->flush, &ngx_posted_events);   /* after this round of events: gathers what it read */
+        }
     }
     return NGX_OK;
 }
