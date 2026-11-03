@@ -4,7 +4,7 @@ Every submission on the same box: **8 dedicated vCPU / 16 GB**, Postgres 18 on t
 
 | # | Users | Submission | PR | Front | req/s | p95 ms | p99 ms | CPU: app / Postgres | Note |
 |--:|--:|---|---|---|--:|--:|--:|---|---|
-| 1 | **220,000** | [rust-epoll-theCatWisel](submissions/rust-epoll-theCatWisel) | [#191](https://github.com/arjaythedev/multicore-server-challenge/pull/191) @theCatWisel | direct | 55,975 | 317 | 422 | 47% / 48% |  |
+| 1 | **220,000** | [rust-epoll-theCatWisel](submissions/rust-epoll-theCatWisel) | [#191](https://github.com/arjaythedev/multicore-server-challenge/pull/191) @theCatWisel | direct | 56,623 | 198 | 273 | 40% / 49% | Update #201 scored at commit 64438eb (same 220,000 as merged #191); the PR's newer commit f4fd833 is queued for its own run |
 | 2 | **220,000** | [zig-iouring-nick-potts](submissions/zig-iouring-nick-potts) | [#168](https://github.com/arjaythedev/multicore-server-challenge/pull/168) @nick-potts | direct | 55,763 | 316 | 438 | 36% / 53% |  |
 | 3 | **200,000** | [nish-std-amritk](submissions/nish-std-amritk) | [#196](https://github.com/arjaythedev/multicore-server-challenge/pull/196) @amritk | direct | 49,464 | 402 | 473 | 40% / 42% |  |
 | 4 | **190,000** | [asm-epoll-nickita-khylkouski](submissions/asm-epoll-nickita-khylkouski) | [#130](https://github.com/arjaythedev/multicore-server-challenge/pull/130) @nickita-khylkouski | direct | 49,536 | 152 | 241 | 30% / 61% |  |
