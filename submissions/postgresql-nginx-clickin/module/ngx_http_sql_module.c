@@ -13,6 +13,15 @@
  * statement's first row becomes a value too, for the statements after it. The first row with a non-NULL
  * "status" column is the response: that status, with the "body" column as the JSON body (NULL = empty).
  *
+ * Batches. "sql_batch METHOD x_batch.sql" after a route gives it a second, set-oriented statement. Requests for
+ * that route are then queued in the worker's event loop and run together, as one statement on one connection:
+ * each request value becomes a text[] with one element per request (constants such as env: values stay plain
+ * text, and :batch_size is the number of requests), and the statement answers one row per request with the
+ * columns i (1-based place in the arrays), status and body. A queue is sent when the route has no batch in
+ * flight (so requests gather while the previous batch runs), or when it reaches sql_batch_max requests. A batch
+ * of one request, a statement error and any request the batch left unanswered all fall back to the route's own
+ * statements, one request at a time.
+ *
  * Postgres can't do bcrypt here (no extensions), so two column names ask this module for it:
  *   bcrypt_password            -> hashed with bcrypt cost 10 into the value bcrypt_hash (NULL stays NULL)
  *   check_password, check_hash -> compared with bcrypt; a mismatch answers 401
@@ -50,17 +59,34 @@ typedef struct {
     ngx_str_t    literal;
 } sql_param_t;
 
+typedef struct sql_task_ctx_s sql_task_ctx_t;
+
+/* Where each $n of a batch statement comes from. */
+#define SQL_BATCH_SIZE   -1   /* :batch_size */
+#define SQL_BATCH_NULL   -2   /* not a value of this route: NULL */
+
 typedef struct {
     ngx_uint_t   method;      /* NGX_HTTP_GET, ... */
     ngx_uint_t   steps[SQL_MAX_STEPS];
     ngx_uint_t   nsteps;
     ngx_array_t  params;      /* sql_param_t */
+
+    /* sql_batch: the statement, where its $n come from, and this worker's queue */
+    ngx_uint_t   batch;       /* 0: none; else statement index + 1 */
+    ngx_int_t    batch_src[SQL_MAX_VALUES];   /* index into params, or SQL_BATCH_* */
+    sql_task_ctx_t **queue;   /* ngx_alloc()'d in the worker, sql_batch_max long */
+    ngx_uint_t   nqueue;
+    ngx_uint_t   inflight;
+    ngx_event_t  flush;       /* posted when the first request is queued */
 } sql_route_t;
 
 typedef struct {
     ngx_str_t    dir;
     ngx_array_t *stmts;       /* sql_stmt_t, shared by every route */
     ngx_thread_pool_t *pool;
+    ngx_uint_t   batch_max;
+    ngx_uint_t   batch_inflight;
+    ngx_msec_t   batch_wait;
 } sql_main_conf_t;
 
 typedef struct {
@@ -68,7 +94,7 @@ typedef struct {
 } sql_loc_conf_t;
 
 /* A task on the thread pool: request values in, response out. Only malloc() inside the thread. */
-typedef struct {
+struct sql_task_ctx_s {
     ngx_http_request_t *r;
     sql_route_t        *route;
     char               *names[SQL_MAX_VALUES];
@@ -77,25 +103,44 @@ typedef struct {
     ngx_int_t           status;
     char               *body;      /* malloc() */
     size_t              body_len;
-} sql_task_ctx_t;
+};
+
+/* A batch on the thread pool: the requests of one route's queue. */
+typedef struct {
+    sql_route_t        *route;
+    sql_main_conf_t    *mcf;
+    ngx_uint_t          n;
+    sql_task_ctx_t     *reqs[1];   /* n of them */
+} sql_batch_t;
 
 static ngx_int_t ngx_http_sql_init(ngx_conf_t *cf);
 static void *ngx_http_sql_create_main_conf(ngx_conf_t *cf);
 static void *ngx_http_sql_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_sql_dir(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static char *ngx_http_sql_route(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static char *ngx_http_sql_batch(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 
 static ngx_command_t ngx_http_sql_commands[] = {
     { ngx_string("sql_dir"), NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1, ngx_http_sql_dir,
       NGX_HTTP_MAIN_CONF_OFFSET, 0, NULL },
     { ngx_string("sql"), NGX_HTTP_LOC_CONF | NGX_CONF_2MORE, ngx_http_sql_route,
       NGX_HTTP_LOC_CONF_OFFSET, 0, NULL },
+    { ngx_string("sql_batch"), NGX_HTTP_LOC_CONF | NGX_CONF_TAKE2, ngx_http_sql_batch,
+      NGX_HTTP_LOC_CONF_OFFSET, 0, NULL },
+    { ngx_string("sql_batch_max"), NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1, ngx_conf_set_num_slot,
+      NGX_HTTP_MAIN_CONF_OFFSET, offsetof(sql_main_conf_t, batch_max), NULL },
+    { ngx_string("sql_batch_inflight"), NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1, ngx_conf_set_num_slot,
+      NGX_HTTP_MAIN_CONF_OFFSET, offsetof(sql_main_conf_t, batch_inflight), NULL },
+    { ngx_string("sql_batch_wait"), NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1, ngx_conf_set_msec_slot,
+      NGX_HTTP_MAIN_CONF_OFFSET, offsetof(sql_main_conf_t, batch_wait), NULL },
     ngx_null_command
 };
 
+static char *ngx_http_sql_init_main_conf(ngx_conf_t *cf, void *conf);
+
 static ngx_http_module_t ngx_http_sql_module_ctx = {
     NULL, ngx_http_sql_init,
-    ngx_http_sql_create_main_conf, NULL,
+    ngx_http_sql_create_main_conf, ngx_http_sql_init_main_conf,
     NULL, NULL,
     ngx_http_sql_create_loc_conf, NULL
 };
@@ -116,7 +161,24 @@ ngx_http_sql_create_main_conf(ngx_conf_t *cf)
         return NULL;
     }
     mcf->stmts = ngx_array_create(cf->pool, 32, sizeof(sql_stmt_t));
+    mcf->batch_max = NGX_CONF_UNSET_UINT;
+    mcf->batch_inflight = NGX_CONF_UNSET_UINT;
+    mcf->batch_wait = NGX_CONF_UNSET_MSEC;
     return mcf->stmts ? mcf : NULL;
+}
+
+static char *
+ngx_http_sql_init_main_conf(ngx_conf_t *cf, void *conf)
+{
+    sql_main_conf_t *mcf = conf;
+
+    ngx_conf_init_uint_value(mcf->batch_max, 128);
+    ngx_conf_init_uint_value(mcf->batch_inflight, 1);
+    ngx_conf_init_msec_value(mcf->batch_wait, 0);
+    if (mcf->batch_max < 1 || mcf->batch_inflight < 1) {
+        return "sql_batch_max and sql_batch_inflight must be at least 1";
+    }
+    return NGX_CONF_OK;
 }
 
 static void *
@@ -316,7 +378,7 @@ ngx_http_sql_route(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return "needs sql_dir before it";
     }
     if (lcf->routes == NULL) {
-        lcf->routes = ngx_array_create(cf->pool, 4, sizeof(sql_route_t));
+        lcf->routes = ngx_array_create(cf->pool, 4, sizeof(sql_route_t));   /* one per method: never grows */
         if (lcf->routes == NULL) {
             return NGX_CONF_ERROR;
         }
@@ -399,6 +461,53 @@ ngx_http_sql_route(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
     clcf->handler = ngx_http_sql_handler;
+    return NGX_CONF_OK;
+}
+
+/* sql_batch METHOD x_batch.sql: the set-oriented statement for the route of that method above it */
+static char *
+ngx_http_sql_batch(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    sql_loc_conf_t  *lcf = conf;
+    sql_main_conf_t *mcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_sql_module);
+    ngx_str_t       *v = cf->args->elts;
+    sql_route_t     *route = NULL, *routes;
+    sql_stmt_t      *st;
+    sql_param_t     *pm;
+    ngx_uint_t       i, id;
+
+    routes = lcf->routes ? lcf->routes->elts : NULL;
+    for (i = 0; lcf->routes != NULL && i < lcf->routes->nelts; i++) {
+        if ((routes[i].method == NGX_HTTP_GET && ngx_strcmp(v[1].data, "GET") == 0)
+            || (routes[i].method == NGX_HTTP_POST && ngx_strcmp(v[1].data, "POST") == 0)
+            || (routes[i].method == NGX_HTTP_PUT && ngx_strcmp(v[1].data, "PUT") == 0)
+            || (routes[i].method == NGX_HTTP_DELETE && ngx_strcmp(v[1].data, "DELETE") == 0))
+        {
+            route = &routes[i];
+        }
+    }
+    if (route == NULL) {
+        return "needs a \"sql\" route of that method before it";
+    }
+    if (load_stmt(cf, mcf, v[2].data, v[2].len, &id) != NGX_OK) {
+        return "cannot load SQL";
+    }
+    route->batch = id + 1;
+    st = (sql_stmt_t *) mcf->stmts->elts + id;
+    pm = route->params.elts;
+    for (int k = 0; k < st->nparams; k++) {
+        route->batch_src[k] = SQL_BATCH_NULL;
+        if (strcmp(st->names[k], "batch_size") == 0) {
+            route->batch_src[k] = SQL_BATCH_SIZE;
+        }
+        for (i = 0; i < route->params.nelts; i++) {
+            if (pm[i].name.len == strlen(st->names[k])
+                && ngx_strncmp(pm[i].name.data, st->names[k], pm[i].name.len) == 0)
+            {
+                route->batch_src[k] = i;
+            }
+        }
+    }
     return NGX_CONF_OK;
 }
 
@@ -523,18 +632,33 @@ bcrypt_check(const char *password, const char *hash)
     return ok;
 }
 
-static void
-ngx_http_sql_thread(void *data, ngx_log_t *log)
+/* Prepare statement id on this thread's connection the first time it runs there. */
+static int
+prepare(PGconn *c, sql_main_conf_t *mcf, ngx_uint_t id, char *name, ngx_log_t *log)
 {
-    sql_task_ctx_t  *t = data;
-    sql_main_conf_t *mcf = ngx_http_get_module_main_conf(t->r, ngx_http_sql_module);
-    sql_stmt_t      *stmts = mcf->stmts->elts;
-    PGconn          *c = thread_conn(mcf->stmts->nelts, log);
+    sql_stmt_t *st = (sql_stmt_t *) mcf->stmts->elts + id;
+    PGresult   *res;
+    int         ok;
 
-    if (c == NULL) {
-        respond(t, 500, ERR_500);
-        return;
+    snprintf(name, 16, "s%lu", (unsigned long) id);
+    if (tl_prepared[id]) {
+        return 1;
     }
+    res = PQprepare(c, name, st->sql, 0, NULL);
+    ok = PQresultStatus(res) == PGRES_COMMAND_OK;
+    if (!ok) {
+        ngx_log_error(NGX_LOG_ERR, log, 0, "sql: prepare: %s", PQresultErrorMessage(res));
+    }
+    PQclear(res);
+    tl_prepared[id] = ok;
+    return ok;
+}
+
+/* One request: the route's statements in order, until one sets a status. */
+static void
+run_steps(sql_task_ctx_t *t, sql_main_conf_t *mcf, PGconn *c, ngx_log_t *log)
+{
+    sql_stmt_t *stmts = mcf->stmts->elts;
 
     for (ngx_uint_t s = 0; s < t->route->nsteps && t->status == 0; s++) {
         ngx_uint_t   id = t->route->steps[s];
@@ -542,21 +666,10 @@ ngx_http_sql_thread(void *data, ngx_log_t *log)
         char         name[16];
         const char  *vals[SQL_MAX_VALUES];
         PGresult    *res;
-        int          ok;
 
-        snprintf(name, sizeof(name), "s%lu", (unsigned long) id);
-        if (!tl_prepared[id]) {
-            res = PQprepare(c, name, st->sql, 0, NULL);
-            ok = PQresultStatus(res) == PGRES_COMMAND_OK;
-            if (!ok) {
-                ngx_log_error(NGX_LOG_ERR, log, 0, "sql: prepare: %s", PQresultErrorMessage(res));
-            }
-            PQclear(res);
-            if (!ok) {
-                respond(t, 500, ERR_500);
-                break;
-            }
-            tl_prepared[id] = 1;
+        if (!prepare(c, mcf, id, name, log)) {
+            respond(t, 500, ERR_500);
+            break;
         }
         for (int i = 0; i < st->nparams; i++) {
             vals[i] = get_value(t, st->names[i]);
@@ -627,6 +740,145 @@ ngx_http_sql_thread(void *data, ngx_log_t *log)
     }
 }
 
+static void
+ngx_http_sql_thread(void *data, ngx_log_t *log)
+{
+    sql_task_ctx_t  *t = data;
+    sql_main_conf_t *mcf = ngx_http_get_module_main_conf(t->r, ngx_http_sql_module);
+    PGconn          *c = thread_conn(mcf->stmts->nelts, log);
+
+    if (c == NULL) {
+        respond(t, 500, ERR_500);
+        return;
+    }
+    run_steps(t, mcf, c, log);
+}
+
+/* A Postgres text[] literal of one value of every request: {"a",NULL,"b\"c"}. malloc()'d. */
+static char *
+array_literal(sql_batch_t *b, ngx_uint_t pi)
+{
+    size_t  len = 3;
+    char   *out, *d;
+
+    for (ngx_uint_t k = 0; k < b->n; k++) {
+        const char *v = b->reqs[k]->values[pi];
+
+        len += v ? strlen(v) * 2 + 3 : 5;
+    }
+    out = malloc(len);
+    if (out == NULL) {
+        return NULL;
+    }
+    d = out;
+    *d++ = '{';
+    for (ngx_uint_t k = 0; k < b->n; k++) {
+        const char *v = b->reqs[k]->values[pi];
+
+        if (k > 0) {
+            *d++ = ',';
+        }
+        if (v == NULL) {
+            memcpy(d, "NULL", 4);
+            d += 4;
+            continue;
+        }
+        *d++ = '"';
+        for (; *v; v++) {
+            if (*v == '"' || *v == '\\') {
+                *d++ = '\\';
+            }
+            *d++ = *v;
+        }
+        *d++ = '"';
+    }
+    *d++ = '}';
+    *d = '\0';
+    return out;
+}
+
+/* Run a batch statement; answer the requests it answers. The rest fall back to run_steps(). */
+static void
+run_batch(sql_batch_t *b, PGconn *c, ngx_log_t *log)
+{
+    sql_route_t *route = b->route;
+    ngx_uint_t   id = route->batch - 1;
+    sql_stmt_t  *st = (sql_stmt_t *) b->mcf->stmts->elts + id;
+    char         name[16], size[24], *arrays[SQL_MAX_VALUES];
+    const char  *vals[SQL_MAX_VALUES];
+    PGresult    *res;
+    int          fi, fs, fb, ok = 1;
+
+    if (!prepare(c, b->mcf, id, name, log)) {
+        return;
+    }
+    snprintf(size, sizeof(size), "%lu", (unsigned long) b->n);
+    for (int k = 0; k < st->nparams; k++) {
+        ngx_int_t    src = route->batch_src[k];
+        sql_param_t *pm = route->params.elts;
+
+        arrays[k] = NULL;
+        vals[k] = NULL;
+        if (src == SQL_BATCH_SIZE) {
+            vals[k] = size;
+        } else if (src >= 0 && pm[src].index == NGX_ERROR) {      /* a constant: the same for every request */
+            vals[k] = b->reqs[0]->values[src];
+        } else if (src >= 0) {
+            arrays[k] = array_literal(b, src);
+            vals[k] = arrays[k];
+            ok = ok && arrays[k] != NULL;
+        }
+    }
+    if (ok) {
+        res = PQexecPrepared(c, name, st->nparams, vals, NULL, NULL, 0);
+        fi = PQfnumber(res, "i");
+        fs = PQfnumber(res, "status");
+        fb = PQfnumber(res, "body");
+        if (PQresultStatus(res) == PGRES_TUPLES_OK && fi >= 0 && fs >= 0 && fb >= 0) {
+            for (int row = 0; row < PQntuples(res); row++) {
+                const char *i = PQgetvalue(res, row, fi), *status = PQgetvalue(res, row, fs);
+                ngx_int_t   k = ngx_atoi((u_char *) i, strlen(i)) - 1;
+
+                if (k >= 0 && (ngx_uint_t) k < b->n && b->reqs[k]->status == 0 && !PQgetisnull(res, row, fs)) {
+                    respond(b->reqs[k], ngx_atoi((u_char *) status, strlen(status)),
+                            PQgetisnull(res, row, fb) ? NULL : PQgetvalue(res, row, fb));
+                }
+            }
+        } else {
+            ngx_log_error(NGX_LOG_WARN, log, 0, "sql: batch %s of %ui: %s", name, b->n, PQresultErrorMessage(res));
+        }
+        PQclear(res);
+        if (PQtransactionStatus(c) != PQTRANS_IDLE) {
+            PQclear(PQexec(c, "ROLLBACK"));
+        }
+    }
+    for (int k = 0; k < st->nparams; k++) {
+        free(arrays[k]);
+    }
+}
+
+static void
+ngx_http_sql_batch_thread(void *data, ngx_log_t *log)
+{
+    sql_batch_t *b = data;
+    PGconn      *c = thread_conn(b->mcf->stmts->nelts, log);
+
+    if (c == NULL) {
+        for (ngx_uint_t k = 0; k < b->n; k++) {
+            respond(b->reqs[k], 500, ERR_500);
+        }
+        return;
+    }
+    if (b->n > 1) {
+        run_batch(b, c, log);
+    }
+    for (ngx_uint_t k = 0; k < b->n; k++) {                   /* a batch of one, or what the batch left */
+        if (b->reqs[k]->status == 0) {
+            run_steps(b->reqs[k], b->mcf, c, log);
+        }
+    }
+}
+
 /* ---- the event loop side ---------------------------------------------------------------------------------- */
 
 static ngx_int_t
@@ -689,6 +941,111 @@ ngx_http_sql_done(ngx_event_t *ev)
     ngx_http_run_posted_requests(c);
 }
 
+static void flush_queue(sql_route_t *route, sql_main_conf_t *mcf, ngx_log_t *log);
+
+static void
+ngx_http_sql_batch_done(ngx_event_t *ev)
+{
+    sql_batch_t     *b = ev->data;
+    sql_route_t     *route = b->route;
+    sql_main_conf_t *mcf = b->mcf;
+    ngx_log_t       *log = ev->log;
+
+    for (ngx_uint_t k = 0; k < b->n; k++) {
+        sql_task_ctx_t     *t = b->reqs[k];
+        ngx_http_request_t *r = t->r;
+        ngx_connection_t   *c = r->connection;
+        ngx_int_t           rc;
+
+        rc = send_response(r, t->status, t->body, t->body_len);
+        free_task(t);
+        ngx_http_finalize_request(r, rc);
+        ngx_http_run_posted_requests(c);
+    }
+    route->inflight--;
+    ngx_free((ngx_thread_task_t *) b - 1);
+    if (route->nqueue > 0) {           /* gathered while this batch ran */
+        flush_queue(route, mcf, log);
+    }
+}
+
+/* Send the route's queue to the thread pool as one batch. */
+static void
+flush_queue(sql_route_t *route, sql_main_conf_t *mcf, ngx_log_t *log)
+{
+    ngx_thread_task_t *task;
+    sql_batch_t       *b;
+    size_t             size = sizeof(ngx_thread_task_t) + sizeof(sql_batch_t)
+                              + (route->nqueue - 1) * sizeof(sql_task_ctx_t *);
+
+    if (route->flush.posted) {
+        ngx_delete_posted_event(&route->flush);
+    }
+    if (route->flush.timer_set) {
+        ngx_del_timer(&route->flush);
+    }
+    task = ngx_calloc(size, log);
+    if (task == NULL) {
+        return;                         /* the requests stay queued: the next flush takes them */
+    }
+    b = (sql_batch_t *) (task + 1);
+    b->route = route;
+    b->mcf = mcf;
+    b->n = route->nqueue;
+    ngx_memcpy(b->reqs, route->queue, route->nqueue * sizeof(sql_task_ctx_t *));
+    task->ctx = b;
+    task->handler = ngx_http_sql_batch_thread;
+    task->event.data = b;
+    task->event.handler = ngx_http_sql_batch_done;
+    if (ngx_thread_task_post(mcf->pool, task) != NGX_OK) {
+        ngx_free(task);
+        return;
+    }
+    route->nqueue = 0;
+    route->inflight++;
+}
+
+static void
+ngx_http_sql_flush_event(ngx_event_t *ev)
+{
+    sql_route_t     *route = ev->data;
+    sql_main_conf_t *mcf = ngx_http_cycle_get_module_main_conf(ngx_cycle, ngx_http_sql_module);
+
+    if (route->nqueue > 0 && route->inflight < mcf->batch_inflight) {
+        flush_queue(route, mcf, ev->log);
+    }
+}
+
+/* Queue a request of a route that has a batch statement. */
+static ngx_int_t
+enqueue(sql_route_t *route, sql_main_conf_t *mcf, sql_task_ctx_t *t, ngx_log_t *log)
+{
+    if (route->queue == NULL) {         /* first use in this worker */
+        route->queue = ngx_alloc(mcf->batch_max * sizeof(sql_task_ctx_t *), log);
+        if (route->queue == NULL) {
+            return NGX_ERROR;
+        }
+        route->flush.handler = ngx_http_sql_flush_event;
+        route->flush.data = route;
+        route->flush.log = ngx_cycle->log;
+        route->flush.cancelable = 1;
+    }
+    if (route->nqueue == mcf->batch_max) {
+        return NGX_ERROR;               /* only when the thread pool refused a full queue */
+    }
+    route->queue[route->nqueue++] = t;
+    if (route->nqueue == mcf->batch_max) {
+        flush_queue(route, mcf, log);
+    } else if (!route->flush.posted && !route->flush.timer_set && route->inflight < mcf->batch_inflight) {
+        if (mcf->batch_wait) {
+            ngx_add_timer(&route->flush, mcf->batch_wait);    /* sql_batch_wait: gather a little longer */
+        } else {
+            ngx_post_event(&route->flush, &ngx_posted_events);   /* after this round of events: gathers what it read */
+        }
+    }
+    return NGX_OK;
+}
+
 static void
 ngx_http_sql_body_read(ngx_http_request_t *r)
 {
@@ -710,12 +1067,17 @@ ngx_http_sql_body_read(ngx_http_request_t *r)
         return;
     }
 
-    task = ngx_thread_task_alloc(r->pool, sizeof(sql_task_ctx_t));
-    if (task == NULL) {
+    if (route->batch) {
+        task = NULL;
+        t = ngx_pcalloc(r->pool, sizeof(sql_task_ctx_t));
+    } else {
+        task = ngx_thread_task_alloc(r->pool, sizeof(sql_task_ctx_t));
+        t = task ? task->ctx : NULL;
+    }
+    if (t == NULL) {
         ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
     }
-    t = task->ctx;
     t->r = r;
     t->route = route;
 
@@ -777,6 +1139,13 @@ ngx_http_sql_body_read(ngx_http_request_t *r)
         set_value(t, n, (char *) s);
     }
 
+    if (route->batch) {
+        if (enqueue(route, mcf, t, r->connection->log) != NGX_OK) {
+            free_task(t);
+            ngx_http_finalize_request(r, NGX_HTTP_SERVICE_UNAVAILABLE);
+        }
+        return;
+    }
     task->handler = ngx_http_sql_thread;
     task->event.data = t;
     task->event.handler = ngx_http_sql_done;
