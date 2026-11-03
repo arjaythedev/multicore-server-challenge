@@ -15,3 +15,5 @@
 {"id":"e15","label":"e15-over","what":"overload defenses: per-event try/with, spare fd at EMFILE, 503 past 150k queued, unhandled logging","kind":"structural","score":null,"note":"robustness"}
 {"id":"e16","label":"e16-reconn","what":"connection threads reconnect with retries","kind":"structural","score":null,"note":"robustness"}
 {"id":"e17","label":"e17-fl","what":"each feed viewer's follows read once (fl CTE) and reused for hubs, bounds, page, count, flags","kind":"structural","score":null,"note":"real batches same rows; buffers 16,208 -> 12,069 fresh, 19,387 -> 14,095 aged follows"}
+{"id":"e18","label":"e18-no503","what":"no 503 backlog cap; reads of disconnected clients dropped from batches; dispatch waits for pending output","kind":"structural","score":null,"note":"rules: no load shedding against the error budget"}
+{"id":"e19","label":"e19-uring","what":"io_uring loops (IO_MODE=uring): multishot accept/recv, buffer ring with 6.8 resv workaround or classic PROVIDE_BUFFERS, ring sends","kind":"structural","score":null,"note":"197/197 epoll, uring, uring+classic; lane A/B comparison queued"}

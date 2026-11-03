@@ -91,11 +91,33 @@ Script: `experiments/h.sh`.
   lane answers 503; unhandled exceptions are logged.
 - **e16: connection threads reconnect with retries.** A failed batch reconnected once and let a second failure
   (Postgres full, fd table full) escape the thread, which kills the process.
-- **e01c #87 search** (100k start): 100k 99.2 µs/req (app 47.9, PG 51.3, p95 60 ms), 200k pass 107.9 (app 49.2,
-  PG 58.7, p95 174 ms), 400k fail (14.8% errors), 300k fail (6.8% errors, timeouts after the overload probe).
+- **e01c #87 search** (solo, 100k start): 100k 99.2 µs/req (app 47.9, PG 51.3, p95 60 ms), 200k pass 107.9 (app
+  49.2, PG 58.7, p95 174 ms), 400k fail (14.8% errors), 300k fail (6.8%), 250k fail (1.97%, p95 635 ms), 220k pass,
+  230k pass (p95 415 ms); **hold 230k pass: p95 474 ms, p99 569 ms, 0.07% errors. Score 230,000** on this harness.
+  At 220k its logins: p95 276 ms, p99 325 ms, no errors.
 - **e17: each feed viewer's follows read once.** A feed viewer's follows were scanned in the hub candidates, once
   per hub bound, in the page scan, in the count probe and again for the `following` flags: five scans and up to 16
   probes. Now one `fl` row per distinct feed viewer holds the followee array and the rest use it (`&&` against
   the hubs, `= ANY` for the page and the count). Same rows on the 40 real batches; buffers per batch 16,208 ->
   12,069 (-26%). On a copy with 10% of `follows` deleted and re-inserted without vacuum (pages no longer
   all-visible, like a long run): 19,387 -> 14,095. Execution time is within noise while a search runs on the box.
+- **Harness: two lanes.** Lane A: app + PG `main` (:5432) on CPUs 0-7, loadgen 8-11, app :80. Lane B: app + PG
+  `laneb` (:5434, same config, seeded from `conduit_seed`) on CPUs 12-19, loadgen 20-23, app :8081. Lane runs
+  compare CPU per request at a fixed load below capacity, within one lane only (the lanes are on different CCDs of
+  the 7900X3D). Probes near capacity and holds run solo. Every phase now also reports login and sign-up p95/p99/errors
+  and every route with a non-2xx status or an error class (`routes.py`). The Postgres and app ports are reserved
+  from the ephemeral range (with 1024-65535, loadgen sockets took :5434 on 127.0.0.1).
+- **e18: no 503s.** The backlog cap (503 past 150,000 queued jobs) is gone: a connection has at most one request in
+  flight, so the queues can't outgrow the open connections, and a 503 would spend the 1% error budget. Instead
+  reads whose client has disconnected (the load generator gives up after 10 s) are dropped from their batch; under
+  overload that is the work that piles up. Writes always run. Also: dispatch waits for a reply to be fully sent
+  before parsing a pipelined request (with epoll a partial send could have let a later reply go first).
+- **e19: io_uring loops** (`IO_MODE=uring`, `native/uring.c` on raw syscalls). Per I/O thread: a multishot accept, a
+  multishot recv per connection into 8,192 provided 2 KB buffers, sends from the pinned reply, an eventfd read for
+  replies from other threads, and one `io_uring_enter` that submits and waits. Setup flags are tried from
+  SINGLE_ISSUER + DEFER_TASKRUN down. The buffers are a buffer ring, registered again with `resv[0] = 1` on EINVAL
+  (Ubuntu 6.8.0-1xx builds have that check inverted, which killed #60 at startup on the scorer), or, if that fails or
+  `URING_BUFS=classic`, handed over with `IORING_OP_PROVIDE_BUFFERS` (the path #168 uses on the scorer). Multishot
+  accept and recv fall back to one-shot on EINVAL, and a loop whose ring can't be opened runs epoll. wsl26 runs 6.18,
+  which doesn't have the bug, so the classic path is tested by forcing it: 197/197 with epoll, uring and uring +
+  classic.
