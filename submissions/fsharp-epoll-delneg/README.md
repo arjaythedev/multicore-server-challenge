@@ -1,5 +1,86 @@
-# F# multicore: epoll, batched Postgres (delneg)
+# F# on epoll, with batched Postgres reads (delneg)
 
 Front: direct
 
-(work in progress)
+| | |
+|---|---|
+| Language | F# 11 on .NET 11 RC3 (official SDK tarball, SHA-512 checked in `install.sh`), ReadyToRun, tiered PGO |
+| HTTP | our own HTTP/1.1 server on epoll (P/Invoke to libc), no ASP.NET |
+| Postgres driver | our own v3 wire client: SCRAM-SHA-256, binary parameters and rows, named prepared statements, pipelining |
+| bcrypt | our own multi-lane EksBlowfish in C (`native/bcrypt.c`), compiled by `build.sh` with gcc |
+| JWT | HS256 with .NET's HMACSHA256; signature, `alg` and `exp` checked on every request |
+| Dependencies | FSharp.Core only, pinned in `src/packages.lock.json` |
+
+```sh
+sudo bash install.sh && bash build.sh
+DATABASE_URL=... JWT_SECRET=... HOST=0.0.0.0 PORT=80 bash start.sh
+```
+
+No caches across requests, no schema or Postgres configuration changes, nothing tuned outside the process.
+
+## How a request flows
+
+```
+ 4 I/O threads (epoll, SO_REUSEPORT)      read lane, 20 ms clock         8 read connections
+ parse in place, JWT, route  ─────────►   one queue for the process ───► one pipelined round trip per batch:
+                                                                          rd, comments, profiles, users, tags
+                         ◄── per-thread reply inbox, one eventfd write per batch of replies ◄──
+                                          write lane, 5 ms clock         4 write connections
+                             ─────────►   one queue for the process ───► one implicit transaction per batch,
+                                                                          answered only after it commits
+                                          bcrypt: 2 threads, 6 lanes
+```
+
+- **I/O.** Each I/O thread has its own epoll set and listener. A request that arrives in one read is parsed straight
+  from the read buffer. The handler either answers at once (validation, auth errors) or queues a job. Replies come
+  back through the thread's inbox, and the thread is woken once per batch of replies, not once per reply. Near the
+  fd limit, the connection that has been idle longest is closed.
+- **Lanes.** All I/O threads feed one read queue and one write queue. One idle connection thread at a time sleeps
+  out the clock (`usleep`) and then takes everything queued; the others block. We started with a timed
+  `Monitor.Wait`, which spins before it blocks: on the write threads that spinning took more CPU than the writes.
+- **One statement for list and article reads.** Every global, tag, author, favorited and feed list and every
+  single-article read in a batch is one execution of one prepared statement (`rd` in `src/Sql.fs`), with the
+  requests passed as arrays. Requests for pages near the top of the same list share one fetch, an article that many
+  requests need is read once, and the authors, favorite counts and tags of the batch's articles come from three
+  lookups in id order. The tag list is read in the same round trip, and its ids put the tag names on the articles.
+- **Feeds.** Followees that several feed viewers in the batch share are probed once. One with 1,000 or more articles
+  proves the capped count for all its followers. Its n-th newest article bounds every other followee scan for those
+  followers (n is the batch's deepest feed page). Both shortcuts are exact.
+- **Comments.** One statement per batch for every thread requested. Each comment author is read once, and the
+  `following` flags look only at the follows from each viewer to the authors in the threads that viewer asked for.
+- **Writes.** A batch's favorites, follows and comment changes go in one implicit transaction (one Sync), one request
+  per user and kind per batch; the rest wait for the next batch. After the commit, comments are answered from their
+  `RETURNING` rows, and favorites and follows go to the read lane to be answered with the article or profile.
+  Sign-ups, settings and article changes each get their own transaction.
+- **bcrypt.** The lanes run in lockstep, so one pass costs about the same for 1 lane or 6: 38 ms for a single hash,
+  11 ms per hash with 6 lanes. Logins are about 0.1% of requests, so a login waits up to 250 ms for the lanes to
+  fill.
+- **Scheduling.** Our threads run under SCHED_BATCH, so waking one doesn't preempt a Postgres backend mid-query.
+  The bcrypt threads also run at nice 5.
+
+## Measured (our box, not the official one)
+
+All numbers are from our own test box: AMD Ryzen 9 7900X3D under WSL2, with Postgres 18 and the server sharing CPUs
+0-7, the real `bench/cmd/loadgen` on other CPUs, the full seed, and the scorer's search (3-minute warm-up, doubling
+2-minute probes, a 5-minute hold). The harness is `experiments/h.sh`, and every experiment is in
+`experiments/worklog.md`.
+
+(results to come)
+
+## Credits
+
+Ideas from other entries, in our own code:
+
+- Batching reads from every connection into one round trip on a clock: #22's batching policy, #47's gather and #79's
+  clock.
+- One statement for all list and article reads in a batch, and comment threads whose follows lookup is scoped to
+  their authors: #168.
+- Feed counts proved by a followee with 1,000+ articles: #61 and #100. The shared-followee bound on feed pages: #102
+  and #105.
+- One tags read answering every tags request in a batch: #48.
+- SCHED_BATCH for the server's threads: #168, measured by #130.
+- Reading each comment author once per execution: #152.
+
+Ours: the lane leader without timed waits, write answers through the read lane, the id-ordered lookups for article
+details, the epoll server, the Postgres client, and the bcrypt core, whose init words are generated from pi by
+`native/gen_pi.py`.
