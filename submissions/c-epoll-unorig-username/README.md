@@ -15,18 +15,21 @@ No caches across requests, no schema or Postgres config changes, no host tuning.
 
 ## Measured results
 
-On one AWS `c7i.2xlarge` running the server and Postgres, 5 load boxes, the repo's `loadgen search` from 8,000 users, one search per
-entry. That box is well above the official one, so only the comparison means anything:
+On one AWS `c7i.2xlarge` running the server and Postgres, with 5 load boxes, the repo's `loadgen search` from 8,000 users, each
+search starting from a freshly seeded database so that holds run on a database aged by the earlier phases. Two searches per
+entry, interleaved. That box is well above the official one, so only the comparison means anything, and it is small:
 
-| Entry | Held | req/s | p95 ms | p99 ms | Box CPU | App / Postgres |
-|---|--:|--:|--:|--:|--:|---|
-| zig-iouring-nick-potts | 190,000 | 47,360 | 498 | 639 | 99% | 29% / 68% |
-| this entry | 140,000 | 34,353 | 500 | 536 | 81% | 24% / 55% |
-| go-epoll-unorig-username | 130,000 | 32,193 | 452 | 592 | 100% | 37% / 62% |
+| Entry | Users held, search 1 | Users held, search 2 | Hold p95 ms (1 / 2) | Hold req/s (1 / 2) |
+|---|--:|--:|--:|--:|
+| zig-iouring-nick-potts | 210,000 | 190,000 | 500 / 412 | 52,375 / 47,773 |
+| this entry | 190,000 | 190,000 | 425 / 480 | 46,741 / 46,620 |
 
-Both this entry and the leader pass 2-minute probes to 256,000 users on a young database, with p95 381 and 415 ms, and then fail
-holds there as the database ages. **The leader holds about a third more.** At its scoring hold this entry isn't out of CPU: batch
-latency sets its limit, and the 160 ms gap below was chosen on a young database, so that choice is suspect.
+This entry failed its 200,000-user hold by 3 ms and 26 ms of p95 (503 and 526 ms); the leader failed it at 569 ms in search 2 and
+stepped from 220,000 to a passing 210,000 in search 1. The same searches before reading flags by pair held 140,000 users for this entry (one search).
+Above its limit this entry's p95 stays near 500-650 ms up to 256,000 users, where the leader's rises past 1,000 ms; at its
+limit this entry's median is higher (about 340-380 ms against 230-290 ms). Searches of the same code differed by up to 20,000
+users, so a difference of one step is within noise. Both entries pass 2-minute probes to 256,000 users and fail holds there as
+the database ages.
 
 ## 1. Flat statements, joined here
 
@@ -38,7 +41,7 @@ keeping joins out of Postgres altogether:
  phase 1   tags, users, list windows, follows of feed viewers, articles by slug, comment threads
  phase 2   each distinct followee's newest ids; the viewer's feed is merged here
  phase 3   article rows for every id on every page
- phase 4   article_tags, favorite counts, authors, favorited pairs, following pairs
+ phase 4   article_tags, favorite counts, authors, then the favorited and following pairs the pages show
 ```
 
 Nothing is materialized, aggregated into arrays or sorted inside Postgres unless an index gives it for free, and a list
@@ -47,10 +50,15 @@ each response is assembled from those pieces. Everything lives in an arena that 
 
 Two details matter a lot:
 
-- **Two-array lookups are pinned to the primary key.** With `user_id = ANY($1) AND article_id = ANY($2)` the generic plan
-  picks `favorites_article_idx` and filters `user_id` linearly: on the first run this statement was 87% of all Postgres
-  statement time. `OFFSET 0` around the primary-key scan pins it, and a hash join applies the second array. `enable_indexscan
-  = off` does not help on Postgres 18: it disables index-only scans too, and the planner then goes by cost.
+- **Flags are read for only the pairs a response shows.** `favorited` and `following` come from primary-key probes on the
+  exact `(viewer, article)` and `(viewer, author)` pairs the batch will render, one probe each, deduplicated. The idea of
+  fetching only the displayed pairs comes from nick-potts' #168 (its README describes `favorited` as an existence check on the
+  viewer and the displayed article, `following` as a lookup of the viewer against only the page's authors, and the comments
+  follows lookup scoped to the thread's authors). The SQL and the pair collection here are written for this entry's flat
+  statements. Before this, the flag statements read every favorite and every followee of each viewer in the batch and hash-joined
+  them against the batch's articles. On a database aged by writes (1.38M articles, 8.45M favorites) that was 30% of Postgres
+  statement time, and moving to pair probes took paired 180k runs from p95 698 and 678 ms to 430 and 436 ms. The old statements
+  remain behind `PAIR_FLAGS=0`.
 - **Feeds merge here, from each followee once.** #154 and #168 compute each viewer's feed page in SQL. Here two viewers sharing
   a followee share its scan, and the server does the merge. Feed requests are a small share of traffic, but their statement was
   29% of Postgres statement time, so this is still where much of the cost sits.
@@ -133,7 +141,8 @@ after the commit.
 Borrowed, by section:
 
 - Section 1: phases of array scans, each article and author read once, fragments rendered once (#154); array-parameter batching
-  (#7); the mutation statements (go-epoll-unorig-username, #89).
+  (#7); the mutation statements (go-epoll-unorig-username, #89); reading flags for only the displayed pairs (the approach
+  described in #168's README; the statements and pair collection are written here).
 - Section 2: the 1,000-article count shortcut (#61, also #105 and #168).
 - Section 3: the drain gap and lanes (#79, #117, #168), a freed connection going to the oldest waiting lane (#154), the cap of 6
   drains and 8 read connections (#168).
