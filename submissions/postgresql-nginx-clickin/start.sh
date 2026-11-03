@@ -24,6 +24,9 @@ for (( i = 0; i < 128; i += 2 )); do
   JWT_HMAC_OPAD+=$(printf %02x $(( 0x${KEY:i:2} ^ 0x5c )))
 done
 export JWT_HMAC_IPAD JWT_HMAC_OPAD
+# Postgres is on 127.0.0.1. libpq's default sslmode=prefer would put TLS on every connection to a server with
+# ssl = on (Ubuntu's default), encrypting every statement and result on both ends of the loopback.
+export PGSSLMODE=${PGSSLMODE:-disable}
 
 mkdir -p run
 {

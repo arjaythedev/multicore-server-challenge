@@ -109,6 +109,10 @@ Then it checks `alg = HS256`, that `exp` is a number in the future, and that `su
 - Writes are committed (autocommit, or the explicit `COMMIT`) before the response is sent.
 - Connections: one per thread-pool thread, 3 threads per nginx worker, so 24 on the box's 8 cores. That held
   more users than 6 or 11 per worker: Postgres shares the cores, and fewer busy backends contend less.
+- No TLS to Postgres: `start.sh` sets `PGSSLMODE=disable` (override it to change). libpq's default, `prefer`,
+  encrypts every statement and result over the loopback when the server has `ssl = on`. Ubuntu's Postgres has
+  that by default, with its snakeoil certificate. Locally, with `ssl = on`, TLS cost 5 % more Postgres CPU per
+  request (0.136 vs 0.129 cores per 1k req/s, two runs each).
 - Shutdown: nginx's thread pool lets a worker go on to `exit()` while its threads are still inside
   `pthread_exit()`. `exit()` runs libcrypto's `OPENSSL_cleanup` (libcrypto comes in with libpq), so a thread still
   freeing its own state could crash the worker with SIGSEGV or "double free" (2 in 30 stops under load, locally).
