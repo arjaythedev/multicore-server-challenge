@@ -40,12 +40,13 @@ WITH g AS MATERIALIZED (
           WHERE %s AND EXISTS (SELECT 1 FROM articles a WHERE a.author_id = c.f ORDER BY a.id DESC OFFSET 999 LIMIT 1)) AS ids
 ), hb AS MATERIALIZED (
   -- feed pages: if a followee has n articles, the n newest of its followers' feeds are no older than its n-th
-  -- newest, so every followee scan for them can stop there (n = the batch's largest feed fetch)
-  SELECT c.f, (SELECT a.id FROM articles a WHERE a.author_id = c.f ORDER BY a.id DESC
-                OFFSET (SELECT coalesce(max(g.lim + g.off), 1) - 1 FROM g WHERE g.k = 4) LIMIT 1) AS b
-    FROM cand c WHERE %s
+  -- newest, so every followee scan for them can stop there. One bound per followee and feed depth n in the batch
+  -- (most feeds are page 1, so their bound is the 10th newest, not the deepest page's)
+  SELECT c.f, n.n, (SELECT a.id FROM articles a WHERE a.author_id = c.f ORDER BY a.id DESC OFFSET n.n - 1 LIMIT 1) AS b
+    FROM cand c, (SELECT DISTINCT g.lim + g.off AS n FROM g WHERE g.k = 4) n WHERE %s
 ), gb AS MATERIALIZED (
-  SELECT g.gi, coalesce((SELECT max(hb.b) FROM hb JOIN follows fo ON fo.followee_id = hb.f AND fo.follower_id = g.kid), 0) AS bound
+  SELECT g.gi, coalesce((SELECT max(hb.b) FROM hb JOIN follows fo ON fo.followee_id = hb.f AND fo.follower_id = g.kid
+                          WHERE hb.n = g.lim + g.off), 0) AS bound
     FROM g WHERE g.k = 4
 ), ga AS MATERIALIZED (
   SELECT g.gi,
@@ -54,11 +55,17 @@ WITH g AS MATERIALIZED (
       WHEN 1 THEN ARRAY(SELECT at.article_id FROM article_tags at WHERE at.tag_id = g.kid ORDER BY at.article_id DESC LIMIT g.lim OFFSET g.off)
       WHEN 2 THEN ARRAY(SELECT a.id FROM articles a WHERE a.author_id = g.kid ORDER BY a.id DESC LIMIT g.lim OFFSET g.off)
       WHEN 3 THEN ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id = g.kid ORDER BY f.article_id DESC LIMIT g.lim OFFSET g.off)
-      ELSE ARRAY(SELECT x.id FROM follows fo CROSS JOIN LATERAL (
-                   SELECT a2.id FROM articles a2
-                    WHERE a2.author_id = fo.followee_id AND a2.id >= coalesce(gb.bound, 0)
+      -- with a bound, the few articles newer than it come from one index scan over all followees at once;
+      -- without one, each followee's newest are fetched separately and merged
+      ELSE CASE WHEN gb.bound > 0
+        THEN ARRAY(SELECT a2.id FROM articles a2
+                    WHERE a2.author_id = ANY(ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = g.kid))
+                      AND a2.id >= gb.bound
+                    ORDER BY a2.id DESC LIMIT g.lim OFFSET g.off)
+        ELSE ARRAY(SELECT x.id FROM follows fo CROSS JOIN LATERAL (
+                   SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id
                     ORDER BY a2.id DESC LIMIT g.lim + g.off) x
-                 WHERE fo.follower_id = g.kid ORDER BY x.id DESC LIMIT g.lim OFFSET g.off)
+                 WHERE fo.follower_id = g.kid ORDER BY x.id DESC LIMIT g.lim OFFSET g.off) END
     END AS ids,
     CASE g.k
       WHEN 0 THEN CASE WHEN EXISTS (SELECT 1 FROM articles a OFFSET 999) THEN 1000

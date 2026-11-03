@@ -51,3 +51,18 @@ Script: `experiments/h.sh`.
   call: hot articles collect comments during the run), all writes ~3.3 s.
 - **Dropped: one probe per distinct followee.** Distinct followees are 75-80% of (viewer, followee) pairs in real
   batches (1,339 of 1,791), so sharing them would save ~5% of the buffers at best, before the wider bounds.
+- **e08** (SCHED_BATCH + usleep clock), same sequence as e05-e07: 50k 107.8 µs/req (app 50.1, PG 57.7), 150k 110.0
+  (app 50.5, PG 59.5). Idle app CPU at the 500-user warm-up fell from 0.06 to 0.02 cores. At 150k bcrypt is still
+  0.71 cores (17 ms per hash under load: CPUs 0-7 are 4 cores x 2 threads), the I/O threads' kernel time ~21 µs/req.
+- **e09: article details as id-ordered set lookups** (one `= ANY(sorted ids)` scan each for authors, favorite counts
+  and tags instead of three correlated subplans per article). Same rows on all 40 real batches; buffers per batch
+  24,067 -> 17,624, but plain execution time unchanged (21.9 -> 21.2 ms per batch). Buffer hits are not what costs
+  here: an ablation of the real batches puts feeds at ~8 ms, viewer flags ~4 ms and the article rows ~5 ms of
+  ~21 ms, and the flags cost ~3 µs per subplan call (two short index scans per viewer). Kept (no slower, fewer
+  buffers), with the follows flag now the viewer's whole followee list, checked in the app.
+- **e01b #87 search** (fixed harness): 25k 116.3, 50k 101.7 (app 50.1, PG 51.6), 100k 100.6, 150k 105.8 (app
+  43.8, PG 61.9); the 200k probe was flagged LG-limited: loadgen processes with 40k users on ~2.4 CPUs each stalled
+  ("sampler tick 8185 ms late", timer lag > 50 ms). The search was stopped: above ~190k this harness measured the
+  loadgen. Searches now run the loadgen on CPUs 8-22 with 25k users per process (`PER`, `LGLAST`).
+- **e10: two read lanes.** Comments, profiles, users and logins have their own lane and connections (3), so their
+  statements run in parallel with `rd` (5 connections) instead of after it in the same backend.
