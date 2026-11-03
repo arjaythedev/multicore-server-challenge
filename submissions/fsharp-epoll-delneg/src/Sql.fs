@@ -61,8 +61,11 @@ WITH g AS MATERIALIZED (
                  WHERE fo.follower_id = g.kid ORDER BY x.id DESC LIMIT g.lim OFFSET g.off)
     END AS ids,
     CASE g.k
-      WHEN 0 THEN (SELECT count(*) FROM (SELECT 1 FROM articles a LIMIT 1000) s)
-      WHEN 1 THEN (SELECT count(*) FROM (SELECT 1 FROM article_tags at WHERE at.tag_id = g.kid LIMIT 1000) s)
+      WHEN 0 THEN CASE WHEN EXISTS (SELECT 1 FROM articles a OFFSET 999) THEN 1000
+                  ELSE (SELECT count(*) FROM articles a) END
+      -- a 1,000th row proves the capped count without counting (cheaper than an aggregate over 1,000 rows)
+      WHEN 1 THEN CASE WHEN EXISTS (SELECT 1 FROM article_tags at WHERE at.tag_id = g.kid OFFSET 999) THEN 1000
+                  ELSE (SELECT count(*) FROM article_tags at WHERE at.tag_id = g.kid) END
       WHEN 2 THEN (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = g.kid LIMIT 1000) s)
       WHEN 3 THEN (SELECT count(*) FROM (SELECT 1 FROM favorites f WHERE f.user_id = g.kid LIMIT 1000) s)
       ELSE CASE WHEN EXISTS (SELECT 1 FROM follows fo, hub WHERE fo.follower_id = g.kid AND fo.followee_id = ANY(hub.ids))

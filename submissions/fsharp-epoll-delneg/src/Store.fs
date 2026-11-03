@@ -89,35 +89,69 @@ type WJob(kind: WKind, dest: Io.Dest) =
 let private ticksPerUs = float Stopwatch.Frequency / 1e6
 
 /// A queue shared by every I/O thread, drained by its connection threads in batches.
+///
+/// One idle thread at a time is the leader: it sleeps (Thread.Sleep, which doesn't spin) until the oldest queued
+/// job has waited the clock, then takes up to a batch and hands leadership on. The other idle threads block in an
+/// untimed wait. A timed Monitor.Wait spins before it blocks, which cost more CPU than the batches themselves.
 [<Sealed>]
 type Lane<'T when 'T :> Job>(clockUs: int, maxBatch: int) =
     let q = Queue<'T>()
     let gate = obj ()
     let clock = int64 (float clockUs * ticksPerUs)
+    let mutable leader = false
     member _.Count = q.Count
 
     member _.Push(j: 'T) =
         j.T <- Stopwatch.GetTimestamp()
         lock gate (fun () ->
             q.Enqueue j
-            if q.Count = 1 || q.Count = maxBatch then Monitor.Pulse gate)
+            if (q.Count = 1 && not leader) || q.Count = maxBatch then Monitor.Pulse gate)
 
-    /// Blocks until the oldest queued job has waited the clock (or a batch is full), then takes up to a batch.
     member _.Take(into: List<'T>) =
-        lock gate (fun () ->
-            let mutable go = true
-            while go do
-                if q.Count = 0 then Monitor.Wait gate |> ignore
-                elif q.Count >= maxBatch then go <- false
+        let mutable got = false
+        while not got do
+            let mutable sleepUs = 0
+            lock gate (fun () ->
+                while q.Count = 0 || (leader && q.Count < maxBatch) do
+                    Monitor.Wait gate |> ignore
+                if q.Count >= maxBatch then got <- true
                 else
                     let left = clock - (Stopwatch.GetTimestamp() - q.Peek().T)
-                    if left <= 0L then go <- false
-                    else Monitor.Wait(gate, TimeSpan.FromTicks(max 1L (int64 (float left / ticksPerUs * 10.0)))) |> ignore
-            while q.Count > 0 && into.Count < maxBatch do
-                into.Add(q.Dequeue())
-            if q.Count > 0 then Monitor.Pulse gate)
+                    if left <= 0L then got <- true
+                    else
+                        leader <- true
+                        sleepUs <- max 1 (int (float left / ticksPerUs))
+                if got then
+                    while q.Count > 0 && into.Count < maxBatch do
+                        into.Add(q.Dequeue())
+                    if q.Count > 0 then Monitor.Pulse gate)
+            if not got then
+                Thread.Sleep(TimeSpan.FromTicks(int64 sleepUs * 10L))
+                lock gate (fun () -> leader <- false)
 
 let mutable stats = false
+
+/// experiments (RD_DUMP=path): the read statement's inputs of a few batches, as psql EXECUTE lines for EXPLAIN
+let mutable dumpPath: string = null
+let mutable private dumpLeft = 40
+let mutable private dumpSkip = 0
+
+let private pgArray (xs: seq<string>) =
+    let b = StringBuilder("'{")
+    let mutable first = true
+    for x in xs do
+        if not first then b.Append ',' |> ignore
+        first <- false
+        if isNull x then b.Append "NULL" |> ignore
+        else b.Append('"').Append(x.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("'", "''")).Append('"') |> ignore
+    b.Append("}'").ToString()
+
+let private dumpRead (cols: string list) =
+    lock typeof<RJob> (fun () ->
+        dumpSkip <- dumpSkip + 1
+        if dumpLeft > 0 && dumpSkip > 4000 && dumpSkip % 25 = 0 then
+            dumpLeft <- dumpLeft - 1
+            IO.File.AppendAllText(dumpPath, "EXECUTE rd(" + String.Join(", ", cols) + ");\n"))
 let private statReads = ref 0L
 let private statReadBatches = ref 0L
 
@@ -263,6 +297,7 @@ type private Reader(c: Conn) =
     let cmtFollows = Dictionary<int64, int64[]>()
     let found = HashSet<int>()
     let mutable tagsBody: byte[] = null
+    let mutable dump = false
 
     let clear () =
         for l in [ tags; users; logins; profiles; arts; cmts; lists ] do
@@ -563,6 +598,8 @@ type private Reader(c: Conn) =
         replyBody j 200 tw
 
     /// Writes this batch's statements into the connection's output (no Sync).
+    member _.Dump with set (v: bool) = dump <- v
+
     member _.Prepare(batch: List<RJob>) =
         clear ()
         profileReplies.Clear()
@@ -628,6 +665,13 @@ type private Reader(c: Conn) =
             o.ArrEnd()
             o.EndBind()
             o.Execute()
+            if dump then
+                let num (xs: seq<'a>) = pgArray (Seq.map string xs)
+                dumpRead
+                    [ num gk; pgArray gkey; num gv; num glim; num goff
+                      num [ for struct (g, _, _) in rq -> g ]; num [ for struct (_, f, _) in rq -> f ]
+                      num [ for struct (_, _, t) in rq -> t ]; num [ for j in lists -> j.Viewer ]
+                      pgArray [ for j in arts -> j.Key ]; pgArray [ for _ in arts -> null ]; num [ for j in arts -> j.Viewer ] ]
         if cmts.Count > 0 then
             for j in cmts do
                 if not (slugIndex.ContainsKey j.Key) then
@@ -1126,7 +1170,7 @@ let private failAll (batch: List<'T>) (ex: exn) =
 
 let private readThread (url: string) (options: string) () =
     let mutable c = connect url options
-    let mutable r = Reader(c)
+    let mutable r = Reader(c, Dump = not (isNull dumpPath))
     let batch = List<RJob>()
     while true do
         batch.Clear()
@@ -1137,7 +1181,7 @@ let private readThread (url: string) (options: string) () =
             failAll batch ex
             (c :> IDisposable).Dispose()
             c <- connect url options
-            r <- Reader(c)
+            r <- Reader(c, Dump = not (isNull dumpPath))
 
 let private writeThread (url: string) (options: string) () =
     let mutable c = connect url options

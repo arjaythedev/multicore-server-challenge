@@ -1,0 +1,4 @@
+{"id":"e01","label":"e01-pr87","what":"#87 (9de3218) on the harness, reference","kind":"reference","score":180000,"note":"190k/200k LG-limited (old harness: loadgen processes shared one CPU set); re-run as e01b"}
+{"id":"e02","label":"e02-new","what":"new design: epoll I/O, own PG client, batched lanes, own bcrypt; first build","kind":"structural","score":null,"note":"warm-up showed PG 4.4 ms/req: currval() in WHERE seq-scanned articles after each insert; fixed with a scalar subquery"}
+{"id":"e03","label":"e03-hubs","what":"shared followee probes for feed counts (HUB_COUNT) and feed page bounds (FEED_BOUND)","kind":"structural","score":null,"note":"first run used the pre-fix build, discarded"}
+{"id":"e04","label":"e04-tagprobe","what":"global/tag counts proved by a 1,000th row (EXISTS OFFSET 999) instead of an aggregate over 1,000 rows","kind":"structural","score":null,"note":"side cluster: 200 tag counts 15.3 ms -> 10.1 ms; 197/197 dev and full seed"}
