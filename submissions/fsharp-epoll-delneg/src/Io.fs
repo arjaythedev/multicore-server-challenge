@@ -161,7 +161,7 @@ type Loop(index: int, listenFd: int) =
         let data = slotData.[slot]
         let off = slotOff.[slot]
         let p = NativePtr.add (NativePtr.ofNativeInt<byte> (slotPin.[slot].AddrOfPinnedObject())) off
-        Sys.ur_send (ring, slotFd.[slot], p, uint32 (data.Length - off), ud KSend slot slotFd.[slot]) |> ignore
+        Sys.ur_send (ring, slotFd.[slot], p, uint32 (data.Length - off), ud KSend slot slotFd.[slot])
 
     let rec sendBytes (fd: int) (c: Conn) (data: byte[]) (off: int) =
         if useRing then
@@ -173,7 +173,12 @@ type Loop(index: int, listenFd: int) =
             slotFd.[slot] <- fd
             slotGen.[slot] <- c.Gen
             c.Out <- data
-            submitSend slot
+            if submitSend slot < 0 then
+                // no room in the ring even after submitting: drop the connection rather than leave it hanging
+                slotPin.[slot].Free()
+                slotData.[slot] <- null
+                freeSlots.Push slot
+                closeFd fd
             false
         else
             // writes as much as the socket takes; keeps the rest for EPOLLOUT
@@ -416,9 +421,9 @@ type Loop(index: int, listenFd: int) =
             c.In <- null
             c.InLen <- 0
             c.Out <- null
-            if useRing then Sys.ur_recv (ring, fd, ud KRecv (gen28 c.Gen) fd) |> ignore
-            else Sys.ctl ep Sys.EPOLL_CTL_ADD fd (Sys.EPOLLIN ||| Sys.EPOLLRDHUP) (uint64 fd) |> ignore
+            if not useRing then Sys.ctl ep Sys.EPOLL_CTL_ADD fd (Sys.EPOLLIN ||| Sys.EPOLLRDHUP) (uint64 fd) |> ignore
             lruAdd fd
+            if useRing && Sys.ur_recv (ring, fd, ud KRecv (gen28 c.Gen) fd) < 0 then closeFd fd
 
     /// at the fd limit: close the connection idle the longest, or, with none idle, free the spare fd, take the
     /// newcomer and close it at once, so the listener doesn't stay readable (a loop spinning on accept)
@@ -452,6 +457,9 @@ type Loop(index: int, listenFd: int) =
                 eprintfn "io: deliver fd %d: %s" fd ex.Message
                 closeFd fd
 
+    let armRecv (fd: int) (g: int) =
+        if Sys.ur_recv (ring, fd, ud KRecv g fd) < 0 then closeFd fd
+
     let live (fd: int) (g: int) =
         let c = conns.[fd]
         not (isNull c) && c.Open && gen28 c.Gen = g
@@ -474,15 +482,15 @@ type Loop(index: int, listenFd: int) =
                         eprintfn "io: fd %d: %s" fd ex.Message
                         closeFd fd
                     if hasBuf then Sys.ur_buf_return (ring, bid)
-                    if not more && c.Open then Sys.ur_recv (ring, fd, ud KRecv mid fd) |> ignore
+                    if not more && c.Open then armRecv fd mid
                 else
                     if hasBuf then Sys.ur_buf_return (ring, bid)
                     if cq.Res = -Sys.ENOBUFS then (if not more then starved.Add fd)
                     elif cq.Res = -Sys.EINVAL && Sys.ur_ms_recv ring <> 0 then
                         Sys.ur_no_ms_recv ring // kernel without multishot recv: one-shot from now on
-                        Sys.ur_recv (ring, fd, ud KRecv mid fd) |> ignore
+                        armRecv fd mid
                     elif cq.Res = -Sys.EINTR || cq.Res = -Sys.EAGAIN then
-                        if not more then Sys.ur_recv (ring, fd, ud KRecv mid fd) |> ignore
+                        if not more then armRecv fd mid
                     else closeFd fd // 0: the client closed; other errors: drop the connection
             elif hasBuf then Sys.ur_buf_return (ring, bid)
         elif kind = KSend then
@@ -494,7 +502,11 @@ type Loop(index: int, listenFd: int) =
             let alive = not (isNull c) && c.Open && c.Gen = g
             if alive && cq.Res > 0 && slotOff.[slot] + cq.Res < data.Length then
                 slotOff.[slot] <- slotOff.[slot] + cq.Res // partial send: the rest, from the same pinned reply
-                submitSend slot
+                if submitSend slot < 0 then
+                    slotPin.[slot].Free()
+                    slotData.[slot] <- null
+                    freeSlots.Push slot
+                    closeFd sfd
             else
                 slotPin.[slot].Free()
                 slotData.[slot] <- null
@@ -556,7 +568,7 @@ type Loop(index: int, listenFd: int) =
                 if starved.Count > 0 then
                     for fd in starved do
                         let c = conns.[fd]
-                        if not (isNull c) && c.Open then Sys.ur_recv (ring, fd, ud KRecv (gen28 c.Gen) fd) |> ignore
+                        if not (isNull c) && c.Open then armRecv fd (gen28 c.Gen)
                     starved.Clear()
             true
 
