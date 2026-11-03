@@ -15,13 +15,13 @@
 // (the challenge's), and optionally HTTP_WORKERS (a quarter of the CPUs, at least 2), DB_READ_CONNS (6) and
 // DB_WRITE_CONNS (1) per worker, DB_MAX_IN_FLIGHT (16), DB_READ_IN_FLIGHT (4)
 // for the read connections, DB_READ_PLANS (10) read plans in flight
-// per worker, READ_PLAN_MIN (2048), READ_PLAN_WAIT_US (40000) and
+// per worker, READ_PLAN_MIN (4096), READ_PLAN_WAIT_US (60000) and
 // READ_PLAN_CLOCK (1; 2 adaptive, with READ_PLAN_LIGHT 32) for when a plan starts (worker.ts, `planWaitLeft`),
 // BCRYPT_WORKERS (half the CPUs, at least 2), BCRYPT_BATCH_MS (80) for logins
 // and BCRYPT_HASH_MS (20) for sign-ups (bcrypt-service.ts),
 // BCRYPT_PORT (47391), BCRYPT_NICE (0; 1 to 19 lowers the bcrypt services'
 // priority, and "idle" moves them to SCHED_IDLE), IDLE_TIMEOUT_MS (75000) and
-// BCRYPT_WIDTH (6; 0 times it at startup; 1 to 6 lanes a call),
+// BCRYPT_WIDTH (start.sh passes the width build.sh measured, else 6; 0 times it at startup; 1 to 6 lanes a call),
 // ACK_DELAY (0 leaves the kernel's ACKs alone; 1 turns delayed ACKs back on after each answer, worker.ts `ackDelayAfter`),
 // GZIP (0; 1 when it saves a TCP segment, 2 whenever it saves anything), GZIP_MIN (1300),
 // READ_SERVICE (1; 0 leaves each worker its own plans), READ_SERVICE_CONNS (12), READ_SERVICE_PLANS (20),
@@ -135,8 +135,8 @@ export const main = (): i32 => {
   cfg.maxInFlight = envInt("DB_MAX_IN_FLIGHT", 16)
   cfg.readInFlight = envInt("DB_READ_IN_FLIGHT", 4)
   cfg.readPlans = envInt("DB_READ_PLANS", 10)
-  cfg.planMin = envInt("READ_PLAN_MIN", 2048)
-  cfg.planWaitUs = envInt("READ_PLAN_WAIT_US", 40000)
+  cfg.planMin = envInt("READ_PLAN_MIN", 4096)
+  cfg.planWaitUs = envInt("READ_PLAN_WAIT_US", 60000)
   const clock: string = getenv("READ_PLAN_CLOCK") ?? "1"
   cfg.planClock = clock === "0" ? 0 : clock === "2" ? 2 : 1
   cfg.planLight = envInt("READ_PLAN_LIGHT", 32)

@@ -3,12 +3,14 @@
 Front: direct
 
 An update of this submission, scored at 91,000 users in #83 (`3de991e`),
-100,000 in #116 (`6e69d72`) and 140,000 in #159 (`6cdf1fd`), on the same
-design. Since #159: one read service holds every read plan of the box, plans
-hold up to 2,048 reads over a 40 ms window, each author of a plan is read once,
+100,000 in #116 (`6e69d72`), 140,000 in #159 (`6cdf1fd`) and 180,000 in
+#189 (`76a40a5`), on the same design. Since #189: each plan group's
+statements run on two connections side by side, and plans hold up to 4,096
+reads over a 60 ms window instead of 2,048 over 40 ms. Since #159: one read
+service holds every read plan of the box, each author of a plan is read once,
 a feed no longer asks whether its viewer follows the authors it was built
-from, a login's check waits 80 ms for company instead of 160, bcrypt always
-runs six lanes, and delayed ACKs are left to the kernel. Since #116,
+from, a login's check waits 80 ms for company instead of 160, bcrypt's
+batch width is measured once at build time, and delayed ACKs are left to the kernel. Since #116,
 most of it to
 cut what Postgres spends a request: favorite counts leave `plan_meta` for a
 count lane of their own, an idea of this submission's (below); two HTTP
@@ -26,7 +28,7 @@ read queue than four could have, where #83 ran
 two), and Nish 0.23.1 no longer sweeps every idle connection on every turn of
 the loop.
 
-Nish 0.29.0 (a statically typed TypeScript subset compiled to native code
+Nish 0.32.0 (a statically typed TypeScript subset compiled to native code
 through LLVM), built with clang-18 and lld-18 from LLVM 18, against
 PostgreSQL 18. The compiler runs on Node.js 22.18.0 at build time only; the
 server is one native binary with no runtime dependency beyond libc. Every
@@ -41,7 +43,9 @@ bash build.sh
 DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=... HOST=0.0.0.0 PORT=80 bash start.sh
 ```
 
-The server needs Nish 0.29.0: 0.26.0 brought binary result columns to
+The server needs Nish 0.32.0, whose bcrypt batch kernels take a hash in
+6.5% less time at five lanes on the Xeon VM (below): 0.31.0 renamed the
+HTTP/1.1 codec `nish/net/http1-codec`. 0.26.0 brought binary result columns to
 `nish/net/postgres` (`bindStartBinary`, `binaryInt`, `PgBinary`) and
 `TCP_QUICKACK` to `netSetOption`, and 0.27.0 the binary `PgBatcher`
 (`PgBatchConfig.binary`), `PgBinaryArray` for an integer array column, and
@@ -132,8 +136,8 @@ and four on the box), and
   Nothing outlives its plan: every value in an answer was read from
   Postgres while that request waited, and a plan takes only the requests
   already waiting when it starts.
-- **Batch clock.** A plan starts when 2,048 reads wait (a full plan) or when
-  the oldest has waited 40 ms, and up to 20 are in
+- **Batch clock.** A plan starts when 4,096 reads wait (a full plan) or when
+  the oldest has waited 60 ms, and up to 20 are in
   flight at the read service, on 12 connections. Started at once instead, a plan is whatever arrived
   during the last one's two round trips, about 17 requests at the load
   measured below, and Postgres pays its fixed costs and reads the same
@@ -153,9 +157,20 @@ and four on the box), and
   requests (below), plans of up to 1,024 over 25 ms took Postgres and the
   server from 61.1 µs a request to 56.0, for about 20 ms of p95; 2,048 over
   40 ms took the saturated run below from 57.2 to 54.8 and 53.8 in two runs.
+  At 230,000 users, 4,096 over 60 ms took Postgres from about 31 µs a
+  request to 29.6 and, with the two lanes below, p95 from 511 ms to 459.
   Nish's `PgBatcher` takes at most 1,024 keys, so a plan takes at most that
   many articles, comment threads or profiles by key, and a read past them
   waits for the next plan.
+- **A plan's statements in two lanes.** Only about three of a plan's
+  statements were running in Postgres at any moment, because a plan's
+  group ran its statements one after another on one connection while other
+  connections sat idle, so a read waited the sum of them. Each group now
+  runs as two halves on two connections side by side: group A's feeds, its
+  costliest statement, beside everything else, and group B's articles
+  beside the flags and authors. When the pool can give only one connection,
+  both halves run on it as before. The same CPU, less waiting: at 230,000
+  users, saturated, p95 went from 553 ms to 511.
 - **Each author once.** `plan_meta` and `plan_comments` no longer join `users`
   row by row: a plan collects the distinct authors of its articles and
   comments, reads them with one `plan_users` statement, and writes each
@@ -224,13 +239,28 @@ and four on the box), and
   175,000 users on the Xeon VM, two with it and two without, leaving the ACKs
   to the kernel cut the CPU outside Postgres by about 8% and p99 from
   366–1,844 ms to 463–569, so it is off.
-- **bcrypt at six lanes.** Each process used to time bcrypt's widths at
-  startup (`bcryptCalibrate`), all at once; on the Xeon VM they chose three
-  lanes on one start and five on the next, and three cost about 5% of the box
-  (a hold's CPU outside Postgres, 202 s a minute against 184 at six). Six is
-  the fastest on both CPUs measured, so it is the default; `BCRYPT_WIDTH=0`
-  times it again. bcrypt is about a quarter of the Xeon VM's CPU at these
-  loads, about 32 ms of CPU a login.
+- **bcrypt's width, measured at build time.** Each process used to time
+  bcrypt's widths at startup (`bcryptCalibrate`), all at once; on the Xeon VM
+  they chose three lanes on one start and five on the next, and three cost
+  about 5% of the box (a hold's CPU outside Postgres, 202 s a minute against
+  184 at six). The fastest width is a property of the core, though, not a
+  constant: five lanes beat six on the Xeon Platinum 8260 VM, six beat five on
+  a Ryzen 9 9950X, by 2 to 5% a hash. So `build.sh` builds and runs
+  `src/bcrypt-width.ts` once, alone on the quiet machine: it times widths 3
+  to 6 at cost 8, interleaved over nine rounds, takes each one's median and
+  writes the fastest to `bin/bcrypt-width.txt`, about a second. It picked 5
+  on the Xeon VM six runs out of six and 6 on the Ryzen five out of five.
+  `start.sh` passes it on as `BCRYPT_WIDTH` unless one is set; without the
+  file the server runs six. bcrypt is about a quarter of the Xeon VM's CPU at
+  these loads, about 32 ms of CPU a login.
+- **Built for the machine it runs on.** The challenge builds on the box, so
+  `build.sh` builds for x86-64-v3 (AVX2, BMI2, FMA) when `/proc/cpuinfo` lists
+  every feature of it, and for baseline x86-64 otherwise. Neither choice
+  moved a whole hold past its noise: on the Xeon VM at 175,000 users the
+  CPU outside Postgres was 70.3–71.8 µs a request built this way (v3, five
+  lanes) against 70.4–71.8 at baseline and six, two holds each, and the
+  saturated run below passed 230,000 both ways. They cost nothing and keep
+  each core at the width its own timing picks.
 - **Durable group commit.** While a batch is in flight on the write
   connection, the writes that arrive wait. Then up to 128 of them go as one
   group: one transaction, one commit, and one WAL flush. Each response is
@@ -290,11 +320,11 @@ Optional process settings, with their defaults: `HTTP_WORKERS` (a quarter of the
 CPUs, at least 2),
 `DB_READ_CONNS` (6) and `DB_WRITE_CONNS` (1) per worker, `DB_MAX_IN_FLIGHT`
 (16), `DB_READ_PLANS` (10) read plans in flight per worker,
-`READ_PLAN_WAIT_US` (40000) and `READ_PLAN_MIN` (2048) for the batch clock,
+`READ_PLAN_WAIT_US` (60000) and `READ_PLAN_MIN` (4096) for the batch clock,
 `READ_PLAN_CLOCK` (1; 0 starts a plan at once while none is in flight, 2
 is adaptive) and `READ_PLAN_LIGHT` (32), `BCRYPT_WORKERS` (half the CPUs,
 at least 2), `BCRYPT_BATCH_MS` (80) and `BCRYPT_HASH_MS` (20),
-`BCRYPT_WIDTH` (6; 0 times the widths at startup; 1 to 6 lanes a call),
+`BCRYPT_WIDTH` (what `build.sh` measured, else 6; 0 times the widths at startup; 1 to 6 lanes a call),
 `GZIP` (0; 1 when it saves a TCP segment, 2 whenever it saves anything; at
 145,000 users on the VM it cost about 30 µs a request and failed the hold),
 `GZIP_MIN` (1300),
@@ -332,9 +362,17 @@ machine's, about a third of the official box's.
 | `a24c18d` | 190,000 | PASS | 47,856 | 275 ms | 327 ms | 31.5 + 22.3 |
 | `a24c18d` | 210,000 | PASS | 51,129 | 450 ms | 552 ms | 31.0 + 23.5 |
 | `a24c18d` | 230,000 | FAIL | 46,967 | 1,483 ms | 1,828 ms | 28.7 + 28.6 |
-| this one | 230,000 | FAIL | 55,073 | 579 ms | 697 ms | 31.4 + 22.2 |
-| this one, again | 230,000 | FAIL | 55,436 | 537 ms | 639 ms | 30.8 + 21.9 |
+| `cf7a78f` | 230,000 | FAIL | 55,073 | 579 ms | 697 ms | 31.4 + 22.2 |
+| `cf7a78f`, again | 230,000 | FAIL | 55,436 | 537 ms | 639 ms | 30.8 + 21.9 |
+| this one | 230,000 | PASS | 56,049 | 459 ms | 539 ms | 29.6 + 21.7 |
+| this one, again | 230,000 | PASS | 55,814 | 482 ms | 578 ms | 29.6 + 21.9 |
 | rust-epoll-theCatWisel (#154), for scale | 210,000 | PASS | 54,390 | 149 ms | 195 ms | 35.7 + 14.8 |
+
+This rig ranks builds; it does not predict the score. `cf7a78f` (#189 as
+merged) scored 180,000 officially, at 77% of the box's CPU, so officially
+this server ran out of time before it ran out of CPU. That is why this
+update goes after waiting: in a plan's statements, which ran one after
+another, more than in its CPU.
 
 On a Xeon Platinum 8260 VM with 8 vCPU and 16 GB (Postgres 18 and `box/`'s
 setup), 5-minute holds from a separate load box, alternating the builds, on a
@@ -344,8 +382,10 @@ fresh copy of the seed each time; CPU from `/proc` over a minute of the hold:
 |---|--:|---|--:|--:|--:|---|--:|
 | `91dd6fd`, two holds | 175,000 | PASS, PASS | 44,333–44,450 | 298–305 ms | 422–431 ms | 78.9–79.2 + 72.0–77.5 | 84–87% |
 | `a24c18d`, two holds | 175,000 | PASS, PASS | 43,943–43,971 | 340–383 ms | 462–632 ms | 73.6–74.0 + 71.8–73.0 | 81% |
+| `a24c18d`, two more holds (alternated with the next row) | 175,000 | PASS, PASS | 43,563–43,648 | 424–426 ms | 585–610 ms | 69.7–70.9 + 72.3–74.7 | 78–80% |
+| `cf7a78f`, two holds | 175,000 | PASS, PASS | 44,053–44,083 | 349–414 ms | 532–616 ms | 72.9–76.0 + 69.9–71.5 | 79–82% |
 | `a24c18d`, two holds past the VM's limit | 185,000 | FAIL, FAIL | 42,554–45,117 | 859–1,881 ms | 2,439–5,489 ms | 72.4–74.0 + 72.6–88.4 | 83–86% |
-| this one, two holds past the VM's limit | 185,000 | FAIL, FAIL | 44,126–45,194 | 886–1,652 ms | 2,431–4,395 ms | 74.9–76.8 + 73.4–77.4 | 84–86% |
+| `cf7a78f`, two holds past the VM's limit | 185,000 | FAIL, FAIL | 44,126–45,194 | 886–1,652 ms | 2,431–4,395 ms | 74.9–76.8 + 73.4–77.4 | 84–86% |
 
 The window's extra wait shows as p95 while the box has room. At 185,000 the
 two builds' holds overlap: past the VM's limit its load box runs out of local
@@ -355,8 +395,7 @@ softirq, and once clients time out the kernel runs out of orphan sockets, so
 overload there says little about either build.
 
 In `91dd6fd`, bcrypt was 12.3 of the server's 23.0 µs on this machine (about
-11 ms of CPU a login), the HTTP workers 6.7 and the read service 3.8. Building with `--cpu x86-64-v3` measured
-the same, so the build stays at baseline x86-64.
+11 ms of CPU a login), the HTTP workers 6.7 and the read service 3.8.
 
 ### On the fixed load box
 

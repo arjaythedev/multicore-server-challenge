@@ -74,6 +74,8 @@ export class ReadService {
   state: i32[]
   /** Per ticket: the plan whose group it is, `plans.length` for a count run not yet bound, past that a count run by place, or -1. */
   ticketPlan: i32[]
+  /** Per ticket of a plan: the lane of the group it binds (ReadPlan.bindA and bindB). */
+  ticketLane: i32[]
   /**
    * The count lanes: one run taking plans, up to `lanes` running, each on a
    * connection of its own, and whether a connection has been asked for. A
@@ -93,6 +95,9 @@ export class ReadService {
   /** Per plan: it waits for a count run still, and its connection was lost meanwhile. */
   counting: boolean[]
   lost: boolean[]
+  /** Per plan: the lanes of its group still running, and whether a connection under one was lost. */
+  lanesLeft: i32[]
+  laneLost: boolean[]
   /** Per plan in S_SEND: the next answer to send, and since when a full ring has held it back (0: none has). */
   sendNext: i32[]
   sendHeld: i64[]
@@ -123,6 +128,8 @@ export class ReadService {
     this.state = []
     this.counting = []
     this.lost = []
+    this.lanesLeft = []
+    this.laneLost = []
     this.sendNext = []
     this.sendHeld = []
     for (let k: i32 = 0; k < (cfg.readPlans > 0 ? cfg.readPlans : 1); k++) {
@@ -130,6 +137,8 @@ export class ReadService {
       this.state.push(S_FREE)
       this.counting.push(false)
       this.lost.push(false)
+      this.lanesLeft.push(0)
+      this.laneLost.push(false)
       this.sendNext.push(0)
       this.sendHeld.push(toI64(0))
     }
@@ -138,6 +147,7 @@ export class ReadService {
     this.pool.register(this.plans[0].comments.name, this.plans[0].comments.sql, noTypes)
     this.pool.register(this.plans[0].profiles.name, this.plans[0].profiles.sql, noTypes)
     this.ticketPlan = new Array<i32>(SERVICE_TICKETS)
+    this.ticketLane = new Array<i32>(SERVICE_TICKETS)
     for (let k: i32 = 0; k < SERVICE_TICKETS; k++) {
       this.ticketPlan[k] = -1
     }
@@ -288,11 +298,9 @@ export class ReadService {
     }
     for (let p: i32 = 0; p < toI32(this.state.length); p++) {
       if (this.state[p] === S_DUE) {
-        const ticket: i32 = this.pool.request()
-        if (ticket === PG_POOL_FULL) {
+        if (!this.askLanes(p, this.plans[p].lanesA())) {
           break
         }
-        this.ticketPlan[ticket % SERVICE_TICKETS] = p
         this.state[p] = S_A
       }
     }
@@ -376,7 +384,8 @@ export class ReadService {
       return
     }
     const plan: ReadPlan = this.plans[pi]
-    if (!(this.state[pi] === S_A ? plan.bindA(conn) : plan.bindB(conn))) {
+    const lane: i32 = this.ticketLane[at]
+    if (!(this.state[pi] === S_A ? plan.bindA(conn, lane) : plan.bindB(conn, lane))) {
       // The statements bound still run; the plan's requests go alone once they have.
       plan.failed = true
       conn.bindCancel()
@@ -384,7 +393,7 @@ export class ReadService {
     if (!this.pool.send()) {
       this.ticketPlan[at] = -1
       plan.failed = true
-      this.groupDone(pi)
+      this.laneDone(pi)
     }
   }
 
@@ -416,14 +425,63 @@ export class ReadService {
   }
 
   askB(p: i32): boolean {
-    const ticket: i32 = this.pool.request()
-    if (ticket === PG_POOL_FULL) {
+    if (!this.askLanes(p, this.plans[p].lanesB())) {
       this.plans[p].failed = true
       return false
     }
-    this.ticketPlan[ticket % SERVICE_TICKETS] = p
     this.state[p] = S_B
     return true
+  }
+
+  /**
+   * Asks the pool for a connection for each lane of `lanes` (bit 0, bit 1) of
+   * plan `p`'s next group, so its two halves run side by side; both on one
+   * when the pool has room for only one, or the group has one lane. False
+   * when it has room for none.
+   */
+  askLanes(p: i32, lanes: i32): boolean {
+    const first: i32 = this.pool.request()
+    if (first === PG_POOL_FULL) {
+      return false
+    }
+    this.ticketPlan[first % SERVICE_TICKETS] = p
+    this.laneLost[p] = false
+    if (lanes !== 3) {
+      this.ticketLane[first % SERVICE_TICKETS] = 2
+      this.lanesLeft[p] = 1
+      return true
+    }
+    const second: i32 = this.pool.request()
+    if (second === PG_POOL_FULL) {
+      this.ticketLane[first % SERVICE_TICKETS] = 2
+      this.lanesLeft[p] = 1
+      return true
+    }
+    this.ticketLane[first % SERVICE_TICKETS] = 0
+    this.ticketPlan[second % SERVICE_TICKETS] = p
+    this.ticketLane[second % SERVICE_TICKETS] = 1
+    this.lanesLeft[p] = 2
+    return true
+  }
+
+  /** Lane of plan `p` done; once its group's last is, the group is. */
+  laneDone(p: i32): void {
+    this.lanesLeft[p] -= 1
+    if (this.lanesLeft[p] > 0) {
+      return
+    }
+    if (!this.laneLost[p]) {
+      this.groupDone(p)
+      return
+    }
+    const plan: ReadPlan = this.plans[p]
+    plan.abortA()
+    if (this.counting[p]) {
+      this.lost[p] = true
+      this.state[p] = S_COUNT
+    } else {
+      this.finish(p, true)
+    }
   }
 
   countsDone(place: i32, failed: boolean, lost: boolean): void {
@@ -596,23 +654,19 @@ export class ReadService {
     const plan: ReadPlan = this.plans[p]
     if (event === PG_LOST) {
       this.ticketPlan[at] = -1
-      plan.abortA()
-      if (this.counting[p]) {
-        this.lost[p] = true
-        this.state[p] = S_COUNT
-      } else {
-        this.finish(p, true)
-      }
+      plan.failed = true
+      this.laneLost[p] = true
+      this.laneDone(p)
     } else if (event === PG_GROUP_DONE) {
       this.ticketPlan[at] = -1
       if (conn.groupFailed) {
         plan.failed = true
       }
-      this.groupDone(p)
+      this.laneDone(p)
     } else if (this.state[p] === S_A) {
-      plan.eventA(conn, event)
+      plan.eventA(conn, event, this.ticketLane[at])
     } else {
-      plan.eventB(conn, event)
+      plan.eventB(conn, event, this.ticketLane[at])
     }
   }
 }
