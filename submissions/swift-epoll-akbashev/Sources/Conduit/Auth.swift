@@ -150,9 +150,10 @@ struct TokenSigner: Sendable {
             if header.count > 340 { return nil }
             var headerBytes = InlineArray<256, UInt8>(repeating: 0)
             var headerSpan = headerBytes.mutableSpan
-            guard let n = Base64.urlDecode(header, into: &headerSpan),
-                  let alg = JSON.parse(headerBytes.span.extracting(0..<n))?.get("alg")?.string,
-                  Bytes.equal(alg, "HS256") else { return nil }
+            guard let n = Base64.urlDecode(header, into: &headerSpan) else { return nil }
+            let json = headerBytes.span.extracting(0..<n)
+            guard let fields = JSON.scan(json), let alg = fields.member("alg", in: json), alg.kind == .string,
+                  JSON.withString(json, alg, { Bytes.equal($0, "HS256") }) else { return nil }
         }
 
         let now = Sys.unixNowF64()
@@ -166,20 +167,33 @@ struct TokenSigner: Sendable {
         return claims(payload.span, now: now)
     }
 
+    /// The claims, read in place: `exp` (required) and `nbf` against the clock, `iat` a number if present, and `sub` a
+    /// positive integer string, the user id.
     private func claims(_ payload: Span<UInt8>, now: Double) -> Int64? {
-        switch Self.scanFlatClaims(payload, now: now) {
-        case .valid(let uid): return uid
-        case .invalid: return nil
-        case .fallback: break
+        guard let fields = JSON.scan(payload), fields.isObject,
+              let exp = fields.member("exp", in: payload), exp.kind == .number,
+              let expires = JSON.number(payload, exp), now < expires else { return nil }
+        if let nbf = fields.member("nbf", in: payload) {
+            guard nbf.kind == .number, let notBefore = JSON.number(payload, nbf), now >= notBefore else { return nil }
         }
-        guard let obj = JSON.parse(payload)?.object, let exp = obj.get("exp")?.number, now < exp else { return nil }
-        if let nbf = obj.get("nbf") {
-            guard let n = nbf.number, now >= n else { return nil }
+        if let iat = fields.member("iat", in: payload), iat.kind != .number { return nil }
+        guard let sub = fields.member("sub", in: payload), sub.kind == .string else { return nil }
+        return JSON.withString(payload, sub, Self.positiveInteger)
+    }
+
+    /// A positive decimal integer that fits an Int64, nil otherwise.
+    private static func positiveInteger(_ digits: Span<UInt8>) -> Int64? {
+        guard digits.count > 0 else { return nil }
+        var value: Int64 = 0
+        for i in 0..<digits.count {
+            let ch = digits[i]
+            guard (0x30...0x39).contains(ch) else { return nil }
+            let (m, o1) = value.multipliedReportingOverflow(by: 10)
+            let (s, o2) = m.addingReportingOverflow(Int64(ch - 0x30))
+            if o1 || o2 { return nil }
+            value = s
         }
-        if let iat = obj.get("iat"), iat.number == nil { return nil }
-        guard let sub = obj.get("sub")?.string, !sub.isEmpty, sub.allSatisfy({ (0x30...0x39).contains($0) }),
-              let uid = Int64(String(decoding: sub, as: UTF8.self)), uid > 0 else { return nil }
-        return uid
+        return value > 0 ? value : nil
     }
 
     /// A token for `userID`, valid 30 days.
@@ -208,107 +222,6 @@ extension TokenSigner {
     private static let jwtHeaderStandard: StaticString = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
     private static let jwtHeaderReordered: StaticString = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9"
     private static let jwtHeaderMinimal: StaticString = "eyJhbGciOiJIUzI1NiJ9"
-
-    private enum FlatClaims {
-        /// Not a flat payload: parse it fully.
-        case fallback
-        case invalid
-        case valid(Int64)
-    }
-
-    @inline(__always) private static func skipWhitespace(_ buf: Span<UInt8>, _ from: Int) -> Int {
-        var pos = from
-        while pos < buf.count {
-            switch buf[pos] {
-            case 0x20, 0x09, 0x0D, 0x0A: pos += 1
-            default: return pos
-            }
-        }
-        return pos
-    }
-
-    /// The fast path for flat payloads with no escapes and no nested values (`scan_flat_claims`).
-    private static func scanFlatClaims(_ buf: Span<UInt8>, now: Double) -> FlatClaims {
-        if Bytes.find(buf, 0x5C) != nil { return .fallback }
-        var i = skipWhitespace(buf, 0)
-        if i >= buf.count || buf[i] != 0x7B { return .invalid }
-        i = skipWhitespace(buf, i + 1)
-        if i < buf.count && buf[i] == 0x7D { return .invalid }
-        var sub: Int64?
-        var exp: Double?
-        var nbf: Double?
-        while true {
-            if i >= buf.count || buf[i] != 0x22 { return .fallback }
-            i += 1
-            let k0 = i
-            while i < buf.count && buf[i] != 0x22 {
-                if buf[i] < 0x20 { return .invalid }
-                i += 1
-            }
-            if i >= buf.count { return .invalid }
-            let key = buf.extracting(k0..<i)
-            i = skipWhitespace(buf, i + 1)
-            if i >= buf.count || buf[i] != 0x3A { return .invalid }
-            i = skipWhitespace(buf, i + 1)
-            if i >= buf.count { return .invalid }
-            if Bytes.equal(key, "sub") {
-                if buf[i] != 0x22 { return .invalid }
-                i += 1
-                let v0 = i
-                var uid: Int64 = 0
-                while i < buf.count && buf[i] != 0x22 {
-                    let ch = buf[i]
-                    guard (0x30...0x39).contains(ch) else { return .invalid }
-                    let (m, o1) = uid.multipliedReportingOverflow(by: 10)
-                    let (s, o2) = m.addingReportingOverflow(Int64(ch - 0x30))
-                    if o1 || o2 { return .fallback }
-                    uid = s
-                    i += 1
-                }
-                if i >= buf.count || i == v0 || uid <= 0 { return .invalid }
-                i += 1
-                sub = uid
-            } else if Bytes.equal(key, "exp") || Bytes.equal(key, "nbf") || Bytes.equal(key, "iat") {
-                let negative = buf[i] == 0x2D
-                if negative { i += 1 }
-                let d0 = i
-                var value: Int64 = 0
-                while i < buf.count && (0x30...0x39).contains(buf[i]) {
-                    let (m, o1) = value.multipliedReportingOverflow(by: 10)
-                    let digit = Int64(buf[i] - 0x30)
-                    let (s, o2) = negative ? m.subtractingReportingOverflow(digit) : m.addingReportingOverflow(digit)
-                    if o1 || o2 { return .fallback }
-                    value = s
-                    i += 1
-                }
-                if i == d0 { return .invalid }
-                if i < buf.count && (buf[i] == 0x2E || buf[i] == 0x65 || buf[i] == 0x45) { return .fallback }
-                if Bytes.equal(key, "exp") {
-                    exp = Double(value)
-                } else if Bytes.equal(key, "nbf") {
-                    nbf = Double(value)
-                }
-            } else {
-                return .fallback
-            }
-            i = skipWhitespace(buf, i)
-            if i >= buf.count { return .invalid }
-            if buf[i] == 0x2C {
-                i = skipWhitespace(buf, i + 1)
-                continue
-            } else if buf[i] == 0x7D {
-                i = skipWhitespace(buf, i + 1)
-                if i != buf.count { return .invalid }
-                break
-            } else {
-                return .fallback
-            }
-        }
-        guard let exp, now < exp else { return .invalid }
-        if let nbf, now < nbf { return .invalid }
-        guard let sub else { return .invalid }
-        return .valid(sub)
-    }
 
     @inline(__always) private static func constantTimeEqual32(_ a: SHA256.Digest, _ b: Span<UInt8>) -> Bool {
         guard b.count >= 32 else { return false }

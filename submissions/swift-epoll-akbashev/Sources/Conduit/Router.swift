@@ -13,9 +13,27 @@ struct ReplyAddr: Hashable, Sendable {
 struct OutgoingReply: Sendable {
     let addr: ReplyAddr
     let status: UInt16
-    /// The body: built once and shared by every reply in a batch that has the same one (an array is reference
-    /// counted, so this is the Rust's `Arc<[u8]>` as well as its `Vec<u8>`).
-    let body: [UInt8]
+    let body: Body
+
+    enum Body: Sendable {
+        /// Built once and shared by every reply in a batch that has the same one (an array is reference counted, so
+        /// this is the Rust's `Arc<[u8]>` as well as its `Vec<u8>`).
+        case bytes([UInt8])
+        /// An error's message: the reactor writes the body.
+        case error(StaticString)
+    }
+
+    init(addr: ReplyAddr, status: UInt16, body: [UInt8]) {
+        self.addr = addr
+        self.status = status
+        self.body = .bytes(body)
+    }
+
+    init(addr: ReplyAddr, status: UInt16, error message: StaticString) {
+        self.addr = addr
+        self.status = status
+        body = .error(message)
+    }
 }
 
 enum ReadOp: Sendable {
@@ -116,20 +134,21 @@ extension HTTP {
 }
 
 extension JSON {
-    static func errorBody(_ message: StaticString) -> ByteBuffer {
-        var out = ByteBuffer(capacity: 40 + message.utf8CodeUnitCount)
+    /// The RealWorld error body, `{"errors":{"body":["<message>"]}}`.
+    static func writeError(_ out: inout ByteBuffer, _ message: StaticString) {
         out.append("{\"errors\":{\"body\":[")
         writeString(&out, message)
         out.append("]}}")
-        return out
     }
 }
 
 /// Requests to their work (router.rs): what needs no database is answered here.
 enum Router {
-    /// What routing decided: an answer now (its body owned, moved to the connection's write), or work for the lanes.
+    /// What routing decided, used once: an answer now (an error, whose body the reactor writes, or a constant one), or
+    /// work for the lanes.
     enum Dispatch: ~Copyable {
-        case immediate(UInt16, ByteBuffer)
+        case error(UInt16, StaticString)
+        case constant(UInt16, StaticString)
         case read(ReadTask)
         case readFront(ReadTask)
         case write(WriteTask)
@@ -137,7 +156,7 @@ enum Router {
     }
 
     @inline(__always) private static func failNow(_ status: UInt16, _ message: StaticString) -> Dispatch {
-        .immediate(status, JSON.errorBody(message))
+        .error(status, message)
     }
 
     @inline(__always) private static func hexNibble(_ b: UInt8) -> UInt8? {
@@ -280,28 +299,24 @@ enum Router {
         return (lim, off)
     }
 
-    private static func unwrapJsonEnvelope(_ body: Span<UInt8>, _ rootKey: StaticString) -> JSON.Map? {
-        guard case .object(var outer)? = JSON.parse(body), case .object(let inner)? = outer.remove(rootKey) else { return nil }
-        return inner
+    /// A request body's envelope, `{"<rootKey>":{...}}`, read in place: where the inner object is in the body, and
+    /// where its members are in it.
+    private struct Envelope {
+        let range: Range<Int>
+        let fields: JSON.Object
     }
 
-    private static func containsNul(_ map: JSON.Map) -> Bool {
-        func check(_ v: JSON.Value) -> Bool {
-            switch v {
-            case .string(let s): s.contains(0)
-            case .array(let arr): arr.contains(where: check)
-            case .object(let obj): obj.values.contains(where: check)
-            default: false
-            }
-        }
-        return map.values.contains(where: check)
+    private static func unwrapJsonEnvelope(_ body: Span<UInt8>, _ rootKey: StaticString) -> Envelope? {
+        guard let outer = JSON.scan(body), let root = outer.member(rootKey, in: body), root.kind == .object,
+              let fields = JSON.scan(body.extracting(root.value)) else { return nil }
+        return Envelope(range: root.value, fields: fields)
     }
 
     /// The object under `rootKey`, or the message to fail the request with (422).
-    private static func parseValidEnvelope(_ body: Span<UInt8>, _ rootKey: StaticString) -> (JSON.Map?, StaticString) {
-        guard let m = unwrapJsonEnvelope(body, rootKey) else { return (nil, "invalid request body") }
-        if containsNul(m) { return (nil, "strings must not contain NUL") }
-        return (m, "")
+    private static func parseValidEnvelope(_ body: Span<UInt8>, _ rootKey: StaticString) -> (Envelope?, StaticString) {
+        guard let envelope = unwrapJsonEnvelope(body, rootKey) else { return (nil, "invalid request body") }
+        if envelope.fields.hasNul { return (nil, "strings must not contain NUL") }
+        return (envelope, "")
     }
 
     private enum Field {
@@ -318,17 +333,23 @@ enum Router {
         }
     }
 
-    private static func optionalStrField(_ map: JSON.Map, _ key: StaticString, nonEmpty: Bool) -> Field {
-        switch map.get(key) {
-        case nil, .null?: .absent
-        case .string(let s)? where nonEmpty && s.isEmpty: .invalid
-        case .string(let s)?: .value(s)
-        default: .invalid
+    /// A string field of the envelope, copied (it travels to a lane); absent or null, or something else (invalid).
+    private static func optionalStrField(_ body: Span<UInt8>, _ envelope: Envelope, _ key: StaticString, nonEmpty: Bool) -> Field {
+        let src = body.extracting(envelope.range)
+        guard let field = envelope.fields.member(key, in: src) else { return .absent }
+        switch field.kind {
+        case .null:
+            return .absent
+        case .string:
+            let value = JSON.ownedString(src, field)
+            return nonEmpty && value.isEmpty ? .invalid : .value(value)
+        default:
+            return .invalid
         }
     }
 
-    private static func requiredStrField(_ map: JSON.Map, _ key: StaticString) -> [UInt8]? {
-        if case .value(let v) = optionalStrField(map, key, nonEmpty: true) { v } else { nil }
+    private static func requiredStrField(_ body: Span<UInt8>, _ envelope: Envelope, _ key: StaticString) -> [UInt8]? {
+        if case .value(let v) = optionalStrField(body, envelope, key, nonEmpty: true) { v } else { nil }
     }
 
     private enum AuthState {
@@ -425,7 +446,7 @@ enum Router {
             return required { v in
                 let (obj, failure) = parseValidEnvelope(req.body, "comment")
                 guard let obj else { return failNow(422, failure) }
-                guard let body = requiredStrField(obj, "body") else { return failNow(422, "comment body required") }
+                guard let body = requiredStrField(req.body, obj, "body") else { return failNow(422, "comment body required") }
                 return write(.createComment(slug: slug, body: body), v)
             }
         }
@@ -463,11 +484,7 @@ enum Router {
     private static func routeArticleList(_ rawQuery: Span<UInt8>, _ viewer: Int64, _ addr: ReplyAddr) -> Dispatch {
         let q = scanListQuery(rawQuery)
         guard let (lim, off) = validatePageBounds(q) else { return failNow(422, "invalid pagination parameters") }
-        if q.impossibleFilter {
-            var body = ByteBuffer(capacity: 34)
-            body.append("{\"articles\":[],\"articlesCount\":0}")
-            return .immediate(200, body)
-        }
+        if q.impossibleFilter { return .constant(200, "{\"articles\":[],\"articlesCount\":0}") }
         let op: ReadOp
         if let tag = q.tag, !tag.isEmpty {
             op = .byTag(tag: tag, lim: lim, off: off)
@@ -484,8 +501,8 @@ enum Router {
     private static func handleRegister(_ body: Span<UInt8>, _ addr: ReplyAddr) -> Dispatch {
         let (obj, failure) = parseValidEnvelope(body, "user")
         guard let obj else { return failNow(422, failure) }
-        guard let username = requiredStrField(obj, "username"), let email = requiredStrField(obj, "email"),
-              let password = requiredStrField(obj, "password") else {
+        guard let username = requiredStrField(body, obj, "username"), let email = requiredStrField(body, obj, "email"),
+              let password = requiredStrField(body, obj, "password") else {
             return failNow(422, "username, email, and password are required")
         }
         if password.count > bcryptMaxBytes { return failNow(422, "password exceeds maximum length") }
@@ -495,7 +512,7 @@ enum Router {
 
     private static func handleLogin(_ body: Span<UInt8>, _ addr: ReplyAddr) -> Dispatch {
         guard let obj = unwrapJsonEnvelope(body, "user") else { return failNow(422, "invalid login payload") }
-        guard let email = requiredStrField(obj, "email"), let password = requiredStrField(obj, "password") else {
+        guard let email = requiredStrField(body, obj, "email"), let password = requiredStrField(body, obj, "password") else {
             return failNow(422, "email and password are required")
         }
         if email.contains(0) || password.count > bcryptMaxBytes { return failNow(401, "invalid credentials") }
@@ -505,11 +522,11 @@ enum Router {
     private static func handleUpdateUser(_ body: Span<UInt8>, _ uid: Int64, _ token: [UInt8], _ addr: ReplyAddr) -> Dispatch {
         let (obj, failure) = parseValidEnvelope(body, "user")
         guard let obj else { return failNow(422, failure) }
-        guard let email = optionalStrField(obj, "email", nonEmpty: true).optional,
-              let username = optionalStrField(obj, "username", nonEmpty: true).optional,
-              let password = optionalStrField(obj, "password", nonEmpty: true).optional,
-              let bio = optionalStrField(obj, "bio", nonEmpty: false).optional,
-              let image = optionalStrField(obj, "image", nonEmpty: false).optional else {
+        guard let email = optionalStrField(body, obj, "email", nonEmpty: true).optional,
+              let username = optionalStrField(body, obj, "username", nonEmpty: true).optional,
+              let password = optionalStrField(body, obj, "password", nonEmpty: true).optional,
+              let bio = optionalStrField(body, obj, "bio", nonEmpty: false).optional,
+              let image = optionalStrField(body, obj, "image", nonEmpty: false).optional else {
             return failNow(422, "invalid user fields")
         }
         let op = WriteOp.updateUser(token: token, email: email, username: username, hash: nil, bio: bio, image: image)
@@ -521,25 +538,32 @@ enum Router {
     private static func handleCreateArticle(_ body: Span<UInt8>, _ viewer: Int64, _ addr: ReplyAddr) -> Dispatch {
         let (obj, failure) = parseValidEnvelope(body, "article")
         guard let obj else { return failNow(422, failure) }
-        guard let title = requiredStrField(obj, "title"), let description = requiredStrField(obj, "description"),
-              let articleBody = requiredStrField(obj, "body") else {
+        guard let title = requiredStrField(body, obj, "title"), let description = requiredStrField(body, obj, "description"),
+              let articleBody = requiredStrField(body, obj, "body") else {
             return failNow(422, "title, description, and body are required")
         }
         var tags: [[UInt8]] = []
-        switch obj.get("tagList") {
-        case nil, .null?:
-            break
-        case .array(let arr)?:
-            for item in arr {
-                guard case .string(let s) = item, !s.isEmpty else { return failNow(422, "tagList must contain non-empty strings") }
-                tags.append(s)
+        let src = body.extracting(obj.range)
+        if let tagList = obj.fields.member("tagList", in: src) {
+            switch tagList.kind {
+            case .null:
+                break
+            case .array:
+                let allStrings = JSON.forEachElement(src, tagList) { item in
+                    guard item.kind == .string else { return false }
+                    let tag = JSON.ownedString(src, item)
+                    guard !tag.isEmpty else { return false }
+                    tags.append(tag)
+                    return true
+                }
+                guard allStrings else { return failNow(422, "tagList must contain non-empty strings") }
+                tags.sort { $0.lexicographicallyPrecedes($1) }
+                var unique: [[UInt8]] = []
+                for t in tags where unique.last != t { unique.append(t) }
+                tags = unique
+            default:
+                return failNow(422, "tagList must be an array")
             }
-            tags.sort { $0.lexicographicallyPrecedes($1) }
-            var unique: [[UInt8]] = []
-            for t in tags where unique.last != t { unique.append(t) }
-            tags = unique
-        default:
-            return failNow(422, "tagList must be an array")
         }
         return .write(WriteTask(op: .createArticle(title: title, description: description, body: articleBody, tags: tags),
                                 viewer: viewer, addr: addr))
@@ -548,9 +572,9 @@ enum Router {
     private static func handleUpdateArticle(_ body: Span<UInt8>, _ slug: [UInt8], _ viewer: Int64, _ addr: ReplyAddr) -> Dispatch {
         let (obj, failure) = parseValidEnvelope(body, "article")
         guard let obj else { return failNow(422, failure) }
-        guard let title = optionalStrField(obj, "title", nonEmpty: true).optional,
-              let description = optionalStrField(obj, "description", nonEmpty: true).optional,
-              let articleBody = optionalStrField(obj, "body", nonEmpty: true).optional else {
+        guard let title = optionalStrField(body, obj, "title", nonEmpty: true).optional,
+              let description = optionalStrField(body, obj, "description", nonEmpty: true).optional,
+              let articleBody = optionalStrField(body, obj, "body", nonEmpty: true).optional else {
             return failNow(422, "article fields must be non-empty strings")
         }
         return .write(WriteTask(op: .updateArticle(slug: slug, title: title, description: description, body: articleBody),

@@ -1,5 +1,5 @@
 // codec.rs: byte search, the JSON writer (strings, integers, RFC 3339 timestamps), base64 and base64url, and the JSON
-// parser for request bodies and JWT claims. Readers take a `Span`; the parser is a ~Escapable view over one.
+// reader for request bodies and JWT claims: a validating pass that builds nothing and reads strings in place.
 import Glibc
 import Syscalls
 
@@ -414,71 +414,176 @@ enum Base64 {
 // ---------- JSON input ----------
 
 extension JSON {
-    /// A parsed JSON value. Strings are their UTF-8 bytes (validated), compared byte for byte as the Rust's are.
-    enum Value: Sendable {
+    /// What a value is.
+    enum Kind {
+        case string
+        case number
+        case object
+        case array
+        case `true`
+        case `false`
         case null
-        case bool(Bool)
-        case number(Double)
-        case string([UInt8])
-        case array([Value])
-        case object(Map)
-
-        var string: [UInt8]? {
-            if case .string(let s) = self { s } else { nil }
-        }
-
-        var number: Double? {
-            if case .number(let n) = self { n } else { nil }
-        }
-
-        var object: Map? {
-            if case .object(let m) = self { m } else { nil }
-        }
-
-        func get(_ key: StaticString) -> Value? { object?.get(key) }
     }
 
-    struct Map: Sendable {
-        struct Entry: Sendable {
-            let key: [UInt8]
-            var value: Value
+    /// A member of an object, as places in the document: its key's text and, for a string value, its text (both
+    /// without the quotes), or the whole value otherwise. A string with escapes is decoded when it is read.
+    struct Member {
+        let key: Range<Int>
+        let keyEscaped: Bool
+        let value: Range<Int>
+        let kind: Kind
+        let valueEscaped: Bool
+
+        static let none = Member(key: 0..<0, keyEscaped: false, value: 0..<0, kind: .null, valueEscaped: false)
+    }
+
+    /// What `scan` found: whether the document is an object, and where its members are.
+    struct Object {
+        static let capacity = 16
+        fileprivate(set) var members = InlineArray<16, Member>(repeating: .none)
+        fileprivate(set) var count = 0
+        fileprivate(set) var isObject = false
+        /// Some string in the document decodes to one with a NUL (`\u0000`).
+        fileprivate(set) var hasNul = false
+
+        /// The last member named `key` in `src` (a later duplicate wins, as in JavaScript's JSON.parse).
+        func member(_ key: StaticString, in src: Span<UInt8>) -> Member? {
+            var i = count
+            while i > 0 {
+                i -= 1
+                let m = members[i]
+                if !m.keyEscaped {
+                    if Bytes.equal(src.extracting(m.key), key) { return m }
+                } else if Bytes.equal(JSON.unescape(src.extracting(m.key)), key) {
+                    return m
+                }
+            }
+            return nil
         }
+    }
 
-        private(set) var entries: [Entry] = []
-
-        func get(_ key: StaticString) -> Value? {
-            entries.last { Bytes.equal($0.key, key) }?.value
+    /// Checks that `src` is one JSON value (RFC 8259: strings valid UTF-8, nesting at most 64 deep) and, when it is an
+    /// object, notes where its members are (the first `Object.capacity`; the rest are still checked). Builds nothing:
+    /// nil if the document isn't valid.
+    static func scan(_ src: Span<UInt8>) -> Object? {
+        var scanner = Scanner(src)
+        var object = Object()
+        scanner.skipWhitespace()
+        if scanner.pos < src.count && src[scanner.pos] == 0x7B {
+            object.isObject = true
+            guard scanner.object(depth: 1, noting: &object) else { return nil }
+        } else {
+            guard scanner.value(depth: 0) != nil else { return nil }
         }
+        scanner.skipWhitespace()
+        object.hasNul = scanner.sawNul
+        return scanner.pos == src.count ? object : nil
+    }
 
-        mutating func remove(_ key: StaticString) -> Value? {
-            guard let pos = entries.lastIndex(where: { Bytes.equal($0.key, key) }) else { return nil }
-            let value = entries.remove(at: pos).value
-            entries.removeAll { Bytes.equal($0.key, key) }
-            return value
+    /// Calls `body` with each element of an array member (already checked), a string's text without its quotes, until
+    /// `body` returns false; whether it went through them all.
+    static func forEachElement(_ src: Span<UInt8>, _ array: Member, _ body: (Member) -> Bool) -> Bool {
+        var scanner = Scanner(src)
+        scanner.pos = array.value.lowerBound + 1
+        scanner.skipWhitespace()
+        if src[scanner.pos] == 0x5D { return true }
+        while true {
+            scanner.skipWhitespace()
+            let start = scanner.pos
+            guard let (kind, escaped) = scanner.value(depth: 1) else { return false }
+            let range = kind == .string ? (start + 1)..<(scanner.pos - 1) : start..<scanner.pos
+            if !body(Member(key: 0..<0, keyEscaped: false, value: range, kind: kind, valueEscaped: escaped)) { return false }
+            scanner.skipWhitespace()
+            if src[scanner.pos] == 0x5D { return true }
+            scanner.pos += 1
         }
+    }
 
-        var values: [Value] { entries.map(\.value) }
+    /// Calls `body` with a string member's text: in place, or decoded when it has escapes.
+    static func withString<R>(_ src: Span<UInt8>, _ member: Member, _ body: (Span<UInt8>) -> R) -> R {
+        if !member.valueEscaped { return body(src.extracting(member.value)) }
+        let decoded = unescape(src.extracting(member.value))
+        return body(decoded.span)
+    }
 
-        mutating func insert(_ key: [UInt8], _ value: Value) {
-            if let i = entries.firstIndex(where: { $0.key == key }) {
-                entries[i].value = value
-            } else {
-                entries.append(Entry(key: key, value: value))
+    /// A string member's text as an owned array (decoded when it has escapes): for a value that outlives the request.
+    static func ownedString(_ src: Span<UInt8>, _ member: Member) -> [UInt8] {
+        member.valueEscaped ? unescape(src.extracting(member.value)) : ByteBuffer(copying: src.extracting(member.value)).take()
+    }
+
+    /// A number member's value.
+    static func number(_ src: Span<UInt8>, _ member: Member) -> Double? {
+        let text = src.extracting(member.value)
+        // Integers, the usual case, without going through text.
+        var value: Int64 = 0
+        var i = text.count > 0 && text[0] == 0x2D ? 1 : 0
+        let negative = i == 1
+        while i < text.count, (0x30...0x39).contains(text[i]) {
+            let (m, o1) = value.multipliedReportingOverflow(by: 10)
+            let (v, o2) = m.addingReportingOverflow(Int64(text[i] - 0x30))
+            if o1 || o2 { break }
+            value = v
+            i += 1
+        }
+        if i == text.count { return Double(negative ? -value : value) }
+        guard let string = Bytes.copyString(text), let double = Double(string), double.isFinite else { return nil }
+        return double
+    }
+
+    /// A checked string's text with its escapes decoded.
+    static func unescape(_ text: Span<UInt8>) -> [UInt8] {
+        var out = ByteBuffer(capacity: text.count)
+        var i = 0
+        while i < text.count {
+            let c = text[i]
+            if c != 0x5C {
+                out.append(c)
+                i += 1
+                continue
+            }
+            let e = text[i + 1]
+            i += 2
+            switch e {
+            case 0x62: out.append(0x08)
+            case 0x66: out.append(0x0C)
+            case 0x6E: out.append(0x0A)
+            case 0x72: out.append(0x0D)
+            case 0x74: out.append(0x09)
+            case 0x75:
+                var code = UInt32(hex4(text, i))
+                i += 4
+                if (0xD800...0xDBFF).contains(code) {
+                    code = 0x10000 + ((code - 0xD800) << 10) + (UInt32(hex4(text, i + 2)) - 0xDC00)
+                    i += 6
+                }
+                for byte in UTF8.encode(Unicode.Scalar(code)!)! { out.append(byte) }
+            default: out.append(e)
             }
         }
+        return out.take()
     }
 
-    static func parse(_ src: Span<UInt8>) -> Value? {
-        var p = Parser(src)
-        guard let value = p.parseValue(depth: 0) else { return nil }
-        p.skipWhitespace()
-        return p.pos == src.count ? value : nil
+    @inline(__always) fileprivate static func hexValue(_ b: UInt8) -> UInt16? {
+        switch b {
+        case 0x30...0x39: UInt16(b - 0x30)
+        case 0x61...0x66: UInt16(b - 0x61 + 10)
+        case 0x41...0x46: UInt16(b - 0x41 + 10)
+        default: nil
+        }
     }
 
-    /// A recursive-descent parser over a borrowed body: it can't outlive the bytes it reads.
-    struct Parser: ~Escapable {
+    /// Four hex digits at `at` (already checked).
+    @inline(__always) private static func hex4(_ text: Span<UInt8>, _ at: Int) -> UInt16 {
+        var value: UInt16 = 0
+        for k in 0..<4 { value = value << 4 | hexValue(text[at + k])! }
+        return value
+    }
+
+    /// The validating pass over a borrowed document: it can't outlive the bytes it reads.
+    private struct Scanner: ~Escapable {
         let src: Span<UInt8>
         var pos = 0
+        var sawNul = false
 
         @_lifetime(copy src)
         init(_ src: Span<UInt8>) {
@@ -494,213 +599,167 @@ extension JSON {
             }
         }
 
-        @inline(__always) private func at(_ offset: Int = 0) -> UInt8? {
-            pos + offset < src.count ? src[pos + offset] : nil
+        private mutating func literal(_ text: StaticString) -> Bool {
+            let n = text.utf8CodeUnitCount
+            guard pos + n <= src.count, Bytes.equal(src.extracting(pos..<(pos + n)), text) else { return false }
+            pos += n
+            return true
         }
 
-        private func matches(_ literal: StaticString) -> Bool {
-            let n = literal.utf8CodeUnitCount
-            guard pos + n <= src.count else { return false }
-            return Bytes.equal(src.extracting(pos..<(pos + n)), literal)
-        }
-
-        mutating func parseValue(depth: Int) -> Value? {
-            if depth > 64 { return nil }
-            skipWhitespace()
-            guard let b = at() else { return nil }
-            switch b {
-            case 0x22: return parseString().map(Value.string)
-            case 0x7B: return parseObject(depth: depth + 1).map(Value.object)
-            case 0x5B: return parseArray(depth: depth + 1).map(Value.array)
-            case 0x74:
-                guard matches("true") else { return nil }
-                pos += 4
-                return .bool(true)
-            case 0x66:
-                guard matches("false") else { return nil }
-                pos += 5
-                return .bool(false)
-            case 0x6E:
-                guard matches("null") else { return nil }
-                pos += 4
-                return .null
-            case 0x2D, 0x30...0x39: return parseNumber().map(Value.number)
+        /// The value at `pos`, passed over: its kind and, for a string, whether it has escapes; nil if invalid.
+        mutating func value(depth: Int) -> (kind: Kind, escaped: Bool)? {
+            guard depth <= 64, pos < src.count else { return nil }
+            switch src[pos] {
+            case 0x22:
+                guard let escaped = string() else { return nil }
+                return (.string, escaped)
+            case 0x7B:
+                var unused = Object()
+                return object(depth: depth + 1, noting: &unused, keep: false) ? (.object, false) : nil
+            case 0x5B:
+                return array(depth: depth + 1) ? (.array, false) : nil
+            case 0x74: return literal("true") ? (.true, false) : nil
+            case 0x66: return literal("false") ? (.false, false) : nil
+            case 0x6E: return literal("null") ? (.null, false) : nil
+            case 0x2D, 0x30...0x39: return number() ? (.number, false) : nil
             default: return nil
             }
         }
 
-        mutating func parseString() -> [UInt8]? {
+        /// The string whose opening quote is at `pos`, passed over: whether it has escapes; nil if invalid.
+        mutating func string() -> Bool? {
             pos += 1
             let start = pos
+            var escaped = false
             while pos < src.count {
                 let c = src[pos]
                 if c == 0x22 {
-                    let segment = src.extracting(start..<pos)
-                    guard Bytes.isValidUTF8(segment) else { return nil }
+                    // Escapes are ASCII, so the text with them is valid UTF-8 exactly when its other bytes are.
+                    guard Bytes.isValidUTF8(src.extracting(start..<pos)) else { return nil }
                     pos += 1
-                    return ByteBuffer(copying: segment).take()
-                }
-                if c == 0x5C { return parseStringEscaped(start) }
-                if c < 0x20 { return nil }
-                pos += 1
-            }
-            return nil
-        }
-
-        private mutating func parseStringEscaped(_ start: Int) -> [UInt8]? {
-            let head = src.extracting(start..<pos)
-            guard Bytes.isValidUTF8(head) else { return nil }
-            var out = ByteBuffer(copying: head)
-            while pos < src.count {
-                let c = src[pos]
-                if c == 0x22 {
-                    pos += 1
-                    return out.take()
+                    return escaped
                 }
                 if c < 0x20 { return nil }
-                if c != 0x5C {
-                    let segStart = pos
-                    pos += 1
-                    while pos < src.count {
-                        let b = src[pos]
-                        if b == 0x22 || b == 0x5C || b < 0x20 { break }
-                        pos += 1
+                if c == 0x5C {
+                    escaped = true
+                    guard pos + 1 < src.count else { return nil }
+                    switch src[pos + 1] {
+                    case 0x22, 0x5C, 0x2F, 0x62, 0x66, 0x6E, 0x72, 0x74:
+                        pos += 2
+                    case 0x75:
+                        guard let unit = hex4(at: pos + 2) else { return nil }
+                        if unit == 0 { sawNul = true }
+                        pos += 6
+                        if (0xDC00...0xDFFF).contains(unit) { return nil }
+                        if (0xD800...0xDBFF).contains(unit) {
+                            guard pos + 1 < src.count, src[pos] == 0x5C, src[pos + 1] == 0x75,
+                                  let low = hex4(at: pos + 2), (0xDC00...0xDFFF).contains(low) else { return nil }
+                            pos += 6
+                        }
+                    default:
+                        return nil
                     }
-                    let segment = src.extracting(segStart..<pos)
-                    guard Bytes.isValidUTF8(segment) else { return nil }
-                    out.append(segment)
                     continue
                 }
                 pos += 1
-                guard let esc = at() else { return nil }
-                pos += 1
-                switch esc {
-                case 0x22: out.append(0x22)
-                case 0x5C: out.append(0x5C)
-                case 0x2F: out.append(0x2F)
-                case 0x62: out.append(0x08)
-                case 0x66: out.append(0x0C)
-                case 0x6E: out.append(0x0A)
-                case 0x72: out.append(0x0D)
-                case 0x74: out.append(0x09)
-                case 0x75:
-                    guard let u1 = readHex4() else { return nil }
-                    let code: UInt32
-                    if (0xD800...0xDBFF).contains(u1) {
-                        guard matches("\\u") else { return nil }
-                        pos += 2
-                        guard let u2 = readHex4(), (0xDC00...0xDFFF).contains(u2) else { return nil }
-                        code = 0x10000 + (UInt32(u1 - 0xD800) << 10) + UInt32(u2 - 0xDC00)
-                    } else if (0xDC00...0xDFFF).contains(u1) {
-                        return nil
-                    } else {
-                        code = UInt32(u1)
-                    }
-                    guard let scalar = Unicode.Scalar(code) else { return nil }
-                    for byte in UTF8.encode(scalar)! { out.append(byte) }
-                default:
-                    return nil
-                }
             }
             return nil
         }
 
-        private mutating func readHex4() -> UInt16? {
-            guard pos + 4 <= src.count else { return nil }
+        private func hex4(at: Int) -> UInt16? {
+            guard at + 4 <= src.count else { return nil }
             var value: UInt16 = 0
-            for i in 0..<4 {
-                let b = src[pos + i]
-                let d: UInt8
-                switch b {
-                case 0x30...0x39: d = b - 0x30
-                case 0x61...0x66: d = b - 0x61 + 10
-                case 0x41...0x46: d = b - 0x41 + 10
-                default: return nil
-                }
-                value = value << 4 | UInt16(d)
+            for k in 0..<4 {
+                guard let d = JSON.hexValue(src[at + k]) else { return nil }
+                value = value << 4 | d
             }
-            pos += 4
             return value
         }
 
-        private mutating func skipDigits() {
-            while let b = at(), (0x30...0x39).contains(b) { pos += 1 }
-        }
-
-        mutating func parseNumber() -> Double? {
+        private mutating func digits() -> Bool {
             let start = pos
-            if at() == 0x2D { pos += 1 }
-            guard let first = at() else { return nil }
-            if first == 0x30 {
-                pos += 1
-                if let b = at(), (0x30...0x39).contains(b) { return nil }
-            } else if (0x30...0x39).contains(first) {
-                skipDigits()
-            } else {
-                return nil
-            }
-            if at() == 0x2E {
-                pos += 1
-                let fracStart = pos
-                skipDigits()
-                if pos == fracStart { return nil }
-            }
-            if let e = at(), e == 0x65 || e == 0x45 {
-                pos += 1
-                if let s = at(), s == 0x2B || s == 0x2D { pos += 1 }
-                let expStart = pos
-                skipDigits()
-                if pos == expStart { return nil }
-            }
-            guard let text = Bytes.copyString(src.extracting(start..<pos)), let v = Double(text), v.isFinite else { return nil }
-            return v
+            while pos < src.count, (0x30...0x39).contains(src[pos]) { pos += 1 }
+            return pos > start
         }
 
-        mutating func parseArray(depth: Int) -> [Value]? {
+        mutating func number() -> Bool {
+            if src[pos] == 0x2D { pos += 1 }
+            guard pos < src.count else { return false }
+            if src[pos] == 0x30 {
+                pos += 1
+            } else if !digits() {
+                return false
+            }
+            if pos < src.count && src[pos] == 0x2E {
+                pos += 1
+                guard digits() else { return false }
+            }
+            if pos < src.count && (src[pos] == 0x65 || src[pos] == 0x45) {
+                pos += 1
+                if pos < src.count && (src[pos] == 0x2B || src[pos] == 0x2D) { pos += 1 }
+                guard digits() else { return false }
+            }
+            return true
+        }
+
+        /// The object whose brace is at `pos`, passed over; its members noted in `object` when `keep`.
+        mutating func object(depth: Int, noting object: inout Object, keep: Bool = true) -> Bool {
             pos += 1
             skipWhitespace()
-            var arr: [Value] = []
-            if at() == 0x5D {
+            if pos < src.count && src[pos] == 0x7D {
                 pos += 1
-                return arr
+                return true
             }
             while true {
-                guard let v = parseValue(depth: depth) else { return nil }
-                arr.append(v)
                 skipWhitespace()
-                switch at() {
-                case 0x2C: pos += 1
-                case 0x5D:
+                guard pos < src.count, src[pos] == 0x22 else { return false }
+                let keyStart = pos + 1
+                guard let keyEscaped = string() else { return false }
+                let key = keyStart..<(pos - 1)
+                skipWhitespace()
+                guard pos < src.count, src[pos] == 0x3A else { return false }
+                pos += 1
+                skipWhitespace()
+                let valueStart = pos
+                guard let (kind, valueEscaped) = value(depth: depth) else { return false }
+                if keep && object.count < Object.capacity {
+                    let range = kind == .string ? (valueStart + 1)..<(pos - 1) : valueStart..<pos
+                    object.members[object.count] = Member(key: key, keyEscaped: keyEscaped, value: range, kind: kind,
+                                                          valueEscaped: valueEscaped)
+                    object.count += 1
+                }
+                skipWhitespace()
+                guard pos < src.count else { return false }
+                if src[pos] == 0x2C {
                     pos += 1
-                    return arr
-                default: return nil
+                } else if src[pos] == 0x7D {
+                    pos += 1
+                    return true
+                } else {
+                    return false
                 }
             }
         }
 
-        mutating func parseObject(depth: Int) -> Map? {
+        mutating func array(depth: Int) -> Bool {
             pos += 1
             skipWhitespace()
-            var map = Map()
-            if at() == 0x7D {
+            if pos < src.count && src[pos] == 0x5D {
                 pos += 1
-                return map
+                return true
             }
             while true {
                 skipWhitespace()
-                guard at() == 0x22, let key = parseString() else { return nil }
+                guard value(depth: depth) != nil else { return false }
                 skipWhitespace()
-                guard at() == 0x3A else { return nil }
-                pos += 1
-                guard let value = parseValue(depth: depth) else { return nil }
-                map.insert(key, value)
-                skipWhitespace()
-                switch at() {
-                case 0x2C: pos += 1
-                case 0x7D:
+                guard pos < src.count else { return false }
+                if src[pos] == 0x2C {
                     pos += 1
-                    return map
-                default: return nil
+                } else if src[pos] == 0x5D {
+                    pos += 1
+                    return true
+                } else {
+                    return false
                 }
             }
         }

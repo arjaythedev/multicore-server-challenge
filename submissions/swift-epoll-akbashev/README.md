@@ -71,13 +71,16 @@ batch, never per request:
 
 - `~Copyable`: `ByteBuffer` (the Rust's `Vec<u8>`: one owner, never copied, so appending never copies its array),
   `UniqueArray` (the reactor's connection slots, each owning its buffers), `PgConn` (owns its socket, closes it in
-  `deinit`), `PipelineBuf`, `TxBuf`, and the `Router.Dispatch`/`HTTP.ParseOutcome` results that carry an owned body.
+  `deinit`), `PipelineBuf`, `TxBuf`, and the `Router.Dispatch`/`HTTP.ParseOutcome` results, each used once.
 - `Span`, `RawSpan`, `MutableSpan`, `OutputSpan`: every byte reader takes a `Span`; integers are loaded from a
   `RawSpan` (`load(fromByteOffset:as:_:)`, big-endian for Postgres frames and cells and SHA-256 blocks, native for
   epoll events), as are the JSON writer's 16-byte SIMD and 8-byte word checks; socket reads fill a buffer through an
-  `OutputSpan`; base64 decodes into a `MutableSpan` of a stack `InlineArray`.
+  `OutputSpan`; base64 decodes, and response heads are written, into a `MutableSpan` of a stack `InlineArray`.
 - `~Escapable` with `@_lifetime`: `HTTP.Request` borrows the reactor's read buffer (the Rust's `HttpReq<'a>`), the JSON
-  parser borrows the body, and the pipeline buffer lends its cells as `Span`s.
+  reader borrows the body (a validating pass that builds nothing: members are places in the body, kept in an
+  `InlineArray`, and strings are read in place, copied only into the value that goes to a lane), and the pipeline
+  buffer lends its cells as `Span`s. Errors are `StaticString`s whose bodies the reactor writes, so no error answer
+  allocates.
 - `InlineArray` and value generics: the SHA-256 state and schedule, bcrypt's Blowfish states (`Bcrypt.hashLanes<let n>`,
   the Rust's `bcrypt_lanes<const N>`), bcrypt's base64 decode (`<let count: Int>`), HTTP header and number buffers.
 - `UTF8Span(validating:)` for UTF-8 checks, typed throws (`throws(PgError)`), `Mutex` and `Atomic` from

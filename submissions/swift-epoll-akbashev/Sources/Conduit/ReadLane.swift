@@ -38,7 +38,7 @@ extension JSON {
 
 extension OutgoingReply {
     static func error(_ addr: ReplyAddr, _ status: UInt16, _ message: StaticString) -> OutgoingReply {
-        OutgoingReply(addr: addr, status: status, body: JSON.errorBody(message).take())
+        OutgoingReply(addr: addr, status: status, error: message)
     }
 
     /// Sends each reactor its share of `replies`: one message per reactor, a child task starting on its loop.

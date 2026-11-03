@@ -21,6 +21,8 @@ actor Reactor {
     private var slots = UniqueArray<ClientSlot>(capacity: 16384)
     private var freeSlots: [UInt32] = []
     private var scratch = ByteBuffer(capacity: 256 * 1024)
+    /// Error bodies are written here, and sent from here.
+    private var errorBody = ByteBuffer(capacity: 256)
     private var pipelinedSlots: [UInt32] = []
     private var activeConns = 0
     private var idleHead = idleNone
@@ -97,7 +99,10 @@ actor Reactor {
             let s = Int(rep.addr.slot)
             guard s < slots.count, slots[s].fd >= 0, slots[s].epoch == rep.addr.epoch, slots[s].inFlight else { continue }
             let hasBufferedRx = !slots[s].rx.isEmpty
-            rep.body.withUnsafeBytes { writeResponse(rep.addr.slot, rep.status, $0) }
+            switch rep.body {
+            case .bytes(let body): body.withUnsafeBytes { writeResponse(rep.addr.slot, rep.status, $0) }
+            case .error(let message): writeError(rep.addr.slot, rep.status, message)
+            }
             if hasBufferedRx { pipelinedSlots.append(rep.addr.slot) }
         }
         for slot in pipelinedSlots { drainRxBuf(slot) }
@@ -262,8 +267,11 @@ actor Reactor {
     /// Writes an immediate answer, or queues the work for this tick's submission. Whether it was immediate.
     private func handle(_ dispatch: consuming Router.Dispatch, _ slot: UInt32) -> Bool {
         switch consume dispatch {
-        case .immediate(let status, let body):
-            body.withBytes { writeResponse(slot, status, $0) }
+        case .error(let status, let message):
+            writeError(slot, status, message)
+            return true
+        case .constant(let status, let body):
+            writeResponse(slot, status, UnsafeRawBufferPointer(start: body.utf8Start, count: body.utf8CodeUnitCount))
             return true
         case .read(let t): pending.reads.append(t)
         case .readFront(let t): pending.readsFront.append(t)
@@ -310,7 +318,14 @@ actor Reactor {
         slots[s].closeOnDone = true
         slots[s].inFlight = true
         slots[s].rx.release()
-        JSON.errorBody(HTTP.reasonPhrase(status)).withBytes { writeResponse(slot, status, $0) }
+        writeError(slot, status, HTTP.reasonPhrase(status))
+    }
+
+    /// The RealWorld error body, written here and sent from here.
+    private func writeError(_ slot: UInt32, _ status: UInt16, _ message: StaticString) {
+        errorBody.removeAll()
+        JSON.writeError(&errorBody, message)
+        errorBody.withBytes { writeResponse(slot, status, $0) }
     }
 
     // ---------- writing ----------
@@ -320,11 +335,11 @@ actor Reactor {
         slots[s].inFlight = false
         slots[s].reused = true
         let close = slots[s].closeOnDone
-        // The header in a stack buffer, as the Rust's `[0u8; 160]`: no allocation per response.
-        withUnsafeTemporaryAllocation(byteCount: 192, alignment: 8) { raw in
-            let header = UnsafeRawBufferPointer(rebasing: raw[0..<HTTP.formatHeader(raw, status, body.count, close)])
-            send(slot, header, body)
-        }
+        // The head in an inline array on the stack, as the Rust's `[0u8; 160]`: no allocation per response.
+        var head = InlineArray<192, UInt8>(repeating: 0)
+        var headSpan = head.mutableSpan
+        let n = HTTP.formatHeader(into: &headSpan, status, body.count, close)
+        head.span.withUnsafeBytes { send(slot, UnsafeRawBufferPointer(rebasing: $0[0..<n]), body) }
         updateWriteState(slot)
     }
 
@@ -482,40 +497,43 @@ enum HTTP {
     }
 
     /// The response head (status line, Content-Type, Content-Length, Connection) into `out`; returns its length.
-    fileprivate static func formatHeader(_ out: UnsafeMutableRawBufferPointer, _ status: UInt16, _ length: Int, _ close: Bool) -> Int {
+    fileprivate static func formatHeader(into out: inout MutableSpan<UInt8>, _ status: UInt16, _ length: Int, _ close: Bool) -> Int {
         var n = 0
-        func put(_ s: StaticString) {
-            (out.baseAddress! + n).copyMemory(from: s.utf8Start, byteCount: s.utf8CodeUnitCount)
-            n += s.utf8CodeUnitCount
-        }
-        func putLength() {
-            var digits = 1
-            var v = length
-            while v >= 10 {
-                v /= 10
-                digits += 1
-            }
-            v = length
-            for i in stride(from: n + digits - 1, through: n, by: -1) {
-                out[i] = 0x30 + UInt8(v % 10)
-                v /= 10
-            }
-            n += digits
-        }
         if status == 200 && !close {
-            put("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ")
-            putLength()
-            put("\r\n\r\n")
+            n = put(&out, n, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ")
+            n = putDecimal(&out, n, length)
+            n = put(&out, n, "\r\n\r\n")
         } else if status == 204 {
-            put(close ? "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n" : "HTTP/1.1 204 No Content\r\n\r\n")
+            n = put(&out, n, close ? "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n" : "HTTP/1.1 204 No Content\r\n\r\n")
         } else {
-            put("HTTP/1.1 ")
-            put(reasonPhrase(status))
-            put("\r\nContent-Type: application/json\r\nContent-Length: ")
-            putLength()
-            put(close ? "\r\nConnection: close\r\n\r\n" : "\r\n\r\n")
+            n = put(&out, n, "HTTP/1.1 ")
+            n = put(&out, n, reasonPhrase(status))
+            n = put(&out, n, "\r\nContent-Type: application/json\r\nContent-Length: ")
+            n = putDecimal(&out, n, length)
+            n = put(&out, n, close ? "\r\nConnection: close\r\n\r\n" : "\r\n\r\n")
         }
         return n
+    }
+
+    @inline(__always) private static func put(_ out: inout MutableSpan<UInt8>, _ at: Int, _ text: StaticString) -> Int {
+        let bytes = text.utf8Start
+        for i in 0..<text.utf8CodeUnitCount { out[at + i] = bytes[i] }
+        return at + text.utf8CodeUnitCount
+    }
+
+    @inline(__always) private static func putDecimal(_ out: inout MutableSpan<UInt8>, _ at: Int, _ value: Int) -> Int {
+        var digits = 1
+        var v = value
+        while v >= 10 {
+            v /= 10
+            digits += 1
+        }
+        v = value
+        for i in stride(from: at + digits - 1, through: at, by: -1) {
+            out[i] = 0x30 + UInt8(v % 10)
+            v /= 10
+        }
+        return at + digits
     }
 
     enum ParseOutcome: ~Copyable {
