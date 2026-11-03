@@ -133,8 +133,8 @@ let mutable stats = false
 
 /// experiments (RD_DUMP=path): the read statement's inputs of a few batches, as psql EXECUTE lines for EXPLAIN
 let mutable dumpPath: string = null
-let mutable private dumpLeft = 40
-let mutable private dumpSkip = 0
+let private dumpLeft = Dictionary<string, int>()
+let private dumpSkip = Dictionary<string, int>()
 
 let private pgArray (xs: seq<string>) =
     let b = StringBuilder("'{")
@@ -146,12 +146,15 @@ let private pgArray (xs: seq<string>) =
         else b.Append('"').Append(x.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("'", "''")).Append('"') |> ignore
     b.Append("}'").ToString()
 
-let private dumpRead (cols: string list) =
+/// experiments (RD_DUMP): 40 executions of a statement, spread over the run once it is warm, as EXECUTE lines
+let private dumpStmt (name: string) (cols: string list) =
     lock typeof<RJob> (fun () ->
-        dumpSkip <- dumpSkip + 1
-        if dumpLeft > 0 && dumpSkip > 4000 && dumpSkip % 25 = 0 then
-            dumpLeft <- dumpLeft - 1
-            IO.File.AppendAllText(dumpPath, "EXECUTE rd(" + String.Join(", ", cols) + ");\n"))
+        let n = (match dumpSkip.TryGetValue name with | true, x -> x | _ -> 0) + 1
+        dumpSkip.[name] <- n
+        let left = match dumpLeft.TryGetValue name with | true, x -> x | _ -> 40
+        if left > 0 && n > 2000 && n % 20 = 0 then
+            dumpLeft.[name] <- left - 1
+            IO.File.AppendAllText(dumpPath, "EXECUTE " + name + "(" + String.Join(", ", cols) + ");\n"))
 let private statReads = ref 0L
 let private statReadBatches = ref 0L
 
@@ -667,7 +670,7 @@ type private Reader(c: Conn) =
             o.Execute()
             if dump then
                 let num (xs: seq<'a>) = pgArray (Seq.map string xs)
-                dumpRead
+                dumpStmt "rd"
                     [ num gk; pgArray gkey; num gv; num glim; num goff
                       num [ for struct (g, _, _) in rq -> g ]; num [ for struct (_, f, _) in rq -> f ]
                       num [ for struct (_, _, t) in rq -> t ]; num [ for j in lists -> j.Viewer ]
@@ -692,6 +695,10 @@ type private Reader(c: Conn) =
             o.ArrEnd()
             o.EndBind()
             o.Execute()
+            if dump then
+                dumpStmt "cm"
+                    [ pgArray slugs; pgArray [ for j in cmts -> string (slugIndex.[j.Key] + 1) ]
+                      pgArray [ for j in cmts -> string j.Viewer ] ]
         if profiles.Count > 0 then
             o.Bind("pf", 2)
             o.ArrBegin(OidText, profiles.Count, false)
