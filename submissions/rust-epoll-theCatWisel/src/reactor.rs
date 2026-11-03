@@ -30,6 +30,8 @@ pub mod sys {
     pub const SO_REUSEPORT: c_int = 15;
     pub const IPPROTO_TCP: c_int = 6;
     pub const TCP_NODELAY: c_int = 1;
+    pub const TCP_QUICKACK: c_int = 12;
+    pub const MADV_HUGEPAGE: c_int = 14;
     pub const IPPROTO_IPV6: c_int = 41;
     pub const IPV6_V6ONLY: c_int = 26;
     pub const EPOLL_CLOEXEC: c_int = 0o2000000;
@@ -137,6 +139,7 @@ pub mod sys {
         pub fn writev(fd: c_int, iov: *const iovec, iovcnt: c_int) -> isize;
         pub fn close(fd: c_int) -> c_int;
         pub fn getrandom(buf: *mut c_void, buflen: usize, flags: u32) -> isize;
+        pub fn madvise(addr: *mut c_void, length: usize, advice: c_int) -> c_int;
     }
 }
 
@@ -206,7 +209,7 @@ impl ReplyBody {
     #[inline]
     pub fn from_shared(plain_vec: Vec<u8>, gz_scratch: &mut Vec<u8>) -> Self {
         let plain: Arc<[u8]> = plain_vec.into();
-        if plain.len() >= 192 {
+        if plain.len() >= 512 {
             codec::gzip_compress_fast(&plain, gz_scratch);
             if gz_scratch.len() + 26 < plain.len().saturating_sub(64) {
                 return ReplyBody::SharedGz {
@@ -356,22 +359,39 @@ pub fn error_reply(addr: ReplyAddr, status: u16, msg: &str) -> OutgoingReply {
     }
 }
 
+const FLAG_IN_FLIGHT: u8 = 1 << 0;
+const FLAG_CLOSE_ON_DONE: u8 = 1 << 1;
+const FLAG_ACCEPT_GZIP: u8 = 1 << 2;
+const FLAG_EOF_SEEN: u8 = 1 << 3;
+const FLAG_POLLING_OUT: u8 = 1 << 4;
+const FLAG_CONTINUE_SENT: u8 = 1 << 5;
+const FLAG_REUSED: u8 = 1 << 6;
+const FLAG_IN_IDLE_LRU: u8 = 1 << 7;
+
 struct ClientSlot {
-    fd: RawFd,
-    epoch: u32,
     rx: Vec<u8>,
     tx: Vec<u8>,
-    tx_off: usize,
-    in_flight: bool,
-    close_on_done: bool,
-    accept_gzip: bool,
-    eof_seen: bool,
-    polling_out: bool,
-    continue_sent: bool,
-    reused: bool,
-    in_idle_lru: bool,
+    fd: RawFd,
+    epoch: u32,
+    tx_off: u32,
     idle_prev: u32,
     idle_next: u32,
+    flags: u8,
+}
+
+impl ClientSlot {
+    #[inline(always)]
+    fn flag(&self, mask: u8) -> bool {
+        (self.flags & mask) != 0
+    }
+    #[inline(always)]
+    fn set_flag(&mut self, mask: u8, val: bool) {
+        if val {
+            self.flags |= mask;
+        } else {
+            self.flags &= !mask;
+        }
+    }
 }
 
 pub struct Reactor {
@@ -532,14 +552,28 @@ impl Reactor {
         let ep_fd = sys_cvt(unsafe { sys::epoll_create1(sys::EPOLL_CLOEXEC) })?;
         let ob = worker_outbox(worker_id as usize);
         let outbox_fd = ob.event_fd;
+        let mut slots = Vec::with_capacity(16384);
+        let mut scratch = vec![0; 256 * 1024];
+        unsafe {
+            let _ = sys::madvise(
+                scratch.as_mut_ptr() as *mut sys::c_void,
+                scratch.capacity(),
+                sys::MADV_HUGEPAGE,
+            );
+            let _ = sys::madvise(
+                slots.as_mut_ptr() as *mut sys::c_void,
+                slots.capacity() * std::mem::size_of::<ClientSlot>(),
+                sys::MADV_HUGEPAGE,
+            );
+        }
         let reactor = Reactor {
             worker_id,
             ep_fd,
             listen_fd,
             outbox_fd,
-            slots: Vec::with_capacity(16384),
+            slots,
             free_slots: Vec::with_capacity(4096),
-            scratch: vec![0; 256 * 1024],
+            scratch,
             outbox_buf: Vec::with_capacity(1024),
             pipelined_slots: Vec::with_capacity(256),
             signer,
@@ -564,10 +598,10 @@ impl Reactor {
     #[inline]
     fn link_idle(&mut self, slot: u32) {
         let c = &mut self.slots[slot as usize];
-        if c.in_idle_lru || c.fd < 0 {
+        if c.flag(FLAG_IN_IDLE_LRU) || c.fd < 0 {
             return;
         }
-        c.in_idle_lru = true;
+        c.set_flag(FLAG_IN_IDLE_LRU, true);
         c.idle_prev = self.idle_tail;
         c.idle_next = IDLE_NONE;
         if self.idle_tail != IDLE_NONE {
@@ -582,10 +616,10 @@ impl Reactor {
     fn unlink_idle(&mut self, slot: u32) {
         let (in_lru, prev, next) = {
             let c = &mut self.slots[slot as usize];
-            if !c.in_idle_lru {
+            if !c.flag(FLAG_IN_IDLE_LRU) {
                 return;
             }
-            c.in_idle_lru = false;
+            c.set_flag(FLAG_IN_IDLE_LRU, false);
             let p = c.idle_prev;
             let n = c.idle_next;
             c.idle_prev = IDLE_NONE;
@@ -671,14 +705,7 @@ impl Reactor {
                 Some(idx) => {
                     let c = &mut self.slots[idx as usize];
                     c.fd = fd;
-                    c.in_flight = false;
-                    c.close_on_done = false;
-                    c.accept_gzip = false;
-                    c.eof_seen = false;
-                    c.polling_out = false;
-                    c.continue_sent = false;
-                    c.reused = false;
-                    c.in_idle_lru = false;
+                    c.flags = 0;
                     c.idle_prev = IDLE_NONE;
                     c.idle_next = IDLE_NONE;
                     c.tx_off = 0;
@@ -686,21 +713,14 @@ impl Reactor {
                 }
                 None => {
                     self.slots.push(ClientSlot {
-                        fd,
-                        epoch: 0,
                         rx: Vec::new(),
                         tx: Vec::new(),
+                        fd,
+                        epoch: 0,
                         tx_off: 0,
-                        in_flight: false,
-                        close_on_done: false,
-                        accept_gzip: false,
-                        eof_seen: false,
-                        polling_out: false,
-                        continue_sent: false,
-                        reused: false,
-                        in_idle_lru: false,
                         idle_prev: IDLE_NONE,
                         idle_next: IDLE_NONE,
+                        flags: 0,
                     });
                     ((self.slots.len() - 1) as u32, 0)
                 }
@@ -741,8 +761,7 @@ impl Reactor {
         c.rx = Vec::new();
         c.tx = Vec::new();
         c.tx_off = 0;
-        c.in_flight = false;
-        c.reused = false;
+        c.flags = 0;
         self.active_conns = self.active_conns.saturating_sub(1);
         self.free_slots.push(slot);
     }
@@ -763,7 +782,7 @@ impl Reactor {
                 if c.fd < 0 {
                     return;
                 }
-                (c.fd, first_read && !c.in_flight && c.rx.is_empty())
+                (c.fd, first_read && !c.flag(FLAG_IN_FLIGHT) && c.rx.is_empty())
             };
             first_read = false;
 
@@ -812,10 +831,10 @@ impl Reactor {
                         dispatch,
                     } => {
                         let c = &mut self.slots[slot as usize];
-                        c.continue_sent = false;
-                        c.close_on_done = close_after;
-                        c.accept_gzip = accept_gzip;
-                        c.in_flight = true;
+                        c.set_flag(FLAG_CONTINUE_SENT, false);
+                        c.set_flag(FLAG_CLOSE_ON_DONE, close_after);
+                        c.set_flag(FLAG_ACCEPT_GZIP, accept_gzip);
+                        c.set_flag(FLAG_IN_FLIGHT, true);
                         if consumed < n {
                             c.rx.extend_from_slice(&self.scratch[consumed..n]);
                         }
@@ -833,8 +852,8 @@ impl Reactor {
                     ParseOutcome::Incomplete { send_continue } => {
                         let c = &mut self.slots[slot as usize];
                         c.rx.extend_from_slice(&self.scratch[..n]);
-                        if send_continue && !c.continue_sent {
-                            c.continue_sent = true;
+                        if send_continue && !c.flag(FLAG_CONTINUE_SENT) {
+                            c.set_flag(FLAG_CONTINUE_SENT, true);
                             self.write_raw_bytes(slot, b"HTTP/1.1 100 Continue\r\n\r\n");
                         }
                         return;
@@ -858,14 +877,14 @@ impl Reactor {
     fn drain_rx_buf(&mut self, slot: u32) {
         loop {
             let c = &mut self.slots[slot as usize];
-            if c.fd < 0 || c.in_flight || c.rx.is_empty() {
+            if c.fd < 0 || c.flag(FLAG_IN_FLIGHT) || c.rx.is_empty() {
                 if c.fd >= 0 && c.rx.is_empty() {
                     if c.rx.capacity() > 4096 {
                         c.rx = Vec::new();
                     } else {
                         c.rx.clear();
                     }
-                    if !c.in_flight && c.tx_off >= c.tx.len() && c.reused {
+                    if !c.flag(FLAG_IN_FLIGHT) && (c.tx_off as usize) >= c.tx.len() && c.flag(FLAG_REUSED) {
                         self.link_idle(slot);
                     }
                 }
@@ -883,10 +902,10 @@ impl Reactor {
                     accept_gzip,
                     dispatch,
                 } => {
-                    c.continue_sent = false;
-                    c.close_on_done = close_after;
-                    c.accept_gzip = accept_gzip;
-                    c.in_flight = true;
+                    c.set_flag(FLAG_CONTINUE_SENT, false);
+                    c.set_flag(FLAG_CLOSE_ON_DONE, close_after);
+                    c.set_flag(FLAG_ACCEPT_GZIP, accept_gzip);
+                    c.set_flag(FLAG_IN_FLIGHT, true);
                     if consumed == c.rx.len() {
                         c.rx = Vec::new();
                     } else {
@@ -898,8 +917,8 @@ impl Reactor {
                     }
                 }
                 ParseOutcome::Incomplete { send_continue } => {
-                    if send_continue && !c.continue_sent {
-                        c.continue_sent = true;
+                    if send_continue && !c.flag(FLAG_CONTINUE_SENT) {
+                        c.set_flag(FLAG_CONTINUE_SENT, true);
                         self.write_raw_bytes(slot, b"HTTP/1.1 100 Continue\r\n\r\n");
                     }
                     return;
@@ -914,8 +933,8 @@ impl Reactor {
 
     fn reject_conn(&mut self, slot: u32, status: u16) {
         let c = &mut self.slots[slot as usize];
-        c.close_on_done = true;
-        c.in_flight = true;
+        c.set_flag(FLAG_CLOSE_ON_DONE, true);
+        c.set_flag(FLAG_IN_FLIGHT, true);
         c.rx = Vec::new();
         let body = make_error_json(reason_phrase(status));
         self.write_response(slot, status, &body);
@@ -946,11 +965,11 @@ impl Reactor {
         check_pipelined.clear();
         for rep in &replies {
             let c = &self.slots[rep.addr.slot as usize];
-            if c.fd < 0 || c.epoch != rep.addr.epoch || !c.in_flight {
+            if c.fd < 0 || c.epoch != rep.addr.epoch || !c.flag(FLAG_IN_FLIGHT) {
                 continue;
             }
             let has_buffered_rx = !c.rx.is_empty();
-            let (plain, pre_gz) = rep.body.select(c.accept_gzip);
+            let (plain, pre_gz) = rep.body.select(c.flag(FLAG_ACCEPT_GZIP));
             self.write_response_ext(rep.addr.slot, rep.status, plain, pre_gz);
             if has_buffered_rx {
                 check_pipelined.push(rep.addr.slot);
@@ -972,8 +991,9 @@ impl Reactor {
 
     fn write_response_ext(&mut self, slot: u32, status: u16, body: &[u8], pre_gz: Option<&[u8]>) {
         let c = &mut self.slots[slot as usize];
-        c.in_flight = false;
-        c.reused = true;
+        c.set_flag(FLAG_IN_FLIGHT, false);
+        c.set_flag(FLAG_REUSED, true);
+        let close_on_done = c.flag(FLAG_CLOSE_ON_DONE);
         let (payload, use_gzip): (&[u8], bool) = if let Some(gz) = pre_gz {
             (gz, true)
         } else {
@@ -986,7 +1006,7 @@ impl Reactor {
             hlen += bytes.len();
         };
 
-        if status == 200 && !c.close_on_done {
+        if status == 200 && !close_on_done {
             if use_gzip {
                 const PFX_200_GZ: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: ";
                 hdr[..PFX_200_GZ.len()].copy_from_slice(PFX_200_GZ);
@@ -1003,7 +1023,7 @@ impl Reactor {
             hdr[hlen..hlen + 4].copy_from_slice(b"\r\n\r\n");
             hlen += 4;
         } else if status == 204 {
-            append(if c.close_on_done {
+            append(if close_on_done {
                 b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"
             } else {
                 b"HTTP/1.1 204 No Content\r\n\r\n"
@@ -1018,7 +1038,7 @@ impl Reactor {
             }
             let mut num = [0u8; 20];
             append(codec::format_u64_into(payload.len() as u64, &mut num));
-            append(if c.close_on_done {
+            append(if close_on_done {
                 b"\r\nConnection: close\r\n\r\n"
             } else {
                 b"\r\n\r\n"
@@ -1026,7 +1046,7 @@ impl Reactor {
         }
 
         let fd = c.fd;
-        if c.tx.len() > c.tx_off {
+        if c.tx.len() > c.tx_off as usize {
             c.tx.extend_from_slice(&hdr[..hlen]);
             c.tx.extend_from_slice(payload);
         } else {
@@ -1069,7 +1089,7 @@ impl Reactor {
 
     fn write_raw_bytes(&mut self, slot: u32, raw: &[u8]) {
         let c = &mut self.slots[slot as usize];
-        if c.tx.len() > c.tx_off {
+        if c.tx.len() > c.tx_off as usize {
             c.tx.extend_from_slice(raw);
         } else {
             let rc = unsafe { sys::write(c.fd, raw.as_ptr() as *const sys::c_void, raw.len()) };
@@ -1098,8 +1118,8 @@ impl Reactor {
         if c.fd < 0 {
             return;
         }
-        while c.tx_off < c.tx.len() {
-            let rem = &c.tx[c.tx_off..];
+        while (c.tx_off as usize) < c.tx.len() {
+            let rem = &c.tx[c.tx_off as usize..];
             let rc = unsafe { sys::write(c.fd, rem.as_ptr() as *const sys::c_void, rem.len()) };
             if rc < 0 {
                 let err = io::Error::last_os_error();
@@ -1112,7 +1132,7 @@ impl Reactor {
                     }
                 }
             }
-            c.tx_off += rc as usize;
+            c.tx_off += rc as u32;
         }
         self.update_write_state(slot);
     }
@@ -1123,7 +1143,7 @@ impl Reactor {
             if c.fd < 0 {
                 return;
             }
-            let has_unsent = c.tx_off < c.tx.len();
+            let has_unsent = (c.tx_off as usize) < c.tx.len();
             if !has_unsent {
                 if c.tx.capacity() > 4096 {
                     c.tx = Vec::new();
@@ -1132,10 +1152,11 @@ impl Reactor {
                 }
                 c.tx_off = 0;
             }
-            let should_drop = !has_unsent && !c.in_flight && (c.close_on_done || c.eof_seen);
-            let should_link_idle = !should_drop && !has_unsent && !c.in_flight && c.rx.is_empty() && c.reused;
-            let mask_change = if !should_drop && has_unsent != c.polling_out {
-                c.polling_out = has_unsent;
+            let in_flight = c.flag(FLAG_IN_FLIGHT);
+            let should_drop = !has_unsent && !in_flight && (c.flag(FLAG_CLOSE_ON_DONE) || c.flag(FLAG_EOF_SEEN));
+            let should_link_idle = !should_drop && !has_unsent && !in_flight && c.rx.is_empty() && c.flag(FLAG_REUSED);
+            let mask_change = if !should_drop && has_unsent != c.flag(FLAG_POLLING_OUT) {
+                c.set_flag(FLAG_POLLING_OUT, has_unsent);
                 let mask = if has_unsent {
                     sys::EPOLLIN | sys::EPOLLOUT | sys::EPOLLRDHUP
                 } else {
@@ -1193,6 +1214,12 @@ fn is_valid_token_name(s: &[u8]) -> bool {
     !s.is_empty()
         && s.iter()
             .all(|&b| b > 0x20 && b < 0x7f && !matches!(b, b'(' | b')' | b'<' | b'>' | b'@' | b',' | b';' | b':' | b'\\' | b'"' | b'/' | b'[' | b']' | b'?' | b'=' | b'{' | b'}'))
+}
+
+#[inline(always)]
+fn eq_hdr8(name: &[u8], prefix8: &[u8; 8], tail: &[u8]) -> bool {
+    let w = u64::from_le_bytes(name[..8].try_into().unwrap()) | 0x2020_2020_2020_2020;
+    w == u64::from_le_bytes(*prefix8) && name[8..].eq_ignore_ascii_case(tail)
 }
 
 #[inline]
@@ -1264,10 +1291,10 @@ fn parse_one_http(signer: &TokenSigner, buf: &[u8], addr: ReplyAddr) -> ParseOut
         let val = trim_http_ows(&line[colon + 1..]);
 
         match name.len() {
-            13 if name.eq_ignore_ascii_case(b"authorization") => {
+            13 if eq_hdr8(name, b"authoriz", b"ation") => {
                 auth_hdr = Some(val);
             }
-            14 if name.eq_ignore_ascii_case(b"content-length") => {
+            14 if eq_hdr8(name, b"content-", b"length") => {
                 let Some(n) = parse_usize_ascii(val) else {
                     return ParseOutcome::Reject(400);
                 };
@@ -1278,17 +1305,17 @@ fn parse_one_http(signer: &TokenSigner, buf: &[u8], addr: ReplyAddr) -> ParseOut
                 }
                 content_len = Some(n);
             }
-            10 if name.eq_ignore_ascii_case(b"connection") => {
+            10 if eq_hdr8(name, b"connecti", b"on") => {
                 if val.eq_ignore_ascii_case(b"close") {
                     keep_alive = false;
                 } else if val.eq_ignore_ascii_case(b"keep-alive") {
                     keep_alive = true;
                 }
             }
-            15 if name.eq_ignore_ascii_case(b"accept-encoding") => {
+            15 if eq_hdr8(name, b"accept-e", b"ncoding") => {
                 accept_gzip = codec::contains_gzip_token(val);
             }
-            17 if name.eq_ignore_ascii_case(b"transfer-encoding") => {
+            17 if eq_hdr8(name, b"transfer", b"-encoding") => {
                 is_chunked = val.eq_ignore_ascii_case(b"chunked");
                 if !is_chunked {
                     return ParseOutcome::Reject(400);

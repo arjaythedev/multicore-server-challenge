@@ -331,31 +331,40 @@ pub fn write_timestamp(dst: &mut Vec<u8>, pg_micros: i64) {
     let y = year as u32;
     let (hh, mm, ss) = (day_sec / 3600, (day_sec / 60) % 60, day_sec % 60);
 
+    let yh = (((y / 100) % 100) * 2) as usize;
+    let yl = ((y % 100) * 2) as usize;
+    let mo = (month * 2) as usize;
+    let da = (day * 2) as usize;
+    let h2 = (hh * 2) as usize;
+    let m2 = (mm * 2) as usize;
+    let s2 = (ss * 2) as usize;
+    let msl = ((millis % 100) * 2) as usize;
+
     let out: [u8; 26] = [
         b'"',
-        b'0' + ((y / 1000) % 10) as u8,
-        b'0' + ((y / 100) % 10) as u8,
-        b'0' + ((y / 10) % 10) as u8,
-        b'0' + (y % 10) as u8,
+        DEC_DIGITS_LUT[yh],
+        DEC_DIGITS_LUT[yh + 1],
+        DEC_DIGITS_LUT[yl],
+        DEC_DIGITS_LUT[yl + 1],
         b'-',
-        b'0' + (month / 10) as u8,
-        b'0' + (month % 10) as u8,
+        DEC_DIGITS_LUT[mo],
+        DEC_DIGITS_LUT[mo + 1],
         b'-',
-        b'0' + (day / 10) as u8,
-        b'0' + (day % 10) as u8,
+        DEC_DIGITS_LUT[da],
+        DEC_DIGITS_LUT[da + 1],
         b'T',
-        b'0' + (hh / 10) as u8,
-        b'0' + (hh % 10) as u8,
+        DEC_DIGITS_LUT[h2],
+        DEC_DIGITS_LUT[h2 + 1],
         b':',
-        b'0' + (mm / 10) as u8,
-        b'0' + (mm % 10) as u8,
+        DEC_DIGITS_LUT[m2],
+        DEC_DIGITS_LUT[m2 + 1],
         b':',
-        b'0' + (ss / 10) as u8,
-        b'0' + (ss % 10) as u8,
+        DEC_DIGITS_LUT[s2],
+        DEC_DIGITS_LUT[s2 + 1],
         b'.',
         b'0' + (millis / 100) as u8,
-        b'0' + ((millis / 10) % 10) as u8,
-        b'0' + (millis % 10) as u8,
+        DEC_DIGITS_LUT[msl],
+        DEC_DIGITS_LUT[msl + 1],
         b'Z',
         b'"',
     ];
@@ -392,10 +401,12 @@ pub fn b64url_encode_append(src: &[u8], dst: &mut String) {
     let mut i = 0;
     while i + 3 <= src.len() {
         let n = ((src[i] as u32) << 16) | ((src[i + 1] as u32) << 8) | (src[i + 2] as u32);
-        out.push(B64_URL_ENC[((n >> 18) & 0x3f) as usize]);
-        out.push(B64_URL_ENC[((n >> 12) & 0x3f) as usize]);
-        out.push(B64_URL_ENC[((n >> 6) & 0x3f) as usize]);
-        out.push(B64_URL_ENC[(n & 0x3f) as usize]);
+        out.extend_from_slice(&[
+            B64_URL_ENC[((n >> 18) & 0x3f) as usize],
+            B64_URL_ENC[((n >> 12) & 0x3f) as usize],
+            B64_URL_ENC[((n >> 6) & 0x3f) as usize],
+            B64_URL_ENC[(n & 0x3f) as usize],
+        ]);
         i += 3;
     }
     let rem = src.len() - i;
@@ -408,6 +419,58 @@ pub fn b64url_encode_append(src: &[u8], dst: &mut String) {
         out.push(B64_URL_ENC[((n >> 18) & 0x3f) as usize]);
         out.push(B64_URL_ENC[((n >> 12) & 0x3f) as usize]);
         out.push(B64_URL_ENC[((n >> 6) & 0x3f) as usize]);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn b64url_decode_chunk16_ssse3(chunk: &[u8], out12: &mut [u8]) -> bool {
+    unsafe {
+        use std::arch::x86_64::*;
+        let c = _mm_loadu_si128(chunk.as_ptr().cast());
+        let is_upper = _mm_and_si128(
+            _mm_cmpgt_epi8(c, _mm_set1_epi8(b'A' as i8 - 1)),
+            _mm_cmpgt_epi8(_mm_set1_epi8(b'Z' as i8 + 1), c),
+        );
+        let is_lower = _mm_and_si128(
+            _mm_cmpgt_epi8(c, _mm_set1_epi8(b'a' as i8 - 1)),
+            _mm_cmpgt_epi8(_mm_set1_epi8(b'z' as i8 + 1), c),
+        );
+        let is_digit = _mm_and_si128(
+            _mm_cmpgt_epi8(c, _mm_set1_epi8(b'0' as i8 - 1)),
+            _mm_cmpgt_epi8(_mm_set1_epi8(b'9' as i8 + 1), c),
+        );
+        let is_dash = _mm_cmpeq_epi8(c, _mm_set1_epi8(b'-' as i8));
+        let is_under = _mm_cmpeq_epi8(c, _mm_set1_epi8(b'_' as i8));
+        let valid = _mm_or_si128(
+            _mm_or_si128(is_upper, is_lower),
+            _mm_or_si128(is_digit, _mm_or_si128(is_dash, is_under)),
+        );
+        if _mm_movemask_epi8(valid) != 0xffff {
+            return false;
+        }
+        let off = _mm_or_si128(
+            _mm_or_si128(
+                _mm_and_si128(is_upper, _mm_set1_epi8(-65)),
+                _mm_and_si128(is_lower, _mm_set1_epi8(-71)),
+            ),
+            _mm_or_si128(
+                _mm_and_si128(is_digit, _mm_set1_epi8(4)),
+                _mm_or_si128(
+                    _mm_and_si128(is_dash, _mm_set1_epi8(17)),
+                    _mm_and_si128(is_under, _mm_set1_epi8(-32)),
+                ),
+            ),
+        );
+        let v = _mm_add_epi8(c, off);
+        let merged16 = _mm_maddubs_epi16(v, _mm_set1_epi32(0x0140_0140));
+        let merged32 = _mm_madd_epi16(merged16, _mm_set1_epi32(0x0001_1000));
+        let shuf = _mm_setr_epi8(2, 1, 0, 6, 5, 4, 10, 9, 8, 14, 13, 12, -1, -1, -1, -1);
+        let packed = _mm_shuffle_epi8(merged32, shuf);
+        let mut tmp = [0u8; 16];
+        _mm_storeu_si128(tmp.as_mut_ptr().cast(), packed);
+        out12[..12].copy_from_slice(&tmp[..12]);
+        true
     }
 }
 
@@ -427,6 +490,16 @@ pub fn b64url_decode_slice(src: &[u8], dst: &mut [u8]) -> Option<usize> {
     }
     let mut si = 0;
     let mut di = 0;
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2() {
+        while si + 16 <= src.len() {
+            if !unsafe { b64url_decode_chunk16_ssse3(&src[si..si + 16], &mut dst[di..di + 12]) } {
+                return None;
+            }
+            si += 16;
+            di += 12;
+        }
+    }
     while si + 4 <= src.len() {
         let a = B64_URL_DEC[src[si] as usize];
         let b = B64_URL_DEC[src[si + 1] as usize];
@@ -682,6 +755,10 @@ impl<'a> JsonParser<'a> {
     fn parse_string(&mut self) -> Option<String> {
         self.pos += 1;
         let start = self.pos;
+        #[cfg(target_arch = "x86_64")]
+        if self.src.len() - self.pos >= 32 && has_avx2() {
+            self.pos += unsafe { scan_clean_avx2(&self.src[self.pos..]) };
+        }
         while self.pos < self.src.len() {
             let c = self.src[self.pos];
             if c == b'"' {
@@ -714,6 +791,10 @@ impl<'a> JsonParser<'a> {
             if c != b'\\' {
                 let seg_start = self.pos;
                 self.pos += 1;
+                #[cfg(target_arch = "x86_64")]
+                if self.src.len() - self.pos >= 32 && has_avx2() {
+                    self.pos += unsafe { scan_clean_avx2(&self.src[self.pos..]) };
+                }
                 while self.pos < self.src.len() {
                     let b = self.src[self.pos];
                     if b == b'"' || b == b'\\' || b < 0x20 {
@@ -985,6 +1066,35 @@ unsafe fn crc32_pclmul(data: &[u8]) -> u32 {
 
         let k1k2 = _mm_set_epi64x(0x1c6e_4159_6i64, 0x1544_42bd_4i64);
         let mut pos = 64usize;
+        #[cfg(all(target_feature = "vpclmulqdq", target_feature = "avx2"))]
+        if data.len() >= 128 {
+            let mut v0 = _mm256_inserti128_si256(_mm256_castsi128_si256(x0), x1, 1);
+            let mut v1 = _mm256_inserti128_si256(_mm256_castsi128_si256(x2), x3, 1);
+            let vk1k2 = _mm256_broadcastsi128_si256(k1k2);
+            while pos + 64 <= data.len() {
+                let vy0 = _mm256_loadu_si256(ptr.add(pos).cast());
+                let vy1 = _mm256_loadu_si256(ptr.add(pos + 32).cast());
+                v0 = _mm256_xor_si256(
+                    _mm256_xor_si256(
+                        _mm256_clmulepi64_epi128(v0, vk1k2, 0x00),
+                        _mm256_clmulepi64_epi128(v0, vk1k2, 0x11),
+                    ),
+                    vy0,
+                );
+                v1 = _mm256_xor_si256(
+                    _mm256_xor_si256(
+                        _mm256_clmulepi64_epi128(v1, vk1k2, 0x00),
+                        _mm256_clmulepi64_epi128(v1, vk1k2, 0x11),
+                    ),
+                    vy1,
+                );
+                pos += 64;
+            }
+            x0 = _mm256_castsi256_si128(v0);
+            x1 = _mm256_extracti128_si256(v0, 1);
+            x2 = _mm256_castsi256_si128(v1);
+            x3 = _mm256_extracti128_si256(v1, 1);
+        }
         while pos + 64 <= data.len() {
             let y0 = _mm_loadu_si128(ptr.add(pos).cast());
             let y1 = _mm_loadu_si128(ptr.add(pos + 16).cast());
@@ -1204,13 +1314,201 @@ fn emit_literal_run(
     }
 }
 
+#[derive(Default, Clone, Copy)]
+pub struct HwBuildHasher;
+
+pub struct HwHasher(u64);
+
+impl std::hash::BuildHasher for HwBuildHasher {
+    type Hasher = HwHasher;
+
+    #[inline(always)]
+    fn build_hasher(&self) -> HwHasher {
+        HwHasher(0x517c_c1b7_2722_0a95)
+    }
+}
+
+impl std::hash::Hasher for HwHasher {
+    #[inline(always)]
+    fn finish(&self) -> u64 {
+        let mut x = self.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x ^ (x >> 27)
+    }
+
+    #[inline(always)]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0;
+        let mut i = 0;
+        #[cfg(all(target_arch = "x86_64", target_feature = "sse4.2"))]
+        unsafe {
+            use std::arch::x86_64::*;
+            while i + 8 <= bytes.len() {
+                let w = u64::from_ne_bytes(bytes[i..i + 8].try_into().unwrap());
+                h = _mm_crc32_u64(h, w);
+                i += 8;
+            }
+            if i + 4 <= bytes.len() {
+                let w = u32::from_ne_bytes(bytes[i..i + 4].try_into().unwrap());
+                h = _mm_crc32_u32(h as u32, w) as u64;
+                i += 4;
+            }
+            while i < bytes.len() {
+                h = _mm_crc32_u8(h as u32, bytes[i]) as u64;
+                i += 1;
+            }
+            self.0 = h;
+            return;
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.2")))]
+        {
+            while i + 8 <= bytes.len() {
+                let w = u64::from_ne_bytes(bytes[i..i + 8].try_into().unwrap());
+                h = (h ^ w).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                i += 8;
+            }
+            while i < bytes.len() {
+                h = (h ^ (bytes[i] as u64)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                i += 1;
+            }
+            self.0 = h;
+        }
+    }
+
+    #[inline(always)]
+    fn write_u8(&mut self, v: u8) {
+        #[cfg(all(target_arch = "x86_64", target_feature = "sse4.2"))]
+        unsafe {
+            self.0 = std::arch::x86_64::_mm_crc32_u8(self.0 as u32, v) as u64;
+            return;
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.2")))]
+        {
+            self.0 = (self.0 ^ (v as u64)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+
+    #[inline(always)]
+    fn write_i8(&mut self, v: i8) {
+        self.write_u8(v as u8);
+    }
+
+    #[inline(always)]
+    fn write_u16(&mut self, v: u16) {
+        #[cfg(all(target_arch = "x86_64", target_feature = "sse4.2"))]
+        unsafe {
+            self.0 = std::arch::x86_64::_mm_crc32_u16(self.0 as u32, v) as u64;
+            return;
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.2")))]
+        {
+            self.0 = (self.0 ^ (v as u64)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+
+    #[inline(always)]
+    fn write_i16(&mut self, v: i16) {
+        self.write_u16(v as u16);
+    }
+
+    #[inline(always)]
+    fn write_i32(&mut self, v: i32) {
+        self.write_u32(v as u32);
+    }
+
+    #[inline(always)]
+    fn write_u32(&mut self, v: u32) {
+        #[cfg(all(target_arch = "x86_64", target_feature = "sse4.2"))]
+        unsafe {
+            self.0 = std::arch::x86_64::_mm_crc32_u32(self.0 as u32, v) as u64;
+            return;
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.2")))]
+        {
+            self.0 = (self.0 ^ (v as u64)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+
+    #[inline(always)]
+    fn write_i64(&mut self, v: i64) {
+        self.write_u64(v as u64);
+    }
+
+    #[inline(always)]
+    fn write_u64(&mut self, v: u64) {
+        #[cfg(all(target_arch = "x86_64", target_feature = "sse4.2"))]
+        unsafe {
+            self.0 = std::arch::x86_64::_mm_crc32_u64(self.0, v);
+            return;
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.2")))]
+        {
+            self.0 = (self.0 ^ v).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+
+    #[inline(always)]
+    fn write_usize(&mut self, v: usize) {
+        self.write_u64(v as u64);
+    }
+
+    #[inline(always)]
+    fn write_isize(&mut self, v: isize) {
+        self.write_u64(v as u64);
+    }
+}
+
 #[inline(always)]
 fn hash4(v: u32) -> usize {
-    (v.wrapping_mul(0x9E37_79B1) >> 20) as usize
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse4.2"))]
+    unsafe {
+        return (std::arch::x86_64::_mm_crc32_u32(0, v) as usize) & 0xfff;
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.2")))]
+    {
+        (v.wrapping_mul(0x9E37_79B1) >> 20) as usize
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn match_len_at_avx2(src: &[u8], ip: usize, cand: usize, max_ml: usize) -> usize {
+    unsafe {
+        use std::arch::x86_64::*;
+        let mut m = 4usize;
+        while m + 32 <= max_ml {
+            let va = _mm256_loadu_si256(src.as_ptr().add(ip + m).cast());
+            let vb = _mm256_loadu_si256(src.as_ptr().add(cand + m).cast());
+            let eq = _mm256_movemask_epi8(_mm256_cmpeq_epi8(va, vb)) as u32;
+            if eq != 0xffff_ffff {
+                m += (!eq).trailing_zeros() as usize;
+                return m.min(max_ml);
+            }
+            m += 32;
+        }
+        while m + 8 <= max_ml {
+            let a = u64::from_le_bytes(src[ip + m..ip + m + 8].try_into().unwrap());
+            let b = u64::from_le_bytes(src[cand + m..cand + m + 8].try_into().unwrap());
+            let d = a ^ b;
+            if d != 0 {
+                m += (d.trailing_zeros() >> 3) as usize;
+                return m.min(max_ml);
+            }
+            m += 8;
+        }
+        while m < max_ml && src[ip + m] == src[cand + m] {
+            m += 1;
+        }
+        m
+    }
 }
 
 #[inline(always)]
 fn match_len_at(src: &[u8], ip: usize, cand: usize, max_ml: usize) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    if max_ml >= 36 && has_avx2() {
+        return unsafe { match_len_at_avx2(src, ip, cand, max_ml) };
+    }
     let mut m = 4usize;
     while m + 8 <= max_ml {
         let a = u64::from_le_bytes(src[ip + m..ip + m + 8].try_into().unwrap());

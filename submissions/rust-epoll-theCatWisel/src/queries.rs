@@ -127,11 +127,15 @@ pub fn read_catalog() -> Vec<PreparedDef> {
              SELECT 1::int8, u.id, 0::int8, 0::int8, NULL::timestamptz, NULL::timestamptz, u.username, u.bio, u.image \
              FROM au CROSS JOIN LATERAL unnest(au.aids) aid JOIN users u ON u.id = aid \
              UNION ALL \
-             SELECT 2::int8, v, fo.followee_id, 0::int8, NULL::timestamptz, NULL::timestamptz, NULL::text, NULL::text, NULL::text \
-             FROM unnest($2::int8[]) v \
-             CROSS JOIN au \
-             CROSS JOIN LATERAL unnest(ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = v AND fo.followee_id = ANY(au.aids))) fo(followee_id)",
-            &[OID_TEXT_ARR, OID_INT8_ARR],
+             SELECT 2::int8, rv.v, fo.followee_id, 0::int8, NULL::timestamptz, NULL::timestamptz, NULL::text, NULL::text, NULL::text \
+             FROM ( \
+               SELECT rv.v, array_agg(t.author_id) AS kaids \
+               FROM unnest($2::int8[], $3::int8[]) rv(v, k) \
+               JOIN t ON t.k = rv.k AND t.author_id IS NOT NULL \
+               GROUP BY rv.v \
+             ) rv \
+             CROSS JOIN LATERAL unnest(ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = rv.v AND fo.followee_id = ANY(rv.kaids))) fo(followee_id)",
+            &[OID_TEXT_ARR, OID_INT8_ARR, OID_INT8_ARR],
         ),
         def(
             "global",
@@ -343,18 +347,21 @@ pub fn write_catalog() -> Vec<PreparedDef> {
             "WITH ins AS (INSERT INTO articles (id, slug, author_id, title, description, body) \
                SELECT n.id, $5::text || '-' || n.id, $1, $2, $3, $4 \
                FROM (SELECT nextval('articles_id_seq'::regclass) AS id) n \
-               RETURNING id, slug, created_at, updated_at, author_id), \
+               RETURNING id, slug, title, description, body, created_at, updated_at, author_id), \
              existing AS MATERIALIZED (SELECT id, name FROM tags WHERE name = ANY($6::text[])), \
              new_tags AS (INSERT INTO tags (name) \
                SELECT name FROM (SELECT DISTINCT unnest($6::text[]) AS name) names \
                WHERE NOT EXISTS (SELECT 1 FROM existing e WHERE e.name = names.name) \
-               ORDER BY name ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id), \
-             all_tags AS (SELECT id FROM existing UNION ALL SELECT id FROM new_tags), \
+               ORDER BY name ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id, name), \
+             all_tags AS (SELECT id, name FROM existing UNION ALL SELECT id, name FROM new_tags), \
              ins_at AS (INSERT INTO article_tags (article_id, tag_id) SELECT ins.id, all_tags.id FROM ins, all_tags) \
-             SELECT ins.slug, ins.created_at, ins.updated_at, \
-             u.username, u.bio, u.image, \
-             EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = ins.author_id), \
-             EXISTS (SELECT 1 FROM new_tags) \
+             SELECT ins.slug, ins.title, ins.description, ins.body, \
+               ARRAY(SELECT name FROM all_tags ORDER BY name), \
+               ins.created_at, ins.updated_at, \
+               EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = ins.id AND f.user_id = $1), \
+               (SELECT count(*) FROM favorites f WHERE f.article_id = ins.id), \
+               u.username, u.bio, u.image, \
+               EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = ins.author_id) \
              FROM ins JOIN users u ON u.id = ins.author_id",
             &[OID_INT8, OID_TEXT, OID_TEXT, OID_TEXT, OID_TEXT, OID_TEXT_ARR],
         ),
@@ -391,9 +398,10 @@ pub fn write_catalog() -> Vec<PreparedDef> {
                  FROM unnest($1::int8[], $2::text[], $3::text[]) WITH ORDINALITY x(uid, slug, body, k) \
                  CROSS JOIN LATERAL (SELECT id FROM articles WHERE slug = x.slug) a ORDER BY x.k) s), \
              ins AS (INSERT INTO comments (id, article_id, author_id, body) \
-               SELECT cid, aid, uid, body FROM r ORDER BY aid, cid) \
-             SELECT r.k, r.cid, r.body, now(), now(), u.username, u.bio, u.image \
-             FROM r CROSS JOIN LATERAL (SELECT username, bio, image FROM users WHERE id = r.uid) u",
+               SELECT cid, aid, uid, body FROM r ORDER BY aid, cid \
+               RETURNING id, body, created_at, updated_at, author_id) \
+             SELECT r.k, ins.id, ins.body, ins.created_at, ins.updated_at, u.username, u.bio, u.image \
+             FROM r JOIN ins ON ins.id = r.cid JOIN users u ON u.id = ins.author_id",
             &[OID_INT8_ARR, OID_TEXT_ARR, OID_TEXT_ARR],
         ),
         def(

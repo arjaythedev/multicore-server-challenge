@@ -196,7 +196,7 @@ fn hex_nibble(b: u8) -> Option<u8> {
 
 fn percent_decode(src: &[u8], decode_plus: bool) -> Option<String> {
     let decoded = percent_decode_raw(src, decode_plus)?;
-    if decoded.contains('\0') {
+    if codec::find_byte(decoded.as_bytes(), 0).is_some() {
         return None;
     }
     Some(decoded)
@@ -357,7 +357,7 @@ fn unwrap_json_envelope(body: &[u8], root_key: &str) -> Option<JsonMap> {
 fn contains_nul_char(map: &JsonMap) -> bool {
     fn check_val(v: &JsonVal) -> bool {
         match v {
-            JsonVal::Str(s) => s.contains('\0'),
+            JsonVal::Str(s) => codec::find_byte(s.as_bytes(), 0).is_some(),
             JsonVal::Array(arr) => arr.iter().any(check_val),
             JsonVal::Object(obj) => obj.values().any(check_val),
             _ => false,
