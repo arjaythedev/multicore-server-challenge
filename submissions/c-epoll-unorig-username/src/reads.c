@@ -46,6 +46,9 @@ static const pg_stmt READ_STMTS[] = {
     // the first array, which is ruinous at batch sizes. OFFSET 0 pins the primary-key scan, and the join hashes the second array.
     S("f_flag", "SELECT s.user_id, s.article_id FROM (SELECT user_id, article_id FROM favorites WHERE user_id = ANY($1::int8[]) OFFSET 0) s"
                 " JOIN unnest($2::int8[]) a(id) ON a.id = s.article_id"),
+    // Pair-scoped variants (PAIR_FLAGS=1): only the displayed (viewer, article|author) pairs, each a primary-key probe.
+    S("f_pair", "SELECT f.user_id, f.article_id FROM unnest($1::int8[], $2::int8[]) p(v, a) JOIN favorites f ON f.user_id = p.v AND f.article_id = p.a"),
+    S("fo_pair", "SELECT f.follower_id, f.followee_id FROM unnest($1::int8[], $2::int8[]) p(v, a) JOIN follows f ON f.follower_id = p.v AND f.followee_id = p.a"),
     S("fo_flag", "SELECT s.follower_id, s.followee_id FROM (SELECT follower_id, followee_id FROM follows WHERE follower_id = ANY($1::int8[]) OFFSET 0) s"
                  " JOIN unnest($2::int8[]) a(id) ON a.id = s.followee_id"),
 };
@@ -442,7 +445,7 @@ static void rc_release(rcache *c) {
 enum { B_OK, B_LOST, B_SQL };
 
 // READ_TRACE=1: per-exchange and per-batch wall time, summed over all drains and printed every 10 s.
-static int trace_on;
+static int trace_on, pair_flags;
 static _Atomic int64_t tr_ex_ns[16], tr_ex_n[16], tr_b_ns, tr_b_n, tr_b_jobs, tr_last;
 #define EXCH(res)                                                                       \
   do {                                                                                  \
@@ -984,8 +987,61 @@ static int run_batch(drain_t *d, job **jobs, int n) {
   }
   if (authors.n) { is_sort(&authors); pg_bind(c, "u_id", 1); pg_i64arr(c, authors.v, authors.n); pg_bind_end(c); }
   bool ff = aidall.n && favv.n, fo = folv.n && folt.n;
-  if (ff) { is_sort(&favv); pg_bind(c, "f_flag", 2); pg_i64arr(c, favv.v, favv.n); pg_i64arr(c, aidall.v, aidall.n); pg_bind_end(c); }
-  if (fo) { is_sort(&folv); is_sort(&folt); pg_bind(c, "fo_flag", 2); pg_i64arr(c, folv.v, folv.n); pg_i64arr(c, folt.v, folt.n); pg_bind_end(c); }
+  if (pair_flags) {
+    // Only the pairs the responses ask about.
+    int cap = 16;
+    for (int i = 0; i < n; i++) {
+      if (!jobs[i] || !jobs[i]->viewer) continue;
+      cap += jb[i].n + 1;  // every pair list holds at most one entry per displayed article, or per comment below
+      if (jobs[i]->kind == K_COMMENTS)
+        for (cmt_t *m = threads[jb[i].thread].first; m; m = m->next) cap++;
+    }
+    pairset fseen, oseen;
+    ps_init(&fseen, a, cap);
+    ps_init(&oseen, a, cap);
+    int64_t *fv = arena_alloc(a, 8 * (size_t)cap * 4), *fa = fv + cap, *ov = fa + cap, *oa = ov + cap;
+    int nf = 0, no = 0, fcap = cap, ocap = cap;
+#define PF(v_, a_) do { if (!ps_has(&fseen, v_, a_)) { ps_add(&fseen, v_, a_); if (nf < fcap) { fv[nf] = v_; fa[nf++] = a_; } } } while (0)
+#define PO(v_, a_) do { if (!ps_has(&oseen, v_, a_)) { ps_add(&oseen, v_, a_); if (no < ocap) { ov[no] = v_; oa[no++] = a_; } } } while (0)
+    for (int i = 0; i < n; i++) {
+      job *j = jobs[i];
+      if (!j || !j->viewer) continue;
+      switch (j->kind) {
+        case K_LIST_ALL: case K_LIST_TAG: case K_LIST_AUTHOR: case K_LIST_FAV: case K_FEED:
+          for (int q = 0; q < jb[i].n; q++) {
+            int ix = m64_get(&artm, jb[i].ids[q]);
+            if (ix < 0 || !arts[ix].slug) continue;
+            PF(j->viewer, arts[ix].id);
+            if (j->kind != K_FEED) PO(j->viewer, arts[ix].author);
+          }
+          break;
+        case K_ARTICLE_SLUG: case K_ARTICLE_ID: {
+          int ix = -1;
+          if (j->kind == K_ARTICLE_ID) ix = m64_get(&artm, j->id);
+          else { sent *e = ms_slot(&slugm, j->s1, j->l1); if (e->s) ix = e->v; }
+          if (ix < 0 || !arts[ix].slug) break;
+          PF(j->viewer, arts[ix].id);
+          PO(j->viewer, arts[ix].author);
+          break;
+        }
+        case K_COMMENTS:
+          for (cmt_t *m = threads[jb[i].thread].first; m; m = m->next) PO(j->viewer, m->author);
+          break;
+        case K_PROFILE: {
+          sent *e = nn ? ms_slot(&pm, j->s1, j->l1) : NULL;
+          if (e && e->s) PO(j->viewer, be64(prow[e->v].v[0]));
+          break;
+        }
+      }
+    }
+    ff = nf > 0;
+    fo = no > 0;
+    if (ff) { pg_bind(c, "f_pair", 2); pg_i64arr(c, fv, nf); pg_i64arr(c, fa, nf); pg_bind_end(c); }
+    if (fo) { pg_bind(c, "fo_pair", 2); pg_i64arr(c, ov, no); pg_i64arr(c, oa, no); pg_bind_end(c); }
+  } else {
+    if (ff) { is_sort(&favv); pg_bind(c, "f_flag", 2); pg_i64arr(c, favv.v, favv.n); pg_i64arr(c, aidall.v, aidall.n); pg_bind_end(c); }
+    if (fo) { is_sort(&folv); is_sort(&folt); pg_bind(c, "fo_flag", 2); pg_i64arr(c, folv.v, folv.n); pg_i64arr(c, folt.v, folt.n); pg_bind_end(c); }
+  }
   author_t *au = NULL;
   int nau = 0;
   map64 aum;
@@ -1361,6 +1417,7 @@ void reads_start(int n) {
   lanes[LANE_COMMENT].gap = (e = getenv("GAP_COMMENT_US")) ? atoll(e) : 160000;
   if ((e = getenv("HUB_EST"))) hub_est = atoll(e);
   trace_on = getenv("READ_TRACE") != NULL;
+  pair_flags = !getenv("PAIR_FLAGS") || atoi(getenv("PAIR_FLAGS"));
   if ((e = getenv("READ_CAP"))) read_cap = atoi(e);
   if ((e = getenv("READ_LANES"))) lane_on = atoi(e);
   for (int i = 0; i < n; i++) {
