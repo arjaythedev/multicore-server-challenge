@@ -220,7 +220,7 @@ let main args =
             let every = TimeSpan.FromMilliseconds(float (setting "BATCH_LOG_MS" "25"))
             let s = Stats.Sampler(every, reads, writes, setting "BATCH_LOG_PG_CGROUP" "", 200_000)
             s.Start()
-            Some s
+            Some(s, new Stats.GcLog(100_000))
     if statsEvery.Ticks > 0L then
         Stats.start statsEvery connections reads readLanes writes writeLanes (phases |> Option.map (fun p -> p, phasesFile))
     app.Lifetime.ApplicationStopping.Register(fun () ->
@@ -248,10 +248,14 @@ let main args =
         | None -> ()
         phases |> Option.iter (fun p -> p.Snapshot(phasesFile, DateTimeOffset.UtcNow.ToUnixTimeSeconds()))
         sampler
-        |> Option.iter (fun s ->
+        |> Option.iter (fun (s, gc) ->
             let batches = reads.WriteLog(batchLog + ".batches.csv")
             let samples = s.Write(batchLog + ".samples.csv")
-            eprintfn "batch log: %d batches, %d samples written to %s.*.csv" batches samples batchLog))
+            let collections, lines = gc.Write(batchLog + ".gc.csv")
+            eprintfn "batch log: %d batches, %d samples, %d GC pauses written to %s.*.csv" batches samples collections batchLog
+            eprintfn "GC pauses by generation (runtime total %.0f ms):" (GC.GetTotalPauseDuration().TotalMilliseconds)
+            for line in lines do
+                eprintfn "%s" line))
     |> ignore
     app.Run()
     0

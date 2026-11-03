@@ -191,6 +191,94 @@ type Sampler(every: TimeSpan, reads: Engine.Reads.Gather, writes: Engine.Commit.
             w.WriteLine(String.Join(',', rows[i * fields .. i * fields + fields - 1]))
         n
 
+/// Every collection (with BATCH_LOG), from the runtime's own GC events, written as CSV at
+/// shutdown: when the runtime began suspending threads, its number, generation, type and reason;
+/// how long the suspension took (until every thread stopped), the collection itself, and the
+/// whole pause (until every thread ran again); the bytes promoted out of each generation and each
+/// generation's size after; pinned objects; the mechanisms (compaction, promotion, demotion); and
+/// what the marking found alive, by root: stacks, the finalize queue, handles, older generations
+/// (cards). A suspension with no collection in it has generation -1.
+[<Sealed>]
+type GcLog(capacity: int) =
+    inherit Diagnostics.Tracing.EventListener()
+    static let fields = 25
+    let rows: int64[] = Array.zeroCreate (capacity * fields)
+    let at = [| 0; 0 |] // rows done, a row open (1)
+    let mutable suspended = 0L
+    let mutable started = 0L
+    let unix (t: DateTime) = (t.ToUniversalTime() - DateTime.UnixEpoch).Ticks / 10L
+    let value (e: Diagnostics.Tracing.EventWrittenEventArgs) (name: string) =
+        let i = e.PayloadNames.IndexOf name
+        if i < 0 then 0L else Convert.ToInt64 e.Payload[i]
+
+    // Called by the base constructor, before this type's fields exist: touch none of them.
+    override this.OnEventSourceCreated(source) =
+        if source.Name = "Microsoft-Windows-DotNETRuntime" then
+            this.EnableEvents(source, Diagnostics.Tracing.EventLevel.Informational, LanguagePrimitives.EnumOfValue<int64, Diagnostics.Tracing.EventKeywords> 1L) // GC
+
+    override _.OnEventWritten(e) =
+        lock rows (fun () ->
+            let n = at[0]
+            let row = n * fields
+            let t = unix e.TimeStamp
+            let isOpen = at[1] = 1 && n < capacity
+            match e.EventId with
+            | 9 when n < capacity -> // GCSuspendEEBegin
+                Array.fill rows row fields 0L
+                rows[row] <- t
+                rows[row + 2] <- -1L
+                suspended <- t
+                at[1] <- 1
+            | 8 when isOpen -> rows[row + 5] <- t - suspended // GCSuspendEEEnd
+            | 1 when isOpen -> // GCStart
+                started <- t
+                rows[row + 1] <- value e "Count"
+                rows[row + 2] <- value e "Depth"
+                rows[row + 3] <- value e "Type"
+                rows[row + 4] <- value e "Reason"
+            | 2 when isOpen -> rows[row + 6] <- t - started // GCEnd
+            | 4 when isOpen -> // GCHeapStats
+                for g in 0..4 do
+                    rows[row + 8 + g] <- value e $"TotalPromotedSize{g}"
+                    rows[row + 13 + g] <- value e $"GenerationSize{g}"
+                rows[row + 18] <- value e "PinnedObjectCount"
+            | 205 when isOpen -> // GCGlobalHeapHistory
+                rows[row + 19] <- value e "GlobalMechanisms"
+                rows[row + 24] <- value e "NumHeaps"
+            | 202 when isOpen -> // GCMarkWithType: stack, finalize queue, handles, older generations
+                match value e "Type" with
+                | k when k <= 3L -> rows[row + 20 + int k] <- rows[row + 20 + int k] + value e "Bytes"
+                | _ -> ()
+            | 3 when isOpen -> // GCRestartEEEnd
+                rows[row + 7] <- t - suspended
+                at[0] <- n + 1
+                at[1] <- 0
+            | _ -> ())
+
+    /// Writes the rows; returns how many, and per generation (-1: no collection) the count, the
+    /// pauses' p50 and max and mean suspension in ms, and the mean promoted MB.
+    member _.Write(path: string) =
+        let n, rs =
+            lock rows (fun () ->
+                let n = at[0]
+                n, [| for i in 0 .. n - 1 -> rows[i * fields .. i * fields + fields - 1] |])
+        use w = new IO.StreamWriter(path)
+        w.WriteLine "unix_us,index,gen,type,reason,suspend_us,gc_us,pause_us,promoted0,promoted1,promoted2,promoted_loh,promoted_poh,size0,size1,size2,size_loh,size_poh,pinned,mechanisms,mark_stack,mark_fq,mark_handles,mark_older,heaps"
+        for r in rs do
+            w.WriteLine(String.Join(',', r))
+        let lines =
+            rs
+            |> Array.groupBy (fun r -> r[2])
+            |> Array.sortBy fst
+            |> Array.map (fun (gen, xs) ->
+                let pauses = xs |> Array.map (fun r -> r[7]) |> Array.sort
+                let ms (us: int64) = float us / 1000.0
+                sprintf "  gen %2d: %5d, pause p50 %.1f max %.1f ms, suspension mean %.2f ms, promoted mean %.1f MB"
+                    gen xs.Length (ms pauses[pauses.Length / 2]) (ms pauses[pauses.Length - 1])
+                    (xs |> Array.averageBy (fun r -> ms r[5]))
+                    (xs |> Array.averageBy (fun r -> float (r[8] + r[9] + r[10] + r[11] + r[12]) / 1048576.0)))
+        n, lines
+
 let private mb (bytes: int64) = bytes / 1048576L
 
 /// The latest GC of `kind` and, if it is not GC number `seen`, "g<gen> <promoted>MB <pause>ms".

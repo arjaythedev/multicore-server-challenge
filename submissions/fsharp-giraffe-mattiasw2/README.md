@@ -165,8 +165,9 @@ and never inside SQL, a transaction or a commit group.
   6 threads 150 ms instead of 50 filled the batches to 3.3-3.4 hashes instead of 2.4 and saved 0.12-0.16 of the
   app's ~2.8 threads in two paired runs, with the same p95. A burst of logins waits for a thread instead of
   parking thread-pool threads that the cheap reads need.
-- **GC:** server GC, non-concurrent, DATAS off, and a 64 MB gen0 budget (`DOTNET_GCgen0size` in `start.sh`). The
-  JIT runs with tiered PGO. `DOTNET_gcServer=0` (workstation GC, as `csharp-epoll-jit-gichamba` runs) or
+- **GC:** server GC, background (concurrent) gen2, DATAS off, a 64 MB gen0 budget (`DOTNET_GCgen0size` in
+  `start.sh`) and a 1 MB large-object threshold (`DOTNET_GCLOHThreshold`, 85 KB by default). The JIT runs with
+  tiered PGO. `DOTNET_gcServer=0` (workstation GC, as `csharp-epoll-jit-gichamba` runs) or
   `DOTNET_GCHeapCount=N` override it from the environment.
 - **Scheduling:** `start.sh` runs the process under `SCHED_BATCH` (`chrt --batch 0`, no privileges, inherited by every
   thread), as `java-raw-stohirov` and `kotlin-native-luben93` do: our threads wake constantly, and under the default
@@ -434,6 +435,28 @@ queue, the reads answered and the write queue. Laid out as a Gantt per lane, it 
 vCPUs at 120,000 users the cores were 92% busy on average; under 3.5% of the time was GC, and only 1% of the
 25 ms samples under 80% busy held a GC pause. A gen0 budget of 256 MB instead of 64 changed nothing, and 512 MB
 cost more CPU per request.
+
+`<prefix>.gc.csv` has every GC pause, from the runtime's own GC events: its generation and reason, how long
+suspending the threads took, the collection and the whole pause, the bytes promoted out of each generation, each
+generation's size after, and what the marking found alive by root (stacks, finalize queue, handles, older
+generations). At shutdown the log also prints the pauses per generation. On 6 pinned vCPUs at 125,000 users, in
+60 s: 8 gen0 pauses of about 100 ms (up to 158), 3 gen1 of 130 to 230 ms and 2 gen2 of 490 to 540 ms, 4% of the
+time paused. Suspending the threads took about 1 ms; the time went to the collections themselves. Each gen0 kept
+30 to 150 MB alive, nearly all of it reached from older generations (cards), not from stacks, and a gen2 compacted
+a 1.1 GB gen2.
+
+The gen2s at steady state came from the large-object heap: it grew ~5 MB/s with short-lived objects of 85 KB to
+1 MB, and only a full gen2 frees it. With `DOTNET_GCLOHThreshold` at 1 MB those die in gen0 and the large-object heap
+stays flat. Background GC on top removed the blocking gen2 at the end of the ramp. One run each, same rig:
+
+| | p95 | p99 | blocking gen2 | longest pause | gen0 pause p50 | paused |
+|---|--:|--:|--:|--:|--:|--:|
+| before | 409 ms | 650 ms | 2 | 541 ms | 101 ms | 4.0% |
+| LOH threshold 1 MB | 328 ms | 473 ms | 1 | 513 ms | 98 ms | 3.1% |
+| + background GC (now the default) | 355 ms | 466 ms | 0 | 333 ms | 110 ms | 3.2% |
+| LOH 1 MB + 256 MB gen0 | 451 ms | 604 ms | 1 | 524 ms | 147 ms | 3.0% |
+
+A bigger gen0 budget gives fewer but longer gen0 pauses: each keeps about as much alive.
 
 Each kind of connection names itself in Postgres (`application_name`): `conduit-read` (the read lanes),
 `conduit-write` (the write lanes) and `conduit-pool` (the multiplexed pool), so `pg_stat_activity` and probes on
