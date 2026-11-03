@@ -166,3 +166,6 @@ type Writer(connectionString: string, lanes: int, maxGroup: int) =
     /// (groups, writes) so far. A group that the server refused and that ran again write by
     /// write still counts once.
     member _.Counts = Volatile.Read(&counts[0]), Volatile.Read(&counts[1])
+
+    /// Writes queued and not yet taken into a group.
+    member _.Depth = queue.Reader.Count

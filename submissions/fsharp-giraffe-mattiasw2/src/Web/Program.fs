@@ -9,6 +9,7 @@ open System.Threading.Tasks
 open Microsoft.AspNetCore.Builder
 open Microsoft.AspNetCore.Hosting
 open Microsoft.AspNetCore.Http
+open Microsoft.AspNetCore.Server.Kestrel.Core
 open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Logging
 open Giraffe
@@ -94,6 +95,12 @@ let main args =
     let bcryptWidth = max 1 (int (setting "BCRYPT_WIDTH" "4"))
     // Logins are ~0.1% of the requests, so waiting for batch-mates barely touches p95 or p99.
     let bcryptGather = TimeSpan.FromMilliseconds(float (setting "BCRYPT_GATHER_MS" "150"))
+    // Diagnostics: a line on stderr every STATS_SECONDS (fractions allowed); 0, the default, is off.
+    let statsEvery = TimeSpan.FromSeconds(float (setting "STATS_SECONDS" "0"))
+    let connections = Stats.Connections()
+    let listening (listen: ListenOptions) =
+        if statsEvery.Ticks > 0L then
+            connections.Count listen
 
     Engine.Passwords.start bcryptLanes bcryptWidth bcryptGather
     let ds = Engine.Db.dataSource (Engine.Db.connectionString databaseUrl poolSize true)
@@ -116,9 +123,9 @@ let main args =
         o.Limits.MaxConcurrentUpgradedConnections <- Nullable()
         o.Limits.MinRequestBodyDataRate <- null
         match IPAddress.TryParse host with
-        | true, ip -> o.Listen(ip, port)
-        | _ when host = "localhost" -> o.ListenLocalhost port
-        | _ -> o.ListenAnyIP port)
+        | true, ip -> o.Listen(ip, port, listening)
+        | _ when host = "localhost" -> o.ListenLocalhost(port, listening)
+        | _ -> o.ListenAnyIP(port, listening))
     |> ignore
     // Kestrel's listen backlog is 512 unless set. Users arrive thousands a second, so a GC pause
     // of a few hundred ms fills 512, and the kernel drops the rest: each dropped connection costs
@@ -146,6 +153,8 @@ let main args =
     eprintfn
         "conduit (F#, Giraffe on Kestrel) on %s:%d, %d read lanes (batches of <= %d) + %d write lanes (groups of <= %d) + %d multiplexed db connections, %d bcrypt lanes"
         host port readLanes readBatch writeLanes writeGroup poolSize bcryptLanes
+    if statsEvery.Ticks > 0L then
+        Stats.start statsEvery connections reads readLanes writes
     app.Lifetime.ApplicationStopping.Register(fun () ->
         let hashes, verifies = Engine.Passwords.counts ()
         eprintfn "bcrypt: %d hashes (sign-ups, password changes), %d verifies (logins)" hashes verifies

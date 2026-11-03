@@ -68,9 +68,11 @@ and never inside SQL, a transaction or a commit group.
 - **Read batching for the hot reads** (`src/Engine/Reads.fs`): tags, the four article lists, the feed, article by
   slug, comments and profiles. Each such request is a value (`Read`) on one channel. `READ_LANES` reader lanes
   (default one per core), each with a connection of its own, answer the queue in batches:
-  - **Gather.** A lane that wakes for a request waits until the oldest queued request is `READ_GATHER_MS` old, or
-    until `READ_BATCH` requests are queued, whichever comes first, and then takes them all. The latency budget is
-    500 ms at p95, and a bigger batch shares more work.
+  - **Gather.** One lane gathers at a time: it takes requests as they arrive until the first is `READ_GATHER_MS`
+    old, or until it holds `READ_BATCH`, whichever comes first. The latency budget is 500 ms at p95, and a bigger
+    batch shares more work. The lane never peeks at the queue: a `TryPeek` stops the `ConcurrentQueue` under the
+    channel from clearing dequeued slots and reusing segments, and the dead segments then kept every answer alive
+    through gen0 collections (~400 MB promoted per gen0 at 140k users, found with a heap dump).
   - **Batch size.** A batch's statements run one after another on one backend, so a huge batch is slow for every
     request in it: while all lanes are busy the queue grows, the next lane takes it all, and that batch is slower
     still. At 85,000 users a cap of 512 beat 1,024 on p95 and p99 in two paired runs (227 vs 427 ms and 255 vs
@@ -362,4 +364,22 @@ SKIP_CONFORMANCE=1 bash check.sh  # the quick gate, no database
 
 Environment: `DATABASE_URL`, `JWT_SECRET` (required); `HOST` (127.0.0.1), `PORT` (3000); `READ_LANES` (cores);
 `READ_BATCH` (512); `READ_GATHER_MS` (25); `WRITE_LANES` (2); `WRITE_GROUP` (128); `DB_POOL_SIZE` (cores / 2, capped so the total stays
-at most 95); `BCRYPT_THREADS` (2); `BCRYPT_WIDTH` (4); `BCRYPT_GATHER_MS` (150).
+at most 95); `BCRYPT_THREADS` (2); `BCRYPT_WIDTH` (4); `BCRYPT_GATHER_MS` (150); `STATS_SECONDS` (0, off).
+
+`STATS_SECONDS=1` prints one diagnostic line a second on stderr (`src/Web/Stats.fs`), to line up against the load
+generator's seconds (`t=` is unix seconds):
+
+| Field | Meaning |
+|---|---|
+| `dt` | the interval as measured; above `STATS_SECONDS`, the process (or this thread) was stalled |
+| `conn`, `new` | Kestrel connections open, and opened in the interval |
+| `gc0`, `gc1`, `gc2`, `pause` | collections of exactly that generation, and the total GC pause in the interval |
+| `alloc` | MB allocated in the interval |
+| `eph`, `full`, `bg` | the latest ephemeral, full blocking and background GC, if one ran in the interval: generation, MB promoted, pause |
+| `heap`, `gen2`, `loh`, `poh` | sizes after the latest GC (0 before the first) |
+| `cpu`, `pool`, `pending` | the process's cores busy, thread-pool threads, queued work items |
+| `reads q`, `busy`, `batches`, `per`, `worst` | read requests queued, lanes running a batch, batches finished, requests per batch, the longest arrival-to-answer |
+| `writes q` | writes queued for group commit |
+
+A seconds-long stall that shows up in `pause` (and `dt`) is GC. If `pause` stays small while `reads q` and `worst`
+grow, requests are queueing for the database.
