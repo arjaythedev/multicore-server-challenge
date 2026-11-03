@@ -28,7 +28,7 @@ read queue than four could have, where #83 ran
 two), and Nish 0.23.1 no longer sweeps every idle connection on every turn of
 the loop.
 
-Nish 0.29.0 (a statically typed TypeScript subset compiled to native code
+Nish 0.32.0 (a statically typed TypeScript subset compiled to native code
 through LLVM), built with clang-18 and lld-18 from LLVM 18, against
 PostgreSQL 18. The compiler runs on Node.js 22.18.0 at build time only; the
 server is one native binary with no runtime dependency beyond libc. Every
@@ -43,7 +43,9 @@ bash build.sh
 DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=... HOST=0.0.0.0 PORT=80 bash start.sh
 ```
 
-The server needs Nish 0.29.0: 0.26.0 brought binary result columns to
+The server needs Nish 0.32.0, whose bcrypt batch kernels take a hash in
+6.5% less time at five lanes on the Xeon VM (below): 0.31.0 renamed the
+HTTP/1.1 codec `nish/net/http1-codec`. 0.26.0 brought binary result columns to
 `nish/net/postgres` (`bindStartBinary`, `binaryInt`, `PgBinary`) and
 `TCP_QUICKACK` to `netSetOption`, and 0.27.0 the binary `PgBatcher`
 (`PgBatchConfig.binary`), `PgBinaryArray` for an integer array column, and

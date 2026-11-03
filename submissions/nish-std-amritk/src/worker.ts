@@ -54,7 +54,7 @@ import {
   Http1Connection,
   Http1Server,
 } from "nish/net/http1-server"
-import { HTTP1_NO_BODY, Http1Parser } from "nish/net/http1"
+import { HTTP1_NO_BODY, Http1Parser } from "nish/net/http1-codec"
 import { HTTP_CODING_IDENTITY, HttpCompressor } from "nish/net/http-compress"
 import { DEFLATE_FAST } from "nish/compress/deflate"
 import { JsonWriter } from "nish/json"
