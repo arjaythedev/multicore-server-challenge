@@ -77,8 +77,9 @@ batch, never per request:
   epoll events), as are the JSON writer's 16-byte SIMD and 8-byte word checks; socket reads fill a buffer through an
   `OutputSpan`; base64 decodes, and response heads are written, into a `MutableSpan` of a stack `InlineArray`.
 - `~Escapable` with `@_lifetime`: `HTTP.Request` borrows the reactor's read buffer (the Rust's `HttpReq<'a>`), the JSON
-  reader borrows the body (a validating pass that builds nothing: members are places in the body, kept in an
-  `InlineArray`, and strings are read in place, copied only into the value that goes to a lane), and the pipeline
+  reader borrows the body (a validating pass that builds nothing and keeps only the members the caller names, as
+  places in the body in an `InlineArray`; strings are read in place, copied only into the value that goes to a lane),
+  and the pipeline
   buffer lends its cells as `Span`s. Errors are `StaticString`s whose bodies the reactor writes, so no error answer
   allocates.
 - `InlineArray` and value generics: the SHA-256 state and schedule, bcrypt's Blowfish states (`Bcrypt.hashLanes<let n>`,

@@ -79,7 +79,12 @@ actor Reactor {
                 submitPending(&group)
                 // Let the queued messages run (jobs on this same thread: Task.yield re-enqueues on the actor's executor),
                 // then carry on.
-                if messagesWaiting { await Task.yield() }
+                if messagesWaiting {
+                    await Task.yield()
+                    // A lane's replies may have routed pipelined requests: they go to the scheduler now, not after the
+                    // next wake-up, which may not come.
+                    submitPending(&group)
+                }
             }
         }
     }
@@ -107,7 +112,7 @@ actor Reactor {
         }
         for slot in pipelinedSlots { drainRxBuf(slot) }
         pipelinedSlots.removeAll(keepingCapacity: true)
-        // Pipelined requests routed here go out with the tick that resumes after this message.
+        // Pipelined requests routed here go out as soon as the tick that let this message run resumes.
     }
 
     // ---------- connections ----------
@@ -233,7 +238,7 @@ actor Reactor {
                 break
             }
             if n == 0 {
-                dropConn(slot)
+                peerDone(slot)
                 return
             }
             // Parse straight out of the scratch buffer when the connection has nothing left over.
@@ -264,6 +269,20 @@ actor Reactor {
         drainRxBuf(slot)
     }
 
+    /// The peer is done sending (it may have only half-closed): what it sent is answered, then the connection closes.
+    /// Its socket stops being polled for input, which epoll would otherwise report again and again.
+    private func peerDone(_ slot: UInt32) {
+        let s = Int(slot)
+        guard slots[s].inFlight || slots[s].txOff < slots[s].tx.count || !slots[s].rx.isEmpty else {
+            dropConn(slot)
+            return
+        }
+        slots[s].eofSeen = true
+        unlinkIdle(slot)
+        _ = ctl(Sys.EPOLL_CTL_MOD, slots[s].fd, slots[s].pollingOut ? Sys.EPOLLOUT : 0, UInt64(slot))
+        if !slots[s].inFlight { drainRxBuf(slot) }
+    }
+
     /// Writes an immediate answer, or queues the work for this tick's submission. Whether it was immediate.
     private func handle(_ dispatch: consuming Router.Dispatch, _ slot: UInt32) -> Bool {
         switch consume dispatch {
@@ -287,7 +306,12 @@ actor Reactor {
             if slots[s].fd < 0 || slots[s].inFlight || slots[s].rx.isEmpty {
                 if slots[s].fd >= 0 && slots[s].rx.isEmpty {
                     if slots[s].rx.capacity > 4096 { slots[s].rx.release() } else { slots[s].rx.removeAll() }
-                    if !slots[s].inFlight && slots[s].txOff >= slots[s].tx.count && slots[s].reused { linkIdle(slot) }
+                    let idle = !slots[s].inFlight && slots[s].txOff >= slots[s].tx.count
+                    if idle && slots[s].eofSeen {
+                        dropConn(slot)
+                    } else if idle && slots[s].reused {
+                        linkIdle(slot)
+                    }
                 }
                 return
             }
@@ -301,6 +325,11 @@ actor Reactor {
                 if consumed == slots[s].rx.count { slots[s].rx.release() } else { slots[s].rx.removeFirst(consumed) }
                 if !handle(dispatch, slot) { return }
             case .incomplete(let sendContinue):
+                // A request the peer will never finish.
+                if slots[s].eofSeen {
+                    if slots[s].txOff >= slots[s].tx.count { dropConn(slot) } else { slots[s].closeOnDone = true }
+                    return
+                }
                 if sendContinue && !slots[s].continueSent {
                     slots[s].continueSent = true
                     writeRaw(slot, "HTTP/1.1 100 Continue\r\n\r\n")
@@ -430,12 +459,13 @@ actor Reactor {
             slots[s].txOff = 0
         }
         let inFlight = slots[s].inFlight
-        let shouldDrop = !hasUnsent && !inFlight && (slots[s].closeOnDone || slots[s].eofSeen)
-        let shouldLinkIdle = !shouldDrop && !hasUnsent && !inFlight && slots[s].rx.isEmpty && slots[s].reused
+        let shouldDrop = !hasUnsent && !inFlight && (slots[s].closeOnDone || (slots[s].eofSeen && slots[s].rx.isEmpty))
+        let shouldLinkIdle = !shouldDrop && !hasUnsent && !inFlight && slots[s].rx.isEmpty && slots[s].reused && !slots[s].eofSeen
         var maskChange: UInt32?
         if !shouldDrop && hasUnsent != slots[s].pollingOut {
             slots[s].pollingOut = hasUnsent
-            maskChange = hasUnsent ? Sys.EPOLLIN | Sys.EPOLLOUT | Sys.EPOLLRDHUP : Sys.EPOLLIN | Sys.EPOLLRDHUP
+            let input = slots[s].eofSeen ? 0 : Sys.EPOLLIN | Sys.EPOLLRDHUP
+            maskChange = hasUnsent ? input | Sys.EPOLLOUT : input
         }
         if shouldDrop {
             dropConn(slot)
@@ -464,6 +494,7 @@ extension Reactor {
         var txOff = 0
         var inFlight = false
         var closeOnDone = false
+        /// The peer is done sending: once what it sent is answered, the connection closes.
         var eofSeen = false
         var pollingOut = false
         var continueSent = false

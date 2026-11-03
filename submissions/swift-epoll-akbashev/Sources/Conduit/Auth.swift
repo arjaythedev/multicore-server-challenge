@@ -152,7 +152,7 @@ struct TokenSigner: Sendable {
             var headerSpan = headerBytes.mutableSpan
             guard let n = Base64.urlDecode(header, into: &headerSpan) else { return nil }
             let json = headerBytes.span.extracting(0..<n)
-            guard let fields = JSON.scan(json), let alg = fields.member("alg", in: json), alg.kind == .string,
+            guard let fields = JSON.scan(json, keys: ["alg"]), let alg = fields[0], alg.kind == .string,
                   JSON.withString(json, alg, { Bytes.equal($0, "HS256") }) else { return nil }
         }
 
@@ -170,14 +170,14 @@ struct TokenSigner: Sendable {
     /// The claims, read in place: `exp` (required) and `nbf` against the clock, `iat` a number if present, and `sub` a
     /// positive integer string, the user id.
     private func claims(_ payload: Span<UInt8>, now: Double) -> Int64? {
-        guard let fields = JSON.scan(payload), fields.isObject,
-              let exp = fields.member("exp", in: payload), exp.kind == .number,
+        guard let fields = JSON.scan(payload, keys: ["exp", "nbf", "iat", "sub"]), fields.isObject,
+              let exp = fields[0], exp.kind == .number,
               let expires = JSON.number(payload, exp), now < expires else { return nil }
-        if let nbf = fields.member("nbf", in: payload) {
+        if let nbf = fields[1] {
             guard nbf.kind == .number, let notBefore = JSON.number(payload, nbf), now >= notBefore else { return nil }
         }
-        if let iat = fields.member("iat", in: payload), iat.kind != .number { return nil }
-        guard let sub = fields.member("sub", in: payload), sub.kind == .string else { return nil }
+        if let iat = fields[2], iat.kind != .number { return nil }
+        guard let sub = fields[3], sub.kind == .string else { return nil }
         return JSON.withString(payload, sub, Self.positiveInteger)
     }
 

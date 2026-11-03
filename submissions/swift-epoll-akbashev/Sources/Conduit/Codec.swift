@@ -428,56 +428,58 @@ extension JSON {
     /// A member of an object, as places in the document: its key's text and, for a string value, its text (both
     /// without the quotes), or the whole value otherwise. A string with escapes is decoded when it is read.
     struct Member {
-        let key: Range<Int>
-        let keyEscaped: Bool
-        let value: Range<Int>
+        private let keyStart: UInt32
+        private let keyEnd: UInt32
+        private let valueStart: UInt32
+        private let valueEnd: UInt32
         let kind: Kind
+        let keyEscaped: Bool
         let valueEscaped: Bool
+
+        init(key: Range<Int>, keyEscaped: Bool, value: Range<Int>, kind: Kind, valueEscaped: Bool) {
+            keyStart = UInt32(truncatingIfNeeded: key.lowerBound)
+            keyEnd = UInt32(truncatingIfNeeded: key.upperBound)
+            valueStart = UInt32(truncatingIfNeeded: value.lowerBound)
+            valueEnd = UInt32(truncatingIfNeeded: value.upperBound)
+            self.kind = kind
+            self.keyEscaped = keyEscaped
+            self.valueEscaped = valueEscaped
+        }
+
+        @inline(__always) var key: Range<Int> { Int(keyStart)..<Int(keyEnd) }
+        @inline(__always) var value: Range<Int> { Int(valueStart)..<Int(valueEnd) }
 
         static let none = Member(key: 0..<0, keyEscaped: false, value: 0..<0, kind: .null, valueEscaped: false)
     }
 
-    /// What `scan` found: whether the document is an object, and where its members are.
-    struct Object {
-        static let capacity = 16
-        fileprivate(set) var members = InlineArray<16, Member>(repeating: .none)
-        fileprivate(set) var count = 0
+    /// What `scan` found: whether the document is an object, the last member of its top-level object named by each
+    /// key asked for (by the key's position), and whether some string in it decodes to one with a NUL (`\u0000`).
+    struct Found<let n: Int> {
+        fileprivate var members = InlineArray<n, Member>(repeating: .none)
+        fileprivate var present: UInt64 = 0
         fileprivate(set) var isObject = false
-        /// Some string in the document decodes to one with a NUL (`\u0000`).
         fileprivate(set) var hasNul = false
 
-        /// The last member named `key` in `src` (a later duplicate wins, as in JavaScript's JSON.parse).
-        func member(_ key: StaticString, in src: Span<UInt8>) -> Member? {
-            var i = count
-            while i > 0 {
-                i -= 1
-                let m = members[i]
-                if !m.keyEscaped {
-                    if Bytes.equal(src.extracting(m.key), key) { return m }
-                } else if Bytes.equal(JSON.unescape(src.extracting(m.key)), key) {
-                    return m
-                }
-            }
-            return nil
-        }
+        /// The member named by the `i`th key, if the object has one.
+        @inline(__always) subscript(i: Int) -> Member? { present & (1 << UInt64(i)) != 0 ? members[i] : nil }
     }
 
     /// Checks that `src` is one JSON value (RFC 8259: strings valid UTF-8, nesting at most 64 deep) and, when it is an
-    /// object, notes where its members are (the first `Object.capacity`; the rest are still checked). Builds nothing:
-    /// nil if the document isn't valid.
-    static func scan(_ src: Span<UInt8>) -> Object? {
+    /// object, finds its members named by `keys` (a later duplicate wins, as in JavaScript's JSON.parse). Builds and
+    /// keeps nothing else: nil if the document isn't valid.
+    static func scan<let n: Int>(_ src: Span<UInt8>, keys: InlineArray<n, StaticString>) -> Found<n>? {
         var scanner = Scanner(src)
-        var object = Object()
+        var found = Found<n>()
         scanner.skipWhitespace()
         if scanner.pos < src.count && src[scanner.pos] == 0x7B {
-            object.isObject = true
-            guard scanner.object(depth: 1, noting: &object) else { return nil }
+            found.isObject = true
+            guard scanner.object(depth: 1, keys: keys, found: &found) else { return nil }
         } else {
             guard scanner.value(depth: 0) != nil else { return nil }
         }
         scanner.skipWhitespace()
-        object.hasNul = scanner.sawNul
-        return scanner.pos == src.count ? object : nil
+        found.hasNul = scanner.sawNul
+        return scanner.pos == src.count ? found : nil
     }
 
     /// Calls `body` with each element of an array member (already checked), a string's text without its quotes, until
@@ -528,6 +530,18 @@ extension JSON {
         if i == text.count { return Double(negative ? -value : value) }
         guard let string = Bytes.copyString(text), let double = Double(string), double.isFinite else { return nil }
         return double
+    }
+
+    /// Whether a member's key is `key`: lengths and first bytes first, which rule out nearly every other key cheaply.
+    @inline(__always) fileprivate static func keyMatches(_ text: Span<UInt8>, escaped: Bool, _ key: StaticString) -> Bool {
+        if escaped { return Bytes.equal(unescape(text), key) }
+        let n = key.utf8CodeUnitCount
+        guard text.count == n else { return false }
+        if n == 0 { return true }
+        let k = key.utf8Start
+        guard text[0] == k[0] else { return false }
+        for i in 1..<n where text[i] != k[i] { return false }
+        return true
     }
 
     /// A checked string's text with its escapes decoded.
@@ -614,8 +628,8 @@ extension JSON {
                 guard let escaped = string() else { return nil }
                 return (.string, escaped)
             case 0x7B:
-                var unused = Object()
-                return object(depth: depth + 1, noting: &unused, keep: false) ? (.object, false) : nil
+                var none = Found<0>()
+                return object(depth: depth + 1, keys: [], found: &none) ? (.object, false) : nil
             case 0x5B:
                 return array(depth: depth + 1) ? (.array, false) : nil
             case 0x74: return literal("true") ? (.true, false) : nil
@@ -631,14 +645,17 @@ extension JSON {
             pos += 1
             let start = pos
             var escaped = false
+            var ascii = true
             while pos < src.count {
                 let c = src[pos]
                 if c == 0x22 {
-                    // Escapes are ASCII, so the text with them is valid UTF-8 exactly when its other bytes are.
-                    guard Bytes.isValidUTF8(src.extracting(start..<pos)) else { return nil }
+                    // Escapes are ASCII, so the text with them is valid UTF-8 exactly when its other bytes are; all-ASCII
+                    // text needs no further check.
+                    guard ascii || Bytes.isValidUTF8(src.extracting(start..<pos)) else { return nil }
                     pos += 1
                     return escaped
                 }
+                if c >= 0x80 { ascii = false }
                 if c < 0x20 { return nil }
                 if c == 0x5C {
                     escaped = true
@@ -702,8 +719,8 @@ extension JSON {
             return true
         }
 
-        /// The object whose brace is at `pos`, passed over; its members noted in `object` when `keep`.
-        mutating func object(depth: Int, noting object: inout Object, keep: Bool = true) -> Bool {
+        /// The object whose brace is at `pos`, passed over; its members named by `keys` noted in `found`.
+        mutating func object<let n: Int>(depth: Int, keys: InlineArray<n, StaticString>, found: inout Found<n>) -> Bool {
             pos += 1
             skipWhitespace()
             if pos < src.count && src[pos] == 0x7D {
@@ -722,11 +739,10 @@ extension JSON {
                 skipWhitespace()
                 let valueStart = pos
                 guard let (kind, valueEscaped) = value(depth: depth) else { return false }
-                if keep && object.count < Object.capacity {
+                for k in 0..<n where JSON.keyMatches(src.extracting(key), escaped: keyEscaped, keys[k]) {
                     let range = kind == .string ? (valueStart + 1)..<(pos - 1) : valueStart..<pos
-                    object.members[object.count] = Member(key: key, keyEscaped: keyEscaped, value: range, kind: kind,
-                                                          valueEscaped: valueEscaped)
-                    object.count += 1
+                    found.members[k] = Member(key: key, keyEscaped: keyEscaped, value: range, kind: kind, valueEscaped: valueEscaped)
+                    found.present |= 1 << UInt64(k)
                 }
                 skipWhitespace()
                 guard pos < src.count else { return false }
