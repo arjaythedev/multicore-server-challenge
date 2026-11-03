@@ -35,6 +35,89 @@ type Connections() =
                 :> Task))
         |> ignore
 
+/// Server time per endpoint (only while the line is on), named as the load generator names them,
+/// so a client's latency minus ours is what happened outside the handlers: Kestrel, the kernel,
+/// the network.
+[<Sealed>]
+type Endpoints() =
+    let timings = Collections.Concurrent.ConcurrentDictionary<string, Engine.Db.Millis>()
+
+    static member Name(httpMethod: string, path: string, has: string -> bool) : string =
+        let s = path.Split('/', StringSplitOptions.RemoveEmptyEntries)
+        let route =
+            if s.Length < 2 || s[0] <> "api" then
+                "other"
+            else
+                match s[1], s.Length with
+                | "tags", 2 -> "/api/tags"
+                | "user", 2 -> "/api/user"
+                | "users", 2 -> "/api/users"
+                | "users", 3 -> "/api/users/login"
+                | "profiles", 3 -> "/api/profiles/:username"
+                | "profiles", 4 -> "/api/profiles/:username/follow"
+                | "articles", 2 when httpMethod = "GET" ->
+                    if has "tag" then "/api/articles?tag"
+                    elif has "author" then "/api/articles?author"
+                    elif has "favorited" then "/api/articles?favorited"
+                    else "/api/articles"
+                | "articles", 2 -> "/api/articles"
+                | "articles", 3 when s[2] = "feed" && httpMethod = "GET" -> "/api/articles/feed"
+                | "articles", 3 -> "/api/articles/:slug"
+                | "articles", 4 -> $"/api/articles/:slug/{s[3]}"
+                | "articles", 5 -> "/api/articles/:slug/comments/:id"
+                | _ -> "other"
+        $"{httpMethod} {route}"
+
+    member _.Record(name: string, elapsed: TimeSpan) =
+        timings.GetOrAdd(name, fun _ -> Engine.Db.Millis()).Record elapsed
+
+    /// One line per endpoint, busiest first: "name count p50/p95/p99 ms".
+    member _.Lines() =
+        timings
+        |> Seq.map (fun kv -> kv.Key, kv.Value.Count, kv.Value.Summary())
+        |> Seq.sortByDescending (fun (_, n, _) -> n)
+        |> Seq.map (fun (name, n, summary) -> sprintf "  %-42s %9d  %s" name n summary)
+        |> List.ofSeq
+
+/// Where each request's time went, by endpoint and by log2 bucket of its server time (bucket 0:
+/// under 1 ms; bucket b: 2^(b-1) to 2^b ms; the last holds the rest). Per cell: the count and the
+/// summed microseconds of the server time and of each lane phase. Six interlocked adds per
+/// request, so it can stay on under load. Unlike a percentile, a cell's phases add up, so the
+/// slow buckets can be split into phases. `Snapshot` appends the cumulative cells as CSV; two
+/// snapshots subtracted give any window.
+[<Sealed>]
+type Phases() =
+    static let buckets = 16
+    static let fields = 6 // count, server, read queued, read executed, write queued, write executed
+    let names = Collections.Concurrent.ConcurrentDictionary<string, int>()
+    let cells: int64[] = Array.zeroCreate (64 * buckets * fields)
+    let micros (ticks: int64) = ticks * 1_000_000L / Stopwatch.Frequency
+
+    member _.Record(name: string, server: int64, t: Engine.Db.Trace) =
+        let e = names.GetOrAdd(name, fun _ -> names.Count)
+        if e < 64 then
+            let ms = uint64 (server * 1000L / Stopwatch.Frequency)
+            let b = if ms = 0UL then 0 else min (buckets - 1) (64 - Numerics.BitOperations.LeadingZeroCount ms)
+            let at = (e * buckets + b) * fields
+            Interlocked.Increment &cells[at] |> ignore
+            Interlocked.Add(&cells[at + 1], micros server) |> ignore
+            Interlocked.Add(&cells[at + 2], micros t.ReadQueued) |> ignore
+            Interlocked.Add(&cells[at + 3], micros t.ReadExecuted) |> ignore
+            Interlocked.Add(&cells[at + 4], micros t.WriteQueued) |> ignore
+            Interlocked.Add(&cells[at + 5], micros t.WriteExecuted) |> ignore
+
+    /// Appends one row per non-empty cell: unix_s,endpoint,bucket,count,server_us,read_q_us,
+    /// read_x_us,write_q_us,write_x_us (cumulative since start).
+    member _.Snapshot(path: string, unix: int64) =
+        use w = IO.File.AppendText path
+        for kv in names do
+            for b in 0 .. buckets - 1 do
+                let at = (kv.Value * buckets + b) * fields
+                let n = Volatile.Read &cells[at]
+                if n > 0L then
+                    let f i = Volatile.Read &cells[at + i]
+                    w.WriteLine $"{unix},{kv.Key},{b},{n},{f 1},{f 2},{f 3},{f 4},{f 5}"
+
 let private mb (bytes: int64) = bytes / 1048576L
 
 /// The latest GC of `kind` and, if it is not GC number `seen`, "g<gen> <promoted>MB <pause>ms".
@@ -46,7 +129,7 @@ let private latest (kind: GCKind) (seen: int64) : int64 * string =
         let pause = if info.PauseDurations.Length > 0 then info.PauseDurations[0] else TimeSpan.Zero
         info.Index, $"g{info.Generation} {mb info.PromotedBytes}MB {int pause.TotalMilliseconds}ms"
 
-let start (every: TimeSpan) (connections: Connections) (reads: Engine.Reads.Gather) (readLanes: int) (writes: Engine.Commit.Writer) =
+let start (every: TimeSpan) (connections: Connections) (reads: Engine.Reads.Gather) (readLanes: int) (writes: Engine.Commit.Writer) (writeLanes: int) (phases: (Phases * string) option) =
     let sample () =
         let mutable at = Stopwatch.GetTimestamp()
         let mutable opened = connections.Opened
@@ -55,6 +138,8 @@ let start (every: TimeSpan) (connections: Connections) (reads: Engine.Reads.Gath
         let mutable allocated = GC.GetTotalAllocatedBytes false
         let mutable cpu = Environment.CpuUsage.TotalTime
         let mutable batches, requests = reads.Counts
+        let mutable groups, written = writes.Counts
+        let mutable writeBusy = writes.BusyTicks
         let mutable ephemeral = (GC.GetGCMemoryInfo GCKind.Ephemeral).Index
         let mutable full = (GC.GetGCMemoryInfo GCKind.FullBlocking).Index
         let mutable background = (GC.GetGCMemoryInfo GCKind.Background).Index
@@ -70,6 +155,7 @@ let start (every: TimeSpan) (connections: Connections) (reads: Engine.Reads.Gath
             let allocated' = GC.GetTotalAllocatedBytes false
             let cpu' = Environment.CpuUsage.TotalTime
             let batches', requests' = reads.Counts
+            let groups', written' = writes.Counts
             let heap = GC.GetGCMemoryInfo GCKind.Any
             let generations = heap.GenerationInfo
             let ephemeral', lastEphemeral = latest GCKind.Ephemeral ephemeral
@@ -78,7 +164,7 @@ let start (every: TimeSpan) (connections: Connections) (reads: Engine.Reads.Gath
             let wall = DateTimeOffset.UtcNow
             let perBatch = if batches' = batches then 0L else (requests' - requests) / (batches' - batches)
             eprintfn
-                "stats t=%d %s dt=%dms | conn=%d new=%d | gc0=%d gc1=%d gc2=%d pause=%dms alloc=%dMB eph=[%s] full=[%s] bg=[%s] | heap=%dMB gen2=%dMB loh=%dMB poh=%dMB | cpu=%.2f pool=%d pending=%d | reads q=%d busy=%d/%d batches=%d per=%d worst=%dms | writes q=%d"
+                "stats t=%d %s dt=%dms | conn=%d new=%d | gc0=%d gc1=%d gc2=%d pause=%dms alloc=%dMB eph=[%s] full=[%s] bg=[%s] | heap=%dMB gen2=%dMB loh=%dMB poh=%dMB | cpu=%.2f pool=%d pending=%d | reads q=%d busy=%d/%d batches=%d per=%d worst=%dms | writes q=%d busy=%.0f%% groups=%d per=%d refused=%d"
                 (wall.ToUnixTimeSeconds())
                 (wall.ToString "HH:mm:ss.fff")
                 (int dt.TotalMilliseconds)
@@ -106,6 +192,14 @@ let start (every: TimeSpan) (connections: Connections) (reads: Engine.Reads.Gath
                 perBatch
                 (int (reads.Worst()).TotalMilliseconds)
                 writes.Depth
+                (100.0 * float (writes.BusyTicks - writeBusy) / float Stopwatch.Frequency / dt.TotalSeconds / float writeLanes)
+                (groups' - groups)
+                (if groups' = groups then 0L else (written' - written) / (groups' - groups))
+                (fst writes.Refusals)
+            writeBusy <- writes.BusyTicks
+            groups <- groups'
+            written <- written'
+            phases |> Option.iter (fun (p, path) -> p.Snapshot(path, wall.ToUnixTimeSeconds()))
             at <- now
             opened <- opened'
             collections <- collections'

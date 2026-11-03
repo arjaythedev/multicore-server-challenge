@@ -24,7 +24,7 @@ let private dataSource =
         (match Environment.GetEnvironmentVariable "BATCH_TEST_DATABASE_URL" with
          | null
          | "" -> failwith "BATCH_TEST_DATABASE_URL is not set (check.sh phase 4 provides it)"
-         | url -> NpgsqlDataSource.Create(Db.connectionString url 2 false))
+         | url -> NpgsqlDataSource.Create(Db.connectionString url 4 false))
 
 /// What a client sees: the answer as Wire encodes it.
 let private seen (a: Answer) : string =
@@ -42,6 +42,13 @@ let private seen (a: Answer) : string =
 let private run (reads: Read[]) : Answer[] =
     use conn = dataSource.Value.OpenConnection()
     (answer conn reads).GetAwaiter().GetResult()
+
+/// The same batch with phase B split as far as it goes: three connections, one article a part.
+let private runSplit (reads: Read[]) : Answer[] =
+    use conn = dataSource.Value.OpenConnection()
+    use h1 = dataSource.Value.OpenConnection()
+    use h2 = dataSource.Value.OpenConnection()
+    (answerWith conn [| h1; h2 |] 1 null reads).GetAwaiter().GetResult()
 
 let private column (sql: string) (read: Data.Common.DbDataReader -> 'a) : 'a list =
     use conn = dataSource.Value.OpenConnection()
@@ -139,8 +146,9 @@ let ``a request's answer does not depend on its batch-mates`` () =
     let property (batch: Read list) =
         let batch = Array.ofList batch
         let together = run batch |> Array.map seen
+        let split = runSplit batch |> Array.map seen
         let alone = batch |> Array.map (fun r -> seen (Array.exactlyOne (run [| r |])))
-        together = alone
+        together = alone && split = alone
     Check.One(Config.QuickThrowOnFailure.WithMaxTest(500), Prop.forAll (batches pools.Value) property)
 
 [<Fact>]

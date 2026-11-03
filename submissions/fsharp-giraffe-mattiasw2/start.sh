@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 # Runs the server in the foreground. Config: DATABASE_URL, JWT_SECRET, HOST, PORT (SPEC.md).
 # Optional: READ_LANES / READ_BATCH (read-batching connections, default one per core; requests per
-# batch, default 512), READ_GATHER_MS (how long a request may wait for batch-mates, default
+# batch, default 2048), READ_SPLIT / READ_SPLIT_MIN (connections per lane for a split phase B, default 1, off;
+# fewest articles per part, default 64), READ_GATHER_MS (how long a request may wait for batch-mates, default
 # 25), DB_POOL_SIZE (multiplexed connections for cold reads, default cores / 2),
-# WRITE_LANES / WRITE_GROUP (group-commit connections, default 2; writes per group, default 128),
-# BCRYPT_THREADS / BCRYPT_WIDTH / BCRYPT_GATHER_MS (bcrypt threads, default 2; hashes each computes in
+# WRITE_LANES / WRITE_GROUP (group-commit connections, default (cores + 2) / 4; writes per group, default 128),
+# BCRYPT_THREADS / BCRYPT_WIDTH / BCRYPT_GATHER_MS (bcrypt threads, default (cores + 2) / 4; hashes each computes in
 # lockstep, default 4; how long a login may wait for batch-mates, default 150), STATS_SECONDS (a
-# diagnostic line on stderr every that many seconds: GC, connections, queues; default 0, off).
+# diagnostic line on stderr every that many seconds: GC, connections, queues; default 0, off),
+# PHASES_FILE (with STATS_SECONDS: where each request's time went, appended at every stats line),
+# PG_OPTIONS (replaces the Postgres session settings in src/Engine/Db.fs), SCHED_BATCH (0: run
+# under the default scheduling policy). GC: DOTNET_gcServer=0 (workstation GC) or
+# DOTNET_GCHeapCount=N override the server GC that Web.fsproj sets.
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 export DOTNET_ROOT="${DOTNET_ROOT:-/usr/local/dotnet}" DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1
@@ -20,4 +25,10 @@ export DOTNET_GCgen0size="${DOTNET_GCgen0size:-0x4000000}"
 export DOTNET_ThreadPool_UnfairSemaphoreSpinLimit="${DOTNET_ThreadPool_UnfairSemaphoreSpinLimit:-0}"
 DOTNET="$DOTNET_ROOT/dotnet"
 [ -x "$DOTNET" ] || DOTNET=dotnet
+# SCHED_BATCH (inherited by every thread; no privileges needed): our threads wake constantly, and
+# under the default policy each wakeup may preempt a busy Postgres backend. As in
+# java-raw-stohirov and kotlin-native-luben93. SCHED_BATCH=0 runs under the default policy.
+if [ "${SCHED_BATCH:-1}" != 0 ] && command -v chrt >/dev/null; then
+  exec chrt --batch 0 "$DOTNET" "$DIR/out/Web.dll"
+fi
 exec "$DOTNET" "$DIR/out/Web.dll"
