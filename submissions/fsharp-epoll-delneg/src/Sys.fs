@@ -183,3 +183,58 @@ let raiseNoFile () : int =
         int (min (NativeInterop.NativePtr.get lim 0) 100000000UL)
     else
         1024
+
+[<DllImport(C, SetLastError = true)>]
+extern int shutdown(int fd, int how)
+
+[<Literal>]
+let ENOBUFS = 105
+[<Literal>]
+let EINVAL = 22
+
+// io_uring: the ring mechanics live in native/uring.c (built into libconduitbc.so); the connection logic is in Io.fs
+
+[<Literal>]
+let private U = "libconduitbc.so"
+
+[<Struct; StructLayout(LayoutKind.Sequential)>]
+type UrCqe =
+    val mutable Ud: uint64
+    val mutable Res: int
+    val mutable Flags: uint32
+
+[<DllImport(U)>]
+extern nativeint ur_open(uint32 entries, uint32 cqEntries, uint32 nbufs, uint32 buflen, int forceClassic, int& info, int& err)
+
+[<DllImport(U)>]
+extern int ur_wait(nativeint u, UrCqe* out, int max)
+
+[<DllImport(U); SuppressGCTransition>]
+extern nativeint ur_pool(nativeint u)
+
+[<DllImport(U); SuppressGCTransition>]
+extern int ur_accept(nativeint u, int lfd, uint64 ud)
+
+[<DllImport(U); SuppressGCTransition>]
+extern int ur_recv(nativeint u, int fd, uint64 ud)
+
+[<DllImport(U); SuppressGCTransition>]
+extern int ur_send(nativeint u, int fd, byte* buf, uint32 len, uint64 ud)
+
+[<DllImport(U); SuppressGCTransition>]
+extern int ur_read_efd(nativeint u, int efd, uint64 ud)
+
+[<DllImport(U); SuppressGCTransition>]
+extern void ur_buf_return(nativeint u, int bid)
+
+[<DllImport(U); SuppressGCTransition>]
+extern int ur_ms_accept(nativeint u)
+
+[<DllImport(U); SuppressGCTransition>]
+extern int ur_ms_recv(nativeint u)
+
+[<DllImport(U); SuppressGCTransition>]
+extern void ur_no_ms_accept(nativeint u)
+
+[<DllImport(U); SuppressGCTransition>]
+extern void ur_no_ms_recv(nativeint u)

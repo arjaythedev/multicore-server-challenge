@@ -41,7 +41,13 @@ let main _ =
     let host = env "HOST" "0.0.0.0"
     let port = num "PORT" 3000
     let loops = num "IO_THREADS" 4
+    // IO_MODE=uring: io_uring loops (each falls back to epoll if the kernel refuses a ring); URING_BUFS=classic forces
+    // IORING_OP_PROVIDE_BUFFERS instead of a buffer ring, the path for kernels whose buffer rings fail
+    Io.uring <- env "IO_MODE" "epoll" = "uring"
+    Io.uringClassic <- env "URING_BUFS" "ring" = "classic"
+    Io.uringBufs <- num "URING_NBUFS" 8192
+    Io.uringBufLen <- num "URING_BUFLEN" 2048
     let limit = Io.start host port loops (reads + sideReads + writes + 200) (num "IO_NICE" 0)
-    eprintfn "conduit on %s:%d: %d I/O threads, postgres %d + %d read and %d write connections, fd limit %d" host port loops reads sideReads writes limit
+    eprintfn "conduit on %s:%d: %d %s I/O threads, postgres %d + %d read and %d write connections, fd limit %d" host port loops (if Io.uring then "io_uring" else "epoll") reads sideReads writes limit
     Thread.Sleep Timeout.Infinite
     0
