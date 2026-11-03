@@ -357,13 +357,16 @@ type Conn(url: string, options: string) =
         c.Send()
 
     /// Connects, authenticates (SCRAM-SHA-256, MD5, cleartext or trust) and waits for ReadyForQuery.
+    /// shown in pg_stat_activity (which lane the connection serves)
+    member val AppName = "conduit" with get, set
+
     member c.Open() =
         sock.NoDelay <- true
         sock.Connect(uri.Host, port)
         let mutable p = 0
         out.I32 0
         out.I32 196608
-        for k, v in [ "user", user; "database", db; "options", options; "application_name", "conduit" ] do
+        for k, v in [ "user", user; "database", db; "options", options; "application_name", c.AppName ] do
             if v <> "" then
                 out.CStr k
                 out.CStr v

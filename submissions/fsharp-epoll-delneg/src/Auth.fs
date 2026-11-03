@@ -17,6 +17,9 @@ open System.Threading
 let mutable private secret: byte[] = [||]
 let init (s: string) = secret <- Encoding.UTF8.GetBytes s
 
+/// one HMAC-SHA256 context per thread, reset after each use (HashData sets up a new one on every call)
+let private macs = new Threading.ThreadLocal<IncrementalHash>(fun () -> IncrementalHash.CreateHMAC(HashAlgorithmName.SHA256, secret))
+
 let private header = Base64Url.EncodeToString(Encoding.ASCII.GetBytes """{"alg":"HS256","typ":"JWT"}""")
 
 let nowUnix () = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
@@ -89,7 +92,9 @@ let verify (token: ReadOnlySpan<byte>) : int64 =
                || gLen <> 32 then
                 -1L
             else
-                HMACSHA256.HashData(ReadOnlySpan secret, signing, mac) |> ignore
+                let h = macs.Value
+                h.AppendData signing
+                h.GetHashAndReset mac |> ignore
                 if not (CryptographicOperations.FixedTimeEquals(mac, given.Slice(0, 32))) then -1L
                 else
                     let h64 = token.Slice(0, d1)

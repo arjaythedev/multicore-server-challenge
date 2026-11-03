@@ -35,7 +35,7 @@ PGCG=/sys/fs/cgroup/system.slice/system-postgresql.slice/postgresql@18-main.serv
 MON=$!
 phase() { # name users ramp measure
   local N=$1 U=$2 R=$3 M=$4 D=$OUT/$1; mkdir -p $D
-  local K=$(( (U + 39999) / 40000 )); local per=$(( U / K )); local rem=$(( U - per*K ))
+  local PER=${PER:-40000}; local K=$(( (U + PER - 1) / PER )); local per=$(( U / K )); local rem=$(( U - per*K ))
   local sa=$(( $(date +%s%N) / 1000000 + 5000 )) off=0 pids=() files=()
   for k in $(seq 0 $((K-1))); do
     local u=$per; [ $k -lt $rem ] && u=$((u+1))
@@ -46,6 +46,9 @@ phase() { # name users ramp measure
   done
   if [ -n "${PERF:-}" ]; then # profile the app mid-window from the build CPUs (needs APPENV=DOTNET_PerfMapEnabled=1)
     ( sleep $((R + 15)); sudo taskset -c 20-23 perf record -q -F 499 -g -p $(systemctl show -p MainPID --value mcfs2-app) -o $D/perf.data -- sleep 30 >/dev/null 2>&1 ) &
+  fi
+  if [ -n "${PGSPLIT:-}" ]; then # Postgres CPU by connection name / process type over 40 s of the window
+    ( sleep $((R + 15)); $H/pgsplit.sh 40 > $D/pgsplit.txt 2>&1 ) &
   fi
   if [ -n "${PGPERF:-}" ]; then # profile CPUs 0-7 (app and Postgres) mid-window; filter with --comm postgres
     ( sleep $((R + 15)); sudo taskset -c 20-23 perf record -q -F 499 -g -a -C 0-7 -o $D/pgperf.data -- sleep 20 >/dev/null 2>&1 ) &

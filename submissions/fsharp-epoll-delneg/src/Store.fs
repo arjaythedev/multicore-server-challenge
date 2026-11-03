@@ -1164,8 +1164,8 @@ type private Writer(c: Conn) =
 // ---------------- lanes and their connection threads ----------------
 
 
-let private connect (url: string) (options: string) =
-    let c = new Conn(url, options)
+let private connect (url: string) (options: string) (name: string) =
+    let c = new Conn(url, options, AppName = name)
     c.Open()
     for name, sql, oids in Sql.all () do
         c.Prepare(name, sql, oids)
@@ -1177,9 +1177,9 @@ let private failAll (batch: List<'T>) (ex: exn) =
     for j in batch do
         reply j err
 
-let private readThread (lane: Lane<RJob>) (url: string) (options: string) () =
+let private readThread (lane: Lane<RJob>) (name: string) (url: string) (options: string) () =
     Sys.schedThread ()
-    let mutable c = connect url options
+    let mutable c = connect url options name
     let mutable r = Reader(c, Dump = not (isNull dumpPath))
     let batch = List<RJob>()
     while true do
@@ -1190,12 +1190,12 @@ let private readThread (lane: Lane<RJob>) (url: string) (options: string) () =
         with ex ->
             failAll batch ex
             (c :> IDisposable).Dispose()
-            c <- connect url options
+            c <- connect url options name
             r <- Reader(c, Dump = not (isNull dumpPath))
 
 let private writeThread (url: string) (options: string) () =
     Sys.schedThread ()
-    let mutable c = connect url options
+    let mutable c = connect url options "conduit-write"
     let mutable wr = Writer(c)
     let batch = List<WJob>()
     while true do
@@ -1208,7 +1208,7 @@ let private writeThread (url: string) (options: string) () =
         with ex ->
             failAll batch ex
             (c :> IDisposable).Dispose()
-            c <- connect url options
+            c <- connect url options "conduit-write"
             wr <- Writer(c)
 
 /// Opens the connections (each prepares every statement) and starts their threads.
@@ -1217,11 +1217,11 @@ let start (url: string) (options: string) (reads: int) (sideReads: int) (writes:
     sideLane <- Lane<RJob>(sideClockUs, readMax)
     writeLane <- Lane<WJob>(writeClockUs, writeMax)
     // fail at startup, not on the first request, if a statement doesn't prepare
-    (connect url options :> IDisposable).Dispose()
+    (connect url options "conduit-check" :> IDisposable).Dispose()
     for i in 1 .. reads do
-        Thread(readThread readLane url options, IsBackground = true, Name = sprintf "pg-read-%d" i).Start()
+        Thread(readThread readLane "conduit-read" url options, IsBackground = true, Name = sprintf "pg-read-%d" i).Start()
     for i in 1 .. sideReads do
-        Thread(readThread sideLane url options, IsBackground = true, Name = sprintf "pg-side-%d" i).Start()
+        Thread(readThread sideLane "conduit-side" url options, IsBackground = true, Name = sprintf "pg-side-%d" i).Start()
     for i in 1 .. writes do
         Thread(writeThread url options, IsBackground = true, Name = sprintf "pg-write-%d" i).Start()
     if stats then

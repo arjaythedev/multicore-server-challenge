@@ -66,3 +66,17 @@ Script: `experiments/h.sh`.
   loadgen. Searches now run the loadgen on CPUs 8-22 with 25k users per process (`PER`, `LGLAST`).
 - **e10: two read lanes.** Comments, profiles, users and logins have their own lane and connections (3), so their
   statements run in parallel with `rd` (5 connections) instead of after it in the same backend.
+- **#87 profile run** (same sequence as e08: warm-up, 50k, 150k): 50k 101.9 µs/req (app 51.0, PG 51.0), 150k 99.3
+  (app 44.6, PG 54.8). e08 in the same sequence: 107.8 and 110.0. So at this point the new design is ~10% more
+  expensive per request than #87: PG +5 µs at 150k, app +6 µs (I/O threads 0.91 vs 0.78 cores, bcrypt 0.72 vs
+  0.63, libcrypto 2.6x #87's share).
+- **e11: feed bounds per page depth.** The bound came from the batch's deepest feed page (usually 50), so page-1 feeds
+  scanned back to a hub's 50th newest article instead of its 10th. Now one bound per (hub, depth). Same rows on the
+  real batches, 21.6 -> 20.9 ms per batch.
+- **Generic vs custom plans** for `rd` on the real batches: 26.5 vs 27.5 ms (planning included): generic stays.
+  Not materializing the single-use CTEs (fc, tg, au and more): 30 ms, much worse.
+- **e12: bounded feeds from one index scan** (`author_id = ANY(followees) AND id >= bound`, then sort the few rows)
+  instead of a subplan per followee; 86 of 111 feeds in a real batch take it. Same rows; time within noise
+  (maybe -2%).
+- **e13: one HMAC context per thread** (`IncrementalHash`) for JWT checks instead of `HMACSHA256.HashData`, which
+  sets up a new OpenSSL context per call.
