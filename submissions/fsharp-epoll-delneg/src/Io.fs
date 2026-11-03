@@ -63,6 +63,7 @@ type Loop(index: int, listenFd: int) =
     let inbox = ConcurrentQueue<struct (int * int * byte[])>()
     let mutable wakePending = 0
     let rbuf: byte[] = Array.zeroCreate (256 * 1024)
+    let mutable spareFd = Sys.openDevNull ()
     let mutable lruHead = -1 // oldest idle
     let mutable lruTail = -1
 
@@ -330,6 +331,14 @@ type Loop(index: int, listenFd: int) =
             else
                 let e = Sys.errno ()
                 if (e = Sys.EMFILE || e = Sys.ENFILE) && evictOne () then ()
+                elif (e = Sys.EMFILE || e = Sys.ENFILE) && spareFd >= 0 then
+                    // nothing idle to close: free the spare fd, take the connection and close it at once, so the
+                    // listener doesn't stay readable (an epoll loop spinning on accept)
+                    Sys.close spareFd |> ignore
+                    let x = Sys.accept4 (listenFd, 0n, 0n, Sys.SOCK_CLOEXEC)
+                    if x >= 0 then Sys.close x |> ignore
+                    spareFd <- Sys.openDevNull ()
+                    go <- false
                 else go <- false
 
     do dispatchRef <- dispatch
@@ -360,12 +369,21 @@ type Loop(index: int, listenFd: int) =
                     let mutable item = Unchecked.defaultof<struct (int * int * byte[])>
                     while inbox.TryDequeue(&item) do
                         let struct (fd, gen, data) = item
-                        deliver fd gen data
+                        try
+                            deliver fd gen data
+                        with ex ->
+                            eprintfn "io: deliver fd %d: %s" fd ex.Message
+                            closeFd fd
                 else
                     let fd = int ev.Data
-                    if ev.Events &&& Sys.EPOLLOUT <> 0u then onWritable fd
-                    if ev.Events &&& (Sys.EPOLLIN ||| Sys.EPOLLHUP ||| Sys.EPOLLERR ||| Sys.EPOLLRDHUP) <> 0u then
-                        onReadable fd
+                    try
+                        if ev.Events &&& Sys.EPOLLOUT <> 0u then onWritable fd
+                        if ev.Events &&& (Sys.EPOLLIN ||| Sys.EPOLLHUP ||| Sys.EPOLLERR ||| Sys.EPOLLRDHUP) <> 0u then
+                            onReadable fd
+                    with ex ->
+                        // one connection's failure closes that connection, never the loop
+                        eprintfn "io: fd %d: %s" fd ex.Message
+                        closeFd fd
 
 let mutable private loops: Loop[] = [||]
 

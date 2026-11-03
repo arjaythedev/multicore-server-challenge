@@ -157,7 +157,7 @@ let private register (d: Dest) (r: Request) =
             else
                 Auth.hash pw (fun h ->
                     if isNull h then post d (Json.error 500 "hash failed")
-                    else writeLane.Push(WJob(WKind.Signup, d, Username = u, Email = e, Hash = h)))
+                    else pushWrite (WJob(WKind.Signup, d, Username = u, Email = e, Hash = h)))
                 null
 
 let private login (d: Dest) (r: Request) =
@@ -180,7 +180,7 @@ let private updateUser (d: Dest) (r: Request) (viewer: int64) =
         | Some email, Some username, Some password, Some bio, Some image ->
             let j = WJob(WKind.UpdateUser, d, Viewer = viewer, Token = tokenOf r, Email = email, Username = username, Bio = bio, Image = image)
             if isNull password then
-                writeLane.Push j
+                pushWrite j
                 null
             else
                 let pw = Encoding.UTF8.GetBytes password
@@ -188,7 +188,7 @@ let private updateUser (d: Dest) (r: Request) (viewer: int64) =
                 else
                     Auth.hash pw (fun h ->
                         j.Hash <- h
-                        writeLane.Push j)
+                        pushWrite j)
                     null
         | _ -> bad
 
@@ -209,7 +209,7 @@ let private createArticle (d: Dest) (r: Request) (viewer: int64) =
             | _ -> None
         match tags with
         | Some tl when not (isNull t || isNull ds || isNull b) ->
-            writeLane.Push(WJob(WKind.ArticleCreate, d, Viewer = viewer, Title = t, Description = ds, Body = b, TagList = Array.distinct tl))
+            pushWrite (WJob(WKind.ArticleCreate, d, Viewer = viewer, Title = t, Description = ds, Body = b, TagList = Array.distinct tl))
             null
         | _ -> bad
 
@@ -219,7 +219,7 @@ let private updateArticle (d: Dest) (r: Request) (viewer: int64) (slug: string) 
     | Some o ->
         match optional true (field o "title"), optional true (field o "description"), optional true (field o "body") with
         | Some t, Some ds, Some b ->
-            writeLane.Push(WJob(WKind.ArticleUpdate, d, Viewer = viewer, Key = slug, Title = t, Description = ds, Body = b))
+            pushWrite (WJob(WKind.ArticleUpdate, d, Viewer = viewer, Key = slug, Title = t, Description = ds, Body = b))
             null
         | _ -> bad
 
@@ -230,7 +230,7 @@ let private addComment (d: Dest) (r: Request) (viewer: int64) (slug: string) =
         match required (field o "body") with
         | null -> bad
         | b ->
-            writeLane.Push(WJob(WKind.CommentAdd, d, Viewer = viewer, Key = slug, Text = b))
+            pushWrite (WJob(WKind.CommentAdd, d, Viewer = viewer, Key = slug, Text = b))
             null
 
 /// The handler: returns the response now, or null when a lane will answer.
@@ -285,7 +285,7 @@ let handle (d: Dest) (r: Request) : byte[] =
             | 3, "profiles" when segs.[2] = "follow" && (m = 'P'B || m = 'D'B) ->
                 match need () with
                 | Some v ->
-                    writeLane.Push(WJob((if m = 'P'B then WKind.FollowAdd else WKind.FollowDel), d, Viewer = v, Key = segs.[1]))
+                    pushWrite (WJob((if m = 'P'B then WKind.FollowAdd else WKind.FollowDel), d, Viewer = v, Key = segs.[1]))
                     null
                 | None -> unauthorized
             | 1, "articles" when m = 'G'B ->
@@ -316,14 +316,14 @@ let handle (d: Dest) (r: Request) : byte[] =
                 | 'D'B ->
                     match need () with
                     | Some v ->
-                        writeLane.Push(WJob(WKind.ArticleDelete, d, Viewer = v, Key = slug))
+                        pushWrite (WJob(WKind.ArticleDelete, d, Viewer = v, Key = slug))
                         null
                     | None -> unauthorized
                 | _ -> notFound
             | 3, "articles" when segs.[2] = "favorite" && (m = 'P'B || m = 'D'B) ->
                 match need () with
                 | Some v ->
-                    writeLane.Push(WJob((if m = 'P'B then WKind.FavAdd else WKind.FavDel), d, Viewer = v, Key = segs.[1]))
+                    pushWrite (WJob((if m = 'P'B then WKind.FavAdd else WKind.FavDel), d, Viewer = v, Key = segs.[1]))
                     null
                 | None -> unauthorized
             | 3, "articles" when segs.[2] = "comments" ->
@@ -345,7 +345,7 @@ let handle (d: Dest) (r: Request) : byte[] =
                     let id = parseNat segs.[3]
                     if id <= 0L then notFound
                     else
-                        writeLane.Push(WJob(WKind.CommentDel, d, Viewer = v, Key = segs.[1], CommentId = id))
+                        pushWrite (WJob(WKind.CommentDel, d, Viewer = v, Key = segs.[1], CommentId = id))
                         null
                 | None -> unauthorized
             | _ -> notFound

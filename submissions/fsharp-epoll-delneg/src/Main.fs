@@ -13,12 +13,14 @@ let private num (name: string) (fallback: int) = int (env name (string fallback)
 
 [<EntryPoint>]
 let main _ =
+    AppDomain.CurrentDomain.UnhandledException.Add(fun e -> eprintfn "fatal: %O" e.ExceptionObject)
     let url = env "DATABASE_URL" "postgres://conduit:conduit@127.0.0.1:5432/conduit"
     // session settings on our own connections only (Rule 2): generic plans (custom planning costs about as much
     // as running these statements), no JIT and no parallel workers for short OLTP statements
     let options = env "PG_OPTIONS" "-c plan_cache_mode=force_generic_plan -c jit=off -c max_parallel_workers_per_gather=0"
     Auth.init (env "JWT_SECRET" "multicore-server-challenge")
     Store.stats <- env "MC_STATS" "0" = "1"
+    Store.backlogCap <- num "BACKLOG_CAP" 150000
     // our threads wake without preempting Postgres mid-query (THREAD_SCHED=other turns it off)
     Sys.threadPolicy <- (if env "THREAD_SCHED" "batch" = "batch" then Sys.SCHED_BATCH else Sys.SCHED_OTHER)
     Store.dumpPath <- (match env "RD_DUMP" "" with "" -> null | p -> p)

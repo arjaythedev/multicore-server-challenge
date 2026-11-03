@@ -32,6 +32,12 @@ extern nativeint write(int fd, byte* buf, unativeint count)
 [<DllImport(C, SetLastError = true)>]
 extern int close(int fd)
 
+[<DllImport(C, SetLastError = true, EntryPoint = "open")>]
+extern int private open_(string path, int flags)
+
+/// a spare descriptor, given up when accept hits the fd limit
+let openDevNull () = open_ ("/dev/null", 0x80000)
+
 /// sockets use recv/send rather than read/write: they skip the VFS layer (file position lock, LSM file check)
 [<DllImport(C, SetLastError = true)>]
 extern nativeint recv(int fd, byte* buf, unativeint count, int flags)

@@ -107,6 +107,13 @@ type Lane<'T when 'T :> Job>(clockUs: int, maxBatch: int) =
             q.Enqueue j
             if (q.Count = 1 && not leader) || q.Count = maxBatch then Monitor.Pulse gate)
 
+    /// Push unless the backlog is past `cap` jobs (overload: the caller answers 503 rather than queue without bound)
+    member l.TryPush(j: 'T, cap: int) =
+        if q.Count >= cap then false
+        else
+            l.Push j
+            true
+
     member _.Take(into: List<'T>) =
         let mutable got = false
         while not got do
@@ -821,15 +828,24 @@ type private Reader(c: Conn) =
 /// lists, articles and tags (the `rd` statement) on one; comments, profiles, users and logins on the other.
 let mutable readLane: Lane<RJob> = Unchecked.defaultof<_>
 let mutable sideLane: Lane<RJob> = Unchecked.defaultof<_>
+let mutable writeLane: Lane<WJob> = Unchecked.defaultof<_>
+
+/// most jobs a lane holds before new ones are answered 503 (a few seconds of work at full load)
+let mutable backlogCap = 150000
+let private busy = Json.error 503 "overloaded"
 
 let pushRead (j: RJob) =
-    match j.Kind with
-    | RKind.Comments
-    | RKind.Profile
-    | RKind.User
-    | RKind.Login -> sideLane.Push j
-    | _ -> readLane.Push j
-let mutable writeLane: Lane<WJob> = Unchecked.defaultof<_>
+    let lane =
+        match j.Kind with
+        | RKind.Comments
+        | RKind.Profile
+        | RKind.User
+        | RKind.Login -> sideLane
+        | _ -> readLane
+    if not (lane.TryPush(j, backlogCap)) then Io.post j.Dest busy
+
+let pushWrite (j: WJob) =
+    if not (writeLane.TryPush(j, backlogCap)) then Io.post j.Dest busy
 
 [<Sealed>]
 type private Writer(c: Conn) =
