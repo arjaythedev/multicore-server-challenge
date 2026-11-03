@@ -1,8 +1,55 @@
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::os::fd::AsRawFd;
 
 use crate::auth;
 use crate::codec;
+use crate::reactor::sys;
+
+#[inline]
+fn enable_quickack(stream: &TcpStream) {
+    let one: sys::c_int = 1;
+    unsafe {
+        let _ = sys::setsockopt(
+            stream.as_raw_fd(),
+            sys::IPPROTO_TCP,
+            sys::TCP_QUICKACK,
+            &one as *const _ as *const sys::c_void,
+            std::mem::size_of::<sys::c_int>() as u32,
+        );
+    }
+}
+
+#[inline]
+fn read_into_vec(stream: &TcpStream, buf: &mut Vec<u8>, min_space: usize) -> PgResult<usize> {
+    buf.reserve(min_space.max(64 * 1024));
+    let spare = buf.spare_capacity_mut();
+    loop {
+        let n = unsafe {
+            sys::read(
+                stream.as_raw_fd(),
+                spare.as_mut_ptr() as *mut sys::c_void,
+                spare.len(),
+            )
+        };
+        if n > 0 {
+            let n = n as usize;
+            unsafe { buf.set_len(buf.len() + n) };
+            return Ok(n);
+        }
+        if n == 0 {
+            return Err(PgError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "postgres connection closed",
+            )));
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(PgError::Io(err));
+    }
+}
 
 pub const OID_INT8: u32 = 20;
 pub const OID_INT4: u32 = 23;
@@ -422,6 +469,7 @@ impl PgConn {
     pub fn connect(ep: &DbEndpoint) -> PgResult<Self> {
         let stream = TcpStream::connect((ep.host.as_str(), ep.port))?;
         stream.set_nodelay(true)?;
+        enable_quickack(&stream);
         let mut conn = PgConn {
             stream,
             rx: vec![0; 64 * 1024],
@@ -618,23 +666,48 @@ impl PgConn {
     pub fn read_pipeline_append(&mut self, expected_execs: usize, out: &mut PipelineBuf) -> PgResult<()> {
         let target_results = out.results.len() + expected_execs;
         let mut row_start = out.rows.len() as u32;
+        let mut rpos = out.data.len();
+        if self.rpos < self.rend {
+            out.data.extend_from_slice(&self.rx[self.rpos..self.rend]);
+            self.rpos = 0;
+            self.rend = 0;
+        }
         loop {
-            let (tag, body) = self.next_frame()?;
+            while out.data.len() - rpos < 5 {
+                let need = 5 - (out.data.len() - rpos);
+                read_into_vec(&self.stream, &mut out.data, need)?;
+            }
+            let tag = out.data[rpos];
+            let frame_len =
+                i32::from_be_bytes(out.data[rpos + 1..rpos + 5].try_into().unwrap()) as usize;
+            let total_frame = 1 + frame_len;
+            while out.data.len() - rpos < total_frame {
+                let need = total_frame - (out.data.len() - rpos);
+                read_into_vec(&self.stream, &mut out.data, need)?;
+            }
+            let payload_start = rpos + 5;
+            let payload_end = rpos + total_frame;
+            rpos = payload_end;
             match tag {
                 b'D' => {
-                    let ncols = u16::from_be_bytes(body[0..2].try_into().unwrap());
+                    let ncols = u16::from_be_bytes(
+                        out.data[payload_start..payload_start + 2]
+                            .try_into()
+                            .unwrap(),
+                    );
                     let col_start = out.cols.len() as u32;
-                    let mut p = 2;
+                    let mut p = payload_start + 2;
                     for _ in 0..ncols {
-                        let len = i32::from_be_bytes(body[p..p + 4].try_into().unwrap());
+                        let len = i32::from_be_bytes(out.data[p..p + 4].try_into().unwrap());
                         p += 4;
                         if len < 0 {
                             out.cols.push(Cell { offset: 0, len: -1 });
                         } else {
-                            let offset = out.data.len() as u32;
-                            out.data.extend_from_slice(&body[p..p + len as usize]);
+                            out.cols.push(Cell {
+                                offset: p as u32,
+                                len,
+                            });
                             p += len as usize;
-                            out.cols.push(Cell { offset, len });
                         }
                     }
                     out.rows.push(RowSpan {
@@ -653,10 +726,11 @@ impl PgConn {
                 }
                 b'E' => {
                     let total = out.rows.len() as u32;
+                    let err = decode_error(&out.data[payload_start..payload_end]);
                     out.results.push(ExecOutcome {
                         row_start,
                         row_count: total - row_start,
-                        error: Some(decode_error(body)),
+                        error: Some(err),
                     });
                     row_start = total;
                 }
@@ -669,6 +743,16 @@ impl PgConn {
                 b'1' | b'2' | b'3' | b'n' | b't' | b'T' | b'N' | b'S' | b'A' | b's' => {}
                 other => return Err(PgError::Wire(format!("unexpected frame {:?}", other as char))),
             }
+        }
+        if out.data.len() > rpos {
+            let rem = out.data.len() - rpos;
+            if self.rx.len() < rem {
+                self.rx.resize(rem.next_power_of_two(), 0);
+            }
+            self.rx[..rem].copy_from_slice(&out.data[rpos..]);
+            self.rpos = 0;
+            self.rend = rem;
+            out.data.truncate(rpos);
         }
         while out.results.len() < target_results {
             out.results.push(ExecOutcome {

@@ -29,7 +29,7 @@ fn main() {
 
     let io_workers: usize = env_parse("IO_THREADS", (cores / 2).max(2));
     let read_workers: usize = env_parse("READ_LANES", cores.max(4));
-    let write_workers: usize = env_parse("WRITE_LANES", 1);
+    let write_workers: usize = env_parse("WRITE_LANES", (cores / 2).clamp(2, 4));
     let crypto_workers: usize = env_parse("BCRYPT_THREADS", (cores / 2).max(3));
 
     let (auto_lanes, seed_bcrypt_us, l1d_kb) = auth::calibrate_bcrypt_hardware();
@@ -76,10 +76,11 @@ fn main() {
             .spawn(move || worker.run_loop())
             .unwrap();
     }
-    for _ in 0..crypto_workers {
+    for idx in 0..crypto_workers {
+        let is_watchdog = idx == 0;
         std::thread::Builder::new()
             .name("crypto".into())
-            .spawn(move || engine::run_crypto_worker(cfg))
+            .spawn(move || engine::run_crypto_worker(cfg, is_watchdog))
             .unwrap();
     }
 
@@ -93,6 +94,7 @@ fn main() {
                 .name("io-reactor".into())
                 .spawn(move || {
                     reactor::unshare_files();
+                    reactor::set_thread_nice(5);
                     let lfd = reactor::bind_listener(&host, bind_port).expect("failed to bind listener");
                     let srv = reactor::Reactor::new(idx as u16, lfd, signer, fd_budget)
                         .expect("failed to init epoll reactor");

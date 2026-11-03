@@ -24,7 +24,13 @@ const SHA256_K: [u32; 64] = [
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sha,sse4.1,ssse3")]
-unsafe fn compress_words_shani(state: &mut [u32; 8], w: [u32; 16]) {
+unsafe fn compress_m_shani(
+    state: &mut [u32; 8],
+    mut m0: std::arch::x86_64::__m128i,
+    mut m1: std::arch::x86_64::__m128i,
+    mut m2: std::arch::x86_64::__m128i,
+    mut m3: std::arch::x86_64::__m128i,
+) {
     unsafe {
         use std::arch::x86_64::*;
 
@@ -37,22 +43,9 @@ unsafe fn compress_words_shani(state: &mut [u32; 8], w: [u32; 16]) {
         let abef_save = abef;
         let cdgh_save = cdgh;
 
-        let load_w = |idx: usize| -> __m128i {
-            _mm_set_epi32(
-                w[idx + 3] as i32,
-                w[idx + 2] as i32,
-                w[idx + 1] as i32,
-                w[idx] as i32,
-            )
-        };
         let load_k = |idx: usize| -> __m128i {
             _mm_loadu_si128(SHA256_K.as_ptr().add(idx).cast())
         };
-
-        let mut m0 = load_w(0);
-        let mut m1 = load_w(4);
-        let mut m2 = load_w(8);
-        let mut m3 = load_w(12);
 
         macro_rules! rnd4 {
             ($m_cur:ident, $k_idx:expr) => {{
@@ -99,30 +92,75 @@ unsafe fn compress_words_shani(state: &mut [u32; 8], w: [u32; 16]) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sha,sse4.1,ssse3")]
+unsafe fn compress_words_shani(state: &mut [u32; 8], w: [u32; 16]) {
+    unsafe {
+        use std::arch::x86_64::*;
+        let ptr = w.as_ptr();
+        compress_m_shani(
+            state,
+            _mm_loadu_si128(ptr.cast()),
+            _mm_loadu_si128(ptr.add(4).cast()),
+            _mm_loadu_si128(ptr.add(8).cast()),
+            _mm_loadu_si128(ptr.add(12).cast()),
+        );
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sha,sse4.1,ssse3")]
+unsafe fn compress_block_shani(state: &mut [u32; 8], block: &[u8; 64]) {
+    unsafe {
+        use std::arch::x86_64::*;
+        let bswap = _mm_set_epi8(12, 13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3);
+        let ptr = block.as_ptr();
+        compress_m_shani(
+            state,
+            _mm_shuffle_epi8(_mm_loadu_si128(ptr.cast()), bswap),
+            _mm_shuffle_epi8(_mm_loadu_si128(ptr.add(16).cast()), bswap),
+            _mm_shuffle_epi8(_mm_loadu_si128(ptr.add(32).cast()), bswap),
+            _mm_shuffle_epi8(_mm_loadu_si128(ptr.add(48).cast()), bswap),
+        );
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
-fn compress_words(state: &mut [u32; 8], w: [u32; 16]) {
+fn has_shani() -> bool {
     #[cfg(all(
-        target_arch = "x86_64",
         target_feature = "sha",
         target_feature = "sse4.1",
         target_feature = "ssse3"
     ))]
     {
-        unsafe { compress_words_shani(state, w) };
-        return;
+        true
     }
-    #[cfg(all(
-        target_arch = "x86_64",
-        not(all(
-            target_feature = "sha",
-            target_feature = "sse4.1",
-            target_feature = "ssse3"
-        ))
-    ))]
-    if std::is_x86_feature_detected!("sha")
-        && std::is_x86_feature_detected!("sse4.1")
-        && std::is_x86_feature_detected!("ssse3")
+    #[cfg(not(all(
+        target_feature = "sha",
+        target_feature = "sse4.1",
+        target_feature = "ssse3"
+    )))]
     {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static HAS_SHANI: AtomicU8 = AtomicU8::new(0);
+        let st = HAS_SHANI.load(Ordering::Relaxed);
+        if st != 0 {
+            st == 2
+        } else {
+            let d = std::is_x86_feature_detected!("sha")
+                && std::is_x86_feature_detected!("sse4.1")
+                && std::is_x86_feature_detected!("ssse3");
+            HAS_SHANI.store(if d { 2 } else { 1 }, Ordering::Relaxed);
+            d
+        }
+    }
+}
+
+#[inline(always)]
+fn compress_words(state: &mut [u32; 8], w: [u32; 16]) {
+    #[cfg(target_arch = "x86_64")]
+    if has_shani() {
         unsafe { compress_words_shani(state, w) };
         return;
     }
@@ -196,6 +234,11 @@ fn compress_words_scalar(state: &mut [u32; 8], mut w: [u32; 16]) {
 
 #[inline(always)]
 fn compress_block(state: &mut [u32; 8], block: &[u8; 64]) {
+    #[cfg(target_arch = "x86_64")]
+    if has_shani() {
+        unsafe { compress_block_shani(state, block) };
+        return;
+    }
     let w: [u32; 16] = std::array::from_fn(|i| {
         u32::from_be_bytes([block[4 * i], block[4 * i + 1], block[4 * i + 2], block[4 * i + 3]])
     });
@@ -222,8 +265,27 @@ fn sha256_with_state(mut state: [u32; 8], prior_bytes: u64, data: &[u8]) -> [u32
     state
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn state_to_bytes_ssse3(state: &[u32; 8]) -> [u8; 32] {
+    unsafe {
+        use std::arch::x86_64::*;
+        let mut out = [0u8; 32];
+        let bswap = _mm_set_epi8(12, 13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3);
+        let s0 = _mm_shuffle_epi8(_mm_loadu_si128(state.as_ptr().cast()), bswap);
+        let s1 = _mm_shuffle_epi8(_mm_loadu_si128(state.as_ptr().add(4).cast()), bswap);
+        _mm_storeu_si128(out.as_mut_ptr().cast(), s0);
+        _mm_storeu_si128(out.as_mut_ptr().add(16).cast(), s1);
+        out
+    }
+}
+
 #[inline(always)]
 fn state_to_bytes(state: &[u32; 8]) -> [u8; 32] {
+    #[cfg(target_arch = "x86_64")]
+    if has_shani() {
+        return unsafe { state_to_bytes_ssse3(state) };
+    }
     let mut out = [0u8; 32];
     for (i, &w) in state.iter().enumerate() {
         out[4 * i..4 * i + 4].copy_from_slice(&w.to_be_bytes());
@@ -250,8 +312,30 @@ pub struct TokenSigner {
     opad_state: [u32; 8],
 }
 
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct Timespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn clock_gettime(clk_id: i32, tp: *mut Timespec) -> i32;
+}
+
+#[cfg(target_os = "linux")]
+const CLOCK_REALTIME_COARSE: i32 = 5;
+
 #[inline]
 fn unix_now_secs() -> i64 {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+        if clock_gettime(CLOCK_REALTIME_COARSE, &mut ts) == 0 {
+            return ts.tv_sec;
+        }
+    }
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -260,6 +344,13 @@ fn unix_now_secs() -> i64 {
 
 #[inline]
 fn unix_now_f64() -> f64 {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+        if clock_gettime(CLOCK_REALTIME_COARSE, &mut ts) == 0 {
+            return ts.tv_sec as f64 + (ts.tv_nsec as f64 * 1e-9);
+        }
+    }
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
@@ -396,16 +487,39 @@ fn scan_flat_claims(buf: &[u8], now: f64) -> Option<Option<i64>> {
     Some(sub_uid)
 }
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx2")]
+unsafe fn ct_eq_32_avx2(a: &[u8; 32], b: &[u8]) -> bool {
+    unsafe {
+        use std::arch::x86_64::*;
+        let va = _mm256_loadu_si256(a.as_ptr().cast());
+        let vb = _mm256_loadu_si256(b.as_ptr().cast());
+        let diff = _mm256_xor_si256(va, vb);
+        _mm256_testz_si256(diff, diff) != 0
+    }
+}
+
 #[inline(always)]
 fn ct_eq_32(a: &[u8; 32], b: &[u8]) -> bool {
     if b.len() != 32 {
         return false;
     }
-    let mut diff = 0u8;
-    for i in 0..32 {
-        diff |= a[i] ^ b[i];
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        return unsafe { ct_eq_32_avx2(a, b) };
     }
-    diff == 0
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        let a0 = u64::from_ne_bytes(a[0..8].try_into().unwrap());
+        let a1 = u64::from_ne_bytes(a[8..16].try_into().unwrap());
+        let a2 = u64::from_ne_bytes(a[16..24].try_into().unwrap());
+        let a3 = u64::from_ne_bytes(a[24..32].try_into().unwrap());
+        let b0 = u64::from_ne_bytes(b[0..8].try_into().unwrap());
+        let b1 = u64::from_ne_bytes(b[8..16].try_into().unwrap());
+        let b2 = u64::from_ne_bytes(b[16..24].try_into().unwrap());
+        let b3 = u64::from_ne_bytes(b[24..32].try_into().unwrap());
+        std::hint::black_box((a0 ^ b0) | (a1 ^ b1) | (a2 ^ b2) | (a3 ^ b3)) == 0
+    }
 }
 
 impl TokenSigner {
@@ -718,25 +832,34 @@ const _: () = assert!(std::mem::size_of::<BfState>() == 4224);
 std::arch::global_asm!(include_str!(concat!(env!("OUT_DIR"), "/bc_expand0.s")));
 
 #[cfg(target_arch = "x86_64")]
+type Cost10Fn = unsafe extern "C" fn(
+    st: *mut BfState,
+    key_p: *const [u32; 18],
+    salt_p: *const [u32; 18],
+    rounds: u64,
+    ctext: *mut [u32; 6],
+);
+
+#[cfg(target_arch = "x86_64")]
 unsafe extern "C" {
-    fn bc_expand0_ah_1(st: *mut BfState);
-    fn bc_expand0_ah_2(st: *mut BfState);
-    fn bc_expand0_ah_3(st: *mut BfState);
-    fn bc_expand0_ah_4(st: *mut BfState);
-    fn bc_expand0_ah_5(st: *mut BfState);
-    fn bc_expand0_ah_6(st: *mut BfState);
-    fn bc_expand0_bextr_1(st: *mut BfState);
-    fn bc_expand0_bextr_2(st: *mut BfState);
-    fn bc_expand0_bextr_3(st: *mut BfState);
-    fn bc_expand0_bextr_4(st: *mut BfState);
-    fn bc_expand0_bextr_5(st: *mut BfState);
-    fn bc_expand0_bextr_6(st: *mut BfState);
-    fn bc_expand0_shrx_1(st: *mut BfState);
-    fn bc_expand0_shrx_2(st: *mut BfState);
-    fn bc_expand0_shrx_3(st: *mut BfState);
-    fn bc_expand0_shrx_4(st: *mut BfState);
-    fn bc_expand0_shrx_5(st: *mut BfState);
-    fn bc_expand0_shrx_6(st: *mut BfState);
+    fn bc_cost10_ah_1(st: *mut BfState, key_p: *const [u32; 18], salt_p: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_ah_2(st: *mut BfState, key_p: *const [u32; 18], salt_p: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_ah_3(st: *mut BfState, key_p: *const [u32; 18], salt_p: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_ah_4(st: *mut BfState, key_p: *const [u32; 18], salt_p: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_ah_5(st: *mut BfState, key_p: *const [u32; 18], salt_p: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_ah_6(st: *mut BfState, key_p: *const [u32; 18], salt_p: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_bextr_1(st: *mut BfState, key_p: *const [u32; 18], salt_p: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_bextr_2(st: *mut BfState, key_p: *const [u32; 18], salt_p: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_bextr_3(st: *mut BfState, key_p: *const [u32; 18], salt_p: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_bextr_4(st: *mut BfState, key_p: *const [u32; 18], salt_p: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_bextr_5(st: *mut BfState, key_p: *const [u32; 18], salt_p: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_bextr_6(st: *mut BfState, key_p: *const [u32; 18], salt_p: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_shrx_1(st: *mut BfState, key_p: *const [u32; 18], salt_p: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_shrx_2(st: *mut BfState, key_p: *const [u32; 18], salt_p: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_shrx_3(st: *mut BfState, key_p: *const [u32; 18], salt_p: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_shrx_4(st: *mut BfState, key_p: *const [u32; 18], salt_p: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_shrx_5(st: *mut BfState, key_p: *const [u32; 18], salt_p: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_shrx_6(st: *mut BfState, key_p: *const [u32; 18], salt_p: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -760,37 +883,28 @@ pub fn active_bcrypt_kernel() -> BcryptKernel {
     }
 }
 
-#[inline(always)]
-fn xor_p_lanes<const N: usize>(st: &mut [BfState; N], xor_words: &[[u32; 18]; N]) {
-    for k in 0..N {
-        for i in 0..18 {
-            st[k].p[i] ^= xor_words[k][i];
-        }
-    }
-}
-
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-fn asm_expand0_fn<const N: usize>(kernel: BcryptKernel) -> Option<unsafe extern "C" fn(*mut BfState)> {
+fn asm_cost10_fn<const N: usize>(kernel: BcryptKernel) -> Option<Cost10Fn> {
     match (kernel, N) {
-        (BcryptKernel::Ah, 1) => Some(bc_expand0_ah_1),
-        (BcryptKernel::Ah, 2) => Some(bc_expand0_ah_2),
-        (BcryptKernel::Ah, 3) => Some(bc_expand0_ah_3),
-        (BcryptKernel::Ah, 4) => Some(bc_expand0_ah_4),
-        (BcryptKernel::Ah, 5) => Some(bc_expand0_ah_5),
-        (BcryptKernel::Ah, 6) => Some(bc_expand0_ah_6),
-        (BcryptKernel::Bextr, 1) => Some(bc_expand0_bextr_1),
-        (BcryptKernel::Bextr, 2) => Some(bc_expand0_bextr_2),
-        (BcryptKernel::Bextr, 3) => Some(bc_expand0_bextr_3),
-        (BcryptKernel::Bextr, 4) => Some(bc_expand0_bextr_4),
-        (BcryptKernel::Bextr, 5) => Some(bc_expand0_bextr_5),
-        (BcryptKernel::Bextr, 6) => Some(bc_expand0_bextr_6),
-        (BcryptKernel::Shrx, 1) => Some(bc_expand0_shrx_1),
-        (BcryptKernel::Shrx, 2) => Some(bc_expand0_shrx_2),
-        (BcryptKernel::Shrx, 3) => Some(bc_expand0_shrx_3),
-        (BcryptKernel::Shrx, 4) => Some(bc_expand0_shrx_4),
-        (BcryptKernel::Shrx, 5) => Some(bc_expand0_shrx_5),
-        (BcryptKernel::Shrx, 6) => Some(bc_expand0_shrx_6),
+        (BcryptKernel::Ah, 1) => Some(bc_cost10_ah_1),
+        (BcryptKernel::Ah, 2) => Some(bc_cost10_ah_2),
+        (BcryptKernel::Ah, 3) => Some(bc_cost10_ah_3),
+        (BcryptKernel::Ah, 4) => Some(bc_cost10_ah_4),
+        (BcryptKernel::Ah, 5) => Some(bc_cost10_ah_5),
+        (BcryptKernel::Ah, 6) => Some(bc_cost10_ah_6),
+        (BcryptKernel::Bextr, 1) => Some(bc_cost10_bextr_1),
+        (BcryptKernel::Bextr, 2) => Some(bc_cost10_bextr_2),
+        (BcryptKernel::Bextr, 3) => Some(bc_cost10_bextr_3),
+        (BcryptKernel::Bextr, 4) => Some(bc_cost10_bextr_4),
+        (BcryptKernel::Bextr, 5) => Some(bc_cost10_bextr_5),
+        (BcryptKernel::Bextr, 6) => Some(bc_cost10_bextr_6),
+        (BcryptKernel::Shrx, 1) => Some(bc_cost10_shrx_1),
+        (BcryptKernel::Shrx, 2) => Some(bc_cost10_shrx_2),
+        (BcryptKernel::Shrx, 3) => Some(bc_cost10_shrx_3),
+        (BcryptKernel::Shrx, 4) => Some(bc_cost10_shrx_4),
+        (BcryptKernel::Shrx, 5) => Some(bc_cost10_shrx_5),
+        (BcryptKernel::Shrx, 6) => Some(bc_cost10_shrx_6),
         _ => None,
     }
 }
@@ -937,49 +1051,63 @@ pub fn bcrypt_lanes_with_kernel<const N: usize>(
     let mats: [KeyMaterial; N] = std::array::from_fn(|k| KeyMaterial::from_pw_salt(inputs[k].password, &inputs[k].salt));
     let key_p: [[u32; 18]; N] = std::array::from_fn(|k| mats[k].key_p);
     let salt_p: [[u32; 18]; N] = std::array::from_fn(|k| mats[k].salt18);
-    let salt4: [[u32; 4]; N] = std::array::from_fn(|k| mats[k].salt4);
 
     let mut st: [BfState; N] = [BfState {
         p: BF_P,
         s: BF_S,
         _pad: [0; 14],
     }; N];
-
-    eks_expand::<N, true>(&mut st, &key_p, &salt4);
+    let mut ctext: [[u32; 6]; N] = [BCRYPT_CTEXT; N];
     let rounds = 1u64 << cost;
+
     #[cfg(target_arch = "x86_64")]
-    if let Some(expand0) = asm_expand0_fn::<N>(kernel) {
-        let base_ptr = st.as_mut_ptr();
-        for _ in 0..rounds {
-            xor_p_lanes(&mut st, &key_p);
-            unsafe { expand0(base_ptr) };
-            xor_p_lanes(&mut st, &salt_p);
-            unsafe { expand0(base_ptr) };
+    if let Some(cost10_fn) = asm_cost10_fn::<N>(kernel) {
+        unsafe {
+            cost10_fn(
+                st.as_mut_ptr(),
+                key_p.as_ptr(),
+                salt_p.as_ptr(),
+                rounds,
+                ctext.as_mut_ptr(),
+            );
         }
     } else {
+        let salt4: [[u32; 4]; N] = std::array::from_fn(|k| mats[k].salt4);
+        eks_expand::<N, true>(&mut st, &key_p, &salt4);
         for _ in 0..rounds {
             eks_expand::<N, false>(&mut st, &key_p, &salt4);
             eks_expand::<N, false>(&mut st, &salt_p, &salt4);
+        }
+        for _ in 0..64 {
+            for blk in 0..3 {
+                let mut l: [u32; N] = std::array::from_fn(|k| ctext[k][2 * blk]);
+                let mut r: [u32; N] = std::array::from_fn(|k| ctext[k][2 * blk + 1]);
+                encipher_lanes(&st, &mut l, &mut r);
+                for k in 0..N {
+                    ctext[k][2 * blk] = l[k];
+                    ctext[k][2 * blk + 1] = r[k];
+                }
+            }
         }
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
         let _ = kernel;
+        let salt4: [[u32; 4]; N] = std::array::from_fn(|k| mats[k].salt4);
+        eks_expand::<N, true>(&mut st, &key_p, &salt4);
         for _ in 0..rounds {
             eks_expand::<N, false>(&mut st, &key_p, &salt4);
             eks_expand::<N, false>(&mut st, &salt_p, &salt4);
         }
-    }
-
-    let mut ctext: [[u32; 6]; N] = [BCRYPT_CTEXT; N];
-    for _ in 0..64 {
-        for blk in 0..3 {
-            let mut l: [u32; N] = std::array::from_fn(|k| ctext[k][2 * blk]);
-            let mut r: [u32; N] = std::array::from_fn(|k| ctext[k][2 * blk + 1]);
-            encipher_lanes(&st, &mut l, &mut r);
-            for k in 0..N {
-                ctext[k][2 * blk] = l[k];
-                ctext[k][2 * blk + 1] = r[k];
+        for _ in 0..64 {
+            for blk in 0..3 {
+                let mut l: [u32; N] = std::array::from_fn(|k| ctext[k][2 * blk]);
+                let mut r: [u32; N] = std::array::from_fn(|k| ctext[k][2 * blk + 1]);
+                encipher_lanes(&st, &mut l, &mut r);
+                for k in 0..N {
+                    ctext[k][2 * blk] = l[k];
+                    ctext[k][2 * blk + 1] = r[k];
+                }
             }
         }
     }
@@ -1172,11 +1300,11 @@ pub fn format_bcrypt(cost: u32, salt: &[u8; 16], digest: &[u8; 23]) -> String {
 
 #[inline]
 pub fn ct_digest_eq(a: &[u8; 23], b: &[u8; 23]) -> bool {
-    let mut diff = 0u8;
-    for i in 0..23 {
-        diff |= a[i] ^ b[i];
-    }
-    diff == 0
+    let a0 = u128::from_ne_bytes(a[0..16].try_into().unwrap());
+    let b0 = u128::from_ne_bytes(b[0..16].try_into().unwrap());
+    let a1 = u64::from_ne_bytes(a[15..23].try_into().unwrap());
+    let b1 = u64::from_ne_bytes(b[15..23].try_into().unwrap());
+    std::hint::black_box(((a0 ^ b0) != 0) | ((a1 ^ b1) != 0)) == false
 }
 
 #[cfg(test)]
