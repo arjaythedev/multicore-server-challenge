@@ -232,6 +232,7 @@ pub enum BindParam<'a> {
     I64Slice(&'a [i64]),
     I32Slice(&'a [i32]),
     TextSlice(&'a [String]),
+    SmallStrSlice(&'a [crate::codec::SmallStr]),
 }
 
 #[inline]
@@ -278,6 +279,15 @@ impl BindParam<'_> {
                 for s in *items {
                     dst.extend_from_slice(&(s.len() as i32).to_be_bytes());
                     dst.extend_from_slice(s.as_bytes());
+                }
+            }
+            BindParam::SmallStrSlice(items) => {
+                let payload: usize = items.iter().map(|s| 4 + s.len()).sum();
+                write_array_header(dst, 20 + payload, OID_TEXT, items.len());
+                for s in *items {
+                    let b = s.as_bytes();
+                    dst.extend_from_slice(&(b.len() as i32).to_be_bytes());
+                    dst.extend_from_slice(b);
                 }
             }
         }

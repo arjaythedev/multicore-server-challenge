@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::auth::{self, BcryptInput, TokenSigner};
-use crate::codec;
+use crate::codec::{self, SmallStr};
 use crate::queries;
 use crate::reactor::{self, OutgoingReply, ReplyAddr, ReplyBody};
 use crate::router::{Timestamped, WorkQueue};
@@ -16,15 +16,15 @@ use crate::wire::{
 pub enum ReadOp {
     Tags,
     CurrentUser { id: i64, token: String },
-    Login { email: String, password: Vec<u8> },
-    Profile { username: String },
-    ArticleBySlug { slug: String },
+    Login { email: SmallStr, password: Vec<u8> },
+    Profile { username: SmallStr },
+    ArticleBySlug { slug: SmallStr },
     ArticleById { id: i64 },
-    Comments { slug: String },
+    Comments { slug: SmallStr },
     Global { lim: i64, off: i64 },
-    ByTag { tag: String, lim: i64, off: i64 },
-    ByAuthor { username: String, lim: i64, off: i64 },
-    ByFavorited { username: String, lim: i64, off: i64 },
+    ByTag { tag: SmallStr, lim: i64, off: i64 },
+    ByAuthor { username: SmallStr, lim: i64, off: i64 },
+    ByFavorited { username: SmallStr, lim: i64, off: i64 },
     Feed { lim: i64, off: i64 },
 }
 
@@ -44,24 +44,24 @@ impl Timestamped for ReadTask {
 
 pub enum WriteOp {
     Register {
-        username: String,
-        email: String,
+        username: SmallStr,
+        email: SmallStr,
         hash: String,
     },
     UpdateUser {
         token: String,
-        email: Option<String>,
-        username: Option<String>,
+        email: Option<SmallStr>,
+        username: Option<SmallStr>,
         hash: Option<String>,
         bio: Option<String>,
         image: Option<String>,
     },
     Follow {
-        username: String,
+        username: SmallStr,
         on: bool,
     },
     Favorite {
-        slug: String,
+        slug: SmallStr,
         on: bool,
     },
     CreateArticle {
@@ -71,20 +71,20 @@ pub enum WriteOp {
         tags: Vec<String>,
     },
     UpdateArticle {
-        slug: String,
+        slug: SmallStr,
         title: Option<String>,
         description: Option<String>,
         body: Option<String>,
     },
     DeleteArticle {
-        slug: String,
+        slug: SmallStr,
     },
     CreateComment {
-        slug: String,
+        slug: SmallStr,
         body: String,
     },
     DeleteComment {
-        slug: String,
+        slug: SmallStr,
         id: i64,
     },
 }
@@ -160,15 +160,13 @@ static BUSY_CRYPTO_WORKERS: AtomicUsize = AtomicUsize::new(0);
 static EWMA_BCRYPT_US: AtomicUsize = AtomicUsize::new(0);
 static EWMA_CRYPTO_LEN: AtomicUsize = AtomicUsize::new(0);
 static LAST_CRYPTO_DONE_US: AtomicUsize = AtomicUsize::new(0);
-static MONO_BOOT: OnceLock<Instant> = OnceLock::new();
 
 pub static WRITE_QUEUE: WorkQueue<WriteTask> = WorkQueue::new();
 pub static CRYPTO_QUEUE: WorkQueue<CryptoTask> = WorkQueue::new();
 
 #[inline]
 fn mono_micros() -> usize {
-    let base = MONO_BOOT.get_or_init(Instant::now);
-    base.elapsed().as_micros() as usize
+    auth::mono_micros()
 }
 
 #[inline]
@@ -181,6 +179,11 @@ pub fn lane_for_op(op: &ReadOp) -> usize {
 }
 
 #[inline]
+pub fn read_op_lane(op: &ReadOp) -> usize {
+    lane_for_op(op)
+}
+
+#[inline]
 pub fn wake_read_dispatcher(lane: usize) {
     if COALESCING_LANE[lane].load(Ordering::SeqCst) == 0 && WAITING_READ_WORKERS.load(Ordering::SeqCst) > 0 {
         let _g = BATCH_LOCK.lock().unwrap();
@@ -189,16 +192,18 @@ pub fn wake_read_dispatcher(lane: usize) {
 }
 
 #[inline]
-pub fn enqueue_read_task(task: ReadTask) {
+pub fn enqueue_read_front(task: ReadTask) {
     let lane = lane_for_op(&task.op);
-    READ_LANES[lane].push(task);
+    READ_LANES[lane].push_front(task);
     wake_read_dispatcher(lane);
 }
 
 #[inline]
-pub fn enqueue_read_front(task: ReadTask) {
-    let lane = lane_for_op(&task.op);
-    READ_LANES[lane].push_front(task);
+pub fn enqueue_read_batch_lane(lane: usize, batch: &mut Vec<ReadTask>, _now: Instant) {
+    if batch.is_empty() {
+        return;
+    }
+    READ_LANES[lane].push_batch(batch);
     wake_read_dispatcher(lane);
 }
 
@@ -224,7 +229,6 @@ pub struct RuntimeConfig {
 }
 
 pub fn seed_hardware_ewma(batch_us: usize, bcrypt_us: usize) {
-    let _ = MONO_BOOT.get_or_init(Instant::now);
     for slot in &EWMA_LANE_US {
         slot.store(batch_us, Ordering::Relaxed);
     }
@@ -236,6 +240,7 @@ type FastMap<K, V> = HashMap<K, V, codec::HwBuildHasher>;
 struct KeySet<K: Hash + Eq + Clone> {
     index: FastMap<K, u32>,
     items: Vec<K>,
+    counts: Vec<u32>,
 }
 
 impl<K: Hash + Eq + Clone> KeySet<K> {
@@ -243,6 +248,7 @@ impl<K: Hash + Eq + Clone> KeySet<K> {
         KeySet {
             index: FastMap::default(),
             items: Vec::new(),
+            counts: Vec::new(),
         }
     }
 
@@ -250,17 +256,25 @@ impl<K: Hash + Eq + Clone> KeySet<K> {
     fn clear(&mut self) {
         self.index.clear();
         self.items.clear();
+        self.counts.clear();
     }
 
     #[inline]
     fn intern(&mut self, key: K) -> u32 {
         if let Some(&idx) = self.index.get(&key) {
+            self.counts[idx as usize] += 1;
             return idx;
         }
         let idx = self.items.len() as u32;
         self.index.insert(key.clone(), idx);
         self.items.push(key);
+        self.counts.push(1);
         idx
+    }
+
+    #[inline]
+    fn count(&self, idx: u32) -> u32 {
+        self.counts.get(idx as usize).copied().unwrap_or(0)
     }
 
     #[inline]
@@ -269,16 +283,18 @@ impl<K: Hash + Eq + Clone> KeySet<K> {
     }
 }
 
-impl KeySet<String> {
+impl KeySet<SmallStr> {
     #[inline]
-    fn intern_str(&mut self, key: &str) -> u32 {
-        if let Some(&idx) = self.index.get(key) {
+    fn intern_small(&mut self, key: &SmallStr) -> u32 {
+        if let Some(&idx) = self.index.get(key.as_bytes()) {
+            self.counts[idx as usize] += 1;
             return idx;
         }
         let idx = self.items.len() as u32;
-        let owned = key.to_owned();
+        let owned = key.clone();
         self.index.insert(owned.clone(), idx);
         self.items.push(owned);
+        self.counts.push(1);
         idx
     }
 }
@@ -305,7 +321,7 @@ fn map_rows_by_i64_into(
 fn map_rows_by_str_into(
     pipe: &PipelineBuf,
     res_idx: Option<usize>,
-    keys: &KeySet<String>,
+    keys: &KeySet<SmallStr>,
     col: usize,
     out: &mut Vec<Option<wire::RowSpan>>,
 ) {
@@ -315,10 +331,8 @@ fn map_rows_by_str_into(
         for &span in pipe.result_rows(idx) {
             let r = pipe.row(span);
             if let Some(raw) = pipe.bytes(r[col]) {
-                if let Ok(s) = std::str::from_utf8(raw) {
-                    if let Some(&ord) = keys.index.get(s) {
-                        out[ord as usize] = Some(span);
-                    }
+                if let Some(&ord) = keys.index.get(raw) {
+                    out[ord as usize] = Some(span);
                 }
             }
         }
@@ -444,14 +458,17 @@ struct ReadRenderScratch {
     rendered_slugs: Vec<Option<ReplyBody>>,
     rendered_global: Vec<Option<ReplyBody>>,
     rendered_filters: [Vec<Option<ReplyBody>>; 3],
-    gz_scratch: Vec<u8>,
     global_counts: Vec<i64>,
     global_pages: Vec<ArticlePage>,
+    global_win_buf: ArticlePage,
     filter_counts: [Vec<i64>; 3],
     filter_pages: [Vec<ArticlePage>; 3],
     feed_counts: Vec<i64>,
     feed_pages: Vec<ArticlePage>,
     raw_pages: Vec<Vec<(i64, i64, wire::RowSpan)>>,
+    early_replies: Vec<OutgoingReply>,
+    replies: Vec<OutgoingReply>,
+    login_tasks: Vec<CryptoTask>,
 }
 
 impl ReadRenderScratch {
@@ -472,20 +489,23 @@ impl ReadRenderScratch {
             rendered_slugs: Vec::with_capacity(64),
             rendered_global: Vec::with_capacity(16),
             rendered_filters: [Vec::with_capacity(32), Vec::with_capacity(32), Vec::with_capacity(32)],
-            gz_scratch: Vec::with_capacity(64 * 1024),
             global_counts: Vec::with_capacity(4),
             global_pages: Vec::with_capacity(16),
+            global_win_buf: Vec::with_capacity(200),
             filter_counts: [Vec::with_capacity(32), Vec::with_capacity(32), Vec::with_capacity(32)],
             filter_pages: [Vec::with_capacity(32), Vec::with_capacity(32), Vec::with_capacity(32)],
             feed_counts: Vec::with_capacity(64),
             feed_pages: Vec::with_capacity(64),
             raw_pages: Vec::with_capacity(64),
+            early_replies: Vec::with_capacity(128),
+            replies: Vec::with_capacity(512),
+            login_tasks: Vec::with_capacity(32),
         }
     }
 }
 
 struct FilterDedup {
-    counts: KeySet<String>,
+    counts: KeySet<SmallStr>,
     pages: KeySet<(u32, i64, i64)>,
 }
 
@@ -514,26 +534,37 @@ struct ArticleRef {
 
 type ArticlePage = Vec<ArticleRef>;
 
+#[inline(always)]
+fn pack_pair(viewer: i64, target: i64) -> u64 {
+    ((viewer as u64) << 32) | (target as u32 as u64)
+}
+
 fn build_flag_runs(
-    pairs: &mut Vec<(i64, i64)>,
+    pairs: &mut Vec<u64>,
     viewers: &mut Vec<i64>,
     targets: &mut Vec<i64>,
     starts: &mut Vec<i32>,
     ends: &mut Vec<i32>,
 ) {
+    if pairs.is_empty() {
+        viewers.clear();
+        targets.clear();
+        starts.clear();
+        ends.clear();
+        return;
+    }
     pairs.sort_unstable();
     pairs.dedup();
     viewers.clear();
     targets.clear();
     starts.clear();
     ends.clear();
-    if pairs.is_empty() {
-        return;
-    }
     targets.reserve(pairs.len());
-    let mut cur_v = pairs[0].0;
+    let mut cur_v = (pairs[0] >> 32) as i32 as i64;
     let mut run_start = 1i32;
-    for (idx, &(v, t)) in pairs.iter().enumerate() {
+    for (idx, &p) in pairs.iter().enumerate() {
+        let v = (p >> 32) as i32 as i64;
+        let t = (p as u32) as i32 as i64;
         if v != cur_v {
             viewers.push(cur_v);
             starts.push(run_start);
@@ -680,11 +711,11 @@ pub struct ReadWorker {
     arena: Vec<u8>,
     batch_tags: Vec<wire::Cell>,
     k_uid: KeySet<i64>,
-    k_uemail: KeySet<String>,
-    k_prof: KeySet<(i64, String)>,
-    k_slug: KeySet<String>,
+    k_uemail: KeySet<SmallStr>,
+    k_prof: KeySet<(i64, SmallStr)>,
+    k_slug: KeySet<SmallStr>,
     k_aid: KeySet<i64>,
-    k_cmts: KeySet<String>,
+    k_cmts: KeySet<SmallStr>,
     k_cmt_viewers: KeySet<(i64, i64)>,
     k_cmt_authors: KeySet<i64>,
     k_global: KeySet<(i64, i64)>,
@@ -700,8 +731,8 @@ pub struct ReadWorker {
     art_meta: Vec<MetaSource>,
     meta_req_ids: Vec<i64>,
     author_spans: Vec<Option<wire::RowSpan>>,
-    fav_pairs: Vec<(i64, i64)>,
-    foll_pairs: Vec<(i64, i64)>,
+    fav_pairs: Vec<u64>,
+    foll_pairs: Vec<u64>,
     fav_viewers: Vec<i64>,
     fav_targets: Vec<i64>,
     fav_starts: Vec<i32>,
@@ -710,8 +741,8 @@ pub struct ReadWorker {
     foll_targets: Vec<i64>,
     foll_starts: Vec<i32>,
     foll_ends: Vec<i32>,
-    fav_hits: Vec<(i64, i64)>,
-    foll_hits: Vec<(i64, i64)>,
+    fav_hits: Vec<u64>,
+    foll_hits: Vec<u64>,
     cached_arts: Vec<CachedArticleSlices>,
     feed_depths: Vec<i64>,
     enc_a: ArrayEncoder,
@@ -841,14 +872,14 @@ impl ReadWorker {
             let leftover = READ_LANES[lane].try_take_aged(want, max_age, cap, &mut tasks);
             LAST_DRAIN_US[lane].store(mono_micros(), Ordering::Relaxed);
             COALESCING_LANE[lane].store(0, Ordering::SeqCst);
-            if leftover > 0 || READ_LANES[lane].peek_state().0 > 0 {
+            if leftover > 0 || READ_LANES[lane].approx_len() > 0 {
                 wake_read_dispatcher(lane);
             }
 
             expired_replies.clear();
             tasks.retain(|t| check_task_alive_and_fresh(t.addr, t.enqueued_at, &mut expired_replies));
             if !expired_replies.is_empty() {
-                reactor::complete_batch(std::mem::take(&mut expired_replies));
+                reactor::complete_batch(&mut expired_replies);
             }
             if tasks.is_empty() {
                 INFLIGHT_LANE[lane].fetch_sub(1, Ordering::AcqRel);
@@ -890,12 +921,13 @@ impl ReadWorker {
             if let Err(err) = res {
                 eprintln!("read batch error: {err}");
                 self.conn = None;
-                reactor::complete_batch(
+                expired_replies.clear();
+                expired_replies.extend(
                     err_addrs
                         .drain(..)
-                        .map(|a| reactor::error_reply(a, 500, "internal server error"))
-                        .collect(),
+                        .map(|a| reactor::error_reply(a, 500, "internal server error")),
                 );
+                reactor::complete_batch(&mut expired_replies);
             }
         }
     }
@@ -904,7 +936,7 @@ impl ReadWorker {
         err_addrs.clear();
         err_addrs.extend(tasks.iter().map(|t| t.addr));
 
-        let mut need_tags_endpoint = false;
+        let mut tags_count = 0u32;
         self.batch_tags.fill(wire::Cell { offset: 0, len: -1 });
         self.k_uid.clear();
         self.k_uemail.clear();
@@ -925,16 +957,16 @@ impl ReadWorker {
         for t in tasks.iter() {
             let slot = match &t.op {
                 ReadOp::Tags => {
-                    need_tags_endpoint = true;
+                    tags_count += 1;
                     PlanSlot::Tags
                 }
                 ReadOp::CurrentUser { id, .. } => PlanSlot::User(self.k_uid.intern(*id)),
-                ReadOp::Login { email, .. } => PlanSlot::Login(self.k_uemail.intern_str(email)),
+                ReadOp::Login { email, .. } => PlanSlot::Login(self.k_uemail.intern_small(email)),
                 ReadOp::Profile { username } => PlanSlot::Profile(self.k_prof.intern((t.viewer, username.clone()))),
-                ReadOp::ArticleBySlug { slug } => PlanSlot::BySlug(self.k_slug.intern_str(slug)),
+                ReadOp::ArticleBySlug { slug } => PlanSlot::BySlug(self.k_slug.intern_small(slug)),
                 ReadOp::ArticleById { id } => PlanSlot::ById(self.k_aid.intern(*id)),
                 ReadOp::Comments { slug } => {
-                    let k = self.k_cmts.intern_str(slug);
+                    let k = self.k_cmts.intern_small(slug);
                     if t.viewer > 0 {
                         self.k_cmt_viewers.intern((t.viewer, k as i64 + 1));
                     }
@@ -958,7 +990,7 @@ impl ReadWorker {
                         _ => 2,
                     };
                     let fd = &mut self.k_filters[kind];
-                    let c_ord = fd.counts.intern_str(key);
+                    let c_ord = fd.counts.intern_small(key);
                     let p_ord = fd.pages.intern((c_ord, *lim, *off));
                     PlanSlot::Filtered(kind, c_ord, p_ord)
                 }
@@ -971,6 +1003,7 @@ impl ReadWorker {
             self.plan.push(slot);
         }
 
+        let need_tags_endpoint = tags_count > 0;
         let touches_articles = self.k_slug.len()
             + self.k_aid.len()
             + self.k_global.len()
@@ -1017,7 +1050,7 @@ impl ReadWorker {
                 tx.bind_and_exec("uid", &[BindParam::I64Slice(&self.k_uid.items)]);
             }
             if st_uemail.is_some() {
-                tx.bind_and_exec("uemail", &[BindParam::TextSlice(&self.k_uemail.items)]);
+                tx.bind_and_exec("uemail", &[BindParam::SmallStrSlice(&self.k_uemail.items)]);
             }
             if st_prof.is_some() {
                 self.enc_a.reset(OID_INT8, self.k_prof.items.len());
@@ -1051,7 +1084,7 @@ impl ReadWorker {
         }
         if n_phase_a2 > 0 {
             if st_slug.is_some() {
-                tx.bind_and_exec("aslug", &[BindParam::TextSlice(&self.k_slug.items)]);
+                tx.bind_and_exec("aslug", &[BindParam::SmallStrSlice(&self.k_slug.items)]);
             }
             if st_aid.is_some() {
                 tx.bind_and_exec("aid", &[BindParam::I64Slice(&self.k_aid.items)]);
@@ -1066,7 +1099,7 @@ impl ReadWorker {
                 tx.bind_and_exec(
                     "cmts",
                     &[
-                        BindParam::TextSlice(&self.k_cmts.items),
+                        BindParam::SmallStrSlice(&self.k_cmts.items),
                         BindParam::Raw(self.enc_a.finish()),
                         BindParam::Raw(self.enc_b.finish()),
                     ],
@@ -1105,7 +1138,7 @@ impl ReadWorker {
                     tx.bind_and_exec(
                         FILTER_STMT_NAMES[i],
                         &[
-                            BindParam::TextSlice(&fd.counts.items),
+                            BindParam::SmallStrSlice(&fd.counts.items),
                             BindParam::Raw(self.enc_a.finish()),
                             BindParam::Raw(self.enc_b.finish()),
                             BindParam::Raw(self.enc_c.finish()),
@@ -1187,7 +1220,11 @@ impl ReadWorker {
                         codec::write_str(&mut buf, self.pa.bytes(self.pa.row(span)[1]).unwrap_or(b""));
                     }
                     buf.extend_from_slice(b"]}");
-                    rendered_tags = Some(ReplyBody::from_shared(buf, &mut self.rr.gz_scratch));
+                    rendered_tags = Some(if tags_count > 1 {
+                        ReplyBody::Shared(buf.into())
+                    } else {
+                        ReplyBody::Owned(buf)
+                    });
                 }
             }
             let pa = &self.pa;
@@ -1210,18 +1247,24 @@ impl ReadWorker {
             let uemail_rows = &self.rr.uemail_rows;
             let prof_rows = &self.rr.prof_rows;
             let rendered_profiles = &mut self.rr.rendered_profiles;
-            let mut early_replies: Vec<OutgoingReply> = Vec::new();
-            let mut login_tasks: Vec<CryptoTask> = Vec::new();
+            let early_replies = &mut self.rr.early_replies;
+            let login_tasks = &mut self.rr.login_tasks;
+            early_replies.clear();
+            login_tasks.clear();
 
             if need_tags_endpoint || st_uid.is_some() || st_uemail.is_some() || st_prof.is_some() {
                 for (task, &slot) in tasks.iter_mut().zip(self.plan.iter()) {
                     match slot {
                         PlanSlot::Tags => {
-                            let shared = rendered_tags.as_ref().unwrap().clone();
+                            let body = if tags_count == 1 {
+                                rendered_tags.take().unwrap()
+                            } else {
+                                rendered_tags.as_ref().unwrap().clone()
+                            };
                             early_replies.push(OutgoingReply {
                                 addr: task.addr,
                                 status: 200,
-                                body: shared,
+                                body,
                             });
                         }
                         PlanSlot::User(k) => {
@@ -1298,13 +1341,21 @@ impl ReadWorker {
                                             following,
                                         );
                                         body.push(b'}');
-                                        let arc: Arc<[u8]> = body.into();
-                                        rendered_profiles[k as usize] = Some(arc.clone());
-                                        early_replies.push(OutgoingReply {
-                                            addr: task.addr,
-                                            status: 200,
-                                            body: ReplyBody::Shared(arc),
-                                        });
+                                        if self.k_prof.count(k) > 1 {
+                                            let arc: Arc<[u8]> = body.into();
+                                            rendered_profiles[k as usize] = Some(arc.clone());
+                                            early_replies.push(OutgoingReply {
+                                                addr: task.addr,
+                                                status: 200,
+                                                body: ReplyBody::Shared(arc),
+                                            });
+                                        } else {
+                                            early_replies.push(OutgoingReply {
+                                                addr: task.addr,
+                                                status: 200,
+                                                body: ReplyBody::Owned(body),
+                                            });
+                                        }
                                     }
                                 }
                                 None => early_replies.push(reactor::error_reply(task.addr, 404, "profile not found")),
@@ -1315,7 +1366,7 @@ impl ReadWorker {
                 }
             }
             if !login_tasks.is_empty() {
-                CRYPTO_QUEUE.push_batch(&mut login_tasks);
+                CRYPTO_QUEUE.push_batch(login_tasks);
             }
             if !early_replies.is_empty() {
                 reactor::complete_batch(early_replies);
@@ -1356,7 +1407,9 @@ impl ReadWorker {
         self.rr.cmt_author_spans.clear();
         self.fav_hits.clear();
         self.foll_hits.clear();
-        let mut cmt_foll_viewer_mask = 0u64;
+        let mut flagged_viewer_bits = [0u64; 8];
+        let mut fav_pair_bits = [0u64; 32];
+        let mut foll_pair_bits = [0u64; 32];
         if let Some(idx) = st_cmts {
             let key_count = self.k_cmts.len();
             for (row_idx, &span) in pa.result_rows(idx).iter().enumerate() {
@@ -1378,9 +1431,10 @@ impl ReadWorker {
                     }
                     2 => {
                         let (viewer_id, target_id) = (pa.i64(r[1]), pa.i64(r[2]));
-                        let bit = 1u64 << ((viewer_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58);
-                        cmt_foll_viewer_mask |= bit;
-                        self.foll_hits.push((viewer_id, target_id));
+                        set_viewer_bit(&mut flagged_viewer_bits, viewer_id);
+                        let packed = pack_pair(viewer_id, target_id);
+                        set_pair_bit(&mut foll_pair_bits, packed);
+                        self.foll_hits.push(packed);
                     }
                     _ => {}
                 }
@@ -1412,11 +1466,9 @@ impl ReadWorker {
             for &span in pa.result_rows(idx) {
                 let r = pa.row(span);
                 if let Some(raw) = pa.bytes(r[3]) {
-                    if let Ok(s) = std::str::from_utf8(raw) {
-                        if let Some(&ord) = self.k_slug.index.get(s) {
-                            self.rr.slug_rows[ord as usize] =
-                                Some(intern_art(pa.i64(r[1]), pa.i64(r[2]), span, MetaSource::PhaseA(span)));
-                        }
+                    if let Some(&ord) = self.k_slug.index.get(raw) {
+                        self.rr.slug_rows[ord as usize] =
+                            Some(intern_art(pa.i64(r[1]), pa.i64(r[2]), span, MetaSource::PhaseA(span)));
                     }
                 }
             }
@@ -1508,7 +1560,11 @@ impl ReadWorker {
                 &mut self.rr.global_counts,
                 &mut self.rr.global_pages,
             );
-            let win = self.rr.global_pages.pop().unwrap_or_default();
+            let win = &mut self.rr.global_win_buf;
+            win.clear();
+            if let Some(first_p) = self.rr.global_pages.first_mut() {
+                std::mem::swap(win, first_p);
+            }
             let n_g = self.k_global.items.len();
             for p in self.rr.global_pages.iter_mut() {
                 p.clear();
@@ -1576,41 +1632,41 @@ impl ReadWorker {
             match *slot {
                 PlanSlot::BySlug(k) => {
                     if let Some(art) = slug_rows[k as usize] {
-                        self.fav_pairs.push((viewer, art.aid));
-                        self.foll_pairs.push((viewer, art.author));
+                        self.fav_pairs.push(pack_pair(viewer, art.aid));
+                        self.foll_pairs.push(pack_pair(viewer, art.author));
                     }
                 }
                 PlanSlot::ById(k) => {
                     if let Some(art) = aid_rows[k as usize] {
-                        self.fav_pairs.push((viewer, art.aid));
-                        self.foll_pairs.push((viewer, art.author));
+                        self.fav_pairs.push(pack_pair(viewer, art.aid));
+                        self.foll_pairs.push(pack_pair(viewer, art.author));
                     }
                 }
                 PlanSlot::Global(p) => {
                     for &art in &global_pages[p as usize] {
-                        self.fav_pairs.push((viewer, art.aid));
-                        self.foll_pairs.push((viewer, art.author));
+                        self.fav_pairs.push(pack_pair(viewer, art.aid));
+                        self.foll_pairs.push(pack_pair(viewer, art.author));
                     }
                 }
                 PlanSlot::Filtered(kind, _, p) => {
                     let rows = &filter_pages[kind][p as usize];
                     if kind == 1 {
                         if let Some(&first) = rows.first() {
-                            self.foll_pairs.push((viewer, first.author));
+                            self.foll_pairs.push(pack_pair(viewer, first.author));
                         }
                         for &art in rows {
-                            self.fav_pairs.push((viewer, art.aid));
+                            self.fav_pairs.push(pack_pair(viewer, art.aid));
                         }
                     } else {
                         for &art in rows {
-                            self.fav_pairs.push((viewer, art.aid));
-                            self.foll_pairs.push((viewer, art.author));
+                            self.fav_pairs.push(pack_pair(viewer, art.aid));
+                            self.foll_pairs.push(pack_pair(viewer, art.author));
                         }
                     }
                 }
                 PlanSlot::Feed(_, p) => {
                     for &art in &feed_pages[p as usize] {
-                        self.fav_pairs.push((viewer, art.aid));
+                        self.fav_pairs.push(pack_pair(viewer, art.aid));
                     }
                 }
                 PlanSlot::Comments(_)
@@ -1722,8 +1778,6 @@ impl ReadWorker {
         let pa = &self.pa;
         let pb = &self.pb;
         let arena = &mut self.arena;
-        let mut fav_viewer_mask = 0u64;
-        let mut foll_viewer_mask = cmt_foll_viewer_mask;
         let mut tag_sort_buf: Vec<&[u8]> = Vec::with_capacity(8);
 
         if n_phase_b > 0 {
@@ -1857,19 +1911,22 @@ impl ReadWorker {
                 for &span in pb.result_rows(s) {
                     let r = pb.row(span);
                     let (kind, viewer_id, target_id) = (pb.i64(r[0]), pb.i64(r[1]), pb.i64(r[2]));
-                    let bit = 1u64 << ((viewer_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58);
+                    set_viewer_bit(&mut flagged_viewer_bits, viewer_id);
+                    let packed = pack_pair(viewer_id, target_id);
                     if kind == 0 {
-                        fav_viewer_mask |= bit;
-                        self.fav_hits.push((viewer_id, target_id));
+                        set_pair_bit(&mut fav_pair_bits, packed);
+                        self.fav_hits.push(packed);
                     } else {
-                        foll_viewer_mask |= bit;
-                        self.foll_hits.push((viewer_id, target_id));
+                        set_pair_bit(&mut foll_pair_bits, packed);
+                        self.foll_hits.push(packed);
                     }
                 }
-                self.fav_hits.sort_unstable();
+                if self.fav_hits.len() > 1 {
+                    self.fav_hits.sort_unstable();
+                }
             }
         }
-        if !self.foll_hits.is_empty() {
+        if self.foll_hits.len() > 1 {
             self.foll_hits.sort_unstable();
         }
 
@@ -1934,8 +1991,9 @@ impl ReadWorker {
             arena,
             fav_hits: &self.fav_hits,
             foll_hits: &self.foll_hits,
-            fav_viewer_mask,
-            foll_viewer_mask,
+            flagged_viewer_bits,
+            fav_pair_bits,
+            foll_pair_bits,
         };
 
         self.rr.rendered_slugs.clear();
@@ -1954,14 +2012,14 @@ impl ReadWorker {
         let rendered_slugs = &mut self.rr.rendered_slugs;
         let rendered_global = &mut self.rr.rendered_global;
         let rendered_filters = &mut self.rr.rendered_filters;
-        let gz_scratch = &mut self.rr.gz_scratch;
         let global_counts = &self.rr.global_counts;
         let global_pages = &self.rr.global_pages;
         let filter_counts = &self.rr.filter_counts;
         let filter_pages = &self.rr.filter_pages;
         let feed_counts = &self.rr.feed_counts;
         let feed_pages = &self.rr.feed_pages;
-        let mut replies: Vec<OutgoingReply> = Vec::with_capacity(tasks.len());
+        let replies = &mut self.rr.replies;
+        replies.clear();
 
         for (task, &slot) in tasks.drain(..).zip(self.plan.iter()) {
             let viewer = task.viewer;
@@ -1973,8 +2031,8 @@ impl ReadWorker {
                         replies.push(reactor::error_reply(addr, 404, "article not found"));
                         continue;
                     };
-                    let unflagged = render_ctx.is_article_unflagged(art, viewer);
-                    if unflagged {
+                    let shareable = self.k_slug.count(k) > 1 && render_ctx.is_article_unflagged(art, viewer);
+                    if shareable {
                         if let Some(shared) = &rendered_slugs[k as usize] {
                             replies.push(OutgoingReply {
                                 addr,
@@ -1986,14 +2044,21 @@ impl ReadWorker {
                     }
                     let mut body = Vec::with_capacity(2048);
                     body.extend_from_slice(b"{\"article\":");
-                    if render_ctx.write_article(&mut body, pa, art, true, viewer, false) {
+                    if render_ctx.write_article(
+                        &mut body,
+                        pa,
+                        art,
+                        true,
+                        if shareable { 0 } else { viewer },
+                        false,
+                    ) {
                         body.push(b'}');
-                        let reply_body = if unflagged {
-                            let rb = ReplyBody::from_shared(body, gz_scratch);
+                        let reply_body = if shareable {
+                            let rb = ReplyBody::Shared(body.into());
                             rendered_slugs[k as usize] = Some(rb.clone());
                             rb
                         } else {
-                            ReplyBody::from_owned(body, gz_scratch)
+                            ReplyBody::Owned(body)
                         };
                         replies.push(OutgoingReply {
                             addr,
@@ -2016,7 +2081,7 @@ impl ReadWorker {
                         replies.push(OutgoingReply {
                             addr,
                             status: 200,
-                            body: ReplyBody::from_owned(body, gz_scratch),
+                            body: ReplyBody::Owned(body),
                         });
                     } else {
                         replies.push(reactor::error_reply(addr, 404, "article not found"));
@@ -2028,8 +2093,10 @@ impl ReadWorker {
                         continue;
                     };
                     let list = &cmt_slices[s_start as usize..s_end as usize];
-                    let unflagged = viewer == 0 || list.iter().all(|c| !render_ctx.is_following(viewer, c.author_id));
-                    if unflagged {
+                    let unflagged = !render_ctx.viewer_has_any_flag(viewer)
+                        || list.iter().all(|c| !render_ctx.is_following(viewer, c.author_id));
+                    let shareable = self.k_cmts.count(k) > 1 && unflagged;
+                    if shareable {
                         if let Some(shared) = &rendered_cmts[k as usize] {
                             replies.push(OutgoingReply {
                                 addr,
@@ -2050,12 +2117,12 @@ impl ReadWorker {
                         body.extend_from_slice(if foll { b"true}}" } else { b"false}}" });
                     }
                     body.extend_from_slice(b"]}");
-                    let reply_body = if unflagged {
-                        let rb = ReplyBody::from_shared(body, gz_scratch);
+                    let reply_body = if shareable {
+                        let rb = ReplyBody::Shared(body.into());
                         rendered_cmts[k as usize] = Some(rb.clone());
                         rb
                     } else {
-                        ReplyBody::from_owned(body, gz_scratch)
+                        ReplyBody::Owned(body)
                     };
                     replies.push(OutgoingReply {
                         addr,
@@ -2064,19 +2131,30 @@ impl ReadWorker {
                     });
                 }
                 PlanSlot::Global(_) | PlanSlot::Filtered(..) | PlanSlot::Feed(..) => {
-                    let (rows, total_count, is_feed): (&ArticlePage, i64, bool) = match slot {
-                        PlanSlot::Global(p) => (&global_pages[p as usize], global_counts[0], false),
+                    let (rows, total_count, is_feed, slot_req_cnt): (&ArticlePage, i64, bool, u32) = match slot {
+                        PlanSlot::Global(p) => (
+                            &global_pages[p as usize],
+                            global_counts[0],
+                            false,
+                            self.k_global.count(p),
+                        ),
                         PlanSlot::Filtered(kind, c, p) => (
                             &filter_pages[kind][p as usize],
                             filter_counts[kind][c as usize],
                             false,
+                            self.k_filters[kind].pages.count(p),
                         ),
-                        PlanSlot::Feed(c, p) => (&feed_pages[p as usize], feed_counts[c as usize], true),
+                        PlanSlot::Feed(c, p) => (&feed_pages[p as usize], feed_counts[c as usize], true, 1),
                         _ => unreachable!(),
                     };
                     let unflagged = !is_feed
-                        && (viewer == 0 || rows.iter().all(|&art| render_ctx.is_article_unflagged(art, viewer)));
-                    if unflagged {
+                        && (!render_ctx.viewer_has_any_flag(viewer)
+                            || (slot_req_cnt > 1
+                                && rows
+                                    .iter()
+                                    .all(|&art| render_ctx.is_article_unflagged(art, viewer))));
+                    let shareable = slot_req_cnt > 1 && unflagged;
+                    if shareable {
                         let cached = match slot {
                             PlanSlot::Global(p) => &rendered_global[p as usize],
                             PlanSlot::Filtered(kind, _, p) => &rendered_filters[kind][p as usize],
@@ -2094,6 +2172,7 @@ impl ReadWorker {
                     let mut body = Vec::with_capacity(512 + 700 * rows.len());
                     body.extend_from_slice(b"{\"articles\":[");
                     let mut first = true;
+                    let eff_viewer = if unflagged { 0 } else { viewer };
                     for (idx, &art) in rows.iter().enumerate() {
                         #[cfg(target_arch = "x86_64")]
                         if let Some(next_art) = rows.get(idx + 2) {
@@ -2115,14 +2194,7 @@ impl ReadWorker {
                         if !first {
                             body.push(b',');
                         }
-                        if render_ctx.write_article(
-                            &mut body,
-                            pa,
-                            art,
-                            false,
-                            if unflagged { 0 } else { viewer },
-                            is_feed,
-                        ) {
+                        if render_ctx.write_article(&mut body, pa, art, false, eff_viewer, is_feed) {
                             first = false;
                         } else {
                             body.truncate(mark);
@@ -2131,8 +2203,8 @@ impl ReadWorker {
                     body.extend_from_slice(b"],\"articlesCount\":");
                     codec::write_i64(&mut body, total_count);
                     body.push(b'}');
-                    let reply_body = if unflagged {
-                        let rb = ReplyBody::from_shared(body, gz_scratch);
+                    let reply_body = if shareable {
+                        let rb = ReplyBody::Shared(body.into());
                         match slot {
                             PlanSlot::Global(p) => rendered_global[p as usize] = Some(rb.clone()),
                             PlanSlot::Filtered(kind, _, p) => rendered_filters[kind][p as usize] = Some(rb.clone()),
@@ -2140,7 +2212,7 @@ impl ReadWorker {
                         }
                         rb
                     } else {
-                        ReplyBody::from_owned(body, gz_scratch)
+                        ReplyBody::Owned(body)
                     };
                     replies.push(OutgoingReply {
                         addr,
@@ -2161,33 +2233,69 @@ impl ReadWorker {
 struct RenderCtx<'a> {
     cached_arts: &'a [CachedArticleSlices],
     arena: &'a [u8],
-    fav_hits: &'a [(i64, i64)],
-    foll_hits: &'a [(i64, i64)],
-    fav_viewer_mask: u64,
-    foll_viewer_mask: u64,
+    fav_hits: &'a [u64],
+    foll_hits: &'a [u64],
+    flagged_viewer_bits: [u64; 8],
+    fav_pair_bits: [u64; 32],
+    foll_pair_bits: [u64; 32],
 }
 
 #[inline(always)]
-fn viewer_bit(viewer: i64) -> u64 {
-    1u64 << ((viewer as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58)
+fn viewer_bit_pos(viewer: i64) -> (usize, u64) {
+    let h = (viewer as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 55;
+    ((h >> 6) as usize, 1u64 << (h & 63))
+}
+
+#[inline(always)]
+fn set_viewer_bit(bits: &mut [u64; 8], viewer: i64) {
+    let (w, m) = viewer_bit_pos(viewer);
+    bits[w] |= m;
+}
+
+#[inline(always)]
+fn pair_bit_pos(packed: u64) -> (usize, u64) {
+    let h = packed.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 53;
+    ((h >> 6) as usize, 1u64 << (h & 63))
+}
+
+#[inline(always)]
+fn set_pair_bit(bits: &mut [u64; 32], packed: u64) {
+    let (w, m) = pair_bit_pos(packed);
+    bits[w] |= m;
+}
+
+#[inline(always)]
+fn test_pair_bit(bits: &[u64; 32], packed: u64) -> bool {
+    let (w, m) = pair_bit_pos(packed);
+    (bits[w] & m) != 0
 }
 
 impl RenderCtx<'_> {
-    #[inline]
+    #[inline(always)]
+    fn viewer_has_any_flag(&self, viewer: i64) -> bool {
+        if viewer == 0 {
+            return false;
+        }
+        let (w, m) = viewer_bit_pos(viewer);
+        (self.flagged_viewer_bits[w] & m) != 0
+    }
+
+    #[inline(always)]
     fn is_following(&self, viewer: i64, author: i64) -> bool {
-        (self.foll_viewer_mask & viewer_bit(viewer)) != 0
-            && self.foll_hits.binary_search(&(viewer, author)).is_ok()
+        let packed = pack_pair(viewer, author);
+        test_pair_bit(&self.foll_pair_bits, packed) && self.foll_hits.binary_search(&packed).is_ok()
     }
 
-    #[inline]
+    #[inline(always)]
     fn is_favorited(&self, viewer: i64, article: i64) -> bool {
-        (self.fav_viewer_mask & viewer_bit(viewer)) != 0
-            && self.fav_hits.binary_search(&(viewer, article)).is_ok()
+        let packed = pack_pair(viewer, article);
+        test_pair_bit(&self.fav_pair_bits, packed) && self.fav_hits.binary_search(&packed).is_ok()
     }
 
-    #[inline]
+    #[inline(always)]
     fn is_article_unflagged(&self, art: ArticleRef, viewer: i64) -> bool {
-        viewer == 0 || (!self.is_favorited(viewer, art.aid) && !self.is_following(viewer, art.author))
+        !self.viewer_has_any_flag(viewer)
+            || (!self.is_favorited(viewer, art.aid) && !self.is_following(viewer, art.author))
     }
 
     #[inline]
@@ -2234,6 +2342,10 @@ pub struct WriteWorker {
     enc_i64: ArrayEncoder,
     enc_txt1: ArrayEncoder,
     enc_txt2: ArrayEncoder,
+    replies: Vec<OutgoingReply>,
+    expired_replies: Vec<OutgoingReply>,
+    post_reads: Vec<ReadTask>,
+    locs: Vec<WriteDispatchLoc>,
 }
 
 fn stmt_count_for_write(_task: &WriteTask) -> usize {
@@ -2275,6 +2387,13 @@ fn opt_str_param(opt: &Option<String>) -> BindParam<'_> {
     }
 }
 
+fn opt_small_param(opt: &Option<SmallStr>) -> BindParam<'_> {
+    match opt {
+        Some(s) => BindParam::Text(s.as_bytes()),
+        None => BindParam::Null,
+    }
+}
+
 fn bind_single_write(tx: &mut wire::TxBuf, task: &WriteTask) {
     let v = task.viewer;
     match &task.op {
@@ -2297,8 +2416,8 @@ fn bind_single_write(tx: &mut wire::TxBuf, task: &WriteTask) {
             "upduser",
             &[
                 BindParam::I64(v),
-                opt_str_param(email),
-                opt_str_param(username),
+                opt_small_param(email),
+                opt_small_param(username),
                 opt_str_param(hash),
                 opt_str_param(bio),
                 opt_str_param(image),
@@ -2389,6 +2508,10 @@ impl WriteWorker {
             enc_i64: ArrayEncoder::with_capacity(OID_INT8, 64),
             enc_txt1: ArrayEncoder::with_capacity(OID_TEXT, 64),
             enc_txt2: ArrayEncoder::with_capacity(OID_TEXT, 64),
+            replies: Vec::with_capacity(128),
+            expired_replies: Vec::with_capacity(32),
+            post_reads: Vec::with_capacity(64),
+            locs: Vec::with_capacity(128),
         }
     }
 
@@ -2446,21 +2569,22 @@ impl WriteWorker {
             if let Err((err, pending_addrs)) = res {
                 eprintln!("write group error: {err}");
                 self.conn = None;
-                reactor::complete_batch(
+                self.replies.clear();
+                self.replies.extend(
                     pending_addrs
                         .into_iter()
-                        .map(|a| reactor::error_reply(a, 500, "internal server error"))
-                        .collect(),
+                        .map(|a| reactor::error_reply(a, 500, "internal server error")),
                 );
+                reactor::complete_batch(&mut self.replies);
             }
         }
     }
 
     fn commit_group(&mut self, tasks: &mut Vec<WriteTask>) -> Result<(), (PgError, Vec<ReplyAddr>)> {
-        let mut expired_replies = Vec::new();
-        tasks.retain(|t| check_task_alive_and_fresh(t.addr, t.enqueued_at, &mut expired_replies));
-        if !expired_replies.is_empty() {
-            reactor::complete_batch(expired_replies);
+        self.expired_replies.clear();
+        tasks.retain(|t| check_task_alive_and_fresh(t.addr, t.enqueued_at, &mut self.expired_replies));
+        if !self.expired_replies.is_empty() {
+            reactor::complete_batch(&mut self.expired_replies);
         }
         if tasks.is_empty() {
             return Ok(());
@@ -2628,41 +2752,41 @@ impl WriteWorker {
 
         let (mut c_fav_on, mut c_fav_off, mut c_foll_on, mut c_foll_off, mut c_cmt) =
             (0usize, 0usize, 0usize, 0usize, 0usize);
-        let mut locs = Vec::with_capacity(tasks.len());
+        self.locs.clear();
         for t in tasks.iter() {
             match &t.op {
                 WriteOp::Favorite { on: true, .. } if batch_fav_on => {
                     c_fav_on += 1;
-                    locs.push(WriteDispatchLoc::BatchedFav { on: true, ord: c_fav_on });
+                    self.locs.push(WriteDispatchLoc::BatchedFav { on: true, ord: c_fav_on });
                 }
                 WriteOp::Favorite { on: false, .. } if batch_fav_off => {
                     c_fav_off += 1;
-                    locs.push(WriteDispatchLoc::BatchedFav {
+                    self.locs.push(WriteDispatchLoc::BatchedFav {
                         on: false,
                         ord: c_fav_off,
                     });
                 }
                 WriteOp::Follow { on: true, .. } if batch_foll_on => {
                     c_foll_on += 1;
-                    locs.push(WriteDispatchLoc::BatchedFollow {
+                    self.locs.push(WriteDispatchLoc::BatchedFollow {
                         on: true,
                         ord: c_foll_on,
                     });
                 }
                 WriteOp::Follow { on: false, .. } if batch_foll_off => {
                     c_foll_off += 1;
-                    locs.push(WriteDispatchLoc::BatchedFollow {
+                    self.locs.push(WriteDispatchLoc::BatchedFollow {
                         on: false,
                         ord: c_foll_off,
                     });
                 }
                 WriteOp::CreateComment { .. } if batch_cmt => {
                     c_cmt += 1;
-                    locs.push(WriteDispatchLoc::BatchedComment { ord: c_cmt });
+                    self.locs.push(WriteDispatchLoc::BatchedComment { ord: c_cmt });
                 }
                 _ => {
                     let cnt = stmt_count_for_write(t);
-                    locs.push(WriteDispatchLoc::Direct {
+                    self.locs.push(WriteDispatchLoc::Direct {
                         start: n_exec,
                         count: cnt,
                     });
@@ -2709,12 +2833,20 @@ impl WriteWorker {
         let foll_off_res = decode_ord_rows(slot_foll_off, c_foll_off);
         let cmt_res = decode_ord_rows(slot_cmt, c_cmt);
 
-        let mut replies = Vec::with_capacity(tasks.len());
-        let mut post_reads: Vec<ReadTask> = Vec::new();
-        for (task, loc) in tasks.drain(..).zip(locs) {
+        self.replies.clear();
+        self.post_reads.clear();
+        for (task, &loc) in tasks.drain(..).zip(self.locs.iter()) {
             match loc {
                 WriteDispatchLoc::Direct { start, count } => {
-                    finalize_write_task(task, pipe, start, count, self.cfg, &mut replies, &mut post_reads);
+                    finalize_write_task(
+                        task,
+                        pipe,
+                        start,
+                        count,
+                        self.cfg,
+                        &mut self.replies,
+                        &mut self.post_reads,
+                    );
                 }
                 WriteDispatchLoc::BatchedFav { on, ord } => {
                     let row = if on {
@@ -2724,7 +2856,7 @@ impl WriteWorker {
                     };
                     match row {
                         Some(r) => {
-                            post_reads.push(ReadTask {
+                            self.post_reads.push(ReadTask {
                                 op: ReadOp::ArticleById {
                                     id: pipe.i64(r[1]),
                                 },
@@ -2733,7 +2865,7 @@ impl WriteWorker {
                                 enqueued_at: task.enqueued_at,
                             });
                         }
-                        None => replies.push(reactor::error_reply(task.addr, 404, "article not found")),
+                        None => self.replies.push(reactor::error_reply(task.addr, 404, "article not found")),
                     }
                 }
                 WriteDispatchLoc::BatchedFollow { on, ord } => {
@@ -2754,13 +2886,13 @@ impl WriteWorker {
                                 on,
                             );
                             body.push(b'}');
-                            replies.push(OutgoingReply {
+                            self.replies.push(OutgoingReply {
                                 addr: task.addr,
                                 status: 200,
                                 body: ReplyBody::Owned(body),
                             });
                         }
-                        None => replies.push(reactor::error_reply(task.addr, 404, "profile not found")),
+                        None => self.replies.push(reactor::error_reply(task.addr, 404, "profile not found")),
                     }
                 }
                 WriteDispatchLoc::BatchedComment { ord } => match cmt_res[ord - 1] {
@@ -2783,21 +2915,21 @@ impl WriteWorker {
                             false,
                         );
                         body.extend_from_slice(b"}}");
-                        replies.push(OutgoingReply {
+                        self.replies.push(OutgoingReply {
                             addr: task.addr,
                             status: 201,
                             body: ReplyBody::Owned(body),
                         });
                     }
-                    None => replies.push(reactor::error_reply(task.addr, 404, "article not found")),
+                    None => self.replies.push(reactor::error_reply(task.addr, 404, "article not found")),
                 },
             }
         }
 
-        if !post_reads.is_empty() {
-            enqueue_read_batch_fast(&mut post_reads);
+        if !self.post_reads.is_empty() {
+            enqueue_read_batch_fast(&mut self.post_reads);
         }
-        reactor::complete_batch(replies);
+        reactor::complete_batch(&mut self.replies);
         Ok(())
     }
 
@@ -2808,13 +2940,21 @@ impl WriteWorker {
         conn.tx.write_sync();
         conn.flush()?;
         conn.read_pipeline_into(cnt, &mut self.pipe)?;
-        let mut replies = Vec::new();
-        let mut post_reads = Vec::new();
-        finalize_write_task(task, &self.pipe, 0, cnt, self.cfg, &mut replies, &mut post_reads);
-        if !post_reads.is_empty() {
-            enqueue_read_batch_fast(&mut post_reads);
+        self.replies.clear();
+        self.post_reads.clear();
+        finalize_write_task(
+            task,
+            &self.pipe,
+            0,
+            cnt,
+            self.cfg,
+            &mut self.replies,
+            &mut self.post_reads,
+        );
+        if !self.post_reads.is_empty() {
+            enqueue_read_batch_fast(&mut self.post_reads);
         }
-        reactor::complete_batch(replies);
+        reactor::complete_batch(&mut self.replies);
         Ok(())
     }
 }
@@ -3060,7 +3200,7 @@ pub fn run_crypto_worker(cfg: &'static RuntimeConfig, is_watchdog: bool) {
             }
         });
         if !expired_replies.is_empty() {
-            reactor::complete_batch(std::mem::take(&mut expired_replies));
+            reactor::complete_batch(&mut expired_replies);
         }
         let t0 = Instant::now();
         non_std.clear();
@@ -3104,7 +3244,7 @@ pub fn run_crypto_worker(cfg: &'static RuntimeConfig, is_watchdog: bool) {
                 }
                 None => {
                     if let CryptoTask::VerifyLogin { addr, .. } = task {
-                        reactor::complete_one(addr, 401, reactor::make_error_json("invalid credentials"));
+                        reactor::complete_reply(reactor::error_reply(addr, 401, "invalid credentials"));
                     }
                 }
             }
@@ -3204,7 +3344,7 @@ fn execute_bcrypt_batch(tasks: &mut Vec<CryptoTask>, cfg: &RuntimeConfig, cost: 
         }
     }
     if !replies.is_empty() {
-        reactor::complete_batch(replies);
+        reactor::complete_batch(&mut replies);
     }
     if !writes.is_empty() {
         WRITE_QUEUE.push_batch_front(&mut writes);
