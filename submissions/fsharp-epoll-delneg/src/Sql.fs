@@ -17,7 +17,7 @@ let private slugify (x: string) = sprintf "trim(both '-' from lower(regexp_repla
 ///   2  article, once per distinct article needed: a = id, b = author, c = favorites count, s1..s3 slug, title,
 ///      description, s4 body (only for direct reads), s5..s7 author name, bio, image, ts1/ts2, tg = tag ids
 ///   3  viewer: a = viewer, arr = which of the articles they asked for they favorited
-///   4  viewer: a = viewer, arr = which of those articles' authors they follow
+///   4  viewer: a = viewer, arr = everyone they follow (about 20; the server checks each author against it)
 ///   5  direct read: a = its index, b = article id (no row: no such article)
 /// hubs: how many shared followees to probe; hubCount/feedBound: whether to use the probes for counts/pages
 let readSql (hubs: int) (hubCount: bool) (feedBound: bool) =
@@ -56,7 +56,7 @@ WITH g AS MATERIALIZED (
       WHEN 3 THEN ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id = g.kid ORDER BY f.article_id DESC LIMIT g.lim OFFSET g.off)
       ELSE ARRAY(SELECT x.id FROM follows fo CROSS JOIN LATERAL (
                    SELECT a2.id FROM articles a2
-                    WHERE a2.author_id = fo.followee_id AND a2.id >= (SELECT gb.bound FROM gb WHERE gb.gi = g.gi)
+                    WHERE a2.author_id = fo.followee_id AND a2.id >= coalesce(gb.bound, 0)
                     ORDER BY a2.id DESC LIMIT g.lim + g.off) x
                  WHERE fo.follower_id = g.kid ORDER BY x.id DESC LIMIT g.lim OFFSET g.off)
     END AS ids,
@@ -73,7 +73,7 @@ WITH g AS MATERIALIZED (
                 ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id IN (
                         SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = g.kid) LIMIT 1000) s) END
     END AS cnt
-  FROM g
+  FROM g LEFT JOIN gb ON gb.gi = g.gi
 ), r AS MATERIALIZED (
   SELECT r.rv, ga.ids[r.rfrom:r.rto] AS ids
     FROM unnest($6::int4[], $7::int4[], $8::int4[], $9::int8[]) AS r(rg, rfrom, rto, rv) JOIN ga ON ga.gi = r.rg
@@ -85,11 +85,23 @@ WITH g AS MATERIALIZED (
          CASE WHEN a.id = ANY(ARRAY(SELECT d.id FROM d)) THEN a.body END AS body, a.created_at, a.updated_at
     FROM articles a
    WHERE a.id = ANY(ARRAY(SELECT unnest(r.ids) FROM r UNION SELECT d.id FROM d WHERE d.id IS NOT NULL))
+), ids AS MATERIALIZED (
+  -- the batch's articles in id order: each lookup below is one index scan stepping through the array
+  -- (Postgres 18 moves along the leaf pages between nearby keys instead of descending once per article)
+  SELECT ARRAY(SELECT art.id FROM art ORDER BY art.id) AS a,
+         ARRAY(SELECT DISTINCT art.author_id FROM art ORDER BY 1) AS u
+), fc AS MATERIALIZED (
+  SELECT f.article_id AS id, count(*) AS n FROM favorites f, ids WHERE f.article_id = ANY(ids.a) GROUP BY f.article_id
+), tg AS MATERIALIZED (
+  SELECT at.article_id AS id, array_agg(at.tag_id) AS t FROM article_tags at, ids WHERE at.article_id = ANY(ids.a)
+   GROUP BY at.article_id
+), au AS MATERIALIZED (
+  SELECT u.id, u.username, u.bio, u.image FROM users u, ids WHERE u.id = ANY(ids.u)
 ), vw AS MATERIALIZED (
-  SELECT q.v, array_agg(DISTINCT q.id) AS ids, array_agg(DISTINCT art.author_id) AS authors
+  -- each signed-in viewer's articles in this batch (duplicates are harmless in ANY)
+  SELECT q.v, array_agg(q.id) AS ids
     FROM (SELECT r.rv AS v, unnest(r.ids) AS id FROM r WHERE r.rv <> 0
           UNION ALL SELECT d.dv, d.id FROM d WHERE d.dv <> 0 AND d.id IS NOT NULL) q
-    JOIN art ON art.id = q.id
    GROUP BY q.v
 )
 SELECT 1 AS t, ga.gi AS a, ga.cnt AS b, NULL::int8 AS c, ga.ids AS arr, NULL::text AS s1, NULL::text AS s2,
@@ -97,16 +109,16 @@ SELECT 1 AS t, ga.gi AS a, ga.cnt AS b, NULL::int8 AS c, ga.ids AS arr, NULL::te
        NULL::timestamptz AS ts1, NULL::timestamptz AS ts2, NULL::int4[] AS tg
   FROM ga
 UNION ALL
-SELECT 2, art.id, art.author_id, (SELECT count(*) FROM favorites f WHERE f.article_id = art.id), NULL,
-       art.slug, art.title, art.description, art.body, u.username, u.bio, u.image, art.created_at, art.updated_at,
-       ARRAY(SELECT at.tag_id FROM article_tags at WHERE at.article_id = art.id)
-  FROM art JOIN users u ON u.id = art.author_id
+SELECT 2, art.id, art.author_id, coalesce(fc.n, 0), NULL,
+       art.slug, art.title, art.description, art.body, au.username, au.bio, au.image, art.created_at, art.updated_at,
+       coalesce(tg.t, '{}')
+  FROM art JOIN au ON au.id = art.author_id LEFT JOIN fc ON fc.id = art.id LEFT JOIN tg ON tg.id = art.id
 UNION ALL
 SELECT 3, vw.v, NULL, NULL, ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id = vw.v AND f.article_id = ANY(vw.ids)),
        NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
   FROM vw
 UNION ALL
-SELECT 4, vw.v, NULL, NULL, ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = vw.v AND fo.followee_id = ANY(vw.authors)),
+SELECT 4, vw.v, NULL, NULL, ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = vw.v),
        NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
   FROM vw
 UNION ALL

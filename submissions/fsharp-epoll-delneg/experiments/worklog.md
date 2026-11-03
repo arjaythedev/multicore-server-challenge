@@ -38,3 +38,16 @@ Script: `experiments/h.sh`.
   the others block untimed.
 - **e07**: write batches no longer read their answers in the transaction: after commit, favorites and follows go
   to the read lane (as an article or profile read), where they share the batch's `rd`.
+- **e05-e07 at 50k/150k** (same sequence: 3-minute warm-up, 50k, 150k): e05 125.3/119.8 µs/req, e07 120.5/116.4
+  (150k: app 55.5, PG 60.9). A 150k run on a fresh database (no warm-up, no 50k phase) cost 106.6 (PG 53.4):
+  the database's age moves PG by ~7 µs/req, so builds are compared only in identical sequences.
+- **e07 profile at 50k**: the write threads still spun, now in the kernel (`sched_yield`): `Thread.Sleep(TimeSpan)`
+  rounds down to whole milliseconds, so the last fraction of each 5 ms clock was `Sleep(0)`. Fixed with `usleep`.
+- **Real batches** (RD_DUMP at 150k, replayed on the side cluster): ~400 list and article requests, 475 distinct
+  viewers, 1,037 distinct articles, 111 feed groups, 218 direct reads; 24k buffer accesses per execution: feeds ~10k
+  (1,791 followee probes, 5.9k), article rows ~11.5k, viewer flags 2.9k. `EXPLAIN ANALYZE` with timing is ~7x
+  slower than plain execution on WSL (clock reads), so its per-node times are not usable; buffers are.
+  pg_stat_statements over 30 s at 150k: `rd` 42.3 s (28.8 ms per call), comments 12.4 s (11.7 ms, 4,340 rows per
+  call: hot articles collect comments during the run), all writes ~3.3 s.
+- **Dropped: one probe per distinct followee.** Distinct followees are 75-80% of (viewer, followee) pairs in real
+  batches (1,339 of 1,791), so sharing them would save ~5% of the buffers at best, before the wider bounds.
