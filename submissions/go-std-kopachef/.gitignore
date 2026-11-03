@@ -1,0 +1,7 @@
+bin/
+__pycache__/
+
+# Local development tests are excluded from the submission.
+*_test.go
+/internal/bcryptlane/scalar_generate.py
+/internal/bcryptlane/scalar_amd64.s
