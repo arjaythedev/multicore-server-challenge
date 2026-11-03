@@ -385,7 +385,7 @@ SKIP_CONFORMANCE=1 bash check.sh  # the quick gate, no database
 
 Environment: `DATABASE_URL`, `JWT_SECRET` (required); `HOST` (127.0.0.1), `PORT` (3000); `READ_LANES` (cores);
 `READ_BATCH` (2048); `READ_GATHER_MS` (25); `READ_SPLIT` (1, off); `READ_SPLIT_MIN` (64); `WRITE_LANES` ((cores + 2) / 4: 2 on 8 or 6 cores); `WRITE_GROUP` (128); `DB_POOL_SIZE` (cores / 2, capped so the total stays
-at most 95); `BCRYPT_THREADS` ((cores + 2) / 4); `BCRYPT_WIDTH` (4); `BCRYPT_GATHER_MS` (150); `STATS_SECONDS` (0, off); `PHASES_FILE` (none); `PG_OPTIONS` (the four session settings above); `SCHED_BATCH` (1).
+at most 95); `BCRYPT_THREADS` ((cores + 2) / 4); `BCRYPT_WIDTH` (4); `BCRYPT_GATHER_MS` (150); `STATS_SECONDS` (0, off); `PHASES_FILE` (none); `BATCH_LOG`, `BATCH_LOG_MS` (25), `BATCH_LOG_PG_CGROUP` (none); `PG_OPTIONS` (the four session settings above); `SCHED_BATCH` (1).
 
 `STATS_SECONDS=1` prints one diagnostic line a second on stderr (`src/Web/Stats.fs`), to line up against the load
 generator's seconds (`t=` is unix seconds):
@@ -409,6 +409,17 @@ endpoint and per log2 bucket of server time (under 1 ms, 1-2, 2-4, ... ms), the 
 read queue, the read batch, the write queue and the write group (`Stats.Phases`, six interlocked adds per
 request). The snapshots are cumulative, so two of them subtracted give any window, and unlike percentiles a
 bucket's phases add up: the slow buckets show which phase made them slow.
+
+`BATCH_LOG=<prefix>` keeps a fine timeline and writes it at shutdown: `<prefix>.batches.csv` has every read batch
+(lane, size, and when it was taken, when phase A, the plan and phase B ended, and when it was answered), and
+`<prefix>.samples.csv` a row every `BATCH_LOG_MS` (25) of cumulative counters: the app's CPU, Postgres's CPU (the
+`usage_usec` of the cgroup `cpu.stat` named by `BATCH_LOG_PG_CGROUP`), how busy the cores this process may run on
+were (`/proc/stat`, Postgres's backends on them included), the GC pause so far, the read lanes busy, the read
+queue, the reads answered and the write queue. Laid out as a Gantt per lane, it tells a dip in CPU from a GC pause
+(the GC threads keep the cores busy while nothing is answered) and from lanes idle between bursts. On 6 pinned
+vCPUs at 120,000 users the cores were 92% busy on average; under 3.5% of the time was GC, and only 1% of the
+25 ms samples under 80% busy held a GC pause. A gen0 budget of 256 MB instead of 64 changed nothing, and 512 MB
+cost more CPU per request.
 
 A seconds-long stall that shows up in `pause` (and `dt`) is GC. If `pause` stays small while `reads q` and `worst`
 grow, requests are queueing for the database.

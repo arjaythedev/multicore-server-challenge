@@ -118,6 +118,75 @@ type Phases() =
                     let f i = Volatile.Read &cells[at + i]
                     w.WriteLine $"{unix},{kv.Key},{b},{n},{f 1},{f 2},{f 3},{f 4},{f 5}"
 
+/// A fine timeline (BATCH_LOG): every `every` (25 ms) a row of cumulative counters, written as
+/// CSV at shutdown. CPU of the app (its own clock), of Postgres (the usage_usec of the cgroup
+/// file BATCH_LOG_PG_CGROUP, if given) and of the cores this process may run on (busy and total
+/// jiffies from /proc/stat, which also counts the Postgres backends sharing them); the GC pause
+/// so far; the read lanes busy, the read queue, the read requests answered so far, the write
+/// queue. Differences between rows give each 25 ms.
+[<Sealed>]
+type Sampler(every: TimeSpan, reads: Engine.Reads.Gather, writes: Engine.Commit.Writer, pgCgroup: string, capacity: int) =
+    static let fields = 10
+    let rows: int64[] = Array.zeroCreate (capacity * fields)
+    let next = [| -1 |]
+    let unixAt0 = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1000L
+    let ticksAt0 = Stopwatch.GetTimestamp()
+    // The cores in this process's affinity (the first 64).
+    let ours =
+        let mask = uint64 (Process.GetCurrentProcess().ProcessorAffinity.ToInt64())
+        Set.ofList [ for c in 0..63 do if (mask >>> c) &&& 1UL = 1UL then c ]
+    let cores () =
+        let mutable busy = 0L
+        let mutable total = 0L
+        for line in IO.File.ReadLines "/proc/stat" do
+            if line.StartsWith "cpu" && line.Length > 3 && Char.IsDigit line[3] then
+                let f = line.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                if ours.Contains(int (f[0].Substring 3)) then
+                    let v i = if f.Length > i then int64 f[i] else 0L
+                    let idle = v 4 + v 5 // idle, iowait
+                    let b = v 1 + v 2 + v 3 + v 6 + v 7 + v 8 // user, nice, system, irq, softirq, steal
+                    busy <- busy + b
+                    total <- total + b + idle
+        busy, total
+    let pg () =
+        if pgCgroup = "" then 0L
+        else
+            try
+                IO.File.ReadLines pgCgroup
+                |> Seq.tryFind (fun l -> l.StartsWith "usage_usec ")
+                |> Option.map (fun l -> int64 (l.Substring 11))
+                |> Option.defaultValue 0L
+            with _ -> 0L
+
+    member _.Start() =
+        let sample () =
+            while true do
+                Thread.Sleep every
+                let i = Interlocked.Increment &next[0]
+                if i < capacity then
+                    let busy, total = cores ()
+                    let _, answered = reads.Counts
+                    let at = i * fields
+                    rows[at] <- unixAt0 + (Stopwatch.GetTimestamp() - ticksAt0) * 1_000_000L / Stopwatch.Frequency
+                    rows[at + 1] <- int64 Environment.CpuUsage.TotalTime.TotalMicroseconds
+                    rows[at + 2] <- pg ()
+                    rows[at + 3] <- busy
+                    rows[at + 4] <- total
+                    rows[at + 5] <- int64 (GC.GetTotalPauseDuration().TotalMicroseconds)
+                    rows[at + 6] <- int64 reads.Busy
+                    rows[at + 7] <- int64 reads.Depth
+                    rows[at + 8] <- answered
+                    rows[at + 9] <- int64 writes.Depth
+        Thread(sample, IsBackground = true, Name = "sampler").Start()
+
+    member _.Write(path: string) =
+        let n = min capacity (Volatile.Read &next[0] + 1)
+        use w = new IO.StreamWriter(path)
+        w.WriteLine "unix_us,app_cpu_us,pg_cpu_us,cores_busy_jiffies,cores_total_jiffies,gc_pause_us,read_lanes_busy,read_queue,reads_answered,write_queue"
+        for i in 0 .. n - 1 do
+            w.WriteLine(String.Join(',', rows[i * fields .. i * fields + fields - 1]))
+        n
+
 let private mb (bytes: int64) = bytes / 1048576L
 
 /// The latest GC of `kind` and, if it is not GC number `seen`, "g<gen> <promoted>MB <pause>ms".

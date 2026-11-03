@@ -48,7 +48,7 @@ let private runSplit (reads: Read[]) : Answer[] =
     use conn = dataSource.Value.OpenConnection()
     use h1 = dataSource.Value.OpenConnection()
     use h2 = dataSource.Value.OpenConnection()
-    (answerWith conn [| h1; h2 |] 1 null reads).GetAwaiter().GetResult()
+    (answerWith conn [| h1; h2 |] 1 null null reads).GetAwaiter().GetResult()
 
 let private column (sql: string) (read: Data.Common.DbDataReader -> 'a) : 'a list =
     use conn = dataSource.Value.OpenConnection()

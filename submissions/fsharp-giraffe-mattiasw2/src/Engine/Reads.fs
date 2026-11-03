@@ -568,13 +568,22 @@ let private beginRead = "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY"
 /// imports it (SET TRANSACTION SNAPSHOT) before its part, so all parts see exactly the database
 /// phase A saw; `conn` commits only once every part is back, which keeps the snapshot exported
 /// while they import it. `times`, if not null, records phase A, the plan between, phase B and the
-/// assembly.
-let answerWith (conn: NpgsqlConnection) (helpers: NpgsqlConnection[]) (perPart: int) (times: Db.Millis[]) (reads: Read[]) : Task<Answer[]> =
+/// assembly; `laps`, if not null, gets the Stopwatch timestamp at the end of each (0 where the
+/// batch had no such step).
+let answerWith
+    (conn: NpgsqlConnection)
+    (helpers: NpgsqlConnection[])
+    (perPart: int)
+    (times: Db.Millis[])
+    (laps: int64[])
+    (reads: Read[])
+    : Task<Answer[]> =
     task {
         let at = ref (Diagnostics.Stopwatch.GetTimestamp())
         let lap (i: int) =
             let now = Diagnostics.Stopwatch.GetTimestamp()
             if not (isNull times) then times[i].Record(Diagnostics.Stopwatch.GetElapsedTime(at.Value, now))
+            if not (isNull laps) then laps[i] <- now
             at.Value <- now
         let a = planA reads
         let foundA =
@@ -639,7 +648,7 @@ let answerWith (conn: NpgsqlConnection) (helpers: NpgsqlConnection[]) (perPart: 
 
 /// One batch on one connection. Public for the batch property test (Tests/BatchTests.fs): a
 /// request's answer never depends on its batch-mates.
-let answer (conn: NpgsqlConnection) (reads: Read[]) : Task<Answer[]> = answerWith conn [||] 1 null reads
+let answer (conn: NpgsqlConnection) (reads: Read[]) : Task<Answer[]> = answerWith conn [||] 1 null null reads
 
 // --------------------------------------------------------------- lanes ---------
 
@@ -663,7 +672,7 @@ let private unexpected (a: Answer) : 'a = invalidOp $"Reads: unexpected answer {
 /// if `maxBatch` of them arrive sooner): bigger batches share more, and the wait is inside the
 /// latency budget.
 [<Sealed>]
-type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpan, split: int, perPart: int) =
+type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpan, split: int, perPart: int, logCapacity: int) =
     let queue =
         Channel.CreateUnbounded<Pending>(UnboundedChannelOptions(SingleReader = (lanes = 1), SingleWriter = false))
     let ds = NpgsqlDataSource.Create connectionString
@@ -673,6 +682,12 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
     let answered = Db.Millis() // per request: arrived -> answered
     let phases = Array.init 4 (fun _ -> Db.Millis()) // per batch: phase A, plan B, phase B, assemble
     let busy = [| 0L |] // lanes running a batch
+    // The batch log (logCapacity > 0, BATCH_LOG): per batch its lane, size, and the Stopwatch
+    // timestamps of taken, phase A, plan, phase B and answered (0: no such step).
+    let logged: int64[] = Array.zeroCreate (logCapacity * 7)
+    let logNext = [| -1 |]
+    let unixAt0 = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1000L
+    let ticksAt0 = Diagnostics.Stopwatch.GetTimestamp()
     let worst = [| 0L |] // TimeSpan ticks: the longest arrived -> answered since Worst() last ran
     /// How often a gathering lane takes what has been queued since it last looked.
     let tick = TimeSpan.FromMilliseconds 2.0
@@ -701,12 +716,12 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
         }
 
     /// `conns`: the lane's connection, then its helpers for a split phase B.
-    let rec serve (conns: NpgsqlConnection[]) (batch: Pending[]) : Task =
+    let rec serve (conns: NpgsqlConnection[]) (laps: int64[]) (batch: Pending[]) : Task =
         task {
             let conn = conns[0]
             let mutable failure = None
             try
-                let! answers = answerWith conn conns[1..] perPart phases (batch |> Array.map _.Read)
+                let! answers = answerWith conn conns[1..] perPart phases laps (batch |> Array.map _.Read)
                 for i in 0 .. batch.Length - 1 do
                     batch[i].Answer answers[i]
             with e ->
@@ -721,13 +736,13 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
                     // One request's statement failed and took the batch with it: each request
                     // runs again alone and meets its own fate.
                     for p in batch do
-                        do! serve conns [| p |]
+                        do! serve conns null [| p |]
                 | e ->
                     for p in batch do
                         p.Fail e
         }
 
-    let lane () : Task =
+    let lane (index: int) : Task =
         task {
             // The lane's connection, then split - 1 helpers for phase B.
             let conns: NpgsqlConnection[] = Array.zeroCreate (max 1 split)
@@ -756,6 +771,7 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
                     let batch = pending.ToArray()
                     pending.Clear()
                     let taken = Diagnostics.Stopwatch.GetTimestamp()
+                    let laps: int64[] = if logCapacity > 0 then Array.zeroCreate 4 else null
                     Interlocked.Increment(&busy[0]) |> ignore
                     for p in batch do
                         queued.Record(Diagnostics.Stopwatch.GetElapsedTime(p.Arrived, taken))
@@ -767,11 +783,20 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
                                 conns[i] <- null
                                 let! c = ds.OpenConnectionAsync()
                                 conns[i] <- c
-                        do! serve conns batch
+                        do! serve conns laps batch
                     with e ->
                         for p in batch do
                             p.Fail e
                     let finished = Diagnostics.Stopwatch.GetTimestamp()
+                    if logCapacity > 0 then
+                        let i = Interlocked.Increment &logNext[0]
+                        if i < logCapacity then
+                            let at = i * 7
+                            logged[at] <- int64 index
+                            logged[at + 1] <- int64 batch.Length
+                            logged[at + 2] <- taken
+                            for k in 0..3 do
+                                logged[at + 3 + k] <- laps[k]
                     Interlocked.Decrement(&busy[0]) |> ignore
                     executed.Record(Diagnostics.Stopwatch.GetElapsedTime(taken, finished))
                     for p in batch do
@@ -784,8 +809,8 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
         }
 
     do
-        for _ in 1..lanes do
-            Task.Run<unit>(fun () -> task { do! lane () }) |> ignore
+        for i in 0 .. lanes - 1 do
+            Task.Run<unit>(fun () -> task { do! lane i }) |> ignore
 
     /// Queues one read; the task completes when its batch has been answered.
     member _.Run(read: Read) : Task<Answer> =
@@ -850,6 +875,20 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
 
     /// Lanes running a batch right now.
     member _.Busy = Volatile.Read(&busy[0])
+
+    /// Writes the batch log as CSV (unix microseconds; 0 where a batch had no such step) and
+    /// returns how many batches it held.
+    member _.WriteLog(path: string) =
+        let n = min logCapacity (Volatile.Read &logNext[0] + 1)
+        let us (ticks: int64) =
+            if ticks = 0L then 0L else unixAt0 + (ticks - ticksAt0) * 1_000_000L / Diagnostics.Stopwatch.Frequency
+        use w = new IO.StreamWriter(path)
+        w.WriteLine "lane,size,taken_us,phase_a_us,plan_us,phase_b_us,answered_us"
+        for i in 0 .. n - 1 do
+            let at = i * 7
+            w.WriteLine
+                $"{logged[at]},{logged[at + 1]},{us logged[at + 2]},{us logged[at + 3]},{us logged[at + 4]},{us logged[at + 5]},{us logged[at + 6]}"
+        n
 
     /// The longest arrived -> answered since the last call, and resets it.
     member _.Worst() = TimeSpan(Interlocked.Exchange(&worst[0], 0L))

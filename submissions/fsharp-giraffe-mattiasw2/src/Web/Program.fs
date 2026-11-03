@@ -93,6 +93,10 @@ let main args =
     // once (1: off), each part at least READ_SPLIT_MIN distinct articles.
     let readSplit = max 1 (int (setting "READ_SPLIT" "1"))
     let readSplitMin = max 1 (int (setting "READ_SPLIT_MIN" "64"))
+    // A fine timeline for diagnostics (off unless BATCH_LOG is set): a batch log and a sample of
+    // CPU, GC and queues every BATCH_LOG_MS (25), written at shutdown to BATCH_LOG.batches.csv and
+    // BATCH_LOG.samples.csv. BATCH_LOG_PG_CGROUP: Postgres's cgroup cpu.stat, for its CPU.
+    let batchLog = setting "BATCH_LOG" ""
     // Multiplexed: the cold reads (sign-in lookups, the read after a write). Rule: 95 or fewer
     // connections in total, lanes included.
     let poolSize = min (95 - writeLanes - readLanes * readSplit) (int (setting "DB_POOL_SIZE" (string (max 2 (cores / 2)))))
@@ -123,7 +127,8 @@ let main args =
             readBatch,
             readGather,
             readSplit,
-            readSplitMin
+            readSplitMin,
+            (if batchLog = "" then 0 else 400_000)
         )
     let env: Handlers.Env =
         { Db = ds
@@ -191,6 +196,14 @@ let main args =
         "conduit (F#, Giraffe on Kestrel) on %s:%d, %d cores: %d read lanes (batches of <= %d, gather %d ms, phase B on %d connections from %d articles each) + %d write lanes (groups of <= %d) + %d multiplexed db connections, %d bcrypt threads (%d wide), server GC %b"
         host port cores readLanes readBatch (int readGather.TotalMilliseconds) readSplit readSplitMin writeLanes writeGroup poolSize bcryptLanes
         bcryptWidth Runtime.GCSettings.IsServerGC
+    let sampler =
+        if batchLog = "" then
+            None
+        else
+            let every = TimeSpan.FromMilliseconds(float (setting "BATCH_LOG_MS" "25"))
+            let s = Stats.Sampler(every, reads, writes, setting "BATCH_LOG_PG_CGROUP" "", 200_000)
+            s.Start()
+            Some s
     if statsEvery.Ticks > 0L then
         Stats.start statsEvery connections reads readLanes writes writeLanes (phases |> Option.map (fun p -> p, phasesFile))
     app.Lifetime.ApplicationStopping.Register(fun () ->
@@ -216,7 +229,12 @@ let main args =
             for line in t.Lines() do
                 eprintfn "%s" line
         | None -> ()
-        phases |> Option.iter (fun p -> p.Snapshot(phasesFile, DateTimeOffset.UtcNow.ToUnixTimeSeconds())))
+        phases |> Option.iter (fun p -> p.Snapshot(phasesFile, DateTimeOffset.UtcNow.ToUnixTimeSeconds()))
+        sampler
+        |> Option.iter (fun s ->
+            let batches = reads.WriteLog(batchLog + ".batches.csv")
+            let samples = s.Write(batchLog + ".samples.csv")
+            eprintfn "batch log: %d batches, %d samples written to %s.*.csv" batches samples batchLog))
     |> ignore
     app.Run()
     0

@@ -9,6 +9,8 @@
 # lockstep, default 4; how long a login may wait for batch-mates, default 150), STATS_SECONDS (a
 # diagnostic line on stderr every that many seconds: GC, connections, queues; default 0, off),
 # PHASES_FILE (with STATS_SECONDS: where each request's time went, appended at every stats line),
+# BATCH_LOG (a prefix: a 25 ms timeline of CPU, GC and queues and a log of every read batch, written at
+# shutdown; BATCH_LOG_MS, BATCH_LOG_PG_CGROUP: Postgres's cgroup cpu.stat),
 # PG_OPTIONS (replaces the Postgres session settings in src/Engine/Db.fs), SCHED_BATCH (0: run
 # under the default scheduling policy). GC: DOTNET_gcServer=0 (workstation GC) or
 # DOTNET_GCHeapCount=N override the server GC that Web.fsproj sets.
