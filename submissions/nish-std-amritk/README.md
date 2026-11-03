@@ -3,10 +3,13 @@
 Front: direct
 
 An update of this submission, scored at 91,000 users in #83 (`3de991e`),
-100,000 in #116 (`6e69d72`), 140,000 in #159 (`6cdf1fd`) and 180,000 in
-#189 (`76a40a5`), on the same design. Since #189: each plan group's
-statements run on two connections side by side, and plans hold up to 4,096
-reads over a 60 ms window instead of 2,048 over 40 ms. Since #159: one read
+100,000 in #116 (`6e69d72`), 140,000 in #159 (`6cdf1fd`), 180,000 in
+#189 (`76a40a5`) and 200,000 in #196 (`6b5557b`), on the same design. Since
+#196: each statement of a plan's group gets a connection of its own, the
+feeds split in two, instead of two lanes pipelined four deep on whatever
+connections the pool had opened. Since #189: plans hold up to 4,096 reads
+over a 60 ms window instead of 2,048 over 40 ms, and Nish 0.32.0's faster
+bcrypt. Since #159: one read
 service holds every read plan of the box, each author of a plan is read once,
 a feed no longer asks whether its viewer follows the authors it was built
 from, a login's check waits 80 ms for company instead of 160, bcrypt's
@@ -162,15 +165,21 @@ and four on the box), and
   Nish's `PgBatcher` takes at most 1,024 keys, so a plan takes at most that
   many articles, comment threads or profiles by key, and a read past them
   waits for the next plan.
-- **A plan's statements in two lanes.** Only about three of a plan's
-  statements were running in Postgres at any moment, because a plan's
-  group ran its statements one after another on one connection while other
-  connections sat idle, so a read waited the sum of them. Each group now
-  runs as two halves on two connections side by side: group A's feeds, its
-  costliest statement, beside everything else, and group B's articles
-  beside the flags and authors. When the pool can give only one connection,
-  both halves run on it as before. The same CPU, less waiting: at 230,000
-  users, saturated, p95 went from 553 ms to 511.
+- **A plan's statements side by side.** A read waits for its plan's group
+  A and then its group B, so it waits the slowest statement of each. Each
+  group runs as lanes on connections of their own: group A's feeds in two
+  halves (when a plan has 64 feed pages or more, `FEED_SPLIT`), its comments,
+  its tag names and other lists, and its articles and profiles by key; group
+  B's articles, flags and authors. A lane the pool has no connection for goes
+  with the last one it gave. In #196 these were two lanes, and the read
+  service's pool pipelined up to four groups on a connection
+  (`DB_READ_IN_FLIGHT`) before it opened another, so lanes queued behind
+  other plans' statements while connections sat unopened. Now the service
+  takes one group a connection (`READ_SERVICE_IN_FLIGHT`, 1) on up to 20
+  (`READ_SERVICE_CONNS`). `PLAN_STATS=1` prints, every 10 s, how long plans
+  spend in each stage and lane. On the Xeon VM at 175,000 users, group A
+  went from 48 ms to 30, group B from 31 to 28, and the wait for the counts
+  after B from 13–18 ms to 2.
 - **Each author once.** `plan_meta` and `plan_comments` no longer join `users`
   row by row: a plan collects the distinct authors of its articles and
   comments, reads them with one `plan_users` statement, and writes each
@@ -386,6 +395,22 @@ fresh copy of the seed each time; CPU from `/proc` over a minute of the hold:
 | `cf7a78f`, two holds | 175,000 | PASS, PASS | 44,053–44,083 | 349–414 ms | 532–616 ms | 72.9–76.0 + 69.9–71.5 | 79–82% |
 | `a24c18d`, two holds past the VM's limit | 185,000 | FAIL, FAIL | 42,554–45,117 | 859–1,881 ms | 2,439–5,489 ms | 72.4–74.0 + 72.6–88.4 | 83–86% |
 | `cf7a78f`, two holds past the VM's limit | 185,000 | FAIL, FAIL | 44,126–45,194 | 886–1,652 ms | 2,431–4,395 ms | 74.9–76.8 + 73.4–77.4 | 84–86% |
+
+Lanes on connections of their own, against `6b5557b` (#196), alternated on
+the same VM, two holds each:
+
+| Build | Users | Verdict | req/s | p50 | p95 | p99 | Postgres + rest µs a request | Box busy |
+|---|--:|---|--:|--:|--:|--:|---|--:|
+| `6b5557b` | 175,000 | PASS, PASS | 43,849–43,918 | 201–208 ms | 363–388 ms | 518–539 ms | 65.4–66.6 + 68.9–69.6 | 75% |
+| this one | 175,000 | PASS, PASS | 44,698–44,733 | 133 ms | 226–230 ms | 362–366 ms | 70.7–70.8 + 65.9–66.0 | 77% |
+| `6b5557b` | 185,000 | PASS, PASS | 46,211–46,334 | 206–214 ms | 369–423 ms | 498–601 ms | 67.2–67.4 + 69.4–69.6 | 80% |
+| this one | 185,000 | PASS, PASS | 47,025–47,065 | 147–149 ms | 265–273 ms | 385–401 ms | 69.6–69.8 + 64.4–64.9 | 79% |
+
+The same CPU a request, a third less waiting. On the saturated run, where
+the CPU is all used, it is the other way: more statements at once cost about
+1 µs a request there and 230,000 failed twice (p95 639 and 691 ms, against
+448 for `6b5557b`). #196 scored 200,000 at 85% of the box and failed 210,000
+on p95 with CPU to spare, which is the VM's case, not the saturated run's.
 
 The window's extra wait shows as p95 while the box has room. At 185,000 the
 two builds' holds overlap: past the VM's limit its load box runs out of local

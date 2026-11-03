@@ -22,7 +22,7 @@ import {
   pollWait,
   tcpConnect,
 } from "nish:net"
-import { monotonicNanos } from "nish:process"
+import { getenv, monotonicNanos } from "nish:process"
 import { secret, wipe } from "nish:secret"
 import { H1_WANT_READ, H1_WANT_WRITE } from "nish/net/http1-server"
 import {
@@ -35,7 +35,7 @@ import {
   PgPool,
 } from "nish/net/postgres"
 import { RING_EMPTY, RING_TOO_SMALL } from "nish/sync/ring"
-import { CountRun, PLAN_ALONE, ReadPlan } from "./plan"
+import { CountRun, LANES, LANES_ALL, PLAN_ALONE, ReadPlan } from "./plan"
 import { ANSWER_ALONE, ANSWER_MAX, ANSWER_TAIL, READ_HEAD, ReadLink } from "./read-ring"
 import { registerPlanStatements } from "./sql"
 import { pgConfig, WorkerConfig } from "./worker"
@@ -74,8 +74,9 @@ export class ReadService {
   state: i32[]
   /** Per ticket: the plan whose group it is, `plans.length` for a count run not yet bound, past that a count run by place, or -1. */
   ticketPlan: i32[]
-  /** Per ticket of a plan: the lane of the group it binds (ReadPlan.bindA and bindB). */
+  /** Per ticket of a plan: its slot in the plan's group, and the lanes it binds (ReadPlan.bindA and bindB). */
   ticketLane: i32[]
+  ticketMask: i32[]
   /**
    * The count lanes: one run taking plans, up to `lanes` running, each on a
    * connection of its own, and whether a connection has been asked for. A
@@ -102,6 +103,17 @@ export class ReadService {
   sendNext: i32[]
   sendHeld: i64[]
   sending: i32 = 0
+  /**
+   * PLAN_STATS=1: per plan, when it opened, was due, bound and ended group A,
+   * bound and ended group B, had its counts and had sent its answers
+   * (`stamps[8 * p + k]`), summed over the plans freed and printed every 10 s.
+   */
+  stats: boolean = false
+  stamps: i64[]
+  spans: i64[]
+  statPlans: i64 = 0
+  statReads: i64 = 0
+  statAt: i64 = 0
   planMin: i32
   planWait: i64
   /** A read popped that its plan had no room for, and its worker; the next ring to look at. */
@@ -148,6 +160,7 @@ export class ReadService {
     this.pool.register(this.plans[0].profiles.name, this.plans[0].profiles.sql, noTypes)
     this.ticketPlan = new Array<i32>(SERVICE_TICKETS)
     this.ticketLane = new Array<i32>(SERVICE_TICKETS)
+    this.ticketMask = new Array<i32>(SERVICE_TICKETS)
     for (let k: i32 = 0; k < SERVICE_TICKETS; k++) {
       this.ticketPlan[k] = -1
     }
@@ -161,6 +174,65 @@ export class ReadService {
     this.planMin = cfg.planMin
     this.planWait = toI64(cfg.planWaitUs) * 1000
     this.rec = new Array<u8>(READ_HEAD + 2048)
+    this.stats = (getenv("PLAN_STATS") ?? "") === "1"
+    const split: string = getenv("FEED_SPLIT") ?? ""
+    for (const plan of this.plans) {
+      plan.feedSplitAt = split.length > 0 ? toI32(parseInt(split)) : 64
+    }
+    this.stamps = new Array<i64>(16 * toI32(this.plans.length))
+    this.spans = new Array<i64>(16)
+  }
+
+  stamp(p: i32, k: i32, first: boolean): void {
+    if (this.stats && (!first || this.stamps[16 * p + k] === toI64(0))) {
+      this.stamps[16 * p + k] = monotonicNanos()
+    }
+  }
+
+  /** Plan `p` is free: adds its spans, and prints the means every 10 s. */
+  statFree(p: i32): void {
+    if (!this.stats) {
+      return
+    }
+    const now: i64 = monotonicNanos()
+    this.stamps[16 * p + 7] = now
+    // A stage a plan skipped (no group B, no counts) takes the stamp before it.
+    for (let k: i32 = 1; k < 8; k++) {
+      if (this.stamps[16 * p + k] === toI64(0)) {
+        this.stamps[16 * p + k] = this.stamps[16 * p + k - 1]
+      }
+      this.spans[k] += this.stamps[16 * p + k] - this.stamps[16 * p + k - 1]
+    }
+    // Each lane's end, from its group's bind: 8 to 11 group A's, 12 to 15 group B's.
+    for (let k: i32 = 8; k < 16; k++) {
+      const base: i32 = k < 12 || k === 15 ? 2 : 4
+      const from: i64 = this.stamps[16 * p + base]
+      if (this.stamps[16 * p + k] > toI64(0)) {
+        this.spans[k] += this.stamps[16 * p + k] - from
+      }
+    }
+    this.statPlans += toI64(1)
+    this.statReads += toI64(this.plans[p].count)
+    for (let k: i32 = 0; k < 16; k++) {
+      this.stamps[16 * p + k] = toI64(0)
+    }
+    if (this.statAt === toI64(0)) {
+      this.statAt = now
+    }
+    if (now - this.statAt >= toI64(10000) * toI64(1000000) && this.statPlans > toI64(0)) {
+      const n: i64 = this.statPlans
+      const d: i64 = n * toI64(1000)
+      const sp: i64[] = this.spans
+      console.log(
+        `plan stats: ${n} plans, ${this.statReads / n} reads a plan; us: window ${sp[1] / d}, to A ${sp[2] / d}, A ${sp[3] / d}, to B ${sp[4] / d}, B ${sp[5] / d}, counts ${sp[6] / d}, send ${sp[7] / d}; lanes A ${sp[8] / d} ${sp[9] / d} ${sp[10] / d} ${sp[11] / d}, ${sp[15] / d}, B ${sp[12] / d} ${sp[13] / d} ${sp[14] / d}`
+      )
+      for (let k: i32 = 0; k < 16; k++) {
+        this.spans[k] = toI64(0)
+      }
+      this.statPlans = toI64(0)
+      this.statReads = toI64(0)
+      this.statAt = now
+    }
   }
 
   /** Serves until a worker goes; a worker that goes ends the server (the challenge restarts nothing). */
@@ -258,6 +330,7 @@ export class ReadService {
         this.state[p] = S_OPEN
         this.open = p
         this.openedAt = monotonicNanos()
+        this.stamp(p, 0, false)
       }
       const b: u8[] = this.rec
       const tag: i32 = getI32LE(b, 0) * WORKER_TAGS + this.recFrom
@@ -276,6 +349,7 @@ export class ReadService {
         took = true
       } else {
         this.state[this.open] = S_DUE
+        this.stamp(this.open, 1, false)
         this.open = -1
       }
     }
@@ -293,6 +367,7 @@ export class ReadService {
     this.take()
     if (this.open >= 0 && (this.plans[this.open].count >= this.planMin || this.waitLeft() === 0)) {
       this.state[this.open] = S_DUE
+      this.stamp(this.open, 1, false)
       this.open = -1
       this.take()
     }
@@ -385,7 +460,9 @@ export class ReadService {
     }
     const plan: ReadPlan = this.plans[pi]
     const lane: i32 = this.ticketLane[at]
-    if (!(this.state[pi] === S_A ? plan.bindA(conn, lane) : plan.bindB(conn, lane))) {
+    const mask: i32 = this.ticketMask[at]
+    this.stamp(pi, this.state[pi] === S_A ? 2 : 4, true)
+    if (!(this.state[pi] === S_A ? plan.bindA(conn, mask, lane) : plan.bindB(conn, mask, lane))) {
       // The statements bound still run; the plan's requests go alone once they have.
       plan.failed = true
       conn.bindCancel()
@@ -399,6 +476,7 @@ export class ReadService {
 
   groupDone(p: i32): void {
     const plan: ReadPlan = this.plans[p]
+    this.stamp(p, this.state[p] === S_A ? 3 : 5, false)
     if (this.state[p] === S_A) {
       if (plan.failed) {
         plan.abortA()
@@ -434,33 +512,46 @@ export class ReadService {
   }
 
   /**
-   * Asks the pool for a connection for each lane of `lanes` (bit 0, bit 1) of
-   * plan `p`'s next group, so its two halves run side by side; both on one
-   * when the pool has room for only one, or the group has one lane. False
-   * when it has room for none.
+   * Asks the pool for a connection for each lane of `lanes` (a bit each) of
+   * plan `p`'s next group, so they run side by side; the lanes it has no room
+   * for go on the last connection it gave. False when it has room for none.
    */
   askLanes(p: i32, lanes: i32): boolean {
-    const first: i32 = this.pool.request()
-    if (first === PG_POOL_FULL) {
-      return false
+    let slots: i32 = 0
+    let last: i32 = -1
+    for (let lane: i32 = 0; lane < LANES; lane++) {
+      if ((lanes & (1 << lane)) === 0) {
+        continue
+      }
+      const ticket: i32 = this.pool.request()
+      if (ticket === PG_POOL_FULL) {
+        if (last < 0) {
+          return false
+        }
+        // Every lane from here on goes with the last connection given.
+        this.ticketMask[last] = this.ticketMask[last] | (lanes & ~((1 << lane) - 1))
+        break
+      }
+      last = ticket % SERVICE_TICKETS
+      this.ticketPlan[last] = p
+      this.ticketLane[last] = slots
+      this.ticketMask[last] = 1 << lane
+      slots += 1
     }
-    this.ticketPlan[first % SERVICE_TICKETS] = p
+    if (last < 0) {
+      // A group with nothing to read: one connection binds it empty, and its end is the group's.
+      const ticket: i32 = this.pool.request()
+      if (ticket === PG_POOL_FULL) {
+        return false
+      }
+      last = ticket % SERVICE_TICKETS
+      this.ticketPlan[last] = p
+      this.ticketLane[last] = 0
+      this.ticketMask[last] = LANES_ALL
+      slots = 1
+    }
     this.laneLost[p] = false
-    if (lanes !== 3) {
-      this.ticketLane[first % SERVICE_TICKETS] = 2
-      this.lanesLeft[p] = 1
-      return true
-    }
-    const second: i32 = this.pool.request()
-    if (second === PG_POOL_FULL) {
-      this.ticketLane[first % SERVICE_TICKETS] = 2
-      this.lanesLeft[p] = 1
-      return true
-    }
-    this.ticketLane[first % SERVICE_TICKETS] = 0
-    this.ticketPlan[second % SERVICE_TICKETS] = p
-    this.ticketLane[second % SERVICE_TICKETS] = 1
-    this.lanesLeft[p] = 2
+    this.lanesLeft[p] = slots
     return true
   }
 
@@ -502,6 +593,7 @@ export class ReadService {
 
   /** Sends plan `p`'s answers to its workers, and frees the plan once all have gone. */
   finish(p: i32, lost: boolean): void {
+    this.stamp(p, 6, false)
     this.lost[p] = lost
     this.sendNext[p] = 0
     this.sendHeld[p] = toI64(0)
@@ -545,6 +637,7 @@ export class ReadService {
       }
       this.sendHeld[p] = toI64(0)
     }
+    this.statFree(p)
     this.state[p] = S_FREE
     this.lost[p] = false
     this.sending -= 1
@@ -661,6 +754,15 @@ export class ReadService {
       this.ticketPlan[at] = -1
       if (conn.groupFailed) {
         plan.failed = true
+      }
+      if (this.stats) {
+        // A connection of one lane: that lane's end.
+        const m: i32 = this.ticketMask[at]
+        for (let l: i32 = 0; l < LANES; l++) {
+          if (m === 1 << l) {
+            this.stamp(p, this.state[p] === S_A ? (l < 4 ? 8 + l : 15) : 12 + l, false)
+          }
+        }
       }
       this.laneDone(p)
     } else if (this.state[p] === S_A) {
