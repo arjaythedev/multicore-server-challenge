@@ -380,6 +380,7 @@ let start (host: string) (port: int) (count: int) (reserve: int) (nice: int) =
     loops <- Array.init count (fun i -> Loop(i, Sys.listenTcp host port))
     for l in loops do
         Thread((fun () ->
+                    Sys.schedThread ()
                     Sys.niceThread nice
                     l.Run()),
                IsBackground = true,

@@ -19,6 +19,8 @@ let main _ =
     let options = env "PG_OPTIONS" "-c plan_cache_mode=force_generic_plan -c jit=off -c max_parallel_workers_per_gather=0"
     Auth.init (env "JWT_SECRET" "multicore-server-challenge")
     Store.stats <- env "MC_STATS" "0" = "1"
+    // our threads wake without preempting Postgres mid-query (THREAD_SCHED=other turns it off)
+    Sys.threadPolicy <- (if env "THREAD_SCHED" "batch" = "batch" then Sys.SCHED_BATCH else Sys.SCHED_OTHER)
     Store.dumpPath <- (match env "RD_DUMP" "" with "" -> null | p -> p)
     // logins are ~0.1% of requests, so they can wait for full lanes (a 6-lane pass costs ~11 ms per hash, one lane 38 ms)
     Auth.start (num "BCRYPT_THREADS" 2) (num "BCRYPT_LANES" 6) (num "BCRYPT_FILL" 6) (num "BCRYPT_WAIT_MS" 250) (num "BCRYPT_NICE" 5)

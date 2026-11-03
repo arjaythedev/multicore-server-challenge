@@ -146,6 +146,7 @@ let mutable private fillTo = 4
 /// Hashes up to `lanes` passwords in one pass of the multi-lane core. Lanes run in lockstep, so a thread takes
 /// a short wait (BCRYPT_WAIT_MS) to fill at least `fillTo` lanes before it starts a sparse batch.
 let private hasher (nice: int) () =
+    Sys.schedThread ()
     Sys.niceThread nice
     let batch = List<Job>()
     let keys = Array.zeroCreate<nativeint> 6

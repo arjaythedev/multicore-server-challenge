@@ -62,6 +62,13 @@ extern int setpriority(int which, int who, int prio)
 [<DllImport(C, SetLastError = true)>]
 extern int64 syscall(int64 n)
 
+/// sleeps the calling thread for microseconds (Thread.Sleep rounds down to whole milliseconds: 0 is a yield)
+[<DllImport(C)>]
+extern int usleep(uint32 usec)
+
+[<DllImport(C, SetLastError = true, EntryPoint = "sched_setscheduler")>]
+extern int private sched_setscheduler_(int pid, int policy, int* param)
+
 let errno () = Marshal.GetLastPInvokeError()
 
 /// setsockopt with an int value
@@ -109,6 +116,21 @@ let tid () = int (syscall 186L)
 
 /// lowers (or raises, if allowed) the calling thread's nice value
 let niceThread (n: int) = setpriority (0, tid (), n) |> ignore
+
+[<Literal>]
+let SCHED_OTHER = 0
+[<Literal>]
+let SCHED_BATCH = 3
+
+/// The calling thread's scheduling policy. SCHED_BATCH keeps its CPU share but doesn't preempt a running task
+/// (a Postgres backend mid-query) when it wakes. Call before niceThread: the nice value is set after.
+let mutable threadPolicy = SCHED_BATCH
+
+let schedThread () =
+    let policy = threadPolicy
+    let p = NativeInterop.NativePtr.stackalloc<int> 1
+    NativeInterop.NativePtr.write p 0
+    sched_setscheduler_ (0, policy, p) |> ignore
 
 let ctl (ep: int) (op: int) (fd: int) (events: uint32) (data: uint64) =
     let mutable ev = EpollEvent()

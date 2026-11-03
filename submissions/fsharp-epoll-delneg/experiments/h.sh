@@ -44,6 +44,12 @@ phase() { # name users ramp measure
       -tail 15s -start-at $sa -secret $SECRET -articles 500000 -run-id $L-$N-$RANDOM -q -out $D/box$k.json > $D/box$k.log 2>&1 &
     pids+=($!); files+=($D/box$k.json); off=$((off+u))
   done
+  if [ -n "${PERF:-}" ]; then # profile the app mid-window from the build CPUs (needs APPENV=DOTNET_PerfMapEnabled=1)
+    ( sleep $((R + 15)); sudo taskset -c 20-23 perf record -q -F 499 -g -p $(systemctl show -p MainPID --value mcfs2-app) -o $D/perf.data -- sleep 30 >/dev/null 2>&1 ) &
+  fi
+  if [ -n "${PGPERF:-}" ]; then # profile CPUs 0-7 (app and Postgres) mid-window; filter with --comm postgres
+    ( sleep $((R + 15)); sudo taskset -c 20-23 perf record -q -F 499 -g -a -C 0-7 -o $D/pgperf.data -- sleep 20 >/dev/null 2>&1 ) &
+  fi
   wait "${pids[@]}"
   $LG merge -o $D/merged.json "${files[@]}" > $D/merged.txt 2>&1
   local ws=$(echo "$sa/1000 + $R" | bc -l) we=$(echo "$sa/1000 + $R + $M" | bc -l)

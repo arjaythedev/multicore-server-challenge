@@ -90,7 +90,7 @@ let private ticksPerUs = float Stopwatch.Frequency / 1e6
 
 /// A queue shared by every I/O thread, drained by its connection threads in batches.
 ///
-/// One idle thread at a time is the leader: it sleeps (Thread.Sleep, which doesn't spin) until the oldest queued
+/// One idle thread at a time is the leader: it sleeps (usleep, which doesn't spin) until the oldest queued
 /// job has waited the clock, then takes up to a batch and hands leadership on. The other idle threads block in an
 /// untimed wait. A timed Monitor.Wait spins before it blocks, which cost more CPU than the batches themselves.
 [<Sealed>]
@@ -126,7 +126,7 @@ type Lane<'T when 'T :> Job>(clockUs: int, maxBatch: int) =
                         into.Add(q.Dequeue())
                     if q.Count > 0 then Monitor.Pulse gate)
             if not got then
-                Thread.Sleep(TimeSpan.FromTicks(int64 sleepUs * 10L))
+                Sys.usleep(uint32 sleepUs) |> ignore
                 lock gate (fun () -> leader <- false)
 
 let mutable stats = false
@@ -817,6 +817,9 @@ type private Reader(c: Conn) =
 
 // ---------------- writes ----------------
 
+let mutable readLane: Lane<RJob> = Unchecked.defaultof<_>
+let mutable writeLane: Lane<WJob> = Unchecked.defaultof<_>
+
 [<Sealed>]
 type private Writer(c: Conn) =
     let w = W(1 <<< 16)
@@ -827,7 +830,6 @@ type private Writer(c: Conn) =
     let rare = List<WJob>()
     let seen = HashSet<struct (int * int64)>()
     let deferred = List<WJob>()
-    let reader = Reader(c)
 
     let statement (onRow: unit -> unit) =
         let mutable ok = true
@@ -883,9 +885,10 @@ type private Writer(c: Conn) =
         w.Raw ""","following":false}}}"""B
         response 201 (w.Span(0, w.Length))
 
-    /// Favorites, follows and comments of many users in one implicit transaction (one Sync). The favorite and
-    /// follow answers are read inside it, after the writes, with the read path's statements; nothing is
-    /// answered until it has committed. False if anything failed (then nothing was committed).
+    /// Favorites, follows and comments of many users in one implicit transaction (one Sync). Once it has
+    /// committed, comments are answered from their RETURNING rows, and favorites and follows go on to the read
+    /// lane, which answers them with the article or profile as it is now. False if anything failed (then nothing
+    /// was committed).
     let group (favs: List<WJob>) (fols: List<WJob>) (adds: List<WJob>) (dels: List<WJob>) : bool =
         let o = c.Out
         let favAdd = List(favs |> Seq.filter (fun j -> j.Kind = WKind.FavAdd))
@@ -929,12 +932,6 @@ type private Writer(c: Conn) =
             o.ArrEnd()
             o.EndBind()
             o.Execute()
-        let readBatch = List<RJob>()
-        for j in favs do
-            readBatch.Add(RJob(RKind.Article, j.Dest, Viewer = j.Viewer, Key = j.Key))
-        for j in fols do
-            readBatch.Add(RJob(RKind.Profile, j.Dest, Viewer = j.Viewer, Key = j.Key))
-        if readBatch.Count > 0 then reader.Prepare readBatch
         o.Sync()
         c.Send()
         let mutable ok = true
@@ -948,10 +945,13 @@ type private Writer(c: Conn) =
         let delRows = Dictionary<int, int64>()
         if ok && adds.Count > 0 then check (statement (fun () -> cmtRows.[c.Int8 0] <- commentReply ()))
         if ok && dels.Count > 0 then check (statement (fun () -> delRows.[int (c.Int8 0) - 1] <- c.Int8 1))
-        if ok && readBatch.Count > 0 then ok <- reader.Collect()
         finishSync ()
         if ok then
-            if readBatch.Count > 0 then reader.Answer true
+            // committed: the favorite and follow answers (article, profile) are read by the read lane
+            for j in favs do
+                readLane.Push(RJob(RKind.Article, j.Dest, Viewer = j.Viewer, Key = j.Key))
+            for j in fols do
+                readLane.Push(RJob(RKind.Profile, j.Dest, Viewer = j.Viewer, Key = j.Key))
             for j in adds do
                 match cmtRows.TryGetValue j.Viewer with
                 | true, b -> reply j b
@@ -1152,8 +1152,6 @@ type private Writer(c: Conn) =
 
 // ---------------- lanes and their connection threads ----------------
 
-let mutable readLane: Lane<RJob> = Unchecked.defaultof<_>
-let mutable writeLane: Lane<WJob> = Unchecked.defaultof<_>
 
 let private connect (url: string) (options: string) =
     let c = new Conn(url, options)
@@ -1169,6 +1167,7 @@ let private failAll (batch: List<'T>) (ex: exn) =
         reply j err
 
 let private readThread (url: string) (options: string) () =
+    Sys.schedThread ()
     let mutable c = connect url options
     let mutable r = Reader(c, Dump = not (isNull dumpPath))
     let batch = List<RJob>()
@@ -1184,6 +1183,7 @@ let private readThread (url: string) (options: string) () =
             r <- Reader(c, Dump = not (isNull dumpPath))
 
 let private writeThread (url: string) (options: string) () =
+    Sys.schedThread ()
     let mutable c = connect url options
     let mutable wr = Writer(c)
     let batch = List<WJob>()

@@ -22,3 +22,19 @@ Script: `experiments/h.sh`.
   counts 15.3 ms -> 10.1 ms on the side cluster (every seeded tag has 1,000+ articles).
 - **Note on low load**: at 25k users app CPU per request is high (97 µs) partly because bcrypt rarely fills its
   lanes (36 ms per single-lane hash vs ~10 ms per hash at 5-6 lanes).
+- **e04 profile, 50k and 150k users** (cpu mode, perf on the app, pg_stat_statements on the cluster):
+  - 50k: 141 µs/req (app 82, PG 59); 150k: 130 µs/req (app 65.5, PG 64.4). #87 at 150k: 110 (app 45.6, PG 64.4).
+    So the first build is no better than #87.
+  - App: bcrypt threads 38-40% of app CPU (logins rarely filled the lanes: 41 logins/s at 150k came out at about
+    25 ms per hash). I/O threads 21-36%, mostly kernel TCP. Write threads 18% at 50k, nearly all of it in
+    `System.Threading.Condition::Wait`: the timed `Monitor.Wait` of the 5 ms write clock spins before it
+    blocks, and the four write threads did that for every tiny batch.
+  - Postgres, 50 s at 50k: `rd` 26.0 s in 8,962 calls, comments 6.7 s in 2,198 calls, comment insert 0.7 s,
+    favorite insert 0.6 s, tags 0.4 s, profiles 0.3 s. Only ~2,200 of the `rd` calls were read batches; the rest
+    came from write batches answering their favorites (0.2-0.3 ms each for one article). A read batch's `rd`
+    averaged ~10 ms for ~135 list and article requests: about 75 µs each.
+- **e05**: bcrypt waits up to 250 ms for 6 lanes (logins are ~0.1% of requests; 6 lanes cost 11 ms per hash).
+- **e06**: lanes without timed waits: one idle thread is the leader and sleeps out the clock (`Thread.Sleep`),
+  the others block untimed.
+- **e07**: write batches no longer read their answers in the transaction: after commit, favorites and follows go
+  to the read lane (as an article or profile read), where they share the batch's `rd`.
