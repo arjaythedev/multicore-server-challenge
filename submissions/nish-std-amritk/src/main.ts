@@ -21,7 +21,7 @@
 // and BCRYPT_HASH_MS (20) for sign-ups (bcrypt-service.ts),
 // BCRYPT_PORT (47391), BCRYPT_NICE (0; 1 to 19 lowers the bcrypt services'
 // priority, and "idle" moves them to SCHED_IDLE), IDLE_TIMEOUT_MS (75000) and
-// BCRYPT_WIDTH (6; 0 times it at startup; 1 to 6 lanes a call),
+// BCRYPT_WIDTH (start.sh passes the width build.sh measured, else 6; 0 times it at startup; 1 to 6 lanes a call),
 // ACK_DELAY (0 leaves the kernel's ACKs alone; 1 turns delayed ACKs back on after each answer, worker.ts `ackDelayAfter`),
 // GZIP (0; 1 when it saves a TCP segment, 2 whenever it saves anything), GZIP_MIN (1300),
 // READ_SERVICE (1; 0 leaves each worker its own plans), READ_SERVICE_CONNS (12), READ_SERVICE_PLANS (20),

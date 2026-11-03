@@ -9,8 +9,8 @@ statements run on two connections side by side, and plans hold up to 4,096
 reads over a 60 ms window instead of 2,048 over 40 ms. Since #159: one read
 service holds every read plan of the box, each author of a plan is read once,
 a feed no longer asks whether its viewer follows the authors it was built
-from, a login's check waits 80 ms for company instead of 160, bcrypt always
-runs six lanes, and delayed ACKs are left to the kernel. Since #116,
+from, a login's check waits 80 ms for company instead of 160, bcrypt's
+batch width is measured once at build time, and delayed ACKs are left to the kernel. Since #116,
 most of it to
 cut what Postgres spends a request: favorite counts leave `plan_meta` for a
 count lane of their own, an idea of this submission's (below); two HTTP
@@ -237,13 +237,28 @@ and four on the box), and
   175,000 users on the Xeon VM, two with it and two without, leaving the ACKs
   to the kernel cut the CPU outside Postgres by about 8% and p99 from
   366–1,844 ms to 463–569, so it is off.
-- **bcrypt at six lanes.** Each process used to time bcrypt's widths at
-  startup (`bcryptCalibrate`), all at once; on the Xeon VM they chose three
-  lanes on one start and five on the next, and three cost about 5% of the box
-  (a hold's CPU outside Postgres, 202 s a minute against 184 at six). Six is
-  the fastest on both CPUs measured, so it is the default; `BCRYPT_WIDTH=0`
-  times it again. bcrypt is about a quarter of the Xeon VM's CPU at these
-  loads, about 32 ms of CPU a login.
+- **bcrypt's width, measured at build time.** Each process used to time
+  bcrypt's widths at startup (`bcryptCalibrate`), all at once; on the Xeon VM
+  they chose three lanes on one start and five on the next, and three cost
+  about 5% of the box (a hold's CPU outside Postgres, 202 s a minute against
+  184 at six). The fastest width is a property of the core, though, not a
+  constant: five lanes beat six on the Xeon Platinum 8260 VM, six beat five on
+  a Ryzen 9 9950X, by 2 to 5% a hash. So `build.sh` builds and runs
+  `src/bcrypt-width.ts` once, alone on the quiet machine: it times widths 3
+  to 6 at cost 8, interleaved over nine rounds, takes each one's median and
+  writes the fastest to `bin/bcrypt-width.txt`, about a second. It picked 5
+  on the Xeon VM six runs out of six and 6 on the Ryzen five out of five.
+  `start.sh` passes it on as `BCRYPT_WIDTH` unless one is set; without the
+  file the server runs six. bcrypt is about a quarter of the Xeon VM's CPU at
+  these loads, about 32 ms of CPU a login.
+- **Built for the machine it runs on.** The challenge builds on the box, so
+  `build.sh` builds for x86-64-v3 (AVX2, BMI2, FMA) when `/proc/cpuinfo` lists
+  every feature of it, and for baseline x86-64 otherwise. Neither choice
+  moved a whole hold past its noise: on the Xeon VM at 175,000 users the
+  CPU outside Postgres was 70.3–71.8 µs a request built this way (v3, five
+  lanes) against 70.4–71.8 at baseline and six, two holds each, and the
+  saturated run below passed 230,000 both ways. They cost nothing and keep
+  each core at the width its own timing picks.
 - **Durable group commit.** While a batch is in flight on the write
   connection, the writes that arrive wait. Then up to 128 of them go as one
   group: one transaction, one commit, and one WAL flush. Each response is
@@ -307,7 +322,7 @@ CPUs, at least 2),
 `READ_PLAN_CLOCK` (1; 0 starts a plan at once while none is in flight, 2
 is adaptive) and `READ_PLAN_LIGHT` (32), `BCRYPT_WORKERS` (half the CPUs,
 at least 2), `BCRYPT_BATCH_MS` (80) and `BCRYPT_HASH_MS` (20),
-`BCRYPT_WIDTH` (6; 0 times the widths at startup; 1 to 6 lanes a call),
+`BCRYPT_WIDTH` (what `build.sh` measured, else 6; 0 times the widths at startup; 1 to 6 lanes a call),
 `GZIP` (0; 1 when it saves a TCP segment, 2 whenever it saves anything; at
 145,000 users on the VM it cost about 30 µs a request and failed the hold),
 `GZIP_MIN` (1300),
@@ -378,8 +393,7 @@ softirq, and once clients time out the kernel runs out of orphan sockets, so
 overload there says little about either build.
 
 In `91dd6fd`, bcrypt was 12.3 of the server's 23.0 µs on this machine (about
-11 ms of CPU a login), the HTTP workers 6.7 and the read service 3.8. Building with `--cpu x86-64-v3` measured
-the same, so the build stays at baseline x86-64.
+11 ms of CPU a login), the HTTP workers 6.7 and the read service 3.8.
 
 ### On the fixed load box
 
