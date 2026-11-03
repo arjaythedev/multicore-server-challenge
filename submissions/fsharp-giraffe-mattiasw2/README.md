@@ -84,6 +84,12 @@ and never inside SQL, a transaction or a commit group.
     (12 on 6 vCPUs) changed nothing but each batch's time: lanes are backends, not cores. The shutdown line
     `read timings` gives p50/p95/p99 of a request's wait for its batch, a batch's execution and a request's whole
     time in the read path; `read batch phases` splits a batch into phase A, the plan, phase B and the assembly.
+  - **Fair share (`READ_SHARE_MIN`, 64).** A gathering lane takes what waits divided by the idle lanes (itself
+    included), at least 64 and at most `READ_BATCH`, and leaves the rest to the next idle lane, which takes it at once
+    (it has already waited out the window). A burst that arrives while lanes are idle then runs on several backends
+    at once instead of one; with every other lane busy (full speed) the share is everything, the biggest batch.
+    Back to back at 125,000 users on 6 vCPUs: p95 719 vs 778 ms, p99 915 vs 1,002, twice the batches at half the
+    batch time, the same CPU (99%).
   - **Split phase B (`READ_SPLIT`, off).** Phase B can be cut by article over `READ_SPLIT` connections per lane,
     all reading phase A's snapshot (`pg_export_snapshot`, then `SET TRANSACTION SNAPSHOT` on each helper; the
     batch property test covers it). On a CPU that is already full it lost: at 125,000 users on 6 vCPUs p95 571 ms
@@ -138,8 +144,16 @@ and never inside SQL, a transaction or a commit group.
   lanes (default (cores + 2) / 4: 2 on 8 cores), each with a connection of its own, take whatever queued while their previous group was in flight
   (up to `WRITE_GROUP`, default 128) and send it as one `NpgsqlBatch`. That is one round trip and one implicit
   transaction, ended by the batch's Sync, so the whole group shares one commit and one WAL flush. Each caller is
-  answered only after that commit (ReadyForQuery). There is no timer: with no load a group is one write, and under
-  load the groups grow by themselves.
+  answered only after that commit (ReadyForQuery). Under load the groups grow by themselves.
+  - A group smaller than `WRITE_GROUP_MIN` (8) waits for company
+    until its oldest write has waited `WRITE_GATHER_MS` (2): otherwise a lane that wakes for the first write while the
+    other commits takes it nearly alone. Interleaved at 125,000 users on 6 vCPUs it cut the commits by 11-12% and the
+    write queue's peaks (53-129 writes instead of 408-573), at the same CPU. Ten groups a second instead
+    (`WRITE_LANES=1 WRITE_GATHER_MS=100 WRITE_GROUP_MIN=100000 WRITE_GROUP=1024`) cut the commits from 117-162 to 8-9
+    a second and changed nothing else measurable but the writes, ~100 ms slower. Snapshots are not why: a uprobe on
+    Postgres's `GetSnapshotData` counted ~7,000-7,500 calls a second either way, ~90% on the write connections (3-4 per
+    write), 1.2 µs each at the median with the probe's own trap, under 2% of one core in all; the read lanes take
+    30-70 a second.
   - If the server refuses one statement (a UNIQUE name, a deadlock between lanes), it rolls the whole group back, so
     none of it happened. Each write then runs again in its own transaction, and only the bad one fails.
   - If the connection breaks, whether the group committed is unknown, so its writes fail (500) instead of being
@@ -384,7 +398,7 @@ SKIP_CONFORMANCE=1 bash check.sh  # the quick gate, no database
 ```
 
 Environment: `DATABASE_URL`, `JWT_SECRET` (required); `HOST` (127.0.0.1), `PORT` (3000); `READ_LANES` (cores);
-`READ_BATCH` (2048); `READ_GATHER_MS` (25); `READ_SPLIT` (1, off); `READ_SPLIT_MIN` (64); `WRITE_LANES` ((cores + 2) / 4: 2 on 8 or 6 cores); `WRITE_GROUP` (128); `DB_POOL_SIZE` (cores / 2, capped so the total stays
+`READ_BATCH` (2048); `READ_GATHER_MS` (25); `READ_SHARE_MIN` (64; 0 takes everything up to `READ_BATCH`); `READ_SPLIT` (1, off); `READ_SPLIT_MIN` (64); `WRITE_LANES` ((cores + 2) / 4: 2 on 8 or 6 cores); `WRITE_GROUP` (128); `WRITE_GROUP_MIN` (8) and `WRITE_GATHER_MS` (2; 0 never waits); `DB_POOL_SIZE` (cores / 2, capped so the total stays
 at most 95); `BCRYPT_THREADS` ((cores + 2) / 4); `BCRYPT_WIDTH` (4); `BCRYPT_GATHER_MS` (150); `STATS_SECONDS` (0, off); `PHASES_FILE` (none); `BATCH_LOG`, `BATCH_LOG_MS` (25), `BATCH_LOG_PG_CGROUP` (none); `PG_OPTIONS` (the four session settings above); `SCHED_BATCH` (1).
 
 `STATS_SECONDS=1` prints one diagnostic line a second on stderr (`src/Web/Stats.fs`), to line up against the load
@@ -420,6 +434,10 @@ queue, the reads answered and the write queue. Laid out as a Gantt per lane, it 
 vCPUs at 120,000 users the cores were 92% busy on average; under 3.5% of the time was GC, and only 1% of the
 25 ms samples under 80% busy held a GC pause. A gen0 budget of 256 MB instead of 64 changed nothing, and 512 MB
 cost more CPU per request.
+
+Each kind of connection names itself in Postgres (`application_name`): `conduit-read` (the read lanes),
+`conduit-write` (the write lanes) and `conduit-pool` (the multiplexed pool), so `pg_stat_activity` and probes on
+the backends can tell them apart.
 
 A seconds-long stall that shows up in `pause` (and `dt`) is GC. If `pause` stays small while `reads q` and `worst`
 grow, requests are queueing for the database.

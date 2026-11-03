@@ -160,23 +160,27 @@ type Sampler(every: TimeSpan, reads: Engine.Reads.Gather, writes: Engine.Commit.
 
     member _.Start() =
         let sample () =
-            while true do
-                Thread.Sleep every
-                let i = Interlocked.Increment &next[0]
-                if i < capacity then
-                    let busy, total = cores ()
-                    let _, answered = reads.Counts
-                    let at = i * fields
-                    rows[at] <- unixAt0 + (Stopwatch.GetTimestamp() - ticksAt0) * 1_000_000L / Stopwatch.Frequency
-                    rows[at + 1] <- int64 Environment.CpuUsage.TotalTime.TotalMicroseconds
-                    rows[at + 2] <- pg ()
-                    rows[at + 3] <- busy
-                    rows[at + 4] <- total
-                    rows[at + 5] <- int64 (GC.GetTotalPauseDuration().TotalMicroseconds)
-                    rows[at + 6] <- int64 reads.Busy
-                    rows[at + 7] <- int64 reads.Depth
-                    rows[at + 8] <- answered
-                    rows[at + 9] <- int64 writes.Depth
+            try
+                while true do
+                    Thread.Sleep every
+                    let i = Interlocked.Increment &next[0]
+                    if i < capacity then
+                        let busy, total = cores ()
+                        let _, answered = reads.Counts
+                        let at = i * fields
+                        rows[at] <- unixAt0 + (Stopwatch.GetTimestamp() - ticksAt0) * 1_000_000L / Stopwatch.Frequency
+                        rows[at + 1] <- int64 Environment.CpuUsage.TotalTime.TotalMicroseconds
+                        rows[at + 2] <- pg ()
+                        rows[at + 3] <- busy
+                        rows[at + 4] <- total
+                        rows[at + 5] <- int64 (GC.GetTotalPauseDuration().TotalMicroseconds)
+                        rows[at + 6] <- int64 reads.Busy
+                        rows[at + 7] <- int64 reads.Depth
+                        rows[at + 8] <- answered
+                        rows[at + 9] <- int64 writes.Depth
+            with e ->
+                // A diagnostic must never take the server down.
+                eprintfn "sampler stopped: %s" e.Message
         Thread(sample, IsBackground = true, Name = "sampler").Start()
 
     member _.Write(path: string) =
@@ -281,4 +285,10 @@ let start (every: TimeSpan) (connections: Connections) (reads: Engine.Reads.Gath
             full <- full'
             background <- background'
 
-    Thread(sample, IsBackground = true, Name = "stats").Start()
+    // A diagnostic must never take the server down.
+    let guarded () =
+        try
+            sample ()
+        with e ->
+            eprintfn "stats stopped: %s" e.Message
+    Thread(guarded, IsBackground = true, Name = "stats").Start()

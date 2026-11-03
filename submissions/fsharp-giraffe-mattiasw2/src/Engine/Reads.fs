@@ -672,9 +672,11 @@ let private unexpected (a: Answer) : 'a = invalidOp $"Reads: unexpected answer {
 /// if `maxBatch` of them arrive sooner): bigger batches share more, and the wait is inside the
 /// latency budget.
 [<Sealed>]
-type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpan, split: int, perPart: int, logCapacity: int) =
+type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpan, split: int, perPart: int, shareMin: int, logCapacity: int) =
     let queue =
-        Channel.CreateUnbounded<Pending>(UnboundedChannelOptions(SingleReader = (lanes = 1), SingleWriter = false))
+        // Never SingleReader, even with one lane: a single-reader channel cannot report its length
+        // (Depth), which the diagnostics read.
+        Channel.CreateUnbounded<Pending>(UnboundedChannelOptions(SingleReader = false, SingleWriter = false))
     let ds = NpgsqlDataSource.Create connectionString
     let counts = [| 0L; 0L |] // batches, requests
     let queued = Db.Millis() // per request: arrived -> taken into a batch
@@ -699,9 +701,24 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
         if ticks > seen && Interlocked.CompareExchange(&worst[0], ticks, seen) <> seen then
             noteWorst ticks
 
+    /// How many requests the gathering lane takes: its fair share of what waits, so that a burst
+    /// arriving while lanes are idle is spread over them and runs on several backends at once,
+    /// instead of one batch running on one backend while the others wait. The share is what waits
+    /// (taken + queued) over the idle lanes, this one included, at least `shareMin` and at most
+    /// `maxBatch`. With every other lane busy (full speed) it is everything up to `maxBatch`, as
+    /// big as a batch gets, since that shares the most work. shareMin = 0 turns it off.
+    let share (taken: int) =
+        if shareMin <= 0 then
+            maxBatch
+        else
+            let idle = max 1 (lanes - int (Volatile.Read &busy[0]))
+            let waiting = taken + queue.Reader.Count
+            min maxBatch (max shareMin ((waiting + idle - 1) / idle))
+
     let take (into: ResizeArray<Pending>) =
+        let limit = share into.Count
         let mutable p = Unchecked.defaultof<Pending>
-        while into.Count < maxBatch && queue.Reader.TryRead(&p) do
+        while into.Count < limit && queue.Reader.TryRead(&p) do
             into.Add p
 
     let rollback (conn: NpgsqlConnection) : Task =
@@ -758,7 +775,7 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
                     take pending
                     // (Ticks, not TimeSpan's `>`: F#'s generic comparison boxes structs.)
                     let mutable waiting = gather.Ticks > 0L && pending.Count > 0
-                    while waiting && pending.Count < maxBatch do
+                    while waiting && pending.Count < share pending.Count do
                         let left = gather - Diagnostics.Stopwatch.GetElapsedTime pending[0].Arrived
                         if left.Ticks > 0L then
                             do! Task.Delay(if left.Ticks < tick.Ticks then left else tick)

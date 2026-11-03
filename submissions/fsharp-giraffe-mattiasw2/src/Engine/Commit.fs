@@ -98,9 +98,11 @@ let private execute (conn: NpgsqlConnection) (group: IWrite list) : Task =
 /// The process's write side: `lanes` dedicated connections (not multiplexed: a batch's implicit
 /// transaction needs a connection of its own), each committing one group at a time.
 [<Sealed>]
-type Writer(connectionString: string, lanes: int, maxGroup: int) =
+type Writer(connectionString: string, lanes: int, maxGroup: int, minGroup: int, gather: TimeSpan) =
     let queue =
-        Channel.CreateUnbounded<IWrite>(UnboundedChannelOptions(SingleReader = (lanes = 1), SingleWriter = false))
+        // Never SingleReader, even with one lane: a single-reader channel cannot report its length
+        // (Depth), which the diagnostics read.
+        Channel.CreateUnbounded<IWrite>(UnboundedChannelOptions(SingleReader = false, SingleWriter = false))
     let ds = NpgsqlDataSource.Create connectionString
     let counts = [| 0L; 0L; 0L; 0L; 0L |] // groups, writes, groups refused and rerun alone, writes failed alone, Stopwatch ticks executing
     let queued = Db.Millis() // per write: arrived -> taken into a group
@@ -151,6 +153,19 @@ type Writer(connectionString: string, lanes: int, maxGroup: int) =
             let group = ResizeArray<IWrite>(maxGroup)
             while! queue.Reader.WaitToReadAsync() do
                 take group
+                // A small group waits for company: until it holds `minGroup` writes or its oldest
+                // has waited `gather`, whichever comes first. Without it, a lane that wakes for the
+                // first write while the other lane commits takes that write nearly alone, and the
+                // lanes split the stream into groups of 2-6, a commit and a WAL flush each.
+                // (Ticks, not TimeSpan's `>`: F#'s generic comparison boxes structs.)
+                let mutable waiting = gather.Ticks > 0L && group.Count > 0
+                while waiting && group.Count < minGroup do
+                    let left = gather - Diagnostics.Stopwatch.GetElapsedTime group[0].Arrived
+                    if left.Ticks > 0L then
+                        do! Task.Delay left
+                        take group
+                    else
+                        waiting <- false
                 if group.Count > 0 then
                     let writes = List.ofSeq group
                     group.Clear()

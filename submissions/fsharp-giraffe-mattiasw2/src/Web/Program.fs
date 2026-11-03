@@ -84,6 +84,10 @@ let main args =
     // WRITE_GROUP writes at a time.
     let writeLanes = max 1 (int (setting "WRITE_LANES" (string quarter)))
     let writeGroup = max 1 (int (setting "WRITE_GROUP" "128"))
+    // A group smaller than WRITE_GROUP_MIN waits for company until its oldest write has waited
+    // WRITE_GATHER_MS (0: never waits, as before).
+    let writeGroupMin = max 1 (int (setting "WRITE_GROUP_MIN" "8"))
+    let writeGather = TimeSpan.FromMilliseconds(float (setting "WRITE_GATHER_MS" "2"))
     // Read batching: READ_LANES connections of their own, each running one batch of up to
     // READ_BATCH requests at a time. One busy backend per core.
     let readLanes = max 1 (int (setting "READ_LANES" (string cores)))
@@ -93,6 +97,9 @@ let main args =
     // once (1: off), each part at least READ_SPLIT_MIN distinct articles.
     let readSplit = max 1 (int (setting "READ_SPLIT" "1"))
     let readSplitMin = max 1 (int (setting "READ_SPLIT_MIN" "64"))
+    // A gathering lane takes its fair share of what waits (what waits over the idle lanes), at
+    // least READ_SHARE_MIN (64; 0: take everything up to READ_BATCH, as before).
+    let readShareMin = max 0 (int (setting "READ_SHARE_MIN" "64"))
     // A fine timeline for diagnostics (off unless BATCH_LOG is set): a batch log and a sample of
     // CPU, GC and queues every BATCH_LOG_MS (25), written at shutdown to BATCH_LOG.batches.csv and
     // BATCH_LOG.samples.csv. BATCH_LOG_PG_CGROUP: Postgres's cgroup cpu.stat, for its CPU.
@@ -117,17 +124,27 @@ let main args =
             connections.Count listen
 
     Engine.Passwords.start bcryptLanes bcryptWidth bcryptGather
-    let ds = Engine.Db.dataSource (Engine.Db.connectionString databaseUrl poolSize true)
+    // Each kind of connection names itself, so Postgres's own views (pg_stat_activity) and
+    // probes on its backends can tell the read lanes, the write lanes and the pool apart.
+    let named (role: string) (connectionString: string) = $"{connectionString};Application Name=conduit-{role}"
+    let ds = Engine.Db.dataSource (named "pool" (Engine.Db.connectionString databaseUrl poolSize true))
     let writes =
-        Engine.Commit.Writer(Engine.Db.connectionString databaseUrl writeLanes false, writeLanes, writeGroup)
+        Engine.Commit.Writer(
+            named "write" (Engine.Db.connectionString databaseUrl writeLanes false),
+            writeLanes,
+            writeGroup,
+            writeGroupMin,
+            writeGather
+        )
     let reads =
         Engine.Reads.Gather(
-            Engine.Db.connectionString databaseUrl (readLanes * readSplit) false,
+            named "read" (Engine.Db.connectionString databaseUrl (readLanes * readSplit) false),
             readLanes,
             readBatch,
             readGather,
             readSplit,
             readSplitMin,
+            readShareMin,
             (if batchLog = "" then 0 else 400_000)
         )
     let env: Handlers.Env =
@@ -193,8 +210,8 @@ let main args =
     // Touch the database before taking traffic: a bad DATABASE_URL fails here, loudly.
     (Engine.Tags.all reads).GetAwaiter().GetResult() |> ignore
     eprintfn
-        "conduit (F#, Giraffe on Kestrel) on %s:%d, %d cores: %d read lanes (batches of <= %d, gather %d ms, phase B on %d connections from %d articles each) + %d write lanes (groups of <= %d) + %d multiplexed db connections, %d bcrypt threads (%d wide), server GC %b"
-        host port cores readLanes readBatch (int readGather.TotalMilliseconds) readSplit readSplitMin writeLanes writeGroup poolSize bcryptLanes
+        "conduit (F#, Giraffe on Kestrel) on %s:%d, %d cores: %d read lanes (batches of <= %d, gather %d ms, fair share from %d, phase B on %d connections from %d articles each) + %d write lanes (groups of <= %d, waiting %d ms for %d) + %d multiplexed db connections, %d bcrypt threads (%d wide), server GC %b"
+        host port cores readLanes readBatch (int readGather.TotalMilliseconds) readShareMin readSplit readSplitMin writeLanes writeGroup (int writeGather.TotalMilliseconds) writeGroupMin poolSize bcryptLanes
         bcryptWidth Runtime.GCSettings.IsServerGC
     let sampler =
         if batchLog = "" then
