@@ -43,7 +43,7 @@ type private Pending<'r>(statements: Statement list, read: RowReader -> 'r) =
     let reply = TaskCompletionSource<'r list>(TaskCreationOptions.RunContinuationsAsynchronously)
     let mutable rows: 'r list = []
     let arrived = Diagnostics.Stopwatch.GetTimestamp()
-    let trace = Db.Trace.Current.Value
+    let trace = if Db.Millis.Enabled then Db.Trace.Current.Value else null
     member _.Task = reply.Task
 
     interface IWrite with
@@ -170,9 +170,10 @@ type Writer(connectionString: string, lanes: int, maxGroup: int, minGroup: int, 
                     let writes = List.ofSeq group
                     group.Clear()
                     let taken = Diagnostics.Stopwatch.GetTimestamp()
-                    for w in writes do
-                        queued.Record(Diagnostics.Stopwatch.GetElapsedTime(w.Arrived, taken))
-                        if not (isNull w.Trace) then w.Trace.WriteQueued <- taken - w.Arrived
+                    if Db.Millis.Enabled then
+                        for w in writes do
+                            queued.Record(Diagnostics.Stopwatch.GetElapsedTime(w.Arrived, taken))
+                            if not (isNull w.Trace) then w.Trace.WriteQueued <- taken - w.Arrived
                     try
                         if isNull conn || conn.State <> ConnectionState.Open then
                             if not (isNull conn) then conn.Dispose()
@@ -184,11 +185,12 @@ type Writer(connectionString: string, lanes: int, maxGroup: int, minGroup: int, 
                         for w in writes do
                             w.Failed e
                     let finished = Diagnostics.Stopwatch.GetTimestamp()
-                    executed.Record(Diagnostics.Stopwatch.GetElapsedTime(taken, finished))
                     Interlocked.Add(&counts[4], finished - taken) |> ignore
-                    for w in writes do
-                        answered.Record(Diagnostics.Stopwatch.GetElapsedTime(w.Arrived, finished))
-                        if not (isNull w.Trace) then w.Trace.WriteExecuted <- finished - taken
+                    if Db.Millis.Enabled then
+                        executed.Record(Diagnostics.Stopwatch.GetElapsedTime(taken, finished))
+                        for w in writes do
+                            answered.Record(Diagnostics.Stopwatch.GetElapsedTime(w.Arrived, finished))
+                            if not (isNull w.Trace) then w.Trace.WriteExecuted <- finished - taken
                     Interlocked.Increment(&counts[0]) |> ignore
                     Interlocked.Add(&counts[1], int64 writes.Length) |> ignore
         }

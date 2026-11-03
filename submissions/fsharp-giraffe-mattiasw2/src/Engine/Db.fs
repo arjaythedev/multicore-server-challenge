@@ -66,16 +66,20 @@ let rec isUniqueViolation (e: exn) : bool =
     | e -> isUniqueViolation e.InnerException
 
 /// Durations in 1 ms buckets (the last bucket holds everything from 2 s up), for the shutdown
-/// lines: cheap enough to record every request.
+/// lines. Off unless `Enabled` (a diagnostic is on: STATS_SECONDS or BATCH_LOG): every record is
+/// two interlocked adds on lines that all the lanes share.
 [<Sealed>]
 type Millis() =
     let buckets: int64[] = Array.zeroCreate 2001
     let micros = [| 0L |] // the exact sum, for the mean (phases' means add up; percentiles do not)
 
+    static member val Enabled = false with get, set
+
     member _.Record(elapsed: TimeSpan) =
-        let ms = int elapsed.TotalMilliseconds
-        Interlocked.Increment(&buckets[if ms < 0 then 0 elif ms > 2000 then 2000 else ms]) |> ignore
-        Interlocked.Add(&micros[0], int64 elapsed.TotalMicroseconds) |> ignore
+        if Millis.Enabled then
+            let ms = int elapsed.TotalMilliseconds
+            Interlocked.Increment(&buckets[if ms < 0 then 0 elif ms > 2000 then 2000 else ms]) |> ignore
+            Interlocked.Add(&micros[0], int64 elapsed.TotalMicroseconds) |> ignore
 
     member _.Count = Array.sum buckets
 

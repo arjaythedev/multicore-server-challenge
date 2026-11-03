@@ -84,6 +84,8 @@ and never inside SQL, a transaction or a commit group.
     (12 on 6 vCPUs) changed nothing but each batch's time: lanes are backends, not cores. The shutdown line
     `read timings` gives p50/p95/p99 of a request's wait for its batch, a batch's execution and a request's whole
     time in the read path; `read batch phases` splits a batch into phase A, the plan, phase B and the assembly.
+    These timings (and the `write timings` line) are recorded only while a diagnostic is on (`STATS_SECONDS` or
+    `BATCH_LOG`): each record is two interlocked adds on counters every lane shares. Off, the lines print `-`.
   - **Fair share (`READ_SHARE_MIN`, 64).** A gathering lane takes what waits divided by the idle lanes (itself
     included), at least 64 and at most `READ_BATCH`, and leaves the rest to the next idle lane, which takes it at once
     (it has already waited out the window). A burst that arrives while lanes are idle then runs on several backends

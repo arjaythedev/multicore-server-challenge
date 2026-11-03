@@ -656,7 +656,7 @@ let answer (conn: NpgsqlConnection) (reads: Read[]) : Task<Answer[]> = answerWit
 type private Pending(read: Read) =
     let reply = TaskCompletionSource<Answer>(TaskCreationOptions.RunContinuationsAsynchronously)
     let arrived = Diagnostics.Stopwatch.GetTimestamp()
-    let trace = Db.Trace.Current.Value
+    let trace = if Db.Millis.Enabled then Db.Trace.Current.Value else null
     member _.Read = read
     member _.Arrived = arrived
     member _.Trace = trace
@@ -790,9 +790,10 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
                     let taken = Diagnostics.Stopwatch.GetTimestamp()
                     let laps: int64[] = if logCapacity > 0 then Array.zeroCreate 4 else null
                     Interlocked.Increment(&busy[0]) |> ignore
-                    for p in batch do
-                        queued.Record(Diagnostics.Stopwatch.GetElapsedTime(p.Arrived, taken))
-                        if not (isNull p.Trace) then p.Trace.ReadQueued <- taken - p.Arrived
+                    if Db.Millis.Enabled then
+                        for p in batch do
+                            queued.Record(Diagnostics.Stopwatch.GetElapsedTime(p.Arrived, taken))
+                            if not (isNull p.Trace) then p.Trace.ReadQueued <- taken - p.Arrived
                     try
                         for i in 0 .. conns.Length - 1 do
                             if isNull conns[i] || conns[i].State <> ConnectionState.Open then
@@ -815,10 +816,11 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
                             for k in 0..3 do
                                 logged[at + 3 + k] <- laps[k]
                     Interlocked.Decrement(&busy[0]) |> ignore
-                    executed.Record(Diagnostics.Stopwatch.GetElapsedTime(taken, finished))
-                    for p in batch do
-                        answered.Record(Diagnostics.Stopwatch.GetElapsedTime(p.Arrived, finished))
-                        if not (isNull p.Trace) then p.Trace.ReadExecuted <- finished - taken
+                    if Db.Millis.Enabled then
+                        executed.Record(Diagnostics.Stopwatch.GetElapsedTime(taken, finished))
+                        for p in batch do
+                            answered.Record(Diagnostics.Stopwatch.GetElapsedTime(p.Arrived, finished))
+                            if not (isNull p.Trace) then p.Trace.ReadExecuted <- finished - taken
                     // The queue is FIFO, so the batch's first request waited longest.
                     noteWorst (Diagnostics.Stopwatch.GetElapsedTime(batch[0].Arrived, finished)).Ticks
                     Interlocked.Increment(&counts[0]) |> ignore

@@ -118,6 +118,8 @@ let main args =
     let bcryptGather = TimeSpan.FromMilliseconds(float (setting "BCRYPT_GATHER_MS" "150"))
     // Diagnostics: a line on stderr every STATS_SECONDS (fractions allowed); 0, the default, is off.
     let statsEvery = TimeSpan.FromSeconds(float (setting "STATS_SECONDS" "0"))
+    // The read and write timings (the shutdown lines) only while a diagnostic is on.
+    Engine.Db.Millis.Enabled <- statsEvery.Ticks > 0L || batchLog <> ""
     let connections = Stats.Connections()
     let listening (listen: ListenOptions) =
         if statsEvery.Ticks > 0L then
