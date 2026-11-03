@@ -145,10 +145,45 @@ static ngx_http_module_t ngx_http_sql_module_ctx = {
     ngx_http_sql_create_loc_conf, NULL
 };
 
+static void ngx_http_sql_exit_process(ngx_cycle_t *cycle);
+
 ngx_module_t ngx_http_sql_module = {
     NGX_MODULE_V1, &ngx_http_sql_module_ctx, ngx_http_sql_commands, NGX_HTTP_MODULE,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NGX_MODULE_V1_PADDING
+    NULL, NULL, NULL, NULL, NULL, ngx_http_sql_exit_process, NULL, NGX_MODULE_V1_PADDING
 };
+
+/* A worker exits through exit(), whose atexit handlers include OPENSSL_cleanup() (libcrypto, loaded by libpq).
+ * The thread pool module's exit_process, which runs before this one, returns as soon as each thread has *started*
+ * pthread_exit(): a thread can still be freeing its OpenSSL and malloc state while exit() frees the same globals,
+ * and the worker dies with SIGSEGV or SIGABRT ("double free") on shutdown. Wait until this is the only thread. */
+static ngx_uint_t
+thread_count(void)
+{
+    DIR           *d = opendir("/proc/self/task");
+    struct dirent *e;
+    ngx_uint_t     n = 0;
+
+    if (d == NULL) {
+        return 1;                       /* can't tell: don't wait */
+    }
+    while ((e = readdir(d)) != NULL) {
+        n += e->d_name[0] != '.';
+    }
+    closedir(d);
+    return n;
+}
+
+static void
+ngx_http_sql_exit_process(ngx_cycle_t *cycle)
+{
+    for (int ms = 0; thread_count() > 1; ms++) {
+        if (ms == 5000) {
+            ngx_log_error(NGX_LOG_WARN, cycle->log, 0, "sql: thread pool threads still running at exit");
+            return;
+        }
+        ngx_msleep(1);
+    }
+}
 
 /* ---- configuration --------------------------------------------------------------------------------------- */
 

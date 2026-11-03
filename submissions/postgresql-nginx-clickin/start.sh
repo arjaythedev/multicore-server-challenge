@@ -8,7 +8,7 @@ cd "$(dirname "$0")"
 : "${DATABASE_URL:?}" "${JWT_SECRET:?}" "${HOST:=0.0.0.0}" "${PORT:=80}"
 WORKERS=${NGINX_WORKERS:-$(nproc)}
 THREADS=${SQL_THREADS:-3}; [ $(( THREADS * WORKERS )) -gt 95 ] && THREADS=$(( 95 / WORKERS ))
-BATCH_MAX=${SQL_BATCH_MAX:-128} BATCH_INFLIGHT=${SQL_BATCH_INFLIGHT:-1} BATCH_WAIT=${SQL_BATCH_WAIT:-0ms}
+BATCH_MAX=${SQL_BATCH_MAX:-128} BATCH_INFLIGHT=${SQL_BATCH_INFLIGHT:-1} BATCH_WAIT=${SQL_BATCH_WAIT:-20ms}
 
 # HMAC-SHA256's two padded keys (RFC 2104) depend only on JWT_SECRET, so they are worked out once here and handed
 # to the SQL as hex (sql/_hmac_keys.sql). The HMAC itself is still computed in SQL for every token.
