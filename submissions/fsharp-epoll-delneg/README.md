@@ -8,7 +8,7 @@ Front: direct
 | HTTP | our own HTTP/1.1 server on epoll (P/Invoke to libc), no ASP.NET |
 | Postgres driver | our own v3 wire client: SCRAM-SHA-256, binary parameters and rows, named prepared statements, pipelining |
 | bcrypt | our own multi-lane EksBlowfish in C (`native/bcrypt.c`), compiled by `build.sh` with gcc |
-| JWT | HS256 with .NET's HMACSHA256; signature, `alg` and `exp` checked on every request |
+| JWT | HS256 with .NET's HMAC-SHA256 (one reusable context per thread); signature, `alg` and `exp` checked on every request |
 | Dependencies | FSharp.Core only, pinned in `src/packages.lock.json` |
 
 ```sh
@@ -21,23 +21,28 @@ No caches across requests, no schema or Postgres configuration changes, nothing 
 ## How a request flows
 
 ```
- 4 I/O threads (epoll, SO_REUSEPORT)      read lane, 20 ms clock         8 read connections
- parse in place, JWT, route  ─────────►   one queue for the process ───► one pipelined round trip per batch:
-                                                                          rd, comments, profiles, users, tags
+ 4 I/O threads (epoll, SO_REUSEPORT)      read lane, 20 ms clock         5 connections: rd + tags,
+ parse in place, JWT, route  ─────────►   lists, articles, tags     ───► one pipelined round trip per batch
+                             ─────────►   side lane, 20 ms clock    ───► 3 connections: comments, profiles,
+                                          comments, profiles, users      users, logins
                          ◄── per-thread reply inbox, one eventfd write per batch of replies ◄──
-                                          write lane, 5 ms clock         4 write connections
-                             ─────────►   one queue for the process ───► one implicit transaction per batch,
-                                                                          answered only after it commits
+                             ─────────►   write lane, 5 ms clock    ───► 4 connections: one implicit
+                                                                          transaction per batch, answered
+                                                                          only after it commits
                                           bcrypt: 2 threads, 6 lanes
 ```
 
-- **I/O.** Each I/O thread has its own epoll set and listener. A request that arrives in one read is parsed straight
-  from the read buffer. The handler either answers at once (validation, auth errors) or queues a job. Replies come
+- **I/O.** Each I/O thread has its own epoll set and listener, and uses `recv`/`send`, which skip the VFS layer that
+  `read`/`write` go through. A request that arrives in one read is parsed straight from the read buffer. The handler either answers at once (validation, auth errors) or queues a job. Replies come
   back through the thread's inbox, and the thread is woken once per batch of replies, not once per reply. Near the
   fd limit, the connection that has been idle longest is closed.
-- **Lanes.** All I/O threads feed one read queue and one write queue. One idle connection thread at a time sleeps
-  out the clock (`usleep`) and then takes everything queued; the others block. We started with a timed
-  `Monitor.Wait`, which spins before it blocks: on the write threads that spinning took more CPU than the writes.
+- **Lanes.** All I/O threads feed the same three queues. One idle connection thread per lane at a time sleeps out
+  the clock (`usleep`) and then takes everything queued; the others block. We started with a timed `Monitor.Wait`,
+  which spins before it blocks: on the write threads that spinning took more CPU than the writes. Reads are split in
+  two lanes so that the comments statement runs in a second backend while `rd` runs, not after it.
+- **Overload.** Past 150,000 queued jobs in a lane, new requests get 503 instead of an ever longer queue. At the fd
+  limit with no idle connection to close, a spare descriptor is given up to accept and close the newcomer, so the
+  listener can't keep the loop spinning. An error on one connection closes that connection only.
 - **One statement for list and article reads.** Every global, tag, author, favorited and feed list and every
   single-article read in a batch is one execution of one prepared statement (`rd` in `src/Sql.fs`), with the
   requests passed as arrays. Requests for pages near the top of the same list share one fetch, an article that many

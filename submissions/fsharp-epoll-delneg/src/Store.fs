@@ -1193,6 +1193,18 @@ let private failAll (batch: List<'T>) (ex: exn) =
     for j in batch do
         reply j err
 
+/// Reconnects after a failed batch, retrying while Postgres or the fd table can't take a new connection, so a
+/// connection thread never dies of the exception.
+let private reconnect (url: string) (options: string) (name: string) =
+    let mutable c = Unchecked.defaultof<Conn>
+    while isNull (box c) do
+        try
+            c <- connect url options name
+        with ex ->
+            eprintfn "%s: reconnect failed: %s" name ex.Message
+            Thread.Sleep 200
+    c
+
 let private readThread (lane: Lane<RJob>) (name: string) (url: string) (options: string) () =
     Sys.schedThread ()
     let mutable c = connect url options name
@@ -1205,8 +1217,8 @@ let private readThread (lane: Lane<RJob>) (name: string) (url: string) (options:
             r.Run batch
         with ex ->
             failAll batch ex
-            (c :> IDisposable).Dispose()
-            c <- connect url options name
+            (try (c :> IDisposable).Dispose() with _ -> ())
+            c <- reconnect url options name
             r <- Reader(c, Dump = not (isNull dumpPath))
 
 let private writeThread (url: string) (options: string) () =
@@ -1223,8 +1235,8 @@ let private writeThread (url: string) (options: string) () =
                 writeLane.Push j
         with ex ->
             failAll batch ex
-            (c :> IDisposable).Dispose()
-            c <- connect url options "conduit-write"
+            (try (c :> IDisposable).Dispose() with _ -> ())
+            c <- reconnect url options "conduit-write"
             wr <- Writer(c)
 
 /// Opens the connections (each prepares every statement) and starts their threads.
