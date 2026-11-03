@@ -107,13 +107,6 @@ type Lane<'T when 'T :> Job>(clockUs: int, maxBatch: int) =
             q.Enqueue j
             if (q.Count = 1 && not leader) || q.Count = maxBatch then Monitor.Pulse gate)
 
-    /// Push unless the backlog is past `cap` jobs (overload: the caller answers 503 rather than queue without bound)
-    member l.TryPush(j: 'T, cap: int) =
-        if q.Count >= cap then false
-        else
-            l.Push j
-            true
-
     member _.Take(into: List<'T>) =
         let mutable got = false
         while not got do
@@ -830,10 +823,8 @@ let mutable readLane: Lane<RJob> = Unchecked.defaultof<_>
 let mutable sideLane: Lane<RJob> = Unchecked.defaultof<_>
 let mutable writeLane: Lane<WJob> = Unchecked.defaultof<_>
 
-/// most jobs a lane holds before new ones are answered 503 (a few seconds of work at full load)
-let mutable backlogCap = 150000
-let private busy = Json.error 503 "overloaded"
-
+/// No cap and no 503: a connection has at most one request in flight (the next one waits unparsed until it is
+/// answered), so a lane never holds more jobs than there are open connections.
 let pushRead (j: RJob) =
     let lane =
         match j.Kind with
@@ -842,10 +833,13 @@ let pushRead (j: RJob) =
         | RKind.User
         | RKind.Login -> sideLane
         | _ -> readLane
-    if not (lane.TryPush(j, backlogCap)) then Io.post j.Dest busy
+    lane.Push j
 
-let pushWrite (j: WJob) =
-    if not (writeLane.TryPush(j, backlogCap)) then Io.post j.Dest busy
+let pushWrite (j: WJob) = writeLane.Push j
+
+/// reads whose client has disconnected (a load generator gives up after 10 s) are dropped from a batch: nobody is
+/// left to answer, and under overload they would otherwise be most of the work. Writes still run.
+let mutable private statDropped = 0L
 
 [<Sealed>]
 type private Writer(c: Conn) =
@@ -1213,8 +1207,10 @@ let private readThread (lane: Lane<RJob>) (name: string) (url: string) (options:
     while true do
         batch.Clear()
         lane.Take batch
+        let dropped = batch.RemoveAll(fun j -> not (Io.alive j.Dest))
+        if dropped > 0 then Interlocked.Add(&statDropped, int64 dropped) |> ignore
         try
-            r.Run batch
+            if batch.Count > 0 then r.Run batch
         with ex ->
             failAll batch ex
             (try (c :> IDisposable).Dispose() with _ -> ())
@@ -1258,8 +1254,9 @@ let start (url: string) (options: string) (reads: int) (sideReads: int) (writes:
                         Thread.Sleep 5000
                         let n = Interlocked.Exchange(statReads, 0L)
                         let b = Interlocked.Exchange(statReadBatches, 0L)
-                        eprintfn "reads %d in %d batches (%.1f per batch), queued now: read %d side %d write %d; gc %d/%d/%d, paused %.0f ms, heap %d MB"
-                            n b (if b > 0L then float n / float b else 0.0) readLane.Count sideLane.Count writeLane.Count
+                        eprintfn "reads %d in %d batches (%.1f per batch), %d dropped (client gone), queued now: read %d side %d write %d; gc %d/%d/%d, paused %.0f ms, heap %d MB"
+                            n b (if b > 0L then float n / float b else 0.0) (Interlocked.Exchange(&statDropped, 0L))
+                            readLane.Count sideLane.Count writeLane.Count
                             (GC.CollectionCount 0) (GC.CollectionCount 1) (GC.CollectionCount 2)
                             (GC.GetTotalPauseDuration().TotalMilliseconds) (GC.GetTotalMemory false / 1048576L)),
                IsBackground = true)

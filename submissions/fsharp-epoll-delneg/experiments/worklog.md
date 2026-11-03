@@ -91,3 +91,11 @@ Script: `experiments/h.sh`.
   lane answers 503; unhandled exceptions are logged.
 - **e16: connection threads reconnect with retries.** A failed batch reconnected once and let a second failure
   (Postgres full, fd table full) escape the thread, which kills the process.
+- **e01c #87 search** (100k start): 100k 99.2 µs/req (app 47.9, PG 51.3, p95 60 ms), 200k pass 107.9 (app 49.2,
+  PG 58.7, p95 174 ms), 400k fail (14.8% errors), 300k fail (6.8% errors, timeouts after the overload probe).
+- **e17: each feed viewer's follows read once.** A feed viewer's follows were scanned in the hub candidates, once
+  per hub bound, in the page scan, in the count probe and again for the `following` flags: five scans and up to 16
+  probes. Now one `fl` row per distinct feed viewer holds the followee array and the rest use it (`&&` against
+  the hubs, `= ANY` for the page and the count). Same rows on the 40 real batches; buffers per batch 16,208 ->
+  12,069 (-26%). On a copy with 10% of `follows` deleted and re-inserted without vacuum (pages no longer
+  all-visible, like a long run): 19,387 -> 14,095. Execution time is within noise while a search runs on the box.

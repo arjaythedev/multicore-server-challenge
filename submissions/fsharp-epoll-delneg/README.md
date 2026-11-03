@@ -40,9 +40,12 @@ No caches across requests, no schema or Postgres configuration changes, nothing 
   the clock (`usleep`) and then takes everything queued; the others block. We started with a timed `Monitor.Wait`,
   which spins before it blocks: on the write threads that spinning took more CPU than the writes. Reads are split in
   two lanes so that the comments statement runs in a second backend while `rd` runs, not after it.
-- **Overload.** Past 150,000 queued jobs in a lane, new requests get 503 instead of an ever longer queue. At the fd
-  limit with no idle connection to close, a spare descriptor is given up to accept and close the newcomer, so the
-  listener can't keep the loop spinning. An error on one connection closes that connection only.
+- **Overload.** Nothing is answered 503. A connection has one request in flight at a time (the next waits unparsed
+  until it is answered), so the queues can't outgrow the open connections. A read whose client has disconnected
+  (a load generator gives up after 10 s) is dropped from its batch, since nobody is left to answer it; writes always
+  run. At the fd limit with no idle connection to close, a spare descriptor is given up to accept and close the
+  newcomer, so the listener can't keep the loop spinning. An error on one connection closes that connection only, and
+  a Postgres connection that fails is replaced, retrying until Postgres takes it.
 - **One statement for list and article reads.** Every global, tag, author, favorited and feed list and every
   single-article read in a batch is one execution of one prepared statement (`rd` in `src/Sql.fs`), with the
   requests passed as arrays. Requests for pages near the top of the same list share one fetch, an article that many

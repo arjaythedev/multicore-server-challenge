@@ -387,6 +387,12 @@ type Loop(index: int, listenFd: int) =
 
 let mutable private loops: Loop[] = [||]
 
+/// Whether the client of a queued request is still connected (read from other threads: a stale answer only means
+/// a job is done for nobody, or skipped a moment after its client left)
+let alive (d: Dest) =
+    let c = conns.[d.Fd]
+    not (isNull c) && c.Open && c.Gen = d.Gen
+
 /// Answers a request that went asynchronous. Safe from any thread.
 let post (d: Dest) (data: byte[]) = loops.[d.Loop].Post(d.Fd, d.Gen, data)
 

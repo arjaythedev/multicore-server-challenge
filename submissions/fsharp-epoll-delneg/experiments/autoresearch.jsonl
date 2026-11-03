@@ -14,3 +14,4 @@
 {"id":"e14","label":"e14-recv","what":"recv/send with MSG_NOSIGNAL on client sockets","kind":"structural","score":null,"note":"skips VFS read/write path"}
 {"id":"e15","label":"e15-over","what":"overload defenses: per-event try/with, spare fd at EMFILE, 503 past 150k queued, unhandled logging","kind":"structural","score":null,"note":"robustness"}
 {"id":"e16","label":"e16-reconn","what":"connection threads reconnect with retries","kind":"structural","score":null,"note":"robustness"}
+{"id":"e17","label":"e17-fl","what":"each feed viewer's follows read once (fl CTE) and reused for hubs, bounds, page, count, flags","kind":"structural","score":null,"note":"real batches same rows; buffers 16,208 -> 12,069 fresh, 19,387 -> 14,095 aged follows"}
