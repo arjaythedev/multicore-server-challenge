@@ -1114,7 +1114,7 @@ let mutable writeLane: Lane<WJob> = Unchecked.defaultof<_>
 let private connect (url: string) (options: string) =
     let c = new Conn(url, options)
     c.Open()
-    for name, sql, oids in Sql.all do
+    for name, sql, oids in Sql.all () do
         c.Prepare(name, sql, oids)
     c
 

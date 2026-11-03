@@ -8,7 +8,7 @@ set -u
 L=$1; SUB=$2; MODE=$3; shift 3
 H=$HOME/mc-fs2-h; OUT=$H/runs/$L; mkdir -p $OUT
 export PATH=$HOME/go-sdk/bin:$PATH PGHOST=127.0.0.1 PGUSER=delneg PGPASSWORD=delneg
-SECRET=multicore-server-challenge; LG=$H/loadgen; LGCPUS=${LGCPUS:-8-19}
+SECRET=multicore-server-challenge; LG=$H/loadgen; LGFIRST=${LGFIRST:-8}; LGLAST=${LGLAST:-19}
 exec >> $OUT/run.log 2>&1
 echo "=== $(date -u +%FT%TZ) $L $SUB $MODE $* WARM=${WARM:-1} FRESH=${FRESH:-1} APPENV=${APPENV:-}"
 sudo sysctl -q -w net.core.somaxconn=65535 net.ipv4.tcp_max_syn_backlog=65535 net.ipv4.ip_local_port_range="1024 65535" net.ipv4.tcp_tw_reuse=1 fs.file-max=2097152 fs.nr_open=1048576
@@ -39,7 +39,8 @@ phase() { # name users ramp measure
   local sa=$(( $(date +%s%N) / 1000000 + 5000 )) off=0 pids=() files=()
   for k in $(seq 0 $((K-1))); do
     local u=$per; [ $k -lt $rem ] && u=$((u+1))
-    taskset -c $LGCPUS $LG run -target http://127.0.0.$((k+1)):80 -users $u -box-index $k -id-offset $off -ramp ${R}s -measure ${M}s \
+    local ncpu=$((LGLAST-LGFIRST+1)); local a=$((LGFIRST + k*ncpu/K)); local b=$((LGFIRST + (k+1)*ncpu/K - 1))
+    GOMAXPROCS=$((b-a+1)) taskset -c $a-$b $LG run -target http://127.0.0.$((k+1)):80 -users $u -box-index $k -id-offset $off -ramp ${R}s -measure ${M}s \
       -tail 15s -start-at $sa -secret $SECRET -articles 500000 -run-id $L-$N-$RANDOM -q -out $D/box$k.json > $D/box$k.log 2>&1 &
     pids+=($!); files+=($D/box$k.json); off=$((off+u))
   done

@@ -19,8 +19,10 @@ let private slugify (x: string) = sprintf "trim(both '-' from lower(regexp_repla
 ///   3  viewer: a = viewer, arr = which of the articles they asked for they favorited
 ///   4  viewer: a = viewer, arr = which of those articles' authors they follow
 ///   5  direct read: a = its index, b = article id (no row: no such article)
-let read =
-    """
+/// hubs: how many shared followees to probe; hubCount/feedBound: whether to use the probes for counts/pages
+let readSql (hubs: int) (hubCount: bool) (feedBound: bool) =
+    sprintf
+        """
 WITH g AS MATERIALIZED (
   SELECT g.gi, g.k, g.lim, g.off,
          CASE g.k WHEN 1 THEN (SELECT t.id FROM tags t WHERE t.name = g.key)::int8
@@ -28,6 +30,23 @@ WITH g AS MATERIALIZED (
                   WHEN 3 THEN (SELECT u.id FROM users u WHERE u.username = g.key)
                   WHEN 4 THEN g.v END AS kid
     FROM unnest($1::int4[], $2::text[], $3::int8[], $4::int8[], $5::int8[]) WITH ORDINALITY AS g(k, key, v, lim, off, gi)
+), cand AS MATERIALIZED (
+  -- the followees that the most feed viewers of this batch share, probed once each below
+  SELECT fo.followee_id AS f FROM g JOIN follows fo ON fo.follower_id = g.kid
+   WHERE g.k = 4 GROUP BY fo.followee_id HAVING count(*) >= 2 ORDER BY count(*) DESC LIMIT %d
+), hub AS MATERIALIZED (
+  -- feed counts: a followee with 1,000+ articles proves the capped count, so its followers get 1000 uncounted
+  SELECT ARRAY(SELECT c.f FROM cand c
+          WHERE %s AND EXISTS (SELECT 1 FROM articles a WHERE a.author_id = c.f ORDER BY a.id DESC OFFSET 999 LIMIT 1)) AS ids
+), hb AS MATERIALIZED (
+  -- feed pages: if a followee has n articles, the n newest of its followers' feeds are no older than its n-th
+  -- newest, so every followee scan for them can stop there (n = the batch's largest feed fetch)
+  SELECT c.f, (SELECT a.id FROM articles a WHERE a.author_id = c.f ORDER BY a.id DESC
+                OFFSET (SELECT coalesce(max(g.lim + g.off), 1) - 1 FROM g WHERE g.k = 4) LIMIT 1) AS b
+    FROM cand c WHERE %s
+), gb AS MATERIALIZED (
+  SELECT g.gi, coalesce((SELECT max(hb.b) FROM hb JOIN follows fo ON fo.followee_id = hb.f AND fo.follower_id = g.kid), 0) AS bound
+    FROM g WHERE g.k = 4
 ), ga AS MATERIALIZED (
   SELECT g.gi,
     CASE g.k
@@ -36,7 +55,9 @@ WITH g AS MATERIALIZED (
       WHEN 2 THEN ARRAY(SELECT a.id FROM articles a WHERE a.author_id = g.kid ORDER BY a.id DESC LIMIT g.lim OFFSET g.off)
       WHEN 3 THEN ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id = g.kid ORDER BY f.article_id DESC LIMIT g.lim OFFSET g.off)
       ELSE ARRAY(SELECT x.id FROM follows fo CROSS JOIN LATERAL (
-                   SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT g.lim + g.off) x
+                   SELECT a2.id FROM articles a2
+                    WHERE a2.author_id = fo.followee_id AND a2.id >= (SELECT gb.bound FROM gb WHERE gb.gi = g.gi)
+                    ORDER BY a2.id DESC LIMIT g.lim + g.off) x
                  WHERE fo.follower_id = g.kid ORDER BY x.id DESC LIMIT g.lim OFFSET g.off)
     END AS ids,
     CASE g.k
@@ -44,8 +65,10 @@ WITH g AS MATERIALIZED (
       WHEN 1 THEN (SELECT count(*) FROM (SELECT 1 FROM article_tags at WHERE at.tag_id = g.kid LIMIT 1000) s)
       WHEN 2 THEN (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = g.kid LIMIT 1000) s)
       WHEN 3 THEN (SELECT count(*) FROM (SELECT 1 FROM favorites f WHERE f.user_id = g.kid LIMIT 1000) s)
-      ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id IN (
-              SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = g.kid) LIMIT 1000) s)
+      ELSE CASE WHEN EXISTS (SELECT 1 FROM follows fo, hub WHERE fo.follower_id = g.kid AND fo.followee_id = ANY(hub.ids))
+                THEN 1000
+                ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id IN (
+                        SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = g.kid) LIMIT 1000) s) END
     END AS cnt
   FROM g
 ), r AS MATERIALIZED (
@@ -87,6 +110,7 @@ UNION ALL
 SELECT 5, d.di, d.id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
   FROM d WHERE d.id IS NOT NULL
 """
+        hubs (if hubCount then "true" else "false") (if feedBound then "true" else "false")
 
 let readOids =
     [| OidInt4Arr; OidTextArr; OidInt8Arr; OidInt8Arr; OidInt8Arr; OidInt4Arr; OidInt4Arr; OidInt4Arr; OidInt8Arr
@@ -289,7 +313,9 @@ let articleDelete = "DELETE FROM articles a WHERE a.slug = $2 AND a.author_id = 
 let articleDeleteOids = [| OidInt8; OidText |]
 
 /// name, sql, parameter types: prepared on every connection at startup
-let all =
+let mutable read = readSql 16 true true
+
+let all () =
     [ "rd", read, readOids
       "cm", comments, commentsOids
       "pf", profiles, profilesOids

@@ -20,6 +20,7 @@ let main _ =
     Auth.init (env "JWT_SECRET" "multicore-server-challenge")
     Store.stats <- env "MC_STATS" "0" = "1"
     Auth.start (num "BCRYPT_THREADS" 2) (num "BCRYPT_LANES" 6) (num "BCRYPT_FILL" 4) (num "BCRYPT_WAIT_MS" 30) (num "BCRYPT_NICE" 5)
+    Sql.read <- Sql.readSql (num "HUBS" 16) (env "HUB_COUNT" "1" = "1") (env "FEED_BOUND" "1" = "1")
     let reads = num "PG_READS" 8
     let writes = num "PG_WRITES" 4
     Store.start url options reads writes (num "READ_CLOCK_US" 20000) (num "READ_MAX" 2000) (num "WRITE_CLOCK_US" 5000) (num "WRITE_MAX" 256)
