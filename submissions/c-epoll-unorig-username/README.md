@@ -2,13 +2,9 @@
 
 Front: direct
 
-| | |
-|---|---|
-| Language | C11, built with Ubuntu 24.04's gcc 13 from `build-essential` |
-| Framework | none: HTTP/1.1 on raw `epoll` |
-| Database driver | none: own PostgreSQL wire client (SCRAM-SHA-256, prepared statements, binary rows, no RowDescription) |
-| Database | PostgreSQL 18 |
-| Other dependencies | none beyond libc. JSON, JWT, SHA-256, bcrypt and gzip are written here |
+Written in C11 and built with the gcc 13 that Ubuntu 24.04's `build-essential` installs. There is no framework and nothing
+beyond libc: HTTP/1.1 on raw `epoll`, and in-tree JSON, JWT, SHA-256, bcrypt, gzip and a PostgreSQL client (SCRAM-SHA-256,
+prepared statements, binary rows, no RowDescription) for PostgreSQL 18.
 
 ```sh
 sudo bash install.sh && bash build.sh
@@ -21,8 +17,9 @@ No caches across requests, no schema or Postgres config changes, no host tuning.
 
 ## 1. Flat statements, joined here
 
-The top entries send Postgres one large statement per batch, so each article is read once. This one sends a pipeline of
-flat index scans over keys that are already distinct and sorted, and does every join in the server:
+Each drain sends a pipeline of index scans over keys that are already distinct and sorted, in phases. The phased shape, and
+reading each article and author once, follow theCatWisel's #154. Array parameters follow #7. This entry takes it further by
+keeping joins out of Postgres altogether:
 
 ```
  phase 1   tags, users, list windows, follows of feed viewers, articles by slug, comment threads
@@ -41,14 +38,16 @@ Two details matter a lot:
   picks `favorites_article_idx` and filters `user_id` linearly: on the first run this statement was 87% of all Postgres
   statement time. `OFFSET 0` around the primary-key scan pins it, and a hash join applies the second array. `enable_indexscan
   = off` does not help on Postgres 18: it disables index-only scans too, and the planner then goes by cost.
-- **Feeds merge here, from each followee once.** Two viewers sharing a followee share its scan. Feed requests are a small
-  share of traffic but their statement was 29% of Postgres statement time.
+- **Feeds merge here, from each followee once.** #154 and #168 compute each viewer's feed page in SQL. Here two viewers sharing
+  a followee share its scan, and the server does the merge. Feed requests are a small share of traffic, but their statement was
+  29% of Postgres statement time, so this is still where much of the cost sits.
 
 ## 2. Feed counts: the likely hub first
 
-`articlesCount` stops at 1,000, and most viewers follow an author with 1,000+ articles, which alone settles it (307 of 399
-sampled viewers, through just 28 such authors). Counting was costlier than reading the ids (43 ms against 24 ms on a batch
-of 5,336 followees). So:
+`articlesCount` stops at 1,000, so an author with 1,000+ articles settles a viewer's count alone. That shortcut is #61's, and
+#105 and #168 use it as well. Here 307 of 399 sampled viewers followed one of just 28 such authors, and counting cost more than
+reading the ids (43 ms against 24 ms on a batch of 5,336 followees). What this entry adds is how it finds those authors with no
+extra query:
 
 1. An id array shorter than requested holds all that author's articles, so it is already the exact count.
 2. Authors whose newest ids fall densely enough to suggest 600+ articles are counted first.
@@ -62,7 +61,8 @@ took Postgres from 59.4 and 58.4 µs per request to 52.8 and 52.7.
 Each lane (feeds, comments, the rest) starts a drain at most every 160 ms. A bigger batch shares more, and p95 has room. At
 230k users on the test box, 160 ms against 80 ms took Postgres from 54.9 and 53.9 µs per request to 46.1, and p95 from 184
 and 182 ms to 327 ms. A freed connection goes to the lane whose oldest read has waited longest, with at most 6 drains at
-once.
+once. That cap of 6 and the 8 read connections are #168's values, kept without a sweep of my own. The gap is the one constant
+here that was tested against the leader's, and only at those two values.
 
 ## 4. bcrypt
 
@@ -70,7 +70,7 @@ once.
   against 49.6 ms for one lane, and 14.7 ms for the same five lanes in C. Chosen at startup if the CPU has BMI2, and checked
   against vectors from `golang.org/x/crypto/bcrypt` at every lane count.
 - A hasher waits up to 150 ms for a full set of lanes. Without that, hashes ran one or two lanes at a time.
-- Hashers run at `SCHED_IDLE`. A watchdog at normal priority takes over any batch held up for 700 ms, so a saturated box slows
+- Hashers run at `SCHED_IDLE`. A watchdog at normal priority takes over any batch held up for 3 s, so a saturated box slows
   logins but never strands them.
 
 ## 5. Scheduling
@@ -88,7 +88,7 @@ backend mid-query.
 ## 7. Writes
 
 Up to 128 writes go out with one Sync, with no `BEGIN`/`COMMIT`, so they share a transaction and a WAL flush, and each is
-answered only after ReadyForQuery. Favorites and article writes then answer through the read queue, so the response is read
+answered only after ReadyForQuery. 128 comes from go-epoll-unorig-username (#89) and #168 uses the same number; it wasn't swept. Favorites and article writes then answer through the read queue, so the response is read
 after the commit.
 
 ## Failure handling
@@ -99,23 +99,38 @@ after the commit.
   fail only themselves.
 - A lost read connection reconnects and retries. After a few attempts the request is answered 500 rather than left hanging.
 - A write whose connection dies mid-group is answered 500: its commit is unknown, so nothing is claimed.
-- With backends killed, Postgres crashed, then down for 6 s, under load: @@FAILURE@@
+- With backends killed, Postgres crashed, then down for 6 s, under load: 127,743 writes claimed and every one found in the database afterwards, 97 answered 500, the
+  longest request 4.3 s, and the server still up.
 - `accept()` out of descriptors stops accepting for 100 ms instead of exiting. Each loop has its own fd table
   (`unshare(CLONE_FILES)`), so `LimitNOFILE` applies per loop.
 - Reads from clients that hung up are dropped before they reach Postgres.
 
 ## Tried and dropped
 
-@@DROPPED@@
+| Tried | Measured | |
+|---|---|---|
+| AVX-512 gather bcrypt, 16 lanes | 18.5 ms per hash against 12.95 ms | dropped |
+| One `rorx` per two index bytes, using the high-byte register | 15.0 ms against 13.2 ms | dropped |
+| Phase 4 on parallel helper connections | 7% more Postgres CPU per request, no steady latency gain on an aged database | dropped |
+| Database threads at the default policy | p95 1,482 and 1,666 ms against 1,310 and 1,277 ms on an aged database | dropped |
+| 80 and 100 ms gaps on an aged database | p95 no better, Postgres CPU higher | dropped |
 
 ## Credits
 
-Ideas borrowed: the drain gap and lanes from nick-potts' #79, #117 and #168; the freed connection going to the oldest waiting
-lane from theCatWisel's #154, which is also where the flat array-scan phases and the shared global window come from; dropping
-reads of clients that hung up from theCatWisel's #132; SCHED_BATCH and SCHED_IDLE hashers from #130 and #168; gzip only when it
-saves a segment, and group commit without `BEGIN`/`COMMIT`, from #168; sharing a response within a batch from #31, #132 and
-#143; the private fd table from #154. The bcrypt vectors come from `golang.org/x/crypto/bcrypt`; the array-parameter reads
-and the mutation statements started from go-epoll-unorig-username (#89).
+Borrowed, by section:
 
-Ours: every join in the server with Postgres doing only flat scans, the hash-joined flag statements, feeds merged from each
-followee once, feed counts ordered by estimated hub, and the choice of drain gap against the p95 limit.
+- Section 1: phases of array scans, each article and author read once, fragments rendered once (#154); array-parameter batching
+  (#7); the mutation statements (go-epoll-unorig-username, #89).
+- Section 2: the 1,000-article count shortcut (#61, also #105 and #168).
+- Section 3: the drain gap and lanes (#79, #117, #168), a freed connection going to the oldest waiting lane (#154), the cap of 6
+  drains and 8 read connections (#168).
+- Section 4: register-resident multi-lane kernels (#130, #154, #168), SCHED_IDLE hashers with a watchdog (#168). This watchdog
+  restarts a batch, where #168's resumes from a saved round. Test vectors come from `golang.org/x/crypto/bcrypt`.
+- Section 5: SCHED_BATCH and nice 5 for loops (#130, #168).
+- Section 6: gzip only when it saves a segment (#168), with an encoder written here; sharing a response within a batch (#31, #132,
+  #143, #168).
+- Section 7: group commit without `BEGIN`/`COMMIT` (#168).
+- Also: dropping reads of clients that hung up (#132), and a private fd table per loop (#154).
+
+New in this entry, as far as I could find: feeds merged in the server from one scan per followee, flag lookups as one hash-joined
+scan pinned with `OFFSET 0`, and ordering feed counts by id density.
