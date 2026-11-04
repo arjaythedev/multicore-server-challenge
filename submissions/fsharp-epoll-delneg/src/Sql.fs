@@ -145,10 +145,10 @@ let readOids =
     [| OidInt4Arr; OidTextArr; OidInt8Arr; OidInt8Arr; OidInt8Arr; OidInt4Arr; OidInt4Arr; OidInt4Arr; OidInt8Arr
        OidTextArr; OidInt8Arr; OidInt8Arr |]
 
-/// Comment threads for many articles: $1 distinct slugs, $2/$3 each request's slug index and viewer. Rows by t:
+/// Comment threads for many articles: $1 distinct slugs, $2 the signed-in viewers. Rows by t:
 ///   1 comment: a = slug index, b = id, c = author, s1 = body, ts1/ts2
 ///   2 author, once per batch: a = id, s1..s3 username, bio, image
-///   3 viewer: a = viewer, arr = which authors of the threads they asked for they follow
+///   3 viewer: a = viewer, arr = everyone they follow (none: no row)
 ///   4 article found: a = slug index
 let comments =
     """
@@ -161,10 +161,10 @@ WITH s AS MATERIALIZED (
       SELECT c.id, c.author_id, c.body, c.created_at, c.updated_at FROM comments c
        WHERE c.article_id = s.aid ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c
 ), vf AS MATERIALIZED (
-  SELECT q.v, array_agg(DISTINCT c.author_id) AS au
-    FROM (SELECT DISTINCT r.v, r.si FROM unnest($2::int4[], $3::int8[]) AS r(si, v) WHERE r.v <> 0) q
-    JOIN c ON c.si = q.si
-   GROUP BY q.v
+  -- one index scan over the sorted viewers
+  SELECT fo.follower_id AS v, array_agg(fo.followee_id) AS fs FROM follows fo
+   WHERE fo.follower_id = ANY(ARRAY(SELECT DISTINCT r.v FROM unnest($2::int8[]) AS r(v) WHERE r.v <> 0 ORDER BY 1))
+   GROUP BY fo.follower_id
 )
 SELECT 1 AS t, c.si AS a, c.id AS b, c.author_id AS c, c.body AS s1, NULL::text AS s2, NULL::text AS s3,
        c.created_at AS ts1, c.updated_at AS ts2, NULL::int8[] AS arr
@@ -173,14 +173,12 @@ UNION ALL
 SELECT 2, u.id, NULL, NULL, u.username, u.bio, u.image, NULL, NULL, NULL
   FROM users u WHERE u.id = ANY(ARRAY(SELECT DISTINCT c.author_id FROM c))
 UNION ALL
-SELECT 3, vf.v, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-       ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = vf.v AND fo.followee_id = ANY(vf.au))
-  FROM vf
+SELECT 3, vf.v, NULL, NULL, NULL, NULL, NULL, NULL, NULL, vf.fs FROM vf
 UNION ALL
 SELECT 4, s.si, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL FROM s WHERE s.aid IS NOT NULL
 """
 
-let commentsOids = [| OidTextArr; OidInt4Arr; OidInt8Arr |]
+let commentsOids = [| OidTextArr; OidInt8Arr |]
 
 /// Profiles by username, with the viewer's following flag: one row per request found (i = request index).
 let profiles =

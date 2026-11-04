@@ -196,3 +196,9 @@ Script: `experiments/h.sh`.
   StackTrace.dll`, a lazy load failing for want of an fd; connection fds now can't starve the runtime's table. Replay: ~19k req/s vs ~9k.
   Considered and not taken: io_uring direct descriptors (fixed files) also escape the fd limit, but on 6.8 file releases are FIFO behind
   the oldest pending request's resource node, so an idle connection's pending recv holds back the release of every socket closed after it.
+- **e25: comments take each viewer's whole followee list from one grouped scan** (`follows` over the sorted viewer ids) instead of
+  first collecting the authors each viewer's threads have and probing per viewer. On 40 real batches, run-aged DB: 3.97-4.31 -> 3.55-3.78 ms
+  per call, buffers about equal, and the statement loses a parameter. Also tried: joining users per comment and dropping `t=2`: 5.1-5.4 ms, worse.
+  The rd ablation on the same batches (15.4 ms per batch): no feeds 8.4, no favorite counts 9.6, no tags 12.9, no list counts 13.4, no flags
+  13.7, no follows 14.5, no authors 14.4, no bodies 15.1. A feed's articles are nearly all its viewer's alone, so feeds pay for rows the
+  other lists share.

@@ -680,14 +680,10 @@ type private Reader(c: Conn) =
                 if not (slugIndex.ContainsKey j.Key) then
                     slugIndex.[j.Key] <- slugs.Count
                     slugs.Add j.Key
-            o.Bind("cm", 3)
+            o.Bind("cm", 2)
             o.ArrBegin(OidText, slugs.Count, false)
             for s in slugs do
                 o.EText s
-            o.ArrEnd()
-            o.ArrBegin(OidInt4, cmts.Count, false)
-            for j in cmts do
-                o.EInt4(slugIndex.[j.Key] + 1)
             o.ArrEnd()
             o.ArrBegin(OidInt8, cmts.Count, false)
             for j in cmts do
@@ -697,8 +693,7 @@ type private Reader(c: Conn) =
             o.Execute()
             if dump then
                 dumpStmt "cm"
-                    [ pgArray slugs; pgArray [ for j in cmts -> string (slugIndex.[j.Key] + 1) ]
-                      pgArray [ for j in cmts -> string j.Viewer ] ]
+                    [ pgArray slugs; pgArray [ for j in cmts -> string j.Viewer ] ]
         if profiles.Count > 0 then
             o.Bind("pf", 2)
             o.ArrBegin(OidText, profiles.Count, false)
