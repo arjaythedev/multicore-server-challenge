@@ -162,16 +162,27 @@ let private usersSql =
     "SELECT r.i, x.id, x.username, x.bio, x.image FROM unnest(@usernames::text[]) WITH ORDINALITY AS r(username, i)
       CROSS JOIN LATERAL (SELECT u.id, u.username, u.bio, u.image FROM users u WHERE u.username = r.username LIMIT 1) x"
 
-/// Phase B: each distinct article's card; the body only where an article page shows it.
-/// Each tag name is one tags_pkey probe: as a JOIN the planner hash-joins the whole tags table
-/// once per card, which was over half of this statement's time.
+// Phase B: each distinct article's card, from four statements over the whole batch's articles,
+// in this order so the card rows can be finished as they arrive:
+//   tagRanksSql   the tags table (200 rows), ordered by name in the database's collation;
+//   cardTagsSql   the cards' (article, tag id) pairs, one index scan for all of them;
+//   favoritesSql  the cards' favorite counts, one index scan (an article without any has no row);
+//   cardsSql      the cards' columns and authors; the body only where an article page shows it.
+// F# names each card's tags and orders them by their position in the tags table: that is the
+// spec's `ORDER BY t.name`, without a tags_pkey probe per tag. On the seed, 1,000 cards took
+// 9.9 ms as one statement with the tag names and counts inside, 4.2 ms as these four.
+
+let private tagRanksSql = "SELECT t.id, t.name FROM tags t ORDER BY t.name"
+
+let private cardTagsSql = "SELECT at.article_id, at.tag_id FROM article_tags at WHERE at.article_id = ANY (@ids)"
+
+let private favoritesSql =
+    "SELECT f.article_id, count(*) FROM favorites f WHERE f.article_id = ANY (@ids) GROUP BY f.article_id"
+
 let private cardsSql =
     "SELECT x.* FROM unnest(@ids::int8[], @bodies::bool[]) AS r(id, body)
       CROSS JOIN LATERAL (
             SELECT a.id, CASE WHEN r.body THEN a.body END AS body, a.slug, a.title, a.description, a.created_at, a.updated_at,
-                   ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at
-                          WHERE at.article_id = a.id ORDER BY 1) AS tag_list,
-                   (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
                    a.author_id, u.username, u.bio, u.image
               FROM articles a JOIN users u ON u.id = a.author_id
              WHERE a.id = r.id LIMIT 1) x"
@@ -357,17 +368,35 @@ let private splitB (b: PlanB) (parts: int) : PlanB[] =
         plans[0].UserPairs.Add pair |> ignore
     plans
 
-/// What phase B found.
+/// What phase B found. The tag and favorite fields are the cards' parts, read before the cards.
 [<NoEquality; NoComparison>]
 type private FoundB =
     { Cards: Dictionary<int64, Card>
       Favorited: HashSet<struct (int64 * int64)>
-      Following: HashSet<struct (int64 * int64)> }
+      Following: HashSet<struct (int64 * int64)>
+      /// Tag id -> its position in name order (an index into TagNames).
+      TagRanks: Dictionary<int, int>
+      TagNames: ResizeArray<string>
+      /// Article id -> its tags' positions.
+      CardTags: Dictionary<int64, ResizeArray<int>>
+      FavoritesCounts: Dictionary<int64, int64> }
 
 let private emptyB () =
     { Cards = Dictionary()
       Favorited = HashSet()
-      Following = HashSet() }
+      Following = HashSet()
+      TagRanks = Dictionary()
+      TagNames = ResizeArray()
+      CardTags = Dictionary()
+      FavoritesCounts = Dictionary() }
+
+/// An article's tag names in the database's name order (its collation, not .NET's).
+let private tagList (found: FoundB) (article: int64) : string[] =
+    match found.CardTags.TryGetValue article with
+    | true, ranks ->
+        ranks.Sort()
+        Array.init ranks.Count (fun i -> found.TagNames[ranks[i]])
+    | _ -> Array.empty
 
 // ------------------------------------------------------------ assemble ---------
 
@@ -527,7 +556,25 @@ let private stepsB (b: PlanB) (found: FoundB) : Step list =
     let firsts (pairs: Distinct<struct (int64 * int64)>) = [| for struct (x, _) in pairs.Items -> x |]
     let seconds (pairs: Distinct<struct (int64 * int64)>) = [| for struct (_, y) in pairs.Items -> y |]
     [ if b.Cards.Count > 0 then
-          command cardsSql [ longs "@ids" (b.Cards.Items.ToArray()); bools "@bodies" (b.Bodies.ToArray()) ],
+          let ids = b.Cards.Items.ToArray()
+          command tagRanksSql [],
+          readRows (fun r ->
+              found.TagRanks[r.GetInt32 0] <- found.TagNames.Count
+              found.TagNames.Add(r.GetString 1))
+          command cardTagsSql [ longs "@ids" ids ],
+          readRows (fun r ->
+              let article = r.GetInt64 0
+              let ranks =
+                  match found.CardTags.TryGetValue article with
+                  | true, ranks -> ranks
+                  | _ ->
+                      let ranks = ResizeArray 4
+                      found.CardTags[article] <- ranks
+                      ranks
+              ranks.Add found.TagRanks[r.GetInt32 1])
+          command favoritesSql [ longs "@ids" ids ],
+          readRows (fun r -> found.FavoritesCounts[r.GetInt64 0] <- r.GetInt64 1)
+          command cardsSql [ longs "@ids" ids; bools "@bodies" (b.Bodies.ToArray()) ],
           readRows (fun r ->
               let id = r.GetInt64 0
               found.Cards[id] <-
@@ -538,13 +585,16 @@ let private stepsB (b: PlanB) (found: FoundB) : Step list =
                     Description = r.GetString 4
                     CreatedAt = r.GetDateTime 5
                     UpdatedAt = r.GetDateTime 6
-                    TagList = r.GetFieldValue<string[]> 7
-                    FavoritesCount = r.GetInt64 8
+                    TagList = tagList found id
+                    FavoritesCount =
+                      match found.FavoritesCounts.TryGetValue id with
+                      | true, n -> n
+                      | _ -> 0L
                     Author =
-                      { Id = r.GetInt64 9
-                        Username = r.GetString 10
-                        Bio = textOrNone r 11
-                        Image = textOrNone r 12 } })
+                      { Id = r.GetInt64 7
+                        Username = r.GetString 8
+                        Bio = textOrNone r 9
+                        Image = textOrNone r 10 } })
       if b.ArticlePairs.Count > 0 || b.UserPairs.Count > 0 then
           command
               flagsSql
