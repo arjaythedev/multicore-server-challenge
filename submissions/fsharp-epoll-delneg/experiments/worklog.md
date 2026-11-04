@@ -161,3 +161,14 @@ Script: `experiments/h.sh`.
   the array for every article. On the 40 real batches: identical rows except 10 `t=4` rows with an empty array
   (viewers who follow no one; the server already treats a missing row as no follows). Execution 20.6 -> 20.0 ms per
   batch (seed), 22.7 -> 22.2 (aged follows), in both orders; buffers unchanged.
+- **Box rebooted (night of 3-4 Nov)**: the e20-vs-#87 lane run died after its first pair; CPU pins (runtime
+  properties) were lost, so `h.sh` now enforces them on every run. First pair at 80k, different lanes, so only a hint:
+  #87 lane A 103.2 µs/req (app 49.9, PG 53.2), e20 lane B 104.5 (app 46.5, PG 57.9). The statements over 60 s:
+  comments 14.7 s (ours, 6.6 ms x 2,238) vs 11.2 s (#87, 5.7 ms x 1,951); `rd` 48.0 s vs ~45 s for #87's set of list,
+  article and flag statements; buffers 39M vs ~55M, so again PG CPU doesn't follow buffers.
+- **Dropped: one scan for all direct-read slugs** (instead of one lookup per read). Same rows on the real batches,
+  no change in time (19.7 vs ~20.1 ms per batch, wall 2.77 vs 2.78 s).
+- **Lane runs side by side cost more than one lane alone**: e21 in lane A with lane B idle: 92.3 µs/req at 80k (app 40.9,
+  PG 51.4), against 104-115 with both lanes busy (those are e19/e20, so not a clean comparison, but the jump is too big
+  to be the code). Lane results compare only with runs made under the same conditions. First RD_DUMP with comments
+  came out of the 500-user warm-up (tiny batches), discarded; redone at 150k without a warm-up.
