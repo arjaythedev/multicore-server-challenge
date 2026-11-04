@@ -325,7 +325,23 @@ unsafe extern "C" {
 }
 
 #[cfg(target_os = "linux")]
+const CLOCK_MONOTONIC: i32 = 1;
+#[cfg(target_os = "linux")]
 const CLOCK_REALTIME_COARSE: i32 = 5;
+
+#[inline]
+pub fn mono_micros() -> usize {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+        if clock_gettime(CLOCK_MONOTONIC, &mut ts) == 0 {
+            return (ts.tv_sec as usize)
+                .wrapping_mul(1_000_000)
+                .wrapping_add((ts.tv_nsec as usize) / 1_000);
+        }
+    }
+    0
+}
 
 #[inline]
 fn unix_now_secs() -> i64 {

@@ -1,6 +1,155 @@
 const MASK_LO: u64 = 0x0101_0101_0101_0101;
 const MASK_HI: u64 = 0x8080_8080_8080_8080;
 
+pub const SMALL_STR_CAP: usize = 62;
+
+pub enum SmallStr {
+    Inline {
+        len: u8,
+        buf: [std::mem::MaybeUninit<u8>; SMALL_STR_CAP],
+    },
+    Heap(Box<str>),
+}
+
+impl SmallStr {
+    #[inline]
+    pub const fn empty() -> Self {
+        SmallStr::Inline {
+            len: 0,
+            buf: [std::mem::MaybeUninit::uninit(); SMALL_STR_CAP],
+        }
+    }
+
+    #[inline]
+    pub fn from_str(s: &str) -> Self {
+        let bytes = s.as_bytes();
+        if bytes.len() <= SMALL_STR_CAP {
+            let mut buf = [std::mem::MaybeUninit::uninit(); SMALL_STR_CAP];
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.as_mut_ptr().cast(), bytes.len());
+            }
+            SmallStr::Inline {
+                len: bytes.len() as u8,
+                buf,
+            }
+        } else {
+            SmallStr::Heap(s.into())
+        }
+    }
+
+    #[inline]
+    pub fn from_string(s: String) -> Self {
+        if s.len() <= SMALL_STR_CAP {
+            Self::from_str(&s)
+        } else {
+            SmallStr::Heap(s.into_boxed_str())
+        }
+    }
+
+    #[inline(always)]
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            SmallStr::Inline { len, buf } => unsafe {
+                std::slice::from_raw_parts(buf.as_ptr().cast(), *len as usize)
+            },
+            SmallStr::Heap(s) => s.as_bytes(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn as_str(&self) -> &str {
+        unsafe { std::str::from_utf8_unchecked(self.as_bytes()) }
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        match self {
+            SmallStr::Inline { len, .. } => *len as usize,
+            SmallStr::Heap(s) => s.len(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Clone for SmallStr {
+    #[inline]
+    fn clone(&self) -> Self {
+        match self {
+            SmallStr::Inline { len, buf } => {
+                let n = *len as usize;
+                let mut out = [std::mem::MaybeUninit::uninit(); SMALL_STR_CAP];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(buf.as_ptr(), out.as_mut_ptr(), n);
+                }
+                SmallStr::Inline { len: *len, buf: out }
+            }
+            SmallStr::Heap(s) => SmallStr::Heap(s.clone()),
+        }
+    }
+}
+
+impl Default for SmallStr {
+    #[inline]
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl std::ops::Deref for SmallStr {
+    type Target = str;
+    #[inline(always)]
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::borrow::Borrow<[u8]> for SmallStr {
+    #[inline(always)]
+    fn borrow(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl PartialEq for SmallStr {
+    #[inline(always)]
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl Eq for SmallStr {}
+
+impl PartialOrd for SmallStr {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SmallStr {
+    #[inline]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_bytes().cmp(other.as_bytes())
+    }
+}
+
+impl std::hash::Hash for SmallStr {
+    #[inline(always)]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_bytes().hash(state);
+    }
+}
+
+impl std::fmt::Debug for SmallStr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
 const DEC_DIGITS_LUT: &[u8; 200] = b"\
 0001020304050607080910111213141516171819\
 2021222324252627282930313233343536373839\
@@ -141,6 +290,31 @@ fn has_special8(word: u64) -> bool {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+unsafe fn copy_clean_avx2(src: *const u8, dst: *mut u8, len: usize) -> usize {
+    use std::arch::x86_64::*;
+    let mut pos = 0usize;
+    let vq = _mm256_set1_epi8(b'"' as i8);
+    let vs = _mm256_set1_epi8(b'\\' as i8);
+    let vc = _mm256_set1_epi8(0x1f);
+    unsafe {
+        while pos + 32 <= len {
+            let chunk = _mm256_loadu_si256(src.add(pos).cast());
+            let is_quote = _mm256_cmpeq_epi8(chunk, vq);
+            let is_slash = _mm256_cmpeq_epi8(chunk, vs);
+            let is_ctrl = _mm256_cmpeq_epi8(_mm256_min_epu8(chunk, vc), chunk);
+            let mask = _mm256_movemask_epi8(_mm256_or_si256(_mm256_or_si256(is_quote, is_slash), is_ctrl)) as u32;
+            _mm256_storeu_si256(dst.add(pos).cast(), chunk);
+            if mask != 0 {
+                return pos + mask.trailing_zeros() as usize;
+            }
+            pos += 32;
+        }
+    }
+    pos
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
 unsafe fn scan_clean_avx2(buf: &[u8]) -> usize {
     use std::arch::x86_64::*;
     let mut pos = 0usize;
@@ -175,45 +349,9 @@ fn chunk16_clean(buf: &[u8]) -> bool {
     }
 }
 
-#[inline]
-pub fn write_str(dst: &mut Vec<u8>, src: &[u8]) {
-    dst.reserve(src.len() + 2);
-    dst.push(b'"');
-    let mut pos = 0;
-
-    #[cfg(target_arch = "x86_64")]
-    if src.len() >= 32 && has_avx2() {
-        pos = unsafe { scan_clean_avx2(src) };
-    }
-    #[cfg(target_arch = "x86_64")]
-    while pos + 16 <= src.len() {
-        if !chunk16_clean(&src[pos..]) {
-            break;
-        }
-        pos += 16;
-    }
-    while pos + 8 <= src.len() {
-        let w = u64::from_le_bytes(src[pos..pos + 8].try_into().unwrap());
-        if has_special8(w) {
-            break;
-        }
-        pos += 8;
-    }
-    while pos < src.len() {
-        let c = src[pos];
-        if c < 0x20 || c == b'"' || c == b'\\' {
-            break;
-        }
-        pos += 1;
-    }
-    if pos == src.len() {
-        dst.extend_from_slice(src);
-        dst.push(b'"');
-        return;
-    }
-
-    dst.extend_from_slice(&src[..pos]);
-    let tail = &src[pos..];
+#[cold]
+#[inline(never)]
+fn write_str_escaped_tail(dst: &mut Vec<u8>, tail: &[u8]) {
     let mut anchor = 0;
     let mut idx = 0;
     while idx < tail.len() {
@@ -257,6 +395,74 @@ pub fn write_str(dst: &mut Vec<u8>, src: &[u8]) {
     }
     dst.extend_from_slice(&tail[anchor..]);
     dst.push(b'"');
+}
+
+#[inline]
+pub fn write_str(dst: &mut Vec<u8>, src: &[u8]) {
+    let len = src.len();
+    let old_len = dst.len();
+    dst.reserve(len + 2);
+    unsafe {
+        let base = dst.as_mut_ptr().add(old_len);
+        *base = b'"';
+        let out = base.add(1);
+        let sptr = src.as_ptr();
+        let mut pos = 0usize;
+
+        #[cfg(target_arch = "x86_64")]
+        if len >= 32 && has_avx2() {
+            pos = copy_clean_avx2(sptr, out, len);
+            if pos + 32 <= len {
+                dst.set_len(old_len + 1 + pos);
+                write_str_escaped_tail(dst, &src[pos..]);
+                return;
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::arch::x86_64::*;
+            let vq = _mm_set1_epi8(b'"' as i8);
+            let vs = _mm_set1_epi8(b'\\' as i8);
+            let vc = _mm_set1_epi8(0x1f);
+            while pos + 16 <= len {
+                let chunk = _mm_loadu_si128(sptr.add(pos).cast());
+                let is_quote = _mm_cmpeq_epi8(chunk, vq);
+                let is_slash = _mm_cmpeq_epi8(chunk, vs);
+                let is_ctrl = _mm_cmpeq_epi8(_mm_min_epu8(chunk, vc), chunk);
+                let mask = _mm_movemask_epi8(_mm_or_si128(_mm_or_si128(is_quote, is_slash), is_ctrl)) as u32;
+                _mm_storeu_si128(out.add(pos).cast(), chunk);
+                if mask != 0 {
+                    pos += mask.trailing_zeros() as usize;
+                    dst.set_len(old_len + 1 + pos);
+                    write_str_escaped_tail(dst, &src[pos..]);
+                    return;
+                }
+                pos += 16;
+            }
+        }
+        while pos + 8 <= len {
+            let w = (sptr.add(pos) as *const u64).read_unaligned();
+            if has_special8(w) {
+                dst.set_len(old_len + 1 + pos);
+                write_str_escaped_tail(dst, &src[pos..]);
+                return;
+            }
+            (out.add(pos) as *mut u64).write_unaligned(w);
+            pos += 8;
+        }
+        while pos < len {
+            let c = *sptr.add(pos);
+            if c < 0x20 || c == b'"' || c == b'\\' {
+                dst.set_len(old_len + 1 + pos);
+                write_str_escaped_tail(dst, &src[pos..]);
+                return;
+            }
+            *out.add(pos) = c;
+            pos += 1;
+        }
+        *out.add(len) = b'"';
+        dst.set_len(old_len + len + 2);
+    }
 }
 
 #[inline]
@@ -960,360 +1166,6 @@ impl<'a> JsonParser<'a> {
     }
 }
 
-#[inline]
-pub fn contains_gzip_token(val: &[u8]) -> bool {
-    if val.eq_ignore_ascii_case(b"gzip") {
-        return true;
-    }
-    for part in val.split(|&b| b == b',') {
-        let mut s = part;
-        while let [b' ' | b'\t', rest @ ..] = s {
-            s = rest;
-        }
-        while let [rest @ .., b' ' | b'\t'] = s {
-            s = rest;
-        }
-        let mut iter = s.splitn(2, |&b| b == b';');
-        let coding = iter.next().unwrap_or(b"");
-        let mut ctrim = coding;
-        while let [rest @ .., b' ' | b'\t'] = ctrim {
-            ctrim = rest;
-        }
-        if !ctrim.eq_ignore_ascii_case(b"gzip") {
-            continue;
-        }
-        if let Some(params) = iter.next() {
-            let mut p = params;
-            while let [b' ' | b'\t', rest @ ..] = p {
-                p = rest;
-            }
-            if p.len() >= 3 && p[..2].eq_ignore_ascii_case(b"q=") && p[2] == b'0' {
-                let rest = &p[3..];
-                let all_zero = rest.iter().all(|&b| b == b'.' || b == b'0' || b == b' ' || b == b'\t');
-                if all_zero {
-                    continue;
-                }
-            }
-        }
-        return true;
-    }
-    false
-}
-
-const CRC32_SLICE4: [[u32; 256]; 4] = {
-    let mut t = [[0u32; 256]; 4];
-    let mut i = 0;
-    while i < 256 {
-        let mut c = i as u32;
-        let mut k = 0;
-        while k < 8 {
-            c = if (c & 1) != 0 {
-                (c >> 1) ^ 0xEDB8_8320
-            } else {
-                c >> 1
-            };
-            k += 1;
-        }
-        t[0][i] = c;
-        i += 1;
-    }
-    let mut i = 0;
-    while i < 256 {
-        let mut c = t[0][i];
-        let mut s = 1;
-        while s < 4 {
-            c = (c >> 8) ^ t[0][(c & 0xff) as usize];
-            t[s][i] = c;
-            s += 1;
-        }
-        i += 1;
-    }
-    t
-};
-
-#[inline]
-fn crc32_slice4(mut crc: u32, data: &[u8]) -> u32 {
-    let mut i = 0;
-    while i + 4 <= data.len() {
-        let w = crc ^ u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
-        crc = CRC32_SLICE4[3][(w & 0xff) as usize]
-            ^ CRC32_SLICE4[2][((w >> 8) & 0xff) as usize]
-            ^ CRC32_SLICE4[1][((w >> 16) & 0xff) as usize]
-            ^ CRC32_SLICE4[0][(w >> 24) as usize];
-        i += 4;
-    }
-    while i < data.len() {
-        crc = (crc >> 8) ^ CRC32_SLICE4[0][((crc as u8) ^ data[i]) as usize];
-        i += 1;
-    }
-    crc
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "pclmulqdq,sse4.1")]
-unsafe fn crc32_pclmul(data: &[u8]) -> u32 {
-    use std::arch::x86_64::*;
-    if data.len() < 64 {
-        return !crc32_slice4(!0u32, data);
-    }
-    unsafe {
-        let ptr = data.as_ptr();
-        let mut x0 = _mm_loadu_si128(ptr.cast());
-        let mut x1 = _mm_loadu_si128(ptr.add(16).cast());
-        let mut x2 = _mm_loadu_si128(ptr.add(32).cast());
-        let mut x3 = _mm_loadu_si128(ptr.add(48).cast());
-        x0 = _mm_xor_si128(x0, _mm_cvtsi32_si128(!0i32));
-
-        let k1k2 = _mm_set_epi64x(0x1c6e_4159_6i64, 0x1544_42bd_4i64);
-        let mut pos = 64usize;
-        #[cfg(all(target_feature = "vpclmulqdq", target_feature = "avx2"))]
-        if data.len() >= 128 {
-            let mut v0 = _mm256_inserti128_si256(_mm256_castsi128_si256(x0), x1, 1);
-            let mut v1 = _mm256_inserti128_si256(_mm256_castsi128_si256(x2), x3, 1);
-            let vk1k2 = _mm256_broadcastsi128_si256(k1k2);
-            while pos + 64 <= data.len() {
-                let vy0 = _mm256_loadu_si256(ptr.add(pos).cast());
-                let vy1 = _mm256_loadu_si256(ptr.add(pos + 32).cast());
-                v0 = _mm256_xor_si256(
-                    _mm256_xor_si256(
-                        _mm256_clmulepi64_epi128(v0, vk1k2, 0x00),
-                        _mm256_clmulepi64_epi128(v0, vk1k2, 0x11),
-                    ),
-                    vy0,
-                );
-                v1 = _mm256_xor_si256(
-                    _mm256_xor_si256(
-                        _mm256_clmulepi64_epi128(v1, vk1k2, 0x00),
-                        _mm256_clmulepi64_epi128(v1, vk1k2, 0x11),
-                    ),
-                    vy1,
-                );
-                pos += 64;
-            }
-            x0 = _mm256_castsi256_si128(v0);
-            x1 = _mm256_extracti128_si256(v0, 1);
-            x2 = _mm256_castsi256_si128(v1);
-            x3 = _mm256_extracti128_si256(v1, 1);
-        }
-        while pos + 64 <= data.len() {
-            let y0 = _mm_loadu_si128(ptr.add(pos).cast());
-            let y1 = _mm_loadu_si128(ptr.add(pos + 16).cast());
-            let y2 = _mm_loadu_si128(ptr.add(pos + 32).cast());
-            let y3 = _mm_loadu_si128(ptr.add(pos + 48).cast());
-
-            x0 = _mm_xor_si128(
-                _mm_xor_si128(_mm_clmulepi64_si128(x0, k1k2, 0x00), _mm_clmulepi64_si128(x0, k1k2, 0x11)),
-                y0,
-            );
-            x1 = _mm_xor_si128(
-                _mm_xor_si128(_mm_clmulepi64_si128(x1, k1k2, 0x00), _mm_clmulepi64_si128(x1, k1k2, 0x11)),
-                y1,
-            );
-            x2 = _mm_xor_si128(
-                _mm_xor_si128(_mm_clmulepi64_si128(x2, k1k2, 0x00), _mm_clmulepi64_si128(x2, k1k2, 0x11)),
-                y2,
-            );
-            x3 = _mm_xor_si128(
-                _mm_xor_si128(_mm_clmulepi64_si128(x3, k1k2, 0x00), _mm_clmulepi64_si128(x3, k1k2, 0x11)),
-                y3,
-            );
-            pos += 64;
-        }
-
-        let k3k4 = _mm_set_epi64x(0x0cca_a009_ei64, 0x1751_997d_0i64);
-        x0 = _mm_xor_si128(
-            _mm_xor_si128(_mm_clmulepi64_si128(x0, k3k4, 0x00), _mm_clmulepi64_si128(x0, k3k4, 0x11)),
-            x1,
-        );
-        x0 = _mm_xor_si128(
-            _mm_xor_si128(_mm_clmulepi64_si128(x0, k3k4, 0x00), _mm_clmulepi64_si128(x0, k3k4, 0x11)),
-            x2,
-        );
-        x0 = _mm_xor_si128(
-            _mm_xor_si128(_mm_clmulepi64_si128(x0, k3k4, 0x00), _mm_clmulepi64_si128(x0, k3k4, 0x11)),
-            x3,
-        );
-
-        while pos + 16 <= data.len() {
-            let y = _mm_loadu_si128(ptr.add(pos).cast());
-            x0 = _mm_xor_si128(
-                _mm_xor_si128(_mm_clmulepi64_si128(x0, k3k4, 0x00), _mm_clmulepi64_si128(x0, k3k4, 0x11)),
-                y,
-            );
-            pos += 16;
-        }
-
-        let k4 = _mm_set_epi64x(0, 0x0cca_a009_ei64);
-        let t0 = _mm_clmulepi64_si128(x0, k4, 0x00);
-        x0 = _mm_xor_si128(_mm_srli_si128(x0, 8), t0);
-
-        let k5 = _mm_set_epi64x(0, 0x163c_d612_4i64);
-        let t1 = _mm_clmulepi64_si128(_mm_and_si128(x0, _mm_set_epi32(0, 0, 0, -1)), k5, 0x00);
-        x0 = _mm_xor_si128(_mm_srli_si128(x0, 4), t1);
-
-        let poly_mu = _mm_set_epi64x(0x1db7_1064_1i64, 0x1f70_1164_1i64);
-        let mask32 = _mm_set_epi32(0, 0, 0, -1);
-        let q = _mm_clmulepi64_si128(_mm_and_si128(x0, mask32), poly_mu, 0x00);
-        let r = _mm_clmulepi64_si128(_mm_and_si128(q, mask32), poly_mu, 0x10);
-        let crc = _mm_extract_epi32(_mm_xor_si128(x0, r), 1) as u32;
-
-        if pos < data.len() {
-            !crc32_slice4(crc, &data[pos..])
-        } else {
-            !crc
-        }
-    }
-}
-
-#[inline]
-pub fn crc32_ieee(data: &[u8]) -> u32 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq", target_feature = "sse4.1"))]
-    {
-        unsafe { crc32_pclmul(data) }
-    }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "pclmulqdq", target_feature = "sse4.1")))]
-    {
-        #[cfg(target_arch = "x86_64")]
-        if data.len() >= 64 {
-            use std::sync::atomic::{AtomicU8, Ordering};
-            static HAS_PCLMUL: AtomicU8 = AtomicU8::new(0);
-            let st = HAS_PCLMUL.load(Ordering::Relaxed);
-            let ok = if st != 0 {
-                st == 2
-            } else {
-                let d = std::is_x86_feature_detected!("pclmulqdq")
-                    && std::is_x86_feature_detected!("sse4.1");
-                HAS_PCLMUL.store(if d { 2 } else { 1 }, Ordering::Relaxed);
-                d
-            };
-            if ok {
-                return unsafe { crc32_pclmul(data) };
-            }
-        }
-        !crc32_slice4(!0u32, data)
-    }
-}
-
-const fn rev_bits(mut v: u16, n: u8) -> u16 {
-    let mut r = 0u16;
-    let mut i = 0;
-    while i < n {
-        r = (r << 1) | (v & 1);
-        v >>= 1;
-        i += 1;
-    }
-    r
-}
-
-const FIXED_LIT: [(u16, u8); 256] = {
-    let mut t = [(0u16, 0u8); 256];
-    let mut s = 0;
-    while s < 144 {
-        t[s] = (rev_bits(0x30 + s as u16, 8), 8);
-        s += 1;
-    }
-    while s < 256 {
-        t[s] = (rev_bits(0x190 + (s - 144) as u16, 9), 9);
-        s += 1;
-    }
-    t
-};
-
-const FIXED_PAIR: [u32; 65536] = {
-    let mut t = [0u32; 65536];
-    let mut x = 0usize;
-    while x < 256 {
-        let (cx, lx) = FIXED_LIT[x];
-        let mut y = 0usize;
-        while y < 256 {
-            let (cy, ly) = FIXED_LIT[y];
-            let code = (cx as u32) | ((cy as u32) << lx);
-            let len = (lx + ly) as u32;
-            t[x | (y << 8)] = code | (len << 20) | ((lx as u32) << 26);
-            y += 1;
-        }
-        x += 1;
-    }
-    t
-};
-
-const FIXED_LEN: [(u16, u8); 259] = {
-    const BASE: [u16; 29] = [
-        3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115,
-        131, 163, 195, 227, 258,
-    ];
-    const EXTRA: [u8; 29] = [
-        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
-    ];
-    let mut t = [(0u16, 0u8); 259];
-    let mut l = 3usize;
-    while l <= 258 {
-        let mut idx = 0usize;
-        while idx + 1 < 29 && (l as u16) >= BASE[idx + 1] {
-            idx += 1;
-        }
-        let sym = 257 + idx;
-        let (hcode, hbits) = if sym <= 279 {
-            (rev_bits((sym - 256) as u16, 7), 7u8)
-        } else {
-            (rev_bits((0xc0 + (sym - 280)) as u16, 8), 8u8)
-        };
-        let extra = (l as u16) - BASE[idx];
-        let ebits = EXTRA[idx];
-        t[l] = (hcode | (extra << hbits), hbits + ebits);
-        l += 1;
-    }
-    t
-};
-
-const DIST_SYM_REV: [u16; 30] = {
-    let mut t = [0u16; 30];
-    let mut i = 0;
-    while i < 30 {
-        t[i] = rev_bits(i as u16, 5);
-        i += 1;
-    }
-    t
-};
-
-#[inline(always)]
-fn put_bits(dst: &mut Vec<u8>, bit_buf: &mut u64, bit_cnt: &mut u32, bits: u64, nbits: u8) {
-    *bit_buf |= bits << *bit_cnt;
-    *bit_cnt += nbits as u32;
-    if *bit_cnt >= 32 {
-        dst.extend_from_slice(&(*bit_buf as u32).to_le_bytes());
-        *bit_buf >>= 32;
-        *bit_cnt -= 32;
-    }
-}
-
-#[inline(always)]
-fn emit_literal_run(
-    src: &[u8],
-    mut pos: usize,
-    end: usize,
-    dst: &mut Vec<u8>,
-    bit_buf: &mut u64,
-    bit_cnt: &mut u32,
-) {
-    while pos + 2 <= end {
-        let p0 = u16::from_le_bytes([src[pos], src[pos + 1]]) as usize;
-        let e0 = FIXED_PAIR[p0];
-        put_bits(
-            dst,
-            bit_buf,
-            bit_cnt,
-            (e0 & 0x3ffff) as u64,
-            ((e0 >> 20) & 0x3f) as u8,
-        );
-        pos += 2;
-    }
-    if pos < end {
-        let (lit_c, lit_b) = FIXED_LIT[src[pos] as usize];
-        put_bits(dst, bit_buf, bit_cnt, lit_c as u64, lit_b);
-    }
-}
-
 #[derive(Default, Clone, Copy)]
 pub struct HwBuildHasher;
 
@@ -1458,217 +1310,6 @@ impl std::hash::Hasher for HwHasher {
     }
 }
 
-#[inline(always)]
-fn hash4(v: u32) -> usize {
-    #[cfg(all(target_arch = "x86_64", target_feature = "sse4.2"))]
-    unsafe {
-        return (std::arch::x86_64::_mm_crc32_u32(0, v) as usize) & 0xfff;
-    }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.2")))]
-    {
-        (v.wrapping_mul(0x9E37_79B1) >> 20) as usize
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn match_len_at_avx2(src: &[u8], ip: usize, cand: usize, max_ml: usize) -> usize {
-    unsafe {
-        use std::arch::x86_64::*;
-        let mut m = 4usize;
-        while m + 32 <= max_ml {
-            let va = _mm256_loadu_si256(src.as_ptr().add(ip + m).cast());
-            let vb = _mm256_loadu_si256(src.as_ptr().add(cand + m).cast());
-            let eq = _mm256_movemask_epi8(_mm256_cmpeq_epi8(va, vb)) as u32;
-            if eq != 0xffff_ffff {
-                m += (!eq).trailing_zeros() as usize;
-                return m.min(max_ml);
-            }
-            m += 32;
-        }
-        while m + 8 <= max_ml {
-            let a = u64::from_le_bytes(src[ip + m..ip + m + 8].try_into().unwrap());
-            let b = u64::from_le_bytes(src[cand + m..cand + m + 8].try_into().unwrap());
-            let d = a ^ b;
-            if d != 0 {
-                m += (d.trailing_zeros() >> 3) as usize;
-                return m.min(max_ml);
-            }
-            m += 8;
-        }
-        while m < max_ml && src[ip + m] == src[cand + m] {
-            m += 1;
-        }
-        m
-    }
-}
-
-#[inline(always)]
-fn match_len_at(src: &[u8], ip: usize, cand: usize, max_ml: usize) -> usize {
-    #[cfg(target_arch = "x86_64")]
-    if max_ml >= 36 && has_avx2() {
-        return unsafe { match_len_at_avx2(src, ip, cand, max_ml) };
-    }
-    let mut m = 4usize;
-    while m + 8 <= max_ml {
-        let a = u64::from_le_bytes(src[ip + m..ip + m + 8].try_into().unwrap());
-        let b = u64::from_le_bytes(src[cand + m..cand + m + 8].try_into().unwrap());
-        let d = a ^ b;
-        if d != 0 {
-            m += (d.trailing_zeros() >> 3) as usize;
-            return m.min(max_ml);
-        }
-        m += 8;
-    }
-    while m < max_ml && src[ip + m] == src[cand + m] {
-        m += 1;
-    }
-    m
-}
-
-#[inline(always)]
-fn resolve_cand(ip: usize, raw: u16, len: usize) -> Option<usize> {
-    if raw == 0 {
-        return None;
-    }
-    let base_hi = ip & !0xffff;
-    let mut cand = base_hi | (raw.wrapping_sub(1) as usize);
-    if cand >= ip && cand >= 0x10000 {
-        cand -= 0x10000;
-    }
-    if cand < ip && ip - cand <= 32768 && cand + 4 <= len {
-        Some(cand)
-    } else {
-        None
-    }
-}
-
-pub fn gzip_compress_fast(src: &[u8], dst: &mut Vec<u8>) {
-    dst.clear();
-    dst.reserve((src.len() >> 1) + 64);
-    dst.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x03]);
-
-    let len = src.len();
-    let mut bit_buf: u64 = 0b011;
-    let mut bit_cnt: u32 = 3;
-    let mut htab = [0u32; 4096];
-
-    let mut ip = 0usize;
-    let mut lit_start = 0usize;
-
-    while ip + 8 <= len {
-        let cur4 = u32::from_le_bytes(src[ip..ip + 4].try_into().unwrap());
-        let h = hash4(cur4);
-        let pair = htab[h];
-        let raw0 = pair as u16;
-        let raw1 = (pair >> 16) as u16;
-        let ip_tag = (ip as u16).wrapping_add(1);
-        htab[h] = ((raw0 as u32) << 16) | (ip_tag as u32);
-
-        let max_ml = (len - ip).min(258);
-        let mut best_cand = 0usize;
-        let mut best_ml = 0usize;
-
-        if let Some(c0) = resolve_cand(ip, raw0, len) {
-            if u32::from_le_bytes(src[c0..c0 + 4].try_into().unwrap()) == cur4 {
-                best_cand = c0;
-                best_ml = match_len_at(src, ip, c0, max_ml);
-            }
-        }
-        if best_ml < 32 {
-            if let Some(c1) = resolve_cand(ip, raw1, len) {
-                if u32::from_le_bytes(src[c1..c1 + 4].try_into().unwrap()) == cur4 {
-                    let ml1 = match_len_at(src, ip, c1, max_ml);
-                    if ml1 > best_ml + 1 {
-                        best_cand = c1;
-                        best_ml = ml1;
-                    }
-                }
-            }
-        }
-
-        if best_ml >= 4 && (best_ml >= 5 || ip - best_cand <= 4096) {
-            if lit_start < ip {
-                emit_literal_run(src, lit_start, ip, dst, &mut bit_buf, &mut bit_cnt);
-            }
-
-            let dist = ip - best_cand;
-            let (dcode, dbits) = if dist <= 4 {
-                (DIST_SYM_REV[dist - 1] as u64, 5u8)
-            } else {
-                let d = (dist - 1) as u32;
-                let msb = 31 - d.leading_zeros();
-                let eb = msb - 1;
-                let sym = ((msb << 1) + ((d >> eb) & 1)) as usize;
-                let extra = d & ((1u32 << eb) - 1);
-                (
-                    (DIST_SYM_REV[sym] as u64) | ((extra as u64) << 5),
-                    (5 + eb) as u8,
-                )
-            };
-
-            let mut probe = ip;
-            let mut ml = best_ml;
-            loop {
-                let (lcode, lbits) = FIXED_LEN[ml];
-                let combined = (lcode as u64) | (dcode << lbits);
-                let clen = lbits + dbits;
-                bit_buf |= combined << bit_cnt;
-                bit_cnt += clen as u32;
-                if bit_cnt >= 32 {
-                    dst.extend_from_slice(&(bit_buf as u32).to_le_bytes());
-                    bit_buf >>= 32;
-                    bit_cnt -= 32;
-                }
-
-                let next_ip = probe + ml;
-                let idx_limit = next_ip.min(len.saturating_sub(4));
-                let mut k = probe + 2;
-                let step_k = if ml > 64 { 4 } else { 2 };
-                while k < idx_limit {
-                    let w4 = u32::from_le_bytes(src[k..k + 4].try_into().unwrap());
-                    let hk = hash4(w4);
-                    let pk = htab[hk];
-                    let kt = (k as u16).wrapping_add(1);
-                    htab[hk] = ((pk & 0xffff) << 16) | (kt as u32);
-                    k += step_k;
-                }
-
-                ip = next_ip;
-                lit_start = ip;
-                if ml == 258 && ip + 8 <= len {
-                    let c_next = ip - dist;
-                    if u32::from_le_bytes(src[ip..ip + 4].try_into().unwrap())
-                        == u32::from_le_bytes(src[c_next..c_next + 4].try_into().unwrap())
-                    {
-                        probe = ip;
-                        ml = match_len_at(src, ip, c_next, (len - ip).min(258));
-                        continue;
-                    }
-                }
-                break;
-            }
-            continue;
-        }
-
-        ip += 1 + ((ip - lit_start) >> 7);
-    }
-
-    if lit_start < len {
-        emit_literal_run(src, lit_start, len, dst, &mut bit_buf, &mut bit_cnt);
-    }
-    put_bits(dst, &mut bit_buf, &mut bit_cnt, 0, 7);
-    while bit_cnt > 0 {
-        dst.push(bit_buf as u8);
-        bit_buf >>= 8;
-        bit_cnt = bit_cnt.saturating_sub(8);
-    }
-
-    let crc = crc32_ieee(src);
-    dst.extend_from_slice(&crc.to_le_bytes());
-    dst.extend_from_slice(&(len as u32).to_le_bytes());
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1694,6 +1335,23 @@ mod tests {
         let mut buf = Vec::new();
         write_str(&mut buf, b"a\"b\\c\n\x01\xc3\xa9");
         assert_eq!(buf, b"\"a\\\"b\\\\c\\n\\u0001\xc3\xa9\"");
+
+        for len in [0usize, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 95] {
+            let clean: Vec<u8> = (0..len).map(|i| b'a' + (i % 26) as u8).collect();
+            buf.clear();
+            write_str(&mut buf, &clean);
+            assert_eq!(buf[0], b'"');
+            assert_eq!(buf[buf.len() - 1], b'"');
+            assert_eq!(&buf[1..buf.len() - 1], &clean[..]);
+
+            if len > 0 {
+                let mut dirty = clean.clone();
+                dirty[len / 2] = b'"';
+                buf.clear();
+                write_str(&mut buf, &dirty);
+                assert_eq!(buf.len(), len + 3);
+            }
+        }
     }
 
     #[test]
@@ -1726,58 +1384,22 @@ mod tests {
     }
 
     #[test]
-    fn gzip_and_crc32_compliance() {
-        assert_eq!(crc32_ieee(b"123456789"), 0xCBF4_3926);
-        let mut sample = Vec::with_capacity(2048);
-        for i in 0..2048u32 {
-            sample.push((i.wrapping_mul(1664525).wrapping_add(1013904223) >> 24) as u8);
-            let exp = !crc32_slice4(!0u32, &sample);
-            assert_eq!(crc32_ieee(&sample), exp);
-        }
-        assert!(contains_gzip_token(b"gzip"));
-        assert!(contains_gzip_token(b"deflate, gzip;q=0.9, br"));
-        assert!(!contains_gzip_token(b"gzip;q=0"));
-        assert!(!contains_gzip_token(b"br, deflate"));
+    fn small_str_inline_and_heap() {
+        let inline = SmallStr::from_str("how-to-train-your-dragon-42");
+        assert_eq!(inline.as_str(), "how-to-train-your-dragon-42");
+        assert_eq!(inline.clone(), inline);
 
-        for count in [8usize, 40usize] {
-            let mut payload = Vec::new();
-            for i in 0..count {
-                payload.extend_from_slice(br#"{"slug":"how-to-train-your-dragon-"#);
-                write_i64(&mut payload, i as i64);
-                payload.extend_from_slice("\",\"title\":\"How to train your dragon\",\"description\":\"Conformance comment <b>&</b> \\\"quoted\\\" ünïcode 🚀\",\"tagList\":[\"dragons\",\"training\"],\"createdAt\":\"2026-01-01T00:00:00.000Z\",\"updatedAt\":\"2026-01-01T00:00:00.000Z\",\"favorited\":false,\"favoritesCount\":42,\"author\":{\"username\":\"jake\",\"bio\":null,\"image\":null,\"following\":false}},".as_bytes());
-            }
-            let mut gz = Vec::new();
-            gzip_compress_fast(&payload, &mut gz);
-            assert!(gz.len() * 2 < payload.len());
-            let mut child = std::process::Command::new("gzip")
-                .arg("-dc")
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .spawn()
-                .unwrap();
-            use std::io::Write;
-            child.stdin.as_mut().unwrap().write_all(&gz).unwrap();
-            let out = child.wait_with_output().unwrap();
-            assert!(out.status.success());
-            assert_eq!(out.stdout, payload);
-        }
+        let long_s = "a".repeat(80);
+        let heap = SmallStr::from_str(&long_s);
+        assert_eq!(heap.as_str(), long_s);
+        assert_eq!(heap.clone(), heap);
+        assert!(inline != heap);
 
-        let mut high_bytes = Vec::with_capacity(4096);
-        for i in 0..4096u32 {
-            high_bytes.push(144 + ((i.wrapping_mul(1103515245).wrapping_add(12345) >> 16) % 112) as u8);
-        }
-        let mut gz_hi = Vec::new();
-        gzip_compress_fast(&high_bytes, &mut gz_hi);
-        let mut child = std::process::Command::new("gzip")
-            .arg("-dc")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        use std::io::Write;
-        child.stdin.as_mut().unwrap().write_all(&gz_hi).unwrap();
-        let out = child.wait_with_output().unwrap();
-        assert!(out.status.success());
-        assert_eq!(out.stdout, high_bytes);
+        let mut map: std::collections::HashMap<SmallStr, u32, HwBuildHasher> =
+            std::collections::HashMap::default();
+        map.insert(inline.clone(), 7);
+        map.insert(heap.clone(), 9);
+        assert_eq!(map.get(b"how-to-train-your-dragon-42".as_slice()), Some(&7));
+        assert_eq!(map.get(long_s.as_bytes()), Some(&9));
     }
 }
