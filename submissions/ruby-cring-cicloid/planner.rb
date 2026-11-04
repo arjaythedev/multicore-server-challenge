@@ -18,7 +18,8 @@ class Planner
   MAX = Integer(ENV.fetch("READ_MAX", "512")) # requests per batch; a backlog runs as several batches
 
   # One read request. `kind` and `args` say what it wants; `document` (or `missing`) is the answer.
-  Request = Struct.new(:kind, :viewer, :a, :b, :c, :queue, :document)
+  # `fiber` waits for it.
+  Request = Struct.new(:kind, :viewer, :a, :b, :c, :fiber, :document, :error)
 
   FALSE = "false"
   TRUE = "true"
@@ -44,14 +45,21 @@ class Planner
 
   private
 
+  # The requesting fiber parks itself with the scheduler's block hook and the batch resumes it with unblock:
+  # a Thread::Queue per wait cost several times the wake-up itself. Safe on one thread: a request always
+  # blocks before its batch runs, since the batch starts on a later pass of the event loop.
   def ask(kind, viewer, a, b, c)
-    queue = (Thread.current[:planner_queue] ||= Thread::Queue.new) # Thread#[] is fiber-local
-    @pending << Request.new(kind, viewer, a, b, c, queue, nil)
+    request = Request.new(kind, viewer, a, b, c, Fiber.current, nil, nil)
+    @pending << request
     @signal.push(Process.clock_gettime(Process::CLOCK_MONOTONIC)) if @pending.size == 1
-    answer = queue.pop
-    raise answer if answer.is_a?(Exception)
+    Fiber.scheduler.block(request, nil) until request.document || request.error
+    raise request.error if request.error
 
-    answer == :missing ? nil : answer
+    request.document == :missing ? nil : request.document
+  end
+
+  def wake(request)
+    Fiber.scheduler.unblock(request, request.fiber)
   end
 
   def run
@@ -64,7 +72,10 @@ class Planner
         begin
           answer(batch)
         rescue StandardError => error
-          batch.each { |request| request.queue.push(error) } # nothing was delivered: answer() delivers last
+          batch.each do |request| # nothing was delivered: answer() delivers last
+            request.error = error
+            wake(request)
+          end
         end
       end
     end
@@ -101,7 +112,10 @@ class Planner
     enrich unless @articles.empty? && @flags_follow.empty?
     @finish.each(&:call) if @finish
     @finish = nil
-    batch.each { |request| request.queue.push(request.document || :missing) }
+    batch.each do |request|
+      request.document ||= :missing
+      wake(request)
+    end
   end
 
   def later(&block) = (@finish ||= []) << block
@@ -316,14 +330,14 @@ class Planner
     ids = @articles.keys
     statements = []
     unless ids.empty?
-      encoded = @array.encode(ids)
-      statements << [:b_enrich, [encoded, @array.encode(ids.map { |id| @articles[id][:author] })]]
+      encoded = ints(ids)
+      statements << [:b_enrich, [encoded, ints(ids.map { |id| @articles[id][:author] })]]
       statements << [:b_tag_names, [encoded]]
     end
     flags = !@flags_fav.empty? || !@flags_follow.empty?
     if flags
-      statements << [:b_flags, [@array.encode(@flags_fav.map(&:first)), @array.encode(@flags_fav.map(&:last)),
-                                @array.encode(@flags_follow.map(&:first)), @array.encode(@flags_follow.map(&:last))]]
+      statements << [:b_flags, [ints(@flags_fav.map(&:first)), ints(@flags_fav.map(&:last)),
+                                ints(@flags_follow.map(&:first)), ints(@flags_follow.map(&:last))]]
     end
     results = @db.group(statements)
     unless ids.empty?
@@ -376,6 +390,9 @@ class Planner
 
   # Postgres text (TimeZone UTC) -> "2024-09-15T14:22:31.123Z", milliseconds truncated.
   def time(text) = Fmt.time(text)
+
+  # An int8[] literal; for integers that's all PG::TextEncoder::Array would write, at a fraction of the cost.
+  def ints(values) = "{#{values.join(",")}}"
 
   def parse_ids(text)
     return [] if text.bytesize <= 2
