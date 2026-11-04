@@ -209,3 +209,7 @@ Script: `experiments/h.sh`.
 - **Dropped: favorite flags in one scan** (all viewers x all the batch's articles on `favorites_pkey`, instead of one probe per viewer). Same buffers, but 10.1 ->
   24.4 ms per batch on real batches: 836 ids in a second `ANY` make it much slower per tuple. Groups in a batch were already distinct per key (9.6 tag, 14.2 author, 32
   feed groups per batch), so there's no count to share there either; a capped tag count costs its 1,000 index tuples per tag.
+- **Holds at 220k, solo, fixed harness (5 min, p95/p99 ms, µs/req app + PG):** e23 epoll 139/172, 114.5 (51.2 + 63.3), 1.10M connects; e23 io_uring 126/156, 113.4 (49.6 + 63.8);
+  e24 epoll (own fd tables) 127/159, 110.0 (48.2 + 61.8), exactly 220,000 connects. All 0% errors, logins p95 ~245. So the stale-event crash is gone, and no eviction saves ~4% at
+  220k, where only a tenth of the users were over the limit; the saving should grow with the load. e21 vs #87 at 80k, three pairs, both lanes busy: lane A 104.1 vs 104.9 and 103.0 (#87),
+  lane B 106.4, 104.2 vs 103.6 (#87): level, PG ~3-4 µs behind (comments, addressed by e25), app ~3 µs ahead.
