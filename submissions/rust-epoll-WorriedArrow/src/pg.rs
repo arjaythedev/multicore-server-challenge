@@ -385,7 +385,8 @@ impl Conn {
         // ("auto") keeps re-planning them per execution because a custom plan looks cheaper for each array. jit: a
         // generic plan can't see LIMIT values or array sizes, its cost estimate crosses jit_above_cost, and compiling
         // costs milliseconds per execution of a sub-millisecond statement. max_parallel_workers_per_gather: a generic
-        // plan can't see how small a batch's arrays are; parallel workers would only add startup cost.
+        // plan can't see how small a batch's arrays are; parallel workers would only add startup cost. enable_memoize: the generic plans of the tag and favorited
+        // lists put a Memoize over their article join, whose keys are distinct anyway; without it they ran 5-45% faster on an aged database.
         for (k, v) in [
             ("user", cfg.user.as_str()),
             ("database", cfg.dbname.as_str()),
@@ -394,6 +395,7 @@ impl Conn {
             ("plan_cache_mode", "force_generic_plan"),
             ("jit", "off"),
             ("max_parallel_workers_per_gather", "0"),
+            ("enable_memoize", "off"),
         ] {
             m.extend_from_slice(k.as_bytes());
             m.push(0);

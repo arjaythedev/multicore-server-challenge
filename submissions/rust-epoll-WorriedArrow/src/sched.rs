@@ -6,8 +6,11 @@
 //! - Each class starts a batch at most every `gap` (since its last batch started), and a request is taken at the
 //!   latest `gap + min_age` after it arrived. At low load a request waits only `min_age`.
 //! - At most `max_active` batches run at once, and each class at most its cap, plus one when its oldest request is
-//!   the oldest of all, so a class with a backlog gets more lanes without starving the others.
-//! - Among the classes that are due, the one whose oldest request has waited longest goes first.
+//!   the oldest of all, plus one for feeds and comments when their oldest has waited `borrow_age` and the fast class
+//!   has a lane to spare, plus one for any class whose oldest has waited `starve_age`. A class whose work outgrows
+//!   its cap (feeds near saturation) gets lanes before its queue runs away, without starving the others.
+//! - Among the classes that are due, the one whose oldest request has waited longest goes first; heads within 2 ms
+//!   of each other go in class order, fast reads first.
 
 use crate::db::{Read, ReadJob};
 use std::collections::VecDeque;
@@ -18,6 +21,7 @@ pub const FAST: usize = 0;
 pub const CMTS: usize = 1;
 pub const FEED: usize = 2;
 const CLASSES: usize = 3;
+const TIE: Duration = Duration::from_millis(2);
 
 pub fn class_of(r: &Read) -> usize {
     match r {
@@ -33,6 +37,8 @@ pub struct Config {
     pub caps: [usize; CLASSES],
     pub max_active: usize,
     pub max_batch: usize,
+    pub borrow_age: Duration,
+    pub starve_age: Duration,
 }
 
 struct State {
@@ -86,8 +92,19 @@ impl Sched {
             if g.active < cfg.max_active {
                 for c in 0..CLASSES {
                     let Some(&(head, _)) = g.q[c].front() else { continue };
-                    let cap = cfg.caps[c] + usize::from(oldest == Some(c));
+                    let age = now.saturating_duration_since(head);
+                    let cap = cfg.caps[c]
+                        + usize::from(oldest == Some(c))
+                        + usize::from(c != FAST && age >= cfg.borrow_age && g.inflight[FAST] < cfg.caps[FAST])
+                        + usize::from(age >= cfg.starve_age);
                     if g.inflight[c] >= cap {
+                        // The cap grows once the head has waited borrow_age or starve_age: wake then to look again.
+                        let grow = [cfg.borrow_age, cfg.starve_age].into_iter().map(|a| head + a).filter(|&t| t > now).min();
+                        if let Some(t) = grow {
+                            if wake.is_none_or(|w| t < w) {
+                                wake = Some(t);
+                            }
+                        }
                         continue;
                     }
                     // Due once the head has waited min_age and the class's gap has passed, or in any case once the
@@ -95,7 +112,8 @@ impl Sched {
                     let gap_at = g.last_start[c].map_or(now, |t| t + cfg.gap[c]);
                     let due = (head + cfg.min_age).max(gap_at).min(head + cfg.gap[c] + cfg.min_age);
                     if due <= now {
-                        if pick.is_none_or(|(h, _)| head < h) {
+                        // Classes are visited in order, so a later one must be older by more than 2 ms.
+                        if pick.is_none_or(|(h, _)| head + TIE < h) {
                             pick = Some((head, c));
                         }
                     } else if wake.is_none_or(|w| due < w) {

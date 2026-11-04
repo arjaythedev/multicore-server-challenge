@@ -57,9 +57,12 @@ distinct article in phase B. A feed's articles are by followed authors, so they 
 those authors each signed-in viewer of the thread follows. A comments batch has no phase B.
 
 **Forming batches.** Reads queue by class: feeds, comment threads, and the rest. Each class starts a batch at most
-every gap (75 ms, 120 ms for feeds), and a read is due at most gap + 5 ms after it arrives. At most `READ_ACTIVE` batches run at once,
-each class at most its share of the lanes plus one for the class whose oldest read has waited longest. A fast
-batch never waits on a feed statement, and each class's batch shares its lookups across everything that waited the
+every gap (75 ms, 80 ms for feeds), and a read is due at most gap + 5 ms after it arrives. At most `READ_ACTIVE`
+batches run at once, each class at most its share of the lanes, plus one for the class whose oldest read has waited
+longest, plus one for feeds and comments once their oldest read has waited 90 ms while the fast class has a lane to
+spare, plus one for any class whose oldest read has waited 300 ms. Feeds are 8% of requests but the dearest read,
+and near saturation their batches outgrow two lanes; a class held at its cap queues until its reads time out, so the
+cap grows with the wait instead. A fast batch never waits on a feed statement, and each class's batch shares its lookups across everything that waited the
 gap. Postgres pays a fixed cost per statement execution, and a batch of a few hundred requests splits it a few
 hundred ways; everything requests have in common (the newest page, the tag list, a viral article's favorite count
 and comment thread) is read once per batch instead of once per request. List pages of one key in a batch are read
@@ -95,6 +98,8 @@ worker only takes full sets, so a steady trickle of logins isn't split into half
 every execution (16% of Postgres CPU in a profile), and `jit = off`, because a generic plan can't see LIMIT values or
 array sizes, its cost estimate crosses `jit_above_cost`, and compiling took milliseconds per sub-millisecond statement.
 `max_parallel_workers_per_gather = 0`, for the same reason: a generic plan can't see how small a batch's arrays are.
+`enable_memoize = off`: the generic plans of the tag and favorited lists put a Memoize over their article join,
+whose keys are distinct anyway; on an aged database those statements ran 5-45% faster without it.
 
 **Scheduling**: at startup the process puts itself under the `SCHED_BATCH` policy (no privileges needed; every
 thread inherits it). Our threads wake constantly (a request, a reply, a ready batch), and under the default policy
@@ -132,7 +137,9 @@ Defaults suit the 8-vCPU box; all are optional environment variables.
 | `READ_LANES` | cores | read connections |
 | `FEED_CONN` | 1 | 1: each read lane runs its batch's feed statement on a second connection, alongside the rest of phase A |
 | `CLASS_LANES` | 1 | 1: reads queue by class (feeds, comment threads, the rest), each class a batch at most every gap; 0: one pool |
-| `GAP_FAST_US` / `GAP_CMTS_US` / `GAP_FEED_US` | 75000 / 75000 / 120000 | least time between two batches of a class |
+| `GAP_FAST_US` / `GAP_CMTS_US` / `GAP_FEED_US` | 75000 / 75000 / 80000 | least time between two batches of a class |
+| `BORROW_AGE_US` | 90000 | feeds and comments take a lane past their share once their oldest read has waited this long and the fast class has one to spare |
+| `STARVE_AGE_US` | 300000 | any class takes a lane past its share once its oldest read has waited this long |
 | `FEED_MERGE` | 1 | 1: each distinct followee read once per batch, feeds merged here; 0: per viewer in SQL |
 | `GAP_MIN_US` | 5000 | least time a read waits before its batch starts |
 | `READ_ACTIVE` | read lanes - 1 | most read batches running at once (per class 3/8, 1/4, 1/4 of the lanes, plus one for the class waiting longest) |
@@ -175,6 +182,7 @@ group commit without `BEGIN`/`COMMIT` from `zig-iouring-nick-potts` (#117), whos
 kernel is a port of. Read classes with per-class gaps and caps, event loops at nice 5, tiered hasher priority and sorted
 phase B keys from `rust-epoll-theCatWisel` (#154, #201) and `zig-iouring-nick-potts` (#168); comment threads in one
 statement, list windows per key and shared unflagged bodies from `rust-epoll-theCatWisel` (#201, #205); feeds
-merged from one scan per followee from `c-epoll-unorig-username` (#203).
+merged from one scan per followee from `c-epoll-unorig-username` (#203); `enable_memoize = off` from
+`swift-iouring-Tabonx` (#207).
 
 Built with Claude (Anthropic).

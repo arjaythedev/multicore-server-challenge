@@ -71,11 +71,13 @@ fn main() {
         sched: (env_or("CLASS_LANES", 1) != 0).then(|| {
             let fast = Duration::from_micros(env_or("GAP_FAST_US", 75_000));
             sched::Config {
-                gap: [fast, Duration::from_micros(env_or("GAP_CMTS_US", 75_000)), Duration::from_micros(env_or("GAP_FEED_US", 120_000))],
+                gap: [fast, Duration::from_micros(env_or("GAP_CMTS_US", 75_000)), Duration::from_micros(env_or("GAP_FEED_US", 80_000))],
                 min_age: Duration::from_micros(env_or("GAP_MIN_US", 5_000)),
                 caps: [(read_lanes * 3 / 8).max(2), (read_lanes / 4).max(1), (read_lanes / 4).max(1)],
                 max_active: env_or("READ_ACTIVE", read_lanes.saturating_sub(1).max(3)),
                 max_batch: env_or("READ_BATCH", 4096),
+                borrow_age: Duration::from_micros(env_or("BORROW_AGE_US", 90_000)),
+                starve_age: Duration::from_micros(env_or("STARVE_AGE_US", 300_000)),
             }
         }),
         bcrypt_rescue: Duration::from_millis(env_or("BCRYPT_RESCUE_MS", 1000)),
