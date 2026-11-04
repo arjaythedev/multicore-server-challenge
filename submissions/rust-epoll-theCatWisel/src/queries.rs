@@ -239,28 +239,22 @@ pub fn read_catalog() -> Vec<PreparedDef> {
             &[OID_INT8_ARR],
         ),
         def(
-            "flags",
-            "SELECT 0::int8, p.v, f.article_id \
+            "fav_flags",
+            "SELECT p.v, f.article_id \
              FROM unnest($1::int8[], $3::int4[], $4::int4[]) p(v, s, e) \
              CROSS JOIN LATERAL ( \
                SELECT f.article_id FROM favorites f WHERE f.user_id = p.v AND f.article_id = ANY(($2::int8[])[p.s : p.e]) \
-             ) f \
-             UNION ALL \
-             SELECT 1::int8, q.v, fo.followee_id \
-             FROM unnest($5::int8[], $7::int4[], $8::int4[]) q(v, s, e) \
+             ) f",
+            &[OID_INT8_ARR, OID_INT8_ARR, OID_INT4_ARR, OID_INT4_ARR],
+        ),
+        def(
+            "foll_flags",
+            "SELECT q.v, fo.followee_id \
+             FROM unnest($1::int8[], $3::int4[], $4::int4[]) q(v, s, e) \
              CROSS JOIN LATERAL ( \
-               SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = q.v AND fo.followee_id = ANY(($6::int8[])[q.s : q.e]) \
+               SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = q.v AND fo.followee_id = ANY(($2::int8[])[q.s : q.e]) \
              ) fo",
-            &[
-                OID_INT8_ARR,
-                OID_INT8_ARR,
-                OID_INT4_ARR,
-                OID_INT4_ARR,
-                OID_INT8_ARR,
-                OID_INT8_ARR,
-                OID_INT4_ARR,
-                OID_INT4_ARR,
-            ],
+            &[OID_INT8_ARR, OID_INT8_ARR, OID_INT4_ARR, OID_INT4_ARR],
         ),
     ]
 }

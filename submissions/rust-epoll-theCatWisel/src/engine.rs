@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::auth::{self, BcryptInput, TokenSigner};
@@ -453,7 +453,7 @@ struct ReadRenderScratch {
     cmt_sort_buf: Vec<(i64, i64, wire::RowSpan, wire::RowSpan)>,
     cmt_slices: Vec<CachedCommentSlice>,
     cmt_spans: Vec<Option<(u32, u32)>>,
-    rendered_profiles: Vec<Option<Arc<[u8]>>>,
+    rendered_profiles: Vec<Option<ReplyBody>>,
     rendered_cmts: Vec<Option<ReplyBody>>,
     rendered_slugs: Vec<Option<ReplyBody>>,
     rendered_global: Vec<Option<ReplyBody>>,
@@ -840,7 +840,7 @@ impl ReadWorker {
         let mut expired_replies = Vec::new();
         let rw = self.cfg.read_workers.max(2);
         let lanes = self.cfg.bcrypt_lanes.max(2);
-        let num_families = queries::read_catalog().len();
+        let num_families = 16;
         let base_batch = num_families * rw * 2;
         let max_batch = base_batch * rw * 2;
         loop {
@@ -1241,7 +1241,7 @@ impl ReadWorker {
                     }
                     buf.extend_from_slice(b"]}");
                     rendered_tags = Some(if tags_count > 1 {
-                        ReplyBody::Shared(buf.into())
+                        ReplyBody::shared_200(&buf)
                     } else {
                         ReplyBody::Owned(buf)
                     });
@@ -1346,7 +1346,7 @@ impl ReadWorker {
                                         early_replies.push(OutgoingReply {
                                             addr: task.addr,
                                             status: 200,
-                                            body: ReplyBody::Shared(shared.clone()),
+                                            body: shared.clone(),
                                         });
                                     } else {
                                         let r = pa.row(span);
@@ -1362,12 +1362,12 @@ impl ReadWorker {
                                         );
                                         body.push(b'}');
                                         if self.k_prof.count(k) > 1 {
-                                            let arc: Arc<[u8]> = body.into();
-                                            rendered_profiles[k as usize] = Some(arc.clone());
+                                            let rb = ReplyBody::shared_200(&body);
+                                            rendered_profiles[k as usize] = Some(rb.clone());
                                             early_replies.push(OutgoingReply {
                                                 addr: task.addr,
                                                 status: 200,
-                                                body: ReplyBody::Shared(arc),
+                                                body: rb,
                                             });
                                         } else {
                                             early_replies.push(OutgoingReply {
@@ -1720,7 +1720,8 @@ impl ReadWorker {
         let b_artmeta = alloc_b(!self.meta_req_ids.is_empty());
         let b_artx = alloc_b(self.distinct_arts.len() > 0);
         let b_artau = alloc_b(self.distinct_authors.len() > 0);
-        let b_flags = alloc_b(!self.fav_viewers.is_empty() || !self.foll_viewers.is_empty());
+        let b_fav_flags = alloc_b(!self.fav_viewers.is_empty());
+        let b_foll_flags = alloc_b(!self.foll_viewers.is_empty());
 
         if n_phase_b > 0 {
             let tx = &mut conn.tx;
@@ -1749,14 +1750,21 @@ impl ReadWorker {
                 }
                 tx.bind_and_exec("artau", &[BindParam::I64Slice(&self.sorted_authors)]);
             }
-            if b_flags.is_some() {
+            if b_fav_flags.is_some() {
                 tx.bind_and_exec(
-                    "flags",
+                    "fav_flags",
                     &[
                         BindParam::I64Slice(&self.fav_viewers),
                         BindParam::I64Slice(&self.fav_targets),
                         BindParam::I32Slice(&self.fav_starts),
                         BindParam::I32Slice(&self.fav_ends),
+                    ],
+                );
+            }
+            if b_foll_flags.is_some() {
+                tx.bind_and_exec(
+                    "foll_flags",
+                    &[
                         BindParam::I64Slice(&self.foll_viewers),
                         BindParam::I64Slice(&self.foll_targets),
                         BindParam::I32Slice(&self.foll_starts),
@@ -1792,7 +1800,6 @@ impl ReadWorker {
         let pa = &self.pa;
         let pb = &self.pb;
         let arena = &mut self.arena;
-        let mut tag_sort_buf: Vec<&[u8]> = Vec::with_capacity(8);
 
         if n_phase_b > 0 {
             if let Some(s) = b_tags {
@@ -1873,25 +1880,51 @@ impl ReadWorker {
                     arena.extend_from_slice(b",\"tagList\":[");
                     if let Some(raw_arr) = pb.bytes(r[1]) {
                         let tag_pipe = if b_tags.is_some() { pb } else { pa };
-                        tag_sort_buf.clear();
+                        let mut inline_tags: [&[u8]; 8] = [b""; 8];
+                        let mut n_tags = 0usize;
+                        let mut spill_tags: Vec<&[u8]> = Vec::new();
                         for elem in wire::iter_binary_array(raw_arr) {
                             if let Ok(bytes) = elem.try_into() {
                                 let tid = i32::from_be_bytes(bytes) as usize;
                                 if let Some(&cell) = self.batch_tags.get(tid) {
                                     if let Some(name_bytes) = tag_pipe.bytes(cell) {
-                                        tag_sort_buf.push(name_bytes);
+                                        if n_tags < 8 {
+                                            inline_tags[n_tags] = name_bytes;
+                                            n_tags += 1;
+                                        } else {
+                                            if spill_tags.is_empty() {
+                                                spill_tags.extend_from_slice(&inline_tags);
+                                            }
+                                            spill_tags.push(name_bytes);
+                                        }
                                     }
                                 }
                             }
                         }
-                        if tag_sort_buf.len() > 1 {
-                            tag_sort_buf.sort_unstable();
-                        }
-                        for (idx, &name_bytes) in tag_sort_buf.iter().enumerate() {
-                            if idx > 0 {
-                                arena.push(b',');
+                        if spill_tags.is_empty() {
+                            for i in 1..n_tags {
+                                let cur = inline_tags[i];
+                                let mut j = i;
+                                while j > 0 && inline_tags[j - 1] > cur {
+                                    inline_tags[j] = inline_tags[j - 1];
+                                    j -= 1;
+                                }
+                                inline_tags[j] = cur;
                             }
-                            codec::write_str(arena, name_bytes);
+                            for (idx, &name_bytes) in inline_tags[..n_tags].iter().enumerate() {
+                                if idx > 0 {
+                                    arena.push(b',');
+                                }
+                                codec::write_str(arena, name_bytes);
+                            }
+                        } else {
+                            spill_tags.sort_unstable();
+                            for (idx, &name_bytes) in spill_tags.iter().enumerate() {
+                                if idx > 0 {
+                                    arena.push(b',');
+                                }
+                                codec::write_str(arena, name_bytes);
+                            }
                         }
                     }
                     arena.extend_from_slice(b"],\"createdAt\":");
@@ -1921,22 +1954,27 @@ impl ReadWorker {
                     };
                 }
             }
-            if let Some(s) = b_flags {
+            if let Some(s) = b_fav_flags {
                 for &span in pb.result_rows(s) {
                     let r = pb.row(span);
-                    let (kind, viewer_id, target_id) = (pb.i64(r[0]), pb.i64(r[1]), pb.i64(r[2]));
+                    let (viewer_id, target_id) = (pb.i64(r[0]), pb.i64(r[1]));
                     set_viewer_bit(&mut flagged_viewer_bits, viewer_id);
                     let packed = pack_pair(viewer_id, target_id);
-                    if kind == 0 {
-                        set_pair_bit(&mut fav_pair_bits, packed);
-                        self.fav_hits.push(packed);
-                    } else {
-                        set_pair_bit(&mut foll_pair_bits, packed);
-                        self.foll_hits.push(packed);
-                    }
+                    set_pair_bit(&mut fav_pair_bits, packed);
+                    self.fav_hits.push(packed);
                 }
                 if self.fav_hits.len() > 1 {
                     self.fav_hits.sort_unstable();
+                }
+            }
+            if let Some(s) = b_foll_flags {
+                for &span in pb.result_rows(s) {
+                    let r = pb.row(span);
+                    let (viewer_id, target_id) = (pb.i64(r[0]), pb.i64(r[1]));
+                    set_viewer_bit(&mut flagged_viewer_bits, viewer_id);
+                    let packed = pack_pair(viewer_id, target_id);
+                    set_pair_bit(&mut foll_pair_bits, packed);
+                    self.foll_hits.push(packed);
                 }
             }
         }
@@ -2068,7 +2106,7 @@ impl ReadWorker {
                     ) {
                         body.push(b'}');
                         let reply_body = if shareable {
-                            let rb = ReplyBody::Shared(body.into());
+                            let rb = ReplyBody::shared_200(&body);
                             rendered_slugs[k as usize] = Some(rb.clone());
                             rb
                         } else {
@@ -2132,7 +2170,7 @@ impl ReadWorker {
                     }
                     body.extend_from_slice(b"]}");
                     let reply_body = if shareable {
-                        let rb = ReplyBody::Shared(body.into());
+                        let rb = ReplyBody::shared_200(&body);
                         rendered_cmts[k as usize] = Some(rb.clone());
                         rb
                     } else {
@@ -2218,7 +2256,7 @@ impl ReadWorker {
                     codec::write_i64(&mut body, total_count);
                     body.push(b'}');
                     let reply_body = if shareable {
-                        let rb = ReplyBody::Shared(body.into());
+                        let rb = ReplyBody::shared_200(&body);
                         match slot {
                             PlanSlot::Global(p) => rendered_global[p as usize] = Some(rb.clone()),
                             PlanSlot::Filtered(kind, _, p) => rendered_filters[kind][p as usize] = Some(rb.clone()),

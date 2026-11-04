@@ -195,16 +195,30 @@ pub struct ReplyAddr {
 #[derive(Clone)]
 pub enum ReplyBody {
     Owned(Vec<u8>),
-    Shared(Arc<[u8]>),
+    Shared(Arc<[u8]>, u8),
     Empty,
 }
 
 impl ReplyBody {
+    #[inline]
+    pub fn shared_200(payload: &[u8]) -> Self {
+        const PFX_200: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ";
+        let mut num = [0u8; 20];
+        let digits = codec::format_u64_into(payload.len() as u64, &mut num);
+        let hdr_len = PFX_200.len() + digits.len() + 4;
+        let mut buf = Vec::with_capacity(hdr_len + payload.len());
+        buf.extend_from_slice(PFX_200);
+        buf.extend_from_slice(digits);
+        buf.extend_from_slice(b"\r\n\r\n");
+        buf.extend_from_slice(payload);
+        ReplyBody::Shared(buf.into(), hdr_len as u8)
+    }
+
     #[inline(always)]
     pub fn as_slice(&self) -> &[u8] {
         match self {
             ReplyBody::Owned(v) => v.as_slice(),
-            ReplyBody::Shared(a) => a.as_ref(),
+            ReplyBody::Shared(a, hdr_len) => &a[*hdr_len as usize..],
             ReplyBody::Empty => &[],
         }
     }
@@ -974,7 +988,7 @@ impl Reactor {
                 continue;
             }
             let has_buffered_rx = !c.rx.is_empty();
-            self.write_response(rep.addr.slot, rep.status, rep.body.as_slice());
+            self.write_reply(rep.addr.slot, rep.status, &rep.body);
             if has_buffered_rx {
                 check_pipelined.push(rep.addr.slot);
             }
@@ -986,6 +1000,20 @@ impl Reactor {
         }
         check_pipelined.clear();
         self.pipelined_slots = check_pipelined;
+    }
+
+    #[inline]
+    fn write_reply(&mut self, slot: u32, status: u16, body: &ReplyBody) {
+        if status == 200 && !self.slots[slot as usize].flag(FLAG_CLOSE_ON_DONE) {
+            if let ReplyBody::Shared(frame, _) = body {
+                let c = &mut self.slots[slot as usize];
+                c.set_flag(FLAG_IN_FLIGHT, false);
+                c.set_flag(FLAG_REUSED, true);
+                self.write_raw_bytes(slot, frame);
+                return;
+            }
+        }
+        self.write_response(slot, status, body.as_slice());
     }
 
     fn write_response(&mut self, slot: u32, status: u16, payload: &[u8]) {
