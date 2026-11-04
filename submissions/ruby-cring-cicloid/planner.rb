@@ -15,7 +15,11 @@ require_relative "ext/fmt/fmt"
 # request) the batches.
 class Planner
   WINDOW = Float(ENV.fetch("READ_WINDOW_MS", "40")) / 1000 # 20 ms: more Postgres CPU per request locally
-  MAX = Integer(ENV.fetch("READ_MAX", "512")) # requests per batch; a backlog runs as several batches
+  MAX = Integer(ENV.fetch("READ_MAX", "256")) # requests per batch; a backlog runs as several batches
+  # Batches in flight at once per process, each on its own planner object (a lane) sharing one intake. With
+  # one, a slow batch held up every read behind it while Postgres had connections to spare (on the full seed:
+  # p50 75 ms, max 2.6 s at 30,000 users on 4 cores with the box 40% idle).
+  LANES = Integer(ENV.fetch("READ_LANES", "2"))
 
   # One read request. `kind` and `args` say what it wants; `document` (or `missing`) is the answer.
   # Either `fiber` (a request in this process) waits for it, or `reply` (a request from another process,
@@ -26,14 +30,25 @@ class Planner
   TRUE = "true"
   NULL = "null"
 
-  attr_accessor :after_batch # called after each batch's answers were handed out (remote_planner.rb)
+  attr_reader :after_batch # called after each batch's answers were handed out (remote_planner.rb)
 
-  def initialize(db)
+  # `shared`: the intake ([pending, signal]) of the first lane, for the others.
+  def initialize(db, lanes: LANES, shared: nil)
     @db = db
-    @pending = []
-    @signal = Thread::Queue.new
+    if shared
+      @pending, @signal = shared
+    else
+      @pending = []
+      @signal = Thread::Queue.new
+      @lanes = Array.new(lanes - 1) { Planner.new(db, shared: [@pending, @signal]) }
+    end
     @array = PG::TextEncoder::Array.new
     Fiber.schedule { run }
+  end
+
+  def after_batch=(callback)
+    @after_batch = callback
+    @lanes&.each { |lane| lane.after_batch = callback }
   end
 
   # The documents. `nil` means: not found.
@@ -75,23 +90,26 @@ class Planner
     end
   end
 
+  # Each lane waits for a window to open, collects for WINDOW and takes up to MAX requests. Whatever is left
+  # goes straight to the next free lane (the signal is re-pushed with its time already past).
   def run
     loop do
       opened = @signal.pop
       wait = opened + WINDOW - Process.clock_gettime(Process::CLOCK_MONOTONIC)
       sleep(wait) if wait.positive?
-      until @pending.empty?
-        batch = @pending.shift(MAX)
-        begin
-          answer(batch)
-        rescue StandardError => error
-          batch.each do |request| # nothing was delivered: answer() delivers last
-            request.error = error
-            wake(request)
-          end
+      batch = @pending.shift(MAX)
+      @signal.push(opened) unless @pending.empty?
+      next if batch.empty?
+
+      begin
+        answer(batch)
+      rescue StandardError => error
+        batch.each do |request| # nothing was delivered: answer() delivers last
+          request.error = error
+          wake(request)
         end
-        @after_batch&.call
       end
+      @after_batch&.call
     end
   end
 

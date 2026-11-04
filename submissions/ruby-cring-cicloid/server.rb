@@ -23,7 +23,7 @@ WORKERS = Integer(ENV.fetch("WORKERS", [Etc.nprocessors * 3 / 4, 1].max.to_s))
 # Per worker. Postgres used less CPU per query the fewer connections it had (1 instead of 3: -11% at
 # 4,000 local users); pipelining keeps one busy.
 # WORKERS x PG_CONNECTIONS must stay at 95 or below.
-PG_CONNECTIONS = Integer(ENV.fetch("PG_CONNECTIONS", "1"))
+PG_CONNECTIONS = Integer(ENV.fetch("PG_CONNECTIONS", "2")) # one per read lane (planner.rb)
 # Planner processes (remote_planner.rb): batched reads for the whole server, taking turns by window. 0 (the
 # default) runs a planner inside each worker instead. Locally 2 planners cut Postgres CPU per request by a
 # third (45 to 31 us) and added about as much in the workers and planners (socket framing, copies), so the
