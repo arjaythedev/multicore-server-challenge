@@ -116,12 +116,8 @@ impl<T: Timestamped> WorkQueue<T> {
         }
         let mut g = self.inner.lock().unwrap();
         let was_empty = g.q.is_empty();
-        if let Some(first) = batch.first() {
-            let ts = first.enqueued_at();
-            g.since = Some(match g.since {
-                Some(prev) => prev.min(ts),
-                None => ts,
-            });
+        if was_empty {
+            g.since = batch.first().map(|x| x.enqueued_at());
         }
         for item in batch.drain(..).rev() {
             g.q.push_front(item);

@@ -232,7 +232,7 @@ pub fn init_outboxes(worker_count: usize, slot_cap: usize) {
             assert!(efd >= 0, "eventfd creation failed");
             let epochs: Vec<AtomicU32> = (0..cap).map(|_| AtomicU32::new(EPOCH_CLOSED)).collect();
             WorkerOutbox {
-                pending: Mutex::new(Vec::with_capacity(1024)),
+                pending: Mutex::new(Vec::with_capacity(2048)),
                 event_fd: efd,
                 epochs: epochs.into_boxed_slice(),
             }
@@ -952,7 +952,7 @@ impl Reactor {
         }
         let mut replies = std::mem::take(&mut self.outbox_buf);
         replies.clear();
-        const MAX_OUTBOX_BATCH: usize = 256;
+        const MAX_OUTBOX_BATCH: usize = 4096;
         let more_pending = {
             let mut pending = worker_outbox(self.worker_id as usize).pending.lock().unwrap();
             if pending.len() <= MAX_OUTBOX_BATCH {

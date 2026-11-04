@@ -212,6 +212,10 @@ pub fn enqueue_read_batch_fast(batch: &mut Vec<ReadTask>) {
     if batch.is_empty() {
         return;
     }
+    let now = Instant::now();
+    for t in batch.iter_mut() {
+        t.enqueued_at = now;
+    }
     READ_LANES[LANE_FAST].push_batch_front(batch);
     wake_read_dispatcher(LANE_FAST);
 }
@@ -463,6 +467,8 @@ struct ReadRenderScratch {
     global_win_buf: ArticlePage,
     filter_counts: [Vec<i64>; 3],
     filter_pages: [Vec<ArticlePage>; 3],
+    filter_win_pages: Vec<ArticlePage>,
+    filter_win_max: Vec<i64>,
     feed_counts: Vec<i64>,
     feed_pages: Vec<ArticlePage>,
     raw_pages: Vec<Vec<(i64, i64, wire::RowSpan)>>,
@@ -494,6 +500,8 @@ impl ReadRenderScratch {
             global_win_buf: Vec::with_capacity(200),
             filter_counts: [Vec::with_capacity(32), Vec::with_capacity(32), Vec::with_capacity(32)],
             filter_pages: [Vec::with_capacity(32), Vec::with_capacity(32), Vec::with_capacity(32)],
+            filter_win_pages: Vec::with_capacity(32),
+            filter_win_max: Vec::with_capacity(32),
             feed_counts: Vec::with_capacity(64),
             feed_pages: Vec::with_capacity(64),
             raw_pages: Vec::with_capacity(64),
@@ -695,7 +703,7 @@ fn pick_eligible_lane(
             (last_us + gap_us).saturating_sub(now_us)
         };
         let win_rem_us = 5_000usize.saturating_sub(age_us);
-        let max_item_rem_us = (gap_us + 5_000).saturating_sub(age_us);
+        let max_item_rem_us = (gap_us + 25_000).saturating_sub(age_us);
         let wait_us = gap_rem_us.max(win_rem_us).min(max_item_rem_us);
         (lane_want, Duration::from_micros((age_us + wait_us) as u64))
     };
@@ -1047,7 +1055,14 @@ impl ReadWorker {
                 tx.bind_and_exec("tags", &[]);
             }
             if st_uid.is_some() {
-                tx.bind_and_exec("uid", &[BindParam::I64Slice(&self.k_uid.items)]);
+                if self.k_uid.items.len() > 1 {
+                    self.sorted_arts.clear();
+                    self.sorted_arts.extend_from_slice(&self.k_uid.items);
+                    self.sorted_arts.sort_unstable();
+                    tx.bind_and_exec("uid", &[BindParam::I64Slice(&self.sorted_arts)]);
+                } else {
+                    tx.bind_and_exec("uid", &[BindParam::I64Slice(&self.k_uid.items)]);
+                }
             }
             if st_uemail.is_some() {
                 tx.bind_and_exec("uemail", &[BindParam::SmallStrSlice(&self.k_uemail.items)]);
@@ -1082,12 +1097,32 @@ impl ReadWorker {
                 global_win_max = end;
             }
         }
+        let mut use_filter_win = [false; 3];
+        for i in 0..3 {
+            let fd = &self.k_filters[i];
+            if fd.pages.len() > fd.counts.len()
+                && fd
+                    .pages
+                    .items
+                    .iter()
+                    .all(|&(_, l, o)| l >= 0 && o >= 0 && l.saturating_add(o) <= 200)
+            {
+                use_filter_win[i] = true;
+            }
+        }
         if n_phase_a2 > 0 {
             if st_slug.is_some() {
                 tx.bind_and_exec("aslug", &[BindParam::SmallStrSlice(&self.k_slug.items)]);
             }
             if st_aid.is_some() {
-                tx.bind_and_exec("aid", &[BindParam::I64Slice(&self.k_aid.items)]);
+                if self.k_aid.items.len() > 1 {
+                    self.sorted_arts.clear();
+                    self.sorted_arts.extend_from_slice(&self.k_aid.items);
+                    self.sorted_arts.sort_unstable();
+                    tx.bind_and_exec("aid", &[BindParam::I64Slice(&self.sorted_arts)]);
+                } else {
+                    tx.bind_and_exec("aid", &[BindParam::I64Slice(&self.k_aid.items)]);
+                }
             }
             if st_cmts.is_some() {
                 self.enc_a.reset(OID_INT8, self.k_cmt_viewers.items.len());
@@ -1127,13 +1162,33 @@ impl ReadWorker {
             for i in 0..3 {
                 if st_filters[i].is_some() {
                     let fd = &self.k_filters[i];
-                    self.enc_a.reset(OID_INT8, fd.pages.items.len());
-                    self.enc_b.reset(OID_INT8, fd.pages.items.len());
-                    self.enc_c.reset(OID_INT8, fd.pages.items.len());
-                    for &(c_ord, l, o) in &fd.pages.items {
-                        self.enc_a.push_i64(c_ord as i64 + 1);
-                        self.enc_b.push_i64(l);
-                        self.enc_c.push_i64(o);
+                    if use_filter_win[i] {
+                        let n_cnt = fd.counts.len();
+                        self.rr.filter_win_max.clear();
+                        self.rr.filter_win_max.resize(n_cnt, 0);
+                        for &(c_ord, l, o) in &fd.pages.items {
+                            let end = l.saturating_add(o);
+                            if end > self.rr.filter_win_max[c_ord as usize] {
+                                self.rr.filter_win_max[c_ord as usize] = end;
+                            }
+                        }
+                        self.enc_a.reset(OID_INT8, n_cnt);
+                        self.enc_b.reset(OID_INT8, n_cnt);
+                        self.enc_c.reset(OID_INT8, n_cnt);
+                        for (c_idx, &wmax) in self.rr.filter_win_max.iter().enumerate() {
+                            self.enc_a.push_i64(c_idx as i64 + 1);
+                            self.enc_b.push_i64(wmax.max(1));
+                            self.enc_c.push_i64(0);
+                        }
+                    } else {
+                        self.enc_a.reset(OID_INT8, fd.pages.items.len());
+                        self.enc_b.reset(OID_INT8, fd.pages.items.len());
+                        self.enc_c.reset(OID_INT8, fd.pages.items.len());
+                        for &(c_ord, l, o) in &fd.pages.items {
+                            self.enc_a.push_i64(c_ord as i64 + 1);
+                            self.enc_b.push_i64(l);
+                            self.enc_c.push_i64(o);
+                        }
                     }
                     tx.bind_and_exec(
                         FILTER_STMT_NAMES[i],
@@ -1591,15 +1646,44 @@ impl ReadWorker {
             );
         }
         for i in 0..3 {
-            unpack_list_into(
-                pa,
-                st_filters[i],
-                self.k_filters[i].counts.len(),
-                self.k_filters[i].pages.len(),
-                true,
-                &mut self.rr.filter_counts[i],
-                &mut self.rr.filter_pages[i],
-            );
+            if use_filter_win[i] {
+                let n_cnt = self.k_filters[i].counts.len();
+                let n_page = self.k_filters[i].pages.len();
+                unpack_list_into(
+                    pa,
+                    st_filters[i],
+                    n_cnt,
+                    n_cnt,
+                    true,
+                    &mut self.rr.filter_counts[i],
+                    &mut self.rr.filter_win_pages,
+                );
+                let dst_pages = &mut self.rr.filter_pages[i];
+                for p in dst_pages.iter_mut() {
+                    p.clear();
+                }
+                if dst_pages.len() < n_page {
+                    dst_pages.resize_with(n_page, Vec::new);
+                } else {
+                    dst_pages.truncate(n_page);
+                }
+                for (p_idx, &(c_ord, lim, off)) in self.k_filters[i].pages.items.iter().enumerate() {
+                    let win = &self.rr.filter_win_pages[c_ord as usize];
+                    let start = (off.max(0) as usize).min(win.len());
+                    let end = start.saturating_add(lim.max(0) as usize).min(win.len());
+                    dst_pages[p_idx].extend_from_slice(&win[start..end]);
+                }
+            } else {
+                unpack_list_into(
+                    pa,
+                    st_filters[i],
+                    self.k_filters[i].counts.len(),
+                    self.k_filters[i].pages.len(),
+                    true,
+                    &mut self.rr.filter_counts[i],
+                    &mut self.rr.filter_pages[i],
+                );
+            }
         }
         unpack_list_into(
             pa,
@@ -2346,6 +2430,11 @@ pub struct WriteWorker {
     expired_replies: Vec<OutgoingReply>,
     post_reads: Vec<ReadTask>,
     locs: Vec<WriteDispatchLoc>,
+    fav_on_res: Vec<Option<wire::RowSpan>>,
+    fav_off_res: Vec<Option<wire::RowSpan>>,
+    foll_on_res: Vec<Option<wire::RowSpan>>,
+    foll_off_res: Vec<Option<wire::RowSpan>>,
+    cmt_res: Vec<Option<wire::RowSpan>>,
 }
 
 fn stmt_count_for_write(_task: &WriteTask) -> usize {
@@ -2512,6 +2601,11 @@ impl WriteWorker {
             expired_replies: Vec::with_capacity(32),
             post_reads: Vec::with_capacity(64),
             locs: Vec::with_capacity(128),
+            fav_on_res: Vec::with_capacity(64),
+            fav_off_res: Vec::with_capacity(64),
+            foll_on_res: Vec::with_capacity(64),
+            foll_off_res: Vec::with_capacity(64),
+            cmt_res: Vec::with_capacity(64),
         }
     }
 
@@ -2589,10 +2683,9 @@ impl WriteWorker {
         if tasks.is_empty() {
             return Ok(());
         }
-        let all_addrs: Vec<ReplyAddr> = tasks.iter().map(|t| t.addr).collect();
         let conn = match Self::ensure_conn(&mut self.conn, self.cfg) {
             Ok(c) => c,
-            Err(e) => return Err((e, all_addrs)),
+            Err(e) => return Err((e, tasks.iter().map(|t| t.addr).collect())),
         };
 
         let is_single_task = tasks.len() == 1;
@@ -2799,7 +2892,7 @@ impl WriteWorker {
         conn.tx.write_sync();
 
         if let Err(e) = conn.flush().and_then(|_| conn.read_pipeline_into(n_exec, &mut self.pipe)) {
-            return Err((e, all_addrs));
+            return Err((e, tasks.iter().map(|t| t.addr).collect()));
         }
 
         let any_failed = self.pipe.results.iter().any(|r| r.error.is_some());
@@ -2814,24 +2907,24 @@ impl WriteWorker {
         }
 
         let pipe = &self.pipe;
-        let decode_ord_rows = |slot: Option<usize>, len: usize| -> Vec<Option<&[Cell]>> {
-            let mut out = vec![None; len];
+        let decode_ord_spans = |slot: Option<usize>, len: usize, out: &mut Vec<Option<wire::RowSpan>>| {
+            out.clear();
+            out.resize(len, None);
             if let Some(s) = slot {
                 for &span in pipe.result_rows(s) {
                     let r = pipe.row(span);
                     let k = pipe.i64(r[0]);
                     if k >= 1 && (k as usize) <= len {
-                        out[k as usize - 1] = Some(r);
+                        out[k as usize - 1] = Some(span);
                     }
                 }
             }
-            out
         };
-        let fav_on_res = decode_ord_rows(slot_fav_on, c_fav_on);
-        let fav_off_res = decode_ord_rows(slot_fav_off, c_fav_off);
-        let foll_on_res = decode_ord_rows(slot_foll_on, c_foll_on);
-        let foll_off_res = decode_ord_rows(slot_foll_off, c_foll_off);
-        let cmt_res = decode_ord_rows(slot_cmt, c_cmt);
+        decode_ord_spans(slot_fav_on, c_fav_on, &mut self.fav_on_res);
+        decode_ord_spans(slot_fav_off, c_fav_off, &mut self.fav_off_res);
+        decode_ord_spans(slot_foll_on, c_foll_on, &mut self.foll_on_res);
+        decode_ord_spans(slot_foll_off, c_foll_off, &mut self.foll_off_res);
+        decode_ord_spans(slot_cmt, c_cmt, &mut self.cmt_res);
 
         self.replies.clear();
         self.post_reads.clear();
@@ -2849,13 +2942,14 @@ impl WriteWorker {
                     );
                 }
                 WriteDispatchLoc::BatchedFav { on, ord } => {
-                    let row = if on {
-                        fav_on_res[ord - 1]
+                    let span_opt = if on {
+                        self.fav_on_res[ord - 1]
                     } else {
-                        fav_off_res[ord - 1]
+                        self.fav_off_res[ord - 1]
                     };
-                    match row {
-                        Some(r) => {
+                    match span_opt {
+                        Some(span) => {
+                            let r = pipe.row(span);
                             self.post_reads.push(ReadTask {
                                 op: ReadOp::ArticleById {
                                     id: pipe.i64(r[1]),
@@ -2869,13 +2963,14 @@ impl WriteWorker {
                     }
                 }
                 WriteDispatchLoc::BatchedFollow { on, ord } => {
-                    let row = if on {
-                        foll_on_res[ord - 1]
+                    let span_opt = if on {
+                        self.foll_on_res[ord - 1]
                     } else {
-                        foll_off_res[ord - 1]
+                        self.foll_off_res[ord - 1]
                     };
-                    match row {
-                        Some(r) => {
+                    match span_opt {
+                        Some(span) => {
+                            let r = pipe.row(span);
                             let mut body = Vec::with_capacity(256);
                             body.extend_from_slice(b"{\"profile\":");
                             write_profile_json(
@@ -2895,8 +2990,9 @@ impl WriteWorker {
                         None => self.replies.push(reactor::error_reply(task.addr, 404, "profile not found")),
                     }
                 }
-                WriteDispatchLoc::BatchedComment { ord } => match cmt_res[ord - 1] {
-                    Some(r) => {
+                WriteDispatchLoc::BatchedComment { ord } => match self.cmt_res[ord - 1] {
+                    Some(span) => {
+                        let r = pipe.row(span);
                         let mut body = Vec::with_capacity(512);
                         body.extend_from_slice(b"{\"comment\":{\"id\":");
                         codec::write_i64(&mut body, pipe.i64(r[1]));
@@ -3347,6 +3443,10 @@ fn execute_bcrypt_batch(tasks: &mut Vec<CryptoTask>, cfg: &RuntimeConfig, cost: 
         reactor::complete_batch(&mut replies);
     }
     if !writes.is_empty() {
+        let now = Instant::now();
+        for w in writes.iter_mut() {
+            w.enqueued_at = now;
+        }
         WRITE_QUEUE.push_batch_front(&mut writes);
     }
 }
