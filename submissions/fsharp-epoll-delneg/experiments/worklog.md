@@ -172,3 +172,27 @@ Script: `experiments/h.sh`.
   PG 51.4), against 104-115 with both lanes busy (those are e19/e20, so not a clean comparison, but the jump is too big
   to be the code). Lane results compare only with runs made under the same conditions. First RD_DUMP with comments
   came out of the 500-user warm-up (tiny batches), discarded; redone at 150k without a warm-up.
+- **e21 hold at 220k crashed the process 150 s in** (solo, epoll): until then p95 100-130 ms, p99 ~140 ms at 57,500 req/s, then
+  6 s of ~650 errors/s (`conn_closed`/`conn_reset` with `dropped (client gone)` on our side), and `OutOfMemoryException` on thread
+  `io-1` with a 100 MB heap, stack only in the runtime's exception code. Same family as the e10 "Out of memory." at 300k: both only
+  above 200,000 users, where the fd budget forces evictions. Replay (`experiments/evict.py`, 800 clients, fd limit 420) crashes the
+  old build in under 40 s, with a stack overflow in the exception path.
+- **e23: the cause was stale epoll events.** The connection table was global and the epoll tag was the fd alone. Loop A evicts fd X;
+  loop B accepts a new connection, gets number X; A's batch still holds an event for X, and A runs B's connection. Two threads on one
+  `Conn` corrupt each other's LRU lists and buffers. The tag now carries the generation, and an event for an older one is ignored.
+  Same replay: no crash. io_uring never had the bug (its completions always carried the generation): e21 with `IO_MODE=uring` passed
+  its 220k hold, p95 140, p99 193, 0.10% errors, 116.9 µs/req (app 51.0, PG 65.9), against #87's 124.9 at 230k.
+- **Harness: conntrack.** That hold's errors were all timeouts, starting ~180 s in, with `nf_conntrack: table full` in dmesg:
+  `box/setup-box.sh` sets `nf_conntrack_max=1048576`, wsl26 had 262144, and 3,000 re-dials/s leave 120 s TIME_WAIT entries. `h.sh` sets
+  it now, so holds before this point above ~200k carry that artifact (#87's 230,000 too: it may do a bit better on the fixed harness,
+  to be re-run before the PR).
+- **e24: each I/O thread owns its fd table.** `RLIMIT_NOFILE` is counted per fd table, and `unshare(CLONE_FILES)` gives a thread its
+  own, as a worker of a multi-process server has. Above 200,000 users every shared-table server pays: evicted idle connections re-dial
+  on their next request (~3,000 connects/s at 220k here, 1.07M in the hold), with accept, close and TIME_WAIT on top. Four tables hold
+  ~800,000. The connection table moves into the loop, since one number is a different socket per loop. Two things need care: a file
+  first opened on a loop thread and kept open would be invisible to the other threads, so stderr's stream and all assemblies are opened
+  before the threads start; and a loop's copy of the table keeps Postgres sockets open, so closing one now does `shutdown` first.
+  Replay with `FD_TABLES=shared` also shows what EMFILE does to a .NET process: `Failed to initialize assembly ... System.Diagnostics.
+  StackTrace.dll`, a lazy load failing for want of an fd; connection fds now can't starve the runtime's table. Replay: ~19k req/s vs ~9k.
+  Considered and not taken: io_uring direct descriptors (fixed files) also escape the fd limit, but on 6.8 file releases are FIFO behind
+  the oldest pending request's resource node, so an idle connection's pending recv holds back the release of every socket closed after it.

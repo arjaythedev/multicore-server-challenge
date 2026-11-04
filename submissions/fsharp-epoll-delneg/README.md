@@ -34,8 +34,14 @@ No caches across requests, no schema or Postgres configuration changes, nothing 
 
 - **I/O.** Each I/O thread has its own epoll set and listener, and uses `recv`/`send`, which skip the VFS layer that
   `read`/`write` go through. A request that arrives in one read is parsed straight from the read buffer. The handler either answers at once (validation, auth errors) or queues a job. Replies come
-  back through the thread's inbox, and the thread is woken once per batch of replies, not once per reply. Near the
-  fd limit, the connection that has been idle longest is closed.
+  back through the thread's inbox, and the thread is woken once per batch of replies, not once per reply.
+- **One fd table per I/O thread.** `RLIMIT_NOFILE` is counted per fd table, and each I/O thread calls
+  `unshare(CLONE_FILES)` at startup to get its own, as each worker of a multi-process server has. With the box's limit
+  of 200,000 the four threads hold ~800,000 connections. A server with one table has to close idle connections above
+  200,000 users, and those users dial again on their next request. The kernel also skips the table's shared-state work
+  for a table with one user, and connection fds can't starve the runtime of the fds it needs, for example to load an
+  assembly. Near a thread's own limit, its connection that has been idle longest is closed (`FD_TABLES=shared` turns
+  all of this off).
 - **Lanes.** All I/O threads feed the same three queues. One idle connection thread per lane at a time sleeps out
   the clock (`usleep`) and then takes everything queued; the others block. We started with a timed `Monitor.Wait`,
   which spins before it blocks: on the write threads that spinning took more CPU than the writes. Reads are split in
