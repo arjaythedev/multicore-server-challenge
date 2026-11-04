@@ -22,3 +22,4 @@
 {"id": "e22", "label": "e22-slugscan", "what": "one scan for all direct-read slugs", "kind": "structural", "score": null, "note": "dropped: same rows, no gain (19.7 vs ~20.1 ms/batch)"}
 {"id": "e23", "label": "e23-eptag", "what": "epoll tag carries the connection generation; stale events ignored", "kind": "fix", "score": null, "note": "fixes crash above the fd budget; replay at fd limit 420 no longer crashes"}
 {"id": "e24", "label": "e24-fdtables", "what": "unshare(CLONE_FILES) per I/O thread; connection table per loop", "kind": "structural", "score": null, "note": "no eviction above 200k connections; holds queued"}
+{"id":"e26","label":"e26-flagscan","what":"favorite flags in one scan over viewers x articles","kind":"structural","score":null,"note":"dropped: 10.1 -> 24.4 ms per batch on replay"}

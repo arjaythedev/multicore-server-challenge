@@ -206,3 +206,6 @@ Script: `experiments/h.sh`.
   CPU 23, best of 6: `-O3 -funroll-loops` 10.5 ms per hash, `-O3` 10.7, `-march=x86-64-v3` 10.8, `-mtune=znver3` 11.3, `-O2` 16.8. Ubuntu 24.04's gcc 13.3,
   which the scorer's build uses, 10.7. That's ~2.9 cycles per lane per round; a hand-allocated assembly loop would have 14 instructions per lane-round, ~2.3
   cycles at best on a 6-wide core, so ~1% of total CPU for x86-only assembly. Not worth it.
+- **Dropped: favorite flags in one scan** (all viewers x all the batch's articles on `favorites_pkey`, instead of one probe per viewer). Same buffers, but 10.1 ->
+  24.4 ms per batch on real batches: 836 ids in a second `ANY` make it much slower per tuple. Groups in a batch were already distinct per key (9.6 tag, 14.2 author, 32
+  feed groups per batch), so there's no count to share there either; a capped tag count costs its 1,000 index tuples per tag.
