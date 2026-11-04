@@ -27,8 +27,7 @@ PG_CONNECTIONS = Integer(ENV.fetch("PG_CONNECTIONS", "1"))
 # Planner processes (remote_planner.rb): batched reads for the whole server, taking turns by window. 0 (the
 # default) runs a planner inside each worker instead. Locally 2 planners cut Postgres CPU per request by a
 # third (45 to 31 us) and added about as much in the workers and planners (socket framing, copies), so the
-# simpler layout stays the default until a run on the 8-core box says otherwise. With 0, a
-# planner inside each worker instead.
+# simpler layout stays the default until a run on the 8-core box says otherwise.
 PLANNERS = Integer(ENV.fetch("PLANNERS", "0"))
 PLANNER_CONNECTIONS = Integer(ENV.fetch("PLANNER_CONNECTIONS", "2")) # per planner
 total = (WORKERS * PG_CONNECTIONS) + (PLANNERS * PLANNER_CONNECTIONS)
