@@ -46,18 +46,28 @@ two viewer-dependent booleans left open, and spliced per response.
 **Feeds** share work between the viewers of a batch. A followee followed by several of them (popular authors are
 followed by many) is looked at once: whether it has 1,000 or more articles (then every viewer following it counts
 1,000 without a scan), and the id of its `limit + offset`-th newest article. That id is a floor for those viewers'
-pages, which can only hold articles at least that new, so every other followee's index scan stops there. Feed pages
-come back as article ids and authors only, straight from `articles_author_idx`; the columns of articles no other
-statement in the batch returned are read once per distinct article in phase B, since popular followees' newest
-articles are on many viewers' pages at once. A feed's articles are by followed authors, so they need no follow probe.
+pages, which can only hold articles at least that new. Then each distinct followee of the batch's viewers is read
+once, its newest ids down to the lowest floor and the deepest page among its followers, straight from
+`articles_author_idx`, and each viewer's page is merged here from its followees' arrays. Two viewers sharing a
+followee share its scan. The columns of articles no other statement in the batch returned are read once per
+distinct article in phase B. A feed's articles are by followed authors, so they need no follow probe.
+`FEED_MERGE=0` merges per viewer in SQL instead.
 
-**Forming batches.** Lanes take turns forming batches: one lane collects while the others execute theirs. It takes
-what is waiting once the oldest waiting request has waited 40 ms (or 4,096 are queued). Under a backlog the oldest
-has already waited that long, so nothing waits on a timer; at lower load batches fill for the window instead of
-being whatever trickled in since the last lane freed up. Postgres pays a fixed cost per statement execution, and a
-batch of a few hundred requests splits it a few hundred ways; everything requests have in common (the newest page,
-the tag list, a viral article's favorite count and comment thread) is read once per batch instead of once per
-request. Pushing a request only wakes the collecting lane when its batch is ready, not on every request.
+**Comment threads** come back in one statement: the comments, their distinct authors' profiles, and which of
+those authors each signed-in viewer of the thread follows. A comments batch has no phase B.
+
+**Forming batches.** Reads queue by class: feeds, comment threads, and the rest. Each class starts a batch at most
+every gap (75 ms, 120 ms for feeds), and a read is due at most gap + 5 ms after it arrives. At most `READ_ACTIVE` batches run at once,
+each class at most its share of the lanes plus one for the class whose oldest read has waited longest. A fast
+batch never waits on a feed statement, and each class's batch shares its lookups across everything that waited the
+gap. Postgres pays a fixed cost per statement execution, and a batch of a few hundred requests splits it a few
+hundred ways; everything requests have in common (the newest page, the tag list, a viral article's favorite count
+and comment thread) is read once per batch instead of once per request. List pages of one key in a batch are read
+as one window and sliced here, and phase B binds its keys sorted so index walks are monotone.
+
+**Identical responses in a batch share one body** when no viewer flag is set in it (article pages, comment threads,
+global and filtered lists; never feeds or write read-backs). The body is built once from that batch's rows and
+freed when its last send completes; the next batch starts with nothing shared.
 
 Nothing outlives its batch: every value in a response was read from Postgres while that request was waiting, and
 only requests already queued when the batch started share it.
@@ -121,6 +131,13 @@ Defaults suit the 8-vCPU box; all are optional environment variables.
 | `IO_THREADS` | cores / 2 | epoll threads |
 | `READ_LANES` | cores | read connections |
 | `FEED_CONN` | 1 | 1: each read lane runs its batch's feed statement on a second connection, alongside the rest of phase A |
+| `CLASS_LANES` | 1 | 1: reads queue by class (feeds, comment threads, the rest), each class a batch at most every gap; 0: one pool |
+| `GAP_FAST_US` / `GAP_CMTS_US` / `GAP_FEED_US` | 75000 / 75000 / 120000 | least time between two batches of a class |
+| `FEED_MERGE` | 1 | 1: each distinct followee read once per batch, feeds merged here; 0: per viewer in SQL |
+| `GAP_MIN_US` | 5000 | least time a read waits before its batch starts |
+| `READ_ACTIVE` | read lanes - 1 | most read batches running at once (per class 3/8, 1/4, 1/4 of the lanes, plus one for the class waiting longest) |
+| `LOOP_NICE` | 5 | nice value of the event loop threads |
+| `BCRYPT_NICE` | 10 | nice value of the hashing threads after the first |
 | `WRITE_LANES` | 1 | group-commit connections |
 | `BCRYPT_THREADS` | 2 | bcrypt threads (the first gathers, the rest take full sets) |
 | `BCRYPT_LANES` | measured | hashes run in lockstep (1 to 6; by default timed at startup) |
@@ -155,6 +172,9 @@ from `zig-fourneau-y2kbugger`; `max_parallel_workers_per_gather = 0` from severa
 `accept` on `EMFILE`, `SCHED_BATCH` and merging runs of writes from `asm-epoll-nickita-khylkouski` (#82, #130);
 merged favorite/follow statements also in #105; skipping queued work for clients that hung up and a descriptor table per IO thread from #132. Leaving quick-ack mode after each response and
 group commit without `BEGIN`/`COMMIT` from `zig-iouring-nick-potts` (#117), whose `asm_gen.zig` the generated bcrypt
-kernel is a port of.
+kernel is a port of. Read classes with per-class gaps and caps, event loops at nice 5, tiered hasher priority and sorted
+phase B keys from `rust-epoll-theCatWisel` (#154, #201) and `zig-iouring-nick-potts` (#168); comment threads in one
+statement, list windows per key and shared unflagged bodies from `rust-epoll-theCatWisel` (#201, #205); feeds
+merged from one scan per followee from `c-epoll-unorig-username` (#203).
 
 Built with Claude (Anthropic).

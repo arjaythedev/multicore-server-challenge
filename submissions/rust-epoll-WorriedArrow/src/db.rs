@@ -20,7 +20,7 @@ use std::time::Duration;
 use crate::json;
 use crate::pg::{self, ArrayBuf, Col, Conn, Param, Pipeline, INT8, TEXT};
 use crate::queue::Queue;
-use crate::reply::{self, ReplyTo, Response};
+use crate::reply::{self, Body, ReplyTo, Response};
 
 // ------------------------------------------------------------------------------------------------------------------
 // jobs
@@ -98,9 +98,13 @@ impl Pool {
 pub static READS: Pool = Pool::new();
 pub static FEEDS: Pool = Pool::new();
 pub static FEED_SPLIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Reads queue by class (crate::sched) instead of in one pool.
+pub static CLASS_LANES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn push_read(job: ReadJob) {
-    if matches!(job.kind, Read::Feed { .. }) && FEED_SPLIT.load(Relaxed) {
+    if CLASS_LANES.load(Relaxed) {
+        crate::sched::READS.push(job);
+    } else if matches!(job.kind, Read::Feed { .. }) && FEED_SPLIT.load(Relaxed) {
         FEEDS.q.push(job);
     } else {
         READS.q.push(job);
@@ -121,6 +125,11 @@ pub struct Settings {
     pub bcrypt_window: Duration,
     pub bcrypt_idle: bool,
     pub feed_conn: bool,
+    /// Feeds read each distinct followee's newest ids once and merge per viewer here ("feedm"), not per viewer in SQL.
+    pub feed_merge: bool,
+    pub bcrypt_nice: i32,
+    /// Read scheduling by class (None: one pool, lanes taking turns).
+    pub sched: Option<crate::sched::Config>,
     pub bcrypt_rescue: Duration,
 }
 
@@ -154,6 +163,7 @@ impl Hasher for Fx {
     }
 }
 type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
+type FxSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<Fx>>;
 
 /// Distinct keys of one statement in one batch; a key's position + 1 is its `k` in SQL.
 struct Keys<K: Hash + Eq + Clone> {
@@ -193,6 +203,18 @@ impl Keys<String> {
     }
 }
 
+/// A response body, kept for the rest of the batch under `key` if it has one (see `shared` in ReadLane::batch).
+fn keep(shared: &mut FxMap<(u8, u64, u16), std::sync::Arc<Vec<u8>>>, key: Option<(u8, u64, u16)>, b: Vec<u8>) -> Body {
+    match key {
+        Some(k) => {
+            let a = std::sync::Arc::new(b);
+            shared.insert(k, a.clone());
+            Body::Shared(a)
+        }
+        None => Body::Own(b),
+    }
+}
+
 /// A list statement's rows: k < 0 is the count of count key -k (k = 0: the single global count), k > 0 a page row.
 fn decode_list<'p>(pa: &'p Pipeline, slot: Option<usize>, ncount: usize, npage: usize) -> (Vec<i64>, Vec<PageRows<'p>>) {
     let mut counts = vec![0i64; ncount.max(1)];
@@ -213,6 +235,54 @@ fn decode_list<'p>(pa: &'p Pipeline, slot: Option<usize>, ncount: usize, npage: 
         for p in &mut pages {
             p.sort_unstable_by(|a, b| b.0.cmp(&a.0));
         }
+    }
+    (counts, pages)
+}
+
+/// Feed pages from "feedm" rows: [0, viewer k, capped count], [1, viewer k, floor id, -, followee ids],
+/// [2, followee, -, -, its newest ids (descending, at least the floor id, at most the deepest page of its followers)].
+/// A viewer's page is the newest limit + offset ids across its followees' arrays, then the offset skipped. Each
+/// array holds every article of that followee a follower's page can show (the floor is no higher than any
+/// follower's, the depth no lower), so the merge equals the reference ordering by id across all followed authors.
+fn merge_feeds<'p>(pa: &'p Pipeline, slot: Option<usize>, feed: &Keys<i64>, pages_k: &Keys<(i64, i64, i64)>) -> (Vec<i64>, Vec<PageRows<'p>>) {
+    let mut counts = vec![0i64; feed.len().max(1)];
+    let mut pages: Vec<PageRows> = vec![Vec::new(); pages_k.len()];
+    let Some(s) = slot else { return (counts, pages) };
+    let rows = &pa.results[s].rows;
+    let mut viewer: Vec<(i64, Option<&[u8]>)> = vec![(0, None); feed.len()];
+    let mut ids: FxMap<i64, (Vec<i64>, &[Col])> = FxMap::default();
+    for r in rows {
+        let a = pa.i64(r[1]);
+        match pa.i64(r[0]) {
+            0 if a >= 1 && a as usize <= counts.len() => counts[a as usize - 1] = pa.i64(r[2]),
+            1 if a >= 1 && a as usize <= viewer.len() => viewer[a as usize - 1] = (pa.i64(r[2]), pa.bytes(r[4])),
+            2 => {
+                let v: Vec<i64> = pa.bytes(r[4]).map_or(Vec::new(), |b| {
+                    pg::array_elems(b).filter_map(|e| e.try_into().ok().map(i64::from_be_bytes)).collect()
+                });
+                ids.insert(a, (v, &r[..]));
+            }
+            _ => {}
+        }
+    }
+    let mut cand: Vec<ArtRef> = Vec::new();
+    for (i, &(v, lim, off)) in pages_k.list.iter().enumerate() {
+        let Some(&vk) = feed.map.get(&v) else { continue };
+        let (floor, fids) = viewer[vk as usize];
+        let depth = (lim + off).max(0) as usize;
+        cand.clear();
+        for f in fids.into_iter().flat_map(pg::array_elems) {
+            let Ok(f) = f.try_into().map(i64::from_be_bytes) else { continue };
+            if let Some((list, row)) = ids.get(&f) {
+                cand.extend(list.iter().take(depth).take_while(|&&id| id >= floor).map(|&id| (id, f, *row)));
+            }
+        }
+        if cand.len() > depth {
+            cand.select_nth_unstable_by(depth, |a, b| b.0.cmp(&a.0));
+            cand.truncate(depth);
+        }
+        cand.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        pages[i] = cand.iter().skip(off.max(0) as usize).copied().collect();
     }
     (counts, pages)
 }
@@ -349,6 +419,15 @@ impl ReadLane {
 
     pub fn run(mut self) {
         let mut jobs = Vec::with_capacity(self.s.read_batch);
+        if let Some(cfg) = &self.s.sched {
+            loop {
+                jobs.clear();
+                let c = crate::sched::READS.take(cfg, &mut jobs);
+                let batch = std::mem::take(&mut jobs);
+                self.execute(batch);
+                crate::sched::READS.done(c);
+            }
+        }
         loop {
             jobs.clear();
             {
@@ -435,14 +514,25 @@ impl ReadLane {
             })
             .collect();
 
+        // (viewer, comment thread k) for every signed-in comments request: the statement returns which of each
+        // thread's authors the viewer follows.
+        let mut cview: Keys<(i64, i64)> = Keys::new();
+        for (j, a) in jobs.iter().zip(asks.iter()) {
+            if let (Ask::Comments(k), true) = (a, j.viewer != 0) {
+                cview.idx((j.viewer, *k as i64 + 1));
+            }
+        }
+
         // ---- phase A ----
         // The feed statement (the costliest one) goes out first on the lane's second connection, so a second backend
         // runs it while the first runs the rest of phase A; phase B, after both, still covers every article once.
-        let split = self.s.feed_conn && feed.len() > 0;
+        // Only worth it when the batch has other phase-A work to overlap with.
+        let others = aslug.len() + aid.len() + cmts.len() + global.len() + lists.iter().map(|l| l.page.len()).sum::<usize>();
+        let split = self.s.feed_conn && feed.len() > 0 && others > 0;
         if split {
             let fc = Self::conn_of(&mut self.fconn, self.s)?;
             fc.out.bind_exec(
-                "feed",
+                if self.s.feed_merge { "feedm" } else { "feed" },
                 &[
                     Param::Raw(&int_array(feed.list.iter().copied())),
                     Param::Raw(&int_array(feedpage.list.iter().map(|k| k.0))),
@@ -475,6 +565,19 @@ impl ReadLane {
         let s_cmts = slot(cmts.len() > 0);
         let s_global = slot(global.len() > 0);
         let s_lists: [Option<usize>; 3] = std::array::from_fn(|f| slot(lists[f].page.len() > 0));
+        // Several pages of the same tag, author or favorites list in one batch read one window per key (as deep as the
+        // deepest page asked for, up to 200 rows), sliced into pages here, instead of one scan per page.
+        let wins: [Option<Vec<i64>>; 3] = std::array::from_fn(|f| {
+            let l = &lists[f];
+            if l.page.len() <= l.count.len() || !l.page.list.iter().all(|k| k.1 >= 0 && k.2 >= 0 && k.1 + k.2 <= 200) {
+                return None;
+            }
+            let mut depth = vec![0i64; l.count.len()];
+            for k in &l.page.list {
+                depth[k.0 as usize] = depth[k.0 as usize].max(k.1 + k.2);
+            }
+            Some(depth)
+        });
         let s_feed = slot(feed.len() > 0 && !split);
 
         let o = &mut conn.out;
@@ -502,7 +605,14 @@ impl ReadLane {
             o.bind_exec("aid", &[Param::Raw(&int_array(aid.list.iter().copied()))]);
         }
         if s_cmts.is_some() {
-            o.bind_exec("cmts", &[Param::Raw(&texts(&cmts))]);
+            o.bind_exec(
+                "cmts",
+                &[
+                    Param::Raw(&texts(&cmts)),
+                    Param::Raw(&int_array(cview.list.iter().map(|p| p.0))),
+                    Param::Raw(&int_array(cview.list.iter().map(|p| p.1))),
+                ],
+            );
         }
         if s_global.is_some() {
             o.bind_exec(
@@ -513,20 +623,33 @@ impl ReadLane {
         for f in 0..3 {
             if s_lists[f].is_some() {
                 let l = &lists[f];
-                o.bind_exec(
-                    LIST_STMTS[f],
-                    &[
-                        Param::Raw(&texts(&l.count)),
-                        Param::Raw(&text_array(l.page.list.iter().map(|k| l.count.list[k.0 as usize].as_bytes()))),
-                        Param::Raw(&int_array(l.page.list.iter().map(|k| k.1))),
-                        Param::Raw(&int_array(l.page.list.iter().map(|k| k.2))),
-                    ],
-                );
+                if let Some(w) = &wins[f] {
+                    // One window per key, from the newest row to the deepest page any request of the batch asks for.
+                    o.bind_exec(
+                        LIST_STMTS[f],
+                        &[
+                            Param::Raw(&texts(&l.count)),
+                            Param::Raw(&texts(&l.count)),
+                            Param::Raw(&int_array(w.iter().copied())),
+                            Param::Raw(&int_array(w.iter().map(|_| 0))),
+                        ],
+                    );
+                } else {
+                    o.bind_exec(
+                        LIST_STMTS[f],
+                        &[
+                            Param::Raw(&texts(&l.count)),
+                            Param::Raw(&text_array(l.page.list.iter().map(|k| l.count.list[k.0 as usize].as_bytes()))),
+                            Param::Raw(&int_array(l.page.list.iter().map(|k| k.1))),
+                            Param::Raw(&int_array(l.page.list.iter().map(|k| k.2))),
+                        ],
+                    );
+                }
             }
         }
         if s_feed.is_some() {
             o.bind_exec(
-                "feed",
+                if self.s.feed_merge { "feedm" } else { "feed" },
                 &[
                     Param::Raw(&int_array(feed.list.iter().copied())),
                     Param::Raw(&int_array(feedpage.list.iter().map(|k| k.0))),
@@ -547,11 +670,12 @@ impl ReadLane {
             let g_uemail = s_uemail.map(|s| group(&pa, s, uemail.len())).unwrap_or_default();
             let mut early: Vec<Response> = Vec::new();
             let mut tags_body: Option<Vec<u8>> = None;
+            let mut tags_shared: FxMap<u16, std::sync::Arc<Vec<u8>>> = FxMap::default();
             for (i, (j, a)) in jobs.iter_mut().zip(asks.iter()).enumerate() {
                 let to = j.to;
                 match *a {
                     Ask::Tags => {
-                        // One body for every tag-list request of the batch.
+                        // One body for every tag-list request of the batch, shared per IO thread.
                         let b = tags_body.get_or_insert_with(|| {
                             let s = s_tags.unwrap();
                             let mut b = Vec::with_capacity(4096);
@@ -565,7 +689,11 @@ impl ReadLane {
                             b.extend_from_slice(b"]}");
                             b
                         });
-                        early.push(Response { to, status: 200, body: b.clone() });
+                        let a = tags_shared
+                            .entry(to.thread)
+                            .or_insert_with(|| std::sync::Arc::new(b.clone()))
+                            .clone();
+                        early.push(Response { to, status: 200, body: Body::Shared(a) });
                     }
                     Ask::User(k) => {
                         let Read::CurrentUser { token, .. } = &j.kind else { unreachable!() };
@@ -574,7 +702,7 @@ impl ReadLane {
                                 let r = &pa.results[s_uid.unwrap()].rows[i];
                                 let mut b = Vec::with_capacity(512);
                                 user_json(&mut b, pa.bytes(r[3]).unwrap_or(b""), token.as_bytes(), pa.bytes(r[2]).unwrap_or(b""), pa.bytes(r[4]), pa.bytes(r[5]));
-                                early.push(Response { to, status: 200, body: b });
+                                early.push(Response { to, status: 200, body: b.into() });
                             }
                             None => early.push(reply::error(to, 401, "unauthorized")),
                         }
@@ -623,7 +751,29 @@ impl ReadLane {
         // ---- decode phase A ----
         let g = |slot: Option<usize>, n: usize| slot.map(|s| group(&pa, s, n)).unwrap_or_default();
         let g_prof = g(s_prof, prof.len());
-        let g_cmts = g(s_cmts, cmts.len());
+        // The comments statement's rows: kind 0 a comment of thread k (column 1), kind 1 an author's profile, kind 2 a
+        // (viewer, author) pair the viewer follows.
+        let mut g_cmts: Vec<Vec<usize>> = vec![Vec::new(); cmts.len()];
+        let mut auser: FxMap<i64, &[Col]> = FxMap::default();
+        let mut cfoll: FxSet<(i64, i64)> = FxSet::default();
+        if let Some(s) = s_cmts {
+            for (i, r) in pa.results[s].rows.iter().enumerate() {
+                match pa.i64(r[0]) {
+                    0 => {
+                        let k = pa.i64(r[1]);
+                        if k >= 1 && (k as usize) <= cmts.len() {
+                            g_cmts[k as usize - 1].push(i);
+                        }
+                    }
+                    1 => {
+                        auser.insert(pa.i64(r[1]), &r[..]);
+                    }
+                    _ => {
+                        cfoll.insert((pa.i64(r[1]), pa.i64(r[2])));
+                    }
+                }
+            }
+        }
         let first_row = |slot: Option<usize>, n: usize| -> Vec<Option<ArtRef>> {
             let mut v = vec![None; n];
             if let Some(s) = slot {
@@ -640,12 +790,32 @@ impl ReadLane {
         let by_id = first_row(s_aid, aid.len());
 
         let (gcount, gpages) = decode_list(&pa, s_global, 1, global.len());
-        let decoded: Vec<(Vec<i64>, Vec<PageRows>)> =
-            (0..3).map(|f| decode_list(&pa, s_lists[f], lists[f].count.len(), lists[f].page.len())).collect();
+        let decoded: Vec<(Vec<i64>, Vec<PageRows>)> = (0..3)
+            .map(|f| {
+                let l = &lists[f];
+                if wins[f].is_none() {
+                    return decode_list(&pa, s_lists[f], l.count.len(), l.page.len());
+                }
+                let (counts, win) = decode_list(&pa, s_lists[f], l.count.len(), l.count.len());
+                let pages = l
+                    .page
+                    .list
+                    .iter()
+                    .map(|&(c, lim, off)| {
+                        let w = &win[c as usize];
+                        let start = (off as usize).min(w.len());
+                        w[start..(start + lim as usize).min(w.len())].to_vec()
+                    })
+                    .collect();
+                (counts, pages)
+            })
+            .collect();
 
-        let (fcount, fpages) = match &pf {
-            Some(p) => decode_list(p, Some(0), feed.len(), feedpage.len()),
-            None => decode_list(&pa, s_feed, feed.len(), feedpage.len()),
+        let (fcount, fpages) = match (&pf, self.s.feed_merge) {
+            (Some(p), false) => decode_list(p, Some(0), feed.len(), feedpage.len()),
+            (None, false) => decode_list(&pa, s_feed, feed.len(), feedpage.len()),
+            (Some(p), true) => merge_feeds(p, Some(0), &feed, &feedpage),
+            (None, true) => merge_feeds(&pa, s_feed, &feed, &feedpage),
         };
 
         // ---- phase B keys ----
@@ -695,18 +865,8 @@ impl ReadLane {
                         add_art(id, author, v, &mut arts, &mut favd, None);
                     }
                 }
-                Ask::Comments(k) => {
-                    if v != 0 {
-                        if let Some(s) = s_cmts {
-                            for &i in &g_cmts[k as usize] {
-                                let r = &pa.results[s].rows[i];
-                                if r[2].len >= 0 {
-                                    foll.idx((v, pa.i64(r[6])));
-                                }
-                            }
-                        }
-                    }
-                }
+                // Comment threads come with their authors and the viewer's follows: no phase B.
+                Ask::Comments(_) => {}
                 Ask::Profile(k) => {
                     if v != 0 {
                         if let (Some(s), Some(&i)) = (s_prof, g_prof[k as usize].first()) {
@@ -730,18 +890,6 @@ impl ReadLane {
             }
         }
 
-        // Every comment's author, sorted and distinct.
-        let mut cauth: Vec<i64> = Vec::new();
-        if let Some(s) = s_cmts {
-            for r in &pa.results[s].rows {
-                if r[2].len >= 0 {
-                    cauth.push(pa.i64(r[6]));
-                }
-            }
-        }
-        cauth.sort_unstable();
-        cauth.dedup();
-
         // ---- phase B ----
         let mut nb = 0usize;
         let mut slotb = |cond: bool| -> Option<usize> {
@@ -755,29 +903,37 @@ impl ReadLane {
         let b_artx = slotb(arts.len() > 0);
         let b_flags = slotb(favd.len() + foll.len() > 0);
         let b_rows = slotb(need_rows.len() > 0);
-        let b_auser = slotb(!cauth.is_empty());
         let pb = if nb > 0 {
-            let ids = int_array(arts.list.iter().copied());
+            // Keys in ascending order (results are matched back by key): each statement's index probes then walk
+            // the B-trees in one direction, page after page, instead of jumping around them.
+            let mut art: Vec<(i64, i64)> = arts.list.iter().copied().zip(art_author.iter().copied()).collect();
+            art.sort_unstable();
+            let mut fv = favd.list.clone();
+            fv.sort_unstable();
+            let mut fo = foll.list.clone();
+            fo.sort_unstable();
+            let mut rows_ids = need_rows.list.clone();
+            rows_ids.sort_unstable();
             let o = &mut conn.out;
             if b_artx.is_some() {
-                o.bind_exec("artx", &[Param::Raw(&ids), Param::Raw(&int_array(art_author.iter().copied()))]);
+                o.bind_exec(
+                    "artx",
+                    &[Param::Raw(&int_array(art.iter().map(|p| p.0))), Param::Raw(&int_array(art.iter().map(|p| p.1)))],
+                );
             }
             if b_flags.is_some() {
                 o.bind_exec(
                     "flags",
                     &[
-                        Param::Raw(&int_array(favd.list.iter().map(|p| p.0))),
-                        Param::Raw(&int_array(favd.list.iter().map(|p| p.1))),
-                        Param::Raw(&int_array(foll.list.iter().map(|p| p.0))),
-                        Param::Raw(&int_array(foll.list.iter().map(|p| p.1))),
+                        Param::Raw(&int_array(fv.iter().map(|p| p.0))),
+                        Param::Raw(&int_array(fv.iter().map(|p| p.1))),
+                        Param::Raw(&int_array(fo.iter().map(|p| p.0))),
+                        Param::Raw(&int_array(fo.iter().map(|p| p.1))),
                     ],
                 );
             }
             if b_rows.is_some() {
-                o.bind_exec("artrow", &[Param::Raw(&int_array(need_rows.list.iter().copied()))]);
-            }
-            if b_auser.is_some() {
-                o.bind_exec("auser", &[Param::Raw(&int_array(cauth.iter().copied()))]);
+                o.bind_exec("artrow", &[Param::Raw(&int_array(rows_ids.iter().copied()))]);
             }
             o.sync();
             conn.flush()?;
@@ -817,12 +973,6 @@ impl ReadLane {
                 }
             }
         }
-        let mut auser: FxMap<i64, &[Col]> = FxMap::default();
-        if let (Some(pb), Some(s)) = (&pb, b_auser) {
-            for r in &pb.results[s].rows {
-                auser.insert(pb.i64(r[0]), &r[..]);
-            }
-        }
         let mut rows_b: FxMap<i64, usize> = FxMap::default();
         if let (Some(pb), Some(s)) = (&pb, b_rows) {
             for (i, r) in pb.results[s].rows.iter().enumerate() {
@@ -846,6 +996,9 @@ impl ReadLane {
         };
 
         // ---- assemble ----
+        // Responses that come out the same for every requester (no favorited or following flag set for the viewer)
+        // are rendered once per batch and IO thread and shared; the bytes are this batch's, freed with its last send.
+        let mut shared: FxMap<(u8, u64, u16), std::sync::Arc<Vec<u8>>> = FxMap::default();
         let mut out: Vec<Response> = Vec::with_capacity(jobs.len());
         for ((j, ask), done) in jobs.into_iter().zip(asks.into_iter()).zip(done) {
             if done {
@@ -863,7 +1016,7 @@ impl ReadLane {
                         b.extend_from_slice(b"{\"profile\":");
                         profile_obj(&mut b, pa.bytes(r[2]).unwrap_or(b""), pa.bytes(r[3]), pa.bytes(r[4]), following);
                         b.push(b'}');
-                        out.push(Response { to, status: 200, body: b });
+                        out.push(Response { to, status: 200, body: b.into() });
                     }
                     None => out.push(reply::error(to, 404, "profile not found")),
                 },
@@ -873,11 +1026,21 @@ impl ReadLane {
                         Read::ArticleId { status, .. } => status,
                         _ => 200,
                     };
+                    let key = match (ask, p) {
+                        (Ask::Slug(k), Some((id, author, _))) if v == 0 || (!ctx.favorited(v, id) && !ctx.following(v, author)) => {
+                            Some((5u8, k as u64, to.thread))
+                        }
+                        _ => None,
+                    };
+                    if let Some(a) = key.and_then(|k| shared.get(&k)) {
+                        out.push(Response { to, status, body: Body::Shared(a.clone()) });
+                        continue;
+                    }
                     let mut b = Vec::with_capacity(2048);
                     b.extend_from_slice(b"{\"article\":");
                     if p.is_some_and(|a| ctx.article(&mut b, &pa, a, true, v, false)) {
                         b.push(b'}');
-                        out.push(Response { to, status, body: b });
+                        out.push(Response { to, status, body: keep(&mut shared, key, b) });
                     } else {
                         out.push(reply::error(to, 404, "article not found"));
                     }
@@ -898,8 +1061,11 @@ impl ReadLane {
                         .collect();
                     // Already newest first from the statement; sorting a sorted run is linear.
                     list.sort_unstable_by(|(x, _), (y, _)| (pa.i64(y[4]), pa.i64(y[2])).cmp(&(pa.i64(x[4]), pa.i64(x[2]))));
-                    // Some whenever a comment is listed: its author came from phase B's "auser".
-                    let pbr = pb.as_ref();
+                    let key = (v == 0 || list.iter().all(|(r, _)| !cfoll.contains(&(v, pa.i64(r[6]))))).then_some((6u8, k as u64, to.thread));
+                    if let Some(a) = key.and_then(|k| shared.get(&k)) {
+                        out.push(Response { to, status: 200, body: Body::Shared(a.clone()) });
+                        continue;
+                    }
                     let mut b = Vec::with_capacity(64 + 400 * list.len());
                     b.extend_from_slice(b"{\"comments\":[");
                     for (n, (r, u)) in list.into_iter().enumerate() {
@@ -915,13 +1081,12 @@ impl ReadLane {
                         b.extend_from_slice(b",\"body\":");
                         json::str(&mut b, pa.bytes(r[3]).unwrap_or(b""));
                         b.extend_from_slice(b",\"author\":");
-                        let following = v != 0 && ctx.following(v, pa.i64(r[6]));
-                        let pb = pbr.unwrap();
-                        profile_obj(&mut b, pb.bytes(u[1]).unwrap_or(b""), pb.bytes(u[2]), pb.bytes(u[3]), following);
+                        let following = v != 0 && cfoll.contains(&(v, pa.i64(r[6])));
+                        profile_obj(&mut b, pa.bytes(u[3]).unwrap_or(b""), pa.bytes(u[7]), pa.bytes(u[8]), following);
                         b.push(b'}');
                     }
                     b.extend_from_slice(b"]}");
-                    out.push(Response { to, status: 200, body: b });
+                    out.push(Response { to, status: 200, body: keep(&mut shared, key, b) });
                 }
                 Ask::Global(_) | Ask::List(..) | Ask::Feed(..) => {
                     let (rows, count): (&PageRows, i64) = match ask {
@@ -932,6 +1097,17 @@ impl ReadLane {
                     };
                     // A feed only holds articles by authors the viewer follows.
                     let followed = matches!(ask, Ask::Feed(..)) && v != 0;
+                    let key = match ask {
+                        Ask::Global(p) => Some((1u8, p as u64)),
+                        Ask::List(f, _, p) => Some((2 + f as u8, p as u64)),
+                        _ => None,
+                    }
+                    .filter(|_| v == 0 || rows.iter().all(|&(id, author, _)| !ctx.favorited(v, id) && !ctx.following(v, author)))
+                    .map(|(a, b)| (a, b, to.thread));
+                    if let Some(a) = key.and_then(|k| shared.get(&k)) {
+                        out.push(Response { to, status: 200, body: Body::Shared(a.clone()) });
+                        continue;
+                    }
                     let mut b = Vec::with_capacity(512 + 700 * rows.len());
                     b.extend_from_slice(b"{\"articles\":[");
                     let mut first = true;
@@ -949,7 +1125,7 @@ impl ReadLane {
                     b.extend_from_slice(b"],\"articlesCount\":");
                     json::int(&mut b, count);
                     b.push(b'}');
-                    out.push(Response { to, status: 200, body: b });
+                    out.push(Response { to, status: 200, body: keep(&mut shared, key, b) });
                 }
             }
         }
@@ -1336,7 +1512,7 @@ fn finish_row(j: WriteJob, p: &Pipeline, first: Option<&[Col]>, s: &Settings, ou
                 let token = s.keys.issue(p.i64(r[0]));
                 let mut b = Vec::with_capacity(512);
                 user_json(&mut b, p.bytes(r[2]).unwrap_or(b""), token.as_bytes(), p.bytes(r[1]).unwrap_or(b""), p.bytes(r[3]), p.bytes(r[4]));
-                out.push(Response { to, status: 201, body: b });
+                out.push(Response { to, status: 201, body: b.into() });
             }
             None => out.push(reply::error(to, 422, "username or email is already taken")),
         },
@@ -1344,7 +1520,7 @@ fn finish_row(j: WriteJob, p: &Pipeline, first: Option<&[Col]>, s: &Settings, ou
             Some(r) => {
                 let mut b = Vec::with_capacity(512);
                 user_json(&mut b, p.bytes(r[2]).unwrap_or(b""), token.as_bytes(), p.bytes(r[1]).unwrap_or(b""), p.bytes(r[3]), p.bytes(r[4]));
-                out.push(Response { to, status: 200, body: b });
+                out.push(Response { to, status: 200, body: b.into() });
             }
             None => out.push(reply::error(to, 401, "unauthorized")),
         },
@@ -1354,7 +1530,7 @@ fn finish_row(j: WriteJob, p: &Pipeline, first: Option<&[Col]>, s: &Settings, ou
                 b.extend_from_slice(b"{\"profile\":");
                 profile_obj(&mut b, p.bytes(r[0]).unwrap_or(b""), p.bytes(r[1]), p.bytes(r[2]), on);
                 b.push(b'}');
-                out.push(Response { to, status: 200, body: b });
+                out.push(Response { to, status: 200, body: b.into() });
             }
             None => out.push(reply::error(to, 404, "profile not found")),
         },
@@ -1373,7 +1549,7 @@ fn finish_row(j: WriteJob, p: &Pipeline, first: Option<&[Col]>, s: &Settings, ou
         },
         Write::DeleteArticle { .. } => match first {
             Some(r) if p.i64(r[0]) != v => out.push(reply::error(to, 403, "not the author")),
-            Some(_) => out.push(Response { to, status: 204, body: Vec::new() }),
+            Some(_) => out.push(Response { to, status: 204, body: Vec::new().into() }),
             None => out.push(reply::error(to, 404, "article not found")),
         },
         Write::CreateComment { .. } => match first {
@@ -1390,13 +1566,13 @@ fn finish_row(j: WriteJob, p: &Pipeline, first: Option<&[Col]>, s: &Settings, ou
                 b.extend_from_slice(b",\"author\":");
                 profile_obj(&mut b, p.bytes(r[4]).unwrap_or(b""), p.bytes(r[5]), p.bytes(r[6]), false);
                 b.extend_from_slice(b"}}");
-                out.push(Response { to, status: 201, body: b });
+                out.push(Response { to, status: 201, body: b.into() });
             }
             None => out.push(reply::error(to, 404, "article not found")),
         },
         Write::DeleteComment { .. } => match first {
             Some(r) if p.i64(r[0]) != v => out.push(reply::error(to, 403, "not the author")),
-            Some(_) => out.push(Response { to, status: 204, body: Vec::new() }),
+            Some(_) => out.push(Response { to, status: 204, body: Vec::new().into() }),
             None => out.push(reply::error(to, 404, "comment not found")),
         },
     }
@@ -1414,6 +1590,10 @@ pub fn bcrypt_worker(s: &'static Settings, index: usize) {
     // leave SCHED_IDLE again to take its locks at normal priority.
     if s.bcrypt_idle {
         unsafe { libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, 19) };
+    } else if index > 0 && s.bcrypt_nice > 0 {
+        // Hashers past the first at a lower priority: logins still finish on the first one when the box is full,
+        // and the rest take what CPU Postgres leaves.
+        unsafe { libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, s.bcrypt_nice) };
     }
     let mut jobs: Vec<BcryptJob> = Vec::new();
     loop {

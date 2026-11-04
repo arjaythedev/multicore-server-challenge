@@ -8,6 +8,7 @@ mod jwt;
 mod pg;
 mod queue;
 mod reply;
+mod sched;
 mod sql;
 
 use std::time::Duration;
@@ -64,6 +65,19 @@ fn main() {
         bcrypt_window: Duration::from_millis(env_or("BCRYPT_WINDOW_MS", 400)),
         bcrypt_idle: env_or("BCRYPT_IDLE", 0) != 0,
         feed_conn: env_or("FEED_CONN", 1) != 0,
+        feed_merge: env_or("FEED_MERGE", 1) != 0,
+        bcrypt_nice: env_or("BCRYPT_NICE", 10),
+        // Reads by class (feeds, comments, the rest), each class a batch at most every gap, as the leading entries do.
+        sched: (env_or("CLASS_LANES", 1) != 0).then(|| {
+            let fast = Duration::from_micros(env_or("GAP_FAST_US", 75_000));
+            sched::Config {
+                gap: [fast, Duration::from_micros(env_or("GAP_CMTS_US", 75_000)), Duration::from_micros(env_or("GAP_FEED_US", 120_000))],
+                min_age: Duration::from_micros(env_or("GAP_MIN_US", 5_000)),
+                caps: [(read_lanes * 3 / 8).max(2), (read_lanes / 4).max(1), (read_lanes / 4).max(1)],
+                max_active: env_or("READ_ACTIVE", read_lanes.saturating_sub(1).max(3)),
+                max_batch: env_or("READ_BATCH", 4096),
+            }
+        }),
         bcrypt_rescue: Duration::from_millis(env_or("BCRYPT_RESCUE_MS", 1000)),
     }));
 
@@ -77,12 +91,14 @@ fn main() {
         }
     }
 
+    http::LOOP_NICE.store(env_or("LOOP_NICE", 5), std::sync::atomic::Ordering::Relaxed);
     http::ACK_DELAY.store(env_or("ACK_DELAY", 0) != 0, std::sync::atomic::Ordering::Relaxed);
     reply::init(io_threads);
     // FEED_LANES of the read lanes (and connections) serve only feeds; 0 (the default): every lane serves every read.
     // A fixed split caps feeds at those lanes' connections, and near saturation their queue can grow without bound.
     let feed_lanes: usize = env_or::<usize>("FEED_LANES", 0).min(read_lanes.saturating_sub(1));
     db::FEED_SPLIT.store(feed_lanes > 0, std::sync::atomic::Ordering::Relaxed);
+    db::CLASS_LANES.store(settings.sched.is_some(), std::sync::atomic::Ordering::Relaxed);
     for i in 0..read_lanes {
         let pool = if i < feed_lanes { &db::FEEDS } else { &db::READS };
         let lane = db::ReadLane::new(settings, pool);
