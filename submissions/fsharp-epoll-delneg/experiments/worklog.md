@@ -219,3 +219,9 @@ Script: `experiments/h.sh`.
 - **e25 search (solo, epoll, fd tables):** probes 200k pass (103.1 µs/req, PG 55.3), 400k fail (65,189 req/s, no crash, 0.1% errors), 300k fail, 250k pass (p95 462, 125.9 µs/req, PG 70.8), 280k and 260k fail
   (260k: 131.9, PG 74.8), then the hold at 250k fails: p95 1032, 137.1 µs/req (app 57.4, PG 79.7), saturated at 7.8 cores. PG per request grew 44% over 40 minutes of searching: `articles` 500k -> 683k, `comments`
   +575k, `favorites` +847k rows. The aged DB, not connections, now sets the ceiling.
+- **What aging costs (e25, 150k users, after a 50-minute search, against 55 µs/req on a fresh DB): PG 110.7 µs/req**, `rd` 70 ms per batch, 63k buffers. Deep links are Zipf-skewed to the newest seeded articles, so rank 1
+  (article 500000) had 18,455 favorites and 16,921 comments. A batch's favorite counts read ~96,000 index tuples, 55,000 of them with a heap fetch, since recent favorites sit on pages not yet all-visible: 54% of `rd` by ablation
+  (44 -> 20 ms). Those counts are repeated in every batch, ~50 times a second. Followee lists of non-feed viewers: ~8,000 heap fetches a batch (`follows` VM mostly cleared by unfollows). Feed scans: 9x the rows per viewer.
+  Replay on that DB: bound + per-followee LATERAL for feeds: no change (45.8 vs 45.6 ms); probing followees per viewer instead of whole lists: worse for `rd` (58 ms) and comments (17 vs 10 ms).
+- **e25, READ_CLOCK_US on the aged DB, 180k users (side lane follows it):** 20 ms 151.2, 149.0 µs/req (PG 102, 100; p95 198, 184); 50 ms 135.8 (PG 85.9; p95 261); 100 ms 130.9 (PG 80.6; p95 272); 150 ms 128.3 (PG 79.6; p95 265). -15% total CPU: on an aged
+  DB the cost per batch is mostly fixed by the viral articles, so fewer batches pay directly.
