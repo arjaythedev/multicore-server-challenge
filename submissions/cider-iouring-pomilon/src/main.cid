@@ -1,7 +1,7 @@
 // main.cid — Multicore io_uring server entrypoint for RealWorld Conduit
 // Pure Cider non-blocking implementation with zero C wrapper files.
 
-from sys import sys_fork, sys_exit, sys_sched_setaffinity, sys_sched_getaffinity, sys_socket, sys_bind, sys_listen, sys_setsockopt, sys_close, sys_mmap, native_memset, native_memcpy, native_strncmp, native_atoi, native_htons, native_inet_pton, sys_prlimit64, Rlimit64, sys_ioctl_fionread, sys_socketpair, sys_read;
+from sys import sys_fork, sys_exit, sys_sched_getaffinity, sys_socket, sys_bind, sys_listen, sys_setsockopt, sys_close, sys_mmap, native_memset, native_memcpy, native_strncmp, native_atoi, native_htons, native_inet_pton, sys_prlimit64, Rlimit64, sys_ioctl_fionread, sys_socketpair, sys_read;
 from uring import Ring, IoUringSqe, IoUringCqe, ring_init, ring_get_sqe, ring_submit, ring_submit_and_wait, IORING_OP_ACCEPT, IORING_OP_RECV, IORING_OP_SEND, IORING_OP_POLL_ADD, IORING_ACCEPT_MULTISHOT, IORING_CQE_F_MORE;
 from http import HttpRequest, http_parse_request;
 from router import ConnSlot, route_dispatch, route_finish, route_login_finish, bcrypt_worker_loop, router_set_bcrypt_fds, router_bcrypt_done, BcryptResp, STATE_IDLE, STATE_RECV, STATE_WAIT_DB, STATE_SEND, STATE_WAIT_PG, STATE_WAIT_BCRYPT, router_set_slots_base, router_clear_inflight;
@@ -12,27 +12,6 @@ struct SockAddrIn {
     var sin_port: u16;
     var sin_addr: u32;
     var sin_zero: [u8; 8];
-}
-
-struct CpuSet {
-    var bits: [u64; 16];
-}
-
-func pin_to_core(cpu: int) -> void {
-    var set: CpuSet = uninit;
-    native_memset((&set as *void) as *char, 0 as u8, 128 as i64);
-    var word: int = cpu / 64;
-    var bit: int = cpu % 64;
-    set.bits[word] = (1 as u64) << (bit as u64);
-    sys_sched_setaffinity(0, 128, (&set) as *void);
-}
-
-func unpin_core() -> void {
-    var set: CpuSet = uninit;
-    for (var i: int = 0; i < 16; i = i + 1) {
-        set.bits[i] = 0xFFFFFFFFFFFFFFFF as u64;
-    }
-    sys_sched_setaffinity(0, 128, (&set) as *void);
 }
 
 func get_env(envp: **char, key: *char, klen: int) -> *char {
@@ -152,9 +131,7 @@ func dispatch_slot(slot: *ConnSlot, slot_idx: int, req: *HttpRequest, secret: *c
     }
 }
 
-func worker_run(worker_id: int, host: *char, port: int, db_url: *char, secret: *char, slen: int, max_slots: int, num_read: int, num_write: int) -> void {
-    pin_to_core(worker_id);
-
+func worker_run(host: *char, port: int, db_url: *char, secret: *char, slen: int, max_slots: int, num_read: int, num_write: int) -> void {
     // Ensure worker limit is raised
     var old_lim: Rlimit64 = uninit;
     sys_prlimit64(0, 7, 0 as *void, (&old_lim) as *void);
@@ -174,7 +151,6 @@ func worker_run(worker_id: int, host: *char, port: int, db_url: *char, secret: *
         var bpid: int = sys_fork();
         if (bpid == 0) {
             sys_close(bpair[0]);
-            unpin_core();
             bcrypt_worker_loop(bpair[1]);
             sys_exit(0);
         }
@@ -878,7 +854,9 @@ func main(argc: int, argv: **char, envp: **char) -> int {
     }
 
     var cpus: int = get_cpu_count();
-    var num_workers: int = (cpus + 3) / 4;
+    var num_workers: int = cpus / 2;
+    if (num_workers < 2) { num_workers = 2; }
+    if (num_workers > 8) { num_workers = 8; }
     var nw_str: *char = get_env(envp, "CONDUIT_WORKERS", 15);
     if (nw_str as i64 != 0 as i64) {
         num_workers = native_atoi(nw_str);
@@ -931,12 +909,12 @@ func main(argc: int, argv: **char, envp: **char) -> int {
         var pid: int = sys_fork();
         if (pid == 0) {
             // Child worker
-            worker_run(i, host, port, db_url, secret, slen, worker_slots, num_read, num_write);
+            worker_run(host, port, db_url, secret, slen, worker_slots, num_read, num_write);
             sys_exit(0);
         }
     }
 
     // Last worker runs in parent process
-    worker_run(num_workers - 1, host, port, db_url, secret, slen, worker_slots, num_read, num_write);
+    worker_run(host, port, db_url, secret, slen, worker_slots, num_read, num_write);
     return 0;
 }

@@ -12,6 +12,7 @@ apt-get install -y -qq --no-install-recommends \
   unzip \
   ca-certificates \
   libpq-dev \
+  libcrypt-dev \
   python3
 
 CIDER_DIR=/opt/cider

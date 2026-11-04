@@ -6,6 +6,7 @@ from http import HttpRequest, http_query_param, http_parse_limit, http_parse_off
 from json import json_find_str, json_find_taglist, json_escape, json_unescape, json_has_wrapper;
 from sha256 import jwt_verify, jwt_sign;
 from bcrypt import bcrypt_hash, bcrypt_verify;
+extern func crypt(key: *char, salt: *char) -> *char;
 from pg import PgConn, PQresultStatus, PQclear, PQntuples, PQnfields, PQgetvalue, PQgetisnull, pg_get_read_conn, pg_get_write_conn, pg_get_write_conn_force, pg_enqueue_slot, PQsendQueryPrepared, PQsendPipelineSync, PGRES_TUPLES_OK, PGRES_COMMAND_OK;
 
 func str_len(s: *char) -> int {
@@ -307,6 +308,19 @@ struct BcryptResp {
     var ok: int;
 }
 
+func constant_time_hash_eq(a: *char, b: *char, n: int) -> int {
+    var pa: i64 = a as i64;
+    var pb: i64 = b as i64;
+    var diff: int = 0;
+    for (var i: int = 0; i < n; i = i + 1) {
+        diff = diff | (((*(((pa + (i as i64)) as *u8))) ^ (*(((pb + (i as i64)) as *u8)))) as int);
+    }
+    if (diff == 0) {
+        return 1;
+    }
+    return 0;
+}
+
 var g_bcrypt_fds: [int; 4] = [-1, -1, -1, -1];
 var g_bcrypt_load: [int; 4] = [0, 0, 0, 0];
 var g_num_bcrypt: int = 0;
@@ -335,7 +349,16 @@ func bcrypt_worker_loop(fd: int) -> void {
         if (nr <= 0) {
             sys_exit(0);
         }
-        var ok: int = bcrypt_verify((&job.pw[0]) as *char, job.pw_len, (&job.hash[0]) as *char, job.hash_len);
+        // The bcrypt child is single-threaded, so libcrypt's static result
+        // buffer is safe here. The stored cost-10 hash remains the setting,
+        // so verification still performs the required bcrypt work.
+        job.pw[job.pw_len] = 0 as u8;
+        job.hash[job.hash_len] = 0 as u8;
+        var ok: int = 0;
+        var got: *char = crypt((&job.pw[0]) as *char, (&job.hash[0]) as *char);
+        if (got as i64 != 0 as i64 && job.hash_len == 60) {
+            ok = constant_time_hash_eq(got, (&job.hash[0]) as *char, 60);
+        }
         var resp: BcryptResp = uninit;
         resp.slot_idx = job.slot_idx;
         resp.ok = ok;
@@ -1388,8 +1411,11 @@ func route_finish(slot: *ConnSlot, slot_idx: int, secret: *char, slen: int, out:
             job.pw_len = slot->p2_len;
             if (job.pw_len > 72) { job.pw_len = 72; }
             job.hash_len = hlen;
+            if (job.hash_len > 64) { job.hash_len = 64; }
             native_memcpy((&job.pw[0]) as *char, (&slot->param2[0]) as *char, job.pw_len as i64);
-            native_memcpy((&job.hash[0]) as *char, db_hash, hlen as i64);
+            native_memcpy((&job.hash[0]) as *char, db_hash, job.hash_len as i64);
+            job.pw[job.pw_len] = 0 as u8;
+            job.hash[job.hash_len] = 0 as u8;
 
             sys_write(bfd, (&job) as *void, sizeof(BcryptJob) as i64);
             slot->state = STATE_WAIT_BCRYPT;

@@ -91,10 +91,6 @@ func sys_exit(code: int) -> void {
     sys_call(60, code as i64, 0, 0, 0, 0, 0);
 }
 
-func sys_sched_setaffinity(pid: int, cpusetsize: i64, mask: *void) -> int {
-    return sys_call(203, pid as i64, cpusetsize, mask as i64, 0, 0, 0) as int;
-}
-
 func sys_sched_getaffinity(pid: int, cpusetsize: i64, mask: *void) -> int {
     return sys_call(204, pid as i64, cpusetsize, mask as i64, 0, 0, 0) as int;
 }

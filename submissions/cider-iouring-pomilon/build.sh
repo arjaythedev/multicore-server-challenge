@@ -47,6 +47,6 @@ for mod in "${MODULES[@]}"; do
 done
 
 echo "== [Link] Linking bin/conduit with libpq..."
-gcc -Wl,--defsym=main=main__main "$DIR"/src/*.o -lpq -o "$DIR/bin/conduit"
+gcc -Wl,--defsym=main=main__main "$DIR"/src/*.o -lpq -lcrypt -o "$DIR/bin/conduit"
 
 echo "== Build complete: $DIR/bin/conduit"
