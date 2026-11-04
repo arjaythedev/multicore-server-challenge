@@ -34,6 +34,9 @@ struct Conn {
 /// Emptied request buffers kept per IO thread.
 const SPARE_IN: usize = 256;
 
+/// Nice value for the event loop threads (0: unchanged).
+pub static LOOP_NICE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(5);
+
 pub struct Server {
     thread: u16,
     ep: RawFd,
@@ -130,6 +133,12 @@ impl Server {
     }
 
     pub fn run(mut self, private_fds: bool, unshared: &std::sync::Barrier) {
+        // Event loops at a lower priority (nice LOOP_NICE, 5 by default): a request can wait a moment, a Postgres backend
+        // in the middle of a batch holds up all of it.
+        let nice = LOOP_NICE.load(std::sync::atomic::Ordering::Relaxed);
+        if nice > 0 {
+            unsafe { libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, nice) };
+        }
         // A descriptor table of this thread's own: client sockets are only ever touched by the thread that accepted
         // them, and with an unshared table the kernel skips the shared table's locking and per-call reference counts
         // on every accept, read, write and close.

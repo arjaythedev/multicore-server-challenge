@@ -98,9 +98,13 @@ impl Pool {
 pub static READS: Pool = Pool::new();
 pub static FEEDS: Pool = Pool::new();
 pub static FEED_SPLIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Reads queue by class (crate::sched) instead of in one pool.
+pub static CLASS_LANES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn push_read(job: ReadJob) {
-    if matches!(job.kind, Read::Feed { .. }) && FEED_SPLIT.load(Relaxed) {
+    if CLASS_LANES.load(Relaxed) {
+        crate::sched::READS.push(job);
+    } else if matches!(job.kind, Read::Feed { .. }) && FEED_SPLIT.load(Relaxed) {
         FEEDS.q.push(job);
     } else {
         READS.q.push(job);
@@ -121,6 +125,9 @@ pub struct Settings {
     pub bcrypt_window: Duration,
     pub bcrypt_idle: bool,
     pub feed_conn: bool,
+    pub bcrypt_nice: i32,
+    /// Read scheduling by class (None: one pool, lanes taking turns).
+    pub sched: Option<crate::sched::Config>,
     pub bcrypt_rescue: Duration,
 }
 
@@ -349,6 +356,15 @@ impl ReadLane {
 
     pub fn run(mut self) {
         let mut jobs = Vec::with_capacity(self.s.read_batch);
+        if let Some(cfg) = &self.s.sched {
+            loop {
+                jobs.clear();
+                let c = crate::sched::READS.take(cfg, &mut jobs);
+                let batch = std::mem::take(&mut jobs);
+                self.execute(batch);
+                crate::sched::READS.done(c);
+            }
+        }
         loop {
             jobs.clear();
             {
@@ -438,7 +454,9 @@ impl ReadLane {
         // ---- phase A ----
         // The feed statement (the costliest one) goes out first on the lane's second connection, so a second backend
         // runs it while the first runs the rest of phase A; phase B, after both, still covers every article once.
-        let split = self.s.feed_conn && feed.len() > 0;
+        // Only worth it when the batch has other phase-A work to overlap with.
+        let others = aslug.len() + aid.len() + cmts.len() + global.len() + lists.iter().map(|l| l.page.len()).sum::<usize>();
+        let split = self.s.feed_conn && feed.len() > 0 && others > 0;
         if split {
             let fc = Self::conn_of(&mut self.fconn, self.s)?;
             fc.out.bind_exec(
@@ -757,24 +775,36 @@ impl ReadLane {
         let b_rows = slotb(need_rows.len() > 0);
         let b_auser = slotb(!cauth.is_empty());
         let pb = if nb > 0 {
-            let ids = int_array(arts.list.iter().copied());
+            // Keys in ascending order (results are matched back by key): each statement's index probes then walk
+            // the B-trees in one direction, page after page, instead of jumping around them.
+            let mut art: Vec<(i64, i64)> = arts.list.iter().copied().zip(art_author.iter().copied()).collect();
+            art.sort_unstable();
+            let mut fv = favd.list.clone();
+            fv.sort_unstable();
+            let mut fo = foll.list.clone();
+            fo.sort_unstable();
+            let mut rows_ids = need_rows.list.clone();
+            rows_ids.sort_unstable();
             let o = &mut conn.out;
             if b_artx.is_some() {
-                o.bind_exec("artx", &[Param::Raw(&ids), Param::Raw(&int_array(art_author.iter().copied()))]);
+                o.bind_exec(
+                    "artx",
+                    &[Param::Raw(&int_array(art.iter().map(|p| p.0))), Param::Raw(&int_array(art.iter().map(|p| p.1)))],
+                );
             }
             if b_flags.is_some() {
                 o.bind_exec(
                     "flags",
                     &[
-                        Param::Raw(&int_array(favd.list.iter().map(|p| p.0))),
-                        Param::Raw(&int_array(favd.list.iter().map(|p| p.1))),
-                        Param::Raw(&int_array(foll.list.iter().map(|p| p.0))),
-                        Param::Raw(&int_array(foll.list.iter().map(|p| p.1))),
+                        Param::Raw(&int_array(fv.iter().map(|p| p.0))),
+                        Param::Raw(&int_array(fv.iter().map(|p| p.1))),
+                        Param::Raw(&int_array(fo.iter().map(|p| p.0))),
+                        Param::Raw(&int_array(fo.iter().map(|p| p.1))),
                     ],
                 );
             }
             if b_rows.is_some() {
-                o.bind_exec("artrow", &[Param::Raw(&int_array(need_rows.list.iter().copied()))]);
+                o.bind_exec("artrow", &[Param::Raw(&int_array(rows_ids.iter().copied()))]);
             }
             if b_auser.is_some() {
                 o.bind_exec("auser", &[Param::Raw(&int_array(cauth.iter().copied()))]);
@@ -1414,6 +1444,10 @@ pub fn bcrypt_worker(s: &'static Settings, index: usize) {
     // leave SCHED_IDLE again to take its locks at normal priority.
     if s.bcrypt_idle {
         unsafe { libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, 19) };
+    } else if index > 0 && s.bcrypt_nice > 0 {
+        // Hashers past the first at a lower priority: logins still finish on the first one when the box is full,
+        // and the rest take what CPU Postgres leaves.
+        unsafe { libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, s.bcrypt_nice) };
     }
     let mut jobs: Vec<BcryptJob> = Vec::new();
     loop {

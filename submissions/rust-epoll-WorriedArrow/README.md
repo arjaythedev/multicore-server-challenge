@@ -121,6 +121,12 @@ Defaults suit the 8-vCPU box; all are optional environment variables.
 | `IO_THREADS` | cores / 2 | epoll threads |
 | `READ_LANES` | cores | read connections |
 | `FEED_CONN` | 1 | 1: each read lane runs its batch's feed statement on a second connection, alongside the rest of phase A |
+| `CLASS_LANES` | 1 | 1: reads queue by class (feeds, comment threads, the rest), each class a batch at most every gap; 0: one pool |
+| `GAP_FAST_US` / `GAP_CMTS_US` / `GAP_FEED_US` | 75000 | least time between two batches of a class |
+| `GAP_MIN_US` | 5000 | least time a read waits before its batch starts |
+| `READ_ACTIVE` | read lanes - 1 | most read batches running at once (per class 3/8, 1/4, 1/4 of the lanes, plus one for the class waiting longest) |
+| `LOOP_NICE` | 5 | nice value of the event loop threads |
+| `BCRYPT_NICE` | 10 | nice value of the hashing threads after the first |
 | `WRITE_LANES` | 1 | group-commit connections |
 | `BCRYPT_THREADS` | 2 | bcrypt threads (the first gathers, the rest take full sets) |
 | `BCRYPT_LANES` | measured | hashes run in lockstep (1 to 6; by default timed at startup) |
