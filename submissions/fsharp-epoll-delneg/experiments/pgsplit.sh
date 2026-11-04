@@ -8,10 +8,10 @@ snap() {
     t=$(awk '{print $14 + $15}' /proc/$pid/stat 2>/dev/null) || continue
     echo "$pid ${name// /_} $t"
   done
-  # processes not in pg_stat_activity (checkpointer etc. are, autovacuum launcher is): all postgres pids
-  for p in $(pgrep -u postgres -x postgres); do echo "$p ALL $(awk '{print $14 + $15}' /proc/$p/stat 2>/dev/null)"; done
+  # pg_stat_activity also lists the background processes (checkpointer, walwriter, autovacuum workers, ...)
 }
-snap > /tmp/pgsplit.a; sleep "$1"; snap > /tmp/pgsplit.b
+A=$(mktemp); B=$(mktemp); trap 'rm -f $A $B' EXIT
+snap > $A; sleep "$1"; snap > $B
 hz=$(getconf CLK_TCK)
 awk -v hz=$hz -v secs=$1 'NR==FNR {a[$1" "$2]=$3; next} {k=$1" "$2; if (k in a) d=$3-a[k]; else d=$3; s[$2]+=d}
-  END {for (g in s) printf "%-28s %.3f cores\n", g, s[g]/hz/secs}' /tmp/pgsplit.a /tmp/pgsplit.b | sort -k2 -rn
+  END {for (g in s) {printf "%-28s %.3f cores\n", g, s[g]/hz/secs; t+=s[g]}; printf "%-28s %.3f cores\n", "ALL", t/hz/secs}' $A $B | sort -k2 -rn

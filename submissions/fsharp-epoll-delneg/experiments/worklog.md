@@ -202,3 +202,7 @@ Script: `experiments/h.sh`.
   The rd ablation on the same batches (15.4 ms per batch): no feeds 8.4, no favorite counts 9.6, no tags 12.9, no list counts 13.4, no flags
   13.7, no follows 14.5, no authors 14.4, no bodies 15.1. A feed's articles are nearly all its viewer's alone, so feeds pay for rows the
   other lists share.
+- **bcrypt build check (not an experiment, no change).** bcrypt is the largest single app cost (~11-20 ms x 0.1% of requests), so: flags at 6 lanes,
+  CPU 23, best of 6: `-O3 -funroll-loops` 10.5 ms per hash, `-O3` 10.7, `-march=x86-64-v3` 10.8, `-mtune=znver3` 11.3, `-O2` 16.8. Ubuntu 24.04's gcc 13.3,
+  which the scorer's build uses, 10.7. That's ~2.9 cycles per lane per round; a hand-allocated assembly loop would have 14 instructions per lane-round, ~2.3
+  cycles at best on a 6-wide core, so ~1% of total CPU for x86-only assembly. Not worth it.
