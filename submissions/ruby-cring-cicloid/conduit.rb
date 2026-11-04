@@ -34,9 +34,10 @@ class Conduit
   ZERO = "0"
   MAX_PASSWORD = Bcrypt::MAX # longer passwords are refused rather than truncated
 
-  def initialize(db, secret)
+  # `planner`: where reads go (RemotePlanner::Client); by default a Planner in this process.
+  def initialize(db, secret, planner: nil)
     @db = db
-    @planner = Planner.new(db)
+    @planner = planner || Planner.new(db)
     @tokens = Tokens.new(secret)
     @array = PG::TextEncoder::Array.new
   end

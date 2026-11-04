@@ -18,12 +18,15 @@ class Planner
   MAX = Integer(ENV.fetch("READ_MAX", "512")) # requests per batch; a backlog runs as several batches
 
   # One read request. `kind` and `args` say what it wants; `document` (or `missing`) is the answer.
-  # `fiber` waits for it.
-  Request = Struct.new(:kind, :viewer, :a, :b, :c, :fiber, :document, :error)
+  # Either `fiber` (a request in this process) waits for it, or `reply` (a request from another process,
+  # see remote_planner.rb) is called with it.
+  Request = Struct.new(:kind, :viewer, :a, :b, :c, :fiber, :document, :error, :reply)
 
   FALSE = "false"
   TRUE = "true"
   NULL = "null"
+
+  attr_accessor :after_batch # called after each batch's answers were handed out (remote_planner.rb)
 
   def initialize(db)
     @db = db
@@ -43,13 +46,19 @@ class Planner
   # kind: :global (value nil), :tag, :author or :favorited
   def list(kind, viewer, value, limit, offset) = ask(kind, viewer, value, limit, offset)
 
+  # A request from another process; its `reply` is called when the batch is done.
+  def submit(request)
+    @pending << request
+    @signal.push(Process.clock_gettime(Process::CLOCK_MONOTONIC)) if @pending.size == 1
+  end
+
   private
 
   # The requesting fiber parks itself with the scheduler's block hook and the batch resumes it with unblock:
   # a Thread::Queue per wait cost several times the wake-up itself. Safe on one thread: a request always
   # blocks before its batch runs, since the batch starts on a later pass of the event loop.
   def ask(kind, viewer, a, b, c)
-    request = Request.new(kind, viewer, a, b, c, Fiber.current, nil, nil)
+    request = Request.new(kind, viewer, a, b, c, Fiber.current, nil, nil, nil)
     @pending << request
     @signal.push(Process.clock_gettime(Process::CLOCK_MONOTONIC)) if @pending.size == 1
     Fiber.scheduler.block(request, nil) until request.document || request.error
@@ -59,7 +68,11 @@ class Planner
   end
 
   def wake(request)
-    Fiber.scheduler.unblock(request, request.fiber)
+    if request.fiber
+      Fiber.scheduler.unblock(request, request.fiber)
+    else
+      request.reply.call(request)
+    end
   end
 
   def run
@@ -77,6 +90,7 @@ class Planner
             wake(request)
           end
         end
+        @after_batch&.call
       end
     end
   end
@@ -305,8 +319,12 @@ class Planner
     viewer = request.viewer
     ids.each { |id| want_flags(viewer, id) }
     later do
-      items = ids.map { |id| article_json(id, viewer, body: false) }
-      request.document = "{\"articles\":[#{items.join(",")}],\"articlesCount\":#{count}}"
+      out = String.new("{\"articles\":[", capacity: 64 + (ids.size * 640))
+      ids.each_with_index do |id, i|
+        out << "," unless i.zero?
+        append_article(out, id, viewer, body: false)
+      end
+      request.document = out << "],\"articlesCount\":" << count.to_s << "}"
     end
   end
 
@@ -375,10 +393,13 @@ class Planner
                 username, bio, image)
   end
 
-  def article_json(id, viewer, body:)
+  def article_json(id, viewer, body:) = append_article(String.new(capacity: 1024), id, viewer, body: body)
+
+  # Appends the article's JSON for `viewer` to `out`: the batch's fragments around the two flags.
+  def append_article(out, id, viewer, body:)
     article = @articles[id]
     head, body_part, tail, middle = article[:fragments]
-    out = String.new(head, capacity: 512)
+    out << head
     out << body_part if body && body_part
     out << tail << favorited?(viewer, id) << middle << following?(viewer, article[:author]) << "}}"
   end

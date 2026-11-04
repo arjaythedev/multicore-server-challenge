@@ -5,6 +5,7 @@ require "etc"
 require_relative "conduit"
 require_relative "http"
 require_relative "bcrypt_service"
+require_relative "remote_planner"
 
 # Ruby runs one thread at a time per process, so the server is one process per core. The master loads
 # the code, warms YJIT on the whole request path (the compiled code is shared with the workers through
@@ -23,7 +24,15 @@ WORKERS = Integer(ENV.fetch("WORKERS", [Etc.nprocessors * 3 / 4, 1].max.to_s))
 # 4,000 local users); pipelining keeps one busy.
 # WORKERS x PG_CONNECTIONS must stay at 95 or below.
 PG_CONNECTIONS = Integer(ENV.fetch("PG_CONNECTIONS", "1"))
-abort "WORKERS x PG_CONNECTIONS = #{WORKERS * PG_CONNECTIONS} is over 95" if WORKERS * PG_CONNECTIONS > 95
+# Planner processes (remote_planner.rb): batched reads for the whole server, taking turns by window. 0 (the
+# default) runs a planner inside each worker instead. Locally 2 planners cut Postgres CPU per request by a
+# third (45 to 31 us) and added about as much in the workers and planners (socket framing, copies), so the
+# simpler layout stays the default until a run on the 8-core box says otherwise. With 0, a
+# planner inside each worker instead.
+PLANNERS = Integer(ENV.fetch("PLANNERS", "0"))
+PLANNER_CONNECTIONS = Integer(ENV.fetch("PLANNER_CONNECTIONS", "2")) # per planner
+total = (WORKERS * PG_CONNECTIONS) + (PLANNERS * PLANNER_CONNECTIONS)
+abort "#{total} Postgres connections is over 95" if total > 95
 
 # The warm-up drives requests through http.rb's parser and the app over a socket pair; it never listens.
 class WarmServer < HTTPServer
@@ -81,12 +90,13 @@ def warm_up_in(task)
   end
 end
 
-def serve(index, bcrypt)
+def serve(index, bcrypt, planners)
   Async do |task|
     Bcrypt.client = BcryptService::Client.new(bcrypt)
     db = DB.new(DATABASE_URL, PG_CONNECTIONS, SQL::ALL, setup: SQL::SETUP)
     db.start
-    app = Conduit.new(db, SECRET)
+    planner = RemotePlanner::Client.new(planners, Planner::WINDOW) unless planners.empty?
+    app = Conduit.new(db, SECRET, planner: planner)
     # Client connections as io_uring direct descriptors, driven from C, where the kernel allows it, else
     # in epoll. CONNECTIONS=epoll forces the fallback.
     server = begin
@@ -116,7 +126,8 @@ def serve(index, bcrypt)
     server.run(task)
     if index.zero?
       compiled = RubyVM::YJIT.enabled? ? "#{RubyVM::YJIT.runtime_stats[:compiled_iseq_count]} iseqs compiled" : "YJIT off"
-      warn "listening on #{HOST}:#{PORT} (#{WORKERS} workers, #{server.class}, #{PG_CONNECTIONS} Postgres connections each, #{compiled})"
+      warn "listening on #{HOST}:#{PORT} (#{WORKERS} workers, #{server.class}, #{PG_CONNECTIONS} Postgres connections each, " \
+           "#{PLANNERS} planners with #{PLANNER_CONNECTIONS}, #{compiled})"
     end
   end
 end
@@ -125,17 +136,43 @@ warm_up
 GC.compact
 Process.warmup
 
+# A planner process: Planner over its own Postgres connections, serving every worker's socket.
+def plan(sockets)
+  Async do |task|
+    db = DB.new(DATABASE_URL, PLANNER_CONNECTIONS, SQL::ALL, setup: SQL::SETUP)
+    db.start
+    RemotePlanner::Server.new(Planner.new(db), sockets).run(task)
+    GC.config(rgengc_allow_full_mark: false)
+  end
+end
+
 lanes = BcryptService.calibrate
-# One socketpair per worker for bcrypt, made before the fork: the worker keeps one end, the master the other.
+# Socketpairs, made before the fork: one per worker for bcrypt (the master keeps the other end), and one per
+# (worker, planner) for reads.
 pairs = Array.new(WORKERS) { UNIXSocket.pair(:SEQPACKET) }
-pids = Array.new(WORKERS) do |index|
-  fork do
+links = Array.new(PLANNERS) { Array.new(WORKERS) { UNIXSocket.pair(:STREAM) } } # [planner][worker] = [planner end, worker end]
+close_all_but = lambda do |keep|
+  (pairs.flatten + links.flatten).each { |socket| socket.close unless keep.include?(socket) || socket.closed? }
+end
+pids = []
+PLANNERS.times do |p|
+  pids << fork do
     %w[TERM INT].each { |signal| trap(signal) { exit!(0) } }
-    pairs.each_with_index { |(master_end, worker_end), i| master_end.close; worker_end.close unless i == index }
-    serve(index, pairs[index][1])
+    mine = links[p].map(&:first)
+    close_all_but.call(mine)
+    plan(mine)
+  end
+end
+WORKERS.times do |index|
+  pids << fork do
+    %w[TERM INT].each { |signal| trap(signal) { exit!(0) } }
+    planners = links.map { |row| row[index][1] }
+    close_all_but.call([pairs[index][1], *planners])
+    serve(index, pairs[index][1], planners)
   end
 end
 pairs.each { |_, worker_end| worker_end.close }
+links.flatten.each(&:close)
 
 stop = lambda do |signal|
   pids.each do |pid|
