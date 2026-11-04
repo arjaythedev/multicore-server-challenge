@@ -2,7 +2,7 @@
 //! the key's 1-based ordinal `k`. Results match SPEC.md's reference SQL; ordering of rows within a key is restored
 //! in the application where the statement doesn't order them.
 
-use crate::pg::{INT8_ARRAY, TEXT_ARRAY};
+use crate::pg::{INT4_ARRAY, INT8_ARRAY, TEXT_ARRAY};
 
 pub struct Stmt {
     pub name: &'static str,
@@ -17,6 +17,13 @@ fn s(name: &'static str, sql: impl Into<String>, types: &'static [u32]) -> Stmt 
 /// A count capped at 1,000, in one pass over at most 1,000 index entries.
 fn capped(rows: &str) -> String {
     format!("(SELECT count(*) FROM ({rows} LIMIT 1000) s)")
+}
+
+/// A count capped at 1,000 for keys that usually reach it (tags): skipping 999 entries, with no aggregate per entry,
+/// settles a key with 1,000 or more about a quarter faster than counting them; only smaller keys are counted, in a
+/// second pass over fewer than 1,000. Keys that are usually small (authors, favoriters) would pay that pass twice.
+fn capped_big(rows: &str) -> String {
+    format!("(CASE WHEN EXISTS ({rows} OFFSET 999) THEN 1000::int8 ELSE (SELECT count(*) FROM ({rows}) s) END)")
 }
 
 /// Article row columns, after `k`: [id, author_id, slug, title, description, created_at, updated_at].
@@ -68,10 +75,10 @@ pub fn read_statements() -> Vec<Stmt> {
              SELECT 1::int8, u.id, NULL::int8, u.username, NULL::timestamptz, NULL::timestamptz, NULL::int8, u.bio, u.image \
              FROM users u WHERE u.id = ANY(ARRAY(SELECT DISTINCT t.author_id FROM t WHERE t.author_id IS NOT NULL ORDER BY 1)) \
              UNION ALL \
-             SELECT 2::int8, q.v, fo.followee_id, NULL::text, NULL::timestamptz, NULL::timestamptz, NULL::int8, NULL::text, NULL::text \
-             FROM (SELECT p.v, array_agg(DISTINCT t.author_id) AS aids FROM unnest($2::int8[], $3::int8[]) p(v, k) \
-               JOIN t ON t.k = p.k AND t.author_id IS NOT NULL GROUP BY p.v) q \
-             CROSS JOIN LATERAL (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = q.v AND fo.followee_id = ANY(q.aids)) fo",
+             SELECT 2::int8, p.v, fo.followee_id, NULL::text, NULL::timestamptz, NULL::timestamptz, NULL::int8, NULL::text, NULL::text \
+             FROM (SELECT t.k, array_agg(t.author_id) AS aids FROM t WHERE t.author_id IS NOT NULL GROUP BY t.k) ta \
+             JOIN unnest($2::int8[], $3::int8[]) p(v, k) ON p.k = ta.k \
+             CROSS JOIN LATERAL (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = p.v AND fo.followee_id = ANY(ta.aids)) fo",
             &[TEXT_ARRAY, INT8_ARRAY, INT8_ARRAY],
         ),
         // Lists: one statement per filter returns the capped counts (k <= 0: -k is the count key, the count in
@@ -98,7 +105,7 @@ pub fn read_statements() -> Vec<Stmt> {
                  CROSS JOIN LATERAL (SELECT at.article_id FROM article_tags at WHERE at.tag_id = t.id \
                    ORDER BY at.article_id DESC LIMIT r.lim OFFSET r.off) p \
                  JOIN articles a ON a.id = p.article_id",
-                capped("SELECT 1 FROM article_tags at WHERE at.tag_id = t.id")
+                capped_big("SELECT 1 FROM article_tags at WHERE at.tag_id = t.id")
             ),
             &[TEXT_ARRAY, TEXT_ARRAY, INT8_ARRAY, INT8_ARRAY],
         ),
@@ -218,17 +225,19 @@ pub fn read_statements() -> Vec<Stmt> {
             &[INT8_ARRAY, INT8_ARRAY],
         ),
         // Viewer flags: (0, viewer, article) for each favorited pair asked about, (1, viewer, followee) for each
-        // followed pair. Each viewer's candidates go in one primary-key range scan (= ANY) instead of a probe each.
+        // followed pair. Each viewer's candidates go in one primary-key range scan (= ANY) instead of a probe each;
+        // the server groups the pairs by viewer and sends each one's slice of a flat target array (the form of
+        // theCatWisel's #201), so Postgres doesn't aggregate them.
         s(
             "flags",
-            "WITH p AS (SELECT x.v, array_agg(x.a) AS aa FROM unnest($1::int8[], $2::int8[]) x(v, a) GROUP BY x.v), \
-             q AS (SELECT x.v, array_agg(x.u) AS uu FROM unnest($3::int8[], $4::int8[]) x(v, u) GROUP BY x.v) \
-             SELECT 0::int8, p.v, f.article_id FROM p CROSS JOIN LATERAL \
-               (SELECT f.article_id FROM favorites f WHERE f.user_id = p.v AND f.article_id = ANY(p.aa)) f \
+            "SELECT 0::int8, p.v, f.article_id FROM unnest($1::int8[], $3::int4[], $4::int4[]) p(v, s, e) \
+             CROSS JOIN LATERAL (SELECT f.article_id FROM favorites f \
+               WHERE f.user_id = p.v AND f.article_id = ANY(($2::int8[])[p.s : p.e])) f \
              UNION ALL \
-             SELECT 1::int8, q.v, fo.followee_id FROM q CROSS JOIN LATERAL \
-               (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = q.v AND fo.followee_id = ANY(q.uu)) fo",
-            &[INT8_ARRAY, INT8_ARRAY, INT8_ARRAY, INT8_ARRAY],
+             SELECT 1::int8, q.v, fo.followee_id FROM unnest($5::int8[], $7::int4[], $8::int4[]) q(v, s, e) \
+             CROSS JOIN LATERAL (SELECT fo.followee_id FROM follows fo \
+               WHERE fo.follower_id = q.v AND fo.followee_id = ANY(($6::int8[])[q.s : q.e])) fo",
+            &[INT8_ARRAY, INT8_ARRAY, INT4_ARRAY, INT4_ARRAY, INT8_ARRAY, INT8_ARRAY, INT4_ARRAY, INT4_ARRAY],
         ),
     ]
 }

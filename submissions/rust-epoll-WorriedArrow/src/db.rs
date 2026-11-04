@@ -18,7 +18,7 @@ use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use crate::json;
-use crate::pg::{self, ArrayBuf, Col, Conn, Param, Pipeline, INT8, TEXT};
+use crate::pg::{self, ArrayBuf, Col, Conn, Param, Pipeline, INT4, INT8, TEXT};
 use crate::queue::Queue;
 use crate::reply::{self, Body, ReplyTo, Response};
 
@@ -315,6 +315,28 @@ fn int_array(items: impl Iterator<Item = i64>) -> Vec<u8> {
     }
     a.finish();
     a.buf
+}
+
+/// Sorted (viewer, target) pairs as four arrays: distinct viewers, all targets, and each viewer's first and last
+/// target position (1-based, inclusive), for `ANY(targets[s : e])`.
+fn by_viewer(pairs: &[(i64, i64)]) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+    let (mut v, mut t, mut s, mut e) = (ArrayBuf::new(INT8), ArrayBuf::new(INT8), ArrayBuf::new(INT4), ArrayBuf::new(INT4));
+    let mut i = 0;
+    while i < pairs.len() {
+        let mut j = i;
+        while j < pairs.len() && pairs[j].0 == pairs[i].0 {
+            t.i64(pairs[j].1);
+            j += 1;
+        }
+        v.i64(pairs[i].0);
+        s.i32(i as i32 + 1);
+        e.i32(j as i32);
+        i = j;
+    }
+    for a in [&mut v, &mut t, &mut s, &mut e] {
+        a.finish();
+    }
+    (v.buf, t.buf, s.buf, e.buf)
 }
 
 fn owned(p: &Pipeline, c: Col) -> Option<Vec<u8>> {
@@ -931,13 +953,20 @@ impl ReadLane {
                 );
             }
             if b_flags.is_some() {
+                // Each viewer once, with the 1-based slice of its targets in the flat (sorted) target array.
+                let (v1, t1, s1, e1) = by_viewer(&fv);
+                let (v2, t2, s2, e2) = by_viewer(&fo);
                 o.bind_exec(
                     "flags",
                     &[
-                        Param::Raw(&int_array(fv.iter().map(|p| p.0))),
-                        Param::Raw(&int_array(fv.iter().map(|p| p.1))),
-                        Param::Raw(&int_array(fo.iter().map(|p| p.0))),
-                        Param::Raw(&int_array(fo.iter().map(|p| p.1))),
+                        Param::Raw(&v1),
+                        Param::Raw(&t1),
+                        Param::Raw(&s1),
+                        Param::Raw(&e1),
+                        Param::Raw(&v2),
+                        Param::Raw(&t2),
+                        Param::Raw(&s2),
+                        Param::Raw(&e2),
                     ],
                 );
             }

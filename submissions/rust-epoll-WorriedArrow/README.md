@@ -33,7 +33,7 @@ shared queue, of every endpoint, and answers the whole batch in two pipelined ro
    ids, favorite count and the author's profile in one statement. The newest articles show up in global lists, tag
    pages, feeds and article pages at the same time, and are enriched once per batch instead of once per request.
    The per-viewer `favorited` / `following` flags are one primary-key range scan per viewer (`= ANY(...)`) instead
-   of a probe per article.
+   of a probe per article; the server groups the pairs by viewer and sends each viewer's slice of one target array.
 
 Phase A sends a first `Sync` after the tag list, current-user and login lookups, so those requests (about a quarter
 of all traffic) are answered, or handed to bcrypt, before the rest of the batch and its phase B; every tag-list
@@ -57,7 +57,7 @@ distinct article in phase B. A feed's articles are by followed authors, so they 
 those authors each signed-in viewer of the thread follows. A comments batch has no phase B.
 
 **Forming batches.** Reads queue by class: feeds, comment threads, and the rest. Each class starts a batch at most
-every gap (75 ms, 80 ms for feeds), and a read is due at most gap + 5 ms after it arrives. At most `READ_ACTIVE`
+every gap (75 ms, 80 ms for feeds, 100 ms for comment threads), and a read is due at most gap + 5 ms after it arrives. At most `READ_ACTIVE`
 batches run at once, each class at most its share of the lanes, plus one for the class whose oldest read has waited
 longest, plus one for feeds and comments once their oldest read has waited 90 ms while the fast class has a lane to
 spare, plus one for any class whose oldest read has waited 300 ms. Feeds are 8% of requests but the dearest read,
@@ -88,8 +88,9 @@ unfavorites, follows, unfollows and new comments in a group are put next to thei
 loads, and interleaving independent hashes lets the core overlap them. How many lanes pay off depends on the CPU
 (its L1 and registers hold a few 4 KB S-box sets, not many). The lanes' states sit next to each other in memory, and
 on x86-64 with BMI1/BMI2 the cost loop can run a generated assembly expand0 (`build.rs`) that reaches every lane
-from one base register, in two styles of S-box index extraction. At startup the server times each kernel (that one in
-both styles, and the plain Rust one) at widths 1 to 6 on throwaway keys at a low cost and keeps the fastest per hash. One worker waits up to 400 ms for its lanes to fill; a second
+from one base register, in three styles of S-box index extraction (`shrx`, without the `bextr` Intel cores split in
+two micro-ops, is nick-potts's). At startup the server times each kernel (that one in all three styles, and the
+plain Rust one) at widths 1 to 6 on throwaway keys at a low cost and keeps the fastest per hash. One worker waits up to 400 ms for its lanes to fill; a second
 worker only takes full sets, so a steady trickle of logins isn't split into half-empty runs. Every hash still does all
 2^10 rounds; logins always verify against the stored hash.
 
@@ -137,7 +138,7 @@ Defaults suit the 8-vCPU box; all are optional environment variables.
 | `READ_LANES` | cores | read connections |
 | `FEED_CONN` | 1 | 1: each read lane runs its batch's feed statement on a second connection, alongside the rest of phase A |
 | `CLASS_LANES` | 1 | 1: reads queue by class (feeds, comment threads, the rest), each class a batch at most every gap; 0: one pool |
-| `GAP_FAST_US` / `GAP_CMTS_US` / `GAP_FEED_US` | 75000 / 75000 / 80000 | least time between two batches of a class |
+| `GAP_FAST_US` / `GAP_CMTS_US` / `GAP_FEED_US` | 75000 / 100000 / 80000 | least time between two batches of a class |
 | `BORROW_AGE_US` | 90000 | feeds and comments take a lane past their share once their oldest read has waited this long and the fast class has one to spare |
 | `STARVE_AGE_US` | 300000 | any class takes a lane past its share once its oldest read has waited this long |
 | `FEED_MERGE` | 1 | 1: each distinct followee read once per batch, feeds merged here; 0: per viewer in SQL |
@@ -183,6 +184,7 @@ kernel is a port of. Read classes with per-class gaps and caps, event loops at n
 phase B keys from `rust-epoll-theCatWisel` (#154, #201) and `zig-iouring-nick-potts` (#168); comment threads in one
 statement, list windows per key and shared unflagged bodies from `rust-epoll-theCatWisel` (#201, #205); feeds
 merged from one scan per followee from `c-epoll-unorig-username` (#203); `enable_memoize = off` from
-`swift-iouring-Tabonx` (#207).
+`swift-iouring-Tabonx` (#207); flags as per-viewer slices and tag counts settled by skipping 999 entries from
+`rust-epoll-theCatWisel` (#201); the `shrx` bcrypt kernel from `zig-iouring-nick-potts` (#168).
 
 Built with Claude (Anthropic).

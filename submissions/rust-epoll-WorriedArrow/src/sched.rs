@@ -23,9 +23,14 @@ pub const FEED: usize = 2;
 const CLASSES: usize = 3;
 const TIE: Duration = Duration::from_millis(2);
 
+/// Feeds in the fast class (FEED_CLASS=0): one batch then enriches the articles of lists, article pages and feeds
+/// together, each counted once, and the feed statement runs on the lane's second connection beside the rest.
+pub static FEED_OWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 pub fn class_of(r: &Read) -> usize {
     match r {
-        Read::Feed { .. } => FEED,
+        Read::Feed { .. } if FEED_OWN.load(std::sync::atomic::Ordering::Relaxed) => FEED,
+        Read::Feed { .. } => FAST,
         Read::Comments { .. } => CMTS,
         _ => FAST,
     }
