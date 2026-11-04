@@ -16,9 +16,10 @@ PORT = Integer(ENV.fetch("PORT", "3000"))
 DATABASE_URL = ENV.fetch("DATABASE_URL")
 SECRET = ENV.fetch("JWT_SECRET")
 WORKERS = Integer(ENV.fetch("WORKERS", Etc.nprocessors.to_s))
-# Per worker. Postgres used less CPU per query the fewer connections it had; pipelining keeps a few
-# busy. WORKERS x PG_CONNECTIONS must stay at 95 or below.
-PG_CONNECTIONS = Integer(ENV.fetch("PG_CONNECTIONS", "3"))
+# Per worker. Postgres used less CPU per query the fewer connections it had (1 instead of 3: -11% at
+# 4,000 local users); pipelining keeps one busy.
+# WORKERS x PG_CONNECTIONS must stay at 95 or below.
+PG_CONNECTIONS = Integer(ENV.fetch("PG_CONNECTIONS", "1"))
 abort "WORKERS x PG_CONNECTIONS = #{WORKERS * PG_CONNECTIONS} is over 95" if WORKERS * PG_CONNECTIONS > 95
 
 # The warm-up drives requests through http.rb's parser and the app over a socket pair; it never listens.

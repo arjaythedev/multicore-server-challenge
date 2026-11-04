@@ -103,7 +103,7 @@ module SQL
     tag_article: "INSERT INTO article_tags (article_id, tag_id) " \
                  "SELECT currval(pg_get_serial_sequence('articles', 'id')), t.id FROM tags t WHERE t.name = ANY($1::text[])",
     created_article: "SELECT '{\"article\":' || #{FULL}::text || '}' FROM articles a JOIN users u ON u.id = a.author_id " \
-                     "WHERE a.id = currval(pg_get_serial_sequence('articles', 'id'))",
+                     "WHERE a.id = (SELECT currval(pg_get_serial_sequence('articles', 'id')))", # once, as an InitPlan: a bare volatile currval() in WHERE can't use the primary key and scanned every article
     begin: "BEGIN",
     commit: "COMMIT",
     # $1 = viewer, $2 = slug, $3 title, $4 description, $5 body. Returns author_id and, if the viewer is the
