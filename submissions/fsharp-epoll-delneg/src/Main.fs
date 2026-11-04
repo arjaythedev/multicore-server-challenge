@@ -37,8 +37,12 @@ let main _ =
     let reads = num "PG_READS" 5
     let sideReads = num "PG_SIDE_READS" 3
     let writes = num "PG_WRITES" 4
-    let readClock = num "READ_CLOCK_US" 20000
-    Store.start url options reads sideReads writes readClock (num "SIDE_CLOCK_US" readClock) (num "READ_MAX" 2000) (num "WRITE_CLOCK_US" 5000) (num "WRITE_MAX" 256)
+    // READ_CLOCK_US fixes the read clock; otherwise it follows the load, between these
+    let clockFixed = num "READ_CLOCK_US" 0
+    let clockMin = if clockFixed > 0 then clockFixed else num "READ_CLOCK_MIN_US" 5000
+    let clockMax = if clockFixed > 0 then clockFixed else num "READ_CLOCK_MAX_US" 150000
+    Store.articlesOnSide <- env "ARTICLE_LANE" "side" = "side"
+    Store.start url options reads sideReads writes clockMin clockMax (float (env "READ_CLOCK_PER_RATE" "3")) (num "READ_MAX" 2000) (num "WRITE_CLOCK_US" 5000) (num "WRITE_MAX" 256)
     Io.handler <- Api.handle
     let host = env "HOST" "0.0.0.0"
     let port = num "PORT" 3000

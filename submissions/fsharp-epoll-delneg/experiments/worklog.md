@@ -225,3 +225,6 @@ Script: `experiments/h.sh`.
   Replay on that DB: bound + per-followee LATERAL for feeds: no change (45.8 vs 45.6 ms); probing followees per viewer instead of whole lists: worse for `rd` (58 ms) and comments (17 vs 10 ms).
 - **e25, READ_CLOCK_US on the aged DB, 180k users (side lane follows it):** 20 ms 151.2, 149.0 µs/req (PG 102, 100; p95 198, 184); 50 ms 135.8 (PG 85.9; p95 261); 100 ms 130.9 (PG 80.6; p95 272); 150 ms 128.3 (PG 79.6; p95 265). -15% total CPU: on an aged
   DB the cost per batch is mostly fixed by the viral articles, so fewer batches pay directly.
+- **e27: single-article reads in the side lane, with a slower clock there** (the viral articles arrive by deep link, so this counts them less often): aged DB, 180k: baseline 148.6, 149.1 µs/req; side lane at 100 ms 141.7, 140.9 (p95 ~245); at 200 ms
+  142.8; side 100 + read 50 ms 135.2, no better than both lanes at 50 ms (135.8); comments alone on the slower clock 145.0. Less than the same clock on all reads (130.9 at 100 ms), so lists read those articles too.
+- **e28: the read clock follows the load:** 3 µs of clock per job/s across both read lanes, smoothed over about a second, 5 to 150 ms, so ~15 ms at 25k users, the ceiling above ~200k users. A fixed clock would either add 100 ms to every read when quiet or waste CPU when busy.

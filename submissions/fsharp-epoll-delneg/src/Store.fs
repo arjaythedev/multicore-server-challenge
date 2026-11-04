@@ -97,13 +97,18 @@ let private ticksPerUs = float Stopwatch.Frequency / 1e6
 type Lane<'T when 'T :> Job>(clockUs: int, maxBatch: int) =
     let q = Queue<'T>()
     let gate = obj ()
-    let clock = int64 (float clockUs * ticksPerUs)
+    let mutable clock = int64 (float clockUs * ticksPerUs)
     let mutable leader = false
+    let mutable pushed = 0L
     member _.Count = q.Count
+    /// jobs so far (read without the lock: only ever used as a rate)
+    member _.Pushed = Volatile.Read(&pushed)
+    member _.SetClockUs(us: int) = Volatile.Write(&clock, int64 (float us * ticksPerUs))
 
     member _.Push(j: 'T) =
         j.T <- Stopwatch.GetTimestamp()
         lock gate (fun () ->
+            pushed <- pushed + 1L
             q.Enqueue j
             if (q.Count = 1 && not leader) || q.Count = maxBatch then Monitor.Pulse gate)
 
@@ -823,6 +828,8 @@ type private Reader(c: Conn) =
 /// lists, articles and tags (the `rd` statement) on one; comments, profiles, users and logins on the other.
 let mutable readLane: Lane<RJob> = Unchecked.defaultof<_>
 let mutable sideLane: Lane<RJob> = Unchecked.defaultof<_>
+/// Single-article reads go in the side lane, with comments
+let mutable articlesOnSide = true
 let mutable writeLane: Lane<WJob> = Unchecked.defaultof<_>
 
 /// No cap and no 503: a connection has at most one request in flight (the next one waits unparsed until it is
@@ -830,6 +837,8 @@ let mutable writeLane: Lane<WJob> = Unchecked.defaultof<_>
 let pushRead (j: RJob) =
     let lane =
         match j.Kind with
+        | RKind.Article when not articlesOnSide -> readLane
+        | RKind.Article
         | RKind.Comments
         | RKind.Profile
         | RKind.User
@@ -1238,9 +1247,9 @@ let private writeThread (url: string) (options: string) () =
             wr <- Writer(c)
 
 /// Opens the connections (each prepares every statement) and starts their threads.
-let start (url: string) (options: string) (reads: int) (sideReads: int) (writes: int) (readClockUs: int) (sideClockUs: int) (readMax: int) (writeClockUs: int) (writeMax: int) =
-    readLane <- Lane<RJob>(readClockUs, readMax)
-    sideLane <- Lane<RJob>(sideClockUs, readMax)
+let start (url: string) (options: string) (reads: int) (sideReads: int) (writes: int) (clockMinUs: int) (clockMaxUs: int) (clockUsPerRate: float) (readMax: int) (writeClockUs: int) (writeMax: int) =
+    readLane <- Lane<RJob>(clockMinUs, readMax)
+    sideLane <- Lane<RJob>(clockMinUs, readMax)
     writeLane <- Lane<WJob>(writeClockUs, writeMax)
     // fail at startup, not on the first request, if a statement doesn't prepare
     (connect url options "conduit-check" :> IDisposable).Dispose()
@@ -1250,6 +1259,24 @@ let start (url: string) (options: string) (reads: int) (sideReads: int) (writes:
         Thread(readThread sideLane "conduit-side" url options, IsBackground = true, Name = sprintf "pg-side-%d" i).Start()
     for i in 1 .. writes do
         Thread(writeThread url options, IsBackground = true, Name = sprintf "pg-write-%d" i).Start()
+    // The read clock follows the load. Part of a batch's cost is the same however many requests it holds: above all the
+    // favorite counts of the few most-read articles, which grow through a run and are read again by every batch. So when
+    // busy, fewer and bigger batches save the most, and there's most to save; when quiet, a request needn't wait.
+    if clockMaxUs > clockMinUs then
+        Thread((fun () ->
+                    let mutable last = 0L
+                    let mutable rate = 0.0
+                    while true do
+                        Sys.usleep 100000u |> ignore
+                        let n = readLane.Pushed + sideLane.Pushed
+                        rate <- 0.7 * rate + 0.3 * float (n - last) * 10.0 // jobs/s, smoothed over about a second
+                        last <- n
+                        let us = max clockMinUs (min clockMaxUs (int (rate * clockUsPerRate)))
+                        readLane.SetClockUs us
+                        sideLane.SetClockUs us),
+               IsBackground = true,
+               Name = "read-clock")
+            .Start()
     if stats then
         Thread((fun () ->
                     while true do
