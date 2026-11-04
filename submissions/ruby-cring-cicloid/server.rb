@@ -16,7 +16,9 @@ HOST = ENV.fetch("HOST", "127.0.0.1")
 PORT = Integer(ENV.fetch("PORT", "3000"))
 DATABASE_URL = ENV.fetch("DATABASE_URL")
 SECRET = ENV.fetch("JWT_SECRET")
-WORKERS = Integer(ENV.fetch("WORKERS", Etc.nprocessors.to_s))
+# Workers: three quarters of the cores by default. Postgres runs on the same box, and fewer workers make
+# bigger read batches (locally 6 of 8 passed 20,000 users where 8 failed).
+WORKERS = Integer(ENV.fetch("WORKERS", [Etc.nprocessors * 3 / 4, 1].max.to_s))
 # Per worker. Postgres used less CPU per query the fewer connections it had (1 instead of 3: -11% at
 # 4,000 local users); pipelining keeps one busy.
 # WORKERS x PG_CONNECTIONS must stay at 95 or below.

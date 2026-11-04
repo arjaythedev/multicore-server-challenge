@@ -13,7 +13,7 @@ require "pg"
 # While one batch runs the next one collects, so the busier the worker, the bigger (and cheaper per
 # request) the batches.
 class Planner
-  WINDOW = Float(ENV.fetch("READ_WINDOW_MS", "20")) / 1000
+  WINDOW = Float(ENV.fetch("READ_WINDOW_MS", "40")) / 1000 # 20 ms: more Postgres CPU per request locally
   MAX = Integer(ENV.fetch("READ_MAX", "512")) # requests per batch; a backlog runs as several batches
 
   # One read request. `kind` and `args` say what it wants; `document` (or `missing`) is the answer.
