@@ -493,6 +493,19 @@ impl ReadLane {
         let s_cmts = slot(cmts.len() > 0);
         let s_global = slot(global.len() > 0);
         let s_lists: [Option<usize>; 3] = std::array::from_fn(|f| slot(lists[f].page.len() > 0));
+        // Several pages of the same tag, author or favorites list in one batch read one window per key (as deep as the
+        // deepest page asked for, up to 200 rows), sliced into pages here, instead of one scan per page.
+        let wins: [Option<Vec<i64>>; 3] = std::array::from_fn(|f| {
+            let l = &lists[f];
+            if l.page.len() <= l.count.len() || !l.page.list.iter().all(|k| k.1 >= 0 && k.2 >= 0 && k.1 + k.2 <= 200) {
+                return None;
+            }
+            let mut depth = vec![0i64; l.count.len()];
+            for k in &l.page.list {
+                depth[k.0 as usize] = depth[k.0 as usize].max(k.1 + k.2);
+            }
+            Some(depth)
+        });
         let s_feed = slot(feed.len() > 0 && !split);
 
         let o = &mut conn.out;
@@ -531,15 +544,28 @@ impl ReadLane {
         for f in 0..3 {
             if s_lists[f].is_some() {
                 let l = &lists[f];
-                o.bind_exec(
-                    LIST_STMTS[f],
-                    &[
-                        Param::Raw(&texts(&l.count)),
-                        Param::Raw(&text_array(l.page.list.iter().map(|k| l.count.list[k.0 as usize].as_bytes()))),
-                        Param::Raw(&int_array(l.page.list.iter().map(|k| k.1))),
-                        Param::Raw(&int_array(l.page.list.iter().map(|k| k.2))),
-                    ],
-                );
+                if let Some(w) = &wins[f] {
+                    // One window per key, from the newest row to the deepest page any request of the batch asks for.
+                    o.bind_exec(
+                        LIST_STMTS[f],
+                        &[
+                            Param::Raw(&texts(&l.count)),
+                            Param::Raw(&texts(&l.count)),
+                            Param::Raw(&int_array(w.iter().copied())),
+                            Param::Raw(&int_array(w.iter().map(|_| 0))),
+                        ],
+                    );
+                } else {
+                    o.bind_exec(
+                        LIST_STMTS[f],
+                        &[
+                            Param::Raw(&texts(&l.count)),
+                            Param::Raw(&text_array(l.page.list.iter().map(|k| l.count.list[k.0 as usize].as_bytes()))),
+                            Param::Raw(&int_array(l.page.list.iter().map(|k| k.1))),
+                            Param::Raw(&int_array(l.page.list.iter().map(|k| k.2))),
+                        ],
+                    );
+                }
             }
         }
         if s_feed.is_some() {
@@ -658,8 +684,26 @@ impl ReadLane {
         let by_id = first_row(s_aid, aid.len());
 
         let (gcount, gpages) = decode_list(&pa, s_global, 1, global.len());
-        let decoded: Vec<(Vec<i64>, Vec<PageRows>)> =
-            (0..3).map(|f| decode_list(&pa, s_lists[f], lists[f].count.len(), lists[f].page.len())).collect();
+        let decoded: Vec<(Vec<i64>, Vec<PageRows>)> = (0..3)
+            .map(|f| {
+                let l = &lists[f];
+                if wins[f].is_none() {
+                    return decode_list(&pa, s_lists[f], l.count.len(), l.page.len());
+                }
+                let (counts, win) = decode_list(&pa, s_lists[f], l.count.len(), l.count.len());
+                let pages = l
+                    .page
+                    .list
+                    .iter()
+                    .map(|&(c, lim, off)| {
+                        let w = &win[c as usize];
+                        let start = (off as usize).min(w.len());
+                        w[start..(start + lim as usize).min(w.len())].to_vec()
+                    })
+                    .collect();
+                (counts, pages)
+            })
+            .collect();
 
         let (fcount, fpages) = match &pf {
             Some(p) => decode_list(p, Some(0), feed.len(), feedpage.len()),

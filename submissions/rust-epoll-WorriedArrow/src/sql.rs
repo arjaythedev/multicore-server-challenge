@@ -139,7 +139,7 @@ pub fn read_statements() -> Vec<Stmt> {
                      (SELECT a.id FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC LIMIT 1 OFFSET h.depth - 1) AS floor_id, \
                      EXISTS (SELECT 1 FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC LIMIT 1 OFFSET 999) AS big \
                    FROM (SELECT f.fid, max(u.depth) AS depth FROM u, unnest(u.fids) f(fid) \
-                     GROUP BY f.fid HAVING count(*) >= 2 ORDER BY count(*) DESC, f.fid LIMIT 32) h), \
+                     GROUP BY f.fid HAVING count(*) >= 2 ORDER BY count(*) DESC, f.fid LIMIT 48) h), \
                  big AS MATERIALIZED (SELECT ARRAY(SELECT fid FROM hubs WHERE big) AS fids) \
                  SELECT -u.k, CASE WHEN u.fids && (SELECT fids FROM big) THEN 1000::int8 \
                    ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = ANY(u.fids) LIMIT 1000) s) END, {PAD} \
