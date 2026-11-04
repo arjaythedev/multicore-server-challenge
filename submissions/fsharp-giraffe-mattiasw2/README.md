@@ -104,7 +104,8 @@ and never inside SQL, a transaction or a commit group.
     comments.
   - **Phase B (one round trip).** Everything shown, once per **batch** and across every kind of request: each
     distinct article's card (columns, tags, favorite count, author), whether a list or an article page shows it; and
-    the viewers' flags as two sets, (viewer, article) favorited and (viewer, user) following. The flags are one
+    the viewers' flags as two sets, (viewer, article) favorited and (viewer, user) following. The cards are four
+    flat statements over the batch's articles, put together in F# (see [SQL](#sql)). The flags are one
     statement: each article's author is looked up once, and each viewer's pairs are one index range scan
     (`= ANY`), not one probe per pair.
   - **Assemble (pure).** Each request's answer is built from those maps. Requests that show the same article share one
@@ -183,8 +184,17 @@ statement per kind, see above):
 - **Lists:** the count, the page's ids and their cards are one statement. The page is chosen by id first and the card
   columns are built only for its rows, so a huge `offset` skips index entries instead of computing tag arrays and
   counts for every skipped article. An empty page still returns the count.
-- **Tag names:** each is one `tags` primary-key probe, sorted in SQL. Written as a join, the planner may hash the
-  whole tags table once per article shown.
+- **Cards (phase B):** four statements over all of a batch's articles, not one per article with subqueries:
+  - the tags table (200 rows), `ORDER BY name`;
+  - the cards' (article, tag id) pairs, one `article_id = ANY` index-only scan;
+  - the favorite counts, one `article_id = ANY … GROUP BY` index-only scan;
+  - the cards' columns and authors.
+
+  F# names each card's tags and orders them by their position in the tags table. That is the spec's `ORDER BY
+  t.name` in the database's collation (`en_US.utf8`, not .NET's ordering), with no `tags` probe per tag. On the
+  seed, 1,000 cards took 9.9 ms as one statement with the tag names and counts inside, 4.2 ms as these four.
+  On 6 vCPUs, 135k users went from a fail (p95 826 ms, the queue growing) to a pass (p95 445, p99 576 ms), and 125k
+  went from p95 355–376 to 279 ms.
 - **Global count:** walks the primary key from the oldest end (`ORDER BY id LIMIT 1000`). Those pages are
   all-visible, so it is an index-only scan.
 - **Feed count:** a viewer who follows an author with 1,000 or more articles has a feed of at least 1,000. Each batch
@@ -382,9 +392,10 @@ Ideas taken from other entries; the code here is our own.
   - comment threads in the first round trip, so the second one knows the comment authors, and the favorited and
     following flags as one statement with one `= ANY` range scan per viewer (their two-phase planner, which they
     credit to `rust-epoll-WorriedArrow`);
-  - tag names by a primary-key probe per tag instead of a join;
   - letting a login wait 150 ms for bcrypt batch-mates;
   - their Openwall crypt_blowfish with interleaved lanes, as the yardstick our F# bcrypt was tuned against.
+- `rust-epoll-theCatWisel` (PR #201): the tags table read once per batch, and tag ids instead of names per card.
+- `c-epoll-unorig-username` (PR #203): the cards' tag ids as one `article_id = ANY` statement.
 
 Read batching and group commit themselves come from an earlier presentation (rule 6 allows several requests'
 writes in one transaction).
