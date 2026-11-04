@@ -14,6 +14,7 @@ bundle install --jobs 4
 NATIVE=""
 [ "$(uname -m)" = x86_64 ] && NATIVE="-march=native"
 (cd ext/ring && NATIVE="$NATIVE" ruby extconf.rb > /dev/null && make clean > /dev/null && make)
+(cd ext/fmt && NATIVE="$NATIVE" ruby extconf.rb > /dev/null && make clean > /dev/null && make)
 (cd ext/jwt && NATIVE="$NATIVE" ruby extconf.rb > /dev/null && make clean > /dev/null && make)
 (cd ext/bcrypt && NATIVE="$NATIVE" ruby extconf.rb > /dev/null && make clean > /dev/null && make)
 ruby -r ./ext/bcrypt/bcrypt_lanes -e 'abort "bcrypt self-test failed" unless BcryptLanes.self_test'

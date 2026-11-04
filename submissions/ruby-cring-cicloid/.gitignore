@@ -12,3 +12,7 @@ ext/jwt/Makefile
 ext/jwt/*.o
 ext/jwt/*.so
 ext/jwt/mkmf.log
+ext/fmt/Makefile
+ext/fmt/*.o
+ext/fmt/*.so
+ext/fmt/mkmf.log

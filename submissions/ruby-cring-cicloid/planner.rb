@@ -2,6 +2,7 @@
 
 require "json"
 require "pg"
+require_relative "ext/fmt/fmt"
 
 # Batched reads for one worker process. A read request joins the current batch and its fiber waits; the
 # first request of a batch opens a window (READ_WINDOW_MS), and when it closes the whole batch goes to
@@ -197,9 +198,7 @@ class Planner
       found.each do |k, list|
         list.sort_by! { |row| row[10].to_i } # newest first (n from the statement)
         rendered[k] = list.map do |row|
-          ["{\"id\":#{row[2]},\"createdAt\":\"#{time(row[4])}\",\"updatedAt\":\"#{time(row[5])}\",\"body\":#{str(row[3])}," \
-           "\"author\":{\"username\":#{str(row[7])},\"bio\":#{str(row[8])},\"image\":#{str(row[9])},\"following\":",
-           row[6].to_i]
+          [Fmt.comment(row[2], row[4], row[5], row[3], row[7], row[8], row[9]), row[6].to_i]
         end
       end
       anonymous = {} # k => document
@@ -358,12 +357,8 @@ class Planner
   # per batch, joined per request.
   def fragments(article, tag_names, favorites, username, bio, image)
     row = article[:row]
-    head = "{\"slug\":#{str(row[3])},\"title\":#{str(row[4])},\"description\":#{str(row[5])}"
-    tail = ",\"tagList\":[#{tag_names.join(",")}],\"createdAt\":\"#{time(row[6])}\",\"updatedAt\":\"#{time(row[7])}\",\"favorited\":"
-    middle = ",\"favoritesCount\":#{favorites},\"author\":{\"username\":#{str(username)},\"bio\":#{str(bio)}," \
-             "\"image\":#{str(image)},\"following\":"
-    body = article[:body] && ",\"body\":#{str(article[:body])}"
-    [head, body, tail, middle]
+    Fmt.article(row[3], row[4], row[5], article[:body], "[#{tag_names.join(",")}]", row[6], row[7], favorites,
+                username, bio, image)
   end
 
   def article_json(id, viewer, body:)
@@ -377,15 +372,10 @@ class Planner
   # --- formatting ---------------------------------------------------------------------------------------
 
   # A JSON string, or null.
-  def str(value) = value.nil? ? NULL : JSON.generate(value)
+  def str(value) = Fmt.str(value)
 
-  # "2024-09-15 14:22:31.123456+00" (Postgres text, TimeZone UTC) -> "2024-09-15T14:22:31.123" (truncated to
-  # milliseconds; the fraction is absent when it is zero) + "Z".
-  def time(text)
-    frac = text.getbyte(19) == 46 ? text.byteslice(20, 3).ljust(3, "0").tr("+", "0") : "000"
-    frac = frac.gsub(/[^0-9]/, "0") unless frac.match?(/\A[0-9]{3}\z/)
-    "#{text.byteslice(0, 10)}T#{text.byteslice(11, 8)}.#{frac}Z"
-  end
+  # Postgres text (TimeZone UTC) -> "2024-09-15T14:22:31.123Z", milliseconds truncated.
+  def time(text) = Fmt.time(text)
 
   def parse_ids(text)
     return [] if text.bytesize <= 2
