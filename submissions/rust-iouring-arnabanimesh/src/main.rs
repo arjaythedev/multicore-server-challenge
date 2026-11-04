@@ -62,7 +62,7 @@ fn wait_for_free_port(addr: SocketAddr) {
                 }
                 if Instant::now() >= deadline {
                     fatal(&format!(
-                        "{} is still in use ({}). Is an old conduit-uring running? Check: pgrep -af conduit-uring",
+                        "{} is still in use ({}). Is an old conduit running? Check: pgrep -af conduit",
                         addr, e
                     ));
                 }
@@ -240,7 +240,7 @@ fn connect_with_retry(
                     if msg.contains("53300") {
                         eprintln!(
                             "  hint: postgres is out of connection slots - another instance (or an earlier run) is still connected. \
-                             Look at: SELECT application_name, state, count(*) FROM pg_stat_activity GROUP BY 1, 2;  and  pgrep -af conduit-uring"
+                             Look at: SELECT application_name, state, count(*) FROM pg_stat_activity GROUP BY 1, 2;  and  pgrep -af conduit"
                         );
                     }
                 }

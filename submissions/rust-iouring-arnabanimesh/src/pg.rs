@@ -7,13 +7,11 @@
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
-use std::num::NonZeroU32;
 use std::os::unix::io::IntoRawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
-use ring::rand::{SecureRandom, SystemRandom};
-use ring::{digest, hmac, pbkdf2};
+use postgres_protocol::authentication::sasl::{ChannelBinding, ScramSha256};
+use bytes::{Buf, BufMut};
 
 use crate::sql;
 
@@ -172,11 +170,11 @@ pub fn parse_msg(tx: &mut Vec<u8>, name: &[u8], sql_text: &str, oids: &[u32]) {
 #[inline]
 pub fn bind_begin(tx: &mut Vec<u8>, name: &[u8], nparams: u16) -> usize {
     let s = msg_begin(tx, b'B');
-    tx.push(0); // portal ""
-    tx.extend_from_slice(name);
-    tx.extend_from_slice(&1u16.to_be_bytes()); // one parameter format code ...
-    tx.extend_from_slice(&1u16.to_be_bytes()); // ... binary, applied to every parameter
-    tx.extend_from_slice(&nparams.to_be_bytes());
+    tx.put_u8(0); // portal ""
+    tx.put_slice(name);
+    tx.put_u16(1); // one parameter format code
+    tx.put_u16(1); // binary
+    tx.put_u16(nparams);
     s
 }
 
@@ -196,8 +194,8 @@ pub fn sync(tx: &mut Vec<u8>) {
 
 #[inline]
 pub fn p_i64(tx: &mut Vec<u8>, v: i64) {
-    tx.extend_from_slice(&8i32.to_be_bytes());
-    tx.extend_from_slice(&v.to_be_bytes());
+    tx.put_i32(8);
+    tx.put_i64(v);
 }
 
 #[inline]
@@ -221,19 +219,16 @@ pub fn p_opt_text(tx: &mut Vec<u8>, v: Option<&str>) {
 
 /// Binary text[] (one dimension, no NULL elements).
 pub fn p_text_array(tx: &mut Vec<u8>, items: &[String]) {
-    let mut total: usize = 20;
+    let total: usize = 20 + items.iter().map(|it| 4 + it.len()).sum::<usize>();
+    tx.put_i32(total as i32);
+    tx.put_i32(1); // ndim
+    tx.put_i32(0); // has nulls
+    tx.put_i32(25); // OID: TEXT
+    tx.put_i32(items.len() as i32);
+    tx.put_i32(1); // lower bound
     for it in items {
-        total += 4 + it.len();
-    }
-    tx.extend_from_slice(&(total as i32).to_be_bytes());
-    tx.extend_from_slice(&1i32.to_be_bytes()); // ndim
-    tx.extend_from_slice(&0i32.to_be_bytes()); // has nulls
-    tx.extend_from_slice(&25i32.to_be_bytes()); // element type: text
-    tx.extend_from_slice(&(items.len() as i32).to_be_bytes()); // dimension size
-    tx.extend_from_slice(&1i32.to_be_bytes()); // lower bound
-    for it in items {
-        tx.extend_from_slice(&(it.len() as i32).to_be_bytes());
-        tx.extend_from_slice(it.as_bytes());
+        tx.put_i32(it.len() as i32);
+        tx.put_slice(it.as_bytes());
     }
 }
 
@@ -307,55 +302,46 @@ impl Scan {
 /// Column reader for one binary DataRow payload.
 pub struct RowReader<'a> {
     d: &'a [u8],
-    p: usize,
 }
 
 impl<'a> RowReader<'a> {
     pub fn new(rx: &'a [u8], r: (u32, u32)) -> RowReader<'a> {
         let s = r.0 as usize;
         let e = s + r.1 as usize;
-        RowReader { d: &rx[s..e], p: 2 } // skip the i16 column count
+        // Skip the 2-byte column count header directly
+        RowReader { d: &rx[s + 2..e] }
     }
 
-    /// Next column; None means SQL NULL.
     pub fn field(&mut self) -> Option<&'a [u8]> {
-        if self.p + 4 > self.d.len() {
+        if self.d.len() < 4 {
             return None;
         }
-        let len = i32::from_be_bytes([self.d[self.p], self.d[self.p + 1], self.d[self.p + 2], self.d[self.p + 3]]);
-        self.p += 4;
+        let len = self.d.get_i32();
         if len < 0 {
             return None;
         }
         let l = len as usize;
-        if self.p + l > self.d.len() {
+        if self.d.len() < l {
             return None;
         }
-        let s = &self.d[self.p..self.p + l];
-        self.p += l;
-        Some(s)
+        let (val, rest) = self.d.split_at(l);
+        self.d = rest;
+        Some(val)
     }
 
-    /// Next column, NULL treated as empty.
     pub fn bytes(&mut self) -> &'a [u8] {
-        match self.field() {
-            Some(s) => s,
-            None => &[],
-        }
+        self.field().unwrap_or(&[])
     }
 
     pub fn int8(&mut self) -> i64 {
         match self.field() {
-            Some(s) if s.len() == 8 => i64::from_be_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]),
+            Some(mut s) if s.len() == 8 => s.get_i64(),
             _ => 0,
         }
     }
 
     pub fn boolean(&mut self) -> bool {
-        match self.field() {
-            Some(s) if !s.is_empty() => s[0] != 0,
-            _ => false,
-        }
+        matches!(self.field(), Some([b, ..]) if *b != 0)
     }
 }
 
@@ -406,200 +392,80 @@ fn read_msg(s: &mut TcpStream) -> io::Result<(u8, Vec<u8>)> {
     Ok((hdr[0], payload))
 }
 
-fn contains(hay: &[u8], needle: &[u8]) -> bool {
-    hay.windows(needle.len()).any(|w| w == needle)
-}
-
-struct Scram {
-    client_first_bare: String,
-    nonce: String,
-    server_sig: Vec<u8>,
-}
-
-impl Scram {
-    fn start() -> io::Result<(Scram, Vec<u8>)> {
-        let rng = SystemRandom::new();
-        let mut raw = [0u8; 18];
-        rng.fill(&mut raw).map_err(|_| proto("random generator failed"))?;
-        let mut nonce = String::with_capacity(36);
-        for b in raw.iter() {
-            nonce.push_str(&format!("{:02x}", b));
-        }
-        let bare = format!("n=,r={}", nonce);
-        let first = format!("n,,{}", bare).into_bytes();
-        Ok((
-            Scram {
-                client_first_bare: bare,
-                nonce,
-                server_sig: Vec::new(),
-            },
-            first,
-        ))
-    }
-
-    fn client_final(&mut self, server_first: &str, password: &str) -> io::Result<Vec<u8>> {
-        let mut r: Option<&str> = None;
-        let mut salt_b64: Option<&str> = None;
-        let mut iter: Option<&str> = None;
-        for part in server_first.split(',') {
-            if let Some(v) = part.strip_prefix("r=") {
-                r = Some(v);
-            } else if let Some(v) = part.strip_prefix("s=") {
-                salt_b64 = Some(v);
-            } else if let Some(v) = part.strip_prefix("i=") {
-                iter = Some(v);
-            }
-        }
-        let r = r.ok_or_else(|| proto("SCRAM: missing nonce"))?;
-        let salt_b64 = salt_b64.ok_or_else(|| proto("SCRAM: missing salt"))?;
-        let iter = iter.ok_or_else(|| proto("SCRAM: missing iteration count"))?;
-        if !r.starts_with(self.nonce.as_str()) {
-            return Err(proto("SCRAM: server nonce does not extend client nonce"));
-        }
-        let salt = STANDARD
-            .decode(salt_b64)
-            .map_err(|_| proto("SCRAM: bad salt encoding"))?;
-        let iterations: u32 = iter.parse().map_err(|_| proto("SCRAM: bad iteration count"))?;
-        let iterations = NonZeroU32::new(iterations).ok_or_else(|| proto("SCRAM: zero iterations"))?;
-
-        let mut salted = [0u8; 32];
-        pbkdf2::derive(
-            pbkdf2::PBKDF2_HMAC_SHA256,
-            iterations,
-            &salt,
-            password.as_bytes(),
-            &mut salted,
-        );
-        let salted_key = hmac::Key::new(hmac::HMAC_SHA256, &salted);
-        let client_key_tag = hmac::sign(&salted_key, b"Client Key");
-        let client_key: &[u8] = client_key_tag.as_ref();
-        let stored_key_d = digest::digest(&digest::SHA256, client_key);
-        let stored_key: &[u8] = stored_key_d.as_ref();
-
-        let client_final_no_proof = format!("c=biws,r={}", r);
-        let auth_message = format!(
-            "{},{},{}",
-            self.client_first_bare, server_first, client_final_no_proof
-        );
-        let stored = hmac::Key::new(hmac::HMAC_SHA256, stored_key);
-        let client_sig_tag = hmac::sign(&stored, auth_message.as_bytes());
-        let client_sig: &[u8] = client_sig_tag.as_ref();
-        let mut proof = [0u8; 32];
-        for i in 0..32 {
-            proof[i] = client_key[i] ^ client_sig[i];
-        }
-
-        let server_key_tag = hmac::sign(&salted_key, b"Server Key");
-        let server_key: &[u8] = server_key_tag.as_ref();
-        let skey = hmac::Key::new(hmac::HMAC_SHA256, server_key);
-        let server_sig_tag = hmac::sign(&skey, auth_message.as_bytes());
-        let server_sig: &[u8] = server_sig_tag.as_ref();
-        self.server_sig = server_sig.to_vec();
-
-        Ok(format!("{},p={}", client_final_no_proof, STANDARD.encode(proof)).into_bytes())
-    }
-
-    fn verify(&self, server_final: &str) -> io::Result<()> {
-        let v = server_final
-            .trim()
-            .strip_prefix("v=")
-            .ok_or_else(|| proto("SCRAM: bad server-final message"))?;
-        let got = STANDARD
-            .decode(v)
-            .map_err(|_| proto("SCRAM: bad server signature encoding"))?;
-        if got != self.server_sig {
-            return Err(proto("SCRAM: server signature mismatch"));
-        }
-        Ok(())
-    }
-}
-
 fn startup(s: &mut TcpStream, cfg: &PgConfig) -> io::Result<()> {
     let mut m: Vec<u8> = Vec::with_capacity(128);
-    m.extend_from_slice(&[0, 0, 0, 0]);
-    m.extend_from_slice(&196_608u32.to_be_bytes()); // protocol 3.0
-    let params: [(&str, &str); 4] = [
+    m.put_u32(0);
+    m.put_u32(196_608); // protocol 3.0
+    for (k, v) in [
         ("user", cfg.user.as_str()),
         ("database", cfg.dbname.as_str()),
         ("application_name", "conduit"),
         ("client_encoding", "UTF8"),
-    ];
-    for (k, v) in params.iter() {
-        m.extend_from_slice(k.as_bytes());
-        m.push(0);
-        m.extend_from_slice(v.as_bytes());
-        m.push(0);
+    ] {
+        m.put_slice(k.as_bytes());
+        m.put_u8(0);
+        m.put_slice(v.as_bytes());
+        m.put_u8(0);
     }
-    m.push(0);
+    m.put_u8(0);
     let len = m.len() as u32;
     m[0..4].copy_from_slice(&len.to_be_bytes());
     s.write_all(&m)?;
 
-    let mut scram: Option<Scram> = None;
+    let mut scram: Option<ScramSha256> = None;
     loop {
         let (tag, payload) = read_msg(s)?;
         match tag {
             b'R' => {
-                if payload.len() < 4 {
+                let mut p = payload.as_slice();
+                if p.len() < 4 {
                     return Err(proto("short authentication message"));
                 }
-                let code = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                match code {
+                match p.get_i32() {
                     0 => {}
                     3 => {
                         let mut out = Vec::with_capacity(cfg.password.len() + 8);
                         let b = msg_begin(&mut out, b'p');
-                        out.extend_from_slice(cfg.password.as_bytes());
-                        out.push(0);
+                        out.put_slice(cfg.password.as_bytes());
+                        out.put_u8(0);
                         msg_end(&mut out, b);
                         s.write_all(&out)?;
                     }
                     10 => {
-                        if !contains(&payload[4..], b"SCRAM-SHA-256") {
+                        if !p.windows(13).any(|w| w == b"SCRAM-SHA-256") {
                             return Err(proto("server offers no SCRAM-SHA-256"));
                         }
-                        let (st, first) = Scram::start()?;
+                        let st = ScramSha256::new(cfg.password.as_bytes(), ChannelBinding::unsupported());
+                        let first = st.message();
                         let mut out = Vec::with_capacity(64 + first.len());
                         let b = msg_begin(&mut out, b'p');
-                        out.extend_from_slice(b"SCRAM-SHA-256\0");
-                        out.extend_from_slice(&(first.len() as i32).to_be_bytes());
-                        out.extend_from_slice(&first);
+                        out.put_slice(b"SCRAM-SHA-256\0");
+                        out.put_i32(first.len() as i32);
+                        out.put_slice(first);
                         msg_end(&mut out, b);
                         s.write_all(&out)?;
                         scram = Some(st);
                     }
                     11 => {
-                        let st = match scram.as_mut() {
-                            Some(st) => st,
-                            None => return Err(proto("unexpected SASLContinue")),
-                        };
-                        let server_first = String::from_utf8_lossy(&payload[4..]).into_owned();
-                        let fin = st.client_final(&server_first, &cfg.password)?;
+                        let st = scram.as_mut().ok_or_else(|| proto("unexpected SASLContinue"))?;
+                        st.update(p).map_err(|e| proto(&e.to_string()))?;
+                        let fin = st.message();
                         let mut out = Vec::with_capacity(32 + fin.len());
                         let b = msg_begin(&mut out, b'p');
-                        out.extend_from_slice(&fin);
+                        out.put_slice(fin);
                         msg_end(&mut out, b);
                         s.write_all(&out)?;
                     }
                     12 => {
-                        let st = match scram.as_ref() {
-                            Some(st) => st,
-                            None => return Err(proto("unexpected SASLFinal")),
-                        };
-                        let server_final = String::from_utf8_lossy(&payload[4..]).into_owned();
-                        st.verify(&server_final)?;
+                        let st = scram.as_mut().ok_or_else(|| proto("unexpected SASLFinal"))?;
+                        st.finish(p).map_err(|e| proto(&e.to_string()))?;
                     }
-                    5 => return Err(proto("server requested md5 authentication (unsupported)")),
-                    other => {
-                        return Err(proto(&format!("unsupported authentication request {}", other)))
-                    }
+                    other => return Err(proto(&format!("unsupported auth request {}", other))),
                 }
             }
-            b'E' => {
-                return Err(proto(&format!("startup failed: {}", error_text(&payload))));
-            }
+            b'E' => return Err(proto(&format!("startup failed: {}", error_text(&payload)))),
             b'Z' => return Ok(()),
-            _ => {} // ParameterStatus, BackendKeyData, NoticeResponse
+            _ => {}
         }
     }
 }
