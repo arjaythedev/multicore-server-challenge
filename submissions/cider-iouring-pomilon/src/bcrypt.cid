@@ -1,0 +1,295 @@
+// bcrypt.cid — 100% Pure Cider bcrypt ("$2a$", "$2b$", "$2y$") implementation
+// Zero libc dependencies.
+
+from sys import native_memcpy, native_memset, native_memcmp;
+from bcrypt_tables import BF_P, BF_S;
+
+struct Blowfish {
+    var P: [u32; 18];
+    var S: [u32; 1024];
+}
+
+func bf_F(st: *Blowfish, x: u32) -> u32 {
+    var b0: int = ((x >> 24) & (255 as u32)) as int;
+    var b1: int = ((x >> 16) & (255 as u32)) as int;
+    var b2: int = ((x >> 8)  & (255 as u32)) as int;
+    var b3: int = (x & (255 as u32)) as int;
+
+    var s0: u32 = st->S[b0];
+    var s1: u32 = st->S[256 + b1];
+    var s2: u32 = st->S[512 + b2];
+    var s3: u32 = st->S[768 + b3];
+
+    return (((s0 + s1) ^ s2) + s3);
+}
+
+func bf_encrypt(st: *Blowfish, lp: *u32, rp: *u32) -> void {
+    var l: u32 = *lp;
+    var r: u32 = *rp;
+    var s: *u32 = &st->S[0];
+    var p: *u32 = &st->P[0];
+    l = l ^ p[0];
+    for (var i: int = 1; i <= 16; i = i + 2) {
+        var b0: int = ((l >> 24) & (255 as u32)) as int;
+        var b1: int = ((l >> 16) & (255 as u32)) as int;
+        var b2: int = ((l >> 8)  & (255 as u32)) as int;
+        var b3: int = (l & (255 as u32)) as int;
+        var f1: u32 = (((s[b0] + s[256 + b1]) ^ s[512 + b2]) + s[768 + b3]);
+        r = r ^ f1 ^ p[i];
+
+        var rb0: int = ((r >> 24) & (255 as u32)) as int;
+        var rb1: int = ((r >> 16) & (255 as u32)) as int;
+        var rb2: int = ((r >> 8)  & (255 as u32)) as int;
+        var rb3: int = (r & (255 as u32)) as int;
+        var f2: u32 = (((s[rb0] + s[256 + rb1]) ^ s[512 + rb2]) + s[768 + rb3]);
+        l = l ^ f2 ^ p[i + 1];
+    }
+    *lp = r ^ p[17];
+    *rp = l;
+}
+
+func stream_word(data: *u8, n: int, pos: *int) -> u32 {
+    var d: i64 = data as i64;
+    var w: u32 = 0 as u32;
+    var p: int = *pos;
+    for (var i: int = 0; i < 4; i = i + 1) {
+        var b: u32 = (*(((d + (p as i64)) as *u8))) as u32;
+        w = (w << 8) | b;
+        p = p + 1;
+        if (p == n) { p = 0; }
+    }
+    *pos = p;
+    return w;
+}
+
+func expand_salted(st: *Blowfish, key: *u8, keylen: int, salt: *u8) -> void {
+    var kp: int = 0;
+    var sp: int = 0;
+    var l: u32 = 0 as u32;
+    var r: u32 = 0 as u32;
+
+    for (var i: int = 0; i < 18; i = i + 1) {
+        st->P[i] = st->P[i] ^ stream_word(key, keylen, &kp);
+    }
+    for (var i: int = 0; i < 18; i = i + 2) {
+        l = l ^ stream_word(salt, 16, &sp);
+        r = r ^ stream_word(salt, 16, &sp);
+        bf_encrypt(st, &l, &r);
+        st->P[i] = l;
+        st->P[i + 1] = r;
+    }
+    for (var b: int = 0; b < 4; b = b + 1) {
+        for (var i: int = 0; i < 256; i = i + 2) {
+            l = l ^ stream_word(salt, 16, &sp);
+            r = r ^ stream_word(salt, 16, &sp);
+            bf_encrypt(st, &l, &r);
+            st->S[b * 256 + i] = l;
+            st->S[b * 256 + i + 1] = r;
+        }
+    }
+}
+
+func expand(st: *Blowfish, key: *u8, keylen: int) -> void {
+    var kp: int = 0;
+    var l: u32 = 0 as u32;
+    var r: u32 = 0 as u32;
+
+    for (var i: int = 0; i < 18; i = i + 1) {
+        st->P[i] = st->P[i] ^ stream_word(key, keylen, &kp);
+    }
+    for (var i: int = 0; i < 18; i = i + 2) {
+        bf_encrypt(st, &l, &r);
+        st->P[i] = l;
+        st->P[i + 1] = r;
+    }
+    for (var b: int = 0; b < 4; b = b + 1) {
+        for (var i: int = 0; i < 256; i = i + 2) {
+            bf_encrypt(st, &l, &r);
+            st->S[b * 256 + i] = l;
+            st->S[b * 256 + i + 1] = r;
+        }
+    }
+}
+
+func bcrypt_raw(pw: *char, pwlen: int, salt: *u8, cost: int, out: *u8) -> void {
+    var st: Blowfish = uninit;
+    native_memcpy((&st.P[0]) as *char, (&BF_P[0]) as *char, 18 * 4);
+    native_memcpy((&st.S[0]) as *char, (&BF_S[0]) as *char, 1024 * 4);
+
+    var key: [u8; 73] = uninit;
+    var actual_pwlen: int = pwlen;
+    if (actual_pwlen > 72) { actual_pwlen = 72; }
+    native_memcpy((&key[0]) as *char, pw, actual_pwlen as i64);
+    key[actual_pwlen] = 0 as u8;
+    var keylen: int = actual_pwlen + 1;
+
+    expand_salted(&st, &key[0], keylen, salt);
+
+    var rounds: i64 = (1 as i64) << cost;
+    while (rounds > 0) {
+        rounds = rounds - 1;
+        expand(&st, &key[0], keylen);
+        expand(&st, salt, 16);
+    }
+
+    // Encrypt "OrpheanBeholderScryDoubt" 64 times
+    var magic: *char = "OrpheanBeholderScryDoubt";
+    var m: i64 = magic as i64;
+    var c: [u32; 6] = uninit;
+    for (var i: int = 0; i < 6; i = i + 1) {
+        var b0: u32 = (*(((m + (i as i64) * 4 + 0) as *u8))) as u32;
+        var b1: u32 = (*(((m + (i as i64) * 4 + 1) as *u8))) as u32;
+        var b2: u32 = (*(((m + (i as i64) * 4 + 2) as *u8))) as u32;
+        var b3: u32 = (*(((m + (i as i64) * 4 + 3) as *u8))) as u32;
+        c[i] = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+    }
+
+    for (var k: int = 0; k < 64; k = k + 1) {
+        for (var i: int = 0; i < 6; i = i + 2) {
+            bf_encrypt(&st, &c[i], &c[i + 1]);
+        }
+    }
+
+    var o: i64 = out as i64;
+    for (var i: int = 0; i < 5; i = i + 1) {
+        var v: u32 = c[i];
+        *(((o + (i as i64) * 4 + 0) as *u8)) = ((v >> 24) & 0xFF as u32) as u8;
+        *(((o + (i as i64) * 4 + 1) as *u8)) = ((v >> 16) & 0xFF as u32) as u8;
+        *(((o + (i as i64) * 4 + 2) as *u8)) = ((v >> 8)  & 0xFF as u32) as u8;
+        *(((o + (i as i64) * 4 + 3) as *u8)) = (v & 0xFF as u32) as u8;
+    }
+    // 23 bytes kept total (last 3 bytes from c[5])
+    var v5: u32 = c[5];
+    *(((o + 20) as *u8)) = ((v5 >> 24) & 0xFF as u32) as u8;
+    *(((o + 21) as *u8)) = ((v5 >> 16) & 0xFF as u32) as u8;
+    *(((o + 22) as *u8)) = ((v5 >> 8)  & 0xFF as u32) as u8;
+}
+
+func get_bcrypt_alphabet() -> *char {
+    var a: *char = "./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    return a;
+}
+
+func bcrypt_b64_encode(dst: *char, src: *u8, n: int) -> int {
+    var d: i64 = dst as i64;
+    var s: i64 = src as i64;
+    var alpha: i64 = get_bcrypt_alphabet() as i64;
+    var out_idx: int = 0;
+
+    for (var i: int = 0; i < n; i = i + 3) {
+        var v: u32 = ((*(((s + (i as i64)) as *u8))) as u32) << 16;
+        if (i + 1 < n) { v = v | (((*(((s + (i as i64) + 1) as *u8))) as u32) << 8); }
+        if (i + 2 < n) { v = v | ((*(((s + (i as i64) + 2) as *u8))) as u32); }
+
+        *(((d + (out_idx as i64)) as *u8)) = *(((alpha + (((v >> 18) & 63 as u32) as i64)) as *u8));
+        out_idx = out_idx + 1;
+        *(((d + (out_idx as i64)) as *u8)) = *(((alpha + (((v >> 12) & 63 as u32) as i64)) as *u8));
+        out_idx = out_idx + 1;
+        if (i + 1 < n) {
+            *(((d + (out_idx as i64)) as *u8)) = *(((alpha + (((v >> 6) & 63 as u32) as i64)) as *u8));
+            out_idx = out_idx + 1;
+        }
+        if (i + 2 < n) {
+            *(((d + (out_idx as i64)) as *u8)) = *(((alpha + ((v & 63 as u32) as i64)) as *u8));
+            out_idx = out_idx + 1;
+        }
+    }
+    *(((d + (out_idx as i64)) as *u8)) = 0 as u8;
+    return out_idx;
+}
+
+func b64_index(c: u8) -> int {
+    if (c == (46 as u8)) { return 0; } // '.'
+    if (c == (47 as u8)) { return 1; } // '/'
+    if (c >= (65 as u8) && c <= (90 as u8)) { return ((c - 65 as u8) as int) + 2; }
+    if (c >= (97 as u8) && c <= (122 as u8)) { return ((c - 97 as u8) as int) + 28; }
+    if (c >= (48 as u8) && c <= (57 as u8)) { return ((c - 48 as u8) as int) + 54; }
+    return -1;
+}
+
+func bcrypt_b64_decode(dst: *u8, dstlen: int, src: *char, n: int) -> int {
+    var d: i64 = dst as i64;
+    var s: i64 = src as i64;
+    var acc: u32 = 0 as u32;
+    var bits: int = 0;
+    var o: int = 0;
+
+    for (var i: int = 0; i < n; i = i + 1) {
+        var v: int = b64_index(*(((s + (i as i64)) as *u8)));
+        if (v < 0) { return 0; }
+        acc = (acc << 6) | (v as u32);
+        bits = bits + 6;
+        if (bits >= 8) {
+            bits = bits - 8;
+            if (o < dstlen) {
+                *(((d + (o as i64)) as *u8)) = ((acc >> bits) & 0xFF as u32) as u8;
+            }
+            o = o + 1;
+        }
+    }
+    if (o == dstlen) { return 1; }
+    return 0;
+}
+
+struct BcryptSetting {
+    var minor: u8;
+    var cost: int;
+    var salt: [u8; 16];
+    var hash: [u8; 31];
+}
+
+func bcrypt_parse(h: *char, n: int, s: *BcryptSetting) -> int {
+    var p: i64 = h as i64;
+    var i: int = 3;
+    if (n < 59 || *(((p + 0) as *u8)) != (36 as u8) || *(((p + 1) as *u8)) != (50 as u8)) { return 0; } // "$2"
+    s->minor = 0 as u8;
+    if (*(((p + 2) as *u8)) != (36 as u8)) { // not '$'
+        s->minor = *(((p + 2) as *u8));
+        if (*(((p + 3) as *u8)) != (36 as u8)) { return 0; }
+        i = 4;
+    }
+    if (n != i + 2 + 1 + 22 + 31) { return 0; }
+    var c0: u8 = *(((p + (i as i64)) as *u8));
+    var c1: u8 = *(((p + (i as i64) + 1) as *u8));
+    if (c0 < (48 as u8) || c0 > (57 as u8) || c1 < (48 as u8) || c1 > (57 as u8) || *(((p + (i as i64) + 2) as *u8)) != (36 as u8)) {
+        return 0;
+    }
+    s->cost = ((c0 - 48 as u8) as int) * 10 + ((c1 - 48 as u8) as int);
+    if (s->cost < 4 || s->cost > 31) { return 0; }
+    i = i + 3;
+
+    if (bcrypt_b64_decode(&s->salt[0], 16, (p + (i as i64)) as *char, 22) == 0) {
+        return 0;
+    }
+    native_memcpy((&s->hash[0]) as *char, (p + (i as i64) + 22) as *char, 31);
+    return 1;
+}
+
+func bcrypt_verify(pw: *char, pwlen: int, hash: *char, hlen: int) -> int {
+    var s: BcryptSetting = uninit;
+    var raw: [u8; 23] = uninit;
+    var enc: [u8; 32] = uninit;
+
+    if (bcrypt_parse(hash, hlen, &s) == 0 || pwlen > 72) { return 0; }
+    bcrypt_raw(pw, pwlen, &s.salt[0], s.cost, &raw[0]);
+    bcrypt_b64_encode((&enc[0]) as *char, &raw[0], 23);
+
+    return (native_memcmp((&enc[0]) as *char, (&s.hash[0]) as *char, 31) == 0) as int;
+}
+
+func bcrypt_hash(pw: *char, pwlen: int, salt: *u8, cost: int, out_hash: *char) -> int {
+    var p: i64 = out_hash as i64;
+    native_memcpy(out_hash, "$2a$", 4 as i64);
+    *(((p + 4) as *u8)) = (48 + (cost / 10)) as u8;
+    *(((p + 5) as *u8)) = (48 + (cost % 10)) as u8;
+    *(((p + 6) as *u8)) = 36 as u8; // '$'
+
+    bcrypt_b64_encode((p + 7) as *char, salt, 16);
+
+    var raw: [u8; 23] = uninit;
+    bcrypt_raw(pw, pwlen, salt, cost, &raw[0]);
+
+    bcrypt_b64_encode((p + 29) as *char, &raw[0], 23);
+    *(((p + 60) as *u8)) = 0 as u8;
+    return 60;
+}
