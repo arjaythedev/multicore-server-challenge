@@ -116,8 +116,12 @@ impl<T: Timestamped> WorkQueue<T> {
         }
         let mut g = self.inner.lock().unwrap();
         let was_empty = g.q.is_empty();
-        if was_empty {
-            g.since = batch.first().map(|x| x.enqueued_at());
+        if let Some(first) = batch.first() {
+            let ts = first.enqueued_at();
+            g.since = Some(match g.since {
+                Some(prev) => prev.min(ts),
+                None => ts,
+            });
         }
         for item in batch.drain(..).rev() {
             g.q.push_front(item);
@@ -424,21 +428,26 @@ fn take_clean_json_str<'a>(s: &'a [u8]) -> Option<(&'a str, &'a [u8])> {
 }
 
 #[inline]
-fn extract_flat_comment_body(body: &[u8]) -> Option<String> {
+fn extract_single_wrapped_str(
+    body: &[u8],
+    outer_key: &str,
+    inner_key: &str,
+    require_non_empty: bool,
+) -> Option<String> {
     let s = skip_ws(body).strip_prefix(b"{")?;
     let (k1, s) = take_clean_json_str(s)?;
-    if k1 != "comment" {
+    if k1 != outer_key {
         return None;
     }
     let s = skip_ws(s).strip_prefix(b":")?;
     let s = skip_ws(s).strip_prefix(b"{")?;
     let (k2, s) = take_clean_json_str(s)?;
-    if k2 != "body" {
+    if k2 != inner_key {
         return None;
     }
     let s = skip_ws(s).strip_prefix(b":")?;
     let (val, s) = take_clean_json_str(s)?;
-    if val.is_empty() {
+    if require_non_empty && val.is_empty() {
         return None;
     }
     let s = skip_ws(s).strip_prefix(b"}")?;
@@ -726,7 +735,7 @@ pub fn route_request(
             };
             match verify_auth_header(signer, req.auth) {
                 AuthState::Verified(v, _) => {
-                    if let Some(body) = extract_flat_comment_body(req.body) {
+                    if let Some(body) = extract_single_wrapped_str(req.body, "comment", "body", true) {
                         return enqueue_write(WriteOp::CreateComment { slug, body }, v, addr, now);
                     }
                     let obj = match parse_valid_envelope(req.body, "comment") {
@@ -925,6 +934,21 @@ fn handle_update_user(
     addr: ReplyAddr,
     now: Instant,
 ) -> Dispatch {
+    if let Some(bio) = extract_single_wrapped_str(body, "user", "bio", false) {
+        return enqueue_write(
+            WriteOp::UpdateUser {
+                token,
+                email: None,
+                username: None,
+                hash: None,
+                bio: Some(bio),
+                image: None,
+            },
+            uid,
+            addr,
+            now,
+        );
+    }
     let obj = match parse_valid_envelope(body, "user") {
         Ok(o) => o,
         Err(resp) => return resp,

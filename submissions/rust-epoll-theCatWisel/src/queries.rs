@@ -31,12 +31,12 @@ fn feed_def() -> PreparedDef {
              hub_floors AS MATERIALIZED ( \
                SELECT h.fid, \
                  (SELECT a.id FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC LIMIT 1 OFFSET h.depth - 1) AS floor_id, \
-                 EXISTS (SELECT 1 FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC LIMIT 1 OFFSET 999) AS big \
+                 EXISTS (SELECT 1 FROM articles a WHERE a.author_id = h.fid ORDER BY a.id ASC LIMIT 1 OFFSET 999) AS big \
                FROM ( \
                  SELECT f.fid, max(u.depth) AS depth \
                  FROM u, unnest(u.fids) AS f(fid) \
                  GROUP BY f.fid HAVING count(*) >= 2 \
-                 ORDER BY count(*) DESC, f.fid LIMIT 48 \
+                 ORDER BY count(*) DESC, f.fid LIMIT 32 \
                ) h \
              ), \
              cap_authors AS MATERIALIZED ( \
@@ -139,7 +139,7 @@ pub fn read_catalog() -> Vec<PreparedDef> {
         ),
         def(
             "global",
-            "SELECT 0::int8, CASE WHEN EXISTS (SELECT 1 FROM articles ORDER BY id DESC LIMIT 1 OFFSET 999) \
+            "SELECT 0::int8, CASE WHEN EXISTS (SELECT 1 FROM articles ORDER BY id ASC LIMIT 1 OFFSET 999) \
              THEN 1000 ELSE (SELECT count(*) FROM articles) END, 0::int8, \
              NULL::text, NULL::text, NULL::text, NULL::timestamptz, NULL::timestamptz \
              UNION ALL \
@@ -151,7 +151,7 @@ pub fn read_catalog() -> Vec<PreparedDef> {
         ),
         def(
             "global_win",
-            "SELECT 0::int8, CASE WHEN EXISTS (SELECT 1 FROM articles ORDER BY id DESC LIMIT 1 OFFSET 999) \
+            "SELECT 0::int8, CASE WHEN EXISTS (SELECT 1 FROM articles ORDER BY id ASC LIMIT 1 OFFSET 999) \
              THEN 1000 ELSE (SELECT count(*) FROM articles) END, 0::int8, \
              NULL::text, NULL::text, NULL::text, NULL::timestamptz, NULL::timestamptz \
              UNION ALL \

@@ -212,10 +212,6 @@ pub fn enqueue_read_batch_fast(batch: &mut Vec<ReadTask>) {
     if batch.is_empty() {
         return;
     }
-    let now = Instant::now();
-    for t in batch.iter_mut() {
-        t.enqueued_at = now;
-    }
     READ_LANES[LANE_FAST].push_batch_front(batch);
     wake_read_dispatcher(LANE_FAST);
 }
@@ -464,11 +460,8 @@ struct ReadRenderScratch {
     rendered_filters: [Vec<Option<ReplyBody>>; 3],
     global_counts: Vec<i64>,
     global_pages: Vec<ArticlePage>,
-    global_win_buf: ArticlePage,
     filter_counts: [Vec<i64>; 3],
     filter_pages: [Vec<ArticlePage>; 3],
-    filter_win_pages: Vec<ArticlePage>,
-    filter_win_max: Vec<i64>,
     feed_counts: Vec<i64>,
     feed_pages: Vec<ArticlePage>,
     raw_pages: Vec<Vec<(i64, i64, wire::RowSpan)>>,
@@ -497,11 +490,8 @@ impl ReadRenderScratch {
             rendered_filters: [Vec::with_capacity(32), Vec::with_capacity(32), Vec::with_capacity(32)],
             global_counts: Vec::with_capacity(4),
             global_pages: Vec::with_capacity(16),
-            global_win_buf: Vec::with_capacity(200),
             filter_counts: [Vec::with_capacity(32), Vec::with_capacity(32), Vec::with_capacity(32)],
             filter_pages: [Vec::with_capacity(32), Vec::with_capacity(32), Vec::with_capacity(32)],
-            filter_win_pages: Vec::with_capacity(32),
-            filter_win_max: Vec::with_capacity(32),
             feed_counts: Vec::with_capacity(64),
             feed_pages: Vec::with_capacity(64),
             raw_pages: Vec::with_capacity(64),
@@ -703,7 +693,7 @@ fn pick_eligible_lane(
             (last_us + gap_us).saturating_sub(now_us)
         };
         let win_rem_us = 5_000usize.saturating_sub(age_us);
-        let max_item_rem_us = (gap_us + 25_000).saturating_sub(age_us);
+        let max_item_rem_us = (gap_us + 5_000).saturating_sub(age_us);
         let wait_us = gap_rem_us.max(win_rem_us).min(max_item_rem_us);
         (lane_want, Duration::from_micros((age_us + wait_us) as u64))
     };
@@ -1056,10 +1046,10 @@ impl ReadWorker {
             }
             if st_uid.is_some() {
                 if self.k_uid.items.len() > 1 {
-                    self.sorted_arts.clear();
-                    self.sorted_arts.extend_from_slice(&self.k_uid.items);
-                    self.sorted_arts.sort_unstable();
-                    tx.bind_and_exec("uid", &[BindParam::I64Slice(&self.sorted_arts)]);
+                    self.sorted_authors.clear();
+                    self.sorted_authors.extend_from_slice(&self.k_uid.items);
+                    self.sorted_authors.sort_unstable();
+                    tx.bind_and_exec("uid", &[BindParam::I64Slice(&self.sorted_authors)]);
                 } else {
                     tx.bind_and_exec("uid", &[BindParam::I64Slice(&self.k_uid.items)]);
                 }
@@ -1086,6 +1076,7 @@ impl ReadWorker {
         }
 
         let mut global_win_max: i64 = 0;
+        let mut global_sum_lim: i64 = 0;
         let mut use_global_win = self.k_global.len() > 0;
         for &(l, o) in &self.k_global.items {
             let end = l.saturating_add(o);
@@ -1093,22 +1084,16 @@ impl ReadWorker {
                 use_global_win = false;
                 break;
             }
+            global_sum_lim = global_sum_lim.saturating_add(l.max(0));
             if end > global_win_max {
                 global_win_max = end;
             }
         }
-        let mut use_filter_win = [false; 3];
-        for i in 0..3 {
-            let fd = &self.k_filters[i];
-            if fd.pages.len() > fd.counts.len()
-                && fd
-                    .pages
-                    .items
-                    .iter()
-                    .all(|&(_, l, o)| l >= 0 && o >= 0 && l.saturating_add(o) <= 200)
-            {
-                use_filter_win[i] = true;
-            }
+        if use_global_win
+            && ((self.k_global.len() == 1 && self.k_global.items[0].1 > 0)
+                || global_sum_lim * 2 < global_win_max)
+        {
+            use_global_win = false;
         }
         if n_phase_a2 > 0 {
             if st_slug.is_some() {
@@ -1162,33 +1147,13 @@ impl ReadWorker {
             for i in 0..3 {
                 if st_filters[i].is_some() {
                     let fd = &self.k_filters[i];
-                    if use_filter_win[i] {
-                        let n_cnt = fd.counts.len();
-                        self.rr.filter_win_max.clear();
-                        self.rr.filter_win_max.resize(n_cnt, 0);
-                        for &(c_ord, l, o) in &fd.pages.items {
-                            let end = l.saturating_add(o);
-                            if end > self.rr.filter_win_max[c_ord as usize] {
-                                self.rr.filter_win_max[c_ord as usize] = end;
-                            }
-                        }
-                        self.enc_a.reset(OID_INT8, n_cnt);
-                        self.enc_b.reset(OID_INT8, n_cnt);
-                        self.enc_c.reset(OID_INT8, n_cnt);
-                        for (c_idx, &wmax) in self.rr.filter_win_max.iter().enumerate() {
-                            self.enc_a.push_i64(c_idx as i64 + 1);
-                            self.enc_b.push_i64(wmax.max(1));
-                            self.enc_c.push_i64(0);
-                        }
-                    } else {
-                        self.enc_a.reset(OID_INT8, fd.pages.items.len());
-                        self.enc_b.reset(OID_INT8, fd.pages.items.len());
-                        self.enc_c.reset(OID_INT8, fd.pages.items.len());
-                        for &(c_ord, l, o) in &fd.pages.items {
-                            self.enc_a.push_i64(c_ord as i64 + 1);
-                            self.enc_b.push_i64(l);
-                            self.enc_c.push_i64(o);
-                        }
+                    self.enc_a.reset(OID_INT8, fd.pages.items.len());
+                    self.enc_b.reset(OID_INT8, fd.pages.items.len());
+                    self.enc_c.reset(OID_INT8, fd.pages.items.len());
+                    for &(c_ord, l, o) in &fd.pages.items {
+                        self.enc_a.push_i64(c_ord as i64 + 1);
+                        self.enc_b.push_i64(l);
+                        self.enc_c.push_i64(o);
                     }
                     tx.bind_and_exec(
                         FILTER_STMT_NAMES[i],
@@ -1549,6 +1514,7 @@ impl ReadWorker {
                                     n_cnt: usize,
                                     n_page: usize,
                                     has_meta: bool,
+                                    win_slices: Option<&[(i64, i64)]>,
                                     counts: &mut Vec<i64>,
                                     pages: &mut Vec<ArticlePage>| {
             counts.clear();
@@ -1562,13 +1528,14 @@ impl ReadWorker {
                 pages.truncate(n_page);
             }
             if let Some(idx) = s {
+                let n_raw = if win_slices.is_some() { 1 } else { n_page };
                 for rp in raw_pages.iter_mut() {
                     rp.clear();
                 }
-                if raw_pages.len() < n_page {
-                    raw_pages.resize_with(n_page, Vec::new);
+                if raw_pages.len() < n_raw {
+                    raw_pages.resize_with(n_raw, Vec::new);
                 } else {
-                    raw_pages.truncate(n_page);
+                    raw_pages.truncate(n_raw);
                 }
                 for &span in pipe.result_rows(idx) {
                     let r = pipe.row(span);
@@ -1579,111 +1546,73 @@ impl ReadWorker {
                         if c_idx < counts.len() {
                             counts[c_idx] = pipe.i64(r[1]);
                         }
-                    } else if (ord as usize) <= n_page {
+                    } else if (ord as usize) <= n_raw {
                         raw_pages[ord as usize - 1].push((pipe.i64(r[1]), pipe.i64(r[2]), span));
                     }
                 }
-                for (p_idx, rp) in raw_pages.iter_mut().enumerate() {
+                if let Some(slices) = win_slices {
+                    let rp = &mut raw_pages[0];
                     if rp.len() > 1 {
                         rp.sort_unstable_by(|a, b| b.0.cmp(&a.0));
                     }
-                    let dst = &mut pages[p_idx];
-                    dst.reserve(rp.len());
-                    for &(aid, author, span) in rp.iter() {
-                        dst.push(intern_art(
-                            aid,
-                            author,
-                            span,
-                            if has_meta {
-                                MetaSource::PhaseA(span)
-                            } else {
-                                MetaSource::None
-                            },
-                        ));
+                    for (p_idx, &(lim, off)) in slices.iter().enumerate() {
+                        let start = (off.max(0) as usize).min(rp.len());
+                        let end = start.saturating_add(lim.max(0) as usize).min(rp.len());
+                        let dst = &mut pages[p_idx];
+                        dst.reserve(end - start);
+                        for &(aid, author, span) in &rp[start..end] {
+                            dst.push(intern_art(aid, author, span, MetaSource::PhaseA(span)));
+                        }
+                    }
+                } else {
+                    for (p_idx, rp) in raw_pages.iter_mut().enumerate() {
+                        if rp.len() > 1 {
+                            rp.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                        }
+                        let dst = &mut pages[p_idx];
+                        dst.reserve(rp.len());
+                        for &(aid, author, span) in rp.iter() {
+                            dst.push(intern_art(
+                                aid,
+                                author,
+                                span,
+                                if has_meta {
+                                    MetaSource::PhaseA(span)
+                                } else {
+                                    MetaSource::None
+                                },
+                            ));
+                        }
                     }
                 }
             }
         };
 
-        if use_global_win {
-            unpack_list_into(
-                pa,
-                st_global,
-                1,
-                1,
-                true,
-                &mut self.rr.global_counts,
-                &mut self.rr.global_pages,
-            );
-            let win = &mut self.rr.global_win_buf;
-            win.clear();
-            if let Some(first_p) = self.rr.global_pages.first_mut() {
-                std::mem::swap(win, first_p);
-            }
-            let n_g = self.k_global.items.len();
-            for p in self.rr.global_pages.iter_mut() {
-                p.clear();
-            }
-            if self.rr.global_pages.len() < n_g {
-                self.rr.global_pages.resize_with(n_g, Vec::new);
+        unpack_list_into(
+            pa,
+            st_global,
+            1,
+            self.k_global.len(),
+            true,
+            if use_global_win {
+                Some(&self.k_global.items)
             } else {
-                self.rr.global_pages.truncate(n_g);
-            }
-            for (idx, &(lim, off)) in self.k_global.items.iter().enumerate() {
-                let start = (off.max(0) as usize).min(win.len());
-                let end = start.saturating_add(lim.max(0) as usize).min(win.len());
-                self.rr.global_pages[idx].extend_from_slice(&win[start..end]);
-            }
-        } else {
-            unpack_list_into(
-                pa,
-                st_global,
-                1,
-                self.k_global.len(),
-                true,
-                &mut self.rr.global_counts,
-                &mut self.rr.global_pages,
-            );
-        }
+                None
+            },
+            &mut self.rr.global_counts,
+            &mut self.rr.global_pages,
+        );
         for i in 0..3 {
-            if use_filter_win[i] {
-                let n_cnt = self.k_filters[i].counts.len();
-                let n_page = self.k_filters[i].pages.len();
-                unpack_list_into(
-                    pa,
-                    st_filters[i],
-                    n_cnt,
-                    n_cnt,
-                    true,
-                    &mut self.rr.filter_counts[i],
-                    &mut self.rr.filter_win_pages,
-                );
-                let dst_pages = &mut self.rr.filter_pages[i];
-                for p in dst_pages.iter_mut() {
-                    p.clear();
-                }
-                if dst_pages.len() < n_page {
-                    dst_pages.resize_with(n_page, Vec::new);
-                } else {
-                    dst_pages.truncate(n_page);
-                }
-                for (p_idx, &(c_ord, lim, off)) in self.k_filters[i].pages.items.iter().enumerate() {
-                    let win = &self.rr.filter_win_pages[c_ord as usize];
-                    let start = (off.max(0) as usize).min(win.len());
-                    let end = start.saturating_add(lim.max(0) as usize).min(win.len());
-                    dst_pages[p_idx].extend_from_slice(&win[start..end]);
-                }
-            } else {
-                unpack_list_into(
-                    pa,
-                    st_filters[i],
-                    self.k_filters[i].counts.len(),
-                    self.k_filters[i].pages.len(),
-                    true,
-                    &mut self.rr.filter_counts[i],
-                    &mut self.rr.filter_pages[i],
-                );
-            }
+            unpack_list_into(
+                pa,
+                st_filters[i],
+                self.k_filters[i].counts.len(),
+                self.k_filters[i].pages.len(),
+                true,
+                None,
+                &mut self.rr.filter_counts[i],
+                &mut self.rr.filter_pages[i],
+            );
         }
         unpack_list_into(
             pa,
@@ -1691,6 +1620,7 @@ impl ReadWorker {
             self.k_feed_cnt.len(),
             self.k_feed_page.len(),
             false,
+            None,
             &mut self.rr.feed_counts,
             &mut self.rr.feed_pages,
         );
@@ -2683,9 +2613,10 @@ impl WriteWorker {
         if tasks.is_empty() {
             return Ok(());
         }
+        let collect_addrs = |ts: &[WriteTask]| -> Vec<ReplyAddr> { ts.iter().map(|t| t.addr).collect() };
         let conn = match Self::ensure_conn(&mut self.conn, self.cfg) {
             Ok(c) => c,
-            Err(e) => return Err((e, tasks.iter().map(|t| t.addr).collect())),
+            Err(e) => return Err((e, collect_addrs(tasks))),
         };
 
         let is_single_task = tasks.len() == 1;
@@ -2892,7 +2823,7 @@ impl WriteWorker {
         conn.tx.write_sync();
 
         if let Err(e) = conn.flush().and_then(|_| conn.read_pipeline_into(n_exec, &mut self.pipe)) {
-            return Err((e, tasks.iter().map(|t| t.addr).collect()));
+            return Err((e, collect_addrs(tasks)));
         }
 
         let any_failed = self.pipe.results.iter().any(|r| r.error.is_some());
@@ -2942,14 +2873,14 @@ impl WriteWorker {
                     );
                 }
                 WriteDispatchLoc::BatchedFav { on, ord } => {
-                    let span_opt = if on {
+                    let span = if on {
                         self.fav_on_res[ord - 1]
                     } else {
                         self.fav_off_res[ord - 1]
                     };
-                    match span_opt {
-                        Some(span) => {
-                            let r = pipe.row(span);
+                    match span {
+                        Some(sp) => {
+                            let r = pipe.row(sp);
                             self.post_reads.push(ReadTask {
                                 op: ReadOp::ArticleById {
                                     id: pipe.i64(r[1]),
@@ -2963,14 +2894,14 @@ impl WriteWorker {
                     }
                 }
                 WriteDispatchLoc::BatchedFollow { on, ord } => {
-                    let span_opt = if on {
+                    let span = if on {
                         self.foll_on_res[ord - 1]
                     } else {
                         self.foll_off_res[ord - 1]
                     };
-                    match span_opt {
-                        Some(span) => {
-                            let r = pipe.row(span);
+                    match span {
+                        Some(sp) => {
+                            let r = pipe.row(sp);
                             let mut body = Vec::with_capacity(256);
                             body.extend_from_slice(b"{\"profile\":");
                             write_profile_json(
@@ -2991,8 +2922,8 @@ impl WriteWorker {
                     }
                 }
                 WriteDispatchLoc::BatchedComment { ord } => match self.cmt_res[ord - 1] {
-                    Some(span) => {
-                        let r = pipe.row(span);
+                    Some(sp) => {
+                        let r = pipe.row(sp);
                         let mut body = Vec::with_capacity(512);
                         body.extend_from_slice(b"{\"comment\":{\"id\":");
                         codec::write_i64(&mut body, pipe.i64(r[1]));
@@ -3443,10 +3374,6 @@ fn execute_bcrypt_batch(tasks: &mut Vec<CryptoTask>, cfg: &RuntimeConfig, cost: 
         reactor::complete_batch(&mut replies);
     }
     if !writes.is_empty() {
-        let now = Instant::now();
-        for w in writes.iter_mut() {
-            w.enqueued_at = now;
-        }
         WRITE_QUEUE.push_batch_front(&mut writes);
     }
 }
