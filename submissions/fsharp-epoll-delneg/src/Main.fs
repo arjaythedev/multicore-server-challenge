@@ -20,6 +20,8 @@ let main _ =
     let options = env "PG_OPTIONS" "-c plan_cache_mode=force_generic_plan -c jit=off -c max_parallel_workers_per_gather=0"
     Auth.init (env "JWT_SECRET" "multicore-server-challenge")
     Store.stats <- env "MC_STATS" "0" = "1"
+    if Store.stats then
+        AppDomain.CurrentDomain.FirstChanceException.Add(fun e -> Console.Error.WriteLine("first chance: " + e.Exception.ToString()))
     // our threads wake without preempting Postgres mid-query (THREAD_SCHED=other turns it off)
     Sys.threadPolicy <- (if env "THREAD_SCHED" "batch" = "batch" then Sys.SCHED_BATCH else Sys.SCHED_OTHER)
     Store.dumpPath <- (match env "RD_DUMP" "" with "" -> null | p -> p)

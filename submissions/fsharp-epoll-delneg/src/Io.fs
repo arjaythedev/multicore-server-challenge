@@ -60,6 +60,11 @@ type private Conn() =
 
 let mutable private conns: Conn[] = [||]
 
+/// epoll's tag for a connection: fd and generation. An fd closed earlier in a batch of events can already belong to
+/// another loop by the time its stale event comes up; the generation tells that event apart from a live one.
+let inline private epTag (fd: int) (c: Conn) =
+    uint64 (uint32 fd) ||| (uint64 (uint32 (c.Gen &&& 0x7FFFFFFF)) <<< 32)
+
 /// io_uring settings (Main sets them): use it, force classic provided buffers (the path for kernels whose buffer
 /// rings fail), ring and pool sizes
 let mutable uring = false
@@ -195,7 +200,7 @@ type Loop(index: int, listenFd: int) =
                     elif k < 0n && e = Sys.EAGAIN then
                         c.Out <- data
                         c.OutOff <- o
-                        Sys.ctl ep Sys.EPOLL_CTL_MOD fd (Sys.EPOLLIN ||| Sys.EPOLLOUT ||| Sys.EPOLLRDHUP) (uint64 fd) |> ignore
+                        Sys.ctl ep Sys.EPOLL_CTL_MOD fd (Sys.EPOLLIN ||| Sys.EPOLLOUT ||| Sys.EPOLLRDHUP) (epTag fd c) |> ignore
                         go <- false
                     else
                         closeFd fd
@@ -396,7 +401,7 @@ type Loop(index: int, listenFd: int) =
         if c.Open && not (isNull c.Out) then
             let data = c.Out
             c.Out <- null
-            Sys.ctl ep Sys.EPOLL_CTL_MOD fd (Sys.EPOLLIN ||| Sys.EPOLLRDHUP) (uint64 fd) |> ignore
+            Sys.ctl ep Sys.EPOLL_CTL_MOD fd (Sys.EPOLLIN ||| Sys.EPOLLRDHUP) (epTag fd c) |> ignore
             if sendBytes fd c data c.OutOff then
                 if c.CloseAfter then closeFd fd
                 elif c.InLen > 0 then dispatch fd
@@ -421,7 +426,7 @@ type Loop(index: int, listenFd: int) =
             c.In <- null
             c.InLen <- 0
             c.Out <- null
-            if not useRing then Sys.ctl ep Sys.EPOLL_CTL_ADD fd (Sys.EPOLLIN ||| Sys.EPOLLRDHUP) (uint64 fd) |> ignore
+            if not useRing then Sys.ctl ep Sys.EPOLL_CTL_ADD fd (Sys.EPOLLIN ||| Sys.EPOLLRDHUP) (epTag fd c) |> ignore
             lruAdd fd
             if useRing && Sys.ur_recv (ring, fd, ud KRecv (gen28 c.Gen) fd) < 0 then closeFd fd
 
@@ -600,15 +605,17 @@ type Loop(index: int, listenFd: int) =
                         Volatile.Write(&wakePending, 0)
                         drainInbox ()
                     else
-                        let fd = int ev.Data
-                        try
-                            if ev.Events &&& Sys.EPOLLOUT <> 0u then onWritable fd
-                            if ev.Events &&& (Sys.EPOLLIN ||| Sys.EPOLLHUP ||| Sys.EPOLLERR ||| Sys.EPOLLRDHUP) <> 0u then
-                                onReadable fd
-                        with ex ->
-                            // one connection's failure closes that connection, never the loop
-                            eprintfn "io: fd %d: %s" fd ex.Message
-                            closeFd fd
+                        let fd = int (uint32 ev.Data)
+                        let c = conns.[fd]
+                        if c.Open && (c.Gen &&& 0x7FFFFFFF) = int (ev.Data >>> 32) then
+                            try
+                                if ev.Events &&& Sys.EPOLLOUT <> 0u then onWritable fd
+                                if ev.Events &&& (Sys.EPOLLIN ||| Sys.EPOLLHUP ||| Sys.EPOLLERR ||| Sys.EPOLLRDHUP) <> 0u then
+                                    onReadable fd
+                            with ex ->
+                                // one connection's failure closes that connection, never the loop
+                                eprintfn "io: fd %d: %s" fd ex.Message
+                                closeFd fd
 
 let mutable private loops: Loop[] = [||]
 
