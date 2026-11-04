@@ -12,6 +12,7 @@ serde_json = "1"
 httparse = "1"
 base64 = "0.23.1"
 memchr = "2"
+io-uring = "0.7.15"
 
 [profile.release]
 opt-level = 3
