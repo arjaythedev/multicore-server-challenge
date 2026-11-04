@@ -6,7 +6,7 @@ Every submission on the same box: **8 dedicated vCPU / 16 GB**, Postgres 18 on t
 |--:|--:|---|---|---|--:|--:|--:|---|---|
 | 1 | **230,000** | [rust-epoll-theCatWisel](submissions/rust-epoll-theCatWisel) | [#201](https://github.com/arjaythedev/multicore-server-challenge/pull/201) @theCatWisel | direct | 58,865 | 257 | 394 | 41% / 51% |  |
 | 2 | **220,000** | [zig-iouring-nick-potts](submissions/zig-iouring-nick-potts) | [#168](https://github.com/arjaythedev/multicore-server-challenge/pull/168) @nick-potts | direct | 55,763 | 316 | 438 | 36% / 53% |  |
-| 3 | **210,000** | [c-epoll-unorig-username](https://github.com/arjaythedev/multicore-server-challenge/pull/203) | [#203](https://github.com/arjaythedev/multicore-server-challenge/pull/203) @unorig-username | direct | 52,012 | 416 | 540 | 39% / 40% |  |
+| 3 | **210,000** | [c-epoll-unorig-username](submissions/c-epoll-unorig-username) | [#203](https://github.com/arjaythedev/multicore-server-challenge/pull/203) @unorig-username | direct | 52,012 | 416 | 540 | 39% / 40% |  |
 | 4 | **200,000** | [nish-std-amritk](submissions/nish-std-amritk) | [#196](https://github.com/arjaythedev/multicore-server-challenge/pull/196) @amritk | direct | 49,464 | 402 | 473 | 40% / 42% |  |
 | 5 | **190,000** | [asm-epoll-nickita-khylkouski](submissions/asm-epoll-nickita-khylkouski) | [#130](https://github.com/arjaythedev/multicore-server-challenge/pull/130) @nickita-khylkouski | direct | 49,536 | 152 | 241 | 30% / 61% |  |
 | 6 | **190,000** | [java-raw-stohirov](submissions/java-raw-stohirov) | [#185](https://github.com/arjaythedev/multicore-server-challenge/pull/185) @stohirov | direct | 48,349 | 260 | 317 | 38% / 47% |  |
