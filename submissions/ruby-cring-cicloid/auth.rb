@@ -2,7 +2,8 @@
 
 require "json"
 require "rbnacl"
-require "ffi"
+require_relative "ext/bcrypt/bcrypt_lanes"
+require_relative "ext/jwt/fast_jwt"
 
 # libsodium's one-shot HMAC-SHA256 and constant-time compare, bound through rbnacl's FFI layer.
 module Sodium
@@ -12,48 +13,36 @@ module Sodium
   sodium_function :verify32, :crypto_verify_32, %i[pointer pointer]
 end
 
-# bcrypt through libxcrypt (Ubuntu's libcrypt.so.1, the same library `crypt(3)` uses), called with the
-# GVL released: a cost-10 hash takes ~40 ms of CPU, and while one runs on a helper thread the event loop
-# keeps serving. Hashes are standard `$2b$10$...`; the seed's `$2a$` hashes verify the same way.
+# bcrypt, cost 10, through BcryptLanes (ext/bcrypt). In the server's workers every hash goes to the
+# master's BcryptService, which interleaves the hashes of the whole server; without a service (warm-up,
+# tests) a hash runs here, one lane, on a helper thread with the GVL released.
 module Bcrypt
-  extend FFI::Library
-  ffi_lib ["libcrypt.so.1", "crypt"]
+  MAX = 72 # bytes bcrypt uses; longer passwords are refused at registration
 
-  DATA_SIZE = 32_768 # sizeof(struct crypt_data) in libxcrypt
-  OUTPUT_SIZE = 384 # CRYPT_GENSALT_OUTPUT_SIZE
-  COST = 10
+  class << self
+    attr_accessor :client
+  end
 
-  attach_function :crypt_rn, %i[string string pointer int], :pointer, blocking: true
-  attach_function :crypt_gensalt_rn, %i[string ulong pointer int pointer int], :pointer
-
-  # Hashes on a fresh thread so the GVL-free crypt call overlaps the event loop. Thread#value waits
-  # through the fiber scheduler, so only the calling fiber waits.
+  # The hash of a new password, or nil when bcrypt can't take it (over 72 bytes, or a NUL byte).
   def self.create(password)
-    Thread.new(password) do |pw|
-      salt = FFI::MemoryPointer.new(:char, OUTPUT_SIZE)
-      crypt_gensalt_rn("$2b$", COST, nil, 0, salt, OUTPUT_SIZE).null? and raise "crypt_gensalt failed"
-      crypt(pw, salt.read_string)
-    end.value
+    return nil unless usable?(password)
+
+    compute(password, BcryptLanes.salt(Random.urandom(16)))
   end
 
   def self.verify(password, hash)
-    return false unless hash.start_with?("$2")
+    return false unless usable?(password) && hash.start_with?("$2")
 
-    Thread.new(password, hash) do |pw, h|
-      out = crypt(pw, h)
-      out.bytesize == h.bytesize && Sodium.constant_time_equal?(out, h)
-    end.value
+    out = compute(password, hash)
+    !out.nil? && Sodium.constant_time_equal?(out, hash)
   end
 
-  def self.crypt(password, setting)
-    data = FFI::MemoryPointer.new(:char, DATA_SIZE)
-    result = crypt_rn(password, setting, data, DATA_SIZE)
-    raise "crypt failed" if result.null?
+  def self.usable?(password) = password.bytesize <= MAX && !password.include?("\0")
 
-    out = result.read_string
-    raise "crypt failed" if out.start_with?("*")
+  def self.compute(password, setting)
+    return client.hash(password, setting) if client
 
-    out
+    Thread.new { BcryptLanes.run([password], [setting])[0] }.value
   end
 end
 
@@ -93,25 +82,14 @@ class Tokens
     "#{input}.#{b64(sign(input))}"
   end
 
-  # The user id of a valid `Authorization: Token <jwt>` header value, or nil.
+  # The user id of a valid `Authorization: Token <jwt>` header value, or nil. FastJWT (ext/jwt) does the
+  # splitting, decoding and the signature check for tokens with the header this server issues.
   def verify(header)
-    return nil unless header.start_with?(PREFIX)
+    claims = FastJWT.claims(header, HEADER, @key)
+    claims = slow_claims(header) if claims == false
+    return nil unless claims
 
-    token = header.byteslice(6, header.bytesize - 6)
-    dot1 = token.index(".") or return nil
-    dot2 = token.index(".", dot1 + 1) or return nil
-    return nil if token.index(".", dot2 + 1)
-
-    header_part = token.byteslice(0, dot1)
-    return nil unless header_part == HEADER || hs256?(header_part)
-
-    signature = unb64(token.byteslice(dot2 + 1, token.bytesize - dot2 - 1))
-    return nil unless signature&.bytesize == 32
-
-    input = token.byteslice(0, dot2)
-    return nil unless Sodium.verify32(sign(input), signature) # rbnacl turns the 0 return into true
-
-    claims = JSON.parse(unb64(token.byteslice(dot1 + 1, dot2 - dot1 - 1)) || (return nil))
+    claims = JSON.parse(claims)
     return nil unless claims.is_a?(Hash)
 
     sub = claims["sub"]
@@ -128,6 +106,24 @@ class Tokens
   def self.token_of(header) = header.byteslice(6, header.bytesize - 6)
 
   private
+
+  # Any other header: decoded and checked for "alg": "HS256" here; the claims JSON when the signature holds.
+  def slow_claims(header)
+    return nil unless header.start_with?(PREFIX)
+
+    token = header.byteslice(6, header.bytesize - 6)
+    dot1 = token.index(".") or return nil
+    dot2 = token.index(".", dot1 + 1) or return nil
+    return nil if token.index(".", dot2 + 1) || !hs256?(token.byteslice(0, dot1))
+
+    signature = unb64(token.byteslice(dot2 + 1, token.bytesize - dot2 - 1))
+    return nil unless signature&.bytesize == 32
+
+    input = token.byteslice(0, dot2)
+    return nil unless Sodium.verify32(sign(input), signature) # rbnacl turns the 0 return into true
+
+    unb64(token.byteslice(dot1 + 1, dot2 - dot1 - 1))
+  end
 
   def sign(input)
     Sodium.hmac_sha256(@mac, input, input.bytesize, @key)

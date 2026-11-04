@@ -4,6 +4,7 @@ require "async"
 require "etc"
 require_relative "conduit"
 require_relative "http"
+require_relative "bcrypt_service"
 
 # Ruby runs one thread at a time per process, so the server is one process per core. The master loads
 # the code, warms YJIT on the whole request path (the compiled code is shared with the workers through
@@ -45,7 +46,7 @@ end
 
 def warm_up_in(task)
   begin
-    db = DB.new(DATABASE_URL, 1, SQL::STATEMENTS, setup: SQL::SETUP)
+    db = DB.new(DATABASE_URL, 1, SQL::ALL, setup: SQL::SETUP)
     db.start
     app = Conduit.new(db, SECRET)
     pg = PG.connect(DATABASE_URL)
@@ -78,9 +79,10 @@ def warm_up_in(task)
   end
 end
 
-def serve(index)
+def serve(index, bcrypt)
   Async do |task|
-    db = DB.new(DATABASE_URL, PG_CONNECTIONS, SQL::STATEMENTS, setup: SQL::SETUP)
+    Bcrypt.client = BcryptService::Client.new(bcrypt)
+    db = DB.new(DATABASE_URL, PG_CONNECTIONS, SQL::ALL, setup: SQL::SETUP)
     db.start
     app = Conduit.new(db, SECRET)
     # Client connections as io_uring direct descriptors, driven from C, where the kernel allows it, else
@@ -121,12 +123,17 @@ warm_up
 GC.compact
 Process.warmup
 
+lanes = BcryptService.calibrate
+# One socketpair per worker for bcrypt, made before the fork: the worker keeps one end, the master the other.
+pairs = Array.new(WORKERS) { UNIXSocket.pair(:SEQPACKET) }
 pids = Array.new(WORKERS) do |index|
   fork do
     %w[TERM INT].each { |signal| trap(signal) { exit!(0) } }
-    serve(index)
+    pairs.each_with_index { |(master_end, worker_end), i| master_end.close; worker_end.close unless i == index }
+    serve(index, pairs[index][1])
   end
 end
+pairs.each { |_, worker_end| worker_end.close }
 
 stop = lambda do |signal|
   pids.each do |pid|
@@ -137,10 +144,14 @@ stop = lambda do |signal|
 end
 %w[TERM INT].each { |signal| trap(signal) { stop.call("TERM") } }
 
-pid, status = Process.wait2
-unless status.success? && status.exitstatus.zero?
-  warn "worker #{pid} exited (#{status}); stopping the others"
+# The first worker to exit stops the rest, and the master with them.
+Thread.new do
+  pid, status = Process.wait2
+  warn "worker #{pid} exited (#{status}); stopping the others" unless status.success?
+  stop.call("TERM")
+  Process.waitall
+  exit!(status.success? ? 0 : 1)
 end
-stop.call("TERM")
-Process.waitall
-exit(status.success? ? 0 : 1)
+
+warn "bcrypt: #{lanes} lanes per set, #{BcryptService::THREADS} threads in the master"
+BcryptService::Server.new(pairs.map(&:first), lanes).run

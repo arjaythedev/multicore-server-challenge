@@ -150,7 +150,89 @@ module SQL
                     "d AS (DELETE FROM comments WHERE id = (SELECT id FROM c0 WHERE author_id = $1)) SELECT author_id FROM c0"
   }.transform_values(&:freeze).freeze
 
+  # --- batched reads (planner.rb) ---------------------------------------------------------------
+  # Each statement takes arrays of one batch's *distinct* keys and tags every row with the key's ordinal k,
+  # so one execution answers every request of that kind in the batch. Phase A finds what each request is
+  # about; phase B enriches the union of the articles phase A returned, once per article. The layout follows
+  # node-uwebsockets-zahidcakici (which credits PR #47, rust-epoll-WorriedArrow); the statements here are
+  # this entry's own. Results match SPEC.md's reference SQL; where a statement can't order rows within a
+  # key, planner.rb restores the order.
+
+  # A count that reaches the 1,000 cap is proven without aggregating; otherwise it's the exact count.
+  def self.capped(rows) = "CASE WHEN EXISTS (#{rows} OFFSET 999) THEN 1000::int8 ELSE (SELECT count(*) FROM (#{rows} LIMIT 1000) s) END"
+
+  # Article columns after k: id, author_id, slug, title, description, created_at, updated_at
+  COLS = "a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at"
+  PAD = "NULL::int8, NULL::text, NULL::text, NULL::text, NULL::timestamptz, NULL::timestamptz"
+
+  BATCH = {
+    b_tags: "SELECT array_to_json(ARRAY(SELECT name FROM tags ORDER BY name))::text",
+    # k, id, username, email, bio, image
+    b_users: "SELECT r.k, u.id, u.username, u.email, u.bio, u.image FROM unnest($1::int8[]) WITH ORDINALITY r(id, k) " \
+             "JOIN users u ON u.id = r.id",
+    # k, id, username, bio, image
+    b_profiles: "SELECT r.k, u.id, u.username, u.bio, u.image FROM unnest($1::text[]) WITH ORDINALITY r(username, k) " \
+                "JOIN users u ON u.username = r.username",
+    # k, COLS, body
+    b_articles: "SELECT r.k, #{COLS}, a.body FROM unnest($1::text[]) WITH ORDINALITY r(slug, k) JOIN articles a ON a.slug = r.slug",
+    # k, article id, comment id, body, created_at, updated_at, author_id, username, bio, image (an article
+    # without comments gives one row with a NULL comment id: it exists)
+    # n numbers each article's comments newest first, so the order survives the join.
+    b_comments: "SELECT r.k, a.id, c.id, c.body, c.created_at, c.updated_at, c.author_id, u.username, u.bio, u.image, c.n " \
+                "FROM unnest($1::text[]) WITH ORDINALITY r(slug, k) JOIN articles a ON a.slug = r.slug " \
+                "LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id, " \
+                "row_number() OVER (ORDER BY c.created_at DESC, c.id DESC) AS n FROM comments c " \
+                "WHERE c.article_id = a.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true " \
+                "LEFT JOIN users u ON u.id = c.author_id",
+    # Lists: count rows have k <= 0 (-k is the count key, the count in column 1); page rows have k > 0.
+    b_global: "SELECT 0::int8, (SELECT count(*) FROM (SELECT 1 FROM articles ORDER BY id LIMIT 1000) s), #{PAD} " \
+              "UNION ALL SELECT r.k, #{COLS} FROM unnest($1::int8[], $2::int8[]) WITH ORDINALITY r(lim, off, k) " \
+              "CROSS JOIN LATERAL (SELECT * FROM articles a ORDER BY a.id DESC LIMIT r.lim OFFSET r.off) a",
+    b_tag: "SELECT -r.k, #{capped("SELECT 1 FROM article_tags at WHERE at.tag_id = t.id")}, #{PAD} " \
+           "FROM unnest($1::text[]) WITH ORDINALITY r(tag, k) LEFT JOIN tags t ON t.name = r.tag " \
+           "UNION ALL SELECT r.k, #{COLS} FROM unnest($2::text[], $3::int8[], $4::int8[]) WITH ORDINALITY r(tag, lim, off, k) " \
+           "JOIN tags t ON t.name = r.tag CROSS JOIN LATERAL (SELECT at.article_id FROM article_tags at WHERE at.tag_id = t.id " \
+           "ORDER BY at.article_id DESC LIMIT r.lim OFFSET r.off) p JOIN articles a ON a.id = p.article_id",
+    b_author: "SELECT -r.k, #{capped("SELECT 1 FROM articles a WHERE a.author_id = u.id")}, #{PAD} " \
+              "FROM unnest($1::text[]) WITH ORDINALITY r(username, k) LEFT JOIN users u ON u.username = r.username " \
+              "UNION ALL SELECT r.k, #{COLS} FROM unnest($2::text[], $3::int8[], $4::int8[]) WITH ORDINALITY r(username, lim, off, k) " \
+              "JOIN users u ON u.username = r.username CROSS JOIN LATERAL (SELECT * FROM articles a WHERE a.author_id = u.id " \
+              "ORDER BY a.id DESC LIMIT r.lim OFFSET r.off) a",
+    b_favorited: "SELECT -r.k, #{capped("SELECT 1 FROM favorites f WHERE f.user_id = u.id")}, #{PAD} " \
+                 "FROM unnest($1::text[]) WITH ORDINALITY r(username, k) LEFT JOIN users u ON u.username = r.username " \
+                 "UNION ALL SELECT r.k, #{COLS} FROM unnest($2::text[], $3::int8[], $4::int8[]) WITH ORDINALITY r(username, lim, off, k) " \
+                 "JOIN users u ON u.username = r.username CROSS JOIN LATERAL (SELECT f.article_id FROM favorites f WHERE f.user_id = u.id " \
+                 "ORDER BY f.article_id DESC LIMIT r.lim OFFSET r.off) p JOIN articles a ON a.id = p.article_id",
+    # Feeds: capped counts per distinct viewer (k <= 0), pages per (viewer, limit, offset) (k > 0). A page reads
+    # at most limit + offset of each followee's newest ids from articles_author_idx.
+    b_feed: "SELECT -r.k, #{capped("SELECT 1 FROM articles a WHERE a.author_id = ANY(ARRAY(SELECT fo.followee_id FROM follows fo " \
+                                     "WHERE fo.follower_id = r.v)) ORDER BY a.author_id, a.id DESC")}, #{PAD} " \
+            "FROM unnest($1::int8[]) WITH ORDINALITY r(v, k) " \
+            "UNION ALL SELECT r.k, #{COLS} FROM unnest($2::int8[], $3::int8[], $4::int8[]) WITH ORDINALITY r(v, lim, off, k) " \
+            "CROSS JOIN LATERAL (SELECT y.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 " \
+            "WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT r.lim + r.off) y " \
+            "WHERE fo.follower_id = r.v ORDER BY y.id DESC LIMIT r.lim OFFSET r.off) x JOIN articles a ON a.id = x.id",
+    # Phase B. One row per distinct article: id, tag ids, favorites count, author username, bio, image.
+    b_enrich: "SELECT r.id, ARRAY(SELECT at.tag_id FROM article_tags at WHERE at.article_id = r.id), " \
+              "(SELECT count(*) FROM favorites f WHERE f.article_id = r.id), u.username, u.bio, u.image " \
+              "FROM unnest($1::int8[], $2::int8[]) r(id, author) JOIN users u ON u.id = r.author",
+    # Names of every tag those articles carry, in the database's name order (tagList is sorted by name).
+    b_tag_names: "SELECT t.id, t.name FROM tags t WHERE t.id IN " \
+                 "(SELECT at.tag_id FROM article_tags at WHERE at.article_id = ANY($1::int8[])) ORDER BY t.name",
+    # Viewer flags: (0, viewer, article) for each favorited pair asked about, (1, viewer, followee) for each
+    # followed pair; each viewer's candidates are one primary-key range scan (= ANY).
+    b_flags: "WITH p AS (SELECT x.v, array_agg(x.a) AS aa FROM unnest($1::int8[], $2::int8[]) x(v, a) GROUP BY x.v), " \
+             "q AS (SELECT x.v, array_agg(x.u) AS uu FROM unnest($3::int8[], $4::int8[]) x(v, u) GROUP BY x.v) " \
+             "SELECT 0::int8, p.v, f.article_id FROM p CROSS JOIN LATERAL " \
+             "(SELECT f.article_id FROM favorites f WHERE f.user_id = p.v AND f.article_id = ANY(p.aa)) f " \
+             "UNION ALL SELECT 1::int8, q.v, fo.followee_id FROM q CROSS JOIN LATERAL " \
+             "(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = q.v AND fo.followee_id = ANY(q.uu)) fo"
+  }.transform_values(&:freeze).freeze
+
   # Per connection: no JIT (a list's generic plan estimated enough rows to trigger it, and compiling took
   # far longer than running), and generic plans from the first execution (no replanning per call).
-  SETUP = ["SET jit = off", "SET plan_cache_mode = force_generic_plan", "SET TIME ZONE 'UTC'"].freeze
+  SETUP = ["SET jit = off", "SET plan_cache_mode = force_generic_plan", "SET TIME ZONE 'UTC'",
+           "SET max_parallel_workers_per_gather = 0"].freeze
+
+  ALL = STATEMENTS.merge(BATCH).freeze
 end

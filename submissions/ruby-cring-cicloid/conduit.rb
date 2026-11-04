@@ -5,6 +5,7 @@ require "uri"
 require_relative "auth"
 require_relative "db"
 require_relative "sql"
+require_relative "planner"
 
 # The Conduit API (SPEC.md) on a plain interface: #call(method, target, authorization, body) returns
 # [status, document]. `target` is the request target (path and query), `authorization` the header value
@@ -31,10 +32,11 @@ class Conduit
   INT64_MAX = (2**63) - 1
   DEFAULT_LIMIT = "20"
   ZERO = "0"
-  MAX_PASSWORD = 72 # bcrypt uses the first 72 bytes; longer passwords are refused rather than truncated
+  MAX_PASSWORD = Bcrypt::MAX # longer passwords are refused rather than truncated
 
   def initialize(db, secret)
     @db = db
+    @planner = Planner.new(db)
     @tokens = Tokens.new(secret)
     @array = PG::TextEncoder::Array.new
   end
@@ -69,7 +71,7 @@ class Conduit
         elsif method == POST then create_article(authorization, body)
         else NOT_FOUND
         end
-      when "tags" then method == GET ? [200, @db.value(:tags, [])] : NOT_FOUND
+      when "tags" then method == GET ? [200, @planner.tags] : NOT_FOUND
       when "user"
         if method == GET then current_user(authorization)
         elsif method == PUT then update_user(authorization, body)
@@ -144,7 +146,7 @@ class Conduit
     password = user["password"]
     return INVALID unless filled?(username) && filled?(email) && filled?(password) && password.bytesize <= MAX_PASSWORD
 
-    hash = Bcrypt.create(password)
+    hash = Bcrypt.create(password) or return INVALID
     result = @db.query(:register, [username, email, hash])
     row = result.values.first
     result.clear
@@ -173,8 +175,9 @@ class Conduit
   def current_user(authorization)
     id = authorization && @tokens.verify(authorization) or return UNAUTHORIZED
 
-    document = @db.value(:user, [id, Tokens.token_of(authorization)]) or return UNAUTHORIZED
-    [200, document]
+    _, username, email, bio, image = @planner.user(id) || (return UNAUTHORIZED)
+    [200, JSON.generate({ "user" => { "email" => email, "token" => Tokens.token_of(authorization), "username" => username,
+                                      "bio" => bio, "image" => image } })]
   end
 
   def update_user(authorization, body)
@@ -185,7 +188,7 @@ class Conduit
                           optional_string?(bio) && optional_string?(image)
     return INVALID if password && password.bytesize > MAX_PASSWORD
 
-    hash = password && Bcrypt.create(password)
+    hash = password && (Bcrypt.create(password) or return INVALID)
     document = @db.value(:update_user, [id, email, username, hash, bio, image, Tokens.token_of(authorization)])
     document ? [200, document] : UNAUTHORIZED
   end
@@ -195,7 +198,7 @@ class Conduit
   def profile(username, authorization)
     viewer = viewer(authorization) or return UNAUTHORIZED
 
-    document = @db.value(:profile, [viewer, username]) or return NOT_FOUND
+    document = @planner.profile(viewer, username) or return NOT_FOUND
     [200, document]
   end
 
@@ -212,16 +215,12 @@ class Conduit
     viewer = viewer(authorization) or return UNAUTHORIZED
     params = query_params(query) or return INVALID
     limit, offset = page(params) || (return INVALID)
-    statement, value = if (tag = params["tag"]) && !tag.empty? then [:list_tag, tag]
-                       elsif (author = params["author"]) && !author.empty? then [:list_author, author]
-                       elsif (favorited = params["favorited"]) && !favorited.empty? then [:list_favorited, favorited]
-                       end
-    document = if statement
-                 @db.value(statement, [viewer, limit, offset, value])
-               else
-                 @db.value(:list_all, [viewer, limit, offset])
-               end
-    [200, document]
+    kind, value = if (tag = params["tag"]) && !tag.empty? then [:tag, tag]
+                  elsif (author = params["author"]) && !author.empty? then [:author, author]
+                  elsif (favorited = params["favorited"]) && !favorited.empty? then [:favorited, favorited]
+                  else [:global, nil]
+                  end
+    [200, @planner.list(kind, viewer, value, limit, offset)]
   end
 
   def feed(query, authorization)
@@ -229,13 +228,13 @@ class Conduit
     params = query_params(query) or return INVALID
     limit, offset = page(params) || (return INVALID)
 
-    [200, @db.value(:feed, [id, limit, offset])]
+    [200, @planner.feed(id, limit, offset)]
   end
 
   def article(slug, authorization)
     viewer = viewer(authorization) or return UNAUTHORIZED
 
-    document = @db.value(:article, [viewer, slug]) or return NOT_FOUND
+    document = @planner.article(viewer, slug) or return NOT_FOUND
     [200, document]
   end
 
@@ -295,7 +294,7 @@ class Conduit
   def comments(slug, authorization)
     viewer = viewer(authorization) or return UNAUTHORIZED
 
-    document = @db.value(:comments, [viewer, slug]) or return NOT_FOUND
+    document = @planner.comments(viewer, slug) or return NOT_FOUND
     [200, document]
   end
 

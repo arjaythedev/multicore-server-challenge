@@ -4,3 +4,11 @@ ext/ring/Makefile
 ext/ring/*.o
 ext/ring/*.so
 ext/ring/mkmf.log
+ext/bcrypt/Makefile
+ext/bcrypt/*.o
+ext/bcrypt/*.so
+ext/bcrypt/mkmf.log
+ext/jwt/Makefile
+ext/jwt/*.o
+ext/jwt/*.so
+ext/jwt/mkmf.log
