@@ -57,9 +57,9 @@ def worker(cfg: dict) -> None:
     uvloop.run(main())
 
 
+
 def supervise(cfg: dict) -> None:
     children: dict[int, int] = {}  # pid -> worker number
-    started: dict[int, float] = {}
     stopping = False
 
     def spawn(i: int) -> None:
@@ -75,7 +75,6 @@ def supervise(cfg: dict) -> None:
                 code = 1
             os._exit(code)
         children[pid] = i
-        started[i] = time.monotonic()
 
     def stop(signum, frame) -> None:
         nonlocal stopping
@@ -88,21 +87,24 @@ def supervise(cfg: dict) -> None:
     signal.signal(signal.SIGINT, stop)
     print(f"conduit: {cfg['cpus']} CPUs, {cfg['workers']} workers with {cfg['pool_size']} connections each, "
           f"listening on {cfg['host']}:{cfg['port']}", file=sys.stderr, flush=True)
+
     for i in range(cfg["workers"]):
         spawn(i)
+
     while children:
         try:
             pid, status = os.wait()
         except ChildProcessError:
             break
+
         i = children.pop(pid, None)
-        if i is None or stopping:
-            continue
-        print(f"worker {i} (pid {pid}) exited with status {status}, restarting", file=sys.stderr, flush=True)
-        if time.monotonic() - started[i] < 2:  # dying right after start: don't spin
-            time.sleep(1)
-        if not stopping:
-            spawn(i)
+        if i is not None and not stopping:
+            print(
+                f"worker {i} (pid {pid}) exited with status {status}; "
+                "not restarting",
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 if __name__ == "__main__":
