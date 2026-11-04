@@ -202,6 +202,11 @@ export const main = (): i32 => {
       region = opened.expect("the read service's region")
     }
   }
+  // HTTP workers and the read service yield to Postgres when the box is full.
+  const loopNice: i32 = envInt("LOOP_NICE", 5)
+  if (index <= http && loopNice > 0 && loopNice < 20) {
+    setNice(loopNice)
+  }
   if (service && index === http) {
     if (region === null) {
       return 0

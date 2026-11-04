@@ -429,6 +429,9 @@ export class ReadPlan {
    * each lane's count bound and count done.
    */
   readonly laneStmts: i32[]
+  /** The tag names have been read, so the tag list's requests can be answered now; and which have been. */
+  tagsReady: boolean = false
+  readonly early: boolean[]
   /** The fewest feed pages a plan splits in two (FEED_SPLIT, 64). */
   feedSplitAt: i32 = 64
   readonly laneCount: i32[]
@@ -551,6 +554,7 @@ export class ReadPlan {
     this.askStart = new Array<i32>(2 * PLAN_MAX + 1)
     this.flagText = new Array<u8>(4096)
     this.askTable = new Array<i32>(ID_TABLE)
+    this.early = new Array<boolean>(PLAN_MAX)
     this.laneStmts = new Array<i32>(LANES * LANE_STMTS)
     this.laneCount = new Array<i32>(LANES)
     this.laneDone = new Array<i32>(LANES)
@@ -625,6 +629,10 @@ export class ReadPlan {
       this.kindCountN[k] = 0
     }
     this.clearKeyTables()
+    for (let k: i32 = 0; k < this.count; k++) {
+      this.early[k] = false
+    }
+    this.tagsReady = false
     this.count = 0
     this.idEnd = 0
     // Each table entry is cleared at the slot it was put in.
@@ -1173,6 +1181,7 @@ export class ReadPlan {
       o = jsonOutString(out, o, this.names, this.nameStart[r], this.nameLen[r])
     }
     this.tagsJsonEnd = jsonOutRaw(out, o, this.f[18])
+    this.tagsReady = true
   }
 
   /** A list statement's row: (k, count, ids, authors), a count row when k <= 0 and a page row when k > 0. */

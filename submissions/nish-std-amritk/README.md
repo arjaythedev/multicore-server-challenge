@@ -5,7 +5,8 @@ Front: direct
 An update of this submission, scored at 91,000 users in #83 (`3de991e`),
 100,000 in #116 (`6e69d72`), 140,000 in #159 (`6cdf1fd`), 180,000 in
 #189 (`76a40a5`) and 200,000 in #196 (`6b5557b`), on the same design. Since
-#196: each statement of a plan's group gets a connection of its own, the
+#196: tag lists are answered as soon as their statement ends, HTTP workers and
+the read service run at nice 5, and each statement of a plan's group gets a connection of its own, the
 feeds split in two, instead of two lanes pipelined four deep on whatever
 connections the pool had opened. Since #189: plans hold up to 4,096 reads
 over a 60 ms window instead of 2,048 over 40 ms, and Nish 0.32.0's faster
@@ -31,7 +32,7 @@ read queue than four could have, where #83 ran
 two), and Nish 0.23.1 no longer sweeps every idle connection on every turn of
 the loop.
 
-Nish 0.32.0 (a statically typed TypeScript subset compiled to native code
+Nish 0.34.0 (a statically typed TypeScript subset compiled to native code
 through LLVM), built with clang-18 and lld-18 from LLVM 18, against
 PostgreSQL 18. The compiler runs on Node.js 22.18.0 at build time only; the
 server is one native binary with no runtime dependency beyond libc. Every
@@ -46,9 +47,11 @@ bash build.sh
 DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=... HOST=0.0.0.0 PORT=80 bash start.sh
 ```
 
-The server needs Nish 0.32.0, whose bcrypt batch kernels take a hash in
-6.5% less time at five lanes on the Xeon VM (below): 0.31.0 renamed the
-HTTP/1.1 codec `nish/net/http1-codec`. 0.26.0 brought binary result columns to
+The server needs Nish 0.34.0, which scans HTTP/1.1 request heads a vector
+at a time and keeps a connection's per-request path on its hot fields. 0.32.0's
+bcrypt batch kernels take a hash in 6.5% less time at five lanes on the Xeon
+VM (below), and 0.31.0 renamed the HTTP/1.1 codec `nish/net/http1-codec`.
+0.26.0 brought binary result columns to
 `nish/net/postgres` (`bindStartBinary`, `binaryInt`, `PgBinary`) and
 `TCP_QUICKACK` to `netSetOption`, and 0.27.0 the binary `PgBatcher`
 (`PgBatchConfig.binary`), `PgBinaryArray` for an integer array column, and
@@ -180,6 +183,12 @@ and four on the box), and
   spend in each stage and lane. On the Xeon VM at 175,000 users, group A
   went from 48 ms to 30, group B from 31 to 28, and the wait for the counts
   after B from 13–18 ms to 2.
+- **Tag lists answered early.** `/api/tags` needs only its plan's tag
+  statement, so a tag read need not wait for the rest of the plan: the service
+  answers it when that statement ends (`EARLY_TAGS`, on), and the plan's send
+  skips it.
+- **HTTP workers and the read service at nice 5** (`LOOP_NICE`, 0 turns it
+  off), so they yield to Postgres when the box is full.
 - **Each author once.** `plan_meta` and `plan_comments` no longer join `users`
   row by row: a plan collects the distinct authors of its articles and
   comments, reads them with one `plan_users` statement, and writes each
@@ -412,6 +421,20 @@ the CPU is all used, it is the other way: more statements at once cost about
 448 for `6b5557b`). #196 scored 200,000 at 85% of the box and failed 210,000
 on p95 with CPU to spare, which is the VM's case, not the saturated run's.
 
+Then Nish 0.34.0, tag lists answered early and scheduling, alternated on the
+same VM, two holds each at 185,000. `SCHED_BATCH` on every process matched nice
+5 within these holds, and both together added nothing, so this build uses nice
+5, which needs no outside tool:
+
+| Build | Verdict | req/s | p50 | p95 | p99 | Postgres + rest µs a request | Box busy |
+|---|---|--:|--:|--:|--:|---|--:|
+| Nish 0.34.0, no early tags | FAIL, PASS | 46,103–46,936 | 154–157 ms | 314–543 ms | 442–1,924 ms | 71.1–71.9 + 66.6–68.3 | 81% |
+| with early tags | PASS, PASS | 47,314–47,354 | 128–131 ms | 254–255 ms | 386–404 ms | 70.7–71.5 + 63.8–64.8 | 80–81% |
+| this one, also nice 5 | PASS, PASS | 47,349–47,434 | 127–130 ms | 218–239 ms | 324–367 ms | 70.3–71.2 + 62.4–63.5 | 79–80% |
+
+The one FAIL is unexplained; that build's other hold passed. This VM cannot
+show the gain above about 190,000 users, where its network interrupts run out.
+
 The window's extra wait shows as p95 while the box has room. At 185,000 the
 two builds' holds overlap: past the VM's limit its load box runs out of local
 ports and holds vary by 2x, so the saturated runs above are what rank them. At 195,000 users
@@ -619,6 +642,11 @@ from the idea, not the code:
   and rust-epoll-WorriedArrow: reading each comment author once per batch.
   From the same two and zig-iouring-nick-potts: a feed's `following` needs no
   query. From WorriedArrow: far bigger batches than this server had kept.
+- From [rust-epoll-theCatWisel](https://github.com/arjaythedev/multicore-server-challenge/tree/main/submissions/rust-epoll-theCatWisel)
+  ([#201](https://github.com/arjaythedev/multicore-server-challenge/pull/201)):
+  answering tag lists and other cheap reads before the rest of the batch, here
+  tag lists only, and reactors at nice 5. From the same entry and
+  zig-iouring-nick-potts: trying `SCHED_BATCH`, measured here and not kept.
 - `enable_memoize=off` as a session option was set first by
   [c-iouring-tigokraft](https://github.com/arjaythedev/multicore-server-challenge/tree/main/submissions/c-iouring-tigokraft)
   ([#10](https://github.com/arjaythedev/multicore-server-challenge/pull/10)),

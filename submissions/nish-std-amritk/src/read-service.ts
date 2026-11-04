@@ -35,7 +35,7 @@ import {
   PgPool,
 } from "nish/net/postgres"
 import { RING_EMPTY, RING_TOO_SMALL } from "nish/sync/ring"
-import { CountRun, LANES, LANES_ALL, PLAN_ALONE, ReadPlan } from "./plan"
+import { CountRun, K_TAGS, LANES, LANES_ALL, PLAN_ALONE, ReadPlan } from "./plan"
 import { ANSWER_ALONE, ANSWER_MAX, ANSWER_TAIL, READ_HEAD, ReadLink } from "./read-ring"
 import { registerPlanStatements } from "./sql"
 import { pgConfig, WorkerConfig } from "./worker"
@@ -109,6 +109,7 @@ export class ReadService {
    * (`stamps[8 * p + k]`), summed over the plans freed and printed every 10 s.
    */
   stats: boolean = false
+  earlyTags: boolean = true
   stamps: i64[]
   spans: i64[]
   statPlans: i64 = 0
@@ -175,6 +176,7 @@ export class ReadService {
     this.planWait = toI64(cfg.planWaitUs) * 1000
     this.rec = new Array<u8>(READ_HEAD + 2048)
     this.stats = (getenv("PLAN_STATS") ?? "") === "1"
+    this.earlyTags = (getenv("EARLY_TAGS") ?? "1") !== "0"
     const split: string = getenv("FEED_SPLIT") ?? ""
     for (const plan of this.plans) {
       plan.feedSplitAt = split.length > 0 ? toI32(parseInt(split)) : 64
@@ -603,6 +605,30 @@ export class ReadService {
   }
 
   /**
+   * The tag list is one statement, the first a plan's lists read, and about a
+   * fifth of all reads: its requests are answered as soon as it has ended,
+   * not when the plan's slowest statement has. One whose worker's ring is
+   * full goes with the rest of the plan.
+   */
+  sendTags(p: i32): void {
+    const plan: ReadPlan = this.plans[p]
+    for (let i: i32 = 0; i < plan.count; i++) {
+      if (plan.kinds[i] === K_TAGS && !plan.early[i]) {
+        plan.outEnd = 0
+        if (plan.render(i) !== 200 || plan.outEnd > ANSWER_MAX) {
+          return
+        }
+        const tag: i32 = plan.tags[i]
+        const len: i32 = plan.seal(tag / WORKER_TAGS, 200, ANSWER_TAIL)
+        if (!this.links[tag % WORKER_TAGS].push(plan.out, len)) {
+          return
+        }
+        plan.early[i] = true
+      }
+    }
+  }
+
+  /**
    * Sends plan `p`'s answers from `sendNext[p]` on. An answer whose worker's
    * ring is full waits there, and the plan with it, for the next turn: the
    * service goes on reading and planning meanwhile instead of spinning. A
@@ -612,6 +638,9 @@ export class ReadService {
     const plan: ReadPlan = this.plans[p]
     const lost: boolean = this.lost[p]
     for (let i: i32 = this.sendNext[p]; i < plan.count; i++) {
+      if (plan.early[i]) {
+        continue
+      }
       let status: i32 = 500
       plan.outEnd = 0
       if (!lost) {
@@ -766,7 +795,11 @@ export class ReadService {
       }
       this.laneDone(p)
     } else if (this.state[p] === S_A) {
+      const ready: boolean = plan.tagsReady
       plan.eventA(conn, event, this.ticketLane[at])
+      if (plan.tagsReady && !ready && this.earlyTags) {
+        this.sendTags(p)
+      }
     } else {
       plan.eventB(conn, event, this.ticketLane[at])
     }
