@@ -49,6 +49,7 @@ let main _ =
     Io.uringClassic <- env "URING_BUFS" "ring" = "classic"
     Io.uringBufs <- num "URING_NBUFS" 8192
     Io.uringBufLen <- num "URING_BUFLEN" 2048
+    Io.ownFdTables <- env "FD_TABLES" "own" = "own"
     let limit = Io.start host port loops (reads + sideReads + writes + 200) (num "IO_NICE" 0)
     eprintfn "conduit on %s:%d: %d %s I/O threads, postgres %d + %d read and %d write connections, fd limit %d" host port loops (if Io.uring then "io_uring" else "epoll") reads sideReads writes limit
     Thread.Sleep Timeout.Infinite

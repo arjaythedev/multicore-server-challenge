@@ -58,8 +58,6 @@ type private Conn() =
     member val Next = -1 with get, set
     member val InLru = false with get, set
 
-let mutable private conns: Conn[] = [||]
-
 /// epoll's tag for a connection: fd and generation. An fd closed earlier in a batch of events can already belong to
 /// another loop by the time its stale event comes up; the generation tells that event apart from a live one.
 let inline private epTag (fd: int) (c: Conn) =
@@ -72,6 +70,10 @@ let mutable uringClassic = false
 let mutable uringBufs = 8192
 let mutable uringBufLen = 2048
 
+/// Each I/O thread gets its own fd table (Run), so RLIMIT_NOFILE, which is counted per table, holds per thread as
+/// it does per worker in a multi-process server. FD_TABLES=shared turns it off.
+let mutable ownFdTables = true
+
 // completion kinds in the top 4 bits of user_data; fd in the low 32, generation (or send slot) in bits 32-59
 [<Literal>]
 let private KAccept = 1UL
@@ -83,11 +85,13 @@ let private KSend = 3UL
 let private KWake = 4UL
 let inline private ud (k: uint64) (mid: int) (fd: int) = (k <<< 60) ||| ((uint64 mid &&& 0xFFFFFFFUL) <<< 32) ||| uint64 (uint32 fd)
 let inline private gen28 (g: int) = g &&& 0xFFFFFFF
-let mutable private fdBudget = 1000
-let mutable private openCount = 0
 
 [<Sealed>]
-type Loop(index: int, listenFd: int) =
+type Loop(index: int, listenFd: int, tableSize: int, sharedBudget: int) =
+    // fd -> connection, for this loop's fds alone: with own fd tables the same number is a different socket per loop
+    let conns: Conn[] = Array.zeroCreate tableSize
+    let mutable fdBudget = sharedBudget
+    let mutable openCount = 0
     let ep = Sys.epoll_create1 0x80000
     let efd = Sys.eventfd (0u, 0x800 ||| 0x80000)
     let inbox = ConcurrentQueue<struct (int * int * byte[])>()
@@ -140,7 +144,7 @@ type Loop(index: int, listenFd: int) =
             // with a recv in flight in the ring, close alone would leave the socket open: shutdown ends the recv
             if useRing then Sys.shutdown (fd, 2) |> ignore
             Sys.close fd |> ignore
-            Interlocked.Decrement(&openCount) |> ignore
+            openCount <- openCount - 1
 
     /// closes the connection idle the longest (one with no request in flight)
     let evictOne () =
@@ -411,7 +415,8 @@ type Loop(index: int, listenFd: int) =
         if fd >= conns.Length then
             Sys.close fd |> ignore
         else
-            if Interlocked.Increment(&openCount) > fdBudget then evictOne () |> ignore
+            openCount <- openCount + 1
+            if openCount > fdBudget then evictOne () |> ignore
             Sys.setsockopt (fd, 6, 1, 1) |> ignore // TCP_NODELAY
             let c =
                 match conns.[fd] with
@@ -581,6 +586,11 @@ type Loop(index: int, listenFd: int) =
 
     member _.Index = index
 
+    /// from any thread: a stale answer only means a job is done for nobody, or skipped a moment after its client left
+    member _.Alive(fd: int, gen: int) =
+        let c = conns.[fd]
+        not (isNull c) && c.Open && c.Gen = gen
+
     /// called from any thread
     member _.Post(fd: int, gen: int, data: byte[]) =
         inbox.Enqueue(struct (fd, gen, data))
@@ -590,6 +600,9 @@ type Loop(index: int, listenFd: int) =
             Sys.write (efd, NativePtr.ofNativeInt (NativePtr.toNativeInt one), 8un) |> ignore
 
     member _.Run() =
+        // the copy keeps every fd opened so far under the same number (this loop's listener and eventfd, the runtime's);
+        // what this thread opens from here on, and closes, stays in its own table
+        if ownFdTables && Sys.unshare Sys.CLONE_FILES = 0 then fdBudget <- tableSize - 16 - 256
         if not (uring && runRing ()) then
             Sys.ctl ep Sys.EPOLL_CTL_ADD listenFd Sys.EPOLLIN TagListen |> ignore
             Sys.ctl ep Sys.EPOLL_CTL_ADD efd Sys.EPOLLIN TagWake |> ignore
@@ -619,11 +632,8 @@ type Loop(index: int, listenFd: int) =
 
 let mutable private loops: Loop[] = [||]
 
-/// Whether the client of a queued request is still connected (read from other threads: a stale answer only means
-/// a job is done for nobody, or skipped a moment after its client left)
-let alive (d: Dest) =
-    let c = conns.[d.Fd]
-    not (isNull c) && c.Open && c.Gen = d.Gen
+/// Whether the client of a queued request is still connected
+let alive (d: Dest) = loops.[d.Loop].Alive(d.Fd, d.Gen)
 
 /// Answers a request that went asynchronous. Safe from any thread.
 let post (d: Dest) (data: byte[]) = loops.[d.Loop].Post(d.Fd, d.Gen, data)
@@ -631,9 +641,16 @@ let post (d: Dest) (data: byte[]) = loops.[d.Loop].Post(d.Fd, d.Gen, data)
 /// Starts `count` I/O threads on host:port. reserve: fds kept free for Postgres, files and the runtime.
 let start (host: string) (port: int) (count: int) (reserve: int) (nice: int) =
     let limit = Sys.raiseNoFile ()
-    conns <- Array.zeroCreate (limit + 16)
-    fdBudget <- max 64 (limit - reserve)
-    loops <- Array.init count (fun i -> Loop(i, Sys.listenTcp host port))
+    // Files a loop thread opened and kept would be invisible to every other thread. So nothing that keeps one may be
+    // opened there for the first time: stderr's stream and the assemblies are opened now.
+    Console.Error.Flush()
+    let seen = HashSet<string>()
+    let rec load (a: Reflection.Assembly) =
+        for n in a.GetReferencedAssemblies() do
+            if seen.Add n.FullName then
+                try load (Reflection.Assembly.Load n) with _ -> ()
+    load (Reflection.Assembly.GetEntryAssembly())
+    loops <- Array.init count (fun i -> Loop(i, Sys.listenTcp host port, limit + 16, max 64 ((limit - reserve) / count)))
     for l in loops do
         Thread((fun () ->
                     Sys.schedThread ()

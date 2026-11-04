@@ -188,6 +188,12 @@ let raiseNoFile () : int =
 extern int shutdown(int fd, int how)
 
 [<Literal>]
+let CLONE_FILES = 0x400
+
+[<DllImport(C, SetLastError = true)>]
+extern int unshare(int flags)
+
+[<Literal>]
 let ENOBUFS = 105
 [<Literal>]
 let EINVAL = 22

@@ -403,4 +403,7 @@ type Conn(url: string, options: string) =
         p <- 0
 
     interface IDisposable with
-        member _.Dispose() = sock.Dispose()
+        // shutdown first: an I/O thread's copy of the fd table may still hold this socket, and Postgres must see it end
+        member _.Dispose() =
+            (try sock.Shutdown(SocketShutdown.Both) with _ -> ())
+            sock.Dispose()
