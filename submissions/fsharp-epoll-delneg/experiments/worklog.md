@@ -213,3 +213,9 @@ Script: `experiments/h.sh`.
   e24 epoll (own fd tables) 127/159, 110.0 (48.2 + 61.8), exactly 220,000 connects. All 0% errors, logins p95 ~245. So the stale-event crash is gone, and no eviction saves ~4% at
   220k, where only a tenth of the users were over the limit; the saving should grow with the load. e21 vs #87 at 80k, three pairs, both lanes busy: lane A 104.1 vs 104.9 and 103.0 (#87),
   lane B 106.4, 104.2 vs 103.6 (#87): level, PG ~3-4 µs behind (comments, addressed by e25), app ~3 µs ahead.
+- **io_uring on a real 6.8 kernel** (`experiments/kernel68`: boots an Ubuntu kernel package in QEMU, TCG, with `native/uring.c` under a small echo loop as PID 1). `6.8.0-1069-aws`: the inverted
+  reserved-byte check is really there: the first buffer ring registration fails, `resv[0] = 1` succeeds, and everything then works: deferred task work, multishot accept and recv (25,000 of 25,000
+  receives without re-arming), server-side close while a recv is pending (shutdown, close; the pending recv ends with a completion for a closed connection), an own fd table; classic provided buffers likewise.
+- **e25 search (solo, epoll, fd tables):** probes 200k pass (103.1 µs/req, PG 55.3), 400k fail (65,189 req/s, no crash, 0.1% errors), 300k fail, 250k pass (p95 462, 125.9 µs/req, PG 70.8), 280k and 260k fail
+  (260k: 131.9, PG 74.8), then the hold at 250k fails: p95 1032, 137.1 µs/req (app 57.4, PG 79.7), saturated at 7.8 cores. PG per request grew 44% over 40 minutes of searching: `articles` 500k -> 683k, `comments`
+  +575k, `favorites` +847k rows. The aged DB, not connections, now sets the ceiling.
