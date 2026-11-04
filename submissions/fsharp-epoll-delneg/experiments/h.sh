@@ -32,7 +32,7 @@ sudo systemctl stop $UNIT 2>/dev/null; sudo systemctl reset-failed $UNIT 2>/dev/
 pkill -f "$LG run -target http://127.0.0.[0-9]*:$APORT " 2>/dev/null
 rsync -a --delete --exclude experiments "$SUB"/ $APPDIR/ && chmod -R a+rX $APPDIR
 if [ "${FRESH:-1}" = 1 ]; then
-  psql -X -q -d postgres -c "DROP DATABASE IF EXISTS conduit WITH (FORCE)" -c "CREATE DATABASE conduit TEMPLATE conduit_seed STRATEGY FILE_COPY OWNER conduit"
+  psql -X -q -d postgres -c "DROP DATABASE IF EXISTS conduit WITH (FORCE)" -c "CREATE DATABASE conduit TEMPLATE ${FROM:-conduit_seed} STRATEGY FILE_COPY OWNER conduit"
   sudo systemctl restart postgresql@18-$PGCLUSTER; sync; [ -n "${LANE:-}" ] || echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
 fi
 ENVARGS=(); for kv in ${APPENV:-}; do ENVARGS+=(--setenv=$kv); done

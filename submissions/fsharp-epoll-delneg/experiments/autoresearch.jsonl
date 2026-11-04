@@ -23,3 +23,5 @@
 {"id": "e23", "label": "e23-eptag", "what": "epoll tag carries the connection generation; stale events ignored", "kind": "fix", "score": null, "note": "fixes crash above the fd budget; replay at fd limit 420 no longer crashes"}
 {"id": "e24", "label": "e24-fdtables", "what": "unshare(CLONE_FILES) per I/O thread; connection table per loop", "kind": "structural", "score": null, "note": "no eviction above 200k connections; holds queued"}
 {"id":"e26","label":"e26-flagscan","what":"favorite flags in one scan over viewers x articles","kind":"structural","score":null,"note":"dropped: 10.1 -> 24.4 ms per batch on replay"}
+{"id": "e27", "label": "e27-articlelane", "what": "single-article reads in the side lane; ARTICLE_LANE switch", "kind": "structural", "score": null, "note": "aged 180k fixed 100 ms: side 129.5,129.8 vs read 129.3,130.3 us/req: no difference"}
+{"id": "e28", "label": "e28-readclock", "what": "read clock follows the load: 5-150 ms, 3 us per job/s across both read lanes", "kind": "structural", "score": null, "note": "fixed clocks on aged 180k: 20 ms ~149, 100 ms ~130 us/req; no full search; final solo hold in worklog"}
