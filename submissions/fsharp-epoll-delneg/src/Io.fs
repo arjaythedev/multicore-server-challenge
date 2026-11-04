@@ -602,7 +602,9 @@ type Loop(index: int, listenFd: int, tableSize: int, sharedBudget: int) =
     member _.Run() =
         // the copy keeps every fd opened so far under the same number (this loop's listener and eventfd, the runtime's);
         // what this thread opens from here on, and closes, stays in its own table
-        if ownFdTables && Sys.unshare Sys.CLONE_FILES = 0 then fdBudget <- tableSize - 16 - 256
+        if ownFdTables then
+            if Sys.unshare Sys.CLONE_FILES = 0 then fdBudget <- tableSize - 16 - 256
+            elif index = 0 then eprintfn "io: no fd table per thread (errno %d), sharing one" (Sys.errno ()) // a seccomp profile, say
         if not (uring && runRing ()) then
             Sys.ctl ep Sys.EPOLL_CTL_ADD listenFd Sys.EPOLLIN TagListen |> ignore
             Sys.ctl ep Sys.EPOLL_CTL_ADD efd Sys.EPOLLIN TagWake |> ignore
