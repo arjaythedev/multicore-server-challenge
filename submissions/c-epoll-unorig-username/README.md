@@ -86,7 +86,7 @@ took Postgres from 59.4 and 58.4 µs per request to 52.8 and 52.7.
 Each lane (feeds, comments, the rest) starts a drain at most every 160 ms. A bigger batch shares more, and p95 has room. At
 230k users on the test box, 160 ms against 80 ms took Postgres from 54.9 and 53.9 µs per request to 46.1, and p95 from 184
 and 182 ms to 327 ms. A freed connection goes to the lane whose oldest read has waited longest, with at most 6 drains at
-once. That cap of 6 and the 8 read connections are #168's values, kept without a sweep of my own.
+once. That cap of 6 and the 8 read connections are #168's values.
 
 On a database aged by a full search, at 190,000 users, a 100 ms gap with 8 drains over 10 connections gave a p95 of 385 and
 373 ms against 477 and 488 ms, in two-minute runs. It is not the default. In a full `loadgen search` the same setting did worse
@@ -134,7 +134,7 @@ after the commit.
   fail only themselves.
 - A lost read connection reconnects and retries. After a few attempts the request is answered 500 rather than left hanging.
 - A write whose connection dies mid-group is answered 500: its commit is unknown, so nothing is claimed.
-- With backends killed, Postgres crashed, then down for 6 s, under load: 127,743 writes claimed and every one found in the database afterwards, 97 answered 500, the
+- With backends killed, Postgres crashed, then down for 6 s, under load: 129,930 writes claimed and every one found in the database afterwards, 94 answered 500, the
   longest request 4.3 s, and the server still up.
 - `accept()` out of descriptors stops accepting for 100 ms instead of exiting. Each loop has its own fd table
   (`unshare(CLONE_FILES)`), so `LimitNOFILE` applies per loop.
@@ -171,5 +171,5 @@ Borrowed, by section:
 - Section 7: group commit without `BEGIN`/`COMMIT` (#168).
 - Also: dropping reads of clients that hung up (#132), and a private fd table per loop (#154).
 
-New in this entry, as far as I could find: feeds merged in the server from one scan per followee, flag lookups as one hash-joined
-scan pinned with `OFFSET 0`, and ordering feed counts by id density.
+New in this entry, as far as I could find: feeds merged in the server from one scan per followee, and ordering feed counts by id
+density.
