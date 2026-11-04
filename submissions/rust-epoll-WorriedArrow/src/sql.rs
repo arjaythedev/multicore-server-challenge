@@ -141,9 +141,8 @@ pub fn read_statements() -> Vec<Stmt> {
             format!(
                 "WITH u AS MATERIALIZED ( \
                    SELECT r.k, r.v, ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.v) AS fids, \
-                     COALESCE((SELECT max(p.lim + p.off) FROM unnest($2::int8[], $3::int8[], $4::int8[]) p(v, lim, off) \
-                       WHERE p.v = r.v), 1) AS depth \
-                   FROM unnest($1::int8[]) WITH ORDINALITY r(v, k)), \
+                     r.depth \
+                   FROM unnest($1::int8[], $5::int8[]) WITH ORDINALITY r(v, depth, k)), \
                  hubs AS MATERIALIZED ( \
                    SELECT h.fid, \
                      (SELECT a.id FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC LIMIT 1 OFFSET h.depth - 1) AS floor_id, \
@@ -164,7 +163,7 @@ pub fn read_statements() -> Vec<Stmt> {
                      ORDER BY a2.id DESC LIMIT p.lim + p.off) y \
                    ORDER BY y.id DESC LIMIT p.lim OFFSET p.off) x"
             ),
-            &[INT8_ARRAY, INT8_ARRAY, INT8_ARRAY, INT8_ARRAY],
+            &[INT8_ARRAY, INT8_ARRAY, INT8_ARRAY, INT8_ARRAY, INT8_ARRAY],
         ),
         // Personal feeds, merged in the server: the same counts, hubs and floors as "feed", then each distinct
         // followee of the batch's viewers once, its newest ids down to the lowest floor and the deepest page among
@@ -174,9 +173,8 @@ pub fn read_statements() -> Vec<Stmt> {
             "feedm",
             "WITH u AS MATERIALIZED ( \
                SELECT r.k, r.v, ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.v) AS fids, \
-                 COALESCE((SELECT max(p.lim + p.off) FROM unnest($2::int8[], $3::int8[], $4::int8[]) p(v, lim, off) \
-                   WHERE p.v = r.v), 1) AS depth \
-               FROM unnest($1::int8[]) WITH ORDINALITY r(v, k)), \
+                 r.depth \
+               FROM unnest($1::int8[], $5::int8[]) WITH ORDINALITY r(v, depth, k)), \
              hubs AS MATERIALIZED ( \
                SELECT h.fid, \
                  (SELECT a.id FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC LIMIT 1 OFFSET h.depth - 1) AS floor_id, \
@@ -199,7 +197,7 @@ pub fn read_statements() -> Vec<Stmt> {
              SELECT 2::int8, ff.fid, NULL::int8, NULL::text, \
                ARRAY(SELECT a.id FROM articles a WHERE a.author_id = ff.fid AND a.id >= ff.floor_id ORDER BY a.id DESC LIMIT ff.depth) \
              FROM ff",
-            &[INT8_ARRAY, INT8_ARRAY, INT8_ARRAY, INT8_ARRAY],
+            &[INT8_ARRAY, INT8_ARRAY, INT8_ARRAY, INT8_ARRAY, INT8_ARRAY],
         ),
         // ---- phase B: enrichment over the union of everything phase A referenced ----
         // Article columns for articles phase A only returned ids for (feed pages), in the page-row layout.

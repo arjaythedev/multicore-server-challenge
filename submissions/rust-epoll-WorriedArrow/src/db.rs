@@ -529,6 +529,13 @@ impl ReadLane {
         // Only worth it when the batch has other phase-A work to overlap with.
         let others = aslug.len() + aid.len() + cmts.len() + global.len() + lists.iter().map(|l| l.page.len()).sum::<usize>();
         let split = self.s.feed_conn && feed.len() > 0 && others > 0;
+        // Each feed viewer's deepest page (limit + offset), so the statement needn't search the pages per viewer.
+        let mut feed_depth = vec![1i64; feed.len()];
+        for &(v, lim, off) in &feedpage.list {
+            if let Some(&i) = feed.map.get(&v) {
+                feed_depth[i as usize] = feed_depth[i as usize].max(lim + off);
+            }
+        }
         if split {
             let fc = Self::conn_of(&mut self.fconn, self.s)?;
             fc.out.bind_exec(
@@ -538,6 +545,7 @@ impl ReadLane {
                     Param::Raw(&int_array(feedpage.list.iter().map(|k| k.0))),
                     Param::Raw(&int_array(feedpage.list.iter().map(|k| k.1))),
                     Param::Raw(&int_array(feedpage.list.iter().map(|k| k.2))),
+                    Param::Raw(&int_array(feed_depth.iter().copied())),
                 ],
             );
             fc.out.sync();
@@ -655,6 +663,7 @@ impl ReadLane {
                     Param::Raw(&int_array(feedpage.list.iter().map(|k| k.0))),
                     Param::Raw(&int_array(feedpage.list.iter().map(|k| k.1))),
                     Param::Raw(&int_array(feedpage.list.iter().map(|k| k.2))),
+                    Param::Raw(&int_array(feed_depth.iter().copied())),
                 ],
             );
         }
