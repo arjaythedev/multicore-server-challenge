@@ -16,20 +16,24 @@ No caches across requests, no schema or Postgres config changes, no host tuning.
 ## Measured results
 
 On one AWS `c7i.2xlarge` running the server and Postgres, with 5 load boxes, the repo's `loadgen search` from 8,000 users, each
-search starting from a freshly seeded database so that holds run on a database aged by the earlier phases. Two searches per
-entry, interleaved. That box is well above the official one, so only the comparison means anything, and it is small:
+search starting from a freshly seeded database so that holds run on a database aged by the earlier phases. Searches of the two
+entries alternated. That box is well above the official one, so only the comparison means anything, and it is small:
 
-| Entry | Users held, search 1 | Users held, search 2 | Hold p95 ms (1 / 2) | Hold req/s (1 / 2) |
-|---|--:|--:|--:|--:|
-| zig-iouring-nick-potts | 210,000 | 190,000 | 500 / 412 | 52,375 / 47,773 |
-| this entry | 190,000 | 190,000 | 425 / 480 | 46,741 / 46,620 |
+| Search | zig-iouring-nick-potts | this entry |
+|---|--:|--:|
+| 1 | 210,000 | 190,000 |
+| 2 | 190,000 | 190,000 |
+| 3 | 200,000 | 200,000 |
+| 4 | 190,000 | 200,000 |
 
-This entry failed its 200,000-user hold by 3 ms and 26 ms of p95 (503 and 526 ms); the leader failed it at 569 ms in search 2 and
-stepped from 220,000 to a passing 210,000 in search 1. The same searches before reading flags by pair held 140,000 users for this entry (one search).
-Above its limit this entry's p95 stays near 500-650 ms up to 256,000 users, where the leader's rises past 1,000 ms; at its
-limit this entry's median is higher (about 340-380 ms against 230-290 ms). Searches of the same code differed by up to 20,000
-users, so a difference of one step is within noise. Both entries pass 2-minute probes to 256,000 users and fail holds there as
-the database ages.
+Users held for 5 minutes. Searches 1 and 2 are this entry before the gzip threshold in section 6 changed, 3 and 4 after it.
+The same code differed by 10,000-20,000 users from one search to the next, so a one-step difference is within noise. Before
+flags were read by pair (section 1) this entry held 140,000 users in one search.
+
+This entry's p95 stays near 500-560 ms from 200,000 up to 256,000 users, where the leader's rises past 700 ms and then 1,000 ms,
+but its median is higher at its limit (about 330-340 ms against 220-290 ms), and with 190,000 users on a database aged by a
+full search (follows 1% all-visible) the leader's 5-minute p95 was 418 ms against 468 ms for this entry. Both pass 2-minute
+probes to 256,000 users and fail holds there as the database ages.
 
 ## 1. Flat statements, joined here
 
@@ -82,8 +86,13 @@ took Postgres from 59.4 and 58.4 µs per request to 52.8 and 52.7.
 Each lane (feeds, comments, the rest) starts a drain at most every 160 ms. A bigger batch shares more, and p95 has room. At
 230k users on the test box, 160 ms against 80 ms took Postgres from 54.9 and 53.9 µs per request to 46.1, and p95 from 184
 and 182 ms to 327 ms. A freed connection goes to the lane whose oldest read has waited longest, with at most 6 drains at
-once. That cap of 6 and the 8 read connections are #168's values, kept without a sweep of my own. The gap is the one constant
-here that was tested against the leader's, and only at those two values.
+once. That cap of 6 and the 8 read connections are #168's values, kept without a sweep of my own.
+
+On a database aged by a full search, at 190,000 users, a 100 ms gap with 8 drains over 10 connections gave a p95 of 385 and
+373 ms against 477 and 488 ms, in two-minute runs. It is not the default. In a full `loadgen search` the same setting did worse
+(p95 about 610-690 ms in every hold from 270,000 down to 190,000 users): at 200,000 users and above the box has no idle time left,
+the bcrypt threads run only on idle time, and 93% of logins and sign-ups timed out at 10 s. `GAP_*_US`, `READ_CAP` and
+`READ_CONNS` set them. Cutting the cap to 4 drains is far worse (p95 about 1,030 ms at 190,000 users).
 
 ## 4. bcrypt
 
@@ -140,6 +149,9 @@ after the commit.
 | Phase 4 on parallel helper connections | 7% more Postgres CPU per request, no steady latency gain on an aged database | dropped |
 | Database threads at the default policy | p95 1,482 and 1,666 ms against 1,310 and 1,277 ms on an aged database | dropped |
 | 80 and 100 ms gaps on an aged database | p95 no better, Postgres CPU higher | dropped |
+| 100 ms gaps with 8 drains over 10 connections | p95 373-385 ms against 477-488 ms in 2-minute runs at 190k, but 93% of logins timed out in a full search and holds ran 610-690 ms | dropped |
+| Feed early-stop (newest id per followee first, then only the followees that can reach a page) | p95 561 and 571 ms to 623 and 599 ms, one more exchange per feed batch | dropped |
+| 3 event loops instead of 4 | p95 within 3%, no change in CPU | dropped |
 
 ## Credits
 
