@@ -89,7 +89,14 @@ def warm_up_in(task)
   end
 end
 
+# Our processes yield to Postgres: a worker at WORKER_NICE (default 5) lets Postgres run first, so batches
+# come back sooner and fill fuller; the master, which only runs bcrypt, at MASTER_NICE (default 10), so a
+# login never delays a request. Raising one's own niceness needs no privilege.
+WORKER_NICE = Integer(ENV.fetch("WORKER_NICE", "5"))
+MASTER_NICE = Integer(ENV.fetch("MASTER_NICE", "10"))
+
 def serve(index, bcrypt, planners)
+  Process.setpriority(Process::PRIO_PROCESS, 0, WORKER_NICE)
   Async do |task|
     Bcrypt.client = BcryptService::Client.new(bcrypt)
     db = DB.new(DATABASE_URL, PG_CONNECTIONS, SQL::ALL, setup: SQL::SETUP)
@@ -191,5 +198,6 @@ Thread.new do
   exit!(status.success? ? 0 : 1)
 end
 
+Process.setpriority(Process::PRIO_PROCESS, 0, MASTER_NICE)
 warn "bcrypt: #{lanes} lanes per set, #{BcryptService::THREADS} threads in the master"
 BcryptService::Server.new(pairs.map(&:first), lanes).run

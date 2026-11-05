@@ -10,7 +10,9 @@ require_relative "ext/bcrypt/bcrypt_lanes"
 # after its first one arrived, on one of THREADS helper threads with the GVL released. Every hash runs all
 # 2^10 rounds with its own salt; logins always verify against the stored hash.
 module BcryptService
-  WAIT = Float(ENV.fetch("BCRYPT_WAIT_MS", "100")) / 1000
+  # How long a set waits for company. At 100 ms sets averaged ~1.2 hashes on the rig and bcrypt took ~15% of
+  # the box; at 300 ms p95 at 50,000 users went from 451 to 301 ms.
+  WAIT = Float(ENV.fetch("BCRYPT_WAIT_MS", "300")) / 1000
   THREADS = Integer(ENV.fetch("BCRYPT_THREADS", "2"))
   HEADER = "N"
 
