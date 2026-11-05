@@ -105,6 +105,20 @@ pub const TCP_QUICKACK: c_int = 12;
 pub const PRIO_PROCESS: c_int = 0;
 
 #[cfg(target_os = "linux")]
+pub const CLONE_FILES: c_int = 0x0000_0400;
+#[cfg(target_os = "linux")]
+pub const SCHED_BATCH: c_int = 3;
+#[cfg(target_os = "linux")]
+pub const SCHED_IDLE: c_int = 5;
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct sched_param {
+    pub sched_priority: c_int,
+}
+
+#[cfg(target_os = "linux")]
 pub const EPOLL_CTL_ADD: c_int = 1;
 #[cfg(target_os = "linux")]
 pub const EPOLL_CTL_DEL: c_int = 2;
@@ -196,6 +210,48 @@ unsafe extern "C" {
     pub fn getrandom(buf: *mut c_void, buflen: usize, flags: c_uint) -> isize;
     #[cfg(target_os = "linux")]
     pub fn sched_getaffinity(pid: c_int, cpusetsize: usize, mask: *mut u8) -> c_int;
+    #[cfg(target_os = "linux")]
+    pub fn sched_setscheduler(pid: c_int, policy: c_int, param: *const sched_param) -> c_int;
+    #[cfg(target_os = "linux")]
+    pub fn unshare(flags: c_int) -> c_int;
+}
+
+/// Isolates the calling thread's file descriptor table (`CLONE_FILES`) so socket
+/// `accept4`/`close`/`recv`/`send` operations never contend on a shared kernel `files_struct` lock.
+#[inline]
+pub fn unshare_files() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let _ = unshare(CLONE_FILES);
+    }
+}
+
+/// Places the calling thread under `SCHED_BATCH` (preventing wakeup preemption of running
+/// Postgres backends) and optionally sets its `nice` value.
+#[inline]
+pub fn set_sched_batch(nice_val: c_int) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let param = sched_param { sched_priority: 0 };
+        let _ = sched_setscheduler(0, SCHED_BATCH, &param);
+        if nice_val != 0 {
+            let _ = setpriority(PRIO_PROCESS, 0, nice_val);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = nice_val;
+}
+
+/// Places background CPU-bound helpers under `SCHED_IDLE` (with fallback to `nice 19`) so
+/// background hashing never preempts PostgreSQL backends or I/O loops.
+#[inline]
+pub fn set_sched_idle() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let param = sched_param { sched_priority: 0 };
+        let _ = sched_setscheduler(0, SCHED_IDLE, &param);
+        let _ = setpriority(PRIO_PROCESS, 0, 19);
+    }
 }
 
 #[inline]
