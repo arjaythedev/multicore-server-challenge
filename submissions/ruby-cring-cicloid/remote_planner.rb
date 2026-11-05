@@ -1,17 +1,20 @@
 # frozen_string_literal: true
 
 require "json"
-require "socket"
 require_relative "planner"
+require_relative "ext/shmq/shmq"
 
 # Batched reads for the whole server instead of per worker. PLANNERS processes run Planner (planner.rb)
-# against Postgres, and the HTTP workers send them their reads over stream socketpairs made before the
-# fork. Planners take turns by time: every worker sends what it receives during window w to planner
-# w mod PLANNERS (CLOCK_MONOTONIC is the same clock in every process), so each window is still one batch for
-# the whole server, while planning and assembly are spread over several processes. With a planner per
-# worker, every planner looked up the same hot articles, favorite counts and comments in its own batches.
+# against Postgres, and the HTTP workers send them their reads through shared memory: for each (worker,
+# planner) pair, one ring of requests and one of replies (ext/shmq), mapped before the fork, each with an
+# eventfd that is written once per batch, not per message. Planners take turns by time: every worker sends
+# what it receives during window w to planner w mod PLANNERS (CLOCK_MONOTONIC is the same clock in every
+# process), so each window is one batch for the whole server while planning and assembly are spread over
+# several processes. With a planner per worker, every planner looked up the same hot articles, favorite
+# counts and comments in its own, smaller batches. (A first version over socketpairs spent in framing,
+# syscalls and copies about what it saved in Postgres.)
 #
-# Frames are a 4-byte length, then:
+# Messages:
 #   request: id (u32), kind (u8), viewer (i64), then a, b, c, each a u16 length (0xFFFF = nil) and bytes
 #   reply:   id (u32), status (u8: 0 document, 1 not found, 2 failed, 3 user as JSON), payload
 module RemotePlanner
@@ -22,48 +25,47 @@ module RemotePlanner
   MISSING = 1
   FAILED = 2
   USER = 3
-  READ_SIZE = 1 << 16
+  REQUEST_RING = Integer(ENV.fetch("PLANNER_REQUEST_RING", (1 << 20).to_s))
+  REPLY_RING = Integer(ENV.fetch("PLANNER_REPLY_RING", (16 << 20).to_s))
 
-  # Reads length-prefixed frames from `socket` and yields each payload, until the peer closes.
-  def self.frames(socket)
-    buffer = String.new(capacity: READ_SIZE, encoding: Encoding::BINARY)
-    loop do
-      chunk = socket.read_nonblock(READ_SIZE, exception: false)
-      if chunk == :wait_readable
-        socket.wait_readable
-        next
-      end
-      break if chunk.nil?
-
-      buffer << chunk
-      at = 0
-      while buffer.bytesize - at >= 4
-        length = buffer.unpack1("N", offset: at)
-        break if buffer.bytesize - at - 4 < length
-
-        yield buffer.byteslice(at + 4, length)
-        at += 4 + length
-      end
-      buffer = buffer.byteslice(at, buffer.bytesize - at) if at.positive?
-    end
+  # The two rings between one worker and one planner, made before the fork.
+  Link = Struct.new(:requests, :replies) do
+    def self.make = new(Shmq::Ring.new(REQUEST_RING), Shmq::Ring.new(REPLY_RING))
   end
 
   def self.field(value) = value.nil? ? NIL_FIELD : [value.bytesize].pack("n") << value.b
+
+  # Pushes `message`, waiting (and waking the consumer) while the ring is full.
+  def self.push(ring, message)
+    until ring.push(message)
+      ring.notify
+      sleep 0.0005
+    end
+  end
+
+  # Yields every message that arrives on `ring`.
+  def self.each_message(ring)
+    io = IO.for_fd(ring.eventfd, autoclose: false)
+    loop do
+      io.wait_readable
+      ring.drain.each { |message| yield message }
+    end
+  end
 
   # Worker side: the Planner interface, answered by the planner processes.
   class Client
     Pending = Struct.new(:fiber, :status, :payload)
 
-    def initialize(sockets, window)
-      @sockets = sockets
+    def initialize(links, window)
+      @links = links
       @window_ms = (window * 1000).round.clamp(1, nil)
       @next = 0
       @waiting = {}
-      @out = sockets.map { String.new(capacity: 1 << 16, encoding: Encoding::BINARY) }
+      @dirty = Array.new(links.size, false)
       @kick = Thread::Queue.new
-      @dirty = false
-      sockets.each { |socket| Fiber.schedule { read(socket) } }
-      Fiber.schedule { flush_loop }
+      @kicked = false
+      links.each { |link| Fiber.schedule { read(link.replies) } }
+      Fiber.schedule { notify_loop }
     end
 
     def tags = ask(:tags, 0, nil, nil, nil)
@@ -86,12 +88,13 @@ module RemotePlanner
       id = (@next = (@next + 1) & 0xFFFFFFFF)
       pending = Pending.new(Fiber.current, nil, nil)
       @waiting[id] = pending
-      body = [id, KIND_INDEX.fetch(kind), viewer].pack("NCq>") << RemotePlanner.field(a) << RemotePlanner.field(b) <<
-             RemotePlanner.field(c)
-      planner = (Process.clock_gettime(Process::CLOCK_MONOTONIC, :millisecond) / @window_ms) % @sockets.size
-      @out[planner] << [body.bytesize].pack("N") << body
-      unless @dirty # one write per planner per event-loop pass, for every request queued in it
-        @dirty = true
+      message = [id, KIND_INDEX.fetch(kind), viewer].pack("NCq>") << RemotePlanner.field(a) << RemotePlanner.field(b) <<
+                RemotePlanner.field(c)
+      planner = (Process.clock_gettime(Process::CLOCK_MONOTONIC, :millisecond) / @window_ms) % @links.size
+      RemotePlanner.push(@links[planner].requests, message)
+      @dirty[planner] = true
+      unless @kicked # one wake-up per planner per event-loop pass
+        @kicked = true
         @kick.push(true)
       end
       Fiber.scheduler.block(pending, nil) until pending.status
@@ -102,61 +105,52 @@ module RemotePlanner
       end
     end
 
-    def flush_loop
+    def notify_loop
       loop do
         @kick.pop
-        @dirty = false
-        @out.each_with_index do |out, i|
-          next if out.empty?
+        @kicked = false
+        @dirty.each_with_index do |dirty, i|
+          next unless dirty
 
-          data = out.dup
-          out.clear
-          @sockets[i].write(data)
+          @dirty[i] = false
+          @links[i].requests.notify
         end
       end
     end
 
-    def read(socket)
-      RemotePlanner.frames(socket) do |frame|
-        id, status = frame.unpack("NC")
+    def read(ring)
+      RemotePlanner.each_message(ring) do |message|
+        id, status = message.unpack("NC")
         pending = @waiting.delete(id) or next
-        pending.payload = frame.byteslice(5, frame.bytesize - 5)
+        pending.payload = message.byteslice(5, message.bytesize - 5)
         pending.status = status
-        Fiber.scheduler.unblock(pending, pending.fiber)
-      end
-      failed = @waiting.values
-      @waiting.clear
-      failed.each do |pending| # the planner is gone
-        pending.status = FAILED
-        pending.payload = "planner process exited"
         Fiber.scheduler.unblock(pending, pending.fiber)
       end
     end
   end
 
-  # Planner side: reads the workers' requests into the planner, writes each worker's answers from a batch
-  # in one write.
+  # Planner side: reads every worker's requests into the planner and answers each worker's share of a batch
+  # with one wake-up.
   class Server
-    Reply = Struct.new(:server, :socket, :id) do
-      def call(request) = server.answer(socket, id, request)
+    Reply = Struct.new(:server, :index, :id) do
+      def call(request) = server.answer(index, id, request)
     end
 
-    def initialize(planner, sockets)
+    def initialize(planner, links)
       @planner = planner
-      @sockets = sockets
-      @out = {} # socket => [header, payload, header, payload, ...] waiting to be written
+      @links = links
+      @dirty = Array.new(links.size, false)
       planner.after_batch = -> { flush }
     end
 
     def run(task)
-      @sockets.each { |socket| task.async { read(socket) } }
+      @links.each_with_index { |link, index| task.async { read(link.requests, index) } }
     end
 
-    def answer(socket, id, request)
-      out = (@out[socket] ||= [])
+    def answer(index, id, request)
       if request.error
         status = FAILED
-        payload = request.error.message.b
+        payload = request.error.message
       elsif request.document == :missing
         status = MISSING
         payload = ""
@@ -167,40 +161,39 @@ module RemotePlanner
         status = DOCUMENT
         payload = request.document
       end
-      out << [5 + payload.bytesize, id, status].pack("NNC") << payload # written as is (writev): no copy
+      message = [id, status].pack("NC") << payload.b
+      RemotePlanner.push(@links[index].replies, message)
+      @dirty[index] = true
     end
 
     private
 
-    def read(socket)
-      RemotePlanner.frames(socket) do |frame|
-        id, kind, viewer = frame.unpack("NCq>")
+    def read(ring, index)
+      RemotePlanner.each_message(ring) do |message|
+        id, kind, viewer = message.unpack("NCq>")
         at = 13
         args = Array.new(3) do
-          length = frame.unpack1("n", offset: at)
+          length = message.unpack1("n", offset: at)
           at += 2
           if length == 0xFFFF
             nil
           else
-            value = frame.byteslice(at, length).force_encoding(Encoding::UTF_8)
+            value = message.byteslice(at, length).force_encoding(Encoding::UTF_8)
             at += length
             value
           end
         end
         @planner.submit(Planner::Request.new(KINDS.fetch(kind), viewer, args[0], args[1], args[2], nil, nil, nil,
-                                             Reply.new(self, socket, id)))
+                                             Reply.new(self, index, id)))
       end
     end
 
     def flush
-      @out.each do |socket, out|
-        next if out.empty?
+      @dirty.each_with_index do |dirty, i|
+        next unless dirty
 
-        parts = out.dup
-        out.clear
-        parts.each_slice(512) { |slice| socket.write(*slice) } # IOV_MAX is 1,024
-      rescue IOError, SystemCallError
-        nil
+        @dirty[i] = false
+        @links[i].replies.notify
       end
     end
   end

@@ -144,11 +144,11 @@ GC.compact
 Process.warmup
 
 # A planner process: Planner over its own Postgres connections, serving every worker's socket.
-def plan(sockets)
+def plan(links)
   Async do |task|
     db = DB.new(DATABASE_URL, PLANNER_CONNECTIONS, SQL::ALL, setup: SQL::SETUP)
     db.start
-    RemotePlanner::Server.new(Planner.new(db), sockets).run(task)
+    RemotePlanner::Server.new(Planner.new(db), links).run(task)
     GC.config(rgengc_allow_full_mark: false)
   end
 end
@@ -157,29 +157,28 @@ lanes = BcryptService.calibrate
 # Socketpairs, made before the fork: one per worker for bcrypt (the master keeps the other end), and one per
 # (worker, planner) for reads.
 pairs = Array.new(WORKERS) { UNIXSocket.pair(:SEQPACKET) }
-links = Array.new(PLANNERS) { Array.new(WORKERS) { UNIXSocket.pair(:STREAM) } } # [planner][worker] = [planner end, worker end]
+# Shared-memory rings (remote_planner.rb) for reads: links[planner][worker].
+links = Array.new(PLANNERS) { Array.new(WORKERS) { RemotePlanner::Link.make } }
 close_all_but = lambda do |keep|
-  (pairs.flatten + links.flatten).each { |socket| socket.close unless keep.include?(socket) || socket.closed? }
+  pairs.flatten.each { |socket| socket.close unless keep.include?(socket) || socket.closed? }
 end
 pids = []
 PLANNERS.times do |p|
   pids << fork do
     %w[TERM INT].each { |signal| trap(signal) { exit!(0) } }
-    mine = links[p].map(&:first)
-    close_all_but.call(mine)
-    plan(mine)
+    close_all_but.call([])
+    plan(links[p])
   end
 end
 WORKERS.times do |index|
   pids << fork do
     %w[TERM INT].each { |signal| trap(signal) { exit!(0) } }
-    planners = links.map { |row| row[index][1] }
-    close_all_but.call([pairs[index][1], *planners])
+    planners = links.map { |row| row[index] }
+    close_all_but.call([pairs[index][1]])
     serve(index, pairs[index][1], planners)
   end
 end
 pairs.each { |_, worker_end| worker_end.close }
-links.flatten.each(&:close)
 
 stop = lambda do |signal|
   pids.each do |pid|

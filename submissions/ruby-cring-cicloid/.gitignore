@@ -16,3 +16,7 @@ ext/fmt/Makefile
 ext/fmt/*.o
 ext/fmt/*.so
 ext/fmt/mkmf.log
+ext/shmq/Makefile
+ext/shmq/*.o
+ext/shmq/*.so
+ext/shmq/mkmf.log
