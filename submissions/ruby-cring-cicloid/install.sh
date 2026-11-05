@@ -6,9 +6,9 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends build-essential curl ca-certificates pkg-config \
-  libssl-dev libyaml-dev zlib1g-dev libffi-dev libgmp-dev libjemalloc-dev \
+  libssl-dev libyaml-dev zlib1g-dev libffi-dev libgmp-dev libjemalloc-dev rustc \
   liburing-dev libpq-dev
-# liburing-dev: headers and library for the connection layer, ext/ring/ring.c.
+# rustc: Ruby 4.0's configure needs it to build YJIT. liburing-dev: the connection layer, ext/ring/ring.c.
 
 # Tune for the CPU it is built on (the benchmark droplet is x86_64). On arm64 -march=native combines
 # with Ruby's pointer-authentication flags into binaries that crash under some VMs, so skip it there.
