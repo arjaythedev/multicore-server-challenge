@@ -90,8 +90,8 @@ fn main() {
 
     let pool_size = env_i64("DB_POOL", 16).clamp(1, 95) as usize;
     let batch_inflight = env_i64("BATCH_INFLIGHT", 3).max(1) as i32;
-    let batch_ms = env_i64("BATCH_MS", 60).max(0);
-    let batch_slow_ms = env_i64("BATCH_SLOW_MS", 85).max(0);
+    let batch_ms = env_i64("BATCH_MS", 50).max(0);
+    let batch_slow_ms = env_i64("BATCH_SLOW_MS", 70).max(0);
     let batch_max = env_i64("BATCH_MAX", 4000).max(1) as usize;
 
     let mut helpers = env_i64("BCRYPT_HELPERS", 0) as usize;
@@ -106,10 +106,7 @@ fn main() {
 
     let mut worker_inboxes = Vec::with_capacity(workers);
     for _ in 0..workers {
-        worker_inboxes.push(Arc::new(WorkerInbox {
-            event_fd: create_eventfd(),
-            queue: Mutex::new(Vec::with_capacity(512)),
-        }));
+        worker_inboxes.push(Arc::new(WorkerInbox::new(create_eventfd())));
     }
     let worker_inboxes = Arc::new(worker_inboxes);
 
@@ -427,10 +424,7 @@ mod tests {
             }
         });
 
-        let w_inbox = Arc::new(WorkerInbox {
-            event_fd: -1,
-            queue: Mutex::new(Vec::new()),
-        });
+        let w_inbox = Arc::new(WorkerInbox::new(-1));
         let workers = Arc::new(vec![Arc::clone(&w_inbox)]);
         let db_inbox = Arc::new(DbInbox {
             event_fd: -1,

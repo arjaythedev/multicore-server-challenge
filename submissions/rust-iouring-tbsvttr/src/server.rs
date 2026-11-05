@@ -1,6 +1,7 @@
 #![allow(dead_code, unused_imports, unused_mut)]
 
 use std::ffi::c_int;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::bcrypt::{self, BCRYPT_LANES, BcryptJob};
@@ -282,12 +283,14 @@ pub fn build_statements() -> Vec<String> {
          {}, {}, {}, \
          arts AS MATERIALIZED (SELECT s.ks, s.vs, (SELECT a.id FROM articles a WHERE a.slug = s.key) AS id \
            FROM {} s), \
-         rq AS MATERIALIZED (\
-           SELECT u.k, 1 AS kind, u.viewer, c.n, g.ids FROM gpa g CROSS JOIN gcnt c {} \
-           UNION ALL {} UNION ALL {} UNION ALL {} \
-           UNION ALL SELECT u.k, 6, u.viewer, NULL::int8, CASE WHEN ar.id IS NULL THEN NULL ELSE ARRAY[ar.id] END \
-             FROM arts ar {}), \
-         ids AS MATERIALIZED (SELECT x.id, bool_or(rq.kind = 6) AS with_body FROM rq CROSS JOIN LATERAL unnest(rq.ids) x(id) \
+         pg AS MATERIALIZED (\
+           SELECT 1 AS kind, g.ks, g.vs, c.n, g.ids FROM gpa g CROSS JOIN gcnt c \
+           UNION ALL SELECT 2, pa.ks, pa.vs, pa.n, pa.ids FROM tpa pa \
+           UNION ALL SELECT 3, pa.ks, pa.vs, pa.n, pa.ids FROM apa pa \
+           UNION ALL SELECT 4, pa.ks, pa.vs, pa.n, pa.ids FROM fpa pa \
+           UNION ALL SELECT 6, ar.ks, ar.vs, NULL::int8, CASE WHEN ar.id IS NULL THEN NULL ELSE ARRAY[ar.id] END \
+             FROM arts ar), \
+         ids AS MATERIALIZED (SELECT x.id, bool_or(pg.kind = 6) AS with_body FROM pg CROSS JOIN LATERAL unnest(pg.ids) x(id) \
            GROUP BY x.id ORDER BY x.id), \
          info AS MATERIALIZED (SELECT y.* FROM ids x CROSS JOIN LATERAL (SELECT a.id, a.slug, a.title, a.description, \
            CASE WHEN x.with_body THEN a.body END AS body, a.created_at, a.updated_at, \
@@ -298,7 +301,10 @@ pub fn build_statements() -> Vec<String> {
            (SELECT u.id, u.username, u.bio, u.image FROM users u WHERE u.id = x.author_id LIMIT 1) u), \
          tn AS MATERIALIZED (SELECT t.id::int8 AS id, t.name, row_number() OVER (ORDER BY t.name) AS rnk \
            FROM (SELECT DISTINCT unnest(tag_ids) AS id FROM info) x CROSS JOIN LATERAL \
-           (SELECT t.id, t.name FROM tags t WHERE t.id = x.id LIMIT 1) t) \
+           (SELECT t.id, t.name FROM tags t WHERE t.id = x.id LIMIT 1) t), \
+         pga AS MATERIALIZED (SELECT pg.ks, pg.vs, pg.n, pg.ids, \
+           CASE WHEN cardinality(pg.ids) > 0 THEN ARRAY(SELECT DISTINCT i.author_id FROM info i WHERE i.id = ANY (pg.ids)) END AS aus \
+           FROM pg) \
          SELECT -2::int8 AS k, tn.rnk AS n, NULL::int8[] AS ids, NULL::int8[] AS favs, NULL::int8[] AS fols, tn.id, \
            tn.name AS slug, NULL::text AS title, NULL::text AS description, NULL::text AS body, \
            NULL::timestamptz AS created_at, NULL::timestamptz AS updated_at, NULL::int8[] AS tag_ids, \
@@ -308,15 +314,16 @@ pub fn build_statements() -> Vec<String> {
            au.username, au.bio, au.image FROM au \
          UNION ALL SELECT 0, NULL, NULL, NULL, NULL, i.id, i.slug, i.title, i.description, i.body, i.created_at, \
            i.updated_at, i.tag_ids, i.fav_count, i.author_id, NULL, NULL, NULL FROM info i \
-         UNION ALL SELECT rq.k, rq.n, rq.ids, \
-           CASE WHEN rq.viewer <> 0 AND cardinality(rq.ids) > 0 THEN ARRAY(SELECT f.article_id FROM favorites f \
-             WHERE f.user_id = rq.viewer AND f.article_id = ANY (rq.ids)) END, \
-           CASE WHEN rq.viewer <> 0 AND cardinality(rq.ids) > 0 THEN ARRAY(SELECT fo.followee_id FROM follows fo \
-             WHERE fo.follower_id = rq.viewer) END, \
-           NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL FROM rq",
+         UNION ALL SELECT u.k, p.n, p.ids, \
+           CASE WHEN u.viewer <> 0 AND cardinality(p.ids) > 0 THEN ARRAY(SELECT f.article_id FROM favorites f \
+             WHERE f.user_id = u.viewer AND f.article_id = ANY (p.ids)) END, \
+           CASE WHEN u.viewer <> 0 AND cardinality(p.aus) > 0 THEN ARRAY(SELECT fo.followee_id FROM follows fo \
+             WHERE fo.follower_id = u.viewer AND fo.followee_id = ANY (p.aus)) END, \
+           NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL \
+           FROM pga p {}",
         page_ids("SELECT a.id FROM articles a ORDER BY a.id DESC"),
         grouped(1, "lim, ofs"),
-        proved_capped("SELECT 1 FROM articles a"),
+        proved_capped("SELECT 1 FROM articles a ORDER BY a.id ASC"),
         keyed(
             "t",
             2,
@@ -342,11 +349,7 @@ pub fn build_statements() -> Vec<String> {
             false,
         ),
         grouped(6, "key"),
-        each_request("g"),
-        keyed_rq("t", 2),
-        keyed_rq("a", 3),
-        keyed_rq("f", 4),
-        each_request("ar"),
+        each_request("p"),
     );
     s.push(pages_sql);
 
@@ -358,21 +361,25 @@ pub fn build_statements() -> Vec<String> {
     // S[13] (s12): FEED ($1 viewer, $2 lim, $3 ofs) — dedicated Feed-only statement
     let feed_sql = format!(
         "WITH {}, \
-         v AS MATERIALIZED (SELECT viewer, max(lim + ofs) AS depth, array_agg(k) AS ks, array_agg(lim) AS lims, \
-           array_agg(ofs) AS ofss FROM req GROUP BY viewer), \
-         fl AS MATERIALIZED (SELECT v.viewer, v.depth, f.fid FROM v LEFT JOIN LATERAL \
-           (SELECT fo.followee_id AS fid FROM follows fo WHERE fo.follower_id = v.viewer OFFSET 0) f ON true), \
-         hubs AS MATERIALIZED (SELECT array_agg(h.fid) AS fids, \
-           array_agg((SELECT a.id FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC OFFSET h.depth - 1 LIMIT 1)) AS floors, \
-           array_agg(EXISTS (SELECT 1 FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC OFFSET 999 LIMIT 1)) AS bigs \
-           FROM (SELECT fid, max(depth) AS depth FROM fl WHERE fid IS NOT NULL GROUP BY fid HAVING count(*) >= 2 \
-           ORDER BY count(*) DESC, fid LIMIT 32) h), \
-         vc AS MATERIALIZED (SELECT v.viewer, v.ks, v.lims, v.ofss, COALESCE(x.floor, 0) AS floor, \
-           CASE WHEN x.big THEN 1000 ELSE {} END AS n FROM v JOIN \
-           (SELECT fl.viewer, COALESCE(bool_or(h.bigs[array_position(h.fids, fl.fid)]), false) AS big, \
-            max(h.floors[array_position(h.fids, fl.fid)]) AS floor FROM fl CROSS JOIN hubs h GROUP BY fl.viewer) x ON x.viewer = v.viewer), \
-         rq AS MATERIALIZED (SELECT g.k, vc.viewer, vc.n, {} AS ids \
-           FROM vc CROSS JOIN LATERAL unnest(vc.ks, vc.lims, vc.ofss) g(k, lim, ofs)), \
+         v AS MATERIALIZED (SELECT r.viewer, max(r.lim + r.ofs) AS depth, array_agg(r.k) AS ks, array_agg(r.lim) AS lims, \
+           array_agg(r.ofs) AS ofss, \
+           ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.viewer) AS fids \
+           FROM req r GROUP BY r.viewer), \
+         hubs AS MATERIALIZED (SELECT h.fid, \
+           ARRAY(SELECT a.id FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC LIMIT h.depth) AS ids, \
+           EXISTS (SELECT 1 FROM articles a WHERE a.author_id = h.fid ORDER BY a.id ASC LIMIT 1 OFFSET 999) AS big \
+           FROM (SELECT f.fid, max(v.depth) AS depth FROM v, unnest(v.fids) AS f(fid) \
+           GROUP BY f.fid HAVING count(*) >= 2 ORDER BY count(*) DESC, f.fid LIMIT 32) h), \
+         cap_authors AS MATERIALIZED (SELECT ARRAY(SELECT hf.fid FROM hubs hf WHERE hf.big) AS fids), \
+         vc AS MATERIALIZED (SELECT v.viewer, v.fids, v.ks, v.lims, v.ofss, \
+           CASE WHEN cardinality(v.fids) = 0 THEN 0::int8 \
+                WHEN v.fids && (SELECT fids FROM cap_authors) THEN 1000::int8 \
+                ELSE {} \
+           END AS n FROM v), \
+         rq AS MATERIALIZED (SELECT g.k, vc.viewer, vc.n, \
+           CASE WHEN cardinality(vc.fids) = 0 THEN '{{}}'::int8[] ELSE {} END AS ids \
+           FROM vc CROSS JOIN LATERAL unnest(vc.ks, vc.lims, vc.ofss) g(k, lim, ofs) \
+           CROSS JOIN LATERAL (SELECT COALESCE(max(hf.ids[g.lim + g.ofs]), 0::int8) AS floor FROM hubs hf WHERE hf.fid = ANY (vc.fids)) fl), \
          ids AS MATERIALIZED (SELECT DISTINCT x.id FROM rq CROSS JOIN LATERAL unnest(rq.ids) x(id) ORDER BY x.id), \
          info AS MATERIALIZED (SELECT y.* FROM ids x CROSS JOIN LATERAL (SELECT a.id, a.slug, a.title, a.description, \
            a.created_at, a.updated_at, \
@@ -399,14 +406,11 @@ pub fn build_statements() -> Vec<String> {
            NULL, \
            NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL FROM rq",
         req(&[("viewer", "int8"), ("lim", "int8"), ("ofs", "int8")]),
-        capped(
-            "SELECT 1 FROM follows fo CROSS JOIN LATERAL \
-             (SELECT 1 FROM articles a WHERE a.author_id = fo.followee_id LIMIT 1000) y WHERE fo.follower_id = v.viewer"
-        ),
+        capped("SELECT 1 FROM articles a WHERE a.author_id = ANY (v.fids)"),
         page_ids(
-            "SELECT y.id FROM follows fo CROSS JOIN LATERAL \
-             (SELECT a.id FROM articles a WHERE a.author_id = fo.followee_id AND a.id >= vc.floor ORDER BY a.id DESC \
-             LIMIT (g.lim + g.ofs)) y WHERE fo.follower_id = vc.viewer ORDER BY y.id DESC"
+            "SELECT y.id FROM unnest(vc.fids) AS fid CROSS JOIN LATERAL \
+             (SELECT a.id FROM articles a WHERE a.author_id = fid AND a.id >= fl.floor ORDER BY a.id DESC \
+             LIMIT (g.lim + g.ofs)) y ORDER BY y.id DESC"
         ),
     );
     s.push(feed_sql);
@@ -476,12 +480,13 @@ pub fn build_statements() -> Vec<String> {
          cm AS MATERIALIZED (SELECT ar.id AS aid, c.id, c.body, c.created_at, c.updated_at, c.author_id, u.username, \
            u.bio, u.image FROM arts ar CROSS JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id \
            FROM comments c WHERE c.article_id = ar.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c \
-           CROSS JOIN LATERAL (SELECT u.username, u.bio, u.image FROM users u WHERE u.id = c.author_id LIMIT 1) u) \
+           CROSS JOIN LATERAL (SELECT u.username, u.bio, u.image FROM users u WHERE u.id = c.author_id LIMIT 1) u), \
+         ca AS MATERIALIZED (SELECT aid, array_agg(DISTINCT author_id) AS au FROM cm GROUP BY aid) \
          SELECT 0::int8 AS k, cm.aid, NULL::int8[] AS fols, cm.id, cm.body, cm.created_at, cm.updated_at, cm.author_id, \
            cm.username, cm.bio, cm.image FROM cm \
-         UNION ALL SELECT u.k, ar.id, CASE WHEN u.viewer <> 0 AND ar.id IS NOT NULL THEN \
-           ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = u.viewer) END, \
-           NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL FROM arts ar {}",
+         UNION ALL SELECT u.k, ar.id, CASE WHEN u.viewer <> 0 AND ca.au IS NOT NULL THEN \
+           ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = u.viewer AND fo.followee_id = ANY (ca.au)) END, \
+           NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL FROM arts ar LEFT JOIN ca ON ca.aid = ar.id {}",
         req(&[("viewer", "int8"), ("slug", "text")]),
         each_request("ar")
     ));
@@ -636,12 +641,44 @@ pub enum WorkerMsg {
     },
 }
 
+const MAX_WORKER_CLIENTS: usize = 262_144;
+
 pub struct WorkerInbox {
     pub event_fd: c_int,
     pub queue: Mutex<Vec<WorkerMsg>>,
+    pub alive_gen: Box<[AtomicU32]>,
 }
 
 impl WorkerInbox {
+    pub fn new(event_fd: c_int) -> Self {
+        let mut alive = Vec::with_capacity(MAX_WORKER_CLIENTS);
+        alive.resize_with(MAX_WORKER_CLIENTS, || AtomicU32::new(0));
+        Self {
+            event_fd,
+            queue: Mutex::new(Vec::with_capacity(512)),
+            alive_gen: alive.into_boxed_slice(),
+        }
+    }
+
+    #[inline]
+    pub fn set_alive(&self, idx: u32, generation: u32) {
+        let i = idx as usize;
+        if i < self.alive_gen.len() {
+            self.alive_gen[i].store(generation, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub fn is_alive(&self, tag: u64) -> bool {
+        let idx = (tag & 0xFFFF_FFFF) as usize;
+        let generation = (tag >> 32) as u32;
+        if idx < self.alive_gen.len() {
+            self.alive_gen[idx].load(Ordering::Relaxed) == generation
+        } else {
+            true
+        }
+    }
+
     pub fn push_and_wake(&self, msg: WorkerMsg) {
         let should_wake = {
             let mut q = self.queue.lock().unwrap();
@@ -773,6 +810,9 @@ impl BcryptPool {
                 let due = clock_ms() + wait_window;
                 while reqs.len() < self.lanes {
                     if let Some(task) = st.queue.pop_front() {
+                        if task.verify && !self.workers[task.worker_id].is_alive(task.client_tag) {
+                            continue;
+                        }
                         let idx = reqs.len();
                         let job = &mut jobs[idx];
                         *job = BcryptJob::default();
@@ -2542,10 +2582,21 @@ impl DbEngine {
 
     fn batch_queue(&mut self, idx: usize, bjob: Job) {
         let b = &mut self.batches[bjob as usize];
-        let count = b.tasks.len().min(self.batch_max);
-        let tasks: Vec<DbTask> = b.tasks.drain(..count).collect();
-        b.inflight += 1;
+        let mut tasks = Vec::with_capacity(b.tasks.len().min(self.batch_max));
+        while tasks.len() < self.batch_max {
+            let Some(task) = b.tasks.pop_front() else {
+                break;
+            };
+            if self.workers[task.worker_id].is_alive(task.client_tag) {
+                tasks.push(task);
+            }
+        }
         b.since = self.now_ms;
+        if tasks.is_empty() {
+            return;
+        }
+        let count = tasks.len();
+        b.inflight += 1;
         b.sent = self.now_ms;
 
         let types = batch_types(bjob);
@@ -2601,9 +2652,33 @@ impl DbEngine {
     }
 
     #[inline]
-    fn batch_room(&self, b: &Batch) -> bool {
+    fn is_heavy_batch(j: usize) -> bool {
+        matches!(j, 9 | 13 | 20)
+    }
+
+    #[inline]
+    fn batch_wait_ms(&self, j: usize) -> i64 {
+        if Self::is_heavy_batch(j) {
+            self.batch_ms
+        } else {
+            (self.batch_ms / 2).max(1)
+        }
+    }
+
+    #[inline]
+    fn batch_slow_wait_ms(&self, j: usize) -> i64 {
+        if Self::is_heavy_batch(j) {
+            self.batch_slow_ms
+        } else {
+            (self.batch_slow_ms / 2).max(1)
+        }
+    }
+
+    #[inline]
+    fn batch_room(&self, j: usize, b: &Batch) -> bool {
         b.inflight == 0
-            || (b.inflight < self.batch_inflight && self.now_ms - b.sent >= self.batch_slow_ms)
+            || (b.inflight < self.batch_inflight
+                && self.now_ms - b.sent >= self.batch_slow_wait_ms(j))
     }
 
     #[cfg(target_os = "linux")]
@@ -2639,11 +2714,12 @@ impl DbEngine {
         }
 
         for j in 1..=N_STATEMENTS {
+            let wait_ms = self.batch_wait_ms(j);
             let can_send = {
                 let b = &self.batches[j];
                 !b.tasks.is_empty()
-                    && self.batch_room(b)
-                    && (self.now_ms - b.since >= self.batch_ms || b.tasks.len() >= self.batch_max)
+                    && self.batch_room(j, b)
+                    && (self.now_ms - b.since >= wait_ms || b.tasks.len() >= self.batch_max)
             };
             if can_send {
                 self.pg_reconnect();
@@ -2681,9 +2757,10 @@ impl DbEngine {
         for j in 1..=N_STATEMENTS {
             let b = &self.batches[j];
             if !b.tasks.is_empty() && b.inflight < self.batch_inflight {
-                let mut at = b.since + self.batch_ms;
-                if b.inflight > 0 && b.sent + self.batch_slow_ms > at {
-                    at = b.sent + self.batch_slow_ms;
+                let mut at = b.since + self.batch_wait_ms(j);
+                let slow_wait = self.batch_slow_wait_ms(j);
+                if b.inflight > 0 && b.sent + slow_wait > at {
+                    at = b.sent + slow_wait;
                 }
                 if due < 0 || at < due {
                     due = at;
@@ -2703,6 +2780,9 @@ impl DbEngine {
     fn start_task(&mut self, task: DbTask) {
         let job = task.job;
         if !job.is_write() {
+            if !self.workers[task.worker_id].is_alive(task.client_tag) {
+                return;
+            }
             if !params_ok(&task.params, task.nparams) {
                 self.finish_job(&task, &[], false);
                 return;
@@ -2733,14 +2813,12 @@ impl DbEngine {
             let k = unsafe { epoll_wait(self.epfd, events.as_mut_ptr(), 1024, timeout) };
             self.now = unix_now();
             self.now_ms = clock_ms();
-            let mut link_busy = false;
 
             if k > 0 {
                 for ev in &events[..k as usize] {
                     let tag = ev.u64_data;
                     let mask = ev.events;
                     if tag == TAG_WAKE {
-                        link_busy = true;
                         drain_eventfd(self.inbox.event_fd);
                         {
                             let mut q = self.inbox.queue.lock().unwrap();
@@ -2764,16 +2842,6 @@ impl DbEngine {
             self.batch_send_all();
             self.pg_flush_all();
             self.flush_workers();
-
-            if k > 0 && k < 32 && self.batch_us > 0 && !link_busy {
-                let ts = timespec {
-                    tv_sec: 0,
-                    tv_nsec: (self.batch_us as i64 * 1000) as _,
-                };
-                unsafe {
-                    let _ = nanosleep(&ts, std::ptr::null_mut());
-                }
-            }
         }
     }
 }
@@ -2960,6 +3028,7 @@ struct Client {
     job: Job,
     close_after: bool,
     closed: bool,
+    released: bool,
     continue_sent: bool,
     watching_out: bool,
     nparams: u16,
@@ -2983,6 +3052,7 @@ impl Client {
             job: Job::None,
             close_after: false,
             closed: true,
+            released: true,
             continue_sent: false,
             watching_out: false,
             nparams: 0,
@@ -3162,6 +3232,7 @@ impl Worker {
         c.job = Job::None;
         c.close_after = false;
         c.closed = false;
+        c.released = false;
         c.continue_sent = false;
         c.watching_out = false;
         c.nparams = 0;
@@ -3172,6 +3243,8 @@ impl Worker {
         c.params.clear();
         c.token.clear();
         c.stash.clear();
+        let generation = c.generation;
+        self.inbox.set_alive(idx, generation);
         idx
     }
 
@@ -3187,12 +3260,15 @@ impl Worker {
             c.fd = -1;
         }
         c.closed = true;
+        c.job = Job::None;
+        c.generation = c.generation.wrapping_add(1).max(1);
+        self.inbox.set_alive(idx, 0);
     }
 
     fn client_release(&mut self, idx: u32) {
         let c = &mut self.clients[idx as usize];
-        if c.closed && c.job == Job::None {
-            c.generation = c.generation.wrapping_add(1).max(1);
+        if c.closed && c.job == Job::None && !c.released {
+            c.released = true;
             c.input.clear();
             c.output.clear();
             c.params.clear();
