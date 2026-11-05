@@ -102,7 +102,10 @@ def serve(index, bcrypt, planners)
     Bcrypt.client = BcryptService::Client.new(bcrypt)
     db = DB.new(DATABASE_URL, PG_CONNECTIONS, SQL::ALL, setup: SQL::SETUP)
     db.start
-    planner = RemotePlanner::Client.new(planners, Planner::WINDOW) unless planners.empty?
+    unless planners.empty?
+      planner = RemotePlanner::Client.new(planners, Planner::WINDOW)
+      planner = RemotePlanner::Split.new(Planner.new(db), planner) unless ENV["PLANNER_LOCAL"] == "0"
+    end
     app = Conduit.new(db, SECRET, planner: planner)
     # Client connections as io_uring direct descriptors, driven from C, where the kernel allows it, else
     # in epoll. CONNECTIONS=epoll forces the fallback.

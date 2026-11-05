@@ -129,6 +129,26 @@ module RemotePlanner
     end
   end
 
+  # Worker side, split: the cheap point lookups with nothing to share between requests (tags, the current
+  # user, profiles; about a third of all reads) stay in the worker's own Planner, and the reads that share
+  # work across requests (articles, comments, lists, feeds) go to the planner processes. A single planner
+  # process otherwise ran out of its one core before Postgres did. PLANNER_LOCAL=0 sends everything.
+  class Split
+    def initialize(local, remote)
+      @local = local
+      @remote = remote
+    end
+
+    def tags = @local.tags
+    def user(id) = @local.user(id)
+    def profile(viewer, username) = @local.profile(viewer, username)
+    def article(viewer, slug) = @remote.article(viewer, slug)
+    def article_by_id(viewer, id) = @remote.article_by_id(viewer, id)
+    def comments(viewer, slug) = @remote.comments(viewer, slug)
+    def feed(viewer, limit, offset) = @remote.feed(viewer, limit, offset)
+    def list(kind, viewer, value, limit, offset) = @remote.list(kind, viewer, value, limit, offset)
+  end
+
   # Planner side: reads every worker's requests into the planner and answers each worker's share of a batch
   # with one wake-up.
   class Server
