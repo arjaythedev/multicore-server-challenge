@@ -85,6 +85,25 @@ impl Sched {
         }
     }
 
+    /// Queues every job of `jobs` (emptying it) under one lock: an IO thread hands over a whole event-loop pass at once.
+    pub fn push_many(&self, jobs: &mut Vec<ReadJob>) {
+        if jobs.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut g = self.m.lock().unwrap();
+        let mut woke = false;
+        for job in jobs.drain(..) {
+            let c = class_of(&job.kind);
+            woke |= g.q[c].is_empty();
+            g.q[c].push_back((now, job));
+        }
+        drop(g);
+        if woke {
+            self.cv.notify_one();
+        }
+    }
+
     /// Blocks until a class is due and has room, then moves its queue (up to `max_batch`) into `out`. Returns the
     /// class; the caller hands it back to `done` when the batch is answered.
     pub fn take(&self, cfg: &Config, out: &mut Vec<ReadJob>) -> usize {

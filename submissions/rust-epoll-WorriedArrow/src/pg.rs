@@ -383,7 +383,7 @@ impl Conn {
     pub fn connect(cfg: &Config) -> Result<Conn> {
         let stream = TcpStream::connect((cfg.host.as_str(), cfg.port))?;
         stream.set_nodelay(true)?;
-        let mut c = Conn { stream, rbuf: vec![0; 64 * 1024], rpos: 0, rend: 0, out: Out::default() };
+        let mut c = Conn { stream, rbuf: vec![0; 1 << 20], rpos: 0, rend: 0, out: Out::default() };
         // StartupMessage
         let mut m = Vec::new();
         m.extend_from_slice(&0i32.to_be_bytes());

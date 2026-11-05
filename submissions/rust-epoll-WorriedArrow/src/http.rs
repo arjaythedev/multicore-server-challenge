@@ -146,6 +146,7 @@ impl Server {
             unsafe { libc::unshare(libc::CLONE_FILES) };
         }
         unshared.wait();
+        crate::db::hold_reads();
         let mut events: Vec<libc::epoll_event> = vec![libc::epoll_event { events: 0, u64: 0 }; 1024];
         loop {
             let timeout = match self.accept_paused {
@@ -181,6 +182,8 @@ impl Server {
                     }
                 }
             }
+            // The pass's reads go to the scheduler together: one lock instead of one per request.
+            crate::db::release_reads();
         }
     }
 

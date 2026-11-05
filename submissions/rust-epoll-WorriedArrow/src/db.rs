@@ -101,9 +101,39 @@ pub static FEED_SPLIT: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// Reads queue by class (crate::sched) instead of in one pool.
 pub static CLASS_LANES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+thread_local! {
+    /// An IO thread's reads of its current event-loop pass, queued together at the end of it (`release_reads`).
+    static HELD: std::cell::RefCell<Option<Vec<ReadJob>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// From now on this thread's reads wait for `release_reads` (IO threads, under class scheduling).
+pub fn hold_reads() {
+    if CLASS_LANES.load(Relaxed) {
+        HELD.with(|h| *h.borrow_mut() = Some(Vec::with_capacity(256)));
+    }
+}
+
+/// Queues the reads this thread held since the last call, under one lock.
+pub fn release_reads() {
+    HELD.with(|h| {
+        if let Some(v) = h.borrow_mut().as_mut() {
+            crate::sched::READS.push_many(v);
+        }
+    });
+}
+
 pub fn push_read(job: ReadJob) {
     if CLASS_LANES.load(Relaxed) {
-        crate::sched::READS.push(job);
+        let job = HELD.with(|h| match h.borrow_mut().as_mut() {
+            Some(v) => {
+                v.push(job);
+                None
+            }
+            None => Some(job),
+        });
+        if let Some(job) = job {
+            crate::sched::READS.push(job);
+        }
     } else if matches!(job.kind, Read::Feed { .. }) && FEED_SPLIT.load(Relaxed) {
         FEEDS.q.push(job);
     } else {
@@ -204,7 +234,7 @@ impl Keys<String> {
 }
 
 /// A response body, kept for the rest of the batch under `key` if it has one (see `shared` in ReadLane::batch).
-fn keep(shared: &mut FxMap<(u8, u64, u16), std::sync::Arc<Vec<u8>>>, key: Option<(u8, u64, u16)>, b: Vec<u8>) -> Body {
+fn keep(shared: &mut FxMap<(u8, u64), std::sync::Arc<Vec<u8>>>, key: Option<(u8, u64)>, b: Vec<u8>) -> Body {
     match key {
         Some(k) => {
             let a = std::sync::Arc::new(b);
@@ -701,12 +731,12 @@ impl ReadLane {
             let g_uemail = s_uemail.map(|s| group(&pa, s, uemail.len())).unwrap_or_default();
             let mut early: Vec<Response> = Vec::new();
             let mut tags_body: Option<Vec<u8>> = None;
-            let mut tags_shared: FxMap<u16, std::sync::Arc<Vec<u8>>> = FxMap::default();
+            let mut tags_shared: Option<std::sync::Arc<Vec<u8>>> = None;
             for (i, (j, a)) in jobs.iter_mut().zip(asks.iter()).enumerate() {
                 let to = j.to;
                 match *a {
                     Ask::Tags => {
-                        // One body for every tag-list request of the batch, shared per IO thread.
+                        // One body for every tag-list request of the batch.
                         let b = tags_body.get_or_insert_with(|| {
                             let s = s_tags.unwrap();
                             let mut b = Vec::with_capacity(4096);
@@ -720,10 +750,7 @@ impl ReadLane {
                             b.extend_from_slice(b"]}");
                             b
                         });
-                        let a = tags_shared
-                            .entry(to.thread)
-                            .or_insert_with(|| std::sync::Arc::new(b.clone()))
-                            .clone();
+                        let a = tags_shared.get_or_insert_with(|| std::sync::Arc::new(b.clone())).clone();
                         early.push(Response { to, status: 200, body: Body::Shared(a) });
                     }
                     Ask::User(k) => {
@@ -787,6 +814,8 @@ impl ReadLane {
         let mut g_cmts: Vec<Vec<usize>> = vec![Vec::new(); cmts.len()];
         let mut auser: FxMap<i64, &[Col]> = FxMap::default();
         let mut cfoll: FxSet<(i64, i64)> = FxSet::default();
+        // Viewers with any follow hit among the batch's comment authors.
+        let mut cfoll_v: FxSet<i64> = FxSet::default();
         if let Some(s) = s_cmts {
             for (i, r) in pa.results[s].rows.iter().enumerate() {
                 match pa.i64(r[0]) {
@@ -801,6 +830,7 @@ impl ReadLane {
                     }
                     _ => {
                         cfoll.insert((pa.i64(r[1]), pa.i64(r[2])));
+                        cfoll_v.insert(pa.i64(r[1]));
                     }
                 }
             }
@@ -1035,8 +1065,9 @@ impl ReadLane {
 
         // ---- assemble ----
         // Responses that come out the same for every requester (no favorited or following flag set for the viewer)
-        // are rendered once per batch and IO thread and shared; the bytes are this batch's, freed with its last send.
-        let mut shared: FxMap<(u8, u64, u16), std::sync::Arc<Vec<u8>>> = FxMap::default();
+        // are rendered once per batch and shared, whichever IO thread sends them (the head with `Connection` is the
+        // IO thread's); the bytes are this batch's, freed with its last send.
+        let mut shared: FxMap<(u8, u64), std::sync::Arc<Vec<u8>>> = FxMap::default();
         let mut out: Vec<Response> = Vec::with_capacity(jobs.len());
         for ((j, ask), done) in jobs.into_iter().zip(asks.into_iter()).zip(done) {
             if done {
@@ -1066,7 +1097,7 @@ impl ReadLane {
                     };
                     let key = match (ask, p) {
                         (Ask::Slug(k), Some((id, author, _))) if v == 0 || (!ctx.favorited(v, id) && !ctx.following(v, author)) => {
-                            Some((5u8, k as u64, to.thread))
+                            Some((5u8, k as u64))
                         }
                         _ => None,
                     };
@@ -1090,6 +1121,15 @@ impl ReadLane {
                         continue;
                     }
                     let s = s_cmts.unwrap();
+                    // A viewer who follows none of the batch's comment authors gets the shared body without a look at
+                    // the thread; only the rest are checked comment by comment.
+                    let quick = v == 0 || !cfoll_v.contains(&v);
+                    if quick {
+                        if let Some(a) = shared.get(&(6u8, k as u64)) {
+                            out.push(Response { to, status: 200, body: Body::Shared(a.clone()) });
+                            continue;
+                        }
+                    }
                     // Each comment with its author's row, looked up once.
                     let mut list: Vec<(&[Col], &[Col])> = rows
                         .iter()
@@ -1099,7 +1139,7 @@ impl ReadLane {
                         .collect();
                     // Already newest first from the statement; sorting a sorted run is linear.
                     list.sort_unstable_by(|(x, _), (y, _)| (pa.i64(y[4]), pa.i64(y[2])).cmp(&(pa.i64(x[4]), pa.i64(x[2]))));
-                    let key = (v == 0 || list.iter().all(|(r, _)| !cfoll.contains(&(v, pa.i64(r[6]))))).then_some((6u8, k as u64, to.thread));
+                    let key = (quick || list.iter().all(|(r, _)| !cfoll.contains(&(v, pa.i64(r[6]))))).then_some((6u8, k as u64));
                     if let Some(a) = key.and_then(|k| shared.get(&k)) {
                         out.push(Response { to, status: 200, body: Body::Shared(a.clone()) });
                         continue;
@@ -1140,8 +1180,7 @@ impl ReadLane {
                         Ask::List(f, _, p) => Some((2 + f as u8, p as u64)),
                         _ => None,
                     }
-                    .filter(|_| v == 0 || rows.iter().all(|&(id, author, _)| !ctx.favorited(v, id) && !ctx.following(v, author)))
-                    .map(|(a, b)| (a, b, to.thread));
+                    .filter(|_| v == 0 || rows.iter().all(|&(id, author, _)| !ctx.favorited(v, id) && !ctx.following(v, author)));
                     if let Some(a) = key.and_then(|k| shared.get(&k)) {
                         out.push(Response { to, status: 200, body: Body::Shared(a.clone()) });
                         continue;
