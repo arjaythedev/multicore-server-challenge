@@ -82,8 +82,8 @@ impl Job {
             | Job::ListTag
             | Job::ListAuthor
             | Job::ListFavorited
-            | Job::Feed
             | Job::Article => Job::ListGlobal,
+            Job::Feed => Job::Feed,
             other => other,
         }
     }
@@ -140,6 +140,13 @@ fn capped(rows: &str) -> String {
     format!("(SELECT count(*) FROM ({rows} LIMIT 1000) s)")
 }
 
+fn proved_capped(rows: &str) -> String {
+    format!(
+        "CASE WHEN EXISTS ({rows} OFFSET 999) THEN 1000 ELSE {} END",
+        capped(rows)
+    )
+}
+
 fn page(rows: &str) -> String {
     format!("(SELECT * FROM ({rows} LIMIT g.lim OFFSET g.ofs) z LIMIT 100)")
 }
@@ -173,12 +180,16 @@ fn page_ids(rows: &str) -> String {
     format!("ARRAY(SELECT x.id FROM {} x ORDER BY x.id DESC)", page(rows))
 }
 
-fn keyed(p: &str, kind: i32, key_sql: &str, count_sql: &str, page_sql: &str) -> String {
+fn keyed(p: &str, kind: i32, key_sql: &str, count_sql: &str, page_sql: &str, prove: bool) -> String {
+    let cnt_expr = if prove {
+        proved_capped(count_sql)
+    } else {
+        capped(count_sql)
+    };
     format!(
-        "{p}cnt AS MATERIALIZED (SELECT ky.key, ky.fid, {} AS n FROM \
+        "{p}cnt AS MATERIALIZED (SELECT ky.key, ky.fid, {cnt_expr} AS n FROM \
          (SELECT s.key, ({key_sql}) AS fid FROM (SELECT DISTINCT key FROM req WHERE kind = {kind}) s) ky), \
          {p}pa AS MATERIALIZED (SELECT g.ks, g.vs, ky.n, {} AS ids FROM {} g JOIN {p}cnt ky ON ky.key = g.key)",
-        capped(count_sql),
         page_ids(page_sql),
         grouped(kind, "key, lim, ofs")
     )
@@ -262,45 +273,28 @@ pub fn build_statements() -> Vec<String> {
             .to_string(),
     );
 
-    // S[9] (s08): PAGES ($1 kind, $2 viewer, $3 limit, $4 offset, $5 key)
+    // S[9] (s08): PAGES ($1 kind, $2 viewer, $3 limit, $4 offset, $5 key) — Lists (kind 1..4) & Article (kind 6)
     let pages_sql = format!(
         "WITH req AS (SELECT * FROM unnest($1::int8[], $2::int8[], $3::int8[], $4::int8[], $5::text[]) \
          WITH ORDINALITY r(kind, viewer, lim, ofs, key, k)), \
          gpa AS MATERIALIZED (SELECT g.ks, g.vs, {} AS ids FROM {} g), \
          gcnt AS MATERIALIZED (SELECT {} AS n FROM (SELECT 1 FROM gpa LIMIT 1) g), \
          {}, {}, {}, \
-         v AS MATERIALIZED (SELECT viewer, max(lim + ofs) AS depth, array_agg(k) AS ks, array_agg(lim) AS lims, \
-           array_agg(ofs) AS ofss FROM req WHERE kind = 5 GROUP BY viewer), \
-         fl AS MATERIALIZED (SELECT v.*, f.fid FROM v LEFT JOIN LATERAL \
-           (SELECT fo.followee_id AS fid FROM follows fo WHERE fo.follower_id = v.viewer OFFSET 0) f ON true), \
-         hubs AS MATERIALIZED (SELECT array_agg(h.fid) AS fids, \
-           array_agg((SELECT a.id FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC OFFSET h.depth - 1 LIMIT 1)) AS floors, \
-           array_agg(EXISTS (SELECT 1 FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC OFFSET 999 LIMIT 1)) AS bigs \
-           FROM (SELECT fid, max(depth) AS depth FROM fl WHERE fid IS NOT NULL GROUP BY fid HAVING count(*) >= 2 \
-           ORDER BY count(*) DESC, fid LIMIT 16) h), \
-         vc AS MATERIALIZED (SELECT x.viewer, x.ks, x.lims, x.ofss, COALESCE(x.floor, 0) AS floor, \
-           CASE WHEN x.big THEN 1000 ELSE {} END AS n FROM \
-           (SELECT fl.viewer, any_value(fl.ks) AS ks, any_value(fl.lims) AS lims, \
-            any_value(fl.ofss) AS ofss, bool_or(h.bigs[array_position(h.fids, fl.fid)]) AS big, \
-            max(h.floors[array_position(h.fids, fl.fid)]) AS floor FROM fl CROSS JOIN hubs h GROUP BY fl.viewer) x), \
-         epa AS MATERIALIZED (SELECT g.k, vc.viewer, vc.n, {} AS ids \
-           FROM vc CROSS JOIN LATERAL unnest(vc.ks, vc.lims, vc.ofss) g(k, lim, ofs)), \
          arts AS MATERIALIZED (SELECT s.ks, s.vs, (SELECT a.id FROM articles a WHERE a.slug = s.key) AS id \
            FROM {} s), \
          rq AS MATERIALIZED (\
            SELECT u.k, 1 AS kind, u.viewer, c.n, g.ids FROM gpa g CROSS JOIN gcnt c {} \
            UNION ALL {} UNION ALL {} UNION ALL {} \
-           UNION ALL SELECT e.k, 5, e.viewer, e.n, e.ids FROM epa e \
            UNION ALL SELECT u.k, 6, u.viewer, NULL::int8, CASE WHEN ar.id IS NULL THEN NULL ELSE ARRAY[ar.id] END \
              FROM arts ar {}), \
          ids AS MATERIALIZED (SELECT x.id, bool_or(rq.kind = 6) AS with_body FROM rq CROSS JOIN LATERAL unnest(rq.ids) x(id) \
-           GROUP BY x.id), \
+           GROUP BY x.id ORDER BY x.id), \
          info AS MATERIALIZED (SELECT y.* FROM ids x CROSS JOIN LATERAL (SELECT a.id, a.slug, a.title, a.description, \
            CASE WHEN x.with_body THEN a.body END AS body, a.created_at, a.updated_at, \
            ARRAY(SELECT at.tag_id::int8 FROM article_tags at WHERE at.article_id = a.id) AS tag_ids, \
            (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS fav_count, a.author_id \
            FROM articles a WHERE a.id = x.id LIMIT 1) y), \
-         au AS MATERIALIZED (SELECT u.* FROM (SELECT DISTINCT author_id FROM info) x CROSS JOIN LATERAL \
+         au AS MATERIALIZED (SELECT u.* FROM (SELECT DISTINCT author_id FROM info ORDER BY 1) x CROSS JOIN LATERAL \
            (SELECT u.id, u.username, u.bio, u.image FROM users u WHERE u.id = x.author_id LIMIT 1) u), \
          tn AS MATERIALIZED (SELECT t.id::int8 AS id, t.name, row_number() OVER (ORDER BY t.name) AS rnk \
            FROM (SELECT DISTINCT unnest(tag_ids) AS id FROM info) x CROSS JOIN LATERAL \
@@ -317,18 +311,19 @@ pub fn build_statements() -> Vec<String> {
          UNION ALL SELECT rq.k, rq.n, rq.ids, \
            CASE WHEN rq.viewer <> 0 AND cardinality(rq.ids) > 0 THEN ARRAY(SELECT f.article_id FROM favorites f \
              WHERE f.user_id = rq.viewer AND f.article_id = ANY (rq.ids)) END, \
-           CASE WHEN rq.viewer <> 0 AND rq.kind <> 5 THEN ARRAY(SELECT fo.followee_id FROM follows fo \
+           CASE WHEN rq.viewer <> 0 AND cardinality(rq.ids) > 0 THEN ARRAY(SELECT fo.followee_id FROM follows fo \
              WHERE fo.follower_id = rq.viewer) END, \
            NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL FROM rq",
         page_ids("SELECT a.id FROM articles a ORDER BY a.id DESC"),
         grouped(1, "lim, ofs"),
-        capped("SELECT 1 FROM articles a"),
+        proved_capped("SELECT 1 FROM articles a"),
         keyed(
             "t",
             2,
             "SELECT t.id FROM tags t WHERE t.name = s.key",
             "SELECT 1 FROM article_tags at WHERE at.tag_id = ky.fid",
             "SELECT at.article_id AS id FROM article_tags at WHERE at.tag_id = ky.fid ORDER BY at.article_id DESC",
+            true,
         ),
         keyed(
             "a",
@@ -336,6 +331,7 @@ pub fn build_statements() -> Vec<String> {
             "SELECT u.id FROM users u WHERE u.username = s.key",
             "SELECT 1 FROM articles a WHERE a.author_id = ky.fid",
             "SELECT a.id FROM articles a WHERE a.author_id = ky.fid ORDER BY a.id DESC",
+            false,
         ),
         keyed(
             "f",
@@ -343,15 +339,7 @@ pub fn build_statements() -> Vec<String> {
             "SELECT u.id FROM users u WHERE u.username = s.key",
             "SELECT 1 FROM favorites f WHERE f.user_id = ky.fid",
             "SELECT f.article_id AS id FROM favorites f WHERE f.user_id = ky.fid ORDER BY f.article_id DESC",
-        ),
-        capped(
-            "SELECT 1 FROM follows fo CROSS JOIN LATERAL \
-             (SELECT 1 FROM articles a WHERE a.author_id = fo.followee_id LIMIT 1000) y WHERE fo.follower_id = x.viewer"
-        ),
-        page_ids(
-            "SELECT y.id FROM follows fo CROSS JOIN LATERAL \
-             (SELECT a.id FROM articles a WHERE a.author_id = fo.followee_id AND a.id >= vc.floor ORDER BY a.id DESC \
-             LIMIT (g.lim + g.ofs)) y WHERE fo.follower_id = vc.viewer ORDER BY y.id DESC"
+            false,
         ),
         grouped(6, "key"),
         each_request("g"),
@@ -362,10 +350,69 @@ pub fn build_statements() -> Vec<String> {
     );
     s.push(pages_sql);
 
-    // S[10]..S[14] (s09..s13): LIST_TAG, LIST_AUTHOR, LIST_FAVORITED, FEED, ARTICLE (in PAGES)
-    for _ in 0..5 {
+    // S[10]..S[12] (s09..s11): LIST_TAG, LIST_AUTHOR, LIST_FAVORITED (in PAGES S[9])
+    for _ in 0..3 {
         s.push("SELECT NULL".to_string());
     }
+
+    // S[13] (s12): FEED ($1 viewer, $2 lim, $3 ofs) — dedicated Feed-only statement
+    let feed_sql = format!(
+        "WITH {}, \
+         v AS MATERIALIZED (SELECT viewer, max(lim + ofs) AS depth, array_agg(k) AS ks, array_agg(lim) AS lims, \
+           array_agg(ofs) AS ofss FROM req GROUP BY viewer), \
+         fl AS MATERIALIZED (SELECT v.viewer, v.depth, f.fid FROM v LEFT JOIN LATERAL \
+           (SELECT fo.followee_id AS fid FROM follows fo WHERE fo.follower_id = v.viewer OFFSET 0) f ON true), \
+         hubs AS MATERIALIZED (SELECT array_agg(h.fid) AS fids, \
+           array_agg((SELECT a.id FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC OFFSET h.depth - 1 LIMIT 1)) AS floors, \
+           array_agg(EXISTS (SELECT 1 FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC OFFSET 999 LIMIT 1)) AS bigs \
+           FROM (SELECT fid, max(depth) AS depth FROM fl WHERE fid IS NOT NULL GROUP BY fid HAVING count(*) >= 2 \
+           ORDER BY count(*) DESC, fid LIMIT 32) h), \
+         vc AS MATERIALIZED (SELECT v.viewer, v.ks, v.lims, v.ofss, COALESCE(x.floor, 0) AS floor, \
+           CASE WHEN x.big THEN 1000 ELSE {} END AS n FROM v JOIN \
+           (SELECT fl.viewer, COALESCE(bool_or(h.bigs[array_position(h.fids, fl.fid)]), false) AS big, \
+            max(h.floors[array_position(h.fids, fl.fid)]) AS floor FROM fl CROSS JOIN hubs h GROUP BY fl.viewer) x ON x.viewer = v.viewer), \
+         rq AS MATERIALIZED (SELECT g.k, vc.viewer, vc.n, {} AS ids \
+           FROM vc CROSS JOIN LATERAL unnest(vc.ks, vc.lims, vc.ofss) g(k, lim, ofs)), \
+         ids AS MATERIALIZED (SELECT DISTINCT x.id FROM rq CROSS JOIN LATERAL unnest(rq.ids) x(id) ORDER BY x.id), \
+         info AS MATERIALIZED (SELECT y.* FROM ids x CROSS JOIN LATERAL (SELECT a.id, a.slug, a.title, a.description, \
+           a.created_at, a.updated_at, \
+           ARRAY(SELECT at.tag_id::int8 FROM article_tags at WHERE at.article_id = a.id) AS tag_ids, \
+           (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS fav_count, a.author_id \
+           FROM articles a WHERE a.id = x.id LIMIT 1) y), \
+         au AS MATERIALIZED (SELECT u.* FROM (SELECT DISTINCT author_id FROM info ORDER BY 1) x CROSS JOIN LATERAL \
+           (SELECT u.id, u.username, u.bio, u.image FROM users u WHERE u.id = x.author_id LIMIT 1) u), \
+         tn AS MATERIALIZED (SELECT t.id::int8 AS id, t.name, row_number() OVER (ORDER BY t.name) AS rnk \
+           FROM (SELECT DISTINCT unnest(tag_ids) AS id FROM info) x CROSS JOIN LATERAL \
+           (SELECT t.id, t.name FROM tags t WHERE t.id = x.id LIMIT 1) t) \
+         SELECT -2::int8 AS k, tn.rnk AS n, NULL::int8[] AS ids, NULL::int8[] AS favs, NULL::int8[] AS fols, tn.id, \
+           tn.name AS slug, NULL::text AS title, NULL::text AS description, NULL::text AS body, \
+           NULL::timestamptz AS created_at, NULL::timestamptz AS updated_at, NULL::int8[] AS tag_ids, \
+           NULL::int8 AS fav_count, NULL::int8 AS author_id, NULL::text AS username, NULL::text AS bio, NULL::text AS image \
+           FROM tn \
+         UNION ALL SELECT -1, NULL, NULL, NULL, NULL, au.id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
+           au.username, au.bio, au.image FROM au \
+         UNION ALL SELECT 0, NULL, NULL, NULL, NULL, i.id, i.slug, i.title, i.description, NULL, i.created_at, \
+           i.updated_at, i.tag_ids, i.fav_count, i.author_id, NULL, NULL, NULL FROM info i \
+         UNION ALL SELECT rq.k, rq.n, rq.ids, \
+           CASE WHEN rq.viewer <> 0 AND cardinality(rq.ids) > 0 THEN ARRAY(SELECT f.article_id FROM favorites f \
+             WHERE f.user_id = rq.viewer AND f.article_id = ANY (rq.ids)) END, \
+           NULL, \
+           NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL FROM rq",
+        req(&[("viewer", "int8"), ("lim", "int8"), ("ofs", "int8")]),
+        capped(
+            "SELECT 1 FROM follows fo CROSS JOIN LATERAL \
+             (SELECT 1 FROM articles a WHERE a.author_id = fo.followee_id LIMIT 1000) y WHERE fo.follower_id = v.viewer"
+        ),
+        page_ids(
+            "SELECT y.id FROM follows fo CROSS JOIN LATERAL \
+             (SELECT a.id FROM articles a WHERE a.author_id = fo.followee_id AND a.id >= vc.floor ORDER BY a.id DESC \
+             LIMIT (g.lim + g.ofs)) y WHERE fo.follower_id = vc.viewer ORDER BY y.id DESC"
+        ),
+    );
+    s.push(feed_sql);
+
+    // S[14] (s13): ARTICLE (in PAGES S[9])
+    s.push("SELECT NULL".to_string());
 
     // S[15] (s14): ARTICLE_CREATE ($1 viewer, $2 title, $3 description, $4 body, $5 tagList JSON)
     s.push(format!(
@@ -434,8 +481,7 @@ pub fn build_statements() -> Vec<String> {
            cm.username, cm.bio, cm.image FROM cm \
          UNION ALL SELECT u.k, ar.id, CASE WHEN u.viewer <> 0 AND ar.id IS NOT NULL THEN \
            ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = u.viewer) END, \
-           NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL FROM arts ar {} \
-         ORDER BY 1, 2, 6 DESC, 4 DESC",
+           NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL FROM arts ar {}",
         req(&[("viewer", "int8"), ("slug", "text")]),
         each_request("ar")
     ));
@@ -688,13 +734,11 @@ impl BcryptPool {
             wait_ms,
         });
 
-            for _ in 0..helper_count {
+        for hid in 0..helper_count {
             let p = Arc::clone(&pool);
             std::thread::spawn(move || {
-                unsafe {
-                    let _ = crate::sys::setpriority(crate::sys::PRIO_PROCESS, 0, 10);
-                }
-                p.helper_loop();
+                crate::sys::set_sched_batch(if hid == 0 { 0 } else { 10 });
+                p.helper_loop(hid == 0);
             });
         }
         pool
@@ -706,7 +750,7 @@ impl BcryptPool {
         self.cv.notify_all();
     }
 
-    fn helper_loop(&self) {
+    fn helper_loop(&self, is_primary: bool) {
         let mut reqs: Vec<BcryptTask> = Vec::with_capacity(self.lanes);
         let mut jobs = [BcryptJob::default(); BCRYPT_LANES];
         let mut wants = [[0u8; 23]; BCRYPT_LANES];
@@ -715,13 +759,18 @@ impl BcryptPool {
             reqs.clear();
             {
                 let mut st = self.state.lock().unwrap();
-                // Wait until we hold the collector token AND at least 1 request is queued
-                while st.collecting || st.queue.is_empty() {
+                // Primary helper collects >= 1 request with wait_ms coalescing;
+                // secondary helpers only wake when a full multi-lane batch is waiting.
+                while st.collecting
+                    || (is_primary && st.queue.is_empty())
+                    || (!is_primary && st.queue.len() < self.lanes)
+                {
                     st = self.cv.wait(st).unwrap();
                 }
                 st.collecting = true;
 
-                let due = clock_ms() + self.wait_ms;
+                let wait_window = if is_primary { self.wait_ms } else { 0 };
+                let due = clock_ms() + wait_window;
                 while reqs.len() < self.lanes {
                     if let Some(task) = st.queue.pop_front() {
                         let idx = reqs.len();
@@ -1091,7 +1140,8 @@ fn batch_types(job: Job) -> &'static [u8] {
         Job::UserGet => b"i",
         Job::Login => b"t",
         Job::Profile | Job::Comments => b"it",
-        Job::ListGlobal | Job::Feed => b"iiiit",
+        Job::Feed => b"iii",
+        Job::ListGlobal => b"iiiit",
         _ => b"",
     }
 }
@@ -2121,18 +2171,26 @@ impl DbEngine {
                 .put(cur_aid, (cur_start, self.comments_vec.len() as u32));
         }
 
-        for (idx, task) in tasks.iter().enumerate() {
-            let k = (idx + 1) as i64;
-            let mut row_opt: Option<&[u8]> = None;
-            if i < m.len() && m[i] == b'D' && Self::message_k(m, i) == k {
-                let size = 1 + (be32(&m[i + 1..i + 5]) as usize);
-                row_opt = Some(&m[i + 5..i + size]);
-                i += size;
+        self.task_rows.clear();
+        self.task_rows.resize(tasks.len(), (0, 0));
+        while i < m.len() {
+            let size = 1 + (be32(&m[i + 1..i + 5]) as usize);
+            if m[i] == b'D' {
+                let k = Self::message_k(m, i);
+                if k >= 1 && (k as usize) <= tasks.len() {
+                    self.task_rows[(k as usize) - 1] = (i + 5, i + size);
+                }
             }
-            let Some(row) = row_opt else {
+            i += size;
+        }
+
+        for (idx, task) in tasks.iter().enumerate() {
+            let (rs, re) = self.task_rows[idx];
+            if rs == 0 {
                 self.send_error(task, 500, "internal server error");
                 continue;
-            };
+            }
+            let row = &m[rs..re];
             let mut r = Row::open(row, true);
             let article_missing = r.is_null();
             let aid = r.int();
@@ -2185,7 +2243,7 @@ impl DbEngine {
     #[cfg(target_os = "linux")]
     fn pg_connect(&mut self, idx: usize) -> bool {
         const SESSION_OPTS: &str =
-            "-c plan_cache_mode=force_generic_plan -c jit=off -c max_parallel_workers_per_gather=0 -c work_mem=32MB";
+            "-c plan_cache_mode=force_generic_plan -c jit=off -c max_parallel_workers_per_gather=0 -c enable_memoize=off -c work_mem=32MB";
         let stmt_refs: Vec<&str> = self.statements.iter().map(|s| s.as_str()).collect();
         match pg_connect_and_prepare(&self.db_url, SESSION_OPTS, &stmt_refs) {
             Ok(fd) => {
@@ -2324,6 +2382,7 @@ impl DbEngine {
             self.batch_finish(&q.tasks, m);
         } else if q.tasks.len() == 1 {
             self.finish_job(&q.tasks[0], m, false);
+            self.batches_waiting = true;
         } else {
             // Group-commit write batch: check if any statement threw an ErrorResponse ('E').
             // If so, Postgres rolled back the implicit transaction for the entire group,
@@ -2434,9 +2493,6 @@ impl DbEngine {
         let mut least: Option<usize> = None;
         for (i, pc) in self.pgs.iter().enumerate() {
             if pc.fd >= 0 && pc.writes == writes {
-                if writes && pc.inflight < PIPELINE_DEPTH {
-                    return Some(i);
-                }
                 if least.map_or(true, |l| pc.inflight < self.pgs[l].inflight) {
                     least = Some(i);
                 }
@@ -2517,7 +2573,7 @@ impl DbEngine {
             put32(o, 1); // lower bound
 
             for task in &tasks {
-                let (p, v) = if bjob == Job::ListGlobal || bjob == Job::Feed {
+                let (p, v) = if bjob == Job::ListGlobal {
                     pages_param(task, j)
                 } else {
                     let s = param_at(&task.params, j);
@@ -2556,6 +2612,32 @@ impl DbEngine {
             return;
         }
         self.batches_waiting = false;
+
+        // Dispatch coalesced write group commit (waits up to 3 ms or 64 writes)
+        if !self.write_queue.is_empty() {
+            let write_due = self.now_ms - self.write_since >= 3 || self.write_queue.len() >= 64;
+            if write_due {
+                self.pg_reconnect();
+                let pc_idx = self.pg_pick(true).or_else(|| self.pg_pick(false));
+                if let Some(idx) = pc_idx {
+                    if self.pgs[idx].inflight < 2 || self.write_queue.len() >= 64 {
+                        let count = self.write_queue.len().min(64);
+                        let tasks: Vec<DbTask> = self.write_queue.drain(..count).collect();
+                        self.write_since = self.now_ms;
+                        self.pg_queue_write_group(idx, tasks);
+                    }
+                } else {
+                    let tasks: Vec<DbTask> = self.write_queue.drain(..).collect();
+                    for task in &tasks {
+                        self.fail_job(task, false);
+                    }
+                }
+            }
+            if !self.write_queue.is_empty() {
+                self.batches_waiting = true;
+            }
+        }
+
         for j in 1..=N_STATEMENTS {
             let can_send = {
                 let b = &self.batches[j];
@@ -2578,24 +2660,6 @@ impl DbEngine {
                 self.batches_waiting = true;
             }
         }
-        const WRITE_GROUP_MAX: usize = 16;
-        while !self.write_queue.is_empty() {
-            self.pg_reconnect();
-            let pc_idx = self.pg_pick(true).or_else(|| self.pg_pick(false));
-            let count = self.write_queue.len().min(WRITE_GROUP_MAX);
-            let mut group: Vec<DbTask> = self.write_queue.drain(..count).collect();
-            if let Some(idx) = pc_idx {
-                if group.len() == 1 {
-                    self.pg_queue_write(idx, group.pop().unwrap());
-                } else {
-                    self.pg_queue_write_group(idx, group);
-                }
-            } else {
-                for task in &group {
-                    self.fail_job(task, false);
-                }
-            }
-        }
     }
 
     fn batch_timeout(&self) -> c_int {
@@ -2603,6 +2667,17 @@ impl DbEngine {
             return -1;
         }
         let mut due: i64 = -1;
+        if !self.write_queue.is_empty() {
+            let can_write = self
+                .pg_pick(true)
+                .or_else(|| self.pg_pick(false))
+                .map_or(true, |idx| {
+                    self.pgs[idx].inflight < 2 || self.write_queue.len() >= 64
+                });
+            if can_write {
+                due = self.write_since + 3;
+            }
+        }
         for j in 1..=N_STATEMENTS {
             let b = &self.batches[j];
             if !b.tasks.is_empty() && b.inflight < self.batch_inflight {
@@ -2641,13 +2716,11 @@ impl DbEngine {
             self.batches_waiting = true;
             return;
         }
-        self.pg_reconnect();
-        let pc_idx = self.pg_pick(true).or_else(|| self.pg_pick(false));
-        if let Some(idx) = pc_idx {
-            self.pg_queue_write(idx, task);
-        } else {
-            self.fail_job(&task, false);
+        if self.write_queue.is_empty() {
+            self.write_since = self.now_ms;
         }
+        self.write_queue.push_back(task);
+        self.batches_waiting = true;
     }
 
     #[cfg(target_os = "linux")]
