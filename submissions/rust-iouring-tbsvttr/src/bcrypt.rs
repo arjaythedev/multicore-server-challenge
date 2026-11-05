@@ -148,18 +148,87 @@ pub fn format(job: &BcryptJob, out: &mut [u8; 60]) {
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 struct BfLane {
-    s: [u32; 1024],
     p: [u32; 18],
+    s: [u32; 1024],
     _pad: [u32; 14],
 }
 
 const _: () = assert!(std::mem::size_of::<BfLane>() == 4224);
 
 const INIT_LANE: BfLane = BfLane {
-    s: BF_S,
     p: BF_P,
+    s: BF_S,
     _pad: [0u32; 14],
 };
+
+#[cfg(target_arch = "x86_64")]
+std::arch::global_asm!(include_str!(concat!(env!("OUT_DIR"), "/bc_expand0.s")));
+
+#[cfg(target_arch = "x86_64")]
+type Cost10Kernel = unsafe extern "C" fn(
+    st: *mut BfLane,
+    pkey: *const [u32; 18],
+    skey: *const [u32; 18],
+    rounds: u64,
+    ctext: *mut [u32; 6],
+);
+
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" {
+    fn bc_cost10_ah_1(st: *mut BfLane, pkey: *const [u32; 18], skey: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_ah_2(st: *mut BfLane, pkey: *const [u32; 18], skey: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_ah_3(st: *mut BfLane, pkey: *const [u32; 18], skey: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_ah_4(st: *mut BfLane, pkey: *const [u32; 18], skey: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_ah_5(st: *mut BfLane, pkey: *const [u32; 18], skey: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_ah_6(st: *mut BfLane, pkey: *const [u32; 18], skey: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+
+    fn bc_cost10_bextr_1(st: *mut BfLane, pkey: *const [u32; 18], skey: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_bextr_2(st: *mut BfLane, pkey: *const [u32; 18], skey: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_bextr_3(st: *mut BfLane, pkey: *const [u32; 18], skey: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_bextr_4(st: *mut BfLane, pkey: *const [u32; 18], skey: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_bextr_5(st: *mut BfLane, pkey: *const [u32; 18], skey: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_bextr_6(st: *mut BfLane, pkey: *const [u32; 18], skey: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+
+    fn bc_cost10_shrx_1(st: *mut BfLane, pkey: *const [u32; 18], skey: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_shrx_2(st: *mut BfLane, pkey: *const [u32; 18], skey: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_shrx_3(st: *mut BfLane, pkey: *const [u32; 18], skey: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_shrx_4(st: *mut BfLane, pkey: *const [u32; 18], skey: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_shrx_5(st: *mut BfLane, pkey: *const [u32; 18], skey: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+    fn bc_cost10_shrx_6(st: *mut BfLane, pkey: *const [u32; 18], skey: *const [u32; 18], rounds: u64, ctext: *mut [u32; 6]);
+}
+
+#[cfg(target_arch = "x86_64")]
+const KERNEL_AH: [Cost10Kernel; BCRYPT_LANES] = [
+    bc_cost10_ah_1,
+    bc_cost10_ah_2,
+    bc_cost10_ah_3,
+    bc_cost10_ah_4,
+    bc_cost10_ah_5,
+    bc_cost10_ah_6,
+];
+
+#[cfg(target_arch = "x86_64")]
+const KERNEL_BEXTR: [Cost10Kernel; BCRYPT_LANES] = [
+    bc_cost10_bextr_1,
+    bc_cost10_bextr_2,
+    bc_cost10_bextr_3,
+    bc_cost10_bextr_4,
+    bc_cost10_bextr_5,
+    bc_cost10_bextr_6,
+];
+
+#[cfg(target_arch = "x86_64")]
+const KERNEL_SHRX: [Cost10Kernel; BCRYPT_LANES] = [
+    bc_cost10_shrx_1,
+    bc_cost10_shrx_2,
+    bc_cost10_shrx_3,
+    bc_cost10_shrx_4,
+    bc_cost10_shrx_5,
+    bc_cost10_shrx_6,
+];
+
+// 0 = Rust fallback, 1 = Shrx, 2 = Ah, 3 = Bextr
+static ACTIVE_KERNEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 #[inline(always)]
 fn feistel(sk: &[u32; 1024], x: u32) -> u32 {
@@ -326,38 +395,68 @@ fn run_n<const N: usize>(jobs: &mut [BcryptJob]) {
         }
     }
 
-    expand_salt::<N>(&mut lanes, &pkey, &salt);
-    for r in 0..max_rounds {
-        for k in 0..N {
-            if r >= (1u32 << jobs[k].cost) {
-                pkey[k].fill(0);
-                skey[k].fill(0);
-            }
-        }
-        expand_0::<N>(&mut lanes, &pkey);
-        expand_0::<N>(&mut lanes, &skey);
-    }
-
     let mut ctext = [[0u32; 6]; BCRYPT_LANES];
     for k in 0..N {
         ctext[k] = BCRYPT_CTEXT;
     }
-    let mut l = [0u32; BCRYPT_LANES];
-    let mut r = [0u32; BCRYPT_LANES];
-    let mut blk = 0usize;
-    while blk <= 4 {
-        for k in 0..N {
-            l[k] = ctext[k][blk];
-            r[k] = ctext[k][blk + 1];
+
+    #[cfg(target_arch = "x86_64")]
+    let used_asm = {
+        let k_id = ACTIVE_KERNEL.load(std::sync::atomic::Ordering::Relaxed);
+        let same_cost = jobs[..N].windows(2).all(|w| w[0].cost == w[1].cost);
+        if k_id != 0 && same_cost && max_rounds > 0 {
+            let kernel = match k_id {
+                1 => KERNEL_SHRX[N - 1],
+                2 => KERNEL_AH[N - 1],
+                _ => KERNEL_BEXTR[N - 1],
+            };
+            unsafe {
+                kernel(
+                    lanes.as_mut_ptr(),
+                    pkey.as_ptr(),
+                    skey.as_ptr(),
+                    max_rounds as u64,
+                    ctext.as_mut_ptr(),
+                );
+            }
+            true
+        } else {
+            false
         }
-        for _ in 0..64 {
-            enc_n::<N>(&lanes, &mut l, &mut r);
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let used_asm = false;
+
+    if !used_asm {
+        expand_salt::<N>(&mut lanes, &pkey, &salt);
+        for r in 0..max_rounds {
+            for k in 0..N {
+                if r >= (1u32 << jobs[k].cost) {
+                    pkey[k].fill(0);
+                    skey[k].fill(0);
+                }
+            }
+            expand_0::<N>(&mut lanes, &pkey);
+            expand_0::<N>(&mut lanes, &skey);
         }
-        for k in 0..N {
-            ctext[k][blk] = l[k];
-            ctext[k][blk + 1] = r[k];
+
+        let mut l = [0u32; BCRYPT_LANES];
+        let mut r = [0u32; BCRYPT_LANES];
+        let mut blk = 0usize;
+        while blk <= 4 {
+            for k in 0..N {
+                l[k] = ctext[k][blk];
+                r[k] = ctext[k][blk + 1];
+            }
+            for _ in 0..64 {
+                enc_n::<N>(&lanes, &mut l, &mut r);
+            }
+            for k in 0..N {
+                ctext[k][blk] = l[k];
+                ctext[k][blk + 1] = r[k];
+            }
+            blk += 2;
         }
-        blk += 2;
     }
 
     for k in 0..N {
@@ -387,18 +486,33 @@ pub fn calibrate_lanes() -> usize {
         ..BcryptJob::default()
     }; BCRYPT_LANES];
 
-    let mut best = 1usize;
+    #[cfg(target_arch = "x86_64")]
+    let candidates: &[u8] = if std::is_x86_feature_detected!("bmi1") && std::is_x86_feature_detected!("bmi2") {
+        &[1, 2, 3, 0]
+    } else {
+        &[0]
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let candidates: &[u8] = &[0];
+
+    let mut best_lanes = 1usize;
+    let mut best_kernel = 0u8;
     let mut best_us = -1i64;
-    for n in 1..=BCRYPT_LANES {
-        let t0 = clock_us();
-        run(&mut jobs[..n]);
-        run(&mut jobs[..n]);
-        let per = (clock_us() - t0) / (n as i64);
-        if best_us < 0 || per * 103 < best_us * 100 {
-            best = n;
-            best_us = per;
+    for &k_id in candidates {
+        ACTIVE_KERNEL.store(k_id, std::sync::atomic::Ordering::Relaxed);
+        for n in 1..=BCRYPT_LANES {
+            let t0 = clock_us();
+            run(&mut jobs[..n]);
+            run(&mut jobs[..n]);
+            let per = (clock_us() - t0) / (n as i64);
+            if best_us < 0 || per * 103 < best_us * 100 {
+                best_lanes = n;
+                best_kernel = k_id;
+                best_us = per;
+            }
         }
     }
-    best
+    ACTIVE_KERNEL.store(best_kernel, std::sync::atomic::Ordering::Relaxed);
+    best_lanes
 }
 

@@ -48,7 +48,7 @@ fn main() {
         crate::sys::signal(crate::sys::SIGPIPE, crate::sys::SIG_IGN);
     }
     raise_nofile_limit();
-    if env_i64("SCHED_BATCH", 1) != 0 {
+    if env_i64("SCHED_BATCH", 0) != 0 {
         set_sched_batch(0);
     }
 
@@ -89,9 +89,9 @@ fn main() {
     workers = workers.min(64);
 
     let pool_size = env_i64("DB_POOL", 48).clamp(1, 95) as usize;
-    let batch_inflight = env_i64("BATCH_INFLIGHT", 3).max(1) as i32;
-    let batch_ms = env_i64("BATCH_MS", 20).max(0);
-    let batch_slow_ms = env_i64("BATCH_SLOW_MS", 100).max(0);
+    let batch_inflight = env_i64("BATCH_INFLIGHT", 4).max(1) as i32;
+    let batch_ms = env_i64("BATCH_MS", 16).max(0);
+    let batch_slow_ms = env_i64("BATCH_SLOW_MS", 50).max(0);
     let batch_max = env_i64("BATCH_MAX", 4000).max(1) as usize;
 
     let mut helpers = env_i64("BCRYPT_HELPERS", 0) as usize;
@@ -155,7 +155,6 @@ fn main() {
         let b_pool = Arc::clone(&bcrypt_pool);
         std::thread::spawn(move || {
             unshare_files();
-            set_sched_batch(5);
             let mut worker = Worker::new(
                 wid,
                 fd_a,
