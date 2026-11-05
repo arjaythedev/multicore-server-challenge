@@ -82,8 +82,8 @@ impl Job {
             | Job::ListTag
             | Job::ListAuthor
             | Job::ListFavorited
-            | Job::Feed
             | Job::Article => Job::ListGlobal,
+            Job::Feed => Job::Feed,
             other => other,
         }
     }
@@ -140,6 +140,13 @@ fn capped(rows: &str) -> String {
     format!("(SELECT count(*) FROM ({rows} LIMIT 1000) s)")
 }
 
+fn proved_capped(rows: &str) -> String {
+    format!(
+        "CASE WHEN EXISTS ({rows} OFFSET 999) THEN 1000 ELSE {} END",
+        capped(rows)
+    )
+}
+
 fn page(rows: &str) -> String {
     format!("(SELECT * FROM ({rows} LIMIT g.lim OFFSET g.ofs) z LIMIT 100)")
 }
@@ -173,12 +180,16 @@ fn page_ids(rows: &str) -> String {
     format!("ARRAY(SELECT x.id FROM {} x ORDER BY x.id DESC)", page(rows))
 }
 
-fn keyed(p: &str, kind: i32, key_sql: &str, count_sql: &str, page_sql: &str) -> String {
+fn keyed(p: &str, kind: i32, key_sql: &str, count_sql: &str, page_sql: &str, prove: bool) -> String {
+    let cnt_expr = if prove {
+        proved_capped(count_sql)
+    } else {
+        capped(count_sql)
+    };
     format!(
-        "{p}cnt AS MATERIALIZED (SELECT ky.key, ky.fid, {} AS n FROM \
+        "{p}cnt AS MATERIALIZED (SELECT ky.key, ky.fid, {cnt_expr} AS n FROM \
          (SELECT s.key, ({key_sql}) AS fid FROM (SELECT DISTINCT key FROM req WHERE kind = {kind}) s) ky), \
          {p}pa AS MATERIALIZED (SELECT g.ks, g.vs, ky.n, {} AS ids FROM {} g JOIN {p}cnt ky ON ky.key = g.key)",
-        capped(count_sql),
         page_ids(page_sql),
         grouped(kind, "key, lim, ofs")
     )
@@ -262,45 +273,28 @@ pub fn build_statements() -> Vec<String> {
             .to_string(),
     );
 
-    // S[9] (s08): PAGES ($1 kind, $2 viewer, $3 limit, $4 offset, $5 key)
+    // S[9] (s08): PAGES ($1 kind, $2 viewer, $3 limit, $4 offset, $5 key) — Lists (kind 1..4) & Article (kind 6)
     let pages_sql = format!(
         "WITH req AS (SELECT * FROM unnest($1::int8[], $2::int8[], $3::int8[], $4::int8[], $5::text[]) \
          WITH ORDINALITY r(kind, viewer, lim, ofs, key, k)), \
          gpa AS MATERIALIZED (SELECT g.ks, g.vs, {} AS ids FROM {} g), \
          gcnt AS MATERIALIZED (SELECT {} AS n FROM (SELECT 1 FROM gpa LIMIT 1) g), \
          {}, {}, {}, \
-         v AS MATERIALIZED (SELECT viewer, max(lim + ofs) AS depth, array_agg(k) AS ks, array_agg(lim) AS lims, \
-           array_agg(ofs) AS ofss FROM req WHERE kind = 5 GROUP BY viewer), \
-         fl AS MATERIALIZED (SELECT v.*, f.fid FROM v LEFT JOIN LATERAL \
-           (SELECT fo.followee_id AS fid FROM follows fo WHERE fo.follower_id = v.viewer OFFSET 0) f ON true), \
-         hubs AS MATERIALIZED (SELECT array_agg(h.fid) AS fids, \
-           array_agg((SELECT a.id FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC OFFSET h.depth - 1 LIMIT 1)) AS floors, \
-           array_agg(EXISTS (SELECT 1 FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC OFFSET 999 LIMIT 1)) AS bigs \
-           FROM (SELECT fid, max(depth) AS depth FROM fl WHERE fid IS NOT NULL GROUP BY fid HAVING count(*) >= 2 \
-           ORDER BY count(*) DESC, fid LIMIT 16) h), \
-         vc AS MATERIALIZED (SELECT x.viewer, x.ks, x.lims, x.ofss, COALESCE(x.floor, 0) AS floor, \
-           CASE WHEN x.big THEN 1000 ELSE {} END AS n FROM \
-           (SELECT fl.viewer, any_value(fl.ks) AS ks, any_value(fl.lims) AS lims, \
-            any_value(fl.ofss) AS ofss, bool_or(h.bigs[array_position(h.fids, fl.fid)]) AS big, \
-            max(h.floors[array_position(h.fids, fl.fid)]) AS floor FROM fl CROSS JOIN hubs h GROUP BY fl.viewer) x), \
-         epa AS MATERIALIZED (SELECT g.k, vc.viewer, vc.n, {} AS ids \
-           FROM vc CROSS JOIN LATERAL unnest(vc.ks, vc.lims, vc.ofss) g(k, lim, ofs)), \
          arts AS MATERIALIZED (SELECT s.ks, s.vs, (SELECT a.id FROM articles a WHERE a.slug = s.key) AS id \
            FROM {} s), \
          rq AS MATERIALIZED (\
            SELECT u.k, 1 AS kind, u.viewer, c.n, g.ids FROM gpa g CROSS JOIN gcnt c {} \
            UNION ALL {} UNION ALL {} UNION ALL {} \
-           UNION ALL SELECT e.k, 5, e.viewer, e.n, e.ids FROM epa e \
            UNION ALL SELECT u.k, 6, u.viewer, NULL::int8, CASE WHEN ar.id IS NULL THEN NULL ELSE ARRAY[ar.id] END \
              FROM arts ar {}), \
          ids AS MATERIALIZED (SELECT x.id, bool_or(rq.kind = 6) AS with_body FROM rq CROSS JOIN LATERAL unnest(rq.ids) x(id) \
-           GROUP BY x.id), \
+           GROUP BY x.id ORDER BY x.id), \
          info AS MATERIALIZED (SELECT y.* FROM ids x CROSS JOIN LATERAL (SELECT a.id, a.slug, a.title, a.description, \
            CASE WHEN x.with_body THEN a.body END AS body, a.created_at, a.updated_at, \
            ARRAY(SELECT at.tag_id::int8 FROM article_tags at WHERE at.article_id = a.id) AS tag_ids, \
            (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS fav_count, a.author_id \
            FROM articles a WHERE a.id = x.id LIMIT 1) y), \
-         au AS MATERIALIZED (SELECT u.* FROM (SELECT DISTINCT author_id FROM info) x CROSS JOIN LATERAL \
+         au AS MATERIALIZED (SELECT u.* FROM (SELECT DISTINCT author_id FROM info ORDER BY 1) x CROSS JOIN LATERAL \
            (SELECT u.id, u.username, u.bio, u.image FROM users u WHERE u.id = x.author_id LIMIT 1) u), \
          tn AS MATERIALIZED (SELECT t.id::int8 AS id, t.name, row_number() OVER (ORDER BY t.name) AS rnk \
            FROM (SELECT DISTINCT unnest(tag_ids) AS id FROM info) x CROSS JOIN LATERAL \
@@ -317,18 +311,19 @@ pub fn build_statements() -> Vec<String> {
          UNION ALL SELECT rq.k, rq.n, rq.ids, \
            CASE WHEN rq.viewer <> 0 AND cardinality(rq.ids) > 0 THEN ARRAY(SELECT f.article_id FROM favorites f \
              WHERE f.user_id = rq.viewer AND f.article_id = ANY (rq.ids)) END, \
-           CASE WHEN rq.viewer <> 0 AND rq.kind <> 5 THEN ARRAY(SELECT fo.followee_id FROM follows fo \
+           CASE WHEN rq.viewer <> 0 AND cardinality(rq.ids) > 0 THEN ARRAY(SELECT fo.followee_id FROM follows fo \
              WHERE fo.follower_id = rq.viewer) END, \
-           NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL FROM rq ORDER BY 1",
+           NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL FROM rq",
         page_ids("SELECT a.id FROM articles a ORDER BY a.id DESC"),
         grouped(1, "lim, ofs"),
-        capped("SELECT 1 FROM articles a"),
+        proved_capped("SELECT 1 FROM articles a"),
         keyed(
             "t",
             2,
             "SELECT t.id FROM tags t WHERE t.name = s.key",
             "SELECT 1 FROM article_tags at WHERE at.tag_id = ky.fid",
             "SELECT at.article_id AS id FROM article_tags at WHERE at.tag_id = ky.fid ORDER BY at.article_id DESC",
+            true,
         ),
         keyed(
             "a",
@@ -336,6 +331,7 @@ pub fn build_statements() -> Vec<String> {
             "SELECT u.id FROM users u WHERE u.username = s.key",
             "SELECT 1 FROM articles a WHERE a.author_id = ky.fid",
             "SELECT a.id FROM articles a WHERE a.author_id = ky.fid ORDER BY a.id DESC",
+            false,
         ),
         keyed(
             "f",
@@ -343,15 +339,7 @@ pub fn build_statements() -> Vec<String> {
             "SELECT u.id FROM users u WHERE u.username = s.key",
             "SELECT 1 FROM favorites f WHERE f.user_id = ky.fid",
             "SELECT f.article_id AS id FROM favorites f WHERE f.user_id = ky.fid ORDER BY f.article_id DESC",
-        ),
-        capped(
-            "SELECT 1 FROM follows fo CROSS JOIN LATERAL \
-             (SELECT 1 FROM articles a WHERE a.author_id = fo.followee_id LIMIT 1000) y WHERE fo.follower_id = x.viewer"
-        ),
-        page_ids(
-            "SELECT y.id FROM follows fo CROSS JOIN LATERAL \
-             (SELECT a.id FROM articles a WHERE a.author_id = fo.followee_id AND a.id >= vc.floor ORDER BY a.id DESC \
-             LIMIT (g.lim + g.ofs)) y WHERE fo.follower_id = vc.viewer ORDER BY y.id DESC"
+            false,
         ),
         grouped(6, "key"),
         each_request("g"),
@@ -362,10 +350,69 @@ pub fn build_statements() -> Vec<String> {
     );
     s.push(pages_sql);
 
-    // S[10]..S[14] (s09..s13): LIST_TAG, LIST_AUTHOR, LIST_FAVORITED, FEED, ARTICLE (in PAGES)
-    for _ in 0..5 {
+    // S[10]..S[12] (s09..s11): LIST_TAG, LIST_AUTHOR, LIST_FAVORITED (in PAGES S[9])
+    for _ in 0..3 {
         s.push("SELECT NULL".to_string());
     }
+
+    // S[13] (s12): FEED ($1 viewer, $2 lim, $3 ofs) — dedicated Feed-only statement
+    let feed_sql = format!(
+        "WITH {}, \
+         v AS MATERIALIZED (SELECT viewer, max(lim + ofs) AS depth, array_agg(k) AS ks, array_agg(lim) AS lims, \
+           array_agg(ofs) AS ofss FROM req GROUP BY viewer), \
+         fl AS MATERIALIZED (SELECT v.viewer, v.depth, f.fid FROM v LEFT JOIN LATERAL \
+           (SELECT fo.followee_id AS fid FROM follows fo WHERE fo.follower_id = v.viewer OFFSET 0) f ON true), \
+         hubs AS MATERIALIZED (SELECT array_agg(h.fid) AS fids, \
+           array_agg((SELECT a.id FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC OFFSET h.depth - 1 LIMIT 1)) AS floors, \
+           array_agg(EXISTS (SELECT 1 FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC OFFSET 999 LIMIT 1)) AS bigs \
+           FROM (SELECT fid, max(depth) AS depth FROM fl WHERE fid IS NOT NULL GROUP BY fid HAVING count(*) >= 2 \
+           ORDER BY count(*) DESC, fid LIMIT 32) h), \
+         vc AS MATERIALIZED (SELECT v.viewer, v.ks, v.lims, v.ofss, COALESCE(x.floor, 0) AS floor, \
+           CASE WHEN x.big THEN 1000 ELSE {} END AS n FROM v JOIN \
+           (SELECT fl.viewer, COALESCE(bool_or(h.bigs[array_position(h.fids, fl.fid)]), false) AS big, \
+            max(h.floors[array_position(h.fids, fl.fid)]) AS floor FROM fl CROSS JOIN hubs h GROUP BY fl.viewer) x ON x.viewer = v.viewer), \
+         rq AS MATERIALIZED (SELECT g.k, vc.viewer, vc.n, {} AS ids \
+           FROM vc CROSS JOIN LATERAL unnest(vc.ks, vc.lims, vc.ofss) g(k, lim, ofs)), \
+         ids AS MATERIALIZED (SELECT DISTINCT x.id FROM rq CROSS JOIN LATERAL unnest(rq.ids) x(id) ORDER BY x.id), \
+         info AS MATERIALIZED (SELECT y.* FROM ids x CROSS JOIN LATERAL (SELECT a.id, a.slug, a.title, a.description, \
+           a.created_at, a.updated_at, \
+           ARRAY(SELECT at.tag_id::int8 FROM article_tags at WHERE at.article_id = a.id) AS tag_ids, \
+           (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS fav_count, a.author_id \
+           FROM articles a WHERE a.id = x.id LIMIT 1) y), \
+         au AS MATERIALIZED (SELECT u.* FROM (SELECT DISTINCT author_id FROM info ORDER BY 1) x CROSS JOIN LATERAL \
+           (SELECT u.id, u.username, u.bio, u.image FROM users u WHERE u.id = x.author_id LIMIT 1) u), \
+         tn AS MATERIALIZED (SELECT t.id::int8 AS id, t.name, row_number() OVER (ORDER BY t.name) AS rnk \
+           FROM (SELECT DISTINCT unnest(tag_ids) AS id FROM info) x CROSS JOIN LATERAL \
+           (SELECT t.id, t.name FROM tags t WHERE t.id = x.id LIMIT 1) t) \
+         SELECT -2::int8 AS k, tn.rnk AS n, NULL::int8[] AS ids, NULL::int8[] AS favs, NULL::int8[] AS fols, tn.id, \
+           tn.name AS slug, NULL::text AS title, NULL::text AS description, NULL::text AS body, \
+           NULL::timestamptz AS created_at, NULL::timestamptz AS updated_at, NULL::int8[] AS tag_ids, \
+           NULL::int8 AS fav_count, NULL::int8 AS author_id, NULL::text AS username, NULL::text AS bio, NULL::text AS image \
+           FROM tn \
+         UNION ALL SELECT -1, NULL, NULL, NULL, NULL, au.id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
+           au.username, au.bio, au.image FROM au \
+         UNION ALL SELECT 0, NULL, NULL, NULL, NULL, i.id, i.slug, i.title, i.description, NULL, i.created_at, \
+           i.updated_at, i.tag_ids, i.fav_count, i.author_id, NULL, NULL, NULL FROM info i \
+         UNION ALL SELECT rq.k, rq.n, rq.ids, \
+           CASE WHEN rq.viewer <> 0 AND cardinality(rq.ids) > 0 THEN ARRAY(SELECT f.article_id FROM favorites f \
+             WHERE f.user_id = rq.viewer AND f.article_id = ANY (rq.ids)) END, \
+           NULL, \
+           NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL FROM rq",
+        req(&[("viewer", "int8"), ("lim", "int8"), ("ofs", "int8")]),
+        capped(
+            "SELECT 1 FROM follows fo CROSS JOIN LATERAL \
+             (SELECT 1 FROM articles a WHERE a.author_id = fo.followee_id LIMIT 1000) y WHERE fo.follower_id = v.viewer"
+        ),
+        page_ids(
+            "SELECT y.id FROM follows fo CROSS JOIN LATERAL \
+             (SELECT a.id FROM articles a WHERE a.author_id = fo.followee_id AND a.id >= vc.floor ORDER BY a.id DESC \
+             LIMIT (g.lim + g.ofs)) y WHERE fo.follower_id = vc.viewer ORDER BY y.id DESC"
+        ),
+    );
+    s.push(feed_sql);
+
+    // S[14] (s13): ARTICLE (in PAGES S[9])
+    s.push("SELECT NULL".to_string());
 
     // S[15] (s14): ARTICLE_CREATE ($1 viewer, $2 title, $3 description, $4 body, $5 tagList JSON)
     s.push(format!(
@@ -434,8 +481,7 @@ pub fn build_statements() -> Vec<String> {
            cm.username, cm.bio, cm.image FROM cm \
          UNION ALL SELECT u.k, ar.id, CASE WHEN u.viewer <> 0 AND ar.id IS NOT NULL THEN \
            ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = u.viewer) END, \
-           NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL FROM arts ar {} \
-         ORDER BY 1, 2, 6 DESC, 4 DESC",
+           NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL FROM arts ar {}",
         req(&[("viewer", "int8"), ("slug", "text")]),
         each_request("ar")
     ));
@@ -540,10 +586,41 @@ pub struct DbTask {
     pub token: Vec<u8>,
 }
 
+pub enum HttpPayload {
+    Owned(Vec<u8>),
+    Shared(Arc<[u8]>),
+}
+
+impl HttpPayload {
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            HttpPayload::Owned(v) => v.as_slice(),
+            HttpPayload::Shared(a) => a,
+        }
+    }
+}
+
+impl std::ops::Deref for HttpPayload {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[u8]> for HttpPayload {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
 pub enum WorkerMsg {
     Http {
         client_tag: u64,
-        response: Vec<u8>,
+        response: HttpPayload,
     },
     LoginRow {
         client_tag: u64,
@@ -657,13 +734,11 @@ impl BcryptPool {
             wait_ms,
         });
 
-        for _ in 0..helper_count {
+        for hid in 0..helper_count {
             let p = Arc::clone(&pool);
             std::thread::spawn(move || {
-                unsafe {
-                    setpriority(PRIO_PROCESS, 0, 10);
-                }
-                p.helper_loop();
+                crate::sys::set_sched_batch(if hid == 0 { 0 } else { 10 });
+                p.helper_loop(hid == 0);
             });
         }
         pool
@@ -675,7 +750,7 @@ impl BcryptPool {
         self.cv.notify_all();
     }
 
-    fn helper_loop(&self) {
+    fn helper_loop(&self, is_primary: bool) {
         let mut reqs: Vec<BcryptTask> = Vec::with_capacity(self.lanes);
         let mut jobs = [BcryptJob::default(); BCRYPT_LANES];
         let mut wants = [[0u8; 23]; BCRYPT_LANES];
@@ -684,13 +759,18 @@ impl BcryptPool {
             reqs.clear();
             {
                 let mut st = self.state.lock().unwrap();
-                // Wait until we hold the collector token AND at least 1 request is queued
-                while st.collecting || st.queue.is_empty() {
+                // Primary helper collects >= 1 request with wait_ms coalescing;
+                // secondary helpers only wake when a full multi-lane batch is waiting.
+                while st.collecting
+                    || (is_primary && st.queue.is_empty())
+                    || (!is_primary && st.queue.len() < self.lanes)
+                {
                     st = self.cv.wait(st).unwrap();
                 }
                 st.collecting = true;
 
-                let due = clock_ms() + self.wait_ms;
+                let wait_window = if is_primary { self.wait_ms } else { 0 };
+                let due = clock_ms() + wait_window;
                 while reqs.len() < self.lanes {
                     if let Some(task) = st.queue.pop_front() {
                         let idx = reqs.len();
@@ -1060,6 +1140,7 @@ fn batch_types(job: Job) -> &'static [u8] {
         Job::UserGet => b"i",
         Job::Login => b"t",
         Job::Profile | Job::Comments => b"it",
+        Job::Feed => b"iii",
         Job::ListGlobal => b"iiiit",
         _ => b"",
     }
@@ -1096,6 +1177,15 @@ struct PreArticle {
 struct PreComment {
     author_id: i64,
     prefix: (u32, u32),
+}
+
+#[derive(Clone, Copy, Default)]
+struct SharedPage {
+    all_followed: bool,
+    count: i64,
+    ids_start: usize,
+    ids_len: usize,
+    resp_idx: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -1161,6 +1251,8 @@ pub struct DbEngine {
     pgs: Vec<PgConn>,
     flush_list: Vec<usize>,
     batches: [Batch; N_STATEMENTS + 1],
+    write_queue: std::collections::VecDeque<DbTask>,
+    write_since: i64,
     batches_waiting: bool,
     batch_inflight: i32,
     batch_ms: i64,
@@ -1176,10 +1268,15 @@ pub struct DbEngine {
     author_table: IdTable<PreAuthor>,
     article_table: IdTable<PreArticle>,
     comment_article_table: IdTable<(u32, u32)>,
+    shared_single_table: IdTable<u32>,
+    shared_resps: Vec<Arc<[u8]>>,
+    shared_pages: Vec<SharedPage>,
+    task_rows: Vec<(usize, usize)>,
     comments_vec: Vec<PreComment>,
     tag_refs: Vec<PreTag>,
     arena: Vec<u8>,
     body: Vec<u8>,
+    resp_scratch: Vec<u8>,
     token_buf: Vec<u8>,
 }
 
@@ -1208,12 +1305,13 @@ impl DbEngine {
             pgs.push(PgConn::new(i >= pool_size - writers));
         }
 
+        let mut worker_out = Vec::with_capacity(workers.len());
+        for _ in 0..workers.len() {
+            worker_out.push(Vec::with_capacity(512));
+        }
+
         #[cfg(target_os = "linux")]
         let epfd = unsafe { epoll_create1(0) };
-
-        let worker_out = (0..workers.len())
-            .map(|_| Vec::with_capacity(256))
-            .collect();
 
         let mut engine = Self {
             #[cfg(target_os = "linux")]
@@ -1227,6 +1325,8 @@ impl DbEngine {
             pgs,
             flush_list: Vec::with_capacity(pool_size),
             batches: std::array::from_fn(|_| Batch::default()),
+            write_queue: std::collections::VecDeque::with_capacity(256),
+            write_since: now_ms,
             batches_waiting: false,
             batch_inflight,
             batch_ms,
@@ -1241,10 +1341,15 @@ impl DbEngine {
             author_table: IdTable::new(),
             article_table: IdTable::new(),
             comment_article_table: IdTable::new(),
+            shared_single_table: IdTable::new(),
+            shared_resps: Vec::with_capacity(128),
+            shared_pages: Vec::with_capacity(128),
+            task_rows: Vec::with_capacity(512),
             comments_vec: Vec::with_capacity(512),
             tag_refs: Vec::with_capacity(32),
             arena: Vec::with_capacity(524288),
             body: Vec::with_capacity(131072),
+            resp_scratch: Vec::with_capacity(131072),
             token_buf: Vec::with_capacity(160),
         };
 
@@ -1274,14 +1379,14 @@ impl DbEngine {
 
     #[inline]
     fn send_to_worker(&mut self, worker_id: usize, msg: WorkerMsg) {
-        if worker_id < 64 && worker_id < self.worker_out.len() {
-            self.worker_out[worker_id].push(msg);
+        self.worker_out[worker_id].push(msg);
+        if worker_id < 64 {
             self.dirty_workers |= 1u64 << worker_id;
         } else {
             let w = &self.workers[worker_id];
             {
                 let mut q = w.queue.lock().unwrap();
-                q.push(msg);
+                q.append(&mut self.worker_out[worker_id]);
             }
             wake_eventfd(w.event_fd);
         }
@@ -1293,12 +1398,23 @@ impl DbEngine {
         while mask != 0 {
             let wid = mask.trailing_zeros() as usize;
             mask &= mask - 1;
-            let w = &self.workers[wid];
-            {
-                let mut q = w.queue.lock().unwrap();
-                q.append(&mut self.worker_out[wid]);
+            let out = &mut self.worker_out[wid];
+            if !out.is_empty() {
+                let w = &self.workers[wid];
+                let should_wake = {
+                    let mut q = w.queue.lock().unwrap();
+                    let was_empty = q.is_empty();
+                    if was_empty {
+                        std::mem::swap(&mut *q, out);
+                    } else {
+                        q.append(out);
+                    }
+                    was_empty
+                };
+                if should_wake {
+                    wake_eventfd(w.event_fd);
+                }
             }
-            wake_eventfd(w.event_fd);
         }
     }
 
@@ -1309,7 +1425,7 @@ impl DbEngine {
             task.worker_id,
             WorkerMsg::Http {
                 client_tag: task.client_tag,
-                response: resp,
+                response: HttpPayload::Owned(resp),
             },
         );
     }
@@ -1321,7 +1437,24 @@ impl DbEngine {
             task.worker_id,
             WorkerMsg::Http {
                 client_tag: task.client_tag,
-                response: resp,
+                response: HttpPayload::Owned(resp),
+            },
+        );
+    }
+
+    #[inline]
+    fn build_shared_body(&mut self, status: i32) -> Arc<[u8]> {
+        build_http_response(&mut self.resp_scratch, status, false, &self.body);
+        Arc::from(self.resp_scratch.as_slice())
+    }
+
+    #[inline]
+    fn send_shared(&mut self, task: &DbTask, resp: Arc<[u8]>) {
+        self.send_to_worker(
+            task.worker_id,
+            WorkerMsg::Http {
+                client_tag: task.client_tag,
+                response: HttpPayload::Shared(resp),
             },
         );
     }
@@ -1333,7 +1466,7 @@ impl DbEngine {
             task.worker_id,
             WorkerMsg::Http {
                 client_tag: task.client_tag,
-                response: resp,
+                response: HttpPayload::Owned(resp),
             },
         );
     }
@@ -1596,8 +1729,13 @@ impl DbEngine {
                 j += size;
             }
             self.body.extend_from_slice(b"]}");
+            let shared = self.build_shared_body(200);
             for task in tasks {
-                self.send_body(task, 200);
+                if !task.close_after {
+                    self.send_shared(task, Arc::clone(&shared));
+                } else {
+                    self.send_body(task, 200);
+                }
             }
             return;
         }
@@ -1653,12 +1791,16 @@ impl DbEngine {
             i += 1 + (be32(&m[i + 1..i + 5]) as usize);
         }
 
-        self.batches[Job::ListGlobal as usize].inflight -= 1;
+        let bjob = tasks[0].job.batch_job() as usize;
+        self.batches[bjob].inflight -= 1;
         self.batches_waiting = true;
 
         self.tag_table.reset(tags);
         self.author_table.reset(authors);
         self.article_table.reset(articles);
+        self.shared_single_table.reset(articles.max(1));
+        self.shared_resps.clear();
+        self.shared_pages.clear();
         self.arena.clear();
 
         i = first_row;
@@ -1786,19 +1928,27 @@ impl DbEngine {
             i += size;
         }
 
+        self.task_rows.clear();
+        self.task_rows.resize(tasks.len(), (0, 0));
+        while i < m.len() {
+            let size = 1 + (be32(&m[i + 1..i + 5]) as usize);
+            if m[i] == b'D' {
+                let k = Self::message_k(m, i);
+                if k >= 1 && (k as usize) <= tasks.len() {
+                    self.task_rows[(k as usize) - 1] = (i + 5, i + size);
+                }
+            }
+            i += size;
+        }
+
         // Now assemble each request's response using pre-formatted slices
         for (idx, task) in tasks.iter().enumerate() {
-            let k = (idx + 1) as i64;
-            let mut row_opt: Option<&[u8]> = None;
-            if i < m.len() && m[i] == b'D' && Self::message_k(m, i) == k {
-                let size = 1 + (be32(&m[i + 1..i + 5]) as usize);
-                row_opt = Some(&m[i + 5..i + size]);
-                i += size;
-            }
-            let Some(row) = row_opt else {
+            let (rs, re) = self.task_rows[idx];
+            if rs == 0 {
                 self.send_error(task, 500, "internal server error");
                 continue;
-            };
+            }
+            let row = &m[rs..re];
 
             let mut r = Row::open(row, true);
             let count = r.int();
@@ -1806,7 +1956,6 @@ impl DbEngine {
             let favs = Int8s::from_col(r.col());
             let fols = Int8s::from_col(r.col());
 
-            self.body.clear();
             if task.job == Job::Article {
                 let art_opt = if ids.count > 0 {
                     self.article_table.get(ids.at(0))
@@ -1817,11 +1966,51 @@ impl DbEngine {
                     self.send_error(task, 404, "article not found");
                     continue;
                 };
+                let can_share = !task.close_after && favs.count == 0 && fols.count == 0;
+                if can_share {
+                    if let Some(ridx) = self.shared_single_table.get(art.id) {
+                        let arc = Arc::clone(&self.shared_resps[ridx as usize]);
+                        self.send_shared(task, arc);
+                        continue;
+                    }
+                }
+                self.body.clear();
                 self.body.extend_from_slice(b"{\"article\":");
                 Self::emit_pre_article(&mut self.body, &self.arena, &art, true, &favs, &fols, false);
                 self.body.push(b'}');
+                if can_share {
+                    let arc = self.build_shared_body(200);
+                    let ridx = self.shared_resps.len() as u32;
+                    self.shared_resps.push(Arc::clone(&arc));
+                    self.shared_single_table.put(art.id, ridx);
+                    self.send_shared(task, arc);
+                } else {
+                    self.send_body(task, 200);
+                }
             } else {
                 let all_followed = task.job == Job::Feed;
+                let can_share = !task.close_after
+                    && favs.count == 0
+                    && (all_followed || fols.count == 0);
+                let ids_bytes = &ids.p[..ids.count * 12];
+                if can_share {
+                    let mut hit: Option<Arc<[u8]>> = None;
+                    for sp in &self.shared_pages {
+                        if sp.all_followed == all_followed
+                            && sp.count == count
+                            && sp.ids_len == ids_bytes.len()
+                            && &m[sp.ids_start..sp.ids_start + sp.ids_len] == ids_bytes
+                        {
+                            hit = Some(Arc::clone(&self.shared_resps[sp.resp_idx as usize]));
+                            break;
+                        }
+                    }
+                    if let Some(arc) = hit {
+                        self.send_shared(task, arc);
+                        continue;
+                    }
+                }
+                self.body.clear();
                 self.body.extend_from_slice(b"{\"articles\":[");
                 let mut first = true;
                 for ai in 0..ids.count {
@@ -1844,9 +2033,30 @@ impl DbEngine {
                 self.body.extend_from_slice(b"],\"articlesCount\":");
                 put_int(&mut self.body, count);
                 self.body.push(b'}');
+                if can_share {
+                    let arc = self.build_shared_body(200);
+                    let resp_idx = self.shared_resps.len() as u32;
+                    self.shared_resps.push(Arc::clone(&arc));
+                    let ids_start = if ids_bytes.is_empty() {
+                        0
+                    } else {
+                        (ids_bytes.as_ptr() as usize) - (m.as_ptr() as usize)
+                    };
+                    self.shared_pages.push(SharedPage {
+                        all_followed,
+                        count,
+                        ids_start,
+                        ids_len: ids_bytes.len(),
+                        resp_idx,
+                    });
+                    self.send_shared(task, arc);
+                } else {
+                    self.send_body(task, 200);
+                }
             }
-            self.send_body(task, 200);
         }
+        self.shared_resps.clear();
+        self.shared_pages.clear();
     }
 
     #[inline]
@@ -1908,6 +2118,8 @@ impl DbEngine {
         self.batches_waiting = true;
 
         self.comment_article_table.reset(articles);
+        self.shared_single_table.reset(articles.max(1));
+        self.shared_resps.clear();
         self.comments_vec.clear();
         self.arena.clear();
 
@@ -1959,18 +2171,26 @@ impl DbEngine {
                 .put(cur_aid, (cur_start, self.comments_vec.len() as u32));
         }
 
-        for (idx, task) in tasks.iter().enumerate() {
-            let k = (idx + 1) as i64;
-            let mut row_opt: Option<&[u8]> = None;
-            if i < m.len() && m[i] == b'D' && Self::message_k(m, i) == k {
-                let size = 1 + (be32(&m[i + 1..i + 5]) as usize);
-                row_opt = Some(&m[i + 5..i + size]);
-                i += size;
+        self.task_rows.clear();
+        self.task_rows.resize(tasks.len(), (0, 0));
+        while i < m.len() {
+            let size = 1 + (be32(&m[i + 1..i + 5]) as usize);
+            if m[i] == b'D' {
+                let k = Self::message_k(m, i);
+                if k >= 1 && (k as usize) <= tasks.len() {
+                    self.task_rows[(k as usize) - 1] = (i + 5, i + size);
+                }
             }
-            let Some(row) = row_opt else {
+            i += size;
+        }
+
+        for (idx, task) in tasks.iter().enumerate() {
+            let (rs, re) = self.task_rows[idx];
+            if rs == 0 {
                 self.send_error(task, 500, "internal server error");
                 continue;
-            };
+            }
+            let row = &m[rs..re];
             let mut r = Row::open(row, true);
             let article_missing = r.is_null();
             let aid = r.int();
@@ -1978,6 +2198,14 @@ impl DbEngine {
             if article_missing {
                 self.send_error(task, 404, "article not found");
             } else {
+                let can_share = !task.close_after && fols.count == 0 && aid > 0;
+                if can_share {
+                    if let Some(ridx) = self.shared_single_table.get(aid) {
+                        let arc = Arc::clone(&self.shared_resps[ridx as usize]);
+                        self.send_shared(task, arc);
+                        continue;
+                    }
+                }
                 self.body.clear();
                 self.body.extend_from_slice(b"{\"comments\":[");
                 if let Some((c_start, c_end)) = self.comment_article_table.get(aid) {
@@ -1998,15 +2226,24 @@ impl DbEngine {
                     }
                 }
                 self.body.extend_from_slice(b"]}");
-                self.send_body(task, 200);
+                if can_share {
+                    let arc = self.build_shared_body(200);
+                    let ridx = self.shared_resps.len() as u32;
+                    self.shared_resps.push(Arc::clone(&arc));
+                    self.shared_single_table.put(aid, ridx);
+                    self.send_shared(task, arc);
+                } else {
+                    self.send_body(task, 200);
+                }
             }
         }
+        self.shared_resps.clear();
     }
 
     #[cfg(target_os = "linux")]
     fn pg_connect(&mut self, idx: usize) -> bool {
         const SESSION_OPTS: &str =
-            "-c plan_cache_mode=force_generic_plan -c jit=off -c max_parallel_workers_per_gather=0 -c work_mem=32MB";
+            "-c plan_cache_mode=force_generic_plan -c jit=off -c max_parallel_workers_per_gather=0 -c enable_memoize=off -c work_mem=32MB";
         let stmt_refs: Vec<&str> = self.statements.iter().map(|s| s.as_str()).collect();
         match pg_connect_and_prepare(&self.db_url, SESSION_OPTS, &stmt_refs) {
             Ok(fd) => {
@@ -2061,8 +2298,10 @@ impl DbEngine {
             pc.queue.drain(..).collect()
         };
         for q in queries {
-            if q.tasks.len() == 1 && q.tasks[0].job.is_write() {
-                self.fail_job(&q.tasks[0], false);
+            if q.tasks[0].job.is_write() {
+                for task in &q.tasks {
+                    self.fail_job(task, false);
+                }
             } else {
                 self.batch_fail(&q.tasks);
             }
@@ -2134,14 +2373,64 @@ impl DbEngine {
         };
         self.pgs[idx].inflight -= 1;
         let first_job = q.tasks[0].job;
-        if first_job.batch_job() == Job::ListGlobal {
+        let bjob = first_job.batch_job();
+        if bjob == Job::ListGlobal || bjob == Job::Feed {
             self.pages_finish(&q.tasks, m);
         } else if first_job == Job::Comments {
             self.comments_finish(&q.tasks, m);
         } else if !first_job.is_write() {
             self.batch_finish(&q.tasks, m);
-        } else {
+        } else if q.tasks.len() == 1 {
             self.finish_job(&q.tasks[0], m, false);
+            self.batches_waiting = true;
+        } else {
+            // Group-commit write batch: check if any statement threw an ErrorResponse ('E').
+            // If so, Postgres rolled back the implicit transaction for the entire group,
+            // so retry each task individually in its own Sync transaction.
+            let mut has_error = false;
+            let mut i = 0usize;
+            while i < m.len() {
+                if m[i] == b'E' {
+                    has_error = true;
+                    break;
+                }
+                i += 1 + (be32(&m[i + 1..i + 5]) as usize);
+            }
+            if has_error {
+                for task in q.tasks {
+                    let target = if self.pgs[idx].fd >= 0 {
+                        Some(idx)
+                    } else {
+                        self.pg_pick(true).or_else(|| self.pg_pick(false))
+                    };
+                    if let Some(t_idx) = target {
+                        self.pg_queue_write(t_idx, task);
+                    } else {
+                        self.fail_job(&task, false);
+                    }
+                }
+                self.batches_waiting = true;
+                return;
+            }
+            // All statements in the group succeeded: split by CommandComplete ('C')
+            let mut seg_start = 0usize;
+            let mut task_idx = 0usize;
+            i = 0;
+            while i < m.len() && task_idx < q.tasks.len() {
+                let size = 1 + (be32(&m[i + 1..i + 5]) as usize);
+                let kind = m[i];
+                i += size;
+                if kind == b'C' {
+                    self.finish_job(&q.tasks[task_idx], &m[seg_start..i], false);
+                    task_idx += 1;
+                    seg_start = i;
+                }
+            }
+            while task_idx < q.tasks.len() {
+                self.fail_job(&q.tasks[task_idx], false);
+                task_idx += 1;
+            }
+            self.batches_waiting = true;
         }
     }
 
@@ -2204,12 +2493,7 @@ impl DbEngine {
         let mut least: Option<usize> = None;
         for (i, pc) in self.pgs.iter().enumerate() {
             if pc.fd >= 0 && pc.writes == writes {
-                if pc.inflight == 0 {
-                    return Some(i);
-                }
-                if (!writes || pc.inflight < PIPELINE_DEPTH)
-                    && least.map_or(true, |l| pc.inflight < self.pgs[l].inflight)
-                {
+                if least.map_or(true, |l| pc.inflight < self.pgs[l].inflight) {
                     least = Some(i);
                 }
             }
@@ -2223,8 +2507,8 @@ impl DbEngine {
         self.flush_later(idx);
     }
 
-    fn pg_queue_write(&mut self, idx: usize, task: DbTask) {
-        let o = &mut self.pgs[idx].out;
+    #[inline]
+    fn encode_write_bind_exec(o: &mut Vec<u8>, task: &DbTask) {
         o.push(b'B');
         let at = length_slot(o);
         o.push(0); // unnamed portal
@@ -2238,8 +2522,22 @@ impl DbEngine {
         let len = (o.len() - at) as i32;
         set32(o, at, len);
         o.extend_from_slice(EXECUTE_MSG);
+    }
+
+    fn pg_queue_write(&mut self, idx: usize, task: DbTask) {
+        let o = &mut self.pgs[idx].out;
+        Self::encode_write_bind_exec(o, &task);
         o.extend_from_slice(SYNC_MSG);
         self.pg_enqueue(idx, vec![task]);
+    }
+
+    fn pg_queue_write_group(&mut self, idx: usize, tasks: Vec<DbTask>) {
+        let o = &mut self.pgs[idx].out;
+        for task in &tasks {
+            Self::encode_write_bind_exec(o, task);
+        }
+        o.extend_from_slice(SYNC_MSG);
+        self.pg_enqueue(idx, tasks);
     }
 
     fn batch_queue(&mut self, idx: usize, bjob: Job) {
@@ -2305,8 +2603,7 @@ impl DbEngine {
     #[inline]
     fn batch_room(&self, b: &Batch) -> bool {
         b.inflight == 0
-            || (b.inflight < self.batch_inflight
-                && (self.now_ms - b.sent >= self.batch_slow_ms || b.tasks.len() >= self.batch_max))
+            || (b.inflight < self.batch_inflight && self.now_ms - b.sent >= self.batch_slow_ms)
     }
 
     #[cfg(target_os = "linux")]
@@ -2315,18 +2612,40 @@ impl DbEngine {
             return;
         }
         self.batches_waiting = false;
-        for j in 1..=N_STATEMENTS {
-            loop {
-                let can_send = {
-                    let b = &self.batches[j];
-                    !b.tasks.is_empty()
-                        && self.batch_room(b)
-                        && (self.now_ms - b.since >= self.batch_ms
-                            || b.tasks.len() >= self.batch_max)
-                };
-                if !can_send {
-                    break;
+
+        // Dispatch coalesced write group commit (waits up to 3 ms or 64 writes)
+        if !self.write_queue.is_empty() {
+            let write_due = self.now_ms - self.write_since >= 3 || self.write_queue.len() >= 64;
+            if write_due {
+                self.pg_reconnect();
+                let pc_idx = self.pg_pick(true).or_else(|| self.pg_pick(false));
+                if let Some(idx) = pc_idx {
+                    if self.pgs[idx].inflight < 2 || self.write_queue.len() >= 64 {
+                        let count = self.write_queue.len().min(64);
+                        let tasks: Vec<DbTask> = self.write_queue.drain(..count).collect();
+                        self.write_since = self.now_ms;
+                        self.pg_queue_write_group(idx, tasks);
+                    }
+                } else {
+                    let tasks: Vec<DbTask> = self.write_queue.drain(..).collect();
+                    for task in &tasks {
+                        self.fail_job(task, false);
+                    }
                 }
+            }
+            if !self.write_queue.is_empty() {
+                self.batches_waiting = true;
+            }
+        }
+
+        for j in 1..=N_STATEMENTS {
+            let can_send = {
+                let b = &self.batches[j];
+                !b.tasks.is_empty()
+                    && self.batch_room(b)
+                    && (self.now_ms - b.since >= self.batch_ms || b.tasks.len() >= self.batch_max)
+            };
+            if can_send {
                 self.pg_reconnect();
                 let pc_idx = self.pg_pick(false).or_else(|| self.pg_pick(true));
                 if let Some(idx) = pc_idx {
@@ -2335,7 +2654,6 @@ impl DbEngine {
                     let tasks: Vec<DbTask> = self.batches[j].tasks.drain(..).collect();
                     self.batches[j].inflight += 1;
                     self.batch_fail(&tasks);
-                    break;
                 }
             }
             if !self.batches[j].tasks.is_empty() {
@@ -2349,12 +2667,20 @@ impl DbEngine {
             return -1;
         }
         let mut due: i64 = -1;
+        if !self.write_queue.is_empty() {
+            let can_write = self
+                .pg_pick(true)
+                .or_else(|| self.pg_pick(false))
+                .map_or(true, |idx| {
+                    self.pgs[idx].inflight < 2 || self.write_queue.len() >= 64
+                });
+            if can_write {
+                due = self.write_since + 3;
+            }
+        }
         for j in 1..=N_STATEMENTS {
             let b = &self.batches[j];
             if !b.tasks.is_empty() && b.inflight < self.batch_inflight {
-                if b.tasks.len() >= self.batch_max {
-                    return 0;
-                }
                 let mut at = b.since + self.batch_ms;
                 if b.inflight > 0 && b.sent + self.batch_slow_ms > at {
                     at = b.sent + self.batch_slow_ms;
@@ -2390,13 +2716,11 @@ impl DbEngine {
             self.batches_waiting = true;
             return;
         }
-        self.pg_reconnect();
-        let pc_idx = self.pg_pick(true).or_else(|| self.pg_pick(false));
-        if let Some(idx) = pc_idx {
-            self.pg_queue_write(idx, task);
-        } else {
-            self.fail_job(&task, false);
+        if self.write_queue.is_empty() {
+            self.write_since = self.now_ms;
         }
+        self.write_queue.push_back(task);
+        self.batches_waiting = true;
     }
 
     #[cfg(target_os = "linux")]
@@ -2409,12 +2733,14 @@ impl DbEngine {
             let k = unsafe { epoll_wait(self.epfd, events.as_mut_ptr(), 1024, timeout) };
             self.now = unix_now();
             self.now_ms = clock_ms();
+            let mut link_busy = false;
 
             if k > 0 {
                 for ev in &events[..k as usize] {
                     let tag = ev.u64_data;
                     let mask = ev.events;
                     if tag == TAG_WAKE {
+                        link_busy = true;
                         drain_eventfd(self.inbox.event_fd);
                         {
                             let mut q = self.inbox.queue.lock().unwrap();
@@ -2438,6 +2764,16 @@ impl DbEngine {
             self.batch_send_all();
             self.pg_flush_all();
             self.flush_workers();
+
+            if k > 0 && k < 32 && self.batch_us > 0 && !link_busy {
+                let ts = timespec {
+                    tv_sec: 0,
+                    tv_nsec: (self.batch_us as i64 * 1000) as _,
+                };
+                unsafe {
+                    let _ = nanosleep(&ts, std::ptr::null_mut());
+                }
+            }
         }
     }
 }
@@ -2712,9 +3048,10 @@ pub struct Worker {
     inbox: Arc<WorkerInbox>,
     db_inbox: Arc<DbInbox>,
     bcrypt_pool: Arc<BcryptPool>,
-    pending_db: Vec<DbTask>,
+    pending_db_tasks: Vec<DbTask>,
     clients: Vec<Client>,
     free_head: Option<u32>,
+    cur_token: Vec<u8>,
     out_buf: Vec<u8>,
     scratch: Vec<u8>,
     scratch2: Vec<u8>,
@@ -2755,9 +3092,10 @@ impl Worker {
             inbox,
             db_inbox,
             bcrypt_pool,
-            pending_db: Vec::with_capacity(256),
-            clients: Vec::with_capacity(2048),
+            pending_db_tasks: Vec::with_capacity(512),
+            clients: Vec::with_capacity(131072),
             free_head: None,
+            cur_token: Vec::with_capacity(256),
             out_buf: Vec::with_capacity(4096),
             scratch: Vec::with_capacity(256),
             scratch2: Vec::with_capacity(256),
@@ -2920,8 +3258,14 @@ impl Worker {
         let tag = self.client_tag(idx);
         let c = &mut self.clients[idx as usize];
         c.job = job;
-        let token = if job == Job::UserGet || job == Job::UserUpdate {
-            c.token.clone()
+        let token = if job == Job::UserGet {
+            self.cur_token.clone()
+        } else if job == Job::UserUpdate {
+            if c.token.is_empty() {
+                self.cur_token.clone()
+            } else {
+                std::mem::take(&mut c.token)
+            }
         } else {
             Vec::new()
         };
@@ -2935,7 +3279,7 @@ impl Worker {
             params: std::mem::take(&mut c.params),
             token,
         };
-        self.pending_db.push(task);
+        self.pending_db_tasks.push(task);
     }
 
     fn bcrypt_request(&mut self, idx: u32, verify: bool, password: &[u8], hash: &[u8]) {
@@ -2965,7 +3309,7 @@ impl Worker {
         });
     }
 
-    fn viewer_of(&mut self, idx: u32, auth: Option<&[u8]>) -> i64 {
+    fn viewer_of(&mut self, _idx: u32, auth: Option<&[u8]>) -> i64 {
         let Some(a) = auth else {
             return 0;
         };
@@ -2977,8 +3321,8 @@ impl Worker {
         if id <= 0 {
             return -1;
         }
-        self.clients[idx as usize].token.clear();
-        self.clients[idx as usize].token.extend_from_slice(tok);
+        self.cur_token.clear();
+        self.cur_token.extend_from_slice(tok);
         id
     }
 
@@ -3073,6 +3417,8 @@ impl Worker {
             c.param_null();
         }
         if password == 1 {
+            c.token.clear();
+            c.token.extend_from_slice(&self.cur_token);
             c.job = Job::BcUpdate;
             let pw = self.f5.clone();
             self.bcrypt_request(idx, false, &pw, &[]);
@@ -3631,7 +3977,7 @@ impl Worker {
 
     #[cfg(target_os = "linux")]
     fn accept_clients(&mut self, listener_fd: c_int) {
-        for _ in 0..1024 {
+        loop {
             let fd = unsafe {
                 accept4(
                     listener_fd,
@@ -3703,15 +4049,11 @@ impl Worker {
                 self.clients[idx as usize].job = Job::None;
                 if self.clients[idx as usize].closed {
                     self.clients[idx as usize].stash.clear();
-                    self.clients[idx as usize].login_prefix = Vec::new();
-                    self.clients[idx as usize].login_suffix = Vec::new();
                     self.client_release(idx);
                     return;
                 }
                 if job == Job::BcLogin {
                     self.clients[idx as usize].stash.clear();
-                    let lp = std::mem::take(&mut self.clients[idx as usize].login_prefix);
-                    let ls = std::mem::take(&mut self.clients[idx as usize].login_suffix);
                     if !ok {
                         self.respond_error(idx, 401, "email or password is invalid");
                     } else {
@@ -3719,10 +4061,14 @@ impl Worker {
                         let close_after = self.clients[idx as usize].close_after;
                         let mut tok = Vec::with_capacity(160);
                         self.jwt_key.sign(viewer, self.now, &mut tok);
-                        let mut body = Vec::with_capacity(lp.len() + tok.len() + ls.len());
-                        body.extend_from_slice(&lp);
+                        let mut body = Vec::with_capacity(
+                            self.clients[idx as usize].login_prefix.len()
+                                + tok.len()
+                                + self.clients[idx as usize].login_suffix.len(),
+                        );
+                        body.extend_from_slice(&self.clients[idx as usize].login_prefix);
                         body.extend_from_slice(&tok);
-                        body.extend_from_slice(&ls);
+                        body.extend_from_slice(&self.clients[idx as usize].login_suffix);
                         let mut resp = std::mem::take(&mut self.out_buf);
                         build_http_response(&mut resp, 200, close_after, &body);
                         self.client_send(idx, &resp);
@@ -3794,11 +4140,15 @@ impl Worker {
                 }
             }
 
-            if !self.pending_db.is_empty() {
+            if !self.pending_db_tasks.is_empty() {
                 let should_wake = {
                     let mut q = self.db_inbox.queue.lock().unwrap();
                     let was_empty = q.is_empty();
-                    q.append(&mut self.pending_db);
+                    if was_empty {
+                        std::mem::swap(&mut *q, &mut self.pending_db_tasks);
+                    } else {
+                        q.append(&mut self.pending_db_tasks);
+                    }
                     was_empty
                 };
                 if should_wake {
