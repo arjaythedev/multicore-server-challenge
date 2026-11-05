@@ -40,6 +40,23 @@ module BcryptService
       Sync do |task|
         @sockets.each { |socket| task.async { read(socket) } }
         task.async { dispatch(task) }
+        task.async { stats } if ENV["BCRYPT_STATS"]
+      end
+    end
+
+    # BCRYPT_STATS=1: every 10 s, hashes, sets and the CPU they took.
+    def stats
+      @hashes = @sets = 0
+      loop do
+        h0 = @hashes
+        s0 = @sets
+        c0 = Process.clock_gettime(Process::CLOCK_PROCESS_CPUTIME_ID)
+        sleep 10
+        c = Process.clock_gettime(Process::CLOCK_PROCESS_CPUTIME_ID) - c0
+        hashes = @hashes - h0
+        sets = @sets - s0
+        warn format("bcrypt: %d hashes in %d sets (%.2f per set), %.0f ms CPU per hash", hashes, sets,
+                    sets.zero? ? 0 : hashes.to_f / sets, hashes.zero? ? 0 : c * 1000 / hashes)
       end
     end
 
@@ -75,6 +92,10 @@ module BcryptService
     end
 
     def hash(set)
+      if @hashes
+        @hashes += set.size
+        @sets += 1
+      end
       results = Thread.new(set) do |jobs|
         BcryptLanes.run(jobs.map { _1[2] }, jobs.map { _1[3] })
       rescue ArgumentError, RuntimeError
