@@ -71,7 +71,7 @@ fn main() {
         extra_port_str.parse::<u16>().ok()
     };
 
-    let batch_us = env_i64("BATCH_US", 2000).max(0) as u32;
+    let batch_us = env_i64("BATCH_US", 200).max(0) as u32;
     let quickack = env_i64("QUICKACK", 0) != 0;
     let quickack_ms = env_i64("QUICKACK_MS", 25);
     let defer_accept = env_i64("DEFER_ACCEPT", 1) as i32;
@@ -84,10 +84,10 @@ fn main() {
     workers = workers.min(64);
 
     let pool_size = env_i64("DB_POOL", 64).clamp(1, 95) as usize;
-    let batch_inflight = env_i64("BATCH_INFLIGHT", 3).max(1) as i32;
-    let batch_ms = env_i64("BATCH_MS", 20).max(0);
-    let batch_slow_ms = env_i64("BATCH_SLOW_MS", 100).max(0);
-    let batch_max = env_i64("BATCH_MAX", 4000).max(1) as usize;
+    let batch_inflight = env_i64("BATCH_INFLIGHT", 6).max(1) as i32;
+    let batch_ms = env_i64("BATCH_MS", 8).max(0);
+    let batch_slow_ms = env_i64("BATCH_SLOW_MS", 15).max(0);
+    let batch_max = env_i64("BATCH_MAX", 600).max(1) as usize;
 
     let mut helpers = env_i64("BCRYPT_HELPERS", 0) as usize;
     if helpers < 1 {
@@ -97,7 +97,7 @@ fn main() {
     if !(1..=BCRYPT_LANES).contains(&lanes) {
         lanes = calibrate_lanes();
     }
-    let wait_ms = env_i64("BCRYPT_WAIT_MS", 150).max(0);
+    let wait_ms = env_i64("BCRYPT_WAIT_MS", 20).max(0);
 
     let mut worker_inboxes = Vec::with_capacity(workers);
     for _ in 0..workers {

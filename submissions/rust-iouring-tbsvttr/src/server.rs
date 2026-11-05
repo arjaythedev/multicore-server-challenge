@@ -1169,6 +1169,7 @@ pub struct DbEngine {
     batch_us: u32,
     inbox: Arc<DbInbox>,
     workers: Arc<Vec<Arc<WorkerInbox>>>,
+    worker_out: Vec<Vec<WorkerMsg>>,
     dirty_workers: u64,
     // Reusable scratch structures for zero-allocation batch assembly
     tag_table: IdTable<PreTag>,
@@ -1210,6 +1211,10 @@ impl DbEngine {
         #[cfg(target_os = "linux")]
         let epfd = unsafe { epoll_create1(0) };
 
+        let worker_out = (0..workers.len())
+            .map(|_| Vec::with_capacity(256))
+            .collect();
+
         let mut engine = Self {
             #[cfg(target_os = "linux")]
             epfd,
@@ -1230,6 +1235,7 @@ impl DbEngine {
             batch_us,
             inbox,
             workers,
+            worker_out,
             dirty_workers: 0,
             tag_table: IdTable::new(),
             author_table: IdTable::new(),
@@ -1266,15 +1272,17 @@ impl DbEngine {
         }
     }
 
+    #[inline]
     fn send_to_worker(&mut self, worker_id: usize, msg: WorkerMsg) {
-        let w = &self.workers[worker_id];
-        {
-            let mut q = w.queue.lock().unwrap();
-            q.push(msg);
-        }
-        if worker_id < 64 {
+        if worker_id < 64 && worker_id < self.worker_out.len() {
+            self.worker_out[worker_id].push(msg);
             self.dirty_workers |= 1u64 << worker_id;
         } else {
+            let w = &self.workers[worker_id];
+            {
+                let mut q = w.queue.lock().unwrap();
+                q.push(msg);
+            }
             wake_eventfd(w.event_fd);
         }
     }
@@ -1285,7 +1293,12 @@ impl DbEngine {
         while mask != 0 {
             let wid = mask.trailing_zeros() as usize;
             mask &= mask - 1;
-            wake_eventfd(self.workers[wid].event_fd);
+            let w = &self.workers[wid];
+            {
+                let mut q = w.queue.lock().unwrap();
+                q.append(&mut self.worker_out[wid]);
+            }
+            wake_eventfd(w.event_fd);
         }
     }
 
@@ -1609,6 +1622,7 @@ impl DbEngine {
     pub fn test_pages_finish(&mut self, tasks: &[DbTask], m: &[u8]) {
         self.batches[Job::ListGlobal as usize].inflight += 1;
         self.pages_finish(tasks, m);
+        self.flush_workers();
     }
 
     fn pages_finish(&mut self, tasks: &[DbTask], m: &[u8]) {
@@ -2190,10 +2204,12 @@ impl DbEngine {
         let mut least: Option<usize> = None;
         for (i, pc) in self.pgs.iter().enumerate() {
             if pc.fd >= 0 && pc.writes == writes {
-                if writes && pc.inflight < PIPELINE_DEPTH {
+                if pc.inflight == 0 {
                     return Some(i);
                 }
-                if least.map_or(true, |l| pc.inflight < self.pgs[l].inflight) {
+                if (!writes || pc.inflight < PIPELINE_DEPTH)
+                    && least.map_or(true, |l| pc.inflight < self.pgs[l].inflight)
+                {
                     least = Some(i);
                 }
             }
@@ -2289,7 +2305,8 @@ impl DbEngine {
     #[inline]
     fn batch_room(&self, b: &Batch) -> bool {
         b.inflight == 0
-            || (b.inflight < self.batch_inflight && self.now_ms - b.sent >= self.batch_slow_ms)
+            || (b.inflight < self.batch_inflight
+                && (self.now_ms - b.sent >= self.batch_slow_ms || b.tasks.len() >= self.batch_max))
     }
 
     #[cfg(target_os = "linux")]
@@ -2299,13 +2316,17 @@ impl DbEngine {
         }
         self.batches_waiting = false;
         for j in 1..=N_STATEMENTS {
-            let can_send = {
-                let b = &self.batches[j];
-                !b.tasks.is_empty()
-                    && self.batch_room(b)
-                    && (self.now_ms - b.since >= self.batch_ms || b.tasks.len() >= self.batch_max)
-            };
-            if can_send {
+            loop {
+                let can_send = {
+                    let b = &self.batches[j];
+                    !b.tasks.is_empty()
+                        && self.batch_room(b)
+                        && (self.now_ms - b.since >= self.batch_ms
+                            || b.tasks.len() >= self.batch_max)
+                };
+                if !can_send {
+                    break;
+                }
                 self.pg_reconnect();
                 let pc_idx = self.pg_pick(false).or_else(|| self.pg_pick(true));
                 if let Some(idx) = pc_idx {
@@ -2314,6 +2335,7 @@ impl DbEngine {
                     let tasks: Vec<DbTask> = self.batches[j].tasks.drain(..).collect();
                     self.batches[j].inflight += 1;
                     self.batch_fail(&tasks);
+                    break;
                 }
             }
             if !self.batches[j].tasks.is_empty() {
@@ -2330,6 +2352,9 @@ impl DbEngine {
         for j in 1..=N_STATEMENTS {
             let b = &self.batches[j];
             if !b.tasks.is_empty() && b.inflight < self.batch_inflight {
+                if b.tasks.len() >= self.batch_max {
+                    return 0;
+                }
                 let mut at = b.since + self.batch_ms;
                 if b.inflight > 0 && b.sent + self.batch_slow_ms > at {
                     at = b.sent + self.batch_slow_ms;
@@ -2687,7 +2712,7 @@ pub struct Worker {
     inbox: Arc<WorkerInbox>,
     db_inbox: Arc<DbInbox>,
     bcrypt_pool: Arc<BcryptPool>,
-    db_needs_wake: bool,
+    pending_db: Vec<DbTask>,
     clients: Vec<Client>,
     free_head: Option<u32>,
     out_buf: Vec<u8>,
@@ -2730,7 +2755,7 @@ impl Worker {
             inbox,
             db_inbox,
             bcrypt_pool,
-            db_needs_wake: false,
+            pending_db: Vec::with_capacity(256),
             clients: Vec::with_capacity(2048),
             free_head: None,
             out_buf: Vec::with_capacity(4096),
@@ -2910,9 +2935,7 @@ impl Worker {
             params: std::mem::take(&mut c.params),
             token,
         };
-        if self.db_inbox.push(task) {
-            self.db_needs_wake = true;
-        }
+        self.pending_db.push(task);
     }
 
     fn bcrypt_request(&mut self, idx: u32, verify: bool, password: &[u8], hash: &[u8]) {
@@ -3608,7 +3631,7 @@ impl Worker {
 
     #[cfg(target_os = "linux")]
     fn accept_clients(&mut self, listener_fd: c_int) {
-        for _ in 0..256 {
+        for _ in 0..1024 {
             let fd = unsafe {
                 accept4(
                     listener_fd,
@@ -3680,11 +3703,15 @@ impl Worker {
                 self.clients[idx as usize].job = Job::None;
                 if self.clients[idx as usize].closed {
                     self.clients[idx as usize].stash.clear();
+                    self.clients[idx as usize].login_prefix = Vec::new();
+                    self.clients[idx as usize].login_suffix = Vec::new();
                     self.client_release(idx);
                     return;
                 }
                 if job == Job::BcLogin {
                     self.clients[idx as usize].stash.clear();
+                    let lp = std::mem::take(&mut self.clients[idx as usize].login_prefix);
+                    let ls = std::mem::take(&mut self.clients[idx as usize].login_suffix);
                     if !ok {
                         self.respond_error(idx, 401, "email or password is invalid");
                     } else {
@@ -3692,14 +3719,10 @@ impl Worker {
                         let close_after = self.clients[idx as usize].close_after;
                         let mut tok = Vec::with_capacity(160);
                         self.jwt_key.sign(viewer, self.now, &mut tok);
-                        let mut body = Vec::with_capacity(
-                            self.clients[idx as usize].login_prefix.len()
-                                + tok.len()
-                                + self.clients[idx as usize].login_suffix.len(),
-                        );
-                        body.extend_from_slice(&self.clients[idx as usize].login_prefix);
+                        let mut body = Vec::with_capacity(lp.len() + tok.len() + ls.len());
+                        body.extend_from_slice(&lp);
                         body.extend_from_slice(&tok);
-                        body.extend_from_slice(&self.clients[idx as usize].login_suffix);
+                        body.extend_from_slice(&ls);
                         let mut resp = std::mem::take(&mut self.out_buf);
                         build_http_response(&mut resp, 200, close_after, &body);
                         self.client_send(idx, &resp);
@@ -3771,9 +3794,16 @@ impl Worker {
                 }
             }
 
-            if self.db_needs_wake {
-                self.db_needs_wake = false;
-                wake_eventfd(self.db_inbox.event_fd);
+            if !self.pending_db.is_empty() {
+                let should_wake = {
+                    let mut q = self.db_inbox.queue.lock().unwrap();
+                    let was_empty = q.is_empty();
+                    q.append(&mut self.pending_db);
+                    was_empty
+                };
+                if should_wake {
+                    wake_eventfd(self.db_inbox.event_fd);
+                }
             }
 
             if k > 0 && k < 32 && self.batch_us > 0 && !link_busy {
