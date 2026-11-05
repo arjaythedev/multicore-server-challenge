@@ -19,3 +19,10 @@ find src -name '*.java' -print > build/sources.txt
 "$JAVAC" --release 25 -cp "$JAR_PATH" -d build/classes @build/sources.txt
 printf 'Manifest-Version: 1.0\nMain-Class: challenge.Main\nClass-Path: ../lib/jakarta.servlet-api-6.1.0.jar\n\n' > build/manifest.mf
 "$JAR" cfm build/server.jar build/manifest.mf -C build/classes .
+# the bcrypt cost loop in C (src/challenge/NativeCost.java); if it can't be built the server uses its Java kernels
+rm -rf build/native
+mkdir -p build/native
+if ! cc -O3 -fPIC -shared -o build/native/libbcrypt.so native/bcrypt_cost.c native/bcrypt_x86_64.S; then
+  echo "build.sh: could not build native/, the server will use its Java bcrypt kernels" >&2
+  rm -rf build/native
+fi

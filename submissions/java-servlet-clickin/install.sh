@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 JDK=jdk-25.0.5+8
+export DEBIAN_FRONTEND=noninteractive
+# gcc builds the bcrypt cost loop in native/ (build.sh); without it the server runs its Java bcrypt kernels
+if ! command -v cc >/dev/null; then
+  apt-get update
+  apt-get install -y --no-install-recommends gcc libc6-dev
+fi
 if [ -x /opt/jdk/bin/javac ] && /opt/jdk/bin/java -version 2>&1 | grep -q '"25.0.5"'; then
   echo "Temurin $JDK already installed"; exit 0
 fi
-export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends curl ca-certificates
 case "$(uname -m)" in
