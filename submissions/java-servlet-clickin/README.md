@@ -110,12 +110,15 @@ against the Servlet API: standard `HttpServlet`s, in async mode, on a container 
   unsorted: joining users per comment row and sorting the union cost comments 14% more. The article and comments
   batches look each slug up once in a `MATERIALIZED` CTE and reuse that row (they used to look it up twice). A keyed
   list (`?tag=`, `?author=`, `?favorited=`) resolves and counts each distinct name once, however many requests in
-  the batch ask for it. A feed batch also reads each viewer's followees once and reuses them for hub selection, the
+  the batch ask for it; a tag's count is proven by finding its 1,000th entry before it is counted (most tags have
+  more), which is cheaper than counting to 1,000. The global list's page depends only on its window, so a batch walks,
+  aggregates and attributes each distinct `(limit, offset)` once (about 5 per batch, against ~170 requests) and its
+  requests add only their viewer flags. A feed batch also reads each viewer's followees once and reuses them for hub selection, the
   page floor, the page itself and its count. The feed knows `following` is true for every author it walks and skips that
   probe; the followee arrays live only for the statement.
 - **The feed's count, proven instead of counted.** Most viewers follow an author with 1,000+ articles (82.6% of users),
-  so their capped count is 1,000. A batch picks the 4 authors most followed by its viewers, proves ≥ 1,000 articles
-  for each with one bounded index walk, and only the other viewers count.
+  so their capped count is 1,000. A batch picks the 32 authors most followed by its viewers (the same hubs that give the
+  page floors), proves ≥ 1,000 articles for each with one bounded index walk, and only the other viewers count.
 - **Group commit.** The write connection has one group in flight; writes that arrive meanwhile go out together, each
   request's statements back to back and one `Sync` at the end: one transaction, one WAL flush. Responses are sent
   only after the group commits (rule 6). If any statement fails, the group is rolled back by Postgres and its
@@ -161,6 +164,22 @@ came out one per thread and the 4-lane loop mostly ran a lone hash (locally 70 m
 threads 1.39 -> 0.63 cores at 18k req/s). Logins wait longer for their set (p50 ~0.2 s), but they are 0.1% of requests.
 
 ## Results
+
+### Feed hubs, shared global windows, tag count proofs (2026-11-05)
+
+Batches captured locally on an aged full seed, with gather windows stretched 3.3x so that a batch holds about as many
+requests as on the official box (~140 feeds, ~170 global lists, ~60 tag lists), replayed as generic plans against a
+copy of the database taken at capture time, best of three, rows identical to the previous statements:
+
+| Change | Time of that kind | Postgres statement time |
+|---|--:|--:|
+| Global list: one walk per distinct `(limit, offset)` | -51% | -2.8% |
+| Feed: all 32 hubs prove the count (was the top 4; 48 or 64 cost more) | -9.5% | -2.8% |
+| Tag list: count proven by its 1,000th entry | -9% | -1.1% |
+
+Sharing windows in the tag, author and favorited lists made them 2-4% slower (few requests share a window there), so
+they keep one walk per request. Under load (same stretched windows, 10,000 users, two alternating runs each, logging
+off): Postgres 36.2 / 37.0 -> 34.4 / 35.3 µs per request, statement time -5.0%, buffers -5.1%, p95 unchanged.
 
 ### Dispatcher wakeups and syscalls (2026-11-05)
 
