@@ -115,10 +115,43 @@ class DB
   def initialize(url, size, statements, setup: [])
     @conns = Array.new(size) { Conn.new(url, statements, setup) }
     @next = 0
+    @writes = []
+    @write_kick = Thread::Queue.new
+    @write_kicked = false
   end
 
   def start
     @conns.each(&:start)
+    Fiber.schedule { write_loop }
+  end
+
+  # One write waiting for its group (see #write).
+  Write = Struct.new(:name, :params, :fiber, :result, :error, :done)
+
+  # Group commit: runs one write statement together with every other write issued in the same pass of the
+  # event loop, as one pipelined group (one transaction, one WAL flush), and returns its PG::Result once that
+  # group has committed. If any statement in the group fails, the group rolls back and each write is retried
+  # in its own transaction, so a failing write never fails the others. For writes that can fail by design
+  # (unique violations), use #query.
+  def write(name, params)
+    write = Write.new(name, params, Fiber.current, nil, nil, false)
+    @writes << write
+    unless @write_kicked
+      @write_kicked = true
+      @write_kick.push(true)
+    end
+    Fiber.scheduler.block(write, nil) until write.done
+    raise write.error if write.error
+
+    write.result
+  end
+
+  # The first column of the first row of a grouped write, or nil.
+  def write_value(name, params)
+    result = write(name, params)
+    value = result.ntuples.zero? ? nil : result.getvalue(0, 0)
+    result.clear
+    value
   end
 
   def close
@@ -159,6 +192,56 @@ class DB
   end
 
   private
+
+  def write_loop
+    queue = Thread::Queue.new
+    loop do
+      @write_kick.pop
+      @write_kicked = false
+      batch = @writes
+      @writes = []
+      begin
+        commit(batch, queue)
+      rescue StandardError => error
+        batch.each { |write| write.error ||= error unless write.done }
+      end
+      batch.each do |write|
+        next if write.done
+
+        write.done = true
+        Fiber.scheduler.unblock(write, write.fiber)
+      end
+    end
+  end
+
+  def commit(batch, queue)
+    results = pick.run(batch.map { |write| [write.name, write.params] }, queue)
+    raise results if results.is_a?(Exception)
+
+    if results.all? { |result| ok?(result) }
+      batch.each_with_index { |write, i| write.result = results[i] }
+      return
+    end
+
+    results.each(&:clear)
+    batch.each do |write| # the group rolled back: each on its own
+      result = pick.run([[write.name, write.params]], queue)
+      raise result if result.is_a?(Exception)
+
+      result = result[0]
+      if ok?(result)
+        write.result = result
+      else
+        write.error = Failed.new(result.error_field(PG::Result::PG_DIAG_SQLSTATE), result.error_message)
+        result.clear
+      end
+    end
+  end
+
+  def ok?(result)
+    status = result.result_status
+    status == PG::PGRES_TUPLES_OK || status == PG::PGRES_COMMAND_OK
+  end
 
   # The connection with the fewest groups in flight.
   def pick

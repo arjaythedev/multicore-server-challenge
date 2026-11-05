@@ -206,7 +206,7 @@ class Conduit
   def follow(statement, username, authorization)
     id = authorization && @tokens.verify(authorization) or return UNAUTHORIZED
 
-    document = @db.value(statement, [id, username]) or return NOT_FOUND
+    document = @db.write_value(statement, [id, username]) or return NOT_FOUND
     [200, document]
   end
 
@@ -264,7 +264,7 @@ class Conduit
     title, description, text = article.values_at("title", "description", "body")
     return INVALID unless optional_filled?(title) && optional_filled?(description) && optional_filled?(text)
 
-    result = @db.query(:update_article, [id, slug, title, description, text])
+    result = @db.write(:update_article, [id, slug, title, description, text])
     if result.ntuples.zero?
       result.clear
       return NOT_FOUND
@@ -279,14 +279,16 @@ class Conduit
   def delete_article(slug, authorization)
     id = authorization && @tokens.verify(authorization) or return UNAUTHORIZED
 
-    author = @db.value(:delete_article, [id, slug]) or return NOT_FOUND
+    author = @db.write_value(:delete_article, [id, slug]) or return NOT_FOUND
     author.to_i == id ? NO_CONTENT : FORBIDDEN
   end
 
+  # The write commits first; the article (favorited, the new count) is then read through the planner.
   def favorite(statement, slug, authorization)
     id = authorization && @tokens.verify(authorization) or return UNAUTHORIZED
 
-    document = @db.value(statement, [id, slug]) or return NOT_FOUND
+    article = @db.write_value(statement, [id, slug]) or return NOT_FOUND
+    document = @planner.article_by_id(id, article) or return NOT_FOUND # deleted in between
     [200, document]
   end
 
@@ -305,7 +307,7 @@ class Conduit
     text = comment["body"]
     return INVALID unless filled?(text)
 
-    document = @db.value(:create_comment, [id, slug, text]) or return NOT_FOUND
+    document = @db.write_value(:create_comment, [id, slug, text]) or return NOT_FOUND
     [201, document]
   end
 
@@ -313,7 +315,7 @@ class Conduit
     id = authorization && @tokens.verify(authorization) or return UNAUTHORIZED
     return NOT_FOUND unless INT64.match?(comment_id) && comment_id.to_i <= INT64_MAX
 
-    author = @db.value(:delete_comment, [id, slug, comment_id]) or return NOT_FOUND
+    author = @db.write_value(:delete_comment, [id, slug, comment_id]) or return NOT_FOUND
     author.to_i == id ? NO_CONTENT : FORBIDDEN
   end
 

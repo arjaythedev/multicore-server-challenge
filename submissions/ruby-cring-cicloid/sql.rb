@@ -116,18 +116,14 @@ module SQL
     delete_article: "WITH a0 AS (SELECT id, author_id FROM articles WHERE slug = $2), " \
                     "d AS (DELETE FROM articles WHERE id = (SELECT id FROM a0 WHERE author_id = $1)) SELECT author_id FROM a0",
 
-    # Favorites. The count subquery runs on the statement's snapshot, which doesn't see the CTE's own
-    # insert or delete, so the change is added (or subtracted) from the CTE's RETURNING.
+    # Favorites: the write returns only the article's id; the article is then read through the planner
+    # (b_articles_id), after the commit, like any other read. Building it here cost twice that.
     favorite: "WITH a0 AS (SELECT id FROM articles WHERE slug = $2), " \
-              "i AS (INSERT INTO favorites (user_id, article_id) SELECT $1, id FROM a0 ON CONFLICT DO NOTHING RETURNING 1) " \
-              "SELECT '{\"article\":' || #{article(body: true, favorited: "true",
-                                                   favorites_count: "((SELECT count(*) FROM favorites f WHERE f.article_id = a.id) + (SELECT count(*) FROM i))")}::text || '}' " \
-              "FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id = (SELECT id FROM a0)",
+              "i AS (INSERT INTO favorites (user_id, article_id) SELECT $1, id FROM a0 ON CONFLICT DO NOTHING) " \
+              "SELECT id FROM a0",
     unfavorite: "WITH a0 AS (SELECT id FROM articles WHERE slug = $2), " \
-                "d AS (DELETE FROM favorites WHERE user_id = $1 AND article_id = (SELECT id FROM a0) RETURNING 1) " \
-                "SELECT '{\"article\":' || #{article(body: true, favorited: "false",
-                                                     favorites_count: "((SELECT count(*) FROM favorites f WHERE f.article_id = a.id) - (SELECT count(*) FROM d))")}::text || '}' " \
-                "FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id = (SELECT id FROM a0)",
+                "d AS (DELETE FROM favorites WHERE user_id = $1 AND article_id = (SELECT id FROM a0)) " \
+                "SELECT id FROM a0",
 
     # Comments. $1 = viewer, $2 = slug.
     comments: "WITH a0 AS (SELECT id FROM articles WHERE slug = $2) " \
@@ -158,8 +154,9 @@ module SQL
   # this entry's own. Results match SPEC.md's reference SQL; where a statement can't order rows within a
   # key, planner.rb restores the order.
 
-  # A count that reaches the 1,000 cap is proven without aggregating; otherwise it's the exact count.
-  def self.capped(rows) = "CASE WHEN EXISTS (#{rows} OFFSET 999) THEN 1000::int8 ELSE (SELECT count(*) FROM (#{rows} LIMIT 1000) s) END"
+  # The count, capped at 1,000, in one pass. (An EXISTS (... OFFSET 999) probe first read every row twice
+  # whenever there were fewer than 1,000, which is the usual case for feeds, authors and favorites.)
+  def self.capped(rows) = "(SELECT count(*) FROM (#{rows} LIMIT 1000) s)"
 
   # Article columns after k: id, author_id, slug, title, description, created_at, updated_at
   COLS = "a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at"
@@ -175,6 +172,7 @@ module SQL
                 "JOIN users u ON u.username = r.username",
     # k, COLS, body
     b_articles: "SELECT r.k, #{COLS}, a.body FROM unnest($1::text[]) WITH ORDINALITY r(slug, k) JOIN articles a ON a.slug = r.slug",
+    b_articles_id: "SELECT r.k, #{COLS}, a.body FROM unnest($1::int8[]) WITH ORDINALITY r(id, k) JOIN articles a ON a.id = r.id",
     # k, article id, comment id, body, created_at, updated_at, author_id, username, bio, image (an article
     # without comments gives one row with a NULL comment id: it exists)
     # n numbers each article's comments newest first, so the order survives the join.
@@ -206,7 +204,7 @@ module SQL
     # Feeds: capped counts per distinct viewer (k <= 0), pages per (viewer, limit, offset) (k > 0). A page reads
     # at most limit + offset of each followee's newest ids from articles_author_idx.
     b_feed: "SELECT -r.k, #{capped("SELECT 1 FROM articles a WHERE a.author_id = ANY(ARRAY(SELECT fo.followee_id FROM follows fo " \
-                                     "WHERE fo.follower_id = r.v)) ORDER BY a.author_id, a.id DESC")}, #{PAD} " \
+                                     "WHERE fo.follower_id = r.v))")}, #{PAD} " \
             "FROM unnest($1::int8[]) WITH ORDINALITY r(v, k) " \
             "UNION ALL SELECT r.k, #{COLS} FROM unnest($2::int8[], $3::int8[], $4::int8[]) WITH ORDINALITY r(v, lim, off, k) " \
             "CROSS JOIN LATERAL (SELECT y.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 " \

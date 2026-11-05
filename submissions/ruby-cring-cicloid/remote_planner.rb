@@ -15,7 +15,7 @@ require_relative "planner"
 #   request: id (u32), kind (u8), viewer (i64), then a, b, c, each a u16 length (0xFFFF = nil) and bytes
 #   reply:   id (u32), status (u8: 0 document, 1 not found, 2 failed, 3 user as JSON), payload
 module RemotePlanner
-  KINDS = %i[tags user profile article comments feed global tag author favorited].freeze
+  KINDS = %i[tags user profile article comments feed global tag author favorited article_id].freeze
   KIND_INDEX = KINDS.each_with_index.to_h.freeze
   NIL_FIELD = "\xFF\xFF".b.freeze
   DOCUMENT = 0
@@ -75,6 +75,7 @@ module RemotePlanner
 
     def profile(viewer, username) = ask(:profile, viewer, username, nil, nil)
     def article(viewer, slug) = ask(:article, viewer, slug, nil, nil)
+    def article_by_id(viewer, id) = ask(:article_id, viewer, id, nil, nil)
     def comments(viewer, slug) = ask(:comments, viewer, slug, nil, nil)
     def feed(viewer, limit, offset) = ask(:feed, viewer, limit, offset, nil)
     def list(kind, viewer, value, limit, offset) = ask(kind, viewer, value, limit, offset)

@@ -56,6 +56,7 @@ class Planner
   def user(id) = ask(:user, id, nil, nil, nil) # [id, username, email, bio, image] or nil
   def profile(viewer, username) = ask(:profile, viewer, username, nil, nil)
   def article(viewer, slug) = ask(:article, viewer, slug, nil, nil)
+  def article_by_id(viewer, id) = ask(:article_id, viewer, id, nil, nil) # id as a decimal string
   def comments(viewer, slug) = ask(:comments, viewer, slug, nil, nil)
   def feed(viewer, limit, offset) = ask(:feed, viewer, limit, offset, nil)
   # kind: :global (value nil), :tag, :author or :favorited
@@ -129,7 +130,8 @@ class Planner
     plan_tags(by_kind[:tags], statements)
     plan_users(by_kind[:user], statements)
     plan_profiles(by_kind[:profile], statements)
-    plan_articles(by_kind[:article], statements)
+    plan_articles(:b_articles, by_kind[:article], statements)
+    plan_articles(:b_articles_id, by_kind[:article_id], statements)
     plan_comments(by_kind[:comments], statements)
     plan_global(by_kind[:global], statements)
     plan_filtered(:b_tag, by_kind[:tag], statements)
@@ -209,11 +211,11 @@ class Planner
     end
   end
 
-  def plan_articles(requests, statements)
+  def plan_articles(name, requests, statements)
     return unless requests
 
     keys, ordinals = distinct(requests, &:a)
-    slot(statements, :b_articles, [@array.encode(keys)]) do |result|
+    slot(statements, name, [@array.encode(keys)]) do |result|
       rows = {}
       result.each_row do |row|
         rows[row[0].to_i] = row
