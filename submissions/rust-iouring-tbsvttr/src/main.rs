@@ -88,21 +88,21 @@ fn main() {
     }
     workers = workers.min(64);
 
-    let pool_size = env_i64("DB_POOL", 16).clamp(1, 95) as usize;
+    let pool_size = env_i64("DB_POOL", 48).clamp(1, 95) as usize;
     let batch_inflight = env_i64("BATCH_INFLIGHT", 3).max(1) as i32;
-    let batch_ms = env_i64("BATCH_MS", 60).max(0);
-    let batch_slow_ms = env_i64("BATCH_SLOW_MS", 85).max(0);
+    let batch_ms = env_i64("BATCH_MS", 20).max(0);
+    let batch_slow_ms = env_i64("BATCH_SLOW_MS", 100).max(0);
     let batch_max = env_i64("BATCH_MAX", 4000).max(1) as usize;
 
     let mut helpers = env_i64("BCRYPT_HELPERS", 0) as usize;
     if helpers < 1 {
-        helpers = (cpus / 2).max(2);
+        helpers = cpus;
     }
     let mut lanes = env_i64("BCRYPT_LANES", 0) as usize;
     if !(1..=BCRYPT_LANES).contains(&lanes) {
         lanes = calibrate_lanes();
     }
-    let wait_ms = env_i64("BCRYPT_WAIT_MS", 300).max(0);
+    let wait_ms = env_i64("BCRYPT_WAIT_MS", 150).max(0);
 
     let mut worker_inboxes = Vec::with_capacity(workers);
     for _ in 0..workers {

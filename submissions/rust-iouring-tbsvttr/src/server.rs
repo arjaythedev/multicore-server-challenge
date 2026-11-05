@@ -82,8 +82,8 @@ impl Job {
             | Job::ListTag
             | Job::ListAuthor
             | Job::ListFavorited
+            | Job::Feed
             | Job::Article => Job::ListGlobal,
-            Job::Feed => Job::Feed,
             other => other,
         }
     }
@@ -359,16 +359,12 @@ pub fn build_statements() -> Vec<String> {
         keyed_rq("f", 4),
         each_request("ar"),
     );
-    s.push(pages_sql.clone());
+    s.push(pages_sql);
 
-    // S[10]..S[12] (s09..s11): LIST_TAG, LIST_AUTHOR, LIST_FAVORITED (in PAGES S[9])
-    for _ in 0..3 {
+    // S[10]..S[14] (s09..s13): LIST_TAG, LIST_AUTHOR, LIST_FAVORITED, FEED, ARTICLE (in PAGES)
+    for _ in 0..5 {
         s.push("SELECT NULL".to_string());
     }
-    // S[13] (s12): FEED (dedicated PAGES statement so Feed runs in parallel with fast article/list reads)
-    s.push(pages_sql);
-    // S[14] (s13): ARTICLE (in PAGES S[9])
-    s.push("SELECT NULL".to_string());
 
     // S[15] (s14): ARTICLE_CREATE ($1 viewer, $2 title, $3 description, $4 body, $5 tagList JSON)
     s.push(format!(
@@ -691,11 +687,11 @@ impl BcryptPool {
             wait_ms,
         });
 
-        for hid in 0..helper_count {
+        for _ in 0..helper_count {
             let p = Arc::clone(&pool);
             std::thread::spawn(move || {
-                crate::sys::set_sched_batch(if hid == 0 { 0 } else { 10 });
-                p.helper_loop(hid == 0);
+                crate::sys::set_sched_batch(10);
+                p.helper_loop();
             });
         }
         pool
@@ -707,7 +703,7 @@ impl BcryptPool {
         self.cv.notify_all();
     }
 
-    fn helper_loop(&self, is_primary: bool) {
+    fn helper_loop(&self) {
         let mut reqs: Vec<BcryptTask> = Vec::with_capacity(self.lanes);
         let mut jobs = [BcryptJob::default(); BCRYPT_LANES];
         let mut wants = [[0u8; 23]; BCRYPT_LANES];
@@ -716,18 +712,13 @@ impl BcryptPool {
             reqs.clear();
             {
                 let mut st = self.state.lock().unwrap();
-                // Primary helper collects >= 1 request with wait_ms coalescing;
-                // secondary helpers only wake when a full multi-lane batch is waiting.
-                while st.collecting
-                    || (is_primary && st.queue.is_empty())
-                    || (!is_primary && st.queue.len() < self.lanes)
-                {
+                // Wait until we hold the collector token AND at least 1 request is queued
+                while st.collecting || st.queue.is_empty() {
                     st = self.cv.wait(st).unwrap();
                 }
                 st.collecting = true;
 
-                let wait_window = if is_primary { self.wait_ms } else { 0 };
-                let due = clock_ms() + wait_window;
+                let due = clock_ms() + self.wait_ms;
                 while reqs.len() < self.lanes {
                     if let Some(task) = st.queue.pop_front() {
                         let idx = reqs.len();
@@ -2524,28 +2515,22 @@ impl DbEngine {
         }
         self.batches_waiting = false;
 
-        // Dispatch coalesced write group commit (waits up to 3 ms or 64 writes)
+        // Dispatch all writes accumulated during the current incoming drain/coalesce pass
+        // immediately (zero extra timer delay, zero epoll_wait(0) busy-spin).
         if !self.write_queue.is_empty() {
-            let write_due = self.now_ms - self.write_since >= 3 || self.write_queue.len() >= 64;
-            if write_due {
-                self.pg_reconnect();
+            self.pg_reconnect();
+            while !self.write_queue.is_empty() {
                 let pc_idx = self.pg_pick(true).or_else(|| self.pg_pick(false));
                 if let Some(idx) = pc_idx {
-                    if self.pgs[idx].inflight < 2 || self.write_queue.len() >= 64 {
-                        let count = self.write_queue.len().min(64);
-                        let tasks: Vec<DbTask> = self.write_queue.drain(..count).collect();
-                        self.write_since = self.now_ms;
-                        self.pg_queue_write_group(idx, tasks);
-                    }
+                    let count = self.write_queue.len().min(16);
+                    let tasks: Vec<DbTask> = self.write_queue.drain(..count).collect();
+                    self.pg_queue_write_group(idx, tasks);
                 } else {
                     let tasks: Vec<DbTask> = self.write_queue.drain(..).collect();
                     for task in &tasks {
                         self.fail_job(task, false);
                     }
                 }
-            }
-            if !self.write_queue.is_empty() {
-                self.batches_waiting = true;
             }
         }
 
@@ -2578,9 +2563,6 @@ impl DbEngine {
             return -1;
         }
         let mut due: i64 = -1;
-        if !self.write_queue.is_empty() {
-            due = self.write_since + 3;
-        }
         for j in 1..=N_STATEMENTS {
             let b = &self.batches[j];
             if !b.tasks.is_empty() && b.inflight < self.batch_inflight {
