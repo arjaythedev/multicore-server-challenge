@@ -40,4 +40,21 @@ defmodule Conduit.UtilTest do
     assert Util.decode_segment("a%00b") == nil
     assert Util.decode_segment("%ff") == nil
   end
+
+  # init/0 swaps the raw patterns for compiled ones (persistent_term, global to the test VM): same answers.
+  test "compiled patterns match as the raw ones" do
+    inputs = ["", "abc", "a%20b", "a+b", "a+b%2", "%", "+", "a\0b", "%00", "x%2By+z", "%e2%82%ac+%"]
+    queries = ["tag=a+b%20c", "author=%00", "li%6Dit=7&offset=+1", "favorited=a%2Bb"]
+
+    run = fn ->
+      {for(s <- inputs, plus? <- [true, false], do: Util.pct_decode(s, plus?)),
+       Enum.map(inputs, &Util.decode_segment/1), Enum.map(inputs, &Util.nul?/1),
+       Enum.map(queries, &Util.parse_query/1)}
+    end
+
+    raw = run.()
+    Util.init()
+    assert run.() == raw
+    assert Util.nul?("a\0b") and not Util.nul?("ab")
+  end
 end

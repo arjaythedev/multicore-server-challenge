@@ -34,9 +34,18 @@ defmodule Conduit.Pg do
     end
   end
 
-  defp call(pool, items) do
+  @doc """
+  Sends `items` (as query/2) without waiting for the answer: a handle for await_raw/1. `:spread` sends them to the
+  least loaded connection, without the statement's preferred one (read plans spread their chunks).
+  """
+  def async(pool, items, routing \\ :affinity) do
     {names, counters, size, slack} = :persistent_term.get({__MODULE__, pool})
-    slot = route(items, counters, size, slack)
+
+    slot =
+      if routing == :spread,
+        do: elem(pick(counters, size), 0),
+        else: route(items, counters, size, slack)
+
     ref = :erlang.monitor(:process, elem(names, slot - 1), [{:alias, :reply_demonitor}])
     :atomics.add(counters, slot, 1)
 
@@ -49,15 +58,30 @@ defmodule Conduit.Pg do
         :erlang.demonitor(ref, [:flush])
         {:error, :down}
     else
-      _ ->
-        receive do
-          {^ref, result} -> result
-          {:DOWN, ^ref, _, _, reason} -> {:error, {:down, reason}}
-        after
-          @timeout ->
-            :erlang.demonitor(ref, [:flush])
-            {:error, :timeout}
-        end
+      _ -> ref
+    end
+  end
+
+  @doc "The answer to async/2, rows raw as in query_raw/2."
+  def await_raw(handle) do
+    case await(handle) do
+      {:ok, res} -> {:ok, Enum.map(res, &elem(&1, 1))}
+      error -> error
+    end
+  end
+
+  defp call(pool, items), do: await(async(pool, items))
+
+  defp await({:error, _} = error), do: error
+
+  defp await(ref) do
+    receive do
+      {^ref, result} -> result
+      {:DOWN, ^ref, _, _, reason} -> {:error, {:down, reason}}
+    after
+      @timeout ->
+        :erlang.demonitor(ref, [:flush])
+        {:error, :timeout}
     end
   end
 
