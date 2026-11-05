@@ -121,6 +121,7 @@ class Planner
     @articles = {} # id => row fields (phase A), enriched in phase B
     @flags_fav = [] # [viewer, article] pairs to look up
     @flags_follow = [] # [viewer, user] pairs
+    @rows_wanted = {} # article ids phase A knew only by id (shared feeds), read whole in phase B
     @fav = {} # (viewer << 32 | article) => true, filled in phase B
     @follow = {} # (viewer << 32 | user) => true
     statements = []
@@ -143,7 +144,7 @@ class Planner
     @slots.each { |index, handler| handler.call(results[index]) }
     results.each(&:clear)
 
-    enrich unless @articles.empty? && @flags_follow.empty?
+    enrich unless @articles.empty? && @flags_follow.empty? && @rows_wanted.empty? && @flags_fav.empty?
     @finish.each(&:call) if @finish
     @finish = nil
     batch.each do |request|
@@ -303,9 +304,64 @@ class Planner
     end
   end
 
+  # Feeds of up to FEED_SHARED_DEPTH rows (limit + offset) share their followees' scans (b_feed_scan); deeper
+  # ones go per viewer (b_feed).
+  FEED_SHARED_DEPTH = Integer(ENV.fetch("FEED_SHARED_DEPTH", "200"))
+
   def plan_feed(requests, statements)
     return unless requests
 
+    shared, deep = requests.partition { |request| request.a.to_i + request.b.to_i <= FEED_SHARED_DEPTH }
+    plan_shared_feed(shared, statements) unless shared.empty?
+    plan_deep_feed(deep, statements) unless deep.empty?
+  end
+
+  def plan_shared_feed(requests, statements)
+    viewers = requests.map(&:viewer).uniq
+    depth = requests.map { |request| request.a.to_i + request.b.to_i }.max
+    follows = Hash.new { |h, k| h[k] = [] } # viewer => followees
+    slot(statements, :b_feed_follows, [ints(viewers)]) do |result|
+      result.each_row do |row|
+        viewer = row[0].to_i
+        followee = row[1].to_i
+        follows[viewer] << followee
+        @follow[(viewer << 32) | followee] = true # a feed's authors are followed by its viewer
+      end
+    end
+    slot(statements, :b_feed_scan, [ints(viewers), depth.to_s]) do |result|
+      scans = {} # followee => [count, ids newest first]
+      result.each_row { |row| scans[row[0].to_i] = [row[1].to_i, parse_ids(row[2])] }
+      requests.each do |request|
+        viewer = request.viewer
+        limit = request.a.to_i
+        offset = request.b.to_i
+        count = 0
+        ids = []
+        follows[viewer].each do |followee|
+          scan = scans[followee] or next
+          count += scan[0]
+          ids.concat(scan[1])
+        end
+        ids.sort!.reverse!
+        page = ids[offset, limit] || []
+        page.each do |id|
+          @rows_wanted[id] = true unless @articles.key?(id)
+          @flags_fav << [viewer, id]
+        end
+        later do
+          shown = page.select { |id| @articles[id]&.key?(:fragments) } # one deleted since phase A is left out
+          out = String.new("{\"articles\":[", capacity: 64 + (shown.size * 640))
+          shown.each_with_index do |id, i|
+            out << "," unless i.zero?
+            append_article(out, id, viewer, body: false)
+          end
+          request.document = out << "],\"articlesCount\":" << [count, 1000].min.to_s << "}"
+        end
+      end
+    end
+  end
+
+  def plan_deep_feed(requests, statements)
     viewers, viewer_ordinals = distinct(requests, &:viewer)
     keys, ordinals = distinct(requests) { |request| [request.viewer, request.a, request.b] }
     params = [@array.encode(viewers), @array.encode(keys.map { _1[0] }), @array.encode(keys.map { _1[1] }),
@@ -365,32 +421,42 @@ class Planner
   end
 
   def enrich
+    @rows_wanted.delete_if { |id, _| @articles.key?(id) } # phase A returned some of them after all
     ids = @articles.keys
+    extra = @rows_wanted.keys
     statements = []
     unless ids.empty?
-      encoded = ints(ids)
-      statements << [:b_enrich, [encoded, ints(ids.map { |id| @articles[id][:author] })]]
-      statements << [:b_tag_names, [encoded]]
+      statements << [:b_enrich, [ints(ids), ints(ids.map { |id| @articles[id][:author] })]]
     end
+    statements << [:b_enrich_rows, [ints(extra)]] unless extra.empty?
+    statements << [:b_tag_names, [ints(ids + extra)]] unless ids.empty? && extra.empty?
     flags = !@flags_fav.empty? || !@flags_follow.empty?
     if flags
       statements << [:b_flags, [ints(@flags_fav.map(&:first)), ints(@flags_fav.map(&:last)),
                                 ints(@flags_follow.map(&:first)), ints(@flags_follow.map(&:last))]]
     end
     results = @db.group(statements)
-    unless ids.empty?
-      rank = {}
-      names = {}
-      results[1].each_row do |row|
-        tag = row[0].to_i
-        rank[tag] = rank.size
-        names[tag] = str(row[1])
-      end
-      results[0].each_row do |row|
-        article = @articles[row[0].to_i]
-        tags = parse_ids(row[1]).sort_by! { |tag| rank[tag] || 0 }
-        article[:fragments] = fragments(article, tags.map { |tag| names[tag] }, row[2], row[3], row[4], row[5])
-      end
+    at = 0
+    enriched = ids.empty? ? nil : results[(at += 1) - 1]
+    rows = extra.empty? ? nil : results[(at += 1) - 1]
+    names_result = ids.empty? && extra.empty? ? nil : results[(at += 1) - 1]
+    rank = {}
+    names = {}
+    names_result&.each_row do |row|
+      tag = row[0].to_i
+      rank[tag] = rank.size
+      names[tag] = str(row[1])
+    end
+    enriched&.each_row do |row|
+      article = @articles[row[0].to_i]
+      tags = parse_ids(row[1]).sort_by! { |tag| rank[tag] || 0 }
+      article[:fragments] = fragments(article, tags.map { |tag| names[tag] }, row[2], row[3], row[4], row[5])
+    end
+    rows&.each_row do |row| # [0, COLS..., tag ids, favorites, username, bio, image]
+      add_article(row, body: nil)
+      article = @articles[row[1].to_i]
+      tags = parse_ids(row[8]).sort_by! { |tag| rank[tag] || 0 }
+      article[:fragments] = fragments(article, tags.map { |tag| names[tag] }, row[9], row[10], row[11], row[12])
     end
     if flags
       results.last.each_row do |row|

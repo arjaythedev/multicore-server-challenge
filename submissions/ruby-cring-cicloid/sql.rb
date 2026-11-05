@@ -210,6 +210,18 @@ module SQL
             "CROSS JOIN LATERAL (SELECT y.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 " \
             "WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT r.lim + r.off) y " \
             "WHERE fo.follower_id = r.v ORDER BY y.id DESC LIMIT r.lim OFFSET r.off) x JOIN articles a ON a.id = x.id",
+    # Shared feeds (planner.rb): the follows of every feed viewer in the batch, and each *distinct* followee
+    # read once: its article count (capped at 1,000) and its newest ids, down to the deepest page ($2 =
+    # limit + offset) any of its followers asked for. Pages are merged in Ruby; two viewers sharing a
+    # followee share its scan.
+    b_feed_follows: "SELECT follower_id, followee_id FROM follows WHERE follower_id = ANY($1::int8[])",
+    b_feed_scan: "SELECT fo.id, (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = fo.id LIMIT 1000) s), " \
+                 "ARRAY(SELECT a.id FROM articles a WHERE a.author_id = fo.id ORDER BY a.id DESC LIMIT $2::int8) " \
+                 "FROM (SELECT DISTINCT followee_id AS id FROM follows WHERE follower_id = ANY($1::int8[])) fo",
+    # Phase B for articles phase A only knew by id (shared feeds): 0, COLS, tag ids, favorites count, author.
+    b_enrich_rows: "SELECT 0::int8, #{COLS}, ARRAY(SELECT at.tag_id FROM article_tags at WHERE at.article_id = a.id), " \
+                   "(SELECT count(*) FROM favorites f WHERE f.article_id = a.id), u.username, u.bio, u.image " \
+                   "FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id = ANY($1::int8[])",
     # Phase B. One row per distinct article: id, tag ids, favorites count, author username, bio, image.
     b_enrich: "SELECT r.id, ARRAY(SELECT at.tag_id FROM article_tags at WHERE at.article_id = r.id), " \
               "(SELECT count(*) FROM favorites f WHERE f.article_id = r.id), u.username, u.bio, u.image " \
