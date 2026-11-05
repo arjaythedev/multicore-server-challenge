@@ -73,6 +73,9 @@ public final class PgConn {
     private int phase;
     private int queryIndex;
     private int fd = -1;
+    // the epoll interest set last registered for fd: flush re-arms only when it changes (the dispatcher flushes
+    // every connection on every wakeup, and an unconditional EPOLL_CTL_MOD was ~4.7 syscalls per request)
+    private int armed;
     private long lastAttempt;
     private Unit transaction;
     private Unit[] group;
@@ -405,6 +408,7 @@ public final class PgConn {
             if (sys.epollCtl(epoll, Sys.EPOLL_CTL_ADD, fd, Sys.EPOLLIN | Sys.EPOLLOUT, tag) != 0) {
                 throw new IllegalStateException("epoll add failed");
             }
+            armed = Sys.EPOLLIN | Sys.EPOLLOUT;
             phase = 0;
             connected = false;
         } catch (RuntimeException e) {
@@ -464,8 +468,11 @@ public final class PgConn {
                 out.len = 0;
             }
             int flags = Sys.EPOLLIN | (out.len != 0 ? Sys.EPOLLOUT : 0);
-            if (sys.epollCtl(epoll, Sys.EPOLL_CTL_MOD, fd, flags, tag) != 0) {
-                throw new IllegalStateException("epoll mod failed");
+            if (flags != armed) {
+                if (sys.epollCtl(epoll, Sys.EPOLL_CTL_MOD, fd, flags, tag) != 0) {
+                    throw new IllegalStateException("epoll mod failed");
+                }
+                armed = flags;
             }
         } catch (Exception e) {
             fail(e.toString());
@@ -506,6 +513,11 @@ public final class PgConn {
                     (int) n);
             in.len += (int) n;
             parse();
+            // level-triggered: a short read drained the socket, and anything that arrives later is reported again,
+            // so the read that would only return EAGAIN is skipped
+            if (n < io.byteSize()) {
+                break;
+            }
         }
     }
 

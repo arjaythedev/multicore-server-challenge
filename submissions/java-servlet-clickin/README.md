@@ -90,6 +90,12 @@ against the Servlet API: standard `HttpServlet`s, in async mode, on a container 
   per request at p95 182 ms (160 ms windows: 136.6 at p95 232 ms), against 151.1 at p95 144 ms with one 40 ms window
   and tag names joined in SQL (an earlier box of the same type). The longer windows come from the leaders (#203
   gathers 160 ms per lane, #168 80-100 ms).
+- **The dispatcher wakes only when it has something to do.** Each lane is its own FIFO, so a wakeup reads each lane's
+  head and size instead of scanning every waiting read several times. Before sleeping, the dispatcher publishes when it
+  will wake by itself (the next window's end, or a completion when every read connection is busy); a loop submitting a
+  read whose window ends later skips the `eventfd` wake. A Postgres socket is re-armed in epoll only when its interest
+  set changes, and a short read ends the read loop. The dispatcher used to make ~4.7 syscalls per request, nearly all
+  `epoll_ctl` re-arming every connection on every wakeup.
 - **A round's kinds run side by side.** A round's batch statements would otherwise run one after another on one
   backend, every request waiting for the round's last one, while the other read connections sat idle (locally 0.7
   busy at 20 ms gathers). The round is grouped by kind and each kind's batch goes whole to one of up to
@@ -155,6 +161,27 @@ came out one per thread and the 4-lane loop mostly ran a lone hash (locally 70 m
 threads 1.39 -> 0.63 cores at 18k req/s). Logins wait longer for their set (p50 ~0.2 s), but they are 0.1% of requests.
 
 ## Results
+
+### Dispatcher wakeups and syscalls (2026-11-05)
+
+Official run of the previous build (`943e162`): 160,000 users held, 41,138 req/s, app 42% / Postgres 43% of the box,
+i.e. ~82 µs of app CPU per request against 45-68 for every entry above it, while its Postgres cost (~84) is within
+that group. Locally (8-CPU container, full seed, fixed load of 10,000 users at think-scale 0.2, ~12.5k req/s, per-thread
+CPU over 60 s, alternating runs):
+
+| | `943e162` (5 runs) | this build (2 runs) |
+|---|--:|--:|
+| Dispatcher syscalls per request | 4.7 (`epoll_ctl` 3.8) | 0.42 |
+| HTTP loop `write` calls per request | 1.32 | 1.02 |
+| Dispatcher CPU, µs/req | 7.4-7.6 | 4.1 |
+| HTTP loops, µs/req | 13.9-14.2 | 13.7-13.9 |
+| p95 (median of seconds) | 131-132 ms | 130-131 ms |
+
+At 16,000 users (~19.9k req/s, one run each) the old dispatcher's cost grew to 8.8 µs/req (its scans grew with the
+number of waiting reads) while this build's stayed at 4.1; p95 136 vs 134 ms, no errors in either.
+bcrypt (~15-18 µs/req here, varying with the login count of a run) is left out. Locally syscalls are cheap; on the
+official box the app's CPU per request is ~2.9x the local figure while Postgres's is ~2x, so the saving there is
+expected to be larger than the local 3.5 µs, but that is not measured.
 
 ### Gather lanes, tag ids and comment authors (2026-11-05)
 
