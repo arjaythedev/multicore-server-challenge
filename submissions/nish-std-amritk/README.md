@@ -5,11 +5,9 @@ Front: direct
 An update of this submission, scored at 91,000 users in #83 (`3de991e`),
 100,000 in #116 (`6e69d72`), 140,000 in #159 (`6cdf1fd`), 180,000 in
 #189 (`76a40a5`) and 200,000 in #196 (`6b5557b`), on the same design. Since
-#196: a plan's ids go to Postgres sorted, tag lists are answered as soon as
-their statement ends, HTTP workers and
-the read service run at nice 5, and each statement of a plan's group gets a connection of its own, the
-feeds split in two, instead of two lanes pipelined four deep on whatever
-connections the pool had opened. Since #189: plans hold up to 4,096 reads
+#196: a plan's ids go to Postgres sorted, and tag lists are answered as soon as
+their statement ends. A plan's groups run as more lanes, which the read
+service's pool pipelines four deep on up to 12 connections, as #196's did. Since #189: plans hold up to 4,096 reads
 over a 60 ms window instead of 2,048 over 40 ms, and Nish 0.32.0's faster
 bcrypt. Since #159: one read
 service holds every read plan of the box, each author of a plan is read once,
@@ -172,19 +170,20 @@ and four on the box), and
   waits for the next plan.
 - **A plan's statements side by side.** A read waits for its plan's group
   A and then its group B, so it waits the slowest statement of each. Each
-  group runs as lanes on connections of their own: group A's feeds in two
-  halves (when a plan has 64 feed pages or more, `FEED_SPLIT`), its comments,
+  group runs as lanes: group A's feeds (in two halves when `FEED_SPLIT` is
+  set and a plan has that many feed pages or more; off), its comments,
   its tag names and other lists, and its articles and profiles by key; group
   B's articles, flags and authors. A lane the pool has no connection for goes
   with the last one it gave. In #196 these were two lanes, and the read
   service's pool pipelined up to four groups on a connection
   (`DB_READ_IN_FLIGHT`) before it opened another, so lanes queued behind
-  other plans' statements while connections sat unopened. Now the service
-  takes one group a connection (`READ_SERVICE_IN_FLIGHT`, 1) on up to 20
-  (`READ_SERVICE_CONNS`). `PLAN_STATS=1` prints, every 10 s, how long plans
-  spend in each stage and lane. On the Xeon VM at 175,000 users, group A
-  went from 48 ms to 30, group B from 31 to 28, and the wait for the counts
-  after B from 13–18 ms to 2.
+  other plans' statements while connections sat unopened. The pool still
+  does (`READ_SERVICE_IN_FLIGHT`, 4, on up to 12, `READ_SERVICE_CONNS`).
+  One group a connection on 20, with the feeds split at 64 pages, took the
+  Xeon VM at 175,000 users from 48 ms to 30 for group A, but scored 190,000
+  officially at `d9e9b93` and `11518f2`, against #196's 200,000, and cost
+  Postgres about 3–4 µs a request more on the VM. `PLAN_STATS=1` prints,
+  every 10 s, how long plans spend in each stage and lane.
 - **Sorted ids.** `plan_meta`, `plan_counts` and `plan_users` read a plan's ids
   in the order its requests met them, so each index lookup landed far from the
   last. A radix sort puts them in ascending order as they are bound, so
@@ -193,8 +192,9 @@ and four on the box), and
   statement, so a tag read need not wait for the rest of the plan: the service
   answers it when that statement ends (`EARLY_TAGS`, on), and the plan's send
   skips it.
-- **HTTP workers and the read service at nice 5** (`LOOP_NICE`, 0 turns it
-  off), so they yield to Postgres when the box is full.
+- **Nice.** `LOOP_NICE=5` puts the HTTP workers and the read service at nice
+  5, so they yield to Postgres when the box is full. It is off, as in #196:
+  the build that scored 190,000 officially ran with it.
 - **Each author once.** `plan_meta` and `plan_comments` no longer join `users`
   row by row: a plan collects the distinct authors of its articles and
   comments, reads them with one `plan_users` statement, and writes each

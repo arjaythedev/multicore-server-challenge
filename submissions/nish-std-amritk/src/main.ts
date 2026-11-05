@@ -24,7 +24,7 @@
 // BCRYPT_WIDTH (start.sh passes the width build.sh measured, else 6; 0 times it at startup; 1 to 6 lanes a call),
 // ACK_DELAY (0 leaves the kernel's ACKs alone; 1 turns delayed ACKs back on after each answer, worker.ts `ackDelayAfter`),
 // GZIP (0; 1 when it saves a TCP segment, 2 whenever it saves anything), GZIP_MIN (1300),
-// READ_SERVICE (1; 0 leaves each worker its own plans), READ_SERVICE_CONNS (20), READ_SERVICE_IN_FLIGHT (1), READ_SERVICE_PLANS (20),
+// READ_SERVICE (1; 0 leaves each worker its own plans), READ_SERVICE_CONNS (12), READ_SERVICE_IN_FLIGHT (4), READ_SERVICE_PLANS (20),
 // READ_COUNT_LANES (1), DB_SOLO_CONNS (2) and ANSWER_PACE (130000 bytes a ms, a worker).
 import { tcpListenFlags } from "nish:net"
 import { availableParallelism, getenv, setIdlePriority, setNice } from "nish:process"
@@ -202,8 +202,8 @@ export const main = (): i32 => {
       region = opened.expect("the read service's region")
     }
   }
-  // HTTP workers and the read service yield to Postgres when the box is full.
-  const loopNice: i32 = envInt("LOOP_NICE", 5)
+  // LOOP_NICE=5 lets HTTP workers and the read service yield to Postgres (off: #196 ran without it).
+  const loopNice: i32 = envInt("LOOP_NICE", 0)
   if (index <= http && loopNice > 0 && loopNice < 20) {
     setNice(loopNice)
   }
@@ -215,11 +215,12 @@ export const main = (): i32 => {
     for (let w: i32 = 0; w < http; w++) {
       links.push(new ReadLink(region, w, preforkServiceChannelOf(process.argv, w), true))
     }
-    // One group a connection, and connections enough for a plan's lanes to
-    // each have one: pipelined four deep, a plan's lanes queued behind each
-    // other's statements on the few connections the pool had opened.
-    cfg.readConns = envInt("READ_SERVICE_CONNS", 20)
-    cfg.readInFlight = envInt("READ_SERVICE_IN_FLIGHT", 1)
+    // #196's pool: up to four groups pipelined on a connection, on up to 12.
+    // One group a connection on 20 (READ_SERVICE_IN_FLIGHT=1,
+    // READ_SERVICE_CONNS=20) cut the VM's waits but scored 190,000
+    // officially, against #196's 200,000.
+    cfg.readConns = envInt("READ_SERVICE_CONNS", 12)
+    cfg.readInFlight = envInt("READ_SERVICE_IN_FLIGHT", 4)
     cfg.readPlans = envInt("READ_SERVICE_PLANS", 20)
     cfg.countLanes = envInt("READ_COUNT_LANES", 1)
     console.log(`conduit: the read service holds ${cfg.readPlans} plans on ${cfg.readConns} connections`)

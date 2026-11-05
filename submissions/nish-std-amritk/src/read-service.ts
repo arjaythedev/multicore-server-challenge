@@ -179,7 +179,7 @@ export class ReadService {
     this.earlyTags = (getenv("EARLY_TAGS") ?? "1") !== "0"
     const split: string = getenv("FEED_SPLIT") ?? ""
     for (const plan of this.plans) {
-      plan.feedSplitAt = split.length > 0 ? toI32(parseInt(split)) : 64
+      plan.feedSplitAt = split.length > 0 ? toI32(parseInt(split)) : 0
     }
     this.stamps = new Array<i64>(16 * toI32(this.plans.length))
     this.spans = new Array<i64>(16)
