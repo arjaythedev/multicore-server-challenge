@@ -43,7 +43,11 @@ fn main() {
     let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
 
     let io_threads: usize = env_or("IO_THREADS", (cpus / 2).max(1));
-    let read_lanes: usize = env_or("READ_LANES", cpus.max(2));
+    // Read lanes (each a thread and a connection) beyond the batches allowed in Postgres at once (READ_ACTIVE, from the
+    // cores): a lane that has its last results keeps decoding and rendering after it gives up its slot, so two more
+    // lanes let the slots stay busy meanwhile.
+    let read_slots = cpus.max(2);
+    let read_lanes: usize = env_or("READ_LANES", read_slots + 2);
     let write_lanes: usize = env_or("WRITE_LANES", 1);
     let bcrypt_threads: usize = env_or("BCRYPT_THREADS", 2);
 
@@ -78,11 +82,11 @@ fn main() {
                 caps: if feed_own {
                     // Comment threads are a fifth of all reads and the dearest after feeds: 3 of 8 lanes like the fast
                     // class, not 2, so they don't depend on borrowing exactly when the fast class is busy too.
-                    [(read_lanes * 3 / 8).max(2), (read_lanes * 3 / 8).max(1), (read_lanes / 4).max(1)]
+                    [(read_slots * 3 / 8).max(2), (read_slots * 3 / 8).max(1), (read_slots / 4).max(1)]
                 } else {
-                    [(read_lanes * 5 / 8).max(2), (read_lanes / 4).max(1), 1]
+                    [(read_slots * 5 / 8).max(2), (read_slots / 4).max(1), 1]
                 },
-                max_active: env_or("READ_ACTIVE", read_lanes.saturating_sub(1).max(3)),
+                max_active: env_or("READ_ACTIVE", read_slots.saturating_sub(1).max(3)),
                 max_batch: env_or("READ_BATCH", 2048),
                 borrow_age: Duration::from_micros(env_or("BORROW_AGE_US", 90_000)),
                 starve_age: Duration::from_micros(env_or("STARVE_AGE_US", 300_000)),
@@ -113,6 +117,9 @@ fn main() {
         let pool = if i < feed_lanes { &db::FEEDS } else { &db::READS };
         let lane = db::ReadLane::new(settings, pool);
         std::thread::Builder::new().name("read".into()).spawn(move || lane.run()).unwrap();
+    }
+    if env_or("BATCH_STATS", 0) != 0 {
+        std::thread::Builder::new().name("stats".into()).spawn(db::print_stats).unwrap();
     }
     for _ in 0..write_lanes {
         let lane = db::WriteLane::new(settings);

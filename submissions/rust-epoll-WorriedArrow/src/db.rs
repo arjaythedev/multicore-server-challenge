@@ -448,13 +448,33 @@ pub struct ReadLane {
     pool: &'static Pool,
     /// Requests of the current batch already answered (before phase B), so a later failure doesn't answer them twice.
     answered: Vec<ReplyTo>,
+    /// The scheduler class whose slot this lane holds while its batch talks to Postgres (`release` hands it back).
+    slot: Option<usize>,
+}
+
+/// Per class (fast, comments, feeds): batches, requests, and nanoseconds spent before phase A's results were in,
+/// in phase B, and rendering. BATCH_STATS=1 prints them every 10 s.
+pub static STATS: std::sync::Mutex<[[u64; 5]; 3]> = std::sync::Mutex::new([[0; 5]; 3]);
+
+pub fn print_stats() {
+    loop {
+        std::thread::sleep(Duration::from_secs(10));
+        let s = std::mem::replace(&mut *STATS.lock().unwrap(), [[0; 5]; 3]);
+        for (c, name) in ["fast", "comments", "feeds"].iter().enumerate() {
+            let [n, jobs, a, b, r] = s[c];
+            if n > 0 {
+                let ms = |x: u64| x as f64 / n as f64 / 1e6;
+                eprintln!("{name}: {n} batches, {} per batch, phase A {:.1} ms, phase B {:.1} ms, render {:.1} ms", jobs / n, ms(a), ms(b), ms(r));
+            }
+        }
+    }
 }
 
 const LIST_STMTS: [&str; 3] = ["tag", "author", "favlist"];
 
 impl ReadLane {
     pub fn new(s: &'static Settings, pool: &'static Pool) -> ReadLane {
-        ReadLane { conn: None, fconn: None, s, pool, answered: Vec::new() }
+        ReadLane { conn: None, fconn: None, s, pool, answered: Vec::new(), slot: None }
     }
 
     /// The lane's connection, (re)opened on demand (borrows only that field).
@@ -475,9 +495,13 @@ impl ReadLane {
             loop {
                 jobs.clear();
                 let c = crate::sched::READS.take(cfg, &mut jobs);
+                self.slot = Some(c);
                 let batch = std::mem::take(&mut jobs);
                 self.execute(batch);
-                crate::sched::READS.done(c);
+                // Normally released once the batch's last Postgres result is in (see `batch`); here on early exits.
+                if let Some(c) = self.slot.take() {
+                    crate::sched::READS.done(c);
+                }
             }
         }
         loop {
@@ -525,6 +549,8 @@ impl ReadLane {
     }
 
     fn batch(&mut self, mut jobs: Vec<ReadJob>) -> pg::Result<()> {
+        let t0 = std::time::Instant::now();
+        let njobs = jobs.len() as u64;
         // ---- distinct keys ----
         let mut want_tags = false;
         let mut uid: Keys<i64> = Keys::new();
@@ -806,6 +832,7 @@ impl ReadLane {
             _ => None,
         };
 
+        let t_a = std::time::Instant::now();
         // ---- decode phase A ----
         let g = |slot: Option<usize>, n: usize| slot.map(|s| group(&pa, s, n)).unwrap_or_default();
         let g_prof = g(s_prof, prof.len());
@@ -1013,6 +1040,14 @@ impl ReadLane {
         } else {
             None
         };
+        // Postgres is done with this batch: the rest is decoding and rendering here, so the scheduler slot (which bounds
+        // how many batches run in Postgres at once) goes to the next batch now, on another lane's connection, instead
+        // of after the responses are written.
+        let class = self.slot.take();
+        if let Some(c) = class {
+            crate::sched::READS.done(c);
+        }
+        let t_b = std::time::Instant::now();
 
         let mut art_row: Vec<Option<usize>> = vec![None; arts.len()];
         let mut tag_rank: FxMap<i32, (u32, Col)> = FxMap::default();
@@ -1207,6 +1242,16 @@ impl ReadLane {
             }
         }
         reply::send_all(out);
+        if let Some(c) = class {
+            let t = std::time::Instant::now();
+            let mut st = STATS.lock().unwrap();
+            let e = &mut st[c];
+            e[0] += 1;
+            e[1] += njobs;
+            e[2] += (t_a - t0).as_nanos() as u64;
+            e[3] += (t_b - t_a).as_nanos() as u64;
+            e[4] += (t - t_b).as_nanos() as u64;
+        }
         Ok(())
     }
 }
@@ -1252,7 +1297,7 @@ impl Ctx<'_> {
         let (id, _, ar) = a;
         let pb = self.pb?;
         let ri = self.arts.map.get(&id).and_then(|&k| self.art_row[k as usize])?;
-        let r = &pb.results[self.b_artx.unwrap()].rows[ri];
+        let r = &pb.results[self.b_artx?].rows[ri];
         // The article's own columns: from its phase-A row, another phase-A row for it, or phase B's "artrow".
         let (src, ar): (&Pipeline, &[Col]) = if ar[3].len >= 0 {
             (pa, ar)

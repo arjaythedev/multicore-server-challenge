@@ -135,7 +135,8 @@ Defaults suit the 8-vCPU box; all are optional environment variables.
 | Variable | Default | |
 |---|---|---|
 | `IO_THREADS` | cores / 2 | epoll threads |
-| `READ_LANES` | cores | read connections |
+| `READ_LANES` | cores + 2 | read lanes, each a thread and a connection; a lane gives its slot back once Postgres is done with its batch, so two more than the slots keep them busy |
+| `BATCH_STATS` | 0 | 1: every 10 s, per class, batches, requests per batch and the time spent in phase A, phase B and rendering |
 | `FEED_CONN` | 1 | 1: each read lane runs its batch's feed statement on a second connection, alongside the rest of phase A |
 | `CLASS_LANES` | 1 | 1: reads queue by class (feeds, comment threads, the rest), each class a batch at most every gap; 0: one pool |
 | `GAP_FAST_US` / `GAP_CMTS_US` / `GAP_FEED_US` | 75000 / 75000 / 80000 | least time between two batches of a class |
@@ -143,7 +144,7 @@ Defaults suit the 8-vCPU box; all are optional environment variables.
 | `STARVE_AGE_US` | 300000 | any class takes a lane past its share once its oldest read has waited this long |
 | `FEED_MERGE` | 1 | 1: each distinct followee read once per batch, feeds merged here; 0: per viewer in SQL |
 | `GAP_MIN_US` | 5000 | least time a read waits before its batch starts |
-| `READ_ACTIVE` | read lanes - 1 | most read batches running at once (per class 3/8, 3/8, 1/4 of the lanes, plus one for the class waiting longest) |
+| `READ_ACTIVE` | cores - 1 | most read batches running at once (per class 3/8, 3/8, 1/4 of the lanes, plus one for the class waiting longest) |
 | `LOOP_NICE` | 5 | nice value of the event loop threads |
 | `BCRYPT_NICE` | 10 | nice value of the hashing threads after the first |
 | `WRITE_LANES` | 1 | group-commit connections |
