@@ -28,8 +28,10 @@ class DB
   class Conn
     attr_reader :pending
 
+    # No TLS on our own connections (PG_SSLMODE to override): DATABASE_URL names no sslmode, so libpq's
+    # default "prefer" encrypted every batch over loopback, on both ends.
     def initialize(url, statements, setup)
-      @pg = PG.connect(url)
+      @pg = PG.connect(url, sslmode: ENV.fetch("PG_SSLMODE", "disable"))
       setup.each { |sql| @pg.exec(sql) }
       statements.each { |name, sql| @pg.prepare(name.to_s, sql) }
       @pg.setnonblocking(true)
