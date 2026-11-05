@@ -143,7 +143,7 @@ with the load generator on separate VMs.
 
 | | Passes | Fails |
 |---|---|---|
-| this entry | 52,000 users | 55,000 (p95 646–729 ms) |
+| this entry | 50,000 users; 52,000 in some runs (p95 335–441 ms) | 52,000 in others (p95 511–947 ms); 55,000 (p95 646–729 ms) |
 | `node-uwebsockets-zahidcakici` | 55,000 | |
 | `python-rawsocket-shawal-mbalire` | 40,000 | 45,000 |
 
