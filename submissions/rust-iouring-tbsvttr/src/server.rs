@@ -82,8 +82,8 @@ impl Job {
             | Job::ListTag
             | Job::ListAuthor
             | Job::ListFavorited
-            | Job::Feed
             | Job::Article => Job::ListGlobal,
+            Job::Feed => Job::Feed,
             other => other,
         }
     }
@@ -359,12 +359,16 @@ pub fn build_statements() -> Vec<String> {
         keyed_rq("f", 4),
         each_request("ar"),
     );
-    s.push(pages_sql);
+    s.push(pages_sql.clone());
 
-    // S[10]..S[14] (s09..s13): LIST_TAG, LIST_AUTHOR, LIST_FAVORITED, FEED, ARTICLE (in PAGES)
-    for _ in 0..5 {
+    // S[10]..S[12] (s09..s11): LIST_TAG, LIST_AUTHOR, LIST_FAVORITED (in PAGES S[9])
+    for _ in 0..3 {
         s.push("SELECT NULL".to_string());
     }
+    // S[13] (s12): FEED (dedicated PAGES statement so Feed runs in parallel with fast article/list reads)
+    s.push(pages_sql);
+    // S[14] (s13): ARTICLE (in PAGES S[9])
+    s.push("SELECT NULL".to_string());
 
     // S[15] (s14): ARTICLE_CREATE ($1 viewer, $2 title, $3 description, $4 body, $5 tagList JSON)
     s.push(format!(
@@ -687,13 +691,11 @@ impl BcryptPool {
             wait_ms,
         });
 
-        for _ in 0..helper_count {
+        for hid in 0..helper_count {
             let p = Arc::clone(&pool);
             std::thread::spawn(move || {
-                unsafe {
-                    setpriority(PRIO_PROCESS, 0, 10);
-                }
-                p.helper_loop();
+                crate::sys::set_sched_batch(if hid == 0 { 0 } else { 10 });
+                p.helper_loop(hid == 0);
             });
         }
         pool
@@ -705,7 +707,7 @@ impl BcryptPool {
         self.cv.notify_all();
     }
 
-    fn helper_loop(&self) {
+    fn helper_loop(&self, is_primary: bool) {
         let mut reqs: Vec<BcryptTask> = Vec::with_capacity(self.lanes);
         let mut jobs = [BcryptJob::default(); BCRYPT_LANES];
         let mut wants = [[0u8; 23]; BCRYPT_LANES];
@@ -714,13 +716,18 @@ impl BcryptPool {
             reqs.clear();
             {
                 let mut st = self.state.lock().unwrap();
-                // Wait until we hold the collector token AND at least 1 request is queued
-                while st.collecting || st.queue.is_empty() {
+                // Primary helper collects >= 1 request with wait_ms coalescing;
+                // secondary helpers only wake when a full multi-lane batch is waiting.
+                while st.collecting
+                    || (is_primary && st.queue.is_empty())
+                    || (!is_primary && st.queue.len() < self.lanes)
+                {
                     st = self.cv.wait(st).unwrap();
                 }
                 st.collecting = true;
 
-                let due = clock_ms() + self.wait_ms;
+                let wait_window = if is_primary { self.wait_ms } else { 0 };
+                let due = clock_ms() + wait_window;
                 while reqs.len() < self.lanes {
                     if let Some(task) = st.queue.pop_front() {
                         let idx = reqs.len();
@@ -1090,7 +1097,7 @@ fn batch_types(job: Job) -> &'static [u8] {
         Job::UserGet => b"i",
         Job::Login => b"t",
         Job::Profile | Job::Comments => b"it",
-        Job::ListGlobal => b"iiiit",
+        Job::ListGlobal | Job::Feed => b"iiiit",
         _ => b"",
     }
 }
@@ -1200,6 +1207,8 @@ pub struct DbEngine {
     pgs: Vec<PgConn>,
     flush_list: Vec<usize>,
     batches: [Batch; N_STATEMENTS + 1],
+    write_queue: std::collections::VecDeque<DbTask>,
+    write_since: i64,
     batches_waiting: bool,
     batch_inflight: i32,
     batch_ms: i64,
@@ -1265,6 +1274,8 @@ impl DbEngine {
             pgs,
             flush_list: Vec::with_capacity(pool_size),
             batches: std::array::from_fn(|_| Batch::default()),
+            write_queue: std::collections::VecDeque::with_capacity(256),
+            write_since: now_ms,
             batches_waiting: false,
             batch_inflight,
             batch_ms,
@@ -1708,7 +1719,8 @@ impl DbEngine {
             i += 1 + (be32(&m[i + 1..i + 5]) as usize);
         }
 
-        self.batches[Job::ListGlobal as usize].inflight -= 1;
+        let bjob = tasks[0].job.batch_job() as usize;
+        self.batches[bjob].inflight -= 1;
         self.batches_waiting = true;
 
         self.tag_table.reset(tags);
@@ -2198,8 +2210,10 @@ impl DbEngine {
             pc.queue.drain(..).collect()
         };
         for q in queries {
-            if q.tasks.len() == 1 && q.tasks[0].job.is_write() {
-                self.fail_job(&q.tasks[0], false);
+            if q.tasks[0].job.is_write() {
+                for task in &q.tasks {
+                    self.fail_job(task, false);
+                }
             } else {
                 self.batch_fail(&q.tasks);
             }
@@ -2271,14 +2285,63 @@ impl DbEngine {
         };
         self.pgs[idx].inflight -= 1;
         let first_job = q.tasks[0].job;
-        if first_job.batch_job() == Job::ListGlobal {
+        let bjob = first_job.batch_job();
+        if bjob == Job::ListGlobal || bjob == Job::Feed {
             self.pages_finish(&q.tasks, m);
         } else if first_job == Job::Comments {
             self.comments_finish(&q.tasks, m);
         } else if !first_job.is_write() {
             self.batch_finish(&q.tasks, m);
-        } else {
+        } else if q.tasks.len() == 1 {
             self.finish_job(&q.tasks[0], m, false);
+        } else {
+            // Group-commit write batch: check if any statement threw an ErrorResponse ('E').
+            // If so, Postgres rolled back the implicit transaction for the entire group,
+            // so retry each task individually in its own Sync transaction.
+            let mut has_error = false;
+            let mut i = 0usize;
+            while i < m.len() {
+                if m[i] == b'E' {
+                    has_error = true;
+                    break;
+                }
+                i += 1 + (be32(&m[i + 1..i + 5]) as usize);
+            }
+            if has_error {
+                for task in q.tasks {
+                    let target = if self.pgs[idx].fd >= 0 {
+                        Some(idx)
+                    } else {
+                        self.pg_pick(true).or_else(|| self.pg_pick(false))
+                    };
+                    if let Some(t_idx) = target {
+                        self.pg_queue_write(t_idx, task);
+                    } else {
+                        self.fail_job(&task, false);
+                    }
+                }
+                self.batches_waiting = true;
+                return;
+            }
+            // All statements in the group succeeded: split by CommandComplete ('C')
+            let mut seg_start = 0usize;
+            let mut task_idx = 0usize;
+            i = 0;
+            while i < m.len() && task_idx < q.tasks.len() {
+                let size = 1 + (be32(&m[i + 1..i + 5]) as usize);
+                let kind = m[i];
+                i += size;
+                if kind == b'C' {
+                    self.finish_job(&q.tasks[task_idx], &m[seg_start..i], false);
+                    task_idx += 1;
+                    seg_start = i;
+                }
+            }
+            while task_idx < q.tasks.len() {
+                self.fail_job(&q.tasks[task_idx], false);
+                task_idx += 1;
+            }
+            self.batches_waiting = true;
         }
     }
 
@@ -2341,9 +2404,6 @@ impl DbEngine {
         let mut least: Option<usize> = None;
         for (i, pc) in self.pgs.iter().enumerate() {
             if pc.fd >= 0 && pc.writes == writes {
-                if writes && pc.inflight < PIPELINE_DEPTH {
-                    return Some(i);
-                }
                 if least.map_or(true, |l| pc.inflight < self.pgs[l].inflight) {
                     least = Some(i);
                 }
@@ -2358,8 +2418,8 @@ impl DbEngine {
         self.flush_later(idx);
     }
 
-    fn pg_queue_write(&mut self, idx: usize, task: DbTask) {
-        let o = &mut self.pgs[idx].out;
+    #[inline]
+    fn encode_write_bind_exec(o: &mut Vec<u8>, task: &DbTask) {
         o.push(b'B');
         let at = length_slot(o);
         o.push(0); // unnamed portal
@@ -2373,8 +2433,22 @@ impl DbEngine {
         let len = (o.len() - at) as i32;
         set32(o, at, len);
         o.extend_from_slice(EXECUTE_MSG);
+    }
+
+    fn pg_queue_write(&mut self, idx: usize, task: DbTask) {
+        let o = &mut self.pgs[idx].out;
+        Self::encode_write_bind_exec(o, &task);
         o.extend_from_slice(SYNC_MSG);
         self.pg_enqueue(idx, vec![task]);
+    }
+
+    fn pg_queue_write_group(&mut self, idx: usize, tasks: Vec<DbTask>) {
+        let o = &mut self.pgs[idx].out;
+        for task in &tasks {
+            Self::encode_write_bind_exec(o, task);
+        }
+        o.extend_from_slice(SYNC_MSG);
+        self.pg_enqueue(idx, tasks);
     }
 
     fn batch_queue(&mut self, idx: usize, bjob: Job) {
@@ -2410,7 +2484,7 @@ impl DbEngine {
             put32(o, 1); // lower bound
 
             for task in &tasks {
-                let (p, v) = if bjob == Job::ListGlobal {
+                let (p, v) = if bjob == Job::ListGlobal || bjob == Job::Feed {
                     pages_param(task, j)
                 } else {
                     let s = param_at(&task.params, j);
@@ -2449,6 +2523,32 @@ impl DbEngine {
             return;
         }
         self.batches_waiting = false;
+
+        // Dispatch coalesced write group commit (waits up to 3 ms or 64 writes)
+        if !self.write_queue.is_empty() {
+            let write_due = self.now_ms - self.write_since >= 3 || self.write_queue.len() >= 64;
+            if write_due {
+                self.pg_reconnect();
+                let pc_idx = self.pg_pick(true).or_else(|| self.pg_pick(false));
+                if let Some(idx) = pc_idx {
+                    if self.pgs[idx].inflight < 2 || self.write_queue.len() >= 64 {
+                        let count = self.write_queue.len().min(64);
+                        let tasks: Vec<DbTask> = self.write_queue.drain(..count).collect();
+                        self.write_since = self.now_ms;
+                        self.pg_queue_write_group(idx, tasks);
+                    }
+                } else {
+                    let tasks: Vec<DbTask> = self.write_queue.drain(..).collect();
+                    for task in &tasks {
+                        self.fail_job(task, false);
+                    }
+                }
+            }
+            if !self.write_queue.is_empty() {
+                self.batches_waiting = true;
+            }
+        }
+
         for j in 1..=N_STATEMENTS {
             let can_send = {
                 let b = &self.batches[j];
@@ -2478,6 +2578,9 @@ impl DbEngine {
             return -1;
         }
         let mut due: i64 = -1;
+        if !self.write_queue.is_empty() {
+            due = self.write_since + 3;
+        }
         for j in 1..=N_STATEMENTS {
             let b = &self.batches[j];
             if !b.tasks.is_empty() && b.inflight < self.batch_inflight {
@@ -2516,13 +2619,11 @@ impl DbEngine {
             self.batches_waiting = true;
             return;
         }
-        self.pg_reconnect();
-        let pc_idx = self.pg_pick(true).or_else(|| self.pg_pick(false));
-        if let Some(idx) = pc_idx {
-            self.pg_queue_write(idx, task);
-        } else {
-            self.fail_job(&task, false);
+        if self.write_queue.is_empty() {
+            self.write_since = self.now_ms;
         }
+        self.write_queue.push_back(task);
+        self.batches_waiting = true;
     }
 
     #[cfg(target_os = "linux")]

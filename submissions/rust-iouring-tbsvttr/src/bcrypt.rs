@@ -145,84 +145,106 @@ pub fn format(job: &BcryptJob, out: &mut [u8; 60]) {
     encode_b64(&job.digest, &mut out[29..60]);
 }
 
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct BfLane {
+    s: [u32; 1024],
+    p: [u32; 18],
+    _pad: [u32; 14],
+}
+
+const _: () = assert!(std::mem::size_of::<BfLane>() == 4224);
+
+const INIT_LANE: BfLane = BfLane {
+    s: BF_S,
+    p: BF_P,
+    _pad: [0u32; 14],
+};
+
+#[inline(always)]
+fn feistel(sk: &[u32; 1024], x: u32) -> u32 {
+    unsafe {
+        let a = *sk.get_unchecked((x >> 24) as usize);
+        let b = *sk.get_unchecked(256 + (((x >> 16) & 0xFF) as usize));
+        let c = *sk.get_unchecked(512 + (((x >> 8) & 0xFF) as usize));
+        let d = *sk.get_unchecked(768 + ((x & 0xFF) as usize));
+        (a.wrapping_add(b) ^ c).wrapping_add(d)
+    }
+}
+
 #[inline(always)]
 fn enc_n<const N: usize>(
-    p: &[[u32; 18]; BCRYPT_LANES],
-    s: &[[u32; 1024]; BCRYPT_LANES],
+    lanes: &[BfLane; BCRYPT_LANES],
     l: &mut [u32; BCRYPT_LANES],
     r: &mut [u32; BCRYPT_LANES],
 ) {
     for k in 0..N {
-        l[k] ^= p[k][0];
+        l[k] ^= lanes[k].p[0];
     }
-    let mut i = 1usize;
-    while i <= 15 {
-        for k in 0..N {
-            let x = l[k];
-            let sk = &s[k];
-            let f = sk[(x >> 24) as usize]
-                .wrapping_add(sk[256 + (((x >> 16) & 0xFF) as usize)])
-                ^ sk[512 + (((x >> 8) & 0xFF) as usize)];
-            r[k] ^= f.wrapping_add(sk[768 + ((x & 0xFF) as usize)]) ^ p[k][i];
-        }
-        for k in 0..N {
-            let x = r[k];
-            let sk = &s[k];
-            let f = sk[(x >> 24) as usize]
-                .wrapping_add(sk[256 + (((x >> 16) & 0xFF) as usize)])
-                ^ sk[512 + (((x >> 8) & 0xFF) as usize)];
-            l[k] ^= f.wrapping_add(sk[768 + ((x & 0xFF) as usize)]) ^ p[k][i + 1];
-        }
-        i += 2;
+    macro_rules! round_pair {
+        ($i1:expr, $i2:expr) => {
+            for k in 0..N {
+                r[k] ^= feistel(&lanes[k].s, l[k]) ^ lanes[k].p[$i1];
+            }
+            for k in 0..N {
+                l[k] ^= feistel(&lanes[k].s, r[k]) ^ lanes[k].p[$i2];
+            }
+        };
     }
+    round_pair!(1, 2);
+    round_pair!(3, 4);
+    round_pair!(5, 6);
+    round_pair!(7, 8);
+    round_pair!(9, 10);
+    round_pair!(11, 12);
+    round_pair!(13, 14);
+    round_pair!(15, 16);
     for k in 0..N {
         let t = l[k];
-        l[k] = r[k] ^ p[k][17];
+        l[k] = r[k] ^ lanes[k].p[17];
         r[k] = t;
     }
 }
 
 fn expand_0<const N: usize>(
-    p: &mut [[u32; 18]; BCRYPT_LANES],
-    s: &mut [[u32; 1024]; BCRYPT_LANES],
+    lanes: &mut [BfLane; BCRYPT_LANES],
     key: &[[u32; 18]; BCRYPT_LANES],
 ) {
     for k in 0..N {
         for i in 0..18 {
-            p[k][i] ^= key[k][i];
+            lanes[k].p[i] ^= key[k][i];
         }
     }
     let mut l = [0u32; BCRYPT_LANES];
     let mut r = [0u32; BCRYPT_LANES];
     let mut i = 0usize;
     while i <= 16 {
-        enc_n::<N>(p, s, &mut l, &mut r);
+        enc_n::<N>(lanes, &mut l, &mut r);
         for k in 0..N {
-            p[k][i] = l[k];
-            p[k][i + 1] = r[k];
+            lanes[k].p[i] = l[k];
+            lanes[k].p[i + 1] = r[k];
         }
         i += 2;
     }
     let mut j = 0usize;
     while j <= 1022 {
-        enc_n::<N>(p, s, &mut l, &mut r);
+        enc_n::<N>(lanes, &mut l, &mut r);
         for k in 0..N {
-            s[k][j] = l[k];
-            s[k][j + 1] = r[k];
+            lanes[k].s[j] = l[k];
+            lanes[k].s[j + 1] = r[k];
         }
         j += 2;
     }
 }
 
 fn expand_salt<const N: usize>(
-    p: &mut [[u32; 18]; BCRYPT_LANES],
-    s: &mut [[u32; 1024]; BCRYPT_LANES],
+    lanes: &mut [BfLane; BCRYPT_LANES],
     key: &[[u32; 18]; BCRYPT_LANES],
     salt: &[[u32; 4]; BCRYPT_LANES],
 ) {
     for k in 0..N {
         for i in 0..18 {
-            p[k][i] ^= key[k][i];
+            lanes[k].p[i] ^= key[k][i];
         }
     }
     let mut l = [0u32; BCRYPT_LANES];
@@ -235,10 +257,10 @@ fn expand_salt<const N: usize>(
             r[k] ^= salt[k][(si + 1) & 3];
         }
         si += 2;
-        enc_n::<N>(p, s, &mut l, &mut r);
+        enc_n::<N>(lanes, &mut l, &mut r);
         for k in 0..N {
-            p[k][i] = l[k];
-            p[k][i + 1] = r[k];
+            lanes[k].p[i] = l[k];
+            lanes[k].p[i + 1] = r[k];
         }
         i += 2;
     }
@@ -249,18 +271,17 @@ fn expand_salt<const N: usize>(
             r[k] ^= salt[k][(si + 1) & 3];
         }
         si += 2;
-        enc_n::<N>(p, s, &mut l, &mut r);
+        enc_n::<N>(lanes, &mut l, &mut r);
         for k in 0..N {
-            s[k][j] = l[k];
-            s[k][j + 1] = r[k];
+            lanes[k].s[j] = l[k];
+            lanes[k].s[j + 1] = r[k];
         }
         j += 2;
     }
 }
 
 fn run_n<const N: usize>(jobs: &mut [BcryptJob]) {
-    let mut p = [BF_P; BCRYPT_LANES];
-    let mut s = [BF_S; BCRYPT_LANES];
+    let mut lanes = [INIT_LANE; BCRYPT_LANES];
     let mut pkey = [[0u32; 18]; BCRYPT_LANES];
     let mut skey = [[0u32; 18]; BCRYPT_LANES];
     let mut salt = [[0u32; 4]; BCRYPT_LANES];
@@ -305,7 +326,7 @@ fn run_n<const N: usize>(jobs: &mut [BcryptJob]) {
         }
     }
 
-    expand_salt::<N>(&mut p, &mut s, &pkey, &salt);
+    expand_salt::<N>(&mut lanes, &pkey, &salt);
     for r in 0..max_rounds {
         for k in 0..N {
             if r >= (1u32 << jobs[k].cost) {
@@ -313,8 +334,8 @@ fn run_n<const N: usize>(jobs: &mut [BcryptJob]) {
                 skey[k].fill(0);
             }
         }
-        expand_0::<N>(&mut p, &mut s, &pkey);
-        expand_0::<N>(&mut p, &mut s, &skey);
+        expand_0::<N>(&mut lanes, &pkey);
+        expand_0::<N>(&mut lanes, &skey);
     }
 
     let mut ctext = [[0u32; 6]; BCRYPT_LANES];
@@ -330,7 +351,7 @@ fn run_n<const N: usize>(jobs: &mut [BcryptJob]) {
             r[k] = ctext[k][blk + 1];
         }
         for _ in 0..64 {
-            enc_n::<N>(&p, &s, &mut l, &mut r);
+            enc_n::<N>(&lanes, &mut l, &mut r);
         }
         for k in 0..N {
             ctext[k][blk] = l[k];
