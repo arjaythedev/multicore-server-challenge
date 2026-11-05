@@ -13,7 +13,17 @@ import challenge.pg.Unit;
 /** CPU-bound password work runs only on these platform threads. */
 public final class BcryptPool implements AutoCloseable {
     private static final AtomicBoolean priorityWarning = new AtomicBoolean();
-    private final int nice = Integer.parseInt(System.getenv().getOrDefault("BCRYPT_NICE", "5"));
+    private final int nice = Integer.parseInt(System.getenv().getOrDefault("BCRYPT_NICE", "0"));
+
+    /** How hashing threads yield to Postgres and the event loops (BCRYPT_SCHED). */
+    enum Sched {
+        /** SCHED_OTHER at BCRYPT_NICE. */
+        NICE,
+        /** SCHED_IDLE: only CPU time nothing else wants. */
+        IDLE
+    }
+
+    private final Sched sched = Sched.valueOf(System.getenv().getOrDefault("BCRYPT_SCHED", "idle").toUpperCase());
     private final ConcurrentLinkedQueue<Unit> queue = new ConcurrentLinkedQueue<>();
     private final Semaphore available = new Semaphore(0);
     private final AtomicInteger publishers = new AtomicInteger();
@@ -38,7 +48,7 @@ public final class BcryptPool implements AutoCloseable {
             Thread timer = new Thread(() -> {
                 StringBuilder curve = new StringBuilder();
                 lanes = BCrypt.fastestLanes(curve);
-                System.err.println("bcrypt: " + lanes + " lanes (per hash at cost 7:" + curve + ")");
+                System.err.println("bcrypt: " + lanes + " lanes (per hash" + (NativeCost.AVAILABLE ? " at cost 10, every CPU hashing:" : " at cost 7:") + curve + ")");
             },
                     "bcrypt-lanes");
             timer.setDaemon(true);
@@ -86,7 +96,7 @@ public final class BcryptPool implements AutoCloseable {
 
     private void run() {
         try {
-            int error = Sys.niceCurrentThread(nice);
+            int error = sched == Sched.IDLE ? Sys.idleCurrentThread() : Sys.niceCurrentThread(nice);
             if (error != 0 && priorityWarning.compareAndSet(false, true)) {
                 System.err.println("bcrypt setpriority failed: errno " + error);
             }

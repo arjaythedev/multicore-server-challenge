@@ -56,16 +56,20 @@ public final class Stmt {
             INT8, TEXT);
     public static final int COMMENTS = register("SELECT c.id,c.body,c.created_at,c.updated_at,u.username,u.bio,u.image,EXISTS(SELECT 1 FROM follows fo WHERE fo.follower_id=$1::int8 AND fo.followee_id=c.author_id) FROM articles a LEFT JOIN LATERAL (SELECT id,body,created_at,updated_at,author_id FROM comments WHERE article_id=a.id ORDER BY created_at DESC,id DESC LIMIT 100) c ON true LEFT JOIN users u ON u.id=c.author_id WHERE a.slug=$2::text ORDER BY c.created_at DESC,c.id DESC",
             INT8, TEXT);
-    // tag names in one join for the whole statement: as a per-article subplan, the generic plan hashed all of tags
-    // (seq scan, 200 rows) once per article, a third of a list batch's time
-    private static final String BATCH_DECO = "SELECT a.id,a.slug,a.title,a.description,a.body,a.created_at,a.updated_at,a.author_id,tg.tags,(SELECT count(*) FROM favorites f WHERE f.article_id=a.id) AS fav_count,u.username,u.bio,u.image FROM ids JOIN articles a ON a.id=ids.id JOIN users u ON u.id=a.author_id LEFT JOIN (SELECT at.article_id,array_agg(t.name ORDER BY t.name) AS tags FROM ids ti JOIN article_tags at ON at.article_id=ti.id JOIN tags t ON t.id=at.tag_id GROUP BY at.article_id) tg ON tg.article_id=a.id";
-    private static final String BATCH_COLUMNS = "d.id,d.slug,d.title,d.description,";
-    private static final String BATCH_DECORATION = "d.created_at,d.updated_at,COALESCE(d.tags,ARRAY[]::text[]) AS array,COALESCE(d.fav_count,0::bigint) AS count,EXISTS(SELECT 1 FROM favorites f WHERE f.user_id=r.viewer AND f.article_id=d.id),d.username,d.bio,d.image,EXISTS(SELECT 1 FROM follows fo WHERE fo.follower_id=r.viewer AND fo.followee_id=d.author_id)";
+    // Tag ids from the article_tags primary key, named by Fanout from the tags rows the same statement returns (in
+    // name order, so the database collation orders each list). Replaying captured Hetzner batches, joining the names
+    // here (hash join, array_agg ordered by name) cost lists 15% more Postgres time; a per-tag name lookup with the
+    // sort in Postgres cost 22% more.
+    private static final String BATCH_DECO = "SELECT a.id,a.slug,a.title,a.description,a.created_at,a.updated_at,a.author_id,ARRAY(SELECT at.tag_id FROM article_tags at WHERE at.article_id=a.id) AS tags,(SELECT count(*) FROM favorites f WHERE f.article_id=a.id) AS fav_count,u.username,u.bio,u.image FROM ids JOIN articles a ON a.id=ids.id JOIN users u ON u.id=a.author_id";
     // each slug is looked up once (m), and the article row read there is the one returned: deco adds only what is
     // shared by every request for the article (tags, favorites count, author)
     public static final int ARTICLE_BATCH = register("WITH r AS MATERIALIZED (SELECT * FROM unnest($1::text[],$2::int8[]) WITH ORDINALITY AS r(slug,viewer,i)), m AS MATERIALIZED (SELECT r.i,r.viewer,a.id,a.slug,a.title,a.description,a.body,a.created_at,a.updated_at,a.author_id FROM r JOIN articles a ON a.slug=r.slug), ids AS (SELECT DISTINCT id,author_id FROM m), deco AS MATERIALIZED (SELECT ids.id,tg.tags,(SELECT count(*) FROM favorites f WHERE f.article_id=ids.id) AS fav_count,u.username,u.bio,u.image FROM ids JOIN users u ON u.id=ids.author_id LEFT JOIN (SELECT at.article_id,array_agg(t.name ORDER BY t.name) AS tags FROM ids ti JOIN article_tags at ON at.article_id=ti.id JOIN tags t ON t.id=at.tag_id GROUP BY at.article_id) tg ON tg.article_id=ids.id) SELECT r.i::int4,r.id,r.slug,r.title,r.description,r.body,r.created_at,r.updated_at,COALESCE(d.tags,ARRAY[]::text[]) AS array,COALESCE(d.fav_count,0::bigint) AS count,EXISTS(SELECT 1 FROM favorites f WHERE f.user_id=r.viewer AND f.article_id=r.id),d.username,d.bio,d.image,EXISTS(SELECT 1 FROM follows fo WHERE fo.follower_id=r.viewer AND fo.followee_id=r.author_id) FROM m r JOIN deco d ON d.id=r.id ORDER BY r.i",
             TEXT_ARRAY, INT8_ARRAY);
-    public static final int COMMENTS_BATCH = register("WITH r AS MATERIALIZED (SELECT * FROM unnest($1::text[],$2::int8[]) WITH ORDINALITY AS r(slug,viewer,i)), m AS MATERIALIZED (SELECT r.i,r.viewer,a.id FROM r JOIN articles a ON a.slug=r.slug), ids AS (SELECT DISTINCT id FROM m), comments_deco AS MATERIALIZED (SELECT ids.id AS article_id,c.id,c.body,c.created_at,c.updated_at,c.author_id,u.username,u.bio,u.image FROM ids LEFT JOIN LATERAL (SELECT id,body,created_at,updated_at,author_id FROM comments WHERE article_id=ids.id ORDER BY created_at DESC,id DESC LIMIT 100) c ON true LEFT JOIN users u ON u.id=c.author_id) SELECT r.i::int4,c.id,c.body,c.created_at,c.updated_at,c.username,c.bio,c.image,EXISTS(SELECT 1 FROM follows fo WHERE fo.follower_id=r.viewer AND fo.followee_id=c.author_id) FROM m r JOIN comments_deco c ON c.article_id=r.id ORDER BY r.i,c.created_at DESC,c.id DESC",
+    // Comment rows carry their author id; each distinct author's profile comes once, tagged -1, after the requests'
+    // rows (Fanout attaches it). Replaying captured Hetzner batches, joining users per comment row and sorting the
+    // union cost comments 14% more Postgres time. Each thread's rows stay together, newest first, as the lateral
+    // index scan returns them.
+    public static final int COMMENTS_BATCH = register("WITH r AS MATERIALIZED (SELECT * FROM unnest($1::text[],$2::int8[]) WITH ORDINALITY AS r(slug,viewer,i)), m AS MATERIALIZED (SELECT r.i,r.viewer,a.id FROM r JOIN articles a ON a.slug=r.slug), ids AS (SELECT DISTINCT id FROM m), cd AS MATERIALIZED (SELECT ids.id AS article_id,c.id,c.body,c.created_at,c.updated_at,c.author_id FROM ids LEFT JOIN LATERAL (SELECT id,body,created_at,updated_at,author_id FROM comments WHERE article_id=ids.id ORDER BY created_at DESC,id DESC LIMIT 100) c ON true), authors AS (SELECT article_id,array_agg(DISTINCT author_id) AS ids FROM cd WHERE author_id IS NOT NULL GROUP BY article_id) SELECT 0::int4,c.article_id,c.id,c.body,c.created_at,c.updated_at,NULL::text,NULL::text,NULL::text,c.author_id,NULL::int8[] FROM cd c UNION ALL SELECT r.i::int4,r.id,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id=r.viewer AND fo.followee_id=ANY(a.ids)) FROM m r LEFT JOIN authors a ON a.article_id=r.id UNION ALL SELECT -1,u.id,NULL,NULL,NULL,NULL,u.username,u.bio,u.image,NULL,NULL FROM users u WHERE u.id=ANY(ARRAY(SELECT DISTINCT author_id FROM cd WHERE author_id IS NOT NULL))",
             TEXT_ARRAY, INT8_ARRAY);
 
     private static int batchList(int single, String inputs, boolean global,
@@ -83,22 +87,22 @@ public final class Stmt {
             prefix = "WITH shared_cnt AS MATERIALIZED (SELECT count(*) AS n FROM (SELECT 1 FROM articles LIMIT 1000) s) ";
             sql = sql.replace("cnt AS (SELECT count(*) AS n FROM (SELECT 1 FROM articles LIMIT 1000) s)", "cnt AS (SELECT n FROM shared_cnt)");
         } else if (single == FEED) {
-            // hubs: the authors most followed by the batch's viewers, read once. A hub's depth-th newest article is a
-            // floor for every viewer following it (their page can only hold articles at least that new), so the
-            // other followees' index walks stop there. The 4 most followed also prove a 1,000 count.
-            afterInputs = ", hubs AS MATERIALIZED (SELECT fo.followee_id AS fid,count(*) AS c,max(r.lim::int8+r.off::int8) AS depth FROM r JOIN follows fo ON fo.follower_id=r.viewer GROUP BY fo.followee_id ORDER BY count(*) DESC,fo.followee_id LIMIT 32), hub_floors AS MATERIALIZED (SELECT h.fid,(SELECT a.id FROM articles a WHERE a.author_id=h.fid ORDER BY a.id DESC OFFSET h.depth-1 LIMIT 1) AS floor_id FROM hubs h), prolific AS MATERIALIZED (SELECT c.fid AS followee_id,EXISTS (SELECT 1 FROM articles a WHERE a.author_id=c.fid ORDER BY a.id DESC OFFSET 999 LIMIT 1) AS proven FROM (SELECT fid FROM hubs ORDER BY c DESC,fid LIMIT 4) c)";
+            // A viewer's followees serve hub selection, the floor, the page and the count within this statement.
+            // A hub's depth-th newest article is a floor for each viewer following it; the top 4 also prove the count.
+            afterInputs = ", viewers AS MATERIALIZED (SELECT d.viewer,ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id=d.viewer) AS fs FROM (SELECT DISTINCT viewer FROM r) d), hubs AS MATERIALIZED (SELECT fo.followee_id AS fid,count(*) AS c,max(r.lim::int8+r.off::int8) AS depth FROM r JOIN viewers v ON v.viewer=r.viewer CROSS JOIN LATERAL unnest(v.fs) fo(followee_id) GROUP BY fo.followee_id ORDER BY count(*) DESC,fo.followee_id LIMIT 32), hub_floors AS MATERIALIZED (SELECT h.fid,(SELECT a.id FROM articles a WHERE a.author_id=h.fid ORDER BY a.id DESC OFFSET h.depth-1 LIMIT 1) AS floor_id FROM hubs h), prolific AS MATERIALIZED (SELECT c.fid AS followee_id,EXISTS (SELECT 1 FROM articles a WHERE a.author_id=c.fid ORDER BY a.id DESC OFFSET 999 LIMIT 1) AS proven FROM (SELECT fid FROM hubs ORDER BY c DESC,fid LIMIT 4) c)";
             sql = sql.replace("SELECT x.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id=fo.followee_id ORDER BY",
-                    "SELECT x.id FROM (SELECT COALESCE(max(hf.floor_id),0::int8) AS f FROM hub_floors hf JOIN follows fh ON fh.follower_id=r.viewer AND fh.followee_id=hf.fid) fl CROSS JOIN follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id=fo.followee_id AND a2.id>=fl.f ORDER BY");
+                    "SELECT x.id FROM (SELECT COALESCE(max(hf.floor_id),0::int8) AS f FROM hub_floors hf WHERE hf.fid=ANY(v.fs)) fl CROSS JOIN LATERAL unnest(v.fs) fo(followee_id) CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id=fo.followee_id AND a2.id>=fl.f ORDER BY")
+                    .replace(") x WHERE fo.follower_id=r.viewer ORDER BY", ") x ORDER BY");
             sql = sql.replace(
                     "cnt AS (SELECT count(*) AS n FROM (SELECT 1 FROM articles a WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id=r.viewer) LIMIT 1000) s)",
-                    "cnt AS (SELECT CASE WHEN EXISTS (SELECT 1 FROM prolific c JOIN follows fo ON fo.follower_id=r.viewer AND fo.followee_id=c.followee_id WHERE c.proven) THEN 1000::bigint ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id=r.viewer) LIMIT 1000) s) END AS n)");
+                    "cnt AS (SELECT CASE WHEN EXISTS (SELECT 1 FROM prolific c WHERE c.proven AND c.followee_id=ANY(v.fs)) THEN 1000::bigint ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id=ANY(v.fs) LIMIT 1000) s) END AS n)");
         }
         int select = sql.indexOf(" SELECT " + ARTICLE_COLUMNS);
         sql = sql.substring(0, select) + " SELECT p.id,cnt.n FROM cnt LEFT JOIN page p ON true";
         String ctes = prefix.isEmpty() ? "WITH " : prefix + ", ";
         String columns = (single == FEED ? "viewer,lim,off" : "lim,off,viewer") + ",i";
         // a feed only lists followed authors (read from the same snapshot), so following is known without a probe
-        return decorated(single == FEED ? "d.id IS NOT NULL" : FOLLOWING,
+        return decorated(single == FEED,
                 ctes
                         + "r AS MATERIALIZED (SELECT * FROM unnest("
                         + inputs
@@ -106,7 +110,9 @@ public final class Stmt {
                         + columns
                         + "))"
                         + afterInputs
-                        + ", pages AS MATERIALIZED (SELECT r.i,r.viewer,p.id,p.n FROM r CROSS JOIN LATERAL ("
+                        + ", pages AS MATERIALIZED (SELECT r.i,r.viewer,p.id,p.n FROM r"
+                        + (single == FEED ? " JOIN viewers v ON v.viewer=r.viewer" : "")
+                        + " CROSS JOIN LATERAL ("
                         + sql
                         + ") p)",
                 types);
@@ -114,19 +120,28 @@ public final class Stmt {
 
     /**
      * {@code pages(i, viewer, id, n)}, one row per listed article (id null for
-     * an empty page), decorated once per distinct article.
+     * an empty page). Each distinct article comes back once, tagged 0, with its
+     * author id and tag ids; the tags table comes last, tagged -1, in name
+     * order; each request comes back as one row with its page's ids,
+     * the ones its viewer favorited and (not for a feed, whose authors are all
+     * followed) the page authors it follows. Fanout rebuilds the single
+     * statement's rows from them: per-row EXISTS probes and the same wide row
+     * sent once per request cost Postgres more than these array lookups (one
+     * index scan per viewer).
      */
-    private static final String FOLLOWING = "EXISTS(SELECT 1 FROM follows fo WHERE fo.follower_id=r.viewer AND fo.followee_id=d.author_id)";
-
-    private static int decorated(String following, String pages, int... types) {
+    private static int decorated(boolean feed, String pages, int... types) {
         return register(
                 pages
                         + ", ids AS (SELECT DISTINCT id FROM pages WHERE id IS NOT NULL), deco AS MATERIALIZED ("
-                        + BATCH_DECO.replace("a.description,a.body,", "a.description,")
-                        + ") SELECT r.i::int4,"
-                        + BATCH_COLUMNS
-                        + BATCH_DECORATION.replace(FOLLOWING, following)
-                        + ",r.n FROM pages r LEFT JOIN deco d ON d.id=r.id ORDER BY r.i,d.id DESC",
+                        + BATCH_DECO
+                        + "), q AS (SELECT p.i,p.viewer,min(p.n) AS n,array_agg(p.id ORDER BY p.id DESC) FILTER (WHERE p.id IS NOT NULL) AS ids"
+                        + (feed ? "" : ",array_agg(DISTINCT d.author_id) FILTER (WHERE d.author_id IS NOT NULL) AS authors")
+                        + " FROM pages p LEFT JOIN deco d ON d.id=p.id GROUP BY p.i,p.viewer)"
+                        + " SELECT 0::int4,d.id,d.slug,d.title,d.description,d.created_at,d.updated_at,d.tags,d.fav_count,d.username,d.bio,d.image,d.author_id,NULL::int8[],NULL::int8[],NULL::int8[],NULL::int8 FROM deco d"
+                        + " UNION ALL SELECT q.i::int4,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,COALESCE(q.ids,ARRAY[]::int8[]),ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id=q.viewer AND f.article_id=ANY(q.ids)),"
+                        + (feed ? "NULL" : "ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id=q.viewer AND fo.followee_id=ANY(q.authors))")
+                        + ",q.n FROM q"
+                        + " UNION ALL (SELECT -1,t.id,t.name,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL FROM tags t ORDER BY t.name)",
                 types);
     }
 
@@ -138,7 +153,7 @@ public final class Stmt {
      * 0.
      */
     private static int keyedList(String key, String count, String page) {
-        return decorated(FOLLOWING, "WITH r AS MATERIALIZED (SELECT * FROM unnest($1::text[],$2::int4[],$3::int4[],$4::int8[]) WITH ORDINALITY AS r(name,lim,off,viewer,i)), k AS MATERIALIZED ("
+        return decorated(false, "WITH r AS MATERIALIZED (SELECT * FROM unnest($1::text[],$2::int4[],$3::int4[],$4::int8[]) WITH ORDINALITY AS r(name,lim,off,viewer,i)), k AS MATERIALIZED ("
                         + key.replace("{names}", "(SELECT DISTINCT name FROM r) k")
                         + "), kc AS MATERIALIZED (SELECT k.name,k.kid,(SELECT count(*) FROM ("
                         + count

@@ -27,6 +27,8 @@ public final class PgDispatcher implements AutoCloseable {
     private final int writeGroupMax;
     private final int readRoundMax;
     private final int gatherUs;
+    /** Gather window per read lane (feed, comments, the rest), microseconds. */
+    private final long[] laneGatherNs = new long[LANES];
     private final boolean coalesce;
     private final ArrayDeque<Unit> waiting = new ArrayDeque<>();
     private final Thread thread;
@@ -39,11 +41,19 @@ public final class PgDispatcher implements AutoCloseable {
         int nw = env("WRITE_CONNS", 1);
         writeGroupMax = env("WRITE_GROUP_MAX", 256);
         readRoundMax = env("READ_ROUND_MAX", 4096);
-        // Hetzner 150k: 20 ms gathers cut Postgres CPU 52 -> 44% of the box (box 97.9 -> 90.6%), p95 498 -> 254 ms; with a
-        // round spread over connections (READ_SPREAD), 30 ms holds the same latency and batches more
-        gatherUs = env("READ_GATHER_US", 30000);
+        // Hetzner 150k: 20 ms gathers cut Postgres CPU 52 -> 44% of the box (box 97.9 -> 90.6%), p95 498 -> 254 ms. At
+        // 140k, 40 ms against 30: Postgres 85.9 -> 81.5 us/req, app +1, p95 ~115 -> ~150 ms (two runs each)
+        gatherUs = env("READ_GATHER_US", 40000);
+        // Feeds and comments gather on their own clocks: their batches are the costliest per request and share the
+        // most within a batch, so they can wait longer than the cheap lookups that make up most reads. Hetzner 140k
+        // (with tag ids, two runs each): 120 ms gave app + Postgres 136.1 us/req at p95 182 ms, against 151.1 at 144 ms
+        // for 40 ms everywhere without tag ids (an earlier box of the same type);
+        // 160 ms gave 136.6 at p95 232 ms.
+        laneGatherNs[FEED_LANE] = 1000L * env("READ_GATHER_FEED_US", 120000);
+        laneGatherNs[COMMENTS_LANE] = 1000L * env("READ_GATHER_COMMENTS_US", 120000);
+        laneGatherNs[REST_LANE] = 1000L * gatherUs;
         coalesce = env("COALESCE", 1) != 0;
-        if (readRoundMax < 1 || gatherUs < 0) {
+        if (readRoundMax < 1 || gatherUs < 0 || laneGatherNs[FEED_LANE] < 0 || laneGatherNs[COMMENTS_LANE] < 0) {
             throw new IllegalArgumentException("invalid read round configuration");
         }
         if (writeGroupMax < 1) {
@@ -78,6 +88,17 @@ public final class PgDispatcher implements AutoCloseable {
         }
         thread = new Thread(this::run, "postgres-dispatcher");
         thread.start();
+    }
+
+    static final int FEED_LANE = 0;
+    static final int COMMENTS_LANE = 1;
+    static final int REST_LANE = 2;
+    static final int LANES = 3;
+
+    /** The lane a read unit gathers in. */
+    static int lane(Unit u) {
+        int k = PgConn.kind(u);
+        return k == PgConn.FEED_KIND ? FEED_LANE : k == PgConn.COMMENTS_KIND ? COMMENTS_LANE : REST_LANE;
     }
 
     private static int env(String key, int defaultValue) {
@@ -129,7 +150,7 @@ public final class PgDispatcher implements AutoCloseable {
      * one connection per kind cuts a round to its slowest statement (locally 21
      * -> ~9 ms at 20 ms gathers, with 7 of 8 read connections idle before).
      */
-    private void spread(int from) {
+    private void spread(int from, int lane) {
         if (buckets == null) {
             buckets = new Unit[PgConn.KINDS + 1][readRoundMax];
         }
@@ -148,10 +169,14 @@ public final class PgDispatcher implements AutoCloseable {
         int count = waiting.size();
         while (count-- > 0) {
             Unit u = waiting.remove();
-            if (u.tx && !u.write) {
+            if (u.write || lane(u) != lane) {
+                waiting.add(u);
+                continue;
+            }
+            if (u.tx) {
                 blocked = true;
             }
-            if (u.write || blocked || taken == readRoundMax) {
+            if (blocked || taken == readRoundMax) {
                 waiting.add(u);
                 continue;
             }
@@ -208,6 +233,52 @@ public final class PgDispatcher implements AutoCloseable {
         }
     }
 
+    // dueLane(): per lane, the oldest waiting read and how many reads wait
+    private final Unit[] laneFirst = new Unit[LANES];
+    private final int[] laneCount = new int[LANES];
+
+    private void scanLanes() {
+        Arrays.fill(laneFirst, null);
+        Arrays.fill(laneCount, 0);
+        for (Unit u : waiting) {
+            if (!u.write) {
+                int l = lane(u);
+                if (laneFirst[l] == null) {
+                    laneFirst[l] = u;
+                }
+                laneCount[l]++;
+            }
+        }
+    }
+
+    /** The lane whose round is due (window elapsed or round full), the one waiting longest; -1 if none. */
+    private int dueLane(long now) {
+        scanLanes();
+        int best = -1;
+        for (int l = 0; l < LANES; l++) {
+            Unit f = laneFirst[l];
+            if (f != null && (laneCount[l] >= readRoundMax || now - f.queuedAt >= laneGatherNs[l])
+                    && (best < 0 || f.queuedAt < laneFirst[best].queuedAt)) {
+                best = l;
+            }
+        }
+        return best;
+    }
+
+    /** Nanoseconds until the next lane's window elapses (0 if one already has), or -1 if no read waits. */
+    private long untilDue(long now) {
+        scanLanes();
+        long min = -1;
+        for (int l = 0; l < LANES; l++) {
+            Unit f = laneFirst[l];
+            if (f != null) {
+                long left = laneCount[l] >= readRoundMax ? 0 : Math.max(0, laneGatherNs[l] - (now - f.queuedAt));
+                min = min < 0 ? left : Math.min(min, left);
+            }
+        }
+        return min;
+    }
+
     private void plan() {
         int count = waiting.size();
         if (coalesce) {
@@ -216,22 +287,11 @@ public final class PgDispatcher implements AutoCloseable {
                 if (!conn.idle()) {
                     continue;
                 }
-                Unit first = null;
-                int readCount = 0;
-                int queued = waiting.size();
-                while (queued-- > 0) {
-                    Unit u = waiting.remove();
-                    if (!u.write) {
-                        if (first == null) {
-                            first = u;
-                        }
-                        readCount++;
-                    }
-                    waiting.add(u);
+                int lane = dueLane(System.nanoTime());
+                if (lane < 0) {
+                    break;
                 }
-                if (first == null || (readCount < readRoundMax && System.nanoTime() - first.queuedAt < (long) gatherUs * 1000)) {
-                    continue;
-                }
+                Unit first = laneFirst[lane];
                 if (first.tx) {
                     waiting.remove(first);
                     try {
@@ -243,8 +303,7 @@ public final class PgDispatcher implements AutoCloseable {
                     }
                     continue;
                 }
-                spread(c);
-                break;
+                spread(c, lane);
             }
         } else {
             while (count-- > 0) {
@@ -316,7 +375,7 @@ public final class PgDispatcher implements AutoCloseable {
                     continue;
                 }
                 int timeout = 1000;
-                if (coalesce && gatherUs > 0 && !waiting.isEmpty()) {
+                if (coalesce && !waiting.isEmpty()) {
                     boolean free = false;
                     for (PgConn conn : reads) {
                         if (conn.idle()) {
@@ -325,16 +384,9 @@ public final class PgDispatcher implements AutoCloseable {
                         }
                     }
                     if (free) {
-                        int queued = waiting.size();
-                        boolean found = false;
-                        while (queued-- > 0) {
-                            Unit u = waiting.remove();
-                            if (!found && !u.write) {
-                                long left = (long) gatherUs * 1000 - (System.nanoTime() - u.queuedAt);
-                                timeout = (int) Math.min(1000, Math.max(0, (left + 999_999) / 1_000_000));
-                                found = true;
-                            }
-                            waiting.add(u);
+                        long left = untilDue(System.nanoTime());
+                        if (left >= 0) {
+                            timeout = (int) Math.min(1000, (left + 999_999) / 1_000_000);
                         }
                     }
                 }

@@ -12,6 +12,8 @@ public final class BCrypt {
     private static final int[] INITIAL = initial();
     private static final int[] MAGIC = {0x4f727068, 0x65616e42, 0x65686f6c, 0x64657253, 0x63727944, 0x6f756274};
     private final SecureRandom random = new SecureRandom();
+    // the cost loop in native/ (C, through FFM) when build.sh could build it; the Java kernels otherwise
+    private final NativeCost nativeCost = NativeCost.AVAILABLE ? new NativeCost() : null;
 
     public String hash(String password) {
         return calculate(password, newSalt());
@@ -98,6 +100,9 @@ public final class BCrypt {
      * longer.
      */
     static int fastestLanes(StringBuilder curve) {
+        if (NativeCost.AVAILABLE) {
+            return NativeCost.calibrate(curve);
+        }
         BCrypt bcrypt = new BCrypt();
         int best = 1;
         double bestNanos = Double.MAX_VALUE;
@@ -168,34 +173,61 @@ public final class BCrypt {
      * Hashes passwords[group[0..count)] (validated, all one cost) together into
      * out.
      */
-    private static void run(String[] passwords, String[] salts, int[] group,
-                            int count, String[] out) {
+    private void run(String[] passwords, String[] salts, int[] group,
+                     int count, String[] out) {
         int[][] p = new int[count][];
         int[][] s = new int[count][];
         int[][] key = new int[count][];
         int[][] salt4 = new int[count][];
-        int[][] salt18 = new int[count][];
         int[][] text = new int[count][];
-        for (int k = 0; k < count; k++) {
-            byte[] bytes = passwords[group[k]].getBytes(StandardCharsets.UTF_8);
-            byte[] salt = decode(salts[group[k]], 7, 29, 16);
-            p[k] = Arrays.copyOf(INITIAL, 18);
-            s[k] = Arrays.copyOfRange(INITIAL, 18, 18 + 1024);
-            key[k] = words(Arrays.copyOf(bytes, Math.min(72, bytes.length + 1)), 18);
-            salt4[k] = words(salt, 4);
-            salt18[k] = words(salt, 18);
-            text[k] = MAGIC.clone();
-        }
-        BCryptLanes.expandSalted(count, p, s, key, salt4);
-        for (long i = 0, n = 1L << cost(salts[group[0]]);
-             i < n;
-             i++) {
-            BCryptLanes.expand(count, p, s, key);
-            BCryptLanes.expand(count, p, s, salt18);
-        }
-        BCryptLanes.encrypt(count, p, s, text);
-        for (int k = 0; k < count; k++) {
-            out[group[k]] = format(salts[group[k]], text[k]);
+        try {
+            for (int k = 0; k < count; k++) {
+                byte[] bytes = passwords[group[k]].getBytes(StandardCharsets.UTF_8);
+                byte[] padded = null;
+                byte[] salt = null;
+                try {
+                    salt = decode(salts[group[k]], 7, 29, 16);
+                    p[k] = Arrays.copyOf(INITIAL, 18);
+                    s[k] = Arrays.copyOfRange(INITIAL, 18, 18 + 1024);
+                    padded = Arrays.copyOf(bytes, Math.min(72, bytes.length + 1));
+                    key[k] = words(padded, 18);
+                    salt4[k] = words(salt, 4);
+                    text[k] = MAGIC.clone();
+                } finally {
+                    Arrays.fill(bytes, (byte) 0);
+                    if (padded != null) Arrays.fill(padded, (byte) 0);
+                    if (salt != null) Arrays.fill(salt, (byte) 0);
+                }
+            }
+            BCryptLanes.expandSalted(count, p, s, key, salt4);
+            long rounds = 1L << cost(salts[group[0]]);
+            if (nativeCost != null) {
+                nativeCost.run(count, rounds, p, s, key, salt4);
+            } else {
+                int[][] salt18 = new int[count][];
+                for (int k = 0; k < count; k++) {
+                    salt18[k] = new int[18];
+                    for (int i = 0; i < 18; i++) {
+                        salt18[k][i] = salt4[k][i & 3];
+                    }
+                }
+                for (long i = 0; i < rounds; i++) {
+                    BCryptLanes.expand(count, p, s, key);
+                    BCryptLanes.expand(count, p, s, salt18);
+                }
+            }
+            BCryptLanes.encrypt(count, p, s, text);
+            for (int k = 0; k < count; k++) {
+                out[group[k]] = format(salts[group[k]], text[k]);
+            }
+        } finally {
+            for (int k = 0; k < count; k++) {
+                if (p[k] != null) Arrays.fill(p[k], 0);
+                if (s[k] != null) Arrays.fill(s[k], 0);
+                if (key[k] != null) Arrays.fill(key[k], 0);
+                if (salt4[k] != null) Arrays.fill(salt4[k], 0);
+                if (text[k] != null) Arrays.fill(text[k], 0);
+            }
         }
     }
 
