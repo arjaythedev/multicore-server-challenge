@@ -5,7 +5,8 @@ Front: direct
 An update of this submission, scored at 91,000 users in #83 (`3de991e`),
 100,000 in #116 (`6e69d72`), 140,000 in #159 (`6cdf1fd`), 180,000 in
 #189 (`76a40a5`) and 200,000 in #196 (`6b5557b`), on the same design. Since
-#196: tag lists are answered as soon as their statement ends, HTTP workers and
+#196: a plan's ids go to Postgres sorted, tag lists are answered as soon as
+their statement ends, HTTP workers and
 the read service run at nice 5, and each statement of a plan's group gets a connection of its own, the
 feeds split in two, instead of two lanes pipelined four deep on whatever
 connections the pool had opened. Since #189: plans hold up to 4,096 reads
@@ -32,7 +33,7 @@ read queue than four could have, where #83 ran
 two), and Nish 0.23.1 no longer sweeps every idle connection on every turn of
 the loop.
 
-Nish 0.34.0 (a statically typed TypeScript subset compiled to native code
+Nish 0.34.1 (a statically typed TypeScript subset compiled to native code
 through LLVM), built with clang-18 and lld-18 from LLVM 18, against
 PostgreSQL 18. The compiler runs on Node.js 22.18.0 at build time only; the
 server is one native binary with no runtime dependency beyond libc. Every
@@ -47,7 +48,8 @@ bash build.sh
 DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=... HOST=0.0.0.0 PORT=80 bash start.sh
 ```
 
-The server needs Nish 0.34.0, which scans HTTP/1.1 request heads a vector
+The server needs Nish 0.34.1, whose Postgres and HTTP/1.1 paths take fewer
+steps a byte; 0.34.0 scans HTTP/1.1 request heads a vector
 at a time and keeps a connection's per-request path on its hot fields. 0.32.0's
 bcrypt batch kernels take a hash in 6.5% less time at five lanes on the Xeon
 VM (below), and 0.31.0 renamed the HTTP/1.1 codec `nish/net/http1-codec`.
@@ -183,6 +185,10 @@ and four on the box), and
   spend in each stage and lane. On the Xeon VM at 175,000 users, group A
   went from 48 ms to 30, group B from 31 to 28, and the wait for the counts
   after B from 13–18 ms to 2.
+- **Sorted ids.** `plan_meta`, `plan_counts` and `plan_users` read a plan's ids
+  in the order its requests met them, so each index lookup landed far from the
+  last. A radix sort puts them in ascending order as they are bound, so
+  neighbouring ids share index and heap pages (`SORT_IDS`, on).
 - **Tag lists answered early.** `/api/tags` needs only its plan's tag
   statement, so a tag read need not wait for the rest of the plan: the service
   answers it when that statement ends (`EARLY_TAGS`, on), and the plan's send
@@ -435,6 +441,15 @@ same VM, two holds each at 185,000. `SCHED_BATCH` on every process matched nice
 The one FAIL is unexplained; that build's other hold passed. This VM cannot
 show the gain above about 190,000 users, where its network interrupts run out.
 
+Then Nish 0.34.1 and sorted ids, alternated on the same VM at 185,000 users
+with one CPU offline, so the box runs about 89% busy below its network limit.
+Both builds passed both holds:
+
+| Build | p95 | p99 | Postgres µs a request | Box busy |
+|---|--:|--:|--:|--:|
+| Nish 0.34.1, ids as met | 294–318 ms | 408–430 ms | 69.1–70.6 | 88–90% |
+| this one, ids sorted | 279–282 ms | 376–397 ms | 68.1–68.2 | 88–89% |
+
 The window's extra wait shows as p95 while the box has room. At 185,000 the
 two builds' holds overlap: past the VM's limit its load box runs out of local
 ports and holds vary by 2x, so the saturated runs above are what rank them. At 195,000 users
@@ -647,6 +662,8 @@ from the idea, not the code:
   answering tag lists and other cheap reads before the rest of the batch, here
   tag lists only, and reactors at nice 5. From the same entry and
   zig-iouring-nick-potts: trying `SCHED_BATCH`, measured here and not kept.
+  Sorting a batch's ids comes from zig-iouring-nick-potts's sorted entity ids,
+  also used by rust-epoll-theCatWisel.
 - `enable_memoize=off` as a session option was set first by
   [c-iouring-tigokraft](https://github.com/arjaythedev/multicore-server-challenge/tree/main/submissions/c-iouring-tigokraft)
   ([#10](https://github.com/arjaythedev/multicore-server-challenge/pull/10)),

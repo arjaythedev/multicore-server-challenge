@@ -38,6 +38,7 @@ import {
   PgConnection,
 } from "nish/net/postgres"
 import { jsonOutBool, jsonOutNull, jsonOutRaw, jsonOutString, jsonOutWorst } from "./json-out"
+import { getenv } from "nish:process"
 import { jwtDigits } from "./jwt"
 import { planArticleBatch, planCommentBatch, planProfileBatch } from "./sql"
 
@@ -169,6 +170,50 @@ const grownBytes = (a: u8[], n: i32, keep: i32): u8[] => {
   return out
 }
 
+/** `SORT_IDS=0` binds ids as the plan met them. */
+const sortingIds = (): boolean => (getenv("SORT_IDS") ?? "1") !== "0"
+
+/** Bucket counts of `sortIds`' passes. */
+const SORT_BUCKETS: i32 = 2048
+
+/**
+ * Sorts `a`'s first `n` non-negative values, a radix sort of 11 bits a pass
+ * with `b` as its other side; `counts` holds `SORT_BUCKETS`. Answers whichever
+ * of the two ended up sorted. A plan's ids go to Postgres in this order, so its
+ * index scans walk their leaf pages forward instead of landing at random.
+ */
+const sortIds = (a: i64[], b: i64[], counts: i32[], n: i32): i64[] => {
+  let top: i64 = toI64(0)
+  for (let k: i32 = 0; k < n; k++) {
+    top = top | a[k]
+  }
+  let from: i64[] = a
+  let to: i64[] = b
+  for (let shift: i64 = toI64(0); top >> shift > toI64(0); shift = shift + toI64(11)) {
+    for (let k: i32 = 0; k < SORT_BUCKETS; k++) {
+      counts[k] = 0
+    }
+    for (let k: i32 = 0; k < n; k++) {
+      counts[toI32((from[k] >> shift) & toI64(2047))] += 1
+    }
+    let at: i32 = 0
+    for (let k: i32 = 0; k < SORT_BUCKETS; k++) {
+      const c: i32 = counts[k]
+      counts[k] = at
+      at += c
+    }
+    for (let k: i32 = 0; k < n; k++) {
+      const d: i32 = toI32((from[k] >> shift) & toI64(2047))
+      to[counts[d]] = from[k]
+      counts[d] += 1
+    }
+    const t: i64[] = from
+    from = to
+    to = t
+  }
+  return from
+}
+
 const grownInts = (a: i64[], n: i32, keep: i32): i64[] => {
   if (n <= toI32(a.length)) {
     return a
@@ -248,6 +293,9 @@ export class CountRun {
   counts: i64[]
   private readonly table: i32[]
   private readonly slots: i32[]
+  private readonly sortA: i64[]
+  private readonly sortB: i64[]
+  private readonly sortCounts: i32[]
   private mask: i32 = 4095
   n: i32 = 0
   /** Its statement could not be bound: its plans go alone. */
@@ -259,6 +307,9 @@ export class CountRun {
     this.counts = new Array<i64>(COUNT_MAX)
     this.slots = new Array<i32>(COUNT_MAX)
     this.table = new Array<i32>(COUNT_TABLE)
+    this.sortA = new Array<i64>(COUNT_MAX)
+    this.sortB = new Array<i64>(COUNT_MAX)
+    this.sortCounts = new Array<i32>(SORT_BUCKETS)
   }
 
   private slot(id: i64): i32 {
@@ -308,7 +359,14 @@ export class CountRun {
   }
 
   bind(conn: PgConnection): boolean {
-    return conn.bindStartBinary("plan_counts") && conn.paramIntArray(this.ids, 0, this.n) && conn.bindEnd()
+    let ids: i64[] = this.ids
+    if (sortingIds()) {
+      for (let k: i32 = 0; k < this.n; k++) {
+        this.sortA[k] = this.ids[k]
+      }
+      ids = sortIds(this.sortA, this.sortB, this.sortCounts, this.n)
+    }
+    return conn.bindStartBinary("plan_counts") && conn.paramIntArray(ids, 0, this.n) && conn.bindEnd()
   }
 
   /** A row of `plan_counts`: (id, count). */
@@ -464,6 +522,14 @@ export class ReadPlan {
   cAuthor: i64[]
   /** The plan's distinct authors, of articles and comments alike, each read once: `plan_users`. */
   private userIds: i64[]
+  // `sortIds`' working space: group B's lanes bind on their own events.
+  private sortA: i64[]
+  private sortB: i64[]
+  private sortIdsOut: i64[]
+  private readonly sortCounts: i32[]
+  private sortUsersA: i64[]
+  private sortUsersB: i64[]
+  private readonly sortUsersCounts: i32[]
   private userSlots: i32[]
   /** Each author's JSON in `text`, `,"author":{...,"following":`, as [u0, u1); -1 until its row comes. */
   private u0: i32[]
@@ -573,6 +639,13 @@ export class ReadPlan {
     this.c1 = new Array<i32>(4096)
     this.cAuthor = new Array<i64>(4096)
     this.userIds = new Array<i64>(4096)
+    this.sortA = new Array<i64>(4096)
+    this.sortB = new Array<i64>(4096)
+    this.sortIdsOut = new Array<i64>(4096)
+    this.sortCounts = new Array<i32>(SORT_BUCKETS)
+    this.sortUsersA = new Array<i64>(4096)
+    this.sortUsersB = new Array<i64>(4096)
+    this.sortUsersCounts = new Array<i32>(SORT_BUCKETS)
     this.userSlots = new Array<i32>(4096)
     this.u0 = new Array<i32>(4096)
     this.u1 = new Array<i32>(4096)
@@ -1513,15 +1586,27 @@ export class ReadPlan {
   bindB(conn: PgConnection, mask: i32, slot: i32): boolean {
     const lane: i32 = slot
     if ((mask & (1 << LANE_META)) !== 0 && this.metas > 0) {
+      // Sorted with each article's flag in the low bit: `metaIds` keeps its
+      // order, which the id table's places point into.
+      this.sortA = grownInts(this.sortA, this.metas, 0)
+      this.sortB = grownInts(this.sortB, this.metas, 0)
+      for (let k: i32 = 0; k < this.metas; k++) {
+        this.sortA[k] = 2 * this.metaIds[k] + (this.metaFull[k] ? toI64(1) : toI64(0))
+      }
+      const keyed: i64[] = sortingIds() ? sortIds(this.sortA, this.sortB, this.sortCounts, this.metas) : this.sortA
+      this.sortIdsOut = grownInts(this.sortIdsOut, this.metas, 0)
+      for (let k: i32 = 0; k < this.metas; k++) {
+        this.sortIdsOut[k] = keyed[k] >> toI64(1)
+      }
       if (
         !conn.bindStartBinary("plan_meta") ||
-        !conn.paramIntArray(this.metaIds, 0, this.metas) ||
+        !conn.paramIntArray(this.sortIdsOut, 0, this.metas) ||
         !conn.arrayStart()
       ) {
         return false
       }
       for (let k: i32 = 0; k < this.metas; k++) {
-        const v: u8[] = this.metaFull[k] ? this.trueBytes : this.falseBytes
+        const v: u8[] = (keyed[k] & toI64(1)) !== toI64(0) ? this.trueBytes : this.falseBytes
         if (!conn.arrayElement(v, 0, 1)) {
           conn.arrayEnd()
           return false
@@ -1595,9 +1680,18 @@ export class ReadPlan {
       this.laneAdd(lane, S_FLAGS)
     }
     if ((mask & (1 << LANE_USERS)) !== 0 && this.users > 0) {
+      let ids: i64[] = this.userIds
+      if (sortingIds()) {
+        this.sortUsersA = grownInts(this.sortUsersA, this.users, 0)
+        this.sortUsersB = grownInts(this.sortUsersB, this.users, 0)
+        for (let k: i32 = 0; k < this.users; k++) {
+          this.sortUsersA[k] = this.userIds[k]
+        }
+        ids = sortIds(this.sortUsersA, this.sortUsersB, this.sortUsersCounts, this.users)
+      }
       if (
         !conn.bindStartBinary("plan_users") ||
-        !conn.paramIntArray(this.userIds, 0, this.users) ||
+        !conn.paramIntArray(ids, 0, this.users) ||
         !conn.bindEnd()
       ) {
         return false
