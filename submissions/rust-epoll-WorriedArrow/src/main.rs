@@ -56,7 +56,7 @@ fn main() {
     let settings: &'static db::Settings = Box::leak(Box::new(db::Settings {
         cfg: pg::Config::parse(&url).expect("DATABASE_URL must be postgres://user:password@host:port/db"),
         keys,
-        read_batch: env_or("READ_BATCH", 4096),
+        read_batch: env_or("READ_BATCH", 2048),
         read_min: env_or("READ_MIN", 4096),
         read_window: Duration::from_micros(env_or("READ_WINDOW_US", 40_000)),
         write_batch: env_or("WRITE_BATCH", 256),
@@ -73,15 +73,17 @@ fn main() {
             sched::FEED_OWN.store(feed_own, std::sync::atomic::Ordering::Relaxed);
             let fast = Duration::from_micros(env_or("GAP_FAST_US", 75_000));
             sched::Config {
-                gap: [fast, Duration::from_micros(env_or("GAP_CMTS_US", 100_000)), Duration::from_micros(env_or("GAP_FEED_US", 80_000))],
+                gap: [fast, Duration::from_micros(env_or("GAP_CMTS_US", 75_000)), Duration::from_micros(env_or("GAP_FEED_US", 80_000))],
                 min_age: Duration::from_micros(env_or("GAP_MIN_US", 5_000)),
                 caps: if feed_own {
-                    [(read_lanes * 3 / 8).max(2), (read_lanes / 4).max(1), (read_lanes / 4).max(1)]
+                    // Comment threads are a fifth of all reads and the dearest after feeds: 3 of 8 lanes like the fast
+                    // class, not 2, so they don't depend on borrowing exactly when the fast class is busy too.
+                    [(read_lanes * 3 / 8).max(2), (read_lanes * 3 / 8).max(1), (read_lanes / 4).max(1)]
                 } else {
                     [(read_lanes * 5 / 8).max(2), (read_lanes / 4).max(1), 1]
                 },
                 max_active: env_or("READ_ACTIVE", read_lanes.saturating_sub(1).max(3)),
-                max_batch: env_or("READ_BATCH", 4096),
+                max_batch: env_or("READ_BATCH", 2048),
                 borrow_age: Duration::from_micros(env_or("BORROW_AGE_US", 90_000)),
                 starve_age: Duration::from_micros(env_or("STARVE_AGE_US", 300_000)),
             }

@@ -57,7 +57,7 @@ distinct article in phase B. A feed's articles are by followed authors, so they 
 those authors each signed-in viewer of the thread follows. A comments batch has no phase B.
 
 **Forming batches.** Reads queue by class: feeds, comment threads, and the rest. Each class starts a batch at most
-every gap (75 ms, 80 ms for feeds, 100 ms for comment threads), and a read is due at most gap + 5 ms after it arrives. At most `READ_ACTIVE`
+every gap (75 ms, 80 ms for feeds), and a read is due at most gap + 5 ms after it arrives. At most `READ_ACTIVE`
 batches run at once, each class at most its share of the lanes, plus one for the class whose oldest read has waited
 longest, plus one for feeds and comments once their oldest read has waited 90 ms while the fast class has a lane to
 spare, plus one for any class whose oldest read has waited 300 ms. Feeds are 8% of requests but the dearest read,
@@ -138,12 +138,12 @@ Defaults suit the 8-vCPU box; all are optional environment variables.
 | `READ_LANES` | cores | read connections |
 | `FEED_CONN` | 1 | 1: each read lane runs its batch's feed statement on a second connection, alongside the rest of phase A |
 | `CLASS_LANES` | 1 | 1: reads queue by class (feeds, comment threads, the rest), each class a batch at most every gap; 0: one pool |
-| `GAP_FAST_US` / `GAP_CMTS_US` / `GAP_FEED_US` | 75000 / 100000 / 80000 | least time between two batches of a class |
+| `GAP_FAST_US` / `GAP_CMTS_US` / `GAP_FEED_US` | 75000 / 75000 / 80000 | least time between two batches of a class |
 | `BORROW_AGE_US` | 90000 | feeds and comments take a lane past their share once their oldest read has waited this long and the fast class has one to spare |
 | `STARVE_AGE_US` | 300000 | any class takes a lane past its share once its oldest read has waited this long |
 | `FEED_MERGE` | 1 | 1: each distinct followee read once per batch, feeds merged here; 0: per viewer in SQL |
 | `GAP_MIN_US` | 5000 | least time a read waits before its batch starts |
-| `READ_ACTIVE` | read lanes - 1 | most read batches running at once (per class 3/8, 1/4, 1/4 of the lanes, plus one for the class waiting longest) |
+| `READ_ACTIVE` | read lanes - 1 | most read batches running at once (per class 3/8, 3/8, 1/4 of the lanes, plus one for the class waiting longest) |
 | `LOOP_NICE` | 5 | nice value of the event loop threads |
 | `BCRYPT_NICE` | 10 | nice value of the hashing threads after the first |
 | `WRITE_LANES` | 1 | group-commit connections |
@@ -153,7 +153,7 @@ Defaults suit the 8-vCPU box; all are optional environment variables.
 | `READ_WINDOW_US` | 40000 | the longest the oldest request waits for its batch to fill |
 | `FEED_LANES` | 0 | read lanes that serve only feeds (0: all lanes serve every read) |
 | `READ_MIN` | 4096 | a batch is taken early once this many (or the recent average, if larger) are waiting |
-| `READ_BATCH`, `WRITE_BATCH` | 4096, 256 | batch size caps |
+| `READ_BATCH`, `WRITE_BATCH` | 2048, 256 | batch size caps |
 | `WRITE_WINDOW_US` | 3000 | how long a write waits for others to share its group |
 | `BCRYPT_IDLE` | 0 | 1: hashing threads at nice 19, plus a normal-priority thread for logins waiting `BCRYPT_RESCUE_MS` |
 | `BCRYPT_RESCUE_MS` | 1000 | with `BCRYPT_IDLE`, how long a login waits before the normal-priority thread hashes it (0: no such thread) |
