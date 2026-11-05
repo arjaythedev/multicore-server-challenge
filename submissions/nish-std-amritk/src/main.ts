@@ -25,7 +25,7 @@
 // ACK_DELAY (0 leaves the kernel's ACKs alone; 1 turns delayed ACKs back on after each answer, worker.ts `ackDelayAfter`),
 // GZIP (0; 1 when it saves a TCP segment, 2 whenever it saves anything), GZIP_MIN (1300),
 // READ_SERVICE (1; 0 leaves each worker its own plans), READ_SERVICE_CONNS (20), READ_SERVICE_IN_FLIGHT (1), READ_SERVICE_PLANS (20),
-// READ_COUNT_LANES (1), DB_SOLO_CONNS (2) and ANSWER_PACE (196608 bytes a ms, a worker).
+// READ_COUNT_LANES (1), DB_SOLO_CONNS (2) and ANSWER_PACE (130000 bytes a ms, a worker).
 import { tcpListenFlags } from "nish:net"
 import { availableParallelism, getenv, setIdlePriority, setNice } from "nish:process"
 import {
@@ -146,7 +146,7 @@ export const main = (): i32 => {
   const gzip: string = getenv("GZIP") ?? "0"
   cfg.gzip = gzip === "1" ? 1 : gzip === "2" ? 2 : 0
   cfg.gzipMin = envInt("GZIP_MIN", 1300)
-  cfg.answerPace = envInt("ANSWER_PACE", 196608)
+  cfg.answerPace = envInt("ANSWER_PACE", 130000)
   // A quarter of the CPUs serve HTTP, each with its own read queue: at 120,000
   // users on a VM like the challenge's, 2 workers' bigger plans cost Postgres
   // 129 µs a request against 4 workers' 150, and 1 worker ran out of core.

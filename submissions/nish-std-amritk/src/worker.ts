@@ -559,7 +559,7 @@ export class WorkerConfig {
   /** How many count runs the read service runs at once. */
   countLanes: i32 = 1
   /** Bytes of the read service's answers a worker sends a millisecond (`ConduitWorker.takeAnswers`). */
-  answerPace: i32 = 196608
+  answerPace: i32 = 130000
   /** 0: no gzip; 1: gzip a body when that sends fewer TCP segments; 2: whenever it saves anything. */
   gzip: i32 = 0
   /** The shortest body gzip is tried on. */

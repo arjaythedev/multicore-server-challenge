@@ -450,6 +450,13 @@ Both builds passed both holds:
 | Nish 0.34.1, ids as met | 294–318 ms | 408–430 ms | 69.1–70.6 | 88–90% |
 | this one, ids sorted | 279–282 ms | 376–397 ms | 68.1–68.2 | 88–89% |
 
+`ANSWER_PACE` then went from 196,608 bytes a millisecond a worker to 130,000,
+about 2.1 Gbit/s across the two workers. `iperf3` tops out at 2.46 Gbit/s on the
+VM, so the old pace let a plan's answers out faster than its network carries
+them. At 200,000 users, alternated, p95 fell from 2,535–3,289 ms to 480–583 ms
+and retransmitted segments from about 12M a hold to about 2M. The official
+box's bandwidth is not known here.
+
 The window's extra wait shows as p95 while the box has room. At 185,000 the
 two builds' holds overlap: past the VM's limit its load box runs out of local
 ports and holds vary by 2x, so the saturated runs above are what rank them. At 195,000 users
