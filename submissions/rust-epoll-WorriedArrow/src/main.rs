@@ -67,7 +67,9 @@ fn main() {
         write_window: Duration::from_micros(env_or("WRITE_WINDOW_US", 3_000)),
         bcrypt_lanes,
         bcrypt_window: Duration::from_millis(env_or("BCRYPT_WINDOW_MS", 400)),
-        bcrypt_idle: env_or("BCRYPT_IDLE", 0) != 0,
+        // Hashing only takes CPU Postgres and the request path leave: logins are a thousandth of the requests but about a
+        // tenth of the box, and at nice 0 that tenth came out of the Postgres backends exactly when the box was full.
+        bcrypt_idle: env_or("BCRYPT_IDLE", 1) != 0,
         feed_conn: env_or("FEED_CONN", 1) != 0,
         feed_merge: env_or("FEED_MERGE", 1) != 0,
         bcrypt_nice: env_or("BCRYPT_NICE", 10),
