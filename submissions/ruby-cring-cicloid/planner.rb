@@ -33,6 +33,33 @@ class Planner
   attr_reader :after_batch # called after each batch's answers were handed out (remote_planner.rb)
 
   # `shared`: the intake ([pending, signal]) of the first lane, for the others.
+  # Distinct (viewer, id) pairs, written straight into the two int8[] literals b_flags takes: a few thousand
+  # pairs per batch, which as arrays of pairs then mapped and joined took ~9% of a planner's CPU.
+  class Pairs
+    def initialize
+      @seen = {}
+      @firsts = String.new("{", capacity: 4096)
+      @seconds = String.new("{", capacity: 4096)
+    end
+
+    def add(first, second)
+      key = (first << 32) | second
+      return if @seen.key?(key)
+
+      unless @seen.empty?
+        @firsts << ","
+        @seconds << ","
+      end
+      @seen[key] = true
+      @firsts << first.to_s
+      @seconds << second.to_s
+    end
+
+    def empty? = @seen.empty?
+    def firsts = "#{@firsts}}"
+    def seconds = "#{@seconds}}"
+  end
+
   def initialize(db, lanes: LANES, shared: nil)
     @db = db
     if shared
@@ -119,8 +146,8 @@ class Planner
   def answer(batch)
     @batch = batch
     @articles = {} # id => row fields (phase A), enriched in phase B
-    @flags_fav = [] # [viewer, article] pairs to look up
-    @flags_follow = [] # [viewer, user] pairs
+    @flags_fav = Pairs.new # (viewer, article) pairs to look up
+    @flags_follow = Pairs.new # (viewer, user) pairs
     @rows_wanted = {} # article ids phase A knew only by id (shared feeds), read whole in phase B
     @fav = {} # (viewer << 32 | article) => true, filled in phase B
     @follow = {} # (viewer << 32 | user) => true
@@ -202,7 +229,7 @@ class Planner
       requests.each_with_index do |request, i|
         row = rows[ordinals[i]] or next
         user_id = row[1].to_i
-        @flags_follow << [request.viewer, user_id] if request.viewer.positive?
+        @flags_follow.add(request.viewer, user_id) if request.viewer.positive?
         later do
           following = following?(request.viewer, user_id)
           request.document = "{\"profile\":{\"username\":#{str(row[2])},\"bio\":#{str(row[3])}," \
@@ -259,7 +286,7 @@ class Planner
           request.document = (anonymous[k] ||= comments_document(pieces, 0))
           next
         end
-        pieces.each { |(_, author)| @flags_follow << [viewer, author] }
+        pieces.each { |(_, author)| @flags_follow.add(viewer, author) }
         later { request.document = comments_document(pieces, viewer) }
       end
     end
@@ -349,7 +376,7 @@ class Planner
         page = ids[offset, limit] || []
         page.each do |id|
           @rows_wanted[id] = true unless @articles.key?(id)
-          @flags_fav << [viewer, id]
+          @flags_fav.add(viewer, id)
         end
         later do
           shown = page.select { |id| @articles[id]&.key?(:fragments) } # one deleted since phase A is left out
@@ -419,8 +446,8 @@ class Planner
   def want_flags(viewer, id)
     return unless viewer.positive?
 
-    @flags_fav << [viewer, id]
-    @flags_follow << [viewer, @articles[id][:author]]
+    @flags_fav.add(viewer, id)
+    @flags_follow.add(viewer, @articles[id][:author])
   end
 
   def enrich
@@ -435,8 +462,7 @@ class Planner
     statements << [:b_tag_names, [ints(ids + extra)]] unless ids.empty? && extra.empty?
     flags = !@flags_fav.empty? || !@flags_follow.empty?
     if flags
-      statements << [:b_flags, [ints(@flags_fav.map(&:first)), ints(@flags_fav.map(&:last)),
-                                ints(@flags_follow.map(&:first)), ints(@flags_follow.map(&:last))]]
+      statements << [:b_flags, [@flags_fav.firsts, @flags_fav.seconds, @flags_follow.firsts, @flags_follow.seconds]]
     end
     results = @db.group(statements)
     at = 0
