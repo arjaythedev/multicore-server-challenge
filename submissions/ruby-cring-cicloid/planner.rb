@@ -304,9 +304,12 @@ class Planner
     end
   end
 
-  # Feeds of up to FEED_SHARED_DEPTH rows (limit + offset) share their followees' scans (b_feed_scan); deeper
-  # ones go per viewer (b_feed).
-  FEED_SHARED_DEPTH = Integer(ENV.fetch("FEED_SHARED_DEPTH", "200"))
+  # Feeds of up to FEED_SHARED_DEPTH rows (limit + offset) can share their followees' scans (b_feed_scan);
+  # the rest go per viewer (b_feed). Off by default: on the full seed the shared scan cost Postgres twice as
+  # much (12.8 s against 6.4 s at the same load), because it counts each followee up to 1,000 where the
+  # per-viewer count stops at 1,000 in total, and per-worker batches rarely share followees. Worth another
+  # look with batches shared by all workers and a count that stops at 1,000 per viewer.
+  FEED_SHARED_DEPTH = Integer(ENV.fetch("FEED_SHARED_DEPTH", "0"))
 
   def plan_feed(requests, statements)
     return unless requests
