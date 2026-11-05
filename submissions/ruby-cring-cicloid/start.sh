@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Runs the server in the foreground. Config: DATABASE_URL, JWT_SECRET, HOST, PORT.
-# Optional: WORKERS (default: cores), PG_CONNECTIONS per worker (default 1), CONNECTIONS=epoll.
+# Optional knobs (README): WORKERS (default 3/4 of the cores), PG_CONNECTIONS per worker (default 2),
+# READ_WINDOW_MS, READ_LANES, READ_MAX, BCRYPT_THREADS, PLANNERS, CONNECTIONS=epoll.
 set -euo pipefail
 cd "$(dirname "$0")"
 ulimit -Sn "$(ulimit -Hn)" 2>/dev/null || true
