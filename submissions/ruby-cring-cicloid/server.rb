@@ -89,10 +89,11 @@ def warm_up_in(task)
   end
 end
 
-# Our processes yield to Postgres: a worker at WORKER_NICE (default 5) lets Postgres run first, so batches
-# come back sooner and fill fuller; the master, which only runs bcrypt, at MASTER_NICE (default 10), so a
-# login never delays a request. Raising one's own niceness needs no privilege.
-WORKER_NICE = Integer(ENV.fetch("WORKER_NICE", "5"))
+# The master, which only runs bcrypt, runs at MASTER_NICE (default 10), so a login never delays a request.
+# Workers at nice 5 (as some C/Rust entries run theirs) were slower here: at 52,000 users on the rig p95 was
+# 608 ms against 544 ms at 0, and 501 ms with only the master at 10. Raising one's own niceness needs no
+# privilege.
+WORKER_NICE = Integer(ENV.fetch("WORKER_NICE", "0"))
 MASTER_NICE = Integer(ENV.fetch("MASTER_NICE", "10"))
 
 def serve(index, bcrypt, planners)
