@@ -12,7 +12,18 @@ defmodule Conduit.Handler do
     # The hot reads render their JSON in C straight from the raw rows (Conduit.Render.Nif); RENDER_NIF=0 renders
     # them here instead (the reference the NIF's output is checked against byte for byte).
     :persistent_term.put({__MODULE__, :render_nif}, System.get_env("RENDER_NIF", "1") != "0")
+    :persistent_term.put({__MODULE__, :plan}, plan_enabled?())
+
+    # tags and profiles through read plans too (Conduit.Plan's small reads); PLAN_SMALL=0: their own statements
+    :persistent_term.put(
+      {__MODULE__, :plan_small},
+      plan_enabled?() and System.get_env("PLAN_SMALL", "1") != "0"
+    )
   end
+
+  @doc "Whether the article reads go through read plans (PLAN, with the NIF renderer, which renders their rows)."
+  def plan_enabled?,
+    do: System.get_env("PLAN", "1") != "0" and System.get_env("RENDER_NIF", "1") != "0"
 
   defp nif?, do: :persistent_term.get({__MODULE__, :render_nif})
 
@@ -67,12 +78,10 @@ defmodule Conduit.Handler do
   # ------------------------------------------------------------------ routes
 
   defp route(:GET, ["tags"], _r) do
-    if nif?() do
-      [row] = Db.read_raw(:tags, [])
-      {200, Render.tags(row)}
-    else
-      [[names]] = Db.read(:tags, [])
-      {200, ["{\"tags\":[", names |> Enum.map(&Json.str/1) |> Enum.intersperse(?,), "]}"]}
+    cond do
+      plan_small?() -> {200, Conduit.Plan.body(:tags, [])}
+      nif?() -> tags_nif()
+      true -> tags_erlang()
     end
   end
 
@@ -97,15 +106,13 @@ defmodule Conduit.Handler do
     u = segment!(u)
     viewer = optional(r)
 
-    case if(nif?(), do: Db.read_raw(:profile, [viewer, u]), else: Db.read(:profile, [viewer, u])) do
-      [row] when is_binary(row) ->
-        {200, Render.profile(row)}
-
-      [[_id, username, bio, image, following]] ->
-        {200, ["{\"profile\":", profile(username, bio, image, following), "}"]}
-
-      _ ->
-        fail(404, "profile not found")
+    if plan_small?() do
+      case Conduit.Plan.body(:profile, [viewer, u]) do
+        nil -> fail(404, "profile not found")
+        body -> {200, body}
+      end
+    else
+      profile_direct(viewer, u)
     end
   end
 
@@ -131,10 +138,15 @@ defmodule Conduit.Handler do
     slug = segment!(slug)
     viewer = optional(r)
 
-    case if(nif?(),
-           do: Db.read_raw(:article_by_slug, [viewer, slug]),
-           else: Db.read(:article_by_slug, [viewer, slug])
-         ) do
+    rows =
+      cond do
+        plan?() -> planned(:article_by_slug, [viewer, slug])
+        nif?() -> Db.read_raw(:article_by_slug, [viewer, slug])
+        true -> Db.read(:article_by_slug, [viewer, slug])
+      end
+
+    case rows do
+      {:body, body} -> {200, body}
       [row] when is_binary(row) -> {200, Render.article(row)}
       [row] -> {200, ["{\"article\":", full_article(row), "}"]}
       _ -> fail(404, "article not found")
@@ -167,10 +179,17 @@ defmodule Conduit.Handler do
     slug = segment!(slug)
     viewer = optional(r)
 
-    case if(nif?(),
-           do: Db.read_raw(:comments, [viewer, slug]),
-           else: Db.read(:comments, [viewer, slug])
-         ) do
+    rows =
+      cond do
+        plan?() -> planned(:comments, [viewer, slug])
+        nif?() -> Db.read_raw(:comments, [viewer, slug])
+        true -> Db.read(:comments, [viewer, slug])
+      end
+
+    case rows do
+      {:body, body} ->
+        {200, body}
+
       [] ->
         fail(404, "article not found")
 
@@ -312,7 +331,7 @@ defmodule Conduit.Handler do
     case extra do
       [v] when is_binary(v) ->
         # Postgres text can't hold NUL, so no tag or user can match.
-        if :binary.match(v, <<0>>) != :nomatch do
+        if Conduit.Util.nul?(v) do
           {200, "{\"articles\":[],\"articlesCount\":0}"}
         else
           list_response(stmt, [viewer, limit, offset | extra])
@@ -331,9 +350,46 @@ defmodule Conduit.Handler do
   end
 
   defp list_response(stmt, params) do
-    if nif?(),
-      do: {200, Render.list(Db.read_raw(stmt, params))},
-      else: article_list(Db.read(stmt, params))
+    cond do
+      plan?() -> {200, Conduit.Plan.body(stmt, params)}
+      nif?() -> {200, Render.list(Db.read_raw(stmt, params))}
+      true -> article_list(Db.read(stmt, params))
+    end
+  end
+
+  # The article reads go through read plans when they're on (Conduit.Plan): the same bytes either way.
+  defp plan?, do: :persistent_term.get({__MODULE__, :plan})
+  defp plan_small?, do: :persistent_term.get({__MODULE__, :plan_small})
+
+  defp tags_nif do
+    [row] = Db.read_raw(:tags, [])
+    {200, Render.tags(row)}
+  end
+
+  defp tags_erlang do
+    [[names]] = Db.read(:tags, [])
+    {200, ["{\"tags\":[", names |> Enum.map(&Json.str/1) |> Enum.intersperse(?,), "]}"]}
+  end
+
+  defp profile_direct(viewer, u) do
+    case if(nif?(), do: Db.read_raw(:profile, [viewer, u]), else: Db.read(:profile, [viewer, u])) do
+      [row] when is_binary(row) ->
+        {200, Render.profile(row)}
+
+      [[_id, username, bio, image, following]] ->
+        {200, ["{\"profile\":", profile(username, bio, image, following), "}"]}
+
+      _ ->
+        fail(404, "profile not found")
+    end
+  end
+
+  # A read plan's body, or [] (no rows: 404) for a missing article.
+  defp planned(kind, params) do
+    case Conduit.Plan.body(kind, params) do
+      nil -> []
+      body -> {:body, body}
+    end
   end
 
   defp page!(q) do
@@ -477,7 +533,7 @@ defmodule Conduit.Handler do
     end
   end
 
-  defp clean?(s), do: :binary.match(s, <<0>>) == :nomatch and String.valid?(s)
+  defp clean?(s), do: not Conduit.Util.nul?(s) and String.valid?(s)
 
   defp req_str!(obj, key, msg) do
     case Map.get(obj, key) do

@@ -8,9 +8,21 @@ defmodule Conduit.Pg.Conn do
   # written at once. Otherwise it waits here, and when a round completes everything waiting goes out as the next round.
   # In a round, single-statement requests for the same batchable statement become one execution of its batched
   # variant: their parameters as arrays, one row set back, split by request ordinal (`r.i`). So batches form only
-  # under load, and grow with it, with no timer.
+  # under load, and grow with it.
+  #
+  # Gather window (`gather` ms; 0 = off): a free round slot doesn't send at once, but waits until the oldest waiting
+  # request has waited that long (or `gather_max` are waiting), so rounds hold more requests to batch (reads) or to
+  # commit together (writes, with `group`). Under a backlog the oldest has already waited that long when a round
+  # completes, and nothing waits.
   #
   # A batch that fails (one bad parameter fails the whole statement) is retried as separate requests.
+  #
+  # Group commit (`group`, write connections): in a round, the requests made only of statements in @groupable go out
+  # under one Sync, so they are one implicit transaction with one commit (one WAL flush) instead of one each. Each
+  # is answered with its own items' results after the ReadyForQuery, i.e. once committed. These statements raise no
+  # errors of their own (conflicts are DO NOTHING, a missing row is no row), and they only lock rows of their own
+  # user, whose requests come one at a time, so groups don't wait on each other. If a group fails anyway, nothing of
+  # it committed, and its requests are retried each on its own Sync.
 
   alias Conduit.Pg.{Proto, Scram}
   require Logger
@@ -28,6 +40,8 @@ defmodule Conduit.Pg.Conn do
 
   # parameter type of a single statement -> element type of the batched variant's array parameter
   @array_elem %{20 => "int8", 23 => "int4", 21 => "int2", 25 => "text", 1043 => "varchar"}
+
+  @groupable [:favorite, :unfavorite, :follow, :unfollow, :comment_create]
 
   def child_spec({name, slot, counters, opts}) do
     %{
@@ -56,8 +70,14 @@ defmodule Conduit.Pg.Conn do
       cur: nil,
       q: :queue.new(),
       held: [],
+      held_n: 0,
+      held_since: 0,
+      gather: Map.get(opts, :gather, 0),
+      gather_max: Map.get(opts, :gather_max, 1024),
+      timer: false,
       inflight: 0,
-      depth: Map.get(opts, :depth, 2)
+      depth: Map.get(opts, :depth, 2),
+      group: Map.get(opts, :group, false)
     })
   end
 
@@ -68,19 +88,45 @@ defmodule Conduit.Pg.Conn do
   defp loop(s) do
     receive do
       {:tcp, _, data} -> loop(pump(recv(s, data)))
-      {:q, _, _, _} = req -> loop(pump(%{s | held: [req | s.held]}))
+      {:q, _, _, _} = req -> loop(pump(hold(s, req)))
+      :gather -> loop(pump(%{s | timer: false}))
       {:tcp_closed, _} -> exit(:pg_closed)
       {:tcp_error, _, reason} -> exit({:pg_tcp_error, reason})
     end
   end
 
-  # Everything held goes out as one round, in one socket write, if a round slot is free.
+  defp hold(%{held: []} = s, req),
+    do: %{s | held: [req], held_n: 1, held_since: :erlang.monotonic_time(:millisecond)}
+
+  defp hold(s, req), do: %{s | held: [req | s.held], held_n: s.held_n + 1}
+
+  # Everything held goes out as one round, in one socket write, if a round slot is free (and, with a gather window,
+  # once the oldest held request has waited it out).
   defp pump(%{held: []} = s), do: s
   defp pump(%{inflight: n, depth: d} = s) when n >= d, do: s
 
-  defp pump(s) do
+  defp pump(%{gather: g, held_n: n, gather_max: max} = s) when g > 0 and n < max do
+    left = s.held_since + g - :erlang.monotonic_time(:millisecond)
+
+    cond do
+      left <= 0 ->
+        send_round(s)
+
+      s.timer ->
+        s
+
+      true ->
+        :erlang.send_after(left, self(), :gather)
+        %{s | timer: true}
+    end
+  end
+
+  defp pump(s), do: send_round(s)
+
+  defp send_round(s) do
     entries = group(:lists.reverse(s.held), s.batches, [], %{})
-    {io, s} = encode(entries, %{s | held: [], inflight: s.inflight + 1}, [])
+    entries = if s.group, do: commit_group(entries), else: entries
+    {io, s} = encode(entries, %{s | held: [], held_n: 0, inflight: s.inflight + 1}, [])
 
     case :gen_tcp.send(s.sock, io) do
       :ok -> s
@@ -102,6 +148,19 @@ defmodule Conduit.Pg.Conn do
       {id, reqs}, acc -> [{:many, id, :lists.reverse(reqs)} | acc]
     end)
   end
+
+  # The groupable requests of a round (2 or more) -> one {:group, reqs} entry, after the others.
+  defp commit_group(entries) do
+    case Enum.split_with(entries, &groupable?/1) do
+      {[_, _ | _] = grouped, others} -> others ++ [{:group, Enum.map(grouped, &elem(&1, 1))}]
+      _ -> entries
+    end
+  end
+
+  defp groupable?({:one, {:q, _, _, items}}),
+    do: Enum.all?(items, fn {id, _} -> id in @groupable end)
+
+  defp groupable?(_), do: false
 
   defp encode([], s, io), do: {io, s}
 
@@ -126,6 +185,17 @@ defmodule Conduit.Pg.Conn do
       end
 
     {Proto.bind_execute(name_z, param_oids, params), {{:many, reqs}, last?, [col_oids]}}
+  end
+
+  # every request's items in a row, one Sync after them all (encode/3); each request with its item count
+  defp entry({:group, reqs}, s, last?) do
+    {msgs, cols, counts} =
+      Enum.reduce(reqs, {[], [], []}, fn {:q, _, _, items} = req, {msgs, cols, counts} ->
+        {m, c} = items(items, s.stmts, [], [])
+        {[msgs, m], [c | cols], [{req, length(items)} | counts]}
+      end)
+
+    {msgs, {{:group, :lists.reverse(counts)}, last?, cols |> :lists.reverse() |> Enum.concat()}}
   end
 
   defp one(to, slot, items, s, last?) do
@@ -201,6 +271,27 @@ defmodule Conduit.Pg.Conn do
     s
   end
 
+  # A committed group: each request gets its own items' results.
+  defp answer({:group, counts}, res, nil, s) do
+    Enum.reduce(counts, res, fn {{:q, to, slot, _}, n}, res ->
+      {mine, rest} = Enum.split(res, n)
+      send(to, {to, {:ok, mine}})
+      :atomics.sub(s.counters, slot, 1)
+      rest
+    end)
+
+    s
+  end
+
+  # A failed group committed nothing: each request again, on its own Sync.
+  defp answer({:group, counts}, _res, err, s) do
+    Logger.warning(
+      "group of #{length(counts)} writes failed (#{inspect(err)}): retrying one by one"
+    )
+
+    retry(for({req, _} <- counts, do: req), s)
+  end
+
   # Every row starts with the request's ordinal `r.i` (int8, never NULL): route by it, strip it. Enum.group_by keeps
   # each request's rows in their order.
   defp answer({:many, reqs}, [{[_i | oids], rows}], nil, s) do
@@ -221,12 +312,24 @@ defmodule Conduit.Pg.Conn do
 
   defp answer({:many, reqs}, _res, err, s) do
     Logger.warning("batch of #{length(reqs)} failed (#{inspect(err)}): retrying one by one")
+    retry(reqs, s)
+  end
+
+  # Requests held again, each to go out alone (never batched or grouped again).
+  defp retry(reqs, s) do
+    # they have waited already: back-dated, so that a gather window doesn't hold them again
+    since =
+      if s.held == [],
+        do: :erlang.monotonic_time(:millisecond) - s.gather,
+        else: s.held_since
 
     %{
       s
       | held:
           Enum.map(reqs, fn {:q, to, slot, items} -> {:q, to, slot, items, :nobatch} end) ++
-            s.held
+            s.held,
+        held_n: s.held_n + length(reqs),
+        held_since: since
     }
   end
 
