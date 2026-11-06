@@ -145,8 +145,14 @@ impl Sched {
                     }
                 }
             }
-            if let Some((_, c)) = pick {
+            if let Some((head, c)) = pick {
+                let k = &crate::stats::CLASS[c];
+                crate::stats::max(&k.max_queue, g.q[c].len() as u64);
+                crate::stats::max(&k.max_active, g.active as u64 + 1);
+                k.head_wait_ns.fetch_add(now.saturating_duration_since(head).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 let n = g.q[c].len().min(cfg.max_batch);
+                k.batches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                k.jobs.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                 out.extend(g.q[c].drain(..n).map(|(_, j)| j));
                 g.inflight[c] += 1;
                 g.active += 1;

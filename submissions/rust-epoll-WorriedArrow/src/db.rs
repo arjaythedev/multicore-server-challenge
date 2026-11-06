@@ -1520,7 +1520,12 @@ impl WriteLane {
                 None => 5,
             });
             let batch = std::mem::take(&mut jobs);
-            if let Err((e, left)) = self.group(batch) {
+            let t0 = std::time::Instant::now();
+            crate::stats::WRITE_GROUPS.fetch_add(1, Relaxed);
+            crate::stats::WRITES.fetch_add(batch.len() as u64, Relaxed);
+            let r = self.group(batch);
+            crate::stats::WRITE_NS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+            if let Err((e, left)) = r {
                 eprintln!("write batch failed: {e}");
                 self.conn = None;
                 // Never retry a write whose commit outcome is unknown.
@@ -1790,6 +1795,7 @@ pub fn bcrypt_rescue(s: &'static Settings) {
 }
 
 fn run_bcrypt(jobs: Vec<BcryptJob>, s: &Settings, cost: u32) {
+    crate::stats::HASHES.fetch_add(jobs.len() as u64, Relaxed);
     // A login whose client hung up isn't worth a hash.
     let (jobs, gone): (Vec<BcryptJob>, Vec<BcryptJob>) =
         jobs.into_iter().partition(|j| !matches!(j, BcryptJob::Verify { to, .. } if !reply::alive(*to)));

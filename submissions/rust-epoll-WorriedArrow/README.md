@@ -91,11 +91,8 @@ on x86-64 with BMI1/BMI2 the cost loop can run a generated assembly expand0 (`bu
 from one base register, in three styles of S-box index extraction (`shrx`, without the `bextr` Intel cores split in
 two micro-ops, is nick-potts's). At startup the server times each kernel (that one in all three styles, and the
 plain Rust one) at widths 1 to 6 on throwaway keys at a low cost and keeps the fastest per hash. One worker waits up to 400 ms for its lanes to fill; a second
-worker only takes full sets, so a steady trickle of logins isn't split into half-empty runs. The hashers run at nice 19:
-logins are a thousandth of the requests but about a tenth of the box's CPU, and at normal priority that tenth comes out
-of the Postgres backends exactly when the box is full. A thread at normal priority hashes whatever has waited a second,
-so a login still finishes when there is no idle time at all. Every hash still does all 2^10 rounds; logins always verify
-against the stored hash.
+worker only takes full sets, so a steady trickle of logins isn't split into half-empty runs. Every hash still does all
+2^10 rounds; logins always verify against the stored hash.
 
 **Postgres session settings** (startup parameters on its own connections, nothing server-wide):
 `plan_cache_mode = force_generic_plan`, because with the default the array-parameter statements were re-planned on
@@ -139,6 +136,7 @@ Defaults suit the 8-vCPU box; all are optional environment variables.
 |---|---|---|
 | `IO_THREADS` | cores / 2 | epoll threads |
 | `READ_LANES` | cores + 2 | read lanes, each a thread and a connection; a lane gives its slot back once Postgres is done with its batch, so two more than the slots keep them busy |
+| `STATS` | 1 | every 10 s to stderr: the box's CPU (busy, softirq, steal), the server's cores, each IO thread's busy share, each read class's batches, sizes, oldest wait, queue and in-flight peaks, and write groups |
 | `BATCH_STATS` | 0 | 1: every 10 s, per class, batches, requests per batch and the time spent in phase A, phase B and rendering |
 | `FEED_CONN` | 1 | 1: each read lane runs its batch's feed statement on a second connection, alongside the rest of phase A |
 | `CLASS_LANES` | 1 | 1: reads queue by class (feeds, comment threads, the rest), each class a batch at most every gap; 0: one pool |
@@ -149,7 +147,7 @@ Defaults suit the 8-vCPU box; all are optional environment variables.
 | `GAP_MIN_US` | 5000 | least time a read waits before its batch starts |
 | `READ_ACTIVE` | cores - 1 | most read batches running at once (per class 3/8, 3/8, 1/4 of the lanes, plus one for the class waiting longest) |
 | `LOOP_NICE` | 5 | nice value of the event loop threads |
-| `BCRYPT_NICE` | 10 | with `BCRYPT_IDLE=0`, nice value of the hashing threads after the first |
+| `BCRYPT_NICE` | 10 | nice value of the hashing threads after the first |
 | `WRITE_LANES` | 1 | group-commit connections |
 | `BCRYPT_THREADS` | 2 | bcrypt threads (the first gathers, the rest take full sets) |
 | `BCRYPT_LANES` | measured | hashes run in lockstep (1 to 6; by default timed at startup) |
@@ -159,7 +157,7 @@ Defaults suit the 8-vCPU box; all are optional environment variables.
 | `READ_MIN` | 4096 | a batch is taken early once this many (or the recent average, if larger) are waiting |
 | `READ_BATCH`, `WRITE_BATCH` | 2048, 256 | batch size caps |
 | `WRITE_WINDOW_US` | 3000 | how long a write waits for others to share its group |
-| `BCRYPT_IDLE` | 1 | 1: hashing threads at nice 19, plus a normal-priority thread for logins waiting `BCRYPT_RESCUE_MS`; 0: the first hasher at nice 0, the rest at `BCRYPT_NICE` |
+| `BCRYPT_IDLE` | 0 | 1: hashing threads at nice 19, plus a normal-priority thread for logins waiting `BCRYPT_RESCUE_MS` |
 | `BCRYPT_RESCUE_MS` | 1000 | with `BCRYPT_IDLE`, how long a login waits before the normal-priority thread hashes it (0: no such thread) |
 | `ACK_DELAY` | 0 | 1: leave TCP quick-ack mode after each response (off by default: at high load most replies miss the delayed-ACK window anyway) |
 | `PRIVATE_FDS` | 1 | a descriptor table per IO thread |
