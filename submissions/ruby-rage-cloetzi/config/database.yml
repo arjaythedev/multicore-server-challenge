@@ -1,0 +1,15 @@
+# Rage merges DATABASE_URL into this. One pool per Iodine worker process: start.sh sizes DB_POOL so that
+# workers x DB_POOL stays within the box's 95-connection budget; a request holds one connection for its duration.
+default: &default
+  adapter: postgresql
+  max_connections: <%= ENV.fetch("DB_POOL", 5) %>
+  checkout_timeout: 10
+  prepared_statements: true
+  # No request here runs the same SELECT twice, so the per-request query cache would only spend CPU on keys.
+  query_cache: false
+
+development:
+  <<: *default
+
+production:
+  <<: *default
