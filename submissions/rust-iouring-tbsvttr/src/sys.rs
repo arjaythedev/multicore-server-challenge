@@ -214,6 +214,29 @@ unsafe extern "C" {
     pub fn sched_setscheduler(pid: c_int, policy: c_int, param: *const sched_param) -> c_int;
     #[cfg(target_os = "linux")]
     pub fn unshare(flags: c_int) -> c_int;
+    #[cfg(target_os = "linux")]
+    pub fn prctl(
+        option: c_int,
+        arg2: c_long,
+        arg3: c_long,
+        arg4: c_long,
+        arg5: c_long,
+    ) -> c_int;
+    #[cfg(target_os = "linux")]
+    pub fn mallopt(param: c_int, value: c_int) -> c_int;
+}
+
+/// Disables Transparent Huge Pages (`PR_SET_THP_DISABLE`) and caps glibc malloc arenas (`M_ARENA_MAX = 4`)
+/// to prevent kernel THP compaction stalls and per-thread arena fragmentation under high load.
+#[inline]
+pub fn tune_process_memory() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        const PR_SET_THP_DISABLE: c_int = 41;
+        const M_ARENA_MAX: c_int = -8;
+        let _ = prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+        let _ = mallopt(M_ARENA_MAX, 4);
+    }
 }
 
 /// Isolates the calling thread's file descriptor table (`CLONE_FILES`) so socket

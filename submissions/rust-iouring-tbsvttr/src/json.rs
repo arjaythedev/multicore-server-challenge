@@ -179,10 +179,11 @@ pub fn decode_string(p: &[u8], mut i: usize, stop: usize, out: &mut Vec<u8>) -> 
 }
 
 fn key_equals(p: &[u8], i: usize, stop: usize, key: &[u8], scratch: &mut Vec<u8>) -> bool {
-    if p.get(i..i + 1 + key.len() + 1)
-        .is_some_and(|s| s[0] == b'"' && &s[1..1 + key.len()] == key && s[1 + key.len()] == b'"')
-    {
+    if stop >= i + 2 && &p[i + 1..stop - 1] == key {
         return true;
+    }
+    if stop < i + 2 || !p[i + 1..stop - 1].contains(&b'\\') {
+        return false;
     }
     decode_string(p, i, stop, scratch).is_some() && scratch.as_slice() == key
 }

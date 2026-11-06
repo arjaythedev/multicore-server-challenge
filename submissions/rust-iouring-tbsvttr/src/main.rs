@@ -15,7 +15,8 @@ use crate::jwt::JwtKey;
 use crate::pg::DbUrl;
 use crate::server::{BcryptPool, DbEngine, DbInbox, Worker, WorkerInbox, build_statements};
 use crate::sys::{
-    open_listener, raise_nofile_limit, resolve_ipv4, set_sched_batch, unshare_files, usable_cpus,
+    open_listener, raise_nofile_limit, resolve_ipv4, set_sched_batch, tune_process_memory,
+    unshare_files, usable_cpus,
 };
 
 fn env_str(name: &str, default: &str) -> String {
@@ -47,6 +48,7 @@ fn main() {
     unsafe {
         crate::sys::signal(crate::sys::SIGPIPE, crate::sys::SIG_IGN);
     }
+    tune_process_memory();
     raise_nofile_limit();
     if env_i64("SCHED_BATCH", 1) != 0 {
         set_sched_batch(0);
@@ -76,9 +78,9 @@ fn main() {
         extra_port_str.parse::<u16>().ok()
     };
 
-    let batch_us = env_i64("BATCH_US", 2000).max(0) as u32;
+    let batch_us = env_i64("BATCH_US", 0).max(0) as u32;
     let quickack = env_i64("QUICKACK", 0) != 0;
-    let quickack_ms = env_i64("QUICKACK_MS", 25);
+    let quickack_ms = env_i64("QUICKACK_MS", 0);
     let defer_accept = env_i64("DEFER_ACCEPT", 1) as i32;
 
     let cpus = usable_cpus().max(1);
@@ -89,24 +91,27 @@ fn main() {
     workers = workers.min(64);
 
     let pool_size = env_i64("DB_POOL", 16).clamp(1, 95) as usize;
-    let batch_inflight = env_i64("BATCH_INFLIGHT", 3).max(1) as i32;
-    let batch_ms = env_i64("BATCH_MS", 50).max(0);
-    let batch_slow_ms = env_i64("BATCH_SLOW_MS", 70).max(0);
-    let batch_max = env_i64("BATCH_MAX", 4000).max(1) as usize;
+    let batch_inflight = env_i64("BATCH_INFLIGHT", 4).max(1) as i32;
+    let batch_ms = env_i64("BATCH_MS", 48).max(0);
+    let batch_slow_ms = env_i64("BATCH_SLOW_MS", 64).max(0);
+    let batch_max = env_i64("BATCH_MAX", 1024).max(1) as usize;
 
     let mut helpers = env_i64("BCRYPT_HELPERS", 0) as usize;
     if helpers < 1 {
-        helpers = (cpus / 2).max(2);
+        helpers = cpus.max(4);
     }
     let mut lanes = env_i64("BCRYPT_LANES", 0) as usize;
     if !(1..=BCRYPT_LANES).contains(&lanes) {
         lanes = calibrate_lanes();
     }
-    let wait_ms = env_i64("BCRYPT_WAIT_MS", 300).max(0);
+    let wait_ms = env_i64("BCRYPT_WAIT_MS", 4).max(0);
 
     let mut worker_inboxes = Vec::with_capacity(workers);
     for _ in 0..workers {
-        worker_inboxes.push(Arc::new(WorkerInbox::new(create_eventfd())));
+        worker_inboxes.push(Arc::new(WorkerInbox {
+            event_fd: create_eventfd(),
+            queue: Mutex::new(Vec::with_capacity(512)),
+        }));
     }
     let worker_inboxes = Arc::new(worker_inboxes);
 
@@ -152,7 +157,7 @@ fn main() {
         let b_pool = Arc::clone(&bcrypt_pool);
         std::thread::spawn(move || {
             unshare_files();
-            set_sched_batch(5);
+            set_sched_batch(0);
             let mut worker = Worker::new(
                 wid,
                 fd_a,
@@ -424,7 +429,10 @@ mod tests {
             }
         });
 
-        let w_inbox = Arc::new(WorkerInbox::new(-1));
+        let w_inbox = Arc::new(WorkerInbox {
+            event_fd: -1,
+            queue: Mutex::new(Vec::new()),
+        });
         let workers = Arc::new(vec![Arc::clone(&w_inbox)]);
         let db_inbox = Arc::new(DbInbox {
             event_fd: -1,
@@ -450,8 +458,12 @@ mod tests {
                 client_tag: 101,
                 job: Job::ListGlobal,
                 close_after: false,
+                key_len: 0,
+                limit: 20,
+                offset: 0,
                 viewer: 1,
                 nparams: 0,
+                key_inline: [0u8; 80],
                 params: Vec::new(),
                 token: Vec::new(),
             },
@@ -460,8 +472,12 @@ mod tests {
                 client_tag: 102,
                 job: Job::Article,
                 close_after: false,
+                key_len: 0,
+                limit: 0,
+                offset: 0,
                 viewer: 1,
                 nparams: 0,
+                key_inline: [0u8; 80],
                 params: Vec::new(),
                 token: Vec::new(),
             },
@@ -485,6 +501,60 @@ mod tests {
             assert!(s.ends_with(
                 r#"{"article":{"slug":"hello-99","title":"Hello","description":"Desc","body":"Body","createdAt":"2000-01-01T00:00:00.000Z","updatedAt":"2000-01-01T00:00:00.000Z","tagList":["async","rust"],"favoritesCount":5,"favorited":false,"author":{"username":"alice","bio":"hacker","image":null,"following":true}}}"#
             ), "unexpected article response: {s}");
+        } else {
+            panic!("expected Http response");
+        }
+        drop(msgs);
+        w_inbox.queue.lock().unwrap().clear();
+
+        // Test comments_finish with 2-branch s19 output (k=0 comment with inline author, k=1 request)
+        let mut cm = Vec::new();
+        wrap_datarow(&mut cm, 11, |r| {
+            push_col_i64(r, 0); // k = 0
+            push_col_i64(r, 99); // aid = 99
+            push_col_null(r); // fols = NULL
+            push_col_i64(r, 501); // id = 501
+            push_col_text(r, b"great post!"); // body
+            push_col_i64(r, 0); // created_at
+            push_col_i64(r, 0); // updated_at
+            push_col_i64(r, 7); // author_id = 7
+            push_col_text(r, b"alice"); // username
+            push_col_text(r, b"hacker"); // bio
+            push_col_null(r); // image
+        });
+        wrap_datarow(&mut cm, 11, |r| {
+            push_col_i64(r, 1); // k = 1
+            push_col_i64(r, 99); // aid = 99
+            push_col_i64_array(r, &[7, 12]); // fols
+            for _ in 0..8 {
+                push_col_null(r);
+            }
+        });
+        let ctasks = vec![DbTask {
+            worker_id: 0,
+            client_tag: 201,
+            job: Job::Comments,
+            close_after: false,
+            key_len: 0,
+            limit: 0,
+            offset: 0,
+            viewer: 1,
+            nparams: 0,
+            key_inline: [0u8; 80],
+            params: Vec::new(),
+            token: Vec::new(),
+        }];
+        engine.test_comments_finish(&ctasks, &cm);
+        let cmsgs = w_inbox.queue.lock().unwrap();
+        assert_eq!(cmsgs.len(), 1);
+        if let WorkerMsg::Http { response, .. } = &cmsgs[0] {
+            let s = std::str::from_utf8(response).unwrap();
+            assert!(
+                s.ends_with(
+                    r#"{"comments":[{"id":501,"createdAt":"2000-01-01T00:00:00.000Z","updatedAt":"2000-01-01T00:00:00.000Z","body":"great post!","author":{"username":"alice","bio":"hacker","image":null,"following":true}}]}"#
+                ),
+                "unexpected comments response: {s}"
+            );
         } else {
             panic!("expected Http response");
         }
