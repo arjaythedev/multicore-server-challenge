@@ -38,14 +38,23 @@ unsafe extern "C" {
     fn bc_expand0_bextr_6(s: *mut State);
     fn bc_expand0_bextr_7(s: *mut State);
     fn bc_expand0_bextr_8(s: *mut State);
+    fn bc_expand0_shrx_1(s: *mut State);
+    fn bc_expand0_shrx_2(s: *mut State);
+    fn bc_expand0_shrx_3(s: *mut State);
+    fn bc_expand0_shrx_4(s: *mut State);
+    fn bc_expand0_shrx_5(s: *mut State);
+    fn bc_expand0_shrx_6(s: *mut State);
+    fn bc_expand0_shrx_7(s: *mut State);
+    fn bc_expand0_shrx_8(s: *mut State);
 }
 
-/// Which expand0 the cost loop runs: the Rust one, or a generated kernel in one of its two index styles.
+/// Which expand0 the cost loop runs: the Rust one, or a generated kernel in one of its three index styles.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Kernel {
     Rust = 0,
     Ah = 1,
     Bextr = 2,
+    Shrx = 3,
 }
 
 static KERNEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -54,6 +63,7 @@ fn kernel() -> Kernel {
     match KERNEL.load(std::sync::atomic::Ordering::Relaxed) {
         1 => Kernel::Ah,
         2 => Kernel::Bextr,
+        3 => Kernel::Shrx,
         _ => Kernel::Rust,
     }
 }
@@ -62,7 +72,7 @@ fn kernel() -> Kernel {
 pub fn kernels() -> Vec<Kernel> {
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("bmi1") && std::arch::is_x86_feature_detected!("bmi2") {
-        return vec![Kernel::Rust, Kernel::Ah, Kernel::Bextr];
+        return vec![Kernel::Rust, Kernel::Ah, Kernel::Bextr, Kernel::Shrx];
     }
     vec![Kernel::Rust]
 }
@@ -81,7 +91,21 @@ fn asm_expand0(k: Kernel, lanes: &mut [State]) {
         bc_expand0_bextr_7,
         bc_expand0_bextr_8,
     ];
-    let f = if k == Kernel::Ah { AH[lanes.len() - 1] } else { BX[lanes.len() - 1] };
+    const SX: [F; 8] = [
+        bc_expand0_shrx_1,
+        bc_expand0_shrx_2,
+        bc_expand0_shrx_3,
+        bc_expand0_shrx_4,
+        bc_expand0_shrx_5,
+        bc_expand0_shrx_6,
+        bc_expand0_shrx_7,
+        bc_expand0_shrx_8,
+    ];
+    let f = match k {
+        Kernel::Ah => AH[lanes.len() - 1],
+        Kernel::Shrx => SX[lanes.len() - 1],
+        _ => BX[lanes.len() - 1],
+    };
     // SAFETY: the lanes are contiguous repr(C) States of 1042 words (the kernel's stride), and `kernels()` checked
     // for the BMI1/BMI2 instructions the kernel uses.
     unsafe { f(lanes.as_mut_ptr()) }
@@ -234,7 +258,7 @@ fn raw_with<const N: usize>(jobs: &[Job; N], cost: u32, k: Kernel) -> [[u8; 23];
     let rounds = 1u64 << cost;
     match k {
         #[cfg(target_arch = "x86_64")]
-        Kernel::Ah | Kernel::Bextr => {
+        Kernel::Ah | Kernel::Bextr | Kernel::Shrx => {
             for _ in 0..rounds {
                 for xor in [&kp, &sp] {
                     for (st, w) in lanes.iter_mut().zip(xor.iter()) {

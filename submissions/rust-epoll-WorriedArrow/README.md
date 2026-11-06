@@ -33,7 +33,7 @@ shared queue, of every endpoint, and answers the whole batch in two pipelined ro
    ids, favorite count and the author's profile in one statement. The newest articles show up in global lists, tag
    pages, feeds and article pages at the same time, and are enriched once per batch instead of once per request.
    The per-viewer `favorited` / `following` flags are one primary-key range scan per viewer (`= ANY(...)`) instead
-   of a probe per article.
+   of a probe per article; the server groups the pairs by viewer and sends each viewer's slice of one target array.
 
 Phase A sends a first `Sync` after the tag list, current-user and login lookups, so those requests (about a quarter
 of all traffic) are answered, or handed to bcrypt, before the rest of the batch and its phase B; every tag-list
@@ -88,8 +88,9 @@ unfavorites, follows, unfollows and new comments in a group are put next to thei
 loads, and interleaving independent hashes lets the core overlap them. How many lanes pay off depends on the CPU
 (its L1 and registers hold a few 4 KB S-box sets, not many). The lanes' states sit next to each other in memory, and
 on x86-64 with BMI1/BMI2 the cost loop can run a generated assembly expand0 (`build.rs`) that reaches every lane
-from one base register, in two styles of S-box index extraction. At startup the server times each kernel (that one in
-both styles, and the plain Rust one) at widths 1 to 6 on throwaway keys at a low cost and keeps the fastest per hash. One worker waits up to 400 ms for its lanes to fill; a second
+from one base register, in three styles of S-box index extraction (`shrx`, without the `bextr` Intel cores split in
+two micro-ops, is nick-potts's). At startup the server times each kernel (that one in all three styles, and the
+plain Rust one) at widths 1 to 6 on throwaway keys at a low cost and keeps the fastest per hash. One worker waits up to 400 ms for its lanes to fill; a second
 worker only takes full sets, so a steady trickle of logins isn't split into half-empty runs. Every hash still does all
 2^10 rounds; logins always verify against the stored hash.
 
@@ -134,7 +135,9 @@ Defaults suit the 8-vCPU box; all are optional environment variables.
 | Variable | Default | |
 |---|---|---|
 | `IO_THREADS` | cores / 2 | epoll threads |
-| `READ_LANES` | cores | read connections |
+| `READ_LANES` | cores + 2 | read lanes, each a thread and a connection; a lane gives its slot back once Postgres is done with its batch, so two more than the slots keep them busy |
+| `STATS` | 1 | every 10 s to stderr: the box's CPU (busy, softirq, steal), the server's cores, each IO thread's busy share, each read class's batches, sizes, oldest wait, queue and in-flight peaks, and write groups |
+| `BATCH_STATS` | 0 | 1: every 10 s, per class, batches, requests per batch and the time spent in phase A, phase B and rendering |
 | `FEED_CONN` | 1 | 1: each read lane runs its batch's feed statement on a second connection, alongside the rest of phase A |
 | `CLASS_LANES` | 1 | 1: reads queue by class (feeds, comment threads, the rest), each class a batch at most every gap; 0: one pool |
 | `GAP_FAST_US` / `GAP_CMTS_US` / `GAP_FEED_US` | 75000 / 75000 / 80000 | least time between two batches of a class |
@@ -142,7 +145,7 @@ Defaults suit the 8-vCPU box; all are optional environment variables.
 | `STARVE_AGE_US` | 300000 | any class takes a lane past its share once its oldest read has waited this long |
 | `FEED_MERGE` | 1 | 1: each distinct followee read once per batch, feeds merged here; 0: per viewer in SQL |
 | `GAP_MIN_US` | 5000 | least time a read waits before its batch starts |
-| `READ_ACTIVE` | read lanes - 1 | most read batches running at once (per class 3/8, 1/4, 1/4 of the lanes, plus one for the class waiting longest) |
+| `READ_ACTIVE` | cores - 1 | most read batches running at once (per class 3/8, 3/8, 1/4 of the lanes, plus one for the class waiting longest) |
 | `LOOP_NICE` | 5 | nice value of the event loop threads |
 | `BCRYPT_NICE` | 10 | nice value of the hashing threads after the first |
 | `WRITE_LANES` | 1 | group-commit connections |
@@ -152,7 +155,7 @@ Defaults suit the 8-vCPU box; all are optional environment variables.
 | `READ_WINDOW_US` | 40000 | the longest the oldest request waits for its batch to fill |
 | `FEED_LANES` | 0 | read lanes that serve only feeds (0: all lanes serve every read) |
 | `READ_MIN` | 4096 | a batch is taken early once this many (or the recent average, if larger) are waiting |
-| `READ_BATCH`, `WRITE_BATCH` | 4096, 256 | batch size caps |
+| `READ_BATCH`, `WRITE_BATCH` | 2048, 256 | batch size caps |
 | `WRITE_WINDOW_US` | 3000 | how long a write waits for others to share its group |
 | `BCRYPT_IDLE` | 0 | 1: hashing threads at nice 19, plus a normal-priority thread for logins waiting `BCRYPT_RESCUE_MS` |
 | `BCRYPT_RESCUE_MS` | 1000 | with `BCRYPT_IDLE`, how long a login waits before the normal-priority thread hashes it (0: no such thread) |
@@ -183,6 +186,7 @@ kernel is a port of. Read classes with per-class gaps and caps, event loops at n
 phase B keys from `rust-epoll-theCatWisel` (#154, #201) and `zig-iouring-nick-potts` (#168); comment threads in one
 statement, list windows per key and shared unflagged bodies from `rust-epoll-theCatWisel` (#201, #205); feeds
 merged from one scan per followee from `c-epoll-unorig-username` (#203); `enable_memoize = off` from
-`swift-iouring-Tabonx` (#207).
+`swift-iouring-Tabonx` (#207); flags as per-viewer slices and tag counts settled by skipping 999 entries from
+`rust-epoll-theCatWisel` (#201); the `shrx` bcrypt kernel from `zig-iouring-nick-potts` (#168).
 
 Built with Claude (Anthropic).

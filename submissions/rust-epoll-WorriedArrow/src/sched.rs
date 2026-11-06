@@ -23,9 +23,14 @@ pub const FEED: usize = 2;
 const CLASSES: usize = 3;
 const TIE: Duration = Duration::from_millis(2);
 
+/// Feeds in the fast class (FEED_CLASS=0): one batch then enriches the articles of lists, article pages and feeds
+/// together, each counted once, and the feed statement runs on the lane's second connection beside the rest.
+pub static FEED_OWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 pub fn class_of(r: &Read) -> usize {
     match r {
-        Read::Feed { .. } => FEED,
+        Read::Feed { .. } if FEED_OWN.load(std::sync::atomic::Ordering::Relaxed) => FEED,
+        Read::Feed { .. } => FAST,
         Read::Comments { .. } => CMTS,
         _ => FAST,
     }
@@ -80,6 +85,25 @@ impl Sched {
         }
     }
 
+    /// Queues every job of `jobs` (emptying it) under one lock: an IO thread hands over a whole event-loop pass at once.
+    pub fn push_many(&self, jobs: &mut Vec<ReadJob>) {
+        if jobs.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut g = self.m.lock().unwrap();
+        let mut woke = false;
+        for job in jobs.drain(..) {
+            let c = class_of(&job.kind);
+            woke |= g.q[c].is_empty();
+            g.q[c].push_back((now, job));
+        }
+        drop(g);
+        if woke {
+            self.cv.notify_one();
+        }
+    }
+
     /// Blocks until a class is due and has room, then moves its queue (up to `max_batch`) into `out`. Returns the
     /// class; the caller hands it back to `done` when the batch is answered.
     pub fn take(&self, cfg: &Config, out: &mut Vec<ReadJob>) -> usize {
@@ -121,8 +145,14 @@ impl Sched {
                     }
                 }
             }
-            if let Some((_, c)) = pick {
+            if let Some((head, c)) = pick {
+                let k = &crate::stats::CLASS[c];
+                crate::stats::max(&k.max_queue, g.q[c].len() as u64);
+                crate::stats::max(&k.max_active, g.active as u64 + 1);
+                k.head_wait_ns.fetch_add(now.saturating_duration_since(head).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 let n = g.q[c].len().min(cfg.max_batch);
+                k.batches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                k.jobs.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                 out.extend(g.q[c].drain(..n).map(|(_, j)| j));
                 g.inflight[c] += 1;
                 g.active += 1;

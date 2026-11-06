@@ -12,6 +12,8 @@ type HmacSha256 = Hmac<Sha256>;
 pub const INT8: u32 = 20;
 pub const TEXT: u32 = 25;
 pub const INT8_ARRAY: u32 = 1016;
+pub const INT4: u32 = 23;
+pub const INT4_ARRAY: u32 = 1007;
 pub const TEXT_ARRAY: u32 = 1009;
 
 #[derive(Debug)]
@@ -211,6 +213,11 @@ impl ArrayBuf {
         self.buf.extend_from_slice(&v.to_be_bytes());
         self.count += 1;
     }
+    pub fn i32(&mut self, v: i32) {
+        self.buf.extend_from_slice(&4i32.to_be_bytes());
+        self.buf.extend_from_slice(&v.to_be_bytes());
+        self.count += 1;
+    }
     pub fn text(&mut self, s: &[u8]) {
         self.buf.extend_from_slice(&(s.len() as i32).to_be_bytes());
         self.buf.extend_from_slice(s);
@@ -376,7 +383,7 @@ impl Conn {
     pub fn connect(cfg: &Config) -> Result<Conn> {
         let stream = TcpStream::connect((cfg.host.as_str(), cfg.port))?;
         stream.set_nodelay(true)?;
-        let mut c = Conn { stream, rbuf: vec![0; 64 * 1024], rpos: 0, rend: 0, out: Out::default() };
+        let mut c = Conn { stream, rbuf: vec![0; 1 << 20], rpos: 0, rend: 0, out: Out::default() };
         // StartupMessage
         let mut m = Vec::new();
         m.extend_from_slice(&0i32.to_be_bytes());

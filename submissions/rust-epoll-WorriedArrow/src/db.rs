@@ -18,7 +18,7 @@ use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use crate::json;
-use crate::pg::{self, ArrayBuf, Col, Conn, Param, Pipeline, INT8, TEXT};
+use crate::pg::{self, ArrayBuf, Col, Conn, Param, Pipeline, INT4, INT8, TEXT};
 use crate::queue::Queue;
 use crate::reply::{self, Body, ReplyTo, Response};
 
@@ -101,9 +101,39 @@ pub static FEED_SPLIT: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// Reads queue by class (crate::sched) instead of in one pool.
 pub static CLASS_LANES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+thread_local! {
+    /// An IO thread's reads of its current event-loop pass, queued together at the end of it (`release_reads`).
+    static HELD: std::cell::RefCell<Option<Vec<ReadJob>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// From now on this thread's reads wait for `release_reads` (IO threads, under class scheduling).
+pub fn hold_reads() {
+    if CLASS_LANES.load(Relaxed) {
+        HELD.with(|h| *h.borrow_mut() = Some(Vec::with_capacity(256)));
+    }
+}
+
+/// Queues the reads this thread held since the last call, under one lock.
+pub fn release_reads() {
+    HELD.with(|h| {
+        if let Some(v) = h.borrow_mut().as_mut() {
+            crate::sched::READS.push_many(v);
+        }
+    });
+}
+
 pub fn push_read(job: ReadJob) {
     if CLASS_LANES.load(Relaxed) {
-        crate::sched::READS.push(job);
+        let job = HELD.with(|h| match h.borrow_mut().as_mut() {
+            Some(v) => {
+                v.push(job);
+                None
+            }
+            None => Some(job),
+        });
+        if let Some(job) = job {
+            crate::sched::READS.push(job);
+        }
     } else if matches!(job.kind, Read::Feed { .. }) && FEED_SPLIT.load(Relaxed) {
         FEEDS.q.push(job);
     } else {
@@ -204,7 +234,7 @@ impl Keys<String> {
 }
 
 /// A response body, kept for the rest of the batch under `key` if it has one (see `shared` in ReadLane::batch).
-fn keep(shared: &mut FxMap<(u8, u64, u16), std::sync::Arc<Vec<u8>>>, key: Option<(u8, u64, u16)>, b: Vec<u8>) -> Body {
+fn keep(shared: &mut FxMap<(u8, u64), std::sync::Arc<Vec<u8>>>, key: Option<(u8, u64)>, b: Vec<u8>) -> Body {
     match key {
         Some(k) => {
             let a = std::sync::Arc::new(b);
@@ -317,6 +347,28 @@ fn int_array(items: impl Iterator<Item = i64>) -> Vec<u8> {
     a.buf
 }
 
+/// Sorted (viewer, target) pairs as four arrays: distinct viewers, all targets, and each viewer's first and last
+/// target position (1-based, inclusive), for `ANY(targets[s : e])`.
+fn by_viewer(pairs: &[(i64, i64)]) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+    let (mut v, mut t, mut s, mut e) = (ArrayBuf::new(INT8), ArrayBuf::new(INT8), ArrayBuf::new(INT4), ArrayBuf::new(INT4));
+    let mut i = 0;
+    while i < pairs.len() {
+        let mut j = i;
+        while j < pairs.len() && pairs[j].0 == pairs[i].0 {
+            t.i64(pairs[j].1);
+            j += 1;
+        }
+        v.i64(pairs[i].0);
+        s.i32(i as i32 + 1);
+        e.i32(j as i32);
+        i = j;
+    }
+    for a in [&mut v, &mut t, &mut s, &mut e] {
+        a.finish();
+    }
+    (v.buf, t.buf, s.buf, e.buf)
+}
+
 fn owned(p: &Pipeline, c: Col) -> Option<Vec<u8>> {
     p.bytes(c).map(|b| b.to_vec())
 }
@@ -396,13 +448,33 @@ pub struct ReadLane {
     pool: &'static Pool,
     /// Requests of the current batch already answered (before phase B), so a later failure doesn't answer them twice.
     answered: Vec<ReplyTo>,
+    /// The scheduler class whose slot this lane holds while its batch talks to Postgres (`release` hands it back).
+    slot: Option<usize>,
+}
+
+/// Per class (fast, comments, feeds): batches, requests, and nanoseconds spent before phase A's results were in,
+/// in phase B, and rendering. BATCH_STATS=1 prints them every 10 s.
+pub static STATS: std::sync::Mutex<[[u64; 5]; 3]> = std::sync::Mutex::new([[0; 5]; 3]);
+
+pub fn print_stats() {
+    loop {
+        std::thread::sleep(Duration::from_secs(10));
+        let s = std::mem::replace(&mut *STATS.lock().unwrap(), [[0; 5]; 3]);
+        for (c, name) in ["fast", "comments", "feeds"].iter().enumerate() {
+            let [n, jobs, a, b, r] = s[c];
+            if n > 0 {
+                let ms = |x: u64| x as f64 / n as f64 / 1e6;
+                eprintln!("{name}: {n} batches, {} per batch, phase A {:.1} ms, phase B {:.1} ms, render {:.1} ms", jobs / n, ms(a), ms(b), ms(r));
+            }
+        }
+    }
 }
 
 const LIST_STMTS: [&str; 3] = ["tag", "author", "favlist"];
 
 impl ReadLane {
     pub fn new(s: &'static Settings, pool: &'static Pool) -> ReadLane {
-        ReadLane { conn: None, fconn: None, s, pool, answered: Vec::new() }
+        ReadLane { conn: None, fconn: None, s, pool, answered: Vec::new(), slot: None }
     }
 
     /// The lane's connection, (re)opened on demand (borrows only that field).
@@ -423,9 +495,13 @@ impl ReadLane {
             loop {
                 jobs.clear();
                 let c = crate::sched::READS.take(cfg, &mut jobs);
+                self.slot = Some(c);
                 let batch = std::mem::take(&mut jobs);
                 self.execute(batch);
-                crate::sched::READS.done(c);
+                // Normally released once the batch's last Postgres result is in (see `batch`); here on early exits.
+                if let Some(c) = self.slot.take() {
+                    crate::sched::READS.done(c);
+                }
             }
         }
         loop {
@@ -473,6 +549,8 @@ impl ReadLane {
     }
 
     fn batch(&mut self, mut jobs: Vec<ReadJob>) -> pg::Result<()> {
+        let t0 = std::time::Instant::now();
+        let njobs = jobs.len() as u64;
         // ---- distinct keys ----
         let mut want_tags = false;
         let mut uid: Keys<i64> = Keys::new();
@@ -529,6 +607,13 @@ impl ReadLane {
         // Only worth it when the batch has other phase-A work to overlap with.
         let others = aslug.len() + aid.len() + cmts.len() + global.len() + lists.iter().map(|l| l.page.len()).sum::<usize>();
         let split = self.s.feed_conn && feed.len() > 0 && others > 0;
+        // Each feed viewer's deepest page (limit + offset), so the statement needn't search the pages per viewer.
+        let mut feed_depth = vec![1i64; feed.len()];
+        for &(v, lim, off) in &feedpage.list {
+            if let Some(&i) = feed.map.get(&v) {
+                feed_depth[i as usize] = feed_depth[i as usize].max(lim + off);
+            }
+        }
         if split {
             let fc = Self::conn_of(&mut self.fconn, self.s)?;
             fc.out.bind_exec(
@@ -538,6 +623,7 @@ impl ReadLane {
                     Param::Raw(&int_array(feedpage.list.iter().map(|k| k.0))),
                     Param::Raw(&int_array(feedpage.list.iter().map(|k| k.1))),
                     Param::Raw(&int_array(feedpage.list.iter().map(|k| k.2))),
+                    Param::Raw(&int_array(feed_depth.iter().copied())),
                 ],
             );
             fc.out.sync();
@@ -655,6 +741,7 @@ impl ReadLane {
                     Param::Raw(&int_array(feedpage.list.iter().map(|k| k.0))),
                     Param::Raw(&int_array(feedpage.list.iter().map(|k| k.1))),
                     Param::Raw(&int_array(feedpage.list.iter().map(|k| k.2))),
+                    Param::Raw(&int_array(feed_depth.iter().copied())),
                 ],
             );
         }
@@ -670,12 +757,12 @@ impl ReadLane {
             let g_uemail = s_uemail.map(|s| group(&pa, s, uemail.len())).unwrap_or_default();
             let mut early: Vec<Response> = Vec::new();
             let mut tags_body: Option<Vec<u8>> = None;
-            let mut tags_shared: FxMap<u16, std::sync::Arc<Vec<u8>>> = FxMap::default();
+            let mut tags_shared: Option<std::sync::Arc<Vec<u8>>> = None;
             for (i, (j, a)) in jobs.iter_mut().zip(asks.iter()).enumerate() {
                 let to = j.to;
                 match *a {
                     Ask::Tags => {
-                        // One body for every tag-list request of the batch, shared per IO thread.
+                        // One body for every tag-list request of the batch.
                         let b = tags_body.get_or_insert_with(|| {
                             let s = s_tags.unwrap();
                             let mut b = Vec::with_capacity(4096);
@@ -689,10 +776,7 @@ impl ReadLane {
                             b.extend_from_slice(b"]}");
                             b
                         });
-                        let a = tags_shared
-                            .entry(to.thread)
-                            .or_insert_with(|| std::sync::Arc::new(b.clone()))
-                            .clone();
+                        let a = tags_shared.get_or_insert_with(|| std::sync::Arc::new(b.clone())).clone();
                         early.push(Response { to, status: 200, body: Body::Shared(a) });
                     }
                     Ask::User(k) => {
@@ -748,6 +832,7 @@ impl ReadLane {
             _ => None,
         };
 
+        let t_a = std::time::Instant::now();
         // ---- decode phase A ----
         let g = |slot: Option<usize>, n: usize| slot.map(|s| group(&pa, s, n)).unwrap_or_default();
         let g_prof = g(s_prof, prof.len());
@@ -756,6 +841,8 @@ impl ReadLane {
         let mut g_cmts: Vec<Vec<usize>> = vec![Vec::new(); cmts.len()];
         let mut auser: FxMap<i64, &[Col]> = FxMap::default();
         let mut cfoll: FxSet<(i64, i64)> = FxSet::default();
+        // Viewers with any follow hit among the batch's comment authors.
+        let mut cfoll_v: FxSet<i64> = FxSet::default();
         if let Some(s) = s_cmts {
             for (i, r) in pa.results[s].rows.iter().enumerate() {
                 match pa.i64(r[0]) {
@@ -770,6 +857,7 @@ impl ReadLane {
                     }
                     _ => {
                         cfoll.insert((pa.i64(r[1]), pa.i64(r[2])));
+                        cfoll_v.insert(pa.i64(r[1]));
                     }
                 }
             }
@@ -922,13 +1010,20 @@ impl ReadLane {
                 );
             }
             if b_flags.is_some() {
+                // Each viewer once, with the 1-based slice of its targets in the flat (sorted) target array.
+                let (v1, t1, s1, e1) = by_viewer(&fv);
+                let (v2, t2, s2, e2) = by_viewer(&fo);
                 o.bind_exec(
                     "flags",
                     &[
-                        Param::Raw(&int_array(fv.iter().map(|p| p.0))),
-                        Param::Raw(&int_array(fv.iter().map(|p| p.1))),
-                        Param::Raw(&int_array(fo.iter().map(|p| p.0))),
-                        Param::Raw(&int_array(fo.iter().map(|p| p.1))),
+                        Param::Raw(&v1),
+                        Param::Raw(&t1),
+                        Param::Raw(&s1),
+                        Param::Raw(&e1),
+                        Param::Raw(&v2),
+                        Param::Raw(&t2),
+                        Param::Raw(&s2),
+                        Param::Raw(&e2),
                     ],
                 );
             }
@@ -945,6 +1040,14 @@ impl ReadLane {
         } else {
             None
         };
+        // Postgres is done with this batch: the rest is decoding and rendering here, so the scheduler slot (which bounds
+        // how many batches run in Postgres at once) goes to the next batch now, on another lane's connection, instead
+        // of after the responses are written.
+        let class = self.slot.take();
+        if let Some(c) = class {
+            crate::sched::READS.done(c);
+        }
+        let t_b = std::time::Instant::now();
 
         let mut art_row: Vec<Option<usize>> = vec![None; arts.len()];
         let mut tag_rank: FxMap<i32, (u32, Col)> = FxMap::default();
@@ -997,8 +1100,9 @@ impl ReadLane {
 
         // ---- assemble ----
         // Responses that come out the same for every requester (no favorited or following flag set for the viewer)
-        // are rendered once per batch and IO thread and shared; the bytes are this batch's, freed with its last send.
-        let mut shared: FxMap<(u8, u64, u16), std::sync::Arc<Vec<u8>>> = FxMap::default();
+        // are rendered once per batch and shared, whichever IO thread sends them (the head with `Connection` is the
+        // IO thread's); the bytes are this batch's, freed with its last send.
+        let mut shared: FxMap<(u8, u64), std::sync::Arc<Vec<u8>>> = FxMap::default();
         let mut out: Vec<Response> = Vec::with_capacity(jobs.len());
         for ((j, ask), done) in jobs.into_iter().zip(asks.into_iter()).zip(done) {
             if done {
@@ -1028,7 +1132,7 @@ impl ReadLane {
                     };
                     let key = match (ask, p) {
                         (Ask::Slug(k), Some((id, author, _))) if v == 0 || (!ctx.favorited(v, id) && !ctx.following(v, author)) => {
-                            Some((5u8, k as u64, to.thread))
+                            Some((5u8, k as u64))
                         }
                         _ => None,
                     };
@@ -1052,6 +1156,15 @@ impl ReadLane {
                         continue;
                     }
                     let s = s_cmts.unwrap();
+                    // A viewer who follows none of the batch's comment authors gets the shared body without a look at
+                    // the thread; only the rest are checked comment by comment.
+                    let quick = v == 0 || !cfoll_v.contains(&v);
+                    if quick {
+                        if let Some(a) = shared.get(&(6u8, k as u64)) {
+                            out.push(Response { to, status: 200, body: Body::Shared(a.clone()) });
+                            continue;
+                        }
+                    }
                     // Each comment with its author's row, looked up once.
                     let mut list: Vec<(&[Col], &[Col])> = rows
                         .iter()
@@ -1061,7 +1174,7 @@ impl ReadLane {
                         .collect();
                     // Already newest first from the statement; sorting a sorted run is linear.
                     list.sort_unstable_by(|(x, _), (y, _)| (pa.i64(y[4]), pa.i64(y[2])).cmp(&(pa.i64(x[4]), pa.i64(x[2]))));
-                    let key = (v == 0 || list.iter().all(|(r, _)| !cfoll.contains(&(v, pa.i64(r[6]))))).then_some((6u8, k as u64, to.thread));
+                    let key = (quick || list.iter().all(|(r, _)| !cfoll.contains(&(v, pa.i64(r[6]))))).then_some((6u8, k as u64));
                     if let Some(a) = key.and_then(|k| shared.get(&k)) {
                         out.push(Response { to, status: 200, body: Body::Shared(a.clone()) });
                         continue;
@@ -1102,8 +1215,7 @@ impl ReadLane {
                         Ask::List(f, _, p) => Some((2 + f as u8, p as u64)),
                         _ => None,
                     }
-                    .filter(|_| v == 0 || rows.iter().all(|&(id, author, _)| !ctx.favorited(v, id) && !ctx.following(v, author)))
-                    .map(|(a, b)| (a, b, to.thread));
+                    .filter(|_| v == 0 || rows.iter().all(|&(id, author, _)| !ctx.favorited(v, id) && !ctx.following(v, author)));
                     if let Some(a) = key.and_then(|k| shared.get(&k)) {
                         out.push(Response { to, status: 200, body: Body::Shared(a.clone()) });
                         continue;
@@ -1130,6 +1242,16 @@ impl ReadLane {
             }
         }
         reply::send_all(out);
+        if let Some(c) = class {
+            let t = std::time::Instant::now();
+            let mut st = STATS.lock().unwrap();
+            let e = &mut st[c];
+            e[0] += 1;
+            e[1] += njobs;
+            e[2] += (t_a - t0).as_nanos() as u64;
+            e[3] += (t_b - t_a).as_nanos() as u64;
+            e[4] += (t - t_b).as_nanos() as u64;
+        }
         Ok(())
     }
 }
@@ -1175,7 +1297,7 @@ impl Ctx<'_> {
         let (id, _, ar) = a;
         let pb = self.pb?;
         let ri = self.arts.map.get(&id).and_then(|&k| self.art_row[k as usize])?;
-        let r = &pb.results[self.b_artx.unwrap()].rows[ri];
+        let r = &pb.results[self.b_artx?].rows[ri];
         // The article's own columns: from its phase-A row, another phase-A row for it, or phase B's "artrow".
         let (src, ar): (&Pipeline, &[Col]) = if ar[3].len >= 0 {
             (pa, ar)
@@ -1398,7 +1520,12 @@ impl WriteLane {
                 None => 5,
             });
             let batch = std::mem::take(&mut jobs);
-            if let Err((e, left)) = self.group(batch) {
+            let t0 = std::time::Instant::now();
+            crate::stats::WRITE_GROUPS.fetch_add(1, Relaxed);
+            crate::stats::WRITES.fetch_add(batch.len() as u64, Relaxed);
+            let r = self.group(batch);
+            crate::stats::WRITE_NS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+            if let Err((e, left)) = r {
                 eprintln!("write batch failed: {e}");
                 self.conn = None;
                 // Never retry a write whose commit outcome is unknown.
@@ -1668,6 +1795,7 @@ pub fn bcrypt_rescue(s: &'static Settings) {
 }
 
 fn run_bcrypt(jobs: Vec<BcryptJob>, s: &Settings, cost: u32) {
+    crate::stats::HASHES.fetch_add(jobs.len() as u64, Relaxed);
     // A login whose client hung up isn't worth a hash.
     let (jobs, gone): (Vec<BcryptJob>, Vec<BcryptJob>) =
         jobs.into_iter().partition(|j| !matches!(j, BcryptJob::Verify { to, .. } if !reply::alive(*to)));
