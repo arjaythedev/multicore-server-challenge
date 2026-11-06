@@ -146,7 +146,7 @@ and four on the box), and
   Postgres while that request waited, and a plan takes only the requests
   already waiting when it starts.
 - **Batch clock.** A plan starts when 4,096 reads wait (a full plan) or when
-  the oldest has waited 60 ms, and up to 20 are in
+  the oldest has waited 80 ms, and up to 20 are in
   flight at the read service, on 12 connections. Started at once instead, a plan is whatever arrived
   during the last one's two round trips, about 17 requests at the load
   measured below, and Postgres pays its fixed costs and reads the same
@@ -168,9 +168,13 @@ and four on the box), and
   40 ms took the saturated run below from 57.2 to 54.8 and 53.8 in two runs.
   At 230,000 users, 4,096 over 60 ms took Postgres from about 31 µs a
   request to 29.6 and, with the two lanes below, p95 from 511 ms to 459.
-  Nish's `PgBatcher` takes at most 1,024 keys, so a plan takes at most that
-  many articles, comment threads or profiles by key, and a read past them
-  waits for the next plan.
+  `62db14b` scored 210,000 officially at 60 ms, p95 347 ms. On the 4-CPU VM
+  at 15,000 users, 80 ms took Postgres and the server (bcrypt aside) about
+  3 µs a request below 60 ms, and 100 ms about 4 to 7, for 20 and 45 ms of
+  p95 (92–100 ms at 60). On the box, 80 ms makes plans of about 3,800 reads,
+  under the 4,096 that start one early; 100 ms would hit it. A plan reads up
+  to 4,096 articles, comment threads or profiles by key, as many as it has
+  reads; at Nish's old limit of 1,024, a read past them waited for the next plan.
 - **A plan's statements side by side.** A read waits for its plan's group
   A and then its group B, so it waits the slowest statement of each. Each
   group runs as lanes: group A's feeds (in two halves when `FEED_SPLIT` is
@@ -378,7 +382,7 @@ Optional process settings, with their defaults: `HTTP_WORKERS` (a quarter of the
 CPUs, at least 2),
 `DB_READ_CONNS` (6) and `DB_WRITE_CONNS` (1) per worker, `DB_MAX_IN_FLIGHT`
 (16), `DB_READ_PLANS` (10) read plans in flight per worker,
-`READ_PLAN_WAIT_US` (60000) and `READ_PLAN_MIN` (4096) for the batch clock,
+`READ_PLAN_WAIT_US` (80000) and `READ_PLAN_MIN` (4096) for the batch clock,
 `READ_PLAN_CLOCK` (1; 0 starts a plan at once while none is in flight, 2
 is adaptive) and `READ_PLAN_LIGHT` (32), `BCRYPT_WORKERS` (half the CPUs,
 at least 2), `BCRYPT_BATCH_MS` (150) and `BCRYPT_HASH_MS` (20),
