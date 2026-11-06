@@ -27,6 +27,7 @@ enum { D_EVENTFD = 1, D_PG_RECV, D_PG_SEND, D_TIMER };
 struct unit {
     struct unit *next;
     struct plan *plan;  /* a plan's phase, or NULL for a worker's unit */
+    int lane;           /* the plan's lane */
     int worker;
     uint64_t token;
     uint32_t len;  /* bytes, for units waiting in the drain */
@@ -62,9 +63,12 @@ struct drain {
     uint64_t efd_val;
     bool *wake;                        /* workers with new replies this iteration */
     struct pending_reply **overflow, **overflow_tail;
-    bool timer_armed;
-    struct __kernel_timespec timer_ts;
+    int timers;                        /* timeouts in flight */
+    int64_t timer_at;                  /* when the soonest of them fires (monotonic us) */
+    struct __kernel_timespec timer_ts[4];
     int64_t ewma_plan_us;              /* how long a plan takes, start to answer (EWMA, 1/4 weight) */
+    int lane_inflight[PL_N];           /* plans of each lane on a connection */
+    int64_t lane_last[PL_N];           /* when each lane's last plan started */
 };
 
 static struct drain D;
@@ -247,6 +251,7 @@ static void on_recv(struct dconn *c, int res) {
             c->inflight--;
             if (done) {
                 c->plan_active = false;
+                D.lane_inflight[u->lane]--;
                 int64_t took = mono_us() - c->plan_t0;
                 D.ewma_plan_us = D.ewma_plan_us ? (3 * D.ewma_plan_us + took) / 4 : took;
                 unit_free(u);
@@ -296,13 +301,19 @@ static int64_t mono_us(void) {
     return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
 
-static void arm_timer(int64_t us) {
-    if (D.timer_armed) return;
-    D.timer_armed = true;
-    D.timer_ts.tv_sec = us / 1000000;
-    D.timer_ts.tv_nsec = (us % 1000000) * 1000;
+/* Wakes the loop in `us`, unless a timeout already in flight fires about as soon. A sooner deadline arms another
+ * timeout (at most 4 in flight; the kernel reads each timespec when the ring is submitted, in this iteration). */
+static void arm_timer(int64_t now, int64_t us) {
+    int64_t at = now + us;
+    if (D.timers && at >= D.timer_at - 200) return;
+    if (D.timers >= 4) return;
+    struct __kernel_timespec *ts = &D.timer_ts[D.timers];
+    D.timers++;
+    D.timer_at = at;
+    ts->tv_sec = us / 1000000;
+    ts->tv_nsec = (us % 1000000) * 1000;
     struct io_uring_sqe *s = dsqe();
-    io_uring_prep_timeout(s, &D.timer_ts, 0, 0);
+    io_uring_prep_timeout(s, ts, 0, 0);
     io_uring_sqe_set_data64(s, D_TIMER);
 }
 
@@ -320,35 +331,74 @@ static int64_t plan_wait(void) {
     return w < cfg.plan_wait_us ? w : cfg.plan_wait_us;
 }
 
+/* Starts a plan of the lane on a connection with no plan running; false if every connection has one. */
+static bool start_plan(int lane, int64_t now) {
+    struct dconn *best = NULL;
+    for (int i = 0; i < D.npg; i++) {
+        struct dconn *c = &D.pg[i];
+        if (!c->plan_active && (!best || c->inflight < best->inflight)) best = c;
+    }
+    if (!best) return false;  /* rescheduled when a plan finishes */
+    struct unit *u = unit_new(-1, 0);
+    u->plan = planner_start(lane, &best->out);
+    if (!u->plan) {
+        unit_free(u);
+        return true;
+    }
+    u->lane = lane;
+    D.lane_inflight[lane]++;
+    D.lane_last[lane] = now;
+    best->plan_active = true;
+    best->plan_t0 = now;
+    u->next = NULL;
+    if (best->tail) best->tail->next = u;
+    else best->head = u;
+    best->tail = u;
+    best->inflight++;
+    return true;
+}
+
+/* With lanes, each lane goes out on its own clock: a plan starts once the lane's oldest read has waited
+ * lane_window_us and lane_gap_us has passed since the lane's last plan started (at once when the lane holds a full
+ * plan), and only while fewer than lane_cap of its plans are in flight. Below saturation a plan takes everything
+ * that arrived in a gap; near it, executions outlast the gap, the cap binds, and the next plan takes everything
+ * that arrived meanwhile: batches grow with the load instead of the number of plans contending for the cores.
+ * A free connection serves the lanes in order: feeds, comments, the rest. */
+static void schedule_lanes(int64_t now) {
+    int64_t next = -1;
+    for (int l = 0; l < PL_N; l++) {
+        while (D.lane_inflight[l] < cfg.lane_cap[l]) {
+            int64_t due = planner_due_in(l, now, cfg.lane_window_us);
+            if (due < 0) break;
+            if (planner_waiting(l) < cfg.plan_max) {
+                int64_t gap = D.lane_last[l] + cfg.lane_gap_us[l] - now;
+                if (gap > due) due = gap;
+            }
+            if (due > 0) {
+                if (next < 0 || due < next) next = due;
+                break;
+            }
+            if (!start_plan(l, now)) return;
+        }
+    }
+    if (next > 0) arm_timer(now, next);
+}
+
 /* Starts plans while requests are due and a connection has no plan running. */
 static void schedule_plans(void) {
     int64_t now = mono_us();
+    if (cfg.lanes) {
+        schedule_lanes(now);
+        return;
+    }
     for (;;) {
-        int64_t due = planner_due_in(now, plan_wait());
+        int64_t due = planner_due_in(PL_SHARED, now, plan_wait());
         if (due < 0) return;
         if (due > 0) {
-            arm_timer(due);
+            arm_timer(now, due);
             return;
         }
-        struct dconn *best = NULL;
-        for (int i = 0; i < D.npg; i++) {
-            struct dconn *c = &D.pg[i];
-            if (!c->plan_active && (!best || c->inflight < best->inflight)) best = c;
-        }
-        if (!best) return;  /* rescheduled when a plan finishes */
-        struct unit *u = unit_new(-1, 0);
-        u->plan = planner_start(&best->out);
-        if (!u->plan) {
-            unit_free(u);
-            return;
-        }
-        best->plan_active = true;
-        best->plan_t0 = now;
-        u->next = NULL;
-        if (best->tail) best->tail->next = u;
-        else best->head = u;
-        best->tail = u;
-        best->inflight++;
+        if (!start_plan(PL_SHARED, now)) return;
     }
 }
 
@@ -378,6 +428,11 @@ void drain_run(void) {
     arm_eventfd();
     for (int i = 0; i < D.npg; i++) arm_recv(&D.pg[i]);
     fprintf(stderr, "drain: %d postgres read connections\n", D.npg);
+    if (cfg.lanes)
+        fprintf(stderr, "drain: lanes feed/comments/shared: gap %lld/%lld/%lld us, cap %d/%d/%d, window %lld us\n",
+                (long long)cfg.lane_gap_us[PL_FEED], (long long)cfg.lane_gap_us[PL_CMT],
+                (long long)cfg.lane_gap_us[PL_SHARED], cfg.lane_cap[PL_FEED], cfg.lane_cap[PL_CMT],
+                cfg.lane_cap[PL_SHARED], (long long)cfg.lane_window_us);
 
     for (;;) {
         for (int i = 0; i < D.npg; i++) {
@@ -407,7 +462,8 @@ void drain_run(void) {
                 on_send((struct dconn *)(uintptr_t)(ud & ~(uint64_t)7), cqe->res);
                 break;
             case D_TIMER:
-                D.timer_armed = false;
+                D.timers--;
+                D.timer_at = INT64_MAX;
                 break;
             }
             n++;

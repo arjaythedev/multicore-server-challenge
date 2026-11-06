@@ -495,6 +495,9 @@ static void start_follow(struct req *r, const char *name, size_t nl, bool follow
     pg_bind_i64(&pb, r->viewer);
     pg_bind_text(&pb, name, nl);
     bind_exec(&pb);
+    r->merge = follow ? M_FOLLOW : M_UNFOLLOW;
+    r->q_split = (uint32_t)r->q.len;
+    keep_slot(r, 0, name, nl);
     http_begin(&r->resp);
     unit_submit(r, true);
 }
@@ -783,6 +786,9 @@ static void start_favorite(struct req *r, const char *slug, size_t sl, bool fav)
     pg_bind_i64(&pb, r->viewer);
     pg_bind_text(&pb, slug, sl);
     bind_exec(&pb);
+    r->merge = fav ? M_FAV : M_UNFAV;
+    r->q_split = (uint32_t)r->q.len;
+    keep_slot(r, 0, slug, sl);
     bind_begin(r, &pb, S_ARTICLE_BY_SLUG);
     pg_bind_i64(&pb, r->viewer);
     pg_bind_text(&pb, slug, sl);
@@ -853,6 +859,10 @@ static void start_create_comment(struct req *r, const struct http_req *hr, const
     pg_bind_i64(&pb, r->viewer);
     pg_bind_text(&pb, body, bl);
     bind_exec(&pb);
+    r->merge = M_COMMENT;
+    r->q_split = (uint32_t)r->q.len;
+    keep_slot(r, 0, slug, sl);
+    keep_slot(r, 1, body, bl);
     http_begin(&r->resp);
     unit_submit(r, true);
 }
