@@ -17,15 +17,15 @@
 // for the read connections, DB_READ_PLANS (10) read plans in flight
 // per worker, READ_PLAN_MIN (4096), READ_PLAN_WAIT_US (60000) and
 // READ_PLAN_CLOCK (1; 2 adaptive, with READ_PLAN_LIGHT 32) for when a plan starts (worker.ts, `planWaitLeft`),
-// BCRYPT_WORKERS (half the CPUs, at least 2), BCRYPT_BATCH_MS (80) for logins
+// BCRYPT_WORKERS (half the CPUs, at least 2), BCRYPT_BATCH_MS (150) for logins
 // and BCRYPT_HASH_MS (20) for sign-ups (bcrypt-service.ts),
 // BCRYPT_PORT (47391), BCRYPT_NICE (0; 1 to 19 lowers the bcrypt services'
 // priority, and "idle" moves them to SCHED_IDLE), IDLE_TIMEOUT_MS (75000) and
 // BCRYPT_WIDTH (start.sh passes the width build.sh measured, else 6; 0 times it at startup; 1 to 6 lanes a call),
 // ACK_DELAY (0 leaves the kernel's ACKs alone; 1 turns delayed ACKs back on after each answer, worker.ts `ackDelayAfter`),
 // GZIP (0; 1 when it saves a TCP segment, 2 whenever it saves anything), GZIP_MIN (1300),
-// READ_SERVICE (1; 0 leaves each worker its own plans), READ_SERVICE_CONNS (12), READ_SERVICE_PLANS (20),
-// READ_COUNT_LANES (1), DB_SOLO_CONNS (2) and ANSWER_PACE (196608 bytes a ms, a worker).
+// READ_SERVICE (1; 0 leaves each worker its own plans), READ_SERVICE_CONNS (12), READ_SERVICE_IN_FLIGHT (4), READ_SERVICE_PLANS (20),
+// READ_COUNT_LANES (1), DB_SOLO_CONNS (2) and ANSWER_PACE (130000 bytes a ms, a worker).
 import { tcpListenFlags } from "nish:net"
 import { availableParallelism, getenv, setIdlePriority, setNice } from "nish:process"
 import {
@@ -146,7 +146,7 @@ export const main = (): i32 => {
   const gzip: string = getenv("GZIP") ?? "0"
   cfg.gzip = gzip === "1" ? 1 : gzip === "2" ? 2 : 0
   cfg.gzipMin = envInt("GZIP_MIN", 1300)
-  cfg.answerPace = envInt("ANSWER_PACE", 196608)
+  cfg.answerPace = envInt("ANSWER_PACE", 130000)
   // A quarter of the CPUs serve HTTP, each with its own read queue: at 120,000
   // users on a VM like the challenge's, 2 workers' bigger plans cost Postgres
   // 129 µs a request against 4 workers' 150, and 1 worker ran out of core.
@@ -202,6 +202,11 @@ export const main = (): i32 => {
       region = opened.expect("the read service's region")
     }
   }
+  // LOOP_NICE=5 lets HTTP workers and the read service yield to Postgres (off: #196 ran without it).
+  const loopNice: i32 = envInt("LOOP_NICE", 0)
+  if (index <= http && loopNice > 0 && loopNice < 20) {
+    setNice(loopNice)
+  }
   if (service && index === http) {
     if (region === null) {
       return 0
@@ -210,7 +215,12 @@ export const main = (): i32 => {
     for (let w: i32 = 0; w < http; w++) {
       links.push(new ReadLink(region, w, preforkServiceChannelOf(process.argv, w), true))
     }
+    // #196's pool: up to four groups pipelined on a connection, on up to 12.
+    // One group a connection on 20 (READ_SERVICE_IN_FLIGHT=1,
+    // READ_SERVICE_CONNS=20) cut the VM's waits but scored 190,000
+    // officially, against #196's 200,000.
     cfg.readConns = envInt("READ_SERVICE_CONNS", 12)
+    cfg.readInFlight = envInt("READ_SERVICE_IN_FLIGHT", 4)
     cfg.readPlans = envInt("READ_SERVICE_PLANS", 20)
     cfg.countLanes = envInt("READ_COUNT_LANES", 1)
     console.log(`conduit: the read service holds ${cfg.readPlans} plans on ${cfg.readConns} connections`)
@@ -227,7 +237,7 @@ export const main = (): i32 => {
       console.log(`conduit: bcrypt runs ${width} lanes a call`)
     }
     lowerPriority(getenv("BCRYPT_NICE") ?? "0")
-    return runBcryptService(listener, envInt("BCRYPT_BATCH_MS", 80), envInt("BCRYPT_HASH_MS", 20), width)
+    return runBcryptService(listener, envInt("BCRYPT_BATCH_MS", 150), envInt("BCRYPT_HASH_MS", 20), width)
   }
   const listener: i32 = tcpListenFlags(cfg.host, cfg.port, cfg.backlog, LISTEN_FLAGS)
   if (listener < 0) {

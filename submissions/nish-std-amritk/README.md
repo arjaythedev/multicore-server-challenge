@@ -3,10 +3,14 @@
 Front: direct
 
 An update of this submission, scored at 91,000 users in #83 (`3de991e`),
-100,000 in #116 (`6e69d72`), 140,000 in #159 (`6cdf1fd`) and 180,000 in
-#189 (`76a40a5`), on the same design. Since #189: each plan group's
-statements run on two connections side by side, and plans hold up to 4,096
-reads over a 60 ms window instead of 2,048 over 40 ms. Since #159: one read
+100,000 in #116 (`6e69d72`), 140,000 in #159 (`6cdf1fd`), 180,000 in
+#189 (`76a40a5`) and 200,000 in #196 (`6b5557b`), on the same design. Since
+#196: a plan's ids go to Postgres sorted, each table read by one index scan
+over them, article pages read once, the plan's integer arrays sent in binary,
+and tag lists are answered as soon as their statement ends. A plan's groups run as more lanes, which the read
+service's pool pipelines four deep on up to 12 connections, as #196's did. Since #189: plans hold up to 4,096 reads
+over a 60 ms window instead of 2,048 over 40 ms, and Nish 0.32.0's faster
+bcrypt. Since #159: one read
 service holds every read plan of the box, each author of a plan is read once,
 a feed no longer asks whether its viewer follows the authors it was built
 from, a login's check waits 80 ms for company instead of 160, bcrypt's
@@ -28,7 +32,7 @@ read queue than four could have, where #83 ran
 two), and Nish 0.23.1 no longer sweeps every idle connection on every turn of
 the loop.
 
-Nish 0.32.0 (a statically typed TypeScript subset compiled to native code
+Nish 0.34.1 (a statically typed TypeScript subset compiled to native code
 through LLVM), built with clang-18 and lld-18 from LLVM 18, against
 PostgreSQL 18. The compiler runs on Node.js 22.18.0 at build time only; the
 server is one native binary with no runtime dependency beyond libc. Every
@@ -43,9 +47,12 @@ bash build.sh
 DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=... HOST=0.0.0.0 PORT=80 bash start.sh
 ```
 
-The server needs Nish 0.32.0, whose bcrypt batch kernels take a hash in
-6.5% less time at five lanes on the Xeon VM (below): 0.31.0 renamed the
-HTTP/1.1 codec `nish/net/http1-codec`. 0.26.0 brought binary result columns to
+The server needs Nish 0.34.1, whose Postgres and HTTP/1.1 paths take fewer
+steps a byte; 0.34.0 scans HTTP/1.1 request heads a vector
+at a time and keeps a connection's per-request path on its hot fields. 0.32.0's
+bcrypt batch kernels take a hash in 6.5% less time at five lanes on the Xeon
+VM (below), and 0.31.0 renamed the HTTP/1.1 codec `nish/net/http1-codec`.
+0.26.0 brought binary result columns to
 `nish/net/postgres` (`bindStartBinary`, `binaryInt`, `PgBinary`) and
 `TCP_QUICKACK` to `netSetOption`, and 0.27.0 the binary `PgBatcher`
 (`PgBatchConfig.binary`), `PgBinaryArray` for an integer array column, and
@@ -117,12 +124,14 @@ and four on the box), and
   2. **Group B** reads the rest once for the whole plan: the columns of the
      union of every article group A returned (lists, feeds and article
      pages alike: an article on the first global page, a tag page and an
-     article page is read once), and the viewers' `favorited` and
+     article page is read once; an article page's whole row comes from
+     group A's read by slug, and group B only writes it), and the viewers' `favorited` and
      `following` flags (a profile's too), each viewer's in one index range
      scan over its ids (`= ANY(...)`) rather than one probe per article. The
-     plan sends them grouped by viewer, the distinct viewers as one array and
-     each viewer's ids as one array, so Postgres does not regroup (viewer, id)
-     pairs. An article's tags
+     plan sends them grouped by viewer: the distinct viewers as one array, all
+     their ids as another and each viewer's window of it as two more, every
+     one binary, so Postgres neither regroups (viewer, id) pairs nor parses
+     text. An article's tags
      come as ids and are named and ordered from group A's one read of every
      tag.
 
@@ -162,15 +171,56 @@ and four on the box), and
   Nish's `PgBatcher` takes at most 1,024 keys, so a plan takes at most that
   many articles, comment threads or profiles by key, and a read past them
   waits for the next plan.
-- **A plan's statements in two lanes.** Only about three of a plan's
-  statements were running in Postgres at any moment, because a plan's
-  group ran its statements one after another on one connection while other
-  connections sat idle, so a read waited the sum of them. Each group now
-  runs as two halves on two connections side by side: group A's feeds, its
-  costliest statement, beside everything else, and group B's articles
-  beside the flags and authors. When the pool can give only one connection,
-  both halves run on it as before. The same CPU, less waiting: at 230,000
-  users, saturated, p95 went from 553 ms to 511.
+- **A plan's statements side by side.** A read waits for its plan's group
+  A and then its group B, so it waits the slowest statement of each. Each
+  group runs as lanes: group A's feeds (in two halves when `FEED_SPLIT` is
+  set and a plan has that many feed pages or more; off), its comments,
+  its tag names and other lists, and its articles and profiles by key; group
+  B's articles, flags and authors. A lane the pool has no connection for goes
+  with the last one it gave. In #196 these were two lanes, and the read
+  service's pool pipelined up to four groups on a connection
+  (`DB_READ_IN_FLIGHT`) before it opened another, so lanes queued behind
+  other plans' statements while connections sat unopened. The pool still
+  does (`READ_SERVICE_IN_FLIGHT`, 4, on up to 12, `READ_SERVICE_CONNS`).
+  One group a connection on 20, with the feeds split at 64 pages, took the
+  Xeon VM at 175,000 users from 48 ms to 30 for group A, but scored 190,000
+  officially at `d9e9b93` and `11518f2`, against #196's 200,000, and cost
+  Postgres about 3–4 µs a request more on the VM. `PLAN_STATS=1` prints,
+  every 10 s, how long plans spend in each stage and lane.
+- **Sorted ids.** `plan_meta`, `plan_counts` and `plan_users` read a plan's ids
+  in the order its requests met them, so each index lookup landed far from the
+  last. A radix sort puts them in ascending order as they are bound, so
+  neighbouring ids share index and heap pages (`SORT_IDS`, on, for
+  `plan_users`; the two below always sort).
+- **One index scan over a plan's ids.** `plan_meta` joined each of a plan's
+  thousand or so ids to the primary key, and read each one's tag ids with a
+  subquery, so every id descended two btrees from their roots; `plan_counts`
+  did the same on `favorites_article_idx`. Now each takes the sorted ids as
+  one `= ANY($1)`, whose scan steps from one id to the next along the leaf
+  pages, with the tag ids merge-joined beside the articles and the counts one
+  `GROUP BY` (an article with no favorite has no row, and counts 0). A tag or
+  favorited page finds its ten authors the same way instead of ten lookups,
+  and a feed page with a floor is one scan over all of its viewer's followees
+  down to the floor instead of a walk for each. An article page's row comes
+  whole from group A's read by slug (its body, tag ids and times beside its
+  id), so `plan_meta` skips it, and the plan's `int8[]` parameters go in
+  binary. Replayed on a quiet copy of the seed, the 33 plans of two seconds at
+  15,000 users (statements and parameters as logged) spent 2.7 ms less each
+  in the executor: `plan_meta` 2.54 ms to 1.39 (`plan_article` 0.46 to
+  0.58), `plan_counts` 1.98 to 1.18, `plan_flags` 3.18 to 2.73, `plan_feed`
+  8.36 to 8.07, `plan_tag` 3.31 to 3.24, `plan_favorited` 0.29 to 0.25.
+  Index searches fell from 8.1 a request to 5.6. On a 4-CPU VM at 15,000
+  users (`-think-scale 0.25`, about 14,900 requests a second), five
+  alternating pairs of runs against `2f74875` took Postgres from 61.9 µs a
+  request to 59.0 and left the server's HTTP workers and read service at
+  27.3 and 27.4 (pairs: −3.2, −1.5, −0.6, −3.7 and −4.7 µs, bcrypt aside).
+- **Tag lists answered early.** `/api/tags` needs only its plan's tag
+  statement, so a tag read need not wait for the rest of the plan: the service
+  answers it when that statement ends (`EARLY_TAGS`, on), and the plan's send
+  skips it.
+- **Nice.** `LOOP_NICE=5` puts the HTTP workers and the read service at nice
+  5, so they yield to Postgres when the box is full. It is off, as in #196:
+  the build that scored 190,000 officially ran with it.
 - **Each author once.** `plan_meta` and `plan_comments` no longer join `users`
   row by row: a plan collects the distinct authors of its articles and
   comments, reads them with one `plan_users` statement, and writes each
@@ -295,12 +345,20 @@ and four on the box), and
   copies, text arrays are copied whole when they need no escaping, and no
   string is made per row. A read plan encodes each article and each comment
   once, and each answer is block copies of them with its viewer's flags.
+- **A longer login window.** Alone, a cost-10 hash took 58.6 ms in one
+  lane and 15.5 ms a hash in six, on a 2.1 GHz Xeon. A batch fills only as
+  fast as logins come, about 0.11% of requests. On a 4-CPU container at
+  14,800 requests a second, two runs each, a window of 290 ms (as many logins a
+  batch as 80 ms gets at the official 48,000 a second) cost the bcrypt
+  services 18.8 and 19.3 ms of CPU a login, and 550 ms (150 ms there) 17.8
+  and 17.9: about 1.3 µs a request at the official rate. Logins are too few
+  to move the overall p95 or p99; their own p95 rises by about the window.
 - **Tokens.** HS256 over an HMAC keyed once with `JWT_SECRET`: each
   signature copies the two keyed states. The signature, algorithm and
   expiry are checked on every request. Nothing is cached between requests.
 - **bcrypt.** Cost 10, with salts from the CSPRNG. Each bcrypt service
   batches up to four hashes or four checks into one four-lane bcrypt call,
-  after a collection window of up to 80 ms for checks (logins) and 20 ms
+  after a collection window of up to 150 ms for checks (logins) and 20 ms
   for hashes (sign-ups, which a 160 ms window kept waiting for company that
   rarely comes). A worker sends a login to the
   service whose batch is closest to full, else the least busy, so batches
@@ -323,7 +381,7 @@ CPUs, at least 2),
 `READ_PLAN_WAIT_US` (60000) and `READ_PLAN_MIN` (4096) for the batch clock,
 `READ_PLAN_CLOCK` (1; 0 starts a plan at once while none is in flight, 2
 is adaptive) and `READ_PLAN_LIGHT` (32), `BCRYPT_WORKERS` (half the CPUs,
-at least 2), `BCRYPT_BATCH_MS` (80) and `BCRYPT_HASH_MS` (20),
+at least 2), `BCRYPT_BATCH_MS` (150) and `BCRYPT_HASH_MS` (20),
 `BCRYPT_WIDTH` (what `build.sh` measured, else 6; 0 times the widths at startup; 1 to 6 lanes a call),
 `GZIP` (0; 1 when it saves a TCP segment, 2 whenever it saves anything; at
 145,000 users on the VM it cost about 30 µs a request and failed the hold),
@@ -386,6 +444,52 @@ fresh copy of the seed each time; CPU from `/proc` over a minute of the hold:
 | `cf7a78f`, two holds | 175,000 | PASS, PASS | 44,053–44,083 | 349–414 ms | 532–616 ms | 72.9–76.0 + 69.9–71.5 | 79–82% |
 | `a24c18d`, two holds past the VM's limit | 185,000 | FAIL, FAIL | 42,554–45,117 | 859–1,881 ms | 2,439–5,489 ms | 72.4–74.0 + 72.6–88.4 | 83–86% |
 | `cf7a78f`, two holds past the VM's limit | 185,000 | FAIL, FAIL | 44,126–45,194 | 886–1,652 ms | 2,431–4,395 ms | 74.9–76.8 + 73.4–77.4 | 84–86% |
+
+Lanes on connections of their own, against `6b5557b` (#196), alternated on
+the same VM, two holds each:
+
+| Build | Users | Verdict | req/s | p50 | p95 | p99 | Postgres + rest µs a request | Box busy |
+|---|--:|---|--:|--:|--:|--:|---|--:|
+| `6b5557b` | 175,000 | PASS, PASS | 43,849–43,918 | 201–208 ms | 363–388 ms | 518–539 ms | 65.4–66.6 + 68.9–69.6 | 75% |
+| this one | 175,000 | PASS, PASS | 44,698–44,733 | 133 ms | 226–230 ms | 362–366 ms | 70.7–70.8 + 65.9–66.0 | 77% |
+| `6b5557b` | 185,000 | PASS, PASS | 46,211–46,334 | 206–214 ms | 369–423 ms | 498–601 ms | 67.2–67.4 + 69.4–69.6 | 80% |
+| this one | 185,000 | PASS, PASS | 47,025–47,065 | 147–149 ms | 265–273 ms | 385–401 ms | 69.6–69.8 + 64.4–64.9 | 79% |
+
+The same CPU a request, a third less waiting. On the saturated run, where
+the CPU is all used, it is the other way: more statements at once cost about
+1 µs a request there and 230,000 failed twice (p95 639 and 691 ms, against
+448 for `6b5557b`). #196 scored 200,000 at 85% of the box and failed 210,000
+on p95 with CPU to spare, which is the VM's case, not the saturated run's.
+
+Then Nish 0.34.0, tag lists answered early and scheduling, alternated on the
+same VM, two holds each at 185,000. `SCHED_BATCH` on every process matched nice
+5 within these holds, and both together added nothing, so this build uses nice
+5, which needs no outside tool:
+
+| Build | Verdict | req/s | p50 | p95 | p99 | Postgres + rest µs a request | Box busy |
+|---|---|--:|--:|--:|--:|---|--:|
+| Nish 0.34.0, no early tags | FAIL, PASS | 46,103–46,936 | 154–157 ms | 314–543 ms | 442–1,924 ms | 71.1–71.9 + 66.6–68.3 | 81% |
+| with early tags | PASS, PASS | 47,314–47,354 | 128–131 ms | 254–255 ms | 386–404 ms | 70.7–71.5 + 63.8–64.8 | 80–81% |
+| this one, also nice 5 | PASS, PASS | 47,349–47,434 | 127–130 ms | 218–239 ms | 324–367 ms | 70.3–71.2 + 62.4–63.5 | 79–80% |
+
+The one FAIL is unexplained; that build's other hold passed. This VM cannot
+show the gain above about 190,000 users, where its network interrupts run out.
+
+Then Nish 0.34.1 and sorted ids, alternated on the same VM at 185,000 users
+with one CPU offline, so the box runs about 89% busy below its network limit.
+Both builds passed both holds:
+
+| Build | p95 | p99 | Postgres µs a request | Box busy |
+|---|--:|--:|--:|--:|
+| Nish 0.34.1, ids as met | 294–318 ms | 408–430 ms | 69.1–70.6 | 88–90% |
+| this one, ids sorted | 279–282 ms | 376–397 ms | 68.1–68.2 | 88–89% |
+
+`ANSWER_PACE` then went from 196,608 bytes a millisecond a worker to 130,000,
+about 2.1 Gbit/s across the two workers. `iperf3` tops out at 2.46 Gbit/s on the
+VM, so the old pace let a plan's answers out faster than its network carries
+them. At 200,000 users, alternated, p95 fell from 2,535–3,289 ms to 480–583 ms
+and retransmitted segments from about 12M a hold to about 2M. The official
+box's bandwidth is not known here.
 
 The window's extra wait shows as p95 while the box has room. At 185,000 the
 two builds' holds overlap: past the VM's limit its load box runs out of local
@@ -594,6 +698,13 @@ from the idea, not the code:
   and rust-epoll-WorriedArrow: reading each comment author once per batch.
   From the same two and zig-iouring-nick-potts: a feed's `following` needs no
   query. From WorriedArrow: far bigger batches than this server had kept.
+- From [rust-epoll-theCatWisel](https://github.com/arjaythedev/multicore-server-challenge/tree/main/submissions/rust-epoll-theCatWisel)
+  ([#201](https://github.com/arjaythedev/multicore-server-challenge/pull/201)):
+  answering tag lists and other cheap reads before the rest of the batch, here
+  tag lists only, and reactors at nice 5. From the same entry and
+  zig-iouring-nick-potts: trying `SCHED_BATCH`, measured here and not kept.
+  Sorting a batch's ids comes from zig-iouring-nick-potts's sorted entity ids,
+  also used by rust-epoll-theCatWisel.
 - `enable_memoize=off` as a session option was set first by
   [c-iouring-tigokraft](https://github.com/arjaythedev/multicore-server-challenge/tree/main/submissions/c-iouring-tigokraft)
   ([#10](https://github.com/arjaythedev/multicore-server-challenge/pull/10)),

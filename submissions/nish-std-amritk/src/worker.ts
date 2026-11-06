@@ -112,6 +112,7 @@ import {
   K_PROFILE,
   K_TAG,
   K_TAGS,
+  LANES_ALL,
   PLAN_ALONE,
   CountRun,
   ReadPlan,
@@ -558,7 +559,7 @@ export class WorkerConfig {
   /** How many count runs the read service runs at once. */
   countLanes: i32 = 1
   /** Bytes of the read service's answers a worker sends a millisecond (`ConduitWorker.takeAnswers`). */
-  answerPace: i32 = 196608
+  answerPace: i32 = 130000
   /** 0: no gzip; 1: gzip a body when that sends fewer TCP segments; 2: whenever it saves anything. */
   gzip: i32 = 0
   /** The shortest body gzip is tried on. */
@@ -1977,9 +1978,9 @@ export class ConduitWorker {
       }
       this.planGroupDone(p)
     } else if (this.planState[p] === PLAN_A) {
-      plan.eventA(conn, event, 2)
+      plan.eventA(conn, event, 0)
     } else {
-      plan.eventB(conn, event, 2)
+      plan.eventB(conn, event, 0)
     }
   }
 
@@ -2042,7 +2043,7 @@ export class ConduitWorker {
             continue
           }
           const plan: ReadPlan = this.plans[pi]
-          const bound: boolean = this.planState[pi] === PLAN_A ? plan.bindA(conn, 2) : plan.bindB(conn, 2)
+          const bound: boolean = this.planState[pi] === PLAN_A ? plan.bindA(conn, LANES_ALL, 0) : plan.bindB(conn, LANES_ALL, 0)
           if (!bound) {
             // The statements bound still run; the plan's requests go alone once they have.
             plan.failed = true
