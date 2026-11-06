@@ -5,8 +5,9 @@ Front: direct
 An update of this submission, scored at 91,000 users in #83 (`3de991e`),
 100,000 in #116 (`6e69d72`), 140,000 in #159 (`6cdf1fd`), 180,000 in
 #189 (`76a40a5`) and 200,000 in #196 (`6b5557b`), on the same design. Since
-#196: a plan's ids go to Postgres sorted, and tag lists are answered as soon as
-their statement ends. A plan's groups run as more lanes, which the read
+#196: a plan's ids go to Postgres sorted, each table read by one index scan
+over them, article pages read once, the plan's integer arrays sent in binary,
+and tag lists are answered as soon as their statement ends. A plan's groups run as more lanes, which the read
 service's pool pipelines four deep on up to 12 connections, as #196's did. Since #189: plans hold up to 4,096 reads
 over a 60 ms window instead of 2,048 over 40 ms, and Nish 0.32.0's faster
 bcrypt. Since #159: one read
@@ -123,12 +124,14 @@ and four on the box), and
   2. **Group B** reads the rest once for the whole plan: the columns of the
      union of every article group A returned (lists, feeds and article
      pages alike: an article on the first global page, a tag page and an
-     article page is read once), and the viewers' `favorited` and
+     article page is read once; an article page's whole row comes from
+     group A's read by slug, and group B only writes it), and the viewers' `favorited` and
      `following` flags (a profile's too), each viewer's in one index range
      scan over its ids (`= ANY(...)`) rather than one probe per article. The
-     plan sends them grouped by viewer, the distinct viewers as one array and
-     each viewer's ids as one array, so Postgres does not regroup (viewer, id)
-     pairs. An article's tags
+     plan sends them grouped by viewer: the distinct viewers as one array, all
+     their ids as another and each viewer's window of it as two more, every
+     one binary, so Postgres neither regroups (viewer, id) pairs nor parses
+     text. An article's tags
      come as ids and are named and ordered from group A's one read of every
      tag.
 
@@ -187,7 +190,30 @@ and four on the box), and
 - **Sorted ids.** `plan_meta`, `plan_counts` and `plan_users` read a plan's ids
   in the order its requests met them, so each index lookup landed far from the
   last. A radix sort puts them in ascending order as they are bound, so
-  neighbouring ids share index and heap pages (`SORT_IDS`, on).
+  neighbouring ids share index and heap pages (`SORT_IDS`, on, for
+  `plan_users`; the two below always sort).
+- **One index scan over a plan's ids.** `plan_meta` joined each of a plan's
+  thousand or so ids to the primary key, and read each one's tag ids with a
+  subquery, so every id descended two btrees from their roots; `plan_counts`
+  did the same on `favorites_article_idx`. Now each takes the sorted ids as
+  one `= ANY($1)`, whose scan steps from one id to the next along the leaf
+  pages, with the tag ids merge-joined beside the articles and the counts one
+  `GROUP BY` (an article with no favorite has no row, and counts 0). A tag or
+  favorited page finds its ten authors the same way instead of ten lookups,
+  and a feed page with a floor is one scan over all of its viewer's followees
+  down to the floor instead of a walk for each. An article page's row comes
+  whole from group A's read by slug (its body, tag ids and times beside its
+  id), so `plan_meta` skips it, and the plan's `int8[]` parameters go in
+  binary. Replayed on a quiet copy of the seed, the 33 plans of two seconds at
+  15,000 users (statements and parameters as logged) spent 2.7 ms less each
+  in the executor: `plan_meta` 2.54 ms to 1.39 (`plan_article` 0.46 to
+  0.58), `plan_counts` 1.98 to 1.18, `plan_flags` 3.18 to 2.73, `plan_feed`
+  8.36 to 8.07, `plan_tag` 3.31 to 3.24, `plan_favorited` 0.29 to 0.25.
+  Index searches fell from 8.1 a request to 5.6. On a 4-CPU VM at 15,000
+  users (`-think-scale 0.25`, about 14,900 requests a second), five
+  alternating pairs of runs against `2f74875` took Postgres from 61.9 µs a
+  request to 59.0 and left the server's HTTP workers and read service at
+  27.3 and 27.4 (pairs: −3.2, −1.5, −0.6, −3.7 and −4.7 µs, bcrypt aside).
 - **Tag lists answered early.** `/api/tags` needs only its plan's tag
   statement, so a tag read need not wait for the rest of the plan: the service
   answers it when that statement ends (`EARLY_TAGS`, on), and the plan's send
