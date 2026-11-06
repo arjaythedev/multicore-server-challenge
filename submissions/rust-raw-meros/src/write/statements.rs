@@ -1,7 +1,7 @@
 //! The prepared statements of a write lane. The SQL lives in `sql/*.sql` (parameters and output shapes are
 //! documented in each file's header) and is prepared once per connection, so a write costs one Bind/Execute.
 
-use crate::pg::{Connection, INT8, PgError, Stmt, TEXT, TEXT_ARRAY};
+use crate::pg::{Connection, INT8, INT8_ARRAY, PgError, Stmt, TEXT, TEXT_ARRAY};
 
 /// One handle per SQL file. A handle works only on the connection that prepared it.
 pub struct Statements {
@@ -19,10 +19,14 @@ pub struct Statements {
     pub unfavorite: Stmt,
     pub add_comment: Stmt,
     pub delete_comment: Stmt,
+    /// The array statements of `batch.rs`: one per run of jobs of a kind.
+    pub favorite_many: Stmt,
+    pub comment_many: Stmt,
+    pub follow_many: Stmt,
 }
 
 impl Statements {
-    /// Prepares every statement (14 round trips, once per connection).
+    /// Prepares every statement (17 round trips, once per connection).
     pub fn prepare(conn: &mut Connection) -> Result<Statements, PgError> {
         Ok(Statements {
             register: conn.prepare(
@@ -90,6 +94,21 @@ impl Statements {
                 "w_delete_comment",
                 include_str!("sql/delete_comment.sql"),
                 &[INT8, TEXT, INT8],
+            )?,
+            favorite_many: conn.prepare(
+                "w_favorite_many",
+                include_str!("sql/favorite_many.sql"),
+                &[INT8_ARRAY, TEXT_ARRAY, INT8_ARRAY],
+            )?,
+            comment_many: conn.prepare(
+                "w_comment_many",
+                include_str!("sql/comment_many.sql"),
+                &[TEXT_ARRAY, INT8_ARRAY, TEXT_ARRAY],
+            )?,
+            follow_many: conn.prepare(
+                "w_follow_many",
+                include_str!("sql/follow_many.sql"),
+                &[INT8_ARRAY, TEXT_ARRAY, INT8_ARRAY],
             )?,
         })
     }

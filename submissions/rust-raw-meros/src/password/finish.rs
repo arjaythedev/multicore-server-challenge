@@ -20,6 +20,7 @@ use super::outbox::Outbox;
 
 const MSG_INVALID_CREDENTIALS: &str = "invalid credentials";
 const MSG_INTERNAL: &str = "internal error";
+const MSG_BUSY: &str = "password service is busy, try again";
 
 /// Per-worker finishing state: the destination, the signer and a reusable token buffer.
 pub struct Finisher<'a, O: Outbox> {
@@ -41,6 +42,25 @@ impl<'a, O: Outbox> Finisher<'a, O> {
     pub fn finish_all(&mut self, batch: &mut Vec<PasswordJob>, verdicts: &[Verdict]) {
         for (job, verdict) in batch.drain(..).zip(verdicts) {
             self.finish(job, *verdict);
+        }
+    }
+
+    /// Answers 503 to every job of `batch` that has waited longer than `limit` and removes it from the batch.
+    pub fn shed_stale(&mut self, batch: &mut Vec<PasswordJob>, limit: std::time::Duration) {
+        let now = std::time::Instant::now();
+        let mut kept = 0;
+        for index in 0..batch.len() {
+            if now.saturating_duration_since(batch[index].queued_at) <= limit {
+                batch.swap(kept, index);
+                kept += 1;
+            }
+        }
+        for job in batch.drain(kept..) {
+            self.answer_error(job.origin, Status::ServiceUnavailable, MSG_BUSY);
+            POOL.put(job.buf);
+            if let PasswordKind::Hash { then } = job.kind {
+                POOL.put(then.buf);
+            }
         }
     }
 

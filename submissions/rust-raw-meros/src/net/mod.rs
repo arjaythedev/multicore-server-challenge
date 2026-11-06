@@ -2,6 +2,9 @@
 //!
 //! An io thread never blocks and never touches the database. A request that needs Postgres becomes a job for a
 //! lane thread; the lane renders the response and posts a [`Reply`] to the owning thread's [`Mailbox`].
+//!
+//! Not handled on purpose: TLS, HTTP/2, request pipelining beyond what the parser buffers, connection limits other than
+//! the descriptor limit (the listener retries when descriptors run out).
 
 mod conn;
 mod io_thread;

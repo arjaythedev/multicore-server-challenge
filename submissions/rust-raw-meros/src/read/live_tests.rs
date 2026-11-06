@@ -115,6 +115,54 @@ fn edge_cases_match_the_reference() {
     }
 }
 
+/// The feed merges per-followee lists in Rust up to `SHALLOW_CAP` (limit + offset) and asks the database beyond it:
+/// pages on both sides of that line, the biggest page SPEC allows, viewers with many followees, with none, and
+/// anonymous, in one batch and each alone, must all match the reference.
+#[test]
+#[ignore]
+fn feed_pages_on_both_sides_of_the_shallow_cap_match_the_reference() {
+    use super::feed::SHALLOW_CAP;
+    let mut h = Harness::connect();
+    let ids = |h: &mut Harness, sql: &str| -> Vec<i64> {
+        h.strings(sql).iter().map(|s| s.parse().unwrap()).collect()
+    };
+    let busy = ids(
+        &mut h,
+        "select follower_id::text from follows group by follower_id order by count(*) desc limit 3",
+    );
+    let loner = ids(
+        &mut h,
+        "select id::text from users where id not in (select follower_id from follows) limit 1",
+    );
+    let mut viewers = busy.clone();
+    viewers.extend(loner);
+    viewers.push(0);
+    viewers.push(Pools::sample(&mut h).followers[0]);
+    let cap = SHALLOW_CAP;
+    let pages = [
+        (10, 0),
+        (100, 0),
+        (1, 0),
+        (100, cap - 100),
+        (100, cap - 99),
+        (1, cap - 1),
+        (1, cap),
+        (20, 450),
+        (100, 2_000),
+        (5, 1_000_000),
+    ];
+    let mut reqs = Vec::new();
+    for &viewer in &viewers {
+        for &(limit, offset) in &pages {
+            reqs.push(Req::list(ListKind::Feed, viewer, "", limit, offset));
+        }
+    }
+    h.check_batch(&reqs);
+    for req in reqs.iter().step_by(3) {
+        h.check_batch(std::slice::from_ref(req));
+    }
+}
+
 #[test]
 #[ignore]
 fn duplicate_requests_share_rows_and_answer_alike() {

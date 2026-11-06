@@ -125,6 +125,18 @@ enum Access {
     None,
 }
 
+/// Everything the route families share: the raw buffer the `Field`s point into, the request, and the caller.
+struct Ctx<'a, 'r> {
+    buf: &'a [u8],
+    req: &'a Request<'r>,
+    /// User id of the authenticated caller, 0 when anonymous.
+    viewer: i64,
+    /// The bearer token bytes, empty when anonymous.
+    token: &'a [u8],
+}
+
+/// Authenticates according to the route, then hands the request to the family that owns the route.
+/// Routes that need no body or lookup (`Tags`, unknown paths) are answered here.
 fn plan_inner(
     jwt: &Jwt,
     now: u64,
@@ -133,14 +145,7 @@ fn plan_inner(
     scratch: &mut Scratch,
 ) -> Result<Plan, Rejection> {
     let found = route(req.method, req.path);
-    let access = match found {
-        Route::Register | Route::Login | Route::Tags | Route::NotFound => Access::None,
-        Route::Profile { .. }
-        | Route::ListArticles
-        | Route::Article { .. }
-        | Route::Comments { .. } => Access::Optional,
-        _ => Access::Required,
-    };
+    let access = access_for(&found);
     let auth = match access {
         Access::None => Auth::Anonymous,
         _ => authenticate(jwt, req.authorization, now),
@@ -150,16 +155,59 @@ fn plan_inner(
         (_, Auth::User { id, token }) => (id, token),
         (_, Auth::Anonymous) => (0, &[]),
     };
-    let segment = |scratch: &mut Scratch, raw: &[u8]| -> Field {
-        lookup_key(buf, scratch, &percent_decode(raw))
+    let cx = Ctx {
+        buf,
+        req,
+        viewer,
+        token,
     };
 
-    Ok(match found {
-        Route::NotFound => return Err(NOT_FOUND),
-        Route::Tags => Plan::Read(ReadPlan::new(ReadKind::Tags, 0)),
+    match found {
+        Route::NotFound => Err(NOT_FOUND),
+        Route::Tags => Ok(Plan::Read(ReadPlan::new(ReadKind::Tags, 0))),
+        Route::Register | Route::Login | Route::CurrentUser | Route::UpdateUser => {
+            plan_user(&cx, scratch, found)
+        }
+        Route::Profile { .. } | Route::Follow { .. } => plan_profile(&cx, scratch, found),
+        Route::ListArticles
+        | Route::Feed
+        | Route::Article { .. }
+        | Route::CreateArticle
+        | Route::UpdateArticle { .. }
+        | Route::DeleteArticle { .. }
+        | Route::Favorite { .. } => plan_article(&cx, scratch, found),
+        Route::Comments { .. } | Route::AddComment { .. } | Route::DeleteComment { .. } => {
+            plan_comment(&cx, scratch, found)
+        }
+    }
+}
+
+/// Whether a route needs a token, may use one, or ignores it. Reads of public data take an optional token so the
+/// answer can say what the viewer follows or favorited; everything that changes state requires one.
+fn access_for(found: &Route<'_>) -> Access {
+    match found {
+        Route::Register | Route::Login | Route::Tags | Route::NotFound => Access::None,
+        Route::Profile { .. }
+        | Route::ListArticles
+        | Route::Article { .. }
+        | Route::Comments { .. } => Access::Optional,
+        _ => Access::Required,
+    }
+}
+
+/// A percent-decoded path segment turned into a lookup key in the scratch area.
+fn segment(buf: &[u8], scratch: &mut Scratch, raw: &[u8]) -> Field {
+    lookup_key(buf, scratch, &percent_decode(raw))
+}
+
+/// Registration, login, the current user and user update. Not handled: profiles (see [`plan_profile`]).
+/// Register and an update that sets a password become [`Plan::Hash`] so the hash is computed off the I/O thread.
+fn plan_user(cx: &Ctx<'_, '_>, scratch: &mut Scratch, found: Route<'_>) -> Result<Plan, Rejection> {
+    let (buf, body_bytes) = (cx.buf, cx.req.body);
+    match found {
         Route::Register => {
-            let r = body::register(buf, req.body, scratch).map_err(unprocessable)?;
-            Plan::Hash {
+            let r = body::register(buf, body_bytes, scratch).map_err(unprocessable)?;
+            Ok(Plan::Hash {
                 viewer: 0,
                 password: r.password,
                 then: WriteKind::Register {
@@ -167,51 +215,76 @@ fn plan_inner(
                     email: r.email,
                     password_hash: [0; 60],
                 },
-            }
+            })
         }
         Route::Login => {
-            let r = body::login(buf, req.body, scratch).map_err(unprocessable)?;
+            let r = body::login(buf, body_bytes, scratch).map_err(unprocessable)?;
             let mut read = ReadPlan::new(ReadKind::LoginLookup, 0);
             read.key = r.email;
             read.password = r.password;
-            Plan::Read(read)
+            Ok(Plan::Read(read))
         }
         Route::CurrentUser => {
-            let mut read = ReadPlan::new(ReadKind::CurrentUser, viewer);
-            read.token = field_of(buf, token);
-            Plan::Read(read)
+            let mut read = ReadPlan::new(ReadKind::CurrentUser, cx.viewer);
+            read.token = field_of(buf, cx.token);
+            Ok(Plan::Read(read))
         }
         Route::UpdateUser => {
-            let u = body::update_user(buf, req.body, scratch).map_err(unprocessable)?;
+            let u = body::update_user(buf, body_bytes, scratch).map_err(unprocessable)?;
             let kind = WriteKind::UpdateUser {
                 email: u.email,
                 username: u.username,
                 password_hash: None,
                 bio: u.bio,
                 image: u.image,
-                token: field_of(buf, token),
+                token: field_of(buf, cx.token),
             };
-            match u.password {
+            let viewer = cx.viewer;
+            Ok(match u.password {
                 Some(password) => Plan::Hash {
                     viewer,
                     password,
                     then: kind,
                 },
                 None => Plan::Write { viewer, kind },
-            }
+            })
         }
+        _ => Err(NOT_FOUND), // not a user route; `plan_inner` never sends one here
+    }
+}
+
+/// Reading a profile and following or unfollowing its owner. The username is the only input.
+fn plan_profile(
+    cx: &Ctx<'_, '_>,
+    scratch: &mut Scratch,
+    found: Route<'_>,
+) -> Result<Plan, Rejection> {
+    match found {
         Route::Profile { username } => {
-            let mut read = ReadPlan::new(ReadKind::Profile, viewer);
-            read.key = segment(scratch, username);
-            Plan::Read(read)
+            let mut read = ReadPlan::new(ReadKind::Profile, cx.viewer);
+            read.key = segment(cx.buf, scratch, username);
+            Ok(Plan::Read(read))
         }
-        Route::Follow { username, follow } => Plan::Write {
-            viewer,
+        Route::Follow { username, follow } => Ok(Plan::Write {
+            viewer: cx.viewer,
             kind: WriteKind::Follow {
-                username: segment(scratch, username),
+                username: segment(cx.buf, scratch, username),
                 follow,
             },
-        },
+        }),
+        _ => Err(NOT_FOUND), // not a profile route; `plan_inner` never sends one here
+    }
+}
+
+/// Listing, the feed, and reading, creating, updating, deleting and favoriting one article.
+/// Not handled: comments (see [`plan_comment`]). Paging is validated before any scratch space is used.
+fn plan_article(
+    cx: &Ctx<'_, '_>,
+    scratch: &mut Scratch,
+    found: Route<'_>,
+) -> Result<Plan, Rejection> {
+    let (buf, req, viewer) = (cx.buf, cx.req, cx.viewer);
+    match found {
         Route::ListArticles => {
             let (limit, offset) = paging(req.query)?;
             let (kind, key) = list_filter(buf, req.query, scratch);
@@ -219,28 +292,23 @@ fn plan_inner(
             read.key = key;
             read.limit = limit;
             read.offset = offset;
-            Plan::Read(read)
+            Ok(Plan::Read(read))
         }
         Route::Feed => {
             let (limit, offset) = paging(req.query)?;
             let mut read = ReadPlan::new(ReadKind::List(ListKind::Feed), viewer);
             read.limit = limit;
             read.offset = offset;
-            Plan::Read(read)
+            Ok(Plan::Read(read))
         }
         Route::Article { slug } => {
             let mut read = ReadPlan::new(ReadKind::Article, viewer);
-            read.key = segment(scratch, slug);
-            Plan::Read(read)
-        }
-        Route::Comments { slug } => {
-            let mut read = ReadPlan::new(ReadKind::Comments, viewer);
-            read.key = segment(scratch, slug);
-            Plan::Read(read)
+            read.key = segment(buf, scratch, slug);
+            Ok(Plan::Read(read))
         }
         Route::CreateArticle => {
             let a = body::new_article(buf, req.body, scratch).map_err(unprocessable)?;
-            Plan::Write {
+            Ok(Plan::Write {
                 viewer,
                 kind: WriteKind::CreateArticle {
                     slug_base: a.slug_base,
@@ -249,55 +317,74 @@ fn plan_inner(
                     body: a.body,
                     tags: a.tags,
                 },
-            }
+            })
         }
         Route::UpdateArticle { slug } => {
             let e = body::article_edit(buf, req.body, scratch).map_err(unprocessable)?;
-            Plan::Write {
+            Ok(Plan::Write {
                 viewer,
                 kind: WriteKind::UpdateArticle {
-                    slug: segment(scratch, slug),
+                    slug: segment(buf, scratch, slug),
                     slug_base: e.slug_base,
                     title: e.title,
                     description: e.description,
                     body: e.body,
                 },
-            }
+            })
         }
-        Route::DeleteArticle { slug } => Plan::Write {
+        Route::DeleteArticle { slug } => Ok(Plan::Write {
             viewer,
             kind: WriteKind::DeleteArticle {
-                slug: segment(scratch, slug),
+                slug: segment(buf, scratch, slug),
             },
-        },
-        Route::Favorite { slug, favorite } => Plan::Write {
+        }),
+        Route::Favorite { slug, favorite } => Ok(Plan::Write {
             viewer,
             kind: WriteKind::Favorite {
-                slug: segment(scratch, slug),
+                slug: segment(buf, scratch, slug),
                 favorite,
             },
-        },
+        }),
+        _ => Err(NOT_FOUND), // not an article route; `plan_inner` never sends one here
+    }
+}
+
+/// Listing, adding and deleting the comments of an article. A comment id that is not a non-negative integer names
+/// nothing, so it is a 404 rather than a 422.
+fn plan_comment(
+    cx: &Ctx<'_, '_>,
+    scratch: &mut Scratch,
+    found: Route<'_>,
+) -> Result<Plan, Rejection> {
+    let (buf, viewer) = (cx.buf, cx.viewer);
+    match found {
+        Route::Comments { slug } => {
+            let mut read = ReadPlan::new(ReadKind::Comments, viewer);
+            read.key = segment(buf, scratch, slug);
+            Ok(Plan::Read(read))
+        }
         Route::AddComment { slug } => {
-            let text = body::comment(buf, req.body, scratch).map_err(unprocessable)?;
-            Plan::Write {
+            let text = body::comment(buf, cx.req.body, scratch).map_err(unprocessable)?;
+            Ok(Plan::Write {
                 viewer,
                 kind: WriteKind::AddComment {
-                    slug: segment(scratch, slug),
+                    slug: segment(buf, scratch, slug),
                     body: text,
                 },
-            }
+            })
         }
         Route::DeleteComment { slug, id } => {
             let comment_id = parse_int(id).filter(|&n| n >= 0).ok_or(NOT_FOUND)?;
-            Plan::Write {
+            Ok(Plan::Write {
                 viewer,
                 kind: WriteKind::DeleteComment {
-                    slug: segment(scratch, slug),
+                    slug: segment(buf, scratch, slug),
                     comment_id,
                 },
-            }
+            })
         }
-    })
+        _ => Err(NOT_FOUND), // not a comment route; `plan_inner` never sends one here
+    }
 }
 
 fn unprocessable(message: &'static str) -> Rejection {

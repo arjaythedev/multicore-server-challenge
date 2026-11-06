@@ -1,4 +1,4 @@
-//! Password service: bcrypt on dedicated, low-priority threads.
+//! Password service: bcrypt on dedicated threads in the lowest scheduling class.
 //!
 //! Two kinds of work arrive in one [`PasswordQueue`]: *verify* (a login, after the read lane fetched the stored
 //! hash) and *hash* (a register or password change that continues as a write once the hash exists). A worker
@@ -11,6 +11,12 @@
 //! Memory: the request buffer is never copied. A login answer reuses a pooled buffer and returns the request
 //! buffer to the pool; a hash job moves the request buffer into the follow-up write job. Per batch the only heap
 //! allocation is the `Vec` of digests that `bcrypt::hash_many` returns.
+//!
+//! Overload: the threads run in `SCHED_IDLE`, so password hashing takes only the CPU that the io threads and Postgres
+//! leave. Under saturation hashing slows down, a login waits, and a job older than [`STALE_AFTER`] is answered 503
+//! unhashed (its client times out at 10 s anyway, so hashing it would burn a core for nobody). Nothing is skipped:
+//! a login that is answered 200 was verified against the stored hash with the full cost, and a login that cannot be
+//! served in time fails. Logins and sign-ups are about 0.1% of the requests, so the error budget absorbs it.
 //!
 //! Not handled on purpose: empty passwords (the app rejects them first), priorities between jobs (FIFO), and
 //! retrying a failed system random source (the request gets a 500).
@@ -25,7 +31,6 @@ mod tests;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use crate::config::Config;
 use crate::jwt::Jwt;
 use crate::net::Mailboxes;
 use crate::sys::{self, SchedClass};
@@ -37,14 +42,15 @@ pub use queue::PasswordQueue;
 
 /// Cost factor of every hash this server writes (challenge rule: bcrypt cost 10).
 pub const BCRYPT_COST: u32 = 10;
+/// A password job that waited this long is shed. The load generator gives up on a request after 10 s, so a job older
+/// than 8 s has no client left to answer, and hashing it would take CPU from the requests that still have one.
+pub const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(8);
 /// Lifetime of a login token in seconds.
 pub const TOKEN_TTL_SECS: u64 = 30 * 24 * 3600;
 
 /// Starts `count` bcrypt threads. They end when [`PasswordQueue::close`] is called and the queue is drained.
-/// `config` is reserved for tuning knobs; the gather window is already in the queue.
 pub fn spawn_threads(
     count: usize,
-    _config: &Config,
     queue: Arc<PasswordQueue>,
     mailboxes: Mailboxes,
     writes: Arc<WriteQueue>,
@@ -58,7 +64,7 @@ pub fn spawn_threads(
                 .name(format!("bcrypt-{i}"))
                 .spawn(move || {
                     // Failure only means the thread keeps the normal class.
-                    let _ = sys::set_thread_sched(SchedClass::Batch);
+                    let _ = sys::set_thread_sched(SchedClass::Idle);
                     run(&queue, &*outbox, &jwt);
                 })
                 .ok()
@@ -72,6 +78,10 @@ fn run<O: Outbox>(queue: &PasswordQueue, outbox: &O, jwt: &Jwt) {
     let mut finisher = finish::Finisher::new(outbox, jwt);
     let mut batch = Vec::with_capacity(crate::bcrypt::MAX_LANES);
     while queue.take_batch(&mut batch) {
+        finisher.shed_stale(&mut batch, STALE_AFTER);
+        if batch.is_empty() {
+            continue;
+        }
         computer.compute(&batch);
         finisher.finish_all(&mut batch, computer.verdicts());
     }
