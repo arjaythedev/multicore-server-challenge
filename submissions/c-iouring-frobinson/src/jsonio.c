@@ -3,19 +3,7 @@
 
 // rw: A strict JSON parser (RFC 8259, as Go's encoding/json accepts it) into an arena-allocated tree.
 
-
 #include "app.h"
-// Own fast-path (rewrite, inspired by rust-mio 8B scan + rust-tokio SSE2): ASCII-only object key skip.
-// rw: Scans keys without UTF-8 decode when bytes are ASCII (common: usernames, slugs, tags). Falls back to full
-
-// rw: parser on non-ASCII/escapes. Identical output, fewer branches. Adds ~50 new lines vs base.
-
-static bool json_is_ascii_key(const char *p, const char *e) {
-    for (; p < e; p++) { unsigned char c = *p; if (c >= 0x80 || c == '"' || c == '\\') return false; if (c < 0x20) return false; }
-    return true;
-}
-void jsonio_ascii_note(void) {}
-
 
 typedef struct { const char *p, *end; arena_t *a; int depth; } jp_t;
 

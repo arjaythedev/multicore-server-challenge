@@ -19,9 +19,6 @@
 #if BC_LANES > 6
 #error "BC_LANES max 6 (L1d 32KB)"
 #endif
-// rw: Future 6-lane entry (stub, compiled): same EksBlowfish core, 6-way interleave, L1d-resident.
-
-void passwd_future_6lane_note(void) {}
 
 // rw: bcrypt ($2a$ / $2b$ / $2y$), computing up to BC_LANES hashes at once in one thread.
 
@@ -131,6 +128,8 @@ EKS_N(1)
 EKS_N(2)
 EKS_N(3)
 EKS_N(4)
+EKS_N(5)
+EKS_N(6)
 
 // rw: ---------- bcrypt's base64 and setting strings ----------
 
@@ -218,6 +217,7 @@ bool bc_gensalt(char setting[30]) {
 // rw: full 60-char hash string: the setting's prefix and salt, then the 31-char hash.
 
 void bc_hash_n(int n, const char *const *pw, const char *const *setting, char (*out)[64]) {
+    if (n < 1 || n > BC_LANES) die("bcrypt: bad lane count %d (max %d)", n, BC_LANES);
     uint32_t kw[BC_LANES][18], sw[BC_LANES][4];
     uint8_t ct[BC_LANES][24];
     int cost = 0;
@@ -229,7 +229,10 @@ void bc_hash_n(int n, const char *const *pw, const char *const *setting, char (*
     case 1: eks1((const uint32_t(*)[18])kw, (const uint32_t(*)[4])sw, cost, ct); break;
     case 2: eks2((const uint32_t(*)[18])kw, (const uint32_t(*)[4])sw, cost, ct); break;
     case 3: eks3((const uint32_t(*)[18])kw, (const uint32_t(*)[4])sw, cost, ct); break;
-    default: eks4((const uint32_t(*)[18])kw, (const uint32_t(*)[4])sw, cost, ct); break;
+    case 4: eks4((const uint32_t(*)[18])kw, (const uint32_t(*)[4])sw, cost, ct); break;
+    case 5: eks5((const uint32_t(*)[18])kw, (const uint32_t(*)[4])sw, cost, ct); break;
+    case 6: eks6((const uint32_t(*)[18])kw, (const uint32_t(*)[4])sw, cost, ct); break;
+    default: die("bcrypt: bad lane count %d", n);
     }
     for (int l = 0; l < n; l++) {
         memcpy(out[l], setting[l], 29); // "$2b$10$" + 22 salt chars, as given

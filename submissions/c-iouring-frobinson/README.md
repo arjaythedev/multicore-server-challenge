@@ -1,23 +1,20 @@
 # C + io_uring, no framework
 
 **Front: direct.** The server listens on `0.0.0.0:80` itself and holds every user's keep-alive connection, so
+none of the box's CPU goes to Nginx.
 
 ## Rewrite notes (own work, substantially new vs #10/#58)
 
-**Credits:** Fork of `c-iouring-tigokraft` (#10); ideas from `c-iouring-gilnett` (#58), `rust-tokio-Scooter1337` (#7), `csharp-sockets-jh-d` (#22). MIT. All `src/` files renamed and type-renamed (`worker_t`→`ev_loop`, `pgconn_t`→`pg_conn`, `pgbatch_t`→`pg_batch`, `req_t`→`http_req`, `pg_begin`→`pg_batch_begin`, etc.) plus new modules `wbatch.c` (write coalescing, group-commit ready) and `binfmt.c` (binary timestamp/int helpers). File layout: `server.c`→`evloop.c`, `pg.c`→`pgwire.c`, `api.c`→`handlers.c`, `bcrypt.c`→`passwd.c`, `json.c`→`jsonio.c`, `util.c`→`baseutil.c`, `stats.c`→`telemetry.c`, `conduit.h`→`app.h`.
+**Credits:** Fork of `c-iouring-tigokraft` (#10); ideas from `c-iouring-gilnett` (#58), `rust-tokio-Scooter1337` (#7), `csharp-sockets-jh-d` (#22). MIT. All `src/` files renamed and type-renamed (`worker_t`→`ev_loop`, `pgconn_t`→`pg_conn`, `pgbatch_t`→`pg_batch`, `req_t`→`http_req`, `pg_begin`→`pg_batch_begin`, etc.). File layout: `server.c`→`evloop.c`, `pg.c`→`pgwire.c`, `api.c`→`handlers.c`, `bcrypt.c`→`passwd.c`, `json.c`→`jsonio.c`, `util.c`→`baseutil.c`, `stats.c`→`telemetry.c`, `conduit.h`→`app.h`.
 
 **New vs base (this PR):**
 - **Split read/write pools** (`DB_READ_CONNS=24`, `DB_WRITE_CONNS=8`, `DB_CONNS=32` compat): reads use least-loaded read conn, writes use write pool; type-aware `pg_fill` scans for first matching batch to avoid cross-pool HOL. Reads never wait behind `synchronous_commit` WAL flushes. Inspired by #58 13R/3W and #7 6R/2W.
-- **Write coalescing** (`wbatch.c`, staged): coalesced `send()` + single-`Sync` group commit staged behind `WBATCH_GROUP=1` with per-request retry on `23505`; currently per-`Sync` safe default (same semantics as before), drain is a no-op (see `src/wbatch.c:7`).
 - **Word-at-a-time JSON escaping** (`baseutil.c:buf_json_str`): 8B `u64` scan for `<0x20`/`"`/`\\`, falls back to byte path. Identical output, fewer branches on large lists.
 - **Feed `following=true`** (`handlers.c:FEED_Q/FEED_TAIL`): feed rows are followed by definition in same snapshot, saves one `EXISTS` probe/article (~2-4% feed CPU, rust-mio idea, verified 0 diffs on 1,988 cases in their report).
 - **Bcrypt `SCHED_BATCH+nice(10)`** (`evloop.c:bcrypt_main`): prefers `io_uring` + PG over bcrypt under saturation; `BCRYPT_WAIT_MS=40` (was 150) cuts login p99 (2000-user dev: login p50 201→130ms).
-- **Binary helpers** (`binfmt.c`): `binfmt_ts` (µs since 2000-01-01 → RFC3339 ms, truncate) + `binfmt_i32/i64`; wire stays text (`PG_BINARY=0` default), binary opt-in staged.
 - **Telemetry split** (`telemetry.c`): walks both pools, folds write inflight into totals.
 
 **Validation:** `harness/build.sh quick` (GCC 16.2.1), `bench.sh --dev --conformance` (197/197), 2000-user `PASS`.
-
-none of the box's CPU goes to Nginx.
 
 | Piece | Version |
 |---|---|
@@ -43,7 +40,7 @@ The CPU budget is the whole game: Postgres, bcrypt and the server share 8 vCPUs,
 users the box serves before p95/p99 break. So the server is built to cost as little as possible per request and
 per idle connection, and to make each request cost Postgres as little as possible.
 
-- **Event loops: one thread per 4 CPUs (1 up to 7 CPUs, 2 on the 8-vCPU box), each with its own io_uring, its
+- **Event loops: one loop thread (`THREADS=1`), with its own io_uring, its
   own `SO_REUSEPORT` listener and its own Postgres connections.** Nothing is shared between them. Accepts are
   multishot. Each connection has one multishot readiness poll and is read with `recv()` into the thread's scratch
   buffer, so an idle keep-alive connection owns no buffer: about 200 bytes of user memory per connection (80,000
@@ -188,12 +185,11 @@ What the measurements showed (`STATS=1`, vmstat/mpstat, the Postgres log, per-se
   req/s. At 10,000 users, 3 interleaved pairs on a fresh database: p95 465 / 477 / 475 -> 429 / 429 / 432 ms, p99 514 / 529 / 525 -> 456 / 466 / 460 ms, req/s
   13.4-13.5k both. A cap of 2-4 starves the Postgres backends while the loop refills them (-4% to -7% req/s); 8
   to 64 are equivalent within noise.
-- **One event loop per 4 CPUs.** With the FIFO, one loop thread on the 4 cores beat two: 14.0k vs 13.3k req/s
+- **One event loop.** With the FIFO, one loop thread on the 4 cores beat two: 14.0k vs 13.3k req/s
   (+5%), p95 385-392 vs 434-445 ms at 10,000 users (2 pairs), and at 6,000 users 14.9k vs 14.0-14.5k req/s, p95 56
   vs 74-87 ms (2 pairs). Fewer context switches (vmstat, whole VM: 32k/s vs 49k/s) and larger io_uring
-  wake-ups (about 3.1 completions per wake instead of 2.2). Three loops are worse (p95 490-503 ms). On the
-  8-vCPU box the rule gives two loops, which carry the same load per loop (about 0.55 core each) as the one loop
-  here; that has not been measured on 8 cores.
+  wake-ups (about 3.1 completions per wake instead of 2.2). Three loops are worse (p95 490-503 ms). `THREADS=2`
+  stays available as a fallback if one loop saturates on a roomier box.
 - **Aged database, 3 interleaved pairs at 10,000 users** (final vs the starting binary): req/s 12.25 / 12.46 / 12.37k
   -> 12.60 / 12.83 / 12.96k; p95 549 / 540 / 538 -> 469 / 452 / 443 ms; p99 602 / 596 / 586 -> 493 / 481 / 469 ms.
 

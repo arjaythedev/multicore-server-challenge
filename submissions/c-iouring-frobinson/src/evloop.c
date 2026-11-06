@@ -33,7 +33,7 @@ config_t CFG;
 
 #define RBUF_SIZE 65536
 #define MAX_HEADER 65536
-#define MAX_BODY (8 << 20)
+#define MAX_BODY (1 << 20) // biggest honest body is a few KB; bound slowloris/arena memory per connection
 
 struct io_uring_sqe *ev_next_sqe(ev_loop *ev) {
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ev->ring);

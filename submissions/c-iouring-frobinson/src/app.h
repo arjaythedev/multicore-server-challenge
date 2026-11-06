@@ -276,7 +276,9 @@ void arena_recycle(struct ev_loop *ev, arena_t *a);
 // rw: ---------- bcrypt (bcrypt.c) ----------
 
 
+#ifndef BC_LANES
 #define BC_LANES 4
+#endif
 bool bc_gensalt(char setting[30]);
 int bc_cost(const char *setting); // -1 if not a $2a$/$2b$/$2y$ setting this implementation handles
 void bc_hash_n(int n, const char *const *pw, const char *const *setting, char (*out)[64]);

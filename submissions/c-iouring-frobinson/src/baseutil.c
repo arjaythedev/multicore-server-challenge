@@ -62,34 +62,37 @@ void buf_i64(buf_t *b, int64_t v) {
 static const char HEX[] = "0123456789abcdef";
 
 // Word-at-a-time fast path for JSON escaping (own implementation, inspired by rust-mio 8B scan + SSE2 idea).
-// rw: Scans 8 bytes via unaligned u64 load; bits trick detects bytes <0x20 or '"' (0x22) or '\\' (0x5C).
+// Scans 8 bytes via unaligned u64 load; a bit trick flags bytes < 0x20, '"' (0x22) or '\\' (0x5C).
+// Falls back to the byte loop for tails and specials. Identical output to the byte loop.
 
-// rw: Falls back to byte loop for tail/specials. Identical output to byte loop.
+// First offset >= i whose byte needs escaping (< 0x20, '"' or '\\').
+// Bytes >= 0x80 pass through to the raw copy, like the byte loop below.
+static size_t json_scan(const char *s, size_t n, size_t i) {
+    while (i + 8 <= n) {
+        uint64_t word;
+        __builtin_memcpy(&word, s + i, 8);
+        uint64_t lo = word & 0x7F7F7F7F7F7F7F7FULL;
+        // bit set iff a low byte is < 0x20 (b + 0x60 stays below 0x80); high bytes masked out
+        uint64_t is_ctrl = (~word & 0x8080808080808080ULL) & ~(lo + 0x6060606060606060ULL) & 0x8080808080808080ULL;
+        uint64_t tmp = word ^ 0x2222222222222222ULL;
+        uint64_t is_q = ((tmp - 0x0101010101010101ULL) & ~tmp & 0x8080808080808080ULL);
+        tmp = word ^ 0x5C5C5C5C5C5C5C5CULL;
+        uint64_t is_bs = ((tmp - 0x0101010101010101ULL) & ~tmp & 0x8080808080808080ULL);
+        if ((is_ctrl | is_q | is_bs) == 0) { i += 8; continue; }
+        break;
+    }
+    return i;
+}
 
 void buf_json_str(buf_t *b, const char *s, size_t n) {
     if (b->cap - b->len < n + 2) buf_grow(b, n + 2);
     b->p[b->len++] = '"';
     size_t start = 0, i = 0;
-    // rw: fast run: copy 8-byte chunks with no specials
-
-    while (i + 8 <= n) {
-        uint64_t word;
-        __builtin_memcpy(&word, s + i, 8);
-        // rw: high-bit per byte if <0x20, or == '"' or '\\'
-
-        uint64_t lo = word & 0x7F7F7F7F7F7F7F7FULL;
-        uint64_t has_ctrl = (lo + 0x6060606060606060ULL) & ~(word & 0x8080808080808080ULL) & 0x8080808080808080ULL;
-        uint64_t is_q = 0, is_bs = 0;
-        uint64_t tmp = word ^ 0x2222222222222222ULL;
-        is_q = ((tmp - 0x0101010101010101ULL) & ~tmp & 0x8080808080808080ULL);
-        tmp = word ^ 0x5C5C5C5C5C5C5C5CULL;
-        is_bs = ((tmp - 0x0101010101010101ULL) & ~tmp & 0x8080808080808080ULL);
-        if ((has_ctrl | is_q | is_bs) == 0) { i += 8; continue; }
-        break;
-    }
-    for (; i < n; i++) {
+    for (;;) {
+        i = json_scan(s, n, i);
+        if (i >= n) break;
         unsigned char c = s[i];
-        if (__builtin_expect(c >= 0x20 && c != '"' && c != '\\', 1)) continue;
+        if (c >= 0x20 && c != '"' && c != '\\') { i++; continue; }
         buf_put(b, s + start, i - start);
         start = i + 1;
         switch (c) {
@@ -103,34 +106,7 @@ void buf_json_str(buf_t *b, const char *s, size_t n) {
             buf_put(b, e, 6);
         }
         }
-        // rw: resume fast path after one special
-
-        size_t j = i + 1;
-        while (j + 8 <= n) {
-            uint64_t word;
-            __builtin_memcpy(&word, s + j, 8);
-            uint64_t lo = word & 0x7F7F7F7F7F7F7F7FULL;
-            uint64_t has_ctrl = (lo + 0x6060606060606060ULL) & ~(word & 0x8080808080808080ULL) & 0x8080808080808080ULL;
-            uint64_t tmp = word ^ 0x2222222222222222ULL;
-            uint64_t is_q = ((tmp - 0x0101010101010101ULL) & ~tmp & 0x8080808080808080ULL);
-            tmp = word ^ 0x5C5C5C5C5C5C5C5CULL;
-            uint64_t is_bs = ((tmp - 0x0101010101010101ULL) & ~tmp & 0x8080808080808080ULL);
-            if ((has_ctrl | is_q | is_bs) == 0) { j += 8; continue; }
-            break;
-        }
-        // rw: copy the fast run we just skipped (will be handled by outer loop's continue check)
-
-        // rw: To keep logic simple, set i = j-1 so outer i++ lands on j
-
-        if (j > i + 1) {
-            // rw: flush pending run up to j via start adjustment: outer loop will scan byte-by-byte from i+1,
-
-            // rw: but those bytes are known clean, so fast-forward
-
-            i = j - 1;
-            // rw: start already at correct place (after last special), no extra copy needed yet
-
-        }
+        i++;
     }
     buf_put(b, s + start, n - start);
     buf_putc(b, '"');
