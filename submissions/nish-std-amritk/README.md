@@ -319,12 +319,20 @@ and four on the box), and
   copies, text arrays are copied whole when they need no escaping, and no
   string is made per row. A read plan encodes each article and each comment
   once, and each answer is block copies of them with its viewer's flags.
+- **A longer login window.** Alone, a cost-10 hash took 58.6 ms in one
+  lane and 15.5 ms a hash in six, on a 2.1 GHz Xeon. A batch fills only as
+  fast as logins come, about 0.11% of requests. On a 4-CPU container at
+  14,800 requests a second, two runs each, a window of 290 ms (as many logins a
+  batch as 80 ms gets at the official 48,000 a second) cost the bcrypt
+  services 18.8 and 19.3 ms of CPU a login, and 550 ms (150 ms there) 17.8
+  and 17.9: about 1.3 µs a request at the official rate. Logins are too few
+  to move the overall p95 or p99; their own p95 rises by about the window.
 - **Tokens.** HS256 over an HMAC keyed once with `JWT_SECRET`: each
   signature copies the two keyed states. The signature, algorithm and
   expiry are checked on every request. Nothing is cached between requests.
 - **bcrypt.** Cost 10, with salts from the CSPRNG. Each bcrypt service
   batches up to four hashes or four checks into one four-lane bcrypt call,
-  after a collection window of up to 80 ms for checks (logins) and 20 ms
+  after a collection window of up to 150 ms for checks (logins) and 20 ms
   for hashes (sign-ups, which a 160 ms window kept waiting for company that
   rarely comes). A worker sends a login to the
   service whose batch is closest to full, else the least busy, so batches
@@ -347,7 +355,7 @@ CPUs, at least 2),
 `READ_PLAN_WAIT_US` (60000) and `READ_PLAN_MIN` (4096) for the batch clock,
 `READ_PLAN_CLOCK` (1; 0 starts a plan at once while none is in flight, 2
 is adaptive) and `READ_PLAN_LIGHT` (32), `BCRYPT_WORKERS` (half the CPUs,
-at least 2), `BCRYPT_BATCH_MS` (80) and `BCRYPT_HASH_MS` (20),
+at least 2), `BCRYPT_BATCH_MS` (150) and `BCRYPT_HASH_MS` (20),
 `BCRYPT_WIDTH` (what `build.sh` measured, else 6; 0 times the widths at startup; 1 to 6 lanes a call),
 `GZIP` (0; 1 when it saves a TCP segment, 2 whenever it saves anything; at
 145,000 users on the VM it cost about 30 µs a request and failed the hold),

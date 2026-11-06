@@ -17,7 +17,7 @@
 // for the read connections, DB_READ_PLANS (10) read plans in flight
 // per worker, READ_PLAN_MIN (4096), READ_PLAN_WAIT_US (60000) and
 // READ_PLAN_CLOCK (1; 2 adaptive, with READ_PLAN_LIGHT 32) for when a plan starts (worker.ts, `planWaitLeft`),
-// BCRYPT_WORKERS (half the CPUs, at least 2), BCRYPT_BATCH_MS (80) for logins
+// BCRYPT_WORKERS (half the CPUs, at least 2), BCRYPT_BATCH_MS (150) for logins
 // and BCRYPT_HASH_MS (20) for sign-ups (bcrypt-service.ts),
 // BCRYPT_PORT (47391), BCRYPT_NICE (0; 1 to 19 lowers the bcrypt services'
 // priority, and "idle" moves them to SCHED_IDLE), IDLE_TIMEOUT_MS (75000) and
@@ -237,7 +237,7 @@ export const main = (): i32 => {
       console.log(`conduit: bcrypt runs ${width} lanes a call`)
     }
     lowerPriority(getenv("BCRYPT_NICE") ?? "0")
-    return runBcryptService(listener, envInt("BCRYPT_BATCH_MS", 80), envInt("BCRYPT_HASH_MS", 20), width)
+    return runBcryptService(listener, envInt("BCRYPT_BATCH_MS", 150), envInt("BCRYPT_HASH_MS", 20), width)
   }
   const listener: i32 = tcpListenFlags(cfg.host, cfg.port, cfg.backlog, LISTEN_FLAGS)
   if (listener < 0) {
