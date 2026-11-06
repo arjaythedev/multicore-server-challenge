@@ -1,0 +1,18 @@
+# Credentials
+.env
+.env.*
+!.env.example
+
+# Diagnostic outputs
+runs/
+data/
+*.csv
+
+# Temporary files
+*.tmp
+*.swp
+
+runtime.env
+*.pyc
+__pycache__/
+*~
