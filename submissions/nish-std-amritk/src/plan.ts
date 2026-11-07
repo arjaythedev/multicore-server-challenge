@@ -82,8 +82,12 @@ export const LANES_ALL: i32 = 31
 /** The most requests one plan takes, and the most bytes of keys. */
 export const PLAN_MAX: i32 = 4096
 export const PLAN_KEY_BYTES: i32 = 393216
-/** The most distinct articles, comment threads or profiles a plan reads by key: nish's `PgBatcher` takes 1,024. */
-const BATCH_MAX: i32 = 1024
+/**
+ * The most distinct articles, comment threads or profiles a plan reads by
+ * key: as many as it has reads. At 1,024, a plan of 80 ms on the
+ * challenge's box could fill its article pages before its window ended.
+ */
+const BATCH_MAX: i32 = PLAN_MAX
 
 /** `render`'s answer for a request the plan could not answer: send it alone. */
 export const PLAN_ALONE: i32 = -1

@@ -32,7 +32,7 @@ read queue than four could have, where #83 ran
 two), and Nish 0.23.1 no longer sweeps every idle connection on every turn of
 the loop.
 
-Nish 0.34.1 (a statically typed TypeScript subset compiled to native code
+Nish 0.35.0 (a statically typed TypeScript subset compiled to native code
 through LLVM), built with clang-18 and lld-18 from LLVM 18, against
 PostgreSQL 18. The compiler runs on Node.js 22.18.0 at build time only; the
 server is one native binary with no runtime dependency beyond libc. Every
@@ -47,8 +47,14 @@ bash build.sh
 DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=... HOST=0.0.0.0 PORT=80 bash start.sh
 ```
 
-The server needs Nish 0.34.1, whose Postgres and HTTP/1.1 paths take fewer
-steps a byte; 0.34.0 scans HTTP/1.1 request heads a vector
+The server needs Nish 0.35.0: a read service writes each answer straight
+into its worker's ring (`SpscRing.reserve` and `commit`), the worker sends it
+from there (`peek`, then `Http1Connection.sendBody`, which writes the head and
+the body in one `writev` and copies only what the socket did not take), and
+the batches of articles and profiles by key, one row a key, leave their rows
+unsorted (`PgBatchConfig.sorted`), which drops the Sort node over them; its
+HTTP/1.1 server also keeps a connection's hot fields together. 0.34.1's
+Postgres and HTTP/1.1 paths take fewer steps a byte; 0.34.0 scans HTTP/1.1 request heads a vector
 at a time and keeps a connection's per-request path on its hot fields. 0.32.0's
 bcrypt batch kernels take a hash in 6.5% less time at five lanes on the Xeon
 VM (below), and 0.31.0 renamed the HTTP/1.1 codec `nish/net/http1-codec`.
@@ -146,7 +152,7 @@ and four on the box), and
   Postgres while that request waited, and a plan takes only the requests
   already waiting when it starts.
 - **Batch clock.** A plan starts when 4,096 reads wait (a full plan) or when
-  the oldest has waited 60 ms, and up to 20 are in
+  the oldest has waited 80 ms, and up to 20 are in
   flight at the read service, on 12 connections. Started at once instead, a plan is whatever arrived
   during the last one's two round trips, about 17 requests at the load
   measured below, and Postgres pays its fixed costs and reads the same
@@ -168,9 +174,13 @@ and four on the box), and
   40 ms took the saturated run below from 57.2 to 54.8 and 53.8 in two runs.
   At 230,000 users, 4,096 over 60 ms took Postgres from about 31 µs a
   request to 29.6 and, with the two lanes below, p95 from 511 ms to 459.
-  Nish's `PgBatcher` takes at most 1,024 keys, so a plan takes at most that
-  many articles, comment threads or profiles by key, and a read past them
-  waits for the next plan.
+  `62db14b` scored 210,000 officially at 60 ms, p95 347 ms. On the 4-CPU VM
+  at 15,000 users, 80 ms took Postgres and the server (bcrypt aside) about
+  3 µs a request below 60 ms, and 100 ms about 4 to 7, for 20 and 45 ms of
+  p95 (92–100 ms at 60). On the box, 80 ms makes plans of about 3,800 reads,
+  under the 4,096 that start one early; 100 ms would hit it. A plan reads up
+  to 4,096 articles, comment threads or profiles by key, as many as it has
+  reads; at Nish's old limit of 1,024, a read past them waited for the next plan.
 - **A plan's statements side by side.** A read waits for its plan's group
   A and then its group B, so it waits the slowest statement of each. Each
   group runs as lanes: group A's feeds (in two halves when `FEED_SPLIT` is
@@ -378,7 +388,7 @@ Optional process settings, with their defaults: `HTTP_WORKERS` (a quarter of the
 CPUs, at least 2),
 `DB_READ_CONNS` (6) and `DB_WRITE_CONNS` (1) per worker, `DB_MAX_IN_FLIGHT`
 (16), `DB_READ_PLANS` (10) read plans in flight per worker,
-`READ_PLAN_WAIT_US` (60000) and `READ_PLAN_MIN` (4096) for the batch clock,
+`READ_PLAN_WAIT_US` (80000) and `READ_PLAN_MIN` (4096) for the batch clock,
 `READ_PLAN_CLOCK` (1; 0 starts a plan at once while none is in flight, 2
 is adaptive) and `READ_PLAN_LIGHT` (32), `BCRYPT_WORKERS` (half the CPUs,
 at least 2), `BCRYPT_BATCH_MS` (150) and `BCRYPT_HASH_MS` (20),
