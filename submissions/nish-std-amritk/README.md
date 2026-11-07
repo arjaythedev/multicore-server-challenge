@@ -368,9 +368,16 @@ and four on the box), and
   expiry are checked on every request. Nothing is cached between requests.
 - **bcrypt.** Cost 10, with salts from the CSPRNG. Each bcrypt service
   batches up to four hashes or four checks into one four-lane bcrypt call,
-  after a collection window of up to 150 ms for checks (logins) and 20 ms
-  for hashes (sign-ups, which a 160 ms window kept waiting for company that
-  rarely comes). A worker sends a login to the
+  after a collection window of up to 150 ms. A sign-up's new hash takes a
+  free lane of a login batch: the call is `bcryptHashN` over all its lanes,
+  each login hashed with its stored hash's salt and matched when the digest
+  is the stored one (compared in constant time, as `bcryptVerify` does), so a
+  sign-up costs a batch one lane more, about 7 ms at cost 10 on the VM,
+  instead of a one-lane call of its own, 58 ms. Sign-ups were hashed after
+  20 ms alone, since a 160 ms window of their own kept them waiting for
+  company that rarely came. A login whose stored hash is not `$2b$10$` or
+  `$2y$10$` (or `$2a$10$` with an ASCII password) is checked with
+  `bcryptVerifyN` as before. A worker sends a login to the
   service whose batch is closest to full, else the least busy, so batches
   fill before another service is given work. With Postgres keeping every
   core busy, one process got a share of a core too small for the logins:
@@ -391,7 +398,7 @@ CPUs, at least 2),
 `READ_PLAN_WAIT_US` (80000) and `READ_PLAN_MIN` (4096) for the batch clock,
 `READ_PLAN_CLOCK` (1; 0 starts a plan at once while none is in flight, 2
 is adaptive) and `READ_PLAN_LIGHT` (32), `BCRYPT_WORKERS` (half the CPUs,
-at least 2), `BCRYPT_BATCH_MS` (150) and `BCRYPT_HASH_MS` (20),
+at least 2), `BCRYPT_BATCH_MS` (150, logins and sign-ups alike),
 `BCRYPT_WIDTH` (what `build.sh` measured, else 6; 0 times the widths at startup; 1 to 6 lanes a call),
 `GZIP` (0; 1 when it saves a TCP segment, 2 whenever it saves anything; at
 145,000 users on the VM it cost about 30 µs a request and failed the hold),
