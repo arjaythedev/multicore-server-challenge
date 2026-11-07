@@ -4,7 +4,10 @@ Front: direct
 
 An update of this submission, scored at 91,000 users in #83 (`3de991e`),
 100,000 in #116 (`6e69d72`), 140,000 in #159 (`6cdf1fd`), 180,000 in
-#189 (`76a40a5`) and 200,000 in #196 (`6b5557b`), on the same design. Since
+#189 (`76a40a5`) and 200,000 in #196 (`6b5557b`), and 210,000 in #200 and
+#223, on the same design. Since #223: reads by key plan apart from lists and
+feeds, sign-ups share login batches, and every bcrypt service but the first
+runs at nice 10. Since
 #196: a plan's ids go to Postgres sorted, each table read by one index scan
 over them, article pages read once, the plan's integer arrays sent in binary,
 and tag lists are answered as soon as their statement ends. A plan's groups run as more lanes, which the read
@@ -224,6 +227,19 @@ and four on the box), and
   alternating pairs of runs against `2f74875` took Postgres from 61.9 µs a
   request to 59.0 and left the server's HTTP workers and read service at
   27.3 and 27.4 (pairs: −3.2, −1.5, −0.6, −3.7 and −4.7 µs, bcrypt aside).
+- **A plan for each class of read.** Every read of a plan waits for its
+  slowest statement, and the lists and feeds are its slowest by far: the
+  lists' lane, then the feed's. The read service keeps one open plan for the
+  lists and feeds and one for the reads by key (articles, comments, profiles
+  and the tag list, about 60% of requests), each gathering and running on its
+  own, so an article page no longer waits for a feed. The two share less (an
+  article on a list and an article page is read once in each), which cost
+  nothing measurable. On the 4-CPU VM at 20,000 users (about 19,200 requests
+  a second, near saturation), three alternating pairs: p50 from 99–102 ms to
+  79–81, p95 from 145–152 to 131–139, p99 from 183–193 to 174–183, at the same
+  CPU a request (84.5, 84.7, 82.4 µs with one plan; 83.7, 83.5, 86.5 with two,
+  Postgres and server, bcrypt aside). `PLAN_CLASSES=0` plans every read together.
+  Feeds and comments on cadences of their own are the leading submissions' design.
 - **Tag lists answered early.** `/api/tags` needs only its plan's tag
   statement, so a tag read need not wait for the rest of the plan: the service
   answers it when that statement ends (`EARLY_TAGS`, on), and the plan's send
@@ -366,6 +382,12 @@ and four on the box), and
 - **Tokens.** HS256 over an HMAC keyed once with `JWT_SECRET`: each
   signature copies the two keyed states. The signature, algorithm and
   expiry are checked on every request. Nothing is cached between requests.
+- **Spare bcrypt services at nice 10.** A worker fills one service's batches
+  before the next, so the first takes most logins; the others run at
+  `BCRYPT_SPARE_NICE` (10), so their bursts yield to the Postgres backends
+  running the plans. One bcrypt service at normal priority and the rest at
+  nice 10 is the setup of the challenge's leading submissions. The VM's two
+  services cannot show it (the second gets almost no logins); the box's four can.
 - **bcrypt.** Cost 10, with salts from the CSPRNG. Each bcrypt service
   batches up to four hashes or four checks into one four-lane bcrypt call,
   after a collection window of up to 150 ms. A sign-up's new hash takes a
