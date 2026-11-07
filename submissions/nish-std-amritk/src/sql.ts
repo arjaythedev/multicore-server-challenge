@@ -511,7 +511,7 @@ export const registerPlanStatements = (pool: PgPool): boolean => {
  * it again by id.
  */
 export const planArticleBatch = (maxRequests: i32): PgBatchConfig =>
-  planBatch(
+  planBatchUnsorted(
     "plan_article",
     "SELECT a.id, a.slug, a.title, a.description, " +
       "ARRAY(SELECT at.tag_id FROM article_tags at WHERE at.article_id = a.id) AS tag_ids, " +
@@ -522,7 +522,7 @@ export const planArticleBatch = (maxRequests: i32): PgBatchConfig =>
 
 /** A plan's batcher of profiles by username: the user's id and profile, no row when there is none. */
 export const planProfileBatch = (maxRequests: i32): PgBatchConfig =>
-  planBatch("plan_profile", "SELECT u.id, u.username, u.bio, u.image FROM users u WHERE u.username = q.key", "", maxRequests)
+  planBatchUnsorted("plan_profile", "SELECT u.id, u.username, u.bio, u.image FROM users u WHERE u.username = q.key", "", maxRequests)
 
 /**
  * A plan's batcher of comments by slug: the article's newest comments, with
@@ -539,6 +539,17 @@ export const planCommentBatch = (maxRequests: i32): PgBatchConfig =>
     "t.created_at DESC, t.id DESC",
     maxRequests
   )
+
+/**
+ * A batcher whose statement leaves its rows in the order they come, with no
+ * `ORDER BY` and no Sort node over them (Nish 0.35.0's `sorted`): for a
+ * read of at most one row a key, which needs no order among them.
+ */
+const planBatchUnsorted = (name: string, select: string, orderBy: string, maxRequests: i32): PgBatchConfig => {
+  const c: PgBatchConfig = planBatch(name, select, orderBy, maxRequests)
+  c.sorted = false
+  return c
+}
 
 const planBatch = (name: string, select: string, orderBy: string, maxRequests: i32): PgBatchConfig => {
   const c = new PgBatchConfig()

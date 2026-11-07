@@ -56,6 +56,12 @@ const S_COUNT: i32 = 5
 const S_SEND: i32 = 6
 /** How long an answer waits for room in a worker's ring, in ns, before that worker counts as stuck. */
 const STUCK_NS: i64 = 5000000000
+/**
+ * The window of a worker's ring an answer is written into in place: most
+ * answers are a few KB; a longer one (a long comment thread) is written to
+ * the plan's own buffer and copied in.
+ */
+const ANSWER_WINDOW: i32 = 65536
 const WORKER_TAGS: i32 = 16
 
 class ServiceSocket {
@@ -641,6 +647,17 @@ export class ReadService {
       if (plan.early[i]) {
         continue
       }
+      const tag: i32 = plan.tags[i]
+      const link: ReadLink = this.links[tag % WORKER_TAGS]
+      // The answer is written straight into the worker's ring when it fits a
+      // window of `ANSWER_WINDOW`; one that grows past it moves to the
+      // plan's own buffer (`grownBytes` copies what it had) and is pushed.
+      const own: u8[] = plan.out
+      const window: u8[] = link.reserve(ANSWER_WINDOW)
+      const inPlace: boolean = window.length > 0
+      if (inPlace) {
+        plan.out = window
+      }
       let status: i32 = 500
       plan.outEnd = 0
       if (!lost) {
@@ -650,9 +667,16 @@ export class ReadService {
         plan.outEnd = 0
         status = status === 200 || status === PLAN_ALONE ? ANSWER_ALONE : status
       }
-      const tag: i32 = plan.tags[i]
       const len: i32 = plan.seal(tag / WORKER_TAGS, status, ANSWER_TAIL)
-      const link: ReadLink = this.links[tag % WORKER_TAGS]
+      if (inPlace) {
+        if (plan.out === window) {
+          plan.out = own
+          link.commit(len)
+          this.sendHeld[p] = toI64(0)
+          continue
+        }
+        link.abandon()
+      }
       if (!link.push(plan.out, len)) {
         link.ring()
         const now: i64 = monotonicNanos()

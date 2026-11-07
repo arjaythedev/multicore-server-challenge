@@ -84,6 +84,26 @@ export class ReadLink {
     return true
   }
 
+  /**
+   * A window of the ring to write a record of up to `n` bytes into, in
+   * place; empty when the ring has no room for that many now. `commit`
+   * publishes it.
+   */
+  reserve(n: i32): u8[] {
+    return this.tx.reserve(n)
+  }
+
+  /** Publishes the first `len` bytes of the window `reserve` gave. */
+  commit(len: i32): void {
+    this.tx.commit(len)
+    this.pushed = true
+  }
+
+  /** Drops the window `reserve` gave, publishing nothing. */
+  abandon(): void {
+    this.tx.abandon()
+  }
+
   /** Wakes the other side if anything was pushed since it said it sleeps. */
   ring(): void {
     if (!this.pushed) {
