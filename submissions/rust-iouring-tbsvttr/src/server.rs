@@ -277,7 +277,12 @@ pub fn build_statements() -> Vec<String> {
     let pages_sql = format!(
         "WITH req AS (SELECT * FROM unnest($1::int8[], $2::int8[], $3::int8[], $4::int8[], $5::text[]) \
          WITH ORDINALITY r(kind, viewer, lim, ofs, key, k)), \
-         gpa AS MATERIALIZED (SELECT g.ks, g.vs, {} AS ids FROM {} g), \
+         gwin AS MATERIALIZED (SELECT ARRAY(SELECT a.id FROM articles a ORDER BY a.id DESC \
+           LIMIT COALESCE((SELECT max(LEAST(lim, 100) + ofs) FROM req WHERE kind = 1 AND LEAST(lim, 100) + ofs <= 500), 0)) AS ids), \
+         gpa AS MATERIALIZED (SELECT g.ks, g.vs, \
+           CASE WHEN LEAST(g.lim, 100) + g.ofs <= 500 \
+             THEN (SELECT gw.ids[g.ofs + 1 : g.ofs + LEAST(g.lim, 100)] FROM gwin gw) \
+             ELSE {} END AS ids FROM {} g), \
          gcnt AS MATERIALIZED (SELECT {} AS n FROM (SELECT 1 FROM gpa LIMIT 1) g), \
          {}, {}, {}, \
          arts AS MATERIALIZED (SELECT s.ks, s.vs, (SELECT a.id FROM articles a WHERE a.slug = s.key) AS id \
@@ -298,7 +303,10 @@ pub fn build_statements() -> Vec<String> {
            (SELECT u.id, u.username, u.bio, u.image FROM users u WHERE u.id = x.author_id LIMIT 1) u), \
          tn AS MATERIALIZED (SELECT t.id::int8 AS id, t.name, row_number() OVER (ORDER BY t.name) AS rnk \
            FROM (SELECT DISTINCT unnest(tag_ids) AS id FROM info) x CROSS JOIN LATERAL \
-           (SELECT t.id, t.name FROM tags t WHERE t.id = x.id LIMIT 1) t) \
+           (SELECT t.id, t.name FROM tags t WHERE t.id = x.id LIMIT 1) t), \
+         vfol AS MATERIALIZED (SELECT v.viewer, \
+           ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = v.viewer AND fo.followee_id IN (SELECT id FROM au)) AS fols \
+           FROM (SELECT DISTINCT viewer FROM rq WHERE viewer <> 0 AND cardinality(ids) > 0) v) \
          SELECT -2::int8 AS k, tn.rnk AS n, NULL::int8[] AS ids, NULL::int8[] AS favs, NULL::int8[] AS fols, tn.id, \
            tn.name AS slug, NULL::text AS title, NULL::text AS description, NULL::text AS body, \
            NULL::timestamptz AS created_at, NULL::timestamptz AS updated_at, NULL::int8[] AS tag_ids, \
@@ -311,9 +319,9 @@ pub fn build_statements() -> Vec<String> {
          UNION ALL SELECT rq.k, rq.n, rq.ids, \
            CASE WHEN rq.viewer <> 0 AND cardinality(rq.ids) > 0 THEN ARRAY(SELECT f.article_id FROM favorites f \
              WHERE f.user_id = rq.viewer AND f.article_id = ANY (rq.ids)) END, \
-           CASE WHEN rq.viewer <> 0 AND cardinality(rq.ids) > 0 THEN ARRAY(SELECT fo.followee_id FROM follows fo \
-             WHERE fo.follower_id = rq.viewer) END, \
-           NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL FROM rq",
+           CASE WHEN rq.viewer <> 0 AND cardinality(rq.ids) > 0 THEN vf.fols END, \
+           NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL \
+           FROM rq LEFT JOIN vfol vf ON vf.viewer = rq.viewer",
         page_ids("SELECT a.id FROM articles a ORDER BY a.id DESC"),
         grouped(1, "lim, ofs"),
         proved_capped("SELECT 1 FROM articles a"),
@@ -358,21 +366,30 @@ pub fn build_statements() -> Vec<String> {
     // S[13] (s12): FEED ($1 viewer, $2 lim, $3 ofs) — dedicated Feed-only statement
     let feed_sql = format!(
         "WITH {}, \
-         v AS MATERIALIZED (SELECT viewer, max(lim + ofs) AS depth, array_agg(k) AS ks, array_agg(lim) AS lims, \
-           array_agg(ofs) AS ofss FROM req GROUP BY viewer), \
+         v AS MATERIALIZED (SELECT viewer, max(LEAST(lim, 100) + ofs) AS depth, array_agg(k) AS ks, \
+           array_agg(LEAST(lim, 100)) AS lims, array_agg(ofs) AS ofss FROM req GROUP BY viewer), \
          fl AS MATERIALIZED (SELECT v.viewer, v.depth, f.fid FROM v LEFT JOIN LATERAL \
            (SELECT fo.followee_id AS fid FROM follows fo WHERE fo.follower_id = v.viewer OFFSET 0) f ON true), \
-         hubs AS MATERIALIZED (SELECT array_agg(h.fid) AS fids, \
-           array_agg((SELECT a.id FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC OFFSET h.depth - 1 LIMIT 1)) AS floors, \
-           array_agg(EXISTS (SELECT 1 FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC OFFSET 999 LIMIT 1)) AS bigs \
-           FROM (SELECT fid, max(depth) AS depth FROM fl WHERE fid IS NOT NULL GROUP BY fid HAVING count(*) >= 2 \
-           ORDER BY count(*) DESC, fid LIMIT 32) h), \
-         vc AS MATERIALIZED (SELECT v.viewer, v.ks, v.lims, v.ofss, COALESCE(x.floor, 0) AS floor, \
-           CASE WHEN x.big THEN 1000 ELSE {} END AS n FROM v JOIN \
-           (SELECT fl.viewer, COALESCE(bool_or(h.bigs[array_position(h.fids, fl.fid)]), false) AS big, \
-            max(h.floors[array_position(h.fids, fl.fid)]) AS floor FROM fl CROSS JOIN hubs h GROUP BY fl.viewer) x ON x.viewer = v.viewer), \
-         rq AS MATERIALIZED (SELECT g.k, vc.viewer, vc.n, {} AS ids \
-           FROM vc CROSS JOIN LATERAL unnest(vc.ks, vc.lims, vc.ofss) g(k, lim, ofs)), \
+         fa AS MATERIALIZED (SELECT f.fid, f.aids, \
+           CASE WHEN cardinality(f.aids) < f.depth THEN cardinality(f.aids)::int8 \
+                ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = f.fid LIMIT 1000) c) \
+           END AS cnt \
+           FROM (SELECT h.fid, h.depth, \
+             ARRAY(SELECT a.id FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC LIMIT h.depth) AS aids \
+             FROM (SELECT fid, max(depth) AS depth FROM fl WHERE fid IS NOT NULL GROUP BY fid) h OFFSET 0) f), \
+         fc AS MATERIALIZED (SELECT fl.viewer, LEAST(sum(fa.cnt), 1000)::int8 AS n \
+           FROM fl JOIN fa ON fa.fid = fl.fid GROUP BY fl.viewer), \
+         fp AS MATERIALIZED (SELECT s.viewer, \
+           ARRAY(SELECT x.id FROM unnest(s.all_ids) AS x(id) ORDER BY x.id DESC LIMIT s.depth) AS top_ids \
+           FROM (SELECT fl.viewer, max(fl.depth) AS depth, array_agg(a.id) AS all_ids \
+             FROM fl JOIN fa ON fa.fid = fl.fid CROSS JOIN LATERAL unnest(fa.aids) AS a(id) \
+             GROUP BY fl.viewer) s), \
+         rq AS MATERIALIZED (SELECT g.k, v.viewer, COALESCE(fc.n, 0::int8) AS n, \
+           CASE WHEN COALESCE(fc.n, 0) <= g.ofs OR fp.top_ids IS NULL THEN ARRAY[]::int8[] \
+                ELSE fp.top_ids[g.ofs + 1 : g.ofs + g.lim] \
+           END AS ids \
+           FROM v LEFT JOIN fc ON fc.viewer = v.viewer LEFT JOIN fp ON fp.viewer = v.viewer \
+           CROSS JOIN LATERAL unnest(v.ks, v.lims, v.ofss) g(k, lim, ofs)), \
          ids AS MATERIALIZED (SELECT DISTINCT x.id FROM rq CROSS JOIN LATERAL unnest(rq.ids) x(id) ORDER BY x.id), \
          info AS MATERIALIZED (SELECT y.* FROM ids x CROSS JOIN LATERAL (SELECT a.id, a.slug, a.title, a.description, \
            a.created_at, a.updated_at, \
@@ -399,15 +416,6 @@ pub fn build_statements() -> Vec<String> {
            NULL, \
            NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL FROM rq",
         req(&[("viewer", "int8"), ("lim", "int8"), ("ofs", "int8")]),
-        capped(
-            "SELECT 1 FROM follows fo CROSS JOIN LATERAL \
-             (SELECT 1 FROM articles a WHERE a.author_id = fo.followee_id LIMIT 1000) y WHERE fo.follower_id = v.viewer"
-        ),
-        page_ids(
-            "SELECT y.id FROM follows fo CROSS JOIN LATERAL \
-             (SELECT a.id FROM articles a WHERE a.author_id = fo.followee_id AND a.id >= vc.floor ORDER BY a.id DESC \
-             LIMIT (g.lim + g.ofs)) y WHERE fo.follower_id = vc.viewer ORDER BY y.id DESC"
-        ),
     );
     s.push(feed_sql);
 
@@ -476,12 +484,15 @@ pub fn build_statements() -> Vec<String> {
          cm AS MATERIALIZED (SELECT ar.id AS aid, c.id, c.body, c.created_at, c.updated_at, c.author_id, u.username, \
            u.bio, u.image FROM arts ar CROSS JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id \
            FROM comments c WHERE c.article_id = ar.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c \
-           CROSS JOIN LATERAL (SELECT u.username, u.bio, u.image FROM users u WHERE u.id = c.author_id LIMIT 1) u) \
+           CROSS JOIN LATERAL (SELECT u.username, u.bio, u.image FROM users u WHERE u.id = c.author_id LIMIT 1) u), \
+         vfol AS MATERIALIZED (SELECT v.viewer, \
+           ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = v.viewer AND fo.followee_id IN (SELECT author_id FROM cm)) AS fols \
+           FROM (SELECT DISTINCT viewer FROM req WHERE viewer <> 0) v) \
          SELECT 0::int8 AS k, cm.aid, NULL::int8[] AS fols, cm.id, cm.body, cm.created_at, cm.updated_at, cm.author_id, \
            cm.username, cm.bio, cm.image FROM cm \
-         UNION ALL SELECT u.k, ar.id, CASE WHEN u.viewer <> 0 AND ar.id IS NOT NULL THEN \
-           ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = u.viewer) END, \
-           NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL FROM arts ar {}",
+         UNION ALL SELECT u.k, ar.id, CASE WHEN u.viewer <> 0 AND ar.id IS NOT NULL THEN vf.fols END, \
+           NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL FROM arts ar {} \
+           LEFT JOIN vfol vf ON vf.viewer = u.viewer",
         req(&[("viewer", "int8"), ("slug", "text")]),
         each_request("ar")
     ));
