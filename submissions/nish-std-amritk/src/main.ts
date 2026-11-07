@@ -18,8 +18,8 @@
 // per worker, READ_PLAN_MIN (4096), READ_PLAN_WAIT_US (80000) and
 // READ_PLAN_CLOCK (1; 2 adaptive, with READ_PLAN_LIGHT 32) for when a plan starts (worker.ts, `planWaitLeft`),
 // BCRYPT_WORKERS (half the CPUs, at least 2), BCRYPT_BATCH_MS (150) for logins
-// and BCRYPT_HASH_MS (20) for sign-ups (bcrypt-service.ts),
-// BCRYPT_PORT (47391), BCRYPT_NICE (0; 1 to 19 lowers the bcrypt services'
+// and the sign-ups that share their batches (bcrypt-service.ts),
+// BCRYPT_PORT (47391), BCRYPT_SPARE_NICE (10, every bcrypt service but the first), BCRYPT_NICE (0; 1 to 19 lowers the bcrypt services'
 // priority, and "idle" moves them to SCHED_IDLE), IDLE_TIMEOUT_MS (75000) and
 // BCRYPT_WIDTH (start.sh passes the width build.sh measured, else 6; 0 times it at startup; 1 to 6 lanes a call),
 // ACK_DELAY (0 leaves the kernel's ACKs alone; 1 turns delayed ACKs back on after each answer, worker.ts `ackDelayAfter`),
@@ -236,8 +236,22 @@ export const main = (): i32 => {
     if (index === http + extra) {
       console.log(`conduit: bcrypt runs ${width} lanes a call`)
     }
-    lowerPriority(getenv("BCRYPT_NICE") ?? "0")
-    return runBcryptService(listener, envInt("BCRYPT_BATCH_MS", 150), envInt("BCRYPT_HASH_MS", 20), width)
+    const nice: string = getenv("BCRYPT_NICE") ?? "0"
+    if (nice === "0" && index > http + extra) {
+      // Every service but the first runs at BCRYPT_SPARE_NICE (10): logins
+      // fill one service's batches before the next, so the first takes most
+      // of them at normal priority, and the others' bursts yield to the
+      // Postgres backends running the plans. One bcrypt worker at normal
+      // priority and the rest at nice 10 is an idea from the challenge's
+      // rust-epoll-theCatWisel submission.
+      const spare: i32 = envInt("BCRYPT_SPARE_NICE", 10)
+      if (spare >= 1 && spare <= 19 && setNice(spare) < 0) {
+        console.log(`conduit: a spare bcrypt service keeps its priority (BCRYPT_SPARE_NICE=${spare})`)
+      }
+    } else {
+      lowerPriority(nice)
+    }
+    return runBcryptService(listener, envInt("BCRYPT_BATCH_MS", 150), width)
   }
   const listener: i32 = tcpListenFlags(cfg.host, cfg.port, cfg.backlog, LISTEN_FLAGS)
   if (listener < 0) {

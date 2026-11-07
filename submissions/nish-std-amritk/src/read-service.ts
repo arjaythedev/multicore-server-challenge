@@ -35,7 +35,7 @@ import {
   PgPool,
 } from "nish/net/postgres"
 import { RING_EMPTY, RING_TOO_SMALL } from "nish/sync/ring"
-import { CountRun, K_TAGS, LANES, LANES_ALL, PLAN_ALONE, ReadPlan } from "./plan"
+import { CountRun, K_ARTICLE, K_COMMENTS, K_PROFILE, K_TAGS, LANES, LANES_ALL, PLAN_ALONE, ReadPlan } from "./plan"
 import { ANSWER_ALONE, ANSWER_MAX, ANSWER_TAIL, READ_HEAD, ReadLink } from "./read-ring"
 import { registerPlanStatements } from "./sql"
 import { pgConfig, WorkerConfig } from "./worker"
@@ -56,6 +56,10 @@ const S_COUNT: i32 = 5
 const S_SEND: i32 = 6
 /** How long an answer waits for room in a worker's ring, in ns, before that worker counts as stuck. */
 const STUCK_NS: i64 = 5000000000
+/** The classes of read a plan holds one of (`ReadService.opens`). */
+const PLAN_CLASSES: i32 = 2
+/** A read's class: 0 a list or a feed, 1 a read by key or the tag list. */
+const readClass = (kind: i32): i32 => (kind === K_ARTICLE || kind === K_COMMENTS || kind === K_PROFILE || kind === K_TAGS ? 1 : 0)
 /**
  * The window of a worker's ring an answer is written into in place: most
  * answers are a few KB; a longer one (a long comment thread) is written to
@@ -97,8 +101,17 @@ export class ReadService {
   running: i32 = 0
   asked: boolean = false
   /** The plan taking reads, or -1, and when its first came. */
-  open: i32 = -1
-  openedAt: i64 = 0
+  /**
+   * The plan taking reads of each class, -1 for none, and when it opened. A
+   * class is a kind of read with a cadence of its own (`readClass`): the
+   * lists and feeds, whose statements are a plan's slowest, and the reads by
+   * key (articles, comments, profiles, the tag list), which then wait for none
+   * of them.
+   */
+  readonly opens: i32[]
+  readonly openedAts: i64[]
+  /** Whether reads are planned by class (`PLAN_CLASSES`, 1) or all together (0). */
+  classes: boolean = true
   /** Per plan: it waits for a count run still, and its connection was lost meanwhile. */
   counting: boolean[]
   lost: boolean[]
@@ -180,6 +193,9 @@ export class ReadService {
     }
     this.planMin = cfg.planMin
     this.planWait = toI64(cfg.planWaitUs) * 1000
+    this.opens = [-1, -1]
+    this.openedAts = [toI64(0), toI64(0)]
+    this.classes = (getenv("PLAN_CLASSES") ?? "1") !== "0"
     this.rec = new Array<u8>(READ_HEAD + 2048)
     this.stats = (getenv("PLAN_STATS") ?? "") === "1"
     this.earlyTags = (getenv("EARLY_TAGS") ?? "1") !== "0"
@@ -257,7 +273,7 @@ export class ReadService {
       if (left > 0) {
         const ms: i32 = toI32((left + 999999) / 1000000)
         wait = ms < wait ? ms : wait
-      } else if (this.open >= 0) {
+      } else if (this.opens[0] >= 0 || this.opens[1] >= 0) {
         wait = 0
       }
       if (this.sending > 0) {
@@ -287,11 +303,16 @@ export class ReadService {
 
   /** How long, in ns, the open plan may wait still. */
   waitLeft(): i64 {
-    if (this.open < 0) {
-      return 0
+    let least: i64 = -1
+    const now: i64 = monotonicNanos()
+    for (let c: i32 = 0; c < PLAN_CLASSES; c++) {
+      if (this.opens[c] >= 0) {
+        const left: i64 = this.openedAts[c] + this.planWait - now
+        const l: i64 = left > 0 ? left : 0
+        least = least < 0 || l < least ? l : least
+      }
     }
-    const left: i64 = this.openedAt + this.planWait - monotonicNanos()
-    return left > 0 ? left : 0
+    return least < 0 ? 0 : least
   }
 
   freePlan(): i32 {
@@ -329,20 +350,22 @@ export class ReadService {
   take(): boolean {
     let took: boolean = false
     while (this.recLen > 0 || this.popRead()) {
-      if (this.open < 0) {
+      const b: u8[] = this.rec
+      const c: i32 = this.classes ? readClass(getI32LE(b, 4)) : 0
+      if (this.opens[c] < 0) {
         const p: i32 = this.freePlan()
         if (p < 0) {
           return took
         }
         this.plans[p].reset()
         this.state[p] = S_OPEN
-        this.open = p
-        this.openedAt = monotonicNanos()
+        this.opens[c] = p
+        this.openedAts[c] = monotonicNanos()
         this.stamp(p, 0, false)
       }
-      const b: u8[] = this.rec
+      const open: i32 = this.opens[c]
       const tag: i32 = getI32LE(b, 0) * WORKER_TAGS + this.recFrom
-      const added: boolean = this.plans[this.open].add(
+      const added: boolean = this.plans[open].add(
         tag,
         getI32LE(b, 4),
         getI64LE(b, 16),
@@ -356,9 +379,9 @@ export class ReadService {
         this.recLen = 0
         took = true
       } else {
-        this.state[this.open] = S_DUE
-        this.stamp(this.open, 1, false)
-        this.open = -1
+        this.state[open] = S_DUE
+        this.stamp(open, 1, false)
+        this.opens[c] = -1
       }
     }
     return took
@@ -373,11 +396,15 @@ export class ReadService {
       }
     }
     this.take()
-    if (this.open >= 0 && (this.plans[this.open].count >= this.planMin || this.waitLeft() === 0)) {
-      this.state[this.open] = S_DUE
-      this.stamp(this.open, 1, false)
-      this.open = -1
-      this.take()
+    const now: i64 = monotonicNanos()
+    for (let c: i32 = 0; c < PLAN_CLASSES; c++) {
+      const open: i32 = this.opens[c]
+      if (open >= 0 && (this.plans[open].count >= this.planMin || now - this.openedAts[c] >= this.planWait)) {
+        this.state[open] = S_DUE
+        this.stamp(open, 1, false)
+        this.opens[c] = -1
+        this.take()
+      }
     }
     for (let p: i32 = 0; p < toI32(this.state.length); p++) {
       if (this.state[p] === S_DUE) {
