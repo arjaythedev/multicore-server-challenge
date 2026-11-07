@@ -241,9 +241,9 @@ export const main = (): i32 => {
       // Every service but the first runs at BCRYPT_SPARE_NICE (10): logins
       // fill one service's batches before the next, so the first takes most
       // of them at normal priority, and the others' bursts yield to the
-      // Postgres backends running the plans. One bcrypt service at normal
-      // priority and the rest at nice 10 is the setup of the challenge's
-      // leading submissions.
+      // Postgres backends running the plans. One bcrypt worker at normal
+      // priority and the rest at nice 10 is an idea from the challenge's
+      // rust-epoll-theCatWisel submission.
       const spare: i32 = envInt("BCRYPT_SPARE_NICE", 10)
       if (spare >= 1 && spare <= 19 && setNice(spare) < 0) {
         console.log(`conduit: a spare bcrypt service keeps its priority (BCRYPT_SPARE_NICE=${spare})`)

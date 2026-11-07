@@ -239,7 +239,10 @@ and four on the box), and
   79–81, p95 from 145–152 to 131–139, p99 from 183–193 to 174–183, at the same
   CPU a request (84.5, 84.7, 82.4 µs with one plan; 83.7, 83.5, 86.5 with two,
   Postgres and server, bcrypt aside). `PLAN_CLASSES=0` plans every read together.
-  Feeds and comments on cadences of their own are the leading submissions' design.
+  Reads split by class, each with a cadence of its own, is an idea from the
+  challenge's rust-epoll-theCatWisel (lanes for feeds, comments and the rest)
+  and rust-epoll-WorriedArrow (feeds and comments apart from a fast class)
+  submissions; the split here is this submission's own.
 - **Tag lists answered early.** `/api/tags` needs only its plan's tag
   statement, so a tag read need not wait for the rest of the plan: the service
   answers it when that statement ends (`EARLY_TAGS`, on), and the plan's send
@@ -385,8 +388,8 @@ and four on the box), and
 - **Spare bcrypt services at nice 10.** A worker fills one service's batches
   before the next, so the first takes most logins; the others run at
   `BCRYPT_SPARE_NICE` (10), so their bursts yield to the Postgres backends
-  running the plans. One bcrypt service at normal priority and the rest at
-  nice 10 is the setup of the challenge's leading submissions. The VM's two
+  running the plans. One bcrypt worker at normal priority and the rest at
+  nice 10 is an idea from the challenge's rust-epoll-theCatWisel submission. The VM's two
   services cannot show it (the second gets almost no logins); the box's four can.
 - **bcrypt.** Cost 10, with salts from the CSPRNG. Each bcrypt service
   batches up to four hashes or four checks into one four-lane bcrypt call,
