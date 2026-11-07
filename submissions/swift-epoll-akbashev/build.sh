@@ -2,7 +2,7 @@
 # Builds the server -> ./.build/release/Conduit. Runs as a normal user; no dependencies to download.
 #   -enforce-exclusivity=unchecked  no dynamic exclusivity checks (the actors' state is touched by their own thread).
 #   --static-swift-stdlib           the Swift runtime linked in: direct calls instead of PLT stubs.
-#   -target-cpu <this CPU>          code for the box's own CPU, as the Rust's `-C target-cpu=native` (BMI1/BMI2 for
+#   -target-cpu <this CPU>          code for the box's own CPU (BMI1/BMI2 for
 #                                   bcrypt's byte extraction, and the CPU's own cost model). Swift has no "native", so
 #                                   the toolchain's clang says which CPU it detects; nothing is added if it can't tell.
 set -euo pipefail

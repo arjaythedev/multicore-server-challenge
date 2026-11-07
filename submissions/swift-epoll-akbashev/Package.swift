@@ -3,11 +3,10 @@ import PackageDescription
 
 let package = Package(
     name: "conduit",
-    // Linux only (epoll, eventfd, accept4, unshare), like the Rust it is ported from. No dependencies: Swift's
-    // standard library, Synchronization and Glibc, as the Rust uses only `std`.
+    // Linux only (epoll, eventfd, accept4, unshare). No dependencies: Swift's standard library, Synchronization and
+    // Glibc.
     targets: [
-        // The Linux calls Glibc's module leaves out, declared in Swift with `@_extern(c)`, as the Rust declares them in
-        // its `mod sys`.
+        // The Linux calls Glibc's module leaves out, declared in Swift with `@_extern(c)`.
         .target(
             name: "Syscalls",
             path: "Sources/Syscalls",
