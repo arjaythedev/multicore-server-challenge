@@ -1,0 +1,513 @@
+// sha256.cid — Pure Cider implementation of SHA-256, HMAC-SHA256, Base64URL, and JWT (HS256)
+// Zero libc or OpenSSL dependencies.
+
+from sys import native_memcpy, native_memset, native_memcmp, native_strlen, sys_clock_gettime, native_itoa, sys_mmap;
+
+func ror32(x: u32, n: int) -> u32 {
+    return (x >> n) | (x << (32 - n));
+}
+
+var K: [u32; 64] = [
+    0x428a2f98 as u32, 0x71374491 as u32, 0xb5c0fbcf as u32, 0xe9b5dba5 as u32,
+    0x3956c25b as u32, 0x59f111f1 as u32, 0x923f82a4 as u32, 0xab1c5ed5 as u32,
+    0xd807aa98 as u32, 0x12835b01 as u32, 0x243185be as u32, 0x550c7dc3 as u32,
+    0x72be5d74 as u32, 0x80deb1fe as u32, 0x9bdc06a7 as u32, 0xc19bf174 as u32,
+    0xe49b69c1 as u32, 0xefbe4786 as u32, 0x0fc19dc6 as u32, 0x240ca1cc as u32,
+    0x2de92c6f as u32, 0x4a7484aa as u32, 0x5cb0a9dc as u32, 0x76f988da as u32,
+    0x983e5152 as u32, 0xa831c66d as u32, 0xb00327c8 as u32, 0xbf597fc7 as u32,
+    0xc6e00bf3 as u32, 0xd5a79147 as u32, 0x06ca6351 as u32, 0x14292967 as u32,
+    0x27b70a85 as u32, 0x2e1b2138 as u32, 0x4d2c6dfc as u32, 0x53380d13 as u32,
+    0x650a7354 as u32, 0x766a0abb as u32, 0x81c2c92e as u32, 0x92722c85 as u32,
+    0xa2bfe8a1 as u32, 0xa81a664b as u32, 0xc24b8b70 as u32, 0xc76c51a3 as u32,
+    0xd192e819 as u32, 0xd6990624 as u32, 0xf40e3585 as u32, 0x106aa070 as u32,
+    0x19a4c116 as u32, 0x1e376c08 as u32, 0x2748774c as u32, 0x34b0bcb5 as u32,
+    0x391c0cb3 as u32, 0x4ed8aa4a as u32, 0x5b9cca4f as u32, 0x682e6ff3 as u32,
+    0x748f82ee as u32, 0x78a5636f as u32, 0x84c87814 as u32, 0x8cc70208 as u32,
+    0x90befffa as u32, 0xa4506ceb as u32, 0xbef9a3f7 as u32, 0xc67178f2 as u32
+];
+
+struct Sha256 {
+    var h: [u32; 8];
+    var blk: [u8; 64];
+    var blen: int;
+    var total: i64;
+}
+
+func sha256_init(s: *Sha256) -> void {
+    s->h[0] = 0x6a09e667 as u32;
+    s->h[1] = 0xbb67ae85 as u32;
+    s->h[2] = 0x3c6ef372 as u32;
+    s->h[3] = 0xa54ff53a as u32;
+    s->h[4] = 0x510e527f as u32;
+    s->h[5] = 0x9b05688c as u32;
+    s->h[6] = 0x1f83d9ab as u32;
+    s->h[7] = 0x5be0cd19 as u32;
+    s->blen = 0;
+    s->total = 0;
+}
+
+func sha256_transform(s: *Sha256, chunk: *u8) -> void {
+    var p: i64 = chunk as i64;
+    var w: [u32; 64] = uninit;
+
+    for (var i: int = 0; i < 16; i = i + 1) {
+        var b0: u32 = (*(((p + (i as i64) * 4 + 0) as *u8))) as u32;
+        var b1: u32 = (*(((p + (i as i64) * 4 + 1) as *u8))) as u32;
+        var b2: u32 = (*(((p + (i as i64) * 4 + 2) as *u8))) as u32;
+        var b3: u32 = (*(((p + (i as i64) * 4 + 3) as *u8))) as u32;
+        w[i] = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+    }
+
+    for (var i: int = 16; i < 64; i = i + 1) {
+        var s0: u32 = ror32(w[i - 15], 7) ^ ror32(w[i - 15], 18) ^ (w[i - 15] >> 3);
+        var s1: u32 = ror32(w[i - 2], 17) ^ ror32(w[i - 2], 19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+
+    var a: u32 = s->h[0];
+    var b: u32 = s->h[1];
+    var c: u32 = s->h[2];
+    var d: u32 = s->h[3];
+    var e: u32 = s->h[4];
+    var f: u32 = s->h[5];
+    var g: u32 = s->h[6];
+    var hh: u32 = s->h[7];
+
+    for (var i: int = 0; i < 64; i = i + 1) {
+        var s1: u32 = ror32(e, 6) ^ ror32(e, 11) ^ ror32(e, 25);
+        var ch: u32 = (e & f) ^ ((~e) & g);
+        var t1: u32 = hh + s1 + ch + K[i] + w[i];
+        var s0: u32 = ror32(a, 2) ^ ror32(a, 13) ^ ror32(a, 22);
+        var maj: u32 = (a & b) ^ (a & c) ^ (b & c);
+        var t2: u32 = s0 + maj;
+
+        hh = g;
+        g = f;
+        f = e;
+        e = d + t1;
+        d = c;
+        c = b;
+        b = a;
+        a = t1 + t2;
+    }
+
+    s->h[0] = s->h[0] + a;
+    s->h[1] = s->h[1] + b;
+    s->h[2] = s->h[2] + c;
+    s->h[3] = s->h[3] + d;
+    s->h[4] = s->h[4] + e;
+    s->h[5] = s->h[5] + f;
+    s->h[6] = s->h[6] + g;
+    s->h[7] = s->h[7] + hh;
+}
+
+func sha256_update(s: *Sha256, data: *char, n: i64) -> void {
+    var p: i64 = data as i64;
+    s->total = s->total + n;
+
+    if (s->blen > 0) {
+        var take: int = 64 - s->blen;
+        if ((take as i64) > n) { take = n as int; }
+        native_memcpy(((&s->blk[0]) as i64 + (s->blen as i64)) as *char, p as *char, take as i64);
+        s->blen = s->blen + take;
+        p = p + (take as i64);
+        n = n - (take as i64);
+        if (s->blen < 64) { return; }
+        sha256_transform(s, &s->blk[0]);
+        s->blen = 0;
+    }
+
+    while (n >= 64) {
+        sha256_transform(s, p as *u8);
+        p = p + 64;
+        n = n - 64;
+    }
+
+    if (n > 0) {
+        native_memcpy((&s->blk[0]) as *char, p as *char, n);
+        s->blen = n as int;
+    }
+}
+
+func sha256_final(s: *Sha256, out: *u8) -> void {
+    var bits: i64 = s->total * 8;
+    s->blk[s->blen] = 0x80 as u8;
+    s->blen = s->blen + 1;
+
+    if (s->blen > 56) {
+        native_memset(((&s->blk[0]) as i64 + (s->blen as i64)) as *char, 0, (64 - s->blen) as i64);
+        sha256_transform(s, &s->blk[0]);
+        s->blen = 0;
+    }
+
+    native_memset(((&s->blk[0]) as i64 + (s->blen as i64)) as *char, 0, (56 - s->blen) as i64);
+
+    // Big-endian 64-bit integer bits
+    for (var i: int = 0; i < 8; i = i + 1) {
+        s->blk[56 + i] = ((bits >> ((7 - i) * 8)) & 0xFF) as u8;
+    }
+    sha256_transform(s, &s->blk[0]);
+
+    var o: i64 = out as i64;
+    for (var i: int = 0; i < 8; i = i + 1) {
+        var v: u32 = s->h[i];
+        *(((o + (i as i64) * 4 + 0) as *u8)) = ((v >> 24) & 0xFF as u32) as u8;
+        *(((o + (i as i64) * 4 + 1) as *u8)) = ((v >> 16) & 0xFF as u32) as u8;
+        *(((o + (i as i64) * 4 + 2) as *u8)) = ((v >> 8)  & 0xFF as u32) as u8;
+        *(((o + (i as i64) * 4 + 3) as *u8)) = (v & 0xFF as u32) as u8;
+    }
+}
+
+func sha256_hash(data: *char, n: i64, out: *u8) -> void {
+    var s: Sha256 = uninit;
+    sha256_init(&s);
+    sha256_update(&s, data, n);
+    sha256_final(&s, out);
+}
+
+// ---- HMAC-SHA256 ----
+
+var g_hmac_inner_ptr: i64 = 0;
+var g_hmac_outer_ptr: i64 = 0;
+var g_hmac_ready: int = 0;
+
+func hmac_sha256_init_key(key: *char, klen: int) -> void {
+    if (g_hmac_inner_ptr == 0 as i64) {
+        var m: *void = sys_mmap(0 as *void, 4096, 3, 34, -1, 0);
+        g_hmac_inner_ptr = m as i64;
+        g_hmac_outer_ptr = (m as i64) + 2048;
+    }
+
+    var k_pad: [u8; 64] = uninit;
+    native_memset((&k_pad[0]) as *char, 0, 64);
+
+    if (klen > 64) {
+        sha256_hash(key, klen as i64, &k_pad[0]);
+    } else {
+        native_memcpy((&k_pad[0]) as *char, key, klen as i64);
+    }
+
+    var ipad: [u8; 64] = uninit;
+    var opad: [u8; 64] = uninit;
+    for (var i: int = 0; i < 64; i = i + 1) {
+        ipad[i] = (k_pad[i] ^ 0x36 as u8) as u8;
+        opad[i] = (k_pad[i] ^ 0x5c as u8) as u8;
+    }
+
+    var g_inner: *Sha256 = g_hmac_inner_ptr as *Sha256;
+    var g_outer: *Sha256 = g_hmac_outer_ptr as *Sha256;
+    sha256_init(g_inner);
+    sha256_update(g_inner, (&ipad[0]) as *char, 64);
+
+    sha256_init(g_outer);
+    sha256_update(g_outer, (&opad[0]) as *char, 64);
+
+    g_hmac_ready = 1;
+}
+
+func hmac_sha256(key: *char, klen: int, data: *char, dlen: int, out: *u8) -> void {
+    if (g_hmac_ready == 0) {
+        hmac_sha256_init_key(key, klen);
+    }
+
+    var inner: Sha256 = uninit;
+    native_memcpy((&inner) as *char, g_hmac_inner_ptr as *char, sizeof(Sha256) as i64);
+    sha256_update(&inner, data, dlen as i64);
+    var inner_hash: [u8; 32] = uninit;
+    sha256_final(&inner, &inner_hash[0]);
+
+    var outer: Sha256 = uninit;
+    native_memcpy((&outer) as *char, g_hmac_outer_ptr as *char, sizeof(Sha256) as i64);
+    sha256_update(&outer, (&inner_hash[0]) as *char, 32);
+    sha256_final(&outer, out);
+}
+
+// ---- Base64URL ----
+
+func get_b64_chars() -> *char {
+    var s: *char = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    return s;
+}
+
+func b64url_encode(src: *u8, slen: int, dst: *char) -> int {
+    var s: i64 = src as i64;
+    var d: i64 = dst as i64;
+    var b_base: i64 = get_b64_chars() as i64;
+    var out_len: int = 0;
+    var i: int = 0;
+
+    while (i + 3 <= slen) {
+        var b0: u32 = (*(((s + (i as i64)) as *u8))) as u32;
+        var b1: u32 = (*(((s + (i as i64) + 1) as *u8))) as u32;
+        var b2: u32 = (*(((s + (i as i64) + 2) as *u8))) as u32;
+        var w: u32 = (b0 << 16) | (b1 << 8) | b2;
+
+        *(((d + (out_len as i64)) as *u8)) = *(((b_base + (((w >> 18) & 63 as u32) as i64)) as *u8));
+        *(((d + (out_len as i64) + 1) as *u8)) = *(((b_base + (((w >> 12) & 63 as u32) as i64)) as *u8));
+        *(((d + (out_len as i64) + 2) as *u8)) = *(((b_base + (((w >> 6) & 63 as u32) as i64)) as *u8));
+        *(((d + (out_len as i64) + 3) as *u8)) = *(((b_base + ((w & 63 as u32) as i64)) as *u8));
+        out_len = out_len + 4;
+        i = i + 3;
+    }
+
+    if (i < slen) {
+        var rem: int = slen - i;
+        var b0: u32 = (*(((s + (i as i64)) as *u8))) as u32;
+        var b1: u32 = 0 as u32;
+        if (rem > 1) { b1 = (*(((s + (i as i64) + 1) as *u8))) as u32; }
+        var w: u32 = (b0 << 16) | (b1 << 8);
+
+        *(((d + (out_len as i64)) as *u8)) = *(((b_base + (((w >> 18) & 63 as u32) as i64)) as *u8));
+        *(((d + (out_len as i64) + 1) as *u8)) = *(((b_base + (((w >> 12) & 63 as u32) as i64)) as *u8));
+        out_len = out_len + 2;
+        if (rem > 1) {
+            *(((d + (out_len as i64)) as *u8)) = *(((b_base + (((w >> 6) & 63 as u32) as i64)) as *u8));
+            out_len = out_len + 1;
+        }
+    }
+    *(((d + (out_len as i64)) as *u8)) = 0 as u8;
+    return out_len;
+}
+
+func b64_val(c: u8) -> int {
+    if (c >= (65 as u8) && c <= (90 as u8)) { return (c - 65 as u8) as int; }
+    if (c >= (97 as u8) && c <= (122 as u8)) { return ((c - 97 as u8) as int) + 26; }
+    if (c >= (48 as u8) && c <= (57 as u8)) { return ((c - 48 as u8) as int) + 52; }
+    if (c == (45 as u8)) { return 62; } // '-'
+    if (c == (95 as u8)) { return 63; } // '_'
+    return -1;
+}
+
+func b64url_decode(src: *char, slen: int, dst: *u8, dcap: int) -> int {
+    if (dcap <= 0 || slen < 0) { return -1; }
+    var s: i64 = src as i64;
+    var d: i64 = dst as i64;
+    var out_len: int = 0;
+    var i: int = 0;
+
+    while (i + 4 <= slen) {
+        var v0: int = b64_val(*(((s + (i as i64)) as *u8)));
+        var v1: int = b64_val(*(((s + (i as i64) + 1) as *u8)));
+        var v2: int = b64_val(*(((s + (i as i64) + 2) as *u8)));
+        var v3: int = b64_val(*(((s + (i as i64) + 3) as *u8)));
+        if (v0 < 0 || v1 < 0 || v2 < 0 || v3 < 0) { return -1; }
+        if (out_len + 3 > dcap) { return -1; }
+
+        var w: u32 = ((v0 as u32) << 18) | ((v1 as u32) << 12) | ((v2 as u32) << 6) | (v3 as u32);
+        *(((d + (out_len as i64)) as *u8)) = ((w >> 16) & 0xFF as u32) as u8;
+        *(((d + (out_len as i64) + 1) as *u8)) = ((w >> 8)  & 0xFF as u32) as u8;
+        *(((d + (out_len as i64) + 2) as *u8)) = (w & 0xFF as u32) as u8;
+        out_len = out_len + 3;
+        i = i + 4;
+    }
+
+    if (i < slen) {
+        var rem: int = slen - i;
+        if (rem == 1) { return -1; }
+        var v0: int = b64_val(*(((s + (i as i64)) as *u8)));
+        var v1: int = b64_val(*(((s + (i as i64) + 1) as *u8)));
+        if (v0 < 0 || v1 < 0) { return -1; }
+        if (rem == 2) {
+            if (out_len + 1 > dcap) { return -1; }
+            var w: u32 = ((v0 as u32) << 18) | ((v1 as u32) << 12);
+            *(((d + (out_len as i64)) as *u8)) = ((w >> 16) & 0xFF as u32) as u8;
+            out_len = out_len + 1;
+        } else if (rem == 3) {
+            var v2: int = b64_val(*(((s + (i as i64) + 2) as *u8)));
+            if (v2 < 0) { return -1; }
+            if (out_len + 2 > dcap) { return -1; }
+            var w: u32 = ((v0 as u32) << 18) | ((v1 as u32) << 12) | ((v2 as u32) << 6);
+            *(((d + (out_len as i64)) as *u8)) = ((w >> 16) & 0xFF as u32) as u8;
+            *(((d + (out_len as i64) + 1) as *u8)) = ((w >> 8)  & 0xFF as u32) as u8;
+            out_len = out_len + 2;
+        } else {
+            return -1;
+        }
+    }
+    return out_len;
+}
+
+// ---- JWT Verification & Generation ----
+
+struct TimeSpec {
+    var sec: i64;
+    var nsec: i64;
+}
+
+func get_now_s() -> i64 {
+    var ts: TimeSpec = uninit;
+    sys_clock_gettime(0, (&ts) as *void);
+    return ts.sec;
+}
+
+// Constant-time memory comparison for signatures
+func const_memcmp(a: *u8, b: *u8, n: int) -> int {
+    var pa: i64 = a as i64;
+    var pb: i64 = b as i64;
+    var diff: int = 0;
+    for (var i: int = 0; i < n; i = i + 1) {
+        diff = diff | (((*(((pa + (i as i64)) as *u8))) ^ (*(((pb + (i as i64)) as *u8)))) as int);
+    }
+    return diff;
+}
+
+func jwt_verify(token: *char, tlen: int, secret: *char, slen: int, out_uid: *i64) -> int {
+    if (tlen < 10 || tlen > 4096 || token as i64 == 0 as i64) { return 0; }
+    var p: i64 = token as i64;
+
+    // Find two '.' separators
+    var dot1: int = -1;
+    var dot2: int = -1;
+    for (var i: int = 0; i < tlen; i = i + 1) {
+        if (*(((p + (i as i64)) as *u8)) == (46 as u8)) { // '.'
+            if (dot1 < 0) { dot1 = i; }
+            else if (dot2 < 0) { dot2 = i; break; }
+        }
+    }
+    if (dot1 < 0 || dot2 < 0) { return 0; }
+
+    // 1. Verify Header (must be HS256)
+    var hdr_buf: [u8; 128] = uninit;
+    var hlen: int = b64url_decode(token, dot1, &hdr_buf[0], 128);
+    if (hlen <= 0) { return 0; }
+    var hdr_base: i64 = (&hdr_buf[0]) as i64;
+    var found_hs256: int = 0;
+    for (var i: int = 0; i + 5 <= hlen; i = i + 1) {
+        if (native_memcmp((hdr_base + (i as i64)) as *char, "HS256", 5) == 0) {
+            found_hs256 = 1;
+            break;
+        }
+    }
+    if (found_hs256 == 0) { return 0; }
+
+    // 2. Verify Signature
+    var expected_sig: [u8; 32] = uninit;
+    hmac_sha256(secret, slen, token, dot2, &expected_sig[0]);
+
+    var actual_sig: [u8; 32] = uninit;
+    var sig_ptr: *char = (p + (dot2 as i64) + 1) as *char;
+    var sig_len: int = tlen - dot2 - 1;
+    var dec_len: int = b64url_decode(sig_ptr, sig_len, &actual_sig[0], 32);
+    if (dec_len != 32) { return 0; }
+
+    if (const_memcmp(&expected_sig[0], &actual_sig[0], 32) != 0) {
+        return 0; // Bad signature
+    }
+
+    // 3. Decode Payload
+    var payload_b64: *char = (p + (dot1 as i64) + 1) as *char;
+    var payload_b64_len: int = dot2 - dot1 - 1;
+    var payload: [u8; 512] = uninit;
+    var plen: int = b64url_decode(payload_b64, payload_b64_len, &payload[0], 512);
+    if (plen <= 0) { return 0; }
+
+    // Check "exp": <timestamp> (mandatory!)
+    var pl_base: i64 = (&payload[0]) as i64;
+    var exp_val: i64 = 0;
+    var has_exp: int = 0;
+    for (var i: int = 0; i + 6 < plen; i = i + 1) {
+        if (native_memcmp((pl_base + (i as i64)) as *char, "\"exp\"", 5) == 0) {
+            var j: int = i + 5;
+            while (j < plen && *(((pl_base + (j as i64)) as *u8)) != (58 as u8)) { j = j + 1; }
+            j = j + 1;
+            while (j < plen && *(((pl_base + (j as i64)) as *u8)) == (32 as u8)) { j = j + 1; }
+            while (j < plen && *(((pl_base + (j as i64)) as *u8)) >= (48 as u8) && *(((pl_base + (j as i64)) as *u8)) <= (57 as u8)) {
+                exp_val = exp_val * 10 + (((*(((pl_base + (j as i64)) as *u8))) - 48 as u8) as i64);
+                has_exp = 1;
+                j = j + 1;
+            }
+            break;
+        }
+    }
+
+    if (has_exp == 0) { return 0; }
+    var now: i64 = get_now_s();
+    if (exp_val <= now) {
+        return 0; // Expired!
+    }
+
+    // Check "sub": "<uid string>" (strictly quoted digits!)
+    var uid_val: i64 = 0;
+    var found_sub: int = 0;
+    for (var i: int = 0; i + 6 < plen; i = i + 1) {
+        if (native_memcmp((pl_base + (i as i64)) as *char, "\"sub\"", 5) == 0) {
+            var j: int = i + 5;
+            while (j < plen && *(((pl_base + (j as i64)) as *u8)) != (58 as u8)) { j = j + 1; }
+            j = j + 1;
+            while (j < plen && *(((pl_base + (j as i64)) as *u8)) == (32 as u8)) { j = j + 1; }
+            // Must be open quote
+            if (j >= plen || *(((pl_base + (j as i64)) as *u8)) != (34 as u8)) { return 0; }
+            j = j + 1;
+            var num_digits: int = 0;
+            while (j < plen && *(((pl_base + (j as i64)) as *u8)) >= (48 as u8) && *(((pl_base + (j as i64)) as *u8)) <= (57 as u8)) {
+                uid_val = uid_val * 10 + (((*(((pl_base + (j as i64)) as *u8))) - 48 as u8) as i64);
+                num_digits = num_digits + 1;
+                j = j + 1;
+            }
+            // Must have at least 1 digit and immediately closing quote
+            if (num_digits == 0 || j >= plen || *(((pl_base + (j as i64)) as *u8)) != (34 as u8)) {
+                return 0;
+            }
+            found_sub = 1;
+            break;
+        }
+    }
+
+    if (found_sub == 0 || uid_val <= 0) { return 0; }
+    *out_uid = uid_val;
+    return 1;
+}
+
+func jwt_sign(uid: i64, secret: *char, slen: int, out_jwt: *char) -> int {
+    var out_base: i64 = out_jwt as i64;
+    var hdr: *char = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
+    var hlen: int = 36;
+    native_memcpy(out_jwt, hdr, 36 as i64);
+    *(((out_base + (hlen as i64)) as *u8)) = 46 as u8; // '.'
+    var cur: int = hlen + 1;
+
+    // Build payload: {"sub":"<uid>","iat":<now>,"exp":<now + 5184000>}
+    var now: i64 = get_now_s();
+    var exp: i64 = now + (2592000 as i64); // 30 days
+    var pl_raw: [u8; 256] = uninit;
+    var pl_base: i64 = (&pl_raw[0]) as i64;
+    var p_pos: int = 0;
+
+    var s1: *char = "{\"sub\":\"";
+    native_memcpy((pl_base + (p_pos as i64)) as *char, s1, 8 as i64);
+    p_pos = p_pos + 8;
+
+    p_pos = p_pos + native_itoa(uid, (pl_base + (p_pos as i64)) as *char);
+
+    var s2: *char = "\",\"iat\":";
+    native_memcpy((pl_base + (p_pos as i64)) as *char, s2, 8 as i64);
+    p_pos = p_pos + 8;
+
+    p_pos = p_pos + native_itoa(now, (pl_base + (p_pos as i64)) as *char);
+
+    var s3: *char = ",\"exp\":";
+    native_memcpy((pl_base + (p_pos as i64)) as *char, s3, 7 as i64);
+    p_pos = p_pos + 7;
+
+    p_pos = p_pos + native_itoa(exp, (pl_base + (p_pos as i64)) as *char);
+
+    *(((pl_base + (p_pos as i64)) as *u8)) = 125 as u8; // '}'
+    p_pos = p_pos + 1;
+
+    var plen_enc: int = b64url_encode(&pl_raw[0], p_pos, (out_base + (cur as i64)) as *char);
+    cur = cur + plen_enc;
+
+    // Add '.'
+    *(((out_base + (cur as i64)) as *u8)) = 46 as u8; // '.'
+    cur = cur + 1;
+
+    // HMAC signature over out_jwt[0 .. cur-1]
+    var sig_bytes: [u8; 32] = uninit;
+    hmac_sha256(secret, slen, out_jwt, cur - 1, &sig_bytes[0]);
+
+    var sig_enc: int = b64url_encode(&sig_bytes[0], 32, (out_base + (cur as i64)) as *char);
+    cur = cur + sig_enc;
+
+    *(((out_base + (cur as i64)) as *u8)) = 0 as u8; // NUL terminator
+    return cur;
+}

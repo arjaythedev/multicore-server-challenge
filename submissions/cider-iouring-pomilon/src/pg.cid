@@ -1,0 +1,394 @@
+// pg.cid — PostgreSQL 18 client and pipeline manager in pure Cider
+// Links libpq directly with zero C wrapper files.
+
+from sys import sys_mmap, native_print;
+
+extern func PQconnectdb(conninfo: *char) -> *void;
+extern func PQexec(conn: *void, query: *char) -> *void;
+extern func PQstatus(conn: *void) -> int;
+extern func PQfinish(conn: *void) -> void;
+extern func PQerrorMessage(conn: *void) -> *char;
+extern func PQsocket(conn: *void) -> int;
+extern func PQprepare(conn: *void, stmtName: *char, query: *char, nParams: int, paramTypes: *u32) -> *void;
+extern func PQsendQueryPrepared(conn: *void, stmtName: *char, nParams: int, paramValues: **char, paramLengths: *int, paramFormats: *int, resultFormat: int) -> int;
+extern func PQenterPipelineMode(conn: *void) -> int;
+extern func PQsendPipelineSync(conn: *void) -> int;
+extern func PQpipelineSync(conn: *void) -> int;
+extern func PQflush(conn: *void) -> int;
+extern func PQsetnonblocking(conn: *void, arg: int) -> int;
+extern func PQisBusy(conn: *void) -> int;
+extern func PQconsumeInput(conn: *void) -> int;
+extern func PQgetResult(conn: *void) -> *void;
+extern func PQclear(res: *void) -> void;
+extern func PQresultStatus(res: *void) -> int;
+extern func PQresultErrorMessage(res: *void) -> *char;
+extern func PQntuples(res: *void) -> int;
+extern func PQnfields(res: *void) -> int;
+extern func PQgetvalue(res: *void, tup_num: int, field_num: int) -> *char;
+extern func PQgetlength(res: *void, tup_num: int, field_num: int) -> int;
+extern func PQgetisnull(res: *void, tup_num: int, field_num: int) -> int;
+
+var PGRES_COMMAND_OK: int = 1;
+var PGRES_TUPLES_OK: int = 2;
+var PGRES_PIPELINE_SYNC: int = 10;
+var CONNECTION_OK: int = 0;
+
+struct PgConn {
+    var c: *void;
+    var socket_fd: int;
+    var in_flight: int;
+    var is_write: int;
+    var q_head: int;
+    var q_tail: int;
+    var q_mask: int;
+    var queue_ptr: i64;
+    var conn_idx: int;
+}
+
+var g_conns_ptr: i64 = 0;
+var g_num_conns: int = 0;
+var g_num_read: int = 0;
+var g_num_write: int = 0;
+var g_next_read: int = 0;
+var g_next_write: int = 0;
+var g_dirty_mask: u32 = 0;
+
+func pg_enqueue_slot(conn: *PgConn, slot_idx: int) -> void {
+    var q: *int = (conn->queue_ptr) as *int;
+    q[conn->q_tail & conn->q_mask] = slot_idx;
+    conn->q_tail = conn->q_tail + 1;
+    conn->in_flight = conn->in_flight + 1;
+    if (conn->conn_idx >= 0 && conn->conn_idx < 32) {
+        g_dirty_mask = g_dirty_mask | ((1 as u32) << (conn->conn_idx as u32));
+    }
+}
+
+func pg_peek_slot(conn: *PgConn) -> int {
+    if (conn->q_head == conn->q_tail) {
+        return -1;
+    }
+    var q: *int = (conn->queue_ptr) as *int;
+    return q[conn->q_head & conn->q_mask];
+}
+
+func pg_pop_slot(conn: *PgConn) -> int {
+    if (conn->q_head == conn->q_tail) {
+        return -1;
+    }
+    var q: *int = (conn->queue_ptr) as *int;
+    var slot_idx: int = q[conn->q_head & conn->q_mask];
+    conn->q_head = conn->q_head + 1;
+    conn->in_flight = conn->in_flight - 1;
+    return slot_idx;
+}
+
+func pg_get_conns_base() -> *PgConn {
+    return g_conns_ptr as *PgConn;
+}
+
+func pg_get_num_conns() -> int {
+    return g_num_conns;
+}
+
+func pg_prepare_stmts(c: *void) -> int {
+    // 1. Tags
+    var r: *void = PQprepare(c, "s_tags", "SELECT coalesce(array_to_json(ARRAY(SELECT name FROM tags ORDER BY name)), '[]')", 0, 0 as *u32);
+    PQclear(r);
+
+    // 2. User Register
+    r = PQprepare(c, "s_user_insert", "INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3) RETURNING id, username, email, bio, image", 3, 0 as *u32);
+    PQclear(r);
+
+    // 3. User Login
+    r = PQprepare(c, "s_user_by_email", "SELECT id, username, email, bio, image, password_hash FROM users WHERE email = $1", 1, 0 as *u32);
+    PQclear(r);
+
+    // 4. User by ID
+    r = PQprepare(c, "s_user_by_id", "SELECT id, username, email, bio, image FROM users WHERE id = $1", 1, 0 as *u32);
+    PQclear(r);
+
+    // 5. User Update
+    r = PQprepare(c, "s_user_update", "UPDATE users SET email = COALESCE($2, email), username = COALESCE($3, username), password_hash = COALESCE($4, password_hash), bio = COALESCE($5, bio), image = COALESCE($6, image) WHERE id = $1 RETURNING id, username, email, bio, image", 6, 0 as *u32);
+    PQclear(r);
+
+    // 6. Profile
+    r = PQprepare(c, "s_profile", "SELECT u.id, u.username, u.bio, u.image, EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = u.id) AS following FROM users u WHERE u.username = $2", 2, 0 as *u32);
+    PQclear(r);
+
+    // 7. User by username
+    r = PQprepare(c, "s_user_by_name", "SELECT id, username, bio, image FROM users WHERE username = $1", 1, 0 as *u32);
+    PQclear(r);
+
+    // 8. Follow
+    r = PQprepare(c, "s_follow", "INSERT INTO follows (follower_id, followee_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", 2, 0 as *u32);
+    PQclear(r);
+
+    // 9. Unfollow
+    r = PQprepare(c, "s_unfollow", "DELETE FROM follows WHERE follower_id = $1 AND followee_id = $2", 2, 0 as *u32);
+    PQclear(r);
+
+    // 10. List All (Single-query count + lateral page)
+    r = PQprepare(c, "s_list_all", "SELECT cnt.n, a.slug, a.title, a.description, to_char(a.created_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(a.updated_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), coalesce(array_to_json(ARRAY(SELECT t.name FROM tags t WHERE t.id = ANY(ARRAY(SELECT at.tag_id FROM article_tags at WHERE at.article_id = a.id)) ORDER BY t.name)), '[]'), (SELECT count(*) FROM favorites f WHERE f.article_id = a.id), EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1), u.username, u.bio, u.image, EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = a.author_id) FROM (SELECT count(*) AS n FROM (SELECT 1 FROM articles LIMIT 1000) s) cnt LEFT JOIN LATERAL (SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, a.author_id FROM articles a ORDER BY a.id DESC OFFSET $3 LIMIT $2) a ON true LEFT JOIN users u ON u.id = a.author_id ORDER BY a.id DESC", 3, 0 as *u32);
+    PQclear(r);
+
+    // 11. List by Tag (Single-query count + lateral page)
+    r = PQprepare(c, "s_list_tag", "SELECT cnt.n, a.slug, a.title, a.description, to_char(a.created_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(a.updated_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), coalesce(array_to_json(ARRAY(SELECT t.name FROM tags t WHERE t.id = ANY(ARRAY(SELECT at.tag_id FROM article_tags at WHERE at.article_id = a.id)) ORDER BY t.name)), '[]'), (SELECT count(*) FROM favorites f WHERE f.article_id = a.id), EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1), u.username, u.bio, u.image, EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = a.author_id) FROM (SELECT count(*) AS n FROM (SELECT 1 FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = $4) LIMIT 1000) s) cnt LEFT JOIN LATERAL (SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, a.author_id FROM articles a WHERE a.id IN (SELECT at.article_id FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = $4) ORDER BY at.article_id DESC LIMIT $2 OFFSET $3)) a ON true LEFT JOIN users u ON u.id = a.author_id ORDER BY a.id DESC", 4, 0 as *u32);
+    PQclear(r);
+
+    // 12. List by Author (Single-query count + lateral page)
+    r = PQprepare(c, "s_list_author", "SELECT cnt.n, a.slug, a.title, a.description, to_char(a.created_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(a.updated_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), coalesce(array_to_json(ARRAY(SELECT t.name FROM tags t WHERE t.id = ANY(ARRAY(SELECT at.tag_id FROM article_tags at WHERE at.article_id = a.id)) ORDER BY t.name)), '[]'), (SELECT count(*) FROM favorites f WHERE f.article_id = a.id), EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1), u.username, u.bio, u.image, EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = a.author_id) FROM (SELECT count(*) AS n FROM (SELECT 1 FROM articles a WHERE a.author_id = (SELECT u.id FROM users u WHERE u.username = $4) LIMIT 1000) s) cnt LEFT JOIN LATERAL (SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, a.author_id FROM articles a WHERE a.author_id = (SELECT au.id FROM users au WHERE au.username = $4) ORDER BY a.id DESC LIMIT $2 OFFSET $3) a ON true LEFT JOIN users u ON u.id = a.author_id ORDER BY a.id DESC", 4, 0 as *u32);
+    PQclear(r);
+
+    // 13. List Favorited (Single-query count + lateral page)
+    r = PQprepare(c, "s_list_fav", "SELECT cnt.n, a.slug, a.title, a.description, to_char(a.created_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(a.updated_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), coalesce(array_to_json(ARRAY(SELECT t.name FROM tags t WHERE t.id = ANY(ARRAY(SELECT at.tag_id FROM article_tags at WHERE at.article_id = a.id)) ORDER BY t.name)), '[]'), (SELECT count(*) FROM favorites f WHERE f.article_id = a.id), EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1), u.username, u.bio, u.image, EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = a.author_id) FROM (SELECT count(*) AS n FROM (SELECT 1 FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = $4) LIMIT 1000) s) cnt LEFT JOIN LATERAL (SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, a.author_id FROM articles a WHERE a.id IN (SELECT f.article_id FROM favorites f WHERE f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = $4) ORDER BY f.article_id DESC LIMIT $2 OFFSET $3)) a ON true LEFT JOIN users u ON u.id = a.author_id ORDER BY a.id DESC", 4, 0 as *u32);
+    PQclear(r);
+
+    // 14. Feed (Single-query count + lateral page)
+    r = PQprepare(c, "s_feed", "SELECT cnt.n, a.slug, a.title, a.description, to_char(a.created_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(a.updated_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), coalesce(array_to_json(ARRAY(SELECT t.name FROM tags t WHERE t.id = ANY(ARRAY(SELECT at.tag_id FROM article_tags at WHERE at.article_id = a.id)) ORDER BY t.name)), '[]'), (SELECT count(*) FROM favorites f WHERE f.article_id = a.id), EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1), u.username, u.bio, u.image, EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = a.author_id) FROM (SELECT count(*) AS n FROM (SELECT 1 FROM articles a WHERE a.author_id IN (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = $1) LIMIT 1000) s) cnt LEFT JOIN LATERAL (SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, a.author_id FROM articles a WHERE a.id IN (SELECT x.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT ($2::int + $3::int)) x WHERE fo.follower_id = $1 ORDER BY x.id DESC LIMIT $2 OFFSET $3)) a ON true LEFT JOIN users u ON u.id = a.author_id ORDER BY a.id DESC", 3, 0 as *u32);
+    PQclear(r);
+
+    // 20. Article by Slug
+    r = PQprepare(c, "s_article_by_slug", "SELECT a.id, a.slug, a.title, a.description, a.body, to_char(a.created_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(a.updated_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), coalesce(array_to_json(ARRAY(SELECT t.name FROM tags t WHERE t.id = ANY(ARRAY(SELECT at.tag_id FROM article_tags at WHERE at.article_id = a.id)) ORDER BY t.name)), '[]'), (SELECT count(*) FROM favorites f WHERE f.article_id = a.id), EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1), u.username, u.bio, u.image, EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = a.author_id) FROM articles a JOIN users u ON u.id = a.author_id WHERE a.slug = $2", 2, 0 as *u32);
+    PQclear(r);
+
+    // 21. Article by ID
+    r = PQprepare(c, "s_article_by_id", "SELECT a.id, a.slug, a.title, a.description, a.body, to_char(a.created_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(a.updated_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), coalesce(array_to_json(ARRAY(SELECT t.name FROM tags t WHERE t.id = ANY(ARRAY(SELECT at.tag_id FROM article_tags at WHERE at.article_id = a.id)) ORDER BY t.name)), '[]'), (SELECT count(*) FROM favorites f WHERE f.article_id = a.id), EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1), u.username, u.bio, u.image, EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = a.author_id) FROM articles a JOIN users u ON u.id = a.author_id WHERE a.id = $2", 2, 0 as *u32);
+    PQclear(r);
+
+    // 22. Article Insert (article, tags and article_tags are one atomic statement)
+    r = PQprepare(c, "s_article_insert", "WITH n AS (SELECT nextval(pg_get_serial_sequence('articles', 'id')) AS id), ins AS (INSERT INTO articles (id, slug, author_id, title, description, body) SELECT n.id, trim(both '-' from lower(regexp_replace($2, '[^A-Za-z0-9]+', '-', 'g'))) || '-' || n.id, $1, $2, $3, $4 FROM n RETURNING id), tg AS (INSERT INTO tags (name) SELECT DISTINCT unnest($5::text[]) ON CONFLICT (name) DO NOTHING RETURNING id), at AS (INSERT INTO article_tags (article_id, tag_id) SELECT DISTINCT ins.id, x.id FROM ins CROSS JOIN LATERAL (SELECT t.id FROM tags t WHERE t.name = ANY($5::text[]) UNION SELECT tg.id FROM tg) x ON CONFLICT (article_id, tag_id) DO NOTHING) SELECT id FROM ins", 5, 0 as *u32);
+    PQclear(r);
+
+    // 23. Tags Insert
+    r = PQprepare(c, "s_tags_insert", "INSERT INTO tags (name) SELECT DISTINCT unnest($1::text[]) ON CONFLICT (name) DO NOTHING", 1, 0 as *u32);
+    PQclear(r);
+
+    // 24. Article Tags Insert
+    r = PQprepare(c, "s_article_tags_insert", "INSERT INTO article_tags (article_id, tag_id) SELECT DISTINCT $1::bigint, t.id FROM tags t WHERE t.name = ANY($2::text[]) ON CONFLICT (article_id, tag_id) DO NOTHING", 2, 0 as *u32);
+    PQclear(r);
+
+    // 25. Article Owner
+    r = PQprepare(c, "s_article_owner", "SELECT id, author_id FROM articles WHERE slug = $1", 1, 0 as *u32);
+    PQclear(r);
+
+    // 26. Article Update
+    r = PQprepare(c, "s_article_update", "UPDATE articles SET title = COALESCE($2, title), description = COALESCE($3, description), body = COALESCE($4, body), slug = CASE WHEN $2::text IS NULL THEN slug ELSE trim(both '-' from lower(regexp_replace($2, '[^A-Za-z0-9]+', '-', 'g'))) || '-' || id END, updated_at = now() WHERE id = $1 RETURNING id", 4, 0 as *u32);
+    PQclear(r);
+
+    // 27. Article Delete
+    r = PQprepare(c, "s_article_delete", "DELETE FROM articles WHERE id = $1", 1, 0 as *u32);
+    PQclear(r);
+
+    // 28. Article Favorite
+    r = PQprepare(c, "s_favorite", "INSERT INTO favorites (user_id, article_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", 2, 0 as *u32);
+    PQclear(r);
+
+    // 29. Article Unfavorite
+    r = PQprepare(c, "s_unfavorite", "DELETE FROM favorites WHERE user_id = $1 AND article_id = $2", 2, 0 as *u32);
+    PQclear(r);
+
+    // 30. Comments by Slug (Single LATERAL query combining article existence check + comments)
+    r = PQprepare(c, "s_comments_by_slug", "SELECT c.id, c.body, to_char(c.created_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(c.updated_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), u.username, u.bio, u.image, EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = c.author_id) FROM articles a LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id FROM comments c WHERE c.article_id = a.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true LEFT JOIN users u ON u.id = c.author_id WHERE a.slug = $2 ORDER BY c.created_at DESC, c.id DESC", 2, 0 as *u32);
+    PQclear(r);
+
+    // 31. Comment Insert
+    r = PQprepare(c, "s_comment_insert", "WITH c AS (INSERT INTO comments (article_id, author_id, body) SELECT a.id, $2, $3 FROM articles a WHERE a.slug = $1 RETURNING id, body, created_at, updated_at, author_id) SELECT c.id, c.body, to_char(c.created_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(c.updated_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), u.username, u.bio, u.image FROM c JOIN users u ON u.id = c.author_id", 3, 0 as *u32);
+    PQclear(r);
+
+    // 32. Comment Owner
+    r = PQprepare(c, "s_comment_owner", "SELECT c.author_id FROM comments c JOIN articles a ON a.id = c.article_id WHERE c.id = $1 AND a.slug = $2", 2, 0 as *u32);
+    PQclear(r);
+
+    // 33. Comment Delete
+    r = PQprepare(c, "s_comment_delete", "DELETE FROM comments WHERE id = $1", 1, 0 as *u32);
+    PQclear(r);
+
+    return 0;
+}
+
+func pg_pool_init(conninfo: *char, num_read: int, num_write: int) -> int {
+    var nr: int = num_read;
+    var nw: int = num_write;
+    if (nr < 1) { nr = 1; }
+    if (nw < 1) { nw = 1; }
+    while (nr + nw > 32) {
+        if (nw > 1) { nw = nw - 1; }
+        else if (nr > 1) { nr = nr - 1; }
+        else { break; }
+    }
+    g_num_read = nr;
+    g_num_write = nw;
+    g_num_conns = nr + nw;
+
+    var sz: i64 = ((g_num_conns as i64) + 1) * (sizeof(PgConn) as i64);
+    var mem: *void = sys_mmap(0 as *void, sz, 3, 34, -1, 0); // PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS
+    if (mem as i64 < 0 as i64) { return -1; }
+    g_conns_ptr = mem as i64;
+
+    var pconns: *PgConn = g_conns_ptr as *PgConn;
+
+    for (var i: int = 0; i < g_num_conns; i = i + 1) {
+        var c: *void = PQconnectdb(conninfo);
+        if (PQstatus(c) != CONNECTION_OK) {
+            PQfinish(c);
+            return -1;
+        }
+        var s_res: *void = PQexec(c, "SET plan_cache_mode = force_generic_plan; SET jit = off; SET max_parallel_workers_per_gather = 0; SET enable_memoize = off; SET enable_hashagg = off; SET enable_seqscan = off;");
+        if (s_res as i64 != 0 as i64) {
+            PQclear(s_res);
+        }
+        pg_prepare_stmts(c);
+        PQsetnonblocking(c, 1);
+        PQenterPipelineMode(c);
+
+        var p: *PgConn = &pconns[i];
+        p->conn_idx = i;
+        p->c = c;
+        p->socket_fd = PQsocket(c);
+        p->in_flight = 0;
+        p->q_mask = 32767;
+        p->q_head = 0;
+        p->q_tail = 0;
+        var qmem: *void = sys_mmap(0 as *void, 262144, 3, 34, -1, 0); // 32768 * 8 bytes
+        if (qmem as i64 < 0 as i64) {
+            return -1;
+        }
+        p->queue_ptr = qmem as i64;
+
+        if (i < num_read) {
+            p->is_write = 0;
+        } else {
+            p->is_write = 1;
+        }
+    }
+    return 0;
+}
+
+func pg_get_read_conn() -> *PgConn {
+    var pconns: *PgConn = g_conns_ptr as *PgConn;
+    var best: int = g_next_read % g_num_read;
+    g_next_read = g_next_read + 1;
+    var min_load: int = pconns[best].in_flight;
+    for (var i: int = 1; i < g_num_read; i = i + 1) {
+        var idx: int = (best + i) % g_num_read;
+        if (pconns[idx].in_flight < min_load) {
+            min_load = pconns[idx].in_flight;
+            best = idx;
+        }
+    }
+    if (min_load >= 128) {
+        return 0 as *PgConn;
+    }
+    return &pconns[best];
+}
+
+func pg_get_write_conn() -> *PgConn {
+    var pconns: *PgConn = g_conns_ptr as *PgConn;
+    var best: int = g_num_read + (g_next_write % g_num_write);
+    g_next_write = g_next_write + 1;
+    var min_load: int = pconns[best].in_flight;
+    for (var i: int = 1; i < g_num_write; i = i + 1) {
+        var idx: int = g_num_read + ((best - g_num_read + i) % g_num_write);
+        if (pconns[idx].in_flight < min_load) {
+            min_load = pconns[idx].in_flight;
+            best = idx;
+        }
+    }
+    if (min_load >= 128) {
+        return 0 as *PgConn;
+    }
+    return &pconns[best];
+}
+
+func pg_get_write_conn_force() -> *PgConn {
+    var pconns: *PgConn = g_conns_ptr as *PgConn;
+    var best: int = g_num_read + (g_next_write % g_num_write);
+    g_next_write = g_next_write + 1;
+    var min_load: int = pconns[best].in_flight;
+    for (var i: int = 1; i < g_num_write; i = i + 1) {
+        var idx: int = g_num_read + ((best - g_num_read + i) % g_num_write);
+        if (pconns[idx].in_flight < min_load) {
+            min_load = pconns[idx].in_flight;
+            best = idx;
+        }
+    }
+    return &pconns[best];
+}
+
+func pg_has_read_capacity() -> int {
+    var pconns: *PgConn = g_conns_ptr as *PgConn;
+    for (var i: int = 0; i < g_num_read; i = i + 1) {
+        if (pconns[i].in_flight < 128) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+func pg_has_write_capacity() -> int {
+    var pconns: *PgConn = g_conns_ptr as *PgConn;
+    for (var i: int = g_num_read; i < g_num_conns; i = i + 1) {
+        if (pconns[i].in_flight < 128) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+func pg_has_capacity(method: int) -> int {
+    if (method == 1) {
+        return pg_has_read_capacity();
+    }
+    return pg_has_write_capacity();
+}
+
+func pg_flush_dirty() -> void {
+    if (g_dirty_mask == (0 as u32)) {
+        return;
+    }
+    var mask: u32 = g_dirty_mask;
+    g_dirty_mask = 0 as u32;
+    var pconns: *PgConn = g_conns_ptr as *PgConn;
+    for (var i: int = 0; i < g_num_conns; i = i + 1) {
+        if ((mask & ((1 as u32) << (i as u32))) != (0 as u32)) {
+            var st: int = PQflush(pconns[i].c);
+            if (st == 1) {
+                // If write buffer still has unsent data, keep bit set
+                g_dirty_mask = g_dirty_mask | ((1 as u32) << (i as u32));
+            }
+        }
+    }
+}
+func pg_exec_single(conn: *PgConn, stmt: *char, nparams: int, vals: **char) -> *void {
+    PQsendQueryPrepared(conn->c, stmt, nparams, vals, 0 as *int, 0 as *int, 0);
+    PQsendPipelineSync(conn->c);
+    PQflush(conn->c);
+
+    var res: *void = PQgetResult(conn->c);
+    if (res as i64 != 0 as i64) {
+        var st: int = PQresultStatus(res);
+        if (st != PGRES_TUPLES_OK && st != PGRES_COMMAND_OK) {
+            native_print("[pg err] stmt: ");
+            native_print(stmt);
+            native_print(": ");
+            native_print(PQresultErrorMessage(res));
+            native_print("\n");
+        }
+    }
+    // Drain until pipeline sync result
+    for (;;) {
+        var sync_res: *void = PQgetResult(conn->c);
+        if (sync_res as i64 == 0 as i64) {
+            if (PQstatus(conn->c) != CONNECTION_OK) {
+                break;
+            }
+            continue;
+        }
+        var st: int = PQresultStatus(sync_res);
+        PQclear(sync_res);
+        if (st == PGRES_PIPELINE_SYNC) {
+            break;
+        }
+    }
+    return res;
+}

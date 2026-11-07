@@ -28,6 +28,10 @@ type Statement = string * (string * SqlValue) list
 /// (a SELECT, or RETURNING) and the ones before it must not.
 type private IWrite =
     abstract Statements: Statement list
+    /// Stopwatch timestamp of its arrival in the queue.
+    abstract Arrived: int64
+    /// The request's trace, or null (Db.Trace).
+    abstract Trace: Db.Trace
     /// Reads this write's result set; the reader is positioned on it.
     abstract Read: NpgsqlDataReader -> Task
     /// The group committed: hand the rows to the caller.
@@ -38,10 +42,14 @@ type private IWrite =
 type private Pending<'r>(statements: Statement list, read: RowReader -> 'r) =
     let reply = TaskCompletionSource<'r list>(TaskCreationOptions.RunContinuationsAsynchronously)
     let mutable rows: 'r list = []
+    let arrived = Diagnostics.Stopwatch.GetTimestamp()
+    let trace = if Db.Millis.Enabled then Db.Trace.Current.Value else null
     member _.Task = reply.Task
 
     interface IWrite with
         member _.Statements = statements
+        member _.Arrived = arrived
+        member _.Trace = trace
 
         member _.Read reader =
             task {
@@ -90,11 +98,16 @@ let private execute (conn: NpgsqlConnection) (group: IWrite list) : Task =
 /// The process's write side: `lanes` dedicated connections (not multiplexed: a batch's implicit
 /// transaction needs a connection of its own), each committing one group at a time.
 [<Sealed>]
-type Writer(connectionString: string, lanes: int, maxGroup: int) =
+type Writer(connectionString: string, lanes: int, maxGroup: int, minGroup: int, gather: TimeSpan) =
     let queue =
-        Channel.CreateUnbounded<IWrite>(UnboundedChannelOptions(SingleReader = (lanes = 1), SingleWriter = false))
+        // Never SingleReader, even with one lane: a single-reader channel cannot report its length
+        // (Depth), which the diagnostics read.
+        Channel.CreateUnbounded<IWrite>(UnboundedChannelOptions(SingleReader = false, SingleWriter = false))
     let ds = NpgsqlDataSource.Create connectionString
-    let counts = [| 0L; 0L |] // groups, writes
+    let counts = [| 0L; 0L; 0L; 0L; 0L |] // groups, writes, groups refused and rerun alone, writes failed alone, Stopwatch ticks executing
+    let queued = Db.Millis() // per write: arrived -> taken into a group
+    let executed = Db.Millis() // per group: taken -> committed (or failed)
+    let answered = Db.Millis() // per write: arrived -> committed (or failed)
 
     let take (into: ResizeArray<IWrite>) =
         let mutable w = Unchecked.defaultof<IWrite>
@@ -107,6 +120,7 @@ type Writer(connectionString: string, lanes: int, maxGroup: int) =
                 do! execute conn [ w ]
                 w.Committed()
             with e ->
+                Interlocked.Increment(&counts[3]) |> ignore
                 w.Failed e
         }
 
@@ -121,11 +135,14 @@ type Writer(connectionString: string, lanes: int, maxGroup: int) =
                 // The server refused one statement (a UNIQUE name, a deadlock) and rolled the
                 // whole group back, so none of it happened: each write runs again in its own
                 // transaction and meets its own fate.
+                Interlocked.Increment(&counts[2]) |> ignore
                 for w in group do
                     do! alone conn w
             | e ->
-                // Not the server's verdict (a broken connection): whether the group committed
-                // is unknown, so it is not retried; its writes fail.
+                // A lone write the server refused, or not the server's verdict (a broken
+                // connection): whether the group committed is unknown, so it is not retried;
+                // its writes fail.
+                if e :? PostgresException then Interlocked.Increment(&counts[3]) |> ignore
                 for w in group do
                     w.Failed e
         }
@@ -136,9 +153,27 @@ type Writer(connectionString: string, lanes: int, maxGroup: int) =
             let group = ResizeArray<IWrite>(maxGroup)
             while! queue.Reader.WaitToReadAsync() do
                 take group
+                // A small group waits for company: until it holds `minGroup` writes or its oldest
+                // has waited `gather`, whichever comes first. Without it, a lane that wakes for the
+                // first write while the other lane commits takes that write nearly alone, and the
+                // lanes split the stream into groups of 2-6, a commit and a WAL flush each.
+                // (Ticks, not TimeSpan's `>`: F#'s generic comparison boxes structs.)
+                let mutable waiting = gather.Ticks > 0L && group.Count > 0
+                while waiting && group.Count < minGroup do
+                    let left = gather - Diagnostics.Stopwatch.GetElapsedTime group[0].Arrived
+                    if left.Ticks > 0L then
+                        do! Task.Delay left
+                        take group
+                    else
+                        waiting <- false
                 if group.Count > 0 then
                     let writes = List.ofSeq group
                     group.Clear()
+                    let taken = Diagnostics.Stopwatch.GetTimestamp()
+                    if Db.Millis.Enabled then
+                        for w in writes do
+                            queued.Record(Diagnostics.Stopwatch.GetElapsedTime(w.Arrived, taken))
+                            if not (isNull w.Trace) then w.Trace.WriteQueued <- taken - w.Arrived
                     try
                         if isNull conn || conn.State <> ConnectionState.Open then
                             if not (isNull conn) then conn.Dispose()
@@ -149,6 +184,13 @@ type Writer(connectionString: string, lanes: int, maxGroup: int) =
                     with e ->
                         for w in writes do
                             w.Failed e
+                    let finished = Diagnostics.Stopwatch.GetTimestamp()
+                    Interlocked.Add(&counts[4], finished - taken) |> ignore
+                    if Db.Millis.Enabled then
+                        executed.Record(Diagnostics.Stopwatch.GetElapsedTime(taken, finished))
+                        for w in writes do
+                            answered.Record(Diagnostics.Stopwatch.GetElapsedTime(w.Arrived, finished))
+                            if not (isNull w.Trace) then w.Trace.WriteExecuted <- finished - taken
                     Interlocked.Increment(&counts[0]) |> ignore
                     Interlocked.Add(&counts[1], int64 writes.Length) |> ignore
         }
@@ -166,6 +208,17 @@ type Writer(connectionString: string, lanes: int, maxGroup: int) =
     /// (groups, writes) so far. A group that the server refused and that ran again write by
     /// write still counts once.
     member _.Counts = Volatile.Read(&counts[0]), Volatile.Read(&counts[1])
+
+    /// Stopwatch ticks the lanes have spent executing groups, all lanes together: its growth over
+    /// a span, divided by the span and the lane count, is how busy the write lanes were.
+    member _.BusyTicks = Volatile.Read(&counts[4])
+
+    /// (groups the server refused and that ran again write by write, writes that then failed alone).
+    member _.Refusals = Volatile.Read(&counts[2]), Volatile.Read(&counts[3])
+
+    /// p50/p95/p99 of: a write's wait for its group, a group's execution (one round trip and its
+    /// commit), a write's whole time in Commit.
+    member _.Timings = queued.Summary(), executed.Summary(), answered.Summary()
 
     /// Writes queued and not yet taken into a group.
     member _.Depth = queue.Reader.Count

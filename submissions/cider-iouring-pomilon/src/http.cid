@@ -1,0 +1,255 @@
+// http.cid — Fast zero-allocation HTTP/1.1 parser and response serializer in pure Cider
+
+from sys import native_memcpy, native_strlen, native_memcmp, native_atoi, native_itoa;
+
+var METHOD_GET: int = 1;
+var METHOD_POST: int = 2;
+var METHOD_PUT: int = 3;
+var METHOD_DELETE: int = 4;
+
+struct HttpRequest {
+    var method: int;
+    var path_ptr: *char;
+    var path_len: int;
+    var query_ptr: *char;
+    var query_len: int;
+    var body_ptr: *char;
+    var body_len: int;
+    var auth_ptr: *char;
+    var auth_len: int;
+    var content_length: int;
+}
+
+func http_parse_request(buf: *char, len: int, req: *HttpRequest) -> int {
+    if (len < 14) { return -1; }
+    var p: i64 = buf as i64;
+
+    // 1. Parse Method
+    var idx: int = 0;
+    if (native_memcmp(buf, "GET ", 4) == 0) {
+        req->method = METHOD_GET;
+        idx = 4;
+    } else if (native_memcmp(buf, "POST ", 5) == 0) {
+        req->method = METHOD_POST;
+        idx = 5;
+    } else if (native_memcmp(buf, "PUT ", 4) == 0) {
+        req->method = METHOD_PUT;
+        idx = 4;
+    } else if (native_memcmp(buf, "DELETE ", 7) == 0) {
+        req->method = METHOD_DELETE;
+        idx = 7;
+    } else {
+        return -1;
+    }
+
+    // 2. Parse Path & Query
+    var path_start: int = idx;
+    var query_start: int = -1;
+    while (idx < len && *(((p + (idx as i64)) as *u8)) != (32 as u8)) { // ' '
+        if (*(((p + (idx as i64)) as *u8)) == (63 as u8) && query_start < 0) { // '?'
+            query_start = idx + 1;
+        }
+        idx = idx + 1;
+    }
+    if (idx >= len) { return -1; }
+
+    if (query_start >= 0) {
+        req->path_ptr = (p + (path_start as i64)) as *char;
+        req->path_len = query_start - 1 - path_start;
+        req->query_ptr = (p + (query_start as i64)) as *char;
+        req->query_len = idx - query_start;
+    } else {
+        req->path_ptr = (p + (path_start as i64)) as *char;
+        req->path_len = idx - path_start;
+        req->query_ptr = 0 as *char;
+        req->query_len = 0;
+    }
+
+    // Skip " HTTP/1.1\r\n"
+    while (idx + 1 < len && !(*(((p + (idx as i64)) as *u8)) == (13 as u8) && *(((p + (idx as i64) + 1) as *u8)) == (10 as u8))) {
+        idx = idx + 1;
+    }
+    idx = idx + 2; // skip \r\n
+
+    // 3. Parse Headers
+    req->auth_ptr = 0 as *char;
+    req->auth_len = 0;
+    req->content_length = 0;
+
+    while (idx + 1 < len) {
+        // End of headers "\r\n"
+        if (*(((p + (idx as i64)) as *u8)) == (13 as u8) && *(((p + (idx as i64) + 1) as *u8)) == (10 as u8)) {
+            idx = idx + 2;
+            break;
+        }
+
+        var h_start: int = idx;
+        while (idx + 1 < len && !(*(((p + (idx as i64)) as *u8)) == (13 as u8) && *(((p + (idx as i64) + 1) as *u8)) == (10 as u8))) {
+            idx = idx + 1;
+        }
+        var h_len: int = idx - h_start;
+        idx = idx + 2; // skip \r\n
+
+        var h_ptr: *char = (p + (h_start as i64)) as *char;
+        // Check "Authorization: "
+        if (h_len > 15 && (native_memcmp(h_ptr, "Authorization: ", 15) == 0 || native_memcmp(h_ptr, "authorization: ", 15) == 0)) {
+            req->auth_ptr = (p + (h_start as i64) + 15) as *char;
+            req->auth_len = h_len - 15;
+        } else if (h_len > 16 && (native_memcmp(h_ptr, "Content-Length: ", 16) == 0 || native_memcmp(h_ptr, "content-length: ", 16) == 0)) {
+            req->content_length = native_atoi((p + (h_start as i64) + 16) as *char);
+        }
+    }
+
+    // 4. Body
+    var body_len: int = len - idx;
+    if (req->content_length > 0 && body_len < req->content_length) {
+        return 2; // Incomplete body: need more bytes
+    }
+    req->body_ptr = (p + (idx as i64)) as *char;
+    req->body_len = body_len;
+    return 0;
+}
+
+// Query string parameter lookup
+func http_query_param(query: *char, qlen: int, key: *char, klen: int, out_val: **char, out_vlen: *int) -> int {
+    if (qlen <= 0 || query as i64 == 0 as i64) { return 0; }
+    var q: i64 = query as i64;
+    var i: int = 0;
+    while (i < qlen) {
+        var start: int = i;
+        while (i < qlen && *(((q + (i as i64)) as *u8)) != (38 as u8)) { // '&'
+            i = i + 1;
+        }
+        var pair_len: int = i - start;
+        // Check for '='
+        var eq: int = -1;
+        for (var j: int = start; j < start + pair_len; j = j + 1) {
+            if (*(((q + (j as i64)) as *u8)) == (61 as u8)) { // '='
+                eq = j;
+                break;
+            }
+        }
+        if (eq > start) {
+            var cur_klen: int = eq - start;
+            if (cur_klen == klen && native_memcmp((q + (start as i64)) as *char, key, klen as i64) == 0) {
+                *out_val = (q + (eq as i64) + 1) as *char;
+                *out_vlen = (start + pair_len) - (eq + 1);
+                return 1;
+            }
+        }
+        i = i + 1; // skip '&'
+    }
+    return 0;
+}
+
+// Parse and validate query limit parameter: 1 <= limit <= 100, default 20
+// Returns 0 on success, -1 if invalid (422)
+func http_parse_limit(query: *char, qlen: int, out_limit: *int) -> int {
+    var val: *char = 0 as *char;
+    var vlen: int = 0;
+    if (http_query_param(query, qlen, "limit", 5, &val, &vlen) <= 0) {
+        *out_limit = 20;
+        return 0;
+    }
+    if (vlen <= 0 || vlen > 3) { return -1; }
+    var vp: i64 = val as i64;
+    var n: int = 0;
+    for (var i: int = 0; i < vlen; i = i + 1) {
+        var c: u8 = *(((vp + (i as i64)) as *u8));
+        if (c < (48 as u8) || c > (57 as u8)) { return -1; }
+        n = n * 10 + ((c - (48 as u8)) as int);
+    }
+    if (n < 1 || n > 100) { return -1; }
+    *out_limit = n;
+    return 0;
+}
+
+// Parse and validate query offset parameter: offset >= 0, default 0
+// Returns 0 on success, -1 if invalid (422)
+func http_parse_offset(query: *char, qlen: int, out_offset: *int) -> int {
+    var val: *char = 0 as *char;
+    var vlen: int = 0;
+    if (http_query_param(query, qlen, "offset", 6, &val, &vlen) <= 0) {
+        *out_offset = 0;
+        return 0;
+    }
+    if (vlen <= 0 || vlen > 9) { return -1; }
+    var vp: i64 = val as i64;
+    var n: int = 0;
+    for (var i: int = 0; i < vlen; i = i + 1) {
+        var c: u8 = *(((vp + (i as i64)) as *u8));
+        if (c < (48 as u8) || c > (57 as u8)) { return -1; }
+        n = n * 10 + ((c - (48 as u8)) as int);
+    }
+    if (n < 0) { return -1; }
+    *out_offset = n;
+    return 0;
+}
+
+// Fast response formatting
+func http_write_status(out: *char, status: int) -> int {
+    if (status == 200) {
+        native_memcpy(out, "HTTP/1.1 200 OK\r\n", 17);
+        return 17;
+    }
+    if (status == 201) {
+        native_memcpy(out, "HTTP/1.1 201 Created\r\n", 22);
+        return 22;
+    }
+    if (status == 204) {
+        native_memcpy(out, "HTTP/1.1 204 No Content\r\n", 25);
+        return 25;
+    }
+    if (status == 400) {
+        native_memcpy(out, "HTTP/1.1 400 Bad Request\r\n", 26);
+        return 26;
+    }
+    if (status == 401) {
+        native_memcpy(out, "HTTP/1.1 401 Unauthorized\r\n", 27);
+        return 27;
+    }
+    if (status == 403) {
+        native_memcpy(out, "HTTP/1.1 403 Forbidden\r\n", 24);
+        return 24;
+    }
+    if (status == 404) {
+        native_memcpy(out, "HTTP/1.1 404 Not Found\r\n", 24);
+        return 24;
+    }
+    if (status == 422) {
+        native_memcpy(out, "HTTP/1.1 422 Unprocessable Entity\r\n", 35);
+        return 35;
+    }
+    native_memcpy(out, "HTTP/1.1 500 Internal Server Error\r\n", 36);
+    return 36;
+}
+
+func http_format_error(out: *char, status: int, msg: *char) -> int {
+    var o: i64 = out as i64;
+    var len: int = http_write_status(out, status);
+
+    var mlen: i64 = native_strlen(msg);
+    var body_len: i64 = 19 + mlen + 4;
+
+    native_memcpy((o + (len as i64)) as *char, "Content-Type: application/json\r\nContent-Length: ", 48);
+    len = len + 48;
+
+    var cl_buf: [u8; 16] = uninit;
+    var cl_len: int = native_itoa(body_len, (&cl_buf[0]) as *char);
+    native_memcpy((o + (len as i64)) as *char, (&cl_buf[0]) as *char, cl_len as i64);
+    len = len + cl_len;
+
+    native_memcpy((o + (len as i64)) as *char, "\r\nConnection: keep-alive\r\n\r\n{\"errors\":{\"body\":[\"", 48);
+    len = len + 48;
+
+    native_memcpy((o + (len as i64)) as *char, msg, mlen);
+    len = len + (mlen as int);
+
+    *(((o + (len as i64))) as *u8) = 34 as u8;  // '"'
+    *(((o + (len as i64) + 1)) as *u8) = 93 as u8;  // ']'
+    *(((o + (len as i64) + 2)) as *u8) = 125 as u8; // '}'
+    *(((o + (len as i64) + 3)) as *u8) = 125 as u8; // '}'
+    len = len + 4;
+
+    return len;
+}

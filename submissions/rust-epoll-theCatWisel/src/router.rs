@@ -1,11 +1,16 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::auth::TokenSigner;
-use crate::codec::{self, JsonMap, JsonVal};
+use crate::codec::{self, JsonMap, JsonVal, SmallStr};
 use crate::engine::{self, CryptoTask, ReadOp, ReadTask, WriteOp, WriteTask};
-use crate::reactor::{self, ReplyAddr};
+use crate::reactor::{self, ReplyAddr, ReplyBody};
+
+pub trait Timestamped {
+    fn enqueued_at(&self) -> Instant;
+}
 
 struct QueueInner<T> {
     q: VecDeque<T>,
@@ -17,9 +22,10 @@ struct QueueInner<T> {
 pub struct WorkQueue<T> {
     inner: Mutex<QueueInner<T>>,
     ready: Condvar,
+    len: AtomicUsize,
 }
 
-impl<T> WorkQueue<T> {
+impl<T: Timestamped> WorkQueue<T> {
     pub const fn new() -> Self {
         WorkQueue {
             inner: Mutex::new(QueueInner {
@@ -29,17 +35,34 @@ impl<T> WorkQueue<T> {
                 waiting: 0,
             }),
             ready: Condvar::new(),
+            len: AtomicUsize::new(0),
         }
+    }
+
+    #[inline]
+    pub fn approx_len(&self) -> usize {
+        self.len.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn peek_state(&self) -> (usize, Option<Instant>) {
+        if self.len.load(Ordering::Relaxed) == 0 {
+            return (0, None);
+        }
+        let g = self.inner.lock().unwrap();
+        (g.q.len(), g.since)
     }
 
     pub fn push(&self, item: T) {
         let mut g = self.inner.lock().unwrap();
         let was_empty = g.q.is_empty();
         if was_empty {
-            g.since = Some(Instant::now());
+            g.since = Some(item.enqueued_at());
         }
         g.q.push_back(item);
-        let notify = g.waiting > 0 && (was_empty || g.q.len() >= g.hold);
+        let qlen = g.q.len();
+        self.len.store(qlen, Ordering::Relaxed);
+        let notify = g.waiting > 0 && (was_empty || qlen >= g.hold);
         drop(g);
         if notify {
             self.ready.notify_one();
@@ -49,11 +72,15 @@ impl<T> WorkQueue<T> {
     pub fn push_front(&self, item: T) {
         let mut g = self.inner.lock().unwrap();
         let was_empty = g.q.is_empty();
-        if was_empty {
-            g.since = Some(Instant::now());
-        }
+        let ts = item.enqueued_at();
+        g.since = Some(match g.since {
+            Some(prev) => prev.min(ts),
+            None => ts,
+        });
         g.q.push_front(item);
-        let notify = g.waiting > 0 && (was_empty || g.q.len() >= g.hold);
+        let qlen = g.q.len();
+        self.len.store(qlen, Ordering::Relaxed);
+        let notify = g.waiting > 0 && (was_empty || qlen >= g.hold);
         drop(g);
         if notify {
             self.ready.notify_one();
@@ -71,10 +98,12 @@ impl<T> WorkQueue<T> {
         let mut g = self.inner.lock().unwrap();
         let was_empty = g.q.is_empty();
         if was_empty {
-            g.since = Some(Instant::now());
+            g.since = batch.first().map(|x| x.enqueued_at());
         }
         g.q.extend(batch.drain(..));
-        let notify = g.waiting > 0 && (was_empty || g.q.len() >= g.hold);
+        let qlen = g.q.len();
+        self.len.store(qlen, Ordering::Relaxed);
+        let notify = g.waiting > 0 && (was_empty || qlen >= g.hold);
         drop(g);
         if notify {
             self.ready.notify_one();
@@ -87,52 +116,39 @@ impl<T> WorkQueue<T> {
         }
         let mut g = self.inner.lock().unwrap();
         let was_empty = g.q.is_empty();
-        if was_empty {
-            g.since = Some(Instant::now());
+        if let Some(first) = batch.first() {
+            let ts = first.enqueued_at();
+            g.since = Some(match g.since {
+                Some(prev) => prev.min(ts),
+                None => ts,
+            });
         }
         for item in batch.drain(..).rev() {
             g.q.push_front(item);
         }
-        let notify = g.waiting > 0 && (was_empty || g.q.len() >= g.hold);
+        let qlen = g.q.len();
+        self.len.store(qlen, Ordering::Relaxed);
+        let notify = g.waiting > 0 && (was_empty || qlen >= g.hold);
         drop(g);
         if notify {
             self.ready.notify_one();
         }
     }
 
-    pub fn drain_up_to(&self, max_items: usize, dst: &mut Vec<T>) {
-        let mut g = self.inner.lock().unwrap();
-        while g.q.is_empty() {
-            g.hold = 1;
-            g.waiting += 1;
-            g = self.ready.wait(g).unwrap();
-            g.waiting -= 1;
-        }
-        let take_n = g.q.len().min(max_items);
-        dst.extend(g.q.drain(..take_n));
-        if g.q.is_empty() {
-            g.since = None;
-        } else {
-            g.since = Some(Instant::now());
-            if g.waiting > 0 {
-                self.ready.notify_one();
-            }
-        }
-    }
-
-    pub fn take_aged(
+    pub fn try_take_aged(
         &self,
         want: usize,
         max_age: Duration,
         max_cap: usize,
         dst: &mut Vec<T>,
-    ) {
+    ) -> usize {
+        if self.len.load(Ordering::Relaxed) == 0 {
+            return 0;
+        }
         let mut g = self.inner.lock().unwrap();
-        while g.q.is_empty() {
-            g.hold = 1;
-            g.waiting += 1;
-            g = self.ready.wait(g).unwrap();
-            g.waiting -= 1;
+        if g.q.is_empty() {
+            self.len.store(0, Ordering::Relaxed);
+            return 0;
         }
         if !max_age.is_zero() && g.q.len() < want {
             let deadline = g.since.unwrap_or_else(Instant::now) + max_age;
@@ -150,14 +166,28 @@ impl<T> WorkQueue<T> {
         }
         let take_n = g.q.len().min(max_cap);
         dst.extend(g.q.drain(..take_n));
-        if g.q.is_empty() {
-            g.since = None;
-        } else {
-            g.since = Some(Instant::now());
+        let rem = g.q.len();
+        self.len.store(rem, Ordering::Relaxed);
+        if let Some(front) = g.q.front() {
+            g.since = Some(front.enqueued_at());
             if g.waiting > 0 {
                 self.ready.notify_one();
             }
+        } else {
+            g.since = None;
         }
+        rem
+    }
+
+    pub fn wait_for_first(&self) -> usize {
+        let mut g = self.inner.lock().unwrap();
+        while g.q.is_empty() {
+            g.hold = 1;
+            g.waiting += 1;
+            g = self.ready.wait(g).unwrap();
+            g.waiting -= 1;
+        }
+        g.q.len()
     }
 }
 
@@ -170,13 +200,13 @@ pub struct HttpReq<'a> {
 }
 
 pub enum Dispatch {
-    Immediate(u16, Vec<u8>),
+    Immediate(u16, ReplyBody),
     Enqueued,
 }
 
 #[inline]
 fn fail_now(status: u16, msg: &str) -> Dispatch {
-    Dispatch::Immediate(status, reactor::make_error_json(msg))
+    Dispatch::Immediate(status, reactor::make_error_body(msg))
 }
 
 #[inline]
@@ -189,12 +219,47 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
-fn percent_decode(src: &[u8], decode_plus: bool) -> Option<String> {
+#[inline]
+fn percent_decode_small(src: &[u8], decode_plus: bool) -> Option<SmallStr> {
+    if !src.iter().any(|&b| b == b'%' || (decode_plus && b == b'+') || b == 0) {
+        let s = std::str::from_utf8(src).ok()?;
+        return Some(SmallStr::from_str(s));
+    }
+    if src.len() <= 62 {
+        let mut buf = [0u8; 62];
+        let mut len = 0usize;
+        let mut i = 0usize;
+        while i < src.len() {
+            let b = match src[i] {
+                b'%' => {
+                    let hi = hex_nibble(*src.get(i + 1)?)?;
+                    let lo = hex_nibble(*src.get(i + 2)?)?;
+                    i += 3;
+                    (hi << 4) | lo
+                }
+                b'+' if decode_plus => {
+                    i += 1;
+                    b' '
+                }
+                c => {
+                    i += 1;
+                    c
+                }
+            };
+            if b == 0 {
+                return None;
+            }
+            buf[len] = b;
+            len += 1;
+        }
+        let s = std::str::from_utf8(&buf[..len]).ok()?;
+        return Some(SmallStr::from_str(s));
+    }
     let decoded = percent_decode_raw(src, decode_plus)?;
-    if decoded.contains('\0') {
+    if codec::find_byte(decoded.as_bytes(), 0).is_some() {
         return None;
     }
-    Some(decoded)
+    Some(SmallStr::from_string(decoded))
 }
 
 fn percent_decode_raw(src: &[u8], decode_plus: bool) -> Option<String> {
@@ -247,9 +312,9 @@ struct ListQuery {
     limit: Option<i64>,
     seen_offset: bool,
     offset: Option<i64>,
-    tag: Option<String>,
-    author: Option<String>,
-    favorited: Option<String>,
+    tag: Option<SmallStr>,
+    author: Option<SmallStr>,
+    favorited: Option<SmallStr>,
     impossible_filter: bool,
 }
 
@@ -266,14 +331,14 @@ fn scan_list_query(raw: &[u8]) -> ListQuery {
             Some(eq) => (&pair[..eq], &pair[eq + 1..]),
             None => (pair, &b""[..]),
         };
-        let owned_key: Option<String>;
-        let key_str: &str = if !k.iter().any(|&b| b == b'%' || b == b'+') {
+        let owned_key: Option<SmallStr>;
+        let key_str: &str = if !k.iter().any(|&b| b == b'%' || b == b'+' || b == 0) {
             match std::str::from_utf8(k) {
-                Ok(s) if !s.contains('\0') => s,
+                Ok(s) => s,
                 _ => continue,
             }
         } else {
-            owned_key = percent_decode(k, true);
+            owned_key = percent_decode_small(k, true);
             match owned_key.as_deref() {
                 Some(s) => s,
                 None => continue,
@@ -287,7 +352,7 @@ fn scan_list_query(raw: &[u8]) -> ListQuery {
                     if !v.iter().any(|&b| b == b'%' || b == b'+') {
                         q.limit = parse_pos_int_bytes(v);
                     } else {
-                        q.limit = percent_decode(v, true).and_then(|s| parse_pos_int_str(&s));
+                        q.limit = percent_decode_small(v, true).and_then(|s| parse_pos_int_str(&s));
                     }
                 }
             }
@@ -297,7 +362,7 @@ fn scan_list_query(raw: &[u8]) -> ListQuery {
                     if !v.iter().any(|&b| b == b'%' || b == b'+') {
                         q.offset = parse_pos_int_bytes(v);
                     } else {
-                        q.offset = percent_decode(v, true).and_then(|s| parse_pos_int_str(&s));
+                        q.offset = percent_decode_small(v, true).and_then(|s| parse_pos_int_str(&s));
                     }
                 }
             }
@@ -308,10 +373,10 @@ fn scan_list_query(raw: &[u8]) -> ListQuery {
                     _ => &mut q.favorited,
                 };
                 if target.is_none() {
-                    match percent_decode(v, true) {
+                    match percent_decode_small(v, true) {
                         Some(decoded) => *target = Some(decoded),
                         None => {
-                            *target = Some(String::new());
+                            *target = Some(SmallStr::empty());
                             q.impossible_filter = true;
                         }
                     }
@@ -338,6 +403,97 @@ fn validate_page_bounds(q: &ListQuery) -> Option<(i64, i64)> {
     Some((lim, off))
 }
 
+#[inline]
+fn skip_ws(mut s: &[u8]) -> &[u8] {
+    while let [b' ' | b'\t' | b'\r' | b'\n', rest @ ..] = s {
+        s = rest;
+    }
+    s
+}
+
+#[inline]
+fn take_clean_json_str<'a>(s: &'a [u8]) -> Option<(&'a str, &'a [u8])> {
+    let s = skip_ws(s);
+    if *s.first()? != b'"' {
+        return None;
+    }
+    let after_q = &s[1..];
+    let q_end = codec::find_byte(after_q, b'"')?;
+    let val_bytes = &after_q[..q_end];
+    if val_bytes.iter().any(|&b| b < 0x20 || b == b'\\') {
+        return None;
+    }
+    let val_str = std::str::from_utf8(val_bytes).ok()?;
+    Some((val_str, &after_q[q_end + 1..]))
+}
+
+#[inline]
+fn extract_flat_comment_body(body: &[u8]) -> Option<String> {
+    let s = skip_ws(body).strip_prefix(b"{")?;
+    let (k1, s) = take_clean_json_str(s)?;
+    if k1 != "comment" {
+        return None;
+    }
+    let s = skip_ws(s).strip_prefix(b":")?;
+    let s = skip_ws(s).strip_prefix(b"{")?;
+    let (k2, s) = take_clean_json_str(s)?;
+    if k2 != "body" {
+        return None;
+    }
+    let s = skip_ws(s).strip_prefix(b":")?;
+    let (val, s) = take_clean_json_str(s)?;
+    if val.is_empty() {
+        return None;
+    }
+    let s = skip_ws(s).strip_prefix(b"}")?;
+    let s = skip_ws(s).strip_prefix(b"}")?;
+    if !skip_ws(s).is_empty() {
+        return None;
+    }
+    Some(String::from(val))
+}
+
+#[inline]
+fn extract_flat_login(body: &[u8]) -> Option<(SmallStr, Vec<u8>)> {
+    let s = skip_ws(body).strip_prefix(b"{")?;
+    let (k1, s) = take_clean_json_str(s)?;
+    if k1 != "user" {
+        return None;
+    }
+    let s = skip_ws(s).strip_prefix(b":")?;
+    let mut s = skip_ws(s).strip_prefix(b"{")?;
+    let mut email: Option<&str> = None;
+    let mut password: Option<&str> = None;
+    let mut first = true;
+    loop {
+        s = skip_ws(s);
+        if let Some(rest) = s.strip_prefix(b"}") {
+            s = rest;
+            break;
+        }
+        if !first {
+            s = s.strip_prefix(b",")?;
+        }
+        first = false;
+        let (k, rest) = take_clean_json_str(s)?;
+        let rest = skip_ws(rest).strip_prefix(b":")?;
+        let (v, rest) = take_clean_json_str(rest)?;
+        s = rest;
+        match k {
+            "email" => email = Some(v),
+            "password" => password = Some(v),
+            _ => return None,
+        }
+    }
+    let s = skip_ws(s).strip_prefix(b"}")?;
+    if !skip_ws(s).is_empty() {
+        return None;
+    }
+    let em = email.filter(|e| !e.is_empty())?;
+    let pw = password.filter(|p| !p.is_empty())?;
+    Some((SmallStr::from_str(em), pw.as_bytes().to_vec()))
+}
+
 fn unwrap_json_envelope(body: &[u8], root_key: &str) -> Option<JsonMap> {
     let parsed = codec::parse_json(body)?;
     match parsed {
@@ -352,7 +508,7 @@ fn unwrap_json_envelope(body: &[u8], root_key: &str) -> Option<JsonMap> {
 fn contains_nul_char(map: &JsonMap) -> bool {
     fn check_val(v: &JsonVal) -> bool {
         match v {
-            JsonVal::Str(s) => s.contains('\0'),
+            JsonVal::Str(s) => codec::find_byte(s.as_bytes(), 0).is_some(),
             JsonVal::Array(arr) => arr.iter().any(check_val),
             JsonVal::Object(obj) => obj.values().any(check_val),
             _ => false,
@@ -382,8 +538,25 @@ fn optional_str_field(
     }
 }
 
+fn optional_small_field(
+    map: &JsonMap,
+    key: &str,
+    require_non_empty: bool,
+) -> Result<Option<SmallStr>, ()> {
+    match map.get(key) {
+        None | Some(JsonVal::Null) => Ok(None),
+        Some(JsonVal::Str(s)) if require_non_empty && s.is_empty() => Err(()),
+        Some(JsonVal::Str(s)) => Ok(Some(SmallStr::from_str(s))),
+        Some(_) => Err(()),
+    }
+}
+
 fn required_str_field(map: &JsonMap, key: &str) -> Result<String, ()> {
     optional_str_field(map, key, true)?.ok_or(())
+}
+
+fn required_small_field(map: &JsonMap, key: &str) -> Result<SmallStr, ()> {
+    optional_small_field(map, key, true)?.ok_or(())
 }
 
 enum AuthState<'a> {
@@ -407,20 +580,43 @@ fn verify_auth_header<'a>(signer: &TokenSigner, raw_hdr: Option<&'a [u8]>) -> Au
 }
 
 #[inline]
-fn enqueue_read(op: ReadOp, viewer: i64, addr: ReplyAddr) -> Dispatch {
-    engine::READ_QUEUE.push(ReadTask { op, viewer, addr });
+fn enqueue_read(
+    op: ReadOp,
+    viewer: i64,
+    addr: ReplyAddr,
+    now: Instant,
+    pending_reads: &mut [Vec<ReadTask>; 3],
+) -> Dispatch {
+    let lane = engine::read_op_lane(&op);
+    pending_reads[lane].push(ReadTask {
+        op,
+        viewer,
+        addr,
+        enqueued_at: now,
+    });
     Dispatch::Enqueued
 }
 
 #[inline]
-fn enqueue_write(op: WriteOp, viewer: i64, addr: ReplyAddr) -> Dispatch {
-    engine::WRITE_QUEUE.push(WriteTask { op, viewer, addr });
+fn enqueue_write(op: WriteOp, viewer: i64, addr: ReplyAddr, now: Instant) -> Dispatch {
+    engine::WRITE_QUEUE.push(WriteTask {
+        op,
+        viewer,
+        addr,
+        enqueued_at: now,
+    });
     Dispatch::Enqueued
 }
 
 const BCRYPT_MAX_BYTES: usize = 72;
 
-pub fn route_request(signer: &TokenSigner, req: &HttpReq, addr: ReplyAddr) -> Dispatch {
+pub fn route_request(
+    signer: &TokenSigner,
+    req: &HttpReq,
+    addr: ReplyAddr,
+    now: Instant,
+    pending_reads: &mut [Vec<ReadTask>; 3],
+) -> Dispatch {
     let Some(subpath) = req.path.strip_prefix(b"/api/") else {
         return fail_now(404, "not found");
     };
@@ -434,26 +630,28 @@ pub fn route_request(signer: &TokenSigner, req: &HttpReq, addr: ReplyAddr) -> Di
         nparts += 1;
     }
 
-    let decode_seg = |seg: &[u8]| -> Option<String> {
+    let decode_seg = |seg: &[u8]| -> Option<SmallStr> {
         if seg.is_empty() {
             None
         } else {
-            percent_decode(seg, false)
+            percent_decode_small(seg, false)
         }
     };
 
     match (req.method, &parts[..nparts]) {
-        (b"GET", [b"tags"]) => enqueue_read(ReadOp::Tags, 0, addr),
+        (b"GET", [b"tags"]) => enqueue_read(ReadOp::Tags, 0, addr, now, pending_reads),
         (b"GET", [b"articles"]) => match verify_auth_header(signer, req.auth) {
-            AuthState::Verified(v, _) => route_article_list(req.query, v, addr),
-            AuthState::Anonymous => route_article_list(req.query, 0, addr),
+            AuthState::Verified(v, _) => route_article_list(req.query, v, addr, now, pending_reads),
+            AuthState::Anonymous => route_article_list(req.query, 0, addr, now, pending_reads),
             AuthState::Rejected => fail_now(401, "unauthorized"),
         },
         (b"GET", [b"articles", b"feed"]) => match verify_auth_header(signer, req.auth) {
             AuthState::Verified(v, _) => {
                 let q = scan_list_query(req.query);
                 match validate_page_bounds(&q) {
-                    Some((lim, off)) => enqueue_read(ReadOp::Feed { lim, off }, v, addr),
+                    Some((lim, off)) => {
+                        enqueue_read(ReadOp::Feed { lim, off }, v, addr, now, pending_reads)
+                    }
                     None => fail_now(422, "invalid pagination parameters"),
                 }
             }
@@ -464,8 +662,12 @@ pub fn route_request(signer: &TokenSigner, req: &HttpReq, addr: ReplyAddr) -> Di
                 return fail_now(404, "not found");
             };
             match verify_auth_header(signer, req.auth) {
-                AuthState::Verified(v, _) => enqueue_read(ReadOp::ArticleBySlug { slug }, v, addr),
-                AuthState::Anonymous => enqueue_read(ReadOp::ArticleBySlug { slug }, 0, addr),
+                AuthState::Verified(v, _) => {
+                    enqueue_read(ReadOp::ArticleBySlug { slug }, v, addr, now, pending_reads)
+                }
+                AuthState::Anonymous => {
+                    enqueue_read(ReadOp::ArticleBySlug { slug }, 0, addr, now, pending_reads)
+                }
                 AuthState::Rejected => fail_now(401, "unauthorized"),
             }
         }
@@ -474,8 +676,12 @@ pub fn route_request(signer: &TokenSigner, req: &HttpReq, addr: ReplyAddr) -> Di
                 return fail_now(404, "not found");
             };
             match verify_auth_header(signer, req.auth) {
-                AuthState::Verified(v, _) => enqueue_read(ReadOp::Comments { slug }, v, addr),
-                AuthState::Anonymous => enqueue_read(ReadOp::Comments { slug }, 0, addr),
+                AuthState::Verified(v, _) => {
+                    enqueue_read(ReadOp::Comments { slug }, v, addr, now, pending_reads)
+                }
+                AuthState::Anonymous => {
+                    enqueue_read(ReadOp::Comments { slug }, 0, addr, now, pending_reads)
+                }
                 AuthState::Rejected => fail_now(401, "unauthorized"),
             }
         }
@@ -484,8 +690,12 @@ pub fn route_request(signer: &TokenSigner, req: &HttpReq, addr: ReplyAddr) -> Di
                 return fail_now(404, "not found");
             };
             match verify_auth_header(signer, req.auth) {
-                AuthState::Verified(v, _) => enqueue_read(ReadOp::Profile { username }, v, addr),
-                AuthState::Anonymous => enqueue_read(ReadOp::Profile { username }, 0, addr),
+                AuthState::Verified(v, _) => {
+                    enqueue_read(ReadOp::Profile { username }, v, addr, now, pending_reads)
+                }
+                AuthState::Anonymous => {
+                    enqueue_read(ReadOp::Profile { username }, 0, addr, now, pending_reads)
+                }
                 AuthState::Rejected => fail_now(401, "unauthorized"),
             }
         }
@@ -497,6 +707,8 @@ pub fn route_request(signer: &TokenSigner, req: &HttpReq, addr: ReplyAddr) -> Di
                 },
                 uid,
                 addr,
+                now,
+                pending_reads,
             ),
             _ => fail_now(401, "unauthorized"),
         },
@@ -506,7 +718,9 @@ pub fn route_request(signer: &TokenSigner, req: &HttpReq, addr: ReplyAddr) -> Di
             };
             let fav_on = req.method == b"POST";
             match verify_auth_header(signer, req.auth) {
-                AuthState::Verified(v, _) => enqueue_write(WriteOp::Favorite { slug, on: fav_on }, v, addr),
+                AuthState::Verified(v, _) => {
+                    enqueue_write(WriteOp::Favorite { slug, on: fav_on }, v, addr, now)
+                }
                 _ => fail_now(401, "unauthorized"),
             }
         }
@@ -516,12 +730,17 @@ pub fn route_request(signer: &TokenSigner, req: &HttpReq, addr: ReplyAddr) -> Di
             };
             match verify_auth_header(signer, req.auth) {
                 AuthState::Verified(v, _) => {
+                    if let Some(body) = extract_flat_comment_body(req.body) {
+                        return enqueue_write(WriteOp::CreateComment { slug, body }, v, addr, now);
+                    }
                     let obj = match parse_valid_envelope(req.body, "comment") {
                         Ok(o) => o,
                         Err(resp) => return resp,
                     };
                     match required_str_field(&obj, "body") {
-                        Ok(body) => enqueue_write(WriteOp::CreateComment { slug, body }, v, addr),
+                        Ok(body) => {
+                            enqueue_write(WriteOp::CreateComment { slug, body }, v, addr, now)
+                        }
                         Err(()) => fail_now(422, "comment body required"),
                     }
                 }
@@ -534,12 +753,20 @@ pub fn route_request(signer: &TokenSigner, req: &HttpReq, addr: ReplyAddr) -> Di
             };
             let follow_on = req.method == b"POST";
             match verify_auth_header(signer, req.auth) {
-                AuthState::Verified(v, _) => enqueue_write(WriteOp::Follow { username, on: follow_on }, v, addr),
+                AuthState::Verified(v, _) => enqueue_write(
+                    WriteOp::Follow {
+                        username,
+                        on: follow_on,
+                    },
+                    v,
+                    addr,
+                    now,
+                ),
                 _ => fail_now(401, "unauthorized"),
             }
         }
         (b"POST", [b"articles"]) => match verify_auth_header(signer, req.auth) {
-            AuthState::Verified(v, _) => handle_create_article(req.body, v, addr),
+            AuthState::Verified(v, _) => handle_create_article(req.body, v, addr, now),
             _ => fail_now(401, "unauthorized"),
         },
         (b"PUT", [b"articles", raw_slug]) if !raw_slug.is_empty() => {
@@ -547,7 +774,7 @@ pub fn route_request(signer: &TokenSigner, req: &HttpReq, addr: ReplyAddr) -> Di
                 return fail_now(404, "not found");
             };
             match verify_auth_header(signer, req.auth) {
-                AuthState::Verified(v, _) => handle_update_article(req.body, slug, v, addr),
+                AuthState::Verified(v, _) => handle_update_article(req.body, slug, v, addr, now),
                 _ => fail_now(401, "unauthorized"),
             }
         }
@@ -556,7 +783,9 @@ pub fn route_request(signer: &TokenSigner, req: &HttpReq, addr: ReplyAddr) -> Di
                 return fail_now(404, "not found");
             };
             match verify_auth_header(signer, req.auth) {
-                AuthState::Verified(v, _) => enqueue_write(WriteOp::DeleteArticle { slug }, v, addr),
+                AuthState::Verified(v, _) => {
+                    enqueue_write(WriteOp::DeleteArticle { slug }, v, addr, now)
+                }
                 _ => fail_now(401, "unauthorized"),
             }
         }
@@ -569,33 +798,48 @@ pub fn route_request(signer: &TokenSigner, req: &HttpReq, addr: ReplyAddr) -> Di
             let id_str = decode_seg(raw_id);
             match verify_auth_header(signer, req.auth) {
                 AuthState::Verified(v, _) => match id_str.as_deref().and_then(parse_pos_int_str) {
-                    Some(cid) => enqueue_write(WriteOp::DeleteComment { slug, id: cid }, v, addr),
+                    Some(cid) => {
+                        enqueue_write(WriteOp::DeleteComment { slug, id: cid }, v, addr, now)
+                    }
                     None => fail_now(404, "comment not found"),
                 },
                 _ => fail_now(401, "unauthorized"),
             }
         }
-        (b"POST", [b"users", b"login"]) => handle_login(req.body, addr),
-        (b"POST", [b"users"]) => handle_register(req.body, addr),
+        (b"POST", [b"users", b"login"]) => handle_login(req.body, addr, now),
+        (b"POST", [b"users"]) => handle_register(req.body, addr, now),
         (b"PUT", [b"user"]) => match verify_auth_header(signer, req.auth) {
-            AuthState::Verified(uid, tok) => {
-                handle_update_user(req.body, uid, String::from_utf8_lossy(tok).into_owned(), addr)
-            }
+            AuthState::Verified(uid, tok) => handle_update_user(
+                req.body,
+                uid,
+                String::from_utf8_lossy(tok).into_owned(),
+                addr,
+                now,
+            ),
             _ => fail_now(401, "unauthorized"),
         },
         _ => fail_now(404, "not found"),
     }
 }
 
-fn route_article_list(raw_query: &[u8], viewer: i64, addr: ReplyAddr) -> Dispatch {
+fn route_article_list(
+    raw_query: &[u8],
+    viewer: i64,
+    addr: ReplyAddr,
+    now: Instant,
+    pending_reads: &mut [Vec<ReadTask>; 3],
+) -> Dispatch {
     let q = scan_list_query(raw_query);
     let Some((lim, off)) = validate_page_bounds(&q) else {
         return fail_now(422, "invalid pagination parameters");
     };
     if q.impossible_filter {
-        return Dispatch::Immediate(200, b"{\"articles\":[],\"articlesCount\":0}".to_vec());
+        return Dispatch::Immediate(
+            200,
+            ReplyBody::Owned(b"{\"articles\":[],\"articlesCount\":0}".to_vec()),
+        );
     }
-    let non_empty = |opt: Option<String>| opt.filter(|s| !s.is_empty());
+    let non_empty = |opt: Option<SmallStr>| opt.filter(|s| !s.is_empty());
     let op = if let Some(tag) = non_empty(q.tag) {
         ReadOp::ByTag { tag, lim, off }
     } else if let Some(username) = non_empty(q.author) {
@@ -605,17 +849,17 @@ fn route_article_list(raw_query: &[u8], viewer: i64, addr: ReplyAddr) -> Dispatc
     } else {
         ReadOp::Global { lim, off }
     };
-    enqueue_read(op, viewer, addr)
+    enqueue_read(op, viewer, addr, now, pending_reads)
 }
 
-fn handle_register(body: &[u8], addr: ReplyAddr) -> Dispatch {
+fn handle_register(body: &[u8], addr: ReplyAddr, now: Instant) -> Dispatch {
     let obj = match parse_valid_envelope(body, "user") {
         Ok(o) => o,
         Err(resp) => return resp,
     };
     let (Ok(username), Ok(email), Ok(password)) = (
-        required_str_field(&obj, "username"),
-        required_str_field(&obj, "email"),
+        required_small_field(&obj, "username"),
+        required_small_field(&obj, "email"),
         required_str_field(&obj, "password"),
     ) else {
         return fail_now(422, "username, email, and password are required");
@@ -631,43 +875,67 @@ fn handle_register(body: &[u8], addr: ReplyAddr) -> Dispatch {
         },
         viewer: 0,
         addr,
+        enqueued_at: now,
     };
     engine::CRYPTO_QUEUE.push(CryptoTask::HashPassword {
         password: password.into_bytes(),
         write: task,
+        enqueued_at: now,
     });
     Dispatch::Enqueued
 }
 
-fn handle_login(body: &[u8], addr: ReplyAddr) -> Dispatch {
+fn handle_login(body: &[u8], addr: ReplyAddr, now: Instant) -> Dispatch {
+    if let Some((email, password)) = extract_flat_login(body) {
+        if password.len() > BCRYPT_MAX_BYTES {
+            return fail_now(401, "invalid credentials");
+        }
+        engine::enqueue_read_front(ReadTask {
+            op: ReadOp::Login { email, password },
+            viewer: 0,
+            addr,
+            enqueued_at: now,
+        });
+        return Dispatch::Enqueued;
+    }
     let Some(obj) = unwrap_json_envelope(body, "user") else {
         return fail_now(422, "invalid login payload");
     };
-    let (Ok(email), Ok(password)) = (required_str_field(&obj, "email"), required_str_field(&obj, "password")) else {
+    let (Ok(email), Ok(password)) = (
+        required_small_field(&obj, "email"),
+        required_str_field(&obj, "password"),
+    ) else {
         return fail_now(422, "email and password are required");
     };
     if email.contains('\0') || password.len() > BCRYPT_MAX_BYTES {
         return fail_now(401, "invalid credentials");
     }
-    engine::READ_QUEUE.push_front(ReadTask {
+    engine::enqueue_read_front(ReadTask {
         op: ReadOp::Login {
             email,
             password: password.into_bytes(),
         },
         viewer: 0,
         addr,
+        enqueued_at: now,
     });
     Dispatch::Enqueued
 }
 
-fn handle_update_user(body: &[u8], uid: i64, token: String, addr: ReplyAddr) -> Dispatch {
+fn handle_update_user(
+    body: &[u8],
+    uid: i64,
+    token: String,
+    addr: ReplyAddr,
+    now: Instant,
+) -> Dispatch {
     let obj = match parse_valid_envelope(body, "user") {
         Ok(o) => o,
         Err(resp) => return resp,
     };
     let (Ok(email), Ok(username), Ok(password), Ok(bio), Ok(image)) = (
-        optional_str_field(&obj, "email", true),
-        optional_str_field(&obj, "username", true),
+        optional_small_field(&obj, "email", true),
+        optional_small_field(&obj, "username", true),
         optional_str_field(&obj, "password", true),
         optional_str_field(&obj, "bio", false),
         optional_str_field(&obj, "image", false),
@@ -691,15 +959,17 @@ fn handle_update_user(body: &[u8], uid: i64, token: String, addr: ReplyAddr) -> 
                     op,
                     viewer: uid,
                     addr,
+                    enqueued_at: now,
                 },
+                enqueued_at: now,
             });
             Dispatch::Enqueued
         }
-        None => enqueue_write(op, uid, addr),
+        None => enqueue_write(op, uid, addr, now),
     }
 }
 
-fn handle_create_article(body: &[u8], viewer: i64, addr: ReplyAddr) -> Dispatch {
+fn handle_create_article(body: &[u8], viewer: i64, addr: ReplyAddr, now: Instant) -> Dispatch {
     let obj = match parse_valid_envelope(body, "article") {
         Ok(o) => o,
         Err(resp) => return resp,
@@ -735,10 +1005,17 @@ fn handle_create_article(body: &[u8], viewer: i64, addr: ReplyAddr) -> Dispatch 
         },
         viewer,
         addr,
+        now,
     )
 }
 
-fn handle_update_article(body: &[u8], slug: String, viewer: i64, addr: ReplyAddr) -> Dispatch {
+fn handle_update_article(
+    body: &[u8],
+    slug: SmallStr,
+    viewer: i64,
+    addr: ReplyAddr,
+    now: Instant,
+) -> Dispatch {
     let obj = match parse_valid_envelope(body, "article") {
         Ok(o) => o,
         Err(resp) => return resp,
@@ -759,5 +1036,6 @@ fn handle_update_article(body: &[u8], slug: String, viewer: i64, addr: ReplyAddr
         },
         viewer,
         addr,
+        now,
     )
 }

@@ -17,6 +17,11 @@ import challenge.pg.Stmt.Statement;
 public final class PgDispatcher implements AutoCloseable {
     private final UnitQueue submitted = new UnitQueue();
     private final AtomicBoolean sleeping = new AtomicBoolean();
+    // while sleeping: the dispatcher wakes by itself no later than this (nanoTime), so a read whose window ends at or
+    // after it needs no eventfd wake. Long.MIN_VALUE when every read connection is busy (a completion wakes it, and
+    // no read could go out before), Long.MAX_VALUE when no read waits (the next one must start its window). With
+    // 40-120 ms windows almost every read used to wake the dispatcher only to be queued.
+    private volatile long wakesBy;
     private final AtomicInteger publishers = new AtomicInteger();
     private final Sys sys = new Sys();
     private final int epoll;
@@ -27,8 +32,14 @@ public final class PgDispatcher implements AutoCloseable {
     private final int writeGroupMax;
     private final int readRoundMax;
     private final int gatherUs;
+    /** Gather window per read lane (feed, comments, the rest), microseconds. */
+    private final long[] laneGatherNs = new long[LANES];
     private final boolean coalesce;
-    private final ArrayDeque<Unit> waiting = new ArrayDeque<>();
+    // waiting reads, one FIFO per lane (in submission order, so each queue is in queuedAt order), and waiting writes:
+    // a wakeup reads each lane's head and size instead of scanning one mixed queue several times (that scan grew
+    // with load times wakeups)
+    private final ArrayDeque<Unit>[] laneQueues = newLaneQueues();
+    private final ArrayDeque<Unit> writeQueue = new ArrayDeque<>();
     private final Thread thread;
     private volatile boolean closed;
 
@@ -39,11 +50,19 @@ public final class PgDispatcher implements AutoCloseable {
         int nw = env("WRITE_CONNS", 1);
         writeGroupMax = env("WRITE_GROUP_MAX", 256);
         readRoundMax = env("READ_ROUND_MAX", 4096);
-        // Hetzner 150k: 20 ms gathers cut Postgres CPU 52 -> 44% of the box (box 97.9 -> 90.6%), p95 498 -> 254 ms; with a
-        // round spread over connections (READ_SPREAD), 30 ms holds the same latency and batches more
-        gatherUs = env("READ_GATHER_US", 30000);
+        // Hetzner 150k: 20 ms gathers cut Postgres CPU 52 -> 44% of the box (box 97.9 -> 90.6%), p95 498 -> 254 ms. At
+        // 140k, 40 ms against 30: Postgres 85.9 -> 81.5 us/req, app +1, p95 ~115 -> ~150 ms (two runs each)
+        gatherUs = env("READ_GATHER_US", 40000);
+        // Feeds and comments gather on their own clocks: their batches are the costliest per request and share the
+        // most within a batch, so they can wait longer than the cheap lookups that make up most reads. Hetzner 140k
+        // (with tag ids, two runs each): 120 ms gave app + Postgres 136.1 us/req at p95 182 ms, against 151.1 at 144 ms
+        // for 40 ms everywhere without tag ids (an earlier box of the same type);
+        // 160 ms gave 136.6 at p95 232 ms.
+        laneGatherNs[FEED_LANE] = 1000L * env("READ_GATHER_FEED_US", 120000);
+        laneGatherNs[COMMENTS_LANE] = 1000L * env("READ_GATHER_COMMENTS_US", 120000);
+        laneGatherNs[REST_LANE] = 1000L * gatherUs;
         coalesce = env("COALESCE", 1) != 0;
-        if (readRoundMax < 1 || gatherUs < 0) {
+        if (readRoundMax < 1 || gatherUs < 0 || laneGatherNs[FEED_LANE] < 0 || laneGatherNs[COMMENTS_LANE] < 0) {
             throw new IllegalArgumentException("invalid read round configuration");
         }
         if (writeGroupMax < 1) {
@@ -80,6 +99,35 @@ public final class PgDispatcher implements AutoCloseable {
         thread.start();
     }
 
+    static final int FEED_LANE = 0;
+    static final int COMMENTS_LANE = 1;
+    static final int REST_LANE = 2;
+    static final int LANES = 3;
+
+    @SuppressWarnings("unchecked")
+    private static ArrayDeque<Unit>[] newLaneQueues() {
+        ArrayDeque<Unit>[] q = new ArrayDeque[LANES];
+        for (int l = 0; l < LANES; l++) {
+            q[l] = new ArrayDeque<>();
+        }
+        return q;
+    }
+
+    private boolean readsWaiting() {
+        for (ArrayDeque<Unit> q : laneQueues) {
+            if (!q.isEmpty()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** The lane a read unit gathers in. */
+    static int lane(Unit u) {
+        int k = PgConn.kind(u);
+        return k == PgConn.FEED_KIND ? FEED_LANE : k == PgConn.COMMENTS_KIND ? COMMENTS_LANE : REST_LANE;
+    }
+
     private static int env(String key, int defaultValue) {
         return Integer.parseInt(System.getenv().getOrDefault(key, Integer.toString(defaultValue)));
     }
@@ -93,8 +141,10 @@ public final class PgDispatcher implements AutoCloseable {
             if (unit.queries.length == 0) {
                 throw new IllegalArgumentException("empty unit");
             }
+            long now = System.nanoTime();
+            unit.queuedAt = now;
             submitted.offer(unit);
-            if (sleeping.compareAndSet(true, false)) {
+            if (sleeping.get() && (unit.write || unit.tx || now + laneGatherNs[lane(unit)] < wakesBy) && sleeping.compareAndSet(true, false)) {
                 Sys.wake(wake);
             }
         } finally {
@@ -105,8 +155,7 @@ public final class PgDispatcher implements AutoCloseable {
     private void drain() {
         Unit unit;
         while ((unit = submitted.poll()) != null) {
-            unit.queuedAt = System.nanoTime();
-            waiting.add(unit);
+            (unit.write ? writeQueue : laneQueues[lane(unit)]).add(unit);
         }
     }
 
@@ -129,7 +178,7 @@ public final class PgDispatcher implements AutoCloseable {
      * one connection per kind cuts a round to its slowest statement (locally 21
      * -> ~9 ms at 20 ms gathers, with 7 of 8 read connections idle before).
      */
-    private void spread(int from) {
+    private void spread(int from, int lane) {
         if (buckets == null) {
             buckets = new Unit[PgConn.KINDS + 1][readRoundMax];
         }
@@ -144,17 +193,10 @@ public final class PgDispatcher implements AutoCloseable {
         }
         Arrays.fill(bucketCounts, 0);
         int taken = 0;
-        boolean blocked = false;
-        int count = waiting.size();
-        while (count-- > 0) {
-            Unit u = waiting.remove();
-            if (u.tx && !u.write) {
-                blocked = true;
-            }
-            if (u.write || blocked || taken == readRoundMax) {
-                waiting.add(u);
-                continue;
-            }
+        ArrayDeque<Unit> queue = laneQueues[lane];
+        // in queue order, up to (not including) a tx read
+        while (taken < readRoundMax && !queue.isEmpty() && !queue.peekFirst().tx) {
+            Unit u = queue.removeFirst();
             int k = PgConn.kind(u);
             int b = k < 0 ? PgConn.KINDS : k;
             buckets[b][bucketCounts[b]++] = u;
@@ -208,32 +250,59 @@ public final class PgDispatcher implements AutoCloseable {
         }
     }
 
+    // dueLane(): per lane, the oldest waiting read and how many reads wait
+    private final Unit[] laneFirst = new Unit[LANES];
+    private final int[] laneCount = new int[LANES];
+
+    private void scanLanes() {
+        for (int l = 0; l < LANES; l++) {
+            laneFirst[l] = laneQueues[l].peekFirst();
+            laneCount[l] = laneQueues[l].size();
+        }
+    }
+
+    /** The lane whose round is due (window elapsed or round full), the one waiting longest; -1 if none. */
+    private int dueLane(long now) {
+        scanLanes();
+        int best = -1;
+        for (int l = 0; l < LANES; l++) {
+            Unit f = laneFirst[l];
+            if (f != null && (laneCount[l] >= readRoundMax || now - f.queuedAt >= laneGatherNs[l])
+                    && (best < 0 || f.queuedAt < laneFirst[best].queuedAt)) {
+                best = l;
+            }
+        }
+        return best;
+    }
+
+    /** Nanoseconds until the next lane's window elapses (0 if one already has), or -1 if no read waits. */
+    private long untilDue(long now) {
+        scanLanes();
+        long min = -1;
+        for (int l = 0; l < LANES; l++) {
+            Unit f = laneFirst[l];
+            if (f != null) {
+                long left = laneCount[l] >= readRoundMax ? 0 : Math.max(0, laneGatherNs[l] - (now - f.queuedAt));
+                min = min < 0 ? left : Math.min(min, left);
+            }
+        }
+        return min;
+    }
+
     private void plan() {
-        int count = waiting.size();
         if (coalesce) {
             for (int c = 0; c < reads.length; c++) {
                 PgConn conn = reads[c];
                 if (!conn.idle()) {
                     continue;
                 }
-                Unit first = null;
-                int readCount = 0;
-                int queued = waiting.size();
-                while (queued-- > 0) {
-                    Unit u = waiting.remove();
-                    if (!u.write) {
-                        if (first == null) {
-                            first = u;
-                        }
-                        readCount++;
-                    }
-                    waiting.add(u);
+                int lane = dueLane(System.nanoTime());
+                if (lane < 0) {
+                    break;
                 }
-                if (first == null || (readCount < readRoundMax && System.nanoTime() - first.queuedAt < (long) gatherUs * 1000)) {
-                    continue;
-                }
+                Unit first = laneFirst[lane];
                 if (first.tx) {
-                    waiting.remove(first);
+                    laneQueues[lane].removeFirst();
                     try {
                         conn.submit(first);
                     } catch (RuntimeException e) {
@@ -243,34 +312,32 @@ public final class PgDispatcher implements AutoCloseable {
                     }
                     continue;
                 }
-                spread(c);
-                break;
+                spread(c, lane);
             }
         } else {
-            while (count-- > 0) {
-                Unit unit = waiting.remove();
-                PgConn best = null;
-                if (unit.write) {
-                    waiting.add(unit);
-                    continue;
-                }
-                for (PgConn conn : reads) {
-                    if (conn.canAccept()
-                            && (!unit.tx || conn.idle())
-                            && (best == null || conn.inFlight() < best.inFlight())) {
-                        best = conn;
+            for (ArrayDeque<Unit> queue : laneQueues) {
+                int count = queue.size();
+                while (count-- > 0) {
+                    Unit unit = queue.remove();
+                    PgConn best = null;
+                    for (PgConn conn : reads) {
+                        if (conn.canAccept()
+                                && (!unit.tx || conn.idle())
+                                && (best == null || conn.inFlight() < best.inFlight())) {
+                            best = conn;
+                        }
                     }
-                }
-                if (best == null) {
-                    waiting.add(unit);
-                    continue;
-                }
-                try {
-                    best.submit(unit);
-                } catch (RuntimeException e) {
-                    unit.sqlState = "XX000";
-                    unit.errorMessage = e.toString();
-                    unit.owner.post(unit);
+                    if (best == null) {
+                        queue.add(unit);
+                        continue;
+                    }
+                    try {
+                        best.submit(unit);
+                    } catch (RuntimeException e) {
+                        unit.sqlState = "XX000";
+                        unit.errorMessage = e.toString();
+                        unit.owner.post(unit);
+                    }
                 }
             }
         }
@@ -278,13 +345,8 @@ public final class PgDispatcher implements AutoCloseable {
             if (!conn.idle()) {
                 continue;
             }
-            count = waiting.size();
-            while (count-- > 0 && conn.groupSize() < writeGroupMax) {
-                Unit unit = waiting.remove();
-                if (!unit.write) {
-                    waiting.add(unit);
-                    continue;
-                }
+            while (!writeQueue.isEmpty() && conn.groupSize() < writeGroupMax) {
+                Unit unit = writeQueue.remove();
                 try {
                     conn.addToGroup(unit);
                 } catch (RuntimeException e) {
@@ -310,13 +372,9 @@ public final class PgDispatcher implements AutoCloseable {
                     conn.ensureConnected();
                     conn.flush(io);
                 }
-                sleeping.set(true);
-                if (submitted.hasPending() || closed) {
-                    sleeping.set(false);
-                    continue;
-                }
                 int timeout = 1000;
-                if (coalesce && gatherUs > 0 && !waiting.isEmpty()) {
+                long by = Long.MAX_VALUE;
+                if (coalesce) {
                     boolean free = false;
                     for (PgConn conn : reads) {
                         if (conn.idle()) {
@@ -324,19 +382,22 @@ public final class PgDispatcher implements AutoCloseable {
                             break;
                         }
                     }
-                    if (free) {
-                        int queued = waiting.size();
-                        boolean found = false;
-                        while (queued-- > 0) {
-                            Unit u = waiting.remove();
-                            if (!found && !u.write) {
-                                long left = (long) gatherUs * 1000 - (System.nanoTime() - u.queuedAt);
-                                timeout = (int) Math.min(1000, Math.max(0, (left + 999_999) / 1_000_000));
-                                found = true;
-                            }
-                            waiting.add(u);
+                    if (!free) {
+                        by = Long.MIN_VALUE;
+                    } else if (readsWaiting()) {
+                        long now = System.nanoTime();
+                        long left = untilDue(now);
+                        if (left >= 0) {
+                            timeout = (int) Math.min(1000, (left + 999_999) / 1_000_000);
+                            by = now + left;
                         }
                     }
+                }
+                wakesBy = by;
+                sleeping.set(true);
+                if (submitted.hasPending() || closed) {
+                    sleeping.set(false);
+                    continue;
                 }
                 int n = sys.epollWait(epoll, events, all.length + 1, timeout);
                 sleeping.set(false);
@@ -349,7 +410,8 @@ public final class PgDispatcher implements AutoCloseable {
                 for (int i = 0; i < n; i++) {
                     int tag = Sys.eventTag(events, i);
                     if (tag == -1) {
-                        while (sys.read(wake, io, 8) > 0) {}
+                        // one read takes the whole eventfd counter
+                        sys.read(wake, io, 8);
                     } else {
                         all[tag].event(Sys.eventFlags(events, i), io);
                     }
@@ -364,13 +426,20 @@ public final class PgDispatcher implements AutoCloseable {
                 conn.fail("dispatcher stopped");
             }
             drain();
-            for (Unit u : waiting) {
-                u.sqlState = "08006";
-                u.errorMessage = "dispatcher stopped";
-                u.owner.post(u);
+            for (ArrayDeque<Unit> queue : laneQueues) {
+                stop(queue);
             }
+            stop(writeQueue);
             Sys.close(wake);
             Sys.close(epoll);
+        }
+    }
+
+    private static void stop(ArrayDeque<Unit> queue) {
+        for (Unit u : queue) {
+            u.sqlState = "08006";
+            u.errorMessage = "dispatcher stopped";
+            u.owner.post(u);
         }
     }
 

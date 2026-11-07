@@ -1,7 +1,7 @@
 use std::io;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::auth::TokenSigner;
 use crate::codec;
@@ -15,6 +15,7 @@ pub mod sys {
     pub const PR_SET_THP_DISABLE: c_int = 41;
     pub const M_ARENA_MAX: c_int = -8;
     pub const SCHED_BATCH: c_int = 3;
+    pub const PRIO_PROCESS: c_int = 0;
     pub const CLONE_FILES: c_int = 0x0000_0400;
     pub const RLIMIT_NOFILE: c_int = 7;
     pub const EFD_NONBLOCK: c_int = 0o4000;
@@ -29,6 +30,8 @@ pub mod sys {
     pub const SO_REUSEPORT: c_int = 15;
     pub const IPPROTO_TCP: c_int = 6;
     pub const TCP_NODELAY: c_int = 1;
+    pub const TCP_QUICKACK: c_int = 12;
+    pub const MADV_HUGEPAGE: c_int = 14;
     pub const IPPROTO_IPV6: c_int = 41;
     pub const IPV6_V6ONLY: c_int = 26;
     pub const EPOLL_CLOEXEC: c_int = 0o2000000;
@@ -107,6 +110,7 @@ pub mod sys {
         pub fn prctl(option: c_int, arg2: usize, arg3: usize, arg4: usize, arg5: usize) -> c_int;
         pub fn mallopt(param: c_int, value: c_int) -> c_int;
         pub fn sched_setscheduler(pid: c_int, policy: c_int, param: *const sched_param) -> c_int;
+        pub fn setpriority(which: c_int, who: u32, prio: c_int) -> c_int;
         pub fn unshare(flags: c_int) -> c_int;
         pub fn getrlimit(resource: c_int, rlim: *mut rlimit) -> c_int;
         pub fn setrlimit(resource: c_int, rlim: *const rlimit) -> c_int;
@@ -135,6 +139,7 @@ pub mod sys {
         pub fn writev(fd: c_int, iov: *const iovec, iovcnt: c_int) -> isize;
         pub fn close(fd: c_int) -> c_int;
         pub fn getrandom(buf: *mut c_void, buflen: usize, flags: u32) -> isize;
+        pub fn madvise(addr: *mut c_void, length: usize, advice: c_int) -> c_int;
     }
 }
 
@@ -148,6 +153,12 @@ const LIMIT_BODY: usize = 1024 * 1024;
 pub fn unshare_files() {
     unsafe {
         let _ = sys::unshare(sys::CLONE_FILES);
+    }
+}
+
+pub fn set_thread_nice(nice_val: i32) {
+    unsafe {
+        let _ = sys::setpriority(sys::PRIO_PROCESS, 0, nice_val);
     }
 }
 
@@ -181,6 +192,7 @@ pub struct ReplyAddr {
     pub epoch: u32,
 }
 
+#[derive(Clone)]
 pub enum ReplyBody {
     Owned(Vec<u8>),
     Shared(Arc<[u8]>),
@@ -188,7 +200,7 @@ pub enum ReplyBody {
 }
 
 impl ReplyBody {
-    #[inline]
+    #[inline(always)]
     pub fn as_slice(&self) -> &[u8] {
         match self {
             ReplyBody::Owned(v) => v.as_slice(),
@@ -210,11 +222,11 @@ pub struct WorkerOutbox {
     pub epochs: Box<[AtomicU32]>,
 }
 
-static OUTBOX_RING: OnceLock<Vec<WorkerOutbox>> = OnceLock::new();
+static OUTBOX_RING: AtomicPtr<WorkerOutbox> = AtomicPtr::new(std::ptr::null_mut());
 
 pub fn init_outboxes(worker_count: usize, slot_cap: usize) {
     let cap = slot_cap.max(65536) + 512;
-    let boxes = (0..worker_count)
+    let boxes: Vec<WorkerOutbox> = (0..worker_count)
         .map(|_| {
             let efd = unsafe { sys::eventfd(0, sys::EFD_NONBLOCK | sys::EFD_CLOEXEC) };
             assert!(efd >= 0, "eventfd creation failed");
@@ -226,12 +238,13 @@ pub fn init_outboxes(worker_count: usize, slot_cap: usize) {
             }
         })
         .collect();
-    OUTBOX_RING.set(boxes).ok().expect("init_outboxes called twice");
+    let ptr = Box::into_raw(boxes.into_boxed_slice()) as *mut WorkerOutbox;
+    OUTBOX_RING.store(ptr, Ordering::Release);
 }
 
-#[inline]
+#[inline(always)]
 pub fn worker_outbox(worker: usize) -> &'static WorkerOutbox {
-    &OUTBOX_RING.get().expect("outboxes not initialized")[worker]
+    unsafe { &*OUTBOX_RING.load(Ordering::Relaxed).add(worker) }
 }
 
 #[inline]
@@ -250,16 +263,8 @@ fn signal_eventfd(efd: RawFd) {
     }
 }
 
-pub fn complete_one(addr: ReplyAddr, status: u16, body: Vec<u8>) {
-    complete_reply(OutgoingReply {
-        addr,
-        status,
-        body: ReplyBody::Owned(body),
-    });
-}
-
 #[inline]
-fn complete_reply(reply: OutgoingReply) {
+pub fn complete_reply(reply: OutgoingReply) {
     let ob = worker_outbox(reply.addr.worker as usize);
     let notify = {
         let mut q = ob.pending.lock().unwrap();
@@ -272,7 +277,7 @@ fn complete_reply(reply: OutgoingReply) {
     }
 }
 
-pub fn complete_batch(mut replies: Vec<OutgoingReply>) {
+pub fn complete_batch(replies: &mut Vec<OutgoingReply>) {
     if replies.is_empty() {
         return;
     }
@@ -311,29 +316,52 @@ pub fn make_error_json(msg: &str) -> Vec<u8> {
     out
 }
 
+#[inline]
+pub fn make_error_body(msg: &str) -> ReplyBody {
+    ReplyBody::Owned(make_error_json(msg))
+}
+
+#[inline]
 pub fn error_reply(addr: ReplyAddr, status: u16, msg: &str) -> OutgoingReply {
     OutgoingReply {
         addr,
         status,
-        body: ReplyBody::Owned(make_error_json(msg)),
+        body: make_error_body(msg),
     }
 }
 
+const FLAG_IN_FLIGHT: u8 = 1 << 0;
+const FLAG_CLOSE_ON_DONE: u8 = 1 << 1;
+const FLAG_EOF_SEEN: u8 = 1 << 3;
+const FLAG_POLLING_OUT: u8 = 1 << 4;
+const FLAG_CONTINUE_SENT: u8 = 1 << 5;
+const FLAG_REUSED: u8 = 1 << 6;
+const FLAG_IN_IDLE_LRU: u8 = 1 << 7;
+
 struct ClientSlot {
-    fd: RawFd,
-    epoch: u32,
     rx: Vec<u8>,
     tx: Vec<u8>,
-    tx_off: usize,
-    in_flight: bool,
-    close_on_done: bool,
-    eof_seen: bool,
-    polling_out: bool,
-    continue_sent: bool,
-    reused: bool,
-    in_idle_lru: bool,
+    fd: RawFd,
+    epoch: u32,
+    tx_off: u32,
     idle_prev: u32,
     idle_next: u32,
+    flags: u8,
+}
+
+impl ClientSlot {
+    #[inline(always)]
+    fn flag(&self, mask: u8) -> bool {
+        (self.flags & mask) != 0
+    }
+    #[inline(always)]
+    fn set_flag(&mut self, mask: u8, val: bool) {
+        if val {
+            self.flags |= mask;
+        } else {
+            self.flags &= !mask;
+        }
+    }
 }
 
 pub struct Reactor {
@@ -346,6 +374,8 @@ pub struct Reactor {
     scratch: Vec<u8>,
     outbox_buf: Vec<OutgoingReply>,
     pipelined_slots: Vec<u32>,
+    pending_reads: [Vec<crate::engine::ReadTask>; 3],
+    batch_now: std::time::Instant,
     signer: &'static TokenSigner,
     epochs: &'static [AtomicU32],
     active_conns: usize,
@@ -364,6 +394,15 @@ fn sys_cvt(rc: i32) -> io::Result<i32> {
 }
 
 pub fn bind_listener(host: &str, port: u16) -> io::Result<RawFd> {
+    if host == "0.0.0.0" {
+        if let Ok(fd) = bind_listener_inner("::", port) {
+            return Ok(fd);
+        }
+    }
+    bind_listener_inner(host, port)
+}
+
+fn bind_listener_inner(host: &str, port: u16) -> io::Result<RawFd> {
     let ip: std::net::IpAddr = host
         .parse()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid HOST address"))?;
@@ -377,15 +416,25 @@ pub fn bind_listener(host: &str, port: u16) -> io::Result<RawFd> {
         let yes: sys::c_int = 1;
         let no: sys::c_int = 0;
         for opt in [sys::SO_REUSEADDR, sys::SO_REUSEPORT] {
-            sys_cvt(sys::setsockopt(
+            if let Err(e) = sys_cvt(sys::setsockopt(
                 fd,
                 sys::SOL_SOCKET,
                 opt,
                 &yes as *const _ as *const sys::c_void,
                 4,
-            ))?;
+            )) {
+                sys::close(fd);
+                return Err(e);
+            }
         }
-        match ip {
+        let _ = sys::setsockopt(
+            fd,
+            sys::IPPROTO_TCP,
+            sys::TCP_NODELAY,
+            &yes as *const _ as *const sys::c_void,
+            4,
+        );
+        let bind_res = match ip {
             std::net::IpAddr::V4(v4) => {
                 let sa = sys::sockaddr_in {
                     sin_family: sys::AF_INET as u16,
@@ -399,16 +448,16 @@ pub fn bind_listener(host: &str, port: u16) -> io::Result<RawFd> {
                     fd,
                     &sa as *const _ as *const sys::sockaddr,
                     std::mem::size_of::<sys::sockaddr_in>() as u32,
-                ))?;
+                ))
             }
             std::net::IpAddr::V6(v6) => {
-                sys_cvt(sys::setsockopt(
+                let _ = sys::setsockopt(
                     fd,
                     sys::IPPROTO_IPV6,
                     sys::IPV6_V6ONLY,
                     &no as *const _ as *const sys::c_void,
                     4,
-                ))?;
+                );
                 let sa = sys::sockaddr_in6 {
                     sin6_family: sys::AF_INET6 as u16,
                     sin6_port: port.to_be(),
@@ -420,10 +469,17 @@ pub fn bind_listener(host: &str, port: u16) -> io::Result<RawFd> {
                     fd,
                     &sa as *const _ as *const sys::sockaddr,
                     std::mem::size_of::<sys::sockaddr_in6>() as u32,
-                ))?;
+                ))
             }
+        };
+        if let Err(e) = bind_res {
+            sys::close(fd);
+            return Err(e);
         }
-        sys_cvt(sys::listen(fd, 65535))?;
+        if let Err(e) = sys_cvt(sys::listen(fd, 65535)) {
+            sys::close(fd);
+            return Err(e);
+        }
         Ok(fd)
     }
 }
@@ -467,16 +523,36 @@ impl Reactor {
         let ep_fd = sys_cvt(unsafe { sys::epoll_create1(sys::EPOLL_CLOEXEC) })?;
         let ob = worker_outbox(worker_id as usize);
         let outbox_fd = ob.event_fd;
+        let mut slots = Vec::with_capacity(16384);
+        let mut scratch = vec![0; 256 * 1024];
+        unsafe {
+            let _ = sys::madvise(
+                scratch.as_mut_ptr() as *mut sys::c_void,
+                scratch.capacity(),
+                sys::MADV_HUGEPAGE,
+            );
+            let _ = sys::madvise(
+                slots.as_mut_ptr() as *mut sys::c_void,
+                slots.capacity() * std::mem::size_of::<ClientSlot>(),
+                sys::MADV_HUGEPAGE,
+            );
+        }
         let reactor = Reactor {
             worker_id,
             ep_fd,
             listen_fd,
             outbox_fd,
-            slots: Vec::with_capacity(16384),
+            slots,
             free_slots: Vec::with_capacity(4096),
-            scratch: vec![0; 256 * 1024],
+            scratch,
             outbox_buf: Vec::with_capacity(1024),
             pipelined_slots: Vec::with_capacity(256),
+            pending_reads: [
+                Vec::with_capacity(128),
+                Vec::with_capacity(128),
+                Vec::with_capacity(128),
+            ],
+            batch_now: std::time::Instant::now(),
             signer,
             epochs: &ob.epochs,
             active_conns: 0,
@@ -490,6 +566,19 @@ impl Reactor {
     }
 
     #[inline]
+    fn flush_pending_reads(&mut self) {
+        for lane in 0..3 {
+            if !self.pending_reads[lane].is_empty() {
+                crate::engine::enqueue_read_batch_lane(
+                    lane,
+                    &mut self.pending_reads[lane],
+                    self.batch_now,
+                );
+            }
+        }
+    }
+
+    #[inline]
     fn ep_ctl(&self, op: i32, fd: RawFd, events: u32, token: u64) -> io::Result<()> {
         let mut ev = sys::epoll_event { events, u64: token };
         sys_cvt(unsafe { sys::epoll_ctl(self.ep_fd, op, fd, &mut ev) })?;
@@ -499,10 +588,10 @@ impl Reactor {
     #[inline]
     fn link_idle(&mut self, slot: u32) {
         let c = &mut self.slots[slot as usize];
-        if c.in_idle_lru || c.fd < 0 {
+        if c.flag(FLAG_IN_IDLE_LRU) || c.fd < 0 {
             return;
         }
-        c.in_idle_lru = true;
+        c.set_flag(FLAG_IN_IDLE_LRU, true);
         c.idle_prev = self.idle_tail;
         c.idle_next = IDLE_NONE;
         if self.idle_tail != IDLE_NONE {
@@ -517,10 +606,10 @@ impl Reactor {
     fn unlink_idle(&mut self, slot: u32) {
         let (in_lru, prev, next) = {
             let c = &mut self.slots[slot as usize];
-            if !c.in_idle_lru {
+            if !c.flag(FLAG_IN_IDLE_LRU) {
                 return;
             }
-            c.in_idle_lru = false;
+            c.set_flag(FLAG_IN_IDLE_LRU, false);
             let p = c.idle_prev;
             let n = c.idle_next;
             c.idle_prev = IDLE_NONE;
@@ -553,6 +642,7 @@ impl Reactor {
                 }
                 panic!("epoll_wait failed: {err}");
             }
+            self.batch_now = std::time::Instant::now();
             for i in 0..n as usize {
                 let ev = events[i];
                 match ev.u64 {
@@ -568,7 +658,11 @@ impl Reactor {
                         }
                     }
                 }
+                if (i & 63) == 63 {
+                    self.flush_pending_reads();
+                }
             }
+            self.flush_pending_reads();
         }
     }
 
@@ -602,27 +696,11 @@ impl Reactor {
                     _ => return,
                 }
             }
-            let yes: sys::c_int = 1;
-            unsafe {
-                sys::setsockopt(
-                    fd,
-                    sys::IPPROTO_TCP,
-                    sys::TCP_NODELAY,
-                    &yes as *const _ as *const sys::c_void,
-                    4,
-                );
-            }
             let (slot, epoch) = match self.free_slots.pop() {
                 Some(idx) => {
                     let c = &mut self.slots[idx as usize];
                     c.fd = fd;
-                    c.in_flight = false;
-                    c.close_on_done = false;
-                    c.eof_seen = false;
-                    c.polling_out = false;
-                    c.continue_sent = false;
-                    c.reused = false;
-                    c.in_idle_lru = false;
+                    c.flags = 0;
                     c.idle_prev = IDLE_NONE;
                     c.idle_next = IDLE_NONE;
                     c.tx_off = 0;
@@ -630,20 +708,14 @@ impl Reactor {
                 }
                 None => {
                     self.slots.push(ClientSlot {
-                        fd,
-                        epoch: 0,
                         rx: Vec::new(),
                         tx: Vec::new(),
+                        fd,
+                        epoch: 0,
                         tx_off: 0,
-                        in_flight: false,
-                        close_on_done: false,
-                        eof_seen: false,
-                        polling_out: false,
-                        continue_sent: false,
-                        reused: false,
-                        in_idle_lru: false,
                         idle_prev: IDLE_NONE,
                         idle_next: IDLE_NONE,
+                        flags: 0,
                     });
                     ((self.slots.len() - 1) as u32, 0)
                 }
@@ -684,8 +756,7 @@ impl Reactor {
         c.rx = Vec::new();
         c.tx = Vec::new();
         c.tx_off = 0;
-        c.in_flight = false;
-        c.reused = false;
+        c.flags = 0;
         self.active_conns = self.active_conns.saturating_sub(1);
         self.free_slots.push(slot);
     }
@@ -706,7 +777,7 @@ impl Reactor {
                 if c.fd < 0 {
                     return;
                 }
-                (c.fd, first_read && !c.in_flight && c.rx.is_empty())
+                (c.fd, first_read && !c.flag(FLAG_IN_FLIGHT) && c.rx.is_empty())
             };
             first_read = false;
 
@@ -747,22 +818,28 @@ impl Reactor {
                     slot,
                     epoch: self.slots[slot as usize].epoch,
                 };
-                match parse_one_http(self.signer, &self.scratch[..n], addr) {
+                match parse_one_http(
+                    self.signer,
+                    &self.scratch[..n],
+                    addr,
+                    self.batch_now,
+                    &mut self.pending_reads,
+                ) {
                     ParseOutcome::Complete {
                         consumed,
                         close_after,
                         dispatch,
                     } => {
                         let c = &mut self.slots[slot as usize];
-                        c.continue_sent = false;
-                        c.close_on_done = close_after;
-                        c.in_flight = true;
+                        c.set_flag(FLAG_CONTINUE_SENT, false);
+                        c.set_flag(FLAG_CLOSE_ON_DONE, close_after);
+                        c.set_flag(FLAG_IN_FLIGHT, true);
                         if consumed < n {
                             c.rx.extend_from_slice(&self.scratch[consumed..n]);
                         }
                         match dispatch {
                             Dispatch::Immediate(status, body) => {
-                                self.write_response(slot, status, &body);
+                                self.write_response(slot, status, body.as_slice());
                                 if !self.slots[slot as usize].rx.is_empty() {
                                     self.drain_rx_buf(slot);
                                 }
@@ -774,8 +851,8 @@ impl Reactor {
                     ParseOutcome::Incomplete { send_continue } => {
                         let c = &mut self.slots[slot as usize];
                         c.rx.extend_from_slice(&self.scratch[..n]);
-                        if send_continue && !c.continue_sent {
-                            c.continue_sent = true;
+                        if send_continue && !c.flag(FLAG_CONTINUE_SENT) {
+                            c.set_flag(FLAG_CONTINUE_SENT, true);
                             self.write_raw_bytes(slot, b"HTTP/1.1 100 Continue\r\n\r\n");
                         }
                         return;
@@ -799,14 +876,14 @@ impl Reactor {
     fn drain_rx_buf(&mut self, slot: u32) {
         loop {
             let c = &mut self.slots[slot as usize];
-            if c.fd < 0 || c.in_flight || c.rx.is_empty() {
+            if c.fd < 0 || c.flag(FLAG_IN_FLIGHT) || c.rx.is_empty() {
                 if c.fd >= 0 && c.rx.is_empty() {
                     if c.rx.capacity() > 4096 {
                         c.rx = Vec::new();
                     } else {
                         c.rx.clear();
                     }
-                    if !c.in_flight && c.tx_off >= c.tx.len() && c.reused {
+                    if !c.flag(FLAG_IN_FLIGHT) && (c.tx_off as usize) >= c.tx.len() && c.flag(FLAG_REUSED) {
                         self.link_idle(slot);
                     }
                 }
@@ -817,28 +894,36 @@ impl Reactor {
                 slot,
                 epoch: c.epoch,
             };
-            match parse_one_http(self.signer, &c.rx, addr) {
+            match parse_one_http(
+                self.signer,
+                &c.rx,
+                addr,
+                self.batch_now,
+                &mut self.pending_reads,
+            ) {
                 ParseOutcome::Complete {
                     consumed,
                     close_after,
                     dispatch,
                 } => {
-                    c.continue_sent = false;
-                    c.close_on_done = close_after;
-                    c.in_flight = true;
+                    c.set_flag(FLAG_CONTINUE_SENT, false);
+                    c.set_flag(FLAG_CLOSE_ON_DONE, close_after);
+                    c.set_flag(FLAG_IN_FLIGHT, true);
                     if consumed == c.rx.len() {
                         c.rx = Vec::new();
                     } else {
                         c.rx.drain(..consumed);
                     }
                     match dispatch {
-                        Dispatch::Immediate(status, body) => self.write_response(slot, status, &body),
+                        Dispatch::Immediate(status, body) => {
+                            self.write_response(slot, status, body.as_slice())
+                        }
                         Dispatch::Enqueued => return,
                     }
                 }
                 ParseOutcome::Incomplete { send_continue } => {
-                    if send_continue && !c.continue_sent {
-                        c.continue_sent = true;
+                    if send_continue && !c.flag(FLAG_CONTINUE_SENT) {
+                        c.set_flag(FLAG_CONTINUE_SENT, true);
                         self.write_raw_bytes(slot, b"HTTP/1.1 100 Continue\r\n\r\n");
                     }
                     return;
@@ -853,11 +938,11 @@ impl Reactor {
 
     fn reject_conn(&mut self, slot: u32, status: u16) {
         let c = &mut self.slots[slot as usize];
-        c.close_on_done = true;
-        c.in_flight = true;
+        c.set_flag(FLAG_CLOSE_ON_DONE, true);
+        c.set_flag(FLAG_IN_FLIGHT, true);
         c.rx = Vec::new();
-        let body = make_error_json(reason_phrase(status));
-        self.write_response(slot, status, &body);
+        let body = make_error_body(reason_phrase(status));
+        self.write_response(slot, status, body.as_slice());
     }
 
     fn flush_outbox(&mut self) {
@@ -867,15 +952,25 @@ impl Reactor {
         }
         let mut replies = std::mem::take(&mut self.outbox_buf);
         replies.clear();
-        {
+        const MAX_OUTBOX_BATCH: usize = 256;
+        let more_pending = {
             let mut pending = worker_outbox(self.worker_id as usize).pending.lock().unwrap();
-            std::mem::swap(&mut replies, &mut *pending);
+            if pending.len() <= MAX_OUTBOX_BATCH {
+                std::mem::swap(&mut replies, &mut *pending);
+                false
+            } else {
+                replies.extend(pending.drain(..MAX_OUTBOX_BATCH));
+                true
+            }
+        };
+        if more_pending {
+            signal_eventfd(self.outbox_fd);
         }
         let mut check_pipelined = std::mem::take(&mut self.pipelined_slots);
         check_pipelined.clear();
         for rep in &replies {
             let c = &self.slots[rep.addr.slot as usize];
-            if c.fd < 0 || c.epoch != rep.addr.epoch || !c.in_flight {
+            if c.fd < 0 || c.epoch != rep.addr.epoch || !c.flag(FLAG_IN_FLIGHT) {
                 continue;
             }
             let has_buffered_rx = !c.rx.is_empty();
@@ -893,10 +988,11 @@ impl Reactor {
         self.pipelined_slots = check_pipelined;
     }
 
-    fn write_response(&mut self, slot: u32, status: u16, body: &[u8]) {
+    fn write_response(&mut self, slot: u32, status: u16, payload: &[u8]) {
         let c = &mut self.slots[slot as usize];
-        c.in_flight = false;
-        c.reused = true;
+        c.set_flag(FLAG_IN_FLIGHT, false);
+        c.set_flag(FLAG_REUSED, true);
+        let close_on_done = c.flag(FLAG_CLOSE_ON_DONE);
         let mut hdr = [0u8; 160];
         let mut hlen = 0usize;
         let mut append = |bytes: &[u8]| {
@@ -904,18 +1000,18 @@ impl Reactor {
             hlen += bytes.len();
         };
 
-        if status == 200 && !c.close_on_done {
+        if status == 200 && !close_on_done {
             const PFX_200: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ";
             hdr[..PFX_200.len()].copy_from_slice(PFX_200);
             hlen = PFX_200.len();
             let mut num = [0u8; 20];
-            let digits = codec::format_u64_into(body.len() as u64, &mut num);
+            let digits = codec::format_u64_into(payload.len() as u64, &mut num);
             hdr[hlen..hlen + digits.len()].copy_from_slice(digits);
             hlen += digits.len();
             hdr[hlen..hlen + 4].copy_from_slice(b"\r\n\r\n");
             hlen += 4;
         } else if status == 204 {
-            append(if c.close_on_done {
+            append(if close_on_done {
                 b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"
             } else {
                 b"HTTP/1.1 204 No Content\r\n\r\n"
@@ -925,8 +1021,8 @@ impl Reactor {
             append(reason_phrase(status).as_bytes());
             append(b"\r\nContent-Type: application/json\r\nContent-Length: ");
             let mut num = [0u8; 20];
-            append(codec::format_u64_into(body.len() as u64, &mut num));
-            append(if c.close_on_done {
+            append(codec::format_u64_into(payload.len() as u64, &mut num));
+            append(if close_on_done {
                 b"\r\nConnection: close\r\n\r\n"
             } else {
                 b"\r\n\r\n"
@@ -934,9 +1030,9 @@ impl Reactor {
         }
 
         let fd = c.fd;
-        if c.tx.len() > c.tx_off {
+        if c.tx.len() > c.tx_off as usize {
             c.tx.extend_from_slice(&hdr[..hlen]);
-            c.tx.extend_from_slice(body);
+            c.tx.extend_from_slice(payload);
         } else {
             let iov = [
                 sys::iovec {
@@ -944,12 +1040,12 @@ impl Reactor {
                     iov_len: hlen,
                 },
                 sys::iovec {
-                    iov_base: body.as_ptr() as *mut sys::c_void,
-                    iov_len: body.len(),
+                    iov_base: payload.as_ptr() as *mut sys::c_void,
+                    iov_len: payload.len(),
                 },
             ];
-            let total = hlen + body.len();
-            let rc = unsafe { sys::writev(fd, iov.as_ptr(), if body.is_empty() { 1 } else { 2 }) };
+            let total = hlen + payload.len();
+            let rc = unsafe { sys::writev(fd, iov.as_ptr(), if payload.is_empty() { 1 } else { 2 }) };
             let written = if rc < 0 {
                 let err = io::Error::last_os_error();
                 if matches!(err.raw_os_error(), Some(sys::EAGAIN) | Some(sys::EINTR)) {
@@ -966,9 +1062,9 @@ impl Reactor {
                 c.tx_off = 0;
                 if written < hlen {
                     c.tx.extend_from_slice(&hdr[written..hlen]);
-                    c.tx.extend_from_slice(body);
+                    c.tx.extend_from_slice(payload);
                 } else {
-                    c.tx.extend_from_slice(&body[written - hlen..]);
+                    c.tx.extend_from_slice(&payload[written - hlen..]);
                 }
             }
         }
@@ -977,7 +1073,7 @@ impl Reactor {
 
     fn write_raw_bytes(&mut self, slot: u32, raw: &[u8]) {
         let c = &mut self.slots[slot as usize];
-        if c.tx.len() > c.tx_off {
+        if c.tx.len() > c.tx_off as usize {
             c.tx.extend_from_slice(raw);
         } else {
             let rc = unsafe { sys::write(c.fd, raw.as_ptr() as *const sys::c_void, raw.len()) };
@@ -1006,8 +1102,8 @@ impl Reactor {
         if c.fd < 0 {
             return;
         }
-        while c.tx_off < c.tx.len() {
-            let rem = &c.tx[c.tx_off..];
+        while (c.tx_off as usize) < c.tx.len() {
+            let rem = &c.tx[c.tx_off as usize..];
             let rc = unsafe { sys::write(c.fd, rem.as_ptr() as *const sys::c_void, rem.len()) };
             if rc < 0 {
                 let err = io::Error::last_os_error();
@@ -1020,7 +1116,7 @@ impl Reactor {
                     }
                 }
             }
-            c.tx_off += rc as usize;
+            c.tx_off += rc as u32;
         }
         self.update_write_state(slot);
     }
@@ -1031,7 +1127,7 @@ impl Reactor {
             if c.fd < 0 {
                 return;
             }
-            let has_unsent = c.tx_off < c.tx.len();
+            let has_unsent = (c.tx_off as usize) < c.tx.len();
             if !has_unsent {
                 if c.tx.capacity() > 4096 {
                     c.tx = Vec::new();
@@ -1040,10 +1136,11 @@ impl Reactor {
                 }
                 c.tx_off = 0;
             }
-            let should_drop = !has_unsent && !c.in_flight && (c.close_on_done || c.eof_seen);
-            let should_link_idle = !should_drop && !has_unsent && !c.in_flight && c.rx.is_empty() && c.reused;
-            let mask_change = if !should_drop && has_unsent != c.polling_out {
-                c.polling_out = has_unsent;
+            let in_flight = c.flag(FLAG_IN_FLIGHT);
+            let should_drop = !has_unsent && !in_flight && (c.flag(FLAG_CLOSE_ON_DONE) || c.flag(FLAG_EOF_SEEN));
+            let should_link_idle = !should_drop && !has_unsent && !in_flight && c.rx.is_empty() && c.flag(FLAG_REUSED);
+            let mask_change = if !should_drop && has_unsent != c.flag(FLAG_POLLING_OUT) {
+                c.set_flag(FLAG_POLLING_OUT, has_unsent);
                 let mask = if has_unsent {
                     sys::EPOLLIN | sys::EPOLLOUT | sys::EPOLLRDHUP
                 } else {
@@ -1096,15 +1193,53 @@ fn parse_usize_ascii(s: &[u8]) -> Option<usize> {
     Some(val)
 }
 
+const TCHAR_LUT: [bool; 256] = {
+    let mut t = [false; 256];
+    let mut b = 0x21usize;
+    while b < 0x7f {
+        t[b] = !matches!(
+            b as u8,
+            b'(' | b')'
+                | b'<'
+                | b'>'
+                | b'@'
+                | b','
+                | b';'
+                | b':'
+                | b'\\'
+                | b'"'
+                | b'/'
+                | b'['
+                | b']'
+                | b'?'
+                | b'='
+                | b'{'
+                | b'}'
+        );
+        b += 1;
+    }
+    t
+};
+
 #[inline(always)]
 fn is_valid_token_name(s: &[u8]) -> bool {
-    !s.is_empty()
-        && s.iter()
-            .all(|&b| b > 0x20 && b < 0x7f && !matches!(b, b'(' | b')' | b'<' | b'>' | b'@' | b',' | b';' | b':' | b'\\' | b'"' | b'/' | b'[' | b']' | b'?' | b'=' | b'{' | b'}'))
+    !s.is_empty() && s.iter().all(|&b| TCHAR_LUT[b as usize])
+}
+
+#[inline(always)]
+fn eq_hdr8(name: &[u8], prefix8: &[u8; 8], tail: &[u8]) -> bool {
+    let w = u64::from_le_bytes(name[..8].try_into().unwrap()) | 0x2020_2020_2020_2020;
+    w == u64::from_le_bytes(*prefix8) && name[8..].eq_ignore_ascii_case(tail)
 }
 
 #[inline]
-fn parse_one_http(signer: &TokenSigner, buf: &[u8], addr: ReplyAddr) -> ParseOutcome {
+fn parse_one_http(
+    signer: &TokenSigner,
+    buf: &[u8],
+    addr: ReplyAddr,
+    now: std::time::Instant,
+    pending_reads: &mut [Vec<crate::engine::ReadTask>; 3],
+) -> ParseOutcome {
     let Some(req_line_end) = codec::find_crlf(buf) else {
         if buf.len() > LIMIT_HEAD {
             return ParseOutcome::Reject(431);
@@ -1171,10 +1306,10 @@ fn parse_one_http(signer: &TokenSigner, buf: &[u8], addr: ReplyAddr) -> ParseOut
         let val = trim_http_ows(&line[colon + 1..]);
 
         match name.len() {
-            13 if name.eq_ignore_ascii_case(b"authorization") => {
+            13 if eq_hdr8(name, b"authoriz", b"ation") => {
                 auth_hdr = Some(val);
             }
-            14 if name.eq_ignore_ascii_case(b"content-length") => {
+            14 if eq_hdr8(name, b"content-", b"length") => {
                 let Some(n) = parse_usize_ascii(val) else {
                     return ParseOutcome::Reject(400);
                 };
@@ -1185,14 +1320,14 @@ fn parse_one_http(signer: &TokenSigner, buf: &[u8], addr: ReplyAddr) -> ParseOut
                 }
                 content_len = Some(n);
             }
-            10 if name.eq_ignore_ascii_case(b"connection") => {
+            10 if eq_hdr8(name, b"connecti", b"on") => {
                 if val.eq_ignore_ascii_case(b"close") {
                     keep_alive = false;
                 } else if val.eq_ignore_ascii_case(b"keep-alive") {
                     keep_alive = true;
                 }
             }
-            17 if name.eq_ignore_ascii_case(b"transfer-encoding") => {
+            17 if eq_hdr8(name, b"transfer", b"-encoding") => {
                 is_chunked = val.eq_ignore_ascii_case(b"chunked");
                 if !is_chunked {
                     return ParseOutcome::Reject(400);
@@ -1254,7 +1389,7 @@ fn parse_one_http(signer: &TokenSigner, buf: &[u8], addr: ReplyAddr) -> ParseOut
         auth: auth_hdr,
         body: body_slice,
     };
-    let dispatch = router::route_request(signer, &http_req, addr);
+    let dispatch = router::route_request(signer, &http_req, addr, now, pending_reads);
     ParseOutcome::Complete {
         consumed: total_consumed,
         close_after: !keep_alive,

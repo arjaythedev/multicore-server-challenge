@@ -1,0 +1,337 @@
+// uring.cid — 100% Freestanding Linux io_uring direct-descriptor engine in pure Cider
+// Zero libc dependencies. Interacts with kernel rings directly via mapped memory.
+
+from sys import sys_mmap, sys_munmap, sys_close, sys_io_uring_setup, sys_io_uring_enter, sys_io_uring_register, native_memset;
+
+var IORING_SETUP_CQSIZE: u32 = 8 as u32;
+var IORING_SETUP_CLAMP: u32 = 16 as u32;
+var IORING_SETUP_SINGLE_ISSUER: u32 = 4096 as u32;
+var IORING_SETUP_DEFER_TASKRUN: u32 = 8192 as u32;
+var IORING_SETUP_COOP_TASKRUN: u32 = 256 as u32;
+
+var IORING_REGISTER_FILES: u32 = 2 as u32;
+var IORING_REGISTER_PBUF_RING: u32 = 22 as u32;
+
+var IORING_OFF_SQ_RING: i64 = 0 as i64;
+var IORING_OFF_CQ_RING: i64 = 0x8000000 as i64;
+var IORING_OFF_SQES: i64 = 0x10000000 as i64;
+
+var IORING_OP_NOP: u8 = 0 as u8;
+var IORING_OP_READV: u8 = 1 as u8;
+var IORING_OP_WRITEV: u8 = 2 as u8;
+var IORING_OP_POLL_ADD: u8 = 6 as u8;
+var IORING_OP_ACCEPT: u8 = 13 as u8;
+var IORING_OP_SEND: u8 = 26 as u8;
+var IORING_OP_RECV: u8 = 27 as u8;
+var IORING_OP_CLOSE: u8 = 19 as u8;
+
+var IORING_ACCEPT_MULTISHOT: u16 = 1 as u16;
+var IORING_RECV_MULTISHOT: u32 = 2 as u32;
+
+var IOSQE_FIXED_FILE: u8 = 1 as u8;
+var IOSQE_BUFFER_SELECT: u8 = 32 as u8;
+
+var IORING_CQE_F_BUFFER: u32 = 1 as u32;
+var IORING_CQE_F_MORE: u32 = 2 as u32;
+
+var PROT_READ: int = 1;
+var PROT_WRITE: int = 2;
+var MAP_SHARED: int = 1;
+var MAP_ANONYMOUS: int = 32;
+var MAP_POPULATE: int = 32768;
+
+struct IoUringSqringOffsets {
+    var head: u32;
+    var tail: u32;
+    var ring_mask: u32;
+    var ring_entries: u32;
+    var flags: u32;
+    var dropped: u32;
+    var array: u32;
+    var resv1: u32;
+    var user_addr: u64;
+}
+
+struct IoUringCqringOffsets {
+    var head: u32;
+    var tail: u32;
+    var ring_mask: u32;
+    var ring_entries: u32;
+    var overflow: u32;
+    var cqes: u32;
+    var flags: u32;
+    var resv1: u32;
+    var user_addr: u64;
+}
+
+struct IoUringParams {
+    var sq_entries: u32;
+    var cq_entries: u32;
+    var flags: u32;
+    var sq_thread_cpu: u32;
+    var sq_thread_idle: u32;
+    var features: u32;
+    var wq_fd: u32;
+    var resv: [u32; 3];
+    var sq_off: IoUringSqringOffsets;
+    var cq_off: IoUringCqringOffsets;
+}
+
+struct IoUringSqe {
+    var opcode: u8;
+    var flags: u8;
+    var ioprio: u16;
+    var fd: i32;
+    var off: u64;
+    var addr: u64;
+    var len: u32;
+    var op_flags: u32;
+    var user_data: u64;
+    var buf_index_or_group: u16;
+    var personality: u16;
+    var file_index: u32;
+    var addr3_or_pad: [u64; 2];
+}
+
+struct IoUringCqe {
+    var user_data: u64;
+    var res: i32;
+    var flags: u32;
+}
+
+struct IoUringBuf {
+    var addr: u64;
+    var len: u32;
+    var bid: u16;
+    var resv: u16;
+}
+
+struct IoUringBufReg {
+    var ring_addr: u64;
+    var ring_entries: u32;
+    var bgid: u16;
+    var flags: u16;
+    var min_left: u32;
+    var resv: [u32; 5];
+}
+
+struct Ring {
+    var ring_fd: int;
+    var sq_head: *u32;
+    var sq_tail: *u32;
+    var sq_ring_mask: u32;
+    var sq_ring_entries: u32;
+    var sq_flags: *u32;
+    var sq_array: *u32;
+    var sqes: *IoUringSqe;
+
+    var cq_head: *u32;
+    var cq_tail: *u32;
+    var cq_ring_mask: u32;
+    var cq_ring_entries: u32;
+    var cqes: *IoUringCqe;
+
+    var sq_ptr: *void;
+    var sq_sz: i64;
+    var cq_ptr: *void;
+    var cq_sz: i64;
+    var sqes_sz: i64;
+
+    // Provided buffer ring
+    var pbuf_ring: *IoUringBuf;
+    var pbuf_tail: u16;
+    var pbuf_mask: int;
+    var pbuf_entries: int;
+    var pbuf_storage: *void;
+    var pbuf_sz: i64;
+}
+
+func ring_init(r: *Ring, entries: u32) -> int {
+    var p: IoUringParams = uninit;
+    native_memset((&p) as *char, 0, sizeof(IoUringParams) as i64);
+    p.flags = IORING_SETUP_COOP_TASKRUN | IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_CQSIZE | IORING_SETUP_CLAMP;
+    p.cq_entries = entries * (2 as u32);
+
+    var fd: int = sys_io_uring_setup(entries, (&p) as *void);
+    if (fd < 0) {
+        // Fallback without DEFER_TASKRUN if kernel does not support it
+        native_memset((&p) as *char, 0, sizeof(IoUringParams) as i64);
+        p.flags = IORING_SETUP_CQSIZE | IORING_SETUP_CLAMP;
+        p.cq_entries = entries * (2 as u32);
+        fd = sys_io_uring_setup(entries, (&p) as *void);
+        if (fd < 0) { return fd; }
+    }
+    r->ring_fd = fd;
+
+    // Calculate mapping sizes
+    var sq_sz: i64 = (p.sq_off.array as i64) + ((p.sq_entries as i64) * 4);
+    var cq_sz: i64 = (p.cq_off.cqes as i64) + ((p.cq_entries as i64) * (sizeof(IoUringCqe) as i64));
+
+    var single_mmap: int = 0;
+    if ((p.features & (1 as u32)) != (0 as u32)) { // IORING_FEAT_SINGLE_MMAP
+        single_mmap = 1;
+        if (cq_sz > sq_sz) { sq_sz = cq_sz; }
+        cq_sz = sq_sz;
+    }
+
+    var sq_ptr: *void = sys_mmap(0 as *void, sq_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQ_RING);
+    if ((sq_ptr as i64) < 0 as i64) {
+        sys_close(fd);
+        return -1;
+    }
+    r->sq_ptr = sq_ptr;
+    r->sq_sz = sq_sz;
+
+    var cq_ptr: *void = sq_ptr;
+    if (single_mmap == 0) {
+        cq_ptr = sys_mmap(0 as *void, cq_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_CQ_RING);
+        if ((cq_ptr as i64) < 0 as i64) {
+            sys_munmap(sq_ptr, sq_sz);
+            sys_close(fd);
+            return -1;
+        }
+    }
+    r->cq_ptr = cq_ptr;
+    r->cq_sz = cq_sz;
+
+    var sqes_sz: i64 = (p.sq_entries as i64) * (sizeof(IoUringSqe) as i64);
+    var sqes_ptr: *void = sys_mmap(0 as *void, sqes_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQES);
+    if ((sqes_ptr as i64) < 0 as i64) {
+        if (single_mmap == 0) { sys_munmap(cq_ptr, cq_sz); }
+        sys_munmap(sq_ptr, sq_sz);
+        sys_close(fd);
+        return -1;
+    }
+    r->sqes = sqes_ptr as *IoUringSqe;
+    r->sqes_sz = sqes_sz;
+
+    // Setup SQ pointers
+    var sq_base: i64 = sq_ptr as i64;
+    r->sq_head = (sq_base + (p.sq_off.head as i64)) as *u32;
+    r->sq_tail = (sq_base + (p.sq_off.tail as i64)) as *u32;
+    r->sq_ring_mask = *(((sq_base + (p.sq_off.ring_mask as i64)) as *u32));
+    r->sq_ring_entries = *(((sq_base + (p.sq_off.ring_entries as i64)) as *u32));
+    r->sq_flags = (sq_base + (p.sq_off.flags as i64)) as *u32;
+    r->sq_array = (sq_base + (p.sq_off.array as i64)) as *u32;
+
+    // Setup CQ pointers
+    var cq_base: i64 = cq_ptr as i64;
+    r->cq_head = (cq_base + (p.cq_off.head as i64)) as *u32;
+    r->cq_tail = (cq_base + (p.cq_off.tail as i64)) as *u32;
+    r->cq_ring_mask = *(((cq_base + (p.cq_off.ring_mask as i64)) as *u32));
+    r->cq_ring_entries = *(((cq_base + (p.cq_off.ring_entries as i64)) as *u32));
+    r->cqes = (cq_base + (p.cq_off.cqes as i64)) as *IoUringCqe;
+
+    return 0;
+}
+
+func ring_register_files(r: *Ring, fds: *int, nr: u32) -> int {
+    return sys_io_uring_register(r->ring_fd, IORING_REGISTER_FILES, fds as *void, nr);
+}
+
+func ring_register_pbuf_ring(r: *Ring, bgid: u16, entries: u32, buf_sz: u32) -> int {
+    var ring_bytes: i64 = (entries as i64) * (sizeof(IoUringBuf) as i64);
+    var br_ptr: *void = sys_mmap(0 as *void, ring_bytes, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_SHARED | MAP_POPULATE, -1, 0);
+    if ((br_ptr as i64) < 0 as i64) { return -1; }
+
+    var reg: IoUringBufReg = uninit;
+    native_memset((&reg) as *char, 0, sizeof(IoUringBufReg) as i64);
+    reg.ring_addr = br_ptr as u64;
+    reg.ring_entries = entries;
+    reg.bgid = bgid;
+
+    var res: int = sys_io_uring_register(r->ring_fd, IORING_REGISTER_PBUF_RING, (&reg) as *void, 1 as u32);
+    if (res < 0) {
+        sys_munmap(br_ptr, ring_bytes);
+        return res;
+    }
+
+    var total_storage: i64 = (entries as i64) * (buf_sz as i64);
+    var storage_ptr: *void = sys_mmap(0 as *void, total_storage, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_SHARED | MAP_POPULATE, -1, 0);
+    if ((storage_ptr as i64) < 0 as i64) {
+        sys_munmap(br_ptr, ring_bytes);
+        return -1;
+    }
+
+    r->pbuf_ring = br_ptr as *IoUringBuf;
+    r->pbuf_tail = 0 as u16;
+    r->pbuf_mask = (entries as int) - 1;
+    r->pbuf_entries = entries as int;
+    r->pbuf_storage = storage_ptr;
+    r->pbuf_sz = total_storage;
+
+    // Populate buffers into ring
+    var st_base: i64 = storage_ptr as i64;
+    var br_base: i64 = br_ptr as i64;
+    for (var i: int = 0; i < (entries as int); i = i + 1) {
+        var b_ptr: *IoUringBuf = (br_base + (i as i64) * (sizeof(IoUringBuf) as i64)) as *IoUringBuf;
+        b_ptr->addr = (st_base + (i as i64) * (buf_sz as i64)) as u64;
+        b_ptr->len = buf_sz;
+        b_ptr->bid = i as u16;
+        b_ptr->resv = 0 as u16;
+    }
+
+    // Set tail in the ring struct
+    var tail_ptr: *u16 = (br_base + 14 as i64) as *u16;
+    *tail_ptr = entries as u16;
+    r->pbuf_tail = entries as u16;
+
+    return 0;
+}
+
+func ring_submit(r: *Ring) -> int {
+    var head: u32 = *(r->sq_head);
+    var tail: u32 = *(r->sq_tail);
+    var to_submit: u32 = tail - head;
+    if (to_submit == (0 as u32)) { return 0; }
+    return sys_io_uring_enter(r->ring_fd, to_submit, 0 as u32, 0 as u32, 0 as *void, 0 as i64);
+}
+
+func ring_get_sqe(r: *Ring) -> *IoUringSqe {
+    var head: u32 = *(r->sq_head);
+    var tail: u32 = *(r->sq_tail);
+    var tries: int = 0;
+    while (tail - head >= r->sq_ring_entries - (16 as u32) && tries < 64) {
+        ring_submit(r);
+        head = *(r->sq_head);
+        tail = *(r->sq_tail);
+        tries = tries + 1;
+    }
+    if (tail - head >= r->sq_ring_entries) {
+        return 0 as *IoUringSqe; // Queue still full; caller must handle cleanly
+    }
+    var idx: u32 = tail & r->sq_ring_mask;
+    var sqe: *IoUringSqe = (r->sqes as i64 + (idx as i64) * (sizeof(IoUringSqe) as i64)) as *IoUringSqe;
+    native_memset(sqe as *char, 0, sizeof(IoUringSqe) as i64);
+
+    // Update SQ array entry
+    var arr_entry: *u32 = (r->sq_array as i64 + (idx as i64) * 4) as *u32;
+    *arr_entry = idx;
+
+    *(r->sq_tail) = tail + (1 as u32);
+    return sqe;
+}
+
+func ring_submit_and_wait(r: *Ring, wait_nr: u32) -> int {
+    var head: u32 = *(r->sq_head);
+    var tail: u32 = *(r->sq_tail);
+    var to_submit: u32 = tail - head;
+    var flags: u32 = 1 as u32; // IORING_ENTER_GETEVENTS
+    return sys_io_uring_enter(r->ring_fd, to_submit, wait_nr, flags, 0 as *void, 0 as i64);
+}
+
+func ring_pbuf_recycle(r: *Ring, bid: u16, buf_sz: u32) -> void {
+    var idx: int = (r->pbuf_tail as int) & r->pbuf_mask;
+    var br_base: i64 = r->pbuf_ring as i64;
+    var b_ptr: *IoUringBuf = (br_base + (idx as i64) * (sizeof(IoUringBuf) as i64)) as *IoUringBuf;
+    var st_base: i64 = r->pbuf_storage as i64;
+
+    b_ptr->addr = (st_base + (bid as i64) * (buf_sz as i64)) as u64;
+    b_ptr->len = buf_sz;
+    b_ptr->bid = bid;
+    b_ptr->resv = 0 as u16;
+
+    r->pbuf_tail = r->pbuf_tail + (1 as u16);
+    var tail_ptr: *u16 = (br_base + 14 as i64) as *u16;
+    *tail_ptr = r->pbuf_tail;
+}

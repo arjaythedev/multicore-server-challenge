@@ -1,6 +1,155 @@
 const MASK_LO: u64 = 0x0101_0101_0101_0101;
 const MASK_HI: u64 = 0x8080_8080_8080_8080;
 
+pub const SMALL_STR_CAP: usize = 62;
+
+pub enum SmallStr {
+    Inline {
+        len: u8,
+        buf: [std::mem::MaybeUninit<u8>; SMALL_STR_CAP],
+    },
+    Heap(Box<str>),
+}
+
+impl SmallStr {
+    #[inline]
+    pub const fn empty() -> Self {
+        SmallStr::Inline {
+            len: 0,
+            buf: [std::mem::MaybeUninit::uninit(); SMALL_STR_CAP],
+        }
+    }
+
+    #[inline]
+    pub fn from_str(s: &str) -> Self {
+        let bytes = s.as_bytes();
+        if bytes.len() <= SMALL_STR_CAP {
+            let mut buf = [std::mem::MaybeUninit::uninit(); SMALL_STR_CAP];
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.as_mut_ptr().cast(), bytes.len());
+            }
+            SmallStr::Inline {
+                len: bytes.len() as u8,
+                buf,
+            }
+        } else {
+            SmallStr::Heap(s.into())
+        }
+    }
+
+    #[inline]
+    pub fn from_string(s: String) -> Self {
+        if s.len() <= SMALL_STR_CAP {
+            Self::from_str(&s)
+        } else {
+            SmallStr::Heap(s.into_boxed_str())
+        }
+    }
+
+    #[inline(always)]
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            SmallStr::Inline { len, buf } => unsafe {
+                std::slice::from_raw_parts(buf.as_ptr().cast(), *len as usize)
+            },
+            SmallStr::Heap(s) => s.as_bytes(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn as_str(&self) -> &str {
+        unsafe { std::str::from_utf8_unchecked(self.as_bytes()) }
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        match self {
+            SmallStr::Inline { len, .. } => *len as usize,
+            SmallStr::Heap(s) => s.len(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Clone for SmallStr {
+    #[inline]
+    fn clone(&self) -> Self {
+        match self {
+            SmallStr::Inline { len, buf } => {
+                let n = *len as usize;
+                let mut out = [std::mem::MaybeUninit::uninit(); SMALL_STR_CAP];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(buf.as_ptr(), out.as_mut_ptr(), n);
+                }
+                SmallStr::Inline { len: *len, buf: out }
+            }
+            SmallStr::Heap(s) => SmallStr::Heap(s.clone()),
+        }
+    }
+}
+
+impl Default for SmallStr {
+    #[inline]
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl std::ops::Deref for SmallStr {
+    type Target = str;
+    #[inline(always)]
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::borrow::Borrow<[u8]> for SmallStr {
+    #[inline(always)]
+    fn borrow(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl PartialEq for SmallStr {
+    #[inline(always)]
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl Eq for SmallStr {}
+
+impl PartialOrd for SmallStr {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SmallStr {
+    #[inline]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_bytes().cmp(other.as_bytes())
+    }
+}
+
+impl std::hash::Hash for SmallStr {
+    #[inline(always)]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_bytes().hash(state);
+    }
+}
+
+impl std::fmt::Debug for SmallStr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
 const DEC_DIGITS_LUT: &[u8; 200] = b"\
 0001020304050607080910111213141516171819\
 2021222324252627282930313233343536373839\
@@ -8,8 +157,67 @@ const DEC_DIGITS_LUT: &[u8; 200] = b"\
 6061626364656667686970717273747576777879\
 8081828384858687888990919293949596979899";
 
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn has_avx2() -> bool {
+    #[cfg(target_feature = "avx2")]
+    {
+        true
+    }
+    #[cfg(not(target_feature = "avx2"))]
+    {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static CACHE: AtomicU8 = AtomicU8::new(0);
+        match CACHE.load(Ordering::Relaxed) {
+            2 => true,
+            1 => false,
+            _ => {
+                let ok = std::is_x86_feature_detected!("avx2");
+                CACHE.store(if ok { 2 } else { 1 }, Ordering::Relaxed);
+                ok
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn find_byte_avx2(haystack: &[u8], needle: u8) -> Option<usize> {
+    use std::arch::x86_64::*;
+    let mut pos = 0usize;
+    let vn = _mm256_set1_epi8(needle as i8);
+    while pos + 32 <= haystack.len() {
+        let chunk = unsafe { _mm256_loadu_si256(haystack.as_ptr().add(pos).cast()) };
+        let mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, vn)) as u32;
+        if mask != 0 {
+            return Some(pos + mask.trailing_zeros() as usize);
+        }
+        pos += 32;
+    }
+    let vn16 = _mm_set1_epi8(needle as i8);
+    if pos + 16 <= haystack.len() {
+        let chunk = unsafe { _mm_loadu_si128(haystack.as_ptr().add(pos).cast()) };
+        let mask = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, vn16)) as u32;
+        if mask != 0 {
+            return Some(pos + mask.trailing_zeros() as usize);
+        }
+        pos += 16;
+    }
+    while pos < haystack.len() {
+        if haystack[pos] == needle {
+            return Some(pos);
+        }
+        pos += 1;
+    }
+    None
+}
+
 #[inline(always)]
 pub fn find_byte(haystack: &[u8], needle: u8) -> Option<usize> {
+    #[cfg(target_arch = "x86_64")]
+    if haystack.len() >= 32 && has_avx2() {
+        return unsafe { find_byte_avx2(haystack, needle) };
+    }
     let mut pos = 0;
     #[cfg(target_arch = "x86_64")]
     unsafe {
@@ -81,6 +289,53 @@ fn has_special8(word: u64) -> bool {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn copy_clean_avx2(src: *const u8, dst: *mut u8, len: usize) -> usize {
+    use std::arch::x86_64::*;
+    let mut pos = 0usize;
+    let vq = _mm256_set1_epi8(b'"' as i8);
+    let vs = _mm256_set1_epi8(b'\\' as i8);
+    let vc = _mm256_set1_epi8(0x1f);
+    unsafe {
+        while pos + 32 <= len {
+            let chunk = _mm256_loadu_si256(src.add(pos).cast());
+            let is_quote = _mm256_cmpeq_epi8(chunk, vq);
+            let is_slash = _mm256_cmpeq_epi8(chunk, vs);
+            let is_ctrl = _mm256_cmpeq_epi8(_mm256_min_epu8(chunk, vc), chunk);
+            let mask = _mm256_movemask_epi8(_mm256_or_si256(_mm256_or_si256(is_quote, is_slash), is_ctrl)) as u32;
+            _mm256_storeu_si256(dst.add(pos).cast(), chunk);
+            if mask != 0 {
+                return pos + mask.trailing_zeros() as usize;
+            }
+            pos += 32;
+        }
+    }
+    pos
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn scan_clean_avx2(buf: &[u8]) -> usize {
+    use std::arch::x86_64::*;
+    let mut pos = 0usize;
+    let vq = _mm256_set1_epi8(b'"' as i8);
+    let vs = _mm256_set1_epi8(b'\\' as i8);
+    let vc = _mm256_set1_epi8(0x1f);
+    while pos + 32 <= buf.len() {
+        let chunk = unsafe { _mm256_loadu_si256(buf.as_ptr().add(pos).cast()) };
+        let is_quote = _mm256_cmpeq_epi8(chunk, vq);
+        let is_slash = _mm256_cmpeq_epi8(chunk, vs);
+        let is_ctrl = _mm256_cmpeq_epi8(_mm256_min_epu8(chunk, vc), chunk);
+        let mask = _mm256_movemask_epi8(_mm256_or_si256(_mm256_or_si256(is_quote, is_slash), is_ctrl)) as u32;
+        if mask != 0 {
+            return pos + mask.trailing_zeros() as usize;
+        }
+        pos += 32;
+    }
+    pos
+}
+
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn chunk16_clean(buf: &[u8]) -> bool {
     unsafe {
@@ -94,44 +349,22 @@ fn chunk16_clean(buf: &[u8]) -> bool {
     }
 }
 
-#[inline]
-pub fn write_str(dst: &mut Vec<u8>, src: &[u8]) {
-    dst.reserve(src.len() + 2);
-    dst.push(b'"');
-    let mut pos = 0;
-
-    #[cfg(target_arch = "x86_64")]
-    while pos + 16 <= src.len() {
-        if !chunk16_clean(&src[pos..]) {
-            break;
-        }
-        pos += 16;
-    }
-    while pos + 8 <= src.len() {
-        let w = u64::from_le_bytes(src[pos..pos + 8].try_into().unwrap());
-        if has_special8(w) {
-            break;
-        }
-        pos += 8;
-    }
-    while pos < src.len() {
-        let c = src[pos];
-        if c < 0x20 || c == b'"' || c == b'\\' {
-            break;
-        }
-        pos += 1;
-    }
-    if pos == src.len() {
-        dst.extend_from_slice(src);
-        dst.push(b'"');
-        return;
-    }
-
-    dst.extend_from_slice(&src[..pos]);
-    let tail = &src[pos..];
+#[cold]
+#[inline(never)]
+fn write_str_escaped_tail(dst: &mut Vec<u8>, tail: &[u8]) {
     let mut anchor = 0;
     let mut idx = 0;
     while idx < tail.len() {
+        #[cfg(target_arch = "x86_64")]
+        if idx + 32 <= tail.len() && has_avx2() {
+            let step = unsafe { scan_clean_avx2(&tail[idx..]) };
+            if step > 0 {
+                idx += step;
+                if idx >= tail.len() {
+                    break;
+                }
+            }
+        }
         #[cfg(target_arch = "x86_64")]
         if idx + 16 <= tail.len() && chunk16_clean(&tail[idx..]) {
             idx += 16;
@@ -162,6 +395,74 @@ pub fn write_str(dst: &mut Vec<u8>, src: &[u8]) {
     }
     dst.extend_from_slice(&tail[anchor..]);
     dst.push(b'"');
+}
+
+#[inline]
+pub fn write_str(dst: &mut Vec<u8>, src: &[u8]) {
+    let len = src.len();
+    let old_len = dst.len();
+    dst.reserve(len + 2);
+    unsafe {
+        let base = dst.as_mut_ptr().add(old_len);
+        *base = b'"';
+        let out = base.add(1);
+        let sptr = src.as_ptr();
+        let mut pos = 0usize;
+
+        #[cfg(target_arch = "x86_64")]
+        if len >= 32 && has_avx2() {
+            pos = copy_clean_avx2(sptr, out, len);
+            if pos + 32 <= len {
+                dst.set_len(old_len + 1 + pos);
+                write_str_escaped_tail(dst, &src[pos..]);
+                return;
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::arch::x86_64::*;
+            let vq = _mm_set1_epi8(b'"' as i8);
+            let vs = _mm_set1_epi8(b'\\' as i8);
+            let vc = _mm_set1_epi8(0x1f);
+            while pos + 16 <= len {
+                let chunk = _mm_loadu_si128(sptr.add(pos).cast());
+                let is_quote = _mm_cmpeq_epi8(chunk, vq);
+                let is_slash = _mm_cmpeq_epi8(chunk, vs);
+                let is_ctrl = _mm_cmpeq_epi8(_mm_min_epu8(chunk, vc), chunk);
+                let mask = _mm_movemask_epi8(_mm_or_si128(_mm_or_si128(is_quote, is_slash), is_ctrl)) as u32;
+                _mm_storeu_si128(out.add(pos).cast(), chunk);
+                if mask != 0 {
+                    pos += mask.trailing_zeros() as usize;
+                    dst.set_len(old_len + 1 + pos);
+                    write_str_escaped_tail(dst, &src[pos..]);
+                    return;
+                }
+                pos += 16;
+            }
+        }
+        while pos + 8 <= len {
+            let w = (sptr.add(pos) as *const u64).read_unaligned();
+            if has_special8(w) {
+                dst.set_len(old_len + 1 + pos);
+                write_str_escaped_tail(dst, &src[pos..]);
+                return;
+            }
+            (out.add(pos) as *mut u64).write_unaligned(w);
+            pos += 8;
+        }
+        while pos < len {
+            let c = *sptr.add(pos);
+            if c < 0x20 || c == b'"' || c == b'\\' {
+                dst.set_len(old_len + 1 + pos);
+                write_str_escaped_tail(dst, &src[pos..]);
+                return;
+            }
+            *out.add(pos) = c;
+            pos += 1;
+        }
+        *out.add(len) = b'"';
+        dst.set_len(old_len + len + 2);
+    }
 }
 
 #[inline]
@@ -236,31 +537,40 @@ pub fn write_timestamp(dst: &mut Vec<u8>, pg_micros: i64) {
     let y = year as u32;
     let (hh, mm, ss) = (day_sec / 3600, (day_sec / 60) % 60, day_sec % 60);
 
+    let yh = (((y / 100) % 100) * 2) as usize;
+    let yl = ((y % 100) * 2) as usize;
+    let mo = (month * 2) as usize;
+    let da = (day * 2) as usize;
+    let h2 = (hh * 2) as usize;
+    let m2 = (mm * 2) as usize;
+    let s2 = (ss * 2) as usize;
+    let msl = ((millis % 100) * 2) as usize;
+
     let out: [u8; 26] = [
         b'"',
-        b'0' + ((y / 1000) % 10) as u8,
-        b'0' + ((y / 100) % 10) as u8,
-        b'0' + ((y / 10) % 10) as u8,
-        b'0' + (y % 10) as u8,
+        DEC_DIGITS_LUT[yh],
+        DEC_DIGITS_LUT[yh + 1],
+        DEC_DIGITS_LUT[yl],
+        DEC_DIGITS_LUT[yl + 1],
         b'-',
-        b'0' + (month / 10) as u8,
-        b'0' + (month % 10) as u8,
+        DEC_DIGITS_LUT[mo],
+        DEC_DIGITS_LUT[mo + 1],
         b'-',
-        b'0' + (day / 10) as u8,
-        b'0' + (day % 10) as u8,
+        DEC_DIGITS_LUT[da],
+        DEC_DIGITS_LUT[da + 1],
         b'T',
-        b'0' + (hh / 10) as u8,
-        b'0' + (hh % 10) as u8,
+        DEC_DIGITS_LUT[h2],
+        DEC_DIGITS_LUT[h2 + 1],
         b':',
-        b'0' + (mm / 10) as u8,
-        b'0' + (mm % 10) as u8,
+        DEC_DIGITS_LUT[m2],
+        DEC_DIGITS_LUT[m2 + 1],
         b':',
-        b'0' + (ss / 10) as u8,
-        b'0' + (ss % 10) as u8,
+        DEC_DIGITS_LUT[s2],
+        DEC_DIGITS_LUT[s2 + 1],
         b'.',
         b'0' + (millis / 100) as u8,
-        b'0' + ((millis / 10) % 10) as u8,
-        b'0' + (millis % 10) as u8,
+        DEC_DIGITS_LUT[msl],
+        DEC_DIGITS_LUT[msl + 1],
         b'Z',
         b'"',
     ];
@@ -297,10 +607,12 @@ pub fn b64url_encode_append(src: &[u8], dst: &mut String) {
     let mut i = 0;
     while i + 3 <= src.len() {
         let n = ((src[i] as u32) << 16) | ((src[i + 1] as u32) << 8) | (src[i + 2] as u32);
-        out.push(B64_URL_ENC[((n >> 18) & 0x3f) as usize]);
-        out.push(B64_URL_ENC[((n >> 12) & 0x3f) as usize]);
-        out.push(B64_URL_ENC[((n >> 6) & 0x3f) as usize]);
-        out.push(B64_URL_ENC[(n & 0x3f) as usize]);
+        out.extend_from_slice(&[
+            B64_URL_ENC[((n >> 18) & 0x3f) as usize],
+            B64_URL_ENC[((n >> 12) & 0x3f) as usize],
+            B64_URL_ENC[((n >> 6) & 0x3f) as usize],
+            B64_URL_ENC[(n & 0x3f) as usize],
+        ]);
         i += 3;
     }
     let rem = src.len() - i;
@@ -313,6 +625,58 @@ pub fn b64url_encode_append(src: &[u8], dst: &mut String) {
         out.push(B64_URL_ENC[((n >> 18) & 0x3f) as usize]);
         out.push(B64_URL_ENC[((n >> 12) & 0x3f) as usize]);
         out.push(B64_URL_ENC[((n >> 6) & 0x3f) as usize]);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn b64url_decode_chunk16_ssse3(chunk: &[u8], out12: &mut [u8]) -> bool {
+    unsafe {
+        use std::arch::x86_64::*;
+        let c = _mm_loadu_si128(chunk.as_ptr().cast());
+        let is_upper = _mm_and_si128(
+            _mm_cmpgt_epi8(c, _mm_set1_epi8(b'A' as i8 - 1)),
+            _mm_cmpgt_epi8(_mm_set1_epi8(b'Z' as i8 + 1), c),
+        );
+        let is_lower = _mm_and_si128(
+            _mm_cmpgt_epi8(c, _mm_set1_epi8(b'a' as i8 - 1)),
+            _mm_cmpgt_epi8(_mm_set1_epi8(b'z' as i8 + 1), c),
+        );
+        let is_digit = _mm_and_si128(
+            _mm_cmpgt_epi8(c, _mm_set1_epi8(b'0' as i8 - 1)),
+            _mm_cmpgt_epi8(_mm_set1_epi8(b'9' as i8 + 1), c),
+        );
+        let is_dash = _mm_cmpeq_epi8(c, _mm_set1_epi8(b'-' as i8));
+        let is_under = _mm_cmpeq_epi8(c, _mm_set1_epi8(b'_' as i8));
+        let valid = _mm_or_si128(
+            _mm_or_si128(is_upper, is_lower),
+            _mm_or_si128(is_digit, _mm_or_si128(is_dash, is_under)),
+        );
+        if _mm_movemask_epi8(valid) != 0xffff {
+            return false;
+        }
+        let off = _mm_or_si128(
+            _mm_or_si128(
+                _mm_and_si128(is_upper, _mm_set1_epi8(-65)),
+                _mm_and_si128(is_lower, _mm_set1_epi8(-71)),
+            ),
+            _mm_or_si128(
+                _mm_and_si128(is_digit, _mm_set1_epi8(4)),
+                _mm_or_si128(
+                    _mm_and_si128(is_dash, _mm_set1_epi8(17)),
+                    _mm_and_si128(is_under, _mm_set1_epi8(-32)),
+                ),
+            ),
+        );
+        let v = _mm_add_epi8(c, off);
+        let merged16 = _mm_maddubs_epi16(v, _mm_set1_epi32(0x0140_0140));
+        let merged32 = _mm_madd_epi16(merged16, _mm_set1_epi32(0x0001_1000));
+        let shuf = _mm_setr_epi8(2, 1, 0, 6, 5, 4, 10, 9, 8, 14, 13, 12, -1, -1, -1, -1);
+        let packed = _mm_shuffle_epi8(merged32, shuf);
+        let mut tmp = [0u8; 16];
+        _mm_storeu_si128(tmp.as_mut_ptr().cast(), packed);
+        out12[..12].copy_from_slice(&tmp[..12]);
+        true
     }
 }
 
@@ -332,6 +696,16 @@ pub fn b64url_decode_slice(src: &[u8], dst: &mut [u8]) -> Option<usize> {
     }
     let mut si = 0;
     let mut di = 0;
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2() {
+        while si + 16 <= src.len() {
+            if !unsafe { b64url_decode_chunk16_ssse3(&src[si..si + 16], &mut dst[di..di + 12]) } {
+                return None;
+            }
+            si += 16;
+            di += 12;
+        }
+    }
     while si + 4 <= src.len() {
         let a = B64_URL_DEC[src[si] as usize];
         let b = B64_URL_DEC[src[si + 1] as usize];
@@ -587,6 +961,10 @@ impl<'a> JsonParser<'a> {
     fn parse_string(&mut self) -> Option<String> {
         self.pos += 1;
         let start = self.pos;
+        #[cfg(target_arch = "x86_64")]
+        if self.src.len() - self.pos >= 32 && has_avx2() {
+            self.pos += unsafe { scan_clean_avx2(&self.src[self.pos..]) };
+        }
         while self.pos < self.src.len() {
             let c = self.src[self.pos];
             if c == b'"' {
@@ -619,6 +997,10 @@ impl<'a> JsonParser<'a> {
             if c != b'\\' {
                 let seg_start = self.pos;
                 self.pos += 1;
+                #[cfg(target_arch = "x86_64")]
+                if self.src.len() - self.pos >= 32 && has_avx2() {
+                    self.pos += unsafe { scan_clean_avx2(&self.src[self.pos..]) };
+                }
                 while self.pos < self.src.len() {
                     let b = self.src[self.pos];
                     if b == b'"' || b == b'\\' || b < 0x20 {
@@ -784,6 +1166,150 @@ impl<'a> JsonParser<'a> {
     }
 }
 
+#[derive(Default, Clone, Copy)]
+pub struct HwBuildHasher;
+
+pub struct HwHasher(u64);
+
+impl std::hash::BuildHasher for HwBuildHasher {
+    type Hasher = HwHasher;
+
+    #[inline(always)]
+    fn build_hasher(&self) -> HwHasher {
+        HwHasher(0x517c_c1b7_2722_0a95)
+    }
+}
+
+impl std::hash::Hasher for HwHasher {
+    #[inline(always)]
+    fn finish(&self) -> u64 {
+        let mut x = self.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x ^ (x >> 27)
+    }
+
+    #[inline(always)]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0;
+        let mut i = 0;
+        #[cfg(all(target_arch = "x86_64", target_feature = "sse4.2"))]
+        unsafe {
+            use std::arch::x86_64::*;
+            while i + 8 <= bytes.len() {
+                let w = u64::from_ne_bytes(bytes[i..i + 8].try_into().unwrap());
+                h = _mm_crc32_u64(h, w);
+                i += 8;
+            }
+            if i + 4 <= bytes.len() {
+                let w = u32::from_ne_bytes(bytes[i..i + 4].try_into().unwrap());
+                h = _mm_crc32_u32(h as u32, w) as u64;
+                i += 4;
+            }
+            while i < bytes.len() {
+                h = _mm_crc32_u8(h as u32, bytes[i]) as u64;
+                i += 1;
+            }
+            self.0 = h;
+            return;
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.2")))]
+        {
+            while i + 8 <= bytes.len() {
+                let w = u64::from_ne_bytes(bytes[i..i + 8].try_into().unwrap());
+                h = (h ^ w).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                i += 8;
+            }
+            while i < bytes.len() {
+                h = (h ^ (bytes[i] as u64)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                i += 1;
+            }
+            self.0 = h;
+        }
+    }
+
+    #[inline(always)]
+    fn write_u8(&mut self, v: u8) {
+        #[cfg(all(target_arch = "x86_64", target_feature = "sse4.2"))]
+        unsafe {
+            self.0 = std::arch::x86_64::_mm_crc32_u8(self.0 as u32, v) as u64;
+            return;
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.2")))]
+        {
+            self.0 = (self.0 ^ (v as u64)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+
+    #[inline(always)]
+    fn write_i8(&mut self, v: i8) {
+        self.write_u8(v as u8);
+    }
+
+    #[inline(always)]
+    fn write_u16(&mut self, v: u16) {
+        #[cfg(all(target_arch = "x86_64", target_feature = "sse4.2"))]
+        unsafe {
+            self.0 = std::arch::x86_64::_mm_crc32_u16(self.0 as u32, v) as u64;
+            return;
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.2")))]
+        {
+            self.0 = (self.0 ^ (v as u64)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+
+    #[inline(always)]
+    fn write_i16(&mut self, v: i16) {
+        self.write_u16(v as u16);
+    }
+
+    #[inline(always)]
+    fn write_i32(&mut self, v: i32) {
+        self.write_u32(v as u32);
+    }
+
+    #[inline(always)]
+    fn write_u32(&mut self, v: u32) {
+        #[cfg(all(target_arch = "x86_64", target_feature = "sse4.2"))]
+        unsafe {
+            self.0 = std::arch::x86_64::_mm_crc32_u32(self.0 as u32, v) as u64;
+            return;
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.2")))]
+        {
+            self.0 = (self.0 ^ (v as u64)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+
+    #[inline(always)]
+    fn write_i64(&mut self, v: i64) {
+        self.write_u64(v as u64);
+    }
+
+    #[inline(always)]
+    fn write_u64(&mut self, v: u64) {
+        #[cfg(all(target_arch = "x86_64", target_feature = "sse4.2"))]
+        unsafe {
+            self.0 = std::arch::x86_64::_mm_crc32_u64(self.0, v);
+            return;
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.2")))]
+        {
+            self.0 = (self.0 ^ v).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+
+    #[inline(always)]
+    fn write_usize(&mut self, v: usize) {
+        self.write_u64(v as u64);
+    }
+
+    #[inline(always)]
+    fn write_isize(&mut self, v: isize) {
+        self.write_u64(v as u64);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -809,6 +1335,23 @@ mod tests {
         let mut buf = Vec::new();
         write_str(&mut buf, b"a\"b\\c\n\x01\xc3\xa9");
         assert_eq!(buf, b"\"a\\\"b\\\\c\\n\\u0001\xc3\xa9\"");
+
+        for len in [0usize, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 95] {
+            let clean: Vec<u8> = (0..len).map(|i| b'a' + (i % 26) as u8).collect();
+            buf.clear();
+            write_str(&mut buf, &clean);
+            assert_eq!(buf[0], b'"');
+            assert_eq!(buf[buf.len() - 1], b'"');
+            assert_eq!(&buf[1..buf.len() - 1], &clean[..]);
+
+            if len > 0 {
+                let mut dirty = clean.clone();
+                dirty[len / 2] = b'"';
+                buf.clear();
+                write_str(&mut buf, &dirty);
+                assert_eq!(buf.len(), len + 3);
+            }
+        }
     }
 
     #[test]
@@ -838,5 +1381,25 @@ mod tests {
         assert_eq!(u.get("n").unwrap().as_f64(), Some(-1250.0));
         assert!(parse_json(br#"{"unclosed": 1"#).is_none());
         assert!(parse_json(br#"{"bad_num": 01}"#).is_none());
+    }
+
+    #[test]
+    fn small_str_inline_and_heap() {
+        let inline = SmallStr::from_str("how-to-train-your-dragon-42");
+        assert_eq!(inline.as_str(), "how-to-train-your-dragon-42");
+        assert_eq!(inline.clone(), inline);
+
+        let long_s = "a".repeat(80);
+        let heap = SmallStr::from_str(&long_s);
+        assert_eq!(heap.as_str(), long_s);
+        assert_eq!(heap.clone(), heap);
+        assert!(inline != heap);
+
+        let mut map: std::collections::HashMap<SmallStr, u32, HwBuildHasher> =
+            std::collections::HashMap::default();
+        map.insert(inline.clone(), 7);
+        map.insert(heap.clone(), 9);
+        assert_eq!(map.get(b"how-to-train-your-dragon-42".as_slice()), Some(&7));
+        assert_eq!(map.get(long_s.as_bytes()), Some(&9));
     }
 }

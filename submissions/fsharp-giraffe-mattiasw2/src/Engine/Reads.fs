@@ -162,16 +162,27 @@ let private usersSql =
     "SELECT r.i, x.id, x.username, x.bio, x.image FROM unnest(@usernames::text[]) WITH ORDINALITY AS r(username, i)
       CROSS JOIN LATERAL (SELECT u.id, u.username, u.bio, u.image FROM users u WHERE u.username = r.username LIMIT 1) x"
 
-/// Phase B: each distinct article's card; the body only where an article page shows it.
-/// Each tag name is one tags_pkey probe: as a JOIN the planner hash-joins the whole tags table
-/// once per card, which was over half of this statement's time.
+// Phase B: each distinct article's card, from four statements over the whole batch's articles,
+// in this order so the card rows can be finished as they arrive:
+//   tagRanksSql   the tags table (200 rows), ordered by name in the database's collation;
+//   cardTagsSql   the cards' (article, tag id) pairs, one index scan for all of them;
+//   favoritesSql  the cards' favorite counts, one index scan (an article without any has no row);
+//   cardsSql      the cards' columns and authors; the body only where an article page shows it.
+// F# names each card's tags and orders them by their position in the tags table: that is the
+// spec's `ORDER BY t.name`, without a tags_pkey probe per tag. On the seed, 1,000 cards took
+// 9.9 ms as one statement with the tag names and counts inside, 4.2 ms as these four.
+
+let private tagRanksSql = "SELECT t.id, t.name FROM tags t ORDER BY t.name"
+
+let private cardTagsSql = "SELECT at.article_id, at.tag_id FROM article_tags at WHERE at.article_id = ANY (@ids)"
+
+let private favoritesSql =
+    "SELECT f.article_id, count(*) FROM favorites f WHERE f.article_id = ANY (@ids) GROUP BY f.article_id"
+
 let private cardsSql =
     "SELECT x.* FROM unnest(@ids::int8[], @bodies::bool[]) AS r(id, body)
       CROSS JOIN LATERAL (
             SELECT a.id, CASE WHEN r.body THEN a.body END AS body, a.slug, a.title, a.description, a.created_at, a.updated_at,
-                   ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at
-                          WHERE at.article_id = a.id ORDER BY 1) AS tag_list,
-                   (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
                    a.author_id, u.username, u.bio, u.image
               FROM articles a JOIN users u ON u.id = a.author_id
              WHERE a.id = r.id LIMIT 1) x"
@@ -333,12 +344,59 @@ let private planB (reads: Read[]) (a: PlanA) (found: FoundA) : PlanB =
             | _ -> ()
     plan
 
-/// What phase B found.
+/// Phase B cut into `parts` by article, for that many connections: each part gets a contiguous
+/// share of the distinct articles, with their bodies and their (viewer, article) pairs; the
+/// (viewer, user) pairs go with the first part. Every part's flags statement looks up only its
+/// own articles' authors.
+let private splitB (b: PlanB) (parts: int) : PlanB[] =
+    let plans =
+        Array.init parts (fun _ ->
+            { Cards = Distinct()
+              Bodies = ResizeArray()
+              ArticlePairs = Distinct()
+              UserPairs = Distinct() })
+    let partOf = Dictionary<int64, int>(b.Cards.Count)
+    for i in 0 .. b.Cards.Count - 1 do
+        let part = i * parts / b.Cards.Count
+        let id = b.Cards.Items[i]
+        partOf[id] <- part
+        plans[part].Cards.Add id |> ignore
+        plans[part].Bodies.Add b.Bodies[i]
+    for struct (_, article) as pair in b.ArticlePairs.Items do
+        plans[partOf[article]].ArticlePairs.Add pair |> ignore
+    for pair in b.UserPairs.Items do
+        plans[0].UserPairs.Add pair |> ignore
+    plans
+
+/// What phase B found. The tag and favorite fields are the cards' parts, read before the cards.
 [<NoEquality; NoComparison>]
 type private FoundB =
     { Cards: Dictionary<int64, Card>
       Favorited: HashSet<struct (int64 * int64)>
-      Following: HashSet<struct (int64 * int64)> }
+      Following: HashSet<struct (int64 * int64)>
+      /// Tag id -> its position in name order (an index into TagNames).
+      TagRanks: Dictionary<int, int>
+      TagNames: ResizeArray<string>
+      /// Article id -> its tags' positions.
+      CardTags: Dictionary<int64, ResizeArray<int>>
+      FavoritesCounts: Dictionary<int64, int64> }
+
+let private emptyB () =
+    { Cards = Dictionary()
+      Favorited = HashSet()
+      Following = HashSet()
+      TagRanks = Dictionary()
+      TagNames = ResizeArray()
+      CardTags = Dictionary()
+      FavoritesCounts = Dictionary() }
+
+/// An article's tag names in the database's name order (its collation, not .NET's).
+let private tagList (found: FoundB) (article: int64) : string[] =
+    match found.CardTags.TryGetValue article with
+    | true, ranks ->
+        ranks.Sort()
+        Array.init ranks.Count (fun i -> found.TagNames[ranks[i]])
+    | _ -> Array.empty
 
 // ------------------------------------------------------------ assemble ---------
 
@@ -419,11 +477,13 @@ let private readRows (each: NpgsqlDataReader -> unit) (r: NpgsqlDataReader) : Ta
             each r
     }
 
-/// One round trip: `prefix`, the steps, `suffix` (BEGIN / COMMIT, which return no result set).
-let private roundTrip (conn: NpgsqlConnection) (prefix: string option) (steps: Step list) (suffix: string option) : Task =
+/// One round trip: `prefix`, the steps, `suffix` (BEGIN, SET TRANSACTION, COMMIT: statements that
+/// return no result set).
+let private roundTrip (conn: NpgsqlConnection) (prefix: string list) (steps: Step list) (suffix: string option) : Task =
     task {
         use batch = new NpgsqlBatch(conn)
-        prefix |> Option.iter (fun sql -> batch.BatchCommands.Add(NpgsqlBatchCommand sql))
+        for sql in prefix do
+            batch.BatchCommands.Add(NpgsqlBatchCommand sql)
         for c, _ in steps do
             batch.BatchCommands.Add c
         suffix |> Option.iter (fun sql -> batch.BatchCommands.Add(NpgsqlBatchCommand sql))
@@ -496,7 +556,25 @@ let private stepsB (b: PlanB) (found: FoundB) : Step list =
     let firsts (pairs: Distinct<struct (int64 * int64)>) = [| for struct (x, _) in pairs.Items -> x |]
     let seconds (pairs: Distinct<struct (int64 * int64)>) = [| for struct (_, y) in pairs.Items -> y |]
     [ if b.Cards.Count > 0 then
-          command cardsSql [ longs "@ids" (b.Cards.Items.ToArray()); bools "@bodies" (b.Bodies.ToArray()) ],
+          let ids = b.Cards.Items.ToArray()
+          command tagRanksSql [],
+          readRows (fun r ->
+              found.TagRanks[r.GetInt32 0] <- found.TagNames.Count
+              found.TagNames.Add(r.GetString 1))
+          command cardTagsSql [ longs "@ids" ids ],
+          readRows (fun r ->
+              let article = r.GetInt64 0
+              let ranks =
+                  match found.CardTags.TryGetValue article with
+                  | true, ranks -> ranks
+                  | _ ->
+                      let ranks = ResizeArray 4
+                      found.CardTags[article] <- ranks
+                      ranks
+              ranks.Add found.TagRanks[r.GetInt32 1])
+          command favoritesSql [ longs "@ids" ids ],
+          readRows (fun r -> found.FavoritesCounts[r.GetInt64 0] <- r.GetInt64 1)
+          command cardsSql [ longs "@ids" ids; bools "@bodies" (b.Bodies.ToArray()) ],
           readRows (fun r ->
               let id = r.GetInt64 0
               found.Cards[id] <-
@@ -507,13 +585,16 @@ let private stepsB (b: PlanB) (found: FoundB) : Step list =
                     Description = r.GetString 4
                     CreatedAt = r.GetDateTime 5
                     UpdatedAt = r.GetDateTime 6
-                    TagList = r.GetFieldValue<string[]> 7
-                    FavoritesCount = r.GetInt64 8
+                    TagList = tagList found id
+                    FavoritesCount =
+                      match found.FavoritesCounts.TryGetValue id with
+                      | true, n -> n
+                      | _ -> 0L
                     Author =
-                      { Id = r.GetInt64 9
-                        Username = r.GetString 10
-                        Bio = textOrNone r 11
-                        Image = textOrNone r 12 } })
+                      { Id = r.GetInt64 7
+                        Username = r.GetString 8
+                        Bio = textOrNone r 9
+                        Image = textOrNone r 10 } })
       if b.ArticlePairs.Count > 0 || b.UserPairs.Count > 0 then
           command
               flagsSql
@@ -525,12 +606,35 @@ let private stepsB (b: PlanB) (found: FoundB) : Step list =
               let pair = struct (r.GetInt64 1, r.GetInt64 2)
               (if r.GetBoolean 0 then found.Following else found.Favorited).Add pair |> ignore) ]
 
+let private beginRead = "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+
 /// One batch, two round trips in one REPEATABLE READ snapshot: both phases see the same
 /// database, so an article phase A found is still there in phase B. Read-only, so committing
-/// costs nothing, and it takes one snapshot instead of one per statement. Public for the batch
-/// property test (Tests/BatchTests.fs): a request's answer never depends on its batch-mates.
-let answer (conn: NpgsqlConnection) (reads: Read[]) : Task<Answer[]> =
+/// costs nothing, and it takes one snapshot instead of one per statement.
+///
+/// With `helpers`, phase B is cut by article into up to 1 + helpers.Length parts (at least
+/// `perPart` distinct articles each) that run at the same time, each on its own connection.
+/// Phase A exports its snapshot (pg_export_snapshot, in the same round trip) and every helper
+/// imports it (SET TRANSACTION SNAPSHOT) before its part, so all parts see exactly the database
+/// phase A saw; `conn` commits only once every part is back, which keeps the snapshot exported
+/// while they import it. `times`, if not null, records phase A, the plan between, phase B and the
+/// assembly; `laps`, if not null, gets the Stopwatch timestamp at the end of each (0 where the
+/// batch had no such step).
+let answerWith
+    (conn: NpgsqlConnection)
+    (helpers: NpgsqlConnection[])
+    (perPart: int)
+    (times: Db.Millis[])
+    (laps: int64[])
+    (reads: Read[])
+    : Task<Answer[]> =
     task {
+        let at = ref (Diagnostics.Stopwatch.GetTimestamp())
+        let lap (i: int) =
+            let now = Diagnostics.Stopwatch.GetTimestamp()
+            if not (isNull times) then times[i].Record(Diagnostics.Stopwatch.GetElapsedTime(at.Value, now))
+            if not (isNull laps) then laps[i] <- now
+            at.Value <- now
         let a = planA reads
         let foundA =
             { TagNames = []
@@ -539,10 +643,7 @@ let answer (conn: NpgsqlConnection) (reads: Read[]) : Task<Answer[]> =
               SlugIds = Array.create a.Slugs.Count ValueNone
               Threads = Dictionary()
               Users = Array.create a.Usernames.Count ValueNone }
-        let foundB =
-            { Cards = Dictionary()
-              Favorited = HashSet()
-              Following = HashSet() }
+        let foundB = emptyB ()
         // Only tags or anonymous profiles: phase A is everything, and needs no snapshot of its own.
         let twoPhases =
             reads
@@ -551,19 +652,53 @@ let answer (conn: NpgsqlConnection) (reads: Read[]) : Task<Answer[]> =
                 | ReadProfile(viewer, _) -> viewer <> 0L
                 | _ -> true)
         if twoPhases then
-            do! roundTrip conn (Some "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY") (stepsA a foundA) None
+            let snapshot = ref ""
+            let export =
+                [ if helpers.Length > 0 then
+                      command "SELECT pg_export_snapshot()" [], readRows (fun r -> snapshot.Value <- r.GetString 0) ]
+            do! roundTrip conn [ beginRead ] (export @ stepsA a foundA) None
+            lap 0
             for pages in foundA.PageIds do
                 for ids in pages do
                     ids.Sort(fun x y -> compare y x)
             for t in foundA.Threads.Values do
                 t.Sort(Comparison newestFirst)
             let b = planB reads a foundA
-            do! roundTrip conn None (stepsB b foundB) (Some "COMMIT")
+            let parts = min (helpers.Length + 1) (max 1 (b.Cards.Count / max 1 perPart))
+            lap 1
+            if parts = 1 then
+                do! roundTrip conn [] (stepsB b foundB) (Some "COMMIT")
+            else
+                let plans = splitB b parts
+                let found = Array.init parts (fun _ -> emptyB ())
+                let work =
+                    [| roundTrip conn [] (stepsB plans[0] found[0]) None
+                       for i in 1 .. parts - 1 do
+                           roundTrip
+                               helpers[i - 1]
+                               [ beginRead; $"SET TRANSACTION SNAPSHOT '{snapshot.Value}'" ]
+                               (stepsB plans[i] found[i])
+                               (Some "COMMIT") |]
+                do! Task.WhenAll work
+                do! roundTrip conn [] [] (Some "COMMIT")
+                for f in found do
+                    for kv in f.Cards do
+                        foundB.Cards[kv.Key] <- kv.Value
+                    foundB.Favorited.UnionWith f.Favorited
+                    foundB.Following.UnionWith f.Following
+            lap 2
         else
-            do! roundTrip conn None (stepsA a foundA) None
+            do! roundTrip conn [] (stepsA a foundA) None
+            lap 0
         foundA.TagNames <- List.rev foundA.TagNames
-        return assemble reads a foundA foundB
+        let answers = assemble reads a foundA foundB
+        lap 3
+        return answers
     }
+
+/// One batch on one connection. Public for the batch property test (Tests/BatchTests.fs): a
+/// request's answer never depends on its batch-mates.
+let answer (conn: NpgsqlConnection) (reads: Read[]) : Task<Answer[]> = answerWith conn [||] 1 null null reads
 
 // --------------------------------------------------------------- lanes ---------
 
@@ -571,40 +706,15 @@ let answer (conn: NpgsqlConnection) (reads: Read[]) : Task<Answer[]> =
 type private Pending(read: Read) =
     let reply = TaskCompletionSource<Answer>(TaskCreationOptions.RunContinuationsAsynchronously)
     let arrived = Diagnostics.Stopwatch.GetTimestamp()
+    let trace = if Db.Millis.Enabled then Db.Trace.Current.Value else null
     member _.Read = read
     member _.Arrived = arrived
+    member _.Trace = trace
     member _.Task = reply.Task
     member _.Answer(a: Answer) = reply.TrySetResult a |> ignore
     member _.Fail(e: exn) = reply.TrySetException e |> ignore
 
 let private unexpected (a: Answer) : 'a = invalidOp $"Reads: unexpected answer {a}"
-
-/// Durations in 1 ms buckets (the last bucket holds everything from 2 s up), for the shutdown
-/// line: cheap enough to record every request.
-[<Sealed>]
-type private Millis() =
-    let buckets: int64[] = Array.zeroCreate 2001
-
-    member _.Record(elapsed: TimeSpan) =
-        let ms = int elapsed.TotalMilliseconds
-        Interlocked.Increment(&buckets[if ms < 0 then 0 elif ms > 2000 then 2000 else ms]) |> ignore
-
-    /// "p50/p95/p99 ms", or "-" before anything was recorded.
-    member _.Summary() =
-        let counts = Array.copy buckets
-        let total = Array.sum counts
-        if total = 0L then
-            "-"
-        else
-            let at (q: float) =
-                let target = int64 (Math.Ceiling(q * float total))
-                let mutable seen = 0L
-                let mutable i = 0
-                while seen + counts[i] < target do
-                    seen <- seen + counts[i]
-                    i <- i + 1
-                i
-            $"{at 0.5}/{at 0.95}/{at 0.99} ms"
 
 /// The hot reads' side of the process: `lanes` dedicated connections (not multiplexed: a batch
 /// holds a snapshot across two round trips), each answering one batch at a time. The lane whose
@@ -612,15 +722,24 @@ type private Millis() =
 /// if `maxBatch` of them arrive sooner): bigger batches share more, and the wait is inside the
 /// latency budget.
 [<Sealed>]
-type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpan) =
+type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpan, split: int, perPart: int, shareMin: int, logCapacity: int) =
     let queue =
-        Channel.CreateUnbounded<Pending>(UnboundedChannelOptions(SingleReader = (lanes = 1), SingleWriter = false))
+        // Never SingleReader, even with one lane: a single-reader channel cannot report its length
+        // (Depth), which the diagnostics read.
+        Channel.CreateUnbounded<Pending>(UnboundedChannelOptions(SingleReader = false, SingleWriter = false))
     let ds = NpgsqlDataSource.Create connectionString
     let counts = [| 0L; 0L |] // batches, requests
-    let queued = Millis() // per request: arrived -> taken into a batch
-    let executed = Millis() // per batch: taken -> answered
-    let answered = Millis() // per request: arrived -> answered
+    let queued = Db.Millis() // per request: arrived -> taken into a batch
+    let executed = Db.Millis() // per batch: taken -> answered
+    let answered = Db.Millis() // per request: arrived -> answered
+    let phases = Array.init 4 (fun _ -> Db.Millis()) // per batch: phase A, plan B, phase B, assemble
     let busy = [| 0L |] // lanes running a batch
+    // The batch log (logCapacity > 0, BATCH_LOG): per batch its lane, size, and the Stopwatch
+    // timestamps of taken, phase A, plan, phase B and answered (0: no such step).
+    let logged: int64[] = Array.zeroCreate (logCapacity * 7)
+    let logNext = [| -1 |]
+    let unixAt0 = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1000L
+    let ticksAt0 = Diagnostics.Stopwatch.GetTimestamp()
     let worst = [| 0L |] // TimeSpan ticks: the longest arrived -> answered since Worst() last ran
     /// How often a gathering lane takes what has been queued since it last looked.
     let tick = TimeSpan.FromMilliseconds 2.0
@@ -632,9 +751,24 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
         if ticks > seen && Interlocked.CompareExchange(&worst[0], ticks, seen) <> seen then
             noteWorst ticks
 
+    /// How many requests the gathering lane takes: its fair share of what waits, so that a burst
+    /// arriving while lanes are idle is spread over them and runs on several backends at once,
+    /// instead of one batch running on one backend while the others wait. The share is what waits
+    /// (taken + queued) over the idle lanes, this one included, at least `shareMin` and at most
+    /// `maxBatch`. With every other lane busy (full speed) it is everything up to `maxBatch`, as
+    /// big as a batch gets, since that shares the most work. shareMin = 0 turns it off.
+    let share (taken: int) =
+        if shareMin <= 0 then
+            maxBatch
+        else
+            let idle = max 1 (lanes - int (Volatile.Read &busy[0]))
+            let waiting = taken + queue.Reader.Count
+            min maxBatch (max shareMin ((waiting + idle - 1) / idle))
+
     let take (into: ResizeArray<Pending>) =
+        let limit = share into.Count
         let mutable p = Unchecked.defaultof<Pending>
-        while into.Count < maxBatch && queue.Reader.TryRead(&p) do
+        while into.Count < limit && queue.Reader.TryRead(&p) do
             into.Add p
 
     let rollback (conn: NpgsqlConnection) : Task =
@@ -648,11 +782,13 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
                     ()
         }
 
-    let rec serve (conn: NpgsqlConnection) (batch: Pending[]) : Task =
+    /// `conns`: the lane's connection, then its helpers for a split phase B.
+    let rec serve (conns: NpgsqlConnection[]) (laps: int64[]) (batch: Pending[]) : Task =
         task {
+            let conn = conns[0]
             let mutable failure = None
             try
-                let! answers = answer conn (batch |> Array.map _.Read)
+                let! answers = answerWith conn conns[1..] perPart phases laps (batch |> Array.map _.Read)
                 for i in 0 .. batch.Length - 1 do
                     batch[i].Answer answers[i]
             with e ->
@@ -660,21 +796,23 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
             match failure with
             | None -> ()
             | Some e ->
-                do! rollback conn
+                for c in conns do
+                    do! rollback c
                 match e with
-                | :? PostgresException when batch.Length > 1 && conn.State = ConnectionState.Open ->
+                | :? PostgresException when batch.Length > 1 && conns |> Array.forall (fun c -> c.State = ConnectionState.Open) ->
                     // One request's statement failed and took the batch with it: each request
                     // runs again alone and meets its own fate.
                     for p in batch do
-                        do! serve conn [| p |]
+                        do! serve conns null [| p |]
                 | e ->
                     for p in batch do
                         p.Fail e
         }
 
-    let lane () : Task =
+    let lane (index: int) : Task =
         task {
-            let mutable conn: NpgsqlConnection = null
+            // The lane's connection, then split - 1 helpers for phase B.
+            let conns: NpgsqlConnection[] = Array.zeroCreate (max 1 split)
             let pending = ResizeArray<Pending>(maxBatch)
             while! queue.Reader.WaitToReadAsync() do
                 // Gather: take requests until the oldest has waited `gather`, or a full batch
@@ -687,7 +825,7 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
                     take pending
                     // (Ticks, not TimeSpan's `>`: F#'s generic comparison boxes structs.)
                     let mutable waiting = gather.Ticks > 0L && pending.Count > 0
-                    while waiting && pending.Count < maxBatch do
+                    while waiting && pending.Count < share pending.Count do
                         let left = gather - Diagnostics.Stopwatch.GetElapsedTime pending[0].Arrived
                         if left.Ticks > 0L then
                             do! Task.Delay(if left.Ticks < tick.Ticks then left else tick)
@@ -700,24 +838,39 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
                     let batch = pending.ToArray()
                     pending.Clear()
                     let taken = Diagnostics.Stopwatch.GetTimestamp()
+                    let laps: int64[] = if logCapacity > 0 then Array.zeroCreate 4 else null
                     Interlocked.Increment(&busy[0]) |> ignore
-                    for p in batch do
-                        queued.Record(Diagnostics.Stopwatch.GetElapsedTime(p.Arrived, taken))
+                    if Db.Millis.Enabled then
+                        for p in batch do
+                            queued.Record(Diagnostics.Stopwatch.GetElapsedTime(p.Arrived, taken))
+                            if not (isNull p.Trace) then p.Trace.ReadQueued <- taken - p.Arrived
                     try
-                        if isNull conn || conn.State <> ConnectionState.Open then
-                            if not (isNull conn) then conn.Dispose()
-                            conn <- null
-                            let! c = ds.OpenConnectionAsync()
-                            conn <- c
-                        do! serve conn batch
+                        for i in 0 .. conns.Length - 1 do
+                            if isNull conns[i] || conns[i].State <> ConnectionState.Open then
+                                if not (isNull conns[i]) then conns[i].Dispose()
+                                conns[i] <- null
+                                let! c = ds.OpenConnectionAsync()
+                                conns[i] <- c
+                        do! serve conns laps batch
                     with e ->
                         for p in batch do
                             p.Fail e
                     let finished = Diagnostics.Stopwatch.GetTimestamp()
+                    if logCapacity > 0 then
+                        let i = Interlocked.Increment &logNext[0]
+                        if i < logCapacity then
+                            let at = i * 7
+                            logged[at] <- int64 index
+                            logged[at + 1] <- int64 batch.Length
+                            logged[at + 2] <- taken
+                            for k in 0..3 do
+                                logged[at + 3 + k] <- laps[k]
                     Interlocked.Decrement(&busy[0]) |> ignore
-                    executed.Record(Diagnostics.Stopwatch.GetElapsedTime(taken, finished))
-                    for p in batch do
-                        answered.Record(Diagnostics.Stopwatch.GetElapsedTime(p.Arrived, finished))
+                    if Db.Millis.Enabled then
+                        executed.Record(Diagnostics.Stopwatch.GetElapsedTime(taken, finished))
+                        for p in batch do
+                            answered.Record(Diagnostics.Stopwatch.GetElapsedTime(p.Arrived, finished))
+                            if not (isNull p.Trace) then p.Trace.ReadExecuted <- finished - taken
                     // The queue is FIFO, so the batch's first request waited longest.
                     noteWorst (Diagnostics.Stopwatch.GetElapsedTime(batch[0].Arrived, finished)).Ticks
                     Interlocked.Increment(&counts[0]) |> ignore
@@ -725,8 +878,8 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
         }
 
     do
-        for _ in 1..lanes do
-            Task.Run<unit>(fun () -> task { do! lane () }) |> ignore
+        for i in 0 .. lanes - 1 do
+            Task.Run<unit>(fun () -> task { do! lane i }) |> ignore
 
     /// Queues one read; the task completes when its batch has been answered.
     member _.Run(read: Read) : Task<Answer> =
@@ -782,11 +935,29 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
     /// time in Reads.
     member _.Timings = queued.Summary(), executed.Summary(), answered.Summary()
 
+    /// p50/p95/p99 per batch of: phase A, the plan between the phases, phase B (split or not),
+    /// the assembly. (A batch of tags and anonymous profiles has phase A and assembly only.)
+    member _.PhaseTimings = phases[0].Summary(), phases[1].Summary(), phases[2].Summary(), phases[3].Summary()
+
     /// Requests queued and not yet taken into a batch.
     member _.Depth = queue.Reader.Count
 
     /// Lanes running a batch right now.
     member _.Busy = Volatile.Read(&busy[0])
+
+    /// Writes the batch log as CSV (unix microseconds; 0 where a batch had no such step) and
+    /// returns how many batches it held.
+    member _.WriteLog(path: string) =
+        let n = min logCapacity (Volatile.Read &logNext[0] + 1)
+        let us (ticks: int64) =
+            if ticks = 0L then 0L else unixAt0 + (ticks - ticksAt0) * 1_000_000L / Diagnostics.Stopwatch.Frequency
+        use w = new IO.StreamWriter(path)
+        w.WriteLine "lane,size,taken_us,phase_a_us,plan_us,phase_b_us,answered_us"
+        for i in 0 .. n - 1 do
+            let at = i * 7
+            w.WriteLine
+                $"{logged[at]},{logged[at + 1]},{us logged[at + 2]},{us logged[at + 3]},{us logged[at + 4]},{us logged[at + 5]},{us logged[at + 6]}"
+        n
 
     /// The longest arrived -> answered since the last call, and resets it.
     member _.Worst() = TimeSpan(Interlocked.Exchange(&worst[0], 0L))

@@ -19,7 +19,12 @@ import challenge.servlet.Request;
 import challenge.servlet.Response;
 
 /**
- * Level-triggered epoll. Each loop owns its listener, sockets and request pool.
+ * epoll; each loop owns its listener, sockets and request pool. Connections
+ * are registered once, edge-triggered for input and output, and never
+ * modified: a busy or deferred connection just remembers that it may have
+ * more to read ({@code readable}). Switching read interest off and on around
+ * every request cost two epoll_ctl calls per request (Hetzner: do_epoll_ctl
+ * alone was 3% of the JVM's CPU). The listener stays level-triggered.
  */
 public final class Loop implements Runnable {
     private static final int MAX_REQUEST = 16 * 1024 * 1024;
@@ -82,6 +87,8 @@ public final class Loop implements Runnable {
         boolean closeAfter;
         boolean dispatching;
         boolean queued;
+        // the socket may hold unread input: set by an input event, cleared by a short or EAGAIN read
+        boolean readable;
         Conn next;
         Exchange exchange;
 
@@ -254,13 +261,16 @@ public final class Loop implements Runnable {
                     close(c);
                     continue;
                 }
-                if ((flags & Sys.EPOLLOUT) != 0) {
+                if ((flags & Sys.EPOLLIN) != 0) {
+                    c.readable = true;
+                }
+                if ((flags & Sys.EPOLLOUT) != 0 && c.output != null) {
                     flush(c);
                     if (!c.closed && !c.busy) {
                         process(c);
                     }
                 }
-                if (!c.closed && !c.busy && (flags & Sys.EPOLLIN) != 0) {
+                if (!c.closed && !c.busy) {
                     read(c);
                 }
                 resume();
@@ -273,7 +283,6 @@ public final class Loop implements Runnable {
             return;
         }
         pending.add(c);
-        ctl(Sys.EPOLL_CTL_MOD, c.fd, 0);
     }
 
     private void resume() {
@@ -295,7 +304,6 @@ public final class Loop implements Runnable {
                     if (inflight >= maxInflight) {
                         defer(c);
                     } else {
-                        ctl(Sys.EPOLL_CTL_MOD, c.fd, Sys.EPOLLIN);
                         read(c);
                     }
                 }
@@ -338,12 +346,12 @@ public final class Loop implements Runnable {
             }
             Conn c = new Conn(fd);
             connections[fd] = c;
-            ctl(Sys.EPOLL_CTL_ADD, fd, Sys.EPOLLIN);
+            ctl(Sys.EPOLL_CTL_ADD, fd, Sys.EPOLLIN | Sys.EPOLLOUT | Sys.EPOLLET);
         }
     }
 
     private void read(Conn c) {
-        while (!c.busy && !c.closed && !c.queued) {
+        while (c.readable && !c.busy && !c.closed && !c.queued) {
             if (inflight >= maxInflight || (!pending.isEmpty() && c != serving)) {
                 defer(c);
                 return;
@@ -357,10 +365,16 @@ public final class Loop implements Runnable {
                 if (sys.errno() == Sys.EINTR) {
                     continue;
                 }
-                if (sys.errno() != Sys.EAGAIN) {
+                if (sys.errno() == Sys.EAGAIN) {
+                    c.readable = false;
+                } else {
                     close(c);
                 }
                 return;
+            }
+            // a short read emptied the socket: anything later raises a new edge
+            if (n < io.byteSize()) {
+                c.readable = false;
             }
             if (c.length + n > MAX_REQUEST) {
                 bad(c);
@@ -423,7 +437,6 @@ public final class Loop implements Runnable {
             }
             c.input = rest;
             c.length = remain;
-            ctl(Sys.EPOLL_CTL_MOD, c.fd, 0);
             ex.conn = c;
             ex.response.finish = ex;
             c.dispatching = true;
@@ -513,6 +526,7 @@ public final class Loop implements Runnable {
                     && !c.busy
                     && c.output == null) {
                 process(c);
+                read(c);
             }
         }
     }
@@ -523,8 +537,6 @@ public final class Loop implements Runnable {
                 close(c);
             } else if (inflight >= maxInflight || !pending.isEmpty()) {
                 defer(c);
-            } else {
-                ctl(Sys.EPOLL_CTL_MOD, c.fd, Sys.EPOLLIN);
             }
             return;
         }
@@ -533,8 +545,8 @@ public final class Loop implements Runnable {
             return;
         }
         if (c.written < c.outputLength) {
+            // the output edge (registered at accept) resumes it
             c.busy = true;
-            ctl(Sys.EPOLL_CTL_MOD, c.fd, Sys.EPOLLOUT);
             return;
         }
         recycleOutput(c.output);
@@ -546,8 +558,6 @@ public final class Loop implements Runnable {
         }
         if (inflight >= maxInflight || !pending.isEmpty()) {
             defer(c);
-        } else {
-            ctl(Sys.EPOLL_CTL_MOD, c.fd, Sys.EPOLLIN);
         }
     }
 
