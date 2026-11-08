@@ -139,8 +139,11 @@ static void deliver(hctx *c, job **g, int n) {
 static void *hasher_main(void *arg) {
   slot_t *slot = arg;
   pthread_setname_np(pthread_self(), "c-hash");
+  // The first hasher runs at SCHED_BATCH nice 10, the rest at SCHED_IDLE: on a box with no idle time logins still get
+  // a share instead of waiting for the 3 s watchdog (the layout of theCatWisel's #201 and amritk's #225).
   const char *pol = getenv("HASH_SCHED");
-  thread_sched(pol ? pol : "idle", 0);
+  bool primary = slot == slots && !pol;
+  thread_sched(pol ? pol : primary ? "batch" : "idle", primary ? 10 : 0);
   hctx *c = calloc(1, sizeof *c);
   job *g[LANES];
   for (;;) {

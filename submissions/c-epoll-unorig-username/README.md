@@ -83,7 +83,11 @@ took Postgres from 59.4 and 58.4 µs per request to 52.8 and 52.7.
 
 ## 3. Longer drain gaps, because the limit is 500 ms
 
-Each lane (feeds, comments, the rest) starts a drain at most every 160 ms. A bigger batch shares more, and p95 has room. At
+Each lane (feeds, comments, list pages, and reads by key: tags, users, profiles, articles by slug) starts a drain at
+most every 160 ms. Reads by key need two exchanges and no list window, so they no longer wait behind the list pages'
+drain: on a local box at the knee, paired runs took p50 from 141 and 152 ms to 117 and 112 and p95 from 223 to 184 at
+the same CPU. Planning reads by key apart from lists is amritk's #225 and theCatWisel's #201; `FAST_LANE=0` merges them
+back into the list lane, and `GAP_FAST_US` sets that lane's gap. A bigger batch shares more, and p95 has room. At
 230k users on the test box, 160 ms against 80 ms took Postgres from 54.9 and 53.9 µs per request to 46.1, and p95 from 184
 and 182 ms to 327 ms. A freed connection goes to the lane whose oldest read has waited longest, with at most 6 drains at
 once. That cap of 6 and the 8 read connections are #168's values.
@@ -100,8 +104,9 @@ the bcrypt threads run only on idle time, and 93% of logins and sign-ups timed o
   against 49.6 ms for one lane, and 14.7 ms for the same five lanes in C. Chosen at startup if the CPU has BMI2, and checked
   against vectors from `golang.org/x/crypto/bcrypt` at every lane count.
 - A hasher waits up to 150 ms for a full set of lanes. Without that, hashes ran one or two lanes at a time.
-- Hashers run at `SCHED_IDLE`. A watchdog at normal priority takes over any batch held up for 3 s, so a saturated box slows
-  logins but never strands them.
+- The first hasher runs at `SCHED_BATCH` nice 10 and the others at `SCHED_IDLE`, so logins keep a small share of a box
+  with no idle time (the layout of #201 and #225). A watchdog at normal priority takes over any batch held up for 3 s,
+  so a saturated box slows logins but never strands them.
 
 ## 5. Scheduling
 
