@@ -1,0 +1,23 @@
+# /etc/systemd/system/conduit-observability.service
+[Unit]
+Description=Conduit Benchmark Observability Dashboard (read-only Netdata API)
+Wants=netdata.service
+After=network.target netdata.service
+
+[Service]
+Type=simple
+User=padlo
+Group=padlo
+WorkingDirectory=/home/padlo/monitoring/conduit-benchmark-dashboard
+ExecStart=/usr/bin/python3 /home/padlo/monitoring/conduit-benchmark-dashboard/server.py --listen 127.0.0.1 --port 18080
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+RestrictAddressFamilies=AF_UNIX AF_INET
+
+[Install]
+WantedBy=multi-user.target
