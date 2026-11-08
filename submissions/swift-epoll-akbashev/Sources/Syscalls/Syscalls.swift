@@ -4,6 +4,8 @@ import Glibc
 
 @_extern(c, "prctl") public func sys_prctl(_ option: Int32, _ a2: UInt, _ a3: UInt, _ a4: UInt, _ a5: UInt) -> Int32
 @_extern(c, "mallopt") public func sys_mallopt(_ param: Int32, _ value: Int32) -> Int32
+@_extern(c, "setpriority") public func sys_setpriority(_ which: Int32, _ who: UInt32, _ prio: Int32) -> Int32
+@_extern(c, "gettid") public func sys_gettid() -> Int32
 @_extern(c, "sched_setscheduler") public func sys_sched_setscheduler(_ pid: Int32, _ policy: Int32, _ param: UnsafeRawPointer) -> Int32
 @_extern(c, "unshare") public func sys_unshare(_ flags: Int32) -> Int32
 @_extern(c, "getrlimit") public func sys_getrlimit(_ resource: Int32, _ rlim: UnsafeMutableRawPointer) -> Int32

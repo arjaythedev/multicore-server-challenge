@@ -37,6 +37,11 @@ enum KernelSource {
 
     static func lanes(_ n: Int, _ body: (Int) -> String) -> [String] { (0..<n).map(body) }
 
+    /// `--sequential`: a half-round's statements lane by lane (each lane's P word and F before the next lane's), so
+    /// one lane's byte indices are dead before the next lane's are made; otherwise every lane's P word, then every
+    /// lane's F.
+    static let sequentialLanes = CommandLine.arguments.contains("--sequential")
+
     static func feistel(_ f: Family) -> [String] {
         ["/// F of lane `k`, its S-boxes read in place.",
          "@inline(__always) private static func blowfishF\(f.suffix)<let m: Int>(_ st: borrowing InlineArray<m, State>, _ k: Int, _ x: UInt32\(f.extraParams)) -> UInt32 {"]
@@ -52,8 +57,13 @@ enum KernelSource {
         for round in 1...16 {
             let (x, y) = round % 2 == 1 ? ("l", "r") : ("r", "l")
             // The P word and F as two statements: in one expression, lending `st` to F while reading it would copy it.
-            out += lanes(n) { "    \(y)\($0) ^= st[\($0)].p[\(round)]" }
-            out += lanes(n) { "    \(y)\($0) ^= blowfishF\(f.suffix)(st, \($0), \(x)\($0)\(f.extraArgs))" }
+            let pWord = { (k: Int) in "    \(y)\(k) ^= st[\(k)].p[\(round)]" }
+            let fOf = { (k: Int) in "    \(y)\(k) ^= blowfishF\(f.suffix)(st, \(k), \(x)\(k)\(f.extraArgs))" }
+            if sequentialLanes {
+                for k in 0..<n { out += [pWord(k), fOf(k)] }
+            } else {
+                out += lanes(n, pWord) + lanes(n, fOf)
+            }
         }
         out += lanes(n) { "    (l\($0), r\($0)) = (r\($0) ^ st[\($0)].p[17], l\($0))" }
         out.append("}")

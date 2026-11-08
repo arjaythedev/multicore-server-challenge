@@ -22,6 +22,7 @@ enum Sys {
     static let SO_REUSEPORT: Int32 = 15
     static let IPPROTO_TCP: Int32 = 6
     static let TCP_NODELAY: Int32 = 1
+    static let TCP_QUICKACK: Int32 = 12
     static let IPPROTO_IPV6: Int32 = 41
     static let IPV6_V6ONLY: Int32 = 26
     static let EPOLL_CLOEXEC: Int32 = 0o2000000
@@ -155,6 +156,11 @@ extension Sys {
         _ = setIntOption(fd, IPPROTO_TCP, TCP_NODELAY, 1)
     }
 
+    /// TCP_QUICKACK on a connected socket: acknowledge at once rather than after the delayed-ACK timer.
+    @inline(__always) static func setQuickAck(_ fd: Int32) {
+        _ = setIntOption(fd, IPPROTO_TCP, TCP_QUICKACK, 1)
+    }
+
     /// Writes all of `bytes` to a blocking descriptor.
     static func writeAll(_ fd: Int32, _ bytes: UnsafeRawBufferPointer) throws(SystemError) {
         var off = 0
@@ -177,20 +183,24 @@ extension Sys {
     /// A thread's body on its way through pthread_create.
     private final class ThreadStart: Sendable {
         let name: String
+        let nice: Int32
         let body: @Sendable () -> Void
-        init(name: String, body: @escaping @Sendable () -> Void) {
+        init(name: String, nice: Int32, body: @escaping @Sendable () -> Void) {
             self.name = name
+            self.nice = nice
             self.body = body
         }
     }
 
     /// Starts a detached thread named `name` running `body`.
-    static func startThread(name: String, _ body: @escaping @Sendable () -> Void) {
-        let start = Unmanaged.passRetained(ThreadStart(name: name, body: body)).toOpaque()
+    /// A thread running `body`, at `nice` (only this thread: on Linux a thread is a task of its own to setpriority).
+    static func startThread(name: String, nice: Int32 = 0, _ body: @escaping @Sendable () -> Void) {
+        let start = Unmanaged.passRetained(ThreadStart(name: name, nice: nice, body: body)).toOpaque()
         var thread = pthread_t()
         let rc = pthread_create(&thread, nil, { raw in
             let start = Unmanaged<ThreadStart>.fromOpaque(raw!).takeRetainedValue()
             _ = sys_pthread_setname_np(pthread_self(), String(start.name.prefix(15)))
+            if start.nice != 0 { _ = sys_setpriority(0, UInt32(bitPattern: sys_gettid()), start.nice) }
             start.body()
             return nil
         }, start)

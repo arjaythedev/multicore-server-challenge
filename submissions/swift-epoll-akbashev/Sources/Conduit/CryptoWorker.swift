@@ -9,6 +9,8 @@ actor CryptoWorker {
 
     private let scheduler: Scheduler
     private let reactors: [Reactor]
+    /// Replies sorted by reactor for a delivery, kept from one to the next.
+    private var buckets: [[OutgoingReply]] = []
     private let signer: TokenSigner
     private let kernel: Bcrypt.Kernel
 
@@ -21,34 +23,31 @@ actor CryptoWorker {
     }
 
     func run() async {
-        await withDiscardingTaskGroup { group in
-            var finished: Scheduler.CryptoBatchDone?
-            while true {
-                let batch = await scheduler.nextCrypto(finished: finished)
-                let t0 = Sys.monotonicNanos()
-                var standard: [CryptoTask] = []
-                var other: [CryptoTask] = []
-                for t in batch {
-                    if Self.storedCost(t) == 10 { standard.append(t) } else { other.append(t) }
-                }
-                var replies: [OutgoingReply] = []
-                var writes: [WriteTask] = []
-                execute(standard, cost: 10, &replies, &writes)
-                finished = Scheduler.CryptoBatchDone(standardUs: standard.isEmpty ? nil : Int((Sys.monotonicNanos() - t0) / 1000))
-                for t in other {
-                    if let cost = Self.storedCost(t) {
-                        execute([t], cost: cost, &replies, &writes)
-                    } else if case .verifyLogin(_, _, _, let addr) = t {
-                        replies.append(OutgoingReply.error(addr, 401, "invalid credentials"))
-                    }
-                }
-                if !writes.isEmpty {
-                    let scheduler = scheduler
-                    let work = Submission(writesFront: writes)
-                    group.addTask(executorPreference: scheduler.loop) { await scheduler.submit(work) }
-                }
-                OutgoingReply.deliver(replies, to: reactors, &group)
+        var finished: Scheduler.CryptoBatchDone?
+        while true {
+            let batch = await scheduler.nextCrypto(finished: finished)
+            let t0 = Sys.monotonicNanos()
+            var standard: [CryptoTask] = []
+            var other: [CryptoTask] = []
+            for t in batch {
+                if Self.storedCost(t) == 10 { standard.append(t) } else { other.append(t) }
             }
+            var replies: [OutgoingReply] = []
+            var writes: [WriteTask] = []
+            execute(standard, cost: 10, &replies, &writes)
+            finished = Scheduler.CryptoBatchDone(standardUs: standard.isEmpty ? nil : Int((Sys.monotonicNanos() - t0) / 1000))
+            for t in other {
+                if let cost = Self.storedCost(t) {
+                    execute([t], cost: cost, &replies, &writes)
+                } else if case .verifyLogin(_, _, _, let addr) = t {
+                    replies.append(OutgoingReply.error(addr, 401, "invalid credentials"))
+                }
+            }
+            if !writes.isEmpty { await scheduler.submit(Submission(writesFront: writes)) }
+            var b: [[OutgoingReply]] = []
+            swap(&b, &buckets)
+            await OutgoingReply.deliver(replies, to: reactors, buckets: &b)
+            swap(&b, &buckets)
         }
     }
 

@@ -159,3 +159,49 @@ struct UniqueArray<Element: ~Copyable>: ~Copyable {
         capacity = next
     }
 }
+
+/// A short byte string held in place (the Rust's 64-byte `SmallStr`): a read's key, a slug, username, email or tag of
+/// up to 56 bytes, costs no allocation, and compares and hashes as seven words. A longer one lives on the heap.
+struct SmallBytes: Hashable, Sendable {
+    static let inlineCapacity = 56
+    /// The bytes, zero-padded, when they fit.
+    private var words = InlineArray<7, UInt64>(repeating: 0)
+    let count: Int
+    private let heap: [UInt8]?
+
+    init(_ bytes: Span<UInt8>) {
+        count = bytes.count
+        if bytes.count <= Self.inlineCapacity {
+            heap = nil
+            withUnsafeMutableBytes(of: &words) { dst in bytes.withUnsafeBytes { dst.copyMemory(from: $0) } }
+        } else {
+            heap = bytes.withUnsafeBufferPointer { Array($0) }
+        }
+    }
+
+    var isEmpty: Bool { count == 0 }
+
+    @inline(__always) func withSpan<R>(_ body: (Span<UInt8>) throws -> R) rethrows -> R {
+        if let heap { return try body(heap.span) }
+        return try withUnsafeBytes(of: words) { raw in
+            try body(Span(_unsafeElements: UnsafeBufferPointer(start: raw.baseAddress!.assumingMemoryBound(to: UInt8.self),
+                                                              count: count)))
+        }
+    }
+
+    static func == (a: SmallBytes, b: SmallBytes) -> Bool {
+        guard a.count == b.count else { return false }
+        if a.heap != nil || b.heap != nil { return a.heap == b.heap }
+        for i in 0..<7 where a.words[i] != b.words[i] { return false }
+        return true
+    }
+
+    func hash(into hasher: inout Hasher) {
+        if let heap {
+            hasher.combine(heap)
+        } else {
+            hasher.combine(count)
+            for i in 0..<7 { hasher.combine(words[i]) }
+        }
+    }
+}

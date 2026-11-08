@@ -41,19 +41,22 @@ extension OutgoingReply {
         OutgoingReply(addr: addr, status: status, error: message)
     }
 
-    /// Sends each reactor its share of `replies`: one message per reactor, a child task starting on its loop.
-    static func deliver(_ replies: [OutgoingReply], to reactors: [Reactor], _ group: inout DiscardingTaskGroup) {
+    /// Sends each reactor its share of `replies`: one call per reactor, which the caller's task makes on that
+    /// reactor's loop, one after another, lending `bodies` (where the `.slice` bodies are) for each. Once the calls
+    /// are back no reactor holds `bodies` or a bucket any more, so the caller writes into them again in place.
+    /// `buckets` is the caller's, one per reactor, kept from one delivery to the next.
+    static func deliver(_ replies: borrowing [OutgoingReply], to reactors: [Reactor], bodies: borrowing [UInt8] = [],
+                        buckets: inout [[OutgoingReply]]) async {
         guard !replies.isEmpty else { return }
         if reactors.count == 1 || replies.allSatisfy({ $0.addr.worker == replies[0].addr.worker }) {
-            let reactor = reactors[Int(replies[0].addr.worker)]
-            group.addTask(executorPreference: reactor.loop) { await reactor.deliver(replies) }
+            await reactors[Int(replies[0].addr.worker)].deliver(replies, bodies: bodies)
             return
         }
-        var buckets = [[OutgoingReply]](repeating: [], count: reactors.count)
-        for r in replies { buckets[Int(r.addr.worker)].append(r) }
-        for (i, bucket) in buckets.enumerated() where !bucket.isEmpty {
-            let reactor = reactors[i]
-            group.addTask(executorPreference: reactor.loop) { await reactor.deliver(bucket) }
+        if buckets.count != reactors.count { buckets = [[OutgoingReply]](repeating: [], count: reactors.count) }
+        for i in replies.indices { buckets[Int(replies[i].addr.worker)].append(replies[i]) }
+        for i in buckets.indices where !buckets[i].isEmpty {
+            await reactors[i].deliver(buckets[i], bodies: bodies)
+            buckets[i].removeAll(keepingCapacity: true)
         }
     }
 }
@@ -70,13 +73,28 @@ actor ReadLane {
     private var pa = PipelineBuf()
     private var pb = PipelineBuf()
     private var arena = ByteBuffer(capacity: 128 * 1024)
+    /// The batch's response bodies, which its replies point into; lent to the reactors with each delivery.
+    private var out = ByteBuffer(capacity: 256 * 1024)
+    /// Replies sorted by reactor for a delivery, kept from one to the next.
+    private var buckets: [[OutgoingReply]] = []
     private var tagLut: [Cell] = []
     private var kUid = KeySet<Int64>()
     private var kUemail = BytesKeySet()
-    private var kProf = BytesKeySet()
+    private var kProf = KeySet<ProfileKey>()
     private var kSlug = BytesKeySet()
     private var kAid = KeySet<Int64>()
     private var kCmts = BytesKeySet()
+    /// The signed-in readers of each comment thread (viewer, the thread's 1-based ordinal): the statement returns which
+    /// of the thread's authors each of them follows.
+    private var kCmtViewers = KeySet<PairKey>()
+    /// A batch's threads as phase A2 returned them: each thread's comment rows, whether its article exists, every
+    /// author's row once, the follows of each reader among them, and each thread's comments rendered into the arena.
+    private var cmtThreads: [[RowSpan]] = []
+    private var cmtFound: [Bool] = []
+    private var cmtAuthors = KeySet<Int64>()
+    private var cmtAuthorRows: [RowSpan] = []
+    private var cmtFollows: [Pair] = []
+    private var cmtSlices: [CachedCommentSlice] = []
     private var kGlobal = KeySet<PairKey>()
     private var kFilterCounts = [BytesKeySet(), BytesKeySet(), BytesKeySet()]
     private var kFilterPages = [KeySet<PageKey>(), KeySet<PageKey>(), KeySet<PageKey>()]
@@ -101,13 +119,18 @@ actor ReadLane {
     private var follTargets: [Int64] = []
     private var follStarts: [Int32] = []
     private var follEnds: [Int32] = []
-    private var favHits: [Pair] = []
-    private var follHits: [Pair] = []
-    private var favViewerMask: UInt64 = 0
-    private var follViewerMask: UInt64 = 0
+    /// Phase B's favorites and follows as packed (viewer, target) pairs, sorted, behind bit filters: 512 bits over the
+    /// viewers with any of them and 2,048 over each kind's pairs, so most lookups end at one bit.
+    private var favHits: [UInt64] = []
+    private var follHits: [UInt64] = []
+    private var flaggedViewers = InlineArray<8, UInt64>(repeating: 0)
+    private var favPairBits = InlineArray<32, UInt64>(repeating: 0)
+    private var follPairBits = InlineArray<32, UInt64>(repeating: 0)
     private var cachedArts: [CachedArticleSlices] = []
     private var feedDepths: [Int64] = []
     private var tagSortBuf: [Cell] = []
+    /// Keys sorted for binding, kept from one batch to the next.
+    private var sortedKeys: [Int64] = []
 
     init(loop: EventLoop, db: DbEndpoint, scheduler: Scheduler, reactors: [Reactor]) {
         self.loop = loop
@@ -125,24 +148,48 @@ actor ReadLane {
     }
 
     func run() async {
-        await withDiscardingTaskGroup { group in
-            var finished: Scheduler.ReadBatchDone?
-            while true {
-                let tasks = await scheduler.nextReads(finished: finished)
-                let t0 = Sys.monotonicNanos()
-                var replies: [OutgoingReply] = []
-                replies.reserveCapacity(tasks.count)
-                do {
-                    try executeBatch(tasks, &replies, &group)
-                } catch {
-                    Sys.logLine("read batch error: \(error)")
-                    conn = nil
-                    replies = errorAddrs.map { OutgoingReply.error($0, 500, "internal server error") }
-                }
-                finished = Scheduler.ReadBatchDone(count: tasks.count, elapsedUs: Int((Sys.monotonicNanos() - t0) / 1000))
-                OutgoingReply.deliver(replies, to: reactors, &group)
+        var finished: Scheduler.ReadBatchDone?
+        while true {
+            let batch = await scheduler.nextReads(finished: finished)
+            let tasks = batch.tasks
+            let t0 = Sys.monotonicNanos()
+            out.removeAll()
+            var replies: [OutgoingReply] = []
+            replies.reserveCapacity(tasks.count)
+            do {
+                try await executeBatch(tasks, &replies)
+            } catch {
+                Sys.logLine("read batch error: \(error)")
+                conn = nil
+                replies = errorAddrs.map { OutgoingReply.error($0, 500, "internal server error") }
             }
+            finished = Scheduler.ReadBatchDone(queue: batch.queue, count: tasks.count, elapsedUs: Int((Sys.monotonicNanos() - t0) / 1000))
+            await send(replies)
         }
+    }
+
+    /// `replies` to their reactors, the batch's bodies lent along.
+    private func send(_ replies: borrowing [OutgoingReply]) async {
+        var b: [[OutgoingReply]] = []
+        swap(&b, &buckets)
+        await OutgoingReply.deliver(replies, to: reactors, bodies: out.bytes, buckets: &b)
+        swap(&b, &buckets)
+    }
+
+    /// `keys` in ascending order, in `sortedKeys` (valid until the next call; binding copies it into the send buffer).
+    private func sortedCopy(_ keys: [Int64]) -> [Int64] {
+        sortedKeys.removeAll(keepingCapacity: true)
+        sortedKeys.append(contentsOf: keys)
+        sortedKeys.sort()
+        return sortedKeys
+    }
+
+    /// Where the next body written into `out` starts.
+    private var mark: Int32 { Int32(out.count) }
+
+    /// The reply for the body written into `out` since `start`.
+    private func reply(_ addr: ReplyAddr, _ start: Int32) -> OutgoingReply {
+        OutgoingReply(addr: addr, status: 200, slice: start..<mark)
     }
 
     // ---------- the batch ----------
@@ -159,16 +206,16 @@ actor ReadLane {
         return ArticleRef(aid: aid, author: author, artOrd: ord, row: row)
     }
 
-    /// Rows of statement `res` grouped by their ordinal column (1-based), as indices into its rows.
-    private func groupRowsByOrdinal(_ res: Int?, _ keys: Int) -> [[Int]] {
-        guard let res else { return [] }
-        var grouped = [[Int]](repeating: [], count: keys)
-        let range = pa.resultRows(res)
-        for ri in range {
-            let ord = pa.i64(pa.rows[ri], 0)
-            if ord >= 1 && ord <= Int64(keys) { grouped[Int(ord) - 1].append(ri - range.lowerBound) }
+    /// Each key's row of statement `res`, matched by its first column, the key's 1-based ordinal (`WITH ORDINALITY`).
+    private func rowsByOrdinal(_ res: Int?, _ keys: Int) -> [RowSpan?] {
+        var out = [RowSpan?](repeating: nil, count: keys)
+        guard let res else { return out }
+        for ri in pa.resultRows(res) {
+            let r = pa.rows[ri]
+            let ord = pa.i64(r, 0)
+            if ord >= 1 && ord <= Int64(keys) { out[Int(ord) - 1] = r }
         }
-        return grouped
+        return out
     }
 
     /// Each key's row of statement `res`, matched by the id in `column` (`map_rows_by_i64_into`).
@@ -220,8 +267,7 @@ actor ReadLane {
         return (counts, pages)
     }
 
-    private func executeBatch(_ tasks: [ReadTask], _ replies: inout [OutgoingReply],
-                              _ group: inout DiscardingTaskGroup) throws(PgError) {
+    private func executeBatch(_ tasks: [ReadTask], _ replies: inout [OutgoingReply]) async throws(PgError) {
         errorAddrs = tasks.map(\.addr)
         var needTagsEndpoint = false
         kUid.clear()
@@ -230,6 +276,7 @@ actor ReadLane {
         kSlug.clear()
         kAid.clear()
         kCmts.clear()
+        kCmtViewers.clear()
         kGlobal.clear()
         for i in 0..<3 {
             kFilterCounts[i].clear()
@@ -247,10 +294,13 @@ actor ReadLane {
                 slot = .tags
             case .currentUser(let id, _): slot = .user(kUid.intern(id))
             case .login(let email, _): slot = .login(kUemail.intern(email))
-            case .profile(let username): slot = .profile(kProf.intern(username))
+            case .profile(let username): slot = .profile(kProf.intern(ProfileKey(viewer: t.viewer, username: username)))
             case .articleBySlug(let slug): slot = .bySlug(kSlug.intern(slug))
             case .articleById(let id, let knownFav): slot = .byId(kAid.intern(id), knownFav: knownFav)
-            case .comments(let slug): slot = .comments(kCmts.intern(slug))
+            case .comments(let slug):
+                let k = kCmts.intern(slug)
+                if t.viewer != 0 { _ = kCmtViewers.intern(PairKey(a: t.viewer, b: Int64(k) + 1)) }
+                slot = .comments(k)
             case .global(let lim, let off): slot = .global(kGlobal.intern(PairKey(a: lim, b: off)))
             case .byTag(let key, let lim, let off), .byAuthor(let key, let lim, let off), .byFavorited(let key, let lim, let off):
                 let kind: Int
@@ -290,13 +340,17 @@ actor ReadLane {
         let stGlobal = alloc(kGlobal.count > 0)
         let stFilters = (0..<3).map { alloc(kFilterPages[$0].count > 0) }
         let stFeed = alloc(kFeedCnt.count > 0)
-        let nA1 = [stTags, stUid, stUemail].count { $0 != nil }
+        let nA1 = [stTags, stUid, stUemail, stProf].count { $0 != nil }
         let nA2 = nA - nA1
 
         if nA1 > 0 {
             if stTags != nil { conn!.tx.bindAndExec("tags", []) }
             if stUid != nil { conn!.tx.bindAndExec("uid", [.i64Array(kUid.items)]) }
-            if stUemail != nil { conn!.tx.bindAndExec("uemail", [.textArray(kUemail.items)]) }
+            if stUemail != nil { conn!.tx.bindAndExec("uemail", [.keyArray(kUemail.items)]) }
+            // A profile carries its viewer's `following` (one EXISTS per profile asked for), so it needs no phase B.
+            if stProf != nil {
+                conn!.tx.bindAndExec("prof", [.i64Array(kProf.items.map(\.viewer)), .keyArray(kProf.items.map(\.username))])
+            }
             conn!.tx.writeSync()
         }
         var globalWinMax: Int64 = 0
@@ -310,10 +364,12 @@ actor ReadLane {
             globalWinMax = max(globalWinMax, end.partialValue)
         }
         if nA2 > 0 {
-            if stProf != nil { conn!.tx.bindAndExec("prof", [.textArray(kProf.items)]) }
-            if stSlug != nil { conn!.tx.bindAndExec("aslug", [.textArray(kSlug.items)]) }
+            if stSlug != nil { conn!.tx.bindAndExec("aslug", [.keyArray(kSlug.items)]) }
             if stAid != nil { conn!.tx.bindAndExec("aid", [.i64Array(kAid.items)]) }
-            if stCmts != nil { conn!.tx.bindAndExec("cmts", [.textArray(kCmts.items)]) }
+            if stCmts != nil {
+                conn!.tx.bindAndExec("cmts", [.keyArray(kCmts.items), .i64Array(kCmtViewers.items.map(\.a)),
+                                              .i64Array(kCmtViewers.items.map(\.b))])
+            }
             if stGlobal != nil {
                 if useGlobalWin {
                     conn!.tx.bindAndExec("global_win", [.i64(max(globalWinMax, 1))])
@@ -324,7 +380,7 @@ actor ReadLane {
             for i in 0..<3 where stFilters[i] != nil {
                 let pages = kFilterPages[i].items
                 conn!.tx.bindAndExec(Self.filterStatementNames[i], [
-                    .textArray(kFilterCounts[i].items),
+                    .keyArray(kFilterCounts[i].items),
                     .i64Array(pages.map { Int64($0.c) + 1 }), .i64Array(pages.map(\.lim)), .i64Array(pages.map(\.off)),
                 ])
             }
@@ -366,13 +422,14 @@ actor ReadLane {
                     if tid >= 0 { tagLut[tid] = pa.cell(r, 1) }
                 }
             }
-            answerPhaseA1(tasks, stTags: stTags, stUid: stUid, stUemail: stUemail, &group)
+            await answerPhaseA1(tasks, stTags: stTags, stUid: stUid, stUemail: stUemail, stProf: stProf)
             errorAddrs = zip(tasks, plan).filter { !$0.1.answeredByPhaseA1 }.map(\.0.addr)
             if nA2 == 0 { return }
         }
         if nA2 > 0 {
             try conn!.readPipeline(appendingTo: &pa, expected: nA2)
             if let failed = pa.results[nA1...].first(where: { $0.error != nil }) { throw .wire("phase A2 error: \(failed.error!)") }
+            if let s = stCmts { await answerComments(tasks, s) }
         }
 
         distinctArts.clear()
@@ -380,8 +437,6 @@ actor ReadLane {
         artAuthorOrds.removeAll(keepingCapacity: true)
         artMeta.removeAll(keepingCapacity: true)
 
-        let profRows = mapRows(stProf, kProf, column: 1)
-        let grpCmts = groupRowsByOrdinal(stCmts, kCmts.count)
 
         var slugRows = [ArticleRef?](repeating: nil, count: kSlug.count)
         if let s = stSlug {
@@ -420,13 +475,6 @@ actor ReadLane {
             unpackList(stFilters[$0], kFilterCounts[$0].count, kFilterPages[$0].count, hasMeta: true)
         }
         let (feedCounts, feedPages) = unpackList(stFeed, kFeedCnt.count, kFeedPage.count, hasMeta: false)
-        // Comment authors join the article authors in phase B's `artau`.
-        if let s = stCmts {
-            for ri in pa.resultRows(s) {
-                let r = pa.rows[ri]
-                if !pa.cell(r, 1).isNull && !pa.cell(r, 5).isNull { _ = distinctAuthors.intern(pa.i64(r, 5)) }
-            }
-        }
         metaRequestIDs.removeAll(keepingCapacity: true)
         for (k, meta) in artMeta.enumerated() where meta.isNone { metaRequestIDs.append(distinctArts.items[k]) }
 
@@ -464,17 +512,7 @@ actor ReadLane {
                 }
             case .feed(_, let p):
                 for art in feedPages[Int(p)] { favPairs.append(Pair(v: v, t: art.aid)) }
-            case .comments(let k):
-                if let s = stCmts {
-                    let base = pa.resultRows(s).lowerBound
-                    for ri in grpCmts[Int(k)] {
-                        let r = pa.rows[base + ri]
-                        if !pa.cell(r, 1).isNull && !pa.cell(r, 5).isNull { follPairs.append(Pair(v: v, t: pa.i64(r, 5))) }
-                    }
-                }
-            case .profile(let k):
-                if let r = profRows[Int(k)] { follPairs.append(Pair(v: v, t: pa.i64(r, 0))) }
-            case .tags, .user, .login:
+            case .tags, .user, .login, .profile, .comments:
                 break
             }
         }
@@ -492,9 +530,10 @@ actor ReadLane {
         let bArtau = allocB(distinctAuthors.count > 0)
         let bFlags = allocB(!favViewers.isEmpty || !follViewers.isEmpty)
         if nB > 0 {
-            if bArtmeta != nil { conn!.tx.bindAndExec("artmeta", [.i64Array(metaRequestIDs)]) }
-            if bArtx != nil { conn!.tx.bindAndExec("artx", [.i64Array(distinctArts.items)]) }
-            if bArtau != nil { conn!.tx.bindAndExec("artau", [.i64Array(distinctAuthors.items)]) }
+            // Keys bound in ascending order, so each statement walks its indexes forward; rows are matched back by id.
+            if bArtmeta != nil { conn!.tx.bindAndExec("artmeta", [.i64Array(sortedCopy(metaRequestIDs))]) }
+            if bArtx != nil { conn!.tx.bindAndExec("artx", [.i64Array(sortedCopy(distinctArts.items))]) }
+            if bArtau != nil { conn!.tx.bindAndExec("artau", [.i64Array(sortedCopy(distinctAuthors.items))]) }
             if bFlags != nil {
                 conn!.tx.bindAndExec("flags", [
                     .i64Array(favViewers), .i64Array(favTargets), .i32Array(favStarts), .i32Array(favEnds),
@@ -512,11 +551,9 @@ actor ReadLane {
         arena.removeAll()
         favHits.removeAll(keepingCapacity: true)
         follHits.removeAll(keepingCapacity: true)
-        favViewerMask = 0
-        follViewerMask = 0
-
-        var renderedProfiles = [[UInt8]?](repeating: nil, count: kProf.count)
-        if stProf != nil { answerAnonymousProfiles(tasks, profRows, &renderedProfiles, &group) }
+        flaggedViewers = InlineArray(repeating: 0)
+        favPairBits = InlineArray(repeating: 0)
+        follPairBits = InlineArray(repeating: 0)
 
         if nB > 0 {
             try conn!.readPipeline(into: &pb, expected: nB)
@@ -538,12 +575,16 @@ actor ReadLane {
                 for ri in pb.resultRows(s) {
                     let r = pb.rows[ri]
                     let kind = pb.i64(r, 0), viewer = pb.i64(r, 1), target = pb.i64(r, 2)
+                    let packed = Self.packPair(viewer, target)
+                    let (w, bit) = Self.viewerBitPosition(viewer)
+                    flaggedViewers[w] |= bit
+                    let (pw, pbit) = Self.pairBitPosition(packed)
                     if kind == 0 {
-                        favViewerMask |= Self.viewerBit(viewer)
-                        favHits.append(Pair(v: viewer, t: target))
+                        favPairBits[pw] |= pbit
+                        favHits.append(packed)
                     } else {
-                        follViewerMask |= Self.viewerBit(viewer)
-                        follHits.append(Pair(v: viewer, t: target))
+                        follPairBits[pw] |= pbit
+                        follHits.append(packed)
                     }
                 }
                 favHits.sort()
@@ -551,38 +592,16 @@ actor ReadLane {
             }
         }
 
-        let cachedComments = stCmts.map { renderCommentFragments($0, grpCmts) } ?? []
-
-        var renderedSlugs = [[UInt8]?](repeating: nil, count: kSlug.count)
-        var renderedComments = [[UInt8]?](repeating: nil, count: kCmts.count)
-        var renderedGlobal = [[UInt8]?](repeating: nil, count: globalPages.count)
-        var renderedFilters = filterResults.map { [[UInt8]?](repeating: nil, count: $0.1.count) }
+        var renderedSlugs = [Range<Int32>?](repeating: nil, count: kSlug.count)
+        var renderedGlobal = [Range<Int32>?](repeating: nil, count: globalPages.count)
+        var renderedFilters = filterResults.map { [Range<Int32>?](repeating: nil, count: $0.1.count) }
 
         for (task, slot) in zip(tasks, plan) {
             let viewer = task.viewer
             let addr = task.addr
             switch slot {
-            case .tags, .user, .login:
+            case .tags, .user, .login, .profile, .comments:
                 break
-            case .profile(let k):
-                if viewer == 0 { continue }
-                guard let r = profRows[Int(k)] else {
-                    replies.append(OutgoingReply.error(addr, 404, "profile not found"))
-                    continue
-                }
-                let following = isFollowing(viewer, pa.i64(r, 0))
-                if !following, let shared = renderedProfiles[Int(k)] {
-                    replies.append(OutgoingReply(addr: addr, status: 200, body: shared))
-                    continue
-                }
-                var body = ByteBuffer(capacity: 256)
-                body.append("{\"profile\":")
-                JSON.writeProfile(&body, username: pa.text(pa.cell(r, 1)), bio: pa.bytes(pa.cell(r, 2)),
-                                  image: pa.bytes(pa.cell(r, 3)), following: following)
-                body.append(0x7D)
-                let bytes = body.take()
-                if !following { renderedProfiles[Int(k)] = bytes }
-                replies.append(OutgoingReply(addr: addr, status: 200, body: bytes))
             case .bySlug(let k):
                 guard let art = slugRows[Int(k)] else {
                     replies.append(OutgoingReply.error(addr, 404, "article not found"))
@@ -590,17 +609,17 @@ actor ReadLane {
                 }
                 let unflagged = isArticleUnflagged(art, viewer)
                 if unflagged, let shared = renderedSlugs[Int(k)] {
-                    replies.append(OutgoingReply(addr: addr, status: 200, body: shared))
+                    replies.append(OutgoingReply(addr: addr, status: 200, slice: shared))
                     continue
                 }
-                var body = ByteBuffer(capacity: 2048)
-                body.append("{\"article\":")
-                if writeArticle(&body, art, includeBody: true, viewer: viewer, knownFollowing: false, knownFav: nil) {
-                    body.append(0x7D)
-                    let bytes = body.take()
-                    if unflagged { renderedSlugs[Int(k)] = bytes }
-                    replies.append(OutgoingReply(addr: addr, status: 200, body: bytes))
+                let start = mark
+                out.append("{\"article\":")
+                if writeArticle(&out, art, includeBody: true, viewer: viewer, knownFollowing: false, knownFav: nil) {
+                    out.append(0x7D)
+                    if unflagged { renderedSlugs[Int(k)] = start..<mark }
+                    replies.append(reply(addr, start))
                 } else {
+                    out.truncate(Int(start))
                     replies.append(OutgoingReply.error(addr, 404, "article not found"))
                 }
             case .byId(let k, let knownFav):
@@ -608,35 +627,15 @@ actor ReadLane {
                     replies.append(OutgoingReply.error(addr, 404, "article not found"))
                     continue
                 }
-                var body = ByteBuffer(capacity: 2048)
-                body.append("{\"article\":")
-                if writeArticle(&body, art, includeBody: true, viewer: viewer, knownFollowing: false, knownFav: knownFav) {
-                    body.append(0x7D)
-                    replies.append(OutgoingReply(addr: addr, status: 200, body: body.take()))
+                let start = mark
+                out.append("{\"article\":")
+                if writeArticle(&out, art, includeBody: true, viewer: viewer, knownFollowing: false, knownFav: knownFav) {
+                    out.append(0x7D)
+                    replies.append(reply(addr, start))
                 } else {
+                    out.truncate(Int(start))
                     replies.append(OutgoingReply.error(addr, 404, "article not found"))
                 }
-            case .comments(let k):
-                guard let list = cachedComments[Int(k)] else {
-                    replies.append(OutgoingReply.error(addr, 404, "article not found"))
-                    continue
-                }
-                let unflagged = viewer == 0 || list.allSatisfy { !isFollowing(viewer, $0.authorID) }
-                if unflagged, let shared = renderedComments[Int(k)] {
-                    replies.append(OutgoingReply(addr: addr, status: 200, body: shared))
-                    continue
-                }
-                var body = ByteBuffer(capacity: 64 + 320 * list.count)
-                body.append("{\"comments\":[")
-                for (i, c) in list.enumerated() {
-                    if i > 0 { body.append(0x2C) }
-                    body.append(arena, Int(c.start)..<Int(c.end))
-                    body.append(!unflagged && isFollowing(viewer, c.authorID) ? "true}}" : "false}}")
-                }
-                body.append("]}")
-                let bytes = body.take()
-                if unflagged { renderedComments[Int(k)] = bytes }
-                replies.append(OutgoingReply(addr: addr, status: 200, body: bytes))
             case .global, .filtered, .feed:
                 let rows: [ArticleRef]
                 let total: Int64
@@ -649,73 +648,88 @@ actor ReadLane {
                 }
                 let unflagged = !isFeed && (viewer == 0 || rows.allSatisfy { isArticleUnflagged($0, viewer) })
                 if unflagged {
-                    var cached: [UInt8]?
+                    var cached: Range<Int32>?
                     if case .global(let p) = slot { cached = renderedGlobal[Int(p)] }
                     if case .filtered(let kind, _, let p) = slot { cached = renderedFilters[kind][Int(p)] }
                     if let cached {
-                        replies.append(OutgoingReply(addr: addr, status: 200, body: cached))
+                        replies.append(OutgoingReply(addr: addr, status: 200, slice: cached))
                         continue
                     }
                 }
-                var body = ByteBuffer(capacity: 512 + 700 * rows.count)
-                body.append("{\"articles\":[")
+                let start = mark
+                out.append("{\"articles\":[")
                 var first = true
                 for art in rows {
-                    let mark = body.count
-                    if !first { body.append(0x2C) }
-                    if writeArticle(&body, art, includeBody: false, viewer: unflagged ? 0 : viewer, knownFollowing: isFeed,
+                    let articleStart = out.count
+                    if !first { out.append(0x2C) }
+                    if writeArticle(&out, art, includeBody: false, viewer: unflagged ? 0 : viewer, knownFollowing: isFeed,
                                     knownFav: nil) {
                         first = false
                     } else {
-                        body.truncate(mark)
+                        out.truncate(articleStart)
                     }
                 }
-                body.append("],\"articlesCount\":")
-                JSON.writeInt(&body, total)
-                body.append(0x7D)
-                let bytes = body.take()
+                out.append("],\"articlesCount\":")
+                JSON.writeInt(&out, total)
+                out.append(0x7D)
                 if unflagged {
-                    if case .global(let p) = slot { renderedGlobal[Int(p)] = bytes }
-                    if case .filtered(let kind, _, let p) = slot { renderedFilters[kind][Int(p)] = bytes }
+                    if case .global(let p) = slot { renderedGlobal[Int(p)] = start..<mark }
+                    if case .filtered(let kind, _, let p) = slot { renderedFilters[kind][Int(p)] = start..<mark }
                 }
-                replies.append(OutgoingReply(addr: addr, status: 200, body: bytes))
+                replies.append(reply(addr, start))
             }
         }
     }
 
     /// Phase A1's replies, sent at once: tags, the current user, and logins whose email has no user; the others go to
     /// the bcrypt workers.
-    private func answerPhaseA1(_ tasks: [ReadTask], stTags: Int?, stUid: Int?, stUemail: Int?,
-                               _ group: inout DiscardingTaskGroup) {
+    private func answerPhaseA1(_ tasks: [ReadTask], stTags: Int?, stUid: Int?, stUemail: Int?, stProf: Int?) async {
         let uidRows = mapRows(stUid, kUid, column: 0)
         let uemailRows = mapRows(stUemail, kUemail, column: 2)
+        let profRows = rowsByOrdinal(stProf, kProf.count)
+        var renderedProfiles = [Range<Int32>?](repeating: nil, count: kProf.count)
         var early: [OutgoingReply] = []
         var logins: [CryptoTask] = []
-        var renderedTags: [UInt8]?
+        var renderedTags: Range<Int32>?
         for (task, slot) in zip(tasks, plan) {
             switch slot {
             case .tags:
                 if renderedTags == nil, let s = stTags {
-                    var buf = ByteBuffer(capacity: 4096)
-                    buf.append("{\"tags\":[")
+                    let start = mark
+                    out.append("{\"tags\":[")
                     for (i, ri) in pa.resultRows(s).enumerated() {
-                        if i > 0 { buf.append(0x2C) }
-                        JSON.writeString(&buf, pa.text(pa.cell(pa.rows[ri], 1)))
+                        if i > 0 { out.append(0x2C) }
+                        JSON.writeString(&out, pa.text(pa.cell(pa.rows[ri], 1)))
                     }
-                    buf.append("]}")
-                    renderedTags = buf.take()
+                    out.append("]}")
+                    renderedTags = start..<mark
                 }
-                early.append(OutgoingReply(addr: task.addr, status: 200, body: renderedTags ?? []))
+                early.append(OutgoingReply(addr: task.addr, status: 200, slice: renderedTags ?? mark..<mark))
             case .user(let k):
                 guard case .currentUser(_, let token) = task.op else { continue }
                 if let r = uidRows[Int(k)] {
-                    var body = ByteBuffer(capacity: 512)
-                    JSON.writeUser(&body, email: pa.text(pa.cell(r, 2)), token: token.span, username: pa.text(pa.cell(r, 1)),
+                    let start = mark
+                    JSON.writeUser(&out, email: pa.text(pa.cell(r, 2)), token: token.span, username: pa.text(pa.cell(r, 1)),
                                    bio: pa.bytes(pa.cell(r, 3)), image: pa.bytes(pa.cell(r, 4)))
-                    early.append(OutgoingReply(addr: task.addr, status: 200, body: body.take()))
+                    early.append(reply(task.addr, start))
                 } else {
                     early.append(OutgoingReply.error(task.addr, 401, "unauthorized"))
                 }
+            case .profile(let k):
+                // (username, bio, image, following) after the ordinal; no row: no such user.
+                guard let r = profRows[Int(k)] else {
+                    early.append(OutgoingReply.error(task.addr, 404, "profile not found"))
+                    continue
+                }
+                if renderedProfiles[Int(k)] == nil {
+                    let start = mark
+                    out.append("{\"profile\":")
+                    JSON.writeProfile(&out, username: pa.text(pa.cell(r, 1)), bio: pa.bytes(pa.cell(r, 2)),
+                                      image: pa.bytes(pa.cell(r, 3)), following: pa.bool(pa.cell(r, 4)))
+                    out.append(0x7D)
+                    renderedProfiles[Int(k)] = start..<mark
+                }
+                early.append(OutgoingReply(addr: task.addr, status: 200, slice: renderedProfiles[Int(k)]!))
             case .login(let k):
                 guard case .login(_, let password) = task.op else { continue }
                 if let r = uemailRows[Int(k)] {
@@ -730,41 +744,8 @@ actor ReadLane {
                 break
             }
         }
-        if !logins.isEmpty {
-            let scheduler = scheduler
-            let work = Submission(crypto: logins)
-            group.addTask(executorPreference: scheduler.loop) { await scheduler.submit(work) }
-        }
-        OutgoingReply.deliver(early, to: reactors, &group)
-    }
-
-    /// Profiles asked for without a token depend on nothing phase B fetches: answered while it runs.
-    private func answerAnonymousProfiles(_ tasks: [ReadTask], _ profRows: [RowSpan?], _ rendered: inout [[UInt8]?],
-                                         _ group: inout DiscardingTaskGroup) {
-        var mid: [OutgoingReply] = []
-        for (task, slot) in zip(tasks, plan) where task.viewer == 0 {
-            guard case .profile(let k) = slot else { continue }
-            guard let r = profRows[Int(k)] else {
-                mid.append(OutgoingReply.error(task.addr, 404, "profile not found"))
-                continue
-            }
-            if rendered[Int(k)] == nil {
-                var body = ByteBuffer(capacity: 256)
-                body.append("{\"profile\":")
-                JSON.writeProfile(&body, username: pa.text(pa.cell(r, 1)), bio: pa.bytes(pa.cell(r, 2)),
-                                  image: pa.bytes(pa.cell(r, 3)), following: false)
-                body.append(0x7D)
-                rendered[Int(k)] = body.take()
-            }
-            mid.append(OutgoingReply(addr: task.addr, status: 200, body: rendered[Int(k)] ?? []))
-        }
-        guard !mid.isEmpty else { return }
-        OutgoingReply.deliver(mid, to: reactors, &group)
-        errorAddrs = zip(tasks, plan).filter { task, slot in
-            if slot.answeredByPhaseA1 { return false }
-            if case .profile = slot, task.viewer == 0 { return false }
-            return true
-        }.map(\.0.addr)
+        if !logins.isEmpty { await scheduler.submit(Submission(crypto: logins)) }
+        await send(early)
     }
 
     /// Each distinct article's JSON, once, into the arena, split where the viewer-dependent parts go.
@@ -822,62 +803,131 @@ actor ReadLane {
 
     /// Each requested article's comment list, newest first, into the arena (authors from phase B's `artau`); nil for
     /// an article that doesn't exist.
-    private func renderCommentFragments(_ s: Int, _ groups: [[Int]]) -> [[CachedCommentSlice]?] {
-        let base = pa.resultRows(s).lowerBound
-        var out: [[CachedCommentSlice]?] = []
-        out.reserveCapacity(groups.count)
-        for indices in groups {
-            if indices.isEmpty {
-                out.append(nil)
+    /// Comment threads come whole from phase A2's `cmts` (rows of kind 0: a thread's comments; 1: their authors, once
+    /// each; 2: a reader and an author of that reader's thread they follow), so they are answered before phase B.
+    private func answerComments(_ tasks: [ReadTask], _ s: Int) async {
+        let n = kCmts.count
+        if cmtThreads.count < n { cmtThreads.append(contentsOf: repeatElement([], count: n - cmtThreads.count)) }
+        for i in 0..<n { cmtThreads[i].removeAll(keepingCapacity: true) }
+        cmtFound.removeAll(keepingCapacity: true)
+        cmtFound.append(contentsOf: repeatElement(false, count: n))
+        cmtAuthors.clear()
+        cmtAuthorRows.removeAll(keepingCapacity: true)
+        cmtFollows.removeAll(keepingCapacity: true)
+        cmtSlices.removeAll(keepingCapacity: true)
+        for ri in pa.resultRows(s) {
+            let r = pa.rows[ri]
+            switch pa.i64(r, 0) {
+            case 0:
+                // (0, ordinal, comment id, author id, created, updated, body): an article with no comments is one row
+                // whose comment columns are null; an unknown slug has no row.
+                let k = Int(pa.i64(r, 1)) - 1
+                guard k >= 0 && k < n else { continue }
+                cmtFound[k] = true
+                if !pa.cell(r, 2).isNull { cmtThreads[k].append(r) }
+            case 1:
+                // (1, user id, 0, 0, null, null, username, bio, image)
+                if Int(cmtAuthors.intern(pa.i64(r, 1))) == cmtAuthorRows.count { cmtAuthorRows.append(r) }
+            default:
+                // (2, reader, followed author)
+                cmtFollows.append(Pair(v: pa.i64(r, 1), t: pa.i64(r, 2)))
+            }
+        }
+        cmtFollows.sort()
+        var threadSlices = [Range<Int>?](repeating: nil, count: n)
+        var rendered = [Range<Int32>?](repeating: nil, count: n)
+        var replies: [OutgoingReply] = []
+        for (task, slot) in zip(tasks, plan) {
+            guard case .comments(let k32) = slot else { continue }
+            let k = Int(k32)
+            guard cmtFound[k] else {
+                replies.append(OutgoingReply.error(task.addr, 404, "article not found"))
                 continue
             }
-            var rows: [(created: Int64, id: Int64, row: RowSpan, author: RowSpan)] = []
-            rows.reserveCapacity(indices.count)
-            for i in indices {
-                let r = pa.rows[base + i]
-                guard !pa.cell(r, 1).isNull && !pa.cell(r, 5).isNull,
-                      let au = distinctAuthors.ordinal(of: pa.i64(r, 5)), let author = authorSpans[Int(au)] else { continue }
-                rows.append((pa.i64(r, 3), pa.i64(r, 1), r, author))
+            if threadSlices[k] == nil { threadSlices[k] = renderThread(k) }
+            let slices = threadSlices[k]!
+            let viewer = task.viewer
+            let unflagged = viewer == 0 || !cmtSlices[slices].contains { cmtFollows.containsSorted(Pair(v: viewer, t: $0.authorID)) }
+            if unflagged, let shared = rendered[k] {
+                replies.append(OutgoingReply(addr: task.addr, status: 200, slice: shared))
+                continue
             }
-            rows.sort { $0.created != $1.created ? $0.created > $1.created : $0.id > $1.id }
-            var list: [CachedCommentSlice] = []
-            list.reserveCapacity(rows.count)
-            for c in rows {
-                let start = UInt32(arena.count)
-                arena.append("{\"id\":")
-                JSON.writeInt(&arena, c.id)
-                arena.append(",\"createdAt\":")
-                JSON.writeTimestamp(&arena, c.created)
-                arena.append(",\"updatedAt\":")
-                JSON.writeTimestamp(&arena, pa.i64(c.row, 4))
-                arena.append(",\"body\":")
-                JSON.writeString(&arena, pa.text(pa.cell(c.row, 2)))
-                arena.append(",\"author\":{\"username\":")
-                JSON.writeString(&arena, pb.text(pb.cell(c.author, 1)))
-                arena.append(",\"bio\":")
-                JSON.writeNullableString(&arena, pb.bytes(pb.cell(c.author, 2)))
-                arena.append(",\"image\":")
-                JSON.writeNullableString(&arena, pb.bytes(pb.cell(c.author, 3)))
-                arena.append(",\"following\":")
-                list.append(CachedCommentSlice(authorID: pa.i64(c.row, 5), start: start, end: UInt32(arena.count)))
+            let start = mark
+            out.append("{\"comments\":[")
+            for i in slices {
+                let c = cmtSlices[i]
+                if i > slices.lowerBound { out.append(0x2C) }
+                out.append(arena, Int(c.start)..<Int(c.end))
+                out.append(!unflagged && cmtFollows.containsSorted(Pair(v: viewer, t: c.authorID)) ? "true}}" : "false}}")
             }
-            out.append(list)
+            out.append("]}")
+            if unflagged { rendered[k] = start..<mark }
+            replies.append(reply(task.addr, start))
         }
-        return out
+        guard !replies.isEmpty else { return }
+        await send(replies)
+        errorAddrs = zip(tasks, plan).filter { task, slot in
+            if slot.answeredByPhaseA1 { return false }
+            if case .comments = slot { return false }
+            return true
+        }.map(\.0.addr)
+    }
+
+    /// Thread `k`'s comments, newest first, each written once into the arena up to its author's `following`; their
+    /// slices are appended to `cmtSlices`, and the range they take there returned.
+    private func renderThread(_ k: Int) -> Range<Int> {
+        cmtThreads[k].sort { a, b in
+            let (ca, cb) = (pa.i64(a, 4), pa.i64(b, 4))
+            return ca != cb ? ca > cb : pa.i64(a, 2) > pa.i64(b, 2)
+        }
+        let first = cmtSlices.count
+        for r in cmtThreads[k] {
+            let authorID = pa.i64(r, 3)
+            guard let au = cmtAuthors.ordinal(of: authorID) else { continue }
+            let author = cmtAuthorRows[Int(au)]
+            let start = UInt32(arena.count)
+            arena.append("{\"id\":")
+            JSON.writeInt(&arena, pa.i64(r, 2))
+            arena.append(",\"createdAt\":")
+            JSON.writeTimestamp(&arena, pa.i64(r, 4))
+            arena.append(",\"updatedAt\":")
+            JSON.writeTimestamp(&arena, pa.i64(r, 5))
+            arena.append(",\"body\":")
+            JSON.writeString(&arena, pa.text(pa.cell(r, 6)))
+            arena.append(",\"author\":{\"username\":")
+            JSON.writeString(&arena, pa.text(pa.cell(author, 6)))
+            arena.append(",\"bio\":")
+            JSON.writeNullableString(&arena, pa.bytes(pa.cell(author, 7)))
+            arena.append(",\"image\":")
+            JSON.writeNullableString(&arena, pa.bytes(pa.cell(author, 8)))
+            arena.append(",\"following\":")
+            cmtSlices.append(CachedCommentSlice(authorID: authorID, start: start, end: UInt32(arena.count)))
+        }
+        return first..<cmtSlices.count
     }
 
     // ---------- flags and rendering (RenderCtx) ----------
 
+    @inline(__always) private func viewerHasAnyFlag(_ viewer: Int64) -> Bool {
+        guard viewer != 0 else { return false }
+        let (w, bit) = Self.viewerBitPosition(viewer)
+        return flaggedViewers[w] & bit != 0
+    }
+
     @inline(__always) private func isFollowing(_ viewer: Int64, _ author: Int64) -> Bool {
-        follViewerMask & Self.viewerBit(viewer) != 0 && follHits.containsSorted(Pair(v: viewer, t: author))
+        let packed = Self.packPair(viewer, author)
+        let (w, bit) = Self.pairBitPosition(packed)
+        return follPairBits[w] & bit != 0 && follHits.containsSorted(packed)
     }
 
     @inline(__always) private func isFavorited(_ viewer: Int64, _ article: Int64) -> Bool {
-        favViewerMask & Self.viewerBit(viewer) != 0 && favHits.containsSorted(Pair(v: viewer, t: article))
+        let packed = Self.packPair(viewer, article)
+        let (w, bit) = Self.pairBitPosition(packed)
+        return favPairBits[w] & bit != 0 && favHits.containsSorted(packed)
     }
 
     @inline(__always) private func isArticleUnflagged(_ art: ArticleRef, _ viewer: Int64) -> Bool {
-        viewer == 0 || (!isFavorited(viewer, art.aid) && !isFollowing(viewer, art.author))
+        !viewerHasAnyFlag(viewer) || (!isFavorited(viewer, art.aid) && !isFollowing(viewer, art.author))
     }
 
     /// `knownFav`: the favorited flag a write just set, used instead of the looked-up one.
@@ -904,6 +954,12 @@ actor ReadLane {
 }
 
 extension ReadLane {
+    /// A profile as one viewer asks for it: the row carries whether that viewer follows it.
+    struct ProfileKey: Hashable {
+        let viewer: Int64
+        let username: SmallBytes
+    }
+
     struct PairKey: Hashable {
         let a: Int64
         let b: Int64
@@ -949,7 +1005,7 @@ extension ReadLane {
     struct BytesKeySet {
         private var firstWithHash: [UInt64: UInt32] = [:]
         private var nextWithHash: [UInt32] = []
-        private(set) var items: [[UInt8]] = []
+        private(set) var items: [SmallBytes] = []
 
         var count: Int { items.count }
 
@@ -968,16 +1024,19 @@ extension ReadLane {
         func ordinal(of key: Span<UInt8>) -> UInt32? {
             var i = firstWithHash[Self.hash(key)] ?? .max
             while i != .max {
-                let candidate = items[Int(i)]
-                if sameBytes(candidate.span, key) { return i }
+                if items[Int(i)].withSpan({ sameBytes($0, key) }) { return i }
                 i = nextWithHash[Int(i)]
             }
             return nil
         }
 
-        mutating func intern(_ key: [UInt8]) -> UInt32 {
-            if let i = ordinal(of: key.span) { return i }
-            let h = Self.hash(key.span)
+        mutating func intern(_ key: SmallBytes) -> UInt32 {
+            let h = key.withSpan { Self.hash($0) }
+            var j = firstWithHash[h] ?? .max
+            while j != .max {
+                if items[Int(j)] == key { return j }
+                j = nextWithHash[Int(j)]
+            }
             let i = UInt32(items.count)
             nextWithHash.append(firstWithHash[h] ?? .max)
             firstWithHash[h] = i
@@ -998,10 +1057,10 @@ extension ReadLane {
         case filtered(Int, UInt32, UInt32)
         case feed(UInt32, UInt32)
 
-        /// Answered from phase A1 alone (tags, the current user, logins handed to the bcrypt workers).
+        /// Answered from phase A1 alone (tags, the current user, profiles, logins handed to the bcrypt workers).
         var answeredByPhaseA1: Bool {
             switch self {
-            case .tags, .user, .login: true
+            case .tags, .user, .login, .profile: true
             default: false
             }
         }
@@ -1047,8 +1106,21 @@ extension ReadLane {
         static func < (a: Pair, b: Pair) -> Bool { a.v != b.v ? a.v < b.v : a.t < b.t }
     }
 
-    @inline(__always) private static func viewerBit(_ viewer: Int64) -> UInt64 {
-        1 << ((UInt64(bitPattern: viewer) &* 0x9E37_79B9_7F4A_7C15) >> 58)
+    /// A viewer and a target in one word (`pack_pair`): the viewer's id in the high half, the target's in the low.
+    @inline(__always) private static func packPair(_ viewer: Int64, _ target: Int64) -> UInt64 {
+        UInt64(bitPattern: viewer) << 32 | UInt64(UInt32(truncatingIfNeeded: target))
+    }
+
+    /// Which word and bit of the 512-bit viewer filter `viewer` sets.
+    @inline(__always) private static func viewerBitPosition(_ viewer: Int64) -> (Int, UInt64) {
+        let h = (UInt64(bitPattern: viewer) &* 0x9E37_79B9_7F4A_7C15) >> 55
+        return (Int(h >> 6), 1 << (h & 63))
+    }
+
+    /// Which word and bit of a 2,048-bit pair filter `packed` sets.
+    @inline(__always) private static func pairBitPosition(_ packed: UInt64) -> (Int, UInt64) {
+        let h = (packed &* 0x9E37_79B9_7F4A_7C15) >> 53
+        return (Int(h >> 6), 1 << (h & 63))
     }
 
     @inline(__always) private static func lexLess(_ a: Span<UInt8>, _ b: Span<UInt8>) -> Bool {
@@ -1098,8 +1170,8 @@ extension ReadLane {
     }
 }
 
-extension Array where Element == ReadLane.Pair {
-    fileprivate func containsSorted(_ x: ReadLane.Pair) -> Bool {
+extension Array where Element: Comparable {
+    fileprivate func containsSorted(_ x: Element) -> Bool {
         var lo = 0
         var hi = count
         while lo < hi {
@@ -1108,7 +1180,9 @@ extension Array where Element == ReadLane.Pair {
         }
         return lo < count && self[lo] == x
     }
+}
 
+extension Array where Element == ReadLane.Pair {
     fileprivate mutating func sortAndDedup() {
         sort()
         var w = 0

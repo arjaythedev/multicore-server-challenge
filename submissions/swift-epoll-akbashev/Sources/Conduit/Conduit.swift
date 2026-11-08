@@ -1,7 +1,7 @@
 // main.rs: configuration, the start-up checks (bcrypt calibration, every statement prepared once), and the server
 // itself as one task group: a child task per actor, each starting on that actor's own event loop. The Rust's thread
-// layout, one actor per thread: IO reactors (cores / 2), read lanes (cores), the write lane, bcrypt workers
-// (cores / 2, at least 3), and the scheduler that holds the queues.
+// layout, one actor per thread: IO reactors (cores / 2), read lanes (cores), write lanes (cores / 2, 2 to 4), bcrypt
+// workers (cores / 2, at least 3), and the scheduler that holds the queues.
 import Glibc
 
 @main
@@ -16,8 +16,13 @@ struct Conduit {
 
         let ioWorkers = envInt("IO_THREADS", max(cores / 2, 2))
         let readWorkers = envInt("READ_LANES", max(cores, 4))
-        let writeWorkers = envInt("WRITE_LANES", 1)
+        let writeWorkers = envInt("WRITE_LANES", min(max(cores / 2, 2), 4))
         let cryptoWorkers = envInt("BCRYPT_THREADS", max(cores / 2, 3))
+        let passNanos = UInt64(max(envInt("PASS_US", 2000), 0)) * 1000
+        // Under full CPU, Postgres and the lanes run before the reactors, and the bcrypt workers after everything else
+        // but the first of them (which keeps logins moving).
+        let loopNice = Int32(envInt("LOOP_NICE", 5))
+        let bcryptNice = Int32(envInt("BCRYPT_NICE", 10))
 
         let calibrationStart = Sys.monotonicNanos()
         let (autoLanes, autoKernel, seedBcryptUs, l1dKB) = Bcrypt.calibrate()
@@ -38,8 +43,8 @@ struct Conduit {
         let scheduler = Scheduler(loop: EventLoop(name: "scheduler"), readWorkers: readWorkers, bcryptLanes: bcryptLanes,
                                   seedBcryptUs: seedBcryptUs)
         let reactors = (0..<ioWorkers).map {
-            Reactor(index: $0, loop: EventLoop(name: "io-reactor"), signer: signer, scheduler: scheduler,
-                    host: host, port: port, fdBudget: fdBudget)
+            Reactor(index: $0, loop: EventLoop(name: "io-reactor", nice: loopNice), signer: signer, scheduler: scheduler,
+                    host: host, port: port, fdBudget: fdBudget, passNanos: passNanos)
         }
         let readLanes = (0..<readWorkers).map { _ in
             ReadLane(loop: EventLoop(name: "db-read"), db: db, scheduler: scheduler, reactors: reactors)
@@ -47,9 +52,9 @@ struct Conduit {
         let writeLanes = (0..<writeWorkers).map { _ in
             WriteLane(loop: EventLoop(name: "db-write"), db: db, scheduler: scheduler, reactors: reactors, signer: signer)
         }
-        let crypto = (0..<cryptoWorkers).map { _ in
-            CryptoWorker(loop: EventLoop(name: "crypto"), scheduler: scheduler, reactors: reactors, signer: signer,
-                         kernel: bcryptKernel)
+        let crypto = (0..<cryptoWorkers).map { i in
+            CryptoWorker(loop: EventLoop(name: "crypto", nice: i == 0 ? 0 : bcryptNice), scheduler: scheduler,
+                         reactors: reactors, signer: signer, kernel: bcryptKernel)
         }
 
         Sys.logLine("listening on \(host):\(port) (\(ioWorkers) io, \(readWorkers) read, \(writeWorkers) write, "

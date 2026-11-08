@@ -19,8 +19,10 @@ has no dependencies: its own HTTP/1.1 server, Postgres wire client, SHA-256/HMAC
 
 ## Design
 
-**One actor per thread.** `cores / 2` reactors, `cores` read lanes, one write lane and `cores / 2` (at least 3)
-bcrypt workers, plus one `Scheduler` actor for the queues (this thread layout is rust-epoll-theCatWisel's). Each
+**One actor per thread.** `cores / 2` reactors, `cores` read lanes, `cores / 2` (2 to 4) write lanes and `cores / 2`
+(at least 3) bcrypt workers, plus one `Scheduler` actor for the queues (this thread layout is rust-epoll-theCatWisel's).
+Reactors run at nice 5 and bcrypt workers after the first at nice 10, so under full CPU Postgres and the lanes go
+first. Each
 actor's executor is an `EventLoop` (`EventLoop.swift`): a thread of its own, an epoll instance and an eventfd,
 conforming to both `SerialExecutor` and `TaskExecutor`. The runtime hands it the actor's jobs through `enqueue` (a
 `Mutex`-guarded list, the one place two threads meet; the eventfd is written only when the loop is about to sleep, as
@@ -35,25 +37,35 @@ batch, never per request:
 
 - **Reactor** (`Reactor.swift`): blocks in `epoll_wait` on its own loop with its sockets and the loop's eventfd in
   the set, one call per tick. It parses, verifies the token and routes (`Router.swift`), answers what needs no
-  Postgres, and sends the tick's work to the scheduler in one message. A lane's replies arrive as one `deliver`
-  message per batch; when one is queued the reactor yields (`Task.yield()` re-enqueues on the actor's own executor)
-  and the message runs on the same thread. `unshare(CLONE_FILES)` gives each reactor thread its own descriptor table.
-- **Scheduler** (`Scheduler.swift`): one lane gathers at a time, taking its batch once it has `want` requests or the
-  oldest has waited `max_age`, both computed from running averages of batch sizes and times; the deadline is a
-  timeout on the scheduler's own loop. Clients that hung up while queued are dropped here, on a cancellation message
+  Postgres, and sends the tick's work to the scheduler in one awaited message. A lane's replies arrive as one
+  `deliver` message per batch; when one is queued the reactor yields (`Task.yield()` re-enqueues on the actor's own
+  executor) and the message runs on the same thread. A pass lasts at least 2 ms: with fewer events than its buffer
+  holds, the reactor waits out the rest on its loop, so work and replies travel in fewer, larger messages.
+  `unshare(CLONE_FILES)` gives each reactor thread its own descriptor table.
+- **Scheduler** (`Scheduler.swift`): reads wait in three queues: fast (tags, users, logins, profiles, articles and
+  lists), comments, and feeds. An idle read lane picks a queue and gathers its next batch, one lane per queue at a
+  time, at most `max(lanes - 1, 3)` gathering or running at once, each queue with a share of them (3/8, 1/4 and 1/4
+  of the lanes, one more for the queue holding the oldest request). With nothing else going on it gathers briefly;
+  otherwise a queue is drained at most every 74 ms (feeds 76), a batch gathers for at least 5 ms, and no request waits
+  longer than the two together. Write lanes gather one at a time, up to 64 writes for 3-5 ms (150 µs when writes come
+  one by one); bcrypt workers too, for a full set of lanes, up to 1.5-2 bcrypt runs (35-45 ms at most). Deadlines are
+  timeouts on the scheduler's own loop. Clients that hung up while queued are dropped here, on a cancellation message
   from the reactor.
 - **Read lane** (`ReadLane.swift`): phase A resolves what each request is about over the batch's distinct keys, in
-  two parts sent in one flush: A1 (tags, the current user, logins) has its own Sync, so those replies go out, and
-  logins reach the bcrypt workers, while Postgres still runs A2's lookups and lists. Lookups and lists bring the
-  articles' metadata with them; phase B enriches the union of the articles found, once each (tags, counts, authors,
-  and metadata for the feed's index-only finds), and the viewers' flags, and anonymous profiles are answered while it
-  runs. Each article's JSON is written once per batch with its viewer-dependent booleans left open, and identical
-  responses are built once and shared. Postgres I/O blocks the lane's own thread. The two-round-trip plan and its SQL
-  are rust-epoll-theCatWisel's.
+  two parts sent in one flush: A1 (tags, the current user, profiles with whether their reader follows them, logins)
+  has its own Sync, so those replies go out, and logins reach the bcrypt workers, while Postgres still runs A2's
+  lookups, lists and comment threads. A thread comes back in one statement with its authors and its readers' follows
+  among them, and is answered before phase B. Lookups and lists bring the articles' metadata with them; phase B
+  enriches the union of the articles found, once each and in id order (tags, counts, authors, and metadata for the
+  feed's index-only finds), and the viewers' flags, which rendering finds through bit filters before a sorted search.
+  Each article's JSON is written once per batch with its viewer-dependent booleans left open, and identical responses
+  are built once and shared. A request's slug, username, email or tag is held inline (`SmallBytes`), so routing a
+  read allocates nothing for it. Postgres I/O blocks the lane's own thread; the sockets have `TCP_NODELAY` and
+  `TCP_QUICKACK`. The two-round-trip plan and its SQL are rust-epoll-theCatWisel's.
 - **Write lane** (`WriteLane.swift`): group commit in one implicit pipeline transaction, favorites, follows and new
-  comments merged into `unnest` statements unless the group also changes what they read, one-by-one retry if the
-  group fails. A new article is answered from its insert in one round trip; a favorite's read-back carries the flag it
-  set. A write group that fails during its retry answers 500 to the writes it didn't get to, and queued writes run
+  comments merged into `unnest` statements (in article order) unless the group also changes what they read,
+  one-by-one retry if the group fails. A new article and its tags are one statement, answered from its insert; a
+  favorite's read-back carries the flag it set and goes to the front of the fast queue. A write group that fails during its retry answers 500 to the writes it didn't get to, and queued writes run
   even if their client hung up.
 - **bcrypt workers** (`CryptoWorker.swift`, `Auth.swift`): lockstep sets of up to `lanes` hashes (the lockstep idea
   is rust-epoll-theCatWisel's); verified logins answer the reactors directly, hashed passwords go back to the
@@ -95,9 +107,10 @@ batch, never per request:
 
 ## Settings
 
-`IO_THREADS` (cores / 2), `READ_LANES` (cores), `WRITE_LANES` (1), `BCRYPT_THREADS` (cores / 2, at least 3),
-`BCRYPT_LANES` (calibrated), and `BCRYPT_KERNEL` (`constant`, or `shrx` on x86-64; calibrated). Cores are the
-process's affinity mask. Postgres connections: `READ_LANES + WRITE_LANES`.
+`IO_THREADS` (cores / 2), `READ_LANES` (cores), `WRITE_LANES` (cores / 2, 2 to 4), `BCRYPT_THREADS` (cores / 2, at
+least 3), `BCRYPT_LANES` (calibrated), `BCRYPT_KERNEL` (`constant`, or `shrx` on x86-64; calibrated), `PASS_US`
+(a reactor pass's least length, 2000), `LOOP_NICE` (5) and `BCRYPT_NICE` (10). Cores are the process's affinity
+mask. Postgres connections: `READ_LANES + WRITE_LANES`.
 
 ## Correctness
 

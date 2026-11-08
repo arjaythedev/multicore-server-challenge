@@ -455,7 +455,11 @@ enum Bcrypt {
         var candidates: [Probe] = []
         for kernel in Kernel.all {
             candidates += [probe(InlineArray<2, KeyMaterial>.self, kernel), probe(InlineArray<3, KeyMaterial>.self, kernel),
-                           probe(InlineArray<4, KeyMaterial>.self, kernel), probe(InlineArray<6, KeyMaterial>.self, kernel)]
+                           probe(InlineArray<4, KeyMaterial>.self, kernel), probe(InlineArray<5, KeyMaterial>.self, kernel),
+                           probe(InlineArray<6, KeyMaterial>.self, kernel)]
+        }
+        if getenv("BCRYPT_REPORT") != nil {
+            for c in candidates { Sys.logLine("bcrypt \(c.kernel) x\(c.lanes): \(c.us10) us per batch, \(c.perHash) us per hash") }
         }
         var best = candidates[0]
         for cand in candidates.dropFirst() {
