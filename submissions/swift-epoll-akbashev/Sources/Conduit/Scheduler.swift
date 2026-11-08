@@ -28,9 +28,9 @@ final class Scheduler: Sendable {
 
     private let state: Mutex<State>
 
-    /// `fullBcryptSets`: wait up to two bcrypt runs, with no cap, for a full lane set once workers overlap, instead of at
-    /// most 35-45 ms.
-    init(readWorkers: Int, bcryptLanes: Int, seedBcryptUs: Int, fullBcryptSets: Bool = false) {
+    /// `fullBcryptSets`: a bcrypt worker's window is fixed when it becomes the gatherer, and is two bcrypt runs once
+    /// workers overlap; without it, the window is fixed at the first job and capped at 35-45 ms.
+    init(readWorkers: Int, bcryptLanes: Int, seedBcryptUs: Int, fullBcryptSets: Bool = true) {
         state = Mutex(State(readWorkers: readWorkers, bcryptLanes: bcryptLanes, seedBcryptUs: seedBcryptUs,
                             fullBcryptSets: fullBcryptSets))
     }
@@ -110,7 +110,7 @@ extension Scheduler {
         var busyReadWorkers = 0
 
         var crypto = TaskQueue<CryptoTask>()
-        var cryptoGatherer: Gatherer?
+        var cryptoGatherer: CryptoGatherer?
         var idleCrypto: [EventLoop] = []
         var busyCryptoWorkers = 0
         var ewmaBcryptUs: Int
@@ -154,9 +154,11 @@ extension Scheduler {
                 wakeIdleReader(now, &wakes)
             }
             if !s.crypto.isEmpty {
+                let wasEmpty = crypto.isEmpty
                 crypto.append(contentsOf: s.crypto, at: now)
                 if let g = cryptoGatherer {
-                    if crypto.count >= max(bcryptLanes, 1) { wakes.add(g.loop) }
+                    // Its window runs from the first job; a full set goes at once.
+                    if wasEmpty || crypto.count >= max(bcryptLanes, 1) { wakes.add(g.loop) }
                 } else if !idleCrypto.isEmpty {
                     wakes.add(idleCrypto.removeFirst())
                 }
@@ -279,9 +281,12 @@ extension Scheduler {
 
         // ---------- bcrypt ----------
 
-        /// One worker gathers at a time, for a full lane set: briefly when logins come one by one, otherwise for 1.5
-        /// bcrypt runs (2 to 35 ms) with no other worker busy, or 2 (10 to 45 ms) with one. With `fullBcryptSets`,
-        /// briefly while no worker is busy and logins come one by one, otherwise for two bcrypt runs.
+        /// One worker gathers at a time, for a full lane set, for a window from its oldest job's arrival. With
+        /// `fullBcryptSets` (the Rust #154's crypto lock) the window is fixed when the worker becomes the gatherer, which
+        /// for all but the first is the moment the set before is handed out, while that set counts as busy: briefly only
+        /// when no worker is busy and logins come one by one, otherwise two bcrypt runs. Without it (#201) the window is
+        /// fixed when the first job comes: briefly when logins come one by one, otherwise 1.5 bcrypt runs (2 to 35 ms)
+        /// with no other worker busy, or 2 (10 to 45 ms) with one.
         mutating func nextCrypto(_ loop: EventLoop, finished: CryptoBatchDone?, _ wakes: inout Wakes) -> TakeStep<CryptoTask> {
             let now = Sys.monotonicNanos()
             if let f = finished {
@@ -292,40 +297,52 @@ extension Scheduler {
                     lastCryptoDone = now
                 }
             }
-            let lanes = max(bcryptLanes, 1)
             if let g = cryptoGatherer, g.loop !== loop {
                 if !idleCrypto.contains(where: { $0 === loop }) { idleCrypto.append(loop) }
                 return .wait(.max)
             }
             idleCrypto.removeAll { $0 === loop }
             if cryptoGatherer == nil {
-                guard let since = crypto.since else {
-                    idleCrypto.append(loop)
-                    return .wait(.max)
-                }
-                let tauUs = max(ewmaBcryptUs, 10_000)
-                let overlap = busyCryptoWorkers > 0 || crypto.count > 1
-                    || (lastCryptoDone > 0 && now &- min(lastCryptoDone, now) < 120_000_000)
-                let ageUs = if fullBcryptSets {
-                    busyCryptoWorkers == 0 && ewmaCryptoLen <= 1 ? max(ewmaBcryptUs / (lanes * 2), 1) : max(ewmaBcryptUs * 2, 1)
-                } else if !overlap && ewmaCryptoLen <= 1 {
-                    max(tauUs / (lanes * 2), 1)
-                } else if busyCryptoWorkers == 0 {
-                    min(max(tauUs * 3 / 2, 2_000), 35_000)
-                } else {
-                    min(max(tauUs * 2, 10_000), 45_000)
-                }
-                cryptoGatherer = Gatherer(loop: loop, want: lanes, deadline: since + UInt64(ageUs) * 1000)
+                cryptoGatherer = CryptoGatherer(loop: loop, window: fullBcryptSets ? cryptoWindow(now) : nil)
             }
-            let deadline = cryptoGatherer!.deadline
+            guard let since = crypto.since else { return .wait(.max) }
+            if cryptoGatherer!.window == nil { cryptoGatherer!.window = cryptoWindow(now) }
+            let lanes = max(bcryptLanes, 1)
+            let deadline = since + cryptoGatherer!.window!
             if crypto.count < lanes && now < deadline { return .wait(deadline) }
             cryptoGatherer = nil
             var batch = crypto.take(min(crypto.count, lanes))
             ewmaCryptoLen = ewmaCryptoLen == 0 ? batch.count : (ewmaCryptoLen * 3 + batch.count) / 4
             busyCryptoWorkers += 1
             if !cancelled.isEmpty { batch.removeAll { cancelled.contains($0.addr) } }
-            if !crypto.isEmpty && !idleCrypto.isEmpty { wakes.add(idleCrypto.removeFirst()) }
+            // The next idle worker gathers from now on (the next Rust worker takes the crypto lock the moment this one
+            // releases it).
+            if !idleCrypto.isEmpty {
+                let next = idleCrypto.removeFirst()
+                cryptoGatherer = CryptoGatherer(loop: next, window: fullBcryptSets ? cryptoWindow(now) : nil)
+                if !crypto.isEmpty { wakes.add(next) }
+            }
             return .batch(batch)
+        }
+
+        /// The gathering worker's window, in nanoseconds from its oldest job's arrival.
+        private func cryptoWindow(_ now: UInt64) -> UInt64 {
+            let lanes = max(bcryptLanes, 1)
+            if fullBcryptSets {
+                let us = busyCryptoWorkers == 0 && ewmaCryptoLen <= 1 ? max(ewmaBcryptUs / (lanes * 2), 1) : max(ewmaBcryptUs * 2, 1)
+                return UInt64(us) * 1000
+            }
+            let tauUs = max(ewmaBcryptUs, 10_000)
+            let overlap = busyCryptoWorkers > 0 || crypto.count > 1
+                || (lastCryptoDone > 0 && now &- min(lastCryptoDone, now) < 120_000_000)
+            let us = if !overlap && ewmaCryptoLen <= 1 {
+                max(tauUs / (lanes * 2), 1)
+            } else if busyCryptoWorkers == 0 {
+                min(max(tauUs * 3 / 2, 2_000), 35_000)
+            } else {
+                min(max(tauUs * 2, 10_000), 45_000)
+            }
+            return UInt64(us) * 1000
         }
 
         // ---------- writes ----------
@@ -454,6 +471,12 @@ extension Scheduler {
             }
             return out
         }
+    }
+
+    /// The bcrypt worker gathering the next lane set, on `loop`, and its window once fixed.
+    private struct CryptoGatherer {
+        let loop: EventLoop
+        var window: UInt64?
     }
 
     /// The worker gathering a queue's next batch, on `loop`, which it takes once `want` requests wait or at `deadline`.

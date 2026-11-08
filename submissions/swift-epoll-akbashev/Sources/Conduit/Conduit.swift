@@ -43,7 +43,7 @@ struct Conduit {
         let fdBudget = Sys.probeNofileLimit()
 
         let scheduler = Scheduler(readWorkers: readWorkers, bcryptLanes: bcryptLanes, seedBcryptUs: seedBcryptUs,
-                                  fullBcryptSets: env("BCRYPT_WAIT") == "full")
+                                  fullBcryptSets: env("BCRYPT_WAIT") != "capped")
         // Reactor 0's loop is the main thread's, which runs it once start-up is done.
         let mainLoop = EventLoop(name: "io-reactor", nice: loopNice, onCallingThread: true)
         let reactors = (0..<ioWorkers).map {

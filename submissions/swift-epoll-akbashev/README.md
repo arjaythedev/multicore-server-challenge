@@ -50,8 +50,11 @@ bodies are `[UInt8]`), and messages are per epoll tick or per batch, never per r
   and 1/4 of the lanes, one more for the queue holding the oldest request). With nothing else going on it gathers
   briefly; otherwise a queue is drained at most every 74 ms (feeds 76), a batch gathers for at least 5 ms, and no
   request waits longer than the two together. Write lanes gather one at a time, up to 64 writes for 3-5 ms (150 µs
-  when writes come one by one); bcrypt workers too, for a full set of lanes, up to 1.5-2 bcrypt runs (35-45 ms at
-  most). Clients that hung up while queued are dropped here, on a cancellation the reactor queues with its work.
+  when writes come one by one); bcrypt workers too, for a full set of lanes, for up to two bcrypt runs. A bcrypt
+  worker's window is fixed when it starts gathering, which is the moment the set before it is handed out, so it waits
+  the long window even when logins come one at a time: a window fixed at the first login would mostly be the short
+  one, and most sets would run one login. Clients that hung up while queued are dropped here, on a cancellation the
+  reactor queues with its work.
 - **Read lane** (`ReadLane.swift`): phase A resolves what each request is about over the batch's distinct keys, in
   two parts sent in one flush: A1 (tags, the current user, profiles with whether their reader follows them, logins)
   has its own Sync, so those replies go out, and logins reach the bcrypt workers, while Postgres still runs A2's
@@ -110,8 +113,8 @@ bodies are `[UInt8]`), and messages are per epoll tick or per batch, never per r
 
 `IO_THREADS` (cores / 2), `READ_LANES` (cores), `WRITE_LANES` (cores / 2, 2 to 4), `BCRYPT_THREADS` (cores / 2, at
 least 3), `BCRYPT_LANES` (calibrated), `BCRYPT_KERNEL` (`constant`, or `shrx` on x86-64; calibrated), `PASS_US`
-(a reactor pass's least length, 2000), `LOOP_NICE` (5), `BCRYPT_NICE` (10) and `BCRYPT_WAIT` (`full`: wait up to
-two bcrypt runs, uncapped, for a full lane set). Cores are the process's affinity
+(a reactor pass's least length, 2000), `LOOP_NICE` (5), `BCRYPT_NICE` (10) and `BCRYPT_WAIT` (`capped`: a bcrypt
+worker's window fixed at its first job, at most 35-45 ms). Cores are the process's affinity
 mask. Postgres connections: `READ_LANES + WRITE_LANES`.
 
 ## Correctness
