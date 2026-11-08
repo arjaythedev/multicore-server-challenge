@@ -61,7 +61,7 @@ extension OutgoingReply {
     }
 }
 
-actor ReadLane {
+actor ReadLane: LoopIsolated {
     nonisolated let loop: EventLoop
     nonisolated var unownedExecutor: UnownedSerialExecutor { loop.asUnownedSerialExecutor() }
 
@@ -150,7 +150,7 @@ actor ReadLane {
     func run() async {
         var finished: Scheduler.ReadBatchDone?
         while true {
-            let batch = await scheduler.nextReads(finished: finished)
+            let batch = await scheduler.nextReads(for: self, finished: finished)
             let tasks = batch.tasks
             let t0 = Sys.monotonicNanos()
             out.removeAll()
@@ -744,7 +744,7 @@ actor ReadLane {
                 break
             }
         }
-        if !logins.isEmpty { await scheduler.submit(Submission(crypto: logins)) }
+        if !logins.isEmpty { scheduler.submit(Submission(crypto: logins)) }
         await send(early)
     }
 

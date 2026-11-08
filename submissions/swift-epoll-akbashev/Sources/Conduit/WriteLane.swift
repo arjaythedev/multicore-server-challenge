@@ -6,7 +6,7 @@
 // the read lanes, with the favorited flag they just set.
 import Glibc
 
-actor WriteLane {
+actor WriteLane: LoopIsolated {
     nonisolated let loop: EventLoop
     nonisolated var unownedExecutor: UnownedSerialExecutor { loop.asUnownedSerialExecutor() }
 
@@ -38,7 +38,7 @@ actor WriteLane {
     func run() async {
         var finished = false
         while true {
-            let tasks = await scheduler.nextWrites(finished: finished)
+            let tasks = await scheduler.nextWrites(for: self, finished: finished)
             finished = true
             var replies: [OutgoingReply] = []
             var postReads: [ReadTask] = []
@@ -49,7 +49,7 @@ actor WriteLane {
                 conn = nil
                 replies.append(contentsOf: error.addrs.map { OutgoingReply.error($0, 500, "internal server error") })
             }
-            if !postReads.isEmpty { await scheduler.submit(Submission(readsFront: postReads)) }
+            if !postReads.isEmpty { scheduler.submit(Submission(readsFront: postReads)) }
             var b: [[OutgoingReply]] = []
             swap(&b, &buckets)
             await OutgoingReply.deliver(replies, to: reactors, buckets: &b)

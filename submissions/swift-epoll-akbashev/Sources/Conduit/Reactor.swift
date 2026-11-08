@@ -1,8 +1,8 @@
 // reactor.rs: an HTTP/1.1 reactor on its own SO_REUSEPORT listener, with a file descriptor table of its own. It is an
 // actor on its own event loop: the connection table is plain actor state, touched only by this actor's thread. Each
 // turn it takes the ready events off its epoll instance, parses and routes what arrived, and hands the tick's work
-// to the scheduler in one call, which its task makes on the scheduler's loop and comes back from. Replies arrive as
-// `deliver` calls from the lanes, one per batch, and go out with writev.
+// to the scheduler in one plain call, without leaving its thread. Replies arrive as `deliver` calls from the lanes,
+// one per batch, and go out with writev.
 import Glibc
 import Syscalls
 
@@ -80,34 +80,23 @@ actor Reactor {
                     if flags & (Sys.EPOLLIN | Sys.EPOLLHUP | Sys.EPOLLERR | Sys.EPOLLRDHUP) != 0 { readReady(slot, flags) }
                 }
             }
-            if !pending.isEmpty {
-                // While this task is on the scheduler's loop, the messages queued here run.
-                await submitPending()
-            } else if messagesWaiting {
-                // Let them run now (jobs on this same thread: Task.yield re-enqueues on the actor's executor).
-                await Task.yield()
-            }
-            // A lane's replies may have routed pipelined requests: they go to the scheduler now, not after the next
-            // wake-up, which may not come.
-            if !pending.isEmpty { await submitPending() }
+            // The tick's work goes to the scheduler at once; `pending` keeps its arrays' memory for the next tick.
+            if !pending.isEmpty { scheduler.submit(&pending) }
+            // Let the lanes' queued deliveries run now (jobs on this same thread: Task.yield re-enqueues on the actor's
+            // executor).
+            if messagesWaiting { await Task.yield() }
             // A fixed cadence: a tick that didn't fill `events` lasts `passNanos` from its epoll_wait, so what arrives
-            // meanwhile is routed in the next one and goes to the scheduler in one call with it: one round trip for
-            // many requests. The task waits on this loop, whose thread runs the lanes' deliveries in the meantime. A
-            // full tick goes straight on, so the cadence can't cap throughput.
+            // meanwhile is routed in the next one and goes to the scheduler in one call with it. The task waits on
+            // this loop, whose thread runs the lanes' deliveries in the meantime. A full tick goes straight on, so the
+            // cadence can't cap throughput.
             if n > 0 && n < maxEvents && passNanos > 0 {
                 let deadline = turnStarted + passNanos
                 if Sys.monotonicNanos() < deadline { await loop.wait(until: deadline) }
             }
+            // Deliveries may have routed pipelined requests: they go now, not after the next wake-up, which may not
+            // come.
+            if !pending.isEmpty { scheduler.submit(&pending) }
         }
-    }
-
-    /// Hands this tick's work to the scheduler: this task carries it to the scheduler's loop and comes back with the
-    /// submission emptied, which the next tick fills (unless a delivery that ran meanwhile already started one).
-    private func submitPending() async {
-        var work = Submission()
-        swap(&work, &pending)
-        let emptied = await scheduler.submit(consume work)
-        if pending.isEmpty { pending = emptied }
     }
 
     /// A batch of replies from a lane (flush_outbox), with the buffer their `.slice` bodies are in, lent for the call.

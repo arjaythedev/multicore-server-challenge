@@ -3,7 +3,7 @@
 // together; any other cost runs on its own. Verified logins answer straight to the reactors; hashed passwords go back
 // to the scheduler as writes, ahead of the queue.
 
-actor CryptoWorker {
+actor CryptoWorker: LoopIsolated {
     nonisolated let loop: EventLoop
     nonisolated var unownedExecutor: UnownedSerialExecutor { loop.asUnownedSerialExecutor() }
 
@@ -25,7 +25,7 @@ actor CryptoWorker {
     func run() async {
         var finished: Scheduler.CryptoBatchDone?
         while true {
-            let batch = await scheduler.nextCrypto(finished: finished)
+            let batch = await scheduler.nextCrypto(for: self, finished: finished)
             let t0 = Sys.monotonicNanos()
             var standard: [CryptoTask] = []
             var other: [CryptoTask] = []
@@ -43,7 +43,7 @@ actor CryptoWorker {
                     replies.append(OutgoingReply.error(addr, 401, "invalid credentials"))
                 }
             }
-            if !writes.isEmpty { await scheduler.submit(Submission(writesFront: writes)) }
+            if !writes.isEmpty { scheduler.submit(Submission(writesFront: writes)) }
             var b: [[OutgoingReply]] = []
             swap(&b, &buckets)
             await OutgoingReply.deliver(replies, to: reactors, buckets: &b)

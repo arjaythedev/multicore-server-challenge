@@ -199,13 +199,18 @@ extension Sys {
         var thread = pthread_t()
         let rc = pthread_create(&thread, nil, { raw in
             let start = Unmanaged<ThreadStart>.fromOpaque(raw!).takeRetainedValue()
-            _ = sys_pthread_setname_np(pthread_self(), String(start.name.prefix(15)))
-            if start.nice != 0 { _ = sys_setpriority(0, UInt32(bitPattern: sys_gettid()), start.nice) }
+            Sys.nameThisThread(start.name, nice: start.nice)
             start.body()
             return nil
         }, start)
         if rc != 0 { fatalError("pthread_create: \(rc)") }
         pthread_detach(thread)
+    }
+
+    /// Names the calling thread `name` and sets it at `nice`.
+    static func nameThisThread(_ name: String, nice: Int32 = 0) {
+        _ = sys_pthread_setname_np(pthread_self(), String(name.prefix(15)))
+        if nice != 0 { _ = sys_setpriority(0, UInt32(bitPattern: sys_gettid()), nice) }
     }
 }
 

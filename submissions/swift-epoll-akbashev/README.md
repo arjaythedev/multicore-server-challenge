@@ -20,37 +20,38 @@ has no dependencies: its own HTTP/1.1 server, Postgres wire client, SHA-256/HMAC
 ## Design
 
 **One actor per thread.** `cores / 2` reactors, `cores` read lanes, `cores / 2` (2 to 4) write lanes and `cores / 2`
-(at least 3) bcrypt workers, plus one `Scheduler` actor for the queues (this thread layout is rust-epoll-theCatWisel's).
+(at least 3) bcrypt workers (this thread layout is rust-epoll-theCatWisel's). The queues between them are a
+`Scheduler`: shared state behind one `Mutex`, which every thread touches for a moment, so it has no thread of its own.
 Reactors run at nice 5 and bcrypt workers after the first at nice 10, so under full CPU Postgres and the lanes go
-first. Each
-actor's executor is an `EventLoop` (`EventLoop.swift`): a thread of its own, an epoll instance and an eventfd,
-conforming to both `SerialExecutor` and `TaskExecutor`. The runtime hands it the actor's jobs through `enqueue` (a
-`Mutex`-guarded list, the one place two threads meet; the eventfd is written only when the loop is about to sleep, as
-NIO's event loop does) and the thread runs them in order. `main` starts every actor as a child task of one
-`withDiscardingTaskGroup`, each with `executorPreference:` its own loop, so it starts there rather than on the global
-pool.
+first. Each actor's executor is an `EventLoop` (`EventLoop.swift`): a thread of its own, an epoll instance and an
+eventfd, conforming to both `SerialExecutor` and `TaskExecutor`. The runtime hands it the actor's jobs through
+`enqueue` (a `Mutex`-guarded list, the one place two threads meet; the eventfd is written only when the loop is about
+to sleep, as NIO's event loop does) and the thread runs them in order. `main` is synchronous: it starts one root task
+on reactor 0's loop, holding a `withDiscardingTaskGroup` with every actor as a child task (each with
+`executorPreference:` its own loop, so it starts there), and then gives its own thread to that loop. Every thread is
+an actor's, and Swift's global executor, with libdispatch's threads behind it, is never used.
 
-Inside an actor, state is plain: a reactor's connection table, a lane's Postgres connection and arenas, the
-scheduler's queues and batching policy. Nothing is `@unchecked Sendable`; what crosses between actors is a value
-(`ReadTask`, `WriteTask`, `CryptoTask`, replies whose bodies are `[UInt8]`), and messages are per epoll tick or per
-batch, never per request:
+Inside an actor, state is plain: a reactor's connection table, a lane's Postgres connection and arenas. Nothing is
+`@unchecked Sendable`; what crosses between actors is a value (`ReadTask`, `WriteTask`, `CryptoTask`, replies whose
+bodies are `[UInt8]`), and messages are per epoll tick or per batch, never per request:
 
-- **Reactor** (`Reactor.swift`): blocks in `epoll_wait` on its own loop with its sockets and the loop's eventfd in
-  the set, one call per tick. It parses, verifies the token and routes (`Router.swift`), answers what needs no
-  Postgres, and sends the tick's work to the scheduler in one awaited message. A lane's replies arrive as one
-  `deliver` message per batch; when one is queued the reactor yields (`Task.yield()` re-enqueues on the actor's own
-  executor) and the message runs on the same thread. A pass lasts at least 2 ms: with fewer events than its buffer
+- **Reactor** (`Reactor.swift`): blocks in `epoll_wait` on its own loop with its sockets and the loop's eventfd in the
+  set, one call per tick. It parses, verifies the token and routes (`Router.swift`), answers what needs no Postgres,
+  and queues the tick's work on the scheduler with one plain call, never leaving its thread. A lane's replies arrive
+  as one `deliver` message per batch; when one is queued the reactor yields (`Task.yield()` re-enqueues on the actor's
+  own executor) and the message runs on the same thread. A pass lasts at least 2 ms: with fewer events than its buffer
   holds, the reactor waits out the rest on its loop, so work and replies travel in fewer, larger messages.
   `unshare(CLONE_FILES)` gives each reactor thread its own descriptor table.
-- **Scheduler** (`Scheduler.swift`): reads wait in three queues: fast (tags, users, logins, profiles, articles and
-  lists), comments, and feeds. An idle read lane picks a queue and gathers its next batch, one lane per queue at a
-  time, at most `max(lanes - 1, 3)` gathering or running at once, each queue with a share of them (3/8, 1/4 and 1/4
-  of the lanes, one more for the queue holding the oldest request). With nothing else going on it gathers briefly;
-  otherwise a queue is drained at most every 74 ms (feeds 76), a batch gathers for at least 5 ms, and no request waits
-  longer than the two together. Write lanes gather one at a time, up to 64 writes for 3-5 ms (150 µs when writes come
-  one by one); bcrypt workers too, for a full set of lanes, up to 1.5-2 bcrypt runs (35-45 ms at most). Deadlines are
-  timeouts on the scheduler's own loop. Clients that hung up while queued are dropped here, on a cancellation message
-  from the reactor.
+- **Scheduler** (`Scheduler.swift`): a lane, write lane or bcrypt worker takes its next batch under the lock, and when
+  there is none yet waits on its own loop (an `isolated` parameter makes it the caller's), until the call that makes
+  its batch ready wakes it or its window ends. Reads wait in three queues: fast (tags, users, logins, profiles,
+  articles and lists), comments, and feeds. An idle read lane picks a queue and gathers its next batch, one lane per
+  queue at a time, at most `max(lanes - 1, 3)` gathering or running at once, each queue with a share of them (3/8, 1/4
+  and 1/4 of the lanes, one more for the queue holding the oldest request). With nothing else going on it gathers
+  briefly; otherwise a queue is drained at most every 74 ms (feeds 76), a batch gathers for at least 5 ms, and no
+  request waits longer than the two together. Write lanes gather one at a time, up to 64 writes for 3-5 ms (150 µs
+  when writes come one by one); bcrypt workers too, for a full set of lanes, up to 1.5-2 bcrypt runs (35-45 ms at
+  most). Clients that hung up while queued are dropped here, on a cancellation the reactor queues with its work.
 - **Read lane** (`ReadLane.swift`): phase A resolves what each request is about over the batch's distinct keys, in
   two parts sent in one flush: A1 (tags, the current user, profiles with whether their reader follows them, logins)
   has its own Sync, so those replies go out, and logins reach the bcrypt workers, while Postgres still runs A2's
@@ -109,7 +110,8 @@ batch, never per request:
 
 `IO_THREADS` (cores / 2), `READ_LANES` (cores), `WRITE_LANES` (cores / 2, 2 to 4), `BCRYPT_THREADS` (cores / 2, at
 least 3), `BCRYPT_LANES` (calibrated), `BCRYPT_KERNEL` (`constant`, or `shrx` on x86-64; calibrated), `PASS_US`
-(a reactor pass's least length, 2000), `LOOP_NICE` (5) and `BCRYPT_NICE` (10). Cores are the process's affinity
+(a reactor pass's least length, 2000), `LOOP_NICE` (5), `BCRYPT_NICE` (10) and `BCRYPT_WAIT` (`full`: wait up to
+two bcrypt runs, uncapped, for a full lane set). Cores are the process's affinity
 mask. Postgres connections: `READ_LANES + WRITE_LANES`.
 
 ## Correctness
