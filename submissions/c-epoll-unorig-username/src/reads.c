@@ -1240,9 +1240,11 @@ static int run_batch(drain_t *d, job **jobs, int n) {
   return B_OK;
 }
 
-// ---- the queue: three lanes. Feeds are the costliest read and comments the next, so nothing waits behind them, and
-// each lane starts a drain at most once per gap. A free connection goes to the lane whose oldest read has waited longest.
-enum { LANE_SHARED, LANE_FEED, LANE_COMMENT, NLANES };
+// ---- the queue: four lanes. Feeds are the costliest read and comments the next, so nothing waits behind them; reads by
+// key (tags, users, profiles, articles by slug or id) need two exchanges and no list window, so they do not wait behind
+// the list pages either. Each lane starts a drain at most once per gap. A free connection goes to the lane whose oldest
+// read has waited longest.
+enum { LANE_SHARED, LANE_FEED, LANE_COMMENT, LANE_FAST, NLANES };
 typedef struct {
   job *head, *tail;
   int n, inflight;
@@ -1251,13 +1253,21 @@ typedef struct {
 static lane_t lanes[NLANES];
 static pthread_mutex_t q_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t q_cv;
-static int waiting, inflight, read_cap = 6, lane_on = 1;
+static int waiting, inflight, read_cap = 6, lane_on = 1, fast_on = 1;
 #define MAX_BATCH 65536
+
+static int lane_of(const job *j) {
+  if (!lane_on) return LANE_SHARED;
+  if (j->kind == K_FEED) return LANE_FEED;
+  if (j->kind == K_COMMENTS) return LANE_COMMENT;
+  if (fast_on && (j->kind < K_LIST_ALL || j->kind > K_FEED)) return LANE_FAST;
+  return LANE_SHARED;
+}
 
 void read_enqueue(job *j) {
   j->next = NULL;
   j->t_in = now_us();
-  lane_t *l = &lanes[lane_on ? (j->kind == K_FEED ? LANE_FEED : j->kind == K_COMMENTS ? LANE_COMMENT : LANE_SHARED) : LANE_SHARED];
+  lane_t *l = &lanes[lane_of(j)];
   pthread_mutex_lock(&q_mu);
   if (l->tail) l->tail->next = j;
   else l->head = j;
@@ -1415,6 +1425,8 @@ void reads_start(int n) {
   lanes[LANE_SHARED].gap = (e = getenv("GAP_SHARED_US")) ? atoll(e) : 160000;
   lanes[LANE_FEED].gap = (e = getenv("GAP_FEED_US")) ? atoll(e) : 160000;
   lanes[LANE_COMMENT].gap = (e = getenv("GAP_COMMENT_US")) ? atoll(e) : 160000;
+  lanes[LANE_FAST].gap = (e = getenv("GAP_FAST_US")) ? atoll(e) : 160000;
+  if ((e = getenv("FAST_LANE"))) fast_on = atoi(e);
   if ((e = getenv("HUB_EST"))) hub_est = atoll(e);
   trace_on = getenv("READ_TRACE") != NULL;
   pair_flags = !getenv("PAIR_FLAGS") || atoi(getenv("PAIR_FLAGS"));
