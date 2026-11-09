@@ -45,7 +45,7 @@ extension OutgoingReply {
     /// reactor's loop, one after another, lending `bodies` (where the `.slice` bodies are) for each. Once the calls
     /// are back no reactor holds `bodies` or a bucket any more, so the caller writes into them again in place.
     /// `buckets` is the caller's, one per reactor, kept from one delivery to the next.
-    static func deliver(_ replies: borrowing [OutgoingReply], to reactors: [Reactor], bodies: borrowing [UInt8] = [],
+    static func deliver(_ replies: borrowing [OutgoingReply], to reactors: [Reactor], bodies: Span<UInt8>,
                         buckets: inout [[OutgoingReply]]) async {
         guard !replies.isEmpty else { return }
         if reactors.count == 1 || replies.allSatisfy({ $0.addr.worker == replies[0].addr.worker }) {
@@ -58,6 +58,12 @@ extension OutgoingReply {
             await reactors[i].deliver(buckets[i], bodies: bodies)
             buckets[i].removeAll(keepingCapacity: true)
         }
+    }
+
+    /// `deliver` for replies with no `.slice` bodies.
+    static func deliver(_ replies: borrowing [OutgoingReply], to reactors: [Reactor], buckets: inout [[OutgoingReply]]) async {
+        let none: [UInt8] = []
+        await deliver(replies, to: reactors, bodies: none.span, buckets: &buckets)
     }
 }
 
@@ -95,6 +101,8 @@ actor ReadLane: LoopIsolated {
     private var cmtAuthorRows: [RowSpan] = []
     private var cmtFollows: [Pair] = []
     private var cmtSlices: [CachedCommentSlice] = []
+    /// A thread's comments as they are sorted: created, id, the comment's row and its author's (`cmt_sort_buf`).
+    private var cmtSortBuf: [(created: Int64, id: Int64, row: RowSpan, author: RowSpan)] = []
     private var kGlobal = KeySet<PairKey>()
     private var kFilterCounts = [BytesKeySet(), BytesKeySet(), BytesKeySet()]
     private var kFilterPages = [KeySet<PageKey>(), KeySet<PageKey>(), KeySet<PageKey>()]
@@ -109,8 +117,9 @@ actor ReadLane: LoopIsolated {
     /// The batch's requests not answered yet: the ones a failure must answer with a 500.
     private var errorAddrs: [ReplyAddr] = []
     private var authorSpans: [RowSpan?] = []
-    private var favPairs: [Pair] = []
-    private var follPairs: [Pair] = []
+    /// The (viewer, article) and (viewer, author) pairs phase B asks about, packed as `packPair` packs them.
+    private var favPairs: [UInt64] = []
+    private var follPairs: [UInt64] = []
     private var favViewers: [Int64] = []
     private var favTargets: [Int64] = []
     private var favStarts: [Int32] = []
@@ -172,7 +181,7 @@ actor ReadLane: LoopIsolated {
     private func send(_ replies: borrowing [OutgoingReply]) async {
         var b: [[OutgoingReply]] = []
         swap(&b, &buckets)
-        await OutgoingReply.deliver(replies, to: reactors, bodies: out.bytes, buckets: &b)
+        await OutgoingReply.deliver(replies, to: reactors, bodies: out.span, buckets: &b)
         swap(&b, &buckets)
     }
 
@@ -180,7 +189,7 @@ actor ReadLane: LoopIsolated {
     private func sortedCopy(_ keys: [Int64]) -> [Int64] {
         sortedKeys.removeAll(keepingCapacity: true)
         sortedKeys.append(contentsOf: keys)
-        sortedKeys.sort()
+        sortedKeys.sortUnstable()
         return sortedKeys
     }
 
@@ -260,7 +269,7 @@ actor ReadLane: LoopIsolated {
         }
         for p in 0..<nPage {
             var rp = raw[p]
-            if rp.count > 1 { rp.sort { $0.0 > $1.0 } }
+            if rp.count > 1 { rp.sortUnstable { $0.0 > $1.0 } }
             pages[p].reserveCapacity(rp.count)
             for (aid, author, span) in rp { pages[p].append(internArt(aid, author, span, hasMeta ? .phaseA(span) : .none)) }
         }
@@ -408,9 +417,15 @@ actor ReadLane: LoopIsolated {
             if let failed = pa.results.first(where: { $0.error != nil }) { throw .wire("phase A1 error: \(failed.error!)") }
             if needTagsEndpoint, let s = stTags {
                 let range = pa.resultRows(s)
-                var sorted = Array(pa.rows[range])
-                sorted.sort { Self.lexLess(pa.text(pa.cell($0, 1)), pa.text(pa.cell($1, 1))) }
-                pa.rows.replaceSubrange(range, with: sorted)
+                // In place, as the Rust sorts the slice: the rows go aside while the comparison reads cells and bytes.
+                var rows: [RowSpan] = []
+                swap(&rows, &pa.rows)
+                rows.withUnsafeMutableBufferPointer {
+                    [RowSpan].sortUnstable(UnsafeMutableBufferPointer(rebasing: $0[range])) {
+                        Self.lexLess(pa.text(pa.cell($0, 1)), pa.text(pa.cell($1, 1)))
+                    }
+                }
+                swap(&rows, &pa.rows)
             }
             if touchesArticles, let s = stTags {
                 let range = pa.resultRows(s)
@@ -486,32 +501,32 @@ actor ReadLane: LoopIsolated {
             switch slot {
             case .bySlug(let k):
                 if let art = slugRows[Int(k)] {
-                    favPairs.append(Pair(v: v, t: art.aid))
-                    follPairs.append(Pair(v: v, t: art.author))
+                    favPairs.append(Self.packPair(v, art.aid))
+                    follPairs.append(Self.packPair(v, art.author))
                 }
             case .byId(let k, let knownFav):
                 if let art = idRows[Int(k)] {
-                    if knownFav == nil { favPairs.append(Pair(v: v, t: art.aid)) }
-                    follPairs.append(Pair(v: v, t: art.author))
+                    if knownFav == nil { favPairs.append(Self.packPair(v, art.aid)) }
+                    follPairs.append(Self.packPair(v, art.author))
                 }
             case .global(let p):
                 for art in globalPages[Int(p)] {
-                    favPairs.append(Pair(v: v, t: art.aid))
-                    follPairs.append(Pair(v: v, t: art.author))
+                    favPairs.append(Self.packPair(v, art.aid))
+                    follPairs.append(Self.packPair(v, art.author))
                 }
             case .filtered(let kind, _, let p):
                 let rows = filterResults[kind].1[Int(p)]
                 if kind == 1 {
-                    if let first = rows.first { follPairs.append(Pair(v: v, t: first.author)) }
-                    for art in rows { favPairs.append(Pair(v: v, t: art.aid)) }
+                    if let first = rows.first { follPairs.append(Self.packPair(v, first.author)) }
+                    for art in rows { favPairs.append(Self.packPair(v, art.aid)) }
                 } else {
                     for art in rows {
-                        favPairs.append(Pair(v: v, t: art.aid))
-                        follPairs.append(Pair(v: v, t: art.author))
+                        favPairs.append(Self.packPair(v, art.aid))
+                        follPairs.append(Self.packPair(v, art.author))
                     }
                 }
             case .feed(_, let p):
-                for art in feedPages[Int(p)] { favPairs.append(Pair(v: v, t: art.aid)) }
+                for art in feedPages[Int(p)] { favPairs.append(Self.packPair(v, art.aid)) }
             case .tags, .user, .login, .profile, .comments:
                 break
             }
@@ -587,8 +602,8 @@ actor ReadLane: LoopIsolated {
                         follHits.append(packed)
                     }
                 }
-                favHits.sort()
-                follHits.sort()
+                favHits.sortUnstable()
+                follHits.sortUnstable()
             }
         }
 
@@ -774,7 +789,7 @@ actor ReadLane: LoopIsolated {
                 let tid = Int(elem.bytes.load(fromByteOffset: 0, as: Int32.self, .bigEndian))
                 if tid >= 0 && tid < tagLut.count && !tagLut[tid].isNull { tagSortBuf.append(tagLut[tid]) }
             }
-            if tagSortBuf.count > 1 { tagSortBuf.sort { Self.lexLess(pa.text($0), pa.text($1)) } }
+            if tagSortBuf.count > 1 { tagSortBuf.sortUnstable { Self.lexLess(pa.text($0), pa.text($1)) } }
             for (i, name) in tagSortBuf.enumerated() {
                 if i > 0 { arena.append(0x2C) }
                 JSON.writeString(&arena, pa.text(name))
@@ -833,7 +848,7 @@ actor ReadLane: LoopIsolated {
                 cmtFollows.append(Pair(v: pa.i64(r, 1), t: pa.i64(r, 2)))
             }
         }
-        cmtFollows.sort()
+        cmtFollows.sortUnstable()
         var threadSlices = [Range<Int>?](repeating: nil, count: n)
         var rendered = [Range<Int32>?](repeating: nil, count: n)
         var replies: [OutgoingReply] = []
@@ -876,20 +891,21 @@ actor ReadLane: LoopIsolated {
     /// Thread `k`'s comments, newest first, each written once into the arena up to its author's `following`; their
     /// slices are appended to `cmtSlices`, and the range they take there returned.
     private func renderThread(_ k: Int) -> Range<Int> {
-        cmtThreads[k].sort { a, b in
-            let (ca, cb) = (pa.i64(a, 4), pa.i64(b, 4))
-            return ca != cb ? ca > cb : pa.i64(a, 2) > pa.i64(b, 2)
-        }
-        let first = cmtSlices.count
+        // The sort keys read out first, as the Rust does, so the sort compares integers.
+        cmtSortBuf.removeAll(keepingCapacity: true)
         for r in cmtThreads[k] {
+            guard let au = cmtAuthors.ordinal(of: pa.i64(r, 3)) else { continue }
+            cmtSortBuf.append((pa.i64(r, 4), pa.i64(r, 2), r, cmtAuthorRows[Int(au)]))
+        }
+        cmtSortBuf.sortUnstable { a, b in a.created != b.created ? a.created > b.created : a.id > b.id }
+        let first = cmtSlices.count
+        for (created, id, r, author) in cmtSortBuf {
             let authorID = pa.i64(r, 3)
-            guard let au = cmtAuthors.ordinal(of: authorID) else { continue }
-            let author = cmtAuthorRows[Int(au)]
             let start = UInt32(arena.count)
             arena.append("{\"id\":")
-            JSON.writeInt(&arena, pa.i64(r, 2))
+            JSON.writeInt(&arena, id)
             arena.append(",\"createdAt\":")
-            JSON.writeTimestamp(&arena, pa.i64(r, 4))
+            JSON.writeTimestamp(&arena, created)
             arena.append(",\"updatedAt\":")
             JSON.writeTimestamp(&arena, pa.i64(r, 5))
             arena.append(",\"body\":")
@@ -955,91 +971,95 @@ actor ReadLane: LoopIsolated {
 
 extension ReadLane {
     /// A profile as one viewer asks for it: the row carries whether that viewer follows it.
-    struct ProfileKey: Hashable {
+    struct ProfileKey: FastHashable {
         let viewer: Int64
         let username: SmallBytes
+
+        func feed(_ hasher: inout FastHasher) {
+            hasher.write(viewer)
+            username.feed(&hasher)
+        }
     }
 
-    struct PairKey: Hashable {
+    struct PairKey: FastHashable {
         let a: Int64
         let b: Int64
+
+        func feed(_ hasher: inout FastHasher) {
+            hasher.write(a)
+            hasher.write(b)
+        }
     }
 
-    struct PageKey: Hashable {
+    struct PageKey: FastHashable {
         let c: UInt32
         let lim: Int64
         let off: Int64
+
+        func feed(_ hasher: inout FastHasher) {
+            hasher.write(UInt64(c))
+            hasher.write(lim)
+            hasher.write(off)
+        }
     }
 
-    /// Distinct keys in first-seen order, each with its ordinal (`KeySet`).
-    struct KeySet<K: Hashable> {
-        private var index: [K: UInt32] = [:]
+    /// Distinct keys in first-seen order, each with its ordinal (`KeySet`), indexed by their `FastHasher` hash.
+    struct KeySet<K: FastHashable> {
+        private var index = IndexTable()
         private(set) var items: [K] = []
 
         var count: Int { items.count }
 
         mutating func clear() {
-            index.removeAll(keepingCapacity: true)
+            index.clear()
             items.removeAll(keepingCapacity: true)
         }
 
         mutating func intern(_ key: K) -> UInt32 {
-            if let i = index[key] { return i }
+            let h = key.fastHash
+            if let i = index.find(h, { items[Int($0)] == key }) { return i }
             let i = UInt32(items.count)
-            index[key] = i
+            index.insert(h, i)
             items.append(key)
             return i
         }
 
-        @inline(__always) func ordinal(of key: K) -> UInt32? { index[key] }
+        @inline(__always) func ordinal(of key: K) -> UInt32? { index.find(key.fastHash) { items[Int($0)] == key } }
     }
 
     @inline(__always) private static func sameBytes(_ a: Span<UInt8>, _ b: Span<UInt8>) -> Bool {
         guard a.count == b.count else { return false }
-        for i in a.indices where a[i] != b[i] { return false }
-        return true
+        return a.withUnsafeBytes { pa in b.withUnsafeBytes { pb in Bytes.compare(pa.baseAddress, pb.baseAddress, a.count) == 0 } }
     }
 
     /// `KeySet<String>`, whose items go to Postgres as a text[]. It is also looked up by a row's column, a borrowed
-    /// `Span`, without copying it: the index is keyed by the bytes' FNV-1a hash, with a chain for keys sharing one.
+    /// `Span`, without copying it: a `SmallBytes` and the same bytes in a `Span` hash alike.
     struct BytesKeySet {
-        private var firstWithHash: [UInt64: UInt32] = [:]
-        private var nextWithHash: [UInt32] = []
+        private var index = IndexTable()
         private(set) var items: [SmallBytes] = []
 
         var count: Int { items.count }
 
         mutating func clear() {
-            firstWithHash.removeAll(keepingCapacity: true)
-            nextWithHash.removeAll(keepingCapacity: true)
+            index.clear()
             items.removeAll(keepingCapacity: true)
         }
 
         @inline(__always) private static func hash(_ key: Span<UInt8>) -> UInt64 {
-            var h: UInt64 = 0xCBF2_9CE4_8422_2325
-            for i in key.indices { h = (h ^ UInt64(key[i])) &* 0x100_0000_01B3 }
-            return h
+            var h = FastHasher()
+            h.write(bytes: key)
+            return h.finish()
         }
 
         func ordinal(of key: Span<UInt8>) -> UInt32? {
-            var i = firstWithHash[Self.hash(key)] ?? .max
-            while i != .max {
-                if items[Int(i)].withSpan({ sameBytes($0, key) }) { return i }
-                i = nextWithHash[Int(i)]
-            }
-            return nil
+            index.find(Self.hash(key)) { items[Int($0)].withSpan { sameBytes($0, key) } }
         }
 
         mutating func intern(_ key: SmallBytes) -> UInt32 {
-            let h = key.withSpan { Self.hash($0) }
-            var j = firstWithHash[h] ?? .max
-            while j != .max {
-                if items[Int(j)] == key { return j }
-                j = nextWithHash[Int(j)]
-            }
+            let h = key.fastHash
+            if let i = index.find(h, { items[Int($0)] == key }) { return i }
             let i = UInt32(items.count)
-            nextWithHash.append(firstWithHash[h] ?? .max)
-            firstWithHash[h] = i
+            index.insert(h, i)
             items.append(key)
             return i
         }
@@ -1129,7 +1149,8 @@ extension ReadLane {
         return c != 0 ? c < 0 : a.count < b.count
     }
 
-    private static func buildFlagRuns(_ pairs: inout [Pair], _ viewers: inout [Int64], _ targets: inout [Int64],
+    /// The packed pairs sorted and deduplicated as integers, then as runs: each viewer once, its targets in a row.
+    private static func buildFlagRuns(_ pairs: inout [UInt64], _ viewers: inout [Int64], _ targets: inout [Int64],
                                       _ starts: inout [Int32], _ ends: inout [Int32]) {
         pairs.sortAndDedup()
         viewers.removeAll(keepingCapacity: true)
@@ -1137,17 +1158,18 @@ extension ReadLane {
         starts.removeAll(keepingCapacity: true)
         ends.removeAll(keepingCapacity: true)
         guard let first = pairs.first else { return }
-        var current = first.v
+        var current = Int64(Int32(truncatingIfNeeded: first >> 32))
         var runStart: Int32 = 1
         for (i, p) in pairs.enumerated() {
-            if p.v != current {
+            let v = Int64(Int32(truncatingIfNeeded: p >> 32))
+            if v != current {
                 viewers.append(current)
                 starts.append(runStart)
                 ends.append(Int32(i))
-                current = p.v
+                current = v
                 runStart = Int32(i) + 1
             }
-            targets.append(p.t)
+            targets.append(Int64(Int32(truncatingIfNeeded: p)))
         }
         viewers.append(current)
         starts.append(runStart)
@@ -1182,9 +1204,9 @@ extension Array where Element: Comparable {
     }
 }
 
-extension Array where Element == ReadLane.Pair {
+extension Array where Element == UInt64 {
     fileprivate mutating func sortAndDedup() {
-        sort()
+        sortUnstable()
         var w = 0
         for i in indices where w == 0 || self[i] != self[w - 1] {
             self[w] = self[i]

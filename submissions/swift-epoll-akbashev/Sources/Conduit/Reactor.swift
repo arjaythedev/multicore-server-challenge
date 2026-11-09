@@ -100,7 +100,7 @@ actor Reactor {
     }
 
     /// A batch of replies from a lane (flush_outbox), with the buffer their `.slice` bodies are in, lent for the call.
-    func deliver(_ replies: borrowing [OutgoingReply], bodies: borrowing [UInt8]) {
+    func deliver(_ replies: borrowing [OutgoingReply], bodies: Span<UInt8>) {
         for i in replies.indices {
             let rep = replies[i]
             let s = Int(rep.addr.slot)
@@ -109,9 +109,7 @@ actor Reactor {
             switch rep.body {
             case .bytes(let body): body.withUnsafeBytes { writeResponse(rep.addr.slot, rep.status, $0) }
             case .slice(let range):
-                bodies.withUnsafeBytes {
-                    writeResponse(rep.addr.slot, rep.status, UnsafeRawBufferPointer(rebasing: $0[Int(range.lowerBound)..<Int(range.upperBound)]))
-                }
+                bodies.extracting(Int(range.lowerBound)..<Int(range.upperBound)).withUnsafeBytes { writeResponse(rep.addr.slot, rep.status, $0) }
             case .error(let message): writeError(rep.addr.slot, rep.status, message)
             }
             if hasBufferedRx { pipelinedSlots.append(rep.addr.slot) }
@@ -166,7 +164,6 @@ actor Reactor {
                 default: return
                 }
             }
-            Sys.setNoDelay(fd)
             let slot: UInt32
             if let idx = freeSlots.popLast() {
                 let s = Int(idx)

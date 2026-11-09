@@ -63,7 +63,8 @@ struct Conduit {
 
         Sys.logLine("listening on \(host):\(port) (\(ioWorkers) io, \(readWorkers) read, \(writeWorkers) write, "
             + "\(cryptoWorkers)x\(bcryptLanes) crypto (\(bcryptKernel) kernel), L1D=\(l1dKB)KB, nofile=\(fdBudget)/io, "
-            + "bcrypt cost 10 = \(seedBcryptUs / 1000) ms per \(autoLanes)-lane batch, calibrated in \(calibrationMs) ms)")
+            + "bcrypt cost 10 = \(seedBcryptUs / 1000) ms per \(autoLanes)-lane batch, calibrated in \(calibrationMs) ms, "
+            + "SHA-256 \(SHA256.usesExtensions ? "on the CPU's SHA extensions" : "in Swift"))")
 
         // The server's root task, on reactor 0's loop: it starts every actor as a child and waits on them for good.
         Task(executorPreference: mainLoop) {

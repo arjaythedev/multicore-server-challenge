@@ -289,7 +289,7 @@ struct PipelineBuf: ~Copyable {
 
     /// A copy of a cell's bytes; nil for NULL.
     func copy(_ c: Cell) -> [UInt8]? {
-        c.isNull ? nil : ByteBuffer(copying: text(c)).take()
+        c.isNull ? nil : [UInt8](copying: text(c))
     }
 }
 
@@ -401,7 +401,7 @@ struct PgConn: ~Copyable {
         }
     }
 
-    private func payload(_ r: Range<Int>) -> [UInt8] { ByteBuffer(copying: rx.span.extracting(r)).take() }
+    private func payload(_ r: Range<Int>) -> [UInt8] { [UInt8](copying: rx.span.extracting(r)) }
 
     private mutating func authenticate(_ ep: DbEndpoint) throws(PgError) {
         var scram: (bare: String, nonce: String)?

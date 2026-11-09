@@ -270,7 +270,7 @@ actor WriteLane: LoopIsolated {
             guard let r = first else { return replies.append(OutgoingReply.error(addr, 500, "internal server error")) }
             var sortedTags = tags
             if sortedTags.count > 1 {
-                sortedTags.sort { $0.lexicographicallyPrecedes($1) }
+                sortedTags.sortUnstable { $0.lexicographicallyPrecedes($1) }
                 var w = 1
                 for i in 1..<sortedTags.count where sortedTags[i] != sortedTags[w - 1] {
                     sortedTags[w] = sortedTags[i]

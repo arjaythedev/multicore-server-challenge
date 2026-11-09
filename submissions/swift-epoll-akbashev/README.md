@@ -12,7 +12,7 @@ has no dependencies: its own HTTP/1.1 server, Postgres wire client, SHA-256/HMAC
 | Dependencies | none: the standard library, Synchronization, Glibc |
 | HTTP | hand-rolled HTTP/1.1 on epoll, one `SO_REUSEPORT` listener per reactor |
 | Postgres | hand-rolled protocol 3.0 client: SCRAM-SHA-256, extended protocol, binary rows, pipelines |
-| JWT | HS256 with the secret's HMAC midstates precomputed (portable SHA-256) |
+| JWT | HS256 with the secret's HMAC midstates precomputed; SHA-256 on the CPU's SHA extensions where it has them |
 | bcrypt | cost 10, several hashes in lockstep per thread, width calibrated at start-up; generated Swift kernels |
 | Allocator | jemalloc (`libjemalloc2`, installed by `install.sh`, preloaded by `start.sh`); glibc malloc without it |
 | Build | release, `-Ounchecked` and `-enforce-exclusivity=unchecked` (see Correctness), for the box's own CPU |
@@ -33,7 +33,8 @@ an actor's, and Swift's global executor, with libdispatch's threads behind it, i
 
 Inside an actor, state is plain: a reactor's connection table, a lane's Postgres connection and arenas. Nothing is
 `@unchecked Sendable`; what crosses between actors is a value (`ReadTask`, `WriteTask`, `CryptoTask`, replies whose
-bodies are `[UInt8]`), and messages are per epoll tick or per batch, never per request:
+bodies are `[UInt8]` or a range of a read batch's body buffer, which the lane lends to each reactor as a `Span` for
+the call), and messages are per epoll tick or per batch, never per request:
 
 - **Reactor** (`Reactor.swift`): blocks in `epoll_wait` on its own loop with its sockets and the loop's eventfd in the
   set, one call per tick. It parses, verifies the token and routes (`Router.swift`), answers what needs no Postgres,
@@ -41,7 +42,8 @@ bodies are `[UInt8]`), and messages are per epoll tick or per batch, never per r
   as one `deliver` message per batch; when one is queued the reactor yields (`Task.yield()` re-enqueues on the actor's
   own executor) and the message runs on the same thread. A pass lasts at least 2 ms: with fewer events than its buffer
   holds, the reactor waits out the rest on its loop, so work and replies travel in fewer, larger messages.
-  `unshare(CLONE_FILES)` gives each reactor thread its own descriptor table.
+  `unshare(CLONE_FILES)` gives each reactor thread its own descriptor table, and `TCP_NODELAY` is set once on each
+  listener, which accepted sockets inherit.
 - **Scheduler** (`Scheduler.swift`): a lane, write lane or bcrypt worker takes its next batch under the lock, and when
   there is none yet waits on its own loop (an `isolated` parameter makes it the caller's), until the call that makes
   its batch ready wakes it or its window ends. Reads wait in three queues: fast (tags, users, logins, profiles,
@@ -64,7 +66,9 @@ bodies are `[UInt8]`), and messages are per epoll tick or per batch, never per r
   feed's index-only finds), and the viewers' flags, which rendering finds through bit filters before a sorted search.
   Each article's JSON is written once per batch with its viewer-dependent booleans left open, and identical responses
   are built once and shared. A request's slug, username, email or tag is held inline (`SmallBytes`), so routing a
-  read allocates nothing for it. Postgres I/O blocks the lane's own thread; the sockets have `TCP_NODELAY` and
+  read allocates nothing for it. A batch's distinct keys are indexed by a hash table of the lane's own (open
+  addressing, one multiply per word: Swift's `Dictionary` always hashes with SipHash), the viewers' flag pairs are
+  packed into one `UInt64` each, and sorts are in place with their comparison inlined. Postgres I/O blocks the lane's own thread; the sockets have `TCP_NODELAY` and
   `TCP_QUICKACK`. The two-round-trip plan and its SQL are rust-epoll-theCatWisel's.
 - **Write lane** (`WriteLane.swift`): group commit in one implicit pipeline transaction, favorites, follows and new
   comments merged into `unnest` statements (in article order) unless the group also changes what they read,
@@ -87,7 +91,8 @@ bodies are `[UInt8]`), and messages are per epoll tick or per batch, never per r
 
 ## Swift 6.4 features, and where
 
-- `~Copyable`: `ByteBuffer` (one owner, never copied, so appending never copies its array), `UniqueArray` (the
+- `~Copyable`: `ByteBuffer` (owns its memory, as Rust's `Vec<u8>`: one owner, never copied, so appending is a
+  capacity check and a copy, with no uniqueness check and no generic `append(contentsOf:)`), `UniqueArray` (the
   reactor's connection slots, each owning its buffers), `PgConn` (owns its socket, closes it in `deinit`),
   `PipelineBuf`, `TxBuf`, and the `Router.Dispatch`/`HTTP.ParseOutcome` results, each used once.
 - `Span`, `RawSpan`, `MutableSpan`, `OutputSpan`: every byte reader takes a `Span`; integers are loaded from a
@@ -106,8 +111,12 @@ bodies are `[UInt8]`), and messages are per epoll tick or per batch, never per r
 - `@_extern(c)`: the Linux calls Glibc's module leaves out (epoll, eventfd, accept4, unshare, getrandom,
   sched_setscheduler, prctl, mallopt), declared in Swift in a module of their own (`Sources/Syscalls`). Each is the C
   function itself, so a call to one is a direct call.
-- Byte search is glibc's `memchr`, JSON escaping uses portable `SIMD16`, and SHA-256 is a portable compression
-  function: Swift has no counterpart to C's x86 intrinsics.
+- `Builtin`: Swift has no counterpart to C's x86 intrinsics, but its compiler's `Builtin` module reaches the
+  instructions, so SHA-256 runs on the CPU's SHA extensions where it has them (`Sources/SHAExtensions`, built with
+  the compiler's hidden `-enable-builtin-module` flag and the SHA instructions enabled for that module alone). At
+  start-up the server checks `/proc/cpuinfo` for `sha_ni` and that the module hashes test messages as its portable
+  Swift function does, and uses the portable one otherwise.
+- Byte search is glibc's `memchr`; JSON escaping uses portable `SIMD16`, copying a string as it checks it.
 
 ## Settings
 

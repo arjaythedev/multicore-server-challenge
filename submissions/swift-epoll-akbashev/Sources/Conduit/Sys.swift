@@ -131,6 +131,8 @@ extension Sys {
         for opt in [SO_REUSEADDR, SO_REUSEPORT] {
             guard setIntOption(fd, SOL_SOCKET, opt, 1) == 0 else { throw SystemError("setsockopt") }
         }
+        // Set once here, as the Rust does: Linux gives every accepted socket the listener's TCP_NODELAY.
+        _ = setIntOption(fd, IPPROTO_TCP, TCP_NODELAY, 1)
         let bound: Int32
         if isV4 {
             var sa = sockaddr_in()
@@ -151,7 +153,7 @@ extension Sys {
         return fd
     }
 
-    /// TCP_NODELAY on an accepted or connected socket.
+    /// TCP_NODELAY on a connected socket.
     @inline(__always) static func setNoDelay(_ fd: Int32) {
         _ = setIntOption(fd, IPPROTO_TCP, TCP_NODELAY, 1)
     }
@@ -172,6 +174,21 @@ extension Sys {
             }
             off += n
         }
+    }
+
+    /// Whether /proc/cpuinfo's `flags` line lists `flag`.
+    static func cpuHasFlag(_ flag: String) -> Bool {
+        guard let file = fopen("/proc/cpuinfo", "r") else { return false }
+        defer { fclose(file) }
+        var line: UnsafeMutablePointer<CChar>?
+        var size = 0
+        defer { free(line) }
+        while getline(&line, &size, file) > 0, let line {
+            let text = String(cString: line)
+            guard text.hasPrefix("flags") else { continue }
+            return text.split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "\n" }).contains { $0 == flag }
+        }
+        return false
     }
 
     /// A line on standard error (Rust's `eprintln!`).

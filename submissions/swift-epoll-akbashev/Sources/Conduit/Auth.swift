@@ -1,9 +1,13 @@
 // auth.rs: SHA-256 and HMAC-SHA256 (the JWT's HS256 with the secret's ipad/opad midstates computed once), JWT
-// verification and issuing, and bcrypt with several hashes run in lockstep. The Rust's x86 SHA-NI path has no Swift
-// counterpart (Swift doesn't reach CPU intrinsics), so SHA-256 is the Rust's portable compression function.
+// verification and issuing, and bcrypt with several hashes run in lockstep. SHA-256 runs on the CPU's SHA extensions
+// where it has them, as the Rust's SHA-NI path (the SHAExtensions module), and on the Rust's portable compression
+// function otherwise.
 import Glibc
+#if arch(x86_64)
+import SHAExtensions
+#endif
 
-/// SHA-256 and HMAC-SHA256: the Rust's portable compression function.
+/// SHA-256 and HMAC-SHA256.
 enum SHA256 {
     typealias State = InlineArray<8, UInt32>
     typealias Digest = InlineArray<32, UInt8>
@@ -69,23 +73,51 @@ enum SHA256 {
         compressWords(&state, w)
     }
 
-    static func hash(from initial: State, priorBytes: UInt64, _ data: Span<UInt8>) -> State {
+    /// Compresses the `blocks` 64-byte blocks of `data`, on the CPU's SHA extensions if `extensions`.
+    @inline(__always) static func compress(_ state: inout State, _ data: RawSpan, blocks: Int, extensions: Bool) {
+        #if arch(x86_64)
+        if extensions {
+            data.withUnsafeBytes { raw in
+                withUnsafeMutableBytes(of: &state) { SHAExtensions.compress($0.baseAddress!.assumingMemoryBound(to: UInt32.self), raw.baseAddress!, blocks: blocks) }
+            }
+            return
+        }
+        #endif
+        for i in 0..<blocks { compressBlock(&state, data, at: 64 * i) }
+    }
+
+    static func hash(from initial: State, priorBytes: UInt64, _ data: Span<UInt8>, extensions: Bool = usesExtensions) -> State {
         var state = initial
         let full = data.count / 64
-        for i in 0..<full { compressBlock(&state, data.bytes, at: 64 * i) }
+        if full > 0 { compress(&state, data.bytes, blocks: full, extensions: extensions) }
+        // The rest, 0x80, zeros and the length in bits: one block, or two when the rest leaves no room for the length.
         let rem = data.count - 64 * full
+        let blocks = rem >= 56 ? 2 : 1
         let totalBits = (priorBytes + UInt64(data.count)) * 8
-        var tail = InlineArray<64, UInt8>(repeating: 0)
+        var tail = InlineArray<128, UInt8>(repeating: 0)
         for i in 0..<rem { tail[i] = data[64 * full + i] }
         tail[rem] = 0x80
-        if rem >= 56 {
-            compressBlock(&state, tail.span.bytes)
-            tail = InlineArray(repeating: 0)
-        }
-        for i in 0..<8 { tail[56 + i] = UInt8(truncatingIfNeeded: totalBits >> (56 - 8 * UInt64(i))) }
-        compressBlock(&state, tail.span.bytes)
+        for i in 0..<8 { tail[64 * blocks - 8 + i] = UInt8(truncatingIfNeeded: totalBits >> (56 - 8 * UInt64(i))) }
+        compress(&state, tail.span.bytes, blocks: blocks, extensions: extensions)
         return state
     }
+
+    /// Whether SHA-256 runs on the CPU's SHA extensions: the CPU lists them (`sha_ni` in /proc/cpuinfo), and they
+    /// hash messages of every padding case as the Swift function does. Checked once.
+    static let usesExtensions: Bool = {
+        #if arch(x86_64)
+        guard Sys.cpuHasFlag("sha_ni") else { return false }
+        for n in [0, 1, 55, 56, 63, 64, 65, 119, 120, 127, 128, 300] {
+            let message = (0..<n).map { UInt8(truncatingIfNeeded: $0 &* 31 &+ 7) }
+            let fast = hash(from: initialState, priorBytes: 0, message.span, extensions: true)
+            let portable = hash(from: initialState, priorBytes: 0, message.span, extensions: false)
+            for i in 0..<8 where fast[i] != portable[i] { return false }
+        }
+        return true
+        #else
+        return false
+        #endif
+    }()
 
     @inline(__always) static func stateBytes(_ state: State) -> Digest {
         Digest { i in UInt8(truncatingIfNeeded: state[i >> 2] >> (24 - 8 * UInt32(i & 3))) }
@@ -104,6 +136,8 @@ enum SHA256 {
 struct TokenSigner: Sendable {
     private var ipadState: SHA256.State
     private var opadState: SHA256.State
+    /// `SHA256.usesExtensions`, kept here for the requests.
+    private let extensions = SHA256.usesExtensions
 
     init(secret: borrowing [UInt8]) {
         var block = InlineArray<64, UInt8>(repeating: 0)
@@ -122,13 +156,23 @@ struct TokenSigner: Sendable {
     }
 
     func sign(_ data: Span<UInt8>) -> SHA256.Digest {
-        let inner = SHA256.hash(from: ipadState, priorBytes: 64, data)
-        let words: InlineArray<16, UInt32> = [
-            inner[0], inner[1], inner[2], inner[3], inner[4], inner[5], inner[6], inner[7],
-            0x8000_0000, 0, 0, 0, 0, 0, 0, 768,
-        ]
+        let inner = SHA256.hash(from: ipadState, priorBytes: 64, data, extensions: extensions)
         var outer = opadState
-        SHA256.compressWords(&outer, words)
+        if extensions {
+            // The outer block as bytes: the inner digest, 0x80, and the length (64 + 32 bytes, 768 bits).
+            var block = InlineArray<64, UInt8>(repeating: 0)
+            let digest = SHA256.stateBytes(inner)
+            for i in 0..<32 { block[i] = digest[i] }
+            block[32] = 0x80
+            block[62] = 0x03
+            SHA256.compress(&outer, block.span.bytes, blocks: 1, extensions: true)
+        } else {
+            let words: InlineArray<16, UInt32> = [
+                inner[0], inner[1], inner[2], inner[3], inner[4], inner[5], inner[6], inner[7],
+                0x8000_0000, 0, 0, 0, 0, 0, 0, 768,
+            ]
+            SHA256.compressWords(&outer, words)
+        }
         return SHA256.stateBytes(outer)
     }
 

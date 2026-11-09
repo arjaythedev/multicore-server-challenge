@@ -606,7 +606,7 @@ enum Router {
                     return true
                 }
                 guard allStrings else { return failNow(422, "tagList must contain non-empty strings") }
-                tags.sort { $0.lexicographicallyPrecedes($1) }
+                tags.sortUnstable { $0.lexicographicallyPrecedes($1) }
                 var unique: [[UInt8]] = []
                 for t in tags where unique.last != t { unique.append(t) }
                 tags = unique
