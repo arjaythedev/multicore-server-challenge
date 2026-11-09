@@ -82,43 +82,67 @@ enum JSON {
     }
 
     /// Whether 16 bytes need no escaping (the Rust's SSE2 `chunk16_clean`, as portable SIMD).
-    @inline(__always) private static func chunk16Clean(_ raw: RawSpan, _ at: Int) -> Bool {
-        let v = raw.load(fromByteOffset: at, as: SIMD16<UInt8>.self)
+    @inline(__always) private static func clean16(_ v: SIMD16<UInt8>) -> Bool {
         let special = (v .== SIMD16(repeating: 0x22)) .| (v .== SIMD16(repeating: 0x5C)) .| (v .< SIMD16(repeating: 0x20))
         return !any(special)
     }
 
     private static let hexDigits: StaticString = "0123456789abcdef"
 
-    /// `src` as a JSON string, quotes included.
+    /// `src` as a JSON string, quotes included (the Rust's `write_str`). Its clean start is copied as it is scanned,
+    /// 16 bytes at a time, then 8, then one; the first byte that needs escaping hands the rest to `writeEscapedTail`.
     static func writeString(_ dst: inout ByteBuffer, _ src: Span<UInt8>) {
-        let raw = src.bytes
         let n = src.count
-        dst.append(0x22)
-        var pos = 0
-        while pos + 16 <= n, chunk16Clean(raw, pos) { pos += 16 }
-        while pos + 8 <= n, !hasSpecial8(raw.load(fromByteOffset: pos, as: UInt64.self, .littleEndian)) {
-            pos += 8
+        var clean = 0
+        src.withUnsafeBytes { s in
+            _ = dst.appendSpare(maximum: n + 2) { spare in
+                let out = spare.baseAddress!
+                out.storeBytes(of: 0x22, as: UInt8.self)
+                guard let p = s.baseAddress else {
+                    out.storeBytes(of: 0x22, toByteOffset: 1, as: UInt8.self)
+                    clean = n
+                    return 2
+                }
+                var pos = 0
+                while pos + 16 <= n {
+                    let v = p.loadUnaligned(fromByteOffset: pos, as: SIMD16<UInt8>.self)
+                    if !clean16(v) { break }
+                    out.storeBytes(of: v, toByteOffset: 1 + pos, as: SIMD16<UInt8>.self)
+                    pos += 16
+                }
+                while pos + 8 <= n {
+                    let w = p.loadUnaligned(fromByteOffset: pos, as: UInt64.self)
+                    if hasSpecial8(UInt64(littleEndian: w)) { break }
+                    out.storeBytes(of: w, toByteOffset: 1 + pos, as: UInt64.self)
+                    pos += 8
+                }
+                while pos < n {
+                    let c = p.load(fromByteOffset: pos, as: UInt8.self)
+                    if c < 0x20 || c == 0x22 || c == 0x5C { break }
+                    out.storeBytes(of: c, toByteOffset: 1 + pos, as: UInt8.self)
+                    pos += 1
+                }
+                clean = pos
+                if pos < n { return 1 + pos }
+                out.storeBytes(of: 0x22, toByteOffset: 1 + n, as: UInt8.self)
+                return n + 2
+            }
         }
-        while pos < n {
-            let c = src[pos]
-            if c < 0x20 || c == 0x22 || c == 0x5C { break }
-            pos += 1
-        }
-        if pos == n {
-            dst.append(src)
-            dst.append(0x22)
-            return
-        }
-        dst.append(src.extracting(0..<pos))
-        var anchor = pos
-        var idx = pos
+        if clean < n { writeEscapedTail(&dst, src.extracting(clean..<n)) }
+    }
+
+    /// The rest of a string from its first byte that needs escaping, and the closing quote.
+    @inline(never) private static func writeEscapedTail(_ dst: inout ByteBuffer, _ tail: Span<UInt8>) {
+        let raw = tail.bytes
+        let n = tail.count
+        var anchor = 0
+        var idx = 0
         while idx < n {
-            if idx + 16 <= n, chunk16Clean(raw, idx) {
+            if idx + 16 <= n, clean16(raw.load(fromByteOffset: idx, as: SIMD16<UInt8>.self)) {
                 idx += 16
                 continue
             }
-            let c = src[idx]
+            let c = tail[idx]
             let escape: StaticString
             switch c {
             case 0x22: escape = "\\\""
@@ -131,7 +155,7 @@ enum JSON {
                 idx += 1
                 continue
             }
-            dst.append(src.extracting(anchor..<idx))
+            dst.append(tail.extracting(anchor..<idx))
             if escape.utf8CodeUnitCount == 0 {
                 dst.append("\\u00")
                 dst.append(hexDigits.utf8Start[Int(c >> 4)])
@@ -142,7 +166,7 @@ enum JSON {
             anchor = idx + 1
             idx += 1
         }
-        dst.append(src.extracting(anchor..<n))
+        dst.append(tail.extracting(anchor..<n))
         dst.append(0x22)
     }
 
@@ -510,7 +534,7 @@ extension JSON {
 
     /// A string member's text as an owned array (decoded when it has escapes): for a value that outlives the request.
     static func ownedString(_ src: Span<UInt8>, _ member: Member) -> [UInt8] {
-        member.valueEscaped ? unescape(src.extracting(member.value)) : ByteBuffer(copying: src.extracting(member.value)).take()
+        member.valueEscaped ? unescape(src.extracting(member.value)) : [UInt8](copying: src.extracting(member.value))
     }
 
     /// A number member's value.

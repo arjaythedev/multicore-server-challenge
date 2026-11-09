@@ -94,6 +94,7 @@ enum BindParam {
     case i64Array([Int64])
     case i32Array([Int32])
     case textArray([[UInt8]])
+    case keyArray([SmallBytes])
 }
 
 /// The outgoing messages of one pipeline.
@@ -174,6 +175,13 @@ struct TxBuf: ~Copyable {
             for s in items {
                 i32(Int32(s.count))
                 buf.append(s)
+            }
+        case .keyArray(let items):
+            let payload = items.reduce(0) { $0 + 4 + $1.count }
+            arrayHeader(byteLength: 20 + payload, elemOID: OID.text, count: items.count)
+            for s in items {
+                i32(Int32(s.count))
+                s.withSpan { buf.append($0) }
             }
         }
     }
@@ -281,7 +289,7 @@ struct PipelineBuf: ~Copyable {
 
     /// A copy of a cell's bytes; nil for NULL.
     func copy(_ c: Cell) -> [UInt8]? {
-        c.isNull ? nil : ByteBuffer(copying: text(c)).take()
+        c.isNull ? nil : [UInt8](copying: text(c))
     }
 }
 
@@ -321,6 +329,7 @@ struct PgConn: ~Copyable {
         }
         guard fd >= 0 else { throw .io("connect \(ep.host):\(ep.port): \(String(cString: strerror(errno)))") }
         Sys.setNoDelay(fd)
+        Sys.setQuickAck(fd)
         var conn = PgConn(fd: fd)
 
         var startup: [UInt8] = [0, 0, 0, 0]
@@ -392,7 +401,7 @@ struct PgConn: ~Copyable {
         }
     }
 
-    private func payload(_ r: Range<Int>) -> [UInt8] { ByteBuffer(copying: rx.span.extracting(r)).take() }
+    private func payload(_ r: Range<Int>) -> [UInt8] { [UInt8](copying: rx.span.extracting(r)) }
 
     private mutating func authenticate(_ ep: DbEndpoint) throws(PgError) {
         var scram: (bare: String, nonce: String)?

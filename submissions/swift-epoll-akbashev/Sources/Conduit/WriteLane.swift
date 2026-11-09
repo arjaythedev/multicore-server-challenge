@@ -1,4 +1,4 @@
-// engine.rs's WriteWorker: the write lane. Every write waiting is pipelined before one Sync, which makes them one
+// engine.rs's WriteWorker: a write lane. Each group the scheduler gathers for it is pipelined before one Sync, which makes them one
 // implicit transaction committed at the Sync (group commit); responses go out only after Postgres reports it done.
 // Favorites, follows and new comments of a group run as one `unnest` statement per kind, unless the group also
 // changes what they would read (the same article, or a profile). If any statement fails, each write is retried on
@@ -6,13 +6,15 @@
 // the read lanes, with the favorited flag they just set.
 import Glibc
 
-actor WriteLane {
+actor WriteLane: LoopIsolated {
     nonisolated let loop: EventLoop
     nonisolated var unownedExecutor: UnownedSerialExecutor { loop.asUnownedSerialExecutor() }
 
     private let db: DbEndpoint
     private let scheduler: Scheduler
     private let reactors: [Reactor]
+    /// Replies sorted by reactor for a delivery, kept from one to the next.
+    private var buckets: [[OutgoingReply]] = []
     private let signer: TokenSigner
     private var conn: PgConn?
     private var pipe = PipelineBuf()
@@ -34,25 +36,24 @@ actor WriteLane {
     }
 
     func run() async {
-        await withDiscardingTaskGroup { group in
-            while true {
-                let tasks = await scheduler.nextWrites()
-                var replies: [OutgoingReply] = []
-                var postReads: [ReadTask] = []
-                do throws(WriteFailure) {
-                    try commitGroup(tasks, &replies, &postReads)
-                } catch {
-                    Sys.logLine("write group error: \(error.error)")
-                    conn = nil
-                    replies.append(contentsOf: error.addrs.map { OutgoingReply.error($0, 500, "internal server error") })
-                }
-                if !postReads.isEmpty {
-                    let scheduler = scheduler
-                    let work = Submission(reads: postReads)
-                    group.addTask(executorPreference: scheduler.loop) { await scheduler.submit(work) }
-                }
-                OutgoingReply.deliver(replies, to: reactors, &group)
+        var finished = false
+        while true {
+            let tasks = await scheduler.nextWrites(for: self, finished: finished)
+            finished = true
+            var replies: [OutgoingReply] = []
+            var postReads: [ReadTask] = []
+            do throws(WriteFailure) {
+                try commitGroup(tasks, &replies, &postReads)
+            } catch {
+                Sys.logLine("write group error: \(error.error)")
+                conn = nil
+                replies.append(contentsOf: error.addrs.map { OutgoingReply.error($0, 500, "internal server error") })
             }
+            if !postReads.isEmpty { scheduler.submit(Submission(readsFront: postReads)) }
+            var b: [[OutgoingReply]] = []
+            swap(&b, &buckets)
+            await OutgoingReply.deliver(replies, to: reactors, buckets: &b)
+            swap(&b, &buckets)
         }
     }
 
@@ -131,10 +132,10 @@ actor WriteLane {
                 counts.comments += 1
                 locs.append(.batchedComment(ord: counts.comments))
             default:
-                let n = Self.stmtCount(t)
-                locs.append(.direct(start: nExec, count: n))
+                // Every other write is one statement.
+                locs.append(.direct(start: nExec, count: 1))
                 Self.bindSingleWrite(&conn!.tx, t)
-                nExec += n
+                nExec += 1
             }
         }
         conn!.tx.writeSync()
@@ -208,12 +209,11 @@ actor WriteLane {
     private func execIndividual(_ task: WriteTask, _ replies: inout [OutgoingReply],
                                 _ postReads: inout [ReadTask]) throws(PgError) {
         try ensureConn()
-        let n = Self.stmtCount(task)
         Self.bindSingleWrite(&conn!.tx, task)
         conn!.tx.writeSync()
         try conn!.flush()
-        try conn!.readPipeline(into: &pipe, expected: n)
-        finalize(task, 0, n, &replies, &postReads)
+        try conn!.readPipeline(into: &pipe, expected: 1)
+        finalize(task, 0, 1, &replies, &postReads)
     }
 
     private func finalize(_ task: WriteTask, _ start: Int, _ count: Int, _ replies: inout [OutgoingReply],
@@ -270,7 +270,7 @@ actor WriteLane {
             guard let r = first else { return replies.append(OutgoingReply.error(addr, 500, "internal server error")) }
             var sortedTags = tags
             if sortedTags.count > 1 {
-                sortedTags.sort { $0.lexicographicallyPrecedes($1) }
+                sortedTags.sortUnstable { $0.lexicographicallyPrecedes($1) }
                 var w = 1
                 for i in 1..<sortedTags.count where sortedTags[i] != sortedTags[w - 1] {
                     sortedTags[w] = sortedTags[i]
@@ -313,11 +313,6 @@ extension WriteLane {
         let addrs: [ReplyAddr]
     }
 
-    private static func stmtCount(_ task: WriteTask) -> Int {
-        if case .createArticle(_, _, _, let tags) = task.op, !tags.isEmpty { return 3 }
-        return 1
-    }
-
     /// The slug's prefix: ASCII letters and digits, lowercased, runs of anything else as one dash.
     static func slugifyASCII(_ title: [UInt8]) -> [UInt8] {
         var out: [UInt8] = []
@@ -352,11 +347,9 @@ extension WriteLane {
         case .favorite(let slug, let on):
             tx.bindAndExec(on ? "fav" : "unfav", [.i64(v), .text(slug)])
         case .createArticle(let title, let description, let body, let tags):
-            tx.bindAndExec("newart", [.i64(v), .text(title), .text(description), .text(body), .text(slugifyASCII(title))])
-            if !tags.isEmpty {
-                tx.bindAndExec("newtags", [.textArray(tags)])
-                tx.bindAndExec("arttags", [.textArray(tags)])
-            }
+            // The article, its new tags and its tag links in one statement.
+            tx.bindAndExec("newart", [.i64(v), .text(title), .text(description), .text(body), .text(slugifyASCII(title)),
+                                      .textArray(tags)])
         case .updateArticle(let slug, let title, let description, let body):
             tx.bindAndExec("updart", [.text(slug), optText(title), optText(description), optText(body), .i64(v),
                                       optText(title.map(slugifyASCII))])
@@ -385,8 +378,9 @@ extension WriteLane {
         body.append("}}")
     }
 
-    /// A new article's `{"article":{…}}` (`write_full_article_envelope`), from `newart`'s row (slug, created_at,
-    /// updated_at, the author's username, bio, image, and whether the writer follows them) and the request's fields.
+    /// A new article's `{"article":{…}}` (`write_full_article_envelope`), from `newart`'s row (slug, title, description,
+    /// body, tags, created_at, updated_at, favorited, favoritesCount, the author's username, bio and image, and whether
+    /// the writer follows them: its slug, timestamps and author are read here) and the request's fields.
     private static func writeFullArticleEnvelope(_ dst: inout ByteBuffer, _ p: borrowing PipelineBuf, _ r: RowSpan, title: [UInt8],
                                                  description: [UInt8], body: [UInt8], tags: [[UInt8]]) {
         dst.append("{\"article\":{\"slug\":")
@@ -403,12 +397,12 @@ extension WriteLane {
             JSON.writeString(&dst, tag)
         }
         dst.append("],\"createdAt\":")
-        JSON.writeTimestamp(&dst, p.i64(r, 1))
+        JSON.writeTimestamp(&dst, p.i64(r, 5))
         dst.append(",\"updatedAt\":")
-        JSON.writeTimestamp(&dst, p.i64(r, 2))
+        JSON.writeTimestamp(&dst, p.i64(r, 6))
         dst.append(",\"favorited\":false,\"favoritesCount\":0,\"author\":")
-        JSON.writeProfile(&dst, username: p.text(p.cell(r, 3)), bio: p.bytes(p.cell(r, 4)), image: p.bytes(p.cell(r, 5)),
-                          following: p.bool(p.cell(r, 6)))
+        JSON.writeProfile(&dst, username: p.text(p.cell(r, 9)), bio: p.bytes(p.cell(r, 10)), image: p.bytes(p.cell(r, 11)),
+                          following: p.bool(p.cell(r, 12)))
         dst.append("}}")
     }
 }

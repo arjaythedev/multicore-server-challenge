@@ -22,6 +22,7 @@ enum Sys {
     static let SO_REUSEPORT: Int32 = 15
     static let IPPROTO_TCP: Int32 = 6
     static let TCP_NODELAY: Int32 = 1
+    static let TCP_QUICKACK: Int32 = 12
     static let IPPROTO_IPV6: Int32 = 41
     static let IPV6_V6ONLY: Int32 = 26
     static let EPOLL_CLOEXEC: Int32 = 0o2000000
@@ -130,6 +131,8 @@ extension Sys {
         for opt in [SO_REUSEADDR, SO_REUSEPORT] {
             guard setIntOption(fd, SOL_SOCKET, opt, 1) == 0 else { throw SystemError("setsockopt") }
         }
+        // Set once here, as the Rust does: Linux gives every accepted socket the listener's TCP_NODELAY.
+        _ = setIntOption(fd, IPPROTO_TCP, TCP_NODELAY, 1)
         let bound: Int32
         if isV4 {
             var sa = sockaddr_in()
@@ -150,9 +153,14 @@ extension Sys {
         return fd
     }
 
-    /// TCP_NODELAY on an accepted or connected socket.
+    /// TCP_NODELAY on a connected socket.
     @inline(__always) static func setNoDelay(_ fd: Int32) {
         _ = setIntOption(fd, IPPROTO_TCP, TCP_NODELAY, 1)
+    }
+
+    /// TCP_QUICKACK on a connected socket: acknowledge at once rather than after the delayed-ACK timer.
+    @inline(__always) static func setQuickAck(_ fd: Int32) {
+        _ = setIntOption(fd, IPPROTO_TCP, TCP_QUICKACK, 1)
     }
 
     /// Writes all of `bytes` to a blocking descriptor.
@@ -168,6 +176,21 @@ extension Sys {
         }
     }
 
+    /// Whether /proc/cpuinfo's `flags` line lists `flag`.
+    static func cpuHasFlag(_ flag: String) -> Bool {
+        guard let file = fopen("/proc/cpuinfo", "r") else { return false }
+        defer { fclose(file) }
+        var line: UnsafeMutablePointer<CChar>?
+        var size = 0
+        defer { free(line) }
+        while getline(&line, &size, file) > 0, let line {
+            let text = String(cString: line)
+            guard text.hasPrefix("flags") else { continue }
+            return text.split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "\n" }).contains { $0 == flag }
+        }
+        return false
+    }
+
     /// A line on standard error (Rust's `eprintln!`).
     static func logLine(_ line: String) {
         var text = line + "\n"
@@ -177,25 +200,34 @@ extension Sys {
     /// A thread's body on its way through pthread_create.
     private final class ThreadStart: Sendable {
         let name: String
+        let nice: Int32
         let body: @Sendable () -> Void
-        init(name: String, body: @escaping @Sendable () -> Void) {
+        init(name: String, nice: Int32, body: @escaping @Sendable () -> Void) {
             self.name = name
+            self.nice = nice
             self.body = body
         }
     }
 
     /// Starts a detached thread named `name` running `body`.
-    static func startThread(name: String, _ body: @escaping @Sendable () -> Void) {
-        let start = Unmanaged.passRetained(ThreadStart(name: name, body: body)).toOpaque()
+    /// A thread running `body`, at `nice` (only this thread: on Linux a thread is a task of its own to setpriority).
+    static func startThread(name: String, nice: Int32 = 0, _ body: @escaping @Sendable () -> Void) {
+        let start = Unmanaged.passRetained(ThreadStart(name: name, nice: nice, body: body)).toOpaque()
         var thread = pthread_t()
         let rc = pthread_create(&thread, nil, { raw in
             let start = Unmanaged<ThreadStart>.fromOpaque(raw!).takeRetainedValue()
-            _ = sys_pthread_setname_np(pthread_self(), String(start.name.prefix(15)))
+            Sys.nameThisThread(start.name, nice: start.nice)
             start.body()
             return nil
         }, start)
         if rc != 0 { fatalError("pthread_create: \(rc)") }
         pthread_detach(thread)
+    }
+
+    /// Names the calling thread `name` and sets it at `nice`.
+    static func nameThisThread(_ name: String, nice: Int32 = 0) {
+        _ = sys_pthread_setname_np(pthread_self(), String(name.prefix(15)))
+        if nice != 0 { _ = sys_setpriority(0, UInt32(bitPattern: sys_gettid()), nice) }
     }
 }
 

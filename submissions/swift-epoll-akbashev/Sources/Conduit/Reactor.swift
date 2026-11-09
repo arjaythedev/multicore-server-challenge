@@ -1,8 +1,8 @@
 // reactor.rs: an HTTP/1.1 reactor on its own SO_REUSEPORT listener, with a file descriptor table of its own. It is an
 // actor on its own event loop: the connection table is plain actor state, touched only by this actor's thread. Each
 // turn it takes the ready events off its epoll instance, parses and routes what arrived, and hands the tick's work
-// to the scheduler in one message (a child task of the reactor's own task group). Replies arrive as `deliver`
-// messages from the lanes, one per batch, and go out with writev.
+// to the scheduler in one plain call, without leaving its thread. Replies arrive as `deliver` calls from the lanes,
+// one per batch, and go out with writev.
 import Glibc
 import Syscalls
 
@@ -31,9 +31,13 @@ actor Reactor {
     private let maxEvents = 1024
     /// What this tick routed, for the scheduler.
     private var pending = Submission()
+    /// How long a tick that didn't fill `events` lasts, counted from its epoll_wait.
+    private let passNanos: UInt64
 
-    init(index: Int, loop: EventLoop, signer: TokenSigner, scheduler: Scheduler, host: String, port: UInt16, fdBudget: Int) {
+    init(index: Int, loop: EventLoop, signer: TokenSigner, scheduler: Scheduler, host: String, port: UInt16, fdBudget: Int,
+         passNanos: UInt64) {
         self.index = UInt16(index)
+        self.passNanos = passNanos
         self.loop = loop
         self.signer = signer
         self.scheduler = scheduler
@@ -59,53 +63,53 @@ actor Reactor {
             fatalError("failed to bind listener: \(error)")
         }
         guard ctl(Sys.EPOLL_CTL_ADD, listenFD, Sys.EPOLLIN, Self.tokenListener) else { fatalError("epoll_ctl listener: \(errno)") }
-        await withDiscardingTaskGroup { group in
-            while true {
-                // One epoll_wait per tick, as the Rust's loop: it blocks here, on this actor's own thread, until a
-                // socket is ready or a message (a lane's `deliver`) is queued for the actor.
-                let (n, messagesWaiting) = loop.waitForEvents(&events)
-                for i in 0..<n {
-                    let base = i * Sys.epollEventStride
-                    let flags = events.span.bytes.load(fromByteOffset: base, as: UInt32.self)
-                    let token = events.span.bytes.load(fromByteOffset: base + Sys.epollDataOffset, as: UInt64.self)
-                    switch token {
-                    case Self.tokenListener: acceptReady()
-                    default:
-                        let slot = UInt32(truncatingIfNeeded: token)
-                        if flags & Sys.EPOLLOUT != 0 { flushTx(slot) }
-                        if flags & (Sys.EPOLLIN | Sys.EPOLLHUP | Sys.EPOLLERR | Sys.EPOLLRDHUP) != 0 { readReady(slot, flags) }
-                    }
-                }
-                submitPending(&group)
-                // Let the queued messages run (jobs on this same thread: Task.yield re-enqueues on the actor's executor),
-                // then carry on.
-                if messagesWaiting {
-                    await Task.yield()
-                    // A lane's replies may have routed pipelined requests: they go to the scheduler now, not after the
-                    // next wake-up, which may not come.
-                    submitPending(&group)
+        while true {
+            // One epoll_wait per tick, as the Rust's loop: it blocks here, on this actor's own thread, until a socket is
+            // ready or a message (a lane's `deliver`) is queued for the actor.
+            let (n, messagesWaiting) = loop.waitForEvents(&events)
+            let turnStarted = Sys.monotonicNanos()
+            for i in 0..<n {
+                let base = i * Sys.epollEventStride
+                let flags = events.span.bytes.load(fromByteOffset: base, as: UInt32.self)
+                let token = events.span.bytes.load(fromByteOffset: base + Sys.epollDataOffset, as: UInt64.self)
+                switch token {
+                case Self.tokenListener: acceptReady()
+                default:
+                    let slot = UInt32(truncatingIfNeeded: token)
+                    if flags & Sys.EPOLLOUT != 0 { flushTx(slot) }
+                    if flags & (Sys.EPOLLIN | Sys.EPOLLHUP | Sys.EPOLLERR | Sys.EPOLLRDHUP) != 0 { readReady(slot, flags) }
                 }
             }
+            // The tick's work goes to the scheduler at once; `pending` keeps its arrays' memory for the next tick.
+            if !pending.isEmpty { scheduler.submit(&pending) }
+            // Let the lanes' queued deliveries run now (jobs on this same thread: Task.yield re-enqueues on the actor's
+            // executor).
+            if messagesWaiting { await Task.yield() }
+            // A fixed cadence: a tick that didn't fill `events` lasts `passNanos` from its epoll_wait, so what arrives
+            // meanwhile is routed in the next one and goes to the scheduler in one call with it. The task waits on
+            // this loop, whose thread runs the lanes' deliveries in the meantime. A full tick goes straight on, so the
+            // cadence can't cap throughput.
+            if n > 0 && n < maxEvents && passNanos > 0 {
+                let deadline = turnStarted + passNanos
+                if Sys.monotonicNanos() < deadline { await loop.wait(until: deadline) }
+            }
+            // Deliveries may have routed pipelined requests: they go now, not after the next wake-up, which may not
+            // come.
+            if !pending.isEmpty { scheduler.submit(&pending) }
         }
     }
 
-    /// Hands this tick's work to the scheduler: one message, a child task that starts on the scheduler's loop.
-    private func submitPending(_ group: inout DiscardingTaskGroup) {
-        guard !pending.isEmpty else { return }
-        let work = pending
-        pending = Submission()
-        let scheduler = scheduler
-        group.addTask(executorPreference: scheduler.loop) { await scheduler.submit(work) }
-    }
-
-    /// A batch of replies from a lane (flush_outbox).
-    func deliver(_ replies: [OutgoingReply]) {
-        for rep in replies {
+    /// A batch of replies from a lane (flush_outbox), with the buffer their `.slice` bodies are in, lent for the call.
+    func deliver(_ replies: borrowing [OutgoingReply], bodies: Span<UInt8>) {
+        for i in replies.indices {
+            let rep = replies[i]
             let s = Int(rep.addr.slot)
             guard s < slots.count, slots[s].fd >= 0, slots[s].epoch == rep.addr.epoch, slots[s].inFlight else { continue }
             let hasBufferedRx = !slots[s].rx.isEmpty
             switch rep.body {
             case .bytes(let body): body.withUnsafeBytes { writeResponse(rep.addr.slot, rep.status, $0) }
+            case .slice(let range):
+                bodies.extracting(Int(range.lowerBound)..<Int(range.upperBound)).withUnsafeBytes { writeResponse(rep.addr.slot, rep.status, $0) }
             case .error(let message): writeError(rep.addr.slot, rep.status, message)
             }
             if hasBufferedRx { pipelinedSlots.append(rep.addr.slot) }
@@ -160,7 +164,6 @@ actor Reactor {
                 default: return
                 }
             }
-            Sys.setNoDelay(fd)
             let slot: UInt32
             if let idx = freeSlots.popLast() {
                 let s = Int(idx)
