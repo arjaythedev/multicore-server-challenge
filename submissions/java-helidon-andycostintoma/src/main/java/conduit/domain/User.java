@@ -12,15 +12,6 @@ public final class User {
     private final String bio;
     private final String image;
 
-    private User(Props props) {
-        this.id = props.id();
-        this.username = props.username();
-        this.email = props.email();
-        this.passwordHash = props.passwordHash();
-        this.bio = props.bio();
-        this.image = props.image();
-    }
-
     public long id() {
         return id;
     }
@@ -55,14 +46,21 @@ public final class User {
     ) {
     }
 
-    public record Changes(
+    public record Input(
+        String username,
+        String email,
+        String password
+    ) {
+    }
+
+    public record UpdateInput(
         String username,
         String email,
         String password,
         String bio,
         String image
     ) {
-        public Changes {
+        public UpdateInput {
             if (username != null) {
                 requireUsername(username);
             }
@@ -75,19 +73,19 @@ public final class User {
         }
     }
 
-    public static User register(String username, String email, String password,
-        UnaryOperator<String> hash) {
-        requireUsername(username);
-        requireEmail(email);
-        requirePassword(password);
-        return new User(new Props(0, username, email, hash.apply(password), null, null));
+    public static User register(Input input, UnaryOperator<String> hash) {
+        requireUsername(input.username());
+        requireEmail(input.email());
+        requirePassword(input.password());
+        return new User(new Props(0, input.username(), input.email(), hash.apply(input.password()),
+            null, null));
     }
 
     public static User reconstitute(Props props) {
         return new User(props);
     }
 
-    public User update(Changes changes, String passwordHash) {
+    public User update(UpdateInput changes, String passwordHash) {
         return new User(new Props(id, unchanged(changes.username(), username),
             unchanged(changes.email(), email), unchanged(passwordHash, this.passwordHash),
             unchanged(changes.bio(), bio), unchanged(changes.image(), image)));
@@ -116,5 +114,14 @@ public final class User {
 
     private static String unchanged(String replacement, String previous) {
         return replacement == null ? previous : replacement;
+    }
+
+    private User(Props props) {
+        this.id = props.id();
+        this.username = props.username();
+        this.email = props.email();
+        this.passwordHash = props.passwordHash();
+        this.bio = props.bio();
+        this.image = props.image();
     }
 }

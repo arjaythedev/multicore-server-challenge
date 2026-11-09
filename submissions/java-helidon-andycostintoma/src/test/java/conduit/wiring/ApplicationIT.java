@@ -196,7 +196,7 @@ class ApplicationIT {
                             HttpRequest.BodyPublishers.ofString(invalid.body()))
                         .build(),
                     HttpResponse.BodyHandlers.ofString());
-            assertEquals(422, authenticated.statusCode(), invalid.path());
+            assertEquals(422, authenticated.statusCode(), invalid.path() + " " + invalid.body());
             assertTrue(JSON.readTree(authenticated.body()).path("errors").path("body").isArray());
 
             var anonymous = http.send(HttpRequest.newBuilder(uri)
@@ -271,10 +271,9 @@ class ApplicationIT {
                 () -> new JooqUnitOfWork(sql).run(repositories -> {
                     var user = repositories.users().insert(User.reconstitute(new User.Props(0,
                         "save-conflict-before", "save-before@example.com", "hash", null, null)));
-                    repositories.users()
-                        .save(user.update(
-                            new User.Changes(null, "save-conflict@example.com", null, null, null),
-                            null));
+                    repositories.users().save(user.update(
+                        new User.UpdateInput(null, "save-conflict@example.com", null, null, null),
+                        null));
                     return null;
                 }));
             assertEquals("Username or email already exists", thrown.getMessage());
@@ -366,6 +365,38 @@ class ApplicationIT {
     }
 
     @Test
+    void creatingCommentReturnsTheCommentWithoutAnExtraWrapper() throws Exception {
+        var base = "http://127.0.0.1:" + application.port();
+        var registration = http.send(HttpRequest.newBuilder(URI.create(base + "/api/users"))
+            .POST(HttpRequest.BodyPublishers.ofString(
+                """
+                    {"user":{"username":"comment-response","email":"comment-response@example.com","password":"secret"}}
+                    """))
+            .build(), HttpResponse.BodyHandlers.ofString());
+        assertEquals(201, registration.statusCode());
+        var token = JSON.readTree(registration.body()).path("user").path("token").asText();
+
+        var article = http.send(HttpRequest.newBuilder(URI.create(base + "/api/articles"))
+            .header("Authorization", "Token " + token).POST(HttpRequest.BodyPublishers.ofString("""
+                {"article":{"title":"Comment response","description":"Description","body":"Body"}}
+                """)).build(), HttpResponse.BodyHandlers.ofString());
+        assertEquals(201, article.statusCode());
+        var slug = JSON.readTree(article.body()).path("article").path("slug").asText();
+
+        var response = http.send(HttpRequest
+            .newBuilder(URI.create(base + "/api/articles/" + slug + "/comments"))
+            .header("Authorization", "Token " + token).POST(HttpRequest.BodyPublishers.ofString("""
+                {"comment":{"body":"hello"}}
+                """)).build(), HttpResponse.BodyHandlers.ofString());
+        assertEquals(201, response.statusCode());
+        var comment = JSON.readTree(response.body()).path("comment");
+        assertEquals("hello", comment.path("body").asText());
+        assertEquals("comment-response", comment.path("author").path("username").asText());
+        assertTrue(comment.path("id").asLong() > 0);
+        assertEquals(5, comment.size());
+    }
+
+    @Test
     void articleUpdateTimestampUsesUpdateStatementNotTransactionStart() throws Exception {
         try (var connection = DriverManager.getConnection(POSTGRES.getJdbcUrl(),
             POSTGRES.getUsername(), POSTGRES.getPassword())) {
@@ -384,7 +415,7 @@ class ApplicationIT {
                     .execute();
                 new JooqUnitOfWork(transaction).run(repositories -> {
                     var article = repositories.articles().article("timestamp-test").update(author,
-                        null, null, "new body");
+                        new Article.UpdateInput(null, null, "new body"));
                     repositories.articles().update(article);
                     return article;
                 });

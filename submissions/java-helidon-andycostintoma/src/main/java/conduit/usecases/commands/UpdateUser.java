@@ -25,7 +25,7 @@ public final class UpdateUser {
     }
 
     public UserView execute(long userId, String token, Request request) {
-        var changes = new User.Changes(request.username(), request.email(), request.password(),
+        var changes = new User.UpdateInput(request.username(), request.email(), request.password(),
             request.bio(), request.image());
         var hash = changes.password() == null ? null : passwords.hash(changes.password());
         var user = uow.run(tx -> {

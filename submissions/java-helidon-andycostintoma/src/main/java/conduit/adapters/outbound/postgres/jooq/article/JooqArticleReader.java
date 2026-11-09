@@ -27,6 +27,7 @@ import org.jooq.DSLContext;
 import org.jooq.Field;
 import org.jooq.Record;
 import org.jooq.SelectJoinStep;
+import org.jooq.SelectLimitStep;
 import org.jooq.impl.DSL;
 
 public final class JooqArticleReader implements ArticleReader {
@@ -41,51 +42,46 @@ public final class JooqArticleReader implements ArticleReader {
     @Override
     public ArticlePage list(long viewer, int limit, long offset, String tag, String author,
         String favorited) {
-        Condition condition = DSL.noCondition();
-        long count;
         if (tag != null) {
             var tagId = DSL.select(TAGS.ID).from(TAGS).where(TAGS.NAME.eq(tag));
-            condition = ARTICLES.ID.in(DSL.select(ARTICLE_TAGS.ARTICLE_ID).from(ARTICLE_TAGS)
-                .where(ARTICLE_TAGS.TAG_ID.eq(tagId)).orderBy(ARTICLE_TAGS.ARTICLE_ID.desc())
-                .limit(limit).offset(offset));
-            var page = listed(viewer, condition, null, 0);
-            count = sql.fetchCount(DSL.selectOne().from(ARTICLE_TAGS)
-                .where(ARTICLE_TAGS.TAG_ID.eq(tagId)).limit(1000));
-            return new ArticlePage(page, count);
-        } else if (author != null) {
-            condition = ARTICLES.AUTHOR_ID
-                .eq(DSL.select(USERS.ID).from(USERS).where(USERS.USERNAME.eq(author)));
-        } else if (favorited != null) {
-            var userId = DSL.select(USERS.ID).from(USERS).where(USERS.USERNAME.eq(favorited));
-            condition = ARTICLES.ID.in(
-                DSL.select(FAVORITES.ARTICLE_ID).from(FAVORITES).where(FAVORITES.USER_ID.eq(userId))
-                    .orderBy(FAVORITES.ARTICLE_ID.desc()).limit(limit).offset(offset));
-            var page = listed(viewer, condition, null, 0);
-            count = sql.fetchCount(
-                DSL.selectOne().from(FAVORITES).where(FAVORITES.USER_ID.eq(userId)).limit(1000));
-            return new ArticlePage(page, count);
+            return page(viewer,
+                ARTICLES.ID.in(DSL.select(ARTICLE_TAGS.ARTICLE_ID).from(ARTICLE_TAGS)
+                    .where(ARTICLE_TAGS.TAG_ID.eq(tagId)).orderBy(ARTICLE_TAGS.ARTICLE_ID.desc())
+                    .limit(limit).offset(offset)),
+                DSL.selectOne().from(ARTICLE_TAGS).where(ARTICLE_TAGS.TAG_ID.eq(tagId)));
         }
-        var page = listed(viewer, condition, limit, offset);
-        count = sql.fetchCount(DSL.selectOne().from(ARTICLES).where(condition).limit(1000));
-        return new ArticlePage(page, count);
+        if (author == null && favorited != null) {
+            var userId = DSL.select(USERS.ID).from(USERS).where(USERS.USERNAME.eq(favorited));
+            return page(viewer,
+                ARTICLES.ID.in(DSL.select(FAVORITES.ARTICLE_ID).from(FAVORITES)
+                    .where(FAVORITES.USER_ID.eq(userId)).orderBy(FAVORITES.ARTICLE_ID.desc())
+                    .limit(limit).offset(offset)),
+                DSL.selectOne().from(FAVORITES).where(FAVORITES.USER_ID.eq(userId)));
+        }
+        var condition = author == null
+            ? DSL.noCondition()
+            : ARTICLES.AUTHOR_ID
+                .eq(DSL.select(USERS.ID).from(USERS).where(USERS.USERNAME.eq(author)));
+        // Page bare ids from the index first so per-row decoration skips offset rows.
+        return page(viewer,
+            ARTICLES.ID.in(DSL.select(ARTICLES.ID).from(ARTICLES).where(condition)
+                .orderBy(ARTICLES.ID.desc()).limit(limit).offset(offset)),
+            DSL.selectOne().from(ARTICLES).where(condition));
     }
 
     @Override
     public ArticlePage feed(long viewer, int limit, long offset) {
         // Preserve the reference lateral top-N plan, which bounds work per followed
         // author.
-        Condition pageCondition = DSL.condition(
-            "{0} in (select x.id from follows fo cross join lateral "
-                + "(select a2.id from articles a2 where a2.author_id = fo.followee_id order by a2.id desc limit {1}) x "
-                + "where fo.follower_id = {2} order by x.id desc limit {3} offset {4})",
-            ARTICLES.ID, DSL.val(offset > Long.MAX_VALUE - limit ? Long.MAX_VALUE : offset + limit),
+        var onPage = DSL.condition("{0} in (select x.id from follows fo cross join lateral "
+            + "(select a2.id from articles a2 where a2.author_id = fo.followee_id order by a2.id desc limit {1}) x "
+            + "where fo.follower_id = {2} order by x.id desc limit {3} offset {4})", ARTICLES.ID,
+            DSL.val(offset > Long.MAX_VALUE - limit ? Long.MAX_VALUE : offset + limit),
             DSL.val(viewer), DSL.val(limit), DSL.val(offset));
-        var page = listed(viewer, pageCondition, null, 0);
         var follows = DSL.select(FOLLOWS.FOLLOWEE_ID).from(FOLLOWS)
             .where(FOLLOWS.FOLLOWER_ID.eq(viewer));
-        long count = sql.fetchCount(
-            DSL.selectOne().from(ARTICLES).where(ARTICLES.AUTHOR_ID.in(follows)).limit(1000));
-        return new ArticlePage(page, count);
+        return page(viewer, onPage,
+            DSL.selectOne().from(ARTICLES).where(ARTICLES.AUTHOR_ID.in(follows)));
     }
 
     @Override
@@ -100,14 +96,14 @@ public final class JooqArticleReader implements ArticleReader {
 
     @Override
     public List<CommentView> comments(long viewer, String slug) {
-        var articleId = sql.select(ARTICLES.ID).from(ARTICLES).where(ARTICLES.SLUG.eq(slug))
-            .fetchOne(ARTICLES.ID);
-        if (articleId == null) {
-            throw missing();
-        }
-        return selectComments(viewer).where(COMMENTS.ARTICLE_ID.eq(articleId))
+        var articleId = DSL.select(ARTICLES.ID).from(ARTICLES).where(ARTICLES.SLUG.eq(slug));
+        var comments = selectComments(viewer).where(COMMENTS.ARTICLE_ID.eq(articleId))
             .orderBy(COMMENTS.CREATED_AT.desc(), COMMENTS.ID.desc()).limit(100)
             .fetch(CommentMapper::toView);
+        if (comments.isEmpty() && !sql.fetchExists(articleId)) {
+            throw missing();
+        }
+        return comments;
     }
 
     @Override
@@ -130,17 +126,22 @@ public final class JooqArticleReader implements ArticleReader {
             .from(COMMENTS).join(USERS).on(USERS.ID.eq(COMMENTS.AUTHOR_ID));
     }
 
-    private List<ArticleSummary> listed(long viewer, Condition condition, Integer limit,
-        long offset) {
-        var query = select(viewer, false).where(condition).orderBy(ARTICLES.ID.desc());
-        var rows = limit == null ? query.fetch() : query.limit(limit).offset(offset).fetch();
-        return rows.map(r -> new ArticleSummary(r.get(ARTICLES.SLUG), r.get(ARTICLES.TITLE),
+    // The count rides along for non-empty pages; empty pages need a separate query.
+    private ArticlePage page(long viewer, Condition onPage, SelectLimitStep<?> matching) {
+        var count = DSL.selectCount().from(matching.limit(1000).asTable("matching"));
+        var rows = select(viewer, false, count.asField("articles_count")).where(onPage)
+            .orderBy(ARTICLES.ID.desc()).fetch();
+        if (rows.isEmpty()) {
+            return new ArticlePage(List.of(), sql.fetchValue(count));
+        }
+        var articles = rows.map(r -> new ArticleSummary(r.get(ARTICLES.SLUG), r.get(ARTICLES.TITLE),
             r.get(ARTICLES.DESCRIPTION), tags(r), timestamp(r.get(ARTICLES.CREATED_AT)),
             timestamp(r.get(ARTICLES.UPDATED_AT)), r.get("favorited", Boolean.class),
             r.get("favorites_count", Long.class), profile(r)));
+        return new ArticlePage(articles, rows.getFirst().get("articles_count", Long.class));
     }
 
-    private SelectJoinStep<Record> select(long viewer, boolean full) {
+    private SelectJoinStep<Record> select(long viewer, boolean full, Field<?>... extra) {
         var at = ARTICLE_TAGS.as("at");
         Field<String[]> tags = DSL.array(DSL.select(TAGS.NAME).from(at).join(TAGS)
             .on(TAGS.ID.eq(at.TAG_ID)).where(at.ARTICLE_ID.eq(ARTICLES.ID)).orderBy(TAGS.NAME))
@@ -159,8 +160,10 @@ public final class JooqArticleReader implements ArticleReader {
             List.of(ARTICLES.ID, ARTICLES.SLUG, ARTICLES.TITLE, ARTICLES.DESCRIPTION,
                 ARTICLES.CREATED_AT, ARTICLES.UPDATED_AT, tags, count, favorited, USERS.USERNAME,
                 USERS.BIO, USERS.IMAGE, following));
-        if (full)
+        if (full) {
             fields.add(ARTICLES.BODY);
+        }
+        fields.addAll(List.of(extra));
         return sql.select(fields).from(ARTICLES).join(USERS).on(USERS.ID.eq(ARTICLES.AUTHOR_ID));
     }
 

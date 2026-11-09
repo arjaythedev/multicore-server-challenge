@@ -7,11 +7,11 @@ import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 
 final class Database {
-    static HikariDataSource open(String databaseUrl) {
-        return new HikariDataSource(poolConfig(databaseUrl));
+    static HikariDataSource open(String databaseUrl, int poolSize) {
+        return new HikariDataSource(poolConfig(databaseUrl, poolSize));
     }
 
-    static HikariConfig poolConfig(String databaseUrl) {
+    static HikariConfig poolConfig(String databaseUrl, int poolSize) {
         var uri = URI.create(databaseUrl);
         if (!("postgres".equals(uri.getScheme()) || "postgresql".equals(uri.getScheme()))
             || uri.getHost() == null || uri.getRawPath() == null || uri.getRawPath().length() < 2
@@ -38,10 +38,12 @@ final class Database {
             }
         }
         config.setPoolName("conduit");
-        config.setMaximumPoolSize(16);
-        config.setConnectionTimeout(5_000);
+        config.setMaximumPoolSize(poolSize);
+        config.setConnectionTimeout(2_000);
         config.setInitializationFailTimeout(10_000);
         config.addDataSourceProperty("tcpKeepAlive", "true");
+        // Avoid JIT and parallel-worker startup costs for short OLTP queries.
+        config.addDataSourceProperty("options", "-c jit=off -c max_parallel_workers_per_gather=0");
         return config;
     }
 

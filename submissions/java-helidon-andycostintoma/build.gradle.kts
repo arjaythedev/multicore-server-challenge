@@ -71,6 +71,7 @@ dependencies {
 
 application {
     mainClass = "conduit.Main"
+    applicationDefaultJvmArgs = listOf("-Xms2g", "-Xmx2g", "-XX:+AlwaysPreTouch")
 }
 
 val generatedJooq = layout.projectDirectory.dir("src/main/java/conduit/generated/postgres/jooq")

@@ -26,8 +26,9 @@ public final class CreateArticle {
     public ArticleDetails execute(long viewer, Request request) {
         var tags = Article.tags(request.tagList());
         var articleId = uow.run(tx -> {
-            var article = Article.create(viewer, request.title(), request.description(),
-                request.body(), tx.articles()::nextArticleId);
+            var article = Article.create(
+                new Article.Input(viewer, request.title(), request.description(), request.body()),
+                tx.articles()::nextArticleId);
             tx.articles().insert(article, tags);
             return article.id();
         });

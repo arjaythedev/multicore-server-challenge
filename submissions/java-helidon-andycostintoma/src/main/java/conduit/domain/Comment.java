@@ -9,13 +9,6 @@ public final class Comment {
     private final long authorId;
     private final String body;
 
-    private Comment(Props props) {
-        this.id = props.id();
-        this.articleId = props.articleId();
-        this.authorId = props.authorId();
-        this.body = props.body();
-    }
-
     public long id() {
         return id;
     }
@@ -40,11 +33,22 @@ public final class Comment {
     ) {
     }
 
-    public static Comment create(long articleId, long authorId, String body) {
+    public record Input(
+        long articleId,
+        long authorId,
+        String body
+    ) {
+    }
+
+    public static Comment create(Input input) {
+        requireBody(input.body());
+        return new Comment(new Props(0, input.articleId(), input.authorId(), input.body()));
+    }
+
+    public static void requireBody(String body) {
         if (body == null || body.isEmpty()) {
             throw new InvalidInput("Comment body is required");
         }
-        return new Comment(new Props(0, articleId, authorId, body));
     }
 
     public static Comment reconstitute(Props props) {
@@ -55,5 +59,12 @@ public final class Comment {
         if (viewer != authorId) {
             throw new Forbidden("Only the author may delete this comment");
         }
+    }
+
+    private Comment(Props props) {
+        this.id = props.id();
+        this.articleId = props.articleId();
+        this.authorId = props.authorId();
+        this.body = props.body();
     }
 }

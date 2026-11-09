@@ -5,7 +5,6 @@ import static conduit.adapters.inbound.http.HttpSupport.body;
 import static conduit.adapters.inbound.http.HttpSupport.send;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import conduit.contracts.article.readmodel.CommentView;
 import conduit.errors.InvalidInput;
 import conduit.usecases.commands.AddComment;
 import conduit.usecases.queries.Authenticate;
@@ -30,7 +29,7 @@ public final class AddCommentHandler {
         var text = parse(body(request, Request.class));
         var comment = addComment.execute(session.userId(),
             request.path().pathParameters().get("slug"), text);
-        send(response, json, 201, Map.of("comment", new Response(comment)));
+        send(response, json, 201, Map.of("comment", comment));
     }
 
     record Request(
@@ -40,11 +39,6 @@ public final class AddCommentHandler {
 
     record CommentBody(
         String body
-    ) {
-    }
-
-    record Response(
-        CommentView comment
     ) {
     }
 

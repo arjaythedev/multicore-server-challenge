@@ -65,7 +65,7 @@ public final class Application implements AutoCloseable {
     private final WebServer server;
 
     public static Application start(Config config) {
-        var database = Database.open(config.databaseUrl());
+        var database = Database.open(config.databaseUrl(), config.databasePoolSize());
         try {
             var sql = DSL.using(database, SQLDialect.POSTGRES,
                 new Settings().withExecuteLogging(false));

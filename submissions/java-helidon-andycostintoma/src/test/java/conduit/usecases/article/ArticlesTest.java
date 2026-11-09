@@ -182,11 +182,11 @@ class ArticlesTest {
     }
 
     @Test
-    void invalidCommentsRollBackWithoutWriting() {
+    void invalidCommentsFailBeforeOpeningTransaction() {
         var fixture = new Fixture();
         for (String body : new String[]{null, ""}) {
             assertThrows(InvalidInput.class, () -> fixture.comment.execute(7, "old-1", body));
-            assertEquals(List.of("begin", "load", "rollback"), fixture.events);
+            assertEquals(List.of(), fixture.events);
             fixture.events.clear();
         }
         var response = fixture.comment.execute(7, "old-1", "comment");
@@ -258,7 +258,7 @@ class ArticlesTest {
         private final ListArticles list = new ListArticles(this);
         private final ListFeed feed = new ListFeed(this);
         private final ListComments comments = new ListComments(this);
-        private Article article = Article.create(7, "old", "d", "b", () -> 1);
+        private Article article = Article.create(new Article.Input(7, "old", "d", "b"), () -> 1);
         private List<String> tags;
         private String tagFilter;
         private String authorFilter;

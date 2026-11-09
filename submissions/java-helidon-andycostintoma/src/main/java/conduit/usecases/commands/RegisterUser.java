@@ -25,7 +25,8 @@ public final class RegisterUser {
     }
 
     public UserView execute(Request request) {
-        var registered = User.register(request.username(), request.email(), request.password(),
+        var registered = User.register(
+            new User.Input(request.username(), request.email(), request.password()),
             passwords::hash);
         var user = uow.run(tx -> tx.users().insert(registered));
         return new UserView(user.email(), tokens.apply(user.id()), user.username(), user.bio(),

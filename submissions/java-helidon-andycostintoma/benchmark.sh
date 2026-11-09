@@ -46,6 +46,8 @@ for users in $BENCH_USERS; do
 done
 set +f
 (( ${#USERS[@]} > 0 )) || fail "BENCH_USERS must not be empty"
+BENCH_WARMUP_USERS="${BENCH_WARMUP_USERS-${USERS[0]}}"
+positive_integer "$BENCH_WARMUP_USERS" || fail "BENCH_WARMUP_USERS must be a positive integer (no leading zeroes)"
 for name in BENCH_WARMUP BENCH_RAMP BENCH_MEASURE BENCH_TAIL; do
     duration "${!name}" || fail "$name must be a positive Go duration (h/m/s/ms/us/ns), below 292 years"
 done
@@ -62,7 +64,7 @@ JWT_SECRET=multicore-server-challenge-benchmark
     echo "postgres_image=postgres:18.6-bookworm"
     echo "fsync=on"
     echo "users=$BENCH_USERS repeats=$BENCH_REPEATS"
-    echo "warmup=$BENCH_WARMUP ramp=$BENCH_RAMP measure=$BENCH_MEASURE tail=$BENCH_TAIL"
+    echo "warmup=$BENCH_WARMUP warmup_users=$BENCH_WARMUP_USERS ramp=$BENCH_RAMP measure=$BENCH_MEASURE tail=$BENCH_TAIL"
     echo "articles=10000 think_scale=1 profile=$BENCH_PROFILE"
     echo "pause_seconds=$BENCH_PAUSE stop_on_fail=$BENCH_STOP_ON_FAIL"
     echo "fixture=deterministic-devseed-scale-0.02; shared across warmup and measured repeats"
@@ -146,7 +148,7 @@ phase() {
 }
 
 overall=0
-phase warmup "${USERS[0]}" "$BENCH_WARMUP"
+phase warmup "$BENCH_WARMUP_USERS" "$BENCH_WARMUP"
 for users in "${USERS[@]}"; do
     for ((repeat=1; repeat<=BENCH_REPEATS; repeat++)); do
         echo "== allow sockets to drain for $BENCH_PAUSE seconds"

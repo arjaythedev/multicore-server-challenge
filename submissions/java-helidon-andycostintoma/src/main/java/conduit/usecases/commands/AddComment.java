@@ -15,9 +15,11 @@ public final class AddComment {
     }
 
     public CommentView execute(long viewer, String slug, String body) {
+        Comment.requireBody(body);
         var comment = uow.run(tx -> {
             var articleId = tx.articles().articleId(slug);
-            return tx.comments().insertComment(Comment.create(articleId, viewer, body));
+            return tx.comments()
+                .insertComment(Comment.create(new Comment.Input(articleId, viewer, body)));
         });
         return reader.comment(viewer, slug, comment.id());
     }

@@ -14,15 +14,6 @@ public final class Article {
     private final String description;
     private final String body;
 
-    private Article(Props props) {
-        this.id = props.id();
-        this.authorId = props.authorId();
-        this.slug = props.slug();
-        this.title = props.title();
-        this.description = props.description();
-        this.body = props.body();
-    }
-
     public long id() {
         return id;
     }
@@ -57,13 +48,28 @@ public final class Article {
     ) {
     }
 
-    public static Article create(long authorId, String title, String description, String body,
-        LongSupplier nextId) {
-        if (missing(title) || missing(description) || missing(body)) {
+    public record Input(
+        long authorId,
+        String title,
+        String description,
+        String body
+    ) {
+    }
+
+    public record UpdateInput(
+        String title,
+        String description,
+        String body
+    ) {
+    }
+
+    public static Article create(Input input, LongSupplier nextId) {
+        if (missing(input.title()) || missing(input.description()) || missing(input.body())) {
             throw new InvalidInput("A non-empty string is required");
         }
         var id = nextId.getAsLong();
-        return new Article(new Props(id, authorId, slug(title, id), title, description, body));
+        return new Article(new Props(id, input.authorId(), slug(input.title(), id), input.title(),
+            input.description(), input.body()));
     }
 
     public static Article reconstitute(Props props) {
@@ -82,14 +88,16 @@ public final class Article {
         return tags.stream().distinct().toList();
     }
 
-    public Article update(long viewer, String title, String description, String body) {
+    public Article update(long viewer, UpdateInput input) {
         authorize(viewer);
-        if ("".equals(title) || "".equals(description) || "".equals(body)) {
+        if ("".equals(input.title()) || "".equals(input.description()) || "".equals(input.body())) {
             throw new InvalidInput("A non-empty string is required");
         }
-        return new Article(new Props(id, authorId, title == null ? slug : slug(title, id),
-            title == null ? this.title : title,
-            description == null ? this.description : description, body == null ? this.body : body));
+        return new Article(
+            new Props(id, authorId, input.title() == null ? slug : slug(input.title(), id),
+                input.title() == null ? title : input.title(),
+                input.description() == null ? description : input.description(),
+                input.body() == null ? body : input.body()));
     }
 
     public void authorize(long viewer) {
@@ -105,5 +113,14 @@ public final class Article {
     private static String slug(String title, long id) {
         return title.replaceAll("[^A-Za-z0-9]+", "-").toLowerCase(Locale.ROOT).replaceAll("^-+|-+$",
             "") + "-" + id;
+    }
+
+    private Article(Props props) {
+        this.id = props.id();
+        this.authorId = props.authorId();
+        this.slug = props.slug();
+        this.title = props.title();
+        this.description = props.description();
+        this.body = props.body();
     }
 }

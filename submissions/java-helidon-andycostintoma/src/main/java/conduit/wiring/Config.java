@@ -6,10 +6,13 @@ public record Config(
     String databaseUrl,
     String host,
     int port,
-    String jwtSecret
+    String jwtSecret,
+    int databasePoolSize
 ) {
+    static final int DEFAULT_DATABASE_POOL_SIZE = 24;
+
     public Config(String databaseUrl, String host, int port) {
-        this(databaseUrl, host, port, "multicore-server-challenge");
+        this(databaseUrl, host, port, "multicore-server-challenge", DEFAULT_DATABASE_POOL_SIZE);
     }
 
     public static Config from(Map<String, String> environment) {
@@ -29,6 +32,12 @@ public record Config(
         if (secret.isEmpty()) {
             throw new IllegalArgumentException("JWT_SECRET must not be empty");
         }
-        return new Config(databaseUrl, host, port, secret);
+        var poolSize = Integer.parseInt(environment.getOrDefault("DATABASE_POOL_SIZE",
+            Integer.toString(DEFAULT_DATABASE_POOL_SIZE)));
+        // PostgreSQL allows 100 connections and reserves some for superusers.
+        if (poolSize < 1 || poolSize > 95) {
+            throw new IllegalArgumentException("DATABASE_POOL_SIZE must be between 1 and 95");
+        }
+        return new Config(databaseUrl, host, port, secret, poolSize);
     }
 }

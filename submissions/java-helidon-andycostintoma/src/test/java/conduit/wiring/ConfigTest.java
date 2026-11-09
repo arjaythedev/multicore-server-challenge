@@ -30,6 +30,21 @@ class ConfigTest {
         assertEquals(DATABASE_URL, config.databaseUrl());
         assertEquals("127.0.0.1", config.host());
         assertEquals(3000, config.port());
+        assertEquals(24, config.databasePoolSize());
+    }
+
+    @Test
+    void usesExplicitPoolSize() {
+        var config = Config.from(Map.of("DATABASE_URL", DATABASE_URL, "DATABASE_POOL_SIZE", "32"));
+
+        assertEquals(32, config.databasePoolSize());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"0", "96", "-1", "abc", ""})
+    void rejectsInvalidPoolSize(String poolSize) {
+        assertThrows(IllegalArgumentException.class, () -> Config
+            .from(Map.of("DATABASE_URL", DATABASE_URL, "DATABASE_POOL_SIZE", poolSize)));
     }
 
     @Test
