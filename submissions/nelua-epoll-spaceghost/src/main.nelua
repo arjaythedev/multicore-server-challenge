@@ -1,0 +1,98 @@
+## pragmas.nogc = true
+## pragmas.noentrypoint = true
+## pragmas.nochecks = true
+
+local N = require 'bindings'
+local R = require 'reads'
+local M = require 'mutations'
+
+local function route(r:*N.Request):cint
+  local count=N.segments(r)
+  if count < 2 or not N.eq(N.segment(r,0),'api') then return 0 end
+  local method=N.method(r)
+  local resource=N.segment(r,1)
+  if N.eq(resource,'users') then
+    if N.eq(method,'POST') then
+      if count==2 then return 1 end
+      if count==3 and N.eq(N.segment(r,2),'login') then return 2 end
+    end
+  elseif N.eq(resource,'user') and count==2 then
+    if N.eq(method,'GET') then return 3 end
+    if N.eq(method,'PUT') then return 4 end
+  elseif N.eq(resource,'profiles') then
+    if count==3 and N.eq(method,'GET') then return 5 end
+    if count==4 and N.eq(N.segment(r,3),'follow') then
+      if N.eq(method,'POST') then return 6 end
+      if N.eq(method,'DELETE') then return 7 end
+    end
+  elseif N.eq(resource,'articles') then
+    if count==2 then
+      if N.eq(method,'GET') then return 8 end
+      if N.eq(method,'POST') then return 10 end
+    elseif count==3 then
+      if N.eq(method,'GET') then
+        if N.eq(N.segment(r,2),'feed') then return 9 end
+        return 11
+      end
+      if N.eq(method,'PUT') then return 12 end
+      if N.eq(method,'DELETE') then return 13 end
+    elseif count==4 then
+      if N.eq(N.segment(r,3),'favorite') then
+        if N.eq(method,'POST') then return 14 end
+        if N.eq(method,'DELETE') then return 15 end
+      elseif N.eq(N.segment(r,3),'comments') then
+        if N.eq(method,'GET') then return 16 end
+        if N.eq(method,'POST') then return 17 end
+      end
+    elseif count==5 and N.eq(N.segment(r,3),'comments') and N.eq(method,'DELETE') then
+      return 18
+    end
+  elseif count==2 and N.eq(resource,'tags') and N.eq(method,'GET') then return 19
+  end
+  return 0
+end
+
+local function conduit_lane(r:*N.Request):cint <cexport,codename'conduit_lane'>
+  local operation=route(r)
+  if operation==1 or operation==2 then return 2 end
+  if operation==4 then
+    -- A bio/email edit must not wait behind cost-10 password hashes.
+    local password=N.field(N.body(r,'user'),'password')
+    if N.kind(password)==3 and N.length(N.string(password))>0 then return 2 end
+    return 1
+  end
+  if operation==6 or operation==7 or operation==10 or operation==12 or
+     operation==13 or operation==14 or operation==15 or operation==17 or operation==18 then return 1 end
+  return 0
+end
+
+local function conduit_handle(r:*N.Request,db:*N.Db) <cexport,codename'conduit_handle'>
+  local operation=route(r)
+  if operation==0 then N.error(r,404); return end
+  if operation==1 then M.register(r,db); return end
+  if operation==2 then M.login(r,db); return end
+  if operation==19 then R.tags(r,db); return end
+  local viewer=N.auth(r)
+  local optional=operation==5 or operation==8 or operation==11 or operation==16
+  if viewer<0 or (viewer==0 and not optional) then N.error(r,401); return end
+  local key=N.segment(r,2)
+  if operation==3 then M.current(r,db,viewer)
+  elseif operation==4 then M.update_user(r,db,viewer)
+  elseif operation==5 then R.profile(r,db,viewer,key)
+  elseif operation==6 then M.follow(r,db,viewer,key,true)
+  elseif operation==7 then M.follow(r,db,viewer,key,false)
+  elseif operation==8 then R.list(r,db,viewer,false)
+  elseif operation==9 then R.list(r,db,viewer,true)
+  elseif operation==10 then M.create_article(r,db,viewer)
+  elseif operation==11 then R.article(r,db,viewer,key,false,200)
+  elseif operation==12 then M.update_article(r,db,viewer,key)
+  elseif operation==13 then M.delete_article(r,db,viewer,key)
+  elseif operation==14 then M.favorite(r,db,viewer,key,true)
+  elseif operation==15 then M.favorite(r,db,viewer,key,false)
+  elseif operation==16 then R.comments(r,db,viewer,key)
+  elseif operation==17 then M.create_comment(r,db,viewer,key)
+  elseif operation==18 then M.delete_comment(r,db,viewer,key,N.segment(r,4))
+  end
+end
+
+require 'batch'
