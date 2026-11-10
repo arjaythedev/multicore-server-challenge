@@ -1,0 +1,45 @@
+[package]
+name = "conduit"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = ["batch-bcrypt", "group-commit", "simd-json", "boxed-requests"]
+boxed-requests = []
+batch-bcrypt = ["native-bcrypt"]
+group-commit = []
+simd-json = []
+native-bcrypt = ["dep:subtle", "dep:getrandom"]
+
+[dependencies]
+subtle = { version = "=2.6.1", optional = true }
+getrandom = { version = "=0.4.3", optional = true }
+tokio = { version = "=1.53.2", features = ["rt-multi-thread", "net", "macros", "sync", "time", "signal", "io-util"] }
+http = "=1.5.0"
+httparse = "=1.10.1"
+memchr = "=2.8.3"
+serde = { version = "=1.0.229", features = ["derive"] }
+bytes = "=1.12.1"
+# No TLS: Postgres is on localhost.
+tokio-postgres = { path = "vendor/tokio-postgres", version = "=0.7.18", default-features = false, features = ["runtime"] }
+postgres-types = "=0.2.14"
+futures-util = { version = "=0.3.34", default-features = false, features = ["alloc"] }
+serde_json = "=1.0.154"
+bcrypt = "=0.19.3"
+hmac = "=0.12.1"
+sha2 = "=0.10.9"
+base64 = "=0.22.1"
+itoa = "=1.0.18"
+form_urlencoded = "=1.2.2"
+percent-encoding = "=2.3.2"
+socket2 = { version = "=0.6.5", features = ["all"] }
+mimalloc = { version = "=0.1.52", default-features = false }
+
+[build-dependencies]
+cc = "=1.8.0"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
