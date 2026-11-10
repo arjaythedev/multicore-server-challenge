@@ -150,7 +150,9 @@ fn batched(query: q.Select, order: q.Expr[]): q.Query throws q.QueryError {
     return s.build(PG)
 }
 
-fn sharedList(key: string, count: q.Select, ids: q.Select): q.Query throws q.QueryError {
+// followed: every listed author is one the viewer follows (the feed picks its
+// articles through the viewer's follows), so following is true without a lookup.
+fn sharedList(key: string, count: q.Select, ids: q.Select, followed: bool): q.Query throws q.QueryError {
     let distinctKeys: q.Select = q.from("r").distinct().select([q.col(key).alias("key")])
     let counts: q.Select = q.select([q.col("d.key"), q.sub(count).alias("total")]).fromExpr(q.sub(distinctKeys).alias("d"))
     let pages: q.Select = q.from("r").distinct().select([q.col(key).alias("key"), q.col("l"), q.col("o")])
@@ -165,7 +167,11 @@ fn sharedList(key: string, count: q.Select, ids: q.Select): q.Query throws q.Que
     let picked: q.Expr[] = cols(["r.i", "c.total", "x.id", "x.slug", "x.title", "x.description", "x.created_at", "x.updated_at", "x.tag_list", "x.favorites_count"])
     picked.push(q.caseWhen(present, favoritedBy(q.col("x.id"), q.col("r.v"))).end().alias("favorited"))
     picked = append(picked, cols(["x.username", "x.bio", "x.image"]))
-    picked.push(q.caseWhen(present, follows(q.col("r.v"), q.col("x.author_id"))).end().alias("following"))
+    let following: q.Expr = follows(q.col("r.v"), q.col("x.author_id"))
+    if (followed) {
+        following = q.boolean(true)
+    }
+    picked.push(q.caseWhen(present, following).end().alias("following"))
     let rk: q.Expr = q.col("r." + key)
     let s: q.Select = q.from("r").select(picked)
         .withMaterialized("r", q.select([q.star()]).fromExpr(requests()))
@@ -348,21 +354,21 @@ fn batchComments(): q.Query throws q.QueryError {
 }
 
 fn batchListAll(): q.Query throws q.QueryError {
-    return sharedList("k", countAll(), idsAll(q.col("g.l"), q.col("g.o")))
+    return sharedList("k", countAll(), idsAll(q.col("g.l"), q.col("g.o")), false)
 }
 
 fn batchListTag(): q.Query throws q.QueryError {
-    return sharedList("k", countTag(q.col("d.key")), idsTag(q.col("g.key"), q.col("g.l"), q.col("g.o")))
+    return sharedList("k", countTag(q.col("d.key")), idsTag(q.col("g.key"), q.col("g.l"), q.col("g.o")), false)
 }
 
 fn batchListAuthor(): q.Query throws q.QueryError {
-    return sharedList("k", countAuthor(q.col("d.key")), idsAuthor(q.col("g.key"), q.col("g.l"), q.col("g.o")))
+    return sharedList("k", countAuthor(q.col("d.key")), idsAuthor(q.col("g.key"), q.col("g.l"), q.col("g.o")), false)
 }
 
 fn batchListFavorited(): q.Query throws q.QueryError {
-    return sharedList("k", countFavorited(q.col("d.key")), idsFavorited(q.col("g.key"), q.col("g.l"), q.col("g.o")))
+    return sharedList("k", countFavorited(q.col("d.key")), idsFavorited(q.col("g.key"), q.col("g.l"), q.col("g.o")), false)
 }
 
 fn batchListFeed(): q.Query throws q.QueryError {
-    return sharedList("v", countFeed(q.col("d.key")), idsFeed(q.col("g.key"), q.col("g.l"), q.col("g.o")))
+    return sharedList("v", countFeed(q.col("d.key")), idsFeed(q.col("g.key"), q.col("g.l"), q.col("g.o")), true)
 }
