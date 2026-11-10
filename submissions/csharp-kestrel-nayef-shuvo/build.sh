@@ -9,9 +9,9 @@ DOTNET="$DOTNET_ROOT/dotnet"
 EXTRA=()
 command -v clang >/dev/null 2>&1 || EXTRA+=(-p:CppCompilerAndLinker=gcc)
 rm -rf bin
-# Restores exactly packages.lock.json under the SDK that install.sh pins (10.0.402); Conduit.csproj sends any other SDK to a
+# Restores exactly packages.lock.json under the SDK that install.sh pins (10.0.403); Conduit.csproj sends any other SDK to a
 # throwaway lock file under obj/, because its AOT packages have other hashes.
-if [ "$("$DOTNET" --version)" = "10.0.402" ]; then LOCK=(--locked-mode); else LOCK=(); fi
+if [ "$("$DOTNET" --version)" = "10.0.403" ]; then LOCK=(--locked-mode); else LOCK=(); fi
 "$DOTNET" restore Conduit.csproj ${LOCK[@]+"${LOCK[@]}"} -v quiet
 "$DOTNET" publish Conduit.csproj -c Release -o bin --no-restore -v quiet -nologo ${EXTRA[@]+"${EXTRA[@]}"}
 echo "built bin/conduit (.NET SDK $("$DOTNET" --version), Native AOT)"

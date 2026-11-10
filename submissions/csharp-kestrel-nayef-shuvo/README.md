@@ -8,7 +8,7 @@ executable. It passes `bench/cmd/conformance` (197/197), also on Ubuntu 24.04 wi
 
 | Piece | Version |
 |---|---|
-| .NET | SDK 10.0.402 (official tarball, sha512-checked), Native AOT; `install.sh` also installs clang and zlib1g-dev, which the AOT linker needs |
+| .NET | SDK 10.0.403 (official tarball, sha512-checked), Native AOT; `install.sh` also installs clang and zlib1g-dev, which the AOT linker needs |
 | HTTP | ASP.NET Core 10 Kestrel, HTTP/1.1 only, one `app.Run` request delegate, manual routing |
 | JSON | `System.Text.Json`: `Utf8JsonWriter` out, `JsonDocument` in (no reflection serializer) |
 | Postgres | `Npgsql` 10.0.3, one `NpgsqlDataSource`, `MaxPoolSize = DB_POOL_SIZE` |
@@ -22,7 +22,7 @@ NuGet packages are pinned by `packages.lock.json`, restored with `--locked-mode`
 On a clean Ubuntu 24.04, from this folder:
 
 ```bash
-sudo bash install.sh     # once, as root: .NET SDK 10.0.402, clang, zlib1g-dev
+sudo bash install.sh     # once, as root: .NET SDK 10.0.403, clang, zlib1g-dev
 bash build.sh            # as a normal user: Native AOT build into bin/conduit, about 40 seconds
 DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=multicore-server-challenge bash start.sh
 ```
@@ -47,7 +47,7 @@ bash test/run.sh submissions/csharp-kestrel-nayef-shuvo
 | `BCRYPT_BATCH_MS` | 100 | how long the first waiting hash waits for others to share its run |
 
 Idle keep-alive connections stay open for Kestrel's default 130 s, longer than the 65 s that Nginx needs.
-`build.sh` checks the lock file strictly only with SDK 10.0.402; any other SDK (for example a distro's source-built one,
+`build.sh` checks the lock file strictly only with SDK 10.0.403; any other SDK (for example a distro's source-built one,
 which has other hashes for the AOT packages) restores into a throwaway lock file under `obj/` instead of failing.
 
 A Debug build (`dotnet run` in this folder) adds Swagger UI at `/swagger`, one log line per request with its error message,
