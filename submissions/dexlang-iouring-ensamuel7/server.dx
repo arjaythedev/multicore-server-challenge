@@ -10,6 +10,8 @@ import "queries"
 import "github.com/ensamuel7/dex-modules/dexqu" as "q"
 
 let conn: int = -1
+let loginLanes: int = 0
+let loginTurn: int = 0
 let jwtSecret: string = ""
 
 let stTags: int = -1
@@ -854,7 +856,15 @@ fn register(req: http.HttpRequest): http.HttpResponse {
     return ok(201, json.encode(UserEnvelope { user: u }))
 }
 
+// Logins go to the login lane, which checks every worker's logins in one set
+// with bcryptVerifyAll; this is the fallback if the lane is not there.
 fn login(req: http.HttpRequest): http.HttpResponse {
+    if (loginLanes > 0) {
+        loginTurn = (loginTurn + 1) % loginLanes
+        if (http.relay(loginTurn, req.body)) {
+            return internal()
+        }
+    }
     let f: Fields = wrapper(req.body, "user")
     if (!f.valid) {
         return fail(422, "invalid body")
@@ -883,6 +893,71 @@ fn login(req: http.HttpRequest): http.HttpResponse {
     }
     u.token = issueToken(id)
     return ok(200, json.encode(UserEnvelope { user: u }))
+}
+
+struct LoginWait {
+    at: int
+    id: long
+    user: User
+}
+
+// The login lane: a process of its own that every worker relays logins to.
+// It looks each one up, then runs bcrypt for the whole set at once, which
+// costs well under half the CPU per login of one bcryptVerify at a time.
+fn serveLogins(lane: int, payloads: string[]): void {
+    if (conn < 0) {
+        conn = db.openSingleThreaded("postgres", sessionDsn(os.env("DATABASE_URL")))
+        if (conn < 0) {
+            return
+        }
+        try {
+            stLogin = prepare(queries.login())
+        } catch (e: q.QueryError) {
+            return
+        }
+    }
+    let waits: LoginWait[] = []
+    let passwords: string[] = []
+    let hashes: string[] = []
+    for (let i: int = 0; i < payloads.len(); i = i + 1) {
+        let f: Fields = wrapper(payloads[i], "user")
+        if (!f.valid) {
+            http.reply(i, 422, errorBody("invalid body"), "")
+            continue
+        }
+        let email: string = requiredString(f.obj, "email")
+        let password: string = requiredString(f.obj, "password")
+        if (email.isEmpty() || password.isEmpty()) {
+            http.reply(i, 422, errorBody("email and password are required"), "")
+            continue
+        }
+        db.reset(stLogin)
+        bindS(stLogin, "email", email)
+        if (!db.step(stLogin)) {
+            let failed: bool = db.errorCode() != ""
+            db.reset(stLogin)
+            if (failed) {
+                http.reply(i, 500, errorBody("internal error"), "")
+            } else {
+                http.reply(i, 401, errorBody("invalid email or password"), "")
+            }
+            continue
+        }
+        hashes.push(colStr(stLogin, 5))
+        passwords.push(password)
+        waits.push(LoginWait { at: i, id: colLong(stLogin, 0), user: readUser(stLogin, "") })
+        db.reset(stLogin)
+    }
+    let matched: bool[] = crypto.bcryptVerifyAll(passwords, hashes)
+    for (let k: int = 0; k < waits.len(); k = k + 1) {
+        if (!matched[k]) {
+            http.reply(waits[k].at, 401, errorBody("invalid email or password"), "")
+            continue
+        }
+        let u: User = waits[k].user
+        u.token = issueToken(waits[k].id)
+        http.reply(waits[k].at, 200, json.encode(UserEnvelope { user: u }), "")
+    }
 }
 
 fn currentUser(req: http.HttpRequest): http.HttpResponse {
@@ -1483,6 +1558,22 @@ fn main(): void {
     let workers: int = 0
     if (!os.env("WORKERS").isEmpty()) {
         workers = str.toInt(os.env("WORKERS"))
+    }
+
+    // The login lanes fork first, with their own batch window: a login waits up
+    // to LOGIN_MS for others to share its bcrypt set. Each worker takes turns
+    // between them, so one busy lane doesn't hold every login back.
+    loginLanes = 2
+    if (!os.env("LOGIN_LANES").isEmpty()) {
+        loginLanes = str.toInt(os.env("LOGIN_LANES"))
+    }
+    if (loginLanes > 0) {
+        let loginWindow: int = 150
+        if (!os.env("LOGIN_MS").isEmpty()) {
+            loginWindow = str.toInt(os.env("LOGIN_MS"))
+        }
+        http.batchWindow(loginWindow)
+        http.lanes(loginLanes, serveLogins)
     }
 
     http.fork(workers)
