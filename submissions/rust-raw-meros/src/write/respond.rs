@@ -88,8 +88,8 @@ impl Responder {
         finding: Finding<'_>,
         out: &mut Vec<u8>,
     ) -> Result<Verdict, PgError> {
-        let result = match finding {
-            Finding::Done(result) => result,
+        let row = match finding {
+            Finding::Done(result, row) => result.row(row),
             Finding::Rejected => return Ok(Verdict::Error(Status::Internal, INTERNAL)),
             Finding::Unknown => {
                 return Ok(Verdict::Error(Status::ServiceUnavailable, UNKNOWN_OUTCOME));
@@ -98,22 +98,22 @@ impl Responder {
         };
         match &job.kind {
             WriteKind::Register { .. } => {
-                let Some(id) = bodies::user_id(&result)? else {
-                    return bodies::register(&result, "", out);
+                let Some(id) = bodies::user_id(row)? else {
+                    return bodies::register(row, "", out);
                 };
                 let token = self.sign(id)?;
-                bodies::register(&result, token, out)
+                bodies::register(row, token, out)
             }
             WriteKind::UpdateUser { token, .. } => {
-                bodies::update_user(&result, token.text(&job.buf), out)
+                bodies::update_user(row, token.text(&job.buf), out)
             }
-            WriteKind::Follow { follow, .. } => bodies::profile(&result, *follow, out),
-            WriteKind::CreateArticle { .. } => bodies::article(&result, Status::Created, out),
-            WriteKind::UpdateArticle { .. } => bodies::update_article(&result, out),
-            WriteKind::DeleteArticle { .. } => bodies::removal(&result, Kind::Article),
-            WriteKind::Favorite { .. } => bodies::article(&result, Status::Ok, out),
-            WriteKind::AddComment { .. } => bodies::comment(&result, out),
-            WriteKind::DeleteComment { .. } => bodies::removal(&result, Kind::Comment),
+            WriteKind::Follow { follow, .. } => bodies::profile(row, *follow, out),
+            WriteKind::CreateArticle { .. } => bodies::article(row, Status::Created, out),
+            WriteKind::UpdateArticle { .. } => bodies::update_article(row, out),
+            WriteKind::DeleteArticle { .. } => bodies::removal(row, Kind::Article),
+            WriteKind::Favorite { .. } => bodies::article(row, Status::Ok, out),
+            WriteKind::AddComment { .. } => bodies::comment(row, out),
+            WriteKind::DeleteComment { .. } => bodies::removal(row, Kind::Comment),
         }
     }
 

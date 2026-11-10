@@ -3,12 +3,12 @@
 //! The statements take parallel arrays, one element per request of the group. The arrays live in vectors owned by
 //! the plan and reused from batch to batch; text elements are `&str` slices of each job's own request buffer, so no
 //! request text is copied before `Connection::push` writes it to the socket buffer. The only text the plan builds
-//! itself is the feed key (the viewer id in decimal), which goes into one reusable byte arena.
+//! itself is nothing: the feed takes the viewer ids as numbers.
 
 use crate::app::jobs::ReadJob;
-use crate::json::itoa;
 use crate::pg::{Connection, Param, PgError};
 
+use super::feed::SHALLOW_CAP;
 use super::scratch::recycle;
 use super::statements::{Group, Statements};
 
@@ -23,9 +23,6 @@ pub struct Plan {
     viewers: Vec<i64>,
     limits: Vec<i64>,
     offsets: Vec<i64>,
-    /// Decimal viewer ids for the feed key, back to back.
-    digits: Vec<u8>,
-    spans: Vec<(u32, u32)>,
     texts: Vec<&'static str>,
 }
 
@@ -62,8 +59,6 @@ impl Plan {
         let groups: usize = self.members.iter().map(|m| m.capacity() * 4).sum();
         groups
             + (self.viewers.capacity() + self.limits.capacity() + self.offsets.capacity()) * 8
-            + self.digits.capacity()
-            + self.spans.capacity() * 8
             + self.texts.capacity() * 16
     }
 
@@ -108,8 +103,6 @@ impl Plan {
             viewers,
             limits,
             offsets,
-            digits,
-            spans,
             texts,
             ..
         } = self;
@@ -118,21 +111,12 @@ impl Plan {
         viewers.extend(members.iter().map(|&i| jobs[i as usize].viewer));
         let mut keys = recycle(std::mem::take(texts));
         let result = match group {
-            Group::ListAll
-            | Group::ListTag
-            | Group::ListAuthor
-            | Group::ListFavorited
-            | Group::Feed => {
+            Group::ListAll | Group::ListTag | Group::ListAuthor | Group::ListFavorited => {
                 limits.clear();
                 limits.extend(members.iter().map(|&i| jobs[i as usize].limit));
                 offsets.clear();
                 offsets.extend(members.iter().map(|&i| jobs[i as usize].offset));
-                if group == Group::Feed {
-                    fill_decimal_keys(digits, spans, viewers);
-                    keys.extend(spans.iter().map(|&(s, e)| decimal_text(digits, s, e)));
-                } else {
-                    keys.extend(members.iter().map(|&i| key_text(&jobs[i as usize])));
-                }
+                keys.extend(members.iter().map(|&i| key_text(&jobs[i as usize])));
                 conn.push(
                     stmt,
                     &[
@@ -140,6 +124,21 @@ impl Plan {
                         Param::Int8Array(limits),
                         Param::Int8Array(offsets),
                         Param::TextArray(&keys),
+                    ],
+                )
+            }
+            Group::Feed => {
+                limits.clear();
+                limits.extend(members.iter().map(|&i| jobs[i as usize].limit));
+                offsets.clear();
+                offsets.extend(members.iter().map(|&i| jobs[i as usize].offset));
+                conn.push(
+                    stmt,
+                    &[
+                        Param::Int8Array(viewers),
+                        Param::Int8Array(limits),
+                        Param::Int8Array(offsets),
+                        Param::Int8(SHALLOW_CAP),
                     ],
                 )
             }
@@ -162,23 +161,6 @@ impl Plan {
 /// The text a request is about (slug, username, tag, email), borrowed from the job's own buffer.
 fn key_text(job: &ReadJob) -> &str {
     job.key.text(&job.buf)
-}
-
-fn fill_decimal_keys(digits: &mut Vec<u8>, spans: &mut Vec<(u32, u32)>, ids: &[i64]) {
-    digits.clear();
-    spans.clear();
-    for &id in ids {
-        let start = digits.len() as u32;
-        itoa::write_i64(digits, id);
-        spans.push((start, digits.len() as u32));
-    }
-}
-
-fn decimal_text(digits: &[u8], start: u32, end: u32) -> &str {
-    digits
-        .get(start as usize..end as usize)
-        .and_then(|d| std::str::from_utf8(d).ok())
-        .unwrap_or("")
 }
 
 #[cfg(test)]
@@ -213,17 +195,6 @@ mod tests {
         plan.assign(&jobs[..0]);
         assert!(plan.members(Group::Article).is_empty());
         assert!(!plan.needs_tags());
-    }
-
-    #[test]
-    fn feed_keys_are_the_viewer_ids_in_decimal() {
-        let (mut digits, mut spans) = (Vec::new(), Vec::new());
-        fill_decimal_keys(&mut digits, &mut spans, &[7, 100_000, 42]);
-        let keys: Vec<&str> = spans
-            .iter()
-            .map(|&(s, e)| decimal_text(&digits, s, e))
-            .collect();
-        assert_eq!(keys, ["7", "100000", "42"]);
     }
 
     #[test]

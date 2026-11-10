@@ -26,6 +26,17 @@ use crate::password::PasswordQueue;
 use crate::read::ReadQueue;
 use crate::write::WriteQueue;
 
+/// Admission control. A queue this long is a backlog of more than half a second at the rates the server reaches, so a
+/// request that joins it would wait for longer than the clients tolerate while its buffer pins memory. Beyond the
+/// limit a request is answered 503 at once: the admitted requests keep their latency, memory stays bounded, and the
+/// server recovers as soon as the load drops. Only real overload gets here (under the p95 limit the queues hold a
+/// few batches).
+const MAX_QUEUED_READS: usize = 24_576;
+const MAX_QUEUED_WRITES: usize = 8_192;
+/// Registrations and password changes wait for bcrypt: about 30 hashes per second at the highest load we measured,
+/// so 4,096 waiting jobs are already more than the 8 s shed limit of the password threads can ever serve.
+const MAX_QUEUED_HASHES: usize = 4_096;
+
 /// Shared by all io threads.
 pub struct App {
     jwt: Arc<Jwt>,
@@ -65,7 +76,7 @@ impl App {
             ),
         };
         let origin = Origin { conn, keep_alive };
-        match plan {
+        match self.admit(plan) {
             Plan::Reject(status, message) => {
                 let start = out.finish_error(status, keep_alive, message);
                 Step::Answered {
@@ -132,6 +143,21 @@ impl App {
         Step::Queued { rest }
     }
 
+    /// Admission control: a request that would join an over-long queue is rejected with 503 instead.
+    fn admit(&self, plan: Plan) -> Plan {
+        let overloaded = match plan {
+            Plan::Read(_) => self.read.len() > MAX_QUEUED_READS,
+            Plan::Write { .. } => self.write.len() > MAX_QUEUED_WRITES,
+            Plan::Hash { .. } => self.password.len() > MAX_QUEUED_HASHES,
+            _ => false,
+        };
+        if overloaded {
+            Plan::Reject(Status::ServiceUnavailable, MSG_BUSY)
+        } else {
+            plan
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn queue_hash(
         &self,
@@ -165,6 +191,8 @@ impl App {
         Step::Queued { rest }
     }
 }
+
+const MSG_BUSY: &str = "server is busy, try again";
 
 fn unix_seconds() -> u64 {
     SystemTime::now()

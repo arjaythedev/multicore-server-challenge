@@ -37,6 +37,7 @@ fn run() -> Result<(), String> {
     let write_queue = WriteQueue::new(config.write_window, config.write_batch_max);
     let password_queue = PasswordQueue::new(config.bcrypt_window);
 
+    read::spawn_reporter(config.stats_seconds, config.read_lanes);
     let mut threads = Vec::new();
     threads.extend(read::spawn_lanes(
         config.read_lanes,
@@ -55,7 +56,6 @@ fn run() -> Result<(), String> {
     ));
     threads.extend(conduit::password::spawn_threads(
         config.bcrypt_threads,
-        &config,
         password_queue.clone(),
         mailboxes.clone(),
         write_queue.clone(),

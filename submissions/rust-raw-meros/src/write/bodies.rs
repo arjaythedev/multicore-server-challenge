@@ -7,7 +7,7 @@
 
 use crate::http::Status;
 use crate::json::JsonWriter;
-use crate::pg::{PgError, Row, StmtResult};
+use crate::pg::{PgError, Row};
 use crate::render::{
     Article, Comment, Profile, User, article_object, comment_object, profile_object, user_object,
 };
@@ -60,17 +60,13 @@ fn write_user(out: &mut Vec<u8>, row: &Row<'_>, token: &str) -> Result<(), PgErr
     Ok(())
 }
 
-/// The user id a successful register or update names (column 0 of the first row), for signing the token.
-pub fn user_id(result: &StmtResult<'_>) -> Result<Option<i64>, PgError> {
-    result.row(0).map(|row| row.i64(0)).transpose()
+/// The user id a successful register or update names (column 0 of the job's row), for signing the token.
+pub fn user_id(row: Option<Row<'_>>) -> Result<Option<i64>, PgError> {
+    row.map(|row| row.i64(0)).transpose()
 }
 
-pub fn register(
-    result: &StmtResult<'_>,
-    token: &str,
-    out: &mut Vec<u8>,
-) -> Result<Verdict, PgError> {
-    let Some(row) = result.row(0) else {
+pub fn register(row: Option<Row<'_>>, token: &str, out: &mut Vec<u8>) -> Result<Verdict, PgError> {
+    let Some(row) = row else {
         return Ok(Verdict::Error(Status::Unprocessable, TAKEN));
     };
     write_user(out, &row, token)?;
@@ -78,11 +74,11 @@ pub fn register(
 }
 
 pub fn update_user(
-    result: &StmtResult<'_>,
+    row: Option<Row<'_>>,
     token: &str,
     out: &mut Vec<u8>,
 ) -> Result<Verdict, PgError> {
-    let Some(row) = result.row(0) else {
+    let Some(row) = row else {
         return Ok(Verdict::Error(Status::Unauthorized, NO_USER));
     };
     write_user(out, &row, token)?;
@@ -91,11 +87,11 @@ pub fn update_user(
 
 /// `id, username, bio, image` as `{"profile": ...}` with the constant `following` the request implies.
 pub fn profile(
-    result: &StmtResult<'_>,
+    row: Option<Row<'_>>,
     following: bool,
     out: &mut Vec<u8>,
 ) -> Result<Verdict, PgError> {
-    let Some(row) = result.row(0) else {
+    let Some(row) = row.filter(|row| !row.is_null(0)) else {
         return Ok(Verdict::Error(Status::NotFound, NO_PROFILE));
     };
     let profile = Profile {
@@ -131,13 +127,14 @@ fn write_article(out: &mut Vec<u8>, row: &Row<'_>, offset: usize) -> Result<(), 
     Ok(())
 }
 
-/// An "article_full" row (create, favorite, unfavorite); no row is a 404.
+/// An "article_full" row (create, favorite, unfavorite); no row, or a row whose id is NULL (a run of favorites
+/// answers every job with a row), is a 404.
 pub fn article(
-    result: &StmtResult<'_>,
+    row: Option<Row<'_>>,
     success: Status,
     out: &mut Vec<u8>,
 ) -> Result<Verdict, PgError> {
-    let Some(row) = result.row(0) else {
+    let Some(row) = row.filter(|row| !row.is_null(0)) else {
         return Ok(Verdict::Error(Status::NotFound, NO_ARTICLE));
     };
     write_article(out, &row, 0)?;
@@ -145,8 +142,8 @@ pub fn article(
 }
 
 /// `update_article`: `found_id` NULL is a 404, a found article without an updated row a 403.
-pub fn update_article(result: &StmtResult<'_>, out: &mut Vec<u8>) -> Result<Verdict, PgError> {
-    let Some(row) = result.row(0) else {
+pub fn update_article(row: Option<Row<'_>>, out: &mut Vec<u8>) -> Result<Verdict, PgError> {
+    let Some(row) = row else {
         return Ok(Verdict::Error(Status::NotFound, NO_ARTICLE));
     };
     if row.is_null(0) {
@@ -160,8 +157,8 @@ pub fn update_article(result: &StmtResult<'_>, out: &mut Vec<u8>) -> Result<Verd
 }
 
 /// `delete_article` / `delete_comment`: `found_id, found_author, deleted_id`.
-pub fn removal(result: &StmtResult<'_>, missing: Kind) -> Result<Verdict, PgError> {
-    let Some(row) = result.row(0) else {
+pub fn removal(row: Option<Row<'_>>, missing: Kind) -> Result<Verdict, PgError> {
+    let Some(row) = row else {
         return Ok(Verdict::Error(Status::NotFound, missing.message()));
     };
     if row.is_null(0) {
@@ -190,8 +187,8 @@ impl Kind {
 }
 
 /// `add_comment`: columns `article_id, id, body, created_at, updated_at, username, bio, image`; `article_id` NULL is a 404; the author is the viewer, who does not follow themselves.
-pub fn comment(result: &StmtResult<'_>, out: &mut Vec<u8>) -> Result<Verdict, PgError> {
-    let Some(row) = result.row(0) else {
+pub fn comment(row: Option<Row<'_>>, out: &mut Vec<u8>) -> Result<Verdict, PgError> {
+    let Some(row) = row else {
         return Ok(Verdict::Error(Status::NotFound, NO_ARTICLE));
     };
     if row.is_null(0) {

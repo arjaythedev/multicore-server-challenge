@@ -38,6 +38,7 @@ pub fn test_config(url: &str) -> Config {
         write_batch_max: 1,
         bcrypt_threads: 1,
         bcrypt_window: Duration::ZERO,
+        stats_seconds: 0,
     }
 }
 

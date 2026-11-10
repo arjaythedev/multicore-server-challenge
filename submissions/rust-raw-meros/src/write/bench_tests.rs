@@ -101,6 +101,8 @@ fn jobs(
 #[ignore]
 fn group_commit_throughput_and_postgres_cpu() {
     let master = postmaster_pid();
+    let url = test_url();
+    let db_name = url.rsplit('/').next().unwrap_or("write_test").to_owned();
     let mut next_viewer = 1_000;
     println!(
         "\n{:<24} {:>5} {:>9} {:>12} {:>16} {:>16}",
@@ -134,7 +136,7 @@ fn group_commit_throughput_and_postgres_cpu() {
             let ours = master.and_then(|m| {
                 pg_children(m)
                     .into_iter()
-                    .find(|c| !before.contains(&c.0) && c.2.contains("write_test"))
+                    .find(|c| !before.contains(&c.0) && c.2.contains(db_name.as_str()))
             });
             let cpu0 = master.map(pg_children).unwrap_or_default();
             let started = Instant::now();

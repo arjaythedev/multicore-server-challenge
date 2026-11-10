@@ -5,7 +5,7 @@
 //! comment of each `.sql` file for the output columns.
 
 use crate::app::jobs::{ListKind, ReadKind};
-use crate::pg::{Connection, INT8_ARRAY, PgError, Stmt, TEXT_ARRAY};
+use crate::pg::{Connection, INT8, INT8_ARRAY, PgError, Stmt, TEXT_ARRAY};
 
 /// The groups a batch is split into. `Tags` has no statement of its own: the tag table is fetched whenever any
 /// group needs it and the `Tags` requests are answered from it.
@@ -79,16 +79,17 @@ impl Group {
         self.is_article_shaped() || self == Group::Tags
     }
 
-    /// Statement text and parameter types; `None` for `Tags`.
+    /// Statement text and parameter types; `None` for `Tags`. The feed's is its first phase.
     fn definition(self) -> Option<(&'static str, &'static [u32])> {
         const LIST: &[u32] = &[INT8_ARRAY, INT8_ARRAY, INT8_ARRAY, TEXT_ARRAY];
+        const FEED_LISTS: &[u32] = &[INT8_ARRAY, INT8_ARRAY, INT8_ARRAY, INT8];
         const BY_KEY: &[u32] = &[INT8_ARRAY, TEXT_ARRAY];
         Some(match self {
             Group::ListAll => (include_str!("sql/list_all.sql"), LIST),
             Group::ListTag => (include_str!("sql/list_tag.sql"), LIST),
             Group::ListAuthor => (include_str!("sql/list_author.sql"), LIST),
             Group::ListFavorited => (include_str!("sql/list_favorited.sql"), LIST),
-            Group::Feed => (include_str!("sql/feed.sql"), LIST),
+            Group::Feed => (include_str!("sql/feed_lists.sql"), FEED_LISTS),
             Group::Article => (include_str!("sql/article.sql"), BY_KEY),
             Group::Comments => (include_str!("sql/comments.sql"), BY_KEY),
             Group::Profile => (include_str!("sql/profile.sql"), BY_KEY),
@@ -118,10 +119,15 @@ impl Group {
 /// The tag table: id and name of every tag, in name order.
 const TAGS_SQL: &str = include_str!("sql/tags.sql");
 
+/// Phase B of the feed (phase A is the statement of `Group::Feed`), see `feed.rs`.
+const FEED_ARTICLES_SQL: &str = include_str!("sql/feed_articles.sql");
+const FEED_ARTICLES_PARAMS: &[u32] = &[INT8_ARRAY; 7];
+
 /// The prepared statements of one connection.
 pub struct Statements {
     by_group: [Option<Stmt>; Group::COUNT],
     tags: Stmt,
+    feed_articles: Stmt,
 }
 
 impl Statements {
@@ -134,7 +140,16 @@ impl Statements {
             }
         }
         let tags = conn.prepare(Group::Tags.statement_name(), TAGS_SQL, &[])?;
-        Ok(Statements { by_group, tags })
+        let feed_articles = conn.prepare(
+            "read_feed_articles",
+            FEED_ARTICLES_SQL,
+            FEED_ARTICLES_PARAMS,
+        )?;
+        Ok(Statements {
+            by_group,
+            tags,
+            feed_articles,
+        })
     }
 
     /// The statement that answers `group`; `None` for `Tags`.
@@ -144,6 +159,11 @@ impl Statements {
 
     pub fn tags(&self) -> &Stmt {
         &self.tags
+    }
+
+    /// The feed's second statement: article rows for pages merged from the first one's lists.
+    pub fn feed_articles(&self) -> &Stmt {
+        &self.feed_articles
     }
 }
 

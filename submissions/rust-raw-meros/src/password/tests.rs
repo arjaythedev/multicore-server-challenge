@@ -251,6 +251,18 @@ fn close_releases_a_waiting_taker_once_drained() {
 // ---- end to end ----
 
 #[test]
+fn a_job_that_waited_too_long_is_shed_with_503_and_the_rest_is_still_computed() {
+    let rig = Rig::new(Duration::ZERO);
+    let mut stale = verify_job(1, 7, PASSWORD);
+    stale.queued_at = Instant::now() - STALE_AFTER - Duration::from_secs(1);
+    rig.queue.push(stale);
+    rig.queue.push(verify_job(2, 8, PASSWORD));
+    let mut statuses = [rig.reply().0, rig.reply().0];
+    statuses.sort_unstable();
+    assert_eq!(statuses, [200, 503]);
+}
+
+#[test]
 fn right_password_answers_200_with_a_token_that_verifies() {
     let rig = Rig::new(Duration::ZERO);
     rig.queue.push(verify_job(0, 42, PASSWORD));

@@ -22,8 +22,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::finding::{Failure, Finding, all_ok, finding_for};
+use super::batch::{Plan, Step, plan_group};
+use super::finding::{Failure, Finding, all_ok, finding_for, finding_for_row};
 use super::push::{Pushed, push_job};
+use super::push_run::push_run;
 use super::queue::WriteQueue;
 use super::respond::Responder;
 use super::statements::Statements;
@@ -48,7 +50,16 @@ const LOG_EVERY: u32 = 40;
 #[derive(Clone, Copy)]
 enum Slot {
     Rejected,
-    Pushed { first: usize, count: usize },
+    Pushed {
+        first: usize,
+        count: usize,
+    },
+    /// Row `row` of the `rows` rows of the array statement at pipeline position `stmt`.
+    Row {
+        stmt: usize,
+        row: usize,
+        rows: usize,
+    },
 }
 
 /// How a group ended.
@@ -71,7 +82,9 @@ pub struct Lane {
     results: Results,
     responder: Responder,
     mailboxes: Mailboxes,
+    /// Slot of every job of the group being run (index = job index).
     slots: Vec<Slot>,
+    plan: Plan,
 }
 
 impl Lane {
@@ -88,6 +101,7 @@ impl Lane {
             responder: Responder::new(jwt),
             mailboxes,
             slots: Vec::new(),
+            plan: Plan::default(),
         })
     }
 
@@ -119,21 +133,40 @@ impl Lane {
         self.results.shrink_if_above(MAX_KEPT_ARENA);
     }
 
-    /// All jobs in one transaction.
+    /// All jobs in one transaction. Runs of favorites, comments and follows share one array statement per kind
+    /// (see `batch`); every other job pushes its own statements. Both orders give each job the result of running
+    /// the jobs one after another.
     fn run_group(&mut self, jobs: &[WriteJob]) -> Group {
+        plan_group(jobs, &mut self.plan);
         self.slots.clear();
+        self.slots.resize(jobs.len(), Slot::Rejected);
         let mut next = 0;
-        for job in jobs {
-            match push_job(&mut self.conn, &self.stmts, job) {
-                Ok(Pushed::Statements(count)) => {
-                    self.slots.push(Slot::Pushed { first: next, count });
-                    next += count;
+        for step in &self.plan.steps {
+            let pushed = match *step {
+                Step::Single(i) => push_job(&mut self.conn, &self.stmts, &jobs[i]).map(|pushed| {
+                    if let Pushed::Statements(count) = pushed {
+                        self.slots[i] = Slot::Pushed { first: next, count };
+                        next += count;
+                    }
+                }),
+                Step::Run { kind, start, end } => {
+                    let members = self.plan.members(start, end);
+                    push_run(&mut self.conn, &self.stmts, jobs, kind, members).map(|()| {
+                        for (row, &i) in members.iter().enumerate() {
+                            let rows = members.len();
+                            self.slots[i] = Slot::Row {
+                                stmt: next,
+                                row,
+                                rows,
+                            };
+                        }
+                        next += 1;
+                    })
                 }
-                Ok(Pushed::Rejected) => self.slots.push(Slot::Rejected),
-                Err(_) => {
-                    self.lose(jobs);
-                    return Group::Lost;
-                }
+            };
+            if pushed.is_err() {
+                self.lose(jobs);
+                return Group::Lost;
             }
         }
         match self.conn.flush_and_collect(&mut self.results) {
@@ -142,6 +175,9 @@ impl Lane {
                     let finding = match *slot {
                         Slot::Rejected => Finding::Rejected,
                         Slot::Pushed { first, count } => finding_for(&self.results, first, count),
+                        Slot::Row { stmt, row, rows } => {
+                            finding_for_row(&self.results, stmt, row, rows)
+                        }
                     };
                     self.responder.answer(job, finding);
                 }
