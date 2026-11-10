@@ -1,0 +1,45 @@
+# Pre-verify the c-libco submission exactly like the challenge CI does:
+# install.sh + test/run.sh (build, start, 197 conformance checks) on a clean
+# ubuntu-24.04 against Postgres 18 and the 2% dev seed.
+name: conformance
+on:
+  workflow_dispatch:
+  push:
+    branches: [bench, c-libco-sub]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:18
+        env: { POSTGRES_PASSWORD: postgres }
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
+    env: { PGHOST: 127.0.0.1, PGPORT: 5432, PGUSER: postgres, PGPASSWORD: postgres }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: bench/go.mod, cache-dependency-path: bench/go.sum }
+      - name: tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client curl jq
+      - name: seed
+        run: bash seed/make-seed.sh --dev
+      - name: install.sh
+        run: sudo bash submissions/c-libco-ssmurfgg04-gif/install.sh
+      - name: diagnostic (start server, probe, show trace)
+        run: |
+          (cd submissions/c-libco-ssmurfgg04-gif && bash build.sh)
+          cd submissions/c-libco-ssmurfgg04-gif
+          DATABASE_URL="postgres://conduit:conduit@127.0.0.1:5432/conduit_dev" \
+          JWT_SECRET=multicore-server-challenge HOST=127.0.0.1 PORT=3000 LOG=1 \
+          setsid nohup bash start.sh > /tmp/server.log 2>&1 < /dev/null &
+          sleep 2
+          curl -m 3 -v http://127.0.0.1:3000/api/tags 2>&1 | tail -12
+          echo "=== server log ==="
+          cat /tmp/server.log
+          pkill -f bin/conduit || true
+          sleep 1
+      - name: build, start, test
+        run: bash test/run.sh submissions/c-libco-ssmurfgg04-gif
