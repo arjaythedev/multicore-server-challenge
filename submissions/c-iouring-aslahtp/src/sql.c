@@ -153,6 +153,39 @@ const struct stmt_def stmts[S_COUNT] = {
                          "SELECT username, bio, image FROM u",
                          2, 3, {I8, T}, {T, T, T}},
 
+    /* ---- merged writes: the same writes for a whole run of requests, keyed by (viewer, slug or name) arrays.
+     * Inserts go in key order, so two groups touching the same keys lock them in the same order. A missing
+     * target writes nothing and returns no row for that request, as the single forms do. */
+    [S_M_FAVORITE] = {"INSERT INTO favorites (user_id, article_id) SELECT DISTINCT r.v, a.id "
+                      "FROM unnest($1::int8[], $2::text[]) r(v, slug) JOIN articles a ON a.slug = r.slug "
+                      "ORDER BY 1, 2 ON CONFLICT DO NOTHING",
+                      2, 0, {I8A, TA}, {0}},
+    [S_M_UNFAVORITE] = {"DELETE FROM favorites f USING unnest($1::int8[], $2::text[]) r(v, slug) "
+                        "JOIN articles a ON a.slug = r.slug WHERE f.user_id = r.v AND f.article_id = a.id",
+                        2, 0, {I8A, TA}, {0}},
+    [S_M_FOLLOW] = {"WITH r AS (SELECT r.k, r.v, u.id, u.username, u.bio, u.image "
+                    "FROM unnest($1::int8[], $2::text[]) WITH ORDINALITY r(v, name, k) JOIN users u ON u.username = r.name), "
+                    "w AS (INSERT INTO follows (follower_id, followee_id) SELECT DISTINCT v, id FROM r ORDER BY 1, 2 "
+                    "ON CONFLICT DO NOTHING) "
+                    "SELECT username, bio, image, k FROM r",
+                    2, 4, {I8A, TA}, {T, T, T, I8}},
+    [S_M_UNFOLLOW] = {"WITH r AS (SELECT r.k, r.v, u.id, u.username, u.bio, u.image "
+                      "FROM unnest($1::int8[], $2::text[]) WITH ORDINALITY r(v, name, k) JOIN users u ON u.username = r.name), "
+                      "w AS (DELETE FROM follows fo USING r WHERE fo.follower_id = r.v AND fo.followee_id = r.id) "
+                      "SELECT username, bio, image, k FROM r",
+                      2, 4, {I8A, TA}, {T, T, T, I8}},
+    /* Ids are drawn in request order (the sorted subquery is kept apart by OFFSET 0, so nextval runs over its
+     * rows in order), so comments made in one group list newest-last exactly as if they had run one by one. */
+    [S_M_COMMENT] = {"WITH r AS MATERIALIZED (SELECT s.k, nextval(pg_get_serial_sequence('comments', 'id')) AS id, "
+                     "s.article_id, s.author_id, s.body FROM (SELECT r.k, a.id AS article_id, r.author_id, r.body "
+                     "FROM unnest($1::text[], $2::int8[], $3::text[]) WITH ORDINALITY r(slug, author_id, body, k) "
+                     "JOIN articles a ON a.slug = r.slug ORDER BY r.k OFFSET 0) s), "
+                     "c AS (INSERT INTO comments (id, article_id, author_id, body) "
+                     "SELECT id, article_id, author_id, body FROM r RETURNING id, body, created_at, updated_at, author_id) "
+                     "SELECT c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image, r.k "
+                     "FROM c JOIN r ON r.id = c.id JOIN users u ON u.id = c.author_id",
+                     3, 8, {TA, I8A, TA}, {I8, T, TZ, TZ, T, T, T, I8}},
+
     /* ---- the drain's planner (see planner.c). Every page statement returns lean article rows:
      * k, id, author_id, slug, title, description, created_at, updated_at; the page's ids are cut first from the
      * narrowest index, and only those rows are read from articles. Rows come back in any order; the planner

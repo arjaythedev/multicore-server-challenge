@@ -45,6 +45,14 @@ enum stmt {
     S_FOLLOW_NAME,
     S_UNFOLLOW_NAME,
 
+    /* Merged writes: a run of one kind from a write group as one statement over arrays (worker.c). Rows end with
+     * the request's ordinal k in the run, so each goes back to its request. */
+    S_M_FAVORITE,
+    S_M_UNFAVORITE,
+    S_M_FOLLOW,
+    S_M_UNFOLLOW,
+    S_M_COMMENT,
+
     /* The drain's planner: phase A, one statement per family, keys as arrays, rows tagged with the key's
      * ordinal k (1-based) ... */
     P_GLOBAL_PAGES,

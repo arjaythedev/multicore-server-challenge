@@ -51,6 +51,9 @@ struct bc_job {
     char hash[BCRYPT_LEN + 1];  /* VERIFY: the stored hash; HASH: the result */
 };
 
+/* Writes that can run merged with others of their kind (worker.c pg_start_group). */
+enum merge { M_NONE, M_FAV, M_UNFAV, M_FOLLOW, M_UNFOLLOW, M_COMMENT, M_KINDS };
+
 /* One request in flight. Everything it needs after the synchronous dispatch is copied in. */
 struct req {
     struct worker *w;
@@ -61,6 +64,9 @@ struct req {
     bool keep_alive, pg_error, write;
     bool solo;             /* a write that may fail on its own (unique names): never grouped with others */
     uint8_t ipc_kind;      /* reads: what q holds for the drain (IPC_PG unit or IPC_PLAN request) */
+    uint8_t merge;         /* writes: enum merge; its keys are s[0] (slug or name) and, for comments, s[1] (body) */
+    uint32_t q_split;      /* merge writes: q's bytes after the write statement (the rest of the unit) start here */
+    int64_t t_us;          /* writes: when queued (CLOCK_MONOTONIC) */
     uint8_t step;
     uint16_t stmt;         /* statement index within the running unit */
     uint16_t nexec;        /* statements (Executes) in the unit */
@@ -81,6 +87,13 @@ struct req {
     struct bc_job bc;
 };
 
+/* One statement run of a write group: a request's own statements (r set, from r->stmt to r->nexec), or one merged
+ * statement for requests run[0 .. n) of the connection's run array (r NULL). */
+struct wstep {
+    struct req *r;
+    uint32_t run, n;
+};
+
 struct pgc {
     struct worker *w;
     int fd;
@@ -90,7 +103,11 @@ struct pgc {
     struct buf in;
     struct req *head, *tail;  /* units in flight, in order */
     uint32_t inflight;
-    struct req *cur;          /* write connections: the unit of the running group receiving messages */
+    struct wstep *steps;      /* write connections: the running group's statements, in the order sent */
+    uint32_t nsteps, cur;     /* cur: the step receiving messages */
+    struct req **run;         /* requests of the merged steps */
+    uint32_t nrun;
+    struct req **seg;         /* scratch: the segment being merged */
     bool group_failed;
     struct pgc *next_dirty;
 };
@@ -114,6 +131,9 @@ struct worker {
     struct pgc *dirty;
     struct req *wait_read, *wait_read_tail;
     struct req *wait_write, *wait_write_tail;  /* writes waiting for the next group */
+    uint32_t wait_write_n;
+    bool timer_armed;      /* a timeout is in flight to start a group whose writes waited write_wait_us */
+    struct __kernel_timespec timer_ts;
     struct req *free_reqs;
     struct arena scratch;
     int efd;
@@ -150,10 +170,19 @@ struct config {
     int bcrypt_nice;  /* read_conns: the drain's, for the box */
     uint32_t pg_pipeline;  /* units in flight per Postgres read connection */
     uint32_t write_group;  /* most writes committed by one Sync */
+    bool write_merge;      /* runs of one kind of write in a group go as one statement over arrays */
+    int64_t write_wait_us; /* how long the oldest queued write waits for others to share its group */
+    bool skip_gone;        /* queued reads and bcrypt jobs of clients that hung up are dropped, not run */
     uint32_t plan_max;     /* most planned reads in one plan */
     int64_t plan_wait_us;  /* how long the oldest planned read may wait for company */
     bool planner;          /* hot reads go to the planner (else as plain units) */
     bool plan_pace;        /* plan wait follows the load (drain.c plan_wait); plan_wait_us becomes its cap */
+    bool lanes;            /* feeds, comments and the rest plan apart, each on its own clock (drain.c) */
+    int64_t lane_window_us;          /* a lane's oldest read waits at least this long for company */
+    int64_t lane_gap_us[3];          /* by enum plan_lane: least time between a lane's plan starts */
+    int lane_cap[3];                 /* by enum plan_lane: most plans of a lane in flight */
+    bool ack_delay;        /* after each response, TCP_QUICKACK off: the next request's ACK rides on its response */
+    bool sched_batch;      /* every process and thread under SCHED_BATCH */
     bool direct_fds;       /* accept client sockets as io_uring direct descriptors (off: no measured gain on loopback) */
 };
 extern struct config cfg;
