@@ -1,0 +1,9 @@
+bin/
+.dub/
+docs/
+*.exe
+*.o
+*.obj
+*.lst
+__test__*__
+vendor/*/lib*.a
