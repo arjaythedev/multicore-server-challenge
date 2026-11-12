@@ -8,7 +8,7 @@ database layer of typed queries through Npgsql.FSharp, and one small module for 
 
 | Piece | Version |
 |---|---|
-| Language | F# 10, .NET 10 (`global.json`: SDK 10.0.100+, `install.sh` installs 10.0.402) |
+| Language | F# 11, .NET 11 (`global.json`: SDK 11.0.100+, `install.sh` installs 11.0.100) |
 | HTTP | ASP.NET Core Kestrel, Giraffe 7.0.2 with endpoint routing |
 | JSON | `System.Text.Json`: `Utf8JsonWriter` out, `JsonDocument` in |
 | Postgres | Npgsql 10.0.3 (multiplexing, auto-prepare) through Npgsql.FSharp 5.7.0 |
@@ -403,7 +403,7 @@ writes in one transaction).
 ## Build, run, check
 
 ```bash
-sudo bash install.sh            # once: .NET SDK 10.0.402 -> /usr/local/dotnet
+sudo bash install.sh            # once: .NET SDK 11.0.100 -> /usr/local/dotnet
 bash build.sh                   # -> out/Web.dll
 DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=multicore-server-challenge \
   HOST=0.0.0.0 PORT=80 bash start.sh

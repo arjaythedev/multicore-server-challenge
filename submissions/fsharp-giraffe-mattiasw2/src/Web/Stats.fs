@@ -13,6 +13,11 @@ open System.Threading.Tasks
 open Microsoft.AspNetCore.Connections
 open Microsoft.AspNetCore.Server.Kestrel.Core
 
+/// One line on stderr. The server's own lines use this and string interpolation without printf
+/// specifiers (`{x:F1}`, `{name,-42}`), never `eprintfn`/`sprintf`: FSharp.Core's printf builds its
+/// formatters by reflection (MakeGenericMethod), which Native AOT cannot compile.
+let eprint (line: string) = Console.Error.WriteLine line
+
 /// Kestrel connections, counted by connection middleware (only when the line is on: the
 /// middleware's state lives as long as each connection).
 [<Sealed>]
@@ -76,7 +81,7 @@ type Endpoints() =
         timings
         |> Seq.map (fun kv -> kv.Key, kv.Value.Count, kv.Value.Summary())
         |> Seq.sortByDescending (fun (_, n, _) -> n)
-        |> Seq.map (fun (name, n, summary) -> sprintf "  %-42s %9d  %s" name n summary)
+        |> Seq.map (fun (name, n, summary) -> $"  {name,-42} {n,9}  {summary}")
         |> List.ofSeq
 
 /// Where each request's time went, by endpoint and by log2 bucket of its server time (bucket 0:
@@ -180,7 +185,7 @@ type Sampler(every: TimeSpan, reads: Engine.Reads.Gather, writes: Engine.Commit.
                         rows[at + 9] <- int64 writes.Depth
             with e ->
                 // A diagnostic must never take the server down.
-                eprintfn "sampler stopped: %s" e.Message
+                eprint $"sampler stopped: {e.Message}"
         Thread(sample, IsBackground = true, Name = "sampler").Start()
 
     member _.Write(path: string) =
@@ -273,10 +278,11 @@ type GcLog(capacity: int) =
             |> Array.map (fun (gen, xs) ->
                 let pauses = xs |> Array.map (fun r -> r[7]) |> Array.sort
                 let ms (us: int64) = float us / 1000.0
-                sprintf "  gen %2d: %5d, pause p50 %.1f max %.1f ms, suspension mean %.2f ms, promoted mean %.1f MB"
-                    gen xs.Length (ms pauses[pauses.Length / 2]) (ms pauses[pauses.Length - 1])
-                    (xs |> Array.averageBy (fun r -> ms r[5]))
-                    (xs |> Array.averageBy (fun r -> float (r[8] + r[9] + r[10] + r[11] + r[12]) / 1048576.0)))
+                let p50 = ms pauses[pauses.Length / 2]
+                let worst = ms pauses[pauses.Length - 1]
+                let suspension = xs |> Array.averageBy (fun r -> ms r[5])
+                let promoted = xs |> Array.averageBy (fun r -> float (r[8] + r[9] + r[10] + r[11] + r[12]) / 1048576.0)
+                $"  gen {gen,2}: {xs.Length,5}, pause p50 {p50:F1} max {worst:F1} ms, suspension mean {suspension:F2} ms, promoted mean {promoted:F1} MB")
         n, lines
 
 let private mb (bytes: int64) = bytes / 1048576L
@@ -324,39 +330,26 @@ let start (every: TimeSpan) (connections: Connections) (reads: Engine.Reads.Gath
             let background', lastBackground = latest GCKind.Background background
             let wall = DateTimeOffset.UtcNow
             let perBatch = if batches' = batches then 0L else (requests' - requests) / (batches' - batches)
-            eprintfn
-                "stats t=%d %s dt=%dms | conn=%d new=%d | gc0=%d gc1=%d gc2=%d pause=%dms alloc=%dMB eph=[%s] full=[%s] bg=[%s] | heap=%dMB gen2=%dMB loh=%dMB poh=%dMB | cpu=%.2f pool=%d pending=%d | reads q=%d busy=%d/%d batches=%d per=%d worst=%dms | writes q=%d busy=%.0f%% groups=%d per=%d refused=%d"
-                (wall.ToUnixTimeSeconds())
-                (wall.ToString "HH:mm:ss.fff")
-                (int dt.TotalMilliseconds)
-                connections.Open
-                (opened' - opened)
-                (d[0] - d[1])
-                (d[1] - d[2])
-                d[2]
-                (int (paused' - paused).TotalMilliseconds)
-                (mb (allocated' - allocated))
-                lastEphemeral
-                lastFull
-                lastBackground
-                (mb heap.HeapSizeBytes)
-                (mb generations[2].SizeAfterBytes)
-                (mb generations[3].SizeAfterBytes)
-                (mb generations[4].SizeAfterBytes)
-                ((cpu' - cpu).TotalSeconds / dt.TotalSeconds)
-                ThreadPool.ThreadCount
-                ThreadPool.PendingWorkItemCount
-                reads.Depth
-                reads.Busy
-                readLanes
-                (batches' - batches)
-                perBatch
-                (int (reads.Worst()).TotalMilliseconds)
-                writes.Depth
-                (100.0 * float (writes.BusyTicks - writeBusy) / float Stopwatch.Frequency / dt.TotalSeconds / float writeLanes)
-                (groups' - groups)
-                (if groups' = groups then 0L else (written' - written) / (groups' - groups))
-                (fst writes.Refusals)
+            let cores = (cpu' - cpu).TotalSeconds / dt.TotalSeconds
+            let writeBusyPercent =
+                100.0 * float (writes.BusyTicks - writeBusy) / float Stopwatch.Frequency / dt.TotalSeconds / float writeLanes
+            let perGroup = if groups' = groups then 0L else (written' - written) / (groups' - groups)
+            let clock = wall.ToString "HH:mm:ss.fff"
+            // Interpolation without printf specifiers compiles to String.Format (no reflection, so
+            // Native AOT can build it). A literal percent sign would be a specifier, hence "pct".
+            eprint (
+                $"stats t={wall.ToUnixTimeSeconds()} {clock} dt={int dt.TotalMilliseconds}ms"
+                + $" | conn={connections.Open} new={opened' - opened}"
+                + $" | gc0={d[0] - d[1]} gc1={d[1] - d[2]} gc2={d[2]} pause={int (paused' - paused).TotalMilliseconds}ms"
+                + $" alloc={mb (allocated' - allocated)}MB eph=[{lastEphemeral}] full=[{lastFull}] bg=[{lastBackground}]"
+                + $" | heap={mb heap.HeapSizeBytes}MB gen2={mb generations[2].SizeAfterBytes}MB"
+                + $" loh={mb generations[3].SizeAfterBytes}MB poh={mb generations[4].SizeAfterBytes}MB"
+                + $" | cpu={cores:F2} pool={ThreadPool.ThreadCount} pending={ThreadPool.PendingWorkItemCount}"
+                + $" | reads q={reads.Depth} busy={reads.Busy}/{readLanes} batches={batches' - batches} per={perBatch}"
+                + $" worst={int (reads.Worst()).TotalMilliseconds}ms"
+                + $" | writes q={writes.Depth} busy={writeBusyPercent:F0}pct groups={groups' - groups} per={perGroup}"
+                + $" refused={fst writes.Refusals}"
+            )
             writeBusy <- writes.BusyTicks
             groups <- groups'
             written <- written'
@@ -378,5 +371,5 @@ let start (every: TimeSpan) (connections: Connections) (reads: Engine.Reads.Gath
         try
             sample ()
         with e ->
-            eprintfn "stats stopped: %s" e.Message
+            eprint $"stats stopped: {e.Message}"
     Thread(guarded, IsBackground = true, Name = "stats").Start()

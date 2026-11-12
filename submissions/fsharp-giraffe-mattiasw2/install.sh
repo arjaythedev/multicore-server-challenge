@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs once as root on a clean Ubuntu 24.04: the .NET SDK (official tarball, sha512-checked) -> /usr/local/dotnet.
 set -euo pipefail
-SDK_VERSION=10.0.402
+SDK_VERSION=11.0.100
 case "$(uname -m)" in x86_64) RID=linux-x64 ;; aarch64) RID=linux-arm64 ;; *) echo "unsupported arch $(uname -m)"; exit 1 ;; esac
 apt-get update -q && apt-get install -y -q curl jq ca-certificates libicu74 libstdc++6 libssl3t64 zlib1g
 FILE="$(curl -fsSL "https://builds.dotnet.microsoft.com/dotnet/release-metadata/${SDK_VERSION%.*}/releases.json" \
