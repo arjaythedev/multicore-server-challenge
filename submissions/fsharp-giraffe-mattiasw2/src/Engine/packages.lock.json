@@ -12,7 +12,7 @@
         "type": "Direct",
         "requested": "[11.0.101, )",
         "resolved": "11.0.101",
-        "contentHash": "/Us61HrXUuswvfVj2vj6RPa123Lnvj3nF9RHT5dFQdPmPhBxGAjlwIKyUYg2TACsr0iHCZFqvZcMNmBf9A8h4g=="
+        "contentHash": "XL1wfb0gujXAtnJfO7rYfxKgwufCiT8aOKqGoqKB83oxRAZ9+yiNWXinHO4x9StYuunTl/AH8eERc0hv7UXJVQ=="
       },
       "Npgsql": {
         "type": "Direct",
