@@ -77,3 +77,34 @@ let ``a tampered payload is refused`` () =
     let parts = signer.Mint(1L, now).Split('.')
     let token = parts[0] + "." + b64 $"""{{"sub":"2","iat":{now},"exp":{now + 60L}}}""" + "." + parts[2]
     Assert.Equal(ValueNone, signer.Verify(token, now))
+
+// The canonical header takes the allocation-free path; these are its own edge cases.
+
+[<Theory>]
+[<InlineData("""{"sub":"5","exp":9999999999,"sub":"6"}""", 6L)>]
+[<InlineData("""{"x":{"sub":"9"},"sub":"5","exp":9999999999,"y":[1,{"exp":1}]}""", 5L)>]
+[<InlineData("""{"s\u0075b":"5","exp":9999999999}""", 5L)>]
+[<InlineData("""{"sub":"\u0035","exp":9999999999}""", 5L)>]
+[<InlineData(""" { "exp" : 9.999999999e9 , "sub" : "5" } """, 5L)>]
+let ``the fast path reads claims as a JSON document would`` (payload: string, expected: int64) =
+    Assert.Equal(ValueSome expected, signer.Verify(forge secret hs256 payload, now))
+
+[<Theory>]
+[<InlineData("""{"sub":"5","exp":9999999999,"sub":5}""")>]
+[<InlineData("""{"sub":"5","exp":9999999999,"exp":1}""")>]
+[<InlineData("""{"sub":"5","exp":"9999999999"}""")>]
+[<InlineData("""{"sub":"+5","exp":9999999999}""")>]
+[<InlineData("""{"sub":" 5","exp":9999999999}""")>]
+[<InlineData("""{"sub":"0","exp":9999999999}""")>]
+[<InlineData("""{"sub":"5","exp":9999999999} x""")>]
+[<InlineData("""{"sub":"5","exp":9999999999""")>]
+[<InlineData("""["sub","5"]""")>]
+[<InlineData("""{"sub":"5","exp":9999999999,}""")>]
+let ``the fast path refuses what a JSON document would`` (payload: string) =
+    Assert.Equal(ValueNone, signer.Verify(forge secret hs256 payload, now))
+
+[<Fact>]
+let ``a signature of the wrong length is refused`` () =
+    let parts = signer.Mint(1L, now).Split('.')
+    Assert.Equal(ValueNone, signer.Verify(parts[0] + "." + parts[1] + "." + parts[2] + parts[2], now))
+    Assert.Equal(ValueNone, signer.Verify(parts[0] + "." + parts[1] + "." + parts[2].Substring(0, 20), now))

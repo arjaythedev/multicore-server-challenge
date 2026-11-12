@@ -102,7 +102,8 @@ type Millis() =
                     seen <- seen + counts[i]
                     i <- i + 1
                 i
-            $"{at 0.5}/{at 0.95}/{at 0.99} ms (mean %.1f{float (Volatile.Read &micros[0]) / 1000.0 / float total})"
+            let mean = float (Volatile.Read &micros[0]) / 1000.0 / float total
+            $"{at 0.5}/{at 0.95}/{at 0.99} ms (mean {mean:F1})"
 
 /// One request's time in the lanes, in Stopwatch ticks, filled in by the lanes it used. Only when
 /// TRACE_FILE is set: the web layer puts one in `Current` for each request, and a lane's pending

@@ -1,12 +1,12 @@
 {
   "version": 1,
   "dependencies": {
-    "net10.0": {
+    "net11.0": {
       "FSharp.Core": {
         "type": "Direct",
-        "requested": "[10.0.104, )",
-        "resolved": "10.0.104",
-        "contentHash": "2VQpRzjhuN6EHODVGiYZ/svc68up2/c3TdQ7eQtkY2MAN6EKMOF2SaraPCiMDu4+JMIbq9KkPxaWk5sXbfPs9Q=="
+        "requested": "[11.0.101, )",
+        "resolved": "11.0.101",
+        "contentHash": "XL1wfb0gujXAtnJfO7rYfxKgwufCiT8aOKqGoqKB83oxRAZ9+yiNWXinHO4x9StYuunTl/AH8eERc0hv7UXJVQ=="
       },
       "Giraffe": {
         "type": "Direct",
@@ -64,7 +64,7 @@
         "type": "Project",
         "dependencies": {
           "BCrypt.Net-Next": "[4.2.0, )",
-          "FSharp.Core": "[10.0.104, )",
+          "FSharp.Core": "[11.0.101, )",
           "Npgsql": "[10.0.3, )",
           "Npgsql.FSharp": "[5.7.0, )"
         }

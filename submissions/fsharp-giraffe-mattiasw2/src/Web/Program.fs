@@ -15,30 +15,58 @@ open Microsoft.Extensions.Logging
 open Giraffe
 open Giraffe.EndpointRouting
 
+// Routes with path parameters are ASP.NET route templates, not Giraffe's `routef`: `routef` parses its
+// "%s" format through FSharp.Core's printf machinery (reflection, MakeGenericMethod), which Native AOT
+// cannot compile. Each helper reads the parameter names from the template itself, so a template and
+// the values its handler reads cannot drift apart.
+
+/// The names of a route template's `{name}` segments, in order.
+let private parameters (template: string) : string array =
+    template.Split '/'
+    |> Array.filter (fun s -> s.StartsWith '{' && s.EndsWith '}')
+    |> Array.map (fun s -> s.Substring(1, s.Length - 2))
+
+let private expect (count: int) (template: string) : string array =
+    match parameters template with
+    | names when names.Length = count -> names
+    | names -> invalidArg (nameof template) $"{template}: {names.Length} parameters, expected {count}"
+
+/// `route1 "/api/articles/{slug}" handler`: the handler gets the decoded `{slug}`.
+let private route1 (template: string) (handler: string -> HttpHandler) : Endpoint =
+    let names = expect 1 template
+    route template (fun next ctx -> handler (string ctx.Request.RouteValues[names[0]]) next ctx)
+
+/// `route2 "/api/articles/{slug}/comments/{id}" handler`: the handler gets both values, in template order.
+let private route2 (template: string) (handler: string * string -> HttpHandler) : Endpoint =
+    let names = expect 2 template
+    route template (fun next ctx ->
+        let values = ctx.Request.RouteValues
+        handler (string values[names[0]], string values[names[1]]) next ctx)
+
 let endpoints (env: Handlers.Env) : Endpoint list =
     [ GET
           [ route "/api/tags" (Handlers.tags env)
             route "/api/user" (Handlers.currentUser env)
-            routef "/api/profiles/%s" (Handlers.profile env)
+            route1 "/api/profiles/{username}" (Handlers.profile env)
             route "/api/articles" (Handlers.listArticles env)
             route "/api/articles/feed" (Handlers.feed env)
-            routef "/api/articles/%s" (Handlers.article env)
-            routef "/api/articles/%s/comments" (Handlers.comments env) ]
+            route1 "/api/articles/{slug}" (Handlers.article env)
+            route1 "/api/articles/{slug}/comments" (Handlers.comments env) ]
       POST
           [ route "/api/users" (Handlers.register env)
             route "/api/users/login" (Handlers.login env)
-            routef "/api/profiles/%s/follow" (Handlers.follow env true)
+            route1 "/api/profiles/{username}/follow" (Handlers.follow env true)
             route "/api/articles" (Handlers.createArticle env)
-            routef "/api/articles/%s/favorite" (Handlers.favorite env true)
-            routef "/api/articles/%s/comments" (Handlers.addComment env) ]
+            route1 "/api/articles/{slug}/favorite" (Handlers.favorite env true)
+            route1 "/api/articles/{slug}/comments" (Handlers.addComment env) ]
       PUT
           [ route "/api/user" (Handlers.updateUser env)
-            routef "/api/articles/%s" (Handlers.updateArticle env) ]
+            route1 "/api/articles/{slug}" (Handlers.updateArticle env) ]
       DELETE
-          [ routef "/api/profiles/%s/follow" (Handlers.follow env false)
-            routef "/api/articles/%s" (Handlers.deleteArticle env)
-            routef "/api/articles/%s/favorite" (Handlers.favorite env false)
-            routef "/api/articles/%s/comments/%s" (Handlers.deleteComment env) ] ]
+          [ route1 "/api/profiles/{username}/follow" (Handlers.follow env false)
+            route1 "/api/articles/{slug}" (Handlers.deleteArticle env)
+            route1 "/api/articles/{slug}/favorite" (Handlers.favorite env false)
+            route2 "/api/articles/{slug}/comments/{id}" (Handlers.deleteComment env) ] ]
 
 let private setting (name: string) (fallback: string) =
     match Environment.GetEnvironmentVariable name with
@@ -93,27 +121,29 @@ let main args =
     let readLanes = max 1 (int (setting "READ_LANES" (string cores)))
     let readBatch = max 1 (int (setting "READ_BATCH" "2048"))
     let readGather = TimeSpan.FromMilliseconds(float (setting "READ_GATHER_MS" "25"))
-    // READ_SPLIT connections per lane: a batch's phase B, cut by article, runs on that many at
-    // once (1: off), each part at least READ_SPLIT_MIN distinct articles.
-    let readSplit = max 1 (int (setting "READ_SPLIT" "1"))
-    let readSplitMin = max 1 (int (setting "READ_SPLIT_MIN" "64"))
     // A gathering lane takes its fair share of what waits (what waits over the idle lanes), at
     // least READ_SHARE_MIN (64; 0: take everything up to READ_BATCH, as before).
     let readShareMin = max 0 (int (setting "READ_SHARE_MIN" "64"))
+    // Count lanes: connections that count favorites for all the read lanes' batches at once
+    // (1; 0: each batch counts its own, in its phase B).
+    let countLanes = max 0 (int (setting "READ_COUNT_LANES" "1"))
     // A fine timeline for diagnostics (off unless BATCH_LOG is set): a batch log and a sample of
     // CPU, GC and queues every BATCH_LOG_MS (25), written at shutdown to BATCH_LOG.batches.csv and
     // BATCH_LOG.samples.csv. BATCH_LOG_PG_CGROUP: Postgres's cgroup cpu.stat, for its CPU.
     let batchLog = setting "BATCH_LOG" ""
     // Multiplexed: the cold reads (sign-in lookups, the read after a write). Rule: 95 or fewer
     // connections in total, lanes included.
-    let poolSize = min (95 - writeLanes - readLanes * readSplit) (int (setting "DB_POOL_SIZE" (string (max 2 (cores / 2)))))
-    // A quarter of the cores, each computing up to four hashes in lockstep (~25 a second per
-    // thread), covers the login rate the reads leave room for; fewer threads also fill the
-    // lockstep batches.
+    let poolSize = min (95 - writeLanes - readLanes - countLanes) (int (setting "DB_POOL_SIZE" (string (max 2 (cores / 2)))))
+    // A quarter of the cores, each computing several hashes in lockstep (five on a recent x86-64
+    // core, ~120 a second per idle thread), covers the login rate the reads leave room for; fewer
+    // threads also fill the lockstep batches.
     let bcryptLanes = max 1 (int (setting "BCRYPT_THREADS" (string quarter)))
-    // Each bcrypt thread computes up to BCRYPT_WIDTH hashes in lockstep, letting the first wait
-    // up to BCRYPT_GATHER_MS for batch-mates.
-    let bcryptWidth = max 1 (int (setting "BCRYPT_WIDTH" "4"))
+    // Each bcrypt thread computes up to BCRYPT_WIDTH hashes in lockstep (1 to 6; 0, the default:
+    // the width this CPU hashes fastest at) with the kernel BCRYPT_KERNEL (c, ah, bextr or shrx;
+    // by default the fastest, timed at startup), letting the first wait up to BCRYPT_GATHER_MS
+    // for batch-mates.
+    let bcryptWidth = max 0 (int (setting "BCRYPT_WIDTH" "0"))
+    let bcryptKernel = setting "BCRYPT_KERNEL" ""
     // Logins are ~0.1% of the requests, so waiting for batch-mates barely touches p95 or p99.
     let bcryptGather = TimeSpan.FromMilliseconds(float (setting "BCRYPT_GATHER_MS" "150"))
     // Diagnostics: a line on stderr every STATS_SECONDS (fractions allowed); 0, the default, is off.
@@ -125,7 +155,8 @@ let main args =
         if statsEvery.Ticks > 0L then
             connections.Count listen
 
-    Engine.Passwords.start bcryptLanes bcryptWidth bcryptGather
+    Engine.Passwords.start bcryptLanes bcryptKernel bcryptWidth bcryptGather
+    let bcryptKernel, bcryptWidth, bcryptMs = Engine.Passwords.kernel ()
     // Each kind of connection names itself, so Postgres's own views (pg_stat_activity) and
     // probes on its backends can tell the read lanes, the write lanes and the pool apart.
     let named (role: string) (connectionString: string) = $"{connectionString};Application Name=conduit-{role}"
@@ -140,12 +171,11 @@ let main args =
         )
     let reads =
         Engine.Reads.Gather(
-            named "read" (Engine.Db.connectionString databaseUrl (readLanes * readSplit) false),
+            named "read" (Engine.Db.connectionString databaseUrl (readLanes + countLanes) false),
             readLanes,
+            countLanes,
             readBatch,
             readGather,
-            readSplit,
-            readSplitMin,
             readShareMin,
             (if batchLog = "" then 0 else 400_000)
         )
@@ -195,7 +225,7 @@ let main args =
                 try
                     do! next.Invoke ctx
                 with e ->
-                    eprintfn "%s %s: %s" ctx.Request.Method ctx.Request.Path.Value (e.ToString())
+                    Stats.eprint $"{ctx.Request.Method} {ctx.Request.Path.Value}: {e}"
                     do! writeError ctx 500 "internal error"
                 if perEndpoint.IsSome || phases.IsSome then
                     let finished = Diagnostics.Stopwatch.GetTimestamp()
@@ -211,10 +241,14 @@ let main args =
 
     // Touch the database before taking traffic: a bad DATABASE_URL fails here, loudly.
     (Engine.Tags.all reads).GetAwaiter().GetResult() |> ignore
-    eprintfn
-        "conduit (F#, Giraffe on Kestrel) on %s:%d, %d cores: %d read lanes (batches of <= %d, gather %d ms, fair share from %d, phase B on %d connections from %d articles each) + %d write lanes (groups of <= %d, waiting %d ms for %d) + %d multiplexed db connections, %d bcrypt threads (%d wide), server GC %b"
-        host port cores readLanes readBatch (int readGather.TotalMilliseconds) readShareMin readSplit readSplitMin writeLanes writeGroup (int writeGather.TotalMilliseconds) writeGroupMin poolSize bcryptLanes
-        bcryptWidth Runtime.GCSettings.IsServerGC
+    let serverGC = if Runtime.GCSettings.IsServerGC then "true" else "false"
+    Stats.eprint (
+        $"conduit (F#, Giraffe on Kestrel) on {host}:{port}, {cores} cores:"
+        + $" {readLanes} read lanes (batches of <= {readBatch}, gather {int readGather.TotalMilliseconds} ms,"
+        + $" fair share from {readShareMin})"
+        + $" + {writeLanes} write lanes (groups of <= {writeGroup}, waiting {int writeGather.TotalMilliseconds} ms for {writeGroupMin})"
+        + $" + {poolSize} multiplexed db connections, {bcryptLanes} bcrypt threads ({bcryptWidth} wide, kernel {bcryptKernel}, {bcryptMs:F1} ms a hash), server GC {serverGC}"
+    )
     let sampler =
         if batchLog = "" then
             None
@@ -227,26 +261,26 @@ let main args =
         Stats.start statsEvery connections reads readLanes writes writeLanes (phases |> Option.map (fun p -> p, phasesFile))
     app.Lifetime.ApplicationStopping.Register(fun () ->
         let hashes, verifies = Engine.Passwords.counts ()
-        eprintfn "bcrypt: %d hashes (sign-ups, password changes), %d verifies (logins)" hashes verifies
+        Stats.eprint $"bcrypt: {hashes} hashes (sign-ups, password changes), {verifies} verifies (logins)"
         let lockstepBatches, inBatches = Engine.Passwords.lockstep ()
-        eprintfn "bcrypt lockstep: %d hashes in %d batches" inBatches lockstepBatches
+        Stats.eprint $"bcrypt lockstep: {inBatches} hashes in {lockstepBatches} batches"
         let groups, written = writes.Counts
-        eprintfn "group commit: %d writes in %d groups" written groups
+        Stats.eprint $"group commit: {written} writes in {groups} groups"
         let refused, failedAlone = writes.Refusals
-        eprintfn "group commit refusals: %d groups rerun write by write, %d writes failed alone" refused failedAlone
+        Stats.eprint $"group commit refusals: {refused} groups rerun write by write, {failedAlone} writes failed alone"
         let batches, requests = reads.Counts
-        eprintfn "read batching: %d requests in %d batches" requests batches
+        Stats.eprint $"read batching: {requests} requests in {batches} batches"
         let queued, executed, answered = reads.Timings
-        eprintfn "read timings (p50/p95/p99): queued %s, batch executed %s, answered %s" queued executed answered
+        Stats.eprint $"read timings (p50/p95/p99): queued {queued}, batch executed {executed}, answered {answered}"
         let a, plan, b, assembled = reads.PhaseTimings
-        eprintfn "read batch phases (p50/p95/p99): A %s, plan %s, B %s, assemble %s" a plan b assembled
+        Stats.eprint $"read batch phases (p50/p95/p99): A {a}, plan {plan}, B {b}, assemble {assembled}"
         let queued, executed, answered = writes.Timings
-        eprintfn "write timings (p50/p95/p99): queued %s, group executed %s, answered %s" queued executed answered
+        Stats.eprint $"write timings (p50/p95/p99): queued {queued}, group executed {executed}, answered {answered}"
         match perEndpoint with
         | Some t ->
-            eprintfn "server time per endpoint (count, p50/p95/p99):"
+            Stats.eprint "server time per endpoint (count, p50/p95/p99):"
             for line in t.Lines() do
-                eprintfn "%s" line
+                Stats.eprint line
         | None -> ()
         phases |> Option.iter (fun p -> p.Snapshot(phasesFile, DateTimeOffset.UtcNow.ToUnixTimeSeconds()))
         sampler
@@ -254,10 +288,11 @@ let main args =
             let batches = reads.WriteLog(batchLog + ".batches.csv")
             let samples = s.Write(batchLog + ".samples.csv")
             let collections, lines = gc.Write(batchLog + ".gc.csv")
-            eprintfn "batch log: %d batches, %d samples, %d GC pauses written to %s.*.csv" batches samples collections batchLog
-            eprintfn "GC pauses by generation (runtime total %.0f ms):" (GC.GetTotalPauseDuration().TotalMilliseconds)
+            Stats.eprint $"batch log: {batches} batches, {samples} samples, {collections} GC pauses written to {batchLog}.*.csv"
+            let pauses = GC.GetTotalPauseDuration().TotalMilliseconds
+            Stats.eprint $"GC pauses by generation (runtime total {pauses:F0} ms):"
             for line in lines do
-                eprintfn "%s" line))
+                Stats.eprint line))
     |> ignore
     app.Run()
     0

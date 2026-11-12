@@ -2,16 +2,22 @@
 ///
 /// One bcrypt is ~1 M Blowfish encryptions, each step feeding the next: a chain of dependent
 /// S-box lookups, so a single hash leaves the CPU waiting on memory latency. Hashes of different
-/// logins are independent, so this module steps several of them ("lanes") together: chain step
-/// k of every lane, then step k + 1. Neighbouring steps then have no data dependency, and the
-/// CPU's out-of-order engine overlaps them. The output is bcrypt's, bit for bit
-/// (Tests/BcryptTests.fs checks it against BCrypt.Net-Next on random passwords and salts).
+/// logins are independent, so several of them ("lanes") are stepped together: chain step k of
+/// every lane, then step k + 1. Neighbouring steps then have no data dependency, and the CPU's
+/// out-of-order engine overlaps them.
+///
+/// The Blowfish itself is C and assembly (native/cbcrypt.c, native/gen-bcrypt-x86.py), built by
+/// native/build.sh into libcbcrypt.so and called here. This module chooses the kernel and the
+/// width, and reads and writes the stored form. The output is bcrypt's, bit for bit
+/// (Tests/BcryptTests.fs checks every kernel at every width against BCrypt.Net-Next).
 module Engine.Bcrypt
 
-#nowarn "9" // NativePtr: the Blowfish state is pinned, and the rounds index it without bounds checks
+#nowarn "9" // NativePtr: the buffers handed to the library live on the stack
 
 open System
+open System.Diagnostics
 open System.Numerics
+open System.Runtime.InteropServices
 open System.Text
 open Microsoft.FSharp.NativeInterop
 
@@ -24,7 +30,7 @@ let private StateWords = 1042
 /// Blowfish's initial state is the hexadecimal digits of pi's fractional part (P starts
 /// 0x243F6A88). Computed here with Machin's formula, pi = 16 atan(1/5) - 4 atan(1/239), on
 /// big integers, instead of pasting 1042 constants; the unit test checks words of it against
-/// the published tables.
+/// the published tables. Pinned for good, so the library reads it in place.
 let initialState: uint32[] =
     let bits = StateWords * 32 + 64 // 64 guard bits absorb the truncation of ~7000 terms
     let scale = BigInteger.One <<< bits
@@ -42,328 +48,105 @@ let initialState: uint32[] =
     let pi = BigInteger 16 * arctanInverse 5 - BigInteger 4 * arctanInverse 239
     let fraction = pi - BigInteger 3 * scale
     let word = BigInteger UInt32.MaxValue
-    Array.init StateWords (fun i -> uint32 ((fraction >>> (bits - 32 * (i + 1))) &&& word))
+    let state = GC.AllocateUninitializedArray<uint32>(StateWords, pinned = true)
+    for i in 0 .. StateWords - 1 do
+        state[i] <- uint32 ((fraction >>> (bits - 32 * (i + 1))) &&& word)
+    state
 
-/// "OrpheanBeholderScryDoubt", the text bcrypt encrypts 64 times.
-let private magic =
-    let b = Encoding.ASCII.GetBytes "OrpheanBeholderScryDoubt"
-    Array.init 6 (fun i -> (uint32 b[4 * i] <<< 24) ||| (uint32 b[4 * i + 1] <<< 16) ||| (uint32 b[4 * i + 2] <<< 8) ||| uint32 b[4 * i + 3])
+// ------------------------------------------------------------------ the library --------
 
-// ------------------------------------------------------------------ Blowfish ----------
+/// The kernels this CPU can run, as a bit mask (bit k: kernel k).
+[<DllImport("cbcrypt", ExactSpelling = true)>]
+extern int private cbcrypt_kernels()
 
-// Each S-box is addressed as its own pointer (a constant offset from the state) and indexed by
-// a byte: the JIT then knows the index is not negative and folds the offset into the load
-// (`[p + 4*idx + 1096]`), where an int sum `offset + idx` costs an add and a sign extension.
-let inline private f (s: nativeptr<uint32>) (x: uint32) =
-    ((NativePtr.get s (int (byte (x >>> 24))) + NativePtr.get (NativePtr.add s 256) (int (byte (x >>> 16))))
-     ^^^ NativePtr.get (NativePtr.add s 512) (int (byte (x >>> 8))))
-    + NativePtr.get (NativePtr.add s 768) (int (byte x))
+/// `lanes` hashes of one cost: 72 key bytes, a key length and 16 salt bytes a lane in, 23 hash
+/// bytes a lane out. 0, or -1 for an argument out of range (native/cbcrypt.c).
+[<DllImport("cbcrypt", ExactSpelling = true)>]
+extern int private cbcrypt_raw(uint32* init, int kernel, int cost, int lanes, byte* keys, int* keyLengths, byte* salts, byte* hashes)
 
-/// One Blowfish block with the lane state at `p`.
-let inline private encipher (p: nativeptr<uint32>) (xl: byref<uint32>) (xr: byref<uint32>) =
-    let s = NativePtr.add p 18
-    let mutable l = xl ^^^ NativePtr.get p 0
-    let mutable r = xr
-    let mutable i = 1
-    while i < 17 do
-        r <- r ^^^ f s l ^^^ NativePtr.get p i
-        l <- l ^^^ f s r ^^^ NativePtr.get p (i + 1)
-        i <- i + 2
-    xl <- r ^^^ NativePtr.get p 17
-    xr <- l
+/// `initialState` where it is pinned.
+let private initial: nativeptr<uint32> =
+    NativePtr.ofNativeInt (Marshal.UnsafeAddrOfPinnedArrayElement(initialState, 0))
 
-/// Two Blowfish blocks, of two lanes, with their rounds interleaved: two independent chains of
-/// S-box lookups in flight at once, all in registers.
-let inline private encipher2
-    (p0: nativeptr<uint32>)
-    (p1: nativeptr<uint32>)
-    (l0: byref<uint32>)
-    (r0: byref<uint32>)
-    (l1: byref<uint32>)
-    (r1: byref<uint32>)
-    =
-    let s0 = NativePtr.add p0 18
-    let s1 = NativePtr.add p1 18
-    let mutable a = l0 ^^^ NativePtr.get p0 0
-    let mutable b = r0
-    let mutable c = l1 ^^^ NativePtr.get p1 0
-    let mutable d = r1
-    let mutable i = 1
-    while i < 17 do
-        b <- b ^^^ f s0 a ^^^ NativePtr.get p0 i
-        d <- d ^^^ f s1 c ^^^ NativePtr.get p1 i
-        a <- a ^^^ f s0 b ^^^ NativePtr.get p0 (i + 1)
-        c <- c ^^^ f s1 d ^^^ NativePtr.get p1 (i + 1)
-        i <- i + 2
-    l0 <- b ^^^ NativePtr.get p0 17
-    r0 <- a
-    l1 <- d ^^^ NativePtr.get p1 17
-    r1 <- c
+/// The most hashes one call steps together.
+[<Literal>]
+let MaxLanes = 6
 
-/// One Feistel half-round of the lane at `p`: `y ^^^ F(x) ^^^ P[i]`. The S-boxes start 18 words
-/// into the state, so only the lane's one pointer stays live.
-let inline private half (p: nativeptr<uint32>) (i: int) (x: uint32) (y: uint32) =
-    y ^^^ f (NativePtr.add p 18) x ^^^ NativePtr.get p i
+/// A kernel is the code of the cost loop: 0 is C, the others assembly that differs in how a
+/// round takes its four S-box index bytes apart. Which is fastest depends on the CPU.
+let kernelNames = [| "c"; "ah"; "bextr"; "shrx" |]
 
-/// Four Blowfish blocks, of four lanes, with their rounds interleaved. The 16 rounds are written
-/// out: each P word is then a constant offset, and no round counter competes for the registers
-/// that the eight chain words and four lane pointers already fill.
-let inline private encipher4
-    (p0: nativeptr<uint32>)
-    (p1: nativeptr<uint32>)
-    (p2: nativeptr<uint32>)
-    (p3: nativeptr<uint32>)
-    (x: nativeptr<uint32>)
-    =
-    let mutable a0 = NativePtr.get x 0 ^^^ NativePtr.get p0 0
-    let mutable b0 = NativePtr.get x 1
-    let mutable a1 = NativePtr.get x 2 ^^^ NativePtr.get p1 0
-    let mutable b1 = NativePtr.get x 3
-    let mutable a2 = NativePtr.get x 4 ^^^ NativePtr.get p2 0
-    let mutable b2 = NativePtr.get x 5
-    let mutable a3 = NativePtr.get x 6 ^^^ NativePtr.get p3 0
-    let mutable b3 = NativePtr.get x 7
-    b0 <- half p0 1 a0 b0
-    b1 <- half p1 1 a1 b1
-    b2 <- half p2 1 a2 b2
-    b3 <- half p3 1 a3 b3
-    a0 <- half p0 2 b0 a0
-    a1 <- half p1 2 b1 a1
-    a2 <- half p2 2 b2 a2
-    a3 <- half p3 2 b3 a3
-    b0 <- half p0 3 a0 b0
-    b1 <- half p1 3 a1 b1
-    b2 <- half p2 3 a2 b2
-    b3 <- half p3 3 a3 b3
-    a0 <- half p0 4 b0 a0
-    a1 <- half p1 4 b1 a1
-    a2 <- half p2 4 b2 a2
-    a3 <- half p3 4 b3 a3
-    b0 <- half p0 5 a0 b0
-    b1 <- half p1 5 a1 b1
-    b2 <- half p2 5 a2 b2
-    b3 <- half p3 5 a3 b3
-    a0 <- half p0 6 b0 a0
-    a1 <- half p1 6 b1 a1
-    a2 <- half p2 6 b2 a2
-    a3 <- half p3 6 b3 a3
-    b0 <- half p0 7 a0 b0
-    b1 <- half p1 7 a1 b1
-    b2 <- half p2 7 a2 b2
-    b3 <- half p3 7 a3 b3
-    a0 <- half p0 8 b0 a0
-    a1 <- half p1 8 b1 a1
-    a2 <- half p2 8 b2 a2
-    a3 <- half p3 8 b3 a3
-    b0 <- half p0 9 a0 b0
-    b1 <- half p1 9 a1 b1
-    b2 <- half p2 9 a2 b2
-    b3 <- half p3 9 a3 b3
-    a0 <- half p0 10 b0 a0
-    a1 <- half p1 10 b1 a1
-    a2 <- half p2 10 b2 a2
-    a3 <- half p3 10 b3 a3
-    b0 <- half p0 11 a0 b0
-    b1 <- half p1 11 a1 b1
-    b2 <- half p2 11 a2 b2
-    b3 <- half p3 11 a3 b3
-    a0 <- half p0 12 b0 a0
-    a1 <- half p1 12 b1 a1
-    a2 <- half p2 12 b2 a2
-    a3 <- half p3 12 b3 a3
-    b0 <- half p0 13 a0 b0
-    b1 <- half p1 13 a1 b1
-    b2 <- half p2 13 a2 b2
-    b3 <- half p3 13 a3 b3
-    a0 <- half p0 14 b0 a0
-    a1 <- half p1 14 b1 a1
-    a2 <- half p2 14 b2 a2
-    a3 <- half p3 14 b3 a3
-    b0 <- half p0 15 a0 b0
-    b1 <- half p1 15 a1 b1
-    b2 <- half p2 15 a2 b2
-    b3 <- half p3 15 a3 b3
-    a0 <- half p0 16 b0 a0
-    a1 <- half p1 16 b1 a1
-    a2 <- half p2 16 b2 a2
-    a3 <- half p3 16 b3 a3
-    NativePtr.set x 0 (b0 ^^^ NativePtr.get p0 17)
-    NativePtr.set x 1 a0
-    NativePtr.set x 2 (b1 ^^^ NativePtr.get p1 17)
-    NativePtr.set x 3 a1
-    NativePtr.set x 4 (b2 ^^^ NativePtr.get p2 17)
-    NativePtr.set x 5 a2
-    NativePtr.set x 6 (b3 ^^^ NativePtr.get p3 17)
-    NativePtr.set x 7 a3
+/// The kernels this CPU can run (the assembly ones need x86-64 with BMI1 and BMI2).
+let kernels: int list =
+    let mask = cbcrypt_kernels ()
+    [ for k in 0 .. kernelNames.Length - 1 do
+          if (mask >>> k) &&& 1 = 1 then
+              k ]
 
-/// `expand` for exactly four lanes; the chains live in `x` (8 words) between blocks.
-let private expand4
-    (p: nativeptr<uint32>[])
-    (k: nativeptr<uint32>[])
-    (s: nativeptr<uint32>[])
-    (x: nativeptr<uint32>)
-    (salted: bool)
-    =
-    for lane in 0..3 do
-        for i in 0..17 do
-            NativePtr.set p[lane] i (NativePtr.get p[lane] i ^^^ NativePtr.get k[lane] i)
-    for i in 0..7 do
-        NativePtr.set x i 0u
-    let p0, p1, p2, p3 = p[0], p[1], p[2], p[3]
-    let mutable j = 0
-    while j < StateWords do
-        if salted then
-            for lane in 0..3 do
-                NativePtr.set x (2 * lane) (NativePtr.get x (2 * lane) ^^^ NativePtr.get s[lane] (j &&& 3))
-                NativePtr.set x (2 * lane + 1) (NativePtr.get x (2 * lane + 1) ^^^ NativePtr.get s[lane] ((j + 1) &&& 3))
-        encipher4 p0 p1 p2 p3 x
-        NativePtr.set p0 j (NativePtr.get x 0)
-        NativePtr.set p0 (j + 1) (NativePtr.get x 1)
-        NativePtr.set p1 j (NativePtr.get x 2)
-        NativePtr.set p1 (j + 1) (NativePtr.get x 3)
-        NativePtr.set p2 j (NativePtr.get x 4)
-        NativePtr.set p2 (j + 1) (NativePtr.get x 5)
-        NativePtr.set p3 j (NativePtr.get x 6)
-        NativePtr.set p3 (j + 1) (NativePtr.get x 7)
-        j <- j + 2
-
-/// `expand` for exactly two lanes, the pair's chains in registers and their rounds interleaved.
-let private expand2 (p0: nativeptr<uint32>) (p1: nativeptr<uint32>) (k0: nativeptr<uint32>) (k1: nativeptr<uint32>) (s0: nativeptr<uint32>) (s1: nativeptr<uint32>) (salted: bool) =
-    for i in 0..17 do
-        NativePtr.set p0 i (NativePtr.get p0 i ^^^ NativePtr.get k0 i)
-        NativePtr.set p1 i (NativePtr.get p1 i ^^^ NativePtr.get k1 i)
-    let mutable l0 = 0u
-    let mutable r0 = 0u
-    let mutable l1 = 0u
-    let mutable r1 = 0u
-    let mutable j = 0
-    if salted then
-        while j < StateWords do
-            l0 <- l0 ^^^ NativePtr.get s0 (j &&& 3)
-            r0 <- r0 ^^^ NativePtr.get s0 ((j + 1) &&& 3)
-            l1 <- l1 ^^^ NativePtr.get s1 (j &&& 3)
-            r1 <- r1 ^^^ NativePtr.get s1 ((j + 1) &&& 3)
-            encipher2 p0 p1 &l0 &r0 &l1 &r1
-            NativePtr.set p0 j l0
-            NativePtr.set p0 (j + 1) r0
-            NativePtr.set p1 j l1
-            NativePtr.set p1 (j + 1) r1
-            j <- j + 2
-    else
-        while j < StateWords do
-            encipher2 p0 p1 &l0 &r0 &l1 &r1
-            NativePtr.set p0 j l0
-            NativePtr.set p0 (j + 1) r0
-            NativePtr.set p1 j l1
-            NativePtr.set p1 (j + 1) r1
-            j <- j + 2
-
-/// Blowfish's key schedule, for every lane at once: P ^= the lane's 18 key words, then the
-/// whole state is re-encrypted as a chain, each block XORed with the next two words of the
-/// lane's salt (bcrypt's EksBlowfish) when `salted`, else with nothing (plain Blowfish).
-let private expand
-    (state: nativeptr<uint32>)
-    (lanes: int)
-    (keys: nativeptr<uint32>)
-    (salts: nativeptr<uint32>)
-    (salted: bool)
-    (chain: nativeptr<uint32>)
-    =
-    for lane in 0 .. lanes - 1 do
-        let p = NativePtr.add state (lane * StateWords)
-        let k = NativePtr.add keys (lane * 18)
-        for i in 0..17 do
-            NativePtr.set p i (NativePtr.get p i ^^^ NativePtr.get k i)
-        NativePtr.set chain (2 * lane) 0u
-        NativePtr.set chain (2 * lane + 1) 0u
-    let mutable j = 0
-    while j < StateWords do
-        // Step j of every lane: independent chains, so the CPU overlaps them.
+/// bcrypt's raw 23 bytes for each (key, 16-byte salt), all with the same cost, computed by
+/// `kernel`, MaxLanes at a time. The key is the password's UTF-8 bytes followed by a NUL (the
+/// $2a$/$2b$ convention); bytes past 72 never count.
+let rawWith (kernel: int) (cost: int) (inputs: (byte[] * byte[])[]) : byte[][] =
+    let keys = NativePtr.stackalloc<byte> (MaxLanes * 72)
+    let lengths = NativePtr.stackalloc<int> MaxLanes
+    let salts = NativePtr.stackalloc<byte> (MaxLanes * 16)
+    let hashes = NativePtr.stackalloc<byte> (MaxLanes * 23)
+    let out = Array.zeroCreate<byte[]> inputs.Length
+    let mutable first = 0
+    while first < inputs.Length do
+        let lanes = min MaxLanes (inputs.Length - first)
         for lane in 0 .. lanes - 1 do
-            let p = NativePtr.add state (lane * StateWords)
-            let mutable xl = NativePtr.get chain (2 * lane)
-            let mutable xr = NativePtr.get chain (2 * lane + 1)
-            if salted then
-                xl <- xl ^^^ NativePtr.get salts (lane * 4 + (j &&& 3))
-                xr <- xr ^^^ NativePtr.get salts (lane * 4 + ((j + 1) &&& 3))
-            encipher p &xl &xr
-            NativePtr.set p j xl
-            NativePtr.set p (j + 1) xr
-            NativePtr.set chain (2 * lane) xl
-            NativePtr.set chain (2 * lane + 1) xr
-        j <- j + 2
+            let key, salt = inputs[first + lane]
+            if key.Length = 0 || salt.Length <> 16 then
+                invalidArg (nameof inputs) "a key of at least one byte and a salt of 16"
+            let length = min key.Length 72
+            key.AsSpan(0, length).CopyTo(Span<byte>(NativePtr.toVoidPtr (NativePtr.add keys (lane * 72)), 72))
+            NativePtr.set lengths lane length
+            salt.AsSpan().CopyTo(Span<byte>(NativePtr.toVoidPtr (NativePtr.add salts (lane * 16)), 16))
+        if cbcrypt_raw (initial, kernel, cost, lanes, keys, lengths, salts, hashes) <> 0 then
+            invalidOp $"bcrypt: kernel {kernel}, cost {cost}, {lanes} lanes refused"
+        for lane in 0 .. lanes - 1 do
+            out[first + lane] <- Span<byte>(NativePtr.toVoidPtr (NativePtr.add hashes (lane * 23)), 23).ToArray()
+        first <- first + lanes
+    out
 
-/// 18 words from `bytes` repeated cyclically (Blowfish's key stream; bytes past 72 never count).
-let private streamWords (bytes: byte[]) : uint32[] =
-    let mutable at = 0
-    Array.init 18 (fun _ ->
-        let mutable w = 0u
-        for _ in 1..4 do
-            w <- (w <<< 8) ||| uint32 bytes[at]
-            at <- (at + 1) % bytes.Length
-        w)
+/// Milliseconds a hash of cost 10 takes `kernel` at `lanes` lanes: the best of three runs at
+/// cost 6, a sixteenth of the work (a run is 2-3 ms).
+let private time (kernel: int) (lanes: int) : float =
+    let inputs = Array.init lanes (fun l -> [| byte (l + 1); 0uy |], Array.create 16 (byte l))
+    let mutable best = Double.MaxValue
+    for _ in 1..3 do
+        let started = Stopwatch.GetTimestamp()
+        rawWith kernel 6 inputs |> ignore
+        best <- min best (Stopwatch.GetElapsedTime(started).TotalMilliseconds * 16.0 / float lanes)
+    best
 
-/// bcrypt's raw 23 bytes for each (key, 16-byte salt), all with the same cost. The key is the
-/// password's UTF-8 bytes followed by a NUL (the $2a$/$2b$ convention).
+/// The kernel and the width that hash fastest on this CPU, timed here (~0.2 s): among `wanted`
+/// kernels (a name of kernelNames, anything else: all this CPU has) and at exactly `width`
+/// lanes (0: 1 to MaxLanes; then the narrowest width within 3% of the best, since a batch is
+/// not always full). Returns (kernel, width, ms per cost-10 hash).
+let calibrate (wanted: string) (width: int) : int * int * float =
+    let candidates =
+        match kernels |> List.filter (fun k -> kernelNames[k] = wanted) with
+        | [] -> kernels
+        | named -> named
+    let widths = if width >= 1 then [ min width MaxLanes ] else [ 1..MaxLanes ]
+    let timed = [ for w in widths -> w, candidates |> List.map (fun k -> k, time k w) |> List.minBy snd ]
+    let fastest = timed |> List.map (fun (_, (_, ms)) -> ms) |> List.min
+    let w, (k, ms) = timed |> List.find (fun (_, (_, ms)) -> ms <= fastest * 1.03)
+    k, w, ms
+
+/// The kernel `raw` uses: Passwords.start sets it from `calibrate`; before that, the measured best.
+let mutable private chosen = -1
+
+let choose (kernel: int) : unit = chosen <- kernel
+
+/// `rawWith` the chosen kernel.
 let raw (cost: int) (inputs: (byte[] * byte[])[]) : byte[][] =
-    // Three lanes go as four (a copy of the last one, its result dropped): one interleaved quad
-    // costs less than a pair and a single.
-    let given = inputs.Length
-    let inputs = if given % 4 = 3 then Array.append inputs [| inputs[given - 1] |] else inputs
-    let lanes = inputs.Length
-    let state = Array.zeroCreate<uint32> (lanes * StateWords)
-    let keys = Array.zeroCreate<uint32> (lanes * 18)
-    let saltKeys = Array.zeroCreate<uint32> (lanes * 18)
-    let salts = Array.zeroCreate<uint32> (lanes * 4)
-    let chain = Array.zeroCreate<uint32> (lanes * 2)
-    let text = Array.zeroCreate<uint32> (lanes * 6)
-    for lane in 0 .. lanes - 1 do
-        let key, salt = inputs[lane]
-        Array.blit initialState 0 state (lane * StateWords) StateWords
-        Array.blit (streamWords key) 0 keys (lane * 18) 18
-        let saltStream = streamWords salt
-        Array.blit saltStream 0 saltKeys (lane * 18) 18
-        Array.blit saltStream 0 salts (lane * 4) 4 // the salt's 4 words (16 bytes)
-        Array.blit magic 0 text (lane * 6) 6
-    use pState = fixed state
-    use pKeys = fixed keys
-    use pSaltKeys = fixed saltKeys
-    use pSalts = fixed salts
-    use pChain = fixed chain
-    use pText = fixed text
-    // Lanes go in fours through expand4, then a pair through expand2 (rounds interleaved), and
-    // an odd one out through expand.
-    let quads = lanes / 4
-    let lane l = NativePtr.add pState (l * StateWords)
-    let words (p: nativeptr<uint32>) l n = NativePtr.add p (l * n)
-    let x = Array.zeroCreate<uint32> 8
-    use pX = fixed x
-    let schedule (keys: nativeptr<uint32>) (salted: bool) =
-        for q in 0 .. quads - 1 do
-            let ls = [| 4 * q .. 4 * q + 3 |]
-            expand4 (ls |> Array.map lane) (ls |> Array.map (fun l -> words keys l 18)) (ls |> Array.map (fun l -> words pSalts l 4)) pX salted
-        let mutable l = 4 * quads
-        if lanes - l >= 2 then
-            expand2 (lane l) (lane (l + 1)) (words keys l 18) (words keys (l + 1) 18) (words pSalts l 4) (words pSalts (l + 1) 4) salted
-            l <- l + 2
-        if l < lanes then
-            expand (lane l) 1 (words keys l 18) (words pSalts l 4) salted pChain
-    schedule pKeys true
-    for _ in 1 .. (1 <<< cost) do
-        schedule pKeys false
-        schedule pSaltKeys false
-    for _ in 1..64 do
-        for block in 0..2 do
-            for lane in 0 .. lanes - 1 do
-                let p = NativePtr.add pState (lane * StateWords)
-                let t = NativePtr.add pText (lane * 6 + 2 * block)
-                let mutable xl = NativePtr.get t 0
-                let mutable xr = NativePtr.get t 1
-                encipher p &xl &xr
-                NativePtr.set t 0 xl
-                NativePtr.set t 1 xr
-    Array.init given (fun lane ->
-        Array.init 23 (fun i -> byte (text[lane * 6 + i / 4] >>> (24 - 8 * (i % 4)))))
+    if chosen < 0 then
+        let k, _, _ = calibrate "" 0
+        chosen <- k
+    rawWith chosen cost inputs
 
 // ------------------------------------------------------------------ the string ---------
 

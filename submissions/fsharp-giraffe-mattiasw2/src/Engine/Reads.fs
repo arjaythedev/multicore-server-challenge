@@ -5,21 +5,23 @@ module Engine.Reads
 // to a cap, and answers the whole batch in two round trips inside ONE read-only snapshot:
 //
 //   plan     F#: the batch's distinct needs. Forty requests for page 1 of the global feed are
-//            one page; an article page and its comments are one slug lookup.
-//   phase A  ids: the tag list, one capped count per distinct list key, the ids of each
-//            distinct page, slug -> article id, username -> user, and each distinct comment
-//            thread (so phase B knows who wrote the comments).
-//   phase B  everything shown, once per BATCH, across every kind of request: each distinct
-//            article's card (columns, tags, favorite count, author) whether a list or an
-//            article page shows it, and the viewers' flags as two sets: (viewer, article)
-//            favorited and (viewer, user) following.
+//            one page; forty viewers of one article are one row.
+//   phase A  whatever a key leads to, each row read once: the tags table; each distinct list
+//            page with its articles' columns and a capped count per list key; each feed
+//            viewer's count and the newest article ids of its followees; the article of each
+//            slug; each comment thread; each username's user.
+//   plan     F#: the feed pages (cut from those ids), every article shown, every
+//            author to name, and each viewer's (viewer, article) and (viewer, user) pairs.
+//   phase B  what only ids can ask for, once per BATCH: the feed articles' columns, the tags
+//            and favorite counts of every article shown, every author once, and the viewers'
+//            flags as one index range per viewer.
 //   assemble pure: each request's answer from those maps. Requests that show the same article
-//            share one Card object (and Web encodes its JSON once).
+//            share one Card object.
 //
-// The SQL only looks rows up by keys F# has already made distinct (unnest the arrays, one
-// LATERAL index probe per key), so there is no dedup work left for Postgres. A lane lets the
-// oldest request wait up to the gather window for batch-mates; near saturation the queue already
-// holds a full batch, nobody waits, and each request costs less.
+// The SQL only looks rows up by keys F# has already made distinct, so there is no dedup, join
+// or grouping work left for Postgres. A lane lets the oldest request wait up to the gather window
+// for batch-mates; near saturation the queue already holds a full batch, nobody waits, and each
+// request costs less.
 //
 // Not a cache: every request is answered from a snapshot taken after it arrived, and nothing
 // outlives its batch (README rule 5).
@@ -59,174 +61,197 @@ let private texts (name: string) (values: string[]) : NpgsqlParameter =
 let private longs (name: string) (values: int64[]) : NpgsqlParameter =
     NpgsqlParameter<int64[]>(name, NpgsqlDbType.Array ||| NpgsqlDbType.Bigint, TypedValue = values)
 
-let private bools (name: string) (values: bool[]) : NpgsqlParameter =
-    NpgsqlParameter<bool[]>(name, NpgsqlDbType.Array ||| NpgsqlDbType.Boolean, TypedValue = values)
+let private ints (name: string) (values: int[]) : NpgsqlParameter =
+    NpgsqlParameter<int[]>(name, NpgsqlDbType.Array ||| NpgsqlDbType.Integer, TypedValue = values)
 
-/// A list's capped counts, one row (r.i, NULL, total) per distinct count key in @ckeys, and its
-/// page of ids over the distinct request `r` (r.key, r.lim, r.off, r.depth). Every page is newest
-/// first (id DESC).
-type private Listing = { Counts: string; Page: string }
+/// Both the tag list and the cards' tag names: the tags table (200 rows) in name order, which is
+/// the spec's `ORDER BY t.name` in the database's collation (not .NET's).
+let private tagsSql = "SELECT t.id, t.name FROM tags t ORDER BY t.name"
 
-/// Counts: `rows` (over the key r.key, LIMIT 1000) counted for each key.
-let private capped (rows: string) =
-    $"SELECT r.i, NULL::int8 AS id, (SELECT count(*) FROM ({rows}) s) AS total
-        FROM unnest(@ckeys::text[]) WITH ORDINALITY AS r(key, i)"
+/// An article's columns as a card needs them, without the body. The statement that finds an
+/// article returns them, so its row is read once.
+let private cardColumns = "a.id, a.author_id, a.slug, a.title, a.description, a.created_at, a.updated_at"
+
+let private noCard = "NULL::int8, NULL::int8, NULL::text, NULL::text, NULL::text, NULL::timestamptz, NULL::timestamptz"
+
+/// One kind of list. Its statement resolves each distinct key once (`k.kid`), counts each key
+/// (capped) and returns each distinct page's articles, newest first (id DESC).
+type private Listing =
+    { /// The key's id, from the key text `r.key`.
+      Resolve: string
+      /// The rows to count for `k.kid`; the caller caps them at 1000.
+      Counted: string
+      /// The cards (`cardColumns`) of the page `p.lim`, `p.off` of `k.kid`.
+      Page: string }
 
 // The global count walks the primary key from the OLDEST end: those pages are all-visible, so
 // it is an index-only scan that never touches the heap. count(min(total, 1000)) either way.
 let private everything =
-    { Counts = capped "SELECT 1 FROM articles a ORDER BY a.id LIMIT 1000"
-      Page = "SELECT a.id FROM articles a ORDER BY a.id DESC LIMIT r.lim OFFSET r.off" }
+    { Resolve = "0::int8"
+      Counted = "SELECT 1 FROM articles a ORDER BY a.id"
+      Page = $"SELECT {cardColumns} FROM articles a ORDER BY a.id DESC LIMIT p.lim OFFSET p.off" }
+
+/// A page of ids `y.id`, then each article's row: one probe each. (LIMIT 1 keeps the planner,
+/// which cannot see how few ids there are, from turning the probes into a join of whole tables.)
+let private cardsOf (ids: string) =
+    $"SELECT a.* FROM ({ids}) y CROSS JOIN LATERAL (SELECT {cardColumns} FROM articles a WHERE a.id = y.id LIMIT 1) a"
 
 let private byTag =
-    { Counts = capped "SELECT 1 FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = r.key) LIMIT 1000"
+    { Resolve = "(SELECT t.id FROM tags t WHERE t.name = r.key)"
+      Counted = "SELECT 1 FROM article_tags at WHERE at.tag_id = k.kid"
       Page =
-        "SELECT at.article_id AS id FROM article_tags at
-          WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = r.key)
-          ORDER BY at.article_id DESC LIMIT r.lim OFFSET r.off" }
+        cardsOf
+            "SELECT at.article_id AS id FROM article_tags at WHERE at.tag_id = k.kid
+              ORDER BY at.article_id DESC LIMIT p.lim OFFSET p.off" }
+
+let private userOfKey = "(SELECT u.id FROM users u WHERE u.username = r.key)"
 
 let private byAuthor =
-    { Counts = capped "SELECT 1 FROM articles a WHERE a.author_id = (SELECT u.id FROM users u WHERE u.username = r.key) LIMIT 1000"
-      Page =
-        "SELECT a.id FROM articles a WHERE a.author_id = (SELECT u.id FROM users u WHERE u.username = r.key)
-          ORDER BY a.id DESC LIMIT r.lim OFFSET r.off" }
+    { Resolve = userOfKey
+      Counted = "SELECT 1 FROM articles a WHERE a.author_id = k.kid"
+      Page = $"SELECT {cardColumns} FROM articles a WHERE a.author_id = k.kid ORDER BY a.id DESC LIMIT p.lim OFFSET p.off" }
 
 let private favoritedBy =
-    { Counts = capped "SELECT 1 FROM favorites f WHERE f.user_id = (SELECT u.id FROM users u WHERE u.username = r.key) LIMIT 1000"
+    { Resolve = userOfKey
+      Counted = "SELECT 1 FROM favorites f WHERE f.user_id = k.kid"
       Page =
-        "SELECT f.article_id AS id FROM favorites f WHERE f.user_id = (SELECT u.id FROM users u WHERE u.username = r.key)
-          ORDER BY f.article_id DESC LIMIT r.lim OFFSET r.off" }
-
-// The feed's key is the viewer. Each followee contributes at most depth = limit + offset of its
-// newest articles.
-let private feed =
-    { Counts =
-        // A viewer who follows an author with 1000 or more articles has a feed of 1000 or more.
-        // The batch proves that once for each of the 8 followees its viewers share most (heavy),
-        // and those viewers get 1000 without a count. The rest are counted as before.
-        "WITH fv AS MATERIALIZED (
-              SELECT r.i, ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.key::int8) AS fids
-                FROM unnest(@ckeys::text[]) WITH ORDINALITY AS r(key, i)),
-            shared AS MATERIALIZED (
-              SELECT x.id FROM fv CROSS JOIN LATERAL unnest(fv.fids) AS x(id)
-               GROUP BY x.id HAVING count(*) >= 2 ORDER BY count(*) DESC LIMIT 8),
-            heavy AS MATERIALIZED (
-              SELECT coalesce(array_agg(s.id), '{}') AS ids FROM shared s
-               WHERE EXISTS (SELECT 1 FROM articles a WHERE a.author_id = s.id OFFSET 999))
-          SELECT fv.i, NULL::int8 AS id,
-                 CASE WHEN fv.fids && (SELECT h.ids FROM heavy h) THEN 1000::int8
-                      ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = ANY (fv.fids) LIMIT 1000) s)
-                 END AS total
-            FROM fv"
-      Page =
-        "SELECT x.id FROM follows fo CROSS JOIN LATERAL
-                (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT r.depth) x
-          WHERE fo.follower_id = r.key::int8 ORDER BY x.id DESC LIMIT r.lim OFFSET r.off" }
+        cardsOf
+            "SELECT f.article_id AS id FROM favorites f WHERE f.user_id = k.kid
+              ORDER BY f.article_id DESC LIMIT p.lim OFFSET p.off" }
 
 /// Indexed by `listingOf`.
-let private listings = [| everything; byTag; byAuthor; favoritedBy; feed |]
+let private listings = [| everything; byTag; byAuthor; favoritedBy |]
 
-/// A list request's listing and key.
-let private listingOf (read: Read) : struct (int * string) =
-    match read with
-    | ReadPage(_, Everything, _) -> 0, ""
-    | ReadPage(_, ByTag tag, _) -> 1, tag
-    | ReadPage(_, ByAuthor name, _) -> 2, name
-    | ReadPage(_, FavoritedBy name, _) -> 3, name
-    | ReadFeed(viewer, _) -> 4, string viewer
-    | _ -> invalidArg "read" "not a list"
+let private listingOf (filter: ArticleFilter) : struct (int * string) =
+    match filter with
+    | Everything -> 0, ""
+    | ByTag tag -> 1, tag
+    | ByAuthor name -> 2, name
+    | FavoritedBy name -> 3, name
 
-/// Phase A, per listing: count rows (i = the count key's position, total set) and page rows (i =
-/// the page's position, id set).
+/// Phase A, per listing. Count rows: the key's position, no card, the total. Page rows: the
+/// page's position, a card, no total.
 let private listSql (l: Listing) =
-    $"{l.Counts}
+    $"WITH k AS MATERIALIZED (
+            SELECT r.i, {l.Resolve} AS kid FROM unnest(@keys::text[]) WITH ORDINALITY AS r(key, i))
+      SELECT k.i, {noCard}, (SELECT count(*) FROM ({l.Counted} LIMIT 1000) s) AS total FROM k
       UNION ALL
-      SELECT r.i, x.id, NULL::int8
-        FROM unnest(@pkeys::text[], @lims::int8[], @offs::int8[], @depths::int8[]) WITH ORDINALITY AS r(key, lim, off, depth, i)
+      SELECT p.i, x.*, NULL::int8
+        FROM unnest(@pkeys::int8[], @lims::int8[], @offs::int8[]) WITH ORDINALITY AS p(k, lim, off, i)
+        JOIN k ON k.i = p.k
        CROSS JOIN LATERAL ({l.Page}) x"
 
 let private listSqls = listings |> Array.map listSql
 
-let private tagsSql = "SELECT name FROM tags ORDER BY name"
+/// Phase A, the feeds of the batch's distinct viewers (@viewers, each with the deepest
+/// limit + offset it asks for). Rows of kind 0: the viewer's position and its capped count.
+/// Rows of kind 1: the viewer's position and one of its newest `depth` (article, author); F#
+/// cuts each page from them.
+///
+/// A hub is a followee that several of the batch's viewers share (the 32 most shared).
+///
+/// The candidates. A hub's floor is the id of its `depth`-th newest article: a viewer who follows
+/// it has at least `depth` articles from that id up, so its pages lie there, and ONE index scan
+/// (every followee, from the floor up) finds them. A viewer without a hub that has a floor takes
+/// the newest `depth` of each followee, a scan per followee.
+///
+/// The count. A viewer who follows an author with 1000 or more articles has a feed of 1000 or
+/// more. The batch proves that once for each hub that three or more viewers share (the proof
+/// walks 1000 index entries, as much as counting for one viewer), and its viewers get 1000
+/// without a count. The rest are counted.
+let private feedSql =
+    "WITH fv AS MATERIALIZED (
+          SELECT r.i, r.depth, ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.v) AS fids
+            FROM unnest(@viewers::int8[], @depths::int8[]) WITH ORDINALITY AS r(v, depth, i)),
+        hub AS MATERIALIZED (
+          SELECT h.f,
+                 (SELECT a.id FROM articles a WHERE a.author_id = h.f ORDER BY a.id DESC OFFSET h.depth - 1 LIMIT 1) AS floor,
+                 CASE WHEN h.n >= 3 THEN EXISTS (SELECT 1 FROM articles a WHERE a.author_id = h.f OFFSET 999) ELSE false END AS big
+            FROM (SELECT x.f, max(fv.depth) AS depth, count(*) AS n
+                    FROM fv CROSS JOIN LATERAL unnest(fv.fids) AS x(f)
+                   GROUP BY x.f HAVING count(*) >= 2 ORDER BY count(*) DESC LIMIT 32) h),
+        heavy AS MATERIALIZED (SELECT coalesce(array_agg(hub.f) FILTER (WHERE hub.big), '{}') AS ids FROM hub),
+        fl AS MATERIALIZED (
+          SELECT fv.i, fv.depth, fv.fids, (SELECT max(hub.floor) FROM hub WHERE hub.f = ANY (fv.fids)) AS floor FROM fv)
+     SELECT 0, fl.i, NULL::int8, NULL::int8,
+            CASE WHEN fl.fids && (SELECT h.ids FROM heavy h) THEN 1000::int8
+                 ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = ANY (fl.fids) LIMIT 1000) s)
+            END
+       FROM fl
+     UNION ALL
+     SELECT 1, fl.i, a.id, a.author_id, NULL::int8
+       FROM fl CROSS JOIN LATERAL (
+              SELECT a.id, a.author_id FROM articles a WHERE a.author_id = ANY (fl.fids) AND a.id >= fl.floor
+               ORDER BY a.id DESC LIMIT fl.depth) a
+      WHERE fl.floor IS NOT NULL
+     UNION ALL
+     SELECT 1, fl.i, a.id, a.author_id, NULL::int8
+       FROM fl CROSS JOIN LATERAL (
+              SELECT n.id, f.id AS author_id FROM unnest(fl.fids) AS f(id)
+               CROSS JOIN LATERAL (SELECT a.id FROM articles a WHERE a.author_id = f.id ORDER BY a.id DESC LIMIT fl.depth) n
+               ORDER BY n.id DESC LIMIT fl.depth) a
+      WHERE fl.floor IS NULL"
 
-// Every lookup by a key is CROSS JOIN LATERAL (... LIMIT 1): one index probe per key. With a
-// plain join the planner, which cannot see how few keys there are, may hash-join whole tables;
-// the LIMIT 1 (the keys are unique, so it changes nothing) keeps it from flattening the LATERAL
-// back into that join.
+/// Phase A: the article of each distinct slug an article page shows, with its body.
+let private slugsSql = $"SELECT {cardColumns}, a.body FROM articles a WHERE a.slug = ANY (@slugs)"
 
-let private slugsSql =
-    "SELECT r.i, x.id FROM unnest(@slugs::text[]) WITH ORDINALITY AS r(slug, i)
-      CROSS JOIN LATERAL (SELECT a.id FROM articles a WHERE a.slug = r.slug LIMIT 1) x"
+/// Phase A: the newest 100 comments of each distinct slug a comments page shows (F# puts them in
+/// order). An article without comments is one row without a comment; no row means no article.
+let private threadsSql =
+    "SELECT r.i, c.id, c.body, c.created_at, c.updated_at, c.author_id
+       FROM unnest(@threads::text[]) WITH ORDINALITY AS r(slug, i)
+      CROSS JOIN LATERAL (SELECT a.id FROM articles a WHERE a.slug = r.slug LIMIT 1) a
+       LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id
+                            FROM comments c WHERE c.article_id = a.id
+                           ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true"
 
-let private usersSql =
-    "SELECT r.i, x.id, x.username, x.bio, x.image FROM unnest(@usernames::text[]) WITH ORDINALITY AS r(username, i)
-      CROSS JOIN LATERAL (SELECT u.id, u.username, u.bio, u.image FROM users u WHERE u.username = r.username LIMIT 1) x"
+let private userColumns = "u.id, u.username, u.bio, u.image"
 
-// Phase B: each distinct article's card, from four statements over the whole batch's articles,
-// in this order so the card rows can be finished as they arrive:
-//   tagRanksSql   the tags table (200 rows), ordered by name in the database's collation;
+/// Phase A: the profiles' users.
+let private usernamesSql = $"SELECT {userColumns} FROM users u WHERE u.username = ANY (@usernames)"
+
+// Phase B: flat statements over ids F# has made distinct, put together in F#.
+//   metaSql       the feed articles' columns (phase A returned only their ids);
 //   cardTagsSql   the cards' (article, tag id) pairs, one index scan for all of them;
 //   favoritesSql  the cards' favorite counts, one index scan (an article without any has no row);
-//   cardsSql      the cards' columns and authors; the body only where an article page shows it.
-// F# names each card's tags and orders them by their position in the tags table: that is the
-// spec's `ORDER BY t.name`, without a tags_pkey probe per tag. On the seed, 1,000 cards took
-// 9.9 ms as one statement with the tag names and counts inside, 4.2 ms as these four.
+//   authorsSql    each distinct author of a card or a comment, once.
+// F# names each card's tags and orders them by their position in the tags table. On the seed,
+// 1,000 cards took 9.9 ms as one statement with the tag names and counts inside, 4.2 ms flat.
 
-let private tagRanksSql = "SELECT t.id, t.name FROM tags t ORDER BY t.name"
+let private metaSql = $"SELECT {cardColumns} FROM articles a WHERE a.id = ANY (@ids)"
 
 let private cardTagsSql = "SELECT at.article_id, at.tag_id FROM article_tags at WHERE at.article_id = ANY (@ids)"
 
 let private favoritesSql =
     "SELECT f.article_id, count(*) FROM favorites f WHERE f.article_id = ANY (@ids) GROUP BY f.article_id"
 
-let private cardsSql =
-    "SELECT x.* FROM unnest(@ids::int8[], @bodies::bool[]) AS r(id, body)
-      CROSS JOIN LATERAL (
-            SELECT a.id, CASE WHEN r.body THEN a.body END AS body, a.slug, a.title, a.description, a.created_at, a.updated_at,
-                   a.author_id, u.username, u.bio, u.image
-              FROM articles a JOIN users u ON u.id = a.author_id
-             WHERE a.id = r.id LIMIT 1) x"
+let private authorsSql = $"SELECT {userColumns} FROM users u WHERE u.id = ANY (@ids)"
 
-/// Phase A: the newest 100 comments of each distinct slug a comments page shows (F# puts them in
-/// order), so phase B already knows who wrote them. An article without comments has no rows.
-let private threadsSql =
-    "SELECT a.id, c.id, c.body, c.created_at, c.updated_at, c.author_id, u.username, u.bio, u.image
-       FROM unnest(@threads::text[]) AS r(slug)
-      CROSS JOIN LATERAL (SELECT a.id FROM articles a WHERE a.slug = r.slug LIMIT 1) a
-      CROSS JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id
-                            FROM comments c WHERE c.article_id = a.id
-                           ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c
-      CROSS JOIN LATERAL (SELECT u.username, u.bio, u.image FROM users u WHERE u.id = c.author_id LIMIT 1) u"
-
-/// Phase B: the viewers' flags that are set. Favorited for the (viewer, article) pairs shown;
-/// following for the authors of those articles (each article's author looked up once, not once
-/// per viewer) and for the (viewer, user) pairs F# already knows: profiles and comment authors.
-/// Each viewer's pairs are one index range scan with = ANY, not one probe per pair.
+/// Phase B: the viewers' flags that are set. F# has grouped the pairs: viewer i's articles are
+/// @fa[@fs[i] : @fe[i]] and the users it might follow are @oa[@os[i] : @oe[i]], so each viewer
+/// is one index range scan with = ANY, and nothing is sorted or aggregated here.
 /// Rows: following?, viewer, article or user.
 let private flagsSql =
-    "WITH p AS MATERIALIZED (SELECT q.v, q.a FROM unnest(@av::int8[], @aa::int8[]) AS q(v, a)),
-          au AS MATERIALIZED (
-            SELECT d.a, x.author_id FROM (SELECT DISTINCT p.a FROM p) d
-             CROSS JOIN LATERAL (SELECT ar.author_id FROM articles ar WHERE ar.id = d.a LIMIT 1) x),
-          fav AS (SELECT p.v, array_agg(p.a) AS ids FROM p GROUP BY p.v),
-          fol AS (SELECT s.v, array_agg(DISTINCT s.u) AS ids
-                    FROM (SELECT p.v, au.author_id AS u FROM p JOIN au ON au.a = p.a
-                          UNION ALL
-                          SELECT q.v, q.u FROM unnest(@uv::int8[], @uu::int8[]) AS q(v, u)) s
-                   GROUP BY s.v)
-     SELECT false, fav.v, f.article_id FROM fav
-      CROSS JOIN LATERAL (SELECT f.article_id FROM favorites f WHERE f.user_id = fav.v AND f.article_id = ANY (fav.ids)) f
+    "SELECT false, p.v, f.article_id
+       FROM unnest(@fv::int8[], @fs::int4[], @fe::int4[]) AS p(v, s, e)
+      CROSS JOIN LATERAL (SELECT f.article_id FROM favorites f
+                           WHERE f.user_id = p.v AND f.article_id = ANY ((@fa::int8[])[p.s:p.e])) f
      UNION ALL
-     SELECT true, fol.v, fo.followee_id FROM fol
-      CROSS JOIN LATERAL (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = fol.v AND fo.followee_id = ANY (fol.ids)) fo"
+     SELECT true, q.v, fo.followee_id
+       FROM unnest(@ov::int8[], @os::int4[], @oe::int4[]) AS q(v, s, e)
+      CROSS JOIN LATERAL (SELECT fo.followee_id FROM follows fo
+                           WHERE fo.follower_id = q.v AND fo.followee_id = ANY ((@oa::int8[])[q.s:q.e])) fo"
 
 // ---------------------------------------------------------------- plan ---------
 
-/// Distinct keys in first-seen order, each with its position.
+/// Distinct keys in first-seen order, each with its position. `capacity`: about how many keys
+/// to expect (a table that grows by doubling throws away as much as it ends up holding).
 [<Sealed>]
-type private Distinct<'k when 'k: equality>() =
-    let index = Dictionary<'k, int>()
-    let items = ResizeArray<'k>()
+type private Distinct<'k when 'k: equality>(capacity: int) =
+    let index = Dictionary<'k, int>(capacity)
+    let items = ResizeArray<'k>(capacity)
+
+    new() = Distinct<'k>(0)
 
     member _.Add(key: 'k) : int =
         match index.TryGetValue key with
@@ -241,6 +266,12 @@ type private Distinct<'k when 'k: equality>() =
     member _.Items = items
     member _.IndexOf(key: 'k) = index[key]
 
+    /// -1 for a key that was never added.
+    member _.Find(key: 'k) : int =
+        match index.TryGetValue key with
+        | true, i -> i
+        | _ -> -1
+
 /// Saturating, so a huge offset cannot overflow the feed's LIMIT.
 let private depthOf (p: Paging) =
     if p.Offset > Int64.MaxValue - p.Limit then Int64.MaxValue else p.Limit + p.Offset
@@ -249,204 +280,307 @@ let private depthOf (p: Paging) =
 [<NoEquality; NoComparison>]
 type private PlanA =
     { Tags: bool
-      Counts: Distinct<string>[]
-      Pages: Distinct<struct (string * int64 * int64 * int64)>[]
+      /// Per listing: its distinct keys, and its distinct pages (key position, limit, offset).
+      Keys: Distinct<string>[]
+      Pages: Distinct<struct (int * int64 * int64)>[]
+      /// The feeds' distinct viewers, each with its deepest limit + offset.
+      FeedViewers: Distinct<int64>
+      FeedDepths: ResizeArray<int64>
       Slugs: Distinct<string>
       Threads: Distinct<string>
       Usernames: Distinct<string> }
 
-let private pageKey (read: Read) (paging: Paging) =
-    let struct (l, key) = listingOf read
-    struct (l, key, struct (key, paging.Limit, paging.Offset, depthOf paging))
+let private pageOf (a: PlanA) (filter: ArticleFilter) (paging: Paging) : struct (int * int * int) =
+    let struct (l, key) = listingOf filter
+    let k = a.Keys[l].Add key
+    struct (l, k, a.Pages[l].Add(struct (k, paging.Limit, paging.Offset)))
 
 let private planA (reads: Read[]) : PlanA =
     let plan =
-        { Tags =
+        { // The tags table: for a tag list, and to name the tags of any card.
+          Tags =
             reads
             |> Array.exists (function
-                | ReadTags -> true
-                | _ -> false)
-          Counts = Array.init listings.Length (fun _ -> Distinct())
+                | ReadComments _
+                | ReadProfile _ -> false
+                | _ -> true)
+          Keys = Array.init listings.Length (fun _ -> Distinct())
           Pages = Array.init listings.Length (fun _ -> Distinct())
+          FeedViewers = Distinct()
+          FeedDepths = ResizeArray()
           Slugs = Distinct()
           Threads = Distinct()
           Usernames = Distinct() }
     for read in reads do
         match read with
         | ReadTags -> ()
-        | ReadPage(_, _, paging)
-        | ReadFeed(_, paging) ->
-            let struct (l, key, page) = pageKey read paging
-            plan.Counts[l].Add key |> ignore
-            plan.Pages[l].Add page |> ignore
+        | ReadPage(_, filter, paging) -> pageOf plan filter paging |> ignore
+        | ReadFeed(viewer, paging) ->
+            let i = plan.FeedViewers.Add viewer
+            let depth = depthOf paging
+            if i = plan.FeedDepths.Count then plan.FeedDepths.Add depth
+            elif depth > plan.FeedDepths[i] then plan.FeedDepths[i] <- depth
         | ReadArticle(_, slug) -> plan.Slugs.Add slug |> ignore
-        | ReadComments(_, slug) ->
-            plan.Slugs.Add slug |> ignore
-            plan.Threads.Add slug |> ignore
+        | ReadComments(_, slug) -> plan.Threads.Add slug |> ignore
         | ReadProfile(_, username) -> plan.Usernames.Add username |> ignore
     plan
 
-/// What phase A found.
+/// An article's row.
 [<NoEquality; NoComparison>]
-type private FoundA =
-    { mutable TagNames: string list
+type private Row =
+    { Id: int64
+      AuthorId: int64
+      Slug: string
+      Title: string
+      Description: string
+      CreatedAt: DateTime
+      UpdatedAt: DateTime
+      /// Only where an article page asked for it.
+      Body: string option }
+
+/// A comment's row.
+[<NoEquality; NoComparison>]
+type private Remark =
+    { Id: int64
+      Body: string
+      CreatedAt: DateTime
+      UpdatedAt: DateTime
+      AuthorId: int64 }
+
+/// What the two phases found. Phase A fills everything down to Newest; phase B adds the feed
+/// articles' rows and fills the rest.
+[<NoEquality; NoComparison>]
+type private Found =
+    { /// The tags table in name order, and tag id -> its position there.
+      TagNames: ResizeArray<string>
+      TagRanks: Dictionary<int, int>
+      /// Per listing: each key's capped count, each page's article ids.
       Totals: int64[][]
       PageIds: ResizeArray<int64>[][]
-      SlugIds: int64 voption[]
-      /// Article id -> its newest comments (newest first once phase A is sorted).
-      Threads: Dictionary<int64, ResizeArray<CommentCard>>
-      Users: Author voption[] }
+      Rows: Dictionary<int64, Row>
+      SlugIds: Dictionary<string, int64>
+      /// Per thread slug: its newest comments, or null where there is no such article.
+      Threads: ResizeArray<Remark>[]
+      /// Per username.
+      Users: Author voption[]
+      /// Per feed viewer: its capped count, and the newest `depth` articles of its followees as
+      /// (article, author).
+      FeedTotals: int64[]
+      Feeds: ResizeArray<struct (int64 * int64)>[]
+      /// Article id -> its tags' positions.
+      CardTags: Dictionary<int64, ResizeArray<int>>
+      mutable FavoritesCounts: Dictionary<int64, int64>
+      Authors: Dictionary<int64, Author>
+      Favorited: HashSet<struct (int64 * int64)>
+      Following: HashSet<struct (int64 * int64)> }
 
 /// What phase B must fetch.
 [<NoEquality; NoComparison>]
 type private PlanB =
-    { Cards: Distinct<int64>
-      Bodies: ResizeArray<bool>
-      ArticlePairs: Distinct<struct (int64 * int64)>
-      UserPairs: Distinct<struct (int64 * int64)> }
+    { /// Per request: a feed request's page as (article, author), newest first; null otherwise.
+      FeedPages: struct (int64 * int64)[][]
+      /// Feed articles whose row phase A did not happen to return.
+      Meta: Distinct<int64>
+      /// Every article shown, and every author of an article or a comment shown.
+      Cards: Distinct<int64>
+      Authors: Distinct<int64>
+      /// (viewer, article shown to it) and (viewer, user it may follow), with repeats.
+      Favorites: ResizeArray<struct (int64 * int64)>
+      Follows: ResizeArray<struct (int64 * int64)> }
+
+let private newestPairFirst (struct (x: int64, _: int64)) (struct (y: int64, _: int64)) = compare y x
+
+/// A feed page: the newest `limit` after `offset` of the viewer's candidates (sorted, newest
+/// first).
+let private feedPage (candidates: ResizeArray<struct (int64 * int64)>) (paging: Paging) : struct (int64 * int64)[] =
+    let skip = if paging.Offset > int64 candidates.Count then candidates.Count else int paging.Offset
+    let take = if paging.Limit > int64 (candidates.Count - skip) then candidates.Count - skip else int paging.Limit
+    candidates.GetRange(skip, take).ToArray()
 
 /// (No user has id 0, so an anonymous viewer's flags are all false and need no pairs.)
-let private planB (reads: Read[]) (a: PlanA) (found: FoundA) : PlanB =
+let private planB (reads: Read[]) (a: PlanA) (found: Found) : PlanB =
     let plan =
-        { Cards = Distinct()
-          Bodies = ResizeArray()
-          ArticlePairs = Distinct()
-          UserPairs = Distinct() }
-    let card (viewer: ViewerId) (id: int64) (body: bool) =
-        let i = plan.Cards.Add id
-        if i = plan.Bodies.Count then plan.Bodies.Add body
-        elif body then plan.Bodies[i] <- true
-        if viewer <> 0L then plan.ArticlePairs.Add(struct (viewer, id)) |> ignore
-    for read in reads do
-        match read with
+        { FeedPages = Array.zeroCreate reads.Length
+          Meta = Distinct()
+          // Nearly every row phase A returned is shown, and each has an author.
+          Cards = Distinct found.Rows.Count
+          Authors = Distinct found.Rows.Count
+          Favorites = ResizeArray found.Rows.Count
+          Follows = ResizeArray found.Rows.Count }
+    /// An article phase A returned, shown to `viewer`.
+    let card (viewer: ViewerId) (id: int64) =
+        match found.Rows.TryGetValue id with
+        | true, row ->
+            plan.Cards.Add id |> ignore
+            plan.Authors.Add row.AuthorId |> ignore
+            if viewer <> 0L then
+                plan.Favorites.Add(struct (viewer, id))
+                plan.Follows.Add(struct (viewer, row.AuthorId))
+        | _ -> ()
+    for i in 0 .. reads.Length - 1 do
+        match reads[i] with
         | ReadTags -> ()
-        | ReadPage(viewer, _, paging)
+        | ReadPage(viewer, filter, paging) ->
+            let struct (l, _, page) = pageOf a filter paging
+            for id in found.PageIds[l][page] do
+                card viewer id
         | ReadFeed(viewer, paging) ->
-            let struct (l, _, page) = pageKey read paging
-            for id in found.PageIds[l][a.Pages[l].IndexOf page] do
-                card viewer id false
+            let page = feedPage found.Feeds[a.FeedViewers.IndexOf viewer] paging
+            plan.FeedPages[i] <- page
+            // The viewer follows every author on its feed: no (viewer, author) pair to look up.
+            for struct (id, author) in page do
+                plan.Cards.Add id |> ignore
+                plan.Authors.Add author |> ignore
+                if not (found.Rows.ContainsKey id) then plan.Meta.Add id |> ignore
+                plan.Favorites.Add(struct (viewer, id))
         | ReadArticle(viewer, slug) ->
-            match found.SlugIds[a.Slugs.IndexOf slug] with
-            | ValueSome id -> card viewer id true
-            | ValueNone -> ()
-        | ReadComments(viewer, slug) ->
-            match found.SlugIds[a.Slugs.IndexOf slug] with
-            | ValueSome id when viewer <> 0L ->
-                match found.Threads.TryGetValue id with
-                | true, thread ->
-                    for c in thread do
-                        plan.UserPairs.Add(struct (viewer, c.Author.Id)) |> ignore
-                | _ -> ()
+            match found.SlugIds.TryGetValue slug with
+            | true, id -> card viewer id
             | _ -> ()
+        | ReadComments(viewer, slug) ->
+            let thread = found.Threads[a.Threads.IndexOf slug]
+            if not (isNull thread) then
+                for c in thread do
+                    plan.Authors.Add c.AuthorId |> ignore
+                    if viewer <> 0L then plan.Follows.Add(struct (viewer, c.AuthorId))
         | ReadProfile(viewer, username) ->
             match found.Users[a.Usernames.IndexOf username] with
-            | ValueSome u when viewer <> 0L -> plan.UserPairs.Add(struct (viewer, u.Id)) |> ignore
+            | ValueSome u when viewer <> 0L -> plan.Follows.Add(struct (viewer, u.Id))
             | _ -> ()
     plan
 
-/// Phase B cut into `parts` by article, for that many connections: each part gets a contiguous
-/// share of the distinct articles, with their bodies and their (viewer, article) pairs; the
-/// (viewer, user) pairs go with the first part. Every part's flags statement looks up only its
-/// own articles' authors.
-let private splitB (b: PlanB) (parts: int) : PlanB[] =
-    let plans =
-        Array.init parts (fun _ ->
-            { Cards = Distinct()
-              Bodies = ResizeArray()
-              ArticlePairs = Distinct()
-              UserPairs = Distinct() })
-    let partOf = Dictionary<int64, int>(b.Cards.Count)
-    for i in 0 .. b.Cards.Count - 1 do
-        let part = i * parts / b.Cards.Count
-        let id = b.Cards.Items[i]
-        partOf[id] <- part
-        plans[part].Cards.Add id |> ignore
-        plans[part].Bodies.Add b.Bodies[i]
-    for struct (_, article) as pair in b.ArticlePairs.Items do
-        plans[partOf[article]].ArticlePairs.Add pair |> ignore
-    for pair in b.UserPairs.Items do
-        plans[0].UserPairs.Add pair |> ignore
-    plans
+let private byOwner (struct (v: int64, x: int64)) (struct (w: int64, y: int64)) =
+    if v <> w then compare v w else compare x y
 
-/// What phase B found. The tag and favorite fields are the cards' parts, read before the cards.
-[<NoEquality; NoComparison>]
-type private FoundB =
-    { Cards: Dictionary<int64, Card>
-      Favorited: HashSet<struct (int64 * int64)>
-      Following: HashSet<struct (int64 * int64)>
-      /// Tag id -> its position in name order (an index into TagNames).
-      TagRanks: Dictionary<int, int>
-      TagNames: ResizeArray<string>
-      /// Article id -> its tags' positions.
-      CardTags: Dictionary<int64, ResizeArray<int>>
-      FavoritesCounts: Dictionary<int64, int64> }
-
-let private emptyB () =
-    { Cards = Dictionary()
-      Favorited = HashSet()
-      Following = HashSet()
-      TagRanks = Dictionary()
-      TagNames = ResizeArray()
-      CardTags = Dictionary()
-      FavoritesCounts = Dictionary() }
-
-/// An article's tag names in the database's name order (its collation, not .NET's).
-let private tagList (found: FoundB) (article: int64) : string[] =
-    match found.CardTags.TryGetValue article with
-    | true, ranks ->
-        ranks.Sort()
-        Array.init ranks.Count (fun i -> found.TagNames[ranks[i]])
-    | _ -> Array.empty
+/// Pairs (owner, item) as the flags statement takes them: the distinct owners, and each owner's
+/// distinct items as the slice [start : end] (1-based, inclusive) of one flat array.
+let private slices (pairs: ResizeArray<struct (int64 * int64)>) : struct (int64[] * int[] * int[] * int64[]) =
+    pairs.Sort(Comparison byOwner)
+    let owners = ResizeArray<int64>()
+    let starts = ResizeArray<int>()
+    let ends = ResizeArray<int>()
+    let items = ResizeArray<int64>(pairs.Count)
+    for i in 0 .. pairs.Count - 1 do
+        let struct (owner, item) = pairs[i]
+        if i = 0 then
+            owners.Add owner
+            starts.Add 1
+            items.Add item
+        else
+            let struct (lastOwner, lastItem) = pairs[i - 1]
+            if owner <> lastOwner then
+                ends.Add items.Count
+                owners.Add owner
+                starts.Add(items.Count + 1)
+                items.Add item
+            elif item <> lastItem then
+                items.Add item
+    if pairs.Count > 0 then ends.Add items.Count
+    struct (owners.ToArray(), starts.ToArray(), ends.ToArray(), items.ToArray())
 
 // ------------------------------------------------------------ assemble ---------
 
-let private newestFirst (x: CommentCard) (y: CommentCard) =
+let private newestFirst (x: Remark) (y: Remark) =
     // DateTime.Compare, not `compare`: F#'s generic comparison boxes structs.
     match DateTime.Compare(y.CreatedAt, x.CreatedAt) with
     | 0 -> compare y.Id x.Id
     | c -> c
 
 /// Pure: every request's answer from what the two phases found.
-let private assemble (reads: Read[]) (a: PlanA) (foundA: FoundA) (foundB: FoundB) : Answer[] =
+let private assemble (reads: Read[]) (a: PlanA) (b: PlanB) (found: Found) : Answer[] =
     let following (viewer: ViewerId) (user: int64) =
-        viewer <> 0L && foundB.Following.Contains(struct (viewer, user))
-    let article (viewer: ViewerId) (card: Card) : Article =
-        { Card = card
-          Favorited = viewer <> 0L && foundB.Favorited.Contains(struct (viewer, card.Id))
-          Following = following viewer card.Author.Id }
-    let card (id: int64) =
-        match foundB.Cards.TryGetValue id with
+        viewer <> 0L && found.Following.Contains(struct (viewer, user))
+    // One list for every tag request of the batch (a list is 200 nodes).
+    let tagNames = lazy (List.ofSeq found.TagNames)
+    let cards = Dictionary<int64, Card> b.Cards.Count
+    /// An article's card, built once for the batch. Its tags come out in the database's name
+    /// order: their positions in the tags table, sorted.
+    let card (id: int64) : Card voption =
+        match cards.TryGetValue id with
         | true, c -> ValueSome c
-        | _ -> ValueNone
-    reads
-    |> Array.map (fun read ->
-        match read with
-        | ReadTags -> TagNames foundA.TagNames
-        | ReadPage(viewer, _, paging)
-        | ReadFeed(viewer, paging) ->
-            let struct (l, key, page) = pageKey read paging
+        | _ ->
+            match found.Rows.TryGetValue id with
+            | true, row ->
+                match found.Authors.TryGetValue row.AuthorId with
+                | true, author ->
+                    let c =
+                        { Id = id
+                          Slug = row.Slug
+                          Title = row.Title
+                          Description = row.Description
+                          Body = row.Body
+                          TagList =
+                            match found.CardTags.TryGetValue id with
+                            | true, ranks ->
+                                ranks.Sort()
+                                Array.init ranks.Count (fun i -> found.TagNames[ranks[i]])
+                            | _ -> Array.empty
+                          CreatedAt = row.CreatedAt
+                          UpdatedAt = row.UpdatedAt
+                          FavoritesCount =
+                            match found.FavoritesCounts.TryGetValue id with
+                            | true, n -> n
+                            | _ -> 0L
+                          Author = author }
+                    cards[id] <- c
+                    ValueSome c
+                | _ -> ValueNone
+            | _ -> ValueNone
+    let article (viewer: ViewerId) (c: Card) : Article =
+        { Card = c
+          Favorited = viewer <> 0L && found.Favorited.Contains(struct (viewer, c.Id))
+          Following = following viewer c.Author.Id }
+    Array.init reads.Length (fun i ->
+        match reads[i] with
+        | ReadTags -> TagNames tagNames.Value
+        | ReadPage(viewer, filter, paging) ->
+            let struct (l, key, page) = pageOf a filter paging
             Listed
                 { Articles =
-                    [ for id in foundA.PageIds[l][a.Pages[l].IndexOf page] do
+                    [ for id in found.PageIds[l][page] do
                           match card id with
                           | ValueSome c -> article viewer c
                           | ValueNone -> () ]
-                  Count = foundA.Totals[l][a.Counts[l].IndexOf key] }
+                  Count = found.Totals[l][key] }
+        | ReadFeed(viewer, _) ->
+            Listed
+                { Articles =
+                    [ for struct (id, _) in b.FeedPages[i] do
+                          match card id with
+                          | ValueSome c ->
+                              { Card = c
+                                Favorited = found.Favorited.Contains(struct (viewer, id))
+                                Following = true }
+                          | ValueNone -> () ]
+                  Count = found.FeedTotals[a.FeedViewers.IndexOf viewer] }
         | ReadArticle(viewer, slug) ->
-            match foundA.SlugIds[a.Slugs.IndexOf slug] |> ValueOption.bind card with
-            | ValueSome c -> Found(Some(article viewer c))
-            | ValueNone -> Found None
+            match found.SlugIds.TryGetValue slug with
+            | true, id ->
+                match card id with
+                | ValueSome c -> Found(Some(article viewer c))
+                | ValueNone -> Found None
+            | _ -> Found None
         | ReadComments(viewer, slug) ->
-            match foundA.SlugIds[a.Slugs.IndexOf slug] with
-            | ValueNone -> Thread None
-            | ValueSome id ->
-                let cards =
-                    match foundA.Threads.TryGetValue id with
-                    | true, t -> List.ofSeq t
-                    | _ -> []
-                Thread(Some [ for c in cards -> { Card = c; Following = following viewer c.Author.Id } ])
+            let thread = found.Threads[a.Threads.IndexOf slug]
+            if isNull thread then
+                Thread None
+            else
+                Thread(
+                    Some
+                        [ for c in thread do
+                              match found.Authors.TryGetValue c.AuthorId with
+                              | true, author ->
+                                  { Card =
+                                      { Id = c.Id
+                                        CreatedAt = c.CreatedAt
+                                        UpdatedAt = c.UpdatedAt
+                                        Body = c.Body
+                                        Author = author }
+                                    Following = following viewer c.AuthorId }
+                              | _ -> () ]
+                )
         | ReadProfile(viewer, username) ->
-            match foundA.Users[a.Usernames.IndexOf username] with
+            match found.Users[a.Usernames.IndexOf username] with
             | ValueSome u ->
                 Person(
                     Some
@@ -477,8 +611,8 @@ let private readRows (each: NpgsqlDataReader -> unit) (r: NpgsqlDataReader) : Ta
             each r
     }
 
-/// One round trip: `prefix`, the steps, `suffix` (BEGIN, SET TRANSACTION, COMMIT: statements that
-/// return no result set).
+/// One round trip: `prefix`, the steps, `suffix` (BEGIN, COMMIT: statements that return no
+/// result set).
 let private roundTrip (conn: NpgsqlConnection) (prefix: string list) (steps: Step list) (suffix: string option) : Task =
     task {
         use batch = new NpgsqlBatch(conn)
@@ -498,69 +632,170 @@ let private roundTrip (conn: NpgsqlConnection) (prefix: string list) (steps: Ste
         do! reader.CloseAsync()
     }
 
-let private stepsA (a: PlanA) (found: FoundA) : Step list =
+/// The card columns of the row the reader is on, from column `at`.
+let private rowAt (r: NpgsqlDataReader) (at: int) (body: string option) : Row =
+    { Id = r.GetInt64 at
+      AuthorId = r.GetInt64(at + 1)
+      Slug = r.GetString(at + 2)
+      Title = r.GetString(at + 3)
+      Description = r.GetString(at + 4)
+      CreatedAt = r.GetDateTime(at + 5)
+      UpdatedAt = r.GetDateTime(at + 6)
+      Body = body }
+
+let private userAt (r: NpgsqlDataReader) : Author =
+    { Id = r.GetInt64 0
+      Username = r.GetString 1
+      Bio = textOrNone r 2
+      Image = textOrNone r 3 }
+
+let private stepsA (a: PlanA) (found: Found) : Step list =
     [ if a.Tags then
-          command tagsSql [], readRows (fun r -> found.TagNames <- r.GetString 0 :: found.TagNames)
+          command tagsSql [],
+          readRows (fun r ->
+              found.TagRanks[r.GetInt32 0] <- found.TagNames.Count
+              found.TagNames.Add(r.GetString 1))
       for l in 0 .. listings.Length - 1 do
           if a.Pages[l].Count > 0 then
               let pages = a.Pages[l].Items
               command
                   listSqls[l]
-                  [ texts "@ckeys" (a.Counts[l].Items.ToArray())
-                    texts "@pkeys" [| for struct (k, _, _, _) in pages -> k |]
-                    longs "@lims" [| for struct (_, lim, _, _) in pages -> lim |]
-                    longs "@offs" [| for struct (_, _, off, _) in pages -> off |]
-                    longs "@depths" [| for struct (_, _, _, depth) in pages -> depth |] ],
+                  [ texts "@keys" (a.Keys[l].Items.ToArray())
+                    longs "@pkeys" [| for struct (k, _, _) in pages -> int64 k + 1L |]
+                    longs "@lims" [| for struct (_, lim, _) in pages -> lim |]
+                    longs "@offs" [| for struct (_, _, off) in pages -> off |] ],
               readRows (fun r ->
                   let i = int (r.GetInt64 0) - 1
                   if r.IsDBNull 1 then
-                      found.Totals[l][i] <- r.GetInt64 2
+                      found.Totals[l][i] <- r.GetInt64 8
                   else
-                      let ids = found.PageIds[l][i]
-                      ids.Add(r.GetInt64 1))
+                      let id = r.GetInt64 1
+                      let page = found.PageIds[l][i]
+                      page.Add id
+                      if not (found.Rows.ContainsKey id) then found.Rows[id] <- rowAt r 1 None)
+      if a.FeedViewers.Count > 0 then
+          command feedSql [ longs "@viewers" (a.FeedViewers.Items.ToArray()); longs "@depths" (a.FeedDepths.ToArray()) ],
+          readRows (fun r ->
+              let i = int (r.GetInt64 1) - 1
+              if r.GetInt32 0 = 0 then
+                  found.FeedTotals[i] <- r.GetInt64 4
+              else
+                  let candidates = found.Feeds[i]
+                  candidates.Add(struct (r.GetInt64 2, r.GetInt64 3)))
       if a.Slugs.Count > 0 then
           command slugsSql [ texts "@slugs" (a.Slugs.Items.ToArray()) ],
-          readRows (fun r -> found.SlugIds[int (r.GetInt64 0) - 1] <- ValueSome(r.GetInt64 1))
+          // After the lists, so that an article a list also shows keeps the row with the body.
+          readRows (fun r ->
+              let row = rowAt r 0 (Some(r.GetString 7))
+              found.Rows[row.Id] <- row
+              found.SlugIds[row.Slug] <- row.Id)
       if a.Threads.Count > 0 then
           command threadsSql [ texts "@threads" (a.Threads.Items.ToArray()) ],
           readRows (fun r ->
-              let article = r.GetInt64 0
-              let thread =
-                  match found.Threads.TryGetValue article with
-                  | true, t -> t
-                  | _ ->
-                      let t = ResizeArray()
-                      found.Threads[article] <- t
-                      t
-              thread.Add
-                  { Id = r.GetInt64 1
-                    Body = r.GetString 2
-                    CreatedAt = r.GetDateTime 3
-                    UpdatedAt = r.GetDateTime 4
-                    Author =
-                      { Id = r.GetInt64 5
-                        Username = r.GetString 6
-                        Bio = textOrNone r 7
-                        Image = textOrNone r 8 } })
-      if a.Usernames.Count > 0 then
-          command usersSql [ texts "@usernames" (a.Usernames.Items.ToArray()) ],
-          readRows (fun r ->
-              found.Users[int (r.GetInt64 0) - 1] <-
-                  ValueSome
+              let i = int (r.GetInt64 0) - 1
+              if isNull found.Threads[i] then found.Threads[i] <- ResizeArray()
+              if not (r.IsDBNull 1) then
+                  let thread = found.Threads[i]
+                  thread.Add
                       { Id = r.GetInt64 1
-                        Username = r.GetString 2
-                        Bio = textOrNone r 3
-                        Image = textOrNone r 4 }) ]
-
-let private stepsB (b: PlanB) (found: FoundB) : Step list =
-    let firsts (pairs: Distinct<struct (int64 * int64)>) = [| for struct (x, _) in pairs.Items -> x |]
-    let seconds (pairs: Distinct<struct (int64 * int64)>) = [| for struct (_, y) in pairs.Items -> y |]
-    [ if b.Cards.Count > 0 then
-          let ids = b.Cards.Items.ToArray()
-          command tagRanksSql [],
+                        Body = r.GetString 2
+                        CreatedAt = r.GetDateTime 3
+                        UpdatedAt = r.GetDateTime 4
+                        AuthorId = r.GetInt64 5 })
+      if a.Usernames.Count > 0 then
+          command usernamesSql [ texts "@usernames" (a.Usernames.Items.ToArray()) ],
           readRows (fun r ->
-              found.TagRanks[r.GetInt32 0] <- found.TagNames.Count
-              found.TagNames.Add(r.GetString 1))
+              let u = userAt r
+              let i = a.Usernames.Find u.Username
+              if i >= 0 then found.Users[i] <- ValueSome u) ]
+
+/// The count lanes: favorite counts for all the read lanes at once. A favorite count walks the
+/// article's index entries (and the heap of pages writes have touched), so it costs by the row,
+/// and the popular articles are on the pages of batch after batch. Each count lane runs one
+/// statement at a time over the union of the articles of every batch waiting when it starts,
+/// each counted once. A run is bound after the batches it answers asked, in its own snapshot,
+/// and keeps nothing once they have their counts: a batch of batches, not a cache. (The idea is
+/// nish-std-amritk's.)
+[<Sealed>]
+type [<AllowNullLiteral>] Counts(ds: NpgsqlDataSource, lanes: int) =
+    let queue =
+        Channel.CreateUnbounded<struct (int64[] * TaskCompletionSource<Dictionary<int64, int64>>)>()
+    let totals = [| 0L; 0L; 0L |] // runs, ids asked for, ids counted
+
+    let drain (into: ResizeArray<struct (int64[] * TaskCompletionSource<Dictionary<int64, int64>>)>) =
+        let mutable w = Unchecked.defaultof<struct (int64[] * TaskCompletionSource<Dictionary<int64, int64>>)>
+        while queue.Reader.TryRead(&w) do
+            into.Add w
+
+    let run (conn: NpgsqlConnection) (ids: int64[]) : Task<Dictionary<int64, int64>> =
+        task {
+            let found = Dictionary<int64, int64>(ids.Length)
+            use c = new NpgsqlCommand(favoritesSql.Replace("@ids", "$1"), conn)
+            c.Parameters.Add(NpgsqlParameter<int64[]>(NpgsqlDbType = (NpgsqlDbType.Array ||| NpgsqlDbType.Bigint), TypedValue = ids))
+            |> ignore
+            use! r = c.ExecuteReaderAsync()
+            while! r.ReadAsync() do
+                found[r.GetInt64 0] <- r.GetInt64 1
+            return found
+        }
+
+    let lane () : Task =
+        task {
+            let mutable conn: NpgsqlConnection = null
+            let waiting = ResizeArray()
+            let union = HashSet<int64>()
+            while! queue.Reader.WaitToReadAsync() do
+                drain waiting
+                if waiting.Count > 0 then
+                    try
+                        if isNull conn || conn.State <> ConnectionState.Open then
+                            if not (isNull conn) then conn.Dispose()
+                            conn <- null
+                            let! c = ds.OpenConnectionAsync()
+                            conn <- c
+                        let mutable asked = 0
+                        for struct (ids, _) in waiting do
+                            asked <- asked + ids.Length
+                            for id in ids do
+                                union.Add id |> ignore
+                        let ids = Array.zeroCreate union.Count
+                        union.CopyTo ids
+                        let! found = run conn ids
+                        Interlocked.Increment(&totals[0]) |> ignore
+                        Interlocked.Add(&totals[1], int64 asked) |> ignore
+                        Interlocked.Add(&totals[2], int64 ids.Length) |> ignore
+                        for struct (_, reply) in waiting do
+                            reply.TrySetResult found |> ignore
+                    with e ->
+                        for struct (_, reply) in waiting do
+                            reply.TrySetException e |> ignore
+                    waiting.Clear()
+                    union.Clear()
+        }
+
+    do
+        for _ in 1..lanes do
+            Task.Run<unit>(fun () -> task { do! lane () }) |> ignore
+
+    /// The favorite counts of `ids` (an article without any has no entry). The dictionary is
+    /// shared with the other batches of its run: read it, never write it.
+    member _.Of(ids: int64[]) : Task<Dictionary<int64, int64>> =
+        let reply = TaskCompletionSource<Dictionary<int64, int64>>(TaskCreationOptions.RunContinuationsAsynchronously)
+        if queue.Writer.TryWrite(struct (ids, reply)) then reply.Task
+        else Task.FromException<Dictionary<int64, int64>>(InvalidOperationException "Counts: closed")
+
+    /// Runs, ids asked for and ids counted, since the last call.
+    member _.Take() : struct (int64 * int64 * int64) =
+        struct (Interlocked.Exchange(&totals[0], 0L), Interlocked.Exchange(&totals[1], 0L), Interlocked.Exchange(&totals[2], 0L))
+
+let private stepsB (b: PlanB) (found: Found) (countHere: bool) : Step list =
+    [ if b.Meta.Count > 0 then
+          command metaSql [ longs "@ids" (b.Meta.Items.ToArray()) ],
+          readRows (fun r ->
+              let row = rowAt r 0 None
+              found.Rows[row.Id] <- row)
+      if b.Cards.Count > 0 then
+          let ids = b.Cards.Items.ToArray()
           command cardTagsSql [ longs "@ids" ids ],
           readRows (fun r ->
               let article = r.GetInt64 0
@@ -571,37 +806,30 @@ let private stepsB (b: PlanB) (found: FoundB) : Step list =
                       let ranks = ResizeArray 4
                       found.CardTags[article] <- ranks
                       ranks
-              ranks.Add found.TagRanks[r.GetInt32 1])
-          command favoritesSql [ longs "@ids" ids ],
-          readRows (fun r -> found.FavoritesCounts[r.GetInt64 0] <- r.GetInt64 1)
-          command cardsSql [ longs "@ids" ids; bools "@bodies" (b.Bodies.ToArray()) ],
+              match found.TagRanks.TryGetValue(r.GetInt32 1) with
+              | true, rank -> ranks.Add rank
+              | _ -> ())
+          if countHere then
+              command favoritesSql [ longs "@ids" ids ],
+              readRows (fun r -> found.FavoritesCounts[r.GetInt64 0] <- r.GetInt64 1)
+      if b.Authors.Count > 0 then
+          command authorsSql [ longs "@ids" (b.Authors.Items.ToArray()) ],
           readRows (fun r ->
-              let id = r.GetInt64 0
-              found.Cards[id] <-
-                  { Id = id
-                    Body = textOrNone r 1
-                    Slug = r.GetString 2
-                    Title = r.GetString 3
-                    Description = r.GetString 4
-                    CreatedAt = r.GetDateTime 5
-                    UpdatedAt = r.GetDateTime 6
-                    TagList = tagList found id
-                    FavoritesCount =
-                      match found.FavoritesCounts.TryGetValue id with
-                      | true, n -> n
-                      | _ -> 0L
-                    Author =
-                      { Id = r.GetInt64 7
-                        Username = r.GetString 8
-                        Bio = textOrNone r 9
-                        Image = textOrNone r 10 } })
-      if b.ArticlePairs.Count > 0 || b.UserPairs.Count > 0 then
+              let u = userAt r
+              found.Authors[u.Id] <- u)
+      if b.Favorites.Count > 0 || b.Follows.Count > 0 then
+          let struct (fv, fs, fe, fa) = slices b.Favorites
+          let struct (ov, os, oe, oa) = slices b.Follows
           command
               flagsSql
-              [ longs "@av" (firsts b.ArticlePairs)
-                longs "@aa" (seconds b.ArticlePairs)
-                longs "@uv" (firsts b.UserPairs)
-                longs "@uu" (seconds b.UserPairs) ],
+              [ longs "@fv" fv
+                ints "@fs" fs
+                ints "@fe" fe
+                longs "@fa" fa
+                longs "@ov" ov
+                ints "@os" os
+                ints "@oe" oe
+                longs "@oa" oa ],
           readRows (fun r ->
               let pair = struct (r.GetInt64 1, r.GetInt64 2)
               (if r.GetBoolean 0 then found.Following else found.Favorited).Add pair |> ignore) ]
@@ -612,22 +840,10 @@ let private beginRead = "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY"
 /// database, so an article phase A found is still there in phase B. Read-only, so committing
 /// costs nothing, and it takes one snapshot instead of one per statement.
 ///
-/// With `helpers`, phase B is cut by article into up to 1 + helpers.Length parts (at least
-/// `perPart` distinct articles each) that run at the same time, each on its own connection.
-/// Phase A exports its snapshot (pg_export_snapshot, in the same round trip) and every helper
-/// imports it (SET TRANSACTION SNAPSHOT) before its part, so all parts see exactly the database
-/// phase A saw; `conn` commits only once every part is back, which keeps the snapshot exported
-/// while they import it. `times`, if not null, records phase A, the plan between, phase B and the
-/// assembly; `laps`, if not null, gets the Stopwatch timestamp at the end of each (0 where the
-/// batch had no such step).
-let answerWith
-    (conn: NpgsqlConnection)
-    (helpers: NpgsqlConnection[])
-    (perPart: int)
-    (times: Db.Millis[])
-    (laps: int64[])
-    (reads: Read[])
-    : Task<Answer[]> =
+/// `times`, if not null, records phase A, the plan between, phase B and the assembly; `laps`,
+/// if not null, gets the Stopwatch timestamp at the end of each (0 where the batch had no such
+/// step).
+let answerWith (conn: NpgsqlConnection) (counts: Counts) (times: Db.Millis[]) (laps: int64[]) (reads: Read[]) : Task<Answer[]> =
     task {
         let at = ref (Diagnostics.Stopwatch.GetTimestamp())
         let lap (i: int) =
@@ -636,14 +852,22 @@ let answerWith
             if not (isNull laps) then laps[i] <- now
             at.Value <- now
         let a = planA reads
-        let foundA =
-            { TagNames = []
-              Totals = Array.init listings.Length (fun l -> Array.zeroCreate a.Counts[l].Count)
+        let found =
+            { TagNames = ResizeArray()
+              TagRanks = Dictionary()
+              Totals = Array.init listings.Length (fun l -> Array.zeroCreate a.Keys[l].Count)
               PageIds = Array.init listings.Length (fun l -> Array.init a.Pages[l].Count (fun _ -> ResizeArray()))
-              SlugIds = Array.create a.Slugs.Count ValueNone
-              Threads = Dictionary()
-              Users = Array.create a.Usernames.Count ValueNone }
-        let foundB = emptyB ()
+              Rows = Dictionary()
+              SlugIds = Dictionary()
+              Threads = Array.zeroCreate a.Threads.Count
+              Users = Array.create a.Usernames.Count ValueNone
+              FeedTotals = Array.zeroCreate a.FeedViewers.Count
+              Feeds = Array.init a.FeedViewers.Count (fun _ -> ResizeArray())
+              CardTags = Dictionary()
+              FavoritesCounts = Dictionary()
+              Authors = Dictionary()
+              Favorited = HashSet()
+              Following = HashSet() }
         // Only tags or anonymous profiles: phase A is everything, and needs no snapshot of its own.
         let twoPhases =
             reads
@@ -651,54 +875,42 @@ let answerWith
                 | ReadTags -> false
                 | ReadProfile(viewer, _) -> viewer <> 0L
                 | _ -> true)
+        let mutable b = Unchecked.defaultof<PlanB>
         if twoPhases then
-            let snapshot = ref ""
-            let export =
-                [ if helpers.Length > 0 then
-                      command "SELECT pg_export_snapshot()" [], readRows (fun r -> snapshot.Value <- r.GetString 0) ]
-            do! roundTrip conn [ beginRead ] (export @ stepsA a foundA) None
+            do! roundTrip conn [ beginRead ] (stepsA a found) None
             lap 0
-            for pages in foundA.PageIds do
+            for pages in found.PageIds do
                 for ids in pages do
                     ids.Sort(fun x y -> compare y x)
-            for t in foundA.Threads.Values do
-                t.Sort(Comparison newestFirst)
-            let b = planB reads a foundA
-            let parts = min (helpers.Length + 1) (max 1 (b.Cards.Count / max 1 perPart))
+            for t in found.Threads do
+                if not (isNull t) then t.Sort(Comparison newestFirst)
+            for candidates in found.Feeds do
+                candidates.Sort(Comparison newestPairFirst)
+            b <- planB reads a found
+            found.CardTags.EnsureCapacity b.Cards.Count |> ignore
+            let shared = not (isNull counts) && b.Cards.Count > 0
+            // The count lanes work beside phase B, not after it.
+            let counting = if shared then counts.Of(b.Cards.Items.ToArray()) else null
+            if not shared then found.FavoritesCounts.EnsureCapacity b.Cards.Count |> ignore
+            found.Authors.EnsureCapacity b.Authors.Count |> ignore
             lap 1
-            if parts = 1 then
-                do! roundTrip conn [] (stepsB b foundB) (Some "COMMIT")
-            else
-                let plans = splitB b parts
-                let found = Array.init parts (fun _ -> emptyB ())
-                let work =
-                    [| roundTrip conn [] (stepsB plans[0] found[0]) None
-                       for i in 1 .. parts - 1 do
-                           roundTrip
-                               helpers[i - 1]
-                               [ beginRead; $"SET TRANSACTION SNAPSHOT '{snapshot.Value}'" ]
-                               (stepsB plans[i] found[i])
-                               (Some "COMMIT") |]
-                do! Task.WhenAll work
-                do! roundTrip conn [] [] (Some "COMMIT")
-                for f in found do
-                    for kv in f.Cards do
-                        foundB.Cards[kv.Key] <- kv.Value
-                    foundB.Favorited.UnionWith f.Favorited
-                    foundB.Following.UnionWith f.Following
+            do! roundTrip conn [] (stepsB b found (not shared)) (Some "COMMIT")
+            if shared then
+                let! counted = counting
+                found.FavoritesCounts <- counted
             lap 2
         else
-            do! roundTrip conn [] (stepsA a foundA) None
+            do! roundTrip conn [] (stepsA a found) None
             lap 0
-        foundA.TagNames <- List.rev foundA.TagNames
-        let answers = assemble reads a foundA foundB
+            b <- planB reads a found
+        let answers = assemble reads a b found
         lap 3
         return answers
     }
 
 /// One batch on one connection. Public for the batch property test (Tests/BatchTests.fs): a
 /// request's answer never depends on its batch-mates.
-let answer (conn: NpgsqlConnection) (reads: Read[]) : Task<Answer[]> = answerWith conn [||] 1 null null reads
+let answer (conn: NpgsqlConnection) (reads: Read[]) : Task<Answer[]> = answerWith conn null null null reads
 
 // --------------------------------------------------------------- lanes ---------
 
@@ -722,12 +934,13 @@ let private unexpected (a: Answer) : 'a = invalidOp $"Reads: unexpected answer {
 /// if `maxBatch` of them arrive sooner): bigger batches share more, and the wait is inside the
 /// latency budget.
 [<Sealed>]
-type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpan, split: int, perPart: int, shareMin: int, logCapacity: int) =
+type Gather(connectionString: string, lanes: int, countLanes: int, maxBatch: int, gather: TimeSpan, shareMin: int, logCapacity: int) =
     let queue =
         // Never SingleReader, even with one lane: a single-reader channel cannot report its length
         // (Depth), which the diagnostics read.
         Channel.CreateUnbounded<Pending>(UnboundedChannelOptions(SingleReader = false, SingleWriter = false))
     let ds = NpgsqlDataSource.Create connectionString
+    let shared = if countLanes > 0 then Counts(ds, countLanes) else null
     let counts = [| 0L; 0L |] // batches, requests
     let queued = Db.Millis() // per request: arrived -> taken into a batch
     let executed = Db.Millis() // per batch: taken -> answered
@@ -782,13 +995,11 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
                     ()
         }
 
-    /// `conns`: the lane's connection, then its helpers for a split phase B.
-    let rec serve (conns: NpgsqlConnection[]) (laps: int64[]) (batch: Pending[]) : Task =
+    let rec serve (conn: NpgsqlConnection) (laps: int64[]) (batch: Pending[]) : Task =
         task {
-            let conn = conns[0]
             let mutable failure = None
             try
-                let! answers = answerWith conn conns[1..] perPart phases laps (batch |> Array.map _.Read)
+                let! answers = answerWith conn shared phases laps (batch |> Array.map _.Read)
                 for i in 0 .. batch.Length - 1 do
                     batch[i].Answer answers[i]
             with e ->
@@ -796,14 +1007,13 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
             match failure with
             | None -> ()
             | Some e ->
-                for c in conns do
-                    do! rollback c
+                do! rollback conn
                 match e with
-                | :? PostgresException when batch.Length > 1 && conns |> Array.forall (fun c -> c.State = ConnectionState.Open) ->
+                | :? PostgresException when batch.Length > 1 && conn.State = ConnectionState.Open ->
                     // One request's statement failed and took the batch with it: each request
                     // runs again alone and meets its own fate.
                     for p in batch do
-                        do! serve conns null [| p |]
+                        do! serve conn null [| p |]
                 | e ->
                     for p in batch do
                         p.Fail e
@@ -811,8 +1021,7 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
 
     let lane (index: int) : Task =
         task {
-            // The lane's connection, then split - 1 helpers for phase B.
-            let conns: NpgsqlConnection[] = Array.zeroCreate (max 1 split)
+            let mutable conn: NpgsqlConnection = null
             let pending = ResizeArray<Pending>(maxBatch)
             while! queue.Reader.WaitToReadAsync() do
                 // Gather: take requests until the oldest has waited `gather`, or a full batch
@@ -845,13 +1054,12 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
                             queued.Record(Diagnostics.Stopwatch.GetElapsedTime(p.Arrived, taken))
                             if not (isNull p.Trace) then p.Trace.ReadQueued <- taken - p.Arrived
                     try
-                        for i in 0 .. conns.Length - 1 do
-                            if isNull conns[i] || conns[i].State <> ConnectionState.Open then
-                                if not (isNull conns[i]) then conns[i].Dispose()
-                                conns[i] <- null
-                                let! c = ds.OpenConnectionAsync()
-                                conns[i] <- c
-                        do! serve conns laps batch
+                        if isNull conn || conn.State <> ConnectionState.Open then
+                            if not (isNull conn) then conn.Dispose()
+                            conn <- null
+                            let! c = ds.OpenConnectionAsync()
+                            conn <- c
+                        do! serve conn laps batch
                     with e ->
                         for p in batch do
                             p.Fail e
@@ -935,12 +1143,16 @@ type Gather(connectionString: string, lanes: int, maxBatch: int, gather: TimeSpa
     /// time in Reads.
     member _.Timings = queued.Summary(), executed.Summary(), answered.Summary()
 
-    /// p50/p95/p99 per batch of: phase A, the plan between the phases, phase B (split or not),
+    /// p50/p95/p99 per batch of: phase A, the plan between the phases, phase B,
     /// the assembly. (A batch of tags and anonymous profiles has phase A and assembly only.)
     member _.PhaseTimings = phases[0].Summary(), phases[1].Summary(), phases[2].Summary(), phases[3].Summary()
 
     /// Requests queued and not yet taken into a batch.
     member _.Depth = queue.Reader.Count
+
+    /// The count lanes' runs, ids asked for and ids counted since the last call (zeros without count lanes).
+    member _.Counted() : struct (int64 * int64 * int64) =
+        if isNull shared then struct (0L, 0L, 0L) else shared.Take()
 
     /// Lanes running a batch right now.
     member _.Busy = Volatile.Read(&busy[0])
