@@ -134,13 +134,16 @@ let main args =
     // Multiplexed: the cold reads (sign-in lookups, the read after a write). Rule: 95 or fewer
     // connections in total, lanes included.
     let poolSize = min (95 - writeLanes - readLanes - countLanes) (int (setting "DB_POOL_SIZE" (string (max 2 (cores / 2)))))
-    // A quarter of the cores, each computing up to four hashes in lockstep (~25 a second per
-    // thread), covers the login rate the reads leave room for; fewer threads also fill the
-    // lockstep batches.
+    // A quarter of the cores, each computing several hashes in lockstep (five on a recent x86-64
+    // core, ~120 a second per idle thread), covers the login rate the reads leave room for; fewer
+    // threads also fill the lockstep batches.
     let bcryptLanes = max 1 (int (setting "BCRYPT_THREADS" (string quarter)))
-    // Each bcrypt thread computes up to BCRYPT_WIDTH hashes in lockstep, letting the first wait
-    // up to BCRYPT_GATHER_MS for batch-mates.
-    let bcryptWidth = max 1 (int (setting "BCRYPT_WIDTH" "4"))
+    // Each bcrypt thread computes up to BCRYPT_WIDTH hashes in lockstep (1 to 6; 0, the default:
+    // the width this CPU hashes fastest at) with the kernel BCRYPT_KERNEL (c, ah, bextr or shrx;
+    // by default the fastest, timed at startup), letting the first wait up to BCRYPT_GATHER_MS
+    // for batch-mates.
+    let bcryptWidth = max 0 (int (setting "BCRYPT_WIDTH" "0"))
+    let bcryptKernel = setting "BCRYPT_KERNEL" ""
     // Logins are ~0.1% of the requests, so waiting for batch-mates barely touches p95 or p99.
     let bcryptGather = TimeSpan.FromMilliseconds(float (setting "BCRYPT_GATHER_MS" "150"))
     // Diagnostics: a line on stderr every STATS_SECONDS (fractions allowed); 0, the default, is off.
@@ -152,7 +155,8 @@ let main args =
         if statsEvery.Ticks > 0L then
             connections.Count listen
 
-    Engine.Passwords.start bcryptLanes bcryptWidth bcryptGather
+    Engine.Passwords.start bcryptLanes bcryptKernel bcryptWidth bcryptGather
+    let bcryptKernel, bcryptWidth, bcryptMs = Engine.Passwords.kernel ()
     // Each kind of connection names itself, so Postgres's own views (pg_stat_activity) and
     // probes on its backends can tell the read lanes, the write lanes and the pool apart.
     let named (role: string) (connectionString: string) = $"{connectionString};Application Name=conduit-{role}"
@@ -243,7 +247,7 @@ let main args =
         + $" {readLanes} read lanes (batches of <= {readBatch}, gather {int readGather.TotalMilliseconds} ms,"
         + $" fair share from {readShareMin})"
         + $" + {writeLanes} write lanes (groups of <= {writeGroup}, waiting {int writeGather.TotalMilliseconds} ms for {writeGroupMin})"
-        + $" + {poolSize} multiplexed db connections, {bcryptLanes} bcrypt threads ({bcryptWidth} wide), server GC {serverGC}"
+        + $" + {poolSize} multiplexed db connections, {bcryptLanes} bcrypt threads ({bcryptWidth} wide, kernel {bcryptKernel}, {bcryptMs:F1} ms a hash), server GC {serverGC}"
     )
     let sampler =
         if batchLog = "" then

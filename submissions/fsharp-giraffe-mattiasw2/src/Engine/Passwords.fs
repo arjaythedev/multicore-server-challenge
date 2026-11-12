@@ -8,12 +8,12 @@ open System.Text
 open System.Threading
 open System.Threading.Tasks
 
-// bcrypt cost 10 is ~50 ms of an idle core and ~90 ms under load: the largest single share of
-// this server's CPU (README). Run on the thread pool it would park request threads and stall the cheap reads
+// bcrypt cost 10 is ~35 ms of an idle core for one hash and the largest single share of this
+// server's CPU (README). Run on the thread pool it would park request threads and stall the cheap reads
 // behind it, so it runs on a few dedicated threads with a queue in front. Each thread computes
-// up to `width` hashes in lockstep (Bcrypt: independent chains overlap in the CPU), so a thread
-// that picks up a login first waits up to `gather` for batch-mates. Under load the queue
-// already holds them and nobody waits.
+// up to `width` hashes in lockstep (Bcrypt: independent chains overlap in the CPU, so five take
+// little longer than one), so a thread that picks up a login first waits up to `gather` for
+// batch-mates. Under load the queue already holds them and nobody waits.
 
 [<NoEquality; NoComparison>]
 type private Job =
@@ -35,6 +35,11 @@ let counts () : int64 * int64 = Interlocked.Read &hashes, Interlocked.Read &veri
 let lockstep () : int64 * int64 = Volatile.Read &batches[0], Volatile.Read &batches[1]
 
 let mutable private threads = 0
+let mutable private settled = "", 0, 0.0
+
+/// The kernel the bcrypt threads run, how many hashes each steps together, and the milliseconds a
+/// hash took at that width when `start` timed it.
+let kernel () : string * int * float = settled
 let private gate = obj ()
 /// Held by the one thread that is gathering a batch, so batch-mates are not spread one per thread.
 let private gathering = obj ()
@@ -90,16 +95,21 @@ let private compute (batch: Job list) =
 
 /// Starts `count` bcrypt threads, each computing up to `width` hashes at once and letting the
 /// first wait up to `gather` for the rest (idempotent: only the first call starts threads).
-let start (count: int) (width: int) (gather: TimeSpan) : unit =
+/// `width` 0 is the width this CPU hashes fastest at, and `kernel` "" the kernel that does;
+/// both are timed here (Bcrypt.calibrate, ~0.2 s).
+let start (count: int) (kernel: string) (width: int) (gather: TimeSpan) : unit =
     lock gate (fun () ->
         if threads = 0 then
+            let k, width, ms = Bcrypt.calibrate kernel width
+            Bcrypt.choose k
+            settled <- (Bcrypt.kernelNames[k], width, ms)
             threads <- max 1 count
             for i in 1..threads do
                 let t =
                     Thread(
                         (fun () ->
                             while true do
-                                compute (next (max 1 width) gather)),
+                                compute (next width gather)),
                         IsBackground = true,
                         Name = $"bcrypt-{i}"
                     )
@@ -107,7 +117,7 @@ let start (count: int) (width: int) (gather: TimeSpan) : unit =
 
 let private ensureStarted () =
     if threads = 0 then
-        start 2 4 (TimeSpan.FromMilliseconds 50.0)
+        start 2 "" 0 (TimeSpan.FromMilliseconds 50.0)
 
 /// bcrypt reads at most 72 bytes; a longer password would be silently truncated, so it is refused.
 let fits (password: string) : bool = Encoding.UTF8.GetByteCount password <= 72

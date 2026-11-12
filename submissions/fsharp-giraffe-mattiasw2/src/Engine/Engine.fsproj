@@ -17,6 +17,19 @@
     <Compile Include="Articles.fs" />
     <Compile Include="Comments.fs" />
   </ItemGroup>
+  <!-- bcrypt's Blowfish is C and assembly (native/): built here, so that every build, publish and
+       test run has libcbcrypt.so beside its assemblies (it travels with Engine.dll to the
+       projects that reference this one). Needs gcc and python3 (install.sh). -->
+  <PropertyGroup>
+    <NativeDir>$(MSBuildProjectDirectory)/../../native</NativeDir>
+    <NativeLibrary>$(MSBuildProjectDirectory)/$(BaseIntermediateOutputPath)native/libcbcrypt.so</NativeLibrary>
+  </PropertyGroup>
+  <Target Name="NativeBcrypt" BeforeTargets="AssignTargetPaths" Inputs="$(NativeDir)/cbcrypt.c;$(NativeDir)/gen-bcrypt-x86.py;$(NativeDir)/build.sh" Outputs="$(NativeLibrary)">
+    <Exec Command="bash &quot;$(NativeDir)/build.sh&quot; &quot;$(NativeLibrary)&quot;" />
+  </Target>
+  <ItemGroup>
+    <None Include="$(NativeLibrary)" Link="libcbcrypt.so" CopyToOutputDirectory="PreserveNewest" Visible="false" />
+  </ItemGroup>
   <ItemGroup>
     <PackageReference Update="FSharp.Core" Version="11.0.101" />
     <PackageReference Include="Npgsql" Version="10.0.3" />

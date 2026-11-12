@@ -7,8 +7,9 @@
 # WRITE_LANES / WRITE_GROUP (group-commit connections, default (cores + 2) / 4; writes per group, default 128),
 # WRITE_GROUP_MIN / WRITE_GATHER_MS (a smaller group waits for company until its oldest write has waited
 # that long; defaults 8 and 2, 0 never waits),
-# BCRYPT_THREADS / BCRYPT_WIDTH / BCRYPT_GATHER_MS (bcrypt threads, default (cores + 2) / 4; hashes each computes in
-# lockstep, default 4; how long a login may wait for batch-mates, default 150), STATS_SECONDS (a
+# BCRYPT_THREADS / BCRYPT_WIDTH / BCRYPT_KERNEL / BCRYPT_GATHER_MS (bcrypt threads, default (cores + 2) / 4; hashes each
+# computes in lockstep, 1 to 6, default 0: the width this CPU hashes fastest at; the kernel, c, ah, bextr or shrx, by
+# default the fastest, timed at startup; how long a login may wait for batch-mates, default 150), STATS_SECONDS (a
 # diagnostic line on stderr every that many seconds: GC, connections, queues; default 0, off),
 # PHASES_FILE (with STATS_SECONDS: where each request's time went, appended at every stats line),
 # BATCH_LOG (a prefix: a 25 ms timeline of CPU, GC and queues, a log of every read batch and every GC pause, written at

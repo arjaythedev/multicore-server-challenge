@@ -13,16 +13,17 @@ database layer of typed queries through Npgsql.FSharp, and one small module for 
 | JSON | `System.Text.Json`: `Utf8JsonWriter` out, `JsonDocument` in |
 | Postgres | Npgsql 10.0.3 (multiplexing, auto-prepare) through Npgsql.FSharp 5.7.0 |
 | JWT | HS256 with the BCL's `HMACSHA256` and `Base64Url` (`src/Web/Jwt.fs`) |
-| bcrypt | our own, four hashes in lockstep (`src/Engine/Bcrypt.fs`), cost 10; BCrypt.Net-Next 4.2.0 is the test reference and the fallback for unusual hashes |
+| bcrypt | C and generated x86-64 assembly (`native/`, built by gcc 13.3 from apt), up to six hashes in lockstep, called from `src/Engine/Bcrypt.fs`; cost 10; BCrypt.Net-Next 4.2.0 is the test reference and the fallback for unusual hashes |
 
 Package versions are pinned, and `build.sh` restores the `packages.lock.json` graphs in locked mode.
 
 ## Layout
 
 ```
-src/Engine/   the database side: Types, Db (pool), Commit (group commit), Reads (read batching), Bcrypt (lockstep bcrypt), Passwords (bcrypt threads), Tags, Users, Profiles, Articles, Comments
+src/Engine/   the database side: Types, Db (pool), Commit (group commit), Reads (read batching), Bcrypt (the bcrypt library's caller: kernel, width, stored form), Passwords (bcrypt threads), Tags, Users, Profiles, Articles, Comments
 src/Web/      Jwt (the token shim), Wire (JSON in/out, query paging; pure), Handlers (Giraffe), Program (Kestrel)
 src/Tests/    xUnit facts for Jwt and Wire, BcryptTests against BCrypt.Net-Next (no database); BatchTests, the read-batching property (FsCheck)
+native/       bcrypt's Blowfish: cbcrypt.c, gen-bcrypt-x86.py (writes the assembly kernels), build.sh -> libcbcrypt.so
 check.sh      the harness: build -> facts -> conformance suite (../../test/run.sh) -> batch property, one verdict
 ```
 
@@ -49,13 +50,15 @@ real keys, every request's answer inside the batch equals its answer alone, byte
 planted bug (one viewer's favorite leaking to another viewer of the same article) shrank to exactly that batch: two
 viewers, one article.
 
-**bcrypt is F#, not C.** Several fast entries call C for bcrypt. Ours is managed F# with raw pointers
-(`src/Engine/Bcrypt.fs`): four logins' hashes step through their Blowfish rounds together,
-so four independent chains of S-box lookups keep the core busy. Blowfish's 1,042 initial words are computed from
-pi (Machin's formula on big integers), not pasted. The JIT's code was tuned by reading its assembly (see
-"Where the app's CPU goes" below): one quad of hashes is now 12.9 ms per hash on one Zen 5 core, against 11.1 ms for Openwall's C
-with the same interleaving. Every hash is checked bit for bit against BCrypt.Net-Next by a property test on random
-passwords (UTF-8 up to 72 bytes) and salts. bcrypt runs only for a request that will succeed (cheap checks first)
+**bcrypt is the one piece that is not F#.** Up to six logins' hashes step through their Blowfish rounds together,
+so independent chains of S-box lookups keep the core busy. That was managed F# with raw pointers until the
+JIT's code, tuned by reading its assembly, stood at 12.9 ms per hash for four at a time on one Zen 5 core; the
+cost loop is now C with generated assembly kernels (`native/`, the generator is `java-servlet-clickin`'s port of
+`zig-iouring-nick-potts`'s), 8.1 ms per hash for five at a time on the same core (see "Where the app's CPU goes"
+below). F# still chooses the kernel and the width by timing them at startup, reads and writes the stored form, and
+computes Blowfish's 1,042 initial words from pi (Machin's formula on big integers), not pasted. Every hash is
+checked bit for bit against BCrypt.Net-Next by property tests on random passwords (UTF-8 up to 72 bytes and past
+them) and salts, for every kernel at every width. bcrypt runs only for a request that will succeed (cheap checks first)
 and never inside SQL, a transaction or a commit group.
 
 ## Multicore model
@@ -169,7 +172,8 @@ and never inside SQL, a transaction or a commit group.
     applied twice.
   - At shutdown the server logs `group commit: N writes in M groups`.
 - **bcrypt on dedicated threads** (`BCRYPT_THREADS`, default (cores + 2) / 4: 2 on 8 cores) behind a queue, each computing up to `BCRYPT_WIDTH`
-  (4) hashes in lockstep (see below). A thread that takes a login waits up to `BCRYPT_GATHER_MS` (150) for
+  hashes in lockstep (see below; by default the width this CPU hashes fastest at, timed at startup together with
+  the kernel, `BCRYPT_KERNEL`: 5 with `bextr` on Zen 5). A thread that takes a login waits up to `BCRYPT_GATHER_MS` (150) for
   batch-mates. Logins are ~0.1% of the requests, so that wait barely touches p95 or p99. At 100,000 users on
   6 threads 150 ms instead of 50 filled the batches to 3.3-3.4 hashes instead of 2.4 and saved 0.12-0.16 of the
   app's ~2.8 threads in two paired runs, with the same p95. A burst of logins waits for a thread instead of
@@ -234,7 +238,7 @@ statement per kind, see above):
 
 ## bcrypt runs once per sign-in, and never for a refused request
 
-bcrypt is by far the most expensive thing the server does (~50-80 ms of a core), so it runs exactly once per
+bcrypt is by far the most expensive thing the server does (~35 ms of an idle core for one hash), so it runs exactly once per
 sign-up, password change or login, and only when that request is going to succeed:
 
 | Request | bcrypt |
@@ -361,9 +365,9 @@ with busy hyperthread siblings. The rules make every login pay it (cost 10, veri
 cache), so the only lever is a faster bcrypt. The system's native one (libxcrypt `crypt_r`, the Openwall C code)
 is only 22% faster than BCrypt.Net-Next.
 
-**So bcrypt is our own, four hashes in lockstep** (`src/Engine/Bcrypt.fs`). One bcrypt is ~1 M Blowfish encryptions,
+**So bcrypt became our own, four hashes in lockstep** (first in F#, in `src/Engine/Bcrypt.fs`). One bcrypt is ~1 M Blowfish encryptions,
 each feeding the next: a chain of dependent S-box lookups that leaves the CPU waiting on memory latency. Four
-logins' hashes are independent, so their rounds are interleaved inside each encryption (`encipher4`). That is four
+logins' hashes are independent, so their rounds were interleaved inside each encryption (`encipher4`). That is four
 chains in flight at once, all in registers, which the CPU's out-of-order engine overlaps.
 
 | bcrypt cost 10, one thread | ms per hash | vs BCrypt.Net-Next |
@@ -373,7 +377,7 @@ chains in flight at once, all in registers, which the CPU's out-of-order engine 
 | ours, two in lockstep | ~33 | ~2.2x |
 | ours, four in lockstep | **~19-20** | **~3.2-4x** |
 
-(A batch of three runs as four, the copy's result dropped: one quad costs less than a pair plus a single.)
+(A batch of three ran as four, the copy's result dropped: one quad cost less than a pair plus a single.)
 
 **Then the JIT's code got the same treatment as C's.** Against Openwall's crypt_blowfish in C with interleaved
 lanes (the code `csharp-epoll-aot-gichamba` calls; `gcc -O2`), on one idle Zen 5 core, fully optimized JIT:
@@ -396,11 +400,60 @@ At 85,000 users on the test box this cut the app's CPU from 3.81 to 3.00 cores, 
 (21,400 against 21,000) and p95 from 647 ms to 515 ms. Postgres took the freed cores (3.88 to 4.30) and is now the
 larger consumer, and the lockstep batches averaged ~2.5 logins.
 
-- **Bit for bit.** `Tests/BcryptTests.fs` is an FsCheck property: for random batches (1 to 6) of random passwords
-  (ASCII and 2-, 3- and 4-byte UTF-8, up to the 72-byte limit) and random salts, every hash equals
-  BCrypt.Net-Next's. Our hashes also verify in BCrypt.Net-Next, and its `$2a$` and `$2b$` hashes verify in ours.
+**Then the cost loop moved to C and assembly** (`native/`, called through P/Invoke). gcc gives interleaved lanes
+in C what the F# was tuned towards, and the entries at the top of the leaderboard go further: generated assembly
+that reaches every lane from one base register and keeps five lanes' halves in registers
+(`zig-iouring-nick-potts`'s generator; ours is `java-servlet-clickin`'s Python port of it, which `native/build.sh`
+runs). Cost 10, ms per hash by the number of hashes in lockstep, on one pinned Zen 5 thread, the best of 5 runs,
+each checked against the others' output:
+
+| Kernel | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|--:|--:|--:|--:|--:|--:|
+| ours in F#, as it was | 44.2 | 24.0 | | 13.2 | | |
+| C lanes: `csharp-epoll-aot-gichamba` (Openwall, `gcc -O2`) | 36.4 | 19.5 | 15.0 | 11.7 | 9.9 | 9.5 |
+| C lanes: `fsharp-epoll-delneg` (`gcc -O3 -funroll-loops`) | 36.3 | 19.4 | 15.0 | 11.6 | 10.0 | 9.4 |
+| C lanes: `rust-tokio-Scooter1337` (libxcrypt, `-O3`) | | 21.0 | 13.5 | 10.9 | | |
+| C lanes: `java-raw-stohirov`'s generated C (`gcc -O3 -march=native`) | 36.3 | 18.4 | 12.8 | 10.5 | 9.3 | 9.2 |
+| assembly: `c-epoll-unorig-username` | 39.5 | 20.2 | 14.3 | 11.8 | 10.4 | |
+| assembly: `swift-iouring-Tabonx` | | | | | 9.5 | |
+| generated assembly, `ah` | 35.8 | 18.0 | 12.5 | 10.1 | 8.9 | 9.3 |
+| generated assembly, `shrx` | 35.9 | 18.1 | 12.5 | 10.1 | 8.7 | 9.3 |
+| generated assembly, `bextr` (what this CPU gets) | 33.1 | 16.8 | 11.6 | 9.3 | **8.1** | 9.3 |
+
+With the sibling hyperthread busy, as it is in the server, the F# took 21.0 ms at four, the best C 14.5 ms and
+`bextr` 11.2 ms at five; on a Zen 5c core `bextr` at five takes 11.8 ms. Which style and width win depends on the
+CPU (the generator's authors found `ah` on Zen 3 and `shrx` on Skylake-class Intel), so `Bcrypt.calibrate` times
+every kernel at 1 to 6 lanes at startup (at cost 6, ~0.2 s in all) and takes the narrowest width within 3% of the
+best. `native/cbcrypt.c` holds the rest of a hash and plain C kernels for a CPU without BMI2, or arm64. John the
+Ripper's `BF_std` (three interleaved, in C) was not timed.
+
+In the server, on 6 vCPUs, back to back with the F# build (the commit before; one run each, in both orders,
+because here the second run of a pair is the slower one whichever build it is):
+
+| Users | Build | Run | p50 | p95 | p99 | app threads | Postgres threads | |
+|--:|---|---|--:|--:|--:|--:|--:|---|
+| 130,000 | F# | first | 61 ms | 207 ms | 307 ms | 3.17 (bcrypt 0.89) | 2.65 | pass |
+| 130,000 | C | second | 82 ms | 292 ms | 452 ms | 3.06 (bcrypt 0.55) | 2.79 | pass |
+| 130,000 | C | first | 78 ms | 255 ms | 383 ms | 3.04 | 2.79 | pass |
+| 130,000 | F# | second | 141 ms | 341 ms | 481 ms | 3.40 | 2.49 | pass |
+| 150,000 | F# | first | 308 ms | 596 ms | 747 ms | 3.54 | 2.38 | fail |
+| 150,000 | C | second | 244 ms | 629 ms | 904 ms | 3.42 | 2.48 | fail |
+| 150,000 | C | first | 231 ms | 587 ms | 935 ms | 3.37 | 2.52 | fail |
+| 150,000 | F# | second | 325 ms | 703 ms | 998 ms | 3.54 | 2.36 | fail |
+
+By `perf` at 130,000 users bcrypt went from 28% of the app's samples to 18%, 0.89 threads to 0.55, which is 25 ms
+of CPU per hash down to 16 ms; the batches hold 4.1-4.5 hashes instead of 3.6-3.7. The latencies moved less than
+the run order moves them: p95 at 130,000 users averages 274 ms for either build, and 150,000 users fails with
+both (the median there is a quarter lower with C). The six threads are full either way, and Postgres and the read
+lanes take what bcrypt gives back.
+
+- **Bit for bit.** `Tests/BcryptTests.fs` holds FsCheck properties: for every kernel this CPU has, at every width
+  from 1 to 6, random passwords (ASCII and 2-, 3- and 4-byte UTF-8, up to the 72-byte limit) and random salts hash
+  to exactly BCrypt.Net-Next's hashes; so do passwords past 72 bytes, whose tail never counts. Our hashes also
+  verify in BCrypt.Net-Next, and its `$2a$`, `$2b$` and `$2y$` hashes verify in ours.
 - **Constants derived, not pasted.** Blowfish's 1,042 initial words are the hexadecimal digits of pi. `Bcrypt.fs`
-  computes them with Machin's formula on big integers, and the tests check them against the published tables.
+  computes them with Machin's formula on big integers and hands them to the library, and the tests check them
+  against the published tables.
 - Stored hashes we do not compute ourselves (another revision, a malformed string) go to BCrypt.Net-Next, and a
   malformed one verifies as false. Comparisons are constant-time.
 
@@ -435,9 +488,13 @@ bcrypt is still a third of the app's CPU for 0.1% of the requests: ~37 ms of CPU
 quad, because its threads share cores with Postgres and the app. Below it the profile is flat; Giraffe costs
 under 1%.
 
+With the C and assembly kernels (130,000 users, the paired run above) bcrypt is one symbol,
+`bcrypt_expand_bextr_5` in `libcbcrypt.so`: 18% of the app's 3.06 threads, 0.55.
+
 ## Built on others' ideas
 
-Ideas taken from other entries; the code here is our own.
+Ideas taken from other entries; the code here is our own, except `native/gen-bcrypt-x86.py`, which is another
+entry's file (MIT, like the repository).
 
 - `csharp-epoll-aot-gichamba` / `csharp-epoll-jit-gichamba` (PR #103 / #104), compared line by line:
   - the feed count's shortcut: a viewer who follows an author with 1,000+ articles counts 1,000, proved once per
@@ -448,6 +505,11 @@ Ideas taken from other entries; the code here is our own.
     credit to `rust-epoll-WorriedArrow`);
   - letting a login wait 150 ms for bcrypt batch-mates;
   - their Openwall crypt_blowfish with interleaved lanes, as the yardstick our F# bcrypt was tuned against.
+- bcrypt's assembly kernels: `native/gen-bcrypt-x86.py` is `java-servlet-clickin`'s `tools/gen-bcrypt-x86.py`
+  (PR #217), a port of `zig-iouring-nick-potts`'s `asm_gen.zig` (PR #117, #168) by way of
+  `rust-epoll-WorriedArrow`'s `build.rs` and `java-raw-stohirov`'s generator (PR #185): one base register for all
+  lanes, five lanes' halves in registers, three ways of taking the index bytes apart, and timing them at startup
+  because the fastest depends on the CPU. `native/cbcrypt.c` around them is ours.
 - `rust-epoll-theCatWisel` (PR #201): the tags table read once per batch, and tag ids instead of names per card;
   the statement that finds an article returns its columns, so phase B never reads the row again; each author once;
   the flags as one range scan per viewer over a slice of one array; and the feed's hub floors.
@@ -459,8 +521,8 @@ writes in one transaction).
 ## Build, run, check
 
 ```bash
-sudo bash install.sh            # once: .NET SDK 11.0.100 -> /usr/local/dotnet
-bash build.sh                   # -> out/Web.dll
+sudo bash install.sh            # once: .NET SDK 11.0.100 -> /usr/local/dotnet; gcc and python3 from apt
+bash build.sh                   # -> out/Web.dll, out/libcbcrypt.so
 DATABASE_URL=postgres://conduit:conduit@127.0.0.1:5432/conduit JWT_SECRET=multicore-server-challenge \
   HOST=0.0.0.0 PORT=80 bash start.sh
 bash check.sh                   # build + facts + conformance + batch property (needs the dev seed, Go, psql, curl)
@@ -469,7 +531,7 @@ SKIP_CONFORMANCE=1 bash check.sh  # the quick gate, no database
 
 Environment: `DATABASE_URL`, `JWT_SECRET` (required); `HOST` (127.0.0.1), `PORT` (3000); `READ_LANES` (cores);
 `READ_BATCH` (2048); `READ_GATHER_MS` (25); `READ_SHARE_MIN` (64; 0 takes everything up to `READ_BATCH`); `READ_COUNT_LANES` (1; 0: each batch counts its own favorites); `WRITE_LANES` ((cores + 2) / 4: 2 on 8 or 6 cores); `WRITE_GROUP` (128); `WRITE_GROUP_MIN` (8) and `WRITE_GATHER_MS` (2; 0 never waits); `DB_POOL_SIZE` (cores / 2, capped so the total stays
-at most 95); `BCRYPT_THREADS` ((cores + 2) / 4); `BCRYPT_WIDTH` (4); `BCRYPT_GATHER_MS` (150); `STATS_SECONDS` (0, off); `PHASES_FILE` (none); `BATCH_LOG`, `BATCH_LOG_MS` (25), `BATCH_LOG_PG_CGROUP` (none); `PG_OPTIONS` (the four session settings above); `SCHED_BATCH` (1).
+at most 95); `BCRYPT_THREADS` ((cores + 2) / 4); `BCRYPT_WIDTH` (0: the fastest of 1 to 6, timed at startup) and `BCRYPT_KERNEL` (the fastest of `c`, `ah`, `bextr`, `shrx`); `BCRYPT_GATHER_MS` (150); `STATS_SECONDS` (0, off); `PHASES_FILE` (none); `BATCH_LOG`, `BATCH_LOG_MS` (25), `BATCH_LOG_PG_CGROUP` (none); `PG_OPTIONS` (the four session settings above); `SCHED_BATCH` (1).
 
 `STATS_SECONDS=1` prints one diagnostic line a second on stderr (`src/Web/Stats.fs`), to line up against the load
 generator's seconds (`t=` is unix seconds):

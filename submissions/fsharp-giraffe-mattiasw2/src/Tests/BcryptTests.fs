@@ -1,5 +1,7 @@
-/// Our lockstep bcrypt against the reference, BCrypt.Net-Next: bit for bit, on random
-/// passwords (ASCII, multibyte, up to bcrypt's 72 bytes), random salts and random batch sizes.
+/// The lockstep bcrypt (native/cbcrypt.c through Engine.Bcrypt) against the reference,
+/// BCrypt.Net-Next: bit for bit, with every kernel this CPU has at every width, on random
+/// passwords (ASCII, multibyte, up to bcrypt's 72 bytes and past them), random salts and random
+/// batch sizes.
 module Tests.BcryptTests
 
 open System
@@ -47,6 +49,77 @@ let private batch =
         let! n = Gen.choose (1, 6)
         return! Gen.listOfLength n (Gen.zip password salt)
     }
+
+let private reference (cost: int) (password: string) (salt: byte[]) =
+    BCrypt.Net.BCrypt.HashPassword(password, $"$2a${cost:D2}$" + Bcrypt.encode salt)
+
+[<Fact>]
+let ``every kernel at every width equals BCrypt.Net-Next, bit for bit`` () =
+    Assert.Contains(0, Bcrypt.kernels) // the C kernel runs everywhere
+    let lanes width = Gen.listOfLength width (Gen.zip password salt)
+    for kernel in Bcrypt.kernels do
+        for width in 1 .. Bcrypt.MaxLanes do
+            let property (inputs: (string * byte[]) list) =
+                let inputs = Array.ofList inputs
+                let ours =
+                    Bcrypt.rawWith kernel 4 [| for p, s in inputs -> Bcrypt.key p, s |]
+                    |> Array.mapi (fun i h -> Bcrypt.format "$2a$" 4 (snd inputs[i]) h)
+                ours = (inputs |> Array.map (fun (p, s) -> reference 4 p s))
+            Check.One(Config.QuickThrowOnFailure.WithMaxTest(25), Prop.forAll (Arb.fromGen (lanes width)) property)
+
+[<Fact>]
+let ``more inputs than lanes go in several calls, and a bad argument is refused`` () =
+    let inputs = [| for i in 0..12 -> String('p', i), Array.init 16 (fun j -> byte (i * 16 + j)) |]
+    let ours = Bcrypt.raw 4 [| for p, s in inputs -> Bcrypt.key p, s |]
+    Assert.Equal(13, ours.Length)
+    for i in 0..12 do
+        Assert.Equal(reference 4 (fst inputs[i]) (snd inputs[i]), Bcrypt.format "$2a$" 4 (snd inputs[i]) ours[i])
+    let one = [| Bcrypt.key "x", Array.zeroCreate<byte> 16 |]
+    Assert.Throws<InvalidOperationException>(fun () -> Bcrypt.rawWith 0 3 one |> ignore) |> ignore // cost < 4
+    Assert.Throws<InvalidOperationException>(fun () -> Bcrypt.rawWith 99 4 one |> ignore) |> ignore // no such kernel
+    Assert.Throws<ArgumentException>(fun () -> Bcrypt.rawWith 0 4 [| Bcrypt.key "x", Array.zeroCreate<byte> 15 |] |> ignore) |> ignore
+
+[<Fact>]
+let ``calibration picks a kernel this CPU has and a width, and honours what is asked for`` () =
+    let kernel, width, ms = Bcrypt.calibrate "" 0
+    Assert.Contains(kernel, Bcrypt.kernels)
+    Assert.InRange(width, 1, Bcrypt.MaxLanes)
+    Assert.True(ms > 0.0)
+    let kernel, width, _ = Bcrypt.calibrate "c" 3
+    Assert.Equal((0, 3), (kernel, width))
+    let _, width, _ = Bcrypt.calibrate "no such kernel" 99
+    Assert.Equal(Bcrypt.MaxLanes, width)
+
+[<Fact>]
+let ``bytes past 72 never count, as in BCrypt.Net-Next`` () =
+    let s = Array.init 16 (fun i -> byte (255 - i))
+    for p in [ String('x', 73); String('x', 72) + "tail"; String.replicate 40 "é"; String.replicate 30 "€" + "abc" ] do
+        Assert.True(Encoding.UTF8.GetByteCount p > 72)
+        for kernel in Bcrypt.kernels do
+            let ours = Bcrypt.format "$2a$" 4 s (Array.exactlyOne (Bcrypt.rawWith kernel 4 [| Bcrypt.key p, s |]))
+            Assert.Equal(reference 4 p s, ours)
+    // The server's verify agrees with the reference on a password that differs only past byte 72.
+    let stored = reference 4 (String('x', 72) + "one") s
+    Assert.Equal(BCrypt.Net.BCrypt.Verify(String('x', 72) + "two", stored), (Passwords.verify (String('x', 72) + "two") stored).Result)
+    Assert.False((Passwords.verify (String('x', 71) + "y") stored).Result)
+
+[<Fact>]
+let ``$2a$, $2b$ and $2y$ hashes verify, a full batch at a time, and a wrong password does not`` () =
+    let users =
+        [| for i in 0..12 ->
+               let password = if i = 0 then "" elif i % 3 = 0 then $"pässwörd €{i}" else $"password{i}"
+               let revision = [| 'a'; 'b'; 'y' |][i % 3]
+               password, BCrypt.Net.BCrypt.HashPassword(password, BCrypt.Net.BCrypt.GenerateSalt(4, revision)) |]
+    for password, stored in users do
+        Assert.StartsWith("$2", stored)
+    // All at once, so the bcrypt threads take them in batches of every size up to their width.
+    let right = users |> Array.map (fun (password, stored) -> Passwords.verify password stored)
+    let wrong = users |> Array.map (fun (password, stored) -> Passwords.verify (password + "x") stored)
+    for task in right do
+        Assert.True(task.Result)
+    for task in wrong do
+        Assert.False(task.Result)
+    Assert.Equal<char list>([ 'a'; 'b'; 'y' ], users |> Array.map (fun (_, stored) -> stored[2]) |> Array.distinct |> Array.sort |> List.ofArray)
 
 [<Fact>]
 let ``lockstep bcrypt equals BCrypt.Net-Next, bit for bit`` () =
