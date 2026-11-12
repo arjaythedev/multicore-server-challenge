@@ -16,6 +16,11 @@ public final class BCryptTest {
         if (!bcrypt.verify("password123", known10)) {
             throw new AssertionError("cost 10 vector");
         }
+        String nulHash = "$2b$04$CCCCCCCCCCCCCCCCCCCCC.flu1Gv69OE8XQBS4Bm1aHA6o5dN4y3.";
+        if (!bcrypt.calculate("a\u0000b", nulHash.substring(0, 29)).equals(nulHash)
+                || !bcrypt.verify("a\u0000b", nulHash) || bcrypt.verify("a", nulHash)) {
+            throw new AssertionError("embedded NUL");
+        }
         String[] passwords = {"", "한글🔒", "x".repeat(71), "x".repeat(72),
                 "x".repeat(73)};
         String[] vectors = {"$2a$04$CCCCCCCCCCCCCCCCCCCCC.Cg0ly9t/KVBCBYYDfOmZKwry9JuXClC", "$2b$05$ZSfEoPvlcsj2XfvsSeK25e27C1uF0vytKDlDzSKG6tFwIhAz3sKEa",

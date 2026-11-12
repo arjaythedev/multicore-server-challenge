@@ -5,9 +5,11 @@
 //!
 //! A port of nick-potts's asm_gen.zig (zig-iouring-nick-potts). One base register reaches every lane, so each S-box
 //! and P read is rdi + index*4 + a constant folded into an add or xor; five lanes keep their halves in registers and
-//! further lanes keep them on the stack. Two styles, picked per CPU at startup:
+//! further lanes keep them on the stack. Three styles, picked per CPU at startup:
 //! - `ah`: byte 0 by movzx from the low byte, byte 1 by bextr, bytes 2 and 3 by one rorx then movzx from al and ah.
 //! - `bextr`: byte 3 by a copy and a shift, bytes 2 and 1 by bextr, byte 0 by movzx; no partial register reads.
+//! - `shrx`: byte 3 by shrx, bytes 2 and 1 by one rorx then movzx from ah and al, byte 0 by movzx; no bextr, which
+//!   Intel cores split into two micro-ops (11 a round instead of 12). Added in nick-potts's later asm_gen.zig.
 use std::fmt::Write;
 
 const MAX_LANES: usize = 8;
@@ -22,6 +24,7 @@ const LOW: [[&str; 2]; REG_LANES] = [["bl", "bpl"], ["r8b", "r9b"], ["r10b", "r1
 enum Style {
     Ah,
     Bextr,
+    Shrx,
 }
 
 fn slot(u: usize, h: usize) -> usize {
@@ -49,9 +52,19 @@ fn half_round(o: &mut String, style: Style, u: usize, hx: usize, r: usize) {
                 writeln!(o, "  mov edx, dword ptr [rdi + rsi*4 + {s}]").unwrap();
                 writeln!(o, "  bextr esi, {x}, eax").unwrap();
             }
+            Style::Shrx => {
+                writeln!(o, "  shrx esi, {x}, ecx").unwrap();
+                writeln!(o, "  mov edx, dword ptr [rdi + rsi*4 + {s}]").unwrap();
+                writeln!(o, "  rorx eax, {x}, 8").unwrap();
+                writeln!(o, "  movzx esi, ah").unwrap();
+            }
         }
         writeln!(o, "  add edx, dword ptr [rdi + rsi*4 + {}]", s + 1024).unwrap();
-        writeln!(o, "  bextr esi, {x}, ecx").unwrap();
+        if style == Style::Shrx {
+            writeln!(o, "  movzx esi, al").unwrap();
+        } else {
+            writeln!(o, "  bextr esi, {x}, ecx").unwrap();
+        }
         writeln!(o, "  xor edx, dword ptr [rdi + rsi*4 + {}]", s + 2048).unwrap();
         writeln!(o, "  movzx esi, {}", LOW[u][hx]).unwrap();
         writeln!(o, "  add edx, dword ptr [rdi + rsi*4 + {}]", s + 3072).unwrap();
@@ -75,13 +88,17 @@ fn function(o: &mut String, style: Style, n: usize) {
     let mem_lanes = n.saturating_sub(REG_LANES);
     // Counter plus the stack lanes, keeping rsp 16-byte aligned after the six pushes.
     let frame = 8 + 8 * mem_lanes + if mem_lanes % 2 == 0 { 8 } else { 0 };
-    let name = if style == Style::Ah { "ah" } else { "bextr" };
+    let name = match style {
+        Style::Ah => "ah",
+        Style::Bextr => "bextr",
+        Style::Shrx => "shrx",
+    };
     let f = format!("bc_expand0_{name}_{n}");
     writeln!(o, "  .globl {f}\n  .type {f}, @function\n  .p2align 6\n{f}:").unwrap();
     for r in ["rbx", "rbp", "r12", "r13", "r14", "r15"] {
         writeln!(o, "  push {r}").unwrap();
     }
-    writeln!(o, "  sub rsp, {frame}\n  mov ecx, 0x0808").unwrap();
+    writeln!(o, "  sub rsp, {frame}\n  mov ecx, {}", if style == Style::Shrx { "24" } else { "0x0808" }).unwrap();
     if style == Style::Bextr {
         writeln!(o, "  mov eax, 0x0810").unwrap();
     }
@@ -147,7 +164,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     let mut o = String::new();
     if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64") {
-        for style in [Style::Ah, Style::Bextr] {
+        for style in [Style::Ah, Style::Bextr, Style::Shrx] {
             for n in 1..=MAX_LANES {
                 function(&mut o, style, n);
             }

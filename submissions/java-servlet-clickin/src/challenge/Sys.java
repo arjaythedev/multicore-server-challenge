@@ -47,6 +47,7 @@ public final class Sys {
     public static final int EPOLLOUT = 0x4;
     public static final int EPOLLERR = 0x8;
     public static final int EPOLLHUP = 0x10;
+    public static final int EPOLLET = 1 << 31;
     public static final int EINTR = 4;
     public static final int EAGAIN = 11;
     public static final int ENOMEM = 12;
@@ -433,6 +434,22 @@ public final class Sys {
     private static final class Priority {
         static final MethodHandle GETTID = fn("gettid", FunctionDescriptor.of(JAVA_INT));
         static final MethodHandle SETPRIORITY = fn("setpriority", FunctionDescriptor.of(JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT), ERRNO);
+        static final MethodHandle SCHED_SETSCHEDULER = fn("sched_setscheduler", FunctionDescriptor.of(JAVA_INT, JAVA_INT, JAVA_INT, ADDRESS), ERRNO);
+    }
+
+    private static final int SCHED_IDLE = 5;
+
+    /** Moves the calling thread to SCHED_IDLE: it runs only on CPU time no other thread wants. 0 or errno. */
+    public static int idleCurrentThread() {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment state = arena.allocate(STATE_LAYOUT);
+            MemorySegment param = arena.allocate(JAVA_INT);
+            int tid = (int) Priority.GETTID.invokeExact();
+            int result = (int) Priority.SCHED_SETSCHEDULER.invokeExact(state, tid, SCHED_IDLE, param);
+            return result == 0 ? 0 : (int) ERRNO_VALUE.get(state, 0L);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
     }
 
     public static int niceCurrentThread(int nice) {

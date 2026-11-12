@@ -302,19 +302,35 @@ export const registerStatements = (pool: PgPool): boolean => {
  * (with `author` beside each `id`): its article ids and their authors, newest
  * first, as two arrays.
  */
-const planPage = (pageIds: string): string =>
-  "CROSS JOIN LATERAL (SELECT array_agg(p.id ORDER BY p.id DESC) AS ids, array_agg(p.author ORDER BY p.id DESC) AS authors FROM (" +
+const planPage = (pageIds: string): string => "CROSS JOIN LATERAL (" + pageArrays(pageIds) + ") x"
+
+/** The two arrays of a page, from the ids `pageIds` selects, with `author` beside each `id`. */
+const pageArrays = (pageIds: string): string =>
+  "SELECT array_agg(p.id ORDER BY p.id DESC) AS ids, array_agg(p.author ORDER BY p.id DESC) AS authors FROM (" +
   pageIds +
-  ") p) x"
+  ") p"
+
+/**
+ * A plan's list page whose ids `articleIds` selects (as `article_id`) from a
+ * table that does not hold their authors: the page's ids, then their authors
+ * from one index scan of the articles over all of them (`= ANY`), instead of
+ * one primary-key lookup for each.
+ */
+const planPageOf = (articleIds: string): string =>
+  "CROSS JOIN LATERAL (SELECT array_agg(i.article_id ORDER BY i.article_id DESC) AS ids FROM (" +
+  articleIds +
+  ") i) x0 CROSS JOIN LATERAL (SELECT x0.ids, " +
+  "(SELECT array_agg(a.author_id ORDER BY a.id DESC) FROM articles a WHERE a.id = ANY(x0.ids)) AS authors) x"
 
 /**
  * A plan's statement for one kind of list: a row (-k, count) for each count
  * key `k` of `$1`, and a row (k, NULL, ids, authors) for each page key `k`
  * of the parallel arrays `$2` (the key), `$3` (limits) and `$4` (offsets).
  * `keyJoin` finds the key's row (`t` or `u`, NULL when there is none),
- * `count` the capped count over it, and `pageIds` the page.
+ * `count` the capped count over it, and `page` (`planPage` or `planPageOf`)
+ * the page.
  */
-const planList = (keyType: string, keyJoin: string, count: string, pageIds: string): string =>
+const planList = (keyType: string, keyJoin: string, count: string, page: string): string =>
   "SELECT -q.k, (SELECT count(*) FROM (" +
   count +
   " LIMIT 1000) s), NULL::int8[], NULL::int8[] FROM unnest($1::" +
@@ -326,7 +342,7 @@ const planList = (keyType: string, keyJoin: string, count: string, pageIds: stri
   "[], $3::int8[], $4::int8[]) WITH ORDINALITY q(key, lim, off, k) " +
   keyJoin +
   " " +
-  planPage(pageIds)
+  page
 
 /** Registers the plans' statements on `pool`; false when the pool refused one. */
 export const registerPlanStatements = (pool: PgPool): boolean => {
@@ -354,8 +370,9 @@ export const registerPlanStatements = (pool: PgPool): boolean => {
         "text",
         "LEFT JOIN tags t ON t.name = q.key",
         "SELECT 1 FROM article_tags at WHERE at.tag_id = t.id",
-        "SELECT a.id, a.author_id AS author FROM (SELECT at.article_id FROM article_tags at WHERE at.tag_id = t.id " +
-          "ORDER BY at.article_id DESC LIMIT q.lim OFFSET q.off) i JOIN articles a ON a.id = i.article_id"
+        planPageOf(
+          "SELECT at.article_id FROM article_tags at WHERE at.tag_id = t.id ORDER BY at.article_id DESC LIMIT q.lim OFFSET q.off"
+        )
       ),
       none
     ) && ok
@@ -366,7 +383,9 @@ export const registerPlanStatements = (pool: PgPool): boolean => {
         "text",
         "LEFT JOIN users u ON u.username = q.key",
         "SELECT 1 FROM articles a WHERE a.author_id = u.id",
-        "SELECT a.id, a.author_id AS author FROM articles a WHERE a.author_id = u.id ORDER BY a.id DESC LIMIT q.lim OFFSET q.off"
+        planPage(
+          "SELECT a.id, a.author_id AS author FROM articles a WHERE a.author_id = u.id ORDER BY a.id DESC LIMIT q.lim OFFSET q.off"
+        )
       ),
       none
     ) && ok
@@ -377,8 +396,9 @@ export const registerPlanStatements = (pool: PgPool): boolean => {
         "text",
         "LEFT JOIN users u ON u.username = q.key",
         "SELECT 1 FROM favorites f WHERE f.user_id = u.id",
-        "SELECT a.id, a.author_id AS author FROM (SELECT f.article_id FROM favorites f WHERE f.user_id = u.id " +
-          "ORDER BY f.article_id DESC LIMIT q.lim OFFSET q.off) i JOIN articles a ON a.id = i.article_id"
+        planPageOf(
+          "SELECT f.article_id FROM favorites f WHERE f.user_id = u.id ORDER BY f.article_id DESC LIMIT q.lim OFFSET q.off"
+        )
       ),
       none
     ) && ok
@@ -390,6 +410,9 @@ export const registerPlanStatements = (pool: PgPool): boolean => {
   // and one with 1,000 articles proves its followers' count without a count.
   // An idea from the challenge's rust-epoll-WorriedArrow and
   // rust-epoll-theCatWisel submissions; the SQL follows the latter's.
+  // A page with a floor is one index scan over all of the viewer's followees
+  // (`= ANY`) down to the floor, rather than one walk for each: what it reads
+  // is what the walks would have kept.
   ok =
     pool.register(
       "plan_feed",
@@ -405,10 +428,17 @@ export const registerPlanStatements = (pool: PgPool): boolean => {
         "FROM unnest($1::int8[]) WITH ORDINALITY c(key, k) JOIN u ON u.key = c.key CROSS JOIN capped " +
         "UNION ALL SELECT w.k, NULL::int8, x.ids, x.authors FROM w JOIN u ON u.key = w.key " +
         "CROSS JOIN LATERAL (SELECT COALESCE(max(h.floor_id), 0::int8) AS floor_id FROM hubs h WHERE h.fid = ANY(u.fids)) fl " +
-        planPage(
+        "CROSS JOIN LATERAL (SELECT z.ids, z.authors FROM (" +
+        pageArrays(
+          "SELECT a2.id, a2.author_id AS author FROM articles a2 WHERE a2.author_id = ANY(u.fids) AND a2.id >= fl.floor_id " +
+            "ORDER BY a2.id DESC LIMIT w.lim OFFSET w.off"
+        ) +
+        ") z WHERE fl.floor_id > 0 UNION ALL SELECT z.ids, z.authors FROM (" +
+        pageArrays(
           "SELECT y.id, fid AS author FROM unnest(u.fids) fid CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 " +
             "WHERE a2.author_id = fid AND a2.id >= fl.floor_id ORDER BY a2.id DESC LIMIT (w.lim + w.off)) y ORDER BY y.id DESC LIMIT w.lim OFFSET w.off"
-        ),
+        ) +
+        ") z WHERE fl.floor_id = 0) x",
       none
     ) && ok
   // Every tag by name, once a plan: the tag list's answer, and the names, in
@@ -420,14 +450,20 @@ export const registerPlanStatements = (pool: PgPool): boolean => {
   // rows come in binary (`bindStartBinary`): the id, the count, the two times
   // and the tag ids (an `int4[]`, read by `PgBinaryArray`) are sent as they
   // are stored instead of formatted as text.
+  //
+  // `$1` comes sorted, and each table is read by one index scan over all of
+  // it (`= ANY`), which goes from one id to the next along the leaf pages
+  // instead of descending from the root for each, the articles merge-joined
+  // to their tag ids; `$2` is the ids whose body is shown, those of article
+  // pages that group A did not already read.
   ok =
     pool.register(
       "plan_meta",
-      "SELECT a.id, a.slug, a.title, a.description, " +
-        "ARRAY(SELECT at.tag_id FROM article_tags at WHERE at.article_id = a.id), " +
-        "a.created_at, a.updated_at, " +
-        "CASE WHEN q.with_body THEN a.body END " +
-        "FROM unnest($1::int8[], $2::bool[]) q(id, with_body) JOIN articles a ON a.id = q.id",
+      "SELECT a.id, a.slug, a.title, a.description, t.tag_ids, a.created_at, a.updated_at, " +
+        "CASE WHEN a.id = ANY($2::int8[]) THEN a.body END " +
+        "FROM articles a LEFT JOIN (SELECT at.article_id, array_agg(at.tag_id) AS tag_ids FROM article_tags at " +
+        "WHERE at.article_id = ANY($1::int8[]) GROUP BY at.article_id) t ON t.article_id = a.id " +
+        "WHERE a.id = ANY($1::int8[])",
       none
     ) && ok
   // Each author of a plan's articles and comments, once, however many rows of
@@ -440,37 +476,53 @@ export const registerPlanStatements = (pool: PgPool): boolean => {
     ) && ok
   // Each article's favorite count, for a worker's count lane (plan.ts
   // `CountRun`): the costliest column of `plan_meta`, a walk of the article's
-  // index entries and, for the pages writes have touched, its heap.
+  // index entries and, for the pages writes have touched, its heap. One index
+  // scan over the sorted ids (`= ANY`), as `plan_meta`'s; an article with no
+  // favorite has no row, and its count stays 0.
   ok =
     pool.register(
       "plan_counts",
-      "SELECT q.id, (SELECT count(*) FROM favorites f WHERE f.article_id = q.id) FROM unnest($1::int8[]) q(id)",
+      "SELECT f.article_id, count(*) FROM favorites f WHERE f.article_id = ANY($1::int8[]) GROUP BY f.article_id",
       none
     ) && ok
   // The flags: (0, viewer, article) for each favorite asked about that
   // exists, (1, viewer, user) for each follow; each viewer's in one range
-  // scan of the primary key over its ids. Each viewer's ids come as one
-  // `int8[]` literal, grouped by the plan: regrouping (viewer, id) pairs
-  // here took half the statement's time.
+  // scan of the primary key over its ids. For each kind, the viewers come as
+  // one array, their ids grouped by viewer as one more, and each viewer's
+  // window of those as two more, all of them binary: regrouping (viewer, id)
+  // pairs here took half the statement's time, and a text array of ids for
+  // each viewer, parsed twice, a sixth of what is left.
   ok =
     pool.register(
       "plan_flags",
-      "SELECT 0::int8, g.v, f.article_id FROM unnest($1::int8[], $2::text[]) g(v, ids) " +
-        "CROSS JOIN LATERAL (SELECT f.article_id FROM favorites f WHERE f.user_id = g.v AND f.article_id = ANY(g.ids::int8[])) f " +
-        "UNION ALL SELECT 1::int8, g.v, fo.followee_id FROM unnest($1::int8[], $3::text[]) g(v, ids) " +
-        "CROSS JOIN LATERAL (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = g.v AND fo.followee_id = ANY(g.ids::int8[])) fo",
+      "SELECT 0::int8, g.v, f.article_id FROM unnest($1::int8[], $3::int4[], $4::int4[]) g(v, lo, hi) " +
+        "CROSS JOIN LATERAL (SELECT f.article_id FROM favorites f WHERE f.user_id = g.v AND f.article_id = ANY(($2::int8[])[g.lo:g.hi])) f " +
+        "UNION ALL SELECT 1::int8, g.v, fo.followee_id FROM unnest($5::int8[], $7::int4[], $8::int4[]) g(v, lo, hi) " +
+        "CROSS JOIN LATERAL (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = g.v AND fo.followee_id = ANY(($6::int8[])[g.lo:g.hi])) fo",
       none
     ) && ok
   return ok
 }
 
-/** A plan's batcher of articles by slug: each distinct slug's id and author, no row when there is none. */
+/**
+ * A plan's batcher of articles by slug: each distinct slug's row, no row when
+ * there is none. Its columns are `plan_meta`'s, in that order, with the body,
+ * and then the author: group B writes the article from it instead of reading
+ * it again by id.
+ */
 export const planArticleBatch = (maxRequests: i32): PgBatchConfig =>
-  planBatch("plan_article", "SELECT a.id, a.author_id FROM articles a WHERE a.slug = q.key", "", maxRequests)
+  planBatchUnsorted(
+    "plan_article",
+    "SELECT a.id, a.slug, a.title, a.description, " +
+      "ARRAY(SELECT at.tag_id FROM article_tags at WHERE at.article_id = a.id) AS tag_ids, " +
+      "a.created_at, a.updated_at, a.body, a.author_id FROM articles a WHERE a.slug = q.key",
+    "",
+    maxRequests
+  )
 
 /** A plan's batcher of profiles by username: the user's id and profile, no row when there is none. */
 export const planProfileBatch = (maxRequests: i32): PgBatchConfig =>
-  planBatch("plan_profile", "SELECT u.id, u.username, u.bio, u.image FROM users u WHERE u.username = q.key", "", maxRequests)
+  planBatchUnsorted("plan_profile", "SELECT u.id, u.username, u.bio, u.image FROM users u WHERE u.username = q.key", "", maxRequests)
 
 /**
  * A plan's batcher of comments by slug: the article's newest comments, with
@@ -487,6 +539,17 @@ export const planCommentBatch = (maxRequests: i32): PgBatchConfig =>
     "t.created_at DESC, t.id DESC",
     maxRequests
   )
+
+/**
+ * A batcher whose statement leaves its rows in the order they come, with no
+ * `ORDER BY` and no Sort node over them (Nish 0.35.0's `sorted`): for a
+ * read of at most one row a key, which needs no order among them.
+ */
+const planBatchUnsorted = (name: string, select: string, orderBy: string, maxRequests: i32): PgBatchConfig => {
+  const c: PgBatchConfig = planBatch(name, select, orderBy, maxRequests)
+  c.sorted = false
+  return c
+}
 
 const planBatch = (name: string, select: string, orderBy: string, maxRequests: i32): PgBatchConfig => {
   const c = new PgBatchConfig()

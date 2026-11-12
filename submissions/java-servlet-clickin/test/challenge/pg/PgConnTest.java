@@ -458,38 +458,31 @@ public final class PgConnTest {
         conn.sendReadRound();
         ByteArrayOutputStream wire = new ByteArrayOutputStream();
         DataOutputStream d = new DataOutputStream(wire);
-        message(
-                d,
-                'D',
-                new byte[] {
-                    0,
-                    2,
-                    0,
-                    0,
-                    0,
-                    4,
-                    0,
-                    0,
-                    0,
-                    1,
-                    -1,
-                    -1,
-                    -1,
-                    -1
-                });
-        message(d, 'D', tagged(3, "new"));
-        message(d, 'D', tagged(3, "old"));
-        message(d, 'C', "SELECT 3\0".getBytes(StandardCharsets.UTF_8));
+        // shared rows: article 10 without comments, article 11 with two (authors 5 and 6), then one row per request,
+        // then each author once
+        message(d, 'D', new Row().int4(0).int8(10).nul().nul().nul().nul().nul().nul().nul().nul().nul().bytes());
+        message(d, 'D', new Row().int4(0).int8(11).int8(21).text("new").int8(1).int8(1).nul().nul().nul().int8(5).nul().bytes());
+        message(d, 'D', new Row().int4(0).int8(11).int8(20).text("old").int8(0).int8(0).nul().nul().nul().int8(6).nul().bytes());
+        message(d, 'D', new Row().int4(1).int8(10).nul().nul().nul().nul().nul().nul().nul().nul().int8s().bytes());
+        message(d, 'D', new Row().int4(3).int8(11).nul().nul().nul().nul().nul().nul().nul().nul().int8s(6).bytes());
+        message(d, 'D', new Row().int4(-1).int8(6).nul().nul().nul().nul().text("bob").nul().nul().nul().nul().bytes());
+        message(d, 'D', new Row().int4(-1).int8(5).nul().nul().nul().nul().text("ann").nul().nul().nul().nul().bytes());
+        message(d, 'C', "SELECT 7\0".getBytes(StandardCharsets.UTF_8));
         message(d, 'Z', new byte[] {'I'});
         feed(conn, wire);
         if (done.size() != 3
                 || q[0].rowCount() != 1
                 || !q[0].isNull(0, 0)
+                || q[0].columns(0) != 8
+                || q[0].boolAt(0, 7)
                 || q[1].rowCount() != 0
                 || q[2].rowCount() != 2
-                || !value(q[2]).equals("new")
-                || !new String(q[2].bytes(), q[2].offset(1, 0), q[2].length(1, 0), StandardCharsets.UTF_8)
-                        .equals("old")) {
+                || q[2].int8At(0, 0) != 21
+                || !text(q[2], 0, 1).equals("new")
+                || !text(q[2], 1, 1).equals("old")
+                || !text(q[2], 1, 4).equals("bob")
+                || q[2].boolAt(0, 7)
+                || !q[2].boolAt(1, 7)) {
             throw new AssertionError("comments routing");
         }
     }
@@ -523,45 +516,195 @@ public final class PgConnTest {
         conn.sendReadRound();
         ByteArrayOutputStream wire = new ByteArrayOutputStream();
         DataOutputStream d = new DataOutputStream(wire);
-        message(d, 'D', listRow(1, "new", 7));
-        message(d, 'D', listRow(1, "old", 7));
-        message(d, 'D', listRow(2, null, 7));
-        message(d, 'C', "SELECT 3\0".getBytes(StandardCharsets.UTF_8));
+        // shared rows: articles 102 (author 5) and 101 (author 6); request 1 lists both, request 2 (unit 3) an empty page
+        // article 102 has tags 1 and 3 (named "zeta" and "beta": id order is not name order), 101 none; the tags table
+        // comes last, in name order
+        message(d, 'D', listShared(102, 5, 1, 3));
+        message(d, 'D', listShared(101, 6));
+        message(d, 'D', listRequest(1, new long[] {102, 101}, new long[] {101}, new long[] {5}, 7));
+        message(d, 'D', listRequest(2, new long[] {}, new long[] {}, new long[] {}, 7));
+        message(d, 'D', tagRow(3, "beta"));
+        message(d, 'D', tagRow(2, "mid"));
+        message(d, 'D', tagRow(1, "zeta"));
+        message(d, 'C', "SELECT 7\0".getBytes(StandardCharsets.UTF_8));
         message(d, 'D', tagged(1, "alice"));
         message(d, 'C', "SELECT 1\0".getBytes(StandardCharsets.UTF_8));
         message(d, 'Z', new byte[] {'I'});
         feed(conn, wire);
         if (done.size() != 4
                 || q[0].rowCount() != 2
-                || !value(q[0]).equals("new")
-                || !new String(q[0].bytes(), q[0].offset(1, 0), q[0].length(1, 0), StandardCharsets.UTF_8)
-                        .equals("old")
-                || q[0].int8At(1, 1) != 7
+                || q[0].columns(0) != 14
+                || q[0].int8At(0, 0) != 102
+                || !text(q[0], 0, 1).equals("s102")
+                || q[0].int8At(1, 0) != 101
+                || q[0].int8At(0, 7) != 3
+                || q[0].boolAt(0, 8)
+                || !q[0].boolAt(1, 8)
+                || !q[0].boolAt(0, 12)
+                || q[0].boolAt(1, 12)
+                || !text(q[0], 1, 9).equals("u6")
+                || !tagNames(q[0], 0).equals("[beta, zeta]")
+                || q[0].length(1, 6) != 12
+                || q[0].int8At(1, 13) != 7
                 || q[2].rowCount() != 1
+                || q[2].columns(0) != 14
                 || !q[2].isNull(0, 0)
-                || q[2].int8At(0, 1) != 7
+                || q[2].length(0, 6) != 12
+                || q[2].int8At(0, 7) != 0
+                || q[2].boolAt(0, 8)
+                || q[2].boolAt(0, 12)
+                || q[2].int8At(0, 13) != 7
                 || !value(q[1]).equals("alice")
                 || q[3].rowCount() != 0) {
             throw new AssertionError("list and profile routing");
         }
     }
 
-    private static byte[] listRow(int tag, String value, long count) throws Exception {
-        ByteArrayOutputStream b = new ByteArrayOutputStream();
-        DataOutputStream d = new DataOutputStream(b);
-        d.writeShort(3);
-        d.writeInt(4);
-        d.writeInt(tag);
-        if (value == null) {
-            d.writeInt(-1);
-        } else {
-            byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+    private static byte[] listShared(long id, long author, int... tagIds) throws Exception {
+        return new Row().int4(0)
+                .int8(id)
+                .text("s" + id)
+                .text("t")
+                .text("d")
+                .int8(1)
+                .int8(2)
+                .int4s(tagIds)
+                .int8(3)
+                .text("u" + author)
+                .nul()
+                .nul()
+                .int8(author)
+                .nul()
+                .nul()
+                .nul()
+                .nul()
+                .bytes();
+    }
+
+    private static byte[] listRequest(int tag, long[] ids, long[] favorited, long[] followed, long count) throws Exception {
+        Row row = new Row().int4(tag);
+        for (int i = 0; i < 12; i++) {
+            row.nul();
+        }
+        return row.int8s(ids).int8s(favorited).int8s(followed).int8(count).bytes();
+    }
+
+    private static byte[] tagRow(int id, String name) throws Exception {
+        Row r = new Row().int4(-1).int8(id).text(name);
+        for (int i = 0; i < 14; i++) {
+            r.nul();
+        }
+        return r.bytes();
+    }
+
+    private static String tagNames(Query q, int row) {
+        List<String> names = new ArrayList<>();
+        for (int i = 0; i < q.arrayCount(row, 6); i++) {
+            int at = q.arrayElementOffset(row, 6, i);
+            names.add(new String(q.bytes(), at, q.arrayElementLength(at), StandardCharsets.UTF_8));
+        }
+        return names.toString();
+    }
+
+    private static String text(Query q, int row, int column) {
+        return new String(q.bytes(), q.offset(row, column), q.length(row, column), StandardCharsets.UTF_8);
+    }
+
+    /** A binary DataRow body, built column by column. */
+    private static final class Row {
+        private final ByteArrayOutputStream b = new ByteArrayOutputStream();
+        private final DataOutputStream d = new DataOutputStream(b);
+        private int columns;
+
+        Row int4(int v) throws Exception {
+            d.writeInt(4);
+            d.writeInt(v);
+            columns++;
+            return this;
+        }
+
+        Row int8(long v) throws Exception {
+            d.writeInt(8);
+            d.writeLong(v);
+            columns++;
+            return this;
+        }
+
+        Row text(String v) throws Exception {
+            byte[] bytes = v.getBytes(StandardCharsets.UTF_8);
             d.writeInt(bytes.length);
             d.write(bytes);
+            columns++;
+            return this;
         }
-        d.writeInt(8);
-        d.writeLong(count);
-        return b.toByteArray();
+
+        Row nul() throws Exception {
+            d.writeInt(-1);
+            columns++;
+            return this;
+        }
+
+        Row emptyTextArray() throws Exception {
+            d.writeInt(12);
+            d.writeInt(0);
+            d.writeInt(0);
+            d.writeInt(25);
+            columns++;
+            return this;
+        }
+
+        Row int4s(int... values) throws Exception {
+            if (values.length == 0) {
+                d.writeInt(12);
+                d.writeInt(0);
+                d.writeInt(0);
+                d.writeInt(23);
+            } else {
+                d.writeInt(20 + 8 * values.length);
+                d.writeInt(1);
+                d.writeInt(0);
+                d.writeInt(23);
+                d.writeInt(values.length);
+                d.writeInt(1);
+                for (int v : values) {
+                    d.writeInt(4);
+                    d.writeInt(v);
+                }
+            }
+            columns++;
+            return this;
+        }
+
+        Row int8s(long... values) throws Exception {
+            if (values.length == 0) {
+                d.writeInt(12);
+                d.writeInt(0);
+                d.writeInt(0);
+                d.writeInt(20);
+            } else {
+                d.writeInt(20 + 12 * values.length);
+                d.writeInt(1);
+                d.writeInt(0);
+                d.writeInt(20);
+                d.writeInt(values.length);
+                d.writeInt(1);
+                for (long v : values) {
+                    d.writeInt(8);
+                    d.writeLong(v);
+                }
+            }
+            columns++;
+            return this;
+        }
+
+        byte[] bytes() {
+            byte[] body = b.toByteArray();
+            byte[] out = new byte[body.length + 2];
+            out[0] = (byte) (columns >>> 8);
+            out[1] = (byte) columns;
+            System.arraycopy(body, 0, out, 2, body.length);
+            return out;
+        }
     }
 
     private static void batchParameters() throws Exception {

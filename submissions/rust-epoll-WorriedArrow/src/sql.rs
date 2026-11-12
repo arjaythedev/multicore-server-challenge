@@ -2,7 +2,7 @@
 //! the key's 1-based ordinal `k`. Results match SPEC.md's reference SQL; ordering of rows within a key is restored
 //! in the application where the statement doesn't order them.
 
-use crate::pg::{INT8_ARRAY, TEXT_ARRAY};
+use crate::pg::{INT4_ARRAY, INT8_ARRAY, TEXT_ARRAY};
 
 pub struct Stmt {
     pub name: &'static str,
@@ -17,6 +17,13 @@ fn s(name: &'static str, sql: impl Into<String>, types: &'static [u32]) -> Stmt 
 /// A count capped at 1,000, in one pass over at most 1,000 index entries.
 fn capped(rows: &str) -> String {
     format!("(SELECT count(*) FROM ({rows} LIMIT 1000) s)")
+}
+
+/// A count capped at 1,000 for keys that usually reach it (tags): skipping 999 entries, with no aggregate per entry,
+/// settles a key with 1,000 or more about a quarter faster than counting them; only smaller keys are counted, in a
+/// second pass over fewer than 1,000. Keys that are usually small (authors, favoriters) would pay that pass twice.
+fn capped_big(rows: &str) -> String {
+    format!("(CASE WHEN EXISTS ({rows} OFFSET 999) THEN 1000::int8 ELSE (SELECT count(*) FROM ({rows}) s) END)")
 }
 
 /// Article row columns, after `k`: [id, author_id, slug, title, description, created_at, updated_at].
@@ -58,11 +65,21 @@ pub fn read_statements() -> Vec<Stmt> {
         ),
         s(
             "cmts",
-            "SELECT r.k, a.id, c.id, c.body, c.created_at, c.updated_at, c.author_id \
-             FROM unnest($1::text[]) WITH ORDINALITY r(slug, k) JOIN articles a ON a.slug = r.slug \
-             LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id FROM comments c \
-               WHERE c.article_id = a.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true",
-            &[TEXT_ARRAY],
+            "WITH t AS MATERIALIZED ( \
+               SELECT r.k, c.id, c.body, c.created_at, c.updated_at, c.author_id \
+               FROM unnest($1::text[]) WITH ORDINALITY r(slug, k) JOIN articles a ON a.slug = r.slug \
+               LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id FROM comments c \
+                 WHERE c.article_id = a.id ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true) \
+             SELECT 0::int8, t.k, t.id, t.body, t.created_at, t.updated_at, t.author_id, NULL::text, NULL::text FROM t \
+             UNION ALL \
+             SELECT 1::int8, u.id, NULL::int8, u.username, NULL::timestamptz, NULL::timestamptz, NULL::int8, u.bio, u.image \
+             FROM users u WHERE u.id = ANY(ARRAY(SELECT DISTINCT t.author_id FROM t WHERE t.author_id IS NOT NULL ORDER BY 1)) \
+             UNION ALL \
+             SELECT 2::int8, p.v, fo.followee_id, NULL::text, NULL::timestamptz, NULL::timestamptz, NULL::int8, NULL::text, NULL::text \
+             FROM (SELECT t.k, array_agg(t.author_id) AS aids FROM t WHERE t.author_id IS NOT NULL GROUP BY t.k) ta \
+             JOIN unnest($2::int8[], $3::int8[]) p(v, k) ON p.k = ta.k \
+             CROSS JOIN LATERAL (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = p.v AND fo.followee_id = ANY(ta.aids)) fo",
+            &[TEXT_ARRAY, INT8_ARRAY, INT8_ARRAY],
         ),
         // Lists: one statement per filter returns the capped counts (k <= 0: -k is the count key, the count in
         // column 1) and the page rows (k > 0, the article row layout above). The global count walks the primary key
@@ -88,7 +105,7 @@ pub fn read_statements() -> Vec<Stmt> {
                  CROSS JOIN LATERAL (SELECT at.article_id FROM article_tags at WHERE at.tag_id = t.id \
                    ORDER BY at.article_id DESC LIMIT r.lim OFFSET r.off) p \
                  JOIN articles a ON a.id = p.article_id",
-                capped("SELECT 1 FROM article_tags at WHERE at.tag_id = t.id")
+                capped_big("SELECT 1 FROM article_tags at WHERE at.tag_id = t.id")
             ),
             &[TEXT_ARRAY, TEXT_ARRAY, INT8_ARRAY, INT8_ARRAY],
         ),
@@ -131,15 +148,14 @@ pub fn read_statements() -> Vec<Stmt> {
             format!(
                 "WITH u AS MATERIALIZED ( \
                    SELECT r.k, r.v, ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.v) AS fids, \
-                     COALESCE((SELECT max(p.lim + p.off) FROM unnest($2::int8[], $3::int8[], $4::int8[]) p(v, lim, off) \
-                       WHERE p.v = r.v), 1) AS depth \
-                   FROM unnest($1::int8[]) WITH ORDINALITY r(v, k)), \
+                     r.depth \
+                   FROM unnest($1::int8[], $5::int8[]) WITH ORDINALITY r(v, depth, k)), \
                  hubs AS MATERIALIZED ( \
                    SELECT h.fid, \
                      (SELECT a.id FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC LIMIT 1 OFFSET h.depth - 1) AS floor_id, \
                      EXISTS (SELECT 1 FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC LIMIT 1 OFFSET 999) AS big \
                    FROM (SELECT f.fid, max(u.depth) AS depth FROM u, unnest(u.fids) f(fid) \
-                     GROUP BY f.fid HAVING count(*) >= 2 ORDER BY count(*) DESC, f.fid LIMIT 32) h), \
+                     GROUP BY f.fid HAVING count(*) >= 2 ORDER BY count(*) DESC, f.fid LIMIT 48) h), \
                  big AS MATERIALIZED (SELECT ARRAY(SELECT fid FROM hubs WHERE big) AS fids) \
                  SELECT -u.k, CASE WHEN u.fids && (SELECT fids FROM big) THEN 1000::int8 \
                    ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = ANY(u.fids) LIMIT 1000) s) END, {PAD} \
@@ -154,7 +170,41 @@ pub fn read_statements() -> Vec<Stmt> {
                      ORDER BY a2.id DESC LIMIT p.lim + p.off) y \
                    ORDER BY y.id DESC LIMIT p.lim OFFSET p.off) x"
             ),
-            &[INT8_ARRAY, INT8_ARRAY, INT8_ARRAY, INT8_ARRAY],
+            &[INT8_ARRAY, INT8_ARRAY, INT8_ARRAY, INT8_ARRAY, INT8_ARRAY],
+        ),
+        // Personal feeds, merged in the server: the same counts, hubs and floors as "feed", then each distinct
+        // followee of the batch's viewers once, its newest ids down to the lowest floor and the deepest page among
+        // its followers. Two viewers sharing a followee share its scan; the viewer's page is merged from the arrays.
+        // Rows: [0, viewer k, count], [1, viewer k, floor, -, followees], [2, followee, -, -, ids].
+        s(
+            "feedm",
+            "WITH u AS MATERIALIZED ( \
+               SELECT r.k, r.v, ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.v) AS fids, \
+                 r.depth \
+               FROM unnest($1::int8[], $5::int8[]) WITH ORDINALITY r(v, depth, k)), \
+             hubs AS MATERIALIZED ( \
+               SELECT h.fid, \
+                 (SELECT a.id FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC LIMIT 1 OFFSET h.depth - 1) AS floor_id, \
+                 EXISTS (SELECT 1 FROM articles a WHERE a.author_id = h.fid ORDER BY a.id DESC LIMIT 1 OFFSET 999) AS big \
+               FROM (SELECT f.fid, max(u.depth) AS depth FROM u, unnest(u.fids) f(fid) \
+                 GROUP BY f.fid HAVING count(*) >= 2 ORDER BY count(*) DESC, f.fid LIMIT 48) h), \
+             big AS MATERIALIZED (SELECT ARRAY(SELECT fid FROM hubs WHERE big) AS fids), \
+             uf AS MATERIALIZED ( \
+               SELECT u.k, u.fids, u.depth, \
+                 COALESCE((SELECT max(h.floor_id) FROM hubs h WHERE h.fid = ANY(u.fids)), 0) AS floor_id FROM u), \
+             ff AS MATERIALIZED ( \
+               SELECT f.fid, max(uf.depth) AS depth, min(uf.floor_id) AS floor_id FROM uf, unnest(uf.fids) f(fid) \
+               GROUP BY f.fid ORDER BY f.fid) \
+             SELECT 0::int8, u.k, CASE WHEN u.fids && (SELECT fids FROM big) THEN 1000::int8 \
+               ELSE (SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = ANY(u.fids) LIMIT 1000) s) END, \
+               NULL::text, NULL::int8[] FROM u \
+             UNION ALL \
+             SELECT 1::int8, uf.k, uf.floor_id, NULL::text, uf.fids FROM uf \
+             UNION ALL \
+             SELECT 2::int8, ff.fid, NULL::int8, NULL::text, \
+               ARRAY(SELECT a.id FROM articles a WHERE a.author_id = ff.fid AND a.id >= ff.floor_id ORDER BY a.id DESC LIMIT ff.depth) \
+             FROM ff",
+            &[INT8_ARRAY, INT8_ARRAY, INT8_ARRAY, INT8_ARRAY, INT8_ARRAY],
         ),
         // ---- phase B: enrichment over the union of everything phase A referenced ----
         // Article columns for articles phase A only returned ids for (feed pages), in the page-row layout.
@@ -175,17 +225,19 @@ pub fn read_statements() -> Vec<Stmt> {
             &[INT8_ARRAY, INT8_ARRAY],
         ),
         // Viewer flags: (0, viewer, article) for each favorited pair asked about, (1, viewer, followee) for each
-        // followed pair. Each viewer's candidates go in one primary-key range scan (= ANY) instead of a probe each.
+        // followed pair. Each viewer's candidates go in one primary-key range scan (= ANY) instead of a probe each;
+        // the server groups the pairs by viewer and sends each one's slice of a flat target array (the form of
+        // theCatWisel's #201), so Postgres doesn't aggregate them.
         s(
             "flags",
-            "WITH p AS (SELECT x.v, array_agg(x.a) AS aa FROM unnest($1::int8[], $2::int8[]) x(v, a) GROUP BY x.v), \
-             q AS (SELECT x.v, array_agg(x.u) AS uu FROM unnest($3::int8[], $4::int8[]) x(v, u) GROUP BY x.v) \
-             SELECT 0::int8, p.v, f.article_id FROM p CROSS JOIN LATERAL \
-               (SELECT f.article_id FROM favorites f WHERE f.user_id = p.v AND f.article_id = ANY(p.aa)) f \
+            "SELECT 0::int8, p.v, f.article_id FROM unnest($1::int8[], $3::int4[], $4::int4[]) p(v, s, e) \
+             CROSS JOIN LATERAL (SELECT f.article_id FROM favorites f \
+               WHERE f.user_id = p.v AND f.article_id = ANY(($2::int8[])[p.s : p.e])) f \
              UNION ALL \
-             SELECT 1::int8, q.v, fo.followee_id FROM q CROSS JOIN LATERAL \
-               (SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = q.v AND fo.followee_id = ANY(q.uu)) fo",
-            &[INT8_ARRAY, INT8_ARRAY, INT8_ARRAY, INT8_ARRAY],
+             SELECT 1::int8, q.v, fo.followee_id FROM unnest($5::int8[], $7::int4[], $8::int4[]) q(v, s, e) \
+             CROSS JOIN LATERAL (SELECT fo.followee_id FROM follows fo \
+               WHERE fo.follower_id = q.v AND fo.followee_id = ANY(($6::int8[])[q.s : q.e])) fo",
+            &[INT8_ARRAY, INT8_ARRAY, INT4_ARRAY, INT4_ARRAY, INT8_ARRAY, INT8_ARRAY, INT4_ARRAY, INT4_ARRAY],
         ),
     ]
 }
@@ -343,4 +395,16 @@ pub fn write_statements() -> Vec<Stmt> {
             &[crate::pg::INT8, crate::pg::TEXT, crate::pg::INT8],
         ),
     ]
+}
+
+#[cfg(test)]
+mod dump {
+    /// Prints every statement, for EXPLAIN by hand: cargo test --release dump_sql -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn dump_sql() {
+        for s in super::read_statements().into_iter().chain(super::write_statements()) {
+            println!("--@{}\n{};", s.name, s.sql);
+        }
+    }
 }

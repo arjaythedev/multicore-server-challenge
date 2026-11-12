@@ -13,7 +13,29 @@ pub struct ReplyTo {
 pub struct Response {
     pub to: ReplyTo,
     pub status: u16,
-    pub body: Vec<u8>,
+    pub body: Body,
+}
+
+/// A response body: its own bytes, or bytes several responses of one batch share (identical answers, rendered once).
+pub enum Body {
+    Own(Vec<u8>),
+    Shared(std::sync::Arc<Vec<u8>>),
+}
+
+impl std::ops::Deref for Body {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Body::Own(v) => v,
+            Body::Shared(a) => a,
+        }
+    }
+}
+
+impl From<Vec<u8>> for Body {
+    fn from(v: Vec<u8>) -> Body {
+        Body::Own(v)
+    }
 }
 
 pub struct Outbox {
@@ -72,7 +94,7 @@ pub fn send(to: ReplyTo, status: u16, body: Vec<u8>) {
     let was_empty = {
         let mut q = ob.queue.lock().unwrap();
         let e = q.is_empty();
-        q.push(Response { to, status, body });
+        q.push(Response { to, status, body: body.into() });
         e
     };
     if was_empty {
@@ -113,5 +135,5 @@ pub fn error_body(msg: &str) -> Vec<u8> {
 }
 
 pub fn error(to: ReplyTo, status: u16, msg: &str) -> Response {
-    Response { to, status, body: error_body(msg) }
+    Response { to, status, body: error_body(msg).into() }
 }

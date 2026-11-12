@@ -8,8 +8,8 @@ Front: direct
 | Web API | Jakarta Servlet 6.1 (`jakarta.servlet-api` 6.1.0 from Maven Central, sha256-pinned in `build.sh`): the app is one `HttpServlet` per resource (tags, users, profiles, articles), mapped by URL pattern, using the **async** API (`startAsync` / `AsyncContext.complete`) |
 | Servlet container / HTTP | Our own: HTTP/1.1 on Linux `epoll` through FFM (`java.lang.foreign`), one event loop per thread, with servlet mapping (exact, `/prefix/*`, default), `HttpServlet` method dispatch (405, HEAD, OPTIONS) and an error servlet for `sendError` |
 | Postgres driver | Our own v3 wire client: SCRAM-SHA-256, prepared statements, binary rows, pipelining, cross-request batching, group commit |
-| JSON, JWT, bcrypt | Our own: JSON written straight from Postgres's binary rows, allocation-free HS256 verify, bcrypt cost 10 with interleaved lanes |
-| Dependencies | `jakarta.servlet-api` (interfaces only). Build with `javac` only, no Maven/Gradle |
+| JSON, JWT, bcrypt | Our own: JSON written straight from Postgres's binary rows, allocation-free HS256 verify, bcrypt cost 10 with interleaved lanes; its cost loop in generated x86-64 assembly (or C) through FFM, Java kernels as fallback |
+| Dependencies | `jakarta.servlet-api` (interfaces only). Build with `javac` and `cc` (for `native/`; without it the Java kernels run), no Maven/Gradle |
 
 ```bash
 sudo bash install.sh     # Temurin 25 -> /opt/jdk
@@ -17,7 +17,7 @@ bash build.sh            # servlet API jar (pinned) + javac -> build/server.jar
 DATABASE_URL=postgres://... JWT_SECRET=... HOST=0.0.0.0 PORT=80 bash start.sh
 ```
 
-Linux only (it calls `epoll`, `eventfd` and `setpriority` directly).
+Linux only (it calls `epoll`, `eventfd`, `sched_setscheduler` and `setpriority` directly).
 
 ## Idea
 
@@ -28,7 +28,8 @@ against the Servlet API: standard `HttpServlet`s, in async mode, on a container 
 ## The container
 
 - **Event loops, not threads per request.** `LOOPS` (default cores/2) platform threads, each with its own epoll set and
-  its own `SO_REUSEPORT` listener (`TCP_DEFER_ACCEPT`, `TCP_NODELAY`). The loop parses the request and calls
+  its own `SO_REUSEPORT` listener (`TCP_DEFER_ACCEPT`, `TCP_NODELAY`). A connection is registered once, edge-triggered
+  for input and output, so a request costs no `epoll_ctl` calls (with level-triggered re-arming it cost two). The loop parses the request and calls
   the container on its own thread, which maps the path to a servlet and calls its `service(req, res)`. A handler that needs the database calls `req.startAsync()`, submits
   the query and returns; the result comes back to the same loop (lock-free queue + `eventfd`), the callback writes the
   JSON and calls `complete()`, and the response goes out in one `write`. Nothing ever blocks a loop, so no virtual
@@ -45,6 +46,10 @@ against the Servlet API: standard `HttpServlet`s, in async mode, on a container 
   while it holds a partial request or unsent output. Measured with JFR under load: a few hundred bytes per request at
   most; at ~25k req/s on the Hetzner box that is a short young GC every 6-8 s with a 2 GB heap (ParallelGC,
   pre-touched).
+- **Bulk JSON writes.** The JSON writer reserves space once for an ASCII prefix and copies unescaped UTF-8 runs in
+  bulk, finding the next byte to escape eight bytes at a time (one `long` compare per word); quotes, backslashes,
+  control bytes and non-ASCII raw strings still follow the original escaping and encoding.
+  This adds no response cache and preserves per-request data.
 - **Servlet mapping without a scan.** `Container.addServlet` takes exact, `/prefix/*` and default (`/`) patterns. A
   lookup hashes the path's first N segments once per registered depth, deepest first, into a table whose multiplier
   is searched at registration so patterns never collide, then checks the bytes: the cost does not grow with the number
@@ -73,24 +78,47 @@ against the Servlet API: standard `HttpServlet`s, in async mode, on a container 
   `plan_cache_mode = force_generic_plan` (a session `SET`): in `auto` mode Postgres kept re-planning the batch
   statements, whose array parameters make each custom plan look different, on almost every execution (~0.3 ms each).
 - **Reads are batched across requests.** A single dispatcher thread owns all read connections (8) and the write
-  connection (1). Each read connection has one round in flight; reads that arrive meanwhile wait (and wait up to
-  `READ_GATHER_US` = 30 ms for company, up to `READ_ROUND_MAX` = 4096 per round), then go out together: requests of a kind become **one** statement over arrays
+  connection (1). Each read connection has one round in flight; reads that arrive meanwhile wait for company, up to
+  `READ_ROUND_MAX` = 4096 per round, then go out together: requests of a kind become **one** statement over arrays
   of their parameters (`unnest(...) WITH ORDINALITY` + `LATERAL`), each row tagged with its request. Within a
   statement, each distinct article is decorated (tags, favorites count, author) **once**, however many requests in
   the batch show it; only `favorited` / `following` are per viewer. Nothing outlives the statement (rule 5).
+- **Three gather lanes.** Feeds and comments, the costliest batches per request and the ones that share the most
+  within a batch, gather for `READ_GATHER_FEED_US` / `READ_GATHER_COMMENTS_US` = 120 ms; every other read for
+  `READ_GATHER_US` = 40 ms. A free connection takes the lane whose window has run out and whose oldest read has waited
+  longest, and a round holds one lane's reads. Hetzner at 140k users, two runs each: 136.1 µs of app + Postgres CPU
+  per request at p95 182 ms (160 ms windows: 136.6 at p95 232 ms), against 151.1 at p95 144 ms with one 40 ms window
+  and tag names joined in SQL (an earlier box of the same type). The longer windows come from the leaders (#203
+  gathers 160 ms per lane, #168 80-100 ms).
+- **The dispatcher wakes only when it has something to do.** Each lane is its own FIFO, so a wakeup reads each lane's
+  head and size instead of scanning every waiting read several times. Before sleeping, the dispatcher publishes when it
+  will wake by itself (the next window's end, or a completion when every read connection is busy); a loop submitting a
+  read whose window ends later skips the `eventfd` wake. A Postgres socket is re-armed in epoll only when its interest
+  set changes, and a short read ends the read loop. The dispatcher used to make ~4.7 syscalls per request, nearly all
+  `epoll_ctl` re-arming every connection on every wakeup.
 - **A round's kinds run side by side.** A round's batch statements would otherwise run one after another on one
   backend, every request waiting for the round's last one, while the other read connections sat idle (locally 0.7
   busy at 20 ms gathers). The round is grouped by kind and each kind's batch goes whole to one of up to
   `READ_SPREAD` (3) idle connections, heaviest first onto the least loaded, so a round takes about its slowest
   statement (feed) instead of the sum.
-- **No repeated lookups inside a batch.** Tag names come from one join + `array_agg` grouped by article (the
-  per-article subquery's generic plan scanned and hashed all 200 tags for every article). The article and comments
+- **No repeated lookups inside a batch.** A list batch returns each article's tag *ids* (the `article_tags` primary
+  key) and, once, the tags table in name order; `Fanout` writes each article's names as the `text[]` the single
+  statement returns, ordered by the database's collation. Replaying 523 list batches captured on Hetzner (locally, full seed), joining the
+  names in SQL (hash join + `array_agg` ordered by name) cost 18% more Postgres time, and splitting the batches into
+  flat statements in the style of #203 (ids, then rows, then tags/counts/authors/flags by `= ANY`) gained nothing
+  beyond that. A comments batch returns each comment's author id and each distinct author's profile once (`= ANY`),
+  unsorted: joining users per comment row and sorting the union cost comments 14% more. The article and comments
   batches look each slug up once in a `MATERIALIZED` CTE and reuse that row (they used to look it up twice). A keyed
   list (`?tag=`, `?author=`, `?favorited=`) resolves and counts each distinct name once, however many requests in
-  the batch ask for it. The feed knows `following` is true for every author it walks and skips that probe.
+  the batch ask for it; a tag's count is proven by finding its 1,000th entry before it is counted (most tags have
+  more), which is cheaper than counting to 1,000. The global list's page depends only on its window, so a batch walks,
+  aggregates and attributes each distinct `(limit, offset)` once (about 5 per batch, against ~170 requests) and its
+  requests add only their viewer flags. A feed batch also reads each viewer's followees once and reuses them for hub selection, the
+  page floor, the page itself and its count. The feed knows `following` is true for every author it walks and skips that
+  probe; the followee arrays live only for the statement.
 - **The feed's count, proven instead of counted.** Most viewers follow an author with 1,000+ articles (82.6% of users),
-  so their capped count is 1,000. A batch picks the 4 authors most followed by its viewers, proves ≥ 1,000 articles
-  for each with one bounded index walk, and only the other viewers count.
+  so their capped count is 1,000. A batch picks the 32 authors most followed by its viewers (the same hubs that give the
+  page floors), proves ≥ 1,000 articles for each with one bounded index walk, and only the other viewers count.
 - **Group commit.** The write connection has one group in flight; writes that arrive meanwhile go out together, each
   request's statements back to back and one `Sync` at the end: one transaction, one WAL flush. Responses are sent
   only after the group commits (rule 6). If any statement fails, the group is rolled back by Postgres and its
@@ -114,14 +142,92 @@ Every login and sign-up verifies or hashes with cost 10 (rule 7). That is about 
 leaves most of the core idle: `BCrypt` runs up to 6 independent hashes interleaved in one straight-line kernel per
 width, each lane in its own locals (`BCryptLanes`, generated). Per hash on Hetzner's EPYC
 Milan: 1 lane 60 ms, 2 lanes 33, 3 lanes 25.8, 4 lanes 23.4, 5 lanes 23.0, 6 lanes 24.5 (the earlier hand-written
-2/4-lane loop: 38 / 29). The best width depends on the core's registers and load ports, so the pool times every width
-at startup (~2-5 s of one core, logged as `bcrypt: N lanes`) and takes the fastest, preferring fewer lanes within 3%. Hashes run on their own `BCRYPT_THREADS` (4) threads at `nice` 5 (`setpriority`
-per thread through FFM; `Thread.setPriority` is a no-op on Linux). One thread at a time gathers a set, waiting up to
+2/4-lane loop: 38 / 29).
+
+C2 cannot keep six interleaved Blowfish lanes in registers the way hand-scheduled code does, so the cost loop (the 2^10
+key and salt expansions, nearly all of a hash) runs natively: `native/bcrypt_x86_64.S`, generated by
+`tools/gen-bcrypt-x86.py` for BMI2 cores, or `native/bcrypt_cost.c` elsewhere, built by `build.sh` into
+`build/native/libbcrypt.so` and called through FFM (`NativeCost`). EPYC: 21.8 ms per hash for the best Java kernel,
+11.7 ms natively. Java keeps the password encoding, salted expansion, final encryption and formatting; only the
+expanded integer state crosses over and is wiped after every call. If the library can't be built or loaded, the Java
+kernels above run instead. `NativeCostTest` checks every kernel the CPU runs, at every width, against the Java kernels on random
+states; during development the native build also matched the Java one on 538 full hashes (mixed costs, `$2a/$2b/$2y`,
+Unicode, embedded NUL, 71/72/73-byte passwords). Passing only the expanded state keeps Java's password handling, so
+an embedded NUL is hashed exactly as before.
+
+The best width depends on the core's registers and load ports, so the pool times every width
+at startup (~2-5 s of one core, logged as `bcrypt: N lanes`) and takes the fastest, preferring fewer lanes within 3%. Hashes run on their own `BCRYPT_THREADS` (4) threads under `SCHED_IDLE`
+(`BCRYPT_SCHED=idle`, set per thread through FFM; `Thread.setPriority` is a no-op on Linux), so hashing gets only CPU
+time that Postgres and the event loops leave; `BCRYPT_SCHED=nice` uses `setpriority` at `BCRYPT_NICE` instead. One thread at a time gathers a set, waiting up to
 400 ms to fill its lanes, while the others hash: when every thread gathered on its own for 40 ms, ~20-30 logins/s
 came out one per thread and the 4-lane loop mostly ran a lone hash (locally 70 ms of CPU per hash, 32 ms after; bcrypt
 threads 1.39 -> 0.63 cores at 18k req/s). Logins wait longer for their set (p50 ~0.2 s), but they are 0.1% of requests.
 
 ## Results
+
+### Feed hubs, shared global windows, tag count proofs (2026-11-05)
+
+Batches captured locally on an aged full seed, with gather windows stretched 3.3x so that a batch holds about as many
+requests as on the official box (~140 feeds, ~170 global lists, ~60 tag lists), replayed as generic plans against a
+copy of the database taken at capture time, best of three, rows identical to the previous statements:
+
+| Change | Time of that kind | Postgres statement time |
+|---|--:|--:|
+| Global list: one walk per distinct `(limit, offset)` | -51% | -2.8% |
+| Feed: all 32 hubs prove the count (was the top 4; 48 or 64 cost more) | -9.5% | -2.8% |
+| Tag list: count proven by its 1,000th entry | -9% | -1.1% |
+
+Sharing windows in the tag, author and favorited lists made them 2-4% slower (few requests share a window there), so
+they keep one walk per request. Under load (same stretched windows, 10,000 users, two alternating runs each, logging
+off): Postgres 36.2 / 37.0 -> 34.4 / 35.3 µs per request, statement time -5.0%, buffers -5.1%, p95 unchanged.
+
+### Dispatcher wakeups and syscalls (2026-11-05)
+
+Official run of the previous build (`943e162`): 160,000 users held, 41,138 req/s, app 42% / Postgres 43% of the box,
+i.e. ~82 µs of app CPU per request against 45-68 for every entry above it, while its Postgres cost (~84) is within
+that group. Locally (8-CPU container, full seed, fixed load of 10,000 users at think-scale 0.2, ~12.5k req/s, per-thread
+CPU over 60 s, alternating runs):
+
+| | `943e162` (5 runs) | this build (2 runs) |
+|---|--:|--:|
+| Dispatcher syscalls per request | 4.7 (`epoll_ctl` 3.8) | 0.42 |
+| HTTP loop `write` calls per request | 1.32 | 1.02 |
+| Dispatcher CPU, µs/req | 7.4-7.6 | 4.1 |
+| HTTP loops, µs/req | 13.9-14.2 | 13.7-13.9 |
+| p95 (median of seconds) | 131-132 ms | 130-131 ms |
+
+At 16,000 users (~19.9k req/s, one run each) the old dispatcher's cost grew to 8.8 µs/req (its scans grew with the
+number of waiting reads) while this build's stayed at 4.1; p95 136 vs 134 ms, no errors in either.
+bcrypt (~15-18 µs/req here, varying with the login count of a run) is left out. Locally syscalls are cheap; on the
+official box the app's CPU per request is ~2.9x the local figure while Postgres's is ~2x, so the saving there is
+expected to be larger than the local 3.5 µs, but that is not measured.
+
+### Gather lanes, tag ids and comment authors (2026-11-05)
+
+Hetzner ccx33 (8 dedicated vCPU, as many as the official box; not the same machine), load from three boxes (cpx42, cpx42, ccx23). The run
+below follows the official search: **one database for the whole sequence**, nothing reset between steps, so the
+5-minute holds run on a database aged by the probes before them. Each probe has a 60 s ramp and 60 s measured; each
+hold has a 60 s ramp and 300 s measured. The CPU columns are µs per request on the box (`(app or Postgres %) × 8
+cores / req/s`).
+
+| Step | req/s | p95 | p99 | errors | box CPU | app µs | Postgres µs | |
+|---|--:|--:|--:|--:|--:|--:|--:|---|
+| probe 160,000 | 41,599 | 183 ms | 231 ms | 0 | 69% | 61.3 | 64.0 | pass |
+| probe 200,000 | 51,655 | 259 ms | 344 ms | 0 | 87% | 59.0 | 68.8 | pass |
+| probe 210,000 | 53,916 | 300 ms | 406 ms | 0 | 93% | 59.4 | 70.9 | pass |
+| probe 220,000 | 53,581 | 553 ms | 784 ms | 0.38% | 96% | 59.4 | 75.0 | fail (p95) |
+| hold 210,000 | 51,932 | 509 ms | 651 ms | 0.002% | 98% | 61.5 | 82.1 | fail (p95) |
+| **hold 200,000** | **50,002** | **472 ms** | **627 ms** | 0 | 98% | 61.8 | 88.8 | **pass** |
+
+Postgres time per request grows by 39% over the sequence. At 140k users, the aged database costs Postgres 103.2
+µs per request against 65.5 µs on a fresh one. The feed and the single-article batch double. In their plans the
+growth is heap fetches from index-only scans: `favorites_article_idx` while counting favorites (48k heap fetches
+in one feed batch), `articles_author_idx` while walking new articles, and `follows_pkey`. `follows` was 4%
+all-visible and `users` 0%. Any entry that counts favorites and walks these indexes this way meets the same growth on an aged database. Two remedies did not help:
+
+- Sharing each followee's scan across a feed batch's viewers matched today's rows in 35 of 35 batches. It cost
+  26% more on the aged database, because a shared scan must reach the lowest floor and the deepest page.
+- A tag-name lookup per tag with the sort in Postgres made lists 22% slower.
 
 ### Query work (this branch vs. the previous build, `a3d49a1`)
 
@@ -219,12 +325,14 @@ so compare with the leaderboard loosely.
   standard request/response API, each servlet's routing (through the container, keyword-like slugs included).
 - `test/http-smoke.sh`: pipelining, chunked bodies, HEAD without a body, 405, `AsyncContext.start` and `dispatch()`,
   peer address.
+- `BASE=http://127.0.0.1:3000 JWT_SECRET=... python3 test/feed-batch.py`: compares individual and simultaneous
+  feed requests, including duplicate viewers, absent viewers and deep offsets.
 
 ## Tuning knobs (all optional; defaults are what was measured)
 
-`LOOPS`, `READ_CONNS` (8), `WRITE_CONNS` (1), `READ_GATHER_US` (30000), `READ_ROUND_MAX` (4096), `READ_SPREAD` (3: how many idle read connections one round's kinds are spread over), `WRITE_GROUP_MAX` (256),
-`COALESCE` (1), `MAX_INFLIGHT_PER_LOOP` (2048), `BCRYPT_THREADS` (4), `BCRYPT_LANES` (0 = timed at startup, 1-6), `BCRYPT_GATHER_MS` (400),
-`BCRYPT_NICE` (5), `JAVA_OPTS`.
+`LOOPS`, `READ_CONNS` (8), `WRITE_CONNS` (1), `READ_GATHER_US` (40000), `READ_ROUND_MAX` (4096), `READ_SPREAD` (3: how many idle read connections one round's kinds are spread over), `WRITE_GROUP_MAX` (256),
+`READ_GATHER_FEED_US` (120000), `READ_GATHER_COMMENTS_US` (120000), `COALESCE` (1), `MAX_INFLIGHT_PER_LOOP` (2048), `BCRYPT_THREADS` (4), `BCRYPT_LANES` (0 = timed at startup, 1-6), `BCRYPT_GATHER_MS` (400),
+`BCRYPT_SCHED` (idle; or nice), `BCRYPT_NICE` (0, with `BCRYPT_SCHED=nice`), `JAVA_OPTS`.
 
 ## Credits
 

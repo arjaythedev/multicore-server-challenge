@@ -36,7 +36,7 @@ import {
   pollWait,
   tcpConnect,
 } from "nish:net"
-import { getI32LE, setI32LE, setI64LE } from "nish/bytes"
+import { copyBytes, setI32LE, setI64LE } from "nish/bytes"
 import { RING_EMPTY, RING_TOO_SMALL } from "nish/sync/ring"
 import { monotonicNanos } from "nish:process"
 import { secret, wipe } from "nish:secret"
@@ -112,6 +112,7 @@ import {
   K_PROFILE,
   K_TAG,
   K_TAGS,
+  LANES_ALL,
   PLAN_ALONE,
   CountRun,
   ReadPlan,
@@ -199,6 +200,10 @@ const FIELDS_COMMENT: i32 = 64 // body
 
 const POOL_READ: i32 = 0
 const POOL_WRITE: i32 = 1
+
+/** A little-endian `i32` at `b[off]`, from a window the ring lent (`getI32LE` takes only a writable array). */
+const readI32LE = (b: readonly u8[], off: i32): i32 =>
+  toI32(b[off]) | (toI32(b[off + 1]) << 8) | (toI32(b[off + 2]) << 16) | (toI32(b[off + 3]) << 24)
 
 /** Tokens in the loop: the listener, the bcrypt services (-2 down), then pool slots below; HTTP slots are 0 and up. */
 const TOKEN_LISTENER: i32 = -1
@@ -558,7 +563,7 @@ export class WorkerConfig {
   /** How many count runs the read service runs at once. */
   countLanes: i32 = 1
   /** Bytes of the read service's answers a worker sends a millisecond (`ConduitWorker.takeAnswers`). */
-  answerPace: i32 = 196608
+  answerPace: i32 = 130000
   /** 0: no gzip; 1: gzip a body when that sends fewer TCP segments; 2: whenever it saves anything. */
   gzip: i32 = 0
   /** The shortest body gzip is tried on. */
@@ -668,6 +673,8 @@ export class ConduitWorker {
   reads: ReadLink | null = null
   readRec: u8[]
   answerBuf: u8[]
+  /** A ring answer copied out for gzip, which compresses from a writable array. */
+  answerCopy: u8[]
   /** The channel is gone: the read service died. */
   readsGone: boolean = false
   /** How many bytes of answers may go out a ms, what may go now and when that was reckoned, and whether answers wait for it. */
@@ -680,6 +687,7 @@ export class ConduitWorker {
     this.listener = listener
     this.readRec = new Array<u8>(READ_HEAD + PLAN_KEY_MAX)
     this.answerBuf = new Array<u8>(RESPONSE_ROOM)
+    this.answerCopy = new Array<u8>(0)
     this.pace = toI64(cfg.answerPace)
     const http = new Http1Config()
     http.idleTimeout = cfg.idleTimeoutMs
@@ -880,19 +888,28 @@ export class ConduitWorker {
         this.paced = true
         return took
       }
-      const n: i32 = reads.rx.tryPop(this.answerBuf, 0)
-      if (n === RING_EMPTY) {
-        return took
+      // The answer where the service wrote it, in the ring (`peek`), sent
+      // from there and only then given back; one the ring cannot lend is
+      // copied out as before.
+      const view: readonly u8[] = reads.rx.peek()
+      const lent: boolean = view.length > 0
+      let n: i32 = toI32(view.length)
+      if (!lent) {
+        n = reads.rx.tryPop(this.answerBuf, 0)
+        if (n === RING_EMPTY) {
+          return took
+        }
+        if (n === RING_TOO_SMALL) {
+          this.answerBuf = new Array<u8>(2 * toI32(this.answerBuf.length))
+          continue
+        }
       }
-      if (n === RING_TOO_SMALL) {
-        this.answerBuf = new Array<u8>(2 * toI32(this.answerBuf.length))
-        continue
-      }
+      const rec: readonly u8[] = lent ? view : this.answerBuf
       took = true
       this.paceLeft -= toI64(n)
       const len: i32 = n - ANSWER_TAIL
-      const r: ConduitReq = this.reqs[getI32LE(this.answerBuf, len)]
-      const status: i32 = getI32LE(this.answerBuf, len + 4)
+      const r: ConduitReq = this.reqs[readI32LE(rec, len)]
+      const status: i32 = readI32LE(rec, len + 4)
       r.inPool = false
       if (status === ANSWER_ALONE) {
         r.solo = true
@@ -900,9 +917,12 @@ export class ConduitWorker {
       } else if (status === 404) {
         this.fail(r, 404, r.route === R_COMMENTS ? "article not found" : "not found", true)
       } else if (status === 200) {
-        this.answer(r, status, this.answerBuf, len, true)
+        this.answerFrom(r, rec, len)
       } else {
         this.fail(r, 500, "the database connection was lost", true)
+      }
+      if (lent) {
+        reads.rx.release()
       }
     }
   }
@@ -1115,6 +1135,42 @@ export class ConduitWorker {
     if (later) {
       this.drive(slot)
     }
+  }
+
+  /**
+   * Answers `r` with `buf[0, len)`, an answer the read service wrote, sent
+   * from `buf` itself (`sendBody`): the response head and the body leave in
+   * one write, and only what the socket did not take is copied. Gzip, when
+   * on, copies the body to compress it.
+   */
+  answerFrom(r: ConduitReq, buf: readonly u8[], len: i32): void {
+    if (this.gzip !== null) {
+      if (toI32(this.answerCopy.length) < len) {
+        this.answerCopy = new Array<u8>(len)
+      }
+      copyBytes(this.answerCopy, 0, buf, 0, len)
+      this.answer(r, 200, this.answerCopy, len, true)
+      return
+    }
+    const slot: i32 = r.slot
+    const live: boolean =
+      slot >= 0 &&
+      slot < toI32(this.slotGen.length) &&
+      this.server.holds(slot) &&
+      this.slotGen[slot] === r.gen
+    this.release(r)
+    if (!live) {
+      return
+    }
+    this.answered += 1
+    const conn: Http1Connection = this.server.connection(slot)
+    conn.respond(200, this.jsonNames, this.jsonValues, len)
+    conn.sendBody(buf, 0, len)
+    conn.end()
+    if (slot < toI32(this.slotAnswered.length)) {
+      this.slotAnswered[slot] = true
+    }
+    this.drive(slot)
   }
 
   /**
@@ -1977,9 +2033,9 @@ export class ConduitWorker {
       }
       this.planGroupDone(p)
     } else if (this.planState[p] === PLAN_A) {
-      plan.eventA(conn, event, 2)
+      plan.eventA(conn, event, 0)
     } else {
-      plan.eventB(conn, event, 2)
+      plan.eventB(conn, event, 0)
     }
   }
 
@@ -2042,7 +2098,7 @@ export class ConduitWorker {
             continue
           }
           const plan: ReadPlan = this.plans[pi]
-          const bound: boolean = this.planState[pi] === PLAN_A ? plan.bindA(conn, 2) : plan.bindB(conn, 2)
+          const bound: boolean = this.planState[pi] === PLAN_A ? plan.bindA(conn, LANES_ALL, 0) : plan.bindB(conn, LANES_ALL, 0)
           if (!bound) {
             // The statements bound still run; the plan's requests go alone once they have.
             plan.failed = true

@@ -5,12 +5,19 @@ defmodule Conduit.Bcrypt do
   # chain of dependent table loads, so one hash leaves most of a core idle; interleaved hashes fill it.
   #
   # Concurrent hashes meet in this process. A batch goes to a worker when 4 are waiting, or when the oldest has
-  # waited BCRYPT_WINDOW_MS; at most BCRYPT_WORKERS batches run at once (each on a dirty CPU scheduler). Every hash
-  # still runs all of its 2^10 iterations with its own salt; nothing is reused between requests.
+  # waited BCRYPT_WINDOW_MS; at most BCRYPT_WORKERS batches run at once. Every hash still runs all of its 2^10
+  # iterations with its own salt; nothing is reused between requests.
+  #
+  # By default a batch runs on a dirty CPU scheduler. With BCRYPT_IDLE=n it runs on one of n threads of the NIF's own
+  # under SCHED_IDLE (after zig-iouring-nick-potts), so that it only takes CPU nothing else wants; if that hasn't
+  # answered within BCRYPT_IDLE_WAIT_MS (the box is saturated), the batch is computed again on a dirty CPU scheduler
+  # and the idle threads' late answer is dropped. Off by default: on a saturated box the idle threads get no CPU and
+  # every batch waits out the fallback.
 
   alias Conduit.Bcrypt.Nif
 
-  @lanes 4
+  # the NIF's lane counts (all checked at startup); `lanes` (BCRYPT_LANES) is the batch size used
+  @max_lanes 6
   @cost10 ["$2a$10$", "$2b$10$", "$2y$10$"]
 
   def child_spec(opts), do: %{id: __MODULE__, start: {__MODULE__, :start_link, [opts]}}
@@ -60,7 +67,9 @@ defmodule Conduit.Bcrypt do
 
   def init(parent, opts) do
     Process.register(self(), __MODULE__)
+    opts = Keyword.put_new(opts, :lanes, @max_lanes)
     self_test!()
+    idle = idle_start(Keyword.get(opts, :idle, 0))
     :proc_lib.init_ack(parent, {:ok, self()})
 
     s = %{
@@ -69,7 +78,10 @@ defmodule Conduit.Bcrypt do
       busy: 0,
       timer: nil,
       workers: opts[:workers],
-      window: opts[:window_ms]
+      window: opts[:window_ms],
+      lanes: opts[:lanes],
+      idle: idle,
+      idle_wait: Keyword.get(opts, :idle_wait_ms, 1000)
     }
 
     loop(s)
@@ -90,12 +102,14 @@ defmodule Conduit.Bcrypt do
     {:value, {:job, _, _, _, oldest}} = :queue.peek(s.q)
     waited = now() - oldest
 
-    if s.n >= @lanes or waited >= s.window do
-      {jobs, q} = take(s.q, min(s.n, @lanes), [])
+    if s.n >= s.lanes or waited >= s.window do
+      {jobs, q} = take(s.q, min(s.n, s.lanes), [])
       batcher = self()
 
+      %{idle: idle, idle_wait: idle_wait} = s
+
       spawn(fn ->
-        compute(jobs)
+        compute(jobs, idle, idle_wait)
         send(batcher, :done)
       end)
 
@@ -113,11 +127,33 @@ defmodule Conduit.Bcrypt do
     take(q, k - 1, [job | acc])
   end
 
-  defp compute(jobs) do
+  # The threads are started once per VM (a restarted collector reuses them).
+  defp idle_start(0), do: false
+
+  defp idle_start(n) do
+    case Nif.idle_start(n) do
+      :ok ->
+        true
+
+      {:error, :started} ->
+        true
+
+      {:error, reason} ->
+        IO.puts(
+          :stderr,
+          "bcrypt: no SCHED_IDLE threads (#{inspect(reason)}), dirty schedulers only"
+        )
+
+        false
+    end
+  end
+
+  # Runs in a process of its own, which exits afterwards: a late answer from the idle threads is dropped with it.
+  defp compute(jobs, idle, idle_wait) do
     keys = for {:job, _, key, _, _} <- jobs, do: key
     settings = for {:job, _, _, setting, _} <- jobs, do: setting
 
-    case Nif.hash(keys, settings) do
+    case hashes(keys, settings, idle, idle_wait) do
       hashes when is_list(hashes) ->
         Enum.zip_with(jobs, hashes, fn {:job, to, _, _, _}, hash ->
           send(to, {to, {:ok, hash}})
@@ -129,6 +165,24 @@ defmodule Conduit.Bcrypt do
     end
   end
 
+  defp hashes(keys, settings, true, idle_wait) do
+    ref = make_ref()
+
+    case Nif.hash_idle(keys, settings, ref) do
+      :ok ->
+        receive do
+          {^ref, result} -> result
+        after
+          idle_wait -> Nif.hash(keys, settings)
+        end
+
+      :error ->
+        :error
+    end
+  end
+
+  defp hashes(keys, settings, false, _), do: Nif.hash(keys, settings)
+
   defp now, do: System.monotonic_time(:millisecond)
 
   # Every lane count must give exactly the single-hash results (as rust-tokio-Scooter1337 checks at startup).
@@ -137,12 +191,14 @@ defmodule Conduit.Bcrypt do
       {"batch self test", "$2a$04$abcdefghijklmnopqrstuu"},
       {"één 🙂", "$2b$04$......................"},
       {"", "$2y$04$abcdefghijklmnopqrstuu"},
-      {String.duplicate("1234567890", 7) <> "12", "$2b$04$012345678901234567890u"}
+      {String.duplicate("1234567890", 7) <> "12", "$2b$04$012345678901234567890u"},
+      {"password123", "$2b$04$9.9.9.9.9.9.9.9.9.9.9u"},
+      {"x", "$2a$04$zzzzzzzzzzzzzzzzzzzzzu"}
     ]
 
     serial = for {key, setting} <- inputs, do: Nif.hash([key], [setting])
 
-    for n <- 2..@lanes do
+    for n <- 2..@max_lanes do
       {keys, settings} = inputs |> Enum.take(n) |> Enum.unzip()
       batch = Nif.hash(keys, settings)
 

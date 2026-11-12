@@ -73,6 +73,9 @@ public final class PgConn {
     private int phase;
     private int queryIndex;
     private int fd = -1;
+    // the epoll interest set last registered for fd: flush re-arms only when it changes (the dispatcher flushes
+    // every connection on every wakeup, and an unconditional EPOLL_CTL_MOD was ~4.7 syscalls per request)
+    private int armed;
     private long lastAttempt;
     private Unit transaction;
     private Unit[] group;
@@ -83,51 +86,57 @@ public final class PgConn {
     private int[][] roundIndexes;
     private int[] roundCounts;
     private Query[] readBatches;
+    private final Fanout fanout = new Fanout();
 
     /**
      * Reads that coalesce within a round: same-kind units share one batched
      * statement (TAGS shares one result).
      */
     enum Read {
-        TAGS(0, Stmt.TAGS, -1, new int[] {},
+        TAGS(0, Stmt.TAGS, -1, Fanout.Shape.NONE, new int[] {},
                 new int[] {}),
-        ARTICLE(60, Stmt.ARTICLE, Stmt.ARTICLE_BATCH, new int[] {1, 0},
+        ARTICLE(60, Stmt.ARTICLE, Stmt.ARTICLE_BATCH, Fanout.Shape.NONE, new int[] {1, 0},
                 new int[] {Stmt.TEXT, Stmt.INT8}),
-        COMMENTS(75, Stmt.COMMENTS, Stmt.COMMENTS_BATCH, new int[] {1, 0},
+        COMMENTS(75, Stmt.COMMENTS, Stmt.COMMENTS_BATCH, Fanout.Shape.COMMENTS, new int[] {1, 0},
                 new int[] {Stmt.TEXT, Stmt.INT8}),
         ARTICLES(
                 85,
                 Stmt.ARTICLES,
                 Stmt.ARTICLES_BATCH,
+                Fanout.Shape.LIST,
                 new int[] {1, 2, 0},
                 new int[] {Stmt.INT4, Stmt.INT4, Stmt.INT8}),
         FEED(
                 290,
                 Stmt.FEED,
                 Stmt.FEED_BATCH,
+                Fanout.Shape.FEED,
                 new int[] {0, 1, 2},
                 new int[] {Stmt.INT8, Stmt.INT4, Stmt.INT4}),
-        PROFILE(20, Stmt.PROFILE, Stmt.PROFILE_BATCH, new int[] {1, 0},
+        PROFILE(20, Stmt.PROFILE, Stmt.PROFILE_BATCH, Fanout.Shape.NONE, new int[] {1, 0},
                 new int[] {Stmt.TEXT, Stmt.INT8}),
         ARTICLES_TAG(
                 160,
                 Stmt.ARTICLES_TAG,
                 Stmt.ARTICLES_TAG_BATCH,
+                Fanout.Shape.LIST,
                 new int[] {3, 1, 2, 0},
                 new int[] {Stmt.TEXT, Stmt.INT4, Stmt.INT4, Stmt.INT8}),
         ARTICLES_AUTHOR(
                 120,
                 Stmt.ARTICLES_AUTHOR,
                 Stmt.ARTICLES_AUTHOR_BATCH,
+                Fanout.Shape.LIST,
                 new int[] {3, 1, 2, 0},
                 new int[] {Stmt.TEXT, Stmt.INT4, Stmt.INT4, Stmt.INT8}),
         ARTICLES_FAVORITED(
                 150,
                 Stmt.ARTICLES_FAVORITED,
                 Stmt.ARTICLES_FAVORITED_BATCH,
+                Fanout.Shape.LIST,
                 new int[] {3, 1, 2, 0},
                 new int[] {Stmt.TEXT, Stmt.INT4, Stmt.INT4, Stmt.INT8}),
-        USER(20, Stmt.USER, Stmt.USER_BATCH, new int[] {0},
+        USER(20, Stmt.USER, Stmt.USER_BATCH, Fanout.Shape.NONE, new int[] {0},
                 new int[] {Stmt.INT8});
 
         /**
@@ -144,14 +153,18 @@ public final class PgConn {
 
         final int batch;
 
+        /** How the batch statement's rows map to requests. */
+        final Fanout.Shape shape;
+
         final int[] params;
         final int[] types;
 
-        Read(int cost, int single, int batch,
+        Read(int cost, int single, int batch, Fanout.Shape shape,
              int[] params, int[] types) {
             this.cost = cost;
             this.single = single;
             this.batch = batch;
+            this.shape = shape;
             this.params = params;
             this.types = types;
         }
@@ -159,6 +172,8 @@ public final class PgConn {
 
     private static final Read[] READS = Read.values();
     private static final int SHARED = Read.TAGS.ordinal();
+    static final int FEED_KIND = Read.FEED.ordinal();
+    static final int COMMENTS_KIND = Read.COMMENTS.ordinal();
 
     /**
      * Statement id to Read ordinal + 1 (0: not coalesced), so kind() is a load
@@ -294,6 +309,8 @@ public final class PgConn {
             for (int i = 0; i < roundCounts[SHARED]; i++) {
                 group[roundIndexes[SHARED][i]].queries[0].appendRow(data, at, end - at);
             }
+        } else if (k >= 0 && roundCounts[k] > 1 && READS[k].shape != Fanout.Shape.NONE) {
+            fanout.add(data, at, end);
         } else if (k >= 0 && roundCounts[k] > 1) {
             if (end - at < 10 || getInt(data, at + 2) != 4) {
                 throw new IllegalStateException("invalid read row tag");
@@ -313,6 +330,7 @@ public final class PgConn {
             throw new IllegalStateException("read round did not return to idle");
         }
         if (failed) {
+            fanout.reset();
             for (int i = 0; i < groupSize; i++) {
                 for (Query q : group[i].queries) {
                     q.clearResults();
@@ -390,6 +408,7 @@ public final class PgConn {
             if (sys.epollCtl(epoll, Sys.EPOLL_CTL_ADD, fd, Sys.EPOLLIN | Sys.EPOLLOUT, tag) != 0) {
                 throw new IllegalStateException("epoll add failed");
             }
+            armed = Sys.EPOLLIN | Sys.EPOLLOUT;
             phase = 0;
             connected = false;
         } catch (RuntimeException e) {
@@ -449,8 +468,11 @@ public final class PgConn {
                 out.len = 0;
             }
             int flags = Sys.EPOLLIN | (out.len != 0 ? Sys.EPOLLOUT : 0);
-            if (sys.epollCtl(epoll, Sys.EPOLL_CTL_MOD, fd, flags, tag) != 0) {
-                throw new IllegalStateException("epoll mod failed");
+            if (flags != armed) {
+                if (sys.epollCtl(epoll, Sys.EPOLL_CTL_MOD, fd, flags, tag) != 0) {
+                    throw new IllegalStateException("epoll mod failed");
+                }
+                armed = flags;
             }
         } catch (Exception e) {
             fail(e.toString());
@@ -491,6 +513,11 @@ public final class PgConn {
                     (int) n);
             in.len += (int) n;
             parse();
+            // level-triggered: a short read drained the socket, and anything that arrives later is reported again,
+            // so the read that would only return EAGAIN is skipped
+            if (n < io.byteSize()) {
+                break;
+            }
         }
     }
 
@@ -548,6 +575,9 @@ public final class PgConn {
                 } else {
                     int k = kind(group[groupIndex]);
                     if (k >= 0 && roundCounts[k] > 1) {
+                        if (READS[k].shape != Fanout.Shape.NONE) {
+                            fanout.finish(READS[k].shape, group, roundIndexes[k], roundCounts[k]);
+                        }
                         for (int i = 0; i < roundCounts[k]; i++) {
                             Query q = group[roundIndexes[k][i]].queries[0];
                             q.commandRowCount = q.rowCount();

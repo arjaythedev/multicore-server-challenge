@@ -8,6 +8,9 @@ with plain unoptimized code in each language's most popular framework. On 8 core
 **Now it's your turn: implement the same app in any language and framework, make it as fast as you can,
 and I'll benchmark it on the same 8-core box.**
 
+> **The challenge is closed.** New submissions are no longer benchmarked automatically. The leaderboard stays up with
+> every result so far.
+
 ## What's here
 
 | | |
@@ -81,6 +84,8 @@ To load test it yourself, see [`bench/README.md`](bench/README.md#load-test-your
     sizes) are fair game.
 
 ## Submitting
+
+New submissions are no longer benchmarked automatically. You can still open a pull request, but it won't be run.
 
 Open a pull request that adds one folder, `submissions/<language>-<framework>-<github-username>/`, containing:
 
