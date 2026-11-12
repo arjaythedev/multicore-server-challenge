@@ -43,13 +43,6 @@ let private run (reads: Read[]) : Answer[] =
     use conn = dataSource.Value.OpenConnection()
     (answer conn reads).GetAwaiter().GetResult()
 
-/// The same batch with phase B split as far as it goes: three connections, one article a part.
-let private runSplit (reads: Read[]) : Answer[] =
-    use conn = dataSource.Value.OpenConnection()
-    use h1 = dataSource.Value.OpenConnection()
-    use h2 = dataSource.Value.OpenConnection()
-    (answerWith conn [| h1; h2 |] 1 null null reads).GetAwaiter().GetResult()
-
 let private column (sql: string) (read: Data.Common.DbDataReader -> 'a) : 'a list =
     use conn = dataSource.Value.OpenConnection()
     use cmd = new NpgsqlCommand(sql, conn)
@@ -146,9 +139,8 @@ let ``a request's answer does not depend on its batch-mates`` () =
     let property (batch: Read list) =
         let batch = Array.ofList batch
         let together = run batch |> Array.map seen
-        let split = runSplit batch |> Array.map seen
         let alone = batch |> Array.map (fun r -> seen (Array.exactlyOne (run [| r |])))
-        together = alone && split = alone
+        together = alone
     Check.One(Config.QuickThrowOnFailure.WithMaxTest(500), Prop.forAll (batches pools.Value) property)
 
 [<Fact>]

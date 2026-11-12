@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # Runs the server in the foreground. Config: DATABASE_URL, JWT_SECRET, HOST, PORT (SPEC.md).
 # Optional: READ_LANES / READ_BATCH (read-batching connections, default one per core; requests per
-# batch, default 2048), READ_SPLIT / READ_SPLIT_MIN (connections per lane for a split phase B, default 1, off;
-# fewest articles per part, default 64), READ_SHARE_MIN (a lane's fair share of what waits: at least this,
+# batch, default 2048), READ_SHARE_MIN (a lane's fair share of what waits: at least this,
 # default 64; 0 takes everything up to READ_BATCH), READ_GATHER_MS (how long a request may wait for batch-mates, default
 # 25), DB_POOL_SIZE (multiplexed connections for cold reads, default cores / 2),
 # WRITE_LANES / WRITE_GROUP (group-commit connections, default (cores + 2) / 4; writes per group, default 128),

@@ -121,20 +121,19 @@ let main args =
     let readLanes = max 1 (int (setting "READ_LANES" (string cores)))
     let readBatch = max 1 (int (setting "READ_BATCH" "2048"))
     let readGather = TimeSpan.FromMilliseconds(float (setting "READ_GATHER_MS" "25"))
-    // READ_SPLIT connections per lane: a batch's phase B, cut by article, runs on that many at
-    // once (1: off), each part at least READ_SPLIT_MIN distinct articles.
-    let readSplit = max 1 (int (setting "READ_SPLIT" "1"))
-    let readSplitMin = max 1 (int (setting "READ_SPLIT_MIN" "64"))
     // A gathering lane takes its fair share of what waits (what waits over the idle lanes), at
     // least READ_SHARE_MIN (64; 0: take everything up to READ_BATCH, as before).
     let readShareMin = max 0 (int (setting "READ_SHARE_MIN" "64"))
+    // Count lanes: connections that count favorites for all the read lanes' batches at once
+    // (1; 0: each batch counts its own, in its phase B).
+    let countLanes = max 0 (int (setting "READ_COUNT_LANES" "1"))
     // A fine timeline for diagnostics (off unless BATCH_LOG is set): a batch log and a sample of
     // CPU, GC and queues every BATCH_LOG_MS (25), written at shutdown to BATCH_LOG.batches.csv and
     // BATCH_LOG.samples.csv. BATCH_LOG_PG_CGROUP: Postgres's cgroup cpu.stat, for its CPU.
     let batchLog = setting "BATCH_LOG" ""
     // Multiplexed: the cold reads (sign-in lookups, the read after a write). Rule: 95 or fewer
     // connections in total, lanes included.
-    let poolSize = min (95 - writeLanes - readLanes * readSplit) (int (setting "DB_POOL_SIZE" (string (max 2 (cores / 2)))))
+    let poolSize = min (95 - writeLanes - readLanes - countLanes) (int (setting "DB_POOL_SIZE" (string (max 2 (cores / 2)))))
     // A quarter of the cores, each computing up to four hashes in lockstep (~25 a second per
     // thread), covers the login rate the reads leave room for; fewer threads also fill the
     // lockstep batches.
@@ -168,12 +167,11 @@ let main args =
         )
     let reads =
         Engine.Reads.Gather(
-            named "read" (Engine.Db.connectionString databaseUrl (readLanes * readSplit) false),
+            named "read" (Engine.Db.connectionString databaseUrl (readLanes + countLanes) false),
             readLanes,
+            countLanes,
             readBatch,
             readGather,
-            readSplit,
-            readSplitMin,
             readShareMin,
             (if batchLog = "" then 0 else 400_000)
         )
@@ -243,7 +241,7 @@ let main args =
     Stats.eprint (
         $"conduit (F#, Giraffe on Kestrel) on {host}:{port}, {cores} cores:"
         + $" {readLanes} read lanes (batches of <= {readBatch}, gather {int readGather.TotalMilliseconds} ms,"
-        + $" fair share from {readShareMin}, phase B on {readSplit} connections from {readSplitMin} articles each)"
+        + $" fair share from {readShareMin})"
         + $" + {writeLanes} write lanes (groups of <= {writeGroup}, waiting {int writeGather.TotalMilliseconds} ms for {writeGroupMin})"
         + $" + {poolSize} multiplexed db connections, {bcryptLanes} bcrypt threads ({bcryptWidth} wide), server GC {serverGC}"
     )

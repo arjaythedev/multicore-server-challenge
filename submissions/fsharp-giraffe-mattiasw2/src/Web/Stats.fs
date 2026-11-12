@@ -347,6 +347,7 @@ let start (every: TimeSpan) (connections: Connections) (reads: Engine.Reads.Gath
                 + $" | cpu={cores:F2} pool={ThreadPool.ThreadCount} pending={ThreadPool.PendingWorkItemCount}"
                 + $" | reads q={reads.Depth} busy={reads.Busy}/{readLanes} batches={batches' - batches} per={perBatch}"
                 + $" worst={int (reads.Worst()).TotalMilliseconds}ms"
+                + (let struct (runs, asked, counted) = reads.Counted() in $" counts={runs} asked={asked} counted={counted}")
                 + $" | writes q={writes.Depth} busy={writeBusyPercent:F0}pct groups={groups' - groups} per={perGroup}"
                 + $" refused={fst writes.Refusals}"
             )

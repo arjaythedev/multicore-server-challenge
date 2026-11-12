@@ -39,15 +39,15 @@ parts of this one are done differently.
 
 **The read batch is planned in F#, and SQL only looks rows up.** Every hot read is a value (`Read`, in
 `src/Engine/Reads.fs`), not a query. A batch of them goes through plain functions: `planA` turns the requests into
-distinct keys per kind (forty readers of page 1 are one page, an article page and its comments one slug), two
+distinct keys per kind (forty readers of page 1 are one page, forty viewers of one article one row), two
 round trips fetch what those keys need, `planB` derives the second round's keys from the first round's rows, and
-`assemble` builds every answer from the rows. Postgres never deduplicates or joins whole tables: each statement
-unnests arrays of keys F# has already made distinct and probes an index once per key (`CROSS JOIN LATERAL (...
-LIMIT 1)`). Both rounds run in one `REPEATABLE READ READ ONLY` snapshot. Because plan and assembly are pure, the
-whole design has a property test (`src/Tests/BatchTests.fs`, FsCheck): for random batches of real keys, every
-request's answer inside the batch equals its answer alone, byte for byte as the JSON goes out. A planted bug (one
-viewer's favorite leaking to another viewer of the same article) shrank to exactly that batch: two viewers, one
-article.
+`assemble` builds every answer from the rows. Postgres never deduplicates, joins whole tables, sorts or groups for
+a batch: each statement gets arrays of keys F# has already made distinct and grouped, and every row is read once,
+by the statement that finds it. Both rounds run in one `REPEATABLE READ READ ONLY` snapshot. Because plan and
+assembly are pure, the whole design has a property test (`src/Tests/BatchTests.fs`, FsCheck): for random batches of
+real keys, every request's answer inside the batch equals its answer alone, byte for byte as the JSON goes out. A
+planted bug (one viewer's favorite leaking to another viewer of the same article) shrank to exactly that batch: two
+viewers, one article.
 
 **bcrypt is F#, not C.** Several fast entries call C for bcrypt. Ours is managed F# with raw pointers
 (`src/Engine/Bcrypt.fs`): four logins' hashes step through their Blowfish rounds together,
@@ -86,36 +86,42 @@ and never inside SQL, a transaction or a commit group.
     time in the read path; `read batch phases` splits a batch into phase A, the plan, phase B and the assembly.
     These timings (and the `write timings` line) are recorded only while a diagnostic is on (`STATS_SECONDS` or
     `BATCH_LOG`): each record is two interlocked adds on counters every lane shares. Off, the lines print `-`.
+  - **Count lane (`READ_COUNT_LANES`, 1).** A favorite count walks the article's index entries, and the heap of
+    pages writes have touched, so it costs by the row. One more connection counts favorites for every batch
+    waiting when it starts, each article once, in its own snapshot beside the batches' phase B (the idea is
+    nish-std-amritk's). A run is bound after the batches it answers asked and keeps nothing afterwards. Three
+    alternating pairs at 130,000 users on 6 threads: the statement fell from about 19 to 15 µs and from 10.7 to 7.9
+    buffer hits a request, about 3% of Postgres's time; latency and app CPU moved within the run-to-run noise
+    (server-side p95 worse in two pairs, better in one). Only about 8% of the counts were shared between batches,
+    since a batch already counts each of its articles once. 0 turns it off: each batch counts its own in phase B.
   - **Fair share (`READ_SHARE_MIN`, 64).** A gathering lane takes what waits divided by the idle lanes (itself
     included), at least 64 and at most `READ_BATCH`, and leaves the rest to the next idle lane, which takes it at once
     (it has already waited out the window). A burst that arrives while lanes are idle then runs on several backends
     at once instead of one; with every other lane busy (full speed) the share is everything, the biggest batch.
     Back to back at 125,000 users on 6 vCPUs: p95 719 vs 778 ms, p99 915 vs 1,002, twice the batches at half the
     batch time, the same CPU (99%).
-  - **Split phase B (`READ_SPLIT`, off).** Phase B can be cut by article over `READ_SPLIT` connections per lane,
-    all reading phase A's snapshot (`pg_export_snapshot`, then `SET TRANSACTION SNAPSHOT` on each helper; the
-    batch property test covers it). On a CPU that is already full it lost: at 125,000 users on 6 vCPUs p95 571 ms
-    unsplit, 769 split in two, 842 in three, with the box at 98% either way. It can only pay where lanes are busy
-    and cores idle.
-  - **Plan (F#).** The batch's distinct needs: forty requests for page 1 of the global feed are one page, and an
-    article page and its comments are one slug lookup.
-  - **Phase A (one round trip).** Ids: the tag list, one capped count per distinct list key, the ids of each distinct
-    page, slug → article id, username → user, and each distinct comment thread, so phase B knows who wrote the
-    comments.
-  - **Phase B (one round trip).** Everything shown, once per **batch** and across every kind of request: each
-    distinct article's card (columns, tags, favorite count, author), whether a list or an article page shows it; and
-    the viewers' flags as two sets, (viewer, article) favorited and (viewer, user) following. The cards are four
-    flat statements over the batch's articles, put together in F# (see [SQL](#sql)). The flags are one
-    statement: each article's author is looked up once, and each viewer's pairs are one index range scan
-    (`= ANY`), not one probe per pair.
+  - **Plan (F#).** The batch's distinct needs: forty requests for page 1 of the global feed are one page, and
+    forty viewers of one article are one slug.
+  - **Phase A (one round trip).** Whatever a key leads to, with its row: the tags table; per kind of list, a capped
+    count per distinct key and the articles (card columns) of each distinct page; each feed viewer's count and the
+    ids of its newest articles; the article of each distinct slug; each distinct comment thread; each profile's
+    user.
+  - **Plan (F#).** Every article shown, every author of an article or a comment, and each signed-in viewer's
+    (viewer, article) and (viewer, user) pairs, sorted and grouped per viewer. A feed needs no (viewer, author)
+    pair: the viewer follows every author on it.
+  - **Phase B (one round trip).** What only ids can ask for, once per **batch** and across every kind of request:
+    the tags and the favorite count of every article shown, every author once (`users WHERE id = ANY`), the feed
+    articles' columns, and the viewers' flags: per viewer one index range scan on `favorites` and one on
+    `follows` (`= ANY` over that viewer's slice of one array).
   - **Assemble (pure).** Each request's answer is built from those maps. Requests that show the same article share one
     `Card` object.
   - Both phases run in one `REPEATABLE READ READ ONLY` transaction: one snapshot, so the phases agree, and it is
-    cheaper than a snapshot per statement.
-  - The SQL only looks rows up by keys that F# has already made distinct: unnest the arrays, then one
-    `CROSS JOIN LATERAL (… LIMIT 1)` index probe per key. The planner cannot see how few keys there are. With a plain
-    join it may hash-join whole tables, and the `LIMIT 1` (the keys are unique) stops it from flattening the lateral
-    back into that join.
+    cheaper than a snapshot per statement. The favorite counts are the exception: the count lane reads
+    them in a snapshot of its own, taken after the batch asked.
+  - The SQL only looks rows up by keys that F# has already made distinct. A flat `= ANY (array)` is one index
+    scan for all the keys. Where a key needs a scan of its own (a page, a thread), it is a
+    `CROSS JOIN LATERAL` per key; the planner cannot see how few keys there are, so a lookup inside one ends
+    `LIMIT 1` (the keys are unique), which stops it from flattening the lateral into a join of whole tables.
   - Our sessions run with `jit=off` (a session setting; the server config is untouched). The batched statements
     look costly to the planner, and JIT compiling took ~400 ms of a 1 ms query. Prepared statements do not help:
     Postgres does not cache JIT code. For the same reason they also send `max_parallel_workers_per_gather=0` (the
@@ -181,26 +187,30 @@ and never inside SQL, a transaction or a commit group.
 The reference SQL, reshaped so that **every read and most writes take one round trip** (and a batch of reads one
 statement per kind, see above):
 
-- **Lists:** the count, the page's ids and their cards are one statement. The page is chosen by id first and the card
-  columns are built only for its rows, so a huge `offset` skips index entries instead of computing tag arrays and
-  counts for every skipped article. An empty page still returns the count.
-- **Cards (phase B):** four statements over all of a batch's articles, not one per article with subqueries:
-  - the tags table (200 rows), `ORDER BY name`;
+- **Lists:** one statement per kind of list. It resolves each distinct key once (tag name or username to id, a
+  `MATERIALIZED` CTE), counts each key (capped at 1,000) and returns the card columns of each distinct page. The
+  page is chosen by id first, so a huge `offset` skips index entries, and an empty page still returns the count.
+- **Cards (phase B):** flat statements over all of a batch's articles, not one per article with subqueries:
   - the cards' (article, tag id) pairs, one `article_id = ANY` index-only scan;
   - the favorite counts, one `article_id = ANY … GROUP BY` index-only scan;
-  - the cards' columns and authors.
+  - each distinct author, one `users WHERE id = ANY`.
 
-  F# names each card's tags and orders them by their position in the tags table. That is the spec's `ORDER BY
-  t.name` in the database's collation (`en_US.utf8`, not .NET's ordering), with no `tags` probe per tag. On the
-  seed, 1,000 cards took 9.9 ms as one statement with the tag names and counts inside, 4.2 ms as these four.
-  On 6 vCPUs, 135k users went from a fail (p95 826 ms, the queue growing) to a pass (p95 445, p99 576 ms), and 125k
-  went from p95 355–376 to 279 ms.
+  The tags table (200 rows, `ORDER BY name`) is read once per batch in phase A, for the tag list and for the
+  cards. F# names each card's tags and orders them by their position in that table. That is the spec's `ORDER BY
+  t.name` in the database's collation (`en_US.utf8`, not .NET's ordering), with no `tags` probe per tag.
+- **Feed:** one statement for all the batch's feed viewers. A *hub* is a followee that two or more of them share
+  (the 32 most shared). A hub's *floor* is the id of its `depth`-th newest article (`depth` = limit + offset): a
+  viewer who follows it has at least `depth` articles from that id up, so one index scan over all its followees
+  (`author_id = ANY (followees) AND id >= floor`) holds its page. A viewer without such a hub takes the newest
+  `depth` of each followee, a scan per followee. (Floors from `rust-epoll-theCatWisel`.)
 - **Global count:** walks the primary key from the oldest end (`ORDER BY id LIMIT 1000`). Those pages are
   all-visible, so it is an index-only scan.
-- **Feed count:** a viewer who follows an author with 1,000 or more articles has a feed of at least 1,000. Each batch
-  checks that once for the 8 followees its viewers share most, and those viewers' counts need no scan. On the full
-  seed 78% of the viewers who follow anyone follow such an author. (Idea from `csharp-epoll-aot-gichamba`.)
-- **Comments:** the article lookup and the newest 100 comments are one statement. No row means 404.
+- **Feed count:** a viewer who follows an author with 1,000 or more articles has a feed of at least 1,000. Each
+  batch proves that once for every hub that three or more of its viewers share (the proof walks 1,000 index
+  entries, as much as counting for one viewer), and those viewers' counts need no scan. On the full seed 78% of
+  the viewers who follow anyone follow such an author. (Idea from `csharp-epoll-aot-gichamba`.)
+- **Comments:** the article lookup and the newest 100 comments are one statement: a row without a comment is an
+  article without comments, no row means 404. The comments' authors are named in phase B, each once.
 - **Follow, unfollow, favorite, unfavorite, delete article, delete comment, update article:** the lookup, the
   ownership check and the write are one statement (a data-modifying CTE), and the outer `SELECT` reports what it
   found, so 404 and 403 are still told apart.
@@ -219,7 +229,7 @@ statement per kind, see above):
   `sub` must be a decimal string and `exp` must be present and in the future.
 - **bcrypt:** cost 10 for every new password, and every login verifies against the stored hash. A password longer
   than 72 bytes is refused with a 422, never silently truncated.
-- **Connections:** at most 95 Postgres connections (`READ_LANES` + `WRITE_LANES` + `DB_POOL_SIZE`; the pool is
+- **Connections:** at most 95 Postgres connections (`READ_LANES` + `READ_COUNT_LANES` + `WRITE_LANES` + `DB_POOL_SIZE`; the pool is
   capped to fit).
 
 ## bcrypt runs once per sign-in, and never for a refused request
@@ -274,6 +284,50 @@ stall lasts twice as long, and even after it the 8 read lanes are often all busy
 | 110,000 | 28,700 | 147 ms | 281 ms | 2.8 | 2.5 | pass |
 | 115,000 | 29,700 | 199 ms | 352 ms | 3.0 | 2.7 | pass |
 | 120,000 | 29,000 | 719 ms | 1,120 ms | 3.15 | 2.75 | fail: the 6 threads are full |
+
+**Before and after the read statements were rewritten** (every row read once, grouping in F#, the feed's floors;
+.NET 11; "before" is commit 0749913; one run each, back to back on an idle laptop; a second run of "after" at
+130,000 on 6 vCPUs gave p95 352 ms and p99 494 ms):
+
+6 vCPUs (3 Zen 5 cores x 2; load generator on the other 10 threads):
+
+| Users | Build | requests/s | p95 | p99 | Postgres threads | app threads | |
+|--:|---|--:|--:|--:|--:|--:|---|
+| 110,000 | before | 28,800 | 139 ms | 259 ms | 3.10 | 2.68 | pass |
+| 110,000 | after | 29,000 | 92 ms | 172 ms | 2.79 | 2.80 | pass |
+| 120,000 | before | 30,100 | 454 ms | 579 ms | 2.86 | 3.06 | pass |
+| 120,000 | after | 31,100 | 219 ms | 325 ms | 2.71 | 3.18 | pass |
+| 130,000 | before | 31,300 | 697 ms | 883 ms | 2.75 | 3.18 | fail |
+| 130,000 | after | 33,000 | 352 ms | 502 ms | 2.56 | 3.35 | pass |
+| 140,000 | before | 32,500 | 949 ms | 1,155 ms | 2.81 | 3.13 | fail |
+| 140,000 | after | 34,900 | 485 ms | 677 ms | 2.46 | 3.46 | pass |
+| 150,000 | after | 36,900 | 581 ms | 820 ms | 2.48 | 3.42 | fail: the 6 threads are full |
+
+The app's threads include bcrypt: 28% of its samples at 130,000 users (`perf`, 20 s at 499 Hz), 0.94 of the 3.35
+threads, which leaves 2.40 for everything else.
+
+8 vCPUs (4 Zen 5 cores x 2; load generator on the 8 Zen 5c threads):
+
+| Users | Build | requests/s | p95 | p99 | Postgres threads | app threads | |
+|--:|---|--:|--:|--:|--:|--:|---|
+| 130,000 | before | 33,500 | 422 ms | 632 ms | 4.07 | 3.70 | pass |
+| 130,000 | after | 33,900 | 279 ms | 454 ms | 3.82 | 3.82 | pass |
+| 140,000 | before | 34,900 | 858 ms | 1,927 ms | 3.91 | 3.88 | fail |
+| 140,000 | after | 35,700 | 860 ms | 1,658 ms | 3.63 | 4.08 | fail |
+| 150,000 | after | 37,200 | 1,351 ms | 2,800 ms | 3.49 | 4.19 | fail: the load generator fell behind |
+
+At 140,000 users on 8 vCPUs both builds fail with the same p95 although the medians are 164 and 65 ms, the laptop
+peaks at 99% CPU, and no read batch took longer than 0.3 s inside the server. The same build passes 140,000 on
+6 vCPUs, where the load generator has ten threads instead of the eight slow ones. So from 140,000 up the 8-vCPU
+rows measure the load generator more than the server.
+
+Per request at 110,000 users on 6 vCPUs, Postgres went from 64.9 buffer hits to 52.0 (`pg_stat_statements`):
+article rows 12.7 → 0.8 plus 6.7 for the authors statement, flags 9.9 → 3.3, comment threads 9.4 → 3.2. The lanes
+finish sooner and take the next batch sooner, so batches fell from ~125 reads to ~83 and what is shared per batch
+(favorite counts, tags) rose per request; that is why Postgres's CPU fell less than its work per statement.
+
+Other work on the laptop moves these numbers more than the rewrite does: the same pair at 110,000 users with other
+programs running gave p95 301 → 168 ms instead of 139 → 92.
 
 Before the read batcher stopped peeking at its queue (commits 3f7cc19 to d67ba2f), 100,000 users gave p95 186-197 ms
 in 4 runs and 110,000 gave 291-449 ms in 3. A 5-minute hold at 105,000 users from then passed with p95 194 ms and
@@ -394,7 +448,9 @@ Ideas taken from other entries; the code here is our own.
     credit to `rust-epoll-WorriedArrow`);
   - letting a login wait 150 ms for bcrypt batch-mates;
   - their Openwall crypt_blowfish with interleaved lanes, as the yardstick our F# bcrypt was tuned against.
-- `rust-epoll-theCatWisel` (PR #201): the tags table read once per batch, and tag ids instead of names per card.
+- `rust-epoll-theCatWisel` (PR #201): the tags table read once per batch, and tag ids instead of names per card;
+  the statement that finds an article returns its columns, so phase B never reads the row again; each author once;
+  the flags as one range scan per viewer over a slice of one array; and the feed's hub floors.
 - `c-epoll-unorig-username` (PR #203): the cards' tag ids as one `article_id = ANY` statement.
 
 Read batching and group commit themselves come from an earlier presentation (rule 6 allows several requests'
@@ -412,7 +468,7 @@ SKIP_CONFORMANCE=1 bash check.sh  # the quick gate, no database
 ```
 
 Environment: `DATABASE_URL`, `JWT_SECRET` (required); `HOST` (127.0.0.1), `PORT` (3000); `READ_LANES` (cores);
-`READ_BATCH` (2048); `READ_GATHER_MS` (25); `READ_SHARE_MIN` (64; 0 takes everything up to `READ_BATCH`); `READ_SPLIT` (1, off); `READ_SPLIT_MIN` (64); `WRITE_LANES` ((cores + 2) / 4: 2 on 8 or 6 cores); `WRITE_GROUP` (128); `WRITE_GROUP_MIN` (8) and `WRITE_GATHER_MS` (2; 0 never waits); `DB_POOL_SIZE` (cores / 2, capped so the total stays
+`READ_BATCH` (2048); `READ_GATHER_MS` (25); `READ_SHARE_MIN` (64; 0 takes everything up to `READ_BATCH`); `READ_COUNT_LANES` (1; 0: each batch counts its own favorites); `WRITE_LANES` ((cores + 2) / 4: 2 on 8 or 6 cores); `WRITE_GROUP` (128); `WRITE_GROUP_MIN` (8) and `WRITE_GATHER_MS` (2; 0 never waits); `DB_POOL_SIZE` (cores / 2, capped so the total stays
 at most 95); `BCRYPT_THREADS` ((cores + 2) / 4); `BCRYPT_WIDTH` (4); `BCRYPT_GATHER_MS` (150); `STATS_SECONDS` (0, off); `PHASES_FILE` (none); `BATCH_LOG`, `BATCH_LOG_MS` (25), `BATCH_LOG_PG_CGROUP` (none); `PG_OPTIONS` (the four session settings above); `SCHED_BATCH` (1).
 
 `STATS_SECONDS=1` prints one diagnostic line a second on stderr (`src/Web/Stats.fs`), to line up against the load
