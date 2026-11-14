@@ -136,8 +136,6 @@ pub const session_params = [_][2][]const u8{
     .{ "random_page_cost", "1.1" },
     .{ "cpu_index_tuple_cost", "0.0005" },
     .{ "effective_io_concurrency", "200" },
-    .{ "track_activities", "off" },
-    .{ "track_counts", "off" },
     .{ "search_path", "public" },
     .{ "client_min_messages", "error" },
     .{ "bytea_output", "hex" },
