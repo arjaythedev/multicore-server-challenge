@@ -12,6 +12,7 @@ const std = @import("std");
 const pg = @import("pg.zig");
 const sql = @import("sql.zig");
 const api = @import("api.zig");
+const jw = @import("jw.zig");
 const server = @import("server.zig");
 const bufm = @import("buf.zig");
 
@@ -56,11 +57,22 @@ const Interner = struct {
         }
         return .{ .ord = e.value_ptr.*, .fresh = false };
     }
+
+    /// Check if stack_key already exists. Only allocate with `a.dupe` if fresh.
+    fn getDupe(self: *Interner, a: Alloc, stack_key: []const u8) !struct { ord: u32, fresh: bool } {
+        if (self.map.get(stack_key)) |ord| {
+            return .{ .ord = ord, .fresh = false };
+        }
+        const key = try a.dupe(u8, stack_key);
+        try self.map.put(a, key, self.n + 1);
+        self.n += 1;
+        return .{ .ord = self.n, .fresh = true };
+    }
 };
 
 /// One phase-A row. List statements use c[0..8]: k, id (or the count), author_id, slug, title, description, created_at,
-/// updated_at. a_slug adds body (c[8]); a_cmts and a_prof use their own layouts (see sql.zig).
-const max_cols = 10;
+/// updated_at. a_slug adds full article fields (c[0..15]); a_cmts and a_prof use their own layouts (see sql.zig).
+const max_cols = 16;
 const Row = struct { c: [max_cols]?[]const u8 };
 
 const PairKey = struct { v: i64, id: i64 };
@@ -71,6 +83,7 @@ const GroupState = struct {
     ckeys: Interner = .{}, // distinct count keys (lists)
     pkeys: Interner = .{}, // distinct pages (lists) / distinct slugs / usernames
     p_text: std.ArrayList([]const u8) = .empty,
+    p_viewers: std.ArrayList(i64) = .empty,
     p_lim: std.ArrayList(i64) = .empty,
     p_off: std.ArrayList(i64) = .empty,
     c_text: std.ArrayList([]const u8) = .empty,
@@ -80,10 +93,11 @@ const GroupState = struct {
     // rows grouped by key ordinal (page / slug / username): order[start[k-1] .. start[k]]
     start: []u32 = &.{},
     order: []u32 = &.{},
+    is_win: bool = false,
 };
 
 /// Per request: where its count and its page / key live in its group.
-const Slot = struct { g: Group, cord: u32 = 0, kord: u32 = 0 };
+const Slot = struct { g: Group, cord: u32 = 0, kord: u32 = 0, answered: bool = false };
 
 const Article = struct {
     id: i64,
@@ -181,9 +195,7 @@ fn startInner(w: *Worker, taken: []const Taken) !*Plan {
                 slot.kord = try page(al, g, vb, it.limit, it.offset);
             },
             .slug, .cmts, .prof => {
-                const k = try g.pkeys.get(al, it.text());
-                if (k.fresh) try g.p_text.append(al, it.text());
-                slot.kord = k.ord;
+                slot.kord = try textViewer(al, g, it.text(), it.viewer);
             },
         }
         p.slots[i] = slot;
@@ -202,10 +214,27 @@ fn startInner(w: *Worker, taken: []const Taken) !*Plan {
                 e.exec();
             },
             .global => {
-                e.bind(sql.planId(.a_global));
-                e.pInt8Array(g.p_lim.items);
-                e.pInt8Array(g.p_off.items);
-                e.exec();
+                var win_max: i64 = 0;
+                var use_win = g.p_lim.items.len > 0;
+                for (g.p_lim.items, g.p_off.items) |lim, off| {
+                    const end = lim + off;
+                    if (end > 200) {
+                        use_win = false;
+                        break;
+                    }
+                    if (end > win_max) win_max = end;
+                }
+                if (use_win) {
+                    g.is_win = true;
+                    e.bind(sql.planId(.a_global_win));
+                    e.pInt8(@max(1, win_max));
+                    e.exec();
+                } else {
+                    e.bind(sql.planId(.a_global));
+                    e.pInt8Array(g.p_lim.items);
+                    e.pInt8Array(g.p_off.items);
+                    e.exec();
+                }
             },
             .tag, .author, .fav => {
                 e.bind(sql.planId(switch (gk) {
@@ -238,6 +267,7 @@ fn startInner(w: *Worker, taken: []const Taken) !*Plan {
                     else => .a_prof,
                 }));
                 e.pTextArray(g.p_text.items);
+                e.pInt8Array(g.p_viewers.items);
                 e.exec();
             },
         }
@@ -251,14 +281,38 @@ fn startInner(w: *Worker, taken: []const Taken) !*Plan {
     return p;
 }
 
+/// Ordinal of the (`text`, `viewer`) in `g`, adding it if new.
+fn textViewer(al: Alloc, g: *GroupState, text: []const u8, viewer: i64) !u32 {
+    var kb: [16 + 256]u8 = undefined;
+    const len = 16 + text.len;
+    const key_stack = if (len <= kb.len) blk: {
+        std.mem.writeInt(i64, kb[0..8], viewer, .little);
+        std.mem.writeInt(u64, kb[8..16], text.len, .little);
+        @memcpy(kb[16..][0..text.len], text);
+        break :blk kb[0..len];
+    } else try std.mem.concat(al, u8, &.{ std.mem.asBytes(&viewer), std.mem.asBytes(&text.len), text });
+
+    const k = try g.pkeys.getDupe(al, key_stack);
+    if (k.fresh) {
+        try g.p_text.append(al, text);
+        try g.p_viewers.append(al, viewer);
+    }
+    return k.ord;
+}
+
 /// Ordinal of the page (`text`, limit, offset) in `g`, adding it if new.
 fn page(al: Alloc, g: *GroupState, text: []const u8, lim: i32, off: i32) !u32 {
-    var kb: [24]u8 = undefined;
-    std.mem.writeInt(i64, kb[0..8], lim, .little);
-    std.mem.writeInt(i64, kb[8..16], off, .little);
-    std.mem.writeInt(u64, kb[16..24], text.len, .little);
-    const key = try std.mem.concat(al, u8, &.{ &kb, text });
-    const k = try g.pkeys.get(al, key);
+    var kb: [24 + 256]u8 = undefined;
+    const len = 24 + text.len;
+    const key_stack = if (len <= kb.len) blk: {
+        std.mem.writeInt(i64, kb[0..8], lim, .little);
+        std.mem.writeInt(i64, kb[8..16], off, .little);
+        std.mem.writeInt(u64, kb[16..24], text.len, .little);
+        @memcpy(kb[24..][0..text.len], text);
+        break :blk kb[0..len];
+    } else try std.mem.concat(al, u8, &.{ std.mem.asBytes(&lim), std.mem.asBytes(&off), std.mem.asBytes(&text.len), text });
+
+    const k = try g.pkeys.getDupe(al, key_stack);
     if (k.fresh) {
         try g.p_text.append(al, text);
         try g.p_lim.append(al, lim);
@@ -323,23 +377,33 @@ fn onReplyInner(w: *Worker, p: *Plan, batch: []const u8) !Result {
             const bodies = sts[si].items;
             switch (gk) {
                 .tags => {
-                    // the rows of /api/tags as one reply every waiting request is given
                     var b = Buf{};
                     defer b.deinit();
+                    b.putSlice("{\"tags\":[");
+                    var first = true;
                     for (bodies) |body| {
-                        b.put('D');
-                        b.putInt(u32, @intCast(4 + body.len), .big);
-                        b.putSlice(body);
+                        if (!first) b.put(',');
+                        first = false;
+                        const col = pg.cols(body, 1);
+                        jw.str(&b, col[0].?);
                     }
+                    b.putSlice("]}");
                     p.tags_reply = try al.dupe(u8, b.slice());
                 },
                 .global, .tag, .author, .fav, .feed => try parseList(p, g, gk, bodies),
-                .slug => try parseKeyed(p, g, bodies, 9),
-                .cmts => try parseKeyed(p, g, bodies, 10),
-                .prof => try parseKeyed(p, g, bodies, 5),
+                .slug => try parseKeyed(p, g, bodies, 15),
+                .cmts => try parseKeyed(p, g, bodies, 11),
+                .prof => try parseKeyed(p, g, bodies, 6),
             }
         }
         try collect(p);
+        // Early dispatch for slots that are completely resolved in Phase A:
+        for (p.slots, 0..) |_, i| {
+            const slot = &p.slots[i];
+            if (slot.g == .tags or slot.g == .prof or slot.g == .cmts or slot.g == .slug) {
+                assembleSlot(w, p, i);
+            }
+        }
         if (p.arts.items.len == 0 and p.fav_v.items.len == 0 and p.fol_v.items.len == 0) {
             try assemble(w, p);
             return .done;
@@ -393,6 +457,42 @@ fn parseList(p: *Plan, g: *GroupState, gk: Group, bodies: []const []const u8) !v
     const ncounts = if (gk == .global) 1 else g.ckeys.n;
     g.counts = try al.alloc(i64, ncounts);
     @memset(g.counts, 0);
+    if (gk == .global and g.is_win) {
+        if (bodies.len > 0) {
+            const r0 = rowOf(8, bodies[0]);
+            g.counts[0] = i64At(&r0, 1);
+        }
+        const n_arts = if (bodies.len > 1) bodies.len - 1 else 0;
+        try g.rows.ensureTotalCapacity(al, n_arts);
+        for (bodies[1..]) |body| {
+            g.rows.appendAssumeCapacity(rowOf(8, body));
+        }
+        var total_slots: usize = 0;
+        for (g.p_lim.items, g.p_off.items) |lim, off| {
+            const uoff: usize = @intCast(@max(0, off));
+            const ulim: usize = @intCast(@max(0, lim));
+            if (uoff < g.rows.items.len) {
+                total_slots += @min(ulim, g.rows.items.len - uoff);
+            }
+        }
+        g.start = try al.alloc(u32, g.pkeys.n + 1);
+        g.order = try al.alloc(u32, total_slots);
+        var cur: u32 = 0;
+        g.start[0] = 0;
+        for (1..g.pkeys.n + 1) |k| {
+            g.start[k] = cur;
+            const off: usize = @intCast(@max(0, g.p_off.items[k - 1]));
+            const lim: usize = @intCast(@max(0, g.p_lim.items[k - 1]));
+            if (off < g.rows.items.len) {
+                const take = @min(lim, g.rows.items.len - off);
+                for (0..take) |j| {
+                    g.order[cur] = @intCast(off + j);
+                    cur += 1;
+                }
+            }
+        }
+        return;
+    }
     try g.rows.ensureTotalCapacity(al, bodies.len);
     for (bodies) |body| {
         const r = rowOf(8, body);
@@ -457,7 +557,7 @@ fn collect(p: *Plan) !void {
         const g = &p.gs[@backingInt(slot.g)];
         switch (slot.g) {
             .tags => {},
-            .global, .tag, .author, .fav, .feed, .slug => {
+            .global, .tag, .author, .fav, .feed => {
                 for (rowsOf(g, slot.kord)) |ri| {
                     const r = &g.rows.items[ri];
                     const id = i64At(r, 1);
@@ -472,15 +572,7 @@ fn collect(p: *Plan) !void {
                     }
                 }
             },
-            .cmts => if (it.viewer != 0) {
-                for (rowsOf(g, slot.kord)) |ri| {
-                    const r = &g.rows.items[ri];
-                    if (r.c[6]) |au| try ask(al, &p.fol_ask, &p.fol_v, &p.fol_a, it.viewer, pg.i64Of(au));
-                }
-            },
-            .prof => if (it.viewer != 0) {
-                for (rowsOf(g, slot.kord)) |ri| try ask(al, &p.fol_ask, &p.fol_v, &p.fol_a, it.viewer, i64At(&g.rows.items[ri], 1));
-            },
+            .slug, .cmts, .prof => {},
         }
     }
 }
@@ -490,6 +582,47 @@ fn ask(al: Alloc, seen: *Pairs, vs: *std.ArrayList(i64), ids: *std.ArrayList(i64
     if (e.found_existing) return;
     try vs.append(al, v);
     try ids.append(al, id);
+}
+
+const FlagRuns = struct {
+    viewers: std.ArrayList(i64) = .empty,
+    targets: std.ArrayList(i64) = .empty,
+    starts: std.ArrayList(i32) = .empty,
+    ends: std.ArrayList(i32) = .empty,
+};
+
+const PairIndex = struct {
+    v: i64,
+    id: i64,
+};
+
+fn lessPair(_: void, a: PairIndex, b: PairIndex) bool {
+    if (a.v != b.v) return a.v < b.v;
+    return a.id < b.id;
+}
+
+fn buildFlagRuns(al: Alloc, vs: []const i64, ids: []const i64, runs: *FlagRuns) !void {
+    if (vs.len == 0) return;
+    const pairs = try al.alloc(PairIndex, vs.len);
+    for (vs, ids, 0..) |v, id, i| {
+        pairs[i] = .{ .v = v, .id = id };
+    }
+    std.mem.sort(PairIndex, pairs, {}, lessPair);
+    var cur_v: i64 = pairs[0].v;
+    var run_start: i32 = 1;
+    for (pairs, 0..) |p, i| {
+        if (p.v != cur_v) {
+            try runs.viewers.append(al, cur_v);
+            try runs.starts.append(al, run_start);
+            try runs.ends.append(al, @intCast(i));
+            cur_v = p.v;
+            run_start = @intCast(i + 1);
+        }
+        try runs.targets.append(al, p.id);
+    }
+    try runs.viewers.append(al, cur_v);
+    try runs.starts.append(al, run_start);
+    try runs.ends.append(al, @intCast(pairs.len));
 }
 
 fn encodeB(w: *Worker, p: *Plan) !void {
@@ -507,6 +640,8 @@ fn encodeB(w: *Worker, p: *Plan) !void {
         e.pInt8Array(ids);
         e.pInt8Array(au);
         e.exec();
+        // Sort article IDs ascending for monotonic B-Tree index traversal in PostgreSQL
+        std.mem.sort(i64, ids, {}, std.sort.asc(i64));
         e.bind(sql.planId(.b_fc));
         e.pInt8Array(ids);
         e.exec();
@@ -515,11 +650,21 @@ fn encodeB(w: *Worker, p: *Plan) !void {
         e.exec();
     }
     if (p.fav_v.items.len != 0 or p.fol_v.items.len != 0) {
+        const al = p.a();
+        var fav_runs: FlagRuns = .{};
+        try buildFlagRuns(al, p.fav_v.items, p.fav_a.items, &fav_runs);
+        var fol_runs: FlagRuns = .{};
+        try buildFlagRuns(al, p.fol_v.items, p.fol_a.items, &fol_runs);
+
         e.bind(sql.planId(.b_flags));
-        e.pInt8Array(p.fav_v.items);
-        e.pInt8Array(p.fav_a.items);
-        e.pInt8Array(p.fol_v.items);
-        e.pInt8Array(p.fol_a.items);
+        e.pInt8Array(fav_runs.viewers.items);
+        e.pInt8Array(fav_runs.targets.items);
+        e.pInt4Array(fav_runs.starts.items);
+        e.pInt4Array(fav_runs.ends.items);
+        e.pInt8Array(fol_runs.viewers.items);
+        e.pInt8Array(fol_runs.targets.items);
+        e.pInt4Array(fol_runs.starts.items);
+        e.pInt4Array(fol_runs.ends.items);
         e.exec();
     }
     e.sync();
@@ -554,138 +699,140 @@ fn encodeTextArray(al: Alloc, names: []const []const u8) ![]const u8 {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Assembling replies
+// Assembling replies directly into w.out
 // ---------------------------------------------------------------------------------------------
 
-fn colNull(b: *Buf) void {
-    b.putInt(i32, -1, .big);
-}
-
-fn colBytes(b: *Buf, v: ?[]const u8) void {
-    if (v) |x| {
-        b.ensure(4 + x.len);
-        b.putInt(i32, @intCast(x.len), .big);
-        b.putSlice(x);
-    } else colNull(b);
-}
-
-fn colI64(b: *Buf, v: i64) void {
-    b.putInt(i32, 8, .big);
-    b.putInt(i64, v, .big);
-}
-
-fn colBool(b: *Buf, v: bool) void {
-    b.putInt(i32, 1, .big);
-    b.put(@intFromBool(v));
-}
-
-fn beginRow(b: *Buf, ncols: u16) usize {
-    b.put('D');
-    const at = b.len;
-    b.putInt(u32, 0, .big);
-    b.putInt(u16, ncols, .big);
-    return at;
-}
-
-fn endRow(b: *Buf, at: usize) void {
-    std.mem.writeInt(u32, b.ptr[at..][0..4], @intCast(b.len - at), .big);
-}
-
-fn finishReply(b: *Buf) void {
-    b.putSlice("C\x00\x00\x00\x0dSELECT 0\x00");
-    b.putSlice("Z\x00\x00\x00\x05I");
-}
-
-/// The 13 article columns after the count (id ... following) for the row `r` of a list/article statement.
-fn articleCols(p: *Plan, b: *Buf, it: *const server.StageItem, art: *const Article, following: ?bool) void {
-    colI64(b, art.id);
-    colBytes(b, art.slug);
-    colBytes(b, art.title);
-    colBytes(b, art.description);
-    colBytes(b, art.created);
-    colBytes(b, art.updated);
-    colBytes(b, art.tag_list);
-    colI64(b, art.favs);
-    colBool(b, it.viewer != 0 and p.fav_yes.contains(.{ .v = it.viewer, .id = art.id }));
-    colBytes(b, art.username);
-    colBytes(b, art.bio);
-    colBytes(b, art.image);
-    colBool(b, following orelse (it.viewer != 0 and p.fol_yes.contains(.{ .v = it.viewer, .id = art.author })));
+fn assembleSlot(w: *Worker, p: *Plan, i: usize) void {
+    const slot = &p.slots[i];
+    if (slot.answered) return;
+    const it = &p.items[i];
+    const g = &p.gs[@backingInt(slot.g)];
+    switch (slot.g) {
+        .tags => {
+            w.beginBody();
+            w.out.putSlice(p.tags_reply);
+            api.doneReq(w, it.r, 200);
+        },
+        .global, .tag, .author, .fav, .feed => {
+            const count = g.counts[if (slot.g == .global) 0 else slot.cord - 1];
+            const rows = rowsOf(g, slot.kord);
+            w.beginBody();
+            const o = &w.out;
+            o.putSlice("{\"articles\":[");
+            var first = true;
+            for (rows) |ri| {
+                const r = &g.rows.items[ri];
+                const art = &p.arts.items[p.art_ix.get(i64At(r, 1)).?];
+                if (!first) o.put(',');
+                first = false;
+                const fav = it.viewer != 0 and p.fav_yes.contains(.{ .v = it.viewer, .id = art.id });
+                const fol = if (slot.g == .feed) true else (it.viewer != 0 and p.fol_yes.contains(.{ .v = it.viewer, .id = art.author }));
+                api.writeArticleObj(
+                    w,
+                    art.slug,
+                    art.title,
+                    art.description,
+                    null,
+                    art.tag_list,
+                    pg.i64Of(art.created),
+                    pg.i64Of(art.updated),
+                    art.favs,
+                    fav,
+                    art.username orelse "",
+                    art.bio,
+                    art.image,
+                    fol,
+                );
+            }
+            o.putSlice("],\"articlesCount\":");
+            jw.putInt(o, count);
+            o.put('}');
+            api.doneReq(w, it.r, 200);
+        },
+        .slug => {
+            const rows = rowsOf(g, slot.kord);
+            if (rows.len == 0) {
+                api.notFound(w, it.r, "article not found");
+            } else {
+                const r = &g.rows.items[rows[0]];
+                w.beginBody();
+                const o = &w.out;
+                o.putSlice("{\"article\":");
+                const fav = r.c[10] != null and r.c[10].?[0] != 0 and r.c[10].?[0] != 'f';
+                const fol = r.c[14] != null and r.c[14].?[0] != 0 and r.c[14].?[0] != 'f';
+                api.writeArticleObj(
+                    w,
+                    r.c[2].?, // slug
+                    r.c[3].?, // title
+                    r.c[4].?, // description
+                    r.c[5], // body
+                    r.c[8].?, // tag_list
+                    pg.i64Of(r.c[6].?), // created_at
+                    pg.i64Of(r.c[7].?), // updated_at
+                    pg.i64Of(r.c[9].?), // favs
+                    fav,
+                    r.c[11].?, // username
+                    r.c[12], // bio
+                    r.c[13], // image
+                    fol,
+                );
+                o.put('}');
+                api.doneReq(w, it.r, 200);
+            }
+        },
+        .cmts => {
+            const rows = rowsOf(g, slot.kord);
+            if (rows.len == 0) {
+                api.notFound(w, it.r, "article not found");
+            } else {
+                w.beginBody();
+                const o = &w.out;
+                o.putSlice("{\"comments\":[");
+                var first = true;
+                for (rows) |ri| {
+                    const r = &g.rows.items[ri];
+                    if (r.c[2] == null) continue;
+                    if (!first) o.put(',');
+                    first = false;
+                    const fol = r.c[10] != null and r.c[10].?[0] != 0 and r.c[10].?[0] != 'f';
+                    api.writeComment(
+                        w,
+                        pg.i64Of(r.c[2].?),
+                        r.c[3].?,
+                        pg.i64Of(r.c[4].?),
+                        pg.i64Of(r.c[5].?),
+                        r.c[7].?,
+                        r.c[8],
+                        r.c[9],
+                        fol,
+                    );
+                }
+                o.putSlice("]}");
+                api.doneReq(w, it.r, 200);
+            }
+        },
+        .prof => {
+            const rows = rowsOf(g, slot.kord);
+            if (rows.len == 0) {
+                api.notFound(w, it.r, "profile not found");
+            } else {
+                const r = &g.rows.items[rows[0]];
+                w.beginBody();
+                const o = &w.out;
+                o.putSlice("{\"profile\":");
+                const fol = r.c[5] != null and r.c[5].?[0] != 0 and r.c[5].?[0] != 'f';
+                api.writeProfile(w, r.c[2].?, r.c[3], r.c[4], fol);
+                o.put('}');
+                api.doneReq(w, it.r, 200);
+            }
+        },
+    }
+    slot.answered = true;
 }
 
 fn assemble(w: *Worker, p: *Plan) !void {
-    const syn = &w.synth;
-    for (p.slots, 0..) |slot, i| {
-        const it = &p.items[i];
-        const g = &p.gs[@backingInt(slot.g)];
-        syn.reset();
-        switch (slot.g) {
-            .tags => {
-                syn.putSlice(p.tags_reply);
-            },
-            .global, .tag, .author, .fav, .feed => {
-                const count = g.counts[if (slot.g == .global) 0 else slot.cord - 1];
-                const rows = rowsOf(g, slot.kord);
-                if (rows.len == 0) {
-                    const at = beginRow(syn, 14);
-                    colI64(syn, count);
-                    for (0..13) |_| colNull(syn);
-                    endRow(syn, at);
-                }
-                for (rows) |ri| {
-                    const r = &g.rows.items[ri];
-                    const art = &p.arts.items[p.art_ix.get(i64At(r, 1)).?];
-                    const at = beginRow(syn, 14);
-                    colI64(syn, count);
-                    articleCols(p, syn, it, art, if (slot.g == .feed) true else null);
-                    endRow(syn, at);
-                }
-            },
-            .slug => {
-                const rows = rowsOf(g, slot.kord);
-                if (rows.len != 0) {
-                    const r = &g.rows.items[rows[0]];
-                    const art = &p.arts.items[p.art_ix.get(i64At(r, 1)).?];
-                    const at = beginRow(syn, 14);
-                    articleCols(p, syn, it, art, null);
-                    colBytes(syn, r.c[8]); // body
-                    endRow(syn, at);
-                }
-            },
-            .cmts => {
-                for (rowsOf(g, slot.kord)) |ri| {
-                    const r = &g.rows.items[ri];
-                    const at = beginRow(syn, 8);
-                    if (r.c[2] == null) {
-                        for (0..8) |_| colNull(syn);
-                    } else {
-                        colBytes(syn, r.c[2]); // id
-                        colBytes(syn, r.c[3]); // body
-                        colBytes(syn, r.c[4]); // created_at
-                        colBytes(syn, r.c[5]); // updated_at
-                        colBytes(syn, r.c[7]); // username
-                        colBytes(syn, r.c[8]); // bio
-                        colBytes(syn, r.c[9]); // image
-                        colBool(syn, it.viewer != 0 and p.fol_yes.contains(.{ .v = it.viewer, .id = pg.i64Of(r.c[6].?) }));
-                    }
-                    endRow(syn, at);
-                }
-            },
-            .prof => {
-                for (rowsOf(g, slot.kord)) |ri| {
-                    const r = &g.rows.items[ri];
-                    const at = beginRow(syn, 5);
-                    colI64(syn, i64At(r, 1));
-                    colBytes(syn, r.c[2]);
-                    colBytes(syn, r.c[3]);
-                    colBytes(syn, r.c[4]);
-                    colBool(syn, it.viewer != 0 and p.fol_yes.contains(.{ .v = it.viewer, .id = i64At(r, 1) }));
-                    endRow(syn, at);
-                }
-            },
-        }
-        finishReply(syn);
-        api.onPg(w, it.r, syn.slice());
+    for (p.slots, 0..) |_, i| {
+        assembleSlot(w, p, i);
     }
 }
 
@@ -775,6 +922,12 @@ const PlannerTest = struct {
                     std.mem.writeInt(u64, key[16..24], input.text.len, .little);
                     @memcpy(key[24..][0..input.text.len], input.text);
                     try expectKey(&g.pkeys, input.kord, key[0 .. 24 + input.text.len], false);
+                } else if (gk == .cmts or gk == .prof or gk == .slug) {
+                    var key: [16 + 129]u8 = undefined;
+                    std.mem.writeInt(i64, key[0..8], input.viewer, .little);
+                    std.mem.writeInt(u64, key[8..16], input.text.len, .little);
+                    @memcpy(key[16..][0..input.text.len], input.text);
+                    try expectKey(&g.pkeys, input.kord, key[0 .. 16 + input.text.len], false);
                 } else try expectKey(&g.pkeys, input.kord, item.text(), true);
             }
             try std.testing.expectEqualStrings(input.text, g.p_text.items[input.kord - 1]);
@@ -821,6 +974,7 @@ const PlannerTest = struct {
             }));
             if (filtered) e.pTextArray(g.c_text.items);
             e.pTextArray(g.p_text.items);
+            if (gk == .cmts or gk == .prof or gk == .slug) e.pInt8Array(g.p_viewers.items);
             if (filtered) {
                 e.pInt8Array(g.p_lim.items);
                 e.pInt8Array(g.p_off.items);
@@ -847,9 +1001,9 @@ test "planner owns distinct and duplicate text across lookup and filter kinds" {
         .{ .stmt = .comments, .text = "a-longer-slug", .kord = 2 },
         .{ .stmt = .list_author, .text = "carol", .cord = 2, .kord = 2 },
         .{ .stmt = .list_fav, .text = "carol", .cord = 2, .kord = 2 },
-        .{ .stmt = .article, .text = "slug-alpha", .viewer = 17, .kord = 1 },
-        .{ .stmt = .comments, .text = "slug-alpha", .viewer = 18, .kord = 1 },
-        .{ .stmt = .profile, .text = "alice", .viewer = 19, .kord = 1 },
+        .{ .stmt = .article, .text = "slug-alpha", .viewer = 17, .kord = 3 },
+        .{ .stmt = .comments, .text = "slug-alpha", .viewer = 18, .kord = 3 },
+        .{ .stmt = .profile, .text = "alice", .viewer = 19, .kord = 3 },
         .{ .stmt = .list_tag, .text = "zig", .viewer = 20, .cord = 1, .kord = 1 },
         .{ .stmt = .list_author, .text = "alice", .limit = 5, .offset = 3, .cord = 1, .kord = 3 },
         .{ .stmt = .list_fav, .text = "alice", .offset = 7, .cord = 1, .kord = 3 },
@@ -869,7 +1023,7 @@ test "planner preserves text identity at the 127 128 129 byte storage boundary" 
     for (texts, ords, 0..) |text, ord, ti| {
         for (kinds, 0..) |stmt, ki| {
             const i = ti * kinds.len + ki;
-            inputs[i] = .{ .stmt = stmt, .text = text, .viewer = @intCast(i), .cord = if (ki >= 3) ord else 0, .kord = ord };
+            inputs[i] = .{ .stmt = stmt, .text = text, .viewer = 0, .cord = if (ki >= 3) ord else 0, .kord = ord };
         }
     }
     try PlannerTest.check(&inputs);

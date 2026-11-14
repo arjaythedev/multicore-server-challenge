@@ -469,6 +469,8 @@ pub const Worker = struct {
     pbuf_tail: u16 = 0,
     scratch_rx: []u8 = &.{},
     accept_live: bool = false,
+    plan_taken: std.ArrayList(plan.Taken) = .empty,
+    plan_kept: std.ArrayList(plan.Taken) = .empty,
     rc_busy: u32 = 0, // a reconnect thread is running (atomic)
     rc_fd: i32 = -1, // a connected, prepared socket waiting for the loop to adopt (atomic)
     partials: std.ArrayList(i32) = .empty,
@@ -745,6 +747,8 @@ pub const Worker = struct {
         // delayed ACK because an inherited listener option was not honoured.
         const one: c_int = 1;
         _ = linux.setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, @ptrCast(&one), @sizeOf(c_int));
+        const lowat: c_int = 4096;
+        _ = linux.setsockopt(fd, linux.IPPROTO.TCP, 25, @ptrCast(&lowat), @sizeOf(c_int)); // TCP_NOTSENT_LOWAT
         const c = &self.conns[@intCast(fd)];
         c.* = .{ .gen = c.gen +% 1, .open = true };
         if (self.gzip_mode == 2) {
@@ -1282,13 +1286,13 @@ pub const Worker = struct {
         switch (token & 7) {
             0 => api.onPgFailure(self, @ptrFromInt(token)),
             1 => {
-                const rec: *BatchRec = @ptrFromInt(token & ~@as(usize, 3));
+                const rec: *BatchRec = @ptrFromInt(token & ~@as(usize, 7));
                 for (rec.reqs[0..rec.n]) |r| api.onPgFailure(self, r);
                 if (!rec.fanout) for (rec.items[0..rec.n]) |*it| it.deinit();
                 self.freeBatchRec(rec);
             },
             2 => {
-                const rec: *WRec = @ptrFromInt(token & ~@as(usize, 3));
+                const rec: *WRec = @ptrFromInt(token & ~@as(usize, 7));
                 for (rec.m[0..rec.n]) |*mem| {
                     api.onPgFailure(self, mem.r);
                     mem.deinit();
@@ -1296,7 +1300,10 @@ pub const Worker = struct {
             },
             3 => {
                 const rec: *plan.Plan = @ptrFromInt(token & ~@as(usize, 7));
-                for (rec.items) |it| api.onPgFailure(self, it.r);
+                for (rec.items, 0..) |it, i| {
+                    if (rec.slots[i].answered) continue;
+                    api.onPgFailure(self, it.r);
+                }
                 plan.destroy(rec, true);
             },
             4 => {
@@ -1501,10 +1508,8 @@ pub const Worker = struct {
     fn startPlan(self: *Worker) PlanStart {
         const p = self.bestReadConn(null) orelse return .no_conn;
         p.last_stmt = null;
-        var taken: std.ArrayList(plan.Taken) = .empty;
-        defer taken.deinit(gpa);
-        var kept: std.ArrayList(plan.Taken) = .empty; // single-only retries stay on the per-kind path
-        defer kept.deinit(gpa);
+        self.plan_taken.clearRetainingCapacity();
+        self.plan_kept.clearRetainingCapacity();
         // How many reads this plan takes. Without a split it takes up to the cap, so one connection gets the whole backlog
         // and the others sit idle; with a split the staged reads are shared over the connections that have room.
         const cap: usize = self.shared.cfg.plan_max;
@@ -1515,7 +1520,7 @@ pub const Worker = struct {
         }
         const share_comments = self.sharedComments();
         // Oldest first across eligible kinds; dedicated comments and isolated retries remain independent.
-        while (taken.items.len < want) {
+        while (self.plan_taken.items.len < want) {
             var best: ?usize = null;
             var best_seq: u64 = std.math.maxInt(u64);
             for (&self.stages, 0..) |*st, k| {
@@ -1529,25 +1534,26 @@ pub const Worker = struct {
             const it = self.stages[k].pop();
             const t = plan.Taken{ .stmt = stmt, .it = it };
             if (it.single_only or (self.shared.cfg.packed_reads and pack.kind(stmt) == null) or (stmt == .comments and !share_comments))
-                kept.append(gpa, t) catch return self.unstage(&taken, &kept)
+                self.plan_kept.append(gpa, t) catch return self.unstage(&self.plan_taken, &self.plan_kept)
             else
-                taken.append(gpa, t) catch return self.unstage(&taken, &kept);
+                self.plan_taken.append(gpa, t) catch return self.unstage(&self.plan_taken, &self.plan_kept);
         }
-        if (taken.items.len < self.shared.cfg.plan_min) return self.unstage(&taken, &kept);
+        if (self.plan_taken.items.len < self.shared.cfg.plan_min) return self.unstage(&self.plan_taken, &self.plan_kept);
         const token: usize = if (self.shared.cfg.packed_reads) blk: {
-            const rec = pack.start(self, taken.items) orelse return self.unstage(&taken, &kept);
+            const rec = pack.start(self, self.plan_taken.items) orelse return self.unstage(&self.plan_taken, &self.plan_kept);
             break :blk @intFromPtr(rec) | 4;
         } else blk: {
-            const rec = plan.start(self, taken.items) orelse return self.unstage(&taken, &kept);
+            const rec = plan.start(self, self.plan_taken.items) orelse return self.unstage(&self.plan_taken, &self.plan_kept);
             break :blk @intFromPtr(rec) | 3;
         };
-        for (kept.items) |t| self.stages[@backingInt(t.stmt)].push(t.it);
-        self.staged -= taken.items.len;
+        for (self.plan_kept.items) |t| self.stages[@backingInt(t.stmt)].push(t.it);
+        self.staged -= self.plan_taken.items.len;
         self.pgPush(p, token, self.enc.slice());
         return .started;
     }
 
     fn sharedComments(self: *Worker) bool {
+        if (self.shared.cfg.comments_shared_pct == 0) return false;
         const st = &self.stages[@backingInt(sql.Stmt.comments)];
         const n = @min(st.len, self.shared.cfg.plan_max);
         if (n < 2) return false;
@@ -1604,7 +1610,8 @@ pub const Worker = struct {
             .failed => {
                 // Run every member alone: a request that cannot be answered fails by itself instead of taking the batch down.
                 log.warn("planned batch failed; retrying its {d} requests one by one", .{rec.items.len});
-                for (rec.items, rec.stmts) |it, stmt| {
+                for (rec.items, rec.stmts, 0..) |it, stmt, i| {
+                    if (rec.slots[i].answered) continue;
                     var again = it;
                     again.single_only = true;
                     self.stages[@backingInt(stmt)].push(again);
@@ -1725,11 +1732,6 @@ pub const Worker = struct {
         rec.n = @intCast(n);
         self.enc.reset();
         var e = pg.Enc.init(&self.enc);
-        // A Sync only ends an extended-protocol cycle; it is not a database
-        // commit.  Keep every grouped write in one real transaction so a 2xx
-        // response makes its effects visible to the following request.
-        e.bind(sql.id(.tx_begin));
-        e.exec();
         for (0..n) |i| rec.m[i] = p.staged.items[i];
         rec.array = self.shared.cfg.write_arrays and mutations.encode(&e, rec.m[0..n]);
         if (rec.array) self.stats.array_groups += 1;
@@ -1742,8 +1744,6 @@ pub const Worker = struct {
             self.enc.putSlice("B\x00\x00\x00\x11\x00s9999\x00\x00\x00\x00\x00\x00\x00");
             self.enc.putSlice("E\x00\x00\x00\x09\x00\x00\x00\x00\x00");
         }
-        e.bind(sql.id(.tx_commit));
-        e.exec();
         e.sync();
         const rest = p.staged.items.len - n;
         std.mem.copyForwards(Member, p.staged.items[0..rest], p.staged.items[n..]);
@@ -1778,19 +1778,10 @@ pub const Worker = struct {
             var start: usize = 0;
             var idx: usize = 0;
             var seen: u32 = 0;
-            var began = false;
             const syn = &self.synth;
             while (idx < rec.n) {
                 const m = rd.next() orelse break;
                 if (m.kind != 'C') continue;
-                if (!began) {
-                    // Exclude BEGIN from every synthetic member reply.  The
-                    // full batch has already reached ReadyForQuery, so the
-                    // COMMIT below it completed before a response is sent.
-                    began = true;
-                    start = rd.pos;
-                    continue;
-                }
                 seen += 1;
                 if (seen < rec.m[idx].k) continue;
                 syn.reset();
@@ -2002,8 +1993,41 @@ pub const Worker = struct {
     }
 
     fn run(self: *Worker) void {
-        var cqes: [256]linux.io_uring_cqe = undefined;
         while (true) {
+            while (true) {
+                const head = self.ring.cq.head.*;
+                const tail = @atomicLoad(u32, self.ring.cq.tail, .acquire);
+                const count = tail -% head;
+                if (count == 0) break;
+                self.now = sys.nowUnix();
+                self.mono = monoSecs();
+                const mask = self.ring.cq.mask;
+                var cur = head;
+                while (cur != tail) : (cur +%= 1) {
+                    self.dispatch(self.ring.cq.cqes[cur & mask]);
+                }
+                self.ring.cq_advance(count);
+                self.flushReads();
+                if (self.pbuf_ring != null) self.publishBufs();
+            }
+
+            _ = self.ring.submit() catch {};
+
+            const head = self.ring.cq.head.*;
+            var tail = @atomicLoad(u32, self.ring.cq.tail, .acquire);
+            if (tail != head) continue;
+
+            var spun = false;
+            for (0..200) |_| {
+                std.atomic.spinLoopHint();
+                tail = @atomicLoad(u32, self.ring.cq.tail, .acquire);
+                if (tail != head) {
+                    spun = true;
+                    break;
+                }
+            }
+            if (spun) continue;
+
             _ = self.ring.submit_and_wait(1) catch |e| switch (e) {
                 error.SignalInterrupt => continue,
                 // Out of kernel resources / completion queue full: drain what has completed, then retry.
@@ -2013,15 +2037,6 @@ pub const Worker = struct {
                     std.process.exit(1);
                 },
             };
-            self.now = sys.nowUnix();
-            self.mono = monoSecs();
-            while (true) {
-                const n = self.ring.copy_cqes(&cqes, 0) catch 0;
-                if (n == 0) break;
-                for (cqes[0..n]) |cqe| self.dispatch(cqe);
-                self.flushReads();
-                if (self.pbuf_ring != null) self.publishBufs();
-            }
         }
     }
 };
@@ -2031,7 +2046,7 @@ pub const Worker = struct {
 // ---------------------------------------------------------------------------------------------
 
 fn monoSecs() u32 {
-    return @intCast((sys.nowNs() / 1_000_000_000) & 0x7fffffff);
+    return sys.monoSecs();
 }
 
 fn setNonblock(fd: i32) void {
@@ -2059,13 +2074,20 @@ fn setupPbufRing(w: *Worker) void {
     const ring_bytes = n_bufs * @sizeOf(linux.io_uring_buf);
     const rmem = sys.mapAnon(ring_bytes) catch return;
     var reg = std.mem.zeroInit(linux.io_uring_buf_reg, .{ .ring_addr = @intFromPtr(rmem.ptr), .ring_entries = n_bufs, .bgid = bgid });
-    const rc = linux.io_uring_register(w.ring.fd, .REGISTER_PBUF_RING, &reg, 1);
+    var rc = linux.io_uring_register(w.ring.fd, .REGISTER_PBUF_RING, &reg, 1);
+    if (sys.errnoOf(rc) == .INVAL) {
+        // Ubuntu LP #2162843: affected 6.8 kernels invert reserved-word validation
+        reg.resv[0] = 1;
+        rc = linux.io_uring_register(w.ring.fd, .REGISTER_PBUF_RING, &reg, 1);
+        reg.resv[0] = 0;
+    }
     if (sys.errnoOf(rc) != .SUCCESS) {
         log.warn("provided buffer rings unavailable ({s}); using poll + recv", .{@tagName(sys.errnoOf(rc))});
         sys.unmap(rmem);
         return;
     }
     const bmem = sys.mapAnon(n_bufs * buf_size) catch return;
+    sys.madviseHuge(bmem);
     w.pbuf_mem = bmem.ptr;
     w.pbuf_ring = @ptrCast(@alignCast(rmem.ptr));
     w.pbuf_tail = 0;
@@ -2073,7 +2095,7 @@ fn setupPbufRing(w: *Worker) void {
     w.publishBufs();
 }
 
-fn makeListener(cfg: *const Config) !i32 {
+fn makeListener(cfg: *const Config, id: usize) !i32 {
     const s = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0);
     if (sys.errnoOf(s) != .SUCCESS) return error.SocketFailed;
     const fd: i32 = @intCast(s);
@@ -2081,6 +2103,24 @@ fn makeListener(cfg: *const Config) !i32 {
     inline for (.{ .{ linux.SOL.SOCKET, linux.SO.REUSEADDR }, .{ linux.SOL.SOCKET, linux.SO.REUSEPORT }, .{ linux.IPPROTO.TCP, linux.TCP.NODELAY }, .{ linux.SOL.SOCKET, linux.SO.KEEPALIVE }, .{ linux.IPPROTO.TCP, linux.TCP.DEFER_ACCEPT } }) |o| {
         _ = linux.setsockopt(fd, o[0], o[1], @ptrCast(&one), @sizeOf(c_int));
     }
+    // SO_INCOMING_CPU: route incoming TCP connections to the worker on this CPU
+    const cpu: c_int = @intCast(id % @max(1, sys.cpuCount()));
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, 49, @ptrCast(&cpu), @sizeOf(c_int));
+
+    // TCP_THIN_LINEAR_TIMEOUTS: linear RTO (200ms) for thin streams
+    _ = linux.setsockopt(fd, linux.IPPROTO.TCP, 16, @ptrCast(&one), @sizeOf(c_int));
+
+    // Clamp socket buffer sizes and TCP window to allow up to 1M concurrent connections in 16GB RAM
+    const buf_sz: c_int = 8192;
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVBUF, @ptrCast(&buf_sz), @sizeOf(c_int));
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.SNDBUF, @ptrCast(&buf_sz), @sizeOf(c_int));
+    const clamp: c_int = 4096;
+    _ = linux.setsockopt(fd, linux.IPPROTO.TCP, 10, @ptrCast(&clamp), @sizeOf(c_int));
+
+    // Low-latency network busy polling (50 us)
+    const busy_poll: c_int = 50;
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, 46, @ptrCast(&busy_poll), @sizeOf(c_int));
+
     // Accepted sockets inherit these: probe idle peers after 10 min, so vanished clients do not hold sockets forever.
     const idle: c_int = 600;
     const intvl: c_int = 60;
@@ -2102,6 +2142,7 @@ pub fn workerMain(shared: *Shared, id: usize) void {
 }
 
 fn workerInit(shared: *Shared, id: usize) !void {
+    sys.setSchedBatch(0);
     const cfg = &shared.cfg;
     if (cfg.pin_cpus) {
         const cpus = @max(1, sys.cpuCount());
@@ -2117,6 +2158,8 @@ fn workerInit(shared: *Shared, id: usize) !void {
     w.out = .{ .pool = &w.response_pool };
     w.enc = try Buf.init(16 * 1024);
     w.scratch_rx = try gpa.alloc(u8, 64 * 1024);
+    try w.plan_taken.ensureTotalCapacity(gpa, cfg.plan_max);
+    try w.plan_kept.ensureTotalCapacity(gpa, cfg.plan_max);
     w.ring = try initRing();
     if (!cfg.no_pbuf and !cfg.coordinator) setupPbufRing(w);
     w.now = sys.nowUnix();
@@ -2130,6 +2173,7 @@ fn workerInit(shared: *Shared, id: usize) !void {
     const nfds: usize = @intCast(@min(rl.max, 1 << 21));
     if (!cfg.coordinator) {
         const cmem = try sys.mapAnon(nfds * @sizeOf(Conn));
+        sys.madviseHuge(cmem);
         w.conns = @as([*]Conn, @ptrCast(@alignCast(cmem.ptr)))[0..nfds];
     }
 
@@ -2155,7 +2199,7 @@ fn workerInit(shared: *Shared, id: usize) !void {
     w.sink.efd = @intCast(efd);
 
     if (!cfg.coordinator) {
-        w.listener = try makeListener(cfg);
+        w.listener = try makeListener(cfg, id);
         w.armAccept();
     }
     w.armHub();

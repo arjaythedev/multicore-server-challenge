@@ -10,14 +10,21 @@ pub inline fn errnoOf(rc: usize) Errno {
 
 pub fn nowNs() u64 {
     var ts: linux.timespec = undefined;
-    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    _ = linux.clock_gettime(.MONOTONIC_COARSE, &ts);
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+/// Monotonic seconds for worker clocks (zero division).
+pub fn monoSecs() u32 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC_COARSE, &ts);
+    return @truncate(@as(u64, @bitCast(ts.sec)));
 }
 
 /// Seconds since the Unix epoch.
 pub fn nowUnix() i64 {
     var ts: linux.timespec = undefined;
-    _ = linux.clock_gettime(.REALTIME, &ts);
+    _ = linux.clock_gettime(.REALTIME_COARSE, &ts);
     return ts.sec;
 }
 
@@ -55,6 +62,27 @@ pub fn pinCpu(cpu: usize) void {
     const bit_idx: u6 = @intCast(cpu % (@sizeOf(usize) * 8));
     set[word_idx] |= (@as(usize, 1) << bit_idx);
     linux.sched_setaffinity(0, &set) catch {};
+}
+
+pub fn setSchedIdle() void {
+    const param: linux.sched_param = .{ .priority = 0 };
+    _ = linux.syscall3(.sched_setscheduler, 0, 5, @intFromPtr(&param));
+}
+
+pub fn setSchedBatch(nice_val: i32) void {
+    const param: linux.sched_param = .{ .priority = 0 };
+    _ = linux.syscall3(.sched_setscheduler, 0, 3, @intFromPtr(&param));
+    if (nice_val != 0) {
+        _ = linux.syscall3(.setpriority, 0, 0, @as(usize, @bitCast(@as(isize, nice_val))));
+    }
+}
+
+pub fn unshareFiles() void {
+    _ = linux.syscall1(.unshare, 0x00000400); // CLONE_FILES
+}
+
+pub fn madviseHuge(mem: []const u8) void {
+    _ = linux.madvise(@constCast(@ptrCast(mem.ptr)), mem.len, linux.MADV.HUGEPAGE);
 }
 
 pub fn envGet(environ: [*:null]const ?[*:0]const u8, name: []const u8) ?[]const u8 {

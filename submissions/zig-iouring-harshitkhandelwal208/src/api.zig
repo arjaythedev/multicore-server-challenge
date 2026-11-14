@@ -300,7 +300,7 @@ fn optStr(o: *Buf, v: ?[]const u8) void {
 }
 
 fn boolOf(v: ?[]const u8) bool {
-    return v != null and v.?.len > 0 and v.?[0] != 0;
+    return v != null and v.?.len > 0 and v.?[0] != 0 and v.?[0] != 'f';
 }
 
 fn writeUser(w: *Worker, id_unused: void, row: [5]?[]const u8, token: []const u8) void {
@@ -364,7 +364,54 @@ pub fn writeArticle(w: *Worker, c: []const ?[]const u8, full: bool) void {
     o.put('}');
 }
 
-fn writeComment(w: *Worker, id: i64, body: []const u8, created: i64, updated: i64, username: []const u8, bio: ?[]const u8, image: ?[]const u8, following: bool) void {
+pub fn writeArticleObj(
+    w: *Worker,
+    slug: []const u8,
+    title: []const u8,
+    description: []const u8,
+    body: ?[]const u8,
+    tag_list: []const u8,
+    created: i64,
+    updated: i64,
+    favs: i64,
+    favorited: bool,
+    username: []const u8,
+    bio: ?[]const u8,
+    image: ?[]const u8,
+    following: bool,
+) void {
+    const o = &w.out;
+    o.ensure(512 + (description.len + (if (body) |b| b.len else 0)) * 2);
+    o.putSlice("{\"slug\":");
+    jw.str(o, slug);
+    o.putSlice(",\"title\":");
+    jw.str(o, title);
+    o.putSlice(",\"description\":");
+    jw.str(o, description);
+    if (body) |b| {
+        o.putSlice(",\"body\":");
+        jw.str(o, b);
+    }
+    o.putSlice(",\"tagList\":[");
+    var ta = pg.TextArray.init(tag_list);
+    var first = true;
+    while (ta.next()) |t| {
+        if (!first) o.put(',');
+        first = false;
+        jw.str(o, t);
+    }
+    o.putSlice("],\"createdAt\":");
+    jw.putTimestamp(o, created);
+    o.putSlice(",\"updatedAt\":");
+    jw.putTimestamp(o, updated);
+    o.putSlice(if (favorited) ",\"favorited\":true,\"favoritesCount\":" else ",\"favorited\":false,\"favoritesCount\":");
+    jw.putInt(o, favs);
+    o.putSlice(",\"author\":");
+    writeProfile(w, username, bio, image, following);
+    o.put('}');
+}
+
+pub fn writeComment(w: *Worker, id: i64, body: []const u8, created: i64, updated: i64, username: []const u8, bio: ?[]const u8, image: ?[]const u8, following: bool) void {
     const o = &w.out;
     o.ensure(256 + body.len * 2);
     o.putSlice("{\"id\":");
