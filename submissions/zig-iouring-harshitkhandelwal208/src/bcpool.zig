@@ -114,6 +114,11 @@ pub const Pool = struct {
     }
 
     fn worker(self: *Pool, index: usize) void {
+        if (index == 0) {
+            sys.setSchedBatch(0);
+        } else {
+            sys.setSchedBatch(10);
+        }
         var batch: [bcrypt.max_lanes]Job = undefined;
         var bj: [bcrypt.max_lanes]bcrypt.Job = undefined;
         while (true) {

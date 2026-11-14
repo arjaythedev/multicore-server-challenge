@@ -2,52 +2,62 @@
 const std = @import("std");
 const Buf = @import("buf.zig").Buf;
 
-const vlen = std.simd.suggestVectorLength(u8) orelse 16;
-const V = @Vector(vlen, u8);
+const V32 = @Vector(32, u8);
+
+inline fn escapeOne(dst: [*]u8, c: u8) usize {
+    const hex = "0123456789abcdef";
+    switch (c) {
+        '"' => dst[0..2].* = .{ '\\', '"' },
+        '\\' => dst[0..2].* = .{ '\\', '\\' },
+        '\n' => dst[0..2].* = .{ '\\', 'n' },
+        '\r' => dst[0..2].* = .{ '\\', 'r' },
+        '\t' => dst[0..2].* = .{ '\\', 't' },
+        else => {
+            dst[0..6].* = .{ '\\', 'u', '0', '0', hex[c >> 4], hex[c & 15] };
+            return 6;
+        },
+    }
+    return 2;
+}
+
+pub fn escapeInto(dst0: [*]u8, s: []const u8) usize {
+    var dst = dst0;
+    var i: usize = 0;
+    const lo: V32 = @splat(0x20);
+    const quote: V32 = @splat('"');
+    const back: V32 = @splat('\\');
+    while (i + 32 <= s.len) {
+        const v: V32 = s[i..][0..32].*;
+        const mask: u32 = @bitCast((v < lo) | (v == quote) | (v == back));
+        dst[0..32].* = v;
+        if (mask == 0) {
+            dst += 32;
+            i += 32;
+            continue;
+        }
+        const k = @ctz(mask);
+        dst += k;
+        i += k;
+        dst += escapeOne(dst, s[i]);
+        i += 1;
+    }
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (c < 0x20 or c == '"' or c == '\\') {
+            dst += escapeOne(dst, c);
+        } else {
+            dst[0] = c;
+            dst += 1;
+        }
+    }
+    return dst - dst0;
+}
 
 /// Append `s` as the contents of a JSON string (no surrounding quotes).
 pub fn putEscaped(b: *Buf, s: []const u8) void {
-    b.ensure(s.len);
-    var i: usize = 0;
-    while (true) {
-        // Skip clean chunks a vector at a time.
-        while (i + vlen <= s.len) {
-            const v: V = s[i..][0..vlen].*;
-            const bad = (v < @as(V, @splat(0x20))) | (v == @as(V, @splat('"'))) | (v == @as(V, @splat('\\')));
-            if (@reduce(.Or, bad)) break;
-            b.ptr[b.len..][0..vlen].* = v;
-            b.len += vlen;
-            i += vlen;
-        }
-        const start = i;
-        // Find the exact byte (scalar) in this chunk or the tail.
-        const end = @min(s.len, i + vlen);
-        while (i < end) : (i += 1) {
-            const c = s[i];
-            if (c < 0x20 or c == '"' or c == '\\') break;
-        }
-        b.putSlice(s[start..i]);
-        if (i >= s.len) break;
-        if (i == end and end < s.len) continue; // chunk was clean after all; resume vector scan
-        const c = s[i];
-        if (c >= 0x20 and c != '"' and c != '\\') {
-            continue;
-        }
-        switch (c) {
-            '"' => b.putSlice("\\\""),
-            '\\' => b.putSlice("\\\\"),
-            '\n' => b.putSlice("\\n"),
-            '\r' => b.putSlice("\\r"),
-            '\t' => b.putSlice("\\t"),
-            else => {
-                const hex = "0123456789abcdef";
-                b.putSlice(&[6]u8{ '\\', 'u', '0', '0', hex[c >> 4], hex[c & 15] });
-            },
-        }
-        i += 1;
-        // Escapes may have grown the buffer; reserve the remaining clean input again.
-        b.ensure(s.len - i);
-    }
+    b.ensure(6 * s.len + 32);
+    const n = escapeInto(b.ptr + b.len, s);
+    b.len += n;
 }
 
 pub inline fn str(b: *Buf, s: []const u8) void {
@@ -57,15 +67,36 @@ pub inline fn str(b: *Buf, s: []const u8) void {
     b.put('"');
 }
 
+const digits2: [200]u8 = blk: {
+    var t: [200]u8 = undefined;
+    for (0..100) |i| {
+        t[2 * i] = '0' + @as(u8, @intCast(i / 10));
+        t[2 * i + 1] = '0' + @as(u8, @intCast(i % 10));
+    }
+    break :blk t;
+};
+
+inline fn put2(dst: []u8, v: u64) void {
+    dst[0..2].* = digits2[2 * @as(usize, @intCast(v)) ..][0..2].*;
+}
+
 pub fn putUint(b: *Buf, v: u64) void {
     var tmp: [20]u8 = undefined;
     var i: usize = tmp.len;
     var x = v;
-    while (true) {
+    while (x >= 100) {
+        const q = x / 100;
+        const r: usize = @intCast(x - q * 100);
+        i -= 2;
+        tmp[i..][0..2].* = digits2[2 * r ..][0..2].*;
+        x = q;
+    }
+    if (x >= 10) {
+        i -= 2;
+        tmp[i..][0..2].* = digits2[2 * @as(usize, @intCast(x)) ..][0..2].*;
+    } else {
         i -= 1;
-        tmp[i] = '0' + @as(u8, @intCast(x % 10));
-        x /= 10;
-        if (x == 0) break;
+        tmp[i] = '0' + @as(u8, @intCast(x));
     }
     b.putSlice(tmp[i..]);
 }
@@ -77,13 +108,66 @@ pub fn putInt(b: *Buf, v: i64) void {
     } else putUint(b, @intCast(v));
 }
 
+/// Calendar date (year, month, day) of a day count since 0000-03-01 (proleptic Gregorian), unsigned arithmetic only.
+inline fn civil(z: u64) struct { y: u64, m: u64, d: u64 } {
+    const era = z / 146097;
+    const doe = z - era * 146097;
+    const yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const mp = (5 * doy + 2) / 153;
+    const d = doy - (153 * mp + 2) / 5 + 1;
+    const m = if (mp < 10) mp + 3 else mp - 9;
+    return .{ .y = yoe + era * 400 + @intFromBool(m <= 2), .m = m, .d = d };
+}
+
+threadlocal var last_day: u64 = std.math.maxInt(u64);
+threadlocal var last_date: [11]u8 = undefined; // `"YYYY-MM-DD`
+
 /// Postgres timestamptz (binary: microseconds since 2000-01-01 UTC) as RFC 3339 with 3 fractional digits.
 pub fn putTimestamp(b: *Buf, pg_micros: i64) void {
+    if (pg_micros < 0 or pg_micros >= 2_900_000 * 86_400_000_000) return putTimestampSlow(b, pg_micros);
+    b.ensure(32);
+    const us: u64 = @intCast(pg_micros);
+    const days = us / 86_400_000_000;
+    const rem = us - days * 86_400_000_000;
+    if (days != last_day) {
+        const c = civil(days + 10957 + 719468);
+        last_date[0] = '"';
+        put2(last_date[1..3], c.y / 100);
+        put2(last_date[3..5], c.y % 100);
+        last_date[5] = '-';
+        put2(last_date[6..8], c.m);
+        last_date[8] = '-';
+        put2(last_date[9..11], c.d);
+        last_day = days;
+    }
+    const secs = rem / 1_000_000;
+    const ms = (rem - secs * 1_000_000) / 1000;
+    const hh = secs / 3600;
+    const mm = (secs - hh * 3600) / 60;
+    const ss = secs - hh * 3600 - mm * 60;
+    const o = b.ptr + b.len;
+    o[0..11].* = last_date;
+    o[11] = 'T';
+    put2(o[12..14], hh);
+    o[14] = ':';
+    put2(o[15..17], mm);
+    o[17] = ':';
+    put2(o[18..20], ss);
+    o[20] = '.';
+    const msh = ms / 100;
+    o[21] = '0' + @as(u8, @intCast(msh));
+    put2(o[22..24], ms - msh * 100);
+    o[24] = 'Z';
+    o[25] = '"';
+    b.len += 26;
+}
+
+pub fn putTimestampSlow(b: *Buf, pg_micros: i64) void {
     const us_per_day: i64 = 86_400_000_000;
     const days = @divFloor(pg_micros, us_per_day);
     const rem: u64 = @intCast(pg_micros - days * us_per_day);
-    // civil from days (days since 2000-01-01 -> days since 0000-03-01 shift)
-    const z: i64 = days + 10957 + 719468; // 10957 days from 1970-01-01 to 2000-01-01
+    const z: i64 = days + 10957 + 719468;
     const era = @divFloor(z, 146097);
     const doe: i64 = z - era * 146097;
     const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
@@ -101,34 +185,24 @@ pub fn putTimestamp(b: *Buf, pg_micros: i64) void {
     var o: [26]u8 = undefined;
     const yy: u64 = @intCast(@max(0, @min(9999, y)));
     o[0] = '"';
-    pair(o[1..3], yy / 100);
-    pair(o[3..5], yy % 100);
+    put2(o[1..3], yy / 100);
+    put2(o[3..5], yy % 100);
     o[5] = '-';
-    pair(o[6..8], @intCast(m));
+    put2(o[6..8], @intCast(m));
     o[8] = '-';
-    pair(o[9..11], @intCast(d));
+    put2(o[9..11], @intCast(d));
     o[11] = 'T';
-    pair(o[12..14], hh);
+    put2(o[12..14], hh);
     o[14] = ':';
-    pair(o[15..17], mm);
+    put2(o[15..17], mm);
     o[17] = ':';
-    pair(o[18..20], ss);
+    put2(o[18..20], ss);
     o[20] = '.';
     o[21] = '0' + @as(u8, @intCast(ms / 100));
-    pair(o[22..24], ms % 100);
+    put2(o[22..24], ms % 100);
     o[24] = 'Z';
     o[25] = '"';
     b.putSlice(&o);
-}
-
-const digit_pairs = blk: {
-    var pairs: [100][2]u8 = undefined;
-    for (&pairs, 0..) |*p, i| p.* = .{ '0' + @as(u8, @intCast(i / 10)), '0' + @as(u8, @intCast(i % 10)) };
-    break :blk pairs;
-};
-
-inline fn pair(out: *[2]u8, n: u64) void {
-    out.* = digit_pairs[n];
 }
 
 test "escape" {

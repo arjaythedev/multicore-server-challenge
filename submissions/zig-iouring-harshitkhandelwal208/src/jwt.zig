@@ -9,6 +9,41 @@ const b64 = std.base64.url_safe_no_pad;
 pub const lifetime: i64 = 30 * 24 * 3600;
 const header_b64 = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"; // {"alg":"HS256","typ":"JWT"}
 
+const b64_table: [256]i8 = blk: {
+    var tab: [256]i8 = @splat(-1);
+    for ("ABCDEFGHIJKLMNOPQRSTUVWXYZ", 0..) |c, i| tab[c] = @intCast(i);
+    for ("abcdefghijklmnopqrstuvwxyz", 26..) |c, i| tab[c] = @intCast(i);
+    for ("0123456789", 52..) |c, i| tab[c] = @intCast(i);
+    tab['-'] = 62;
+    tab['_'] = 63;
+    break :blk tab;
+};
+
+inline fn decodeSig43(out: *[32]u8, s: *const [43]u8) bool {
+    var o: usize = 0;
+    var i: usize = 0;
+    while (i < 40) : (i += 4) {
+        const v0: i32 = b64_table[s[i]];
+        const v1: i32 = b64_table[s[i + 1]];
+        const v2: i32 = b64_table[s[i + 2]];
+        const v3: i32 = b64_table[s[i + 3]];
+        if ((v0 | v1 | v2 | v3) < 0) return false;
+        const val = (@as(u32, @intCast(v0)) << 18) | (@as(u32, @intCast(v1)) << 12) | (@as(u32, @intCast(v2)) << 6) | @as(u32, @intCast(v3));
+        out[o] = @truncate(val >> 16);
+        out[o + 1] = @truncate(val >> 8);
+        out[o + 2] = @truncate(val);
+        o += 3;
+    }
+    const v0: i32 = b64_table[s[40]];
+    const v1: i32 = b64_table[s[41]];
+    const v2: i32 = b64_table[s[42]];
+    if ((v0 | v1 | v2) < 0 or (v2 & 3) != 0) return false;
+    const val = (@as(u32, @intCast(v0)) << 12) | (@as(u32, @intCast(v1)) << 6) | @as(u32, @intCast(v2));
+    out[30] = @truncate(val >> 10);
+    out[31] = @truncate(val >> 2);
+    return true;
+}
+
 pub const Key = struct {
     inner: Sha256,
     outer: Sha256,
@@ -62,7 +97,7 @@ pub const Key = struct {
         const sig_b = token[d2 + 1 ..];
         if (sig_b.len != 43) return null;
         var sig: [32]u8 = undefined;
-        b64.Decoder.decode(&sig, sig_b) catch return null;
+        if (!decodeSig43(&sig, sig_b[0..43])) return null;
         const want = self.mac(token[0..d2]);
         var diff: u8 = 0;
         for (sig, want) |a, b| diff |= a ^ b;

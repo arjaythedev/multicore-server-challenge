@@ -44,23 +44,50 @@ pub fn parseHead(data: []const u8) Parsed {
     const head = data[0..end];
     const line_end = std.mem.indexOf(u8, head, "\r\n") orelse head.len;
     const line = head[0..line_end];
-    const sp1 = std.mem.indexOfScalar(u8, line, ' ') orelse return .{ .bad = 400 };
-    const sp2 = std.mem.lastIndexOfScalar(u8, line, ' ') orelse return .{ .bad = 400 };
-    if (sp2 <= sp1) return .{ .bad = 400 };
-    const m = line[0..sp1];
-    const target = line[sp1 + 1 .. sp2];
-    const ver = line[sp2 + 1 ..];
+    var method: Method = .other;
+    var target: []const u8 = undefined;
+    var keep_alive: bool = true;
+
+    var matched = false;
+    if (line.len >= 14 and line[line.len - 9] == ' ') {
+        const ver_u64 = std.mem.readInt(u64, line[line.len - 8 ..][0..8], .little);
+        if (ver_u64 == 0x312e312f50545448 or ver_u64 == 0x302e312f50545448) {
+            const w4 = std.mem.readInt(u32, line[0..4], .little);
+            if (w4 == 0x20544547) { // "GET "
+                method = .get;
+                target = line[4 .. line.len - 9];
+                keep_alive = (ver_u64 == 0x312e312f50545448);
+                matched = true;
+            } else if (w4 == 0x54534f50 and line.len >= 15 and line[4] == ' ') { // "POST "
+                method = .post;
+                target = line[5 .. line.len - 9];
+                keep_alive = (ver_u64 == 0x312e312f50545448);
+                matched = true;
+            }
+        }
+    }
+    if (!matched) {
+        const sp1 = std.mem.indexOfScalar(u8, line, ' ') orelse return .{ .bad = 400 };
+        const sp2 = std.mem.lastIndexOfScalar(u8, line, ' ') orelse return .{ .bad = 400 };
+        if (sp2 <= sp1) return .{ .bad = 400 };
+        const m = line[0..sp1];
+        target = line[sp1 + 1 .. sp2];
+        const ver = line[sp2 + 1 ..];
+        method = if (std.mem.eql(u8, m, "GET")) .get else if (std.mem.eql(u8, m, "POST")) .post else if (std.mem.eql(u8, m, "PUT")) .put else if (std.mem.eql(u8, m, "DELETE")) .delete else .other;
+        if (std.mem.eql(u8, ver, "HTTP/1.1")) {
+            keep_alive = true;
+        } else if (std.mem.eql(u8, ver, "HTTP/1.0")) {
+            keep_alive = false;
+        } else return .{ .bad = 505 };
+    }
+
     var h: Head = .{
-        .method = if (std.mem.eql(u8, m, "GET")) .get else if (std.mem.eql(u8, m, "POST")) .post else if (std.mem.eql(u8, m, "PUT")) .put else if (std.mem.eql(u8, m, "DELETE")) .delete else .other,
+        .method = method,
         .path = target,
         .query = "",
         .head_len = end + 4,
+        .keep_alive = keep_alive,
     };
-    if (std.mem.eql(u8, ver, "HTTP/1.1")) {
-        h.keep_alive = true;
-    } else if (std.mem.eql(u8, ver, "HTTP/1.0")) {
-        h.keep_alive = false;
-    } else return .{ .bad = 505 };
     if (target.len == 0 or target[0] != '/') return .{ .bad = 400 };
     if (std.mem.indexOfScalar(u8, target, '?')) |q| {
         h.path = target[0..q];
@@ -290,6 +317,29 @@ pub fn finishResponse(buf: []u8, body_len: usize, code: u16, keep_alive: bool) [
 }
 
 pub fn finishEncodedResponse(buf: []u8, body_len: usize, code: u16, keep_alive: bool, gzip: bool, vary: bool) []u8 {
+    if ((code == 200 or code == 201) and keep_alive and !gzip and !vary) {
+        var o: usize = head_room;
+        buf[o - 4] = '\r';
+        buf[o - 3] = '\n';
+        buf[o - 2] = '\r';
+        buf[o - 1] = '\n';
+        o -= 4;
+        var x = body_len;
+        while (x >= 10) {
+            o -= 1;
+            buf[o] = '0' + @as(u8, @intCast(x % 10));
+            x /= 10;
+        }
+        o -= 1;
+        buf[o] = '0' + @as(u8, @intCast(x));
+        const pfx = if (code == 200)
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+        else
+            "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: ";
+        o -= pfx.len;
+        @memcpy(buf[o..][0..pfx.len], pfx);
+        return buf[o .. head_room + body_len];
+    }
     var tmp: [head_room]u8 = undefined;
     var n: usize = 0;
     const sl = statusLine(code);

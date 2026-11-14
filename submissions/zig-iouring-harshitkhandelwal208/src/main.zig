@@ -20,6 +20,7 @@ pub fn main(init: std.process.Init) !void {
     // uses plain writes; everything else already passes MSG_NOSIGNAL).
     const ignore: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.IGN }, .mask = linux.sigemptyset(), .flags = 0 };
     _ = linux.sigaction(.PIPE, &ignore, null);
+    sys.lockMemory();
 
     const gpa = @import("buf.zig").gpa;
     const url = init.environ_map.get("DATABASE_URL") orelse "postgres://conduit:conduit@127.0.0.1:5432/conduit";
@@ -42,18 +43,15 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const cpus: u32 = @intCast(std.Thread.getCpuCount() catch 4);
-    // Workers are shared-nothing, so they can be threads of one process or separate processes. A process is limited to
-    // LimitNOFILE open files (200,000 on the benchmark box), so by default every worker is its own process: the
-    // number of connections is then bounded by memory and CPU, not by a per-process limit.
-    const workers_wanted = @max(1, envInt(init, "WORKERS", @max(1, (cpus + 3) / 4)));
+    // On 1-4 cores, 1 worker per core. On 8 cores, reserve 4 cores for Postgres and network softirqs.
+    const default_workers: u32 = if (cpus <= 4) cpus else @min(cpus / 2, 4);
+    const workers_wanted = @max(1, envInt(init, "WORKERS", default_workers));
     const procs = @max(1, @min(envInt(init, "PROCS", workers_wanted), workers_wanted));
     const threads = (workers_wanted + procs - 1) / procs; // workers (threads) per process
     // The number actually started (WORKERS rounded up to a multiple of PROCS): connection counts are per started worker.
     const workers = procs * threads;
-    // Postgres connections: about one per CPU in total. More backends than cores only add context switches and cache
-    // pressure inside Postgres (measured: 36 connections cost ~25% of the throughput of 6 on 6 CPUs); depth, not
-    // width, keeps each backend busy. A quarter of them (at least one per worker) are for writes.
-    const total_conns = @min(envInt(init, "DB_CONNS", @max(4, cpus)), 95);
+    // Postgres connections: scale to handle concurrency up to max_connections=100 ceiling.
+    const total_conns = @min(envInt(init, "DB_CONNS", @max(16, cpus * 4)), 95);
     const writes_total = envInt(init, "DB_WRITE_CONNS", @max(workers, total_conns / 4));
     var cfg = server.Config{
         .host = host,
@@ -66,14 +64,14 @@ pub fn main(init: std.process.Init) !void {
         .pg_depth = std.math.clamp(envInt(init, "PG_DEPTH", 4), 1, 32), // standalone and grouped writes share this bounded depth
         .read_depth = std.math.clamp(envInt(init, "READ_DEPTH", envInt(init, "PG_DEPTH", 4)), 1, 32),
         .packed_reads = envInt(init, "PACKED_READS", 0) != 0,
-        .ack_delay = envInt(init, "ACK_DELAY", 0) != 0,
+        .ack_delay = envInt(init, "ACK_DELAY", 1) != 0,
         .gzip_mode = @min(envInt(init, "GZIP", 0), 2),
         .gzip_min = @max(1024, envInt(init, "GZIP_MIN", 1024)),
-        .comments_shared_pct = @min(envInt(init, "COMMENTS_SHARED_PCT", 50), 100),
+        .comments_shared_pct = @min(envInt(init, "COMMENTS_SHARED_PCT", 0), 100),
         .send_zc_min = @max(1, envInt(init, "SEND_ZC_MIN", 256)),
         .write_group_max = std.math.clamp(envInt(init, "WRITE_GROUP_MAX", 32), 1, 128),
         .write_window_us = @min(envInt(init, "WRITE_WINDOW_US", 0), 10000),
-        .write_arrays = envInt(init, "WRITE_ARRAYS", 0) != 0,
+        .write_arrays = envInt(init, "WRITE_ARRAYS", 1) != 0,
         .batch_max = @max(1, @min(envInt(init, "BATCH_MAX", 64), 256)),
         .read_window_us = envInt(init, "READ_WINDOW_US", 100000), // a staged read waits at most this long for company
         .read_hold_min = envInt(init, "READ_HOLD_MIN", 2048), // ... unless this many are staged already (a full plan batch)
@@ -84,7 +82,7 @@ pub fn main(init: std.process.Init) !void {
         .send_zc = envInt(init, "SEND_ZC", 1) != 0,
         .pin_cpus = envInt(init, "PIN_CPUS", 0) != 0,
         .bc_threads = @max(1, envInt(init, "BCRYPT_THREADS", @max(1, (cpus / 4 + procs - 1) / procs))),
-        .bc_lanes = std.math.clamp(envInt(init, "BCRYPT_LANES", 4), 1, bcrypt.max_lanes),
+        .bc_lanes = std.math.clamp(envInt(init, "BCRYPT_LANES", 5), 1, bcrypt.max_lanes),
         .bc_wait_ms = envInt(init, "BCRYPT_WAIT_MS", 250),
         .bc_auto = envInt(init, "BCRYPT_AUTO", 0) != 0 and init.environ_map.get("BCRYPT_LANES") == null,
         .bc_idle_ms = envInt(init, "BCRYPT_IDLE_MS", 0),

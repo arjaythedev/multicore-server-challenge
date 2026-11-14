@@ -5,7 +5,7 @@
 //! core overlap their chains. The result is bit-identical to the reference algorithm; only the schedule differs.
 const std = @import("std");
 
-pub const max_lanes = 4;
+pub const max_lanes = 5;
 pub const salt_len = 16;
 pub const hash_len = 60;
 
@@ -46,28 +46,32 @@ inline fn f(s: *const [4][256]u32, x: u32) u32 {
     return ((a +% b) ^ c) +% d;
 }
 
-// ---- hand-written x86-64 kernel: 4 lanes in registers ---------------------------------------------------------
+// ---- hand-written x86-64 kernel: 5 lanes in registers ---------------------------------------------------------
 //
-// The compiler spills at four or more interleaved lanes. Written by hand, four lanes fit in the 15 usable registers:
-//   rdi  base of the Quad          r8-r11  L of lane 0-3        r12-r15  R of lane 0-3
-//   rax, rbx, rcx, rdx  F() accumulator of lane 0-3             rsi      byte-index temp, shared by all lanes
-// Reusing one index register across lanes costs nothing: the core renames it, so only true dependencies remain.
-// Per half-round and lane: R ^= ((S0[L>>24] + S1[L>>16&255]) ^ S2[L>>8&255]) + S3[L&255] ^ P[i].
+// The compiler spills at four or more interleaved lanes. Written by hand, five lanes fit in the 15 usable registers:
+//   rdi  base of the Quint
+//   ebx/ebp, r8/r9, r10/r11, r12/r13, r14/r15  (L, R) of lanes 0-4
+//   eax=0x0810, ecx=0x0808  BEXTR bitfield controls
+//   edx  F() accumulator, shared across lanes (renamed by PRF)
+//   rsi  scratch S-box index and loop-counter register
+// Zero spills during Blowfish encryption. Loop counter lives at Quint.counter in L1d cache.
 
 const builtin = @import("builtin");
-/// The hand-written kernel needs BMI2 (rorx); the build targets the machine it runs on (-Dcpu=native).
+/// The hand-written kernel needs BMI2 (bextr); the build targets the machine it runs on (-Dcpu=native).
 const have_asm = builtin.cpu.arch == .x86_64 and std.Target.x86.featureSetHas(builtin.cpu.features, .bmi2);
 const use_asm = true;
 
-const Quad = extern struct {
-    st: [4]State,
-    lr: [8]u32 align(64), // l0..l3, r0..r3 (loaded at entry, stored at exit)
+const Quint = extern struct {
+    st: [5]State,
+    counter: u64,
+    lr: [10]u32 align(64),
 };
 
 const stride = @sizeOf(State);
 const p_off = @offsetOf(State, "p");
 const s_off = @offsetOf(State, "s");
-const lr_off = @offsetOf(Quad, "lr");
+const counter_off = @offsetOf(Quint, "counter");
+const lr_off = @offsetOf(Quint, "lr");
 
 fn num(comptime v: usize) []const u8 {
     comptime {
@@ -82,54 +86,26 @@ fn num(comptime v: usize) []const u8 {
     }
 }
 
-const Lr = [4][]const u8{ "%r8d", "%r9d", "%r10d", "%r11d" };
-const Lb = [4][]const u8{ "%r8b", "%r9b", "%r10b", "%r11b" };
-const Rr = [4][]const u8{ "%r12d", "%r13d", "%r14d", "%r15d" };
-const Xr = [4][]const u8{ "%eax", "%ebx", "%ecx", "%edx" };
+const Lr = [5][]const u8{ "%ebx", "%r8d", "%r10d", "%r12d", "%r14d" };
+const Lb = [5][]const u8{ "%bl", "%r8b", "%r10b", "%r12b", "%r14b" };
+const Rr = [5][]const u8{ "%ebp", "%r9d", "%r11d", "%r13d", "%r15d" };
+const Rb = [5][]const u8{ "%bpl", "%r9b", "%r11b", "%r13b", "%r15b" };
 
-/// One half-round for `N` lanes (lane-major so each lane's chain is contiguous): R ^= F(L) ^ P[pi].
-fn halfRound(comptime N: usize, comptime l: [4][]const u8, comptime lb: [4][]const u8, comptime r: [4][]const u8, comptime pi: usize) []const u8 {
+/// One half-round for `N` lanes using BMI1/BMI2 bextr: R ^= F(L) ^ P[pi].
+/// 11 instructions per lane, zero register spills; %eax=0x0810, %ecx=0x0808, %edx=accumulator.
+fn halfRound(comptime N: usize, comptime l: [5][]const u8, comptime lb: [5][]const u8, comptime r: [5][]const u8, comptime pi: usize) []const u8 {
     comptime {
         @setEvalBranchQuota(10_000_000);
         var o: []const u8 = "";
         for (0..N) |k| {
             const b0 = k * stride + s_off;
-            // rorx (BMI2) is a 3-operand rotate: the wanted byte lands in the low byte without a separate mov.
-            // R ^= P[pi] is off the F() chain: do it first, while the S-box loads are in flight
             o = o ++ "xorl " ++ num(k * stride + p_off + pi * 4) ++ "(%rdi), " ++ r[k] ++ "\n";
-            o = o ++ "rorxl $24, " ++ l[k] ++ ", %esi\n movzbl %sil, %esi\n movl " ++ num(b0) ++ "(%rdi,%rsi,4), " ++ Xr[k] ++ "\n";
-            o = o ++ "rorxl $16, " ++ l[k] ++ ", %esi\n movzbl %sil, %esi\n addl " ++ num(b0 + 1024) ++ "(%rdi,%rsi,4), " ++ Xr[k] ++ "\n";
-            o = o ++ "rorxl $8, " ++ l[k] ++ ", %esi\n movzbl %sil, %esi\n xorl " ++ num(b0 + 2048) ++ "(%rdi,%rsi,4), " ++ Xr[k] ++ "\n";
-            o = o ++ "movzbl " ++ lb[k] ++ ", %esi\n addl " ++ num(b0 + 3072) ++ "(%rdi,%rsi,4), " ++ Xr[k] ++ "\n" ++
-                "xorl " ++ Xr[k] ++ ", " ++ r[k] ++ "\n";
+            o = o ++ "movl " ++ l[k] ++ ", %esi\n shrl $24, %esi\n movl " ++ num(b0) ++ "(%rdi,%rsi,4), %edx\n";
+            o = o ++ "bextrl %eax, " ++ l[k] ++ ", %esi\n addl " ++ num(b0 + 1024) ++ "(%rdi,%rsi,4), %edx\n";
+            o = o ++ "bextrl %ecx, " ++ l[k] ++ ", %esi\n xorl " ++ num(b0 + 2048) ++ "(%rdi,%rsi,4), %edx\n";
+            o = o ++ "movzbl " ++ lb[k] ++ ", %esi\n addl " ++ num(b0 + 3072) ++ "(%rdi,%rsi,4), %edx\n" ++
+                "xorl %edx, " ++ r[k] ++ "\n";
         }
-        return o;
-    }
-}
-
-const Rb = [4][]const u8{ "%r12b", "%r13b", "%r14b", "%r15b" };
-
-/// One block: L,R -> (R ^ P[17], L) in the register roles swapped (the caller swaps names, no moves).
-fn blockText(comptime N: usize, comptime l: [4][]const u8, comptime lb: [4][]const u8, comptime r: [4][]const u8, comptime rb: [4][]const u8) []const u8 {
-    comptime {
-        @setEvalBranchQuota(10_000_000);
-        var o: []const u8 = "";
-        for (0..N) |k| o = o ++ "xorl " ++ num(k * stride + p_off) ++ "(%rdi), " ++ l[k] ++ "\n";
-        var i: usize = 1;
-        while (i < 16) : (i += 2) {
-            o = o ++ halfRound(N, l, lb, r, i);
-            o = o ++ halfRound(N, r, rb, l, i + 1);
-        }
-        for (0..N) |k| o = o ++ "xorl " ++ num(k * stride + p_off + 17 * 4) ++ "(%rdi), " ++ r[k] ++ "\n";
-        return o;
-    }
-}
-
-/// Stores the block just computed (new L is in `r`, new R in `l`) at byte offset %rbp of each lane's state.
-fn storeText(comptime N: usize, comptime l: [4][]const u8, comptime r: [4][]const u8) []const u8 {
-    comptime {
-        var o: []const u8 = "";
-        for (0..N) |k| o = o ++ "movl " ++ r[k] ++ ", " ++ num(k * stride + p_off) ++ "(%rdi,%rbp)\n movl " ++ l[k] ++ ", " ++ num(k * stride + p_off + 4) ++ "(%rdi,%rbp)\n";
         return o;
     }
 }
@@ -138,56 +114,49 @@ fn storeText(comptime N: usize, comptime l: [4][]const u8, comptime r: [4][]cons
 /// next word pair of P then S. Registers hold L/R across blocks; nothing round-trips through memory.
 fn expand0AsmText(comptime N: usize) []const u8 {
     comptime {
-        var o: []const u8 = "";
+        @setEvalBranchQuota(10_000_000);
+        var o: []const u8 = "movq $0, " ++ num(counter_off) ++ "(%rdi)\n";
+        o = o ++ "movl $0x0810, %eax\n movl $0x0808, %ecx\n";
         for (0..N) |k| o = o ++ "xorl " ++ Lr[k] ++ ", " ++ Lr[k] ++ "\n xorl " ++ Rr[k] ++ ", " ++ Rr[k] ++ "\n";
-        o = o ++ "xorl %ebp, %ebp\n1:\n";
-        o = o ++ blockText(N, Lr, Lb, Rr, Rb) ++ storeText(N, Lr, Rr) ++ "addq $8, %rbp\n";
-        o = o ++ blockText(N, Rr, Rb, Lr, Lb) ++ storeText(N, Rr, Lr) ++ "addq $8, %rbp\n";
-        o = o ++ "cmpq $4160, %rbp\n jb 1b\n";
-        o = o ++ blockText(N, Lr, Lb, Rr, Rb) ++ storeText(N, Lr, Rr);
+        o = o ++ "1:\n";
+        for (0..N) |k| o = o ++ "xorl " ++ num(k * stride + p_off) ++ "(%rdi), " ++ Lr[k] ++ "\n";
+        var i: usize = 1;
+        while (i < 16) : (i += 2) {
+            o = o ++ halfRound(N, Lr, Lb, Rr, i);
+            o = o ++ halfRound(N, Rr, Rb, Lr, i + 1);
+        }
+        for (0..N) |k| o = o ++ "xorl " ++ num(k * stride + p_off + 17 * 4) ++ "(%rdi), " ++ Rr[k] ++ "\n";
+        // Store output (Rr, Lr) at word pair [rsi] and swap registers
+        o = o ++ "movq " ++ num(counter_off) ++ "(%rdi), %rsi\n";
+        for (0..N) |k| {
+            o = o ++ "movl " ++ Rr[k] ++ ", " ++ num(k * stride + p_off) ++ "(%rdi,%rsi,8)\n";
+            o = o ++ "movl " ++ Lr[k] ++ ", " ++ num(k * stride + p_off + 4) ++ "(%rdi,%rsi,8)\n";
+            o = o ++ "movl " ++ Lr[k] ++ ", %edx\n";
+            o = o ++ "movl " ++ Rr[k] ++ ", " ++ Lr[k] ++ "\n";
+            o = o ++ "movl %edx, " ++ Rr[k] ++ "\n";
+        }
+        o = o ++ "incq %rsi\n";
+        o = o ++ "movq %rsi, " ++ num(counter_off) ++ "(%rdi)\n";
+        o = o ++ "cmpq $521, %rsi\n";
+        o = o ++ "jb 1b\n";
         return o;
     }
 }
 
-inline fn expand0Asm(comptime N: usize, q: *Quad) void {
+inline fn expand0Asm(comptime N: usize, q: *Quint) void {
     asm volatile (expand0AsmText(N)
         :
         : [q] "{rdi}" (q),
-        : .{ .rax = true, .rbx = true, .rcx = true, .rdx = true, .rsi = true, .rbp = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .memory = true, .cc = true });
-}
-
-fn encipherAsmText(comptime N: usize) []const u8 {
-    comptime {
-        @setEvalBranchQuota(10_000_000);
-        var o: []const u8 = "";
-        for (0..N) |k| o = o ++ "movl " ++ num(lr_off + k * 4) ++ "(%rdi), " ++ Lr[k] ++ "\n movl " ++ num(lr_off + 16 + k * 4) ++ "(%rdi), " ++ Rr[k] ++ "\n";
-        o = o ++ blockText(N, Lr, Lb, Rr, Rb);
-        for (0..N) |k| {
-            o = o ++ "movl " ++ Rr[k] ++ ", " ++ num(lr_off + k * 4) ++ "(%rdi)\n";
-            o = o ++ "movl " ++ Lr[k] ++ ", " ++ num(lr_off + 16 + k * 4) ++ "(%rdi)\n";
-        }
-        return o;
-    }
-}
-
-inline fn encipherAsm(comptime N: usize, q: *Quad) void {
-    asm volatile (encipherAsmText(N)
-        :
-        : [q] "{rdi}" (q),
-        : .{ .rax = true, .rbx = true, .rcx = true, .rdx = true, .rsi = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true, .memory = true, .cc = true });
+        : .{
+            .rax = true, .rbx = true, .rcx = true, .rdx = true, .rsi = true,
+            .rbp = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true,
+            .r12 = true, .r13 = true, .r14 = true, .r15 = true,
+            .memory = true, .cc = true,
+        });
 }
 
 /// Encipher one block per lane. `l`/`r` are the lanes' halves, updated in place.
 inline fn encipher(comptime n: usize, st: *[n]State, l: *[n]u32, r: *[n]u32) void {
-    if (comptime (n == 4 and have_asm and use_asm)) {
-        const q: *Quad = @fieldParentPtr("st", st);
-        q.lr[0..4].* = l.*;
-        q.lr[4..8].* = r.*;
-        encipherAsm(4, q);
-        l.* = q.lr[0..4].*;
-        r.* = q.lr[4..8].*;
-        return;
-    }
     inline for (0..n) |k| l[k] ^= st[k].p[0];
     comptime var i: usize = 1;
     inline while (i < 16) : (i += 2) {
@@ -206,9 +175,9 @@ fn expand0(comptime n: usize, st: *[n]State, kw: *const [n][18]u32) void {
     inline for (0..n) |k| {
         inline for (0..18) |i| st[k].p[i] ^= kw[k][i];
     }
-    if (comptime (n == 4 and have_asm and use_asm)) {
-        const q: *Quad = @fieldParentPtr("st", st);
-        expand0Asm(4, q);
+    if (comptime (have_asm and use_asm and n <= 5)) {
+        const q: *Quint = @fieldParentPtr("st", @as(*[5]State, @ptrCast(st)));
+        expand0Asm(n, q);
         return;
     }
     var l: [n]u32 = @splat(0);
@@ -276,9 +245,8 @@ fn expandSalted(comptime n: usize, st: *[n]State, kw: *const [n][18]u32, salts: 
 }
 
 fn run(comptime n: usize, keys: *const [n][]const u8, salts: *const [n][16]u8, cost: u6, out: *[n][23]u8) void {
-    var quad: Quad = undefined;
-    var plain: [if (n == 4) 0 else n]State = undefined;
-    const st: *[n]State = if (n == 4) @ptrCast(&quad.st) else &plain;
+    var quint: Quint = undefined;
+    const st: *[n]State = @ptrCast(quint.st[0..n]);
     var kw: [n][18]u32 = undefined;
     var sk: [n][18]u32 = undefined;
     inline for (0..n) |k| {
@@ -335,31 +303,24 @@ fn keyOf(buf: *[73]u8, password: []const u8) []const u8 {
 }
 
 /// Hash `jobs` (1..max_lanes, all with the same cost) in one interleaved pass.
-/// One job runs alone (compiled kernel); 2 or 3 are padded to four lanes, which still beats running them one by one.
 pub fn hashBatch(jobs: []Job) void {
     std.debug.assert(jobs.len >= 1 and jobs.len <= max_lanes);
-    if (jobs.len == 1) {
-        var kb: [1][73]u8 = undefined;
-        var keys: [1][]const u8 = .{keyOf(&kb[0], jobs[0].password)};
-        var salts: [1][16]u8 = .{jobs[0].salt};
-        var out: [1][23]u8 = undefined;
-        run(1, &keys, &salts, jobs[0].cost, &out);
-        jobs[0].out = out[0];
-        std.crypto.secureZero(u8, std.mem.asBytes(&kb));
-        return;
+    switch (jobs.len) {
+        inline 1...max_lanes => |n| {
+            var kb: [n][73]u8 = undefined;
+            var keys: [n][]const u8 = undefined;
+            var salts: [n][16]u8 = undefined;
+            var out: [n][23]u8 = undefined;
+            inline for (0..n) |k| {
+                keys[k] = keyOf(&kb[k], jobs[k].password);
+                salts[k] = jobs[k].salt;
+            }
+            run(n, &keys, &salts, jobs[0].cost, &out);
+            for (jobs, 0..) |*j, k| j.out = out[k];
+            std.crypto.secureZero(u8, std.mem.asBytes(&kb));
+        },
+        else => unreachable,
     }
-    var kb: [4][73]u8 = undefined;
-    var keys: [4][]const u8 = undefined;
-    var salts: [4][16]u8 = undefined;
-    var out: [4][23]u8 = undefined;
-    for (0..4) |k| {
-        const j = &jobs[if (k < jobs.len) k else 0];
-        keys[k] = keyOf(&kb[k], j.password);
-        salts[k] = j.salt;
-    }
-    run(4, &keys, &salts, jobs[0].cost, &out);
-    for (jobs, 0..) |*j, k| j.out = out[k];
-    std.crypto.secureZero(u8, std.mem.asBytes(&kb));
 }
 
 /// Optional startup calibration, using independent real cost-10 hashes. This is
