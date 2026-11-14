@@ -85,6 +85,12 @@ pub fn madviseHuge(mem: []const u8) void {
     _ = linux.madvise(@constCast(@ptrCast(mem.ptr)), mem.len, linux.MADV.HUGEPAGE);
 }
 
+pub fn lockMemory() void {
+    var ml: linux.rlimit = .{ .cur = std.math.maxInt(usize), .max = std.math.maxInt(usize) };
+    _ = linux.setrlimit(.MEMLOCK, &ml);
+    _ = linux.syscall1(.mlockall, 1); // MCL_CURRENT = 1
+}
+
 pub fn envGet(environ: [*:null]const ?[*:0]const u8, name: []const u8) ?[]const u8 {
     var i: usize = 0;
     while (environ[i]) |e| : (i += 1) {

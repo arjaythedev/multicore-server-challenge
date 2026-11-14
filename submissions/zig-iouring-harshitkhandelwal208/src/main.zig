@@ -20,6 +20,7 @@ pub fn main(init: std.process.Init) !void {
     // uses plain writes; everything else already passes MSG_NOSIGNAL).
     const ignore: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.IGN }, .mask = linux.sigemptyset(), .flags = 0 };
     _ = linux.sigaction(.PIPE, &ignore, null);
+    sys.lockMemory();
 
     const gpa = @import("buf.zig").gpa;
     const url = init.environ_map.get("DATABASE_URL") orelse "postgres://conduit:conduit@127.0.0.1:5432/conduit";
