@@ -11,6 +11,7 @@ test("concurrent writes, shared pool, committed restart persistence, and gracefu
   const prefix = "integration_" + crypto.randomUUID().replaceAll("-", "");
   const usernames = [prefix + "_author", prefix + "_viewer"];
   const tags = [prefix + "_a", prefix + "_b"];
+  const sharedTags = [prefix + "_c", prefix + "_d"];
   let app: ReturnType<typeof Bun.spawn> | undefined;
   let base = "";
 
@@ -78,7 +79,7 @@ test("concurrent writes, shared pool, committed restart persistence, and gracefu
       api("POST", path + "/comments", viewer, { comment: { body: "concurrent comment " + i } }, 201)));
     expect(new Set(comments.map(result => result.comment.id)).size).toBe(24);
     await Promise.all(Array.from({ length: 8 }, (_, i) => api("POST", "/api/articles", author, {
-      article: { title: prefix + " " + i, description: "d", body: "b", tagList: i % 2 ? tags : [...tags].reverse() },
+      article: { title: prefix + " " + i, description: "d", body: "b", tagList: i % 2 ? sharedTags : [...sharedTags].reverse() },
     }, 201)));
     const [connections] = await cleanup`SELECT count(*) FROM pg_stat_activity WHERE datname = current_database()`;
     expect(Number(connections.count)).toBeLessThanOrEqual(17); // 16 app connections plus this cleanup connection.
@@ -99,7 +100,7 @@ test("concurrent writes, shared pool, committed restart persistence, and gracefu
     finally {
       try {
         await cleanup`DELETE FROM users WHERE username = ANY(${cleanup.array(usernames, "TEXT")})`;
-        await cleanup`DELETE FROM tags WHERE name = ANY(${cleanup.array(tags, "TEXT")})`;
+        await cleanup`DELETE FROM tags WHERE name = ANY(${cleanup.array([...tags, ...sharedTags], "TEXT")})`;
       } finally { await cleanup.close(); }
     }
   }
