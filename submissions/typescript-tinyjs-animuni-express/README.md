@@ -60,13 +60,22 @@ bash test/run.sh submissions/typescript-tinyjs-animuni-express
 ```
 
 This invokes the unit checks and TinyJS build before the official 197-step conformance suite.
-Remote results are pending until linked CI logs establish them. No local executable validation
+In GitHub Actions, the build also runs `integration.test.ts` against the harness's disposable
+database, checking concurrent idempotent favorites/follows, concurrent comments and article/tag
+creation, the shared connection limit, graceful shutdown, and persistence across a server restart.
+It removes its own fixture rows before the official suite starts.
+
+On **15 November 2026**, the [initial remote CI run](https://github.com/arjaythedev/multicore-server-challenge/actions/runs/43724105336)
+for commit `5dd67e8` passed **197/197 official checks**, **5/5 focused unit tests**, dependency
+installation, and the TinyJS production build on Ubuntu 24.04 with PostgreSQL 18.7 and Bun 1.4.4.
+The [PR checks](https://github.com/arjaythedev/multicore-server-challenge/pull/234/checks) show results
+for subsequent commits, including the added integration check. No local executable validation
 has been performed for this submission.
 
 ## Performance and limitations
 
 No capacity, latency, throughput, memory, or CPU measurements are claimed for this submission.
-Pool-size tuning, eight-core utilization profiling, concurrent integration stress, restart testing,
+Pool-size tuning, eight-core utilization profiling, sustained high-concurrency stress,
 and full-seed five-minute holds require suitable authorized remote infrastructure and are pending.
 No paid infrastructure is provisioned. The challenge is closed to automatic benchmarking, so a PR
 does not promise an official run or leaderboard inclusion.
