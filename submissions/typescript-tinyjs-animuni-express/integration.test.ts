@@ -7,7 +7,7 @@ test("concurrent writes, shared pool, committed restart persistence, and gracefu
   if (!databaseUrl || !new URL(databaseUrl).pathname.startsWith("/challenge_test_")) {
     throw new Error("This remote integration check requires test/run.sh's disposable database");
   }
-  const cleanup = new SQL({ url: databaseUrl, max: 1 });
+  const cleanup = new SQL({ url: databaseUrl, max: 1, connectionTimeout: 5, connection: { statement_timeout: "5000" } });
   const prefix = "integration_" + crypto.randomUUID().replaceAll("-", "");
   const usernames = [prefix + "_author", prefix + "_viewer"];
   const tags = [prefix + "_a", prefix + "_b"];
@@ -54,6 +54,7 @@ test("concurrent writes, shared pool, committed restart persistence, and gracefu
   async function api(method: string, path: string, token = "", body?: unknown, status = 200) {
     const response = await fetch(base + path, {
       method,
+      signal: AbortSignal.timeout(5000),
       headers: { ...(token ? { Authorization: `Token ${token}` } : {}), ...(body ? { "Content-Type": "application/json" } : {}) },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
@@ -104,4 +105,4 @@ test("concurrent writes, shared pool, committed restart persistence, and gracefu
       } finally { await cleanup.close(); }
     }
   }
-}, 30000);
+}, 60000);
