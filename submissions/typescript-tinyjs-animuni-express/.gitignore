@@ -1,0 +1,5 @@
+node_modules/
+.tinyjs/
+.env
+*.log
+coverage/

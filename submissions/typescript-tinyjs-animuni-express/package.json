@@ -1,0 +1,12 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tinyjs build",
+    "start": "bun transport.ts",
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "tinyjs-fullstack": "0.1.2"
+  }
+}
