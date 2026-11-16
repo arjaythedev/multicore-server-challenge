@@ -1,83 +1,95 @@
-//! HMAC-SHA-256 implementation with midstate caching for ultra-fast token verification & SCRAM auth.
+//! Keyed-Hashing for Message Authentication (HMAC) per RFC 2104 using SHA-256.
 
-use crate::sec::sha256::{sha256_digest, sha256_with_state, state_to_bytes, compress_block, SHA256_H0};
+use crate::sec::sha256::{compress_block, sha256, Sha256, SHA256_H0};
 
-/// Precomputed HMAC-SHA256 states for fixed keys (avoids recomputing ipad/opad blocks on each request).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct PrecomputedHmac {
-    pub inner_state: [u32; 8],
-    pub outer_state: [u32; 8],
+    inner_mid: [u32; 8],
+    outer_mid: [u32; 8],
 }
 
 impl PrecomputedHmac {
     pub fn new(key: &[u8]) -> Self {
-        let mut key_block = [0u8; 64];
-        if key.len() > 64 {
-            let digest = sha256_digest(key);
-            key_block[..32].copy_from_slice(&digest);
+        let (mut inner_mid, mut outer_mid) = (SHA256_H0, SHA256_H0);
+        let mut ipad = [0x36u8; 64];
+        let mut opad = [0x5cu8; 64];
+        let hashed_key;
+        let effective_key = if key.len() > 64 {
+            hashed_key = sha256(key);
+            &hashed_key[..]
         } else {
-            key_block[..key.len()].copy_from_slice(key);
+            key
+        };
+        let mut i = 0;
+        while i < effective_key.len() {
+            ipad[i] ^= effective_key[i];
+            opad[i] ^= effective_key[i];
+            i += 1;
         }
-
-        let mut ipad = [0u8; 64];
-        let mut opad = [0u8; 64];
-        for i in 0..64 {
-            ipad[i] = key_block[i] ^ 0x36;
-            opad[i] = key_block[i] ^ 0x5c;
-        }
-
-        let mut inner_state = SHA256_H0;
-        compress_block(&mut inner_state, &ipad);
-
-        let mut outer_state = SHA256_H0;
-        compress_block(&mut outer_state, &opad);
-
-        PrecomputedHmac {
-            inner_state,
-            outer_state,
-        }
+        compress_block(&mut inner_mid, &ipad);
+        compress_block(&mut outer_mid, &opad);
+        Self { inner_mid, outer_mid }
     }
 
-    #[inline(always)]
     pub fn sign(&self, data: &[u8]) -> [u8; 32] {
-        let inner_hash = state_to_bytes(&sha256_with_state(self.inner_state, 64, data));
-        state_to_bytes(&sha256_with_state(self.outer_state, 64, &inner_hash))
+        let mut inner_hasher = Sha256::resume(self.inner_mid, 64);
+        inner_hasher.update(data);
+        let inner_digest = inner_hasher.finish();
+
+        let mut outer_hasher = Sha256::resume(self.outer_mid, 64);
+        outer_hasher.update(&inner_digest);
+        outer_hasher.finish()
     }
 }
 
-/// Computes HMAC-SHA256 of `msg` using `key`.
 pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
-    let hmac = PrecomputedHmac::new(key);
-    hmac.sign(msg)
+    PrecomputedHmac::new(key).sign(msg)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn hex_bytes_32(s: &str) -> [u8; 32] {
+        let mut res = [0u8; 32];
+        let b = s.as_bytes();
+        let mut idx = 0;
+        while idx < 32 {
+            let high = match b[idx * 2] {
+                b'0'..=b'9' => b[idx * 2] - b'0',
+                b'a'..=b'f' => b[idx * 2] - b'a' + 10,
+                _ => 0,
+            };
+            let low = match b[idx * 2 + 1] {
+                b'0'..=b'9' => b[idx * 2 + 1] - b'0',
+                b'a'..=b'f' => b[idx * 2 + 1] - b'a' + 10,
+                _ => 0,
+            };
+            res[idx] = (high << 4) | low;
+            idx += 1;
+        }
+        res
+    }
+
     #[test]
     fn test_rfc4231_case1() {
-        let key = [0x0b; 20];
+        let key = [0x0bu8; 20];
         let data = b"Hi There";
-        let expected = [
-            0xb0, 0x34, 0x4c, 0x61, 0xd8, 0xdb, 0x38, 0x53,
-            0x5c, 0xa8, 0xaf, 0xce, 0xaf, 0x0b, 0xf1, 0x2b,
-            0x88, 0x1d, 0xc2, 0x00, 0xc9, 0x83, 0x3d, 0xa7,
-            0x26, 0xe9, 0x37, 0x6c, 0x2e, 0x32, 0xcf, 0xf7,
-        ];
-        assert_eq!(hmac_sha256(&key, data), expected);
+        let exp = hex_bytes_32("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+        assert_eq!(hmac_sha256(&key, data), exp);
     }
 
     #[test]
     fn test_rfc4231_case2() {
-        let key = b"Jefe";
-        let data = b"what do ya want for nothing?";
-        let expected = [
-            0x5b, 0xdc, 0xc1, 0x46, 0xbf, 0x60, 0x75, 0x4e,
-            0x6a, 0x04, 0x24, 0x26, 0x08, 0x95, 0x75, 0xc7,
-            0x5a, 0x00, 0x3f, 0x08, 0x9d, 0x27, 0x39, 0x83,
-            0x9d, 0xec, 0x58, 0xb9, 0x64, 0xec, 0x38, 0x43,
-        ];
-        assert_eq!(hmac_sha256(key, data), expected);
+        let exp = hex_bytes_32("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+        assert_eq!(hmac_sha256(b"Jefe", b"what do ya want for nothing?"), exp);
+    }
+
+    #[test]
+    fn test_rfc4231_case6() {
+        let key = [0xaau8; 131];
+        let data = b"Test Using Larger Than Block-Size Key - Hash Key First";
+        let exp = hex_bytes_32("60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
+        assert_eq!(hmac_sha256(&key, data), exp);
     }
 }
