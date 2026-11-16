@@ -5,10 +5,9 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::rt::spsc::SpscQueue;
-use crate::rt::thread::{spawn_worker, SchedPolicy};
+use crate::rt::thread::{is_pin_enabled, spawn_worker, wait_eventfd, SchedPolicy};
 use crate::sec::bcrypt::{bcrypt_hash, bcrypt_verify_batch, VerifyItem};
 use crate::sec::jwt::jwt_sign;
 use crate::types::{Envelope, Job, KdfJob, Reply};
@@ -40,8 +39,10 @@ pub fn spawn_kdf_worker_indexed(
         None, // No hard CPU pin, allows Linux kernel to schedule across allowed cores
         SchedPolicy::Batch,
         move || {
-            unsafe {
-                libc::nice(5);
+            if is_pin_enabled() {
+                unsafe {
+                    libc::nice(5);
+                }
             }
 
             let mut pending_verifies: Vec<KdfJob> = Vec::with_capacity(32);
@@ -201,8 +202,20 @@ pub fn spawn_kdf_worker_indexed(
                 // 4. Sleep or yield
                 let has_overflow = !overflow_pg.is_empty() || !overflow_replies.is_empty();
                 if !found_any && !has_overflow {
-                    // Small sleep when completely idle to avoid 100% spin
-                    std::thread::sleep(Duration::from_micros(100));
+                    let wake_fd = kdf_queues.first().map(|q| q.event_fd).unwrap_or(-1);
+                    if wake_fd >= 0 {
+                        for q in &kdf_queues {
+                            q.mark_sleeping();
+                        }
+                        if kdf_queues.iter().all(|q| q.is_empty()) {
+                            wait_eventfd(wake_fd, 5);
+                        }
+                        for q in &kdf_queues {
+                            q.mark_awake();
+                        }
+                    } else {
+                        std::thread::yield_now();
+                    }
                 } else if has_overflow {
                     std::thread::yield_now();
                 }
@@ -225,6 +238,7 @@ pub fn spawn_kdf_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use crate::types::ConnRef;
 
     #[test]

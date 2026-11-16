@@ -77,14 +77,26 @@ fn main() {
         reactor_wake_fds.push(create_eventfd().unwrap_or(-1));
     }
 
+    // Dedicated wakeup eventfds for PG drivers (shared across all in_queues of driver p)
+    let mut pg_driver_wake_fds = Vec::with_capacity(pg_threads);
+    for _ in 0..pg_threads {
+        pg_driver_wake_fds.push(create_eventfd().unwrap_or(-1));
+    }
+
+    // Dedicated wakeup eventfds for KDF workers (shared across all in_queues of worker k)
+    let mut kdf_worker_wake_fds = Vec::with_capacity(kdf_threads);
+    for _ in 0..kdf_threads {
+        kdf_worker_wake_fds.push(create_eventfd().unwrap_or(-1));
+    }
+
     // Set up lock-free SPSC queue matrices:
     // 1. Net -> PG: SpscQueue<Envelope, 1024> per (net_idx, pg_idx)
     // Producer: net-reactor-i, Consumer: pg-driver-p
     let mut pg_queues: Vec<Vec<Arc<SpscQueue<Envelope, 1024>>>> = Vec::with_capacity(net_threads);
     for _ in 0..net_threads {
         let mut row = Vec::with_capacity(pg_threads);
-        for _ in 0..pg_threads {
-            let efd = create_eventfd().unwrap_or(-1);
+        for pg_idx in 0..pg_threads {
+            let efd = pg_driver_wake_fds[pg_idx];
             row.push(Arc::new(SpscQueue::<Envelope, 1024>::new(efd)));
         }
         pg_queues.push(row);
@@ -95,8 +107,8 @@ fn main() {
     let mut kdf_net_queues: Vec<Vec<Arc<SpscQueue<KdfJob, 512>>>> = Vec::with_capacity(net_threads);
     for _ in 0..net_threads {
         let mut row = Vec::with_capacity(kdf_threads);
-        for _ in 0..kdf_threads {
-            let efd = create_eventfd().unwrap_or(-1);
+        for kdf_idx in 0..kdf_threads {
+            let efd = kdf_worker_wake_fds[kdf_idx];
             row.push(Arc::new(SpscQueue::<KdfJob, 512>::new(efd)));
         }
         kdf_net_queues.push(row);
@@ -105,8 +117,9 @@ fn main() {
     // 3. PG -> KDF: SpscQueue<KdfJob, 512> per pg_idx
     // Producer: pg-driver-p, Consumer: kdf-worker-(p % kdf_threads)
     let mut kdf_pg_queues: Vec<Arc<SpscQueue<KdfJob, 512>>> = Vec::with_capacity(pg_threads);
-    for _ in 0..pg_threads {
-        let efd = create_eventfd().unwrap_or(-1);
+    for pg_idx in 0..pg_threads {
+        let kdf_idx = pg_idx % kdf_threads;
+        let efd = kdf_worker_wake_fds[kdf_idx];
         kdf_pg_queues.push(Arc::new(SpscQueue::<KdfJob, 512>::new(efd)));
     }
 
@@ -142,8 +155,8 @@ fn main() {
     let mut kdf_to_pg_queues: Vec<Vec<Arc<SpscQueue<Envelope, 1024>>>> = Vec::with_capacity(kdf_threads);
     for _ in 0..kdf_threads {
         let mut row = Vec::with_capacity(pg_threads);
-        for _ in 0..pg_threads {
-            let efd = create_eventfd().unwrap_or(-1);
+        for pg_idx in 0..pg_threads {
+            let efd = pg_driver_wake_fds[pg_idx];
             row.push(Arc::new(SpscQueue::<Envelope, 1024>::new(efd)));
         }
         kdf_to_pg_queues.push(row);

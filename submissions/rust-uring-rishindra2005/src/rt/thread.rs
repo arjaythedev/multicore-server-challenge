@@ -195,6 +195,13 @@ pub fn format_affinity_map(
     format!("Thread affinity map: {} ({})", parts.join(", "), note)
 }
 
+pub fn is_pin_enabled() -> bool {
+    if std::env::var("NO_PIN").is_ok() {
+        return false;
+    }
+    std::env::var("PIN").map(|v| v == "1").unwrap_or(false)
+}
+
 /// Builds the affinity assignments for net reactors and PG drivers.
 pub fn build_affinity_map(
     net_threads: usize,
@@ -202,10 +209,15 @@ pub fn build_affinity_map(
 ) -> (Vec<Option<usize>>, Vec<Option<usize>>, String) {
     let total_pinned = net_threads + pg_threads;
 
-    if std::env::var("NO_PIN").is_ok() {
+    if !is_pin_enabled() {
         let net_pins = vec![None; net_threads];
         let pg_pins = vec![None; pg_threads];
-        let log = format_affinity_map(&net_pins, &pg_pins, "disabled via NO_PIN");
+        let note = if std::env::var("NO_PIN").is_ok() {
+            "disabled via NO_PIN"
+        } else {
+            "pinning: off (set PIN=1 to enable)"
+        };
+        let log = format_affinity_map(&net_pins, &pg_pins, note);
         return (net_pins, pg_pins, log);
     }
 
@@ -247,7 +259,7 @@ where
 }
 
 pub fn pin_current_thread(cpu_id: usize) {
-    if std::env::var("NO_PIN").is_ok() {
+    if !is_pin_enabled() {
         return;
     }
     unsafe {
@@ -262,6 +274,9 @@ pub fn pin_current_thread(cpu_id: usize) {
 }
 
 pub fn apply_sched_policy(policy: SchedPolicy) {
+    if !is_pin_enabled() {
+        return;
+    }
     unsafe {
         match policy {
             SchedPolicy::Batch => {
@@ -278,6 +293,16 @@ pub fn apply_sched_policy(policy: SchedPolicy) {
             }
             SchedPolicy::Normal => {}
         }
+    }
+}
+
+/// Block until `fd` (an eventfd) is readable or `timeout_ms` passes, then drain it. Safe on non-blocking eventfds.
+pub fn wait_eventfd(fd: libc::c_int, timeout_ms: i32) {
+    let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    unsafe {
+        libc::poll(&mut pfd, 1, timeout_ms);
+        let mut v: u64 = 0;
+        libc::read(fd, &mut v as *mut u64 as *mut libc::c_void, 8);
     }
 }
 
@@ -421,5 +446,54 @@ mod tests {
             line,
             "Thread affinity map: net-reactor-0->cpu0, net-reactor-1->cpu2, pg-driver-0->cpu4, pg-driver-1->cpu6, kdf->unpinned (test)"
         );
+    }
+
+    #[test]
+    fn test_wait_eventfd() {
+        let fd = create_eventfd().expect("create_eventfd");
+        let start = std::time::Instant::now();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let val: u64 = 1;
+            unsafe {
+                libc::write(fd, &val as *const u64 as *const libc::c_void, 8);
+            }
+        });
+
+        wait_eventfd(fd, 1000);
+        let elapsed = start.elapsed();
+        handle.join().expect("join");
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "wait_eventfd should return in < 200 ms, took {:?}",
+            elapsed
+        );
+        unsafe {
+            libc::close(fd);
+        }
+
+        let fd2 = create_eventfd().expect("create_eventfd 2");
+        let start2 = std::time::Instant::now();
+        wait_eventfd(fd2, 30);
+        let elapsed2 = start2.elapsed();
+        assert!(
+            elapsed2 >= std::time::Duration::from_millis(25)
+                && elapsed2 < std::time::Duration::from_millis(150),
+            "wait_eventfd on untouched fd should return after ~30 ms, took {:?}",
+            elapsed2
+        );
+        unsafe {
+            libc::close(fd2);
+        }
+    }
+
+    #[test]
+    fn test_pin_default_off() {
+        std::env::remove_var("PIN");
+        assert!(!is_pin_enabled());
+        let (net, pg, log) = build_affinity_map(2, 2);
+        assert_eq!(net, vec![None, None]);
+        assert_eq!(pg, vec![None, None]);
+        assert!(log.contains("pinning: off (set PIN=1 to enable)"));
     }
 }

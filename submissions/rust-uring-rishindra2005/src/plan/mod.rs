@@ -26,6 +26,7 @@ use std::time::Duration;
 use crate::pg::warm::run_warmup;
 use crate::pg::wire::{PgConfig, PgError, PgWire};
 use crate::rt::spsc::SpscQueue;
+use crate::rt::thread::{create_eventfd, wait_eventfd};
 use crate::types::{Envelope, Job, KdfJob, Reply};
 
 /// Sizing configuration for database connection pools.
@@ -138,12 +139,14 @@ pub fn plan_driver_loop(
         );
     }
 
+    let driver_event_fd = in_queues.first().map(|q| q.event_fd).unwrap_or(-1);
+
     // 1. Spawn dedicated Read Workers
     let mut read_workers = Vec::with_capacity(sizing.read_per_driver);
     for w_idx in 0..sizing.read_per_driver {
-        let in_q = Arc::new(SpscQueue::<Envelope, 1024>::new(-1));
-        let out_q = Arc::new(SpscQueue::<Reply, 1024>::new(-1));
-        let kdf_out_q = Arc::new(SpscQueue::<KdfJob, 512>::new(-1));
+        let in_q = Arc::new(SpscQueue::<Envelope, 1024>::new(create_eventfd().unwrap_or(-1)));
+        let out_q = Arc::new(SpscQueue::<Reply, 1024>::new(driver_event_fd));
+        let kdf_out_q = Arc::new(SpscQueue::<KdfJob, 512>::new(driver_event_fd));
 
         let in_q_worker = in_q.clone();
         let out_q_worker = out_q.clone();
@@ -178,8 +181,8 @@ pub fn plan_driver_loop(
     // 2. Spawn dedicated Feed Workers
     let mut feed_workers = Vec::with_capacity(sizing.feed_per_driver);
     for w_idx in 0..sizing.feed_per_driver {
-        let in_q = Arc::new(SpscQueue::<Envelope, 1024>::new(-1));
-        let out_q = Arc::new(SpscQueue::<Reply, 1024>::new(-1));
+        let in_q = Arc::new(SpscQueue::<Envelope, 1024>::new(create_eventfd().unwrap_or(-1)));
+        let out_q = Arc::new(SpscQueue::<Reply, 1024>::new(driver_event_fd));
 
         let in_q_worker = in_q.clone();
         let out_q_worker = out_q.clone();
@@ -211,8 +214,8 @@ pub fn plan_driver_loop(
     // 3. Spawn dedicated Write Workers
     let mut write_workers = Vec::with_capacity(sizing.write_per_driver);
     for w_idx in 0..sizing.write_per_driver {
-        let in_q = Arc::new(SpscQueue::<Envelope, 1024>::new(-1));
-        let out_q = Arc::new(SpscQueue::<Reply, 1024>::new(-1));
+        let in_q = Arc::new(SpscQueue::<Envelope, 1024>::new(create_eventfd().unwrap_or(-1)));
+        let out_q = Arc::new(SpscQueue::<Reply, 1024>::new(driver_event_fd));
 
         let in_q_worker = in_q.clone();
         let out_q_worker = out_q.clone();
@@ -417,7 +420,52 @@ pub fn plan_driver_loop(
         }
 
         if !work_done {
-            std::thread::sleep(Duration::from_micros(10));
+            let has_overflow = !overflow_replies.is_empty()
+                || !overflow_kdf.is_empty()
+                || overflow_read_in.iter().any(|v| !v.is_empty())
+                || overflow_feed_in.iter().any(|v| !v.is_empty())
+                || overflow_write_in.iter().any(|v| !v.is_empty());
+
+            if has_overflow {
+                std::thread::sleep(Duration::from_micros(50));
+            } else {
+                for q in &in_queues {
+                    q.mark_sleeping();
+                }
+                for w in &read_workers {
+                    w.out_q.mark_sleeping();
+                    w.kdf_out_q.mark_sleeping();
+                }
+                for w in &feed_workers {
+                    w.out_q.mark_sleeping();
+                }
+                for w in &write_workers {
+                    w.out_q.mark_sleeping();
+                }
+
+                let all_empty = in_queues.iter().all(|q| q.is_empty())
+                    && read_workers.iter().all(|w| w.out_q.is_empty() && w.kdf_out_q.is_empty())
+                    && feed_workers.iter().all(|w| w.out_q.is_empty())
+                    && write_workers.iter().all(|w| w.out_q.is_empty());
+
+                if all_empty {
+                    wait_eventfd(driver_event_fd, 5);
+                }
+
+                for q in &in_queues {
+                    q.mark_awake();
+                }
+                for w in &read_workers {
+                    w.out_q.mark_awake();
+                    w.kdf_out_q.mark_awake();
+                }
+                for w in &feed_workers {
+                    w.out_q.mark_awake();
+                }
+                for w in &write_workers {
+                    w.out_q.mark_awake();
+                }
+            }
         }
     }
 
@@ -488,7 +536,11 @@ fn run_read_worker_loop(
         }
 
         if batch.is_empty() {
-            std::thread::sleep(Duration::from_micros(20));
+            in_q.mark_sleeping();
+            if in_q.is_empty() {
+                wait_eventfd(in_q.event_fd, 5);
+            }
+            in_q.mark_awake();
             continue;
         }
 
@@ -585,7 +637,11 @@ fn run_feed_worker_loop(
         }
 
         if batch.is_empty() {
-            std::thread::sleep(Duration::from_micros(20));
+            in_q.mark_sleeping();
+            if in_q.is_empty() {
+                wait_eventfd(in_q.event_fd, 5);
+            }
+            in_q.mark_awake();
             continue;
         }
 
@@ -675,7 +731,11 @@ fn run_write_worker_loop(
         }
 
         if batch.is_empty() {
-            std::thread::sleep(Duration::from_micros(20));
+            in_q.mark_sleeping();
+            if in_q.is_empty() {
+                wait_eventfd(in_q.event_fd, 5);
+            }
+            in_q.mark_awake();
             continue;
         }
 
@@ -725,7 +785,6 @@ fn run_write_worker_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ConnRef;
 
     #[test]
     fn test_pool_size_calculation_and_clamp() {
