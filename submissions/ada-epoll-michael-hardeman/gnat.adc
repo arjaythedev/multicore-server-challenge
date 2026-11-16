@@ -1,0 +1,4 @@
+--  Every task is a library-level object created at start-up, and they talk only through protected objects with
+--  pure barriers: the Jorvik profile (Ada 2022 D.13) checks that partition-wide.
+pragma Profile (Jorvik);
+pragma Partition_Elaboration_Policy (Sequential);

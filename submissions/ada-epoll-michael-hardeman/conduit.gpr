@@ -1,0 +1,46 @@
+--  Self-contained so the benchmark box can build it with plain gprbuild.
+--    gprbuild -P conduit.gpr                      release: -O3, checks suppressed
+--    gprbuild -P conduit.gpr -XCONDUIT_MODE=debug  all checks, assertions and contracts on
+project Conduit is
+
+   type Mode_Type is ("debug", "release");
+   Mode : Mode_Type := external ("CONDUIT_MODE", "release");
+
+   for Languages use ("Ada");
+   for Source_Dirs use ("src");
+   for Object_Dir use "obj/" & Mode;
+   for Exec_Dir use "bin";
+   for Main use ("conduit.adb");
+   for Create_Missing_Dirs use "True";
+
+   Common := ("-gnat2022", "-gnatwa", "-gnatw.X", "-gnatwl.l", "-gnatQ", "-fstack-check");
+
+   package Compiler is
+      case Mode is
+         when "debug" =>
+            for Default_Switches ("Ada") use Common & ("-g", "-O1", "-gnata", "-gnato", "-gnatVa");
+         when "release" =>
+            for Default_Switches ("Ada") use Common & ("-g", "-O3", "-gnatn", "-gnatp", "-march=native",
+                                                       "-funroll-loops", "-ffunction-sections",
+                                                       "-fdata-sections");
+      end case;
+   end Compiler;
+
+   package Builder is
+      for Global_Configuration_Pragmas use "gnat.adc";
+   end Builder;
+
+   package Binder is
+      for Switches ("Ada") use ("-Es", "-d32m");   --  every task's stack (reserved, touched as used)
+   end Binder;
+
+   package Linker is
+      case Mode is
+         when "debug" =>
+            for Switches ("Ada") use ("-g");
+         when "release" =>
+            for Switches ("Ada") use ("-g", "-Wl,--gc-sections", "-march=native");
+      end case;
+   end Linker;
+
+end Conduit;
