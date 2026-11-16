@@ -77,23 +77,22 @@ impl EpollReactor {
         }
         if !kdf_queues.is_empty() {
             let num_kdf = kdf_queues.len();
-            while let Some(mut kdf_job) = self.overflow_kdf.pop_front() {
-                let mut pushed = false;
+            while let Some(kdf_job) = self.overflow_kdf.pop_front() {
+                let mut job_slot = Some(kdf_job);
                 for i in 0..num_kdf {
                     let idx = (self.kdf_rr + i) % num_kdf;
-                    match kdf_queues[idx].push(kdf_job) {
+                    match kdf_queues[idx].push(job_slot.take().unwrap()) {
                         Ok(()) => {
                             self.kdf_rr = (idx + 1) % num_kdf;
-                            pushed = true;
                             break;
                         }
                         Err(returned_job) => {
-                            kdf_job = returned_job;
+                            job_slot = Some(returned_job);
                         }
                     }
                 }
-                if !pushed {
-                    self.overflow_kdf.push_front(kdf_job);
+                if let Some(job) = job_slot {
+                    self.overflow_kdf.push_front(job);
                     break;
                 }
             }
@@ -316,26 +315,25 @@ impl EpollReactor {
                     }
                 }
             }
-            crate::api::admit::Admit::Kdf(mut kdf_job) => {
+            crate::api::admit::Admit::Kdf(kdf_job) => {
                 if !kdf_queues.is_empty() {
                     let num_kdf = kdf_queues.len();
                     if overflow_kdf.is_empty() {
-                        let mut pushed = false;
+                        let mut job_slot = Some(kdf_job);
                         for i in 0..num_kdf {
                             let idx = (*kdf_rr + i) % num_kdf;
-                            match kdf_queues[idx].push(kdf_job) {
+                            match kdf_queues[idx].push(job_slot.take().unwrap()) {
                                 Ok(()) => {
                                     *kdf_rr = (idx + 1) % num_kdf;
-                                    pushed = true;
                                     break;
                                 }
                                 Err(returned_job) => {
-                                    kdf_job = returned_job;
+                                    job_slot = Some(returned_job);
                                 }
                             }
                         }
-                        if !pushed {
-                            overflow_kdf.push_back(kdf_job);
+                        if let Some(job) = job_slot {
+                            overflow_kdf.push_back(job);
                         }
                     } else {
                         overflow_kdf.push_back(kdf_job);

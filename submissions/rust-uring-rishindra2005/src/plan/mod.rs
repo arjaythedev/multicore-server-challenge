@@ -603,7 +603,7 @@ fn run_feed_worker_loop(
                     });
                 }
                 for r in staged_replies.drain(..) {
-                    if let Err(reply) = out_q.push(reply) {
+                    if let Err(reply) = out_q.push(r) {
                         overflow_replies.push(reply);
                     }
                 }
@@ -693,7 +693,7 @@ fn run_write_worker_loop(
                     });
                 }
                 for r in staged_replies.drain(..) {
-                    if let Err(reply) = out_q.push(reply) {
+                    if let Err(reply) = out_q.push(r) {
                         overflow_replies.push(reply);
                     }
                 }

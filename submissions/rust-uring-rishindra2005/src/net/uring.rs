@@ -25,6 +25,7 @@ pub const IORING_OP_SENDMSG: u8 = 9;
 pub const IORING_OP_RECVMSG: u8 = 10;
 pub const IORING_OP_TIMEOUT: u8 = 11;
 pub const IORING_OP_ACCEPT: u8 = 13;
+pub const IORING_OP_READ: u8 = 22;
 pub const IORING_OP_SEND: u8 = 26;
 pub const IORING_OP_RECV: u8 = 27;
 pub const IORING_OP_CLOSE: u8 = 19;
