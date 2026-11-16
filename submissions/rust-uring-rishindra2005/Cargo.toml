@@ -1,0 +1,16 @@
+[package]
+name = "rust-uring-rishindra2005"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+debug = 1
+strip = false
+overflow-checks = false
