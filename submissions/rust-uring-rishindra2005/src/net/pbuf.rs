@@ -69,7 +69,7 @@ impl ProvidedBufferRing {
             ring_entries: entries,
             bgid,
             pad: 0,
-            resv: [1, 0, 0], // Kernel 6.8 pbuf validation workaround: resv non-zero required by memchr_inv
+            resv: [0, 0, 0], // must be zero: the kernel rejects non-zero reserved fields with EINVAL
         };
 
         let reg_rc = unsafe {
