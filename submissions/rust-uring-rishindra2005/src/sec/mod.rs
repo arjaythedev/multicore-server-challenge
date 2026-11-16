@@ -13,6 +13,7 @@ pub mod sha256;
 pub mod hmac;
 pub mod scram;
 pub mod jwt;
+pub mod bf_tables;
 pub mod bcrypt;
 pub mod kdf_worker;
 
