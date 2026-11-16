@@ -45,68 +45,97 @@ pub struct CommentRow<'a> {
     pub author: ProfileRow<'a>,
 }
 
-const PG_EPOCH_SECS_FROM_UNIX: i64 = 946_684_800;
+const MONTH_LENGTHS_FROM_MARCH: [u32; 12] = [31, 30, 31, 30, 31, 31, 30, 31, 30, 31, 31, 29];
+
+#[inline(always)]
+fn put2(buf: &mut [u8; 24], at: usize, val: u32) {
+    buf[at] = b'0' + ((val / 10) % 10) as u8;
+    buf[at + 1] = b'0' + (val % 10) as u8;
+}
+
+#[inline(always)]
+fn put3(buf: &mut [u8; 24], at: usize, val: u32) {
+    buf[at] = b'0' + ((val / 100) % 10) as u8;
+    buf[at + 1] = b'0' + ((val / 10) % 10) as u8;
+    buf[at + 2] = b'0' + (val % 10) as u8;
+}
+
+#[inline(always)]
+fn put4(buf: &mut [u8; 24], at: usize, val: u32) {
+    buf[at] = b'0' + ((val / 1000) % 10) as u8;
+    buf[at + 1] = b'0' + ((val / 100) % 10) as u8;
+    buf[at + 2] = b'0' + ((val / 10) % 10) as u8;
+    buf[at + 3] = b'0' + (val % 10) as u8;
+}
 
 /// Format a Postgres binary timestamp (microseconds since 2000-01-01 00:00:00 UTC)
 /// into an RFC 3339 UTC string with exactly 3 fractional digits: "YYYY-MM-DDTHH:MM:SS.mmmZ".
-/// Truncates fractional milliseconds per challenge rules.
+/// Truncates fractional milliseconds toward negative infinity.
 #[inline]
 pub fn format_pg_timestamp(pg_us: i64, buf: &mut [u8; 24]) {
-    let total_secs = PG_EPOCH_SECS_FROM_UNIX + (pg_us / 1_000_000);
-    let mut rem_us = pg_us % 1_000_000;
-    let mut unix_secs = total_secs;
-    if rem_us < 0 {
-        rem_us += 1_000_000;
-        unix_secs -= 1;
+    const US_PER_DAY: i64 = 86_400_000_000;
+    let days_since_2000 = pg_us.div_euclid(US_PER_DAY);
+    let us_in_day = pg_us.rem_euclid(US_PER_DAY);
+
+    let sec_of_day = (us_in_day / 1_000_000) as u32;
+    let rem_us = (us_in_day % 1_000_000) as u32;
+    let millis = rem_us / 1000;
+
+    let hours = sec_of_day / 3600;
+    let rem_sec = sec_of_day % 3600;
+    let minutes = rem_sec / 60;
+    let seconds = rem_sec % 60;
+
+    // Shift origin from 2000-01-01 to 2000-03-01 (60 days) so leap day falls at year end
+    let days_since_epoch = days_since_2000 - 60;
+
+    let cycles400 = days_since_epoch.div_euclid(146_097);
+    let day_in_400 = days_since_epoch.rem_euclid(146_097);
+
+    // 100-year blocks (36,524 days each; clamp to 3 because final century has 36,525 days)
+    let century = (day_in_400 / 36_524).min(3);
+    let day_in_100 = day_in_400 - century * 36_524;
+
+    // 4-year blocks (1,461 days each; clamp to 24 because 25 * 4 = 100)
+    let cycle4 = (day_in_100 / 1_461).min(24);
+    let day_in_4 = day_in_100 - cycle4 * 1_461;
+
+    // 1-year blocks (365 days each; clamp to 3 because leap year is year 3)
+    let year_in_cycle = (day_in_4 / 365).min(3);
+    let day_in_year = (day_in_4 - year_in_cycle * 365) as u32;
+
+    let year_from_march = cycles400 * 400 + century * 100 + cycle4 * 4 + year_in_cycle;
+
+    let mut month_idx = 0usize;
+    let mut day_in_month = day_in_year;
+    for (idx, &month_len) in MONTH_LENGTHS_FROM_MARCH.iter().enumerate() {
+        if day_in_month < month_len {
+            month_idx = idx;
+            break;
+        }
+        day_in_month -= month_len;
     }
-    let frac_ms = (rem_us / 1000) as u32;
+    let day = day_in_month + 1;
 
-    let mut unix_days = unix_secs / 86400;
-    let mut sec_of_day = unix_secs % 86400;
-    if sec_of_day < 0 {
-        sec_of_day += 86400;
-        unix_days -= 1;
-    }
+    let (cal_year, cal_month) = if month_idx < 10 {
+        (2000 + year_from_march, (month_idx + 3) as u32)
+    } else {
+        (2000 + year_from_march + 1, (month_idx - 9) as u32)
+    };
 
-    let hour = (sec_of_day / 3600) as u32;
-    let min = ((sec_of_day % 3600) / 60) as u32;
-    let sec = (sec_of_day % 60) as u32;
-
-    // Howard Hinnant's civil date algorithm from days since 1970-01-01
-    let z = unix_days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = (yoe as i64) + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let yr = (if m <= 2 { y + 1 } else { y }) as u32;
-
-    buf[0] = b'0' + ((yr / 1000) % 10) as u8;
-    buf[1] = b'0' + ((yr / 100) % 10) as u8;
-    buf[2] = b'0' + ((yr / 10) % 10) as u8;
-    buf[3] = b'0' + (yr % 10) as u8;
+    put4(buf, 0, cal_year as u32);
     buf[4] = b'-';
-    buf[5] = b'0' + (m / 10) as u8;
-    buf[6] = b'0' + (m % 10) as u8;
+    put2(buf, 5, cal_month);
     buf[7] = b'-';
-    buf[8] = b'0' + (d / 10) as u8;
-    buf[9] = b'0' + (d % 10) as u8;
+    put2(buf, 8, day);
     buf[10] = b'T';
-    buf[11] = b'0' + (hour / 10) as u8;
-    buf[12] = b'0' + (hour % 10) as u8;
+    put2(buf, 11, hours);
     buf[13] = b':';
-    buf[14] = b'0' + (min / 10) as u8;
-    buf[15] = b'0' + (min % 10) as u8;
+    put2(buf, 14, minutes);
     buf[16] = b':';
-    buf[17] = b'0' + (sec / 10) as u8;
-    buf[18] = b'0' + (sec % 10) as u8;
+    put2(buf, 17, seconds);
     buf[19] = b'.';
-    buf[20] = b'0' + ((frac_ms / 100) % 10) as u8;
-    buf[21] = b'0' + ((frac_ms / 10) % 10) as u8;
-    buf[22] = b'0' + (frac_ms % 10) as u8;
+    put3(buf, 20, millis);
     buf[23] = b'Z';
 }
 
@@ -447,3 +476,117 @@ pub fn frame_response(
     resp.extend_from_slice(body);
     resp
 }
+
+#[cfg(test)]
+mod ts_tests {
+    use super::*;
+
+    fn fmt(pg_us: i64) -> String {
+        let mut buf = [0u8; 24];
+        format_pg_timestamp(pg_us, &mut buf);
+        std::str::from_utf8(&buf).unwrap().to_string()
+    }
+
+    #[test]
+    fn test_pg_timestamp_spec_cases() {
+        assert_eq!(fmt(0), "2000-01-01T00:00:00.000Z");
+        assert_eq!(fmt(-1), "1999-12-31T23:59:59.999Z");
+        assert_eq!(fmt(1_000), "2000-01-01T00:00:00.001Z");
+        assert_eq!(fmt(86_400_000_000 * 59), "2000-02-29T00:00:00.000Z");
+        assert_eq!(fmt(86_400_000_000 * 366), "2001-01-01T00:00:00.000Z");
+        assert_eq!(fmt(762525296789000), "2024-02-29T12:34:56.789Z");
+        assert_eq!(fmt(3160857600000000), "2100-03-01T00:00:00.000Z");
+        assert_eq!(fmt(-946684800000000), "1970-01-01T00:00:00.000Z");
+    }
+
+    fn is_leap_year(y: i64) -> bool {
+        (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+    }
+
+    fn days_in_year(y: i64) -> i64 {
+        if is_leap_year(y) { 366 } else { 365 }
+    }
+
+    fn days_in_month(y: i64, m: usize) -> i64 {
+        match m {
+            1 => 31,
+            2 => if is_leap_year(y) { 29 } else { 28 },
+            3 => 31,
+            4 => 30,
+            5 => 31,
+            6 => 30,
+            7 => 31,
+            8 => 31,
+            9 => 30,
+            10 => 31,
+            11 => 30,
+            12 => 31,
+            _ => unreachable!(),
+        }
+    }
+
+    fn reference_format_pg_timestamp(pg_us: i64) -> String {
+        let days_since_2000 = pg_us.div_euclid(86_400_000_000);
+        let us_in_day = pg_us.rem_euclid(86_400_000_000);
+
+        let sec_of_day = us_in_day / 1_000_000;
+        let rem_us = us_in_day % 1_000_000;
+        let millis = rem_us / 1000;
+        let hour = sec_of_day / 3600;
+        let min = (sec_of_day % 3600) / 60;
+        let sec = sec_of_day % 60;
+
+        let mut year = 2000i64;
+        let mut rem_days = days_since_2000;
+        if rem_days >= 0 {
+            loop {
+                let diy = days_in_year(year);
+                if rem_days < diy {
+                    break;
+                }
+                rem_days -= diy;
+                year += 1;
+            }
+        } else {
+            loop {
+                year -= 1;
+                let diy = days_in_year(year);
+                rem_days += diy;
+                if rem_days >= 0 {
+                    break;
+                }
+            }
+        }
+
+        let mut month = 1usize;
+        loop {
+            let dim = days_in_month(year, month);
+            if rem_days < dim {
+                break;
+            }
+            rem_days -= dim;
+            month += 1;
+        }
+        let day = rem_days + 1;
+
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+            year, month, day, hour, min, sec, millis
+        )
+    }
+
+    #[test]
+    fn test_pg_timestamp_brute_force_reference_check() {
+        let start_day = -36525 * 2;
+        let end_day = 36525 * 2;
+        let mut day_offset = start_day;
+        while day_offset <= end_day {
+            let pg_us = day_offset * 86_400_000_000 + 123_456;
+            let expected = reference_format_pg_timestamp(pg_us);
+            let actual = fmt(pg_us);
+            assert_eq!(actual, expected, "Mismatch at day offset {}", day_offset);
+            day_offset += 7;
+        }
+    }
+}
+
