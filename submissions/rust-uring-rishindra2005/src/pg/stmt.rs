@@ -73,7 +73,7 @@ pub const PREPARED_STATEMENTS: &[StmtDef] = &[
               EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = a.author_id) AS following, \
               EXISTS (SELECT 1 FROM favorites fa WHERE fa.user_id = $1 AND fa.article_id = a.id) AS favorited, \
               (SELECT count(*) FROM favorites fa WHERE fa.article_id = a.id) AS fc, \
-              ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE at.article_id = a.id ORDER BY t.name) AS tags \
+              ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at WHERE at.article_id = a.id ORDER BY 1) AS tags \
               FROM articles a JOIN users u ON u.id = a.author_id WHERE a.slug = $2",
         oids: &[OID_INT8, OID_TEXT],
     },
@@ -102,13 +102,13 @@ pub const PREPARED_STATEMENTS: &[StmtDef] = &[
               UNION ALL \
               SELECT 1::int8, NULL, a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, \
                      a.author_id, u.username, u.bio, u.image, \
-                     ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE at.article_id = a.id ORDER BY t.name), \
+                     ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at WHERE at.article_id = a.id ORDER BY 1), \
                      (SELECT count(*) FROM favorites fa WHERE fa.article_id = a.id), \
                      EXISTS (SELECT 1 FROM favorites fa WHERE fa.user_id = $3 AND fa.article_id = a.id), \
                      EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $3 AND fo.followee_id = a.author_id) \
               FROM (SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, a.author_id \
                     FROM articles a ORDER BY a.id DESC LIMIT $1 OFFSET $2) a \
-              JOIN users u ON u.id = a.author_id \
+              LEFT JOIN LATERAL (SELECT u.username, u.bio, u.image FROM users u WHERE u.id = a.author_id LIMIT 1) u ON true \
               ORDER BY 1 ASC, 3 DESC NULLS LAST",
         oids: &[OID_INT8, OID_INT8, OID_INT8],
     },
@@ -123,13 +123,13 @@ pub const PREPARED_STATEMENTS: &[StmtDef] = &[
               UNION ALL \
               SELECT 1::int8, NULL, a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, \
                      a.author_id, u.username, u.bio, u.image, \
-                     ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE at.article_id = a.id ORDER BY t.name), \
+                     ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at WHERE at.article_id = a.id ORDER BY 1), \
                      (SELECT count(*) FROM favorites fa WHERE fa.article_id = a.id), \
                      EXISTS (SELECT 1 FROM favorites fa WHERE fa.user_id = $4 AND fa.article_id = a.id), \
                      EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $4 AND fo.followee_id = a.author_id) \
               FROM (SELECT at.article_id FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = $1) ORDER BY at.article_id DESC LIMIT $2 OFFSET $3) x \
               JOIN articles a ON a.id = x.article_id \
-              JOIN users u ON u.id = a.author_id \
+              LEFT JOIN LATERAL (SELECT u.username, u.bio, u.image FROM users u WHERE u.id = a.author_id LIMIT 1) u ON true \
               ORDER BY 1 ASC, 3 DESC NULLS LAST",
         oids: &[OID_TEXT, OID_INT8, OID_INT8, OID_INT8],
     },
@@ -144,7 +144,7 @@ pub const PREPARED_STATEMENTS: &[StmtDef] = &[
               UNION ALL \
               SELECT 1::int8, NULL, a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, \
                      a.author_id, au.username, au.bio, au.image, \
-                     ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE at.article_id = a.id ORDER BY t.name), \
+                     ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at WHERE at.article_id = a.id ORDER BY 1), \
                      (SELECT count(*) FROM favorites fa WHERE fa.article_id = a.id), \
                      EXISTS (SELECT 1 FROM favorites fa WHERE fa.user_id = $4 AND fa.article_id = a.id), \
                      EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $4 AND fo.followee_id = a.author_id) \
@@ -164,13 +164,13 @@ pub const PREPARED_STATEMENTS: &[StmtDef] = &[
               UNION ALL \
               SELECT 1::int8, NULL, a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, \
                      a.author_id, u.username, u.bio, u.image, \
-                     ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE at.article_id = a.id ORDER BY t.name), \
+                     ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at WHERE at.article_id = a.id ORDER BY 1), \
                      (SELECT count(*) FROM favorites fa WHERE fa.article_id = a.id), \
                      EXISTS (SELECT 1 FROM favorites fa WHERE fa.user_id = $4 AND fa.article_id = a.id), \
                      EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $4 AND fo.followee_id = a.author_id) \
               FROM (SELECT f.article_id FROM favorites f WHERE f.user_id = (SELECT id FROM fu) ORDER BY f.article_id DESC LIMIT $2 OFFSET $3) x \
               JOIN articles a ON a.id = x.article_id \
-              JOIN users u ON u.id = a.author_id \
+              LEFT JOIN LATERAL (SELECT u.username, u.bio, u.image FROM users u WHERE u.id = a.author_id LIMIT 1) u ON true \
               ORDER BY 1 ASC, 3 DESC NULLS LAST",
         oids: &[OID_TEXT, OID_INT8, OID_INT8, OID_INT8],
     },
@@ -207,11 +207,12 @@ pub const PREPARED_STATEMENTS: &[StmtDef] = &[
               UNION ALL \
               SELECT 1::int8, NULL, p.id, p.slug, p.title, p.description, p.created_at, p.updated_at, \
                      p.author_id, u.username, u.bio, u.image, \
-                     ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE at.article_id = p.id ORDER BY t.name), \
+                     ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at WHERE at.article_id = p.id ORDER BY 1), \
                      (SELECT count(*) FROM favorites fa WHERE fa.article_id = p.id), \
                      EXISTS (SELECT 1 FROM favorites fa WHERE fa.user_id = $1 AND fa.article_id = p.id), \
                      true::bool \
-              FROM page p JOIN users u ON u.id = p.author_id \
+              FROM page p \
+              LEFT JOIN LATERAL (SELECT u.username, u.bio, u.image FROM users u WHERE u.id = p.author_id LIMIT 1) u ON true \
               ORDER BY 1 ASC, 3 DESC NULLS LAST",
         oids: &[OID_INT8, OID_INT8, OID_INT8],
     },
@@ -405,7 +406,7 @@ pub const PREPARED_STATEMENTS: &[StmtDef] = &[
               SELECT (SELECT author_id FROM sel) AS author_id, \
                      u.id, u.slug, u.title, u.description, u.body, u.created_at, u.updated_at, u.author_id, \
                      usr.username, usr.bio, usr.image, \
-                     ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE at.article_id = u.id ORDER BY t.name) AS tags, \
+                     ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at WHERE at.article_id = u.id ORDER BY 1) AS tags, \
                      (SELECT count(*) FROM favorites fa WHERE fa.article_id = u.id) AS favorites_count, \
                      EXISTS (SELECT 1 FROM favorites fa WHERE fa.user_id = $2 AND fa.article_id = u.id) AS favorited, \
                      EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $2 AND fo.followee_id = u.author_id) AS following \
