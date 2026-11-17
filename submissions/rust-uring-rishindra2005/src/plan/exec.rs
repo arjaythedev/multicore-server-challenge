@@ -16,6 +16,8 @@ use crate::types::{Envelope, Job, KdfJob, ListFilter, Reply};
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PlannedJob<'a> {
     Tags,
+    // GET /api/tags that shares the single s_tags execution of an earlier envelope in this batch.
+    TagsShared,
     UserGet { uid_bytes: [u8; 8] },
     Profile { viewer_bytes: [u8; 8], username: &'a str },
     ArticleGet { viewer_bytes: [u8; 8], slug: &'a str },
@@ -42,11 +44,19 @@ pub fn execute_read_batch(
     let mut pipeline = wire.pipeline();
 
     let mut planned: Vec<PlannedJob> = Vec::with_capacity(envelopes.len());
+    // All GET /api/tags requests of this batch are answered from one s_tags execution that runs
+    // while they are being served (the same query and the same result for every one of them).
+    let mut tags_planned = false;
 
     for env in envelopes {
         match &env.job {
             Job::Tags => {
-                planned.push(PlannedJob::Tags);
+                if tags_planned {
+                    planned.push(PlannedJob::TagsShared);
+                } else {
+                    tags_planned = true;
+                    planned.push(PlannedJob::Tags);
+                }
             }
             Job::UserGet => {
                 let uid_bytes = env.viewer.to_be_bytes();
@@ -176,7 +186,7 @@ pub fn execute_read_batch(
                 );
                 q2env.push(env_idx);
             }
-            PlannedJob::Skip => {}
+            PlannedJob::TagsShared | PlannedJob::Skip => {}
         }
     }
 
@@ -412,7 +422,7 @@ pub fn execute_read_batch(
                 }
             }
 
-            PlannedJob::Skip => {}
+            PlannedJob::TagsShared | PlannedJob::Skip => {}
         }
     });
 
@@ -427,14 +437,30 @@ pub fn execute_read_batch(
 
     // Render responses for envelopes
     let mut body_buf = Vec::with_capacity(16384);
+    let mut batch_tags_body: Option<Vec<u8>> = None;
 
     for (idx, env) in envelopes.iter().enumerate() {
         body_buf.clear();
+
+        if planned[idx] == PlannedJob::TagsShared {
+            // The owning Tags envelope has a lower index, so its body is already rendered (or the
+            // query returned no tags, which renders as an empty list).
+            let resp = match &batch_tags_body {
+                Some(body) => frame_response(200, "OK", body, env.keepalive),
+                None => {
+                    render_tags(&mut body_buf, &[]);
+                    frame_response(200, "OK", &body_buf, env.keepalive)
+                }
+            };
+            replies.push(Reply { conn: env.conn, bytes: resp, close: !env.keepalive });
+            continue;
+        }
 
         match &mut outcomes[idx] {
             QueryOutcome::Tags(tags) => {
                 let refs: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
                 render_tags(&mut body_buf, &refs);
+                batch_tags_body = Some(body_buf.clone());
                 let resp = frame_response(200, "OK", &body_buf, env.keepalive);
                 replies.push(Reply { conn: env.conn, bytes: resp, close: !env.keepalive });
             }
