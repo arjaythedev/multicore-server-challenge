@@ -187,7 +187,14 @@ impl PgConfig {
 pub struct PgWire {
     stream: TcpStream,
     write_buf: Vec<u8>,
+    // Receive buffer: replies are read in large chunks and messages are cut out of it,
+    // instead of two blocking recv() calls per protocol message.
+    read_buf: Box<[u8]>,
+    read_pos: usize,
+    read_end: usize,
 }
+
+const READ_BUF_SIZE: usize = 64 * 1024;
 
 impl PgWire {
     /// Connects to PostgreSQL, authenticates via SCRAM-SHA-256, configures session parameters,
@@ -202,6 +209,9 @@ impl PgWire {
         let mut client = Self {
             stream,
             write_buf: Vec::with_capacity(65536),
+            read_buf: vec![0u8; READ_BUF_SIZE].into_boxed_slice(),
+            read_pos: 0,
+            read_end: 0,
         };
 
         client.startup_and_auth(config)?;
@@ -524,7 +534,7 @@ impl PgWire {
     /// Reads exactly one message from the PostgreSQL stream: returns (tag, payload slice).
     pub fn read_message(&mut self) -> Result<(u8, Vec<u8>), PgError> {
         let mut header = [0u8; 5];
-        self.stream.read_exact(&mut header)?;
+        self.fill_exact(&mut header)?;
         let tag = header[0];
         let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
         if len < 4 {
@@ -532,8 +542,41 @@ impl PgWire {
         }
         let body_len = len - 4;
         let mut payload = vec![0u8; body_len];
-        self.stream.read_exact(&mut payload)?;
+        self.fill_exact(&mut payload)?;
         Ok((tag, payload))
+    }
+
+    /// Fills `out` completely, serving bytes from the receive buffer first. When the buffer runs
+    /// dry it is refilled with one recv() of up to READ_BUF_SIZE bytes; a request larger than the
+    /// buffer reads its remainder straight into `out`.
+    fn fill_exact(&mut self, out: &mut [u8]) -> Result<(), PgError> {
+        let mut done = 0;
+        while done < out.len() {
+            if self.read_pos == self.read_end {
+                let want = out.len() - done;
+                if want >= READ_BUF_SIZE {
+                    self.stream.read_exact(&mut out[done..])?;
+                    return Ok(());
+                }
+                let n = loop {
+                    match self.stream.read(&mut self.read_buf) {
+                        Ok(n) => break n,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) => return Err(e.into()),
+                    }
+                };
+                if n == 0 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+                }
+                self.read_pos = 0;
+                self.read_end = n;
+            }
+            let take = (self.read_end - self.read_pos).min(out.len() - done);
+            out[done..done + take].copy_from_slice(&self.read_buf[self.read_pos..self.read_pos + take]);
+            self.read_pos += take;
+            done += take;
+        }
+        Ok(())
     }
 
     /// Parses a PostgreSQL ErrorResponse ('E') into a structured PgError.
