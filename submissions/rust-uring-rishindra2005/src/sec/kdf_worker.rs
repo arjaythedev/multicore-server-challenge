@@ -305,8 +305,12 @@ mod tests {
     use std::time::Duration;
     use crate::types::ConnRef;
 
+    // Every test here runs a KDF worker that bumps the global BATCHES counter, so they run one at a time.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_kdf_worker_reply_ordering_per_connection() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let stop = Arc::new(AtomicBool::new(false));
         let in_q = Arc::new(SpscQueue::<KdfJob, 512>::new(-1));
         let reply_q = Arc::new(SpscQueue::<Reply, 512>::new(-1));
@@ -369,6 +373,7 @@ mod tests {
 
     #[test]
     fn test_kdf_worker_no_drop_when_queues_full() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let stop = Arc::new(AtomicBool::new(false));
         let in_q = Arc::new(SpscQueue::<KdfJob, 512>::new(-1));
         let reply_q = Arc::new(SpscQueue::<Reply, 512>::new(-1));
@@ -443,6 +448,7 @@ mod tests {
 
     #[test]
     fn test_kdf_worker_seed_hash_and_hash_roundtrip() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let stop = Arc::new(AtomicBool::new(false));
         let in_q = Arc::new(SpscQueue::<KdfJob, 512>::new(-1));
         let reply_q = Arc::new(SpscQueue::<Reply, 512>::new(-1));
@@ -550,11 +556,10 @@ mod tests {
         handle.join().expect("join");
     }
 
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn test_kdf_worker_batch_6_jobs_one_batch() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let stop = Arc::new(AtomicBool::new(false));
         let efd = crate::rt::thread::create_eventfd().unwrap_or(-1);
         let in_q = Arc::new(SpscQueue::<KdfJob, 512>::new(efd));
@@ -630,7 +635,7 @@ mod tests {
 
     #[test]
     fn test_kdf_worker_single_job_waits_window() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("KDF_BATCH_WINDOW_MS", "30");
         }
