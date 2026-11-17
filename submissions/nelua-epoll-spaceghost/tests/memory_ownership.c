@@ -42,6 +42,7 @@ int main(void)
     assert(private_frees==before_hosted);
     size_t before_request=private_frees;
     nc_request_free(request);
+    nc_request_pool_trim();
     /* owns() establishes arena provenance, not per-slot liveness: freed slab
      * slots remain mapped. Observe the actual owner free calls instead. */
     assert(private_frees>=before_request+2);

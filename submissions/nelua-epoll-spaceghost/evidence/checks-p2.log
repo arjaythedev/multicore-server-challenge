@@ -1,0 +1,4 @@
+PASS build c-host freestanding
+PASS build c-nelibc freestanding
+PASS build nelua-host freestanding
+PASS build nelua-nelibc freestanding

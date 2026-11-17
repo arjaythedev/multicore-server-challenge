@@ -114,6 +114,7 @@ int main(int argc,char **argv)
            threads,group,mode,actions,wall,cpu,checksum,nc_buffer_cached_bytes());
     nc_request_free(issuer);
     assert(nc_request_memory_used()==0);
+    nc_request_pool_trim();assert(nc_request_pool_cached_bytes()==0);
     nc_buffer_cache_trim();
     assert(nc_buffer_cached_bytes()==0);
     pthread_barrier_destroy(&ready); pthread_barrier_destroy(&go);

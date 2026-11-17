@@ -1,0 +1,184 @@
+{
+  "date": "2026-11-17",
+  "scope": "Context-pool and JSON-reservation component comparisons; variable shared-disk whole-server diagnostics, no official capacity score",
+  "baseline_commit": "ed0b08cc0f1c620cf730a60427ca125241a6747f",
+  "baseline_artifacts": "frozen-v14 from the previous release",
+  "hardware": {
+    "processor": "Intel Core i5-10400",
+    "allowed_logical_cpus": 8,
+    "shared_host": true,
+    "parent_memory_bytes": 6442450944
+  },
+  "versions": {
+    "application_nelua": "a58450563e2d2ec49bff499865c8b5cfdf6ff81a",
+    "nelibc": "73ae254aa0f4cc1fa03f8fad92711c497e9c28fc",
+    "nelibc_build_compiler": "dabbd9effebb7ecfe59a727f49f27b4574109d4d"
+  },
+  "configuration": {
+    "core_profile": "freestanding",
+    "request_pool": 1,
+    "output_reserve": 1,
+    "buffer_cache": {
+      "host": 0,
+      "nelibc": 1
+    },
+    "read_connections": 4,
+    "write_connections": 32,
+    "auth_connections": 8,
+    "read_adaptive": 1,
+    "native_flags": "-march=native -DNC_NET_FAIR=1"
+  },
+  "pool_bounds": {
+    "requested_context_bytes": 4032,
+    "spares_per_owner": 128,
+    "owners": 32,
+    "startup_warm_requested_bytes": 516096,
+    "maximum_requested_spares_bytes": 16515072,
+    "active_lifetime": "until complete socket send or connection retirement",
+    "cross_thread_returns": "belong to freeing owner; thread exit releases spares",
+    "explicit_trim": "calling owner only"
+  },
+  "allocation_matrix": {
+    "samples": 768,
+    "rounds": 8,
+    "actions_per_sample": 65536,
+    "output_reserve": 0,
+    "context_pool": [
+      0,
+      1
+    ],
+    "medium_buffer_cache": [
+      0,
+      1
+    ],
+    "providers": [
+      "host",
+      "nelibc"
+    ],
+    "archive_sha256": "e105489b3744a4061b056346e38a10b635f45c992b8c75204ec4b097fcf31d85",
+    "compiler": "cc (Debian 12.2.0-14+deb12u1) 12.2.0\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n"
+  },
+  "writer_matrix": {
+    "samples": 960,
+    "rounds": 8,
+    "loops_per_case": 50000,
+    "lengths": [
+      12,
+      64,
+      128,
+      1024,
+      4096
+    ],
+    "contents": [
+      "ASCII",
+      "newline every 43 bytes",
+      "UTF-8"
+    ],
+    "context_pool": 1,
+    "output_reserve": [
+      0,
+      1
+    ],
+    "lifetimes": "fresh request per string; consumed changing output"
+  },
+  "whole_server": {
+    "cases": 8,
+    "users": 5000,
+    "articles": 500000,
+    "think_scale": 1,
+    "ramp_s": 60,
+    "measure_s": 30,
+    "tail_s": 15,
+    "repetitions_per_profile_per_version": 2,
+    "order": [
+      "load-c-host-old-4",
+      "load-c-host-new-5",
+      "load-c-host-new-6",
+      "load-c-host-old-7",
+      "load-nelua-nelibc-new-8",
+      "load-nelua-nelibc-old-9",
+      "load-nelua-nelibc-old-10",
+      "load-nelua-nelibc-new-11"
+    ],
+    "pristine_fixtures": "distinct managed snapshot copies; seven seed fingerprint scans before every load",
+    "passed_cases": [
+      "load-nelua-nelibc-old-9"
+    ],
+    "interpretation": "Both new private-provider cases have errors and regress against both old controls; old controls also vary. DataFileRead waits were observed on shared single-disk ZFS, but storage alone is not proven to explain the regression. Both build defaults disabled; no whole-server win claimed."
+  },
+  "checks": {
+    "api": "197/197 in each of four C/Nelua x host/private profiles at default lanes",
+    "sanitizers": "address/undefined instrumentation of bridge tests; private archive uninstrumented",
+    "pool": "40 simultaneous owners, cache overflow, cross-thread returns, held response isolation, complete thread-exit/explicit trim",
+    "source_matching": "Retained component source hashes verified against the committed working tree"
+  },
+  "sources_sha256": {
+    "build.sh": "eba58178b7d40a05e98d292df323d1aa617782a2c2f3cdf84af0b6aa366873d2",
+    "src/BCRYPT-LICENSE": "8783c3757e5cda9666663b4a9e5c476c3483d8677535a7a8f391ce260f764ec7",
+    "src/app_c.c": "8084d63e4410a6adab5424df9a29dcdd5f97d086821e2a2c981b90e0a9091f4b",
+    "src/app_c.h": "3491f496d37f6bd327e055f3738f4301b0c5a6c1a5e361f7e9ef25566f7e7214",
+    "src/batch.nelua": "92f4522b6ae7b31f7be2bd86399fa6589d30964968f40ed0e797881d776f1f16",
+    "src/batch_c.c": "031717d9e4af598f4fc6d7f6027b8dd3096977c320e7b39cf7189b95ba86df58",
+    "src/bcrypt.c": "befb77440c49e3b127dc85810120a2a57298116532d7766d39a2ee8f72bda946",
+    "src/bcrypt.h": "e01468542911daadaa7a9bcf290e21e0c60b66bc2c70da269d2f44f732287c1f",
+    "src/bf_tables.h": "180c465e6737dd8b38b72765e29e64a2c3f5662cbdd3591b3e08177ada85b3c2",
+    "src/bindings.nelua": "23229dbf5d0523257ffd9bad648aff539ce6bec31de384f14c5d7e2138fd668d",
+    "src/core_memory.c": "e8cbf0937342285f7207b21575d3f284d1b42876ca5f7370748d82186d5258cb",
+    "src/db.c": "24dd5886d33c51e7b8221ff1f7900c22b58563ec74c590331e61fbcffe68cb1d",
+    "src/json_dispatch.c": "5004e6dfbabc337800063e4909378e3121a9721be89210048e1817404c13a15c",
+    "src/json_scan.c": "fa4f3a3f30710acab20afca712a30b835eba8b241ed5eaa263bf47671ee5018e",
+    "src/json_scan.h": "1833ac573f6f02306c8700081da6e78def35f3b628f4af3f51b575d63887c853",
+    "src/json_scan.nelua": "9645f8a01189dd27f50bb5d665a6f23c64caa3a1a5769c35b81b1b481286634f",
+    "src/main.nelua": "c27ae552cacd034c7114b4740e6c9689e8f9967449f85c299e4c18b6877fa63a",
+    "src/mutations.nelua": "1b5ee499d7252f70221fcf9c003fac1f5383363e0bd640a4dd04a552ccb2f172",
+    "src/native.h": "801c3cb749cdb199d90eeb0c03b73ff872cfbb7f9631b2652dcc83c8981a8e7d",
+    "src/owned_memory.h": "89389e80a2ed5e5793d5b9954bd99eedf5f16ef1231f15c4a2995a7e33c52781",
+    "src/reactor.c": "4f447500e3ddbca349653b7d4417f8a3ef8de6def3ea1a0f097010ed3c7c236c",
+    "src/reactor.h": "ed35c1ea928c6566562c9c055c84fc134cb97f739f3923f8a8510b20d0294ee8",
+    "src/read_policy.c": "ae5d62422f3dc82cf9d28582ad32de3616365019018ccd5e5c92a2363280641f",
+    "src/read_policy.h": "bc8c4a40d0658f36649542cd4be405f9a2ca91da548ffb0d59ac820289a6c1f2",
+    "src/reads.nelua": "490d596bc82217416b2f65e88d5bc259c715b2a32dd58fde3867eb17e45660c0",
+    "src/request.c": "e2f02f81d7a5fa7b468cffa98b40a8fd4b82736347205ad348d890c65e79e417",
+    "src/serialize.nelua": "980e9fa2527d63e3bb28d709f1a2e91584ea0bd33c8e1f26eced13c203d9c625",
+    "src/serialize_c.c": "955f12a0c3a1ea93801232dcb6c09c177e3712d5c812140581c6361721d78a69",
+    "src/sql_shared.h": "518b6ef8086a7517fb659ea47064b8cd0f351c640c9479c5d98b1069f6d8034d",
+    "src/transport.c": "71442c0a9530fed57bbc375d9ff1619b820e4511ab483fe44710c0d326f00214",
+    "tests/request_memory.c": "ed9d9fd8f4b62094a081b4034bb7fb1527f214376eca99bd909052c4f00c99b5",
+    "tests/request_memory.py": "5be67df56434f95fb7b8b95bcf86056204e4e5850053d00b9bcd0abd5c3292b1",
+    "tests/request_pool.c": "e27ed117441e64e61730e4675759518a91df0a4f94e1e401abc67be6b17c45f5",
+    "tests/request_pool.py": "99363ae7dfc9a219efb1f9c00a43d13fc21c08ffef71ef79e7875eca9a48bf3e",
+    "tests/reservation_shootout.py": "8f5dc66ca85077c160782c57817f7c481caca6c14cf35456a641c46721f16743",
+    "tests/serialize_scan.c": "28cd76225633995bcc9bab7d04e602e312a0f496950dee7ba8d6098564d376d3",
+    "tests/serialize_scan.py": "a08adcf817a09217b9016e7aea8941370a91573420614b9aeeaf36a83e6837d2"
+  },
+  "evidence_sha256": {
+    "checks-p1.log": "e3e8559371300c543cdd881969d1cd52bd3d1c7d00b28ba180b7a164307a408b",
+    "checks-p2.log": "74f33a2c8e464b8ee26e04be4a2fb7f3a7cc83c8a816e733a5c8518cc556ce9f",
+    "conformance-p1.json": "13f26bcc0b2ad00d0cfb064d66debc442f6972d851f1576e12df48109ad31aad",
+    "conformance-p2.json": "73a0cfb89191ad24f2aa2d1e96f2ddbc847365fabc88df051e4707de3e48012f",
+    "core-p1-audits.json": "d6a4f189c4495445484d9d494826c43e84947120cd81528383d7cd9b31186134",
+    "core-p2-audits.json": "4a286d721dd5920b8562e836c7c411220a1e32d67c8cf49453d7d3aa272e25dc",
+    "diagnostic-p1-5000.json": "400d52d86692edb7438d4722880e851bdbdac0d15e4ff20b17124709ac1576d2",
+    "fixture-p1-configuration.json": "a5b0d2a2c68284dffdbcbcada3dac7a58227fe2f46c1f320557ca86fca9542fa",
+    "load-p1-details.json": "fd6f214cf8d4d2349d238916bcfb161654ded5ec4fe3dac72ebfcc83d8debcee",
+    "load-p1-merged.json": "255121861b96e451614a4da65d67b81a7a0f01d31d610e2db5be39841efc4ad7",
+    "request-memory-p1.jsonl": "b3f010b3b8a8311b89f1ee1c464c6da190c0ac2a117ebeb00da6565fb3129867",
+    "writer-p1-metadata.json": "c5a565c43e5efebfafc3875839f81b286d6a39631f28ffe5da01c090a105468a",
+    "writer-p1.jsonl": "c58905eee5bc7fc2d7e51560aa2ca9df921d5b70ad887492ac2de19fd63ac6b8"
+  },
+  "shipping_defaults": {
+    "request_pool": 0,
+    "output_reserve": 0,
+    "reason": "Both new Nelua/private whole-server runs regress against both previous-release controls; leave opt-in pending isolation and validation."
+  },
+  "final_default_validation": {
+    "api": "Four fresh full-seed API checks, 197/197 each with both flags off at 4/32/8",
+    "core_audits": "core-p2-audits.json",
+    "conformance": "conformance-p2.json"
+  },
+  "source_archives": {
+    "measured_p1_sha256": "d96769e3c7260580c07679384e55c6f7ad0a2a3d1266020468d84c0aba43fa99",
+    "default_off_p2_sha256": "e74318424a95ee1f72f00d6211c6ee742ce930cb21c5238f71582b47363aea1e",
+    "scope": "P1 runtime source files match the final tree. After measurement, build.sh defaults changed from 1/1 to 0/0 and P2 rebuilt all four profiles. Final documentation edits do not affect builds."
+  }
+}

@@ -31,6 +31,12 @@
 #ifndef NC_BUFFER_CACHE
 #define NC_BUFFER_CACHE 0
 #endif
+#ifndef NC_REQUEST_POOL
+#define NC_REQUEST_POOL 1
+#endif
+#ifndef NC_OUTPUT_RESERVE
+#define NC_OUTPUT_RESERVE 1
+#endif
 
 /* Bound live request objects, arenas and output/vector capacities with
  * request-owned, conservatively rounded credit reservations. Cached
@@ -232,6 +238,112 @@ _Static_assert(NC_OUTPUT_LIMIT<UINT32_MAX/2U,"buffer growth must fit 32-bit capa
 _Static_assert(NC_BODY_LIMIT<=UINT32_MAX,"body lengths must fit 32 bits");
 _Static_assert(sizeof(nc_request)<=120,"keep the x86-64 request control object compact");
 
+#if NC_REQUEST_POOL
+/* The request header and first arena share one provider allocation. Leave room
+ * for provider metadata within a 4 KiB size class. Cache quotas are per owner,
+ * so hot pop/push operations never contend on a global byte counter or lock.
+ * A block freed by another thread belongs to the freeing thread thereafter. */
+#define NC_CONTEXT_BYTES (4096U-64U)
+#define NC_CONTEXT_OFFSET ((sizeof(nc_request)+_Alignof(nc_chunk)-1U)&~(size_t)(_Alignof(nc_chunk)-1U))
+#define NC_CONTEXT_OWNERS 32U
+#define NC_CONTEXT_SPARES 128U
+typedef struct nc_context_cache {
+    _Alignas(64) void *head;
+    unsigned used;
+    _Atomic unsigned reported;
+    bool occupied;
+} nc_context_cache;
+static nc_context_cache nc_context_caches[NC_CONTEXT_OWNERS];
+static pthread_mutex_t nc_context_registry=PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t nc_context_once=PTHREAD_ONCE_INIT;
+static pthread_key_t nc_context_key;
+static bool nc_context_key_ready;
+static _Thread_local nc_context_cache *nc_context_local;
+static _Thread_local bool nc_context_tried;
+_Static_assert(NC_CONTEXT_OFFSET+sizeof(nc_chunk)<NC_CONTEXT_BYTES,"context must contain an arena");
+
+static void nc_context_clear(nc_context_cache *cache)
+{
+    while (cache->head) {
+        void *block=cache->head;
+        cache->head=*(void **)block;
+        free(block);
+    }
+    cache->used=0;
+    atomic_store_explicit(&cache->reported,0,memory_order_relaxed);
+}
+static void nc_context_destroy(void *value)
+{
+    nc_context_cache *cache=value;
+    nc_context_clear(cache);
+    pthread_mutex_lock(&nc_context_registry);
+    cache->occupied=false;
+    pthread_mutex_unlock(&nc_context_registry);
+    nc_context_local=NULL;nc_context_tried=false;
+}
+static void nc_context_initialize(void)
+{ nc_context_key_ready=pthread_key_create(&nc_context_key,nc_context_destroy)==0; }
+static nc_context_cache *nc_context_owner(void)
+{
+    if (nc_context_tried) return nc_context_local;
+    nc_context_tried=true;
+    pthread_once(&nc_context_once,nc_context_initialize);
+    if (!nc_context_key_ready) return NULL;
+    pthread_mutex_lock(&nc_context_registry);
+    for (unsigned i=0;i<NC_CONTEXT_OWNERS;++i) {
+        nc_context_cache *cache=&nc_context_caches[i];
+        if (cache->occupied) continue;
+        cache->occupied=true;
+        if (pthread_setspecific(nc_context_key,cache)==0) nc_context_local=cache;
+        else cache->occupied=false;
+        break;
+    }
+    pthread_mutex_unlock(&nc_context_registry);
+    return nc_context_local;
+}
+static void *nc_context_take(void)
+{
+    nc_context_cache *cache=nc_context_owner();
+    if (!cache || !cache->head) return malloc(NC_CONTEXT_BYTES);
+    void *block=cache->head;
+    cache->head=*(void **)block;
+    atomic_store_explicit(&cache->reported,--cache->used,memory_order_relaxed);
+    return block;
+}
+static void nc_context_release(void *block)
+{
+    nc_context_cache *cache=nc_context_owner();
+    if (!cache || cache->used==NC_CONTEXT_SPARES) { free(block);return; }
+    *(void **)block=cache->head;
+    cache->head=block;
+    atomic_store_explicit(&cache->reported,++cache->used,memory_order_relaxed);
+}
+size_t nc_request_pool_cached_bytes(void)
+{
+    size_t count=0;
+    for (unsigned i=0;i<NC_CONTEXT_OWNERS;++i)
+        count+=atomic_load_explicit(&nc_context_caches[i].reported,memory_order_relaxed);
+    return count*NC_CONTEXT_BYTES;
+}
+void nc_request_pool_trim(void)
+{ if (nc_context_local) nc_context_clear(nc_context_local); }
+void nc_request_pool_warm(void)
+{
+    nc_context_cache *cache=nc_context_owner();
+    if (!cache) return;
+    while (cache->used<NC_CONTEXT_SPARES) {
+        void *block=malloc(NC_CONTEXT_BYTES);
+        if (!block) break; /* Warming is optional; ordinary allocation can retry. */
+        memset(block,0,NC_CONTEXT_BYTES); /* Touch only this bounded hot pool. */
+        nc_context_release(block);
+    }
+}
+#else
+size_t nc_request_pool_cached_bytes(void) { return 0; }
+void nc_request_pool_trim(void) {}
+void nc_request_pool_warm(void) {}
+#endif
+
 typedef struct nc_parser {
     nc_request *request;
     const unsigned char *at, *end;
@@ -422,8 +534,19 @@ nc_request_create(const char *data, size_t length)
     if (framed <= 0 || (size_t)framed != length) return NULL;
     end=data+length;
     nc_budget initial={0};
+#if NC_REQUEST_POOL
+    if (!nc_budget_charge(&initial,NC_CONTEXT_BYTES)) return NULL;
+    request=nc_context_take();
+    if (request) {
+        memset(request,0,sizeof(*request));
+        nc_chunk *first=(nc_chunk *)((char *)request+NC_CONTEXT_OFFSET);
+        *first=(nc_chunk){.size=NC_CONTEXT_BYTES-NC_CONTEXT_OFFSET-sizeof(*first)};
+        request->chunks=first;
+    }
+#else
     if (!nc_budget_charge(&initial,sizeof(*request))) return NULL;
     request = calloc(1, sizeof(*request));
+#endif
     if (!request) { nc_request_refund(initial.reserved);errno=ENOMEM;return NULL; }
     request->budget=initial;
     request->output.budget=&request->budget;
@@ -521,6 +644,9 @@ nc_request_free(nc_request *request)
 {
     if (!request) return;
     while (request->chunks) {
+#if NC_REQUEST_POOL
+        if (request->chunks==(nc_chunk *)((char *)request+NC_CONTEXT_OFFSET)) break;
+#endif
         nc_chunk *next = request->chunks->next;
         size_t bytes=sizeof(*request->chunks)+request->chunks->size;
         free(request->chunks);
@@ -528,9 +654,14 @@ nc_request_free(nc_request *request)
         request->chunks = next;
     }
     nc_buffer_release(request->output.data,request->output.capacity,&request->budget);
-    if (request->budget.live!=sizeof(*request)) abort();
     size_t reserved=request->budget.reserved;
+#if NC_REQUEST_POOL
+    if (request->budget.live!=NC_CONTEXT_BYTES) abort();
+    nc_context_release(request);
+#else
+    if (request->budget.live!=sizeof(*request)) abort();
     free(request);
+#endif
     nc_request_refund(reserved);
 }
 
@@ -822,44 +953,67 @@ nc_json *nc_array_item(nc_json *value, int index)
     return value;
 }
 
+static bool nc_buffer_grow(nc_buffer *buffer,size_t needed)
+{
+    if (needed<=buffer->capacity) return true;
+    size_t capacity;
+    char *data;
+    size_t slack=NC_MEMORY_SHAPE ? 64U : 0U;
+    capacity=512U;
+    while (capacity < needed) capacity*=2U;
+    /* Never jump to a larger bucket just to leave metadata room: inputs
+     * near a power-of-two boundary must keep the ordinary growth bound. */
+    if (slack && needed<=capacity-slack) capacity-=slack;
+    if (!nc_budget_charge(buffer->budget,capacity)) { buffer->failed=buffer->exhausted=true;return false; }
+    bool released_old=false;
+#if NC_BUFFER_CACHE
+    if (nc_buffer_class(capacity)>=0) {
+        data=nc_buffer_take(capacity);
+        if (data) {
+            if (buffer->length) memcpy(data,buffer->data,buffer->length);
+            nc_buffer_release(buffer->data,buffer->capacity,buffer->budget);
+            released_old=true;
+        }
+    } else data=realloc(buffer->data,capacity);
+#else
+    data=realloc(buffer->data,capacity);
+#endif
+    if (!data) {
+        nc_budget_refund(buffer->budget,capacity);
+        buffer->failed=buffer->exhausted=true;return false;
+    }
+    if (!released_old) nc_budget_refund(buffer->budget,buffer->capacity);
+    buffer->data=data; buffer->capacity=capacity;
+    buffer->data[buffer->length]=0;
+    return true;
+}
+
+bool nc_reserve_json(nc_buffer *buffer,size_t raw_length)
+{
+    if (buffer->failed) return false;
+#if NC_OUTPUT_RESERVE
+    /* Raw bytes plus two quotes are a lower bound, not a guessed response
+     * size. Escaping may need more storage; ordinary growth remains bounded. */
+    if (raw_length>=128) {
+        if (raw_length>NC_OUTPUT_LIMIT-2U || buffer->length>NC_OUTPUT_LIMIT-raw_length-2U) {
+            buffer->failed=true;return false;
+        }
+        return nc_buffer_grow(buffer,(size_t)buffer->length+raw_length+3U);
+    }
+#else
+    (void)raw_length;
+#endif
+    return true;
+}
+
 void
 nc_write_n(nc_buffer *buffer, const char *value, size_t length)
 {
-    size_t needed, capacity;
-    char *data;
     if (buffer->failed) return;
     if (length > NC_OUTPUT_LIMIT || buffer->length > NC_OUTPUT_LIMIT-length || (!value && length)) {
         buffer->failed=true; return;
     }
-    needed=buffer->length+length+1;
-    if (needed > buffer->capacity) {
-        size_t slack=NC_MEMORY_SHAPE ? 64U : 0U;
-        capacity=512U;
-        while (capacity < needed) capacity*=2U;
-        /* Never jump to a larger bucket just to leave metadata room: inputs
-         * near a power-of-two boundary must keep the ordinary growth bound. */
-        if (slack && needed<=capacity-slack) capacity-=slack;
-        if (!nc_budget_charge(buffer->budget,capacity)) { buffer->failed=buffer->exhausted=true;return; }
-        bool released_old=false;
-#if NC_BUFFER_CACHE
-        if (nc_buffer_class(capacity)>=0) {
-            data=nc_buffer_take(capacity);
-            if (data) {
-                if (buffer->length) memcpy(data,buffer->data,buffer->length);
-                nc_buffer_release(buffer->data,buffer->capacity,buffer->budget);
-                released_old=true;
-            }
-        } else data=realloc(buffer->data,capacity);
-#else
-        data=realloc(buffer->data,capacity);
-#endif
-        if (!data) {
-            nc_budget_refund(buffer->budget,capacity);
-            buffer->failed=buffer->exhausted=true;return;
-        }
-        if (!released_old) nc_budget_refund(buffer->budget,buffer->capacity);
-        buffer->data=data; buffer->capacity=capacity;
-    }
+    if (!nc_buffer_grow(buffer,(size_t)buffer->length+length+1U)) return;
     if (length) memcpy(buffer->data+buffer->length,value,length);
     buffer->length+=length;
     buffer->data[buffer->length]=0;

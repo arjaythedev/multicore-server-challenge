@@ -3,6 +3,7 @@
 
 void nc_json_string(nc_buffer *b,unsigned char *data,size_t length)
 {
+    if (length>=128 && !nc_reserve_json(b,length)) return;
     nc_putc(b,'"');
     size_t first=0,i=0;
     bool accelerated=nc_json_scan_enabled();

@@ -240,6 +240,8 @@ database-wide settings stay untouched; no extensions or external cache are used.
 | `READ_COALESCE` | 1 | Share identical reads and public article JSON within the frozen batch |
 | `READ_BATCH_STATS` | 0 | Aggregate density/wait statistics at shutdown |
 | `REQUEST_MEMORY_MB` | 256 | Aggregate live request objects, arenas and output/vector capacities; 1–4096 MiB |
+| `REQUEST_POOL` | 0 | Build-time request-header/first-arena pooling; 0 retains the original allocation path |
+| `OUTPUT_RESERVE` | 0 | Build-time lower-bound reservation before long JSON strings; 0 retains incremental growth |
 | `BUFFER_CACHE` | auto | Build-time untyped buffer reuse: enabled for private Nelibc, disabled for libc |
 | `NELIBC_CACHE` | `.deps/nelibc-source` | Pinned Nelibc source/compiler/archive build cache |
 | `NELUA_ROOT` | `.deps/nelua` | Clean checkout of the pinned compiler |
@@ -253,6 +255,22 @@ until destruction, so most allocations avoid a contended global counter. Exact
 growth is attempted when rounding alone would exceed the cap. Reported usage is
 reserved capacity, conservatively above requested live bytes. Exhaustion returns
 503; freeing a request on another thread releases its entire reservation.
+The context pool combines the request header and first arena in one 4032-byte
+allocation. When enabled, the network thread warms 128 contexts (504 KiB);
+other owners grow on demand. Each of at most 32 owner caches retains at most 128 spare contexts,
+for 15.75 MiB of requested spare storage process-wide. Pop/push operations use
+owner-local lists, with registration synchronized only at thread entry/exit.
+Cross-thread returns enter the freeing thread's cache. Extra owners fall back
+to the provider; thread exit releases its cache. Explicit trimming affects the
+calling owner's cache. Active requests retain their credits until destruction,
+after socket output completes; spare contexts are accounted separately.
+
+With `OUTPUT_RESERVE=1`, both independent writers reserve space for JSON
+strings of at least 128 bytes: raw length plus quotes before emitting. This is a checked lower bound, so
+escaping can still grow the buffer. It avoids growing through small capacities
+when the minimum output length is already known. Enable the two experiments
+independently with `REQUEST_POOL=1` and `OUTPUT_RESERVE=1`; both default to 0.
+
 Optional reusable medium buffers have a separate 32 MiB total
 and 16 MiB per-class bound. They retain storage only: every response is freshly
 rendered. Provider metadata/slabs, libpq/OpenSSL, continuation stacks, transport
@@ -300,8 +318,11 @@ python3 tests/request_budget.py --sanitize --memory host
 python3 tests/request_budget.py --sanitize --memory nelibc
 python3 tests/buffer_cache.py --sanitize --memory nelibc
 python3 tests/memory_ownership.py
-python3 tests/request_memory.py --rounds 4 --actions 131072 > memory.jsonl
+python3 tests/request_pool.py --sanitize --memory host
+python3 tests/request_pool.py --sanitize --memory nelibc
+python3 tests/request_memory.py --rounds 8 --actions 65536 > memory.jsonl
 python3 tests/analyze_request_memory.py memory.jsonl > memory-summary.json
+python3 tests/reservation_shootout.py --output writer-results --rounds 8 --loops 50000
 DATABASE_URL='dbname=postgres' python3 tests/read_reactor.py
 DATABASE_URL='dbname=postgres' python3 tests/read_pipeline.py --sanitize
 createdb nc_batch_validation
@@ -322,9 +343,15 @@ require the maintainer's full-seed benchmark; local runs establish no score.
 The request-memory shootout measures the shared request/buffer/HMAC bridge,
 without sockets or SQL. It uses actual request ownership, single and four-thread
 producers, groups of 1 and 128, changing consumed output and balanced provider
-ordering. Its analyzer requires all declared rounds and variants, identical
+ordering. Its default eight variants independently cross the provider, medium
+buffer cache and context pool; output reservation is disabled to isolate pool
+costs. Its analyzer requires all declared rounds and variants, identical
 checksums, artifact provenance and bounded retained storage. These component
 measurements do not rank the two application languages or establish server capacity.
+The reservation shootout separately crosses C/Nelua, both providers and
+reservation on/off, with a fresh request for every timed string and the context
+pool enabled throughout. Complete eight-round rotations consume identical
+output; reusable-buffer timings alone would hide allocation differences.
 
 The reactor test uses undefined-behavior instrumentation and proves four
 simultaneously outstanding read sessions on one OS thread, independent binary
@@ -404,6 +431,67 @@ lane counts through each case's `read_connections`, `write_connections` and
 its verified transient `build` service, restores its quota and checks recovery.
 These root-run harnesses launch PG, application and load generation unprivileged;
 the entry itself never changes cgroup limits, global sysctls or I/O schedulers.
+
+## Context-pool and reservation comparison
+
+The [pool matrix](evidence/request-memory-p1.jsonl) contains 768 samples over
+eight complete rotations. It compares pooling on/off separately for both
+providers and both medium-buffer-cache settings, with reservation disabled.
+The following are median process CPU nanoseconds per request; each provider
+uses its default medium-buffer-cache setting. These are bridge lifetimes,
+without PostgreSQL or sockets:
+
+| Provider | Producers / group | Work | Pool off | Pool on |
+| --- | --- | --- | ---: | ---: |
+| libc | 1 / 1 | Simple request + 2 KiB output | 313 | 209 |
+| libc | 4 / 128 | Simple request + 2 KiB output | 497 | 411 |
+| libc | 4 / 128 | JWT verification + 16 KiB output | 3,159 | 2,790 |
+| Private Nelibc | 1 / 1 | Simple request + 2 KiB output | 231 | 203 |
+| Private Nelibc | 4 / 128 | Simple request + 2 KiB output | 1,147 | 508 |
+| Private Nelibc | 4 / 128 | JWT verification + 16 KiB output | 3,161 | 3,207 |
+
+Pooling improves every libc workload median in this matrix. Private Nelibc
+improves most cases, with small regressions in some four-producer cases; it
+still does not beat libc consistently. The fresh-request
+[writer matrix](evidence/writer-p1.jsonl), with
+[configuration and binary hashes](evidence/writer-p1-metadata.json), contains
+960 samples across both languages/providers and reservation on/off. Reservation
+reduces median process CPU time by about 8–28% for the tested 1–4 KiB strings.
+Shorter cases range from improvements to a 2.8% regression. These component
+results show component savings, but the combined whole-server runs regress
+against controls. Both build defaults remain disabled; enable independently
+with `REQUEST_POOL=1` and `OUTPUT_RESERVE=1` for further comparisons. A general
+whole-server improvement, or absence of regression, has not been established.
+
+The [whole-server comparison](evidence/diagnostic-p1-5000.json) uses distinct
+fresh full-seed fixtures and two runs per version: old/new/new/old for C/libc,
+and new/old/old/new for Nelua/private Nelibc. Both features are on in the new
+binaries. Goodput excludes errors; ranges below retain both runs:
+
+| Profile / version | Good responses/s | p99 | Errors |
+| --- | ---: | ---: | ---: |
+| C/libc, old | 66–1,131 | 3.24–10.00 s | 0–87.4% |
+| C/libc, both on | 713–945 | 4.83–4.87 s | 0% |
+| Nelua/private, old | 1,158–1,309 | 0.55–2.76 s | 0% |
+| Nelua/private, both on | 17–288 | 10.00 s | 41.4–96.8% |
+
+One old private-provider run passes its SLO; the other seven runs fail. The old
+controls vary widely, but both new private-provider runs are worse than both
+controls. PostgreSQL data-file waits were observed on the shared single-disk
+ZFS pool. The cause remains unresolved; these data do not prove storage alone
+explains the regression. The build defaults therefore keep both experiments
+off. [The manifest](evidence/manifest-p1.json),
+[merged results](evidence/load-p1-merged.json), and
+[target metadata/logs](evidence/load-p1-details.json) retain the comparison.
+
+All four updated freestanding profiles with both features on pass 197 full-seed
+API checks each at 4/32/8 lane counts. The four final default builds with both
+features off also pass [197 checks each](evidence/conformance-p2.json), with
+[fresh core import audits](evidence/core-p2-audits.json). Host and private-provider bridge sanitizer
+checks cover all four pool/reservation combinations, 40 concurrent owners,
+cross-thread returns, held response isolation, memory exhaustion/recovery,
+network backpressure and byte-level serialization oracles. The private library
+archive remains uninstrumented.
 
 ## Credits
 

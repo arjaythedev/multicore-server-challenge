@@ -8,6 +8,7 @@ local S: type = @record{}
 local function copy_word(destination:pointer, source:pointer, length:csize):pointer <cimport'__builtin_memcpy',nodecl> end
 
 local function nc_json_string(buffer: *N.Buffer, data: *[0]byte, length: csize) <cexport, codename 'nc_json_string'>
+  if length >= 128 and not N.reserve_json(buffer, length) then return end
   N.putc(buffer, cchar(34))
   local first: csize = 0
   local i: csize = 0

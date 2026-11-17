@@ -20,6 +20,9 @@ size_t nc_request_memory_used(void);
 size_t nc_request_memory_limit(void);
 size_t nc_buffer_cached_bytes(void); /* Requested bytes retained by optional bounded storage reuse. */
 void nc_buffer_cache_trim(void);
+size_t nc_request_pool_cached_bytes(void); /* At most 32 owners x 128 x 4032 requested bytes. */
+void nc_request_pool_warm(void); /* Warm the calling owner's bounded pool. */
+void nc_request_pool_trim(void); /* Caller cache only; other caches drain at thread exit. */
 const char *nc_method(nc_request *request);
 const char *nc_segment(nc_request *request, int index);
 int nc_segments(nc_request *request);
@@ -50,6 +53,7 @@ bool nc_verify(const char *password, const char *hash);
 
 /* Result writer; structural JSON and business objects belong to the selected app. */
 nc_buffer *nc_begin(nc_request *request, int status);
+bool nc_reserve_json(nc_buffer *buffer, size_t raw_length); /* Reserve a string's minimum encoded size. */
 void nc_write(nc_buffer *buffer, const char *value);
 void nc_write_n(nc_buffer *buffer, const char *value, size_t length);
 void nc_putc(nc_buffer *buffer, char value);

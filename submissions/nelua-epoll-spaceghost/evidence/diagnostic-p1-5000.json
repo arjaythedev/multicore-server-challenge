@@ -1,0 +1,427 @@
+{
+  "scope": "local diagnostic; accelerated/co-located load is not a competition score",
+  "caveats": [
+    "CPU samples cover the displayed subwindow of the measured phase.",
+    "Short-lived PostgreSQL processes can exit between samples; cgroup total CPU is authoritative.",
+    "Memory is measured once per target cgroup; PostgreSQL shared RSS is not summed.",
+    "Host contention and missing PSI must be assessed before choosing defaults.",
+    "Cases require repeated order-balanced rounds before claiming small differences."
+  ],
+  "cases": [
+    {
+      "name": "load-c-host-old-4",
+      "mode": "load",
+      "language": "c",
+      "memory": "host",
+      "version": "old",
+      "binary": "/srv/ai/artifacts/multicore/pseudosocket-20261116/frozen-v14/c-host",
+      "adaptive": 1,
+      "write_connections": 32,
+      "quota": 800,
+      "round": 1,
+      "fixture": "/srv/ai/runs/context-p1-4/workspaces/multicore/pseudosocket-20261116/postgres",
+      "rps": 520.7333333333333,
+      "p50_ms": 9576.447,
+      "p95_ms": 10002.431,
+      "p99_ms": 10002.431,
+      "error_rate": 0.8735757265394956,
+      "goodput_rps": 65.83333333333334,
+      "verdict": {
+        "pass": false,
+        "fail_reasons": [
+          "p95 10002 ms >= 500",
+          "p99 10002 ms >= 1000",
+          "errors 87.36% >= 1%"
+        ],
+        "lg_limited": false
+      },
+      "idle_median_ms": 1.3592415,
+      "resource_sample_span_s": 28.0913595,
+      "app_cores": 0.0630086984576165,
+      "postgres_sampled_cores": 0.07795991504077968,
+      "target_total_cores": 0.14325661241137155,
+      "target_memory_peak_measured_bytes": 1018241024,
+      "app_cpu_us_per_response": 120.9999330257646,
+      "binary_sha256": "dcb91f0ae8aa2fc848297d3ad8d265db0451f757ec94fba6d9acc6bd3091430b",
+      "ancestor_limits": {
+        "/sys/fs/cgroup/system.slice/multicore-shootout-2cb6041dbaa5.service": {
+          "cpu.max": "800000 100000\n",
+          "memory.max": "6442450944\n",
+          "cpuset.cpus.effective": null
+        },
+        "/sys/fs/cgroup/system.slice": {
+          "cpu.max": "max 100000\n",
+          "memory.max": "max\n",
+          "cpuset.cpus.effective": null
+        },
+        "/sys/fs/cgroup": {
+          "cpu.max": "max 100000\n",
+          "memory.max": "6442450944\n",
+          "cpuset.cpus.effective": "0,3-7,10-11\n"
+        }
+      }
+    },
+    {
+      "name": "load-c-host-new-5",
+      "mode": "load",
+      "language": "c",
+      "memory": "host",
+      "version": "new",
+      "binary": "/srv/ai/artifacts/multicore/request-pools-20261117/frozen-p1/c-host",
+      "adaptive": 1,
+      "write_connections": 32,
+      "quota": 800,
+      "round": 1,
+      "fixture": "/srv/ai/runs/context-p1-5/workspaces/multicore/pseudosocket-20261116/postgres",
+      "rps": 712.6,
+      "p50_ms": 3457.023,
+      "p95_ms": 4616.191,
+      "p99_ms": 4874.239,
+      "error_rate": 0,
+      "goodput_rps": 712.6,
+      "verdict": {
+        "pass": false,
+        "fail_reasons": [
+          "p95 4616 ms >= 500",
+          "p99 4874 ms >= 1000"
+        ],
+        "lg_limited": false
+      },
+      "idle_median_ms": 0.330429,
+      "resource_sample_span_s": 28.120709,
+      "app_cores": 0.10312684505927643,
+      "postgres_sampled_cores": 0.14793368118847927,
+      "target_total_cores": 0.25527987221090337,
+      "target_memory_peak_measured_bytes": 1104998400,
+      "app_cpu_us_per_response": 144.71912020667475,
+      "binary_sha256": "1a25ddd0349e9579c76063fa17f73c1abcb917e80de3764736c5c83b50772e84",
+      "ancestor_limits": {
+        "/sys/fs/cgroup/system.slice/multicore-shootout-e78add64c3b9.service": {
+          "cpu.max": "800000 100000\n",
+          "memory.max": "6442450944\n",
+          "cpuset.cpus.effective": null
+        },
+        "/sys/fs/cgroup/system.slice": {
+          "cpu.max": "max 100000\n",
+          "memory.max": "max\n",
+          "cpuset.cpus.effective": null
+        },
+        "/sys/fs/cgroup": {
+          "cpu.max": "max 100000\n",
+          "memory.max": "6442450944\n",
+          "cpuset.cpus.effective": "0,3-7,10-11\n"
+        }
+      }
+    },
+    {
+      "name": "load-c-host-new-6",
+      "mode": "load",
+      "language": "c",
+      "memory": "host",
+      "version": "new",
+      "binary": "/srv/ai/artifacts/multicore/request-pools-20261117/frozen-p1/c-host",
+      "adaptive": 1,
+      "write_connections": 32,
+      "quota": 800,
+      "round": 1,
+      "fixture": "/srv/ai/runs/context-p1-6/workspaces/multicore/pseudosocket-20261116/postgres",
+      "rps": 945.1333333333333,
+      "p50_ms": 920.063,
+      "p95_ms": 4292.607,
+      "p99_ms": 4829.183,
+      "error_rate": 0,
+      "goodput_rps": 945.1333333333333,
+      "verdict": {
+        "pass": false,
+        "fail_reasons": [
+          "p95 4293 ms >= 500",
+          "p99 4829 ms >= 1000"
+        ],
+        "lg_limited": false
+      },
+      "idle_median_ms": 0.28728600000000004,
+      "resource_sample_span_s": 29.077940716,
+      "app_cores": 0.1121124783849016,
+      "postgres_sampled_cores": 0.17951752673901428,
+      "target_total_cores": 0.2957889653880261,
+      "target_memory_peak_measured_bytes": 1106001920,
+      "app_cpu_us_per_response": 118.6208066426976,
+      "binary_sha256": "1a25ddd0349e9579c76063fa17f73c1abcb917e80de3764736c5c83b50772e84",
+      "ancestor_limits": {
+        "/sys/fs/cgroup/system.slice/multicore-shootout-d975bea5086d.service": {
+          "cpu.max": "800000 100000\n",
+          "memory.max": "6442450944\n",
+          "cpuset.cpus.effective": null
+        },
+        "/sys/fs/cgroup/system.slice": {
+          "cpu.max": "max 100000\n",
+          "memory.max": "max\n",
+          "cpuset.cpus.effective": null
+        },
+        "/sys/fs/cgroup": {
+          "cpu.max": "max 100000\n",
+          "memory.max": "6442450944\n",
+          "cpuset.cpus.effective": "0,3-7,10-11\n"
+        }
+      }
+    },
+    {
+      "name": "load-c-host-old-7",
+      "mode": "load",
+      "language": "c",
+      "memory": "host",
+      "version": "old",
+      "binary": "/srv/ai/artifacts/multicore/pseudosocket-20261116/frozen-v14/c-host",
+      "adaptive": 1,
+      "write_connections": 32,
+      "quota": 800,
+      "round": 1,
+      "fixture": "/srv/ai/runs/context-p1-7/workspaces/multicore/pseudosocket-20261116/postgres",
+      "rps": 1131.3333333333333,
+      "p50_ms": 364.287,
+      "p95_ms": 2662.399,
+      "p99_ms": 3244.031,
+      "error_rate": 0,
+      "goodput_rps": 1131.3333333333333,
+      "verdict": {
+        "pass": false,
+        "fail_reasons": [
+          "p95 2662 ms >= 500",
+          "p99 3244 ms >= 1000"
+        ],
+        "lg_limited": false
+      },
+      "idle_median_ms": 0.336356,
+      "resource_sample_span_s": 29.079078645,
+      "app_cores": 0.1045425144693404,
+      "postgres_sampled_cores": 0.169193806312222,
+      "target_total_cores": 0.27945988589281867,
+      "target_memory_peak_measured_bytes": 1143095296,
+      "app_cpu_us_per_response": 92.40646535298211,
+      "binary_sha256": "dcb91f0ae8aa2fc848297d3ad8d265db0451f757ec94fba6d9acc6bd3091430b",
+      "ancestor_limits": {
+        "/sys/fs/cgroup/system.slice/multicore-shootout-757a8eeac4e6.service": {
+          "cpu.max": "800000 100000\n",
+          "memory.max": "6442450944\n",
+          "cpuset.cpus.effective": null
+        },
+        "/sys/fs/cgroup/system.slice": {
+          "cpu.max": "max 100000\n",
+          "memory.max": "max\n",
+          "cpuset.cpus.effective": null
+        },
+        "/sys/fs/cgroup": {
+          "cpu.max": "max 100000\n",
+          "memory.max": "6442450944\n",
+          "cpuset.cpus.effective": "0,3-7,10-11\n"
+        }
+      }
+    },
+    {
+      "name": "load-nelua-nelibc-new-8",
+      "mode": "load",
+      "language": "nelua",
+      "memory": "nelibc",
+      "version": "new",
+      "binary": "/srv/ai/artifacts/multicore/request-pools-20261117/frozen-p1/nelua-nelibc",
+      "adaptive": 1,
+      "write_connections": 32,
+      "quota": 800,
+      "round": 1,
+      "fixture": "/srv/ai/runs/context-p1-8/workspaces/multicore/pseudosocket-20261116/postgres",
+      "rps": 491.73333333333335,
+      "p50_ms": 8368.127,
+      "p95_ms": 10002.431,
+      "p99_ms": 10002.431,
+      "error_rate": 0.41411334056399135,
+      "goodput_rps": 288.09999999999997,
+      "verdict": {
+        "pass": false,
+        "fail_reasons": [
+          "p95 10002 ms >= 500",
+          "p99 10002 ms >= 1000",
+          "errors 41.41% >= 1%"
+        ],
+        "lg_limited": false
+      },
+      "idle_median_ms": 0.43918999999999997,
+      "resource_sample_span_s": 29.078906776,
+      "app_cores": 0.07049783596720179,
+      "postgres_sampled_cores": 0.06981005220166811,
+      "target_total_cores": 0.1431241563536006,
+      "target_memory_peak_measured_bytes": 1108254720,
+      "app_cpu_us_per_response": 143.36598962961318,
+      "binary_sha256": "23fdcc7c224c47de88182f31e0e6648b4402e4d57ed4dda23a5982edcfab6c8f",
+      "ancestor_limits": {
+        "/sys/fs/cgroup/system.slice/multicore-shootout-38d35984e758.service": {
+          "cpu.max": "800000 100000\n",
+          "memory.max": "6442450944\n",
+          "cpuset.cpus.effective": null
+        },
+        "/sys/fs/cgroup/system.slice": {
+          "cpu.max": "max 100000\n",
+          "memory.max": "max\n",
+          "cpuset.cpus.effective": null
+        },
+        "/sys/fs/cgroup": {
+          "cpu.max": "max 100000\n",
+          "memory.max": "6442450944\n",
+          "cpuset.cpus.effective": "0,3-7,10-11\n"
+        }
+      }
+    },
+    {
+      "name": "load-nelua-nelibc-old-9",
+      "mode": "load",
+      "language": "nelua",
+      "memory": "nelibc",
+      "version": "old",
+      "binary": "/srv/ai/artifacts/multicore/pseudosocket-20261116/frozen-v14/nelua-nelibc",
+      "adaptive": 1,
+      "write_connections": 32,
+      "quota": 800,
+      "round": 1,
+      "fixture": "/srv/ai/runs/context-p1-9/workspaces/multicore/pseudosocket-20261116/postgres",
+      "rps": 1309.2,
+      "p50_ms": 2.349,
+      "p95_ms": 286.207,
+      "p99_ms": 554.495,
+      "error_rate": 0,
+      "goodput_rps": 1309.2,
+      "verdict": {
+        "pass": true,
+        "lg_limited": false
+      },
+      "idle_median_ms": 1.403769,
+      "resource_sample_span_s": 29.07309618,
+      "app_cores": 0.13999196971665645,
+      "postgres_sampled_cores": 0.2775762151384318,
+      "target_total_cores": 0.41984988198116296,
+      "target_memory_peak_measured_bytes": 1152843776,
+      "app_cpu_us_per_response": 106.92939941693894,
+      "binary_sha256": "f06bd545fbf72463834acfd26da6a035a2bca43ad7b1dffe90628da47a71602f",
+      "ancestor_limits": {
+        "/sys/fs/cgroup/system.slice/multicore-shootout-4acd277e7290.service": {
+          "cpu.max": "800000 100000\n",
+          "memory.max": "6442450944\n",
+          "cpuset.cpus.effective": null
+        },
+        "/sys/fs/cgroup/system.slice": {
+          "cpu.max": "max 100000\n",
+          "memory.max": "max\n",
+          "cpuset.cpus.effective": null
+        },
+        "/sys/fs/cgroup": {
+          "cpu.max": "max 100000\n",
+          "memory.max": "6442450944\n",
+          "cpuset.cpus.effective": "0,3-7,10-11\n"
+        }
+      }
+    },
+    {
+      "name": "load-nelua-nelibc-old-10",
+      "mode": "load",
+      "language": "nelua",
+      "memory": "nelibc",
+      "version": "old",
+      "binary": "/srv/ai/artifacts/multicore/pseudosocket-20261116/frozen-v14/nelua-nelibc",
+      "adaptive": 1,
+      "write_connections": 32,
+      "quota": 800,
+      "round": 1,
+      "fixture": "/srv/ai/runs/context-p1-10/workspaces/multicore/pseudosocket-20261116/postgres",
+      "rps": 1157.8,
+      "p50_ms": 474.623,
+      "p95_ms": 1740.799,
+      "p99_ms": 2758.655,
+      "error_rate": 0,
+      "goodput_rps": 1157.8,
+      "verdict": {
+        "pass": false,
+        "fail_reasons": [
+          "p95 1741 ms >= 500",
+          "p99 2759 ms >= 1000"
+        ],
+        "lg_limited": false
+      },
+      "idle_median_ms": 0.3248785,
+      "resource_sample_span_s": 29.285187861,
+      "app_cores": 0.12531932584552252,
+      "postgres_sampled_cores": 0.22093080060504927,
+      "target_total_cores": 0.35145934691806824,
+      "target_memory_peak_measured_bytes": 1144967168,
+      "app_cpu_us_per_response": 108.2391827997258,
+      "binary_sha256": "f06bd545fbf72463834acfd26da6a035a2bca43ad7b1dffe90628da47a71602f",
+      "ancestor_limits": {
+        "/sys/fs/cgroup/system.slice/multicore-shootout-1c4060f77b33.service": {
+          "cpu.max": "800000 100000\n",
+          "memory.max": "6442450944\n",
+          "cpuset.cpus.effective": null
+        },
+        "/sys/fs/cgroup/system.slice": {
+          "cpu.max": "max 100000\n",
+          "memory.max": "max\n",
+          "cpuset.cpus.effective": null
+        },
+        "/sys/fs/cgroup": {
+          "cpu.max": "max 100000\n",
+          "memory.max": "6442450944\n",
+          "cpuset.cpus.effective": "0,3-7,10-11\n"
+        }
+      }
+    },
+    {
+      "name": "load-nelua-nelibc-new-11",
+      "mode": "load",
+      "language": "nelua",
+      "memory": "nelibc",
+      "version": "new",
+      "binary": "/srv/ai/artifacts/multicore/request-pools-20261117/frozen-p1/nelua-nelibc",
+      "adaptive": 1,
+      "write_connections": 32,
+      "quota": 800,
+      "round": 1,
+      "fixture": "/srv/ai/runs/context-p1-11/workspaces/multicore/pseudosocket-20261116/postgres",
+      "rps": 520.1666666666666,
+      "p50_ms": 10002.431,
+      "p95_ms": 10002.431,
+      "p99_ms": 10002.431,
+      "error_rate": 0.9679589875040051,
+      "goodput_rps": 16.666666666666675,
+      "verdict": {
+        "pass": false,
+        "fail_reasons": [
+          "p95 10002 ms >= 500",
+          "p99 10002 ms >= 1000",
+          "errors 96.80% >= 1%"
+        ],
+        "lg_limited": false
+      },
+      "idle_median_ms": 0.305685,
+      "resource_sample_span_s": 29.07901709,
+      "app_cores": 0.06843422505791442,
+      "postgres_sampled_cores": 0.057085835977958806,
+      "target_total_cores": 0.12971129623556338,
+      "target_memory_peak_measured_bytes": 1076867072,
+      "app_cpu_us_per_response": 131.56211161406173,
+      "binary_sha256": "23fdcc7c224c47de88182f31e0e6648b4402e4d57ed4dda23a5982edcfab6c8f",
+      "ancestor_limits": {
+        "/sys/fs/cgroup/system.slice/multicore-shootout-e19941343d7e.service": {
+          "cpu.max": "800000 100000\n",
+          "memory.max": "6442450944\n",
+          "cpuset.cpus.effective": null
+        },
+        "/sys/fs/cgroup/system.slice": {
+          "cpu.max": "max 100000\n",
+          "memory.max": "max\n",
+          "cpuset.cpus.effective": null
+        },
+        "/sys/fs/cgroup": {
+          "cpu.max": "max 100000\n",
+          "memory.max": "6442450944\n",
+          "cpuset.cpus.effective": "0,3-7,10-11\n"
+        }
+      }
+    }
+  ]
+}

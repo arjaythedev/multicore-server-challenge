@@ -61,6 +61,7 @@ int main(void)
     nc_buffer_cache_trim();
     assert(nc_buffer_cached_bytes()==0);
     assert(nc_request_memory_used()==0);
+    nc_request_pool_trim();assert(nc_request_pool_cached_bytes()==0);
     puts("PASS: 4608 requests produced on four threads and verified/freed on another; "
          "incremental growth, changing contents, <=32 MiB retained and complete trim");
 }

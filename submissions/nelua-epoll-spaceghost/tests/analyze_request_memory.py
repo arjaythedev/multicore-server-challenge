@@ -13,11 +13,11 @@ def analyze(path):
     if len(metadata) != 1 or records[0] != metadata[0]:
         raise ValueError('expected exactly one leading metadata record')
     meta = metadata[0]
-    variants = list(itertools.product(meta['shapes'], meta['caches'], ('host', 'nelibc')))
-    expected_variants = {(memory, shape, cache) for shape, cache, memory in variants}
+    variants = list(itertools.product(meta['shapes'], meta['caches'], meta.get('pools', [0]), ('host', 'nelibc')))
+    expected_variants = {(memory, shape, cache, pool) for shape, cache, pool, memory in variants}
     binaries = [r for r in records if r.get('type') == 'binary']
     if (len(binaries) != len(expected_variants) or
-            {(r['memory'], r['shape'], r['cache']) for r in binaries} != expected_variants):
+            {(r['memory'], r['shape'], r['cache'], r.get('pool', 0)) for r in binaries} != expected_variants):
         raise ValueError('incomplete or duplicate binary provenance')
     for record in [*binaries, {'sha256': meta['archive_sha256']}]:
         digest = record['sha256']
@@ -30,7 +30,7 @@ def analyze(path):
                                      expected_variants))
     observed, checksums, groups = set(), {}, {}
     for r in samples:
-        variant = r['memory'], r['shape'], r['cache']
+        variant = r['memory'], r['shape'], r['cache'], r.get('pool', 0)
         key = r['round'], r['threads'], r['group'], r['mode'], variant
         if key not in expected or key in observed:
             raise ValueError('unexpected or duplicate sample: ' + str(key))
@@ -47,20 +47,20 @@ def analyze(path):
     if observed != expected:
         raise ValueError(f'incomplete matrix: {len(observed)}/{len(expected)} samples')
     # Confirm the declared Latin rotation, including order within each workload.
-    ordered = [(memory, shape, cache) for shape, cache, memory in variants]
+    ordered = [(memory, shape, cache, pool) for shape, cache, pool, memory in variants]
     for round_ in range(meta['rounds']):
         offset = round_ % len(ordered)
         rotation = ordered[offset:] + ordered[:offset]
         if (round_ // len(ordered)) % 2:
             rotation.reverse()
         for workload in itertools.product((1, 4), (1, 128), (0, 1, 2)):
-            actual = [(r['memory'], r['shape'], r['cache']) for r in samples
+            actual = [(r['memory'], r['shape'], r['cache'], r.get('pool', 0)) for r in samples
                       if (r['round'], r['threads'], r['group'], r['mode']) == (round_, *workload)]
             if actual != rotation:
                 raise ValueError('unexpected variant execution order')
     summary = []
     for key, values in sorted(groups.items()):
-        row = dict(zip(('threads', 'group', 'mode', 'memory', 'shape', 'cache'), key))
+        row = dict(zip(('threads', 'group', 'mode', 'memory', 'shape', 'cache', 'pool'), key))
         for metric in ('cpu_ns', 'wall_ns'):
             timings = [r[metric] / r['actions'] for r in values]
             row[metric + '_per_request'] = {'min': min(timings), 'median': statistics.median(timings),

@@ -84,6 +84,7 @@ int main(int argc,char **argv)
     assert(atomic_load(&successes)>0 && atomic_load(&rejections)>0);
     assert(nc_request_memory_used()==0);
     nc_buffer_cache_trim();assert(nc_buffer_cached_bytes()==0);
+    nc_request_pool_trim();assert(nc_request_pool_cached_bytes()==0);
     pthread_barrier_destroy(&allocated);pthread_barrier_destroy(&released);
     puts("PASS: 1 MiB live budget, 503 fallback, failed-growth preservation, sticky failure, "
          "cache reuse, concurrent exhaustion and complete recovery");

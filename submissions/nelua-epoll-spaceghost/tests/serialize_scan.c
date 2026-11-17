@@ -63,6 +63,8 @@ int main(int argc,char **argv)
         unsigned loops=(unsigned)strtoul(argv[1],NULL,10);
         static const char wire[]="GET /api/tags HTTP/1.1\r\nHost: test\r\n\r\n";
         nc_request *r=nc_request_create(wire,sizeof(wire)-1); assert(r);
+        bool fresh=getenv("NC_WRITER_LIFETIMES")!=NULL;
+        if (fresh) { nc_request_free(r);r=NULL;nc_request_pool_warm(); }
         unsigned char text[4096];
         static const size_t lengths[]={12,64,128,1024,4096};
         for (unsigned kind=0;kind<3;++kind) {
@@ -76,11 +78,13 @@ int main(int argc,char **argv)
             struct timespec begin,end;
             clock_gettime(CLOCK_PROCESS_CPUTIME_ID,&begin);
             for (unsigned i=0;i<loops;++i) {
+                if (fresh) { r=nc_request_create(wire,sizeof(wire)-1);assert(r); }
                 nc_json_string(nc_begin(r,200),text,length);
                 size_t output_length;
                 const unsigned char *output=(const unsigned char *)nc_response_data(r,&output_length);
                 assert(output && output_length>=2);
                 benchmark_checksum+=(size_t)output[i%output_length]+output_length;
+                if (fresh) { nc_request_free(r);r=NULL; }
             }
             clock_gettime(CLOCK_PROCESS_CPUTIME_ID,&end);
             double elapsed=(double)(end.tv_sec-begin.tv_sec)+(double)(end.tv_nsec-begin.tv_nsec)/1e9;
@@ -89,6 +93,7 @@ int main(int argc,char **argv)
             }
         }
         nc_request_free(r);
+        nc_request_pool_trim();nc_buffer_cache_trim();
         fflush(stdout);
         fprintf(stderr,"checksum=%zu\n",benchmark_checksum);
         return 0;

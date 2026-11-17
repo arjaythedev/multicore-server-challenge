@@ -29,6 +29,7 @@ function N.issue_token(r:*N.Request,id:int64):cstring <cimport'nc_issue_token',n
 function N.hash(r:*N.Request,pw:cstring):cstring <cimport'nc_hash',nodecl> end
 function N.verify(pw:cstring,hash:cstring):boolean <cimport'nc_verify',nodecl> end
 function N.begin(r:*N.Request,status:cint):*N.Buffer <cimport'nc_begin',nodecl> end
+function N.reserve_json(b:*N.Buffer,n:csize):boolean <cimport'nc_reserve_json',nodecl> end
 function N.response_data(r:*N.Request,length:*csize):cstring <cimport'nc_response_data',nodecl> end
 function N.status(r:*N.Request):cint <cimport'nc_status',nodecl> end
 function N.write(b:*N.Buffer,s:cstring) <cimport'nc_write',nodecl> end

@@ -5,6 +5,11 @@ APP_IMPL="${APP_IMPL:-nelua}"
 MEMORY_IMPL="${MEMORY_IMPL:-nelibc}"
 CORE_PROFILE="${CORE_PROFILE:-freestanding}"
 BUFFER_CACHE="${BUFFER_CACHE:-auto}"
+REQUEST_POOL="${REQUEST_POOL:-0}"
+OUTPUT_RESERVE="${OUTPUT_RESERVE:-0}"
+for option in "$REQUEST_POOL" "$OUTPUT_RESERVE"; do
+  case "$option" in 0|1) ;; *) echo 'REQUEST_POOL and OUTPUT_RESERVE must be 0 or 1' >&2; exit 1 ;; esac
+done
 case "$CORE_PROFILE" in
   host|freestanding) ;;
   *) echo "CORE_PROFILE must be host or freestanding" >&2; exit 1 ;;
@@ -48,13 +53,13 @@ make -C "$NELUA_ROOT" -j"${JOBS:-2}"
 mv build/app.c.tmp build/app.c
 python3 tools/export_sql.py --check
 APP_SOURCES=(build/app.c)
-APP_FLAGS=(-DNC_BUFFER_CACHE="$BUFFER_CACHE")
+APP_FLAGS=(-DNC_BUFFER_CACHE="$BUFFER_CACHE" -DNC_REQUEST_POOL="$REQUEST_POOL" -DNC_OUTPUT_RESERVE="$OUTPUT_RESERVE")
 APP_BINARY=bin/conduit
 else
 # The C counterpart needs neither the Nelua compiler nor generated application
 # code. sql_shared.h is shared statement data, verified by the Nelua build.
 APP_SOURCES=(src/app_c.c src/batch_c.c src/serialize_c.c)
-APP_FLAGS=(-DNC_APP_C -DNC_BUFFER_CACHE="$BUFFER_CACHE")
+APP_FLAGS=(-DNC_APP_C -DNC_BUFFER_CACHE="$BUFFER_CACHE" -DNC_REQUEST_POOL="$REQUEST_POOL" -DNC_OUTPUT_RESERVE="$OUTPUT_RESERVE")
 APP_BINARY=bin/conduit-c
 fi
 MEMORY_LIBS=()

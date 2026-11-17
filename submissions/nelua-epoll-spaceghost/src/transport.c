@@ -936,6 +936,7 @@ main(void)
         fprintf(stderr, "total database worker connections must be <=95\n");
         return 1;
     }
+    nc_request_pool_warm();
     nc_read_policy_init(&server.pools[0].policy, (unsigned) server.pools[0].threads);
     pthread_mutex_init(&server.startup_lock, NULL);
     pthread_cond_init(&server.startup_ready, NULL);
@@ -1094,8 +1095,9 @@ cleanup:
     if (server.reserve_fd >= 0) close(server.reserve_fd);
     if (server.epoll_fd >= 0) close(server.epoll_fd);
     if (server.read_batch_stats)
-        fprintf(stderr,"request memory: live=%zu limit=%zu retained_buffer_capacity=%zu\n",
-                nc_request_memory_used(),nc_request_memory_limit(),nc_buffer_cached_bytes());
+        fprintf(stderr,"request memory: live=%zu limit=%zu retained_buffer_capacity=%zu retained_context_capacity=%zu\n",
+                nc_request_memory_used(),nc_request_memory_limit(),nc_buffer_cached_bytes(),nc_request_pool_cached_bytes());
     nc_buffer_cache_trim();
+    nc_request_pool_trim();
     return exit_code;
 }
