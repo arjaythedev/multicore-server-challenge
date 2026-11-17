@@ -47,7 +47,7 @@ pub fn spawn_kdf_worker_indexed(
     spawn_worker(
         &name,
         None, // No hard CPU pin, allows Linux kernel to schedule across allowed cores
-        SchedPolicy::Batch,
+        SchedPolicy::Normal,
         move || {
             if is_pin_enabled() {
                 unsafe {

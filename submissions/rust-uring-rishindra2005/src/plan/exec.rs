@@ -17,6 +17,7 @@ use crate::types::{Envelope, Job, KdfJob, ListFilter, Reply};
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PlannedJob<'a> {
     Tags,
+    TagsCached(std::sync::Arc<Vec<u8>>),
     UserGet { uid_bytes: [u8; 8] },
     Profile { viewer_bytes: [u8; 8], username: &'a str },
     ArticleGet { viewer_bytes: [u8; 8], slug: &'a str },
@@ -56,12 +57,15 @@ pub fn execute_read_batch(
     let mut pipeline = wire.pipeline();
 
     let mut planned: Vec<PlannedJob> = Vec::with_capacity(envelopes.len());
+    // Taken before any query of this batch is sent; used when storing a freshly rendered tags body.
+    let batch_gens = count_cache::snapshot();
 
     for env in envelopes {
         match &env.job {
-            Job::Tags => {
-                planned.push(PlannedJob::Tags);
-            }
+            Job::Tags => match count_cache::get_tags_body() {
+                Some(body) => planned.push(PlannedJob::TagsCached(body)),
+                None => planned.push(PlannedJob::Tags),
+            },
             Job::UserGet => {
                 let uid_bytes = env.viewer.to_be_bytes();
                 planned.push(PlannedJob::UserGet { uid_bytes });
@@ -200,7 +204,7 @@ pub fn execute_read_batch(
                 );
                 q2env.push(env_idx);
             }
-            PlannedJob::Skip => {}
+            PlannedJob::TagsCached(_) | PlannedJob::Skip => {}
         }
     }
 
@@ -446,7 +450,7 @@ pub fn execute_read_batch(
                 }
             }
 
-            PlannedJob::Skip => {}
+            PlannedJob::TagsCached(_) | PlannedJob::Skip => {}
         }
     });
 
@@ -481,10 +485,17 @@ pub fn execute_read_batch(
     for (idx, env) in envelopes.iter().enumerate() {
         body_buf.clear();
 
+        if let PlannedJob::TagsCached(body) = &planned[idx] {
+            let resp = frame_response(200, "OK", body, env.keepalive);
+            replies.push(Reply { conn: env.conn, bytes: resp, close: !env.keepalive });
+            continue;
+        }
+
         match &mut outcomes[idx] {
             QueryOutcome::Tags(tags) => {
                 let refs: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
                 render_tags(&mut body_buf, &refs);
+                count_cache::put_tags_body(&body_buf, &batch_gens);
                 let resp = frame_response(200, "OK", &body_buf, env.keepalive);
                 replies.push(Reply { conn: env.conn, bytes: resp, close: !env.keepalive });
             }

@@ -20,6 +20,7 @@ pub mod write;
 
 pub use plan_driver_loop as run_pg_driver;
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,7 +60,7 @@ pub fn compute_pool_sizing(num_cpus: usize, pg_threads: usize) -> PoolSizing {
     let mut total_feed: usize = std::env::var("PG_FEED_CONNS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| (num_cpus / 4).max(1));
+        .unwrap_or_else(|| (num_cpus / 2).max(1));
 
     // Rule R6: Total connections across all threads must stay <= 60
     let total = total_read + total_write + total_feed;
@@ -246,14 +247,14 @@ pub fn plan_driver_loop(
     }
 
     // Per-worker overflow buffers for incoming envelopes to ensure zero dropped requests
-    let mut overflow_read_in: Vec<Vec<Envelope>> = (0..read_workers.len())
-        .map(|_| Vec::with_capacity(64))
+    let mut overflow_read_in: Vec<VecDeque<Envelope>> = (0..read_workers.len())
+        .map(|_| VecDeque::with_capacity(64))
         .collect();
-    let mut overflow_feed_in: Vec<Vec<Envelope>> = (0..feed_workers.len())
-        .map(|_| Vec::with_capacity(64))
+    let mut overflow_feed_in: Vec<VecDeque<Envelope>> = (0..feed_workers.len())
+        .map(|_| VecDeque::with_capacity(64))
         .collect();
-    let mut overflow_write_in: Vec<Vec<Envelope>> = (0..write_workers.len())
-        .map(|_| Vec::with_capacity(64))
+    let mut overflow_write_in: Vec<VecDeque<Envelope>> = (0..write_workers.len())
+        .map(|_| VecDeque::with_capacity(64))
         .collect();
 
     // Outbound overflow buffers for replies and kdf jobs to net reactors and crypto worker
@@ -293,45 +294,39 @@ pub fn plan_driver_loop(
         }
 
         // 2. Drain pending inbound worker overflow buffers
+        // Move queued envelopes in order and stop at the first full push, so a long backlog is
+        // not copied around on every pass of the loop.
         for (idx, worker) in read_workers.iter().enumerate() {
-            if !overflow_read_in[idx].is_empty() {
-                let mut remaining = Vec::with_capacity(overflow_read_in[idx].len());
-                for env in overflow_read_in[idx].drain(..) {
-                    if let Err(e) = worker.in_q.push(env) {
-                        remaining.push(e);
-                    } else {
-                        work_done = true;
-                    }
+            while let Some(env) = overflow_read_in[idx].pop_front() {
+                if let Err(e) = worker.in_q.push(env) {
+                    overflow_read_in[idx].push_front(e);
+                    break;
                 }
-                overflow_read_in[idx] = remaining;
+                work_done = true;
             }
         }
 
+        // Move queued envelopes in order and stop at the first full push, so a long backlog is
+        // not copied around on every pass of the loop.
         for (idx, worker) in feed_workers.iter().enumerate() {
-            if !overflow_feed_in[idx].is_empty() {
-                let mut remaining = Vec::with_capacity(overflow_feed_in[idx].len());
-                for env in overflow_feed_in[idx].drain(..) {
-                    if let Err(e) = worker.in_q.push(env) {
-                        remaining.push(e);
-                    } else {
-                        work_done = true;
-                    }
+            while let Some(env) = overflow_feed_in[idx].pop_front() {
+                if let Err(e) = worker.in_q.push(env) {
+                    overflow_feed_in[idx].push_front(e);
+                    break;
                 }
-                overflow_feed_in[idx] = remaining;
+                work_done = true;
             }
         }
 
+        // Move queued envelopes in order and stop at the first full push, so a long backlog is
+        // not copied around on every pass of the loop.
         for (idx, worker) in write_workers.iter().enumerate() {
-            if !overflow_write_in[idx].is_empty() {
-                let mut remaining = Vec::with_capacity(overflow_write_in[idx].len());
-                for env in overflow_write_in[idx].drain(..) {
-                    if let Err(e) = worker.in_q.push(env) {
-                        remaining.push(e);
-                    } else {
-                        work_done = true;
-                    }
+            while let Some(env) = overflow_write_in[idx].pop_front() {
+                if let Err(e) = worker.in_q.push(env) {
+                    overflow_write_in[idx].push_front(e);
+                    break;
                 }
-                overflow_write_in[idx] = remaining;
+                work_done = true;
             }
         }
 
@@ -385,11 +380,11 @@ pub fn plan_driver_loop(
                 let slot = env.conn.slot as usize;
                 match env.job {
                     Job::Feed { .. } => {
-                        let target = slot % feed_workers.len();
+                        let target = spread_slot(slot) % feed_workers.len();
                         if !overflow_feed_in[target].is_empty() {
-                            overflow_feed_in[target].push(env);
+                            overflow_feed_in[target].push_back(env);
                         } else if let Err(e) = feed_workers[target].in_q.push(env) {
-                            overflow_feed_in[target].push(e);
+                            overflow_feed_in[target].push_back(e);
                         }
                     }
                     Job::Follow { .. }
@@ -401,19 +396,19 @@ pub fn plan_driver_loop(
                     | Job::ArticleDelete { .. }
                     | Job::UserUpdate { .. }
                     | Job::Register { .. } => {
-                        let target = slot % write_workers.len();
+                        let target = spread_slot(slot) % write_workers.len();
                         if !overflow_write_in[target].is_empty() {
-                            overflow_write_in[target].push(env);
+                            overflow_write_in[target].push_back(env);
                         } else if let Err(e) = write_workers[target].in_q.push(env) {
-                            overflow_write_in[target].push(e);
+                            overflow_write_in[target].push_back(e);
                         }
                     }
                     _ => {
-                        let target = slot % read_workers.len();
+                        let target = spread_slot(slot) % read_workers.len();
                         if !overflow_read_in[target].is_empty() {
-                            overflow_read_in[target].push(env);
+                            overflow_read_in[target].push_back(env);
                         } else if let Err(e) = read_workers[target].in_q.push(env) {
-                            overflow_read_in[target].push(e);
+                            overflow_read_in[target].push_back(e);
                         }
                     }
                 }
@@ -471,6 +466,13 @@ pub fn plan_driver_loop(
     }
 
     Ok(())
+}
+
+// The net layer picks the driver with `slot % drivers`, so every slot a driver sees has the same
+// residue; plain `slot % workers` would leave some of its feed workers idle.
+#[inline]
+fn spread_slot(slot: usize) -> usize {
+    ((slot as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize
 }
 
 /// Worker loop for dedicated read connections.
@@ -793,10 +795,10 @@ mod tests {
         let sizing = compute_pool_sizing(8, 2);
         assert_eq!(sizing.total_read, 8);
         assert_eq!(sizing.total_write, 4);
-        assert_eq!(sizing.total_feed, 2);
+        assert_eq!(sizing.total_feed, 4);
         assert_eq!(sizing.read_per_driver, 4);
         assert_eq!(sizing.write_per_driver, 2);
-        assert_eq!(sizing.feed_per_driver, 1);
+        assert_eq!(sizing.feed_per_driver, 2);
         let total_conns = (sizing.read_per_driver + sizing.write_per_driver + sizing.feed_per_driver) * 2;
         assert!(total_conns <= 60, "total conns must be <= 60 per Rule R6");
 

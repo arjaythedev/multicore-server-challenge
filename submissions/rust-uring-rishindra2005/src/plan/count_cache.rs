@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 static CREATE_GEN: AtomicU64 = AtomicU64::new(0);
 static DELETE_GEN: AtomicU64 = AtomicU64::new(0);
@@ -114,6 +114,29 @@ pub fn put_tag(tag: &str, count: i64, at: &Gens) {
     map.insert(tag.to_string(), entry);
 }
 
+// Rendered JSON body of GET /api/tags. Tags are only ever added (by article creates) and never
+// removed, so the body stays correct for as long as no create has finished since it was read.
+static TAGS_BODY: Mutex<Option<(Arc<Vec<u8>>, u64)>> = Mutex::new(None);
+
+pub fn get_tags_body() -> Option<Arc<Vec<u8>>> {
+    if !enabled() {
+        return None;
+    }
+    let now = CREATE_GEN.load(Ordering::SeqCst);
+    let guard = TAGS_BODY.lock().unwrap();
+    match guard.as_ref() {
+        Some((body, at)) if *at == now => Some(Arc::clone(body)),
+        _ => None,
+    }
+}
+
+pub fn put_tags_body(body: &[u8], at: &Gens) {
+    if !enabled() {
+        return;
+    }
+    *TAGS_BODY.lock().unwrap() = Some((Arc::new(body.to_vec()), at.create));
+}
+
 pub fn on_article_create() {
     CREATE_GEN.fetch_add(1, Ordering::SeqCst);
 }
@@ -187,5 +210,16 @@ mod tests {
         on_article_create();
         put_tag("rust", 7, &t_old);
         assert_eq!(get_tag("rust"), None);
+
+        // 3. Tags body: valid until the next create, unaffected by deletes, old snapshot rejected
+        let b_snap = snapshot();
+        put_tags_body(b"{\"tags\":[\"a\"]}", &b_snap);
+        assert_eq!(get_tags_body().as_deref().map(|v| v.as_slice()), Some(&b"{\"tags\":[\"a\"]}"[..]));
+        on_article_delete();
+        assert!(get_tags_body().is_some());
+        on_article_create();
+        assert!(get_tags_body().is_none());
+        put_tags_body(b"{}", &b_snap);
+        assert!(get_tags_body().is_none());
     }
 }
