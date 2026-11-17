@@ -427,6 +427,13 @@ pub fn execute_write_group(
         }
     });
 
+    if envelopes.iter().any(|e| matches!(e.job, Job::ArticleCreate { .. })) {
+        crate::plan::count_cache::on_article_create();
+    }
+    if envelopes.iter().any(|e| matches!(e.job, Job::ArticleDelete { .. })) {
+        crate::plan::count_cache::on_article_delete();
+    }
+
     // In case of transaction/database error, reply 500 to every envelope so no client hangs
     if let Err(e) = exec_res {
         for env in envelopes {
