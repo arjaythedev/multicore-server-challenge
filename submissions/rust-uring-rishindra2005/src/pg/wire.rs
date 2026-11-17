@@ -772,12 +772,91 @@ impl<'a> Pipeline<'a> {
 }
 
 // ============================================================================
+// PostgreSQL Binary Array Encoders
+// ============================================================================
+
+/// Encodes a slice of i64 values into PostgreSQL 1D int8 array binary representation (OID 1016, elem OID 20).
+pub fn encode_int8_array(vals: &[i64], out: &mut Vec<u8>) {
+    if vals.is_empty() {
+        out.extend_from_slice(&0i32.to_be_bytes()); // ndim = 0
+        out.extend_from_slice(&0i32.to_be_bytes()); // has_null = 0
+        out.extend_from_slice(&20u32.to_be_bytes()); // elem_oid = 20
+        return;
+    }
+    out.extend_from_slice(&1i32.to_be_bytes()); // ndim = 1
+    out.extend_from_slice(&0i32.to_be_bytes()); // has_null = 0
+    out.extend_from_slice(&20u32.to_be_bytes()); // elem_oid = 20
+    out.extend_from_slice(&(vals.len() as i32).to_be_bytes()); // dim_len = n
+    out.extend_from_slice(&1i32.to_be_bytes()); // lower_bound = 1
+    for &v in vals {
+        out.extend_from_slice(&8i32.to_be_bytes()); // byte_len = 8
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+}
+
+/// Encodes a slice of &str values into PostgreSQL 1D text array binary representation (OID 1009, elem OID 25).
+pub fn encode_text_array(vals: &[&str], out: &mut Vec<u8>) {
+    if vals.is_empty() {
+        out.extend_from_slice(&0i32.to_be_bytes()); // ndim = 0
+        out.extend_from_slice(&0i32.to_be_bytes()); // has_null = 0
+        out.extend_from_slice(&25u32.to_be_bytes()); // elem_oid = 25
+        return;
+    }
+    out.extend_from_slice(&1i32.to_be_bytes()); // ndim = 1
+    out.extend_from_slice(&0i32.to_be_bytes()); // has_null = 0
+    out.extend_from_slice(&25u32.to_be_bytes()); // elem_oid = 25
+    out.extend_from_slice(&(vals.len() as i32).to_be_bytes()); // dim_len = n
+    out.extend_from_slice(&1i32.to_be_bytes()); // lower_bound = 1
+    for &s in vals {
+        let b = s.as_bytes();
+        out.extend_from_slice(&(b.len() as i32).to_be_bytes());
+        out.extend_from_slice(b);
+    }
+}
+
+// ============================================================================
 // Unit Tests
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_encode_int8_array_exact_bytes() {
+        let mut int8_buf = Vec::new();
+        encode_int8_array(&[1i64, 2i64], &mut int8_buf);
+
+        let mut expected_int8 = Vec::new();
+        expected_int8.extend_from_slice(&1i32.to_be_bytes()); // ndim
+        expected_int8.extend_from_slice(&0i32.to_be_bytes()); // has_null
+        expected_int8.extend_from_slice(&20u32.to_be_bytes()); // elem_oid (int8)
+        expected_int8.extend_from_slice(&2i32.to_be_bytes()); // dim_len
+        expected_int8.extend_from_slice(&1i32.to_be_bytes()); // lbound
+        expected_int8.extend_from_slice(&8i32.to_be_bytes());
+        expected_int8.extend_from_slice(&1i64.to_be_bytes());
+        expected_int8.extend_from_slice(&8i32.to_be_bytes());
+        expected_int8.extend_from_slice(&2i64.to_be_bytes());
+        assert_eq!(int8_buf, expected_int8);
+    }
+
+    #[test]
+    fn test_encode_text_array_exact_bytes() {
+        let mut text_buf = Vec::new();
+        encode_text_array(&["a", "bc"], &mut text_buf);
+
+        let mut expected_text = Vec::new();
+        expected_text.extend_from_slice(&1i32.to_be_bytes()); // ndim
+        expected_text.extend_from_slice(&0i32.to_be_bytes()); // has_null
+        expected_text.extend_from_slice(&25u32.to_be_bytes()); // elem_oid (text)
+        expected_text.extend_from_slice(&2i32.to_be_bytes()); // dim_len
+        expected_text.extend_from_slice(&1i32.to_be_bytes()); // lbound
+        expected_text.extend_from_slice(&1i32.to_be_bytes());
+        expected_text.extend_from_slice(b"a");
+        expected_text.extend_from_slice(&2i32.to_be_bytes());
+        expected_text.extend_from_slice(b"bc");
+        assert_eq!(text_buf, expected_text);
+    }
 
     #[test]
     fn test_sha256_known_vectors() {

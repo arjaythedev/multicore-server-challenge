@@ -9,7 +9,7 @@ use crate::api::render::{
     render_profile, render_tags, render_user, ArticleRow, CommentRow, ProfileRow, UserRow,
 };
 use crate::pg::decode::BinaryDecoder;
-use crate::pg::wire::{PgError, PgWire};
+use crate::pg::wire::{encode_int8_array, encode_text_array, PgError, PgWire};
 use crate::types::{Envelope, Job, KdfJob, ListFilter, Reply};
 
 // Map each envelope to its query slot
@@ -28,6 +28,313 @@ pub(crate) enum PlannedJob<'a> {
     ListAuthor { author: &'a str, limit_bytes: [u8; 8], offset_bytes: [u8; 8], viewer_bytes: [u8; 8] },
     ListFavorited { favorited: &'a str, limit_bytes: [u8; 8], offset_bytes: [u8; 8], viewer_bytes: [u8; 8] },
     Skip,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum QueuedStmt {
+    Single(usize),
+    Packed(Vec<usize>),
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum PackKind {
+    UserGet,
+    LoginLookup,
+    Profile,
+    ArticleGet,
+    Comments,
+}
+
+impl<'a> PlannedJob<'a> {
+    pub(crate) fn pack_kind(&self) -> Option<PackKind> {
+        match self {
+            PlannedJob::UserGet { .. } => Some(PackKind::UserGet),
+            PlannedJob::LoginLookup { .. } => Some(PackKind::LoginLookup),
+            PlannedJob::Profile { .. } => Some(PackKind::Profile),
+            PlannedJob::ArticleGet { .. } => Some(PackKind::ArticleGet),
+            PlannedJob::Comments { .. } => Some(PackKind::Comments),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PlannedGroup {
+    Single(usize),
+    Packed {
+        kind: PackKind,
+        envs: Vec<usize>,
+    },
+}
+
+pub(crate) fn group_planned_jobs<'a>(planned: &'a [PlannedJob<'a>]) -> Vec<PlannedGroup> {
+    let mut groups = Vec::new();
+    let mut processed = vec![false; planned.len()];
+
+    for i in 0..planned.len() {
+        if processed[i] {
+            continue;
+        }
+        match &planned[i] {
+            PlannedJob::Skip | PlannedJob::TagsShared => {
+                processed[i] = true;
+            }
+            job => {
+                if let Some(kind) = job.pack_kind() {
+                    let mut envs = Vec::new();
+                    for j in i..planned.len() {
+                        if !processed[j] && planned[j].pack_kind() == Some(kind) {
+                            envs.push(j);
+                        }
+                    }
+                    if envs.len() >= 2 {
+                        for &idx in &envs {
+                            processed[idx] = true;
+                        }
+                        groups.push(PlannedGroup::Packed { kind, envs });
+                    } else {
+                        processed[i] = true;
+                        groups.push(PlannedGroup::Single(i));
+                    }
+                } else {
+                    processed[i] = true;
+                    groups.push(PlannedGroup::Single(i));
+                }
+            }
+        }
+    }
+
+    groups
+}
+
+#[derive(Default)]
+pub(crate) struct ArticleItem {
+    pub slug: String,
+    pub title: String,
+    pub description: String,
+    pub body: Option<String>,
+    pub created_at_us: i64,
+    pub updated_at_us: i64,
+    pub author_username: String,
+    pub author_bio: Option<String>,
+    pub author_image: Option<String>,
+    pub following: bool,
+    pub favorited: bool,
+    pub favorites_count: i64,
+    pub tags: Vec<String>,
+}
+
+pub(crate) enum QueryOutcome {
+    Empty,
+    Tags(Vec<String>),
+    User { _id: i64, username: String, email: String, bio: Option<String>, image: Option<String> },
+    LoginUser { id: i64, username: String, email: String, bio: Option<String>, image: Option<String>, password_hash: String },
+    Profile { username: String, bio: Option<String>, image: Option<String>, following: bool },
+    Article(ArticleItem),
+    Comments(Vec<CommentRowData>),
+    ArticlesList { count: i64, articles: Vec<ArticleItem> },
+}
+
+pub(crate) struct CommentRowData {
+    pub id: i64,
+    pub body: String,
+    pub created_at_us: i64,
+    pub updated_at_us: i64,
+    pub author_username: String,
+    pub author_bio: Option<String>,
+    pub author_image: Option<String>,
+    pub author_following: bool,
+}
+
+fn parse_row_into_outcome(
+    job: &PlannedJob,
+    row: &crate::pg::decode::BinaryRow,
+    base: usize,
+    outcome: &mut QueryOutcome,
+) {
+    match job {
+        PlannedJob::Tags => {
+            if let Some(tname) = row.get_str(base) {
+                match outcome {
+                    QueryOutcome::Tags(list) => list.push(tname.to_string()),
+                    _ => *outcome = QueryOutcome::Tags(vec![tname.to_string()]),
+                }
+            }
+        }
+
+        PlannedJob::UserGet { .. } => {
+            let _id = row.get_i64(base).unwrap_or(0);
+            let username = row.get_str(1 + base).unwrap_or("").to_string();
+            let email = row.get_str(2 + base).unwrap_or("").to_string();
+            let bio = row.get_str(3 + base).map(|s| s.to_string());
+            let image = row.get_str(4 + base).map(|s| s.to_string());
+            *outcome = QueryOutcome::User { _id, username, email, bio, image };
+        }
+
+        PlannedJob::LoginLookup { .. } => {
+            let id = row.get_i64(base).unwrap_or(0);
+            let username = row.get_str(1 + base).unwrap_or("").to_string();
+            let email = row.get_str(2 + base).unwrap_or("").to_string();
+            let bio = row.get_str(3 + base).map(|s| s.to_string());
+            let image = row.get_str(4 + base).map(|s| s.to_string());
+            let password_hash = row.get_str(5 + base).unwrap_or("").to_string();
+            *outcome = QueryOutcome::LoginUser { id, username, email, bio, image, password_hash };
+        }
+
+        PlannedJob::Profile { .. } => {
+            let username = row.get_str(1 + base).unwrap_or("").to_string();
+            let bio = row.get_str(2 + base).map(|s| s.to_string());
+            let image = row.get_str(3 + base).map(|s| s.to_string());
+            let following = row.get_bool(4 + base).unwrap_or(false);
+            *outcome = QueryOutcome::Profile { username, bio, image, following };
+        }
+
+        PlannedJob::ArticleGet { .. } => {
+            let slug = row.get_str(1 + base).unwrap_or("").to_string();
+            let title = row.get_str(2 + base).unwrap_or("").to_string();
+            let description = row.get_str(3 + base).unwrap_or("").to_string();
+            let body = row.get_str(4 + base).map(|s| s.to_string());
+            let created_at_us = row.get_i64(5 + base).unwrap_or(0);
+            let updated_at_us = row.get_i64(6 + base).unwrap_or(0);
+            let author_username = row.get_str(8 + base).unwrap_or("").to_string();
+            let author_bio = row.get_str(9 + base).map(|s| s.to_string());
+            let author_image = row.get_str(10 + base).map(|s| s.to_string());
+            let following = row.get_bool(11 + base).unwrap_or(false);
+            let favorited = row.get_bool(12 + base).unwrap_or(false);
+            let favorites_count = row.get_i64(13 + base).unwrap_or(0);
+
+            let mut tags = Vec::new();
+            if let Some(tag_raw) = row.get_raw(14 + base) {
+                let mut tag_slices = Vec::new();
+                if BinaryDecoder::decode_text_array(tag_raw, &mut tag_slices).is_ok() {
+                    tags = tag_slices.into_iter().map(|s| s.to_string()).collect();
+                }
+            }
+
+            *outcome = QueryOutcome::Article(ArticleItem {
+                slug,
+                title,
+                description,
+                body,
+                created_at_us,
+                updated_at_us,
+                author_username,
+                author_bio,
+                author_image,
+                following,
+                favorited,
+                favorites_count,
+                tags,
+            });
+        }
+
+        PlannedJob::Comments { .. } => {
+            match outcome {
+                QueryOutcome::Comments(ref mut list) => {
+                    if let Some(cid) = row.get_i64(1 + base) {
+                        let body = row.get_str(2 + base).unwrap_or("").to_string();
+                        let created_at_us = row.get_i64(3 + base).unwrap_or(0);
+                        let updated_at_us = row.get_i64(4 + base).unwrap_or(0);
+                        let author_username = row.get_str(6 + base).unwrap_or("").to_string();
+                        let author_bio = row.get_str(7 + base).map(|s| s.to_string());
+                        let author_image = row.get_str(8 + base).map(|s| s.to_string());
+                        let author_following = row.get_bool(9 + base).unwrap_or(false);
+                        list.push(CommentRowData {
+                            id: cid,
+                            body,
+                            created_at_us,
+                            updated_at_us,
+                            author_username,
+                            author_bio,
+                            author_image,
+                            author_following,
+                        });
+                    }
+                }
+                _ => {
+                    let mut list = Vec::new();
+                    if let Some(cid) = row.get_i64(1 + base) {
+                        let body = row.get_str(2 + base).unwrap_or("").to_string();
+                        let created_at_us = row.get_i64(3 + base).unwrap_or(0);
+                        let updated_at_us = row.get_i64(4 + base).unwrap_or(0);
+                        let author_username = row.get_str(6 + base).unwrap_or("").to_string();
+                        let author_bio = row.get_str(7 + base).map(|s| s.to_string());
+                        let author_image = row.get_str(8 + base).map(|s| s.to_string());
+                        let author_following = row.get_bool(9 + base).unwrap_or(false);
+                        list.push(CommentRowData {
+                            id: cid,
+                            body,
+                            created_at_us,
+                            updated_at_us,
+                            author_username,
+                            author_bio,
+                            author_image,
+                            author_following,
+                        });
+                    }
+                    *outcome = QueryOutcome::Comments(list);
+                }
+            }
+        }
+
+        PlannedJob::ListGlobal { .. }
+        | PlannedJob::ListTag { .. }
+        | PlannedJob::ListAuthor { .. }
+        | PlannedJob::ListFavorited { .. } => {
+            let row_kind = row.get_i64(base).unwrap_or(-1);
+            if row_kind == 0 {
+                let count = row.get_i64(1 + base).unwrap_or(0);
+                match outcome {
+                    QueryOutcome::ArticlesList { count: ref mut c, .. } => *c = count,
+                    _ => *outcome = QueryOutcome::ArticlesList { count, articles: Vec::new() },
+                }
+            } else if row_kind == 1 {
+                let slug = row.get_str(3 + base).unwrap_or("").to_string();
+                let title = row.get_str(4 + base).unwrap_or("").to_string();
+                let description = row.get_str(5 + base).unwrap_or("").to_string();
+                let created_at_us = row.get_i64(6 + base).unwrap_or(0);
+                let updated_at_us = row.get_i64(7 + base).unwrap_or(0);
+                let author_username = row.get_str(9 + base).unwrap_or("").to_string();
+                let author_bio = row.get_str(10 + base).map(|s| s.to_string());
+                let author_image = row.get_str(11 + base).map(|s| s.to_string());
+
+                let mut tags = Vec::new();
+                if let Some(tag_raw) = row.get_raw(12 + base) {
+                    let mut tag_slices = Vec::new();
+                    if BinaryDecoder::decode_text_array(tag_raw, &mut tag_slices).is_ok() {
+                        tags = tag_slices.into_iter().map(|s| s.to_string()).collect();
+                    }
+                }
+
+                let favorites_count = row.get_i64(13 + base).unwrap_or(0);
+                let favorited = row.get_bool(14 + base).unwrap_or(false);
+                let following = row.get_bool(15 + base).unwrap_or(false);
+
+                let item = ArticleItem {
+                    slug,
+                    title,
+                    description,
+                    body: None,
+                    created_at_us,
+                    updated_at_us,
+                    author_username,
+                    author_bio,
+                    author_image,
+                    following,
+                    favorited,
+                    favorites_count,
+                    tags,
+                };
+
+                match outcome {
+                    QueryOutcome::ArticlesList { ref mut articles, .. } => articles.push(item),
+                    _ => *outcome = QueryOutcome::ArticlesList { count: 0, articles: vec![item] },
+                }
+            }
+        }
+
+        PlannedJob::TagsShared | PlannedJob::Skip => {}
+    }
 }
 
 /// Executes a batch of read envelopes using per-family pipelined statements.
@@ -129,105 +436,130 @@ pub fn execute_read_batch(
         }
     }
 
-    // Bind parameters for queued queries and track q_idx -> envelope mapping
-    let mut q2env: Vec<usize> = Vec::with_capacity(envelopes.len());
+    let groups = group_planned_jobs(&planned);
+    let mut q2env: Vec<QueuedStmt> = Vec::with_capacity(groups.len());
 
-    for (env_idx, job) in planned.iter().enumerate() {
-        match job {
-            PlannedJob::Tags => {
-                pipeline.bind_exec_binary("s_tags", &[]);
-                q2env.push(env_idx);
+    for group in groups {
+        match group {
+            PlannedGroup::Single(env_idx) => {
+                match &planned[env_idx] {
+                    PlannedJob::Tags => {
+                        pipeline.bind_exec_binary("s_tags", &[]);
+                    }
+                    PlannedJob::UserGet { uid_bytes } => {
+                        pipeline.bind_exec_binary("s_uid", &[uid_bytes.as_slice()]);
+                    }
+                    PlannedJob::Profile { viewer_bytes, username } => {
+                        pipeline.bind_exec_binary("s_prof", &[viewer_bytes.as_slice(), username.as_bytes()]);
+                    }
+                    PlannedJob::ArticleGet { viewer_bytes, slug } => {
+                        pipeline.bind_exec_binary("s_aslug", &[viewer_bytes.as_slice(), slug.as_bytes()]);
+                    }
+                    PlannedJob::Comments { viewer_bytes, slug } => {
+                        pipeline.bind_exec_binary("s_cmts", &[viewer_bytes.as_slice(), slug.as_bytes()]);
+                    }
+                    PlannedJob::LoginLookup { email, .. } => {
+                        pipeline.bind_exec_binary("s_uemail", &[email.as_bytes()]);
+                    }
+                    PlannedJob::ListGlobal { limit_bytes, offset_bytes, viewer_bytes } => {
+                        pipeline.bind_exec_binary(
+                            "s_global",
+                            &[limit_bytes.as_slice(), offset_bytes.as_slice(), viewer_bytes.as_slice()],
+                        );
+                    }
+                    PlannedJob::ListTag { tag_name, limit_bytes, offset_bytes, viewer_bytes } => {
+                        pipeline.bind_exec_binary(
+                            "s_tag_list",
+                            &[tag_name.as_bytes(), limit_bytes.as_slice(), offset_bytes.as_slice(), viewer_bytes.as_slice()],
+                        );
+                    }
+                    PlannedJob::ListAuthor { author, limit_bytes, offset_bytes, viewer_bytes } => {
+                        pipeline.bind_exec_binary(
+                            "s_author_list",
+                            &[author.as_bytes(), limit_bytes.as_slice(), offset_bytes.as_slice(), viewer_bytes.as_slice()],
+                        );
+                    }
+                    PlannedJob::ListFavorited { favorited, limit_bytes, offset_bytes, viewer_bytes } => {
+                        pipeline.bind_exec_binary(
+                            "s_fav_list",
+                            &[favorited.as_bytes(), limit_bytes.as_slice(), offset_bytes.as_slice(), viewer_bytes.as_slice()],
+                        );
+                    }
+                    PlannedJob::Skip | PlannedJob::TagsShared => unreachable!(),
+                }
+                q2env.push(QueuedStmt::Single(env_idx));
             }
-            PlannedJob::UserGet { uid_bytes } => {
-                pipeline.bind_exec_binary("s_uid", &[uid_bytes.as_slice()]);
-                q2env.push(env_idx);
+            PlannedGroup::Packed { kind, envs } => {
+                match kind {
+                    PackKind::UserGet => {
+                        let mut uids = Vec::with_capacity(envs.len());
+                        for &idx in &envs {
+                            uids.push(envelopes[idx].viewer);
+                        }
+                        let mut buf0 = Vec::new();
+                        encode_int8_array(&uids, &mut buf0);
+                        pipeline.bind_exec_binary("s_uid_p", &[&buf0]);
+                    }
+                    PackKind::LoginLookup => {
+                        let mut emails = Vec::with_capacity(envs.len());
+                        for &idx in &envs {
+                            if let PlannedJob::LoginLookup { email } = &planned[idx] {
+                                emails.push(*email);
+                            }
+                        }
+                        let mut buf0 = Vec::new();
+                        encode_text_array(&emails, &mut buf0);
+                        pipeline.bind_exec_binary("s_uemail_p", &[&buf0]);
+                    }
+                    PackKind::Profile => {
+                        let mut viewers = Vec::with_capacity(envs.len());
+                        let mut usernames = Vec::with_capacity(envs.len());
+                        for &idx in &envs {
+                            if let PlannedJob::Profile { username, .. } = &planned[idx] {
+                                viewers.push(envelopes[idx].viewer);
+                                usernames.push(*username);
+                            }
+                        }
+                        let mut buf0 = Vec::new();
+                        let mut buf1 = Vec::new();
+                        encode_int8_array(&viewers, &mut buf0);
+                        encode_text_array(&usernames, &mut buf1);
+                        pipeline.bind_exec_binary("s_prof_p", &[&buf0, &buf1]);
+                    }
+                    PackKind::ArticleGet => {
+                        let mut viewers = Vec::with_capacity(envs.len());
+                        let mut slugs = Vec::with_capacity(envs.len());
+                        for &idx in &envs {
+                            if let PlannedJob::ArticleGet { slug, .. } = &planned[idx] {
+                                viewers.push(envelopes[idx].viewer);
+                                slugs.push(*slug);
+                            }
+                        }
+                        let mut buf0 = Vec::new();
+                        let mut buf1 = Vec::new();
+                        encode_int8_array(&viewers, &mut buf0);
+                        encode_text_array(&slugs, &mut buf1);
+                        pipeline.bind_exec_binary("s_aslug_p", &[&buf0, &buf1]);
+                    }
+                    PackKind::Comments => {
+                        let mut viewers = Vec::with_capacity(envs.len());
+                        let mut slugs = Vec::with_capacity(envs.len());
+                        for &idx in &envs {
+                            if let PlannedJob::Comments { slug, .. } = &planned[idx] {
+                                viewers.push(envelopes[idx].viewer);
+                                slugs.push(*slug);
+                            }
+                        }
+                        let mut buf0 = Vec::new();
+                        let mut buf1 = Vec::new();
+                        encode_int8_array(&viewers, &mut buf0);
+                        encode_text_array(&slugs, &mut buf1);
+                        pipeline.bind_exec_binary("s_cmts_p", &[&buf0, &buf1]);
+                    }
+                }
+                q2env.push(QueuedStmt::Packed(envs));
             }
-            PlannedJob::Profile { viewer_bytes, username } => {
-                pipeline.bind_exec_binary("s_prof", &[viewer_bytes.as_slice(), username.as_bytes()]);
-                q2env.push(env_idx);
-            }
-            PlannedJob::ArticleGet { viewer_bytes, slug } => {
-                pipeline.bind_exec_binary("s_aslug", &[viewer_bytes.as_slice(), slug.as_bytes()]);
-                q2env.push(env_idx);
-            }
-            PlannedJob::Comments { viewer_bytes, slug } => {
-                pipeline.bind_exec_binary("s_cmts", &[viewer_bytes.as_slice(), slug.as_bytes()]);
-                q2env.push(env_idx);
-            }
-            PlannedJob::LoginLookup { email, .. } => {
-                pipeline.bind_exec_binary("s_uemail", &[email.as_bytes()]);
-                q2env.push(env_idx);
-            }
-            PlannedJob::ListGlobal { limit_bytes, offset_bytes, viewer_bytes } => {
-                pipeline.bind_exec_binary(
-                    "s_global",
-                    &[limit_bytes.as_slice(), offset_bytes.as_slice(), viewer_bytes.as_slice()],
-                );
-                q2env.push(env_idx);
-            }
-            PlannedJob::ListTag { tag_name, limit_bytes, offset_bytes, viewer_bytes } => {
-                pipeline.bind_exec_binary(
-                    "s_tag_list",
-                    &[tag_name.as_bytes(), limit_bytes.as_slice(), offset_bytes.as_slice(), viewer_bytes.as_slice()],
-                );
-                q2env.push(env_idx);
-            }
-            PlannedJob::ListAuthor { author, limit_bytes, offset_bytes, viewer_bytes } => {
-                pipeline.bind_exec_binary(
-                    "s_author_list",
-                    &[author.as_bytes(), limit_bytes.as_slice(), offset_bytes.as_slice(), viewer_bytes.as_slice()],
-                );
-                q2env.push(env_idx);
-            }
-            PlannedJob::ListFavorited { favorited, limit_bytes, offset_bytes, viewer_bytes } => {
-                pipeline.bind_exec_binary(
-                    "s_fav_list",
-                    &[favorited.as_bytes(), limit_bytes.as_slice(), offset_bytes.as_slice(), viewer_bytes.as_slice()],
-                );
-                q2env.push(env_idx);
-            }
-            PlannedJob::TagsShared | PlannedJob::Skip => {}
         }
-    }
-
-    // Data structures for collected results
-    #[derive(Default)]
-    struct ArticleItem {
-        slug: String,
-        title: String,
-        description: String,
-        body: Option<String>,
-        created_at_us: i64,
-        updated_at_us: i64,
-        author_username: String,
-        author_bio: Option<String>,
-        author_image: Option<String>,
-        following: bool,
-        favorited: bool,
-        favorites_count: i64,
-        tags: Vec<String>,
-    }
-
-    enum QueryOutcome {
-        Empty,
-        Tags(Vec<String>),
-        User { _id: i64, username: String, email: String, bio: Option<String>, image: Option<String> },
-        LoginUser { id: i64, username: String, email: String, bio: Option<String>, image: Option<String>, password_hash: String },
-        Profile { username: String, bio: Option<String>, image: Option<String>, following: bool },
-        Article(ArticleItem),
-        Comments(Vec<CommentRowData>),
-        ArticlesList { count: i64, articles: Vec<ArticleItem> },
-    }
-
-    struct CommentRowData {
-        id: i64,
-        body: String,
-        created_at_us: i64,
-        updated_at_us: i64,
-        author_username: String,
-        author_bio: Option<String>,
-        author_image: Option<String>,
-        author_following: bool,
     }
 
     let mut outcomes: Vec<QueryOutcome> = Vec::with_capacity(envelopes.len());
@@ -239,191 +571,18 @@ pub fn execute_read_batch(
         if q_idx >= q2env.len() {
             return;
         }
-        let env_idx = q2env[q_idx];
-
-        match &planned[env_idx] {
-            PlannedJob::Tags => {
-                if let Some(tname) = row.get_str(0) {
-                    match &mut outcomes[env_idx] {
-                        QueryOutcome::Tags(list) => list.push(tname.to_string()),
-                        _ => outcomes[env_idx] = QueryOutcome::Tags(vec![tname.to_string()]),
-                    }
+        let (env_idx, base) = match &q2env[q_idx] {
+            QueuedStmt::Single(idx) => (*idx, 0),
+            QueuedStmt::Packed(envs) => {
+                let ord = row.get_i64(0).unwrap_or(0);
+                if ord < 1 || (ord as usize) > envs.len() {
+                    return;
                 }
+                (envs[(ord - 1) as usize], 1)
             }
+        };
 
-            PlannedJob::UserGet { .. } => {
-                let _id = row.get_i64(0).unwrap_or(0);
-                let username = row.get_str(1).unwrap_or("").to_string();
-                let email = row.get_str(2).unwrap_or("").to_string();
-                let bio = row.get_str(3).map(|s| s.to_string());
-                let image = row.get_str(4).map(|s| s.to_string());
-                outcomes[env_idx] = QueryOutcome::User { _id, username, email, bio, image };
-            }
-
-            PlannedJob::LoginLookup { .. } => {
-                let id = row.get_i64(0).unwrap_or(0);
-                let username = row.get_str(1).unwrap_or("").to_string();
-                let email = row.get_str(2).unwrap_or("").to_string();
-                let bio = row.get_str(3).map(|s| s.to_string());
-                let image = row.get_str(4).map(|s| s.to_string());
-                let password_hash = row.get_str(5).unwrap_or("").to_string();
-                outcomes[env_idx] = QueryOutcome::LoginUser { id, username, email, bio, image, password_hash };
-            }
-
-            PlannedJob::Profile { .. } => {
-                let username = row.get_str(1).unwrap_or("").to_string();
-                let bio = row.get_str(2).map(|s| s.to_string());
-                let image = row.get_str(3).map(|s| s.to_string());
-                let following = row.get_bool(4).unwrap_or(false);
-                outcomes[env_idx] = QueryOutcome::Profile { username, bio, image, following };
-            }
-
-            PlannedJob::ArticleGet { .. } => {
-                let slug = row.get_str(1).unwrap_or("").to_string();
-                let title = row.get_str(2).unwrap_or("").to_string();
-                let description = row.get_str(3).unwrap_or("").to_string();
-                let body = row.get_str(4).map(|s| s.to_string());
-                let created_at_us = row.get_i64(5).unwrap_or(0);
-                let updated_at_us = row.get_i64(6).unwrap_or(0);
-                let author_username = row.get_str(8).unwrap_or("").to_string();
-                let author_bio = row.get_str(9).map(|s| s.to_string());
-                let author_image = row.get_str(10).map(|s| s.to_string());
-                let following = row.get_bool(11).unwrap_or(false);
-                let favorited = row.get_bool(12).unwrap_or(false);
-                let favorites_count = row.get_i64(13).unwrap_or(0);
-
-                let mut tags = Vec::new();
-                if let Some(tag_raw) = row.get_raw(14) {
-                    let mut tag_slices = Vec::new();
-                    if BinaryDecoder::decode_text_array(tag_raw, &mut tag_slices).is_ok() {
-                        tags = tag_slices.into_iter().map(|s| s.to_string()).collect();
-                    }
-                }
-
-                outcomes[env_idx] = QueryOutcome::Article(ArticleItem {
-                    slug,
-                    title,
-                    description,
-                    body,
-                    created_at_us,
-                    updated_at_us,
-                    author_username,
-                    author_bio,
-                    author_image,
-                    following,
-                    favorited,
-                    favorites_count,
-                    tags,
-                });
-            }
-
-            PlannedJob::Comments { .. } => {
-                match outcomes[env_idx] {
-                    QueryOutcome::Comments(ref mut list) => {
-                        if let Some(cid) = row.get_i64(1) {
-                            let body = row.get_str(2).unwrap_or("").to_string();
-                            let created_at_us = row.get_i64(3).unwrap_or(0);
-                            let updated_at_us = row.get_i64(4).unwrap_or(0);
-                            let author_username = row.get_str(6).unwrap_or("").to_string();
-                            let author_bio = row.get_str(7).map(|s| s.to_string());
-                            let author_image = row.get_str(8).map(|s| s.to_string());
-                            let author_following = row.get_bool(9).unwrap_or(false);
-                            list.push(CommentRowData {
-                                id: cid,
-                                body,
-                                created_at_us,
-                                updated_at_us,
-                                author_username,
-                                author_bio,
-                                author_image,
-                                author_following,
-                            });
-                        }
-                    }
-                    _ => {
-                        let mut list = Vec::new();
-                        if let Some(cid) = row.get_i64(1) {
-                            let body = row.get_str(2).unwrap_or("").to_string();
-                            let created_at_us = row.get_i64(3).unwrap_or(0);
-                            let updated_at_us = row.get_i64(4).unwrap_or(0);
-                            let author_username = row.get_str(6).unwrap_or("").to_string();
-                            let author_bio = row.get_str(7).map(|s| s.to_string());
-                            let author_image = row.get_str(8).map(|s| s.to_string());
-                            let author_following = row.get_bool(9).unwrap_or(false);
-                            list.push(CommentRowData {
-                                id: cid,
-                                body,
-                                created_at_us,
-                                updated_at_us,
-                                author_username,
-                                author_bio,
-                                author_image,
-                                author_following,
-                            });
-                        }
-                        outcomes[env_idx] = QueryOutcome::Comments(list);
-                    }
-                }
-            }
-
-            PlannedJob::ListGlobal { .. }
-            | PlannedJob::ListTag { .. }
-            | PlannedJob::ListAuthor { .. }
-            | PlannedJob::ListFavorited { .. } => {
-                let row_kind = row.get_i64(0).unwrap_or(-1);
-                if row_kind == 0 {
-                    let count = row.get_i64(1).unwrap_or(0);
-                    match outcomes[env_idx] {
-                        QueryOutcome::ArticlesList { count: ref mut c, .. } => *c = count,
-                        _ => outcomes[env_idx] = QueryOutcome::ArticlesList { count, articles: Vec::new() },
-                    }
-                } else if row_kind == 1 {
-                    let slug = row.get_str(3).unwrap_or("").to_string();
-                    let title = row.get_str(4).unwrap_or("").to_string();
-                    let description = row.get_str(5).unwrap_or("").to_string();
-                    let created_at_us = row.get_i64(6).unwrap_or(0);
-                    let updated_at_us = row.get_i64(7).unwrap_or(0);
-                    let author_username = row.get_str(9).unwrap_or("").to_string();
-                    let author_bio = row.get_str(10).map(|s| s.to_string());
-                    let author_image = row.get_str(11).map(|s| s.to_string());
-
-                    let mut tags = Vec::new();
-                    if let Some(tag_raw) = row.get_raw(12) {
-                        let mut tag_slices = Vec::new();
-                        if BinaryDecoder::decode_text_array(tag_raw, &mut tag_slices).is_ok() {
-                            tags = tag_slices.into_iter().map(|s| s.to_string()).collect();
-                        }
-                    }
-
-                    let favorites_count = row.get_i64(13).unwrap_or(0);
-                    let favorited = row.get_bool(14).unwrap_or(false);
-                    let following = row.get_bool(15).unwrap_or(false);
-
-                    let item = ArticleItem {
-                        slug,
-                        title,
-                        description,
-                        body: None,
-                        created_at_us,
-                        updated_at_us,
-                        author_username,
-                        author_bio,
-                        author_image,
-                        following,
-                        favorited,
-                        favorites_count,
-                        tags,
-                    };
-
-                    match outcomes[env_idx] {
-                        QueryOutcome::ArticlesList { ref mut articles, .. } => articles.push(item),
-                        _ => outcomes[env_idx] = QueryOutcome::ArticlesList { count: 0, articles: vec![item] },
-                    }
-                }
-            }
-
-            PlannedJob::TagsShared | PlannedJob::Skip => {}
-        }
+        parse_row_into_outcome(&planned[env_idx], &row, base, &mut outcomes[env_idx]);
     });
 
     // In case of database error, reply 500 to every envelope so no connection hangs
@@ -682,20 +841,76 @@ mod tests {
         assert_eq!(planned[1], PlannedJob::Skip);
         assert_eq!(planned[2], PlannedJob::LoginLookup { email: "test@example.com" });
 
-        // Simulate q2env mapping
-        let mut q2env = Vec::new();
-        for (env_idx, job) in planned.iter().enumerate() {
-            match job {
-                PlannedJob::Skip => {}
-                _ => q2env.push(env_idx),
-            }
-        }
+        // Simulate group_planned_jobs
+        let groups = group_planned_jobs(&planned);
 
         // Issued queries count is 2 (query 0 and query 1)
-        assert_eq!(q2env.len(), 2);
+        assert_eq!(groups.len(), 2);
         // Query 0 maps to envelope 0 (Tags)
-        assert_eq!(q2env[0], 0);
+        assert_eq!(groups[0], PlannedGroup::Single(0));
         // Query 1 maps to envelope 2 (LoginLookup), NOT envelope 1 (which was Skip)!
-        assert_eq!(q2env[1], 2);
+        assert_eq!(groups[1], PlannedGroup::Single(2));
+    }
+
+    #[test]
+    fn test_group_planned_jobs_and_mapping() {
+        // A test of the grouping: a batch of planned jobs [Profile a, ArticleGet x, Profile b, Profile a]
+        // -> exactly 2 statements queued (packed s_prof_p with 3 elements in order a,b,a and single s_aslug),
+        // and an ord->env mapping test.
+        let planned = vec![
+            PlannedJob::Profile { viewer_bytes: 10i64.to_be_bytes(), username: "a" },
+            PlannedJob::ArticleGet { viewer_bytes: 0i64.to_be_bytes(), slug: "x" },
+            PlannedJob::Profile { viewer_bytes: 20i64.to_be_bytes(), username: "b" },
+            PlannedJob::Profile { viewer_bytes: 30i64.to_be_bytes(), username: "a" },
+        ];
+
+        let groups = group_planned_jobs(&planned);
+        assert_eq!(groups.len(), 2, "Exactly 2 statements queued");
+        assert_eq!(
+            groups[0],
+            PlannedGroup::Packed {
+                kind: PackKind::Profile,
+                envs: vec![0, 2, 3],
+            },
+            "Packed s_prof_p with 3 elements in order a, b, a"
+        );
+        assert_eq!(
+            groups[1],
+            PlannedGroup::Single(1),
+            "Single s_aslug for envelope 1"
+        );
+
+        // Ordinal-to-envelope mapping test
+        let q2env = vec![
+            QueuedStmt::Packed(vec![0, 2, 3]),
+            QueuedStmt::Single(1),
+        ];
+
+        let map_ord = |q_idx: usize, ord: i64| -> Option<usize> {
+            match &q2env[q_idx] {
+                QueuedStmt::Single(idx) => Some(*idx),
+                QueuedStmt::Packed(envs) => {
+                    if ord < 1 || (ord as usize) > envs.len() {
+                        None
+                    } else {
+                        Some(envs[(ord - 1) as usize])
+                    }
+                }
+            }
+        };
+
+        // Statement 0 (Packed s_prof_p with envs [0, 2, 3]):
+        // ord 1 (1-based) -> env 0 (Profile "a")
+        assert_eq!(map_ord(0, 1), Some(0));
+        // ord 2 -> env 2 (Profile "b")
+        assert_eq!(map_ord(0, 2), Some(2));
+        // ord 3 -> env 3 (Profile "a")
+        assert_eq!(map_ord(0, 3), Some(3));
+        // ord 0 or out of range -> None
+        assert_eq!(map_ord(0, 0), None);
+        assert_eq!(map_ord(0, 4), None);
+
+        // Statement 1 (Single s_aslug for env 1):
+        assert_eq!(map_ord(1, 0), Some(1));
     }
 }

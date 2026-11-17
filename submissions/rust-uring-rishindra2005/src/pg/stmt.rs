@@ -92,6 +92,76 @@ pub const PREPARED_STATEMENTS: &[StmtDef] = &[
         oids: &[OID_INT8, OID_TEXT],
     },
 
+    // 2p. Packed User by id batch
+    StmtDef {
+        name: "s_uid_p",
+        sql: "SELECT r.ord, u.id, u.username, u.email, u.bio, u.image \
+              FROM unnest($1::int8[]) WITH ORDINALITY AS r(id, ord) \
+              JOIN users u ON u.id = r.id \
+              ORDER BY r.ord ASC",
+        oids: &[OID_INT8_ARR],
+    },
+
+    // 3p. Packed User by email batch
+    StmtDef {
+        name: "s_uemail_p",
+        sql: "SELECT r.ord, u.id, u.username, u.email, u.bio, u.image, u.password_hash \
+              FROM unnest($1::text[]) WITH ORDINALITY AS r(email, ord) \
+              JOIN users u ON u.email = r.email \
+              ORDER BY r.ord ASC",
+        oids: &[OID_TEXT_ARR],
+    },
+
+    // 4p. Packed Profile by username batch
+    StmtDef {
+        name: "s_prof_p",
+        sql: "SELECT r.ord, u.id, u.username, u.bio, u.image, \
+              EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.viewer AND fo.followee_id = u.id) AS following \
+              FROM unnest($1::int8[], $2::text[]) WITH ORDINALITY AS r(viewer, username, ord) \
+              JOIN users u ON u.username = r.username \
+              ORDER BY r.ord ASC",
+        oids: &[OID_INT8_ARR, OID_TEXT_ARR],
+    },
+
+    // 5p. Packed Article by slug batch
+    StmtDef {
+        name: "s_aslug_p",
+        sql: "SELECT r.ord, \
+              a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at, a.author_id, \
+              u.username, u.bio, u.image, \
+              EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.viewer AND fo.followee_id = a.author_id) AS following, \
+              EXISTS (SELECT 1 FROM favorites fa WHERE fa.user_id = r.viewer AND fa.article_id = a.id) AS favorited, \
+              (SELECT count(*) FROM favorites fa WHERE fa.article_id = a.id) AS fc, \
+              ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at WHERE at.article_id = a.id ORDER BY 1) AS tags \
+              FROM unnest($1::int8[], $2::text[]) WITH ORDINALITY AS r(viewer, slug, ord) \
+              JOIN articles a ON a.slug = r.slug \
+              JOIN users u ON u.id = a.author_id \
+              ORDER BY r.ord ASC",
+        oids: &[OID_INT8_ARR, OID_TEXT_ARR],
+    },
+
+    // 6p. Packed Comments list by article slug batch
+    StmtDef {
+        name: "s_cmts_p",
+        sql: "SELECT r.ord, \
+              a.id AS article_id, c.id, c.body, c.created_at, c.updated_at, c.author_id, \
+              c.username, c.bio, c.image, \
+              EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.viewer AND fo.followee_id = c.author_id) AS following \
+              FROM unnest($1::int8[], $2::text[]) WITH ORDINALITY AS r(viewer, slug, ord) \
+              JOIN articles a ON a.slug = r.slug \
+              LEFT JOIN LATERAL ( \
+                  SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id, \
+                         u.username, u.bio, u.image \
+                  FROM comments c \
+                  LEFT JOIN users u ON u.id = c.author_id \
+                  WHERE c.article_id = a.id \
+                  ORDER BY c.created_at DESC NULLS LAST, c.id DESC NULLS LAST \
+                  LIMIT 100 \
+              ) c ON true \
+              ORDER BY r.ord ASC, c.created_at DESC NULLS LAST, c.id DESC NULLS LAST",
+        oids: &[OID_INT8_ARR, OID_TEXT_ARR],
+    },
+
     // 7. Global articles list (windowed count + page)
     StmtDef {
         name: "s_global",
