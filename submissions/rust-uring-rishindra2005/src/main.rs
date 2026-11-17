@@ -40,7 +40,9 @@ fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(default_pg_threads);
 
-    let default_kdf_threads = 1;
+    // One batching KDF worker per pg driver (driver p feeds worker p % kdf_threads): a single
+    // worker falls behind when the box is saturated and only gets its fair share of one CPU.
+    let default_kdf_threads = pg_threads.max(1);
     let kdf_threads: usize = env::var("KDF_THREADS")
         .ok()
         .and_then(|k| k.parse().ok())
