@@ -95,6 +95,8 @@ pub struct UringReactor {
     pub kdf_rr: usize,
     /// (slot, gen24) whose multishot recv ended with ENOBUFS; re-armed when buffers are back.
     pub starved_recvs: Vec<(u32, u32)>,
+    pub pg_queues: Vec<Arc<SpscQueue<Envelope, 1024>>>,
+    pub kdf_queues: Vec<Arc<SpscQueue<KdfJob, 512>>>,
 }
 
 impl UringReactor {
@@ -128,6 +130,8 @@ impl UringReactor {
             overflow_kdf: VecDeque::new(),
             kdf_rr: 0,
             starved_recvs: Vec::with_capacity(1024),
+            pg_queues: Vec::new(),
+            kdf_queues: Vec::new(),
         };
 
         reactor.arm_multishot_accept();
@@ -181,6 +185,10 @@ impl UringReactor {
         pg_queues: &[Arc<SpscQueue<Envelope, 1024>>],
         kdf_queues: &[Arc<SpscQueue<KdfJob, 512>>],
     ) {
+        if self.pg_queues.is_empty() {
+            self.pg_queues = pg_queues.to_vec();
+            self.kdf_queues = kdf_queues.to_vec();
+        }
         if self.overflow_pg.len() < pg_queues.len() {
             self.overflow_pg.resize_with(pg_queues.len(), VecDeque::new);
         }
@@ -290,6 +298,10 @@ impl UringReactor {
         pg_queues: &[Arc<SpscQueue<Envelope, 1024>>],
         kdf_queues: &[Arc<SpscQueue<KdfJob, 512>>],
     ) {
+        if self.pg_queues.is_empty() {
+            self.pg_queues = pg_queues.to_vec();
+            self.kdf_queues = kdf_queues.to_vec();
+        }
         if !self.conn_table.is_live(slot_idx, gen24) {
             // CQE of a connection that is closed/closing (its slot may already hold a new connection):
             // give the buffer back and touch nothing else.
@@ -321,88 +333,65 @@ impl UringReactor {
             }
         };
 
-        let conn_ref = ConnRef {
-            reactor: self.reactor_id,
-            slot: slot_idx,
-            gen: slot.gen,
-        };
+        // Streaming request handling: append received chunk and immediately return ring buffer
+        slot.partial_read.extend_from_slice(chunk);
+        self.pbr.return_buf(bid);
 
-        // Streaming request handling
-        if !slot.partial_read.is_empty() {
-            slot.partial_read.extend_from_slice(chunk);
-            self.pbr.return_buf(bid);
-
-            let mut offset = 0;
-            loop {
-                let remaining = &slot.partial_read[offset..];
-                if remaining.is_empty() {
-                    slot.partial_read.clear();
-                    break;
-                }
-
-                match parse_http_request(remaining) {
-                    ParseResult::Complete(req) => {
-                        offset += req.bytes_consumed;
-                        Self::dispatch_admitted_request(
-                            &mut self.outgoing,
-                            &mut self.overflow_pg,
-                            &mut self.overflow_kdf,
-                            &mut self.kdf_rr,
-                            req,
-                            conn_ref,
-                            pg_queues,
-                            kdf_queues,
-                        );
-                    }
-                    ParseResult::Incomplete => {
-                        if offset > 0 {
-                            slot.partial_read.drain(..offset);
-                        }
-                        break;
-                    }
-                    ParseResult::Error => {
-                        slot.partial_read.clear();
-                        self.close_slot(slot_idx);
-                        break;
-                    }
-                }
-            }
-        } else {
-            match parse_http_request(chunk) {
-                ParseResult::Complete(req) => {
-                    let consumed = req.bytes_consumed;
-                    Self::dispatch_admitted_request(
-                        &mut self.outgoing,
-                        &mut self.overflow_pg,
-                        &mut self.overflow_kdf,
-                        &mut self.kdf_rr,
-                        req,
-                        conn_ref,
-                        pg_queues,
-                        kdf_queues,
-                    );
-
-                    if consumed < chunk.len() {
-                        // Pipelined request remaining in this chunk
-                        slot.partial_read.extend_from_slice(&chunk[consumed..]);
-                    }
-                    self.pbr.return_buf(bid);
-                }
-                ParseResult::Incomplete => {
-                    slot.partial_read.extend_from_slice(chunk);
-                    self.pbr.return_buf(bid);
-                }
-                ParseResult::Error => {
-                    self.pbr.return_buf(bid);
-                    self.close_slot(slot_idx);
-                }
-            }
+        // If no request is currently in flight on this connection, parse and dispatch ONE request
+        if !slot.in_flight {
+            self.try_dispatch_next(slot_idx);
         }
 
         // Re-arm multishot recv if it completed
         if (cqe.flags & IORING_CQE_F_MORE) == 0 && self.conn_table.is_live(slot_idx, gen24) {
             if !self.arm_multishot_recv(slot_idx) {
                 self.starved_recvs.push((slot_idx, gen24));
+            }
+        }
+    }
+
+    /// Parses and dispatches the next complete HTTP request from `slot.partial_read`.
+    /// Sets `in_flight = true` upon dispatch. If a request is already in flight or
+    /// partial_read is incomplete/empty, does nothing.
+    pub fn try_dispatch_next(&mut self, slot_idx: u32) {
+        let slot = match self.conn_table.slots.get_mut(slot_idx as usize) {
+            Some(s) if s.in_use && !s.closing => s,
+            _ => return,
+        };
+
+        if slot.in_flight || slot.partial_read.is_empty() {
+            return;
+        }
+
+        let conn_ref = ConnRef {
+            reactor: self.reactor_id,
+            slot: slot_idx,
+            gen: slot.gen,
+        };
+
+        match parse_http_request(&slot.partial_read) {
+            ParseResult::Complete(req) => {
+                let consumed = req.bytes_consumed;
+                slot.in_flight = true;
+                Self::dispatch_admitted_request(
+                    &mut self.outgoing,
+                    &mut self.overflow_pg,
+                    &mut self.overflow_kdf,
+                    &mut self.kdf_rr,
+                    req,
+                    conn_ref,
+                    &self.pg_queues,
+                    &self.kdf_queues,
+                );
+                let slot = &mut self.conn_table.slots[slot_idx as usize];
+                slot.partial_read.drain(..consumed);
+            }
+            ParseResult::Incomplete => {
+                // Incomplete request; wait for more data from kernel
+            }
+            ParseResult::Error => {
+                slot.partial_read.clear();
+                self.close_slot(slot_idx);
             }
         }
     }
@@ -418,6 +407,11 @@ impl UringReactor {
         );
         if outcome == SendOutcome::Close {
             self.close_slot(slot_idx);
+        } else if self.conn_table.is_live(slot_idx, gen24) {
+            let slot = &self.conn_table.slots[slot_idx as usize];
+            if !slot.in_flight && !slot.partial_read.is_empty() {
+                self.try_dispatch_next(slot_idx);
+            }
         }
     }
 
@@ -584,5 +578,280 @@ mod user_data_tests {
         assert_ne!(TOKEN_WAKEUP, TOKEN_CLOSE);
         // A reused slot (gen bumped) must not match the old connection's CQEs.
         assert_ne!(make_user_data(TAG_RECV, 5, 1), make_user_data(TAG_RECV, 5, 2));
+    }
+
+    #[test]
+    fn test_pipelined_requests_in_flight_dispatch() {
+        let dummy_efd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        let pg_q: Arc<SpscQueue<Envelope, 1024>> = Arc::new(SpscQueue::new(dummy_efd));
+        let pg_queues = vec![pg_q.clone()];
+        let kdf_queues = Vec::new();
+
+        let mut conn_table = ConnTable::new(0, 16);
+        let (slot_idx, _) = conn_table.allocate(100, 0, false);
+        let mut outgoing = OutgoingQueue::new();
+        let mut overflow_pg = Vec::new();
+        let mut overflow_kdf = VecDeque::new();
+        let mut kdf_rr = 0;
+
+        // 1. Prepare 3 complete GET requests back-to-back
+        let req1 = b"GET /api/tags HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let req2 = b"GET /api/tags HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let req3 = b"GET /api/tags HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let mut input = Vec::new();
+        input.extend_from_slice(req1);
+        input.extend_from_slice(req2);
+        input.extend_from_slice(req3);
+
+        let slot = conn_table.get_slot_mut(slot_idx).unwrap();
+        slot.partial_read.extend_from_slice(&input);
+
+        let dispatch_next = |conn_table: &mut ConnTable,
+                                 outgoing: &mut OutgoingQueue,
+                                 overflow_pg: &mut Vec<VecDeque<Envelope>>,
+                                 overflow_kdf: &mut VecDeque<KdfJob>,
+                                 kdf_rr: &mut usize,
+                                 slot_idx: u32,
+                                 pg_queues: &[Arc<SpscQueue<Envelope, 1024>>],
+                                 kdf_queues: &[Arc<SpscQueue<KdfJob, 512>>]| {
+            let slot = match conn_table.slots.get_mut(slot_idx as usize) {
+                Some(s) if s.in_use && !s.closing => s,
+                _ => return,
+            };
+
+            if slot.in_flight || slot.partial_read.is_empty() {
+                return;
+            }
+
+            let conn_ref = ConnRef {
+                reactor: 0,
+                slot: slot_idx,
+                gen: slot.gen,
+            };
+
+            match parse_http_request(&slot.partial_read) {
+                ParseResult::Complete(req) => {
+                    let consumed = req.bytes_consumed;
+                    slot.in_flight = true;
+                    UringReactor::dispatch_admitted_request(
+                        outgoing,
+                        overflow_pg,
+                        overflow_kdf,
+                        kdf_rr,
+                        req,
+                        conn_ref,
+                        pg_queues,
+                        kdf_queues,
+                    );
+                    let slot = &mut conn_table.slots[slot_idx as usize];
+                    slot.partial_read.drain(..consumed);
+                }
+                ParseResult::Incomplete => {}
+                ParseResult::Error => {
+                    slot.partial_read.clear();
+                }
+            }
+        };
+
+        // First call: exactly ONE request dispatched now
+        dispatch_next(
+            &mut conn_table,
+            &mut outgoing,
+            &mut overflow_pg,
+            &mut overflow_kdf,
+            &mut kdf_rr,
+            slot_idx,
+            &pg_queues,
+            &kdf_queues,
+        );
+
+        let slot = conn_table.get_slot(slot_idx).unwrap();
+        assert!(slot.in_flight, "Slot must be in flight after first dispatch");
+        assert_eq!(pg_q.len(), 1, "Exactly one request dispatched to PG");
+        assert_eq!(slot.partial_read.len(), req2.len() + req3.len(), "Remaining 2 requests kept in partial_read");
+
+        // Calling dispatch_next again while in_flight should NOT dispatch anything
+        dispatch_next(
+            &mut conn_table,
+            &mut outgoing,
+            &mut overflow_pg,
+            &mut overflow_kdf,
+            &mut kdf_rr,
+            slot_idx,
+            &pg_queues,
+            &kdf_queues,
+        );
+        assert_eq!(pg_q.len(), 1, "Still only 1 request dispatched while in_flight is true");
+
+        // Simulate send-completion for request 1:
+        let slot = conn_table.get_slot_mut(slot_idx).unwrap();
+        slot.in_flight = false;
+
+        // After simulated send-completion: the next one is dispatched
+        dispatch_next(
+            &mut conn_table,
+            &mut outgoing,
+            &mut overflow_pg,
+            &mut overflow_kdf,
+            &mut kdf_rr,
+            slot_idx,
+            &pg_queues,
+            &kdf_queues,
+        );
+        let slot = conn_table.get_slot(slot_idx).unwrap();
+        assert!(slot.in_flight, "Slot must be in flight after second dispatch");
+        assert_eq!(pg_q.len(), 2, "Second request dispatched to PG");
+        assert_eq!(slot.partial_read.len(), req3.len(), "Remaining 1 request kept in partial_read");
+
+        // Simulate send-completion for request 2:
+        let slot = conn_table.get_slot_mut(slot_idx).unwrap();
+        slot.in_flight = false;
+
+        // After simulated send-completion: the 3rd one is dispatched
+        dispatch_next(
+            &mut conn_table,
+            &mut outgoing,
+            &mut overflow_pg,
+            &mut overflow_kdf,
+            &mut kdf_rr,
+            slot_idx,
+            &pg_queues,
+            &kdf_queues,
+        );
+        let slot = conn_table.get_slot(slot_idx).unwrap();
+        assert!(slot.in_flight, "Slot must be in flight after third dispatch");
+        assert_eq!(pg_q.len(), 3, "Third request dispatched to PG");
+        assert!(slot.partial_read.is_empty(), "All requests consumed from partial_read");
+
+        // Simulate send-completion for request 3:
+        let slot = conn_table.get_slot_mut(slot_idx).unwrap();
+        slot.in_flight = false;
+
+        // Now dispatch_next finds partial_read empty, does nothing
+        dispatch_next(
+            &mut conn_table,
+            &mut outgoing,
+            &mut overflow_pg,
+            &mut overflow_kdf,
+            &mut kdf_rr,
+            slot_idx,
+            &pg_queues,
+            &kdf_queues,
+        );
+        let slot = conn_table.get_slot(slot_idx).unwrap();
+        assert!(!slot.in_flight, "Slot remains not in flight");
+        assert_eq!(pg_q.len(), 3);
+
+        unsafe { libc::close(dummy_efd); }
+    }
+
+    #[test]
+    fn test_pipelined_partial_request_preserved() {
+        let dummy_efd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        let pg_q: Arc<SpscQueue<Envelope, 1024>> = Arc::new(SpscQueue::new(dummy_efd));
+        let pg_queues = vec![pg_q.clone()];
+        let kdf_queues = Vec::new();
+
+        let mut conn_table = ConnTable::new(0, 16);
+        let (slot_idx, _) = conn_table.allocate(101, 0, false);
+        let mut outgoing = OutgoingQueue::new();
+        let mut overflow_pg = Vec::new();
+        let mut overflow_kdf = VecDeque::new();
+        let mut kdf_rr = 0;
+
+        // 1.5 requests: 1 complete GET request + half of a second request
+        let req1 = b"GET /api/tags HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let req_half = b"GET /api/tags HTTP/1.1\r\nHost: loca";
+        let mut input = Vec::new();
+        input.extend_from_slice(req1);
+        input.extend_from_slice(req_half);
+
+        let slot = conn_table.get_slot_mut(slot_idx).unwrap();
+        slot.partial_read.extend_from_slice(&input);
+
+        let dispatch_next = |conn_table: &mut ConnTable,
+                                 outgoing: &mut OutgoingQueue,
+                                 overflow_pg: &mut Vec<VecDeque<Envelope>>,
+                                 overflow_kdf: &mut VecDeque<KdfJob>,
+                                 kdf_rr: &mut usize,
+                                 slot_idx: u32,
+                                 pg_queues: &[Arc<SpscQueue<Envelope, 1024>>],
+                                 kdf_queues: &[Arc<SpscQueue<KdfJob, 512>>]| {
+            let slot = match conn_table.slots.get_mut(slot_idx as usize) {
+                Some(s) if s.in_use && !s.closing => s,
+                _ => return,
+            };
+
+            if slot.in_flight || slot.partial_read.is_empty() {
+                return;
+            }
+
+            let conn_ref = ConnRef {
+                reactor: 0,
+                slot: slot_idx,
+                gen: slot.gen,
+            };
+
+            match parse_http_request(&slot.partial_read) {
+                ParseResult::Complete(req) => {
+                    let consumed = req.bytes_consumed;
+                    slot.in_flight = true;
+                    UringReactor::dispatch_admitted_request(
+                        outgoing,
+                        overflow_pg,
+                        overflow_kdf,
+                        kdf_rr,
+                        req,
+                        conn_ref,
+                        pg_queues,
+                        kdf_queues,
+                    );
+                    let slot = &mut conn_table.slots[slot_idx as usize];
+                    slot.partial_read.drain(..consumed);
+                }
+                ParseResult::Incomplete => {}
+                ParseResult::Error => {
+                    slot.partial_read.clear();
+                }
+            }
+        };
+
+        dispatch_next(
+            &mut conn_table,
+            &mut outgoing,
+            &mut overflow_pg,
+            &mut overflow_kdf,
+            &mut kdf_rr,
+            slot_idx,
+            &pg_queues,
+            &kdf_queues,
+        );
+
+        let slot = conn_table.get_slot(slot_idx).unwrap();
+        assert!(slot.in_flight, "Slot must be in flight after complete request dispatched");
+        assert_eq!(pg_q.len(), 1, "Exactly one request dispatched to PG");
+        assert_eq!(slot.partial_read.as_slice(), req_half, "Half request must be preserved in partial_read");
+
+        // Simulate send-completion for request 1:
+        let slot = conn_table.get_slot_mut(slot_idx).unwrap();
+        slot.in_flight = false;
+
+        // Dispatch next on the half request: ParseResult::Incomplete, nothing dispatched, half kept
+        dispatch_next(
+            &mut conn_table,
+            &mut outgoing,
+            &mut overflow_pg,
+            &mut overflow_kdf,
+            &mut kdf_rr,
+            slot_idx,
+            &pg_queues,
+            &kdf_queues,
+        );
+        let slot = conn_table.get_slot(slot_idx).unwrap();
+        assert!(!slot.in_flight, "Slot must not be in flight for incomplete request");
+        assert_eq!(pg_q.len(), 1, "Still 1 request in PG");
+        assert_eq!(slot.partial_read.as_slice(), req_half, "Half request still preserved in partial_read");
+
+        unsafe { libc::close(dummy_efd); }
     }
 }

@@ -131,6 +131,7 @@ impl OutgoingQueue {
             s.pending_write.clear();
             s.write_offset = 0;
             if s.queued_write.is_empty() {
+                s.in_flight = false;
                 return if s.keepalive { SendOutcome::Keep } else { SendOutcome::Close };
             }
             std::mem::swap(&mut s.pending_write, &mut s.queued_write);

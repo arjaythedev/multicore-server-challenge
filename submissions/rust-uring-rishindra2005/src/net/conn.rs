@@ -27,6 +27,8 @@ pub struct ConnSlot {
     pub send_inflight: bool,
     /// Close requested while a send was in flight; finished when that send's CQE arrives.
     pub closing: bool,
+    /// True while an HTTP request/response transaction is in flight for this connection.
+    pub in_flight: bool,
 }
 
 impl Default for ConnSlot {
@@ -44,6 +46,7 @@ impl Default for ConnSlot {
             queued_write: Vec::new(),
             send_inflight: false,
             closing: false,
+            in_flight: false,
         }
     }
 }
@@ -78,6 +81,7 @@ impl ConnTable {
             s.queued_write.clear();
             s.send_inflight = false;
             s.closing = false;
+            s.in_flight = false;
             (idx, s.gen)
         } else {
             let idx = self.slots.len() as u32;
@@ -94,6 +98,7 @@ impl ConnTable {
                 queued_write: Vec::new(),
                 send_inflight: false,
                 closing: false,
+                in_flight: false,
             };
             self.slots.push(s);
             (idx, 1)
@@ -168,6 +173,7 @@ impl ConnTable {
                 s.queued_write.clear();
                 s.send_inflight = false;
                 s.closing = false;
+                s.in_flight = false;
                 self.free_slots.push(slot_idx);
 
                 return (fd, fixed, is_fixed);

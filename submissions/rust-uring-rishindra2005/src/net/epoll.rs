@@ -21,6 +21,8 @@ pub struct EpollReactor {
     pub overflow_pg: Vec<VecDeque<Envelope>>,
     pub overflow_kdf: VecDeque<KdfJob>,
     pub kdf_rr: usize,
+    pub pg_queues: Vec<Arc<SpscQueue<Envelope, 1024>>>,
+    pub kdf_queues: Vec<Arc<SpscQueue<KdfJob, 512>>>,
 }
 
 impl EpollReactor {
@@ -50,6 +52,8 @@ impl EpollReactor {
             overflow_pg: Vec::new(),
             overflow_kdf: VecDeque::new(),
             kdf_rr: 0,
+            pg_queues: Vec::new(),
+            kdf_queues: Vec::new(),
         })
     }
 
@@ -63,6 +67,10 @@ impl EpollReactor {
         pg_queues: &[Arc<SpscQueue<Envelope, 1024>>],
         kdf_queues: &[Arc<SpscQueue<KdfJob, 512>>],
     ) {
+        if self.pg_queues.is_empty() {
+            self.pg_queues = pg_queues.to_vec();
+            self.kdf_queues = kdf_queues.to_vec();
+        }
         if self.overflow_pg.len() < pg_queues.len() {
             self.overflow_pg.resize_with(pg_queues.len(), VecDeque::new);
         }
@@ -148,6 +156,11 @@ impl EpollReactor {
         pg_queues: &[Arc<SpscQueue<Envelope, 1024>>],
         kdf_queues: &[Arc<SpscQueue<KdfJob, 512>>],
     ) {
+        if self.pg_queues.is_empty() {
+            self.pg_queues = pg_queues.to_vec();
+            self.kdf_queues = kdf_queues.to_vec();
+        }
+
         if events & ((libc::EPOLLERR | libc::EPOLLHUP | libc::EPOLLRDHUP) as u32) != 0 {
             self.close_connection(slot_idx);
             return;
@@ -176,74 +189,9 @@ impl EpollReactor {
                         _ => return,
                     };
 
-                    let conn_ref = ConnRef {
-                        reactor: self.reactor_id,
-                        slot: slot_idx,
-                        gen: slot.gen,
-                    };
-
-                    if !slot.partial_read.is_empty() {
-                        slot.partial_read.extend_from_slice(chunk);
-                        let mut offset = 0;
-                        loop {
-                            let remaining = &slot.partial_read[offset..];
-                            if remaining.is_empty() {
-                                slot.partial_read.clear();
-                                break;
-                            }
-                            match parse_http_request(remaining) {
-                                ParseResult::Complete(req) => {
-                                    offset += req.bytes_consumed;
-                                    Self::dispatch_admitted_request(
-                                        &mut self.outgoing,
-                                        &mut self.overflow_pg,
-                                        &mut self.overflow_kdf,
-                                        &mut self.kdf_rr,
-                                        req,
-                                        conn_ref,
-                                        pg_queues,
-                                        kdf_queues,
-                                    );
-                                }
-                                ParseResult::Incomplete => {
-                                    if offset > 0 {
-                                        slot.partial_read.drain(..offset);
-                                    }
-                                    break;
-                                }
-                                ParseResult::Error => {
-                                    slot.partial_read.clear();
-                                    self.close_connection(slot_idx);
-                                    return;
-                                }
-                            }
-                        }
-                    } else {
-                        match parse_http_request(chunk) {
-                            ParseResult::Complete(req) => {
-                                let consumed = req.bytes_consumed;
-                                Self::dispatch_admitted_request(
-                                    &mut self.outgoing,
-                                    &mut self.overflow_pg,
-                                    &mut self.overflow_kdf,
-                                    &mut self.kdf_rr,
-                                    req,
-                                    conn_ref,
-                                    pg_queues,
-                                    kdf_queues,
-                                );
-                                if consumed < chunk.len() {
-                                    slot.partial_read.extend_from_slice(&chunk[consumed..]);
-                                }
-                            }
-                            ParseResult::Incomplete => {
-                                slot.partial_read.extend_from_slice(chunk);
-                            }
-                            ParseResult::Error => {
-                                self.close_connection(slot_idx);
-                                return;
-                            }
-                        }
+                    slot.partial_read.extend_from_slice(chunk);
+                    if !slot.in_flight {
+                        self.try_dispatch_next(slot_idx);
                     }
                 } else if n == 0 {
                     // EOF
@@ -258,6 +206,50 @@ impl EpollReactor {
                         break;
                     }
                 }
+            }
+        }
+    }
+
+    /// Parses and dispatches the next complete HTTP request from `slot.partial_read`.
+    /// Sets `in_flight = true` upon dispatch. If a request is already in flight or
+    /// partial_read is incomplete/empty, does nothing.
+    pub fn try_dispatch_next(&mut self, slot_idx: u32) {
+        let slot = match self.conn_table.slots.get_mut(slot_idx as usize) {
+            Some(s) if s.in_use && !s.closing => s,
+            _ => return,
+        };
+
+        if slot.in_flight || slot.partial_read.is_empty() {
+            return;
+        }
+
+        let conn_ref = ConnRef {
+            reactor: self.reactor_id,
+            slot: slot_idx,
+            gen: slot.gen,
+        };
+
+        match parse_http_request(&slot.partial_read) {
+            ParseResult::Complete(req) => {
+                let consumed = req.bytes_consumed;
+                slot.in_flight = true;
+                Self::dispatch_admitted_request(
+                    &mut self.outgoing,
+                    &mut self.overflow_pg,
+                    &mut self.overflow_kdf,
+                    &mut self.kdf_rr,
+                    req,
+                    conn_ref,
+                    &self.pg_queues,
+                    &self.kdf_queues,
+                );
+                let slot = &mut self.conn_table.slots[slot_idx as usize];
+                slot.partial_read.drain(..consumed);
+            }
+            ParseResult::Incomplete => {}
+            ParseResult::Error => {
+                slot.partial_read.clear();
+                self.close_connection(slot_idx);
             }
         }
     }
@@ -362,8 +354,10 @@ impl EpollReactor {
 
     pub fn flush_sends(&mut self) {
         let mut to_close = Vec::new();
+        let mut to_dispatch = Vec::new();
 
         for reply in self.outgoing.pending_replies.drain(..) {
+            let slot_idx = reply.conn.slot;
             let slot = match self.conn_table.validate_mut(&reply.conn) {
                 Some(s) => s,
                 None => continue,
@@ -398,8 +392,17 @@ impl EpollReactor {
             }
 
             if failed || reply.close {
-                to_close.push(reply.conn.slot);
+                to_close.push(slot_idx);
+            } else {
+                slot.in_flight = false;
+                if !slot.partial_read.is_empty() {
+                    to_dispatch.push(slot_idx);
+                }
             }
+        }
+
+        for slot_idx in to_dispatch {
+            self.try_dispatch_next(slot_idx);
         }
 
         for slot_idx in to_close {
