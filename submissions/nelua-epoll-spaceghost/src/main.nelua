@@ -96,3 +96,4 @@ local function conduit_handle(r:*N.Request,db:*N.Db) <cexport,codename'conduit_h
 end
 
 require 'batch'
+require 'json_scan'

@@ -8,11 +8,15 @@
 #include <assert.h>
 
 struct nc_request { unsigned id; };
+size_t nc_request_memory_limit(void) { return 256U*1024U*1024U; }
+size_t nc_request_memory_used(void) { return 0; }
 
 static pthread_mutex_t test_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t test_changed = PTHREAD_COND_INITIALIZER;
 static unsigned seen[64], handled, executions, active, max_active;
 static bool release_first;
+nc_pressure __wrap_nc_pressure_read(nc_pressure_probe *probe,uint64_t now)
+{ (void)probe; (void)now; return (nc_pressure){.valid=true,.cpu_busy=300}; }
 
 nc_db *nc_db_open(const char *url) { (void)url; return (nc_db *)1; }
 void nc_db_close(nc_db *db) { assert(db == (nc_db *)1); }
@@ -56,11 +60,12 @@ static void enqueue(nc_connection *connections, unsigned first, unsigned count)
     nc_pool *pool = &server.pools[0];
     pthread_mutex_lock(&pool->lock);
     for (unsigned i = first; i < first + count; ++i) {
-        connections[i].queued_at = nc_now();
+        connections[i].queued_at = nc_now_us();
         connections[i].queue_next = NULL;
         if (pool->tail) pool->tail->queue_next = &connections[i];
         else pool->head = &connections[i];
         pool->tail = &connections[i];
+        ++pool->queued;
     }
     pthread_cond_broadcast(&pool->available);
     pthread_mutex_unlock(&pool->lock);
@@ -68,23 +73,25 @@ static void enqueue(nc_connection *connections, unsigned first, unsigned count)
 
 int main(int argc, char **argv)
 {
-    assert(argc == 3);
+    assert(argc == 3 || argc == 4);
     bool shutdown_early = atoi(argv[2]) != 0;
     struct nc_request requests[64];
     nc_connection connections[64];
     memset(&server, 0, sizeof(server));
+    server.read_wake_fd = -1;
     memset(connections, 0, sizeof(connections));
     server.serial_read_gather = atoi(argv[1]) != 0;
     server.read_batch_stats = true;
+    server.read_adaptive = argc == 4 && atoi(argv[3]) != 0;
+    server.pools[0].threads = 4;
+    nc_read_policy_init(&server.pools[0].policy,4);
     server.completion_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     assert(server.completion_fd >= 0);
     pthread_mutex_init(&server.startup_lock, NULL);
     pthread_cond_init(&server.startup_ready, NULL);
     pthread_mutex_init(&server.done_lock, NULL);
     for (int i = 0; i < 3; ++i) {
-        pthread_mutex_init(&server.pools[i].lock, NULL);
-        pthread_mutex_init(&server.pools[i].gather_lock, NULL);
-        pthread_cond_init(&server.pools[i].available, NULL);
+        assert(nc_pool_init(&server.pools[i]));
     }
     for (unsigned i = 0; i < 64; ++i) {
         requests[i].id = i;
@@ -122,8 +129,8 @@ int main(int argc, char **argv)
         assert(server.read_max_batch <= 32);
     }
     close(server.completion_fd);
-    printf("PASS: gather serial=%d early_stop=%d handled=%u batches=%llu concurrent=%u\n",
-           server.serial_read_gather, shutdown_early, handled,
+    printf("PASS: gather serial=%d early_stop=%d adaptive=%d handled=%u batches=%llu concurrent=%u\n",
+           server.serial_read_gather, shutdown_early, server.read_adaptive, handled,
            (unsigned long long)server.read_batches, max_active);
     return 0;
 }

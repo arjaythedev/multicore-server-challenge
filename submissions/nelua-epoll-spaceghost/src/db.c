@@ -1,4 +1,4 @@
-/* Native libpq bridge: business queries and rendering live in Nelua. */
+/* Native libpq bridge shared by the C and Nelua application implementations. */
 #include "native.h"
 #include <libpq-fe.h>
 #include <arpa/inet.h>
@@ -10,26 +10,91 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "owned_memory.h"
 
 enum { NC_PIPELINE_OFF, NC_PIPELINE_STAGING, NC_PIPELINE_RESULTS };
 struct nc_pipeline_op { int id; bool prepare; };
 struct nc_db {
     PGconn *connection;
+    nc_db_wait_fn wait;
+    void *wait_context;
     bool prepared[128];
-    bool pipeline_enabled, reset_needed, pipeline_failed;
+    bool pipeline_enabled, read_coalesce, reset_needed, pipeline_failed;
     int pipeline_state, pipeline_count;
     struct nc_pipeline_op pipeline_ops[18];
     bool pipeline_queued[9];
     PGresult *pipeline_results[9];
 };
 
+void nc_db_set_wait(nc_db *db, nc_db_wait_fn wait, void *context)
+{ db->wait=wait; db->wait_context=context; }
+
+static int nc_db_wait(nc_db *db, short events, int timeout)
+{
+    if (db->wait)
+        return db->wait(db->wait_context,PQsocket(db->connection),events,timeout);
+    struct pollfd socket={PQsocket(db->connection),events,0};
+    int ready=poll(&socket,1,timeout);
+    if (ready>0 && ((socket.revents&(POLLERR|POLLNVAL)) ||
+        ((socket.revents&POLLHUP) && !(socket.revents&POLLIN)))) {
+        errno=EIO; return -1;
+    }
+    return ready;
+}
+
+static int64_t nc_db_milliseconds(void);
+
+/* Non-pipeline queries (e.g. GET /api/user) must yield too. Drain their NULL
+ * boundary before reusing a connection, including normal SQL errors. */
+static PGresult *nc_db_await_result(nc_db *db)
+{
+    PGresult *result=NULL;
+    int64_t now=nc_db_milliseconds();
+    if (now<0) goto failed;
+    const int64_t deadline=now+10000;
+    for (;;) {
+        int pending=PQflush(db->connection);
+        if (pending<0 || !PQconsumeInput(db->connection)) goto failed;
+        while (!PQisBusy(db->connection)) {
+            PGresult *next=PQgetResult(db->connection);
+            if (!next) {
+                if (!result || PQstatus(db->connection)!=CONNECTION_OK ||
+                    PQsetnonblocking(db->connection,0)!=0) goto failed;
+                return result;
+            }
+            if (result) { PQclear(next); goto failed; }
+            result=next;
+        }
+        now=nc_db_milliseconds();
+        if (now<0 || now>=deadline) goto failed;
+        int ready=nc_db_wait(db,POLLIN|(pending?POLLOUT:0),(int)(deadline-now));
+        if (ready<0 && errno==EINTR) continue;
+        if (ready<=0) goto failed;
+    }
+failed:
+    PQclear(result);
+    db->reset_needed=true;
+    return NULL;
+}
+
 static bool nc_db_session(nc_db *db)
 {
-    PGresult *r = PQexec(db->connection,
+    PGresult *r;
+    if (db->wait) {
+        if (PQsetnonblocking(db->connection,1)!=0 ||
+            !PQsendQueryParams(db->connection,
+                "SELECT set_config('jit','off',false), "
+                "set_config('max_parallel_workers_per_gather','0',false), "
+                "set_config('statement_timeout','10s',false), "
+                "set_config('TimeZone','UTC',false), "
+                "set_config('plan_cache_mode','force_generic_plan',false), "
+                "set_config('enable_memoize','off',false)",0,NULL,NULL,NULL,NULL,0)) return false;
+        r=nc_db_await_result(db);
+    } else r=PQexec(db->connection,
         "SET jit=off; SET max_parallel_workers_per_gather=0; "
         "SET statement_timeout='10s'; SET TimeZone='UTC'; "
         "SET plan_cache_mode=force_generic_plan; SET enable_memoize=off");
-    bool good = r && PQresultStatus(r)==PGRES_COMMAND_OK;
+    bool good = r && (PQresultStatus(r)==PGRES_COMMAND_OK || PQresultStatus(r)==PGRES_TUPLES_OK);
     PQclear(r);
     return good;
 }
@@ -40,7 +105,22 @@ static bool nc_db_ready(nc_db *db)
 {
     if (!db || db->pipeline_state!=NC_PIPELINE_OFF) return false;
     if (!db->reset_needed) return true;
-    PQreset(db->connection);
+    if (db->wait) {
+        int64_t now=nc_db_milliseconds();
+        if (now<0 || !PQresetStart(db->connection)) return false;
+        const int64_t deadline=now+5000;
+        for (;;) {
+            PostgresPollingStatusType status=PQresetPoll(db->connection);
+            if (status==PGRES_POLLING_OK) break;
+            if (status!=PGRES_POLLING_READING && status!=PGRES_POLLING_WRITING) return false;
+            now=nc_db_milliseconds();
+            if (now<0 || now>=deadline) return false;
+            int ready=nc_db_wait(db,status==PGRES_POLLING_READING?POLLIN:POLLOUT,
+                                (int)(deadline-now));
+            if (ready<0 && errno==EINTR) continue;
+            if (ready<=0) return false;
+        }
+    } else PQreset(db->connection);
     memset(db->prepared,0,sizeof(db->prepared));
     if (PQstatus(db->connection)!=CONNECTION_OK ||
         PQsetnonblocking(db->connection,0)!=0 || !nc_db_session(db)) return false;
@@ -68,6 +148,12 @@ nc_db *nc_db_open(const char *url)
         free(db); return NULL;
     }
     db->pipeline_enabled=!pipeline || !*pipeline || !strcmp(pipeline,"1");
+    const char *coalesce=getenv("READ_COALESCE");
+    if (coalesce && *coalesce && strcmp(coalesce,"0") && strcmp(coalesce,"1")) {
+        fprintf(stderr,"READ_COALESCE must be 0 or 1\n");
+        free(db); return NULL;
+    }
+    db->read_coalesce=!coalesce || !*coalesce || !strcmp(coalesce,"1");
     /* Avoid TLS CPU on loopback, preserving an explicit URL TLS policy. */
     char *parse_error=NULL;
     PQconninfoOption *options=PQconninfoParse(url,&parse_error);
@@ -89,6 +175,10 @@ nc_db *nc_db_open(const char *url)
     }
     if (!nc_db_session(db)) { nc_db_close(db); return NULL; }
     return db;
+}
+bool nc_db_read_coalesce(nc_db *db)
+{
+    return !db || db->read_coalesce;
 }
 void nc_db_close(nc_db *db)
 {
@@ -131,11 +221,25 @@ nc_result *nc_db_query(nc_db *db,int id,const char *sql,int count,const char *co
     }
     if (!nc_db_ready(db)) return NULL;
     if (!db->prepared[id]) {
-        PGresult *r = PQprepare(db->connection,name,sql,count,NULL);
+        PGresult *r;
+        if (db->wait) {
+            if (PQsetnonblocking(db->connection,1)!=0 ||
+                !PQsendPrepare(db->connection,name,sql,count,NULL)) {
+                db->reset_needed=true; return NULL;
+            }
+            r=nc_db_await_result(db);
+        } else r=PQprepare(db->connection,name,sql,count,NULL);
         if (!r || PQresultStatus(r)!=PGRES_COMMAND_OK) return r;
         PQclear(r); db->prepared[id]=true;
     }
-    PGresult *r = PQexecPrepared(db->connection,name,count,parameters,NULL,NULL,1);
+    PGresult *r;
+    if (db->wait) {
+        if (PQsetnonblocking(db->connection,1)!=0 ||
+            !PQsendQueryPrepared(db->connection,name,count,parameters,NULL,NULL,1)) {
+            db->reset_needed=true; return NULL;
+        }
+        r=nc_db_await_result(db);
+    } else r=PQexecPrepared(db->connection,name,count,parameters,NULL,NULL,1);
     nc_db_log_error(id,r);
     return r;
 }
@@ -214,11 +318,9 @@ bool nc_db_pipeline_flush(nc_db *db)
         now=nc_db_milliseconds();
         int64_t remaining=deadline-now;
         if (now<0 || remaining<=0) goto failed;
-        struct pollfd socket={PQsocket(db->connection),POLLIN|(pending?POLLOUT:0),0};
-        int ready=poll(&socket,1,(int)remaining);
+        int ready=nc_db_wait(db,POLLIN|(pending?POLLOUT:0),(int)remaining);
         if (ready<0 && errno==EINTR) continue;
-        if (ready<=0 || (socket.revents&(POLLERR|POLLNVAL)) ||
-            ((socket.revents&POLLHUP) && !(socket.revents&POLLIN))) goto failed;
+        if (ready<=0) goto failed;
     }
     if (!PQexitPipelineMode(db->connection) || PQsetnonblocking(db->connection,0)!=0)
         goto failed;

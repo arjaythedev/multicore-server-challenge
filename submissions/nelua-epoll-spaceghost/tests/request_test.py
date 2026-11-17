@@ -101,7 +101,8 @@ def main():
                                  (b' 1',-1),(b'-1',-1),(b'1.0',-1),(b'1e3',-1)]:
             assert lib.nc_parse_uint(number) == expected
 
-        strings = ['plain', 'quote" slash\\ line\n\r\t\b\f', '雪 😀 e\u0301', ''.join(chr(i) for i in range(1,32))]
+        strings = ['plain', 'quote" slash\\ line\n\r\t\b\f', '雪 😀 e\u0301',
+                   '\n雪😀\t雪', '', ''.join(chr(i) for i in range(1,32))]
         rng=random.Random(923)
         alphabet=list('abc雪😀"\\\n\t')
         strings += [''.join(rng.choice(alphabet) for _ in range(rng.randrange(100))) for _ in range(100)]
@@ -111,7 +112,18 @@ def main():
                 user=lib.nc_body(r,b'user')
                 assert lib.nc_kind(user) == 1
                 assert lib.nc_string(lib.nc_field(user,b'username')) == value.encode()
+                # Parsing consumes its owned input once; later accesses must
+                # retain the same tree and decoded values.
+                assert lib.nc_body(r,b'user') == user
+                assert lib.nc_string(lib.nc_field(user,b'username')) == value.encode()
                 lib.nc_request_free(r)
+        # Escaped keys, adjacent strings and raw UTF-8 following a shrinking
+        # escape exercise overlapping in-place decoding and delimiters.
+        r=request(b'{"u\\u0073er":{"user\\u006eame":"\\n'+ '雪😀'.encode() + b'","after":"ok"}}')
+        user=lib.nc_body(r,b'user')
+        assert lib.nc_string(lib.nc_field(user,b'username')) == '\n雪😀'.encode()
+        assert lib.nc_string(lib.nc_field(user,b'after')) == b'ok'
+        lib.nc_request_free(r)
         r=request(b'{"user":{"username":"first","username":"last","nil":null,"array":["a","quo\\\"te","back\\\\slash"]}}')
         user=lib.nc_body(r,b'user')
         assert lib.nc_string(lib.nc_field(user,b'username')) == b'last'
@@ -127,10 +139,22 @@ def main():
                    b'{"user":{"x":"\\u0000"}}',b'{"user":{"x":"\\ud800"}}',b'{"user":{"x":"\\udc00"}}',
                    b'{"user":{"x":"\xc0\x80"}}',b'{"user":{"x":01}}',b'{"user":{"x":1.}}',
                    b'{"user":{"x":1e}}',b'{"user":{"x":truefalse}}',b'{"user":{"x":[1,]}}',b'{"user":{"x":"\\q"}}']
+        malformed += [b'{"user":{"x":"' + value + b'"}}' for value in
+                      (b'\xe0\x80\x80', b'\xed\xa0\x80', b'\xf4\x90\x80\x80',
+                       b'\xf5\x80\x80\x80', b'\xe9\x9b', b'\\u12', b'\\u123"')]
         for value in malformed:
             r=request(value)
             assert not lib.nc_body(r,b'user'), value
             lib.nc_request_free(r)
+        for byte in range(256):
+            for prefix in (b'', b'a'*7, b'a'*8, b'a'*31):
+                r=request(b'{"user":{"x":"' + prefix + bytes([byte]) + b'z"}}')
+                user=lib.nc_body(r,b'user')
+                if 32 <= byte < 128 and byte not in (34,92):
+                    assert lib.nc_string(lib.nc_field(user,b'x')) == prefix + bytes([byte]) + b'z'
+                else:
+                    assert not user, byte
+                lib.nc_request_free(r)
 
         def b64(value):
             return base64.urlsafe_b64encode(value).rstrip(b'=')

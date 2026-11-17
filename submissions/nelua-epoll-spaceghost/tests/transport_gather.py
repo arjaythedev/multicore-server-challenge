@@ -17,17 +17,18 @@ def main():
     cc = shlex.split(os.environ.get('CC', 'cc'))
     flags = ['-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
              '-ffunction-sections', '-fdata-sections', '-Wl,--gc-sections',
-             '-I' + str(ROOT / 'src'), '-pthread']
+             '-I' + str(ROOT / 'src'), '-pthread', '-Wl,--wrap=nc_pressure_read']
     if args.sanitize:
         flags += ['-fsanitize=address,undefined', '-fno-omit-frame-pointer']
     with tempfile.TemporaryDirectory(prefix='nc-transport-gather-') as tmp:
         binary = Path(tmp) / 'test'
-        subprocess.run(cc + flags + [str(ROOT / 'tests/transport_gather.c'),
+        subprocess.run(cc + flags + [str(ROOT / 'tests/transport_gather.c'), str(ROOT / 'src/read_policy.c'),
                                     '-o', str(binary)], check=True)
         for serial in (0, 1):
             for early in (0, 1):
-                subprocess.run([str(binary), str(serial), str(early)], check=True,
-                               timeout=10, env={**os.environ, 'ASAN_OPTIONS': 'detect_leaks=0'})
+                for adaptive in (0, 1):
+                    subprocess.run([str(binary), str(serial), str(early), str(adaptive)], check=True,
+                                   timeout=10, env={**os.environ, 'ASAN_OPTIONS': 'detect_leaks=0'})
 
 
 if __name__ == '__main__':

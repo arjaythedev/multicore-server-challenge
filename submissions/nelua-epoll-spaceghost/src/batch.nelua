@@ -7,9 +7,15 @@ local B: type = @record{}
 local function handle_one(req:*N.Request, db:*N.Db) <cimport'conduit_handle',nodecl> end
 
 local function fail_group(requests:*[0]*N.Request, count:cint)
+  local status:cint = 500
   local i:cint = 0
   while i < count do
-    N.error(requests[i], 500)
+    if N.status(requests[i]) == 503 then status = 503; break end
+    i = i + 1
+  end
+  i = 0
+  while i < count do
+    N.error(requests[i], status)
     i = i + 1
   end
 end
@@ -45,14 +51,15 @@ local function tags(requests:*[0]*N.Request, count:cint, db:*N.Db)
 end
 
 local function lookup(requests:*[0]*N.Request, keys:*cstring, viewers:*int64,
-                      count:cint, db:*N.Db, kind:cint)
-  local parameters:[2]cstring = {
-    N.text_vector(requests[0], keys, count),
-    N.int_vector(requests[0], viewers, count)
-  }
-  if not parameters[0] or not parameters[1] then
-    fail_group(requests, count)
-    return
+                      count:cint, db:*N.Db, kind:cint, submit:boolean)
+  local parameters:[2]cstring = {nilptr,nilptr}
+  if submit then
+    parameters[0] = N.text_vector(requests[0], keys, count)
+    parameters[1] = N.int_vector(requests[0], viewers, count)
+    if not parameters[0] or not parameters[1] then
+      fail_group(requests, count)
+      return
+    end
   end
   local result:*N.Result = nilptr
   local ordinal_column:cint = 4
@@ -138,14 +145,15 @@ local function lookup(requests:*[0]*N.Request, keys:*cstring, viewers:*int64,
 end
 
 local function comments(requests:*[0]*N.Request, keys:*cstring, viewers:*int64,
-                        count:cint, db:*N.Db)
-  local parameters:[2]cstring = {
-    N.text_vector(requests[0], keys, count),
-    N.int_vector(requests[0], viewers, count)
-  }
-  if not parameters[0] or not parameters[1] then
-    fail_group(requests, count)
-    return
+                        count:cint, db:*N.Db, submit:boolean)
+  local parameters:[2]cstring = {nilptr,nilptr}
+  if submit then
+    parameters[0] = N.text_vector(requests[0], keys, count)
+    parameters[1] = N.int_vector(requests[0], viewers, count)
+    if not parameters[0] or not parameters[1] then
+      fail_group(requests, count)
+      return
+    end
   end
   local result = N.query(db, 93, [[
     WITH incoming AS MATERIALIZED (
@@ -294,14 +302,17 @@ local q_batch_favorite:cstring <comptime> = #[batch_list_sql(8)]#
 local q_batch_feed:cstring <comptime> = #[batch_list_sql(9)]#
 
 local function pages(requests:*[0]*N.Request, keys:*cstring, viewers:*int64,
-                     limits:*int64, offsets:*int64, count:cint, db:*N.Db, kind:cint)
-  local parameters:[4]cstring = {
-    N.text_vector(requests[0], keys, count), N.int_vector(requests[0], viewers, count),
-    N.int_vector(requests[0], limits, count), N.int_vector(requests[0], offsets, count)
-  }
-  if not parameters[0] or not parameters[1] or not parameters[2] or not parameters[3] then
-    fail_group(requests, count)
-    return
+                     limits:*int64, offsets:*int64, count:cint, db:*N.Db, kind:cint, shared:boolean, submit:boolean)
+  local parameters:[4]cstring = {nilptr,nilptr,nilptr,nilptr}
+  if submit then
+    parameters[0] = N.text_vector(requests[0], keys, count)
+    parameters[1] = N.int_vector(requests[0], viewers, count)
+    parameters[2] = N.int_vector(requests[0], limits, count)
+    parameters[3] = N.int_vector(requests[0], offsets, count)
+    if not parameters[0] or not parameters[1] or not parameters[2] or not parameters[3] then
+      fail_group(requests, count)
+      return
+    end
   end
   local sql:cstring = q_batch_global
   if kind == 6 then sql = q_batch_tag
@@ -315,6 +326,7 @@ local function pages(requests:*[0]*N.Request, keys:*cstring, viewers:*int64,
     if result then N.free(result) end
     return
   end
+  local fragments:[256]S.ArticleFragments
   local row:cint = 0
   local request:cint = 0
   while request < count do
@@ -329,7 +341,9 @@ local function pages(requests:*[0]*N.Request, keys:*cstring, viewers:*int64,
         if not N.null(result, row, 0) then
           if not first then N.putc(buffer, cchar(44)) end
           first = false
-          S.article(buffer, result, row, false)
+          if shared and count > 1 then
+            S.article_shared(buffer, requests[request], result, row, (@*[0]S.ArticleFragments)(&fragments[0]))
+          else S.article(buffer, result, row, false) end
         end
         row = row + 1
       end
@@ -359,6 +373,8 @@ local function conduit_batch(requests:*[0]*N.Request, count:cint, db:*N.Db) <cex
   local viewers:[128]int64 <noinit>
   local limits:[128]int64 <noinit>
   local offsets:[128]int64 <noinit>
+  local representatives:[128]cint <noinit>
+  local coalesce = N.read_coalesce(db)
   local has_group:boolean = false
   local i:cint = 0
   while i < count do
@@ -421,25 +437,58 @@ local function conduit_batch(requests:*[0]*N.Request, count:cint, db:*N.Db) <cex
       i = 0
       while i < count do
         if kinds[i] == kind then
-          grouped[used] = requests[i]
-          viewers[used] = verified[i]
-          limits[used] = validated_limits[i]
-          offsets[used] = validated_offsets[i]
-          if kind >= 5 then keys[used] = filter_keys[i]
-          elseif kind >= 2 then keys[used] = N.segment(requests[i], 2)
-          else keys[used] = nilptr end
-          used = used + 1
+          local key:cstring = ''
+          if kind >= 5 then key = filter_keys[i]
+          elseif kind >= 2 then key = N.segment(requests[i], 2) end
+          local representative:cint = used
+          if coalesce then
+            local j:cint = 0
+            while j < used do
+              if viewers[j] == verified[i] and limits[j] == validated_limits[i] and
+                 offsets[j] == validated_offsets[i] and N.eq(keys[j], key) then
+                representative = j
+                break
+              end
+              j = j + 1
+            end
+          end
+          representatives[i] = representative
+          if representative == used then
+            grouped[used] = requests[i]
+            viewers[used] = verified[i]
+            limits[used] = validated_limits[i]
+            offsets[used] = validated_offsets[i]
+            keys[used] = key
+            used = used + 1
+          end
         end
         i = i + 1
       end
       if used > 0 then
         if kind == 1 then tags((@*[0]*N.Request)(&grouped[0]), used, db)
         elseif kind == 4 then
-          comments((@*[0]*N.Request)(&grouped[0]), &keys[0], &viewers[0], used, db)
+          comments((@*[0]*N.Request)(&grouped[0]), &keys[0], &viewers[0], used, db, phase == 1)
         elseif kind >= 5 then
-          pages((@*[0]*N.Request)(&grouped[0]), &keys[0], &viewers[0], &limits[0], &offsets[0], used, db, kind)
+          pages((@*[0]*N.Request)(&grouped[0]), &keys[0], &viewers[0], &limits[0], &offsets[0], used, db, kind, coalesce, phase == 1)
         else
-          lookup((@*[0]*N.Request)(&grouped[0]), &keys[0], &viewers[0], used, db, kind)
+          lookup((@*[0]*N.Request)(&grouped[0]), &keys[0], &viewers[0], used, db, kind, phase == 1)
+        end
+        -- Authentication and pagination validation above ran for every request.
+        -- Only identical effective reads in this frozen batch share rendering.
+        -- Copy after results arrive, before any representative can be released.
+        if not N.pipeline_staging(db) then
+          i = 0
+          while i < count do
+            if kinds[i] == kind then
+              local representative = grouped[representatives[i]]
+              if requests[i] ~= representative then
+                local length:csize = 0
+                local data = N.response_data(representative, &length)
+                N.write_n(N.begin(requests[i], N.status(representative)), data, length)
+              end
+            end
+            i = i + 1
+          end
         end
       end
       kind = kind + 1

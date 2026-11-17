@@ -41,7 +41,8 @@ def main():
             binary = Path(tmp) / ('baseline' if baseline else 'candidate')
             subprocess.run(shlex.split(os.environ.get('CC', 'cc')) + flags +
                            [str(app), str(ROOT / 'src/request.c'), str(ROOT / 'src/bcrypt.c'),
-                            str(ROOT / 'src/db.c'), str(ROOT / 'tests/tags_batch.c'),
+                            str(ROOT / 'src/db.c'), str(ROOT / 'src/json_scan.c'),
+                            str(ROOT / 'src/json_dispatch.c'), str(ROOT / 'tests/tags_batch.c'),
                             '-pthread', '-lpq', '-lcrypto', '-lcrypt', '-o', str(binary)], check=True)
             subprocess.run([str(binary), '0', str(baseline)], check=True, timeout=30,
                            env={**os.environ, 'ASAN_OPTIONS': os.environ.get('ASAN_OPTIONS', 'detect_leaks=0')})

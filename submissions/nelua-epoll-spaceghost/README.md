@@ -1,17 +1,51 @@
-# Nelua + epoll + PostgreSQL
+# C / Nelua + epoll + PostgreSQL
 
 Front: direct
 
 Conduit's application logic is Nelua: all 19 API operations, routing, parameterized
 SQL, validation, response objects, and JSON emission. It compiles to native C
-using [Spaceghost's Nelua fork](https://github.com/Spaceghost/nelua-lang), pinned
-to `4b5dfd4a76ce4f6e3c59983295f32f7db68466b4`.
+using [official Nelua](https://github.com/edubart/nelua-lang), pinned
+to `a58450563e2d2ec49bff499865c8b5cfdf6ff81a`.
 
 A native host supplies epoll sockets, request-owned buffers, libpq, OpenSSL 3,
 and bcrypt. The build targets GCC 13 and Ubuntu 24.04's development packages;
 libpq follows the benchmark's PostgreSQL packages, discovered with `PG_CONFIG`.
-The executable has no Lua VM, Nelua GC, Nelua allocator, or Nelua initialization/
-panic path. Normal C allocation serves live requests.
+The executable has no Lua VM, Nelua GC, or Nelua initialization/panic path.
+Request allocation uses either host libc or a privately namespaced Nelibc
+archive; libpq and OpenSSL retain their own hosted allocation boundaries.
+
+`APP_IMPL=c` selects a separately handwritten C application implementing all
+19 operations, routing, batching and JSON rendering. Its application builds without invoking
+Nelua; building the optional Nelibc dependency requires its own pinned compiler. Both applications consume the same 34 parameterized SQL statements;
+`tools/export_sql.py --check` checks the released C statement data against Nelua.
+
+`CORE_PROFILE=freestanding` (the default) compiles the selected application objects with
+`-ffreestanding -fno-builtin -fno-stack-protector`, partially links those actual
+objects with `-nostdlib`, audits their imports and links that audited object into
+the host. This is a freestanding application **core**, with a hosted transport,
+libpq, OpenSSL and libxcrypt bridge; the whole executable is not freestanding.
+
+`MEMORY_IMPL=nelibc` is the default. With neither `NELIBC_ROOT` nor
+`NELIBC_ARCHIVE` supplied, the build fetches clean pinned source and builds the
+archive with GCC. `NELIBC_CACHE` selects the reproducible dependency cache
+(default `.deps/nelibc-source`). Nelibc is pinned to
+`73ae254aa0f4cc1fa03f8fad92711c497e9c28fc`; its build compiler uses the separate
+Spaceghost Nelua fork at `dabbd9effebb7ecfe59a727f49f27b4574109d4d`.
+The application compiler remains the official pin above. Source-build manifests
+record compiler identities, revisions and archive hashes. Alternatively supply
+both `NELIBC_ROOT` and `NELIBC_ARCHIVE` for an already built clean dependency.
+The build namespaces every defined archive symbol and hides it from the dynamic ABI.
+Owned bridge buffers use private allocation/copy functions; freestanding core
+memory primitives use that provider. Compiler-known small copies retain bounded
+inline loads/stores. No process-wide allocator interposition is used. The
+ownership test checks both sides of the libpq/OpenSSL boundary. Both C and
+Nelua freestanding/private-Nelibc profiles passed the 197-step API suite; this
+establishes correctness, not a throughput advantage over libc.
+
+JSON string emission skips ordinary text eight bytes at a time using bounded,
+unaligned-safe word loads. Control characters, quotes, and backslashes retain
+the scalar escape path; UTF-8 bytes pass through unchanged. Optional C/Nelua
+SIMD scanner variants below keep that same escaping and response-buffer path.
 
 ## Build and run
 
@@ -23,9 +57,20 @@ bash submissions/nelua-epoll-spaceghost/build.sh
 bash test/run.sh submissions/nelua-epoll-spaceghost
 ```
 
+Build and run the C counterpart with matching selections:
+
+```sh
+APP_IMPL=c MEMORY_IMPL=host bash submissions/nelua-epoll-spaceghost/build.sh
+APP_IMPL=c MEMORY_IMPL=host bash submissions/nelua-epoll-spaceghost/start.sh
+```
+
+Both `APP_IMPL={c,nelua}` support `MEMORY_IMPL={host,nelibc}` and the same
+freestanding core profile. Keep those selections identical at build and start.
+
 The official runner requires the challenge seed, Go, psql, curl, and PostgreSQL
 test credentials; see [test/run.sh](../../test/run.sh). The build verifies a clean
-compiler checkout or linked worktree at the pin, emits C, links one executable, strips unused
+compiler checkout or linked worktree at the pin, generates C afresh with
+`--no-cache` into the submission build directory, links companion C sources explicitly, strips unused
 symbols, and audits generated C for runtime imports. No binaries are committed.
 
 `start.sh` runs in the foreground. Set `DATABASE_URL` and `JWT_SECRET`; `HOST`
@@ -35,9 +80,115 @@ higher port, runtime needs no root privileges, kernel changes, or extra services
 
 ## Concurrency and database work
 
+### C/Nelua SIMD writer comparison
+
+`JSON_SCAN=nelua-auto` enables the Nelua scanner with runtime CPU detection:
+AVX-512F/BW plus AVX2 when available, otherwise AVX2, otherwise word-at-a-time.
+`JSON_SCAN=c-auto` selects the independently written C counterpart. Both loop
+bodies use the same small header of CPU instruction bindings. The default is the selected application language’s `auto` scanner. The legacy
+inline word scanner remains available as `JSON_SCAN=legacy`.
+Explicit `{c,nelua}-{scalar,word,avx2,avx512}` modes support controlled
+comparisons; forcing an unavailable ISA fails startup. Selection occurs before
+worker startup, with no feature detection or environment reads per request.
+
+Every vector load is bounded by the remaining input length. The 64-byte path
+uses 32-byte and word tails; UTF-8 bytes are treated as ordinary bytes. Both
+languages' scanner objects compile with `-ffreestanding -fno-builtin` and have
+no undefined symbols. The application-core and private-Nelibc profiles described
+above are separate build choices. The executable retains hosted dependencies.
+
+Five rotated local component runs on an Intel i7-11700F, GCC 13 with `-O3`
+and LTO for the complete writer, produced these median CPU times. The driver
+consumes a changing position in every rendered result through a volatile
+checksum so the output cannot be discarded as unused work:
+
+| JSON input | Legacy writer | C AVX-512 writer | Nelua AVX-512 writer |
+| --- | ---: | ---: | ---: |
+| 1,024 ordinary ASCII bytes | 177.6 ns | 35.8 ns | 37.2 ns |
+| 1,024 bytes with frequent escapes | 475.7 ns | 265.5 ns | 267.0 ns |
+| 4,096 ordinary ASCII bytes | 656.3 ns | 100.6 ns | 99.6 ns |
+
+These are string-writer microbenchmarks on a shared desktop, not requests per
+second, VM capacity, or an independently authored full C server comparison.
+Small C/Nelua differences do not establish a language advantage. The report
+checker requires the entire specified matrix: 720 scanner-kernel samples and
+525 writer samples in these runs. Missing or duplicate samples fail analysis.
+
+Reproduce component checks from this submission directory after building:
+
+```sh
+python3 tests/json_scan.py --sanitize
+python3 tests/serialize_scan.py --sanitize --modes legacy,c-auto,nelua-auto
+python3 tests/json_scan.py --benchmark 5 > kernel.log
+python3 tests/serialize_scan.py --benchmark 100000 --rounds 5 \
+  --modes legacy,c-auto,nelua-auto > writer.log
+python3 tests/analyze_scan.py writer.log --kind writer \
+  --modes legacy,c-auto,nelua-auto --output writer.json
+```
+
+The standalone scanner driver skips unsupported ISAs. When analyzing kernel
+results on such a machine, supply its supported mode set with `--modes`.
+
+### HTTP-to-libpq socket adapter experiment
+
+Set `READ_REACTOR=1` to run the read side as one epoll-driven adapter with
+`DB_READ_THREADS` independent PostgreSQL sessions. HTTP stays HTTP/1.1 on the
+public side; Nelua validates and translates requests into parameterized SQL,
+and libpq supplies PostgreSQL's protocol on the database side. The adapter uses
+the configured `DATABASE_URL` and needs no extension, extra service, database
+file access, or host tuning.
+
+Each active read batch owns a guarded 512 KiB continuation stack and one libpq
+connection. A socket wait suspends only that continuation; the scheduler runs
+other batches while PostgreSQL executes. Prepared queries, pipelines, connection
+recovery and session initialization after reconnect all yield to epoll. Connection
+establishment during startup remains synchronous and bounded. Binary results and
+request-owned JSON buffers retain their existing ownership. Idle HTTP connections
+own neither a continuation nor a database connection. Authentication and mutation
+workers retain their existing paths, including synchronous commits.
+
+`READ_REACTOR=1` is the default. `READ_REACTOR=0` retains the worker
+implementation for comparison. One scheduler
+also serializes read-side CPU work, so fewer OS threads do not establish higher
+throughput. `READ_GATHER_SERIAL` applies to worker mode; reactor mode always has
+one collector. With `READ_ADAPTIVE=0`, both modes retain the oldest-request 8 ms
+collection deadline and 128-request cap. This is a client adapter, not an
+embedded PostgreSQL engine.
+
+`READ_ADAPTIVE=1` (the default) experimentally adjusts read admission and collection delay.
+It samples CPU counters and available host/cgroup CPU, I/O and memory PSI at
+most four times per second. Cgroup quota utilization and throttled CPU time
+also reveal a saturated process allocation when the wider host remains idle.
+It also tracks batch service time and queue age. Once service exceeds 2 ms,
+collection grows to a quarter of that service time, bounded to 8 ms; this builds
+denser SQL groups without mistaking latency alone for resource pressure.
+CPU or memory pressure reduces active read slots; I/O stalls require concurrent
+service and queue delay before reducing admission. Capacity recovers toward the
+configured connection count as queued demand grows and pressure clears. The
+first request on an idle lane is released immediately; collection is bounded
+to 8 ms and 128 requests. Service time includes application work and database
+waits. Missing kernel observations do not manufacture pressure. Admission
+currently controls reads only; write/auth lanes keep their configured bounds.
+Live request storage at 75% of its configured budget also reduces admission.
+Latency and queue age alone never trigger admission reduction: slow I/O can
+need additional concurrency, and missing PSI leaves that resource unknown.
+These heuristics need workload-specific comparison;
+a passing correctness suite does not establish better capacity or every tail percentile.
+
+Completed responses go directly to `sendmsg` with `TCP_NODELAY` enabled.
+There is no `TCP_CORK`, `MSG_MORE`, or application timer holding completed
+output. The socket loop handles completed replies before new input, caps each
+accept turn at 64 connections and each write turn at 256 KiB, then rearms pending
+writes. This bounds monopolization without a completed-response batching timer.
+Reactor collection deadlines use `epoll_pwait2` microsecond precision
+with an `epoll_wait` fallback. Global sysctls, CPU affinity and I/O schedulers
+are left to the challenge harness; the entry does not change them.
+
 One epoll thread owns sockets; idle keep-alive connections retain no buffers.
-Three bounded lanes own **20 PostgreSQL connections** by default: four read,
-eight mutation, and eight authentication workers. Bcrypt stays off the epoll
+Three bounded lanes own **44 PostgreSQL connections** by default: four read,
+32 mutation, and eight authentication workers. More concurrent durable writers
+allow PostgreSQL group commit to share WAL flushes; synchronous commit stays
+enabled. Bcrypt stays off the epoll
 thread. Pending work, memory, headers, bodies, and output are bounded; overload
 receives 503. Idle keep-alive timeout is 75 seconds.
 
@@ -49,6 +200,18 @@ use each request's independently verified token; ordinality maps results back
 to requests. Shared data and rendered responses end with the batch. Each frozen
 tag group executes a fresh query, renders once, and copies bytes into each
 request's independently owned response buffer; later arrivals cannot reuse it.
+
+After every token and pagination argument has been checked independently,
+identical effective reads in the frozen group share a query row and JSON rendering.
+The identity includes the route family, decoded resource/filter key, verified
+viewer ID, limit, and offset. Responses are copied into independently owned
+buffers before the group ends, including missing-resource and error responses.
+A bounded 256-slot lookup also shares viewer-independent article JSON fragments
+within each page-query result, while both personal flags are read separately
+from every viewer's own row. Fragment references use offsets into request-owned
+buffers, are resolved after buffer growth, and expire with that result. Hash
+probes are capped at 16; collisions fall back to ordinary rendering. No read or
+rendered bytes survive into a later group.
 
 A bounded libpq pipeline submits at most nine batch-read families before waiting
 for results, with a 10-second deadline for flushing and draining the pipeline.
@@ -63,19 +226,44 @@ database-wide settings stay untouched; no extensions or external cache are used.
 
 | Variable | Default | Purpose |
 | --- | ---: | --- |
+| `APP_IMPL` | nelua | Handwritten C or Nelua application |
+| `CORE_PROFILE` | freestanding | `freestanding` audits and links the application core |
+| `MEMORY_IMPL` | nelibc | `nelibc` selects private owned allocation/copy |
 | `DB_READ_THREADS` | 4 | Read workers/connections |
-| `DB_WRITE_THREADS` | 8 | Mutation workers/connections |
+| `DB_WRITE_THREADS` | 32 | Mutation workers/connections; bounded durable group commit concurrency |
 | `DB_AUTH_THREADS` | 8 | Login, registration, password-change workers/connections |
+| `READ_REACTOR` | 1 | One epoll scheduler for all read connections; experimental |
+| `READ_ADAPTIVE` | 1 | Pressure-aware read admission and collection; experimental |
+| `JSON_SCAN` | language-auto | Selected language’s CPU-dispatched scanner; explicit legacy/scalar/word/SIMD comparisons |
 | `READ_GATHER_SERIAL` | 1 | Single collector; DB execution stays concurrent |
 | `READ_PIPELINE` | 1 | Bounded batch-local libpq read pipeline |
+| `READ_COALESCE` | 1 | Share identical reads and public article JSON within the frozen batch |
 | `READ_BATCH_STATS` | 0 | Aggregate density/wait statistics at shutdown |
+| `REQUEST_MEMORY_MB` | 256 | Aggregate live request objects, arenas and output/vector capacities; 1–4096 MiB |
+| `BUFFER_CACHE` | auto | Build-time untyped buffer reuse: enabled for private Nelibc, disabled for libc |
+| `NELIBC_CACHE` | `.deps/nelibc-source` | Pinned Nelibc source/compiler/archive build cache |
 | `NELUA_ROOT` | `.deps/nelua` | Clean checkout of the pinned compiler |
 | `PG_CONFIG` | `pg_config` | Build-time libpq discovery |
 | `JOBS` | 2 | Compiler bootstrap jobs |
 | `NATIVE_FLAGS` | `-march=native` | CPU flags; set empty for a portable build |
 
+The request budget reserves credits before allocation, including old and new
+storage during growth. Credits grow in 8 KiB quanta and stay with their request
+until destruction, so most allocations avoid a contended global counter. Exact
+growth is attempted when rounding alone would exceed the cap. Reported usage is
+reserved capacity, conservatively above requested live bytes. Exhaustion returns
+503; freeing a request on another thread releases its entire reservation.
+Optional reusable medium buffers have a separate 32 MiB total
+and 16 MiB per-class bound. They retain storage only: every response is freshly
+rendered. Provider metadata/slabs, libpq/OpenSSL, continuation stacks, transport
+input and kernel memory are outside these counters; this is not an RSS limit.
+The default is deliberately the same reservation budget for both allocators.
+The x86-64 request control object stays at most 120 bytes. Internal body lengths
+and response capacities use checked 32-bit bounds, keeping libc's control-object
+allocation compact as well as the private-provider comparison.
+
 Worker counts must be positive and total at most 95. Set `READ_GATHER_SERIAL=0`
-or `READ_PIPELINE=0` to disable the corresponding strategy for comparison.
+or `READ_PIPELINE=0` or `READ_COALESCE=0` to disable the corresponding strategy for comparison.
 
 ## Correctness
 
@@ -89,8 +277,9 @@ independent bcrypt states shares execution resources while completing every
 password's work. Libxcrypt handles compatibility cases and supplies an independent
 test oracle. Passwords over 72 bytes are rejected.
 
-JWT verification, password results, query results, and responses are not cached
-across requests. Writes finish committing before queuing a response; synchronous
+JWT verifications and password results are never retained across requests.
+Read results and rendered bytes live only within the frozen batch described above.
+Writes finish committing before queuing a response; synchronous
 commit stays enabled and ambiguous failed commits are not retried. HTTP framing
 and JSON checks cover conflicting lengths, invalid escapes, Unicode, embedded
 NUL, nesting, and response size limits.
@@ -103,10 +292,21 @@ From the submission directory:
 python3 tests/request_test.py
 python3 tests/auth_state.py --sanitize
 python3 tests/tags_batch.py --sanitize
+python3 tests/serialize_scan.py --sanitize
 python3 tests/transport_gather.py --sanitize
+python3 tests/read_policy.py
+python3 tests/network_fair.py --sanitize
+python3 tests/request_budget.py --sanitize --memory host
+python3 tests/request_budget.py --sanitize --memory nelibc
+python3 tests/buffer_cache.py --sanitize --memory nelibc
+python3 tests/memory_ownership.py
+python3 tests/request_memory.py --rounds 4 --actions 131072 > memory.jsonl
+python3 tests/analyze_request_memory.py memory.jsonl > memory-summary.json
+DATABASE_URL='dbname=postgres' python3 tests/read_reactor.py
 DATABASE_URL='dbname=postgres' python3 tests/read_pipeline.py --sanitize
 createdb nc_batch_validation
 DATABASE_URL='dbname=nc_batch_validation' python3 tests/batch_sql.py
+DATABASE_URL='dbname=nc_batch_validation' python3 tests/read_coalesce.py
 dropdb nc_batch_validation
 BASE_URL=http://127.0.0.1:3000 python3 tests/edge_http.py
 ```
@@ -118,6 +318,92 @@ check ownership, errors, timeouts, and recovery. Batch SQL tests replace rows in
 the disposable `nc_batch_*` database and compare against independent SQL oracles.
 HTTP edge tests require a running disposable application. Official rankings
 require the maintainer's full-seed benchmark; local runs establish no score.
+
+The request-memory shootout measures the shared request/buffer/HMAC bridge,
+without sockets or SQL. It uses actual request ownership, single and four-thread
+producers, groups of 1 and 128, changing consumed output and balanced provider
+ordering. Its analyzer requires all declared rounds and variants, identical
+checksums, artifact provenance and bounded retained storage. These component
+measurements do not rank the two application languages or establish server capacity.
+
+The reactor test uses undefined-behavior instrumentation and proves four
+simultaneously outstanding read sessions on one OS thread, independent binary
+result ownership, large socket reads, SQL errors, reconnect/reprepare, and
+completion of validation-only work without an extra wake notification. Its
+`ucontext` continuations are not tested with AddressSanitizer, whose stack-switch
+support requires additional runtime hooks. The ordinary libpq pipeline tests
+retain address and undefined-behavior instrumentation. Private-Nelibc sanitizer
+checks instrument the bridge; the dependency archive itself is not instrumented.
+
+
+## Retained measurements
+
+[Measurement manifest](evidence/manifest-v13.json) records pins, workload, limits
+and hashes. These tests ran unprivileged in the authorized Incus instance on a
+shared i5-10400 host: eight allowed logical CPUs and a **6 GiB parent cap**.
+They do not reproduce the official 8-vCPU/16-GiB VM and establish no official
+capacity score or overall language/provider winner.
+
+The four freestanding C/Nelua × libc/private-Nelibc profiles each pass all
+197 full-seed API checks at 4/8/8 lane counts. Nelua/private Nelibc also passes
+197 at 4/32/8, and the final default source build/start path is checked with the
+official runner. Bounds, cross-thread ownership, allocator exhaustion/recovery,
+network fairness and read-admission tests are retained under `tests/`.
+
+The [complete request-memory matrix](evidence/request-memory-v13.jsonl) has 192
+samples over four balanced rounds. Median process CPU time per request below
+compares libc without bridge reuse against private Nelibc with bounded reuse.
+This is shared bridge code, not a C-versus-Nelua language comparison:
+
+| Producers / group | Work | libc | Private Nelibc |
+| --- | --- | ---: | ---: |
+| 1 / 1 | Simple request + 2 KiB output | 314 ns | 230 ns |
+| 1 / 1 | JSON parse + 2 KiB output | 814 ns | 744 ns |
+| 1 / 1 | JWT verification + 16 KiB output | 2,108 ns | 2,104 ns |
+| 4 / 128 | Simple request + 2 KiB output | 493 ns | 1,268 ns |
+| 4 / 128 | JWT verification + 16 KiB output | 2,483 ns | 2,954 ns |
+
+Private medium-buffer reuse reduces the last case from 39.1 µs without reuse to
+2.95 µs. Nelibc is faster on important single-producer paths; libc remains faster
+in the heavily concurrent grouped cases. Both controls use the compact request
+layout and the same conservative request-memory budget.
+
+The [32-writer whole-server diagnostic](evidence/diagnostic-v13-5000-w32.json)
+uses the nominal client model, 5,000 users, 60 s ramp and 30 s measurement.
+Compared with the [eight-writer run](evidence/diagnostic-v13-5000-w8.json),
+additional concurrent durable writers reduce long tails without disabling sync
+commit. A live PG sample observed WALWrite/WalSync waits while CPU remained spare.
+The final default is 32 writers; all performance rows explicitly set that value.
+
+| Application / memory | p95 | p99 | Errors | SLO |
+| --- | ---: | ---: | ---: | --- |
+| C / libc | 255 ms | 540 ms | 0 | Pass |
+| C / private Nelibc | 421 ms | 1,015 ms | 0 | Fail |
+| Nelua / libc | 168 ms | 437 ms | 0 | Pass |
+| Nelua / private Nelibc | 1,976 ms | 2,677 ms | 0 | Fail |
+
+The existing C entry's published defaults passed its separate 5,000-user run
+(p95 217 ms, p99 472 ms, zero errors). Its idle tag median was 41.3 ms; these four
+profiles measured 0.6–1.4 ms. These are fixed-order observations, not repeated
+capacity rankings. The reference collects reads for 40 ms by default; this entry
+releases the first request on an idle lane immediately. Private Nelibc has not established a consistent
+whole-server latency win over libc on this host.
+
+The [integrated pressure test](evidence/pressure-v13.json) reduces only its owned
+PG/application unit from eight CPU equivalents to 0.1 during ramp, then restores
+it. Read admission falls 4→1 and recovers 1→4. The subsequent measurement has
+zero errors, p95 331 ms and p99 678 ms. That recovery run is diagnostic evidence,
+not a capacity score. Kernel PSI is absent in this instance; actual cgroup CPU
+quota consumption/throttling still drives the controller.
+
+`tools/shootout_run.py` requires a distinct stopped pristine PG fixture per case,
+checks parent limits and retains raw load/resource metadata. Configure runtime
+lane counts through each case's `read_connections`, `write_connections` and
+`auth_connections`. `tools/shootout_analyze.py` rejects incomplete matrices.
+`tools/shootout_pressure.py` accepts exactly one adaptive load case, pulses only
+its verified transient `build` service, restores its quota and checks recovery.
+These root-run harnesses launch PG, application and load generation unprivileged;
+the entry itself never changes cgroup limits, global sysctls or I/O schedulers.
 
 ## Credits
 

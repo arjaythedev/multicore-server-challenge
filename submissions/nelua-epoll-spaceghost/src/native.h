@@ -15,6 +15,11 @@ typedef struct pg_result nc_result;
 ssize_t nc_request_size(const char *data, size_t length);
 nc_request *nc_request_create(const char *data, size_t length);
 void nc_request_free(nc_request *request);
+bool nc_request_memory_ready(void);
+size_t nc_request_memory_used(void);
+size_t nc_request_memory_limit(void);
+size_t nc_buffer_cached_bytes(void); /* Requested bytes retained by optional bounded storage reuse. */
+void nc_buffer_cache_trim(void);
 const char *nc_method(nc_request *request);
 const char *nc_segment(nc_request *request, int index);
 int nc_segments(nc_request *request);
@@ -43,7 +48,7 @@ char *nc_issue_token(nc_request *request, int64_t id);
 char *nc_hash(nc_request *request, const char *password); /* bcrypt cost10 */
 bool nc_verify(const char *password, const char *hash);
 
-/* Result writer; all structural JSON and business objects are emitted by Nelua. */
+/* Result writer; structural JSON and business objects belong to the selected app. */
 nc_buffer *nc_begin(nc_request *request, int status);
 void nc_write(nc_buffer *buffer, const char *value);
 void nc_write_n(nc_buffer *buffer, const char *value, size_t length);
@@ -53,9 +58,17 @@ const char *nc_response_data(nc_request *request, size_t *length);
 int nc_status(nc_request *request);
 void nc_json_string(nc_buffer *buffer, unsigned char *data, size_t length);
 void nc_json_int64(nc_buffer *buffer, int64_t value);
+bool nc_json_scan_init(void);
+bool nc_json_scan_enabled(void);
+size_t nc_json_scan_prefix(unsigned char *data, size_t length);
 
 /* Per-worker prepared libpq connection. Responses follow completed commit. */
 nc_db *nc_db_open(const char *url);
+/* A scheduler may suspend this connection while another connection runs.
+ * Callback follows poll(2): >0 ready, 0 timeout, -1 error (errno set).
+ * Exactly one execution context owns a connection at a time. */
+typedef int (*nc_db_wait_fn)(void *context, int fd, short events, int timeout_ms);
+void nc_db_set_wait(nc_db *db, nc_db_wait_fn wait, void *context);
 void nc_db_close(nc_db *db);
 nc_result *nc_db_query(nc_db *db, int id, const char *sql, int count, const char *const *parameters);
 /* Optional batch-local read pipeline, enabled only by READ_PIPELINE=1.
@@ -65,6 +78,7 @@ bool nc_db_pipeline_begin(nc_db *db);
 bool nc_db_pipeline_staging(nc_db *db);
 bool nc_db_pipeline_flush(nc_db *db);
 void nc_db_pipeline_end(nc_db *db);
+bool nc_db_read_coalesce(nc_db *db);
 bool nc_tx(nc_db *db, const char *command);
 bool nc_db_ok(nc_result *result);
 bool nc_db_unique(nc_result *result);
@@ -78,7 +92,7 @@ bool nc_boolean(nc_result *result, int row, int column);
 void nc_timestamp(nc_buffer *buffer, nc_result *result, int row, int column);
 void nc_text_array(nc_buffer *buffer, nc_result *result, int row, int column);
 
-/* Nelua entrypoints called by the transport. lane: 0 read,1 write,2 bcrypt. */
+/* Application entrypoints called by the shared transport. lane: 0 read,1 write,2 bcrypt. */
 void conduit_handle(nc_request *request, nc_db *db);
 void conduit_batch(nc_request **requests, int count, nc_db *db);
 int conduit_lane(nc_request *request);

@@ -34,12 +34,15 @@ function N.status(r:*N.Request):cint <cimport'nc_status',nodecl> end
 function N.write(b:*N.Buffer,s:cstring) <cimport'nc_write',nodecl> end
 function N.write_n(b:*N.Buffer,s:cstring,n:csize) <cimport'nc_write_n',nodecl> end
 function N.putc(b:*N.Buffer,c:cchar) <cimport'nc_putc',nodecl> end
+function N.scan_enabled():boolean <cimport'nc_json_scan_enabled',nodecl> end
+function N.scan_prefix(p:*[0]byte,n:csize):csize <cimport'nc_json_scan_prefix',nodecl> end
 function N.error(r:*N.Request,status:cint) <cimport'nc_error',nodecl> end
 function N.query(db:*N.Db,id:cint,sql:cstring,count:cint,values:*cstring):*N.Result <cimport'nc_db_query',nodecl> end
 function N.pipeline_begin(db:*N.Db):boolean <cimport'nc_db_pipeline_begin',nodecl> end
 function N.pipeline_staging(db:*N.Db):boolean <cimport'nc_db_pipeline_staging',nodecl> end
 function N.pipeline_flush(db:*N.Db):boolean <cimport'nc_db_pipeline_flush',nodecl> end
 function N.pipeline_end(db:*N.Db) <cimport'nc_db_pipeline_end',nodecl> end
+function N.read_coalesce(db:*N.Db):boolean <cimport'nc_db_read_coalesce',nodecl> end
 function N.tx(db:*N.Db,command:cstring):boolean <cimport'nc_tx',nodecl> end
 function N.ok(res:*N.Result):boolean <cimport'nc_db_ok',nodecl> end
 function N.unique(res:*N.Result):boolean <cimport'nc_db_unique',nodecl> end

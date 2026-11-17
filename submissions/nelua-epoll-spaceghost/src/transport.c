@@ -1,6 +1,8 @@
-/* Linux socket ownership stays on one epoll thread. Nelua runs in bounded DB lanes. */
+/* Linux socket ownership stays on one epoll thread. Application work uses bounded DB lanes. */
 #define _GNU_SOURCE
 #include "native.h"
+#include "reactor.h"
+#include "read_policy.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -17,6 +19,7 @@
 #include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
+#include "owned_memory.h"
 
 #define NC_EVENTS 1024
 #define NC_PENDING_MAX 4096U
@@ -29,6 +32,11 @@
 #define NC_WRITE_MS 30000U
 #define NC_READ_BATCH_MAX 128
 #define NC_READ_WINDOW_MS 8U
+#ifndef NC_NET_FAIR
+#define NC_NET_FAIR 1
+#endif
+#define NC_SEND_QUANTUM (256U * 1024U)
+#define NC_ACCEPT_QUANTUM 64U
 
 /* Also declared by native.h once the Nelua batch entrypoint lands. */
 extern void conduit_batch(nc_request **requests, int count, nc_db *db);
@@ -64,11 +72,15 @@ typedef struct nc_pool {
     pthread_cond_t available;
     nc_connection *head, *tail;
     int threads;
+    size_t queued;
+    unsigned active;
+    nc_read_policy policy;
+    nc_pressure_probe pressure;
     bool stopping;
 } nc_pool;
 
 typedef struct nc_server {
-    int epoll_fd, listener_fd, completion_fd, reserve_fd;
+    int epoll_fd, listener_fd, completion_fd, reserve_fd, read_wake_fd;
     nc_pool pools[3];
     pthread_t workers[95];
     int worker_count;
@@ -81,16 +93,29 @@ typedef struct nc_server {
     nc_connection *connections, *garbage;
     size_t input_bytes, pending_bytes, pending_count;
     const char *database_url;
-    bool serial_read_gather, read_batch_stats;
+    bool serial_read_gather, read_batch_stats, read_reactor, read_adaptive;
     /* Updated under the read pool lock; inspected after all workers join. */
     uint64_t read_batches, read_requests, read_solo_batches, read_oldest_ms;
     unsigned read_max_batch;
-    uint64_t read_max_oldest_ms;
+    uint64_t read_max_oldest_ms, read_oldest_us, read_service_us;
 } nc_server;
 
 static nc_server server;
 static volatile sig_atomic_t interrupted;
 static char listener_tag, completion_tag;
+
+static bool
+nc_pool_init(nc_pool *pool)
+{
+    pthread_condattr_t attributes;
+    if (pthread_mutex_init(&pool->lock,NULL)!=0 ||
+        pthread_mutex_init(&pool->gather_lock,NULL)!=0 ||
+        pthread_condattr_init(&attributes)!=0) return false;
+    int status=pthread_condattr_setclock(&attributes,CLOCK_MONOTONIC);
+    if (!status) status=pthread_cond_init(&pool->available,&attributes);
+    pthread_condattr_destroy(&attributes);
+    return status==0;
+}
 
 static uint64_t
 nc_now(void)
@@ -98,6 +123,68 @@ nc_now(void)
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) abort();
     return (uint64_t) now.tv_sec * 1000U + (uint64_t) now.tv_nsec / 1000000U;
+}
+
+static uint64_t
+nc_now_us(void)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) abort();
+    return (uint64_t) now.tv_sec * 1000000U + (uint64_t) now.tv_nsec / 1000U;
+}
+
+/* Caller holds the read pool lock. Probes never execute SQL or alter host settings. */
+static void
+nc_read_refresh(nc_pool *pool, uint64_t now)
+{
+    if (!server.read_adaptive) return;
+    uint64_t oldest = pool->head ? now - pool->head->queued_at : 0;
+    nc_pressure pressure=nc_pressure_read(&pool->pressure,now);
+    size_t memory_limit=nc_request_memory_limit();
+    pressure.application_memory_high=memory_limit &&
+        nc_request_memory_used()>=memory_limit-memory_limit/4U;
+    nc_read_policy_update(&pool->policy, now, pool->queued, oldest,pressure);
+}
+
+static bool
+nc_read_admitted(nc_pool *pool)
+{
+    nc_read_refresh(pool, nc_now_us());
+    return !server.read_adaptive || pool->active < pool->policy.limit;
+}
+
+static unsigned
+nc_read_window(nc_pool *pool)
+{
+    if (!server.read_adaptive) return NC_READ_WINDOW_MS * 1000U;
+    return nc_read_policy_window(&pool->policy, pool->queued, pool->active);
+}
+
+static void
+nc_read_record(nc_connection **connections, int count)
+{
+    if (!server.read_batch_stats) return;
+    uint64_t oldest_us = nc_now_us() - connections[0]->queued_at;
+    uint64_t oldest_ms = oldest_us / 1000U;
+    ++server.read_batches;
+    server.read_requests += (unsigned) count;
+    if (count == 1) ++server.read_solo_batches;
+    if ((unsigned) count > server.read_max_batch) server.read_max_batch = (unsigned) count;
+    server.read_oldest_ms += oldest_ms;
+    server.read_oldest_us += oldest_us;
+    if (oldest_ms > server.read_max_oldest_ms) server.read_max_oldest_ms = oldest_ms;
+}
+
+static void
+nc_read_finished(nc_pool *pool, unsigned count, uint64_t started)
+{
+    uint64_t elapsed = nc_now_us() - started;
+    pthread_mutex_lock(&pool->lock);
+    if (pool->active) --pool->active;
+    if (server.read_adaptive) nc_read_policy_complete(&pool->policy, count, elapsed);
+    if (server.read_batch_stats) server.read_service_us += elapsed;
+    pthread_cond_broadcast(&pool->available);
+    pthread_mutex_unlock(&pool->lock);
 }
 
 static void
@@ -279,6 +366,7 @@ nc_flush(nc_connection *connection)
 {
     nc_output *output = connection->output;
     size_t total = output->header_length + output->body_length;
+    size_t dispatched = 0;
     while (output->sent < total) {
         struct iovec vectors[2];
         struct msghdr message;
@@ -298,11 +386,23 @@ nc_flush(nc_connection *connection)
             vectors[count++].iov_len = output->body_length - sent_body;
         }
         message.msg_iov = vectors;
+        if (NC_NET_FAIR) {
+            size_t remaining = NC_SEND_QUANTUM-dispatched;
+            for (int i=0;i<count;++i) {
+                if (vectors[i].iov_len>remaining) vectors[i].iov_len=remaining;
+                remaining-=vectors[i].iov_len;
+            }
+        }
         message.msg_iovlen = (size_t) count;
         written = sendmsg(connection->fd, &message, MSG_NOSIGNAL);
         if (written > 0) {
             output->sent += (size_t) written;
+            dispatched += (size_t) written;
             connection->activity = nc_now();
+            if (NC_NET_FAIR && dispatched>=NC_SEND_QUANTUM && output->sent<total) {
+                nc_arm(connection, EPOLLOUT);
+                return;
+            }
             continue;
         }
         if (written < 0 && errno == EINTR) continue;
@@ -366,55 +466,51 @@ nc_worker(void *argument)
          * earlier batches, and this mutex is never held during a DB call. */
         if (gather) pthread_mutex_lock(&pool->gather_lock);
         pthread_mutex_lock(&pool->lock);
-        while (!pool->head && !pool->stopping)
+        while ((!pool->head || (read_pool && !nc_read_admitted(pool))) && !pool->stopping)
             pthread_cond_wait(&pool->available, &pool->lock);
         if (pool->stopping) {
             pthread_mutex_unlock(&pool->lock);
             if (gather) pthread_mutex_unlock(&pool->gather_lock);
             break;
         }
+        unsigned gather_us = read_pool ? nc_read_window(pool) : 0;
+        if (read_pool) ++pool->active;
         connection = pool->head;
         pool->head = connection->queue_next;
+        --pool->queued;
         if (!pool->head) pool->tail = NULL;
         connections[count] = connection;
         requests[count++] = connection->request;
         if (read_pool) {
-            uint64_t deadline = connection->queued_at + NC_READ_WINDOW_MS;
+            uint64_t deadline = connection->queued_at + gather_us;
             while (count < NC_READ_BATCH_MAX && !pool->stopping) {
                 if (pool->head) {
                     connection = pool->head;
                     pool->head = connection->queue_next;
+                    --pool->queued;
                     if (!pool->head) pool->tail = NULL;
                     connections[count] = connection;
                     requests[count++] = connection->request;
                 } else {
-                    struct timespec until;
-                    uint64_t now = nc_now(), remaining;
+                    uint64_t now = nc_now_us();
                     if (now >= deadline) break;
-                    remaining = deadline - now;
-                    clock_gettime(CLOCK_REALTIME, &until);
-                    until.tv_nsec += (long) remaining * 1000000L;
-                    until.tv_sec += until.tv_nsec / 1000000000L;
-                    until.tv_nsec %= 1000000000L;
+                    struct timespec until = {
+                        .tv_sec=(time_t)(deadline/1000000U),
+                        .tv_nsec=(long)(deadline%1000000U)*1000L
+                    };
                     pthread_cond_timedwait(&pool->available, &pool->lock, &until);
                 }
             }
         }
-        if (read_pool && server.read_batch_stats) {
-            uint64_t oldest = nc_now() - connections[0]->queued_at;
-            ++server.read_batches;
-            server.read_requests += (unsigned) count;
-            if (count == 1) ++server.read_solo_batches;
-            if ((unsigned) count > server.read_max_batch)
-                server.read_max_batch = (unsigned) count;
-            server.read_oldest_ms += oldest;
-            if (oldest > server.read_max_oldest_ms) server.read_max_oldest_ms = oldest;
-        }
+        if (read_pool) nc_read_record(connections, count);
         pthread_mutex_unlock(&pool->lock);
         if (gather) pthread_mutex_unlock(&pool->gather_lock);
 
-        if (read_pool) conduit_batch(requests, count, database);
-        else conduit_handle(requests[0], database);
+        if (read_pool) {
+            uint64_t started = nc_now_us();
+            conduit_batch(requests, count, database);
+            nc_read_finished(pool, (unsigned) count, started);
+        } else conduit_handle(requests[0], database);
 
         pthread_mutex_lock(&server.done_lock);
         for (i = 0; i < count; ++i) {
@@ -429,6 +525,106 @@ nc_worker(void *argument)
         while (write(server.completion_fd, &notification, sizeof(notification)) < 0 && errno == EINTR) {}
     }
     nc_db_close(database);
+    return NULL;
+}
+
+/* One reactor owns all read PG connections. A frozen batch keeps its existing
+ * Nelua stack and result ownership while database waits suspend its continuation. */
+typedef struct nc_read_job {
+    nc_connection *connections[NC_READ_BATCH_MAX];
+    nc_request *requests[NC_READ_BATCH_MAX];
+    uint64_t started;
+    int count;
+} nc_read_job;
+
+static void *
+nc_read_take(void *context, uint64_t *deadline)
+{
+    nc_pool *pool = context;
+    nc_read_job *job = NULL;
+    pthread_mutex_lock(&pool->lock);
+    if (pool->head && !pool->stopping && nc_read_admitted(pool)) {
+        uint64_t until = pool->head->queued_at + nc_read_window(pool);
+        /* A full batch can run immediately. Otherwise gather to the oldest
+         * request's deadline without putting this OS thread to sleep. */
+        if (pool->queued < NC_READ_BATCH_MAX && nc_now_us() < until) *deadline = until;
+        else {
+            job = calloc(1, sizeof(*job));
+            if (!job) *deadline = nc_now_us() + 1000;
+            else {
+                while (pool->head && job->count < NC_READ_BATCH_MAX) {
+                    nc_connection *c = pool->head;
+                    pool->head = c->queue_next;
+                    --pool->queued;
+                    job->connections[job->count] = c;
+                    job->requests[job->count++] = c->request;
+                }
+                if (!pool->head) pool->tail = NULL;
+                ++pool->active;
+                nc_read_record(job->connections, job->count);
+            }
+        }
+    }
+    pthread_mutex_unlock(&pool->lock);
+    return job;
+}
+
+static void
+nc_read_execute(void *work, nc_db *database)
+{
+    nc_read_job *job = work;
+    job->started = nc_now_us();
+    conduit_batch(job->requests, job->count, database);
+}
+
+static void
+nc_read_complete(void *context, void *work)
+{
+    nc_read_job *job = work;
+    uint64_t notification = 1;
+    nc_read_finished(context, (unsigned) job->count, job->started);
+    pthread_mutex_lock(&server.done_lock);
+    for (int i = 0; i < job->count; ++i) {
+        nc_connection *c = job->connections[i];
+        c->done_next = NULL;
+        if (server.done_tail) server.done_tail->done_next = c;
+        else server.done_head = c;
+        server.done_tail = c;
+    }
+    pthread_mutex_unlock(&server.done_lock);
+    free(job);
+    while (write(server.completion_fd, &notification, sizeof(notification)) < 0 && errno == EINTR) {}
+}
+
+static bool
+nc_read_stopping(void *context)
+{
+    nc_pool *pool = context;
+    pthread_mutex_lock(&pool->lock);
+    bool stopping = pool->stopping;
+    pthread_mutex_unlock(&pool->lock);
+    return stopping;
+}
+
+static void
+nc_read_started(void *context, bool good)
+{
+    nc_pool *pool = context;
+    pthread_mutex_lock(&server.startup_lock);
+    server.ready_count += pool->threads;
+    if (!good) server.startup_failed = true;
+    pthread_cond_signal(&server.startup_ready);
+    pthread_mutex_unlock(&server.startup_lock);
+}
+
+static void *
+nc_read_scheduler(void *context)
+{
+    nc_pool *pool = context;
+    const nc_reactor_hooks hooks = {
+        nc_read_take, nc_read_execute, nc_read_complete, nc_read_stopping, nc_read_started
+    };
+    nc_reactor_run(server.database_url, pool->threads, server.read_wake_fd, &hooks, pool);
     return NULL;
 }
 
@@ -455,7 +651,7 @@ nc_dispatch(nc_connection *connection)
     }
     connection->request = nc_request_create(connection->input, (size_t) size);
     if (!connection->request) {
-        nc_simple_error(connection, 400);
+        nc_simple_error(connection, errno==ENOMEM?503:400);
         return true;
     }
     connection->charge = (size_t) size;
@@ -470,7 +666,7 @@ nc_dispatch(nc_connection *connection)
     if (lane < 0 || lane > 2) lane = 0;
     pool = &server.pools[lane];
     connection->stage = NC_WORKING;
-    connection->queued_at = nc_now();
+    connection->queued_at = nc_now_us();
     connection->queue_next = NULL;
     /* Do not leave the request readable while a worker owns it. */
     if (!nc_arm(connection, 0)) {
@@ -482,8 +678,13 @@ nc_dispatch(nc_connection *connection)
     if (pool->tail) pool->tail->queue_next = connection;
     else pool->head = connection;
     pool->tail = connection;
+    ++pool->queued;
     pthread_cond_signal(&pool->available);
     pthread_mutex_unlock(&pool->lock);
+    if (lane == 0 && server.read_reactor) {
+        uint64_t notification = 1;
+        while (write(server.read_wake_fd, &notification, sizeof(notification)) < 0 && errno == EINTR) {}
+    }
     return true;
 }
 
@@ -578,6 +779,7 @@ nc_completions(void)
 static bool
 nc_accept(void)
 {
+    unsigned accepted = 0;
     for (;;) {
         struct epoll_event event;
         nc_connection *connection;
@@ -612,6 +814,9 @@ nc_accept(void)
         event.data.ptr = connection;
         if (epoll_ctl(server.epoll_fd, EPOLL_CTL_ADD, fd, &event) != 0)
             nc_close(connection);
+        /* The listener is level-triggered. Yield a connection flood back to
+         * completed replies and existing streams, then accept on the next turn. */
+        if (NC_NET_FAIR && ++accepted>=NC_ACCEPT_QUANTUM) return true;
     }
 }
 
@@ -680,6 +885,10 @@ nc_stop_workers(void)
         pthread_cond_broadcast(&server.pools[i].available);
         pthread_mutex_unlock(&server.pools[i].lock);
     }
+    if (server.read_wake_fd >= 0) {
+        uint64_t notification = 1;
+        while (write(server.read_wake_fd, &notification, sizeof(notification)) < 0 && errno == EINTR) {}
+    }
     for (i = 0; i < server.worker_count; ++i) pthread_join(server.workers[i], NULL);
 }
 
@@ -694,18 +903,29 @@ main(void)
     bool accepting = true;
     int i, j, expected = 0, exit_code = 0, serial_gather, batch_stats;
     memset(&server, 0, sizeof(server));
-    server.epoll_fd = server.listener_fd = server.completion_fd = server.reserve_fd = -1;
+    server.epoll_fd = server.listener_fd = server.completion_fd = server.reserve_fd = server.read_wake_fd = -1;
     server.database_url = getenv("DATABASE_URL");
+    if (!nc_json_scan_init()) return 1;
     if (!server.database_url || !*server.database_url || !getenv("JWT_SECRET")) {
         fprintf(stderr, "DATABASE_URL and JWT_SECRET are required\n");
         return 1;
     }
+    if (!nc_request_memory_ready()) {
+        fprintf(stderr,"REQUEST_MEMORY_MB must be an integer in 1..4096\n");
+        return 1;
+    }
     server.pools[0].threads = nc_thread_count("DB_READ_THREADS", 4);
-    server.pools[1].threads = nc_thread_count("DB_WRITE_THREADS", 8);
+    server.pools[1].threads = nc_thread_count("DB_WRITE_THREADS", 32);
     server.pools[2].threads = nc_thread_count("DB_AUTH_THREADS", 8);
     serial_gather = nc_switch("READ_GATHER_SERIAL", 1);
     batch_stats = nc_switch("READ_BATCH_STATS", 0);
     if (serial_gather < 0 || batch_stats < 0) return 1;
+    int read_reactor = nc_switch("READ_REACTOR", 1);
+    if (read_reactor < 0) return 1;
+    server.read_reactor = read_reactor != 0;
+    int adaptive = nc_switch("READ_ADAPTIVE", 1);
+    if (adaptive < 0) return 1;
+    server.read_adaptive = adaptive != 0;
     server.serial_read_gather = serial_gather != 0;
     server.read_batch_stats = batch_stats != 0;
     for (i = 0; i < 3; ++i) {
@@ -716,17 +936,20 @@ main(void)
         fprintf(stderr, "total database worker connections must be <=95\n");
         return 1;
     }
+    nc_read_policy_init(&server.pools[0].policy, (unsigned) server.pools[0].threads);
     pthread_mutex_init(&server.startup_lock, NULL);
     pthread_cond_init(&server.startup_ready, NULL);
     pthread_mutex_init(&server.done_lock, NULL);
     for (i = 0; i < 3; ++i) {
-        pthread_mutex_init(&server.pools[i].lock, NULL);
-        pthread_mutex_init(&server.pools[i].gather_lock, NULL);
-        pthread_cond_init(&server.pools[i].available, NULL);
+        if (!nc_pool_init(&server.pools[i])) {
+            fprintf(stderr,"database lane synchronization initialization failed\n");
+            return 1;
+        }
     }
     server.epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     server.completion_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    if (server.epoll_fd < 0 || server.completion_fd < 0 ||
+    server.read_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (server.epoll_fd < 0 || server.completion_fd < 0 || server.read_wake_fd < 0 ||
         !nc_add_descriptor(server.completion_fd, &completion_tag)) {
         perror("epoll/eventfd");
         exit_code = 1;
@@ -741,9 +964,10 @@ main(void)
     pthread_attr_init(&attributes);
     pthread_attr_setstacksize(&attributes, 512U * 1024U);
     for (i = 0; i < 3; ++i) {
-        for (j = 0; j < server.pools[i].threads; ++j) {
+        int threads = (i == 0 && server.read_reactor) ? 1 : server.pools[i].threads;
+        for (j = 0; j < threads; ++j) {
             int error = pthread_create(&server.workers[server.worker_count], &attributes,
-                                       nc_worker, &server.pools[i]);
+                                       (i == 0 && server.read_reactor) ? nc_read_scheduler : nc_worker, &server.pools[i]);
             if (error) {
                 fprintf(stderr, "pthread_create: %s\n", strerror(error));
                 pthread_attr_destroy(&attributes);
@@ -770,7 +994,12 @@ main(void)
         goto shutdown;
     }
     server.reserve_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
-    fprintf(stderr, "Nelua epoll ready on %s:%s; DB lanes %d/%d/%d (%zu bytes/idle connection)\n",
+#ifdef NC_APP_C
+    const char *implementation="C";
+#else
+    const char *implementation="Nelua";
+#endif
+    fprintf(stderr, "%s epoll ready on %s:%s; DB lanes %d/%d/%d (%zu bytes/idle connection)\n", implementation,
             host && *host ? host : "127.0.0.1", port && *port ? port : "3000",
             server.pools[0].threads, server.pools[1].threads, server.pools[2].threads,
             sizeof(nc_connection));
@@ -785,6 +1014,11 @@ main(void)
             exit_code = 1;
             break;
         }
+        if (NC_NET_FAIR) {
+            for (i=0;i<count;++i) {
+                if (events[i].data.ptr==&completion_tag) { nc_completions(); break; }
+            }
+        }
         for (i = 0; i < count; ++i) {
             if (events[i].data.ptr == &listener_tag) {
                 if (accepting && !nc_accept()) {
@@ -792,7 +1026,9 @@ main(void)
                     accepting = false;
                     resume = nc_now() + 100;
                 }
-            } else if (events[i].data.ptr == &completion_tag) nc_completions();
+            } else if (events[i].data.ptr == &completion_tag) {
+                if (!NC_NET_FAIR) nc_completions();
+            }
             else {
                 nc_connection *connection = events[i].data.ptr;
                 uint32_t flags = events[i].events;
@@ -836,6 +1072,15 @@ shutdown:
             server.read_batches ? (double) server.read_oldest_ms / server.read_batches : 0.0,
             (unsigned long long) server.read_max_oldest_ms);
     }
+    if (server.read_adaptive) {
+        nc_read_policy *p = &server.pools[0].policy;
+        fprintf(stderr, "read policy: active_limit=%u/%u minimum=%u reductions=%llu recoveries=%llu window_us=%u completed=%llu service_ewma_us=%llu cpu_busy_permille=%u cpu_stall_permille=%u io_stall_permille=%u memory_stall_permille=%u application_memory_high=%d\n",
+                p->limit, p->maximum, p->minimum_limit,
+                (unsigned long long)p->reductions,(unsigned long long)p->recoveries,
+                p->window_us, (unsigned long long) p->completed,
+                (unsigned long long) p->service_us, p->last_cpu_busy, p->last_cpu_stall,
+                p->last_io_stall, p->last_memory_stall,p->last_application_memory_high);
+    }
     while (server.connections) {
         nc_connection *connection = server.connections;
         if (connection->fd >= 0) close(connection->fd);
@@ -845,7 +1090,12 @@ shutdown:
 cleanup:
     if (server.listener_fd >= 0) close(server.listener_fd);
     if (server.completion_fd >= 0) close(server.completion_fd);
+    if (server.read_wake_fd >= 0) close(server.read_wake_fd);
     if (server.reserve_fd >= 0) close(server.reserve_fd);
     if (server.epoll_fd >= 0) close(server.epoll_fd);
+    if (server.read_batch_stats)
+        fprintf(stderr,"request memory: live=%zu limit=%zu retained_buffer_capacity=%zu\n",
+                nc_request_memory_used(),nc_request_memory_limit(),nc_buffer_cached_bytes());
+    nc_buffer_cache_trim();
     return exit_code;
 }

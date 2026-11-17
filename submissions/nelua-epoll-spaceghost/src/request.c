@@ -3,6 +3,7 @@
 #include "bcrypt.h"
 #include <ctype.h>
 #include <crypt.h>
+#include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <openssl/core_names.h>
@@ -12,16 +13,192 @@
 #include <openssl/rand.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <time.h>
+#include "owned_memory.h"
 
 #define NC_HEADER_LIMIT (32U * 1024U)
 #define NC_BODY_LIMIT (1024U * 1024U)
 #define NC_OUTPUT_LIMIT (16U * 1024U * 1024U)
 #define NC_JSON_NODES 65536U
 #define NC_JSON_DEPTH 64U
+#ifndef NC_MEMORY_SHAPE
+#define NC_MEMORY_SHAPE 0
+#endif
+#ifndef NC_BUFFER_CACHE
+#define NC_BUFFER_CACHE 0
+#endif
+
+/* Bound live request objects, arenas and output/vector capacities with
+ * request-owned, conservatively rounded credit reservations. Cached
+ * spare storage has its own independent 32 MiB bound below. Provider metadata,
+ * libpq/OpenSSL and kernel memory are outside this requested-byte accounting. */
+typedef struct nc_budget { size_t live, reserved; } nc_budget;
+#define NC_BUDGET_QUANTUM 8192U
+static pthread_once_t nc_request_memory_once=PTHREAD_ONCE_INIT;
+static size_t nc_request_memory_cap=256U*1024U*1024U;
+static _Atomic size_t nc_request_memory_live;
+
+static void nc_request_memory_configure(void)
+{
+    const char *value=getenv("REQUEST_MEMORY_MB");
+    if (!value || !*value) return;
+    char *end;
+    errno=0;
+    unsigned long long megabytes=strtoull(value,&end,10);
+    if (*value<'0' || *value>'9' || *end || errno || !megabytes || megabytes>4096 ||
+        megabytes>SIZE_MAX/(1024U*1024U)) nc_request_memory_cap=0;
+    else nc_request_memory_cap=(size_t)megabytes*1024U*1024U;
+}
+size_t nc_request_memory_limit(void)
+{
+    pthread_once(&nc_request_memory_once,nc_request_memory_configure);
+    return nc_request_memory_cap;
+}
+bool nc_request_memory_ready(void) { return nc_request_memory_limit()!=0; }
+size_t nc_request_memory_used(void)
+{ return atomic_load_explicit(&nc_request_memory_live,memory_order_relaxed); }
+
+static bool nc_request_charge(size_t bytes)
+{
+    size_t limit=nc_request_memory_limit(), used=nc_request_memory_used();
+    for (;;) {
+        if (!limit || used>limit || bytes>limit-used) { errno=ENOMEM;return false; }
+        if (atomic_compare_exchange_weak_explicit(&nc_request_memory_live,&used,used+bytes,
+                memory_order_relaxed,memory_order_relaxed)) return true;
+    }
+}
+static void nc_request_refund(size_t bytes)
+{
+    if (!bytes) return;
+    size_t before=atomic_fetch_sub_explicit(&nc_request_memory_live,bytes,memory_order_relaxed);
+    if (before<bytes) abort();
+}
+
+/* A request migrates between threads through the transport's ownership queues,
+ * but only its current owner touches these credits. Keep its high-water reserve
+ * until destruction: growth and temporary-vector release need no global atomic
+ * while they fit. The global cap counts reserves, so rounding is conservative.
+ * No thread-local credits can be stranded by a cross-thread free. */
+static bool nc_budget_charge(nc_budget *budget,size_t bytes)
+{
+    if (bytes>SIZE_MAX-budget->live) { errno=ENOMEM;return false; }
+    size_t needed=budget->live+bytes;
+    if (needed>budget->reserved) {
+        size_t target=needed;
+        if (target<=SIZE_MAX-(NC_BUDGET_QUANTUM-1U))
+            target=(target+NC_BUDGET_QUANTUM-1U)&~(size_t)(NC_BUDGET_QUANTUM-1U);
+        if (!nc_request_charge(target-budget->reserved)) {
+            /* Admit exact remaining bytes when rounding alone hits the cap. */
+            if (target==needed || !nc_request_charge(needed-budget->reserved)) return false;
+            target=needed;
+        }
+        budget->reserved=target;
+    }
+    budget->live=needed;
+    return true;
+}
+static void nc_budget_refund(nc_budget *budget,size_t bytes)
+{
+    if (budget->live<bytes) abort();
+    budget->live-=bytes;
+}
+
+#if NC_BUFFER_CACHE
+/* Reuse storage, never a result: every buffer starts with length zero and every
+ * response is rendered again. Bounded medium buffers avoid one mmap/munmap per
+ * Nelibc response above its largest slab class. Both providers can opt in. */
+#define NC_BUFFER_CACHE_BYTES (32U*1024U*1024U)
+#define NC_BUFFER_CLASS_BYTES (16U*1024U*1024U)
+static pthread_mutex_t nc_buffer_cache_lock=PTHREAD_MUTEX_INITIALIZER;
+static void *nc_buffer_spares[14];
+static size_t nc_buffer_spare_bytes[14],nc_buffer_retained;
+
+static int nc_buffer_class(size_t capacity)
+{
+    unsigned shaped=0;
+    size_t nominal=capacity;
+    if (!nominal) return -1;
+    if (nominal&(nominal-1)) {
+        if (!NC_MEMORY_SHAPE || nominal>SIZE_MAX-64U) return -1;
+        nominal+=64U; shaped=1;
+        if (nominal&(nominal-1)) return -1;
+    }
+    if (nominal<16384U || nominal>1048576U) return -1;
+    return (int)((unsigned)__builtin_ctzl(nominal)-14U)*2+(int)shaped;
+}
+
+static char *nc_buffer_take(size_t capacity)
+{
+    int slot=nc_buffer_class(capacity);
+    if (slot>=0) {
+        pthread_mutex_lock(&nc_buffer_cache_lock);
+        void *data=nc_buffer_spares[slot];
+        if (data) {
+            nc_buffer_spares[slot]=*(void **)data;
+            nc_buffer_spare_bytes[slot]-=capacity;
+            nc_buffer_retained-=capacity;
+        }
+        pthread_mutex_unlock(&nc_buffer_cache_lock);
+        if (data) return data;
+    }
+    return malloc(capacity);
+}
+
+static void nc_buffer_release(char *data,size_t capacity,nc_budget *budget)
+{
+    if (!data) return;
+    int slot=nc_buffer_class(capacity);
+    if (slot>=0) {
+        pthread_mutex_lock(&nc_buffer_cache_lock);
+        if (capacity<=NC_BUFFER_CACHE_BYTES-nc_buffer_retained &&
+            capacity<=NC_BUFFER_CLASS_BYTES-nc_buffer_spare_bytes[slot]) {
+            *(void **)data=nc_buffer_spares[slot];
+            nc_buffer_spares[slot]=data;
+            nc_buffer_spare_bytes[slot]+=capacity;
+            nc_buffer_retained+=capacity;
+            pthread_mutex_unlock(&nc_buffer_cache_lock);
+            nc_budget_refund(budget,capacity);
+            return;
+        }
+        pthread_mutex_unlock(&nc_buffer_cache_lock);
+    }
+    free(data);
+    nc_budget_refund(budget,capacity);
+}
+
+size_t nc_buffer_cached_bytes(void)
+{
+    pthread_mutex_lock(&nc_buffer_cache_lock);
+    size_t bytes=nc_buffer_retained;
+    pthread_mutex_unlock(&nc_buffer_cache_lock);
+    return bytes;
+}
+
+void nc_buffer_cache_trim(void)
+{
+    void *heads[14];
+    pthread_mutex_lock(&nc_buffer_cache_lock);
+    for (int slot=0;slot<14;++slot) {
+        heads[slot]=nc_buffer_spares[slot];
+        nc_buffer_spares[slot]=NULL;nc_buffer_spare_bytes[slot]=0;
+    }
+    nc_buffer_retained=0;
+    pthread_mutex_unlock(&nc_buffer_cache_lock);
+    for (int slot=0;slot<14;++slot) {
+        void *data=heads[slot];
+        while (data) { void *next=*(void **)data; free(data); data=next; }
+    }
+}
+#else
+static void nc_buffer_release(char *data,size_t capacity,nc_budget *budget)
+{ if (data) { free(data);nc_budget_refund(budget,capacity); } }
+size_t nc_buffer_cached_bytes(void) { return 0; }
+void nc_buffer_cache_trim(void) {}
+#endif
 
 typedef struct nc_chunk {
     struct nc_chunk *next;
@@ -30,7 +207,7 @@ typedef struct nc_chunk {
     unsigned char bytes[];
 } nc_chunk;
 
-struct nc_buffer { char *data; size_t length, capacity; bool failed; };
+struct nc_buffer { nc_budget *budget; char *data; uint32_t length, capacity; bool failed,exhausted; };
 struct nc_json {
     int kind;
     char *name;
@@ -40,16 +217,20 @@ struct nc_json {
 };
 typedef struct nc_pair { char *name, *value; struct nc_pair *next; } nc_pair;
 struct nc_request {
+    nc_budget budget;
     nc_chunk *chunks;
     char *method, **segments, *authorization;
     int segment_count, status;
-    bool keepalive, authorization_present, body_parsed;
+    uint32_t body_length;
+    bool keepalive, authorization_present, body_parsed, memory_failed;
     char *body;
-    size_t body_length;
     nc_json *json;
     nc_pair *query;
     nc_buffer output;
 };
+_Static_assert(NC_OUTPUT_LIMIT<UINT32_MAX/2U,"buffer growth must fit 32-bit capacities");
+_Static_assert(NC_BODY_LIMIT<=UINT32_MAX,"body lengths must fit 32 bits");
+_Static_assert(sizeof(nc_request)<=120,"keep the x86-64 request control object compact");
 
 typedef struct nc_parser {
     nc_request *request;
@@ -64,12 +245,23 @@ nc_alloc(nc_request *request, size_t length)
     nc_chunk *chunk = request->chunks;
     size_t align = _Alignof(max_align_t);
     size_t padded;
-    if (length > SIZE_MAX - align) return NULL;
+    if (length > SIZE_MAX - align) { request->memory_failed=true;errno=ENOMEM;return NULL; }
     padded = (length + align - 1) & ~(align - 1);
     if (!chunk || chunk->size - chunk->used < padded) {
-        size_t size = padded > 4096 ? padded : 4096;
+        /* Optional experiment: the pinned private allocator adds at most 63
+         * bytes before rounding to a size class. Leave 64 bytes for that and
+         * include our chunk header in the same 4 KiB class. Plain remains the
+         * control until measured against actual request lifetimes. */
+        size_t quantum = NC_MEMORY_SHAPE ? 4096U-64U-sizeof(*chunk) : 4096U;
+        size_t size = padded > quantum ? padded : quantum;
+        if (size>SIZE_MAX-sizeof(*chunk) || !nc_budget_charge(&request->budget,sizeof(*chunk)+size)) {
+            request->memory_failed=true;errno=ENOMEM;return NULL;
+        }
         chunk = malloc(sizeof(*chunk) + size);
-        if (!chunk) return NULL;
+        if (!chunk) {
+            nc_budget_refund(&request->budget,sizeof(*chunk)+size);
+            request->memory_failed=true;errno=ENOMEM;return NULL;
+        }
         chunk->next = request->chunks;
         chunk->used = 0;
         chunk->size = size;
@@ -222,13 +414,19 @@ nc_request_create(const char *data, size_t length)
 {
     ssize_t framed = nc_request_size(data, length);
     nc_request *request;
-    const char *end = data + length;
+    const char *end;
     const char *line_end, *space, *target, *target_end, *version, *line;
     const char *query, *path_end, *part;
     size_t max_segments = 1;
+    errno=0;
     if (framed <= 0 || (size_t)framed != length) return NULL;
+    end=data+length;
+    nc_budget initial={0};
+    if (!nc_budget_charge(&initial,sizeof(*request))) return NULL;
     request = calloc(1, sizeof(*request));
-    if (!request) return NULL;
+    if (!request) { nc_request_refund(initial.reserved);errno=ENOMEM;return NULL; }
+    request->budget=initial;
+    request->output.budget=&request->budget;
     request->status = 500;
     line_end = nc_crlf(data, end);
     space = memchr(data, ' ', (size_t)(line_end-data));
@@ -310,8 +508,12 @@ nc_request_create(const char *data, size_t length)
         line = line_end + 2;
     }
 invalid:
+    {
+    bool exhausted=request->memory_failed;
     nc_request_free(request);
+    errno=exhausted?ENOMEM:0;
     return NULL;
+    }
 }
 
 void
@@ -320,11 +522,16 @@ nc_request_free(nc_request *request)
     if (!request) return;
     while (request->chunks) {
         nc_chunk *next = request->chunks->next;
+        size_t bytes=sizeof(*request->chunks)+request->chunks->size;
         free(request->chunks);
+        nc_budget_refund(&request->budget,bytes);
         request->chunks = next;
     }
-    free(request->output.data);
+    nc_buffer_release(request->output.data,request->output.capacity,&request->budget);
+    if (request->budget.live!=sizeof(*request)) abort();
+    size_t reserved=request->budget.reserved;
     free(request);
+    nc_request_refund(reserved);
 }
 
 const char *nc_method(nc_request *r) { return r->method; }
@@ -405,27 +612,47 @@ nc_unicode4(const unsigned char **at, const unsigned char *end, unsigned *code)
 static char *
 nc_parse_string(nc_parser *parser)
 {
-    const unsigned char *start, *scan;
+    const unsigned char *start;
     char *out;
     size_t used=0;
     if (parser->at == parser->end || *parser->at++ != '"') return NULL;
-    start=parser->at; scan=start;
-    while (scan < parser->end && *scan != '"') {
-        if (*scan < 32) return NULL;
-        if (*scan == '\\') {
-            ++scan;
-            if (scan == parser->end) return NULL;
-            ++scan;
-        } else ++scan;
-    }
-    if (scan == parser->end) return NULL;
-    out=nc_alloc(parser->request,(size_t)(scan-start)+1);
-    if (!out) return NULL;
-    while (parser->at < scan) {
+    start=parser->at;
+    /* Both call sites parse mutable request-owned storage: the body copy or
+     * freshly decoded JWT JSON. Decoding never expands a JSON string, so its
+     * bytes and terminator fit before/at the consumed closing quote. No parser
+     * backtracking reads these bytes again. The original signed token stays
+     * separate and is verified on every nc_auth call. */
+    out=(char *)start;
+    while (parser->at < parser->end) {
+        const unsigned char *plain=parser->at;
+        /* Validate ordinary ASCII eight bytes at a time. High bytes stop the
+         * word path so the UTF-8 validator still checks every multibyte unit.
+         * All loads are bounded; borrow-induced extra stops are harmless. */
+        while ((size_t)(parser->end-parser->at)>=8) {
+            uint64_t word,quote,slash;
+            const uint64_t high=UINT64_C(0x8080808080808080);
+            const uint64_t low=UINT64_C(0x0101010101010101);
+            __builtin_memcpy(&word,parser->at,8);
+            quote=word^UINT64_C(0x2222222222222222);
+            slash=word^UINT64_C(0x5c5c5c5c5c5c5c5c);
+            if ((word&high) || ((word-UINT64_C(0x2020202020202020))&~word&high) ||
+                ((quote-low)&~quote&high) || ((slash-low)&~slash&high)) break;
+            parser->at+=8;
+        }
+        while (parser->at<parser->end && *parser->at>=32 && *parser->at<128 &&
+               *parser->at!='"' && *parser->at!='\\') ++parser->at;
+        size_t ordinary=(size_t)(parser->at-plain);
+        if (ordinary) {
+            if (out+used!=(const char *)plain) memmove(out+used,plain,ordinary);
+            used+=ordinary;
+        }
+        if (parser->at==parser->end) return NULL;
         unsigned char c=*parser->at++;
+        if (c=='"') { out[used]=0; return out; }
+        if (c<32) return NULL;
         if (c == '\\') {
             unsigned code;
-            if (parser->at == scan) return NULL;
+            if (parser->at == parser->end) return NULL;
             c=*parser->at++;
             switch (c) {
             case '"': case '\\': case '/': out[used++]=(char)c; break;
@@ -435,12 +662,12 @@ nc_parse_string(nc_parser *parser)
             case 'r': out[used++]='\r'; break;
             case 't': out[used++]='\t'; break;
             case 'u':
-                if (!nc_unicode4(&parser->at,scan,&code)) return NULL;
+                if (!nc_unicode4(&parser->at,parser->end,&code)) return NULL;
                 if (code >= 0xd800 && code <= 0xdbff) {
                     unsigned low;
-                    if (scan-parser->at < 6 || parser->at[0] != '\\' || parser->at[1] != 'u') return NULL;
+                    if (parser->end-parser->at < 6 || parser->at[0] != '\\' || parser->at[1] != 'u') return NULL;
                     parser->at += 2;
-                    if (!nc_unicode4(&parser->at,scan,&low) || low < 0xdc00 || low > 0xdfff) return NULL;
+                    if (!nc_unicode4(&parser->at,parser->end,&low) || low < 0xdc00 || low > 0xdfff) return NULL;
                     code=0x10000 + ((code-0xd800)<<10) + low-0xdc00;
                 } else if (code >= 0xdc00 && code <= 0xdfff) return NULL;
                 if (code == 0) return NULL; /* NUL cannot cross a C-string/PG-text boundary. */
@@ -460,13 +687,13 @@ nc_parse_string(nc_parser *parser)
         else {
             const unsigned char *at=parser->at-1;
             parser->at=at;
-            if (!nc_utf8_sequence(&parser->at,scan)) return NULL;
-            memcpy(out+used,at,(size_t)(parser->at-at)); used+=(size_t)(parser->at-at);
+            if (!nc_utf8_sequence(&parser->at,parser->end)) return NULL;
+            /* Escapes before UTF-8 can make source and destination overlap. */
+            for (const unsigned char *byte=at; byte<parser->at; ++byte)
+                out[used++]=(char)*byte;
         }
     }
-    parser->at=scan+1;
-    out[used]=0;
-    return out;
+    return NULL; /* Missing closing quote. */
 }
 
 static nc_json *nc_parse_value(nc_parser *parser, unsigned depth);
@@ -555,7 +782,7 @@ invalid:
 }
 
 static nc_json *
-nc_parse_json(nc_request *request, const char *data, size_t length)
+nc_parse_json(nc_request *request, char *data, size_t length)
 {
     nc_parser parser={request,(const unsigned char *)data,(const unsigned char *)data+length,0,false};
     nc_json *node=nc_parse_value(&parser,0);
@@ -606,10 +833,31 @@ nc_write_n(nc_buffer *buffer, const char *value, size_t length)
     }
     needed=buffer->length+length+1;
     if (needed > buffer->capacity) {
-        capacity=buffer->capacity ? buffer->capacity : 512;
-        while (capacity < needed) capacity*=2;
+        size_t slack=NC_MEMORY_SHAPE ? 64U : 0U;
+        capacity=512U;
+        while (capacity < needed) capacity*=2U;
+        /* Never jump to a larger bucket just to leave metadata room: inputs
+         * near a power-of-two boundary must keep the ordinary growth bound. */
+        if (slack && needed<=capacity-slack) capacity-=slack;
+        if (!nc_budget_charge(buffer->budget,capacity)) { buffer->failed=buffer->exhausted=true;return; }
+        bool released_old=false;
+#if NC_BUFFER_CACHE
+        if (nc_buffer_class(capacity)>=0) {
+            data=nc_buffer_take(capacity);
+            if (data) {
+                if (buffer->length) memcpy(data,buffer->data,buffer->length);
+                nc_buffer_release(buffer->data,buffer->capacity,buffer->budget);
+                released_old=true;
+            }
+        } else data=realloc(buffer->data,capacity);
+#else
         data=realloc(buffer->data,capacity);
-        if (!data) { buffer->failed=true; return; }
+#endif
+        if (!data) {
+            nc_budget_refund(buffer->budget,capacity);
+            buffer->failed=buffer->exhausted=true;return;
+        }
+        if (!released_old) nc_budget_refund(buffer->budget,buffer->capacity);
         buffer->data=data; buffer->capacity=capacity;
     }
     if (length) memcpy(buffer->data+buffer->length,value,length);
@@ -620,20 +868,26 @@ void nc_write(nc_buffer *buffer, const char *value) { if (value) nc_write_n(buff
 void nc_putc(nc_buffer *buffer, char value) { nc_write_n(buffer,&value,1); }
 nc_buffer *nc_begin(nc_request *request, int status)
 {
+    if (request->output.exhausted) request->memory_failed=true;
     request->status=status;
     request->output.length=0;
     request->output.failed=false;
+    request->output.exhausted=false;
     return &request->output;
 }
 void nc_error(nc_request *request, int status)
 {
     nc_write(nc_begin(request,status),"{\"errors\":{\"body\":[\"request failed\"]}}");
 }
-int nc_status(nc_request *request) { return request->output.failed ? 500 : request->status; }
+int nc_status(nc_request *request)
+{
+    if (request->memory_failed || request->output.exhausted) return 503;
+    return request->output.failed ? 500 : request->status;
+}
 const char *nc_response_data(nc_request *request, size_t *length)
 {
     static const char failure[]="{\"errors\":{\"body\":[\"internal error\"]}}";
-    if (request->output.failed) { *length=sizeof(failure)-1; return failure; }
+    if (request->memory_failed || request->output.failed) { *length=sizeof(failure)-1; return failure; }
     *length=request->output.length;
     return request->output.data ? request->output.data : "";
 }
@@ -641,12 +895,15 @@ const char *nc_response_data(nc_request *request, size_t *length)
 char *
 nc_tag_array(nc_request *request, nc_json *array)
 {
-    nc_buffer buffer={0};
+    nc_buffer buffer={.budget=&request->budget};
     char *result;
     if (!array || array->kind != 2) return NULL;
     nc_putc(&buffer,'{');
     for (nc_json *item=array->child; item; item=item->next) {
-        if (item->kind != 3) { free(buffer.data); return NULL; }
+        if (item->kind != 3) {
+            if (buffer.exhausted) request->memory_failed=true;
+            nc_buffer_release(buffer.data,buffer.capacity,buffer.budget);return NULL;
+        }
         if (item != array->child) nc_putc(&buffer,',');
         nc_putc(&buffer,'"');
         for (const char *p=item->text; *p; ++p) {
@@ -657,14 +914,15 @@ nc_tag_array(nc_request *request, nc_json *array)
     }
     nc_putc(&buffer,'}');
     result=buffer.failed ? NULL : nc_copy(request,buffer.data,buffer.length);
-    free(buffer.data);
+    if (buffer.exhausted) request->memory_failed=true;
+    nc_buffer_release(buffer.data,buffer.capacity,buffer.budget);
     return result;
 }
 
 char *
 nc_text_vector(nc_request *request, const char *const *values, int count)
 {
-    nc_buffer buffer={0};
+    nc_buffer buffer={.budget=&request->budget};
     char *result;
     if (count < 0 || (count && !values)) return NULL;
     nc_putc(&buffer,'{');
@@ -680,14 +938,15 @@ nc_text_vector(nc_request *request, const char *const *values, int count)
     }
     nc_putc(&buffer,'}');
     result=buffer.failed ? NULL : nc_copy(request,buffer.data,buffer.length);
-    free(buffer.data);
+    if (buffer.exhausted) request->memory_failed=true;
+    nc_buffer_release(buffer.data,buffer.capacity,buffer.budget);
     return result;
 }
 
 char *
 nc_int_vector(nc_request *request, const int64_t *values, int count)
 {
-    nc_buffer buffer={0};
+    nc_buffer buffer={.budget=&request->budget};
     char *result;
     if (count < 0 || (count && !values)) return NULL;
     nc_putc(&buffer,'{');
@@ -700,7 +959,8 @@ nc_int_vector(nc_request *request, const int64_t *values, int count)
     }
     nc_putc(&buffer,'}');
     result=buffer.failed ? NULL : nc_copy(request,buffer.data,buffer.length);
-    free(buffer.data);
+    if (buffer.exhausted) request->memory_failed=true;
+    nc_buffer_release(buffer.data,buffer.capacity,buffer.budget);
     return result;
 }
 
@@ -864,8 +1124,8 @@ nc_auth(nc_request *request)
     header=nc_base64_decode(request,token,(size_t)(first-token),&header_length);
     payload=nc_base64_decode(request,first+1,(size_t)(second-first-1),&payload_length);
     if (!header || !payload) return -1;
-    head=nc_parse_json(request,(const char *)header,header_length);
-    claims=nc_parse_json(request,(const char *)payload,payload_length);
+    head=nc_parse_json(request,(char *)header,header_length);
+    claims=nc_parse_json(request,(char *)payload,payload_length);
     alg=nc_field(head,"alg"); sub=nc_field(claims,"sub"); exp=nc_field(claims,"exp"); nbf=nc_field(claims,"nbf");
     if (!nc_eq(nc_string(alg),"HS256") || !(id=nc_parse_uint(nc_string(sub))) || id < 0 ||
         !exp || exp->kind != 4 || (expiry=nc_parse_uint(exp->text)) < 0) return -1;
