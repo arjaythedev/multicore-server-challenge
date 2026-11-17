@@ -13,7 +13,6 @@
 //! - R7: Pool sizes configurable via PG_READ_CONNS, PG_WRITE_CONNS, PG_FEED_CONNS,
 //!       with sane defaults computed from available CPU count and logged at boot.
 
-pub mod count_cache;
 pub mod exec;
 pub mod feed;
 pub mod write;

@@ -10,34 +10,19 @@ use crate::api::render::{
 };
 use crate::pg::decode::BinaryDecoder;
 use crate::pg::wire::{PgError, PgWire};
-use crate::plan::count_cache;
 use crate::types::{Envelope, Job, KdfJob, ListFilter, Reply};
 
 // Map each envelope to its query slot
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PlannedJob<'a> {
     Tags,
-    TagsCached(std::sync::Arc<Vec<u8>>),
     UserGet { uid_bytes: [u8; 8] },
     Profile { viewer_bytes: [u8; 8], username: &'a str },
     ArticleGet { viewer_bytes: [u8; 8], slug: &'a str },
     Comments { viewer_bytes: [u8; 8], slug: &'a str },
     LoginLookup { email: &'a str },
-    ListGlobal {
-        limit_bytes: [u8; 8],
-        offset_bytes: [u8; 8],
-        viewer_bytes: [u8; 8],
-        cached: Option<i64>,
-        gens: count_cache::Gens,
-    },
-    ListTag {
-        tag_name: &'a str,
-        limit_bytes: [u8; 8],
-        offset_bytes: [u8; 8],
-        viewer_bytes: [u8; 8],
-        cached: Option<i64>,
-        gens: count_cache::Gens,
-    },
+    ListGlobal { limit_bytes: [u8; 8], offset_bytes: [u8; 8], viewer_bytes: [u8; 8] },
+    ListTag { tag_name: &'a str, limit_bytes: [u8; 8], offset_bytes: [u8; 8], viewer_bytes: [u8; 8] },
     ListAuthor { author: &'a str, limit_bytes: [u8; 8], offset_bytes: [u8; 8], viewer_bytes: [u8; 8] },
     ListFavorited { favorited: &'a str, limit_bytes: [u8; 8], offset_bytes: [u8; 8], viewer_bytes: [u8; 8] },
     Skip,
@@ -57,15 +42,12 @@ pub fn execute_read_batch(
     let mut pipeline = wire.pipeline();
 
     let mut planned: Vec<PlannedJob> = Vec::with_capacity(envelopes.len());
-    // Taken before any query of this batch is sent; used when storing a freshly rendered tags body.
-    let batch_gens = count_cache::snapshot();
 
     for env in envelopes {
         match &env.job {
-            Job::Tags => match count_cache::get_tags_body() {
-                Some(body) => planned.push(PlannedJob::TagsCached(body)),
-                None => planned.push(PlannedJob::Tags),
-            },
+            Job::Tags => {
+                planned.push(PlannedJob::Tags);
+            }
             Job::UserGet => {
                 let uid_bytes = env.viewer.to_be_bytes();
                 planned.push(PlannedJob::UserGet { uid_bytes });
@@ -99,26 +81,18 @@ pub fn execute_read_batch(
                 let off = *offset as i64;
                 match filter {
                     ListFilter::Global => {
-                        let gens = count_cache::snapshot();
-                        let cached = count_cache::get_global();
                         planned.push(PlannedJob::ListGlobal {
                             limit_bytes: lim.to_be_bytes(),
                             offset_bytes: off.to_be_bytes(),
                             viewer_bytes: env.viewer.to_be_bytes(),
-                            cached,
-                            gens,
                         });
                     }
                     ListFilter::Tag(tag_name) => {
-                        let gens = count_cache::snapshot();
-                        let cached = count_cache::get_tag(tag_name.as_ref());
                         planned.push(PlannedJob::ListTag {
                             tag_name: tag_name.as_ref(),
                             limit_bytes: lim.to_be_bytes(),
                             offset_bytes: off.to_be_bytes(),
                             viewer_bytes: env.viewer.to_be_bytes(),
-                            cached,
-                            gens,
                         });
                     }
                     ListFilter::Author(author_name) => {
@@ -174,18 +148,16 @@ pub fn execute_read_batch(
                 pipeline.bind_exec_binary("s_uemail", &[email.as_bytes()]);
                 q2env.push(env_idx);
             }
-            PlannedJob::ListGlobal { limit_bytes, offset_bytes, viewer_bytes, cached, .. } => {
-                let stmt = if cached.is_some() { "s_global_nc" } else { "s_global" };
+            PlannedJob::ListGlobal { limit_bytes, offset_bytes, viewer_bytes } => {
                 pipeline.bind_exec_binary(
-                    stmt,
+                    "s_global",
                     &[limit_bytes.as_slice(), offset_bytes.as_slice(), viewer_bytes.as_slice()],
                 );
                 q2env.push(env_idx);
             }
-            PlannedJob::ListTag { tag_name, limit_bytes, offset_bytes, viewer_bytes, cached, .. } => {
-                let stmt = if cached.is_some() { "s_tag_list_nc" } else { "s_tag_list" };
+            PlannedJob::ListTag { tag_name, limit_bytes, offset_bytes, viewer_bytes } => {
                 pipeline.bind_exec_binary(
-                    stmt,
+                    "s_tag_list",
                     &[tag_name.as_bytes(), limit_bytes.as_slice(), offset_bytes.as_slice(), viewer_bytes.as_slice()],
                 );
                 q2env.push(env_idx);
@@ -204,7 +176,7 @@ pub fn execute_read_batch(
                 );
                 q2env.push(env_idx);
             }
-            PlannedJob::TagsCached(_) | PlannedJob::Skip => {}
+            PlannedJob::Skip => {}
         }
     }
 
@@ -251,16 +223,6 @@ pub fn execute_read_batch(
     let mut outcomes: Vec<QueryOutcome> = Vec::with_capacity(envelopes.len());
     for _ in 0..envelopes.len() {
         outcomes.push(QueryOutcome::Empty);
-    }
-
-    for (env_idx, job) in planned.iter().enumerate() {
-        match job {
-            PlannedJob::ListGlobal { cached: Some(c), .. }
-            | PlannedJob::ListTag { cached: Some(c), .. } => {
-                outcomes[env_idx] = QueryOutcome::ArticlesList { count: *c, articles: Vec::new() };
-            }
-            _ => {}
-        }
     }
 
     let exec_res = pipeline.execute(|q_idx, row| {
@@ -450,7 +412,7 @@ pub fn execute_read_batch(
                 }
             }
 
-            PlannedJob::TagsCached(_) | PlannedJob::Skip => {}
+            PlannedJob::Skip => {}
         }
     });
 
@@ -463,39 +425,16 @@ pub fn execute_read_batch(
         return Err(e);
     }
 
-    for (env_idx, job) in planned.iter().enumerate() {
-        match job {
-            PlannedJob::ListGlobal { cached: None, gens, .. } => {
-                if let QueryOutcome::ArticlesList { count, .. } = outcomes[env_idx] {
-                    count_cache::put_global(count, gens);
-                }
-            }
-            PlannedJob::ListTag { tag_name, cached: None, gens, .. } => {
-                if let QueryOutcome::ArticlesList { count, .. } = outcomes[env_idx] {
-                    count_cache::put_tag(tag_name, count, gens);
-                }
-            }
-            _ => {}
-        }
-    }
-
     // Render responses for envelopes
     let mut body_buf = Vec::with_capacity(16384);
 
     for (idx, env) in envelopes.iter().enumerate() {
         body_buf.clear();
 
-        if let PlannedJob::TagsCached(body) = &planned[idx] {
-            let resp = frame_response(200, "OK", body, env.keepalive);
-            replies.push(Reply { conn: env.conn, bytes: resp, close: !env.keepalive });
-            continue;
-        }
-
         match &mut outcomes[idx] {
             QueryOutcome::Tags(tags) => {
                 let refs: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
                 render_tags(&mut body_buf, &refs);
-                count_cache::put_tags_body(&body_buf, &batch_gens);
                 let resp = frame_response(200, "OK", &body_buf, env.keepalive);
                 replies.push(Reply { conn: env.conn, bytes: resp, close: !env.keepalive });
             }

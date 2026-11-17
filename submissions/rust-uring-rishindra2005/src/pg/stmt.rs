@@ -134,38 +134,6 @@ pub const PREPARED_STATEMENTS: &[StmtDef] = &[
         oids: &[OID_TEXT, OID_INT8, OID_INT8, OID_INT8],
     },
 
-    // 7nc. Global articles list without count (cached count)
-    StmtDef {
-        name: "s_global_nc",
-        sql: "SELECT 1::int8, NULL, a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, \
-                     a.author_id, u.username, u.bio, u.image, \
-                     ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at WHERE at.article_id = a.id ORDER BY 1), \
-                     (SELECT count(*) FROM favorites fa WHERE fa.article_id = a.id), \
-                     EXISTS (SELECT 1 FROM favorites fa WHERE fa.user_id = $3 AND fa.article_id = a.id), \
-                     EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $3 AND fo.followee_id = a.author_id) \
-              FROM (SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, a.author_id \
-                    FROM articles a ORDER BY a.id DESC LIMIT $1 OFFSET $2) a \
-              LEFT JOIN LATERAL (SELECT u.username, u.bio, u.image FROM users u WHERE u.id = a.author_id LIMIT 1) u ON true \
-              ORDER BY 1 ASC, 3 DESC NULLS LAST",
-        oids: &[OID_INT8, OID_INT8, OID_INT8],
-    },
-
-    // 8nc. Tag articles list without count (cached count)
-    StmtDef {
-        name: "s_tag_list_nc",
-        sql: "SELECT 1::int8, NULL, a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, \
-                     a.author_id, u.username, u.bio, u.image, \
-                     ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at WHERE at.article_id = a.id ORDER BY 1), \
-                     (SELECT count(*) FROM favorites fa WHERE fa.article_id = a.id), \
-                     EXISTS (SELECT 1 FROM favorites fa WHERE fa.user_id = $4 AND fa.article_id = a.id), \
-                     EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $4 AND fo.followee_id = a.author_id) \
-              FROM (SELECT at.article_id FROM article_tags at WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = $1) ORDER BY at.article_id DESC LIMIT $2 OFFSET $3) x \
-              JOIN articles a ON a.id = x.article_id \
-              LEFT JOIN LATERAL (SELECT u.username, u.bio, u.image FROM users u WHERE u.id = a.author_id LIMIT 1) u ON true \
-              ORDER BY 1 ASC, 3 DESC NULLS LAST",
-        oids: &[OID_TEXT, OID_INT8, OID_INT8, OID_INT8],
-    },
-
     // 9. Author articles list
     StmtDef {
         name: "s_author_list",
