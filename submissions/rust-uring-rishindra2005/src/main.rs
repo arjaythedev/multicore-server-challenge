@@ -40,7 +40,7 @@ fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(default_pg_threads);
 
-    let default_kdf_threads = (num_cpus / 2).max(1);
+    let default_kdf_threads = 1;
     let kdf_threads: usize = env::var("KDF_THREADS")
         .ok()
         .and_then(|k| k.parse().ok())
@@ -58,6 +58,7 @@ fn main() {
         "Booting rust-uring-rishindra2005: port={}, net_threads={} (default={}), pg_threads={} (default={}), kdf_threads={} (default={}), direct_sz={}, allowed_cpus={}, db={}",
         port, net_threads, default_net_threads, pg_threads, default_pg_threads, kdf_threads, default_kdf_threads, direct_sz, num_cpus, db_url
     );
+    println!("KDF batch window: {} ms", rust_uring_rishindra2005::sec::kdf_worker::get_batch_window().as_millis());
 
     let stop_signal = Arc::new(AtomicBool::new(false));
 

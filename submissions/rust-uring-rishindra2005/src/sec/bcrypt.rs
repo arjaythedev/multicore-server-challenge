@@ -671,4 +671,70 @@ mod tests {
             assert_eq!(dec23, Some(rand23));
         }
     }
+
+    #[test]
+    #[ignore]
+    fn bench_lanes() {
+        let pw = b"password123";
+        let salt = [0x5au8; 16];
+        let pws4 = [pw as &[u8]; 4];
+        let salts4 = [salt; 4];
+        let pws6 = [pw as &[u8]; 6];
+        let salts6 = [salt; 6];
+        let cost = 10;
+        let p_scale = 3.29 / 5.16;
+
+        println!("=== Bcrypt Lane Microbenchmark (Cost 10) ===");
+
+        // Warmup
+        let _ = bcrypt_1x(pw, &salt, cost);
+        let _ = bcrypt_4x(&pws4, &salts4, cost);
+        let _ = bcrypt_6x(&pws6, &salts6, cost);
+
+        let mut times_1x = Vec::new();
+        let mut times_4x = Vec::new();
+        let mut times_6x = Vec::new();
+
+        for run in 1..=5 {
+            // 1. bcrypt_1x x 4 hashes
+            let t0 = std::time::Instant::now();
+            for _ in 0..4 {
+                std::hint::black_box(bcrypt_1x(pw, &salt, cost));
+            }
+            let el_1x = t0.elapsed();
+            let ms_per_hash_1x = el_1x.as_secs_f64() * 1000.0 / 4.0;
+            times_1x.push(ms_per_hash_1x);
+
+            // 2. bcrypt_4x x 1 call (4 hashes)
+            let t1 = std::time::Instant::now();
+            std::hint::black_box(bcrypt_4x(&pws4, &salts4, cost));
+            let el_4x = t1.elapsed();
+            let ms_per_hash_4x = el_4x.as_secs_f64() * 1000.0 / 4.0;
+            times_4x.push(ms_per_hash_4x);
+
+            // 3. bcrypt_6x x 1 call (6 hashes)
+            let t2 = std::time::Instant::now();
+            std::hint::black_box(bcrypt_6x(&pws6, &salts6, cost));
+            let el_6x = t2.elapsed();
+            let ms_per_hash_6x = el_6x.as_secs_f64() * 1000.0 / 6.0;
+            times_6x.push(ms_per_hash_6x);
+
+            println!(
+                "Run {}: 1x = {:.2} ms/hash (P-est: {:.2} ms) | 4x = {:.2} ms/hash (P-est: {:.2} ms) | 6x = {:.2} ms/hash (P-est: {:.2} ms)",
+                run,
+                ms_per_hash_1x, ms_per_hash_1x * p_scale,
+                ms_per_hash_4x, ms_per_hash_4x * p_scale,
+                ms_per_hash_6x, ms_per_hash_6x * p_scale
+            );
+        }
+
+        let avg_1x: f64 = times_1x.iter().sum::<f64>() / 5.0;
+        let avg_4x: f64 = times_4x.iter().sum::<f64>() / 5.0;
+        let avg_6x: f64 = times_6x.iter().sum::<f64>() / 5.0;
+
+        println!("--- Average over 5 runs ---");
+        println!("bcrypt_1x (4 calls): {:.2} ms/hash (E-core), {:.2} ms/hash (P-core estimate)", avg_1x, avg_1x * p_scale);
+        println!("bcrypt_4x (1 call):  {:.2} ms/hash (E-core), {:.2} ms/hash (P-core estimate)", avg_4x, avg_4x * p_scale);
+        println!("bcrypt_6x (1 call):  {:.2} ms/hash (E-core), {:.2} ms/hash (P-core estimate)", avg_6x, avg_6x * p_scale);
+    }
 }

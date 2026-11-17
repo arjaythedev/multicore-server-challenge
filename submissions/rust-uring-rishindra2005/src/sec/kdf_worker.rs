@@ -1,10 +1,11 @@
 //! Bcrypt KDF background worker thread implementation.
 //! Runs at SCHED_BATCH / nice 5 priority to ensure fast login turnarounds without starving Postgres or IO.
-//! Batches verify jobs up to 6-wide (SIMD AVX) as soon as jobs are available, with ZERO artificial hold delay.
+//! Batches verify jobs up to 6-wide (SIMD AVX) with an adaptive collection window (KDF_BATCH_WINDOW_MS).
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::rt::spsc::SpscQueue;
 use crate::rt::thread::{is_pin_enabled, spawn_worker, wait_eventfd, SchedPolicy};
@@ -12,16 +13,25 @@ use crate::sec::bcrypt::{bcrypt_hash, bcrypt_verify_batch, VerifyItem};
 use crate::sec::jwt::jwt_sign;
 use crate::types::{Envelope, Job, KdfJob, Reply};
 
+/// Counter of verification batches executed (used in tests).
+pub static BATCHES: AtomicU64 = AtomicU64::new(0);
+
+/// Helper to read the batching collection window from env `KDF_BATCH_WINDOW_MS` (default 120ms).
+pub fn get_batch_window() -> Duration {
+    let ms: u64 = std::env::var("KDF_BATCH_WINDOW_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120);
+    Duration::from_millis(ms)
+}
+
 /// Computes the default number of KDF worker threads.
-/// Controlled via env `KDF_THREADS`, defaulting to `(allowed_cpus / 2).max(1)` per R3/R7.
+/// Controlled via env `KDF_THREADS`, defaulting to 1 per T34.
 pub fn get_default_kdf_threads() -> usize {
     std::env::var("KDF_THREADS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| {
-            let allowed = crate::rt::thread::get_allowed_cpus();
-            (allowed.len() / 2).max(1)
-        })
+        .unwrap_or(1)
 }
 
 /// Spawns a single KDF worker thread with a specified worker index.
@@ -90,44 +100,84 @@ pub fn spawn_kdf_worker_indexed(
                     }
                 }
 
+                let wake_fd = kdf_queues.first().map(|q| q.event_fd).unwrap_or(-1);
+
                 // 2. Drain incoming jobs from all assigned input queues
-                let mut found_any = false;
-                for q in &kdf_queues {
-                    while let Some(job) = q.pop() {
-                        found_any = true;
-                        match job {
-                            KdfJob::Hash { password, mut then } => {
-                                // Password hashing (signup/update): cost 10 and forward to PG
-                                let hash_str = bcrypt_hash(&password, 10);
-                                match &mut then.job {
-                                    Job::Register { password_hash, .. } => {
-                                        *password_hash = hash_str.into_boxed_str();
-                                    }
-                                    Job::UserUpdate { password_hash, .. } => {
-                                        *password_hash = Some(hash_str.into_boxed_str());
-                                    }
-                                    _ => {}
-                                }
-                                // Forward to the pg driver for this connection via kdf's own SPSC queue
-                                let pg_idx = then.conn.slot as usize % pg_queues.len().max(1);
-                                if let Some(pg_q) = pg_queues.get(pg_idx) {
-                                    if overflow_pg.is_empty() {
-                                        if let Err(env) = pg_q.push(then) {
-                                            overflow_pg.push_back((pg_idx, env));
+                let drain_queues = |pending_verifies: &mut Vec<KdfJob>,
+                                    overflow_pg: &mut VecDeque<(usize, Envelope)>| -> bool {
+                    let mut found = false;
+                    for q in &kdf_queues {
+                        while let Some(job) = q.pop() {
+                            found = true;
+                            match job {
+                                KdfJob::Hash { password, mut then } => {
+                                    // Password hashing (signup/update): cost 10 and forward to PG
+                                    let hash_str = bcrypt_hash(&password, 10);
+                                    match &mut then.job {
+                                        Job::Register { password_hash, .. } => {
+                                            *password_hash = hash_str.into_boxed_str();
                                         }
-                                    } else {
-                                        overflow_pg.push_back((pg_idx, then));
+                                        Job::UserUpdate { password_hash, .. } => {
+                                            *password_hash = Some(hash_str.into_boxed_str());
+                                        }
+                                        _ => {}
+                                    }
+                                    let pg_idx = then.conn.slot as usize % pg_queues.len().max(1);
+                                    if let Some(pg_q) = pg_queues.get(pg_idx) {
+                                        if overflow_pg.is_empty() {
+                                            if let Err(env) = pg_q.push(then) {
+                                                overflow_pg.push_back((pg_idx, env));
+                                            }
+                                        } else {
+                                            overflow_pg.push_back((pg_idx, then));
+                                        }
                                     }
                                 }
+                                verify_job @ KdfJob::Verify { .. } => {
+                                    pending_verifies.push(verify_job);
+                                }
                             }
-                            verify_job @ KdfJob::Verify { .. } => {
-                                pending_verifies.push(verify_job);
+                        }
+                    }
+                    found
+                };
+
+                let mut found_any = drain_queues(&mut pending_verifies, &mut overflow_pg);
+
+                // 3. Collection window: when 1..5 pending verify jobs, wait up to WINDOW for 6 jobs
+                if !pending_verifies.is_empty() && pending_verifies.len() < FULL_BATCH {
+                    let window = get_batch_window();
+                    let deadline = Instant::now() + window;
+
+                    while pending_verifies.len() < FULL_BATCH && !stop_signal.load(Ordering::Relaxed) {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            break;
+                        }
+                        let remaining = deadline.saturating_duration_since(now);
+                        let remaining_ms = (remaining.as_millis() as i32).max(1);
+
+                        if wake_fd >= 0 {
+                            for q in &kdf_queues {
+                                q.mark_sleeping();
                             }
+                            if kdf_queues.iter().all(|q| q.is_empty()) {
+                                wait_eventfd(wake_fd, remaining_ms);
+                            }
+                            for q in &kdf_queues {
+                                q.mark_awake();
+                            }
+                        } else {
+                            wait_eventfd(-1, remaining_ms.min(2));
+                        }
+
+                        if drain_queues(&mut pending_verifies, &mut overflow_pg) {
+                            found_any = true;
                         }
                     }
                 }
 
-                // 3. Process pending verifies IMMEDIATELY (ZERO hold delay; batch what's queued)
+                // 4. Process pending verifies using the best kernel for the count
                 while !pending_verifies.is_empty() {
                     let batch_size = pending_verifies.len().min(FULL_BATCH);
                     let batch: Vec<KdfJob> = pending_verifies.drain(..batch_size).collect();
@@ -143,7 +193,22 @@ pub fn spawn_kdf_worker_indexed(
                         }
                     }
 
-                    let results = bcrypt_verify_batch(&items);
+                    let real_len = items.len();
+                    if real_len == 2 || real_len == 3 {
+                        // 2..3 -> 4x: pad with dummy duplicate of items[0] so 4-lane kernel is used in 1 call
+                        let (pw, sh) = (items[0].password, items[0].stored_hash);
+                        while items.len() < 4 {
+                            items.push(VerifyItem { password: pw, stored_hash: sh });
+                        }
+                    } else if real_len == 5 {
+                        // 5 -> 6x with dummy lane: pad to 6 so 6-lane kernel is used in 1 call
+                        let (pw, sh) = (items[0].password, items[0].stored_hash);
+                        items.push(VerifyItem { password: pw, stored_hash: sh });
+                    }
+
+                    BATCHES.fetch_add(1, Ordering::Relaxed);
+                    let mut results = bcrypt_verify_batch(&items);
+                    results.truncate(real_len);
 
                     // Send replies
                     for (job, ok) in batch.into_iter().zip(results) {
@@ -199,10 +264,9 @@ pub fn spawn_kdf_worker_indexed(
                     }
                 }
 
-                // 4. Sleep or yield
+                // 5. Sleep or yield
                 let has_overflow = !overflow_pg.is_empty() || !overflow_replies.is_empty();
                 if !found_any && !has_overflow {
-                    let wake_fd = kdf_queues.first().map(|q| q.event_fd).unwrap_or(-1);
                     if wake_fd >= 0 {
                         for q in &kdf_queues {
                             q.mark_sleeping();
@@ -481,6 +545,155 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(!hashed_str.is_empty(), "Hashed envelope must be forwarded to PG queue");
+
+        stop.store(true, Ordering::Relaxed);
+        handle.join().expect("join");
+    }
+
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_kdf_worker_batch_6_jobs_one_batch() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let efd = crate::rt::thread::create_eventfd().unwrap_or(-1);
+        let in_q = Arc::new(SpscQueue::<KdfJob, 512>::new(efd));
+        let reply_q = Arc::new(SpscQueue::<Reply, 512>::new(-1));
+        let pg_q = Arc::new(SpscQueue::<Envelope, 1024>::new(-1));
+
+        let batch_start = BATCHES.load(Ordering::SeqCst);
+
+        let handle = spawn_kdf_worker_indexed(
+            80,
+            vec![in_q.clone()],
+            vec![reply_q.clone()],
+            vec![pg_q.clone()],
+            stop.clone(),
+        );
+
+        let conn = ConnRef { reactor: 0, slot: 20, gen: 1 };
+        // 3 correct passwords, 3 wrong passwords
+        let pws = ["right1", "right2", "right3", "wrong4", "wrong5", "wrong6"];
+        let hashes = [
+            bcrypt_hash("right1", 4),
+            bcrypt_hash("right2", 4),
+            bcrypt_hash("right3", 4),
+            bcrypt_hash("actual4", 4), // pw "wrong4" will be false (401)
+            bcrypt_hash("actual5", 4), // pw "wrong5" will be false (401)
+            bcrypt_hash("actual6", 4), // pw "wrong6" will be false (401)
+        ];
+
+        let submit_start = Instant::now();
+        for i in 0..6 {
+            in_q.push(KdfJob::Verify {
+                env_conn: conn,
+                keepalive: true,
+                user_id: (i + 1) as i64,
+                username: format!("u{}", i).into_boxed_str(),
+                email: format!("u{}@example.com", i).into_boxed_str(),
+                bio: None,
+                image: None,
+                password: pws[i].to_string().into_boxed_str(),
+                stored_hash: hashes[i].clone().into_boxed_str(),
+            }).expect("push job");
+        }
+        let submit_elapsed = submit_start.elapsed();
+        assert!(submit_elapsed < Duration::from_millis(5), "Submit must be within 5 ms");
+
+        let mut received = Vec::new();
+        let start = Instant::now();
+        while received.len() < 6 && start.elapsed() < Duration::from_secs(5) {
+            if let Some(reply) = reply_q.pop() {
+                let body = String::from_utf8(reply.bytes).expect("utf8");
+                received.push(body);
+            } else {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        assert_eq!(received.len(), 6, "Must receive all 6 replies");
+
+        // 3 right passwords must return 200 OK, 3 wrong passwords must return 401
+        for i in 0..3 {
+            assert!(received[i].starts_with("HTTP/1.1 200 OK"), "Job {} should be 200 OK: {}", i, received[i]);
+        }
+        for i in 3..6 {
+            assert!(received[i].starts_with("HTTP/1.1 401 Unauthorized"), "Job {} should be 401: {}", i, received[i]);
+        }
+
+        let batches_run = BATCHES.load(Ordering::SeqCst) - batch_start;
+        assert_eq!(batches_run, 1, "Expected 6 verify jobs to complete in ONE batch, got {}", batches_run);
+
+        stop.store(true, Ordering::Relaxed);
+        handle.join().expect("join");
+    }
+
+    #[test]
+    fn test_kdf_worker_single_job_waits_window() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("KDF_BATCH_WINDOW_MS", "30");
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let efd = crate::rt::thread::create_eventfd().unwrap_or(-1);
+        let in_q = Arc::new(SpscQueue::<KdfJob, 512>::new(efd));
+        let reply_q = Arc::new(SpscQueue::<Reply, 512>::new(-1));
+        let pg_q = Arc::new(SpscQueue::<Envelope, 1024>::new(-1));
+
+        let handle = spawn_kdf_worker_indexed(
+            81,
+            vec![in_q.clone()],
+            vec![reply_q.clone()],
+            vec![pg_q.clone()],
+            stop.clone(),
+        );
+
+        let conn = ConnRef { reactor: 0, slot: 21, gen: 1 };
+        let pw = "lonely_user";
+        let hash = bcrypt_hash(pw, 4);
+
+        let t0 = Instant::now();
+        in_q.push(KdfJob::Verify {
+            env_conn: conn,
+            keepalive: true,
+            user_id: 42,
+            username: "lonely".to_string().into_boxed_str(),
+            email: "lonely@example.com".to_string().into_boxed_str(),
+            bio: None,
+            image: None,
+            password: pw.to_string().into_boxed_str(),
+            stored_hash: hash.into_boxed_str(),
+        }).expect("push single job");
+
+        let mut got_reply = false;
+        let mut elapsed = Duration::ZERO;
+        while t0.elapsed() < Duration::from_millis(1000) {
+            if let Some(reply) = reply_q.pop() {
+                elapsed = t0.elapsed();
+                let body = String::from_utf8(reply.bytes).expect("utf8");
+                assert!(body.starts_with("HTTP/1.1 200 OK"));
+                got_reply = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        assert!(got_reply, "Single job must complete");
+        assert!(
+            elapsed >= Duration::from_millis(30),
+            "Job completed in {:?}, must be >= WINDOW (30 ms)",
+            elapsed
+        );
+        assert!(
+            elapsed < Duration::from_millis(230),
+            "Job completed in {:?}, must be < WINDOW + 200 ms (230 ms)",
+            elapsed
+        );
+
+        unsafe {
+            std::env::set_var("KDF_BATCH_WINDOW_MS", "120");
+        }
 
         stop.store(true, Ordering::Relaxed);
         handle.join().expect("join");
