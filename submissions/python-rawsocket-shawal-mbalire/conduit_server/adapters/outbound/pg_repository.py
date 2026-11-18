@@ -10,6 +10,7 @@ at connect time, and rows come back in binary format, decoded by one reused psyc
 a few µs and yields the same values.
 """
 
+import os
 import re
 import threading
 import psycopg
@@ -19,6 +20,7 @@ from psycopg import pq
 from psycopg.adapt import Transformer
 from typing import Optional, List
 
+from conduit_server.domain.errors import DuplicateError
 from conduit_server.domain.services import slugify
 from conduit_server.ports.outbound import ArticleRepositoryPort
 
@@ -152,10 +154,15 @@ _FAVORITED_SQL = (
     False,
     False,
 )
+# The feed's count: one index scan over all the followees (`= ANY`, PostgreSQL 17+) instead of one per followee
+# under a nested loop: the same rows, ~20% less time (each index entry passes through fewer executor nodes).
+_FEED_COUNT = (
+    "SELECT count(*) AS n FROM (SELECT 1 FROM articles a3"
+    " WHERE a3.author_id = ANY (ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = {viewer}))"
+    " ORDER BY a3.author_id DESC, a3.id ASC LIMIT 1000) s"
+)
 _FEED_SQL = (
-    "SELECT count(*) AS n FROM (SELECT 1 FROM follows fo CROSS JOIN LATERAL"
-    " (SELECT 1 FROM articles a3 WHERE a3.author_id = fo.followee_id"
-    " ORDER BY a3.author_id DESC, a3.id ASC LIMIT 1000) a WHERE fo.follower_id = $1 LIMIT 1000) s",
+    _FEED_COUNT.format(viewer="$1"),
     f"SELECT {_PAGE_COLS} FROM (SELECT * FROM (SELECT x.id FROM follows fo CROSS JOIN LATERAL"
     " (SELECT a3.id FROM articles a3 WHERE a3.author_id = fo.followee_id ORDER BY a3.id DESC"
     " LIMIT ($2::int + $3::int)) x WHERE fo.follower_id = $1 ORDER BY x.id DESC LIMIT 100 OFFSET $3::int) b"
@@ -407,16 +414,13 @@ _LIST_FEED_BATCH = _Stmt(
     " JOIN users u ON u.id = a.author_id WHERE a.id = d.id LIMIT 1) a)"
     f"{_pages_json(_w_article_json(False, 'true'))}"
     " SELECT v.ord, json_build_object('articles', COALESCE(j.a, '[]'), 'articlesCount',"
-    " (SELECT count(*) FROM (SELECT 1 FROM follows fo CROSS JOIN LATERAL"
-    " (SELECT 1 FROM articles a3 WHERE a3.author_id = fo.followee_id"
-    " ORDER BY a3.author_id DESC, a3.id ASC LIMIT 1000) a WHERE fo.follower_id = v.viewer LIMIT 1000) s))"
+    f" ({_FEED_COUNT.format(viewer='v.viewer')}))"
     " FROM v LEFT JOIN j ON j.ord = v.ord ORDER BY v.ord"
 )
 def _keyed_list_batch(count_sql: str, page_sql: str) -> _Stmt:
     """A list filtered by a key ($2, the tag or username; $3 limit, $4 offset): the count once per distinct key in the
     unit, each request's page as the single statement's, the article data once for the union of the pages. Used for
-    author lists (the workload opens the authors of the newest articles); tag and favorited units measured slower
-    than singles (keys rarely repeat in a unit, and building `w` costs more than it shares)."""
+    author, tag and favorited lists."""
     count = count_sql.replace("$2", "d.key")
     page = page_sql.replace("$2", "v.key").replace("$3::int", "v.lim").replace("$4::int", "v.off")
     return _Stmt(
@@ -435,6 +439,8 @@ def _keyed_list_batch(count_sql: str, page_sql: str) -> _Stmt:
 
 
 _LIST_AUTHOR_BATCH = _keyed_list_batch(*_AUTHOR_SQL[:2])
+_LIST_TAG_BATCH = _keyed_list_batch(*_TAG_SQL[:2])
+_LIST_FAVORITED_BATCH = _keyed_list_batch(*_FAVORITED_SQL[:2])
 
 
 _ARTICLE_BY_SLUG_BATCH = _Stmt(
@@ -507,12 +513,14 @@ BATCHED = {
     _ARTICLE_BY_SLUG_JSON.index: Batched(_ARTICLE_BY_SLUG_BATCH, _viewer_text_params, 2),
     _COMMENTS_BY_SLUG_JSON.index: Batched(_COMMENTS_BY_SLUG_BATCH, _viewer_text_params, 4),
 }
+# Tag and favorited lists, batched since 2026-10-31: on fresh copies of the seed at 50,000 test users, Postgres 109
+# against 114 µs/request (mean of 6 and 8 runs). On the drifted conduit_full they had measured slower than singles.
+# BATCH_KEYED=0 runs them as singles (A/B).
+if os.getenv("BATCH_KEYED", "1") != "0":
+    BATCHED[_LIST_TAG_JSON.index] = Batched(_LIST_TAG_BATCH, _keyed_list_params, 2)
+    BATCHED[_LIST_FAVORITED_JSON.index] = Batched(_LIST_FAVORITED_BATCH, _keyed_list_params, 2)
 # Statements without parameters whose one result every request in the unit shares
 SHARED = frozenset({_TAGS_JSON.index})
-
-
-class DuplicateError(Exception):
-    pass
 
 
 def configure_connection(conn: psycopg.Connection) -> None:

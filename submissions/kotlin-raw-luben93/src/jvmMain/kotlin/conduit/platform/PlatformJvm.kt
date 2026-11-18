@@ -33,6 +33,12 @@ actual fun secureRandomBytes(dst: ByteArray) = random.nextBytes(dst)
 
 actual fun getenv(name: String): String? = System.getenv(name)
 
+actual fun readTextFile(path: String): String? = try {
+    java.nio.file.Files.readString(java.nio.file.Path.of(path))
+} catch (_: Exception) {
+    null
+}
+
 actual fun cpuCount(): Int = Runtime.getRuntime().availableProcessors()
 
 /** Our own threads carry their [Scratch] (and FFM errno capture) in fields: no ThreadLocal lookup on hot paths. */

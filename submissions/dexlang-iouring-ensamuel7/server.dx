@@ -1,0 +1,1559 @@
+import "http"
+import "db"
+import "json"
+import "crypto"
+import "str"
+import "time"
+import "os"
+import "num"
+import "queries"
+import "github.com/ensamuel7/dex-modules/dexqu" as "q"
+
+let conn: int = -1
+let jwtSecret: string = ""
+
+let stTags: int = -1
+let stInsertUser: int = -1
+let stLogin: int = -1
+let stUserById: int = -1
+let stUpdateUser: int = -1
+let stProfile: int = -1
+let stUserByName: int = -1
+let stFollow: int = -1
+let stUnfollow: int = -1
+let stListAll: int = -1
+let stListTag: int = -1
+let stListAuthor: int = -1
+let stListFavorited: int = -1
+let stListFeed: int = -1
+let stArticleBySlug: int = -1
+let stArticleById: int = -1
+let stInsertArticle: int = -1
+let stInsertTags: int = -1
+let stInsertArticleTags: int = -1
+let stOwnArticle: int = -1
+let stUpdateArticle: int = -1
+let stDeleteArticle: int = -1
+let stArticleId: int = -1
+let stFavorite: int = -1
+let stUnfavorite: int = -1
+let stComments: int = -1
+let stInsertComment: int = -1
+let stCommentAuthor: int = -1
+let stDeleteComment: int = -1
+
+const JWT_HEADER: string = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+const TOKEN_TTL: long = 2592000
+
+struct Profile {
+    username: string
+    bio: string?
+    image: string?
+    following: bool
+}
+
+struct User {
+    email: string
+    token: string
+    username: string
+    bio: string?
+    image: string?
+}
+
+struct ArticleItem {
+    slug: string
+    title: string
+    description: string
+    tagList: string[]
+    createdAt: string
+    updatedAt: string
+    favorited: bool
+    favoritesCount: long
+    author: Profile
+}
+
+struct Article {
+    slug: string
+    title: string
+    description: string
+    body: string
+    tagList: string[]
+    createdAt: string
+    updatedAt: string
+    favorited: bool
+    favoritesCount: long
+    author: Profile
+}
+
+struct Comment {
+    id: long
+    createdAt: string
+    updatedAt: string
+    body: string
+    author: Profile
+}
+
+struct UserEnvelope {
+    user: User
+}
+
+struct ProfileEnvelope {
+    profile: Profile
+}
+
+struct ArticleEnvelope {
+    article: Article
+}
+
+struct ArticleList {
+    articles: ArticleItem[]
+    articlesCount: long
+}
+
+struct CommentEnvelope {
+    comment: Comment
+}
+
+struct CommentList {
+    comments: Comment[]
+}
+
+struct TagList {
+    tags: string[]
+}
+
+struct ErrorBody {
+    body: string[]
+}
+
+struct ErrorEnvelope {
+    errors: ErrorBody
+}
+
+struct Viewer {
+    id: long
+    token: string
+    present: bool
+}
+
+fn fail(status: int, message: string): http.HttpResponse {
+    return http.response(status, json.encode(ErrorEnvelope { errors: ErrorBody { body: [message] } }), "application/json")
+}
+
+fn ok(status: int, body: string): http.HttpResponse {
+    return http.response(status, body, "application/json")
+}
+
+fn internal(): http.HttpResponse {
+    return fail(500, "internal error")
+}
+
+fn hexValue(c: char): int {
+    if (c >= '0' && c <= '9') {
+        return num.toInt(c) - 48
+    }
+    if (c >= 'a' && c <= 'f') {
+        return num.toInt(c) - 87
+    }
+    if (c >= 'A' && c <= 'F') {
+        return num.toInt(c) - 55
+    }
+    return -1
+}
+
+fn urlDecode(s: string, plusIsSpace: bool): string {
+    if (!s.contains("%") && !(plusIsSpace && s.contains("+"))) {
+        return s
+    }
+    let sb = StringBuilder()
+    let n: int = s.len()
+    let i: int = 0
+    while (i < n) {
+        let c: char = s.charAt(i)
+        if (c == '%' && i + 2 < n) {
+            let hi: int = hexValue(s.charAt(i + 1))
+            let lo: int = hexValue(s.charAt(i + 2))
+            if (hi >= 0 && lo >= 0) {
+                sb.append(num.toChar(hi * 16 + lo))
+                i = i + 3
+                continue
+            }
+        }
+        if (c == '+' && plusIsSpace) {
+            sb.append(' ')
+        } else {
+            sb.append(c)
+        }
+        i = i + 1
+    }
+    return sb.toString()
+}
+
+struct Query {
+    keys: string[]
+    values: string[]
+}
+
+fn parseQuery(raw: string): Query {
+    let q: Query = Query { keys: [], values: [] }
+    if (raw.isEmpty()) {
+        return q
+    }
+    let pairs: string[] = raw.split("&")
+    for (let i: int = 0; i < pairs.len(); i = i + 1) {
+        let p: string = pairs[i]
+        if (p.isEmpty()) {
+            continue
+        }
+        let eq: int = p.indexOf("=")
+        if (eq < 0) {
+            q.keys.push(urlDecode(p, true))
+            q.values.push("")
+        } else {
+            q.keys.push(urlDecode(p.substring(0, eq), true))
+            q.values.push(urlDecode(p.substring(eq + 1, p.len()), true))
+        }
+    }
+    return q
+}
+
+fn queryIndex(q: Query, key: string): int {
+    for (let i: int = 0; i < q.keys.len(); i = i + 1) {
+        if (q.keys[i] == key) {
+            return i
+        }
+    }
+    return -1
+}
+
+fn queryGet(q: Query, key: string): string {
+    let i: int = queryIndex(q, key)
+    if (i < 0) {
+        return ""
+    }
+    return q.values[i]
+}
+
+fn parseUint(s: string): long {
+    if (!s.isDigit() || s.len() > 18) {
+        return -1
+    }
+    return str.toLong(s)
+}
+
+struct Page {
+    limit: long
+    offset: long
+    valid: bool
+}
+
+fn readPage(q: Query): Page {
+    let page: Page = Page { limit: 20, offset: 0, valid: true }
+    let li: int = queryIndex(q, "limit")
+    if (li >= 0) {
+        let n: long = parseUint(q.values[li])
+        if (n < 1 || n > 100) {
+            page.valid = false
+            return page
+        }
+        page.limit = n
+    }
+    let oi: int = queryIndex(q, "offset")
+    if (oi >= 0) {
+        let n: long = parseUint(q.values[oi])
+        if (n < 0) {
+            page.valid = false
+            return page
+        }
+        page.offset = n
+    }
+    return page
+}
+
+fn base64Url(s: string): string {
+    return crypto.base64Encode(s).replace("+", "-").replace("/", "_").replace("=", "")
+}
+
+fn issueToken(id: long): string {
+    let now: long = time.unixNow()
+    let payload: string = base64Url("{\"sub\":\"${id}\",\"iat\":${now},\"exp\":${now + TOKEN_TTL}}")
+    let signing: string = "${JWT_HEADER}.${payload}"
+    return "${signing}.${crypto.hmacSha256B64Url(jwtSecret, signing)}"
+}
+
+fn verifyToken(token: string): long {
+    let parts: string[] = token.split(".")
+    if (parts.len() != 3) {
+        return 0
+    }
+    if (parts[0] != JWT_HEADER) {
+        let hdr: json.Value = json.decode(crypto.base64UrlDecode(parts[0]))
+        if (!hdr.isObject() || !hdr["alg"].isString() || hdr["alg"].asString() != "HS256") {
+            return 0
+        }
+    }
+    if (!crypto.secureEquals(crypto.hmacSha256B64Url(jwtSecret, "${parts[0]}.${parts[1]}"), parts[2])) {
+        return 0
+    }
+    let payload: json.Value = json.decode(crypto.base64UrlDecode(parts[1]))
+    if (!payload.isObject() || !payload["exp"].isNumber() || payload["exp"].asLong() <= time.unixNow()) {
+        return 0
+    }
+    let sub: json.Value = payload["sub"]
+    if (!sub.isString()) {
+        return 0
+    }
+    let id: long = parseUint(sub.asString())
+    if (id <= 0) {
+        return 0
+    }
+    return id
+}
+
+fn viewerOf(req: http.HttpRequest): Viewer {
+    let header: string = req.headers.get("authorization")
+    if (header.isEmpty()) {
+        return Viewer { id: 0, token: "", present: false }
+    }
+    if (!header.startsWith("Token ")) {
+        return Viewer { id: 0, token: "", present: true }
+    }
+    let token: string = header.substring(6, header.len())
+    return Viewer { id: verifyToken(token), token: token, present: true }
+}
+
+fn timestamp(raw: string): string {
+    if (raw.len() < 19) {
+        return raw
+    }
+    let sb = StringBuilder()
+    sb.append(raw.substring(0, 10))
+    sb.append('T')
+    sb.append(raw.substring(11, 19))
+    sb.append('.')
+    let digits: int = 0
+    if (raw.len() > 19 && raw.charAt(19) == '.') {
+        let i: int = 20
+        while (i < raw.len() && digits < 3) {
+            let c: char = raw.charAt(i)
+            if (c < '0' || c > '9') {
+                break
+            }
+            sb.append(c)
+            digits = digits + 1
+            i = i + 1
+        }
+    }
+    while (digits < 3) {
+        sb.append('0')
+        digits = digits + 1
+    }
+    sb.append('Z')
+    return sb.toString()
+}
+
+fn parseTextArray(raw: string): string[] {
+    let out: string[] = []
+    let n: int = raw.len()
+    if (n < 2 || raw == "{}") {
+        return out
+    }
+    let i: int = 1
+    while (i < n - 1) {
+        let sb = StringBuilder()
+        if (raw.charAt(i) == '"') {
+            i = i + 1
+            while (i < n - 1 && raw.charAt(i) != '"') {
+                if (raw.charAt(i) == '\\' && i + 1 < n - 1) {
+                    i = i + 1
+                }
+                sb.append(raw.charAt(i))
+                i = i + 1
+            }
+            i = i + 1
+        } else {
+            while (i < n - 1 && raw.charAt(i) != ',') {
+                sb.append(raw.charAt(i))
+                i = i + 1
+            }
+        }
+        out.push(sb.toString())
+        i = i + 1
+    }
+    return out
+}
+
+fn textArrayLiteral(items: string[]): string {
+    let sb = StringBuilder()
+    sb.append('{')
+    for (let i: int = 0; i < items.len(); i = i + 1) {
+        if (i > 0) {
+            sb.append(',')
+        }
+        sb.append('"')
+        let s: string = items[i]
+        for (let j: int = 0; j < s.len(); j = j + 1) {
+            let c: char = s.charAt(j)
+            if (c == '"' || c == '\\') {
+                sb.append('\\')
+            }
+            sb.append(c)
+        }
+        sb.append('"')
+    }
+    sb.append('}')
+    return sb.toString()
+}
+
+fn optStr(st: int, col: int): string? {
+    if (db.isNull(st, col)) {
+        return null
+    }
+    let s: string = db.col(st, col)
+    return s
+}
+
+fn colStr(st: int, col: int): string {
+    let s: string = db.col(st, col)
+    return s
+}
+
+fn colLong(st: int, col: int): long {
+    let n: long = db.col(st, col)
+    return n
+}
+
+fn colBool(st: int, col: int): bool {
+    let s: string = db.col(st, col)
+    return s == "t"
+}
+
+fn readListItem(st: int, b: int): ArticleItem {
+    return ArticleItem {
+        slug: colStr(st, b + 2),
+        title: colStr(st, b + 3),
+        description: colStr(st, b + 4),
+        tagList: parseTextArray(colStr(st, b + 7)),
+        createdAt: timestamp(colStr(st, b + 5)),
+        updatedAt: timestamp(colStr(st, b + 6)),
+        favorited: colBool(st, b + 9),
+        favoritesCount: colLong(st, b + 8),
+        author: Profile { username: colStr(st, b + 10), bio: optStr(st, b + 11), image: optStr(st, b + 12), following: colBool(st, b + 13) }
+    }
+}
+
+fn readFullArticle(st: int, b: int): Article {
+    return Article {
+        slug: colStr(st, b + 1),
+        title: colStr(st, b + 2),
+        description: colStr(st, b + 3),
+        body: colStr(st, b + 4),
+        tagList: parseTextArray(colStr(st, b + 7)),
+        createdAt: timestamp(colStr(st, b + 5)),
+        updatedAt: timestamp(colStr(st, b + 6)),
+        favorited: colBool(st, b + 9),
+        favoritesCount: colLong(st, b + 8),
+        author: Profile { username: colStr(st, b + 10), bio: optStr(st, b + 11), image: optStr(st, b + 12), following: colBool(st, b + 13) }
+    }
+}
+
+fn readComment(st: int, b: int): Comment {
+    return Comment {
+        id: colLong(st, b + 1),
+        createdAt: timestamp(colStr(st, b + 3)),
+        updatedAt: timestamp(colStr(st, b + 4)),
+        body: colStr(st, b + 2),
+        author: Profile { username: colStr(st, b + 5), bio: optStr(st, b + 6), image: optStr(st, b + 7), following: colBool(st, b + 8) }
+    }
+}
+
+fn readProfile(st: int, b: int): Profile {
+    return Profile { username: colStr(st, b + 1), bio: optStr(st, b + 2), image: optStr(st, b + 3), following: colBool(st, b + 4) }
+}
+
+fn readUser(st: int, token: string): User {
+    return readUserAt(st, 0, token)
+}
+
+fn readUserAt(st: int, b: int, token: string): User {
+    return User { email: colStr(st, b + 2), token: token, username: colStr(st, b + 1), bio: optStr(st, b + 3), image: optStr(st, b + 4) }
+}
+
+struct Fields {
+    obj: json.Value
+    valid: bool
+}
+
+fn wrapper(body: string, key: string): Fields {
+    let top: json.Value = json.decode(body)
+    if (!top.isObject() || !top.has(key)) {
+        return Fields { obj: top, valid: false }
+    }
+    let inner: json.Value = top[key]
+    return Fields { obj: inner, valid: inner.isObject() }
+}
+
+fn requiredString(obj: json.Value, key: string): string {
+    let v: json.Value = obj[key]
+    if (!v.isString()) {
+        return ""
+    }
+    return v.asString()
+}
+
+struct OptField {
+    value: string
+    present: bool
+    valid: bool
+}
+
+fn optionalString(obj: json.Value, key: string, nonEmpty: bool): OptField {
+    let v: json.Value = obj[key]
+    if (v.isNull()) {
+        return OptField { value: "", present: false, valid: true }
+    }
+    if (!v.isString()) {
+        return OptField { value: "", present: false, valid: false }
+    }
+    let s: string = v.asString()
+    if (nonEmpty && s.isEmpty()) {
+        return OptField { value: "", present: false, valid: false }
+    }
+    return OptField { value: s, present: true, valid: true }
+}
+
+let preparedSt: int[] = []
+let preparedQ: q.Query[] = []
+
+fn slotsOf(st: int, name: string): int[] {
+    for (let i: int = 0; i < preparedSt.len(); i = i + 1) {
+        if (preparedSt[i] == st) {
+            return preparedQ[i].slots(name)
+        }
+    }
+    let none: int[] = []
+    return none
+}
+
+fn bindL(st: int, name: string, v: long): void {
+    foreach (slotsOf(st, name) as at) {
+        db.bindLong(st, at, v)
+    }
+}
+
+fn bindS(st: int, name: string, v: string): void {
+    foreach (slotsOf(st, name) as at) {
+        db.bindStr(st, at, v)
+    }
+}
+
+fn bindOpt(st: int, name: string, f: OptField): void {
+    foreach (slotsOf(st, name) as at) {
+        if (f.present) {
+            db.bindStr(st, at, f.value)
+        } else {
+            db.bindNull(st, at)
+        }
+    }
+}
+
+const K_TAGS: int = 0
+const K_USER: int = 1
+const K_PROFILE: int = 2
+const K_ARTICLE: int = 3
+const K_COMMENTS: int = 4
+const K_ALL: int = 5
+const K_TAG: int = 6
+const K_AUTHOR: int = 7
+const K_FAVORITED: int = 8
+const K_FEED: int = 9
+const KINDS: int = 10
+
+struct Held {
+    ticket: int
+    kind: int
+    viewer: long
+    limit: long
+    offset: long
+    key: string
+    token: string
+}
+
+let held: Held[] = []
+let batchSt: int[] = []
+
+fn hold(kind: int, viewer: long, limit: long, offset: long, key: string, token: string): bool {
+    let t: int = http.hold()
+    if (t < 0) {
+        return false
+    }
+    held.push(Held { ticket: t, kind: kind, viewer: viewer, limit: limit, offset: offset, key: key, token: token })
+    return true
+}
+
+fn errorBody(message: string): string {
+    return json.encode(ErrorEnvelope { errors: ErrorBody { body: [message] } })
+}
+
+fn replyAll(picked: Held[], status: int, body: string): void {
+    for (let i: int = 0; i < picked.len(); i = i + 1) {
+        http.reply(picked[i].ticket, status, body, "")
+    }
+}
+
+fn bindBatch(st: int, picked: Held[]): void {
+    let ids = StringBuilder()
+    let viewers = StringBuilder()
+    let limits = StringBuilder()
+    let offsets = StringBuilder()
+    let keys: string[] = []
+    ids.append('{')
+    viewers.append('{')
+    limits.append('{')
+    offsets.append('{')
+    for (let i: int = 0; i < picked.len(); i = i + 1) {
+        if (i > 0) {
+            ids.append(',')
+            viewers.append(',')
+            limits.append(',')
+            offsets.append(',')
+        }
+        let h: Held = picked[i]
+        ids.append("${i}")
+        viewers.append("${h.viewer}")
+        limits.append("${h.limit}")
+        offsets.append("${h.offset}")
+        keys.push(h.key)
+    }
+    ids.append('}')
+    viewers.append('}')
+    limits.append('}')
+    offsets.append('}')
+    bindS(st, "ids", ids.toString())
+    bindS(st, "viewers", viewers.toString())
+    bindS(st, "limits", limits.toString())
+    bindS(st, "offsets", offsets.toString())
+    bindS(st, "keys", textArrayLiteral(keys))
+}
+
+fn emptyBodies(n: int): string[] {
+    let bodies: string[] = []
+    for (let i: int = 0; i < n; i = i + 1) {
+        bodies.push("")
+    }
+    return bodies
+}
+
+fn replyBodies(picked: Held[], bodies: string[], failed: bool, missingStatus: int, missing: string): void {
+    for (let i: int = 0; i < picked.len(); i = i + 1) {
+        let t: int = picked[i].ticket
+        if (failed) {
+            http.reply(t, 500, errorBody("internal error"), "")
+        } else if (bodies[i].isEmpty()) {
+            http.reply(t, missingStatus, errorBody(missing), "")
+        } else {
+            http.reply(t, 200, bodies[i], "")
+        }
+    }
+}
+
+fn runTags(picked: Held[], st: int): void {
+    let names: string[] = []
+    while (db.step(st)) {
+        names.push(colStr(st, 0))
+    }
+    let failed: bool = db.errorCode() != ""
+    db.reset(st)
+    if (failed) {
+        replyAll(picked, 500, errorBody("internal error"))
+        return
+    }
+    replyAll(picked, 200, json.encode(TagList { tags: names }))
+}
+
+fn runSingle(kind: int, picked: Held[], st: int): void {
+    let bodies: string[] = emptyBodies(picked.len())
+    while (db.step(st)) {
+        let i: int = db.col(st, 0)
+        if (i < 0 || i >= picked.len()) {
+            continue
+        }
+        if (kind == K_USER) {
+            bodies[i] = json.encode(UserEnvelope { user: readUserAt(st, 1, picked[i].token) })
+        } else if (kind == K_PROFILE) {
+            bodies[i] = json.encode(ProfileEnvelope { profile: readProfile(st, 1) })
+        } else {
+            bodies[i] = json.encode(ArticleEnvelope { article: readFullArticle(st, 1) })
+        }
+    }
+    let failed: bool = db.errorCode() != ""
+    db.reset(st)
+    if (kind == K_USER) {
+        replyBodies(picked, bodies, failed, 401, "unauthorized")
+    } else if (kind == K_PROFILE) {
+        replyBodies(picked, bodies, failed, 404, "profile not found")
+    } else {
+        replyBodies(picked, bodies, failed, 404, "article not found")
+    }
+}
+
+fn runComments(picked: Held[], st: int): void {
+    let bodies: string[] = emptyBodies(picked.len())
+    let cur: int = -1
+    let comments: Comment[] = []
+    while (db.step(st)) {
+        let i: int = db.col(st, 0)
+        if (i < 0 || i >= picked.len()) {
+            continue
+        }
+        if (i != cur) {
+            if (cur >= 0) {
+                bodies[cur] = json.encode(CommentList { comments: comments })
+            }
+            cur = i
+            let fresh: Comment[] = []
+            comments = fresh
+        }
+        if (!db.isNull(st, 2)) {
+            comments.push(readComment(st, 1))
+        }
+    }
+    if (cur >= 0) {
+        bodies[cur] = json.encode(CommentList { comments: comments })
+    }
+    let failed: bool = db.errorCode() != ""
+    db.reset(st)
+    replyBodies(picked, bodies, failed, 404, "article not found")
+}
+
+fn runList(picked: Held[], st: int): void {
+    let bodies: string[] = emptyBodies(picked.len())
+    let cur: int = -1
+    let total: long = 0
+    let items: ArticleItem[] = []
+    while (db.step(st)) {
+        let i: int = db.col(st, 0)
+        if (i < 0 || i >= picked.len()) {
+            continue
+        }
+        if (i != cur) {
+            if (cur >= 0) {
+                bodies[cur] = json.encode(ArticleList { articles: items, articlesCount: total })
+            }
+            cur = i
+            let fresh: ArticleItem[] = []
+            items = fresh
+        }
+        total = colLong(st, 1)
+        if (!db.isNull(st, 2)) {
+            items.push(readListItem(st, 1))
+        }
+    }
+    if (cur >= 0) {
+        bodies[cur] = json.encode(ArticleList { articles: items, articlesCount: total })
+    }
+    let failed: bool = db.errorCode() != ""
+    db.reset(st)
+    replyBodies(picked, bodies, failed, 500, "internal error")
+}
+
+fn pick(batch: Held[], kind: int): Held[] {
+    let picked: Held[] = []
+    for (let i: int = 0; i < batch.len(); i = i + 1) {
+        if (batch[i].kind == kind) {
+            picked.push(batch[i])
+        }
+    }
+    return picked
+}
+
+fn flushBatch(): bool {
+    if (held.len() == 0) {
+        return true
+    }
+    let batch: Held[] = held
+    let none: Held[] = []
+    held = none
+    for (let kind: int = 0; kind < KINDS; kind = kind + 1) {
+        let picked: Held[] = pick(batch, kind)
+        if (picked.len() == 0) {
+            continue
+        }
+        let st: int = batchSt[kind]
+        db.reset(st)
+        if (kind != K_TAGS) {
+            bindBatch(st, picked)
+        }
+        if (kind == K_TAGS) {
+            runTags(picked, st)
+        } else if (kind == K_COMMENTS) {
+            runComments(picked, st)
+        } else if (kind >= K_ALL) {
+            runList(picked, st)
+        } else {
+            runSingle(kind, picked, st)
+        }
+    }
+    return true
+}
+
+fn articleResponse(status: int, st: int): http.HttpResponse {
+    let a: Article = readFullArticle(st, 0)
+    db.reset(st)
+    return ok(status, json.encode(ArticleEnvelope { article: a }))
+}
+
+fn fullArticleById(status: int, viewer: long, id: long): http.HttpResponse {
+    db.reset(stArticleById)
+    bindL(stArticleById, "viewer", viewer)
+    bindL(stArticleById, "id", id)
+    if (!db.step(stArticleById)) {
+        let failed: bool = db.errorCode() != ""
+        db.reset(stArticleById)
+        if (failed) {
+            return internal()
+        }
+        return fail(404, "article not found")
+    }
+    return articleResponse(status, stArticleById)
+}
+
+fn register(req: http.HttpRequest): http.HttpResponse {
+    let f: Fields = wrapper(req.body, "user")
+    if (!f.valid) {
+        return fail(422, "invalid body")
+    }
+    let username: string = requiredString(f.obj, "username")
+    let email: string = requiredString(f.obj, "email")
+    let pw: string = requiredString(f.obj, "password")
+    if (username.isEmpty() || email.isEmpty() || pw.isEmpty()) {
+        return fail(422, "username, email and password are required")
+    }
+    if (pw.len() > 72) {
+        return fail(422, "password is too long")
+    }
+    let hash: string = crypto.bcryptHash(pw, 10)
+    if (hash.isEmpty()) {
+        return fail(422, "password cannot be hashed")
+    }
+    db.reset(stInsertUser)
+    bindS(stInsertUser, "username", username)
+    bindS(stInsertUser, "email", email)
+    bindS(stInsertUser, "hash", hash)
+    if (!db.step(stInsertUser)) {
+        let code: string = db.errorCode()
+        db.reset(stInsertUser)
+        if (code == "23505") {
+            return fail(422, "username or email is already taken")
+        }
+        return internal()
+    }
+    let id: long = colLong(stInsertUser, 0)
+    let u: User = readUser(stInsertUser, issueToken(id))
+    db.reset(stInsertUser)
+    return ok(201, json.encode(UserEnvelope { user: u }))
+}
+
+fn login(req: http.HttpRequest): http.HttpResponse {
+    let f: Fields = wrapper(req.body, "user")
+    if (!f.valid) {
+        return fail(422, "invalid body")
+    }
+    let email: string = requiredString(f.obj, "email")
+    let password: string = requiredString(f.obj, "password")
+    if (email.isEmpty() || password.isEmpty()) {
+        return fail(422, "email and password are required")
+    }
+    db.reset(stLogin)
+    bindS(stLogin, "email", email)
+    if (!db.step(stLogin)) {
+        let failed: bool = db.errorCode() != ""
+        db.reset(stLogin)
+        if (failed) {
+            return internal()
+        }
+        return fail(401, "invalid email or password")
+    }
+    let hash: string = colStr(stLogin, 5)
+    let id: long = colLong(stLogin, 0)
+    let u: User = readUser(stLogin, "")
+    db.reset(stLogin)
+    if (!crypto.bcryptVerify(password, hash)) {
+        return fail(401, "invalid email or password")
+    }
+    u.token = issueToken(id)
+    return ok(200, json.encode(UserEnvelope { user: u }))
+}
+
+fn currentUser(req: http.HttpRequest): http.HttpResponse {
+    let v: Viewer = viewerOf(req)
+    if (v.id == 0) {
+        return fail(401, "unauthorized")
+    }
+    if (hold(K_USER, v.id, 0, 0, "", v.token)) {
+        return internal()
+    }
+    db.reset(stUserById)
+    bindL(stUserById, "viewer", v.id)
+    if (!db.step(stUserById)) {
+        let failed: bool = db.errorCode() != ""
+        db.reset(stUserById)
+        if (failed) {
+            return internal()
+        }
+        return fail(401, "unauthorized")
+    }
+    let u: User = readUser(stUserById, v.token)
+    db.reset(stUserById)
+    return ok(200, json.encode(UserEnvelope { user: u }))
+}
+
+fn updateUser(req: http.HttpRequest): http.HttpResponse {
+    let v: Viewer = viewerOf(req)
+    if (v.id == 0) {
+        return fail(401, "unauthorized")
+    }
+    let f: Fields = wrapper(req.body, "user")
+    if (!f.valid) {
+        return fail(422, "invalid body")
+    }
+    let email: OptField = optionalString(f.obj, "email", true)
+    let username: OptField = optionalString(f.obj, "username", true)
+    let password: OptField = optionalString(f.obj, "password", true)
+    let bio: OptField = optionalString(f.obj, "bio", false)
+    let image: OptField = optionalString(f.obj, "image", false)
+    if (!email.valid || !username.valid || !password.valid || !bio.valid || !image.valid) {
+        return fail(422, "invalid user fields")
+    }
+    let hash: OptField = OptField { value: "", present: false, valid: true }
+    if (password.present) {
+        let pw: string = password.value
+        if (pw.len() > 72) {
+            return fail(422, "password is too long")
+        }
+        let h: string = crypto.bcryptHash(pw, 10)
+        if (h.isEmpty()) {
+            return fail(422, "password cannot be hashed")
+        }
+        hash = OptField { value: h, present: true, valid: true }
+    }
+    db.reset(stUpdateUser)
+    bindL(stUpdateUser, "id", v.id)
+    bindOpt(stUpdateUser, "email", email)
+    bindOpt(stUpdateUser, "username", username)
+    bindOpt(stUpdateUser, "hash", hash)
+    bindOpt(stUpdateUser, "bio", bio)
+    bindOpt(stUpdateUser, "image", image)
+    if (!db.step(stUpdateUser)) {
+        let code: string = db.errorCode()
+        db.reset(stUpdateUser)
+        if (code == "23505") {
+            return fail(422, "username or email is already taken")
+        }
+        if (code != "") {
+            return internal()
+        }
+        return fail(401, "unauthorized")
+    }
+    let u: User = readUser(stUpdateUser, v.token)
+    db.reset(stUpdateUser)
+    return ok(200, json.encode(UserEnvelope { user: u }))
+}
+
+fn getProfile(req: http.HttpRequest): http.HttpResponse {
+    let v: Viewer = viewerOf(req)
+    if (v.present && v.id == 0) {
+        return fail(401, "unauthorized")
+    }
+    let username: string = urlDecode(req.params.get("username"), false)
+    if (hold(K_PROFILE, v.id, 0, 0, username, "")) {
+        return internal()
+    }
+    db.reset(stProfile)
+    bindL(stProfile, "viewer", v.id)
+    bindS(stProfile, "key", username)
+    if (!db.step(stProfile)) {
+        let failed: bool = db.errorCode() != ""
+        db.reset(stProfile)
+        if (failed) {
+            return internal()
+        }
+        return fail(404, "profile not found")
+    }
+    let p: Profile = readProfile(stProfile, 0)
+    db.reset(stProfile)
+    return ok(200, json.encode(ProfileEnvelope { profile: p }))
+}
+
+fn followChange(req: http.HttpRequest, follow: bool): http.HttpResponse {
+    let v: Viewer = viewerOf(req)
+    if (v.id == 0) {
+        return fail(401, "unauthorized")
+    }
+    db.reset(stUserByName)
+    bindS(stUserByName, "username", urlDecode(req.params.get("username"), false))
+    if (!db.step(stUserByName)) {
+        let failed: bool = db.errorCode() != ""
+        db.reset(stUserByName)
+        if (failed) {
+            return internal()
+        }
+        return fail(404, "profile not found")
+    }
+    let id: long = colLong(stUserByName, 0)
+    let p: Profile = Profile { username: colStr(stUserByName, 1), bio: optStr(stUserByName, 2), image: optStr(stUserByName, 3), following: follow }
+    db.reset(stUserByName)
+    let st: int = stUnfollow
+    if (follow) {
+        st = stFollow
+    }
+    db.reset(st)
+    bindL(st, "follower", v.id)
+    bindL(st, "followee", id)
+    db.step(st)
+    let failed: bool = db.errorCode() != ""
+    db.reset(st)
+    if (failed) {
+        return internal()
+    }
+    return ok(200, json.encode(ProfileEnvelope { profile: p }))
+}
+
+fn follow(req: http.HttpRequest): http.HttpResponse {
+    return followChange(req, true)
+}
+
+fn unfollow(req: http.HttpRequest): http.HttpResponse {
+    return followChange(req, false)
+}
+
+fn writeList(list: int, viewer: long, page: Page, filter: string): http.HttpResponse {
+    db.reset(list)
+    bindL(list, "viewer", viewer)
+    bindL(list, "limit", page.limit)
+    bindL(list, "offset", page.offset)
+    if (!filter.isEmpty()) {
+        bindS(list, "key", filter)
+    }
+    let items: ArticleItem[] = []
+    let total: long = 0
+    while (db.step(list)) {
+        total = colLong(list, 0)
+        if (!db.isNull(list, 1)) {
+            items.push(readListItem(list, 0))
+        }
+    }
+    let failed: bool = db.errorCode() != ""
+    db.reset(list)
+    if (failed) {
+        return internal()
+    }
+    return ok(200, json.encode(ArticleList { articles: items, articlesCount: total }))
+}
+
+fn listOrHold(kind: int, list: int, viewer: long, page: Page, filter: string): http.HttpResponse {
+    if (hold(kind, viewer, page.limit, page.offset, filter, "")) {
+        return internal()
+    }
+    return writeList(list, viewer, page, filter)
+}
+
+fn listArticles(req: http.HttpRequest): http.HttpResponse {
+    let v: Viewer = viewerOf(req)
+    if (v.present && v.id == 0) {
+        return fail(401, "unauthorized")
+    }
+    let q: Query = parseQuery(req.query)
+    let page: Page = readPage(q)
+    if (!page.valid) {
+        return fail(422, "limit must be 1-100 and offset >= 0")
+    }
+    let tag: string = queryGet(q, "tag")
+    if (!tag.isEmpty()) {
+        return listOrHold(K_TAG, stListTag, v.id, page, tag)
+    }
+    let author: string = queryGet(q, "author")
+    if (!author.isEmpty()) {
+        return listOrHold(K_AUTHOR, stListAuthor, v.id, page, author)
+    }
+    let favorited: string = queryGet(q, "favorited")
+    if (!favorited.isEmpty()) {
+        return listOrHold(K_FAVORITED, stListFavorited, v.id, page, favorited)
+    }
+    return listOrHold(K_ALL, stListAll, v.id, page, "")
+}
+
+fn feed(req: http.HttpRequest): http.HttpResponse {
+    let v: Viewer = viewerOf(req)
+    if (v.id == 0) {
+        return fail(401, "unauthorized")
+    }
+    let page: Page = readPage(parseQuery(req.query))
+    if (!page.valid) {
+        return fail(422, "limit must be 1-100 and offset >= 0")
+    }
+    return listOrHold(K_FEED, stListFeed, v.id, page, "")
+}
+
+fn getArticle(req: http.HttpRequest): http.HttpResponse {
+    let v: Viewer = viewerOf(req)
+    if (v.present && v.id == 0) {
+        return fail(401, "unauthorized")
+    }
+    let slug: string = urlDecode(req.params.get("slug"), false)
+    if (hold(K_ARTICLE, v.id, 0, 0, slug, "")) {
+        return internal()
+    }
+    db.reset(stArticleBySlug)
+    bindL(stArticleBySlug, "viewer", v.id)
+    bindS(stArticleBySlug, "key", slug)
+    if (!db.step(stArticleBySlug)) {
+        let failed: bool = db.errorCode() != ""
+        db.reset(stArticleBySlug)
+        if (failed) {
+            return internal()
+        }
+        return fail(404, "article not found")
+    }
+    return articleResponse(200, stArticleBySlug)
+}
+
+fn rollback(): http.HttpResponse {
+    db.exec(conn, "ROLLBACK")
+    return internal()
+}
+
+fn runStep(st: int): bool {
+    let ran: bool = db.step(st)
+    let failed: bool = db.errorCode() != ""
+    db.reset(st)
+    return ran || !failed
+}
+
+fn createArticle(req: http.HttpRequest): http.HttpResponse {
+    let v: Viewer = viewerOf(req)
+    if (v.id == 0) {
+        return fail(401, "unauthorized")
+    }
+    let f: Fields = wrapper(req.body, "article")
+    if (!f.valid) {
+        return fail(422, "invalid body")
+    }
+    let title: string = requiredString(f.obj, "title")
+    let description: string = requiredString(f.obj, "description")
+    let body: string = requiredString(f.obj, "body")
+    if (title.isEmpty() || description.isEmpty() || body.isEmpty()) {
+        return fail(422, "title, description and body are required")
+    }
+    let tags: string[] = []
+    let rawTags: json.Value = f.obj["tagList"]
+    if (!rawTags.isNull()) {
+        if (!rawTags.isArray()) {
+            return fail(422, "tagList must be an array of non-empty strings")
+        }
+        for (let i: int = 0; i < rawTags.len(); i = i + 1) {
+            let t: json.Value = rawTags[i]
+            if (!t.isString() || t.asString().isEmpty()) {
+                return fail(422, "tagList must be an array of non-empty strings")
+            }
+            tags.push(t.asString())
+        }
+    }
+    if (db.exec(conn, "BEGIN") < 0) {
+        return internal()
+    }
+    db.reset(stInsertArticle)
+    bindL(stInsertArticle, "author", v.id)
+    bindS(stInsertArticle, "title", title)
+    bindS(stInsertArticle, "description", description)
+    bindS(stInsertArticle, "body", body)
+    if (!db.step(stInsertArticle)) {
+        db.reset(stInsertArticle)
+        return rollback()
+    }
+    let id: long = colLong(stInsertArticle, 0)
+    db.reset(stInsertArticle)
+    if (tags.len() > 0) {
+        let literal: string = textArrayLiteral(tags)
+        db.reset(stInsertTags)
+        bindS(stInsertTags, "names", literal)
+        if (!runStep(stInsertTags)) {
+            return rollback()
+        }
+        db.reset(stInsertArticleTags)
+        bindL(stInsertArticleTags, "article", id)
+        bindS(stInsertArticleTags, "names", literal)
+        if (!runStep(stInsertArticleTags)) {
+            return rollback()
+        }
+    }
+    if (db.exec(conn, "COMMIT") < 0) {
+        return rollback()
+    }
+    return fullArticleById(201, v.id, id)
+}
+
+struct Owned {
+    id: long
+    status: int
+}
+
+fn ownArticle(slug: string, viewer: long): Owned {
+    db.reset(stOwnArticle)
+    bindS(stOwnArticle, "slug", slug)
+    if (!db.step(stOwnArticle)) {
+        let failed: bool = db.errorCode() != ""
+        db.reset(stOwnArticle)
+        if (failed) {
+            return Owned { id: 0, status: 500 }
+        }
+        return Owned { id: 0, status: 404 }
+    }
+    let id: long = colLong(stOwnArticle, 0)
+    let author: long = colLong(stOwnArticle, 1)
+    db.reset(stOwnArticle)
+    if (author != viewer) {
+        return Owned { id: id, status: 403 }
+    }
+    return Owned { id: id, status: 200 }
+}
+
+fn ownedFailure(o: Owned): http.HttpResponse {
+    if (o.status == 404) {
+        return fail(404, "article not found")
+    }
+    if (o.status == 403) {
+        return fail(403, "not the author")
+    }
+    return internal()
+}
+
+fn updateArticle(req: http.HttpRequest): http.HttpResponse {
+    let v: Viewer = viewerOf(req)
+    if (v.id == 0) {
+        return fail(401, "unauthorized")
+    }
+    let f: Fields = wrapper(req.body, "article")
+    if (!f.valid) {
+        return fail(422, "invalid body")
+    }
+    let title: OptField = optionalString(f.obj, "title", true)
+    let description: OptField = optionalString(f.obj, "description", true)
+    let body: OptField = optionalString(f.obj, "body", true)
+    if (!title.valid || !description.valid || !body.valid) {
+        return fail(422, "title, description and body must be non-empty strings")
+    }
+    let o: Owned = ownArticle(urlDecode(req.params.get("slug"), false), v.id)
+    if (o.status != 200) {
+        return ownedFailure(o)
+    }
+    db.reset(stUpdateArticle)
+    bindL(stUpdateArticle, "id", o.id)
+    bindOpt(stUpdateArticle, "title", title)
+    bindOpt(stUpdateArticle, "description", description)
+    bindOpt(stUpdateArticle, "body", body)
+    if (!runStep(stUpdateArticle)) {
+        return internal()
+    }
+    return fullArticleById(200, v.id, o.id)
+}
+
+fn deleteArticle(req: http.HttpRequest): http.HttpResponse {
+    let v: Viewer = viewerOf(req)
+    if (v.id == 0) {
+        return fail(401, "unauthorized")
+    }
+    let o: Owned = ownArticle(urlDecode(req.params.get("slug"), false), v.id)
+    if (o.status != 200) {
+        return ownedFailure(o)
+    }
+    db.reset(stDeleteArticle)
+    bindL(stDeleteArticle, "id", o.id)
+    if (!runStep(stDeleteArticle)) {
+        return internal()
+    }
+    return http.response(204, "", "application/json")
+}
+
+fn articleIdBySlug(slug: string): long {
+    db.reset(stArticleId)
+    bindS(stArticleId, "slug", slug)
+    if (!db.step(stArticleId)) {
+        let failed: bool = db.errorCode() != ""
+        db.reset(stArticleId)
+        if (failed) {
+            return -1
+        }
+        return 0
+    }
+    let id: long = colLong(stArticleId, 0)
+    db.reset(stArticleId)
+    return id
+}
+
+fn favoriteChange(req: http.HttpRequest, fav: bool): http.HttpResponse {
+    let v: Viewer = viewerOf(req)
+    if (v.id == 0) {
+        return fail(401, "unauthorized")
+    }
+    let id: long = articleIdBySlug(urlDecode(req.params.get("slug"), false))
+    if (id < 0) {
+        return internal()
+    }
+    if (id == 0) {
+        return fail(404, "article not found")
+    }
+    let st: int = stUnfavorite
+    if (fav) {
+        st = stFavorite
+    }
+    db.reset(st)
+    bindL(st, "user", v.id)
+    bindL(st, "article", id)
+    if (!runStep(st)) {
+        return internal()
+    }
+    return fullArticleById(200, v.id, id)
+}
+
+fn favorite(req: http.HttpRequest): http.HttpResponse {
+    return favoriteChange(req, true)
+}
+
+fn unfavorite(req: http.HttpRequest): http.HttpResponse {
+    return favoriteChange(req, false)
+}
+
+fn listComments(req: http.HttpRequest): http.HttpResponse {
+    let v: Viewer = viewerOf(req)
+    if (v.present && v.id == 0) {
+        return fail(401, "unauthorized")
+    }
+    let slug: string = urlDecode(req.params.get("slug"), false)
+    if (hold(K_COMMENTS, v.id, 0, 0, slug, "")) {
+        return internal()
+    }
+    db.reset(stComments)
+    bindL(stComments, "viewer", v.id)
+    bindS(stComments, "key", slug)
+    let found: bool = false
+    let comments: Comment[] = []
+    while (db.step(stComments)) {
+        found = true
+        if (!db.isNull(stComments, 1)) {
+            comments.push(readComment(stComments, 0))
+        }
+    }
+    let failed: bool = db.errorCode() != ""
+    db.reset(stComments)
+    if (failed) {
+        return internal()
+    }
+    if (!found) {
+        return fail(404, "article not found")
+    }
+    return ok(200, json.encode(CommentList { comments: comments }))
+}
+
+fn createComment(req: http.HttpRequest): http.HttpResponse {
+    let v: Viewer = viewerOf(req)
+    if (v.id == 0) {
+        return fail(401, "unauthorized")
+    }
+    let f: Fields = wrapper(req.body, "comment")
+    if (!f.valid) {
+        return fail(422, "invalid body")
+    }
+    let body: string = requiredString(f.obj, "body")
+    if (body.isEmpty()) {
+        return fail(422, "body is required")
+    }
+    let id: long = articleIdBySlug(urlDecode(req.params.get("slug"), false))
+    if (id < 0) {
+        return internal()
+    }
+    if (id == 0) {
+        return fail(404, "article not found")
+    }
+    db.reset(stInsertComment)
+    bindL(stInsertComment, "article", id)
+    bindL(stInsertComment, "author", v.id)
+    bindS(stInsertComment, "body", body)
+    if (!db.step(stInsertComment)) {
+        db.reset(stInsertComment)
+        return internal()
+    }
+    let c: Comment = Comment {
+        id: colLong(stInsertComment, 0),
+        createdAt: timestamp(colStr(stInsertComment, 2)),
+        updatedAt: timestamp(colStr(stInsertComment, 3)),
+        body: colStr(stInsertComment, 1),
+        author: Profile { username: colStr(stInsertComment, 4), bio: optStr(stInsertComment, 5), image: optStr(stInsertComment, 6), following: false }
+    }
+    db.reset(stInsertComment)
+    return ok(201, json.encode(CommentEnvelope { comment: c }))
+}
+
+fn deleteComment(req: http.HttpRequest): http.HttpResponse {
+    let v: Viewer = viewerOf(req)
+    if (v.id == 0) {
+        return fail(401, "unauthorized")
+    }
+    let id: long = parseUint(req.params.get("id"))
+    if (id < 0) {
+        return fail(404, "comment not found")
+    }
+    db.reset(stCommentAuthor)
+    bindL(stCommentAuthor, "id", id)
+    bindS(stCommentAuthor, "slug", urlDecode(req.params.get("slug"), false))
+    if (!db.step(stCommentAuthor)) {
+        let failed: bool = db.errorCode() != ""
+        db.reset(stCommentAuthor)
+        if (failed) {
+            return internal()
+        }
+        return fail(404, "comment not found")
+    }
+    let author: long = colLong(stCommentAuthor, 0)
+    db.reset(stCommentAuthor)
+    if (author != v.id) {
+        return fail(403, "not the author")
+    }
+    db.reset(stDeleteComment)
+    bindL(stDeleteComment, "id", id)
+    if (!runStep(stDeleteComment)) {
+        return internal()
+    }
+    return http.response(204, "", "application/json")
+}
+
+fn tags(req: http.HttpRequest): http.HttpResponse {
+    if (hold(K_TAGS, 0, 0, 0, "", "")) {
+        return internal()
+    }
+    db.reset(stTags)
+    let names: string[] = []
+    while (db.step(stTags)) {
+        names.push(colStr(stTags, 0))
+    }
+    let failed: bool = db.errorCode() != ""
+    db.reset(stTags)
+    if (failed) {
+        return internal()
+    }
+    return ok(200, json.encode(TagList { tags: names }))
+}
+
+fn notFound(req: http.HttpRequest): http.HttpResponse {
+    return fail(404, "not found")
+}
+
+fn prepare(query: q.Query): int {
+    let st: int = db.prepare(conn, query.sql)
+    if (st < 0) {
+        os.exit(1)
+    }
+    preparedSt.push(st)
+    preparedQ.push(query)
+    return st
+}
+
+fn sessionDsn(url: string): string {
+    let options: string = "sslmode=disable&options=-c%20TimeZone%3DUTC%20-c%20DateStyle%3DISO%20-c%20jit%3Doff%20-c%20plan_cache_mode%3Dforce_generic_plan"
+    if (url.contains("?")) {
+        return "${url}&${options}"
+    }
+    return "${url}?${options}"
+}
+
+fn main(): void {
+    jwtSecret = os.env("JWT_SECRET")
+    let dsn: string = os.env("DATABASE_URL")
+    if (jwtSecret.isEmpty() || dsn.isEmpty()) {
+        os.exit(1)
+    }
+    let host: string = os.env("HOST")
+    if (host.isEmpty()) {
+        host = "127.0.0.1"
+    }
+    let port: int = 3000
+    if (!os.env("PORT").isEmpty()) {
+        port = str.toInt(os.env("PORT"))
+    }
+    let workers: int = 0
+    if (!os.env("WORKERS").isEmpty()) {
+        workers = str.toInt(os.env("WORKERS"))
+    }
+
+    http.fork(workers)
+
+    conn = db.openSingleThreaded("postgres", sessionDsn(dsn))
+    if (conn < 0) {
+        os.exit(1)
+    }
+    try {
+        stTags = prepare(queries.tags())
+        stInsertUser = prepare(queries.insertUser())
+        stLogin = prepare(queries.login())
+        stUserById = prepare(queries.userById())
+        stUpdateUser = prepare(queries.updateUser())
+        stProfile = prepare(queries.profile())
+        stUserByName = prepare(queries.userByName())
+        stFollow = prepare(queries.follow())
+        stUnfollow = prepare(queries.unfollow())
+        stListAll = prepare(queries.listAll())
+        stListTag = prepare(queries.listByTag())
+        stListAuthor = prepare(queries.listByAuthor())
+        stListFavorited = prepare(queries.listByFavorited())
+        stListFeed = prepare(queries.listFeed())
+        stArticleBySlug = prepare(queries.articleBySlug())
+        stArticleById = prepare(queries.articleById())
+        stInsertArticle = prepare(queries.insertArticle())
+        stInsertTags = prepare(queries.insertTags())
+        stInsertArticleTags = prepare(queries.insertArticleTags())
+        stOwnArticle = prepare(queries.ownArticle())
+        stUpdateArticle = prepare(queries.updateArticle())
+        stDeleteArticle = prepare(queries.deleteArticle())
+        stArticleId = prepare(queries.articleId())
+        stFavorite = prepare(queries.favorite())
+        stUnfavorite = prepare(queries.unfavorite())
+        stComments = prepare(queries.comments())
+        stInsertComment = prepare(queries.insertComment())
+        stCommentAuthor = prepare(queries.commentAuthor())
+        stDeleteComment = prepare(queries.deleteComment())
+        batchSt = [stTags, prepare(queries.batchUser()), prepare(queries.batchProfile()), prepare(queries.batchArticle()), prepare(queries.batchComments()), prepare(queries.batchListAll()), prepare(queries.batchListTag()), prepare(queries.batchListAuthor()), prepare(queries.batchListFavorited()), prepare(queries.batchListFeed())]
+    } catch (e: q.QueryError) {
+        os.exit(1)
+    }
+
+    http.route("POST", "/api/users", register)
+    http.route("POST", "/api/users/login", login)
+    http.route("GET", "/api/user", currentUser)
+    http.route("PUT", "/api/user", updateUser)
+    http.route("GET", "/api/profiles/:username", getProfile)
+    http.route("POST", "/api/profiles/:username/follow", follow)
+    http.route("DELETE", "/api/profiles/:username/follow", unfollow)
+    http.route("GET", "/api/articles", listArticles)
+    http.route("GET", "/api/articles/feed", feed)
+    http.route("POST", "/api/articles", createArticle)
+    http.route("GET", "/api/articles/:slug", getArticle)
+    http.route("PUT", "/api/articles/:slug", updateArticle)
+    http.route("DELETE", "/api/articles/:slug", deleteArticle)
+    http.route("POST", "/api/articles/:slug/favorite", favorite)
+    http.route("DELETE", "/api/articles/:slug/favorite", unfavorite)
+    http.route("GET", "/api/articles/:slug/comments", listComments)
+    http.route("POST", "/api/articles/:slug/comments", createComment)
+    http.route("DELETE", "/api/articles/:slug/comments/:id", deleteComment)
+    http.route("GET", "/api/tags", tags)
+    http.notFound(notFound)
+    http.afterBatch(flushBatch)
+
+    http.uring()
+    let window: int = 80
+    if (!os.env("BATCH_MS").isEmpty()) {
+        window = str.toInt(os.env("BATCH_MS"))
+    }
+    http.batchWindow(window)
+    http.limits(0, 75, 200000)
+    http.listenOn(host, port, 1)
+}

@@ -37,6 +37,7 @@ object Main:
     val transport = Transport.pick(Settings.transport)
     val group = MultiThreadIoEventLoopGroup(Settings.loops, transport.ioHandler)
     val loops = group.iterator().asScala.map(_.asInstanceOf[EventLoop]).toVector
+    loops.foreach(loop => loop.submit((() => Handoff.install(loop)): Runnable).sync())
     val passwords = Passwords(Settings.bcryptThreads, Settings.bcryptWaitMillis, Settings.bcryptNice)
     val maxConnections = Settings.maxConnections.getOrElse(connectionDescriptors() / loops.length)
     Log.info("connection limits", "maxConnectionsPerLoop" -> maxConnections, "loops" -> loops.length)
@@ -44,7 +45,7 @@ object Main:
     try
       val pools = startPools(loops, database, transport)
       // Each loop serves its share of the connections with its own Postgres connections: nothing is shared
-      // between loops but the password threads.
+      // between loops but the password threads and, with pgSharedReads, the reads waiting for a connection.
       val servers = loops.zip(pools).map: (loop, pool) =>
         val connections = Connections(Settings.idleTimeoutSeconds, maxConnections, Settings.requestDeadlineSeconds)
         loop.scheduleAtFixedRate(() => connections.sweep(), 1, 1, TimeUnit.SECONDS)
@@ -113,16 +114,22 @@ object Main:
       channel.closeFuture().sync()
     finally group.shutdownGracefully()
 
-  /** Every loop's Postgres connections, prepared. Postgres may still be starting: retries for up to 50 s. */
+  /** Every loop's Postgres connections, prepared, and the reads they take: the process's, or each loop's own.
+    * Postgres may still be starting: retries for up to 50 s.
+    */
   private def startPools(loops: Vector[EventLoop], database: PgConfig, transport: Transport): Vector[PgPool] =
     val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(50)
     var pools: Vector[PgPool] = null
     while pools == null do
       def share(total: Int, i: Int) = total / loops.length + (if i < total % loops.length then 1 else 0)
+      val counts = loops.indices.map(i => share(Settings.pgConnections, i).max(1))
+      def reads(count: Int) = PgReads(count, Settings.pgDepth, Settings.batchSize, Settings.pgDrain, Settings.pgRoundSize,
+        Settings.pgGatherMicros, if Settings.pgPlan then () => Api.RoundPlan() else null)
+      val shared = if Settings.pgSharedReads then reads(counts.sum) else null
       val attempt = loops.zipWithIndex.map((loop, i) =>
-        PgPool(loop, database, Sql.statements, share(Settings.pgConnections, i).max(1), Settings.pgDepth, transport.socketChannel,
-          Settings.batchSize, Settings.pgWriteConnections, Settings.writeGroupSize, Settings.pgDrain,
-          Settings.pgRoundSize, Settings.pgGatherMicros)
+        PgPool(loop, database, Sql.statements, if shared != null then shared else reads(counts(i)),
+          if shared != null then counts.take(i).sum else 0, counts(i), transport.socketChannel,
+          Settings.pgWriteConnections, Settings.writeGroupSize)
       )
       try
         attempt.map(_.start()).foreach(_.get(30, TimeUnit.SECONDS))

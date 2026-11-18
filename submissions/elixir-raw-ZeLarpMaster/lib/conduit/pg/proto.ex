@@ -41,10 +41,18 @@ defmodule Conduit.Pg.Proto do
 
   defp msg(type, body), do: [type, <<IO.iodata_length(body) + 4::32>>, body]
 
+  @doc "A parameter value encoded for type `oid` once, to pass as a parameter of several Binds."
+  def encode_param(oid, v), do: {:encoded, IO.iodata_to_binary(param(oid, v))}
+
+  @doc "The type oid of int8[]."
+  def int8_array, do: @int8_array
+
   defp params([oid | oids], [v | vs], acc, n), do: params(oids, vs, [acc, param(oid, v)], n + 1)
   defp params([], [], acc, n), do: {acc, n}
 
   defp param(_, nil), do: <<-1::32-signed>>
+  # encoded once by encode_param/2, for a value sent with several statements
+  defp param(_, {:encoded, bin}), do: bin
   defp param(@int8, v) when is_integer(v), do: <<8::32, v::64-signed>>
   defp param(@int4, v) when is_integer(v), do: <<4::32, v::32-signed>>
   defp param(@int2, v) when is_integer(v), do: <<2::32, v::16-signed>>

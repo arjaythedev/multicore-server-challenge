@@ -71,13 +71,29 @@ fn unescape_raw(s: &[u8], plus: bool) -> Option<String> {
 /// The first value of each query parameter we care about. `None` = absent.
 #[derive(Default)]
 struct Query {
-    limit: Option<String>,
-    offset: Option<String>,
+    /// limit / offset: Some(None) when present but not a plain non-negative integer.
+    limit: Option<Option<i64>>,
+    offset: Option<Option<i64>>,
     tag: Option<String>,
     author: Option<String>,
     favorited: Option<String>,
     /// A tag/author/favorited value that can't match any row (NUL or invalid UTF-8).
     unmatchable: bool,
+}
+
+fn has_escape(s: &[u8]) -> bool {
+    s.iter().any(|&b| b == b'%' || b == b'+')
+}
+
+/// ASCII digits only, fitting in i64, straight from the query bytes (percent-decoded first only if escaped).
+fn query_uint(v: &[u8]) -> Option<i64> {
+    if has_escape(v) {
+        return unescape(v, true).as_deref().and_then(parse_uint);
+    }
+    if v.is_empty() || !v.iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    std::str::from_utf8(v).ok()?.parse().ok()
 }
 
 fn parse_query(q: &[u8]) -> Query {
@@ -90,25 +106,39 @@ fn parse_query(q: &[u8]) -> Query {
             Some(i) => (&part[..i], &part[i + 1..]),
             None => (part, &b""[..]),
         };
-        let Some(k) = unescape(k, true) else { continue };
-        let (slot, filter) = match k.as_str() {
-            "limit" => (&mut out.limit, false),
-            "offset" => (&mut out.offset, false),
-            "tag" => (&mut out.tag, true),
-            "author" => (&mut out.author, true),
-            "favorited" => (&mut out.favorited, true),
-            _ => continue,
-        };
-        if slot.is_none() {
-            match unescape(v, true) {
-                Some(v) => *slot = Some(v),
-                None if filter => {
-                    *slot = Some(String::new());
-                    out.unmatchable = true;
+        // Keys compare as bytes; only an escaped key is decoded first.
+        let decoded;
+        let k: &[u8] = if has_escape(k) {
+            match unescape(k, true) {
+                Some(d) => {
+                    decoded = d;
+                    decoded.as_bytes()
                 }
-                // limit/offset: not a number -> 422
-                None => *slot = Some("x".into()),
+                None => continue,
             }
+        } else {
+            k
+        };
+        match k {
+            b"limit" if out.limit.is_none() => out.limit = Some(query_uint(v)),
+            b"offset" if out.offset.is_none() => out.offset = Some(query_uint(v)),
+            b"tag" | b"author" | b"favorited" => {
+                let slot = match k {
+                    b"tag" => &mut out.tag,
+                    b"author" => &mut out.author,
+                    _ => &mut out.favorited,
+                };
+                if slot.is_none() {
+                    match unescape(v, true) {
+                        Some(v) => *slot = Some(v),
+                        None => {
+                            *slot = Some(String::new());
+                            out.unmatchable = true;
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
     out
@@ -125,12 +155,12 @@ fn parse_uint(s: &str) -> Option<i64> {
 fn limit_offset(q: &Query) -> Option<(i64, i64)> {
     let mut lim = 20;
     let mut off = 0;
-    if let Some(l) = &q.limit {
-        lim = parse_uint(l).filter(|n| (1..=100).contains(n))?;
+    if let Some(l) = q.limit {
+        lim = l.filter(|n| (1..=100).contains(n))?;
     }
-    if let Some(o) = &q.offset {
+    if let Some(o) = q.offset {
         // Past any real row count either way; capped so `limit + offset` can't overflow bigint in SQL.
-        off = parse_uint(o)?.min(i64::MAX / 2);
+        off = o?.min(i64::MAX / 2);
     }
     Some((lim, off))
 }
@@ -183,23 +213,24 @@ fn req_string(m: &serde_json::Map<String, Value>, k: &str) -> Result<String, ()>
     opt_string(m, k, true)?.ok_or(())
 }
 
-enum Auth {
+enum Auth<'a> {
     None,
     Invalid,
-    User(i64, String),
+    /// The user id and the token as sent (only GET/PUT /api/user echo it back).
+    User(i64, &'a [u8]),
 }
 
-fn auth(keys: &crate::jwt::Keys, h: Option<&[u8]>) -> Auth {
+fn auth<'a>(keys: &crate::jwt::Keys, h: Option<&'a [u8]>) -> Auth<'a> {
     let Some(h) = h else { return Auth::None };
     let Some(tok) = h.strip_prefix(b"Token ") else { return Auth::Invalid };
     match keys.verify(tok) {
-        Some(id) => Auth::User(id, String::from_utf8_lossy(tok).into_owned()),
+        Some(id) => Auth::User(id, tok),
         None => Auth::Invalid,
     }
 }
 
 fn read(kind: Read, viewer: i64, to: ReplyTo) -> Outcome {
-    db::READS.push(ReadJob { kind, viewer, to });
+    db::push_read(ReadJob { kind, viewer, to });
     Outcome::Queued
 }
 
@@ -211,45 +242,58 @@ fn write(kind: Write, viewer: i64, to: ReplyTo) -> Outcome {
 const MAX_PASSWORD: usize = 72;
 
 pub fn handle(keys: &crate::jwt::Keys, r: &Request, to: ReplyTo) -> Outcome {
-    let segs: Vec<&[u8]> = match r.path.strip_prefix(b"/api/") {
-        Some(rest) => rest.split(|&b| b == b'/').collect(),
+    // Path segments after /api/ (no route has more than four).
+    let mut seg_buf: [&[u8]; 5] = [b""; 5];
+    let mut nseg = 0;
+    match r.path.strip_prefix(b"/api/") {
+        Some(rest) => {
+            for s in rest.split(|&b| b == b'/') {
+                if nseg == seg_buf.len() {
+                    return err(404, "not found");
+                }
+                seg_buf[nseg] = s;
+                nseg += 1;
+            }
+        }
         None => return err(404, "not found"),
-    };
+    }
+    let segs = &seg_buf[..nseg];
     let m = r.method;
-    // Auth variants per route.
-    let required = |f: &dyn Fn(i64, String) -> Outcome| -> Outcome {
-        match auth(keys, r.auth) {
+    // Auth variants per route (the token is only checked on routes that use it).
+    fn required<'a>(a: Auth<'a>, f: impl FnOnce(i64, &'a [u8]) -> Outcome) -> Outcome {
+        match a {
             Auth::User(id, tok) => f(id, tok),
             _ => err(401, "unauthorized"),
         }
-    };
-    let optional = |f: &dyn Fn(i64) -> Outcome| -> Outcome {
-        match auth(keys, r.auth) {
+    }
+    fn optional(a: Auth<'_>, f: impl FnOnce(i64) -> Outcome) -> Outcome {
+        match a {
             Auth::User(id, _) => f(id),
             Auth::None => f(0),
             Auth::Invalid => err(401, "unauthorized"),
         }
-    };
+    }
+    let auth = || auth(keys, r.auth);
     let seg = |i: usize| -> Option<String> { segs.get(i).filter(|s| !s.is_empty()).and_then(|s| unescape(s, false)) };
 
-    match (m, segs.as_slice()) {
+    match (m, segs) {
         (b"GET", [b"tags"]) => read(Read::Tags, 0, to),
         (b"POST", [b"users"]) => register(r.body, to),
         (b"POST", [b"users", b"login"]) => login(r.body, to),
-        (b"GET", [b"user"]) => required(&|id, tok| read(Read::CurrentUser { id, token: tok }, id, to)),
-        (b"PUT", [b"user"]) => required(&|id, tok| update_user(r.body, id, tok, to)),
+        (b"GET", [b"user"]) => required(auth(), |id, tok| read(Read::CurrentUser { id, token: String::from_utf8_lossy(tok).into_owned() }, id, to)),
+        (b"PUT", [b"user"]) => required(auth(), |id, tok| update_user(r.body, id, String::from_utf8_lossy(tok).into_owned(), to)),
         (b"GET", [b"profiles", u]) if !u.is_empty() => {
             let Some(u) = seg(1) else { return err(404, "not found") };
-            optional(&|v| read(Read::Profile { username: u.clone() }, v, to))
+            optional(auth(), |v| read(Read::Profile { username: u }, v, to))
         }
         (b"POST" | b"DELETE", [b"profiles", u, b"follow"]) if !u.is_empty() => {
             let Some(u) = seg(1) else { return err(404, "not found") };
             let on = m == b"POST";
-            required(&|v, _| write(Write::Follow { username: u.clone(), on }, v, to))
+            required(auth(), |v, _| write(Write::Follow { username: u, on }, v, to))
         }
-        (b"GET", [b"articles"]) => optional(&|v| list(r.query, v, to)),
-        (b"POST", [b"articles"]) => required(&|v, _| create_article(r.body, v, to)),
-        (b"GET", [b"articles", b"feed"]) => required(&|v, _| {
+        (b"GET", [b"articles"]) => optional(auth(), |v| list(r.query, v, to)),
+        (b"POST", [b"articles"]) => required(auth(), |v, _| create_article(r.body, v, to)),
+        (b"GET", [b"articles", b"feed"]) => required(auth(), |v, _| {
             let q = parse_query(r.query);
             match limit_offset(&q) {
                 Some((lim, off)) => read(Read::Feed { lim, off }, v, to),
@@ -258,31 +302,31 @@ pub fn handle(keys: &crate::jwt::Keys, r: &Request, to: ReplyTo) -> Outcome {
         }),
         (b"GET", [b"articles", s]) if !s.is_empty() => {
             let Some(slug) = seg(1) else { return err(404, "not found") };
-            optional(&|v| read(Read::Article { slug: slug.clone() }, v, to))
+            optional(auth(), |v| read(Read::Article { slug: slug }, v, to))
         }
         (b"PUT", [b"articles", s]) if !s.is_empty() => {
             let Some(slug) = seg(1) else { return err(404, "not found") };
-            required(&|v, _| update_article(r.body, slug.clone(), v, to))
+            required(auth(), |v, _| update_article(r.body, slug, v, to))
         }
         (b"DELETE", [b"articles", s]) if !s.is_empty() => {
             let Some(slug) = seg(1) else { return err(404, "not found") };
-            required(&|v, _| write(Write::DeleteArticle { slug: slug.clone() }, v, to))
+            required(auth(), |v, _| write(Write::DeleteArticle { slug: slug }, v, to))
         }
         (b"POST" | b"DELETE", [b"articles", s, b"favorite"]) if !s.is_empty() => {
             let Some(slug) = seg(1) else { return err(404, "not found") };
             let on = m == b"POST";
-            required(&|v, _| write(Write::Favorite { slug: slug.clone(), on }, v, to))
+            required(auth(), |v, _| write(Write::Favorite { slug: slug, on }, v, to))
         }
         (b"GET", [b"articles", s, b"comments"]) if !s.is_empty() => {
             let Some(slug) = seg(1) else { return err(404, "not found") };
-            optional(&|v| read(Read::Comments { slug: slug.clone() }, v, to))
+            optional(auth(), |v| read(Read::Comments { slug: slug }, v, to))
         }
         (b"POST", [b"articles", s, b"comments"]) if !s.is_empty() => {
             let Some(slug) = seg(1) else { return err(404, "not found") };
-            required(&|v, _| {
+            required(auth(), |v, _| {
                 let c = match body_obj(r.body, "comment") { Ok(c) => c, Err(e) => return e };
                 match req_string(&c, "body") {
-                    Ok(body) => write(Write::CreateComment { slug: slug.clone(), body }, v, to),
+                    Ok(body) => write(Write::CreateComment { slug: slug, body }, v, to),
                     Err(()) => err(422, "body is required"),
                 }
             })
@@ -290,8 +334,8 @@ pub fn handle(keys: &crate::jwt::Keys, r: &Request, to: ReplyTo) -> Outcome {
         (b"DELETE", [b"articles", s, b"comments", id]) if !s.is_empty() && !id.is_empty() => {
             let Some(slug) = seg(1) else { return err(404, "not found") };
             let id = seg(3);
-            required(&|v, _| match id.as_deref().and_then(parse_uint) {
-                Some(id) => write(Write::DeleteComment { slug: slug.clone(), id }, v, to),
+            required(auth(), |v, _| match id.as_deref().and_then(parse_uint) {
+                Some(id) => write(Write::DeleteComment { slug: slug, id }, v, to),
                 None => err(404, "comment not found"),
             })
         }
@@ -305,12 +349,12 @@ fn list(query: &[u8], v: i64, to: ReplyTo) -> Outcome {
     if q.unmatchable {
         return Outcome::Now(200, b"{\"articles\":[],\"articlesCount\":0}".to_vec());
     }
-    let nonempty = |s: &Option<String>| s.as_ref().filter(|s| !s.is_empty()).cloned();
-    let kind = if let Some(tag) = nonempty(&q.tag) {
+    let nonempty = |s: Option<String>| s.filter(|s| !s.is_empty());
+    let kind = if let Some(tag) = nonempty(q.tag) {
         Read::Tag { tag, lim, off }
-    } else if let Some(username) = nonempty(&q.author) {
+    } else if let Some(username) = nonempty(q.author) {
         Read::Author { username, lim, off }
-    } else if let Some(username) = nonempty(&q.favorited) {
+    } else if let Some(username) = nonempty(q.favorited) {
         Read::Favorited { username, lim, off }
     } else {
         Read::Global { lim, off }

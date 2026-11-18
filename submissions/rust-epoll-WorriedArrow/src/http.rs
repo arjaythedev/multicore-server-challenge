@@ -10,6 +10,9 @@ use crate::reply::{self, ReplyTo};
 
 const LISTENER: u64 = u64::MAX;
 const OUTBOX: u64 = u64::MAX - 1;
+/// Delay ACKs on client sockets (see `respond`).
+pub static ACK_DELAY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 const MAX_HEAD: usize = 64 * 1024;
 const MAX_BODY: usize = 1024 * 1024;
 
@@ -28,6 +31,12 @@ struct Conn {
     sent_continue: bool,
 }
 
+/// Emptied request buffers kept per IO thread.
+const SPARE_IN: usize = 256;
+
+/// Nice value for the event loop threads (0: unchanged).
+pub static LOOP_NICE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(5);
+
 pub struct Server {
     thread: u16,
     ep: RawFd,
@@ -40,6 +49,12 @@ pub struct Server {
     /// While set, the listener is out of the epoll set (accept failed for lack of descriptors or memory); it goes
     /// back in at that time. A level-triggered listener would otherwise wake the loop again at once and spin.
     accept_paused: Option<std::time::Instant>,
+    /// Request buffers lent to whichever connection is reading: a request that arrives whole is parsed and handed
+    /// off before the next read, so its buffer comes straight back and connections rarely allocate one.
+    spare_in: Vec<Vec<u8>>,
+    /// The outbox's previous vector and the touched-slot list, kept for their capacity.
+    spare_out: Vec<reply::Response>,
+    touched: Vec<u32>,
 }
 
 fn cvt(r: i32) -> io::Result<i32> {
@@ -105,7 +120,7 @@ impl Server {
     pub fn new(thread: u16, lfd: RawFd, keys: &'static crate::jwt::Keys) -> io::Result<Server> {
         let ep = cvt(unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) })?;
         let efd = reply::outbox(thread as usize).efd;
-        let s = Server { thread, ep, lfd, efd, conns: Vec::new(), free: Vec::new(), scratch: vec![0; 256 * 1024], keys, accept_paused: None };
+        let s = Server { thread, ep, lfd, efd, conns: Vec::new(), free: Vec::new(), scratch: vec![0; 256 * 1024], keys, accept_paused: None, spare_in: Vec::with_capacity(SPARE_IN), spare_out: Vec::with_capacity(1024), touched: Vec::with_capacity(1024) };
         s.ctl(libc::EPOLL_CTL_ADD, lfd, libc::EPOLLIN as u32, LISTENER)?;
         s.ctl(libc::EPOLL_CTL_ADD, efd, libc::EPOLLIN as u32, OUTBOX)?;
         Ok(s)
@@ -117,14 +132,35 @@ impl Server {
         Ok(())
     }
 
-    pub fn run(mut self) {
+    pub fn run(mut self, private_fds: bool, unshared: &std::sync::Barrier) {
+        // Event loops at a lower priority (nice LOOP_NICE, 5 by default): a request can wait a moment, a Postgres backend
+        // in the middle of a batch holds up all of it.
+        let nice = LOOP_NICE.load(std::sync::atomic::Ordering::Relaxed);
+        if nice > 0 {
+            unsafe { libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, nice) };
+        }
+        // A descriptor table of this thread's own: client sockets are only ever touched by the thread that accepted
+        // them, and with an unshared table the kernel skips the shared table's locking and per-call reference counts
+        // on every accept, read, write and close.
+        if private_fds {
+            unsafe { libc::unshare(libc::CLONE_FILES) };
+        }
+        unshared.wait();
+        crate::db::hold_reads();
         let mut events: Vec<libc::epoll_event> = vec![libc::epoll_event { events: 0, u64: 0 }; 1024];
+        let st = &crate::stats::IO[(self.thread as usize).min(crate::stats::IO.len() - 1)];
+        let mut t_pass = std::time::Instant::now();
         loop {
             let timeout = match self.accept_paused {
                 Some(t) => t.saturating_duration_since(std::time::Instant::now()).as_millis() as i32 + 1,
                 None => -1,
             };
+            let t_wait = std::time::Instant::now();
+            st.busy_ns.fetch_add((t_wait - t_pass).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             let n = unsafe { libc::epoll_wait(self.ep, events.as_mut_ptr(), events.len() as i32, timeout) };
+            t_pass = std::time::Instant::now();
+            st.wait_ns.fetch_add((t_pass - t_wait).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            st.events.fetch_add(n.max(0) as u64, std::sync::atomic::Ordering::Relaxed);
             if let Some(t) = self.accept_paused {
                 if std::time::Instant::now() >= t && self.ctl(libc::EPOLL_CTL_ADD, self.lfd, libc::EPOLLIN as u32, LISTENER).is_ok() {
                     self.accept_paused = None;
@@ -153,6 +189,8 @@ impl Server {
                     }
                 }
             }
+            // The pass's reads go to the scheduler together: one lock instead of one per request.
+            crate::db::release_reads();
         }
     }
 
@@ -224,6 +262,7 @@ impl Server {
         }
         c.fd = -1;
         c.generation = c.generation.wrapping_add(1);
+        reply::set_live(self.thread, slot, c.generation);
         c.inbuf = Vec::new();
         c.outbuf = Vec::new();
         c.out_pos = 0;
@@ -252,6 +291,8 @@ impl Server {
             if n == 0 {
                 let c = &mut self.conns[slot as usize];
                 c.peer_closed = true;
+                // queued work for this client can be skipped; its reply only closes the connection
+                reply::set_live(self.thread, slot, c.generation.wrapping_add(1));
                 if !c.busy {
                     self.close(slot);
                 } else {
@@ -262,6 +303,9 @@ impl Server {
             }
             let n = n as usize;
             let c = &mut self.conns[slot as usize];
+            if c.inbuf.capacity() == 0 {
+                c.inbuf = self.spare_in.pop().unwrap_or_else(|| Vec::with_capacity(16 * 1024));
+            }
             c.inbuf.extend_from_slice(&self.scratch[..n]);
             if n < self.scratch.len() {
                 break;
@@ -275,8 +319,9 @@ impl Server {
         loop {
             let c = &mut self.conns[slot as usize];
             if c.fd < 0 || c.busy || c.inbuf.is_empty() {
-                if c.fd >= 0 && c.inbuf.capacity() > 0 && c.inbuf.is_empty() {
-                    c.inbuf = Vec::new();
+                if c.fd >= 0 && c.inbuf.is_empty() {
+                    let buf = std::mem::take(&mut c.inbuf);
+                    self.recycle_in(buf);
                 }
                 return;
             }
@@ -414,10 +459,23 @@ impl Server {
             let outcome = api::handle(self.keys, &r, to);
             let c = &mut self.conns[slot as usize];
             c.inbuf.drain(..consumed);
+            // A queued request owns everything it needs: an emptied buffer goes back to the spares now, not after the
+            // response (a batch window later), so the next connection to read reuses it instead of allocating.
+            if c.inbuf.is_empty() {
+                let buf = std::mem::take(&mut c.inbuf);
+                self.recycle_in(buf);
+            }
             match outcome {
                 Outcome::Now(status, body) => self.respond(slot, status, &body),
                 Outcome::Queued => return,
             }
+        }
+    }
+
+    /// Keeps an emptied request buffer for the next connection that reads (up to SPARE_IN of them).
+    fn recycle_in(&mut self, buf: Vec<u8>) {
+        if buf.capacity() > 0 && buf.capacity() <= 256 * 1024 && self.spare_in.len() < SPARE_IN {
+            self.spare_in.push(buf);
         }
     }
 
@@ -435,9 +493,10 @@ impl Server {
         unsafe {
             libc::read(self.efd, &mut v as *mut u64 as *mut libc::c_void, 8);
         }
-        let batch = std::mem::take(&mut *reply::outbox(self.thread as usize).queue.lock().unwrap());
-        let mut touched: Vec<u32> = Vec::with_capacity(batch.len());
-        for r in batch {
+        let mut batch = std::mem::take(&mut self.spare_out);
+        std::mem::swap(&mut batch, &mut *reply::outbox(self.thread as usize).queue.lock().unwrap());
+        let mut touched = std::mem::take(&mut self.touched);
+        for r in batch.drain(..) {
             let c = &self.conns[r.to.slot as usize];
             if c.fd < 0 || c.generation != r.to.generation || !c.busy {
                 continue;
@@ -445,8 +504,13 @@ impl Server {
             self.respond(r.to.slot, r.status, &r.body);
             touched.push(r.to.slot);
         }
-        for slot in touched {
+        for &slot in &touched {
             self.process(slot);
+        }
+        touched.clear();
+        self.touched = touched;
+        if batch.capacity() <= 64 * 1024 {
+            self.spare_out = batch;
         }
     }
 
@@ -454,21 +518,30 @@ impl Server {
         let c = &mut self.conns[slot as usize];
         c.busy = false;
         let mut head = [0u8; 160];
-        let mut w = &mut head[..];
-        use std::io::Write as _;
-        if status == 204 {
-            let _ = write!(w, "HTTP/1.1 {}\r\n{}\r\n", status_text(status), if c.close_after { "Connection: close\r\n" } else { "" });
-        } else {
-            let _ = write!(
-                w,
-                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}\r\n",
-                status_text(status),
-                body.len(),
-                if c.close_after { "Connection: close\r\n" } else { "" }
-            );
+        let mut hl = 0;
+        let mut put = |b: &[u8]| {
+            head[hl..hl + b.len()].copy_from_slice(b);
+            hl += b.len();
+        };
+        put(b"HTTP/1.1 ");
+        put(status_text(status).as_bytes());
+        put(b"\r\n");
+        if status != 204 {
+            put(b"Content-Type: application/json\r\nContent-Length: ");
+            put(itoa::Buffer::new().format(body.len()).as_bytes());
+            put(b"\r\n");
         }
-        let hl = 160 - w.len();
+        if c.close_after {
+            put(b"Connection: close\r\n");
+        }
+        put(b"\r\n");
         let fd = c.fd;
+        if ACK_DELAY.load(std::sync::atomic::Ordering::Relaxed) {
+            // Leave quick-ack mode, so the ACK for the client's next request rides on our response to it instead of
+            // going out as a packet of its own (the kernel re-enters quick-ack mode by itself, hence every time).
+            let zero: libc::c_int = 0;
+            unsafe { libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_QUICKACK, &zero as *const _ as *const libc::c_void, 4) };
+        }
         if c.outbuf.len() > c.out_pos {
             c.outbuf.extend_from_slice(&head[..hl]);
             c.outbuf.extend_from_slice(body);

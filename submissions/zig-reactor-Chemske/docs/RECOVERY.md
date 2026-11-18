@@ -17,7 +17,7 @@ Active database work has its own client state. A disconnected or expired client 
 
 Retired slots reconnect independently, starting after 250 ms with exponential backoff capped at five seconds. The existing event-loop tick can add scheduling delay when the process is otherwise idle. Each slot owns at most one attempt, with a twenty-second setup deadline. A completed replacement resets its backoff.
 
-`PQconnectStart`/`PQconnectPoll`, parameterized setup and all twenty-one named preparations advance from socket readiness. A replacement is admitted only after all results have been drained and the connection is idle. No startup/session state is inherited from the lost connection. The official numeric loopback database address avoids libpq's potentially blocking hostname resolution; this design does not promise asynchronous DNS for arbitrary URLs.
+`PQconnectStart`/`PQconnectPoll`, parameterized setup and all forty-seven named preparations advance from socket readiness. A replacement is admitted only after all results have been drained and the connection is idle. No startup/session state is inherited from the lost connection. The official numeric loopback database address avoids libpq's potentially blocking hostname resolution; this design does not promise asynchronous DNS for arbitrary URLs.
 
 Each owned session sets `statement_timeout` to eight seconds. This matches the existing application query deadline and bounds abandoned backend work as well as waiting in the application. It changes only that session, with no schema, database, role or server-wide configuration change. Durable commit settings stay untouched. Setup also drains session-only `jit=off` and the selected `plan_cache_mode`; the automatic-plan control remains available. See PERFORMANCE.md for the measurements.
 
@@ -33,4 +33,6 @@ The checks cover rebuilt statements/settings, isolated backend loss, bounded rec
 
 The proxy, application and disposable databases are stopped/removed on exit. All logs and JSON evidence stay under `work/results/recovery/`. No extra software, service or external infrastructure is installed.
 
-The final optimisation round also counts all twenty-one preparations and all three session settings after replacement. Grouped read recipients receive the same drained success/error, or 503 on connection retirement; none are returned to the pending queue.
+The final optimisation round also counts all forty-seven preparations and all three session settings after replacement. Grouped read recipients receive the same drained success/error, or 503 on connection retirement; none are returned to the pending queue.
+
+Grouped favorite mutations also distinguish a fully acknowledged rollback from an uncertain implicit commit. `tests/favorite_batch.py` drops ReadyForQuery after the mutation commits and requires HTTP 503, durable rows and no replay. Only an explicit SQL error followed by idle transaction status permits splitting an aborted group into individual operations.

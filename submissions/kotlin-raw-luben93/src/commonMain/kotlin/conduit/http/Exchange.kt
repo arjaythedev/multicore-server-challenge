@@ -11,9 +11,10 @@ import kotlin.jvm.JvmField
 
 /**
  * Bytes in front of every response body where [putHead] writes the status line and headers (right-aligned), so
- * header + body leave in ONE write. Worst case is ~132 bytes (longest reason, 10-digit length, Connection header).
+ * header + body leave in ONE write. Worst case is ~156 bytes (longest reason, 10-digit length, Connection header,
+ * Content-Encoding).
  */
-internal const val RESERVE = 160
+internal const val RESERVE = 192
 
 private const val OUT_INITIAL = 8192
 /**
@@ -91,6 +92,9 @@ internal class Ex(@JvmField val engine: EngineCore, @JvmField val cs: ConnState)
     @JvmField var chunked = false
     @JvmField var expect = false
 
+    /** The client sent Accept-Encoding with gzip (and no q=0): the body may go out gzipped, see [Gzip]. */
+    @JvmField var acceptGzip = false
+
     @JvmField var res: Out? = null
     private var jsonReady = false
     /**
@@ -151,8 +155,35 @@ internal class Ex(@JvmField val engine: EngineCore, @JvmField val cs: ConnState)
     }
 
     private fun respond(o: Out, status: Int, bodyLen: Int) {
+        if (acceptGzip && bodyLen >= Gzip.MIN_BODY && Gzip.active) {
+            val z = gzipped(o, bodyLen)
+            if (z != null) {
+                val start = putHead(z.buf.buf, status, z.buf.len - RESERVE, connMode, gzip = true)
+                engine.write(cs, z, start, z.buf.len, connMode == CLOSE)
+                return
+            }
+        }
         val start = putHead(o.buf.buf, status, bodyLen, connMode)
         engine.write(cs, o, start, if (bodyLen < 0) RESERVE else o.buf.len, connMode == CLOSE)
+    }
+
+    /**
+     * The body of [o] gzipped into another pooled buffer (then [o] goes back to the pool), or null (o unchanged) if
+     * compressing failed or did not make it smaller.
+     */
+    private fun gzipped(o: Out, bodyLen: Int): Out? {
+        val z = try {
+            engine.takeOut()
+        } catch (_: Throwable) { // out of memory: send it uncompressed
+            return null
+        }
+        if (gzip(o.buf.buf, RESERVE, bodyLen, z.buf) && z.buf.len - RESERVE < bodyLen) {
+            Gzip.count(bodyLen, z.buf.len - RESERVE)
+            engine.putOut(o)
+            return z
+        }
+        engine.putOut(z)
+        return null
     }
 
     override val abandoned: Boolean
@@ -254,12 +285,13 @@ private fun statusLine(status: Int): ByteArray {
 private val CONTENT = "Content-Type: application/json\r\nContent-Length: ".encodeToByteArray()
 private val CONN_CLOSE = "Connection: close\r\n".encodeToByteArray()
 private val CONN_KEEP = "Connection: keep-alive\r\n".encodeToByteArray()
+private val ENC_GZIP = "Content-Encoding: gzip\r\n".encodeToByteArray()
 
 /**
  * Writes the status line and headers into dst so that they end exactly at [RESERVE] (where the body starts) and
- * returns their start. [bodyLen] < 0: no Content-Type/Content-Length (204, 304).
+ * returns their start. [bodyLen] < 0: no Content-Type/Content-Length (204, 304). [gzip]: the body is gzipped.
  */
-internal fun putHead(dst: ByteArray, status: Int, bodyLen: Int, connMode: Int): Int {
+internal fun putHead(dst: ByteArray, status: Int, bodyLen: Int, connMode: Int, gzip: Boolean = false): Int {
     var p = RESERVE - 2
     dst[p] = 13
     dst[p + 1] = 10
@@ -271,6 +303,10 @@ internal fun putHead(dst: ByteArray, status: Int, bodyLen: Int, connMode: Int): 
     if (conn != null) {
         p -= conn.size
         conn.copyInto(dst, p)
+    }
+    if (gzip) {
+        p -= ENC_GZIP.size
+        ENC_GZIP.copyInto(dst, p)
     }
     if (bodyLen >= 0) {
         dst[--p] = 10

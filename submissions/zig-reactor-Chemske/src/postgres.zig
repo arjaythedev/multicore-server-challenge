@@ -5,12 +5,26 @@ const profiles = @import("profiles.zig");
 const articles = @import("articles.zig");
 const operations = @import("operations.zig");
 const read_batch = @import("read_batch.zig");
+const page_batch = @import("page_batch.zig");
 pub const prepared_queries = @import("build_options").prepared_queries;
 
 // Minimal declarations from PostgreSQL 18's public libpq-fe.h ABI.
 pub const Conn = opaque {};
 pub const Result = opaque {};
 extern "c" fn PQconnectStart([*:0]const u8) ?*Conn;
+extern "c" fn PQconnectStartParams([*]const ?[*:0]const u8, [*]const ?[*:0]const u8, c_int) ?*Conn;
+const ConnOption = extern struct {
+    keyword: ?[*:0]const u8,
+    envvar: ?[*:0]const u8,
+    compiled: ?[*:0]const u8,
+    val: ?[*:0]const u8,
+    label: ?[*:0]const u8,
+    dispchar: ?[*:0]const u8,
+    dispsize: c_int,
+};
+extern "c" fn PQconninfoParse([*:0]const u8, *?[*:0]u8) ?[*]ConnOption;
+extern "c" fn PQconninfoFree([*]ConnOption) void;
+extern "c" fn PQfreemem(*anyopaque) void;
 extern "c" fn PQconnectPoll(*Conn) c_int;
 pub extern "c" fn PQsocket(*const Conn) c_int;
 extern "c" fn PQsetnonblocking(*Conn, c_int) c_int;
@@ -34,6 +48,53 @@ extern "c" fn PQresultErrorField(*const Result, c_int) ?[*:0]const u8;
 
 pub const Interest = struct { read: bool = false, write: bool = false, ready: bool = false };
 
+fn numericLoopback(value: []const u8) bool {
+    return std.mem.eql(u8, value, "127.0.0.1") or std.mem.eql(u8, value, "::1");
+}
+
+fn implicitLocalTls(url: [*:0]const u8) bool {
+    var message: ?[*:0]u8 = null;
+    const options = PQconninfoParse(url, &message) orelse {
+        if (message) |value| PQfreemem(@ptrCast(value));
+        return false;
+    };
+    defer PQconninfoFree(options);
+    var host: []const u8 = "";
+    var index: usize = 0;
+    while (options[index].keyword) |key| : (index += 1) {
+        const value = options[index].val orelse continue;
+        const keyword = std.mem.span(key);
+        const text = std.mem.span(value);
+        if (text.len == 0) continue;
+        if (std.mem.eql(u8, keyword, "host")) host = text;
+        if (std.mem.eql(u8, keyword, "hostaddr") and !numericLoopback(text)) return false;
+        if (std.mem.startsWith(u8, keyword, "ssl") or std.mem.eql(u8, keyword, "requiressl") or std.mem.eql(u8, keyword, "channel_binding") or std.mem.eql(u8, keyword, "service")) return false;
+    }
+    return numericLoopback(host);
+}
+
+fn startConnection(url: [*:0]const u8) ?*Conn {
+    if (@import("build_options").loopback_no_tls and implicitLocalTls(url)) {
+        // Explicit URL and environment security/routing choices retain libpq's
+        // ordinary behavior. Remote hosts never take this local-only path.
+        for ([_][*:0]const u8{ "PGSSLMODE", "PGREQUIRESSL", "PGSERVICE", "PGSERVICEFILE", "PGHOSTADDR", "PGSSLROOTCERT", "PGSSLCERT", "PGSSLKEY", "PGSSLCRL", "PGSSLCRLDIR", "PGSSLSNI", "PGSSLNEGOTIATION", "PGCHANNELBINDING" }) |key| {
+            if (c.getenv(key) != null) return PQconnectStart(url);
+        }
+        const keys = [_]?[*:0]const u8{ "sslmode", "dbname", null };
+        const values = [_]?[*:0]const u8{ "disable", url, null };
+        return PQconnectStartParams(&keys, &values, 1);
+    }
+    return PQconnectStart(url);
+}
+
+test "local optional TLS never overrides an explicit security or remote routing choice" {
+    try std.testing.expect(implicitLocalTls("postgres://a:p%40ss@127.0.0.1:5432/db"));
+    try std.testing.expect(implicitLocalTls("host=::1 dbname=test"));
+    for ([_][*:0]const u8{ "postgres://a@remote.example/db", "host=127.0.0.1 hostaddr=192.0.2.1", "host=remote.example hostaddr=127.0.0.1", "host=127.0.0.1 sslmode=require", "host=127.0.0.1 sslmode=verify-full", "host=127.0.0.1 service=custom", "host=127.0.0.1 sslrootcert=/tmp/cert", "host=127.0.0.1 channel_binding=require", "host=127.0.0.1,192.0.2.1", "invalid connection text" }) |url| {
+        try std.testing.expect(!implicitLocalTls(url));
+    }
+}
+
 // One owner advances both authentication and statement preparation from readiness
 // events. A replacement is never published until all prepared queries are drained.
 pub const Connector = struct {
@@ -44,7 +105,7 @@ pub const Connector = struct {
     successful: bool = false,
 
     pub fn start(url: [*:0]const u8) !Connector {
-        const conn = PQconnectStart(url) orelse return error.DatabaseConnect;
+        const conn = startConnection(url) orelse return error.DatabaseConnect;
         errdefer PQfinish(conn);
         if (PQsocket(conn) < 0) return error.DatabaseConnect;
         return .{ .conn = conn };
@@ -142,11 +203,28 @@ fn statementName(route: http.Route, read: ?articles.Read) [:0]const u8 {
 }
 
 fn prepareItem(index: usize) ?struct { name: [:0]const u8, sql: [:0]const u8 } {
+    if (index == 32 + operations.prepared.len) return .{ .name = "batch_comments_compact", .sql = read_batch.compact_comments_sql };
+    if (index == 33 + operations.prepared.len) return .{ .name = "batch_favorite", .sql = read_batch.favorite_sql };
+    if (index == 34 + operations.prepared.len) return .{ .name = "batch_unfavorite", .sql = read_batch.unfavorite_sql };
+    if (index == 35 + operations.prepared.len) return .{ .name = "batch_by_id", .sql = read_batch.by_id_sql };
+    if (index == 36 + operations.prepared.len) return .{ .name = "batch_profiles", .sql = profiles.batch_sql };
+    if (index >= 32) {
+        const operation_index = index - 32;
+        if (operation_index >= operations.prepared.len) return null;
+        const item = operations.prepared[operation_index];
+        return .{ .name = item.name, .sql = item.sql };
+    }
     const routes = [_]http.Route{ .tags, .register, .login, .current, .update, .profile, .follow, .unfollow, .comments };
     if (index < routes.len) return .{ .name = statementName(routes[index], null), .sql = querySql(routes[index], null) };
     const offset = index - routes.len;
     if (offset == 11) return .{ .name = "batch_single", .sql = read_batch.single_sql };
-    if (offset > 11) return null;
+    if (offset == 12) return .{ .name = "batch_comments", .sql = read_batch.comments_sql };
+    if (offset >= 13) {
+        const item = offset - 13;
+        if (item >= 10) return null;
+        const family: articles.Family = @fromBackingInt(@intCast(item % 5));
+        return .{ .name = page_batch.name(family, item >= 5), .sql = page_batch.statement(family, item >= 5) };
+    }
     const read: articles.Read = .{
         .family = @fromBackingInt(@intCast(if (offset < 6) offset else offset - 6)),
         .phase = if (offset < 6) .page else .count,
@@ -178,6 +256,18 @@ pub fn send(conn: *Conn, statement: [:0]const u8, params: []const ?[:0]const u8)
     if (PQsendQueryParams(conn, statement.ptr, @intCast(params.len), null, &values, null, null, 0) != 1) return error.DatabaseQuery;
 }
 
+pub fn sendOperation(conn: *Conn, query_value: operations.Query) !void {
+    if (prepared_queries) {
+        if (query_value.prepared_name) |name| {
+            var values: [6]?[*:0]const u8 = @splat(null);
+            for (query_value.params[0..query_value.count], 0..) |param, index| values[index] = if (param) |value| value.ptr else null;
+            if (PQsendQueryPrepared(conn, name.ptr, @intCast(query_value.count), &values, null, null, 0) != 1) return error.DatabaseQuery;
+            return;
+        }
+    }
+    try send(conn, query_value.statement, query_value.params[0..query_value.count]);
+}
+
 pub fn status(result: *Result) u16 {
     if (PQresultStatus(result) == 2 or PQresultStatus(result) == 1) return 200;
     const code = PQresultErrorField(result, 'C') orelse return 503;
@@ -194,10 +284,14 @@ pub const User = struct {
 };
 
 fn field(result: *Result, column: c_int, allocator: std.mem.Allocator) !?[]const u8 {
-    if (PQgetisnull(result, 0, column) != 0) return null;
-    const len: usize = @intCast(PQgetlength(result, 0, column));
+    return fieldAt(result, 0, column, allocator);
+}
+
+fn fieldAt(result: *Result, row: c_int, column: c_int, allocator: std.mem.Allocator) !?[]const u8 {
+    if (PQgetisnull(result, row, column) != 0) return null;
+    const len: usize = @intCast(PQgetlength(result, row, column));
     if (len > 1024 * 1024) return error.ResponseTooLarge;
-    return try allocator.dupe(u8, PQgetvalue(result, 0, column)[0..len]);
+    return try allocator.dupe(u8, PQgetvalue(result, row, column)[0..len]);
 }
 
 pub fn user(result: *Result, allocator: std.mem.Allocator, login: bool) !?User {
@@ -225,6 +319,21 @@ pub fn profileJson(result: *Result, allocator: std.mem.Allocator) !?[]const u8 {
         .bio = try field(result, 2, allocator),
         .image = try field(result, 3, allocator),
         .following = flag == 't',
+    };
+    return try std.json.Stringify.valueAlloc(allocator, .{ .profile = profile }, .{});
+}
+
+pub fn profileBatchJson(result: *Result, index: usize, expected: usize, allocator: std.mem.Allocator) !?[]const u8 {
+    if (PQresultStatus(result) != 2 or PQnfields(result) != 5 or PQntuples(result) != expected) return error.DatabaseResult;
+    const row: c_int = @intCast(index);
+    const ordinal = std.fmt.parseInt(usize, try required(result, row, 0), 10) catch return error.DatabaseResult;
+    if (ordinal != index + 1) return error.DatabaseResult;
+    const username = (try fieldAt(result, row, 1, allocator)) orelse return null;
+    const profile: profiles.Profile = .{
+        .username = username,
+        .bio = try fieldAt(result, row, 2, allocator),
+        .image = try fieldAt(result, row, 3, allocator),
+        .following = try boolean(result, row, 4),
     };
     return try std.json.Stringify.valueAlloc(allocator, .{ .profile = profile }, .{});
 }
@@ -308,12 +417,254 @@ fn articleAt(result: *Result, row: c_int, offset: c_int, allocator: std.mem.Allo
     };
 }
 
-pub fn sendSingleBatch(conn: *Conn, inputs: []const read_batch.Input, allocator: std.mem.Allocator) !void {
+pub fn sendReadBatch(conn: *Conn, inputs: []const read_batch.Input, allocator: std.mem.Allocator, comments: bool, compact: bool, profile: bool) !void {
     const params = try read_batch.parameters(allocator, inputs);
     if (prepared_queries) {
         const values = [_]?[*:0]const u8{ params[0].ptr, params[1].ptr };
-        if (PQsendQueryPrepared(conn, "batch_single", 2, &values, null, null, 0) != 1) return error.DatabaseQuery;
-    } else try send(conn, read_batch.single_sql, &.{ params[0], params[1] });
+        if (PQsendQueryPrepared(conn, if (profile) "batch_profiles" else if (compact) "batch_comments_compact" else if (comments) "batch_comments" else "batch_single", 2, &values, null, null, 0) != 1) return error.DatabaseQuery;
+    } else try send(conn, if (profile) profiles.batch_sql else if (compact) read_batch.compact_comments_sql else if (comments) read_batch.comments_sql else read_batch.single_sql, &.{ params[0], params[1] });
+}
+
+pub fn sendFavoriteGroup(conn: *Conn, inputs: []const read_batch.Input, allocator: std.mem.Allocator, remove: bool, reading: bool) !void {
+    const params = try read_batch.parameters(allocator, inputs);
+    const name: [:0]const u8 = if (reading) "batch_by_id" else if (remove) "batch_unfavorite" else "batch_favorite";
+    const statement = if (reading) read_batch.by_id_sql else if (remove) read_batch.unfavorite_sql else read_batch.favorite_sql;
+    if (prepared_queries) {
+        const values = [_]?[*:0]const u8{ params[0].ptr, params[1].ptr };
+        if (PQsendQueryPrepared(conn, name.ptr, 2, &values, null, null, 0) != 1) return error.DatabaseQuery;
+    } else try send(conn, statement, &.{ params[0], params[1] });
+}
+
+pub fn confirmedStatementFailure(result: *Result) bool {
+    if (PQresultStatus(result) != 7) return false;
+    const code = PQresultErrorField(result, 'C') orelse return false;
+    const value = std.mem.span(code);
+    return value.len == 5 and !std.mem.startsWith(u8, value, "08") and !std.mem.startsWith(u8, value, "57P");
+}
+
+pub fn favoriteTarget(result: *Result, index: usize, expected: usize, allocator: std.mem.Allocator) !?[:0]const u8 {
+    if (PQresultStatus(result) != 2 or PQnfields(result) != 2 or PQntuples(result) != expected) return error.DatabaseResult;
+    const ordinal = std.fmt.parseInt(usize, try required(result, @intCast(index), 0), 10) catch return error.DatabaseResult;
+    if (ordinal != index + 1) return error.DatabaseResult;
+    const value = cell(result, @intCast(index), 1) orelse return null;
+    const id = std.fmt.parseInt(i64, value, 10) catch return error.DatabaseResult;
+    if (id <= 0) return error.DatabaseResult;
+    return try allocator.dupeSentinel(u8, value, 0);
+}
+
+pub fn readBatchBounds(result: *Result, expected: usize, columns: c_int, bounds: *[read_batch.capacity + 1]usize) !void {
+    return readBatchBoundsFrom(result, expected, columns, bounds, 0);
+}
+
+fn readBatchBoundsFrom(result: *Result, expected: usize, columns: c_int, bounds: *[read_batch.capacity + 1]usize, start: usize) !void {
+    if (PQresultStatus(result) != 2 or PQnfields(result) != columns) return error.DatabaseResult;
+    const count: usize = @intCast(PQntuples(result));
+    if (start > count or count - start < expected or count - start > expected * 100) return error.DatabaseResult;
+    var previous: usize = 0;
+    for (start..count) |row| {
+        const ordinal = std.fmt.parseInt(usize, try required(result, @intCast(row), 0), 10) catch return error.DatabaseResult;
+        if (ordinal == 0 or ordinal > expected or ordinal < previous or ordinal > previous + 1) return error.DatabaseResult;
+        if (ordinal != previous) bounds[ordinal - 1] = row;
+        previous = ordinal;
+    }
+    if (previous != expected) return error.DatabaseResult;
+    bounds[expected] = count;
+}
+
+pub const CompactComments = struct {
+    const Meta = struct { article: i64, value: operations.Comment, bytes: usize };
+    result: *Result,
+    metadata: std.AutoHashMap(i64, Meta),
+    bounds: [read_batch.capacity + 1]usize,
+
+    pub fn deinit(self: *CompactComments) void {
+        self.metadata.deinit();
+    }
+
+    pub fn rows(self: *const CompactComments, index: usize, allocator: std.mem.Allocator) !?[]operations.Comment {
+        const begin = self.bounds[index];
+        const end = self.bounds[index + 1];
+        if (begin >= end or end - begin > 100) return error.DatabaseResult;
+        if (cell(self.result, @intCast(begin), 1) == null) return null;
+        if (cell(self.result, @intCast(begin), 2) == null) {
+            if (end != begin + 1) return error.DatabaseResult;
+            return &.{};
+        }
+        const output = try allocator.alloc(operations.Comment, end - begin);
+        var total: usize = 0;
+        for (output, begin..) |*comment, row| {
+            const article = std.fmt.parseInt(i64, try required(self.result, @intCast(row), 1), 10) catch return error.DatabaseResult;
+            const id = std.fmt.parseInt(i64, try required(self.result, @intCast(row), 2), 10) catch return error.DatabaseResult;
+            const meta = self.metadata.get(id) orelse return error.DatabaseResult;
+            if (meta.article != article) return error.DatabaseResult;
+            total += meta.bytes;
+            if (total > 4 * 1024 * 1024) return error.ResponseTooLarge;
+            comment.* = meta.value;
+            comment.author.following = try boolean(self.result, @intCast(row), 9);
+        }
+        return output;
+    }
+};
+
+pub fn compactComments(result: *Result, expected: usize, allocator: std.mem.Allocator) !CompactComments {
+    if (PQresultStatus(result) != 2 or PQnfields(result) != 11) return error.DatabaseResult;
+    const count: usize = @intCast(PQntuples(result));
+    if (count < expected or count > expected * 200) return error.DatabaseResult;
+    var group: CompactComments = .{ .result = result, .metadata = .init(allocator), .bounds = undefined };
+    errdefer group.deinit();
+    var start: usize = 0;
+    while (start < count) : (start += 1) {
+        const ordinal = std.fmt.parseInt(usize, try required(result, @intCast(start), 0), 10) catch return error.DatabaseResult;
+        if (ordinal != 0) break;
+        var bytes: usize = 0;
+        var value = try commentAt(result, @intCast(start), 2, allocator, &bytes);
+        try value.encodeForGroup(allocator);
+        const article = std.fmt.parseInt(i64, try required(result, @intCast(start), 1), 10) catch return error.DatabaseResult;
+        const entry = try group.metadata.getOrPut(value.id);
+        if (entry.found_existing) return error.DatabaseResult;
+        entry.value_ptr.* = .{ .article = article, .value = value, .bytes = bytes };
+    }
+    try readBatchBoundsFrom(result, expected, 11, &group.bounds, start);
+    return group;
+}
+
+pub fn commentsBatchRows(result: *Result, begin: usize, end: usize, allocator: std.mem.Allocator) !?[]operations.Comment {
+    if (begin >= end or end - begin > 100) return error.DatabaseResult;
+    if (cell(result, @intCast(begin), 1) == null) return null;
+    if (cell(result, @intCast(begin), 2) == null) {
+        if (end != begin + 1) return error.DatabaseResult;
+        return &.{};
+    }
+    const rows = try allocator.alloc(operations.Comment, end - begin);
+    var total: usize = 0;
+    for (rows, begin..) |*comment, row| comment.* = try commentAt(result, @intCast(row), 2, allocator, &total);
+    return rows;
+}
+
+pub fn sendPageBatch(conn: *Conn, inputs: []const page_batch.Input, allocator: std.mem.Allocator, family: articles.Family, count: bool) !void {
+    const params = try page_batch.parameters(allocator, inputs);
+    if (prepared_queries) {
+        const values = [_]?[*:0]const u8{ params[0].ptr, params[1].ptr, params[2].ptr, params[3].ptr };
+        if (PQsendQueryPrepared(conn, page_batch.name(family, count).ptr, 4, &values, null, null, 0) != 1) return error.DatabaseQuery;
+    } else try send(conn, page_batch.statement(family, count), &.{ params[0], params[1], params[2], params[3] });
+}
+
+pub fn pageBatchRows(result: *Result, begin: usize, end: usize, allocator: std.mem.Allocator) ![]articles.Article {
+    if (begin >= end or end - begin > 100) return error.DatabaseResult;
+    if (cell(result, @intCast(begin), 1) == null) {
+        if (end != begin + 1) return error.DatabaseResult;
+        return &.{};
+    }
+    const rows = try allocator.alloc(articles.Article, end - begin);
+    var total: usize = 0;
+    for (rows, begin..) |*article, row| article.* = try articleAt(result, @intCast(row), 1, allocator, false, &total);
+    return rows;
+}
+
+pub const SharedArticles = struct {
+    const Meta = struct { value: articles.Article, bytes: usize };
+    allocator: std.mem.Allocator,
+    metadata: std.StringHashMap(Meta),
+
+    pub fn init(allocator: std.mem.Allocator) SharedArticles {
+        return .{ .allocator = allocator, .metadata = .init(allocator) };
+    }
+
+    pub fn deinit(self: *SharedArticles) void {
+        self.metadata.deinit();
+    }
+
+    pub fn rows(self: *SharedArticles, result: *Result, begin: usize, end: usize, full: bool, allocator: std.mem.Allocator) ![]articles.Article {
+        if (begin >= end or end - begin > 100) return error.DatabaseResult;
+        if (cell(result, @intCast(begin), 1) == null) {
+            if (end != begin + 1) return error.DatabaseResult;
+            return &.{};
+        }
+        const output = try allocator.alloc(articles.Article, end - begin);
+        var total: usize = 0;
+        for (output, begin..) |*article, index| {
+            const row: c_int = @intCast(index);
+            const slug = try required(result, row, 1);
+            const entry = try self.metadata.getOrPut(slug);
+            if (!entry.found_existing) {
+                errdefer _ = self.metadata.remove(slug);
+                var bytes: usize = 0;
+                var value = try articleAt(result, row, 1, self.allocator, full, &bytes);
+                try value.encodeForGroup(self.allocator);
+                entry.key_ptr.* = value.slug;
+                entry.value_ptr.* = .{ .value = value, .bytes = bytes };
+            }
+            total += entry.value_ptr.bytes;
+            if (total > 4 * 1024 * 1024) return error.ResponseTooLarge;
+            article.* = entry.value_ptr.value;
+            article.favorited = try boolean(result, row, 8);
+            article.author.following = try boolean(result, row, 12);
+        }
+        return output;
+    }
+};
+
+pub const CompactPages = struct {
+    const Meta = struct { value: articles.Article, bytes: usize };
+    result: *Result,
+    metadata: std.AutoHashMap(i64, Meta),
+    bounds: [read_batch.capacity + 1]usize,
+
+    pub fn deinit(self: *CompactPages) void {
+        self.metadata.deinit();
+    }
+
+    pub fn rows(self: *const CompactPages, index: usize, allocator: std.mem.Allocator) ![]articles.Article {
+        const begin = self.bounds[index];
+        const end = self.bounds[index + 1];
+        if (begin >= end or end - begin > 100) return error.DatabaseResult;
+        if (cell(self.result, @intCast(begin), 13) == null) {
+            if (end != begin + 1) return error.DatabaseResult;
+            return &.{};
+        }
+        const output = try allocator.alloc(articles.Article, end - begin);
+        var total: usize = 0;
+        for (output, begin..) |*article, row| {
+            const id = std.fmt.parseInt(i64, try required(self.result, @intCast(row), 13), 10) catch return error.DatabaseResult;
+            const position = std.fmt.parseInt(usize, try required(self.result, @intCast(row), 14), 10) catch return error.DatabaseResult;
+            if (position != row - begin + 1) return error.DatabaseResult;
+            const meta = self.metadata.get(id) orelse return error.DatabaseResult;
+            total += meta.bytes;
+            if (total > 4 * 1024 * 1024) return error.ResponseTooLarge;
+            article.* = meta.value;
+            article.favorited = try boolean(self.result, @intCast(row), 8);
+            article.author.following = try boolean(self.result, @intCast(row), 12);
+        }
+        return output;
+    }
+};
+
+pub fn compactPages(result: *Result, expected: usize, allocator: std.mem.Allocator) !CompactPages {
+    if (PQresultStatus(result) != 2 or PQnfields(result) != 15) return error.DatabaseResult;
+    const count: usize = @intCast(PQntuples(result));
+    if (count < expected or count > expected * 200) return error.DatabaseResult;
+    var group: CompactPages = .{ .result = result, .metadata = .init(allocator), .bounds = undefined };
+    errdefer group.deinit();
+    var start: usize = 0;
+    while (start < count) : (start += 1) {
+        const ordinal = std.fmt.parseInt(usize, try required(result, @intCast(start), 0), 10) catch return error.DatabaseResult;
+        if (ordinal != 0) break;
+        var bytes: usize = 0;
+        var value = try articleAt(result, @intCast(start), 1, allocator, false, &bytes);
+        try value.encodeForGroup(allocator);
+        const id = std.fmt.parseInt(i64, try required(result, @intCast(start), 13), 10) catch return error.DatabaseResult;
+        const entry = try group.metadata.getOrPut(id);
+        if (entry.found_existing) return error.DatabaseResult;
+        entry.value_ptr.* = .{ .value = value, .bytes = bytes };
+    }
+    try readBatchBoundsFrom(result, expected, 15, &group.bounds, start);
+    return group;
+}
+
+pub fn pageBatchCount(result: *Result, row: usize) !i64 {
+    const value = std.fmt.parseInt(i64, try required(result, @intCast(row), 1), 10) catch return error.DatabaseResult;
+    if (value < 0 or value > 1000) return error.DatabaseResult;
+    return value;
 }
 
 pub fn checkSingleBatch(result: *Result, expected: usize) !void {
@@ -356,28 +707,29 @@ fn commentRows(result: *Result, allocator: std.mem.Allocator, single: bool, offs
     if (offset == 1 and count == 1 and PQgetisnull(result, 0, 1) != 0) return &.{};
     const comments = try allocator.alloc(operations.Comment, count);
     var total: usize = 0;
-    for (comments, 0..) |*comment, index| {
-        const row: c_int = @intCast(index);
-        for (0..8) |column| {
-            total += @intCast(PQgetlength(result, row, @as(c_int, @intCast(column)) + offset));
-            if (total > 4 * 1024 * 1024) return error.ResponseTooLarge;
-        }
-        const id = std.fmt.parseInt(i64, try required(result, row, offset + 0), 10) catch return error.DatabaseResult;
-        if (id <= 0) return error.DatabaseResult;
-        comment.* = .{
-            .id = id,
-            .body = try textCell(result, row, offset + 1, allocator),
-            .createdAt = try textCell(result, row, offset + 2, allocator),
-            .updatedAt = try textCell(result, row, offset + 3, allocator),
-            .author = .{
-                .username = try textCell(result, row, offset + 4, allocator),
-                .bio = try nullableCell(result, row, offset + 5, allocator),
-                .image = try nullableCell(result, row, offset + 6, allocator),
-                .following = try boolean(result, row, offset + 7),
-            },
-        };
-    }
+    for (comments, 0..) |*comment, index| comment.* = try commentAt(result, @intCast(index), offset, allocator, &total);
     return comments;
+}
+
+fn commentAt(result: *Result, row: c_int, offset: c_int, allocator: std.mem.Allocator, total: *usize) !operations.Comment {
+    for (0..8) |column| {
+        total.* += @intCast(PQgetlength(result, row, @as(c_int, @intCast(column)) + offset));
+        if (total.* > 4 * 1024 * 1024) return error.ResponseTooLarge;
+    }
+    const id = std.fmt.parseInt(i64, try required(result, row, offset + 0), 10) catch return error.DatabaseResult;
+    if (id <= 0) return error.DatabaseResult;
+    return .{
+        .id = id,
+        .body = try textCell(result, row, offset + 1, allocator),
+        .createdAt = try textCell(result, row, offset + 2, allocator),
+        .updatedAt = try textCell(result, row, offset + 3, allocator),
+        .author = .{
+            .username = try textCell(result, row, offset + 4, allocator),
+            .bio = try nullableCell(result, row, offset + 5, allocator),
+            .image = try nullableCell(result, row, offset + 6, allocator),
+            .following = try boolean(result, row, offset + 7),
+        },
+    };
 }
 
 pub fn operationResult(result: *Result, operation: *operations.Operation, allocator: std.mem.Allocator) !u16 {

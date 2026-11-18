@@ -18,15 +18,18 @@ module Conduit
   class State
     getter scratch = Rayo::Buf.new(1024)
     getter tags = Rayo::PG::Batch.new
-    getter array_scratch = Rayo::Buf.new(1024)
-    getter token = Bytes.new(4096)
-    getter claims = Bytes.new(4096)
-    getter payload = Rayo::Buf.new(128)
     property viewer = 0_i64
     property fresh = false
   end
 
   STATES = {} of UInt64 => State
+
+  # Used only within one synchronous step (token signing/verification, tag lists), so
+  # one copy per worker is enough; per connection they cost ~9 KB each at 100k users.
+  TOKEN         = Bytes.new(4096)
+  CLAIMS        = Bytes.new(4096)
+  PAYLOAD       = Rayo::Buf.new(128)
+  ARRAY_SCRATCH = Rayo::Buf.new(1024)
 
   def self.state(ctx)
     STATES[ctx.object_id] ||= State.new
@@ -67,7 +70,7 @@ module Conduit
       return state(ctx).viewer = 0_i64
     end
     raise Invalid.new(401) unless h.size > 6 && h[0, 6] == "Token ".to_slice
-    claims = KEY.verify(h[6..], state(ctx).claims, now: Time.utc.to_unix)
+    claims = KEY.verify(h[6..], CLAIMS, now: Time.utc.to_unix)
     raise Invalid.new(401) unless claims
     begin
       raise Invalid.new(401) unless claims["exp"].i64?
@@ -85,10 +88,9 @@ module Conduit
   end
 
   def self.issue(ctx, id)
-    s = state(ctx)
-    s.payload.clear
-    s.payload << "{\"sub\":\"" << id << "\",\"iat\":" << Time.utc.to_unix << ",\"exp\":" << (Time.utc.to_unix + 30 * 86400) << "}"
-    KEY.sign(Bytes.new(s.payload.ptr, s.payload.len), s.token)
+    PAYLOAD.clear
+    PAYLOAD << "{\"sub\":\"" << id << "\",\"iat\":" << Time.utc.to_unix << ",\"exp\":" << (Time.utc.to_unix + 30 * 86400) << "}"
+    KEY.sign(Bytes.new(PAYLOAD.ptr, PAYLOAD.len), TOKEN)
   end
 
   def self.wrapper(ctx, name)
@@ -232,7 +234,7 @@ module Conduit
     n = full ? 1 : 0
     fields = {slug: row.str(1), title: row.str(2), description: row.str(3),
               createdAt: timestamp(ctx, row.str(4 + n)), updatedAt: timestamp(ctx, row.str(5 + n)),
-              tagList: TagList.new(row, 6 + n, s.array_scratch), favoritesCount: row.i64(7 + n), favorited: favorited,
+              tagList: TagList.new(row, 6 + n, ARRAY_SCRATCH), favoritesCount: row.i64(7 + n), favorited: favorited,
               author: profile(row, 9 + n, following)}
     include_body ? fields.merge({body: row.str(4)}) : fields
   end

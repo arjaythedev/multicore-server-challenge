@@ -46,10 +46,14 @@ PG write thread (x DB_WRITE_CONNS, default 2): group commit. Takes all queued wr
   BEGIN; w1; w2; ...; COMMIT; Sync in ONE round trip; resumes callers only after COMMIT's ReadyForQuery.
   On any error: ROLLBACK, then each job alone (autocommit). `isolated` writes (register, user update: unique
   violations expected) always run alone.
-bcrypt thread (x BCRYPT_THREADS, default 1, nice 10): collects up to 8 jobs within BCRYPT_BATCH_MS (400 ms; at
+bcrypt thread (x BCRYPT_THREADS, default max(2, cpus/4)): collects up to 8 jobs within BCRYPT_BATCH_MS (400 ms; at
   ~28 logins/s 93% of batches are full), computes them as interleaved lanes in one call to the C kernel (FFM on the
   JVM, cinterop on Native; 12.6-13 ms CPU/hash at 8 lanes vs 23.4 / 18.7 ms for the Kotlin 4 lanes), resumes
   each caller on the bcrypt thread. If the kernel is missing or fails its startup checks: Kotlin lanes, up to 4.
+  Extra bcrypt workers (BCRYPT_THREADS_MAX, default cpus/2; BCRYPT_EXTRA_AGE_MS, default window + 100 ms) sleep until the
+  oldest queued login has waited that long, i.e. until every base thread is busy, then take what is queued (a partial
+  batch too): a login rate above what the base threads hash (about 36/s per thread on the busy box) is absorbed instead
+  of timing out, and the extra threads use CPU only while such a backlog exists.
 ```
 
 Every statement is prepared once per connection at startup (named `s<id>`, explicit parameter OIDs, no Describe);
@@ -123,8 +127,16 @@ does the same inside each kind's batched statement (`ReadShare` in app/Sql.kt), 
   shared shape cost more there).
 - Every keyed LATERAL ends in `OFFSET 0`: pulled up into a plain join, the generic plan (which takes a LIMIT parameter
   for 10% of the table) hashed all of articles and users per execution (278 ms per 60 requests).
-- `ReadPool` sends a kind once its oldest request has waited `READ_GATHER_MS` or its batch is full
+- `ReadPool` sends a kind once its oldest request has waited the gather window or its batch is full
   (`READ_MAX_BATCH`, 256); a `db-gather` clock thread hands kinds whose window passed to idle connections.
+- The window is `READ_GATHER_MS` (30). Optional, off by default: `GatherTuner` (db/GatherTuner.kt, `READ_GATHER_AUTO=1`) samples the busy
+  share of the CPUs in Cpus_allowed_list from /proc/stat once a second and widens the window by 10 ms per second up to
+  `READ_GATHER_MAX_MS` while it is at least 75% busy, back down at 60% or less. Bigger batches make the statements cheaper
+  per request (lab, 180k users, fixed windows: Postgres 91 / 75 / 69 / 64 us per request at 30 / 60 / 90 / 120 ms); the price is latency,
+  which is only worth paying once the CPUs are the bottleneck.
+- Postgres sockets time out after 15 s (`PG_IO_TIMEOUT_S`). A worker with no reply outstanding treats the timeout as nothing
+  (an idle connection has nothing to receive: `Worker.awaitMessage` waits again); with a batch in flight it is the hang
+  detector and the worker reconnects.
 
 Connections: 8 read + 4 write on the box (one per CPU, one per two). With 6 + 2, the write connections were ~100%
 busy at 120k users waiting on the WAL flush, and the writes' backlog (5% of requests) broke p99; the read connections
@@ -134,6 +146,31 @@ Lab (2026-10-27, box simulation on 8 of 20 laptop CPUs, lab/reports/omarchy-2026
 went from 170 to 127 us/req (statement execution 5.4 -> 4.1 cores; the global list 127 -> 44 s per 2 minutes), the
 app from 46 to 40 us/req; the scorer's search held 130k (here) instead of 120k. Per execution, 60 workload-shaped
 requests: global list 15.8 -> 4.8 ms, author list 5.3 -> 3.3, article 0.85 -> 0.50, tag list 11.7 -> 9.3.
+
+## Shared rows (`READ_SHARED_ROWS`, default on) and the feed (`READ_FEED_SHARE`, default on)
+
+The shared shapes above still sent every row to every request: 865 comments requests over a few dozen threads made
+Postgres serialize, and the pool parse, each thread once per request. The leaders send each distinct row once
+(.tmp/reports/multicore-sql-research-20261030.md has the statement-by-statement comparison). Kinds with
+`Sharing.GROUPS` (comments, article, global/tag/author lists) now do the same:
+- the pool groups a batch by (key, limit, offset) (`Grouper`, by the key as Postgres sees it: `wireKey`); the statement
+  groups the same way (`min(r.i)` per group) and returns each group's rows ONCE, tagged with the group's first request;
+  `ReadWorker.processReply` hands every request of a group views of those rows (same receive buffer, no copy).
+- what differs per request (favorited, following) comes back as flag rows `(-1 - request, flag int8, NULL...)`: the
+  article id when the viewer favorited it, minus the author id when they follow the author (comments: the author id).
+  One favorites_pkey and one follows_pkey probe per signed-in request, `= ANY` of the group's articles / authors.
+  `Result.hasFlag` looks them up; `JsonWriter.article(..., flags)` and the comments handler use them. Rows then carry
+  the article id and the author id after the usual layout (see `Cols`).
+- the feed keeps its per-request rows (every viewer's page is different) but decorates each distinct page article once:
+  the viewers' page ids are cut first, then tags, favorites counts and authors come from one `= ANY` probe per table
+  and the viewer's favorited flags from one favorites_pkey probe per viewer (about 630 page rows for 290-340
+  distinct articles at 64 feeds).
+Both are exact: the equality harness (.tmp/exp/sqlr, eqgen.py / eqgen2.py) compares every column of every request's
+rows, in order, with the previous statements on the full seed (sizes 1 to 800, anonymous viewers, 404 keys, empty and
+past-the-end pages, hub authors around the 1000-article cap, viewers who follow/favorite what is in the rows).
+EXPLAIN replay, new/old Postgres time per batch on the loaded lab box: feed 76% at 64 feeds, comments 20% (20 hot
+slugs) to 55% (200 slugs), article 80%, global list 26%, tag list 68%, author list 58%.
+`READ_SHARED_ROWS=0` / `READ_FEED_SHARE=0` run the previous statements.
 
 ## Kotlin/Native specifics (linuxX64Main, build.gradle.kts)
 
@@ -210,3 +247,14 @@ server-config changes; session settings only. <= 95 Postgres connections total.
 - Local fd limit is 20000 per process (cannot be raised); the box gives 200000.
 - Research notes (verbatim SQL of the top entries, conformance checklist, bcrypt details):
   `/tmp/claude-0/-home-user-multicore-server-challenge/99796a5c-b120-524c-822d-dc73b94b523b/scratchpad/research/`
+
+## Two-phase reads (READ_TP)
+
+Ported from rust-epoll-theCatWisel's read path (MIT; `db/TwoPhase.kt`, statements in `db/TpSql.kt`). When any of the
+two-phase kinds is ready, every two-phase queue goes into one mixed batch. Phase A is one Sync pipeline of per-kind
+statements returning ids and counts (identical slugs, pages and viewers are interned and queried once). Phase B is one
+round trip: `artx` (article columns, tag ids, favorites count per distinct article), `artau` (per distinct author),
+`flags` (favorited/following per viewer) and the tags table. The app maps tag ids to names, formats each distinct
+article once per batch and assembles every response. Everything lives for one batch only; nothing is kept between
+batches. Deviations from the leader's SQL for exact results: the capped-count gate on tag/author/favorited pages is
+removed, and tag order follows the database collation (`ORDER BY name`).

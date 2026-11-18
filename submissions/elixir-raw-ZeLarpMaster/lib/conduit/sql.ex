@@ -195,7 +195,111 @@ defmodule Conduit.Sql do
                  "password_hash = COALESCE($4, password_hash), bio = COALESCE($5, bio), image = COALESCE($6, image) " <>
                  "WHERE id = $1 RETURNING id, username, email, bio, image"
 
+  # ------------------------------------------------------------------ read plans (Conduit.Plan)
+  # Phase A: one statement per kind of read, over the batch's distinct keys: rows (ordinal, capped count, page ids
+  # newest first). Counts and pages are the single statements' (a page of at most 100 = their constant bound).
+  # Phase B: the columns of every distinct article of the batch once, and the batch viewers' favorites and follows
+  # among those articles and their authors.
+
+  @plan_all "SELECT r.i, #{at_least_1000.("SELECT 1 FROM articles a ORDER BY a.id")}, " <>
+              "ARRAY(SELECT a.id FROM articles a ORDER BY a.id DESC LIMIT r.l OFFSET r.o) " <>
+              "FROM unnest($1::int8[], $2::int8[]) WITH ORDINALITY AS r(l, o, i)"
+
+  @plan_tag "SELECT r.i, c.n, ARRAY(SELECT at.article_id FROM article_tags at WHERE at.tag_id = t.id " <>
+              "ORDER BY at.article_id DESC LIMIT r.l OFFSET r.o) " <>
+              "FROM unnest($1::text[], $2::int8[], $3::int8[]) WITH ORDINALITY AS r(k, l, o, i) " <>
+              "LEFT JOIN tags t ON t.name = r.k CROSS JOIN LATERAL (SELECT " <>
+              at_least_1000.("SELECT 1 FROM article_tags at WHERE at.tag_id = t.id") <> " AS n) c"
+
+  @plan_author "SELECT r.i, c.n, ARRAY(SELECT a.id FROM articles a WHERE a.author_id = u.id " <>
+                 "ORDER BY a.id DESC LIMIT r.l OFFSET r.o) " <>
+                 "FROM unnest($1::text[], $2::int8[], $3::int8[]) WITH ORDINALITY AS r(k, l, o, i) " <>
+                 "LEFT JOIN users u ON u.username = r.k CROSS JOIN LATERAL (SELECT " <>
+                 capped.("SELECT 1 FROM articles a WHERE a.author_id = u.id") <> " AS n) c"
+
+  @plan_favorited "SELECT r.i, c.n, ARRAY(SELECT f.article_id FROM favorites f WHERE f.user_id = u.id " <>
+                    "ORDER BY f.article_id DESC LIMIT r.l OFFSET r.o) " <>
+                    "FROM unnest($1::text[], $2::int8[], $3::int8[]) WITH ORDINALITY AS r(k, l, o, i) " <>
+                    "LEFT JOIN users u ON u.username = r.k CROSS JOIN LATERAL (SELECT " <>
+                    capped.("SELECT 1 FROM favorites f WHERE f.user_id = u.id") <> " AS n) c"
+
+  # The plan's feed viewers' shared followees (followed by 3+ of them) with 1000+ articles ("hubs", after
+  # rust-epoll-theCatWisel and zig-iouring-nick-potts): a viewer following one has a capped count of 1000. Each
+  # candidate walks up to 1000 index entries; for 100 random viewers, 2+ followers gave 165 candidates (27 heavy,
+  # 8.9 ms), 3+ gave 67 (25 heavy, 5.3 ms), and both covered all 77 viewers who follow a heavy author.
+  @plan_feed_heavy "SELECT h.f FROM (SELECT fo.followee_id AS f FROM follows fo WHERE fo.follower_id = ANY ($1::int8[]) " <>
+                     "GROUP BY fo.followee_id HAVING count(*) > 2) h " <>
+                     "WHERE EXISTS (SELECT 1 FROM articles a WHERE a.author_id = h.f OFFSET 999)"
+
+  # $4 = limit + offset (saturated by the caller), as in the single feed; $5 = plan_feed_heavy's authors
+  @plan_feed "SELECT r.i, CASE WHEN EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.v " <>
+               "AND fo.followee_id = ANY ($5::int8[])) THEN 1000::bigint ELSE " <>
+               "(SELECT count(*) FROM (SELECT 1 FROM articles a WHERE a.author_id = " <>
+               "ANY (ARRAY(SELECT fo.followee_id FROM follows fo WHERE fo.follower_id = r.v)) LIMIT 1000) s) END, " <>
+               "ARRAY(SELECT x.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 " <>
+               "WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT r.d) x WHERE fo.follower_id = r.v " <>
+               "ORDER BY x.id DESC LIMIT r.l OFFSET r.o) " <>
+               "FROM unnest($1::int8[], $2::int8[], $3::int8[], $4::int8[]) WITH ORDINALITY AS r(v, l, o, d, i)"
+
+  @plan_slug "SELECT r.i, a.id, a.body FROM unnest($1::text[]) WITH ORDINALITY AS r(k, i) " <>
+               "JOIN articles a ON a.slug = r.k"
+
+  # Column order is what Conduit.Plan splices into the single statements' rows.
+  @plan_articles "SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, #{@tag_list}, " <>
+                   "(SELECT count(*) FROM favorites f WHERE f.article_id = a.id), a.author_id, u.username, u.bio, u.image " <>
+                   "FROM unnest($1::int8[]) AS d(id) JOIN articles a ON a.id = d.id JOIN users u ON u.id = a.author_id"
+
+  # plan_articles for plans whose favorite counts come from the count lane (Conduit.PlanCounts): the same row with a
+  # placeholder count.
+  @plan_articles_nc "SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, #{@tag_list}, " <>
+                      "0::int8, a.author_id, u.username, u.bio, u.image " <>
+                      "FROM unnest($1::int8[]) AS d(id) JOIN articles a ON a.id = d.id JOIN users u ON u.id = a.author_id"
+
+  # The count lane's statement: each distinct article of the waiting plans' ids, its favorite count.
+  @plan_counts "SELECT d.id, (SELECT count(*) FROM favorites f WHERE f.article_id = d.id) " <>
+                 "FROM (SELECT DISTINCT unnest($1::int8[]) AS id) d"
+
+  # One primary-key range scan per viewer, its rows kept when their article is one of the plan's (rows of any viewer x
+  # any id: the caller looks up its own pairs), through a hash of the ids. As a second array key of the index
+  # condition, Postgres walked viewers x ids (16 ms per execution at 175k users, 60% of its time); as `= ANY` filter
+  # it searched the array linearly per favorite (a parameter array isn't hashed): 30 ms for 128 viewers x 3000 ids,
+  # against 0.9 ms as this hash semi-join.
+  @plan_favs "SELECT f.user_id, f.article_id FROM favorites f " <>
+               "WHERE f.user_id = ANY ($1::int8[]) AND f.article_id IN (SELECT unnest($2::int8[]))"
+
+  # The plan's viewers' follows of the plan's authors ($2: article and comment authors), through a hash of the
+  # authors as plan_favs. Every follow of the viewers (~20 each) was 2,100 rows per execution for the app to sift.
+  @plan_follows "SELECT fo.follower_id, fo.followee_id FROM follows fo WHERE fo.follower_id = ANY ($1::int8[]) " <>
+                  "AND fo.followee_id IN (SELECT unnest($2::int8[]))"
+
+  # Each distinct slug's comments as the single statement reads them, with their author ids for plan_follows.
+  @plan_comments "SELECT r.i, a.id, x.id, x.body, x.created_at, x.updated_at, x.author_id, x.username, x.bio, x.image " <>
+                   "FROM unnest($1::text[]) WITH ORDINALITY AS r(k, i) JOIN articles a ON a.slug = r.k " <>
+                   "LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at, c.author_id, u.username, u.bio, " <>
+                   "u.image FROM comments c JOIN users u ON u.id = c.author_id WHERE c.article_id = a.id " <>
+                   "ORDER BY c.created_at DESC, c.id DESC LIMIT 100) x ON true " <>
+                   "ORDER BY r.i, x.created_at DESC, x.id DESC"
+
+  # The plan's profile reads, each request's row (no row: unknown user) as the single statement's after `r.i`.
+  @plan_profile "SELECT r.i, u.id, u.username, u.bio, u.image, " <>
+                  "EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = r.v AND fo.followee_id = u.id) " <>
+                  "FROM unnest($1::int8[], $2::text[]) WITH ORDINALITY AS r(v, k, i) JOIN users u ON u.username = r.k"
+
   @statements [
+    plan_all: @plan_all,
+    plan_profile: @plan_profile,
+    plan_tag: @plan_tag,
+    plan_author: @plan_author,
+    plan_favorited: @plan_favorited,
+    plan_feed: @plan_feed,
+    plan_feed_heavy: @plan_feed_heavy,
+    plan_slug: @plan_slug,
+    plan_articles: @plan_articles,
+    plan_articles_nc: @plan_articles_nc,
+    plan_counts: @plan_counts,
+    plan_favs: @plan_favs,
+    plan_follows: @plan_follows,
+    plan_comments: @plan_comments,
     list_all: @list_all,
     list_tag: @list_tag,
     list_author: @list_author,

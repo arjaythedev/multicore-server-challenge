@@ -17,7 +17,7 @@ from collections import defaultdict
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from conduit_server import main as app  # noqa: E402
-from conduit_server.adapters.inbound import router as router_mod, socket_server  # noqa: E402
+from conduit_server.adapters.inbound import router as router_mod, socket_server, controllers  # noqa: E402
 from conduit_server.adapters.outbound import pg_repository, pg_broker, crypto_adapter  # noqa: E402
 
 _clock = time.thread_time_ns
@@ -56,20 +56,19 @@ _patch(Srv, "_flush", "socket send")
 _patch(Srv, "_accept", "accept + close")
 _patch(Srv, "_close", "accept + close")
 _patch(Srv, "_respond", "requests")  # synchronous requests only (pipelined ones skip it); breakdown counts parses
-_patch(socket_server, "parse_request", "http parse")  # imported by name into socket_server
+_patch(router_mod, "parse_request", "http parse")  # main passes it to the server at startup, after this patch
 _patch(router_mod.SocketRouter, "dispatch", "router dispatch")
 _patch(router_mod.SocketRouter, "resume", "controllers + domain")  # generator handlers' bodies run inside it
 _patch(router_mod.SocketRouter, "_build_response", "json encode + response bytes", static=True)
-_patch(router_mod.HttpRequest, "json", "json decode (request)")
+_patch(controllers, "_body", "json decode (request)")
 for route in router_mod.router.routes:
     route.handler = timed("controllers + domain", route.handler)
 
-Crypto = crypto_adapter.JoseBcryptCryptoAdapter
 for name in ("hash_password", "verify_password"):
-    _patch(Crypto, name, "bcrypt")
+    _patch(crypto_adapter.BcryptPasswordHasher, name, "bcrypt")
 _patch(crypto_adapter, "bcrypt_many", "bcrypt")  # logins, on the broker's bcrypt threads (looked up at call time)
 for name in ("issue_token", "verify_token"):
-    _patch(Crypto, name, "jwt verify/issue")
+    _patch(crypto_adapter.Hs256TokenService, name, "jwt verify/issue")
 
 Repo = pg_repository.PostgresUserRepository
 _patch(Repo, "_run", "libpq exec (send+wait+recv, params)", static=True)

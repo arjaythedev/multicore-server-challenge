@@ -190,6 +190,9 @@ internal class EngineCore(private val handler: suspend (Exchange) -> Unit) {
     /** A response buffer for [Ex] (any thread): taken when the response is rendered, not when the request is parsed. */
     internal fun takeOut(): Out = pool.get()
 
+    /** Returns an unsent buffer (any thread), e.g. the uncompressed body once its gzipped copy is sent instead. */
+    internal fun putOut(o: Out) = pool.put(o)
+
     /** Answers [status] with Connection: close and drops all input. Returns [end] (everything consumed). */
     private fun reject(cs: ConnState, status: Int, message: String, end: Int): Int {
         cs.inBuf = null

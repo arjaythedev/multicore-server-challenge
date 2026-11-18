@@ -401,6 +401,33 @@ object Passwords {
     /** A worker is waiting for its batch to fill; the others take only full batches meanwhile. */
     private var gathering = false
     private var windowNanos = 0L
+
+    /**
+     * Extra workers (BCRYPT_THREADS_MAX above BCRYPT_THREADS, BCRYPT_EXTRA_AGE_MS): they sleep until the oldest queued job
+     * has waited [extraAgeNanos], which is past its batch window, so every base worker is busy by then, and then take
+     * what is queued (a partial batch included). Idle they cost nothing; a login rate beyond what the base workers hash
+     * (about 36 logins/s per thread on the busy box) is absorbed instead of timing out, and the extra threads compete for
+     * the CPU only while such a backlog exists. 0 extra workers: nothing changes.
+     */
+    private var extraThreads = 0
+    private var extraAgeNanos = 0L
+    private var iExtra = 0L // batches the extra workers took in this interval (guarded by lock)
+
+    /**
+     * Adaptive flush, off by default (BCRYPT_FLUSH_MIN / BCRYPT_FLUSH_AGE_MS / BCRYPT_PRIO_LOAD): the batch window above
+     * exists to fill the lanes (a 400 ms window is most of a login's latency), but a login is latency-critical while
+     * the other requests can sit in their own gather windows. So the gatherer stops waiting early when
+     *  - [flushMin] or more jobs are queued and the oldest has waited [flushAgeNanos] (a partial batch, not a tiny one), or
+     *  - the system is loaded: [priorityLoad] or more reads are queued for Postgres (logins go first, now).
+     * 0 keeps the plain window.
+     */
+    private var flushMin = 0
+    private var flushAgeNanos = 0L
+    @Volatile
+    private var priorityLoad = 0
+    /** Reads queued for Postgres right now, set by the app ([conduit.db.Db.readsQueued]); only used with [priorityLoad]. */
+    @Volatile
+    var loadProbe: (() -> Int)? = null
     private var started = false
     private var skipAbandoned = false
     private var queueMax = 0
@@ -417,9 +444,11 @@ object Passwords {
     fun intervalStats(): String {
         lock.lock()
         try {
-            val s = "bcrypt $iJobs/$iBatches wait ${wait.take()}, queued ${queue.size}"
+            var s = "bcrypt $iJobs/$iBatches wait ${wait.take()}, queued ${queue.size}"
+            if (extraThreads > 0) s += ", extra $iExtra"
             iJobs = 0
             iBatches = 0
+            iExtra = 0
             return s
         } finally {
             lock.unlock()
@@ -430,20 +459,35 @@ object Passwords {
      * Starts [threads] bcrypt workers. [batchWindowMs]: how long a worker waits to collect lanes before starting.
      * [queueMax]: queued jobs that make [saturated] (0: never). [skipAbandoned]: drop queued jobs whose HTTP client is
      * gone ([Exchange.abandoned]) instead of hashing them (about 12.6 ms of CPU each); their handlers never resume.
+     * [extraThreads] more workers start but work only on a backlog: the oldest queued job has waited [extraAgeMs] (see
+     * [extraAgeNanos]; keep it above [batchWindowMs]).
      */
-    fun start(threads: Int, batchWindowMs: Long, queueMax: Int = 0, skipAbandoned: Boolean = false) {
+    fun start(
+        threads: Int, batchWindowMs: Long, queueMax: Int = 0, skipAbandoned: Boolean = false,
+        flushMin: Int = 0, flushAgeMs: Long = 100, priorityLoad: Int = 0, niceLevel: Int = 10,
+        extraThreads: Int = 0, extraAgeMs: Long = 500,
+    ) {
         lock.lock()
         try {
             if (started) return // (tests may call it more than once)
             started = true
             windowNanos = batchWindowMs * 1_000_000
+            this.flushMin = flushMin
+            this.flushAgeNanos = flushAgeMs * 1_000_000
+            this.priorityLoad = priorityLoad
             this.queueMax = queueMax
             this.skipAbandoned = skipAbandoned
+            this.extraThreads = maxOf(0, extraThreads)
+            this.extraAgeNanos = extraAgeMs * 1_000_000
         } finally {
             lock.unlock()
         }
         println("bcrypt: ${BcryptKernel.init()}")
-        for (i in 0 until maxOf(1, threads)) startThread("bcrypt-$i", nice = 10) { worker(warm = i == 0) }
+        val base = maxOf(1, threads)
+        for (i in 0 until base) startThread("bcrypt-$i", nice = niceLevel) { worker(warm = i == 0, extra = false) }
+        for (i in 0 until maxOf(0, extraThreads)) {
+            startThread("bcrypt-x$i", nice = niceLevel) { worker(warm = false, extra = true) }
+        }
     }
 
     /** A new "$2b$10$..." hash with a fresh 16-byte random salt. Always suspends; resumes on a bcrypt thread. */
@@ -478,6 +522,8 @@ object Passwords {
             COROUTINE_SUSPENDED
         }
     }
+
+    private const val LOAD_POLL_NANOS = 20_000_000L // how often a waiting gatherer re-reads the load probe
 
     private val EMPTY_KEY = IntArray(18)
     private val EMPTY_SALT = IntArray(4)
@@ -517,7 +563,7 @@ object Passwords {
         noteQueued()
     }
 
-    private fun worker(warm: Boolean) {
+    private fun worker(warm: Boolean, extra: Boolean) {
         if (warm && !BcryptKernel.native) {
             try {
                 warmUp()
@@ -528,7 +574,7 @@ object Passwords {
         val batch = arrayOfNulls<Job>(BcryptKernel.MAX_LANES)
         while (true) {
             try {
-                run(batch, take(batch))
+                run(batch, take(batch, extra))
             } catch (t: Throwable) {
                 logSafe({ "bcrypt worker" }, t)
             }
@@ -539,23 +585,41 @@ object Passwords {
     /**
      * Blocks until a batch is ready: up to [BcryptKernel.maxLanes] jobs of the oldest job's cost, taken once the batch
      * is full or the oldest job is due. One worker gathers at a time; the others take only full batches meanwhile.
+     * An [extra] worker never gathers: it takes the queue (full or not) once the oldest job has waited [extraAgeNanos].
      */
-    private fun take(batch: Array<Job?>): Int {
+    private fun take(batch: Array<Job?>, extra: Boolean): Int {
         val max = BcryptKernel.maxLanes
         lock.lock()
         try {
             while (true) {
                 if (skipAbandoned) dropAbandoned() // so that the batch size below counts live jobs only
-                if (queue.isEmpty() || (gathering && queue.size < max)) {
+                if (queue.isEmpty()) {
                     lock.await()
                     continue
                 }
-                if (queue.size < max) {
+                if (extra) {
+                    val age = nanoTime() - queue[0].born
+                    if (age < extraAgeNanos) {
+                        lock.awaitNanos(extraAgeNanos - age) // an enqueue or a finished batch wakes it early: re-checked
+                        continue
+                    }
+                } else if (gathering && queue.size < max) {
+                    lock.await()
+                    continue
+                }
+                if (!extra && queue.size < max) {
                     gathering = true
                     try {
                         while (queue.isNotEmpty() && queue.size < max) {
-                            val wait = queue[0].due - nanoTime()
+                            val now = nanoTime()
+                            var wait = queue[0].due - now
+                            if (flushMin > 0 && queue.size >= flushMin) wait = minOf(wait, queue[0].born + flushAgeNanos - now)
                             if (wait <= 0) break
+                            if (priorityLoad > 0) {
+                                // loaded: logins go first, now; the load can rise while we sleep, so poll it
+                                if ((loadProbe?.invoke() ?: 0) >= priorityLoad) break
+                                wait = minOf(wait, LOAD_POLL_NANOS)
+                            }
                             lock.awaitNanos(wait)
                         }
                     } finally {
@@ -581,6 +645,7 @@ object Passwords {
                 for (k in 0 until n) wait.add(now - batch[k]!!.born)
                 iJobs += n
                 iBatches++
+                if (extra) iExtra++
                 lock.signalAll() // leftovers need a new gatherer
                 return n
             }

@@ -14,6 +14,7 @@ import struct
 import subprocess
 import threading
 import time
+import uuid
 
 from support import Server, mint, sql, upstream
 
@@ -56,7 +57,13 @@ class Proxy:
         self.release_new.set()
         self.drop_commit = threading.Event()
         self.commit_dropped = threading.Event()
+        self.drop_favorite = threading.Event()
+        self.favorite_dropped = threading.Event()
         self.sessions = []
+        self.hold_counts = False
+        self.count_seen = threading.Event()
+        self.release_counts = threading.Event()
+        self.release_counts.set()
         self.threads = []
 
     def launch(self, function, *args):
@@ -79,11 +86,16 @@ class Proxy:
                     continue
                 backend = socket.create_connection(('127.0.0.1', int(os.environ['PGPORT'])), timeout=3)
                 backend.settimeout(None)
+                # Forward protocol messages immediately; Nagle plus delayed ACKs
+                # must not turn preparation into an artificial startup stall.
+                for peer in (client, backend):
+                    peer.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             except (OSError, socket.timeout):
                 if client is not None:
                     client.close()
                 continue
-            session = {'sockets': (client, backend), 'prepared': set(), 'settings': 0, 'tuning': set(), 'tags': 0, 'article_groups': 0, 'article_single': 0, 'pause': self.pause_new}
+            session = {'sockets': (client, backend), 'prepared': set(), 'settings': 0, 'tuning': set(), 'tags': 0, 'article_groups': 0, 'article_single': 0, 'comment_groups': 0, 'compact_comment_groups': 0, 'comment_single': 0, 'page_groups': 0, 'count_groups': 0, 'page_queries': 0, 'count_queries': 0, 'pause': self.pause_new}
+            session.update(favorite_groups=0, favorite_single=0, favorite_pending=False, favorite_executions=[], feed_hub_preparations=0, profile_groups=0, profile_single=0)
             self.sessions.append(session)
             self.launch(self.frontend, session)
             self.launch(self.backend, session)
@@ -108,15 +120,56 @@ class Proxy:
                     name, statement = body.split(b'\0', 1)
                     if name:
                         session['prepared'].add(name.decode('ascii'))
+                        if b'shared_feed_hubs AS MATERIALIZED' in statement:
+                            session['feed_hub_preparations'] += 1
                     elif statement.startswith(b"SET statement_timeout = '8s'\0"):
                         session['settings'] += 1
                     elif statement.startswith(b'SET jit = off\0') or statement.startswith(b'SET plan_cache_mode = '):
                         session['tuning'].add(statement.split(b'\0', 1)[0])
                 elif header[:1] == b'B':
                     name = body.split(b'\0', 2)[1]
+                    if name in (b'batch_favorite', b'batch_unfavorite', b'op_favorite', b'op_unfavorite'):
+                        # Track original request identities, including legitimate
+                        # singleton groups, rather than treating every single
+                        # statement after an injected disconnect as a replay.
+                        parameters = body.split(b'\0', 2)[2]
+                        formats = struct.unpack_from('!H', parameters)[0]
+                        assert all(struct.unpack_from('!H', parameters, 2 + 2*i)[0] == 0 for i in range(formats))
+                        offset = 2 + 2*formats
+                        count = struct.unpack_from('!H', parameters, offset)[0]
+                        offset += 2
+                        values = []
+                        for _ in range(count):
+                            length = struct.unpack_from('!i', parameters, offset)[0]
+                            offset += 4
+                            assert length >= 0 and offset + length <= len(parameters)
+                            values.append(parameters[offset:offset+length])
+                            offset += length
+                        assert len(values) == 2
+                        viewers = tuple(map(int, values[0][1:-1].split(b','))) if name.startswith(b'batch_') else (int(values[0]),)
+                        session['favorite_executions'].append((name.decode('ascii'), viewers))
+                    if name in (b'batch_favorite', b'batch_unfavorite'):
+                        session['favorite_groups'] += 1
+                        session['favorite_pending'] = True
+                    elif name in (b'op_favorite', b'op_unfavorite'):
+                        session['favorite_single'] += 1
                     if name == b'tags': session['tags'] += 1
                     elif name == b'batch_single': session['article_groups'] += 1
                     elif name == b'page_single': session['article_single'] += 1
+                    elif name == b'batch_profiles': session['profile_groups'] += 1
+                    elif name == b'profile': session['profile_single'] += 1
+                    elif name in (b'batch_comments', b'batch_comments_compact'):
+                        session['comment_groups'] += 1
+                        if name == b'batch_comments_compact': session['compact_comment_groups'] += 1
+                    elif name == b'comments': session['comment_single'] += 1
+                    elif name.startswith(b'batch_page_'): session['page_groups'] += 1
+                    elif name.startswith(b'batch_count_'): session['count_groups'] += 1
+                    elif name.startswith(b'page_'): session['page_queries'] += 1
+                    elif name.startswith(b'count_'): session['count_queries'] += 1
+                    if self.hold_counts and name.startswith(b'batch_count_'):
+                        self.count_seen.set()
+                        while not self.stopping and not self.release_counts.wait(0.1):
+                            pass
                 backend.sendall(header + body)
         except (OSError, EOFError):
             pass
@@ -136,6 +189,12 @@ class Proxy:
                     self.drop_commit.clear()
                     self.commit_dropped.set()
                     return  # PostgreSQL committed, but libpq receives no acknowledgement.
+                if header[:1] == b'Z' and session['favorite_pending']:
+                    session['favorite_pending'] = False
+                    if self.drop_favorite.is_set():
+                        self.drop_favorite.clear()
+                        self.favorite_dropped.set()
+                        return  # Drop the implicit commit's ReadyForQuery, never replay it.
                 client.sendall(header + body)
         except (OSError, EOFError):
             pass
@@ -155,27 +214,29 @@ class Proxy:
 
 @contextmanager
 def lock_tags(server, mode='SHARE', table='tags'):
-    assert mode in ('SHARE', 'ACCESS EXCLUSIVE') and table in ('tags', 'articles')
+    assert mode in ('SHARE', 'ACCESS EXCLUSIVE') and table in ('tags', 'articles', 'users', 'comments', 'follows')
+    application = 'recovery-lock-' + uuid.uuid4().hex
     with (results / 'locker.log').open('a') as log:
         process = subprocess.Popen(['psql', '-X', '-v', 'ON_ERROR_STOP=1', '-d', server.database,
                                     '-c', f'BEGIN; LOCK TABLE {table} IN {mode} MODE; SELECT pg_sleep(30); ROLLBACK'],
-                                   env=dict(os.environ, PGAPPNAME='recovery-lock'), stdout=log, stderr=log)
+                                   env=dict(os.environ, PGAPPNAME=application), stdout=log, stderr=log)
         try:
-            eventually(lambda: sql(f"SELECT count(*) FROM pg_stat_activity WHERE datname='{server.database}' AND application_name='recovery-lock' AND wait_event='PgSleep'") == '1')
+            eventually(lambda: sql(f"SELECT count(*) FROM pg_stat_activity WHERE datname='{server.database}' AND application_name='{application}' AND wait_event='PgSleep'") == '1')
             yield
         finally:
-            sql(f"SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE datname='{server.database}' AND application_name='recovery-lock'")
+            sql(f"SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE datname='{server.database}' AND application_name='{application}'")
             process.wait(timeout=5)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--restart-cluster', action='store_true')
+    parser.add_argument('--connections', type=int, help='Expected total pool size for multi-reactor tests')
     args = parser.parse_args()
     checks = []
     with Proxy() as proxy, Server(results, secret, 'recovery', 'focus', submission / 'zig-out/bin/conduit', database_port=proxy.port) as server:
         count_query = f"SELECT count(*) FROM pg_stat_activity WHERE datname='{server.database}' AND usename='conduit' AND state='idle' AND xact_start IS NULL"
-        connection_count = int(sql(count_query))
+        connection_count = args.connections or int(sql(count_query))
         assert 1 <= connection_count <= 95
 
         def ready():
@@ -191,10 +252,10 @@ def main():
             eventually(lambda: len(proxy.sessions) >= after)
             eventually(ready)
             idle()
-            eventually(lambda: all(len(s['prepared']) == 21 and s['settings'] == 1 and len(s['tuning']) == 2 for s in proxy.sessions[-connection_count:]))
+            eventually(lambda: all(len(s['prepared']) == 48 and s['settings'] == 1 and len(s['tuning']) == 2 for s in proxy.sessions[-connection_count:]))
 
         rebuilt(connection_count)
-        checks.append('all owners finish session setup and twenty-one named preparations before use')
+        checks.append('all owners finish session setup and forty-seven named preparations before use')
         accepted = len(proxy.sessions)
         kill(one=True)
         rebuilt(accepted + 1)
@@ -287,14 +348,18 @@ def main():
             assert server.sql("SELECT count(*) FROM articles WHERE title='recovery committed without acknowledgement'") == '1'
             checks.append('the dedicated development cluster restarts while the application stays alive and reconnects')
 
-    with Server(results, secret, 'recovery', 'contract', submission / 'zig-out/bin/conduit') as server:
-        server.sql(f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='{server.database}' AND usename='conduit'")
-        eventually(lambda: server.request('GET', '/api/tags')[0] == 200)
+    with Proxy() as proxy, Server(results, secret, 'recovery', 'contract', submission / 'zig-out/bin/conduit', database_port=proxy.port) as server:
+        # One healthy listener does not prove that every reactor's pool recovered.
+        count_query = f"SELECT count(*) FROM pg_stat_activity WHERE datname='{server.database}' AND usename='conduit' AND state='idle' AND xact_start IS NULL"
+        rebuilt(connection_count)
+        accepted = len(proxy.sessions)
+        kill()
+        rebuilt(accepted + connection_count)
         run, transcript, _, summary = upstream(server, 'after-recovery', work / 'tools/conformance')
         assert run.returncode == 0 and len(transcript) == 197, summary
         checks.append('all 197 unchanged conformance steps pass after backend replacement')
     evidence = {'checks': checks, 'database_connections': connection_count, 'upstream_steps_passed': 197,
-                'scope': 'native Mac development seed; no full-seed, Linux-runtime or capacity claim'}
+                'scope': 'development-seed fault injection; platform recorded by the enclosing run; no capacity claim'}
     (results / 'results.json').write_text(json.dumps(evidence, indent=2) + '\n')
     print(f'PASS: {len(checks)} recovery/concurrency scenarios; {connection_count} owners; 197 upstream steps', flush=True)
 

@@ -1,4 +1,3 @@
-import orjson
 from types import GeneratorType
 import sys
 from typing import Callable, Dict, Tuple, Any, Optional, List
@@ -6,35 +5,15 @@ from urllib.parse import parse_qs
 import re
 
 from conduit_server.adapters.inbound.errors import ApiError
+from conduit_server.ports.inbound import HttpApplication, HttpRequest
+
+# The JSON codec's dumps (ports.outbound.JsonCodecPort), set by the composition root through use_json
+_dumps = None
 
 
-class HttpRequest:
-    __slots__ = ("method", "path", "params", "query", "headers", "raw", "body")
-
-    def __init__(self, method, path, params, query, headers, raw, body):
-        self.method = method
-        self.path = path
-        self.params = params  # e.g. {"slug": "how-to-..."} from :slug segments
-        self.query = query  # flat dict of first values
-        self.headers = headers  # lowercased keys
-        self.raw = raw
-        self.body = body
-
-    def json(self) -> Any:
-        if not self.body:
-            return {}
-        try:
-            return orjson.loads(self.body)
-        except (ValueError, UnicodeDecodeError):
-            raise ApiError(422, "Invalid JSON body")
-
-    def json_wrapped(self, outer: str) -> dict:
-        """{outer: {...}} — missing/not-a-dict wrapper is 422."""
-        body = self.json()
-        payload = body.get(outer) if isinstance(body, dict) else None
-        if not isinstance(payload, dict):
-            raise ApiError(422, f"{outer} is required")
-        return payload
+def use_json(codec) -> None:
+    global _dumps
+    _dumps = codec.dumps
 
 
 class _Route:
@@ -64,7 +43,7 @@ def _compile_path(pattern: str) -> str:
     return "/" + "/".join(out)
 
 
-class SocketRouter:
+class SocketRouter(HttpApplication):
     def __init__(self):
         self.routes: List[_Route] = []
         self._by_method: Dict[str, List[_Route]] = {}  # routes with :params, in registration order
@@ -175,9 +154,8 @@ class SocketRouter:
     @staticmethod
     def _build_response(status_code: int, data: Any) -> bytes:
         # 204 must carry no body: stray bytes would be read as the next keep-alive response
-        # orjson serializes dataclasses natively, straight to UTF-8 bytes: about 4x the stdlib C encoder
-        # (list page 19.3 → 4.7 µs, user response 0.7 → 0.2 µs, same JSON)
-        # bytes are an already-encoded JSON body (built by Postgres)
+        # bytes are an already-encoded JSON body (built by Postgres); anything else goes through the JSON codec
+        # (orjson by default: dataclasses natively, about 4x the stdlib C encoder)
         if status_code == 204 or data is None:
             if status_code == 204:
                 return _EMPTY_204
@@ -185,7 +163,7 @@ class SocketRouter:
         elif data.__class__ is bytes:
             body = data
         else:
-            body = orjson.dumps(data)
+            body = _dumps(data)
         n = len(body)
         if status_code == 200 and n < 16384:
             return _OK_HEADERS[n] + body

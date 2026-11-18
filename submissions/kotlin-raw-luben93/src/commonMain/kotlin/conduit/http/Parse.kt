@@ -31,6 +31,8 @@ private val AUTHORIZATION = "authorization".encodeToByteArray()
 private val CONNECTION = "connection".encodeToByteArray()
 private val TRANSFER_ENCODING = "transfer-encoding".encodeToByteArray()
 private val EXPECT = "expect".encodeToByteArray()
+private val ACCEPT_ENCODING = "accept-encoding".encodeToByteArray()
+private val GZIP_TOKEN = "gzip".encodeToByteArray()
 private val CHUNKED = "chunked".encodeToByteArray()
 private val CONTINUE = "100-continue".encodeToByteArray()
 private val CLOSE_TOKEN = "close".encodeToByteArray()
@@ -89,6 +91,43 @@ private fun eqToken(b: ByteArray, s: Int, e: Int, lower: ByteArray): Boolean =
     e - s == lower.size && eqLower(b, s, lower)
 
 private fun isWs(c: Byte) = c == SP || c == HT
+
+/**
+ * An Accept-Encoding value b[s, e) lists gzip without q=0 ("gzip", "gzip, deflate", "br;q=1, gzip;q=0.5"). Other
+ * codings and "*" are ignored: we only ever send gzip, and only to clients that name it.
+ */
+private fun acceptsGzip(b: ByteArray, s0: Int, e: Int): Boolean {
+    var s = s0
+    while (s < e) {
+        var t = indexOf(b, ','.code.toByte(), s, e)
+        if (t < 0) t = e
+        var ts = s
+        while (ts < t && isWs(b[ts])) ts++
+        var semi = indexOf(b, ';'.code.toByte(), ts, t)
+        if (semi < 0) semi = t
+        var te = semi
+        while (te > ts && isWs(b[te - 1])) te--
+        if (eqToken(b, ts, te, GZIP_TOKEN)) return !qZero(b, semi, t)
+        s = t + 1
+    }
+    return false
+}
+
+/** Parameters b[s, e) (";q=0", "; q=0.000") give q = 0. */
+private fun qZero(b: ByteArray, s: Int, e: Int): Boolean {
+    val q = indexOf(b, '='.code.toByte(), s, e)
+    if (q < 0) return false
+    var i = q + 1
+    while (i < e && isWs(b[i])) i++
+    if (i >= e || b[i] != '0'.code.toByte()) return false
+    i++
+    if (i < e && b[i] == '.'.code.toByte()) {
+        i++
+        while (i < e && b[i] == '0'.code.toByte()) i++
+    }
+    while (i < e && isWs(b[i])) i++
+    return i == e
+}
 
 /**
  * Parses the head b[start, he) (he from [headEnd]) into [ex]: method, path, query, Authorization, body framing,
@@ -169,6 +208,7 @@ internal fun parseHead(ex: Ex, b: ByteArray, start: Int, he: Int): Int {
                 if (!eqToken(b, vs, ve, CONTINUE)) return 417
                 ex.expect = true
             }
+            15 -> if (eqLower(b, p, ACCEPT_ENCODING)) ex.acceptGzip = acceptsGzip(b, vs, ve)
         }
         p = lineEnd + 1
     }

@@ -111,7 +111,8 @@ with server('zig', submission / 'zig-out/bin/conduit') as zig, server('go', refe
     article = result[1]['article']
     assert result[0] == 200 and article['body'] == body
     assert article['title'] == title and article['description'] == description
-    assert article['tagList'] == sorted(tag_names)
+    expected_tags = json.loads(zig.sql('SELECT json_agg(name ORDER BY name) FROM unnest(ARRAY[' + ','.join(literal(tag) for tag in tag_names) + ']) AS names(name)'))
+    assert article['tagList'] == expected_tags
     assert article['createdAt'] == '2025-04-01T10:00:00.123Z'
     assert article['updatedAt'] == '1969-12-31T23:59:59.987Z'
     assert article['favorited'] is True and article['author']['following'] is True

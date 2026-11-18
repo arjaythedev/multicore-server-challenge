@@ -49,6 +49,9 @@ pub const Def = struct {
     thread_cols: ?[]const Oid = null,
     /// How the statement's requests ride in the mega statement; null: never.
     mega: ?Mega = null,
+    /// The viewer ($1) only sets `favorited` and `following`: within one execution, requests with the same other
+    /// parameters and neither flag set in any row get the same response (drain.zig's shared responses).
+    share: bool = false,
 };
 
 /// MEGA (branch sql-stack, stack-14-fcset: sql-proto's MEGA2 with the stack's count, feed, tag, list-count, list-flag and favorite-count edits, without comments):
@@ -61,10 +64,63 @@ pub const Def = struct {
 /// Comments, tags, profiles and users stay out of it, so the article is the only entity type.
 pub const mega = struct {
     pub const sql = std.mem.trimEnd(u8, @embedFile("sql/MEGA.sql"), "\n; ");
+    /// MEGA with the `ids` CTE built in id order (ZIG_MEGA_SORTED_IDS=1): one sort and dedup instead of a hash
+    /// aggregate followed by the tag and favorite-count arrays each sorting it again. Same rows; the entity rows
+    /// come in id order, which mega.zig never reads.
+    pub const sql_sorted_ids = blk: {
+        @setEvalBranchQuota(100_000);
+        const from = "UNION SELECT id FROM art),";
+        const at = std.mem.indexOf(u8, sql, from) orelse @compileError("MEGA.sql: no ids CTE to sort");
+        break :blk sql[0..at] ++ "UNION SELECT id FROM art ORDER BY 1)," ++ sql[at + from.len ..];
+    };
     pub const params = [_]Oid{ .int4_array, .int8_array, .int8_array, .int8_array, .int8_array, .text_array };
     pub const cols = [_]Oid{ .int8, .int8, .text, .text, .text, .text, .timestamptz, .timestamptz, .text_array, .int8, .bool, .text, .text, .text, .bool, .int8_array, .int8_array, .int8_array, .int8_array, .int8 };
     pub const keys = [_]u8{1};
     pub const ordinal = cols.len - 1;
+    pub const tags = 8;
+    /// MEGA as a read connection prepares it, indexed by ZIG_MEGA_SORTED_IDS * 4 + ZIG_MEGA_TAG_TEXT * 2 +
+    /// ZIG_MEGA_NAME_IDS (main.zig).
+    pub const variants = [8][]const u8{
+        sql,            edit(sql, &name_ids),            edit(sql, &tag_text),            edit(edit(sql, &name_ids), &tag_text),
+        sql_sorted_ids, edit(sql_sorted_ids, &name_ids), edit(sql_sorted_ids, &tag_text), edit(edit(sql_sorted_ids, &name_ids), &tag_text),
+    };
+    /// The columns with ZIG_MEGA_TAG_TEXT=1.
+    pub const cols_tag_text = blk: {
+        var c = cols;
+        c[tags] = .text;
+        break :blk c;
+    };
+    /// ZIG_MEGA_TAG_TEXT=1: each article's tags as one text, the names joined by chr(31) by string_agg, which saves
+    /// Postgres building a text[] and sending it element by element. While some tag name is empty or holds chr(31),
+    /// the join could not be split back, so every article's tags come as chr(31) and the text[] in Postgres's text
+    /// form instead; a joined text never starts with chr(31). mega.zig turns either into the text[].
+    const tag_text = [_][2][]const u8{
+        .{ "array_agg(t.name ORDER BY t.name) AS tags", "string_agg(t.name, chr(31) ORDER BY t.name) AS tags" },
+        .{ "COALESCE(tg.tags, '{}'::text[]) AS tags",
+            \\CASE WHEN NOT EXISTS (SELECT 1 FROM tags t WHERE t.name = '' OR strpos(t.name, chr(31)) > 0) THEN COALESCE(tg.tags, '')
+            \\      ELSE chr(31) || ARRAY(SELECT t.name FROM article_tags at JOIN tags t ON t.id = at.tag_id WHERE at.article_id = a.id ORDER BY t.name)::text END AS tags
+        },
+    };
+    /// ZIG_MEGA_NAME_IDS=1: each distinct list read looks its tag name or username up once, as `rid` in `la`,
+    /// instead of once for its count and again for its page. Every other read's `rid` is 0, not NULL, so the feed
+    /// rows keep a tuple without NULLs.
+    const name_ids = [_][2][]const u8{
+        .{ "WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = ck.t1) OFFSET 999", "WHERE at.tag_id = ck.rid OFFSET 999" },
+        .{ "WHERE at.tag_id = (SELECT t.id FROM tags t WHERE t.name = ck.t1) LIMIT 1000", "WHERE at.tag_id = ck.rid LIMIT 1000" },
+        .{ "author_id = (SELECT au.id FROM users au WHERE au.username = ck.t1)", "author_id = ck.rid" },
+        .{ "f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = ck.t1)", "f.user_id = ck.rid" },
+        .{ "at.tag_id = (SELECT t.id FROM tags t WHERE t.name = lk.t1)", "at.tag_id = lk.rid" },
+        .{ "a2.author_id = (SELECT au.id FROM users au WHERE au.username = lk.t1)", "a2.author_id = lk.rid" },
+        .{ "f.user_id = (SELECT fu.id FROM users fu WHERE fu.username = lk.t1)", "f.user_id = lk.rid" },
+        .{ "ck.t1, ck.a, CASE", "ck.t1, ck.a, ck.rid, CASE" },
+        .{ "lpo, t1, a, max(n)", "lpo, t1, a, rid, max(n)" },
+        .{ "WHERE fo.follower_id = lk.fv) END AS a\n",
+            \\WHERE fo.follower_id = lk.fv) END AS a,
+            \\    CASE WHEN lk.k = 2 THEN (SELECT t.id FROM tags t WHERE t.name = lk.t1)
+            \\      WHEN lk.k IN (3, 4) THEN (SELECT u.id FROM users u WHERE u.username = lk.t1) ELSE 0 END AS rid
+            \\
+        },
+    };
     /// A list read's page arrays and the columns filled per article from them.
     pub const page = struct {
         pub const ids = 15;
@@ -144,6 +200,20 @@ fn batchText(comptime s: Stmt) []const u8 {
     return file("BATCH_", s);
 }
 
+/// `s` with each pair's first text, which must occur exactly once, replaced by its second, in order.
+fn edit(comptime s: []const u8, comptime pairs: []const [2][]const u8) []const u8 {
+    comptime {
+        @setEvalBranchQuota(1_000_000);
+        var t = s;
+        for (pairs) |p| {
+            const at = std.mem.indexOf(u8, t, p[0]) orelse @compileError("MEGA.sql: not found: " ++ p[0]);
+            if (std.mem.indexOfPos(u8, t, at + 1, p[0]) != null) @compileError("MEGA.sql: found twice: " ++ p[0]);
+            t = t[0..at] ++ p[1] ++ t[at + p[0].len ..];
+        }
+        return t;
+    }
+}
+
 fn file(comptime prefix: []const u8, comptime s: Stmt) []const u8 {
     comptime {
         @setEvalBranchQuota(100_000);
@@ -170,21 +240,21 @@ fn file(comptime prefix: []const u8, comptime s: Stmt) []const u8 {
 //   a few index lookups, so they run as units of their own ahead of MEGA and are answered before it runs.
 const defs = [count]Def{
     // lists (branch sql-lists)
-    .{ .sql = text(.list_all), .params = &.{ .int8, .int8, .int8 }, .cols = &list_cols, .batch = .arrays, .order = ", q.id DESC", .mega = listMega(1, &.{ .v, .i1, .i2 }) },
-    .{ .sql = text(.list_tag), .params = &list_params, .cols = &list_cols, .batch = .arrays, .order = ", q.id DESC", .mega = listMega(2, &.{ .v, .i1, .i2, .t1 }) },
-    .{ .sql = text(.list_author), .params = &list_params, .cols = &list_cols, .batch = .arrays, .order = ", q.id DESC", .mega = listMega(3, &.{ .v, .i1, .i2, .t1 }) },
-    .{ .sql = text(.list_favorited), .params = &list_params, .cols = &list_cols, .batch = .arrays, .order = ", q.id DESC", .mega = listMega(4, &.{ .v, .i1, .i2, .t1 }) },
+    .{ .sql = text(.list_all), .params = &.{ .int8, .int8, .int8 }, .cols = &list_cols, .batch = .arrays, .order = ", q.id DESC", .mega = listMega(1, &.{ .v, .i1, .i2 }), .share = true },
+    .{ .sql = text(.list_tag), .params = &list_params, .cols = &list_cols, .batch = .arrays, .order = ", q.id DESC", .mega = listMega(2, &.{ .v, .i1, .i2, .t1 }), .share = true },
+    .{ .sql = text(.list_author), .params = &list_params, .cols = &list_cols, .batch = .arrays, .order = ", q.id DESC", .mega = listMega(3, &.{ .v, .i1, .i2, .t1 }), .share = true },
+    .{ .sql = text(.list_favorited), .params = &list_params, .cols = &list_cols, .batch = .arrays, .order = ", q.id DESC", .mega = listMega(4, &.{ .v, .i1, .i2, .t1 }), .share = true },
     // feed (branch sql-feed)
     .{ .sql = text(.list_feed), .params = &.{ .int8, .int8, .int8, .int8 }, .cols = &list_cols, .batch = .arrays, .order = ", q.id DESC", .mega = listMega(5, &.{ .v, .i1, .i2, .i3 }) },
     // article page (branch sql-articlepage)
-    .{ .sql = text(.article_by_slug), .params = &.{ .int8, .text }, .cols = &full_cols, .batch = .arrays, .mega = .{ .kind = 6, .args = &.{ .v, .t1 }, .cols = &full_mega_cols, .fill = 1 } },
-    .{ .sql = text(.article_by_id), .params = &.{ .int8, .int8 }, .cols = &full_cols, .batch = .arrays, .mega = .{ .kind = 7, .args = &.{ .v, .i1 }, .cols = &full_mega_cols, .fill = 1 } },
+    .{ .sql = text(.article_by_slug), .params = &.{ .int8, .text }, .cols = &full_cols, .batch = .arrays, .mega = .{ .kind = 6, .args = &.{ .v, .t1 }, .cols = &full_mega_cols, .fill = 1 }, .share = true },
+    .{ .sql = text(.article_by_id), .params = &.{ .int8, .int8 }, .cols = &full_cols, .batch = .arrays, .mega = .{ .kind = 7, .args = &.{ .v, .i1 }, .cols = &full_mega_cols, .fill = 1 }, .share = true },
     .{ .sql = text(.comments_list_set), .params = &.{ .int8, .text }, .cols = &.{ .int8, .text, .timestamptz, .timestamptz, .text, .text, .text, .bool }, .batch = .arrays, .batched = batchText(.comments_list_set), .thread_cols = &threads.cols },
     .{ .sql = text(.profile), .params = &.{ .int8, .text }, .cols = &.{ .text, .text, .text, .bool }, .batch = .arrays },
     // users and tags
     .{ .sql = text(.user_by_id), .params = &.{.int8}, .cols = &user_cols, .batch = .arrays },
     .{ .sql = text(.user_by_email), .params = &.{.text}, .cols = &.{ .int8, .text, .text, .text, .text, .text }, .batch = .arrays, .batched = batchText(.user_by_email) },
-    .{ .sql = text(.tags), .params = &.{}, .cols = &.{.text_array}, .batch = .broadcast },
+    .{ .sql = text(.tags), .params = &.{}, .cols = &.{.text_array}, .batch = .broadcast, .share = true },
     // writes (branch sql-writes): a group's writes of one of these statements share one execution of its batched form
     .{ .write = true, .sql = text(.favorite), .params = &.{ .int8, .text }, .cols = &.{.int8}, .batch = .arrays, .batched = batchText(.favorite) },
     .{ .write = true, .sql = text(.unfavorite), .params = &.{ .int8, .text }, .cols = &.{.int8}, .batch = .arrays, .batched = batchText(.unfavorite) },
@@ -204,9 +274,24 @@ pub fn fallible(s: Stmt) bool {
     return s == .user_insert or s == .user_update;
 }
 
+/// ZIG_COMMENTS_FW=1 (main.zig): the batched comments statement carries, per request, only the viewer's followees
+/// among its thread's comment authors (`sql/BATCH_COMMENTS_LIST_SET_FW.sql`), which threads.zig reads the same way.
+/// Each request then fetches follows rows only for authors it follows, not its whole followee list, so the
+/// read stays index-only while follows is not all-visible.
+pub var comments_fw = false;
+const comments_fw_sql = std.mem.trimEnd(u8, @embedFile("sql/BATCH_COMMENTS_LIST_SET_FW.sql"), "\n; ");
+
+/// ZIG_COMMENT_AUTHORS_ONCE=1 (main.zig), with ZIG_COMMENTS_FW=1: the comments statement reads each distinct author's
+/// profile once per batch, as author rows ahead of the thread rows, whose author columns it leaves NULL
+/// (`sql/BATCH_COMMENTS_LIST_SET_FW_AUTHORS.sql`); threads.zig fills them in. The thread rows keep the order of the
+/// per-thread sort, with no join after it.
+pub var comment_authors_once = false;
+const comments_fw_authors_sql = std.mem.trimEnd(u8, @embedFile("sql/BATCH_COMMENTS_LIST_SET_FW_AUTHORS.sql"), "\n; ");
+
 /// The batched form: `$n` becomes `r.pn`, the request rows come from unnest of one array per parameter.
 pub fn batchedSql(gpa: std.mem.Allocator, s: Stmt) ![]u8 {
     const d = s.def();
+    if (s == .comments_list_set and comments_fw) return gpa.dupe(u8, if (comment_authors_once) comments_fw_authors_sql else comments_fw_sql);
     if (d.batched) |b| return gpa.dupe(u8, b);
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(gpa, "SELECT q.*, r.ord FROM unnest(");
@@ -254,4 +339,39 @@ pub fn arrayOid(p: Oid) Oid {
         .text => .text_array,
         else => unreachable,
     };
+}
+
+test "the sorted-ids MEGA orders the ids CTE and changes nothing else" {
+    const ids = "ids AS MATERIALIZED (\n  SELECT id FROM pg WHERE id IS NOT NULL UNION SELECT id FROM art";
+    const at = std.mem.indexOf(u8, mega.sql, ids).? + ids.len;
+    try std.testing.expectEqualStrings(mega.sql[0..at], mega.sql_sorted_ids[0..at]);
+    try std.testing.expectEqualStrings(" ORDER BY 1", mega.sql_sorted_ids[at..][0..11]);
+    try std.testing.expectEqualStrings(mega.sql[at..], mega.sql_sorted_ids[at + 11 ..]);
+}
+
+test "ZIG_COMMENTS_FW swaps only the batched comments statement" {
+    const gpa = std.testing.allocator;
+    defer comments_fw = false;
+    for ([_]bool{ false, true }) |on| {
+        comments_fw = on;
+        const t = try batchedSql(gpa, .comments_list_set);
+        defer gpa.free(t);
+        try std.testing.expectEqualStrings(if (on) comments_fw_sql else comptime batchText(.comments_list_set), t);
+        const f = try batchedSql(gpa, .follow);
+        defer gpa.free(f);
+        try std.testing.expectEqualStrings(comptime batchText(.follow), f);
+    }
+}
+
+test "ZIG_COMMENT_AUTHORS_ONCE swaps the FW comments statement only" {
+    const gpa = std.testing.allocator;
+    defer comments_fw = false;
+    defer comment_authors_once = false;
+    comment_authors_once = true;
+    for ([_]bool{ false, true }) |on| {
+        comments_fw = on;
+        const t = try batchedSql(gpa, .comments_list_set);
+        defer gpa.free(t);
+        try std.testing.expectEqualStrings(if (on) comments_fw_authors_sql else comptime batchText(.comments_list_set), t);
+    }
 }

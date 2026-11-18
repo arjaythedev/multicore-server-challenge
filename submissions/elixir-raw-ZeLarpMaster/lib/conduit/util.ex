@@ -3,6 +3,21 @@ defmodule Conduit.Util do
 
   @max_i64 9_223_372_036_854_775_807
 
+  # :binary.match compiles a pattern that isn't compiled yet on every call (Aho-Corasick for a list: ~1% of app CPU
+  # in perf at 175k users), so init/0 compiles these once. Without it (unit tests) the raw patterns work the same.
+  @patterns {"%", ["%", "+"], <<0>>}
+
+  @doc "Compiles the matching patterns once; called from Conduit.Application.start/2."
+  def init do
+    compiled = @patterns |> Tuple.to_list() |> Enum.map(&:binary.compile_pattern/1) |> List.to_tuple()
+    :persistent_term.put({__MODULE__, :patterns}, compiled)
+  end
+
+  defp pattern(i), do: elem(:persistent_term.get({__MODULE__, :patterns}, @patterns), i)
+
+  @doc "Whether `s` has a NUL byte (Postgres text can't store one)."
+  def nul?(s), do: :binary.match(s, pattern(2)) != :nomatch
+
   @doc "Non-empty ASCII digits that fit in an i64 (no sign, no whitespace); nil otherwise."
   def parse_digits(""), do: nil
 
@@ -20,12 +35,12 @@ defmodule Conduit.Util do
   @doc "Percent-decodes one path segment. nil for invalid UTF-8 or an embedded NUL, which Postgres can't store in text."
   def decode_segment(s) do
     decoded = pct_decode(s, false)
-    if String.valid?(decoded) and :binary.match(decoded, <<0>>) == :nomatch, do: decoded
+    if String.valid?(decoded) and not nul?(decoded), do: decoded
   end
 
   @doc "Percent-decoding that keeps malformed escapes literally; `plus?` turns `+` into a space (query strings)."
   def pct_decode(s, plus?) do
-    if :binary.match(s, if(plus?, do: ["%", "+"], else: ["%"])) == :nomatch do
+    if :binary.match(s, pattern(if(plus?, do: 1, else: 0))) == :nomatch do
       s
     else
       s |> do_decode(plus?, []) |> Enum.reverse() |> IO.iodata_to_binary()

@@ -17,6 +17,12 @@ static inline BF_word batch_f(const BF_ctx *s, BF_word x) {
 #define LANES 4
 #include "bcrypt-batch-impl.h"
 #undef LANES
+#define LANES 5
+#include "bcrypt-batch-impl.h"
+#undef LANES
+#define LANES 6
+#include "bcrypt-batch-impl.h"
+#undef LANES
 
 /* Inputs are NUL terminated, outputs have 61 bytes per lane. No aliasing. */
 int conduit_bcrypt_batch(const char *const *keys, const char *const *settings,
@@ -25,6 +31,8 @@ int conduit_bcrypt_batch(const char *const *keys, const char *const *settings,
     case 2: return batch_run2(keys, settings, out);
     case 3: return batch_run3(keys, settings, out);
     case 4: return batch_run4(keys, settings, out);
+    case 5: return batch_run5(keys, settings, out);
+    case 6: return batch_run6(keys, settings, out);
     default: return 0;
     }
 }

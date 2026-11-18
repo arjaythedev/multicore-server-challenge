@@ -1,0 +1,14 @@
+// Build definition for scala-cli (see build.sh): the Scala version, compiler options and pinned dependencies.
+//> using scala 3.10.0
+//> using options -release 25 -deprecation -feature -Wunused:all
+//> using dep org.typelevel::cats-effect:3.7.1
+//> using dep co.fs2::fs2-core:3.14.0
+//> using dep co.fs2::fs2-io:3.14.0
+//> using dep org.http4s::http4s-ember-server:0.23.38
+//> using dep org.http4s::http4s-dsl:0.23.38
+//> using dep org.http4s::http4s-circe:0.23.38
+//> using dep io.circe::circe-core:0.14.17
+//> using dep io.circe::circe-jawn:0.14.17
+//> using dep org.tpolecat::skunk-core:2.0.0-RC3
+//> using dep org.typelevel::otel4s-core:1.1.0
+//> using dep org.bouncycastle:bcprov-jdk18on:1.86

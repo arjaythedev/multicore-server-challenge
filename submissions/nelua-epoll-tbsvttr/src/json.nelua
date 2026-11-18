@@ -1,0 +1,225 @@
+-- Just enough JSON for request bodies and JWT parts: check that a document is valid, find a key of its top-level
+-- object, read a string or number value. Nothing is allocated except the decoded string.
+require 'buf'
+
+global Json = @record{}
+
+local function is_ws(c: byte): boolean
+  return c == ' '_b or c == '\t'_b or c == '\n'_b or c == '\r'_b
+end
+
+local function is_digit(c: byte): boolean
+  return c >= '0'_b and c <= '9'_b
+end
+
+local function hex_value(c: byte): int32
+  if c >= '0'_b and c <= '9'_b then return c - '0'_b end
+  if c >= 'a'_b and c <= 'f'_b then return c - 'a'_b + 10 end
+  if c >= 'A'_b and c <= 'F'_b then return c - 'A'_b + 10 end
+  return -1
+end
+
+local function skip_ws(p: Bytes, i: isize, n: isize): isize
+  while i < n and is_ws(p[i]) do i = i + 1 end
+  return i
+end
+
+-- Each skip_* takes the index of a value's first byte and returns the index after it, or -1 if it is invalid.
+
+local function skip_string(p: Bytes, i: isize, n: isize): isize
+  if i >= n or p[i] ~= '"'_b then return -1 end
+  i = i + 1
+  while i < n do
+    local c = p[i]
+    if c == '"'_b then return i + 1 end
+    if c < 0x20 then return -1 end
+    if c == '\\'_b then
+      i = i + 1
+      if i >= n then return -1 end
+      c = p[i]
+      if c == 'u'_b then
+        if i + 4 >= n then return -1 end
+        for k: isize = 1, 4 do
+          if hex_value(p[i + k]) < 0 then return -1 end
+        end
+        i = i + 4
+      elseif not (c == '"'_b or c == '\\'_b or c == '/'_b or c == 'b'_b or c == 'f'_b or c == 'n'_b or
+                  c == 'r'_b or c == 't'_b) then
+        return -1
+      end
+    end
+    i = i + 1
+  end
+  return -1
+end
+
+local function skip_number(p: Bytes, i: isize, n: isize): isize
+  if i < n and p[i] == '-'_b then i = i + 1 end
+  if i >= n or not is_digit(p[i]) then return -1 end
+  if p[i] == '0'_b then
+    i = i + 1
+  else
+    while i < n and is_digit(p[i]) do i = i + 1 end
+  end
+  if i < n and p[i] == '.'_b then
+    i = i + 1
+    if i >= n or not is_digit(p[i]) then return -1 end
+    while i < n and is_digit(p[i]) do i = i + 1 end
+  end
+  if i < n and (p[i] == 'e'_b or p[i] == 'E'_b) then
+    i = i + 1
+    if i < n and (p[i] == '+'_b or p[i] == '-'_b) then i = i + 1 end
+    if i >= n or not is_digit(p[i]) then return -1 end
+    while i < n and is_digit(p[i]) do i = i + 1 end
+  end
+  return i
+end
+
+local function skip_literal(p: Bytes, i: isize, n: isize, word: string): isize
+  if i + (@isize)(word.size) > n then return -1 end
+  if C.memcmp(&p[i], word.data, word.size) ~= 0 then return -1 end
+  return i + (@isize)(word.size)
+end
+
+local function skip_value(p: Bytes, i: isize, n: isize, depth: int32): isize <forwarddecl> end
+
+local function skip_container(p: Bytes, i: isize, n: isize, depth: int32): isize
+  if depth > 64 then return -1 end
+  local close: byte = '}'_b
+  if p[i] == '['_b then close = ']'_b end
+  i = skip_ws(p, i + 1, n)
+  if i < n and p[i] == close then return i + 1 end
+  while true do
+    if close == '}'_b then
+      i = skip_string(p, i, n)
+      if i < 0 then return -1 end
+      i = skip_ws(p, i, n)
+      if i >= n or p[i] ~= ':'_b then return -1 end
+      i = skip_ws(p, i + 1, n)
+    end
+    i = skip_value(p, i, n, depth + 1)
+    if i < 0 then return -1 end
+    i = skip_ws(p, i, n)
+    if i >= n then return -1 end
+    if p[i] == close then return i + 1 end
+    if p[i] ~= ','_b then return -1 end
+    i = skip_ws(p, i + 1, n)
+  end
+  return -1
+end
+
+function skip_value(p: Bytes, i: isize, n: isize, depth: int32): isize
+  if i >= n then return -1 end
+  local c = p[i]
+  if c == '{'_b or c == '['_b then return skip_container(p, i, n, depth) end
+  if c == '"'_b then return skip_string(p, i, n) end
+  if c == 't'_b then return skip_literal(p, i, n, 'true') end
+  if c == 'f'_b then return skip_literal(p, i, n, 'false') end
+  if c == 'n'_b then return skip_literal(p, i, n, 'null') end
+  return skip_number(p, i, n)
+end
+
+-- Is p[0, n) one valid JSON document (surrounding whitespace allowed)?
+function Json.valid(p: Bytes, n: isize): boolean
+  local i = skip_value(p, skip_ws(p, 0, n), n, 0)
+  return i >= 0 and skip_ws(p, i, n) == n
+end
+
+-- In a valid document: the value of key in the top-level object as [start, stop), or -1, -1. A repeated key
+-- gives its last value, as in JSON.parse. Keys are compared as written (escapes in keys aren't decoded).
+function Json.find(p: Bytes, n: isize, key: string): (isize, isize)
+  local found_start: isize, found_stop: isize = -1, -1
+  local i = skip_ws(p, 0, n)
+  if i >= n or p[i] ~= '{'_b then return -1, -1 end
+  i = skip_ws(p, i + 1, n)
+  while i < n and p[i] == '"'_b do
+    local key_stop = skip_string(p, i, n)
+    local matches = key_stop - i - 2 == (@isize)(key.size) and C.memcmp(&p[i + 1], key.data, key.size) == 0
+    i = skip_ws(p, skip_ws(p, key_stop, n) + 1, n)   -- past the colon
+    local stop = skip_value(p, i, n, 1)
+    if matches then found_start, found_stop = i, stop end
+    i = skip_ws(p, stop, n)
+    if i < n and p[i] == ','_b then i = skip_ws(p, i + 1, n) end
+  end
+  return found_start, found_stop
+end
+
+local function put_utf8(out: *Buf, cp: uint32): void
+  if cp < 0x80 then
+    out:byte((@byte)(cp))
+  elseif cp < 0x800 then
+    out:byte((@byte)(0xC0 | (cp >> 6)))
+    out:byte((@byte)(0x80 | (cp & 0x3F)))
+  elseif cp < 0x10000 then
+    out:byte((@byte)(0xE0 | (cp >> 12)))
+    out:byte((@byte)(0x80 | ((cp >> 6) & 0x3F)))
+    out:byte((@byte)(0x80 | (cp & 0x3F)))
+  else
+    out:byte((@byte)(0xF0 | (cp >> 18)))
+    out:byte((@byte)(0x80 | ((cp >> 12) & 0x3F)))
+    out:byte((@byte)(0x80 | ((cp >> 6) & 0x3F)))
+    out:byte((@byte)(0x80 | (cp & 0x3F)))
+  end
+end
+
+local function hex4(p: Bytes, i: isize): uint32
+  return (@uint32)((hex_value(p[i]) << 12) | (hex_value(p[i + 1]) << 8) | (hex_value(p[i + 2]) << 4) |
+    hex_value(p[i + 3]))
+end
+
+-- Decode the valid string value p[start, stop) (quotes included) into out. False if the value isn't a string.
+function Json.string(p: Bytes, start: isize, stop: isize, out: *Buf): boolean
+  if start < 0 or p[start] ~= '"'_b then return false end
+  local i = start + 1
+  local last = stop - 1
+  while i < last do
+    local c = p[i]
+    if c ~= '\\'_b then
+      local run = i
+      while i < last and p[i] ~= '\\'_b do i = i + 1 end
+      out:bytes(&p[run], i - run)
+    else
+      c = p[i + 1]
+      i = i + 2
+      if c == 'n'_b then out:byte('\n'_b)
+      elseif c == 't'_b then out:byte('\t'_b)
+      elseif c == 'r'_b then out:byte('\r'_b)
+      elseif c == 'b'_b then out:byte(8)
+      elseif c == 'f'_b then out:byte(12)
+      elseif c == 'u'_b then
+        local cp = hex4(p, i)
+        i = i + 4
+        -- a surrogate pair is one code point
+        if cp >= 0xD800 and cp < 0xDC00 and i + 6 <= last and p[i] == '\\'_b and p[i + 1] == 'u'_b then
+          local low = hex4(p, i + 2)
+          if low >= 0xDC00 and low < 0xE000 then
+            cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00)
+            i = i + 6
+          end
+        end
+        put_utf8(out, cp)
+      else
+        out:byte(c)   -- \" \\ \/
+      end
+    end
+  end
+  return true
+end
+
+-- In a valid array p[start, stop): the next element at or after i as [first, last), or -1, -1 at the end.
+-- Start with i = start + 1 and go on with i = last.
+function Json.next_element(p: Bytes, i: isize, stop: isize): (isize, isize)
+  i = skip_ws(p, i, stop)
+  if i < stop and p[i] == ','_b then i = skip_ws(p, i + 1, stop) end
+  if i >= stop or p[i] == ']'_b then return -1, -1 end
+  return i, skip_value(p, i, stop, 1)
+end
+
+-- The number value p[start, stop) as a float64, or false if the value isn't a number.
+function Json.number(p: Bytes, start: isize, stop: isize): (boolean, float64)
+  if start < 0 or not (p[start] == '-'_b or is_digit(p[start])) or stop - start > 63 then return false, 0 end
+  local tmp: [64]cchar
+  C.memcpy(&tmp[0], &p[start], (@csize)(stop - start))
+  tmp[stop - start] = 0
+  return true, C.strtod(&tmp[0], nilptr)
+end

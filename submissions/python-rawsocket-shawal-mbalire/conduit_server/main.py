@@ -4,67 +4,45 @@ import resource
 import signal
 import socket
 import sys
-from psycopg_pool import ConnectionPool
-
-from conduit_server.adapters.inbound.socket_server import RawSocketHttpServer, make_listener
-from conduit_server.adapters.inbound.router import router
-import conduit_server.adapters.inbound.controllers as controllers
-
-from conduit_server.adapters.outbound.pg_repository import (
-    PgPipeline,
-    PostgresUserRepository,
-    SingleConnection,
-    configure_connection,
-)
-from conduit_server.adapters.outbound.crypto_adapter import JoseBcryptCryptoAdapter
-from conduit_server.adapters.outbound.pg_broker import BrokerClient, serve_broker
+from conduit_server import registry
+from conduit_server.adapters.inbound import router as http_router
+import conduit_server.adapters.inbound.controllers as controllers  # registers the routes
 
 # Total Postgres connections across every worker in threaded mode (max_connections = 100; the spec asks for <= 95).
 DB_BUDGET = int(os.getenv("DB_BUDGET", 64))
 MAX_CONNECTIONS = 95
 
 
-def connections_per_worker(threads: int, pool_size: int, pipeline: bool, pg_readers: int) -> int:
-    """Postgres connections one worker can open. Inline with the pipeline: PG_READERS read pipelines + 1 write
-    pipeline + 1 for the bcrypt helper thread (the loop's own SingleConnection is never opened). Inline without it:
-    the loop's connection + the helper's. Threaded: its pool."""
-    if threads:
-        return pool_size
-    return (pg_readers + 1 if pipeline else 1) + 1
-
-
-def serve(listener, database_url: str, jwt_secret: str, pool_size: int, threads: int, pg_readers: int,
+def serve(adapters: dict, driver, listener, jwt_secret: str, pool_size: int, threads: int, pg_readers: int,
           broker_sock=None):
-    """One worker: its own connections (they can't cross a fork) and thread pool, the shared listener.
+    """One worker: its own connections (they can't cross a fork) and thread pool, its listener.
     threads=0: handlers run inline on the loop thread; bcrypt routes (router.offload) run on one helper thread with
     its own connection; queries that handlers `yield` run on PG_READERS read pipelines and one write pipeline
-    (pg_readers=0, i.e. PIPELINE=0: on the loop's own connection, blocking). See connections_per_worker.
+    (pg_readers=0, i.e. PIPELINE=0: on the loop's own connection, blocking). See driver.connections_per_worker.
     broker_sock: queries go to the shared Postgres broker process instead (pg_broker.py)."""
-    if threads == 0:
-        db_pool = SingleConnection(database_url)
-    else:
-        db_pool = ConnectionPool(
-            conninfo=database_url,
-            min_size=pool_size,
-            max_size=pool_size,
-            configure=configure_connection,
-            open=True,
-        )
-    article_repository = PostgresUserRepository(db_pool)
-    crypto_adapter = JoseBcryptCryptoAdapter(secret_key=jwt_secret)
-
-    # Composition root: wire ports into controllers, then start the raw socket server.
-    controllers.bootstrap(article_repository, crypto_adapter)
+    # Composition root: build the chosen adapters, wire them into the application, then start the transport.
+    codec = adapters["JSON_CODEC"]()
+    http_router.use_json(codec)
+    hasher = adapters["PASSWORD_HASHER"]
+    controllers.bootstrap(
+        driver.repository(threads, pool_size, codec),
+        hasher(),
+        adapters["TOKENS"](secret_key=jwt_secret),
+        codec,
+    )
 
     if broker_sock is not None:
-        pipeline = (BrokerClient(broker_sock),)
+        pipeline = (driver.broker_client(broker_sock),)
     elif threads == 0 and pg_readers:
-        pipeline = tuple(PgPipeline(database_url) for _ in range(pg_readers + 1))
+        pipeline = driver.pipelines(pg_readers)
     else:
         pipeline = None
-    server = RawSocketHttpServer(
-        host="", port=0, router=router, threads=threads, listener=listener,
-        offload=frozenset(router.offload - router.broker_ok if broker_sock is not None else router.offload),
+    router = http_router.router
+    # with the broker, logins yield their bcrypt to it (the hasher's batcher there) instead of the helper thread
+    broker_bcrypt = broker_sock is not None and hasattr(hasher, "batcher")
+    server = adapters["HTTP_SERVER"](
+        host="", port=0, router=router, parse=http_router.parse_request, threads=threads, listener=listener,
+        offload=frozenset(router.offload - router.broker_ok if broker_bcrypt else router.offload),
         pipeline=pipeline,
     )
     server.start()
@@ -90,7 +68,15 @@ def main():
         print("Error: DATABASE_URL and JWT_SECRET environment variables are required.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Initializing Conduit server on {host}:{port} with {workers} worker(s)...", flush=True)
+    print(f"Initializing Conduit server on {host}:{port} with {workers} worker(s): {registry.chosen()}", flush=True)
+    # every chosen adapter is imported here, before the fork, so the workers share its code
+    adapters = {port: registry.adapter(port) for port in registry.ADAPTERS}
+    server_cls = adapters["HTTP_SERVER"]
+    driver = adapters["DB_DRIVER"](database_url)
+    if getattr(driver, "needs_asyncio", False) and not getattr(server_cls, "asyncio", False):
+        print(f"Error: DB_DRIVER={registry.choice('DB_DRIVER')} runs on asyncio: use HTTP_SERVER=uvloop",
+              file=sys.stderr)
+        sys.exit(1)
 
     # Shared by every worker: all imported code and compiled routes (copy-on-write after fork; gc.freeze keeps the
     # collector from dirtying those pages). Listening sockets are made here too, before the fork. Served directly,
@@ -100,9 +86,9 @@ def main():
     # worker at 8,000 users.
     reuseport = workers > 1 and os.getenv("REUSEPORT", "1") != "0"
     if reuseport:
-        listeners = [make_listener(host, port, reuseport=True) for _ in range(workers)]
+        listeners = [server_cls.make_listener(host, port, reuseport=True) for _ in range(workers)]
     else:
-        listeners = [make_listener(host, port)] * workers
+        listeners = [server_cls.make_listener(host, port)] * workers
     # Default THREADS=0: each worker is one thread running handlers inline on its epoll loop, with one connection.
     # Measured ~25% more req/s per CPU than a thread pool per worker, whose GIL handoffs cost ~20 context switches
     # per request. THREADS=N brings back the pool: N threads sharing DB_BUDGET // WORKERS connections.
@@ -112,8 +98,10 @@ def main():
     # BROKER=1 (default, inline pipeline mode only): one more process owns BROKER_READERS read connections and
     # BROKER_WRITERS write connections for all workers, and batches their reads (pg_broker.py). Workers keep only the
     # bcrypt helper's.
-    broker = threads == 0 and bool(pg_readers) and os.getenv("BROKER", "1") != "0"
-    broker_readers = max(1, int(os.getenv("BROKER_READERS", 6)))
+    broker = threads == 0 and bool(pg_readers) and os.getenv("BROKER", "1") != "0" and driver.supports_broker
+    # 8: on fresh copies of the seed at 46,000 test users, 6 readers passed 1 of 2 runs (p95 458/552 ms), 8 passed 3 of 3
+    # (p95 254-330 ms), and 1 of 2 at 50,000; 10 failed at 50,000 and cost Postgres more per request
+    broker_readers = max(1, int(os.getenv("BROKER_READERS", 8)))
     broker_writers = max(1, int(os.getenv("BROKER_WRITERS", 2)))
     # the broker's bcrypt threads (logins): a lone login waits up to BCRYPT_WAIT_MS for others to hash with it
     bcrypt_threads = max(1, int(os.getenv("BCRYPT_THREADS", 2)))
@@ -121,7 +109,7 @@ def main():
     if broker:
         total = broker_readers + broker_writers + workers
     else:
-        total = workers * connections_per_worker(threads, pool_size, bool(pg_readers), pg_readers)
+        total = workers * driver.connections_per_worker(threads, pool_size, pg_readers)
     if total > MAX_CONNECTIONS:
         print(f"Error: {workers} workers would open up to {total} Postgres connections (limit {MAX_CONNECTIONS});"
               " lower WORKERS, PG_READERS or DB_BUDGET.", file=sys.stderr)
@@ -129,7 +117,7 @@ def main():
 
     if workers == 1 and not broker:
         try:
-            serve(listeners[0], database_url, jwt_secret, pool_size, threads, pg_readers)
+            serve(adapters, driver, listeners[0], jwt_secret, pool_size, threads, pg_readers)
         except KeyboardInterrupt:
             sys.exit(0)
         return
@@ -146,8 +134,9 @@ def main():
                 listener.close()
             for worker_end, _ in pairs:
                 worker_end.close()
-            serve_broker([broker_end for _, broker_end in pairs], database_url, broker_readers, broker_writers,
-                         bcrypt_threads, bcrypt_wait)
+            hasher = adapters["PASSWORD_HASHER"]
+            make_bcrypt = (lambda: hasher.batcher(bcrypt_threads, bcrypt_wait)) if hasattr(hasher, "batcher") else None
+            driver.serve_broker([broker_end for _, broker_end in pairs], broker_readers, broker_writers, make_bcrypt)
         children.append(pid)
     for i in range(workers):
         pid = os.fork()
@@ -163,7 +152,7 @@ def main():
                 if j != i:
                     worker_end.close()
             try:
-                serve(listeners[i], database_url, jwt_secret, pool_size, threads, pg_readers,
+                serve(adapters, driver, listeners[i], jwt_secret, pool_size, threads, pg_readers,
                       pairs[i][0] if broker else None)
             except BaseException:
                 import traceback

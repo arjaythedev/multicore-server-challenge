@@ -7,6 +7,7 @@ const Node = struct {
     timer_position: u32 = none,
     deadline: i64 = 0,
     queued: bool = false,
+    write_queue: bool = false,
 };
 
 // One allocation per index, never one allocation per queue/timer operation.
@@ -18,6 +19,8 @@ pub const Scheduler = struct {
     free_head: u32,
     head: u32 = none,
     tail: u32 = none,
+    write_head: u32 = none,
+    write_tail: u32 = none,
 
     pub fn init(allocator: std.mem.Allocator, capacity: usize) !Scheduler {
         const nodes = try allocator.alloc(Node, capacity);
@@ -47,20 +50,33 @@ pub const Scheduler = struct {
     }
 
     pub fn enqueue(self: *Scheduler, index: usize) void {
+        self.enqueueLane(index, false);
+    }
+
+    pub fn enqueueWrite(self: *Scheduler, index: usize) void {
+        self.enqueueLane(index, true);
+    }
+
+    fn enqueueLane(self: *Scheduler, index: usize, write: bool) void {
         const node = &self.nodes[index];
         std.debug.assert(!node.queued);
+        const head = if (write) &self.write_head else &self.head;
+        const tail = if (write) &self.write_tail else &self.tail;
         node.queued = true;
-        node.previous = self.tail;
+        node.write_queue = write;
+        node.previous = tail.*;
         node.next = none;
-        if (self.tail == none) self.head = @intCast(index) else self.nodes[self.tail].next = @intCast(index);
-        self.tail = @intCast(index);
+        if (tail.* == none) head.* = @intCast(index) else self.nodes[tail.*].next = @intCast(index);
+        tail.* = @intCast(index);
     }
 
     pub fn unqueue(self: *Scheduler, index: usize) void {
         const node = &self.nodes[index];
         if (!node.queued) return;
-        if (node.previous == none) self.head = node.next else self.nodes[node.previous].next = node.next;
-        if (node.next == none) self.tail = node.previous else self.nodes[node.next].previous = node.previous;
+        const head = if (node.write_queue) &self.write_head else &self.head;
+        const tail = if (node.write_queue) &self.write_tail else &self.tail;
+        if (node.previous == none) head.* = node.next else self.nodes[node.previous].next = node.next;
+        if (node.next == none) tail.* = node.previous else self.nodes[node.next].previous = node.previous;
         node.next = none;
         node.previous = none;
         node.queued = false;
@@ -207,4 +223,26 @@ test "one hundred thousand slots retain ordered deadlines and can all be reused"
     try std.testing.expectEqual(none, s.head);
     for (0..count) |_| try std.testing.expect(s.acquire() != null);
     try std.testing.expect(s.acquire() == null);
+}
+
+test "independent read and write queues preserve unlink and slot reuse" {
+    var s = try Scheduler.init(std.testing.allocator, 4);
+    defer s.deinit(std.testing.allocator);
+    const a = s.acquire().?;
+    const b = s.acquire().?;
+    const c = s.acquire().?;
+    s.enqueue(a);
+    s.enqueueWrite(b);
+    s.enqueueWrite(c);
+    s.release(b);
+    try std.testing.expectEqual(c, s.write_head);
+    try std.testing.expectEqual(a, s.head);
+    const reused = s.acquire().?;
+    try std.testing.expectEqual(b, reused);
+    s.enqueue(reused);
+    s.release(c);
+    try std.testing.expectEqual(none, s.write_head);
+    try std.testing.expectEqual(reused, s.tail);
+    s.release(a);
+    try std.testing.expectEqual(reused, s.head);
 }

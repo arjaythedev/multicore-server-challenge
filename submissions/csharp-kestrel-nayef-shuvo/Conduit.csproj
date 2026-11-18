@@ -1,0 +1,59 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>conduit</AssemblyName>
+    <RootNamespace>Conduit</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <!-- packages.lock.json holds the hashes of the packages from nuget.org, as restored with the SDK that install.sh pins.
+         Any other SDK (a distro's source-built one carries its own copy of the AOT packs, with other hashes) restores into a
+         throwaway lock file under obj/ and leaves the committed one alone, so dotnet build, run and the IDE work on it too. -->
+    <NuGetLockFilePath Condition="'$(NETCoreSdkVersion)' != '10.0.402'">$(MSBuildProjectDirectory)/obj/local.packages.lock.json</NuGetLockFilePath>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks> <!-- BcryptCore.cs and the generated BcryptLanes.g.cs work through pointers -->
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <!-- Benchmarks/ is its own project (BenchmarkDotNet); its files must not become part of the server. -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);Benchmarks/**</DefaultItemExcludes>
+  </PropertyGroup>
+
+  <!-- Native AOT: `dotnet publish` produces one native executable (bin/conduit), no JIT, no runtime install needed.
+       The instruction set is left at the compiler's default on purpose: <IlcInstructionSet>native</IlcInstructionSet> made ilc fail
+       on the benchmark box's AVX-512 VM, and it measured no faster than the default or x86-64-v3 (within 2% on the list mix, the
+       feed and logins). -->
+  <PropertyGroup>
+    <PublishAot>true</PublishAot>
+    <!-- Restore and publish must agree on the platform: use the SDK's own (linux-x64 on the box). -->
+    <RuntimeIdentifier>$(NETCoreSdkPortableRuntimeIdentifier)</RuntimeIdentifier>
+    <OptimizationPreference>Speed</OptimizationPreference>
+    <StripSymbols>true</StripSymbols>
+  </PropertyGroup>
+
+  <!-- Runtime: server GC (one heap per core, non-concurrent so there is no background GC thread), no culture data,
+       and none of the diagnostics we don't read. -->
+  <PropertyGroup>
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <UseSystemResourceKeys>true</UseSystemResourceKeys>
+    <EventSourceSupport>false</EventSourceSupport>
+    <MetricsSupport>false</MetricsSupport>
+    <DebuggerSupport>false</DebuggerSupport>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.IdentityModel.JsonWebTokens" Version="8.23.0" />
+    <PackageReference Include="Npgsql" Version="10.0.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Idle thread-pool workers sleep at once instead of spinning for work first; the spinning burns CPU that
+         Postgres, on the same cores, needs. -->
+    <RuntimeHostConfigurationOption Include="System.Threading.ThreadPool.UnfairSemaphoreSpinLimit" Value="0" />
+    <!-- Every statement uses positional parameters ($1) and none holds a ';', so Npgsql needn't parse the SQL text. -->
+    <RuntimeHostConfigurationOption Include="Npgsql.EnableSqlRewriting" Value="false" />
+  </ItemGroup>
+
+</Project>

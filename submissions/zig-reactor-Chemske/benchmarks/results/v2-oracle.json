@@ -1,0 +1,724 @@
+{
+  "scope": "Independent Oracle capacity search; not an official leaderboard score",
+  "source_commit": "1f32410627405c139eb926a2ece95bbd9ddc7a5f",
+  "binary_sha256": "48838ef389a32da5dc171cc06c8fc0906ecb7016b5902fffb90d43bb1fd5913c",
+  "build": "Unprivileged plain bash build.sh; Linux defaults, no experiment overrides",
+  "validation_ci": "https://github.com/Chemske/multicore-server-challenge/actions/runs/41039422629",
+  "target": {
+    "os": "Ubuntu 24.04 x86_64",
+    "vcpus": 8,
+    "physical_cores": 4,
+    "threads_per_core": 2,
+    "memory_mib": 15983,
+    "cpu": "AMD EPYC 9J14",
+    "swap": false
+  },
+  "database": {
+    "server": "PostgreSQL 18",
+    "seed": "unchanged full seed",
+    "configuration": "unchanged box/setup-box.sh and box/pg-conf.sh",
+    "conformance_passed": 197
+  },
+  "dependencies": {
+    "zig": "0.17.0",
+    "libpq": "18.6"
+  },
+  "application": {
+    "reactors": 4,
+    "database_connections": 40,
+    "read_connections": 16,
+    "write_connections": 24,
+    "admitted_tasks": 12288,
+    "read_group_max": 512,
+    "bcrypt_workers": 2,
+    "bcrypt_max_lanes": 4,
+    "bcrypt_selected_lanes": 3,
+    "bcrypt_gather_max_ms": 100,
+    "bcrypt_cost": 10
+  },
+  "protocol": {
+    "generator": "unchanged upstream loadgen search/run/merge",
+    "separate_load_generators": 3,
+    "load_generator_each_vcpus": 4,
+    "load_generator_each_memory_gib": 8,
+    "think_scale": 1,
+    "warmup_ramp_s": 60,
+    "warmup_measure_s": 120,
+    "probe_ramp_s": 60,
+    "probe_measure_s": 60,
+    "hold_ramp_s": 60,
+    "hold_measure_s": 300,
+    "p95_limit_ms": 500,
+    "p99_limit_ms": 1000,
+    "error_rate_limit": 0.01
+  },
+  "score_users": 120000,
+  "highest_passing_probe": 130000,
+  "lowest_failing_probe": 140000,
+  "started": "2026-10-30T10:18:28Z",
+  "finished": "2026-10-30T10:53:35Z",
+  "hold": {
+    "measure_start_utc": "2026-10-30T10:48:11.762000+00:00",
+    "measure_s": 300,
+    "overall": {
+      "count": 9076087,
+      "rps": 30253.623333333333,
+      "p50_ms": 162.687,
+      "p90_ms": 387.071,
+      "p95_ms": 470.783,
+      "p99_ms": 653.823,
+      "max_ms": 1296.383,
+      "mean_ms": 194.00348951018174,
+      "errors": 9297,
+      "error_rate": 0.0010243401148534606,
+      "statuses": {
+        "200": 8900324,
+        "201": 161016,
+        "204": 5450,
+        "503": 9297
+      },
+      "error_classes": {
+        "http_503": 9297
+      }
+    },
+    "endpoints": [
+      {
+        "name": "GET /api/articles/:slug",
+        "count": 1802680,
+        "rps": 6008.933333333333,
+        "p50_ms": 159.871,
+        "p90_ms": 317.695,
+        "p95_ms": 376.063,
+        "p99_ms": 490.751,
+        "max_ms": 1293.311,
+        "mean_ms": 179.79021807031722,
+        "errors": 1728,
+        "error_rate": 0.0009585727916213637,
+        "statuses": {
+          "200": 1800952,
+          "503": 1728
+        },
+        "error_classes": {
+          "http_503": 1728
+        }
+      },
+      {
+        "name": "GET /api/articles/:slug/comments",
+        "count": 1800413,
+        "rps": 6001.376666666667,
+        "p50_ms": 278.783,
+        "p90_ms": 480.255,
+        "p95_ms": 560.639,
+        "p99_ms": 702.975,
+        "max_ms": 980.479,
+        "mean_ms": 299.8948713539625,
+        "errors": 1702,
+        "error_rate": 0.0009453386528535397,
+        "statuses": {
+          "200": 1798711,
+          "503": 1702
+        },
+        "error_classes": {
+          "http_503": 1702
+        }
+      },
+      {
+        "name": "GET /api/tags",
+        "count": 1799725,
+        "rps": 5999.083333333333,
+        "p50_ms": 87.743,
+        "p90_ms": 202.239,
+        "p95_ms": 245.119,
+        "p99_ms": 338.687,
+        "max_ms": 684.543,
+        "mean_ms": 103.66897983247434,
+        "errors": 1833,
+        "error_rate": 0.0010184889358096376,
+        "statuses": {
+          "200": 1797892,
+          "503": 1833
+        },
+        "error_classes": {
+          "http_503": 1833
+        }
+      },
+      {
+        "name": "GET /api/articles",
+        "count": 1070337,
+        "rps": 3567.79,
+        "p50_ms": 152.959,
+        "p90_ms": 301.055,
+        "p95_ms": 350.975,
+        "p99_ms": 465.663,
+        "max_ms": 763.903,
+        "mean_ms": 169.13987567093363,
+        "errors": 1280,
+        "error_rate": 0.0011958850343396518,
+        "statuses": {
+          "200": 1069057,
+          "503": 1280
+        },
+        "error_classes": {
+          "http_503": 1280
+        }
+      },
+      {
+        "name": "GET /api/articles/feed",
+        "count": 729531,
+        "rps": 2431.77,
+        "p50_ms": 373.247,
+        "p90_ms": 618.495,
+        "p95_ms": 701.439,
+        "p99_ms": 872.447,
+        "max_ms": 1296.383,
+        "mean_ms": 393.82627574702235,
+        "errors": 840,
+        "error_rate": 0.0011514246824329603,
+        "statuses": {
+          "200": 728691,
+          "503": 840
+        },
+        "error_classes": {
+          "http_503": 840
+        }
+      },
+      {
+        "name": "GET /api/profiles/:username",
+        "count": 490093,
+        "rps": 1633.6433333333334,
+        "p50_ms": 88.895,
+        "p90_ms": 207.487,
+        "p95_ms": 252.671,
+        "p99_ms": 353.023,
+        "max_ms": 677.887,
+        "mean_ms": 105.62194330259753,
+        "errors": 508,
+        "error_rate": 0.0010365379632029023,
+        "statuses": {
+          "200": 489585,
+          "503": 508
+        },
+        "error_classes": {
+          "http_503": 508
+        }
+      },
+      {
+        "name": "GET /api/articles?author",
+        "count": 392021,
+        "rps": 1306.7366666666667,
+        "p50_ms": 189.311,
+        "p90_ms": 348.671,
+        "p95_ms": 397.055,
+        "p99_ms": 528.895,
+        "max_ms": 829.951,
+        "mean_ms": 206.04843529045638,
+        "errors": 441,
+        "error_rate": 0.0011249397353713193,
+        "statuses": {
+          "200": 391580,
+          "503": 441
+        },
+        "error_classes": {
+          "http_503": 441
+        }
+      },
+      {
+        "name": "GET /api/articles?tag",
+        "count": 389024,
+        "rps": 1296.7466666666667,
+        "p50_ms": 148.223,
+        "p90_ms": 296.191,
+        "p95_ms": 351.231,
+        "p99_ms": 468.735,
+        "max_ms": 1206.271,
+        "mean_ms": 166.7577681454103,
+        "errors": 358,
+        "error_rate": 0.000920251706835568,
+        "statuses": {
+          "200": 388666,
+          "503": 358
+        },
+        "error_classes": {
+          "http_503": 358
+        }
+      },
+      {
+        "name": "POST /api/articles/:slug/favorite",
+        "count": 176155,
+        "rps": 587.1833333333333,
+        "p50_ms": 21.535,
+        "p90_ms": 78.847,
+        "p95_ms": 108.095,
+        "p99_ms": 181.119,
+        "max_ms": 368.383,
+        "mean_ms": 33.60845131276425,
+        "errors": 176,
+        "error_rate": 0.000999120093099827,
+        "statuses": {
+          "200": 175979,
+          "503": 176
+        },
+        "error_classes": {
+          "http_503": 176
+        }
+      },
+      {
+        "name": "POST /api/articles/:slug/comments",
+        "count": 122311,
+        "rps": 407.7033333333333,
+        "p50_ms": 21.679,
+        "p90_ms": 84.479,
+        "p95_ms": 116.031,
+        "p99_ms": 200.831,
+        "max_ms": 371.199,
+        "mean_ms": 35.227936620581886,
+        "errors": 111,
+        "error_rate": 0.0009075226267465723,
+        "statuses": {
+          "201": 122200,
+          "503": 111
+        },
+        "error_classes": {
+          "http_503": 111
+        }
+      },
+      {
+        "name": "GET /api/articles?favorited",
+        "count": 98105,
+        "rps": 327.01666666666665,
+        "p50_ms": 153.983,
+        "p90_ms": 307.711,
+        "p95_ms": 358.143,
+        "p99_ms": 471.551,
+        "max_ms": 671.231,
+        "mean_ms": 170.47225014015604,
+        "errors": 107,
+        "error_rate": 0.0010906681616635239,
+        "statuses": {
+          "200": 97998,
+          "503": 107
+        },
+        "error_classes": {
+          "http_503": 107
+        }
+      },
+      {
+        "name": "POST /api/profiles/:username/follow",
+        "count": 52708,
+        "rps": 175.69333333333333,
+        "p50_ms": 18.623,
+        "p90_ms": 78.591,
+        "p95_ms": 110.015,
+        "p99_ms": 192.127,
+        "max_ms": 363.007,
+        "mean_ms": 32.16034249070349,
+        "errors": 48,
+        "error_rate": 0.0009106776959854292,
+        "statuses": {
+          "200": 52660,
+          "503": 48
+        },
+        "error_classes": {
+          "http_503": 48
+        }
+      },
+      {
+        "name": "GET /api/user",
+        "count": 44252,
+        "rps": 147.50666666666666,
+        "p50_ms": 172.543,
+        "p90_ms": 301.567,
+        "p95_ms": 348.159,
+        "p99_ms": 450.559,
+        "max_ms": 701.951,
+        "mean_ms": 186.570446962849,
+        "errors": 48,
+        "error_rate": 0.00108469673687065,
+        "statuses": {
+          "200": 44204,
+          "503": 48
+        },
+        "error_classes": {
+          "http_503": 48
+        }
+      },
+      {
+        "name": "POST /api/articles",
+        "count": 38680,
+        "rps": 128.93333333333334,
+        "p50_ms": 32.383,
+        "p90_ms": 106.751,
+        "p95_ms": 141.567,
+        "p99_ms": 232.191,
+        "max_ms": 431.871,
+        "mean_ms": 47.026003903826265,
+        "errors": 38,
+        "error_rate": 0.0009824198552223372,
+        "statuses": {
+          "201": 38642,
+          "503": 38
+        },
+        "error_classes": {
+          "http_503": 38
+        }
+      },
+      {
+        "name": "DELETE /api/articles/:slug/favorite",
+        "count": 19521,
+        "rps": 65.07,
+        "p50_ms": 21.231,
+        "p90_ms": 77.311,
+        "p95_ms": 105.023,
+        "p99_ms": 175.487,
+        "max_ms": 388.095,
+        "mean_ms": 32.96585564264122,
+        "errors": 19,
+        "error_rate": 0.0009733107935044311,
+        "statuses": {
+          "200": 19502,
+          "503": 19
+        },
+        "error_classes": {
+          "http_503": 19
+        }
+      },
+      {
+        "name": "DELETE /api/profiles/:username/follow",
+        "count": 18578,
+        "rps": 61.92666666666667,
+        "p50_ms": 18.335,
+        "p90_ms": 78.271,
+        "p95_ms": 109.375,
+        "p99_ms": 197.375,
+        "max_ms": 353.535,
+        "mean_ms": 31.8227559478954,
+        "errors": 22,
+        "error_rate": 0.0011841963612875444,
+        "statuses": {
+          "200": 18556,
+          "503": 22
+        },
+        "error_classes": {
+          "http_503": 22
+        }
+      },
+      {
+        "name": "PUT /api/user",
+        "count": 14528,
+        "rps": 48.42666666666667,
+        "p50_ms": 11.231,
+        "p90_ms": 55.679,
+        "p95_ms": 78.911,
+        "p99_ms": 152.959,
+        "max_ms": 312.831,
+        "mean_ms": 22.22715019273125,
+        "errors": 20,
+        "error_rate": 0.0013766519823788547,
+        "statuses": {
+          "200": 14508,
+          "503": 20
+        },
+        "error_classes": {
+          "http_503": 20
+        }
+      },
+      {
+        "name": "POST /api/users/login",
+        "count": 9546,
+        "rps": 31.82,
+        "p50_ms": 384.511,
+        "p90_ms": 581.119,
+        "p95_ms": 642.047,
+        "p99_ms": 775.167,
+        "max_ms": 1127.423,
+        "mean_ms": 402.8379786297928,
+        "errors": 6,
+        "error_rate": 0.0006285355122564425,
+        "statuses": {
+          "200": 9540,
+          "503": 6
+        },
+        "error_classes": {
+          "http_503": 6
+        }
+      },
+      {
+        "name": "DELETE /api/articles/:slug/comments/:id",
+        "count": 5459,
+        "rps": 18.196666666666665,
+        "p50_ms": 17.631,
+        "p90_ms": 76.735,
+        "p95_ms": 108.543,
+        "p99_ms": 201.215,
+        "max_ms": 425.727,
+        "mean_ms": 31.764926909690477,
+        "errors": 9,
+        "error_rate": 0.001648653599560359,
+        "statuses": {
+          "204": 5450,
+          "503": 9
+        },
+        "error_classes": {
+          "http_503": 9
+        }
+      },
+      {
+        "name": "PUT /api/articles/:slug",
+        "count": 2246,
+        "rps": 7.486666666666666,
+        "p50_ms": 23.423,
+        "p90_ms": 73.343,
+        "p95_ms": 99.775,
+        "p99_ms": 172.287,
+        "max_ms": 336.895,
+        "mean_ms": 34.354925645592154,
+        "errors": 3,
+        "error_rate": 0.0013357079252003562,
+        "statuses": {
+          "200": 2243,
+          "503": 3
+        },
+        "error_classes": {
+          "http_503": 3
+        }
+      },
+      {
+        "name": "POST /api/users",
+        "count": 174,
+        "rps": 0.58,
+        "p50_ms": 230.399,
+        "p90_ms": 384.511,
+        "p95_ms": 473.087,
+        "p99_ms": 596.479,
+        "max_ms": 771.071,
+        "mean_ms": 247.7009655172413,
+        "errors": 0,
+        "error_rate": 0,
+        "statuses": {
+          "201": 174
+        }
+      }
+    ],
+    "mix": {
+      "page_views": 4890814,
+      "calls_per_page": 1.8557416004779572,
+      "req_per_user_s": 0.2521135277777778,
+      "write_pct": 4.962050275630897,
+      "page_pct": {
+        "article": 36.02236764677618,
+        "comment": 2.5008311499885294,
+        "delete_own_comment": 0.11161741174373019,
+        "edit_own_article": 0.04596371892286233,
+        "favorite_toggle": 4.000888195707299,
+        "follow_toggle": 1.4575487843127954,
+        "home": 21.883207989508495,
+        "profile": 8.01500527315085,
+        "profile_favorited": 2.005678400364438,
+        "publish": 0.7908703949894639,
+        "settings": 0.29698532800470434,
+        "tag": 7.954176952957115,
+        "your_feed": 14.914858753573537
+      },
+      "session_starts": {
+        "login": 9546,
+        "returning": 29727,
+        "signup": 174
+      }
+    },
+    "load_generators": [
+      {
+        "box_index": 0,
+        "users": 40000,
+        "cpu_avg_measure_pct": 20.52900744343407,
+        "cpu_max_measure_pct": 59.25925925925926,
+        "proc_cpu_avg_measure_pct": 19.52185333681874,
+        "rss_peak_mb": 778.3984375,
+        "fell_behind": false,
+        "tcp_connects": 40068
+      },
+      {
+        "box_index": 1,
+        "users": 40000,
+        "cpu_avg_measure_pct": 22.028545052365356,
+        "cpu_max_measure_pct": 64.28571428571429,
+        "proc_cpu_avg_measure_pct": 19.766383008372443,
+        "rss_peak_mb": 781.43359375,
+        "fell_behind": false,
+        "tcp_connects": 40052
+      },
+      {
+        "box_index": 2,
+        "users": 40000,
+        "cpu_avg_measure_pct": 21.795849788957696,
+        "cpu_max_measure_pct": 58.41836734693877,
+        "proc_cpu_avg_measure_pct": 19.19079530515869,
+        "rss_peak_mb": 781.01953125,
+        "fell_behind": false,
+        "tcp_connects": 40066
+      }
+    ],
+    "target_monitor_means": {
+      "cpu": 92.085,
+      "steal": 7.6,
+      "iow": 0.018,
+      "app_core": 256.051,
+      "pg_core": 525.608,
+      "app_box": 32.007,
+      "pg_box": 65.7,
+      "app_pss": 121.403,
+      "mem_used": 4362.607,
+      "mem_avail": 11619.937
+    },
+    "monitor_samples": 300,
+    "raw_merged_sha256": "1e8fb32d5fd22e8abf48e12f2ed64f996906de8b29b498210ab807384390a466"
+  },
+  "probes": [
+    {
+      "phase": "probe-25000",
+      "users": 25000,
+      "pass": true,
+      "lg_limited": false,
+      "rps": 6657.8,
+      "p50_ms": 0.443,
+      "p95_ms": 1.406,
+      "p99_ms": 1.913,
+      "error_pct": 0
+    },
+    {
+      "phase": "probe-50000",
+      "users": 50000,
+      "pass": true,
+      "lg_limited": false,
+      "rps": 13224.333333333334,
+      "p50_ms": 0.991,
+      "p95_ms": 3.383,
+      "p99_ms": 5.535,
+      "error_pct": 0
+    },
+    {
+      "phase": "probe-100000",
+      "users": 100000,
+      "pass": true,
+      "lg_limited": false,
+      "rps": 26396.516666666666,
+      "p50_ms": 17.215,
+      "p95_ms": 54.271,
+      "p99_ms": 83.135,
+      "error_pct": 0
+    },
+    {
+      "phase": "probe-190000",
+      "users": 190000,
+      "pass": false,
+      "lg_limited": false,
+      "rps": 47102.26666666667,
+      "p50_ms": 200.575,
+      "p95_ms": 739.327,
+      "p99_ms": 1025.023,
+      "error_pct": 32.022202753158375
+    },
+    {
+      "phase": "probe-150000",
+      "users": 150000,
+      "pass": false,
+      "lg_limited": false,
+      "rps": 37033.25,
+      "p50_ms": 239.999,
+      "p95_ms": 638.463,
+      "p99_ms": 868.863,
+      "error_pct": 8.011044129262217
+    },
+    {
+      "phase": "probe-130000",
+      "users": 130000,
+      "pass": true,
+      "lg_limited": false,
+      "rps": 32694.816666666666,
+      "p50_ms": 175.231,
+      "p95_ms": 497.407,
+      "p99_ms": 679.935,
+      "error_pct": 0.5983619217929039
+    },
+    {
+      "phase": "probe-140000",
+      "users": 140000,
+      "pass": false,
+      "lg_limited": false,
+      "rps": 34650.95,
+      "p50_ms": 239.231,
+      "p95_ms": 640.511,
+      "p99_ms": 866.303,
+      "error_pct": 5.218183051258335
+    }
+  ],
+  "holds": [
+    {
+      "phase": "hold-130000",
+      "users": 130000,
+      "pass": false,
+      "lg_limited": false,
+      "rps": 32374.863333333335,
+      "p50_ms": 207.231,
+      "p95_ms": 580.095,
+      "p99_ms": 795.135,
+      "error_pct": 1.7492583495075757
+    },
+    {
+      "phase": "hold-120000",
+      "users": 120000,
+      "pass": true,
+      "lg_limited": false,
+      "rps": 30253.623333333333,
+      "p50_ms": 162.687,
+      "p95_ms": 470.783,
+      "p99_ms": 653.823,
+      "error_pct": 0.10243401148534606
+    }
+  ],
+  "limitations": [
+    "Oracle hardware and CPU steal differ from the organizer host; only the organizer determines rank.",
+    "Requests/s includes failed requests; no capacity is extrapolated from Mac or socket-only tests."
+  ],
+  "boundary_refinement": {
+    "stage": "Additional probe after the completed search, on its aged database",
+    "users": 125000,
+    "ramp_s": 60,
+    "measure_s": 60,
+    "overall": {
+      "count": 1853622,
+      "rps": 30893.7,
+      "p50_ms": 242.943,
+      "p90_ms": 552.447,
+      "p95_ms": 667.135,
+      "p99_ms": 926.719,
+      "max_ms": 1507.327,
+      "mean_ms": 280.9168479959782,
+      "errors": 57576,
+      "error_rate": 0.03106134907764366,
+      "statuses": {
+        "200": 1763560,
+        "201": 32002,
+        "204": 484,
+        "503": 57576
+      },
+      "error_classes": {
+        "http_503": 57576
+      }
+    },
+    "verdict": {
+      "pass": false,
+      "fail_reasons": [
+        "p95 667 ms >= 500",
+        "errors 3.11% >= 1%"
+      ],
+      "lg_limited": false
+    },
+    "target_cpu_mean_pct": 91.975,
+    "target_steal_mean_pct": 7.755,
+    "raw_merged_sha256": "e3a732820da6ea846b465b3a9f521318876c6ad284630f05523967a8889c3d49"
+  },
+  "final_validation_ci": [
+    "https://github.com/Chemske/multicore-server-challenge/actions/runs/41045355459",
+    "https://github.com/Chemske/multicore-server-challenge/actions/runs/41046946269"
+  ]
+}

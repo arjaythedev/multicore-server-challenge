@@ -2,6 +2,7 @@ package conduit.db
 
 import conduit.pg.PgConn
 import conduit.pg.PgError
+import conduit.pg.PgIoException
 import conduit.pg.PgStatement
 import conduit.platform.Monitor
 import conduit.platform.isOutOfMemory
@@ -112,7 +113,7 @@ internal abstract class Pool(
     abstract fun failDrained(drained: List<Any>, err: PgError)
 
     /** Writes the encoded round trip. A failure is left to the worker's reader, which sees the dead socket. */
-    fun send(c: PgConn) {
+    open fun send(c: PgConn) {
         try {
             c.send()
         } catch (_: Throwable) {
@@ -183,7 +184,7 @@ internal abstract class Worker(@JvmField val pool: Pool, @JvmField val index: In
         val lock = pool.lock
         while (true) {
             c.beginReply()
-            c.next() // blocks until a reply (or an asynchronous message, or EOF) arrives
+            awaitMessage(c) // blocks until a reply (or an asynchronous message, or EOF) arrives
             c.pushBack()
             // the sender set inFlight under the lock before writing, so it is visible here, and so is out/its batch
             if (!lock.locked { inFlight }) {
@@ -197,6 +198,24 @@ internal abstract class Worker(@JvmField val pool: Pool, @JvmField val index: In
             }
             if (more) pool.send(c)
             resumeCompleted()
+        }
+    }
+
+    /**
+     * [PgConn.next] that keeps waiting through the socket's receive timeout while no round trip is outstanding: an idle
+     * connection has nothing to receive, so a quiet minute is not a failure. The timeout stays the hang detector for
+     * a connection that was already running a batch when this wait began (the first expiry after a batch is sent
+     * during an idle wait only restarts the wait, so a batch always gets a full timeout).
+     */
+    private fun awaitMessage(c: PgConn) {
+        while (true) {
+            val running = pool.lock.locked { inFlight }
+            try {
+                c.next()
+                return
+            } catch (e: PgIoException) {
+                if (!e.timeout || running) throw e
+            }
         }
     }
 

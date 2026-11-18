@@ -34,7 +34,7 @@ def mint(identifier, secret, expiry=None):
 
 
 class Server:
-    def __init__(self, results, secret, prefix, label, executable, database_port=None, template='conduit_dev'):
+    def __init__(self, results, secret, prefix, label, executable, database_port=None, template='conduit_dev', listen_host='127.0.0.1'):
         self.results = results
         self.secret = secret
         self.database = f'challenge_{prefix}_{label}_{os.getpid()}'
@@ -43,6 +43,7 @@ class Server:
         self.process = None
         self.log = None
         self.database_port = database_port
+        self.listen_host = listen_host
         assert template in ('conduit_dev', 'conduit_seed')
         self.template = template
 
@@ -52,10 +53,10 @@ class Server:
             self.log = (self.results / f'{self.database}.log').open('w')
             database_port = self.database_port or os.environ['PGPORT']
             options = '?sslmode=disable&gssencmode=disable' if self.database_port is not None else ''
-            environment = dict(os.environ, HOST='127.0.0.1', PORT=str(self.port), JWT_SECRET=self.secret,
+            environment = dict(os.environ, HOST=self.listen_host, PORT=str(self.port), JWT_SECRET=self.secret,
                                DATABASE_URL=f"postgres://conduit:conduit@127.0.0.1:{database_port}/{self.database}{options}")
             self.process = subprocess.Popen([str(self.executable)], env=environment, stdout=self.log, stderr=self.log)
-            deadline = time.monotonic() + 10
+            deadline = time.monotonic() + 60
             while True:
                 try:
                     assert self.request('GET', '/api/tags')[0] == 200

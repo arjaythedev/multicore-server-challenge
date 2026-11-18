@@ -141,7 +141,7 @@ pub fn parseRunNs(text: []const u8) ?u64 {
     return std.fmt.parseInt(u64, it.next() orelse return null, 10) catch null;
 }
 
-fn readFile(path: [*:0]const u8, buf: []u8) ?[]const u8 {
+pub fn readFile(path: [*:0]const u8, buf: []u8) ?[]const u8 {
     const fd = sys.check(linux.open(path, .{ .CLOEXEC = true }, 0)) catch return null;
     defer sys.closeFd(@intCast(fd));
     const n = sys.readSome(@intCast(fd), buf) catch return null;
