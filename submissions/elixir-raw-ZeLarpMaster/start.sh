@@ -18,4 +18,9 @@ DIRTY_CPU="${DIRTY_CPU:-$dirty}"
 export ERL_AFLAGS="+S $SCHEDULERS +SDcpu $DIRTY_CPU:$DIRTY_CPU +SDio 2 +sbwt none +sbwtdcpu none +sbwtdio none +P 2000000 +Q 1000000 ${ERL_AFLAGS:-}"
 # Distribution stays off unless asked for (RELEASE_DISTRIBUTION=sname: local profiling over `bin/conduit rpc`).
 export RELEASE_DISTRIBUTION="${RELEASE_DISTRIBUTION:-none}" LANG=C.UTF-8
+# SCHED_BATCH (after zig-iouring-nick-potts, default on): run under SCHED_BATCH (no privileges needed, inherited by
+# every thread), so our wakeups stop preempting Postgres backends mid-slice. Skipped when chrt is missing or refuses.
+if [[ "${SCHED_BATCH:-1}" == 1 ]] && command -v chrt >/dev/null && chrt --batch 0 true 2>/dev/null; then
+  exec chrt --batch 0 _build/prod/rel/conduit/bin/conduit start
+fi
 exec _build/prod/rel/conduit/bin/conduit start

@@ -40,11 +40,13 @@ fn variant(comptime name: []const u8) Variant {
 
 /// These need x86-64-v3: their kernel object is built for it (kernels.zig).
 pub const variants = [_]Variant{ variant("zig"), variant("asm_ah"), variant("asm_bextr") };
+/// `variants` plus the `shrx` style, which startup weighs only when asked (ZIG_BCRYPT_KERNEL).
+pub const variants_shrx = variants ++ [_]Variant{variant("asm_shrx")};
 /// The Zig kernel built for baseline x86-64 (kernels_port.zig), the fallback below x86-64-v3.
 pub const portable = [_]Variant{variant("port")};
 
 pub fn findVariant(name: []const u8) ?*const Variant {
-    for (&(variants ++ portable)) |*v| if (std.mem.eql(u8, v.name, name)) return v;
+    for (&(variants_shrx ++ portable)) |*v| if (std.mem.eql(u8, v.name, name)) return v;
     return null;
 }
 
@@ -314,9 +316,11 @@ fn cheaper(_: void, a: Candidate, b: Candidate) bool {
 const screen_rounds = 2;
 const finalists = 4;
 
-/// Startup: the variants this CPU can run (`variants` on x86-64-v3, else `portable`), then `initWith`.
-pub fn init(rounds: usize, failure: *Failure) InitError!Engine {
-    return initWith(if (cpu.detect().v3) &variants else &portable, rounds, failure);
+/// Startup: the variants this CPU can run (`variants`, or `variants_shrx` with `shrx`, on x86-64-v3, else
+/// `portable`), then `initWith`.
+pub fn init(shrx: bool, rounds: usize, failure: *Failure) InitError!Engine {
+    const set: []const Variant = if (!cpu.detect().v3) &portable else if (shrx) &variants_shrx else &variants;
+    return initWith(set, rounds, failure);
 }
 
 /// Self-test of `set` (fatal on mismatch: a wrong kernel would lock users out), then calibration over `rounds`
@@ -324,7 +328,7 @@ pub fn init(rounds: usize, failure: *Failure) InitError!Engine {
 pub fn initWith(set: []const Variant, rounds: usize, failure: *Failure) InitError!Engine {
     try selfTest(set, failure);
     const widths = max_lanes + 1 - min_calibrated_lanes;
-    var buf: [variants.len * widths]Candidate = undefined;
+    var buf: [variants_shrx.len * widths]Candidate = undefined;
     const c = buf[0 .. set.len * widths];
     for (set, 0..) |*v, i| {
         for (0..widths) |k| c[i * widths + k] = .{ .v = v, .n = min_calibrated_lanes + k };
@@ -337,9 +341,17 @@ pub fn initWith(set: []const Variant, rounds: usize, failure: *Failure) InitErro
     return .{ .variant = c[0].v, .lanes = @intCast(c[0].n), .cpu_ms_per_hash = c[0].ms };
 }
 
+/// `v` at width `n` without calibration: its self-test, then its fastest of `rounds` batches for the CPU figure.
+pub fn initPinned(v: *const Variant, n: usize, rounds: usize, failure: *Failure) InitError!Engine {
+    try selfTest(v[0..1], failure);
+    var ms = std.math.inf(f64);
+    for (0..rounds) |_| ms = @min(ms, timeWidth(v, n));
+    return .{ .variant = v, .lanes = @intCast(n), .cpu_ms_per_hash = ms };
+}
+
 test "known vectors and every width" {
     var failure: Failure = .{};
-    const sets: []const []const Variant = if (cpu.detect().v3) &.{ &variants, &portable } else &.{&portable};
+    const sets: []const []const Variant = if (cpu.detect().v3) &.{ &variants_shrx, &portable } else &.{&portable};
     for (sets) |set| selfTest(set, &failure) catch |e| {
         std.debug.print("self-test failed: {s} width {d} case {d}\n", .{ failure.variant, failure.width, failure.case });
         return e;
@@ -384,7 +396,7 @@ fn carryOn(p: *Progress, n: usize) Progress {
 }
 
 test "a batch stopped after any round and finished from its newest saved state hashes as one run straight through" {
-    const sets: []const []const Variant = if (cpu.detect().v3) &.{ &variants, &portable } else &.{&portable};
+    const sets: []const []const Variant = if (cpu.detect().v3) &.{ &variants_shrx, &portable } else &.{&portable};
     const c = 6;
     var b: Batch = .{};
     try b.init(c, 0x0e5a17e);

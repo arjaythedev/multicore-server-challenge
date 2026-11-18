@@ -20,6 +20,12 @@ object App {
         shareMaxBatch: Int = ReadShare.maxBatch,
         viewerFlags: Boolean = false,
         feedMaxBatch: Int = 0,
+        feedHeavy: Boolean = false,
+        feedFloor: Boolean = false,
+        feedShared: Boolean = false,
+        feedRows: Boolean = false,
+        globalWin: Boolean = false,
+        sharedRows: Boolean = false,
     ) {
         TagOrder.appSorts = appSortsTags && collation != null &&
             TagOrder.isByteOrder(collation[0] ?: "", collation[1] ?: "", collation[2] ?: "")
@@ -27,6 +33,12 @@ object App {
         ReadShare.maxBatch = shareMaxBatch
         ReadShare.viewerFlags = viewerFlags
         ReadShare.feedMaxBatch = feedMaxBatch
+        ReadShare.feedHeavy = feedHeavy
+        ReadShare.feedFloor = feedFloor
+        ReadShare.feedShared = feedShared
+        ReadShare.feedRows = feedRows
+        ReadShare.globalWin = globalWin
+        ReadShare.sharedRows = sharedRows
     }
 
     /** Who sorts tag lists (for the startup log line). */

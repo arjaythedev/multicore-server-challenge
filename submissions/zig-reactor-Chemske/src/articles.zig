@@ -16,6 +16,21 @@ const from = " FROM articles a JOIN users u ON u.id = a.author_id ";
 const select = fields ++ from;
 pub const by_id = fields ++ ", a.body" ++ from ++ " WHERE a.id = $2";
 pub const Family = enum { all, tag, author, favorited, feed, single };
+
+// An author's depth-th row proves that older rows cannot enter the combined
+// first depth rows. This bound is derived afresh in the same page statement.
+pub fn feedIds(comptime viewer: []const u8, comptime limit: []const u8, comptime offset: []const u8, comptime cap: []const u8) []const u8 {
+    const depth = "LEAST((" ++ limit ++ ")::numeric+(" ++ offset ++ ")::numeric,9223372036854775807)::bigint";
+    if (!@import("build_options").feed_prune)
+        return "SELECT x.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id=fo.followee_id ORDER BY a2.id DESC LIMIT " ++ depth ++ ") x WHERE fo.follower_id=" ++ viewer ++ " ORDER BY x.id DESC LIMIT " ++ cap ++ " OFFSET " ++ offset;
+    return "WITH followed AS MATERIALIZED (SELECT followee_id FROM follows WHERE follower_id=" ++ viewer ++ " ORDER BY followee_id), " ++
+        "rank_bound AS MATERIALIZED (SELECT ranked.id FROM (SELECT followee_id FROM followed WHERE " ++ depth ++ "<=256 LIMIT 8) fo CROSS JOIN LATERAL " ++
+        "(SELECT a.id FROM articles a WHERE a.author_id=fo.followee_id ORDER BY a.id DESC LIMIT 1 OFFSET GREATEST(" ++ depth ++ ",1)-1) ranked LIMIT 1) " ++
+        "SELECT x.id FROM followed fo CROSS JOIN LATERAL " ++
+        "(SELECT a2.id FROM articles a2 WHERE a2.author_id=fo.followee_id AND a2.id>=COALESCE((SELECT id FROM rank_bound),'-9223372036854775808'::bigint) " ++
+        "ORDER BY a2.id DESC LIMIT " ++ depth ++ ") x ORDER BY x.id DESC LIMIT " ++ cap ++ " OFFSET " ++ offset;
+}
+
 pub const Read = struct {
     family: Family,
     phase: enum { page, count } = .page,
@@ -37,7 +52,7 @@ pub const Read = struct {
             .author => select ++ " WHERE a.id IN (SELECT p.id FROM articles p WHERE p.author_id = (SELECT id FROM users WHERE username = $4) ORDER BY p.id DESC LIMIT $2::bigint OFFSET $3::bigint) ORDER BY a.id DESC",
             .favorited => select ++ " WHERE a.id IN (SELECT f.article_id FROM favorites f WHERE f.user_id = (SELECT id FROM users WHERE username = $4) ORDER BY f.article_id DESC LIMIT $2::bigint OFFSET $3::bigint) ORDER BY a.id DESC",
             // Numeric addition avoids both the reference's int32 overflow and int64 wraparound.
-            .feed => select ++ " WHERE a.id IN (SELECT x.id FROM follows fo CROSS JOIN LATERAL (SELECT a2.id FROM articles a2 WHERE a2.author_id = fo.followee_id ORDER BY a2.id DESC LIMIT LEAST($2::numeric + $3::numeric, 9223372036854775807)::bigint) x WHERE fo.follower_id = $1 ORDER BY x.id DESC LIMIT $2::bigint OFFSET $3::bigint) ORDER BY a.id DESC",
+            .feed => select ++ " WHERE a.id IN (" ++ (comptime feedIds("$1", "$2", "$3", "$2::bigint")) ++ ") ORDER BY a.id DESC",
             .single => fields ++ ", a.body" ++ from ++ " WHERE a.slug = $2",
         };
     }
@@ -63,8 +78,19 @@ pub const Article = struct {
     favorited: bool,
     author: profiles.Profile,
     body: ?[]const u8 = null,
+    encoded: ?struct { bytes: []const u8, favorite_offset: usize, following_offset: usize } = null,
 
     pub fn jsonStringify(self: Article, writer: *std.json.Stringify) !void {
+        if (self.encoded) |shared| {
+            try writer.beginWriteRaw();
+            try writer.writer.writeAll(shared.bytes[0..shared.favorite_offset]);
+            try writer.writer.writeAll(if (self.favorited) "true" else "false");
+            try writer.writer.writeAll(shared.bytes[shared.favorite_offset + 5 .. shared.following_offset]);
+            try writer.writer.writeAll(if (self.author.following) "true" else "false");
+            try writer.writer.writeAll(shared.bytes[shared.following_offset + 5 ..]);
+            writer.endWriteRaw();
+            return;
+        }
         try writer.beginObject();
         inline for (.{ "slug", "title", "description", "createdAt", "updatedAt", "tagList", "favoritesCount", "favorited", "author" }) |key| {
             try writer.objectField(key);
@@ -76,7 +102,64 @@ pub const Article = struct {
         }
         try writer.endObject();
     }
+
+    // Only standard-encoded bytes and two recorded boolean positions are shared.
+    // The primary request owns these bytes until every group recipient finishes.
+    pub fn encodeForGroup(self: *Article, allocator: std.mem.Allocator) !void {
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        defer output.deinit();
+        var writer: std.json.Stringify = .{ .writer = &output.writer };
+        try writer.beginObject();
+        inline for (.{ "slug", "title", "description", "createdAt", "updatedAt", "tagList", "favoritesCount" }) |key| {
+            try writer.objectField(key);
+            try writer.write(@field(self, key));
+        }
+        try writer.objectField("favorited");
+        try writer.beginWriteRaw();
+        const favorite_offset = output.written().len;
+        try output.writer.writeAll("false");
+        writer.endWriteRaw();
+        try writer.objectField("author");
+        try writer.beginObject();
+        inline for (.{ "username", "bio", "image" }) |key| {
+            try writer.objectField(key);
+            try writer.write(@field(self.author, key));
+        }
+        try writer.objectField("following");
+        try writer.beginWriteRaw();
+        const following_offset = output.written().len;
+        try output.writer.writeAll("false");
+        writer.endWriteRaw();
+        try writer.endObject();
+        if (self.body) |body| {
+            try writer.objectField("body");
+            try writer.write(body);
+        }
+        try writer.endObject();
+        self.encoded = .{ .bytes = try output.toOwnedSlice(), .favorite_offset = favorite_offset, .following_offset = following_offset };
+    }
 };
+
+test "shared article encoding preserves escaped text and independent viewer booleans" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const original: Article = .{ .slug = "quoted\"slug", .title = "é\n\\", .description = "following:false", .createdAt = "date", .updatedAt = "date", .tagList = &.{ "a,b", "\"" }, .favoritesCount = 12, .favorited = false, .author = .{ .username = "name", .bio = "\"following\":false}", .image = null, .following = false }, .body = "body\n\"favorited\":false" };
+    for ([_]?[]const u8{ original.body, null }) |body| {
+        var encoded = original;
+        encoded.body = body;
+        try encoded.encodeForGroup(allocator);
+        for ([_]bool{ false, true }) |favorited| for ([_]bool{ false, true }) |following| {
+            var plain = original;
+            plain.body = body;
+            plain.favorited = favorited;
+            plain.author.following = following;
+            encoded.favorited = favorited;
+            encoded.author.following = following;
+            try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(allocator, plain, .{}), try std.json.Stringify.valueAlloc(allocator, encoded, .{}));
+        };
+    }
+}
 
 // ARRAY(SELECT non-null text) emits one dimension without an explicit dimension prefix.
 pub fn tags(allocator: std.mem.Allocator, text: []const u8) ![][]const u8 {

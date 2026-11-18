@@ -1,11 +1,14 @@
 //! The batched comments statement (`sql/BATCH_COMMENTS_LIST_SET.sql`) reads each distinct thread of a drain once.
 //!
-//! It returns two kinds of rows, told apart by the last column. A request row (ordinal k > 0) names its leader, the
+//! It returns three kinds of rows, told apart by the last column. A request row (ordinal k > 0) names its leader, the
 //! first request in the drain for the same article, and carries the viewer's followee ids. A thread row (-n, where n
 //! requests share the thread) is one comment of the leader's thread, newest first, with its author id and the
-//! constants false and true. Every request row comes before any thread row. `Fan` hands each thread row to every
-//! request that shares it, in COMMENTS_LIST_SET's columns, with `following` pointing at the true or the false
-//! constant by that request's own followees. A request whose article does not exist gets no rows, as alone.
+//! constants false and true. An author row (ordinal 0) carries one distinct author's id and profile, in the comment's
+//! author columns; the statements that send them leave those columns NULL in the thread rows, and `Fan` fills them
+//! from the author rows. Every request row comes before any thread row, and so does every author row. `Fan` hands
+//! each thread row to every request that shares it, in COMMENTS_LIST_SET's columns, with `following` pointing at the
+//! true or the false constant by that request's own followees. A request whose article does not exist gets no rows,
+//! as alone.
 const std = @import("std");
 const pg = @import("pg.zig");
 const sql = @import("sql.zig");
@@ -15,6 +18,7 @@ const gpa = std.heap.smp_allocator;
 
 /// The batched statement's columns: COMMENTS_LIST_SET's eight, then true, author id, followee ids, leader, ordinal.
 pub const cols = [_]sql.Oid{ .int8, .text, .timestamptz, .timestamptz, .text, .text, .text, .bool, .bool, .int8, .int8_array, .int8, .int8 };
+const username = 4;
 const following = 7;
 const yes = 8;
 const author = 9;
@@ -22,7 +26,10 @@ const followees = 10;
 const leader = 11;
 const end = 0xffff_ffff;
 
-/// One execution's requests, filled from its request rows. Reused across executions.
+/// An author's username, bio and image cells in `Fan.data`, as a row's offsets and lengths (-1: NULL).
+const Profile = struct { off: [3]u32, len: [3]i32 };
+
+/// One execution's requests, filled from its request rows, and its authors' profiles. Reused across executions.
 pub const Fan = struct {
     /// Per request (0-based), the next request sharing its leader's thread.
     next: std.ArrayList(u32) = .empty,
@@ -31,12 +38,20 @@ pub const Fan = struct {
     /// Per request, its followee ids in `ids`.
     span: std.ArrayList([2]u32) = .empty,
     ids: std.ArrayList(i64) = .empty,
+    /// Per author id, its profile cells, which take the first `kept` bytes of `data`. A thread row without its author
+    /// columns is copied after them, so its cells and its author's share one buffer.
+    profiles: std.AutoHashMapUnmanaged(i64, Profile) = .empty,
+    data: std.ArrayList(u8) = .empty,
+    kept: u32 = 0,
 
     pub fn reset(f: *Fan) void {
         f.next.clearRetainingCapacity();
         f.count.clearRetainingCapacity();
         f.span.clearRetainingCapacity();
         f.ids.clearRetainingCapacity();
+        f.profiles.clearRetainingCapacity();
+        f.data.clearRetainingCapacity();
+        f.kept = 0;
     }
 
     /// Takes one row of the execution for `members`; hands thread rows on through `sink.row(r, row)`.
@@ -48,6 +63,7 @@ pub const Fan = struct {
             try f.span.appendNTimes(gpa, .{ 0, 0 }, members.len);
         }
         const ord = x.int(cols.len - 1);
+        if (ord == 0) return f.keep(x);
         const lead = x.int(leader);
         if (lead < 1 or lead > members.len) return error.ThreadLeader;
         const l: usize = @intCast(lead - 1);
@@ -65,8 +81,9 @@ pub const Fan = struct {
             f.count.items[l] += 1;
             return;
         }
-        if (ord == 0 or -ord != f.count.items[l]) return error.ThreadBeforeRequests;
+        if (-ord != f.count.items[l]) return error.ThreadBeforeRequests;
         const by: ?i64 = if (x.isNull(author)) null else x.int(author);
+        if (by != null and x.isNull(username)) try f.attach(x, by.?);
         const no = x.off[following];
         const sure = x.off[yes];
         x.n = yes;
@@ -77,6 +94,31 @@ pub const Fan = struct {
             x.off[following] = if (follows) sure else no;
             sink.row(members[k], x);
         }
+    }
+
+    /// Keeps an author row's profile cells.
+    fn keep(f: *Fan, x: *const pg.Row) !void {
+        if (x.isNull(author)) return error.ThreadAuthor;
+        f.data.shrinkRetainingCapacity(f.kept);
+        var p: Profile = undefined;
+        for (username..username + 3, 0..) |c, i| {
+            p.off[i] = @intCast(f.data.items.len);
+            p.len[i] = x.len[c];
+            try f.data.appendSlice(gpa, x.raw(c));
+        }
+        f.kept = @intCast(f.data.items.len);
+        try f.profiles.put(gpa, x.int(author), p);
+    }
+
+    /// Moves a thread row into `data`, after the profiles, and points its author columns at author `by`'s cells.
+    fn attach(f: *Fan, x: *pg.Row, by: i64) !void {
+        const p = f.profiles.get(by) orelse return error.ThreadAuthor;
+        f.data.shrinkRetainingCapacity(f.kept);
+        try f.data.appendSlice(gpa, x.data);
+        x.data = f.data.items;
+        for (x.off[0..x.n]) |*o| o.* += f.kept;
+        x.off[username..][0..3].* = p.off;
+        x.len[username..][0..3].* = p.len;
     }
 };
 
@@ -140,7 +182,7 @@ fn rowBytes(b: *std.ArrayList(u8), ord: i64, lead: i64, cells: []const struct { 
     }
 }
 
-/// Writes each delivered row as `<request> <comment id or -> <body or -> <following>`.
+/// Writes each delivered row as `<request> <comment id or -> <body or -> [<username>/<bio or ->/<image or ->] <following>`.
 const Recorder = struct {
     out: *std.ArrayList(u8),
     reqs: []const Query,
@@ -153,7 +195,10 @@ const Recorder = struct {
             s.out.print(testing.allocator, "- - {s}\n", .{if (x.boolean(7)) "t" else "f"}) catch @panic("oom");
             return;
         }
-        s.out.print(testing.allocator, "{d} '{s}' {s}\n", .{ x.int(0), x.text(1), if (x.boolean(7)) "t" else "f" }) catch @panic("oom");
+        s.out.print(testing.allocator, "{d} '{s}' ", .{ x.int(0), x.text(1) }) catch @panic("oom");
+        if (!x.isNull(username))
+            s.out.print(testing.allocator, "{s}/{s}/{s} ", .{ x.text(username), x.textOrNull(username + 1) orelse "-", x.textOrNull(username + 2) orelse "-" }) catch @panic("oom");
+        s.out.print(testing.allocator, "{s}\n", .{if (x.boolean(7)) "t" else "f"}) catch @panic("oom");
     }
 };
 
@@ -186,8 +231,8 @@ test "each request sharing a thread gets its rows in order, with its own followi
     try feed(&f, &b, &ptrs, rec, 1, 1, &.{.{ followees, .{ .ids = &.{} } }});
     try feed(&f, &b, &ptrs, rec, 2, 2, &.{.{ followees, .{ .ids = &.{9} } }});
     try feed(&f, &b, &ptrs, rec, 4, 1, &.{.{ followees, .{ .ids = &.{8} } }});
-    try feed(&f, &b, &ptrs, rec, -3, 1, &.{ .{ 0, .{ .int = 12 } }, .{ 1, .{ .text = "new" } }, .{ author, .{ .int = 9 } } });
-    try feed(&f, &b, &ptrs, rec, -3, 1, &.{ .{ 0, .{ .int = 11 } }, .{ 1, .{ .text = "old" } }, .{ author, .{ .int = 8 } } });
+    try feed(&f, &b, &ptrs, rec, -3, 1, &.{ .{ 0, .{ .int = 12 } }, .{ 1, .{ .text = "new" } }, .{ author, .{ .int = 9 } }, .{ username, .{ .text = "u9" } } });
+    try feed(&f, &b, &ptrs, rec, -3, 1, &.{ .{ 0, .{ .int = 11 } }, .{ 1, .{ .text = "old" } }, .{ author, .{ .int = 8 } }, .{ username, .{ .text = "u8" } } });
     try feed(&f, &b, &ptrs, rec, -1, 2, &.{});
     var mine: std.ArrayList(u8) = .empty;
     defer mine.deinit(testing.allocator);
@@ -199,17 +244,60 @@ test "each request sharing a thread gets its rows in order, with its own followi
         };
     }
     try testing.expectEqualStrings(
-        \\r1 12 'new' f
-        \\r1 11 'old' f
+        \\r1 12 'new' u9/-/- f
+        \\r1 11 'old' u8/-/- f
         \\r2 - - f
-        \\r3 12 'new' t
-        \\r3 11 'old' f
-        \\r4 12 'new' f
-        \\r4 11 'old' t
+        \\r3 12 'new' u9/-/- t
+        \\r3 11 'old' u8/-/- f
+        \\r4 12 'new' u9/-/- f
+        \\r4 11 'old' u8/-/- t
         \\
     , mine.items);
     f.reset();
     // A thread row before all of its requests' rows is refused, not answered short.
     try feed(&f, &b, &ptrs, rec, 1, 1, &.{.{ followees, .{ .ids = &.{} } }});
     try testing.expectError(error.ThreadBeforeRequests, feed(&f, &b, &ptrs, rec, -2, 1, &.{.{ 0, .{ .int = 1 } }}));
+}
+
+test "author rows fill the author columns of the thread rows that leave them NULL" {
+    var reqs: [2]Query = @splat(.{ .stmt = .comments_list_set });
+    var ptrs: [reqs.len]*Query = undefined;
+    for (&reqs, &ptrs) |*r, *p| p.* = r;
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(testing.allocator);
+    var b: std.ArrayList(u8) = .empty;
+    defer b.deinit(testing.allocator);
+    const rec: Recorder = .{ .out = &got, .reqs = &reqs };
+    var f: Fan = .{};
+    defer {
+        f.next.deinit(gpa);
+        f.count.deinit(gpa);
+        f.span.deinit(gpa);
+        f.ids.deinit(gpa);
+        f.profiles.deinit(gpa);
+        f.data.deinit(gpa);
+    }
+    // Both requests read article A. Author 9 has no bio, author 8 no image; the third comment carries its author
+    // columns itself, as the statements without author rows do.
+    try feed(&f, &b, &ptrs, rec, 1, 1, &.{.{ followees, .{ .ids = &.{9} } }});
+    try feed(&f, &b, &ptrs, rec, 2, 1, &.{.{ followees, .{ .ids = &.{} } }});
+    try feed(&f, &b, &ptrs, rec, 0, 0, &.{ .{ author, .{ .int = 9 } }, .{ username, .{ .text = "nine" } }, .{ username + 2, .{ .text = "i9" } } });
+    try feed(&f, &b, &ptrs, rec, 0, 0, &.{ .{ author, .{ .int = 8 } }, .{ username, .{ .text = "eight" } }, .{ username + 1, .{ .text = "b8" } } });
+    try feed(&f, &b, &ptrs, rec, -2, 1, &.{ .{ 0, .{ .int = 12 } }, .{ 1, .{ .text = "new" } }, .{ author, .{ .int = 9 } } });
+    try feed(&f, &b, &ptrs, rec, -2, 1, &.{ .{ 0, .{ .int = 11 } }, .{ 1, .{ .text = "old" } }, .{ author, .{ .int = 8 } } });
+    try feed(&f, &b, &ptrs, rec, -2, 1, &.{ .{ 0, .{ .int = 10 } }, .{ 1, .{ .text = "mine" } }, .{ author, .{ .int = 8 } }, .{ username, .{ .text = "inline" } } });
+    try testing.expectEqualStrings(
+        \\r1 12 'new' nine/-/i9 t
+        \\r2 12 'new' nine/-/i9 f
+        \\r1 11 'old' eight/b8/- f
+        \\r2 11 'old' eight/b8/- f
+        \\r1 10 'mine' inline/-/- f
+        \\r2 10 'mine' inline/-/- f
+        \\
+    , got.items);
+    f.reset();
+    // A thread row whose author sent no profile is refused, as is an author row without an id.
+    try feed(&f, &b, &ptrs, rec, 1, 1, &.{.{ followees, .{ .ids = &.{} } }});
+    try testing.expectError(error.ThreadAuthor, feed(&f, &b, &ptrs, rec, -1, 1, &.{ .{ 0, .{ .int = 1 } }, .{ author, .{ .int = 7 } } }));
+    try testing.expectError(error.ThreadAuthor, feed(&f, &b, &ptrs, rec, 0, 0, &.{.{ username, .{ .text = "nobody" } }}));
 }

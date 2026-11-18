@@ -13,7 +13,29 @@ pub struct ReplyTo {
 pub struct Response {
     pub to: ReplyTo,
     pub status: u16,
-    pub body: Vec<u8>,
+    pub body: Body,
+}
+
+/// A response body: its own bytes, or bytes several responses of one batch share (identical answers, rendered once).
+pub enum Body {
+    Own(Vec<u8>),
+    Shared(std::sync::Arc<Vec<u8>>),
+}
+
+impl std::ops::Deref for Body {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Body::Own(v) => v,
+            Body::Shared(a) => a,
+        }
+    }
+}
+
+impl From<Vec<u8>> for Body {
+    fn from(v: Vec<u8>) -> Body {
+        Body::Own(v)
+    }
 }
 
 pub struct Outbox {
@@ -22,6 +44,26 @@ pub struct Outbox {
 }
 
 static OUTBOXES: OnceLock<Vec<Outbox>> = OnceLock::new();
+
+/// Per IO thread and connection slot: the generation of the request that slot can still be answered for. A slot whose
+/// client hung up (or was closed) no longer matches its queued requests' generation, so workers skip their work.
+static LIVE: OnceLock<Vec<Box<[std::sync::atomic::AtomicU32]>>> = OnceLock::new();
+const LIVE_SLOTS: usize = 1 << 18;
+
+/// Records that `slot` on `thread` now answers requests of `generation` only.
+pub fn set_live(thread: u16, slot: u32, generation: u32) {
+    if let Some(a) = LIVE.get().and_then(|v| v.get(thread as usize)).and_then(|a| a.get(slot as usize)) {
+        a.store(generation, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Whether the client this reply goes to is still there (as far as its IO thread has seen).
+pub fn alive(to: ReplyTo) -> bool {
+    match LIVE.get().and_then(|v| v.get(to.thread as usize)).and_then(|a| a.get(to.slot as usize)) {
+        Some(a) => a.load(std::sync::atomic::Ordering::Relaxed) == to.generation,
+        None => true,
+    }
+}
 
 pub fn init(threads: usize) {
     let v = (0..threads)
@@ -32,6 +74,8 @@ pub fn init(threads: usize) {
         })
         .collect();
     OUTBOXES.set(v).ok().expect("reply::init twice");
+    let live = (0..threads).map(|_| (0..LIVE_SLOTS).map(|_| std::sync::atomic::AtomicU32::new(0)).collect()).collect();
+    LIVE.set(live).ok().expect("reply::init twice");
 }
 
 pub fn outbox(thread: usize) -> &'static Outbox {
@@ -50,7 +94,7 @@ pub fn send(to: ReplyTo, status: u16, body: Vec<u8>) {
     let was_empty = {
         let mut q = ob.queue.lock().unwrap();
         let e = q.is_empty();
-        q.push(Response { to, status, body });
+        q.push(Response { to, status, body: body.into() });
         e
     };
     if was_empty {
@@ -91,5 +135,5 @@ pub fn error_body(msg: &str) -> Vec<u8> {
 }
 
 pub fn error(to: ReplyTo, status: u16, msg: &str) -> Response {
-    Response { to, status, body: error_body(msg) }
+    Response { to, status, body: error_body(msg).into() }
 }

@@ -26,6 +26,7 @@
 //! A write that can fail on data (`sql.fallible`) never shares a group, so its failure rolls back nobody else's. A
 //! failed group is retried one request per group; a failed solo request gets its error.
 const std = @import("std");
+const builtin = @import("builtin");
 const sql = @import("sql.zig");
 const pg = @import("pg.zig");
 const sys = @import("sys.zig");
@@ -33,6 +34,7 @@ const api = @import("api.zig");
 const mega = @import("mega.zig");
 const threads = @import("threads.zig");
 const drain = @import("drain.zig");
+const shed = @import("shed.zig");
 const Stmt = sql.Stmt;
 
 pub const Param = union(enum) {
@@ -99,6 +101,351 @@ fn lane(l: LaneId) *Lane {
     return &lanes[@intFromEnum(l)];
 }
 
+/// ZIG_FEED_CAP, ZIG_COMMENTS_CAP, ZIG_SHARED_CAP: the lanes' caps on drains in flight in place of
+/// `feed_max_inflight`, `comments_max_inflight` and `max_inflight`; null keeps the lane's.
+pub fn setCaps(feed: ?u8, comments: ?u8, shared: ?u8) void {
+    for ([_]LaneId{ .feed, .comments, .shared }, [_]?u8{ feed, comments, shared }) |l, n| {
+        if (n) |c| lane(l).max_inflight = c;
+    }
+}
+
+/// The feed, comments and shared lanes' caps.
+pub fn caps() [3]u8 {
+    return .{ lane(.feed).max_inflight, lane(.comments).max_inflight, lane(.shared).max_inflight };
+}
+
+/// ZIG_OLDEST_FIRST=1: the lane holding the oldest queued read of every lane may run drains past its own cap, up to
+/// `readTotal()`, and a freed slot goes to the due lane whose oldest read has waited longest. Every other lane keeps
+/// its own cap, so a lane borrows only while no other lane's reads have waited longer, and the slot comes back to
+/// them through the same rule: its drain takes every read it had queued, and the next oldest is another lane's. The
+/// third-slot rules (ZIG_FEED3, ZIG_FEED3_QWAIT) give way to it. The total stays the lanes' caps summed unless
+/// ZIG_READ_CAP sets it, so the lanes trade slots instead of adding them: more drains in flight on the saturated box
+/// split the same cores and each runs longer.
+pub var oldest_first = false;
+
+/// When the oldest read queued on lane `l` arrived (monotonic ns); null with none.
+fn headQueued(l: LaneId) ?u64 {
+    const s = oldestRead(l) orelse return null;
+    return reads[@intFromEnum(s)].head.?.queued_ns;
+}
+
+/// The lane holding the read that has waited longest of every lane's; null with nothing queued.
+fn oldestLane() ?LaneId {
+    var best: ?LaneId = null;
+    var best_ns: u64 = std.math.maxInt(u64);
+    for (lane_order) |l| {
+        const at = headQueued(l) orelse continue;
+        if (at < best_ns) {
+            best = l;
+            best_ns = at;
+        }
+    }
+    return best;
+}
+
+/// ZIG_FEED3=N (1 to 100): the feed lane may run a third drain while the box's CPU was at least N% idle at the last
+/// reading of /proc/stat, taken every `feed3_sample_ns`; 0, the default, never. Unlike shed's reading, hashing counts
+/// as busy: a third feed drain that takes the hashers' CPU wakes the watchdog, and cap 3 without a gate failed that
+/// way (watchdog 1.3 cores at 99.5% box).
+pub var feed3_idle: u8 = 0;
+const feed3_sample_ns = 100 * std.time.ns_per_ms;
+var feed3: struct { open: bool = false, stat: ?shed.Stat = null, next_ns: u64 = 0 } = .{};
+
+/// ZIG_FEED3_QWAIT=N ms: the feed lane may run a third drain once its oldest queued feed has waited N ms, if the
+/// shared lane has a slot to lend; 0, the default, never. The third feed drain takes one of the shared lane's three
+/// slots while it runs, so read drains in flight never exceed the seven of the lanes' own caps, and the slot is back
+/// with the shared lane as soon as any feed drain finishes. The gate is the feed queue's own wait, not the box's
+/// idle: near saturation the box is 95-99% busy, so the idle gate stays shut, while the feed lane sits at its cap
+/// most of the time with hundreds of feeds queued and the shared lane is at its cap under a tenth of the time. A feed
+/// that has waited that long is already past the lane's gap and window, so the slot opens for a backlog, not a blip.
+pub var feed3_qwait_ns: u64 = 0;
+
+/// Whether the feed lane's oldest queued read has waited `feed3_qwait_ns` and the shared lane has a slot to lend.
+fn feedWaited() bool {
+    if (feed3_qwait_ns == 0 or lane(.shared).inflight >= lane(.shared).max_inflight) return false;
+    const s = oldestRead(.feed) orelse return false;
+    return now_ns -| reads[@intFromEnum(s)].head.?.queued_ns >= feed3_qwait_ns;
+}
+
+/// ZIG_SHARED_GAP_BUSY=N ms: the shared lane's gap while the box is busy, 0, the default, never. Busy is at most
+/// `busy_on_idle` of the CPUs this process may run on idle at a reading of /proc/stat (every `feed3_sample_ns`,
+/// hashing counted as busy), and it ends at `busy_off_idle`. Lists, articles, tags and profiles sit far under the
+/// feeds in latency, so a longer gap costs their reads a little wait and gives the shared drains more reads each,
+/// which costs Postgres less per read; the feed and comments lanes keep their gaps.
+pub var shared_gap_busy_ns: u64 = 0;
+const busy_on_idle = 0.05;
+const busy_off_idle = 0.10;
+var busy = false;
+
+/// Lane `l`'s cap on drains in flight now.
+fn cap(l: LaneId) u8 {
+    const own = lane(l).max_inflight;
+    if (oldest_first) return if (oldestLane() == l) @max(own, readTotal()) else own;
+    return switch (l) {
+        .feed => if (feed3.open or feedWaited()) own + 1 else own,
+        .comments => own,
+        .shared => if (feed3_qwait_ns > 0 and lane(.feed).inflight > lane(.feed).max_inflight) own - 1 else own,
+    };
+}
+
+/// Lane `l`'s gap now.
+fn gapOf(l: LaneId) u64 {
+    return if (l == .shared and busy) shared_gap_busy_ns else lane(l).gap_ns;
+}
+
+/// ZIG_READ_CAP=N: read drains in flight across all lanes at most, each lane still under its own cap; 0, the default,
+/// leaves only the lanes' caps, which sum to 7 of the 8 connections. Seven MEGA backends share the cores Postgres
+/// gets (about four at 200,000 users) and each runs that much longer; at the cap a drain starts only as one finishes,
+/// and a freed slot goes to the due lane whose oldest read has waited longest (limited processor sharing).
+pub var read_cap: u8 = 0;
+
+fn readsInflight() u8 {
+    var n: u8 = 0;
+    for (lanes) |ln| n += ln.inflight;
+    return n;
+}
+
+/// Read drains in flight across the lanes at most: ZIG_READ_CAP, else under ZIG_OLDEST_FIRST the lanes' caps
+/// summed; 0, no cap but the lanes' own.
+pub fn readTotal() u8 {
+    if (read_cap > 0 or !oldest_first) return read_cap;
+    var n: u8 = 0;
+    for (lanes) |ln| n += ln.max_inflight;
+    return n;
+}
+
+/// ZIG_LANE_SEP=N: the shared lane starts no drain within N ms of a feed drain's start, the last one or the next one
+/// due; 0, the default, never moves it. Both lanes run on 80 ms gaps, so once their starts line up they stay lined up
+/// and both executions start together.
+pub var lane_sep_ns: u64 = 0;
+
+/// `due` moved to at least `lane_sep_ns` after the feed lane's last drain start and its next one due.
+fn apart(due: u64) u64 {
+    var at = @max(due, lane(.feed).last_ns + lane_sep_ns);
+    if (readsDue(.feed)) |f| if (f < at + lane_sep_ns) {
+        at = @max(at, f + lane_sep_ns);
+    };
+    return at;
+}
+
+/// The CPUs this process may run on: the whole box on the official box, the pinned set elsewhere.
+var cpus: ?std.os.linux.cpu_set_t = null;
+
+fn inSet(set: *const std.os.linux.cpu_set_t, i: usize) bool {
+    const bits = @bitSizeOf(usize);
+    return i / bits < set.len and (set[i / bits] >> @intCast(i % bits)) & 1 == 1;
+}
+
+/// The idle and total ticks of the CPUs in `set`, summed from /proc/stat's per-CPU lines; null with none found.
+fn statOf(text: []const u8, set: *const std.os.linux.cpu_set_t) ?shed.Stat {
+    var s: shed.Stat = .{ .idle = 0, .total = 0 };
+    var any = false;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line.len < 4 or !std.mem.startsWith(u8, line, "cpu") or !std.ascii.isDigit(line[3])) continue;
+        var it = std.mem.tokenizeScalar(u8, line, ' ');
+        const i = std.fmt.parseInt(usize, it.next().?[3..], 10) catch continue;
+        if (!inSet(set, i)) continue;
+        // user nice system idle iowait irq softirq steal, as shed.parseStat reads the box's line.
+        for (0..8) |k| {
+            const x = std.fmt.parseInt(u64, it.next() orelse return null, 10) catch return null;
+            if (k == 3 or k == 4) s.idle += x;
+            s.total += x;
+        }
+        any = true;
+    }
+    return if (any) s else null;
+}
+
+/// Reads the box's idle share since the last reading and moves the third-slot and busy-gap gates on it.
+fn sampleIdle() void {
+    feed3.next_ns = now_ns + feed3_sample_ns;
+    if (cpus == null) {
+        var set: std.os.linux.cpu_set_t = @splat(0);
+        if (std.os.linux.sched_getaffinity(0, @sizeOf(std.os.linux.cpu_set_t), &set) != 0) @memset(&set, std.math.maxInt(usize));
+        cpus = set;
+    }
+    var buf: [16384]u8 = undefined;
+    const stat = statOf(shed.readFile("/proc/stat", &buf) orelse return, &cpus.?) orelse return;
+    if (feed3.stat) |prev| {
+        const idle = shed.idleShare(prev, stat, 0);
+        feed3.open = feed3_idle > 0 and idle * 100 >= @as(f64, @floatFromInt(feed3_idle));
+        if (shared_gap_busy_ns > 0) busy = if (busy) idle < busy_off_idle else idle <= busy_on_idle;
+        stats_gate.readings += 1;
+        stats_gate.open += @intFromBool(feed3.open);
+        stats_gate.busy += @intFromBool(busy);
+    }
+    feed3.stat = stat;
+}
+
+/// ZIG_LANE_STATS=1: the process that drains reads logs each lane's counters every `stats_ns`, in the rig's `lane`
+/// line (synteq/rig/lanes.py) with the wait and run percentiles after it, and every process logs its ring wakes.
+pub var lane_stats = false;
+const stats_ns = 10 * std.time.ns_per_s;
+var stats_at: u64 = 0;
+
+/// Latencies in 1 ms buckets; the last holds everything from 4,095 ms.
+const Hist = struct {
+    n: [4096]u32 = @splat(0),
+    count: u32 = 0,
+
+    fn add(h: *Hist, ns: u64) void {
+        h.n[@min(ns / std.time.ns_per_ms, h.n.len - 1)] += 1;
+        h.count += 1;
+    }
+
+    /// The bucket (ms) holding the `per_mille`th latency, 0 when empty.
+    fn at(h: *const Hist, per_mille: u32) usize {
+        const rank = (@as(u64, h.count) * per_mille + 999) / 1000;
+        var seen: u64 = 0;
+        for (h.n, 0..) |k, bucket| {
+            seen += k;
+            if (seen >= @max(rank, 1)) return bucket;
+        }
+        return 0;
+    }
+};
+
+const LaneStats = struct {
+    drains: u32 = 0,
+    reads: u32 = 0,
+    /// Drains that took a full queue.
+    full_drains: u32 = 0,
+    /// The oldest read's wait at each drain's start: the longest, and the sum.
+    oldest_max_ns: u64 = 0,
+    oldest_sum_ns: u64 = 0,
+    /// Every read's wait from its queueing to its drain's start, and every drain's run to its ReadyForQuery.
+    wait: Hist = .{},
+    run: Hist = .{},
+    /// Time at the cap with reads queued.
+    at_cap: Span = .{},
+    /// Time due but held by ZIG_READ_CAP.
+    held: Span = .{},
+    /// Pumps that left the lane due and under its caps: no connection was free, the only case where the order the
+    /// lanes are served in decides who waits.
+    starved: u32 = 0,
+    /// Drains started on the feed lane's third slot (ZIG_FEED3).
+    third: u32 = 0,
+    /// Drains that started, and that ended, within `near_ns` of another lane's last start or end.
+    near_start: u32 = 0,
+    near_end: u32 = 0,
+    /// Drains in flight summed over time (ns), up to `inflight_at`.
+    inflight_ns: u64 = 0,
+};
+var stats = [_]LaneStats{ .{}, .{}, .{} };
+/// When each lane's `inflight_ns` was last brought up to date (monotonic ns).
+var inflight_at = [_]u64{ 0, 0, 0 };
+
+/// Adds lane `l`'s drains in flight since the last call to its `inflight_ns`; called before the count changes.
+fn sumInflight(l: LaneId) void {
+    const i = @intFromEnum(l);
+    stats[i].inflight_ns += @as(u64, lane(l).inflight) * (now_ns -| inflight_at[i]);
+    inflight_at[i] = now_ns;
+}
+var stats_gate: struct { readings: u32 = 0, open: u32 = 0, busy: u32 = 0 } = .{};
+/// Each lane's last drain end (monotonic ns), for `near_end`.
+var last_end = [_]u64{ 0, 0, 0 };
+const near_ns = 5 * std.time.ns_per_ms;
+
+/// Time a condition held, from pump to pump.
+const Span = struct {
+    ns: u64 = 0,
+    /// Since when it holds, 0 while it does not.
+    since: u64 = 0,
+
+    fn track(sp: *Span, on: bool) void {
+        if (on and sp.since == 0) sp.since = now_ns;
+        if (!on and sp.since != 0) {
+            sp.ns += now_ns -| sp.since;
+            sp.since = 0;
+        }
+    }
+
+    /// The time so far in ms, restarting the count; a span still open carries on into the next.
+    fn take(sp: *Span) u64 {
+        if (sp.since != 0) {
+            sp.ns += now_ns -| sp.since;
+            sp.since = now_ns;
+        }
+        defer sp.ns = 0;
+        return sp.ns / std.time.ns_per_ms;
+    }
+};
+
+/// Whether another lane's time in `at` falls within `near_ns` before now.
+fn nearOther(l: LaneId, at: []const u64) bool {
+    for (at, 0..) |t, i| {
+        if (i != @intFromEnum(l) and t != 0 and now_ns -| t < near_ns) return true;
+    }
+    return false;
+}
+
+fn countDrain(l: LaneId, g: *const Group, was_full: bool) void {
+    const st = &stats[@intFromEnum(l)];
+    st.drains += 1;
+    st.reads += g.nmembers;
+    st.full_drains += @intFromBool(was_full);
+    st.third += @intFromBool(lane(l).inflight >= lane(l).max_inflight);
+    var starts: [lanes.len]u64 = undefined;
+    for (lanes, &starts) |ln, *t| t.* = ln.last_ns;
+    st.near_start += @intFromBool(nearOther(l, &starts));
+    var oldest: u64 = 0;
+    for (g.members[0..g.nmembers]) |r| {
+        const w = now_ns -| r.queued_ns;
+        st.wait.add(w);
+        oldest = @max(oldest, w);
+    }
+    st.oldest_max_ns = @max(st.oldest_max_ns, oldest);
+    st.oldest_sum_ns += oldest;
+}
+
+/// Ends or starts each lane's time at its cap and held by ZIG_READ_CAP, and counts lanes left due with no connection.
+fn countPump() void {
+    const total = readTotal();
+    const capped = total > 0 and readsInflight() >= total;
+    for (lane_order) |l| {
+        const st = &stats[@intFromEnum(l)];
+        st.at_cap.track(lane(l).inflight >= cap(l) and oldestRead(l) != null);
+        const due = if (readsDue(l)) |t| t <= now_ns else false;
+        st.held.track(due and capped);
+        st.starved += @intFromBool(due and !capped);
+    }
+}
+
+fn countEnd(g: *const Group) void {
+    const st = &stats[@intFromEnum(g.lane)];
+    st.run.add(now_ns -| g.start_ns);
+    st.near_end += @intFromBool(nearOther(g.lane, &last_end));
+    last_end[@intFromEnum(g.lane)] = now_ns;
+}
+
+fn logStats() void {
+    if (stats_at == 0) stats_at = now_ns;
+    if (now_ns < stats_at + stats_ns) return;
+    const span_ms = (now_ns - stats_at) / std.time.ns_per_ms;
+    stats_at = now_ns;
+    drain.logWakes(span_ms);
+    if (drain.role == .worker) return;
+    for (lane_order) |l| {
+        const st = &stats[@intFromEnum(l)];
+        const drains: u64 = @max(st.drains, 1);
+        sumInflight(l);
+        const mean = st.inflight_ns * 100 / @max(span_ms * ms, 1);
+        sys.log("lane {s} {d} ms: {d} drains, {d} reads ({d} per drain), {d} on a full queue, oldest waited {d} ms max {d} ms mean, {d} ms at the cap, {d} in flight, {d} queued; wait p50 {d} p95 {d} p99 {d} max {d} ms, run p50 {d} p95 {d} max {d} ms, {d} due with no free connection, {d} on the third slot, gate open {d} of {d} readings, {d} ms held by the read cap, {d} started and {d} ended within 5 ms of another lane, busy gap {d} of {d} readings, {d}.{d:0>2} in flight on average", .{
+            @tagName(l),                 span_ms,                st.drains,                  st.reads,
+            st.reads / drains,           st.full_drains,         st.oldest_max_ns / ms,      st.oldest_sum_ns / drains / ms,
+            st.at_cap.take(),            lane(l).inflight,       queuedOn(l),                st.wait.at(500),
+            st.wait.at(950),             st.wait.at(990),        st.wait.at(1000),           st.run.at(500),
+            st.run.at(950),              st.run.at(1000),        st.starved,                 st.third,
+            stats_gate.open,             stats_gate.readings,    st.held.take(),             st.near_start,
+            st.near_end,                 stats_gate.busy,        stats_gate.readings,        mean / 100,
+            mean % 100,
+        });
+        st.* = .{ .at_cap = st.at_cap, .held = st.held };
+    }
+    stats_gate = .{};
+}
+
 /// The lane a statement's reads drain on. Every statement is on one lane.
 fn laneOf(s: Stmt) LaneId {
     return switch (s) {
@@ -123,6 +470,8 @@ pub const Query = struct {
     solo: bool = false,
     stmt: Stmt = .tags,
     params: [6]Param = undefined,
+    /// In the drain process, the share class of a worker's read (drain.zig's shared responses); 0: never shared.
+    share: u32 = 0,
 };
 
 pub const Queue = struct {
@@ -225,6 +574,8 @@ const Group = struct {
     write: bool = false,
     /// A read drain's lane.
     lane: LaneId = .shared,
+    /// When a connection took it (monotonic ns), for ZIG_LANE_STATS.
+    start_ns: u64 = 0,
     next_free: ?*Group = null,
 
     fn unitMembers(g: *Group, u: *const Unit) []*Query {
@@ -267,6 +618,8 @@ pub const Conn = struct {
     row: pg.Row = .{},
     mega: mega.Result = .{},
     fan: threads.Fan = .{},
+    /// The current unit's shared responses (drain.zig); none while empty.
+    share: drain.Plan = .{},
     /// A write connection's next drain time (monotonic ns), set once it is idle with writes queued.
     write_due: ?u64 = null,
 
@@ -277,14 +630,18 @@ pub const Conn = struct {
     fn pushGroup(c: *Conn, g: *Group) void {
         c.inflight[(c.in_head + c.in_len) % c.inflight.len] = g;
         c.in_len += 1;
-        if (!g.write) lane(g.lane).inflight += 1;
+        if (g.write) return;
+        if (lane_stats) sumInflight(g.lane);
+        lane(g.lane).inflight += 1;
     }
 
     fn popGroup(c: *Conn) *Group {
         const g = c.inflight[c.in_head];
         c.in_head = @intCast((c.in_head + 1) % c.inflight.len);
         c.in_len -= 1;
-        if (!g.write) lane(g.lane).inflight -= 1;
+        if (g.write) return g;
+        if (lane_stats) sumInflight(g.lane);
+        lane(g.lane).inflight -= 1;
         return g;
     }
 };
@@ -327,7 +684,7 @@ pub fn openConn(url: pg.Url, write: bool, index: u16) !Conn {
             try pg.prepareChecked(b, stmtName(&name, 'b', s), text, types[0..d.params.len], cols);
         }
     }
-    if (!write) try pg.prepareChecked(b, mega_name, sql.mega.sql, &sql.mega.params, &sql.mega.cols);
+    if (!write) try pg.prepareChecked(b, mega_name, mega.text(), &sql.mega.params, mega.cols());
     if (b.end != b.start) return error.UnexpectedData;
     return .{
         .fd = b.fd,
@@ -373,9 +730,10 @@ fn addMember(g: *Group, u: *Unit, r: *Query) void {
 fn readsDue(l: LaneId) ?u64 {
     const s = oldestRead(l) orelse return null;
     const ln = lane(l);
-    if (ln.inflight >= ln.max_inflight) return null;
+    if (ln.inflight >= cap(l)) return null;
     if (full(l)) return now_ns;
-    return @max(reads[@intFromEnum(s)].head.?.queued_ns + window_ns, ln.last_ns + ln.gap_ns);
+    const due = @max(reads[@intFromEnum(s)].head.?.queued_ns + window_ns, ln.last_ns + gapOf(l));
+    return if (l == .shared and lane_sep_ns > 0) apart(due) else due;
 }
 
 /// Whether lane `l`'s queue is full: `max_members` reads, as many as one drain takes, which starts its drain at once.
@@ -559,16 +917,35 @@ fn encodeParam(o: *pg.Out, p: Param) void {
     }
 }
 
-/// The drain of the first lane, in `lane_order`, whose drain is due, with the lane's clock restarted. Null when no
-/// lane is due.
+/// The drain of the next due lane, with the lane's clock restarted. Null when no lane is due, or at `readTotal()`.
 fn dueRead() ?*Group {
+    const total = readTotal();
+    if (total > 0 and readsInflight() >= total) return null;
+    const l = nextLane() orelse return null;
+    lane(l).last_ns = now_ns;
+    const was_full = full(l);
+    const g = buildRead(l).?;
+    g.start_ns = now_ns;
+    if (lane_stats) countDrain(l, g, was_full);
+    return g;
+}
+
+/// The first due lane in `lane_order`; under ZIG_READ_CAP or ZIG_OLDEST_FIRST, the due lane whose oldest read has
+/// waited longest.
+fn nextLane() ?LaneId {
+    var best: ?LaneId = null;
+    var best_ns: u64 = std.math.maxInt(u64);
     for (lane_order) |l| {
         const due = readsDue(l) orelse continue;
         if (due > now_ns) continue;
-        lane(l).last_ns = now_ns;
-        return buildRead(l).?;
+        if (read_cap == 0 and !oldest_first) return l;
+        const queued = headQueued(l).?;
+        if (queued < best_ns) {
+            best = l;
+            best_ns = queued;
+        }
     }
-    return null;
+    return best;
 }
 
 /// Fills every connection that has room with new Sync groups, encoded into its pending bytes; reads only once
@@ -577,6 +954,7 @@ fn dueRead() ?*Group {
 /// ends the wait.
 pub fn pump() ?u64 {
     var next: ?u64 = null;
+    if ((feed3_idle > 0 or shared_gap_busy_ns > 0) and drain.role != .worker and now_ns >= feed3.next_ns and !builtin.is_test) sampleIdle();
     for (conns) |*c| {
         if (c.write) {
             if (c.in_len > 0) continue;
@@ -601,6 +979,21 @@ pub fn pump() ?u64 {
         const due = readsDue(l) orelse continue;
         if (due <= now_ns) continue;
         next = if (next) |t| @min(t, due) else due;
+    }
+    // Held at its cap, the feed lane may get a third drain at the next reading, or once its oldest read has waited.
+    // Under oldest-first no clock is needed: which lane holds the oldest read changes only as reads arrive and drains
+    // start or end, and the loop pumps after each.
+    if (!oldest_first and lane(.feed).inflight == lane(.feed).max_inflight) if (oldestRead(.feed)) |s| {
+        if (feed3_idle > 0) next = if (next) |t| @min(t, feed3.next_ns) else feed3.next_ns;
+        if (feed3_qwait_ns > 0 and lane(.shared).inflight < lane(.shared).max_inflight) {
+            const ln = lane(.feed);
+            const at = @max(reads[@intFromEnum(s)].head.?.queued_ns + feed3_qwait_ns, ln.last_ns + ln.gap_ns);
+            if (at > now_ns) next = if (next) |t| @min(t, at) else at;
+        }
+    };
+    if (lane_stats) {
+        countPump();
+        if (!builtin.is_test) logStats();
     }
     return next;
 }
@@ -668,7 +1061,10 @@ fn message(c: *Conn, t: u8, body: []const u8) void {
             const members = g.unitMembers(u);
             switch (u.kind) {
                 .single => results.row(members[0], &c.row),
-                .broadcast => for (members) |r| results.row(r, &c.row),
+                .broadcast => {
+                    if (c.share.reads.len == 0) c.share.all(members);
+                    for (members, 0..) |r, k| if (!c.share.follows(k)) results.row(r, &c.row);
+                },
                 .batched => {
                     if (u.stmt.def().thread_cols != null)
                         return c.fan.row(&c.row, members, results) catch |e| sys.fatal("comments result: {s}", .{@errorName(e)});
@@ -685,12 +1081,13 @@ fn message(c: *Conn, t: u8, body: []const u8) void {
             if (g.failed_at != null) return;
             const u = &g.units[g.cur];
             if (u.kind == .mega) {
-                c.mega.deliver(g.unitMembers(u), results) catch |e| sys.fatal("MEGA result: {s}", .{@errorName(e)});
+                c.mega.deliver(g.unitMembers(u), &c.share, results) catch |e| sys.fatal("MEGA result: {s}", .{@errorName(e)});
                 c.mega.reset();
             } else if (!g.write) {
-                for (g.unitMembers(u)) |r| results.done(r);
+                c.share.answer(g.unitMembers(u), results);
             }
             c.fan.reset();
+            c.share.reset();
             g.cur += 1;
         },
         'E' => {
@@ -699,9 +1096,11 @@ fn message(c: *Conn, t: u8, body: []const u8) void {
             g.err = pg.ErrorInfo.parse(body);
             c.mega.reset();
             c.fan.reset();
+            c.share.reset();
         },
         'Z' => {
             const g = c.popGroup();
+            if (lane_stats and !g.write) countEnd(g);
             finishGroup(g);
             freeGroup(g);
         },
@@ -720,6 +1119,15 @@ fn Results() type {
 
         pub fn done(_: @This(), r: *Query) void {
             if (drain.role == .drain) drain.done(r) else api.onDone(api.request(r));
+        }
+
+        /// Only the drain process has share classes, so only it leads or follows.
+        pub fn lead(_: @This(), r: *Query, n: u32) void {
+            drain.lead(r, n);
+        }
+
+        pub fn same(_: @This(), r: *Query) void {
+            drain.same(r);
         }
 
         /// The statement failed for this query alone.
@@ -773,6 +1181,8 @@ pub fn clearQueuesForTest() void {
     reads = @splat(.{});
     writes = .{};
     for (&lanes) |*l| l.* = .{ .gap_ns = l.gap_ns, .max_inflight = l.max_inflight };
+    last_end = @splat(0);
+    inflight_at = @splat(0);
 }
 
 test "a write drain batches by statement in first-write order and leaves writes that run alone queued" {
@@ -1018,6 +1428,459 @@ test "a lane at its in-flight cap starts no drain, full queue or not, until one 
         try testing.expect(!readsQueued());
         for (cs[1..ln.max_inflight]) |*c| message(c, 'Z', "I");
     }
+}
+
+test "with ZIG_FEED3 the feed lane runs a third drain while the gate is open, never a fourth, and none while it is shut" {
+    clearQueuesForTest();
+    defer clearQueuesForTest();
+    feed3_idle = 10;
+    defer {
+        feed3_idle = 0;
+        feed3 = .{};
+    }
+    const ln = lane(.feed);
+    var cs: [feed_max_inflight + 1]Conn = undefined;
+    for (&cs) |*c| c.* = .{ .fd = -1, .index = 0, .write = false, .rbuf = &.{} };
+    var qs: [feed_max_inflight + 3]Query = undefined;
+    now_ns = 1000 * ms;
+    for (0..feed_max_inflight) |i| {
+        readAt(&qs[i], .list_feed, now_ns);
+        now_ns += ln.gap_ns;
+        cs[i].pushGroup(dueRead().?);
+    }
+    // Shut: two in flight hold the lane, and the wait ends at the next reading.
+    feed3.next_ns = now_ns + feed3_sample_ns;
+    readAt(&qs[feed_max_inflight], .list_feed, now_ns);
+    now_ns += ln.gap_ns;
+    try testing.expectEqual(null, dueRead());
+    try testing.expectEqual(feed3.next_ns, pump().?);
+    // Open: the third drain takes what waited.
+    feed3.open = true;
+    const g = dueRead().?;
+    try testing.expectEqual(&qs[feed_max_inflight], g.members[0]);
+    cs[feed_max_inflight].pushGroup(g);
+    try testing.expectEqual(feed_max_inflight + 1, ln.inflight);
+    // Never a fourth.
+    readAt(&qs[feed_max_inflight + 1], .list_feed, now_ns);
+    now_ns += ln.gap_ns;
+    try testing.expectEqual(null, dueRead());
+    // Shut again with three in flight: one finishing leaves two, still the cap, so nothing starts.
+    feed3.open = false;
+    message(&cs[0], 'Z', "I");
+    try testing.expectEqual(null, dueRead());
+    // A second finishing frees a slot under the usual cap.
+    message(&cs[1], 'Z', "I");
+    const g2 = dueRead().?;
+    defer freeGroup(g2);
+    try testing.expectEqual(&qs[feed_max_inflight + 1], g2.members[0]);
+    message(&cs[feed_max_inflight], 'Z', "I");
+}
+
+test "with ZIG_FEED3_QWAIT the feed lane runs a third drain once its oldest read has waited, on a slot lent by the shared lane" {
+    clearQueuesForTest();
+    defer clearQueuesForTest();
+    feed3_qwait_ns = 120 * ms;
+    defer feed3_qwait_ns = 0;
+    const ln = lane(.feed);
+    var fc: [feed_max_inflight + 1]Conn = undefined;
+    for (&fc) |*c| c.* = .{ .fd = -1, .index = 0, .write = false, .rbuf = &.{} };
+    var sc: [max_inflight]Conn = undefined;
+    for (&sc) |*c| c.* = .{ .fd = -1, .index = 0, .write = false, .rbuf = &.{} };
+    var qs: [feed_max_inflight + 2]Query = undefined;
+    var ss: [max_inflight + 1]Query = undefined;
+    now_ns = 1000 * ms;
+    for (0..feed_max_inflight) |i| {
+        readAt(&qs[i], .list_feed, now_ns);
+        now_ns += ln.gap_ns;
+        fc[i].pushGroup(dueRead().?);
+    }
+    for (0..max_inflight) |i| {
+        readAt(&ss[i], .list_all, now_ns);
+        now_ns += gap_ns;
+        sc[i].pushGroup(dueRead().?);
+    }
+    try testing.expectEqual(feed_max_inflight + max_inflight, readsInflight());
+    // Two feed drains hold the lane. With the shared lane at its cap there is no slot to lend: the feed waits past
+    // 120 ms and nothing opens, and no clock is set for it.
+    readAt(&qs[feed_max_inflight], .list_feed, now_ns);
+    now_ns += 200 * ms;
+    try testing.expectEqual(null, dueRead());
+    try testing.expectEqual(null, pump());
+    // A shared drain finishing lends its slot: the feed that waited gets the third drain, and the shared lane's cap
+    // is two while it runs, so a shared read queued meanwhile waits even past the shared gap.
+    message(&sc[0], 'Z', "I");
+    const g = dueRead().?;
+    try testing.expectEqual(.feed, g.lane);
+    try testing.expectEqual(&qs[feed_max_inflight], g.members[0]);
+    fc[feed_max_inflight].pushGroup(g);
+    try testing.expectEqual(feed_max_inflight + 1, ln.inflight);
+    try testing.expectEqual(max_inflight - 1, cap(.shared));
+    try testing.expectEqual(feed_max_inflight + max_inflight, readsInflight());
+    readAt(&ss[max_inflight], .list_all, now_ns);
+    now_ns += 200 * ms;
+    try testing.expectEqual(null, readsDue(.shared));
+    try testing.expectEqual(null, dueRead());
+    // A feed drain finishing returns the slot: the shared lane drains at once, and a feed queued just now waits
+    // under the cap of two until it has waited 120 ms, which pump() sets the clock for once a shared slot is free.
+    readAt(&qs[feed_max_inflight + 1], .list_feed, now_ns);
+    const queued = now_ns;
+    message(&fc[0], 'Z', "I");
+    try testing.expectEqual(max_inflight, cap(.shared));
+    const sg = dueRead().?;
+    try testing.expectEqual(.shared, sg.lane);
+    try testing.expectEqual(&ss[max_inflight], sg.members[0]);
+    sc[0].pushGroup(sg);
+    try testing.expectEqual(null, dueRead());
+    try testing.expectEqual(null, pump());
+    message(&sc[1], 'Z', "I");
+    try testing.expectEqual(queued + feed3_qwait_ns, pump().?);
+    try testing.expectEqual(null, dueRead());
+    now_ns = queued + feed3_qwait_ns;
+    const g2 = dueRead().?;
+    try testing.expectEqual(&qs[feed_max_inflight + 1], g2.members[0]);
+    fc[0].pushGroup(g2);
+    try testing.expectEqual(feed_max_inflight + max_inflight, readsInflight());
+    for (&fc) |*c| message(c, 'Z', "I");
+    message(&sc[0], 'Z', "I");
+    message(&sc[2], 'Z', "I");
+}
+
+test "with ZIG_SHARED_GAP_BUSY the shared lane keeps the busy gap while the box is busy, and the feed lane keeps its own" {
+    clearQueuesForTest();
+    defer clearQueuesForTest();
+    shared_gap_busy_ns = 120 * ms;
+    defer {
+        shared_gap_busy_ns = 0;
+        busy = false;
+    }
+    var c: Conn = .{ .fd = -1, .index = 0, .write = false, .rbuf = &.{} };
+    var a: Query = undefined;
+    var b: Query = undefined;
+    var f: Query = undefined;
+    var f2: Query = undefined;
+    now_ns = 1000 * ms;
+    readAt(&a, .list_all, now_ns - window_ns);
+    c.pushGroup(dueRead().?);
+    message(&c, 'Z', "I");
+    readAt(&f, .list_feed, now_ns - window_ns);
+    c.pushGroup(dueRead().?);
+    message(&c, 'Z', "I");
+    readAt(&b, .list_all, now_ns);
+    readAt(&f2, .list_feed, now_ns);
+    try testing.expectEqual(1000 * ms + gap_ns, readsDue(.shared).?);
+    busy = true;
+    try testing.expectEqual(1000 * ms + shared_gap_busy_ns, readsDue(.shared).?);
+    try testing.expectEqual(1000 * ms + feed_gap_ns, readsDue(.feed).?);
+    try testing.expectEqual(1000 * ms + feed_gap_ns, pump().?);
+    busy = false;
+    try testing.expectEqual(1000 * ms + gap_ns, readsDue(.shared).?);
+}
+
+test "the box reading sums only the CPUs this process may run on" {
+    const text = "cpu  1 1 1 1 1 1 1 1 0 0\ncpu0 10 0 20 70 0 0 0 0 0 0\ncpu1 50 0 40 10 0 0 0 0 0 0\ncpu2 5 0 5 85 5 0 0 0 0 0\nintr 0\n";
+    var set: std.os.linux.cpu_set_t = @splat(0);
+    set[0] = 0b101;
+    const s = statOf(text, &set).?;
+    try testing.expectEqual(160, s.idle);
+    try testing.expectEqual(200, s.total);
+    set[0] = 0b1000;
+    try testing.expectEqual(null, statOf(text, &set));
+}
+
+test "with ZIG_READ_CAP no read drain starts past the cap, and each freed slot goes to the due lane whose oldest read waited longest" {
+    clearQueuesForTest();
+    defer clearQueuesForTest();
+    read_cap = 2;
+    lane_stats = true;
+    defer {
+        read_cap = 0;
+        lane_stats = false;
+        stats = @splat(.{});
+    }
+    var cs: [8]Conn = undefined;
+    for (&cs) |*c| c.* = .{ .fd = -1, .index = 0, .write = false, .rbuf = &.{} };
+    conns = &cs;
+    defer {
+        for (&cs) |*c| c.pending.deinit();
+        conns = &.{};
+    }
+    var qs: [5]Query = undefined;
+    const stmts = [_]Stmt{ .list_feed, .list_all, .comments_list_set, .list_all, .list_feed };
+    const queued = [_]u64{ 995, 995, 1010, 1020, 1030 };
+    // The feed and shared drains fill the cap, though the feed lane's own cap is two.
+    now_ns = 1000 * ms;
+    for (qs[0..2], stmts[0..2], queued[0..2]) |*r, s, at| {
+        readAt(r, s, at * ms);
+        r.params = @splat(Param{ .int = 1 });
+    }
+    _ = pump();
+    try testing.expectEqual(.feed, cs[0].front().lane);
+    try testing.expectEqual(.shared, cs[1].front().lane);
+    // Every lane due by 1,100 ms, and nothing starts or sets a clock until a drain ends.
+    for (qs[2..], stmts[2..], queued[2..]) |*r, s, at| {
+        readAt(r, s, at * ms);
+        r.params = @splat(Param{ .int = 1 });
+    }
+    now_ns = 1100 * ms;
+    for (lane_order) |l| try testing.expect(readsDue(l).? <= now_ns);
+    try testing.expectEqual(null, pump());
+    try testing.expectEqual(2, readsInflight());
+    // Each drain that ends lets one start, oldest read first: comments (1,010), shared (1,020), then feed (1,030),
+    // not the lanes' usual order.
+    const order = [_]LaneId{ .comments, .shared, .feed };
+    for (order, 0..) |l, i| {
+        now_ns += 10 * ms;
+        const c = &cs[i % 2];
+        message(c, 'Z', "I");
+        try testing.expectEqual(null, pump());
+        try testing.expectEqual(2, readsInflight());
+        try testing.expectEqual(l, c.front().lane);
+    }
+    try testing.expect(!readsQueued());
+    // Time held by the cap: each lane from 1,100 ms until its drain started.
+    for (order, [_]u64{ 10, 20, 30 }) |l, held| {
+        const st = &stats[@intFromEnum(l)];
+        try testing.expectEqual(held * ms, st.held.ns);
+        try testing.expectEqual(0, st.starved);
+    }
+    // The first two drains started together; the others 10 ms apart.
+    try testing.expectEqual(1, stats[@intFromEnum(LaneId.shared)].near_start);
+    try testing.expectEqual(0, stats[@intFromEnum(LaneId.feed)].near_start);
+    for (&cs) |*c| if (c.in_len > 0) message(c, 'Z', "I");
+}
+
+test "with ZIG_OLDEST_FIRST the lane holding the oldest read runs past its cap, up to the lanes' caps summed, and a freed slot goes to the oldest read" {
+    clearQueuesForTest();
+    defer clearQueuesForTest();
+    oldest_first = true;
+    feed3_qwait_ns = 120 * ms;
+    lane_stats = true;
+    defer {
+        oldest_first = false;
+        feed3_qwait_ns = 0;
+        lane_stats = false;
+        stats = @splat(.{});
+    }
+    var cs: [8]Conn = undefined;
+    for (&cs) |*c| c.* = .{ .fd = -1, .index = 0, .write = false, .rbuf = &.{} };
+    conns = &cs;
+    defer {
+        for (&cs) |*c| c.pending.deinit();
+        conns = &.{};
+    }
+    const t = struct {
+        fn queue(r: *Query, s: Stmt, at_ms: u64) void {
+            readAt(r, s, at_ms * ms);
+            r.params = @splat(Param{ .int = 1 });
+        }
+        fn end(all: []Conn, l: LaneId) void {
+            for (all) |*c| if (c.in_len > 0 and c.front().lane == l) return message(c, 'Z', "I");
+            unreachable;
+        }
+    };
+    try testing.expectEqual(7, readTotal());
+    var qs: [12]Query = undefined;
+    // Two feed drains fill the feed lane's own cap.
+    now_ns = 1000 * ms;
+    t.queue(&qs[0], .list_feed, 990);
+    _ = pump();
+    now_ns = 1080 * ms;
+    t.queue(&qs[1], .list_feed, 1070);
+    _ = pump();
+    try testing.expectEqual(2, lane(.feed).inflight);
+    // At 1,200 ms the feed queued at 1,100 holds the oldest read: it gets a third drain though it waited under the
+    // 120 ms third-slot wait, and the list queued at 1,150 drains on its own lane's slot.
+    t.queue(&qs[2], .list_feed, 1100);
+    t.queue(&qs[3], .list_all, 1150);
+    now_ns = 1200 * ms;
+    try testing.expectEqual(null, pump());
+    try testing.expectEqual(3, lane(.feed).inflight);
+    try testing.expectEqual(1, lane(.shared).inflight);
+    try testing.expectEqual(1, stats[@intFromEnum(LaneId.feed)].third);
+    // A comment queued at 1,205 drains at once. The next, queued at 1,220, waits for its lane's gap until 1,310. A
+    // feed queued at 1,290 is due by 1,295 but younger, so the feed lane, past its own cap, starts nothing with three
+    // of the seven slots free, and the only clock is the comment's.
+    t.queue(&qs[4], .comments_list_set, 1205);
+    now_ns = 1210 * ms;
+    try testing.expectEqual(null, pump());
+    t.queue(&qs[5], .comments_list_set, 1220);
+    t.queue(&qs[6], .list_feed, 1290);
+    now_ns = 1300 * ms;
+    try testing.expectEqual(1310 * ms, pump().?);
+    try testing.expectEqual(3, lane(.feed).inflight);
+    // The comment drains as its gap ends, which leaves the feed holding the oldest read: its fourth drain starts in
+    // the same pump, and all seven slots are taken.
+    now_ns = 1310 * ms;
+    try testing.expectEqual(null, pump());
+    try testing.expectEqual(4, lane(.feed).inflight);
+    try testing.expectEqual(2, lane(.comments).inflight);
+    try testing.expectEqual(7, readsInflight());
+    // A list queued at 1,320, a comment at 1,330 and a feed at 1,340 are all due by 1,450 and wait for a slot.
+    t.queue(&qs[7], .list_all, 1320);
+    t.queue(&qs[8], .comments_list_set, 1330);
+    t.queue(&qs[9], .list_feed, 1340);
+    now_ns = 1450 * ms;
+    try testing.expectEqual(null, pump());
+    try testing.expectEqual(7, readsInflight());
+    // A comments drain ends: the comments lane is under its cap again, but the slot goes to the list, which waited
+    // longer, not to the lane first in the usual order.
+    now_ns = 1460 * ms;
+    t.end(&cs, .comments);
+    try testing.expectEqual(null, pump());
+    try testing.expectEqual(2, lane(.shared).inflight);
+    try testing.expectEqual(1, lane(.comments).inflight);
+    try testing.expectEqual(10 * ms, stats[@intFromEnum(LaneId.shared)].held.ns);
+    // A feed drain ends: the comment is now the oldest read and takes the slot; the feed waits on.
+    now_ns = 1470 * ms;
+    t.end(&cs, .feed);
+    try testing.expectEqual(null, pump());
+    try testing.expectEqual(2, lane(.comments).inflight);
+    try testing.expectEqual(3, lane(.feed).inflight);
+    // A shared drain ends: the feed holds the only queued read and goes past its cap again.
+    now_ns = 1480 * ms;
+    t.end(&cs, .shared);
+    try testing.expectEqual(null, pump());
+    try testing.expectEqual(4, lane(.feed).inflight);
+    try testing.expect(!readsQueued());
+    for (stats) |st| try testing.expectEqual(0, st.starved);
+    for (&cs) |*c| if (c.in_len > 0) message(c, 'Z', "I");
+    // The lanes' caps from the environment set the total; ZIG_READ_CAP overrides it.
+    setCaps(3, null, 2);
+    defer setCaps(feed_max_inflight, comments_max_inflight, max_inflight);
+    try testing.expectEqual([3]u8{ 3, comments_max_inflight, 2 }, caps());
+    try testing.expectEqual(7, readTotal());
+    read_cap = 5;
+    defer read_cap = 0;
+    try testing.expectEqual(5, readTotal());
+    oldest_first = false;
+    read_cap = 0;
+    try testing.expectEqual(0, readTotal());
+}
+
+test "with ZIG_FEED_CAP and ZIG_SHARED_CAP the lanes run to their own caps, and the third feed slot lends from the shared lane's" {
+    clearQueuesForTest();
+    defer clearQueuesForTest();
+    setCaps(3, null, 2);
+    defer setCaps(feed_max_inflight, comments_max_inflight, max_inflight);
+    feed3_qwait_ns = 120 * ms;
+    defer feed3_qwait_ns = 0;
+    var cs: [6]Conn = undefined;
+    for (&cs) |*c| c.* = .{ .fd = -1, .index = 0, .write = false, .rbuf = &.{} };
+    var qs: [6]Query = undefined;
+    now_ns = 1000 * ms;
+    for (0..3) |i| {
+        readAt(&qs[i], .list_feed, now_ns);
+        now_ns += feed_gap_ns;
+        cs[i].pushGroup(dueRead().?);
+    }
+    try testing.expectEqual(3, lane(.feed).inflight);
+    readAt(&qs[3], .list_all, now_ns - window_ns);
+    cs[3].pushGroup(dueRead().?);
+    // The feed lane at its cap of three gets a fourth once a feed has waited 120 ms, on the shared lane's second slot.
+    readAt(&qs[4], .list_feed, now_ns);
+    now_ns += 120 * ms;
+    try testing.expectEqual(4, cap(.feed));
+    const g = dueRead().?;
+    try testing.expectEqual(.feed, g.lane);
+    cs[4].pushGroup(g);
+    try testing.expectEqual(1, cap(.shared));
+    readAt(&qs[5], .list_all, now_ns);
+    now_ns += gap_ns;
+    try testing.expectEqual(null, dueRead());
+    message(&cs[0], 'Z', "I");
+    try testing.expectEqual(2, cap(.shared));
+    const sg = dueRead().?;
+    defer freeGroup(sg);
+    try testing.expectEqual(.shared, sg.lane);
+    for (cs[1..5]) |*c| message(c, 'Z', "I");
+}
+
+test "with ZIG_LANE_SEP the shared lane starts no drain that close to a feed drain's start, the last one or the next one due" {
+    clearQueuesForTest();
+    defer clearQueuesForTest();
+    lane_sep_ns = 10 * ms;
+    defer lane_sep_ns = 0;
+    var list: Query = undefined;
+    var feeds: [2]Query = undefined;
+    const shared_due = 1000 * ms + gap_ns;
+    lane(.shared).last_ns = 1000 * ms;
+    readAt(&list, .list_all, 1010 * ms);
+    // Nothing on the feed lane: the shared lane keeps its gap.
+    try testing.expectEqual(shared_due, readsDue(.shared).?);
+    // A feed drain started 3 ms before the shared lane's gap ends: the shared drain waits until 10 ms after it.
+    lane(.feed).last_ns = shared_due - 3 * ms;
+    try testing.expectEqual(shared_due + 7 * ms, readsDue(.shared).?);
+    // The feed lane's next drain is due 4 ms after the shared lane's gap ends: the shared drain goes 10 ms after it.
+    lane(.feed).last_ns = shared_due + 4 * ms - feed_gap_ns;
+    readAt(&feeds[0], .list_feed, 1010 * ms);
+    try testing.expectEqual(shared_due + 14 * ms, readsDue(.shared).?);
+    now_ns = shared_due;
+    try testing.expectEqual(null, dueRead());
+    now_ns = shared_due + 4 * ms;
+    const fg = dueRead().?;
+    defer freeGroup(fg);
+    try testing.expectEqual(.feed, fg.lane);
+    try testing.expectEqual(shared_due + 14 * ms, readsDue(.shared).?);
+    try testing.expectEqual(null, dueRead());
+    now_ns = shared_due + 14 * ms;
+    const sg = dueRead().?;
+    defer freeGroup(sg);
+    try testing.expectEqual(.shared, sg.lane);
+    // A feed due 10 ms or more after the shared lane's gap ends leaves it alone.
+    lane(.shared).last_ns = 2000 * ms;
+    lane(.feed).last_ns = 2000 * ms + 10 * ms + gap_ns - feed_gap_ns;
+    readAt(&list, .list_all, 2000 * ms);
+    readAt(&feeds[1], .list_feed, 2000 * ms);
+    try testing.expectEqual(2000 * ms + gap_ns, readsDue(.shared).?);
+}
+
+test "lane stats: each read's wait, each drain's run, and no lane left due on 8 connections whatever the lane order" {
+    clearQueuesForTest();
+    defer clearQueuesForTest();
+    lane_stats = true;
+    defer {
+        lane_stats = false;
+        stats = @splat(.{});
+    }
+    // Every lane at its cap but one each, and one read due on each: the caps sum to 7, so 8 connections always leave
+    // one free and every due lane drains in the same pump.
+    var cs: [8]Conn = undefined;
+    for (&cs) |*c| c.* = .{ .fd = -1, .index = 0, .write = false, .rbuf = &.{} };
+    conns = &cs;
+    defer conns = &.{};
+    const kinds = [_]Stmt{ .list_feed, .comments_list_set, .list_all };
+    var held: [7]Query = undefined;
+    var k: usize = 0;
+    now_ns = 1000 * ms;
+    for (kinds) |s| {
+        for (0..lane(laneOf(s)).max_inflight - 1) |_| {
+            readAt(&held[k], s, now_ns - window_ns);
+            held[k].params = @splat(Param{ .int = 1 });
+            for (&lanes) |*l| l.last_ns = 0;
+            k += 1;
+            _ = pump();
+        }
+    }
+    var due: [3]Query = undefined;
+    for (&due, kinds) |*r, s| {
+        readAt(r, s, now_ns - 40 * ms);
+        r.params = @splat(Param{ .int = 1 });
+    }
+    for (&lanes) |*l| l.last_ns = 0;
+    _ = pump();
+    try testing.expect(!readsQueued());
+    for (lane_order) |l| try testing.expectEqual(lane(l).max_inflight, lane(l).inflight);
+    for (stats) |st| try testing.expectEqual(0, st.starved);
+    try testing.expectEqual(40, stats[@intFromEnum(LaneId.shared)].wait.at(1000));
+    now_ns += 25 * ms;
+    for (&cs) |*c| {
+        if (c.in_len > 0) message(c, 'Z', "I");
+        c.pending.deinit();
+    }
+    try testing.expectEqual(25, stats[@intFromEnum(LaneId.feed)].run.at(500));
+    for (lane_order) |l| try testing.expectEqual(0, lane(l).inflight);
+    // Each lane ran its cap of drains for those 25 ms.
+    for (lane_order) |l| try testing.expectEqual(@as(u64, lane(l).max_inflight) * 25 * ms, stats[@intFromEnum(l)].inflight_ns);
 }
 
 test "two or more feeds ride one MEGA execution of feeds alone, a feed retry runs alone beside them" {

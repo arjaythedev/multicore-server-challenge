@@ -22,10 +22,12 @@
 // that it reuses; nothing is allocated per request once the worker has
 // served its peak.
 import {
+  NET_TCP_QUICKACK,
   connectResult,
   netAddress,
   netClose,
   netRead,
+  netSetOption,
   netWrite,
   pollAdd,
   pollCreate,
@@ -34,6 +36,8 @@ import {
   pollWait,
   tcpConnect,
 } from "nish:net"
+import { copyBytes, setI32LE, setI64LE } from "nish/bytes"
+import { RING_EMPTY, RING_TOO_SMALL } from "nish/sync/ring"
 import { monotonicNanos } from "nish:process"
 import { secret, wipe } from "nish:secret"
 import {
@@ -50,7 +54,9 @@ import {
   Http1Connection,
   Http1Server,
 } from "nish/net/http1-server"
-import { HTTP1_NO_BODY, Http1Parser } from "nish/net/http1"
+import { HTTP1_NO_BODY, Http1Parser } from "nish/net/http1-codec"
+import { HTTP_CODING_IDENTITY, HttpCompressor } from "nish/net/http-compress"
+import { DEFLATE_FAST } from "nish/compress/deflate"
 import { JsonWriter } from "nish/json"
 import {
   JSON_TOK_ARRAY_BEGIN,
@@ -106,9 +112,12 @@ import {
   K_PROFILE,
   K_TAG,
   K_TAGS,
+  LANES_ALL,
   PLAN_ALONE,
+  CountRun,
   ReadPlan,
 } from "./plan"
+import { ANSWER_ALONE, ANSWER_TAIL, READ_HEAD, ReadLink } from "./read-ring"
 import {
   COL_BIO,
   COL_BODY,
@@ -192,14 +201,18 @@ const FIELDS_COMMENT: i32 = 64 // body
 const POOL_READ: i32 = 0
 const POOL_WRITE: i32 = 1
 
+/** A little-endian `i32` at `b[off]`, from a window the ring lent (`getI32LE` takes only a writable array). */
+const readI32LE = (b: readonly u8[], off: i32): i32 =>
+  toI32(b[off]) | (toI32(b[off + 1]) << 8) | (toI32(b[off + 2]) << 16) | (toI32(b[off + 3]) << 24)
+
 /** Tokens in the loop: the listener, the bcrypt services (-2 down), then pool slots below; HTTP slots are 0 and up. */
 const TOKEN_LISTENER: i32 = -1
 const TOKEN_BCRYPT: i32 = -2
 const TOKEN_POOL: i32 = -16
-/** The most bcrypt services a worker connects to: the tokens between `TOKEN_BCRYPT` and `TOKEN_POOL`. */
-export const BCRYPT_SERVICES_MAX: i32 = 14
-/** The jobs one bcrypt call takes (`bcryptHash4`, `bcryptVerify4`). */
-const BCRYPT_LANES: i32 = 4
+/** The channel to the read service. */
+const TOKEN_READS: i32 = -15
+/** The most bcrypt services a worker connects to: the tokens between `TOKEN_BCRYPT` and `TOKEN_READS`. */
+export const BCRYPT_SERVICES_MAX: i32 = 13
 const POOL_TOKENS: i32 = 1024
 
 const AGAIN: i32 = -11
@@ -213,6 +226,8 @@ const WRITE_BATCH: i32 = 128
 const PLAN_FREE: i32 = 0
 const PLAN_A: i32 = 1
 const PLAN_B: i32 = 2
+/** The plan waits for its favorite counts, between group A and group B. */
+const PLAN_COUNT: i32 = 3
 /** The longest key (a tag, a username, a slug) a read plan takes; a longer one is read alone. */
 const PLAN_KEY_MAX: i32 = 1024
 /**
@@ -285,6 +300,8 @@ class ConduitReq {
   viewer: i64 = 0
   /** A status to answer once the body has ended, or 0. */
   status: i32 = 0
+  /** What the request's `Accept-Encoding` takes (`httpAcceptEncoding`). */
+  coding: i32 = 0
   text: u8[]
   textEnd: i32 = 0
   fStart: i32[]
@@ -528,21 +545,33 @@ export class WorkerConfig {
    * oldest has waited `planWaitUs`: a batch clock. With `planClock` off, the
    * window applies only while another plan is in flight.
    */
-  planMin: i32 = 256
-  planWaitUs: i32 = 10000
+  planMin: i32 = 4096
+  planWaitUs: i32 = 60000
   /** 0: no clock; 1: the clock; 2: the clock only while at least `planLight` reads come a window. */
   planClock: i32 = 1
   planLight: i32 = 32
   bcryptPort: i32 = 47391
   /** How many bcrypt services listen, on `bcryptPort` and up. */
   bcryptServices: i32 = 1
+  /** The jobs one of their calls takes. */
+  bcryptWidth: i32 = 4
   slots: i32 = 200000
   backlog: i32 = 65535
   idleTimeoutMs: i32 = 75000
+  /** Whether each answered connection goes back to delayed ACKs (`ConduitWorker.ackDelay`). */
+  ackDelay: boolean = true
+  /** How many count runs the read service runs at once. */
+  countLanes: i32 = 1
+  /** Bytes of the read service's answers a worker sends a millisecond (`ConduitWorker.takeAnswers`). */
+  answerPace: i32 = 130000
+  /** 0: no gzip; 1: gzip a body when that sends fewer TCP segments; 2: whenever it saves anything. */
+  gzip: i32 = 0
+  /** The shortest body gzip is tried on. */
+  gzipMin: i32 = 1300
 }
 
 /** A pool's connection settings, with up to `maxInFlight` groups in flight on each connection. */
-const pgConfig = (cfg: WorkerConfig, maxInFlight: i32): PgConfig => {
+export const pgConfig = (cfg: WorkerConfig, maxInFlight: i32): PgConfig => {
   const config = new PgConfig()
   config.user = cfg.dbUser
   config.database = cfg.dbName
@@ -580,6 +609,14 @@ export class ConduitWorker {
   /** Per HTTP slot: its request in progress (-1 for none) and its generation. */
   slotReq: i32[]
   slotGen: i32[]
+  /** Per HTTP slot: an answer was written since its last flush (`ackDelayAfter`). */
+  slotAnswered: boolean[]
+  /** `WorkerConfig.bcryptWidth`. */
+  bcryptWidth: i32 = 4
+  /** Gzips a JSON body when `WorkerConfig.gzip` asks; null otherwise. */
+  gzip: HttpCompressor | null = null
+  /** `WorkerConfig.ackDelay`, off for the process once the kernel refuses the option. */
+  ackDelay: boolean = true
   jsonNames: u8[][]
   jsonValues: u8[][]
   noNames: u8[][]
@@ -612,6 +649,10 @@ export class ConduitWorker {
   /** The read plans, each one's `PLAN_` state, and the reads waiting for the next, a ring oldest first. */
   plans: ReadPlan[]
   planState: i32[]
+  /** The count lane (plan.ts `CountRun`): the run plans join, the one running, and whether one runs or is asked for. */
+  countRuns: CountRun[]
+  countOpen: i32 = 0
+  countBusy: boolean = false
   planRing: i32[]
   planHead: i32 = 0
   planCount: i32 = 0
@@ -619,7 +660,7 @@ export class ConduitWorker {
   ticketPlan: i32[]
   /** When each read in `planRing` came, in ns, by its place in the ring; and the start policy. */
   planAt: i64[]
-  planMin: i32 = 256
+  planMin: i32 = 4096
   planWait: i64 = 0
   /** Whether the window gathers reads even while no plan runs: a batch clock (`WorkerConfig.planClock`). */
   planClock: i32 = 1
@@ -628,9 +669,26 @@ export class ConduitWorker {
   arrivals: i64 = 0
   rateAt: i64 = 0
   perWindow: i64 = 0
+  /** The rings to the read service (read-service.ts), which then holds the plans; null when this worker plans for itself. */
+  reads: ReadLink | null = null
+  readRec: u8[]
+  answerBuf: u8[]
+  /** A ring answer copied out for gzip, which compresses from a writable array. */
+  answerCopy: u8[]
+  /** The channel is gone: the read service died. */
+  readsGone: boolean = false
+  /** How many bytes of answers may go out a ms, what may go now and when that was reckoned, and whether answers wait for it. */
+  pace: i64 = 0
+  paceLeft: i64 = 0
+  paceAt: i64 = 0
+  paced: boolean = false
 
   constructor(cfg: WorkerConfig, listener: i32) {
     this.listener = listener
+    this.readRec = new Array<u8>(READ_HEAD + PLAN_KEY_MAX)
+    this.answerBuf = new Array<u8>(RESPONSE_ROOM)
+    this.answerCopy = new Array<u8>(0)
+    this.pace = toI64(cfg.answerPace)
     const http = new Http1Config()
     http.idleTimeout = cfg.idleTimeoutMs
     http.maxBody = 1048576
@@ -682,6 +740,14 @@ export class ConduitWorker {
     this.free = []
     this.slotReq = new Array<i32>(cfg.slots)
     this.slotGen = new Array<i32>(cfg.slots)
+    this.slotAnswered = new Array<boolean>(cfg.slots)
+    this.ackDelay = cfg.ackDelay
+    this.bcryptWidth = cfg.bcryptWidth
+    if (cfg.gzip !== 0) {
+      const enc: HttpCompressor = new HttpCompressor(DEFLATE_FAST, cfg.gzipMin, RESPONSE_ROOM)
+      enc.segmentMode = cfg.gzip === 1
+      this.gzip = enc
+    }
     for (let k: i32 = 0; k < cfg.slots; k++) {
       this.slotReq[k] = -1
     }
@@ -729,6 +795,7 @@ export class ConduitWorker {
     registerPlanStatements(this.pools[POOL_READ])
     this.plans = []
     this.planState = []
+    this.countRuns = [new CountRun(), new CountRun()]
     for (let k: i32 = 0; k < (cfg.readPlans > 0 ? cfg.readPlans : 1); k++) {
       this.plans.push(new ReadPlan())
       this.planState.push(PLAN_FREE)
@@ -756,7 +823,11 @@ export class ConduitWorker {
   run(): i32 {
     const ready: i32[] = new Array<i32>(2 * 512)
     this.bcryptStart()
-    while (true) {
+    const reads: ReadLink | null = this.reads
+    if (reads !== null) {
+      pollAdd(this.loop, reads.fd, H1_WANT_READ, TOKEN_READS)
+    }
+    while (!this.readsGone) {
       this.pump()
       let wait: i32 = 1000
       for (const c of this.bcrypts) {
@@ -768,7 +839,18 @@ export class ConduitWorker {
         const ms: i32 = toI32((left + 999999) / 1000000)
         wait = ms < wait ? ms : wait
       }
+      if (reads !== null) {
+        reads.sleeping()
+        if (this.takeAnswers(reads)) {
+          wait = 0
+        } else if (this.paced) {
+          wait = wait > 1 ? 1 : wait
+        }
+      }
       const n: i32 = pollWait(this.loop, ready, wait)
+      if (reads !== null) {
+        reads.awake()
+      }
       if (n < 0 && n !== -4) {
         return 1
       }
@@ -778,6 +860,88 @@ export class ConduitWorker {
       this.server.expire(monotonicNanos())
       this.bcryptTick()
     }
+    console.log("conduit: the read service is gone")
+    return 1
+  }
+
+  /**
+   * Answers the requests the read service has answered, as fast as `pace`
+   * lets it; whether there were any. A plan's answers come at once, hundreds
+   * of them, and written in one go they overflow a NIC's queue: on the VM at
+   * 175,000 users, 20,000 segments a second went again and 4,600 connections
+   * a second timed out, for 2 ms of waiting saved. Paced, they leave over the
+   * few ms the plan took to gather. On the VM at 175,000 users 192 KiB a ms
+   * passed 2 holds of 2, and 256 KiB passed 2 of 3 and let the retransmits
+   * run away once; it is the worker's share of a 2 Gbit/s peak or so.
+   */
+  takeAnswers(reads: ReadLink): boolean {
+    let took: boolean = false
+    const now: i64 = monotonicNanos()
+    // A gap of a millisecond or more fills the budget, the first one included.
+    const gap: i64 = now - this.paceAt
+    this.paceLeft = gap >= 1000000 ? this.pace : this.paceLeft + (gap * this.pace) / 1000000
+    this.paceLeft = this.paceLeft > this.pace ? this.pace : this.paceLeft
+    this.paceAt = now
+    this.paced = false
+    while (true) {
+      if (this.paceLeft <= 0) {
+        this.paced = true
+        return took
+      }
+      // The answer where the service wrote it, in the ring (`peek`), sent
+      // from there and only then given back; one the ring cannot lend is
+      // copied out as before.
+      const view: readonly u8[] = reads.rx.peek()
+      const lent: boolean = view.length > 0
+      let n: i32 = toI32(view.length)
+      if (!lent) {
+        n = reads.rx.tryPop(this.answerBuf, 0)
+        if (n === RING_EMPTY) {
+          return took
+        }
+        if (n === RING_TOO_SMALL) {
+          this.answerBuf = new Array<u8>(2 * toI32(this.answerBuf.length))
+          continue
+        }
+      }
+      const rec: readonly u8[] = lent ? view : this.answerBuf
+      took = true
+      this.paceLeft -= toI64(n)
+      const len: i32 = n - ANSWER_TAIL
+      const r: ConduitReq = this.reqs[readI32LE(rec, len)]
+      const status: i32 = readI32LE(rec, len + 4)
+      r.inPool = false
+      if (status === ANSWER_ALONE) {
+        r.solo = true
+        this.submit(r, true)
+      } else if (status === 404) {
+        this.fail(r, 404, r.route === R_COMMENTS ? "article not found" : "not found", true)
+      } else if (status === 200) {
+        this.answerFrom(r, rec, len)
+      } else {
+        this.fail(r, 500, "the database connection was lost", true)
+      }
+      if (lent) {
+        reads.rx.release()
+      }
+    }
+  }
+
+  /** Hands `r`, a read of plan kind `kind`, to the read service; false when its ring is full. */
+  sendRead(r: ConduitReq, kind: i32, reads: ReadLink): boolean {
+    const f: i32 = kind === K_ARTICLE || kind === K_COMMENTS || kind === K_PROFILE ? F_PATH : F_FILTER
+    const n: i32 = r.fLen[f] > 0 ? r.fLen[f] : 0
+    const b: u8[] = this.readRec
+    setI32LE(b, 0, r.index)
+    setI32LE(b, 4, kind)
+    setI32LE(b, 8, r.fLen[f])
+    setI64LE(b, 16, r.viewer)
+    setI64LE(b, 24, r.limit)
+    setI64LE(b, 32, r.offset)
+    for (let k: i32 = 0; k < n; k++) {
+      b[READ_HEAD + k] = r.text[r.fStart[f] + k]
+    }
+    return reads.push(b, READ_HEAD + n)
   }
 
   /** One ready descriptor. */
@@ -793,6 +957,11 @@ export class ConduitWorker {
       }
     } else if (token === TOKEN_LISTENER) {
       this.acceptAll()
+    } else if (token === TOKEN_READS) {
+      const reads: ReadLink | null = this.reads
+      if (reads !== null && !reads.woken()) {
+        this.readsGone = true
+      }
     } else if (token <= TOKEN_BCRYPT && token > TOKEN_POOL) {
       const k: i32 = TOKEN_BCRYPT - token
       if (k < toI32(this.bcrypts.length)) {
@@ -857,8 +1026,36 @@ export class ConduitWorker {
     const wants: i32 = this.server.flush(slot)
     if ((wants & H1_DONE) !== 0) {
       this.closeSlot(slot)
-    } else if (this.server.rearm(slot, wants)) {
+      return
+    }
+    this.ackDelayAfter(slot)
+    if (this.server.rearm(slot, wants)) {
       pollModify(this.loop, this.server.fd(slot), wants & (H1_WANT_READ | H1_WANT_WRITE), slot)
+    }
+  }
+
+  /**
+   * After an answer on a kept-alive connection, its socket goes back to
+   * delayed ACKs, so the client's next request is acknowledged by its answer
+   * rather than by an ACK of its own. A client that paused longer than the
+   * retransmit timeout puts Linux in quick-ACK mode, which sends that empty
+   * ACK at once, before the request is even read; every one lands on the CPU
+   * that takes the network interrupts. Linux leaves delayed mode on its own,
+   * so it is set again after every answer. An idea from the challenge's
+   * zig-iouring-nick-potts submission (`ackdelay`).
+   */
+  ackDelayAfter(slot: i32): void {
+    if (slot < 0 || slot >= toI32(this.slotAnswered.length) || !this.slotAnswered[slot]) {
+      return
+    }
+    this.slotAnswered[slot] = false
+    if (!this.ackDelay) {
+      return
+    }
+    const rc: i32 = netSetOption(this.server.fd(slot), NET_TCP_QUICKACK, 0)
+    if (rc === -22 || rc === -95) {
+      console.log(`conduit: TCP_QUICKACK refused (${rc}); ACKs stay as the kernel sends them`)
+      this.ackDelay = false
     }
   }
 
@@ -917,6 +1114,7 @@ export class ConduitWorker {
       slot < toI32(this.slotGen.length) &&
       this.server.holds(slot) &&
       this.slotGen[slot] === r.gen
+    const coding: i32 = r.coding
     this.release(r)
     if (!live) {
       return
@@ -925,14 +1123,68 @@ export class ConduitWorker {
     const conn: Http1Connection = this.server.connection(slot)
     if (status === 204) {
       conn.respond(status, this.noNames, this.noNames, HTTP1_NO_BODY)
-    } else {
+      conn.end()
+    } else if (!this.answerGzipped(conn, status, buf, len, coding)) {
       conn.respond(status, this.jsonNames, this.jsonValues, len)
       conn.write(buf, 0, len)
+      conn.end()
     }
-    conn.end()
+    if (slot < toI32(this.slotAnswered.length)) {
+      this.slotAnswered[slot] = true
+    }
     if (later) {
       this.drive(slot)
     }
+  }
+
+  /**
+   * Answers `r` with `buf[0, len)`, an answer the read service wrote, sent
+   * from `buf` itself (`sendBody`): the response head and the body leave in
+   * one write, and only what the socket did not take is copied. Gzip, when
+   * on, copies the body to compress it.
+   */
+  answerFrom(r: ConduitReq, buf: readonly u8[], len: i32): void {
+    if (this.gzip !== null) {
+      if (toI32(this.answerCopy.length) < len) {
+        this.answerCopy = new Array<u8>(len)
+      }
+      copyBytes(this.answerCopy, 0, buf, 0, len)
+      this.answer(r, 200, this.answerCopy, len, true)
+      return
+    }
+    const slot: i32 = r.slot
+    const live: boolean =
+      slot >= 0 &&
+      slot < toI32(this.slotGen.length) &&
+      this.server.holds(slot) &&
+      this.slotGen[slot] === r.gen
+    this.release(r)
+    if (!live) {
+      return
+    }
+    this.answered += 1
+    const conn: Http1Connection = this.server.connection(slot)
+    conn.respond(200, this.jsonNames, this.jsonValues, len)
+    conn.sendBody(buf, 0, len)
+    conn.end()
+    if (slot < toI32(this.slotAnswered.length)) {
+      this.slotAnswered[slot] = true
+    }
+    this.drive(slot)
+  }
+
+  /**
+   * Answers with `buf[0, len)` through `HttpCompressor`, which sends it gzipped
+   * only when that pays (`WorkerConfig.gzip`); false when it was left unanswered.
+   * Sending gzip only when it saves a TCP segment is an idea from the challenge's
+   * zig-iouring-nick-potts submission; the policy is Nish's own since 0.28.0.
+   */
+  answerGzipped(conn: Http1Connection, status: i32, buf: u8[], len: i32, coding: i32): boolean {
+    const enc: HttpCompressor | null = this.gzip
+    if (enc === null || len < enc.minLength) {
+      return false
+    }
+    return conn.respondEncoded(status, this.jsonNames, this.jsonValues, buf, 0, len, enc, coding) === 0
   }
 
   /** Answers `r` with what `w` wrote into `buf`, or 500 when it did not fit: a cut JSON text is never sent. */
@@ -968,7 +1220,10 @@ export class ConduitWorker {
     if (slot >= 0 && slot < toI32(this.slotReq.length)) {
       this.slotReq[slot] = r.index
     }
-    const p: Http1Parser = this.server.connection(slot).parser
+    const conn: Http1Connection = this.server.connection(slot)
+    const p: Http1Parser = conn.parser
+    // Read now: a request waiting on Postgres leaves its head to the next one's rest.
+    r.coding = this.gzip !== null ? conn.acceptEncoding() : HTTP_CODING_IDENTITY
     this.route(r, p)
     if (r.status !== 0 || r.route === R_TAGS || r.route === R_SIGNUP || r.route === R_LOGIN) {
       return
@@ -1506,8 +1761,13 @@ export class ConduitWorker {
       return
     }
     if (p === POOL_READ && !r.solo && this.planKind(r) >= 0) {
-      // The tag list, lists, feeds, articles and comments wait for the next read plan: `startPlans` takes them.
+      // The tag list, lists, feeds, articles and comments wait for the next read plan: `startPlans` takes them,
+      // or the read service's while its ring has room.
       this.wait(r, p)
+      const reads: ReadLink | null = this.reads
+      if (reads !== null && this.sendRead(r, this.planKind(r), reads)) {
+        return
+      }
       if (this.planCount === QUEUE) {
         r.inPool = false
         this.fail(r, 503, "busy", later)
@@ -1664,18 +1924,66 @@ export class ConduitWorker {
         return
       }
       if (plan.planB()) {
-        const ticket: i32 = this.pools[POOL_READ].request()
-        if (ticket !== PG_POOL_FULL) {
-          const at: i32 = ticket % TICKET_RING
-          this.tickets[POOL_READ][at] = -1
-          this.ticketPlan[at] = p
-          this.planState[p] = PLAN_B
+        if (plan.metas > 0) {
+          if (this.countRuns[this.countOpen].join(p, plan)) {
+            this.planState[p] = PLAN_COUNT
+            return
+          }
+          plan.failed = true
+        } else if (this.planAskB(p)) {
           return
         }
-        plan.failed = true
       }
     }
     this.planFinish(p, false)
+  }
+
+  /** Asks the read pool for plan `p`'s group B; false, with the plan failed, when the pool is full. */
+  planAskB(p: i32): boolean {
+    const ticket: i32 = this.pools[POOL_READ].request()
+    if (ticket === PG_POOL_FULL) {
+      this.plans[p].failed = true
+      return false
+    }
+    const at: i32 = ticket % TICKET_RING
+    this.tickets[POOL_READ][at] = -1
+    this.ticketPlan[at] = p
+    this.planState[p] = PLAN_B
+    return true
+  }
+
+  /** Asks the read pool for the next count run, when plans wait for one and none is running. */
+  startCounts(): void {
+    if (this.countBusy || this.countRuns[this.countOpen].plans.length === 0) {
+      return
+    }
+    const ticket: i32 = this.pools[POOL_READ].request()
+    if (ticket === PG_POOL_FULL) {
+      return
+    }
+    const at: i32 = ticket % TICKET_RING
+    this.tickets[POOL_READ][at] = -1
+    this.ticketPlan[at] = toI32(this.plans.length)
+    this.countBusy = true
+  }
+
+  /** The running count run ended: each of its plans goes on to group B, or alone, or fails with the connection. */
+  countsDone(failed: boolean, lost: boolean): void {
+    const run: CountRun = this.countRuns[1 - this.countOpen]
+    this.countBusy = false
+    for (const p of run.plans) {
+      if (lost) {
+        this.planFinish(p, true)
+      } else {
+        const plan: ReadPlan = this.plans[p]
+        plan.failed = plan.failed || failed || run.failed
+        plan.takeCounts(run)
+        if (plan.failed || !this.planAskB(p)) {
+          this.planFinish(p, false)
+        }
+      }
+    }
+    run.reset()
   }
 
   /**
@@ -1709,6 +2017,10 @@ export class ConduitWorker {
   planEvent(ticket: i32, conn: PgConnection, event: i32): void {
     const at: i32 = ticket % TICKET_RING
     const p: i32 = this.ticketPlan[at]
+    if (p === toI32(this.plans.length)) {
+      this.countEvent(at, conn, event)
+      return
+    }
     const plan: ReadPlan = this.plans[p]
     if (event === PG_LOST) {
       this.ticketPlan[at] = -1
@@ -1721,9 +2033,22 @@ export class ConduitWorker {
       }
       this.planGroupDone(p)
     } else if (this.planState[p] === PLAN_A) {
-      plan.eventA(conn, event)
+      plan.eventA(conn, event, 0)
     } else {
-      plan.eventB(conn, event)
+      plan.eventB(conn, event, 0)
+    }
+  }
+
+  /** One event of the running count run. */
+  countEvent(at: i32, conn: PgConnection, event: i32): void {
+    if (event === PG_LOST) {
+      this.ticketPlan[at] = -1
+      this.countsDone(true, true)
+    } else if (event === PG_GROUP_DONE) {
+      this.ticketPlan[at] = -1
+      this.countsDone(conn.groupFailed, false)
+    } else {
+      this.countRuns[1 - this.countOpen].event(conn, event)
     }
   }
 
@@ -1740,8 +2065,13 @@ export class ConduitWorker {
 
   /** Hands waiting requests to connections, makes the connections wanted, and sends what they queued. */
   pump(): void {
+    const reads: ReadLink | null = this.reads
+    if (reads !== null) {
+      this.takeAnswers(reads)
+    }
     this.batchWrites()
     this.startPlans()
+    this.startCounts()
     for (let p: i32 = 0; p < 2; p++) {
       const pool: PgPool = this.pools[p]
       let s: i32 = pool.dispatch()
@@ -1751,8 +2081,24 @@ export class ConduitWorker {
         if (p === POOL_READ && this.ticketPlan[at] >= 0) {
           // A read plan's group: its statements over the plan's keys.
           const pi: i32 = this.ticketPlan[at]
+          if (pi === toI32(this.plans.length)) {
+            // The count run: it takes every plan waiting now, and the next plans open the other.
+            const run: CountRun = this.countRuns[this.countOpen]
+            this.countOpen = 1 - this.countOpen
+            const counted: boolean = run.bind(conn)
+            if (!counted) {
+              conn.bindCancel()
+            }
+            run.failed = !counted
+            if (!pool.send()) {
+              this.ticketPlan[at] = -1
+              this.countsDone(true, false)
+            }
+            s = pool.dispatch()
+            continue
+          }
           const plan: ReadPlan = this.plans[pi]
-          const bound: boolean = this.planState[pi] === PLAN_A ? plan.bindA(conn) : plan.bindB(conn)
+          const bound: boolean = this.planState[pi] === PLAN_A ? plan.bindA(conn, LANES_ALL, 0) : plan.bindB(conn, LANES_ALL, 0)
           if (!bound) {
             // The statements bound still run; the plan's requests go alone once they have.
             plan.failed = true
@@ -1851,6 +2197,9 @@ export class ConduitWorker {
         k = m.batchNext
         this.submit(m, true)
       }
+    }
+    if (reads !== null) {
+      reads.ring()
     }
   }
 
@@ -2916,7 +3265,7 @@ export class ConduitWorker {
 
   /**
    * The bcrypt service the next job goes to: the one whose batch is the
-   * closest to full without being full, so a service's four lanes fill
+   * closest to full without being full, so a service's lanes fill
    * before the next is given work; and while every batch is full, the least
    * busy. Several services each get the box's fair share of a core when
    * Postgres keeps every core busy, where one alone fell behind the logins.
@@ -2934,7 +3283,7 @@ export class ConduitWorker {
       if (up && c.down) {
         continue
       }
-      const part: i32 = c.inFlight % BCRYPT_LANES
+      const part: i32 = c.inFlight % this.bcryptWidth
       if (part > bestPart) {
         bestPart = part
         best = k

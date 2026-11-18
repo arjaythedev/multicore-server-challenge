@@ -29,11 +29,14 @@ pub const Loop = struct {
         } else {
             const ep = std.os.linux.EPOLL;
             // A zero-interest epoll registration can still repeatedly report HUP.
-            if (!read and !write) {
+            if (!read and !write and !@import("build_options").epoll_pause) {
                 if (c.epoll_ctl(self.fd, ep.CTL_DEL, fd, null) < 0 and c.errno(@as(c_int, -1)) != .NOENT) return error.EventWatch;
                 return;
             }
-            var event: c.epoll_event = .{ .events = (if (read) ep.IN else @as(u32, 0)) | (if (write) ep.OUT else @as(u32, 0)) | ep.RDHUP, .data = .{ .u64 = token } };
+            // Zero-interest ONESHOT can report HUP/ERR once without spinning.
+            // Keeping the registration avoids DEL + failed MOD + ADD per query.
+            const interests = if (!read and !write) ep.ONESHOT else (if (read) ep.IN else @as(u32, 0)) | (if (write) ep.OUT else @as(u32, 0)) | ep.RDHUP;
+            var event: c.epoll_event = .{ .events = interests, .data = .{ .u64 = token } };
             if (c.epoll_ctl(self.fd, ep.CTL_MOD, fd, &event) < 0) {
                 if (c.errno(@as(c_int, -1)) != .NOENT or c.epoll_ctl(self.fd, ep.CTL_ADD, fd, &event) < 0) return error.EventWatch;
             }

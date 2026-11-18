@@ -17,6 +17,8 @@ pub const Task = struct {
     token: []const u8 = "",
     job: bcrypt.Job = .{},
     needs_hash: bool = false,
+    queued_at: i64 = 0,
+    skip_write_batch: bool = false,
     row: ?pg.User = null,
     status: u16 = 503,
     body: ?[]const u8 = null,
@@ -158,7 +160,7 @@ pub const Task = struct {
     pub fn send(self: *Task, connection: *pg.Conn) !void {
         if (self.operation) |operation| {
             const q = operation.query(self.params[0..self.param_count]);
-            if (operation.kind == .comments) try pg.query(connection, .comments, q.params[0..q.count], null) else try pg.send(connection, q.statement, q.params[0..q.count]);
+            if (operation.kind == .comments) try pg.query(connection, .comments, q.params[0..q.count], null) else try pg.sendOperation(connection, q);
         } else try pg.query(connection, self.route, self.params[0..self.param_count], self.read);
     }
 

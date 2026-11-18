@@ -49,3 +49,28 @@ class OutSuite extends munit.FunSuite:
     out.reset()
     val closing = out.response(alloc, Status.NoContent, Out.Ending.Close)
     assertEquals(closing.toString(US_ASCII), "HTTP/1.1 204 No Content\r\nconnection: close\r\n\r\n")
+
+  test("a round's buffers come back whatever their size, a few at most; a request's only when small"):
+    val pool = Out.Pool()
+    val big = pool.takeRound()
+    big.bytes(new Array[Byte](1024 * 1024))
+    pool.giveRound(big)
+    val again = pool.takeRound()
+    assert(again eq big)
+    assertEquals(again.length, 0)
+    val many = Seq.fill(17)(pool.takeRound())
+    many.foreach(pool.giveRound)
+    assertEquals(Seq.fill(17)(pool.takeRound()).count(o => many.exists(_ eq o)), 16)
+    pool.give(big)
+    assert(pool.take() ne big)
+
+  test("Postgres's text escaped as the byte array's escaping does, eight bytes at a time or one"):
+    val random = scala.util.Random(53)
+    // Every byte that needs escaping, its neighbours, and multi-byte UTF-8's bytes, at every place in and around a word.
+    val alphabet = (0 to 0x22).map(_.toByte) ++ Seq('[', '\\', ']', 'a', '~', 0x7f, 0x80, 0xbf, 0xc3, 0xe2, 0xff).map(_.toByte)
+    for n <- 0 to 40; _ <- 1 to 60 do
+      val bytes = Array.fill(n)(if random.nextInt(4) == 0 then alphabet(random.nextInt(alphabet.length)) else ('a' + random.nextInt(26)).toByte)
+      val from = io.netty.buffer.Unpooled.buffer(n + 3).writeBytes(Array[Byte](1, 2, 3)).writeBytes(bytes)
+      val viaBuf = Out().jsonString(from, 3, n).bodyBytes
+      val viaArray = Out().jsonString(bytes).bodyBytes
+      assertEquals(viaBuf.toSeq, viaArray.toSeq, bytes.toSeq)

@@ -53,12 +53,96 @@ const insert_comment_sql =
     \\ FROM c JOIN users u ON u.id = c.author_id
 ;
 
-pub const Comment = struct { id: i64, body: []const u8, createdAt: []const u8, updatedAt: []const u8, author: profiles.Profile };
+pub const Comment = struct {
+    id: i64,
+    body: []const u8,
+    createdAt: []const u8,
+    updatedAt: []const u8,
+    author: profiles.Profile,
+    encoded: ?struct { bytes: []const u8, flag_offset: usize } = null,
+
+    pub fn jsonStringify(self: Comment, writer: *std.json.Stringify) !void {
+        if (self.encoded) |shared| {
+            try writer.beginWriteRaw();
+            try writer.writer.writeAll(shared.bytes[0..shared.flag_offset]);
+            try writer.writer.writeAll(if (self.author.following) "true" else "false");
+            try writer.writer.writeAll(shared.bytes[shared.flag_offset + 5 ..]);
+            writer.endWriteRaw();
+            return;
+        }
+        try writer.beginObject();
+        inline for (.{ "id", "body", "createdAt", "updatedAt", "author" }) |key| {
+            try writer.objectField(key);
+            try writer.write(@field(self, key));
+        }
+        try writer.endObject();
+    }
+
+    // The complete standard-encoded object and its flag offset belong to the
+    // primary task's arena. Followers finish before that arena is released.
+    pub fn encodeForGroup(self: *Comment, allocator: std.mem.Allocator) !void {
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        defer output.deinit();
+        var writer: std.json.Stringify = .{ .writer = &output.writer };
+        try writer.beginObject();
+        inline for (.{ "id", "body", "createdAt", "updatedAt" }) |key| {
+            try writer.objectField(key);
+            try writer.write(@field(self, key));
+        }
+        try writer.objectField("author");
+        try writer.beginObject();
+        inline for (.{ "username", "bio", "image" }) |key| {
+            try writer.objectField(key);
+            try writer.write(@field(self.author, key));
+        }
+        try writer.objectField("following");
+        try writer.beginWriteRaw();
+        const offset = output.written().len;
+        try output.writer.writeAll("false");
+        writer.endWriteRaw();
+        try writer.endObject();
+        try writer.endObject();
+        self.encoded = .{ .bytes = try output.toOwnedSlice(), .flag_offset = offset };
+    }
+};
+
+test "group comment encoding retains escaping, nulls and each recipient flag" {
+    const allocator = std.testing.allocator;
+    var comment: Comment = .{ .id = 42, .body = "quotes \" slash \\ newline\n é", .createdAt = "2030-01-01T00:00:00.000Z", .updatedAt = "2030-01-01T00:00:00.001Z", .author = .{ .username = "user-é", .bio = null, .image = "image\"\\", .following = false } };
+    try comment.encodeForGroup(allocator);
+    defer allocator.free(comment.encoded.?.bytes);
+    inline for (.{ false, true }) |following| {
+        comment.author.following = following;
+        var plain = comment;
+        plain.encoded = null;
+        const expected = try std.json.Stringify.valueAlloc(allocator, plain, .{});
+        defer allocator.free(expected);
+        const actual = try std.json.Stringify.valueAlloc(allocator, comment, .{});
+        defer allocator.free(actual);
+        try std.testing.expectEqualStrings(expected, actual);
+    }
+}
 pub const Query = struct {
     statement: [:0]const u8,
+    prepared_name: ?[:0]const u8 = null,
     params: [6]?[:0]const u8 = @splat(null),
     count: usize = 0,
 };
+
+pub const prepared = [_]struct { name: [:0]const u8, sql: [:0]const u8 }{
+    .{ .name = "op_insert_article", .sql = "INSERT INTO articles(id,slug,author_id,title,description,body) SELECT n.id, trim(both '-' from lower(regexp_replace($2, '[^A-Za-z0-9]+', '-', 'g'))) || '-' || n.id, $1,$2,$3,$4 FROM (SELECT nextval(pg_get_serial_sequence('articles','id')) AS id) n RETURNING id" },
+    .{ .name = "op_insert_tags", .sql = "INSERT INTO tags(name) SELECT DISTINCT value FROM jsonb_array_elements_text($1::jsonb) ON CONFLICT(name) DO NOTHING" },
+    .{ .name = "op_link_tags", .sql = "INSERT INTO article_tags(article_id,tag_id) SELECT $1::bigint,t.id FROM tags t WHERE t.name IN (SELECT value FROM jsonb_array_elements_text($2::jsonb))" },
+    .{ .name = "op_lookup", .sql = "SELECT id FROM articles WHERE slug = $1" },
+    .{ .name = "op_article", .sql = articles.by_id },
+    .{ .name = "op_update_article", .sql = update_sql },
+    .{ .name = "op_delete_article", .sql = delete_sql },
+    .{ .name = "op_favorite", .sql = favorite_sql },
+    .{ .name = "op_unfavorite", .sql = unfavorite_sql },
+    .{ .name = "op_insert_comment", .sql = insert_comment_sql },
+    .{ .name = "op_delete_comment", .sql = delete_comment_sql },
+};
+
 pub const Operation = struct {
     kind: http.Route,
     stage: enum { begin, insert_article, insert_tags, link_tags, commit, rollback, lookup, mutate, article_row, comment_rows },
@@ -101,25 +185,34 @@ pub const Operation = struct {
         };
         q.count = args.len;
         @memcpy(q.params[0..args.len], args);
+        const prepared_index: ?usize = switch (self.stage) {
+            .begin, .commit, .rollback, .comment_rows => null,
+            .insert_article => 0,
+            .insert_tags => 1,
+            .link_tags => 2,
+            .lookup => 3,
+            .article_row => 4,
+            .mutate => switch (self.kind) {
+                .update_article => 5,
+                .delete_article => 6,
+                .favorite => 7,
+                .unfavorite => 8,
+                .create_comment => 9,
+                .delete_comment => 10,
+                else => unreachable,
+            },
+        };
+        if (prepared_index) |index| {
+            q.statement = prepared[index].sql;
+            q.prepared_name = prepared[index].name;
+            return q;
+        }
         q.statement = switch (self.stage) {
             .begin => "BEGIN",
             .commit => "COMMIT",
             .rollback => "ROLLBACK",
-            .insert_article => "INSERT INTO articles(id,slug,author_id,title,description,body) SELECT n.id, trim(both '-' from lower(regexp_replace($2, '[^A-Za-z0-9]+', '-', 'g'))) || '-' || n.id, $1,$2,$3,$4 FROM (SELECT nextval(pg_get_serial_sequence('articles','id')) AS id) n RETURNING id",
-            .insert_tags => "INSERT INTO tags(name) SELECT DISTINCT value FROM jsonb_array_elements_text($1::jsonb) ON CONFLICT(name) DO NOTHING",
-            .link_tags => "INSERT INTO article_tags(article_id,tag_id) SELECT $1::bigint,t.id FROM tags t WHERE t.name IN (SELECT value FROM jsonb_array_elements_text($2::jsonb))",
-            .lookup => "SELECT id FROM articles WHERE slug = $1",
-            .article_row => articles.by_id,
             .comment_rows => list_comments_sql,
-            .mutate => switch (self.kind) {
-                .update_article => update_sql,
-                .delete_article => delete_sql,
-                .favorite => favorite_sql,
-                .unfavorite => unfavorite_sql,
-                .create_comment => insert_comment_sql,
-                .delete_comment => delete_comment_sql,
-                else => unreachable,
-            },
+            else => unreachable,
         };
         return q;
     }

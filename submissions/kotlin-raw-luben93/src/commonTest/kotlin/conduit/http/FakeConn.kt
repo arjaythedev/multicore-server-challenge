@@ -92,6 +92,9 @@ class FakeConn(val engine: HttpEngine) : HttpConn() {
 
     fun text(): String = lock.locked { written.toByteArray().decodeToString() }
 
+    /** Everything written so far, as bytes (for binary bodies such as gzip). */
+    fun bytes(): ByteArray = lock.locked { written.toByteArray() }
+
     fun responses(): List<Resp> = parseResponses(lock.locked { written.toByteArray() })
 }
 

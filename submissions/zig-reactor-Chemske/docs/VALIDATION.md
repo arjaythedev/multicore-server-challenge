@@ -1,5 +1,21 @@
 # Submission validation
 
+## Closed-result revision — 30 October 2026
+
+[Run 41037586892](https://github.com/Chemske/multicore-server-challenge/actions/runs/41037586892) passed all 27 unit checks, closed profiles, all five page families, disconnected-primary ownership, 256 independent feed comparisons, comment groups, favorite rollback and uncertain-commit handling, fresh cost-ten passwords with independent Go verification, 24 blocked writers and progress on four reactors. Zig and Go each passed all 197 unchanged steps. Nine recovery cases rebuilt all 48 statements across 40 database owners. The separate connection test retained 150,000 sockets and answered each; it is not a workload-user result.
+
+The write recovery harness checks independent owners: successful tag reads establish read recovery, then distinct write probes must recover within ten seconds. Every rejected probe must leave its article absent; a successful probe must be durably present once. This avoids treating one recovered read connection as proof that all write owners have already completed their own reconnect and preparation.
+
+The lost favorite-commit test records request identities from PostgreSQL Bind messages. Its unique viewer cohort must execute exactly once per viewer after all owners recover, including a deliberately separate first-time singleton. This detects replay directly and permits ordinary singleton dispatch under multiple reactors. Counting every single statement as a replay could falsely fail when one reactor received only one request. Native checks and [Linux run 41046946269](https://github.com/Chemske/multicore-server-challenge/actions/runs/41046946269) pass the identity test and nine recovery scenarios across 40 owners, including all 197 unchanged steps, without changing the application runtime.
+
+The final Linux default build uses plain `build.sh` as the unprivileged challenge user. [Run 41045355459](https://github.com/Chemske/multicore-server-challenge/actions/runs/41045355459) repeats the focused matrix, then builds with the shipping defaults and checks four serving reactors, all 197 unchanged steps, mutations and 40-owner recovery. On the independent Oracle target the default build also passed 27 unit checks and all 197 unchanged full-seed checks before the database was reset and performance measurement started. Workload capacity is reported separately in [SCALING.md](SCALING.md).
+
+## Scaling revision — 29 October 2026
+
+The integrated Linux revision passed [run 40961667314](https://github.com/Chemske/multicore-server-challenge/actions/runs/40961667314): 22 unit checks, grouped page/comment faults, mixed bcrypt jobs with Go cross-verification, dedicated-writer isolation, two serving reactors, 150,000 actual HTTP sockets, 15 mutation cases and nine recovery cases. Zig and Go each passed the unchanged 197-step development-seed suite; the suite passed again after database recovery. The larger socket check is separate from workload capacity. Configuration, scope and evidence are recorded in [SCALING.md](SCALING.md).
+
+## Initial submission — 25 October 2026
+
 Checked on 25 October 2026. All commands below use the submitted source and unchanged upstream schema, seeds, test suite and reference implementation. Local helper/proxy tests use disposable database copies.
 
 ## Correctness and failure handling

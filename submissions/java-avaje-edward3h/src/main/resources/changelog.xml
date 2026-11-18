@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+    <!-- Build-time only: kiwiproc validates the SQL in the DAOs against the schema. Never run against the real database. -->
+    <changeSet id="schema" author="conduit">
+        <sqlFile path="schema.sql" relativeToChangelogFile="true" splitStatements="true"/>
+    </changeSet>
+</databaseChangeLog>

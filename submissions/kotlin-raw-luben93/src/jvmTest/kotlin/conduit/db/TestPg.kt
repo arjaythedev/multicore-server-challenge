@@ -30,7 +30,7 @@ internal object TestPg {
     val db: String? by lazy { create() }
 
     fun admin(database: String = "postgres"): PgConn =
-        PgConn.connect(host, port, "postgres", System.getenv("PGPASSWORD") ?: "", database, "", "conduit-test")
+        PgConn.connect(host, port, System.getenv("PGUSER")?.takeIf { it.isNotEmpty() } ?: "postgres", System.getenv("PGPASSWORD") ?: "", database, "", "conduit-test")
 
     fun <T> adminQuery(database: String, sql: String, f: (List<List<String?>>) -> T): T {
         val c = admin(database)

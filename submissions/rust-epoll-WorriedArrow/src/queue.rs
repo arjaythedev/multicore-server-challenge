@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 struct Inner<T> {
     q: VecDeque<T>,
-    /// When the oldest queued item arrived (approximate after a partial take: then it is the take's time).
+    /// When the oldest queued item arrived (after a partial take: when the oldest taken one did, an upper bound).
     since: Option<Instant>,
     /// A `take_aged` waiter's threshold: pushes below it don't wake anyone (the waiter's timer covers the age).
     hold: usize,
@@ -65,19 +65,10 @@ impl<T> Queue<T> {
 
     fn drain(g: &mut Inner<T>, n: usize, out: &mut Vec<T>) {
         out.extend(g.q.drain(..n));
-        g.since = if g.q.is_empty() { None } else { Some(Instant::now()) };
-    }
-
-    /// Blocks until at least one item is queued, then takes up to `max`.
-    pub fn take(&self, max: usize, out: &mut Vec<T>) {
-        let mut g = self.m.lock().unwrap();
-        while g.q.is_empty() {
-            g = self.wait(g);
-        }
-        let n = g.q.len().min(max);
-        Self::drain(&mut g, n, out);
-        if !g.q.is_empty() && g.waiting > 0 {
-            self.cv.notify_one();
+        // Items left behind (a backlog past one batch) keep the old timestamp: they are at least that old already,
+        // so the next take doesn't make them wait another window.
+        if g.q.is_empty() {
+            g.since = None;
         }
     }
 
@@ -140,6 +131,19 @@ impl<T> Queue<T> {
         Self::drain(&mut g, n, out);
         if !g.q.is_empty() && g.waiting > 0 {
             self.cv.notify_one();
+        }
+    }
+
+    /// Takes up to `max` without blocking if the oldest item has waited at least `age`; returns whether it did.
+    pub fn take_if_older(&self, age: Duration, max: usize, out: &mut Vec<T>) -> bool {
+        let mut g = self.m.lock().unwrap();
+        match g.since {
+            Some(t) if t.elapsed() >= age => {
+                let n = g.q.len().min(max);
+                Self::drain(&mut g, n, out);
+                true
+            }
+            _ => false,
         }
     }
 }

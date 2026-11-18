@@ -1,7 +1,8 @@
 // bcrypt off the HTTP workers' event loops: one process that every worker
 // reaches over loopback TCP, which batches up to four hashes or four
-// verifications into one `bcryptHash4` or `bcryptVerify4` call, so one core
-// does four cost-10 hashes in about the time of 1.4 (std/crypto/bcrypt.ts).
+// verifications into one `bcryptHashN` or `bcryptVerifyN` call of `width` lanes,
+// the width `bcryptCalibrate` found fastest on this CPU (BCRYPT_WIDTH in main.ts):
+// on the VM's Xeon five lanes take about 1.9 times one hash's time.
 // A 64 ms batch inside an HTTP worker would hold every connection that worker
 // serves for 64 ms; here it holds only the logins.
 //
@@ -12,8 +13,11 @@
 //   reply    id (u32) · status (1 done or matched, 2 no match, 0 failed) ·
 //            hash length (u8) · the hash (a new one, for op 1)
 //
-// A batch runs once four jobs of one kind wait, or once the oldest has waited
-// `windowMs` (BCRYPT_BATCH_MS, the collection window). Every password is
+// A batch runs once `width` jobs wait, or once the oldest has waited the
+// collection window, `windowMs` (BCRYPT_BATCH_MS). Logins and sign-ups share
+// it: a sign-up's new hash takes a free lane of a login batch, the login
+// checked by hashing its password with its stored hash's salt, so a sign-up
+// costs one lane more instead of a one-lane call of its own. Every password is
 // copied into a fresh array the batch wraps as a `Secret`, and that array
 // and the frame it came in are wiped once the batch has run. Every login
 // verifies against its stored hash, and every hash is cost 10 with a salt
@@ -32,7 +36,7 @@ import {
 } from "nish:net"
 import { monotonicNanos } from "nish:process"
 import { Secret, secret, wipe } from "nish:secret"
-import { bcryptHash4, bcryptVerify4 } from "nish/crypto/bcrypt"
+import { bcryptHashN, bcryptVerifyN } from "nish/crypto/bcrypt"
 
 export const BCRYPT_OP_HASH: i32 = 1
 export const BCRYPT_OP_VERIFY: i32 = 2
@@ -41,6 +45,8 @@ export const BCRYPT_MISMATCH: i32 = 2
 export const BCRYPT_FAILED: i32 = 0
 /** The cost every hash is made with: SPEC.md's. */
 const BCRYPT_COST: i32 = 10
+/** The most jobs one call takes: `bcryptHashN`'s and `bcryptVerifyN`'s lanes. */
+export const BCRYPT_LANES: i32 = 6
 /**
  * The longest password a frame carries: bcrypt reads no more. SPEC.md sets no
  * limit; the server refuses a longer one (422 at sign-up and update, 401 at
@@ -165,15 +171,17 @@ const bcryptRetire = (q: BcryptQueue, n: i32): void => {
   q.count -= n
 }
 
-/** Hashes the oldest `n` (1 to 4) jobs of `q` in one call and replies to each. */
+/** Hashes the oldest `n` (1 to 6) jobs of `q` in one call and replies to each. */
 const bcryptRunHash = (peers: BcryptPeer[], q: BcryptQueue, n: i32): void => {
   const p0: Secret<u8[]> = secret(bcryptCopy(q.password[q.head], q.passwordLength[q.head]))
   const p1: Secret<u8[]> | null = bcryptLane(q, n, 1)
   const p2: Secret<u8[]> | null = bcryptLane(q, n, 2)
   const p3: Secret<u8[]> | null = bcryptLane(q, n, 3)
-  const salts: u8[] = new Array<u8>(64)
+  const p4: Secret<u8[]> | null = bcryptLane(q, n, 4)
+  const p5: Secret<u8[]> | null = bcryptLane(q, n, 5)
+  const salts: u8[] = new Array<u8>(96)
   crypto.getRandomValues(salts)
-  const made: Result<string[], string> = bcryptHash4(p0, p1, p2, p3, salts, BCRYPT_COST)
+  const made: Result<string[], string> = bcryptHashN(p0, p1, p2, p3, p4, p5, salts, BCRYPT_COST)
   wipe(p0)
   if (p1 !== null) {
     wipe(p1)
@@ -183,6 +191,12 @@ const bcryptRunHash = (peers: BcryptPeer[], q: BcryptQueue, n: i32): void => {
   }
   if (p3 !== null) {
     wipe(p3)
+  }
+  if (p4 !== null) {
+    wipe(p4)
+  }
+  if (p5 !== null) {
+    wipe(p5)
   }
   for (let k: i32 = 0; k < n; k++) {
     if (made.isErr()) {
@@ -194,11 +208,11 @@ const bcryptRunHash = (peers: BcryptPeer[], q: BcryptQueue, n: i32): void => {
   bcryptRetire(q, n)
 }
 
-/** Verifies the oldest `n` (1 to 4) jobs of `q` against their hashes in one call and replies to each. */
+/** Verifies the oldest `n` (1 to 6) jobs of `q` against their hashes in one call and replies to each. */
 const bcryptRunVerify = (peers: BcryptPeer[], q: BcryptQueue, n: i32): void => {
   const hashes: string[] = []
-  for (let k: i32 = 0; k < 4; k++) {
-    // An empty lane repeats lane 0's hash, which bcryptVerify4 does not read.
+  for (let k: i32 = 0; k < BCRYPT_LANES; k++) {
+    // An empty lane repeats lane 0's hash, which bcryptVerifyN does not read.
     const at: i32 = q.at(k < n ? k : 0)
     hashes.push(String.fromBytes(q.hash[at], 0, q.hashLength[at]))
   }
@@ -206,7 +220,9 @@ const bcryptRunVerify = (peers: BcryptPeer[], q: BcryptQueue, n: i32): void => {
   const p1: Secret<u8[]> | null = bcryptLane(q, n, 1)
   const p2: Secret<u8[]> | null = bcryptLane(q, n, 2)
   const p3: Secret<u8[]> | null = bcryptLane(q, n, 3)
-  const checked: Result<boolean[], string> = bcryptVerify4(p0, p1, p2, p3, hashes)
+  const p4: Secret<u8[]> | null = bcryptLane(q, n, 4)
+  const p5: Secret<u8[]> | null = bcryptLane(q, n, 5)
+  const checked: Result<boolean[], string> = bcryptVerifyN(p0, p1, p2, p3, p4, p5, hashes)
   wipe(p0)
   if (p1 !== null) {
     wipe(p1)
@@ -216,6 +232,12 @@ const bcryptRunVerify = (peers: BcryptPeer[], q: BcryptQueue, n: i32): void => {
   }
   if (p3 !== null) {
     wipe(p3)
+  }
+  if (p4 !== null) {
+    wipe(p4)
+  }
+  if (p5 !== null) {
+    wipe(p5)
   }
   if (checked.isErr() && n > 1) {
     // One malformed stored hash fails the whole call: verify each alone, so
@@ -232,14 +254,158 @@ const bcryptRunVerify = (peers: BcryptPeer[], q: BcryptQueue, n: i32): void => {
   bcryptRetire(q, n)
 }
 
+/** The sextet bcrypt's base64 (`./A-Za-z0-9`) gives character `c`, or -1. */
+const bcryptSextet = (c: i32): i32 => {
+  if (c === 46 || c === 47) {
+    return c - 46
+  }
+  if (c >= 65 && c <= 90) {
+    return c - 63
+  }
+  if (c >= 97 && c <= 122) {
+    return c - 69
+  }
+  if (c >= 48 && c <= 57) {
+    return c + 6
+  }
+  return -1
+}
+
+/**
+ * Whether job `at` of `q`, a login, can be checked by hashing its password
+ * with its stored hash's salt in a `bcryptHashN` call: a 60-character
+ * `$2b$10$` or `$2y$10$` hash, or a `$2a$10$` one with an ASCII password
+ * (`$2a$` differs from `$2b$` only for bytes above 0x7f), with a salt in
+ * bcrypt's alphabet. Its salt's 16 bytes go to `salts[16 * lane]`.
+ */
+const bcryptRideSalt = (q: BcryptQueue, at: i32, salts: u8[], lane: i32): boolean => {
+  const h: u8[] = q.hash[at]
+  if (q.hashLength[at] !== 60 || toI32(h.length) < 60) {
+    return false
+  }
+  const minor: i32 = toI32(h[2])
+  if (toI32(h[0]) !== 36 || toI32(h[1]) !== 50 || toI32(h[3]) !== 36 || toI32(h[4]) !== 49 || toI32(h[5]) !== 48 || toI32(h[6]) !== 36) {
+    return false
+  }
+  if (minor === 97) {
+    const pw: u8[] = q.password[at]
+    for (let k: i32 = 0; k < q.passwordLength[at] && k < toI32(pw.length); k++) {
+      if (toI32(pw[k]) > 127) {
+        return false
+      }
+    }
+  } else if (minor !== 98 && minor !== 121) {
+    return false
+  }
+  // BF_decode of the 22 salt characters: 16 bytes, the last character's top two bits.
+  const sx: i32[] = new Array<i32>(22)
+  for (let k: i32 = 0; k < 22; k++) {
+    sx[k] = bcryptSextet(toI32(h[7 + k]))
+    if (sx[k] < 0) {
+      return false
+    }
+  }
+  const o: i32 = 16 * lane
+  let src: i32 = 0
+  let d: i32 = 0
+  while (d + 2 < 15) {
+    salts[o + d] = toU8((sx[src] << 2) | ((sx[src + 1] & 0x30) >> 4))
+    salts[o + d + 1] = toU8(((sx[src + 1] & 0x0f) << 4) | ((sx[src + 2] & 0x3c) >> 2))
+    salts[o + d + 2] = toU8(((sx[src + 2] & 0x03) << 6) | sx[src + 3])
+    src += 4
+    d += 3
+  }
+  salts[o + 15] = toU8((sx[20] << 2) | ((sx[21] & 0x30) >> 4))
+  return true
+}
+
+/** Whether `made`'s digest (its last 31 characters) is job `at`'s stored one, compared in constant time. */
+const bcryptSameDigest = (made: string, q: BcryptQueue, at: i32): boolean => {
+  const h: u8[] = q.hash[at]
+  if (toI32(made.length) !== 60) {
+    return false
+  }
+  let diff: i32 = 0
+  for (let k: i32 = 29; k < 60; k++) {
+    diff = diff | (toI32(made.charCodeAt(k)) ^ toI32(h[k]))
+  }
+  return diff === 0
+}
+
+/** Job `at` of `q`'s password as a fresh `Secret`, or null for a lane past the batch. */
+const bcryptSecretAt = (q: BcryptQueue, at: i32, used: boolean): Secret<u8[]> | null =>
+  used ? secret(bcryptCopy(q.password[at], q.passwordLength[at])) : null
+
+/**
+ * The oldest `nv` logins of `verifies` and the oldest `nh` sign-ups of
+ * `hashes` in one `bcryptHashN` call of `nv + nh` lanes (1 to 6): each login
+ * is hashed with its stored hash's salt and matches when the digest is the
+ * stored one, which is what `bcryptVerify` checks; each sign-up gets a fresh
+ * salt. A sign-up costs a login batch one more lane (about 7 ms at cost 10)
+ * instead of a call of its own (about 58 ms). False, with nothing run, when
+ * a login cannot be checked that way (`bcryptRideSalt`).
+ */
+const bcryptRunMixed = (peers: BcryptPeer[], verifies: BcryptQueue, nv: i32, hashes: BcryptQueue, nh: i32): boolean => {
+  const salts: u8[] = new Array<u8>(96)
+  crypto.getRandomValues(salts)
+  for (let k: i32 = 0; k < nv; k++) {
+    if (!bcryptRideSalt(verifies, verifies.at(k), salts, k)) {
+      return false
+    }
+  }
+  const n: i32 = nv + nh
+  const ats: i32[] = new Array<i32>(BCRYPT_LANES)
+  for (let k: i32 = 0; k < BCRYPT_LANES; k++) {
+    ats[k] = k < nv ? verifies.at(k) : k < n ? hashes.at(k - nv) : 0
+  }
+  const p0: Secret<u8[]> = secret(
+    nv > 0 ? bcryptCopy(verifies.password[ats[0]], verifies.passwordLength[ats[0]]) : bcryptCopy(hashes.password[ats[0]], hashes.passwordLength[ats[0]])
+  )
+  const p1: Secret<u8[]> | null = bcryptSecretAt(1 < nv ? verifies : hashes, ats[1], 1 < n)
+  const p2: Secret<u8[]> | null = bcryptSecretAt(2 < nv ? verifies : hashes, ats[2], 2 < n)
+  const p3: Secret<u8[]> | null = bcryptSecretAt(3 < nv ? verifies : hashes, ats[3], 3 < n)
+  const p4: Secret<u8[]> | null = bcryptSecretAt(4 < nv ? verifies : hashes, ats[4], 4 < n)
+  const p5: Secret<u8[]> | null = bcryptSecretAt(5 < nv ? verifies : hashes, ats[5], 5 < n)
+  const made: Result<string[], string> = bcryptHashN(p0, p1, p2, p3, p4, p5, salts, BCRYPT_COST)
+  wipe(p0)
+  if (p1 !== null) {
+    wipe(p1)
+  }
+  if (p2 !== null) {
+    wipe(p2)
+  }
+  if (p3 !== null) {
+    wipe(p3)
+  }
+  if (p4 !== null) {
+    wipe(p4)
+  }
+  if (p5 !== null) {
+    wipe(p5)
+  }
+  wipe(salts)
+  if (made.isErr()) {
+    return false
+  }
+  for (let k: i32 = 0; k < nv; k++) {
+    bcryptReply(peers, verifies, ats[k], bcryptOutcome(bcryptSameDigest(made.value[k], verifies, ats[k])), "")
+  }
+  for (let k: i32 = nv; k < n; k++) {
+    bcryptReply(peers, hashes, ats[k], BCRYPT_DONE, made.value[k])
+  }
+  bcryptRetire(verifies, nv)
+  bcryptRetire(hashes, nh)
+  return true
+}
+
 /** Verifies job `at` of `q` alone. */
 const bcryptRunVerifyOne = (peers: BcryptPeer[], q: BcryptQueue, at: i32): void => {
   const hashes: string[] = []
-  for (let k: i32 = 0; k < 4; k++) {
+  for (let k: i32 = 0; k < BCRYPT_LANES; k++) {
     hashes.push(String.fromBytes(q.hash[at], 0, q.hashLength[at]))
   }
   const p0: Secret<u8[]> = secret(bcryptCopy(q.password[at], q.passwordLength[at]))
-  const checked: Result<boolean[], string> = bcryptVerify4(p0, null, null, null, hashes)
+  const checked: Result<boolean[], string> = bcryptVerifyN(p0, null, null, null, null, null, hashes)
   wipe(p0)
   const status: i32 = checked.isErr() ? BCRYPT_FAILED : bcryptOutcome(checked.value[0])
   bcryptReply(peers, q, at, status, "")
@@ -342,19 +508,27 @@ const bcryptForget = (q: BcryptQueue, p: i32): void => {
   }
 }
 
-/** How many of `q`'s jobs a batch takes now: up to 4, or none while fewer wait and the oldest is inside the window. */
-const bcryptDue = (q: BcryptQueue, now: i64, windowNs: i64): i32 => {
-  if (q.count === 0) {
+/**
+ * How many jobs a batch of logins and sign-ups together takes now, logins
+ * first: up to `width` once that many wait, all of them once the oldest of
+ * either has waited `windowNs`, and none before.
+ */
+const bcryptDueMixed = (verifies: BcryptQueue, hashes: BcryptQueue, now: i64, windowNs: i64, width: i32): i32 => {
+  const n: i32 = verifies.count + hashes.count
+  if (n === 0) {
     return 0
   }
-  if (q.count >= 4) {
-    return 4
+  if (n >= width) {
+    return width
   }
-  return now - q.since[q.head] >= windowNs ? q.count : 0
+  const oldest: boolean =
+    (verifies.count > 0 && now - verifies.since[verifies.head] >= windowNs) ||
+    (hashes.count > 0 && now - hashes.since[hashes.head] >= windowNs)
+  return oldest ? n : 0
 }
 
 /** Serves the workers on `listener` until the process is stopped. Answers only on a failure to poll. */
-export const runBcryptService = (listener: i32, windowMs: i32): i32 => {
+export const runBcryptService = (listener: i32, windowMs: i32, width: i32): i32 => {
   const loop: i32 = pollCreate()
   if (loop < 0 || pollAdd(loop, listener, 1, BCRYPT_LISTENER) < 0) {
     return 1
@@ -441,16 +615,23 @@ export const runBcryptService = (listener: i32, windowMs: i32): i32 => {
         }
       }
     }
-    // Run every batch that is due, then send the replies.
-    let due: i32 = bcryptDue(hashes, monotonicNanos(), windowNs)
+    // Run every batch that is due, then send the replies. A login batch
+    // takes the sign-ups waiting into its free lanes; a sign-up waits as long
+    // as a login does for that, and runs alone (in batches of its own) only
+    // when no login batch came due in time.
+    let due: i32 = bcryptDueMixed(verifies, hashes, monotonicNanos(), windowNs, width)
     while (due > 0) {
-      bcryptRunHash(peers, hashes, due)
-      due = bcryptDue(hashes, monotonicNanos(), windowNs)
-    }
-    due = bcryptDue(verifies, monotonicNanos(), windowNs)
-    while (due > 0) {
-      bcryptRunVerify(peers, verifies, due)
-      due = bcryptDue(verifies, monotonicNanos(), windowNs)
+      const nv: i32 = due < verifies.count ? due : verifies.count
+      const nh: i32 = due - nv
+      if (nv === 0 || !bcryptRunMixed(peers, verifies, nv, hashes, nh)) {
+        if (nv > 0) {
+          bcryptRunVerify(peers, verifies, nv)
+        }
+        if (nh > 0) {
+          bcryptRunHash(peers, hashes, nh)
+        }
+      }
+      due = bcryptDueMixed(verifies, hashes, monotonicNanos(), windowNs, width)
     }
     for (let p: i32 = 0; p < BCRYPT_CLIENTS; p++) {
       const peer: BcryptPeer = peers[p]

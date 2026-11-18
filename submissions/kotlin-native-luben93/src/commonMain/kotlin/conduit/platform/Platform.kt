@@ -63,9 +63,15 @@ inline fun <T> Monitor.locked(block: () -> T): T {
     }
 }
 
+/** [BlockingSocket.read] waited longer than the socket's receive timeout without a byte arriving (not a failure by itself). */
+class SocketReadTimeout(message: String) : RuntimeException(message)
+
 /** A blocking TCP client socket with TCP_NODELAY (the Postgres connections; one reader thread each). */
 expect class BlockingSocket {
-    /** Reads up to [len] bytes; blocks until at least one byte arrives. Returns -1 at EOF. Throws on error. */
+    /**
+     * Reads up to [len] bytes; blocks until at least one byte arrives. Returns -1 at EOF. Throws on error, and
+     * [SocketReadTimeout] when the socket has a receive timeout and it expired (the socket stays usable).
+     */
     fun read(b: ByteArray, off: Int, len: Int): Int
 
     /** Writes all [len] bytes, blocking as needed. Throws on error. */

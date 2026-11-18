@@ -12,6 +12,8 @@ type HmacSha256 = Hmac<Sha256>;
 pub const INT8: u32 = 20;
 pub const TEXT: u32 = 25;
 pub const INT8_ARRAY: u32 = 1016;
+pub const INT4: u32 = 23;
+pub const INT4_ARRAY: u32 = 1007;
 pub const TEXT_ARRAY: u32 = 1009;
 
 #[derive(Debug)]
@@ -211,6 +213,11 @@ impl ArrayBuf {
         self.buf.extend_from_slice(&v.to_be_bytes());
         self.count += 1;
     }
+    pub fn i32(&mut self, v: i32) {
+        self.buf.extend_from_slice(&4i32.to_be_bytes());
+        self.buf.extend_from_slice(&v.to_be_bytes());
+        self.count += 1;
+    }
     pub fn text(&mut self, s: &[u8]) {
         self.buf.extend_from_slice(&(s.len() as i32).to_be_bytes());
         self.buf.extend_from_slice(s);
@@ -232,8 +239,62 @@ pub struct Col {
 
 /// Results of one statement in a pipeline.
 pub struct StmtResult {
-    pub rows: Vec<Vec<Col>>,
+    pub rows: Rows,
     pub error: Option<DbError>,
+}
+
+/// A statement's rows, all columns in one array (one allocation per statement rather than per row).
+#[derive(Default)]
+pub struct Rows {
+    cols: Vec<Col>,
+    ncols: usize,
+    nrows: usize,
+}
+
+impl Rows {
+    pub fn len(&self) -> usize {
+        self.nrows
+    }
+    pub fn first(&self) -> Option<&[Col]> {
+        if self.nrows > 0 { Some(&self.cols[..self.ncols]) } else { None }
+    }
+    pub fn iter(&self) -> RowIter<'_> {
+        RowIter { rows: self, i: 0 }
+    }
+}
+
+impl std::ops::Index<usize> for Rows {
+    type Output = [Col];
+    fn index(&self, i: usize) -> &[Col] {
+        assert!(i < self.nrows);
+        &self.cols[i * self.ncols..(i + 1) * self.ncols]
+    }
+}
+
+pub struct RowIter<'a> {
+    rows: &'a Rows,
+    i: usize,
+}
+
+impl<'a> Iterator for RowIter<'a> {
+    type Item = &'a [Col];
+    fn next(&mut self) -> Option<&'a [Col]> {
+        if self.i >= self.rows.nrows {
+            return None;
+        }
+        let n = self.rows.ncols;
+        let r = &self.rows.cols[self.i * n..(self.i + 1) * n];
+        self.i += 1;
+        Some(r)
+    }
+}
+
+impl<'a> IntoIterator for &'a Rows {
+    type Item = &'a [Col];
+    type IntoIter = RowIter<'a>;
+    fn into_iter(self) -> RowIter<'a> {
+        self.iter()
+    }
 }
 
 /// The decoded output of a whole pipeline (everything up to ReadyForQuery). Column values point into `data`.
@@ -322,7 +383,7 @@ impl Conn {
     pub fn connect(cfg: &Config) -> Result<Conn> {
         let stream = TcpStream::connect((cfg.host.as_str(), cfg.port))?;
         stream.set_nodelay(true)?;
-        let mut c = Conn { stream, rbuf: vec![0; 64 * 1024], rpos: 0, rend: 0, out: Out::default() };
+        let mut c = Conn { stream, rbuf: vec![0; 1 << 20], rpos: 0, rend: 0, out: Out::default() };
         // StartupMessage
         let mut m = Vec::new();
         m.extend_from_slice(&0i32.to_be_bytes());
@@ -331,7 +392,8 @@ impl Conn {
         // ("auto") keeps re-planning them per execution because a custom plan looks cheaper for each array. jit: a
         // generic plan can't see LIMIT values or array sizes, its cost estimate crosses jit_above_cost, and compiling
         // costs milliseconds per execution of a sub-millisecond statement. max_parallel_workers_per_gather: a generic
-        // plan can't see how small a batch's arrays are; parallel workers would only add startup cost.
+        // plan can't see how small a batch's arrays are; parallel workers would only add startup cost. enable_memoize: the generic plans of the tag and favorited
+        // lists put a Memoize over their article join, whose keys are distinct anyway; without it they ran 5-45% faster on an aged database.
         for (k, v) in [
             ("user", cfg.user.as_str()),
             ("database", cfg.dbname.as_str()),
@@ -340,6 +402,7 @@ impl Conn {
             ("plan_cache_mode", "force_generic_plan"),
             ("jit", "off"),
             ("max_parallel_workers_per_gather", "0"),
+            ("enable_memoize", "off"),
         ] {
             m.extend_from_slice(k.as_bytes());
             m.push(0);
@@ -503,15 +566,28 @@ impl Conn {
     /// Reads results until ReadyForQuery. One StmtResult per Execute (and per Describe/Parse pair is ignored).
     /// `n_exec` = how many Execute messages were sent, so skipped statements after an error still get a slot.
     pub fn read_pipeline(&mut self, n_exec: usize) -> Result<Pipeline> {
-        let mut data = Vec::with_capacity(4096);
-        let mut results: Vec<StmtResult> = Vec::with_capacity(n_exec);
-        let mut cur: Vec<Vec<Col>> = Vec::new();
+        let mut p = Pipeline { data: Vec::with_capacity(4096), results: Vec::with_capacity(n_exec) };
+        self.read_pipeline_into(&mut p, n_exec)?;
+        Ok(p)
+    }
+
+    /// Reads the results of `n_exec` more executions, up to their ReadyForQuery, appending to `p`.
+    pub fn read_pipeline_into(&mut self, p: &mut Pipeline, n_exec: usize) -> Result<()> {
+        let n_exec = p.results.len() + n_exec;
+        let data = &mut p.data;
+        let results = &mut p.results;
+        let mut cur = Rows::default();
         loop {
             let (tag, body) = self.read_msg()?;
             match tag {
                 b'D' => {
                     let n = u16::from_be_bytes(body[0..2].try_into().unwrap()) as usize;
-                    let mut cols = Vec::with_capacity(n);
+                    if cur.nrows == 0 {
+                        cur.ncols = n;
+                    } else if n != cur.ncols {
+                        return Err(Error::Protocol("rows of one statement differ in width".into()));
+                    }
+                    let cols = &mut cur.cols;
                     let mut p = 2;
                     for _ in 0..n {
                         let len = i32::from_be_bytes(body[p..p + 4].try_into().unwrap());
@@ -525,11 +601,11 @@ impl Conn {
                             cols.push(Col { start, len });
                         }
                     }
-                    cur.push(cols);
+                    cur.nrows += 1;
                 }
                 b'C' => results.push(StmtResult { rows: std::mem::take(&mut cur), error: None }),
                 b'E' => results.push(StmtResult { rows: std::mem::take(&mut cur), error: Some(parse_error(body)) }),
-                b'I' => results.push(StmtResult { rows: Vec::new(), error: None }),
+                b'I' => results.push(StmtResult { rows: Rows::default(), error: None }),
                 b'Z' => break,
                 b'1' | b'2' | b'3' | b'n' | b't' | b'T' | b'N' | b'S' | b'A' | b's' => {}
                 other => return Err(Error::Protocol(format!("unexpected message {:?}", other as char))),
@@ -538,11 +614,11 @@ impl Conn {
         // Statements skipped after an error report nothing; mark them as failed too.
         while results.len() < n_exec {
             results.push(StmtResult {
-                rows: Vec::new(),
+                rows: Rows::default(),
                 error: Some(DbError { code: "skipped".into(), message: "skipped after an earlier error".into() }),
             });
         }
-        Ok(Pipeline { data, results })
+        Ok(())
     }
 
     /// Prepares named statements (Parse + Sync), failing on the first error.

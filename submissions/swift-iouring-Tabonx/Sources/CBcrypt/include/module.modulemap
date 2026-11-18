@@ -1,0 +1,4 @@
+module CBcrypt {
+    header "bcrypt.h"
+    export *
+}

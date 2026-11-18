@@ -1,0 +1,172 @@
+-- The C the server calls into: sockets, epoll and processes from libc, libpq (only to log in and prepare the
+-- statements), OpenSSL's HMAC and ISA-L's igzip. Opaque C types (PGconn, PGresult, ...) are plain pointers here.
+require 'C.stdlib'
+require 'C.string'
+require 'C.stdio'
+require 'C.errno'
+require 'C.time'
+
+## cincdir '/usr/include/postgresql'
+## cinclude '<libpq-fe.h>'
+## cinclude '<openssl/evp.h>'
+## cinclude '<openssl/hmac.h>'
+## cinclude '<openssl/crypto.h>'
+## cinclude '<isa-l/igzip_lib.h>'
+## cinclude '<sys/socket.h>'
+## cinclude '<netdb.h>'
+## cinclude '<netinet/in.h>'
+## cinclude '<netinet/tcp.h>'
+## cinclude '<sys/epoll.h>'
+## cinclude '<sys/resource.h>'
+## cinclude '<sys/prctl.h>'
+## cinclude '<sys/wait.h>'
+## cinclude '<signal.h>'
+## cinclude '<unistd.h>'
+## cinclude '<fcntl.h>'
+## cinclude '<sched.h>'
+## cinclude '<sys/un.h>'
+## cinclude '<sys/random.h>'
+## cinclude '<poll.h>'
+## linklib 'pq'
+## linklib 'crypto'
+## linklib 'isal'
+
+-- libc
+
+global EAGAIN: cint <cimport, nodecl>
+global EINTR: cint <cimport, nodecl>
+
+global sockaddr: type <cimport, nodecl, ctypedef> = @record{sa_family: cushort}
+global addrinfo: type <cimport, nodecl, ctypedef> = @record{
+  ai_flags: cint, ai_family: cint, ai_socktype: cint, ai_protocol: cint,
+  ai_addrlen: cuint, ai_addr: *sockaddr, ai_canonname: cstring, ai_next: pointer
+}
+global AF_UNSPEC: cint <cimport, nodecl>
+global SOCK_STREAM: cint <cimport, nodecl>
+global SOCK_NONBLOCK: cint <cimport, nodecl>
+global SOCK_CLOEXEC: cint <cimport, nodecl>
+global AI_PASSIVE: cint <cimport, nodecl>
+global SOL_SOCKET: cint <cimport, nodecl>
+global SO_REUSEADDR: cint <cimport, nodecl>
+global SO_REUSEPORT: cint <cimport, nodecl>
+global SO_SNDBUF: cint <cimport, nodecl>
+global SO_RCVBUF: cint <cimport, nodecl>
+global IPPROTO_TCP: cint <cimport, nodecl>
+global TCP_NODELAY: cint <cimport, nodecl>
+global TCP_QUICKACK: cint <cimport, nodecl>
+global TCP_DEFER_ACCEPT: cint <cimport, nodecl>
+global MSG_NOSIGNAL: cint <cimport, nodecl>
+global function getaddrinfo(node: cstring, service: cstring, hints: *addrinfo, res: **addrinfo): cint <cimport, nodecl> end
+global function freeaddrinfo(res: *addrinfo): void <cimport, nodecl> end
+global function gai_strerror(code: cint): cstring <cimport, nodecl> end
+global function socket(domain: cint, kind: cint, protocol: cint): cint <cimport, nodecl> end
+global function setsockopt(fd: cint, level: cint, name: cint, value: pointer, len: cuint): cint <cimport, nodecl> end
+global function bind(fd: cint, addr: *sockaddr, len: cuint): cint <cimport, nodecl> end
+global function listen(fd: cint, backlog: cint): cint <cimport, nodecl> end
+global function accept4(fd: cint, addr: pointer, len: pointer, flags: cint): cint <cimport, nodecl> end
+global function recv(fd: cint, buf: pointer, n: csize, flags: cint): isize <cimport, nodecl> end
+global function send(fd: cint, buf: pointer, n: csize, flags: cint): isize <cimport, nodecl> end
+global function close(fd: cint): cint <cimport, nodecl> end
+global function fcntl(fd: cint, cmd: cint, ...: cvarargs): cint <cimport, nodecl> end
+global F_GETFL: cint <cimport, nodecl>
+global F_SETFL: cint <cimport, nodecl>
+global O_NONBLOCK: cint <cimport, nodecl>
+global function memmem(hay: pointer, haylen: csize, needle: pointer, needlelen: csize): pointer <cimport, nodecl> end
+global function sysconf(name: cint): clong <cimport, nodecl> end
+global function usleep(us: cuint): cint <cimport, nodecl> end
+global _SC_NPROCESSORS_ONLN: cint <cimport, nodecl>
+global CLOCK_MONOTONIC: cint <cimport, nodecl>
+global CLOCK_MONOTONIC_COARSE: cint <cimport, nodecl>
+global function clock_gettime(clock: cint, ts: *C.timespec): cint <cimport, nodecl> end
+
+global epoll_data_t: type <cimport, nodecl> = @union{ptr: pointer, fd: cint, u32: uint32, u64: uint64}
+## if ccinfo.is_x86_64 then -- glibc packs it there (12 bytes, 16 elsewhere)
+global epoll_event: type <cimport, nodecl, ctypedef, packed> = @record{events: uint32, data: epoll_data_t}
+## else
+global epoll_event: type <cimport, nodecl, ctypedef> = @record{events: uint32, data: epoll_data_t}
+## end
+global EPOLLIN: uint32 <cimport, nodecl>
+global EPOLLOUT: uint32 <cimport, nodecl>
+global EPOLL_CTL_ADD: cint <cimport, nodecl>
+global EPOLL_CTL_MOD: cint <cimport, nodecl>
+global EPOLL_CTL_DEL: cint <cimport, nodecl>
+global function epoll_create1(flags: cint): cint <cimport, nodecl> end
+global function epoll_ctl(epfd: cint, op: cint, fd: cint, ev: *epoll_event): cint <cimport, nodecl> end
+global function epoll_wait(epfd: cint, evs: *epoll_event, max: cint, timeout: cint): cint <cimport, nodecl> end
+
+global rlimit: type <cimport, nodecl, ctypedef> = @record{rlim_cur: culong, rlim_max: culong}
+global RLIMIT_NOFILE: cint <cimport, nodecl>
+global function getrlimit(resource: cint, rl: *rlimit): cint <cimport, nodecl> end
+global function setrlimit(resource: cint, rl: *rlimit): cint <cimport, nodecl> end
+
+-- The CPUs this process may run on: the mask is a plain array of 64-bit words (cpu_set_t's layout)
+global function sched_getaffinity(pid: cint, size: csize, mask: pointer): cint <cimport, nodecl> end
+
+-- bcrypt helpers: a datagram socket they share and each process's to it, the token pipe, low priority, salts;
+-- the stream socket pairs between the workers and the database process
+global sockaddr_un: type <cimport, nodecl, ctypedef> = @record{sun_family: cushort, sun_path: [108]cchar}
+global AF_UNIX: cint <cimport, nodecl>
+global SOCK_DGRAM: cint <cimport, nodecl>
+global MSG_DONTWAIT: cint <cimport, nodecl>
+global PRIO_PROCESS: cint <cimport, nodecl>
+global function connect(fd: cint, addr: *sockaddr, len: cuint): cint <cimport, nodecl> end
+global function socketpair(domain: cint, kind: cint, protocol: cint, fds: *[2]cint): cint <cimport, nodecl> end
+global function getsockname(fd: cint, addr: *sockaddr, len: *cuint): cint <cimport, nodecl> end
+global function sendto(fd: cint, buf: pointer, n: csize, flags: cint, addr: *sockaddr, len: cuint): isize <cimport, nodecl> end
+global function recvfrom(fd: cint, buf: pointer, n: csize, flags: cint, addr: *sockaddr, len: *cuint): isize <cimport, nodecl> end
+global function pipe(fds: *[2]cint): cint <cimport, nodecl> end
+global function read(fd: cint, buf: pointer, n: csize): isize <cimport, nodecl> end
+global function write(fd: cint, buf: pointer, n: csize): isize <cimport, nodecl> end
+global pollfd: type <cimport, nodecl, ctypedef> = @record{fd: cint, events: cshort, revents: cshort}
+global POLLIN: cshort <cimport, nodecl>
+global function poll(fds: *pollfd, n: culong, timeout: cint): cint <cimport, nodecl> end
+global function setpriority(which: cint, who: cuint, prio: cint): cint <cimport, nodecl> end
+global function getrandom(buf: pointer, n: csize, flags: cuint): isize <cimport, nodecl> end
+
+global SIGKILL: cint <cimport, nodecl>
+global PR_SET_PDEATHSIG: cint <cimport, nodecl>
+global function fork(): cint <cimport, nodecl> end
+global function getppid(): cint <cimport, nodecl> end
+global function waitpid(pid: cint, status: *cint, options: cint): cint <cimport, nodecl> end
+global function kill(pid: cint, sig: cint): cint <cimport, nodecl> end
+global function prctl(option: cint, arg: culong, ...: cvarargs): cint <cimport, nodecl> end
+
+-- libpq
+
+global CONNECTION_OK: cint <cimport, nodecl>
+global PGRES_COMMAND_OK: cint <cimport, nodecl>
+global function PQconnectdbParams(keywords: pointer, values: pointer, expand_dbname: cint): pointer <cimport, nodecl> end
+global function PQstatus(conn: pointer): cint <cimport, nodecl> end
+global function PQerrorMessage(conn: pointer): cstring <cimport, nodecl> end
+global function PQfinish(conn: pointer): void <cimport, nodecl> end
+global function PQprepare(conn: pointer, name: cstring, query: cstring, nparams: cint, types: pointer): pointer <cimport, nodecl> end
+global function PQsocket(conn: pointer): cint <cimport, nodecl> end
+global function PQresultStatus(res: pointer): cint <cimport, nodecl> end
+global function PQresultErrorMessage(res: pointer): cstring <cimport, nodecl> end
+global function PQclear(res: pointer): void <cimport, nodecl> end
+
+-- OpenSSL, ISA-L
+
+global function EVP_sha256(): pointer <cimport, nodecl> end
+global function HMAC(md: pointer, key: pointer, keylen: cint, data: pointer, n: csize, out: pointer,
+  outlen: *cuint): pointer <cimport, nodecl> end
+global function CRYPTO_memcmp(a: pointer, b: pointer, n: csize): cint <cimport, nodecl> end
+
+global isal_zstream: type <cimport, nodecl, ctypedef, cincomplete> = @record{
+  next_in: pointer, avail_in: uint32, total_in: uint32,
+  next_out: pointer, avail_out: uint32, total_out: uint32,
+  level: uint32, level_buf_size: uint32, level_buf: pointer,
+  end_of_stream: uint16, gzip_flag: uint16
+}
+global ISAL_DEF_LVL0_DEFAULT: cint <cimport, nodecl>
+global IGZIP_GZIP: cint <cimport, nodecl>
+global COMP_OK: cint <cimport, nodecl>
+global function isal_deflate_stateless_init(s: *isal_zstream): void <cimport, nodecl> end
+global function isal_deflate_stateless(s: *isal_zstream): cint <cimport, nodecl> end
+
+-- Bytes: raw memory indexed like a C array.
+global Bytes: type = @*[0]byte
+
+global function cbytes(s: cstring): Bytes
+  return (@Bytes)(s)
+end

@@ -33,7 +33,7 @@ object Settings:
   /** The most writes in one transaction ([[WriteGroup]]); 1: each its own. */
   val writeGroupSize: Int = int("conduit.writeGroupSize", 128)
   /** A read connection takes queries only when it has none in flight, and then every read that waits, each kind's
-    * together ([[PgPool]]): one round of statements in flight per connection, so that the reads that arrive meanwhile
+    * together ([[PgReads]]): one round of statements in flight per connection, so that the reads that arrive meanwhile
     * go out in batches. 3-8% less CPU per request than 16 queries in flight per connection.
     */
   val pgDrain: Boolean = sys.props.get("conduit.pgDrain").fold(true)(v =>
@@ -43,13 +43,15 @@ object Settings:
     * still together, in batches of up to [[batchSize]]), so that every kind waits alike. 0: up to [[batchSize]] of
     * every kind, oldest or not: under overload the two most frequent kinds fell rounds behind and failed the holds.
     * 32 and 64 cut the batches too small; with no cap, one connection took thousands of reads while the other served
-    * newer ones. 512, so that [[pgGatherMicros]]'s rounds aren't cut short near the limit.
+    * newer ones. 2,048: at saturation a free connection takes what waits, up to this, and a round's plan shares its
+    * articles' reads across its kinds ([[pgPlan]]): against 512, p95 289 and 282 ms against 645 and 344, Postgres 45
+    * µs per request against 47 (50 ms windows besides gained 3-5% of Postgres's CPU and cost p95 below saturation).
     */
-  val pgRoundSize: Int = sys.props.get("conduit.pgRoundSize").fold(512)(v =>
+  val pgRoundSize: Int = sys.props.get("conduit.pgRoundSize").fold(2048)(v =>
     v.trim.toIntOption.filter(_ >= 0).getOrElse(throw IllegalArgumentException(s"""-Dconduit.pgRoundSize must be 0 or more, not "$v""""))
   )
   /** With [[pgDrain]] and [[pgRoundSize]]: how long the oldest waiting read waits for others before an idle read
-    * connection takes them as a round ([[PgPool]]), unless a round's worth waits first; reads that waited that long
+    * connection takes them as a round ([[PgReads]]), unless a round's worth waits first; reads that waited that long
     * for a connection go as soon as one is free. 0: a free connection takes what waits at once, and a read that
     * finds one free goes alone. 10 ms: 9-11% less of Postgres's CPU per request near the limit, where the batches
     * were what arrived while every connection was busy; 15 ms with rounds of 512 another 6.5%, the packed batches
@@ -58,16 +60,35 @@ object Settings:
   val pgGatherMicros: Int = sys.props.get("conduit.pgGatherMicros").fold(15_000)(v =>
     v.trim.toIntOption.filter(_ >= 0).getOrElse(throw IllegalArgumentException(s"""-Dconduit.pgGatherMicros must be 0 or more, not "$v""""))
   )
-  /** Without [[pgDrain]]: the most requests in flight on one Postgres connection; past that they wait in their loop's
-    * queue, in order.
+  /** The reads of every loop wait in one queue for every loop's read connections ([[PgReads]]): a batch then holds
+    * every read of its kind that waits, not only one loop's. A round goes out on the loop of the connection that takes
+    * it, which reads the replies and hands each response to its request's loop. false: each loop's reads wait for its
+    * own connections, and each request is served on its loop only.
+    */
+  val pgSharedReads: Boolean = sys.props.get("conduit.pgSharedReads").fold(true)(v =>
+    v.trim.toBooleanOption.getOrElse(throw IllegalArgumentException(s"""-Dconduit.pgSharedReads must be true or false, not "$v""""))
+  )
+  /** A round's lists, feeds and article pages, when they are of two kinds or more, go out together in two phases on its
+    * connection ([[Api.RoundPlan]]): each kind's pages and their articles' rows first, then once for the round what
+    * those articles need, whatever kind showed them (tags, favorites counts, authors, the viewers' flags). false: each
+    * kind's batch on its own, in one round trip.
+    */
+  val pgPlan: Boolean = sys.props.get("conduit.pgPlan").fold(true)(v =>
+    v.trim.toBooleanOption.getOrElse(throw IllegalArgumentException(s"""-Dconduit.pgPlan must be true or false, not "$v""""))
+  )
+  /** Without [[pgDrain]]: the most requests in flight on one Postgres connection; past that they wait in the
+    * reads' queue, in order.
     */
   val pgDepth: Int = int("conduit.pgDepth", 16)
   /** The most requests of a kind that wait for a Postgres connection to go out as one statement ([[Sql.Batch]]); 1:
     * each its own statement. 128, for [[pgGatherMicros]]'s batches.
     */
   val batchSize: Int = int("conduit.batchSize", 128)
-  /** Threads that hash and check passwords (bcrypt), off the event loops. */
-  val bcryptThreads: Int = int("conduit.bcryptThreads", math.max(1, cpus / 4))
+  /** Threads that hash and check passwords (bcrypt), off the event loops: half the CPUs, so that at saturation the
+    * hashes don't queue behind each other (a quarter left the logins' p95 at 0.45-0.6 s, half 0.3 s, for the same CPU
+    * per request).
+    */
+  val bcryptThreads: Int = int("conduit.bcryptThreads", math.max(1, cpus / 2))
   /** How long a hash may wait for others to run with it, four at a time ([[Passwords]]). */
   val bcryptWaitMillis: Int = sys.props.get("conduit.bcryptWaitMillis").fold(400)(v =>
     v.trim.toIntOption.filter(_ >= 0).getOrElse(throw IllegalArgumentException(s"""-Dconduit.bcryptWaitMillis must be 0 or more, not "$v""""))
@@ -107,6 +128,8 @@ object Settings:
     "pgConnections" -> pgConnections,
     "pgWriteConnections" -> pgWriteConnections,
     "writeGroupSize" -> writeGroupSize,
+    "pgSharedReads" -> pgSharedReads,
+    "pgPlan" -> pgPlan,
     "pgDepth" -> pgDepth,
     "pgDrain" -> pgDrain,
     "pgRoundSize" -> pgRoundSize,

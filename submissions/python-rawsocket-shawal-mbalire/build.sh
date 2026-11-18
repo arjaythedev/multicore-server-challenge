@@ -13,6 +13,11 @@ else
 fi
 "$UV" venv --python 3.15 --managed-python --clear .venv
 "$UV" pip install --python .venv/bin/python --no-cache -c constraints.txt 'psycopg[c]' psycopg_pool bcrypt pyjwt orjson
+# ALT_ADAPTERS=1: the dependencies of the non-default adapters in registry.py, for local A/B runs (the default
+# adapters don't import them)
+if [ "${ALT_ADAPTERS:-0}" = 1 ]; then
+  "$UV" pip install --python .venv/bin/python --no-cache -c constraints.txt msgspec uvloop asyncpg ujson python-rapidjson yyjson pydantic
+fi
 .venv/bin/python -c 'import sys, psycopg; assert psycopg.pq.__impl__ == "c", psycopg.pq.__impl__; print("python build ok:", sys.version.split()[0], "psycopg", psycopg.__version__, psycopg.pq.__impl__)'
 # Multi-lane bcrypt (native/bcrypt_lanes.c, called through ctypes): Blowfish's initial tables are generated from pi
 N=conduit_server/adapters/outbound/native

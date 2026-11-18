@@ -200,6 +200,78 @@ defmodule Conduit.RenderTest do
     assert Nif.comments([bin([int8(42) | List.duplicate(null(), 8)])]) == ~S({"comments":[]})
   end
 
+  # Read plans (Conduit.Plan): pieces rendered from plan_articles / plan_comments rows, spliced with the booleans,
+  # must be the article / comment JSON above.
+  test "plan rows rendered to pieces" do
+    for i <- 1..200 do
+      a = random_article(i)
+      author = 1000 + i
+
+      row =
+        bin([
+          int8(a.id),
+          text(a.slug),
+          text(a.title),
+          text(a.desc),
+          ts(a.created),
+          ts(a.updated),
+          text_array(a.tags),
+          int8(a.favc),
+          int8(author),
+          text(a.user),
+          opt(a.bio),
+          opt(a.image)
+        ])
+
+      splice = fn {x, y, z} -> bin([x, Json.bool(a.favd), y, Json.bool(a.following), z]) end
+
+      {^i, ^author, pieces} = Nif.plan_article(row, nil)
+      assert splice.(pieces) == bin(article_json(a, false))
+
+      {^i, ^author, pieces} = Nif.plan_article(row, text(a.body))
+      assert splice.(pieces) == bin(article_json(a, true))
+
+      crow =
+        bin([
+          int8(7),
+          int8(42),
+          int8(a.id),
+          text(a.body),
+          ts(a.created),
+          ts(a.updated),
+          int8(author),
+          text(a.user),
+          opt(a.bio),
+          opt(a.image)
+        ])
+
+      {7, ^author, {x, z}} = Nif.plan_comment(crow)
+
+      assert bin([x, Json.bool(a.following), z]) ==
+               bin([
+                 "{\"id\":",
+                 Json.int(a.id),
+                 ",\"createdAt\":",
+                 Json.ts(a.created),
+                 ",\"updatedAt\":",
+                 Json.ts(a.updated),
+                 ",\"body\":",
+                 Json.str(a.body),
+                 ",\"author\":",
+                 profile_json(a.user, a.bio, a.image, a.following),
+                 "}"
+               ])
+
+      assert_raise ArgumentError, fn ->
+        Nif.plan_article(binary_part(row, 0, byte_size(row) - 1), nil)
+      end
+
+      assert_raise ArgumentError, fn -> Nif.plan_comment(crow <> <<0>>) end
+    end
+
+    assert Nif.plan_comment(bin([int8(3), int8(42) | List.duplicate(null(), 8)])) == {3, :none}
+  end
+
   test "profile and tags" do
     for u <- @nasty, bio <- [nil, "a \"bio\""] do
       assert Nif.profile(bin([int8(1), text(u), opt(bio), null(), bool(true)])) ==
