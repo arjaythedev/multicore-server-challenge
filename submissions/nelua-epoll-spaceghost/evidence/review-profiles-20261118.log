@@ -1,0 +1,164 @@
+waiting for server to start.... done
+server started
+BEGIN official c-host
+== conformance suite
+== fresh database challenge_test_404060 from conduit_dev
+== build
+PASS: c freestanding core imports only the declared native ABI and compiler memory primitives
+lto-wrapper: warning: using serial compilation of 2 LTRANS jobs
+lto-wrapper: note: see the ‘-flto’ option documentation for more information
+   text	   data	    bss	    dec	    hex	filename
+ 367317	   3888	   8600	 379805	  5cb9d	bin/conduit-c-freestanding
+audit passed: independently authored C application; no Nelua application/scanner implementation linked
+== start
+== test
+
+197 steps, 197 passed, 0 failed (1.5s)
+RESULT: PASS
+JSON_SCAN=c-auto repetition=0
+PASS: user update routes without allocating/parsing a 20,000-node unauthenticated body on the network thread
+BEGIN official c-nelibc
+== conformance suite
+== fresh database challenge_test_404390 from conduit_dev
+== build
+make: Entering directory '/srv/ai/cache/multicore-pseudosocket/source-bootstrap/nelua-dabbd9ef'
+make: Nothing to be done for 'default'.
+make: Leaving directory '/srv/ai/cache/multicore-pseudosocket/source-bootstrap/nelua-dabbd9ef'
+PASS: pinned Nelibc archive built from source; application compiler unchanged
+PASS: namespaced 1195 Nelibc exports; original archive unchanged
+PASS: c freestanding core imports only the declared native ABI and compiler memory primitives
+lto-wrapper: warning: using serial compilation of 2 LTRANS jobs
+lto-wrapper: note: see the ‘-flto’ option documentation for more information
+   text	   data	    bss	    dec	    hex	filename
+ 623331	   5152	  16664	 645147	  9d81b	bin/conduit-c-nelibc-freestanding
+audit passed: independently authored C application; no Nelua application/scanner implementation linked
+audit passed: private Nelibc allocator/copy symbols linked and hidden from dynamic libraries
+== start
+== test
+
+197 steps, 197 passed, 0 failed (1.6s)
+RESULT: PASS
+JSON_SCAN=c-auto repetition=0
+PASS: user update routes without allocating/parsing a 20,000-node unauthenticated body on the network thread
+BEGIN official nelua-host
+== conformance suite
+== fresh database challenge_test_404776 from conduit_dev
+== build
+make: Entering directory '/srv/ai/workspaces/multicore/review236-20261118/submissions/nelua-epoll-spaceghost/.deps/nelua'
+make: Nothing to be done for 'default'.
+make: Leaving directory '/srv/ai/workspaces/multicore/review236-20261118/submissions/nelua-epoll-spaceghost/.deps/nelua'
+PASS: all 34 C statements match the Nelua source/expanded SQL
+PASS: nelua freestanding core imports only the declared native ABI and compiler memory primitives
+lto-wrapper: warning: using serial compilation of 3 LTRANS jobs
+lto-wrapper: note: see the ‘-flto’ option documentation for more information
+   text	   data	    bss	    dec	    hex	filename
+ 350061	  29248	   8600	 387909	  5eb45	bin/conduit-freestanding
+audit passed: no Nelua VM, GC, allocator, panic, or initialization entrypoint
+== start
+== test
+
+197 steps, 197 passed, 0 failed (1.2s)
+RESULT: PASS
+JSON_SCAN=nelua-auto repetition=0
+PASS: user update routes without allocating/parsing a 20,000-node unauthenticated body on the network thread
+BEGIN official nelua-nelibc
+== conformance suite
+== fresh database challenge_test_405692 from conduit_dev
+== build
+make: Entering directory '/srv/ai/workspaces/multicore/review236-20261118/submissions/nelua-epoll-spaceghost/.deps/nelua'
+make: Nothing to be done for 'default'.
+make: Leaving directory '/srv/ai/workspaces/multicore/review236-20261118/submissions/nelua-epoll-spaceghost/.deps/nelua'
+PASS: all 34 C statements match the Nelua source/expanded SQL
+make: Entering directory '/srv/ai/cache/multicore-pseudosocket/source-bootstrap/nelua-dabbd9ef'
+make: Nothing to be done for 'default'.
+make: Leaving directory '/srv/ai/cache/multicore-pseudosocket/source-bootstrap/nelua-dabbd9ef'
+PASS: pinned Nelibc archive built from source; application compiler unchanged
+PASS: namespaced 1195 Nelibc exports; original archive unchanged
+PASS: nelua freestanding core imports only the declared native ABI and compiler memory primitives
+lto-wrapper: warning: using serial compilation of 2 LTRANS jobs
+lto-wrapper: note: see the ‘-flto’ option documentation for more information
+   text	   data	    bss	    dec	    hex	filename
+ 598347	  30496	  16664	 645507	  9d983	bin/conduit-nelibc-freestanding
+audit passed: no Nelua VM, GC, allocator, panic, or initialization entrypoint
+audit passed: private Nelibc allocator/copy symbols linked and hidden from dynamic libraries
+== start
+== test
+
+197 steps, 197 passed, 0 failed (1.3s)
+RESULT: PASS
+JSON_SCAN=nelua-auto repetition=0
+PASS: user update routes without allocating/parsing a 20,000-node unauthenticated body on the network thread
+make: Entering directory '/srv/ai/workspaces/multicore/review236-20261118/submissions/nelua-epoll-spaceghost/.deps/nelua'
+make: Nothing to be done for 'default'.
+make: Leaving directory '/srv/ai/workspaces/multicore/review236-20261118/submissions/nelua-epoll-spaceghost/.deps/nelua'
+PASS: all 34 C statements match the Nelua source/expanded SQL
+make: Entering directory '/srv/ai/cache/multicore-pseudosocket/source-bootstrap/nelua-dabbd9ef'
+make: Nothing to be done for 'default'.
+make: Leaving directory '/srv/ai/cache/multicore-pseudosocket/source-bootstrap/nelua-dabbd9ef'
+PASS: pinned Nelibc archive built from source; application compiler unchanged
+PASS: namespaced 1195 Nelibc exports; original archive unchanged
+PASS: nelua freestanding core imports only the declared native ABI and compiler memory primitives
+lto-wrapper: warning: using serial compilation of 2 LTRANS jobs
+lto-wrapper: note: see the ‘-flto’ option documentation for more information
+   text	   data	    bss	    dec	    hex	filename
+ 599755	  30496	  18824	 649075	  9e773	bin/conduit-nelibc-freestanding
+audit passed: no Nelua VM, GC, allocator, panic, or initialization entrypoint
+audit passed: private Nelibc allocator/copy symbols linked and hidden from dynamic libraries
+make: Entering directory '/srv/ai/workspaces/multicore/review236-20261118/submissions/nelua-epoll-spaceghost/.deps/nelua'
+make: Nothing to be done for 'default'.
+make: Leaving directory '/srv/ai/workspaces/multicore/review236-20261118/submissions/nelua-epoll-spaceghost/.deps/nelua'
+PASS: all 34 C statements match the Nelua source/expanded SQL
+make: Entering directory '/srv/ai/cache/multicore-pseudosocket/source-bootstrap/nelua-dabbd9ef'
+make: Nothing to be done for 'default'.
+make: Leaving directory '/srv/ai/cache/multicore-pseudosocket/source-bootstrap/nelua-dabbd9ef'
+PASS: pinned Nelibc archive built from source; application compiler unchanged
+PASS: namespaced 1195 Nelibc exports; original archive unchanged
+PASS: nelua freestanding core imports only the declared native ABI and compiler memory primitives
+lto-wrapper: warning: using serial compilation of 2 LTRANS jobs
+lto-wrapper: note: see the ‘-flto’ option documentation for more information
+   text	   data	    bss	    dec	    hex	filename
+ 598379	  30496	  16664	 645539	  9d9a3	bin/conduit-nelibc-freestanding
+audit passed: no Nelua VM, GC, allocator, panic, or initialization entrypoint
+audit passed: private Nelibc allocator/copy symbols linked and hidden from dynamic libraries
+== conformance suite
+== fresh database challenge_test_406315 from conduit_dev
+== build
+make: Entering directory '/srv/ai/workspaces/multicore/review236-20261118/submissions/nelua-epoll-spaceghost/.deps/nelua'
+make: Nothing to be done for 'default'.
+make: Leaving directory '/srv/ai/workspaces/multicore/review236-20261118/submissions/nelua-epoll-spaceghost/.deps/nelua'
+PASS: all 34 C statements match the Nelua source/expanded SQL
+make: Entering directory '/srv/ai/cache/multicore-pseudosocket/source-bootstrap/nelua-dabbd9ef'
+make: Nothing to be done for 'default'.
+make: Leaving directory '/srv/ai/cache/multicore-pseudosocket/source-bootstrap/nelua-dabbd9ef'
+PASS: pinned Nelibc archive built from source; application compiler unchanged
+PASS: namespaced 1195 Nelibc exports; original archive unchanged
+PASS: nelua freestanding core imports only the declared native ABI and compiler memory primitives
+lto-wrapper: warning: using serial compilation of 2 LTRANS jobs
+lto-wrapper: note: see the ‘-flto’ option documentation for more information
+   text	   data	    bss	    dec	    hex	filename
+ 599755	  30496	  18824	 649075	  9e773	bin/conduit-nelibc-freestanding
+audit passed: no Nelua VM, GC, allocator, panic, or initialization entrypoint
+audit passed: private Nelibc allocator/copy symbols linked and hidden from dynamic libraries
+== start
+== test
+
+197 steps, 197 passed, 0 failed (1.4s)
+RESULT: PASS
+query 92 failed (SQLSTATE 22012)
+PASS: streamed oversized results rejected before accumulation; shared 1 MiB cap, cross-connection pressure, binary/null preservation, PGconn-independent lifetime, pipeline cleanup/recovery and SQL errors after partial rows
+PASS: unlimited leaf detects saturated ancestor without PSI; tightest quota wins, scope switches reset counters, admission recovers
+PASS: idle immediacy, bounded pressure response, rate limiting, recovery, I/O discrimination, missing metrics and one-slot bounds
+PASS: gather serial=0 early_stop=0 adaptive=0 handled=64 batches=2 concurrent=2
+PASS: gather serial=0 early_stop=0 adaptive=1 handled=64 batches=2 concurrent=2
+PASS: gather serial=0 early_stop=1 adaptive=0 handled=0 batches=0 concurrent=0
+PASS: gather serial=0 early_stop=1 adaptive=1 handled=0 batches=0 concurrent=0
+PASS: gather serial=1 early_stop=0 adaptive=0 handled=64 batches=2 concurrent=2
+PASS: gather serial=1 early_stop=0 adaptive=1 handled=64 batches=2 concurrent=2
+PASS: gather serial=1 early_stop=1 adaptive=0 handled=0 batches=0 concurrent=0
+PASS: gather serial=1 early_stop=1 adaptive=1 handled=0 batches=0 concurrent=0
+PASS: network fair=0 small reply precedes large completion when enabled; 2 MiB byte-exact transfer, 1 turns, backpressure and closed peer
+PASS: accept fair=0 150 connections drained without losing backlog; TCP_NODELAY verified
+PASS: network fair=1 small reply precedes large completion when enabled; 2 MiB byte-exact transfer, 9 turns, backpressure and closed peer
+PASS: accept fair=1 150 connections drained without losing backlog; TCP_NODELAY verified
+waiting for server to shut down.... done
+server stopped

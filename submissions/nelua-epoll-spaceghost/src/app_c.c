@@ -322,10 +322,8 @@ int conduit_lane(nc_request *r)
 {
     int operation=route(r);
     if (operation==1 || operation==2) return 2;
-    if (operation==4) {
-        nc_json *password=nc_field(nc_body(r,"user"),"password");
-        return nc_kind(password)==3 && nc_length(nc_string(password))>0?2:1;
-    }
+    /* Body-dependent work must never parse JSON on the socket owner. */
+    if (operation==4) return 2;
     return operation==6 || operation==7 || operation==10 || operation==12 || operation==13 ||
            operation==14 || operation==15 || operation==17 || operation==18?1:0;
 }

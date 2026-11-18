@@ -60,7 +60,7 @@ def main():
                          target_total_cores=(right-left)/1e6/span if left is not None and right is not None else None,
                          target_memory_peak_measured_bytes=max(int(s['memory.current']) for s in window
                                                               if s.get('memory.current') is not None),
-                         app_cpu_us_per_response=app_seconds*1e6/(overall['rps']*span),
+                         app_cpu_us_per_response=app_seconds*1e6/(overall['rps']*span) if overall['rps']>0 else None,
                          binary_sha256=metadata['binary_sha256'], ancestor_limits=metadata['ancestor_limits']))
     if not rows:
         raise RuntimeError('no load cases')

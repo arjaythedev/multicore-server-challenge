@@ -6,8 +6,8 @@ local B: type = @record{}
 
 local function handle_one(req:*N.Request, db:*N.Db) <cimport'conduit_handle',nodecl> end
 
-local function fail_group(requests:*[0]*N.Request, count:cint)
-  local status:cint = 500
+local function fail_group(requests:*[0]*N.Request, count:cint, db:*N.Db)
+  local status:cint = N.db_result_exhausted(db) and 503 or 500
   local i:cint = 0
   while i < count do
     if N.status(requests[i]) == 503 then status = 503; break end
@@ -24,7 +24,7 @@ local function tags(requests:*[0]*N.Request, count:cint, db:*N.Db)
   local result = N.query(db, 90, [[SELECT name FROM public.tags ORDER BY name]], 0, nilptr)
   if N.pipeline_staging(db) then return end
   if not N.ok(result) then
-    fail_group(requests, count)
+    fail_group(requests, count, db)
     if result then N.free(result) end
     return
   end
@@ -57,7 +57,7 @@ local function lookup(requests:*[0]*N.Request, keys:*cstring, viewers:*int64,
     parameters[0] = N.text_vector(requests[0], keys, count)
     parameters[1] = N.int_vector(requests[0], viewers, count)
     if not parameters[0] or not parameters[1] then
-      fail_group(requests, count)
+      fail_group(requests, count, db)
       return
     end
   end
@@ -116,7 +116,7 @@ local function lookup(requests:*[0]*N.Request, keys:*cstring, viewers:*int64,
   end
   if N.pipeline_staging(db) then return end
   if not N.ok(result) then
-    fail_group(requests, count)
+    fail_group(requests, count, db)
     if result then N.free(result) end
     return
   end
@@ -151,7 +151,7 @@ local function comments(requests:*[0]*N.Request, keys:*cstring, viewers:*int64,
     parameters[0] = N.text_vector(requests[0], keys, count)
     parameters[1] = N.int_vector(requests[0], viewers, count)
     if not parameters[0] or not parameters[1] then
-      fail_group(requests, count)
+      fail_group(requests, count, db)
       return
     end
   end
@@ -181,7 +181,7 @@ local function comments(requests:*[0]*N.Request, keys:*cstring, viewers:*int64,
   ]], 2, &parameters[0])
   if N.pipeline_staging(db) then return end
   if not N.ok(result) then
-    fail_group(requests, count)
+    fail_group(requests, count, db)
     if result then N.free(result) end
     return
   end
@@ -310,7 +310,7 @@ local function pages(requests:*[0]*N.Request, keys:*cstring, viewers:*int64,
     parameters[2] = N.int_vector(requests[0], limits, count)
     parameters[3] = N.int_vector(requests[0], offsets, count)
     if not parameters[0] or not parameters[1] or not parameters[2] or not parameters[3] then
-      fail_group(requests, count)
+      fail_group(requests, count, db)
       return
     end
   end
@@ -322,7 +322,7 @@ local function pages(requests:*[0]*N.Request, keys:*cstring, viewers:*int64,
   local result = N.query(db, 89 + kind, sql, 4, &parameters[0])
   if N.pipeline_staging(db) then return end
   if not N.ok(result) then
-    fail_group(requests, count)
+    fail_group(requests, count, db)
     if result then N.free(result) end
     return
   end
@@ -497,7 +497,7 @@ local function conduit_batch(requests:*[0]*N.Request, count:cint, db:*N.Db) <cex
       if not N.pipeline_flush(db) then
         i = 0
         while i < count do
-          if kinds[i] > 0 then N.error(requests[i], 500) end
+          if kinds[i] > 0 then N.error(requests[i], N.db_result_exhausted(db) and 503 or 500) end
           i = i + 1
         end
         break

@@ -1,6 +1,9 @@
 /* Native libpq bridge shared by the C and Nelua application implementations. */
 #include "native.h"
 #include <libpq-fe.h>
+#include <libpq-events.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <arpa/inet.h>
 #include <endian.h>
 #include <inttypes.h>
@@ -19,12 +22,99 @@ struct nc_db {
     nc_db_wait_fn wait;
     void *wait_context;
     bool prepared[128];
-    bool pipeline_enabled, read_coalesce, reset_needed, pipeline_failed;
+    bool pipeline_enabled, read_coalesce, reset_needed, pipeline_failed, result_exhausted;
     int pipeline_state, pipeline_count;
     struct nc_pipeline_op pipeline_ops[18];
     bool pipeline_queued[9];
     PGresult *pipeline_results[9];
 };
+
+/* Retained batched results have a process-wide credit cap. Single-row libpq
+ * reception prevents one query from materializing a whole oversized batch
+ * before this check. libpq owns result storage; its destroy event refunds the
+ * credits even if a result outlives the originating connection. */
+static pthread_once_t nc_result_once=PTHREAD_ONCE_INIT;
+static size_t nc_result_cap=64U*1024U*1024U;
+static _Atomic size_t nc_result_live;
+typedef struct nc_result_credit { size_t bytes; } nc_result_credit;
+static void nc_result_configure(void)
+{
+    const char *value=getenv("DB_RESULT_MEMORY_MB");
+    if (!value || !*value) return;
+    char *end; errno=0;
+    unsigned long long mb=strtoull(value,&end,10);
+    if (*value<'0' || *value>'9' || *end || errno || !mb || mb>4096 || mb>SIZE_MAX/(1024U*1024U))
+        nc_result_cap=0;
+    else nc_result_cap=(size_t)mb*1024U*1024U;
+}
+size_t nc_db_result_memory_limit(void)
+{ pthread_once(&nc_result_once,nc_result_configure); return nc_result_cap; }
+size_t nc_db_result_memory_used(void)
+{ return atomic_load_explicit(&nc_result_live,memory_order_relaxed); }
+static bool nc_result_charge(size_t bytes)
+{
+    size_t limit=nc_db_result_memory_limit(),used=nc_db_result_memory_used();
+    for (;;) {
+        if (!limit || used>limit || bytes>limit-used) return false;
+        if (atomic_compare_exchange_weak_explicit(&nc_result_live,&used,used+bytes,
+                memory_order_relaxed,memory_order_relaxed)) return true;
+    }
+}
+static void nc_result_refund(size_t bytes)
+{
+    if (atomic_fetch_sub_explicit(&nc_result_live,bytes,memory_order_relaxed)<bytes) abort();
+}
+static int nc_result_event(PGEventId event,void *info,void *context)
+{
+    (void)context;
+    if (event==PGEVT_RESULTDESTROY) {
+        PGresult *result=((PGEventResultDestroy *)info)->result;
+        nc_result_credit *credit=PQresultInstanceData(result,nc_result_event);
+        if (credit) { nc_result_refund(credit->bytes); free(credit); }
+    }
+    return 1;
+}
+static bool nc_result_append(nc_db *db,PGresult **result,PGresult *row)
+{
+    int columns=PQnfields(row);
+    if (columns<1 || columns>256) return false;
+    if (!*result) {
+        /* Includes result metadata and small allocation-block slack. */
+        const size_t base=65536U;
+        if (!nc_result_charge(base)) goto exhausted;
+        nc_result_credit *credit=malloc(sizeof(*credit));
+        if (!credit) { nc_result_refund(base); goto exhausted; }
+        credit->bytes=base;
+        *result=PQcopyResult(row,PG_COPYRES_ATTRS|PG_COPYRES_EVENTS);
+        if (!*result || !PQresultSetInstanceData(*result,nc_result_event,credit)) {
+            PQclear(*result); *result=NULL;
+            nc_result_refund(base); free(credit); goto exhausted;
+        }
+    }
+    nc_result_credit *credit=PQresultInstanceData(*result,nc_result_event);
+    if (!credit || columns!=PQnfields(*result)) return false;
+    size_t bytes=256U+(size_t)columns*64U;
+    for (int column=0;column<columns;++column) {
+        size_t length=(size_t)PQgetlength(row,0,column);
+        if (length>(SIZE_MAX-bytes)/2U-1U) goto exhausted;
+        bytes+=2U*(length+1U);
+    }
+    if (!nc_result_charge(bytes)) goto exhausted;
+    credit->bytes+=bytes;
+    int tuple=PQntuples(*result);
+    for (int column=0;column<columns;++column)
+        if (!PQsetvalue(*result,tuple,column,
+                PQgetisnull(row,0,column)?NULL:PQgetvalue(row,0,column),
+                PQgetisnull(row,0,column)?-1:PQgetlength(row,0,column))) goto exhausted;
+    /* Fail closed if a libpq implementation needs more than the conservative
+     * reserve. The current row and connection input buffers remain separate. */
+    if (PQresultMemorySize(*result)>credit->bytes) goto exhausted;
+    return true;
+exhausted:
+    db->result_exhausted=true;
+    return false;
+}
+bool nc_db_result_exhausted(nc_db *db) { return db && db->result_exhausted; }
 
 void nc_db_set_wait(nc_db *db, nc_db_wait_fn wait, void *context)
 { db->wait=wait; db->wait_context=context; }
@@ -46,7 +136,7 @@ static int64_t nc_db_milliseconds(void);
 
 /* Non-pipeline queries (e.g. GET /api/user) must yield too. Drain their NULL
  * boundary before reusing a connection, including normal SQL errors. */
-static PGresult *nc_db_await_result(nc_db *db)
+static PGresult *nc_db_await_result(nc_db *db,bool stream)
 {
     PGresult *result=NULL;
     int64_t now=nc_db_milliseconds();
@@ -61,6 +151,17 @@ static PGresult *nc_db_await_result(nc_db *db)
                 if (!result || PQstatus(db->connection)!=CONNECTION_OK ||
                     PQsetnonblocking(db->connection,0)!=0) goto failed;
                 return result;
+            }
+            ExecStatusType status=PQresultStatus(next);
+            if (stream && status==PGRES_SINGLE_TUPLE) {
+                bool good=nc_result_append(db,&result,next);
+                PQclear(next);
+                if (!good) goto failed;
+                continue;
+            }
+            if (stream && result) {
+                if (status==PGRES_TUPLES_OK) { PQclear(next); continue; }
+                PQclear(result); result=NULL; /* A later SQL error discards partial rows. */
             }
             if (result) { PQclear(next); goto failed; }
             result=next;
@@ -89,7 +190,7 @@ static bool nc_db_session(nc_db *db)
                 "set_config('TimeZone','UTC',false), "
                 "set_config('plan_cache_mode','force_generic_plan',false), "
                 "set_config('enable_memoize','off',false)",0,NULL,NULL,NULL,NULL,0)) return false;
-        r=nc_db_await_result(db);
+        r=nc_db_await_result(db,false);
     } else r=PQexec(db->connection,
         "SET jit=off; SET max_parallel_workers_per_gather=0; "
         "SET statement_timeout='10s'; SET TimeZone='UTC'; "
@@ -173,7 +274,9 @@ nc_db *nc_db_open(const char *url)
         fprintf(stderr,"database connection failed\n");
         nc_db_close(db); return NULL;
     }
-    if (!nc_db_session(db)) { nc_db_close(db); return NULL; }
+    if (!nc_db_result_memory_limit() ||
+        !PQregisterEventProc(db->connection,nc_result_event,"nc-result-credits",NULL) ||
+        !nc_db_session(db)) { nc_db_close(db); return NULL; }
     return db;
 }
 bool nc_db_read_coalesce(nc_db *db)
@@ -219,6 +322,7 @@ nc_result *nc_db_query(nc_db *db,int id,const char *sql,int count,const char *co
         db->pipeline_ops[db->pipeline_count++]=(struct nc_pipeline_op){id,false};
         return NULL;
     }
+    db->result_exhausted=false;
     if (!nc_db_ready(db)) return NULL;
     if (!db->prepared[id]) {
         PGresult *r;
@@ -227,18 +331,20 @@ nc_result *nc_db_query(nc_db *db,int id,const char *sql,int count,const char *co
                 !PQsendPrepare(db->connection,name,sql,count,NULL)) {
                 db->reset_needed=true; return NULL;
             }
-            r=nc_db_await_result(db);
+            r=nc_db_await_result(db,false);
         } else r=PQprepare(db->connection,name,sql,count,NULL);
         if (!r || PQresultStatus(r)!=PGRES_COMMAND_OK) return r;
         PQclear(r); db->prepared[id]=true;
     }
     PGresult *r;
-    if (db->wait) {
+    bool stream=id>=90 && id<=98;
+    if (db->wait || stream) {
         if (PQsetnonblocking(db->connection,1)!=0 ||
-            !PQsendQueryPrepared(db->connection,name,count,parameters,NULL,NULL,1)) {
+            !PQsendQueryPrepared(db->connection,name,count,parameters,NULL,NULL,1) ||
+            (stream && !PQsetSingleRowMode(db->connection))) {
             db->reset_needed=true; return NULL;
         }
-        r=nc_db_await_result(db);
+        r=nc_db_await_result(db,stream);
     } else r=PQexecPrepared(db->connection,name,count,parameters,NULL,NULL,1);
     nc_db_log_error(id,r);
     return r;
@@ -253,6 +359,7 @@ bool nc_db_pipeline_begin(nc_db *db)
         return false;
     }
     db->pipeline_failed=false;
+    db->result_exhausted=false;
     db->pipeline_count=0;
     memset(db->pipeline_queued,0,sizeof(db->pipeline_queued));
     db->pipeline_state=NC_PIPELINE_STAGING;
@@ -272,10 +379,11 @@ static int64_t nc_db_milliseconds(void)
 bool nc_db_pipeline_flush(nc_db *db)
 {
     if (!db || db->pipeline_state!=NC_PIPELINE_STAGING) return false;
+    PGresult *building=NULL;
     db->pipeline_state=NC_PIPELINE_RESULTS;
     if (!PQpipelineSync(db->connection)) goto failed;
     int next=0;
-    bool synced=false;
+    bool synced=false,command_boundary=true;
     int64_t now=nc_db_milliseconds();
     if (now<0) goto failed;
     /* Bound the complete read batch, including a broken socket's wait. */
@@ -283,14 +391,34 @@ bool nc_db_pipeline_flush(nc_db *db)
     while (!synced) {
         int pending=PQflush(db->connection);
         if (pending<0 || !PQconsumeInput(db->connection)) goto failed;
-        while (!PQisBusy(db->connection)) {
+        for (;;) {
+            /* Set row mode after the preceding command's NULL boundary and
+             * before PQisBusy parses the next query's first data row. */
+            if (command_boundary && next<db->pipeline_count) {
+                if (!db->pipeline_ops[next].prepare &&
+                    PQpipelineStatus(db->connection)!=PQ_PIPELINE_ABORTED &&
+                    !PQsetSingleRowMode(db->connection))
+                    goto failed;
+                command_boundary=false;
+            }
+            if (PQisBusy(db->connection)) break;
             now=nc_db_milliseconds();
             if (PQstatus(db->connection)!=CONNECTION_OK || now<0 || now>=deadline)
                 goto failed;
             PGresult *r=PQgetResult(db->connection);
             /* Each command has a NULL boundary; it is not the pipeline end. */
-            if (!r) continue;
+            if (!r) { command_boundary=true; continue; }
             ExecStatusType status=PQresultStatus(r);
+            if (status==PGRES_SINGLE_TUPLE) {
+                if (next>=db->pipeline_count || db->pipeline_ops[next].prepare ||
+                    !nc_result_append(db,&building,r)) { PQclear(r); goto failed; }
+                PQclear(r); continue;
+            }
+            if (building) {
+                if (status==PGRES_TUPLES_OK) { PQclear(r); r=building; }
+                else PQclear(building);
+                building=NULL;
+            }
             if (status==PGRES_PIPELINE_SYNC) {
                 PQclear(r);
                 if (next!=db->pipeline_count) goto failed;
@@ -326,6 +454,10 @@ bool nc_db_pipeline_flush(nc_db *db)
         goto failed;
     return !db->pipeline_failed;
 failed:
+    PQclear(building);
+    for (int i=0;i<9;++i) {
+        PQclear(db->pipeline_results[i]); db->pipeline_results[i]=NULL;
+    }
     db->reset_needed=true;
     return false;
 }

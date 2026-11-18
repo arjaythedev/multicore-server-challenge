@@ -49,7 +49,8 @@ static int nc_reactor_wait(void *context,int fd,short events,int timeout)
     nc_fiber *fiber=context;
     struct epoll_event event={0};
     if (timeout<=0) return 0;
-    event.events=EPOLLIN|EPOLLRDHUP;
+    event.events=EPOLLRDHUP;
+    if (events&POLLIN) event.events|=EPOLLIN;
     if (events&POLLOUT) event.events|=EPOLLOUT;
     event.data.ptr=fiber;
     if (epoll_ctl(fiber->reactor->epoll_fd,EPOLL_CTL_ADD,fd,&event)!=0) return -1;

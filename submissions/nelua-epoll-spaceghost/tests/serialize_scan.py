@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--sanitize', action='store_true')
+    parser.add_argument('--driver', type=Path, default=ROOT/'tests/serialize_scan.c')
     parser.add_argument('--generated-c', type=Path, default=ROOT / 'build/app.c')
     parser.add_argument('--implementation', choices=['c', 'nelua'], default='nelua')
     parser.add_argument('--benchmark', type=int, default=0)
@@ -46,9 +47,9 @@ def main():
     with tempfile.TemporaryDirectory(prefix='nc-serialize-') as directory:
         binary = Path(directory) / 'test'
         sources = [ 'src/request.c', 'src/bcrypt.c', 'src/db.c', 'src/json_scan.c',
-                    'src/json_dispatch.c', 'tests/serialize_scan.c']
+                    'src/json_dispatch.c']
         subprocess.run(shlex.split(os.environ.get('CC', 'cc')) + flags +
-                       application + [str(ROOT / p) for p in sources] +
+                       application + [str(ROOT / p) for p in sources] + [str(args.driver)] +
                        libraries + ['-o', str(binary)], check=True)
         if args.compile_only:
             args.compile_only.parent.mkdir(parents=True, exist_ok=True)

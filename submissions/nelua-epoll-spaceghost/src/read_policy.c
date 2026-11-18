@@ -61,6 +61,15 @@ unsigned nc_read_policy_window(const nc_read_policy *p,size_t queued,unsigned ac
 
 static bool read_text(const char *path,char *buffer,size_t capacity)
 {
+#ifdef NC_PRESSURE_TESTING
+    char redirected[4096];
+    const char *root=getenv("NC_PRESSURE_TEST_ROOT");
+    if (root) {
+        int size=snprintf(redirected,sizeof(redirected),"%s%s",root,path);
+        if (size<0 || (size_t)size>=sizeof(redirected)) return false;
+        path=redirected;
+    }
+#endif
     int fd=open(path,O_RDONLY|O_CLOEXEC);
     if (fd<0) return false;
     ssize_t size=read(fd,buffer,capacity-1);
@@ -128,17 +137,34 @@ nc_pressure nc_pressure_read(nc_pressure_probe *p,uint64_t now)
     }
     uint64_t group_usage=0,throttled=0,quota=0,period=0;
     if (*p->cgroup) {
-        char path[1200];
-        snprintf(path,sizeof(path),"/sys/fs/cgroup%s/cpu.stat",p->cgroup);
+        char scope[1024],selected[1024],path[1200];
+        memcpy(scope,p->cgroup,strlen(p->cgroup)+1);
+        memcpy(selected,scope,strlen(scope)+1);
+        /* A leaf may be unlimited while an ancestor throttles both the app
+         * and local database. Compare quota/period ratios without rounding. */
+        for (;;) {
+            snprintf(path,sizeof(path),"/sys/fs/cgroup%s/cpu.max",scope);
+            unsigned long long q=0,t=0;
+            if (read_text(path,text,sizeof(text)) && sscanf(text,"%llu %llu",&q,&t)==2 && q && t &&
+                (!quota || (__uint128_t)q*period<(__uint128_t)quota*t)) {
+                quota=q; period=t;
+                memcpy(selected,scope,strlen(scope)+1);
+            }
+            char *slash=strrchr(scope,'/');
+            if (!slash) break;
+            *slash=0;
+        }
+        snprintf(path,sizeof(path),"/sys/fs/cgroup%s/cpu.stat",selected);
         if (read_text(path,text,sizeof(text))) {
             const char *usage=strstr(text,"usage_usec "), *stall=strstr(text,"throttled_usec ");
             if (usage) group_usage=strtoull(usage+11,NULL,10);
             if (stall) throttled=strtoull(stall+15,NULL,10);
         }
-        snprintf(path,sizeof(path),"/sys/fs/cgroup%s/cpu.max",p->cgroup);
-        if (read_text(path,text,sizeof(text))) {
-            unsigned long long q=0,t=0;
-            if (sscanf(text,"%llu %llu",&q,&t)==2) { quota=q;period=t; }
+        /* Cumulative counters from different ancestors cannot be differenced. */
+        if (strcmp(selected,p->cpu_scope)) {
+            memcpy(p->cpu_scope,selected,strlen(selected)+1);
+            p->group_cpu_usage=group_usage;
+            p->group_throttled=throttled;
         }
     }
     /* Keep totals for both scopes separately: choosing the larger cumulative

@@ -3,9 +3,9 @@
 #include "app_c.h"
 #include "sql_shared.h"
 
-static void fail_group(nc_request **requests,int count)
+static void fail_group(nc_request **requests,int count,nc_db *db)
 {
-    int status=500;
+    int status=nc_db_result_exhausted(db)?503:500;
     for (int i=0;i<count;++i) if (nc_status(requests[i])==503) { status=503;break; }
     for (int i=0;i<count;++i) nc_error(requests[i],status);
 }
@@ -14,7 +14,7 @@ static void tags(nc_request **requests,int count,nc_db *db)
 {
     nc_result *result=nc_db_query(db,90,nc_sql[90],0,NULL);
     if (nc_db_pipeline_staging(db)) return;
-    if (!nc_db_ok(result)) { fail_group(requests,count); nc_result_free(result); return; }
+    if (!nc_db_ok(result)) { fail_group(requests,count,db); nc_result_free(result); return; }
     nc_buffer *b=nc_begin(requests[0],200);
     W(b,"{\"tags\":[");
     for (int row=0;row<nc_rows(result);++row) {
@@ -34,12 +34,12 @@ static void lookup(nc_request **requests,const char **keys,int64_t *viewers,int 
     if (submit) {
         params[0]=nc_text_vector(requests[0],keys,count);
         params[1]=nc_int_vector(requests[0],viewers,count);
-        if (!params[0] || !params[1]) { fail_group(requests,count); return; }
+        if (!params[0] || !params[1]) { fail_group(requests,count,db); return; }
     }
     int id=kind==2?91:92,ordinal=kind==2?4:13;
     nc_result *result=nc_db_query(db,id,nc_sql[id],2,params);
     if (nc_db_pipeline_staging(db)) return;
-    if (!nc_db_ok(result)) { fail_group(requests,count); nc_result_free(result); return; }
+    if (!nc_db_ok(result)) { fail_group(requests,count,db); nc_result_free(result); return; }
     for (int row=0;row<count;++row) {
         if (row>=nc_rows(result) || nc_integer(result,row,ordinal)!=(int64_t)row+1)
             nc_error(requests[row],500);
@@ -59,11 +59,11 @@ static void comments(nc_request **requests,const char **keys,int64_t *viewers,in
     if (submit) {
         params[0]=nc_text_vector(requests[0],keys,count);
         params[1]=nc_int_vector(requests[0],viewers,count);
-        if (!params[0] || !params[1]) { fail_group(requests,count); return; }
+        if (!params[0] || !params[1]) { fail_group(requests,count,db); return; }
     }
     nc_result *result=nc_db_query(db,93,nc_sql[93],2,params);
     if (nc_db_pipeline_staging(db)) return;
-    if (!nc_db_ok(result)) { fail_group(requests,count); nc_result_free(result); return; }
+    if (!nc_db_ok(result)) { fail_group(requests,count,db); nc_result_free(result); return; }
     int row=0;
     for (int request=0;request<count;++request) {
         if (row>=nc_rows(result) || nc_integer(result,row,8)!=(int64_t)request+1)
@@ -94,12 +94,12 @@ static void pages(nc_request **requests,const char **keys,int64_t *viewers,int64
         params[1]=nc_int_vector(requests[0],viewers,count);
         params[2]=nc_int_vector(requests[0],limits,count);
         params[3]=nc_int_vector(requests[0],offsets,count);
-        if (!params[0] || !params[1] || !params[2] || !params[3]) { fail_group(requests,count); return; }
+        if (!params[0] || !params[1] || !params[2] || !params[3]) { fail_group(requests,count,db); return; }
     }
     int id=89+kind;
     nc_result *result=nc_db_query(db,id,nc_sql[id],4,params);
     if (nc_db_pipeline_staging(db)) return;
-    if (!nc_db_ok(result)) { fail_group(requests,count); nc_result_free(result); return; }
+    if (!nc_db_ok(result)) { fail_group(requests,count,db); nc_result_free(result); return; }
     c_fragments fragments[256]={0};
     int row=0;
     for (int request=0;request<count;++request) {
@@ -203,7 +203,7 @@ void conduit_batch(nc_request **requests,int count,nc_db *db)
             }
         }
         if (pipeline && phase==1 && !nc_db_pipeline_flush(db)) {
-            for (int i=0;i<count;++i) if (kinds[i]>0) nc_error(requests[i],500);
+            for (int i=0;i<count;++i) if (kinds[i]>0) nc_error(requests[i],nc_db_result_exhausted(db)?503:500);
             break;
         }
     }

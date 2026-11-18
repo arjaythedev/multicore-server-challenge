@@ -1,0 +1,2 @@
+PASS: unlimited leaf detects saturated ancestor without PSI; tightest quota wins, scope switches reset counters, admission recovers
+PASS: idle immediacy, bounded pressure response, rate limiting, recovery, I/O discrimination, missing metrics and one-slot bounds

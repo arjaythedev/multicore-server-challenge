@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -68,14 +69,37 @@ def warm_seed(port, output):
                    "SELECT count(*), coalesce(sum(('x' || substr(md5(x::text),1,15))::bit(60)::bigint),0) "
                    f'FROM public.{table} x')
             raw = subprocess.check_output(['psql', '-XqAt', '-F', ' ', '-h', '127.0.0.1',
-                                           '-p', str(port), '-U', 'build', '-d', 'conduit_seed',
+                                           '-p', str(port), '-U', 'conduit', '-d', 'conduit_seed',
                                            '-v', 'ON_ERROR_STOP=1', '-c', sql],
-                                          text=True, timeout=max(1, deadline-start))
+                                          text=True, timeout=max(1, deadline-start),
+                                          env={**os.environ, 'PGPASSWORD': 'conduit'})
             values = tuple(map(int, raw.split()))
             if values != expected[table]:
                 raise RuntimeError('fixture fingerprint mismatch: ' + table)
             log.write(json.dumps({'table': table, 'rows': values[0], 'fingerprint': str(values[1]),
                                   'seconds': time.monotonic()-start}) + '\n')
+
+
+def owns_listener(pid, port):
+    """Match a listening TCP inode to this child's fd table, not a health URL."""
+    sockets = set()
+    try:
+        for fd in Path('/proc', str(pid), 'fd').iterdir():
+            try:
+                link = os.readlink(fd)
+            except OSError:
+                continue
+            if link.startswith('socket:['):
+                sockets.add(link[8:-1])
+        for protocol in ('tcp', 'tcp6'):
+            for line in Path('/proc', str(pid), 'net', protocol).read_text().splitlines()[1:]:
+                columns = line.split()
+                if (columns[3] == '0A' and int(columns[1].rsplit(':', 1)[1], 16) == port
+                        and columns[9] in sockets):
+                    return True
+    except (OSError, ValueError, IndexError):
+        pass
+    return False
 
 
 def main():
@@ -94,12 +118,19 @@ def main():
     parser.add_argument('--scan', required=True)
     parser.add_argument('--warm-seed', action='store_true')
     args = parser.parse_args()
+    args.postgres = args.postgres.resolve()
+    args.binary = args.binary.resolve()
+    args.output = args.output.resolve()
     counts = (args.read_connections, args.write_connections, args.auth_connections)
     if min(counts) < 1 or sum(counts) > 95:
         parser.error('positive lane counts with at most 95 total sessions are required')
     if (args.postgres / 'postmaster.pid').exists():
         raise RuntimeError('fixture has postmaster.pid; refusing to take ownership')
-    args.output.mkdir(parents=True, exist_ok=False)
+    # The root launcher precreates this one target-owned child directory.
+    # Direct invocation still requires a new or empty output directory.
+    args.output.mkdir(parents=True, exist_ok=True)
+    if any(args.output.iterdir()):
+        raise RuntimeError('target output directory must be empty')
     stop = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())
@@ -121,6 +152,8 @@ def main():
                 'clock_ticks': os.sysconf('SC_CLK_TCK'), 'page_size': os.sysconf('SC_PAGE_SIZE'),
                 'platform': os.uname()._asdict() if hasattr(os.uname(), '_asdict') else list(os.uname())}
     (args.output / 'metadata.json').write_text(json.dumps(metadata, indent=2) + '\n')
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(('127.0.0.1', args.port))
     server = None
     started = False
     sampler = None
@@ -157,6 +190,9 @@ def main():
             while time.monotonic() < ready_deadline:
                 if stop.is_set() or server.poll() is not None:
                     raise RuntimeError('target exited before readiness')
+                if not owns_listener(server.pid, args.port):
+                    stop.wait(.05)
+                    continue
                 try:
                     with urllib.request.urlopen(f'http://127.0.0.1:{args.port}/api/tags', timeout=1) as response:
                         if response.status == 200:

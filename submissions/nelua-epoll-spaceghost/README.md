@@ -160,6 +160,8 @@ embedded PostgreSQL engine.
 It samples CPU counters and available host/cgroup CPU, I/O and memory PSI at
 most four times per second. Cgroup quota utilization and throttled CPU time
 also reveal a saturated process allocation when the wider host remains idle.
+The probe walks visible cgroup ancestors, uses the smallest quota/period ratio,
+and resets its counter baseline when the limiting scope changes.
 It also tracks batch service time and queue age. Once service exceeds 2 ms,
 collection grows to a quarter of that service time, bounded to 8 ms; this builds
 denser SQL groups without mistaking latency alone for resource pressure.
@@ -240,6 +242,7 @@ database-wide settings stay untouched; no extensions or external cache are used.
 | `READ_PIPELINE` | 1 | Bounded batch-local libpq read pipeline |
 | `READ_COALESCE` | 1 | Share identical reads and public article JSON within the frozen batch |
 | `READ_BATCH_STATS` | 0 | Aggregate density/wait statistics at shutdown |
+| `DB_RESULT_MEMORY_MB` | 64 | Process-wide conservative credits for retained batched libpq results; 1–4096 MiB |
 | `REQUEST_MEMORY_MB` | 256 | Aggregate live request objects, arenas and output/vector capacities; 1–4096 MiB |
 | `REQUEST_POOL` | 0 | Build-time request-header/first-arena pooling; 0 retains the original allocation path |
 | `OUTPUT_RESERVE` | 0 | Build-time lower-bound reservation before long JSON strings; 0 retains incremental growth |
@@ -274,9 +277,17 @@ independently with `REQUEST_POOL=1` and `OUTPUT_RESERVE=1`; both default to 0.
 
 Optional reusable medium buffers have a separate 32 MiB total
 and 16 MiB per-class bound. They retain storage only: every response is freshly
-rendered. Provider metadata/slabs, libpq/OpenSSL, continuation stacks, transport
+rendered. Provider metadata/slabs, libpq connection/input buffers, OpenSSL,
+continuation stacks, transport
 input and kernel memory are outside these counters; this is not an RSS limit.
 The default is deliberately the same reservation budget for both allocators.
+Batched reads use libpq single-row reception and accumulate under a separate
+process-wide `DB_RESULT_MEMORY_MB` credit cap. Row storage is conservatively
+charged before copying, including metadata/slack. Result destruction refunds
+credits even after the originating connection closes. Exhaustion discards the
+partial batch, returns 503 and reconnects before later work, without replay.
+A current wire row and libpq connection/input buffers remain outside that cap;
+these counters do not bound total RSS.
 The x86-64 request control object stays at most 120 bytes. Internal body lengths
 and response capacities use checked 32-bit bounds, keeping libc's control-object
 allocation compact as well as the private-provider comparison.
@@ -303,6 +314,9 @@ independent bcrypt states shares execution resources while completing every
 password's work. Libxcrypt handles compatibility cases and supplies an independent
 test oracle. Passwords over 72 bytes are rejected.
 
+User updates enter the bounded authentication lane without inspecting their
+JSON on the socket owner. Authentication precedes body parsing in the worker;
+large unauthenticated bodies do not allocate JSON trees on the network thread.
 JWT verifications and password results are never retained across requests.
 Read results and rendered bytes live only within the frozen batch described above.
 Writes finish committing before queuing a response; synchronous
@@ -321,6 +335,8 @@ python3 tests/tags_batch.py --sanitize
 python3 tests/serialize_scan.py --sanitize
 python3 tests/transport_gather.py --sanitize
 python3 tests/read_policy.py
+python3 tests/pressure_hierarchy.py
+python3 tests/harness_safety.py
 python3 tests/network_fair.py --sanitize
 python3 tests/request_budget.py --sanitize --memory host
 python3 tests/request_budget.py --sanitize --memory nelibc
@@ -331,6 +347,7 @@ python3 tests/request_pool.py --sanitize --memory nelibc
 python3 tests/request_memory.py --rounds 8 --actions 65536 > memory.jsonl
 python3 tests/analyze_request_memory.py memory.jsonl > memory-summary.json
 python3 tests/reservation_shootout.py --output writer-results --rounds 8 --loops 50000
+DATABASE_URL='dbname=postgres' python3 tests/db_result_budget.py --sanitize
 DATABASE_URL='dbname=postgres' python3 tests/read_reactor.py
 DATABASE_URL='dbname=postgres' python3 tests/read_pipeline.py --sanitize
 createdb nc_batch_validation
@@ -439,6 +456,13 @@ lane counts through each case's `read_connections`, `write_connections` and
 its verified transient `build` service, restores its quota and checks recovery.
 These root-run harnesses launch PG, application and load generation unprivileged;
 the entry itself never changes cgroup limits, global sysctls or I/O schedulers.
+Root launchers open artifacts with the target user's permissions and exclusive,
+no-follow creation. Unit startup logs go through the journal, not a root-opened
+path in a target-writable directory. Readiness requires the launched child's
+listening socket inode, and occupied ports fail before any HTTP probe.
+The target unit gets private IPC and a private `/dev/shm` while keeping PG/app
+inside its resource cgroup. This prevents unrelated session IPC cleanup from
+unlinking its database segments; no host logind setting is changed.
 
 ## Context-pool and reservation comparison
 
@@ -500,6 +524,45 @@ checks cover all four pool/reservation combinations, 40 concurrent owners,
 cross-thread returns, held response isolation, memory exhaustion/recovery,
 network backpressure and byte-level serialization oracles. The private library
 archive remains uninstrumented.
+
+## Review follow-up and controlled comparison
+
+The public default bootstrap passes GitHub Actions and the official dev-seed
+runner. The application still uses the pinned public compiler; private Nelibc
+is an explicit opt-in dependency. Four updated C/Nelua × libc/private profiles,
+plus the combined private pool/reservation build, pass 197 API checks each.
+Tests additionally cover streamed result exhaustion/recovery, SQL errors after
+partial rows, parent quotas without PSI, unauthenticated 20,000-node routing,
+root artifact symlink attacks, occupied listeners and zero-response analysis.
+All eight C/Nelua × allocator × pipeline HTTP overload/recovery combinations
+also return 503 for an oversized author result, then 200 after it is reduced.
+
+The earlier measurements need caution beyond ordinary host contention: retained
+P1 C/libc logs include missing PostgreSQL shared-memory errors,
+and a later diagnostic reproduced unlinked database shared memory during app
+restarts. This is consistent with the
+[documented systemd IPC-cleanup hazard](https://www.postgresql.org/docs/18/kernel-resources.html#SYSTEMD-REMOVEIPC).
+It does not explain every previous failed case or establish an allocator cause.
+The diagnostic launcher now isolates its IPC instead of changing global policy.
+
+A four-round, rotated **2×2 fixed-hot-read** comparison isolates pooling and
+reservation against one unchanged PostgreSQL instance. All 16 samples complete
+with zero HTTP errors and zero byte-level response mismatches. Median throughput
+is about 44k responses/s and p99 about 3.6–3.7 ms across all configurations.
+This is 32 fixed article lookups with 64 clients, not the challenge mix or a
+capacity score. Client CPU is about 1.7 of its two Go execution threads. Small
+throughput/CPU differences do not justify enabling either default. The
+[raw samples](evidence/hot-samples-20261118.jsonl),
+[summary](evidence/hot-summary-20261118.json), and
+[build/test manifest](evidence/review-manifest-20261118.json) retain the results.
+The updated [live pressure run](evidence/review-pressure-20261118.json) restores
+read admission 4→1→4 and completes its 500-user measured phase with zero errors
+and 142 ms p99. That recovery diagnostic is not a capacity comparison.
+
+`tools/hot_read.go` validates every response against its URL's preflight hash;
+`tools/hot_compare.py` retains order, binary hashes, latency, process CPU, PG
+buffer statistics and per-task I/O counters. ZFS disk I/O is not necessarily
+attributed in `read_bytes`; a zero counter alone is not proof of no disk waits.
 
 ## Credits
 

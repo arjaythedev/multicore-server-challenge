@@ -13,7 +13,7 @@ typedef struct nc_pressure_probe {
     uint64_t sampled_at, cpu_total, cpu_idle, cpu_stall, io_stall, memory_stall;
     uint64_t group_stall[3];
     uint64_t group_cpu_usage, group_throttled;
-    char cgroup[1024];
+    char cgroup[1024], cpu_scope[1024];
     bool initialized, baseline;
     nc_pressure value;
 } nc_pressure_probe;

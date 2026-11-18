@@ -55,12 +55,8 @@ end
 local function conduit_lane(r:*N.Request):cint <cexport,codename'conduit_lane'>
   local operation=route(r)
   if operation==1 or operation==2 then return 2 end
-  if operation==4 then
-    -- A bio/email edit must not wait behind cost-10 password hashes.
-    local password=N.field(N.body(r,'user'),'password')
-    if N.kind(password)==3 and N.length(N.string(password))>0 then return 2 end
-    return 1
-  end
+  -- Parsing belongs to the bounded worker lane, after authentication.
+  if operation==4 then return 2 end
   if operation==6 or operation==7 or operation==10 or operation==12 or
      operation==13 or operation==14 or operation==15 or operation==17 or operation==18 then return 1 end
   return 0

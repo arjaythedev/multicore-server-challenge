@@ -45,6 +45,7 @@ function N.pipeline_flush(db:*N.Db):boolean <cimport'nc_db_pipeline_flush',nodec
 function N.pipeline_end(db:*N.Db) <cimport'nc_db_pipeline_end',nodecl> end
 function N.read_coalesce(db:*N.Db):boolean <cimport'nc_db_read_coalesce',nodecl> end
 function N.tx(db:*N.Db,command:cstring):boolean <cimport'nc_tx',nodecl> end
+function N.db_result_exhausted(db:*N.Db):boolean <cimport'nc_db_result_exhausted',nodecl> end
 function N.ok(res:*N.Result):boolean <cimport'nc_db_ok',nodecl> end
 function N.unique(res:*N.Result):boolean <cimport'nc_db_unique',nodecl> end
 function N.free(res:*N.Result) <cimport'nc_result_free',nodecl> end

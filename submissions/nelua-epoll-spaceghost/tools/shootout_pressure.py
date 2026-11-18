@@ -9,12 +9,14 @@ The pulse occurs during ramp, and every quota change is retained as an event.
 import argparse
 import json
 import os
+import pwd
 from pathlib import Path
 import re
 import signal
 import subprocess
 import sys
 import time
+from shootout_run import artifact_read, artifact_write
 
 
 def main():
@@ -30,7 +32,11 @@ def main():
     cases = json.loads(args.cases.read_text())
     if os.geteuid() or len(cases) != 1 or cases[0].get('mode', 'load') != 'load':
         parser.error('root and exactly one load case are required')
+    args.output = args.output.resolve()
     case = cases[0]
+    case['binary'] = str(Path(case['binary']).resolve())
+    case['fixture'] = str(Path(case['fixture']).resolve())
+    artifact_owner = pwd.getpwnam('build')
     restore = int(case.get('quota', 800))
     if not 1 <= args.quota < restore or case['adaptive'] != 1:
         parser.error('pulse must reduce the declared quota; adaptive admission must be enabled')
@@ -52,13 +58,15 @@ def main():
             time.sleep(min(.25, max(0, deadline-time.monotonic())))
 
     def quota(value):
+        nonlocal changed
         subprocess.run(['systemctl', 'set-property', '--runtime', unit,
                         'CPUQuota=' + str(value) + '%'], check=True)
+        changed = value != restore
         events.append({'time_ns': time.time_ns(), 'monotonic_ns': time.monotonic_ns(),
                        'unit': unit, 'quota_percent': value})
-        (args.output / 'pressure-events.json').write_text(json.dumps({
+        artifact_write(args.output / f'pressure-event-{len(events)}.json', json.dumps({
             'scope': 'forced quota pulse during ramp; not a capacity comparison',
-            'events': events}, indent=2) + '\n')
+            'events': events}, indent=2) + '\n', artifact_owner)
 
     try:
         deadline = time.monotonic() + 600
@@ -68,7 +76,7 @@ def main():
                 raise TimeoutError('load generator did not start')
             wait_until(time.monotonic() + .25)
         start = time.monotonic()
-        metadata = json.loads((output / 'target/metadata.json').read_text())
+        metadata = json.loads(artifact_read(output / 'target/metadata.json', artifact_owner))
         unit = Path(metadata['cgroup']).name
         if (not re.fullmatch(r'multicore-shootout-[a-f0-9]{12}\.service', unit) or
                 metadata['binary'] != case['binary']):
@@ -77,6 +85,13 @@ def main():
                                         text=True).strip()
         if owner != 'build':
             raise RuntimeError('refusing to alter a target outside the unprivileged build account')
+        main_pid = subprocess.check_output(['systemctl', 'show', '--property=MainPID', '--value', unit], text=True).strip()
+        argv = Path('/proc', main_pid, 'cmdline').read_bytes().split(b'\0')
+        for flag, expected in (('--postgres', case['fixture']), ('--binary', case['binary']),
+                               ('--output', str(output / 'target'))):
+            encoded = flag.encode()
+            if encoded not in argv or argv.index(encoded)+1 >= len(argv) or argv[argv.index(encoded)+1] != expected.encode():
+                raise RuntimeError('owned service arguments differ from the declared fixture/output')
         wait_until(start + 35)
         quota(args.quota)
         changed = True
@@ -86,6 +101,9 @@ def main():
         process.wait(timeout=300)
         if process.returncode:
             raise RuntimeError('pressure workload failed to complete')
+        artifact_write(args.output / 'pressure-events.json', json.dumps({
+            'scope': 'forced quota pulse during ramp; not a capacity comparison',
+            'events': events}, indent=2) + '\n', artifact_owner)
         completed = True
     finally:
         try:
@@ -100,7 +118,7 @@ def main():
                 except ProcessLookupError:
                     pass
                 process.wait(timeout=150)
-    log = (output / 'target/server.log').read_text()
+    log = artifact_read(output / 'target/server.log', artifact_owner)
     match = re.search(r'read policy: active_limit=(\d+)/(\d+) minimum=(\d+) '
                       r'reductions=(\d+) recoveries=(\d+)', log)
     if not match:

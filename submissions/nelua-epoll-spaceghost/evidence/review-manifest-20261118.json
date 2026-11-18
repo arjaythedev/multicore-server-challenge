@@ -1,0 +1,141 @@
+{
+  "scope": "Review fixes, public bootstrap and controlled hot-read comparison; no competition score",
+  "date_utc": "2026-11-18",
+  "public_bootstrap_commit": "bef33fbe4b9919c94e154506bc03c3825adac394",
+  "public_bootstrap_actions": "https://github.com/arjaythedev/multicore-server-challenge/actions/runs/44244198778",
+  "review_findings_addressed": 11,
+  "default_memory": "host; public edubart application compiler; private Nelibc remains optional",
+  "versions": {
+    "application_nelua": "a58450563e2d2ec49bff499865c8b5cfdf6ff81a",
+    "nelibc": "73ae254aa0f4cc1fa03f8fad92711c497e9c28fc",
+    "nelibc_build_compiler": "dabbd9effebb7ecfe59a727f49f27b4574109d4d"
+  },
+  "configuration": {
+    "request_pool": 0,
+    "output_reserve": 0,
+    "db_result_credit_cap_mib": 64,
+    "request_credit_cap_mib": 256,
+    "read_connections": 4,
+    "write_connections": 32,
+    "auth_connections": 8
+  },
+  "correctness": {
+    "official_dev_seed_profiles": 5,
+    "api_steps_each": 197,
+    "routing_sanitizer_profiles": 4,
+    "http_overload_recovery_combinations": 8,
+    "result_budget_tests": "1 MiB process cap, both providers; pipeline/off, independent lifetime, cleanup and recovery",
+    "additional": "real pipeline, reconnect, 4-session reactor, hierarchy/PSI absence, root artifact attacks, readiness identity, zero-response analysis, socket/gather fairness"
+  },
+  "pressure": {
+    "users": 500,
+    "quota_percent": [
+      800,
+      10,
+      800
+    ],
+    "admission": [
+      4,
+      1,
+      4
+    ],
+    "zero_measured_errors": true,
+    "p99_ms": 142.463,
+    "ipc": "private IPC namespace and private /dev/shm; target remains in bounded service cgroup; no global settings modified"
+  },
+  "hot_read": {
+    "samples": 16,
+    "rounds": 4,
+    "seconds_per_sample": 5,
+    "clients": 64,
+    "request_count": 3529782,
+    "errors": 0,
+    "body_mismatches": 0,
+    "variants": [
+      "00",
+      "10",
+      "01",
+      "11"
+    ],
+    "interpretation": "No catastrophic regression reproduced on fixed hot reads; small differences do not establish a gain. Not the mixed challenge workload.",
+    "client_constraint": "2 Go execution threads; co-located with target/PG, about 1.7 measured client cores",
+    "ipc_note": "Complete matrix held an owned PAM session guard for PG lifetime; guard and PG stopped after measurement. Production diagnostic launcher instead uses private IPC/tmpfs and preserves resource cgroups."
+  },
+  "runtime_sources_and_binaries": {
+    "runtime_sha256": {
+      "src/BCRYPT-LICENSE": "8783c3757e5cda9666663b4a9e5c476c3483d8677535a7a8f391ce260f764ec7",
+      "src/app_c.c": "33f4e5417bb699ed89ee5f6fc71024cd48271c4f8727932d6a59e8a504f4a08d",
+      "src/app_c.h": "3491f496d37f6bd327e055f3738f4301b0c5a6c1a5e361f7e9ef25566f7e7214",
+      "src/batch.nelua": "884fb2e0d5807b2f4770f076e42e5b3bf2b89ff2297e2f47a602417de5fb0633",
+      "src/batch_c.c": "2a0a7e3719690fc95ad2db7b010ecac22832cbf9bed6f75cb42bd2344f80e721",
+      "src/bcrypt.c": "befb77440c49e3b127dc85810120a2a57298116532d7766d39a2ee8f72bda946",
+      "src/bcrypt.h": "e01468542911daadaa7a9bcf290e21e0c60b66bc2c70da269d2f44f732287c1f",
+      "src/bf_tables.h": "180c465e6737dd8b38b72765e29e64a2c3f5662cbdd3591b3e08177ada85b3c2",
+      "src/bindings.nelua": "a440c8770b0116127dc62d051f66471988e32ab3744a295c0b3dc86fc2a9a580",
+      "src/core_memory.c": "e8cbf0937342285f7207b21575d3f284d1b42876ca5f7370748d82186d5258cb",
+      "src/db.c": "2e7a9585eced0abd81c1d83c372102cb3f4109b2e6a3987a37e2e3518a66388b",
+      "src/json_dispatch.c": "5004e6dfbabc337800063e4909378e3121a9721be89210048e1817404c13a15c",
+      "src/json_scan.c": "fa4f3a3f30710acab20afca712a30b835eba8b241ed5eaa263bf47671ee5018e",
+      "src/json_scan.h": "1833ac573f6f02306c8700081da6e78def35f3b628f4af3f51b575d63887c853",
+      "src/json_scan.nelua": "9645f8a01189dd27f50bb5d665a6f23c64caa3a1a5769c35b81b1b481286634f",
+      "src/main.nelua": "77de555c629712ab13eab7008f84825c616128ff5caccdb46f7d5efe814dca24",
+      "src/mutations.nelua": "1b5ee499d7252f70221fcf9c003fac1f5383363e0bd640a4dd04a552ccb2f172",
+      "src/native.h": "75717e8e86004386e792313c7ecdc54cf2532444e774b4f9e05b81632bc7e053",
+      "src/owned_memory.h": "89389e80a2ed5e5793d5b9954bd99eedf5f16ef1231f15c4a2995a7e33c52781",
+      "src/reactor.c": "604a37de2c909fe392c57d258b9eb1bfd87cb3cc0282aedefb4afd1f1aa59be7",
+      "src/reactor.h": "ed35c1ea928c6566562c9c055c84fc134cb97f739f3923f8a8510b20d0294ee8",
+      "src/read_policy.c": "7cfe26bd8d099eeebe66caf465a2581db4f752d005db6d55dbe395494c3a0b00",
+      "src/read_policy.h": "a741493f3678a2fbe7be5c88ba22d7af7a53150dad93fcd677c997dd576ab17c",
+      "src/reads.nelua": "490d596bc82217416b2f65e88d5bc259c715b2a32dd58fde3867eb17e45660c0",
+      "src/request.c": "e2f02f81d7a5fa7b468cffa98b40a8fd4b82736347205ad348d890c65e79e417",
+      "src/serialize.nelua": "980e9fa2527d63e3bb28d709f1a2e91584ea0bd33c8e1f26eced13c203d9c625",
+      "src/serialize_c.c": "955f12a0c3a1ea93801232dcb6c09c177e3712d5c812140581c6361721d78a69",
+      "src/sql_shared.h": "518b6ef8086a7517fb659ea47064b8cd0f351c640c9479c5d98b1069f6d8034d",
+      "src/transport.c": "71442c0a9530fed57bbc375d9ff1619b820e4511ab483fe44710c0d326f00214"
+    },
+    "binary_sha256": {
+      "c-host": "c8068007c02075ed075edb88d3b4ece7ff499ca37f640d6bfab9dc7c9c536629",
+      "c-nelibc": "2318c1aa29b354c88059028ce21ed41b774c937a2867a1fb9b101c8f98e71173",
+      "nelua-host": "a60819f17f6f563ce70ac98f57044220320ade2c8a4f3f23bff7e73d27094e14",
+      "nelua-nelibc": "40178bbfe88cb7c6f86bd78fa081d75643250f4cc9036baec84663009d278670",
+      "nelua-nelibc-01": "e63f386c4108349a25f919a9ebd018a84865fad3f2fb20315d9f43b033a0b66b",
+      "nelua-nelibc-10": "eec55fb279f37404a21397b102e4a447aea895825ffef2c92c51bca3d162acd3",
+      "nelua-nelibc-11": "c93d54c0b66331fe6842a1f3e0e65b5867c3a729af652b42e0a1e4f40916c5ec"
+    }
+  },
+  "diagnostic_sources_sha256": {
+    "tests/db_result_budget.c": "e1ea185d59ec0c77475df01a2389db8518f0b23b9a8d5876483ce8a6513ba70c",
+    "tests/db_result_budget.py": "9fb0c0cbe87aae6a4713c37448fe725e69abec3887b53862f5f2b0da7a7395bd",
+    "tests/harness_safety.py": "0844598725bb9f70f7824a3a97d6b02bb5a4ac0e475e0f2cf75771752ecd4796",
+    "tests/pressure_hierarchy.c": "dbcd1b2cb6eb1732babcd48ef239f6f9e62e6c03592b8639bf9b09688a47a4f7",
+    "tests/pressure_hierarchy.py": "aaa3126f8b62f5a562a77cf70af6df6a5a217a07cadbdd431ef200d417478ade",
+    "tests/result_overload_http.py": "3d4bf0416860a8ef371b4deaa027cd4a3c25798487a9e6bd9bbba8ff1a5902da",
+    "tests/route_lane.c": "4bf397f976e62bf7677b6535da4e8f72959831a47df33798d3318fefe46eb705",
+    "tools/audit.py": "d7599d0b9ae4fd5f1f0934931be8f86cc81249cedf4215078ebc2857fa8f8119",
+    "tools/audit_core.py": "f2e3d7e3753aafdce33aef0fdc477da09a450f649bdeae763d5ba601cb601766",
+    "tools/bootstrap_nelibc.py": "b9ed62efb2cd8896ce4bb8ac5d0ff980f6aac592a4b928485fd129d2283a6850",
+    "tools/export_sql.py": "93a94ef5d9cbece2260c64a7477e3c816edf22fef2b1541177366f014cfdc4bc",
+    "tools/hot_compare.py": "3d132e0828e880d80a825ee8f55b335c4d3c48ad8df7b9b0ddfd4163bee40fa8",
+    "tools/hot_read.go": "c4eed89af3f5366f0b679feabc631e6e44fa944c45c030e7b4e5d85f7dd42471",
+    "tools/private_nelibc.py": "39917a07f25e8e977ee6cda58eb51011fd606ef30dbc593df713a684ba453d03",
+    "tools/shootout_analyze.py": "0bd7bd3e6c17191512e2213aa48841b8ae67a948c27aa78dd86028af2fde4760",
+    "tools/shootout_pressure.py": "99928489050ea482bee635dc7b4ef6161eaebc9c80d114a1a0e7415176040fb2",
+    "tools/shootout_run.py": "fa22480af50c80ce75db3b92557cb94c709de2e84c24ceb08a0d51b60826bc1b",
+    "tools/shootout_target.py": "0c3c1d570917312c4157ecb7057a7e5f3354de3fe74f90b9cd93f128913f7357"
+  },
+  "evidence_sha256": {
+    "hot-metadata-20261118.json": "320fc9f5a4bdbaa9bdf5ea2398bf3ff31b2e99079714de0f6e40000e59266dc6",
+    "hot-samples-20261118.jsonl": "ea2917e6f5eb3bb03ab3ba48ff71493a698487673efcf92fa84f8cdb009eab53",
+    "hot-summary-20261118.json": "f4c81a7967079c6f48a5a4dae1aae44a5ae6022eaa56de9e55de61bcf20cbfdd",
+    "review-build-proof-20261118.json": "7cb2ef5d68612a10164785ea591813a86bbc7bec158c01707b76ebe912f6a9af",
+    "review-core-audits-20261118.json": "7118e6d846d18088fb6654dfd1c2d185e3adaf7aac10546e6128bb40f3fe6e6c",
+    "review-db-20261118.log": "07a28ece32b6b360a518114601e10caec9266e752998650b85ea222d996ff85f",
+    "review-harness-20261118.log": "a8cb8401bb31e475dc7f8add99ffa13eba42a8e8c444552aae91a63b5cb64002",
+    "review-ipc-fault-20261118.json": "14fb2bb0534e1b3f6c8764257db180abd645d620e906a0823ad3a393ddbfc698",
+    "review-overload-20261118.log": "a40287448535a247a33426074ce4c955951aa927e751c6f457f326a92114aa7e",
+    "review-policy-20261118.log": "bc870ed4ff2ccb7a661007ea73f9a842095c87dd84028417199b9daf27e08702",
+    "review-pressure-20261118.json": "16b28b42a1bbb2ec3a58b2b8ecee3943ad75e9df178e34e86f2b5666732152d2",
+    "review-pressure-live-20261118.log": "db3793a5d62a279d98fd7913a1ea8ea5cd8a193f2f62a58f340b2cf3e06705b2",
+    "review-profiles-20261118.log": "cbef04e111bad274455b3cae93a717c4a05324cc5d75310729c3c09d0331198b"
+  }
+}

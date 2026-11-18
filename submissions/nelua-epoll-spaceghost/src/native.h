@@ -74,6 +74,9 @@ nc_db *nc_db_open(const char *url);
 typedef int (*nc_db_wait_fn)(void *context, int fd, short events, int timeout_ms);
 void nc_db_set_wait(nc_db *db, nc_db_wait_fn wait, void *context);
 void nc_db_close(nc_db *db);
+size_t nc_db_result_memory_limit(void);
+size_t nc_db_result_memory_used(void);
+bool nc_db_result_exhausted(nc_db *db);
 nc_result *nc_db_query(nc_db *db, int id, const char *sql, int count, const char *const *parameters);
 /* Optional batch-local read pipeline, enabled only by READ_PIPELINE=1.
  * Stage calls queue IDs90..98; flush drains one Sync; the same queries then
