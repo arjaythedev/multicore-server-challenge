@@ -1,0 +1,76 @@
+{
+  "scope": "Local diagnostics; no official capacity score or overall language/provider ranking",
+  "date": "2026-11-17",
+  "hardware": {
+    "processor": "Intel Core i5-10400",
+    "allowed_logical_cpus": 8,
+    "shared_host": true,
+    "parent_memory_bytes": 6442450944
+  },
+  "workload": {
+    "articles": 500000,
+    "users": 5000,
+    "think_scale": 1,
+    "ramp_s": 60,
+    "measure_s": 30,
+    "tail_s": 15,
+    "rounds": 1,
+    "order": [
+      "c-host",
+      "c-nelibc",
+      "nelua-host",
+      "nelua-nelibc"
+    ],
+    "reference": "existing c-epoll-umitaltintas published defaults, measured last in the eight-writer matrix",
+    "warmup": "seven ordinary full-seed count/fingerprint SQL checks; no extension, cache dropping or index prewarm"
+  },
+  "configuration": {
+    "core_profile": "freestanding",
+    "read_reactor": 1,
+    "read_adaptive": 1,
+    "read_connections": 4,
+    "write_connections": 32,
+    "auth_connections": 8,
+    "json_scan": "selected language auto; AVX2 on this CPU",
+    "native_flags": "-march=native -DNC_NET_FAIR=1",
+    "memory_profiles": {
+      "host": "buffer cache disabled",
+      "nelibc": "bounded buffer cache enabled"
+    },
+    "final_default_change": "Performance used frozen v13 with explicit DB_WRITE_THREADS=32; v14 changes only the native writer-count default to that tested value."
+  },
+  "component": {
+    "scope": "request/buffer/HMAC bridge, no network/database",
+    "rounds": 4,
+    "actions": 131072,
+    "samples": 192,
+    "compiler": "cc (Debian 12.2.0-14+deb12u1) 12.2.0\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
+    "private_archive_sha256": "e105489b3744a4061b056346e38a10b635f45c992b8c75204ec4b097fcf31d85",
+    "source_sha256": {
+      "src/request.c": "e9e34161543aec909830d2fb636a9eabb4a8a92b28be39afc77abeff00362181",
+      "src/owned_memory.h": "89389e80a2ed5e5793d5b9954bd99eedf5f16ef1231f15c4a2995a7e33c52781",
+      "src/native.h": "e82ad3fe2e9a32a0223428dd070ba7e9beb1703a45ab3ab54ff3431959f6fc6d",
+      "src/bcrypt.c": "befb77440c49e3b127dc85810120a2a57298116532d7766d39a2ee8f72bda946",
+      "src/bf_tables.h": "180c465e6737dd8b38b72765e29e64a2c3f5662cbdd3591b3e08177ada85b3c2",
+      "tests/request_memory.c": "b629774024617dd2be1baac4e930f99153e08fcf78c9206bdbf7a0b21ecdc896"
+    }
+  },
+  "versions": {
+    "application_nelua": "a58450563e2d2ec49bff499865c8b5cfdf6ff81a",
+    "nelibc": "73ae254aa0f4cc1fa03f8fad92711c497e9c28fc",
+    "nelibc_build_compiler": "dabbd9effebb7ecfe59a727f49f27b4574109d4d"
+  },
+  "evidence_sha256": {
+    "diagnostic-v13-5000-w32.json": "57388558eeb18f35cf925ed4f342903fcb3f3c9032ef35d59618009ace15ede0",
+    "diagnostic-v13-5000-w8.json": "8f1db45232857400a083dcdc67be07a4f81164316bf2a451374ad5dfceb5f22f",
+    "pressure-v13.json": "8108fbd2c3c5b9fd70e5405fdb1a798fc53644c98af2fa528875cba6a0ed36eb",
+    "request-memory-v13.jsonl": "84981d48f7fadea6deac928cd9d00189d8175815d4af0853899d84065292fb56"
+  },
+  "caveats": [
+    "The existing 6 GiB parent cap differs from the official 16 GiB VM; load generation is outside the target unit but shares the container/host.",
+    "Whole-server samples are one fixed-order pass; storage/cache variation prevents attributing tail differences to language or allocator.",
+    "All 32-writer profiles have zero errors, but both private-Nelibc cases miss at least one latency threshold in the normal run.",
+    "The later private-Nelibc quota-pulse recovery run passes, showing substantial run-to-run tail variation; it is not capacity/ranking evidence.",
+    "Per-PID sampled PG CPU can miss exited workers; target cgroup CPU and memory avoid counting PG shared RSS repeatedly."
+  ]
+}

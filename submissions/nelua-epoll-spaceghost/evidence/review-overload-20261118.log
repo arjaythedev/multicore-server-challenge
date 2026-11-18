@@ -1,0 +1,15 @@
+Started multicore-review236-overload.service - /bin/bash /srv/ai/tmp/multicore-pseudosocket/review236-overload.sh.
+waiting for server to start.... done
+server started
+PASS: c-host pipeline=0 oversized result -> HTTP503 -> recovered HTTP200
+PASS: c-host pipeline=1 oversized result -> HTTP503 -> recovered HTTP200
+PASS: c-nelibc pipeline=0 oversized result -> HTTP503 -> recovered HTTP200
+PASS: c-nelibc pipeline=1 oversized result -> HTTP503 -> recovered HTTP200
+PASS: nelua-host pipeline=0 oversized result -> HTTP503 -> recovered HTTP200
+PASS: nelua-host pipeline=1 oversized result -> HTTP503 -> recovered HTTP200
+PASS: nelua-nelibc pipeline=0 oversized result -> HTTP503 -> recovered HTTP200
+PASS: nelua-nelibc pipeline=1 oversized result -> HTTP503 -> recovered HTTP200
+waiting for server to shut down.... done
+server stopped
+multicore-review236-overload.service: Deactivated successfully.
+multicore-review236-overload.service: Consumed 2.910s CPU time.

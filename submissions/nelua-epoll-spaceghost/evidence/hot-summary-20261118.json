@@ -1,0 +1,54 @@
+{
+  "scope": "Compare four pool/reservation configurations against one unchanged, hot DB.",
+  "samples": 16,
+  "results": [
+    {
+      "variant": "00",
+      "errors": 0,
+      "body_mismatches": 0,
+      "goodput_rps": 44268.117213030935,
+      "p99_ms": 3.659,
+      "app_cpu_us_per_response": 18.958191629917973,
+      "postgres_cpu_us_per_response": 48.56431220458802,
+      "client_cores": 1.7155444142646314,
+      "postgres_read_bytes_counter": 0.0,
+      "postgres_blks_read_delta": 0.0
+    },
+    {
+      "variant": "10",
+      "errors": 0,
+      "body_mismatches": 0,
+      "goodput_rps": 44590.092816520475,
+      "p99_ms": 3.636,
+      "app_cpu_us_per_response": 18.789536682796204,
+      "postgres_cpu_us_per_response": 48.38396991682729,
+      "client_cores": 1.7136716723383019,
+      "postgres_read_bytes_counter": 0.0,
+      "postgres_blks_read_delta": 0.0
+    },
+    {
+      "variant": "01",
+      "errors": 0,
+      "body_mismatches": 0,
+      "goodput_rps": 44259.377263488306,
+      "p99_ms": 3.6505,
+      "app_cpu_us_per_response": 19.02256501117759,
+      "postgres_cpu_us_per_response": 48.25640484078623,
+      "client_cores": 1.7144850711710886,
+      "postgres_read_bytes_counter": 0.0,
+      "postgres_blks_read_delta": 0.0
+    },
+    {
+      "variant": "11",
+      "errors": 0,
+      "body_mismatches": 0,
+      "goodput_rps": 43680.26478528994,
+      "p99_ms": 3.7,
+      "app_cpu_us_per_response": 19.227130329854397,
+      "postgres_cpu_us_per_response": 49.59444227748121,
+      "client_cores": 1.7154206412263826,
+      "postgres_read_bytes_counter": 0.0,
+      "postgres_blks_read_delta": 0.0
+    }
+  ]
+}

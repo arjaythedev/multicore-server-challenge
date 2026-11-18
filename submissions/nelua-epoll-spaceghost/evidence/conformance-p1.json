@@ -1,0 +1,22 @@
+{
+  "conformance-c-host-new-0": {
+    "result": "197 steps, 197 passed, 0 failed (8.2s)\nRESULT: PASS",
+    "binary_sha256": "1a25ddd0349e9579c76063fa17f73c1abcb917e80de3764736c5c83b50772e84",
+    "transcript_sha256": "af79d5204f5940875e78bcf4fc93f3674aa7d10e625d465a6d52ca42d841016c"
+  },
+  "conformance-c-nelibc-new-1": {
+    "result": "197 steps, 197 passed, 0 failed (4.1s)\nRESULT: PASS",
+    "binary_sha256": "ae441c0b795f9b4cc01e9316d5f7403909cc554248d70c939a210ce80d1e2367",
+    "transcript_sha256": "af79d5204f5940875e78bcf4fc93f3674aa7d10e625d465a6d52ca42d841016c"
+  },
+  "conformance-nelua-host-new-2": {
+    "result": "197 steps, 197 passed, 0 failed (4.3s)\nRESULT: PASS",
+    "binary_sha256": "4b5c2f4dcc81b708b629c05e70cea8070f7d3e66573b22590271490d3d801acb",
+    "transcript_sha256": "af79d5204f5940875e78bcf4fc93f3674aa7d10e625d465a6d52ca42d841016c"
+  },
+  "conformance-nelua-nelibc-new-3": {
+    "result": "197 steps, 197 passed, 0 failed (4.7s)\nRESULT: PASS",
+    "binary_sha256": "23fdcc7c224c47de88182f31e0e6648b4402e4d57ed4dda23a5982edcfab6c8f",
+    "transcript_sha256": "af79d5204f5940875e78bcf4fc93f3674aa7d10e625d465a6d52ca42d841016c"
+  }
+}

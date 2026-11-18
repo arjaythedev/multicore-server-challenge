@@ -1,0 +1,54 @@
+waiting for server to start...... done
+server started
+query 92 failed (SQLSTATE 22012)
+PASS: streamed oversized results rejected before accumulation; shared 1 MiB cap, cross-connection pressure, binary/null preservation, PGconn-independent lifetime, pipeline cleanup/recovery and SQL errors after partial rows
+ok 1: explicit-off synchronous query
+ok 2: pipeline mode is cached at connection open
+ok 3: cold prepared query, UTF8 and binary bigint
+ok 4: warm prepared query and exactly-once result claim
+ok 5: 256 KiB result survives partial socket reads and flushes
+ok 6: sixteen parameters retain correct prepared types
+ok 7: results can be claimed out of submission order
+ok 8: unclaimed results are cleared before next batch
+query 92 failed (SQLSTATE 22012)
+ok 9: SQL error preserves SQLSTATE and aborts following commands
+ok 10: next batch reconnects and reprepares after SQL error
+query 95 failed (SQLSTATE 42601)
+ok 11: earlier results survive a later PREPARE error
+ok 12: failed cold PREPARE drains execution and following commands
+ok 13: failed PREPARE is not cached in the next session
+ok 14: statement timeout drains through Sync and marks later work aborted
+query 94 failed (SQLSTATE 57014)
+ok 15: timeout recovery reapplies normal session settings
+ok 16: write IDs are rejected without poisoning following batches
+ok 17: duplicate staged IDs fail safely and preserve recovery
+ok 18: abandoned staging is reset before new work
+query 97 failed (SQLSTATE 57P01)
+ok 19: backend disconnect fails the batch without replay
+ok 20: next batch reconnects after a real backend disconnect
+PASS: 20 native read-pipeline checks
+query 98 failed (SQLSTATE 57P01)
+query 92 failed (SQLSTATE 22012)
+query 92 failed (SQLSTATE 22012)
+query 92 failed (SQLSTATE 22012)
+query 92 failed (SQLSTATE 22012)
+query 92 failed (SQLSTATE 22012)
+query 92 failed (SQLSTATE 22012)
+query 92 failed (SQLSTATE 22012)
+query 92 failed (SQLSTATE 22012)
+query 92 failed (SQLSTATE 22012)
+query 92 failed (SQLSTATE 22012)
+query 92 failed (SQLSTATE 22012)
+query 92 failed (SQLSTATE 22012)
+query 92 failed (SQLSTATE 22012)
+query 92 failed (SQLSTATE 22012)
+query 92 failed (SQLSTATE 22012)
+query 92 failed (SQLSTATE 22012)
+query 98 failed (SQLSTATE 57P01)
+query 92 failed (SQLSTATE 22012)
+query 92 failed (SQLSTATE 22012)
+query 92 failed (SQLSTATE 22012)
+query 92 failed (SQLSTATE 22012)
+PASS: 24 tasks, 4 overlapping libpq sessions on one OS thread; binary results, large reads, pipeline errors, reconnects, inline completion and shutdown with active work
+waiting for server to shut down.... done
+server stopped

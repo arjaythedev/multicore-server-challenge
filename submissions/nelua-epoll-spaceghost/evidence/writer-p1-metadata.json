@@ -1,0 +1,175 @@
+{
+  "scope": "Balanced C/Nelua JSON request-lifetime comparison; run on the Nelibc build host.",
+  "loops": 50000,
+  "rounds": 8,
+  "context_pool": 1,
+  "lifetimes": true,
+  "sources": {
+    "src/request.c": "e2f02f81d7a5fa7b468cffa98b40a8fd4b82736347205ad348d890c65e79e417",
+    "src/serialize_c.c": "955f12a0c3a1ea93801232dcb6c09c177e3712d5c812140581c6361721d78a69",
+    "src/serialize.nelua": "980e9fa2527d63e3bb28d709f1a2e91584ea0bd33c8e1f26eced13c203d9c625",
+    "tests/serialize_scan.c": "28cd76225633995bcc9bab7d04e602e312a0f496950dee7ba8d6098564d376d3"
+  },
+  "binaries": [
+    {
+      "app": "c",
+      "memory": "host",
+      "reserve": 0,
+      "sha256": "fb51fbfd117958344257cf968299bc02086748f7492267ac19b495f30dfacc5b",
+      "command": [
+        "/usr/bin/python3",
+        "/srv/ai/workspaces/multicore/request-pools-20261117/submissions/nelua-epoll-spaceghost/tests/serialize_scan.py",
+        "--implementation",
+        "c",
+        "--memory",
+        "host",
+        "--reserve",
+        "0",
+        "--benchmark",
+        "50000",
+        "--compile-only",
+        "/srv/ai/artifacts/multicore/request-pools-20261117/writer-p1/c-host-r0"
+      ]
+    },
+    {
+      "app": "c",
+      "memory": "host",
+      "reserve": 1,
+      "sha256": "993e800bf6e7e8342f77a4135ca150e4be5f0ae54d231c4a7e5a4353c57b7a50",
+      "command": [
+        "/usr/bin/python3",
+        "/srv/ai/workspaces/multicore/request-pools-20261117/submissions/nelua-epoll-spaceghost/tests/serialize_scan.py",
+        "--implementation",
+        "c",
+        "--memory",
+        "host",
+        "--reserve",
+        "1",
+        "--benchmark",
+        "50000",
+        "--compile-only",
+        "/srv/ai/artifacts/multicore/request-pools-20261117/writer-p1/c-host-r1"
+      ]
+    },
+    {
+      "app": "c",
+      "memory": "nelibc",
+      "reserve": 0,
+      "sha256": "d0263423cb827b1f0a569912ac4f042b679611b20661815371ae9538365f9671",
+      "command": [
+        "/usr/bin/python3",
+        "/srv/ai/workspaces/multicore/request-pools-20261117/submissions/nelua-epoll-spaceghost/tests/serialize_scan.py",
+        "--implementation",
+        "c",
+        "--memory",
+        "nelibc",
+        "--reserve",
+        "0",
+        "--benchmark",
+        "50000",
+        "--compile-only",
+        "/srv/ai/artifacts/multicore/request-pools-20261117/writer-p1/c-nelibc-r0"
+      ]
+    },
+    {
+      "app": "c",
+      "memory": "nelibc",
+      "reserve": 1,
+      "sha256": "1249abd829ec206ed67e162a5e916efbb6b33169c17fb53d137f6d4f475598a2",
+      "command": [
+        "/usr/bin/python3",
+        "/srv/ai/workspaces/multicore/request-pools-20261117/submissions/nelua-epoll-spaceghost/tests/serialize_scan.py",
+        "--implementation",
+        "c",
+        "--memory",
+        "nelibc",
+        "--reserve",
+        "1",
+        "--benchmark",
+        "50000",
+        "--compile-only",
+        "/srv/ai/artifacts/multicore/request-pools-20261117/writer-p1/c-nelibc-r1"
+      ]
+    },
+    {
+      "app": "nelua",
+      "memory": "host",
+      "reserve": 0,
+      "sha256": "b9541b0a668006248556e108c262b58f538c93cc64eb0253e106bc9aebae7404",
+      "command": [
+        "/usr/bin/python3",
+        "/srv/ai/workspaces/multicore/request-pools-20261117/submissions/nelua-epoll-spaceghost/tests/serialize_scan.py",
+        "--implementation",
+        "nelua",
+        "--memory",
+        "host",
+        "--reserve",
+        "0",
+        "--benchmark",
+        "50000",
+        "--compile-only",
+        "/srv/ai/artifacts/multicore/request-pools-20261117/writer-p1/nelua-host-r0"
+      ]
+    },
+    {
+      "app": "nelua",
+      "memory": "host",
+      "reserve": 1,
+      "sha256": "8c3e378603a25e1de5374223c232c5768c10a27845190633bf2c0419f9a9f3f5",
+      "command": [
+        "/usr/bin/python3",
+        "/srv/ai/workspaces/multicore/request-pools-20261117/submissions/nelua-epoll-spaceghost/tests/serialize_scan.py",
+        "--implementation",
+        "nelua",
+        "--memory",
+        "host",
+        "--reserve",
+        "1",
+        "--benchmark",
+        "50000",
+        "--compile-only",
+        "/srv/ai/artifacts/multicore/request-pools-20261117/writer-p1/nelua-host-r1"
+      ]
+    },
+    {
+      "app": "nelua",
+      "memory": "nelibc",
+      "reserve": 0,
+      "sha256": "502c5af5c8fc870f96a464fce71cd6b61266d8390f06b1d06847bb12b2d54a40",
+      "command": [
+        "/usr/bin/python3",
+        "/srv/ai/workspaces/multicore/request-pools-20261117/submissions/nelua-epoll-spaceghost/tests/serialize_scan.py",
+        "--implementation",
+        "nelua",
+        "--memory",
+        "nelibc",
+        "--reserve",
+        "0",
+        "--benchmark",
+        "50000",
+        "--compile-only",
+        "/srv/ai/artifacts/multicore/request-pools-20261117/writer-p1/nelua-nelibc-r0"
+      ]
+    },
+    {
+      "app": "nelua",
+      "memory": "nelibc",
+      "reserve": 1,
+      "sha256": "f339f7b65e60fdb727da9a72911ba9dabfadb22ca50e24c3db4dcbb53db4dbf5",
+      "command": [
+        "/usr/bin/python3",
+        "/srv/ai/workspaces/multicore/request-pools-20261117/submissions/nelua-epoll-spaceghost/tests/serialize_scan.py",
+        "--implementation",
+        "nelua",
+        "--memory",
+        "nelibc",
+        "--reserve",
+        "1",
+        "--benchmark",
+        "50000",
+        "--compile-only",
+        "/srv/ai/artifacts/multicore/request-pools-20261117/writer-p1/nelua-nelibc-r1"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,57 @@
+-- Same-work counterpart to json_scan.c. No allocation or Nelua runtime imports.
+## pragmas.nogc = true
+## pragmas.nochecks = true
+## pragmas.noentrypoint = true
+
+local function copy_word(dst:pointer, src:pointer, n:csize):pointer <cimport'__builtin_memcpy',nodecl> end
+local function mask32(p:*[0]byte):uint32 <cimport'nc_json_mask32',cinclude'"json_scan.h"',nodecl> end
+local function mask64(p:*[0]byte):uint64 <cimport'nc_json_mask64',cinclude'"json_scan.h"',nodecl> end
+local function ctz32(mask:uint32):cint <cimport'__builtin_ctz',nodecl> end
+local function ctz64(mask:culonglong):cint <cimport'__builtin_ctzll',nodecl> end
+
+local function scalar(p:*[0]byte, n:csize):csize <cexport,codename'nc_json_prefix_scalar_nelua'>
+  local i:csize = 0
+  while i < n and p[i] >= 32 and p[i] ~= 34 and p[i] ~= 92 do i = i + 1 end
+  return i
+end
+
+local function word(p:*[0]byte, n:csize):csize <cexport,codename'nc_json_prefix_word_nelua'>
+  local i:csize = 0
+  while n - i >= 8 do
+    local value:uint64 <noinit>
+    copy_word(&value, &p[i], 8)
+    local quotes = value ~ 0x2222222222222222_u64
+    local slashes = value ~ 0x5c5c5c5c5c5c5c5c_u64
+    local controls = (value - 0x2020202020202020_u64) & ~value
+    local matches = ((quotes - 0x0101010101010101_u64) & ~quotes) |
+                    ((slashes - 0x0101010101010101_u64) & ~slashes) | controls
+    if matches & 0x8080808080808080_u64 ~= 0 then break end
+    i = i + 8
+  end
+  return i + scalar(&p[i], n - i)
+end
+
+local function avx2(p:*[0]byte, n:csize):csize <cexport,codename'nc_json_prefix_avx2_nelua',cattribute'target("avx2")'>
+  local i:csize = 0
+  while n - i >= 32 do
+    local mask = mask32(&p[i])
+    if mask ~= 0 then return i + csize(ctz32(mask)) end
+    i = i + 32
+  end
+  return i + word(&p[i], n - i)
+end
+
+local function avx512(p:*[0]byte, n:csize):csize <cexport,codename'nc_json_prefix_avx512_nelua',cattribute'target("avx512f,avx512bw")'>
+  local i:csize = 0
+  while n - i >= 64 do
+    local mask = mask64(&p[i])
+    if mask ~= 0 then return i + csize(ctz64(culonglong(mask))) end
+    i = i + 64
+  end
+  if n - i >= 32 then
+    local mask = mask32(&p[i])
+    if mask ~= 0 then return i + csize(ctz32(mask)) end
+    i = i + 32
+  end
+  return i + word(&p[i], n - i)
+end

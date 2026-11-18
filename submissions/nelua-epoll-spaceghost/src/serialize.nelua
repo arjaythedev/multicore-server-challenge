@@ -1,0 +1,250 @@
+-- Scalar/stack JSON kernels. The host owns each response buffer and result.
+## pragmas.nogc = true
+## pragmas.nochecks = true
+## pragmas.noentrypoint = true
+
+local N = require 'bindings'
+local S: type = @record{}
+local function copy_word(destination:pointer, source:pointer, length:csize):pointer <cimport'__builtin_memcpy',nodecl> end
+
+local function nc_json_string(buffer: *N.Buffer, data: *[0]byte, length: csize) <cexport, codename 'nc_json_string'>
+  if length >= 128 and not N.reserve_json(buffer, length) then return end
+  N.putc(buffer, cchar(34))
+  local first: csize = 0
+  local i: csize = 0
+  local accelerated = N.scan_enabled()
+  while i < length do
+    if accelerated then
+      i = i + N.scan_prefix(&data[i], length - i)
+    else
+      -- Skip eight ordinary bytes at a time. memcpy permits unaligned input, and
+      -- the remaining-length guard never reads beyond the supplied byte range.
+      -- These tests may conservatively stop early, but cannot miss an escape.
+      while length - i >= 8 do
+        local word:uint64 <noinit>
+        copy_word(&word, &data[i], 8)
+        local quotes = word ~ 0x2222222222222222_u64
+        local slashes = word ~ 0x5c5c5c5c5c5c5c5c_u64
+        local controls = (word - 0x2020202020202020_u64) & ~word
+        local matches = ((quotes - 0x0101010101010101_u64) & ~quotes) |
+                        ((slashes - 0x0101010101010101_u64) & ~slashes) | controls
+        if matches & 0x8080808080808080_u64 ~= 0 then break end
+        i = i + 8
+      end
+    end
+    if i == length then break end
+    local value: byte = data[i]
+    if value < 32 or value == 34 or value == 92 then
+      if i > first then N.write_n(buffer, cstring(&data[first]), i - first) end
+      if value == 34 or value == 92 then
+        N.putc(buffer, cchar(92))
+        N.putc(buffer, cchar(value))
+      else
+        local escape: [6]cchar <noinit>
+        escape[0], escape[1], escape[2], escape[3] = cchar(92), cchar(117), cchar(48), cchar(48)
+        local high: byte = value >> 4
+        local low: byte = value & 15
+        escape[4] = cchar(high + 48)
+        if low < 10 then escape[5] = cchar(low + 48) else escape[5] = cchar(low + 87) end
+        N.write_n(buffer, cstring(&escape[0]), 6)
+      end
+      first = i + 1
+    end
+    i = i + 1
+  end
+  if length > first then N.write_n(buffer, cstring(&data[first]), length - first) end
+  N.putc(buffer, cchar(34))
+end
+
+local function nc_json_int64(buffer: *N.Buffer, value: int64) <cexport, codename 'nc_json_int64'>
+  local digits: [20]cchar <noinit>
+  local magnitude: uint64
+  if value < 0 then
+    N.putc(buffer, cchar(45))
+    magnitude = uint64(-(value + 1)) + 1
+  else magnitude = uint64(value) end
+  local first: csize = 20
+  repeat
+    first = first - 1
+    digits[first] = cchar(magnitude % 10 + 48)
+    magnitude = magnitude // 10
+  until magnitude == 0
+  N.write_n(buffer, cstring(&digits[first]), 20 - first)
+end
+
+function S.str(buffer: *N.Buffer, value: cstring) <inline>
+  if value == nilptr then N.write(buffer, 'null')
+  else nc_json_string(buffer, (@*[0]byte)(value), N.length(value)) end
+end
+
+function S.quote(buffer: *N.Buffer, value: cstring) <inline>
+  S.str(buffer, value)
+end
+
+function S.integer(buffer: *N.Buffer, value: int64) <inline>
+  nc_json_int64(buffer, value)
+end
+
+function S.boolean(buffer: *N.Buffer, value: boolean) <inline>
+  if value then N.write(buffer, 'true') else N.write(buffer, 'false') end
+end
+
+function S.text(buffer: *N.Buffer, result: *N.Result, row: cint, column: cint) <inline>
+  if N.null(result, row, column) then N.write(buffer, 'null')
+  else nc_json_string(buffer, (@*[0]byte)(N.value(result, row, column)), N.value_length(result, row, column)) end
+end
+
+-- username, nullable bio, nullable image, following.
+local function profile_prefix(buffer: *N.Buffer, result: *N.Result, row: cint, base: cint)
+  N.write(buffer, '{"username":')
+  S.text(buffer, result, row, base)
+  N.write(buffer, ',"bio":')
+  S.text(buffer, result, row, base + 1)
+  N.write(buffer, ',"image":')
+  S.text(buffer, result, row, base + 2)
+  N.write(buffer, ',"following":')
+end
+
+function S.profile(buffer: *N.Buffer, result: *N.Result, row: cint, base: cint)
+  profile_prefix(buffer, result, row, base)
+  S.boolean(buffer, N.boolean(result, row, base + 3))
+  N.putc(buffer, cchar(125))
+end
+
+-- Full: slug,title,description,body,created,updated,tags,count,favorite,profile.
+-- List: body is omitted and every following field shifts left one column.
+local function article_prefix(buffer: *N.Buffer, result: *N.Result, row: cint, full: boolean):cint
+  N.write(buffer, '{"slug":')
+  S.text(buffer, result, row, 0)
+  N.write(buffer, ',"title":')
+  S.text(buffer, result, row, 1)
+  N.write(buffer, ',"description":')
+  S.text(buffer, result, row, 2)
+  local base: cint = 3
+  if full then
+    N.write(buffer, ',"body":')
+    S.text(buffer, result, row, 3)
+    base = 4
+  end
+  N.write(buffer, ',"createdAt":')
+  N.timestamp(buffer, result, row, base)
+  N.write(buffer, ',"updatedAt":')
+  N.timestamp(buffer, result, row, base + 1)
+  N.write(buffer, ',"tagList":')
+  N.text_array(buffer, result, row, base + 2)
+  N.write(buffer, ',"favoritesCount":')
+  nc_json_int64(buffer, N.integer(result, row, base + 3))
+  N.write(buffer, ',"favorited":')
+  return base
+end
+
+function S.article(buffer: *N.Buffer, result: *N.Result, row: cint, full: boolean)
+  local base = article_prefix(buffer, result, row, full)
+  S.boolean(buffer, N.boolean(result, row, base + 4))
+  N.write(buffer, ',"author":')
+  S.profile(buffer, result, row, base + 5)
+  N.putc(buffer, cchar(125))
+end
+
+-- Offsets refer to request-owned buffers, which may grow while more rows are
+-- rendered. Never retain a raw buffer pointer or a result beyond this page batch.
+local S.ArticleFragments: type = @record{
+  request:*N.Request, slug:cstring,
+  prefix_offset:csize, prefix_length:csize,
+  author_offset:csize, author_length:csize
+}
+
+function S.article_shared(buffer:*N.Buffer, req:*N.Request, result:*N.Result,
+                          row:cint, cache:*[0]S.ArticleFragments)
+  local slug = N.value(result, row, 0)
+  local bytes = (@*[0]byte)(slug)
+  local length = N.value_length(result, row, 0)
+  local hash:uint64 = 14695981039346656037_u64
+  local i:csize = 0
+  while i < length do
+    hash = (hash ~ uint64(bytes[i])) * 1099511628211_u64
+    i = i + 1
+  end
+  local slot:csize = csize(hash & 255)
+  local entry:*S.ArticleFragments = nilptr
+  local probes:cint = 0
+  while probes < 16 do
+    local candidate = &cache[slot]
+    if candidate.request == nilptr then
+      entry = candidate
+      break
+    end
+    if N.eq(candidate.slug, slug) then
+      entry = candidate
+      if candidate.request ~= req and N.status(candidate.request) == 200 then
+        local size:csize = 0
+        local source = (@*[0]byte)(N.response_data(candidate.request, &size))
+        if candidate.prefix_offset <= size and candidate.prefix_length <= size - candidate.prefix_offset and
+           candidate.author_offset <= size and candidate.author_length <= size - candidate.author_offset then
+          N.write_n(buffer, cstring(&source[candidate.prefix_offset]), candidate.prefix_length)
+          S.boolean(buffer, N.boolean(result, row, 7))
+          N.write_n(buffer, cstring(&source[candidate.author_offset]), candidate.author_length)
+          S.boolean(buffer, N.boolean(result, row, 11))
+          N.write(buffer, '}}')
+          return
+        end
+      end
+      break
+    end
+    slot = (slot + 1) & 255
+    probes = probes + 1
+  end
+  -- Cache only viewer-independent JSON. Favorited and following always come
+  -- from this request's own result row, even when the public article repeats.
+  local prefix_offset:csize = 0
+  local prefix_end:csize = 0
+  local author_offset:csize = 0
+  local author_end:csize = 0
+  N.response_data(req, &prefix_offset)
+  article_prefix(buffer, result, row, false)
+  N.response_data(req, &prefix_end)
+  S.boolean(buffer, N.boolean(result, row, 7))
+  N.response_data(req, &author_offset)
+  N.write(buffer, ',"author":')
+  profile_prefix(buffer, result, row, 8)
+  N.response_data(req, &author_end)
+  S.boolean(buffer, N.boolean(result, row, 11))
+  N.write(buffer, '}}')
+  if entry ~= nilptr and N.status(req) == 200 then
+    entry.request, entry.slug = req, slug
+    entry.prefix_offset, entry.prefix_length = prefix_offset, prefix_end - prefix_offset
+    entry.author_offset, entry.author_length = author_offset, author_end - author_offset
+  end
+end
+
+-- User queries return id,username,email,bio,image; id is used only for tokens.
+function S.user(buffer: *N.Buffer, result: *N.Result, row: cint, token: cstring)
+  N.write(buffer, '{"email":')
+  S.text(buffer, result, row, 2)
+  N.write(buffer, ',"token":')
+  S.str(buffer, token)
+  N.write(buffer, ',"username":')
+  S.text(buffer, result, row, 1)
+  N.write(buffer, ',"bio":')
+  S.text(buffer, result, row, 3)
+  N.write(buffer, ',"image":')
+  S.text(buffer, result, row, 4)
+  N.putc(buffer, cchar(125))
+end
+
+-- id,body,created,updated,username,bio,image,following.
+function S.comment(buffer: *N.Buffer, result: *N.Result, row: cint)
+  N.write(buffer, '{"id":')
+  nc_json_int64(buffer, N.integer(result, row, 0))
+  N.write(buffer, ',"body":')
+  S.text(buffer, result, row, 1)
+  N.write(buffer, ',"createdAt":')
+  N.timestamp(buffer, result, row, 2)
+  N.write(buffer, ',"updatedAt":')
+  N.timestamp(buffer, result, row, 3)
+  N.write(buffer, ',"author":')
+  S.profile(buffer, result, row, 4)
+  N.putc(buffer, cchar(125))
+end
+
+return S

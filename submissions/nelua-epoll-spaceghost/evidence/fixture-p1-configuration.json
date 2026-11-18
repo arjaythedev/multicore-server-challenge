@@ -1,0 +1,74 @@
+[
+  {
+    "case": "conformance-c-host-new-0",
+    "config": "# Exact box/pg-conf.sh formulas for 6 GiB / 8 CPUs, not host autodetection.\nmax_connections = 100\nshared_buffers = 1536MB\neffective_cache_size = 4608MB\nmaintenance_work_mem = 384MB\ncheckpoint_completion_target = 0.9\nwal_buffers = 16MB\ndefault_statistics_target = 100\nrandom_page_cost = 1.1\neffective_io_concurrency = 200\nwork_mem = 3640kB\nhuge_pages = try\nmin_wal_size = 1GB\nmax_wal_size = 4GB\nmax_worker_processes = 8\nmax_parallel_workers = 8\nmax_parallel_workers_per_gather = 4\nmax_parallel_maintenance_workers = 4\n",
+    "sha256": "07fab4d760d5e8780f76187a8129408c9500baf244b41b81575d09de7c18be9c",
+    "scope": "diagnostic under existing 6 GiB parent cap; not competition-VM results"
+  },
+  {
+    "case": "conformance-c-nelibc-new-1",
+    "config": "# Exact box/pg-conf.sh formulas for 6 GiB / 8 CPUs, not host autodetection.\nmax_connections = 100\nshared_buffers = 1536MB\neffective_cache_size = 4608MB\nmaintenance_work_mem = 384MB\ncheckpoint_completion_target = 0.9\nwal_buffers = 16MB\ndefault_statistics_target = 100\nrandom_page_cost = 1.1\neffective_io_concurrency = 200\nwork_mem = 3640kB\nhuge_pages = try\nmin_wal_size = 1GB\nmax_wal_size = 4GB\nmax_worker_processes = 8\nmax_parallel_workers = 8\nmax_parallel_workers_per_gather = 4\nmax_parallel_maintenance_workers = 4\n",
+    "sha256": "07fab4d760d5e8780f76187a8129408c9500baf244b41b81575d09de7c18be9c",
+    "scope": "diagnostic under existing 6 GiB parent cap; not competition-VM results"
+  },
+  {
+    "case": "conformance-nelua-host-new-2",
+    "config": "# Exact box/pg-conf.sh formulas for 6 GiB / 8 CPUs, not host autodetection.\nmax_connections = 100\nshared_buffers = 1536MB\neffective_cache_size = 4608MB\nmaintenance_work_mem = 384MB\ncheckpoint_completion_target = 0.9\nwal_buffers = 16MB\ndefault_statistics_target = 100\nrandom_page_cost = 1.1\neffective_io_concurrency = 200\nwork_mem = 3640kB\nhuge_pages = try\nmin_wal_size = 1GB\nmax_wal_size = 4GB\nmax_worker_processes = 8\nmax_parallel_workers = 8\nmax_parallel_workers_per_gather = 4\nmax_parallel_maintenance_workers = 4\n",
+    "sha256": "07fab4d760d5e8780f76187a8129408c9500baf244b41b81575d09de7c18be9c",
+    "scope": "diagnostic under existing 6 GiB parent cap; not competition-VM results"
+  },
+  {
+    "case": "conformance-nelua-nelibc-new-3",
+    "config": "# Exact box/pg-conf.sh formulas for 6 GiB / 8 CPUs, not host autodetection.\nmax_connections = 100\nshared_buffers = 1536MB\neffective_cache_size = 4608MB\nmaintenance_work_mem = 384MB\ncheckpoint_completion_target = 0.9\nwal_buffers = 16MB\ndefault_statistics_target = 100\nrandom_page_cost = 1.1\neffective_io_concurrency = 200\nwork_mem = 3640kB\nhuge_pages = try\nmin_wal_size = 1GB\nmax_wal_size = 4GB\nmax_worker_processes = 8\nmax_parallel_workers = 8\nmax_parallel_workers_per_gather = 4\nmax_parallel_maintenance_workers = 4\n",
+    "sha256": "07fab4d760d5e8780f76187a8129408c9500baf244b41b81575d09de7c18be9c",
+    "scope": "diagnostic under existing 6 GiB parent cap; not competition-VM results"
+  },
+  {
+    "case": "load-c-host-old-4",
+    "config": "# Exact box/pg-conf.sh formulas for 6 GiB / 8 CPUs, not host autodetection.\nmax_connections = 100\nshared_buffers = 1536MB\neffective_cache_size = 4608MB\nmaintenance_work_mem = 384MB\ncheckpoint_completion_target = 0.9\nwal_buffers = 16MB\ndefault_statistics_target = 100\nrandom_page_cost = 1.1\neffective_io_concurrency = 200\nwork_mem = 3640kB\nhuge_pages = try\nmin_wal_size = 1GB\nmax_wal_size = 4GB\nmax_worker_processes = 8\nmax_parallel_workers = 8\nmax_parallel_workers_per_gather = 4\nmax_parallel_maintenance_workers = 4\n",
+    "sha256": "07fab4d760d5e8780f76187a8129408c9500baf244b41b81575d09de7c18be9c",
+    "scope": "diagnostic under existing 6 GiB parent cap; not competition-VM results"
+  },
+  {
+    "case": "load-c-host-new-5",
+    "config": "# Exact box/pg-conf.sh formulas for 6 GiB / 8 CPUs, not host autodetection.\nmax_connections = 100\nshared_buffers = 1536MB\neffective_cache_size = 4608MB\nmaintenance_work_mem = 384MB\ncheckpoint_completion_target = 0.9\nwal_buffers = 16MB\ndefault_statistics_target = 100\nrandom_page_cost = 1.1\neffective_io_concurrency = 200\nwork_mem = 3640kB\nhuge_pages = try\nmin_wal_size = 1GB\nmax_wal_size = 4GB\nmax_worker_processes = 8\nmax_parallel_workers = 8\nmax_parallel_workers_per_gather = 4\nmax_parallel_maintenance_workers = 4\n",
+    "sha256": "07fab4d760d5e8780f76187a8129408c9500baf244b41b81575d09de7c18be9c",
+    "scope": "diagnostic under existing 6 GiB parent cap; not competition-VM results"
+  },
+  {
+    "case": "load-c-host-new-6",
+    "config": "# Exact box/pg-conf.sh formulas for 6 GiB / 8 CPUs, not host autodetection.\nmax_connections = 100\nshared_buffers = 1536MB\neffective_cache_size = 4608MB\nmaintenance_work_mem = 384MB\ncheckpoint_completion_target = 0.9\nwal_buffers = 16MB\ndefault_statistics_target = 100\nrandom_page_cost = 1.1\neffective_io_concurrency = 200\nwork_mem = 3640kB\nhuge_pages = try\nmin_wal_size = 1GB\nmax_wal_size = 4GB\nmax_worker_processes = 8\nmax_parallel_workers = 8\nmax_parallel_workers_per_gather = 4\nmax_parallel_maintenance_workers = 4\n",
+    "sha256": "07fab4d760d5e8780f76187a8129408c9500baf244b41b81575d09de7c18be9c",
+    "scope": "diagnostic under existing 6 GiB parent cap; not competition-VM results"
+  },
+  {
+    "case": "load-c-host-old-7",
+    "config": "# Exact box/pg-conf.sh formulas for 6 GiB / 8 CPUs, not host autodetection.\nmax_connections = 100\nshared_buffers = 1536MB\neffective_cache_size = 4608MB\nmaintenance_work_mem = 384MB\ncheckpoint_completion_target = 0.9\nwal_buffers = 16MB\ndefault_statistics_target = 100\nrandom_page_cost = 1.1\neffective_io_concurrency = 200\nwork_mem = 3640kB\nhuge_pages = try\nmin_wal_size = 1GB\nmax_wal_size = 4GB\nmax_worker_processes = 8\nmax_parallel_workers = 8\nmax_parallel_workers_per_gather = 4\nmax_parallel_maintenance_workers = 4\n",
+    "sha256": "07fab4d760d5e8780f76187a8129408c9500baf244b41b81575d09de7c18be9c",
+    "scope": "diagnostic under existing 6 GiB parent cap; not competition-VM results"
+  },
+  {
+    "case": "load-nelua-nelibc-new-8",
+    "config": "# Exact box/pg-conf.sh formulas for 6 GiB / 8 CPUs, not host autodetection.\nmax_connections = 100\nshared_buffers = 1536MB\neffective_cache_size = 4608MB\nmaintenance_work_mem = 384MB\ncheckpoint_completion_target = 0.9\nwal_buffers = 16MB\ndefault_statistics_target = 100\nrandom_page_cost = 1.1\neffective_io_concurrency = 200\nwork_mem = 3640kB\nhuge_pages = try\nmin_wal_size = 1GB\nmax_wal_size = 4GB\nmax_worker_processes = 8\nmax_parallel_workers = 8\nmax_parallel_workers_per_gather = 4\nmax_parallel_maintenance_workers = 4\n",
+    "sha256": "07fab4d760d5e8780f76187a8129408c9500baf244b41b81575d09de7c18be9c",
+    "scope": "diagnostic under existing 6 GiB parent cap; not competition-VM results"
+  },
+  {
+    "case": "load-nelua-nelibc-old-9",
+    "config": "# Exact box/pg-conf.sh formulas for 6 GiB / 8 CPUs, not host autodetection.\nmax_connections = 100\nshared_buffers = 1536MB\neffective_cache_size = 4608MB\nmaintenance_work_mem = 384MB\ncheckpoint_completion_target = 0.9\nwal_buffers = 16MB\ndefault_statistics_target = 100\nrandom_page_cost = 1.1\neffective_io_concurrency = 200\nwork_mem = 3640kB\nhuge_pages = try\nmin_wal_size = 1GB\nmax_wal_size = 4GB\nmax_worker_processes = 8\nmax_parallel_workers = 8\nmax_parallel_workers_per_gather = 4\nmax_parallel_maintenance_workers = 4\n",
+    "sha256": "07fab4d760d5e8780f76187a8129408c9500baf244b41b81575d09de7c18be9c",
+    "scope": "diagnostic under existing 6 GiB parent cap; not competition-VM results"
+  },
+  {
+    "case": "load-nelua-nelibc-old-10",
+    "config": "# Exact box/pg-conf.sh formulas for 6 GiB / 8 CPUs, not host autodetection.\nmax_connections = 100\nshared_buffers = 1536MB\neffective_cache_size = 4608MB\nmaintenance_work_mem = 384MB\ncheckpoint_completion_target = 0.9\nwal_buffers = 16MB\ndefault_statistics_target = 100\nrandom_page_cost = 1.1\neffective_io_concurrency = 200\nwork_mem = 3640kB\nhuge_pages = try\nmin_wal_size = 1GB\nmax_wal_size = 4GB\nmax_worker_processes = 8\nmax_parallel_workers = 8\nmax_parallel_workers_per_gather = 4\nmax_parallel_maintenance_workers = 4\n",
+    "sha256": "07fab4d760d5e8780f76187a8129408c9500baf244b41b81575d09de7c18be9c",
+    "scope": "diagnostic under existing 6 GiB parent cap; not competition-VM results"
+  },
+  {
+    "case": "load-nelua-nelibc-new-11",
+    "config": "# Exact box/pg-conf.sh formulas for 6 GiB / 8 CPUs, not host autodetection.\nmax_connections = 100\nshared_buffers = 1536MB\neffective_cache_size = 4608MB\nmaintenance_work_mem = 384MB\ncheckpoint_completion_target = 0.9\nwal_buffers = 16MB\ndefault_statistics_target = 100\nrandom_page_cost = 1.1\neffective_io_concurrency = 200\nwork_mem = 3640kB\nhuge_pages = try\nmin_wal_size = 1GB\nmax_wal_size = 4GB\nmax_worker_processes = 8\nmax_parallel_workers = 8\nmax_parallel_workers_per_gather = 4\nmax_parallel_maintenance_workers = 4\n",
+    "sha256": "07fab4d760d5e8780f76187a8129408c9500baf244b41b81575d09de7c18be9c",
+    "scope": "diagnostic under existing 6 GiB parent cap; not competition-VM results"
+  }
+]

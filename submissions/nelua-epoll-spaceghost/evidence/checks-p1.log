@@ -1,0 +1,90 @@
+PASS build c-host freestanding
+PASS build c-nelibc freestanding
+PASS build nelua-host freestanding
+PASS build nelua-nelibc freestanding
+memory=host pool=0 reserve=0
+PASS: bounded owner caches, 40-owner overflow, cross-thread returns, live response isolation, reservation bounds and thread-exit reclamation
+memory=host pool=0 reserve=1
+PASS: bounded owner caches, 40-owner overflow, cross-thread returns, live response isolation, reservation bounds and thread-exit reclamation
+memory=host pool=1 reserve=0
+PASS: bounded owner caches, 40-owner overflow, cross-thread returns, live response isolation, reservation bounds and thread-exit reclamation
+memory=host pool=1 reserve=1
+PASS: bounded owner caches, 40-owner overflow, cross-thread returns, live response isolation, reservation bounds and thread-exit reclamation
+memory=host cache=0
+PASS: 1 MiB live budget, 503 fallback, failed-growth preservation, sticky failure, cache reuse, concurrent exhaustion and complete recovery
+PASS: invalid request budget rejected before allocation
+PASS: invalid request budget rejected before allocation
+PASS: invalid request budget rejected before allocation
+PASS: invalid request budget rejected before allocation
+PASS: invalid request budget rejected before allocation
+memory=host cache=1
+PASS: 1 MiB live budget, 503 fallback, failed-growth preservation, sticky failure, cache reuse, concurrent exhaustion and complete recovery
+PASS: invalid request budget rejected before allocation
+PASS: invalid request budget rejected before allocation
+PASS: invalid request budget rejected before allocation
+PASS: invalid request budget rejected before allocation
+PASS: invalid request budget rejected before allocation
+memory=host cache=0 shape=0
+PASS: 4608 requests produced on four threads and verified/freed on another; incremental growth, changing contents, <=32 MiB retained and complete trim
+memory=host cache=1 shape=0
+PASS: 4608 requests produced on four threads and verified/freed on another; incremental growth, changing contents, <=32 MiB retained and complete trim
+memory=host cache=1 shape=1
+PASS: 4608 requests produced on four threads and verified/freed on another; incremental growth, changing contents, <=32 MiB retained and complete trim
+memory=nelibc pool=0 reserve=0
+PASS: bounded owner caches, 40-owner overflow, cross-thread returns, live response isolation, reservation bounds and thread-exit reclamation
+memory=nelibc pool=0 reserve=1
+PASS: bounded owner caches, 40-owner overflow, cross-thread returns, live response isolation, reservation bounds and thread-exit reclamation
+memory=nelibc pool=1 reserve=0
+PASS: bounded owner caches, 40-owner overflow, cross-thread returns, live response isolation, reservation bounds and thread-exit reclamation
+memory=nelibc pool=1 reserve=1
+PASS: bounded owner caches, 40-owner overflow, cross-thread returns, live response isolation, reservation bounds and thread-exit reclamation
+memory=nelibc cache=0
+PASS: 1 MiB live budget, 503 fallback, failed-growth preservation, sticky failure, cache reuse, concurrent exhaustion and complete recovery
+PASS: invalid request budget rejected before allocation
+PASS: invalid request budget rejected before allocation
+PASS: invalid request budget rejected before allocation
+PASS: invalid request budget rejected before allocation
+PASS: invalid request budget rejected before allocation
+memory=nelibc cache=1
+PASS: 1 MiB live budget, 503 fallback, failed-growth preservation, sticky failure, cache reuse, concurrent exhaustion and complete recovery
+PASS: invalid request budget rejected before allocation
+PASS: invalid request budget rejected before allocation
+PASS: invalid request budget rejected before allocation
+PASS: invalid request budget rejected before allocation
+PASS: invalid request budget rejected before allocation
+memory=nelibc cache=0 shape=0
+PASS: 4608 requests produced on four threads and verified/freed on another; incremental growth, changing contents, <=32 MiB retained and complete trim
+memory=nelibc cache=1 shape=0
+PASS: 4608 requests produced on four threads and verified/freed on another; incremental growth, changing contents, <=32 MiB retained and complete trim
+memory=nelibc cache=1 shape=1
+PASS: 4608 requests produced on four threads and verified/freed on another; incremental growth, changing contents, <=32 MiB retained and complete trim
+PASS: request/buffer owned by private Nelibc; driver/libpq/OpenSSL stay host-owned; all freed through their owners
+PASS: framing, URL/JSON Unicode and controls, duplicate keys, vectors, independent JWT/HMAC, bcrypt cost10 and response bounds
+PASS: network fair=0 small reply precedes large completion when enabled; 2 MiB byte-exact transfer, 1 turns, backpressure and closed peer
+PASS: accept fair=0 150 connections drained without losing backlog; TCP_NODELAY verified
+PASS: network fair=1 small reply precedes large completion when enabled; 2 MiB byte-exact transfer, 9 turns, backpressure and closed peer
+PASS: accept fair=1 150 connections drained without losing backlog; TCP_NODELAY verified
+PASS: gather serial=0 early_stop=0 adaptive=0 handled=64 batches=2 concurrent=2
+PASS: gather serial=0 early_stop=0 adaptive=1 handled=64 batches=2 concurrent=2
+PASS: gather serial=0 early_stop=1 adaptive=0 handled=0 batches=0 concurrent=0
+PASS: gather serial=0 early_stop=1 adaptive=1 handled=0 batches=0 concurrent=0
+PASS: gather serial=1 early_stop=0 adaptive=0 handled=64 batches=2 concurrent=2
+PASS: gather serial=1 early_stop=0 adaptive=1 handled=64 batches=2 concurrent=2
+PASS: gather serial=1 early_stop=1 adaptive=0 handled=0 batches=0 concurrent=0
+PASS: gather serial=1 early_stop=1 adaptive=1 handled=0 batches=0 concurrent=0
+JSON_SCAN=c-auto repetition=0
+PASS: all 256 byte values at every position, tails, unaligned ranges and exact allocation boundaries
+JSON_SCAN=c-auto repetition=0
+PASS: all 256 byte values at every position, tails, unaligned ranges and exact allocation boundaries
+JSON_SCAN=c-auto repetition=0
+PASS: all 256 byte values at every position, tails, unaligned ranges and exact allocation boundaries
+JSON_SCAN=c-auto repetition=0
+PASS: all 256 byte values at every position, tails, unaligned ranges and exact allocation boundaries
+JSON_SCAN=nelua-auto repetition=0
+PASS: all 256 byte values at every position, tails, unaligned ranges and exact allocation boundaries
+JSON_SCAN=nelua-auto repetition=0
+PASS: all 256 byte values at every position, tails, unaligned ranges and exact allocation boundaries
+JSON_SCAN=nelua-auto repetition=0
+PASS: all 256 byte values at every position, tails, unaligned ranges and exact allocation boundaries
+JSON_SCAN=nelua-auto repetition=0
+PASS: all 256 byte values at every position, tails, unaligned ranges and exact allocation boundaries

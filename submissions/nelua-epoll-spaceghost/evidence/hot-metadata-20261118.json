@@ -1,0 +1,29 @@
+{
+  "scope": "Compare four pool/reservation configurations against one unchanged, hot DB.",
+  "fixture": "same unchanged full-seed DB; fixed 32 article lookups, no writes",
+  "session_guard": "multicore-review236-ipc-guard",
+  "rounds": 4,
+  "duration_s": 5,
+  "clients": 64,
+  "compiler_profile": "Nelua/private Nelibc freestanding",
+  "binary_sha256": {
+    "00": "40178bbfe88cb7c6f86bd78fa081d75643250f4cc9036baec84663009d278670",
+    "10": "eec55fb279f37404a21397b102e4a447aea895825ffef2c92c51bca3d162acd3",
+    "01": "e63f386c4108349a25f919a9ebd018a84865fad3f2fb20315d9f43b033a0b66b",
+    "11": "c93d54c0b66331fe6842a1f3e0e65b5867c3a729af652b42e0a1e4f40916c5ec"
+  },
+  "driver_sha256": "df76df92ecbcfbf3b5fa8417ecb18eed0fe318accbd8ca0988f7c77762fd938b",
+  "limits": {
+    "cpu.max": "max 100000",
+    "memory.max": "6442450944",
+    "cpuset.cpus.effective": "2-6,8-9,11"
+  },
+  "caveats": [
+    "Fixed hot read set is not the challenge mix or a capacity score.",
+    "PostgreSQL persists across variants to remove fixture/cache-order differences.",
+    "Client and server share the existing container; client CPU and PG task I/O counters are retained.",
+    "ZFS disk I/O may not be attributed in per-task read_bytes; that counter is not proof of zero storage waits."
+  ],
+  "measured_driver_source_sha256": "557efab050d0404652bf3f4c174313e9ec63239cae4f433c679d571ecae6fe82",
+  "source_note": "Repository Go driver received gofmt only after measurement; measured source retained as hot-read-measured.go."
+}
