@@ -123,6 +123,38 @@ pub const PREPARED_STATEMENTS: &[StmtDef] = &[
         oids: &[OID_INT8_ARR, OID_TEXT_ARR],
     },
 
+    // 7m. Global list page shared by several requests of one read batch (same limit/offset).
+    //     kind 0: the capped count; kind 1: the page's articles (viewer-independent columns);
+    //     kind 2: one row per (request ordinal, article) with that viewer's favorited/following.
+    StmtDef {
+        name: "s_global_m",
+        sql: "WITH page AS MATERIALIZED ( \
+                SELECT a.id, a.slug, a.title, a.description, a.created_at, a.updated_at, a.author_id \
+                FROM articles a ORDER BY a.id DESC LIMIT $1 OFFSET $2 \
+              ), \
+              v AS MATERIALIZED (SELECT r.viewer, r.ord FROM unnest($3::int8[]) WITH ORDINALITY AS r(viewer, ord)) \
+              SELECT 0::int8, CASE WHEN EXISTS (SELECT 1 FROM articles ORDER BY id ASC LIMIT 1 OFFSET 999) \
+                     THEN 1000::int8 ELSE (SELECT count(*) FROM articles) END, \
+                     NULL::int8, NULL::text, NULL::text, NULL::text, NULL::timestamptz, NULL::timestamptz, \
+                     NULL::int8, NULL::text, NULL::text, NULL::text, NULL::text[], NULL::int8, NULL::bool, NULL::bool \
+              UNION ALL \
+              SELECT 1::int8, NULL, p.id, p.slug, p.title, p.description, p.created_at, p.updated_at, \
+                     p.author_id, u.username, u.bio, u.image, \
+                     ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at WHERE at.article_id = p.id ORDER BY 1), \
+                     (SELECT count(*) FROM favorites fa WHERE fa.article_id = p.id), \
+                     false, false \
+              FROM page p \
+              LEFT JOIN LATERAL (SELECT u.username, u.bio, u.image FROM users u WHERE u.id = p.author_id LIMIT 1) u ON true \
+              UNION ALL \
+              SELECT 2::int8, v.ord, p.id, NULL::text, NULL::text, NULL::text, NULL::timestamptz, NULL::timestamptz, \
+                     NULL::int8, NULL::text, NULL::text, NULL::text, NULL::text[], NULL::int8, \
+                     EXISTS (SELECT 1 FROM favorites fa WHERE fa.user_id = v.viewer AND fa.article_id = p.id), \
+                     EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = v.viewer AND fo.followee_id = p.author_id) \
+              FROM v CROSS JOIN page p \
+              ORDER BY 1 ASC, 3 DESC NULLS LAST",
+        oids: &[OID_INT8, OID_INT8, OID_INT8_ARR],
+    },
+
     // 5p. Packed Article by slug batch
     StmtDef {
         name: "s_aslug_p",

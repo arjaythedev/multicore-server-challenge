@@ -34,6 +34,8 @@ pub(crate) enum PlannedJob<'a> {
 pub enum QueuedStmt {
     Single(usize),
     Packed(Vec<usize>),
+    // One s_global_m execution answering every listed envelope (same limit and offset).
+    GlobalShared(Vec<usize>),
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
@@ -65,6 +67,7 @@ pub(crate) enum PlannedGroup {
         kind: PackKind,
         envs: Vec<usize>,
     },
+    GlobalShared(Vec<usize>),
 }
 
 pub(crate) fn group_planned_jobs<'a>(planned: &'a [PlannedJob<'a>]) -> Vec<PlannedGroup> {
@@ -78,6 +81,30 @@ pub(crate) fn group_planned_jobs<'a>(planned: &'a [PlannedJob<'a>]) -> Vec<Plann
         match &planned[i] {
             PlannedJob::Skip | PlannedJob::TagsShared => {
                 processed[i] = true;
+            }
+            PlannedJob::ListGlobal { limit_bytes, offset_bytes, .. } => {
+                // Global-list requests for the same page in one batch share one statement: the page,
+                // its articles and the count are computed once, the viewer flags per request.
+                let mut envs = Vec::new();
+                for j in i..planned.len() {
+                    if processed[j] {
+                        continue;
+                    }
+                    if let PlannedJob::ListGlobal { limit_bytes: l2, offset_bytes: o2, .. } = &planned[j] {
+                        if l2 == limit_bytes && o2 == offset_bytes {
+                            envs.push(j);
+                        }
+                    }
+                }
+                if envs.len() >= 2 {
+                    for &idx in &envs {
+                        processed[idx] = true;
+                    }
+                    groups.push(PlannedGroup::GlobalShared(envs));
+                } else {
+                    processed[i] = true;
+                    groups.push(PlannedGroup::Single(i));
+                }
             }
             job => {
                 if let Some(kind) = job.pack_kind() {
@@ -559,6 +586,17 @@ pub fn execute_read_batch(
                 }
                 q2env.push(QueuedStmt::Packed(envs));
             }
+            PlannedGroup::GlobalShared(envs) => {
+                let (limit_bytes, offset_bytes) = match &planned[envs[0]] {
+                    PlannedJob::ListGlobal { limit_bytes, offset_bytes, .. } => (*limit_bytes, *offset_bytes),
+                    _ => unreachable!(),
+                };
+                let viewers: Vec<i64> = envs.iter().map(|&idx| envelopes[idx].viewer).collect();
+                let mut buf = Vec::new();
+                encode_int8_array(&viewers, &mut buf);
+                pipeline.bind_exec_binary("s_global_m", &[limit_bytes.as_slice(), offset_bytes.as_slice(), &buf]);
+                q2env.push(QueuedStmt::GlobalShared(envs));
+            }
         }
     }
 
@@ -567,11 +605,50 @@ pub fn execute_read_batch(
         outcomes.push(QueryOutcome::Empty);
     }
 
+    // Article ids of the page of the s_global_m statement whose rows are being read.
+    let mut shared_q = usize::MAX;
+    let mut shared_ids: Vec<i64> = Vec::new();
+
     let exec_res = pipeline.execute(|q_idx, row| {
         if q_idx >= q2env.len() {
             return;
         }
         let (env_idx, base) = match &q2env[q_idx] {
+            QueuedStmt::GlobalShared(envs) => {
+                if shared_q != q_idx {
+                    shared_q = q_idx;
+                    shared_ids.clear();
+                }
+                match row.get_i64(0).unwrap_or(-1) {
+                    // Count and article rows are the same for every request of the group.
+                    0 | 1 => {
+                        if row.get_i64(0) == Some(1) {
+                            shared_ids.push(row.get_i64(2).unwrap_or(0));
+                        }
+                        for &idx in envs {
+                            parse_row_into_outcome(&planned[idx], &row, 0, &mut outcomes[idx]);
+                        }
+                    }
+                    // Per-request flags: (ordinal, article id, favorited, following).
+                    2 => {
+                        let ord = row.get_i64(1).unwrap_or(0);
+                        if ord < 1 || (ord as usize) > envs.len() {
+                            return;
+                        }
+                        let id = row.get_i64(2).unwrap_or(0);
+                        if let Some(pos) = shared_ids.iter().position(|&x| x == id) {
+                            if let QueryOutcome::ArticlesList { articles, .. } = &mut outcomes[envs[(ord - 1) as usize]] {
+                                if let Some(item) = articles.get_mut(pos) {
+                                    item.favorited = row.get_bool(14).unwrap_or(false);
+                                    item.following = row.get_bool(15).unwrap_or(false);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                return;
+            }
             QueuedStmt::Single(idx) => (*idx, 0),
             QueuedStmt::Packed(envs) => {
                 let ord = row.get_i64(0).unwrap_or(0);
@@ -889,7 +966,7 @@ mod tests {
         let map_ord = |q_idx: usize, ord: i64| -> Option<usize> {
             match &q2env[q_idx] {
                 QueuedStmt::Single(idx) => Some(*idx),
-                QueuedStmt::Packed(envs) => {
+                QueuedStmt::Packed(envs) | QueuedStmt::GlobalShared(envs) => {
                     if ord < 1 || (ord as usize) > envs.len() {
                         None
                     } else {
@@ -913,4 +990,19 @@ mod tests {
         // Statement 1 (Single s_aslug for env 1):
         assert_eq!(map_ord(1, 0), Some(1));
     }
+
+    #[test]
+    fn test_global_lists_for_same_page_share_one_group() {
+        let p1 = PlannedJob::ListGlobal { limit_bytes: 10i64.to_be_bytes(), offset_bytes: 0i64.to_be_bytes(), viewer_bytes: 1i64.to_be_bytes() };
+        let p2 = PlannedJob::ListGlobal { limit_bytes: 10i64.to_be_bytes(), offset_bytes: 10i64.to_be_bytes(), viewer_bytes: 2i64.to_be_bytes() };
+        let p3 = PlannedJob::ListGlobal { limit_bytes: 10i64.to_be_bytes(), offset_bytes: 0i64.to_be_bytes(), viewer_bytes: 3i64.to_be_bytes() };
+        let planned = vec![p1, PlannedJob::Tags, p2, p3];
+        let groups = group_planned_jobs(&planned);
+        assert_eq!(groups, vec![
+            PlannedGroup::GlobalShared(vec![0, 3]),
+            PlannedGroup::Single(1),
+            PlannedGroup::Single(2),
+        ]);
+    }
+
 }
