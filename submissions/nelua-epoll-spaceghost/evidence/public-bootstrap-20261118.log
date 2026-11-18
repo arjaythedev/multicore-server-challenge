@@ -1,0 +1,28 @@
+waiting for server to start.... done
+server started
+== seedgen -scale 0.02 -> /srv/ai/workspaces/multicore/review236-20261118/seed/data-0.02
+2026/11/18 05:23:19 seed written to /srv/ai/workspaces/multicore/review236-20261118/seed/data-0.02 in 503ms (scale 0.020, 10000 articles)
+== load into conduit_dev
+loaded in 22 s, 95 MB
+== check
+OK: conduit_dev matches the reference seed
+== conformance suite
+== fresh database challenge_test_337398 from conduit_dev
+== build
+make: Entering directory '/srv/ai/workspaces/multicore/review236-20261118/submissions/nelua-epoll-spaceghost/.deps/nelua'
+make: Nothing to be done for 'default'.
+make: Leaving directory '/srv/ai/workspaces/multicore/review236-20261118/submissions/nelua-epoll-spaceghost/.deps/nelua'
+PASS: all 34 C statements match the Nelua source/expanded SQL
+PASS: nelua freestanding core imports only the declared native ABI and compiler memory primitives
+lto-wrapper: warning: using serial compilation of 3 LTRANS jobs
+lto-wrapper: note: see the ‘-flto’ option documentation for more information
+   text	   data	    bss	    dec	    hex	filename
+ 347375	  29157	   5528	 382060	  5d46c	bin/conduit-freestanding
+audit passed: no Nelua VM, GC, allocator, panic, or initialization entrypoint
+== start
+== test
+
+197 steps, 197 passed, 0 failed (2.3s)
+RESULT: PASS
+waiting for server to shut down.... done
+server stopped

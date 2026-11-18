@@ -25,7 +25,8 @@ objects with `-nostdlib`, audits their imports and links that audited object int
 the host. This is a freestanding application **core**, with a hosted transport,
 libpq, OpenSSL and libxcrypt bridge; the whole executable is not freestanding.
 
-`MEMORY_IMPL=nelibc` is the default. With neither `NELIBC_ROOT` nor
+`MEMORY_IMPL=host` is the default and needs no private repository.
+`MEMORY_IMPL=nelibc` is an optional comparison. With neither `NELIBC_ROOT` nor
 `NELIBC_ARCHIVE` supplied, the build fetches clean pinned source and builds the
 archive with GCC. `NELIBC_CACHE` selects the reproducible dependency cache
 (default `.deps/nelibc-source`). Nelibc is pinned to
@@ -228,7 +229,7 @@ database-wide settings stay untouched; no extensions or external cache are used.
 | --- | ---: | --- |
 | `APP_IMPL` | nelua | Handwritten C or Nelua application |
 | `CORE_PROFILE` | freestanding | `freestanding` audits and links the application core |
-| `MEMORY_IMPL` | nelibc | `nelibc` selects private owned allocation/copy |
+| `MEMORY_IMPL` | host | `nelibc` selects private owned allocation/copy |
 | `DB_READ_THREADS` | 4 | Read workers/connections |
 | `DB_WRITE_THREADS` | 32 | Mutation workers/connections; bounded durable group commit concurrency |
 | `DB_AUTH_THREADS` | 8 | Login, registration, password-change workers/connections |
@@ -282,6 +283,13 @@ allocation compact as well as the private-provider comparison.
 
 Worker counts must be positive and total at most 95. Set `READ_GATHER_SERIAL=0`
 or `READ_PIPELINE=0` or `READ_COALESCE=0` to disable the corresponding strategy for comparison.
+
+The default build uses public `edubart/nelua-lang` and the hosted allocator;
+it requires no private repository access. `MEMORY_IMPL=nelibc` remains an
+explicit comparison profile requiring the pinned Nelibc source and its compiler
+fork (or a supplied matching source/archive). The public compiler cannot parse
+the pinned dependency's `*const [0]cchar` syntax. This dependency distinction
+does not affect the public compiler used for the application core.
 
 ## Correctness
 

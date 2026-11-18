@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 APP_IMPL="${APP_IMPL:-nelua}"
-MEMORY_IMPL="${MEMORY_IMPL:-nelibc}"
+MEMORY_IMPL="${MEMORY_IMPL:-host}"
 CORE_PROFILE="${CORE_PROFILE:-freestanding}"
 BUFFER_CACHE="${BUFFER_CACHE:-auto}"
 REQUEST_POOL="${REQUEST_POOL:-0}"
@@ -47,6 +47,7 @@ if [ "$(git -C "$NELUA_ROOT" rev-parse HEAD)" != "$NELUA_REV" ] ||
    ! git -C "$NELUA_ROOT" diff --quiet HEAD --; then
   echo "Expected unmodified official Nelua at $NELUA_REV" >&2; exit 1
 fi
+NELUA_ROOT="$(cd -- "$NELUA_ROOT" && pwd -P)"
 make -C "$NELUA_ROOT" -j"${JOBS:-2}"
 # Generate C afresh and link companions explicitly; no compiler binary cache is used.
 (cd src && "$NELUA_ROOT/nelua" --cache-dir "$PWD/../build/nelua-cache" --no-cache --release --print-code main.nelua) > build/app.c.tmp

@@ -6,7 +6,7 @@ case "${APP_IMPL:-nelua}" in
   c) binary=bin/conduit-c ;;
   *) echo "APP_IMPL must be c or nelua" >&2; exit 1 ;;
 esac
-case "${MEMORY_IMPL:-nelibc}" in
+case "${MEMORY_IMPL:-host}" in
   host) ;;
   nelibc) binary+="-nelibc" ;;
   *) echo "MEMORY_IMPL must be host or nelibc" >&2; exit 1 ;;
