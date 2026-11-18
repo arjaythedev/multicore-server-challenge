@@ -1,0 +1,11 @@
+[build]
+# Default build flags for ThinLTO and native codegen.
+# Release profile panic=abort is set in Cargo.toml [profile.release].
+rustflags = [
+    "-C", "target-cpu=native",
+    "-C", "codegen-units=1",
+    "-C", "linker-plugin-lto",
+    "-C", "linker=clang-22",
+    "-C", "link-arg=-fuse-ld=/usr/bin/ld.lld-22",
+    "-C", "link-arg=-Wl,--emit-relocs",
+]
